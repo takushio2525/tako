@@ -18,6 +18,7 @@ pub mod font;
 pub mod ime;
 pub mod install_info;
 pub mod locale;
+pub mod path;
 pub mod process;
 pub mod procinfo;
 pub mod program_path;

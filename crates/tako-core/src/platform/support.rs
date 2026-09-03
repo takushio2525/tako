@@ -207,12 +207,6 @@ pub mod notes {
         "Dependency detection works, but tako only runs the installer for you on macOS (Homebrew); on Windows it prints the winget command instead",
     );
 
-    /// #970。`canonicalize` の verbatim prefix が OSC 7 経路で `///?/…` へ壊れる
-    pub const WIN_OPEN_DIR_VERBATIM: Note = Note::new(
-        "新タブは開けるが、ペインの cwd が `///?/C:/…` になり、そのタブでは git 操作が「git リポジトリではない」で止まる（`tab new --cwd` / `tree add` も同じ。#970）",
-        "The new tab opens, but the pane cwd becomes `///?/C:/...`, so git operations in that tab stop with \"not a git repository\" (`tab new --cwd` and `tree add` share this; #970)",
-    );
-
     /// #971 / #1038。unix ソケット target の決め打ちは #1038 で解消したが、Windows 実機は未実測
     pub const WIN_REMOTE_SERVE_UNIX: Note = Note::new(
         "#1038 で serve の中継先をループバック TCP へ変えたので、`unix socket serve target is not supported on Windows` で止まる原因は無くなった。ただし Windows 実機での通し（setup の 4 段目 → デーモン起動 → スマホからの接続）は未実測（#971）",
@@ -795,11 +789,9 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_open_dir",
         macos: Support::Supported,
-        windows: Support::Degraded {
-            note: notes::WIN_OPEN_DIR_VERBATIM,
-        },
+        windows: Support::Supported,
         windows_evidence: Evidence::Measured(
-            "#937 の Windows 11 実測: `tako open-in dir <path>` は新タブを作り `tako recent list` にも載るが、ペインの cwd が `///?/C:/…` になりそのタブの git 操作が全滅する（#970）",
+            "#970 の Windows 11 実測（同一バイナリの A/B）: `tako open-in dir <path>` で開いたペインの cwd が `C:\\Users\\…` になり、そのペインで `tako git log --pane N` が branches / commits を返す。`TAKO_970_LEGACY=1` では cwd が `\\\\?\\C:\\…` のまま `git リポジトリではない` で止まる",
         ),
     },
     Feature {

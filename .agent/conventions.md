@@ -181,6 +181,38 @@ CLI が**本物の tmux とは限らない**（Windows は winget の `marlocarl
   （版数文字列の判定を 2 か所に持たない）。attach / send-keys まで tmux 決め打ちの
   検証（セルフテスト 59〜62 / 68 / 73）だけがこの条件を使ってよい
 
+## `canonicalize` の結果を持ち回らない（Issue #970）
+
+`Path::canonicalize` は Windows で **verbatim 形式**（`\\?\C:\Users\…`）を返す。これは
+Win32 のパス正規化と `MAX_PATH` 制限を無効にする**入口指定**であって、他のプログラムへ
+渡したり画面へ出したりする形ではない。
+
+- **解決結果を保存する / 子プロセスへ渡す / 応答へ出すなら
+  `tako_core::platform::path::canonicalize`（境界 B26）を通す**。比較キーを作るだけなら
+  `canonicalize_or_self`（`unwrap_or_else(|_| path.clone())` の置き換え）を使う
+- 番犬テスト `canonicalizeの直呼びが境界の外に残っていない`
+  （`crates/tako-control/tests/platform_parity.rs`）が**ファイルごとの件数**で見張る。
+  トラバーサル判定（`remote_files` / `remote` のアップロード）と比較キー専用の解決、
+  テスト内の直呼びは表に理由つきで載っている。**増やすときは理由を書く**
+- **なぜ macOS では気づけないか**: unix の `canonicalize` は prefix を付けないので、
+  テストも含めて全部緑になる。Windows では `tako open-in dir <repo>` したタブの cwd が
+  シェル統合の `\` → `/` 置換で **`///?/C:/…`（実在しないパス）**になり、
+  `git rev-parse --show-toplevel` を回す `Command::current_dir` が起動に失敗して
+  **そのタブの git 操作が全滅**していた（`tako list` / `recent` / `pane_current_path` の
+  表示にも `\\?\` が漏れる）。git 自身は verbatim を扱えるので、壊れているのは
+  prefix そのものではなく**潰した後の形**
+- **剥がさない場合がある**: verbatim を外すと Win32 の正規化が復活するので、
+  意味が変わる形（`MAX_PATH` 超え / `/` を含む / `.` `..` や空の成分 / 末尾が `.` か
+  空白の成分 / `NUL` などの予約デバイス名 / ボリューム GUID 形）は verbatim のまま返す。
+  **剥がして別の場所を指すより、既知の不具合が残るほうが安全**という判断
+- 発信側（`shell-integration/tako.ps1` の `__takoStripVerbatim`）でも剥がす。シェルが
+  verbatim な作業ディレクトリを**継承する**経路が残るため: `Set-Location` は verbatim を
+  拒否する（FileSystem プロバイダが `Cannot find path` を返す = 実測）ので、入り口は
+  **`CreateProcess` へ渡る cwd だけ** — tako 自身が verbatim な cwd で起動された場合と、
+  #970 より前の版が保存した layout の cwd で開き直した場合。それを見られるのは OSC を出す
+  スクリプトだけ。ただし**入口の代わりにはならない**（prefix は cwd 以外にも漏れる）。
+  順序（置換より前に剥がす）は番犬 `osc7を組む前にverbatimを剥がしている` が固定する
+
 ## 一括 dismiss に食われないクリック要素の作り方（Issue #496 / #503）
 
 ルート div の `on_mouse_down` は `clear_text_input_focus()` を呼び、テキスト入力フラグと

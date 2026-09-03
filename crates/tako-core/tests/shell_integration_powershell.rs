@@ -77,6 +77,14 @@ impl Pane {
     /// `". 'path'"` の 1 語にすると Windows PowerShell 5.1 が引用符を取りこぼして
     /// ドットソースごと落ちる（実測。pwsh 7 は同じ渡し方でも通るので気づきにくい）
     fn new(program: &str, script: &Path) -> Self {
+        Self::new_in(program, script, std::env::temp_dir())
+    }
+
+    /// 起動 cwd を明示するペイン（#970 の検証用）。**verbatim な cwd は
+    /// `Set-Location` では作れない**（PowerShell の FileSystem プロバイダが
+    /// `Cannot find path` で拒否する = 実測）ので、`CreateProcess` へ渡す形でしか
+    /// 再現できない
+    fn new_in(program: &str, script: &Path, cwd: PathBuf) -> Self {
         let command = SpawnCommand {
             program: program.to_string(),
             args: vec![
@@ -93,7 +101,7 @@ impl Pane {
             40,
             SpawnOptions {
                 command: Some(command),
-                cwd: Some(std::env::temp_dir()),
+                cwd: Some(cwd),
                 env: vec![("TAKO_PANE_ID".into(), "1".into())],
             },
         )
@@ -299,6 +307,53 @@ fn pwsh7のペインでcwdが追従する() {
     };
     // 空白 + 日本語で percent エンコードの往復まで見る
     cwd_tracking(&program, &format!("tako si 作業 {}", std::process::id()));
+}
+
+/// **#970 の回帰**: 起動 cwd が verbatim でも OSC 7 の cwd が壊れないこと。
+///
+/// tako 自身は `canonicalize` の戻りから prefix を落とす（境界 B26 =
+/// `tako_core::platform::path`）。それでもシェルが verbatim な作業ディレクトリを
+/// **継承する**経路は残る（tako 自体が verbatim な cwd で起動された / #970 より前の版が
+/// 保存した layout の cwd で開き直した）。**`Set-Location` では作れない**（PowerShell の
+/// FileSystem プロバイダが `Cannot find path` で拒否する = 実測）ので、再現は
+/// `CreateProcess` へ渡す形に限られる。
+///
+/// 統合スクリプトが剥がさないと `\` → `/` の置換で `//?/C:/…` になり、OSC 7 を解いた
+/// cwd は `///?/C:/…`（実在しないパス）へ壊れる
+#[test]
+fn 起動cwdがverbatimでもoscのcwdが壊れない() {
+    let Some(program) = pwsh7() else {
+        eprintln!("skip: PowerShell 7 が無い");
+        return;
+    };
+    detach_own_console();
+    let script = write_script();
+    let plain = std::env::temp_dir().join(format!("tako 970 verbatim {}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&plain);
+    std::fs::create_dir_all(&plain).expect("起動 cwd を作れること");
+    let verbatim = PathBuf::from(format!(r"\\?\{}", plain.display()));
+
+    let mut pane = Pane::new_in(&program, &script, verbatim);
+    pane.wait_ready();
+
+    let reported = pane
+        .session
+        .cwd()
+        .map(Path::to_path_buf)
+        .expect("初期 cwd が報告されること");
+    let text = reported.display().to_string();
+    assert!(
+        !text.contains('?'),
+        "OSC 7 の cwd に verbatim の残骸が入っている: {text}\n{}",
+        pane.screen()
+    );
+    assert!(
+        same_dir(&reported, &plain),
+        "起動 cwd と報告された cwd が違う（報告={text} 期待={}）\n{}",
+        plain.display(),
+        pane.screen()
+    );
+    let _ = std::fs::remove_dir_all(&plain);
 }
 
 #[test]
