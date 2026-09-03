@@ -5312,11 +5312,14 @@ fn dispatch_sessions_link(
         .or_else(|| resolve_session_id_for_pane_via_pid(host, pane_id))
         .or_else(|| crate::sessions::resolve_session_for_pane(&pane_id.as_u64().to_string()));
     let link = crate::claude_remote_link::link_for_agent_session(agent, session_id.as_deref());
+    // #1077: 開けない理由に添える opt-in コマンドを具体形にする
+    // （PWA / CLI / MCP が同じ 1 実装から同じ値を得る）
+    let hint = crate::claude_remote_link::ProfileHint::from_role(&role);
     Ok(json!({
         "pane": pane_id.as_u64(),
         "agent": agent,
         "session_id_resolved": session_id,
-        "remote_link": link.to_json(),
+        "remote_link": link.to_json_with_profile(hint),
     }))
 }
 
@@ -10440,6 +10443,36 @@ fn dir_of(path: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
+/// ペインをそのまま SSH 化できるか（#1006 の `can_ssh_pane` を `list` に載せる。#1080）。
+///
+/// `{ "ok": true }` か `{ "ok": false, "reason": <slug>, "note": <日本語の理由 + 次の一手> }`。
+/// リモート UI（#1080）と AI は**この 1 箇所の答え**を読むので、
+/// 「メニューに出たのに実行すると断られる」食い違いが構造的に起きない
+fn can_ssh_json(host: &dyn ControlHost, pane: &Pane) -> Value {
+    let pane_id = pane.id();
+    let backend = host.backend_session(pane_id).is_some();
+    let session = host.session(pane_id);
+    // 引数を**その場で**組むのは番犬（remote_open_watchdog）に見せるため:
+    // 変数へ退避してから渡すと `is_alt_screen()` が呼び出し式から消え、
+    // 「器つきペインの外側 alt screen を渡していないか」の検査が素通りする
+    // （このヘルパを足したときに実際に素通りするのを A/B で確認した）
+    match tako_core::remote_open::can_ssh_pane(
+        session.is_some(),
+        // 器（tmux）つきペインの**外側** alt screen は常に true（tmux クライアント
+        // 自身が alt screen へ入る）ので中身を見る（#694 / #1006）
+        !backend && session.is_some_and(|s| s.is_alt_screen()),
+        session.map(|s| s.command_state()).unwrap_or_default(),
+        pane.role(),
+    ) {
+        Ok(()) => json!({ "ok": true }),
+        Err(block) => json!({
+            "ok": false,
+            "reason": block.as_str(),
+            "note": block.message(pane_id.as_u64()),
+        }),
+    }
+}
+
 /// ワークスペース全体の構造化スナップショット（FR-2.5.1〜2）。
 /// ツリー構造 + 単位矩形ジオメトリ + 各ペインの状態を返す
 fn list_json(host: &dyn ControlHost) -> Value {
@@ -10521,6 +10554,12 @@ fn list_json(host: &dyn ControlHost) -> Value {
                         "limit_autoresume": p.limit_autoresume(),
                         // SSH の接続待ち / 失敗（#1010。null = どちらでもない）
                         "ssh_connect": host.ssh_connect_state(p.id()),
+                        // このペインをそのまま SSH にできるか（#1006 の判定。#1080）。
+                        // **判定材料を集めるのはここ 1 箇所**にする: 器つきペインの
+                        // 外側 alt screen を渡してはいけない（#694 / #1006 の罠）といった
+                        // 事情を知っているのは実セッションを持つこの層だけで、
+                        // 応答を読むだけのリモート daemon（#1080）が再現すると必ずずれる
+                        "can_ssh": can_ssh_json(host, p),
                         "tmux_session": host.backend_session(p.id()),
                         "backend_windows": host.backend_windows(p.id()).map(|ws| ws.iter().map(|w| json!({
                             "index": w.index,
@@ -10806,6 +10845,35 @@ fn dispatch_tree_folder(
 ) -> Result<Value, DispatchError> {
     use std::path::PathBuf;
 
+    // #1079: 全タブのツリールート（各ペインの cwd + ピン留めフォルダ）。
+    // リモートのファイル API はこれを**認可の正**として使うので、サイドバーと同じ
+    // 1 実装（`tree_roots_of_tab`）を通す = 画面に出ていないフォルダが読めることは
+    // 構造的に起きない。タブ横断なので `resolve_tab` より前で処理する
+    if action == "roots" {
+        let tab_ids: Vec<TabId> = host.workspace().tabs().iter().map(|t| t.id()).collect();
+        let mut tabs: Vec<Value> = Vec::new();
+        for tid in tab_ids {
+            if let Some(tab_mut) = host.workspace_mut().get_tab_mut(tid) {
+                tab_mut.prune_dead_folders();
+            }
+            let title = host
+                .workspace()
+                .get_tab(tid)
+                .map(|t| t.title().to_string())
+                .unwrap_or_default();
+            let roots: Vec<String> = tree_roots_of_tab(host, tid)
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            tabs.push(json!({
+                "tab": tid.as_u64(),
+                "title": title,
+                "roots": roots,
+            }));
+        }
+        return Ok(json!({ "tabs": tabs }));
+    }
+
     let tab_id = resolve_tab(host.workspace(), tab, pane)?;
 
     match action {
@@ -10871,7 +10939,7 @@ fn dispatch_tree_folder(
             Ok(json!({ "folders": folders, "tab": tab_id.as_u64() }))
         }
         _ => Err(DispatchError::InvalidParams(format!(
-            "action は add / remove / list / git-status のいずれか（受け取った値: {action}）"
+            "action は add / remove / list / roots / git-status のいずれか（受け取った値: {action}）"
         ))),
     }
 }
@@ -18012,6 +18080,72 @@ mod tests {
         assert!(result["tab"].as_u64().is_some());
         assert!(result["pane"].as_u64().is_some());
         assert_eq!(result["target"], "tab");
+    }
+
+    #[test]
+    fn listにcan_sshが載り_open_remoteの可否と一致する() {
+        // #1080: リモート（スマホ）は判定材料（セッション・器・OSC 133・role）を
+        // 持たないので、`list` に載った答えをそのまま読む。**その答えが
+        // 実際の OpenRemote の可否と食い違わない**ことをここで縛る
+        // （食い違うと「メニューに出たのに押すと断られる」= 受け入れ条件 ③ が壊れる）
+        let mut host = MockHost::new();
+        let tab_id = host.workspace().active_tab_id();
+        let pane_id = host.workspace().get_tab(tab_id).unwrap().tree().focused();
+
+        // ① セッションが無いペイン（プレビュー相当）は理由つきで false
+        let list = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
+        let can = &list["tabs"][0]["panes"][0]["can_ssh"];
+        assert_eq!(can["ok"], false, "セッションが無ければ SSH 化できない");
+        assert_eq!(can["reason"], "no_session");
+        assert!(
+            can["note"].as_str().unwrap_or("").contains("target=split"),
+            "断るなら次の一手を必ず添える: {can}"
+        );
+        // 実際に呼んでも断られる（判定と実行が一致する）
+        assert!(
+            dispatch(
+                &mut host,
+                open_remote_req(
+                    Some(tako_core::remote_open::RemoteOpenTarget::Pane),
+                    Some(pane_id.as_u64()),
+                ),
+                PaneOrigin::Cli,
+            )
+            .is_err(),
+            "list が false と言ったなら実行も断られる"
+        );
+
+        // ② 素のシェルのセッションを張ると true になり、実行も通る
+        let (session, _rx) = TerminalSession::spawn(80, 24, SpawnOptions::default())
+            .expect("既定シェルの PTY を張れる");
+        host.sessions.insert(pane_id.as_u64(), session);
+        let list = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
+        assert_eq!(list["tabs"][0]["panes"][0]["can_ssh"]["ok"], true);
+        assert!(
+            list["tabs"][0]["panes"][0]["can_ssh"]["reason"].is_null(),
+            "通るときは理由を出さない"
+        );
+        assert!(dispatch(
+            &mut host,
+            open_remote_req(
+                Some(tako_core::remote_open::RemoteOpenTarget::Pane),
+                Some(pane_id.as_u64()),
+            ),
+            PaneOrigin::Cli,
+        )
+        .is_ok());
+
+        // ③ role が付く（AI エージェントのペイン）と false へ戻る
+        let ws = host.workspace_mut();
+        let tab = ws.get_tab_mut(tab_id).unwrap();
+        tab.tree_mut()
+            .get_mut(pane_id)
+            .unwrap()
+            .set_role(Some("orchestrator-worker:1".to_string()));
+        let list = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
+        let can = &list["tabs"][0]["panes"][0]["can_ssh"];
+        assert_eq!(can["ok"], false, "エージェントのペインは対象外");
+        assert_eq!(can["reason"], "agent_role");
     }
 
     #[test]

@@ -11,6 +11,8 @@
 import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
 import { createClient } from '../api';
 import { AgentIcon } from '../components/agent-icon';
+import { RemoteLinkRow, AccountChip } from '../components/remote-link';
+import { MasterLauncher } from '../components/master-launcher';
 
 const PREVIEW_LINES = 8;
 const PULL_THRESHOLD = 80;
@@ -214,6 +216,8 @@ function PaneCard({ pane, fallback, onOpen }) {
         )}
         {pane.model && <span class="card-chip">{pane.model}</span>}
         {label && <span class="card-chip card-chip-task">{label}</span>}
+        {/* #1077: 会話がどの tako アカウント配下か（スマホが別アカウントだと出ない） */}
+        <AccountChip link={pane.remote_link} />
       </div>
 
       {pane.permission_dialog && (
@@ -232,6 +236,9 @@ function PaneCard({ pane, fallback, onOpen }) {
       <div class="pane-card-preview">
         <PreviewBox pane={pane} fallback={fallback} />
       </div>
+
+      {/* #1077: Claude 公式へ送り出す（繋がっていなければ理由をたたんで出す） */}
+      <RemoteLinkRow link={pane.remote_link} />
 
       <div class="pane-card-footer">
         <span class="footer-meta">{pane.position ? `pane ${pane.position}` : ''}</span>
@@ -254,6 +261,8 @@ export function PanesPage({ me }) {
   const [pulling, setPulling] = useState(false);
   const [pullY, setPullY] = useState(0);
   const [filter, setFilter] = useState('all');
+  // #1078: master ランチャー（新しいタブ + master 起動）のボトムシート
+  const [launcher, setLauncher] = useState(false);
   const timerRef = useRef(null);
   const touchStartRef = useRef({ y: 0, scrollTop: 0 });
   const listRef = useRef(null);
@@ -343,13 +352,35 @@ export function PanesPage({ me }) {
             <span class="dot online" style="width: 7px; height: 7px;" />
             <span class="chip-name">{(me && me.host) || 'tako'}</span>
           </div>
-          <button
-            class={`refresh-btn${pulling ? ' spinning' : ''}`}
-            aria-label="更新"
-            onClick={() => { setPulling(true); refresh().then(() => setPulling(false)); }}
-          >
-            <RefreshIcon />
-          </button>
+          <div class="panes-header-actions">
+            {/* #1078: スマホから master を立てる。role が足りない端末でも入口は出し、
+                シートを開いた時点で理由を出す（隠すと「機能が無い」と誤解させる） */}
+            <button
+              class="launch-btn"
+              aria-label="master を起動"
+              onClick={() => setLauncher(true)}
+            >
+              <PlusIcon />
+              <span>master</span>
+            </button>
+            {/* #1079: ファイルビューへの導線 */}
+            <button
+              class="files-entry-btn"
+              aria-label="ファイル"
+              onClick={() => { window.location.hash = '#/files'; }}
+            >
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+              </svg>
+            </button>
+            <button
+              class={`refresh-btn${pulling ? ' spinning' : ''}`}
+              aria-label="更新"
+              onClick={() => { setPulling(true); refresh().then(() => setPulling(false)); }}
+            >
+              <RefreshIcon />
+            </button>
+          </div>
         </div>
         <div class="filter-row">
           {FILTERS.map(f => (
@@ -423,7 +454,23 @@ export function PanesPage({ me }) {
           ))}
         </div>
       )}
+
+      {launcher && (
+        <MasterLauncher
+          me={me}
+          onClose={() => setLauncher(false)}
+          onLaunched={() => refresh()}
+        />
+      )}
     </div>
+  );
+}
+
+function PlusIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M8 3.2v9.6M3.2 8h9.6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+    </svg>
   );
 }
 

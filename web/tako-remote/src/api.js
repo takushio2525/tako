@@ -75,8 +75,36 @@ export function createClient() {
     agents() {
       return request('GET', '/api/agents');
     },
+    // #1078: master を立てられるプロファイルの一覧（Observe で引ける）。
+    // 中身は `tako orchestrator profiles list` と同じ 1 実装が作る
+    masterProfiles() {
+      return request('GET', '/api/master/profiles');
+    },
+    // #1078: 新しいタブを作る（Manage role 必須）。cwd 未指定なら PC 側の既定
+    createTab(cwd) {
+      return request('POST', '/api/tabs', cwd ? { cwd } : {});
+    },
+    // #1078: そのタブで master を起動する（Manage role 必須）。
+    // 組み立て（プロファイル検証 / system prompt / 起動コマンド）は daemon 側が正
+    launchMaster(tabId, profile) {
+      return request('POST', `/api/tabs/${encodeURIComponent(tabId)}/master`, { profile });
+    },
     messages(sessionId, tail = 30) {
       return request('GET', `/api/sessions/${encodeURIComponent(sessionId)}/messages?tail=${tail}`);
+    },
+    // --- SSH の切り替え / 新規接続（#1080。role は manage）---
+    // ~/.ssh/config の Host 一覧。押せる先が無い端末には配らない（manage 必須）
+    sshHosts() {
+      return request('GET', '/api/ssh-hosts');
+    },
+    // このペインをそのまま SSH にする（#1006 の target=pane。pane ID は変わらない）。
+    // target を渡せばそのペインを分割元にして新しいペイン / タブへも開ける
+    sshPane(id, host, opts = {}) {
+      return request('POST', `/api/panes/${encodeURIComponent(id)}/ssh`, { host, ...opts });
+    },
+    // ペインを指定しない接続（既定 = いま開いているタブへ新ペイン = #1006 の既定）
+    sshOpen(host, opts = {}) {
+      return request('POST', '/api/ssh', { host, ...opts });
     },
     // リサイズ要求は存在しない: リモート表示は PC 側のペインサイズに一切影響しない（#63）
     wsUrl(paneId) {
