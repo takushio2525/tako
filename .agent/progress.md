@@ -4072,3 +4072,33 @@
   検出力は role を Observe へ落として**observe 端末が実際にタブを作れる**ことまで実測
 - 関連: PR #1088（`Refs #1077, #1078, #1059`）。**実機スマホは未検証**
 - 次: 実機での「タップ → Claude アプリ」確認。柱1 の残りは #1059 のエピック参照
+
+## 2026-09-03（#1093: 組織クレジット上限の見出しを検知できず自動復帰が発火しない問題を根治）
+- 症状は「解除後 1 時間以上 worker 3 体が止まったまま `supervisor.log` に記録ゼロ」。原因は
+  **停止判定の文言が `hit your usage limit` 決め打ち**で、実際の見出し
+  `You've hit your session limit · resets 7:50pm (Asia/Tokyo)` に 1 文字も当たらないこと。
+  **Issue の推定と違い解除時刻パースは無罪**（既存の `resets ` アンカーで 19:50 を正しく読む =
+  診断テストで実測）。壊れていたのは検知だけ
+- 直し方は 1 文言の追加ではなく**テンプレートを規則にした**: claude 2.1.258 のバイナリから
+  見出しの組み立て（`` `You've hit your ${限度の名前}${理由}` ``）と限度名の表（`nF` =
+  `session limit` / `weekly limit` / `Opus limit` / `Sonnet limit` / `Fable limit` /
+  `usage credit limit` + 各種 spend limit + `usage limit` / `limit`）を採り、
+  **すべて `limit` で終わる**ことを使って `hit your` の直後（句読点の手前）に `limit` が
+  在るかで判定する。版で名前が増えても追従する。正本は
+  `tako_core::limit_resume::is_limit_exhausted_line` の 1 箇所で、`detect_worker_error` と
+  ステータスバーの両方がここを通る（判定が散ると「復帰は動いたのにメーターは `--`」が再発する）
+- **ステータスバーの `--` も同時に解消**: 上限中はフッターが `5h NN%` を出さないので、
+  見出しから枠を読んで（`session limit` → 5h / `weekly` ・ `Opus` ・ `Sonnet` → 7d）
+  100% を埋める。**フッターに数値があれば実データが勝ち**、枠へ対応づけられない上限
+  （`usage credit limit` / spend limit）は `--` のまま（メーターに嘘を書かない）。
+  走査窓を別に持つ理由は実測の幾何（フッター 6 行 + 入力欄 3 行 + 空行 = 見出しは 10〜15 行上。
+  本体の 8 行窓では届かない）
+- 検証: fmt / clippy（両 feature）/ `cargo test --workspace` 全緑 / Windows クロスチェック
+  エラー 0・警告 12（**全件が未変更ファイル由来** = ベースライン同数）/ 隔離セルフテスト
+  `TAKO_APP_SELF_TEST_OK`（項目 111 に正例 ④ を新設 = 検知・解除時刻・**メーター 100%**・
+  解除前は撃たない・解除後の復帰・**`supervisor.log` への記録**を実測: `audit=0->1`)。
+  **検出力は `TAKO_1093_LEGACY=1` の A/B**（unit 7 本 + 項目 111 が FAILED / 旧文言の
+  回帰テスト 4 本は両アームで緑）
+- 範囲外として申し送り: `You're out of usage credits · resets …` / `Your org is out of usage`
+  は**別テンプレート**なので今回は受けていない（同じ穴が残る）。`paint_and_hold` の POSIX 経路は
+  本文を素の単引用符で囲むので fixture に `'` を入れられない（実バイトの fixture は unit 側が持つ）

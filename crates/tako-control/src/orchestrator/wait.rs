@@ -1240,20 +1240,16 @@ pub fn detect_worker_error(output: &str) -> Option<(WorkerErrorKind, String)> {
         }
     }
 
-    // 1. usage limit 到達（claude / codex）
-    //    - codex: 「■ You've hit your usage limit. ... try again at 4:24 AM.」
-    //    - claude: 「Claude usage limit reached. Your limit will reset at …」
-    //    - 「5-hour limit reached ∙ resets 3am」系は limit reached + reset の共起で拾う
-    //    - 「Claude Opus 4.6 limit reached, now using …」は自動モデル切替の告知で
-    //      worker は停止しないため除外する
+    // 1. usage limit 到達（claude / codex）。
+    //    **文言の正本は `tako_core::limit_resume::is_limit_exhausted_line`**（#1093）で、
+    //    ステータスバーのメーターも同じ規則を通る（判定が 2 か所へ散ると
+    //    「自動復帰は動いたのにメーターは `--`」のような食い違いが起きる）。
+    //    受ける形は claude の見出しテンプレート `You've hit your <名前>limit…`
+    //    （`session limit` / `weekly limit` / `Opus limit` / 支出上限 …）+ codex の
+    //    `You've hit your usage limit.` + 旧来の `usage limit reached` / `limit reached … reset`。
+    //    「… limit reached, now using …」は自動モデル切替の告知なので正本側で除外している
     for l in &lines {
-        if l.contains("limit reached, now using") {
-            continue;
-        }
-        if l.contains("hit your usage limit")
-            || l.contains("usage limit reached")
-            || (l.contains("limit reached") && l.contains("reset"))
-        {
+        if tako_core::limit_resume::is_limit_exhausted_line(l) {
             return Some((WorkerErrorKind::UsageLimit, l.trim().to_string()));
         }
     }
