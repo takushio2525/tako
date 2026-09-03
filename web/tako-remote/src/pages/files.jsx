@@ -361,6 +361,10 @@ function FileView({ file, root, path, onReload }) {
 
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(file.text || '');
+  // 画面に出している本文。保存できたらここを差し替える（読み直しの往復を省く）。
+  // **`file` を書き換えない**のが要点: prop を触ると下の useEffect の依存が動き、
+  // 保存できた直後に状態がリセットされて「保存しました」が一瞬で消える
+  const [shown, setShown] = useState(file.text || '');
   const [etag, setEtag] = useState(file.etag || '');
   const [busy, setBusy] = useState(false);
   // { ok: true, remote } / { ok: false, message, kind, pending }
@@ -368,16 +372,19 @@ function FileView({ file, root, path, onReload }) {
   const [pendingWrite, setPendingWrite] = useState(file.pending_write === true);
   const areaRef = useRef(null);
 
-  // 別のファイルへ移ったら下書きと結果を捨てる（前のファイルの内容を持ち回らない）
+  // 別のファイルへ移った / 読み直したら下書きと結果を捨てる
+  // （依存は**読み込んだ応答そのもの**。値ではなく識別で見るので、
+  //   自分の保存で状態が巻き戻らない）
   useEffect(() => {
     setEditing(false);
     setDraft(file.text || '');
+    setShown(file.text || '');
     setEtag(file.etag || '');
     setResult(null);
     setPendingWrite(file.pending_write === true);
-  }, [root, path, file.etag, file.pending_write]);
+  }, [root, path, file]);
 
-  const dirty = editing && draft !== (file.text || '');
+  const dirty = editing && draft !== shown;
 
   async function save() {
     setBusy(true);
@@ -392,9 +399,7 @@ function FileView({ file, root, path, onReload }) {
       setPendingWrite(false);
       setResult({ ok: true, remote: out.remote });
       setEditing(false);
-      // 画面の本文を保存後のものへ揃える（読み直しの往復を省く）
-      file.text = draft;
-      file.etag = out.etag || '';
+      setShown(draft);
     } catch (e) {
       setResult({ ok: false, message: e.message, kind: e.kind, pending: e.pending });
       if (e.pending) setPendingWrite(true);
@@ -436,10 +441,12 @@ function FileView({ file, root, path, onReload }) {
           </button>
         )}
         {/* daemon が Content-Disposition: attachment を付けるので、
-            素の遷移で iOS / Android とも保存シートが開く */}
-        <a class="btn btn-primary file-download" href={downloadUrl}>
+            素の遷移で iOS / Android とも保存シートが開く。
+            **編集モードの「保存」（PC へ書き戻す）と言い分ける**ため、
+            こちらは「端末に保存」= 手元へ落とす操作だと分かる語にしてある */}
+        <a class="btn file-download" href={downloadUrl}>
           <DownloadIcon />
-          保存
+          端末に保存
         </a>
       </div>
 
@@ -503,7 +510,7 @@ function FileView({ file, root, path, onReload }) {
             <button
               class="btn"
               disabled={busy}
-              onClick={() => { setDraft(file.text || ''); setEditing(false); setResult(null); }}
+              onClick={() => { setDraft(shown); setEditing(false); setResult(null); }}
             >
               取り消す
             </button>
@@ -513,7 +520,7 @@ function FileView({ file, root, path, onReload }) {
           </div>
         </>
       ) : (
-        <pre class="file-preview">{file.text}</pre>
+        <pre class="file-preview">{shown}</pre>
       )}
     </>
   );

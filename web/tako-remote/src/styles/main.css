@@ -1205,13 +1205,18 @@ body {
 
 .file-edit-btn { flex: none; padding: 11px 16px; min-height: 44px; }
 
-/* 本文の編集欄。プレビューと同じ字面にして「見ていたものを直している」感を保つ */
+/* 本文の編集欄。字面はプレビューと同じにして「見ていたものを直している」感を保つが、
+   **編集中だと分かる印**は付ける（枠と左のアクセント。付けないと読み取り表示と
+   見分けが付かず、スマホでは「触れるのか」が分からない） */
 .file-editor {
   flex: 1; width: 100%; box-sizing: border-box; resize: none;
   margin: 0; padding: 14px 16px;
-  border: none; outline: none;
+  border: none; border-top: 1px solid var(--line);
+  border-left: 3px solid var(--green);
+  outline: none;
   font-family: var(--mono); font-size: 12.5px; line-height: 1.65;
-  color: var(--t-fg); background: var(--t-bg);
+  color: var(--t-fg); background: var(--panel);
+  caret-color: var(--green);
   tab-size: 4; -webkit-overflow-scrolling: touch;
 }
 
