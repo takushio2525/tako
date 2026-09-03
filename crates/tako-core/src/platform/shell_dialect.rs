@@ -242,6 +242,19 @@ impl ShellDialect {
         }
     }
 
+    /// 現在のディレクトリを**そのまま 1 行**で出力する（#935）。
+    ///
+    /// PowerShell の `pwd` は `Get-Location` のエイリアスで、返るのは文字列ではなく
+    /// `PathInfo` オブジェクトなので**表として整形され、パスがコンソール幅で切られる**
+    /// （実機実測: 15 バイトのはずのパスが表のヘッダ付きで途中まで出た）。
+    /// `$PWD.Path` を `Write-Host` で出せば素の 1 行になる
+    pub fn print_cwd(self) -> String {
+        match self {
+            Self::Posix => "pwd".to_string(),
+            Self::PowerShell => "Write-Host $PWD.Path".to_string(),
+        }
+    }
+
     /// ディレクトリ移動（両方 `cd` で通るが、意図を境界に持たせておく）
     pub fn cd(self, path: &str) -> String {
         match self {
@@ -800,6 +813,18 @@ mod tests {
             PS.mkdir_and_cd("C:\\Temp\\tako-osc-e2e"),
             "New-Item -ItemType Directory -Force -Path 'C:\\Temp\\tako-osc-e2e' | Out-Null; \
              Set-Location 'C:\\Temp\\tako-osc-e2e'"
+        );
+    }
+
+    /// 現在のディレクトリの出力（#935）。PowerShell は `pwd` のエイリアスを使わない
+    /// （`Get-Location` は表として整形され、パスがコンソール幅で切られる = 実機実測）
+    #[test]
+    fn 現在のディレクトリを1行で出す() {
+        assert_eq!(POSIX.print_cwd(), "pwd");
+        assert_eq!(PS.print_cwd(), "Write-Host $PWD.Path");
+        assert!(
+            !PS.print_cwd().split_whitespace().any(|w| w == "pwd"),
+            "PowerShell 側が pwd エイリアスへ戻っている"
         );
     }
 
