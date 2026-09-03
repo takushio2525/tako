@@ -16,8 +16,8 @@ tako platform --status pending      # まだ使えないものだけ
 
 | 状態 | 件数 | 意味 |
 | --- | --- | --- |
-| 対応 | 113 / 144（78%） | macOS と同じように使えます |
-| 一部対応 | 13 | 使えますが機能が落ちます。落ち方は各表の「差分」列 |
+| 対応 | 114 / 144（79%） | macOS と同じように使えます |
+| 一部対応 | 12 | 使えますが機能が落ちます。落ち方は各表の「差分」列 |
 | 未実測 | 1 | 実装はあり macOS と同じ経路を通るが、Windows 実機でまだ動かしていないもの |
 | 未対応 | 15 | Windows 側の実装が無い、または動かないことが分かっているもの |
 | 対象外 | 2 | Windows にその概念が無い、または OS が同等機能を標準で持つ |
@@ -119,7 +119,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 
 ## AI 連携（オーケストレーション）
 
-対応 25・一部対応 2
+対応 26・一部対応 1
 
 | 機能 | 状態 | 差分 | 根拠 |
 | --- | --- | --- | --- |
@@ -144,8 +144,8 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 | `tako_limit_service` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako limit-service` が現在サービスを返し、claude → codex → claude の切替が反映される |
 | `tako_sessions` | 対応 | — | 実機実測: #877 で実機の session_id 解決（resolve_session_id_for_backend -> Some）を実測 + sessions の単体 14 本が実機で緑。resume のペイン起動そのものは未実測だが、経路は #867 で実機実測済みの launch と同じ |
 | `tako_session_restart` | 一部対応 | 引き継ぎ再起動は使えるが、ハーネス更新（会話を保ったまま CLI を建て直す）はプロセスの終了要求が Windows 未対応のため使えない（#1067 / 境界 B5） | OS の仕様: tako_control::platform::process::terminate の Windows 実装は「プロセスの停止は Windows では未対応です」を返す（B5 の制御側が未実装）。handoff は queue_prompt_flow だけを使うので影響を受けない |
-| `tako_task_gate` | 対応 | — | 実機テスト: acceptance_gates のゲート登録テストが実機で緑（落ちているのは execute_command の 5 件だけ） |
-| `tako_task_gate_check` | 一部対応 | ゲートの登録と表示は動くが、コマンド型ゲートの実行が sh -c 決め打ちのため Windows では判定できない（#935） | 実機テスト: 実機の cargo test で execute_command 系 5 件が失敗（sh 不在）。PR / custom ゲートの判定は動く |
+| `tako_task_gate` | 対応 | — | 実機テスト: acceptance_gates の 14 テストが実機で緑（#935 でコマンド型述語の実行も通るようになった） |
+| `tako_task_gate_check` | 対応 | — | 実機実測: #935 の Windows 11 実測: `tako task gate check` が 4 形（exit 0 / exit 1 / cwd 指定 / 出力取得）とも判定し、`cmd /c exit 7` は evidence が `exit 7`（値が丸まらない）・非 ASCII の出力も化けない。`TAKO_935_LEGACY=1` では 4 形すべてが「コマンド実行に失敗: program not found」 |
 | `tako_task_gate_show` | 対応 | — | 実機テスト: acceptance_gates の表示テストが実機で緑 |
 | `tako_task_checkpoint` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako task checkpoint --task-id … --phase running` が保存され、`tako task update --phase verifying` が反映される |
 | `tako_task_list` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako task list --json` が保存したチェックポイントを issue / branch / project / prompt_head / phase つきで返す |
