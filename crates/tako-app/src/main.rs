@@ -53080,6 +53080,116 @@ mod self_test {
                     "111: 接近の警告 / 情報では自動復帰が発動しない (#1096)",
                 );
 
+                // --- 正例 ⑥ 時間では解けない利用阻害（#1106） ---
+                // claude 2.1.258 の阻害の前置き（`dCt` / `pCt` / `Par`）のうち、#1096 が
+                // 受けた「時間で解けるぶん」を除いた残り = 座席種別・管理者による無効化・
+                // グループ枠 $0・クレジット要求・追加利用ぶんの枯渇・組織でのサービス無効。
+                // #1106 前はどの規則にも当たらず `detect_worker_error` が None を返し、
+                // **止まっているのに idle = 作業完了に見えていた**（しかも待っても直らない
+                // ので人が気づくまで永久に止まったまま）。
+                //
+                // fixture は**アポストロフィを含まない実文言**を選んである（`paint_and_hold`
+                // の POSIX 経路は本文を素の単引用符で囲む。正例 ③〜⑤ と同じ理由）。
+                // 8 文言すべてのバイト等価な固定は `limit_resume.rs` / `wait.rs` /
+                // `limit_stop.rs` の単体テストが持つので、ここで見たいのは
+                // 「実ペイン → 別種として検知 → 自動復帰は撃たない → メーターは `--`」の通し
+                let entitlement_line = "Your usage allocation has been disabled by your admin";
+                let entitlement_body = format!("{filler813}実装を進めます\n  {entitlement_line}\n");
+                let Some(ent_pane) = make_fixture_pane(cx, &entitlement_body).await else {
+                    fail("#1106: 利用阻害ペインの作成")
+                };
+                if !wait_screen(cx, ent_pane, "usage allocation has been disabled").await {
+                    fail("#1106: 利用阻害 fixture が画面に出ない");
+                }
+                settle813(cx, ent_pane).await;
+                let _ = set_enabled(cx, ent_pane, true);
+                // 実ペインの画面から種別を解決する（worker_status / watch が通るのと同じ関数）
+                let classify = |cx: &mut AsyncApp, pane: PaneId| -> Option<(String, String, String)> {
+                    window
+                        .update(cx, |app, _, _| {
+                            let lines = app.terminals.get(&pane)?.visible_lines();
+                            tako_control::orchestrator::wait::detect_worker_error(&lines.join("\n"))
+                                .map(|(k, detail)| {
+                                    (
+                                        k.as_str().to_string(),
+                                        k.recommended_action().to_string(),
+                                        detail,
+                                    )
+                                })
+                        })
+                        .ok()
+                        .flatten()
+                };
+                let ent_class = classify(cx, ent_pane);
+                let (sent_ent, kind_ent, _) = drive(cx, ent_pane);
+                println!(
+                    "TAKO_SELF_TEST_1106_DETECT: class={ent_class:?} limit_kind={kind_ent:?} \
+                     sent={} state=({})",
+                    sent_ent.len(),
+                    state813(cx, ent_pane),
+                );
+                check(
+                    ent_class.as_ref().map(|c| c.0.as_str()) == Some("entitlement_blocked"),
+                    "111: 時間で解けない阻害を entitlement_blocked として検知する (#1106)",
+                );
+                check(
+                    ent_class.as_ref().map(|c| c.1.as_str()) == Some("needs_human"),
+                    "111: 推奨アクションが needs_human（wait_reset ではない） (#1106)",
+                );
+                check(
+                    ent_class
+                        .as_ref()
+                        .is_some_and(|c| c.2.contains(entitlement_line)),
+                    "111: detail に実文言が入る（そのままユーザーへ見せられる） (#1106)",
+                );
+                // 自動復帰（#813）は発動しない。**解除時刻へ寄せても**撃たない
+                // （追跡そのものが作られない = `is_limit_exhausted_line` に混ざっていない）
+                backdate(cx, ent_pane);
+                let (sent_ent_after, kind_ent_after, attempts_ent) = drive(cx, ent_pane);
+                println!(
+                    "TAKO_SELF_TEST_1106_NO_RESUME: kind={kind_ent_after:?} sent={} attempts={}",
+                    sent_ent_after.len(),
+                    attempts_ent
+                );
+                check(
+                    sent_ent.is_empty()
+                        && kind_ent.is_none()
+                        && sent_ent_after.is_empty()
+                        && kind_ent_after.is_none()
+                        && attempts_ent == 0,
+                    "111: 時間で解けない阻害では自動復帰が発動しない (#1106)",
+                );
+                // 枠の使用率とは無関係なのでメーターは `--` のまま
+                let meter1106 = window
+                    .update(cx, |app, _, _| {
+                        app.terminals
+                            .get(&ent_pane)
+                            .and_then(|s| s.agent_metrics())
+                            .map(|m| (m.limit_5h, m.limit_week))
+                    })
+                    .ok()
+                    .flatten();
+                println!("TAKO_SELF_TEST_1106_METER: pane={meter1106:?}");
+                check(
+                    meter1106.is_none_or(|(h, w)| h.is_none() && w.is_none()),
+                    "111: 利用阻害ではステータスバーのメーターを埋めない (#1106)",
+                );
+                // --- 負例 ⑤ 時間で解ける上限は従来どおり usage_limit（#1106 の対照） ---
+                // 同じ関数・同じ実ペイン経路で種別が分かれること。ここが
+                // entitlement_blocked へ倒れると #1093 / #1096 の自動復帰が丸ごと死ぬ
+                let class_session = classify(cx, session_pane);
+                let class_credits = classify(cx, credits_pane);
+                println!(
+                    "TAKO_SELF_TEST_1106_CONTRAST: session={class_session:?} \
+                     credits={class_credits:?}"
+                );
+                check(
+                    class_session.as_ref().map(|c| c.0.as_str()) == Some("usage_limit")
+                        && class_session.as_ref().map(|c| c.1.as_str()) == Some("wait_reset")
+                        && class_credits.as_ref().map(|c| c.0.as_str()) == Some("usage_limit"),
+                    "111: 時間で解ける上限は従来どおり usage_limit / wait_reset (#1106)",
+                );
+
                 // --- 負例 ② permission ダイアログでは発動しない ---
                 let perm_body = format!(
                     "{filler813}   Bash command\n   npm test\n   \
@@ -53173,10 +53283,12 @@ mod self_test {
                 println!("TAKO_SELF_TEST_813_PERSIST: {persisted:?}");
                 check(
                     // 有効にしたのは idle / dialog / codex / session / credits / warn /
-                    // permission / api の 8 ペインだけ（codex = #985、session = #1093、
-                    // credits と warn = #1096 で追加）。OFF のペインはフィールドごと
-                    // 出ない（旧 tako でも読める JSON を保つ）
-                    persisted == Some((8, 8)),
+                    // ent / permission / api の 9 ペインだけ（codex = #985、
+                    // session = #1093、credits と warn = #1096、ent = #1106 で追加。
+                    // ent は**オプトイン ON でも自動復帰が発動しない**ことを見るために
+                    // 有効化してある）。OFF のペインはフィールドごと出ない
+                    // （旧 tako でも読める JSON を保つ）
+                    persisted == Some((9, 9)),
                     "111: 有効にしたペインだけが保存表現へ載る (#813)",
                 );
 

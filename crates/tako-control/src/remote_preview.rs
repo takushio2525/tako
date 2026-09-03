@@ -401,6 +401,19 @@ mod tests {
     }
 
     #[test]
+    fn issue1106_時間で解けない阻害もerrorとして種別つきで返る() {
+        // リモート（PWA）のペイン一覧も同じ関数を通る。ここで idle に落ちると
+        // スマホ側でも「作業完了」に見える（#1106 の実害がそのまま出る）
+        let screen = "  ⎿  Your usage allocation has been disabled by your admin\n❯ ";
+        let (activity, err) = agent_activity(screen, false);
+        assert_eq!(activity, Activity::Error);
+        let (kind, detail) = err.expect("種別が付くこと");
+        assert_eq!(kind.as_str(), "entitlement_blocked");
+        assert_eq!(kind.recommended_action(), "needs_human");
+        assert!(detail.contains("usage allocation has been disabled"));
+    }
+
+    #[test]
     fn 作業中の画面はエラー判定にかけない() {
         // busy 中の detect_worker_error はツール実行ログへ誤検知する契約
         let screen = format!("{CLAUDE_BUSY}\nClaude usage limit reached. reset at 3am");
