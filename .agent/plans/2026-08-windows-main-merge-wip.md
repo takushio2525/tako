@@ -3699,6 +3699,57 @@ SFTP の読み書き #966）で、直すには「#65 のソケット共有を Wi
 skip の行に `script` のパスを出したので後から言い分けられるが、根治するなら #889 の
 `integration_shell_command` を 41 にも使って**専用ペインで閉じる**のが筋 → **#1091** へ起票。
 
+### 実機テストスイート（`cargo test --workspace --no-fail-fast`。head `1d8a5b0`）
+
+**どのクレートも増えていない**（TEST_EXITCODE=101 = 既知失敗があるので非ゼロ）:
+
+| スイート | 2026-09-02 のベースライン | このブランチ |
+|---|---|---|
+| tako-app (bin) | 528 / 0 | **534** / 0 |
+| tako-cli (lib) | 58 / 0 | 58 / 0 |
+| tako-core (lib) | 1266 / **14 failed** | 1314 / **13 failed** |
+| tako-control (lib) | 1048 / **10 failed** | 1068 / **10 failed** |
+| `remote_fs_e2e` | 0 / **1 failed**（#930） | 0 / **1 failed** |
+| その他（platform_parity / psmux_backend / shell_integration_powershell 等） | 0 failed | 0 failed |
+
+**2026-09-02 のベースラインは件数だけで名前を残していない**ので厳密な集合差は取れない。
+以後のために**失敗名の一覧をここへ残す**（24 件。内訳は POSIX 前提のテスト = symlink /
+mode ビット / `~` 展開 / `links` の絶対パス / `shell_profile`、と既知の製品縮退 =
+`acceptance_gates`（#935）/ `stale_binary` / `remote` / `bundle_install`（macOS 専用）/
+`remote_fs_e2e`（#930））:
+
+```
+acceptance_gates::tests::execute_command_true_false
+acceptance_gates::tests::execute_command_with_cwd
+acceptance_gates::tests::execute_command_with_output
+acceptance_gates::tests::gate_check_skips_custom
+acceptance_gates::tests::gate_check_with_command
+config_share::env::tests::リポジトリ配下の実体も外部管理として検出する
+dispatch::tests::tree_folder_symlink経由でも削除できる
+dispatch::tests::tree_folder_symlink経由の重複追加は1エントリに畳まれる
+dispatch::tests::tree_folder_追加と一覧と削除
+git_tree::tests::一覧は起点の配下だけを返して綴りを二重に出さない
+links::tests::cwd不明でも絶対パスとホーム起点は検出する
+links::tests::detect_absolute_path
+links::tests::tuiの装飾付きsoft_wrapをまたぐパスを検出する
+orchestrator::tests::resolved_env_expands_tilde
+platform::bundle_install::tests::既存を差し替えても置き場のパスは空にならない
+platform::bundle_install::tests::標準的でないバンドルはバンドルごと入れ替える
+remote::tests::is_process_aliveは現在のプロセスをtrueで返す
+shell_profile::tests::path判定は完全一致で行う
+shell_profile::tests::既にpathにあるならファイルを触らない
+stale_binary::tests::test_pidpath_self
+stale_binary::tests::ランチャ探索は実行可能な通常ファイルだけを拾う
+tab::tests::pinned_folder_symlink経由でも削除できる
+tab::tests::pinned_folder_symlink経由の重複は畳まれる
+解決できないホストは接続前に分類される
+```
+
+**この PR が足したテストは実機でも緑**（`diag::tests::この環境では混み具合が採れる` =
+Windows で `load` が採れることを実機が保証する / `file_uri` 2 本 / `osc_tap` 1 本 /
+番犬 4 本）。tako-core の failed が 14 → 13 に減っているが、passed も 1266 → 1314 と
+増えている（main が 9/2 から進んでいる）ので**この PR に帰せられる差ではない**。
+
 ### macOS 側で観測した #1062 のフレーク（この変更とは無関係）
 
 同じバイナリ・同じレシピで 2 本取ったところ、1 本目だけ項目 137 (d)（#1040）で落ちた:
