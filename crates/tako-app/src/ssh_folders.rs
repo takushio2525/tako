@@ -445,7 +445,7 @@ impl TakoApp {
     /// ツリーに出ているリモートホストの接続を見て、復帰待ちを進める（#1040）。
     ///
     /// 戻り値は**これから background で繋ぎ直しに行くホスト**。
-    /// 判定材料は `master_alive`（= ソケットの stat 1 回）だけなので、
+    /// 判定材料は `remote_fs::liveness`（= ソケットの stat 1 回）だけなので、
     /// 平常時はホスト数ぶんの stat しか起きない
     pub(crate) fn drive_remote_recovery(&mut self) -> Vec<String> {
         let mut hosts: Vec<String> = Vec::new();
@@ -462,13 +462,22 @@ impl TakoApp {
         let mut jobs: Vec<String> = Vec::new();
         let mut restored: Vec<String> = Vec::new();
         for host in hosts {
-            let alive = tako_core::remote_fs::master_alive(&host);
-            if alive {
-                // 待っていたものが戻った（ペインの再接続で戻る場合もここを通る）
-                if self.remote_recovery.remove(&host).is_some() {
-                    restored.push(host);
+            match tako_core::remote_fs::liveness(&host) {
+                tako_core::remote_fs::Liveness::Live => {
+                    // 待っていたものが戻った（ペインの再接続で戻る場合もここを通る）
+                    if self.remote_recovery.remove(&host).is_some() {
+                        restored.push(host);
+                    }
+                    continue;
                 }
-                continue;
+                // #1090: 多重化が無いプラットフォームには「生きている接続」が無いので
+                // 生死を判定できない。**切断と決めつけて繋ぎ直しに行かない**
+                // （行くと平常時に延々と probe を撃ち続ける）
+                tako_core::remote_fs::Liveness::Unknown => {
+                    self.remote_recovery.remove(&host);
+                    continue;
+                }
+                tako_core::remote_fs::Liveness::Dead => {}
             }
             let entry = self
                 .remote_recovery

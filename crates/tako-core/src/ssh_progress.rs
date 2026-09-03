@@ -83,14 +83,27 @@ pub struct ConnectInputs<'a> {
     pub screen_changed: bool,
     /// tako が印字したものしか載っていないペインか（`split` / `tab` = true）
     pub fresh_pane: bool,
+    /// tako がこのペインへ印字した文面（[`crate::remote_fs::pane_prints`]）。
+    ///
+    /// **折り返しの続き行を見分けるために要る**（#1090）。物理行は端末幅で折り返され、
+    /// `tako: ` の前置きは**先頭行にしか付かない**ので、行の頭だけを見る
+    /// [`is_tako_line`] では続き行が tako のものだと分からない。すると規則 ④
+    /// （まっさらなペイン + tako 以外の行 = ssh が何か言った）が**バナーの続き行**で
+    /// 当たり、繋がっていないのに `Opened` になる（実測: 44 桁のペインで日本語の
+    /// バナーが 2 行へ折り返され、#1040 の自動再接続まで armed になった）
+    pub tako_prints: &'a [String],
 }
 
 /// tako が [`crate::remote_fs::ssh_pane_script`] で印字する行の頭。
 /// 日英どちらの文面でも共通なので、これで「tako の行」を言語に依らず見分けられる
 pub const TAKO_LINE_PREFIX: &str = "tako: ";
 
-/// スクリプトが出す失敗行に必ず入る文字列（日英どちらの文面にも入っている）
-pub const SCRIPT_FAILURE_MARK: &str = "ssh exit 255";
+/// スクリプトが出す失敗行に必ず入る文字列（日英どちらの文面にも入っている）。
+///
+/// #1090 で文面が**実際の終了コード**を載せる形になったので、末尾の数字は含めない
+/// （`ssh exit 255` / `ssh exit -1` のどちらも拾う。古いペインが印字する
+/// `ssh exit 255` もそのまま前方一致で拾えるので、世代をまたいでも壊れない）
+pub const SCRIPT_FAILURE_MARK: &str = "ssh exit ";
 
 /// ssh 自身が出す失敗行の見分け。**OpenSSH が印字する英語のまま**並べる
 /// （ssh の出力はロケールに依らない）。ここに無い理由でも、スクリプト経路なら
@@ -111,6 +124,12 @@ const SSH_ERROR_PATTERNS: &[&str] = &[
     "REMOTE HOST IDENTIFICATION HAS CHANGED",
     "Bad configuration option",
     "Bad owner or permissions",
+    // #1090: Windows の OpenSSH に ControlMaster を渡すと接続の前にこれで落ちる。
+    // exit も 255 ではない（`-1`）ので、**行を見分けられないと失敗が畳まれる**
+    "getsockname failed",
+    // 握手の途中で相手との読み書きが壊れた（上と同時に出るほか、
+    // 接続が張れずに終わったときにも出る）
+    "Read from remote host",
 ];
 
 /// 相手が入力を待っている行の見分け（小文字化して比べる）。
@@ -134,6 +153,18 @@ fn is_tako_line(line: &str) -> bool {
     line.trim_start().starts_with(TAKO_LINE_PREFIX)
 }
 
+/// tako が印字した文面の**一部**か（= 折り返しの続き行。#1090）。
+///
+/// 物理行は論理行の連続した切れ端なので、tako の文面の**部分文字列**かどうかで見分く。
+/// 1 文字の切れ端はどんな文面にも当たってしまうので下限を置く
+fn is_tako_fragment(line: &str, prints: &[String]) -> bool {
+    let t = line.trim();
+    t.chars().count() >= MIN_FRAGMENT_CHARS && prints.iter().any(|p| p.contains(t))
+}
+
+/// 続き行と見なす最短の長さ（これ未満は偶然一致しうるので見ない）
+const MIN_FRAGMENT_CHARS: usize = 2;
+
 /// 判定（詳細はモジュール doc）
 pub fn classify(inputs: &ConnectInputs) -> ConnectPhase {
     // 「tako 以外が書いた中身のある行」だけを見る
@@ -146,37 +177,64 @@ pub fn classify(inputs: &ConnectInputs) -> ConnectPhase {
         // ① tako のスクリプトが出した失敗行 = ssh が exit 255 で落ちた。
         //    理由は**その直前の行**（スクリプトの文面がそう言っている）
         if trimmed.contains(SCRIPT_FAILURE_MARK) {
+            // #1090: **ssh が出した失敗行を優先して拾う**。素の「直前の非空行」だと、
+            // 端末幅で折り返された理由の**尻尾**（`…\202\305\202\267\201B` のような
+            // 途中の切れ端）が理由として出てしまう（実測: 44 桁のペイン）。
+            // 見分けられなければ従来どおり直前の非空行へ落ちる
             let reason = interesting
                 .iter()
-                .rev()
-                .find(|l| !l.trim().is_empty())
+                .find(|l| is_ssh_error_line(l))
+                .or_else(|| interesting.iter().rev().find(|l| !l.trim().is_empty()))
                 .map(|l| l.trim().to_string());
             return ConnectPhase::Failed { reason };
         }
-        if is_tako_line(trimmed) {
+        if is_tako_line(trimmed) || is_tako_fragment(trimmed, inputs.tako_prints) {
             continue;
         }
         interesting.push(trimmed);
     }
 
+    // #1090: **折り返しで割れたパターンを繋いでから**見る。物理行は端末幅で切られる
+    // ので、狭いペインでは `ssh: Could not resolve hostname` のような目印が 2 行へ
+    // 割れて per-line の `contains` では当たらない。しかも tako がバナーを印字した
+    // 直後の行は「バナーの尻尾 + ssh の出力」が**同じ物理行に載る**（実測）ため、
+    // 残り幅ぶんしか目印が入らず必ず切れる。
+    //
+    // 当たらないと規則 ④（まっさら + tako 以外の行 = ssh が何か言った）へ落ちて
+    // `Opened` になり、繋がっていないのに #1040 の自動再接続まで armed になる
+    // （Windows 実機の 44 桁のペインで実測）。
+    //
+    // 連結は「tako 以外の行」だけなので、あいだに tako の行が挟まると本来隣り合って
+    // いない文字列が繋がる。目印はどれも具体的な英文なので偶然の一致は実質起きない
+    let joined: String = interesting.concat();
+
     // ② ssh 自身の失敗行（`pane` 経路にはスクリプトが無いのでこちらで拾う）
-    for line in &interesting {
-        if is_ssh_error_line(line) {
-            return ConnectPhase::Failed {
-                reason: Some(line.trim().to_string()),
-            };
-        }
+    if SSH_ERROR_PATTERNS.iter().any(|p| joined.contains(p)) {
+        // 理由は目印を含む行（割れていれば ssh の出力が始まった行）を出す
+        let reason = interesting
+            .iter()
+            .find(|l| is_ssh_error_line(l))
+            .or(interesting.first())
+            .map(|l| l.trim().to_string());
+        return ConnectPhase::Failed { reason };
     }
 
     // ③ 入力待ち = もう黙っていない
-    for line in &interesting {
-        let lower = line.to_lowercase();
+    {
+        let lower = joined.to_lowercase();
         if PROMPT_PATTERNS.iter().any(|p| lower.contains(p)) {
             return ConnectPhase::Opened;
         }
     }
 
-    // ④ まっさらなペインなら「tako 以外の行が出た」だけで十分
+    // ④ まっさらなペインなら「tako 以外の行が出た」だけで十分。
+    //
+    //    **これは「沈黙が破れた」以上のことを言っていない**（#1090）。器（psmux / tmux）
+    //    つきのペインでは器と下のシェルも描くので、ここで `Opened` になったからといって
+    //    「接続が成立した」証拠にはならない。#1040 の自動再接続が要求する
+    //    「一度でも繋がった」の判定にこれを使ってはいけない（呼び出し側の責任。
+    //    実測: バナーが出る前の 1 行で armed になり、繋がったことが一度も無いホストへ
+    //    ssh を打ち直していた）
     if inputs.fresh_pane && !interesting.is_empty() {
         return ConnectPhase::Opened;
     }
@@ -240,13 +298,20 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    /// テスト用の既定（`tako_prints` は「win 宛のバナー」= 実際に印字される文面）
     fn inputs<'a>(new_lines: &'a [String], fresh: bool) -> ConnectInputs<'a> {
         ConnectInputs {
             new_lines,
             master_socket: false,
             screen_changed: false,
             fresh_pane: fresh,
+            tako_prints: prints(),
         }
+    }
+
+    fn prints() -> &'static [String] {
+        static P: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        P.get_or_init(|| crate::remote_fs::pane_prints("win"))
     }
 
     #[test]
@@ -371,6 +436,160 @@ mod tests {
             classify(&inputs(&l, true)),
             ConnectPhase::Failed { reason: None }
         );
+    }
+
+    /// #1090: 実機で観測した「繋がったペインの画面」でちゃんと畳むか
+    /// （Windows OpenSSH のログインシェルが出すバナー）
+    #[test]
+    fn 実機の接続成功画面で畳む() {
+        let l = lines(&[
+            "tako: tako1090 へ接続しています…（中止は Ctrl+C）",
+            "Windows PowerShell",
+            "Copyright (C) Microsoft Corporation. All rights reserved.",
+            "",
+            "PS C:\\Users\\winuser>",
+        ]);
+        let mut i = inputs(&l, true);
+        i.tako_prints = std::slice::from_ref(Box::leak(Box::new(
+            "tako: tako1090 へ接続しています…（中止は Ctrl+C）".to_string(),
+        )));
+        assert_eq!(classify(&i), ConnectPhase::Opened);
+        // バナーが流れて消えたあとも同じ
+        let l2 = lines(&[
+            "Windows PowerShell",
+            "Copyright (C) Microsoft Corporation. All rights reserved.",
+            "",
+            "PS C:\\Users\\winuser>",
+        ]);
+        let mut i2 = inputs(&l2, true);
+        i2.tako_prints = i.tako_prints;
+        assert_eq!(classify(&i2), ConnectPhase::Opened);
+    }
+
+    /// #1090: 規則 ④ は「沈黙が破れた」しか言っていない。
+    ///
+    /// 器（psmux / tmux）や下のシェルが先に描いた行でもここは `Opened` を返す。
+    /// **だからこれを「接続が成立した」証拠に使ってはいけない**
+    /// （#1040 の `ever_connected` は呼び出し側が別の材料で決める）
+    #[test]
+    fn 規則4は沈黙が破れたことしか言わない() {
+        let l = lines(&["[psmux] session created"]);
+        assert_eq!(classify(&inputs(&l, true)), ConnectPhase::Opened);
+        // 既存シェルの経路（fresh でない）はこの規則の対象外
+        assert_eq!(classify(&inputs(&l, false)), ConnectPhase::Connecting);
+    }
+
+    /// #1090: **折り返しで割れた目印**を繋いでから見る。
+    ///
+    /// 実測（Windows 実機・44 桁のペイン）: tako のバナーの尻尾と ssh の出力が
+    /// **同じ物理行**に載るので、残り幅ぶんしか目印が入らず per-line の `contains` が
+    /// 必ず外れ、規則 ④ で `Opened` へ倒れていた（→ #1040 の自動再接続が armed）
+    #[test]
+    fn 折り返しで割れた_ssh_の目印も失敗として読む() {
+        // `います…（中止は Ctrl+C）` の直後に ssh の出力が続き、目印が途中で切れる
+        let l = lines(&[
+            "tako: win へ接続して",
+            "います…（中止は Ctrl+C）ssh: Could not resol",
+            "ve hostname win: nodename nor servname",
+        ]);
+        match classify(&inputs(&l, true)) {
+            ConnectPhase::Failed { reason } => {
+                assert!(reason.is_some(), "理由が空: {l:?}");
+            }
+            other => panic!("失敗として読めていない: {other:?}"),
+        }
+
+        // 入力待ちの目印も同じように割れる
+        let l = lines(&["testuser@win's pass", "word:"]);
+        assert_eq!(classify(&inputs(&l, false)), ConnectPhase::Opened);
+    }
+
+    /// #1090: 折り返された理由の**尻尾**ではなく ssh の失敗行を理由に出す
+    #[test]
+    fn 折り返された理由は先頭の_ssh_の失敗行を拾う() {
+        let l = lines(&[
+            "tako: win へ接続してい",
+            "ます…（中止は Ctrl+C）",
+            "ssh: Could not resolve hostname selftest-non",
+            "existent-1010: unknown host",
+            "tako: win への接続に失敗しました（ssh exit 255）。理由は上の行です",
+        ]);
+        match classify(&inputs(&l, true)) {
+            ConnectPhase::Failed { reason } => assert_eq!(
+                reason.as_deref(),
+                Some("ssh: Could not resolve hostname selftest-non")
+            ),
+            other => panic!("失敗として読めていない: {other:?}"),
+        }
+    }
+
+    /// #1090: **折り返されたバナーの続き行を「ssh が何か言った」と読まない**。
+    ///
+    /// 実測（Windows 実機・44 桁のペイン）: 日本語のバナーが 2 行へ折り返され、
+    /// 続き行（`ます…（中止は Ctrl+C）`）が規則 ④ に当たって `Opened` になり、
+    /// そのまま `Connected` へ進んで #1040 の自動再接続が armed になっていた
+    /// （繋がったことが一度も無いホストなのに ssh を打ち直す）
+    #[test]
+    fn 折り返されたバナーの続き行を_ssh_の出力と読まない() {
+        // `visible_lines()` が返す物理行（44 桁で折り返した形）
+        let l = lines(&["tako: win へ接続してい", "ます…（中止は Ctrl+C）"]);
+        assert_eq!(classify(&inputs(&l, true)), ConnectPhase::Connecting);
+
+        // 英語のバナーでも同じ（表示言語を切り替えても見分けられる）
+        let l = lines(&["tako: connecting to win… (Ctrl+C", " to cancel)"]);
+        assert_eq!(classify(&inputs(&l, true)), ConnectPhase::Connecting);
+
+        // ssh が本当に何か言ったら従来どおり畳む（検出力を殺していない）
+        let l = lines(&[
+            "tako: win へ接続してい",
+            "ます…（中止は Ctrl+C）",
+            "The authenticity of host 'win' can't be",
+        ]);
+        assert_eq!(classify(&inputs(&l, true)), ConnectPhase::Opened);
+    }
+
+    /// #1090: Windows の OpenSSH に ControlMaster を渡すと出る行。
+    /// **これを知らないと規則 ④ が先に当たって `Opened` へ畳まれる**
+    /// （= 接続中チップが失敗へ置き換わらずに消える。実機で観測した症状そのもの）
+    #[test]
+    fn windows_の多重化非対応の失敗行を失敗として読む() {
+        let l = lines(&[
+            "tako: win へ接続しています…（中止は Ctrl+C）",
+            "getsockname failed: Not a socket",
+            "Read from remote host win: Unknown error",
+        ]);
+        match classify(&inputs(&l, true)) {
+            ConnectPhase::Failed { reason } => {
+                assert_eq!(reason.as_deref(), Some("getsockname failed: Not a socket"));
+            }
+            other => panic!("失敗として読めていない: {other:?}"),
+        }
+        // `pane` 経路（まっさらでない画面）でも同じ
+        assert!(is_ssh_error_line("getsockname failed: Not a socket"));
+        assert!(is_ssh_error_line(
+            "Read from remote host win: Unknown error"
+        ));
+    }
+
+    /// #1090: スクリプトの文面が実際の終了コードを載せる形になっても
+    /// マーカーで拾える（新旧どちらの文面も）
+    #[test]
+    fn マーカーは終了コードが何であっても拾える() {
+        for line in [
+            // #1090 以降（実際のコード）
+            "tako: win への接続に失敗しました（ssh exit -1）。理由は上の行です",
+            // #1090 以前に作られたペインが印字する形
+            "tako: win への接続に失敗しました（ssh exit 255）。理由は上の行です",
+            "tako: could not connect to win (ssh exit -1). The reason is printed above",
+        ] {
+            let l = lines(&["ssh: connect to host win port 22: Connection refused", line]);
+            match classify(&inputs(&l, true)) {
+                ConnectPhase::Failed { reason } => {
+                    assert!(reason.unwrap().contains("Connection refused"), "{line}");
+                }
+                other => panic!("{line}: 失敗として読めていない: {other:?}"),
+            }
+        }
     }
 
     #[test]

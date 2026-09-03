@@ -4719,7 +4719,7 @@ impl TakoApp {
                         })
                         .detach();
                     }
-                    // #1040: 切断したリモートフォルダの自動復帰。判定（`master_alive` =
+                    // #1040: 切断したリモートフォルダの自動復帰。判定（`remote_fs::liveness` =
                     // ソケットの stat）は UI で、**繋ぎ直しと保留の押し出しは background**。
                     // 待ちが 1 件も無ければジョブは出ない = 平常時のコストはゼロ
                     let Ok(recovery_jobs) =
@@ -9371,23 +9371,48 @@ impl TakoApp {
                 st.baseline_index.min(lines.len())
             };
             let new_lines = &lines[from..];
+            let prints = tako_core::remote_fs::pane_prints(&st.host);
+            // #1090: **接続が成立した証拠**。多重化のソケットは接続が張れて初めて
+            // 作られるので、これだけが「一度でも繋がった」と言ってよい材料になる
+            // （#1040 の自動再接続の前提）。多重化が無いプラットフォームでは
+            // 常に false = **自動再接続は armed にならない**（宣言済みの縮退。
+            // `platform::ssh_client::NO_MULTIPLEXING`）
+            let master_socket = tako_core::remote_fs::control_path(&st.host)
+                .map(|p| p.exists())
+                .unwrap_or(false);
+            if std::env::var("TAKO_1090_DIAG").as_deref() == Ok("1") {
+                let nonempty: Vec<&String> =
+                    new_lines.iter().filter(|l| !l.trim().is_empty()).collect();
+                println!(
+                    "TAKO_1090_DIAG: pane={} phase={:?} fresh={} from={from} lines={} nonempty={} first={:?} sock={master_socket}",
+                    pane.as_u64(),
+                    st.phase.as_str(),
+                    st.fresh_pane,
+                    lines.len(),
+                    nonempty.len(),
+                    nonempty.first().map(|l| l.chars().take(40).collect::<String>()),
+                );
+            }
 
             match st.phase.clone() {
                 // --- 接続待ち（#1010 のまま）------------------------------------
                 ConnectPhase::Connecting => {
                     let phase = ssh_progress::classify(&ssh_progress::ConnectInputs {
                         new_lines,
-                        master_socket: tako_core::remote_fs::control_path(&st.host)
-                            .map(|p| p.exists())
-                            .unwrap_or(false),
+                        master_socket,
                         screen_changed: fingerprint != st.baseline_fingerprint,
                         fresh_pane: st.fresh_pane,
+                        // #1090: 折り返されたバナーの続き行を ssh の出力と読まない
+                        tako_prints: &prints,
                     });
                     match phase {
                         // #1040: ここで捨てずに**見張りへ移る**。切断を拾うため
                         ConnectPhase::Opened => {
                             if let Some(st) = self.ssh_connect.get_mut(&pane) {
-                                st.ever_connected = true;
+                                // #1090: `Opened` は「沈黙が破れた」までしか言わない
+                                // （器や下のシェルが描いた行でもここへ来る）。
+                                // **一度でも繋がった**は多重化のソケットだけが証明する
+                                st.ever_connected |= master_socket;
                                 st.phase = ConnectPhase::Connected;
                                 st.rebase(&lines);
                             }
@@ -9401,6 +9426,15 @@ impl TakoApp {
                 }
                 // --- 使えている: 切れていないかだけを見る（#1040）----------------
                 ConnectPhase::Connected => {
+                    // 見張っている間にソケットが出てきたらそこで証拠が揃う（#1090）
+                    if master_socket && !st.ever_connected {
+                        if let Some(st) = self.ssh_connect.get_mut(&pane) {
+                            st.ever_connected = true;
+                        }
+                    }
+                    let Some(st) = self.ssh_connect.get(&pane) else {
+                        continue;
+                    };
                     let Some((_signal, reason)) =
                         reconnect::detect_disconnect(new_lines, exit_code)
                     else {
@@ -9443,12 +9477,11 @@ impl TakoApp {
                     if st.attempt_pending {
                         let phase = ssh_progress::classify(&ssh_progress::ConnectInputs {
                             new_lines,
-                            master_socket: tako_core::remote_fs::control_path(&st.host)
-                                .map(|p| p.exists())
-                                .unwrap_or(false),
+                            master_socket,
                             screen_changed: fingerprint != st.baseline_fingerprint,
                             // 打ち直しは**必ず既存シェルへ 1 行**なので fresh ではない
                             fresh_pane: false,
+                            tako_prints: &prints,
                         });
                         match phase {
                             ConnectPhase::Opened => {
@@ -53047,6 +53080,116 @@ mod self_test {
                     "111: 接近の警告 / 情報では自動復帰が発動しない (#1096)",
                 );
 
+                // --- 正例 ⑥ 時間では解けない利用阻害（#1106） ---
+                // claude 2.1.258 の阻害の前置き（`dCt` / `pCt` / `Par`）のうち、#1096 が
+                // 受けた「時間で解けるぶん」を除いた残り = 座席種別・管理者による無効化・
+                // グループ枠 $0・クレジット要求・追加利用ぶんの枯渇・組織でのサービス無効。
+                // #1106 前はどの規則にも当たらず `detect_worker_error` が None を返し、
+                // **止まっているのに idle = 作業完了に見えていた**（しかも待っても直らない
+                // ので人が気づくまで永久に止まったまま）。
+                //
+                // fixture は**アポストロフィを含まない実文言**を選んである（`paint_and_hold`
+                // の POSIX 経路は本文を素の単引用符で囲む。正例 ③〜⑤ と同じ理由）。
+                // 8 文言すべてのバイト等価な固定は `limit_resume.rs` / `wait.rs` /
+                // `limit_stop.rs` の単体テストが持つので、ここで見たいのは
+                // 「実ペイン → 別種として検知 → 自動復帰は撃たない → メーターは `--`」の通し
+                let entitlement_line = "Your usage allocation has been disabled by your admin";
+                let entitlement_body = format!("{filler813}実装を進めます\n  {entitlement_line}\n");
+                let Some(ent_pane) = make_fixture_pane(cx, &entitlement_body).await else {
+                    fail("#1106: 利用阻害ペインの作成")
+                };
+                if !wait_screen(cx, ent_pane, "usage allocation has been disabled").await {
+                    fail("#1106: 利用阻害 fixture が画面に出ない");
+                }
+                settle813(cx, ent_pane).await;
+                let _ = set_enabled(cx, ent_pane, true);
+                // 実ペインの画面から種別を解決する（worker_status / watch が通るのと同じ関数）
+                let classify = |cx: &mut AsyncApp, pane: PaneId| -> Option<(String, String, String)> {
+                    window
+                        .update(cx, |app, _, _| {
+                            let lines = app.terminals.get(&pane)?.visible_lines();
+                            tako_control::orchestrator::wait::detect_worker_error(&lines.join("\n"))
+                                .map(|(k, detail)| {
+                                    (
+                                        k.as_str().to_string(),
+                                        k.recommended_action().to_string(),
+                                        detail,
+                                    )
+                                })
+                        })
+                        .ok()
+                        .flatten()
+                };
+                let ent_class = classify(cx, ent_pane);
+                let (sent_ent, kind_ent, _) = drive(cx, ent_pane);
+                println!(
+                    "TAKO_SELF_TEST_1106_DETECT: class={ent_class:?} limit_kind={kind_ent:?} \
+                     sent={} state=({})",
+                    sent_ent.len(),
+                    state813(cx, ent_pane),
+                );
+                check(
+                    ent_class.as_ref().map(|c| c.0.as_str()) == Some("entitlement_blocked"),
+                    "111: 時間で解けない阻害を entitlement_blocked として検知する (#1106)",
+                );
+                check(
+                    ent_class.as_ref().map(|c| c.1.as_str()) == Some("needs_human"),
+                    "111: 推奨アクションが needs_human（wait_reset ではない） (#1106)",
+                );
+                check(
+                    ent_class
+                        .as_ref()
+                        .is_some_and(|c| c.2.contains(entitlement_line)),
+                    "111: detail に実文言が入る（そのままユーザーへ見せられる） (#1106)",
+                );
+                // 自動復帰（#813）は発動しない。**解除時刻へ寄せても**撃たない
+                // （追跡そのものが作られない = `is_limit_exhausted_line` に混ざっていない）
+                backdate(cx, ent_pane);
+                let (sent_ent_after, kind_ent_after, attempts_ent) = drive(cx, ent_pane);
+                println!(
+                    "TAKO_SELF_TEST_1106_NO_RESUME: kind={kind_ent_after:?} sent={} attempts={}",
+                    sent_ent_after.len(),
+                    attempts_ent
+                );
+                check(
+                    sent_ent.is_empty()
+                        && kind_ent.is_none()
+                        && sent_ent_after.is_empty()
+                        && kind_ent_after.is_none()
+                        && attempts_ent == 0,
+                    "111: 時間で解けない阻害では自動復帰が発動しない (#1106)",
+                );
+                // 枠の使用率とは無関係なのでメーターは `--` のまま
+                let meter1106 = window
+                    .update(cx, |app, _, _| {
+                        app.terminals
+                            .get(&ent_pane)
+                            .and_then(|s| s.agent_metrics())
+                            .map(|m| (m.limit_5h, m.limit_week))
+                    })
+                    .ok()
+                    .flatten();
+                println!("TAKO_SELF_TEST_1106_METER: pane={meter1106:?}");
+                check(
+                    meter1106.is_none_or(|(h, w)| h.is_none() && w.is_none()),
+                    "111: 利用阻害ではステータスバーのメーターを埋めない (#1106)",
+                );
+                // --- 負例 ⑤ 時間で解ける上限は従来どおり usage_limit（#1106 の対照） ---
+                // 同じ関数・同じ実ペイン経路で種別が分かれること。ここが
+                // entitlement_blocked へ倒れると #1093 / #1096 の自動復帰が丸ごと死ぬ
+                let class_session = classify(cx, session_pane);
+                let class_credits = classify(cx, credits_pane);
+                println!(
+                    "TAKO_SELF_TEST_1106_CONTRAST: session={class_session:?} \
+                     credits={class_credits:?}"
+                );
+                check(
+                    class_session.as_ref().map(|c| c.0.as_str()) == Some("usage_limit")
+                        && class_session.as_ref().map(|c| c.1.as_str()) == Some("wait_reset")
+                        && class_credits.as_ref().map(|c| c.0.as_str()) == Some("usage_limit"),
+                    "111: 時間で解ける上限は従来どおり usage_limit / wait_reset (#1106)",
+                );
+
                 // --- 負例 ② permission ダイアログでは発動しない ---
                 let perm_body = format!(
                     "{filler813}   Bash command\n   npm test\n   \
@@ -53140,10 +53283,12 @@ mod self_test {
                 println!("TAKO_SELF_TEST_813_PERSIST: {persisted:?}");
                 check(
                     // 有効にしたのは idle / dialog / codex / session / credits / warn /
-                    // permission / api の 8 ペインだけ（codex = #985、session = #1093、
-                    // credits と warn = #1096 で追加）。OFF のペインはフィールドごと
-                    // 出ない（旧 tako でも読める JSON を保つ）
-                    persisted == Some((8, 8)),
+                    // ent / permission / api の 9 ペインだけ（codex = #985、
+                    // session = #1093、credits と warn = #1096、ent = #1106 で追加。
+                    // ent は**オプトイン ON でも自動復帰が発動しない**ことを見るために
+                    // 有効化してある）。OFF のペインはフィールドごと出ない
+                    // （旧 tako でも読める JSON を保つ）
+                    persisted == Some((9, 9)),
                     "111: 有効にしたペインだけが保存表現へ載る (#813)",
                 );
 
@@ -57845,15 +57990,59 @@ mod self_test {
                 );
 
                 // (d) 失敗すると**消えずに理由へ置き換わる**（無言にしない）
+                //
+                // #1090: **観測した phase の履歴も残す**。ここは 500ms ごとに
+                // `drive_ssh_connect` を回すので、途中の状態（まだ何も出ていない /
+                // バナーだけ）で誤分類されるとその瞬間しか痕跡が無い。失敗したときに
+                // 「どの順で何へ倒れたか」が分からないと原因を追えない（実測で 1 度踏んだ）
                 let mut failed = None;
+                let mut phase_trail: Vec<String> = Vec::new();
+                let mut first_line: Option<String> = None;
                 for _ in 0..40 {
                     wait(cx, 500).await;
-                    let st = window
+                    let (st, screen_lines) = window
                         .update(cx, |app: &mut TakoApp, _, _| {
                             app.drive_ssh_connect();
-                            <TakoApp as UiStateHost>::ssh_connect_state(app, PaneId::from_raw(ssh_pane))
+                            let pid = PaneId::from_raw(ssh_pane);
+                            let st = <TakoApp as UiStateHost>::ssh_connect_state(app, pid);
+                            let n = app
+                                .terminals
+                                .get(&pid)
+                                .map(|s| {
+                                    s.visible_lines()
+                                        .into_iter()
+                                        .filter(|l| !l.trim().is_empty())
+                                        .count()
+                                })
+                                .unwrap_or(0);
+                            (st, n)
                         })
-                        .unwrap_or(None);
+                        .unwrap_or((None, 0));
+                    let label = st
+                        .as_ref()
+                        .map(|v| v["phase"].as_str().unwrap_or("?").to_string())
+                        .unwrap_or_else(|| "<none>".to_string());
+                    let entry = format!("{label}/{screen_lines}");
+                    if phase_trail.last() != Some(&entry) {
+                        phase_trail.push(entry);
+                    }
+                    // 何が「1 行」だったのかが分からないと原因を追えないので、
+                    // 序盤の数サンプルだけ先頭行の中身も控える（#1090）
+                    if phase_trail.len() <= 4 && first_line.is_none() && screen_lines > 0 {
+                        first_line = window
+                            .update(cx, |app: &mut TakoApp, _, _| {
+                                app.terminals
+                                    .get(&PaneId::from_raw(ssh_pane))
+                                    .and_then(|s| {
+                                        s.visible_lines()
+                                            .into_iter()
+                                            .find(|l| !l.trim().is_empty())
+                                    })
+                                    .map(|l| l.chars().take(40).collect::<String>())
+                            })
+                            .ok()
+                            .flatten();
+                    }
                     if st.as_ref().map(|v| v["phase"] == "failed").unwrap_or(false) {
                         failed = st;
                         break;
@@ -57863,6 +58052,10 @@ mod self_test {
                     .as_ref()
                     .map(|v| v["phase"] == "failed" && !v["reason"].is_null())
                     .unwrap_or(false);
+                println!(
+                    "TAKO_SELF_TEST_133D_TRAIL: {} first_line={first_line:?}",
+                    phase_trail.join(" -> ")
+                );
                 if !failed_ok {
                     // #1073: 「スクリプトが走っていない」と「走ったが分類できていない」を
                     // 言い分ける（実機で 20 秒待っても connecting のままだった）。

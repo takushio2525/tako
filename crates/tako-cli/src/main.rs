@@ -1582,7 +1582,8 @@ enum OrchestratorCommand {
         limit_resume: Option<bool>,
     },
     /// worker の状態確認（busy / idle / error / gone / unknown。error 時は
-    /// error.kind（api_error / usage_limit / limit_dialog）と recommended_action を含む。#157）
+    /// error.kind（api_error / usage_limit / limit_dialog / launch_failed /
+    /// entitlement_blocked）と recommended_action を含む。#157 / #983 / #1106）
     Status {
         /// ペイン ID（--worker と排他。どちらか必須）
         #[arg(long)]

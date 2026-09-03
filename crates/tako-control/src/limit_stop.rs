@@ -10,7 +10,10 @@
 //!   （#157。「usage limit reached」「hit your usage limit」「limit reached … reset」）
 //!
 //! **permission ダイアログ・API エラー・通常の idle では None を返す**のが本モジュールの
-//! 責務（自動復帰は上限由来の停止に限る、という安全条件を 1 か所で守る）
+//! 責務（自動復帰は上限由来の停止に限る、という安全条件を 1 か所で守る）。
+//! **時間では解けない利用阻害（`WorkerErrorKind::EntitlementBlocked`。#1106）でも None**
+//! —— 座席種別や管理者による無効化は待っても解けないので、ナッジを撃つと
+//! 試行上限まで空撃ちするだけになる（報告は watch / supervisor の担当）
 
 use tako_core::limit_resume::{parse_reset_at, LimitStop, LimitStopKind};
 
@@ -417,6 +420,41 @@ mod tests {
             7,
             "日付つきの解除時刻が 24 時間以内へ丸まっている"
         );
+    }
+
+    #[test]
+    fn issue1106_時間で解けない阻害では自動復帰を発動させない() {
+        // #1106 の新種別（`WorkerErrorKind::EntitlementBlocked`）。
+        // ここで `Some` を返すと「解除まで待って続行ナッジ」を撃つことになるが、
+        // 待っても解けないので **max_attempts 回撃って諦めるだけ**になる。
+        // 停止として報告するのは supervisor / watch 側（`WORKER_ERROR`）の仕事
+        for line in [
+            "Your seat type doesn't include usage credits",
+            "Your seat type doesn't include usage",
+            "Your seat type doesn't include extra usage",
+            "Your usage allocation has been disabled by your admin",
+            "Your group's usage limit is set to $0",
+            "Fable 5 requires usage credits",
+            "You're out of extra usage",
+            "This service is disabled for your org",
+        ] {
+            let src = OUT_OF_CREDITS_IDLE.replace(
+                "You're out of usage credits · resets 7:50pm (Asia/Tokyo) · progress saved",
+                line,
+            );
+            assert!(
+                detect_limit_stop(&screen(&src), OBSERVED, JST).is_none(),
+                "時間で解けない阻害で自動復帰が発動しうる状態になっている: {line}"
+            );
+            // 一方で「止まっている」ことは新種別として検知できている
+            let (kind, detail) = detect_worker_error(&screen(&src).join("\n"))
+                .unwrap_or_else(|| panic!("停止として検知されない: {line}"));
+            assert_eq!(kind, WorkerErrorKind::EntitlementBlocked, "{line}");
+            assert!(
+                detail.contains(line),
+                "検知の根拠が見出し行になっていない: {detail}"
+            );
+        }
     }
 
     #[test]
