@@ -23185,7 +23185,7 @@ mod self_test {
         format!(
             "{} {} elapsed={elapsed}s",
             build_flavor(),
-            tako_control::diag::format_load_average(tako_control::diag::load_average())
+            tako_control::diag::format_machine_load(tako_control::diag::machine_load())
         )
     }
 
@@ -24802,6 +24802,48 @@ mod self_test {
             return false;
         }
         !focused_contains(window, cx, forbidden)
+    }
+
+    /// **アプリの状態を時間ではなく状態で待つ**（#796 の作法を状態読みへ拡張。#1073）。
+    ///
+    /// なぜ要るか: シェル統合由来の状態（cwd / コマンド実行状態）は、**器が OSC を
+    /// 素通ししない環境では側路（`osc_sink`。#766）から 2 秒 tick で取り込まれる**。
+    /// PTY からインラインで届く POSIX と違い、`wait(cx, 1000)` の直後に 1 回読む形は
+    /// tick を跨げず**構造的に落ちる**（実機で項目 41 が 9/2 に落ちた原因）。
+    ///
+    /// 上限まで待って駄目なら偽なので、検出力は固定待ちより強い
+    /// （成立しない条件はいくら待っても成立しない）。諦めたときは
+    /// 「何を待って何秒待ったか + 実行環境」を出す
+    async fn wait_for_app_state<F>(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        label: &str,
+        timeout: Duration,
+        predicate: F,
+    ) -> bool
+    where
+        F: Fn(&TakoApp) -> bool,
+    {
+        let started = std::time::Instant::now();
+        loop {
+            if window
+                .update(cx, |app, _, _| predicate(app))
+                .unwrap_or(false)
+            {
+                return true;
+            }
+            if started.elapsed() >= timeout {
+                println!(
+                    "TAKO_SELF_TEST_STATE_TIMEOUT: label={label:?} waited={:.1}s {}",
+                    started.elapsed().as_secs_f32(),
+                    env_line()
+                );
+                return false;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(100))
+                .await;
+        }
     }
 
     /// ファイルツリーのインデントガイド線（#589）の実ピクセル検証。
@@ -35717,16 +35759,37 @@ mod self_test {
                 //     list で公開される（FR-2.4.1 + FR-2.1.4 の e2e。実コマンドで検証する）
                 press(any, cx, sh.clear_line_key());
                 type_text(any, cx, &sh.cd(&osc_dir), true);
-                wait(cx, 1000).await;
-                let osc_cwd_ok = window
-                    .update(cx, |app, _, _| {
+                // 側路経由（#766）は 2 秒 tick で取り込むので**状態で待つ**（#1073）
+                let osc_cwd_ok = wait_for_app_state(
+                    window,
+                    cx,
+                    "OSC 7 の cwd",
+                    Duration::from_secs(20),
+                    |app| {
                         app.terminals
                             .get(&app.focused_pane())
                             .and_then(|s| s.cwd())
                             .map(|p| p == osc_expected.as_path())
                             .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
+                    },
+                )
+                .await;
+                if !osc_cwd_ok {
+                    // 「届いていない」と「別のパスとして届いた」を言い分ける（#1073）
+                    let seen = window
+                        .update(cx, |app, _, _| {
+                            app.terminals
+                                .get(&app.focused_pane())
+                                .and_then(|s| s.cwd())
+                                .map(|p| p.display().to_string())
+                        })
+                        .unwrap_or(None);
+                    println!(
+                        "TAKO_SELF_TEST_41: expected={:?} seen={seen:?} typed={:?}",
+                        osc_expected.display().to_string(),
+                        sh.cd(&osc_dir)
+                    );
+                }
                 check(osc_cwd_ok, "シェル統合の OSC 7 で cwd 検知");
                 // 実行中状態の検知: sleep 5 の実行ウィンドウ内で Running への遷移をポーリングで
                 // 捕まえる（高負荷時はコマンド開始自体が 1 秒超遅れるため。項目 17 と同型の対策）
@@ -35802,21 +35865,58 @@ mod self_test {
                             })
                     })
                     .unwrap_or(false);
+                if !list_exposes {
+                    // 応答のどのフィールドが食い違ったかを出す（#1073: cwd の表記で落ちた）
+                    let row = window
+                        .update(cx, |app, _, _| {
+                            let focused = app.focused_pane().as_u64();
+                            let value = tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::List,
+                                PaneOrigin::Cli,
+                            )
+                            .expect("list は常に成功する");
+                            value["tabs"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .flat_map(|t| t["panes"].as_array().into_iter().flatten())
+                                .find(|p| p["id"].as_u64() == Some(focused))
+                                .map(|p| {
+                                    format!(
+                                        "state={:?} exit_code={:?} cwd={:?}",
+                                        p["state"].as_str(),
+                                        p["exit_code"].as_i64(),
+                                        p["cwd"].as_str()
+                                    )
+                                })
+                        })
+                        .unwrap_or(None);
+                    println!(
+                        "TAKO_SELF_TEST_41_LIST: want cwd={osc_dir:?} got {}",
+                        row.unwrap_or_else(|| "（対象ペインが list に無い）".to_string())
+                    );
+                }
                 check(list_exposes, "list が state / exit_code / cwd を公開");
 
                 // 41b. split が分割元の cwd を継承する（OSC 7 連携。FR-2.4.1）。
                 //     --focus で新ペインへ移り、新ペイン側の cwd 継承を検証する（3c9d363 追従）
                 type_text(any, cx, &format!("{cli} split --right --focus"), true);
-                wait(cx, 2000).await;
-                let inherited = window
-                    .update(cx, |app, _, _| {
+                // 新ペインの cwd も側路経由だと 2 秒 tick に乗る（#1073）
+                let inherited = wait_for_app_state(
+                    window,
+                    cx,
+                    "split 後の cwd 継承",
+                    Duration::from_secs(20),
+                    |app| {
                         app.terminals
                             .get(&app.focused_pane())
                             .and_then(|s| s.cwd())
                             .map(|p| p == osc_expected.as_path())
                             .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
+                    },
+                )
+                .await;
                 check(inherited, "split が分割元の cwd を継承");
                 // 片付け: 新ペインを閉じ、状態を idle へ戻す
                 type_text(any, cx, &format!("{cli} close"), true);
@@ -35824,11 +35924,20 @@ mod self_test {
                 type_text(any, cx, &sh.exit_status(0), true);
                 wait(cx, 500).await;
             } else {
+                // #1073: Windows の配置は `$PROFILE` のブロックが**いまの data dir の
+                // スクリプト**を指しているかで決まる。`TAKO_ISOLATED=1` は data dir を
+                // pid ごとに変えるので、同じ機・同じコードでも起動の仕方で
+                // 「skip される回」と「走る回」が入れ替わる。どちらだったかを
+                // 後から言えるように script のパスまで出す
                 println!(
                     "TAKO_SELF_TEST_SKIPPED: 41 / 41b（シェル統合がこの環境では効かない: \
-                     installed={} blocked_by_backend={:?}）",
+                     installed={} blocked_by_backend={:?} script={:?}）",
                     shell_integration.installed(),
-                    shell_integration.blocked_by_backend
+                    shell_integration.blocked_by_backend,
+                    shell_integration
+                        .script
+                        .as_ref()
+                        .map(|p| p.display().to_string())
                 );
             }
 

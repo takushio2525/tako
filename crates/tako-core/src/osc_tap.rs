@@ -174,8 +174,10 @@ fn parse_cwd(uri: &[u8]) -> Option<OscEvent> {
     if path.is_empty() {
         return None;
     }
+    // URI のパスは常に `/` 区切りなので、表示が他の経路と揃うよう OS の区切りへ寄せる
+    // （動作は元から同じ = `Path` の比較は成分単位。変わるのは `display()` だけ。#1073）
     Some(OscEvent::CwdChanged(PathBuf::from(
-        crate::file_uri::strip_drive_slash(&path),
+        crate::file_uri::native_separators(crate::file_uri::strip_drive_slash(&path)).as_ref(),
     )))
 }
 
@@ -431,6 +433,32 @@ mod tests {
         assert_eq!(
             parse_cwd(b"file://host/C:/tmp"),
             Some(OscEvent::CwdChanged(PathBuf::from("C:/tmp")))
+        );
+    }
+
+    /// #1073: `cwd` の**表示**は `tako list` / MCP の応答とペインヘッダのチップへ
+    /// そのまま出る。URI のパスは常に `/` 区切りなので、寄せないと Windows だけ
+    /// 「同じ機に `C:/Users/…` と `C:\Users\…` が混ざる」形になる（実機の項目 41 で
+    /// 文字列比較が落ちて見つかった）。両プラットフォームで通る形で固定する
+    #[test]
+    fn cwdの表示はこのosの区切りだけを使う() {
+        let cwd = match parse_cwd(b"file:///C:/Users/foo/dev") {
+            Some(OscEvent::CwdChanged(p)) => p,
+            other => panic!("cwd が返らない: {other:?}"),
+        };
+        let shown = cwd.display().to_string();
+        let foreign = if std::path::MAIN_SEPARATOR == '/' {
+            '\\'
+        } else {
+            '/'
+        };
+        assert!(
+            !shown.contains(foreign),
+            "cwd の表示に別プラットフォームの区切りが混ざっている: {shown}"
+        );
+        assert!(
+            shown.contains(std::path::MAIN_SEPARATOR),
+            "cwd の表示に区切りが無い: {shown}"
         );
     }
 
