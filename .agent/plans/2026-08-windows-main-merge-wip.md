@@ -3781,3 +3781,71 @@ Windows で `load` が採れることを実機が保証する / `file_uri` 2 本
 
 **#1062 は「main で止まる」と書かれているが実際は間欠**（負荷だけでも決まらない）。
 SSH 経路はこの PR の差分に 1 行も含まれないので回帰ではない。観測は #1062 へコメント済み。
+
+## #1091 の記録（2026-09-03。項目 41 / 41b が `$PROFILE` の配置に依存していた）
+
+**症状**: 項目 41 / 41b（OSC 7 = cwd 追従 / OSC 133 = コマンド実行状態）が
+`shell_integration::status().effective()` でゲートされており、`TAKO_ISOLATED=1` の
+隔離レシピからは配置（`$PROFILE` のブロックが**いまの data dir の** `tako.ps1` を
+指しているか）が見えないので **skip**。#1073 の症状の半分がこれで、
+**レシピどおりに回すと Windows の OSC 7 / 133 が永久に未検証**だった。
+
+### 直し方（#889 の項目 93 と同じ手）
+
+ゲートを「配置されているか」から**「統合を読ませたシェルを起こせるか」**へ変えた。
+
+- 判定は純粋関数 `osc_selftest_runnable(is_posix, backend_blocked, integration_shell_available)`。
+  **引数に配置状態を取らない**ので、ゲートが `installed()` / `effective()` へ戻ることは
+  構造的に起こらない（単体テストが両プラットフォームぶんを macOS から検査する）
+- 検証は `ShellDialect::integration_shell_command`（`-NoProfile` + 統合スクリプトの
+  ドットソース）で立てた**専用ペイン 1 枚**の中で完結。POSIX は `None` = 既定シェルを
+  そのまま起こす（spawn 時の env 注入で統合が効くので、従来と同じ経路）
+- 器が OSC を素通しせず側路（#766）も無い環境（#525）だけは従来どおり対象外
+
+### 専用ペインにすると新しく生える穴 2 つ（どちらも塞いだ）
+
+1. **「起こした場所」が答えになる**。ペインの `cwd` は spawn 時の値がそのまま
+   セッションへ入る（OSC 7 を待たない）ので、期待値と同じ場所で起こすと `cd` が
+   1 文字も届かなくても cwd 検知が成立する。**期待値の親ディレクトリで起こし、
+   その前提自体を `check` で見る**（実機は `start_dir=…\AppData\Local` /
+   `expected=…\AppData\Local\Temp`）
+2. **分割元の cwd は 41 で既に期待値**。41b の判定に「フォーカスが別のペインへ移った」を
+   含めないと `tako split` が届かなくても成立する（`split_inherited_cwd_ok`）
+
+### 実機の A/B（Windows 11 / debug / worktree `tako-wt-1073`）
+
+| head | 起動 | `installed` | 項目 41 / 41b | 停止位置 |
+|---|---|---|---|---|
+| `2e7415c`（main） | `TAKO_ISOLATED=1` | false | **skip**（`SKIPPED: 41 / 41b …installed=false`） | 44 付近（`scroll --to`。`load=cpu100%` の別フレーク） |
+| `5f3a5ec`（本 PR） | `TAKO_ISOLATED=1` | false | **走って通る**（`runnable=true` / `script=…tako-iso-data-19216…`） | **133 (d) = #1090** |
+| `5f3a5ec` | 素の `TAKO_SELF_TEST=1` | true | **走って通る**（`script=…AppData\Roaming\tako…`） | **133 (d) = #1090** |
+
+**両モードで同じ壁（133 (d) = #1090）へ着く** = モード差は項目 41 のゲートだけに閉じた。
+`installed=false` のまま `runnable=true` になっているのが、配置から切り離せた直接の証拠。
+
+### 検出力（`TAKO_1091_INJECT_NO_SPLIT=1` = split を打たない注入）
+
+macOS / Windows のどちらでも 41b が落ちる。**cwd は期待値のまま**なので、
+フォーカス移動を条件から外していたら偽 PASS になっていたことがそのまま読める:
+
+```
+TAKO_SELF_TEST_41B: from=19 focused=19 seen=Some("…\AppData\Local\Temp") expected="…\AppData\Local\Temp"
+TAKO_APP_SELF_TEST_FAILED: split が分割元の cwd を継承
+```
+
+### 踏んだ罠
+
+- **項目 97 (#720) は負荷で落ちる**。`SETTLE_SHELL_LIMIT` は 4 秒なので、
+  `load=cpu100%/12cpu`（他 worker の cargo と並走）だと新規ペインのシェルが
+  4 秒で確定せず `97-SETTLE: sequence=[Preparing, Terminal, Starter]` になる。
+  静かな機（`cpu69%` 開始）では `[Preparing, Starter]` で通る。**実機の A/B は
+  負荷まで揃えて記録すること**（#1073 の作法「env まで揃える」の続き）
+- **`ssh win` 越しの PowerShell へ複雑な引用符を渡さない**。`Invoke-CimMethod` や
+  `findstr /C:` は zsh → ssh → powershell の 3 層で壊れる。**`.ps1` / `.cmd` を
+  ローカルで作って `scp` → `pwsh -File` で叩く**（本文は ASCII だけにすれば
+  5.1 の CP932 も踏まない）。ログの回収も `type` ではなく `scp`
+- **アボートした run は psmux サーバーと pwsh を残す**（`fail()` は `exit(1)` なので
+  後始末を通らない）。片付けは**自分の socket 名だけ**を対象にする
+  （`-L tako-iso-<pid>` / `tako-st-<pid>` を command line で照合 → `taskkill /T /F`）。
+  この機には他 worker の `tako-iso-12868` / `tako-st-23928` と本番 tako が居るので、
+  名前一致の一括 kill は禁止。今回は 12 サーバーを解放（tmux 34→22 / pwsh 100→77）
