@@ -57332,6 +57332,34 @@ mod self_test {
                     .as_ref()
                     .map(|v| v["phase"] == "failed" && !v["reason"].is_null())
                     .unwrap_or(false);
+                if !failed_ok {
+                    // #1073: 「スクリプトが走っていない」と「走ったが分類できていない」を
+                    // 言い分ける（実機で 20 秒待っても connecting のままだった）。
+                    // ペインの中身・いまの phase・器の有無を全部出す
+                    let (phase, backend, lines) = window
+                        .update(cx, |app: &mut TakoApp, _, _| {
+                            let pid = PaneId::from_raw(ssh_pane);
+                            let phase = <TakoApp as UiStateHost>::ssh_connect_state(app, pid)
+                                .map(|v| v["phase"].to_string());
+                            let backend = app.backend_sessions.contains_key(&pid);
+                            let lines: Vec<String> = app
+                                .terminals
+                                .get(&pid)
+                                .map(|s| {
+                                    s.visible_lines()
+                                        .into_iter()
+                                        .filter(|l| !l.trim().is_empty())
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            (phase, backend, lines)
+                        })
+                        .unwrap_or((None, false, Vec::new()));
+                    println!(
+                        "TAKO_SELF_TEST_133D: host={host1010:?} phase={phase:?} \
+                         backend={backend} lines={lines:?}"
+                    );
+                }
                 check(
                     failed_ok,
                     &format!("133: 接続失敗は消えずに理由へ置き換わる (#1010。{failed:?})"),

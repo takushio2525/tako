@@ -4027,3 +4027,24 @@
   load 15 で項目 94（#702。打った行が 6 秒以内に実行されない）/ load 5 で項目 113（#816。
   2.5 秒の出力が `lines+=25 < 40`）。並行 worker のビルドで load が跳ねる時間帯は避けて測る
 - 次: PR → CI → merge / install は master 判断
+
+## 2026-09-03（#1073: Windows 実機の GUI セルフテスト完走を復旧 + #967 も解消）
+- **停止位置が 2 つあったのは世代差ではなく起動の仕方の差**（#920 の完走ログの
+  `tako-iso-data-<pid>` が決定的）。`TAKO_ISOLATED=1` を付けない起動だと data dir が本番に
+  なり `$PROFILE` の配置が「効いている」判定になるので、#920 では skip されていた項目 41 /
+  41b（OSC 7 / 133）が**初めて走り、そこで落ちていた**
+- 落ちる理由は 2 つ: ①cwd を固定待ち 1 秒の直後に 1 回読む形が側路（#766）の **2 秒 tick** を
+  跨げない = コイン投げ（9/2 は落ち・9/3 の main は通った）→ `wait_for_app_state` で状態待ちへ
+  ②`list` の `cwd` が Windows だけ `/` 区切り（`file://` URI 由来）で文字列比較が食い違う →
+  `file_uri::native_separators` を `osc_tap::parse_cwd` へ通して製品側を直した
+- 41 を通した先の壁は **#967**（項目 97 / 99 が画面の `tako setup` リテラルを期待。#898 で
+  実体パスになった時点から落ちていた。macOS は basename が `tako` なので**通ってしまう**）。
+  期待値を `welcome::launch_command_line` から作り折り返しに強い形へ。**両モードで完走**
+- 副目標: `load=unknown` を解消（境界 `platform::sysload` = B25 新設。Windows は
+  `GetSystemTimes` の差分から `load=cpu14%/12cpu`。3 つ組はでっち上げない）
+- 番犬 2 本（`シェル統合由来の状態を固定待ちで読んでいない` /
+  `ペイン画面の検査はtakoコマンドをリテラルで期待しない`）は **origin/main の実ファイルで
+  pre-fix の 4 行を名指しし、このブランチで 0 件**を実測
+- 関連: PR（`Refs #1073` / `Closes #967`）。記録は plan の「#1073 の記録」節
+- 次: 項目 41 の実行がモードで変わること自体の根治（#889 の `integration_shell_command` を
+  41 にも使って専用ペインで閉じる）は別 Issue へ
