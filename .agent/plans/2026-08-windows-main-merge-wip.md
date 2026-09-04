@@ -4001,3 +4001,87 @@ video_player の既存分だけ = 触ったファイルは含まれない）。
 開発者モードは OFF）、**素のユーザーで走る tako のセルフテストでは前提にできない**。
 判定そのもの（`image_path` / 版の読み取り / 実行ファイル判定）は境界の単体テストが
 **両プラットフォームで**見ているので、項目 103 は非 unix で理由つき SKIP にした。
+
+#### #1102 の記録（セルフテスト項目 135 = ファイルツリーの git 色。2026-09-04）
+
+**症状**: #1090（PR #1098）で項目 133 を通した先の壁。`tree git-status` の応答で
+`roots` が `C:\Users\…\repo`（OS の区切り）なのに `repos[].root` が
+`C:/Users/…/repo`（`/`）で、**同じ応答に 2 通りの表記が混ざる**。
+
+##### 根因は git の出口 1 箇所（Issue の見立てが当たっていた稀な例）
+
+`git rev-parse --show-toplevel` は **Windows でも `/` 区切り**で返す。
+`normalize_repo_root` は「`PathBuf` は Windows でも `/` を区切りとして解釈するので
+そのままでよい」として UNC だけを直していた。**動作は確かに同じ**（`Path` の比較も
+`HashMap` の引きも成分単位）だが `display()` の結果は割れる。しかも
+`from_git_path` がそこへ `PathBuf::push`（= `\`）で継ぐので、
+**1 本のパスの中で `C:/Users/…/repo\src` と割れる**ところまで行っていた。
+
+直し方は #1092（`file://` URI 由来の cwd）と同型で、**git の出口で OS の区切りへ寄せる**
+（`to_git_path` の逆向き）。変換の実装は `file_uri::native_separators` の 1 本を共有し、
+UNC の専用分岐はこの変換に吸収されるので畳んだ。`normalize_repo_root_with` を足したので
+**macOS 上から Windows の形を検証できる**。
+
+##### 実機 A/B（同一バイナリ・env だけ替える）
+
+`TAKO_1102_LEGACY=1` で #1102 前へ戻る。GUI を使わない決定的な実測が
+`cargo test -p tako-core --lib git` で取れる（新設の
+`repo_rootとfrom_git_pathの表記が揃う` が実 `git` の出口を通る）:
+
+| arm | 結果 |
+|---|---|
+| 既定 | 66 passed / 1 failed（**失敗は既存の `git_tree::…綴りを二重に出さない`** = POSIX 決め打ちのテスト） |
+| `TAKO_1102_LEGACY=1` | 65 passed / **2 failed**。増えた 1 件のメッセージが症状そのもの:<br>`ルート C:/Users/x/repo と絶対パス C:/Users/x/repo\src\deep\nested.txt で区切りが割れている` |
+
+GUI セルフテストの実機 A/B（同じ build・env だけ替える）:
+
+| arm | 項目 135 |
+|---|---|
+| `TAKO_1102_LEGACY=1` | **FAILED**: `135: 応答のパス表記が OS の区切りで揃う (#1102。paths=11 want_style=(false, true) mixed=[…"C:/Users/<winuser>/…/repo", "C:/Users/<winuser>/…/repo\build", …])` |
+| 既定 | **通過**: `TAKO_SELF_TEST_1009: kinds=true propagate=true plain=true rows=true dispatch=true paths=11 style=(false, true) mixed=0 entries=9 repos=1` |
+
+`roots` は legacy でも `mixed` に出ない（呼び出し側が渡した実パスなので元から
+OS の区切り）= Issue の記述と一致する。
+
+##### テスト側も 2 か所直した
+
+- 項目 135 (d) の探索が `path.ends_with("/src")` と **POSIX の区切りを決め打ち**
+  していた（製品側を直しても Windows では当たらない）→ **実パスとして**突き合わせる
+- (f) を新設: `roots` / `repos[].root` / `entries[].path` の区切りが
+  **その機の実パスと同じ流儀**で出ることを見る。表記の混在そのものを落とす検査で、
+  区切り 2 種の有無を比べるので macOS でも検出力がある
+
+##### 次の壁は項目 137（#1040）。POSIX 決め打ちは直したが**解消していない**
+
+fixture が `printf '%s\n' …` を**ペインのシェルへ直接**書いていた。
+**この機に `printf` は無い**（実測: `Get-Command printf` → NOT found。
+git for Windows の `usr\bin` は PATH に無い）ので、PowerShell のペインでは
+1 度も実行されていなかった。それでも段 (a) が通っていたのは、
+**打ち込んだコマンド行そのものが画面へエコーされ、その中に marker 文字列が
+含まれていた**ため（= 偶然通っていた）。段 (d) は「理由は marker の 1 つ上の行」
+という契約なので、両方が 1 行に並ぶエコー行では成立せず落ちる。
+
+`ShellDialect::print_lines` へ寄せた（PowerShell の `echo 'a' 'b'` は
+**2 行に分かれる**ことを実測で確認 = `count=2 out=[aaa|bbb]`）。
+**ただしこれだけでは項目 137 (d) は通らない**（修正の前後で 2/2 とも同じ失敗。
+`phase=Some("connected")` / tail の末尾が打ち直しの `echo TAKO_1040_RETRY`）。
+残っているのは #1040 側の競合（打ち直しが fixture の行を上書きする / marker の
+最初の出現が **エコー行**なので分類が「切断」へ倒れて再接続が走る）で、
+**#1102 の射程外**として分離した。次の run が切り分けられるように失敗診断の
+tail を 3 → 12 行へ広げてある。
+
+**起動コマンド（argv）の番犬（#889）は在ったが、`pty_line` / `type_text` で流す
+「本文」は素通りだった**ので番犬 `ペインへ打つ本文もposix決め打ちにしない` を足した。
+POSIX でしか走らない箇所（`/bin/zsh` の存在で gate された 41c、macOS 限定の
+visual-test）は `watchdog-allow` + 理由で外す。
+
+##### 実機の測り方で分かったこと
+
+- **`Start-Process` した tako-app の `PriorityClass = "High"`** が効く。この機は
+  他セッションの残骸プロセスで CPU が飽和することがあり、既定の優先度だと
+  時間依存の項目（#739 の送達待ち 4 秒、#813 の fixture 描画）が**次々に別の場所で**
+  落ちる。優先度を上げた run は同じ負荷のまま項目 137 まで到達した
+  （7 → 74 → 113 → 150 行と、run ごとに落ちる場所が動くのが「負荷依存」の見分け方）
+- **落ちる場所が動くうちは製品の回帰と決めない**。#739 は 1 回目 `delivered=false` /
+  2 回目 `delivered=true` で、コードは 1 行も変えていない
+- ログは書き込み中に `Get-Content` で開けない（`FileShare.ReadWrite` で開く）

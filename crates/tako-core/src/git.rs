@@ -270,10 +270,41 @@ pub fn from_git_path(repo: &Path, rel: &str) -> std::path::PathBuf {
 
 /// `rev-parse --show-toplevel` の出力を実パスへ直す。
 ///
-/// git は Windows でも `C:/Users/x/repo` のように `/` で返す。`PathBuf` は
-/// Windows でも `/` を区切りとして解釈するのでそのままでも動くが、
-/// UNC（git は `//server/share` と返す）だけは `\\server\share` に直さないと解決できない
+/// git は Windows でも `C:/Users/x/repo` のように **`/` 区切り**で返す。`PathBuf` は
+/// Windows でも `/` を区切りとして解釈するので**動作は元から同じ**だが、`display()` の
+/// 結果がそのまま応答へ出るため、直さないと**同じ機に同じパスの 2 通りの表記が混ざる**
+/// （#1102 の実測: `tree git-status` の `roots` は OS の区切りなのに `repos[].root` だけ
+/// `C:/…` になり、`from_git_path` がそこへ `push` するので
+/// `C:/Users/…/repo\src` という 1 本の中で割れた形にまでなる）。
+/// 表記は `tako list` / MCP の応答・git タブ・プレビューの履歴表示にも出るので、
+/// **git の出口 1 箇所**で OS の区切りへ寄せる（[`to_git_path`] の逆向き）。
+///
+/// UNC（git は `//server/share` と返す）もこの変換で `\\server\share` になる。
+///
+/// 判定は**文字列の形だけ**で決まるので `cfg` を書かない。macOS 上から Windows の形を
+/// 検証したいときは [`normalize_repo_root_with`] を使う（#515 の方針）
 pub fn normalize_repo_root(raw: &str) -> std::path::PathBuf {
+    if legacy_1102() {
+        return legacy_normalize_repo_root(raw);
+    }
+    normalize_repo_root_with(raw, std::path::MAIN_SEPARATOR)
+}
+
+/// [`normalize_repo_root`] の区切り明示版（テスト用に両プラットフォームぶんを回す）
+pub fn normalize_repo_root_with(raw: &str, main_separator: char) -> std::path::PathBuf {
+    let trimmed = raw.trim();
+    std::path::PathBuf::from(
+        crate::file_uri::native_separators_with(trimmed, main_separator).as_ref(),
+    )
+}
+
+/// #1102 の修正を入れる前へ戻す逃げ道（`TAKO_1102_LEGACY=1`）。A/B 計測専用
+fn legacy_1102() -> bool {
+    std::env::var_os("TAKO_1102_LEGACY").is_some()
+}
+
+/// #1102 以前の [`normalize_repo_root`]（UNC だけを直し、他は git の `/` 表記のまま）
+fn legacy_normalize_repo_root(raw: &str) -> std::path::PathBuf {
     let trimmed = raw.trim();
     if cfg!(windows) && trimmed.starts_with("//") && !trimmed.starts_with("///") {
         return std::path::PathBuf::from(trimmed.replace('/', "\\"));
@@ -2802,10 +2833,63 @@ mod portability_tests {
     #[test]
     fn normalize_repo_rootはドライブレター表記をそのまま扱える() {
         // git は Windows でも `/` で返す。PathBuf は `/` を区切りとして解釈するので
-        // そのまま渡してよい（分解できることを確認する）
+        // そのまま渡しても分解はできる（表記だけが割れる = #1102）
         let p = normalize_repo_root("C:/Users/dev/repo\n");
         assert!(p.to_string_lossy().starts_with("C:/") || p.to_string_lossy().starts_with("C:\\"));
         assert!(p.to_string_lossy().ends_with("repo"));
+    }
+
+    /// #1102: git の出力（常に `/`）を **OS の区切り**へ寄せる。
+    /// 区切りを引数で受ける版を使うので、macOS 上から Windows の形を検証できる
+    #[test]
+    fn normalize_repo_rootはgitのスラッシュをosの区切りへ寄せる() {
+        // Windows: `C:/Users/x/repo` → `C:\Users\x\repo`
+        assert_eq!(
+            normalize_repo_root_with("C:/Users/x/repo\n", '\\').to_string_lossy(),
+            "C:\\Users\\x\\repo"
+        );
+        // UNC も同じ変換で実パス表記になる（#1102 前は専用の分岐で直していた）
+        assert_eq!(
+            normalize_repo_root_with("//server/share/repo", '\\').to_string_lossy(),
+            "\\\\server\\share\\repo"
+        );
+        // unix は 1 文字も触らない（`\` はファイル名に使える普通の文字）
+        assert_eq!(
+            normalize_repo_root_with("/tmp/repo\n", '/').to_string_lossy(),
+            "/tmp/repo"
+        );
+        assert_eq!(
+            normalize_repo_root_with("/tmp/a\\b", '/').to_string_lossy(),
+            "/tmp/a\\b"
+        );
+    }
+
+    /// #1102: 表記を寄せても**同じ場所を指す**（変わるのは `display()` だけ）。
+    /// `Path` の比較は成分単位なので、寄せる前後で等価であることを固定する
+    #[test]
+    fn normalize_repo_rootは寄せても同じパスを指す() {
+        let before = std::path::PathBuf::from("C:/Users/x/repo");
+        let after = normalize_repo_root_with("C:/Users/x/repo", std::path::MAIN_SEPARATOR);
+        assert_eq!(before, after);
+    }
+
+    /// #1102: リポジトリルートと、そこへ git の相対パスを継いだ絶対パスが
+    /// **1 本の中で割れない**（Windows は `PathBuf::push` が `\` を足すので、
+    /// ルートが `/` のままだと `C:/Users/…/repo\src` になっていた）
+    #[test]
+    fn repo_rootとfrom_git_pathの表記が揃う() {
+        let repo = normalize_repo_root("C:/Users/x/repo");
+        let abs = from_git_path(&repo, "src/deep/nested.txt");
+        let root_text = repo.display().to_string();
+        let abs_text = abs.display().to_string();
+        let style = |s: &str| (s.contains('/'), s.contains('\\'));
+        assert_eq!(
+            style(&root_text),
+            style(&abs_text),
+            "ルート {root_text} と絶対パス {abs_text} で区切りが割れている"
+        );
+        // 継いだ側はルートを文字列としても前置きに持つ（応答の突き合わせが成立する）
+        assert!(abs_text.starts_with(&root_text), "{abs_text} / {root_text}");
     }
 
     /// CRLF のリポジトリで git 出力を受けても各パーサが壊れないこと。

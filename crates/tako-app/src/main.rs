@@ -29013,6 +29013,7 @@ mod self_test {
         // 決まった絵を仕込む: 下端が揃った大文字だけの行を空行で挟む
         // （インクの塊が 1 行 = 1 グリフ行にきれいに分かれる）
         press(any, cx, "ctrl-u");
+        // watchdog-allow: visual-test は macOS でしか走らない（feature ゲート）
         type_text(
             any,
             cx,
@@ -31096,7 +31097,8 @@ mod self_test {
                     PaneOrigin::User,
                 );
                 if let Some(session) = app.terminals.get(&out_pane) {
-                    // 行末は `pty_line`（CR）で送る（#897 の番犬）
+                    // 行末は `pty_line`（CR）で送る（#897 の番犬）。
+                    // watchdog-allow: visual-test は macOS でしか走らない（feature ゲート）
                     session.write(pty_line(
                         "clear; i=0; while [ $i -lt 4000 ]; do printf '\\rworking %d' $i; \
                          i=$((i+1)); sleep 0.05; done",
@@ -36796,6 +36798,7 @@ mod self_test {
                 // エッジ 2: alt screen の TUI では zsh の line editor 自体が動かないので
                 // 干渉しない（打鍵はそのまま TUI へ届き、前のプロンプトの予測も残らない）
                 press(any, cx, sh.clear_line_key());
+                // watchdog-allow: 41c は `/bin/zsh` が在るときだけ走る（上の gate）
                 type_text(any, cx, "printf '\\033[?1049h'; cat; printf '\\033[?1049l'", true);
                 wait(cx, 1200).await;
                 type_text(any, cx, "TAKO600-alt", false);
@@ -58795,6 +58798,8 @@ mod self_test {
             //   (d) 同じ表が CLI / MCP（`tree git-status`）からも読める（開発不変条件）
             //   (e) git 側へ渡す走査の起点は**ルートだけ**（展開ディレクトリを全部
             //       渡すと `git rev-parse` が 2 秒ごとにその数だけ起動する）
+            //   (f) 応答に出るパスの区切りが OS の流儀で揃う（#1102。git は Windows でも
+            //       `/` で返すので、寄せないと 1 つの応答に 2 通りの表記が混ざる）
             {
                 let base1009 = std::env::temp_dir().join(format!(
                     "tako-selftest-1009-{}",
@@ -58952,28 +58957,76 @@ mod self_test {
                         .ok()
                     })
                     .unwrap_or(None);
+                let entries1009 = payload1009
+                    .as_ref()
+                    .and_then(|v| v["entries"].as_array().cloned())
+                    .unwrap_or_default();
+                // 応答のパスは**実パスとして**突き合わせる（区切りの流儀に依らない）。
+                // 文字列の suffix で探すと POSIX の `/src` を決め打ちすることになり、
+                // 表記が直っても Windows では当たらない（#1102）
+                let find1009 = |rel: &str| {
+                    let want = repo1009.join(rel);
+                    entries1009.iter().find(|e| {
+                        e["path"]
+                            .as_str()
+                            .map(|p| std::path::Path::new(p) == want)
+                            .unwrap_or(false)
+                    })
+                };
                 let dispatch_ok = payload1009
                     .as_ref()
                     .map(|v| {
-                        let entries = v["entries"].as_array().cloned().unwrap_or_default();
-                        let find = |name: &str| {
-                            entries.iter().find(|e| {
-                                e["path"]
-                                    .as_str()
-                                    .map(|p| p.ends_with(name))
-                                    .unwrap_or(false)
-                            })
-                        };
-                        find("fresh.txt").map(|e| e["state"] == "untracked") == Some(true)
-                            && find("staged.txt").map(|e| e["staged"] == "M") == Some(true)
-                            && find("tracked.txt").map(|e| e["unstaged"] == "M") == Some(true)
-                            && find("/src").map(|e| e["propagated"] == true) == Some(true)
+                        find1009("fresh.txt").map(|e| e["state"] == "untracked") == Some(true)
+                            && find1009("staged.txt").map(|e| e["staged"] == "M") == Some(true)
+                            && find1009("tracked.txt").map(|e| e["unstaged"] == "M") == Some(true)
+                            && find1009("src").map(|e| e["propagated"] == true) == Some(true)
                             && v["repos"].as_array().map(|r| r.len()) == Some(1)
                     })
                     .unwrap_or(false);
                 check(
                     dispatch_ok,
                     &format!("135: 同じ表が CLI / MCP からも読める (#1009。{payload1009:?})"),
+                );
+
+                // (f) 応答の中でパスの表記が割れない（#1102）。
+                // git は Windows でも `/` 区切りで返すので、寄せずに `PathBuf` にすると
+                // `roots` は `\`・`repos[].root` は `/`・`entries[].path` は
+                // `C:/…/repo\src` と 1 つの応答に 3 通りの表記が混ざる。
+                // 「同じ機の他の経路（`tako list` の cwd 等）と同じ流儀か」を見るので、
+                // 基準は**この機で作った実パス**の流儀にする
+                // 区切り 2 種の有無だけを見る（macOS でも「`\\` が紛れていないか」を
+                // 見られるので、両プラットフォームで検出力がある）
+                let sep_style1009 = |s: &str| (s.contains('/'), s.contains('\\'));
+                let want_style1009 = sep_style1009(&repo1009.display().to_string());
+                let mut shown1009: Vec<String> = Vec::new();
+                if let Some(v) = payload1009.as_ref() {
+                    for r in v["roots"].as_array().cloned().unwrap_or_default() {
+                        if let Some(s) = r.as_str() {
+                            shown1009.push(s.to_string());
+                        }
+                    }
+                    for r in v["repos"].as_array().cloned().unwrap_or_default() {
+                        if let Some(s) = r["root"].as_str() {
+                            shown1009.push(s.to_string());
+                        }
+                    }
+                    for e in &entries1009 {
+                        if let Some(s) = e["path"].as_str() {
+                            shown1009.push(s.to_string());
+                        }
+                    }
+                }
+                let mixed1009: Vec<&String> = shown1009
+                    .iter()
+                    .filter(|s| sep_style1009(s) != want_style1009)
+                    .collect();
+                check(
+                    !shown1009.is_empty() && mixed1009.is_empty(),
+                    &format!(
+                        "135: 応答のパス表記が OS の区切りで揃う \
+                         (#1102。paths={} want_style={want_style1009:?} mixed={mixed1009:?})",
+                        shown1009.len()
+                    ),
                 );
 
                 // (e) git へ渡す起点はルートだけ（展開ディレクトリを混ぜない）。
@@ -59001,7 +59054,9 @@ mod self_test {
                 println!(
                     "TAKO_SELF_TEST_1009: kinds={kinds_ok} propagate={propagate_ok} \
                      plain={plain_ok} rows={rows_ok} dispatch={dispatch_ok} \
-                     entries={} repos={}",
+                     paths={} style={want_style1009:?} mixed={} entries={} repos={}",
+                    shown1009.len(),
+                    mixed1009.len(),
                     map1009.len(),
                     map1009.repos().len()
                 );
@@ -59307,7 +59362,10 @@ mod self_test {
                 make_socket(false);
                 let _ = window.update(cx, |app: &mut TakoApp, _, _| {
                     if let Some(s) = app.terminals.get_mut(&pid1040) {
-                        s.write(pty_line(&format!("printf '%s\\n' {}", tako_core::shell::quote_for_shell(&marker1040))));
+                        // ペインへ打つ文字列は方言境界から組む（#865。POSIX の
+                        // `printf` を直書きすると PowerShell のペインでは
+                        // **機能が正常でも**マーカーが出ず、この段が必ず落ちる）
+                        s.write(pty_line(&sh.print_lines(std::slice::from_ref(&marker1040))));
                     }
                 });
                 let mut reconnecting1040 = None;
@@ -59437,11 +59495,12 @@ mod self_test {
                             st.rebase(&now);
                         }
                         if let Some(s) = app.terminals.get_mut(&pid1040) {
-                            s.write(pty_line(&format!(
-                                "printf '%s\\n%s\\n' {} {}",
-                                tako_core::shell::quote_for_shell("testuser@host: Permission denied (publickey)."),
-                                tako_core::shell::quote_for_shell(&marker1040)
-                            )));
+                            // 2 行を 1 行ずつそのまま出す（#865 の方言境界。
+                            // POSIX の `printf` は PowerShell のペインで通らない）
+                            s.write(pty_line(&sh.print_lines(&[
+                                "testuser@host: Permission denied (publickey).".to_string(),
+                                marker1040.clone(),
+                            ])));
                         }
                     })
                     .is_ok();
@@ -59476,7 +59535,9 @@ mod self_test {
                                     .into_iter()
                                     .filter(|l| !l.trim().is_empty())
                                     .rev()
-                                    .take(3)
+                                    // #1102: 3 行では「fixture の行が実行されたのか」
+                                    // 「打ち直しに上書きされたのか」を見分けられない
+                                    .take(12)
                                     .collect()
                             })
                             .unwrap_or_default();
@@ -61681,6 +61742,91 @@ mod selftest_pane_command_watchdog {
              検査している。製品が書くのは `welcome::launch_command_line` の実体パス\
              （Windows は `…\\tako.exe <sub>`）なので実機だけが落ちる。\
              期待値を同じ関数から作ること（#967）"
+        );
+    }
+
+    /// **ペインへ打ち込む本文を POSIX 決め打ちで書いている形**（#1102）。
+    ///
+    /// 起動コマンド（argv）は上の番犬が見ているが、`pty_line` / `type_text` で
+    /// **ペインのシェルへ流す本文**にも同じ罠がある。`printf '%s\n' …` は
+    /// PowerShell のペインでは通らないので、fixture の行が画面に出ず
+    /// **製品が正常でも検査だけが落ちる**（項目 137 = #1040 の (a)(d) が実機で
+    /// これに当たっていた。macOS では通るので CI では永久に気づけない）。
+    ///
+    /// 正しい形は [`tako_core::platform::shell_dialect::ShellDialect`] から組むこと
+    /// （2 行そのまま出すなら `print_lines`）。POSIX でしか走らない項目
+    /// （`/bin/zsh` の存在で gate された 41c など）は `watchdog-allow` で外す
+    fn posix_only_pane_text(src: &str) -> Vec<usize> {
+        let write = concat!("pty_", "line(");
+        let typed = concat!("type_", "text(");
+        let posix = concat!("printf", " '");
+        let lines: Vec<&str> = src.lines().collect();
+        let mut hits = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            if !line.contains(write) && !line.contains(typed) {
+                continue;
+            }
+            // 逃げ道は直前の行にも書ける（`watchdog-allow:` + 理由のコメント）
+            let window = &lines[index.saturating_sub(1)..(index + 5).min(lines.len())];
+            let around = window
+                .iter()
+                .map(|l| l.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if around.contains(ALLOW_MARKER) {
+                continue;
+            }
+            if around.contains(posix) {
+                hits.push(index + 1);
+            }
+        }
+        hits
+    }
+
+    #[test]
+    fn ペインへ打つ本文もposix決め打ちにしない() {
+        let hits = posix_only_pane_text(include_str!("main.rs"));
+        assert!(
+            hits.is_empty(),
+            "main.rs:{hits:?} がペインへ流す本文を POSIX 決め打ちで組んでいる。\
+             PowerShell のペインでは行が出ず、製品が正常でも検査だけが落ちる。\
+             `ShellDialect`（`print_lines` 等）から組むこと（#1102）"
+        );
+    }
+
+    /// 検出力の担保: #1102 で直した形を見つけ、方言境界から組んだ形は許す
+    #[test]
+    fn 番犬はposix決め打ちの本文を見つけ方言境界は許す() {
+        // 見本に `.write(` を literal で書かない（#897 の番犬が括弧の釣り合いで
+        // 式を切り出すので、見本の文字列から後続の行まで舐めてしまう）。
+        // この番犬が見るのは `pty_line(` と `printf '` の 2 語だけ
+        let bad = format!(
+            "                        write({}(&format!(\"{} '%s\\n' {{}}\", q)));",
+            concat!("pty_", "line"),
+            concat!("print", "f"),
+        );
+        assert_eq!(posix_only_pane_text(&bad), vec![1], "違反を見逃した");
+        let good = format!(
+            "                        write({}(&sh.print_lines(&[marker.clone()])));",
+            concat!("pty_", "line"),
+        );
+        assert!(
+            posix_only_pane_text(&good).is_empty(),
+            "方言境界を誤検知した"
+        );
+        // 逃げ道つき（直前の行に書いた形）は許す
+        let allowed = format!(
+            "                // {}: POSIX でしか走らない項目\n                {}(any, cx, \"{} 'x'\", true);",
+            ALLOW_MARKER,
+            concat!("type_", "text"),
+            concat!("print", "f"),
+        );
+        assert!(
+            posix_only_pane_text(&allowed).is_empty(),
+            "逃げ道が効いていない"
         );
     }
 
