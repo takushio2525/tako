@@ -181,7 +181,26 @@ scripts/promo/pii-scan.sh ~/Desktop/tako-promo/tako-explainer-v1.mp4
   （実測）。連番スクリーンショット（4 fps・3x）→ ffmpeg の方が確実で鮮明
 - PWA の term ビューは WebSocket の画面プッシュ前提なので、モックでは読み込み中のまま。撮らない
 - 文字サイズはペイン既定の 13 では 1080p で小さいので `tako theme --size 15` で撮る
-- `say -v Kyoko` の `-r` は 160 と 175 で尺が変わらなかった（実測）。180 で使う
+- `say -v Kyoko` の `-r` は 160 と 175 で尺が変わらなかった（実測）。180 で使う。ピークは -13dB 程度と
+  小さいので合成時に +7dB（limiter つき）持ち上げる
+- **かんたん表示のチャット判定は器（tmux バックエンド）が要る**: `chat_session` の材料
+  `live_claude_sessions_by_backend` は tmux ペインの pid 対応付けに乗るので、`TAKO_PERSIST=0` の
+  隔離では claude ペインが永久に terminal のまま（実測: persist=0 は 40 秒待っても terminal /
+  persist=1 は 5 秒で chat）。master 章だけ persist=1 で撮る
+- **再起動復元の絵は器を残して止める**: `promo_stop_isolated` は tmux `kill-server` まで行うので、
+  それを挟むと再起動が「tmux 再 attach 0 / 新規シェル 3」になる（persist.log で実測）。
+  前半のあとは `promo_stop_isolated_keep_sessions`（アプリだけ SIGTERM）
+- master（sonnet）は既定プロファイルの effort=max だと最初の spawn まで 40 秒考え、3 体の spawn に
+  2 分超かかる（1 体 40 秒前後 = prompt 送達待ち）。収録では `--effort medium` + 尺 420 秒 +
+  「ペインが 4 つ揃うまで」「chat が出るまで」「master が idle に戻るまで」を待つ形にした
+- ffmpeg は既定で stdin を読むので `while read` ループの中で呼ぶと tsv の次の行を食う → `-nostdin`
+- bash の `IFS=$'\t' read` は連続タブを 1 つに潰すので、空欄のある tsv は列がずれる →
+  `promo_timeline_rows` で空欄を `-` に埋めてから読む
+- docs の md は frontmatter（`--- title ---`）がプレビューで本文として描かれる → 見出しへ置換して写す
+- コマンドカード（`tako show-command`）は画面下部に出るので、その区間のテロップは上に置く
+  （caption の先頭 `^`）
+- `$id（` のように変数の直後に全角を置くと bash が変数名に取り込んで `set -u` で落ちる
+  （`shell_scripts` 番犬が CI で落とす）。`${id}（` と書く
 
 ## 付随物（YouTube）
 
