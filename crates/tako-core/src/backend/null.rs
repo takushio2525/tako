@@ -37,6 +37,10 @@ impl SessionBackend for NullBackend {
             // 器が無いので打鍵は tako の PTY へ直接届く（#907）
             keystrokes_ascii_only: false,
             quotes_program: true,
+            // 器が無い = CSI u は外側の tako がそのまま扱う（#28 の直接ペイン経路）
+            extended_keys: true,
+            // 器が無い = copy mode 自体が無い（スクロールは tako 側。FR-2.5.13）
+            suppresses_copy_mode_indicator: true,
             label: "none",
         }
     }

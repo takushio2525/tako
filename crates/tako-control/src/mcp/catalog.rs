@@ -1410,6 +1410,8 @@ pub fn tools() -> Vec<Value> {
                         "type": "array", "items": { "type": "string" },
                         "description": "環境変数を削除する（キー名の配列。set 時。Issue #500）",
                     },
+                    "cwd": { "type": "string", "description": "master / solo をこのフォルダで起動する（**絶対パスか `~/` から始まる形**。相対パスは起動時に解決できないので拒否する。存在しないパスもエラー。空文字でクリア。set 時。#500 / #1056）。引き継ぎ（tako_orchestrator_handoff）の後任もここで起動する（未設定なら前任 master と同じフォルダ。#1055）" },
+                    "clear_cwd": { "type": "boolean", "description": "cwd の指定を解除する（set 時。#1056）" },
                     "master_account": { "type": "string", "description": "master の既定アカウント名（accounts.yaml のキー。空文字でクリア。set 時。#504）" },
                     "clear_master_account": { "type": "boolean", "description": "master_account を解除する（set 時。#504）" },
                     "worker_account": { "type": "string", "description": "worker の既定アカウント名（空文字でクリア。set 時。#504）" },
@@ -2015,14 +2017,14 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_remote_scrollback",
-            "description": "ペインのスクロールバック履歴をプレーンテキストで取得する。\
-                tmux capture-pane で指定行数の履歴を取得し、ANSI なしのテキストとして返す。\
+            "description": "ペインのスクロールバック（履歴 + 現画面）をプレーンテキストで取得する。\
+                永続化の器（tmux / psmux）から指定行数を遡り、ANSI なしのテキストとして返す。\
                 リモートからの画面履歴確認やログ検索に使う。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "pane_id": { "type": "string", "description": "対象ペイン ID（必須。session:window.pane）" },
-                    "lines": { "type": "integer", "minimum": 1, "default": 1000, "description": "取得する履歴行数（省略時は 1000）" },
+                    "pane_id": { "type": "string", "description": "対象（必須。tako のペイン ID / 器のセッション名 / session:window.pane）" },
+                    "lines": { "type": "integer", "minimum": 1, "default": 1000, "description": "遡る履歴行数（省略時は 1000）" },
                 },
                 "required": ["pane_id"],
                 "additionalProperties": false,

@@ -22,6 +22,21 @@
 //! 拾えない（器のサーバープロセス配下に移るため）。この制限は macOS と同じで、
 //! Windows 固有の縮退ではない。
 //!
+//! ## 実行中プロセスの実行ファイルパス（#936）
+//!
+//! [`image_path`] は**両プラットフォームぶんをここに置く**。この関数には
+//! `ports.rs` のような macOS 側の先行実装が無く（`tako-control::stale_binary` が
+//! `cfg` 付きで持っていた）、寄せ先を分けると呼び出し側に `cfg` が残るため。
+//!
+//! Windows は `QueryFullProcessImageNameW`。**フラグは 0（Win32 形式）で呼ぶ**:
+//! `PROCESS_NAME_NATIVE`（1）は**リネームを反映しない**（実測 2026-09-04:
+//! 実行中の exe を改名すると 0 は新しい名前、1 は古い名前を返す）。claude の
+//! 自己更新は「旧 exe を `claude.exe.old.<ts>` へ改名 → 新 exe を同じ名前で設置」
+//! なので、**リネームを反映する 0 でないと古いプロセスを見分けられない**
+//! （#936 の stale 検知はこの差だけで成り立っている）。
+//! .NET の `Process.Path` / `GetModuleFileNameEx` も改名前の名前を返すので
+//! 「Get-Process で見えているパス」を根拠にしないこと。
+//!
 //! ## 依存クレートを足さない方針
 //!
 //! `windows-sys` は入れず必要な関数だけ宣言する（`platform::locale` の
@@ -56,6 +71,15 @@ pub fn snapshot() -> Vec<ProcEntry> {
 /// 取得手段が無いプラットフォームでは空を返す
 pub fn tcp_listeners() -> Vec<TcpListenEntry> {
     imp::tcp_listeners()
+}
+
+/// 実行中プロセスの実行ファイルの絶対パス。取れなければ `None`
+/// （プロセスが既に居ない / 権限が無い / 取得手段が無いプラットフォーム）。
+///
+/// **返すのは「いまのファイル名」**: 実行中に実行ファイルが改名されたら
+/// 改名後のパスを返す（モジュールの解説を参照。#936 の stale 検知が依っている）
+pub fn image_path(pid: u32) -> Option<std::path::PathBuf> {
+    imp::image_path(pid)
 }
 
 /// `root` とその子孫の pid 集合（`root` 自身を含む）。
@@ -119,12 +143,48 @@ mod imp {
         sz_exe_file: [u16; MAX_PATH],
     }
 
+    /// `PROCESS_QUERY_LIMITED_INFORMATION`。`PROCESS_QUERY_INFORMATION` より弱く、
+    /// **保護されたプロセスにも開ける**（実行ファイルパスの取得はこれで足りる）
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x0000_1000;
+
     #[link(name = "kernel32")]
     extern "system" {
         fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> Handle;
         fn Process32FirstW(snapshot: Handle, entry: *mut ProcessEntry32W) -> i32;
         fn Process32NextW(snapshot: Handle, entry: *mut ProcessEntry32W) -> i32;
         fn CloseHandle(object: Handle) -> i32;
+        fn OpenProcess(access: u32, inherit_handle: i32, process_id: u32) -> Handle;
+        fn QueryFullProcessImageNameW(
+            process: Handle,
+            flags: u32,
+            exe_name: *mut u16,
+            size: *mut u32,
+        ) -> i32;
+    }
+
+    pub(super) fn image_path(pid: u32) -> Option<std::path::PathBuf> {
+        // SAFETY: OpenProcess の戻りは null を検査し、復帰経路すべてで CloseHandle する。
+        // buf は size に渡した長さぶん確保済みで、API はそれ以上書き込まない
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return None;
+            }
+            // 長いパス（verbatim 無しでも `MAX_PATH` を超えうる）に備えて広く取る。
+            // 呼ばれるのは走査の変化時だけなので確保コストは問題にならない
+            let mut buf = vec![0u16; 32 * 1024];
+            let mut size = buf.len() as u32;
+            // フラグ 0 = Win32 形式。1（`PROCESS_NAME_NATIVE`）は改名を反映しない
+            let ok = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size);
+            CloseHandle(handle);
+            if ok == 0 || size == 0 {
+                return None;
+            }
+            let len = (size as usize).min(buf.len());
+            Some(std::path::PathBuf::from(String::from_utf16_lossy(
+                &buf[..len],
+            )))
+        }
     }
 
     fn invalid_handle() -> Handle {
@@ -328,6 +388,28 @@ mod imp {
     pub(super) fn tcp_listeners() -> Vec<TcpListenEntry> {
         Vec::new()
     }
+
+    /// macOS は libproc の `proc_pidpath`（**実体のパス**を返すので symlink の
+    /// ランチャ越しに起動しても `versions/<版>` 側が出る）。
+    /// それ以外の unix は `/proc/<pid>/exe`
+    #[cfg(target_os = "macos")]
+    pub(super) fn image_path(pid: u32) -> Option<std::path::PathBuf> {
+        let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        // SAFETY: buf.len() を長さとして渡しており、API はそれ以上書き込まない
+        let ret =
+            unsafe { libc::proc_pidpath(pid as i32, buf.as_mut_ptr().cast(), buf.len() as u32) };
+        if ret <= 0 {
+            return None;
+        }
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(ret as usize);
+        let text = std::str::from_utf8(&buf[..len]).ok()?;
+        Some(std::path::PathBuf::from(text))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn image_path(pid: u32) -> Option<std::path::PathBuf> {
+        std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+    }
 }
 
 #[cfg(test)]
@@ -388,6 +470,45 @@ mod tests {
         // System Idle Process を root にすると親無しプロセス群を全部拾ってしまう
         let procs = vec![p(0, 0, "idle"), p(4, 0, "System"), p(100, 4, "smss.exe")];
         assert_eq!(descendants_of(&procs, 0), HashSet::from([0]));
+    }
+
+    /// 実機の OS へ問い合わせる（**両プラットフォームで走る**）。#936 の
+    /// `stale_binary::pidpath` はこの 1 本に載っているので、Windows 未実装へ
+    /// 戻すとここが落ちる
+    #[test]
+    fn 実行中プロセスの実行ファイルパスを解決できる() {
+        let me = std::process::id();
+        let path = image_path(me).expect("自プロセスの実行ファイルパスが取れない");
+        assert!(path.is_absolute(), "絶対パスでない: {}", path.display());
+        assert!(
+            path.is_file(),
+            "実ファイルを指していない: {}",
+            path.display()
+        );
+        // 自分は cargo のテストバイナリなので、名前にクレート名の断片が入る
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        assert!(
+            name.contains("tako") || name.contains("procinfo") || name.contains("test"),
+            "自プロセスと無関係なパスを返している: {}",
+            path.display()
+        );
+        // verbatim prefix（`\\?\`）を持ち回らない。#970 の比較相手
+        // （`platform::path::canonicalize`）は剥がした形なので、付いていると
+        // stale 判定が**常に true** になる
+        assert!(
+            !path.to_string_lossy().starts_with(r"\\?\"),
+            "verbatim prefix が付いている: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn 居ないpidは解決できない() {
+        // 32bit の pid 空間の上端付近。実在しない値なので必ず None
+        assert_eq!(image_path(0xFFFF_FFF0), None);
     }
 
     /// 実機の OS へ問い合わせる。**この環境の構成に依存しない検査だけ**を書く

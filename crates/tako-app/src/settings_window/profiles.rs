@@ -484,6 +484,8 @@ impl SettingsWindow {
             from,
             projects: None,
             clear_projects: false,
+            cwd: None,
+            clear_cwd: false,
             master_agent: None,
             clear_master_agent: false,
             model: None,
@@ -1690,6 +1692,8 @@ fn profiles_request(action: &str, kind: ProfileKind, name: Option<&str>) -> Requ
         from: None,
         projects: None,
         clear_projects: false,
+        cwd: None,
+        clear_cwd: false,
         master_agent: None,
         clear_master_agent: false,
         model: None,
@@ -1776,6 +1780,10 @@ impl ProfilesSet {
             from: None,
             projects: self.projects,
             clear_projects: self.clear_projects,
+            // #1056: cwd は CLI / MCP から設定する（設定画面にはまだ入力欄が無い）。
+            // None / false = 「触らない」なので、GUI の set がここを消すことはない
+            cwd: None,
+            clear_cwd: false,
             master_agent: self.master_agent,
             clear_master_agent: self.clear_master_agent,
             model: self.model,

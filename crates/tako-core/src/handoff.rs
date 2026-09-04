@@ -12,6 +12,7 @@
 //! 実際の送信は tako-app の定期 tick（画面由来の ctx% を持っている層）が、
 //! 新 master の spawn は `tako-control::dispatch` が担う。
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::i18n::{lang, Lang};
@@ -153,6 +154,107 @@ pub fn resolve_master_profile(
             },
         ),
         None => (DEFAULT_PROFILE.to_string(), ProfileSource::Default),
+    }
+}
+
+/// 後任 master の起動フォルダを**どこから**決めたか（#1055 の診断用）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuccessorCwdSource {
+    /// プロファイルの `cwd`（ユーザーの明示指定）
+    Profile,
+    /// 前任 master ペインの cwd
+    PreviousMaster,
+    /// どちらからも決まらずホームへ落ちた（#1055 以前の唯一の挙動）
+    Home,
+}
+
+impl SuccessorCwdSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Profile => "profile",
+            Self::PreviousMaster => "previous_master",
+            Self::Home => "home",
+        }
+    }
+
+    /// 警告文へ埋め込む「決め手」の説明
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Profile => "プロファイルの cwd",
+            Self::PreviousMaster => "前任 master の cwd",
+            Self::Home => "ホーム（プロファイルにも前任にも手がかりが無い）",
+        }
+    }
+}
+
+/// 後任 master の起動フォルダの決定
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuccessorCwd {
+    pub path: PathBuf,
+    pub source: SuccessorCwdSource,
+}
+
+/// 後任 master をどのフォルダで起動するかを決める（#1055）。
+///
+/// 順は **プロファイルの `cwd` → 前任 master の cwd → ホーム**。
+///
+/// #1055 以前はホーム決め打ちだった（`dispatch` に `let cwd = home_dir()` が
+/// 直書きされており、プロファイルの `cwd` すら読んでいなかった）。master の動作環境は
+/// cwd に依存しうる（PreToolUse フック・direnv・リポジトリローカルの設定）ので、
+/// 「同プロファイル / 同アカウント / 同モデル / 同 effort で立て直す」という
+/// 引き継ぎの約束に **cwd も含める**。実発の症状: `$PWD` がリポジトリ配下のときだけ
+/// 許可するフックを持つ環境で、後任がホームで立ち上がって全ツールを拒否され、
+/// 引き継ぎ手順（実態確認 → 前任ペインの確認 → close）に一切入れなかった。
+///
+/// プロファイルを前任より優先するのは、プロファイルが**ユーザーの明示指定**だから
+/// （前任がどこに居ようと、そのプロファイルの master はそこで動けと言われている）。
+pub fn resolve_successor_cwd(
+    profile_cwd: Option<PathBuf>,
+    previous_cwd: Option<PathBuf>,
+    home: PathBuf,
+) -> SuccessorCwd {
+    if let Some(path) = profile_cwd {
+        return SuccessorCwd {
+            path,
+            source: SuccessorCwdSource::Profile,
+        };
+    }
+    if let Some(path) = previous_cwd {
+        return SuccessorCwd {
+            path,
+            source: SuccessorCwdSource::PreviousMaster,
+        };
+    }
+    SuccessorCwd {
+        path: home,
+        source: SuccessorCwdSource::Home,
+    }
+}
+
+/// 起動フォルダが前任と食い違うときの警告文（#1055）。
+///
+/// 黙って別のフォルダで立てると「後任だけツールが全部拒否される」のような
+/// **理由の分からない停止**になるので、食い違いは必ず言葉にする。
+/// 前任の cwd を採取できなかった場合も、ホームへ落ちたときだけは黙らない
+/// （プロファイルで明示されているならユーザーの指定どおりなので黙る）。
+pub fn successor_cwd_warning(
+    resolved: &SuccessorCwd,
+    previous_cwd: Option<&Path>,
+    profile_name: &str,
+) -> Option<String> {
+    let new_path = resolved.path.display();
+    match previous_cwd {
+        Some(prev) if prev == resolved.path => None,
+        Some(prev) => Some(format!(
+            "後任 master の起動フォルダが前任と違います（前任: {} / 後任: {new_path}）。決め手: {}。\n  cwd に依存する設定（PreToolUse フック・direnv・リポジトリローカルの設定）があると、後任だけ挙動が変わります。\n  前任に合わせるには: tako orchestrator profiles set {profile_name} --cwd {}",
+            prev.display(),
+            resolved.source.describe(),
+            prev.display(),
+        )),
+        None if resolved.source == SuccessorCwdSource::Home => Some(format!(
+            "前任 master の cwd を採取できなかったため、後任をホーム（{new_path}）で起動します。\n  cwd に依存する設定があると、後任だけ挙動が変わります。\n  明示するには: tako orchestrator profiles set {profile_name} --cwd <path>"
+        )),
+        None => None,
     }
 }
 
@@ -2312,5 +2414,88 @@ mod tests {
             resolve_master_profile(None, Some("worker:tako:1")),
             ("default".to_string(), ProfileSource::Default)
         );
+    }
+
+    // --- #1055: 後任 master の起動フォルダ ---
+
+    fn cwd(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    /// 解決順は プロファイル → 前任 → ホーム
+    #[test]
+    fn 後任のcwdはプロファイルが最優先で次が前任() {
+        // プロファイル指定があれば前任より優先（ユーザーの明示指定）
+        let r = resolve_successor_cwd(
+            Some(cwd("/repo/a")),
+            Some(cwd("/repo/b")),
+            cwd("/Users/testuser"),
+        );
+        assert_eq!(r.path, cwd("/repo/a"));
+        assert_eq!(r.source, SuccessorCwdSource::Profile);
+
+        // プロファイル未設定なら前任を継ぐ（#1055 の主症状はここが無かった）
+        let r = resolve_successor_cwd(None, Some(cwd("/repo/b")), cwd("/Users/testuser"));
+        assert_eq!(r.path, cwd("/repo/b"));
+        assert_eq!(r.source, SuccessorCwdSource::PreviousMaster);
+
+        // どちらも無ければホーム（#1055 以前の唯一の挙動）
+        let r = resolve_successor_cwd(None, None, cwd("/Users/testuser"));
+        assert_eq!(r.path, cwd("/Users/testuser"));
+        assert_eq!(r.source, SuccessorCwdSource::Home);
+        assert_eq!(r.source.as_str(), "home");
+    }
+
+    /// 前任と同じフォルダに落ち着いたときは黙る（毎回の引き継ぎで警告を出さない）
+    #[test]
+    fn 前任と同じcwdなら警告を出さない() {
+        let r = resolve_successor_cwd(None, Some(cwd("/repo/a")), cwd("/Users/testuser"));
+        assert_eq!(
+            successor_cwd_warning(&r, Some(Path::new("/repo/a")), "takodev"),
+            None
+        );
+        // プロファイルが前任と同じ値を指しているときも同じ（出どころは違うが結果は同じ）
+        let r = resolve_successor_cwd(
+            Some(cwd("/repo/a")),
+            Some(cwd("/repo/a")),
+            cwd("/Users/testuser"),
+        );
+        assert_eq!(
+            successor_cwd_warning(&r, Some(Path::new("/repo/a")), "takodev"),
+            None
+        );
+    }
+
+    /// 前任と違うフォルダで立てるときは理由と直し方を出す
+    #[test]
+    fn 前任と違うcwdなら理由と直し方を出す() {
+        let r = resolve_successor_cwd(
+            Some(cwd("/repo/a")),
+            Some(cwd("/repo/b")),
+            cwd("/Users/testuser"),
+        );
+        let w = successor_cwd_warning(&r, Some(Path::new("/repo/b")), "takodev")
+            .expect("食い違いは黙らない");
+        assert!(w.contains("/repo/b"), "前任の cwd が出ていない: {w}");
+        assert!(w.contains("/repo/a"), "後任の cwd が出ていない: {w}");
+        assert!(w.contains("プロファイルの cwd"), "決め手が出ていない: {w}");
+        // 直し方は最簡形のコマンドで示す（#322）
+        assert!(
+            w.contains("tako orchestrator profiles set takodev --cwd /repo/b"),
+            "次の一手が無い: {w}"
+        );
+    }
+
+    /// 前任の cwd を採取できずホームへ落ちたときも黙らない
+    /// （#1055 の実発はこの形。理由が分からないまま全ツール拒否になった）
+    #[test]
+    fn 前任が不明でホームへ落ちたら警告する() {
+        let r = resolve_successor_cwd(None, None, cwd("/Users/testuser"));
+        let w = successor_cwd_warning(&r, None, "takodev").expect("ホーム落ちは黙らない");
+        assert!(w.contains("/Users/testuser"), "起動先が出ていない: {w}");
+        assert!(w.contains("--cwd"), "明示の仕方が出ていない: {w}");
+        // 前任が不明でもプロファイルで明示されているならユーザーの指定どおり = 黙る
+        let r = resolve_successor_cwd(Some(cwd("/repo/a")), None, cwd("/Users/testuser"));
+        assert_eq!(successor_cwd_warning(&r, None, "takodev"), None);
     }
 }

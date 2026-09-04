@@ -16,10 +16,10 @@ tako platform --status pending      # まだ使えないものだけ
 
 | 状態 | 件数 | 意味 |
 | --- | --- | --- |
-| 対応 | 113 / 144（78%） | macOS と同じように使えます |
+| 対応 | 114 / 144（79%） | macOS と同じように使えます |
 | 一部対応 | 14 | 使えますが機能が落ちます。落ち方は各表の「差分」列 |
 | 未実測 | 1 | 実装はあり macOS と同じ経路を通るが、Windows 実機でまだ動かしていないもの |
-| 未対応 | 14 | Windows 側の実装が無い、または動かないことが分かっているもの |
+| 未対応 | 13 | Windows 側の実装が無い、または動かないことが分かっているもの |
 | 対象外 | 2 | Windows にその概念が無い、または OS が同等機能を標準で持つ |
 
 ### 「未実測」について
@@ -198,7 +198,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 | `tako_port_detect` | 対応 | — | 実機実測: スライス 9 で tako list が 8123/node.exe を拾い、psmux の偽 listen 21 個を 1 つも報告しない + セルフテスト項目 55（ON/OFF） |
 | `tako_fda` | 対象外 | Windows に macOS の TCC（フルディスクアクセス）に相当する仕組みが無い | OS の仕様: Windows に TCC（フルディスクアクセス）相当の仕組みが無いので許可を求める対象が無い（#515 の判定テストが固定） |
 | `tako_shell_integration` | 一部対応 | cwd 追従とコマンド状態は器（psmux）越しでも側路で届くが、psmux が OSC を素通ししないため status の effective は false のままになる（#766） | 実機実測: #766 で側路の state が unknown → idle、exit_code=3、cwd が OSC 7 由来で追従。実機 shell_integration_powershell 7/0（#525） |
-| `tako_stale_binary` | 一部対応 | PATH 上の claude の実在確認は動くが、実行中の claude のパスを解決できないため古いバイナリの警告が出ない（#936 / #726） | 実機テスト: stale_binary::tests::test_pidpath_self と ランチャ探索…の 2 件が失敗。PATH 上の探索は #898 で境界 B16 へ寄せて実機実測済み |
+| `tako_stale_binary` | 一部対応 | 古いバイナリの検知と警告は動くが、バナーの「張り直す」はプロセスの終了要求が Windows 未対応のため実行できない（#1067 / 境界 B5） | 実機実測: #936 の Windows 11 実測（隔離 GUI + 偽 claude）: 実行中プロセスのパスを境界 B5（`procinfo::image_path`）で解決し、`tako stale-binary status` が stale=true / spawned_version=1.0.0 / current_version=1.0.1 を返してバナー「claude 1.0.1 が利用可能です（このセッションは 1.0.0）」が出る。claude の自己更新と同じ形（旧 exe を改名 → 新 exe を同じ名前で設置）でも stale=false → true へ変わる。張り直しは #1067 の terminate 未実装のため実行できない |
 | `tako_check_health` | 対応 | — | 実機実測: #937 の Windows 11 実測: MCP `tako_check_health` が HTTP 200 で healthy=true / tmux_available=true / persist_enabled=true / version_match=true / issues=[] を返す |
 | `tako_telemetry` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako telemetry status` → `on` → `status`（true）→ `off` → `status`（false）の往復 |
 
@@ -223,7 +223,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 
 ## リモートアクセス
 
-対応 1・一部対応 2・未対応 / 未実測 8
+対応 2・一部対応 2・未対応 / 未実測 7
 
 | 機能 | 状態 | 差分 | 根拠 |
 | --- | --- | --- | --- |
@@ -234,7 +234,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 | `tako_remote_devices` | 未対応 / 未実測 | #1038 で serve の中継先をループバック TCP へ変えたので、`unix socket serve target is not supported on Windows` で止まる原因は無くなった。ただし Windows 実機での通し（setup の 4 段目 → デーモン起動 → スマホからの接続）は未実測（#971） | 実機実測: #937 の Windows 11 実測: `tako remote devices list` は running=false の形を返すが、デーモンを起動できないので端末を登録できない（#971） |
 | `tako_remote_agents` | 未対応 / 未実測 | #1038 で serve の中継先をループバック TCP へ変えたので、`unix socket serve target is not supported on Windows` で止まる原因は無くなった。ただし Windows 実機での通し（setup の 4 段目 → デーモン起動 → スマホからの接続）は未実測（#971） | 実機実測: #937 の Windows 11 実測: `tako remote agents` は agents=[] を返し走査そのものは動く（#877 の境界）が、`tako remote setup` が serve 設定で失敗しデーモンを起動できない（#971） |
 | `tako_remote_messages` | 未対応 / 未実測 | remote デーモンの起動・停止に unix 前提の処理が残っており、Windows 実機での通し確認も未了 | 実機実測: #937 の Windows 11 実測: CLI が <SESSION_ID> を要求するところまで確認。実機の claude が未認証で会話を作れないため本体は未実測（デーモン側は #971 でブロック） |
-| `tako_remote_scrollback` | 未対応 / 未実測 | スクロールバックの取得が器の境界を通らず psmux で解決できない（セッション名でもペイン ID でも `no server running` になる。#972） | 実機実測: #937 の Windows 11 実測: セッション名でもペイン ID でも `psmux: no server running on session '<socket>__<target>'` になる。同じソケットへ境界経由で叩く `tako tmux list` は成功する（#972） |
+| `tako_remote_scrollback` | 対応 | — | 実機実測: #972 の Windows 11 実測（psmux 3.3.7・同一バイナリの A/B）: 既定では実経路テスト `remote_scrollback_e2e`（実 psmux + 偽 IPC サーバー）がセッション名と数値ペイン ID の両方で緑、`TAKO_972_LEGACY=1` では `psmux: no server running on session '<socket>__<pane id>'` で落ちる（#937 が報告した症状そのもの）。数値 ID の解決に要る IPC クライアントの Windows 実装も #972 で入れた（それまでは `Windows の IPC は未実装` の 1 行だった） |
 | `tako_open_remote` | 一部対応 | Windows の OpenSSH は接続多重化（ControlMaster）に対応しないため、操作ごとに独立した SSH 接続になる。鍵・ssh-agent で入れる相手は変わらないが、パスワード認証しか無い相手はツリーの展開やファイルの取得のたびに認証が要る。接続が生きているかもソケットで判定できないので、切断後の自動再接続（#1040）も armed にならない（#1090） | 実機実測: #1090 の Windows 11 実測（OpenSSH_for_Windows_10.0p2）: ControlMaster 系を渡すと接続の前に `getsockname failed: Not a socket` / exit -1 で死に、渡さないと同じ相手へ exit 255（`Could not resolve hostname` / `Host key verification failed`）まで進む。渡さない形にしたうえで到達不能ホストの 3 経路（split / tab / pane）が理由 + 次の一手を出してローカルのシェルへ戻ることを実測 |
 | `tako_remote_folder` | 一部対応 | 同梱の OpenSSH クライアントで開けるが、接続多重化（ControlMaster）が無いので操作ごとに認証が起きる（パスワード認証しか無い相手は展開のたびに聞かれる。接続が生きているかも判定できない。#1090）。ペインの ssh を検知した自動追加（#976）は、プロセスのコマンド行を採れないので働かない（明示的に開く経路だけが使える） | 実機実測: #1090 の Windows 11 実測: ControlMaster 系を渡した sftp は `getsockname failed: Not a socket` で握手にすら進まないが、渡さないと同じ相手へ SSH の握手が進む（`Host key verification failed` まで到達）。渡さない形で `tako remote-folder open` / `ls` が実 SSH 先の一覧を返すことを実測 |
 | `tako_ssh_hosts` | 対応 | — | 実機テスト: ~/.ssh/config の解析は純粋関数で、remote_fs / ssh_hosts の単体が実機で緑（ホーム解決は #870 で一本化） |

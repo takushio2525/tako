@@ -164,10 +164,11 @@ pub mod notes {
         "AI naming works, but without shell integration (#525) a tab's inputs (cwd, title, command state) never change after startup, so each tab is named only once. Without claude installed the tab name becomes the PowerShell executable path (#760)",
     );
 
-    /// #936。PATH 上の探索（#898 で境界へ寄せた）は動くが、実行中プロセスを特定できない
-    pub const WIN_STALE_BINARY_PID: Note = Note::new(
-        "PATH 上の claude の実在確認は動くが、実行中の claude のパスを解決できないため古いバイナリの警告が出ない（#936 / #726）",
-        "Checking that claude exists on PATH works, but the running claude's path cannot be resolved, so the stale binary warning never appears (#936 / #726)",
+    /// #936 で検知と警告は動くようになった。残るのはバナーの「張り直す」で、
+    /// ハーネス更新がプロセスの終了要求（境界 B5 の制御側 = #1067）に依っている
+    pub const WIN_STALE_BINARY_RESTART: Note = Note::new(
+        "古いバイナリの検知と警告は動くが、バナーの「張り直す」はプロセスの終了要求が Windows 未対応のため実行できない（#1067 / 境界 B5）",
+        "Detecting a stale binary and warning about it works, but the banner's Restart action cannot run because process termination is not implemented on Windows (#1067 / boundary B5)",
     );
 
     /// #766 / #525。側路（`TAKO_OSC_SINK`）で届くが、能力申告は素通し不可のまま
@@ -210,12 +211,6 @@ pub mod notes {
     pub const WIN_REMOTE_SERVE_UNIX: Note = Note::new(
         "#1038 で serve の中継先をループバック TCP へ変えたので、`unix socket serve target is not supported on Windows` で止まる原因は無くなった。ただし Windows 実機での通し（setup の 4 段目 → デーモン起動 → スマホからの接続）は未実測（#971）",
         "The hard-coded unix socket serve target was removed in #1038 (the daemon now listens on loopback TCP), so `unix socket serve target is not supported on Windows` no longer applies. The end-to-end run on real Windows hardware (setup step 4 -> daemon start -> phone access) is still unmeasured (#971)",
-    );
-
-    /// #972。器の境界（#519）を通らず `tako_core::tmux` を直に叩いている
-    pub const WIN_REMOTE_SCROLLBACK_BACKEND: Note = Note::new(
-        "スクロールバックの取得が器の境界を通らず psmux で解決できない（セッション名でもペイン ID でも `no server running` になる。#972）",
-        "Scrollback capture bypasses the container boundary and psmux cannot resolve it (both a session name and a pane id return `no server running`; #972)",
     );
 
     // ─── そもそも要らない / 概念が無い ─────────────────────────────
@@ -1204,12 +1199,9 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_remote_scrollback",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_REMOTE_SCROLLBACK_BACKEND,
-            issue: 972,
-        },
+        windows: Support::Supported,
         windows_evidence: Evidence::Measured(
-            "#937 の Windows 11 実測: セッション名でもペイン ID でも `psmux: no server running on session '<socket>__<target>'` になる。同じソケットへ境界経由で叩く `tako tmux list` は成功する（#972）",
+            "#972 の Windows 11 実測（psmux 3.3.7・同一バイナリの A/B）: 既定では実経路テスト `remote_scrollback_e2e`（実 psmux + 偽 IPC サーバー）がセッション名と数値ペイン ID の両方で緑、`TAKO_972_LEGACY=1` では `psmux: no server running on session '<socket>__<pane id>'` で落ちる（#937 が報告した症状そのもの）。数値 ID の解決に要る IPC クライアントの Windows 実装も #972 で入れた（それまでは `Windows の IPC は未実装` の 1 行だった）",
         ),
     },
     Feature {
@@ -1485,13 +1477,17 @@ pub const MATRIX: &[Feature] = &[
         ),
     },
     Feature {
+        // #936 で検知そのものは動くようになった。**Supported へ倒さない**のは
+        // バナーの「張り直す」（= `tako session_restart` と同一実装）が
+        // プロセスの終了要求を必要とし、その Windows 実装が無いため
+        // （`platform::process::terminate` は明示 Err）。status / dismiss は動く
         key: "tako_stale_binary",
         macos: Support::Supported,
         windows: Support::Degraded {
-            note: notes::WIN_STALE_BINARY_PID,
+            note: notes::WIN_STALE_BINARY_RESTART,
         },
-        windows_evidence: Evidence::UnitTest(
-            "stale_binary::tests::test_pidpath_self と ランチャ探索…の 2 件が失敗。PATH 上の探索は #898 で境界 B16 へ寄せて実機実測済み",
+        windows_evidence: Evidence::Measured(
+            "#936 の Windows 11 実測（隔離 GUI + 偽 claude）: 実行中プロセスのパスを境界 B5（`procinfo::image_path`）で解決し、`tako stale-binary status` が stale=true / spawned_version=1.0.0 / current_version=1.0.1 を返してバナー「claude 1.0.1 が利用可能です（このセッションは 1.0.0）」が出る。claude の自己更新と同じ形（旧 exe を改名 → 新 exe を同じ名前で設置）でも stale=false → true へ変わる。張り直しは #1067 の terminate 未実装のため実行できない",
         ),
     },
     Feature {

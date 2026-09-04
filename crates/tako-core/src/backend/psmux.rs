@@ -62,6 +62,22 @@ pub const VERIFIED_VERSION: &str = "3.3.7";
 /// `extended-keys` / `extended-keys-format` / `copy-mode-position-format` /
 /// `default-terminal` / `terminal-features`（いずれも psmux が知らない or 未確認）。
 /// `escape-time` も外してある（psmux は ConPTY 直結で tmux の ESC 曖昧性回避が要らない）
+/// **psmux 3.3.7 が知らない設定オプション**（#974 の実機実測）。
+///
+/// 書くと 1 行につき 1 件の `psmux: N config warning(s):` が**ペインの出力へ**混ざる。
+/// 警告が出るだけで設定は効かないので、器へ渡す conf を組む側
+/// （`tmux_backend::backend_conf`）はこれらを能力で落とす。
+///
+/// **「psmux 版 conf に無い設定」とは別物**である点に注意: `default-terminal` /
+/// `escape-time` は下の [`BACKEND_CONF`] にも無いが、psmux は警告を出さずに受理する
+/// （#974 の実測で警告は 4 行だけだった）。ここには**実測で拒否されたものだけ**を置く
+pub const UNKNOWN_OPTIONS: &[&str] = &[
+    "extended-keys",
+    "extended-keys-format",
+    "terminal-features",
+    "copy-mode-position-format",
+];
+
 const BACKEND_CONF: &str = "\
 # tako psmux バックエンド設定（自動生成。手で編集しない。tako-core::backend::psmux）
 set -g status off
@@ -181,6 +197,12 @@ fn run_with(bin: &str, socket: Option<&str>, args: &[&str]) -> Result<String, St
 ///
 /// `pub` なのは統合テストが「この conf を psmux が警告なしで受理するか」を
 /// 実バイナリで確かめるため（未知のオプションが 1 行でもあるとペインに警告が出る）
+/// psmux が受理することを実バイナリで確かめてある conf の中身
+/// （統合テスト `psmux_backend::confは警告なしで受理されwarm_offが効く` が検証する）
+pub fn verified_conf() -> &'static str {
+    BACKEND_CONF
+}
+
 pub fn ensure_conf() -> Option<PathBuf> {
     let dir = data_dir()?;
     std::fs::create_dir_all(&dir).ok()?;
@@ -216,6 +238,12 @@ impl SessionBackend for PsmuxBackend {
             // そのまま運ぶので、非 ASCII は `inject_text` で入れる
             keystrokes_ascii_only: true,
             quotes_program: false,
+            // **拡張キーの語彙を 1 つも持たない**（#974 の実機実測: `extended-keys` /
+            // `extended-keys-format` / `terminal-features` は `unknown option` の
+            // 警告になるだけで効かない）。CSI u の要求は器で止まる
+            extended_keys: false,
+            // `copy-mode-position-format` を持たない（#974 の実機実測）
+            suppresses_copy_mode_indicator: false,
             label: "psmux",
         }
     }
@@ -581,6 +609,19 @@ impl DetachedCapture for PsmuxCapture {
         (!text.is_empty()).then(|| text.to_string())
     }
 
+    /// 履歴 + 現画面。ターゲットは psmux の規則（`=` を付けない = [`PsmuxBackend::target`]）
+    /// に従い素の名前で渡す。`-E` を付けないので現画面が入る
+    fn capture_scrollback(
+        &self,
+        session: &SessionRef,
+        lines: usize,
+    ) -> Result<Vec<String>, BackendError> {
+        let start = format!("-{lines}");
+        self.run(&["capture-pane", "-p", "-t", session.as_str(), "-S", &start])
+            .map(|out| out.lines().map(str::to_string).collect())
+            .map_err(BackendError::Operation)
+    }
+
     /// `#{history_bytes}` は psmux では空なので **0 を返す**。
     /// これは「バイト数 0」ではなく「観測できない」の意味で、
     /// 履歴飽和時のバイト差分検知（pane_log）はこの器では働かない
@@ -924,17 +965,15 @@ mod tests {
             BACKEND_CONF.contains("set -g warm off"),
             "warm off が無いと 1 セッションあたり pwsh が 1 本余計に常駐する"
         );
-        for unknown in [
-            "extended-keys",
-            "copy-mode-position-format",
-            "default-terminal",
-            "terminal-features",
-        ] {
+        for unknown in UNKNOWN_OPTIONS {
             assert!(
                 !BACKEND_CONF.contains(unknown),
                 "psmux が知らない設定 {unknown} が conf に残っている（ペインへ警告が出る）"
             );
         }
+        // psmux が受理はする（#974 の実測で警告に出ない）が、この conf では
+        // 保守的に外しているもの。落とす理由が違うので正本の列挙とは分けておく
+        assert!(!BACKEND_CONF.contains("default-terminal"));
     }
 
     /// **要件 2**: `show-environment` が全変数を返しても目的の 1 本を取り出せる

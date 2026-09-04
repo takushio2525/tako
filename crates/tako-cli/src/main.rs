@@ -1090,7 +1090,7 @@ enum RemoteCommand {
     },
     /// ペインのスクロールバック履歴をプレーンテキストで表示する
     Scrollback {
-        /// 対象ペイン ID（session:window.pane）
+        /// 対象（tako のペイン ID / 器のセッション名 / `session:window.pane`）
         pane_id: String,
         /// 取得する履歴行数（省略時は 1000）
         #[arg(long, default_value_t = 1000)]
@@ -2008,6 +2008,12 @@ enum ProfilesCommand {
         /// worker_account を解除する
         #[arg(long)]
         clear_worker_account: bool,
+        /// master / solo をこのフォルダで起動する（絶対パスか ~/ 始まり。空文字でクリア。#500 / #1056）
+        #[arg(long, conflicts_with = "clear_cwd")]
+        cwd: Option<String>,
+        /// cwd の指定を解除する（#1056）
+        #[arg(long)]
+        clear_cwd: bool,
         /// 割り当てるプロジェクトキー（カンマ区切り。丸ごと置き換え。#721）
         #[arg(long, value_delimiter = ',', conflicts_with = "clear_projects")]
         projects: Option<Vec<String>>,
@@ -4152,6 +4158,8 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
             clear_worker_account,
             projects,
             clear_projects,
+            cwd,
+            clear_cwd,
             ctx_threshold,
             clear_ctx_threshold,
             auto_handoff,
@@ -4167,6 +4175,8 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
             from: None,
             projects: projects.clone(),
             clear_projects: *clear_projects,
+            cwd: cwd.clone(),
+            clear_cwd: *clear_cwd,
             master_agent: master_agent.clone(),
             clear_master_agent: *clear_master_agent,
             model: model.clone(),

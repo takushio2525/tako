@@ -35,6 +35,13 @@ impl TmuxBackend {
         }
     }
 
+    /// ソケットを明示しての構築（**隔離検証・統合テスト用**。
+    /// `PsmuxBackend::with_parts` と同じ狙いで、プロセス全体の環境変数を
+    /// 触らずに器を隔離できる）
+    pub fn with_socket(socket: String) -> Self {
+        Self { socket }
+    }
+
     pub fn socket(&self) -> &str {
         &self.socket
     }
@@ -77,6 +84,13 @@ impl SessionBackend for TmuxBackend {
             // tmux の client は打鍵をバイト等価で内側へ渡す（macOS で実測。#907）
             keystrokes_ascii_only: false,
             quotes_program: true,
+            // conf の `extended-keys always` + `extended-keys-format csi-u` +
+            // `terminal-features … :extkeys` が CSI u を内側へ届ける（#28 の両輪の片方。
+            // ネスト tmux 用の同じ設定は `NESTED_TMUX_SNIPPET`）
+            extended_keys: true,
+            // conf の `copy-mode-position-format ''` で消せる（tmux 3.6 の既定書式は
+            // 先頭行のタイムスタンプを出す。2026-06-12 実機バグ (2)）
+            suppresses_copy_mode_indicator: true,
             label: "tmux",
         }
     }
@@ -267,6 +281,15 @@ impl DetachedCapture for TmuxBackend {
         } else {
             Some(text)
         }
+    }
+
+    fn capture_scrollback(
+        &self,
+        session: &SessionRef,
+        lines: usize,
+    ) -> Result<Vec<String>, BackendError> {
+        crate::tmux::capture_scrollback_plain(self.sock(), session.as_str(), lines)
+            .map_err(BackendError::Operation)
     }
 
     fn history_probe(&self, session: &SessionRef) -> Option<HistoryProbe> {

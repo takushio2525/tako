@@ -805,6 +805,12 @@ pub enum Request {
         /// projects の指定を解除する（Issue #721）
         #[serde(default)]
         clear_projects: bool,
+        /// master / solo をこのフォルダで起動する（`~` 展開。Issue #500 Part 5 / #1056）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        /// cwd の指定を解除する（Issue #1056）
+        #[serde(default)]
+        clear_cwd: bool,
         /// master のエージェント種別（claude / codex。agy は master 非対応）を設定する
         #[serde(default, skip_serializing_if = "Option::is_none")]
         master_agent: Option<String>,
