@@ -200,6 +200,90 @@ pub fn read_messages_at(path: &Path, tail: usize) -> Result<Vec<Value>, String> 
     Ok(normalize_lines(reader.lines().map_while(Result::ok), tail))
 }
 
+// ─────────────── コンテキスト使用量（Issue #1021） ───────────────
+
+/// 末尾から探すときに読むバイト数。assistant の usage 行は毎ターン出るので
+/// 通常はこの窓に必ず入る（入らなければ全走査へ落ちる）
+const USAGE_TAIL_BYTES: u64 = 1 << 20;
+
+/// 最後の API 応答の入力トークン量（Issue #1021）。
+///
+/// `claude agents --json` が `contextPercentUsed` を返さなくなった（2.1.258 実測）ので、
+/// ctx% は**上流と同じ式**で自分で出す。分子がこれ、分母が文脈窓
+/// （[`tako_core::ctx_usage::used_percent`]）。
+///
+/// **ペインの内容も発話も返さない**（トークン数とモデル id だけ = 診断の絶対ルール）
+pub fn last_context_usage(session_id: &str) -> Option<tako_core::ctx_usage::TranscriptCtx> {
+    last_context_usage_at(&find_transcript(session_id)?)
+}
+
+/// [`last_context_usage`] のパス指定版（所在が既に分かっているとき）
+pub fn last_context_usage_at(path: &Path) -> Option<tako_core::ctx_usage::TranscriptCtx> {
+    // 末尾だけ読んで探す（transcript は数 MB になるので 2 秒 tick で全走査しない）
+    if let Some(found) = scan_tail_for_usage(path) {
+        return Some(found);
+    }
+    // 末尾の窓に usage 行が無い（巨大なツール出力が続いた等）ときだけ全走査へ落ちる
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let mut last = None;
+    for line in reader.lines().map_while(Result::ok) {
+        if let Some(u) = usage_from_line(&line) {
+            last = Some(u);
+        }
+    }
+    last
+}
+
+/// ファイル末尾 [`USAGE_TAIL_BYTES`] を読み、**後ろから**最初に見つかった usage 行を返す
+fn scan_tail_for_usage(path: &Path) -> Option<tako_core::ctx_usage::TranscriptCtx> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(USAGE_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    // UTF-8 境界の途中で切れても落ちないようバイトで読んで lossy 変換する
+    let mut bytes = Vec::new();
+    file.take(USAGE_TAIL_BYTES).read_to_end(&mut bytes).ok()?;
+    let buf = String::from_utf8_lossy(&bytes);
+
+    let mut lines: Vec<&str> = buf.lines().collect();
+    // 途中から読んでいるので先頭行は不完全な可能性がある（先頭から読んだなら完全）
+    if start > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+    lines.iter().rev().find_map(|l| usage_from_line(l))
+}
+
+/// transcript の 1 行から assistant の usage を読む（該当しなければ `None`）
+fn usage_from_line(line: &str) -> Option<tako_core::ctx_usage::TranscriptCtx> {
+    // JSON パースの前に安い篩をかける（全走査でも 1 行ごとの serde を避ける）
+    if !line.contains("\"usage\"") {
+        return None;
+    }
+    let obj: Value = serde_json::from_str(line).ok()?;
+    if obj["type"].as_str() != Some("assistant") {
+        return None;
+    }
+    // サブエージェントの消費は本体の文脈使用率ではない
+    if obj["isSidechain"].as_bool() == Some(true) {
+        return None;
+    }
+    let usage = &obj["message"]["usage"];
+    let field = |k: &str| usage[k].as_u64().unwrap_or(0);
+    let total = field("input_tokens")
+        + field("cache_creation_input_tokens")
+        + field("cache_read_input_tokens");
+    if total == 0 {
+        return None;
+    }
+    Some(tako_core::ctx_usage::TranscriptCtx {
+        total_input_tokens: total,
+        model: obj["message"]["model"].as_str().map(str::to_string),
+    })
+}
+
 /// システム通知エントリ（`role: "system"`。#715）を落とした複製を返す。
 ///
 /// リモート PWA のチャットは role が `user` 以外を全てエージェント発話として描くので、
