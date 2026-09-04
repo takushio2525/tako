@@ -316,7 +316,10 @@ scene_master() {
         "PATH=$PROMO_DEMO/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         "ANTHROPIC_MODEL=$FAST_MODEL"
     )
-    explainer_begin master "$work" "$socket"
+    # チャット表示（かんたん表示）の判定は agents 走査 → tmux ペインの pid 対応付けに乗るので
+    # **器（tmux バックエンド）が要る**。persist=0 だと claude ペインが永久に terminal のまま
+    # （隔離で実測: persist=0 は 40 秒待っても terminal / persist=1 は 5 秒で chat）
+    explainer_begin master "$work" "$socket" 1
     trap 'promo_stop_isolated '"$socket" EXIT
     local base; base=$(promo_base_pane)
     tko welcome dismiss >/dev/null 2>&1 || true

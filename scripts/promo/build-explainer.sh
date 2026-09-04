@@ -86,11 +86,15 @@ while IFS=$'\t' read -r id kind source anchor offset min_dur caption subtitle sp
         # 素材の残り尺が足りない分は最後のフレームで保つ（tpad）。in 点は動かさない
         vf="tpad=stop_mode=clone:stop_duration=900,trim=duration=${dur},setpts=PTS-STARTPTS,scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=0x0d1117,fps=${FPS},setsar=1"
         if [ -n "$caption" ] || [ -n "$subtitle" ]; then
+            # テロップは既定で下寄せ。画面下部にコマンドカード等が出る区間は caption の先頭に
+            # `^` を付けると上寄せになる（重なって読めない = 実測）
+            local cap_y="H-h-64"
+            if [ "${caption#^}" != "$caption" ]; then caption=${caption#^}; cap_y="64"; fi
             png="$WORK/$id-cap.png"
             "$CAPTION_BIN" "$png" "$W" "$CAPTION_FONT_PX" "$caption" "$subtitle"
             ffmpeg -nostdin -v error -y -ss "$start" -i "$src" \
                 -loop 1 -framerate "$FPS" -t "$dur" -i "$png" \
-                -filter_complex "[0:v]${vf}[bg];[1:v]format=rgba,setpts=PTS-STARTPTS,fade=t=in:st=0.25:d=0.45:alpha=1,fade=t=out:st=${fo_start}:d=0.5:alpha=1[cap];[bg][cap]overlay=0:H-h-64:format=auto,format=yuv420p[v]" \
+                -filter_complex "[0:v]${vf}[bg];[1:v]format=rgba,setpts=PTS-STARTPTS,fade=t=in:st=0.25:d=0.45:alpha=1,fade=t=out:st=${fo_start}:d=0.5:alpha=1[cap];[bg][cap]overlay=0:${cap_y}:format=auto,format=yuv420p[v]" \
                 -map "[v]" -an -t "$dur" -c:v libx264 -preset medium -crf 18 -pix_fmt yuv420p -r "$FPS" "$seg"
         else
             ffmpeg -nostdin -v error -y -ss "$start" -i "$src" -vf "$vf,format=yuv420p" \
