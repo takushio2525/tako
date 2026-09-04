@@ -197,6 +197,27 @@ impl ShellDialect {
         }
     }
 
+    /// ファイルの中身をそのまま 1 行ずつ出す（**打ち込んだ行に本文が現れない**）。
+    ///
+    /// [`print_lines`] は本文を引数に持つので、**シェルがエコーしたコマンド行にも
+    /// 本文が載る**。画面を検索する検査ではこれが致命的になる: 項目 137（#1040）は
+    /// 「失敗マーカーの 1 つ上の行が理由」という契約を見るのに、エコー行が
+    /// **マーカーの最初の出現**になってしまい、理由が直前のプロンプトへずれていた
+    /// （#1127 の実測: `reason=Some("TAKO_1040_RETRY")` → 「待てば直る」と誤判定）。
+    /// 数値マーカーで同じ罠を避けている [`arith`](Self::arith) の文字列版。
+    ///
+    /// 中身は**呼び出し側が Rust で書く**（シェルを通さないのでバイトがそのまま届く）。
+    /// PowerShell 5.1 の `Get-Content` は既定でその機のコードページ（日本語環境は
+    /// CP932）で読むので、**`-Encoding UTF8` を必ず付ける**（実測: 付けないと
+    /// `への接続に失敗しました` が `縺ｸ縺ｮ謗･邯壹↓…` に化ける）
+    pub fn print_file(self, path: &Path) -> String {
+        let quoted = self.quote_arg(&path.to_string_lossy());
+        match self {
+            Self::Posix => format!("cat {quoted}"),
+            Self::PowerShell => format!("Get-Content -Encoding UTF8 -LiteralPath {quoted}"),
+        }
+    }
+
     /// `<prefix><0..count-1>` を 1 行ずつ、行間に待ちを入れて出す。
     /// 取り込み経路（PTY → 画面）を「少しずつ流れてくる出力」で試すのに使う
     pub fn emit_numbered_lines(self, prefix: &str, count: u32, delay_ms: u32) -> String {
@@ -702,6 +723,48 @@ fn ps_restore_env(name: &str, tmp: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1127: 打ち込んだ行に本文が現れない出力手段。
+    /// 両方言ぶんを macOS からも Windows からも検証する
+    #[test]
+    fn print_fileは本文をコマンド行へ載せない() {
+        let path = Path::new("/tmp/tako-1127.txt");
+        for dialect in [ShellDialect::Posix, ShellDialect::PowerShell] {
+            let line = dialect.print_file(path);
+            assert!(
+                line.contains("tako-1127.txt"),
+                "{dialect:?}: パスが入っていない: {line}"
+            );
+            // 本文（= 中身）は 1 文字も現れない
+            assert!(
+                !line.contains("ssh exit "),
+                "{dialect:?}: 本文がコマンド行に載っている: {line}"
+            );
+        }
+        // PowerShell 5.1 は既定でコードページ依存に読むので UTF-8 を明示する
+        assert!(
+            ShellDialect::PowerShell
+                .print_file(path)
+                .contains("-Encoding UTF8"),
+            "PowerShell の読み出しに -Encoding UTF8 が無い（日本語が化ける）"
+        );
+        assert!(ShellDialect::Posix.print_file(path).starts_with("cat "));
+    }
+
+    /// 対照: [`ShellDialect::print_lines`] は**本文を引数に持つ**ので
+    /// エコー行に載る。だから項目 137 の fixture では使えない（#1127）
+    #[test]
+    fn print_linesは本文がコマンド行に載る() {
+        let body = "tako: h への接続に失敗しました（ssh exit ）。理由は上の行です".to_string();
+        for dialect in [ShellDialect::Posix, ShellDialect::PowerShell] {
+            assert!(
+                dialect
+                    .print_lines(std::slice::from_ref(&body))
+                    .contains("ssh exit "),
+                "{dialect:?}: 前提が変わった（print_lines が本文を隠すようになった）"
+            );
+        }
+    }
 
     const POSIX: ShellDialect = ShellDialect::Posix;
     const PS: ShellDialect = ShellDialect::PowerShell;

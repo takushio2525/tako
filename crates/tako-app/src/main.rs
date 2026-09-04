@@ -59278,6 +59278,18 @@ mod self_test {
                     "tako: {host1040} への接続に失敗しました（{}）。理由は上の行です",
                     tako_core::ssh_progress::SCRIPT_FAILURE_MARK
                 );
+                // #1127: 画面へ出す行は**ファイル経由**で出す。`print_lines` は本文を
+                // 引数に持つのでシェルがエコーしたコマンド行にも本文が載り、
+                // **そのエコー行がマーカーの最初の出現になる**（`detect_disconnect` は
+                // `position()` = 最初の 1 件を採る）。すると「理由は 1 つ上の行」の契約が
+                // プロンプトを拾い、認証系の失敗が「待てば直る」と誤判定される
+                // （実機で 2/2 とも `phase=connected` のまま = #1127）
+                let fixture1040 = std::env::temp_dir()
+                    .join(format!("tako-selftest-1040-{}.txt", std::process::id()));
+                let emit1040 = |lines: &[&str]| {
+                    let _ = std::fs::write(&fixture1040, format!("{}\n", lines.join("\n")));
+                    sh.print_file(&fixture1040)
+                };
                 let socket1040 = tako_core::remote_fs::control_path(host1040);
                 let make_socket = |on: bool| {
                     if let Some(p) = &socket1040 {
@@ -59362,10 +59374,9 @@ mod self_test {
                 make_socket(false);
                 let _ = window.update(cx, |app: &mut TakoApp, _, _| {
                     if let Some(s) = app.terminals.get_mut(&pid1040) {
-                        // ペインへ打つ文字列は方言境界から組む（#865。POSIX の
-                        // `printf` を直書きすると PowerShell のペインでは
-                        // **機能が正常でも**マーカーが出ず、この段が必ず落ちる）
-                        s.write(pty_line(&sh.print_lines(std::slice::from_ref(&marker1040))));
+                        // 打つ文字列は方言境界から組む（#865）。本文はファイル経由で
+                        // 出す（#1127。エコー行に marker を載せない）
+                        s.write(pty_line(&emit1040(&[marker1040.as_str()])));
                     }
                 });
                 let mut reconnecting1040 = None;
@@ -59495,11 +59506,12 @@ mod self_test {
                             st.rebase(&now);
                         }
                         if let Some(s) = app.terminals.get_mut(&pid1040) {
-                            // 2 行を 1 行ずつそのまま出す（#865 の方言境界。
-                            // POSIX の `printf` は PowerShell のペインで通らない）
-                            s.write(pty_line(&sh.print_lines(&[
-                                "testuser@host: Permission denied (publickey).".to_string(),
-                                marker1040.clone(),
+                            // 理由 → マーカーの 2 行を**ファイル経由**で出す（#1127）。
+                            // 引数で渡すとエコー行が marker の最初の出現になり、
+                            // 理由が 1 つ上の行（プロンプト）へずれる
+                            s.write(pty_line(&emit1040(&[
+                                "testuser@host: Permission denied (publickey).",
+                                marker1040.as_str(),
                             ])));
                         }
                     })
@@ -59617,6 +59629,7 @@ mod self_test {
                     std::env::var_os("TAKO_1040_LEGACY").is_some()
                 );
                 notify_and_draw(any, window, cx);
+                let _ = std::fs::remove_file(&fixture1040);
             }
 
             // 138. 「リモートからフォルダを開く」の VSCode Remote 化（#1041）。
