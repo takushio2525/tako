@@ -2313,6 +2313,34 @@ mod tests {
     }
 
     #[test]
+    fn issue1123_目印の字下げが無くても続きは結合する() {
+        // 塊の先頭行が 0 桁目から始まる形（`⎿` に字下げが付かない描画）。
+        // 先頭行は「字下げ無し = 新しい塊」で始まり、続きは字下げがあるので結合される
+        let lines = [
+            "⎿  You've hit your",
+            "   session limit ·",
+            "   resets 5:50am",
+        ];
+        let joined = unwrap_wrapped_lines(&lines);
+        assert_eq!(joined.len(), 1, "{joined:?}");
+        assert!(is_limit_exhausted_line(&joined[0]), "{}", joined[0]);
+    }
+
+    #[test]
+    fn issue1123_字下げの無い行は続きにしない() {
+        // 字下げは「折り返しの続き」の唯一の手がかり（claude は続きを必ず字下げする）。
+        // 0 桁目から始まる行までつなげると、無関係な段落から偽の見出しが生まれる
+        let lines = ["⎿  You've hit your", "session limit · resets 5:50am"];
+        let joined = unwrap_wrapped_lines(&lines);
+        assert_eq!(
+            joined.len(),
+            2,
+            "字下げの無い行を続きにしている: {joined:?}"
+        );
+        assert!(joined.iter().all(|l| !is_limit_exhausted_line(l)));
+    }
+
+    #[test]
     fn issue1123_折り返しが無ければ論理行は入力そのまま() {
         // 目印つきの行・字下げ無しの行だけの画面では結合が 1 度も起きない
         let lines = [
