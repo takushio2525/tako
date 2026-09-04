@@ -1196,6 +1196,21 @@ pub fn prof_effort_ignored() -> &'static str {
     )
 }
 
+pub fn prof_cwd_placeholder() -> &'static str {
+    tr!("ホーム", "Home")
+}
+
+pub fn prof_label_cwd() -> &'static str {
+    tr!("起動フォルダ", "Startup folder")
+}
+
+pub fn desc_prof_cwd() -> &'static str {
+    tr!(
+        "master / solo をこのフォルダで起動する（空欄 = ホーム）。絶対パスか ~/ 始まり",
+        "Start master / solo in this folder (empty = home). Absolute path or starting with ~/"
+    )
+}
+
 pub fn prof_label_tab_naming() -> &'static str {
     tr!("タブ名の命名規則", "Tab naming convention")
 }
@@ -1563,6 +1578,9 @@ mod tests {
                 prof_label_agent_args().into(),
                 desc_prof_agent_args().into(),
                 prof_effort_ignored().into(),
+                prof_label_cwd().into(),
+                desc_prof_cwd().into(),
+                prof_cwd_placeholder().into(),
                 prof_label_tab_naming().into(),
                 desc_prof_tab_naming().into(),
                 prof_section_handoff().into(),
