@@ -88,7 +88,7 @@ while IFS=$'\t' read -r id kind source anchor offset min_dur caption subtitle sp
         if [ -n "$caption" ] || [ -n "$subtitle" ]; then
             # テロップは既定で下寄せ。画面下部にコマンドカード等が出る区間は caption の先頭に
             # `^` を付けると上寄せになる（重なって読めない = 実測）
-            local cap_y="H-h-64"
+            cap_y="H-h-64"
             if [ "${caption#^}" != "$caption" ]; then caption=${caption#^}; cap_y="64"; fi
             png="$WORK/$id-cap.png"
             "$CAPTION_BIN" "$png" "$W" "$CAPTION_FONT_PX" "$caption" "$subtitle"
