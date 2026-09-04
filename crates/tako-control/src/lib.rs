@@ -32,6 +32,7 @@ pub mod agent_models;
 pub mod agent_support;
 pub mod agents;
 pub mod agents_sync;
+pub mod claude_ctx;
 pub mod claude_remote;
 pub mod claude_remote_link;
 pub mod claude_session;

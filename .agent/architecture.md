@@ -2013,6 +2013,98 @@ legacy = 8 本 / CPU 1.80 s、new = 4 本 / CPU 0.95 s。
   選択肢パースは折り返しを知らないので、狭いペインの上限**ダイアログ**は
   種別の手がかり（`classify_dialog`）しか広げていない。#748 の構造パースを
   狭幅対応にするのは別の話
+## ctx% とモデル名の取得元（#1021。2026-09-04 実測）
+
+`claude agents --json` は **2.1.258 で `contextPercentUsed` / `model` を返さない**。
+この経路だけに頼っていたので ctx% 依存機能（`orchestrator self` の `ctx_percent` /
+`worker_status` / #749 の閾値判定 / チャットヘッダの残量バー #702）が静かに全滅していた。
+
+### 上流の実物（どれが使えてどれが使えないか）
+
+| ソース | ctx% | model | 備考 |
+|---|---|---|---|
+| `claude agents --json` | ✗ | ✗ | 出力キーは `cwd` / `kind` / `name` / `pid` / `sessionId` / `startedAt` / `status` の 7 つ。`contextPercentUsed` は**バイナリの文字列表からも消えている**ので改名でもない |
+| セッション台帳（#1011） | ✗ | ✗ | 全キー和集合を採取して確認（ctx / model は無い） |
+| **transcript の最後の assistant 行** | ✓ | ✓（モデル **id**） | `message.usage` と `message.model`。式は下記 |
+| **ペインの画面** | △ | △ | 出ているならそれが正（claude 自身の答え）。ただし**既定構成では出ない**（下記） |
+
+### claude 自身の式（transcript から再現できる）
+
+statusLine フックの stdin JSON（`.context_window.used_percentage`）の算出は
+
+```text
+used% = clamp(round(total_input_tokens / context_window_size * 100), 0, 100)
+total_input_tokens = input_tokens + cache_creation_input_tokens + cache_read_input_tokens
+```
+
+分子は**最後の API 応答の usage** = transcript の最後の assistant 行の `message.usage`。
+正本は `tako_core::ctx_usage::used_percent`。
+
+**`context_window_size` はどこにもファイルとして残っていない**（transcript の全行種別にも
+`~/.claude.json` の `autoCompactWindowsCache` = null にも無い）。上流は「`[1m]` 接尾辞」
+「組織モデルカタログの `native_1m` フラグ」「`CLAUDE_CODE_MAX_CONTEXT_TOKENS`」
+「auto-compact の窓」から実行時に解決するので、**静的な表は原理的に権威になれない**。
+だから `declared_context_window` は**実測できた族だけ**を返し、それ以外は `None`
+（推測して 5 倍ずれた ctx% を出すと早すぎる自動ハンドオフを起こす）。
+
+### 画面は「claude 自身の答え」だが既定構成では出ない
+
+claude の**組み込み**表示（`NN% context used` / `NN% until auto-compact` /
+`Context low (NN% remaining)`）は
+
+```text
+warn 閾値 = 窓 − 33000 トークン（level === "ok" のときは何も描かない）
+```
+
+なので **1M 窓では ~96.7% を超えるまで一切出ない** = #749 の 50〜60% 閾値には届かない。
+`ctx NN%` が普段見えているのは**ユーザーが設定した statusLine スクリプト**の出力。
+statusLine を外した実 claude で「フッターに ctx 表記が 1 つも出ない」ことを実測した。
+
+なお組み込みの 3 形式は **% が語の前**に来るので、`ctx` / `context` の後ろから
+% を探す旧実装では取りこぼす（`Context low (12% remaining)` は残量なのに 12% 使用と
+**誤読**していた）。`terminal::builtin_ctx_percent` がこの 3 形式を先に見る。
+
+### だから優先順は「画面 → transcript → none」
+
+- **画面**が数値を出しているならそれが正（claude 自身の計算結果。窓の推定が要らない）
+- 画面が黙っていれば **transcript**（式は厳密だが窓の解決が推定を含む）
+- どちらも駄目なら **none + 理由**（`ctx_reason`。無説明の `null` を返さない）
+
+両方あるときは**突き合わせて差を申告する**（`ctx_screen_delta` / `warnings`）。
+上流が窓の決め方を変えたら差として現れるので、静かに嘘をつくのではなく気づける
+（#1011 の「自己検証つきの内部レイアウト利用」と同じ型）。窓は**画面からの逆算**を
+先に試すので、宣言表が古くても画面が出ている環境では実態へ追従する。
+
+### 4 経路が同じ 1 実装を通る
+
+`tako-control::claude_ctx::resolve` が材料の集め方を持ち、判断は
+`tako_core::ctx_usage`（純関数）。通るのは `orchestrator self` / `worker_status` /
+#749 の tick（`tako-app::handoff_ctx`）/ チャットヘッダ（`chat_view::prefer_source`）。
+
+**#749 の tick は 2 秒間隔なので transcript を UI スレッドで読まない**
+（`handoff_ctx` が 30 秒間隔の background でセッションカタログと transcript を読み、
+結果だけを控える。プロセスは 1 つも起こさない）。画面から読めているペインは
+そもそも対象にならないので、通常運転では走査対象が空になる。
+
+### 実測（本番の稼働ペイン。窓 1,000,000 で 8/8 一致）
+
+`claude-opus-5` / `claude-fable-5` / `claude-fable-5-1` の 8 ペインで、
+transcript から算出した値が画面の `ctx NN%` と**すべて一致**した
+（200,000 を要求する組は 1 つも無い）。この 8 組は
+`ctx_usage::tests::本番で実測した8組がすべて窓1mで画面と一致する` が固定している。
+
+A/B は `TAKO_1021_LEGACY=1`（画面も transcript も見ない = #1021 前）。
+
+### ⚠️ 踏み抜きどころ
+
+- **`agents --json` の値を先頭に残す**（上流が将来また返すならそれが最も権威）。
+  消すと「返るようになったのに使わない」状態が固定される
+- **サブエージェントの usage を数えない**（`isSidechain` を除外）。master の
+  文脈使用率ではない
+- **transcript を全走査しない**。末尾 1 MiB を後ろから読み、見つからないときだけ
+  全走査へ落ちる（数 MB のファイルを 2 秒 tick にぶら下げない）
+- **`window` が分からないモデルで推測しない**。画面が出ているときはそちらが使われるので、
+  黙って 5 倍ずれた値を出すより「採れなかった」と言う方が安全
 
 ## セキュリティ方針
 

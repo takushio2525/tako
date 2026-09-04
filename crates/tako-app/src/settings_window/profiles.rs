@@ -39,6 +39,8 @@ pub enum ProfileField {
     Model,
     WorkerModel,
     TabNaming,
+    /// master / solo の起動フォルダ（#500 Part 5 / #1119）
+    Cwd,
     /// 引き継ぎ閾値（%。#749）
     CtxThreshold,
     /// エージェント別設定のモデル（対象エージェント名）
@@ -56,6 +58,7 @@ impl ProfileField {
             Self::Model => "prof-model".into(),
             Self::WorkerModel => "prof-worker-model".into(),
             Self::TabNaming => "prof-tab-naming".into(),
+            Self::Cwd => "prof-cwd".into(),
             Self::CtxThreshold => "prof-ctx-threshold".into(),
             Self::AgentModel(a) => format!("prof-agent-model-{a}"),
             Self::AgentArgs(a) => format!("prof-agent-args-{a}"),
@@ -222,6 +225,22 @@ impl SettingsWindow {
                 },
                 cx,
             ),
+            // #1119: 空欄 = 解除（ホームへ戻る）。`~` 展開・存在検証・相対パスの拒否は
+            // dispatch（CLI / MCP と同じ 1 実装）が持つので GUI 側では判定しない。
+            // 弾かれた理由は `run` が `message` へ載せるので、CLI と同じ文言が画面に出る
+            ProfileField::Cwd => {
+                let trimmed = value.trim().to_string();
+                self.set_profile(
+                    |p| {
+                        if trimmed.is_empty() {
+                            p.clear_cwd = true;
+                        } else {
+                            p.cwd = Some(trimmed);
+                        }
+                    },
+                    cx,
+                )
+            }
             // 空文字でクリアする仕様が dispatch 側にあるのでそのまま渡す
             ProfileField::TabNaming => {
                 self.set_profile(|p| p.tab_naming_convention = Some(value), cx)
@@ -631,6 +650,17 @@ impl SettingsWindow {
                             cx,
                         );
                     },
+                ))
+                .child(self.row(
+                    txt::prof_label_cwd(),
+                    txt::desc_prof_cwd(),
+                    self.text_field(
+                        EditField::Profile(ProfileField::Cwd),
+                        detail["cwd"].as_str().unwrap_or(""),
+                        txt::prof_cwd_placeholder(),
+                        Some(px(260.)),
+                        cx,
+                    ),
                 ))
                 // --- worker ---
                 .child(self.section(txt::prof_section_worker()))
@@ -1630,6 +1660,12 @@ impl SettingsWindow {
         self.commit_profile_field(field, value.to_string(), cx);
     }
 
+    /// 直近のメッセージ（成功 = false / 失敗 = true）。
+    /// 保存が弾かれたときに理由が画面へ出ているかを見るために使う
+    pub(crate) fn st_profiles_message(&self) -> Option<(String, bool)> {
+        self.message.clone()
+    }
+
     /// 単一選択チップの押下（保存値を直接渡す）
     pub(crate) fn st_profiles_pick_effort(&mut self, value: &str, cx: &mut Context<Self>) {
         let value = value.to_string();
@@ -1761,6 +1797,9 @@ struct ProfilesSet {
     clear_worker_account: bool,
     projects: Option<Vec<String>>,
     clear_projects: bool,
+    /// master / solo の起動フォルダ（#500 Part 5 / #1119）
+    cwd: Option<String>,
+    clear_cwd: bool,
     ctx_threshold: Option<u32>,
     clear_ctx_threshold: bool,
     auto_handoff: Option<bool>,
@@ -1780,10 +1819,8 @@ impl ProfilesSet {
             from: None,
             projects: self.projects,
             clear_projects: self.clear_projects,
-            // #1056: cwd は CLI / MCP から設定する（設定画面にはまだ入力欄が無い）。
-            // None / false = 「触らない」なので、GUI の set がここを消すことはない
-            cwd: None,
-            clear_cwd: false,
+            cwd: self.cwd,
+            clear_cwd: self.clear_cwd,
             master_agent: self.master_agent,
             clear_master_agent: self.clear_master_agent,
             model: self.model,
