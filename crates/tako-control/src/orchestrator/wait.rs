@@ -1250,16 +1250,32 @@ pub fn screen_is_collapsed(output: &str) -> bool {
 pub fn detect_worker_error(output: &str) -> Option<(WorkerErrorKind, String)> {
     // tail_lines は新しい行が先頭 = 最初のマッチが画面最下部に最も近い
     let lines = tail_lines(output, 30);
+    // 折り返しを結合した論理行（#1123）。**物理行で外れたときだけ**見る二段目で、
+    // claude TUI が自分で折り返した見出し（狭いペインでは 3〜4 行に割れる）を
+    // 1 本へ戻してから同じ規則へ通す。結合は候補を増やすだけなので、
+    // 折り返しの無い画面では 1 ビットも変わらない
+    let unwrapped = tako_core::limit_resume::unwrapped_tail_of(output, 30);
 
     // 0. claude の limit 対処ダイアログ（#748。実文言はバイナリ内文字列より）。
     //    メッセージ行がスクロールアウトしてダイアログだけ見えている場合でも
     //    「limit 到達で止まっている」と分かるようにする（無いと idle = 完了に見える）
-    if lines.iter().any(|l| l.contains("What do you want to do?")) {
-        if let Some(l) = lines.iter().find(|l| {
-            l.contains("Stop and wait for limit to reset") || l.contains("Wait for limit to reset")
-        }) {
-            return Some((WorkerErrorKind::UsageLimit, l.trim().to_string()));
+    // 見出しも選択肢も狭いペインでは折り返されるので、物理行 → 論理行の順に見る（#1123）
+    let limit_dialog_line = |pool: &mut dyn Iterator<Item = &str>| -> Option<String> {
+        let seen: Vec<&str> = pool.collect();
+        if !seen.iter().any(|l| l.contains("What do you want to do?")) {
+            return None;
         }
+        seen.iter()
+            .find(|l| {
+                l.contains("Stop and wait for limit to reset")
+                    || l.contains("Wait for limit to reset")
+            })
+            .map(|l| l.trim().to_string())
+    };
+    if let Some(l) = limit_dialog_line(&mut lines.iter().copied())
+        .or_else(|| limit_dialog_line(&mut unwrapped.iter().map(String::as_str)))
+    {
+        return Some((WorkerErrorKind::UsageLimit, l));
     }
 
     // 1. usage limit 到達（claude / codex）。
@@ -1275,6 +1291,14 @@ pub fn detect_worker_error(output: &str) -> Option<(WorkerErrorKind, String)> {
             return Some((WorkerErrorKind::UsageLimit, l.trim().to_string()));
         }
     }
+    // 1'. 同じ規則を**折り返しを結合した論理行**にも当てる（#1123）。
+    //    返すメッセージも結合後の 1 本なので、`limit_stop` 側の `parse_reset_at` が
+    //    別行へ落ちた `resets 5:50am` をそのまま読める
+    for l in &unwrapped {
+        if tako_core::limit_resume::is_limit_exhausted_line(l) {
+            return Some((WorkerErrorKind::UsageLimit, l.trim().to_string()));
+        }
+    }
 
     // 1b. **時間では解けない**利用阻害（#1106）。座席種別・管理者による無効化・
     //    グループ枠 $0・クレジットの要求・追加利用ぶんの枯渇・組織でのサービス無効。
@@ -1285,6 +1309,13 @@ pub fn detect_worker_error(output: &str) -> Option<(WorkerErrorKind, String)> {
     //    上限（1.）より後に見るのは #1093 / #1096 の判定へ 1 ビットも影響させないため
     //    （排他なので順序は結果に出ない）
     for l in &lines {
+        if tako_core::limit_resume::entitlement_block_line(l) {
+            return Some((WorkerErrorKind::EntitlementBlocked, l.trim().to_string()));
+        }
+    }
+    // 1b'. 阻害の文言も狭いペインでは割れる（#1123）。上限（1'.）より後に見るのは
+    //    物理行のときと同じ理由（2 つの規則は排他なので順序は結果に出ない）
+    for l in &unwrapped {
         if tako_core::limit_resume::entitlement_block_line(l) {
             return Some((WorkerErrorKind::EntitlementBlocked, l.trim().to_string()));
         }
@@ -2316,6 +2347,56 @@ mod tests {
             detect_worker_error("Do you trust this folder?\n❯ 1. Yes\n  Press enter to confirm"),
             None
         );
+    }
+
+    /// #1123: 幅 25 桁で上限に当たった画面（2026-09-04 の実採取）。
+    /// claude が自分で折り返すので、どの物理行も #1093 の規則に当たらない
+    const WRAPPED_LIMIT_SCREEN: &str = "⏺ 実装を進めます\n\n  \u{23bf}  You've hit your\n     session limit ·\n     resets 5:50am\n     (Asia/Tokyo)\n     /usage-credits to\n     request more usage\n     from your admin.\n\n─────────────────────────\n❯ \n─────────────────────────";
+
+    #[test]
+    fn issue1123_折り返した上限見出しをusage_limitとして検知する() {
+        // 前提: 物理行はどれも当たらない（#1123 の実害そのもの）
+        for l in WRAPPED_LIMIT_SCREEN.lines() {
+            assert!(
+                !tako_core::limit_resume::is_limit_exhausted_line(l),
+                "物理行が単体で当たるなら前提が違う: {l}"
+            );
+        }
+        let (kind, message) =
+            detect_worker_error(WRAPPED_LIMIT_SCREEN).expect("折り返した見出しが検知されない");
+        assert_eq!(kind, WorkerErrorKind::UsageLimit);
+        assert!(
+            message.contains("hit your session limit") && message.contains("resets 5:50am"),
+            "根拠が結合後の 1 本になっていない（`limit_stop` の解除時刻パースが空振りする）: {message}"
+        );
+    }
+
+    #[test]
+    fn issue1123_折り返した阻害はentitlement_blockedのまま() {
+        // 排他は結合後も保たれる（混ざると自動復帰が「解除まで待つ」で空撃ちする）
+        let screen = WRAPPED_LIMIT_SCREEN.replace(
+            "  \u{23bf}  You've hit your\n     session limit ·\n     resets 5:50am\n     (Asia/Tokyo)\n     /usage-credits to\n     request more usage\n     from your admin.",
+            "  \u{23bf}  Your seat type\n     doesn't include\n     usage credits",
+        );
+        let (kind, _) = detect_worker_error(&screen).expect("検知される");
+        assert_eq!(kind, WorkerErrorKind::EntitlementBlocked);
+    }
+
+    #[test]
+    fn issue1123_折り返しても正常画面や自動切替に誤検知しない() {
+        // 結合は候補を増やすだけなので、止まっていない画面を上限にしてはいけない
+        for screen in [
+            "⏺ 実装が完了しました。\n  テストは全て緑です。\n\n─────────────────────────\n❯ \n─────────────────────────",
+            "  \u{23bf}  Opus limit\n     reached, now using\n     Sonnet\n\n─────────────────────────\n❯ \n─────────────────────────",
+            "  \u{23bf}  You've used 90%\n     of your session\n     limit\n\n─────────────────────────\n❯ \n─────────────────────────",
+            "  \u{23bf}  You're close to\n     your weekly limit\n\n─────────────────────────\n❯ \n─────────────────────────",
+        ] {
+            assert_eq!(
+                detect_worker_error(screen),
+                None,
+                "止まっていない画面を検知した: {screen}"
+            );
+        }
     }
 
     #[test]

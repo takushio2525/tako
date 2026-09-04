@@ -1146,13 +1146,23 @@ fn parse_agent_metrics(lines: &[String]) -> Option<AgentMetrics> {
 /// （`visible_lines`）なので深いスクロールバックまでは遡らない
 const EXHAUSTED_SCAN_LINES: usize = 24;
 
-/// 画面末尾から上限の見出しを探す（下の行ほど新しいので末尾から見る。#1093）
+/// 画面末尾から上限の見出しを探す（下の行ほど新しいので末尾から見る。#1093）。
+///
+/// 物理行で外れたら**折り返しを結合した論理行**でもう一度見る（#1123）。狭いペイン
+/// （実発生は 21〜25 桁）では見出しが 3〜4 行に割れて 1 本も規則に当たらず、
+/// 自動復帰が発火しないのと同時にメーターも `--` のままになっていた。
+/// 物理行を先に見るので、折り返しの無い画面では判定が 1 ビットも変わらない
 fn exhausted_limit_window_in(lines: &[String]) -> Option<LimitWindow> {
     lines
         .iter()
         .rev()
         .take(EXHAUSTED_SCAN_LINES)
         .find_map(|l| exhausted_limit_window(l))
+        .or_else(|| {
+            crate::limit_resume::unwrapped_tail(lines, EXHAUSTED_SCAN_LINES)
+                .iter()
+                .find_map(|l| exhausted_limit_window(l))
+        })
 }
 
 /// フッターの角括弧からモデル表示名を取り出す（#702）。
@@ -2046,6 +2056,76 @@ mod tests {
             "実データを 100% で塗り潰してはいけない"
         );
         assert_eq!(m.limit_week, Some(46));
+    }
+
+    /// #1123: **幅 25 桁**で上限に当たったペインの実画面（2026-09-04 の実採取）。
+    /// 見出しは claude 自身が語の境界で折り返し、続きを内容の列へ字下げする。
+    /// フッターの `5h` / `7d` が `--` なのも実際の症状どおり
+    fn narrow_limit_stopped_screen(headline: &[&str]) -> Vec<String> {
+        let mut lines: Vec<String> = vec!["⏺ 実装を進めます".into(), String::new()];
+        for l in headline {
+            lines.push((*l).into());
+        }
+        lines.push(String::new());
+        lines.push("─".repeat(25));
+        lines.push("❯".into());
+        lines.push("─".repeat(25));
+        for l in [
+            "  [Opus 5 · xH]  ▸ z…",
+            "  ctx   7% ░░░░░░░░░░",
+            "  5h   --",
+            "  7d   --",
+            "  ⏵⏵ auto mode on    ·",
+        ] {
+            lines.push(l.into());
+        }
+        lines
+    }
+
+    #[test]
+    fn issue1123_折り返した見出しでもメーターを100パーセントで埋める() {
+        // 実採取（25 桁）。#1093 の規則は 1 行を入力に取るので、狭いペインでは
+        // どの物理行にも当たらず `5h` が `--` のままだった
+        let m = parse_agent_metrics(&narrow_limit_stopped_screen(&[
+            "  ⎿  You've hit your",
+            "     session limit ·",
+            "     resets 5:50am",
+            "     (Asia/Tokyo)",
+            "     /usage-credits to",
+            "     request more usage",
+            "     from your admin.",
+        ]))
+        .expect("上限中はメトリクスが取れる（`--` にしない）");
+        assert_eq!(m.limit_5h, Some(100), "折り返した `session limit` = 5h 枠");
+        assert_eq!(m.limit_week, None, "週枠については何も言っていない");
+
+        // 週枠も同じ（折り返し位置が変わるだけ）
+        let m = parse_agent_metrics(&narrow_limit_stopped_screen(&[
+            "  ⎿  You've hit your",
+            "     weekly limit ·",
+            "     resets 5:50am",
+            "     (Asia/Tokyo)",
+        ]))
+        .expect("取れる");
+        assert_eq!(m.limit_5h, None);
+        assert_eq!(m.limit_week, Some(100));
+    }
+
+    #[test]
+    fn issue1123_折り返しても枠の分からない上限ではメーターを埋めない() {
+        // 結合しても `usage credit limit` は 5h / 週へ対応づけられない
+        // （この画面は `ctx 7%` を出しているのでメトリクス自体は取れる。
+        //   見るのは**枠のメーターを埋めていないこと**）
+        let m = parse_agent_metrics(&narrow_limit_stopped_screen(&[
+            "  ⎿  You've hit your",
+            "     usage credit limit",
+            "     · contact your",
+            "     admin to increase",
+            "     it",
+        ]))
+        .expect("ctx があるので取れる");
+        assert_eq!(m.limit_5h, None, "枠が分からないのにメーターを埋めている");
+        assert_eq!(m.limit_week, None, "枠が分からないのにメーターを埋めている");
     }
 
     #[test]
