@@ -53648,6 +53648,149 @@ mod self_test {
                     "111: 時間で解ける上限は従来どおり usage_limit / wait_reset (#1106)",
                 );
 
+                // --- 正例 ⑦ ペイン幅で折り返した見出し（#1123） ---
+                // 2026-09-04 に worker 4 体（幅 21〜25 桁）が 5h 上限で止まり、
+                // 解除の 7.5 時間後まで復帰しなかった。claude は見出しを**自分で**
+                // 折り返して続きを字下げするので（実測: 25 桁で 7 行）、1 行を入力に
+                // 取る #1093 / #1096 / #1106 の規則がどの物理行にも当たらない。
+                //
+                // fixture は実採取の折り返し（アポストロフィだけは落としてある。
+                // `paint_and_hold` の POSIX 経路が本文を素の単引用符で囲むため。
+                // 正例 ③〜⑥ と同じ理由）。実バイトの fixture は
+                // `limit_stop.rs` の `WRAPPED_SESSION_LIMIT_IDLE` が持つ
+                let wrapped_body = format!(
+                    "{filler813}実装を進めます\n  \
+                     \u{23bf}  You have hit your\n     \
+                     session limit ·\n     \
+                     resets 5:50am\n     \
+                     (Asia/Tokyo)\n     \
+                     /usage-credits to\n     \
+                     request more usage\n     \
+                     from your admin.\n"
+                );
+                let Some(wrapped_pane) = make_fixture_pane(cx, &wrapped_body).await else {
+                    fail("#1123: 折り返し見出しペインの作成")
+                };
+                if !wait_screen(cx, wrapped_pane, "from your admin.").await {
+                    fail("#1123: 折り返し fixture が画面に出ない");
+                }
+                settle813(cx, wrapped_pane).await;
+                // 前提: **物理行はどれも規則に当たらない**（#1123 の実害そのもの）
+                let phys_hit = window
+                    .update(cx, |app, _, _| {
+                        app.terminals
+                            .get(&wrapped_pane)
+                            .map(|s| {
+                                s.visible_lines()
+                                    .iter()
+                                    .filter(|l| {
+                                        tako_core::limit_resume::is_limit_exhausted_line(l)
+                                    })
+                                    .count()
+                            })
+                            .unwrap_or(0)
+                    })
+                    .unwrap_or(0);
+                let _ = set_enabled(cx, wrapped_pane, true);
+                let (_, kind_wrapped, _) = drive(cx, wrapped_pane);
+                let reset_wrapped = window
+                    .update(cx, |app, _, _| {
+                        app.limit_resume.get(&wrapped_pane).and_then(|t| t.reset_at)
+                    })
+                    .ok()
+                    .flatten();
+                println!(
+                    "TAKO_SELF_TEST_1123_DETECT: phys_hit={phys_hit} kind={kind_wrapped:?} \
+                     reset_at={reset_wrapped:?} state=({})",
+                    state813(cx, wrapped_pane),
+                );
+                check(
+                    phys_hit == 0,
+                    "111: 折り返した見出しは物理行では 1 本も当たらない（前提。#1123）",
+                );
+                check(
+                    kind_wrapped.as_deref() == Some("idle"),
+                    "111: 折り返した見出しでも上限停止として検知する (#1123)",
+                );
+                // watch / worker_status が使う分類も同じ実ペインの画面で通す
+                // （#1106 の対照と同じ `classify` = `detect_worker_error` そのもの）。
+                // detail が**結合後の 1 本**であることまで見る —— ここが物理行のままだと
+                // `limit_stop` 側の `parse_reset_at` が解除時刻を拾えない
+                let class_wrapped = classify(cx, wrapped_pane);
+                println!("TAKO_SELF_TEST_1123_CLASS: {class_wrapped:?}");
+                check(
+                    class_wrapped.as_ref().map(|c| c.0.as_str()) == Some("usage_limit")
+                        && class_wrapped.as_ref().map(|c| c.1.as_str()) == Some("wait_reset")
+                        && class_wrapped
+                            .as_ref()
+                            .is_some_and(|c| c.2.contains("resets 5:50am")),
+                    "111: 折り返した見出しが usage_limit / wait_reset へ分類される (#1123)",
+                );
+                check(
+                    reset_wrapped.is_some(),
+                    "111: 別の行へ割れた `resets 5:50am` から解除時刻を解決する (#1123)",
+                );
+                // ステータスバーの 5h メーターも同じ規則を通る（#1093 と同じ受け入れ条件）
+                let meter1123 = window
+                    .update(cx, |app, _, _| {
+                        let pane_level = app
+                            .terminals
+                            .get(&wrapped_pane)
+                            .and_then(|s| s.agent_metrics())
+                            .and_then(|m| m.limit_5h);
+                        app.refresh_agent_metrics();
+                        (pane_level, app.agent_metrics.limit_5h)
+                    })
+                    .unwrap_or((None, None));
+                println!(
+                    "TAKO_SELF_TEST_1123_METER: pane={:?} statusbar={:?}",
+                    meter1123.0, meter1123.1
+                );
+                check(
+                    meter1123.0 == Some(100) && meter1123.1 == Some(100),
+                    "111: 折り返した見出しでもメーターが 100% になる (#1123)",
+                );
+                // 解除前は撃たない → 解除後に撃つ → 監査ログに残る
+                let (sent_before1123, _, _) = drive(cx, wrapped_pane);
+                check(
+                    sent_before1123.is_empty(),
+                    "111: 解除時刻より前は継続ナッジを送らない (#1123)",
+                );
+                let audit_before1123 = tako_control::orchestrator::supervisor::read_audit_log(200)
+                    .iter()
+                    .filter(|l| {
+                        l.contains("action=limit_autoresume")
+                            && l.contains(&format!("pane={}", wrapped_pane.as_u64()))
+                    })
+                    .count();
+                backdate(cx, wrapped_pane);
+                let (sent_1123, _, attempts_1123) = drive(cx, wrapped_pane);
+                let audit_after1123: Vec<String> =
+                    tako_control::orchestrator::supervisor::read_audit_log(200)
+                        .into_iter()
+                        .filter(|l| {
+                            l.contains("action=limit_autoresume")
+                                && l.contains(&format!("pane={}", wrapped_pane.as_u64()))
+                        })
+                        .collect();
+                println!(
+                    "TAKO_SELF_TEST_1123_RESUME: sent={} attempts={attempts_1123} audit={}->{}",
+                    sent_1123.len(),
+                    audit_before1123,
+                    audit_after1123.len(),
+                );
+                check(
+                    sent_1123.len() == 1 && attempts_1123 == 1,
+                    "111: 解除後に折り返し見出しのペインが再開される (#1123)",
+                );
+                check(
+                    audit_after1123.len() == audit_before1123 + 1
+                        && audit_after1123
+                            .last()
+                            .is_some_and(|l| l.contains("nudge queued")),
+                    "111: 折り返した上限の自動復帰が supervisor.log に記録される (#1123)",
+                );
+
                 // --- 負例 ② permission ダイアログでは発動しない ---
                 let perm_body = format!(
                     "{filler813}   Bash command\n   npm test\n   \
@@ -53741,12 +53884,12 @@ mod self_test {
                 println!("TAKO_SELF_TEST_813_PERSIST: {persisted:?}");
                 check(
                     // 有効にしたのは idle / dialog / codex / session / credits / warn /
-                    // ent / permission / api の 9 ペインだけ（codex = #985、
-                    // session = #1093、credits と warn = #1096、ent = #1106 で追加。
-                    // ent は**オプトイン ON でも自動復帰が発動しない**ことを見るために
-                    // 有効化してある）。OFF のペインはフィールドごと出ない
-                    // （旧 tako でも読める JSON を保つ）
-                    persisted == Some((9, 9)),
+                    // ent / wrapped / permission / api の 10 ペインだけ（codex = #985、
+                    // session = #1093、credits と warn = #1096、ent = #1106、
+                    // wrapped = #1123 で追加。ent は**オプトイン ON でも自動復帰が
+                    // 発動しない**ことを見るために有効化してある）。
+                    // OFF のペインはフィールドごと出ない（旧 tako でも読める JSON を保つ）
+                    persisted == Some((10, 10)),
                     "111: 有効にしたペインだけが保存表現へ載る (#813)",
                 );
 

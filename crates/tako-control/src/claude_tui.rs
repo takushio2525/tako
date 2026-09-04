@@ -161,7 +161,23 @@ fn classify_dialog(lines: &[String], list: &tako_core::dialog::ChoiceList) -> Di
         .iter()
         .any(|h| h.contains("What do you want to do?"))
         && lines.iter().any(|l| l.contains("limit"));
-    if lines.iter().any(|l| l.contains("Approaching rate limits")) || limit_option || limit_title {
+    // 狭いペインでは見出しも選択肢も claude 自身が折り返すので、物理行で外れたら
+    // 結合した論理行でも見る（#1123）。**選択肢の構造そのもの**（`tako_core::dialog`）を
+    // 狭幅で読み直すのは別の話なので、ここでは種別の手がかりだけを広げる
+    let limit_wrapped = !limit_option
+        && !limit_title
+        && tako_core::limit_resume::unwrap_wrapped_lines(lines)
+            .iter()
+            .any(|l| {
+                l.contains("Approaching rate limits")
+                    || l.to_lowercase().contains("wait for limit to reset")
+                    || (l.contains("What do you want to do?") && l.contains("limit"))
+            });
+    if lines.iter().any(|l| l.contains("Approaching rate limits"))
+        || limit_option
+        || limit_title
+        || limit_wrapped
+    {
         return DialogKind::UsageLimit;
     }
     if lines.iter().any(|l| {

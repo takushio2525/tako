@@ -596,6 +596,135 @@ fn legacy_entitlement_block() -> bool {
     *LEGACY.get_or_init(|| std::env::var_os("TAKO_1106_LEGACY").is_some())
 }
 
+// --- 折り返しの結合（#1123） ---
+
+/// 結合する継続行の上限。
+///
+/// 21 桁のペインでは見出し 1 本が 4 行、`⎿` の塊まるごとなら 9 行ほどに割れる（実採取）。
+/// 上限を置くのは「字下げが続くだけの領域」を丸ごと 1 本へ畳んでしまわないため
+const MAX_WRAP_JOIN_LINES: usize = 12;
+
+/// 結合後の論理行の文字数上限。見出し + 解除時刻は 21 桁の折り返しでも 120 文字前後
+/// なので十分に余裕がある。長い出力を延々とつなげないための歯止め
+const MAX_WRAP_JOIN_CHARS: usize = 1000;
+
+/// **新しい塊**の始まりを表す先頭文字（claude TUI の実採取より）。
+/// これで始まる字下げ行は折り返しの続きとして扱わない。
+///
+/// - `⎿` = ツール結果 / `⏺` = 発話・ツール実行の見出し / `❯` = 入力行と選択カーソル
+/// - `│ ╭ ╮ ╰ ╯ ─ ━ ▔ ▁ █` = 入力欄と区切り線の罫線
+///
+/// **`·`（中黒）は入れない**: 実採取の `⎿` の塊に `     · clau.de/web` が
+/// 継続行として現れる（中黒で始まる継続行は珍しくない）
+const BLOCK_MARKERS: [char; 13] = [
+    '⎿', '⏺', '❯', '│', '╭', '╮', '╰', '╯', '─', '━', '▔', '▁', '█',
+];
+
+/// その行が**新しい論理行**を始めるか（= 直前の行の折り返しの続きではないか）。
+///
+/// 字下げが無い行は必ず新しい塊（claude は折り返した続きを必ず字下げする = 実測）。
+/// 字下げがあっても目印で始まる行は新しい塊
+fn starts_new_block(line: &str) -> bool {
+    if !line.starts_with(' ') {
+        return true; // 字下げ無し（空行もここ）
+    }
+    let rest = line.trim_start();
+    match rest.chars().next() {
+        None => true,
+        Some(first) => BLOCK_MARKERS.contains(&first),
+    }
+}
+
+/// 折り返しを結合した論理行を作る（#1123）。空行は塊の切れ目として落とす。
+///
+/// # なぜ必要か（実測 2026-09-04。claude 2.1.258 を 25 桁のペインで動かした）
+///
+/// claude TUI は本文を**自分で**折り返し、続きを字下げして次の行へ書く。端末の
+/// ソフトラップ（1 論理行が画面幅で折り返されているだけ）ではないので、
+/// **`tmux capture-pane -J` でも alacritty の `WRAPLINE` でも 1 本には戻らない**
+/// （`-J` で採っても行が割れたままなのを実測した）。
+///
+/// ```text
+///   ⎿  Tip: Run tasks in      ← 目印つきの先頭行（内容は 5 桁目から）
+///      the cloud while you    ← 続き（5 桁の字下げ）
+///      keep coding locally
+///      · clau.de/web
+/// ```
+///
+/// 続きの字下げ幅は**内容の列とは限らない**（同じ画面で `  ⎿  Stop hook` の続きが
+/// 2 桁の字下げで出るのを実測した）ので、幅の一致では判定しない。
+/// 「字下げがあり、目印で始まらない非空行」を続きとみなす。
+///
+/// # 何に使うか
+///
+/// 上限の見出し（[`is_limit_exhausted_line`]）・利用阻害（[`entitlement_block_line`]）・
+/// 解除時刻（[`parse_reset_at`]）はどれも **1 論理行**を入力に取る。狭いペイン
+/// （実発生は 21〜25 桁）では見出しが 3〜4 行に割れ、どの物理行も規則に当たらないので
+/// 自動復帰（#813）も watch の `WORKER_ERROR` も同時に外れる
+/// （#1123 の実害 = 解除後 7.5 時間 worker 4 体が止まったまま）。
+///
+/// **呼び出し側は物理行を先に走査し、外れたときだけここへ落ちる**こと。
+/// 結合は候補を増やすだけなので、折り返しの無い画面では判定が 1 ビットも変わらない
+pub fn unwrap_wrapped_lines<S: AsRef<str>>(lines: &[S]) -> Vec<String> {
+    let legacy = legacy_wrapped_headline();
+    let mut out: Vec<String> = Vec::new();
+    // 直前の論理行が続きを受け付けるか（空行を挟んだら閉じる）
+    let mut open = false;
+    let mut joined = 0usize;
+    for raw in lines {
+        let line = raw.as_ref();
+        if line.trim().is_empty() {
+            open = false;
+            joined = 0;
+            continue;
+        }
+        if !legacy && open && joined < MAX_WRAP_JOIN_LINES && !starts_new_block(line) {
+            let tail = line.trim();
+            if let Some(last) = out.last_mut() {
+                if last.chars().count() + tail.chars().count() < MAX_WRAP_JOIN_CHARS {
+                    // claude は語の境界で折り返して行頭の空白を捨てるので、
+                    // 空白 1 つでつなぐと元の 1 行が戻る
+                    last.push(' ');
+                    last.push_str(tail);
+                    joined += 1;
+                    continue;
+                }
+            }
+        }
+        out.push(line.trim_end().to_string());
+        open = true;
+        joined = 0;
+    }
+    out
+}
+
+/// 画面末尾の論理行を**下から順に**最大 `take` 本返す（#1123）。
+///
+/// 物理行の走査で外れたときのフォールバックに使う（下の行ほど新しいので末尾から見る）。
+/// `TAKO_1123_LEGACY=1` では結合が起きないので、返るのは呼び出し側が既に見た物理行
+/// そのもの = 候補が増えず #1123 前の判定へそのまま戻る
+pub fn unwrapped_tail<S: AsRef<str>>(lines: &[S], take: usize) -> Vec<String> {
+    let mut out = unwrap_wrapped_lines(lines);
+    out.reverse();
+    out.truncate(take);
+    out
+}
+
+/// 画面テキスト（改行区切り）から論理行を下から順に返す（#1123）。
+/// [`unwrapped_tail`] の `&str` 版で、`detect_worker_error` のように
+/// 1 本の文字列を受け取る呼び出し側が使う
+pub fn unwrapped_tail_of(output: &str, take: usize) -> Vec<String> {
+    let lines: Vec<&str> = output.lines().collect();
+    unwrapped_tail(&lines, take)
+}
+
+/// `TAKO_1123_LEGACY=1` で #1123 前（折り返しを結合しない）へ戻す（A/B 用）。
+/// 狭いペインでは上限の見出しがどの規則にも当たらなくなる
+fn legacy_wrapped_headline() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_1123_LEGACY").is_some())
+}
+
 // --- リセット時刻のパース ---
 
 /// リセット時刻が書かれている箇所の目印（小文字で検索。実採取の文言由来）。
@@ -2054,5 +2183,270 @@ mod tests {
             "Keep current model (never show again)",
         ]);
         assert_eq!(safe_choice(&opts), Some((2, "Keep current model")));
+    }
+
+    // --- #1123: ペイン幅で折り返された見出し ---
+
+    /// 実採取（2026-09-04。**幅 25 桁**のペインで worker 4 体が止まっていた画面）。
+    /// claude 2.1.258 が自分で語の境界で折り返し、続きを内容の列（5 桁）へ字下げする。
+    /// どの物理行も #1093 / #1096 の規則に当たらないので、自動復帰も watch の
+    /// `WORKER_ERROR` も同時に外れていた（解除後 7.5 時間の停止）
+    const WRAPPED_25: [&str; 7] = [
+        "  ⎿  You've hit your",
+        "     session limit ·",
+        "     resets 5:50am",
+        "     (Asia/Tokyo)",
+        "     /usage-credits to",
+        "     request more usage",
+        "     from your admin.",
+    ];
+
+    /// 折り返す前の 1 論理行（80 桁のペインならこの形で 1 行に収まる）
+    const WRAPPED_SOURCE: &str = "You've hit your session limit · resets 5:50am (Asia/Tokyo) \
+                                  /usage-credits to request more usage from your admin.";
+
+    /// claude TUI の折り返しを再現する（先頭行は目印つき・続きは内容の列へ字下げ）。
+    /// 実採取（[`WRAPPED_25`]）と形が一致することを別のテストで固定してあるので、
+    /// 他の幅もこれで作ってよい
+    fn wrap_claude_block(text: &str, cols: usize) -> Vec<String> {
+        let (first, cont) = ("  ⎿  ", "     ");
+        let mut out: Vec<String> = Vec::new();
+        let mut line = first.to_string();
+        let mut width = first.chars().count();
+        for word in text.split(' ') {
+            let w = word.chars().count();
+            let head = out.is_empty() && line.chars().count() == first.chars().count();
+            if !head && width + 1 + w > cols {
+                out.push(line);
+                line = format!("{cont}{word}");
+                width = cont.chars().count() + w;
+            } else if head {
+                line.push_str(word);
+                width += w;
+            } else {
+                line.push(' ');
+                line.push_str(word);
+                width += 1 + w;
+            }
+        }
+        out.push(line);
+        out
+    }
+
+    #[test]
+    fn issue1123_折り返しの生成器が実採取と一致する() {
+        // 生成器を実採取に固定しておく。ここがずれたら他の幅のテストも信用できない
+        assert_eq!(
+            wrap_claude_block(WRAPPED_SOURCE, 25),
+            WRAPPED_25.to_vec(),
+            "25 桁の折り返しが 2026-09-04 の実採取と一致しない"
+        );
+    }
+
+    #[test]
+    fn issue1123_実採取の折り返し見出しを結合して上限として読む() {
+        // 前提: **物理行はどれも当たらない**（これが #1123 の実害そのもの）
+        for l in WRAPPED_25 {
+            assert!(
+                !is_limit_exhausted_line(l),
+                "物理行が単体で当たるなら #1123 の前提が違う: {l}"
+            );
+        }
+        let joined = unwrap_wrapped_lines(&WRAPPED_25);
+        assert_eq!(joined.len(), 1, "1 本の論理行へ戻らない: {joined:?}");
+        assert!(
+            is_limit_exhausted_line(&joined[0]),
+            "結合しても上限として読めない: {}",
+            joined[0]
+        );
+        assert_eq!(
+            exhausted_limit_window(&joined[0]),
+            Some(LimitWindow::FiveHour),
+            "`session limit` は 5h 枠（メーターを 100% にする根拠）"
+        );
+        // 解除時刻（`resets 5:50am`）も同じ 1 本から読める
+        let observed = 1_786_752_000 - 9 * 3600; // JST 09:00 相当
+        assert!(
+            parse_reset_at(&joined[0], observed, 9 * 3600).is_some(),
+            "結合後の行から解除時刻が読めない: {}",
+            joined[0]
+        );
+    }
+
+    #[test]
+    fn issue1123_幅を変えても見出しを読む() {
+        // 実発生は 21〜25 桁。80 桁は折り返しが起きない側の対照
+        for cols in [21usize, 25, 40, 80] {
+            let lines = wrap_claude_block(WRAPPED_SOURCE, cols);
+            let joined = unwrap_wrapped_lines(&lines);
+            assert_eq!(joined.len(), 1, "{cols} 桁で 1 本へ戻らない: {joined:?}");
+            assert!(
+                is_limit_exhausted_line(&joined[0]),
+                "{cols} 桁で上限として読めない: {}",
+                joined[0]
+            );
+            assert_eq!(
+                exhausted_limit_window(&joined[0]),
+                Some(LimitWindow::FiveHour),
+                "{cols} 桁で枠が読めない"
+            );
+        }
+    }
+
+    #[test]
+    fn issue1123_続きの字下げが塊の列でも結合する() {
+        // 実採取（同じ 25 桁の画面）。`⎿` の塊なのに続きが**内容の列ではなく
+        // 塊の列**（2 桁）へ字下げされることがある。だから幅の一致では判定しない
+        let lines = [
+            "  ⎿  You have hit",
+            "  your session",
+            "  limit · resets",
+            "  5:50am",
+        ];
+        let joined = unwrap_wrapped_lines(&lines);
+        assert_eq!(
+            joined.len(),
+            1,
+            "字下げ 2 桁の続きが結合されない: {joined:?}"
+        );
+        assert!(is_limit_exhausted_line(&joined[0]), "{}", joined[0]);
+    }
+
+    #[test]
+    fn issue1123_目印の字下げが無くても続きは結合する() {
+        // 塊の先頭行が 0 桁目から始まる形（`⎿` に字下げが付かない描画）。
+        // 先頭行は「字下げ無し = 新しい塊」で始まり、続きは字下げがあるので結合される
+        let lines = [
+            "⎿  You've hit your",
+            "   session limit ·",
+            "   resets 5:50am",
+        ];
+        let joined = unwrap_wrapped_lines(&lines);
+        assert_eq!(joined.len(), 1, "{joined:?}");
+        assert!(is_limit_exhausted_line(&joined[0]), "{}", joined[0]);
+    }
+
+    #[test]
+    fn issue1123_字下げの無い行は続きにしない() {
+        // 字下げは「折り返しの続き」の唯一の手がかり（claude は続きを必ず字下げする）。
+        // 0 桁目から始まる行までつなげると、無関係な段落から偽の見出しが生まれる
+        let lines = ["⎿  You've hit your", "session limit · resets 5:50am"];
+        let joined = unwrap_wrapped_lines(&lines);
+        assert_eq!(
+            joined.len(),
+            2,
+            "字下げの無い行を続きにしている: {joined:?}"
+        );
+        assert!(joined.iter().all(|l| !is_limit_exhausted_line(l)));
+    }
+
+    #[test]
+    fn issue1123_折り返しが無ければ論理行は入力そのまま() {
+        // 目印つきの行・字下げ無しの行だけの画面では結合が 1 度も起きない
+        let lines = [
+            "⏺ 実装を進めます",
+            "  ⎿  You've hit your session limit · resets 7:50pm (Asia/Tokyo)",
+            "",
+            "────────────────────────",
+            "❯ ",
+            "────────────────────────",
+        ];
+        let joined = unwrap_wrapped_lines(&lines);
+        let want: Vec<String> = lines
+            .iter()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.trim_end().to_string())
+            .collect();
+        assert_eq!(joined, want, "折り返しの無い画面で行が変わっている");
+    }
+
+    #[test]
+    fn issue1123_空行をまたいで結合しない() {
+        // 空行は塊の切れ目。またいでつなぐと無関係な段落から偽の見出しが生まれる
+        let lines = ["  ⎿  You've hit your", "", "     session limit ·"];
+        let joined = unwrap_wrapped_lines(&lines);
+        assert_eq!(joined.len(), 2, "空行をまたいで結合している: {joined:?}");
+        assert!(joined.iter().all(|l| !is_limit_exhausted_line(l)));
+    }
+
+    #[test]
+    fn issue1123_自動モデル切替の告知は折り返しても上限にしない() {
+        // `limit reached, now using …` は worker が止まらない告知（#157 の除外条件）。
+        // 折り返しを結合すると除外条件のほうが当たるので、結合しても上限にならない
+        let lines = wrap_claude_block("Opus limit reached, now using Sonnet", 21);
+        for l in unwrap_wrapped_lines(&lines) {
+            assert!(!is_limit_exhausted_line(&l), "自動切替を上限と読んだ: {l}");
+        }
+    }
+
+    #[test]
+    fn issue1123_時間で解けない阻害は折り返しても阻害のまま() {
+        // #1106 / #1107 の排他は結合後も保たれる（混ぜると自動復帰が空撃ちする）
+        for text in [
+            "Your seat type doesn't include usage credits",
+            "Your group's usage limit is set to $0",
+            "You've reached your workspace credit limit",
+        ] {
+            let joined = unwrap_wrapped_lines(&wrap_claude_block(text, 21));
+            assert_eq!(joined.len(), 1, "{text}: {joined:?}");
+            assert!(
+                entitlement_block_line(&joined[0]),
+                "阻害として読めない: {}",
+                joined[0]
+            );
+            assert!(
+                !is_limit_exhausted_line(&joined[0]),
+                "阻害を上限と読んだ（排他が破れている）: {}",
+                joined[0]
+            );
+        }
+    }
+
+    #[test]
+    fn issue1123_警告や情報は折り返しても上限にしない() {
+        // まだ動けるペインへナッジを撃たないための境界（#1096 と同じ分類）
+        for text in [
+            "You've used 90% of your session limit",
+            "You're close to your weekly limit",
+            "You're now using usage credits",
+        ] {
+            let joined = unwrap_wrapped_lines(&wrap_claude_block(text, 21));
+            for l in &joined {
+                assert!(!is_limit_exhausted_line(l), "{text} を上限と読んだ: {l}");
+            }
+        }
+    }
+
+    #[test]
+    fn issue1123_結合は行数と文字数で歯止めをかける() {
+        // 字下げが続くだけの領域を丸ごと 1 本へ畳まない
+        let many: Vec<String> = (0..40).map(|i| format!("     line{i}")).collect();
+        let joined = unwrap_wrapped_lines(&many);
+        assert!(joined.len() > 1, "40 行が 1 本に畳まれた");
+        assert!(
+            joined[0].split(' ').filter(|s| !s.is_empty()).count() <= MAX_WRAP_JOIN_LINES + 1,
+            "行数の歯止めが効いていない: {}",
+            joined[0]
+        );
+        let long: Vec<String> = (0..30)
+            .map(|_| format!("     {}", "x".repeat(80)))
+            .collect();
+        for l in unwrap_wrapped_lines(&long) {
+            assert!(
+                l.chars().count() <= MAX_WRAP_JOIN_CHARS + 80,
+                "文字数の歯止めが効いていない: {}",
+                l.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn issue1123_末尾から順に返す() {
+        // 下の行ほど新しいので、フォールバックの走査も末尾から
+        let lines = ["⏺ a", "⏺ b", "⏺ c"];
+        assert_eq!(
+            unwrapped_tail(&lines, 2),
+            vec!["⏺ c".to_string(), "⏺ b".into()]
+        );
     }
 }
