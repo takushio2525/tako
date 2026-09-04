@@ -80,8 +80,31 @@ pub fn is_choice_dialog(lines: &[&str]) -> bool {
 /// 画面テキストから選択肢の並びを検知する。
 ///
 /// 判定は最下部の選択カーソル行を起点にする（会話ログに残っている過去の
-/// `❯ 送信済みメッセージ` を拾わないため）
+/// `❯ 送信済みメッセージ` を拾わないため）。
+///
+/// 狭いペイン（実発生は 21〜25 桁）ではラベルが折り返されて切り詰まるので、
+/// **物理行で組んだうえで、折り返しを結合した行でも組み直して比べる**（#1131）。
+/// 採るのは「選択肢の数が減っていない」ほうだけなので、結合が選択肢を畳んで
+/// しまう形（番号なしの並び）では物理行の結果がそのまま残る。
+/// 折り返しが 1 つも無い画面では入力が**同一の文字列**なので 1 ビットも変わらない
 pub fn detect_choice_list(lines: &[&str]) -> Option<ChoiceList> {
+    let raw = detect_choice_list_in(lines);
+    let unwrapped = unwrap_dialog_lines(lines);
+    if unwrapped.iter().zip(lines).all(|(a, b)| a == b) {
+        return raw; // 結合が起きていない = 判定材料が同一
+    }
+    let refs: Vec<&str> = unwrapped.iter().map(String::as_str).collect();
+    match (detect_choice_list_in(&refs), raw) {
+        // 結合後のほうが選択肢を取りこぼしていなければそちらを採る
+        // （ラベルが 1 本に戻っているのはこちらだけ）
+        (Some(joined), Some(raw)) if joined.options.len() >= raw.options.len() => Some(joined),
+        (Some(joined), None) => Some(joined),
+        (_, raw) => raw,
+    }
+}
+
+/// [`detect_choice_list`] の本体（渡された行をそのまま材料にする）
+fn detect_choice_list_in(lines: &[&str]) -> Option<ChoiceList> {
     let bottom = lines.iter().rposition(|l| !l.trim().is_empty())? + 1;
     let scan_from = bottom.saturating_sub(SCAN_ROWS);
     let cursor_row = (scan_from..bottom)
@@ -175,6 +198,172 @@ pub fn detect_choice_list(lines: &[&str]) -> Option<ChoiceList> {
         header: header_block(lines, *rows.first().unwrap_or(&cursor_row)),
         cursor_row,
     })
+}
+
+// --- 折り返しの結合（#1131） ---
+
+/// 結合する継続行の上限（#1131）。選択肢のラベルは 21 桁でも 3 行までに収まる
+const MAX_WRAP_JOIN_LINES: usize = 8;
+
+/// 結合後のラベルの文字数上限（#1131）
+const MAX_WRAP_JOIN_CHARS: usize = 600;
+
+/// ダイアログの本文が折り返す位置と画面幅の差（実採取 = 3 桁。
+/// 25 桁のペインで本文の列 3 / 選択肢の列 8 の両方がこの値で一致する）
+const DIALOG_RIGHT_PAD: usize = 3;
+
+/// その行が**新しい要素**を始めるか（= 直前の行の折り返しの続きではないか）。
+///
+/// `indent` は直前の論理行の中身が始まる桁。続きは**必ずそれより深く**字下げされる
+/// （実採取: 25 桁の確認ダイアログで `   ❯ 1. Yes, switch to` の続きが
+/// `        Haiku 4.5` = 番号の後ろの列）。同じ桁の行は**次の選択肢**なので結合しない。
+///
+/// 加えて、深く字下げされていても次のものは続きにしない:
+/// 選択カーソル行 / 番号つき選択肢 / 操作キーの案内 / 罫線
+fn starts_new_dialog_block(
+    line: &str,
+    prev: &str,
+    indent: usize,
+    numbered: bool,
+    usable: usize,
+) -> bool {
+    let stripped = line.trim_start();
+    if stripped.is_empty() {
+        return true;
+    }
+    let leading = line.chars().take_while(|c| *c == ' ').count();
+    // 番号つきの選択肢は**ラベルの列**（`1. ` の後ろ）へ折り返し、兄弟の選択肢は
+    // それより左の**番号の列**に並ぶ（実採取）。だから同じ桁は続きでよい。
+    // 番号なしの並びは兄弟も続きも同じ桁に来て区別できないので、**深い行だけ**を
+    // 続きとみなす（`/mcp` のサーバー一覧を 1 個へ畳まないための安全側）
+    let deep_enough = if numbered {
+        leading >= indent
+    } else {
+        leading > indent
+    };
+    if !deep_enough {
+        return true;
+    }
+    // **折り返しの続きは「前の行に載らなかったから次の行に来た」もの**。
+    // 前の行に最初の語がまだ入る余地があるなら、それは折り返しではなく
+    // 別の要素（実採取: 80 桁の AskUserQuestion は選択肢の下に説明行が
+    // ラベルと同じ桁で並ぶ）。桁は表示幅ではなく char 数で数えるので、
+    // 全角の行では**控えめ**に見積もる = 結合しない側へ倒れる（安全側）
+    let first_word = stripped
+        .split(' ')
+        .next()
+        .unwrap_or(stripped)
+        .chars()
+        .count();
+    if prev.chars().count() + 1 + first_word <= usable {
+        return true;
+    }
+    if cursor_content(line).is_some() || is_key_hint(line) || is_rule_line(stripped) {
+        return true;
+    }
+    numbered_choice(strip_indent(line)).is_some()
+}
+
+/// 選択肢のラベルが折り返された画面を、1 論理行へ戻す（#1131）。
+///
+/// # なぜ必要か（実採取 2026-09-04。claude 2.1.258 の同じダイアログを 80 桁と 25 桁で）
+///
+/// ```text
+/// 80 桁:  ❯ 1. Yes, switch to Haiku 4.5
+///           2. No, go back
+///
+/// 25 桁:  ❯ 1. Yes, switch to      ← ラベルがここで折れる
+///              Haiku 4.5           ← 続き（ラベルの列へ字下げ）
+///           2. No, go back
+/// ```
+///
+/// 構造検知（[`detect_choice_list`]）は 1 行 = 1 選択肢を前提にしているので、
+/// 狭いペインではラベルが `Yes, switch to` に切り詰められる。**選択肢は見つかるのに
+/// ラベルが違う**ので、`respond` のラベル一致検証と #813 の安全な選択肢の選別
+/// （`safe_choice`）が静かに外れる。
+///
+/// 続きの判定は [`starts_new_dialog_block`]。**同じ桁の行は次の選択肢**なので、
+/// 番号なしの並び（`/mcp` のサーバー一覧）を 1 個へ畳んでしまうことはない
+pub fn unwrap_dialog_lines(lines: &[&str]) -> Vec<String> {
+    if legacy_wrapped_dialog() {
+        return lines.iter().map(|l| (*l).to_string()).collect();
+    }
+    // 画面の幅（罫線がペイン幅いっぱいに引かれるので最長行がそれに当たる）。
+    // 右端の余白ぶんを引いた値が本文の折り返し位置になる（実採取で 3 桁）
+    let usable = lines
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0)
+        .saturating_sub(DIALOG_RIGHT_PAD);
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    // 続きを受け付けている論理行（`out` の添字と中身の桁）。None = 受け付けない
+    let mut open: Option<(usize, usize, bool)> = None;
+    let mut joined = 0usize;
+    for line in lines {
+        if let Some((row, indent, numbered)) = open {
+            if joined < MAX_WRAP_JOIN_LINES
+                && !starts_new_dialog_block(line, &out[row], indent, numbered, usable)
+            {
+                let tail = line.trim();
+                let last = &mut out[row];
+                if last.chars().count() + tail.chars().count() < MAX_WRAP_JOIN_CHARS {
+                    last.push(' ');
+                    last.push_str(tail);
+                    joined += 1;
+                    // **行数は保つ**（画面の行番号と 1:1 のまま扱う）。結合した行は
+                    // 空行にしておくと、罫線・兄弟行の走査が「そこで切れる」ので
+                    // 元の並びと同じ意味になる
+                    out.push(String::new());
+                    continue;
+                }
+            }
+        }
+        joined = 0;
+        let is_numbered =
+            numbered_choice(cursor_content(line).unwrap_or_else(|| strip_indent(line))).is_some();
+        open = content_start_column(line).map(|c| (out.len(), c, is_numbered));
+        out.push((*line).to_string());
+    }
+    out
+}
+
+/// その行の「中身が始まる桁」（行頭空白 + 縦罫線 + 選択カーソル + 番号を除いた位置）。
+/// 折り返しの続きはこの桁へ字下げされる（実採取）
+fn content_start_column(line: &str) -> Option<usize> {
+    let stripped = line.trim_start();
+    if stripped.is_empty() {
+        return None;
+    }
+    // 罫線と操作キーの案内は**続きを受け付けない**（本文ではないので折り返されない）。
+    // 受け付けると、箱の境界である罫線が直後の見出しを吸って `header_block` の
+    // 「罫線でそれまでを捨てる」が効かなくなる（実採取 fixture で踏んだ）
+    if is_rule_line(stripped) || is_key_hint(line) {
+        return None;
+    }
+    let after_cursor = cursor_content(line).map(|inner| {
+        let offset = line.len() - inner.len();
+        line[..offset].chars().count()
+    });
+    let base = match after_cursor {
+        Some(c) => c,
+        None => line.chars().take_while(|c| *c == ' ').count(),
+    };
+    // 番号つきなら番号とドットの後ろがラベルの列
+    let inner = cursor_content(line).unwrap_or_else(|| strip_indent(line));
+    match numbered_choice(inner) {
+        Some((_, label)) => {
+            let consumed = inner.chars().count() - label.chars().count();
+            Some(base + consumed)
+        }
+        None => Some(base),
+    }
+}
+
+/// `TAKO_1131_LEGACY=1` で #1131 前（折り返しを結合しない）へ戻す（A/B 用）
+fn legacy_wrapped_dialog() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_1131_LEGACY").is_some())
 }
 
 /// 走査する下端からの行数。ダイアログは選択肢 + 説明で 20 行を超えることがある
@@ -635,5 +824,207 @@ Antigravity CLI requires permission to read, edit, and execute files here.
         assert!(!is_rule_line(""));
         assert!(!is_rule_line("Select model"));
         assert!(!is_rule_line("❯ 1. Yes"));
+    }
+
+    // --- #1131: ペイン幅で折り返された選択肢 ---
+
+    /// 実採取（2026-09-04。claude 2.1.258 の**同じ確認ダイアログ**を 80 桁と 25 桁で
+    /// 採った対。`tmux resize-window` で幅だけ変えているので中身は完全に同じ）。
+    ///
+    /// 25 桁ではラベルが折り返され、続きが**ラベルの列**（`❯ 1. ` の後ろ = 8 桁）へ
+    /// 字下げされる。#1131 前の構造検知は 1 行 = 1 選択肢を前提にしていたので、
+    /// 選択肢は見つかるのにラベルが `Yes, switch to` に切り詰められていた
+    const CONFIRM_80: &str = r#"▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Switch model?
+   Your next response will be slower and use more tokens
+
+   This conversation is cached for the current model. Switching to Haiku 4.5
+   means the full history gets re-read on your next message.
+
+   ❯ 1. Yes, switch to Haiku 4.5
+     2. No, go back"#;
+
+    const CONFIRM_25: &str = r#"▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Switch model?
+   Your next response
+   will be slower and
+   use more tokens
+
+   This conversation
+   is cached for the
+   current model.
+   Switching to Haiku
+   4.5 means the full
+   history gets
+   re-read on your
+   next message.
+
+   ❯ 1. Yes, switch to
+        Haiku 4.5
+     2. No, go back"#;
+
+    #[test]
+    fn issue1131_実採取の確認ダイアログは幅が違っても同じ選択肢になる() {
+        let wide = detect_choice_list(&rows(CONFIRM_80)).expect("80 桁で検知される");
+        let narrow = detect_choice_list(&rows(CONFIRM_25)).expect("25 桁で検知されない");
+        assert!(wide.numbered && narrow.numbered);
+        assert_eq!(
+            narrow.options.len(),
+            wide.options.len(),
+            "選択肢の数が幅で変わる: {:?}",
+            narrow.options
+        );
+        for (n, w) in narrow.options.iter().zip(&wide.options) {
+            assert_eq!(n.number, w.number, "番号が違う");
+            assert_eq!(
+                n.label, w.label,
+                "ラベルが幅で変わる（折り返しが結合できていない）"
+            );
+            assert_eq!(n.highlighted, w.highlighted, "ハイライトが違う");
+        }
+        assert_eq!(narrow.highlighted, wide.highlighted);
+        // 本文（title に使う）も同じ 1 本になる
+        assert_eq!(
+            narrow.header.join(" "),
+            wide.header.join(" "),
+            "本文が幅で変わる"
+        );
+    }
+
+    /// claude TUI の折り返しを再現する（#1131）。
+    /// 続きは**中身の列**へ字下げされ、右端に 3 桁の余白が残る
+    /// （実採取の [`CONFIRM_25`] が本文の列 3 と選択肢の列 8 の両方でこの形に一致する）
+    fn wrap_dialog_line(prefix: &str, text: &str, cols: usize) -> Vec<String> {
+        let col = prefix.chars().count();
+        let avail = cols.saturating_sub(col + 3).max(1);
+        let cont = " ".repeat(col);
+        let mut out: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        for w in text.split(' ') {
+            let next = if cur.is_empty() {
+                w.to_string()
+            } else {
+                format!("{cur} {w}")
+            };
+            if next.chars().count() > avail && !cur.is_empty() {
+                out.push(format!(
+                    "{}{cur}",
+                    if out.is_empty() { prefix } else { &cont }
+                ));
+                cur = w.to_string();
+            } else {
+                cur = next;
+            }
+        }
+        out.push(format!(
+            "{}{cur}",
+            if out.is_empty() { prefix } else { &cont }
+        ));
+        out
+    }
+
+    #[test]
+    fn issue1131_折り返しの生成器が実採取と一致する() {
+        // 生成器を実採取へ固定する。ここがずれたら他の fixture も信用できない
+        assert_eq!(
+            wrap_dialog_line("   ❯ 1. ", "Yes, switch to Haiku 4.5", 25),
+            vec![
+                "   ❯ 1. Yes, switch to".to_string(),
+                "        Haiku 4.5".into()
+            ],
+            "選択肢の列（8 桁）"
+        );
+        assert_eq!(
+            wrap_dialog_line(
+                "   ",
+                "Your next response will be slower and use more tokens",
+                25
+            ),
+            vec![
+                "   Your next response".to_string(),
+                "   will be slower and".into(),
+                "   use more tokens".into(),
+            ],
+            "本文の列（3 桁）"
+        );
+    }
+
+    #[test]
+    fn issue1131_permissionダイアログを25桁でも同じ選択肢で読む() {
+        // #748 の実採取（80 桁）の選択肢だけを 25 桁へ折り返す。
+        // ラベルが 2 行に割れても番号・ラベル・ハイライトが変わらないこと
+        let mut lines: Vec<String> = vec![
+            "▔".repeat(25),
+            "   Bash command".into(),
+            "".into(),
+            "   perl -e \"print 42\"".into(),
+            "".into(),
+            "   Do you want to".into(),
+            "   proceed?".into(),
+            "".into(),
+        ];
+        for (i, (prefix, label)) in [
+            ("   ❯ 1. ", "Yes"),
+            ("     2. ", "Yes, and don't ask again"),
+            ("     3. ", "No, and tell Claude what to do differently"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let _ = i;
+            lines.extend(wrap_dialog_line(prefix, label, 25));
+        }
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let list = detect_choice_list(&refs).expect("25 桁の permission が検知されない");
+        assert!(list.numbered);
+        assert_eq!(list.options.len(), 3, "{:?}", list.options);
+        assert_eq!(list.options[0].label, "Yes");
+        assert_eq!(list.options[1].label, "Yes, and don't ask again");
+        assert_eq!(
+            list.options[2].label, "No, and tell Claude what to do differently",
+            "折り返したラベルが 1 本へ戻っていない"
+        );
+        assert_eq!(list.highlighted, Some(0));
+        assert!(list.header.join(" ").contains("Do you want to proceed?"));
+    }
+
+    #[test]
+    fn issue1131_上限ダイアログを25桁でも同じ選択肢で読む() {
+        // #748 / #813 の実文言。ここが読めないと「解除まで待つ」の自動確定が効かない
+        let mut lines: Vec<String> = vec!["▔".repeat(25)];
+        lines.extend(wrap_dialog_line("   ", "What do you want to do?", 25));
+        lines.push("".into());
+        for (prefix, label) in [
+            ("   ❯ 1. ", "Stop and wait for limit to reset"),
+            (
+                "     2. ",
+                "Upgrade to Max 20x for higher session limits every month",
+            ),
+            ("     3. ", "Continue with usage credits"),
+        ] {
+            lines.extend(wrap_dialog_line(prefix, label, 25));
+        }
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let list = detect_choice_list(&refs).expect("25 桁の上限ダイアログが検知されない");
+        assert_eq!(list.options.len(), 3, "{:?}", list.options);
+        assert_eq!(list.options[0].label, "Stop and wait for limit to reset");
+        assert_eq!(
+            list.options[1].label,
+            "Upgrade to Max 20x for higher session limits every month"
+        );
+        assert!(list.header.join(" ").contains("What do you want to do?"));
+    }
+
+    #[test]
+    fn issue1131_番号なしの並びは畳まない() {
+        // 兄弟の選択肢は**同じ桁**に並ぶので、続きと取り違えて 1 個へ畳んではいけない
+        let lines = rows(
+            "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n   Select a server\n\n   ❯ tako\n     linear\n     playwright",
+        );
+        let list = detect_choice_list(&lines).expect("検知される");
+        assert!(!list.numbered);
+        assert_eq!(list.options.len(), 3, "{:?}", list.options);
+        assert_eq!(list.options[0].label, "tako");
+        assert_eq!(list.options[2].label, "playwright");
     }
 }
