@@ -28006,10 +28006,24 @@ mod self_test {
             geom.background,
             flip,
         );
+        // 期待値は**帯の実面積から作る**（#920 / #943）。旧実装は device px の
+        // リテラル 40 で縛っていたので、**表示スケール 1 の機では原理的に落ちた**
+        // （#943 の報告値 `strip=32` は scale=2 の 126 のちょうど 1/4 = 同じ絵の
+        // スケール差。閾値 40 だけがスケールに追随していなかった）。
+        // 下線は帯を埋めるのが正しいので「帯の半分以上が塗られている」で見る
+        let strip_bounds = underline_line(attr_bounds("VA"));
+        let strip_area = ((f32::from(strip_bounds.size.width) * scale)
+            .round()
+            .max(0.0)
+            * (f32::from(strip_bounds.size.height) * scale)
+                .round()
+                .max(0.0)) as usize;
+        let strip_min = (strip_area / 2).max(1);
         println!(
             "TAKO_VISUAL_PIXEL: term-grid attrs-underline model={ul_run_flag} ink={ul_ink} \
              plain_ink={plain_ink} band={ul_band} plain_band={plain_band} below={ul_below} \
-             plain_below={plain_below} strip={ul_strip} plain_strip={plain_strip} profile={:?}",
+             plain_below={plain_below} strip={ul_strip} strip_area={strip_area} \
+             strip_min={strip_min} scale={scale} plain_strip={plain_strip} profile={:?}",
             ink_row_profile(&frame, &attr_bounds("VA"), scale, geom.background, flip),
         );
         check(
@@ -28027,9 +28041,14 @@ mod self_test {
             ul_run_flag,
             "visual-test 端末グリッド: SGR 4 がモデルで underline に解決される (#787)",
         );
+        // 帯の面積が 0 に潰れると閾値が 1 になって検査が空振りするので、前提も見る
         check(
-            ul_ink > plain_ink && ul_strip >= 40 && plain_strip == 0,
-            "visual-test 端末グリッド: SGR 4 の下線が実ピクセルで描かれる (#797/#787)",
+            strip_area >= 8,
+            "visual-test 端末グリッド: 下線の帯に面積がある（閾値が空振りしない前提）(#943)",
+        );
+        check(
+            ul_ink > plain_ink && ul_strip >= strip_min && plain_strip == 0,
+            "visual-test 端末グリッド: SGR 4 の下線が実ピクセルで描かれる (#797/#787/#943)",
         );
         check(
             ul_below == 0 && plain_below == 0,
@@ -28313,7 +28332,27 @@ mod self_test {
         //
         // 既存の subline 節（そのまま比較 / 半行戻して比較の差分）とは独立に、
         // **インク縦プロファイルの位相**で言う。行単位描画なら位相は 0 か 1 セルにしか
-        // ならないので、半セルの位相はピクセル単位描画の直接証拠になる
+        // ならないので、半セルの位相はピクセル単位描画の直接証拠になる。
+        //
+        // **測れるのは直接ペインだけ**（#943）。器（tmux）つきのペインはホイールが
+        // `mirror_scroll_pane` → `backend_scroll_px` の**ミラー経路**へ入り、
+        // `session.scroll_pixels`（= `fract` を作る側）を通らない。しかもミラーは
+        // 「tmux から capture して作る」ので 1 フレームでは立たず、画面も動かない
+        // = #159 の設計どおりの挙動。前提を見ずに測っていたため、`TAKO_PERSIST=1` を
+        // 付けた実行では `fract=0.000 shift=0 zero_cost=0.00`（フレーム完全同一）で
+        // **必ず落ち、以降の節が 1 つも走らなかった**（#943 の報告値と実測が一致）。
+        // 既定のレシピ（`TAKO_ISOLATED=1` 単独 = persist OFF）では直接ペインなので走る。
+        // 旧挙動（前提を見ずに測る）は `TAKO_943_LEGACY=1`
+        let mirrored = window
+            .update(cx, |app, _, _| app.mirror_scroll_pane(geom.pane))
+            .unwrap_or(false);
+        let legacy_943 = std::env::var_os("TAKO_943_LEGACY").is_some();
+        if mirrored && !legacy_943 {
+            println!(
+                "TAKO_VISUAL_SKIPPED: term-grid scroll（器つきペインはミラー経路 = 行単位。\
+                 直接ペイン専用の検査。persist を切ると走る。#943/#159）"
+            );
+        }
         press(any, cx, "ctrl-u");
         type_text(any, cx, "seq 400", true);
         cx.background_executor()
@@ -28395,28 +28434,35 @@ mod self_test {
         let (first_flat, last_flat, rows_flat) = ink_extent(&prof_flat);
         let (first_half, last_half, rows_half) = ink_extent(&prof_half);
         println!(
-            "TAKO_VISUAL_PIXEL: term-grid scroll fract={:.3} shift={shift} \
-             expected={expected_shift} best_cost={best_cost:.2} zero_cost={zero_cost:.2} \
-             first={first_flat}->{first_half} last={last_flat}->{last_half} \
-             ink_rows={rows_flat}->{rows_half}",
+            "TAKO_VISUAL_PIXEL: term-grid scroll mirrored={mirrored} fract={:.3} \
+             shift={shift} expected={expected_shift} best_cost={best_cost:.2} \
+             zero_cost={zero_cost:.2} first={first_flat}->{first_half} \
+             last={last_flat}->{last_half} ink_rows={rows_flat}->{rows_half}",
             half.screen.fract,
         );
-        check(
-            (half.screen.fract - 0.5).abs() < 0.2,
-            "visual-test 端末グリッド: 半行スクロールで端数が 0.5 行になる (#159/#787)",
-        );
-        check(
-            (shift - expected_shift).abs() <= 2 && best_cost * 2.0 < zero_cost,
-            "visual-test 端末グリッド: 描画がちょうど半セルずれる（ピクセル単位）(#159/#787)",
-        );
-        check(
-            first_half >= 0 && first_half < first_flat,
-            "visual-test 端末グリッド: 上端に部分行が出る（クリップされて先頭が繰り上がる）(#159/#787)",
-        );
-        check(
-            (last_half - last_flat).abs() as f32 <= cell_h * 0.25 * scale,
-            "visual-test 端末グリッド: 下端の部分行（extra_bottom）が隙間を埋める (#159/#787)",
-        );
+        // 器つきは上で理由を出して飛ばす（器の有無は診断行に出るので、
+        // 「直接ペインのはずが器つきだった」= 隔離の取りこぼしにも気づける）
+        if legacy_943 || !mirrored {
+            // ここへ来るのは直接ペイン（または `TAKO_943_LEGACY=1`）だけ。前提は
+            // 診断行の `mirrored=` に出るので、判定を 1 本増やしても
+            // 非 legacy では必ず真になるだけ（= 検出力にならない）ため置かない
+            check(
+                (half.screen.fract - 0.5).abs() < 0.2,
+                "visual-test 端末グリッド: 半行スクロールで端数が 0.5 行になる (#159/#787)",
+            );
+            check(
+                (shift - expected_shift).abs() <= 2 && best_cost * 2.0 < zero_cost,
+                "visual-test 端末グリッド: 描画がちょうど半セルずれる（ピクセル単位）(#159/#787)",
+            );
+            check(
+                first_half >= 0 && first_half < first_flat,
+                "visual-test 端末グリッド: 上端に部分行が出る（クリップされて先頭が繰り上がる）(#159/#787)",
+            );
+            check(
+                (last_half - last_flat).abs() as f32 <= cell_h * 0.25 * scale,
+                "visual-test 端末グリッド: 下端の部分行（extra_bottom）が隙間を埋める (#159/#787)",
+            );
+        }
         window
             .update(cx, |app, _, cx| {
                 if let Some(session) = app.terminals.get(&geom.pane) {
