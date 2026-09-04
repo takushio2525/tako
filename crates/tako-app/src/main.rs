@@ -61382,14 +61382,17 @@ mod selftest_pane_command_watchdog {
     /// 検出力の担保: #1102 で直した形を見つけ、方言境界から組んだ形は許す
     #[test]
     fn 番犬はposix決め打ちの本文を見つけ方言境界は許す() {
+        // 見本に `.write(` を literal で書かない（#897 の番犬が括弧の釣り合いで
+        // 式を切り出すので、見本の文字列から後続の行まで舐めてしまう）。
+        // この番犬が見るのは `pty_line(` と `printf '` の 2 語だけ
         let bad = format!(
-            "                        s.write({}(&format!(\"{} '%s\\n' {{}}\", q)));",
+            "                        write({}(&format!(\"{} '%s\\n' {{}}\", q)));",
             concat!("pty_", "line"),
             concat!("print", "f"),
         );
         assert_eq!(posix_only_pane_text(&bad), vec![1], "違反を見逃した");
         let good = format!(
-            "                        s.write({}(&sh.print_lines(&[marker.clone()])));",
+            "                        write({}(&sh.print_lines(&[marker.clone()])));",
             concat!("pty_", "line"),
         );
         assert!(
