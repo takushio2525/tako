@@ -53570,6 +53570,20 @@ mod self_test {
                     kind_wrapped.as_deref() == Some("idle"),
                     "111: 折り返した見出しでも上限停止として検知する (#1123)",
                 );
+                // watch / worker_status が使う分類も同じ実ペインの画面で通す
+                // （#1106 の対照と同じ `classify` = `detect_worker_error` そのもの）。
+                // detail が**結合後の 1 本**であることまで見る —— ここが物理行のままだと
+                // `limit_stop` 側の `parse_reset_at` が解除時刻を拾えない
+                let class_wrapped = classify(cx, wrapped_pane);
+                println!("TAKO_SELF_TEST_1123_CLASS: {class_wrapped:?}");
+                check(
+                    class_wrapped.as_ref().map(|c| c.0.as_str()) == Some("usage_limit")
+                        && class_wrapped.as_ref().map(|c| c.1.as_str()) == Some("wait_reset")
+                        && class_wrapped
+                            .as_ref()
+                            .is_some_and(|c| c.2.contains("resets 5:50am")),
+                    "111: 折り返した見出しが usage_limit / wait_reset へ分類される (#1123)",
+                );
                 check(
                     reset_wrapped.is_some(),
                     "111: 別の行へ割れた `resets 5:50am` から解除時刻を解決する (#1123)",
