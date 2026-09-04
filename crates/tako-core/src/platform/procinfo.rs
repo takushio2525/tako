@@ -117,6 +117,66 @@ pub fn descendants_of(procs: &[ProcEntry], root: u32) -> HashSet<u32> {
     found
 }
 
+/// 実行ファイル名から拡張子と大文字小文字を落とした比較用の語
+fn stem_of(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    base.strip_suffix(".exe")
+        .or_else(|| base.strip_suffix(".EXE"))
+        .unwrap_or(base)
+        .to_ascii_lowercase()
+}
+
+/// tako 自身の実行ファイル名（GUI と CLI）
+const TAKO_NAMES: [&str; 2] = ["tako", "tako-app"];
+/// エージェント CLI の実行ファイル名
+const AGENT_NAMES: [&str; 3] = ["claude", "codex", "agy"];
+
+/// **tako 自身の直接の子として動いているエージェント CLI** を洗い出す（#1129）。
+///
+/// tako がエージェントを起こす設計上の経路は必ず**ペインのシェル**を通る
+/// （`queue_command_flow` / `Request::Send`）ので、正しい親子は
+/// `シェル → claude` になる。`tako → claude` は「tako が自分の子として起こして
+/// 待っている」形で、`tako setup` の認証段が起こしていた
+/// `claude auth login`（ブラウザ操作待ち = 自分では終わらない）と
+/// setup エージェントがこれに当たる。
+///
+/// この形の子は **tako が死んでも回収されない**。Windows は子プロセスの終了要求
+/// （#1067 の境界 B5）が未実装で、ペイン close も隔離インスタンスの終了も
+/// 孫を回収しないため、実機では 1 日で 46 本まで積み上がり CPU が 100% に
+/// 張り付いた（#1129 の採取）。
+///
+/// **直接の親だけ**を見る。祖先を辿ると、器を持たない構成（`TAKO_BACKEND=none`）で
+/// ペインのシェルが `tako-app` の子になるため、シェルから正しく起動した
+/// エージェントまで拾ってしまう。
+///
+/// 返すのは `(エージェントの pid, 親の tako の pid)`。純粋関数なので
+/// **macOS 上から Windows の名前（`claude.exe` / `tako.exe`）も検査できる**
+pub fn agent_children_of_tako(procs: &[ProcEntry]) -> Vec<(u32, u32)> {
+    let takos: HashSet<u32> = procs
+        .iter()
+        .filter(|p| TAKO_NAMES.contains(&stem_of(&p.name).as_str()))
+        .map(|p| p.pid)
+        .collect();
+    let mut found: Vec<(u32, u32)> = procs
+        .iter()
+        // 自分が自分の親になっている行（壊れた ppid）は親子と見なさない
+        .filter(|p| p.ppid != p.pid)
+        .filter(|p| AGENT_NAMES.contains(&stem_of(&p.name).as_str()))
+        .filter(|p| takos.contains(&p.ppid))
+        .map(|p| (p.pid, p.ppid))
+        .collect();
+    found.sort_unstable();
+    found
+}
+
+/// エージェント CLI として動いているプロセスの件数（診断用。親子は問わない）
+pub fn agent_process_count(procs: &[ProcEntry]) -> usize {
+    procs
+        .iter()
+        .filter(|p| AGENT_NAMES.contains(&stem_of(&p.name).as_str()))
+        .count()
+}
+
 #[cfg(windows)]
 mod imp {
     use super::{ProcEntry, TcpListenEntry};
@@ -509,6 +569,90 @@ mod tests {
     fn 居ないpidは解決できない() {
         // 32bit の pid 空間の上端付近。実在しない値なので必ず None
         assert_eq!(image_path(0xFFFF_FFF0), None);
+    }
+
+    fn proc(pid: u32, ppid: u32, name: &str) -> ProcEntry {
+        ProcEntry {
+            pid,
+            ppid,
+            name: name.to_string(),
+        }
+    }
+
+    /// #1129 の実機の形。`tako setup` の認証段が `claude auth login` を
+    /// 自分の子として起こして `.status()` で待っていた
+    #[test]
+    fn takoの直接の子のエージェントを名指しする() {
+        let procs = vec![
+            proc(1, 0, "launchd"),
+            proc(10, 1, "tako-app"),
+            proc(20, 10, "tmux"),
+            proc(30, 20, "zsh"),
+            proc(40, 30, "tako"),   // ペインのシェルが起こした `tako setup`
+            proc(50, 40, "claude"), // ← その子（`claude auth login`）
+        ];
+        assert_eq!(agent_children_of_tako(&procs), vec![(50, 40)]);
+    }
+
+    /// **Windows の名前でも同じ判定になる**（macOS 上から検査できるのが要点）
+    #[test]
+    fn windowsの実行ファイル名でも判定できる() {
+        let procs = vec![
+            proc(10, 4, "tako-app.exe"),
+            proc(20, 10, "tmux.exe"),
+            proc(30, 20, "pwsh.exe"),
+            proc(40, 30, "TAKO.EXE"),
+            proc(50, 40, "claude.exe"),
+        ];
+        assert_eq!(agent_children_of_tako(&procs), vec![(50, 40)]);
+    }
+
+    /// 設計どおりの形（**ペインのシェルが起こした**エージェント）は拾わない。
+    /// 器を持たない構成ではシェルが `tako-app` の子になるので、
+    /// 祖先を辿る判定にすると正しい起動まで落としてしまう
+    #[test]
+    fn シェルが起こしたエージェントは拾わない() {
+        let procs = vec![
+            proc(10, 1, "tako-app"),
+            // 器なし構成: ペインのシェルが tako-app の直接の子
+            proc(30, 10, "zsh"),
+            proc(50, 30, "claude"),
+            // 器つき構成: シェルは器の子
+            proc(20, 10, "tmux"),
+            proc(31, 20, "pwsh.exe"),
+            proc(51, 31, "claude.exe"),
+        ];
+        assert!(agent_children_of_tako(&procs).is_empty());
+    }
+
+    /// 親が先に死んだ孤児（実機で 46 本中 45 本がこの形）は
+    /// tako の子ではないので拾わない = 検査は「いま起こしている側」だけを見る
+    #[test]
+    fn 孤児になったエージェントは拾わない() {
+        let procs = vec![proc(50, 1, "claude"), proc(51, 51, "claude")];
+        assert!(agent_children_of_tako(&procs).is_empty());
+    }
+
+    #[test]
+    fn claude以外のエージェントも対象にする() {
+        let procs = vec![
+            proc(40, 1, "tako"),
+            proc(50, 40, "codex"),
+            proc(51, 40, "agy"),
+            proc(52, 40, "node"),
+        ];
+        assert_eq!(agent_children_of_tako(&procs), vec![(50, 40), (51, 40)]);
+    }
+
+    #[test]
+    fn エージェントの件数は親子を問わず数える() {
+        let procs = vec![
+            proc(40, 1, "tako"),
+            proc(50, 40, "claude"),
+            proc(51, 1, "claude.exe"),
+            proc(52, 1, "zsh"),
+        ];
+        assert_eq!(agent_process_count(&procs), 2);
     }
 
     /// 実機の OS へ問い合わせる。**この環境の構成に依存しない検査だけ**を書く

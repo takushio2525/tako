@@ -48757,6 +48757,18 @@ mod self_test {
 
                 // (d) スターター下部の setup リンク → そのペインのシェルへ tako setup。
                 //     setup はターミナルの対話ウィザードなので**覆わない**
+                //
+                //     **走らせない**（#1129）。修正前はここで積んだ行を送達確認つき経路が
+                //     実行するところまで待っており、実機では 1 run ごとに本物の
+                //     `tako setup` が走っていた。未認証の機では認証段が
+                //     `claude auth login`（ブラウザ操作待ち = 終わらない）を起こし、
+                //     インスタンスを閉じても Windows は孫を回収しないので 1 日で
+                //     46 本まで積み上がった。認証済みの機でも対話ウィザードが完走して
+                //     setup エージェント（実 claude）が立つ。
+                //     見たいのは「押したら**この**ペインのシェルへ**正しい行**が積まれ、
+                //     ペインを覆わない」なので、積まれた行そのものを見て取り下げる
+                //     （項目 93(d1) と同じ作法。組んだ行が**実際に実行される形**である
+                //     ことは項目 93(d2) が `--version` で別に見ている）
                 let setup_clicked = window
                     .update(cx, |app, _, cx| {
                         app.pane_settle.clear();
@@ -48768,48 +48780,40 @@ mod self_test {
                 // Windows で成立しない（実体は `…\tako.exe setup` なので部分文字列が
                 // 無い）。#898 が `resolve_tako_binary` を実体パスへ替えた時点から
                 // 落ちており、macOS は basename が `tako` なので**通ってしまう** =
-                // CI でも気づけなかった。画面は折り返すので、空白を落として
-                // 突き合わせる（項目 93(d2) と同じ作法）
+                // CI でも気づけなかった
                 let setup_line = tako_control::welcome::launch_command_line("setup");
-                let squash =
-                    |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
-                let setup_needle = squash(&setup_line);
                 println!("selftest 97d: setup_line={setup_line:?}");
-                let mut setup_delivered = false;
-                for _ in 0..40 {
-                    wait(cx, 100).await;
-                    setup_delivered = window
+                let queued_setup = window
+                    .update(cx, |app, _, _| {
+                        app.command_flows
+                            .iter()
+                            .filter(|c| c.pane == fresh)
+                            .map(|c| c.flow.command().to_string())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let setup_queued = queued_setup.iter().any(|c| c == &setup_line);
+                // 積んだ `tako setup` は**走らせない**ので、判定の直後に取り下げる。
+                // `TAKO_1129_LEGACY=1` のときだけ取り下げずに走らせる = 同一バイナリで
+                // 「本物の setup が走って `claude auth login` が残る」を再現できる
+                // （項目 143 の検出力の実証に使う）
+                if !tako_control::setup_bootstrap::legacy_auth_launch() {
+                    window
                         .update(cx, |app, _, _| {
-                            squash(
-                                &app.terminals
-                                    .get(&fresh)
-                                    .map(|s| s.visible_lines().join(""))
-                                    .unwrap_or_default(),
-                            )
-                            .contains(&setup_needle)
+                            app.command_flows.retain(|c| c.pane != fresh)
                         })
-                        .unwrap_or(false);
-                    if setup_delivered {
-                        break;
-                    }
+                        .ok();
                 }
-                if !setup_delivered {
-                    let screen = window
-                        .update(cx, |app, _, _| {
-                            app.terminals
-                                .get(&fresh)
-                                .map(|s| s.visible_lines().join("|"))
-                                .unwrap_or_else(|| "<ペインなし>".to_string())
-                        })
-                        .unwrap_or_default();
+                if !setup_queued {
                     println!(
-                        "TAKO_SELF_TEST_97D: needle={setup_needle:?} clicked={setup_clicked} \
-                         screen={screen:?}"
+                        "TAKO_SELF_TEST_97D: expected={setup_line:?} clicked={setup_clicked} \
+                         queued={queued_setup:?}"
                     );
                 }
                 check(
-                    setup_clicked && setup_delivered,
-                    "スターターの setup リンクで tako setup が届く（覆わない）(#720 / #967)",
+                    setup_clicked && setup_queued,
+                    "スターターの setup リンクで tako setup が積まれる（覆わない・走らせない）\
+                     (#720 / #967 / #1129)",
                 );
 
                 // (e) 「AI チームに任せる」押下 = エージェント待ちの過渡期が張られ、
@@ -60882,6 +60886,59 @@ mod self_test {
                 });
                 let _ = std::fs::remove_file(&body142);
                 notify_and_draw(any, window, cx);
+            }
+
+            // 143. tako がエージェント CLI を**自分の子として**起こしていない（#1129）。
+            //
+            // `claude auth login` はブラウザ操作待ちで自分では終わらない。tako が
+            // 起こすと寿命の持ち主が居なくなり、Windows は子プロセスの終了要求
+            // （#1067 の境界 B5）が未実装なので、ペイン close も隔離インスタンスの
+            // 終了も孫を回収しない。実機ではこれで 1 日 46 本まで積み上がり
+            // `Win32_Processor.LoadPercentage` が 100% に張り付いた。
+            //
+            // 設計上、tako がエージェントを起こす経路は必ず**ペインのシェル**を通る
+            // （`queue_command_flow` / `Request::Send`）ので、正しい親子は
+            // `シェル → claude`。判定は**直接の親だけ**を見るので、実 claude を使う
+            // 項目（`TAKO_SELF_TEST_CLAUDE=1`）でエージェントが立っていても増えない。
+            //
+            // **run の最後に見る**のが要点。`tako setup` は `.status()` で待つので
+            // この時点ではまだ生きている（孤児になるのはインスタンス終了後で、
+            // そうなると親を辿れず発生源が分からなくなる = Issue の 46 本中 45 本）。
+            // 機械検証は「tako の子が居ないこと」で、エージェント総数は診断の材料として
+            // 出すだけにする（他の worker が同じマシンで claude を動かしているため）
+            {
+                let procs = tako_core::platform::procinfo::snapshot();
+                let leaked = tako_core::platform::procinfo::agent_children_of_tako(&procs);
+                let name_of = |pid: u32| -> String {
+                    procs
+                        .iter()
+                        .find(|p| p.pid == pid)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_else(|| "<gone>".into())
+                };
+                let detail: Vec<String> = leaked
+                    .iter()
+                    .map(|(child, parent)| {
+                        format!(
+                            "{}({child}) <- {}({parent})",
+                            name_of(*child),
+                            name_of(*parent)
+                        )
+                    })
+                    .collect();
+                println!(
+                    "TAKO_SELF_TEST_1129: procs={} agents={} leaked={detail:?} legacy={}",
+                    procs.len(),
+                    tako_core::platform::procinfo::agent_process_count(&procs),
+                    tako_control::setup_bootstrap::legacy_auth_launch(),
+                );
+                check(
+                    leaked.is_empty(),
+                    &format!(
+                        "143: tako がエージェント CLI を自分の子として起こしていない \
+                         (#1129) leaked={detail:?}"
+                    ),
+                );
             }
 
             // 後片付け: 隔離した接続情報ディレクトリを消す

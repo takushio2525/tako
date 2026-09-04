@@ -8,7 +8,8 @@
 //!
 //! 1. [`Step::Install`] — エージェント CLI を公式インストーラで導入する
 //! 2. [`Step::Path`] — ランチャーの置き場所をログインシェルの PATH へ通す
-//! 3. [`Step::Auth`] — `claude auth login` で認証してもらう
+//! 3. [`Step::Auth`] — `claude auth login` の実行を**ユーザーへ依頼する**
+//!    （tako は代行しない。#1129 の理由は [`auth_instructions`]）
 //! 4. [`Step::Ready`] — 既存の検出型 setup へ引き継ぐ
 //!
 //! ## 設計の要点
@@ -193,6 +194,38 @@ pub fn recipe() -> InstallRecipe {
 /// `exe::find`（PATH 外まで走査）を使う ③引き継ぎ先を探さない
 pub fn legacy_mode() -> bool {
     std::env::var_os("TAKO_1057_LEGACY").is_some()
+}
+
+/// 認証の段でユーザーへ出す案内（理由 + 次の一手）。**文面の正本はここ 1 箇所**。
+///
+/// ## tako が `claude auth login` を代行しない理由（#1129）
+///
+/// ブラウザ操作待ちのプロセスは**自分では終わらない**。tako が起こすと寿命の
+/// 持ち主が居なくなり、Windows は子プロセスの終了要求（#1067 の境界 B5）が
+/// 未実装なので、ペイン close も隔離インスタンスの終了も孫を回収しない。
+/// 実機ではこれで `claude auth login` が 1 日で 46 本まで積み上がり、
+/// `Win32_Processor.LoadPercentage` が 100% に張り付いた（#1129 の採取）。
+///
+/// 「人が見ているか」を stdin が端末かどうかで判別することはできない
+/// （セルフテストがペインへ打ち込む `tako setup` も PTY 上では端末に見える）。
+/// だから条件で絞るのではなく**構造的に起こさない**。
+/// これは AGENTS.md / docs / MCP の説明（#1057「認証は代行させない」）と同じ契約で、
+/// コードだけがそこから外れていた。
+pub fn auth_instructions() -> Vec<String> {
+    let cmd = crate::orchestrator::agent_cli::auth_command(tako_core::agent_support::Agent::Claude)
+        .unwrap_or("claude auth login");
+    vec![
+        "Claude アカウントへのログインが必要です。".to_string(),
+        "ブラウザでの操作が要るため tako は代行しません。".to_string(),
+        format!("次の 1 手: {cmd}"),
+        "ログインしたら tako setup をやり直してください".to_string(),
+    ]
+}
+
+/// `TAKO_1129_LEGACY=1` で修正前（tako が `claude auth login` を起こす）へ戻す。
+/// 同一バイナリで A/B を取るためだけの逃げ道
+pub fn legacy_auth_launch() -> bool {
+    std::env::var_os("TAKO_1129_LEGACY").is_some()
 }
 
 /// 「何をどこに入れるか」
