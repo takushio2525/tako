@@ -256,6 +256,110 @@ printf '\033[32mdone\033[0m %s\n' "$task"
 sleep 600
 WRK
     chmod +x "$PROMO_DEMO/awesome-app/scripts/worker.sh"
+
+    promo_make_demo_extras
+}
+
+# 解説動画（#1081）の基本操作章で使う追加素材。すべてリポジトリ内かその場生成で PII なし
+promo_make_demo_extras() {
+    local repo="$PROMO_LIB_DIR/../.."
+    mkdir -p "$PROMO_DEMO/awesome-app/docs" "$PROMO_DEMO/awesome-app/tests" "$PROMO_DEMO/tako-docs"
+
+    # 画像プレビュー用: tako のアイコン候補 PNG（リポジトリ同梱）
+    cp "$repo/assets/icon/preview/icon-a-1024.png" "$PROMO_DEMO/awesome-app/docs/logo.png"
+
+    # PDF プレビュー用: macOS 同梱の cupsfilter でテキストから作る（外部依存なし）
+    cat > "$PROMO_DEMO/awesome-app/docs/spec.txt" <<'TXT'
+awesome-app  Design Notes
+
+1. Overview
+   awesome-app is a tiny web app used to demo tako.
+
+2. Architecture
+   - src/app.py    HTTP routes
+   - src/api.py    JSON API helpers
+   - scripts/      dev server, build, worker
+
+3. API
+   GET /api/users   -> list users
+   GET /api/posts   -> list posts
+   GET /api/health  -> {"ok": true}
+
+4. Build
+   scripts/build.sh compiles and bundles the app.
+TXT
+    cupsfilter -i text/plain "$PROMO_DEMO/awesome-app/docs/spec.txt" \
+        > "$PROMO_DEMO/awesome-app/docs/spec.pdf" 2>/dev/null || rm -f "$PROMO_DEMO/awesome-app/docs/spec.pdf"
+
+    cat > "$PROMO_DEMO/awesome-app/src/api.py" <<'PY'
+"""awesome-app: JSON API helpers."""
+
+import json
+from dataclasses import dataclass, asdict
+
+
+@dataclass
+class User:
+    id: int
+    name: str
+
+
+def users() -> list[User]:
+    return [User(1, "alice"), User(2, "bob")]
+
+
+def to_json(items) -> str:
+    return json.dumps([asdict(i) for i in items])
+PY
+
+    cat > "$PROMO_DEMO/awesome-app/tests/test_api.py" <<'PY'
+from src.api import users, to_json
+
+
+def test_users_are_serializable():
+    assert '"alice"' in to_json(users())
+PY
+
+    # master 章の worker に渡す「完了する」タスク（worker.sh は末尾で sleep 600 するので
+    # エージェントの Bash 呼び出しが終わらず、報告まで撮れない）
+    cat > "$PROMO_DEMO/awesome-app/scripts/task.sh" <<'TSK'
+#!/bin/bash
+# デモ用: 受け取ったタスク名の作業ログを流して数秒で完了する
+task=${1:-task}
+printf 'task %s\n' "$task"
+lines=("reading source files" "applying changes" "running tests" "all checks passed")
+for l in "${lines[@]}"; do
+    printf '  * %s\n' "$l"
+    sleep 1.5
+done
+printf 'done %s: 4 files changed, tests green\n' "$task"
+TSK
+    chmod +x "$PROMO_DEMO/awesome-app/scripts/task.sh"
+
+    # 課題提起の章で「ログのタブ」として流す疑似ログ
+    cat > "$PROMO_DEMO/awesome-app/scripts/logs.sh" <<'LOG'
+#!/bin/bash
+# デモ用: アプリケーションログを流し続ける
+levels=(INFO INFO INFO WARN INFO DEBUG)
+msgs=("request handled" "cache warmed" "job queued" "slow query 412ms" "user signed in" "gc pause 3ms")
+i=0
+while true; do
+    printf '\033[90m%s\033[0m %-5s %s\n' "$(date '+%H:%M:%S')" "${levels[$((i % 6))]}" "${msgs[$((i % 6))]}"
+    i=$((i + 1))
+    sleep 0.7
+done
+LOG
+    chmod +x "$PROMO_DEMO/awesome-app/scripts/logs.sh"
+
+    # Windows / OSS の章で tako 自身のドキュメントをプレビューする（実 HOME のパスを
+    # 画面に出さないよう、リポジトリから /private/tmp 配下へ写しを置く）
+    cp "$repo/README.md" "$PROMO_DEMO/tako-docs/README.md"
+    cp "$repo/LICENSE" "$PROMO_DEMO/tako-docs/LICENSE"
+    # docs の frontmatter（--- title/description ---）は md プレビューでは本文として描かれるので
+    # 見出しに置き換える
+    { echo "# Windows 対応状況"; echo;
+      awk 'BEGIN{fm=0} NR==1 && /^---$/ {fm=1; next} fm==1 && /^---$/ {fm=2; next} fm!=1 {print}' \
+          "$repo/docs/src/content/docs/windows-support.md"; } > "$PROMO_DEMO/tako-docs/windows-support.md"
 }
 
 # setup シーン用のデモ HOME とデモ PATH（#470 v2）。
@@ -367,6 +471,28 @@ promo_wait_pii_clear() {
     done
 }
 
+# 収録ウインドウの初期サイズを決める（#1081。YouTube 向けに 16:9 = 960x540pt → Retina で
+# 1920x1080px）。tako-app は初回起動時に layout.json の `window` フレームを読んで
+# その寸法で開く（TAKO_SELF_TEST 以外）。タブが空のレイアウトは復元段で「空」として
+# 拒否され新規ワークスペースになるので、挙動は初回起動と同じでフレームだけが効く。
+# 隔離 data_dir にだけ書くので本番の layout.json には触れない
+promo_seed_window_frame() {
+    local work=$1 w=${2:-960} h=${3:-540}
+    local x=${TAKO_PROMO_WIN_X:-240} y=${TAKO_PROMO_WIN_Y:-160}
+    mkdir -p "$work/data"
+    printf '{"version":1,"active_tab":0,"tabs":[],"window":{"x":%s,"y":%s,"width":%s,"height":%s,"state":"windowed"}}\n' \
+        "$x" "$y" "$w" "$h" > "$work/data/layout.json"
+}
+
+# タイムライン tsv（explainer-timeline.tsv）を bash の read で安全に読める形へ正規化する。
+# bash の `IFS=$'\t' read` はタブを空白類として扱い**連続タブを 1 つに潰す**ので、
+# 空欄（カードの source 等）があると列がずれる（実測: op_card の min_dur に "tako" が入った）。
+# 空欄を `-` で埋めて 9 列に揃え、コメント行と空行を落として出す。読む側は `-` を空欄として扱う
+promo_timeline_rows() {
+    awk -F'\t' 'BEGIN{OFS="\t"} /^#/ || NF<2 {next} {for (i=1;i<=9;i++) if ($i=="") $i="-"; NF=9; print}' "$1"
+}
+promo_tl_field() { [ "$1" = "-" ] && printf '' || printf '%s' "$1"; }
+
 # ── 隔離インスタンス ───────────────────────────────────────────────
 # $1 = 作業ディレクトリ, $2 = tmux ソケット名, $3 = persist（1 で永続化 ON）
 # 追加の環境変数は PROMO_EXTRA_ENV 配列（"KEY=VALUE" 形式）で渡す
@@ -401,6 +527,19 @@ promo_start_isolated() {
     PROMO_SOCKET_PATH="$work/data/tako.sock"
     PROMO_TOKEN=$(cat "$work/data/token")
     sleep 3
+}
+
+# アプリだけを止め、器（tmux セッション）は生かしておく（#1081 の再起動復元シーン）。
+# promo_stop_isolated は tmux kill-server まで行うので、それを挟むと再起動で
+# 「tmux 再 attach 0 / 新規シェル」になり復元の絵が撮れない（実測）
+promo_stop_isolated_keep_sessions() {
+    if [ -n "${PROMO_APP_PID:-}" ]; then
+        kill "$PROMO_APP_PID" 2>/dev/null || true
+        local i
+        for i in $(seq 1 30); do kill -0 "$PROMO_APP_PID" 2>/dev/null || break; sleep 0.5; done
+        kill -9 "$PROMO_APP_PID" 2>/dev/null || true
+    fi
+    return 0
 }
 
 promo_stop_isolated() {
@@ -457,7 +596,8 @@ promo_record_start() {
     PROMO_REC_DIR="$PROMO_WORK/frames-raw"
     rm -rf "$PROMO_REC_DIR"; mkdir -p "$PROMO_REC_DIR"
     local marker="$PROMO_WORK/rec.start"
-    date +%s > "$marker"
+    # ビート（テロップ・ナレーションの同期点。#1081）の基準にするので小数秒で残す
+    /usr/bin/python3 -c 'import time; print(time.time())' > "$marker"
 
     (
         local end=$(( $(date +%s) + dur )) i=0 last="" miss=0
@@ -490,6 +630,18 @@ promo_record_start() {
     ) &
     PROMO_REC_PID=$!
     sleep 0.5
+}
+
+# 収録中の「いま何をした」を収録開始からの経過秒つきで記録する（#1081）。
+# build-explainer.sh がこの表（<scene>-beats.tsv）を in 点にしてテロップと
+# ナレーションを合わせるので、CLI 操作の直前に呼ぶ。収録外で呼ばれたら何もしない
+PROMO_BEATS_FILE=${PROMO_BEATS_FILE:-}
+promo_beat() {
+    local name=$1 marker="$PROMO_WORK/rec.start" t
+    [ -n "$PROMO_BEATS_FILE" ] && [ -s "$marker" ] || return 0
+    t=$(/usr/bin/python3 -c 'import sys,time; print(f"{time.time()-float(open(sys.argv[1]).read()):.2f}")' "$marker")
+    printf '%s\t%s\n' "$name" "$t" >> "$PROMO_BEATS_FILE"
+    echo "   beat $name @ ${t}s"
 }
 
 promo_record_wait() {

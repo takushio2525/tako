@@ -28,7 +28,11 @@ SR = 44100
 BPM = 100.0
 BEAT = 60.0 / BPM  # 0.6s
 BAR = BEAT * 4  # 2.4s
-TOTAL = 115.0  # 秒。106 秒の本編（v3 構成）+ 前後の余白
+# 秒。既定は #470 の 106 秒の本編（v3 構成）+ 前後の余白。
+# 解説動画（#1081）のように長尺で使うときは TAKO_BGM_TOTAL で伸ばし、
+# TAKO_BGM_PROFILE=explainer でナレーションの邪魔をしない薄い構成にする
+TOTAL = float(os.environ.get("TAKO_BGM_TOTAL", "115"))
+PROFILE = os.environ.get("TAKO_BGM_PROFILE", "intro")
 
 # A マイナー。数値は A4=440 を基準にした周波数
 NOTE = {
@@ -170,17 +174,29 @@ def build() -> Track:
         # 導入 → 画面操作で厚く → setup（36〜65s）は対話を読ませるため軽く →
         # master + プロジェクト文脈（65〜98s）で最も厚く → アウトロ（98s〜）で抜く
         pad_g, arp_g, bass_g, drum_g = 0.30, 0.0, 0.0, 0.0
-        if t0 >= 5.0:
+        if PROFILE == "explainer":
+            # ナレーションの下に敷く用: 全体を薄く、8 小節ごとに軽く出し入れするだけ。
+            # ドラムは終始控えめ、末尾 8 秒でベースとドラムを抜く
+            phase = (b // 8) % 3
+            pad_g = 0.30
+            arp_g = 0.10 if phase != 1 else 0.06
+            bass_g = 0.18 if phase != 2 else 0.10
+            drum_g = 0.22 if phase == 0 else 0.14
+            if t0 < 3.0:
+                arp_g, bass_g, drum_g = 0.0, 0.0, 0.0
+            if t0 >= TOTAL - 8.0:
+                drum_g, bass_g = 0.0, 0.08
+        elif t0 >= 5.0:
             arp_g = 0.16
-        if t0 >= 10.0:
+        if PROFILE != "explainer" and t0 >= 10.0:
             drum_g, bass_g = 0.55, 0.30
-        if t0 >= 17.0:
+        if PROFILE != "explainer" and t0 >= 17.0:
             arp_g, pad_g = 0.20, 0.34
-        if 36.0 <= t0 < 65.0:  # setup: テロップと対話画面を読ませるため軽くする
+        if PROFILE != "explainer" and 36.0 <= t0 < 65.0:  # setup: テロップと対話画面を読ませるため軽くする
             drum_g, bass_g, arp_g = 0.30, 0.20, 0.12
-        if t0 >= 65.0:  # master + プロジェクト文脈: 一番厚くする
+        if PROFILE != "explainer" and t0 >= 65.0:  # master + プロジェクト文脈: 一番厚くする
             drum_g, bass_g, arp_g, pad_g = 0.60, 0.32, 0.22, 0.36
-        if t0 >= 98.0:  # アウトロ
+        if PROFILE != "explainer" and t0 >= 98.0:  # アウトロ
             drum_g, bass_g = 0.0, 0.16
             arp_g = 0.10
 
