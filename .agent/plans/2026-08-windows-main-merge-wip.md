@@ -4033,8 +4033,15 @@ UNC の専用分岐はこの変換に吸収されるので畳んだ。`normalize
 | 既定 | 66 passed / 1 failed（**失敗は既存の `git_tree::…綴りを二重に出さない`** = POSIX 決め打ちのテスト） |
 | `TAKO_1102_LEGACY=1` | 65 passed / **2 failed**。増えた 1 件のメッセージが症状そのもの:<br>`ルート C:/Users/x/repo と絶対パス C:/Users/x/repo\src\deep\nested.txt で区切りが割れている` |
 
-GUI セルフテストでは項目 135 が通過し（`TAKO_SELF_TEST_1009: … dispatch=true`）、
-そのまま項目 137 へ進んだ。
+GUI セルフテストの実機 A/B（同じ build・env だけ替える）:
+
+| arm | 項目 135 |
+|---|---|
+| `TAKO_1102_LEGACY=1` | **FAILED**: `135: 応答のパス表記が OS の区切りで揃う (#1102。paths=11 want_style=(false, true) mixed=[…"C:/Users/<winuser>/…/repo", "C:/Users/<winuser>/…/repo\build", …])` |
+| 既定 | **通過**: `TAKO_SELF_TEST_1009: kinds=true propagate=true plain=true rows=true dispatch=true paths=11 style=(false, true) mixed=0 entries=9 repos=1` |
+
+`roots` は legacy でも `mixed` に出ない（呼び出し側が渡した実パスなので元から
+OS の区切り）= Issue の記述と一致する。
 
 ##### テスト側も 2 か所直した
 
@@ -4044,12 +4051,24 @@ GUI セルフテストでは項目 135 が通過し（`TAKO_SELF_TEST_1009: … 
   **その機の実パスと同じ流儀**で出ることを見る。表記の混在そのものを落とす検査で、
   区切り 2 種の有無を比べるので macOS でも検出力がある
 
-##### 次の壁は項目 137（#1040）= 同型（POSIX 決め打ちの本文）
+##### 次の壁は項目 137（#1040）。POSIX 決め打ちは直したが**解消していない**
 
-fixture が `printf '%s\n' …` を**ペインのシェルへ直接**書いていた。PowerShell では
-通らないので「認証系の失敗」の行が画面に出ず、`ssh_connect` が `connected` のまま
-= **製品が正常でも検査だけが落ちる**（`phase=Some("connected")` / tail に marker が無い）。
-`ShellDialect::print_lines` へ寄せて解消。
+fixture が `printf '%s\n' …` を**ペインのシェルへ直接**書いていた。
+**この機に `printf` は無い**（実測: `Get-Command printf` → NOT found。
+git for Windows の `usr\bin` は PATH に無い）ので、PowerShell のペインでは
+1 度も実行されていなかった。それでも段 (a) が通っていたのは、
+**打ち込んだコマンド行そのものが画面へエコーされ、その中に marker 文字列が
+含まれていた**ため（= 偶然通っていた）。段 (d) は「理由は marker の 1 つ上の行」
+という契約なので、両方が 1 行に並ぶエコー行では成立せず落ちる。
+
+`ShellDialect::print_lines` へ寄せた（PowerShell の `echo 'a' 'b'` は
+**2 行に分かれる**ことを実測で確認 = `count=2 out=[aaa|bbb]`）。
+**ただしこれだけでは項目 137 (d) は通らない**（修正の前後で 2/2 とも同じ失敗。
+`phase=Some("connected")` / tail の末尾が打ち直しの `echo TAKO_1040_RETRY`）。
+残っているのは #1040 側の競合（打ち直しが fixture の行を上書きする / marker の
+最初の出現が **エコー行**なので分類が「切断」へ倒れて再接続が走る）で、
+**#1102 の射程外**として分離した。次の run が切り分けられるように失敗診断の
+tail を 3 → 12 行へ広げてある。
 
 **起動コマンド（argv）の番犬（#889）は在ったが、`pty_line` / `type_text` で流す
 「本文」は素通りだった**ので番犬 `ペインへ打つ本文もposix決め打ちにしない` を足した。

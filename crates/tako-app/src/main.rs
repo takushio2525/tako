@@ -59338,7 +59338,9 @@ mod self_test {
                                     .into_iter()
                                     .filter(|l| !l.trim().is_empty())
                                     .rev()
-                                    .take(3)
+                                    // #1102: 3 行では「fixture の行が実行されたのか」
+                                    // 「打ち直しに上書きされたのか」を見分けられない
+                                    .take(12)
                                     .collect()
                             })
                             .unwrap_or_default();
