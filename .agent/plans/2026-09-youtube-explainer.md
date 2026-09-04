@@ -202,6 +202,20 @@ scripts/promo/pii-scan.sh ~/Desktop/tako-promo/tako-explainer-v1.mp4
 - `$id（` のように変数の直後に全角を置くと bash が変数名に取り込んで `set -u` で落ちる
   （`shell_scripts` 番犬が CI で落とす）。`${id}（` と書く
 
+## 完成物と検査結果（v1・2026-09-04）
+
+| 項目 | 値 |
+|---|---|
+| 動画 | `~/Desktop/tako-promo/tako-explainer-v1.mp4`（9:47 = 587.3 秒 / 1920x1080 / 30fps / H.264 + AAC 48kHz / 47 区間） |
+| 章タイムスタンプ | `~/Desktop/tako-promo/tako-explainer-chapters.txt`（説明文へ転記済み） |
+| 音声 | ナレーション 47 区間 488.7 秒（`say -v Kyoko`）+ BGM 660 秒（`make-bgm.py` explainer） |
+| サムネ | `tako-explainer-thumb-a.png` / `tako-explainer-thumb-b.png`（1280x720） |
+| 説明文 | `tako-explainer-description.txt` |
+| PII 検査 | 587 フレーム（1 fps）を Vision OCR → 認識行 32,531。email / home_path / tailnet / private_ip / token / uuid / 環境由来語（5 語）の 7 カテゴリすべて **0 件** |
+| 機械検査 | 無音 8 秒以上なし / 黒は章カードのフェード（0.3〜0.5 秒 × 20）のみ / -18 LUFS（v1 時点。以後 +3dB へ調整）|
+
+素材は `~/Desktop/tako-promo/scenes/<scene>-raw.mp4` + `<scene>-beats.tsv`（#470 の旧素材は `scenes/old-470/`）。
+
 ## 付随物（YouTube）
 
 ### タイトル案（3 つ）
