@@ -16,9 +16,59 @@ pub fn default_shell() -> Option<SpawnCommand> {
     imp::default_shell()
 }
 
-/// 明示コマンド（`tako split -- <command>` 等）を、ユーザーの環境で実行される形に包む
+/// 明示コマンド（`tako split -- <command>` 等）を、ユーザーの環境で実行される形に包む。
+///
+/// **「ユーザーの環境」= 対話ペインと同じ環境**（#1031）。素のペインは
+/// [`default_shell`] が返す `$SHELL -l` を **tty 上で**起こすので、zsh から見ると
+/// 「対話 + ログイン」シェル = `.zprofile` も `.zshrc` も読まれる。ところが明示コマンドは
+/// `-c` を付けるぶん**非対話**になり、`.zshrc` だけが読まれない。nodebrew / fnm /
+/// Homebrew の PATH を `.zshrc` で通している人は多いので、同じ tako の中なのに
+/// 「素のペインでは `npm` が引けるのに、カードの実行ペインでは command not found」に
+/// なっていた（#1031 実発）。`-i` を足して**素のペインと同じ読み込み順**へ揃える。
+///
+/// `TAKO_1031_LEGACY=1` で #1031 前（`-l -c` = 非対話）へ戻せる = 同一バイナリで A/B が取れる
 pub fn login_shell_command(command: SpawnCommand) -> SpawnCommand {
     imp::login_shell_command(command)
+}
+
+/// コマンドが**失敗したときだけ**ペインを残す形に包む（#1031）。
+///
+/// `tako split --command` のペインは「コマンドの終了 = ペイン close」なので、
+/// 起動に失敗すると数秒で消え、理由が画面にもログにも残らなかった（#1031 実発）。
+/// 成功したときは従来どおり即 close（`exit 0` するだけ）、非 0 のときだけ
+/// 終了コードのマーカー行 + 案内を出して入力待ちで止める。
+///
+/// マーカーの形は実行ペイン（[`run_pane_command`]）と同じ `<marker_prefix><code>` で、
+/// 読む側（`tako_control::dispatch::find_exit_marker`）も 1 つ。**接頭辞は呼び出し側が渡す**
+/// （契約の持ち主を増やさない）。
+///
+/// `TAKO_1031_LEGACY=1` では**包まない** = #1031 前の「失敗しても黙って消える」へ戻る
+pub fn hold_on_failure_command(command: SpawnCommand, marker_prefix: &str) -> SpawnCommand {
+    if legacy_1031() {
+        return command;
+    }
+    imp::hold_on_failure_command(command, marker_prefix, hold_hint(crate::i18n::lang()))
+}
+
+/// 失敗したペインに出す案内（日英）。
+///
+/// シェルへ**そのまま埋め込む**ので `"` / `$` / バッククォート / `\` を含めない
+/// （POSIX は二重引用符の中、PowerShell は単引用符の中に置く）。
+/// 純粋関数にしてあるので macOS 上から両言語を検査できる
+pub fn hold_hint(lang: crate::i18n::Lang) -> &'static str {
+    match lang {
+        crate::i18n::Lang::Ja => {
+            "[tako] コマンドが失敗しました。上の出力を確認できます。Enter でこのペインを閉じます。"
+        }
+        crate::i18n::Lang::En => {
+            "[tako] The command failed. The output above is kept. Press Enter to close this pane."
+        }
+    }
+}
+
+/// #1031 の A/B ゲート（対話シェル化と失敗時の保持を両方 #1031 前へ戻す）
+fn legacy_1031() -> bool {
+    std::env::var_os("TAKO_1031_LEGACY").is_some()
 }
 
 /// 実行ペイン（#453 Code Runner / #666 コマンド提案カード / `tako run-interactive`）を
@@ -154,14 +204,20 @@ mod imp {
     /// 失敗する（2026-06-12 実機リグレッション）。`$SHELL -l -c "<コマンド>"` にして
     /// ユーザーの PATH・環境変数で実行する
     pub(crate) fn login_shell_command(command: SpawnCommand) -> SpawnCommand {
-        SpawnCommand {
-            program: user_shell(),
-            args: vec![
-                "-l".into(),
-                "-c".into(),
-                crate::tmux_backend::shell_quoted(&command),
-            ],
-        }
+        super::posix_login_shell_command(
+            &user_shell(),
+            &crate::tmux_backend::shell_quoted(&command),
+            // #1031: 素のペイン（`$SHELL -l` を tty で起こす = 対話）と読み込み順を揃える
+            !super::legacy_1031(),
+        )
+    }
+
+    pub(crate) fn hold_on_failure_command(
+        command: SpawnCommand,
+        marker_prefix: &str,
+        hint: &str,
+    ) -> SpawnCommand {
+        super::posix_hold_on_failure_command(&command, marker_prefix, hint)
     }
 
     pub(crate) fn run_pane_command(command: &str, marker_prefix: &str) -> SpawnCommand {
@@ -225,6 +281,19 @@ mod imp {
         command
     }
 
+    /// argv を PowerShell の呼び出し演算子（`&`）で起こし、失敗したときだけ止める。
+    ///
+    /// POSIX と違ってここが**唯一のシェル層**（[`login_shell_command`] は素通し）なので、
+    /// `$PROFILE` を読む形（`-NoProfile` を付けない）にして
+    /// [`run_pane_command`] と環境を揃える
+    pub(crate) fn hold_on_failure_command(
+        command: SpawnCommand,
+        marker_prefix: &str,
+        hint: &str,
+    ) -> SpawnCommand {
+        super::powershell_hold_on_failure_command(&run_pane_shell(), &command, marker_prefix, hint)
+    }
+
     pub(crate) fn run_pane_command(command: &str, marker_prefix: &str) -> SpawnCommand {
         super::powershell_run_pane_command(&run_pane_shell(), command, marker_prefix)
     }
@@ -276,6 +345,96 @@ mod imp {
     /// 非 UTF-8 の環境変数値は解決に使えないため落とす（後段のフォールバックへ回す）
     fn env_string(key: &str) -> Option<String> {
         std::env::var_os(key).and_then(|v| v.into_string().ok())
+    }
+}
+
+/// POSIX の「ユーザーの環境で 1 本のシェル片を走らせる」argv（純粋関数。#1031）。
+///
+/// `interactive`（= `-i`）が付くと zsh は `.zshrc` も読む。**素のペインと同じ読み込み順**に
+/// するのが目的で、`-l`（`.zprofile`）は従来どおり残す。bash は「対話ログイン」でも
+/// `.bashrc` ではなく `.bash_profile` を読む（= `-i` の有無で読むファイルが変わらない）が、
+/// これも素のペイン（`bash -l` を tty で起こす）と同じなので**揃っている**のが正しい。
+///
+/// フラグの並びを `-l -i -c` に固定するのは、`-c` の直後がスクリプト本体である必要があるため
+#[cfg_attr(windows, allow(dead_code))]
+fn posix_login_shell_command(shell: &str, script: &str, interactive: bool) -> SpawnCommand {
+    let mut args = vec!["-l".to_string()];
+    if interactive {
+        args.push("-i".to_string());
+    }
+    args.push("-c".to_string());
+    args.push(script.to_string());
+    SpawnCommand {
+        program: shell.to_string(),
+        args,
+    }
+}
+
+/// POSIX の「失敗したときだけ止める」argv（純粋関数。#1031）。
+///
+/// 成功時は `exit 0` で即終了する = ペインは従来どおり閉じる。非 0 のときだけ
+/// マーカー行 + 案内を出して `read` で待つ。最後に元の終了コードで `exit` するので、
+/// 呼び出し元（`login_shell_command` のラッパーシェル）から見た終了コードも保たれる。
+///
+/// `/bin/sh` 決め打ちの理由は [`posix_run_pane_command`] と同じ
+/// （fish のような POSIX でないログインシェルでも成立させる）。この 1 段は
+/// 実行ペインが既に通っている形と同じで、プロセスの深さも同じ
+#[cfg_attr(windows, allow(dead_code))]
+fn posix_hold_on_failure_command(
+    command: &SpawnCommand,
+    marker_prefix: &str,
+    hint: &str,
+) -> SpawnCommand {
+    let inner = crate::tmux_backend::shell_quoted(command);
+    let script = format!(
+        "{inner}; __tako_code=$?; \
+         if [ \"$__tako_code\" -ne 0 ]; then \
+         echo \"{marker_prefix}$__tako_code\"; \
+         echo \"{hint}\"; \
+         read -r __TAKO_HOLD__ 2>/dev/null || true; \
+         fi; \
+         exit \"$__tako_code\""
+    );
+    SpawnCommand {
+        program: "/bin/sh".to_string(),
+        args: vec!["-c".to_string(), script],
+    }
+}
+
+/// Windows の「失敗したときだけ止める」argv（純粋関数。**macOS 上でもテストできる**。#1031）。
+///
+/// 終了コードの決め方は [`powershell_exit_code_script`] に任せる（規則を 2 つ持たない）。
+/// argv は呼び出し演算子（`&`）で起こす: `Invoke-Expression` と違って**語のリストのまま**
+/// 渡せるので、空白や日本語を含む引数が割れない
+#[cfg_attr(not(windows), allow(dead_code))]
+fn powershell_hold_on_failure_command(
+    program: &str,
+    command: &SpawnCommand,
+    marker_prefix: &str,
+    hint: &str,
+) -> SpawnCommand {
+    let invocation = std::iter::once(&command.program)
+        .chain(command.args.iter())
+        .map(|w| ShellDialect::PowerShell.quote_arg(w))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let marker = ShellDialect::PowerShell.quote_arg(marker_prefix);
+    let hint_lit = ShellDialect::PowerShell.quote_arg(hint);
+    let script = format!(
+        "{}if ($__tako_code -ne 0) {{\n\
+         Write-Host ({marker} + $__tako_code)\n\
+         Write-Host {hint_lit}\n\
+         try {{ $null = [Console]::ReadLine() }} catch {{ }}\n\
+         }}\nexit $__tako_code\n",
+        powershell_exit_code_script(&format!("& {invocation}"))
+    );
+    SpawnCommand {
+        program: program.to_string(),
+        args: vec![
+            "-NoLogo".to_string(),
+            "-EncodedCommand".to_string(),
+            encode_powershell_command(&script),
+        ],
     }
 }
 
@@ -621,6 +780,242 @@ fn resolve_windows_shell(
     com_spec
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "cmd.exe".into())
+}
+
+#[cfg(test)]
+mod tests_1031 {
+    use super::*;
+    use crate::i18n::Lang;
+
+    fn cmd(words: &[&str]) -> SpawnCommand {
+        let mut it = words.iter();
+        SpawnCommand {
+            program: it.next().expect("program").to_string(),
+            args: it.map(|w| w.to_string()).collect(),
+        }
+    }
+
+    /// #1031 の中身: ラッパーが `-i` を持つと zsh は `.zshrc` も読む。
+    /// **フラグの並びも固定する**（`-c` の直後がスクリプト本体でないと動かない）
+    #[test]
+    fn ログインシェルのラッパーは対話フラグを持つ() {
+        let got = posix_login_shell_command("/bin/zsh", "npm --version", true);
+        assert_eq!(got.program, "/bin/zsh");
+        assert_eq!(got.args, vec!["-l", "-i", "-c", "npm --version"]);
+    }
+
+    /// **配線**の検査（純粋関数だけを見ていると `imp` 側で `-i` を落としても気づけない）。
+    /// `login_shell_command` は `spawn_session` が実際に通す 1 実装なので、ここが
+    /// #1031 前へ戻ると実行ペイン 3 経路の環境が丸ごと変わる
+    #[cfg(unix)]
+    #[test]
+    fn 配線されたログインシェルのラッパーが対話フラグを持つ() {
+        assert!(
+            std::env::var_os("TAKO_1031_LEGACY").is_none(),
+            "A/B の env が立ったままではこの検査に意味が無い"
+        );
+        let got = login_shell_command(cmd(&["/bin/echo", "hi"]));
+        assert_eq!(
+            got.args
+                .iter()
+                .take(3)
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["-l", "-i", "-c"],
+            "args={:?}",
+            got.args
+        );
+    }
+
+    /// **配線**の検査（`hold_on_failure_command` の既定は「包む」）
+    #[test]
+    fn 配線された失敗時の保持が既定で有効() {
+        assert!(std::env::var_os("TAKO_1031_LEGACY").is_none());
+        let got = hold_on_failure_command(cmd(&["npm", "run", "dev"]), "__TAKO_EXIT=");
+        assert_ne!(got.program, "npm", "包まれていない: {got:?}");
+        let script = got.args.last().expect("スクリプトが要る");
+        assert!(script.contains("__TAKO_EXIT="), "script={script}");
+    }
+
+    /// `TAKO_1031_LEGACY=1` 相当。#1031 前は `-l -c`（非対話）= `.zshrc` を読まない
+    #[test]
+    fn legacy指定ではラッパーが非対話へ戻る() {
+        let got = posix_login_shell_command("/bin/zsh", "npm --version", false);
+        assert_eq!(got.args, vec!["-l", "-c", "npm --version"]);
+        assert!(
+            !got.args.iter().any(|a| a == "-i"),
+            "legacy に -i が混ざっている: {:?}",
+            got.args
+        );
+    }
+
+    /// 成功時は従来どおり即終了（ペインが閉じる）、失敗時だけマーカー + 案内 + 待ち
+    #[test]
+    fn 失敗時だけ止めるposix片の構造() {
+        let got = posix_hold_on_failure_command(
+            &cmd(&["npm", "run", "dev"]),
+            "__TAKO_EXIT=",
+            "[tako] failed",
+        );
+        assert_eq!(got.program, "/bin/sh");
+        assert_eq!(got.args[0], "-c");
+        let script = &got.args[1];
+        // 本体はそのまま先頭に居る（余計な包みを増やさない）
+        assert!(script.starts_with("npm run dev; "), "script={script}");
+        // 判定は非 0 のときだけ
+        assert!(
+            script.contains(r#"if [ "$__tako_code" -ne 0 ]; then"#),
+            "script={script}"
+        );
+        // 実行ペインと同じマーカー行
+        assert!(
+            script.contains(r#"echo "__TAKO_EXIT=$__tako_code""#),
+            "script={script}"
+        );
+        assert!(
+            script.contains(r#"echo "[tako] failed""#),
+            "script={script}"
+        );
+        // 待つのは失敗したときだけ（`fi` の前）
+        let read_at = script.find("read -r __TAKO_HOLD__").expect("待ちが要る");
+        let fi_at = script.rfind("fi;").expect("fi が要る");
+        assert!(read_at < fi_at, "待ちが if の外にある: {script}");
+        // 終了コードは元のまま返す（呼び出し元のラッパーから見た値を変えない）
+        assert!(
+            script.trim_end().ends_with(r#"exit "$__tako_code""#),
+            "script={script}"
+        );
+    }
+
+    /// 空白・日本語・引用符を含む語が 1 語のまま届く（#884 と同じ不変条件）
+    #[test]
+    fn 失敗時に止める包みは語を割らない() {
+        let got = posix_hold_on_failure_command(
+            &cmd(&["/bin/echo", "a b", "検証", "it's"]),
+            "__TAKO_EXIT=",
+            "[tako] failed",
+        );
+        let script = &got.args[1];
+        assert!(
+            script.starts_with("/bin/echo 'a b' '検証' 'it'"),
+            "script={script}"
+        );
+        // 実際に sh で走らせて語の数を確かめる（POSIX 上でだけ）
+        #[cfg(unix)]
+        {
+            let out = std::process::Command::new(&got.program)
+                .args(&got.args)
+                .output()
+                .expect("sh が走る");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                "a b 検証 it's",
+                "stderr={}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    /// 成功したコマンドは待たずに終わる（= ペインが従来どおり閉じる）
+    #[cfg(unix)]
+    #[test]
+    fn 成功したコマンドは待たずに終わる() {
+        let got = posix_hold_on_failure_command(&cmd(&["true"]), "__TAKO_EXIT=", "[tako] failed");
+        let out = std::process::Command::new(&got.program)
+            .args(&got.args)
+            .output()
+            .expect("sh が走る");
+        assert_eq!(out.status.code(), Some(0));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "");
+    }
+
+    /// 失敗したコマンドはマーカーと案内を出し、終了コードを保つ
+    /// （stdin が閉じているので `read` は即戻る = テストがハングしない）
+    #[cfg(unix)]
+    #[test]
+    fn 失敗したコマンドは終了コードと案内を出す() {
+        let got = posix_hold_on_failure_command(
+            &cmd(&["sh", "-c", "exit 7"]),
+            "__TAKO_EXIT=",
+            "[tako] failed",
+        );
+        let out = std::process::Command::new(&got.program)
+            .args(&got.args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("sh が走る");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("__TAKO_EXIT=7"), "stdout={stdout}");
+        assert!(stdout.contains("[tako] failed"), "stdout={stdout}");
+        assert_eq!(out.status.code(), Some(7));
+    }
+
+    /// Windows 側（**macOS 上で検査する**）: `&` で argv を起こし、
+    /// 失敗したときだけマーカー + 案内 + 待ちを出す
+    #[test]
+    fn 失敗時だけ止めるpowershell片の構造() {
+        let got = powershell_hold_on_failure_command(
+            "pwsh.exe",
+            &cmd(&["npm", "run dev", "it's"]),
+            "__TAKO_EXIT=",
+            "[tako] failed",
+        );
+        assert_eq!(got.program, "pwsh.exe");
+        assert_eq!(got.args[0], "-NoLogo");
+        assert_eq!(got.args[1], "-EncodedCommand");
+        let script = decode_powershell_command(&got.args[2]);
+        // 呼び出し演算子 + 語ごとの引用（空白と `'` が壊れない）
+        assert!(
+            script.contains("& 'npm' 'run dev' 'it''s'"),
+            "script={script}"
+        );
+        // 終了コードの決め方は 1 実装（`powershell_exit_code_script`）に任せている
+        assert!(script.contains("$__tako_code"), "script={script}");
+        assert!(
+            script.contains("if ($__tako_code -ne 0) {"),
+            "script={script}"
+        );
+        assert!(
+            script.contains("Write-Host ('__TAKO_EXIT=' + $__tako_code)"),
+            "script={script}"
+        );
+        assert!(
+            script.contains("Write-Host '[tako] failed'"),
+            "script={script}"
+        );
+        assert!(script.contains("[Console]::ReadLine()"), "script={script}");
+        // 親へ返す終了コードは元のまま（`-EncodedCommand` は素通ししない。#935 の実測）
+        assert!(
+            script.trim_end().ends_with("exit $__tako_code"),
+            "script={script}"
+        );
+        // プロファイルは読む（実行ペイン `run_pane_command` と環境を揃える）
+        assert!(
+            !got.args.iter().any(|a| a == "-NoProfile"),
+            "args={:?}",
+            got.args
+        );
+    }
+
+    /// 案内は日英とも用意し、**シェルへ直に埋め込める文字だけ**で書く
+    #[test]
+    fn 失敗時の案内は日英ともシェル安全() {
+        let ja = hold_hint(Lang::Ja);
+        let en = hold_hint(Lang::En);
+        assert_ne!(ja, en);
+        for (name, hint) in [("ja", ja), ("en", en)] {
+            assert!(hint.contains("tako"), "{name}: 発信元が分からない");
+            for bad in ['"', '$', '`', '\\'] {
+                assert!(
+                    !hint.contains(bad),
+                    "{name}: シェルが解釈する文字が入っている: {bad:?}"
+                );
+            }
+        }
+        // Enter で閉じられることを両言語で伝える
+        assert!(ja.contains("Enter"), "ja={ja}");
+        assert!(en.contains("Enter"), "en={en}");
+    }
 }
 
 #[cfg(test)]

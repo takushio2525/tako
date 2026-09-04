@@ -46,11 +46,15 @@ _tako_add_cli_path() {
   return 0
 }
 
-# 非対話シェル（`$SHELL -l -c <コマンド>` = コマンドペイン・エージェントペイン）は
-# フックが回らないのでここで足す。対話シェルは ~/.zshrc を読み終えた後（precmd）に回す
-# —— .zshrc や .zprofile で PATH を組み立てるユーザーは多く、この時点の PATH で
-# 「tako が既にあるか」を判定すると必ず誤るため
-if [[ ! -o interactive && -n ${TAKO_PANE_ID-} ]]; then
+# コマンドを与えられたシェル（`$SHELL -l -i -c <コマンド>` = コマンドペイン・
+# エージェントペイン）はプロンプトが出ない = precmd フックが一度も回らないので、
+# ここで足すしかない。判定に `-o interactive` だけを使わないのは #1031 で
+# コマンドペインのラッパーが `-i` 付き（= 対話）になったため —— zsh は `-c` のとき
+# だけ ZSH_EXECUTION_STRING を設定するので、それを「プロンプトが出ないシェル」の印にする。
+# 素の対話シェルは ~/.zshrc を読み終えた後（precmd）に回す —— .zshrc や .zprofile で
+# PATH を組み立てるユーザーは多く、この時点の PATH で「tako が既にあるか」を
+# 判定すると必ず誤るため
+if [[ -n ${TAKO_PANE_ID-} && ( ! -o interactive || -n ${ZSH_EXECUTION_STRING-} ) ]]; then
   _tako_add_cli_path
 fi
 
