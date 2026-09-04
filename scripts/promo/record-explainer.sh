@@ -323,8 +323,10 @@ scene_master() {
     # master が spawn 先に使うプロジェクトと、収録用の軽い worker モデル（隔離 data_dir へ書く）
     tko orchestrator projects add --key awesome-app \
         --cwd "$PROMO_DEMO/awesome-app" --description "デモ用の Web アプリ" >/dev/null 2>&1 || true
+    # 既定プロファイルは effort=max で master が最初の spawn まで 40 秒以上考える（実測）ので、
+    # 収録では medium に落とす（挙動そのものは変わらない）
     tko orchestrator profiles set default --worker-model haiku \
-        --worker-model-policy fixed >/dev/null 2>&1 || true
+        --worker-model-policy fixed --effort medium --worker-effort medium >/dev/null 2>&1 || true
     type_cmd "$base" "cd $PROMO_DEMO/awesome-app && clear"
     tko tab rename --tab 1 awesome-app >/dev/null 2>&1 || true
     type_cmd "$base" "tako setup-mcp"
@@ -334,7 +336,7 @@ scene_master() {
     sleep 30
     promo_wait_pii_clear 120 "$base" || { promo_stop_isolated "$socket"; trap - EXIT; PROMO_EXTRA_ENV=(); return 1; }
 
-    promo_record_start "$raw" "${TAKO_PROMO_MASTER_DUR:-260}"
+    promo_record_start "$raw" "${TAKO_PROMO_MASTER_DUR:-420}"
     sleep 14
     promo_beat request
     # --await-prompt は送達検証で Enter を撃ち直すため、生成中の master を中断させることがある。
@@ -342,9 +344,9 @@ scene_master() {
     tko send --pane "$base" \
         "worker を 3 体 spawn して。project は awesome-app。それぞれ 'api' / 'ui' / 'docs' を担当し、プロンプトは「bash scripts/task.sh <担当名> を実行して、出力の最終行を報告して」でよい。確認は不要、すぐ spawn して。3 体の報告が揃ったら結果を 3 行でまとめて。" \
         >/dev/null 2>&1 || true
-    # worker ペインが出そろうまで待つ（最大 150s）
+    # worker ペインが出そろうまで待つ（最大 240s。spawn は 1 体 40 秒前後 = 実測）
     local i n=0
-    for i in $(seq 1 30); do
+    for i in $(seq 1 48); do
         n=$(tko list 2>/dev/null | /usr/bin/python3 -c \
             'import json,sys
 try: d=json.load(sys.stdin)
@@ -362,12 +364,23 @@ print(sum(len(t["panes"]) for t in d["tabs"]))' 2>/dev/null || echo 0)
     sleep 16
     promo_beat gui
     tko ui-mode gui >/dev/null 2>&1 || true
-    sleep 18
+    # claude ペインがチャット表示へ切り替わるまで待つ（判定は agents 走査に乗るので数秒〜30 秒）
+    for i in $(seq 1 8); do
+        sleep 4
+        tko ui-mode 2>/dev/null | grep -q '"chat"' && break
+    done
+    echo "   pane_display: $(tko ui-mode 2>/dev/null | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin).get("pane_display"))' 2>/dev/null)"
+    sleep 16
     tko ui-mode terminal >/dev/null 2>&1 || true
     tko panel --hide >/dev/null 2>&1 || true
     sleep 2
     promo_beat report
-    # master の検収・報告を待つ（残り尺いっぱい）
+    # master の検収・報告（idle へ戻る）を待つ。残り尺を超えない範囲で
+    for i in $(seq 1 30); do
+        tko orchestrator status --pane "$base" 2>/dev/null | grep -q '"status": *"idle"' && break
+        sleep 5
+    done
+    promo_beat report_done
     promo_record_wait
     promo_stop_isolated "$socket"; trap - EXIT
     PROMO_EXTRA_ENV=()
@@ -397,7 +410,8 @@ scene_restore() {
     promo_record_start "$PROMO_OUT/scenes/restore-before-raw.mp4" 12
     promo_record_wait
     echo "   終了 → 再起動（復元を待つ）"
-    promo_stop_isolated "$socket"
+    # 器（tmux）は生かしたままアプリだけ終了する = 実運用の「tako を閉じる」と同じ
+    promo_stop_isolated_keep_sessions
     sleep 3
     promo_start_isolated "$work" "$socket" 1
     tko theme --size "$FONT_SIZE" >/dev/null 2>&1 || true

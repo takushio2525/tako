@@ -355,7 +355,11 @@ LOG
     # 画面に出さないよう、リポジトリから /private/tmp 配下へ写しを置く）
     cp "$repo/README.md" "$PROMO_DEMO/tako-docs/README.md"
     cp "$repo/LICENSE" "$PROMO_DEMO/tako-docs/LICENSE"
-    cp "$repo/docs/src/content/docs/windows-support.md" "$PROMO_DEMO/tako-docs/windows-support.md"
+    # docs の frontmatter（--- title/description ---）は md プレビューでは本文として描かれるので
+    # 見出しに置き換える
+    { echo "# Windows 対応状況"; echo;
+      awk 'BEGIN{fm=0} NR==1 && /^---$/ {fm=1; next} fm==1 && /^---$/ {fm=2; next} fm!=1 {print}' \
+          "$repo/docs/src/content/docs/windows-support.md"; } > "$PROMO_DEMO/tako-docs/windows-support.md"
 }
 
 # setup シーン用のデモ HOME とデモ PATH（#470 v2）。
@@ -523,6 +527,19 @@ promo_start_isolated() {
     PROMO_SOCKET_PATH="$work/data/tako.sock"
     PROMO_TOKEN=$(cat "$work/data/token")
     sleep 3
+}
+
+# アプリだけを止め、器（tmux セッション）は生かしておく（#1081 の再起動復元シーン）。
+# promo_stop_isolated は tmux kill-server まで行うので、それを挟むと再起動で
+# 「tmux 再 attach 0 / 新規シェル」になり復元の絵が撮れない（実測）
+promo_stop_isolated_keep_sessions() {
+    if [ -n "${PROMO_APP_PID:-}" ]; then
+        kill "$PROMO_APP_PID" 2>/dev/null || true
+        local i
+        for i in $(seq 1 30); do kill -0 "$PROMO_APP_PID" 2>/dev/null || break; sleep 0.5; done
+        kill -9 "$PROMO_APP_PID" 2>/dev/null || true
+    fi
+    return 0
 }
 
 promo_stop_isolated() {
