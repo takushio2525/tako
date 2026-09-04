@@ -141,7 +141,7 @@ for i in "${!ids[@]}"; do
 done
 [ "$n" -gt 0 ] || { echo "ERROR: ナレーション wav が 1 つも無い" >&2; exit 1; }
 # say の出力はピークが -13dB 程度と小さい（実測）ので +7dB 持ち上げる（クリップは limiter で防ぐ）
-printf '%samix=inputs=%d:normalize=0:dropout_transition=0,volume=2.2,alimiter=limit=0.95,apad=whole_dur=%s[narr];\n' "$mix" "$n" "$VDUR" >> "$fc"
+printf '%samix=inputs=%d:normalize=0:dropout_transition=0,volume=3.0,alimiter=limit=0.95,apad=whole_dur=%s[narr];\n' "$mix" "$n" "$VDUR" >> "$fc"
 narr_only="$WORK/narr.wav"
 ffmpeg -nostdin -v error -y "${inputs[@]}" -filter_complex_script "$fc" -map "[narr]" -t "$VDUR" -ar 48000 -ac 2 "$narr_only"
 
@@ -149,7 +149,7 @@ if [ -f "$BGM" ]; then
     fade_start=$(/usr/bin/python3 -c "print(max(0.0, $VDUR - 3.0))")
     # BGM は薄く（-16dB 相当）。ナレーション中はさらに sidechain で下げる
     ffmpeg -nostdin -v error -y -i "$video" -i "$narr_only" -stream_loop -1 -i "$BGM" \
-        -filter_complex "[2:a]atrim=0:${VDUR},asetpts=PTS-STARTPTS,volume=0.20,afade=t=in:st=0:d=2,afade=t=out:st=${fade_start}:d=3[bgm];[bgm][1:a]sidechaincompress=threshold=0.015:ratio=8:attack=40:release=700:makeup=1[duck];[1:a][duck]amix=inputs=2:normalize=0:dropout_transition=0[a]" \
+        -filter_complex "[2:a]atrim=0:${VDUR},asetpts=PTS-STARTPTS,volume=0.26,afade=t=in:st=0:d=2,afade=t=out:st=${fade_start}:d=3[bgm];[bgm][1:a]sidechaincompress=threshold=0.015:ratio=8:attack=40:release=700:makeup=1[duck];[1:a][duck]amix=inputs=2:normalize=0:dropout_transition=0[a]" \
         -map 0:v -map "[a]" -c:v copy -c:a aac -ar 48000 -b:a 192k -movflags +faststart -shortest "$OUT"
 else
     echo "!! BGM が無い（${BGM}）。ナレーションのみで書き出す" >&2
