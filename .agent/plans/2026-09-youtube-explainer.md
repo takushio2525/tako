@@ -234,7 +234,16 @@ tako master 実践ガイド: https://tako-docs.pages.dev/features/orchestrator/
 Windows 対応状況: https://tako-docs.pages.dev/windows-support/
 
 ■ 章
-CHAPTERS_PLACEHOLDER
+00:00 オープニング
+00:20 1. 課題 — AI エージェント時代のターミナル
+01:10 2. tako の思想 — 集約監視 / ゼロコンフィグ / AI フルコントロール
+02:26 3. 導入 — brew 1 行と tako setup
+03:45 4. 基本操作 — タブ / ペイン / ファイルツリー / プレビュー
+05:14 5. AI に任せる — tako master と worker
+07:16 6. 再起動しても戻る — tmux バックエンド
+07:50 7. スマホから — tako remote と Remote Control
+08:49 8. Windows と OSS — 導入方法とリンク
+09:37 まとめ
 
 ■ 注記
 ・ナレーションは合成音声（macOS の日本語音声）です
