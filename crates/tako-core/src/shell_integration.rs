@@ -1183,8 +1183,14 @@ mod tests {
         // zsh: 判定は .zshrc の後（precmd）。ここが .zshenv 直下へ戻ると、
         // .zprofile / .zshrc で PATH を組むユーザーを必ず誤判定する
         assert!(ZSH_ZSHENV.contains("precmd_functions+=(_tako_path_sync)"));
-        // 非対話（コマンドペイン・エージェントペイン）はフックが回らないので直接呼ぶ
-        assert!(ZSH_ZSHENV.contains("if [[ ! -o interactive && -n ${TAKO_PANE_ID-} ]]; then"));
+        // プロンプトが出ないシェル（コマンドペイン・エージェントペイン）はフックが
+        // 回らないので直接呼ぶ。#1031 でラッパーが `-i` 付き（= 対話）になったので、
+        // 判定材料は「対話か」ではなく **`-c` か**（zsh は `-c` のときだけ
+        // ZSH_EXECUTION_STRING を設定する）。ここが `! -o interactive` だけへ戻ると、
+        // コマンドペインで tako CLI が PATH から消える
+        assert!(ZSH_ZSHENV.contains(
+            "if [[ -n ${TAKO_PANE_ID-} && ( ! -o interactive || -n ${ZSH_EXECUTION_STRING-} ) ]]; then"
+        ));
         // 足すのは末尾のみ（zsh の path 配列 += / bash・fish は $PATH の後ろ）
         assert!(ZSH_ZSHENV.contains("path+=(\"$dir\")"));
         assert!(BASH_SCRIPT.contains("export PATH=\"$PATH:$_tako_cli_dir\""));

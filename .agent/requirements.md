@@ -306,8 +306,12 @@ FR-2.2.7 の環境変数解決のまま（誤ったペインへ副作用を起�
   PATH が最小構成（`/usr/bin:/bin:…`）なので、アプリ側で「PATH に tako があるか」を
   判定すると必ず誤る。したがって spawn 時の env で PATH を足す方式は採らない:
   - zsh 対話: 最初の `precmd`（= `.zshrc` / `.zprofile` の後）。一度足したらフックを外す
-  - zsh 非対話（`$SHELL -l -c <コマンド>` = コマンドペイン・エージェントペイン）: `.zshenv`。
-    この時点の PATH で判定すると取りこぼしうるが、足すのは末尾なので解決順は変わらない
+  - zsh の**プロンプトが出ないシェル**（`$SHELL -l -i -c <コマンド>` = コマンドペイン・
+    エージェントペイン）: `.zshenv`。この時点の PATH で判定すると取りこぼしうるが、
+    足すのは末尾なので解決順は変わらない。**判定材料は「対話か」ではなく `-c` か**
+    （zsh は `-c` のときだけ `ZSH_EXECUTION_STRING` を設定する）: #1031 でこのラッパーが
+    `-i` 付き（= 対話）になったので、`! -o interactive` だけを見ると条件が外れて
+    コマンドペインから `tako` が消える
   - bash: `PROMPT_COMMAND` から source される最初のプロンプト（= `~/.bashrc` の後）
   - fish: 最初の `fish_prompt`（= `config.fish` の後。`vendor_conf.d` はその前に読まれる）
 - 追加するディレクトリは **`current_exe()` の隣**を起動時に解決した値（直書きしない）。
@@ -353,6 +357,7 @@ FR-2.2.7 の環境変数解決のまま（誤ったペインへ副作用を起�
 | FR-2.5.11 | 操作: ファイルを開いてプレビューペインで表示する（FR-3.2 系操作の AI 実行。「探して開いて見せて」のコア操作。✅ 2026-06-13: dispatch `OpenFile` + CLI `tako open` + MCP `tako_open_file` = 計 21 ツール） | M |
 | FR-2.5.12 | 操作: Web ビューペイン（FR-3.8）で任意の URL を開いてユーザーに見せる（✅ 2026-07-13、#155。CLI `tako web open` + MCP `tako_web` action=open） | S |
 | FR-2.5.13 | 操作: スクロールバック表示の取得・移動（絶対位置 / 相対行数。0 = 最下部）。**#159 でピクセル単位のスムーススクロールへ刷新**: 表示位置は行小数（直接ペイン = `display_offset - fract`、`TerminalSession::scroll_pixels`）で保持し、描画は行スタック全体をサブラインシフト（Chrome / iTerm2 相当のリニア描画）。バックエンドペイン（FR-5）・ネスト tmux（ペイン内 attach）は **tmux 履歴のローカルミラー**（`tako-core::scroll_mirror`。スクロール開始時に `capture-pane -e` でチャンク取得 → 以降の描画は完全ローカル）で、copy-mode には入らない（旧 copy-mode 駆動の ① 行単位 ② tmux 往復レイテンシ ③ キー飲まれ、を構造的に解消。2026-07-13）。マウス要求アプリ（vim / claude 等）へのレポートは **tmux サーバーへの直接注入（`send-keys -H`）+ 転送レート制限**で届ける（#167。外側 PTY 書き込みの断片化で `4;45;18M` 等が入力欄へ平文混入する事故の根治。`architecture.md`「マウスレポート転送」節）。CLI / MCP の `Scroll` は `ControlHost::backend_scroll_view` で UI と同一経路。**TmuxOpen ビューペイン（`tako tmux open` の再アタッチ・`tako-view-*` ラッパー経由）も同じミラー経路に乗る**（#181: 外側 alacritty は alt screen（履歴なし）のため、分岐が `backend_sessions` のみだと直接ペイン扱いに落ちてスクロール不能だった。判定は `mirror_scroll_pane`（backend ∪ tmux_view）に統一、実体は wrapper（無ければ元セッション）@ socket を `ScrollTarget::Nested` として**ビュー先優先**で解決（persist ON では外側 PTY も backend ラップされるため backend 優先だと外側 = history 0 へ誤解決する）。persist 復元で戻ったビューペインは `tmux_view_panes` に載らないが、ネスト検出候補に backend socket 自身を含めることで tty 突き合わせで実体へ解決する。既知制約: カスタム `-L` 外部サーバーのビューは復元後にネスト検出できずスクロール不可（ビューを開き直せば回復）。2026-07-13）。UI はペイン右端のオーバーレイスクロールバーで、iTerm2 流に**スクロール中だけ表示 → 約 1 秒でフェードアウト**、ホバー / ドラッグ中は表示維持 + サム強調。スクロール中のキー入力は最下部へ戻してから流す（iTerm2 流）。既知制約: ミラー表示中（バックエンドの過去閲覧中）の選択・cmd+クリックは無効（視覚位置とライブ viewport が不一致のため。最下部へ戻れば可） | S |
+| FR-2.5.14 | **明示コマンドのペインはユーザーの対話環境で起き、失敗しても消えない**（#1031）。①起動シェルは**素のペインと同じ**（`platform::shell::login_shell_command` = `$SHELL -l -i -c`。素のペインは `$SHELL -l` を tty で起こすので zsh から見ると対話ログイン = `.zprofile` も `.zshrc` も読まれる。`-i` が無いと `.zshrc` だけ読まれず、nodebrew / fnm / Homebrew の PATH を `.zshrc` で通しているユーザーには「素のペインでは `npm` が引けるのに実行ペインでは command not found」になる）。②`tako split --command` のコマンドが**非 0 で終わったときだけ**、実行ペイン（FR-3.18 / FR-2.22.4）と同じ `__TAKO_EXIT=<code>` マーカーと案内（日英）を出して入力待ちで止める（`hold_on_failure_command`）。成功時は従来どおり即 close。閉じたペインの出力は FR-5.13 のペインログ（`tako logs show <pane>`）で後から読める。A/B は `TAKO_1031_LEGACY=1` | M |
 
 Phase 3 設計時の指針:
 
@@ -820,7 +825,7 @@ scene の実ピクセルで見出しサイズ・インラインコード・コ�
 | FR-2.22.1 | AI（master / solo / worker）が「ユーザーに実行してほしいコマンド」を渡すと、**対象ペインのターミナル領域の下に作った専用帯**へネイティブカードとして表示する（既定の対象は呼び出し元ペイン = AI が対話しているペイン）。位置の規則は FR-2.22.10 | M |
 | FR-2.22.2 | カードは**論理文字列**を保管する。表示は等幅 + 背景パネルで折り返してよい（狭幅ペインでも全文が読める）が、**コピー・実行に使うのは常に保管した論理文字列**でありペイン幅の影響を受けない。改行を含む複数行コマンドは改行を保持する | M |
 | FR-2.22.3 | 「コピー」ボタンで論理文字列をクリップボードへ入れ、成功をボタン表示で返す（アイコンとラベルが「コピーしました」へ変わる） | M |
-| FR-2.22.4 | 「新規ペインで実行」ボタンで**同じタブに新しいペインを分割して実行**する（Code Runner FR-3.18 の `spawn_command_pane` 経路を再利用。複合コマンドの包み方は`platform::shell::run_pane_command`（境界 B1）が決める = POSIX は `/bin/sh -c` の引数として渡し#453 の 127 即死を避ける / Windows は PowerShell へ `-EncodedCommand` で渡す。#875）。**対話中のペインには一切書き込まない**。既定でフォーカスも移さない。ボタン押下自体が明示操作なので追加の確認ダイアログは出さない | M |
+| FR-2.22.4 | 「新規ペインで実行」ボタンで**同じタブに新しいペインを分割して実行**する（Code Runner FR-3.18 の `spawn_command_pane` 経路を再利用。複合コマンドの包み方は`platform::shell::run_pane_command`（境界 B1）が決める = POSIX は `/bin/sh -c` の引数として渡し#453 の 127 即死を避ける / Windows は PowerShell へ `-EncodedCommand` で渡す。#875）。**対話中のペインには一切書き込まない**。既定でフォーカスも移さない。起動シェルは FR-2.5.14 の規則（ユーザーの対話環境）に従う。ボタン押下自体が明示操作なので追加の確認ダイアログは出さない | M |
 | FR-2.22.5 | × でカードを閉じる。1 カードに複数コマンドを載せられ（上限 10 件）、各コマンドが個別のコピー / 実行ボタンと番号ラベルを持つ。1 ペインあたりのカードは上限 3 枚で、超えたら古いものから落とす（提示を重ねても画面が埋まらない） | M |
 | FR-2.22.6 | カードは**揮発**（セッション内使い捨て）。レイアウト永続化の対象外で、ペインが閉じたら掃除する | M |
 | FR-2.22.7 | コマンド文字列は受け入れ時に正規化・検証する: CRLF → LF、前後の空白のみ除去（内側の改行・インデントは保持）、空文字列は拒否、**改行とタブ以外の制御文字は拒否**（クリップボードとシェルへ渡る文字列にエスケープシーケンスが混入する経路を構造的に閉じる）、1 コマンド 4096 バイト上限 | M |
@@ -1279,7 +1284,7 @@ A/B は `TAKO_1067_LEGACY` を持たない（#498 の旧経路は意図どおり
 | FR-3.16 | **プレビューの目次ナビゲーション**: Markdown は H1〜H6 の見出しアウトライン、PDF は PDFKit のアウトラインをヘッダのドロップダウンに表示し、項目クリックで対応する見出し / ページへジャンプする。PDF の `n / 全ページ数` 表示はクリックで全ページ一覧を開き、任意ページへジャンプできる。目次は初回ロードとライブリロード時に本文と同じ background 処理で 1 回だけ構築し、render では完成済みデータだけを参照する。dispatch `PreviewOutline` + CLI `tako preview-outline [--pane N] [--item N]` + MCP `tako_preview_outline`（全 84 ツール）へ一覧と 1 始まり項目ジャンプを 1:1 公開し、ページ番号指定は既存 `PreviewView` / `tako preview --page` / `tako_preview_view` を共有する（✅ 2026-07-15、#232） | M |
 | FR-3.17 | **プレビュー画像のメモリ上限**: PDF・画像・動画サムネのデコード済み画像をプロセス全体のバイト予算つき LRU で管理する。既定 512MiB、設定範囲 256〜8192MiB。PDF は表示ページの前後だけを遅延デコードし、退避時は tako の `Arc` に加えて GPUI asset cache と sprite atlas の CPU / GPU 資源を明示解放する。動画の置換済みフレームも次フレームで atlas から除去する。close は即時退避、BG 退避は LRU の非参照候補とする。ライブリロードの重量読み込みは `(pane, path)` 単位 single-flight + 最新要求 1 件へ直列化する。dispatch `PreviewCache` + CLI `tako preview-cache [max_mb]` + MCP `tako_preview_cache`（全 88 ツール）へ上限・現在使用 bytes・entry 数を 1:1 公開し、`settings.json` に永続化する（✅ 2026-07-15、#258） | M |
 
-| FR-3.18 | **Code Runner（再生ボタン）**: プレビューペインで開いているファイルを再生ボタンでワンクリック実行する。ファイル先頭 64 行 / 16 KiB の `tako:run:` 宣言（プロファイル `[name]` 複数定義可、変数展開 `${file}` / `${fileBase}` / `${fileNoExt}` / `${fileDir}` / `${ext}`）→ 拡張子既定（settings.json `runner_defaults` + 組み込み 21 言語）→ CLI `--command` の優先順位で解決。cwd はファイルのあるディレクトリが既定（宣言で上書き可）。実行は既存 `RunInteractive` と同一の split → spawn 経路（`spawn_command_pane` ヘルパー共通化）。起動コマンドの組み立てとマーカーの出力（`__TAKO_EXIT=<code>`）は`platform::shell::run_pane_command`（境界 B1）が決め、`tako:shell` 宣言の包み方は`declared_shell_command` が宣言されたシェルの方言から決める（#875）。dispatch `Run` / `RunResolve` / `RunnerDefaults` + CLI `tako run <file>` / `tako run-default` + MCP `tako_run` / `tako_run_resolve` / `tako_run_defaults`（全 108 ツール）。MCP description に宣言書式を含み、エージェントが参照して正しいヘッダを書ける。INSTRUCTIONS / master・solo prompt にファイル作成時の `tako:run` 付与を行動規範化（✅ M1〜M3・M5・M6、2026-07-22、#453。M4 UI は別 PR）。**`focus` の既定は false = 実行ペインを作ってもフォーカスを移さない**（ユーザーの打鍵を奪わない。`PaneTree::split_with_ratio` が無条件で新ペインへフォーカスを移すため、`spawn_command_pane` が分割前のフォーカスへ戻すことで担保する。`Request::Split` と同一規約。入力待ちの `RunInteractive` と再生ボタンだけが明示 true で移す。✅ 2026-07-30、#676） | M |
+| FR-3.18 | **Code Runner（再生ボタン）**: プレビューペインで開いているファイルを再生ボタンでワンクリック実行する。ファイル先頭 64 行 / 16 KiB の `tako:run:` 宣言（プロファイル `[name]` 複数定義可、変数展開 `${file}` / `${fileBase}` / `${fileNoExt}` / `${fileDir}` / `${ext}`）→ 拡張子既定（settings.json `runner_defaults` + 組み込み 21 言語）→ CLI `--command` の優先順位で解決。cwd はファイルのあるディレクトリが既定（宣言で上書き可）。実行は既存 `RunInteractive` と同一の split → spawn 経路（`spawn_command_pane` ヘルパー共通化）。起動コマンドの組み立てとマーカーの出力（`__TAKO_EXIT=<code>`）は`platform::shell::run_pane_command`（境界 B1）が決め、`tako:shell` 宣言の包み方は`declared_shell_command` が宣言されたシェルの方言から決める（#875）。起動シェルは FR-2.5.14 の規則（ユーザーの対話環境）に従う（#1031）。dispatch `Run` / `RunResolve` / `RunnerDefaults` + CLI `tako run <file>` / `tako run-default` + MCP `tako_run` / `tako_run_resolve` / `tako_run_defaults`（全 108 ツール）。MCP description に宣言書式を含み、エージェントが参照して正しいヘッダを書ける。INSTRUCTIONS / master・solo prompt にファイル作成時の `tako:run` 付与を行動規範化（✅ M1〜M3・M5・M6、2026-07-22、#453。M4 UI は別 PR）。**`focus` の既定は false = 実行ペインを作ってもフォーカスを移さない**（ユーザーの打鍵を奪わない。`PaneTree::split_with_ratio` が無条件で新ペインへフォーカスを移すため、`spawn_command_pane` が分割前のフォーカスへ戻すことで担保する。`Request::Split` と同一規約。入力待ちの `RunInteractive` と再生ボタンだけが明示 true で移す。✅ 2026-07-30、#676） | M |
 
 FR-3.1〜3.3 実装メモ（2026-06-13）:
 

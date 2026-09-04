@@ -23299,6 +23299,12 @@ mod self_test {
         }
     }
 
+    /// 空白と改行を落とす（**折り返した画面**の文字列一致に使う）。
+    /// ペインが狭いと 1 つの案内が複数行へ割れるので、行を跨いで探せる形にする
+    fn squash_ws(s: &str) -> String {
+        s.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
     /// パスを NSURL の `absoluteString` 相当（`file://` + パーセントエンコード）へ。
     /// 項目 116（#835）が Finder から来る形そのままで受け口を叩くために使う。
     /// エスケープ対象は RFC 3986 の unreserved + パス区切り以外すべて。
@@ -60881,6 +60887,327 @@ mod self_test {
                     cx.notify();
                 });
                 let _ = std::fs::remove_file(&body142);
+                notify_and_draw(any, window, cx);
+            }
+
+            // 143. 明示コマンドのペインが**素のペインと同じ環境**で走り、失敗しても
+            //      黙って消えない（#1031）。
+            //
+            //      (a) ラッパーが `-l -i -c` = zsh は `.zshrc` も読む。#1031 前は
+            //          `-l -c`（非対話）で `.zshrc` だけ読まれず、nodebrew / fnm /
+            //          Homebrew の PATH を `.zshrc` で通している人は「素のペインでは
+            //          `npm` が引けるのに実行ペインでは command not found」になっていた
+            //      (b) 実際に起きたシェルが `.zshrc` を読む（rc の置き場をこのペインだけ
+            //          差し替えて、そこで export した値がコマンドまで届くかを見る）
+            //      (c) 失敗したコマンドは終了コードのマーカー + 案内を残してペインが生きる
+            //      (d) 成功したコマンドは従来どおり待たずに閉じる
+            //
+            //      **判定は #1031 後の姿を無条件で見る**ので、`TAKO_1031_LEGACY=1` で
+            //      起動すると (a) / (b) / (c) が落ちる = 検出力（同一バイナリの A/B）
+            {
+                let legacy1031 = std::env::var_os("TAKO_1031_LEGACY").is_some();
+
+                // (a) 境界の出力（app が `spawn_session` で通すのと同じ 1 実装）
+                let wrapper = tako_core::login_shell_command(tako_core::SpawnCommand {
+                    program: "/bin/echo".into(),
+                    args: vec!["hi".into()],
+                });
+                let wrapper_args = wrapper.args.clone();
+                if cfg!(unix) {
+                    check(
+                        wrapper_args.iter().any(|a| a == "-l")
+                            && wrapper_args.iter().any(|a| a == "-i")
+                            && wrapper_args.iter().any(|a| a == "-c"),
+                        &format!(
+                            "143 (a): 明示コマンドは対話ログインシェルで走る (#1031) \
+                             args={wrapper_args:?} legacy={legacy1031}"
+                        ),
+                    );
+                }
+
+                // この項目専用のタブで完結させる（項目 93 / 141 と同じ手）
+                let made143 = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        let made = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::TabNew {
+                                title: Some("st1031".into()),
+                                focus: Some(true),
+                                cwd: None,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                        // dispatch を直接呼ぶので PTY 起動依頼もここで消化する（#1023）
+                        for (p, options) in std::mem::take(&mut app.pending_attach) {
+                            if app.spawn_session(p, options, cx).is_err() {
+                                app.remove_pane(p, cx);
+                            }
+                        }
+                        cx.notify();
+                        match made {
+                            Ok(v) => match (v["pane"].as_u64(), v["tab"].as_u64()) {
+                                (Some(p), Some(t)) => {
+                                    Ok((PaneId::from_raw(p), TabId::from_raw(t)))
+                                }
+                                _ => Err(format!("tab new の応答: {v}")),
+                            },
+                            Err(e) => Err(format!("tab new: {e}")),
+                        }
+                    })
+                    .unwrap_or_else(|e| Err(format!("window.update: {e}")));
+                let (term143, tab143) = match made143 {
+                    Ok(v) => v,
+                    Err(why) => fail(&format!("143: 検証用タブを作れない (#1031。{why})")),
+                };
+
+                // 実 CLI を 1 本走らせる（応答 JSON を返す）
+                let split_cli =
+                    async |cx: &mut AsyncApp, args: Vec<String>| -> Option<serde_json::Value> {
+                        let out =
+                            cli_output_bg(cx, &cli_path, &ipc_endpoint, &token, term143, tab143, args)
+                                .await?;
+                        serde_json::from_slice(&out.stdout).ok()
+                    };
+                // `tako split` はペイン ID を**素の数値**で返す（`{"pane":N}` ではない）。
+                // 他のコマンドと形が違うのでここで吸収する
+                fn pane_of(v: &Option<serde_json::Value>) -> Option<PaneId> {
+                    v.as_ref()
+                        .and_then(|v| v["pane"].as_u64().or_else(|| v.as_u64()))
+                        .map(PaneId::from_raw)
+                }
+
+                // (b) 実際に起きたシェルが `.zshrc` を読む（= 素のペインと同じ）。
+                //     **このペインだけ `TAKO_ORIG_ZDOTDIR` を差し替えて** rc を用意し、
+                //     そこで export した値がコマンドまで届くかを見る（`login_shell_command`
+                //     は `spawn_session` の中で掛かるので、ここは製品経路そのもの）。
+                //     `HOME` ではなく `ZDOTDIR` の復元先を使うのは、器（tmux）つきでも
+                //     届かせるため: 器のセッション env へ `-e` で確定されるのは
+                //     `shell_integration::INJECTED_KEYS` に載っている名前だけで、
+                //     `HOME` は器のサーバーの stale な値に負ける。
+                //     ps で argv を覗く形は使えない: zsh は `-c <1 コマンド>` を
+                //     最後に `exec` で置き換えるので、見えるのは内側の `/bin/sh` になる
+                //     （実測）。#1031 前は `.zprofile` だけが届き `.zshrc` は届かない
+                let user_shell143 = std::env::var("SHELL").unwrap_or_default();
+                let zsh143 = std::path::Path::new(&user_shell143)
+                    .file_name()
+                    .map(|n| n == "zsh")
+                    .unwrap_or(false);
+                // シェル統合（ZDOTDIR 注入）が効いていないと rc の置き場を差し替えられない
+                let zdot_injected143 = tako_core::shell_integration::env()
+                    .iter()
+                    .any(|(k, _)| k == "ZDOTDIR");
+                let home143 =
+                    std::env::temp_dir().join(format!("tako-1031-home-{}", std::process::id()));
+                let mut probe143 = String::new();
+                let mut probe_pane143 = None;
+                if cfg!(unix) && zsh143 && zdot_injected143 {
+                    let _ = std::fs::remove_dir_all(&home143);
+                    if std::fs::create_dir_all(&home143).is_ok()
+                        && std::fs::write(
+                            home143.join(".zprofile"),
+                            "export ST1031_PROFILE=profile-ok\n",
+                        )
+                        .is_ok()
+                        && std::fs::write(home143.join(".zshrc"), "export ST1031_RC=rc-ok\n").is_ok()
+                    {
+                        let probe_argv143 = sh.shell_snippet_command(&sh.sequence(&[
+                            sh.echo("ST1031 rc=[${ST1031_RC}] profile=[${ST1031_PROFILE}]"),
+                            sh.sleep(30),
+                        ]));
+                        let made = window
+                            .update(cx, |app: &mut TakoApp, _, cx| {
+                                let made = tako_control::dispatch(
+                                    app,
+                                    tako_control::protocol::Request::Split {
+                                        pane: Some(term143.as_u64()),
+                                        tab: None,
+                                        direction: None,
+                                        ratio: None,
+                                        // 読めたかを 1 行で出し、判定できるまで居座る。
+                                        // argv は方言境界から作る（#889 の番犬）
+                                        command: Some(probe_argv143.clone()),
+                                        cwd: None,
+                                        focus: None,
+                                    },
+                                    PaneOrigin::Cli,
+                                );
+                                // **env を足してから** spawn する（#1023 と同じ消化の形）
+                                for (p, mut options) in std::mem::take(&mut app.pending_attach) {
+                                    options.env.push((
+                                        "TAKO_ORIG_ZDOTDIR".into(),
+                                        home143.display().to_string(),
+                                    ));
+                                    if app.spawn_session(p, options, cx).is_err() {
+                                        app.remove_pane(p, cx);
+                                    }
+                                }
+                                cx.notify();
+                                made.ok().and_then(|v| v["pane"].as_u64())
+                            })
+                            .ok()
+                            .flatten();
+                        probe_pane143 = made.map(PaneId::from_raw);
+                    }
+                }
+                let backend143 = probe_pane143
+                    .and_then(|p| {
+                        window
+                            .update(cx, |app: &mut TakoApp, _, _| {
+                                app.backend_sessions.contains_key(&p)
+                            })
+                            .ok()
+                    })
+                    .unwrap_or(false);
+                if let Some(probe_pane) = probe_pane143 {
+                    let seen = wait_for_app_state(
+                        window,
+                        cx,
+                        "143: HOME 差し替えペインが結果を出す (#1031)",
+                        Duration::from_secs(15),
+                        |app| {
+                            app.terminals
+                                .get(&probe_pane)
+                                .map(|s| s.visible_lines().iter().any(|l| l.contains("ST1031 rc=")))
+                                .unwrap_or(false)
+                        },
+                    )
+                    .await;
+                    probe143 = window
+                        .update(cx, |app: &mut TakoApp, _, _| {
+                            app.terminals
+                                .get(&probe_pane)
+                                .and_then(|s| {
+                                    s.visible_lines()
+                                        .iter()
+                                        .find(|l| l.contains("ST1031 rc="))
+                                        .map(|l| l.trim().to_string())
+                                })
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default();
+                    // `.zprofile` は #1031 前後どちらでも読まれる（`-l` は元から付いている）
+                    check(
+                        seen && probe143.contains("profile=[profile-ok]"),
+                        &format!(
+                            "143 (b): ログインプロファイルは従来どおり読まれる (#1031) \
+                             seen={seen} line={probe143:?}"
+                        ),
+                    );
+                    // `.zshrc` は `-i` があるときだけ読まれる = #1031 の中身そのもの
+                    check(
+                        probe143.contains("rc=[rc-ok]"),
+                        &format!(
+                            "143 (b): .zshrc は対話シェルのときだけ読まれる (#1031) \
+                             line={probe143:?} legacy={legacy1031}"
+                        ),
+                    );
+                    let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                        app.close_pane_button(probe_pane, CloseOrigin::Internal, cx);
+                        cx.notify();
+                    });
+                } else {
+                    println!(
+                        "TAKO_SELF_TEST_SKIPPED: 143(b) の rc 読み込み検査\
+                         （shell={user_shell143:?} unix={} zdotdir={zdot_injected143}）",
+                        cfg!(unix)
+                    );
+                }
+                let _ = std::fs::remove_dir_all(&home143);
+
+                // (c) 失敗したコマンドはペインが残り、終了コードと案内が読める
+                let mut fail_args143 = vec!["split".into(), "--pane".into(), term143.to_string(), "--".into()];
+                fail_args143.extend(sh.shell_snippet_command(
+                    &sh.sequence(&[sh.echo("st1031-out"), sh.exit_status(7)]),
+                ));
+                let fail143 = split_cli(cx, fail_args143).await;
+                let Some(bad_pane) = pane_of(&fail143) else {
+                    fail(&format!("143: 失敗コマンドの split が失敗した (#1031。{fail143:?})"))
+                };
+                let hint143 = tako_core::platform::shell::hold_hint(tako_core::i18n::lang());
+                let held = wait_for_app_state(
+                    window,
+                    cx,
+                    "143: 失敗したコマンドが終了コードと案内を残す (#1031)",
+                    Duration::from_secs(12),
+                    |app| {
+                        app.terminals
+                            .get(&bad_pane)
+                            .map(|s| {
+                                // 案内は狭いペインで**行を折り返す**ので、空白と改行を
+                                // 落としてから見る（実測: 「…このペインを閉じ」「ます。」）
+                                let joined = squash_ws(&s.visible_lines().join(""));
+                                joined.contains("__TAKO_EXIT=7")
+                                    && joined.contains(&squash_ws(hint143))
+                            })
+                            .unwrap_or(false)
+                    },
+                )
+                .await;
+                let screen143 = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.terminals
+                            .get(&bad_pane)
+                            .map(|s| {
+                                s.visible_lines()
+                                    .iter()
+                                    .map(|l| l.trim_end().to_string())
+                                    .filter(|l| !l.is_empty())
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                let alive143 = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.terminals.contains_key(&bad_pane)
+                    })
+                    .unwrap_or(false);
+                check(
+                    held && alive143,
+                    &format!(
+                        "143 (c): 失敗したコマンドは終了コードと案内を残して止まる \
+                         (#1031) held={held} alive={alive143} screen={screen143:?}"
+                    ),
+                );
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                    app.close_pane_button(bad_pane, CloseOrigin::Internal, cx);
+                    cx.notify();
+                });
+
+                // (d) 成功したコマンドは従来どおり閉じる（包みが常時 hold にならない）
+                let mut ok_args143 = vec!["split".into(), "--pane".into(), term143.to_string(), "--".into()];
+                ok_args143.extend(sh.shell_snippet_command(&sh.echo("st1031-ok")));
+                let ok143 = split_cli(cx, ok_args143).await;
+                if let Some(good_pane) = pane_of(&ok143) {
+                    let gone = wait_for_app_state(
+                        window,
+                        cx,
+                        "143: 成功したコマンドのペインが閉じる (#1031)",
+                        Duration::from_secs(12),
+                        |app| !app.terminals.contains_key(&good_pane),
+                    )
+                    .await;
+                    check(
+                        gone,
+                        &format!(
+                            "143 (d): 成功したコマンドのペインは従来どおり閉じる (#1031) \
+                             gone={gone}"
+                        ),
+                    );
+                } else {
+                    fail(&format!("143: 成功コマンドの split が失敗した (#1031。{ok143:?})"));
+                }
+
+                println!(
+                    "TAKO_SELF_TEST_1031: wrapper={wrapper_args:?} probe={probe143:?} \
+                     backend={backend143} held={held} legacy={legacy1031}"
+                );
+
+                // 後片付け: 専用タブを畳む
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                    app.close_pane_button(term143, CloseOrigin::Internal, cx);
+                    cx.notify();
+                });
                 notify_and_draw(any, window, cx);
             }
 
