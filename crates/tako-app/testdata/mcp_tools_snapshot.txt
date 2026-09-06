@@ -11,6 +11,7 @@ tako_close_pane
 tako_collapse_tab
 tako_config_share
 tako_confirm_close
+tako_context_budget
 tako_create_tab
 tako_equalize_layout
 tako_fda

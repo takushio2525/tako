@@ -500,6 +500,10 @@ pub const RECOMMENDED_SECTIONS: &[(&str, &str)] = &[
         "templates/sections/06-completion-verification.md",
         include_str!("../../../resources/setup/templates/sections/06-completion-verification.md"),
     ),
+    (
+        "templates/sections/07-context-budget.md",
+        include_str!("../../../resources/setup/templates/sections/07-context-budget.md"),
+    ),
 ];
 
 /// 同梱の既定グローバル指示ファイル（未作成時に setup が書く内容）
@@ -1132,14 +1136,14 @@ mod tests {
 
     // --- 項目レベル比較（Issue #322） ---
 
-    /// 同梱 sections は全 7 項目が coverage メタ行を持ち、パースできること
+    /// 同梱 sections は全 8 項目が coverage メタ行を持ち、パースできること
     #[test]
     fn issue_322_recommended_sections_parse() {
-        assert_eq!(RECOMMENDED_SECTIONS.len(), 7, "同梱推奨ルールは 7 項目");
+        assert_eq!(RECOMMENDED_SECTIONS.len(), 8, "同梱推奨ルールは 8 項目");
         let sections = recommended_coverage_sections();
         assert_eq!(
             sections.len(),
-            7,
+            8,
             "全項目が coverage メタ行を持つ（不足はメタ行の記入漏れ）"
         );
         for section in &sections {
@@ -1194,7 +1198,7 @@ mod tests {
         assert!(!joined.contains("言語設定"), "言語はカバー済み: {joined}");
 
         let lines = coverage.render_lines();
-        assert!(lines[0].contains("全 7 項目"));
+        assert!(lines[0].contains("全 8 項目"));
         assert!(
             lines
                 .iter()
@@ -1214,7 +1218,7 @@ mod tests {
     fn issue_322_empty_instructions_report_all_missing() {
         let coverage = compare_instruction_coverage("");
         assert!(!coverage.is_full());
-        assert_eq!(coverage.missing_summaries().len(), 7, "全 7 項目が不足");
+        assert_eq!(coverage.missing_summaries().len(), 8, "全 8 項目が不足");
         assert!(!coverage.render_lines().iter().any(|l| l.contains("[OK]")));
     }
 

@@ -535,6 +535,16 @@ pub const MATRIX: &[Feature] = &[
         ),
     },
     Feature {
+        // 起動時ロードの予算（#1139）。ファイルを読んで数えるだけのローカル処理で、
+        // 判定は純粋関数なので macOS 上から Windows 側の答えも検証できる
+        key: "tako_context_budget",
+        macos: Support::Supported,
+        windows: Support::Supported,
+        windows_evidence: Evidence::UnitTest(
+            "context_budget の単体 18 本と番犬 context_budget.rs（判定・移送とも純粋関数でプラットフォーム分岐が無い）",
+        ),
+    },
+    Feature {
         key: "tako_create_tab",
         macos: Support::Supported,
         windows: Support::Supported,

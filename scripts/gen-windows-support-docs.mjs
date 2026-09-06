@@ -78,7 +78,7 @@ const CATEGORIES = [
     'tako_setup', 'tako_setup_bootstrap', 'tako_setup_changes', 'tako_setup_deps',
     'tako_setup_mcp', 'tako_setup_models',
     'tako_settings', 'tako_migrate', 'tako_agents_sync_rules',
-    'tako_config_share', 'tako_platform', 'tako_agent_support',
+    'tako_config_share', 'tako_platform', 'tako_agent_support', 'tako_context_budget',
   ]],
   ['リモートアクセス', [
     'tako_remote_start', 'tako_remote_stop', 'tako_remote_status',

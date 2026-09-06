@@ -8,6 +8,47 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [Unreleased]
+
+### Added
+
+- **Startup load budget: `tako context-budget`** (#1139). Everything an agent
+  force-loads at startup — the global guide, `AGENTS.md` and its `@import` chain,
+  the master / solo system prompt, handoff files — is now measured against numeric
+  limits. `tako context-budget` reports bytes / lines / estimated tokens / budget /
+  reason per item; `tako context-budget fix` automatically folds old work-log entries
+  into `progress-archive.md`, one line each. The fix is idempotent, never rewrites or
+  summarises text, and refuses to write unless the total entry count is preserved
+  (the full text stays in git history). Overruns that need a human decision come back
+  as `proposals` with the concrete next step. Available as MCP `tako_context_budget`
+  (action `check` / `fix`), and checked in CI by a watchdog that runs the same
+  judgement function on this repository's own work log.
+  Measured trigger: master was spending 31% of its context (~310k tokens) before doing
+  any work, 180k of which was an `@import`ed work log grown to 332 entries / 407 KB
+  over three months, because the existing rule only *suggested* archiving.
+- **起動時ロードの予算 `tako context-budget`**（#1139）。エージェントが起動した瞬間に
+  強制ロードするもの（グローバル指示・`AGENTS.md` と `@import` チェーン・master / solo の
+  system prompt・引き継ぎ）を数値の上限と突き合わせる。`tako context-budget` が項目ごとに
+  bytes / 行 / 概算トークン / 予算 / 超過理由を返し、`tako context-budget fix` が作業ログの
+  古いエントリを `progress-archive.md` へ 1 行ずつ自動で移す。**冪等・本文の要約も改変も
+  しない・移送で総エントリ数が合わなければ書き込まない**（全文は git 履歴に残る）。
+  人間の判断が要る超過は直し方つきの `proposals` として返る。MCP `tako_context_budget`
+  （action = check / fix）と 1:1 で、CI の番犬が**同じ判定関数**でこのリポジトリ自身の
+  作業ログを検査する。
+  きっかけの実測: master が何も作業しないうちにコンテキストの 31%（約 31 万トークン）を
+  使っており、その 18 万トークンは 3 か月で 332 エントリ / 407 KB に育った `@import` 済みの
+  作業ログだった（既存の規約はアーカイブを**提案**するだけだったため守られなかった）。
+
+### Changed
+
+- The work-log budget (5 work days / 20 entries / 3 lines each / 12 KB, 90-day archive
+  retention) is now generated from a single source of truth into the three places tako
+  ships regulations, and a test pins them to the table so the numbers cannot drift.
+  `.agent/roadmap.md` is no longer `@import`ed (it is a backtick reference now).
+- 作業ログの予算（5 作業日 / 20 エントリ / 各 3 行 / 12 KB・アーカイブ保持 90 日）を
+  正本の表から生成し、tako が配る規約 3 か所へ埋め込んで一致をテストで固定した。
+  `.agent/roadmap.md` は `@import` をやめてバックティック参照にした。
+
 ## [0.8.6] - 2026-09-05
 
 Nightly patch release (automated). Changes since v0.8.5:

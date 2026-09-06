@@ -779,6 +779,13 @@ pub(super) fn build_request(
             status: str_arg(args, "status")?.map(|s| s.to_string()),
             known_limitations: bool_arg(args, "known_limitations")?.unwrap_or(false),
         },
+        "tako_context_budget" => Request::ContextBudget {
+            action: str_arg(args, "action")?.map(|s| s.to_string()),
+            cwd: str_arg(args, "cwd")?.map(|s| s.to_string()),
+            profile: str_arg(args, "profile")?.map(|s| s.to_string()),
+            dry_run: bool_arg(args, "dry_run")?.unwrap_or(false),
+            pane: u64_arg(args, "pane")?.or(caller),
+        },
         "tako_lang" => Request::Lang {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
             value: str_arg(args, "value")?.map(|s| s.to_string()),
