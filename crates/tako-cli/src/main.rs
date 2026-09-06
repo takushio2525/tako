@@ -147,6 +147,12 @@ enum Command {
     /// agent 能力マトリクスを表示する（どの CLI でどこまで使えるか。Issue #982）
     AgentSupport(AgentSupportArgs),
     Platform(PlatformArgs),
+    /// 起動時ロードの予算の確認と自動修正（Issue #1139）。
+    /// AI が起動した瞬間に強制ロードされるもの（グローバル指示・AGENTS.md と
+    /// @import チェーン・system prompt・引き継ぎ）を棚卸しし、上限と突き合わせる。
+    /// `fix` で作業ログの archive 移送だけを自動で直す
+    #[command(name = "context-budget")]
+    ContextBudget(ContextBudgetArgs),
     /// シェル統合（OSC 7 / 133 = ペインの cwd 追従とコマンド実行状態）の
     /// 配置状態の確認と配置・解除（Issue #525）。引数なしで現在の状態を表示。
     /// unix は環境変数の注入だけで完結するので配置操作は不要
@@ -2532,6 +2538,26 @@ struct PlatformArgs {
     json: bool,
 }
 
+/// 起動時ロードの予算の引数（Issue #1139）
+#[derive(Args)]
+struct ContextBudgetArgs {
+    /// 操作（省略時は check = 何も書き換えない）
+    #[arg(value_parser = ["check", "fix"])]
+    action: Option<String>,
+    /// 対象フォルダ（省略時は現在のフォルダ）
+    #[arg(long)]
+    cwd: Option<String>,
+    /// system prompt / 引き継ぎを見るプロファイル（省略時は default）
+    #[arg(long)]
+    profile: Option<String>,
+    /// fix のとき、書き込まずに移送予定だけを表示する
+    #[arg(long)]
+    dry_run: bool,
+    /// 生の JSON で出力する
+    #[arg(long)]
+    json: bool,
+}
+
 /// シェル統合の配置操作の引数（Issue #525）
 #[derive(Args)]
 struct ShellIntegrationArgs {
@@ -3222,6 +3248,7 @@ fn cli_main() -> ExitCode {
         // 対応マトリクスはバイナリに埋め込まれた静的な表なのでローカル処理。
         // GUI が動いていない環境（移植作業中の Windows がまさにそれ）でも引けることが本質
         Command::Platform(ref args) => platform_local(args),
+        Command::ContextBudget(ref args) => context_budget_local(args),
         Command::AgentSupport(ref args) => agent_support_local(args),
         // GUI を必要としないローカル処理（platform と同じ扱い）。
         // 実体は dispatch と共通の tako_control::shell_integration::run
@@ -3547,6 +3574,14 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         .and_then(|m| orchestrator::one_m_model_warning(m, "worker"))
     {
         eprintln!("{warning}");
+    }
+
+    // #1139: 起動時ロードが予算を超えていたら 1 行だけ出す（超過が無ければ黙る）。
+    // ここは cwd 移動（Part 5）より後なので、これから master が読むフォルダで測れる
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(line) = tako_control::context_budget::startup_line(&cwd, Some(profile_name)) {
+            eprintln!("{line}");
+        }
     }
 
     let prompt_content = profile.build_system_prompt(profile_name);
@@ -4858,6 +4893,127 @@ fn agent_support_local(args: &AgentSupportArgs) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// 起動時ロードの予算（#1139）。GUI も IPC も要らないローカル処理。
+/// **壊れた設定で GUI が起動しないときにも引ける**ことが本質なので IPC 非依存にする
+fn context_budget_local(args: &ContextBudgetArgs) -> Result<(), String> {
+    tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
+    let cwd = match args.cwd {
+        Some(ref c) => std::path::PathBuf::from(tako_control::orchestrator::expand_tilde(c)),
+        None => std::env::current_dir().map_err(|e| format!("cwd が取れない: {e}"))?,
+    };
+    let fixing = args.action.as_deref() == Some("fix");
+    let out = if fixing {
+        tako_control::context_budget::fix(&cwd, args.profile.as_deref(), args.dry_run)?
+    } else {
+        tako_control::context_budget::report(&cwd, args.profile.as_deref())?
+    };
+    if args.json {
+        println!("{}", pretty_json(&out));
+        return Ok(());
+    }
+    if fixing {
+        print_context_budget_fix(&out, args.dry_run);
+    } else {
+        print_context_budget_check(&out);
+    }
+    Ok(())
+}
+
+fn print_context_budget_check(out: &serde_json::Value) {
+    let empty = vec![];
+    let items = out["items"].as_array().unwrap_or(&empty);
+    println!(
+        "起動時ロード: {} 項目 / 概算 {} トークン",
+        items.len(),
+        out["totals"]["est_tokens"].as_u64().unwrap_or(0)
+    );
+    for it in items {
+        let v = it["violations"].as_array();
+        let mark = if v.is_some() { "!" } else { " " };
+        println!(
+            "{mark} {:<40} {:>7} bytes / 約 {:>6} tok  [{}]",
+            it["path"].as_str().unwrap_or("?"),
+            it["bytes"].as_u64().unwrap_or(0),
+            it["est_tokens"].as_u64().unwrap_or(0),
+            it["kind"].as_str().unwrap_or("?")
+        );
+        for x in v.into_iter().flatten() {
+            println!(
+                "      超過 {}: {} > {}（{}）",
+                x["metric"].as_str().unwrap_or("?"),
+                x["actual"].as_u64().unwrap_or(0),
+                x["limit"].as_u64().unwrap_or(0),
+                x["note"].as_str().unwrap_or("")
+            );
+        }
+    }
+    let violations = out["violations"].as_u64().unwrap_or(0);
+    if violations == 0 {
+        println!("\n予算内");
+        return;
+    }
+    let fixable = out["fixable"].as_u64().unwrap_or(0);
+    println!("\n超過: {violations} 件（自動で直せる: {fixable} 件）");
+    if fixable > 0 {
+        // 既定値で済む引数は付けない（#322 の最簡形）
+        println!("いま直す: tako context-budget fix");
+    }
+    for p in out["proposals"].as_array().unwrap_or(&empty) {
+        println!(
+            "  提案 {}: {}",
+            p["path"].as_str().unwrap_or("?"),
+            p["next_step"].as_str().unwrap_or("")
+        );
+    }
+}
+
+fn print_context_budget_fix(out: &serde_json::Value, dry_run: bool) {
+    let empty = vec![];
+    if dry_run {
+        println!("（dry-run: 書き込まない）");
+    }
+    for c in out["changes"].as_array().unwrap_or(&empty) {
+        let path = c["path"].as_str().unwrap_or("?");
+        if !c["changed"].as_bool().unwrap_or(false) {
+            println!("{path}: 変更なし（予算内）");
+            continue;
+        }
+        println!(
+            "{path}: {} 件 → 残 {} 件 / archive へ {} 件（総数保存: {}）",
+            c["entries_before"].as_u64().unwrap_or(0),
+            c["entries_kept"].as_u64().unwrap_or(0),
+            c["entries_archived"].as_u64().unwrap_or(0),
+            if c["entries_preserved"].as_bool().unwrap_or(false) {
+                "はい"
+            } else {
+                "いいえ"
+            }
+        );
+        println!(
+            "  {} → {} bytes（約 {} → {} トークン）",
+            c["bytes_before"].as_u64().unwrap_or(0),
+            c["bytes_after"].as_u64().unwrap_or(0),
+            c["est_tokens_before"].as_u64().unwrap_or(0),
+            c["est_tokens_after"].as_u64().unwrap_or(0)
+        );
+        let aged = c["archive_lines_removed_by_age"].as_u64().unwrap_or(0);
+        if aged > 0 {
+            println!("  保持期間を過ぎて archive から削除: {aged} 行");
+        }
+        for l in c["archived_preview"].as_array().unwrap_or(&empty) {
+            println!("    移送予定 {}", l.as_str().unwrap_or(""));
+        }
+    }
+    println!("変更したファイル: {}", out["changed"].as_u64().unwrap_or(0));
+    for p in out["proposals"].as_array().unwrap_or(&empty) {
+        println!(
+            "  提案 {}: {}",
+            p["path"].as_str().unwrap_or("?"),
+            p["next_step"].as_str().unwrap_or("")
+        );
+    }
 }
 
 fn platform_local(args: &PlatformArgs) -> Result<(), String> {
@@ -6773,6 +6929,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Agents(_) => unreachable!("agents は run() を通らない"),
         Command::Recover(_) => unreachable!("recover は run() を通らない（ローカル処理）"),
         Command::Platform(_) => unreachable!("platform は run() を通らない（ローカル処理）"),
+        Command::ContextBudget(_) => {
+            unreachable!("context-budget は run() を通らない（ローカル処理）")
+        }
         Command::AgentSupport(_) => {
             unreachable!("agent-support は run() を通らない（ローカル処理）")
         }

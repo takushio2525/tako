@@ -3386,6 +3386,8 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
         !skip_agent,
     )?;
 
+    print_context_budget_status();
+
     if !skip_agent {
         if review_mode && instruction_existed {
             let parent = instruction.parent().unwrap_or(Path::new("."));
@@ -3485,6 +3487,22 @@ fn now_iso8601() -> String {
         }
         _ => "unknown".into(),
     }
+}
+
+/// 起動時ロードの予算の状態を 1 行だけ出す（Issue #1139）。
+///
+/// **質問はしない**（標準 `tako setup` の質問ゼロ = #262）。予算内なら黙って素通りし、
+/// 超過があるときだけ状態 + 最簡形の直し方を出す（#322）
+fn print_context_budget_status() {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let Some(line) = tako_control::context_budget::startup_line(&cwd, None) else {
+        return;
+    };
+    eprintln!();
+    eprintln!("起動時ロードの予算");
+    eprintln!("  {line}");
 }
 
 #[cfg(test)]
@@ -3781,7 +3799,7 @@ mod tests {
     #[test]
     fn embedded_resources_not_empty() {
         assert!(!SYSTEM_PROMPT.is_empty());
-        assert_eq!(RECOMMENDED_SECTIONS.len(), 7);
+        assert_eq!(RECOMMENDED_SECTIONS.len(), 8);
         for (rel_path, content) in RECOMMENDED_SECTIONS {
             assert!(!content.is_empty(), "{rel_path} が空");
         }

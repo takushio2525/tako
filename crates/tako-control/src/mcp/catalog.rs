@@ -2580,6 +2580,50 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_context_budget",
+            "description": "起動時ロードの予算の確認と自動修正（Issue #1139）。\
+                AI が**起動した瞬間に強制ロードされるもの**（グローバル指示ファイル・\
+                リポジトリの AGENTS.md / CLAUDE.md とその @import チェーン・master / solo の \
+                system prompt・引き継ぎ）を棚卸しし、種別ごとの上限と突き合わせる。\
+                積もった作業ログが毎ターン全文読み込まれてコンテキストを食い潰すのを防ぐための機構。\
+                action=check（既定）: 何も書き換えず、項目ごとの bytes / 行 / 概算トークン / 予算 / \
+                超過理由（violations）と、自動では直せないものの直し方（proposals）を返す。\
+                action=fix: **自動で直せるものだけ**直す = `## YYYY-MM-DD` の見出しが並ぶ作業ログの \
+                古いエントリを progress-archive.md へ 1 行に畳んで移す（本文の要約も改変もしない。\
+                全文は git 履歴に残る）。移送で総エントリ数が合わなければ書き込まない。\
+                dry_run=true で書き込まずに移送予定だけを返す。\
+                cwd: 対象フォルダ（省略時は呼び出し元ペインの cwd）。profile: system prompt と \
+                引き継ぎを見るプロファイル（省略時は default）。\
+                **起動直後にこれを引き、fix で直せるものは直し、proposals は Issue 化すること**。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["check", "fix"],
+                        "description": "check（既定。何も書き換えない）/ fix（自動で直せるものだけ直す）",
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "対象フォルダ（省略時は呼び出し元ペインの cwd）",
+                    },
+                    "profile": {
+                        "type": "string",
+                        "description": "system prompt / 引き継ぎを見るプロファイル（省略時は default）",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "fix のとき、書き込まずに移送予定だけを返す",
+                    },
+                    "pane": {
+                        "type": "integer",
+                        "description": "cwd 省略時の基準ペイン（省略時は呼び出し元）",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_ui_mode",
             "description": "UI 表示モード（GUI ライク表示 ⇔ ターミナル表示）の状態確認・切替（Issue #691）。\
                 action=status（既定）: 現在のモードと、ターミナル表示へ戻してあるペインを返す。\

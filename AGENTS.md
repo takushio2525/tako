@@ -187,12 +187,48 @@ CI（`.github/workflows/ci.yml`）は macOS / Windows の両ランナーで buil
 
 - 現在の作業状況（毎ターン上書き）: @.agent/activeContext.md
 - 完了タスクの時系列（毎ターン追記）: @.agent/progress.md
-- フェーズ計画・次の一手: @.agent/roadmap.md
 
 セッション開始時に必ず読み、応答終了前に `activeContext` は最新状態で**上書き**、
 作業が一段落していれば `progress` の末尾に**1〜3 行で追記**する。
 スキップ可能なターン（単発質問への回答、タイポ修正のみ）では更新しない。
-詳細ルールはグローバル CLAUDE.md の「プロジェクト作業履歴メモ」節を参照。
+
+フェーズ計画・次の一手は `.agent/roadmap.md`、移送済みの古い履歴は
+`.agent/progress-archive.md`（どちらも**毎ターンは読まない**。必要なときだけ Read する）。
+
+### 起動時ロードの予算（Issue #1139）
+
+**この節は生成物**（正本は `tako_core::context_budget` の予算表）。手で数値を書き換えない。
+`tako context-budget` / MCP `tako_context_budget` が同じ表で判定し、CI の番犬
+`crates/tako-control/tests/context_budget.rs` が落とす。
+
+<!-- tako:context-budget-rule -->
+### 絶対に読む範囲（`@import` してよいもの）
+
+- **現在状態**（`activeContext.md` 型）: 80 行以内。「現在の対象 / 直近の観点 / 次の一手」だけを置く
+- **作業ログ**（`progress.md` 型）: **直近 5 作業日 かつ 20 エントリ かつ 12 KB 以内**。
+  1 エントリは「何を / どこを / 結果」の **3 行以内**にとどめ、詳細は git log・Issue・PR に委ねる
+- タスクリスト 1 本（プロジェクトにあれば）
+
+### アーカイブとする範囲
+
+- 予算から外れたエントリは `progress-archive.md` へ **1 行**（`- YYYY-MM-DD #番号 一言`）で移す
+- アーカイブは `@import` しない・普段は Read しない
+- **90 日より古いアーカイブ行は消す**（git log・Issue・PR が正本なので情報は失われない）
+
+### それ以外の上限
+
+- エージェント規約（`AGENTS.md`）は **30 KB 以内**。長い注記・実測・罠は `.agent/` 配下の
+  別ファイルへ出し、規約からは**バックティック参照**で案内する（`@import` にはしない）
+- `@import` の合計は **40 KB 以内**
+- 引き継ぎの運用メモは 80 行以内 / グローバル指示ファイルは 24 KB 以内
+
+### 機械強制
+
+- `tako context-budget` で状態を確認し、`tako context-budget fix` で作業ログの移送を自動で行う
+  （**冪等・本文は改変しない・全文は git 履歴に残る**）
+- 自動で直せないもの（規約の肥大・`@import` の増殖）は `proposals` として直し方が返る
+- CI の番犬がこの予算を検査するので、超えたまま merge できない
+<!-- /tako:context-budget-rule -->
 
 ## コミット規約
 
