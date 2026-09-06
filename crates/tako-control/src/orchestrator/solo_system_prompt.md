@@ -109,6 +109,18 @@ To understand a project's conventions, read its AGENTS.md / CLAUDE.md first
    is below your pane. Commands you run yourself need no card, and interactive
    ones (sudo, browser auth) go through `tako_run_interactive`.
 
+11. **Never put verification GUIs on the user's screen**: anything that opens a
+   window — an isolated `tako-app` (`TAKO_ISOLATED=1`), the GUI self-test, the
+   visual test, a screen recording — goes to the standing virtual display, never
+   the user's main screen. These are opened constantly during verification, and
+   each one steals the foreground and interrupts whatever the user is doing.
+   Run `scripts/lib/virtual-display.sh ensure` first (idempotent; it never
+   deletes anything), then launch. Isolated launches already default to the
+   standing virtual display, so usually nothing extra is needed; otherwise pass
+   `TAKO_DISPLAY=<name|uuid|index>`. Where the window actually landed is
+   readable from `tako_check_health` (`display_placement`) — check it instead of
+   assuming. **Never delete the virtual display**: it is permanent by design.
+
 <!-- block: tools -->
 ## Available Tools
 

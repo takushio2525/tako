@@ -670,3 +670,49 @@ tako は public リポなので、**実ユーザー名・実ホームパス・�
 SHA-256 は総当たりで戻せるので、除去したはずの値を別の形で public リポへ置くことになる。
 CI で特定の語も見張りたいときは `TAKO_PII_TERMS`（`,` 区切り・GitHub secret 経由）で
 外から渡す。
+
+## 窓を出す検証はユーザーの画面に出さない（Issue #1141）
+
+隔離 GUI（`TAKO_ISOLATED=1` の tako-app・セルフテスト・visual-test・収録）は検証のたびに
+何度も立つ。既定のままだと**ユーザーのメイン画面の前面に窓が出て作業を妨げる**ので、
+常設の仮想ディスプレイ（既定名 `tako-vd`）へ逃がす。
+
+```sh
+scripts/lib/virtual-display.sh ensure   # 無ければ作る（冪等・消す機能は無い）
+# 以降、検証用の起動は何もしなくても tako-vd へ出る
+env -u TAKO_SOCKET -u TAKO_TOKEN -u TAKO_PANE_ID -u TERM -u COLORTERM \
+  TAKO_SELF_TEST=1 TAKO_ISOLATED=1 cargo run -p tako-app
+```
+
+- **面を指定するのは `TAKO_DISPLAY=<名前 | UUID | index>`**。`TAKO_ISOLATED` /
+  `TAKO_SELF_TEST` / `TAKO_VISUAL_TEST` のどれかが立っていれば**未指定でも** `tako-vd` を狙う
+- **通常起動は 1 ビットも変わらない**（未指定 かつ 非検証なら置き先は未解決のまま）
+- 指定が外れても**起動は止まらない**。既定の面へ落ちて persist.log に理由 + 候補が 1 行残る。
+  どこへ置いたかは `tako_check_health` の `display_placement` で読める
+- **`tako-vd` は常設。消さない**（ヘルパにも消す機能を作っていない）。ユーザーの
+  ディスプレイ構成・解像度・配置・ミラーリングにも触らない
+
+### 別 Space へ逃がすのでは代わりにならない
+
+GPUI は**窓が完全に隠れる**（他窓に覆われる / 表示中でない Space にある）と描画を止める
+（#470 の実測。同じ絵が撮れ続け、描画依存のセルフテスト項目が進まない）。退避先は
+OS から**実ディスプレイとして見える面**である必要がある。
+
+### 器（BetterDisplay）の応答は当てにしない
+
+`scripts/lib/virtual-display.sh` はこの実測に従って書いてある。器を差し替えるときも同じ:
+
+- `set -connected=on` は**「Failed.」と言いながら実際は繋がる**。`get -connected` と
+  identifiers の `displayID` も接続中に off / 0 を返す（実測）。**繋がっている = 窓を置ける**
+  なので、判定は NSScreen（`vd_screens`）を正にする
+- 接続は **tagID 指定で 1 回だけ**（`-name=` 指定は複数に当たり同じ画面が何枚も繋がりうる）。
+  tagID は操作のたびに並べ替わるので**打つ直前に引き直す**（古い tagID を使うと黙って空振る）
+- 接続直後は **macOS の配置が落ち着くまで座標が動く**（3 枚目を繋いだ直後は既存の面と
+  同じ x を返し、数秒後に本来の x へ移った）。座標が要るときは `bounds` を読み直す
+- アプリが起動していないと CLI は**応答せず固まる**（`open -g -a` してから待つ・タイムアウト必須）
+
+### 窓を増やすときは置き先を通す
+
+tako が開く窓は**全部** `centered_on_target()` を通す（メイン + 追加ビューポート +
+設定 / About / アップデート）。1 枚でも素の `Bounds::centered(None, ..)` が残ると、
+セルフテストが開く設定画面などがユーザーの画面へ飛び出す。

@@ -8,6 +8,24 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [Unreleased]
+
+- [機能追加] [macOS] 検証用 GUI をユーザーのメイン画面に出さない: 常設の仮想ディスプレイへ逃がす (#1141)
+  隔離起動・セルフテスト・visual-test の窓は、指定が無くても常設の仮想ディスプレイ
+  （既定名 `tako-vd`）へ開く。面は `TAKO_DISPLAY=<名前 | UUID | index>` でも選べる。
+  用意するのは `scripts/lib/virtual-display.sh ensure`（冪等・**消す機能は持たない**）。
+  指定が外れても起動は止まらず、理由と候補が persist.log に 1 行残り、どこへ置いたかは
+  MCP `tako_check_health` の `display_placement` で読める。**通常起動の挙動は変わらない**。
+  Keep verification GUIs off the user's screen by opening them on a standing virtual
+  display. Isolated launches, the GUI self-test and the visual test now target the
+  standing virtual display (default name `tako-vd`) without extra flags; any display can
+  be selected with `TAKO_DISPLAY=<name | uuid | index>`. Create the display with
+  `scripts/lib/virtual-display.sh ensure` (idempotent, and deliberately has no delete
+  command). A missing display never blocks startup: tako falls back to the default screen
+  and records the reason plus the candidate list, and where the window actually landed is
+  readable from `display_placement` in the `tako_check_health` MCP tool. Normal launches
+  are unaffected.
+
 ## [0.8.6] - 2026-09-05
 
 Nightly patch release (automated). Changes since v0.8.5:
