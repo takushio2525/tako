@@ -41851,6 +41851,141 @@ mod self_test {
                     .unwrap_or(false);
                 check(send_ok, "ダイアログ解消後は送信が通る (#748)");
                 wait(cx, 400).await;
+                // ⑤ **狭いペインの折り返し**（#1131）。同じダイアログを 25 桁で
+                //    描いたときの形（claude 自身が語の境界で折り返し、続きを
+                //    ラベルの列へ字下げする。実採取で裏取りした生成器の出力）。
+                //    #1131 前は選択肢は見つかるのに**ラベルが切り詰められ**、
+                //    respond のラベル一致検証と #813 の安全な選択肢の選別が静かに外れた
+                let narrow_cmd = sh.paint_and_hold(
+                    concat!(
+                        "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n",
+                        "   What do you want to\n",
+                        "   do?\n\n",
+                        "   ❯ 1. Stop and wait\n",
+                        "        for limit to\n",
+                        "        reset\n",
+                        "     2. Upgrade to Max\n",
+                        "        20x for higher\n",
+                        "        session limits\n",
+                        "        every month\n\n",
+                        "   Enter to confirm\n",
+                    ),
+                    30,
+                );
+                // 直前に Ctrl-C + clear を打っているので、プロンプトが戻るまで待つ
+                // （起動途中 / 復帰途中の PTY は打鍵を落とす。#903）
+                let _ = wait_for_pane_ready(
+                    window,
+                    cx,
+                    tako_core::PaneId::from_raw(dlg_pane),
+                    Duration::from_secs(30),
+                )
+                .await;
+                let _ = window.update(cx, |app, _, _| send(app, &narrow_cmd));
+                let mut narrow_shown = false;
+                for _ in 0..20 {
+                    wait(cx, 300).await;
+                    narrow_shown = window
+                        .update(cx, |app, _, _| {
+                            read(app)
+                                .ok()
+                                .is_some_and(|v| v["choice_dialog"].is_object())
+                        })
+                        .unwrap_or(false);
+                    if narrow_shown {
+                        break;
+                    }
+                }
+                let (narrow_kind, narrow_labels) = window
+                    .update(cx, |app, _, _| {
+                        let v = read(app).unwrap_or_default();
+                        let labels: Vec<String> = v["choice_dialog"]["options"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .map(|o| o["label"].as_str().unwrap_or_default().to_string())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        (
+                            v["choice_dialog"]["kind"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_string(),
+                            labels,
+                        )
+                    })
+                    .unwrap_or_default();
+                println!(
+                    "TAKO_SELF_TEST_1131: shown={narrow_shown} kind={narrow_kind} \
+                     labels={narrow_labels:?}"
+                );
+                check(
+                    narrow_shown && narrow_kind == "usage_limit",
+                    "102: 25 桁に折り返したダイアログでも usage_limit として分類される (#1131)",
+                );
+                check(
+                    narrow_labels
+                        == [
+                            "Stop and wait for limit to reset",
+                            "Upgrade to Max 20x for higher session limits every month",
+                        ],
+                    "102: 折り返したラベルが 80 桁と同じ 1 本へ戻る (#1131)",
+                );
+                // #813 の安全な選択肢の選別が狭幅でも同じ答えを出す
+                // （切り詰まったラベルでは「解除まで待つ」が拾えず自動復帰が空撃ちする）
+                let narrow_safe = tako_core::limit_resume::safe_choice(
+                    &narrow_labels
+                        .iter()
+                        .enumerate()
+                        .map(|(i, l)| (Some(i as u32 + 1), l.clone()))
+                        .collect::<Vec<_>>(),
+                )
+                .map(|(n, l)| (n, l.to_string()));
+                println!("TAKO_SELF_TEST_1131_SAFE: {narrow_safe:?}");
+                check(
+                    narrow_safe.as_ref().map(|(n, _)| *n) == Some(1),
+                    "102: 折り返したラベルからも「解除まで待つ」を選べる (#1131 / #813)",
+                );
+                if has_backend {
+                    let narrow_probe = window
+                        .update(cx, |app, _, _| {
+                            tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::OrchestratorRespond {
+                                    pane_id: dlg_pane,
+                                    choice: None,
+                                    caller_role: Some("selftest".into()),
+                                },
+                                PaneOrigin::Cli,
+                            )
+                        })
+                        .ok()
+                        .and_then(|r| r.ok());
+                    check(
+                        narrow_probe.as_ref().is_some_and(|v| {
+                            v["responded"] == false
+                                && v["options"].as_array().map(|o| o.len()) == Some(2)
+                                && v["options"][0]["label"] == "Stop and wait for limit to reset"
+                        }),
+                        "102: 狭幅でも respond の下見が結合済みラベルを返す (#1131)",
+                    );
+                }
+                // 後片付け（次の項目のために画面を戻す）
+                let _ = window.update(cx, |app, _, cx| {
+                    if let Some(term) = app.terminals.get(&tako_core::PaneId::from_raw(dlg_pane)) {
+                        term.write(vec![0x03]);
+                    }
+                    cx.notify();
+                });
+                wait(cx, 600).await;
+                let _ = window.update(cx, |app, _, cx| {
+                    if let Some(term) = app.terminals.get(&tako_core::PaneId::from_raw(dlg_pane)) {
+                        term.write(b"clear\r".to_vec());
+                    }
+                    cx.notify();
+                });
+                wait(cx, 400).await;
                 let _ = window.update(cx, |app, _, cx| {
                     let _ = tako_control::dispatch(
                         app,
