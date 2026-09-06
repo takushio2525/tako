@@ -899,55 +899,73 @@ fn run_bootstrap_stage(assume_yes: bool) -> Result<(), String> {
         }
     }
 
-    // 認証（ブラウザが開く。非対話では代行しない）
+    // 認証（**tako は代行しない**。理由と文面は `setup_bootstrap::auth_instructions`。#1129）
+    //
+    // 修正前はここで `claude auth login` を起こして `.status()` で待っていた。
+    // ブラウザ操作待ちのプロセスは自分では終わらないので、実機（Windows）では
+    // セルフテストが打ち込む `tako setup` 経由で 1 日 46 本まで積み上がり、
+    // インスタンスを閉じても孫が回収されず CPU が 100% に張り付いた（#1129）。
     let state = setup_bootstrap::status()?;
     if state.step == Step::Auth {
-        let binary = state
-            .binary
-            .clone()
-            .ok_or("claude コマンドを解決できません")?;
         eprintln!();
         eprintln!("  [3/3] {}", Step::Auth.describe());
-        let interactive = !assume_yes && std::io::IsTerminal::is_terminal(&std::io::stdin());
-        if !interactive {
-            return Err(
-                "Claude アカウントへのログインが必要です。\n\
-                 ブラウザでの操作が要るため自動化できません。\n\
-                 `claude auth login` を実行してログインしてから `tako setup` をやり直してください"
-                    .to_string(),
-            );
+        if setup_bootstrap::legacy_auth_launch() {
+            // `TAKO_1129_LEGACY=1` で修正前へ戻す（同一バイナリで A/B を取る逃げ道）
+            legacy_launch_auth_login(&state, assume_yes)?;
+        } else {
+            return Err(setup_bootstrap::auth_instructions().join("\n"));
         }
-        eprintln!("  ブラウザが開きます。画面の指示にしたがってログインしてください");
-        eprintln!();
-        let status = tako_core::platform::process::no_console_window(
-            &mut std::process::Command::new(&binary),
-        )
-        .args(["auth", "login"])
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .status()
-        .map_err(|e| format!("[3/3] claude auth login を起動できません: {e}"))?;
-        if !status.success() {
-            return Err(format!(
-                "[3/3] ログインが完了しませんでした（exit {}）。\n\
-                 `claude auth login` を自分で実行してから `tako setup` をやり直してください",
-                status.code().unwrap_or(-1)
-            ));
-        }
-        // 「起動した」ではなく「ログインできた」ことを確かめてから次へ進む
-        if !setup_bootstrap::is_authenticated(&binary) {
-            return Err("[3/3] ログインを確認できませんでした。\n\
-                 `claude auth status` で状態を確認し、必要なら `claude auth login` を\
-                 やり直してから `tako setup` を再実行してください"
-                .to_string());
-        }
-        eprintln!("  [OK] ログインしました");
     }
 
     eprintln!();
     eprintln!("  導入が完了しました。続けて設定を行います");
     eprintln!();
+    Ok(())
+}
+
+/// `TAKO_1129_LEGACY=1` のときだけ通る修正前の認証段（#1129 の A/B 用）。
+///
+/// **製品の既定経路ではない**。`claude auth login` を起こして待つので、
+/// ブラウザ操作が完了しない環境では戻ってこず、Windows では
+/// インスタンス終了後も孤児として残る（それが #1129 の症状）
+fn legacy_launch_auth_login(
+    state: &tako_control::setup_bootstrap::BootstrapState,
+    assume_yes: bool,
+) -> Result<(), String> {
+    let binary = state
+        .binary
+        .clone()
+        .ok_or("claude コマンドを解決できません")?;
+    let interactive = !assume_yes && std::io::IsTerminal::is_terminal(&std::io::stdin());
+    if !interactive {
+        return Err(setup_bootstrap::auth_instructions().join("\n"));
+    }
+    eprintln!("  ブラウザが開きます。画面の指示にしたがってログインしてください");
+    eprintln!();
+    let status =
+        tako_core::platform::process::no_console_window(&mut std::process::Command::new(&binary))
+            // watchdog-allow: #1129 の A/B 用。製品の既定経路はここを通らない
+            .args(["auth", "login"])
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()
+            .map_err(|e| format!("[3/3] claude auth login を起動できません: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "[3/3] ログインが完了しませんでした（exit {}）。\n{}",
+            status.code().unwrap_or(-1),
+            setup_bootstrap::auth_instructions().join("\n")
+        ));
+    }
+    // 「起動した」ではなく「ログインできた」ことを確かめてから次へ進む
+    if !setup_bootstrap::is_authenticated(&binary) {
+        return Err(format!(
+            "[3/3] ログインを確認できませんでした。\n{}",
+            setup_bootstrap::auth_instructions().join("\n")
+        ));
+    }
+    eprintln!("  [OK] ログインしました");
     Ok(())
 }
 
