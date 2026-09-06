@@ -10126,6 +10126,10 @@ fn check_health(host: &dyn ControlHost) -> Value {
                 "name": d.name,
                 "uuid": d.uuid,
                 "primary": d.primary,
+                // 解決した時点の矩形（窓がここへ開いたかを GUI 無しで突き合わせられる）
+                "rect": d.rect.map(|r| json!({
+                    "x": r.x, "y": r.y, "width": r.width, "height": r.height,
+                })),
             })),
             "matched_by": p.matched_by.map(tako_core::platform::display::MatchKind::as_str),
             "reason": p.reason,

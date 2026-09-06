@@ -22850,6 +22850,17 @@ fn resolve_target_display(cx: &App) -> Option<gpui::DisplayId> {
                     .find(|(nid, _)| *nid == id)
                     .map(|(_, n)| n.clone()),
                 primary: primary == Some(id),
+                // **解決した時点の矩形**を持ち回る（あとから `cx.displays()` を引き直すと
+                // ディスプレイスリープや配置変更で空・別値になり得る。#1141 で実測）
+                rect: {
+                    let b = d.bounds();
+                    Some(disp::DisplayRect {
+                        x: f32::from(b.origin.x),
+                        y: f32::from(b.origin.y),
+                        width: f32::from(b.size.width),
+                        height: f32::from(b.size.height),
+                    })
+                },
             }
         })
         .collect();
@@ -61588,6 +61599,9 @@ mod self_test {
                         "144: tako がエージェント CLI を自分の子として起こしていない \
                          (#1129) leaked={detail:?}"
                     ),
+                );
+            }
+
             // 145. 検証用 GUI の窓がユーザーのメイン画面に出ていない（#1141）。
             //      セルフテストは `TAKO_SELF_TEST` が立っているので、指定が無くても
             //      常設の仮想ディスプレイ（tako-vd）を狙う。**「狙った」ではなく
@@ -61615,35 +61629,28 @@ mod self_test {
                         placement.requested,
                     ),
                 );
-                let inside = match placement.resolved.as_ref() {
-                    Some(target) => {
-                        // 解決した = その面の矩形の中に窓が開いているはず
-                        let win = cx
-                            .update(|cx| {
-                                let bounds = any.update(cx, |_, window, _| window.bounds()).ok();
-                                let screen = cx
-                                    .displays()
-                                    .into_iter()
-                                    .find(|d| u64::from(d.id()) == target.id)
-                                    .map(|d| d.bounds());
-                                (bounds, screen)
-                            });
+                let inside = match placement.resolved.as_ref().and_then(|t| t.rect) {
+                    Some(scr) => {
+                        // 解決した = その面の矩形の中に窓が開いているはず。突き合わせ先は
+                        // **解決した時点に記録した矩形**（`cx.displays()` を引き直すと
+                        // ディスプレイスリープで空になり、黙って弱い検査へ落ちる = 実測）
+                        let win =
+                            cx.update(|cx| any.update(cx, |_, window, _| window.bounds()).ok());
                         match win {
-                            (Some(w), Some(scr)) => {
-                                let ok = w.origin.x >= scr.origin.x
-                                    && w.origin.y >= scr.origin.y
-                                    && w.origin.x + w.size.width
-                                        <= scr.origin.x + scr.size.width
-                                    && w.origin.y + w.size.height
-                                        <= scr.origin.y + scr.size.height;
+                            Some(w) => {
+                                let ok = scr.contains(
+                                    f32::from(w.origin.x),
+                                    f32::from(w.origin.y),
+                                    f32::from(w.size.width),
+                                    f32::from(w.size.height),
+                                );
                                 println!(
-                                    "TAKO_SELF_TEST_1141_RECT: window={:?} screen={:?} inside={ok}",
-                                    w, scr
+                                    "TAKO_SELF_TEST_1141_RECT: window={w:?} screen={scr:?} inside={ok}"
                                 );
                                 Some(ok)
                             }
-                            other => {
-                                println!("TAKO_SELF_TEST_1141_RECT: 取れない {other:?}");
+                            None => {
+                                println!("TAKO_SELF_TEST_1141_RECT: 窓の矩形が取れない");
                                 None
                             }
                         }

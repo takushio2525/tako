@@ -46,8 +46,35 @@ pub const ENV_DISPLAY: &str = "TAKO_DISPLAY";
 /// 名前引きにかける時間の上限。超えたら名前無しで進む（起動を待たせない）
 const NAME_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 
+/// ディスプレイの矩形（論理ピクセル。左上原点のグローバル座標）。
+///
+/// **解決した時点の値を持ち回る**のが要点。あとから `cx.displays()` を引き直すと、
+/// ディスプレイスリープや配置変更で空・別値になり得る（#1141 で実測: セルフテストの
+/// 突き合わせが「面が見つからない」で黙って弱い検査へ落ちた）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DisplayRect {
+    /// 左端
+    pub x: f32,
+    /// 上端
+    pub y: f32,
+    /// 幅
+    pub width: f32,
+    /// 高さ
+    pub height: f32,
+}
+
+impl DisplayRect {
+    /// 指定の矩形がこの面に収まっているか（境界を含む）
+    pub fn contains(&self, x: f32, y: f32, width: f32, height: f32) -> bool {
+        x >= self.x
+            && y >= self.y
+            && x + width <= self.x + self.width
+            && y + height <= self.y + self.height
+    }
+}
+
 /// 選択の候補 1 枚。呼び出し側（tako-app）が GPUI の `cx.displays()` から組む
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DisplayCandidate {
     /// `cx.displays()` の並び順（0 始まり）。`TAKO_DISPLAY=1` の 1 はこれ
     pub index: usize,
@@ -59,6 +86,8 @@ pub struct DisplayCandidate {
     pub name: Option<String>,
     /// 主ディスプレイ（メニューバーのある面）か
     pub primary: bool,
+    /// 解決した時点のこの面の矩形（取れなければ `None`）
+    pub rect: Option<DisplayRect>,
 }
 
 impl DisplayCandidate {
@@ -76,7 +105,7 @@ impl DisplayCandidate {
 }
 
 /// 指定をどう解釈したか。`Selected` 以外は呼び出し側が既定動作へ落ちる
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Selection {
     /// 指定が無い（`TAKO_DISPLAY` 未設定 かつ 隔離既定にも当たらない）
     NotRequested,
@@ -192,7 +221,7 @@ pub fn select(spec: &str, candidates: &[DisplayCandidate]) -> Selection {
 }
 
 /// 起動時に決めた配置。`tako_check_health` が読む（設計原則 5: AI から状態が読める）
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Placement {
     /// 指定文字列（無指定なら `None`）
     pub requested: Option<String>,
@@ -344,6 +373,12 @@ mod tests {
             uuid: uuid.map(String::from),
             name: name.map(String::from),
             primary: index == 0,
+            rect: Some(DisplayRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1512.0,
+                height: 982.0,
+            }),
         }
     }
 
@@ -503,6 +538,25 @@ mod tests {
         }
         // どれでもない = 通常起動
         assert!(!is_verification_gui(None, false, false));
+    }
+
+    #[test]
+    fn 矩形の内外判定は境界を含む() {
+        let r = DisplayRect {
+            x: 1512.0,
+            y: 0.0,
+            width: 2560.0,
+            height: 1440.0,
+        };
+        // 実測値（#1141: tako-vd の中央へ開いた窓）
+        assert!(r.contains(2312.0, 420.0, 960.0, 600.0));
+        // 面の左上・右下にぴったり接する = 収まっている
+        assert!(r.contains(1512.0, 0.0, 2560.0, 1440.0));
+        // 1px でもはみ出したら外
+        assert!(!r.contains(1511.0, 0.0, 960.0, 600.0), "左へはみ出す");
+        assert!(!r.contains(1512.0, 841.0, 960.0, 600.0), "下へはみ出す");
+        // メイン画面に開いた窓（#1141 の「外した」実測値）は tako-vd の外
+        assert!(!r.contains(276.0, 191.0, 960.0, 600.0));
     }
 
     /// 当たっても外れても 1 行残る（診断の入口）
