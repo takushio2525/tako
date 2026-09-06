@@ -8,6 +8,19 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.8.6] - 2026-09-05
+
+Nightly patch release (automated). Changes since v0.8.5:
+夜間パッチリリース（自動）。v0.8.5 以降の変更:
+
+- [修正] 実行ペインをユーザーの対話シェル環境で起こし、失敗しても消さない (#1031) (#1134)
+- [修正] ペイン幅で折り返された上限の見出しを結合してから判定する (#1123) (#1130)
+- [修正] git が返すリポジトリルートの区切りを OS の表記へ寄せる: セルフテスト項目 135 が Windows で落ちる問題を根治 (#1102) (#1128)
+- [修正] ctx% の取得元を「画面 → transcript → none」の 3 層にして ctx% 依存機能を復活させる (#1021) (#1125)
+- [機能追加] 設定画面のプロファイルタブに起動フォルダ（cwd）の行を追加する (#1119) (#1121)
+- [修正] visual-test の terminal-grid が器つき / スケール 1 で落ちる 2 つの前提穴を根治 (#943) (#1120)
+- [改善] 器へ書くバックエンド設定を能力で出し分け、psmux の設定警告 4 行を消す (#974) (#1118)
+
 ## [0.8.5] - 2026-09-04
 
 Nightly patch release (automated). Changes since v0.8.4:

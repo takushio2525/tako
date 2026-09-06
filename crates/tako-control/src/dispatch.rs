@@ -643,10 +643,19 @@ fn dispatch_inner(
                 )
                 .map_err(op_err)?;
             let options = SpawnOptions {
-                command: command.filter(|c| !c.is_empty()).map(|mut c| SpawnCommand {
-                    program: c.remove(0),
-                    args: c,
-                }),
+                // #1031: 明示コマンドのペインは「コマンド終了 = close」なので、起動に
+                // 失敗すると数秒で消えて理由が残らなかった。**失敗したときだけ**
+                // 終了コード（実行ペインと同じ `__TAKO_EXIT=` マーカー）+ 案内を出して
+                // 止める形に包む。成功時は従来どおり即 close
+                command: command
+                    .filter(|c| !c.is_empty())
+                    .map(|mut c| SpawnCommand {
+                        program: c.remove(0),
+                        args: c,
+                    })
+                    .map(|c| {
+                        tako_core::platform::shell::hold_on_failure_command(c, EXIT_MARKER_PREFIX)
+                    }),
                 // cwd 未指定なら分割元ペインの cwd（OSC 7 通知）を継承する。
                 // ssh 先などローカルに存在しないパスは無視しホーム既定に任せる
                 cwd: cwd.map(Into::into).or_else(|| {
@@ -19419,6 +19428,76 @@ mod tests {
             (&want.program, &want.args),
             "実行ペインの起動コマンドが境界の出力と食い違う"
         );
+    }
+
+    /// #1031: `tako split --command` のペインは「コマンド終了 = close」なので、
+    /// 起動に失敗すると数秒で消えて理由がどこにも残らなかった。境界の
+    /// `hold_on_failure_command` を通す = 失敗したときだけ終了コードを出して止まる
+    #[test]
+    fn splitのコマンドは失敗時に止まる形で包まれる() {
+        let mut host = MockHost::new();
+        let root = host.ws.active_tab().tree().focused();
+        let result = dispatch(
+            &mut host,
+            Request::Split {
+                pane: Some(root.as_u64()),
+                tab: None,
+                direction: None,
+                ratio: None,
+                command: Some(vec!["npm".into(), "run".into(), "dev".into()]),
+                cwd: None,
+                focus: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        let pane_id = result["pane"].as_u64().unwrap();
+        let opts = host.attached_options.get(&pane_id).expect("options 記録");
+        let cmd = opts.command.as_ref().expect("command が設定されている");
+        // 境界の出力と 1 バイトも食い違わない（接頭辞は読む側と同じ定数から採る）
+        let want = tako_core::platform::shell::hold_on_failure_command(
+            SpawnCommand {
+                program: "npm".into(),
+                args: vec!["run".into(), "dev".into()],
+            },
+            EXIT_MARKER_PREFIX,
+        );
+        assert_eq!(
+            (&cmd.program, &cmd.args),
+            (&want.program, &want.args),
+            "split の起動コマンドが境界の出力と食い違う"
+        );
+        #[cfg(unix)]
+        {
+            let sh_code = cmd.args.get(1).expect("-c の引数");
+            assert!(sh_code.starts_with("npm run dev; "), "{sh_code}");
+            assert!(sh_code.contains("__TAKO_EXIT="), "{sh_code}");
+        }
+    }
+
+    /// コマンド無しの split は素のシェル（`command: None`）のまま。
+    /// 包みが無条件に掛かると、ただの分割まで `/bin/sh` 起動へ化ける
+    #[test]
+    fn コマンド無しのsplitは包まれない() {
+        let mut host = MockHost::new();
+        let root = host.ws.active_tab().tree().focused();
+        let result = dispatch(
+            &mut host,
+            Request::Split {
+                pane: Some(root.as_u64()),
+                tab: None,
+                direction: None,
+                ratio: None,
+                command: None,
+                cwd: None,
+                focus: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        let pane_id = result["pane"].as_u64().unwrap();
+        let opts = host.attached_options.get(&pane_id).expect("options 記録");
+        assert!(opts.command.is_none(), "command={:?}", opts.command);
     }
 
     #[test]
