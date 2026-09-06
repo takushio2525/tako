@@ -26,14 +26,24 @@ pub struct Item {
     pub imported_by: Option<String>,
 }
 
-/// ホームを `~` へ畳んだ表示用パス（個人情報を応答へ出さない。#927）
+/// ホームを `~` へ畳んだ表示用パス（個人情報を応答へ出さない。#927）。
+///
+/// **前方一致だけでは足りない**: claude のメモリは cwd を `/` → `-` へ潰した
+/// スラグ（`-Users-<名前>-dev-tako`）をパスの**途中**に持つので、畳んだ後も
+/// ユーザー名が残る。同じ潰し方をしたホームも併せて置き換える
 fn display_path(p: &Path) -> String {
-    match tako_core::paths::home_dir() {
-        Some(home) => match p.strip_prefix(&home) {
-            Ok(rest) => format!("~/{}", rest.display()),
-            Err(_) => p.display().to_string(),
-        },
-        None => p.display().to_string(),
+    let Some(home) = tako_core::paths::home_dir() else {
+        return p.display().to_string();
+    };
+    let shown = match p.strip_prefix(&home) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => p.display().to_string(),
+    };
+    let dashed = home.display().to_string().replace(['/', '\\'], "-");
+    if dashed.len() > 1 {
+        shown.replace(&dashed, "-~")
+    } else {
+        shown
     }
 }
 
@@ -563,6 +573,30 @@ mod tests {
             classify(Path::new("/tmp/other.md"), "# x\n"),
             ItemKind::Imported
         );
+    }
+
+    #[test]
+    fn 表示用パスはスラグの中のホームも畳む() {
+        // claude のメモリは cwd を `/` → `-` へ潰したスラグをパスの途中に持つので、
+        // 前方一致で `~` にするだけではユーザー名が残る（実測で踏んだ）
+        let Some(home) = tako_core::paths::home_dir() else {
+            return;
+        };
+        let dashed = home.display().to_string().replace(['/', '\\'], "-");
+        let p = home.join(format!(
+            ".claude/projects/{dashed}-dev-tako/memory/MEMORY.md"
+        ));
+        let shown = display_path(&p);
+        let user = home
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        assert!(!user.is_empty());
+        assert!(
+            !shown.contains(&user),
+            "表示用パスにユーザー名が残っている: {shown}"
+        );
+        assert!(shown.starts_with("~/.claude/projects/"));
     }
 
     #[test]
