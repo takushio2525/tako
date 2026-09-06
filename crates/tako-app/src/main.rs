@@ -62034,6 +62034,218 @@ mod self_test {
                 );
             }
 
+            // --- 項目 146: プロファイル既定の自動復帰が master / solo 本人へ配られる（#1140） ---
+            //
+            // #822 はこの設定を「spawn した worker」にだけ配っていたので、**master が
+            // 上限で止まると人が気づくまで止まったまま**だった。`tako master` /
+            // `tako solo` / リモートからの master 起動（#1078）はどれも起動コマンドを
+            // 流す前に `Request::Title` で role を貼るので、その 1 か所を本番経路として
+            // 叩く（claude を起こさずに済むぶん、判定が起動タイミングに揺らされない）。
+            //
+            // 隔離: プロファイルの置き場は `TAKO_ORCHESTRATOR_DIR`（#658 でセルフテストの
+            // 既定隔離に入っている）なので、本番の profiles/ には触れない
+            {
+                let odir = tako_control::orchestrator::config_dir()
+                    .unwrap_or_else(|| fail("146: orchestrator の設定ディレクトリが取れない (#1140)"));
+                let on146 = "st1140-on";
+                let off146 = "st1140-off";
+                let write146 = |dir: &str, name: &str, body: &str| {
+                    let d = odir.join(dir);
+                    if std::fs::create_dir_all(&d).is_err()
+                        || std::fs::write(d.join(format!("{name}.yaml")), body).is_err()
+                    {
+                        fail("146: 検証用プロファイルを書けない (#1140)");
+                    }
+                };
+                write146("profiles", on146, "effort: high\nlimit_resume: true\n");
+                write146("profiles", off146, "effort: high\n");
+                write146("solo-profiles", on146, "effort: high\nlimit_resume: true\n");
+
+                // この項目専用のタブで完結させる（項目 143 と同じ手）
+                let made146 = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        let made = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::TabNew {
+                                title: Some("st1140".into()),
+                                focus: Some(true),
+                                cwd: None,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                        for (p, options) in std::mem::take(&mut app.pending_attach) {
+                            if app.spawn_session(p, options, cx).is_err() {
+                                app.remove_pane(p, cx);
+                            }
+                        }
+                        cx.notify();
+                        match made {
+                            Ok(v) => match (v["pane"].as_u64(), v["tab"].as_u64()) {
+                                (Some(p), Some(t)) => Ok((p, t)),
+                                _ => Err(format!("tab new の応答: {v}")),
+                            },
+                            Err(e) => Err(format!("tab new: {e}")),
+                        }
+                    })
+                    .unwrap_or_else(|e| Err(format!("window.update: {e}")));
+                let (term146, _tab146) = match made146 {
+                    Ok(v) => v,
+                    Err(why) => fail(&format!("146: 検証用タブを作れない (#1140。{why})")),
+                };
+
+                let split146 = |cx: &mut AsyncApp| -> u64 {
+                    window
+                        .update(cx, |app: &mut TakoApp, _, cx| {
+                            let made = tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::Split {
+                                    pane: Some(term146),
+                                    tab: None,
+                                    direction: None,
+                                    ratio: None,
+                                    command: None,
+                                    cwd: None,
+                                    focus: Some(false),
+                                },
+                                PaneOrigin::Cli,
+                            );
+                            for (p, options) in std::mem::take(&mut app.pending_attach) {
+                                if app.spawn_session(p, options, cx).is_err() {
+                                    app.remove_pane(p, cx);
+                                }
+                            }
+                            cx.notify();
+                            made.ok().and_then(|v| v["pane"].as_u64())
+                        })
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| fail("146: 検証用ペインを分割できない (#1140)"))
+                };
+                let off_pane146 = split146(cx);
+                let solo_pane146 = split146(cx);
+                let worker_pane146 = split146(cx);
+
+                // 本番経路そのまま: role を貼る → ペイン単位の状態を読む
+                let role146 = |cx: &mut AsyncApp, pane: u64, role: &str| {
+                    let r = window
+                        .update(cx, |app: &mut TakoApp, _, _| {
+                            tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::Title {
+                                    pane: Some(pane),
+                                    title: None,
+                                    role: Some(role.to_string()),
+                                },
+                                PaneOrigin::Cli,
+                            )
+                            .err()
+                            .map(|e| e.to_string())
+                        })
+                        .ok()
+                        .flatten();
+                    if let Some(e) = r {
+                        fail(&format!("146: role を貼れない (#1140。{e})"));
+                    }
+                };
+                let resume146 = |cx: &mut AsyncApp, pane: u64| -> bool {
+                    window
+                        .update(cx, |app: &mut TakoApp, _, _| {
+                            tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::LimitResume {
+                                    pane: Some(pane),
+                                    enabled: None,
+                                    all: None,
+                                },
+                                PaneOrigin::Cli,
+                            )
+                            .ok()
+                            .and_then(|v| v["enabled"].as_bool())
+                        })
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| fail("146: 自動復帰の状態を読めない (#1140)"))
+                };
+
+                role146(cx, term146, &format!("orchestrator-master:{on146}"));
+                role146(cx, off_pane146, &format!("orchestrator-master:{off146}"));
+                role146(cx, solo_pane146, &format!("solo:{on146}"));
+                // worker の role は master 側の配布に巻き込まない
+                // （#822 の解決順 = spawn 引数が最優先、をここで踏み潰さない）
+                role146(cx, worker_pane146, &format!("orchestrator-worker:{on146}"));
+
+                let (a146, b146, c146, d146) = (
+                    resume146(cx, term146),
+                    resume146(cx, off_pane146),
+                    resume146(cx, solo_pane146),
+                    resume146(cx, worker_pane146),
+                );
+                println!(
+                    "TAKO_SELF_TEST_1140: master_on={a146} master_off={b146} \
+                     solo_on={c146} worker={d146} legacy={}",
+                    std::env::var_os("TAKO_1140_LEGACY").is_some()
+                );
+                check(
+                    a146,
+                    "146: プロファイル ON の master 本人が起動直後から自動復帰 ON (#1140)",
+                );
+                check(
+                    !b146,
+                    "146: プロファイル未設定の master は OFF のまま (#1140)",
+                );
+                check(
+                    c146,
+                    "146: プロファイル ON の solo 本人が起動直後から自動復帰 ON (#1140)",
+                );
+                check(!d146, "146: worker の role へは master 経路が配らない (#1140)");
+
+                // 人が ON にしたペインを role の貼り直しで OFF へ戻さない
+                // （#813 のペイン単位オプトインを壊さないことがこの経路の不変条件）
+                let kept146 = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::LimitResume {
+                                pane: Some(off_pane146),
+                                enabled: Some(true),
+                                all: None,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                    })
+                    .is_ok();
+                check(kept146, "146: 手動 ON の設定に失敗 (#1140)");
+                role146(cx, off_pane146, &format!("orchestrator-master:{off146}"));
+                check(
+                    resume146(cx, off_pane146),
+                    "146: 手で ON にしたペインが role の貼り直しで OFF へ戻った (#1140)",
+                );
+
+                // 後片付け（検証用ペインと検証用プロファイル）。
+                // 4 枚とも閉じるとこの項目専用タブごと畳まれる
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                    for pane in [worker_pane146, solo_pane146, off_pane146, term146] {
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Close {
+                                pane: Some(pane),
+                                force: true,
+                                caller_role: None,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                    }
+                    cx.notify();
+                });
+                for (dir, name) in [
+                    ("profiles", on146),
+                    ("profiles", off146),
+                    ("solo-profiles", on146),
+                ] {
+                    let _ = std::fs::remove_file(odir.join(dir).join(format!("{name}.yaml")));
+                }
+            }
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);

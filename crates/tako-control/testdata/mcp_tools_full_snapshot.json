@@ -1891,7 +1891,7 @@
           "type": "boolean"
         },
         "clear_limit_resume": {
-          "description": "limit_resume の指定を解除して既定（無効）へ戻す（set 時。#822）",
+          "description": "limit_resume の指定を解除して既定（無効）へ戻す（set 時。#822 / #1140）",
           "type": "boolean"
         },
         "clear_master_account": {
@@ -1963,7 +1963,7 @@
           "type": "string"
         },
         "limit_resume": {
-          "description": "このプロファイルから spawn した worker ペインで利用上限後の自動復帰（5h / 週次上限のリセット後に tako が再開させる）を既定 ON にする（既定 false。set 時。#822）。spawn 側の limit_resume が指定されていればそちらが勝つ",
+          "description": "このプロファイルで立つペインで利用上限後の自動復帰（5h / 週次上限のリセット後に tako が再開させる）を既定 ON にする（既定 false。set 時）。効く先は tako master / tako solo 本人のペインと引き継ぎの後任 master（#1140）と、このプロファイルから spawn した worker（#822。spawn 側の limit_resume が指定されていればそちらが勝つ）。実効値は応答の resolved_master_limit_resume（本人）と resolved_limit_resume（worker）に返る",
           "type": "boolean"
         },
         "master_account": {

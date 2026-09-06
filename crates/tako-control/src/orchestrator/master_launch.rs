@@ -50,6 +50,10 @@ pub struct MasterLaunchPlan {
     pub model_label: String,
     /// effort
     pub effort: String,
+    /// 利用上限後の自動復帰（#813）をこの master のペインへ配るか（#1140。既定 false）。
+    /// **適用するのは role を貼る dispatch 側**（`Request::Title`）なので、ここは
+    /// 「起動した時点でどうなったか」を応答へ載せるための値
+    pub limit_resume: bool,
     /// プロファイルが Remote Control を opt-in しているか（#1068。既定 false）
     pub remote_control_opt_in: bool,
     /// Remote Control（#1068）の決定。**opt-in していても環境が不適格ならフラグは付かない**
@@ -69,6 +73,7 @@ impl MasterLaunchPlan {
             "model": self.model_label,
             "effort": self.effort,
             "cwd": self.cwd.as_ref().map(|p| p.display().to_string()),
+            "limit_resume": self.limit_resume,
             "remote_control": self.remote_control_json(),
         })
     }
@@ -155,6 +160,7 @@ pub fn plan(profile_name: &str) -> Result<MasterLaunchPlan, String> {
         agent,
         model_label: profile.master_model_label(),
         effort: profile.effort.clone(),
+        limit_resume: orchestrator::resolve_master_limit_resume(&profile),
         remote_control_opt_in: profile.remote_control_enabled(),
         remote_control,
     })
@@ -222,6 +228,7 @@ mod tests {
             agent: orchestrator::WorkerAgent::Claude,
             model_label: "CLI 既定".into(),
             effort: "high".into(),
+            limit_resume: false,
             remote_control_opt_in: false,
             remote_control: crate::claude_remote::RemoteControlDecision::off(),
         };

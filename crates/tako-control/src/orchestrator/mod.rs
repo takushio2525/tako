@@ -247,6 +247,51 @@ pub fn resolve_worker_limit_resume(profile: &Profile, spawn_override: Option<boo
     spawn_override.or(profile.limit_resume).unwrap_or(false)
 }
 
+/// master / solo **本人**のペインに適用する利用上限後の自動復帰（FR-2.27 / #813）の
+/// 既定値（Issue #1140）。
+///
+/// #822 はこの設定を「そのプロファイルから spawn した worker」にだけ配っていたので、
+/// **master 自身が上限で止まると人が気づくまで止まったまま**だった（実運用の 8 代目
+/// master で実測。master が自分のペインへ `tako limit-resume on --pane <自分>` を手で
+/// 打ち、後任へ引き継ぎで申し送るしか手が無かった）。
+///
+/// 解決順は **プロファイル → false**（master / solo には spawn 引数に相当する入口が
+/// 無いので 2 段。既定 OFF は #813 のペイン単位オプトインを崩さないため）。
+///
+/// `TAKO_1140_LEGACY=1` で #1140 前（worker にだけ配る）へ戻る
+pub fn resolve_master_limit_resume(profile: &Profile) -> bool {
+    if master_limit_resume_legacy() {
+        return false;
+    }
+    profile.limit_resume.unwrap_or(false)
+}
+
+/// A/B 用（#1140 前の挙動 = master / solo 本人には配らない）
+fn master_limit_resume_legacy() -> bool {
+    std::env::var_os("TAKO_1140_LEGACY").is_some()
+}
+
+/// ペインの role から「master / solo **本人**へ配る自動復帰の既定」を解く（Issue #1140）。
+///
+/// role を貼る経路（`tako master` / `tako solo` の `Request::Title`・引き継ぎの後任・
+/// 会話を引き継いだ再起動）が**すべてここを通る**ので、master 起動の入口が増えても
+/// 配り忘れが起きない。worker の role・role なし・読めないプロファイルはすべて false
+/// （黙って既定へ落ちる = 設定が壊れていても起動そのものは止めない）。
+///
+/// 解釈は `ProfileHint::from_role`（daemon / dispatch が共有する 1 実装）を通す
+pub fn master_pane_limit_resume(role: &str) -> bool {
+    let profile = match crate::claude_remote_link::ProfileHint::from_role(role) {
+        crate::claude_remote_link::ProfileHint::Master(name) => {
+            Profile::load(name.unwrap_or("default")).unwrap_or_default()
+        }
+        crate::claude_remote_link::ProfileHint::Solo(name) => {
+            load_solo_profile(name.unwrap_or("default")).unwrap_or_else(|_| solo_default_profile())
+        }
+        crate::claude_remote_link::ProfileHint::Unknown => return false,
+    };
+    resolve_master_limit_resume(&profile)
+}
+
 /// `~` を `$HOME` に展開する
 pub fn expand_tilde(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
@@ -787,11 +832,15 @@ pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_handoff: Option<bool>,
 
-    /// このプロファイルから spawn した worker ペインで利用上限後の自動復帰
-    /// （FR-2.27 / #813）を既定 ON にするか（Issue #822。省略時 false = 従来どおり
-    /// ペイン単位のオプトイン）。spawn 引数（`limit_resume`）が指定されていれば
-    /// そちらが勝つ。solo プロファイルは worker を spawn しないため効果がない
-    /// （`profile_to_json` が警告を返す）
+    /// このプロファイルで立つペインで利用上限後の自動復帰（FR-2.27 / #813）を
+    /// 既定 ON にするか（Issue #822 / #1140。省略時 false = 従来どおりペイン単位の
+    /// オプトイン）。
+    ///
+    /// 効く先は **`tako master` / `tako solo` 本人のペインと引き継ぎの後任 master**
+    /// （#1140。解決は [`resolve_master_limit_resume`]）と、**このプロファイルから
+    /// spawn した worker**（#822。解決は [`resolve_worker_limit_resume`] で、
+    /// spawn 引数が指定されていればそちらが勝つ）。solo プロファイルは worker を
+    /// spawn しないので、効く先は本人のペインだけ（`profile_to_json` が注意を返す）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit_resume: Option<bool>,
 
@@ -4605,6 +4654,75 @@ worker_agents:
         };
         assert!(!resolve_worker_limit_resume(&explicit_off, None));
         assert!(resolve_worker_limit_resume(&explicit_off, Some(true)));
+    }
+
+    /// #1140: 同じ `limit_resume` が master / solo **本人**のペインにも配られる。
+    /// 解決順は プロファイル → false（master に spawn 引数は無い）。
+    /// **`TAKO_1140_LEGACY=1` の A/B ではこのテストが落ちる**（= 検出力）
+    #[test]
+    fn masterの自動復帰はプロファイル既定から決まる() {
+        assert!(!resolve_master_limit_resume(&Profile::default()));
+        assert!(resolve_master_limit_resume(&Profile {
+            limit_resume: Some(true),
+            ..Default::default()
+        }));
+        assert!(!resolve_master_limit_resume(&Profile {
+            limit_resume: Some(false),
+            ..Default::default()
+        }));
+        // #822 の worker 側は 3 段のまま（spawn 引数が最優先）= 解決順を混ぜない
+        let on = Profile {
+            limit_resume: Some(true),
+            ..Default::default()
+        };
+        assert!(!resolve_worker_limit_resume(&on, Some(false)));
+        assert!(resolve_master_limit_resume(&on));
+    }
+
+    /// #1140: role からの解決は「master / solo だけ」。worker の role や role なしは
+    /// 触らない（ここが緩むと worker の spawn 引数による明示 OFF を踏み潰す）
+    #[test]
+    fn 自動復帰の配布先はmasterとsoloのroleだけ() {
+        let dir = config_dir().expect("テストは隔離先を返す");
+        let _ = std::fs::create_dir_all(dir.join("profiles"));
+        let _ = std::fs::create_dir_all(dir.join("solo-profiles"));
+        let name = "issue1140-on";
+        std::fs::write(
+            dir.join("profiles").join(format!("{name}.yaml")),
+            "effort: high\nlimit_resume: true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("solo-profiles").join(format!("{name}.yaml")),
+            "effort: medium\nlimit_resume: true\n",
+        )
+        .unwrap();
+        // master は表示用 role（`orchestrator-master:<名前>`）と env 用（`master:<名前>`）の
+        // 2 語彙があり、どちらから来ても同じ答えになる（#761 の語彙分裂を持ち込まない）
+        assert!(master_pane_limit_resume(&format!(
+            "orchestrator-master:{name}"
+        )));
+        assert!(master_pane_limit_resume(&format!("master:{name}")));
+        assert!(master_pane_limit_resume(&format!("solo:{name}")));
+        // worker / role なし / 未登録プロファイルは配らない
+        assert!(!master_pane_limit_resume(&format!(
+            "orchestrator-worker:{name}"
+        )));
+        assert!(!master_pane_limit_resume(""));
+        assert!(!master_pane_limit_resume(
+            "orchestrator-master:この名前のプロファイルは無い-1140"
+        ));
+
+        // 明示 OFF のプロファイルは配らない（既定へ落ちるのではなく OFF が効く）
+        let off = "issue1140-off";
+        std::fs::write(
+            dir.join("profiles").join(format!("{off}.yaml")),
+            "effort: high\nlimit_resume: false\n",
+        )
+        .unwrap();
+        assert!(!master_pane_limit_resume(&format!(
+            "orchestrator-master:{off}"
+        )));
     }
 
     /// 既定値は YAML へ書き出さない（設定ファイルを汚さない）。

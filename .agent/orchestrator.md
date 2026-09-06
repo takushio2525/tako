@@ -603,14 +603,19 @@ permission ダイアログ・plan 確認・API エラー・普通の idle では
 MCP は `tako_limit_resume` が 1:1 対応。`tako list` / `tako read` /
 `tako orchestrator worker-status` にも状態が載る。
 
-### spawn した worker へ既定で効かせる（Issue #822）
+### プロファイル既定で効かせる（Issue #822 / #1140）
 
-長時間の自律運転では「spawn するたびに手で ON」が最後の人間依存点になる。
-プロファイルに `limit_resume` を持たせると、**そのプロファイルから spawn した
-worker ペインが最初から有効**になる。
+長時間の自律運転では「立てるたびに手で ON」が最後の人間依存点になる。
+プロファイルに `limit_resume` を持たせると、そのプロファイルで立つペインが
+**最初から有効**になる。効く先は 2 つ:
+
+- **master / solo 本人のペイン**（`tako master -<名前>` / `tako solo -<名前>`）と
+  **引き継ぎ（`tako orchestrator handoff`）で立つ後任 master**、
+  **会話を引き継いだセッション再起動**（#1140）
+- **そのプロファイルから spawn した worker**（#822）
 
 ```bash
-# プロファイル既定を ON にする（以後 spawn した worker は自動復帰の対象）
+# プロファイル既定を ON にする（以後この名前で立つ master / solo / worker が対象）
 tako orchestrator profiles set myprofile --limit-resume true
 
 # 既定へ戻す（= 無効。ペイン単位のオプトインだけになる）
@@ -621,23 +626,52 @@ tako orchestrator spawn --project tako --prompt "..." --limit-resume true
 tako orchestrator spawn --project tako --prompt "..." --limit-resume false
 ```
 
-解決順は **spawn 引数 → プロファイル → 無効**。`--limit-resume false` は「未指定」ではなく
-**明示 OFF** なので、プロファイルが ON でもその worker だけ切れる。
+解決順は worker が **spawn 引数 → プロファイル → 無効**、master / solo 本人が
+**プロファイル → 無効**（本人には spawn 引数に相当する入口が無い）。
+`--limit-resume false` は「未指定」ではなく**明示 OFF** なので、プロファイルが
+ON でもその worker だけ切れる。
 
-適用されたかは 3 か所で読める:
+**ON を勝手に OFF へは戻さない**: 人が `tako limit-resume on --pane N` で有効に
+したペインは、あとから master の role を貼り直しても有効のまま
+（#813 のペイン単位オプトインを壊さないため、配るのは「ON にする」方向だけ）。
 
-- `tako orchestrator spawn` の応答の `limit_resume`
-- `tako orchestrator workers` の各行の `limit_resume`（ペインが居ないときは `null`）
+適用されたかは 4 か所で読める:
+
+- `tako limit-resume --pane <master のペイン>` の `enabled`（本人ぶん）
+- `tako orchestrator handoff` の応答の `limit_resume`（後任ぶん）
+- `tako orchestrator spawn` の応答の `limit_resume` / `tako orchestrator workers`
+  の各行の `limit_resume`（ペインが居ないときは `null`）
 - `tako orchestrator worker-status` / `tako read` / `tako list` の `limit_resume`
   （ヘッダのループアイコンも同じペイン属性を読む）
 
-GUI は設定画面（⌘,）→ プロファイル → 「worker のリミット後自動復帰」。
-`tako orchestrator profiles show` の `resolved_limit_resume` が実効値
-（未設定なら false）で、GUI のトグルもこれを表示している。
+GUI は設定画面（⌘,）→ プロファイル → 「リミット後の自動復帰」。
+`tako orchestrator profiles show` は実効値を 2 本返す:
+`resolved_master_limit_resume`（master / solo 本人）と `resolved_limit_resume`（worker）。
+どちらも未設定なら false。
 
-**solo プロファイルでは効かない**（solo は worker を spawn しないため）。ON にすると
-`profiles list` / `show` / `set` が警告を返すので、solo で使いたいときはペイン単位の
-`tako limit-resume on` を使う。
+**solo プロファイルでは worker へは配られない**（solo は worker を spawn しないため）。
+効くのは `tako solo` で立てた本人のペインだけで、`profiles list` / `show` / `set` が
+その旨を注意として返す。
+
+A/B は `TAKO_1140_LEGACY=1`（#1140 前 = worker にだけ配る挙動へ戻る）。
+
+### claude 自身の自動続行との関係（#1140 の実物調査）
+
+claude 2.1.258 は**上限の API エラーを受けた時点で自分でも「解除を待って続行する」
+段取りに入る**（ダイアログを出さずに arm する。設定キーは `autoContinueAtUsageLimit`
+= 未設定なら ON）。ただし続くのは**同じ claude プロセスが生きているあいだだけ**で、
+プロセス終了・`esc` / `Ctrl-C`・人が入力を送信・`/clear`・会話の resume・アカウント
+切替で解除される。連続の張り直しは 2 回まで、解除が 24 時間より先だと自動では張らない。
+
+つまり上流の自動続行は**あるが当てにはできない**ので、tako 側の自動復帰（#813）は
+そのまま必要。逆に、両方が動いても衝突はしない（tako は解除時刻を過ぎてから撃つので、
+上流が先に再開していればもう上限で止まっていない）。
+
+なお、上限ダイアログの `Stop and wait for limit to reset` は**自動続行を arm しない**
+（値は `cancel` で、arm 済みなら解除する側）。arm する選択肢は
+`Wait here, then continue automatically …`。codex 0.153.0 と agy 1.1.25 には
+相当する仕組みが無い（`tako agent-support --agent codex` の
+`limit_autocontinue_upstream` が根拠つきで宣言している）。
 
 ## 品質パイプライン（全プロファイル共通）
 

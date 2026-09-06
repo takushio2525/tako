@@ -2042,10 +2042,11 @@ enum ProfilesCommand {
         /// auto_handoff を解除して既定（有効）へ戻す（#749）
         #[arg(long)]
         clear_auto_handoff: bool,
-        /// spawn した worker で利用上限後の自動復帰を既定 ON にする（既定 false。#822）
+        /// master / solo 本人のペイン（引き継ぎの後任を含む。#1140）と spawn した
+        /// worker（#822）で利用上限後の自動復帰を既定 ON にする（既定 false）
         #[arg(long, conflicts_with = "clear_limit_resume")]
         limit_resume: Option<bool>,
-        /// limit_resume を解除して既定（無効）へ戻す（#822）
+        /// limit_resume を解除して既定（無効）へ戻す（#822 / #1140）
         #[arg(long)]
         clear_limit_resume: bool,
         /// codex（master / worker）のサンドボックスと承認を丸ごと外して起動することを
@@ -3642,6 +3643,11 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         profile.master_model_label(),
         profile.effort
     );
+    // #1140: 本人のペインへ配った利用上限後の自動復帰。適用は role を貼る
+    // dispatch 側（`Request::Title`）が行うので、ここは何が起きたかを言うだけ
+    if orchestrator::resolve_master_limit_resume(&profile) {
+        eprintln!("リミット後の自動復帰: 有効（プロファイル既定。#1140）");
+    }
     let policy_desc = match profile.worker_model_policy {
         orchestrator::WorkerModelPolicy::Inherit if profile.master_agent_is_claude() => format!(
             "inherit（master と同じ {} / {}）",
@@ -3825,6 +3831,10 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         profile.effort
     );
     eprintln!("モード: solo（オーケストレーション無し・1 対 1 対話・worker spawn 禁止）");
+    // #1140: solo は worker を spawn しないので、この設定が効く先は本人のペインだけ
+    if orchestrator::resolve_master_limit_resume(&profile) {
+        eprintln!("リミット後の自動復帰: 有効（プロファイル既定。#1140）");
+    }
     // Part 4: env の可視化（キー名のみ。Issue #500 / #547）
     print_master_env(&profile, profile_name);
     eprintln!("system prompt: {}", prompt_path.display());
