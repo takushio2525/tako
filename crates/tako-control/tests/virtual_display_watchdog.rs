@@ -1,6 +1,6 @@
-//! 仮想ディスプレイまわりの番犬（#1141）
+//! 仮想ディスプレイまわりの番犬（#1141 / #1150）
 //!
-//! 守りたい不変条件は 3 つ。どれも「壊れても動いているように見える」ので、
+//! 守りたい不変条件は 6 つ。どれも「壊れても動いているように見える」ので、
 //! 人間の記憶ではなくテストで固定する。
 //!
 //! 1. **ヘルパは消す機能を持たない**。`tako-vd` は常設で、検証のたびに作り直さない
@@ -9,6 +9,12 @@
 //! 2. **既定名が Rust とシェルでずれない**（ずれると隔離起動だけ黙ってメイン画面へ落ちる）
 //! 3. **tako が開く窓は全部同じ面へ出す**。1 枚でも素の中央寄せが残ると、
 //!    セルフテストが開く設定画面などがユーザーの画面へ飛び出す
+//! 4. **`ensure` が成功で返る道はすべて締め（増殖の検査 → Main 保護）を通る**（#1150）。
+//!    片方の道だけ通していると「既に在るから何もしない」の側から漏れる
+//! 5. **孤児の後片付けは実行条件を確かめてから器を再起動する**（#1150）。順番が逆・
+//!    条件を見ないと、内蔵が居ない機で**画面が 0 枚になり機械が眠る**（走っている
+//!    worker が全部巻き添えになる）
+//! 6. **見張りのモックテストが CI で走る**（画面の無いランナーでも回るようスタブ実装）
 
 use std::path::{Path, PathBuf};
 
@@ -60,7 +66,13 @@ fn 仮想ディスプレイのヘルパは消す機能を持たない() {
 #[test]
 fn ヘルパは必要なサブコマンドをそろえている() {
     let src = helper_source();
-    for sub in ["ensure)", "bounds)", "status)", "move-window)"] {
+    for sub in [
+        "ensure)",
+        "bounds)",
+        "status)",
+        "move-window)",
+        "cleanup-orphans)",
+    ] {
         assert!(
             src.contains(sub),
             "ヘルパにサブコマンド {sub} が無い（#1141 の受け入れ条件）"
@@ -117,5 +129,130 @@ fn takoが開く窓は全部置き先を通る() {
            1 枚でも素の中央寄せが残ると、セルフテストが開く設定画面などが\n\
            ユーザーのメイン画面へ飛び出す",
         hits.join("\n  "),
+    );
+}
+
+/// シェル関数の本体（`名前() {` から列 0 の `}` まで）を取り出す。
+/// ヘルパの関数はすべてトップレベルなので、この素朴な切り出しで足りる
+fn shell_fn_body(src: &str, name: &str) -> String {
+    let head = format!("{name}() {{");
+    let start = src
+        .find(&head)
+        .unwrap_or_else(|| panic!("シェル関数 {name} が見つからない"));
+    let rest = &src[start + head.len()..];
+    let end = rest
+        .find("\n}")
+        .unwrap_or_else(|| panic!("シェル関数 {name} の終わりが見つからない"));
+    rest[..end].to_string()
+}
+
+/// 行コメントを落とした実行部分だけを 1 本の文字列に
+fn code_only(body: &str) -> String {
+    body.lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `ensure` は**成功で返るすべての道**で締め（増殖の検査 → Main 保護）を通る。
+///
+/// 「既に在るから何もしない」の早期 return を締めの外に置くと、
+/// **増殖したまま / Main が仮想のまま**返る道が残る（#1150 で実際に踏んだ形。
+/// 蓋閉じのあいだに Main が `tako-vd` へ移り、以降の ensure は何も気づかなかった）。
+#[test]
+fn ensureが成功で返る道はすべて締めを通る() {
+    let src = helper_source();
+    let body = code_only(&shell_fn_body(&src, "vd_ensure"));
+    let finishes = body.matches("vd_finish_ensure").count();
+    assert!(
+        finishes >= 2,
+        "vd_ensure の中で締め（vd_finish_ensure）を通る箇所が {finishes} 個しかない。\n\
+         → 「既に在る」道と「繋いだ」道の両方が通ること（#1150）"
+    );
+    let bare: Vec<&str> = body
+        .lines()
+        .filter(|l| l.trim() == "return 0")
+        .map(str::trim)
+        .collect();
+    assert!(
+        bare.is_empty(),
+        "vd_ensure に締めを通らない `return 0` がある（{} 箇所）。\n\
+         → 成功で返るときは vd_finish_ensure の結果を返すこと（#1150）",
+        bare.len()
+    );
+}
+
+/// 締めは**増殖の検査と Main 保護の両方**を呼ぶ（片方だけ残ると症状が半分だけ直る）
+#[test]
+fn 締めは増殖の検査とmain保護の両方を通す() {
+    let src = helper_source();
+    let body = code_only(&shell_fn_body(&src, "vd_finish_ensure"));
+    for needle in ["vd_assert_single", "vd_protect_main"] {
+        assert!(
+            body.contains(needle),
+            "vd_finish_ensure が {needle} を呼んでいない（#1150）。\n\
+             → 増殖の検査（同名が 2 枚以上なら止まる）と Main 保護（内蔵が居るときだけ\n\
+               内蔵へ戻す）は両方が締めに要る"
+        );
+    }
+}
+
+/// Main 保護は**内蔵が居るときだけ**動く（戻す先が無い機で仮想を Main に据え直さない）
+#[test]
+fn main保護は内蔵が居ないとき何もしない() {
+    let src = helper_source();
+    let body = code_only(&shell_fn_body(&src, "vd_main_protection_plan"));
+    assert!(
+        body.contains("builtin_id") && body.contains("noop"),
+        "vd_main_protection_plan が内蔵の有無で分岐していない（#1150）"
+    );
+    // 判定は純関数（stdin のテーブルだけを見る）= 器へ触らない
+    assert!(
+        !body.contains("vd_bd"),
+        "Main 保護の判定が器（vd_bd）を呼んでいる。判定は純関数のままにする\n\
+         （テストがスタブ無しで 3 ケースを回せる形を壊さない）"
+    );
+}
+
+/// 孤児の後片付けは**実行条件を確かめてから**器を再起動する。
+///
+/// 器の再起動は一瞬すべての仮想ディスプレイを落とすので、内蔵が NSScreen に居ない機で
+/// 走らせると**画面が 0 枚になり機械が眠る**（#1150: 蓋閉じで `tako-vd` が唯一の画面。
+/// 走っている worker が全部巻き添えになる）。
+#[test]
+fn 孤児の後片付けは実行条件を確かめてから器を再起動する() {
+    let src = helper_source();
+    let body = code_only(&shell_fn_body(&src, "vd_cleanup_orphans"));
+    let gate = body
+        .find("vd_cleanup_gate")
+        .expect("vd_cleanup_orphans が実行条件（vd_cleanup_gate）を見ていない（#1150）");
+    let restart = body
+        .find("restartApp")
+        .expect("vd_cleanup_orphans に器の再起動が無い（掃除の手段はこれだけ）");
+    assert!(
+        gate < restart,
+        "器の再起動が実行条件の確認より先にある（#1150）。\n\
+         → 内蔵が居ない / 蓋が閉じているときは撃ってはいけない"
+    );
+    // 器を再起動するのは apply のときだけ（既定は下見）
+    assert!(
+        body.contains("--dry-run") && body.contains("--apply"),
+        "cleanup-orphans が下見（--dry-run）と実行（--apply）を分けていない（#1150）"
+    );
+}
+
+/// 見張りのモックテストが CI で走る（実ディスプレイの無いランナーでも回る）
+#[test]
+fn 見張りのモックテストがciで走る() {
+    const SCRIPT: &str = "scripts/test-virtual-display-guard.sh";
+    assert!(
+        repo_root().join(SCRIPT).is_file(),
+        "{SCRIPT} が無い（#1150 の番犬の実体）"
+    );
+    let ci = std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml"))
+        .expect("ci.yml を読む");
+    assert!(
+        ci.contains(SCRIPT),
+        "{SCRIPT} が CI に載っていない（載っていないと壊れても誰も気づかない）"
     );
 }

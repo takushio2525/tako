@@ -821,3 +821,9 @@ These apply across tasks and PRs, on top of Task Intake and Acceptance Inspectio
    `TAKO_DISPLAY=<name|uuid|index>`. Where the window actually landed is
    readable from `tako_check_health` (`display_placement`) — check it instead of
    assuming. **Never delete the virtual display**: it is permanent by design.
+   **Never create a temporary one either** — reuse the standing display; a
+   differently-named one leaks orphan screens that the container can no longer
+   remove (#1150). If a run genuinely needs a different display setup, announce
+   `DISPLAY CHANGE <operation>` first, confirm no other worker is drawing, and
+   show the before/after with `scripts/lib/virtual-display.sh status --snapshot`:
+   the Main display and the built-in display must be the same before and after.

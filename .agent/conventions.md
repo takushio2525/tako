@@ -736,7 +736,9 @@ env -u TAKO_SOCKET -u TAKO_TOKEN -u TAKO_PANE_ID -u TERM -u COLORTERM \
 - 指定が外れても**起動は止まらない**。既定の面へ落ちて persist.log に理由 + 候補が 1 行残る。
   どこへ置いたかは `tako_check_health` の `display_placement` で読める
 - **`tako-vd` は常設。消さない**（ヘルパにも消す機能を作っていない）。ユーザーの
-  ディスプレイ構成・解像度・配置・ミラーリングにも触らない
+  ディスプレイ構成・解像度・配置・ミラーリングにも触らない。落として良いのは
+  **器の管理外へ外れた残骸（孤児）だけ**で、それも `cleanup-orphans` の実行条件を
+  満たしたときに限る（後述）
 
 ### 別 Space へ逃がすのでは代わりにならない
 
@@ -770,3 +772,39 @@ GPUI の `cx.displays()` が空**になる（#1141 で実測）。狙いは外�
 tako が開く窓は**全部** `centered_on_target()` を通す（メイン + 追加ビューポート +
 設定 / About / アップデート）。1 枚でも素の `Bounds::centered(None, ..)` が残ると、
 セルフテストが開く設定画面などがユーザーの画面へ飛び出す。
+
+### 作業の前後でディスプレイ構成を変えない（Issue #1150）
+
+**受け入れ条件**: 作業の前後で **Main Display と内蔵ディスプレイの有無が変わらない**。
+前後で 1 枚ずつ撮って diff すれば示せる:
+
+```sh
+scripts/lib/virtual-display.sh status --snapshot > /tmp/vd-before.txt
+# …作業…
+scripts/lib/virtual-display.sh status --snapshot > /tmp/vd-after.txt
+diff /tmp/vd-before.txt /tmp/vd-after.txt   # 差分が無い = 構成を触っていない
+```
+
+スナップショットは `clamshell=` / `backend_instances=` と 1 行 1 面（`name` / `frame` /
+`id` / `builtin` / `main`）で、並びは名前順に固定してある（列挙順のゆらぎで
+偽の差分が出ない）。
+
+- **検証のために一時的な仮想ディスプレイを作らない**。常設の 1 枚（`tako-vd`）を
+  使い回す。名前を変えた面を作って検証すると**孤児が残る**（#1150 の実測: 検出力の
+  A/B で作った `tako-vd-ab1141` が NSScreen に 2 枚残り、器からは消せなくなった）。
+  どうしても要るときは **`DISPLAY CHANGE <操作>` と宣言**し、他の worker が
+  描画していないことを確かめてから行う
+- **`ensure` は同名が 2 枚以上あると理由つきで止まる**。macOS は同名の面に枝番を
+  付けて見せる（`tako-vd（1）`）ので、完全一致で数えると「無い」に見えて
+  もう 1 枚繋ぎ、増殖に気づけない
+- **`ensure` の締めが Main を守る**: Main が `tako-vd` で内蔵が居るなら内蔵へ戻す。
+  **内蔵が居ないとき（蓋閉じ）は何もしない**（戻す先が無い）。外部モニタが Main の
+  ときも触らない（ユーザーの構成）
+- **孤児の後片付けは下見が既定**: `cleanup-orphans` は列挙して実行条件を判定するだけ。
+  掃除は `--apply` で、**内蔵が NSScreen に居る かつ 蓋が開いている**ときだけ走る。
+  器の再起動は一瞬すべての仮想ディスプレイを落とすので、条件を満たさないまま撃つと
+  **画面が 0 枚になって機械が眠り、走っている worker が全部巻き添えになる**
+- **器へ渡す引数は `BetterDisplay help` に在るものだけ**。解釈できない引数を渡すと
+  CLI として動かず「proceeding with app launch」= **アプリの追加実体**として起き
+  （#1150 の実測: 誤った `create` で起きた実体が 5 時間走り続けていた）、実体が増えると
+  同じ仮想スクリーンが何枚も繋がりうる。実体数は `status` / `--snapshot` に出る
