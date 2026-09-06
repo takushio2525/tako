@@ -753,7 +753,10 @@ pub fn plan_prune(progress: &str, archive: &str, today_days: i64) -> PrunePlan {
             break;
         }
         let cost = e.render().len() + 1;
-        if used + cost > max_bytes {
+        // **1 件も残らない結果にはしない**: 1 エントリだけでバイト予算を超える場合でも
+        // 最も新しい 1 件は残す（作業ログを黙って空にするより、超過として報告した方がよい。
+        // その 1 件を短く書き直すのは人間の仕事なので `check` が提案として名指しする）
+        if used + cost > max_bytes && kept_count > 0 {
             break;
         }
         used += cost;
@@ -1039,6 +1042,22 @@ mod tests {
         let lines = plan.archive_text.matches("同じ見出し").count();
         assert_eq!(lines, 2, "アーカイブにも 2 行 = 1 エントリ 1 行");
         assert!(plan.entries_preserved());
+    }
+
+    #[test]
+    fn エントリ1件でバイト予算を超えても作業ログを空にしない() {
+        // 予算まるごとを超える 1 エントリ。空にするのではなく残して超過を報告する
+        let text = format!(
+            "# t\n\n## 2026-09-01（古い）\n- x\n\n## 2026-09-05（巨大）\n- {}\n",
+            "あ".repeat(PROGRESS_MAX_BYTES)
+        );
+        let plan = plan_prune(&text, "", date_to_days("2026-09-06").unwrap());
+        assert_eq!(plan.kept.len(), 1, "最も新しい 1 件は残る");
+        assert_eq!(plan.kept[0].date, "2026-09-05");
+        assert!(plan.entries_preserved());
+        // そのうえで超過として報告される（自動では直せない = 書き直しは人間の仕事）
+        let m = measure(ItemKind::ProgressLog, &plan.progress_text);
+        assert!(m.bytes > PROGRESS_MAX_BYTES);
     }
 
     #[test]
