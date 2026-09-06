@@ -10346,8 +10346,7 @@ impl TakoApp {
             let weak2 = weak.clone();
             let result = cx.open_window(
                 WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                        None,
+                    window_bounds: Some(WindowBounds::Windowed(centered_on_target(
                         size(px(760.), px(600.)),
                         cx,
                     ))),
@@ -10403,8 +10402,7 @@ impl TakoApp {
             let weak2 = weak.clone();
             let result = cx.open_window(
                 WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                        None,
+                    window_bounds: Some(WindowBounds::Windowed(centered_on_target(
                         size(px(420.), px(300.)),
                         cx,
                     ))),
@@ -10458,8 +10456,7 @@ impl TakoApp {
             let (w, h) = update_window::WINDOW_SIZE;
             let result = cx.open_window(
                 WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                        None,
+                    window_bounds: Some(WindowBounds::Windowed(centered_on_target(
                         size(px(w), px(h)),
                         cx,
                     ))),
@@ -22834,18 +22831,7 @@ fn native_window_handle(window: &Window) -> Option<isize> {
 /// 保存済みレイアウトから復元してウインドウを開く（#312: Dock クリックでの復帰用）
 fn open_restored_window(cx: &mut App) {
     let saved_frame = tako_control::layout::load().and_then(|l| l.window);
-    let bounds = match saved_frame {
-        Some(f) if f.width >= 200.0 && f.height >= 150.0 => {
-            let bounds = Bounds::new(point(px(f.x), px(f.y)), size(px(f.width), px(f.height)));
-            match f.state.as_str() {
-                "fullscreen" => WindowBounds::Fullscreen(bounds),
-                "maximized" => WindowBounds::Maximized(bounds),
-                _ => WindowBounds::Windowed(bounds),
-            }
-        }
-        _ => WindowBounds::Windowed(Bounds::centered(None, size(px(960.), px(600.)), cx)),
-    };
-    open_primary_window(bounds, cx);
+    open_primary_window(initial_window_bounds(saved_frame, cx), cx);
 }
 
 /// ウインドウが 0 枚になった後の再表示（#381: Dock 復帰・New Window）。生きている
@@ -22877,6 +22863,169 @@ fn reopen_or_restore(cx: &mut App) {
     }
 }
 
+// ── 窓を置くディスプレイ（#1141）────────────────────────────────
+// 隔離 GUI（TAKO_ISOLATED=1・セルフテスト・visual-test）の窓をユーザーのメイン画面へ
+// 出さないための配置。判定の正は `tako_core::platform::display`（純粋関数）で、ここは
+// GPUI から候補を組んで結果を持ち回るだけ。
+//
+// **通常起動は 1 ビットも変わらない**（`TAKO_DISPLAY` 未指定 かつ 非隔離なら
+// `requested_spec` が None を返し、以降の分岐がすべて既定へ落ちる）。
+
+/// 起動時に決めた置き先。`main` の `app.run` で 1 回だけ決めて以後は読むだけ
+static TARGET_DISPLAY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+
+/// 置き先のディスプレイを決めて記録する（窓を 1 枚も開く前に 1 回だけ呼ぶ）。
+///
+/// 見つからなくても**起動は止めない**: 既定の面へ落として理由を persist.log に 1 行残す
+/// （指定が外れるのは検証の都合であって、tako が起動できない理由ではない）。
+fn resolve_target_display(cx: &App) -> Option<gpui::DisplayId> {
+    use tako_core::platform::display as disp;
+
+    // 窓を出す検証（隔離起動・セルフテスト・visual-test）はどれもユーザーの画面に出さない
+    let verification = disp::is_verification_gui(
+        std::env::var("TAKO_ISOLATED").ok().as_deref(),
+        std::env::var_os("TAKO_SELF_TEST").is_some(),
+        std::env::var_os("TAKO_VISUAL_TEST").is_some(),
+    );
+    let spec = disp::requested_spec(
+        std::env::var(disp::ENV_DISPLAY).ok().as_deref(),
+        verification,
+    );
+    let Some(spec) = spec else {
+        disp::record_placement(disp::Placement::not_requested());
+        let _ = TARGET_DISPLAY.set(None);
+        return None;
+    };
+
+    // 名前は指定が要るときにしか引かない（通常起動はこの費用を払わない）
+    let names = disp::display_names();
+    let primary = cx.primary_display().map(|d| u64::from(d.id()));
+    let candidates: Vec<disp::DisplayCandidate> = cx
+        .displays()
+        .iter()
+        .enumerate()
+        .map(|(index, d)| {
+            let id = u64::from(d.id());
+            disp::DisplayCandidate {
+                index,
+                id,
+                uuid: d.uuid().ok().map(|u| u.to_string()),
+                name: names
+                    .iter()
+                    .find(|(nid, _)| *nid == id)
+                    .map(|(_, n)| n.clone()),
+                primary: primary == Some(id),
+                // **解決した時点の矩形**を持ち回る（あとから `cx.displays()` を引き直すと
+                // ディスプレイスリープや配置変更で空・別値になり得る。#1141 で実測）
+                rect: {
+                    let b = d.bounds();
+                    Some(disp::DisplayRect {
+                        x: f32::from(b.origin.x),
+                        y: f32::from(b.origin.y),
+                        width: f32::from(b.size.width),
+                        height: f32::from(b.size.height),
+                    })
+                },
+            }
+        })
+        .collect();
+
+    let selection = disp::select(&spec, &candidates);
+    let (target, placement) = match selection {
+        disp::Selection::Selected {
+            display,
+            matched_by,
+            spec,
+        } => {
+            let id = display.id;
+            (
+                Some(id),
+                disp::Placement {
+                    requested: Some(spec),
+                    resolved: Some(display),
+                    matched_by: Some(matched_by),
+                    reason: None,
+                    available: candidates
+                        .iter()
+                        .map(disp::DisplayCandidate::label)
+                        .collect(),
+                },
+            )
+        }
+        disp::Selection::NotFound { spec, available } => {
+            // 名前を引けない環境（Windows）で名前を指定された、を切り分けられるようにする
+            let reason = if !disp::name_lookup_supported() && !available.is_empty() {
+                "該当なし（このプラットフォームでは名前を引けないので UUID か index で指定する）"
+            } else {
+                "該当なし"
+            };
+            (
+                None,
+                disp::Placement {
+                    requested: Some(spec),
+                    resolved: None,
+                    matched_by: None,
+                    reason: Some(reason.to_string()),
+                    available,
+                },
+            )
+        }
+        // `requested_spec` が Some を返した後なので空指定にはならない
+        disp::Selection::NotRequested => (None, disp::Placement::not_requested()),
+    };
+    persist_diag(&placement.log_line());
+    if std::env::var_os("TAKO_SELF_TEST").is_some() {
+        println!("TAKO_SELF_TEST_DISPLAY: {}", placement.log_line());
+    }
+    disp::record_placement(placement);
+    let _ = TARGET_DISPLAY.set(target);
+    target.map(gpui::DisplayId::new)
+}
+
+/// 置き先のディスプレイ（`resolve_target_display` の結果。未解決なら `None`）
+fn target_display_id() -> Option<gpui::DisplayId> {
+    TARGET_DISPLAY
+        .get()
+        .copied()
+        .flatten()
+        .map(gpui::DisplayId::new)
+}
+
+/// 置き先のディスプレイ（無ければ既定の面）の中央に置く矩形。
+///
+/// tako が開く窓は**全部これを通す**。1 枚でも素の `Bounds::centered(None, ..)` が残ると、
+/// 設定画面や About がユーザーのメイン画面へ飛び出す（セルフテストは設定画面も開く）。
+fn centered_on_target(size: Size<Pixels>, cx: &App) -> Bounds<Pixels> {
+    Bounds::centered(target_display_id(), size, cx)
+}
+
+/// 保存済みフレーム（FR-5）から初期の窓矩形を決める。
+///
+/// **置き先のディスプレイが決まっていれば保存位置より置き先が勝つ**（#1141）。
+/// 保存された座標はメイン画面のものなので、そのまま使うと隔離起動の窓が
+/// ユーザーの画面へ戻ってしまう。ユーザーの保存値は書き換えないので、
+/// `TAKO_DISPLAY` を外して起動し直せば元の位置に戻る。
+fn initial_window_bounds(
+    saved_frame: Option<tako_control::layout::WindowFrame>,
+    cx: &App,
+) -> WindowBounds {
+    if target_display_id().is_some() {
+        return WindowBounds::Windowed(centered_on_target(size(px(960.), px(600.)), cx));
+    }
+    match saved_frame {
+        // 壊れた保存値（極端に小さい等）は既定へフォールバック
+        Some(f) if f.width >= 200.0 && f.height >= 150.0 => {
+            let bounds = Bounds::new(point(px(f.x), px(f.y)), size(px(f.width), px(f.height)));
+            match f.state.as_str() {
+                "fullscreen" => WindowBounds::Fullscreen(bounds),
+                "maximized" => WindowBounds::Maximized(bounds),
+                _ => WindowBounds::Windowed(bounds),
+            }
+        }
+        _ => WindowBounds::Windowed(centered_on_target(size(px(960.), px(600.)), cx)),
+    }
+}
+
 /// プライマリウィンドウを開く（TakoApp entity を新規作成する経路: 初回起動・Dock 復帰）。
 /// 追加ウィンドウは `open_viewport_window`（同一 entity 共有。Issue #339）を使う。
 /// 赤ボタン close の挙動は `TakoApp::handle_window_close`（複数ウィンドウなら
@@ -22886,6 +23035,8 @@ fn open_primary_window(window_bounds: WindowBounds, cx: &mut App) -> gpui::Windo
         WindowOptions {
             window_bounds: Some(window_bounds),
             titlebar: Some(tako_titlebar_options()),
+            // #1141: 置き先が決まっていればその面へ。未解決なら None = 既定動作
+            display_id: target_display_id(),
             ..Default::default()
         },
         |window, cx| {
@@ -22918,12 +23069,14 @@ fn open_viewport_window(
     cx: &mut App,
 ) {
     let bounds = bounds.unwrap_or_else(|| {
-        WindowBounds::Windowed(Bounds::centered(None, size(px(960.), px(600.)), cx))
+        WindowBounds::Windowed(centered_on_target(size(px(960.), px(600.)), cx))
     });
     let opened = cx.open_window(
         WindowOptions {
             window_bounds: Some(bounds),
             titlebar: Some(tako_titlebar_options()),
+            // #1141: 2 枚目以降も同じ面へ（隔離検証で片方だけメイン画面へ出さない）
+            display_id: target_display_id(),
             ..Default::default()
         },
         |window, cx| {
@@ -23168,6 +23321,10 @@ fn main() {
         }
     });
     app.run(move |cx: &mut App| {
+        // 窓を 1 枚でも開く前に置き先を決める（#1141）。以後は `target_display_id()` /
+        // `centered_on_target` が同じ答えを返すので、Dock 復帰・New Window・設定画面も
+        // 同じ面へ開く。通常起動（`TAKO_DISPLAY` 未指定 かつ 非隔離）では None のまま
+        resolve_target_display(cx);
         cx.bind_keys(key_bindings());
         cx.set_menus(app_menus());
         // #872: 「ウィンドウが 0 枚になったらプロセスを終わらせるか」は tako が決める。
@@ -23259,18 +23416,7 @@ fn main() {
         } else {
             None
         };
-        let window_bounds = match saved_frame {
-            // 壊れた保存値（極端に小さい等）は既定へフォールバック
-            Some(f) if f.width >= 200.0 && f.height >= 150.0 => {
-                let bounds = Bounds::new(point(px(f.x), px(f.y)), size(px(f.width), px(f.height)));
-                match f.state.as_str() {
-                    "fullscreen" => WindowBounds::Fullscreen(bounds),
-                    "maximized" => WindowBounds::Maximized(bounds),
-                    _ => WindowBounds::Windowed(bounds),
-                }
-            }
-            _ => WindowBounds::Windowed(Bounds::centered(None, size(px(960.), px(600.)), cx)),
-        };
+        let window_bounds = initial_window_bounds(saved_frame, cx);
         let window = open_primary_window(window_bounds, cx);
         cx.activate(true);
 
@@ -61782,6 +61928,109 @@ mod self_test {
                         "144: tako がエージェント CLI を自分の子として起こしていない \
                          (#1129) leaked={detail:?}"
                     ),
+                );
+            }
+
+            // 145. 検証用 GUI の窓がユーザーのメイン画面に出ていない（#1141）。
+            //      セルフテストは `TAKO_SELF_TEST` が立っているので、指定が無くても
+            //      常設の仮想ディスプレイ（tako-vd）を狙う。**「狙った」ではなく
+            //      「実際にその矩形へ開いた」**を見るのが要点で、GPUI の窓の実 bounds を
+            //      解決したディスプレイの bounds と突き合わせる。
+            //
+            //      tako-vd が用意されていない機（CI・他人の環境）では狙いが外れるのが
+            //      正しい挙動なので、そのときは「外した記録が残っていること」を見る。
+            //      `scripts/lib/virtual-display.sh ensure` を通してあれば前者を通る
+            {
+                use tako_core::platform::display as disp;
+                let placement = disp::placement();
+                check(
+                    placement.is_some(),
+                    "145: 起動時にディスプレイの置き先を記録している (#1141)",
+                );
+                let placement = placement.unwrap_or_else(disp::Placement::not_requested);
+                // セルフテストは検証用の起動なので、指定が無くても tako-vd を狙う
+                check(
+                    placement.requested.as_deref() == Some(disp::DEFAULT_VIRTUAL_DISPLAY_NAME)
+                        || std::env::var_os(disp::ENV_DISPLAY).is_some(),
+                    &format!(
+                        "145: 検証用の起動は指定が無くても仮想ディスプレイを狙う (#1141。\
+                         requested={:?})",
+                        placement.requested,
+                    ),
+                );
+                let inside = match placement.resolved.as_ref().and_then(|t| t.rect) {
+                    Some(scr) => {
+                        // 解決した = その面の矩形の中に窓が開いているはず。突き合わせ先は
+                        // **解決した時点に記録した矩形**（`cx.displays()` を引き直すと
+                        // ディスプレイスリープで空になり、黙って弱い検査へ落ちる = 実測）
+                        let win =
+                            cx.update(|cx| any.update(cx, |_, window, _| window.bounds()).ok());
+                        match win {
+                            Some(w) => {
+                                let ok = scr.contains(
+                                    f32::from(w.origin.x),
+                                    f32::from(w.origin.y),
+                                    f32::from(w.size.width),
+                                    f32::from(w.size.height),
+                                );
+                                println!(
+                                    "TAKO_SELF_TEST_1141_RECT: window={w:?} screen={scr:?} inside={ok}"
+                                );
+                                Some(ok)
+                            }
+                            None => {
+                                println!("TAKO_SELF_TEST_1141_RECT: 窓の矩形が取れない");
+                                None
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                match inside {
+                    Some(ok) => check(
+                        ok,
+                        "145: 窓は狙ったディスプレイの矩形の中に開いている (#1141)",
+                    ),
+                    // 解決できない機では「黙って既定へ落ちた」ではなく理由が残ることを見る
+                    None => check(
+                        placement.resolved.is_some() || placement.reason.is_some(),
+                        &format!(
+                            "145: 狙いが外れたときは理由が残る (#1141。reason={:?})",
+                            placement.reason,
+                        ),
+                    ),
+                }
+                // 診断から読めること（設計原則 5: AI が状態を確認できる）
+                let health = window
+                    .update(cx, |app, _, _cx| {
+                        tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::CheckHealth,
+                            PaneOrigin::Cli,
+                        )
+                    })
+                    .ok()
+                    .and_then(Result::ok);
+                let reported = health
+                    .as_ref()
+                    .and_then(|v| v["display_placement"]["requested"].as_str())
+                    .map(String::from);
+                check(
+                    reported == placement.requested,
+                    &format!(
+                        "145: check_health が置き先を申告する (#1141。\
+                         reported={reported:?} actual={:?})",
+                        placement.requested,
+                    ),
+                );
+                println!(
+                    "TAKO_SELF_TEST_1141: requested={:?} resolved={:?} matched_by={:?} \
+                     reason={:?} available={}",
+                    placement.requested,
+                    placement.resolved.as_ref().map(|d| d.label()),
+                    placement.matched_by.map(disp::MatchKind::as_str),
+                    placement.reason,
+                    placement.available.len(),
                 );
             }
 

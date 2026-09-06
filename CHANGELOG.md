@@ -54,6 +54,25 @@ change-type tag. Entries without a platform tag apply to every platform.
 - `AGENTS.md` を 1 行 1 コマンドの索引に絞った（104 KB → 25 KB）。長い注記・実測・罠・
   A/B の env はそのまま `.agent/commands.md` へ移し、毎ターンではなく必要なときだけ読む。
 
+- **Verification GUIs no longer open on the user's screen** (#1141). [macOS] Isolated
+  launches (`TAKO_ISOLATED=1`), the GUI self-test and the visual test now open on a
+  standing virtual display (default name `tako-vd`) without any extra flag; any display
+  can be selected with `TAKO_DISPLAY=<name | uuid | index>`. Create the display with
+  `scripts/lib/virtual-display.sh ensure` (idempotent, and deliberately has no delete
+  command). A missing display never blocks startup: tako falls back to the default screen
+  and records the reason plus the candidate list in persist.log, and where the window
+  actually landed is readable from `display_placement` in `tako_check_health`. Normal
+  launches are unaffected. Escaping to another Space is not an alternative: GPUI stops
+  drawing a fully hidden window (#470), so the target has to be a real display to the OS.
+- **検証用 GUI をユーザーのメイン画面に出さない**（#1141）。[macOS] 隔離起動
+  （`TAKO_ISOLATED=1`）・セルフテスト・visual-test の窓は、指定が無くても常設の仮想
+  ディスプレイ（既定名 `tako-vd`）へ開く。面は `TAKO_DISPLAY=<名前 | UUID | index>` でも
+  選べる。用意するのは `scripts/lib/virtual-display.sh ensure`（冪等・**消す機能は
+  持たない**）。指定が外れても起動は止まらず、理由と候補が persist.log に 1 行残り、
+  どこへ置いたかは `tako_check_health` の `display_placement` で読める。**通常起動の
+  挙動は変わらない**。別 Space へ逃がすのでは代わりにならない（GPUI は窓が完全に隠れると
+  描画を止める = #470）ので、退避先は OS から実ディスプレイとして見える面が要る。
+
 ## [0.8.6] - 2026-09-05
 
 Nightly patch release (automated). Changes since v0.8.5:

@@ -10319,6 +10319,27 @@ fn check_health(host: &dyn ControlHost) -> Value {
         }));
     }
 
+    // 窓をどのディスプレイへ置いたか（#1141）。隔離 GUI の窓をユーザーのメイン画面へ
+    // 出さない仕掛けが**効いているか**を AI からも読めるようにする（設計原則 5）。
+    // 記録するのは tako-app（窓を開く直前に 1 回）なので、GUI が無い経路では None
+    let display_placement = tako_core::platform::display::placement();
+    if let Some(p) = display_placement.as_ref() {
+        // 狙ったのに外したときだけ申告する（当たっているときは黙る = 通常起動と同じ）
+        if let (Some(spec), None) = (p.requested.as_ref(), p.resolved.as_ref()) {
+            issues.push(json!({
+                "level": "warning",
+                "check": "display_placement",
+                "message": format!(
+                    "ディスプレイ {spec} が見つからないので既定の面へ開いている\
+                     （理由={} / 候補=[{}]）。\
+                     scripts/lib/virtual-display.sh ensure で用意できる",
+                    p.reason.as_deref().unwrap_or("不明"),
+                    p.available.join(", "),
+                ),
+            }));
+        }
+    }
+
     // ワークスペースの状態サマリ
     let ws = host.workspace();
     let tab_count = ws.tabs().len();
@@ -10343,6 +10364,26 @@ fn check_health(host: &dyn ControlHost) -> Value {
         // まずここを読む。macOS は常に not_applicable
         "dpi_awareness": dpi_awareness.as_str(),
         "dpi_awareness_expected": tako_core::platform::dpi::expected_here().as_str(),
+        // #1141: 窓を置いたディスプレイ。`requested` は TAKO_DISPLAY か隔離起動の既定
+        // （tako-vd）。`resolved` が null なら既定の面（= ユーザーのメイン画面）に出ている
+        "display_placement": display_placement.as_ref().map(|p| json!({
+            "requested": p.requested,
+            "resolved": p.resolved.as_ref().map(|d| json!({
+                "index": d.index,
+                "id": d.id,
+                "name": d.name,
+                "uuid": d.uuid,
+                "primary": d.primary,
+                // 解決した時点の矩形（窓がここへ開いたかを GUI 無しで突き合わせられる）
+                "rect": d.rect.map(|r| json!({
+                    "x": r.x, "y": r.y, "width": r.width, "height": r.height,
+                })),
+            })),
+            "matched_by": p.matched_by.map(tako_core::platform::display::MatchKind::as_str),
+            "reason": p.reason,
+            "available": p.available,
+            "name_lookup_supported": tako_core::platform::display::name_lookup_supported(),
+        })),
         "workspace": {
             "tabs": tab_count,
             "panes": pane_count,
