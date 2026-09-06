@@ -57,6 +57,34 @@ fn 作業ログが起動時ロードの予算に収まっている() {
 }
 
 #[test]
+fn エージェント規約が起動時ロードの予算に収まっている() {
+    // `AGENTS.md` は `CLAUDE.md` の 1 行リダイレクト経由で**毎ターン全文が載る**。
+    // 長い注記・実測・罠は `.agent/commands.md` のような別ファイルへ出し、
+    // 規約からはバックティック参照で案内する（`@import` にはしない）
+    let text = read("AGENTS.md");
+    let m = budget::measure(ItemKind::AgentsGuide, &text);
+    let over: Vec<String> = budget::violations(ItemKind::AgentsGuide, &m)
+        .into_iter()
+        .filter(|v| enforced(v.metric))
+        .map(|v| {
+            format!(
+                "  {} が {} で上限 {} を超えている（{}）",
+                v.metric.as_str(),
+                v.actual,
+                v.limit,
+                v.note.ja()
+            )
+        })
+        .collect();
+    assert!(
+        over.is_empty(),
+        "AGENTS.md が起動時ロードの予算を超えている\n{}\n\
+         直し方: 長い節を `.agent/` 配下の別ファイルへ移し、バックティック参照で案内する",
+        over.join("\n")
+    );
+}
+
+#[test]
 fn アーカイブは毎ターン読み込まれる側に置かれていない() {
     // アーカイブを `@import` してしまうと、移送した意味がまるごと消える
     let agents = read("AGENTS.md");

@@ -85,8 +85,9 @@ fn 既定の仮想ディスプレイ名がrustとシェルでそろっている(
          → ずれると隔離起動だけが黙ってメイン画面へ落ちる（症状が出るのは\n\
            「窓が邪魔」という報告だけで、ログは正常に見える）"
     );
-    // AGENTS.md / conventions.md が案内する名前も同じであること
-    for doc in ["AGENTS.md", ".agent/conventions.md"] {
+    // 案内する docs も同じ名前であること（#1139 以降、コマンドの全文は
+    // `.agent/commands.md` に移り AGENTS.md は 1 行の索引だけになった）
+    for doc in [".agent/commands.md", ".agent/conventions.md"] {
         let text = std::fs::read_to_string(repo_root().join(doc)).unwrap_or_default();
         assert!(
             text.contains(name),
