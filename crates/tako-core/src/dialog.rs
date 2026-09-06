@@ -255,7 +255,9 @@ fn starts_new_dialog_block(
         .unwrap_or(stripped)
         .chars()
         .count();
-    if prev.chars().count() + 1 + first_word <= usable {
+    // 前の行の長さは**行末の余白を落として**測る（実画面は幅ぶん空白で埋まることがあり、
+    // 埋めたままだと「もう入らない」と誤判定して結合しすぎる側へ倒れる）
+    if prev.trim_end().chars().count() + 1 + first_word <= usable {
         return true;
     }
     if cursor_content(line).is_some() || is_key_hint(line) || is_rule_line(stripped) {
@@ -308,6 +310,10 @@ pub fn unwrap_dialog_lines(lines: &[&str]) -> Vec<String> {
                 let tail = line.trim();
                 let last = &mut out[row];
                 if last.chars().count() + tail.chars().count() < MAX_WRAP_JOIN_CHARS {
+                    // 行末の余白は情報を持たないので落としてから継ぐ。実画面はペイン幅ぶん
+                    // 空白で埋まることがあり、そのまま繋ぐとラベルの途中に空白の塊が残って
+                    // `respond` のラベル一致検証が外れる（#1131 が直したかったものと同じ形）
+                    last.truncate(last.trim_end().len());
                     last.push(' ');
                     last.push_str(tail);
                     joined += 1;
@@ -341,10 +347,8 @@ fn content_start_column(line: &str) -> Option<usize> {
     if is_rule_line(stripped) || is_key_hint(line) {
         return None;
     }
-    let after_cursor = cursor_content(line).map(|inner| {
-        let offset = line.len() - inner.len();
-        line[..offset].chars().count()
-    });
+    let after_cursor =
+        cursor_content(line).map(|inner| line[..subslice_offset(line, inner)].chars().count());
     let base = match after_cursor {
         Some(c) => c,
         None => line.chars().take_while(|c| *c == ' ').count(),
@@ -407,12 +411,22 @@ pub fn numbered_choice(inner: &str) -> Option<(u32, &str)> {
     inner[..digits].parse().ok().map(|n| (n, label))
 }
 
+/// `inner`（`line` の部分スライス）が `line` の何バイト目から始まるかを返す。
+///
+/// **`line.len() - inner.len()` で求めてはいけない**: [`cursor_content`] は `trim` で
+/// **末尾も**削るので、行の右側が空白で埋まっている実画面ではその分だけ後ろへずれる。
+/// 全角を含む行ではずれた位置が文字の途中を指し、`line[..offset]` が panic する
+/// （#1131 の実装で実際に踏んだ。`origin/main` は同じ入力で落ちない = 回帰だった）
+fn subslice_offset(line: &str, inner: &str) -> usize {
+    // 部分スライスなのでアドレスの差が開始バイト位置になる（unsafe は要らない）
+    inner.as_ptr() as usize - line.as_ptr() as usize
+}
+
 /// その行の「中身が始まる桁」（行頭空白 + 縦罫線 + 選択カーソルを除いた位置）。
 /// 桁は**表示幅ではなく char 数**で数える（全角の選択肢でも兄弟行の空白は半角なので一致する）
 fn content_column(line: &str) -> Option<usize> {
     let inner = cursor_content(line)?;
-    let offset = line.len() - inner.len();
-    Some(line[..offset].chars().count())
+    Some(line[..subslice_offset(line, inner)].chars().count())
 }
 
 /// 選択カーソルのない兄弟行か（中身の開始桁がカーソル行と一致する非空行）
@@ -1026,5 +1040,58 @@ Antigravity CLI requires permission to read, edit, and execute files here.
         assert_eq!(list.options.len(), 3, "{:?}", list.options);
         assert_eq!(list.options[0].label, "tako");
         assert_eq!(list.options[2].label, "playwright");
+    }
+
+    #[test]
+    fn issue1131_行末が空白で埋まった全角のダイアログでも落ちない() {
+        // 実画面の行はペイン幅ぶん空白で埋まりうる。`cursor_content` は末尾も trim するので
+        // `line.len() - inner.len()` で開始位置を求めると全角文字の途中を指して panic し、
+        // 余白を落とさずに継ぐとラベルの途中へ空白の塊が残る（どちらも実装中に踏んだ。
+        // `origin/main` は同じ入力で落ちない = #1131 が持ち込みかけた回帰）
+        let pad = |s: &str| {
+            let mut t = s.to_string();
+            while t.chars().count() < 25 {
+                t.push(' ');
+            }
+            t
+        };
+        let owned = [
+            "▔".repeat(25),
+            pad("   このダイアログは？"),
+            String::new(),
+            pad("   ❯ 1. はい、ぜんぶ進めますよ"),
+            pad("        つづき"),
+            pad("     2. いいえ"),
+        ];
+        let lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let list = detect_choice_list(&lines).expect("末尾空白つきでも検知される");
+        assert!(list.numbered);
+        assert_eq!(list.options.len(), 2, "{:?}", list.options);
+        // 折り返しの続きは結合され、繋ぎ目に余白の塊が残らない
+        assert_eq!(list.options[0].label, "はい、ぜんぶ進めますよ つづき");
+        assert_eq!(list.options[1].label, "いいえ");
+        for o in &list.options {
+            assert!(
+                !o.label.contains("  "),
+                "ラベルに余白の塊が残っている: {:?}",
+                o.label
+            );
+        }
+    }
+
+    #[test]
+    fn 部分スライスの開始位置は末尾のtrimに影響されない() {
+        // `subslice_offset` の不変条件。ここが `line.len() - inner.len()` に戻ると
+        // 上のダイアログが panic する
+        let line = "   ❯ 1. はい、進める          ";
+        let inner = cursor_content(line).expect("カーソル行");
+        assert_eq!(inner, "1. はい、進める", "末尾は trim される");
+        let offset = subslice_offset(line, inner);
+        assert_eq!(&line[..offset], "   ❯ ");
+        assert!(
+            offset < line.len() - inner.len(),
+            "末尾に空白があるぶん素朴な引き算より小さい: offset={offset} naive={}",
+            line.len() - inner.len()
+        );
     }
 }
