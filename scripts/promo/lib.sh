@@ -15,6 +15,13 @@
 #     （実際に他アプリの内容が混入した素材を作ってしまい破棄した）
 #   - 画面ロック中と、隔離ウィンドウが別 Space にある場合はキャプチャできない。
 #     promo_check_capturable がロックと権限不足を切り分けて事前に止める
+#
+# 収録の舞台（2026-09-06・#1081）:
+#   - 既定は**仮想ディスプレイ**（BetterDisplay の仮想スクリーン `tako-vd`。常設・削除しない）。
+#     隔離 tako の窓は起動時からそこへ出し、ユーザーのメイン画面には窓もフォーカス移動も出さない。
+#     GPUI は窓が完全に隠れると描画を止めるが、仮想ディスプレイ上の窓は何にも隠れないので
+#     従来の「定期的に最前面へ activate する」（= ユーザーの作業を毎 2 秒奪う）が要らなくなる
+#   - `TAKO_PROMO_STAGE=main` で従来方式（メイン画面 + activate）へ戻せる（A/B 用。普段は使わない）
 
 PROMO_APP=${TAKO_PROMO_APP:-/Applications/tako.app/Contents/MacOS/tako-app}
 PROMO_CLI=${TAKO_PROMO_CLI:-/Applications/tako.app/Contents/MacOS/tako}
@@ -51,6 +58,13 @@ promo_require() {
        [ "$PROMO_LIB_DIR/winbounds.swift" -nt "$PROMO_WINBOUNDS" ]; then
         swiftc -O -o "$PROMO_WINBOUNDS" "$PROMO_LIB_DIR/winbounds.swift" 2>/dev/null || {
             echo "ERROR: winbounds.swift のコンパイルに失敗" >&2; return 1; }
+    fi
+    # ディスプレイ一覧（仮想ディスプレイの矩形と HiDPI 判定に使う）も同じ扱い
+    PROMO_DISPLAYS=/private/tmp/tako-promo-displays
+    if [ ! -x "$PROMO_DISPLAYS" ] || \
+       [ "$PROMO_LIB_DIR/displays.swift" -nt "$PROMO_DISPLAYS" ]; then
+        swiftc -O -o "$PROMO_DISPLAYS" "$PROMO_LIB_DIR/displays.swift" 2>/dev/null || {
+            echo "ERROR: displays.swift のコンパイルに失敗" >&2; return 1; }
     fi
 }
 
@@ -321,18 +335,29 @@ def test_users_are_serializable():
 PY
 
     # master 章の worker に渡す「完了する」タスク（worker.sh は末尾で sleep 600 するので
-    # エージェントの Bash 呼び出しが終わらず、報告まで撮れない）
+    # エージェントの Bash 呼び出しが終わらず、報告まで撮れない）。
+    # 長さは約 80 秒（TAKO_PROMO_TASK_SECS）: 数秒で終わると master が `orchestrator_run` の
+    # auto_close で worker ペインを畳み、「3 体が並ぶ / orch ビュー / かんたん表示」の絵が
+    # 撮れないまま報告だけが残る（2026-09-06 に実測。sonnet・effort medium は 2 分で完走した）
     cat > "$PROMO_DEMO/awesome-app/scripts/task.sh" <<'TSK'
 #!/bin/bash
-# デモ用: 受け取ったタスク名の作業ログを流して数秒で完了する
+# デモ用: 受け取ったタスク名の作業ログを流し、テストを回している風の進捗を出して完了する
 task=${1:-task}
+total=${TAKO_PROMO_TASK_SECS:-80}
 printf 'task %s\n' "$task"
-lines=("reading source files" "applying changes" "running tests" "all checks passed")
+lines=("reading source files" "applying changes" "running tests")
 for l in "${lines[@]}"; do
     printf '  * %s\n' "$l"
     sleep 1.5
 done
-printf 'done %s: 4 files changed, tests green\n' "$task"
+# 残りの時間は 1 行ずつテスト結果を流す（画面が動き続ける = 「稼働中」に見える）
+n=$(( (total - 8) / 2 )); [ "$n" -gt 0 ] || n=1
+for i in $(seq 1 "$n"); do
+    printf '    test_%s_%02d ... ok\n' "$task" "$i"
+    sleep 2
+done
+printf '  * all checks passed\n'
+printf 'done %s: 4 files changed, %d tests green\n' "$task" "$n"
 TSK
     chmod +x "$PROMO_DEMO/awesome-app/scripts/task.sh"
 
@@ -395,6 +420,8 @@ promo_demo_home_agent_ready() {
     mkdir -p "$PROMO_DEMO/home/Library/Preferences" "$PROMO_DEMO/home/.claude"
     HOME="$PROMO_DEMO/home" security list-keychains -d user \
         -s "$HOME/Library/Keychains/login.keychain-db" >/dev/null 2>&1 || true
+    # 共有キーチェーンのトークンを収録中に更新させない（下の promo_ensure_oauth_fresh を参照）
+    promo_ensure_oauth_fresh "${TAKO_PROMO_OAUTH_NEED:-900}" || return 1
     /usr/bin/python3 - "$PROMO_DEMO" <<'PY'
 import json, os, sys
 
@@ -432,6 +459,48 @@ with open(os.path.join(home, ".claude/settings.json"), "w") as f:
         indent=1,
     )
 PY
+}
+
+# デモ HOME の claude が OAuth トークンを**更新しなくて済む**ことを確かめる（2026-09-06 の事故対策）。
+# 背景: デモ HOME は実ユーザーのログインキーチェーン（`Claude Code-credentials` の 1 項目）を
+#   共有するが、更新の排他（claude が HOME 配下で取る）は共有しない。共有トークンの期限切れの
+#   瞬間に本番の claude 群と同時に refresh を打つと負けた側が invalid_grant を受け、claude は
+#   **キーチェーンの資格情報を空にして「Login expired」**を出す = ユーザーごとログアウトされる
+#   （22:52:24 に mdat が動き accessToken / refreshToken が空・expiresAt が epoch 0 になった。実測）。
+# 対策: 収録が終わるまで（$1 秒）トークンが有効なら更新は起きない。足りなければ**実 HOME の claude**
+#   （排他つき）に 1 回だけ更新させ、それでも足りなければ止めてユーザーの再ログインを待つ。
+#   トークンの値は一切読まない（期限のフィールドだけ）
+promo_oauth_expires_in() {
+    security find-generic-password -s 'Claude Code-credentials' -w 2>/dev/null | /usr/bin/python3 -c '
+import sys, json, time
+try:
+    d = json.loads(sys.stdin.read())
+    o = d.get("claudeAiOauth") or {}
+    exp = float(o.get("expiresAt") or 0)
+    if not o.get("refreshToken"): print(-1); sys.exit()
+    exp = exp / 1000 if exp > 1e12 else exp
+    print(int(exp - time.time()))
+except Exception:
+    print(-1)
+'
+}
+promo_ensure_oauth_fresh() {
+    local need=${1:-900} left
+    left=$(promo_oauth_expires_in)
+    if [ "${left:-0}" -lt 0 ]; then
+        echo "ERROR: Claude Code の資格情報が無い（ログアウト状態）。ユーザーに 'claude auth login' を依頼する" >&2
+        return 1
+    fi
+    if [ "$left" -lt "$need" ]; then
+        echo "   OAuth トークンの残り ${left}s < ${need}s → 実 HOME の claude に更新させる（デモ HOME からは更新しない）"
+        env "${PROMO_ENV_CLEAN[@]}" claude -p 'ok' --model haiku --max-turns 1 >/dev/null 2>&1 || true
+        left=$(promo_oauth_expires_in)
+        if [ "${left:-0}" -lt "$need" ]; then
+            echo "ERROR: トークンを更新できない（残り ${left}s）。ユーザーに 'claude auth login' を依頼する" >&2
+            return 1
+        fi
+    fi
+    echo "   OAuth トークン残り ${left}s（収録 ${need}s のあいだ更新は起きない）"
 }
 
 # 画面に出るテキストへ個人情報（メールアドレス・実ホームパス）が残っていないかを
@@ -493,12 +562,243 @@ promo_timeline_rows() {
 }
 promo_tl_field() { [ "$1" = "-" ] && printf '' || printf '%s' "$1"; }
 
+# ── 収録の舞台: 仮想ディスプレイ（#1081・2026-09-06）────────────────
+# 隔離 tako の窓をどこへ出すか。
+#   virtual（既定）… BetterDisplay の仮想スクリーン $PROMO_VD_NAME へ出す。無ければ作り、
+#                    切れていれば繋ぐ。**常設なので作業後も削除・切断しない**（ユーザー指示:
+#                    隔離 tako の窓・セルフテスト・デバッグの GUI 検証は今後すべてここへ出す）
+#   main           … #470 以来の従来方式（メイン画面に出し、描画維持のため定期的に activate する）。
+#                    ユーザーの作業を邪魔するので A/B 用にだけ残す
+PROMO_STAGE=${TAKO_PROMO_STAGE:-virtual}
+PROMO_VD_NAME=${TAKO_PROMO_VD_NAME:-tako-vd}
+PROMO_BD_APP=/Applications/BetterDisplay.app
+PROMO_BD_BIN="$PROMO_BD_APP/Contents/MacOS/BetterDisplay"
+# 窓を仮想ディスプレイの左上からこれだけ内側へ置く（座標はポイント）
+PROMO_VD_PAD_X=${TAKO_PROMO_VD_PAD_X:-40}
+PROMO_VD_PAD_Y=${TAKO_PROMO_VD_PAD_Y:-60}
+PROMO_VD_READY=""
+
+# BetterDisplay の CLI（= アプリ本体を引数つきで起こす薄いクライアント。betterdisplaycli と同じ）。
+# 実測（4.3.5）: ①アプリが起動していないと応答せず固まる → alarm で切る
+# ②応答文は当てにならない（`set -connected=on` が「Failed.」と言いながら接続される /
+#   何も出さずに成功する）→ 結果は必ず CG のディスプレイ一覧（$PROMO_DISPLAYS）で確かめる
+# ③仮想スクリーンの tagID は操作のたびに並べ替わる → 使う直前に引き直す
+# ④`-name=` 指定の `set -connected=on` は複数のオブジェクトに当たり、同じ画面が 5 枚繋がった
+#   → 接続は tagID 指定で 1 回だけ
+# ⑤仮想スクリーンの作成・接続に Pro は要らない（`get -proAvailable` = off の機で実測）
+promo_bd() {
+    perl -e 'alarm 25; exec @ARGV' "$PROMO_BD_BIN" "$@" 2>/dev/null
+}
+
+# 仮想スクリーンの一覧（tagID<TAB>displayID<TAB>serial<TAB>name）
+promo_bd_virtual_screens() {
+    promo_bd get -identifiers | /usr/bin/python3 -c '
+import sys, json
+raw = sys.stdin.read().strip()
+try:
+    data = json.loads("[" + raw + "]")
+except Exception:
+    sys.exit(0)
+for d in data:
+    if d.get("deviceType") == "VirtualScreen":
+        print("\t".join(str(d.get(k, "")) for k in ("tagID", "displayID", "serial", "name")))
+'
+}
+
+promo_bd_vd_row() {
+    promo_bd_virtual_screens | awk -F'\t' -v n="$PROMO_VD_NAME" '$4==n {print; exit}'
+}
+
+# BetterDisplay を（未起動なら）起こして CLI が応答するまで待つ
+promo_bd_ensure_running() {
+    [ -x "$PROMO_BD_BIN" ] || {
+        echo "ERROR: BetterDisplay が無い（${PROMO_BD_APP}）。brew install --cask betterdisplay" >&2
+        return 1
+    }
+    if ! pgrep -x BetterDisplay >/dev/null 2>&1; then
+        echo "   BetterDisplay を起動します（仮想ディスプレイの器）"
+        open -g -a "$PROMO_BD_APP" || return 1
+    fi
+    local i
+    for i in $(seq 1 30); do
+        promo_bd get -identifiers | grep -q deviceType && return 0
+        sleep 1
+    done
+    echo "ERROR: BetterDisplay の CLI が応答しない（メニューバーにアイコンが出ているか確認）" >&2
+    return 1
+}
+
+# 仮想スクリーン $PROMO_VD_NAME が**いま繋がっている** CG のディスプレイ行を出す（繋がっていなければ 1）。
+# 繋がっているかは identifiers の `displayID`（未接続は "0"）で見る。`get -connected` は接続中でも
+# off を返すことがあり（実測）当てにならない。displayID が引けないときは BetterDisplay の配置
+# （"XxY"）と解像度（"WxH"）で CG の行を照合する
+promo_vd_cg_line() {
+    local row did tag place res
+    row=$(promo_bd_vd_row); [ -n "$row" ] || return 1
+    tag=$(printf '%s' "$row" | cut -f1); did=$(printf '%s' "$row" | cut -f2)
+    if [ -n "$did" ] && [ "$did" != 0 ]; then
+        "$PROMO_DISPLAYS" | awk -v d="$did" '$1==d {print; found=1; exit} END {exit found ? 0 : 1}' && return 0
+    fi
+    place=$(promo_bd get "-tagID=$tag" -placement); res=$(promo_bd get "-tagID=$tag" -resolution)
+    case "$place" in *x*) ;; *) return 1 ;; esac
+    "$PROMO_DISPLAYS" | awk -v x="${place%x*}" -v y="${place#*x}" -v w="${res%x*}" -v h="${res#*x}" \
+        '$2==x && $3==y && $4==w && $5==h {print; found=1; exit} END {exit found ? 0 : 1}'
+}
+
+# 常設の仮想ディスプレイ $PROMO_VD_NAME を使える状態にし、矩形を PROMO_VD_ID / _X / _Y / _W / _H へ
+# 入れる。窓の seed 位置（TAKO_PROMO_WIN_X / _Y）が未指定ならこの画面の左上 + 余白にする。
+# 2 回目以降は何もしない（1 プロセス内で冪等）
+promo_vd_prepare() {
+    [ -z "$PROMO_VD_READY" ] || return 0
+    promo_bd_ensure_running || return 1
+    local row tag i
+    row=$(promo_bd_vd_row)
+    if [ -z "$row" ]; then
+        echo "   仮想スクリーン ${PROMO_VD_NAME} を作成（16:9 / HiDPI・常設）"
+        promo_bd create -type=VirtualScreen "-virtualScreenName=$PROMO_VD_NAME" \
+            -aspectWidth=16 -aspectHeight=9 -virtualScreenHiDPI=on -virtualScreenSerial=1081 >/dev/null || true
+        for i in $(seq 1 10); do
+            row=$(promo_bd_vd_row); [ -n "$row" ] && break; sleep 1
+        done
+        [ -n "$row" ] || {
+            echo "ERROR: 仮想スクリーン ${PROMO_VD_NAME} を作れない（BetterDisplay の Virtual screens で手動作成する）" >&2
+            return 1
+        }
+    fi
+    tag=$(printf '%s' "$row" | cut -f1)
+    local line=""
+    if ! line=$(promo_vd_cg_line); then
+        echo "   仮想スクリーン ${PROMO_VD_NAME} を接続"
+        # tagID 指定で 1 回だけ。繋がっているのに重ねて set すると同じ画面が増えうるので、
+        # 「CG に居ない」ことを確かめてからしか打たない
+        promo_bd set "-tagID=$tag" -connected=on >/dev/null || true
+        for i in $(seq 1 20); do
+            line=$(promo_vd_cg_line) && break
+            line=""; sleep 1
+        done
+    fi
+    [ -n "$line" ] || {
+        echo "ERROR: 仮想ディスプレイ ${PROMO_VD_NAME} が CG のディスプレイ一覧に現れない" >&2
+        return 1
+    }
+    read -r PROMO_VD_ID PROMO_VD_X PROMO_VD_Y PROMO_VD_W PROMO_VD_H PROMO_VD_PXW _ _ <<<"$line"
+    # 960x540pt の窓を 1920x1080px で撮るには 2x（HiDPI）が必須
+    if [ "$PROMO_VD_PXW" -lt $((PROMO_VD_W * 2)) ]; then
+        echo "ERROR: 仮想ディスプレイが HiDPI でない（${PROMO_VD_W}pt = ${PROMO_VD_PXW}px）。" >&2
+        echo "       BetterDisplay の ${PROMO_VD_NAME} の設定で HiDPI（2x）の解像度を選ぶこと" >&2
+        return 1
+    fi
+    # 窓の置き場所。常設の画面は他の worker の隔離 tako とも共有するので、既にある窓と
+    # 重ならない空きへ置く（重ねられて隠れると GPUI が描画を止め、同じ絵が撮れ続ける）
+    if [ -z "${TAKO_PROMO_WIN_X:-}" ] || [ -z "${TAKO_PROMO_WIN_Y:-}" ]; then
+        local origin
+        origin=$(promo_vd_free_origin "${TAKO_PROMO_WIN_W:-960}" "${TAKO_PROMO_WIN_H:-600}")
+        TAKO_PROMO_WIN_X=${origin% *}; TAKO_PROMO_WIN_Y=${origin#* }
+    fi
+    PROMO_VD_READY=1
+    echo "   舞台: 仮想ディスプレイ ${PROMO_VD_NAME}（id=${PROMO_VD_ID} ${PROMO_VD_X},${PROMO_VD_Y} ${PROMO_VD_W}x${PROMO_VD_H}pt / ${PROMO_VD_PXW}px 幅）窓は ${TAKO_PROMO_WIN_X},${TAKO_PROMO_WIN_Y} へ"
+}
+
+# 仮想ディスプレイの中で、いま画面に出ている窓（PID を問わない）と重ならない w x h の置き場所を
+# 「x y」で返す。左上から右へ、行が埋まれば下へ探し、空きが無ければ左上（重なる）に落ちる。
+# 他の worker の隔離 tako と同じ画面を分け合うためのもの
+promo_vd_free_origin() {
+    local w=$1 h=$2
+    "$PROMO_WINBOUNDS" --all 2>/dev/null | awk -v w="$w" -v h="$h" \
+        -v X="$PROMO_VD_X" -v Y="$PROMO_VD_Y" -v W="$PROMO_VD_W" -v H="$PROMO_VD_H" \
+        -v px="$PROMO_VD_PAD_X" -v py="$PROMO_VD_PAD_Y" '
+        { n++; wx[n]=$3; wy[n]=$4; ww[n]=$5; wh[n]=$6 }
+        END {
+            # 余白の刻みで総当たり（窓幅の刻みだと 1 枚の大きな窓の右の空きを見逃す = 実測）
+            for (y = Y + py; y + h <= Y + H; y += py) {
+                for (x = X + px; x + w <= X + W; x += px) {
+                    ok = 1
+                    for (i = 1; i <= n; i++) {
+                        if (wx[i] < x + w && x < wx[i] + ww[i] && wy[i] < y + h && y < wy[i] + wh[i]) { ok = 0; break }
+                    }
+                    if (ok) { print x, y; exit }
+                }
+            }
+            print X + px, Y + py
+        }'
+}
+
+# 舞台の準備（stage が main なら何もしない）。隔離インスタンスを起こす前に呼ぶ
+promo_stage_prepare() {
+    case "$PROMO_STAGE" in
+        virtual) promo_vd_prepare ;;
+        main) return 0 ;;
+        *) echo "ERROR: TAKO_PROMO_STAGE は virtual か main（${PROMO_STAGE}）" >&2; return 1 ;;
+    esac
+}
+
+# 隔離 tako の窓（$1 = pid）が仮想ディスプレイの矩形に収まっているか（0 = 収まっている）。
+# 判定に使った矩形は PROMO_WIN_LAST_BOUNDS（"wid x y w h"）に残す
+promo_vd_window_inside() {
+    local b
+    b=$("$PROMO_WINBOUNDS" "$1" 2>/dev/null) || return 1
+    PROMO_WIN_LAST_BOUNDS=$b
+    echo "$b" | awk -v X="$PROMO_VD_X" -v Y="$PROMO_VD_Y" -v W="$PROMO_VD_W" -v H="$PROMO_VD_H" \
+        '{exit ($2>=X && $3>=Y && $2+$4<=X+W && $3+$5<=Y+H) ? 0 : 1}'
+}
+
+# 窓を仮想ディスプレイへ移す（System Events の AX 経由。GPUI の窓にも効く = 実測）
+promo_vd_move_window() {
+    local pid=$1 x=$((PROMO_VD_X + PROMO_VD_PAD_X)) y=$((PROMO_VD_Y + PROMO_VD_PAD_Y))
+    osascript -e "tell application \"System Events\" to tell (first application process whose unix id is $pid) to set position of window 1 to {$x, $y}" >/dev/null 2>&1
+}
+
+# 窓が仮想ディスプレイの中にあることを確かめ、外なら移す。結果は必ず 1 行残す（受け入れの証拠）
+promo_vd_place_window() {
+    local pid=$1
+    # 窓が見つからない理由の大半は「隔離 tako が居ない」（外から kill された / 起動に失敗した）。
+    # 09-06 の実測: 本番 GUI の再起動に巻き込まれて隔離 tako が SIGTERM で落ち、
+    # 「窓を移せない（?）」と出て収録が止まった。理由が分かる形で止める
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "ERROR: 隔離 tako（pid ${pid}）が終了している。${PROMO_WORK:-}/app.log と data/persist.log を確認" >&2
+        return 1
+    fi
+    if ! promo_vd_window_inside "$pid"; then
+        echo "   窓が仮想ディスプレイの外（${PROMO_WIN_LAST_BOUNDS:-?}）→ 移動"
+        promo_vd_move_window "$pid"; sleep 0.5
+        promo_vd_window_inside "$pid" || {
+            echo "ERROR: 窓を仮想ディスプレイへ移せない（${PROMO_WIN_LAST_BOUNDS:-?}）" >&2
+            return 1
+        }
+    fi
+    echo "   窓 ${PROMO_WIN_LAST_BOUNDS} は仮想ディスプレイ ${PROMO_VD_X},${PROMO_VD_Y} ${PROMO_VD_W}x${PROMO_VD_H} の中"
+}
+
+# 前面のアプリの pid（System Events）。取れなければ空
+promo_frontmost_pid() {
+    osascript -e 'tell application "System Events" to get unix id of first application process whose frontmost is true' 2>/dev/null
+}
+
+# 隔離 tako は起動時に自分を activate する（tako-app の `cx.activate(true)`）ので、窓が仮想
+# ディスプレイ側でもキー入力の宛先が一瞬そちらへ移る。**隔離 tako が前面になっているときだけ**
+# 起動前に前面だったアプリ（$1）へ戻す（ユーザーがその間に別のアプリへ移っていたら触らない）
+promo_give_back_focus() {
+    local prev=$1
+    [ -n "$prev" ] && [ "$prev" != "${PROMO_APP_PID:-}" ] || return 0
+    [ "$(promo_frontmost_pid)" = "${PROMO_APP_PID:-}" ] || return 0
+    osascript -e "tell application \"System Events\" to set frontmost of (first application process whose unix id is $prev) to true" >/dev/null 2>&1 || true
+}
+
 # ── 隔離インスタンス ───────────────────────────────────────────────
 # $1 = 作業ディレクトリ, $2 = tmux ソケット名, $3 = persist（1 で永続化 ON）
 # 追加の環境変数は PROMO_EXTRA_ENV 配列（"KEY=VALUE" 形式）で渡す
 promo_start_isolated() {
     local work=$1 socket=$2 persist=${3:-0}
     mkdir -p "$work/discovery" "$work/data"
+    # 舞台（仮想ディスプレイ）を先に用意し、呼び出し側が窓の位置を seed していなければ
+    # GPUI 既定サイズ（960x600pt）の窓を仮想ディスプレイ側へ seed する = 起動の瞬間から
+    # メイン画面に出ない（record-scenes.sh のように seed しない呼び出し側のため）
+    promo_stage_prepare || return 1
+    if [ "$PROMO_STAGE" = virtual ] && [ ! -f "$work/data/layout.json" ]; then
+        promo_seed_window_frame "$work" 960 600
+    fi
+    local front_before=""
+    [ "$PROMO_STAGE" = virtual ] && front_before=$(promo_frontmost_pid)
     (
         cd "$PROMO_DEMO/awesome-app"
         env "${PROMO_ENV_CLEAN[@]}" \
@@ -526,7 +826,19 @@ promo_start_isolated() {
     fi
     PROMO_SOCKET_PATH="$work/data/tako.sock"
     PROMO_TOKEN=$(cat "$work/data/token")
-    sleep 3
+    # 起動時の activate で奪われたキーフォーカスを元のアプリへ返す（窓が出た直後と、
+    # GPUI の初期化が落ち着いた後の 2 回。奪われていなければ何もしない）
+    if [ "$PROMO_STAGE" = virtual ]; then
+        for i in $(seq 1 20); do
+            "$PROMO_WINBOUNDS" "$PROMO_APP_PID" >/dev/null 2>&1 && break
+            sleep 0.25
+        done
+        promo_give_back_focus "$front_before"
+        sleep 3
+        promo_give_back_focus "$front_before"
+    else
+        sleep 3
+    fi
 }
 
 # アプリだけを止め、器（tmux セッション）は生かしておく（#1081 の再起動復元シーン）。
@@ -584,12 +896,19 @@ promo_base_pane() {
 # $1 = 出力 mp4, $2 = 尺（秒）。収録は background で走り promo_record_wait で待つ。
 promo_record_start() {
     local out=$1 dur=$2
-    # GPUI のウィンドウは完全に隠れると描画を止める。撮る直前に最前面へ出す
-    "$PROMO_WINBOUNDS" "$PROMO_APP_PID" --activate >/dev/null 2>&1 || true
+    if [ "$PROMO_STAGE" = virtual ]; then
+        # 仮想ディスプレイの窓は何にも隠れないので activate は要らない（ユーザーのフォーカスも奪わない）。
+        # 窓がその画面に収まっていることだけ確かめる（外なら移す）
+        promo_vd_place_window "$PROMO_APP_PID" || return 1
+    else
+        # GPUI のウィンドウは完全に隠れると描画を止める。撮る直前に最前面へ出す
+        "$PROMO_WINBOUNDS" "$PROMO_APP_PID" --activate >/dev/null 2>&1 || true
+    fi
     # 実際にキャプチャできるウィンドウが現れるまで待ってから収録に入る
     promo_wait_window || return 1
     local wid=$PROMO_WID
     echo "   対象ウィンドウ: id=$wid ${PROMO_WIN_GEOM// /x}（尺 ${dur}s）"
+    echo "RECORDING START $(basename "${out%.*}") stage=${PROMO_STAGE} window=${PROMO_WIN_LAST_BOUNDS:-${PROMO_WIN_GEOM}}"
 
     PROMO_REC_OUT=$out
     PROMO_REC_DUR=$dur
@@ -605,10 +924,15 @@ promo_record_start() {
             i=$((i + 1))
             local f
             f=$(printf '%s/f%05d.png' "$PROMO_REC_DIR" "$i")
-            # 対象ウィンドウが他のウィンドウの背後に回ると GPUI が描画を止め、
-            # 同じ絵が撮れ続ける。定期的に最前面へ戻して描画を維持する（#470 v2）
             if [ $((i % 20)) -eq 1 ]; then
-                "$PROMO_WINBOUNDS" "$PROMO_APP_PID" --activate >/dev/null 2>&1 || true
+                if [ "$PROMO_STAGE" = virtual ]; then
+                    # 何かの拍子に窓がメイン画面へ動いていたら戻す（activate はしない）
+                    promo_vd_window_inside "$PROMO_APP_PID" || promo_vd_move_window "$PROMO_APP_PID" || true
+                else
+                    # 対象ウィンドウが他のウィンドウの背後に回ると GPUI が描画を止め、
+                    # 同じ絵が撮れ続ける。定期的に最前面へ戻して描画を維持する（#470 v2）
+                    "$PROMO_WINBOUNDS" "$PROMO_APP_PID" --activate >/dev/null 2>&1 || true
+                fi
             fi
             if screencapture -x -o -l"$wid" "$f" 2>/dev/null && [ -s "$f" ]; then
                 last=$f; miss=0
@@ -653,6 +977,7 @@ promo_record_wait() {
     local fps
     fps=$(/usr/bin/python3 -c "print(f'{$n/$PROMO_REC_DUR:.3f}')")
     echo "   $n 枚 / ${PROMO_REC_DUR}s = ${fps} fps → エンコード"
+    echo "RECORDING END $(basename "${PROMO_REC_OUT%.*}") frames=${n}"
     rm -f "$PROMO_REC_OUT"
     ffmpeg -hide_banner -loglevel error -framerate "$fps" \
         -i "$PROMO_REC_DIR/f%05d.png" \
@@ -682,7 +1007,8 @@ promo_verify() {
     if [ "${total:-0}" -gt 3 ] && [ "$((distinct * 3))" -lt "$total" ]; then
         echo "!! 警告: 素材がほとんど動いていない（${distinct}/${total}）。" >&2
         echo "!! 収録ウィンドウが他のウィンドウに隠れて描画が止まっていた可能性が高い。" >&2
-        echo "!! 収録対象ウィンドウを最前面にしてから撮り直すこと。" >&2
+        echo "!! 仮想ディスプレイ（${PROMO_VD_NAME}）が繋がっていて窓がその中にあるか、" >&2
+        echo "!! （stage=main なら最前面にあるか）を確かめてから撮り直すこと。" >&2
         return 1
     fi
     # 全黒フレーム（TCC 権限喪失）の自動検出

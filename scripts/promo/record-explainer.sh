@@ -17,6 +17,10 @@
 #   windows … 8. Windows と OSS（対応状況ページ / LICENSE / README / brew カード）
 #
 # 各シーンは lib.sh の隔離インスタンス（TAKO_ISOLATED=1 + 明示ソケット + デモ HOME）で撮る。
+# 隔離 tako の窓は**仮想ディスプレイ**（BetterDisplay の `tako-vd`。常設）へ出すので、
+# 収録中もユーザーのメイン画面には何も出ない（`TAKO_PROMO_STAGE=main` で従来方式）。
+# 収録の開始と終了は `RECORDING START <scene>-raw ...` / `RECORDING END <scene>-raw ...` の
+# 1 行ずつで分かる（GUI 再起動などを避けてもらうための合図）。
 # 収録中に CLI 操作をした瞬間を promo_beat で <scene>-beats.tsv に残し、
 # build-explainer.sh がそれを in 点にしてテロップ・ナレーションを合わせる。
 # 出力: ~/Desktop/tako-promo/scenes/<scene>-raw.mp4 + <scene>-beats.tsv
@@ -38,6 +42,8 @@ explainer_begin() {
     local scene=$1 work=$2 socket=$3 persist=${4:-0}
     echo "== scene $scene"
     promo_wait_capturable "${TAKO_PROMO_WAIT_UNLOCK:-0}" || promo_check_capturable
+    # 舞台（仮想ディスプレイ）を先に用意する = 窓の seed 位置がその画面の中になる
+    promo_stage_prepare || return 1
     rm -rf "$work"
     promo_seed_window_frame "$work" 960 540
     promo_start_isolated "$work" "$socket" "$persist"
@@ -315,6 +321,10 @@ scene_master() {
         "HOME=$PROMO_DEMO/home"
         "PATH=$PROMO_DEMO/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         "ANTHROPIC_MODEL=$FAST_MODEL"
+        # worker への指示は従来のキー操作経路（#32）で届ける。第 1 層（#790 の Cross-Session
+        # Messaging）だと worker の画面に「別セッションからの指示として扱え」の定型文が
+        # 冒頭に大きく出て、視聴者には無関係な注意書きが worker ペインを埋める
+        "TAKO_PEER_MESSAGING=off"
     )
     # チャット表示（かんたん表示）の判定は agents 走査 → tmux ペインの pid 対応付けに乗るので
     # **器（tmux バックエンド）が要る**。persist=0 だと claude ペインが永久に terminal のまま
@@ -343,9 +353,12 @@ scene_master() {
     sleep 14
     promo_beat request
     # --await-prompt は送達検証で Enter を撃ち直すため、生成中の master を中断させることがある。
-    # ここは 1 回だけ素直に送る（#470 v3 の教訓）
+    # ここは 1 回だけ素直に送る（#470 v3 の教訓）。
+    # 「同時に」「run ではなく spawn」「ペインは閉じない」は絵のための指定: 2026-09-06 の実測では
+    # master（sonnet・medium）が `tako_orchestrator_run` を 1 体ずつ直列に回し、各 worker を完了直後に
+    # auto_close したので、3 体が並ぶ絵・orch ビュー・かんたん表示が一度も撮れなかった
     tko send --pane "$base" \
-        "worker を 3 体 spawn して。project は awesome-app。それぞれ 'api' / 'ui' / 'docs' を担当し、プロンプトは「bash scripts/task.sh <担当名> を実行して、出力の最終行を報告して」でよい。確認は不要、すぐ spawn して。3 体の報告が揃ったら結果を 3 行でまとめて。" \
+        "worker を 3 体、tako_orchestrator_spawn で同時に立てて（tako_orchestrator_run は使わない）。project は awesome-app。担当は 'api' / 'ui' / 'docs' で、各 worker へのプロンプトは「bash scripts/task.sh <担当名> を実行して、出力の最終行を報告して」でよい。確認は不要、すぐ spawn して。worker のペインは閉じないでそのまま残して。3 体の報告が揃ったら結果を 3 行でまとめて。" \
         >/dev/null 2>&1 || true
     # worker ペインが出そろうまで待つ（最大 240s。spawn は 1 体 40 秒前後 = 実測）
     local i n=0
