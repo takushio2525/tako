@@ -846,6 +846,12 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
             "ログインシェル経由のフォールバック（`#[cfg(unix)]`）",
         ),
         (
+            "crates/tako-core/src/platform/display.rs",
+            1,
+            "`system_profiler`（境界 B26 の macOS 実装。`#[cfg(target_os = \"macos\")]` の \
+             内側なので Windows からは到達しない。#1141）",
+        ),
+        (
             "crates/tako-core/src/platform/exe.rs",
             1,
             "境界 B16 の unix 実装（ログインシェル経由）。Windows 実装は子プロセスを起こさない",

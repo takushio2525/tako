@@ -43,7 +43,9 @@ pub const DEFAULT_VIRTUAL_DISPLAY_NAME: &str = "tako-vd";
 /// 窓を置くディスプレイを指定する環境変数。値は「名前 | UUID | index」
 pub const ENV_DISPLAY: &str = "TAKO_DISPLAY";
 
-/// 名前引きにかける時間の上限。超えたら名前無しで進む（起動を待たせない）
+/// 名前引きにかける時間の上限。超えたら名前無しで進む（起動を待たせない）。
+/// 名前を引ける実装を持つプラットフォームでしか使わない
+#[cfg(target_os = "macos")]
 const NAME_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// ディスプレイの矩形（論理ピクセル。左上原点のグローバル座標）。
