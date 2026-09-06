@@ -1549,6 +1549,10 @@ enum OrchestratorCommand {
         /// worker 領域内の配置アルゴリズム: grid（十字四分割系。既定）/ spiral（縦横交互の半分割）
         #[arg(long)]
         algorithm: Option<String>,
+        /// worker ペイン 1 枚に保証する最小の桁数（既定 60。0 = 保証しない / 20〜400）。
+        /// 割る spawn は同じタブへ割らず別のタブへ出る（#1132）
+        #[arg(long)]
+        min_worker_cols: Option<u16>,
     },
     /// 子 worker を spawn する（split + エージェント CLI 起動 + プロンプト送信）
     Spawn {
@@ -3080,6 +3084,7 @@ fn cli_main() -> ExitCode {
             ref policy,
             master_ratio,
             ref algorithm,
+            min_worker_cols,
         }) => {
             // config.yaml のみの操作のため IPC 不要。dispatch と同一関数を共用する
             // （MCP `tako_orchestrator_layout` と 1:1。二重実装を作らない）
@@ -3087,6 +3092,7 @@ fn cli_main() -> ExitCode {
                 policy.as_deref(),
                 master_ratio,
                 algorithm.as_deref(),
+                min_worker_cols,
             )
             .map_err(|e| e.to_string())
             .map(|result| println!("{}", pretty_json(&result)))

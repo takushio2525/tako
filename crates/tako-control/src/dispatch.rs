@@ -2830,7 +2830,13 @@ fn dispatch_inner(
             policy,
             master_ratio,
             algorithm,
-        } => dispatch_orchestrator_layout(policy.as_deref(), master_ratio, algorithm.as_deref()),
+            min_worker_cols,
+        } => dispatch_orchestrator_layout(
+            policy.as_deref(),
+            master_ratio,
+            algorithm.as_deref(),
+            min_worker_cols,
+        ),
 
         Request::OrchestratorSelf {
             pane,
@@ -6974,7 +6980,9 @@ pub fn dispatch_orchestrator_layout(
     policy: Option<&str>,
     master_ratio: Option<f32>,
     algorithm: Option<&str>,
+    min_worker_cols: Option<u16>,
 ) -> Result<Value, DispatchError> {
+    use tako_core::spawn_layout::{MIN_WORKER_COLS_FLOOR, MIN_WORKER_COLS_MAX};
     // 検証は書き込み前に完了させる（不正値ではロックを取らない）
     let policy = policy
         .map(tako_core::SpawnLayoutPolicy::parse)
@@ -6987,12 +6995,22 @@ pub fn dispatch_orchestrator_layout(
             )));
         }
     }
+    if let Some(c) = min_worker_cols {
+        if c != 0 && !(MIN_WORKER_COLS_FLOOR..=MIN_WORKER_COLS_MAX).contains(&c) {
+            return Err(DispatchError::InvalidParams(format!(
+                "min_worker_cols は 0（保証しない）か {MIN_WORKER_COLS_FLOOR}〜{MIN_WORKER_COLS_MAX} で指定してください（指定値: {c}）"
+            )));
+        }
+    }
     let algorithm = algorithm
         .map(tako_core::WorkerLayoutAlgorithm::parse)
         .transpose()
         .map_err(DispatchError::InvalidParams)?;
 
-    let changed = policy.is_some() || master_ratio.is_some() || algorithm.is_some();
+    let changed = policy.is_some()
+        || master_ratio.is_some()
+        || algorithm.is_some()
+        || min_worker_cols.is_some();
     let resolved = if changed {
         crate::setup::mutate_config(|config| {
             if let Some(p) = policy {
@@ -7003,6 +7021,9 @@ pub fn dispatch_orchestrator_layout(
             }
             if let Some(a) = algorithm {
                 config.spawn_layout.algorithm = Some(a.as_str().to_string());
+            }
+            if let Some(c) = min_worker_cols {
+                config.spawn_layout.min_worker_cols = Some(c);
             }
             config.spawn_layout.resolve()
         })
@@ -7019,6 +7040,11 @@ pub fn dispatch_orchestrator_layout(
         "policy": resolved.policy.as_str(),
         "master_ratio": ratio,
         "algorithm": resolved.algorithm.as_str(),
+        // #1132: worker ペイン 1 枚に保証する最小の桁数（0 = 保証しない）。
+        // これを割る spawn は同じタブへ割らず別のタブへ出る
+        "min_worker_cols": resolved.min_worker_cols,
+        "min_worker_cols_default": tako_core::spawn_layout::DEFAULT_MIN_WORKER_COLS,
+        "min_worker_cols_range": [MIN_WORKER_COLS_FLOOR, MIN_WORKER_COLS_MAX],
         "updated": changed,
         "config_path": crate::setup::config_yaml_path().ok(),
     }))
@@ -8082,6 +8108,199 @@ struct SpawnParams<'a> {
     limit_resume: Option<bool>,
 }
 
+/// #1132 の A/B。`TAKO_1132_LEGACY=1` で下限幅の保証をせず、どんなに狭くなっても
+/// 同じタブへ割る（= #1132 前の挙動）
+fn legacy_worker_min_width() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_1132_LEGACY").is_some())
+}
+
+/// worker を置く先（#1132）。`tab` が None なら新しいタブを作って root ペインにする
+struct WorkerPlacement {
+    tab: Option<TabId>,
+    /// 置き先タブでの分割元。新しいタブのときは spawned_by に使う元の master
+    anchor: PaneId,
+    /// 応答の `placement`: same_tab / overflow_tab / new_tab
+    kind: &'static str,
+    /// 同じタブへ置かなかった理由（置いたときは None）
+    reason: Option<String>,
+    /// 見積もった桁数（実測が無くて見積もれなければ None）
+    predicted_cols: Option<u16>,
+    min_cols: u16,
+}
+
+/// タブ `tab` の `anchor` へ worker を 1 体足したとき、worker ペインの中で
+/// いちばん狭くなるものの桁数を見積もる（#1132）。実測が無ければ None
+fn predicted_worker_cols(
+    host: &dyn ControlHost,
+    tab: TabId,
+    anchor: PaneId,
+    layout: &tako_core::SpawnLayoutConfig,
+) -> Option<u16> {
+    let tree = host.workspace().get_tab(tab)?.tree();
+    if !tree.contains(anchor) {
+        return None;
+    }
+    let rects = tree.layout(tako_core::Rect::UNIT);
+    let width_of = |id: PaneId| rects.iter().find(|(p, _)| *p == id).map(|(_, r)| *r);
+    let anchor_rect = width_of(anchor)?;
+    // 既存の worker 領域は「外接矩形の幅」で測る（領域はサブツリー = 矩形）
+    let area = tree.worker_area_panes(anchor).and_then(|ids| {
+        let mut left = f32::INFINITY;
+        let mut right = f32::NEG_INFINITY;
+        for id in &ids {
+            let r = width_of(*id)?;
+            left = left.min(r.x);
+            right = right.max(r.x + r.width);
+        }
+        Some(tako_core::spawn_layout::WorkerArea {
+            width: (right - left).max(0.0),
+            count: ids.len(),
+        })
+    });
+    let share = tako_core::spawn_layout::prospective_narrowest_worker_share(
+        layout,
+        anchor_rect.width,
+        area,
+    );
+    host.pane_cols_for_width_fraction(tab, share)
+}
+
+/// worker の置き先を決める（#1132）。
+///
+/// 同じタブの worker 領域が下限幅を割るなら、①この master 由来の worker だけが居る
+/// 既存タブ（= 前にあふれた先）で余裕のあるもの → ②新しいタブ の順に落とす。
+/// 見積もれない・下限を切っていない・そもそも新しいタブでも足りないときは同じタブへ置く
+/// （見積もれないことや、そもそも達成できない下限を理由に spawn を止めない）
+fn plan_worker_placement(
+    host: &dyn ControlHost,
+    tab_id: TabId,
+    target: PaneId,
+    layout: &tako_core::SpawnLayoutConfig,
+) -> WorkerPlacement {
+    let min_cols = layout.min_worker_cols;
+    let same_tab = |predicted: Option<u16>| WorkerPlacement {
+        tab: Some(tab_id),
+        anchor: target,
+        kind: "same_tab",
+        reason: None,
+        predicted_cols: predicted,
+        min_cols,
+    };
+    if min_cols == 0 || legacy_worker_min_width() {
+        return same_tab(None);
+    }
+    let Some(predicted) = predicted_worker_cols(host, tab_id, target, layout) else {
+        // 画面の実測が無い（GUI 外・まだ一度も描かれていない）= 見積もれない
+        return same_tab(None);
+    };
+    if predicted >= min_cols {
+        return same_tab(Some(predicted));
+    }
+    // 新しいタブ（= 全幅）でも下限に届かないなら、下限そのものが達成できない。
+    // タブを増やしても解決しないので同じタブへ置く（理由は応答に載せる）
+    let full_tab_cols = host.pane_cols_for_width_fraction(tab_id, 1.0);
+    if full_tab_cols.is_some_and(|c| c < min_cols) {
+        return WorkerPlacement {
+            tab: Some(tab_id),
+            anchor: target,
+            kind: "same_tab",
+            reason: Some(format!(
+                "ウィンドウ幅がそもそも下限に届かない（タブ全幅 {} 桁 < 下限 {min_cols} 桁）ので同じタブへ置いた。\n  直すには: ウィンドウを広げる / 文字サイズを下げる / tako orchestrator layout --min-worker-cols <桁>",
+                full_tab_cols.unwrap_or(0)
+            )),
+            predicted_cols: Some(predicted),
+            min_cols,
+        };
+    }
+
+    // ① この master 由来の worker だけが居るタブ（前にあふれた先）で余裕のあるもの
+    let descendants = spawn_descendants_across_tabs(host.workspace(), target);
+    for tab in host.workspace().tabs() {
+        if tab.id() == tab_id {
+            continue;
+        }
+        let panes = tab.tree().panes();
+        if panes.is_empty() || !panes.iter().all(|p| descendants.contains(&p.id())) {
+            continue;
+        }
+        // そのタブの左上ペインを分割元にする（あふれ先タブでは最初に置いた worker）
+        let Some(local_anchor) = top_left_pane(tab.tree()) else {
+            continue;
+        };
+        if let Some(cols) = predicted_worker_cols(host, tab.id(), local_anchor, layout) {
+            if cols >= min_cols {
+                return WorkerPlacement {
+                    tab: Some(tab.id()),
+                    anchor: local_anchor,
+                    kind: "overflow_tab",
+                    reason: Some(format!(
+                        "同じタブへ置くと worker ペインが {predicted} 桁（下限 {min_cols} 桁）になるので、\n  すでにこの master の worker が居るタブ {} へ置いた（{cols} 桁）",
+                        tab.id().as_u64()
+                    )),
+                    predicted_cols: Some(cols),
+                    min_cols,
+                };
+            }
+        }
+    }
+
+    // ② 新しいタブ（worker が root = 全幅）
+    WorkerPlacement {
+        tab: None,
+        anchor: target,
+        kind: "new_tab",
+        reason: Some(format!(
+            "同じタブへ置くと worker ペインが {predicted} 桁（下限 {min_cols} 桁）になるので、新しいタブへ置いた。\n  同じタブへ詰めたいときは: tako orchestrator layout --min-worker-cols <桁>（0 で保証しない）"
+        )),
+        predicted_cols: full_tab_cols,
+        min_cols,
+    }
+}
+
+/// `spawned_by` チェーンで `anchor` に到達するペイン（**タブをまたいで**探す）。
+/// あふれ先タブの判定に使う
+fn spawn_descendants_across_tabs(
+    ws: &tako_core::Workspace,
+    anchor: PaneId,
+) -> std::collections::HashSet<PaneId> {
+    use std::collections::{HashMap, HashSet};
+    let mut spawn_map: HashMap<PaneId, Option<PaneId>> = HashMap::new();
+    for tab in ws.tabs() {
+        for pane in tab.tree().panes() {
+            spawn_map.insert(pane.id(), pane.spawned_by());
+        }
+    }
+    let mut out: HashSet<PaneId> = HashSet::new();
+    for &id in spawn_map.keys() {
+        let mut cur = id;
+        let mut seen = HashSet::new();
+        while let Some(Some(parent)) = spawn_map.get(&cur).copied() {
+            if !seen.insert(cur) {
+                break; // 保存データ破損などによる循環の防御
+            }
+            if parent == anchor {
+                out.insert(id);
+                break;
+            }
+            cur = parent;
+        }
+    }
+    out
+}
+
+/// ツリーの左上のペイン（あふれ先タブでの分割元 = 最初に置いた worker）
+fn top_left_pane(tree: &tako_core::PaneTree) -> Option<PaneId> {
+    tree.layout(tako_core::Rect::UNIT)
+        .into_iter()
+        .min_by(|(_, a), (_, b)| {
+            (a.x, a.y)
+                .partial_cmp(&(b.x, b.y))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(id, _)| id)
+}
+
 fn dispatch_orchestrator_spawn(
     host: &mut dyn ControlHost,
     origin: PaneOrigin,
@@ -8202,11 +8421,33 @@ fn dispatch_orchestrator_spawn(
     // 既定 = master-reserved（spawn 元の取り分を維持し、worker は右側の worker 領域内へ
     // grid 配置）。領域判定は既存 worker の spawned_by チェーンによる
     let layout = crate::setup::spawn_layout_config();
-    tree_mut(host.workspace_mut(), tab_id)
-        .spawn_worker(target, new_pane, &layout)
-        .map_err(op_err)?;
-    // MCP/CLI 経由ではフォーカスを分割元に維持（ユーザーの入力を奪わない）
-    let _ = tree_mut(host.workspace_mut(), tab_id).focus(target);
+    // #1132: worker ペイン 1 枚の下限幅を割るなら同じタブへ割らず別のタブへ出す
+    // （21〜25 桁まで狭まると claude TUI がハード折り返しして検知全般が壊れる）
+    let placement = plan_worker_placement(host, tab_id, target, &layout);
+    let placement_kind = placement.kind;
+    let placement_reason = placement.reason.clone();
+    let placement_predicted = placement.predicted_cols;
+    let placement_min = placement.min_cols;
+    let (tab_id, target) = match placement.tab {
+        Some(tab) => {
+            let anchor = placement.anchor;
+            tree_mut(host.workspace_mut(), tab)
+                .spawn_worker(anchor, new_pane, &layout)
+                .map_err(op_err)?;
+            // MCP/CLI 経由ではフォーカスを分割元に維持（ユーザーの入力を奪わない）
+            let _ = tree_mut(host.workspace_mut(), tab).focus(anchor);
+            (tab, anchor)
+        }
+        None => {
+            // 新しいタブ: worker が root ペイン = 全幅。表示中のタブは奪わない
+            let prev_active = host.workspace().active_tab_id();
+            let tab = host
+                .workspace_mut()
+                .create_tab(format!("{project} workers"), new_pane);
+            let _ = host.workspace_mut().activate_tab(prev_active);
+            (tab, placement.anchor)
+        }
+    };
     let options = SpawnOptions {
         command: None,
         cwd: Some(std::path::PathBuf::from(&cwd)),
@@ -8420,6 +8661,13 @@ fn dispatch_orchestrator_spawn(
     Ok(json!({
         "pane_id": new_id.as_u64(),
         "spawned_by": target.as_u64(),
+        // #1132: どのタブへ出したか（同じタブへ置けなかったときは master のタブと違う）
+        "tab": tab_id.as_u64(),
+        "placement": placement_kind,
+        "placement_reason": placement_reason,
+        // 見積もった worker ペインの桁数と、保証した下限（0 = 保証しない）
+        "pane_cols": placement_predicted,
+        "min_worker_cols": placement_min,
         "title": window_title,
         "cwd": cwd,
         "agent": worker_agent.as_str(),
@@ -12068,6 +12316,8 @@ mod tests {
         /// #1006: 実 PTY のセッション（既存ペインの SSH 化は「素のシェルか」を
         /// セッションから判定するので、モックでは実物を持たせる）
         sessions: std::collections::HashMap<u64, TerminalSession>,
+        /// #1132: タブ内容領域の幅（桁。実測の代役）。None = 実測が無い
+        tab_cols: Option<f32>,
     }
 
     impl MockHost {
@@ -12103,6 +12353,7 @@ mod tests {
                 menu_ops: Vec::new(),
                 backend_sessions: std::collections::HashMap::new(),
                 sessions: std::collections::HashMap::new(),
+                tab_cols: None,
                 welcome_banner: false,
                 autosuggest: true,
                 autosuggest_hint: true,
@@ -12188,6 +12439,13 @@ mod tests {
     }
 
     impl UiStateHost for MockHost {
+        /// #1132: 幅比 → 桁数。GUI の実測（`PaneWidthMetrics`）の代役として
+        /// 「タブ幅 × 幅比」を返す（枠と余白は桁数に対して小さいので省く）
+        fn pane_cols_for_width_fraction(&self, _tab: TabId, fraction: f32) -> Option<u16> {
+            self.tab_cols
+                .map(|cols| (cols * fraction).floor().clamp(0.0, f32::from(u16::MAX)) as u16)
+        }
+
         fn request_window_state(
             &mut self,
             window: tako_core::WindowId,
@@ -21167,5 +21425,158 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, DispatchError::PaneNotFound(999_999)));
+    }
+
+    // --- #1132: worker ペインの最小幅の保証 ---
+
+    /// #1132 のテスト用に「master + worker n 体」のタブを組む。
+    /// spawn 経路と同じ手順（`spawn_worker` → `set_spawned_by`）を通す
+    fn layout_with_workers(host: &mut MockHost, workers: usize) -> (TabId, PaneId) {
+        let tab = host.ws.active_tab_id();
+        let master = host.ws.get_tab(tab).unwrap().tree().focused();
+        let layout = tako_core::SpawnLayoutConfig::default();
+        for _ in 0..workers {
+            let pane = Pane::new(PaneOrigin::Mcp);
+            let id = pane.id();
+            let tree = host.ws.get_tab_mut(tab).unwrap().tree_mut();
+            tree.spawn_worker(master, pane, &layout).unwrap();
+            tree.get_mut(id).unwrap().set_spawned_by(Some(master));
+        }
+        (tab, master)
+    }
+
+    #[test]
+    fn issue1132_下限を満たすなら同じタブへ置く() {
+        let mut host = MockHost::new();
+        // 400 桁のタブ: master 半分 = 200 桁、worker 領域 200 桁
+        host.tab_cols = Some(400.0);
+        let (tab, master) = layout_with_workers(&mut host, 2);
+        let layout = tako_core::SpawnLayoutConfig::default();
+        let plan = plan_worker_placement(&host, tab, master, &layout);
+        assert_eq!(plan.kind, "same_tab");
+        assert_eq!(plan.tab, Some(tab));
+        assert_eq!(plan.anchor, master);
+        assert!(plan.reason.is_none());
+        // grid(3) は 2 列なので領域 200 桁 → 100 桁
+        assert_eq!(plan.predicted_cols, Some(100));
+        assert_eq!(
+            plan.min_cols,
+            tako_core::spawn_layout::DEFAULT_MIN_WORKER_COLS
+        );
+    }
+
+    #[test]
+    fn issue1132_下限を割るなら新しいタブへ出す() {
+        let mut host = MockHost::new();
+        // 実測（#1132）と同じ約 124 桁のタブ
+        host.tab_cols = Some(124.0);
+        let (tab, master) = layout_with_workers(&mut host, 2);
+        let layout = tako_core::SpawnLayoutConfig::default();
+        let plan = plan_worker_placement(&host, tab, master, &layout);
+        assert_eq!(plan.kind, "new_tab", "{:?}", plan.reason);
+        assert_eq!(plan.tab, None, "新しいタブを作る");
+        assert_eq!(plan.anchor, master, "spawned_by は master のまま");
+        let reason = plan.reason.expect("理由が載る");
+        assert!(reason.contains("31 桁"), "{reason}");
+        assert!(
+            reason.contains("min-worker-cols"),
+            "次の一手が載る: {reason}"
+        );
+        // 新しいタブは全幅なので下限を満たす
+        assert_eq!(plan.predicted_cols, Some(124));
+    }
+
+    #[test]
+    fn issue1132_あふれ先のタブに余裕があれば詰める() {
+        let mut host = MockHost::new();
+        host.tab_cols = Some(124.0);
+        let (tab, master) = layout_with_workers(&mut host, 2);
+        // 前にあふれた先（master 由来の worker 1 体だけが居るタブ）
+        let overflow_pane = Pane::new(PaneOrigin::Mcp);
+        let overflow_id = overflow_pane.id();
+        let overflow_tab = host
+            .ws
+            .create_tab("tako workers".to_string(), overflow_pane);
+        host.ws
+            .get_tab_mut(overflow_tab)
+            .unwrap()
+            .tree_mut()
+            .get_mut(overflow_id)
+            .unwrap()
+            .set_spawned_by(Some(master));
+
+        let layout = tako_core::SpawnLayoutConfig::default();
+        let plan = plan_worker_placement(&host, tab, master, &layout);
+        assert_eq!(plan.kind, "overflow_tab", "{:?}", plan.reason);
+        assert_eq!(plan.tab, Some(overflow_tab));
+        assert_eq!(
+            plan.anchor, overflow_id,
+            "あふれ先の左上ペインを分割元にする"
+        );
+        // あふれ先は 124 桁で領域が新設される = 62 桁（下限 60 桁を満たす）
+        assert_eq!(plan.predicted_cols, Some(62));
+
+        // ユーザーが自分で開いたペインが混じっているタブは「あふれ先」に使わない
+        let user_pane = Pane::new(PaneOrigin::User);
+        let user_id = user_pane.id();
+        let mixed = host.ws.create_tab("mixed".to_string(), user_pane);
+        let plan = plan_worker_placement(&host, tab, master, &layout);
+        assert_eq!(plan.tab, Some(overflow_tab), "混在タブは選ばない");
+        // あふれ先を混在させると候補から外れて新しいタブへ落ちる
+        let extra = Pane::new(PaneOrigin::User);
+        let extra_id = extra.id();
+        let tree = host.ws.get_tab_mut(overflow_tab).unwrap().tree_mut();
+        tree.split(overflow_id, tako_core::SplitDirection::Down, extra)
+            .unwrap();
+        let plan = plan_worker_placement(&host, tab, master, &layout);
+        assert_eq!(plan.kind, "new_tab", "{:?}", plan.reason);
+        let _ = (mixed, user_id, extra_id);
+    }
+
+    #[test]
+    fn issue1132_実測が無い_下限0_達成不能では同じタブへ置く() {
+        let layout = tako_core::SpawnLayoutConfig::default();
+
+        // 実測が無い（GUI 外・まだ描かれていない）= 見積もれないので止めない
+        let mut host = MockHost::new();
+        host.tab_cols = None;
+        let (tab, master) = layout_with_workers(&mut host, 4);
+        let plan = plan_worker_placement(&host, tab, master, &layout);
+        assert_eq!(plan.kind, "same_tab");
+        assert_eq!(plan.predicted_cols, None);
+
+        // 下限 0 = 保証しない
+        let mut host = MockHost::new();
+        host.tab_cols = Some(40.0);
+        let (tab, master) = layout_with_workers(&mut host, 4);
+        let off = tako_core::SpawnLayoutConfig {
+            min_worker_cols: 0,
+            ..layout
+        };
+        let plan = plan_worker_placement(&host, tab, master, &off);
+        assert_eq!(plan.kind, "same_tab");
+        assert_eq!(plan.min_cols, 0);
+
+        // タブ全幅でも下限に届かない = タブを増やしても解決しないので同じタブへ
+        let plan = plan_worker_placement(&host, tab, master, &layout);
+        assert_eq!(plan.kind, "same_tab");
+        let reason = plan.reason.expect("理由が載る");
+        assert!(reason.contains("ウィンドウ"), "{reason}");
+        assert_eq!(host.ws.tabs().len(), 1, "無駄なタブを作らない");
+    }
+
+    #[test]
+    fn issue1132_layoutの応答に下限幅が載る() {
+        // config.yaml を触らない読み取り経路だけを見る（書き込みは実 HOME を汚す）
+        let resolved = tako_core::SpawnLayoutConfig::default();
+        assert_eq!(
+            resolved.min_worker_cols,
+            tako_core::spawn_layout::DEFAULT_MIN_WORKER_COLS
+        );
+        // 範囲外の指定は書き込む前に弾く
+        let err = dispatch_orchestrator_layout(None, None, None, Some(5)).unwrap_err();
+        assert!(format!("{err}").contains("min_worker_cols"), "{err}");
+        let err = dispatch_orchestrator_layout(None, None, None, Some(9999)).unwrap_err();
+        assert!(format!("{err}").contains("min_worker_cols"), "{err}");
     }
 }

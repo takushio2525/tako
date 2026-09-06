@@ -2234,6 +2234,55 @@ mod tests {
         out
     }
 
+    /// #1132: worker ペインの最小幅の既定値（[`crate::spawn_layout::DEFAULT_MIN_WORKER_COLS`]）
+    /// の根拠を固定する。
+    ///
+    /// 「tako が読む通知が既定幅では 3 行以内に収まり、実害が出た 21〜25 桁では
+    /// 5 行以上に割れる」。折り返しの結合の予算（`MAX_WRAP_JOIN_LINES` = 12）に
+    /// 対して十分な余裕があることも同時に見る
+    #[test]
+    fn issue1132_既定の最小幅では通知が3行以内に収まる() {
+        // tako が 1 論理行として読む必要のある実文言のうち長いもの（実採取・バイナリ由来）
+        const NOTICES: [&str; 5] = [
+            "You've hit your session limit · resets 7:50pm (Asia/Tokyo)",
+            "You're out of usage credits. Run /usage-credits to keep using Opus or /model to switch models.",
+            "Your workspace is out of credits. Ask your workspace owner to refill in order to continue.",
+            "You hit your spend cap set by the owner of your workspace. Ask an owner to increase your spend cap to continue.",
+            "You've reached your workspace credit limit",
+        ];
+        let min = usize::from(crate::spawn_layout::DEFAULT_MIN_WORKER_COLS);
+        // #1123 の実害が出た幅（実採取は 21〜25 桁）
+        const SYMPTOM_COLS: usize = 25;
+        for notice in NOTICES {
+            let wide = wrap_claude_block(notice, min);
+            assert!(
+                wide.len() <= 3,
+                "既定幅 {min} 桁で {} 行に割れた: {notice}",
+                wide.len()
+            );
+            assert!(
+                wide.len() < MAX_WRAP_JOIN_LINES,
+                "結合の予算を超えている: {notice}"
+            );
+            // 割れても結合すれば必ず判定へ戻る（#1123 / #1130 の保証）
+            let joined = unwrap_wrapped_lines(&wide);
+            assert!(
+                joined
+                    .iter()
+                    .any(|l| is_limit_exhausted_line(l) || entitlement_block_line(l)),
+                "既定幅で結合しても判定に戻らない: {notice}"
+            );
+            // 実害が出た幅では同じ通知がもっと細かく割れる（= 既定幅に意味がある）
+            let narrow = wrap_claude_block(notice, SYMPTOM_COLS);
+            assert!(
+                narrow.len() >= wide.len() + 2,
+                "{SYMPTOM_COLS} 桁でも {} 行しか割れない（既定幅 {} 行）: {notice}",
+                narrow.len(),
+                wide.len()
+            );
+        }
+    }
+
     #[test]
     fn issue1123_折り返しの生成器が実採取と一致する() {
         // 生成器を実採取に固定しておく。ここがずれたら他の幅のテストも信用できない

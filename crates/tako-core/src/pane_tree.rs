@@ -674,19 +674,10 @@ impl PaneTree {
         self.rebuild_worker_area(anchor, &mut None, algorithm)
     }
 
-    /// anchor の worker 領域を見つけ、（あれば `extra` を末尾に加えて）`algorithm` で
-    /// 再構築する。worker 領域 = anchor Leaf から根へのパス上で anchor と反対側にあり、
-    /// 全リーフの `spawned_by` チェーンが anchor へ到達するサブツリー
-    /// （anchor に最も近い祖先を優先）。見つからなければ何もせず false
-    fn rebuild_worker_area(
-        &mut self,
-        anchor: PaneId,
-        extra: &mut Option<Pane>,
-        algorithm: WorkerLayoutAlgorithm,
-    ) -> bool {
+    /// `anchor` から spawn されたペイン（`spawned_by` チェーンが anchor へ到達するもの）の集合。
+    /// 保存データ破損による循環は打ち切る
+    fn spawn_descendants_of(&self, anchor: PaneId) -> std::collections::HashSet<PaneId> {
         use std::collections::{HashMap, HashSet};
-
-        // spawned_by チェーン判定表を先に作る（木の再帰中に self を再借用しないため）
         let spawn_map: HashMap<PaneId, Option<PaneId>> = self
             .panes()
             .iter()
@@ -707,26 +698,83 @@ impl PaneTree {
                 cur = parent;
             }
         }
+        workers
+    }
+
+    /// `anchor` の worker 領域に入っているペインを**読み取りだけ**で列挙する（#1132）。
+    ///
+    /// 領域の定義と探索順は [`Self::rebuild_worker_area`] とまったく同じ
+    /// （anchor に最も近い祖先を優先し、全リーフが spawn 由来のサブツリー）。
+    /// 領域が無ければ `None` を返し、これは `reflow_workers` が `false` を返す条件と一致する
+    /// （その一致は単体テストで固定してある）。
+    ///
+    /// spawn する前に「足したときにどれだけ狭くなるか」を見積もるために使う
+    pub fn worker_area_panes(&self, anchor: PaneId) -> Option<Vec<PaneId>> {
+        if !self.contains(anchor) {
+            return None;
+        }
+        let workers = self.spawn_descendants_of(anchor);
+        if workers.is_empty() {
+            return None;
+        }
+
+        fn leaf_ids(node: &PaneNode, out: &mut Vec<PaneId>) {
+            match node {
+                PaneNode::Leaf(p) => out.push(p.id()),
+                PaneNode::Split { first, second, .. } => {
+                    leaf_ids(first, out);
+                    leaf_ids(second, out);
+                }
+            }
+        }
+
+        /// rebuild_worker_area の `rec` の読み取り版。near（anchor 側）を先に降りるので
+        /// anchor に最も近い祖先が勝つ
+        fn rec(
+            node: &PaneNode,
+            anchor: PaneId,
+            workers: &std::collections::HashSet<PaneId>,
+        ) -> Option<Vec<PaneId>> {
+            let PaneNode::Split { first, second, .. } = node else {
+                return None;
+            };
+            let in_first = subtree_contains(first, anchor);
+            if !in_first && !subtree_contains(second, anchor) {
+                return None;
+            }
+            let (near, far) = if in_first {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            if let Some(found) = rec(near, anchor, workers) {
+                return Some(found);
+            }
+            if all_workers(far, workers) {
+                let mut out = Vec::new();
+                leaf_ids(far, &mut out);
+                return Some(out);
+            }
+            None
+        }
+
+        rec(self.root(), anchor, &workers)
+    }
+
+    /// anchor の worker 領域を見つけ、（あれば `extra` を末尾に加えて）`algorithm` で
+    /// 再構築する。worker 領域 = anchor Leaf から根へのパス上で anchor と反対側にあり、
+    /// 全リーフの `spawned_by` チェーンが anchor へ到達するサブツリー
+    /// （anchor に最も近い祖先を優先）。見つからなければ何もせず false
+    fn rebuild_worker_area(
+        &mut self,
+        anchor: PaneId,
+        extra: &mut Option<Pane>,
+        algorithm: WorkerLayoutAlgorithm,
+    ) -> bool {
+        // spawned_by チェーン判定表を先に作る（木の再帰中に self を再借用しないため）
+        let workers = self.spawn_descendants_of(anchor);
         if workers.is_empty() {
             return false;
-        }
-
-        fn subtree_contains(node: &PaneNode, id: PaneId) -> bool {
-            match node {
-                PaneNode::Leaf(p) => p.id() == id,
-                PaneNode::Split { first, second, .. } => {
-                    subtree_contains(first, id) || subtree_contains(second, id)
-                }
-            }
-        }
-
-        fn all_workers(node: &PaneNode, workers: &std::collections::HashSet<PaneId>) -> bool {
-            match node {
-                PaneNode::Leaf(p) => workers.contains(&p.id()),
-                PaneNode::Split { first, second, .. } => {
-                    all_workers(first, workers) && all_workers(second, workers)
-                }
-            }
         }
 
         fn collect_leaves(node: PaneNode, out: &mut Vec<Pane>) {
@@ -821,6 +869,26 @@ fn split_rects(r: Rect, axis: SplitAxis, ratio: f32) -> (Rect, Rect) {
 }
 
 /// 仕切り領域 `area` 内のポインタ座標 `(x, y)` を first 側取り分比率へ換算する（純粋関数）。
+/// サブツリーに `id` のリーフが含まれるか（worker 領域の探索で使う）
+fn subtree_contains(node: &PaneNode, id: PaneId) -> bool {
+    match node {
+        PaneNode::Leaf(p) => p.id() == id,
+        PaneNode::Split { first, second, .. } => {
+            subtree_contains(first, id) || subtree_contains(second, id)
+        }
+    }
+}
+
+/// サブツリーのリーフが全部 `workers` に含まれるか（= worker 領域として扱えるか）
+fn all_workers(node: &PaneNode, workers: &std::collections::HashSet<PaneId>) -> bool {
+    match node {
+        PaneNode::Leaf(p) => workers.contains(&p.id()),
+        PaneNode::Split { first, second, .. } => {
+            all_workers(first, workers) && all_workers(second, workers)
+        }
+    }
+}
+
 /// Horizontal は x、Vertical は y を使う。`MIN_SHARE..=MAX_SHARE` にクランプする
 pub fn ratio_for_position(area: Rect, axis: SplitAxis, x: f32, y: f32) -> f32 {
     let raw = match axis {
@@ -1249,6 +1317,9 @@ mod tests {
                 policy: SpawnLayoutPolicy::MasterReserved,
                 master_ratio: 0.5,
                 algorithm: WorkerLayoutAlgorithm::Grid,
+                // #1132 の下限幅は dispatch 側の配置決定で使う。ここは木の組み立てだけを
+                // 見るテストなので既定値をそのまま使う（spawn_worker は下限を見ない）
+                min_worker_cols: crate::spawn_layout::DEFAULT_MIN_WORKER_COLS,
             }
         }
 
@@ -1436,6 +1507,46 @@ mod tests {
             let w2 = spawn(&mut t, master, &config);
             assert_close_to(rect_of(&t, master).width, 0.55 * 0.55);
             assert_close_to(rect_of(&t, w2).width, 0.55 * 0.45);
+        }
+
+        /// #1132: 読み取り専用の領域探索（[`PaneTree::worker_area_panes`]）が
+        /// 再構築（`reflow_workers`）と**同じ領域**を指すことを固定する。
+        /// ここがずれると spawn 前の見積もりが別の領域の幅を見てしまう
+        #[test]
+        fn issue1132_領域探索は再構築と一致する() {
+            let config = grid_config();
+
+            // worker が居ない = 領域は無い（reflow も false）
+            let (mut t, master) = tree();
+            assert_eq!(t.worker_area_panes(master), None);
+            assert!(!t.reflow_workers(master, config.algorithm));
+
+            // spawn 1〜4 体: 領域は spawn 順のまま全 worker
+            let mut expected = Vec::new();
+            for _ in 0..4 {
+                expected.push(spawn(&mut t, master, &config));
+                let found = t.worker_area_panes(master).expect("領域がある");
+                assert_eq!(found, expected, "spawn {} 体目", expected.len());
+                assert!(t.reflow_workers(master, config.algorithm));
+            }
+
+            // 混在サブツリーは領域と見なさない = 新設された側だけが領域になる
+            let (mut t, master) = tree();
+            let w1 = spawn(&mut t, master, &config);
+            let _user = t
+                .split(w1, SplitDirection::Right, Pane::new(PaneOrigin::User))
+                .unwrap();
+            let w2 = spawn(&mut t, master, &config);
+            assert_eq!(
+                t.worker_area_panes(master),
+                Some(vec![w2]),
+                "混在領域は含まず、新設された領域だけを指す"
+            );
+
+            // 居ない anchor は None（reflow も false）
+            let (t, _master) = tree();
+            let ghost = PaneId::from_raw(9_999_999);
+            assert_eq!(t.worker_area_panes(ghost), None);
         }
 
         #[test]

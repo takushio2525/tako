@@ -921,7 +921,8 @@ pub enum Request {
     /// 全パラメータ省略で現在値の取得、いずれか指定でその項目を更新して結果を返す。
     /// policy: "master-reserved"（master の取り分を維持し worker は右側の worker 領域内へ。既定）
     /// / "legacy"（従来の右等分割）。master_ratio: master 側へ残す取り分（0.1〜0.9。既定 0.5）。
-    /// algorithm: worker 領域内の配置（"grid" = 十字四分割系 / "spiral" = 縦横交互の半分割）
+    /// algorithm: worker 領域内の配置（"grid" = 十字四分割系 / "spiral" = 縦横交互の半分割）。
+    /// min_worker_cols: worker ペイン 1 枚に保証する最小の桁数（#1132。既定 60 / 0 = 保証しない）
     OrchestratorLayout {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy: Option<String>,
@@ -929,6 +930,9 @@ pub enum Request {
         master_ratio: Option<f32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         algorithm: Option<String>,
+        /// worker ペイン 1 枚に保証する最小の桁数（#1132。0 = 保証しない）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min_worker_cols: Option<u16>,
     },
     /// オーケストレーター: worker の spawn（split + エージェント CLI 起動 + プロンプト送信）
     OrchestratorSpawn {

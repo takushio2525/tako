@@ -1465,7 +1465,12 @@ pub fn tools() -> Vec<Value> {
                 algorithm は worker 領域内の配置: grid（1 体=全面 → 2 体=上下 → 3〜4 体=十字四分割）/ \
                 spiral（縦横交互に半分ずつの渦巻き分割）。\
                 worker close 時は領域内だけがリフローされ、master とユーザーが自分で開いた\
-                ペインの矩形は変わらない。",
+                ペインの矩形は変わらない。\
+                min_worker_cols は worker ペイン 1 枚に保証する最小の桁数（既定 60。0 = 保証しない）。\
+                これを割る spawn は同じタブへ割らず、この master の worker が居る別のタブか\
+                新しいタブへ出る（spawn 応答の placement / placement_reason / pane_cols に載る）。\
+                狭いペインでは claude TUI がメッセージをハード折り返しするので、\
+                上限・ダイアログ・報告の読み取りが同時に壊れる（#1132）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1477,6 +1482,10 @@ pub fn tools() -> Vec<Value> {
                     "master_ratio": {
                         "type": "number",
                         "description": "master 側へ残す取り分 0.1〜0.9（省略で現状維持）",
+                    },
+                    "min_worker_cols": {
+                        "type": "integer",
+                        "description": "worker ペイン 1 枚に保証する最小の桁数（0 = 保証しない / 20〜400。省略で現状維持）",
                     },
                     "algorithm": {
                         "type": "string",
