@@ -48,6 +48,11 @@ change-type tag. Entries without a platform tag apply to every platform.
 - 作業ログの予算（5 作業日 / 20 エントリ / 各 3 行 / 12 KB・アーカイブ保持 90 日）を
   正本の表から生成し、tako が配る規約 3 か所へ埋め込んで一致をテストで固定した。
   `.agent/roadmap.md` は `@import` をやめてバックティック参照にした。
+- `AGENTS.md` is now a one-line-per-command index (104 KB → 25 KB); the long notes,
+  measurements, pitfalls and A/B env vars moved verbatim into `.agent/commands.md`,
+  which is read on demand instead of on every turn.
+- `AGENTS.md` を 1 行 1 コマンドの索引に絞った（104 KB → 25 KB）。長い注記・実測・罠・
+  A/B の env はそのまま `.agent/commands.md` へ移し、毎ターンではなく必要なときだけ読む。
 
 ## [0.8.6] - 2026-09-05
 
