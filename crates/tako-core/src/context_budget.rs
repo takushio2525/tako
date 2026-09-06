@@ -785,13 +785,29 @@ pub fn plan_prune(progress: &str, archive: &str, today_days: i64) -> PrunePlan {
             groups.push(e.lines);
         }
     }
+    // 既に載っている 1 行はもう積まない。`fix` はアーカイブ → 本体の順に書くので、
+    // 本体の書き込みだけ失敗した状態でやり直すと**同じ行が二重に積まれる**
+    // （アーカイブ側だけ進んだ状態から復帰できる形にしておく）
+    let existing_lines: std::collections::BTreeSet<&str> = groups
+        .iter()
+        .filter(|g| g.len() == 1)
+        .map(|g| g[0].as_str())
+        .collect();
+    let mut appended: Vec<Vec<String>> = Vec::new();
     for e in &archived {
+        let line = e.archive_line();
         if date_to_days(&e.date).is_some_and(|d| d < cutoff) {
-            aged_out.push(e.archive_line());
-        } else {
-            groups.push(vec![e.archive_line()]);
+            aged_out.push(line);
+            continue;
         }
+        // 突き合わせるのは**この回より前から在った行**だけ。同じ回の中では畳まない
+        // （見出しが同じエントリが 2 件あるとき、1 件に減らしてしまわないため）
+        if existing_lines.contains(line.as_str()) {
+            continue;
+        }
+        appended.push(vec![line]);
     }
+    groups.extend(appended);
 
     let progress_text = render_log(&log.preamble, &kept);
     let archive_text = render_archive(&arch_preamble, &groups);
@@ -982,6 +998,47 @@ mod tests {
         );
         assert!(plan.entries_preserved(), "移しても総数は保たれる");
         assert!(!plan.archived.is_empty());
+    }
+
+    #[test]
+    fn アーカイブ側だけ書けた状態からやり直しても二重に積まない() {
+        // fix はアーカイブ → 本体 の順に書く。本体の書き込みが失敗した状態でやり直すと、
+        // 素朴な実装では同じ 1 行が 2 度積まれる
+        let text = log_fixture(&[
+            ("2026-08-20", 1),
+            ("2026-09-01", 1),
+            ("2026-09-02", 1),
+            ("2026-09-03", 1),
+            ("2026-09-04", 1),
+            ("2026-09-05", 1),
+        ]);
+        let today = date_to_days("2026-09-06").unwrap();
+        let first = plan_prune(&text, "", today);
+        assert_eq!(first.archived.len(), 1);
+        // アーカイブだけ書けた（= 本体は 332 件のまま）状態でもう一度計画を立てる
+        let again = plan_prune(&text, &first.archive_text, today);
+        assert_eq!(
+            again.archive_text, first.archive_text,
+            "同じ行が二重に積まれない"
+        );
+    }
+
+    #[test]
+    fn 見出しが同じエントリが2件あっても1件に畳まない() {
+        // 実データに在る形（同じ日・同じ見出しで本文が違う 2 件）を、
+        // 直近 5 作業日より古い位置に置いて移送対象にする
+        let mut text = String::from(
+            "# t\n\n## 2026-08-01（同じ見出し）\n- 本文 A\n\n\
+             ## 2026-08-01（同じ見出し）\n- 本文 B\n",
+        );
+        for d in 1..=5 {
+            text.push_str(&format!("\n## 2026-09-0{d}（新しい）\n- x\n"));
+        }
+        let plan = plan_prune(&text, "", date_to_days("2026-09-06").unwrap());
+        assert_eq!(plan.archived.len(), 2, "2 件とも移送される");
+        let lines = plan.archive_text.matches("同じ見出し").count();
+        assert_eq!(lines, 2, "アーカイブにも 2 行 = 1 エントリ 1 行");
+        assert!(plan.entries_preserved());
     }
 
     #[test]
