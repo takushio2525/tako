@@ -115,13 +115,26 @@ fn detect_limit_stop_from_screen(
     }
 }
 
-/// 画面のどこかにあるリセット時刻表記を拾う（下の行ほど新しいので末尾から見る）
+/// 画面のどこかにあるリセット時刻表記を拾う（下の行ほど新しいので末尾から見る）。
+///
+/// 物理行で読めなければ**折り返しを結合した論理行**でもう一度読む（#1123）。
+/// 狭いペインでは `resets Sep 8,` と `3:05pm` のように日付と時刻が別の行へ割れ、
+/// 日付つき表記（#1096）が「読めない」= 不明へ落ちてしまう
 fn reset_at_from_lines(lines: &[String], observed_at: i64, tz_offset: i32) -> Option<i64> {
     lines
         .iter()
         .rev()
         .find_map(|l| parse_reset_at(l, observed_at, tz_offset))
+        .or_else(|| {
+            tako_core::limit_resume::unwrapped_tail(lines, RESET_SCAN_LINES)
+                .iter()
+                .find_map(|l| parse_reset_at(l, observed_at, tz_offset))
+        })
 }
+
+/// 折り返しを結合してリセット時刻を探すときの走査範囲（画面末尾からの論理行数。#1123）。
+/// 物理行の走査は画面全体を見るが、結合後はまとめて見に行くので上限を置く
+const RESET_SCAN_LINES: usize = 40;
 
 /// 現在の画面から自動復帰の材料をまとめて採る（GUI の 2 秒 tick 用）。
 ///
@@ -665,5 +678,108 @@ try again at Aug 28th, 2026 4:24 AM.
         );
         // そもそも自動復帰の対象にもしない（上限で「止まって」いる画面ではない）
         assert!(detect_limit_stop(&screen(CODEX_USAGE_MENU), OBSERVED, JST).is_none());
+    }
+
+    /// #1123: **幅 25 桁**で上限に当たったペインの実採取（2026-09-04。worker 4 体が
+    /// 解除後 7.5 時間止まったままだった画面）。claude が自分で折り返しているので
+    /// どの物理行も #1093 の規則に当たらない。フッターに `5h` / `7d` が無いのも症状どおり
+    const WRAPPED_SESSION_LIMIT_IDLE: &str = r#"⏺ 実装を進めます
+
+  ⎿  You've hit your
+     session limit ·
+     resets 5:50am
+     (Asia/Tokyo)
+     /usage-credits to
+     request more usage
+     from your admin.
+
+─────────────────────────
+❯
+─────────────────────────
+  ⏵⏵ accept edits on
+  tako
+  main
+  ~/dev/tako
+  ⏸ 待機中 · ? for
+  shortcuts"#;
+
+    #[test]
+    fn issue1123_折り返した見出しでも上限停止として検知する() {
+        let stop = detect_limit_stop(&screen(WRAPPED_SESSION_LIMIT_IDLE), OBSERVED, JST)
+            .expect("折り返した見出しが検知されない（#1123 の実害）");
+        assert_eq!(
+            stop.kind,
+            LimitStopKind::Idle,
+            "ダイアログ無しなので idle 型"
+        );
+        assert!(
+            stop.message.contains("hit your session limit"),
+            "検知の根拠が結合後の 1 本になっていない: {}",
+            stop.message
+        );
+        // 解除時刻（`resets 5:50am`）も同じ 1 本から読める。
+        // JST 00:30 観測 → その日の 05:50 = 5 時間 20 分先
+        assert_eq!(
+            stop.reset_at,
+            Some(OBSERVED + 5 * 3600 + 20 * 60),
+            "折り返した `resets 5:50am` が読めていない"
+        );
+    }
+
+    #[test]
+    fn issue1123_折り返した日付つき解除時刻も読む() {
+        // 週枠は最大 7 日先なので日付つきが通常形（#1096）。狭いペインでは
+        // 日付と時刻が別の行へ割れ、「日付は在るが読めない」= 不明へ落ちていた
+        let src = WRAPPED_SESSION_LIMIT_IDLE
+            .replace("     session limit ·\n", "     weekly limit ·\n")
+            .replace(
+                "     resets 5:50am\n     (Asia/Tokyo)\n",
+                "     resets Aug 22,\n     9:15am (Asia/Tokyo)\n",
+            );
+        let stop = detect_limit_stop(&screen(&src), OBSERVED, JST).expect("検知される");
+        let at = stop.reset_at.expect("日付つきの解除時刻が読めていない");
+        assert!(
+            at > OBSERVED + 6 * 86_400,
+            "24 時間以内へ丸められている: {at} (observed={OBSERVED})"
+        );
+    }
+
+    #[test]
+    fn issue1123_折り返しても上限でない画面は検知しない() {
+        // 25 桁に折り返した通常 idle / permission / API エラー / 警告。
+        // 結合は候補を増やすだけなので、これらが上限になってはいけない
+        for src in [
+            "⏺ 実装が完了しました。\n  テストは全て緑です。\n\n─────────────────────────\n❯\n─────────────────────────",
+            "  ⎿  You've used 90%\n     of your session\n     limit\n\n─────────────────────────\n❯\n─────────────────────────",
+            "  ⎿  API Error:\n     Connection closed\n     mid-response.\n\n─────────────────────────\n❯\n─────────────────────────",
+            "  ⎿  Opus limit\n     reached, now using\n     Sonnet\n\n─────────────────────────\n❯\n─────────────────────────",
+        ] {
+            assert!(
+                detect_limit_stop(&screen(src), OBSERVED, JST).is_none(),
+                "上限ではない画面を検知した: {src}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue1123_折り返した阻害は上限にならない() {
+        // 時間では解けない阻害（#1106）は結合後も阻害のまま = 自動復帰は発動しない
+        let src = WRAPPED_SESSION_LIMIT_IDLE.replace(
+            "  ⎿  You've hit your\n     session limit ·\n     resets 5:50am\n     (Asia/Tokyo)\n     /usage-credits to\n     request more usage\n     from your admin.\n",
+            "  ⎿  Your seat type\n     doesn't include\n     usage credits\n",
+        );
+        assert!(
+            detect_limit_stop(&screen(&src), OBSERVED, JST).is_none(),
+            "待っても解けない阻害で自動復帰を発動させてはいけない"
+        );
+        // ただし worker の異常としては検知される（idle = 作業完了に見せない）
+        let joined: String = screen(&src).join("\n");
+        assert!(matches!(
+            crate::orchestrator::wait::detect_worker_error(&joined),
+            Some((
+                crate::orchestrator::wait::WorkerErrorKind::EntitlementBlocked,
+                _
+            ))
+        ));
     }
 }

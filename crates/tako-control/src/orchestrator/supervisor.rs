@@ -58,9 +58,31 @@ impl SupervisorMode {
 
 // --- 監査ログ ---
 
-/// 監査ログファイルのパス
+/// 監査ログファイルのパス。
+///
+/// **テストビルドでは必ず隔離先へ倒す**（#944 系 / #1123 で実測）。復旧の単体テストは
+/// `recover_*` を実経路で呼ぶので、ここが本番を指していると `TAKO_DATA_DIR` を渡さずに
+/// `cargo test` した人の `<data_dir>/supervisor.log` へ `worker=test-1 pane=42` が
+/// 混ざる。監査ログは「あとから何が起きたかを追う」ためのものなので、
+/// 混ざると本物の記録の判断材料にならなくなる（隔離の作法は
+/// `orchestrator::config_dir` と同じ）
 fn audit_log_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    return Some(test_audit_dir().join("supervisor.log"));
+    #[cfg(not(test))]
     tako_core::paths::data_dir().map(|d| d.join("supervisor.log"))
+}
+
+/// テスト専用の監査ログ置き場（プロセスごとに 1 つ）
+#[cfg(test)]
+fn test_audit_dir() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("tako-test-supervisor-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    })
+    .clone()
 }
 
 /// 監査ログに 1 行追記する（最大 256KB ローテート）
@@ -1165,6 +1187,34 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("action=test"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn issue1123_監査ログはテストビルドでは本番のdata_dirへ書かない() {
+        // #944 系の汚染（本番 `supervisor.log` に `worker=test-1 pane=42` が混ざる）を
+        // 構造で止める。復旧の単体テストは `recover_*` を実経路で呼ぶので、
+        // ここが本番を指していると `TAKO_DATA_DIR` 無しの `cargo test` で必ず漏れる
+        let path = audit_log_path().expect("テストビルドでは必ず解決する");
+        assert!(
+            path.starts_with(std::env::temp_dir()),
+            "監査ログが一時ディレクトリの外を指している: {}",
+            path.display()
+        );
+        if let Some(live) = tako_core::paths::data_dir() {
+            assert_ne!(
+                path,
+                live.join("supervisor.log"),
+                "テストビルドが本番の supervisor.log を指している"
+            );
+        }
+        // 実経路（audit_log → read_audit_log）が隔離先で往復する
+        audit_log("test-isolated", 4242, "issue1123_probe", "detail");
+        assert!(
+            read_audit_log(50)
+                .iter()
+                .any(|l| l.contains("action=issue1123_probe") && l.contains("pane=4242")),
+            "隔離先へ書いた行が読み戻せない"
+        );
     }
 
     #[test]

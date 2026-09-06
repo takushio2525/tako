@@ -23299,6 +23299,12 @@ mod self_test {
         }
     }
 
+    /// 空白と改行を落とす（**折り返した画面**の文字列一致に使う）。
+    /// ペインが狭いと 1 つの案内が複数行へ割れるので、行を跨いで探せる形にする
+    fn squash_ws(s: &str) -> String {
+        s.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
     /// パスを NSURL の `absoluteString` 相当（`file://` + パーセントエンコード）へ。
     /// 項目 116（#835）が Finder から来る形そのままで受け口を叩くために使う。
     /// エスケープ対象は RFC 3986 の unreserved + パス区切り以外すべて。
@@ -53648,6 +53654,149 @@ mod self_test {
                     "111: 時間で解ける上限は従来どおり usage_limit / wait_reset (#1106)",
                 );
 
+                // --- 正例 ⑦ ペイン幅で折り返した見出し（#1123） ---
+                // 2026-09-04 に worker 4 体（幅 21〜25 桁）が 5h 上限で止まり、
+                // 解除の 7.5 時間後まで復帰しなかった。claude は見出しを**自分で**
+                // 折り返して続きを字下げするので（実測: 25 桁で 7 行）、1 行を入力に
+                // 取る #1093 / #1096 / #1106 の規則がどの物理行にも当たらない。
+                //
+                // fixture は実採取の折り返し（アポストロフィだけは落としてある。
+                // `paint_and_hold` の POSIX 経路が本文を素の単引用符で囲むため。
+                // 正例 ③〜⑥ と同じ理由）。実バイトの fixture は
+                // `limit_stop.rs` の `WRAPPED_SESSION_LIMIT_IDLE` が持つ
+                let wrapped_body = format!(
+                    "{filler813}実装を進めます\n  \
+                     \u{23bf}  You have hit your\n     \
+                     session limit ·\n     \
+                     resets 5:50am\n     \
+                     (Asia/Tokyo)\n     \
+                     /usage-credits to\n     \
+                     request more usage\n     \
+                     from your admin.\n"
+                );
+                let Some(wrapped_pane) = make_fixture_pane(cx, &wrapped_body).await else {
+                    fail("#1123: 折り返し見出しペインの作成")
+                };
+                if !wait_screen(cx, wrapped_pane, "from your admin.").await {
+                    fail("#1123: 折り返し fixture が画面に出ない");
+                }
+                settle813(cx, wrapped_pane).await;
+                // 前提: **物理行はどれも規則に当たらない**（#1123 の実害そのもの）
+                let phys_hit = window
+                    .update(cx, |app, _, _| {
+                        app.terminals
+                            .get(&wrapped_pane)
+                            .map(|s| {
+                                s.visible_lines()
+                                    .iter()
+                                    .filter(|l| {
+                                        tako_core::limit_resume::is_limit_exhausted_line(l)
+                                    })
+                                    .count()
+                            })
+                            .unwrap_or(0)
+                    })
+                    .unwrap_or(0);
+                let _ = set_enabled(cx, wrapped_pane, true);
+                let (_, kind_wrapped, _) = drive(cx, wrapped_pane);
+                let reset_wrapped = window
+                    .update(cx, |app, _, _| {
+                        app.limit_resume.get(&wrapped_pane).and_then(|t| t.reset_at)
+                    })
+                    .ok()
+                    .flatten();
+                println!(
+                    "TAKO_SELF_TEST_1123_DETECT: phys_hit={phys_hit} kind={kind_wrapped:?} \
+                     reset_at={reset_wrapped:?} state=({})",
+                    state813(cx, wrapped_pane),
+                );
+                check(
+                    phys_hit == 0,
+                    "111: 折り返した見出しは物理行では 1 本も当たらない（前提。#1123）",
+                );
+                check(
+                    kind_wrapped.as_deref() == Some("idle"),
+                    "111: 折り返した見出しでも上限停止として検知する (#1123)",
+                );
+                // watch / worker_status が使う分類も同じ実ペインの画面で通す
+                // （#1106 の対照と同じ `classify` = `detect_worker_error` そのもの）。
+                // detail が**結合後の 1 本**であることまで見る —— ここが物理行のままだと
+                // `limit_stop` 側の `parse_reset_at` が解除時刻を拾えない
+                let class_wrapped = classify(cx, wrapped_pane);
+                println!("TAKO_SELF_TEST_1123_CLASS: {class_wrapped:?}");
+                check(
+                    class_wrapped.as_ref().map(|c| c.0.as_str()) == Some("usage_limit")
+                        && class_wrapped.as_ref().map(|c| c.1.as_str()) == Some("wait_reset")
+                        && class_wrapped
+                            .as_ref()
+                            .is_some_and(|c| c.2.contains("resets 5:50am")),
+                    "111: 折り返した見出しが usage_limit / wait_reset へ分類される (#1123)",
+                );
+                check(
+                    reset_wrapped.is_some(),
+                    "111: 別の行へ割れた `resets 5:50am` から解除時刻を解決する (#1123)",
+                );
+                // ステータスバーの 5h メーターも同じ規則を通る（#1093 と同じ受け入れ条件）
+                let meter1123 = window
+                    .update(cx, |app, _, _| {
+                        let pane_level = app
+                            .terminals
+                            .get(&wrapped_pane)
+                            .and_then(|s| s.agent_metrics())
+                            .and_then(|m| m.limit_5h);
+                        app.refresh_agent_metrics();
+                        (pane_level, app.agent_metrics.limit_5h)
+                    })
+                    .unwrap_or((None, None));
+                println!(
+                    "TAKO_SELF_TEST_1123_METER: pane={:?} statusbar={:?}",
+                    meter1123.0, meter1123.1
+                );
+                check(
+                    meter1123.0 == Some(100) && meter1123.1 == Some(100),
+                    "111: 折り返した見出しでもメーターが 100% になる (#1123)",
+                );
+                // 解除前は撃たない → 解除後に撃つ → 監査ログに残る
+                let (sent_before1123, _, _) = drive(cx, wrapped_pane);
+                check(
+                    sent_before1123.is_empty(),
+                    "111: 解除時刻より前は継続ナッジを送らない (#1123)",
+                );
+                let audit_before1123 = tako_control::orchestrator::supervisor::read_audit_log(200)
+                    .iter()
+                    .filter(|l| {
+                        l.contains("action=limit_autoresume")
+                            && l.contains(&format!("pane={}", wrapped_pane.as_u64()))
+                    })
+                    .count();
+                backdate(cx, wrapped_pane);
+                let (sent_1123, _, attempts_1123) = drive(cx, wrapped_pane);
+                let audit_after1123: Vec<String> =
+                    tako_control::orchestrator::supervisor::read_audit_log(200)
+                        .into_iter()
+                        .filter(|l| {
+                            l.contains("action=limit_autoresume")
+                                && l.contains(&format!("pane={}", wrapped_pane.as_u64()))
+                        })
+                        .collect();
+                println!(
+                    "TAKO_SELF_TEST_1123_RESUME: sent={} attempts={attempts_1123} audit={}->{}",
+                    sent_1123.len(),
+                    audit_before1123,
+                    audit_after1123.len(),
+                );
+                check(
+                    sent_1123.len() == 1 && attempts_1123 == 1,
+                    "111: 解除後に折り返し見出しのペインが再開される (#1123)",
+                );
+                check(
+                    audit_after1123.len() == audit_before1123 + 1
+                        && audit_after1123
+                            .last()
+                            .is_some_and(|l| l.contains("nudge queued")),
+                    "111: 折り返した上限の自動復帰が supervisor.log に記録される (#1123)",
+                );
+
                 // --- 負例 ② permission ダイアログでは発動しない ---
                 let perm_body = format!(
                     "{filler813}   Bash command\n   npm test\n   \
@@ -53741,12 +53890,12 @@ mod self_test {
                 println!("TAKO_SELF_TEST_813_PERSIST: {persisted:?}");
                 check(
                     // 有効にしたのは idle / dialog / codex / session / credits / warn /
-                    // ent / permission / api の 9 ペインだけ（codex = #985、
-                    // session = #1093、credits と warn = #1096、ent = #1106 で追加。
-                    // ent は**オプトイン ON でも自動復帰が発動しない**ことを見るために
-                    // 有効化してある）。OFF のペインはフィールドごと出ない
-                    // （旧 tako でも読める JSON を保つ）
-                    persisted == Some((9, 9)),
+                    // ent / wrapped / permission / api の 10 ペインだけ（codex = #985、
+                    // session = #1093、credits と warn = #1096、ent = #1106、
+                    // wrapped = #1123 で追加。ent は**オプトイン ON でも自動復帰が
+                    // 発動しない**ことを見るために有効化してある）。
+                    // OFF のペインはフィールドごと出ない（旧 tako でも読める JSON を保つ）
+                    persisted == Some((10, 10)),
                     "111: 有効にしたペインだけが保存表現へ載る (#813)",
                 );
 
@@ -60894,6 +61043,327 @@ mod self_test {
                     cx.notify();
                 });
                 let _ = std::fs::remove_file(&body142);
+                notify_and_draw(any, window, cx);
+            }
+
+            // 143. 明示コマンドのペインが**素のペインと同じ環境**で走り、失敗しても
+            //      黙って消えない（#1031）。
+            //
+            //      (a) ラッパーが `-l -i -c` = zsh は `.zshrc` も読む。#1031 前は
+            //          `-l -c`（非対話）で `.zshrc` だけ読まれず、nodebrew / fnm /
+            //          Homebrew の PATH を `.zshrc` で通している人は「素のペインでは
+            //          `npm` が引けるのに実行ペインでは command not found」になっていた
+            //      (b) 実際に起きたシェルが `.zshrc` を読む（rc の置き場をこのペインだけ
+            //          差し替えて、そこで export した値がコマンドまで届くかを見る）
+            //      (c) 失敗したコマンドは終了コードのマーカー + 案内を残してペインが生きる
+            //      (d) 成功したコマンドは従来どおり待たずに閉じる
+            //
+            //      **判定は #1031 後の姿を無条件で見る**ので、`TAKO_1031_LEGACY=1` で
+            //      起動すると (a) / (b) / (c) が落ちる = 検出力（同一バイナリの A/B）
+            {
+                let legacy1031 = std::env::var_os("TAKO_1031_LEGACY").is_some();
+
+                // (a) 境界の出力（app が `spawn_session` で通すのと同じ 1 実装）
+                let wrapper = tako_core::login_shell_command(tako_core::SpawnCommand {
+                    program: "/bin/echo".into(),
+                    args: vec!["hi".into()],
+                });
+                let wrapper_args = wrapper.args.clone();
+                if cfg!(unix) {
+                    check(
+                        wrapper_args.iter().any(|a| a == "-l")
+                            && wrapper_args.iter().any(|a| a == "-i")
+                            && wrapper_args.iter().any(|a| a == "-c"),
+                        &format!(
+                            "143 (a): 明示コマンドは対話ログインシェルで走る (#1031) \
+                             args={wrapper_args:?} legacy={legacy1031}"
+                        ),
+                    );
+                }
+
+                // この項目専用のタブで完結させる（項目 93 / 141 と同じ手）
+                let made143 = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        let made = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::TabNew {
+                                title: Some("st1031".into()),
+                                focus: Some(true),
+                                cwd: None,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                        // dispatch を直接呼ぶので PTY 起動依頼もここで消化する（#1023）
+                        for (p, options) in std::mem::take(&mut app.pending_attach) {
+                            if app.spawn_session(p, options, cx).is_err() {
+                                app.remove_pane(p, cx);
+                            }
+                        }
+                        cx.notify();
+                        match made {
+                            Ok(v) => match (v["pane"].as_u64(), v["tab"].as_u64()) {
+                                (Some(p), Some(t)) => {
+                                    Ok((PaneId::from_raw(p), TabId::from_raw(t)))
+                                }
+                                _ => Err(format!("tab new の応答: {v}")),
+                            },
+                            Err(e) => Err(format!("tab new: {e}")),
+                        }
+                    })
+                    .unwrap_or_else(|e| Err(format!("window.update: {e}")));
+                let (term143, tab143) = match made143 {
+                    Ok(v) => v,
+                    Err(why) => fail(&format!("143: 検証用タブを作れない (#1031。{why})")),
+                };
+
+                // 実 CLI を 1 本走らせる（応答 JSON を返す）
+                let split_cli =
+                    async |cx: &mut AsyncApp, args: Vec<String>| -> Option<serde_json::Value> {
+                        let out =
+                            cli_output_bg(cx, &cli_path, &ipc_endpoint, &token, term143, tab143, args)
+                                .await?;
+                        serde_json::from_slice(&out.stdout).ok()
+                    };
+                // `tako split` はペイン ID を**素の数値**で返す（`{"pane":N}` ではない）。
+                // 他のコマンドと形が違うのでここで吸収する
+                fn pane_of(v: &Option<serde_json::Value>) -> Option<PaneId> {
+                    v.as_ref()
+                        .and_then(|v| v["pane"].as_u64().or_else(|| v.as_u64()))
+                        .map(PaneId::from_raw)
+                }
+
+                // (b) 実際に起きたシェルが `.zshrc` を読む（= 素のペインと同じ）。
+                //     **このペインだけ `TAKO_ORIG_ZDOTDIR` を差し替えて** rc を用意し、
+                //     そこで export した値がコマンドまで届くかを見る（`login_shell_command`
+                //     は `spawn_session` の中で掛かるので、ここは製品経路そのもの）。
+                //     `HOME` ではなく `ZDOTDIR` の復元先を使うのは、器（tmux）つきでも
+                //     届かせるため: 器のセッション env へ `-e` で確定されるのは
+                //     `shell_integration::INJECTED_KEYS` に載っている名前だけで、
+                //     `HOME` は器のサーバーの stale な値に負ける。
+                //     ps で argv を覗く形は使えない: zsh は `-c <1 コマンド>` を
+                //     最後に `exec` で置き換えるので、見えるのは内側の `/bin/sh` になる
+                //     （実測）。#1031 前は `.zprofile` だけが届き `.zshrc` は届かない
+                let user_shell143 = std::env::var("SHELL").unwrap_or_default();
+                let zsh143 = std::path::Path::new(&user_shell143)
+                    .file_name()
+                    .map(|n| n == "zsh")
+                    .unwrap_or(false);
+                // シェル統合（ZDOTDIR 注入）が効いていないと rc の置き場を差し替えられない
+                let zdot_injected143 = tako_core::shell_integration::env()
+                    .iter()
+                    .any(|(k, _)| k == "ZDOTDIR");
+                let home143 =
+                    std::env::temp_dir().join(format!("tako-1031-home-{}", std::process::id()));
+                let mut probe143 = String::new();
+                let mut probe_pane143 = None;
+                if cfg!(unix) && zsh143 && zdot_injected143 {
+                    let _ = std::fs::remove_dir_all(&home143);
+                    if std::fs::create_dir_all(&home143).is_ok()
+                        && std::fs::write(
+                            home143.join(".zprofile"),
+                            "export ST1031_PROFILE=profile-ok\n",
+                        )
+                        .is_ok()
+                        && std::fs::write(home143.join(".zshrc"), "export ST1031_RC=rc-ok\n").is_ok()
+                    {
+                        let probe_argv143 = sh.shell_snippet_command(&sh.sequence(&[
+                            sh.echo("ST1031 rc=[${ST1031_RC}] profile=[${ST1031_PROFILE}]"),
+                            sh.sleep(30),
+                        ]));
+                        let made = window
+                            .update(cx, |app: &mut TakoApp, _, cx| {
+                                let made = tako_control::dispatch(
+                                    app,
+                                    tako_control::protocol::Request::Split {
+                                        pane: Some(term143.as_u64()),
+                                        tab: None,
+                                        direction: None,
+                                        ratio: None,
+                                        // 読めたかを 1 行で出し、判定できるまで居座る。
+                                        // argv は方言境界から作る（#889 の番犬）
+                                        command: Some(probe_argv143.clone()),
+                                        cwd: None,
+                                        focus: None,
+                                    },
+                                    PaneOrigin::Cli,
+                                );
+                                // **env を足してから** spawn する（#1023 と同じ消化の形）
+                                for (p, mut options) in std::mem::take(&mut app.pending_attach) {
+                                    options.env.push((
+                                        "TAKO_ORIG_ZDOTDIR".into(),
+                                        home143.display().to_string(),
+                                    ));
+                                    if app.spawn_session(p, options, cx).is_err() {
+                                        app.remove_pane(p, cx);
+                                    }
+                                }
+                                cx.notify();
+                                made.ok().and_then(|v| v["pane"].as_u64())
+                            })
+                            .ok()
+                            .flatten();
+                        probe_pane143 = made.map(PaneId::from_raw);
+                    }
+                }
+                let backend143 = probe_pane143
+                    .and_then(|p| {
+                        window
+                            .update(cx, |app: &mut TakoApp, _, _| {
+                                app.backend_sessions.contains_key(&p)
+                            })
+                            .ok()
+                    })
+                    .unwrap_or(false);
+                if let Some(probe_pane) = probe_pane143 {
+                    let seen = wait_for_app_state(
+                        window,
+                        cx,
+                        "143: HOME 差し替えペインが結果を出す (#1031)",
+                        Duration::from_secs(15),
+                        |app| {
+                            app.terminals
+                                .get(&probe_pane)
+                                .map(|s| s.visible_lines().iter().any(|l| l.contains("ST1031 rc=")))
+                                .unwrap_or(false)
+                        },
+                    )
+                    .await;
+                    probe143 = window
+                        .update(cx, |app: &mut TakoApp, _, _| {
+                            app.terminals
+                                .get(&probe_pane)
+                                .and_then(|s| {
+                                    s.visible_lines()
+                                        .iter()
+                                        .find(|l| l.contains("ST1031 rc="))
+                                        .map(|l| l.trim().to_string())
+                                })
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default();
+                    // `.zprofile` は #1031 前後どちらでも読まれる（`-l` は元から付いている）
+                    check(
+                        seen && probe143.contains("profile=[profile-ok]"),
+                        &format!(
+                            "143 (b): ログインプロファイルは従来どおり読まれる (#1031) \
+                             seen={seen} line={probe143:?}"
+                        ),
+                    );
+                    // `.zshrc` は `-i` があるときだけ読まれる = #1031 の中身そのもの
+                    check(
+                        probe143.contains("rc=[rc-ok]"),
+                        &format!(
+                            "143 (b): .zshrc は対話シェルのときだけ読まれる (#1031) \
+                             line={probe143:?} legacy={legacy1031}"
+                        ),
+                    );
+                    let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                        app.close_pane_button(probe_pane, CloseOrigin::Internal, cx);
+                        cx.notify();
+                    });
+                } else {
+                    println!(
+                        "TAKO_SELF_TEST_SKIPPED: 143(b) の rc 読み込み検査\
+                         （shell={user_shell143:?} unix={} zdotdir={zdot_injected143}）",
+                        cfg!(unix)
+                    );
+                }
+                let _ = std::fs::remove_dir_all(&home143);
+
+                // (c) 失敗したコマンドはペインが残り、終了コードと案内が読める
+                let mut fail_args143 = vec!["split".into(), "--pane".into(), term143.to_string(), "--".into()];
+                fail_args143.extend(sh.shell_snippet_command(
+                    &sh.sequence(&[sh.echo("st1031-out"), sh.exit_status(7)]),
+                ));
+                let fail143 = split_cli(cx, fail_args143).await;
+                let Some(bad_pane) = pane_of(&fail143) else {
+                    fail(&format!("143: 失敗コマンドの split が失敗した (#1031。{fail143:?})"))
+                };
+                let hint143 = tako_core::platform::shell::hold_hint(tako_core::i18n::lang());
+                let held = wait_for_app_state(
+                    window,
+                    cx,
+                    "143: 失敗したコマンドが終了コードと案内を残す (#1031)",
+                    Duration::from_secs(12),
+                    |app| {
+                        app.terminals
+                            .get(&bad_pane)
+                            .map(|s| {
+                                // 案内は狭いペインで**行を折り返す**ので、空白と改行を
+                                // 落としてから見る（実測: 「…このペインを閉じ」「ます。」）
+                                let joined = squash_ws(&s.visible_lines().join(""));
+                                joined.contains("__TAKO_EXIT=7")
+                                    && joined.contains(&squash_ws(hint143))
+                            })
+                            .unwrap_or(false)
+                    },
+                )
+                .await;
+                let screen143 = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.terminals
+                            .get(&bad_pane)
+                            .map(|s| {
+                                s.visible_lines()
+                                    .iter()
+                                    .map(|l| l.trim_end().to_string())
+                                    .filter(|l| !l.is_empty())
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                let alive143 = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.terminals.contains_key(&bad_pane)
+                    })
+                    .unwrap_or(false);
+                check(
+                    held && alive143,
+                    &format!(
+                        "143 (c): 失敗したコマンドは終了コードと案内を残して止まる \
+                         (#1031) held={held} alive={alive143} screen={screen143:?}"
+                    ),
+                );
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                    app.close_pane_button(bad_pane, CloseOrigin::Internal, cx);
+                    cx.notify();
+                });
+
+                // (d) 成功したコマンドは従来どおり閉じる（包みが常時 hold にならない）
+                let mut ok_args143 = vec!["split".into(), "--pane".into(), term143.to_string(), "--".into()];
+                ok_args143.extend(sh.shell_snippet_command(&sh.echo("st1031-ok")));
+                let ok143 = split_cli(cx, ok_args143).await;
+                if let Some(good_pane) = pane_of(&ok143) {
+                    let gone = wait_for_app_state(
+                        window,
+                        cx,
+                        "143: 成功したコマンドのペインが閉じる (#1031)",
+                        Duration::from_secs(12),
+                        |app| !app.terminals.contains_key(&good_pane),
+                    )
+                    .await;
+                    check(
+                        gone,
+                        &format!(
+                            "143 (d): 成功したコマンドのペインは従来どおり閉じる (#1031) \
+                             gone={gone}"
+                        ),
+                    );
+                } else {
+                    fail(&format!("143: 成功コマンドの split が失敗した (#1031。{ok143:?})"));
+                }
+
+                println!(
+                    "TAKO_SELF_TEST_1031: wrapper={wrapper_args:?} probe={probe143:?} \
+                     backend={backend143} held={held} legacy={legacy1031}"
+                );
+
+                // 後片付け: 専用タブを畳む
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                    app.close_pane_button(term143, CloseOrigin::Internal, cx);
+                    cx.notify();
+                });
                 notify_and_draw(any, window, cx);
             }
 
