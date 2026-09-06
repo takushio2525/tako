@@ -73,6 +73,12 @@ jobs:
       # **Dock のピンが逃げる形へ戻ったらここで落ちる**（#1042）
       - name: バンドル差し替えのモックテスト
         run: bash scripts/test-bundle-install.sh
+      # 仮想ディスプレイの見張り（同名の増殖で止まる / Main を仮想のままにしない /
+      # 孤児の後片付けは実行条件を満たすまで拒否する）のモックテスト。画面の列挙・器の
+      # CLI・蓋の状態をすべてスタブするので、画面の無いランナーでも走り実機には触らない。
+      # **器を再起動してよい条件の判定が壊れたらここで落ちる**（#1150）
+      - name: 仮想ディスプレイの見張りのモックテスト
+        run: bash scripts/test-virtual-display-guard.sh
 
   windows:
     name: Windows（build + test スモーク）
