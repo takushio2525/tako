@@ -183,11 +183,24 @@ pub fn detect_disconnect(
         .iter()
         .position(|l| l.contains(crate::ssh_progress::SCRIPT_FAILURE_MARK))
     {
-        let reason = new_lines[..idx]
+        // #1127: **ssh が出した失敗行を優先して拾う**。素の「直前の非空行」だと、
+        // 端末幅で折り返された理由の**尻尾**が理由になる（実機の 44 桁のペインで実測:
+        // `testuser@host: Permission denied (publickey).` が 2 行へ割れ、マーカーの
+        // 直前の行が `.` の 1 文字だけになった）。理由が読めないと
+        // [`is_recoverable_reason`] が「待てば直る」側へ倒れるので、**鍵の失敗でも
+        // 打ち直してしまい相手の認証ログを埋める** = この関数が防ぐはずのものが起きる。
+        // `ssh_progress::classify` は #1090 で同じ手当てを済ませており、
+        // [`crate::ssh_progress::is_ssh_error_line`] はそのために公開されている
+        let before = &new_lines[..idx];
+        let reason = before
             .iter()
-            .rev()
             .map(|l| l.trim())
-            .find(|l| !l.is_empty() && !l.starts_with(crate::ssh_progress::TAKO_LINE_PREFIX))
+            .find(|l| crate::ssh_progress::is_ssh_error_line(l))
+            .or_else(|| {
+                before.iter().rev().map(|l| l.trim()).find(|l| {
+                    !l.is_empty() && !l.starts_with(crate::ssh_progress::TAKO_LINE_PREFIX)
+                })
+            })
             .map(str::to_string);
         return Some((DisconnectSignal::ScriptMarker, reason));
     }
@@ -357,6 +370,73 @@ mod tests {
             "累計 {}s は長すぎる",
             total_backoff_secs(MAX_ATTEMPTS)
         );
+    }
+
+    /// #1127: **折り返しで割れた理由**でも認証系だと分かる。
+    ///
+    /// 実機（Windows・44 桁のペイン）の画面をそのまま入れる。`.` の 1 文字だけの
+    /// 行がマーカーの直前に来るので、素の「直前の非空行」だと理由が `.` になり
+    /// 「待てば直る」へ倒れて**鍵の失敗を打ち直してしまう**
+    #[test]
+    fn 折り返しで割れた理由でも認証系だと分かる() {
+        let screen: Vec<String> = [
+            "TAKO_1040_BACK",
+            "PS C:\\Users\\winuser> echo 'testuser@host: Perm",
+            "ission denied (publickey).' 'tako: selftest-",
+            "nonexistent-1040 への接続に失敗しました（ssh",
+            " exit ）。理由は上の行です'",
+            "testuser@host: Permission denied (publickey)",
+            ".",
+            "tako: selftest-nonexistent-1040 への接続に失",
+            "敗しました（ssh exit ）。理由は上の行です",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (signal, reason) = detect_disconnect(&screen, None).expect("切断を検知する");
+        assert_eq!(signal, DisconnectSignal::ScriptMarker);
+        assert_eq!(
+            reason.as_deref(),
+            Some("testuser@host: Permission denied (publickey)"),
+            "折り返しの尻尾（`.`）を理由にしている"
+        );
+        assert!(
+            !is_recoverable_reason(reason.as_deref()),
+            "認証系なのに打ち直す側へ倒れている"
+        );
+    }
+
+    /// 折り返していない従来の形（= #919 の契約）は 1 文字も変わらない
+    #[test]
+    fn 折り返していない画面では直前の行がそのまま理由になる() {
+        let screen: Vec<String> = [
+            "ssh: connect to host h port 22: Connection refused",
+            "tako: h への接続に失敗しました（ssh exit 255）。理由は上の行です",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (_, reason) = detect_disconnect(&screen, None).expect("切断を検知する");
+        assert_eq!(
+            reason.as_deref(),
+            Some("ssh: connect to host h port 22: Connection refused")
+        );
+        assert!(is_recoverable_reason(reason.as_deref()), "回線側は繰り返す");
+    }
+
+    /// ssh の目印がどこにも無ければ従来どおり「直前の非空行」へ落ちる
+    #[test]
+    fn 目印が無ければ直前の非空行へ落ちる() {
+        let screen: Vec<String> = [
+            "something unusual happened",
+            "",
+            "tako: h への接続に失敗しました（ssh exit 255）。理由は上の行です",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (_, reason) = detect_disconnect(&screen, None).expect("切断を検知する");
+        assert_eq!(reason.as_deref(), Some("something unusual happened"));
     }
 
     #[test]
