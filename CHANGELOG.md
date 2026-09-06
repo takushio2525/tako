@@ -41,6 +41,34 @@ change-type tag. Entries without a platform tag apply to every platform.
 
 ### Changed
 
+- **Profile-level auto-resume after usage limits now covers the master / solo session
+  itself** (#1140, extends #822). A profile's `limit_resume: true` used to reach only
+  the workers spawned from it, so when the master itself hit a usage limit everything
+  stayed stopped until a human noticed. It now also applies to the pane started by
+  `tako master` / `tako solo`, to the successor master created by
+  `tako orchestrator handoff`, and to a session restarted with the conversation carried
+  over. All those paths go through one resolver, and the setting only ever turns the
+  flag **on** — a pane you enabled by hand is never silently turned off when its role is
+  re-applied. `tako orchestrator profiles show` now returns two effective values
+  (`resolved_master_limit_resume` for the session itself, `resolved_limit_resume` for
+  workers); the worker resolution order (spawn argument → profile → off) is unchanged.
+  A/B with `TAKO_1140_LEGACY=1`.
+- **プロファイル既定のリミット後自動復帰が master / solo 本人にも効くようになった**
+  （#1140。#822 の拡張）。従来 `limit_resume: true` が届くのは**そのプロファイルから
+  spawn した worker だけ**だったので、master 自身が上限で止まると人が気づくまで
+  全部止まったままだった。`tako master` / `tako solo` で立つ本人のペイン・
+  `tako orchestrator handoff` で立つ後任 master・会話を引き継いだセッション再起動にも
+  同じ既定が配られる。3 経路とも 1 本の解決関数を通り、配るのは **ON にする方向だけ**
+  （人が手で有効にしたペインを role の貼り直しで黙って OFF へ戻さない）。
+  `tako orchestrator profiles show` は実効値を 2 本返す
+  （本人 = `resolved_master_limit_resume` / worker = `resolved_limit_resume`）。
+  worker 側の解決順（spawn 引数 → プロファイル → 無効）は不変。A/B は `TAKO_1140_LEGACY=1`。
+  併せて、**claude 2.1.258 自身にも上限解除後の自動続行がある**ことを実物調査で確定し
+  （ダイアログ無しで arm し、解除時刻 + 30〜90 秒で自分へ継続プロンプトを投げる。
+  ただし同じプロセスが生きているあいだだけで、`esc` / `Ctrl-C` / 手入力の送信 / `/clear` /
+  会話の resume / プロセス終了で解除される）、`tako agent-support` の
+  `limit_autocontinue_upstream` として根拠つきで宣言した（codex / agy には無い）。
+
 - The work-log budget (5 work days / 20 entries / 3 lines each / 12 KB, 90-day archive
   retention) is now generated from a single source of truth into the three places tako
   ships regulations, and a test pins them to the table so the numbers cannot drift.

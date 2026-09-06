@@ -333,6 +333,30 @@ fn collect_limit_resume_panes(host: &dyn ControlHost) -> Vec<u64> {
         .collect()
 }
 
+/// master / solo **本人**のペインへプロファイル既定を配る（Issue #1140）。
+///
+/// 呼ぶのは「そのペインが master / solo になった瞬間」= role を貼る 3 経路
+/// （`tako master` / `tako solo` の `Request::Title`・引き継ぎの後任 master・
+/// 会話を引き継いだセッション再起動）。worker の spawn は従来どおり
+/// `orchestrator::resolve_worker_limit_resume` を通る（解決順に spawn 引数が入る）。
+///
+/// **true のときだけ立てる**: 人が `tako limit-resume on` したペインを、role の
+/// 貼り直しで黙って OFF へ戻さない（#813 のペイン単位オプトインを壊さない）。
+/// 記録も状態が変わったときだけ残す（既定 OFF の起動で persist.log を埋めない）
+fn apply_master_pane_profile_defaults(pane: &mut tako_core::Pane, role: Option<&str>) {
+    let Some(role) = role.filter(|r| !r.is_empty()) else {
+        return;
+    };
+    if pane.limit_autoresume() || !crate::orchestrator::master_pane_limit_resume(role) {
+        return;
+    }
+    pane.set_limit_autoresume(true);
+    crate::diag::persist_log(&format!(
+        "[limit-autoresume] pane={} enabled=true 発生源 profile:{role}",
+        pane.id().as_u64()
+    ));
+}
+
 /// OrchestratorWorkers のサブプロセス実行部分（tmux ls + レジストリ読み）。
 /// UI スレッドで呼ばないこと（OffloadJob::run / dispatch 同期経路用）。
 ///
@@ -1067,7 +1091,12 @@ fn dispatch_inner(
                 pane.set_title((!t.is_empty()).then_some(t));
             }
             if let Some(r) = role {
-                pane.set_role((!r.is_empty()).then_some(r));
+                pane.set_role((!r.is_empty()).then_some(r.clone()));
+                // #1140: master / solo になったペインへプロファイル既定を配る。
+                // `tako master` / `tako solo` / リモートからの master 起動（#1078）は
+                // どれも起動コマンドを流す前にここで role を貼るので、
+                // 「起動直後から ON」がこの 1 か所で揃う
+                apply_master_pane_profile_defaults(pane, Some(r.as_str()));
             }
             Ok(Value::Null)
         }
@@ -5476,6 +5505,9 @@ fn dispatch_sessions_resume(
     if title.is_some() {
         pane_obj.set_title(title.clone());
     }
+    // #1140: 会話を引き継いで立て直した master / solo も本人のペイン
+    // （ここを外すと「再起動したら自動復帰だけ落ちていた」になる）
+    apply_master_pane_profile_defaults(pane_obj, role.as_deref());
     pane_obj.set_role(role);
 
     Ok(json!({
@@ -5681,19 +5713,24 @@ fn profile_to_json(
     v["resolved_ctx_threshold"] = json!(resolved.value);
     v["ctx_threshold_source"] = json!(resolved.source.as_str());
     v["resolved_auto_handoff"] = json!(orchestrator::auto_handoff_enabled(profile));
-    // worker の自動復帰の既定（#822）。実効値も併記して「今 spawn したらどうなるか」を
-    // 1 回の呼び出しで確定できるようにする（ctx_threshold と同じ流儀）
+    // 自動復帰の既定（#822 / #1140）。実効値も併記して「今このプロファイルで立てたら
+    // どうなるか」を 1 回の呼び出しで確定できるようにする（ctx_threshold と同じ流儀）。
+    // **配り先は 2 つある**ので実効値も 2 本返す: master / solo 本人のペイン（#1140）と
+    // spawn した worker（#822。spawn 引数で上書きできるぶん解決順が 1 段多い）
     if profile.limit_resume.is_some() {
         v["limit_resume"] = json!(profile.limit_resume);
     }
     let limit_resume_resolved = orchestrator::resolve_worker_limit_resume(profile, None);
     v["resolved_limit_resume"] = json!(limit_resume_resolved);
-    // solo は worker を spawn しない（solo prompt が禁止している）ので、ON にしても
-    // 効く先が無い。黙って死んだ設定にしないため警告として見せる
+    let master_limit_resume_resolved = orchestrator::resolve_master_limit_resume(profile);
+    v["resolved_master_limit_resume"] = json!(master_limit_resume_resolved);
+    // solo は worker を spawn しない（solo prompt が禁止している）ので、効く先が
+    // 本人のペインだけになる。#1140 前は「効きません」だったが、いまは効く先が
+    // 狭いだけなので、何に効くのかを正しく言う（黙って狭めない）
     if limit_resume_resolved && kind == orchestrator::ProfileKind::Solo {
         let mut warnings: Vec<Value> = v["warnings"].as_array().cloned().unwrap_or_default();
         warnings.push(json!(
-            "limit_resume は spawn した worker ペインへ適用される設定ですが、solo プロファイルは worker を spawn しません（この設定は効きません）。\n  ペイン単位で有効にするには `tako limit-resume on --pane <id>` を使ってください"
+            "solo プロファイルは worker を spawn しないので、limit_resume が効くのは `tako solo` で立てた本人のペインだけです（worker への配布はありません）。\n  ペイン単位で切り替えるには `tako limit-resume on --pane <id>` を使ってください"
         ));
         v["warnings"] = Value::Array(warnings);
     }
@@ -7870,6 +7907,10 @@ fn dispatch_orchestrator_handoff(
     pane_obj.set_title(Some(window_title));
     pane_obj.set_spawned_by(Some(split_target));
     pane_obj.set_role(Some(new_role.clone()));
+    // #1140: 後任 master も本人のペイン。**前任の設定ではなくプロファイル既定から
+    // 決める**（同プロファイルで立て直すのが引き継ぎの約束 = #1055 の cwd と同じ流儀）
+    apply_master_pane_profile_defaults(pane_obj, Some(new_role.as_str()));
+    let limit_resume_applied = pane_obj.limit_autoresume();
 
     let handoff_path = orchestrator::handoff_path(profile_name);
     let mut warnings: Vec<String> = migration.warnings.clone();
@@ -7888,6 +7929,8 @@ fn dispatch_orchestrator_handoff(
         // #854: プロファイルをどこから決めたか（caller_role / pane_role / default）。
         // pane_role が出たら呼び出し元の env が失われていたということ
         "profile_source": profile_source.as_str(),
+        // #1140: 後任へ配った利用上限後の自動復帰（プロファイル既定から決めた実効値）
+        "limit_resume": limit_resume_applied,
         "role": new_role,
         "handoff_file": handoff_path,
         "handoff_prompt_length": handoff_prompt.len(),
@@ -12905,6 +12948,94 @@ mod tests {
             PaneOrigin::Cli,
         );
         assert!(matches!(missing, Err(DispatchError::PaneNotFound(9999))));
+    }
+
+    /// #1140: role を貼った瞬間にプロファイル既定が master / solo **本人**へ配られる。
+    /// `tako master` / `tako solo` / リモートからの master 起動（#1078）は
+    /// どれも起動コマンドの前に `Request::Title` で role を貼るので、ここが本番経路。
+    ///
+    /// **`TAKO_1140_LEGACY=1` の A/B ではこのテストが落ちる**（= 検出力）
+    #[test]
+    fn issue1140_masterとsoloのroleでプロファイル既定が配られる() {
+        let dir = crate::orchestrator::config_dir().expect("テストは隔離先を返す");
+        let _ = std::fs::create_dir_all(dir.join("profiles"));
+        let _ = std::fs::create_dir_all(dir.join("solo-profiles"));
+        std::fs::write(
+            dir.join("profiles").join("_tako_1140_on_.yaml"),
+            "effort: high\nlimit_resume: true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("profiles").join("_tako_1140_off_.yaml"),
+            "effort: high\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("solo-profiles").join("_tako_1140_on_.yaml"),
+            "effort: high\nlimit_resume: true\n",
+        )
+        .unwrap();
+
+        let mut host = MockHost::new();
+        let on_pane = host.root_pane();
+        let off_pane = split(&mut host, on_pane);
+        let solo_pane = split(&mut host, on_pane);
+        let worker_pane = split(&mut host, on_pane);
+
+        let title = |host: &mut MockHost, pane: u64, role: &str| {
+            dispatch(
+                host,
+                Request::Title {
+                    pane: Some(pane),
+                    title: None,
+                    role: Some(role.into()),
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+        };
+        let enabled = |host: &mut MockHost, pane: u64| -> bool {
+            dispatch(
+                host,
+                Request::LimitResume {
+                    pane: Some(pane),
+                    enabled: None,
+                    all: None,
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap()["enabled"]
+                == json!(true)
+        };
+
+        title(&mut host, on_pane, "orchestrator-master:_tako_1140_on_");
+        title(&mut host, off_pane, "orchestrator-master:_tako_1140_off_");
+        title(&mut host, solo_pane, "solo:_tako_1140_on_");
+        // worker の role は master 側の配布に巻き込まない（#822 の解決順が正）
+        title(&mut host, worker_pane, "orchestrator-worker:_tako_1140_on_");
+
+        assert!(enabled(&mut host, on_pane), "master 本人が ON にならない");
+        assert!(!enabled(&mut host, off_pane), "既定 OFF が ON になった");
+        assert!(enabled(&mut host, solo_pane), "solo 本人が ON にならない");
+        assert!(!enabled(&mut host, worker_pane), "worker へ漏れた");
+
+        // 人が OFF にしたペインを role の貼り直しで勝手に ON へ戻さない…のではなく、
+        // **ON を勝手に OFF へ戻さない**のがここの不変条件（#813 のオプトインを壊さない）
+        dispatch(
+            &mut host,
+            Request::LimitResume {
+                pane: Some(off_pane),
+                enabled: Some(true),
+                all: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        title(&mut host, off_pane, "orchestrator-master:_tako_1140_off_");
+        assert!(
+            enabled(&mut host, off_pane),
+            "手で ON にしたペインが role の貼り直しで OFF へ戻った"
+        );
     }
 
     #[test]
@@ -18060,20 +18191,35 @@ mod tests {
             })
         };
 
-        // 未設定 = 生値は出さず実効値だけ false
+        // 未設定 = 生値は出さず実効値だけ false（#1140: 配り先 2 本とも）
         let v = set(None, false).expect("set は成功する");
         assert!(v.get("limit_resume").is_none(), "{v}");
         assert_eq!(v["resolved_limit_resume"].as_bool(), Some(false), "{v}");
+        assert_eq!(
+            v["resolved_master_limit_resume"].as_bool(),
+            Some(false),
+            "{v}"
+        );
 
-        // ON → 生値と実効値の両方が true
+        // ON → 生値と実効値の両方が true。#1140 で master / solo 本人ぶんも true
         let v = set(Some(true), false).expect("set は成功する");
         assert_eq!(v["limit_resume"].as_bool(), Some(true), "{v}");
         assert_eq!(v["resolved_limit_resume"].as_bool(), Some(true), "{v}");
+        assert_eq!(
+            v["resolved_master_limit_resume"].as_bool(),
+            Some(true),
+            "{v}"
+        );
 
         // clear → 生値が消え実効値は false へ戻る
         let v = set(None, true).expect("clear は成功する");
         assert!(v.get("limit_resume").is_none(), "{v}");
         assert_eq!(v["resolved_limit_resume"].as_bool(), Some(false), "{v}");
+        assert_eq!(
+            v["resolved_master_limit_resume"].as_bool(),
+            Some(false),
+            "{v}"
+        );
 
         // 同時指定は拒否（auto_handoff と同じ規約）
         let err = set(Some(true), true).expect_err("同時指定は拒否する");

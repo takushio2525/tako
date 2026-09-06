@@ -254,6 +254,8 @@ pub mod keys {
     /// コンフリクト解消エージェントの起動
     pub const GIT_RESOLVE_AGENT: &str = "git_resolve_agent";
     /// ステータスバーの利用制限サービス切替
+    /// 上流の CLI 自身が上限解除後に自分で続行する仕組み
+    pub const LIMIT_AUTOCONTINUE_UPSTREAM: &str = "limit_autocontinue_upstream";
     pub const LIMIT_SERVICE_SWITCH: &str = "limit_service_switch";
     /// ctx% 超過での自動ハンドオフ
     pub const MASTER_AUTO_HANDOFF: &str = "master_auto_handoff";
@@ -472,6 +474,12 @@ pub mod notes {
     pub const NO_LOCAL_ENTITLEMENT: Note = Note::new(
         "自分のマシンで動かすモデルなので、座席種別・クレジット・組織ポリシーという概念が無い（阻害される権利がそもそも存在しない）",
         "The model runs on your own machine, so there is no seat type, credit balance, or org policy to be blocked by",
+    );
+
+    /// #1140: codex は「解除まで待って自分で続行する」機構を持たない
+    pub const CODEX_NO_AUTOCONTINUE: Note = Note::new(
+        "codex の CLI には上限解除を待って自分で続行する仕組みが無い（止まったままなので tako 側のナッジが唯一の再開手段）",
+        "The codex CLI has no mechanism that waits for the limit to reset and continues by itself, so tako's own nudge is the only way it resumes",
     );
 
     /// ローカルで動かすモデルに利用上限という概念が無い
@@ -693,6 +701,38 @@ pub const MATRIX: &[AgentFeature] = &[
         evidence: AgentEvidence::Source(
             "dispatch.rs の git resolve は 3 系統とも起動できるが、worker と同じ経路なので \
              MCP の一時注入が無い（mcp_servers を組むのは orchestrator/mod.rs の master 側だけ）",
+        ),
+    },
+    AgentFeature {
+        key: keys::LIMIT_AUTOCONTINUE_UPSTREAM,
+        summary: Note::new(
+            "エージェント CLI 自身が上限解除後に続行する（同じプロセスが生き続けているあいだだけ。#1140）",
+            "The agent CLI itself continues once the usage limit resets, but only while the same process stays alive (#1140)",
+        ),
+        claude: S::Supported,
+        codex: unsupported(notes::CODEX_NO_AUTOCONTINUE),
+        agy: unsupported(notes::AGY_NO_LIMIT_RESET),
+        local: unsupported(notes::NO_LOCAL_USAGE_LIMIT),
+        evidence: AgentEvidence::ByDesign(
+            "#1140 の実物調査（claude 2.1.258 の実装ソースをバイナリから採取）: 上限の \
+             API エラーを受けた時点で `bUn(quotaLimits, …)` が**ダイアログ無しで**自動的に \
+             armed へ入り、解除時刻 + 30〜90 秒のジッタで自分へ継続プロンプト \
+             （`Your claude.ai usage limit has reset. Continue the task you were working on …`）\
+             を投げる。設定キーは `autoContinueAtUsageLimit`（**未設定なら ON**）、\
+             ゲートは `tengu_marble_heron` の `enabled` / `autoArm`（未設定なら ON）。\
+             連続の張り直しは 2 回まで（`rearm_cap`）、自動 arm は解除が 24 時間より \
+             先だと張らない（`horizon_exceeded`）。**上限ダイアログの \
+             `Stop and wait for limit to reset`（値 `cancel`）は arm しない**: \
+             継続が既にキューへ入っているか episode が stale なら**解除**し、\
+             それ以外はメニューを閉じるだけ。arm する選択肢は別で、\
+             `Wait here, then continue automatically …`（値 `auto-resume`）。`escape` / `ctrl_c` / \
+             `kill_agents_chord` / 手入力の送信 / `conversation_reset`（clear / resume / \
+             remote_attach）/ `account_switch` / `relaunch` / `process_exit` で解除される。\
+             **codex 0.153.0 と agy 1.1.27 のバイナリには相当する文字列が 1 件も無い** \
+             （`continue automatically` / `auto_resume` / `auto-resume` / `autoResume` / \
+             `wait for limit` / `resume automatically` が各 0 件。同じ走査で codex の \
+             `hit your usage limit` は 7 件・`Try again at` は 1 件当たるので走査は有効）。\
+             **解除時刻をまたぐ実機観測は行っていない**（実装ソースからの判定）",
         ),
     },
     AgentFeature {

@@ -53,8 +53,8 @@ const CATEGORIES = [
     'session_restart_harness', 'session_restart_handoff',
   ]],
   ['利用制限', [
-    'worker_limit_detect', 'worker_limit_autoresume', 'worker_limit_metrics',
-    'worker_entitlement_detect',
+    'worker_limit_detect', 'worker_limit_autoresume', 'limit_autocontinue_upstream',
+    'worker_limit_metrics', 'worker_entitlement_detect',
     'limit_service_switch',
   ]],
   ['リモートからの操作', ['remote_control']],

@@ -1249,16 +1249,13 @@ pub fn desc_prof_auto_handoff() -> &'static str {
 }
 
 pub fn prof_label_limit_resume() -> &'static str {
-    tr!(
-        "worker のリミット後自動復帰",
-        "Auto-resume workers after limits"
-    )
+    tr!("リミット後の自動復帰", "Auto-resume after usage limits")
 }
 
 pub fn desc_prof_limit_resume() -> &'static str {
     tr!(
-        "このプロファイルから spawn した worker を、利用上限のリセット後に tako が自動で再開させる（ペインごとの切替は右クリック）",
-        "tako restarts workers spawned from this profile once the usage limit resets (per-pane toggle is in the right-click menu)"
+        "このプロファイルで立てた master / solo 本人（引き継ぎの後任を含む）と、spawn した worker を、利用上限のリセット後に tako が自動で再開させる（ペインごとの切替は右クリック）",
+        "tako resumes the master / solo session started from this profile (successors included) and the workers it spawns once the usage limit resets (per-pane toggle is in the right-click menu)"
     )
 }
 
