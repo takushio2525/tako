@@ -405,6 +405,7 @@ mod tests {
                 policy: None,
                 master_ratio: None,
                 algorithm: None,
+                min_worker_cols: None,
             }]
         );
         assert_eq!(response.unwrap()["result"]["isError"], false);
@@ -413,7 +414,7 @@ mod tests {
         let (_, requests) = run(
             call(
                 "tako_orchestrator_layout",
-                json!({ "policy": "legacy", "master_ratio": 0.6, "algorithm": "spiral" }),
+                json!({ "policy": "legacy", "master_ratio": 0.6, "algorithm": "spiral", "min_worker_cols": 80 }),
             ),
             None,
             true,
@@ -424,6 +425,8 @@ mod tests {
                 policy: Some("legacy".into()),
                 master_ratio: Some(0.6),
                 algorithm: Some("spiral".into()),
+                // #1132: worker ペインの下限幅も 1:1 で届く
+                min_worker_cols: Some(80),
             }]
         );
     }

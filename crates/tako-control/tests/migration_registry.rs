@@ -186,7 +186,16 @@ fn fingerprint() -> BTreeMap<String, Vec<String>> {
         ),
         (
             "crates/tako-control/src/setup.rs",
-            &["SetupConfig", "SetupState", "OrchestratorConfig"],
+            // #1132: `SpawnLayoutSection` は `SetupConfig.spawn_layout` として config.yaml へ
+            // 直に serde される永続構造体なのに、この表から漏れていた（`min_worker_cols` を
+            // 足しても指紋が動かず素通りする）。#728 の `PendingSpawn` / #1041 の
+            // `RemoteFolderLayout` と同じ穴なので閉じる
+            &[
+                "SetupConfig",
+                "SetupState",
+                "OrchestratorConfig",
+                "SpawnLayoutSection",
+            ],
         ),
         (
             "crates/tako-control/src/orchestrator/mod.rs",

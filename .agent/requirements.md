@@ -762,6 +762,7 @@ tty 突き合わせ）。現状はペイン配下のみ検知のため、**tako 
 | FR-2.20.4 | **worker 領域の判定は origin / spawned_by による**: 領域 = spawn 由来ペイン（`spawned_by` チェーンが spawn 元に到達）だけのサブツリー。ユーザーが手動で開いたペインが混在するサブツリーは領域と見なさず再構築しない（**master とユーザー由来ペインの矩形を勝手に潰さない**） | M |
 | FR-2.20.5 | worker close 時（dispatch `Close` / UI ×・exit）に空いた場所を残り worker で再配分する。リフローは worker 領域内に限定し、master・ユーザー由来ペインの矩形は不変 | M |
 | FR-2.20.6 | master / solo のデフォルト system prompt に「レイアウト操作時は master とユーザー由来ペインの可読性を最優先する」行動規範を持つ | S |
+| FR-2.20.7 | **worker ペイン 1 枚に最小幅（桁数）を保証する**（#1132）。同じタブへ置くと `min_worker_cols`（既定 60 / 0 = 保証しない / 20〜400）を割る spawn は同じタブへ割らず、①すでにその master 由来の worker だけが居るタブで余裕のあるもの → ②新しいタブ（worker を全幅で置く）の順に出す。配置先と理由は spawn 応答（`tab` / `placement` / `placement_reason` / `pane_cols` / `min_worker_cols`）に載る。設定は config.yaml の `spawn_layout.min_worker_cols` で、CLI `tako orchestrator layout --min-worker-cols` + MCP `tako_orchestrator_layout` の `min_worker_cols` で 1:1 公開する | M |
 
 実装メモ（2026-07-13）: レイアウト計算は `tako-core::spawn_layout`（ポリシー型 +
 領域構築の純関数）と `PaneTree::spawn_worker` / `reflow_workers`（領域判定 + 再構築）。
@@ -770,6 +771,29 @@ tako-app `remove_pane_with` の両方から `reflow_workers` を呼ぶ。設定�
 `tako-control::setup::spawn_layout_config()`（不正値は既定へフォールバックし spawn を
 止めない）。機械検証は tako-core 単体テスト（rect 検証 10 本）+ セルフテスト項目 72
 （dispatch 経由 spawn 1→4 → close リフロー → ユーザーペイン不変）。
+
+実装メモ（2026-09-04。FR-2.20.7 = #1132）: **狭いペインでは claude TUI が
+メッセージをハード折り返しする**ので、上限の見出し（#1123）・選択肢ダイアログ・
+報告の読み取りが同時に壊れる（実測: master + worker 7〜8 体で worker が 18〜25 桁。
+解除後 7.5 時間 worker 4 体が止まったまま）。master-reserved の「master の取り分を
+守る」は効いていたが、**worker 領域の 1 ペインの下限幅**が無かった。
+
+- 見積もりは 2 段: 「worker を 1 体足したときにいちばん狭い worker がタブ幅の何割に
+  なるか」は `tako_core::spawn_layout::prospective_narrowest_worker_share`（**純関数**。
+  `build_even` / `build_spiral` の写しで、実際に木を組んで `PaneTree::layout` と
+  突き合わせるテストが拘束する）。**桁数への変換だけ**がセル幅・枠と余白という実測に
+  依るので `ControlHost::pane_cols_for_width_fraction`（GUI だけが答えられる）へ分けた
+  （GUI の式は `pane_text_area_rect` + `grid_cells` と同一。デバイスピクセル丸めのぶん
+  最大 1 桁ずれることを番犬テストが固定する）
+- 領域の探索は `PaneTree::worker_area_panes`（読み取り専用）で、再構築
+  （`rebuild_worker_area`）と**同じ領域**を指すことを単体テストが固定する
+- 既定 60 桁の根拠は 2 つ: ①tako が読む最長の通知（111 文字）が 60 桁なら 3 行以内に
+  収まり、折り返しの結合（`unwrap_wrapped_lines`）の予算に十分収まる（実害が出た
+  21〜25 桁では 5〜7 行に割れる。テストで固定）②実測のタブ（約 124 桁）で master の
+  隣に worker 列が 1 本残る上限（これより大きくするとノート PC でどの worker も
+  同タブに置けなくなる）
+- `spawn_worker`（tako-core）は下限を見ない。配置の決定は dispatch の
+  `plan_worker_placement` に閉じているので、#165 の rect テストは 1 ビットも変わらない
 
 ### FR-2.21 アプリ内更新の通知と専用画面（✅ 2026-07-28、#616。基盤は #36 / #403 / #50 / #595）
 

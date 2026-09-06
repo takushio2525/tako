@@ -324,6 +324,11 @@ pub struct SpawnLayoutSection {
     /// worker 領域内の配置アルゴリズム（"grid" / "spiral"）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub algorithm: Option<String>,
+    /// worker ペイン 1 枚に保証する最小の桁数（#1132。0 = 保証しない）。
+    /// **旧ファイルにこのキーは無い**ので serde default（= None → 既定値へ解決）で読める。
+    /// 移行の手順は不要（#916 の指紋テストが型の変更を検知する）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_worker_cols: Option<u16>,
 }
 
 impl SpawnLayoutSection {
@@ -349,6 +354,10 @@ impl SpawnLayoutSection {
                 .as_deref()
                 .and_then(|s| tako_core::WorkerLayoutAlgorithm::parse(s).ok())
                 .unwrap_or(defaults.algorithm),
+            min_worker_cols: self
+                .min_worker_cols
+                .map(tako_core::spawn_layout::clamp_min_worker_cols)
+                .unwrap_or(defaults.min_worker_cols),
         }
     }
 }

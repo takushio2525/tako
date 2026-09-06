@@ -1122,6 +1122,54 @@ fn pane_text_area_rect(
     )
 }
 
+/// タブ内容領域の幅の実測（#1132）。これから「幅比 `fraction` のペインの桁数」を出す。
+///
+/// 桁数は `floor((内容幅 * 幅比 - 枠と余白) / セル幅)` で、
+/// **[`pane_text_area_rect`] の横方向 + [`grid_cells`] の cols と同じ式**
+/// （ペインは位置に依らず左右で `inset * 2` を必ず失う）。
+/// 実描画はさらにデバイスピクセルへ丸めるので**1 桁までずれる**（下限 60 桁の判定には
+/// 影響しない大きさ）。式の一致とずれの上限は番犬テスト
+/// （`issue1132_桁数の見積もりは実描画と一致する`）で拘束する。
+/// ここが実描画から離れると「見積もりでは足りるのに実際は狭い」= #1132 の症状が戻る
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PaneWidthMetrics {
+    /// タブ内容領域の幅（px）
+    content_width: f32,
+    /// セル 1 個の幅（px）
+    cell_width: f32,
+}
+
+impl PaneWidthMetrics {
+    /// 幅比 `fraction` を占めるペインに収まる桁数
+    fn cols_for_fraction(&self, fraction: f32) -> u16 {
+        if !fraction.is_finite() || fraction <= 0.0 || self.cell_width <= 0.0 {
+            return 0;
+        }
+        let inset = 2.0 * (PANE_BORDER + PANE_PADDING);
+        let text = (self.content_width * fraction - inset).max(0.0);
+        let cols = (text / self.cell_width).floor();
+        if cols <= 0.0 {
+            0
+        } else {
+            cols.min(f32::from(u16::MAX)) as u16
+        }
+    }
+
+    /// 実測済みのテキスト領域の幅（px）とその幅比から内容幅を逆算する。
+    /// `pane_text_area_rect` の逆算なので、同じ式を 2 か所に書かずに済む
+    fn from_measured(text_width: f32, fraction: f32, cell_width: f32) -> Option<Self> {
+        if !fraction.is_finite() || fraction <= 0.0 || cell_width <= 0.0 {
+            return None;
+        }
+        let inset = 2.0 * (PANE_BORDER + PANE_PADDING);
+        let content_width = (text_width + inset) / fraction;
+        content_width.is_finite().then_some(Self {
+            content_width,
+            cell_width,
+        })
+    }
+}
+
 /// テキスト領域に収まる端末グリッド（cols, rows）を求める（#647 で共通化）。
 ///
 /// 表示中ペイン（`render_pane`）と非表示ペイン（`sync_offscreen_pane_sizes`）が
@@ -19082,6 +19130,47 @@ impl UiStateHost for TakoApp {
     fn sidebar_width_max(&self) -> Option<f32> {
         let max = tako_core::sidebar::max_width(self.last_viewport_width);
         max.is_finite().then_some(max)
+    }
+
+    /// #1132: worker ペインの最小幅を保証するための見積もり。
+    ///
+    /// タブ内容領域の幅は「実測済みのペイン 1 枚のテキスト領域 + その幅比」から
+    /// 逆算する（`pane_text_area_rect` の逆算なので式が二重にならない）。
+    /// 表示中のタブがいちばん正確なので、表示中 → 裏タブ用に割り出した領域（#932）
+    /// → 最後に描かれた領域 の順に採る。どれも無い（まだ一度も描かれていない）なら
+    /// `None` を返し、呼び出し側は下限の保証をしない
+    fn pane_cols_for_width_fraction(&self, tab: TabId, fraction: f32) -> Option<u16> {
+        let tree = self.workspace.get_tab(tab)?.tree();
+        let mut layout = tree.layout(Rect::UNIT);
+        // 逆算の丸め誤差は幅比で割られて乗るので、**いちばん広いペイン**から逆算する
+        layout.sort_by(|(_, a), (_, b)| {
+            b.width
+                .partial_cmp(&a.width)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let metrics = layout.iter().find_map(|(id, r)| {
+            if r.width <= 0.0 || !r.width.is_finite() {
+                return None;
+            }
+            let area = self
+                .pane_text_areas
+                .iter()
+                .find(|(p, _)| p == id)
+                .map(|(_, b)| *b)
+                .or_else(|| {
+                    self.offscreen_areas
+                        .as_ref()
+                        .and_then(|(_, areas)| areas.get(id).copied())
+                })
+                .or_else(|| self.pane_last_text_areas.get(id).copied())?;
+            let cell = self.cell_size_for_pane(*id)?;
+            PaneWidthMetrics::from_measured(
+                f32::from(area.size.width),
+                r.width,
+                f32::from(cell.width),
+            )
+        })?;
+        Some(metrics.cols_for_fraction(fraction))
     }
 
     fn set_filetree(&mut self, visible: bool) {
@@ -42945,6 +43034,28 @@ mod self_test {
                 })();
                 check(registered.is_ok(), "spawn レイアウト: 一時プロジェクト登録");
 
+                // #1132: この節は #165 のレイアウト計算そのものを rect で見るので、
+                // worker ペインの下限幅（既定 60 桁）は**いったん切ってから**測る。
+                // 切らないと狭い画面では 3 体目以降が別タブへ出て rect の期待値が
+                // 成立しない（下限そのものの検証は 72b で行う）。
+                // 復元は config.yaml へ**解決済みの値**を書き戻す（未設定だった場合は
+                // 既定値が明示されるだけで、resolve() の結果は変わらない）
+                let layout_min_before = tako_control::dispatch_orchestrator_layout(
+                    None, None, None, None,
+                )
+                .ok()
+                .and_then(|v| v["min_worker_cols"].as_u64())
+                .map(|v| v as u16)
+                .unwrap_or(tako_core::spawn_layout::DEFAULT_MIN_WORKER_COLS);
+                let restore_layout_min = |v: u16| {
+                    let _ = tako_control::dispatch_orchestrator_layout(None, None, None, Some(v));
+                };
+                let min_off = tako_control::dispatch_orchestrator_layout(None, None, None, Some(0))
+                    .ok()
+                    .and_then(|v| v["min_worker_cols"].as_u64())
+                    == Some(0);
+                check(min_off, "spawn レイアウト: 下限幅を切って rect を測る (#1132)");
+
                 // 専用タブ（root = master 役）+ master の下にユーザー由来ペイン
                 let ids = window
                     .update(cx, |app, _, _cx| {
@@ -43081,7 +43192,104 @@ mod self_test {
                     "spawn レイアウト: close 後も master とユーザーペインは不変",
                 );
 
-                // 後始末: タブごと閉じて worker PTY を破棄 + 一時プロジェクト削除
+                // 72b. #1132: worker ペイン 1 枚の下限幅の保証。
+                //      同じタブへ置くと下限を割る spawn は、同じタブへ割らず**別のタブ**へ
+                //      出て、応答に配置先と理由が載ること。
+                //      下限は「そのタブの全幅」に取る（= 同タブの見積もり（半分以下）は
+                //      必ず割り、新しいタブ（全幅）は必ず満たす）ので、画面の大きさに
+                //      依らず判定が決まる
+                {
+                    let full_cols = window
+                        .update(cx, |app, _, _cx| {
+                            tako_control::host::UiStateHost::pane_cols_for_width_fraction(
+                                app,
+                                TabId::from_raw(lt_tab),
+                                1.0,
+                            )
+                        })
+                        .ok()
+                        .flatten();
+                    let floor = full_cols.map(|c| {
+                        c.clamp(
+                            tako_core::spawn_layout::MIN_WORKER_COLS_FLOOR,
+                            tako_core::spawn_layout::MIN_WORKER_COLS_MAX,
+                        )
+                    });
+                    match floor {
+                        None => println!(
+                            "SKIP: ペインが一度も描かれておらず幅を実測できないため \
+                             worker ペインの下限幅の検証を飛ばす (#1132)"
+                        ),
+                        Some(floor) => {
+                            let applied = tako_control::dispatch_orchestrator_layout(
+                                None,
+                                None,
+                                None,
+                                Some(floor),
+                            )
+                            .ok()
+                            .and_then(|v| v["min_worker_cols"].as_u64())
+                                == Some(u64::from(floor));
+                            check(applied, "spawn レイアウト: 下限幅の設定 (#1132)");
+                            let spawned = window
+                                .update(cx, |app, _, _cx| {
+                                    tako_control::dispatch(
+                                        app,
+                                        spawn_req(lt_master, "w1132"),
+                                        PaneOrigin::Mcp,
+                                    )
+                                    .ok()
+                                })
+                                .ok()
+                                .flatten();
+                            let Some(resp) = spawned else {
+                                restore_layout_min(layout_min_before);
+                                fail("spawn レイアウト: 下限幅つき spawn (#1132)");
+                            };
+                            let placement = resp["placement"].as_str().unwrap_or("");
+                            let out_tab = resp["tab"].as_u64().unwrap_or(0);
+                            let out_pane = resp["pane_id"].as_u64().unwrap_or(0);
+                            let reason = resp["placement_reason"].as_str().unwrap_or("");
+                            let cols = resp["pane_cols"].as_u64().unwrap_or(0);
+                            check(
+                                placement == "new_tab" && out_tab != lt_tab,
+                                &format!(
+                                    "spawn レイアウト: 下限を割る spawn は別タブへ出る \
+                                     (#1132。placement={placement} tab={out_tab} 元={lt_tab})"
+                                ),
+                            );
+                            check(
+                                !reason.is_empty() && cols >= u64::from(floor),
+                                &format!(
+                                    "spawn レイアウト: 応答に配置先の理由と桁数が載る \
+                                     (#1132。cols={cols} 下限={floor} 理由={reason})"
+                                ),
+                            );
+                            // あふれ先タブのルートが worker 本体（= 全幅）
+                            let root_is_worker = window
+                                .update(cx, |app, _, _cx| {
+                                    let tab = app.workspace.get_tab(TabId::from_raw(out_tab))?;
+                                    let panes = tab.tree().panes();
+                                    Some(panes.len() == 1 && panes[0].id().as_u64() == out_pane)
+                                })
+                                .ok()
+                                .flatten()
+                                .unwrap_or(false);
+                            check(
+                                root_is_worker,
+                                "spawn レイアウト: あふれ先タブは worker が全幅で 1 枚 (#1132)",
+                            );
+                            // 後始末: あふれ先タブを閉じる
+                            let _ = window.update(cx, |app, _, cx| {
+                                app.remove_tab(TabId::from_raw(out_tab), cx);
+                            });
+                        }
+                    }
+                }
+
+                // 後始末: タブごと閉じて worker PTY を破棄 + 一時プロジェクト削除 +
+                // 下限幅の復元（#1132）
+                restore_layout_min(layout_min_before);
                 let _ = window.update(cx, |app, _, cx| {
                     app.remove_tab(TabId::from_raw(lt_tab), cx);
                 });
@@ -63416,6 +63624,70 @@ mod pane_text_area_tests {
         // 矩形を作る式は 1 か所だけ（#684 と同じ方針: 手計算を増やさない）
         let formula = format!("fn {}(", "pane_text_area_rect");
         assert_eq!(flat.matches(&formula).count(), 1);
+    }
+
+    /// #1132: 幅比 → 桁数の見積もりが**実描画の式**（`pane_text_area_rect` +
+    /// `grid_cells`）と一致することを固定する。
+    ///
+    /// ここがずれると「見積もりでは下限を満たすのに実際は狭い」= #1132 の症状が戻る。
+    /// 内容幅の逆算（[`PaneWidthMetrics::from_measured`]）も往復で確かめる
+    #[test]
+    fn issue1132_桁数の見積もりは実描画と一致する() {
+        for content_w in [400.0f32, 900.0, 1288.0, 1920.0, 2560.0] {
+            for cell_w in [7.0f32, 9.5, 12.0, 16.5] {
+                let metrics = PaneWidthMetrics {
+                    content_width: content_w,
+                    cell_width: cell_w,
+                };
+                for fraction in [1.0f32, 0.5, 0.45, 0.3333, 0.25, 0.125, 0.0625] {
+                    // 実描画と同じ経路: 単位矩形 → テキスト領域 → グリッド
+                    let content =
+                        Bounds::new(point(px(0.0), px(0.0)), size(px(content_w), px(1000.0)));
+                    let r = Rect::new(0.0, 0.0, fraction, 1.0);
+                    let area = pane_text_area_rect(content, r, PANE_TITLE_BAR, 0.0, 1.0);
+                    let (want, _) = grid_cells(area.size, size(px(cell_w), px(20.0)));
+                    let got = usize::from(metrics.cols_for_fraction(fraction));
+                    // 実描画はテキスト領域をデバイスピクセルへ丸める（snap）ので、
+                    // 丸めのぶんだけ 1 桁ずれることがある。下限（既定 60 桁）の判定に
+                    // 対しては無視できる大きさだが、**ずれの上限は固定しておく**
+                    assert!(
+                        got.abs_diff(want) <= 1,
+                        "見積もり {got} と実描画 {want} が 1 桁より離れた: \
+                         content={content_w} cell={cell_w} fraction={fraction}"
+                    );
+                    // 実測から内容幅を逆算しても同じ桁数に戻る
+                    let back = PaneWidthMetrics::from_measured(
+                        f32::from(area.size.width),
+                        fraction,
+                        cell_w,
+                    )
+                    .expect("逆算できる");
+                    // pane_text_area_rect はデバイスピクセルへ丸める（snap）ので、
+                    // 逆算にはその丸めが幅比で割られて乗る。誤差の大きさを固定して
+                    // おく（幅比が小さいペインから逆算すると誤差が増える = だから
+                    // ホスト側は**いちばん広いペイン**から逆算する）
+                    let tolerance = 1.5 / fraction;
+                    assert!(
+                        (back.content_width - content_w).abs() < tolerance,
+                        "逆算した内容幅がずれた: {} != {content_w}（許容 {tolerance}）",
+                        back.content_width
+                    );
+                }
+            }
+        }
+        // 異常値は 0 桁（下限の判定で必ず「足りない」側へ倒れる）
+        let bad = PaneWidthMetrics {
+            content_width: 1000.0,
+            cell_width: 0.0,
+        };
+        assert_eq!(bad.cols_for_fraction(0.5), 0);
+        let ok = PaneWidthMetrics {
+            content_width: 1000.0,
+            cell_width: 10.0,
+        };
+        assert_eq!(ok.cols_for_fraction(f32::NAN), 0);
+        assert_eq!(ok.cols_for_fraction(0.0), 0);
+        assert_eq!(PaneWidthMetrics::from_measured(100.0, 0.0, 10.0), None);
     }
 
     /// ターミナルペインの**直接の子**の棚卸し（#781 の再発防止）。
