@@ -3736,6 +3736,31 @@ fn dispatch_inner(
         } => crate::platform::report(platform.as_deref(), status.as_deref(), known_limitations)
             .map_err(DispatchError::InvalidParams),
 
+        // 起動時ロードの予算（#1139）。判定は tako_core::context_budget の純粋関数、
+        // 集めるのは crate::context_budget。CLI・MCP とも同じ 1 本を通る
+        Request::ContextBudget {
+            action,
+            cwd,
+            profile,
+            dry_run,
+            pane,
+        } => {
+            let dir = match cwd {
+                Some(c) => PathBuf::from(crate::orchestrator::expand_tilde(&c)),
+                // 省略時は呼び出し元ペインの cwd（master は対象リポジトリで動いている）
+                None => git_pane_cwd(host, pane)?,
+            };
+            match action.as_deref().unwrap_or("check") {
+                "check" => crate::context_budget::report(&dir, profile.as_deref())
+                    .map_err(DispatchError::Operation),
+                "fix" => crate::context_budget::fix(&dir, profile.as_deref(), dry_run)
+                    .map_err(DispatchError::Operation),
+                other => Err(DispatchError::InvalidParams(format!(
+                    "未知の action: {other}（check / fix）"
+                ))),
+            }
+        }
+
         Request::ShellIntegration { action } => {
             crate::shell_integration::run(action.as_deref()).map_err(DispatchError::InvalidParams)
         }

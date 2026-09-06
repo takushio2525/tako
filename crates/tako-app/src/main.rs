@@ -48898,6 +48898,18 @@ mod self_test {
 
                 // (d) スターター下部の setup リンク → そのペインのシェルへ tako setup。
                 //     setup はターミナルの対話ウィザードなので**覆わない**
+                //
+                //     **走らせない**（#1129）。修正前はここで積んだ行を送達確認つき経路が
+                //     実行するところまで待っており、実機では 1 run ごとに本物の
+                //     `tako setup` が走っていた。未認証の機では認証段が
+                //     `claude auth login`（ブラウザ操作待ち = 終わらない）を起こし、
+                //     インスタンスを閉じても Windows は孫を回収しないので 1 日で
+                //     46 本まで積み上がった。認証済みの機でも対話ウィザードが完走して
+                //     setup エージェント（実 claude）が立つ。
+                //     見たいのは「押したら**この**ペインのシェルへ**正しい行**が積まれ、
+                //     ペインを覆わない」なので、積まれた行そのものを見て取り下げる
+                //     （項目 93(d1) と同じ作法。組んだ行が**実際に実行される形**である
+                //     ことは項目 93(d2) が `--version` で別に見ている）
                 let setup_clicked = window
                     .update(cx, |app, _, cx| {
                         app.pane_settle.clear();
@@ -48909,48 +48921,40 @@ mod self_test {
                 // Windows で成立しない（実体は `…\tako.exe setup` なので部分文字列が
                 // 無い）。#898 が `resolve_tako_binary` を実体パスへ替えた時点から
                 // 落ちており、macOS は basename が `tako` なので**通ってしまう** =
-                // CI でも気づけなかった。画面は折り返すので、空白を落として
-                // 突き合わせる（項目 93(d2) と同じ作法）
+                // CI でも気づけなかった
                 let setup_line = tako_control::welcome::launch_command_line("setup");
-                let squash =
-                    |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
-                let setup_needle = squash(&setup_line);
                 println!("selftest 97d: setup_line={setup_line:?}");
-                let mut setup_delivered = false;
-                for _ in 0..40 {
-                    wait(cx, 100).await;
-                    setup_delivered = window
+                let queued_setup = window
+                    .update(cx, |app, _, _| {
+                        app.command_flows
+                            .iter()
+                            .filter(|c| c.pane == fresh)
+                            .map(|c| c.flow.command().to_string())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let setup_queued = queued_setup.iter().any(|c| c == &setup_line);
+                // 積んだ `tako setup` は**走らせない**ので、判定の直後に取り下げる。
+                // `TAKO_1129_LEGACY=1` のときだけ取り下げずに走らせる = 同一バイナリで
+                // 「本物の setup が走って `claude auth login` が残る」を再現できる
+                // （項目 143 の検出力の実証に使う）
+                if !tako_control::setup_bootstrap::legacy_auth_launch() {
+                    window
                         .update(cx, |app, _, _| {
-                            squash(
-                                &app.terminals
-                                    .get(&fresh)
-                                    .map(|s| s.visible_lines().join(""))
-                                    .unwrap_or_default(),
-                            )
-                            .contains(&setup_needle)
+                            app.command_flows.retain(|c| c.pane != fresh)
                         })
-                        .unwrap_or(false);
-                    if setup_delivered {
-                        break;
-                    }
+                        .ok();
                 }
-                if !setup_delivered {
-                    let screen = window
-                        .update(cx, |app, _, _| {
-                            app.terminals
-                                .get(&fresh)
-                                .map(|s| s.visible_lines().join("|"))
-                                .unwrap_or_else(|| "<ペインなし>".to_string())
-                        })
-                        .unwrap_or_default();
+                if !setup_queued {
                     println!(
-                        "TAKO_SELF_TEST_97D: needle={setup_needle:?} clicked={setup_clicked} \
-                         screen={screen:?}"
+                        "TAKO_SELF_TEST_97D: expected={setup_line:?} clicked={setup_clicked} \
+                         queued={queued_setup:?}"
                     );
                 }
                 check(
-                    setup_clicked && setup_delivered,
-                    "スターターの setup リンクで tako setup が届く（覆わない）(#720 / #967)",
+                    setup_clicked && setup_queued,
+                    "スターターの setup リンクで tako setup が積まれる（覆わない・走らせない）\
+                     (#720 / #967 / #1129)",
                 );
 
                 // (e) 「AI チームに任せる」押下 = エージェント待ちの過渡期が張られ、
@@ -59562,6 +59566,18 @@ mod self_test {
                     "tako: {host1040} への接続に失敗しました（{}）。理由は上の行です",
                     tako_core::ssh_progress::SCRIPT_FAILURE_MARK
                 );
+                // #1127: 画面へ出す行は**ファイル経由**で出す。`print_lines` は本文を
+                // 引数に持つのでシェルがエコーしたコマンド行にも本文が載り、
+                // **そのエコー行がマーカーの最初の出現になる**（`detect_disconnect` は
+                // `position()` = 最初の 1 件を採る）。すると「理由は 1 つ上の行」の契約が
+                // プロンプトを拾い、認証系の失敗が「待てば直る」と誤判定される
+                // （実機で 2/2 とも `phase=connected` のまま = #1127）
+                let fixture1040 = std::env::temp_dir()
+                    .join(format!("tako-selftest-1040-{}.txt", std::process::id()));
+                let emit1040 = |lines: &[&str]| {
+                    let _ = std::fs::write(&fixture1040, format!("{}\n", lines.join("\n")));
+                    sh.print_file(&fixture1040)
+                };
                 let socket1040 = tako_core::remote_fs::control_path(host1040);
                 let make_socket = |on: bool| {
                     if let Some(p) = &socket1040 {
@@ -59646,10 +59662,9 @@ mod self_test {
                 make_socket(false);
                 let _ = window.update(cx, |app: &mut TakoApp, _, _| {
                     if let Some(s) = app.terminals.get_mut(&pid1040) {
-                        // ペインへ打つ文字列は方言境界から組む（#865。POSIX の
-                        // `printf` を直書きすると PowerShell のペインでは
-                        // **機能が正常でも**マーカーが出ず、この段が必ず落ちる）
-                        s.write(pty_line(&sh.print_lines(std::slice::from_ref(&marker1040))));
+                        // 打つ文字列は方言境界から組む（#865）。本文はファイル経由で
+                        // 出す（#1127。エコー行に marker を載せない）
+                        s.write(pty_line(&emit1040(&[marker1040.as_str()])));
                     }
                 });
                 let mut reconnecting1040 = None;
@@ -59779,11 +59794,12 @@ mod self_test {
                             st.rebase(&now);
                         }
                         if let Some(s) = app.terminals.get_mut(&pid1040) {
-                            // 2 行を 1 行ずつそのまま出す（#865 の方言境界。
-                            // POSIX の `printf` は PowerShell のペインで通らない）
-                            s.write(pty_line(&sh.print_lines(&[
-                                "testuser@host: Permission denied (publickey).".to_string(),
-                                marker1040.clone(),
+                            // 理由 → マーカーの 2 行を**ファイル経由**で出す（#1127）。
+                            // 引数で渡すとエコー行が marker の最初の出現になり、
+                            // 理由が 1 つ上の行（プロンプト）へずれる
+                            s.write(pty_line(&emit1040(&[
+                                "testuser@host: Permission denied (publickey).",
+                                marker1040.as_str(),
                             ])));
                         }
                     })
@@ -59901,6 +59917,7 @@ mod self_test {
                     std::env::var_os("TAKO_1040_LEGACY").is_some()
                 );
                 notify_and_draw(any, window, cx);
+                let _ = std::fs::remove_file(&fixture1040);
             }
 
             // 138. 「リモートからフォルダを開く」の VSCode Remote 化（#1041）。
@@ -61489,7 +61506,89 @@ mod self_test {
                 notify_and_draw(any, window, cx);
             }
 
-            // 144. 検証用 GUI の窓がユーザーのメイン画面に出ていない（#1141）。
+            // 144. tako がエージェント CLI を**自分の子として**起こしていない（#1129）。
+            //
+            // `claude auth login` はブラウザ操作待ちで自分では終わらない。tako が
+            // 起こすと寿命の持ち主が居なくなり、Windows は子プロセスの終了要求
+            // （#1067 の境界 B5）が未実装なので、ペイン close も隔離インスタンスの
+            // 終了も孫を回収しない。実機ではこれで 1 日 46 本まで積み上がり
+            // `Win32_Processor.LoadPercentage` が 100% に張り付いた。
+            //
+            // 設計上、tako がエージェントを起こす経路は必ず**ペインのシェル**を通る
+            // （`queue_command_flow` / `Request::Send`）ので、正しい親子は
+            // `シェル → claude`。判定は**直接の親だけ**を見るので、実 claude を使う
+            // 項目（`TAKO_SELF_TEST_CLAUDE=1`）でエージェントが立っていても増えない。
+            //
+            // **このインスタンスのペイン配下だけ**を見る。`tako → claude` は本番でも
+            // 正当に存在する（#391 の setup 対話エージェントは `tako setup` が自分の子
+            // として起こして待つ形）ので、機械全体を見ると人が `tako setup` を開いて
+            // いるだけで落ちる = 実測（開発機に `tako(17296) → claude(20014)` が居た）。
+            // 器つきならペインのシェルは器の子なので `pane_pids_all` から、
+            // 器なしなら `child_pid` から根を採る（両方の構成を覆う）。
+            //
+            // **run の最後に見る**のが要点。`tako setup` は `.status()` で待つので
+            // この時点ではまだ生きている（孤児になるのはインスタンス終了後で、
+            // そうなると親を辿れず発生源が分からなくなる = Issue の 46 本中 45 本）。
+            // 機械検証は「tako の子が居ないこと」で、エージェント総数は診断の材料として
+            // 出すだけにする（他の worker が同じマシンで claude を動かしているため）
+            {
+                let procs = tako_core::platform::procinfo::snapshot();
+                let all_leaks = tako_core::platform::procinfo::agent_children_of_tako(&procs);
+                // このインスタンスのペイン配下の根を集める
+                let mut roots: Vec<u32> = vec![std::process::id()];
+                roots.extend(
+                    window
+                        .update(cx, |app, _, _| {
+                            app.terminals
+                                .values()
+                                .filter_map(|s| s.child_pid())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
+                );
+                roots.extend(
+                    tako_core::backend::backend()
+                        .pane_pids_all()
+                        .into_iter()
+                        .map(|(_, pid)| pid),
+                );
+                let leaked =
+                    tako_core::platform::procinfo::agent_children_of_tako_under(&procs, &roots);
+                let name_of = |pid: u32| -> String {
+                    procs
+                        .iter()
+                        .find(|p| p.pid == pid)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_else(|| "<gone>".into())
+                };
+                let detail: Vec<String> = leaked
+                    .iter()
+                    .map(|(child, parent)| {
+                        format!(
+                            "{}({child}) <- {}({parent})",
+                            name_of(*child),
+                            name_of(*parent)
+                        )
+                    })
+                    .collect();
+                // 機械全体の件数は**診断として出すだけ**（他のインスタンスや人の
+                // `tako setup` の分をここで落とさない）
+                println!(
+                    "TAKO_SELF_TEST_1129: procs={} agents={} roots={} leaked={detail:?} \
+                     all_leaks={} legacy={}",
+                    procs.len(),
+                    tako_core::platform::procinfo::agent_process_count(&procs),
+                    roots.len(),
+                    all_leaks.len(),
+                    tako_control::setup_bootstrap::legacy_auth_launch(),
+                );
+                check(
+                    leaked.is_empty(),
+                    &format!(
+                        "144: tako がエージェント CLI を自分の子として起こしていない \
+                         (#1129) leaked={detail:?}"
+                    ),
+            // 145. 検証用 GUI の窓がユーザーのメイン画面に出ていない（#1141）。
             //      セルフテストは `TAKO_SELF_TEST` が立っているので、指定が無くても
             //      常設の仮想ディスプレイ（tako-vd）を狙う。**「狙った」ではなく
             //      「実際にその矩形へ開いた」**を見るのが要点で、GPUI の窓の実 bounds を
@@ -61503,7 +61602,7 @@ mod self_test {
                 let placement = disp::placement();
                 check(
                     placement.is_some(),
-                    "144: 起動時にディスプレイの置き先を記録している (#1141)",
+                    "145: 起動時にディスプレイの置き先を記録している (#1141)",
                 );
                 let placement = placement.unwrap_or_else(disp::Placement::not_requested);
                 // セルフテストは検証用の起動なので、指定が無くても tako-vd を狙う
@@ -61511,7 +61610,7 @@ mod self_test {
                     placement.requested.as_deref() == Some(disp::DEFAULT_VIRTUAL_DISPLAY_NAME)
                         || std::env::var_os(disp::ENV_DISPLAY).is_some(),
                     &format!(
-                        "144: 検証用の起動は指定が無くても仮想ディスプレイを狙う (#1141。\
+                        "145: 検証用の起動は指定が無くても仮想ディスプレイを狙う (#1141。\
                          requested={:?})",
                         placement.requested,
                     ),
@@ -61554,13 +61653,13 @@ mod self_test {
                 match inside {
                     Some(ok) => check(
                         ok,
-                        "144: 窓は狙ったディスプレイの矩形の中に開いている (#1141)",
+                        "145: 窓は狙ったディスプレイの矩形の中に開いている (#1141)",
                     ),
                     // 解決できない機では「黙って既定へ落ちた」ではなく理由が残ることを見る
                     None => check(
                         placement.resolved.is_some() || placement.reason.is_some(),
                         &format!(
-                            "144: 狙いが外れたときは理由が残る (#1141。reason={:?})",
+                            "145: 狙いが外れたときは理由が残る (#1141。reason={:?})",
                             placement.reason,
                         ),
                     ),
@@ -61583,7 +61682,7 @@ mod self_test {
                 check(
                     reported == placement.requested,
                     &format!(
-                        "144: check_health が置き先を申告する (#1141。\
+                        "145: check_health が置き先を申告する (#1141。\
                          reported={reported:?} actual={:?})",
                         placement.requested,
                     ),

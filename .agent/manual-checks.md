@@ -779,7 +779,7 @@ Finder から掴んで運ぶ**部分 —— OS のドラッグセッション（
 
 ## 検証用 GUI の置き場（Issue #1141）
 
-窓がどの矩形に開いたかは機械検証できる（セルフテスト項目 144 と `tako_check_health` の
+窓がどの矩形に開いたかは機械検証できる（セルフテスト項目 145 と `tako_check_health` の
 `display_placement`）。**「ユーザーの作業を邪魔しないか」は人が見ないと分からない**ので、
 以下を実機で確認する。前提: `scripts/lib/virtual-display.sh ensure` を通してある。
 

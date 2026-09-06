@@ -975,8 +975,9 @@ fn read_number(b: &[u8], start: usize, max_digits: usize) -> Option<(i64, usize)
 }
 
 /// グレゴリオ暦 → 1970-01-01 からの日数（Howard Hinnant の `days_from_civil`）。
-/// 外部クレートを増やさない自前変換（`pane_log::civil_utc` の逆変換）
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+/// 外部クレートを増やさない自前変換（`pane_log::civil_utc` の逆変換）。
+/// **暦の実装をワークスペースで 2 本持たない**ため `context_budget` からも引く（#1139）
+pub(crate) fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
@@ -987,7 +988,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 }
 
 /// 1970-01-01 からの日数 → グレゴリオ暦（`days_from_civil` の逆）
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);

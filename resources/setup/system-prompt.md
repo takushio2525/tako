@@ -99,7 +99,7 @@ CLI 検出、認証確認、プラン確認、MCP 設定、推奨 profile 生成
 
 `setup-context.yaml` の `instruction_file` と `instruction_coverage` を Read する。
 
-既存ファイルがある場合は、同梱推奨ルール（`templates/sections/` の 7 項目）と
+既存ファイルがある場合は、同梱推奨ルール（`templates/sections/` の 8 項目）と
 **項目レベルで突き合わせる**。内容を少し見て「良さそう」と印象で素通ししない。
 
 1. CLI による決定的比較の結果が `instruction_coverage` にある

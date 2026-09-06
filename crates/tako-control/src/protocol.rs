@@ -1325,6 +1325,30 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         known_limitations: bool,
     },
+    /// 起動時ロードの予算（Issue #1139）。AI が起動した瞬間に強制ロードされるもの
+    /// （グローバル指示・`AGENTS.md` と `@import` チェーン・system prompt・引き継ぎ）を
+    /// 棚卸しし、種別ごとの上限と突き合わせる。
+    ///
+    /// `action` = "check"（既定・何も書き換えない）/ "fix"（自動で直せるものだけ直す）。
+    /// 自動で直せるのは `## YYYY-MM-DD` が並ぶ作業ログの archive 移送だけで、
+    /// 残りは `proposals` として直し方を返す
+    ContextBudget {
+        /// "check"（既定）/ "fix"
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<String>,
+        /// 対象のフォルダ（省略時は呼び出し元ペインの cwd）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        /// system prompt / 引き継ぎを見るプロファイル（省略時は default）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<String>,
+        /// fix のとき、書き込まずに移送予定だけを返す
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        dry_run: bool,
+        /// 呼び出し元ペイン（cwd 省略時の基準）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+    },
     /// シェル統合（OSC 7 / 133）の配置状態の確認と配置・解除（Issue #525 / #467）。
     /// `action` = "status"（既定）/ "install" / "uninstall"。
     ///

@@ -16,7 +16,7 @@ tako platform --status pending      # まだ使えないものだけ
 
 | 状態 | 件数 | 意味 |
 | --- | --- | --- |
-| 対応 | 114 / 144（79%） | macOS と同じように使えます |
+| 対応 | 115 / 145（79%） | macOS と同じように使えます |
 | 一部対応 | 14 | 使えますが機能が落ちます。落ち方は各表の「差分」列 |
 | 未実測 | 1 | 実装はあり macOS と同じ経路を通るが、Windows 実機でまだ動かしていないもの |
 | 未対応 | 13 | Windows 側の実装が無い、または動かないことが分かっているもの |
@@ -204,7 +204,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 
 ## セットアップと設定
 
-対応 10・一部対応 1・未対応 / 未実測 1
+対応 11・一部対応 1・未対応 / 未実測 1
 
 | 機能 | 状態 | 差分 | 根拠 |
 | --- | --- | --- | --- |
@@ -220,6 +220,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 | `tako_config_share` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako config init` が共有リポジトリを作って初回コミット（7 ファイル）、`tako config` が差分（same 4）を出し、`tako config pull` が 1 件取り込む |
 | `tako_platform` | 対応 | — | 実機テスト: platform_parity 13 本と support の単体が実機で緑（判定は純粋関数） |
 | `tako_agent_support` | 対応 | — | 実機テスト: agent_parity 5 本と agent_support の単体 15 本が緑（判定は純粋関数で OS を見ない） |
+| `tako_context_budget` | 対応 | — | 実機テスト: context_budget の単体 18 本と番犬 context_budget.rs（判定・移送とも純粋関数でプラットフォーム分岐が無い） |
 
 ## リモートアクセス
 
