@@ -722,12 +722,13 @@ pub const MATRIX: &[AgentFeature] = &[
              ゲートは `tengu_marble_heron` の `enabled` / `autoArm`（未設定なら ON）。\
              連続の張り直しは 2 回まで（`rearm_cap`）、自動 arm は解除が 24 時間より \
              先だと張らない（`horizon_exceeded`）。**上限ダイアログの \
-             `Stop and wait for limit to reset` は arm しない**（値は `cancel` で、\
-             armed を解除する側）。arm する選択肢は `Wait here, then continue \
-             automatically …`（値 `auto-resume`）。`escape` / `ctrl_c` / \
+             `Stop and wait for limit to reset`（値 `cancel`）は arm しない**: \
+             継続が既にキューへ入っているか episode が stale なら**解除**し、\
+             それ以外はメニューを閉じるだけ。arm する選択肢は別で、\
+             `Wait here, then continue automatically …`（値 `auto-resume`）。`escape` / `ctrl_c` / \
              `kill_agents_chord` / 手入力の送信 / `conversation_reset`（clear / resume / \
              remote_attach）/ `account_switch` / `relaunch` / `process_exit` で解除される。\
-             **codex 0.153.0 と agy 1.1.25 のバイナリには相当する文字列が 1 件も無い** \
+             **codex 0.153.0 と agy 1.1.27 のバイナリには相当する文字列が 1 件も無い** \
              （`continue automatically` / `auto_resume` / `auto-resume` / `autoResume` / \
              `wait for limit` / `resume automatically` が各 0 件。同じ走査で codex の \
              `hit your usage limit` は 7 件・`Try again at` は 1 件当たるので走査は有効）。\

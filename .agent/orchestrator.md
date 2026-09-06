@@ -667,9 +667,10 @@ claude 2.1.258 は**上限の API エラーを受けた時点で自分でも「�
 そのまま必要。逆に、両方が動いても衝突はしない（tako は解除時刻を過ぎてから撃つので、
 上流が先に再開していればもう上限で止まっていない）。
 
-なお、上限ダイアログの `Stop and wait for limit to reset` は**自動続行を arm しない**
-（値は `cancel` で、arm 済みなら解除する側）。arm する選択肢は
-`Wait here, then continue automatically …`。codex 0.153.0 と agy 1.1.25 には
+なお、上限ダイアログの `Stop and wait for limit to reset`（値 `cancel`）は
+**自動続行を arm しない**（継続が既にキューへ入っているか episode が stale のときは
+解除し、それ以外はメニューを閉じるだけ）。arm する選択肢は別項目の
+`Wait here, then continue automatically …`。codex 0.153.0 と agy 1.1.27 には
 相当する仕組みが無い（`tako agent-support --agent codex` の
 `limit_autocontinue_upstream` が根拠つきで宣言している）。
 
