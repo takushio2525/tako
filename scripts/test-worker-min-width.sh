@@ -12,6 +12,8 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TMPDIR_ROOT="$(mktemp -d /tmp/tk1132-shared-XXXXXX)"
+trap 'rm -rf "$TMPDIR_ROOT"' EXIT
 TAKO_BIN="${TAKO_BIN:-$REPO_ROOT/target/debug/tako}"
 APP_BIN="${APP_BIN:-$REPO_ROOT/target/debug/tako-app}"
 WORKERS="${WORKERS:-8}"
@@ -34,11 +36,46 @@ done
 unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_MCP_URL
 
 # GPUI のウィンドウは他のウィンドウに**完全に隠れると描画を止める**（#838 / #470）。
-# 描かれないと PTY のセル数が確定せず（既定 80x24 のまま）幅を実測できないので、
-# 測る前に対象を最前面へ出す。バンドルではないので pid で指名する
-activate_app() {
-  local pid="$1"
-  osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is ${pid}) to true" >/dev/null 2>&1
+# 描かれないと PTY のセル数が確定せず（既定 80x24 のまま）幅を実測できない。
+# ただしユーザーのメイン画面に隔離 tako の窓を出さない（2026-09-06 の恒久指示）ので、
+# **仮想ディスプレイ `tako-vd` へ移してから**描かせる。あちらでは何にも覆われないので
+# 前面化（= ユーザーのキーボード focus を奪う）は要らない。
+# tako-vd が無ければ NEED VD を出して先へ進む（幅を実測できないぶんは skip になる）
+VD_ORIGIN=""
+vd_origin() {
+  if [ -n "$VD_ORIGIN" ]; then printf '%s' "$VD_ORIGIN"; return 0; fi
+  local src="$TMPDIR_ROOT/vd-origin.swift"
+  cat > "$src" <<'SW'
+import AppKit
+guard let main = NSScreen.screens.first(where: { $0.frame.origin == .zero })
+    ?? NSScreen.screens.first else { exit(1) }
+let topY = main.frame.origin.y + main.frame.size.height
+guard let vd = NSScreen.screens.first(where: { $0.localizedName == "tako-vd" }) else { exit(2) }
+let f = vd.frame
+// System Events が使う「主画面の左上を原点に下向き y」へ変換した左上
+print("\(Int(f.origin.x)) \(Int(topY - (f.origin.y + f.size.height)))")
+SW
+  VD_ORIGIN="$(swift "$src" 2>/dev/null || true)"
+  printf '%s' "$VD_ORIGIN"
+}
+
+place_on_vd() {
+  local pid="$1" origin x y
+  origin="$(vd_origin)"
+  if [ -z "$origin" ]; then
+    echo "  NEED VD: 仮想ディスプレイ tako-vd が見つからない（幅の実測は skip になる）"
+    return 1
+  fi
+  x="${origin%% *}"
+  y="${origin##* }"
+  osascript <<OSA >/dev/null 2>&1
+tell application "System Events"
+  set p to first process whose unix id is ${pid}
+  repeat with w in windows of p
+    set position of w to {${x} + 40, ${y} + 40}
+  end repeat
+end tell
+OSA
 }
 
 # 各ペインの cols と role・所属タブを取り出す
@@ -102,7 +139,7 @@ YAML
   fi
   pass "隔離 tako-app が起動して CLI から見える（pid ${APP_PID}）"
   # 実ウィンドウを前面へ出して描かせ、PTY のセル数が確定するのを待つ
-  activate_app "$APP_PID"
+  place_on_vd "$APP_PID"
   sleep 3
 
   local min_cols master tab0
@@ -132,14 +169,14 @@ print(d.get("placement"), d.get("tab"), d.get("pane_cols"))
       "$i" "${placement:-?}" "${out_tab:-?}" "${cols:-?}"
     placements="$placements ${placement:-?}"
     # 新しいタブのペインが描かれて実寸になるのを待つ（隠れると描画が止まるので毎回前面へ）
-    activate_app "$APP_PID"
+    place_on_vd "$APP_PID"
     sleep 1
     if [ "${placement:-ERR}" = "ERR" ]; then
       echo "$resp" | head -3
       bad "w$i の spawn が失敗した"
     fi
   done
-  activate_app "$APP_PID"
+  place_on_vd "$APP_PID"
   sleep 3
 
   echo "  --- tako list の実測 ---"
@@ -148,13 +185,21 @@ print(d.get("placement"), d.get("tab"), d.get("pane_cols"))
   done
 
   # 判定: worker ペイン（role が orchestrator-worker）の cols が全部下限以上か
-  local narrow tabs_used
+  local narrow tabs_used live
   narrow="$(panes_json | awk -v m="$min_cols" '$4 ~ /^orchestrator-worker/ && $3 != "None" && $3+0 < m {n++} END {print n+0}')"
   tabs_used="$(panes_json | awk '$4 ~ /^orchestrator-worker/ {print $1}' | sort -u | wc -l | tr -d ' ')"
-  echo "  下限を割った worker ペイン: ${narrow} 枚 / 使ったタブ: ${tabs_used}"
+  # PTY の桁数は**描かれたフレーム**でしか確定しない（GPUI は窓が隠れると描画を止める。
+  # #838 / #470）。worker ペインが全部 spawn 直後の既定 80x24 のままなら「実測できて
+  # いない」ので、桁数に依る判定は理由つきで飛ばす（配置の判定は材料が別なので残る）
+  live="$(panes_json | awk '$4 ~ /^orchestrator-worker/ && $3 != "None" && $3+0 != 80 {n++} END {print n+0}')"
+  echo "  下限を割った worker ペイン: ${narrow} 枚 / 使ったタブ: ${tabs_used} / 実寸が載ったペイン: ${live}"
   if [ -n "$floor" ]; then
-    check "$([ "$narrow" -eq 0 ] && echo 1 || echo 0)" \
-      "どの worker ペインも下限（${min_cols} 桁）以上（割った枚数=${narrow}）"
+    if [ "$live" -eq 0 ]; then
+      echo "  SKIP: ウィンドウが描かれず PTY の桁数を実測できないため cols の判定を飛ばす"
+    else
+      check "$([ "$narrow" -eq 0 ] && echo 1 || echo 0)" \
+        "どの worker ペインも下限（${min_cols} 桁）以上（割った枚数=${narrow}）"
+    fi
     # 下限を下げると 3 通りの配置が全部出る（同タブ → 新タブ → あふれ先へ詰める）
     for kind in same_tab new_tab overflow_tab; do
       case " $placements " in
@@ -163,13 +208,21 @@ print(d.get("placement"), d.get("tab"), d.get("pane_cols"))
       esac
     done
   elif [ -z "$legacy" ]; then
-    check "$([ "$narrow" -eq 0 ] && echo 1 || echo 0)" \
-      "どの worker ペインも下限（${min_cols} 桁）以上（割った枚数=${narrow}）"
+    if [ "$live" -eq 0 ]; then
+      echo "  SKIP: ウィンドウが描かれず PTY の桁数を実測できないため cols の判定を飛ばす"
+    else
+      check "$([ "$narrow" -eq 0 ] && echo 1 || echo 0)" \
+        "どの worker ペインも下限（${min_cols} 桁）以上（割った枚数=${narrow}）"
+    fi
     check "$([ "$tabs_used" -gt 1 ] && echo 1 || echo 0)" \
       "下限を割る spawn が別のタブへ分散した（使ったタブ=${tabs_used}）"
   else
-    check "$([ "$narrow" -gt 0 ] && echo 1 || echo 0)" \
-      "旧挙動: 下限を割る worker ペインが出る（割った枚数=${narrow}）"
+    if [ "$live" -eq 0 ]; then
+      echo "  SKIP: ウィンドウが描かれず PTY の桁数を実測できないため cols の判定を飛ばす"
+    else
+      check "$([ "$narrow" -gt 0 ] && echo 1 || echo 0)" \
+        "旧挙動: 下限を割る worker ペインが出る（割った枚数=${narrow}）"
+    fi
     check "$([ "$tabs_used" -eq 1 ] && echo 1 || echo 0)" \
       "旧挙動: 全部同じタブへ割る（使ったタブ=${tabs_used}）"
   fi
