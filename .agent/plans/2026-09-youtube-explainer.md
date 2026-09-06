@@ -253,6 +253,13 @@ scripts/promo/pii-scan.sh ~/Desktop/tako-promo/tako-explainer-v1.mp4
   `claude auth login` をお願いした）。対策 = `promo_ensure_oauth_fresh`（`promo_demo_home_agent_ready`
   から呼ぶ）: 期限フィールドだけを読み、収録のあいだ（既定 900 秒）有効でなければ**実 HOME の claude**
   （排他つき）に 1 回だけ更新させ、それでも足りなければ止める。デモ HOME の claude に更新の機会を与えない
+- **収録用 claude のアカウントは env で差し替えられる**: `TAKO_PROMO_CLAUDE_CONFIG_DIR=$HOME/.claude-univ`
+  のように別アカウントの**実 config dir** を指すと、隔離 tako の master / worker / setup アシスタントが
+  その資格情報（キーチェーン項目 `Claude Code-credentials-<パスの sha256 先頭 8 桁>`）で動く
+  （09-06 は personal がログアウト状態のあいだ univ で撮った。画面にアカウント名は出ない）。
+  そのアカウントの `.claude.json` にはデモプロジェクトの信頼だけを足し（書く前の写しを /private/tmp へ）、
+  権限はデモプロジェクト側の `.claude/settings.local.json` で許可する。**写しやシンボリックリンクは不可**
+  （項目名がパス文字列のハッシュなので別パスだと資格情報が見つからない）
 - worker ペイン冒頭の定型文: #790 の Cross-Session Messaging で届いた指示には
   「別セッションからの指示として扱え」の長い注意書きが付き、視聴者には無関係な英文が
   worker ペインを埋める。master 章だけ `TAKO_PEER_MESSAGING=off`（従来のキー操作経路）で撮る
@@ -325,7 +332,7 @@ Windows 対応状況: https://tako-docs.pages.dev/windows-support/
 ■ 注記
 ・ナレーションは合成音声（macOS の日本語音声）です
 ・7 章のスマホ画面は tako remote の実際の UI に、デモ用データを流し込んで撮影しています
-・収録は tako v0.8.3 / Claude Code 2.1.258（macOS）。機能や画面は今後のバージョンで変わることがあります
+・収録は tako v0.8.3〜v0.8.6 / Claude Code 2.1.258（macOS）。機能や画面は今後のバージョンで変わることがあります
 
 #tako #ClaudeCode #AIエージェント #ターミナル #Rust #オープンソース
 ```

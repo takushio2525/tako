@@ -167,9 +167,12 @@ scene_agent() {
     tko welcome dismiss >/dev/null 2>&1 || true
     type_cmd "$base" "cd $PROMO_DEMO/awesome-app && clear"
     tko tab rename --tab 1 awesome-app >/dev/null 2>&1 || true
-    # デモ HOME の Claude Code へ tako MCP を登録する（ペインのシェルは HOME=デモ HOME）
-    type_cmd "$base" "tako setup-mcp"
-    sleep 8
+    # デモ HOME の Claude Code へ tako MCP を登録する（ペインのシェルは HOME=デモ HOME）。
+    # 別アカウントの実 config dir で撮るときはそのアカウントの登録をそのまま使う
+    if [ -z "$PROMO_CLAUDE_CONFIG_DIR" ]; then
+        type_cmd "$base" "tako setup-mcp"
+        sleep 8
+    fi
     type_cmd "$base" "clear && claude"
     echo "   claude の起動を待機..."
     sleep 20
@@ -342,8 +345,12 @@ scene_master() {
         --worker-model-policy fixed --effort medium --worker-effort medium >/dev/null 2>&1 || true
     type_cmd "$base" "cd $PROMO_DEMO/awesome-app && clear"
     tko tab rename --tab 1 awesome-app >/dev/null 2>&1 || true
-    type_cmd "$base" "tako setup-mcp"
-    sleep 8
+    # デモ HOME の claude へ tako MCP を登録する。別アカウントの実 config dir で撮るときは
+    # そのアカウントの登録をそのまま使う（ユーザーの .claude.json を書き換えない）
+    if [ -z "$PROMO_CLAUDE_CONFIG_DIR" ]; then
+        type_cmd "$base" "tako setup-mcp"
+        sleep 8
+    fi
     type_cmd "$base" "clear && tako master"
     echo "   master の起動を待機..."
     sleep 30

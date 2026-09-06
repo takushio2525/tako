@@ -30,6 +30,14 @@ PROMO_OUT=${TAKO_PROMO_OUT:-"$HOME/Desktop/tako-promo"}
 PROMO_FRAMES=${TAKO_PROMO_FRAMES:-/private/tmp/tako-promo-frames}
 PROMO_DEMO=/private/tmp/tako-demo
 PROMO_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 収録で起こす claude（隔離 tako の master / worker / setup アシスタント）に使う Claude Code の
+# 設定ディレクトリ（= アカウント）。空なら従来どおりデモ HOME 配下（`$PROMO_DEMO/home/.claude`。
+# 資格情報はログインキーチェーンの既定項目を共有）。`TAKO_PROMO_CLAUDE_CONFIG_DIR=$HOME/.claude-univ`
+# のように別アカウントの実ディレクトリを指すと、その資格情報（`Claude Code-credentials-<sha256 の先頭 8 桁>`）
+# で動く。画面にアカウント名や config dir は出ないので絵は変わらない（2026-09-06: personal が
+# ログアウト状態のあいだ univ で撮った）。**実ディレクトリの写しやシンボリックリンクは不可**
+# （キーチェーンの項目名がパス文字列のハッシュなので、別パスだと資格情報が見つからない）
+PROMO_CLAUDE_CONFIG_DIR=${TAKO_PROMO_CLAUDE_CONFIG_DIR:-}
 
 # 継承環境を env -u で落とすための引数列。
 #   TAKO_*      … 本番インスタンスへの誤接続を防ぐ
@@ -422,6 +430,9 @@ promo_demo_home_agent_ready() {
         -s "$HOME/Library/Keychains/login.keychain-db" >/dev/null 2>&1 || true
     # 共有キーチェーンのトークンを収録中に更新させない（下の promo_ensure_oauth_fresh を参照）
     promo_ensure_oauth_fresh "${TAKO_PROMO_OAUTH_NEED:-900}" || return 1
+    if [ -n "$PROMO_CLAUDE_CONFIG_DIR" ]; then
+        promo_external_config_ready || return 1
+    fi
     /usr/bin/python3 - "$PROMO_DEMO" <<'PY'
 import json, os, sys
 
@@ -470,8 +481,17 @@ PY
 # 対策: 収録が終わるまで（$1 秒）トークンが有効なら更新は起きない。足りなければ**実 HOME の claude**
 #   （排他つき）に 1 回だけ更新させ、それでも足りなければ止めてユーザーの再ログインを待つ。
 #   トークンの値は一切読まない（期限のフィールドだけ）
+# 資格情報のキーチェーン項目名。既定 HOME は `Claude Code-credentials`、CLAUDE_CONFIG_DIR を指定した
+# claude は `Claude Code-credentials-<そのパスの sha256 先頭 8 桁>`（キーチェーンの項目名と突き合わせて実測）
+promo_oauth_service() {
+    if [ -n "$PROMO_CLAUDE_CONFIG_DIR" ]; then
+        printf 'Claude Code-credentials-%s' "$(printf '%s' "$PROMO_CLAUDE_CONFIG_DIR" | shasum -a 256 | cut -c1-8)"
+    else
+        printf 'Claude Code-credentials'
+    fi
+}
 promo_oauth_expires_in() {
-    security find-generic-password -s 'Claude Code-credentials' -w 2>/dev/null | /usr/bin/python3 -c '
+    security find-generic-password -s "$(promo_oauth_service)" -w 2>/dev/null | /usr/bin/python3 -c '
 import sys, json, time
 try:
     d = json.loads(sys.stdin.read())
@@ -487,20 +507,60 @@ except Exception:
 promo_ensure_oauth_fresh() {
     local need=${1:-900} left
     left=$(promo_oauth_expires_in)
+    local who=${PROMO_CLAUDE_CONFIG_DIR:-既定}
     if [ "${left:-0}" -lt 0 ]; then
-        echo "ERROR: Claude Code の資格情報が無い（ログアウト状態）。ユーザーに 'claude auth login' を依頼する" >&2
+        echo "ERROR: Claude Code の資格情報が無い（${who} はログアウト状態）。ユーザーに 'claude auth login' を依頼する" >&2
         return 1
     fi
     if [ "$left" -lt "$need" ]; then
         echo "   OAuth トークンの残り ${left}s < ${need}s → 実 HOME の claude に更新させる（デモ HOME からは更新しない）"
-        env "${PROMO_ENV_CLEAN[@]}" claude -p 'ok' --model haiku --max-turns 1 >/dev/null 2>&1 || true
+        env "${PROMO_ENV_CLEAN[@]}" ${PROMO_CLAUDE_CONFIG_DIR:+"CLAUDE_CONFIG_DIR=$PROMO_CLAUDE_CONFIG_DIR"} \
+            claude -p 'ok' --model haiku --max-turns 1 >/dev/null 2>&1 || true
         left=$(promo_oauth_expires_in)
         if [ "${left:-0}" -lt "$need" ]; then
             echo "ERROR: トークンを更新できない（残り ${left}s）。ユーザーに 'claude auth login' を依頼する" >&2
             return 1
         fi
     fi
-    echo "   OAuth トークン残り ${left}s（収録 ${need}s のあいだ更新は起きない）"
+    echo "   OAuth トークン残り ${left}s（${who}。収録 ${need}s のあいだ更新は起きない）"
+}
+
+# 別アカウントの実 config dir（$PROMO_CLAUDE_CONFIG_DIR）で撮るときの下ごしらえ。
+#   - そのアカウントの `.claude.json` にデモプロジェクトの信頼だけを足す（無いと起動時に信頼ダイアログが
+#     出て収録が止まる。tako の spawn が worker に対して行う `ensure_trusted_in` と同じ書き込み。
+#     他のキーには触らず、書く前の写しを /private/tmp へ残す）
+#   - 権限はユーザーの settings.json を汚さず、デモプロジェクト側の `.claude/settings.local.json` で許可する
+promo_external_config_ready() {
+    local cfg="$PROMO_CLAUDE_CONFIG_DIR/.claude.json"
+    [ -f "$cfg" ] || { echo "ERROR: ${cfg} が無い（そのアカウントで一度 claude を起動してログインしておく）" >&2; return 1; }
+    mkdir -p /private/tmp/tako-promo-dev
+    cp -p "$cfg" "/private/tmp/tako-promo-dev/claude.json.before-$(date +%H%M%S)"
+    /usr/bin/python3 - "$cfg" "$PROMO_DEMO/awesome-app" <<'PY'
+import json, os, sys, tempfile
+path, project = sys.argv[1], sys.argv[2]
+with open(path, encoding="utf-8") as f:
+    data = json.load(f)
+projects = data.setdefault("projects", {})
+entry = projects.setdefault(project, {})
+if entry.get("hasTrustDialogAccepted") and entry.get("hasCompletedProjectOnboarding"):
+    sys.exit(0)
+entry["hasTrustDialogAccepted"] = True
+entry["hasCompletedProjectOnboarding"] = True
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".claude.json.")
+with os.fdopen(fd, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+os.replace(tmp, path)
+print("   信頼を追加:", project)
+PY
+    mkdir -p "$PROMO_DEMO/awesome-app/.claude"
+    cat > "$PROMO_DEMO/awesome-app/.claude/settings.local.json" <<'JSON'
+{
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__tako"]
+  }
+}
+JSON
 }
 
 # 画面に出るテキストへ個人情報（メールアドレス・実ホームパス）が残っていないかを
@@ -803,6 +863,7 @@ promo_start_isolated() {
         cd "$PROMO_DEMO/awesome-app"
         env "${PROMO_ENV_CLEAN[@]}" \
             ${PROMO_EXTRA_ENV[@]+"${PROMO_EXTRA_ENV[@]}"} \
+            ${PROMO_CLAUDE_CONFIG_DIR:+"CLAUDE_CONFIG_DIR=$PROMO_CLAUDE_CONFIG_DIR"} \
             TAKO_ISOLATED=1 \
             TAKO_PERSIST="$persist" \
             TAKO_TMUX_SOCKET="$socket" \
