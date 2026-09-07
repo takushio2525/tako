@@ -23611,6 +23611,95 @@ mod self_test {
         base.mul_f64(factor)
     }
 
+    /// **やり直しの上限回数を機の混み具合で伸ばす**（純粋関数。#995）。
+    ///
+    /// 混んだ機では 1 フレームの描画そのものが伸びるので、測る窓に外から来る
+    /// 全体 notify（2 秒 tick 等）が挟まる確率も上がる。回数の上限は
+    /// [`state_wait_budget`] と**同じ方針**（伸ばすだけ・4 倍で打ち切り）で決める
+    /// = 予算の政策を 2 か所に書かない
+    pub(crate) fn guard_attempts(base: u32, busy: Option<f64>) -> u32 {
+        let scaled = state_wait_budget(Duration::from_millis(u64::from(base)), busy);
+        u32::try_from(scaled.as_millis())
+            .unwrap_or(base)
+            .clamp(base, base.saturating_mul(4))
+    }
+
+    /// 出力起因の再描画を測った 1 試行の増分（#858 / #995）。
+    ///
+    /// どれも**アプリ全体のカウンタ**なので、測る窓のあいだにアプリ全体を汚す
+    /// `cx.notify()` が挟まると可視ペイン全部が描き直り、製品の回帰と同じ数字になる。
+    /// 汚れの発生源を名前で言えるように材料をまとめて採る
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+    pub(crate) struct RedrawDelta {
+        /// ペイン本体（`view_cache::PaneBody`。#786）
+        pub(crate) body: u64,
+        /// ペインヘッダ（`view_cache::PaneHeader`。#803）
+        pub(crate) header: u64,
+        /// クローム 4 枚（タブバー / サイドバー / 右パネル / ステータスバー。#786）
+        pub(crate) chrome: u64,
+        /// 出力の経路がアプリ全体を汚した回数（`term_pending_app`。#858）
+        pub(crate) app_notify: u64,
+        /// 本体ビューが無くアプリ全体へ落ちた回数（#858）
+        pub(crate) fallback: u64,
+        /// ヘッダの時計が進んだ回数（1 秒に 1 回。#803 / #858）
+        pub(crate) clock: u64,
+    }
+
+    impl RedrawDelta {
+        /// 窓の前後の差（負にはならない = カウンタは単調増加）
+        fn since(self, before: Self) -> Self {
+            Self {
+                body: self.body.saturating_sub(before.body),
+                header: self.header.saturating_sub(before.header),
+                chrome: self.chrome.saturating_sub(before.chrome),
+                app_notify: self.app_notify.saturating_sub(before.app_notify),
+                fallback: self.fallback.saturating_sub(before.fallback),
+                clock: self.clock.saturating_sub(before.clock),
+            }
+        }
+    }
+
+    /// 「何を製品の挙動として測るか」（#995）。
+    ///
+    /// **測る量そのものは窓の汚れの証人にできない**（外から来た全体 notify と
+    /// 製品の回帰が同じ数字になる = #858 / #995 の本質）。証人には
+    /// 「アプリ全体が汚れたときだけ動き、かつ測る量ではないもの」を選ぶ
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) enum RedrawSubject {
+        /// 項目 110（#803。測るのは**ヘッダ**）。証人はキャッシュしたクローム 4 枚
+        /// （描き直るのはアプリ全体が汚れたときだけ = 可視ペインの枚数に依らない）
+        Header,
+        /// 項目 108（#786。測るのは**クローム**）。証人は
+        /// 「出力を流していないペインの本体も描き直ったか」
+        Chrome,
+    }
+
+    /// この試行を製品の挙動として判定してよいか（純粋関数。#858 / #995）。
+    ///
+    /// 清浄の条件は 4 つ: ①証人が動いていない ②出力の経路がアプリ全体を汚して
+    /// いない ③時間で動くヘッダの時計が窓の中で走っていない ④本体ビューが在る。
+    /// ②〜④は測る前に窓の外へ出せる（[`measure_output_redraw`] の準備）ので、
+    /// 実際にやり直しの引き金になるのはほぼ①（= 外から来る全体 notify）
+    pub(crate) fn redraw_window_clean(
+        subject: RedrawSubject,
+        delta: RedrawDelta,
+        prepared: bool,
+    ) -> bool {
+        let witness_dirty = match subject {
+            // キャッシュしたクロームが描き直るのはアプリ全体が汚れたときだけ（#858）
+            RedrawSubject::Header => delta.chrome > 0,
+            // 出力を流したのは 1 ペインだけなので、本体が 2 枚以上描き直っていれば
+            // アプリ全体が汚れた証拠（#995）。ヘッダは `TAKO_803_NO_HEADER_CACHE=1`
+            // だと毎フレーム描き直る（#803 の A/B 構成）ので証人にしない
+            RedrawSubject::Chrome => delta.body > 1,
+        };
+        prepared
+            && !witness_dirty
+            && delta.app_notify == 0
+            && delta.fallback == 0
+            && delta.clock == 0
+    }
+
     fn fail(step: &str) -> ! {
         // 環境要因（load / feature 構成）は失敗と同じ場所に出す（#796）
         println!("TAKO_APP_SELF_TEST_ENV: {}", env_line());
@@ -25560,6 +25649,139 @@ mod self_test {
             }
             cx.background_executor().timer(poll).await;
         }
+    }
+
+    /// [`measure_output_redraw`] の結果（#995）。
+    pub(crate) struct RedrawWindow {
+        /// 清浄だった試行の増分（全試行が汚れていたら `None` = 判定できない）
+        judged: Option<RedrawDelta>,
+        /// 各試行の記録（診断行へそのまま出す）
+        notes: Vec<String>,
+        /// **全試行で**出力の経路がアプリ全体を汚していた（= 製品の回帰の形）
+        always_app_dirty: bool,
+    }
+
+    /// **出力起因の再描画を「測る窓が清浄な試行」で測る**（#858 → #995 で 1 実装）。
+    ///
+    /// 項目 108（#786。クロームを測る）と項目 110（#803。ヘッダを測る）は同じ形の
+    /// 検査で、同じ理由で落ちていた: `pane_*_renders` / `chrome_renders` は
+    /// **アプリ全体のカウンタ**なので、窓に外から来る全体 notify（2 秒 tick 等）が
+    /// 挟まると可視ペイン全部が描き直り、**製品の回帰と同じ数字**になる。
+    ///
+    /// 窓の汚れのうち**時間で動くもの**（ヘッダの時計 #803）と**持ち越し**
+    /// （`term_pending_app`）は測る前に外へ出し、**外から来るもの**は
+    /// [`redraw_window_clean`] の証人で検出してやり直す（上限つき・各試行を記録・
+    /// 全滅なら呼び出し側が FAILED にする = 素通りさせない）。
+    ///
+    /// `inject` は検出力の実証用（実機で偶然を待たない。#853 と同じ流儀）:
+    /// - `app` … **1 回目だけ**窓の中でアプリ全体を汚す（2 秒 tick が一過性に
+    ///   挟まった状況）。汚れを見つけて測り直し、通るのが正しい
+    /// - `measured` … **毎回**「測る量」のキャッシュ単位だけを汚す（製品が壊れた
+    ///   状況）。窓は清浄なので判定へ進み、やり直しに隠されず FAILED になる
+    async fn measure_output_redraw(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        target: PaneId,
+        subject: RedrawSubject,
+        guard_off: bool,
+        inject: &str,
+        cx: &mut AsyncApp,
+    ) -> RedrawWindow {
+        let draw = |cx: &mut AsyncApp| {
+            let _ = any.update(cx, |_, w, cx| w.draw(cx).clear());
+        };
+        let snapshot = |cx: &mut AsyncApp| {
+            window
+                .update(cx, |app: &mut TakoApp, _, _| RedrawDelta {
+                    body: app.pane_body_renders,
+                    header: app.pane_header_renders,
+                    chrome: app.chrome_renders,
+                    app_notify: app.term_app_notifies,
+                    fallback: app.pane_body_notify_fallbacks,
+                    clock: app.header_clock_ticks,
+                })
+                .unwrap_or_default()
+        };
+        let mut out = RedrawWindow {
+            judged: None,
+            notes: Vec::new(),
+            always_app_dirty: true,
+        };
+        let attempts = guard_attempts(5, machine_busy());
+        for attempt in 1..=attempts {
+            let prepared = window
+                .update(cx, |app: &mut TakoApp, _, cx| {
+                    if guard_off {
+                        return app.pane_bodies.contains_key(&target);
+                    }
+                    // 出力起因の持ち越しを落とす（全体経路へ入らせない）
+                    app.term_pending_app = false;
+                    app.term_pending_panes.clear();
+                    // 時計は「出力による再描画」ではない。いま進めた扱いにして窓の外へ
+                    app.last_header_clock_tick = std::time::Instant::now();
+                    // 本体ビューが無いと `notify_pane_body` がアプリ全体へ落ちる
+                    app.notify_pane_body(target, cx);
+                    app.pane_bodies.contains_key(&target)
+                })
+                .unwrap_or(false);
+            draw(cx);
+            let before = snapshot(cx);
+            let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                // デバウンス窓を空けて「要求するなら即座に要求する」状態にする
+                app.last_term_notify =
+                    std::time::Instant::now() - std::time::Duration::from_secs(1);
+                app.on_term_event(
+                    target,
+                    tako_core::SessionEvent::Term(tako_core::TermEvent::Wakeup),
+                    cx,
+                );
+            });
+            // 汚れの注入は「2 秒 tick が挟まる位置」= 出力の直後・描画の直前
+            if inject == "app" && attempt == 1 {
+                let _ = window.update(cx, |_: &mut TakoApp, _, cx| cx.notify());
+            } else if inject == "measured" {
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| match subject {
+                    RedrawSubject::Header => {
+                        if let Some(view) = app.pane_headers.get(&target).cloned() {
+                            view.update(cx, |_, cx| cx.notify());
+                        }
+                    }
+                    RedrawSubject::Chrome => {
+                        // ステータスバーは常に描かれる（= キャッシュビューが必ず在る）
+                        if let Some(view) = app
+                            .chrome_views
+                            .get(&view_cache::ChromePart::StatusBar)
+                            .cloned()
+                        {
+                            view.update(cx, |_, cx| cx.notify());
+                        }
+                    }
+                });
+            }
+            draw(cx);
+            let delta = snapshot(cx).since(before);
+            out.notes.push(format!(
+                "attempt={attempt}/{attempts} body=+{} header=+{} chrome=+{} \
+                 app_notify=+{} fallback=+{} clock=+{} prepared={prepared}",
+                delta.body,
+                delta.header,
+                delta.chrome,
+                delta.app_notify,
+                delta.fallback,
+                delta.clock,
+            ));
+            if delta.app_notify == 0 {
+                out.always_app_dirty = false;
+            }
+            if guard_off || redraw_window_clean(subject, delta, prepared) {
+                out.judged = Some(delta);
+                break;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(150))
+                .await;
+        }
+        out
     }
 
     /// **#1153 の A/B の口**: 設定すると「固定窓・1 回読み・総数の差分」の旧経路へ戻る。
@@ -53509,63 +53731,114 @@ mod self_test {
                         })
                         .unwrap_or((0, 0))
                 };
-                let (panes0, chrome0) = counters(cx);
                 // ① このウィンドウに**実際に描かれた**ペインの出力だけを流す。
                 // 直前の draw で `pane_text_areas` に載ったものが正（複数ウィンドウ
-                // 構成では active_tab がこのウィンドウの表示タブとは限らない）
-                let fed = window786
-                    .update(cx, |app: &mut TakoApp, _, cx| {
-                        let Some(target) = app
-                            .pane_text_areas
+                // 構成では active_tab がこのウィンドウの表示タブとは限らない）。
+                // プレビュー / Web ビューのペインは本体の中身が別なので除く（110 と同じ）
+                let target = window786
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.pane_text_areas
                             .iter()
                             .map(|(id, _)| *id)
-                            .find(|id| app.terminals.contains_key(id))
-                        else {
-                            return false;
-                        };
-                        app.last_term_notify =
-                            std::time::Instant::now() - std::time::Duration::from_secs(1);
-                        app.on_term_event(
-                            target,
-                            tako_core::SessionEvent::Term(tako_core::TermEvent::Wakeup),
-                            cx,
-                        );
-                        true
+                            .find(|id| {
+                                app.terminals.contains_key(id)
+                                    && !app.previews.contains_key(id)
+                                    && !app.webviews.iter().any(|w| w.pane == Some(*id))
+                            })
                     })
-                    .unwrap_or(false);
-                draw(cx);
-                let (panes1, chrome1) = counters(cx);
-                // ② テーマ切替（= ペインの外にも出る普通の状態変化）で全部が汚れる
-                let _ = window786.update(cx, |app: &mut TakoApp, _, cx| app.toggle_theme(cx));
-                draw(cx);
-                let (panes2, chrome2) = counters(cx);
-                let _ = window786.update(cx, |app: &mut TakoApp, _, cx| app.toggle_theme(cx));
-                draw(cx);
-                println!(
-                    "TAKO_SELF_TEST_786: fed={fed} output=(panes +{} chrome +{}) \
-                     theme=(panes +{} chrome +{})",
-                    panes1 - panes0,
-                    chrome1 - chrome0,
-                    panes2 - panes1,
-                    chrome2 - chrome1,
-                );
-                if !fed {
-                    // ウィンドウが遮蔽されて 1 度も描かれていないと `pane_text_areas` が
-                    // 空になる。product の欠陥ではないので落とさず飛ばす（76d と同じ扱い）
-                    println!(
-                        "TAKO_SELF_TEST_SKIPPED: 108（ペインが未描画。\
-                         ウィンドウを前面にして再実行すると検証できる）"
-                    );
-                } else {
-                    check(panes1 > panes0, "108: 出力のあったペインは描き直される (#786)");
-                    check(
-                        chrome1 == chrome0,
-                        "108: ペイン出力ではクロームを描き直さない (#786)",
-                    );
-                    check(
-                        chrome2 > chrome1 && panes2 > panes1,
-                        "108: ペイン外の状態変化では全部が描き直される (#786)",
-                    );
+                    .ok()
+                    .flatten();
+                // #995: 窓の汚れの証人は「出力を流していないペインの本体も描き直ったか」
+                // なので、2 枚以上描かれていないと成り立たない
+                let drawn = window786
+                    .update(cx, |app: &mut TakoApp, _, _| app.pane_text_areas.len())
+                    .unwrap_or(0);
+                match target.filter(|_| drawn >= 2) {
+                    None => {
+                        // ウィンドウが遮蔽されていると 1 度も描かれず `pane_text_areas` が
+                        // 空になる。product の欠陥ではないので落とさず飛ばす（76d と同じ扱い）
+                        println!(
+                            "TAKO_SELF_TEST_SKIPPED: 108（描かれたターミナルのペインが \
+                             {drawn} 枚。ウィンドウを前面にして再実行すると検証できる）"
+                        );
+                    }
+                    Some(target) => {
+                        // #995: 素で 1 回測ると**窓の外の理由**で落ちる（#858 が項目 110 で
+                        // 突き止めたのと同じ穴）。`chrome_renders` はアプリ全体のカウンタ
+                        // なので、窓に外から来る全体 notify（2 秒 tick 等）が挟まると
+                        // クローム 4 枚が描き直り、**② の意図的な全体 notify と同じ数字**に
+                        // なる（Issue の実測: load 27 で FAILED / load 14 で ok）。
+                        //
+                        // 時間で動くもの（ヘッダの時計）と持ち越し（`term_pending_app`）は
+                        // 測る前に窓の外へ出し、外から来る汚れは**検出してやり直す**
+                        // （[`measure_output_redraw`]。上限つき・各試行を記録）。
+                        // 証人は「出力を流していないペインの本体も描き直ったか」
+                        // = 測る量（クローム）そのものは証人にできない（`RedrawSubject`）。
+                        //
+                        // A/B の口（実機で偶然を待たない。#858 と同じ流儀）:
+                        // - `TAKO_995_LEGACY=1` … 窓を整えず 1 回だけ測る = 修正前
+                        // - `TAKO_995_INJECT=app` … 窓の中でアプリ全体を汚す（**1 回目
+                        //   だけ** = 2 秒 tick が一過性に挟まった状況）。修正前は FAILED、
+                        //   修正後は汚れを見つけて測り直す
+                        // - `TAKO_995_INJECT=chrome` … 窓の中でクロームのビューだけを汚す
+                        //   （**毎回** = #786 が壊れた状況）。窓は清浄なので判定へ進み、
+                        //   やり直しに隠されず FAILED になる
+                        let legacy = std::env::var_os("TAKO_995_LEGACY").is_some();
+                        let inject =
+                            match std::env::var("TAKO_995_INJECT").unwrap_or_default().as_str() {
+                                "app" => "app",
+                                "chrome" => "measured",
+                                _ => "",
+                            };
+                        let measured = measure_output_redraw(
+                            any786,
+                            window786,
+                            target,
+                            RedrawSubject::Chrome,
+                            legacy,
+                            inject,
+                            cx,
+                        )
+                        .await;
+                        println!("TAKO_SELF_TEST_786_WINDOW: {}", measured.notes.join(" | "));
+                        let Some(output) = measured.judged else {
+                            // 全滅の理由を名指しする: 出力の経路が毎回アプリ全体を
+                            // 汚していたなら、測り方ではなく製品（#786）の回帰
+                            if measured.always_app_dirty {
+                                fail("108: ペイン出力がアプリ全体を汚している (#786)")
+                            }
+                            fail("108: 測る窓が最後まで汚れていて判定できない (#995)")
+                        };
+                        // ② テーマ切替（= ペインの外にも出る普通の状態変化）で全部が汚れる
+                        let (panes1, chrome1) = counters(cx);
+                        let _ =
+                            window786.update(cx, |app: &mut TakoApp, _, cx| app.toggle_theme(cx));
+                        draw(cx);
+                        let (panes2, chrome2) = counters(cx);
+                        let _ =
+                            window786.update(cx, |app: &mut TakoApp, _, cx| app.toggle_theme(cx));
+                        draw(cx);
+                        println!(
+                            "TAKO_SELF_TEST_786: drawn={drawn} output=(panes +{} chrome +{}) \
+                             theme=(panes +{} chrome +{})",
+                            output.body,
+                            output.chrome,
+                            panes2 - panes1,
+                            chrome2 - chrome1,
+                        );
+                        check(
+                            output.body > 0,
+                            "108: 出力のあったペインは描き直される (#786)",
+                        );
+                        check(
+                            output.chrome == 0,
+                            "108: ペイン出力ではクロームを描き直さない (#786)",
+                        );
+                        check(
+                            chrome2 > chrome1 && panes2 > panes1,
+                            "108: ペイン外の状態変化では全部が描き直される (#786)",
+                        );
+                    }
                 }
             } else {
                 println!("TAKO_SELF_TEST_SKIPPED: 108（TAKO_786_NO_VIEW_CACHE でキャッシュ無効）");
@@ -53832,25 +54105,6 @@ mod self_test {
                         })
                         .unwrap_or((0, 0))
                 };
-                // #858: 測る窓が「出力だけ」だったかを判定する材料。
-                //
-                // アプリ全体を汚す `cx.notify()` が窓に挟まると、キャッシュしてある
-                // クローム 4 枚（#786）も一緒に描き直る = **可視ペインの枚数に依らない
-                // 汚れの証拠**になる。ヘッダの時計（#803。1 秒に 1 回）と
-                // `term_pending_app` の持ち越し・ビュー未作成のフォールバックも
-                // それぞれ数えるので、汚れの発生源が名前で分かる
-                let dirt = |cx: &mut gpui::AsyncApp| {
-                    window803
-                        .update(cx, |app: &mut TakoApp, _, _| {
-                            (
-                                app.chrome_renders,
-                                app.term_app_notifies,
-                                app.pane_body_notify_fallbacks,
-                                app.header_clock_ticks,
-                            )
-                        })
-                        .unwrap_or((0, 0, 0, 0))
-                };
                 // 対象は「このウィンドウに実際に描かれた」ターミナルのペイン。
                 // 持ち上げているかは**条件にしない**（条件にすると、持ち上げを戻した
                 // ときに検査が落ちずに飛ぶ = 検出力が無くなる）
@@ -53901,72 +54155,30 @@ mod self_test {
                     //   （**毎回** = #803 が壊れた状況）。窓は汚れていないので判定へ進み、
                     //   やり直しに隠されず FAILED になる
                     let guard_off = std::env::var_os("TAKO_858_NO_WINDOW_GUARD").is_some();
-                    let inject = std::env::var("TAKO_858_INJECT").unwrap_or_default();
-                    let mut judged: Option<(u64, u64)> = None;
-                    let mut notes: Vec<String> = Vec::new();
-                    for attempt in 1..=5u32 {
-                        let prepared = window803
-                            .update(cx, |app: &mut TakoApp, _, cx| {
-                                if guard_off {
-                                    return app.pane_bodies.contains_key(&target);
-                                }
-                                // ②: 出力起因の持ち越しを落とす（全体経路へ入らせない）
-                                app.term_pending_app = false;
-                                app.term_pending_panes.clear();
-                                // ③: 時計は「出力」ではない。いま進めた扱いにして窓の外へ
-                                app.last_header_clock_tick = std::time::Instant::now();
-                                // 本体ビューが無いと `notify_pane_body` が全体へ落ちる
-                                app.notify_pane_body(target, cx);
-                                app.pane_bodies.contains_key(&target)
-                            })
-                            .unwrap_or(false);
-                        draw(cx);
-                        let (body0, head0) = counters(cx);
-                        let dirt0 = dirt(cx);
-                        let _ = window803.update(cx, |app: &mut TakoApp, _, cx| {
-                            app.last_term_notify =
-                                std::time::Instant::now() - std::time::Duration::from_secs(1);
-                            app.on_term_event(
-                                target,
-                                tako_core::SessionEvent::Term(tako_core::TermEvent::Wakeup),
-                                cx,
-                            );
-                        });
-                        // 汚れの注入は「2 秒 tick が挟まる位置」= 出力の直後・描画の直前
-                        if inject == "app" && attempt == 1 {
-                            let _ = window803.update(cx, |_: &mut TakoApp, _, cx| cx.notify());
-                        } else if inject == "header" {
-                            let _ = window803.update(cx, |app: &mut TakoApp, _, cx| {
-                                if let Some(view) = app.pane_headers.get(&target).cloned() {
-                                    view.update(cx, |_, cx| cx.notify());
-                                }
-                            });
-                        }
-                        draw(cx);
-                        let (body1, head1) = counters(cx);
-                        let dirt1 = dirt(cx);
-                        notes.push(format!(
-                            "attempt={attempt} body=+{} header=+{} chrome=+{} app_notify=+{} \
-                             fallback=+{} clock=+{} prepared={prepared}",
-                            body1 - body0,
-                            head1 - head0,
-                            dirt1.0 - dirt0.0,
-                            dirt1.1 - dirt0.1,
-                            dirt1.2 - dirt0.2,
-                            dirt1.3 - dirt0.3,
-                        ));
-                        // 窓が汚れていない = クロームも時計も全体 notify も動いていない。
-                        // このときだけヘッダの増分を製品の挙動として判定する
-                        if guard_off || (dirt1 == dirt0 && prepared) {
-                            judged = Some((body1 - body0, head1 - head0));
-                            break;
-                        }
-                        wait(cx, 150).await;
-                    }
-                    println!("TAKO_SELF_TEST_803_WINDOW: {}", notes.join(" | "));
-                    let Some((body_delta, head_delta)) = judged else {
+                    let inject =
+                        match std::env::var("TAKO_858_INJECT").unwrap_or_default().as_str() {
+                            "app" => "app",
+                            "header" => "measured",
+                            _ => "",
+                        };
+                    // 窓の清浄化とやり直しは項目 108（#786）と同じ形なので
+                    // [`measure_output_redraw`] の 1 実装へ寄せてある（#995）。
+                    // ここで測るのはヘッダなので、証人はキャッシュしたクローム 4 枚
+                    let measured = measure_output_redraw(
+                        any803,
+                        window803,
+                        target,
+                        RedrawSubject::Header,
+                        guard_off,
+                        inject,
+                        cx,
+                    )
+                    .await;
+                    println!("TAKO_SELF_TEST_803_WINDOW: {}", measured.notes.join(" | "));
+                    let Some(output) = measured.judged else {
                         fail("110: 測る窓が最後まで汚れていて判定できない (#858)")
                     };
+                    let (body_delta, head_delta) = (output.body, output.header);
                     let (body1, head1) = counters(cx);
                     // ② 実 dispatch（CLI / MCP が通る道）でタイトルを変える。
                     // ControlHost のメソッド自身は notify しない設計なので、IPC の
@@ -64361,6 +64573,141 @@ mod self_test_wait_budget_tests {
         // #1165 が観測した混み具合（load 12.9 / 12 コア ≒ 1.08）でさらに伸びる
         let (busy, _, _) = resolve_text_wait(budget, Some(1.08), false);
         assert!(busy > idle, "混んだ機で伸びていない");
+    }
+}
+
+/// **測る窓が汚れているかの判定**（#858 / #995）。
+///
+/// 項目 108（#786。クロームを測る）と項目 110（#803。ヘッダを測る）は、どちらも
+/// 「窓に外から来る全体 notify（2 秒 tick 等）が挟まると製品の回帰と同じ数字になる」
+/// という同じ穴で落ちていた。判定は純粋関数なので、**実機で偶然を待たずに**
+/// 「外から来た汚れ」と「本物の回帰」を取り違えないことを固定できる
+#[cfg(test)]
+mod self_test_redraw_window_tests {
+    use super::self_test::{guard_attempts, redraw_window_clean, RedrawDelta, RedrawSubject};
+
+    /// 出力を 1 ペインへ流しただけの清浄な窓（本体 1 枚だけが描き直る）
+    fn pure_output() -> RedrawDelta {
+        RedrawDelta {
+            body: 1,
+            ..RedrawDelta::default()
+        }
+    }
+
+    #[test]
+    fn 清浄な窓はどちらの測り方でも判定へ進む() {
+        assert!(redraw_window_clean(
+            RedrawSubject::Header,
+            pure_output(),
+            true
+        ));
+        assert!(redraw_window_clean(
+            RedrawSubject::Chrome,
+            pure_output(),
+            true
+        ));
+    }
+
+    /// 2 秒 tick 等の全体 notify は可視ペイン全部の本体とヘッダ・クローム 4 枚を汚す。
+    /// **どちらの測り方でも「窓の外から来た」と分かる**のが #995 の要点
+    #[test]
+    fn 外から来た全体notifyは両方の測り方で汚れと分かる() {
+        let tick = RedrawDelta {
+            body: 2,
+            header: 2,
+            chrome: 4,
+            ..RedrawDelta::default()
+        };
+        assert!(!redraw_window_clean(RedrawSubject::Header, tick, true));
+        assert!(!redraw_window_clean(RedrawSubject::Chrome, tick, true));
+    }
+
+    /// **やり直しが本物の回帰を隠さない**（#858 の `INJECT=header` / #995 の
+    /// `INJECT=chrome` が実機で確かめているのと同じこと）。
+    /// 測る量だけが増えた窓は清浄なので 1 回目で判定へ進み、そこで FAILED になる
+    #[test]
+    fn 測る量だけが増えた窓は清浄として判定へ進む() {
+        let header_regression = RedrawDelta {
+            body: 1,
+            header: 1,
+            ..RedrawDelta::default()
+        };
+        assert!(redraw_window_clean(
+            RedrawSubject::Header,
+            header_regression,
+            true
+        ));
+        let chrome_regression = RedrawDelta {
+            body: 1,
+            chrome: 1,
+            ..RedrawDelta::default()
+        };
+        assert!(redraw_window_clean(
+            RedrawSubject::Chrome,
+            chrome_regression,
+            true
+        ));
+    }
+
+    /// 出力の経路がアプリ全体を汚した窓・本体ビューが無い窓は判定しない
+    /// （どちらも測る前に窓の外へ出せるもの = 出ていたら測り直す）
+    #[test]
+    fn 出力の経路が全体を汚した窓と未準備の窓は判定しない() {
+        for subject in [RedrawSubject::Header, RedrawSubject::Chrome] {
+            let app_notify = RedrawDelta {
+                app_notify: 1,
+                ..pure_output()
+            };
+            assert!(!redraw_window_clean(subject, app_notify, true));
+            let fallback = RedrawDelta {
+                fallback: 1,
+                ..pure_output()
+            };
+            assert!(!redraw_window_clean(subject, fallback, true));
+            let clock = RedrawDelta {
+                clock: 1,
+                ..pure_output()
+            };
+            assert!(!redraw_window_clean(subject, clock, true));
+            assert!(!redraw_window_clean(subject, pure_output(), false));
+        }
+    }
+
+    /// 項目 108 の証人にヘッダを使わない理由（#995）。
+    ///
+    /// `TAKO_803_NO_HEADER_CACHE=1`（#803 の A/B）はヘッダを**毎フレーム**描き直すので、
+    /// ヘッダを証人にすると 108 が永久に「汚れている」= 判定できなくなる。
+    /// 本体の枚数で見れば構成に依らない（項目 110 はこの env では走らない）
+    #[test]
+    fn ヘッダが毎フレーム描き直る構成でも108は判定できる() {
+        let no_header_cache = RedrawDelta {
+            body: 1,
+            header: 2,
+            ..RedrawDelta::default()
+        };
+        assert!(redraw_window_clean(
+            RedrawSubject::Chrome,
+            no_header_cache,
+            true
+        ));
+    }
+
+    /// やり直しの上限は `state_wait_budget` と同じ方針（伸ばすだけ・4 倍で打ち切り）
+    #[test]
+    fn やり直しの上限は伸ばすだけで縮まない() {
+        assert_eq!(guard_attempts(5, None), 5, "混み具合が読めないと基準のまま");
+        assert_eq!(guard_attempts(5, Some(0.0)), 5, "空いていても縮めない");
+        assert_eq!(
+            guard_attempts(5, Some(-1.0)),
+            5,
+            "採り損ねた負値でも縮めない"
+        );
+        assert_eq!(guard_attempts(5, Some(1.0)), 10, "全コアが埋まっていれば倍");
+        assert_eq!(
+            guard_attempts(5, Some(27.0)),
+            20,
+            "Issue の load 27 でも 4 倍で打ち切り"
+        );
     }
 }
 
