@@ -4,7 +4,8 @@
 #             clip（収録素材。source=シーン名 → scenes/<source>-raw.mp4、anchor=ビート名 or 秒）
 #   offset  = anchor からのずらし秒（負も可）
 #   min_dur = この区間の最短秒数。実際の長さは max(min_dur, ナレーション秒 + 0.8)
-#   speech  = ナレーション（say -v Kyoko 用。外来語はカナ表記。空なら無音区間）
+#   speech  = ナレーション（VOICEVOX / ずんだもん用。外来語はカナ表記。空なら無音区間。
+#             読みの確認は scripts/promo/voicevox-synth.py --print-kana）
 # 各主張の裏取りは .agent/plans/2026-09-youtube-explainer.md「訴求と裏取り」の表を参照。
 #
 # ── オープニング ────────────────────────────────────────────────────

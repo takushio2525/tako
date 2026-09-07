@@ -15,7 +15,8 @@
   唯一の例外は 7 章のスマホ画面で、**PWA の UI そのものは本物**（`web/tako-remote` を
   そのまま配信）だが **API はモック**（実 daemon は tailscale serve を張る = 本番の
   Tailscale / remote 状態に触れるため）。テロップに「画面はデモ用データ」と明記する
-- ナレーションは macOS 同梱の日本語 TTS（`say -v Kyoko`。この機で使える唯一の日本語音声）。
+- ナレーションは VOICEVOX ENGINE のずんだもん / ノーマル（v3 以降。選定の根拠は「声の選定」節）。
+  v2 までは macOS 同梱の `say -v Kyoko` で、抑揚が狭く棒読みに聞こえたため降りた。
   区間の長さは**ナレーションが駆動**する（`max(min_dur, 音声秒 + 0.8)`）
 - UI・テロップ・カードに絵文字を使わない（ブランド方針）
 - PII ゼロ: 全フレームを Vision OCR にかけ、メール / 実ホームパス / ユーザー名 / ホスト名 /
@@ -145,7 +146,7 @@
 | `scripts/promo/displays.swift` | 接続中ディスプレイの矩形と実ピクセル（`displayID x y w h pxW pxH main\|secondary`）。仮想ディスプレイの位置決めと HiDPI 判定 |
 | `scripts/promo/record-explainer.sh <scene\|all>` | 9 シーンの収録。CLI 操作の瞬間を `<scene>-beats.tsv` へ記録。収録の開始 / 終了は `RECORDING START` / `RECORDING END` の 1 行 |
 | `scripts/promo/record-pwa.cjs` | PWA（`web/tako-remote`）を iPhone ビューポートでモック API つきに撮る（連番スクショ → mp4） |
-| `scripts/promo/narrate.sh` | timeline.tsv の speech 列 → `say -v Kyoko` → 48kHz wav + durations.tsv |
+| `scripts/promo/narrate.sh` | timeline.tsv の speech 列 → VOICEVOX（既定）or `say` → 48kHz wav + durations.tsv。バックエンドは `TAKO_PROMO_TTS` で切替、ピークは声に依らず `TAKO_PROMO_PEAK_DB` へそろえる |
 | `scripts/promo/make-bgm.py` | BGM 合成（`TAKO_BGM_TOTAL=660 TAKO_BGM_PROFILE=explainer` で薄い長尺版） |
 | `scripts/promo/titlecard.swift` / `caption.swift` | 章カード（全面）/ 下段テロップ（半透明パネル） |
 | `scripts/promo/build-explainer.sh` | 切り出し → カード / テロップ → 連結 → ナレーション配置 → BGM ダッキング → mp4 + 章タイムスタンプ |
@@ -230,7 +231,7 @@ scripts/promo/pii-scan.sh ~/Desktop/tako-promo/tako-explainer-v1.mp4
   （実測）。連番スクリーンショット（4 fps・3x）→ ffmpeg の方が確実で鮮明
 - PWA の term ビューは WebSocket の画面プッシュ前提なので、モックでは読み込み中のまま。撮らない
 - 文字サイズはペイン既定の 13 では 1080p で小さいので `tako theme --size 15` で撮る
-- `say -v Kyoko` の `-r` は 160 と 175 で尺が変わらなかった（実測）。180 で使う。ピークは -13dB 程度と
+- （say バックエンドの実測。v2 まではこれが本番だった）`-r` は 160 と 175 で尺が変わらなかった。180 で使う。ピークは -13dB 程度と
   小さいので合成時に +7dB（limiter つき）持ち上げる
 - **かんたん表示のチャット判定は器（tmux バックエンド）が要る**: `chat_session` の材料
   `live_claude_sessions_by_backend` は tmux ペインの pid 対応付けに乗るので、`TAKO_PERSIST=0` の
@@ -279,6 +280,101 @@ scripts/promo/pii-scan.sh ~/Desktop/tako-promo/tako-explainer-v1.mp4
   （caption の先頭 `^`）
 - `$id（` のように変数の直後に全角を置くと bash が変数名に取り込んで `set -u` で落ちる
   （`shell_scripts` 番犬が CI で落とす）。`${id}（` と書く
+
+## 声の選定（v3・2026-09-07）
+
+v2 まではナレーションが macOS の `say -v Kyoko` で、ユーザー評価は「声をどうにかして欲しい」。
+**抑揚の狭さが原因**だと数値で確かめてから替えた（有声フレームの F0 を自己相関で拾い、
+音高に依らないセミトーンで散らばりを測る = 棒読み度の代理指標）。
+
+| 候補 | 平均 F0 | 抑揚 SD | 抑揚幅 | 判断 |
+|---|---|---|---|---|
+| say / Kyoko（v2 まで） | 260.9 Hz | 3.29 半音 | 8.20 半音 | 基準。**これが狭い** |
+| ずんだもん ノーマル（id=3） | 374.2 Hz | **4.22 半音** | **10.71 半音** | **採用**。使える中で最も広い（Kyoko 比 +28%） |
+| ずんだもん セクシー（id=5） | 377.2 Hz | 3.64 半音 | 9.94 半音 | やや平坦・14% 遅く尺が伸びる |
+| ずんだもん ツンツン（id=7） | 358.8 Hz | 2.88 半音 | 7.63 半音 | **Kyoko より狭い**（直したい欠点そのもの） |
+| ずんだもん ささやき（id=22） | 315.9 Hz | 8.44 半音 | 23.53 半音 | 数値は大きいが**有声 139 / 1000 フレーム**（ほぼ無声の息）。BGM の下で埋もれる |
+
+採用は **ずんだもん ノーマル（speaker=3）**。パラメータは同一区間で 5 通り測って選んだ:
+
+| 調整 | 平均 F0 | 抑揚 SD | 尺 | |
+|---|---|---|---|---|
+| 既定（1.0 / 0.0 / 1.0） | 374.2 Hz | 4.22 半音 | 9.1s | |
+| speed 1.0 / pitch -0.03 / inton 1.15 / pause 1.1 | 344.6 Hz | 4.20 半音 | 9.3s | |
+| **speed 1.05 / pitch -0.05 / inton 1.28 / pause 1.1** | **326.5 Hz** | **4.43 半音** | **8.9s** | **採用** |
+| speed 0.95 / pitch -0.03 / inton 1.10 / pause 1.25 | 340.8 Hz | 4.35 半音 | 10.1s | 尺が伸びる |
+| speed 1.02 / pitch -0.05 / inton 1.20 / pause 1.1 | 321.5 Hz | 4.02 半音 | 9.2s | 抑揚が落ちる |
+
+採用値は**抑揚が最も広く・平均音高が最も低く（甲高さが和らぐ）・尺が伸びない**の 3 つを同時に満たす。
+既定値は `voicevox-synth.py` が持つ（`TAKO_PROMO_VV_*` で上書きできる）。
+
+### 読みの検証（耳を使わずに済む部分）
+
+`POST /audio_query` の戻り値の `kana` が**エンジンが実際にどう読むか**なので、外来語の読み違いは
+合成前に確認できる（`voicevox-synth.py --print-kana`）。台本は外来語をすべてカナで書いてあるため
+**書き換え不要**だと実測で確認した: `エーアイエージェント` → `エエアイエエジェント` /
+`ジーユーアイターミナル` → `ジイユウアイタアミナル` / `ティーマックス` → `ティイマックス` /
+`エムシーピー` → `エムシイピイ` / `クロード` → `クロオド` / `ジーピーエル バージョン 3` →
+`ジイ/ピイ/エル、バアジョン、サン`（数字も正しい）。
+
+### 声を替えると音量段が壊れる（v3 で直した）
+
+**同じピークにそろえてもラウドネスは一致しない**。クレストファクタが声ごとに違うためで、
+ピーク -12.3dB で揃えた同一区間が say は -25.3 LUFS・ずんだもんは **-31.9 LUFS**（6.6dB 差）。
+`build-explainer.sh` のナレーション段は `volume=3.0`（+9.5dB）の**固定ゲイン**で、これは
+say のピーク中央値 -12.3dB 専用の値だった。そのまま VOICEVOX を通したら最終段が振り切れて
+**0.0dBFS まで潰れた**（実測）。
+
+- narrate.sh は**どのバックエンドでも同じピーク**（`TAKO_PROMO_PEAK_DB`、既定 -12.3dBFS）へそろえる。
+  測るのは**最終形**（48kHz stereo 変換後）。変換前に測ると ffmpeg の mono → stereo 行列が
+  各チャンネルへ 1/√2（-3.01dB）を掛けるぶん狙いから外れる（実測: 目標 -12.3 に対し出力 -15.3）
+- build-explainer.sh のナレーション段は**測ってから当てる**（`TAKO_PROMO_NARR_LUFS`、既定 -15.8 LUFS
+  = v2 の設計値）。固定ゲインは声を替えるたびに壊れるので置かない
+- 最終段で番組全体を **-14 LUFS**（`TAKO_PROMO_LUFS`）へ寄せる。1 パスの `loudnorm` は音楽の下で
+  ポンプするので使わず、測って固定ゲイン 1 回 + リミッタ
+- **`alimiter` は `level=disabled` が必須**。自動レベルが既定 true で、リミットしたあと 0dB へ
+  戻すので `limit` の指定が無かったことになる（実測: `limit=0.84` でも True Peak +0.6dBFS）
+
+### クレジット表記（VOICEVOX 利用規約）
+
+生成音声の公開には話者クレジットの表示が必要。表記は**エンジンの `/speakers` の policy から引く**
+（`voicevox-synth.py --print-credit` → `VOICEVOX:ずんだもん`）ので、話者を替えても手で直す場所が無い。
+置き場は 2 か所:
+
+1. **動画の末尾カード**（`outro_card` の脚注に `音声: VOICEVOX:ずんだもん`。他の章カードには出さない）
+2. **説明文**（`tako-explainer-description.txt` の「注記」。規約 URL も併記）
+
+BGM は `make-bgm.py` が波形から合成した自作音源なので**外部素材のクレジットは不要**
+（GPL-3.0-or-later のリポジトリの一部として扱える）。説明文にもその旨を 1 行入れてある。
+
+### エンジンの入手（リポジトリには置かない）
+
+```sh
+curl -fL -o /tmp/vv.7z.001 \
+  https://github.com/VOICEVOX/voicevox_engine/releases/download/0.25.2/voicevox_engine-macos-arm64-0.25.2.7z.001
+7zz x -y -o"$HOME/Desktop/tako-promo/tools" /tmp/vv.7z.001
+~/Desktop/tako-promo/tools/macos-arm64/run --host 127.0.0.1 --port 50021   # 合成中だけ起動する
+```
+
+配布物は約 1.8GB（展開後も同程度）なので `~/Desktop/tako-promo/tools/` に置き、**リポジトリには入れない**。
+合成が終わったらエンジンは停止する。
+
+## 完成物と検査結果（v3・2026-09-07）
+
+v2 との差は**ナレーションの声だけ**（映像素材 `scenes/*-raw.mp4` は撮り直していない）。
+区間長はナレーション秒で決まるので、**章タイムスタンプは v2 から動く**（下表）。
+
+| 項目 | 値 |
+|---|---|
+| 動画 | `~/Desktop/tako-promo/tako-explainer-v3.mp4`（10:01 = 601.4 秒 / 1920x1080 / 30fps / H.264 + AAC 48kHz / 47 区間 / 45.9MB） |
+| 声 | VOICEVOX ENGINE 0.25.2 / ずんだもん ノーマル（speaker=3）/ speed 1.05・pitch -0.05・intonation 1.28・pause 1.1 |
+| ナレーション | 47 区間 / 合計 514.9 秒（v2 の say は 488.7 秒 = +26.2 秒 / +5.4%） |
+| 章タイムスタンプ | `tako-explainer-chapters.txt`（00:00 / 00:21 / 01:11 / 02:29 / 03:49 / 05:22 / 07:27 / 08:01 / 09:03 / 09:51） |
+| 音量 | **-14.8 LUFS / True Peak -1.7 dBTP / LRA 8.1 LU**（v2 は -15.2 LUFS / -1.8 dBTP。クリップなし） |
+| 機械検査 | 8 秒以上の無音なし / 2 秒以上の黒フレームなし / BGM はナレーション外の区間で -17〜-22dB（ダッキング動作） |
+| PII 検査 | 601 フレーム（1 fps）を Vision OCR → 34,491 行 → 7 カテゴリすべて **0 件** |
+| クレジット | 末尾カードの脚注（595 秒のフレームで目視確認）+ 説明文の「注記」 |
+| サムネ | **変更なし**（v2 のものを流用） |
 
 ## 完成物と検査結果（v2・2026-09-07）
 
