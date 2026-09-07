@@ -280,6 +280,10 @@ scripts/promo/pii-scan.sh ~/Desktop/tako-promo/tako-explainer-v1.mp4
   （caption の先頭 `^`）
 - `$id（` のように変数の直後に全角を置くと bash が変数名に取り込んで `set -u` で落ちる
   （`shell_scripts` 番犬が CI で落とす）。`${id}（` と書く
+- **System Events の合成クリックは GPUI に届かない**（`.agent/activeContext.md` から移した実測）。
+  窓の移動・前面化のような AX 経由の操作は効くのにクリックは受け取られないので、GUI の操作を
+  機械で検証するときは `self_test::click_at`（実 OS マウスと同じ `PlatformInput` を流す）を通す。
+  **ドラッグは合成 `PlatformInput` なら届く**（#725 / #1043 の実測）
 
 ## 声の選定（v3・2026-09-07）
 

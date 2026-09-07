@@ -1,109 +1,68 @@
 # Active Context
 
 > このファイルは AI が毎ターン上書きする現在状態のスナップショット。
-> 過去ログは `progress.md` を見ること。
+> 過去ログは `progress.md`、フェーズ計画は `roadmap.md` を見ること。
+> 予算は **80 行以内**（`tako context-budget`）。過去ターンの実装詳細はここに書かない。
 
-## 現在の対象（2026-09-03 未明 = 9/1〜9/3 の 7 PR 一括着地・GUI 反映済み）
+## 現在の対象（2026-09-08）
 
-- **9/1〜9/3 に merge 済み**（詳細は progress.md）: #1057 setup 導入実行代行（PR #1064）/
-  #1058 Win GUI モード導線（#1065）/ #1041 リモート VSCode 風（#1066）/ #1060 PII（#1061）/
-  #1063 は計測の錯覚 = PerMonitorV2 不変条件化（#1071）/ #1067 セッション再起動 2 種（#1074）/
-  **リモート刷新 柱 1 土台 = Remote Control opt-in + session URL 公開**（#1068/#1069 = PR #1070）。
-  main = `d6596ab`
-- **/Applications = `d6596ab` 世代・本番 GUI は 9/3 00:33 再起動済み（pid 51132）= 全反映済み**。
-  ユーザー目視待ち: ツリー git 色（#1009）/ Finder D&D（#1043）/ リモートフォルダ新挙動（#1041 の
-  ツリー先頭 + 自動 SSH）/ ペイン右クリックの再起動 2 項目（#1067）
-- **本番 remote は停止中（復旧作業の途中）**: 8/31 未明から GUI 版 Tailscale が稼働して standalone が
-  停止 → ユーザー選択は standalone へ戻す。brew tailscaled は **root 起動が必要**
-  （`sudo brew services start tailscale`）で、root 化により state が変わり**再ログインが必要**。
-  ペイン 1498 で `tailscale up` → `tako remote start` の sudo + ブラウザログイン待ち。
-  完了すれば従来 URL（standalone ノード）で復旧する
-- **リモート大刷新はエピック #1059**（調査レポート = research/2026-09-01-remote-renewal-claude-official.md。
-  分割 A〜H 中 A/B が着地済み。次 = 柱1-C「PWA に Claude で開く」/ 柱1-D「スマホから master 起動」）
-- **リポに PR 必須ルールが入った**: docs 含め main 直 push しない（PR 経由）
+- main = `4d84695`。9/7〜9/8 に #1143（狭いペインの `/model` セレクタ）/ #1136（夜間リリースの
+  使い捨て worktree 化）/ #1154（system prompt を予算対象へ）/ #1160 / #1162 / #1153 / #1165
+  （検証環境とセルフテストの待ち）/ #1081 の v3 動画が着地。1 件ずつは progress.md
+- **/Applications は 9/7 19:52 ビルド・GUI は 9/7 19:54 起動**（版数 v0.8.7）。それ以降の main
+  = #1162 / #1153 / #1165 = **セルフテストの待ち条件のみ**なので、install + GUI 再起動は
+  次に製品挙動を変える PR とまとめてよい
+- **ユーザー目視待ち**: ツリー git 色（#1009）/ Finder D&D の実マウス（#1043）/ Dock ピン留めは
+  次回の更新で確認（#1042）/ #1059 のスマホ 4 項目 / #1081 v3 の試聴（10:01・音声は数値のみ検査）
+- **本番 remote は稼働中**（standalone tailscaled・`serve_ok=true`）。GUI 版 Tailscale と
+  2 系統同時なので `warnings` が 1 行出るのは既知（#1038）
+- **検証用 GUI は常設の仮想ディスプレイ `tako-vd` へ出す**（#1141 / #1150 / #1160。ユーザーの
+  メイン画面に窓を出さない）。起動前に `scripts/lib/virtual-display.sh ensure`、
+  レシピは `.agent/conventions.md`（`-u TERM -u COLORTERM` まで揃える）
 - **検収の status 読みは `/Applications/tako.app/Contents/MacOS/tako` で叩く**（PATH 先頭の
-  `~/dev/tako/target` の stale ビルドだと新フィールドがキーごと無い = #432 と同じ罠を 8/29 に実演）
+  `~/dev/tako/target` が stale だと新フィールドがキーごと無い = #432 と同じ罠）
+- 作業は**専用 worktree**・main 直 push はしない（docs も PR 経由）
 
-## #1049 / remote を触るときの不変条件
+## 直近の観点
 
-- serve の読み書きは**公開 URL のノードへ解決した handle**（`tailscale::resolve_serve_handle`）を
-  通す（既定探索のままだと二重 tailscaled 環境で**別ノードを読む / 本物を消し残す**）。
-  `--socket` 名指しでも**毎周期ノード名を照合**（ログインし直しで改名される）
-- **応答している相手からは奪い返さない**（生きた別 daemon と :443 を奪い合うと両方が上限まで暴れる）。
-  張り直しは上限 5 回 / 連続 10 回健全で予算回復
-- **daemon 内では起動情報 JSON のあと `println!` / `eprintln!` 禁止**（`spawn_daemon` が pipe を
-  破棄するので EPIPE panic でスレッドが黙って死ぬ = 実測）。記録は `audit_serve` / health ファイルへ。
-  番犬 = `remote_daemon_output_watchdog`
-- whois は系統をまたいでも解決する（同一 tailnet の netmap）= 認証経路は入れ替わりの影響なし。
-  検証は `bash scripts/test-serve-watch.sh`（偽 tailscale + 隔離 state・本番不可侵・37 件）
-
-## A/B の env（同一バイナリで旧挙動へ戻せる・最近の分）
-
-- `TAKO_1002_LEGACY` / `TAKO_1010_LEGACY` / `TAKO_1011_LEGACY`（+ `TAKO_1011_INJECT_LEDGER_GAP`）/
-  `TAKO_1023_LEGACY` / `TAKO_1038_LEGACY`（UDS へ）+ `TAKO_1038_INJECT_UNREACHABLE` /
-  `TAKO_1040_LEGACY` / `TAKO_1042_LEGACY` / `TAKO_1043_LEGACY` / `TAKO_1049_LEGACY`
-  （+ `TAKO_1049_WATCH_SECS`）。それ以前の一覧は progress.md 8/24 以前の各エントリ。
-  **#1063 は env ではなく `__COMPAT_LAYER=DPIUNAWARE`** で非認識にして A/B する（OS の仕掛け）
-
-## Windows 実機まわり（要点。全文は plan の各記録節）
-
-- **#1073 で壁 2 つを潰し両モードとも項目 133 まで到達**（41 = 固定待ち × 側路 2 秒 tick +
-  cwd の区切り / 97・99 = 画面の `tako <sub>` リテラル = #967）。**停止は世代差ではなく
-  起動の仕方の差**で、`TAKO_ISOLATED=1` を落とすと data dir が本番になり項目 41 / 41b
-  （OSC 7 / 133）が走る = 隔離時は skip。A/B は env まで揃える（どちらだったかは
-  skip 行の `script=` が `tako-iso-data-<pid>` かで分かる）。**壁 3 = 133 (d) は製品側 =
-  #1090**（Windows の OpenSSH は ControlMaster 非対応 → exit≠255 で理由が出ず、
-  `getsockname failed` が未分類なので失敗が Opened へ畳まれる。SSH 系の全経路に影響）
-- **`load=unknown` は解消**（境界 `platform::sysload` = B25。Windows は `load=cpu14%/12cpu`）
-- 実機テストのベースラインは
-  **2026-09-02 に取り直して 21 件**（失敗名まで照合。plan「後続 worker への引き継ぎ」節の表。
-  それ以前の「22 件」は `tako-control` が未実行だった頃の値なので当てにしない）
-- **実機 SSH は 9/3 時点で疎通**（`ssh win`）。未着手の実機バグ: #935 / #936 / #970 /
-  #972 / #973 / #974 / **#1090**（Windows の SSH ペインが無言死）/ **#1091**（項目 41 の
-  モード依存）。#967 は #1073 で解消。#971 は #1038 で実装済み・実機実測待ち
-- **#1063（1.22 倍あふれる）は製品の欠陥ではなかった**: 素の `powershell.exe` は DPI 非認識で、
-  `GetWindowRect` は物理 ÷ 倍率・`CopyFromScreen` は物理のまま = スクショがクロップになる。
-  **実機を測るときは `scripts/windows/measure-window.ps1`**（PerMonitorV2 を宣言し検算する）
-- **Windows の `cargo test` は 9/2 まで `tako-control` が 1 件も走っていなかった**（#983 の
-  POSIX 決め打ち）。#1063 の PR で解消。以後スイートを回すときは件数が跳ねることに注意
-- 規約: マトリクスは根拠なしに倒さない（`windows_evidence`・T7 が落とす）/ テストに理由文を
-  直書きしない / 生成 docs は `gen-windows-support-docs.mjs --check` が CI で見る
-
-## 測り方の要点（繰り返し踏む分だけ）
-
-- セルフテストは `-u TERM -u COLORTERM` で起動する（tako のペイン内から起こすと TERM を継承して
-  項目 1b が確定で落ちる）/ `cargo test` には `TAKO_DATA_DIR` を渡す（#944）/
-  隔離インスタンスの kill は **ps でフルパス確認 → 明示 pid**（8/29 に pgrep 先頭撃ちで誤爆した）
-- 合成クリック（System Events）は GPUI に届かない。ドラッグは合成 PlatformInput なら届く（#725 / #1043）
-
-## リモート刷新（エピック #1059）柱 1 の土台
-
-- **#1068 / #1069 実装済み**（`b42abb8` / `ed69192`。ブランチ `feat/1068-1069-remote-control-optin`）。
-  プロファイル `remote_control`（既定 false）で `--remote-control` を渡し、
-  `tako sessions link` / MCP / `/api/agents` / `/api/v2/panes` が公式 URL を 1 実装で返す
-- **不変条件**: 不適格な環境ではフラグを付けない（付けると claude が起動時に落ちる）/
-  証明できるときだけ断る（プラン・ZDR はローカルから分からないので断らない）/
-  URL を捏造しない（connected 以外は url も id も持たない）/ アカウント UUID を保持しない
-- **実測で分かった前提**: `bridge_status` 行は `--remote-control` つきのセッションだけに出る
-  （アカウント既定の自動接続では出ない = `bridge-session` が予備段の主役）。
-  この機の既定アカウントは**自動接続が ON** なので、非 opt-in の worker も connected になりうる
-- 検証の作法: 隔離は `TAKO_ISOLATED=1` + `TAKO_PERSIST=1` + `TAKO_TMUX_SOCKET=<専用>`
-  （`TAKO_ISOLATED` 単独だと `TAKO_PERSIST=0` になり器が無く pane → session 解決が空振りする）。
-  実 URL はハッシュだけで扱う（リポ・ログへ実値を残さない）
+- **セルフテストの待ちを「状態待ち + `state_wait_budget`」へ寄せ切る途中**。#1162（実寸が届く前に
+  fixture を描いていた）→ #1153（4 系統）→ #1165（画面エコー 9 か所）で移送済み。番犬 3 本
+  （固定窓で `dispatch` / 増えた数 / 画面の文字列を待つ形）が再発を落とす。
+  高負荷で落ちる open = #1167 / #995 / #771 / #1122 / #1114。**#1124 は #1153 で系統を
+  根治済み・close 判断だけが残っている**
+- **起動時ロードの予算（#1139）は `tako context-budget` が正**で CI の番犬が落とす。残る超過 4 件は
+  リポ内が `progress.md` の 1 エントリ長（28 行 > 3。**書くときに守る** = 自動修正の対象外）、
+  あとはリポ外の個人環境ファイル 3 つ（master system prompt の `append` = `local-rules.md`
+  10.9 KB → **分離はユーザー相談が必要** / `handoff/default.md` 374 行 / `~/.claude/CLAUDE.md`）
+- **Windows 実機**: 隔離 GUI セルフテストは #1127 で**初完走**（ただし `editbin /STACK` の迂回つき）。
+  素のビルドで完走するための残ブロッカーは **#1133 のみ**（項目 80 でスタックオーバーフロー）。
+  実機で残る open = #1137 / #1114（間欠失敗）/ #971（#1038 で実装済み・実機実測待ち）。
+  Windows 全体は #467 配下。実測・A/B・引き継ぎ表は plan（下記）
+- **リモート刷新（エピック #1059）は分割 A〜H が全部 main に着地**。残りはユーザーの実機スマホ
+  確認だけ（①「Claude で開く」→ アプリ ②「+ master」でタブ + 起動 ③ファイルの閲覧・編集・保存
+  ④SSH の切り替え / 新規接続）。Windows のファイル API（daemon → app の IPC が unix 実装のみ）は
+  Windows 系の残バグとして別扱い
 
 ## 次の一手
 
-- **GUI 再起動で全反映 → ユーザー目視**（#1009 / #1043 の close 判断・#1042 は報告者確認待ち）
-- **#1041**（リモートフォルダを開いたらツリー先頭 + ターミナル自動 SSH）が着手可能（#1040 着地済み）
-- #975 残: #986（worker MCP）→ #987〜#992。open バグ #1013 / #1015 / #1021 / #1022 / #1030 /
+- **#1167**（tako-control の「追記ぶんだけ読む」が高負荷で落ちる）着手中
+- 残るフレーク #995 / #771 / #1122 を #1153 と同じ形（状態待ち + 番犬）へ寄せる
+- #1059 / #1081 はユーザー確認が済んだら close する
+- #975 残: #986（worker から MCP）→ #987〜#992。open バグ #1013 / #1015 / #1022 / #1030 /
   #1033 / #1034 / #1035
-- #1001 残: C2 / C3 / C6 / C7（main.rs 直列群・1 本ずつ）・C5 / C8〜C10（調査系）
-- #1007 IDE 化: S0 の一部（#1016）済み → S1（LSP 基盤）。正本 = research/2026-08-28-ide-editor-report.md
-- リモート大刷新エピック（ユーザー意向）: リモート側セッション永続等。#1038 GUI 構成の通し検証と
-  合わせて設計 Issue を master が提案予定
+- #1001 残: C2 / C3 / C6 / C7（`main.rs` 直列群・1 本ずつ）・C4（#1012 の無限 `repeat()` 3 件）・
+  C5 / C8〜C10（調査系）
+- #1007 IDE 化: S0 の一部（#1016）済み → S1（LSP 基盤）
 
 ## 現フェーズで Read すべき設計書
 
-- `.agent/plans/2026-08-remote-folder.md`（SSH / リモートの設計・実測・罠。#1040 の §17 含む）
-- `research/2026-08-28-ide-editor-report.md`（#1007 着手時）+ `research/2026-08-28-perf-profile-report.md`（#1001 着手時）
-- `crates/tako-core/src/platform/support.rs`（対応マトリクスの正本。判定を触るなら必ず読む）
+- セルフテストの待ち条件・番犬を触る: `.agent/conventions.md`「セルフテストの待ち条件の書き方」節
+- Windows 実機: `.agent/plans/2026-08-windows-main-merge-wip.md`（ベースラインは 2026-09-02 に
+  取り直した表・#1063 の DPI・#1091 / #935 / #936 / #1102 / #1127 の記録・`editbin` の迂回）
+- SSH / リモート: `.agent/plans/2026-08-remote-folder.md`（#1040 / #1041 と A/B の env）+
+  `.agent/plans/tako-remote-plan.md`（§10 = `remote serve` の不変条件）+
+  `research/2026-09-01-remote-renewal-claude-official.md`（#1059）
+- 動画・仮想ディスプレイ収録: `.agent/plans/2026-09-youtube-explainer.md`
+- #1007 着手時 = `<data_dir>/orchestrator/research/2026-08-28-ide-editor-report.md` /
+  #1001 着手時 = 同 `2026-08-28-perf-profile-report.md`（どちらもリポ外）
+- 対応マトリクスの判定を触るなら `crates/tako-core/src/platform/support.rs`
