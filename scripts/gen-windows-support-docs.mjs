@@ -47,6 +47,7 @@ const CATEGORIES = [
   ['AI 連携（オーケストレーション）', [
     'tako_orchestrator_spawn', 'tako_orchestrator_self', 'tako_orchestrator_handoff',
     'tako_orchestrator_handoffs', 'tako_orchestrator_profiles',
+    'tako_orchestrator_guide',
     'tako_orchestrator_projects', 'tako_orchestrator_accounts',
     'tako_orchestrator_layout', 'tako_orchestrator_workers',
     'tako_orchestrator_worker_status', 'tako_orchestrator_respond',
