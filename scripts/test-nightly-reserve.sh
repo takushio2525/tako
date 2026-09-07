@@ -153,8 +153,10 @@ make_env() {
   # cargo は ~/.cargo/bin にしか無いので HOME を差し替えると見えなくなる
   # （dry-run 経路は cargo を実行しない。実走経路でも Cargo.lock は既にあるので no-op でよい）。
   # osascript は /usr/bin より前に来るので、これで通知が出なくなる
+  # gh も塞ぐ（release.sh がスタブなので実際には使われないが、前提チェックの
+  # `command -v gh` が通らない環境でテストが落ちるのを防ぐ = ランナーに依存しない）
   local stub
-  for stub in cargo osascript; do
+  for stub in cargo osascript gh; do
     printf '#!/bin/sh\nexit 0\n' > "$dir/home/.local/bin/$stub"
     chmod +x "$dir/home/.local/bin/$stub"
   done
