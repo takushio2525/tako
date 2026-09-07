@@ -52674,6 +52674,19 @@ mod self_test {
                         "101c-CLAUDE: closed={closed} saw_marker={saw_marker} \
                          saw_done={saw_done} prompt_flow={prompt_flow}"
                     );
+                    // 判定根拠の画面証跡（成否に関わらず。項目 45c の `45c-SCREEN` と同型）。
+                    // `saw_marker=false` の切り分けには**後任が何を出したか**が要る:
+                    // 画面に出ていないのか、出たが読めていないのかは、これが無いと
+                    // 実機の再現待ちになる（#771 で 1 回ぶん無駄にした）
+                    let _ = window.update(cx, |app, _, _| {
+                        if let Some(session) = app.terminals.get(&new_pane) {
+                            for l in session.visible_lines() {
+                                if !l.trim().is_empty() {
+                                    println!("101c-SCREEN: {l}");
+                                }
+                            }
+                        }
+                    });
                     // **`saw_marker` を必須にする**: これが後任へプロンプトが実際に届いた
                     // 唯一の証拠。届かないまま closed になったら、それは後任の仕事ではなく
                     // 前任ペインが別の理由で消えただけ（実測で踏んだ偽陽性。#749）
