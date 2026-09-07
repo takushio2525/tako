@@ -27,6 +27,13 @@ TSV=${TAKO_PROMO_TIMELINE:-"$SCRIPT_DIR/explainer-timeline.tsv"}
 SCENES_DIR="$PROMO_OUT/scenes"
 NARR_DIR="$PROMO_OUT/audio/narr"
 BGM="$PROMO_OUT/audio/bgm-explainer.wav"
+# ナレーションの声のクレジット（VOICEVOX 利用規約）。エンジンが応答すればそこから引き、
+# 応答しなければ環境変数の値を使う（合成済みの wav から再合成せずに組めるようにする）。
+# say バックエンドで作った音声にはクレジット義務が無いので TAKO_PROMO_VOICE_CREDIT= で空にする。
+VOICE_CREDIT=${TAKO_PROMO_VOICE_CREDIT-$(
+    /usr/bin/env python3 "$SCRIPT_DIR/voicevox-synth.py" --print-credit 2>/dev/null || true
+)}
+# BGM は make-bgm.py が波形から合成した自作音源（外部素材ではないのでクレジット不要）
 WORK=/private/tmp/tako-promo-explainer-build
 W=1920; H=1080; FPS=30
 PAD_AFTER_SPEECH=${TAKO_PROMO_PAD:-0.8}
@@ -69,8 +76,14 @@ while IFS=$'\t' read -r id kind source anchor offset min_dur caption subtitle sp
     case "$kind" in
     card)
         png="$WORK/$id-card.png"
-        "$TITLE_BIN" "$png" "$W" "$H" "$caption" "$subtitle" "$source" \
-            "github.com/takushio2525/tako  /  tako-docs.pages.dev"
+        # 末尾カードだけは脚注に音声素材のクレジットを載せる。VOICEVOX の利用規約は
+        # 生成音声の公開に話者クレジットの表示を求めるので、ここと説明文の 2 か所に置く
+        # （表記はエンジンから引いた値。narrate.sh / voicevox-synth.py と同じ 1 実装）。
+        card_footer="github.com/takushio2525/tako  /  tako-docs.pages.dev"
+        if [ "$id" = "outro_card" ] && [ -n "$VOICE_CREDIT" ]; then
+            card_footer="${card_footer}    音声: ${VOICE_CREDIT}"
+        fi
+        "$TITLE_BIN" "$png" "$W" "$H" "$caption" "$subtitle" "$source" "$card_footer"
         ffmpeg -nostdin -v error -y -loop 1 -framerate "$FPS" -t "$dur" -i "$png" \
             -vf "format=yuv420p,fade=t=in:st=0:d=0.5,fade=t=out:st=${fo_start}:d=0.6" \
             -c:v libx264 -preset medium -crf 18 -pix_fmt yuv420p -r "$FPS" "$seg"
@@ -140,21 +153,61 @@ for i in "${!ids[@]}"; do
     mix+="[n$n]"; n=$((n + 1))
 done
 [ "$n" -gt 0 ] || { echo "ERROR: ナレーション wav が 1 つも無い" >&2; exit 1; }
-# say の出力はピークが -13dB 程度と小さい（実測）ので +7dB 持ち上げる（クリップは limiter で防ぐ）
-printf '%samix=inputs=%d:normalize=0:dropout_transition=0,volume=3.0,alimiter=limit=0.95,apad=whole_dur=%s[narr];\n' "$mix" "$n" "$VDUR" >> "$fc"
-narr_only="$WORK/narr.wav"
-ffmpeg -nostdin -v error -y "${inputs[@]}" -filter_complex_script "$fc" -map "[narr]" -t "$VDUR" -ar 48000 -ac 2 "$narr_only"
+# ナレーションのバスを目標ラウドネスへそろえる。**固定ゲインで持ち上げてはいけない**:
+# 声を替えるとクレストファクタが変わるので、同じピークにそろえてもラウドネスは一致しない
+# （実測: ピーク -12.3dB で say は -25.3 LUFS・VOICEVOX/ずんだもんは -31.9 LUFS = 6.6dB 差）。
+# 固定の +9.5dB は say 専用の値で、そのまま VOICEVOX に当てると最終段のリミッタが
+# 振り切れて 0.0dBFS まで潰れた（実測）。測ってから当てれば、どの声でも同じ音量で出る。
+printf '%samix=inputs=%d:normalize=0:dropout_transition=0,apad=whole_dur=%s[narr];\n' "$mix" "$n" "$VDUR" >> "$fc"
+narr_flat="$WORK/narr-flat.wav"
+ffmpeg -nostdin -v error -y "${inputs[@]}" -filter_complex_script "$fc" -map "[narr]" -t "$VDUR" -ar 48000 -ac 2 "$narr_flat"
 
+# 目標値は v2（say）の設計値そのまま。BGM を敷いたあと最終段で -14 LUFS へ寄せるので、
+# ここを動かすと BGM とナレーションの相対バランスが変わる
+NARR_LUFS=${TAKO_PROMO_NARR_LUFS:--15.8}
+narr_i=$(ffmpeg -nostdin -hide_banner -i "$narr_flat" -af ebur128=framelog=quiet -f null - 2>&1 \
+    | sed -n 's/^ *I: *\(-*[0-9.]*\) LUFS.*/\1/p' | tail -1)
+narr_only="$WORK/narr.wav"
+if [ -n "$narr_i" ]; then
+    narr_gain=$(/usr/bin/python3 -c "print(f'{${NARR_LUFS} - (${narr_i}):.2f}')")
+    echo "   ナレーション: ${narr_i} LUFS → ${NARR_LUFS} LUFS（${narr_gain}dB）"
+    ffmpeg -nostdin -v error -y -i "$narr_flat" \
+        -af "volume=${narr_gain}dB,alimiter=limit=0.95:level=disabled" -ar 48000 -ac 2 "$narr_only"
+else
+    echo "!! ナレーションのラウドネスを測れなかった。ゲイン調整なしで進む" >&2
+    cp "$narr_flat" "$narr_only"
+fi
+
+mixwav="$WORK/mix.wav"
 if [ -f "$BGM" ]; then
     fade_start=$(/usr/bin/python3 -c "print(max(0.0, $VDUR - 3.0))")
     # BGM は薄く（-16dB 相当）。ナレーション中はさらに sidechain で下げる
-    ffmpeg -nostdin -v error -y -i "$video" -i "$narr_only" -stream_loop -1 -i "$BGM" \
-        -filter_complex "[2:a]atrim=0:${VDUR},asetpts=PTS-STARTPTS,volume=0.26,afade=t=in:st=0:d=2,afade=t=out:st=${fade_start}:d=3[bgm];[bgm][1:a]sidechaincompress=threshold=0.015:ratio=8:attack=40:release=700:makeup=1[duck];[1:a][duck]amix=inputs=2:normalize=0:dropout_transition=0[a]" \
-        -map 0:v -map "[a]" -c:v copy -c:a aac -ar 48000 -b:a 192k -movflags +faststart -shortest "$OUT"
+    ffmpeg -nostdin -v error -y -i "$narr_only" -stream_loop -1 -i "$BGM" \
+        -filter_complex "[1:a]atrim=0:${VDUR},asetpts=PTS-STARTPTS,volume=0.26,afade=t=in:st=0:d=2,afade=t=out:st=${fade_start}:d=3[bgm];[bgm][0:a]sidechaincompress=threshold=0.015:ratio=8:attack=40:release=700:makeup=1[duck];[0:a][duck]amix=inputs=2:normalize=0:dropout_transition=0[a]" \
+        -map "[a]" -t "$VDUR" -ar 48000 -ac 2 "$mixwav"
 else
     echo "!! BGM が無い（${BGM}）。ナレーションのみで書き出す" >&2
-    ffmpeg -nostdin -v error -y -i "$video" -i "$narr_only" -map 0:v -map 1:a -c:v copy -c:a aac -ar 48000 -b:a 192k -movflags +faststart -shortest "$OUT"
+    cp "$narr_only" "$mixwav"
 fi
+
+# ── ラウドネスを YouTube の基準（-14 LUFS）へそろえる ─────────────────
+# 測ってから固定ゲインを 1 回かける方式（loudnorm の 1 パスは音楽の下でポンプするため使わない）。
+# 目標を外れて突き上がるピークは alimiter で止める（AAC のオーバーシュートぶんを見て -2dBFS で止める）。
+# **level=disabled が必須**: alimiter の自動レベルは既定 true で、リミットしたあと
+# 0dB へ戻すので limit の指定が無かったことになる（実測: limit=0.84 でも true peak +0.6dBFS）。
+LUFS_TARGET=${TAKO_PROMO_LUFS:--14.0}
+measured_i=$(ffmpeg -nostdin -hide_banner -i "$mixwav" -af ebur128=framelog=quiet -f null - 2>&1 \
+    | sed -n 's/^ *I: *\(-*[0-9.]*\) LUFS.*/\1/p' | tail -1)
+if [ -n "$measured_i" ]; then
+    gain=$(/usr/bin/python3 -c "print(f'{${LUFS_TARGET} - (${measured_i}):.2f}')")
+    echo "   ラウドネス: ${measured_i} LUFS → ${LUFS_TARGET} LUFS（${gain}dB）"
+    afilter="volume=${gain}dB,alimiter=limit=0.79:level=disabled"
+else
+    echo "!! ラウドネスを測れなかった。ゲイン調整なしで書き出す" >&2
+    afilter="anull"
+fi
+ffmpeg -nostdin -v error -y -i "$video" -i "$mixwav" -filter_complex "[1:a]${afilter}[a]" \
+    -map 0:v -map "[a]" -c:v copy -c:a aac -ar 48000 -b:a 192k -movflags +faststart -shortest "$OUT"
 
 # 章のタイムスタンプ（YouTube 説明文用）を区間表から出す
 chap="$WORK/chapters.txt"; : > "$chap"
