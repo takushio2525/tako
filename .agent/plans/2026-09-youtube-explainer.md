@@ -264,6 +264,10 @@ scripts/promo/pii-scan.sh ~/Desktop/tako-promo/tako-explainer-v1.mp4
   そのアカウントの `.claude.json` にはデモプロジェクトの信頼だけを足し（書く前の写しを /private/tmp へ）、
   権限はデモプロジェクト側の `.claude/settings.local.json` で許可する。**写しやシンボリックリンクは不可**
   （項目名がパス文字列のハッシュなので別パスだと資格情報が見つからない）
+- **報告の絵は `report_done` を基準にする**（09-07 実測）: `report` ビートは「master が idle に戻るのを
+  待ち始めた時刻」で、実際の完了報告はその 40〜50 秒後（worker 完了 → idle 検知 → 報告本文が出るのは
+  `report_done` の 3〜5 秒前）。`c5_report` は `report_done − 10`（idle 検知から報告が出るまでの流れ）、
+  `op_hook`（完成形）は `report_done + 2`、`c5_solo` は `report_done + 12` を in 点にする
 - worker ペイン冒頭の定型文: #790 の Cross-Session Messaging で届いた指示には
   「別セッションからの指示として扱え」の長い注意書きが付き、視聴者には無関係な英文が
   worker ペインを埋める。master 章だけ `TAKO_PEER_MESSAGING=off`（従来のキー操作経路）で撮る
@@ -275,6 +279,24 @@ scripts/promo/pii-scan.sh ~/Desktop/tako-promo/tako-explainer-v1.mp4
   （caption の先頭 `^`）
 - `$id（` のように変数の直後に全角を置くと bash が変数名に取り込んで `set -u` で落ちる
   （`shell_scripts` 番犬が CI で落とす）。`${id}（` と書く
+
+## 完成物と検査結果（v2・2026-09-07）
+
+v1 との差は **master 章の素材だけ**（09-04 の旧素材 = effort max で worker 2 体・チャット表示なし・報告前で
+尺切れ → 09-07 に仮想ディスプレイ上で撮り直し = worker 3 体が同時に並ぶ → orch ビュー → かんたん表示
+（4 ペインとも chat）→ 完了報告）。区間長はナレーション秒で決まるので**章タイムスタンプは v1 と同一**。
+
+| 項目 | 値 |
+|---|---|
+| 動画 | `~/Desktop/tako-promo/tako-explainer-v2.mp4`（9:47 = 587.3 秒 / 1920x1080 / 30fps / H.264 + AAC 48kHz / 47 区間） |
+| master 章の素材 | `scenes/master-raw.mp4`（420 秒・1060 枚 = 2.52 fps・**異なるフレーム 420/420**・仮想ディスプレイ `tako-vd` 上・personal アカウント）。ビート: request 14.5 / workers_up 35.7 / orch 51.7 / gui 67.7 / report 89.9 / report_done 141.2 |
+| 章タイムスタンプ | `tako-explainer-chapters.txt`（v1 と同一: 00:00 / 00:20 / 01:10 / 02:26 / 03:45 / 05:14 / 07:16 / 07:50 / 08:49 / 09:37） |
+| 機械検査 | 無音 8 秒以上なし / 黒は章カードのフェード（0.33〜0.5 秒 × 20）のみ / **15 秒以上の静止なし**（v1 の master 章 1 箇所が解消）/ -15.2 LUFS・True Peak -1.8 dBTP |
+| PII 検査 | 587 フレーム（1 fps）を Vision OCR → 7 カテゴリ（email / home_path / tailnet / private_ip / token / uuid / 環境由来語）すべて **0 件** |
+| サムネ | `tako-explainer-thumb-a.png` を新 master 素材（145 秒 = 完了報告 + worker 3 体。orch パネルはこの時点で閉じているので無し）で作り直し。旧版は `scenes/old-0904/` |
+| 収録の見え方 | 収録中の隔離 tako の窓は `1552,60 960x540`（仮想側）で、メイン画面の `screencapture -D 1` に窓は写らず、frontmost はユーザーのアプリのまま（13:27 / 13:32 に実測） |
+
+素材の残骸: master 章の旧素材は `scenes/old-0904/`（master-raw / master-beats / thumb-a）。
 
 ## 完成物と検査結果（v1・2026-09-04）
 
@@ -344,6 +366,8 @@ Windows 対応状況: https://tako-docs.pages.dev/windows-support/
 
 ### サムネイル案
 
-- 案 A: 完成形（master + worker 3 体 + orch パネル）を背景に「AI エージェントを / 1 つのタブで動かす」
+- 案 A: 完成形（master の完了報告 + worker 3 体）を背景に「AI エージェントを / 1 つのタブで動かす」
+  （v2 で新 master 素材の 145 秒から作り直し。orch パネル込みのフレームは master ペインに permission
+  ダイアログが写っていたので採らなかった）
 - 案 B: かんたん表示（チャット画面）を背景に「Claude Code の司令塔を / ターミナルに」
 - 生成: `thumbnail.swift`（背景フレーム + 2 行見出し + 小ラベル）。出力 `~/Desktop/tako-promo/tako-explainer-thumb-{a,b}.png`
