@@ -176,9 +176,13 @@ scripts/promo/pii-scan.sh ~/Desktop/tako-promo/tako-explainer-v1.mp4
 セルフテスト・GUI 検証・収録の隔離 tako はすべてこの画面へ出す。**常設なので作業後に削除・切断しない**。
 
 - 器は **BetterDisplay**（`/Applications/BetterDisplay.app`・4.3.5。仮想スクリーンの作成・接続に
-  Pro は要らない = `get -proAvailable` が off の機で実測）。名前は **`tako-vd`**（16:9・HiDPI・
-  serial 1081）。`lib.sh` の `promo_stage_prepare` が無ければ作り、切れていれば繋ぐ（冪等）。
-  接続後の実測: CG displayID 13・配置 `1512,0`・2560x1440pt = **5120x2880px**（メイン 1512x982pt の右隣）
+  Pro は要らない = `get -proAvailable` が off の機で実測）。名前は **`tako-vd`**（16:9・HiDPI）。
+  **器の扱い（作る・繋ぐ・増殖の検査・Main を仮想にしない）の正本は全プロジェクト共通の
+  `scripts/lib/virtual-display.sh`**（#1141 / #1150。`ensure` / `bounds` / `status` / `move-window`）で、
+  `lib.sh` の `promo_stage_prepare` はそれを呼んでから収録固有の仕事（HiDPI の確認・窓の置き場所・
+  窓がその中にあることの検査）だけをする。接続後の実測: 配置 `1512,0`・2560x1440pt =
+  **5120x2880px**（メイン 1512x982pt の右隣）。displayID は器の再起動で変わる（13 → 17 を実測）ので
+  控えず、毎回名前から解く
 - 窓の置き方: `layout.json` の `window` を仮想ディスプレイの中の座標で seed するだけで
   **起動の瞬間からそこに出る**（GPUI は `window.x/y` を CG のグローバル座標として
   メインスクリーンの高さで y を反転し Cocoa 座標へ直す = `gpui_macos/src/window.rs`）。

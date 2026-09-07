@@ -631,114 +631,35 @@ promo_tl_field() { [ "$1" = "-" ] && printf '' || printf '%s' "$1"; }
 #                    ユーザーの作業を邪魔するので A/B 用にだけ残す
 PROMO_STAGE=${TAKO_PROMO_STAGE:-virtual}
 PROMO_VD_NAME=${TAKO_PROMO_VD_NAME:-tako-vd}
-PROMO_BD_APP=/Applications/BetterDisplay.app
-PROMO_BD_BIN="$PROMO_BD_APP/Contents/MacOS/BetterDisplay"
 # 窓を仮想ディスプレイの左上からこれだけ内側へ置く（座標はポイント）
 PROMO_VD_PAD_X=${TAKO_PROMO_VD_PAD_X:-40}
 PROMO_VD_PAD_Y=${TAKO_PROMO_VD_PAD_Y:-60}
 PROMO_VD_READY=""
 
-# BetterDisplay の CLI（= アプリ本体を引数つきで起こす薄いクライアント。betterdisplaycli と同じ）。
-# 実測（4.3.5）: ①アプリが起動していないと応答せず固まる → alarm で切る
-# ②応答文は当てにならない（`set -connected=on` が「Failed.」と言いながら接続される /
-#   何も出さずに成功する）→ 結果は必ず CG のディスプレイ一覧（$PROMO_DISPLAYS）で確かめる
-# ③仮想スクリーンの tagID は操作のたびに並べ替わる → 使う直前に引き直す
-# ④`-name=` 指定の `set -connected=on` は複数のオブジェクトに当たり、同じ画面が 5 枚繋がった
-#   → 接続は tagID 指定で 1 回だけ
-# ⑤仮想スクリーンの作成・接続に Pro は要らない（`get -proAvailable` = off の機で実測）
-promo_bd() {
-    perl -e 'alarm 25; exec @ARGV' "$PROMO_BD_BIN" "$@" 2>/dev/null
-}
-
-# 仮想スクリーンの一覧（tagID<TAB>displayID<TAB>serial<TAB>name）
-promo_bd_virtual_screens() {
-    promo_bd get -identifiers | /usr/bin/python3 -c '
-import sys, json
-raw = sys.stdin.read().strip()
-try:
-    data = json.loads("[" + raw + "]")
-except Exception:
-    sys.exit(0)
-for d in data:
-    if d.get("deviceType") == "VirtualScreen":
-        print("\t".join(str(d.get(k, "")) for k in ("tagID", "displayID", "serial", "name")))
-'
-}
-
-promo_bd_vd_row() {
-    promo_bd_virtual_screens | awk -F'\t' -v n="$PROMO_VD_NAME" '$4==n {print; exit}'
-}
-
-# BetterDisplay を（未起動なら）起こして CLI が応答するまで待つ
-promo_bd_ensure_running() {
-    [ -x "$PROMO_BD_BIN" ] || {
-        echo "ERROR: BetterDisplay が無い（${PROMO_BD_APP}）。brew install --cask betterdisplay" >&2
-        return 1
-    }
-    if ! pgrep -x BetterDisplay >/dev/null 2>&1; then
-        echo "   BetterDisplay を起動します（仮想ディスプレイの器）"
-        open -g -a "$PROMO_BD_APP" || return 1
-    fi
-    local i
-    for i in $(seq 1 30); do
-        promo_bd get -identifiers | grep -q deviceType && return 0
-        sleep 1
-    done
-    echo "ERROR: BetterDisplay の CLI が応答しない（メニューバーにアイコンが出ているか確認）" >&2
-    return 1
-}
-
-# 仮想スクリーン $PROMO_VD_NAME が**いま繋がっている** CG のディスプレイ行を出す（繋がっていなければ 1）。
-# 繋がっているかは identifiers の `displayID`（未接続は "0"）で見る。`get -connected` は接続中でも
-# off を返すことがあり（実測）当てにならない。displayID が引けないときは BetterDisplay の配置
-# （"XxY"）と解像度（"WxH"）で CG の行を照合する
-promo_vd_cg_line() {
-    local row did tag place res
-    row=$(promo_bd_vd_row); [ -n "$row" ] || return 1
-    tag=$(printf '%s' "$row" | cut -f1); did=$(printf '%s' "$row" | cut -f2)
-    if [ -n "$did" ] && [ "$did" != 0 ]; then
-        "$PROMO_DISPLAYS" | awk -v d="$did" '$1==d {print; found=1; exit} END {exit found ? 0 : 1}' && return 0
-    fi
-    place=$(promo_bd get "-tagID=$tag" -placement); res=$(promo_bd get "-tagID=$tag" -resolution)
-    case "$place" in *x*) ;; *) return 1 ;; esac
-    "$PROMO_DISPLAYS" | awk -v x="${place%x*}" -v y="${place#*x}" -v w="${res%x*}" -v h="${res#*x}" \
-        '$2==x && $3==y && $4==w && $5==h {print; found=1; exit} END {exit found ? 0 : 1}'
+# 器（BetterDisplay）の扱いは全プロジェクト共通の `scripts/lib/virtual-display.sh`（#1141 / #1150）
+# に任せる: 無ければ作る・切れていれば繋ぐ・同名の増殖を検査する・Main を仮想にしたままにしない。
+# BetterDisplay CLI の癖（応答文が当てにならない / tagID が並べ替わる / `-name=` 指定で同じ画面が
+# 何枚も繋がる 等）もそちらに集約してある。ここでは「面が用意できた」あとの収録固有の仕事
+# （HiDPI の確認・窓の置き場所・窓がその中にあることの検査）だけを持つ
+PROMO_VD_LIB="$PROMO_LIB_DIR/../lib/virtual-display.sh"
+promo_vd_lib() {
+    TAKO_VD_NAME="$PROMO_VD_NAME" bash "$PROMO_VD_LIB" "$@"
 }
 
 # 常設の仮想ディスプレイ $PROMO_VD_NAME を使える状態にし、矩形を PROMO_VD_ID / _X / _Y / _W / _H へ
-# 入れる。窓の seed 位置（TAKO_PROMO_WIN_X / _Y）が未指定ならこの画面の左上 + 余白にする。
+# 入れる。窓の seed 位置（TAKO_PROMO_WIN_X / _Y）が未指定なら他の窓と重ならない空きにする。
 # 2 回目以降は何もしない（1 プロセス内で冪等）
 promo_vd_prepare() {
     [ -z "$PROMO_VD_READY" ] || return 0
-    promo_bd_ensure_running || return 1
-    local row tag i
-    row=$(promo_bd_vd_row)
-    if [ -z "$row" ]; then
-        echo "   仮想スクリーン ${PROMO_VD_NAME} を作成（16:9 / HiDPI・常設）"
-        promo_bd create -type=VirtualScreen "-virtualScreenName=$PROMO_VD_NAME" \
-            -aspectWidth=16 -aspectHeight=9 -virtualScreenHiDPI=on -virtualScreenSerial=1081 >/dev/null || true
-        for i in $(seq 1 10); do
-            row=$(promo_bd_vd_row); [ -n "$row" ] && break; sleep 1
-        done
-        [ -n "$row" ] || {
-            echo "ERROR: 仮想スクリーン ${PROMO_VD_NAME} を作れない（BetterDisplay の Virtual screens で手動作成する）" >&2
-            return 1
-        }
-    fi
-    tag=$(printf '%s' "$row" | cut -f1)
-    local line=""
-    if ! line=$(promo_vd_cg_line); then
-        echo "   仮想スクリーン ${PROMO_VD_NAME} を接続"
-        # tagID 指定で 1 回だけ。繋がっているのに重ねて set すると同じ画面が増えうるので、
-        # 「CG に居ない」ことを確かめてからしか打たない
-        promo_bd set "-tagID=$tag" -connected=on >/dev/null || true
-        for i in $(seq 1 20); do
-            line=$(promo_vd_cg_line) && break
-            line=""; sleep 1
-        done
-    fi
-    [ -n "$line" ] || {
-        echo "ERROR: 仮想ディスプレイ ${PROMO_VD_NAME} が CG のディスプレイ一覧に現れない" >&2
+    [ -f "$PROMO_VD_LIB" ] || { echo "ERROR: ${PROMO_VD_LIB} が無い" >&2; return 1; }
+    promo_vd_lib ensure || return 1
+    local bounds line
+    bounds=$(promo_vd_lib bounds) || return 1
+    # 同じ矩形の行を CG の一覧から引き、displayID と実ピクセル（HiDPI 判定）を得る
+    line=$("$PROMO_DISPLAYS" | awk -v x="${bounds%% *}" -v r="$bounds" '
+        { if (($2 " " $3 " " $4 " " $5) == r) { print; found = 1; exit } }
+        END { exit found ? 0 : 1 }') || {
+        echo "ERROR: 仮想ディスプレイ ${PROMO_VD_NAME}（${bounds}）が CG のディスプレイ一覧と一致しない" >&2
         return 1
     }
     read -r PROMO_VD_ID PROMO_VD_X PROMO_VD_Y PROMO_VD_W PROMO_VD_H PROMO_VD_PXW _ _ <<<"$line"
