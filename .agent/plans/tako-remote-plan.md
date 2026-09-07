@@ -299,3 +299,19 @@ Geist / Geist Mono。**フォントは自己ホスト**（Google Fonts 参照禁
 - **残存リスク**: 弾 0 の結果次第で Tailscale 前提が崩れる可能性（そのための関門設計）。
   Mac 側承認ダイアログは GPUI 実装のため弾 4 は tako-app にも手が入る（工数大だが直列なので許容）
 - **判定**: 抜け・矛盾なし。弾 0 + 弾 1 から着手可
+
+## 10. `tako remote serve` を触るときの不変条件（#1049。2026-08-29）
+
+`.agent/activeContext.md` から移した節（#1139 の起動時ロード予算に収めるため）。
+
+- serve の読み書きは**公開 URL のノードへ解決した handle**（`tailscale::resolve_serve_handle`）を
+  通す（既定探索のままだと二重 tailscaled 環境で**別ノードを読む / 本物を消し残す**）。
+  `--socket` を名指ししていても**毎周期ノード名を照合する**（ログインし直しで改名される）
+- **応答している相手からは奪い返さない**（生きた別 daemon と :443 を奪い合うと両方が上限まで
+  暴れる）。張り直しは上限 5 回・連続 10 回健全で予算回復
+- **daemon 内では起動情報 JSON のあとに `println!` / `eprintln!` を書かない**（`spawn_daemon` が
+  pipe を破棄するので EPIPE panic でスレッドが黙って死ぬ = 実測）。記録は `audit_serve` と
+  health ファイルへ出す。番犬 = `remote_daemon_output_watchdog`
+- whois は系統をまたいでも解決する（同一 tailnet の netmap）ので、**認証経路は tailscaled の
+  入れ替わりの影響を受けない**
+- 検証は `bash scripts/test-serve-watch.sh`（偽 tailscale + 隔離 state・本番不可侵・37 件）

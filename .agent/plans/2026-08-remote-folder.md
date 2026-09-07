@@ -796,3 +796,17 @@ Mac からのログインは `%ProgramData%\ssh\administrators_authorized_keys` 
 5. `~/.ssh/config` に `Host <名前> / HostName localhost / IdentityFile … / IdentitiesOnly yes`
 
 **検証が終わったら追記した 1 行と鍵・config・known_hosts を消す**。
+
+## A/B の env（同一バイナリで旧挙動へ戻す）
+
+`.agent/activeContext.md` から移した一覧（#1139 の起動時ロード予算に収めるため）。
+SSH / リモート系のうち、他の `.agent/*.md` に記録が無いものだけを置く。
+
+- `TAKO_1010_LEGACY=1` — SSH / リモートファイルの進行状況表示を入れる前へ戻す
+  （スピナー無し + 取得を UI スレッドで同期実行する旧挙動。#1010。`sidebar.rs`）
+- `TAKO_1023_LEGACY=1` — ファイルメニュー経路の SSH ペインの**後始末をしない**旧挙動へ戻す
+  （#1023。`main.rs`）
+
+`TAKO_1040_LEGACY`（本ファイル §17）/ `TAKO_1049_LEGACY` + `TAKO_1049_WATCH_SECS`
+（`.agent/commands.md`）/ `TAKO_1038_LEGACY` + `TAKO_1038_INJECT_UNREACHABLE`
+（`.agent/architecture.md`）は別の場所に記録がある。
