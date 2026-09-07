@@ -19,36 +19,6 @@
 
 ---
 
-## 2026-09-03（#1093: 組織クレジット上限の見出しを検知できず自動復帰が発火しない問題を根治）
-- 症状は「解除後 1 時間以上 worker 3 体が止まったまま `supervisor.log` に記録ゼロ」。原因は
-  **停止判定の文言が `hit your usage limit` 決め打ち**で、実際の見出し
-  `You've hit your session limit · resets 7:50pm (Asia/Tokyo)` に 1 文字も当たらないこと。
-  **Issue の推定と違い解除時刻パースは無罪**（既存の `resets ` アンカーで 19:50 を正しく読む =
-  診断テストで実測）。壊れていたのは検知だけ
-- 直し方は 1 文言の追加ではなく**テンプレートを規則にした**: claude 2.1.258 のバイナリから
-  見出しの組み立て（`` `You've hit your ${限度の名前}${理由}` ``）と限度名の表（`nF` =
-  `session limit` / `weekly limit` / `Opus limit` / `Sonnet limit` / `Fable limit` /
-  `usage credit limit` + 各種 spend limit + `usage limit` / `limit`）を採り、
-  **すべて `limit` で終わる**ことを使って `hit your` の直後（句読点の手前）に `limit` が
-  在るかで判定する。版で名前が増えても追従する。正本は
-  `tako_core::limit_resume::is_limit_exhausted_line` の 1 箇所で、`detect_worker_error` と
-  ステータスバーの両方がここを通る（判定が散ると「復帰は動いたのにメーターは `--`」が再発する）
-- **ステータスバーの `--` も同時に解消**: 上限中はフッターが `5h NN%` を出さないので、
-  見出しから枠を読んで（`session limit` → 5h / `weekly` ・ `Opus` ・ `Sonnet` → 7d）
-  100% を埋める。**フッターに数値があれば実データが勝ち**、枠へ対応づけられない上限
-  （`usage credit limit` / spend limit）は `--` のまま（メーターに嘘を書かない）。
-  走査窓を別に持つ理由は実測の幾何（フッター 6 行 + 入力欄 3 行 + 空行 = 見出しは 10〜15 行上。
-  本体の 8 行窓では届かない）
-- 検証: fmt / clippy（両 feature）/ `cargo test --workspace` 全緑 / Windows クロスチェック
-  エラー 0・警告 12（**全件が未変更ファイル由来** = ベースライン同数）/ 隔離セルフテスト
-  `TAKO_APP_SELF_TEST_OK`（項目 111 に正例 ④ を新設 = 検知・解除時刻・**メーター 100%**・
-  解除前は撃たない・解除後の復帰・**`supervisor.log` への記録**を実測: `audit=0->1`)。
-  **検出力は `TAKO_1093_LEGACY=1` の A/B**（unit 7 本 + 項目 111 が FAILED / 旧文言の
-  回帰テスト 4 本は両アームで緑）
-- 範囲外として申し送り: `You're out of usage credits · resets …` / `Your org is out of usage`
-  は**別テンプレート**なので今回は受けていない（同じ穴が残る）。`paint_and_hold` の POSIX 経路は
-  本文を素の単引用符で囲むので fixture に `'` を入れられない（実バイトの fixture は unit 側が持つ）
-
 ## 2026-09-07（#1143: 狭いペインの `/model` セレクタを選択肢ダイアログとして読めるようにした）
 - 実採取で原因確定: カーソル `❯` は「描かれない」のではなく**ダイアログがペインより高いと画面外へ出る**（25×70 では出る）。
   経路 3（カーソルなしの番号つき連なりを anchor）+ `label_truncated` 申告 + 2 列レイアウトの説明列をラベルへ混ぜない、の 3 点で直した
@@ -115,3 +85,8 @@
 - 原因 2 つ（見立ての「tmux が描く」は外れ）: 検査側 = 測るあいだミラーが立って表示が tmux 履歴 / 製品側 = `parse_ansi_lines` が履歴行にカーソルを焼いていた
 - 前者は製品と同じ `cancel_scroll_before_input` を通してから書く形へ・後者は `show_cursor=false` へ。器つき 5 通りが直接ペインと同一値（`fill=544 / stray=0`）で緑・**skip 無し**
 - A/B は `TAKO_1122_LEGACY=1` が Issue と同じ `fill=272/0/0/0` で FAILED。全 3578 件緑。次に落ちる `subline` 節（#943 の前提ガード無し）は #1173 へ起票
+
+## 2026-09-08（#771: 実 claude e2e の待ちを固定窓から負荷追従の予算へ替え、真因を #1175 へ切り出した）
+- 101c の固定 300 秒窓を `wait_for_claude_state`（`state_wait_budget` + 診断 2 行 + `prompt_flow=` + `101c-SCREEN`）へ。
+  同型 14 か所（45c / 95c ×11 / 97c ×2 / 101c）を同じ予算へ。番犬 `実claudeの応答を固定窓で待っていない`（待ちがループ末尾にある形を #1153 / #1165 は見逃す）
+- **実測で待ちは無罪**（予算 465〜701s に対し実際 93〜242s で `ok=true`）。落ちているのは目印の観測側 = スクロールするビューポートを見ている → #1175 へ起票
