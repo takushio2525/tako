@@ -25293,18 +25293,38 @@ mod self_test {
     /// 失敗時に限って末尾を出す（項目 73 / 74 に同型の先例あり）。
     /// 長さは打ち切る = 洪水した画面でログを埋めない
     fn focused_screen_tail(window: WindowHandle<TakoApp>, cx: &mut AsyncApp) -> String {
+        pane_screen_tail(window, cx, None)
+    }
+
+    /// [`focused_screen_tail`] のペイン指定版（#771）。
+    ///
+    /// 実 claude を待つ検査は**フォーカス中とは別のペイン**（引き継ぎの後任・
+    /// チャット用に立てた専用ペイン）を見ているので、諦めたときの画面末尾も
+    /// 見ていたペインから採る。フォーカスの画面を貼っても切り分けの材料にならない
+    fn pane_screen_tail(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        pane: Option<PaneId>,
+    ) -> String {
+        fn tail_of(lines: Vec<String>) -> String {
+            lines
+                .iter()
+                .map(|l| l.trim_end().to_string())
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        }
         let joined = window
-            .update(cx, |app, _, _| {
-                app.focused_session()
-                    .map(|s| {
-                        s.visible_lines()
-                            .iter()
-                            .map(|l| l.trim_end().to_string())
-                            .filter(|l| !l.is_empty())
-                            .collect::<Vec<_>>()
-                            .join(" | ")
-                    })
-                    .unwrap_or_default()
+            .update(cx, |app, _, _| match pane {
+                Some(p) => app
+                    .terminals
+                    .get(&p)
+                    .map(|s| tail_of(s.visible_lines()))
+                    .unwrap_or_default(),
+                None => app
+                    .focused_session()
+                    .map(|s| tail_of(s.visible_lines()))
+                    .unwrap_or_default(),
             })
             .unwrap_or_default();
         let tail: String = joined.chars().rev().take(240).collect();
@@ -25437,6 +25457,153 @@ mod self_test {
     /// その項目が FAILED になるのが正しい
     fn inject_1165() -> String {
         std::env::var("TAKO_1165_INJECT").unwrap_or_default()
+    }
+
+    /// **#771 の A/B の口**: 設定すると実 claude の応答待ちを旧実装の固定窓へ戻す。
+    ///
+    /// 同じバイナリで旧挙動を再現できるようにしておくのは、直したことを実測で示すため
+    /// （#1162 の `TAKO_1162_LEGACY` / #1165 の `TAKO_1165_LEGACY` と同じ役目）。
+    /// **判定そのものは変えない**ので、旧経路でも期待値が出ていれば通る
+    fn legacy_771() -> bool {
+        std::env::var_os("TAKO_771_LEGACY").is_some()
+    }
+
+    /// **#771 の注入口**（#1165 の `TAKO_1165_INJECT` と同じ役目）。2 系統ある。
+    ///
+    /// **① 遅れの再現**（`slow`）: 実 claude の応答の観測を旧経路の窓を超えて遅らせる。
+    /// 機の混み具合は再現できないので、Issue が観測した「高負荷で応答が窓に入らない」を
+    /// 人工的に作る。旧経路（固定窓）は確定で落ち、新経路は待ってから通る。
+    ///
+    /// **② 検出力の担保**（`nomarker`）: 観測をずっと成立させない。待ちを延ばしても
+    /// **本物の回帰は隠れない**ことの実測で、上限まで待ってからその項目が
+    /// FAILED になるのが正しい
+    fn inject_771() -> String {
+        std::env::var("TAKO_771_INJECT").unwrap_or_default()
+    }
+
+    /// 注入 `slow` の遅らせ幅（純粋関数。#771）。**旧経路の固定窓を必ず超え、
+    /// 新経路の素の上限には収まる**長さにする（超えないと「旧が落ちて新が通る」の
+    /// A/B が成立せず、収まらないと新経路も落ちて差が出ない）
+    pub(crate) fn inject_771_delay(legacy_window: Duration) -> Duration {
+        legacy_window + Duration::from_secs(5)
+    }
+
+    /// 注入 `nomarker`（= 相手の応答をずっと観測しない）の遅らせ幅。
+    /// 実質無限でよいが、`Duration` の演算で驚かない長さにしておく
+    const INJECT_771_FOREVER: Duration = Duration::from_secs(365 * 24 * 3600);
+
+    /// **実 claude の応答待ちの「上限 / ポーリング間隔」を決める**（純粋関数。#771）。
+    ///
+    /// 新経路の上限は [`state_wait_budget`]（混み具合で**伸ばすだけ**・4 倍で打ち切り）。
+    /// **ポーリング間隔は旧実装のまま据え置く**のが #1165 との違いで、理由は 2 つ:
+    /// 実 claude の待ちは最長 300 秒（101c）あり 100ms 刻みにすると画面の読み取りが
+    /// 3000 回走る / 変えたいのは「いつ諦めるか」だけで、観測の刻みを細かくしても
+    /// 判定は変わらない（相手は秒単位で動く）
+    pub(crate) fn resolve_claude_wait(
+        budget: TextWaitBudget,
+        busy: Option<f64>,
+        legacy: bool,
+    ) -> (Duration, Duration) {
+        if legacy {
+            (budget.legacy_window, budget.legacy_poll)
+        } else {
+            (
+                state_wait_budget(budget.base, busy),
+                budget.legacy_poll.max(Duration::from_millis(50)),
+            )
+        }
+    }
+
+    /// **上限を「伸ばせるところまで伸ばした」か**（純粋関数。#771）。
+    ///
+    /// [`state_wait_budget`] の係数は 4 倍で打ち切るので、混み具合がそれを超えている
+    /// ときは「予算を最大まで積んでも足りなかった」= 機が極端に混んでいる、が言える。
+    /// 診断行にこれを出しておくと、FAILED を見た人が
+    /// **待ちが短かったのか相手が応答しなかったのか**を 1 行で切り分けられる
+    /// （SKIP にして隠さないのは、隠すと回帰も一緒に隠れるため）
+    pub(crate) fn claude_budget_capped(busy: Option<f64>) -> bool {
+        busy.is_some_and(|b| 1.0 + b.max(0.0) >= 4.0)
+    }
+
+    /// **実 claude の応答を状態で待つ**（#771）。
+    ///
+    /// 対象は `TAKO_SELF_TEST_CLAUDE` 系の項目（45c=#28 / 95c=#716 / 97c=#720 /
+    /// 101c=#749）。旧実装はどれも `for _ in 0..N { … wait(cx, M).await }` =
+    /// **固定 N×M 窓**で、待っている相手が**実 LLM** なので混んだ機では窓を使い切って
+    /// 落ちていた（#771 の実測: 101c が `saw_marker=false` で 2/2 回不成立）。
+    ///
+    /// - 上限は [`resolve_claude_wait`]（`state_wait_budget` = 伸ばすだけ・4 倍で打ち切り）
+    /// - `step` は**毎周期呼ばれる**ので、信頼ダイアログの承諾のような
+    ///   「待ちながら押す」駆動も観測と同じ場所に書ける（真を返したら成立）。
+    ///   第 2 引数は「相手の応答を**観測してよいか**」で、注入
+    ///   （`TAKO_771_INJECT`）のあいだだけ false になる。駆動は毎周期・観測だけを
+    ///   止める形にしてあるので、遅れを再現しても相手は前へ進む
+    /// - 上限まで待って駄目なら偽 + 診断 2 行。**SKIP にはしない**ので検出力は
+    ///   固定窓と同じか強い（成立しない条件はいくら待っても成立しない）
+    ///
+    /// 診断は毎回 1 行（`TAKO_SELF_TEST_771`）、諦めたときは加えて
+    /// `TAKO_SELF_TEST_WAIT_TIMEOUT`（`waited=` / `budget=` / `load=` / `screen_tail=`）。
+    /// `capped=true` なら「4 倍まで積んでも足りなかった」= 機が極端に混んでいた印
+    async fn wait_for_claude_state<F>(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        tag: &str,
+        pane: Option<PaneId>,
+        budget: TextWaitBudget,
+        mut step: F,
+    ) -> bool
+    where
+        F: FnMut(&mut TakoApp, bool) -> bool,
+    {
+        let legacy = legacy_771();
+        let busy = machine_busy();
+        let (limit, poll) = resolve_claude_wait(budget, busy, legacy);
+        // 注入は「相手の応答がまだ来ていない」を再現する = `step` の第 2 引数を
+        // 一定時間 false にする。**駆動（信頼ダイアログの承諾）は毎周期行う**ので、
+        // 遅らせているあいだも相手は前へ進む（承諾を止めると claude が起動せず、
+        // 遅れの再現ではなく別の失敗になってしまう）
+        let inject = inject_771();
+        let hold = match inject.as_str() {
+            "slow" => Some(inject_771_delay(budget.legacy_window)),
+            "nomarker" => Some(INJECT_771_FOREVER),
+            _ => None,
+        };
+        let started = std::time::Instant::now();
+        let mut ok = false;
+        loop {
+            let observe = hold.is_none_or(|h| started.elapsed() >= h);
+            if window
+                .update(cx, |app, _, _| step(app, observe))
+                .unwrap_or(false)
+            {
+                ok = true;
+                break;
+            }
+            if started.elapsed() >= limit {
+                break;
+            }
+            cx.background_executor().timer(poll).await;
+        }
+        let waited = started.elapsed();
+        let capped = claude_budget_capped(busy);
+        println!(
+            "TAKO_SELF_TEST_771: item={tag} ok={ok} waited={:.1}s budget={:.1}s \
+             legacy={legacy} capped={capped} inject={inject:?} {}",
+            waited.as_secs_f32(),
+            limit.as_secs_f32(),
+            env_line()
+        );
+        if !ok {
+            println!(
+                "TAKO_SELF_TEST_WAIT_TIMEOUT: needle={tag:?} waited={:.1}s budget={:.1}s \
+                 capped={capped} {} screen_tail={:?}",
+                waited.as_secs_f32(),
+                limit.as_secs_f32(),
+                env_line(),
+                pane_screen_tail(window, cx, pane)
+            );
+        }
+        ok
     }
 
     /// **打鍵の結果が画面に出るまで状態で待ち、出なければ上限つきで送り直す**（#1165）。
@@ -38325,32 +38492,33 @@ mod self_test {
                 // 入力欄内で hello28 の直下の行に world28 が来る = 改行挿入
                 // （送信されてしまった場合は transcript とセパレータを挟むため隣接しない。
                 //  改行されなかった場合は同一行に連結される）
-                let mut newline_ok = false;
-                for _ in 0..20 {
-                    wait(cx, 400).await;
-                    let ok = window
-                        .update(cx, |app, _, _| {
-                            app.focused_session()
+                // **固定窓で待たない**（#771。旧実装は 20 × 400ms = 固定 8 秒）。
+                // 実 claude が入力欄を描き替えるのを待つ形なので、混んだ機では
+                // 窓を使い切る（#1165 で起動待ちだけ直し、ここは残っていた）
+                let newline_ok = wait_for_claude_state(
+                    window,
+                    cx,
+                    "45c-newline",
+                    None,
+                    text_wait_budget(20, 400, 20),
+                    |app, observe| {
+                        observe
+                            && app
+                                .focused_session()
                                 .map(|s| {
                                     let lines = s.visible_lines();
                                     let joined = lines
                                         .iter()
                                         .any(|l| l.contains("hello28") && l.contains("world28"));
-                                    let hello =
-                                        lines.iter().position(|l| l.contains("hello28"));
-                                    let world =
-                                        lines.iter().position(|l| l.contains("world28"));
+                                    let hello = lines.iter().position(|l| l.contains("hello28"));
+                                    let world = lines.iter().position(|l| l.contains("world28"));
                                     matches!((hello, world), (Some(h), Some(w)) if w == h + 1)
                                         && !joined
                                 })
                                 .unwrap_or(false)
-                        })
-                        .unwrap_or(false);
-                    if ok {
-                        newline_ok = true;
-                        break;
-                    }
-                }
+                    },
+                )
+                .await;
                 // 判定根拠の画面証跡を出力（成否に関わらず。ペインの spawn 経路も明示）
                 let _ = window.update(cx, |app, _, _| {
                     let pane = app.focused_pane();
@@ -49172,21 +49340,23 @@ mod self_test {
                 } else {
                     None
                 };
-                if let Some(chat_pane) = claude_pane {
-                    // シェルがプロンプトを出すまで待つ（打鍵が捨てられないように）
-                    for _ in 0..40 {
-                        wait(cx, 100).await;
-                        let ready = window
-                            .update(cx, |app, _, _| {
-                                app.terminals.get(&chat_pane).is_some_and(|s| {
+                if let Some(chat_pane) = claude_pane.filter(|_| claude_e2e) {
+                    // シェルがプロンプトを出すまで待つ（打鍵が捨てられないように）。
+                    // 旧実装は 40 × 100ms の固定 4 秒窓（#771）
+                    let _ = wait_for_claude_state(
+                        window,
+                        cx,
+                        "95c-shell-ready",
+                        Some(chat_pane),
+                        text_wait_budget(40, 100, 15),
+                        |app, observe| {
+                            observe
+                                && app.terminals.get(&chat_pane).is_some_and(|s| {
                                     s.command_state() == tako_core::CommandState::Idle
                                 })
-                            })
-                            .unwrap_or(false);
-                        if ready {
-                            break;
-                        }
-                    }
+                        },
+                    )
+                    .await;
                     let _ = window.update(cx, |app, _, cx| {
                         app.jump_to_pane(chat_pane, cx);
                         if let Some(session) = app.terminals.get(&chat_pane) {
@@ -49197,39 +49367,34 @@ mod self_test {
                     // **TUI のフッター文字列を目印にしない**: このペインは分割で
                     // 背が低いことがあり、フッターが画面に出ないだけで落ちてしまう。
                     // 「チャット表示になったか」= session_id が解決できたか、が本当の前提条件
-                    let mut became_chat = false;
-                    for _ in 0..150 {
-                        wait(cx, 1000).await;
-                        let trust = window
-                            .update(cx, |app, _, _| {
-                                if app.pane_display_for(chat_pane) == PaneDisplay::Chat {
-                                    return None;
+                    // **固定窓で待たない**（#771。旧実装は 150 × 1000ms = 固定 150 秒）。
+                    // 信頼ダイアログの承諾は**駆動**なので毎周期行い、観測だけを予算で待つ
+                    let became_chat = wait_for_claude_state(
+                        window,
+                        cx,
+                        "95c-became-chat",
+                        Some(chat_pane),
+                        text_wait_budget(150, 1000, 180),
+                        |app, observe| {
+                            if app.pane_display_for(chat_pane) == PaneDisplay::Chat {
+                                return observe;
+                            }
+                            let lines = app
+                                .terminals
+                                .get(&chat_pane)
+                                .map(|s| s.visible_lines())
+                                .unwrap_or_default();
+                            if lines.iter().any(|l| {
+                                l.contains("trust this folder") || l.contains("Yes, I trust")
+                            }) {
+                                if let Some(session) = app.terminals.get(&chat_pane) {
+                                    session.write(b"\r".to_vec());
                                 }
-                                let lines = app
-                                    .terminals
-                                    .get(&chat_pane)
-                                    .map(|s| s.visible_lines())
-                                    .unwrap_or_default();
-                                Some(lines.iter().any(|l| {
-                                    l.contains("trust this folder") || l.contains("Yes, I trust")
-                                }))
-                            })
-                            .unwrap_or(Some(false));
-                        match trust {
-                            None => {
-                                became_chat = true;
-                                break;
                             }
-                            Some(true) => {
-                                let _ = window.update(cx, |app, _, _| {
-                                    if let Some(session) = app.terminals.get(&chat_pane) {
-                                        session.write(b"\r".to_vec());
-                                    }
-                                });
-                            }
-                            Some(false) => {}
-                        }
-                    }
+                            false
+                        },
+                    )
+                    .await;
                     if !became_chat {
                         let note = window
                             .update(cx, |app, _, _| {
@@ -49270,28 +49435,30 @@ mod self_test {
                             PaneOrigin::User,
                         )
                     });
-                    let mut mirrored = false;
-                    for _ in 0..30 {
-                        wait(cx, 500).await;
-                        mirrored = window
-                            .update(cx, |app, _, _| {
-                                app.chat_input_mirror(chat_pane, true)
+                    // 旧実装は 30 × 500ms の固定 15 秒窓（#771）
+                    let mirrored = wait_for_claude_state(
+                        window,
+                        cx,
+                        "95c-mirrored",
+                        Some(chat_pane),
+                        text_wait_budget(30, 500, 30),
+                        |app, observe| {
+                            observe
+                                && app
+                                    .chat_input_mirror(chat_pane, true)
                                     .is_some_and(|m| m.has_text)
-                                    && app
-                                        .terminals
-                                        .get(&chat_pane)
-                                        .and_then(|t| {
-                                            tako_core::screen::analyze_input_line(
-                                                &t.screen_opts(&app.theme, false),
-                                            )
-                                        })
-                                        .is_some_and(|st| st.text.contains(&probe))
-                            })
-                            .unwrap_or(false);
-                        if mirrored {
-                            break;
-                        }
-                    }
+                                && app
+                                    .terminals
+                                    .get(&chat_pane)
+                                    .and_then(|t| {
+                                        tako_core::screen::analyze_input_line(
+                                            &t.screen_opts(&app.theme, false),
+                                        )
+                                    })
+                                    .is_some_and(|st| st.text.contains(&probe))
+                        },
+                    )
+                    .await;
                     check(
                         mirrored,
                         "95c: 打鍵が TUI の入力行に入り、チャット入力欄がそれを映す (#719)",
@@ -49310,22 +49477,24 @@ mod self_test {
 
                     // transcript に自分の発話が現れる = GUI → Send → PromptFlow → claude →
                     // transcript → チャット表示の全経路が繋がっている
-                    let mut in_transcript = false;
-                    for _ in 0..90 {
-                        wait(cx, 1000).await;
-                        in_transcript = window
-                            .update(cx, |app, _, _| {
-                                app.chat_state(chat_pane).is_some_and(|s| {
+                    // 旧実装は 90 × 1000ms の固定 90 秒窓（#771）
+                    let in_transcript = wait_for_claude_state(
+                        window,
+                        cx,
+                        "95c-in-transcript",
+                        Some(chat_pane),
+                        text_wait_budget(90, 1000, 120),
+                        |app, observe| {
+                            observe
+                                && app.chat_state(chat_pane).is_some_and(|s| {
                                     s.messages.iter().any(|m| {
-                                        m.role == chat_view::ChatRole::User && m.text.contains(&probe)
+                                        m.role == chat_view::ChatRole::User
+                                            && m.text.contains(&probe)
                                     })
                                 })
-                            })
-                            .unwrap_or(false);
-                        if in_transcript {
-                            break;
-                        }
-                    }
+                        },
+                    )
+                    .await;
                     if !in_transcript {
                         let note = window
                             .update(cx, |app, _, _| {
@@ -49352,20 +49521,25 @@ mod self_test {
                     // #737 追加要件 3: 生成中は **実 TUI のスピナー行**（作業内容 +
                     // 経過時間 + 受信トークン数）が採れ、会話末尾のインジケータへ載る。
                     // ここが None だと「考え中…」への縮退表示になる（表示自体は出る）
+                    // 旧実装は 30 × 500ms の固定 15 秒窓（#771）
                     let mut live_activity: Option<String> = None;
-                    for _ in 0..30 {
-                        live_activity = window
-                            .update(cx, |app, _, _| {
-                                app.chat_input_mirror(chat_pane, true)
-                                    .and_then(|m| m.activity)
-                            })
-                            .ok()
-                            .flatten();
-                        if live_activity.is_some() {
-                            break;
-                        }
-                        wait(cx, 500).await;
-                    }
+                    let _ = wait_for_claude_state(
+                        window,
+                        cx,
+                        "95c-live-activity",
+                        Some(chat_pane),
+                        text_wait_budget(30, 500, 30),
+                        |app, observe| {
+                            if !observe {
+                                return false;
+                            }
+                            live_activity = app
+                                .chat_input_mirror(chat_pane, true)
+                                .and_then(|m| m.activity);
+                            live_activity.is_some()
+                        },
+                    )
+                    .await;
                     println!("95c-737-ACTIVITY: live={live_activity:?}");
                     check(
                         live_activity.is_some(),
@@ -49393,11 +49567,18 @@ mod self_test {
                     // 入力行へ echo が返るのを待ってから確定する。busy 中は claude が
                     // 打鍵を入力行ではなく内部キューへ入れる（#572）ので、その場合は
                     // 入力行に現れないまま = 確定不要（ターン終了時に自動で送られる）
-                    for _ in 0..30 {
-                        wait(cx, 500).await;
-                        let in_line = window
-                            .update(cx, |app, _, _| {
-                                app.terminals
+                    // 旧実装は 30 × 500ms の固定 15 秒窓（#771）。確定は待ちの**後**へ
+                    // 出した（待ちの内側に副作用を置くと、予算切れの回だけ確定が漏れる）
+                    if wait_for_claude_state(
+                        window,
+                        cx,
+                        "95c-probe2-in-line",
+                        Some(chat_pane),
+                        text_wait_budget(30, 500, 30),
+                        |app, observe| {
+                            observe
+                                && app
+                                    .terminals
                                     .get(&chat_pane)
                                     .and_then(|t| {
                                         tako_core::screen::analyze_input_line(
@@ -49405,67 +49586,76 @@ mod self_test {
                                         )
                                     })
                                     .is_some_and(|st| st.text.contains(&probe2))
-                            })
-                            .unwrap_or(false);
-                        if in_line {
-                            let _ = window
-                                .update(cx, |app, _, cx| app.chat_submit_input(chat_pane, cx));
-                            break;
-                        }
+                        },
+                    )
+                    .await
+                    {
+                        let _ =
+                            window.update(cx, |app, _, cx| app.chat_submit_input(chat_pane, cx));
                     }
                     // #737 追加要件 5: **配送を待たずに**自分の吹き出しが出る。
                     // 判定材料は描画に使うのと同じ `chat_visible_messages`（楽観 echo +
                     // transcript のキュー行の両方がここへ合流する）
+                    // 旧実装は 20 × 500ms の固定 10 秒窓（#771）
                     let mut echo_seen = false;
                     let mut echo_queued = false;
-                    for _ in 0..20 {
-                        (echo_seen, echo_queued) = window
-                            .update(cx, |app, _, _| {
-                                let state =
-                                    app.chat_panes.get(&chat_pane).cloned().unwrap_or_default();
-                                let visible = app.chat_visible_messages(chat_pane, &state);
-                                let hit = visible.iter().find(|m| {
-                                    m.role == chat_view::ChatRole::User && m.text.contains(&probe2)
-                                });
-                                (hit.is_some(), hit.is_some_and(|m| m.queued))
-                            })
-                            .unwrap_or((false, false));
-                        if echo_seen {
-                            break;
-                        }
-                        wait(cx, 500).await;
-                    }
+                    let _ = wait_for_claude_state(
+                        window,
+                        cx,
+                        "95c-echo-seen",
+                        Some(chat_pane),
+                        text_wait_budget(20, 500, 20),
+                        |app, observe| {
+                            if !observe {
+                                return false;
+                            }
+                            let state =
+                                app.chat_panes.get(&chat_pane).cloned().unwrap_or_default();
+                            let visible = app.chat_visible_messages(chat_pane, &state);
+                            let hit = visible.iter().find(|m| {
+                                m.role == chat_view::ChatRole::User && m.text.contains(&probe2)
+                            });
+                            echo_seen = hit.is_some();
+                            echo_queued = hit.is_some_and(|m| m.queued);
+                            echo_seen
+                        },
+                    )
+                    .await;
                     println!("95c-737-ECHO: seen={echo_seen} queued={echo_queued}");
                     check(
                         echo_seen,
                         "95c/#737: busy 中に送った指示が配送前から自分の吹き出しとして出る",
                     );
 
+                    // 旧実装は 120 × 1000ms の固定 120 秒窓（#771）
                     let mut queued_seen = false;
-                    let mut delivered2 = false;
-                    for _ in 0..120 {
-                        wait(cx, 1000).await;
-                        let (queued, landed) = window
-                            .update(cx, |app, _, _| {
-                                app.chat_state(chat_pane)
-                                    .map(|s| {
-                                        (
-                                            s.queued,
-                                            s.messages.iter().any(|m| {
-                                                m.role == chat_view::ChatRole::User
-                                                    && m.text.contains(&probe2)
-                                            }),
-                                        )
-                                    })
-                                    .unwrap_or((false, false))
-                            })
-                            .unwrap_or((false, false));
-                        queued_seen |= queued;
-                        delivered2 = landed;
-                        if landed {
-                            break;
-                        }
-                    }
+                    let delivered2 = wait_for_claude_state(
+                        window,
+                        cx,
+                        "95c-delivered2",
+                        Some(chat_pane),
+                        text_wait_budget(120, 1000, 150),
+                        |app, observe| {
+                            if !observe {
+                                return false;
+                            }
+                            let (queued, landed) = app
+                                .chat_state(chat_pane)
+                                .map(|s| {
+                                    (
+                                        s.queued,
+                                        s.messages.iter().any(|m| {
+                                            m.role == chat_view::ChatRole::User
+                                                && m.text.contains(&probe2)
+                                        }),
+                                    )
+                                })
+                                .unwrap_or((false, false));
+                            queued_seen |= queued;
+                            landed
+                        },
+                    )
+                    .await;
                     println!("95c-QUEUE: queued_observed={queued_seen}");
                     check(
                         delivered2,
@@ -49523,12 +49713,18 @@ mod self_test {
                             let _ = app.workspace.active_tab_mut().tree_mut().focus(chat_pane);
                             app.forward_image_paste(cx);
                         });
-                        // claude が clipboard を読んで `[Image #N]` を挿入するのを待つ
-                        for _ in 0..30 {
-                            wait(cx, 500).await;
-                            marker_in_line = window
-                                .update(cx, |app, _, _| {
-                                    app.terminals
+                        // claude が clipboard を読んで `[Image #N]` を挿入するのを待つ。
+                        // 旧実装は 30 × 500ms の固定 15 秒窓（#771）
+                        marker_in_line = wait_for_claude_state(
+                            window,
+                            cx,
+                            "95c-image-marker",
+                            Some(chat_pane),
+                            text_wait_budget(30, 500, 30),
+                            |app, observe| {
+                                observe
+                                    && app
+                                        .terminals
                                         .get(&chat_pane)
                                         .and_then(|t| {
                                             tako_core::screen::analyze_input_line(
@@ -49536,12 +49732,9 @@ mod self_test {
                                             )
                                         })
                                         .is_some_and(|st| st.text.contains("[Image"))
-                                })
-                                .unwrap_or(false);
-                            if marker_in_line {
-                                break;
-                            }
-                        }
+                            },
+                        )
+                        .await;
                     }
                     println!("95c-746-PASTE: png_ok={png_ok} marker_in_line={marker_in_line}");
                     if marker_in_line {
@@ -49570,32 +49763,37 @@ mod self_test {
                         let _ =
                             window.update(cx, |app, _, cx| app.chat_submit_input(chat_pane, cx));
                         // 送信直後: 吹き出しは 1 個・マーカーは出さない・画像チップつき
+                        // 旧実装は 20 × 500ms の固定 10 秒窓（#771）
                         let mut immediate = (false, false, 0usize);
-                        for _ in 0..20 {
-                            immediate = window
-                                .update(cx, |app, _, _| {
-                                    let state =
-                                        app.chat_panes.get(&chat_pane).cloned().unwrap_or_default();
-                                    let visible = app.chat_visible_messages(chat_pane, &state);
-                                    let same: Vec<&chat_view::ChatMessage> = visible
-                                        .iter()
-                                        .filter(|m| {
-                                            m.role == chat_view::ChatRole::User
-                                                && m.text.contains(&probe3)
-                                        })
-                                        .collect();
-                                    (
-                                        same.iter().any(|m| m.images >= 1),
-                                        same.iter().any(|m| m.text.contains("[Image")),
-                                        same.len(),
-                                    )
-                                })
-                                .unwrap_or((false, false, 0));
-                            if immediate.2 > 0 {
-                                break;
-                            }
-                            wait(cx, 500).await;
-                        }
+                        let _ = wait_for_claude_state(
+                            window,
+                            cx,
+                            "95c-image-echo",
+                            Some(chat_pane),
+                            text_wait_budget(20, 500, 20),
+                            |app, observe| {
+                                if !observe {
+                                    return false;
+                                }
+                                let state =
+                                    app.chat_panes.get(&chat_pane).cloned().unwrap_or_default();
+                                let visible = app.chat_visible_messages(chat_pane, &state);
+                                let same: Vec<&chat_view::ChatMessage> = visible
+                                    .iter()
+                                    .filter(|m| {
+                                        m.role == chat_view::ChatRole::User
+                                            && m.text.contains(&probe3)
+                                    })
+                                    .collect();
+                                immediate = (
+                                    same.iter().any(|m| m.images >= 1),
+                                    same.iter().any(|m| m.text.contains("[Image")),
+                                    same.len(),
+                                );
+                                immediate.2 > 0
+                            },
+                        )
+                        .await;
                         println!(
                             "95c-746-ECHO: raw_line={raw_line:?} chip={} leaked={} bubbles={}",
                             immediate.0, immediate.1, immediate.2
@@ -49609,35 +49807,40 @@ mod self_test {
                             "95c/#746: 送信直後は吹き出し 1 個・画像チップつき・内部表記なし",
                         );
                         // 配送後: 吹き出しは 1 個のまま・「送信待ち」が解除される
+                        // 旧実装は 180 × 1000ms の固定 180 秒窓（#771）
                         let mut after = (0usize, true);
-                        for _ in 0..180 {
-                            wait(cx, 1000).await;
-                            after = window
-                                .update(cx, |app, _, _| {
-                                    let state =
-                                        app.chat_panes.get(&chat_pane).cloned().unwrap_or_default();
-                                    let landed = state.messages.iter().any(|m| {
+                        let _ = wait_for_claude_state(
+                            window,
+                            cx,
+                            "95c-image-delivered",
+                            Some(chat_pane),
+                            text_wait_budget(180, 1000, 210),
+                            |app, observe| {
+                                if !observe {
+                                    return false;
+                                }
+                                let state =
+                                    app.chat_panes.get(&chat_pane).cloned().unwrap_or_default();
+                                let landed = state.messages.iter().any(|m| {
+                                    m.role == chat_view::ChatRole::User
+                                        && m.text.contains(&probe3)
+                                });
+                                let visible = app.chat_visible_messages(chat_pane, &state);
+                                let same: Vec<&chat_view::ChatMessage> = visible
+                                    .iter()
+                                    .filter(|m| {
                                         m.role == chat_view::ChatRole::User
                                             && m.text.contains(&probe3)
-                                    });
-                                    let visible = app.chat_visible_messages(chat_pane, &state);
-                                    let same: Vec<&chat_view::ChatMessage> = visible
-                                        .iter()
-                                        .filter(|m| {
-                                            m.role == chat_view::ChatRole::User
-                                                && m.text.contains(&probe3)
-                                        })
-                                        .collect();
-                                    (
-                                        if landed { same.len() } else { 0 },
-                                        same.iter().any(|m| m.queued),
-                                    )
-                                })
-                                .unwrap_or((0, true));
-                            if after.0 > 0 && !after.1 {
-                                break;
-                            }
-                        }
+                                    })
+                                    .collect();
+                                after = (
+                                    if landed { same.len() } else { 0 },
+                                    same.iter().any(|m| m.queued),
+                                );
+                                after.0 > 0 && !after.1
+                            },
+                        )
+                        .await;
                         println!("95c-746-DELIVERED: bubbles={} queued={}", after.0, after.1);
                         check(
                             after.0 == 1 && !after.1,
@@ -50474,52 +50677,58 @@ mod self_test {
                         .ok()
                         .flatten();
                     if let Some(e2e_pane) = e2e_pane {
-                        for _ in 0..60 {
-                            wait(cx, 100).await;
-                            let ready = window
-                                .update(cx, |app, _, _| {
-                                    app.pane_display_for(e2e_pane) == PaneDisplay::Starter
-                                })
-                                .unwrap_or(false);
-                            if ready {
-                                break;
-                            }
-                        }
+                        // 旧実装は 60 × 100ms の固定 6 秒窓（#771）
+                        let _ = wait_for_claude_state(
+                            window,
+                            cx,
+                            "97c-starter-ready",
+                            Some(e2e_pane),
+                            text_wait_budget(60, 100, 15),
+                            |app, observe| {
+                                observe
+                                    && app.pane_display_for(e2e_pane) == PaneDisplay::Starter
+                            },
+                        )
+                        .await;
                         // スターターの主ボタンをそのまま押す（ユーザーの操作と同じ経路）
                         let _ = window.update(cx, |app, _, cx| {
                             app.starter_action(e2e_pane, StarterAction::Solo, cx)
                         });
+                        // **固定窓で待たない**（#771。旧実装は 600 × 50ms = 固定 30 秒）。
+                        // 猶予の上限（`SETTLE_AGENT_LIMIT` = 製品の定数）との比較は
+                        // 下の 2 つ目の check がやる。窓が上限をわずかに上回るだけの
+                        // 旧実装では、混んだ機で「チャットにならなかった」と
+                        // 「猶予を超えた」が区別できなかった
                         let started = std::time::Instant::now();
                         let mut seq: Vec<PaneDisplay> = Vec::new();
-                        let mut became_chat = false;
-                        for _ in 0..600 {
-                            let display = window
-                                .update(cx, |app, _, _| {
-                                    // 起動時の信頼ダイアログは承諾しておく（#32 の経路）
-                                    let lines = app
-                                        .terminals
-                                        .get(&e2e_pane)
-                                        .map(|s| s.visible_lines())
-                                        .unwrap_or_default();
-                                    if lines.iter().any(|l| {
-                                        l.contains("trust this folder") || l.contains("Yes, I trust")
-                                    }) {
-                                        if let Some(session) = app.terminals.get(&e2e_pane) {
-                                            session.write(b"\r".to_vec());
-                                        }
+                        let became_chat = wait_for_claude_state(
+                            window,
+                            cx,
+                            "97c-became-chat",
+                            Some(e2e_pane),
+                            text_wait_budget(600, 50, 60),
+                            |app, observe| {
+                                // 起動時の信頼ダイアログは承諾しておく（#32 の経路。**駆動**）
+                                let lines = app
+                                    .terminals
+                                    .get(&e2e_pane)
+                                    .map(|s| s.visible_lines())
+                                    .unwrap_or_default();
+                                if lines.iter().any(|l| {
+                                    l.contains("trust this folder") || l.contains("Yes, I trust")
+                                }) {
+                                    if let Some(session) = app.terminals.get(&e2e_pane) {
+                                        session.write(b"\r".to_vec());
                                     }
-                                    app.pane_display_for(e2e_pane)
-                                })
-                                .unwrap_or(PaneDisplay::Terminal);
-                            if seq.last() != Some(&display) {
-                                seq.push(display);
-                            }
-                            if display == PaneDisplay::Chat {
-                                became_chat = true;
-                                break;
-                            }
-                            wait(cx, 50).await;
-                        }
+                                }
+                                let display = app.pane_display_for(e2e_pane);
+                                if seq.last() != Some(&display) {
+                                    seq.push(display);
+                                }
+                                observe && display == PaneDisplay::Chat
+                            },
+                        )
+                        .await;
                         let elapsed_ms = started.elapsed().as_millis();
                         println!(
                             "97c-CLAUDE: became_chat={became_chat} elapsed_ms={elapsed_ms} \
@@ -52406,48 +52615,64 @@ mod self_test {
 
                     // 後任の起動 → 引き継ぎ読了 → 前任 close を待つ。
                     // 実 LLM の判断が入るので長めに待ち、信頼ダイアログは承諾しておく
-                    let mut closed = false;
+                    // **固定窓で待たない**（#771。旧実装は 600 × 500ms = 固定 300 秒）。
+                    // ここで待っている相手は**実 LLM** なので、混んだ機では窓を使い切って
+                    // `saw_marker=false` になる（#771 の実測: load1 が 11〜79 の機で 2/2 回
+                    // 不成立）。上限を `state_wait_budget` へ通して混み具合に追従させ、
+                    // 諦めたときは診断行（`waited=` / `budget=` / `load=` / `screen_tail=`）
+                    // で「待ちが短かったのか相手が応答しなかったのか」を切り分ける
                     let mut saw_marker = false;
                     let mut saw_done = false;
-                    for _ in 0..600 {
-                        let (c, m, d) = window
-                            .update(cx, |app, _, _| {
-                                let lines = app
-                                    .terminals
-                                    .get(&new_pane)
-                                    .map(|s| s.visible_lines())
-                                    .unwrap_or_default();
-                                if lines.iter().any(|l| {
-                                    l.contains("trust this folder") || l.contains("Yes, I trust")
-                                }) {
-                                    if let Some(session) = app.terminals.get(&new_pane) {
-                                        session.write(b"\r".to_vec());
-                                    }
+                    let closed = wait_for_claude_state(
+                        window,
+                        cx,
+                        "101c-handoff-closed",
+                        Some(new_pane),
+                        text_wait_budget(600, 500, 360),
+                        |app, observe| {
+                            let lines = app
+                                .terminals
+                                .get(&new_pane)
+                                .map(|s| s.visible_lines())
+                                .unwrap_or_default();
+                            // 起動時の信頼ダイアログは承諾しておく（**駆動**は毎周期）
+                            if lines.iter().any(|l| {
+                                l.contains("trust this folder") || l.contains("Yes, I trust")
+                            }) {
+                                if let Some(session) = app.terminals.get(&new_pane) {
+                                    session.write(b"\r".to_vec());
                                 }
-                                let joined = lines.join("\n");
-                                let gone = app
-                                    .workspace
-                                    .tabs()
-                                    .iter()
-                                    .all(|t| t.tree().get(master_pane).is_none());
-                                (
-                                    gone,
-                                    joined.contains("TAKO749-HANDOFF-MARKER"),
-                                    joined.contains("引き継ぎ完了")
-                                        || joined.to_lowercase().contains("handoff complete"),
-                                )
-                            })
-                            .unwrap_or((false, false, false));
-                        saw_marker |= m;
-                        saw_done |= d;
-                        closed = c;
-                        if closed {
-                            break;
-                        }
-                        wait(cx, 500).await;
-                    }
+                            }
+                            if !observe {
+                                return false;
+                            }
+                            let joined = lines.join("\n");
+                            saw_marker |= joined.contains("TAKO749-HANDOFF-MARKER");
+                            saw_done |= joined.contains("引き継ぎ完了")
+                                || joined.to_lowercase().contains("handoff complete");
+                            app.workspace
+                                .tabs()
+                                .iter()
+                                .all(|t| t.tree().get(master_pane).is_none())
+                        },
+                    )
+                    .await;
+                    // 送達フローの生き死にも出す（#771）。`saw_marker=false` には
+                    // ①テスト側の窓を使い切った ②送達フローが 120 秒で諦めた
+                    // ③実 claude がまだ考えている の 3 通りがあり、②は**製品側の**
+                    // タイムアウトなので待ちを伸ばしても解けない = 区別が要る
+                    let prompt_flow = window
+                        .update(cx, |app, _, _| {
+                            app.prompt_flows
+                                .iter()
+                                .find(|f| f.pane == new_pane)
+                                .map(|f| format!("{:?}", f.state))
+                                .unwrap_or_else(|| "none".to_string())
+                        })
+                        .unwrap_or_else(|_| "unknown".to_string());
                     println!(
-                        "101c-CLAUDE: closed={closed} saw_marker={saw_marker} saw_done={saw_done}"
+                        "101c-CLAUDE: closed={closed} saw_marker={saw_marker} \
+                         saw_done={saw_done} prompt_flow={prompt_flow}"
                     );
                     // **`saw_marker` を必須にする**: これが後任へプロンプトが実際に届いた
                     // 唯一の証拠。届かないまま closed になったら、それは後任の仕事ではなく
@@ -64638,6 +64863,131 @@ mod self_test_wait_budget_tests {
     }
 }
 
+/// 実 claude の応答待ちの予算（純粋関数。#771）。
+///
+/// 項目 101c（引き継ぎ e2e）は 600 × 500ms = **固定 300 秒**の窓で実 LLM の応答を
+/// 待っていたため、load1 が 11〜79 の機では 2/2 回 `saw_marker=false` で落ちていた。
+/// 予算の政策（伸ばすだけ / 4 倍で打ち切り）は `state_wait_budget` と共有し、
+/// ここでは **①旧の固定窓を同一バイナリで再現できる ②空いている機でも旧より広い
+/// ③注入の遅れが旧と新のあいだに収まる**の 3 点を固定する
+#[cfg(test)]
+mod self_test_claude_wait_tests {
+    use super::self_test::{
+        claude_budget_capped, inject_771_delay, resolve_claude_wait, text_wait_budget,
+    };
+    use std::time::Duration;
+
+    /// 旧経路（`TAKO_771_LEGACY=1`）は項目 101c の固定窓をそのまま再現する
+    #[test]
+    fn 旧経路は項目101cの固定窓をそのまま再現する() {
+        let (limit, poll) = resolve_claude_wait(text_wait_budget(600, 500, 360), Some(3.0), true);
+        assert_eq!(
+            limit,
+            Duration::from_secs(300),
+            "固定窓が 600 × 500ms でない"
+        );
+        assert_eq!(poll, Duration::from_millis(500), "1 周期が 500ms でない");
+    }
+
+    /// 新経路は**空いている機でも**旧の固定窓より広い（300 秒 → 360 秒）。
+    /// ここが等しいと「混んだ機でしか差が出ない」= A/B が取れない
+    #[test]
+    fn 新経路は空いている機でも旧の固定窓より広い() {
+        let budget = text_wait_budget(600, 500, 360);
+        let (idle, poll) = resolve_claude_wait(budget, Some(0.0), false);
+        let (legacy, _) = resolve_claude_wait(budget, Some(0.0), true);
+        assert_eq!(idle, Duration::from_secs(360));
+        assert!(idle > legacy, "新経路が旧の固定窓を超えていない");
+        // 刻みは旧のまま据え置く（最長 300 秒超の待ちを 100ms 刻みにしない）
+        assert_eq!(poll, Duration::from_millis(500));
+    }
+
+    /// 混み具合で伸び、4 倍で打ち切る（政策は `state_wait_budget` と 1 つ）
+    #[test]
+    fn 混んだ機で伸びて4倍で打ち切る() {
+        let budget = text_wait_budget(600, 500, 360);
+        let (busy, _) = resolve_claude_wait(budget, Some(1.0), false);
+        assert_eq!(busy, Duration::from_secs(720));
+        let (extreme, _) = resolve_claude_wait(budget, Some(10.0), false);
+        assert_eq!(extreme, Duration::from_secs(1440));
+    }
+
+    /// `load=unknown` の環境（Windows 実機）でも素の上限は残る
+    #[test]
+    fn 混み具合が読めなくても素の上限は残る() {
+        let (limit, _) = resolve_claude_wait(text_wait_budget(600, 500, 360), None, false);
+        assert_eq!(limit, Duration::from_secs(360));
+    }
+
+    /// 呼び出し側の予算を**ソースから採る**（呼び出しが増えても勝手に検査される）。
+    /// パターンは `concat!` で分割して書く（このテスト自身のソース行が対象に入るため）
+    fn claude_wait_budgets() -> Vec<(u32, u64, u64)> {
+        let src = include_str!("main.rs");
+        let call = concat!("wait_for_claude", "_state(");
+        let budget = concat!("text_wait", "_budget(");
+        let mut out = Vec::new();
+        for (index, _) in src.match_indices(call) {
+            // 文字境界で切る（日本語コメントの途中でバイト単位に切ると落ちる）
+            let head: String = src[index..].chars().take(400).collect();
+            let Some(pos) = head.find(budget) else {
+                continue;
+            };
+            let args = &head[pos + budget.len()..];
+            let Some(close) = args.find(')') else {
+                continue;
+            };
+            let nums: Vec<u64> = args[..close]
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
+            if let [times, interval, base] = nums[..] {
+                out.push((times as u32, interval, base));
+            }
+        }
+        out
+    }
+
+    /// 注入 `slow` の遅れは**旧の固定窓を超え、新の素の上限に収まる**。
+    /// この不等式が崩れると「旧が落ちて新が通る」の A/B が成立しない
+    #[test]
+    fn 注入の遅れは旧の窓を超えて新の上限に収まる() {
+        let sites = claude_wait_budgets();
+        assert!(
+            sites.len() >= 14,
+            "実 claude の待ちの呼び出しが採れていない（採れたのは {sites:?}）"
+        );
+        assert!(
+            sites.contains(&(600, 500, 360)),
+            "項目 101c の予算（旧 600 × 500ms）が採れていない: {sites:?}"
+        );
+        for (times, interval, base) in sites {
+            let budget = text_wait_budget(times, interval, base);
+            let (legacy, _) = resolve_claude_wait(budget, Some(0.0), true);
+            let (idle, _) = resolve_claude_wait(budget, Some(0.0), false);
+            let delay = inject_771_delay(legacy);
+            assert!(
+                delay > legacy,
+                "注入が旧の窓を超えていない: ({times}, {interval}, {base})"
+            );
+            assert!(
+                delay < idle,
+                "注入が新の上限に収まっていない: ({times}, {interval}, {base})"
+            );
+        }
+    }
+
+    /// 「4 倍まで積んでも足りなかった」の印（診断行の `capped=`）。
+    /// SKIP にして隠さないので、これは**理由の申告**にしか使わない
+    #[test]
+    fn 極端な混み具合だけが打ち切りとして申告される() {
+        assert!(!claude_budget_capped(None));
+        assert!(!claude_budget_capped(Some(0.0)));
+        assert!(!claude_budget_capped(Some(2.9)));
+        assert!(claude_budget_capped(Some(3.0)));
+        assert!(claude_budget_capped(Some(30.0)));
+    }
+}
+
 /// **測る窓が汚れているかの判定**（#858 / #995）。
 ///
 /// 項目 108（#786。クロームを測る）と項目 110（#803。ヘッダを測る）は、どちらも
@@ -66774,6 +67124,149 @@ mod selftest_wait_watchdog {
             concat!("focused_", "contains(window")
         );
         assert!(fixed_window_then_screen_text_read(&negative).is_empty());
+    }
+
+    /// **実 claude の応答を固定回数の窓で待っていない**（#771）。
+    ///
+    /// `TAKO_SELF_TEST_CLAUDE` 系の項目（45c=#28 / 95c=#716 / 97c=#720 / 101c=#749）が
+    /// 待っている相手は**実 LLM** なので、応答までの時間は機の混み具合で桁が動く。
+    /// 旧実装はどれも `for _ in 0..N { … wait(cx, M).await }` = 固定 N×M 窓で、
+    /// 項目 101c は load1 が 11〜79 の機で 2/2 回 `saw_marker=false` になっていた
+    /// （#771 の実測）。
+    ///
+    /// なぜ既存の番犬をすり抜けたか: #1153 / #1165 のアンカーは
+    /// 「`for _ in 0..N {` の**次の行**が `wait(cx,`」なので、**待ちがループの末尾に
+    /// ある**形（`… if ok { break; } wait(cx, 500).await;`）を見ない。実 claude の
+    /// 待ちは 14 か所のうち 4 か所がその形だった。
+    ///
+    /// 正しい形は `wait_for_claude_state`（状態待ち + `state_wait_budget` の上限 +
+    /// 諦めたときの診断 2 行）。**片付けの Ctrl-C 連打は対象外**で、その見分けは
+    /// 「早く抜ける（`break`）か」= 待ちの結果を判定に使っているか、で付ける
+    /// （片付けは何回叩いたかだけが意味を持つので `break` を持たない）。
+    /// パターンは `concat!` で分割して書く（番犬自身のソース行が検査対象に入るため）
+    fn fixed_window_in_claude_e2e(src: &str) -> Vec<usize> {
+        let lines: Vec<&str> = src.lines().collect();
+        let gate = concat!("claude_", "e2e");
+        let wait_call = concat!("wait(cx", ", ");
+        let mut hits = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            // 実 claude の e2e で守られている**ブロックの入口**だけを region の頭にする
+            // （`let claude_e2e = …;` のような宣言は行末が `{` ではないので入らない）
+            if !(line.contains(gate) && line.trim_end().ends_with('{')) {
+                continue;
+            }
+            let indent = line.len() - line.trim_start().len();
+            let mut end = lines.len();
+            for (offset, candidate) in lines.iter().enumerate().skip(index + 1) {
+                let trimmed = candidate.trim_start();
+                if !trimmed.is_empty()
+                    && candidate.len() - trimmed.len() == indent
+                    && trimmed.starts_with('}')
+                {
+                    end = offset;
+                    break;
+                }
+            }
+            for (offset, candidate) in lines.iter().enumerate().take(end).skip(index + 1) {
+                let trimmed = candidate.trim();
+                if !(trimmed.starts_with("for ")
+                    && trimmed.contains(" in 0..")
+                    && trimmed.ends_with('{'))
+                {
+                    continue;
+                }
+                // 本文は**インデントで閉じ括弧まで**採る（行数で切ると、本文の長い
+                // ループの末尾にある `wait` を見落とす = #771 の項目 101c がこれ）
+                let loop_indent = candidate.len() - candidate.trim_start().len();
+                let mut body = String::new();
+                for inner in lines.iter().take(end).skip(offset + 1) {
+                    let trimmed = inner.trim_start();
+                    if !trimmed.is_empty()
+                        && inner.len() - trimmed.len() == loop_indent
+                        && trimmed.starts_with('}')
+                    {
+                        break;
+                    }
+                    body.push_str(inner.trim());
+                    body.push(' ');
+                }
+                if body.contains(wait_call) && body.contains("break") {
+                    hits.push(offset + 1);
+                }
+            }
+        }
+        hits.sort_unstable();
+        hits.dedup();
+        hits
+    }
+
+    #[test]
+    fn 実claudeの応答を固定窓で待っていない() {
+        let src = include_str!("main.rs");
+        let hits = fixed_window_in_claude_e2e(src);
+        assert!(
+            hits.is_empty(),
+            "main.rs:{hits:?} が「実 claude の応答を固定回数の窓で待つ」形で書かれている。\
+             相手は実 LLM なので応答までの時間は機の混み具合で桁が動き、混んだ機では\
+             窓を使い切って落ちる（#771 の項目 101c は load1 が 11〜79 の機で 2/2 回\
+             `saw_marker=false`）。`wait_for_claude_state`（状態待ち + `state_wait_budget` の\
+             上限 + 諦めたときの診断行）を使うこと"
+        );
+    }
+
+    /// 検出力の担保: 番犬自身が空振りしないこと（#771 で直した形そのものを与える）
+    #[test]
+    fn 番犬は末尾待ちの実claude窓を見逃さず片付けは許す() {
+        let gate = format!(
+            "                if {}_enabled(\"749\") {{",
+            concat!("claude_", "e2e")
+        );
+        let wait_line = format!(
+            "                        {}",
+            concat!("wait(cx", ", 500).await;")
+        );
+        let close = "                }";
+        // 待ちが**ループの末尾**にある形（#1153 / #1165 の番犬が見ない形）
+        let bad = [
+            gate.as_str(),
+            "                    for _ in 0..600 {",
+            "                        let (c, m, d) = read(app);",
+            "                        if closed { break; }",
+            wait_line.as_str(),
+            "                    }",
+            close,
+        ]
+        .join("\n");
+        assert_eq!(fixed_window_in_claude_e2e(&bad), vec![2]);
+        // 片付けの Ctrl-C 連打（判定に使わない = `break` を持たない）は許す
+        let teardown = [
+            gate.as_str(),
+            "                    for _ in 0..3 {",
+            "                        let _ = window.update(cx, |app, _, _| ctrl_c(app));",
+            wait_line.as_str(),
+            "                    }",
+            close,
+        ]
+        .join("\n");
+        assert!(fixed_window_in_claude_e2e(&teardown).is_empty());
+        // 状態待ちヘルパーへ寄せた形は許す
+        let helper = format!(
+            "                    let closed = {}(window, cx, tag, pane, budget, step).await;",
+            concat!("wait_for_claude", "_state")
+        );
+        let good = [gate.as_str(), helper.as_str(), close].join("\n");
+        assert!(fixed_window_in_claude_e2e(&good).is_empty());
+        // 実 claude の e2e の外にある固定窓は対象外（#1153 / #1165 の番犬が見る）
+        let elsewhere = [
+            "                if other_gate {",
+            "                    for _ in 0..8 {",
+            wait_line.as_str(),
+            "                        if ok { break; }",
+            "                    }",
+            close,
+        ]
+        .join("\n");
+        assert!(fixed_window_in_claude_e2e(&elsewhere).is_empty());
     }
 
     #[test]
