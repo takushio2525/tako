@@ -99,3 +99,11 @@
   経路 3（カーソルなしの番号つき連なりを anchor）+ `label_truncated` 申告 + 2 列レイアウトの説明列をラベルへ混ぜない、の 3 点で直した
 - fmt / clippy / `cargo test --workspace` 全緑（3521 件）+ 隔離 GUI（tako-vd）の実 claude 25 桁 × 44 行ペインで
   CLI / MCP / watch の 3 経路を実測 / A/B `TAKO_1143_LEGACY=1` で新規 14 本中 10 本が FAILED。仕様は FR-2.25.11
+
+## 2026-09-07（#1136: 夜間リリースが共有ツリーを detached のまま放置する問題を根治）
+- リリース作業を**使い捨て worktree**（`git worktree add --detach` → trap で撤去）へ移し、
+  install_root の HEAD を一切触らない形にした。成功・ビルド失敗・片肺・SIGTERM のどれでも main のまま
+- 重複コミットの経路は「ビルド中に origin/main が進む → push 拒否 → `set -e` で無言死 →
+  未 push のリリースコミットごと detached が残る」。押し出す前に先端を照合して中止するようにし、
+  多重起動ロックを HOME 単位 + **リポジトリ単位**の 2 段にした（$HOME が違う並走を止められていなかった）
+- 検証: test-nightly-reserve 126 PASS（新規 7 本）/ test-release-retry 55 PASS / A/B で修正前は 18 FAIL
