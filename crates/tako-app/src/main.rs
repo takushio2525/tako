@@ -29342,6 +29342,66 @@ mod self_test {
         let mut cursor_notes: Vec<String> = Vec::new();
         let mut cursor_ok = true;
         let mut hidden_ok = false;
+        // #1122 の診断: カーソル色のインクが**実際にどこへ乗っているか**を格子へ写す。
+        // 測ったセルが 0 でもペイン全体に色が在れば「別の場所に描かれている」と分かる
+        let cursor_ink =
+            |f: &image::RgbaImage, g: &GridGeom| -> (usize, Option<(usize, usize)>, usize) {
+                let total = color_pixels_in_bounds(f, profile_bounds(g), scale, g.cursor, 10, flip);
+                let mut best = (0usize, None);
+                for row in 0..g.screen.rows {
+                    for col in 0..g.screen.cols {
+                        let b = grid_cell_bounds(&g.area, g.cell, g.subline, col, 1, row);
+                        let n = color_pixels_in_bounds(f, b, scale, g.cursor, 10, flip);
+                        if n > best.0 {
+                            best = (n, Some((col, row)));
+                        }
+                    }
+                }
+                (total, best.1, best.0)
+            };
+        let mirror_state = |cx: &mut AsyncApp| -> (bool, Option<f32>) {
+            window
+                .update(cx, |app, _, _| {
+                    (
+                        app.mirror_scroll_pane(geom.pane),
+                        app.scroll_ctls
+                            .get(&geom.pane)
+                            .and_then(|c| c.mirror.as_ref())
+                            .map(|m| m.effective_position()),
+                    )
+                })
+                .unwrap_or((false, None))
+        };
+        // #1122: 器（tmux）つきのペインは前段の scroll ラウンドでミラーが立ったまま残る。
+        // ミラーが立っているあいだ `compose_mirror_lines` は表示行を tmux 履歴（capture 由来）
+        // へ差し替えるので、**ライブ画面のカーソルは 1 px も画面に出ない**（#159 の設計どおり）。
+        // 一方 `grid_geom` が読む `session.screen()` はライブなので位置だけは返り続け、
+        // 「位置は在るのに塗られていない」に見えていた（実測 `mirror_pos=Some(0.5)` →
+        // 出力が進むと 41.5 まで育つ / `fill=272` は 0.5 行ぶんのサブラインずれで
+        // row 0 が半分だけ見えている回）。`session.scroll_to_bottom()` は alacritty 側の
+        // `display_offset` を戻すだけでミラーには触らない。
+        //
+        // 実ユーザーの打鍵は必ず `cancel_scroll_before_input` を通ってライブへ戻る
+        // （`main.rs` のキー経路と IME 確定の 2 箇所）。検査も**同じ前処理を通してから**書く
+        // = 前提を作る。これで器つきでも 5 通りを実測できる（skip にしない）。
+        // 旧挙動（前提を作らずに書く）は `TAKO_1122_LEGACY=1`
+        let legacy_1122 = std::env::var_os("TAKO_1122_LEGACY").is_some();
+        let write_cursor_cmd = |cx: &mut AsyncApp, cmd: &str| {
+            window
+                .update(cx, |app, _, cx| {
+                    if !legacy_1122 {
+                        app.cancel_scroll_before_input(geom.pane);
+                    }
+                    if let Some(session) = app.terminals.get(&geom.pane) {
+                        session.write(pty_line(cmd));
+                    }
+                    cx.notify();
+                })
+                .ok();
+        };
+        // 表示がライブ画面か（ミラー合成中でないか）。`compose_mirror_lines` は
+        // `effective_position() > 0` のときだけ履歴へ差し替える
+        let mut display_live = true;
         // 比較のためプレビューペインを右に開いてフォーカスを奪う（PTY を増やさない）
         let side_file = dir.join("side.txt");
         std::fs::write(&side_file, "side\n").expect("visual-test グリッド: 副ペイン用ファイル");
@@ -29378,15 +29438,7 @@ mod self_test {
                 let shape_script = dir.join(format!("cursor-{shape}.sh"));
                 std::fs::write(&shape_script, format!("printf '{sequence}'\n"))
                     .expect("visual-test グリッド: カーソル形状スクリプト");
-                window
-                    .update(cx, |app, _, cx| {
-                        if let Some(session) = app.terminals.get(&geom.pane) {
-                            session
-                                .write(pty_line(&format!("clear; sh {}", shape_script.display())));
-                        }
-                        cx.notify();
-                    })
-                    .ok();
+                write_cursor_cmd(cx, &format!("clear; sh {}", shape_script.display()));
                 cx.background_executor()
                     .timer(Duration::from_millis(900))
                     .await;
@@ -29420,9 +29472,21 @@ mod self_test {
                         )
                     })
                     .unwrap_or((0, 0));
+                let ink = cursor_ink(&cursor_frame, &now);
+                let mstate = mirror_state(cx);
+                display_live &= mstate.1.is_none_or(|p| p <= 0.0);
                 cursor_notes.push(format!(
-                    "{shape}/focused={focused} cell={:?} fill={} area={}",
-                    now.screen.cursor, hit.0, hit.1
+                    "{shape}/focused={focused} cell={:?} fill={} area={} \
+                     mirrored={} mirror_pos={:?} offset={} ink_total={} ink_best={:?}({})",
+                    now.screen.cursor,
+                    hit.0,
+                    hit.1,
+                    mstate.0,
+                    mstate.1,
+                    now.screen.display_offset,
+                    ink.0,
+                    ink.1,
+                    ink.2
                 ));
                 cursor_ok &= now.screen.cursor.is_some() && hit.0 * 2 >= hit.1 && hit.1 > 0;
             }
@@ -29431,15 +29495,7 @@ mod self_test {
                 let hide_script = dir.join("cursor-hide.sh");
                 std::fs::write(&hide_script, "printf '\\033[?25l'\n")
                     .expect("visual-test グリッド: カーソル非表示スクリプト");
-                window
-                    .update(cx, |app, _, cx| {
-                        if let Some(session) = app.terminals.get(&geom.pane) {
-                            session
-                                .write(pty_line(&format!("clear; sh {}", hide_script.display())));
-                        }
-                        cx.notify();
-                    })
-                    .ok();
+                write_cursor_cmd(cx, &format!("clear; sh {}", hide_script.display()));
                 cx.background_executor()
                     .timer(Duration::from_millis(900))
                     .await;
@@ -29459,20 +29515,19 @@ mod self_test {
                     flip,
                 );
                 hidden_ok = now.screen.cursor.is_none() && stray == 0;
-                cursor_notes.push(format!("hidden cell={:?} stray={stray}", now.screen.cursor));
+                let ink = cursor_ink(&hidden_frame, &now);
+                let mstate = mirror_state(cx);
+                display_live &= mstate.1.is_none_or(|p| p <= 0.0);
+                cursor_notes.push(format!(
+                    "hidden cell={:?} stray={stray} mirrored={} mirror_pos={:?} \
+                     offset={} ink_best={:?}({})",
+                    now.screen.cursor, mstate.0, mstate.1, now.screen.display_offset, ink.1, ink.2
+                ));
                 // 元に戻す（以降の節はカーソルが見える前提）
                 let show_script = dir.join("cursor-show.sh");
                 std::fs::write(&show_script, "printf '\\033[?25h\\033[0 q'\n")
                     .expect("visual-test グリッド: カーソル復帰スクリプト");
-                window
-                    .update(cx, |app, _, cx| {
-                        if let Some(session) = app.terminals.get(&geom.pane) {
-                            session
-                                .write(pty_line(&format!("clear; sh {}", show_script.display())));
-                        }
-                        cx.notify();
-                    })
-                    .ok();
+                write_cursor_cmd(cx, &format!("clear; sh {}", show_script.display()));
                 cx.background_executor()
                     .timer(Duration::from_millis(700))
                     .await;
@@ -29488,6 +29543,13 @@ mod self_test {
         check(
             hidden_ok,
             "visual-test 端末グリッド: DECTCEM で隠すとカーソル色が出ない（対照）(#787)",
+        );
+        // 前提そのものを検査する（#1122）。ミラーが立っていたら測っていたのは
+        // tmux 履歴で、上の 2 本は「カーソルの描画」を見ていない。
+        // 診断行の `mirror_pos=` に実値が出るので、落ちた回はそこで分かる
+        check(
+            display_live,
+            "visual-test 端末グリッド: カーソルを測るあいだ表示はライブ画面（ミラー合成中でない）(#1122)",
         );
 
         // 後片付け（以降の節へ影響を残さない）
