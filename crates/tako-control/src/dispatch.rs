@@ -9675,7 +9675,7 @@ fn resolve_choice_index(
             .enumerate()
             .map(|(i, o)| {
                 let mark = if o.label_truncated {
-                    "…(切り詰め)"
+                    "（切り詰め）"
                 } else {
                     ""
                 };
@@ -16976,7 +16976,7 @@ mod tests {
             .to_string();
         assert!(err.contains("番号で指定する"), "{err}");
         // 一覧の表示にも切り詰めが出る（master がラベルを信用しないための手がかり）
-        assert!(err.contains("1. Defaul……(切り詰め)"), "{err}");
+        assert!(err.contains("1. Defaul…（切り詰め）"), "{err}");
     }
 
     #[test]

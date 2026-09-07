@@ -351,8 +351,9 @@ fn label_before_column<'a>(line: &str, label: &'a str, col: usize) -> Option<&'a
 /// - 入力欄のプロンプト（`❯` / `›` / `>`）が画面に 1 つも無い
 ///   （= 入力欄が奪われている。呼び出し元で確認済み）
 /// - 同じ桁に揃った番号つき行が 2 つ以上あり、**番号が 1 ずつ増える**
-/// - その連なりの上に**罫線**がある（= ダイアログの箱の中。Markdown の `---` は
-///   [`is_rule_line`] の文字集合に無いので当たらない）
+/// - **TUI が描いた一覧**である証拠がある: 連なりの上に**罫線**がある（= 箱の中。
+///   Markdown の `---` は [`is_rule_line`] の文字集合に無いので当たらない）か、
+///   選択肢が**2 列レイアウト**（[`description_column`]）で描かれている
 /// - 連なりのあとに続くのは空行・キー案内・罫線・**より深い字下げ**（説明列の
 ///   折り返し）だけ = 画面が選択肢一覧の途中で尽きている
 fn detect_cursorless_numbered(lines: &[&str], bottom: usize) -> Option<ChoiceList> {
@@ -382,9 +383,18 @@ fn detect_cursorless_numbered(lines: &[&str], bottom: usize) -> Option<ChoiceLis
         return None;
     }
 
-    // 連なりの上に罫線（= ダイアログの箱の上端）があること
+    // 「TUI が描いた一覧」の証拠が要る。次のどちらかで足りる:
+    //  a) 連なりの上に罫線がある（= ダイアログの箱の中）
+    //  b) 選択肢が 2 列レイアウト（ラベル列 + 説明列）で描かれている
+    // b を認めるのは、**画面の上が切られていても判定できる**ようにするため。
+    // `worker_status` の `recent_output` は末尾 30 行に丸められる（`tail_join`）ので、
+    // 25 桁の `/model` では箱の上端が窓の外に落ちる（実測: 罫線は画面の 3 行目 =
+    // 窓に入らない）。2 列レイアウトは continuation 行が説明列の桁へぴたりと
+    // 揃っていることが根拠なので、本文の箇条書き（折り返しても列は揃わない）や
+    // Markdown の番号リストは満たさない
     let first = rows[0];
-    if !(0..first).any(|i| is_rule_line(lines[i])) {
+    let framed = (0..first).any(|i| is_rule_line(lines[i]));
+    if !framed && description_column(lines, &rows).is_none() {
         return None;
     }
 
@@ -1597,6 +1607,34 @@ Antigravity CLI requires permission to read, edit, and execute files here.
     }
 
     #[test]
+    fn issue1143_画面の上が切られていても2列レイアウトなら読める() {
+        // `worker_status` の `recent_output` は末尾 30 行に丸められる（`tail_join`）。
+        // 25 桁の `/model` では箱の上端（罫線）が画面の 3 行目にあるので窓に入らない。
+        // 実採取（25 桁 × 44 行）の末尾 30 行をそのまま材料にする
+        let full = rows(MODEL_25_NO_CURSOR);
+        let tail: Vec<&str> = full[full.len() - 30..].to_vec();
+        assert!(
+            !tail.iter().any(|l| is_rule_line(l)),
+            "この検証の前提は「窓に罫線が無い」こと"
+        );
+        let list = detect_choice_list(&tail).expect("末尾 30 行だけでも検知される");
+        assert!(list.numbered);
+        assert_eq!(list.cursor_row, None);
+        assert_eq!(
+            list.options
+                .iter()
+                .map(|o| (o.number, o.label.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(1), "Defaul…".to_string()),
+                (Some(2), "Opus (…".to_string()),
+            ],
+            "窓に入っている選択肢だけを組む"
+        );
+        assert!(list.options.iter().all(|o| o.label_truncated));
+    }
+
+    #[test]
     fn issue1143_カーソルなし経路は本文の箇条書きを拾わない() {
         // 罫線の無い番号つき並び（応答本文・シェルで開いた Markdown）は
         // 入力欄が見えていなくてもダイアログではない
@@ -1620,6 +1658,19 @@ Antigravity CLI requires permission to read, edit, and execute files here.
         assert!(
             detect_choice_list(&gaps).is_none(),
             "番号が 1 ずつ増えない並びを一覧と誤認した"
+        );
+        // 折り返しつきの箇条書き（罫線が窓の外に落ちた形を模す）。
+        // 続きの行は在るが、選択肢の行に「2 桁以上の空白の切れ目」が無いので
+        // 2 列レイアウトの証拠にならない = 採らない
+        let wrapped_prose = [
+            "  1. 依存を入れる。これは長くて",
+            "     次の行へ折り返す説明",
+            "  2. ビルドする。こちらも長くて",
+            "     折り返す",
+        ];
+        assert!(
+            detect_choice_list(&wrapped_prose).is_none(),
+            "折り返しただけの本文の箇条書きを一覧と誤認した"
         );
         // 一覧の後ろに本文が続く = 画面が一覧の途中で尽きていない
         let trailing = [

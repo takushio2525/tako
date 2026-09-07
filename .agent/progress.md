@@ -97,4 +97,5 @@
 ## 2026-09-07（#1143: 狭いペインの `/model` セレクタを選択肢ダイアログとして読めるようにした）
 - 実採取で原因確定: カーソル `❯` は「描かれない」のではなく**ダイアログがペインより高いと画面外へ出る**（25×70 では出る）。
   経路 3（カーソルなしの番号つき連なりを anchor）+ `label_truncated` 申告 + 2 列レイアウトの説明列をラベルへ混ぜない、の 3 点で直した
-- fmt / clippy / `cargo test --workspace` 全緑（3520 件）/ A/B `TAKO_1143_LEGACY=1` で新規 13 本中 9 本が FAILED。仕様は FR-2.25.11
+- fmt / clippy / `cargo test --workspace` 全緑（3521 件）+ 隔離 GUI（tako-vd）の実 claude 25 桁 × 44 行ペインで
+  CLI / MCP / watch の 3 経路を実測 / A/B `TAKO_1143_LEGACY=1` で新規 14 本中 10 本が FAILED。仕様は FR-2.25.11
