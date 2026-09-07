@@ -25247,6 +25247,20 @@ mod self_test {
         needle: &str,
         timeout: Duration,
     ) -> Option<Duration> {
+        wait_for_focused_text_polled(window, cx, needle, timeout, Duration::from_millis(100)).await
+    }
+
+    /// [`wait_for_focused_text_timed`] のポーリング間隔つき版（#1165）。
+    ///
+    /// 間隔を外から与えられるようにしたのは、**同一バイナリで旧挙動（固定窓）を
+    /// 再現できる**ようにするため（`TAKO_1165_LEGACY=1`）。判定そのものは変わらない
+    async fn wait_for_focused_text_polled(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        needle: &str,
+        timeout: Duration,
+        poll: Duration,
+    ) -> Option<Duration> {
         let started = std::time::Instant::now();
         loop {
             if focused_contains(window, cx, needle) {
@@ -25261,10 +25275,142 @@ mod self_test {
                 );
                 return None;
             }
-            cx.background_executor()
-                .timer(Duration::from_millis(100))
-                .await;
+            cx.background_executor().timer(poll).await;
         }
+    }
+
+    /// **画面テキストの状態待ちの予算**（#1165）。
+    ///
+    /// 新経路（`base` を [`state_wait_budget`] で混み具合に応じて伸ばす）と
+    /// 旧経路（固定窓 = `回数 × 間隔`）の数値を 1 つに持つ。**旧の数値をコードに
+    /// 残す**のは、`TAKO_1165_LEGACY=1` で同一バイナリの A/B が取れるようにするため
+    #[derive(Clone, Copy)]
+    pub(crate) struct TextWaitBudget {
+        /// 新経路の素の上限（混み具合で伸ばす前の値）
+        base: Duration,
+        /// 旧経路の固定窓（`回数 × 間隔`）
+        legacy_window: Duration,
+        /// 旧経路のポーリング間隔（固定窓の 1 周期）
+        legacy_poll: Duration,
+    }
+
+    /// 旧実装の固定窓（`times × interval_ms`）と新しい素の上限（`base_secs`）から予算を組む。
+    ///
+    /// 呼び出し側に旧の数値をそのまま書かせるのは、**何を何へ置き換えたか**が
+    /// コードから読めるようにするため（例: 項目 1b は `8 × 800ms` → 素 20 秒）
+    pub(crate) fn text_wait_budget(times: u32, interval_ms: u64, base_secs: u64) -> TextWaitBudget {
+        TextWaitBudget {
+            base: Duration::from_secs(base_secs),
+            legacy_window: Duration::from_millis(interval_ms * u64::from(times)),
+            legacy_poll: Duration::from_millis(interval_ms),
+        }
+    }
+
+    /// 予算から「上限 / ポーリング間隔 / 試行回数」を決める（純粋関数。#1165）。
+    ///
+    /// 試行回数が 2 なのは**打鍵が 1 回落ちた**ぶん（#903 / #737）を吸収するため。
+    /// 項目 102（#1162）が 3 なのは Ctrl-C を挟んで画面ごと作り直す形だからで、
+    /// ここは「コマンドを打ち直してエコーを見る」だけなので 2 で足りる
+    /// （増やすと、本物の回帰があるときに FAILED を出すまでが無駄に長くなる）
+    pub(crate) fn resolve_text_wait(
+        budget: TextWaitBudget,
+        busy: Option<f64>,
+        legacy: bool,
+    ) -> (Duration, Duration, usize) {
+        if legacy {
+            (budget.legacy_window, budget.legacy_poll, 1)
+        } else {
+            (
+                state_wait_budget(budget.base, busy),
+                Duration::from_millis(100),
+                2,
+            )
+        }
+    }
+
+    /// **#1165 の A/B の口**: 設定すると「固定窓・1 回・送り直しなし」の旧経路へ戻る。
+    ///
+    /// 同じバイナリで旧挙動を再現できるようにしておくのは、直したことを実測で示すため
+    /// （#1162 の `TAKO_1162_LEGACY` と同じ役目）。**判定そのものは変えない**ので、
+    /// 旧経路でも期待値が出ていれば通る（= 待ち方だけの差であることを示せる）
+    fn legacy_1165() -> bool {
+        std::env::var_os("TAKO_1165_LEGACY").is_some()
+    }
+
+    /// **#1165 の注入口**（#1162 の `TAKO_1162_INJECT` と同じ役目）。2 系統ある。
+    ///
+    /// **① 遅れの再現**（`late`）: 項目 1b のエコーが返るのを 8 秒遅らせる。
+    /// 機の混み具合は再現できないので、Issue が観測した「エコーの反映が遅い」を
+    /// 人工的に作る。旧経路（固定 6.4 秒窓）は確定で落ち、新経路は待ってから通る。
+    ///
+    /// **② 検出力の担保**（`noecho`）: 期待文字列を出さないコマンドへ差し替える。
+    /// 待ちを延ばしても**本物の回帰は隠れない**ことの実測で、上限まで待ってから
+    /// その項目が FAILED になるのが正しい
+    fn inject_1165() -> String {
+        std::env::var("TAKO_1165_INJECT").unwrap_or_default()
+    }
+
+    /// **打鍵の結果が画面に出るまで状態で待ち、出なければ上限つきで送り直す**（#1165）。
+    ///
+    /// 対象は「画面に出るはずの文字列」を待つ検査（項目 1b / 17 / 20 / 45b / 45c / 58 / 59 / 81）。
+    /// 旧実装はどれも `for _ in 0..N { wait(cx, M).await; ok = focused_contains(…) }` =
+    /// **固定 N×M 窓**で、混んだ機ではエコーが返る前に窓を使い切って落ちていた
+    /// （#1165 の実測は項目 1b が load 12.9 で 6.4 秒を使い切った 1 回。
+    /// **1b は最初の項目なので落ちると 1c 以降が 1 つも走らない** = 被害が最大）。
+    ///
+    /// 直し方は #1162 の項目 102 と同じ 3 点:
+    /// - 上限は [`state_wait_budget`]（混み具合で**伸ばすだけ**・4 倍で打ち切り）
+    /// - 待ちは [`wait_for_focused_text_polled`]（状態到達まで待ち、上限で診断 1 行 + 偽）
+    /// - それでも出なければ**打鍵そのものが落ちた**疑い（#903 / #737）で上限つきに送り直す
+    ///
+    /// 送り直しに Ctrl-C を挟まないのは、ここで待っているのが**自分で終わる短命な
+    /// コマンド**だからで、進んでいる最中に殺すと判定が却って不安定になる
+    /// （画面を保持し続ける fixture を扱う項目 102 は Ctrl-C を挟む = 事情が違う）。
+    ///
+    /// 診断は毎回 1 行出す（`ok=` / `attempt=` / `waited=` / `budget=` + 実行環境の `load=`）。
+    /// 上限まで待って駄目なら偽なので、検出力は固定窓と同じか強い
+    /// （成立しない条件はいくら待っても成立しない）
+    async fn type_until_focused_text<F>(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        tag: &str,
+        needle: &str,
+        budget: TextWaitBudget,
+        mut send: F,
+    ) -> bool
+    where
+        F: FnMut(&mut AsyncApp),
+    {
+        let legacy = legacy_1165();
+        let (limit, poll, tries) = resolve_text_wait(budget, machine_busy(), legacy);
+        // `waited` は**この検査に費たした総時間**（送り直しを含む）。成功時の 1 回ぶん
+        // だけを出すと、諦めたときに `waited=0.0s` と書いてしまい「待っていない」と
+        // 読めてしまう（各試行の内訳は `TAKO_SELF_TEST_WAIT_TIMEOUT` の行に出る）
+        let started = std::time::Instant::now();
+        let mut ok = false;
+        let mut used = 0usize;
+        for attempt in 1..=tries {
+            used = attempt;
+            send(cx);
+            if wait_for_focused_text_polled(window, cx, needle, limit, poll)
+                .await
+                .is_some()
+            {
+                ok = true;
+                break;
+            }
+        }
+        let waited = started.elapsed().as_secs_f32();
+        // **判定した瞬間の混み具合まで出す**（#1162 と同じ理由）。冒頭の
+        // `TAKO_APP_SELF_TEST_ENV` は t=0 の値なので、この項目に効いていた負荷は
+        // そこからは分からない
+        println!(
+            "TAKO_SELF_TEST_1165: item={tag} ok={ok} attempt={used}/{tries} \
+             waited={waited:.1}s budget={:.1}s legacy={legacy} needle={needle:?} {}",
+            limit.as_secs_f32(),
+            env_line()
+        );
+        ok
     }
 
     /// **新しいペインへ最初の打鍵を送る前に、シェルが受け取れる状態になるまで待つ**（#903）。
@@ -35279,18 +35425,31 @@ mod self_test {
             );
 
             // 1b. TERM / COLORTERM 注入（tmux 等の「missing or unsuitable terminal」回避）。
-            //     高負荷環境（worker のビルド並走等）ではエコー反映が 800ms を超えることが
-            //     あるため、リトライループで待つ（フレーキー対策。項目 17 と同型）
-            type_text(any, cx, &sh.echo("TERMCHK=${TERM},${COLORTERM}"), true);
-            let mut term_ok = false;
-            for _ in 0..8 {
-                wait(cx, 800).await;
-                term_ok = focused_contains(window, cx, "TERMCHK=xterm-256color,truecolor");
-                if term_ok {
-                    break;
-                }
-            }
-            check(term_ok, "TERM / COLORTERM 注入");
+            //     **固定窓で待たない**（#1165）: 旧実装は「打つ → 固定 8 × 800ms = 6.4 秒の
+            //     窓でエコーを見る」形で、混んだ機（実測 load 12.9）ではエコーが返る前に
+            //     窓を使い切って落ちていた。**この項目は最初なので落ちると 1c 以降が
+            //     1 つも走らない** = 被害が最大だった
+            let term_cmd = match inject_1165().as_str() {
+                // ① 遅れの再現: エコーが返るのを 8 秒遅らせる（旧経路の 6.4 秒窓は
+                //    確定で落ち、新経路は待ってから通る）
+                "late" => sh.sequence(&[sh.sleep(8), sh.echo("TERMCHK=${TERM},${COLORTERM}")]),
+                // ② 検出力の担保: 期待文字列を出さない = 待ちを延ばしても本物の回帰は
+                //    隠れないこと（上限まで待ってから FAILED になるのが正しい）
+                "noecho" => sh.echo("TERMCHK=absent"),
+                _ => sh.echo("TERMCHK=${TERM},${COLORTERM}"),
+            };
+            check(
+                type_until_focused_text(
+                    window,
+                    cx,
+                    "1b",
+                    "TERMCHK=xterm-256color,truecolor",
+                    text_wait_budget(8, 800, 20),
+                    |cx| type_text(any, cx, &term_cmd, true),
+                )
+                .await,
+                "TERM / COLORTERM 注入",
+            );
 
             // 1c. 初期 cwd はホーム（.app 起動時に `/` へ落ちない）
             type_text(
@@ -35719,26 +35878,24 @@ mod self_test {
             );
 
             // 17. tako list がペイン内シェルから成功する（FR-2.2.4 / FR-2.2.7）。
-            //     高負荷環境では debug ビルドの CLI 起動 + IPC 往復が 1 秒を超えることが
-            //     あるため、リトライループで待つ（フレーキー対策）
-            type_text(
-                any,
-                cx,
-                &sh.on_success_echo(
-                    &sh.discard_output(&format!("{cli} list")),
-                    &sh.marker("TAKO-LIST-", 40, 2),
-                ),
-                true,
+            //     高負荷環境では debug ビルドの CLI 起動 + IPC 往復が 1 秒を超えるので、
+            //     **固定窓では待たない**（#1165。旧実装は 8 × 800ms = 6.4 秒）
+            let list_cmd = sh.on_success_echo(
+                &sh.discard_output(&format!("{cli} list")),
+                &sh.marker("TAKO-LIST-", 40, 2),
             );
-            let mut list_ok = false;
-            for _ in 0..8 {
-                wait(cx, 800).await;
-                list_ok = focused_contains(window, cx, "TAKO-LIST-42");
-                if list_ok {
-                    break;
-                }
-            }
-            check(list_ok, "tako list");
+            check(
+                type_until_focused_text(
+                    window,
+                    cx,
+                    "17",
+                    "TAKO-LIST-42",
+                    text_wait_budget(8, 800, 20),
+                    |cx| type_text(any, cx, &list_cmd, true),
+                )
+                .await,
+                "tako list",
+            );
 
             // 18. tako split --down --focus（呼び出し元の自動特定 + origin=cli + フォーカス移動）。
             // 既定はフォーカスを分割元に維持する仕様（3c9d363）のため、--focus を明示して
@@ -35800,26 +35957,25 @@ mod self_test {
             }
             check(sent, "tako send で別ペインへ送信");
 
-            // 20. tako read で別ペインの画面内容を取得する（FR-2.2.5。リトライは項目 17 と同型）
-            type_text(
-                any,
-                cx,
-                &sh.on_output_contains_echo(
-                    &format!("{cli} read --pane {pane2}"),
-                    "TAKO-SEND-42",
-                    &sh.marker("TAKO-READ-", 40, 2),
-                ),
-                true,
+            // 20. tako read で別ペインの画面内容を取得する（FR-2.2.5。
+            //     待ち方は項目 17 と同型 = 状態待ち。旧実装は 8 × 1000ms の固定窓（#1165）
+            let read_cmd = sh.on_output_contains_echo(
+                &format!("{cli} read --pane {pane2}"),
+                "TAKO-SEND-42",
+                &sh.marker("TAKO-READ-", 40, 2),
             );
-            let mut read_ok = false;
-            for _ in 0..8 {
-                wait(cx, 1000).await;
-                read_ok = focused_contains(window, cx, "TAKO-READ-42");
-                if read_ok {
-                    break;
-                }
-            }
-            check(read_ok, "tako read");
+            check(
+                type_until_focused_text(
+                    window,
+                    cx,
+                    "20",
+                    "TAKO-READ-42",
+                    text_wait_budget(8, 1000, 20),
+                    |cx| type_text(any, cx, &read_cmd, true),
+                )
+                .await,
+                "tako read",
+            );
 
             // 21. tako title --role（FR-2.2.6 / FR-2.1.3）
             type_text(
@@ -37813,17 +37969,19 @@ mod self_test {
                 //     ESC を ^[ とエコーするため、届いたバイト列が ^[[13;2u として見える）
                 type_text(any, cx, "cat", true);
                 wait(cx, 800).await;
-                press(any, cx, "shift-enter");
-                let mut shift_enter_csi_u = false;
-                for _ in 0..20 {
-                    wait(cx, 200).await;
-                    if focused_contains(window, cx, "[13;2u") {
-                        shift_enter_csi_u = true;
-                        break;
-                    }
-                }
+                // 届いたバイト列の出現も状態で待つ（#1165。旧実装は 20 × 200ms の固定窓）。
+                // 送り直しは Shift+Enter をもう 1 回押すだけ = 同じバイト列が増えるので
+                // 判定に影響しない（打鍵が落ちた #903 / #737 のぶんを吸収する）
                 check(
-                    shift_enter_csi_u,
+                    type_until_focused_text(
+                        window,
+                        cx,
+                        "45b",
+                        "[13;2u",
+                        text_wait_budget(20, 200, 15),
+                        |cx| press(any, cx, "shift-enter"),
+                    )
+                    .await,
                     "Shift+Enter が CSI u で届く（Issue #28）",
                 );
                 press(any, cx, "ctrl-c");
@@ -37844,9 +38002,16 @@ mod self_test {
             //     実機検証ツールという位置付け）
             if claude_e2e_enabled("28") {
                 type_text(any, cx, "claude", true);
+                // **固定窓で待たない**（#1165。旧実装は 80 × 500ms = 固定 40 秒）。
+                // ここは毎周期で信頼ダイアログを畳む**駆動**ループなので
+                // `type_until_focused_text`（送って待つだけ）には載せられないが、
+                // 上限は同じ `state_wait_budget` に通して混み具合へ追従させる
+                let (ready_budget, ready_poll, _) =
+                    resolve_text_wait(text_wait_budget(80, 500, 40), machine_busy(), legacy_1165());
+                let ready_started = std::time::Instant::now();
                 let mut claude_ready = false;
-                for _ in 0..80 {
-                    wait(cx, 500).await;
+                while ready_started.elapsed() < ready_budget {
+                    cx.background_executor().timer(ready_poll).await;
                     if focused_contains(window, cx, "trust this folder")
                         || focused_contains(window, cx, "Yes, I trust")
                     {
@@ -37858,6 +38023,14 @@ mod self_test {
                         break;
                     }
                 }
+                println!(
+                    "TAKO_SELF_TEST_1165: item=45c-ready ok={claude_ready} attempt=1/1 \
+                     waited={:.1}s budget={:.1}s legacy={} needle=\"shift+tab to cycle\" {}",
+                    ready_started.elapsed().as_secs_f32(),
+                    ready_budget.as_secs_f32(),
+                    legacy_1165(),
+                    env_line()
+                );
                 check(claude_ready, "45c: claude TUI 起動");
                 wait(cx, 2000).await;
                 type_text(any, cx, "hello28", false);
@@ -37919,16 +38092,19 @@ mod self_test {
                 wait(cx, 400).await;
                 press(any, cx, "ctrl-c");
                 wait(cx, 2500).await;
-                type_text(any, cx, "echo BACK28", true);
-                let mut back_to_shell = false;
-                for _ in 0..20 {
-                    wait(cx, 400).await;
-                    if focused_contains(window, cx, "BACK28") {
-                        back_to_shell = true;
-                        break;
-                    }
-                }
-                check(back_to_shell, "45c: claude 終了後にシェルへ復帰");
+                // 旧実装は 20 × 400ms の固定窓（#1165）
+                check(
+                    type_until_focused_text(
+                        window,
+                        cx,
+                        "45c-back",
+                        "BACK28",
+                        text_wait_budget(20, 400, 20),
+                        |cx| type_text(any, cx, "echo BACK28", true),
+                    )
+                    .await,
+                    "45c: claude 終了後にシェルへ復帰",
+                );
             }
 
             // 46. 全角行のマウス座標→セル変換。描画は 1 文字 = 1 div（w = cell_width × char_cols）
@@ -38586,31 +38762,30 @@ mod self_test {
             // 58. tako persist の ON/OFF と状態取得（Phase 5.5 / FR-5。CLI / MCP と同じ
             //     dispatch 経路。セルフテスト中は設定・レイアウトを永続化しない）。
             //     診断フィールド（layout_path / last_restore。Issue #30）の露出も確認する
-            type_text(
-                any,
-                cx,
-                &sh.on_success(
-                    &sh.discard_output(&format!("{cli} persist on")),
-                    &sh.on_output_contains_echo(
-                        &format!("{cli} persist"),
-                        "\"enabled\":true",
-                        // 診断フィールドの露出（#30）は続けて同じ経路で見る
-                        &sh.marker("TAKO-PS-", 50, 8),
-                    ),
+            let persist_cmd = sh.on_success(
+                &sh.discard_output(&format!("{cli} persist on")),
+                &sh.on_output_contains_echo(
+                    &format!("{cli} persist"),
+                    "\"enabled\":true",
+                    // 診断フィールドの露出（#30）は続けて同じ経路で見る
+                    &sh.marker("TAKO-PS-", 50, 8),
                 ),
-                true,
             );
-            // debug CLI 3 連発 + IPC 往復のため固定待ちでは不足することがある
-            // （リトライは項目 17 と同型のフレーキー対策）
-            let mut persist_status_ok = false;
-            for _ in 0..8 {
-                wait(cx, 1200).await;
-                persist_status_ok = focused_contains(window, cx, "TAKO-PS-58");
-                if persist_status_ok {
-                    break;
-                }
-            }
-            check(persist_status_ok, "tako persist on / 状態取得");
+            // debug CLI 3 連発 + IPC 往復なので**固定窓では待たない**
+            // （#1165。旧実装は 8 × 1200ms = 9.6 秒。`persist on` は冪等なので
+            // 送り直しても状態は変わらない）
+            check(
+                type_until_focused_text(
+                    window,
+                    cx,
+                    "58",
+                    "TAKO-PS-58",
+                    text_wait_budget(8, 1200, 25),
+                    |cx| type_text(any, cx, &persist_cmd, true),
+                )
+                .await,
+                "tako persist on / 状態取得",
+            );
             let persist_on = window
                 .update(cx, |app, _, _| app.tmux_persist)
                 .unwrap_or(false);
@@ -38651,16 +38826,20 @@ mod self_test {
                 }
                 check(session_up, "分割でバックエンドセッションが生える");
                 press(any, cx, sh.clear_line_key());
-                type_text(any, cx, "echo TAKO-BK-'OK'", true);
-                let mut echoed = false;
-                for _ in 0..20 {
-                    wait(cx, 500).await;
-                    echoed = focused_contains(window, cx, "TAKO-BK-OK");
-                    if echoed {
-                        break;
-                    }
-                }
-                check(echoed, "バックエンドペインでシェルが動く");
+                // 器（tmux）の client + 内側シェルの二段起動を跨ぐので
+                // **固定窓では待たない**（#1165。旧実装は 20 × 500ms = 10 秒）
+                check(
+                    type_until_focused_text(
+                        window,
+                        cx,
+                        "59",
+                        "TAKO-BK-OK",
+                        text_wait_budget(20, 500, 25),
+                        |cx| type_text(any, cx, "echo TAKO-BK-'OK'", true),
+                    )
+                    .await,
+                    "バックエンドペインでシェルが動く",
+                );
 
                 // 60. OSC 7 パススルー（allow-passthrough + シェル統合の包み直し）で
                 //     器越しでも cwd 検知（FR-2.4.1）が生きている。
@@ -45179,17 +45358,17 @@ mod self_test {
                 // 素通り禁止（#796 / #872）: ハンドルが死んでいると以前はここで
                 // 黙って飛ばされ、項目 81 が「何も検証していないのに緑」になっていた
                 check(setup_ok, "項目 81 の前提（ウィンドウハンドルが生きている） (#503)");
-                type_text(any, cx, "echo ST503OK", true);
-                let mut st503_ok = false;
-                for _ in 0..8 {
-                    wait(cx, 500).await;
-                    st503_ok = focused_contains(window, cx, "ST503OK");
-                    if st503_ok {
-                        break;
-                    }
-                }
+                // 旧実装は 8 × 500ms の固定窓（#1165）
                 check(
-                    st503_ok,
+                    type_until_focused_text(
+                        window,
+                        cx,
+                        "81",
+                        "ST503OK",
+                        text_wait_budget(8, 500, 15),
+                        |cx| type_text(any, cx, "echo ST503OK", true),
+                    )
+                    .await,
                     "フラグ残留でもパネル非表示なら打鍵がターミナルに届く (#503)",
                 );
             }
@@ -64110,7 +64289,7 @@ mod selftest_pty_enter_watchdog {
 /// 待ち続けてはいけない）
 #[cfg(test)]
 mod self_test_wait_budget_tests {
-    use super::self_test::state_wait_budget;
+    use super::self_test::{resolve_text_wait, state_wait_budget, text_wait_budget};
     use std::time::Duration;
 
     /// `load=unknown` の環境（Windows 実機で 1 か月ぶん出ていた）でも予算は残る
@@ -64152,6 +64331,36 @@ mod self_test_wait_budget_tests {
             state_wait_budget(Duration::from_secs(20), Some(10.0)),
             Duration::from_secs(80)
         );
+    }
+
+    /// #1165: 画面テキストの待ちも同じ予算に通る。旧経路（`TAKO_1165_LEGACY=1`）は
+    /// **項目 1b の固定窓そのまま**（8 × 800ms = 6.4 秒・1 回・送り直しなし）
+    #[test]
+    fn 旧経路は項目1bの固定窓をそのまま再現する() {
+        let (limit, poll, tries) = resolve_text_wait(text_wait_budget(8, 800, 20), Some(3.0), true);
+        assert_eq!(
+            limit,
+            Duration::from_millis(6400),
+            "固定窓が 8 × 800ms でない"
+        );
+        assert_eq!(poll, Duration::from_millis(800), "1 周期が 800ms でない");
+        assert_eq!(tries, 1, "旧経路は送り直さない");
+    }
+
+    /// 新経路は**混み具合で伸ばすだけ**で、上限つきの送り直しが付く。
+    /// 空いている機でも旧の固定窓より広いこと（6.4 秒 → 20 秒）が #1165 の核心
+    #[test]
+    fn 新経路は空いている機でも旧の固定窓より広い() {
+        let budget = text_wait_budget(8, 800, 20);
+        let (idle, poll, tries) = resolve_text_wait(budget, Some(0.0), false);
+        assert_eq!(idle, Duration::from_secs(20));
+        assert_eq!(poll, Duration::from_millis(100), "状態待ちの刻みが粗い");
+        assert_eq!(tries, 2, "打鍵落ち 1 回ぶんの送り直しが無い");
+        let (legacy, _, _) = resolve_text_wait(budget, Some(0.0), true);
+        assert!(idle > legacy, "新経路が旧の固定窓を超えていない");
+        // #1165 が観測した混み具合（load 12.9 / 12 コア ≒ 1.08）でさらに伸びる
+        let (busy, _, _) = resolve_text_wait(budget, Some(1.08), false);
+        assert!(busy > idle, "混んだ機で伸びていない");
     }
 }
 
@@ -65775,16 +65984,28 @@ mod selftest_wait_watchdog {
                 continue;
             }
             // 肯定形が 1 つでもあれば違反（`!focused_contains` だけなら見逃す）
-            let mut rest = following.as_str();
-            while let Some(at) = rest.find("focused_contains(window") {
-                if !rest[..at].ends_with('!') {
-                    hits.push(index + 1);
-                    break;
-                }
-                rest = &rest[at + 1..];
+            if has_positive_focused_contains(&following) {
+                hits.push(index + 1);
             }
         }
         hits
+    }
+
+    /// 本文に**肯定形の** `focused_contains` があるか（#796 / #1165 が共有）。
+    ///
+    /// `!` 付き（否定検査）を除くのは #796 と同じ理由: 「出ないこと」の確認は
+    /// 落ち着くまでの待ちが本質なので固定待ちで良い（出るものを待つのに固定時間を
+    /// 使うのが誤り）。パターンは `concat!` で分割して書く
+    /// （番犬自身のソース行が検査対象に入るため）
+    fn has_positive_focused_contains(body: &str) -> bool {
+        let mut rest = body;
+        while let Some(at) = rest.find(concat!("focused_", "contains(window")) {
+            if !rest[..at].ends_with('!') {
+                return true;
+            }
+            rest = &rest[at + 1..];
+        }
+        false
     }
 
     /// **打ち込んで描く疑似 TUI の fixture は、シェルの準備を待つ**（#903）。
@@ -66082,6 +66303,68 @@ mod selftest_wait_watchdog {
             concat!("wait_for_app", "_state")
         );
         assert!(fixed_window_then_growth_read(&good).is_empty());
+    }
+
+    /// **固定窓のあいだに画面の文字列を待っていない**（#1165）。
+    ///
+    /// `for _ in 0..8 { wait(cx, 800).await; ok = focused_contains(…) }` は
+    /// 「8 回 × 800ms = **固定 6.4 秒**」の窓で画面のエコーを待つ形で、混んだ機では
+    /// エコーが返る前に窓を使い切る。項目 1b（TERM / COLORTERM 注入）が load 12.9 で
+    /// これを踏み、**最初の項目なので 1c 以降が 1 つも走らなかった**（#1165 の実測）。
+    ///
+    /// なぜ既存の番犬をすり抜けたか: `画面の文字列を待つ検査は固定待ちに依存していない`
+    /// （#796）は「固定待ちの**直後**に `focused_contains`」しか見ないので、
+    /// **リトライループに包むと見逃す**。#1153 で入った「固定回数ループ」のアンカー
+    /// （`for _ in 0..N {` の次行が `wait(cx,`）へ needle を足して名指しできるようにした。
+    ///
+    /// 正しい形は `type_until_focused_text`（状態待ち + `state_wait_budget` の上限 +
+    /// 上限つきの送り直し）
+    fn fixed_window_then_screen_text_read(src: &str) -> Vec<usize> {
+        fixed_window_loop_bodies(src)
+            .into_iter()
+            .filter(|(_, body)| has_positive_focused_contains(body))
+            .map(|(line, _)| line)
+            .collect()
+    }
+
+    #[test]
+    fn 固定窓のあいだに画面の文字列を待っていない() {
+        let src = include_str!("main.rs");
+        let hits = fixed_window_then_screen_text_read(src);
+        assert!(
+            hits.is_empty(),
+            "main.rs:{hits:?} が「固定回数の窓のあいだに画面の文字列を待つ」形で書かれている。\
+             混んだ機ではエコーが返る前に窓を使い切り、**その項目以降が 1 つも走らなく\
+             なる**（#1165 の項目 1b は load 12.9 で 6.4 秒を使い切り、1c 以降が全部\
+             走らなかった）。`type_until_focused_text`（状態待ち + `state_wait_budget` の\
+             上限 + 上限つきの送り直し）を使うこと"
+        );
+    }
+
+    /// 検出力の担保: 番犬自身が空振りしないこと（#1165 で直した形そのものを与える）
+    #[test]
+    fn 番犬は固定窓の画面テキスト読みを見逃さず状態待ちは許す() {
+        let bad = format!(
+            "                for _ in 0..8 {{\n                    {}\n                    \
+             term_ok = {}, cx, \"TERMCHK=xterm-256color,truecolor\");",
+            concat!("wait(cx", ", 800).await;"),
+            concat!("focused_", "contains(window")
+        );
+        assert_eq!(fixed_window_then_screen_text_read(&bad), vec![1]);
+        // 状態待ちヘルパーへ寄せた形は許す
+        let good = format!(
+            "            let ok = {}(window, cx, \"1b\", needle, budget, |cx| send(cx)).await;",
+            concat!("type_until_focused", "_text")
+        );
+        assert!(fixed_window_then_screen_text_read(&good).is_empty());
+        // 否定検査（「出ないこと」の確認）は固定待ちで良い = 対象外（#796 と同じ規則）
+        let negative = format!(
+            "                for _ in 0..8 {{\n                    {}\n                    \
+             gone = !{}, cx, \"X\");",
+            concat!("wait(cx", ", 800).await;"),
+            concat!("focused_", "contains(window")
+        );
+        assert!(fixed_window_then_screen_text_read(&negative).is_empty());
     }
 
     #[test]
