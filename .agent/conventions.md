@@ -441,6 +441,28 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
   上限は `state_wait_budget` で機の混み具合に応じて**伸ばすだけ**にする
   （縮めない = 環境で判定が緩くならない / 4 倍で打ち切る = 回帰があるとき待ち続けない）。
   番犬テスト `dispatchの応答を固定窓で待っていない` が違反行を名指しで落とす
+- **「増えた数」を固定窓で測らない**（#1153）。総数の差分は、窓のあいだに
+  **関係のない何かが減る**と成立しない。項目 657 は `MenuInvoke` の直後 2.4 秒のうちに
+  先行項目の検証用ペインがコマンド終了で畳まれ、`invoked=true tabs=8->4` = アクションは
+  発火しているのに `tabs().len() > before` が偽になっていた（#1124 の実測）。
+  **作ったものの ID が押す前の集合に無いか**で見れば、他のタブ・ペインの増減に依らない
+  （注入 `TAKO_1153_INJECT=tabgone` の実測: `tabs=9->9 new_tab=Some(33)` で新経路は通る）。
+  番犬テスト `固定窓のあいだに増えた数を測っていない` が違反行を名指しで落とす。
+  「N 行増える」を固定窓で測る形も同じ穴で、**混み具合で 1 行の間隔が伸びる** fixture
+  （POSIX の `sleep` は 1 行ごとに fork + exec が入る）では窓を使い切る → 状態待ち +
+  `state_wait_budget`。**窓を伸ばしたら、窓の長さに比例する上限（再確認の回数など）も
+  同じ率で伸ばす**（項目 113 の `hops_bound`。実測: 窓 6.5 秒で 80 → 100）
+- **表示状態を読む前に「材料が揺れていないか」を状態で待つ**（#1153）。
+  `pane_display` の材料はどれも時間で解ける途中状態を持つ: `command_state` は
+  OSC 133 D が届くまで `Running` / `busy_children` は sleep_guard の 2 秒 tick が
+  更新するまで真 / 生成直後の猶予（#720）が生きていれば `Preparing`。
+  **とくに猶予は role を付けると長い方（`SettleKind::Agent` = 25 秒）へ切り替わる**
+  （`PaneSettle::state`）ので、role を貼った直後に 1 回読む形は
+  `display=preparing` / `settling=true` / `reason=null` を読んで**25 秒間ずっと**落ちる
+  （#1153 / #1124 の実測。`prune_pane_settle` の 2 秒 tick が追いつく前に読むと踏む）。
+  **混み具合と単調に対応しない**（load 1.63 の静かな機でも落ちた）ので、待ちの長さでは
+  なく状態で待つ。診断行には材料そのもの（`pane_display_diag` = `display` / `reason` /
+  `state` / `has_role` / `busy_children` / `released` / `settling`）と `waited=` を毎回出す
 - **疑似 TUI の fixture は「ペインの起動コマンド」で描く。打ち込むなら準備を待つ**。
   既にあるペインへ打ち込む形は Windows で 3 通り壊れた（#903 の実測）:
   ①状態切替の Ctrl+C で**器（psmux）の client が終了**し外側 PTY ごと死ぬ
