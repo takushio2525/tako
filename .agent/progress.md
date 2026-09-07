@@ -106,4 +106,5 @@
 - 重複コミットの経路は「ビルド中に origin/main が進む → push 拒否 → `set -e` で無言死 →
   未 push のリリースコミットごと detached が残る」。押し出す前に先端を照合して中止するようにし、
   多重起動ロックを HOME 単位 + **リポジトリ単位**の 2 段にした（$HOME が違う並走を止められていなかった）
-- 検証: test-nightly-reserve 126 PASS（新規 7 本）/ test-release-retry 55 PASS / A/B で修正前は 18 FAIL
+- 検証: test-nightly-reserve 129 PASS（新規 7 本・CI へも載せた）/ test-release-retry 55 PASS /
+  A/B で修正前は 20 FAIL。失敗経路 4 種の HEAD before/after を隔離環境で実測
