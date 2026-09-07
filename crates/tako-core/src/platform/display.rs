@@ -26,13 +26,38 @@
 //! [`select`] は候補の一覧を受け取るだけなので **macOS 上から Windows 側の挙動も検証できる**
 //! （`support` / `window_lifecycle` / `dpi` と同じ作法）。
 //!
-//! ## 見つからないときは止めない
+//! ## 見つからないときの構え（#1160）
 //!
-//! 指定されたディスプレイが無いのは**検証の都合**であって、tako が起動できない理由ではない。
-//! [`Selection::NotFound`] を返して呼び出し側は既定動作（メイン画面）へ落ち、
-//! 理由を persist.log へ 1 行だけ残す。
+//! [`Selection::NotFound`] のあとどうするかは [`miss_for`] が決める。分かれ目は
+//! **面が 1 枚も見えていないか**（`enumeration_empty`）で、`is_verification_gui` だけで
+//! 決めてはいけない。
+//!
+//! - **面が 1 枚も見えない + 検証用 GUI**: **窓を開かずに終わる**。列挙が空なのは
+//!   「置き先が無い」ではなく**まだ分からない**状態（下記）なので、ここで既定の面へ
+//!   落とすと #1141 の目的が黙って破れる
+//! - **面は見えているが当たらない**: 既定の面へ落ちて起動は止めない。その機に置き先が
+//!   無いということで（CI・他人の環境・仮想ディスプレイを配線していない Windows =
+//!   FR-4.8.10）、**ここで開かないと検証そのものが回らなくなる**。代わりに
+//!   [`Placement::fallback_notice`] で起動時に見える警告を出す
+//! - **通常起動で `TAKO_DISPLAY` が外れた**: 常に既定の面へ落ちる。指定が外れるのは
+//!   検証の都合であって、tako が起動できない理由ではない
+//!
+//! ## 列挙は空になりうる（#1160 の原因）
+//!
+//! macOS の `cx.displays()` は **`CGGetActiveDisplayList`**（gpui の `MacDisplay::all`）で、
+//! gpui 自身が「眠っている機では active な一覧が返るとは限らない」と書いている。
+//! 実測（2026-09-07）: ディスプレイスリープ中は `NSScreen` に 2 枚残ったままで
+//! `CGDisplayIsActive` が両方 0 = **列挙が 0 件**になる。
+//! `scripts/lib/virtual-display.sh status` には面が見えているのに `候補=[]` になるのはこれで、
+//! 1 回引いただけで諦めると**起きかけの面を見落として既定の面へ落ちる**。
+//!
+//! なので [`retry_policy`] の予算のあいだ列挙し直す。**待つのは空のあいだだけ**で、
+//! 面が見えているのに当たらないなら待っても答えは変わらない（読めている一覧に無い）。
+//! 眠っている面を**起こす**のは tako ではなく `scripts/lib/virtual-display.sh ensure`
+//! （面を用意する係）の担当で、ここは「現れるまで少し待つ」だけを行う。
 
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 /// 常設の仮想ディスプレイの既定名。`TAKO_DISPLAY` 未指定の隔離起動はこれを探す。
 ///
@@ -42,6 +67,139 @@ pub const DEFAULT_VIRTUAL_DISPLAY_NAME: &str = "tako-vd";
 
 /// 窓を置くディスプレイを指定する環境変数。値は「名前 | UUID | index」
 pub const ENV_DISPLAY: &str = "TAKO_DISPLAY";
+
+/// #1160 の前（列挙を 1 回だけ引き、外れたら必ず既定の面へ落ちる）へ戻す env。
+/// 検出力の A/B 用で、同一バイナリのまま旧挙動を再現できる
+pub const ENV_LEGACY_1160: &str = "TAKO_1160_LEGACY";
+
+/// 列挙を**空に見せる**回数を指定する診断 env（#1160）。
+///
+/// 本物のディスプレイを眠らせずに「起動の瞬間だけ列挙が空」を再現するために使う
+/// （`TAKO_1160_INJECT_EMPTY=2` なら最初の 2 回だけ 0 件を返し、3 回目から実際の列挙）。
+/// 大きな値を渡せば「やり直しても現れない」= 窓を開かずに終わる道も踏める。
+/// **本番動作には影響しない**（明示されたときだけ効く）
+pub const ENV_INJECT_EMPTY_1160: &str = "TAKO_1160_INJECT_EMPTY";
+
+/// 列挙をやり直す間隔（#1160）
+pub const RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
+/// 検証用 GUI がやり直す回数（#1160）。100ms × 20 = **最大 2 秒**。
+///
+/// ここで待つのは「起きかけ / 構成変更の途中」を跨ぐためで、**眠ったままの面が
+/// 自分から起きてくるのを待つ器ではない**（それは `ensure` の担当）。
+/// 待てば必ず現れるものではないので、上限は「起動が体感で止まらない」側に寄せてある
+pub const VERIFICATION_RETRIES: u32 = 20;
+
+/// 通常起動で `TAKO_DISPLAY` が外れたときやり直す回数（#1160）。100ms × 3 = 0.3 秒。
+///
+/// この道は既定の面へ落ちて**必ず起動する**ので、待つ意味は「起きかけを拾えたら拾う」まで。
+/// ユーザーの起動を秒単位で待たせないため検証用より短くしてある
+pub const FALLBACK_RETRIES: u32 = 3;
+
+/// 検証用 GUI が置き先を用意できずに終わるときの終了コード（#1160）。
+/// 他の起動失敗（`1`）と見分けられるように分けてある
+pub const REFUSED_EXIT_CODE: i32 = 4;
+
+/// 指定した面が列挙に無かったときの落とし所
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Miss {
+    /// 既定の面（メイン画面）へ開く。通常起動で `TAKO_DISPLAY` が外れた道
+    FallBack,
+    /// 窓を開かずに終わる。検証用 GUI の道（ユーザーの画面に出すより開かない方がよい）
+    Refuse,
+}
+
+impl Miss {
+    /// 診断・JSON に出す語
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Miss::FallBack => "fall_back",
+            Miss::Refuse => "refuse",
+        }
+    }
+}
+
+/// 列挙が空のあいだやり直す予算（#1160）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicy {
+    /// 列挙をやり直す回数（`0` なら 1 回引いて終わり = #1160 前の挙動）
+    pub retries: u32,
+    /// やり直しの間隔
+    pub interval: Duration,
+}
+
+impl RetryPolicy {
+    /// やり直しに費やしうる最大の時間（診断に出す）
+    pub fn budget(&self) -> Duration {
+        self.interval * self.retries
+    }
+}
+
+/// 列挙をやり直す予算を決める（#1160）。
+///
+/// `TAKO_1160_LEGACY=1` なら #1160 前（やり直さない）を返す。
+/// 判定を 1 か所に閉じているので、tako-app・診断・テストが同じ予算を見る
+pub fn retry_policy(verification_gui: bool) -> RetryPolicy {
+    retry_policy_for(verification_gui, legacy_1160())
+}
+
+/// [`retry_policy`] の中身（env を引数へ出した純粋関数。両アームを 1 プロセスで検証できる）
+fn retry_policy_for(verification_gui: bool, legacy: bool) -> RetryPolicy {
+    RetryPolicy {
+        retries: if legacy {
+            0
+        } else if verification_gui {
+            VERIFICATION_RETRIES
+        } else {
+            FALLBACK_RETRIES
+        },
+        interval: RETRY_INTERVAL,
+    }
+}
+
+/// 外したときの落とし所を決める（#1160）。
+///
+/// **分かれ目は「面が 1 枚も見えていないか」**（`enumeration_empty`）で、検証用 GUI か
+/// どうかだけでは決めない。
+///
+/// - 空 + 検証用 GUI → [`Miss::Refuse`]（窓を開かずに終わる）。列挙が空なのは
+///   「置き先が無い」ではなく**まだ分からない**状態（ディスプレイスリープ）なので、
+///   ここで既定の面 = ユーザーの画面へ落とすと #1141 の目的が黙って破れる
+/// - 面は見えているが当たらない → [`Miss::FallBack`]。その機に置き先が無いということで、
+///   **ここで開かないと検証そのものが回らなくなる**（CI・他人の環境・仮想ディスプレイを
+///   配線していない Windows = FR-4.8.10 では、狙いが外れるのが正しい挙動）。
+///   代わりに [`Placement::fallback_notice`] で起動時に見える警告を出す
+/// - 通常起動 → 常に [`Miss::FallBack`]（起動を止める理由にならない）
+pub fn miss_for(verification_gui: bool, enumeration_empty: bool) -> Miss {
+    miss_for_with(verification_gui, enumeration_empty, legacy_1160())
+}
+
+/// [`miss_for`] の中身（env を引数へ出した純粋関数）
+fn miss_for_with(verification_gui: bool, enumeration_empty: bool, legacy: bool) -> Miss {
+    if !legacy && verification_gui && enumeration_empty {
+        Miss::Refuse
+    } else {
+        Miss::FallBack
+    }
+}
+
+/// `TAKO_1160_LEGACY` が立っているか（プロセス内で 1 回だけ読む）
+pub fn legacy_1160() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os(ENV_LEGACY_1160).is_some())
+}
+
+/// 列挙を空に見せる残り回数（`TAKO_1160_INJECT_EMPTY` の値。未指定なら 0）。
+/// 呼び出し側は「この回数だけ 0 件を返す」を自分で数える
+pub fn inject_empty_count() -> u32 {
+    static N: OnceLock<u32> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var(ENV_INJECT_EMPTY_1160)
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+    })
+}
 
 /// 名前引きにかける時間の上限。超えたら名前無しで進む（起動を待たせない）。
 /// 名前を引ける実装を持つプラットフォームでしか使わない
@@ -235,6 +393,18 @@ pub struct Placement {
     pub reason: Option<String>,
     /// 起動時に見えていた候補の一覧表現
     pub available: Vec<String>,
+    /// 列挙をやり直した回数（#1160。`0` なら 1 回で決まった）
+    pub retries: u32,
+    /// **窓を開かずに終わった**か（#1160）。`true` ならこの起動で窓は 1 枚も開いていない
+    pub refused: bool,
+    /// 外したときに**実際にどうしたか**（#1160）。当たった / 指定が無かったときは `None`。
+    /// **起動時に 1 回決めた値**をそのまま持つ（診断側で再計算すると判定が散る）
+    pub miss_policy: Option<Miss>,
+    /// この起動が検証用 GUI（`TAKO_ISOLATED` / `TAKO_SELF_TEST` / `TAKO_VISUAL_TEST`）だったか。
+    /// 「なぜユーザーの画面に出た / 出なかった」を後から説明するのに要る（#1160）。
+    /// `requested` が `None` のとき（= 通常起動）は常に `false`
+    /// （検証用の起動は [`requested_spec`] が必ず指定を返すため）
+    pub verification: bool,
 }
 
 impl Placement {
@@ -246,25 +416,161 @@ impl Placement {
             matched_by: None,
             reason: None,
             available: Vec::new(),
+            retries: 0,
+            refused: false,
+            miss_policy: None,
+            verification: false,
         }
     }
 
     /// persist.log へ残す 1 行。**当たっても外れても必ず出す**（次に同じことを
     /// 調べる人が「そもそも狙ったのか」から確かめられるように）
     pub fn log_line(&self) -> String {
+        // やり直したときだけ回数を添える（通常起動のログを増やさない）
+        let retried = if self.retries > 0 {
+            format!(" / やり直し={} 回", self.retries)
+        } else {
+            String::new()
+        };
         match (&self.requested, &self.resolved) {
             (None, _) => "ディスプレイ指定なし: 既定の面へ開く".to_string(),
             (Some(spec), Some(d)) => format!(
-                "ディスプレイ指定 {spec}: {} で解決 → {}",
+                "ディスプレイ指定 {spec}: {} で解決 → {}{retried}",
                 self.matched_by.map(MatchKind::as_str).unwrap_or("?"),
                 d.label(),
             ),
+            // #1160: 検証用 GUI は既定の面（= ユーザーの画面）へ落ちない。
+            // 「開かなかった」と「既定へ落ちた」を**別の文**にしておく（persist.log を
+            // 後から読む人が、窓が出たのかどうかを 1 行で判別できるように）
+            (Some(spec), None) if self.refused => format!(
+                "ディスプレイ指定 {spec}: 見つからないので窓を開かずに終了する\
+                 （理由={} / 候補=[{}]{retried}）",
+                self.reason.as_deref().unwrap_or("不明"),
+                self.available.join(", "),
+            ),
             (Some(spec), None) => format!(
-                "ディスプレイ指定 {spec}: 見つからないので既定の面へ開く（理由={} / 候補=[{}]）",
+                "ディスプレイ指定 {spec}: 見つからないので既定の面へ開く（理由={} / 候補=[{}]{retried}）",
                 self.reason.as_deref().unwrap_or("不明"),
                 self.available.join(", "),
             ),
         }
+    }
+
+    /// 診断（`tako_check_health` の `display_placement`）へ出す形（#1141 / #1160）。
+    ///
+    /// **形をここに置く理由**: 中身は `Placement` の状態そのものなので、
+    /// `dispatch` 側で組み立てると GUI を立てないと検証できない
+    /// （実際 #1160 の検証で、無関係な項目が機械の混み具合で落ちてセルフテストが
+    /// 145b まで届かなくなった）。ここに置けば純粋なテストで全状態を固定できる。
+    /// `describe` は `shell_integration` / `backend` と同じ作法
+    pub fn describe(&self) -> serde_json::Value {
+        serde_json::json!({
+            "requested": self.requested,
+            "resolved": self.resolved.as_ref().map(|d| serde_json::json!({
+                "index": d.index,
+                "id": d.id,
+                "name": d.name,
+                "uuid": d.uuid,
+                "primary": d.primary,
+                // 解決した時点の矩形（窓がここへ開いたかを GUI 無しで突き合わせられる）
+                "rect": d.rect.map(|r| serde_json::json!({
+                    "x": r.x, "y": r.y, "width": r.width, "height": r.height,
+                })),
+            })),
+            "matched_by": self.matched_by.map(MatchKind::as_str),
+            "reason": self.reason,
+            "available": self.available,
+            "name_lookup_supported": name_lookup_supported(),
+            // #1160: 列挙のやり直し回数 / 窓を開かずに終わったか /
+            // 外したときに実際にどうしたか（当たったときは null）/ 検証用の起動だったか
+            "retries": self.retries,
+            "refused": self.refused,
+            "miss_policy": self.miss_policy.map(Miss::as_str),
+            "verification": self.verification,
+        })
+    }
+
+    /// 診断の `issues` へ出す 1 件（狙って外したときだけ。当たっていれば `None`）。
+    ///
+    /// **重さを分ける**（#1160）: 既定の面へ落ちた = ユーザーの画面に窓が出ている状態なので
+    /// `warning`、窓を開かずに終わった = 目的どおりの拒否なので `error`（起動しなかった
+    /// 理由が要る）。当たっているときは黙る = 通常起動と同じ
+    pub fn health_issue(&self) -> Option<serde_json::Value> {
+        let spec = self.requested.as_deref()?;
+        if self.resolved.is_some() {
+            return None;
+        }
+        let reason = self.reason.as_deref().unwrap_or("不明");
+        let available = self.available.join(", ");
+        let (level, message) = if self.refused {
+            (
+                "error",
+                format!(
+                    "検証用 GUI の置き先 {spec} が列挙に出ないので窓を開かずに終了した\
+                     （理由={reason} / 候補=[{available}] / やり直し={} 回）。\
+                     scripts/lib/virtual-display.sh ensure で用意できる",
+                    self.retries,
+                ),
+            )
+        } else {
+            (
+                "warning",
+                format!(
+                    "ディスプレイ {spec} が見つからないので既定の面へ開いている\
+                     （理由={reason} / 候補=[{available}] / やり直し={} 回）。\
+                     scripts/lib/virtual-display.sh ensure で用意できる",
+                    self.retries,
+                ),
+            )
+        };
+        Some(serde_json::json!({
+            "level": level,
+            "check": "display_placement",
+            "message": message,
+        }))
+    }
+
+    /// 検証用 GUI が**既定の面（= ユーザーの画面）へ開いた**ときに人へ見せる警告（#1160）。
+    ///
+    /// この道は残してある（面が見えているのに当たらない = その機に置き先が無い。
+    /// ここで開かないと CI・他人の環境・Windows で検証が回らなくなる）が、
+    /// **黙って縮退させない**: persist.log を読むまで気づけなかったのが症状の一部だった。
+    /// 検証用でない起動や、当たった / 開かずに終わった起動では `None`
+    pub fn fallback_notice(&self) -> Option<String> {
+        if !self.verification || self.refused || self.resolved.is_some() {
+            return None;
+        }
+        let spec = self.requested.as_deref()?;
+        Some(format!(
+            "検証用 GUI の置き先 {spec} が見つからないので、\
+             ユーザーのメイン画面へ窓を開いた（理由={} / 候補={} 枚）。\
+             面を用意する: scripts/lib/virtual-display.sh ensure",
+            self.reason.as_deref().unwrap_or("不明"),
+            self.available.len(),
+        ))
+    }
+
+    /// 窓を開かずに終わるときに**人へ見せる**案内（#1160）。
+    ///
+    /// persist.log を読むまで気づけないのが #1160 の症状だったので、起動時に
+    /// stderr へ出す用の文をここで作る（文言の正はこのモジュール）。
+    /// `refused` でなければ `None`
+    pub fn refusal_notice(&self) -> Option<String> {
+        if !self.refused {
+            return None;
+        }
+        let spec = self.requested.as_deref().unwrap_or("?");
+        Some(format!(
+            "検証用 GUI の置き先 {spec} が OS のディスプレイ一覧に出ていないので、\
+             窓を開かずに終了した（理由={} / 候補={} 枚 / やり直し={} 回）。\n\
+             ユーザーのメイン画面へ検証用の窓を出さないため（#1141 / #1160）。\
+             面を用意する: scripts/lib/virtual-display.sh ensure\n\
+             ディスプレイスリープ中は面が在っても列挙から落ちる。\
+             どうしてもメイン画面で起こすなら {ENV_DISPLAY} に実在する面を指定する",
+            self.reason.as_deref().unwrap_or("不明"),
+            self.available.len(),
+            self.retries,
+        ))
     }
 }
 
@@ -570,6 +876,7 @@ mod tests {
             matched_by: Some(MatchKind::Name),
             reason: None,
             available: Vec::new(),
+            ..Placement::not_requested()
         };
         assert!(hit.log_line().contains("tako-vd"));
         assert!(hit.log_line().contains("name"));
@@ -580,12 +887,313 @@ mod tests {
             matched_by: None,
             reason: Some("該当なし".into()),
             available: vec!["[0] id=1 name=Color LCD uuid=? (primary)".into()],
+            ..Placement::not_requested()
         };
         let line = miss.log_line();
         assert!(line.contains("既定の面へ開く"), "{line}");
         assert!(line.contains("Color LCD"), "候補も残す: {line}");
 
         assert!(Placement::not_requested().log_line().contains("指定なし"));
+    }
+
+    // ── #1160: 列挙が空のときユーザーの画面へ落ちない ────────────────
+
+    /// **面が 1 枚も見えないとき、検証用 GUI は既定の面へ落ちない**（#1160 の本体）。
+    ///
+    /// 列挙が空なのは「置き先が無い」ではなく**まだ分からない**状態
+    /// （ディスプレイスリープ）なので、ここでユーザーのメイン画面へ窓を出すのは
+    /// 「開かない」より悪い。`TAKO_1160_LEGACY=1` では `FallBack` に戻るのでこの検査が落ちる
+    #[test]
+    fn 列挙が空なら検証用guiは窓を開かない() {
+        assert_eq!(
+            miss_for(true, true),
+            Miss::Refuse,
+            "検証用 GUI が既定の面（= ユーザーの画面）へ落ちる構えになっている"
+        );
+    }
+
+    /// **面が見えているのに当たらないときは落ちる**（#1160 で狭めた点）。
+    ///
+    /// その機に置き先が無いということで、`tako-vd` を配線していない環境
+    /// （CI・他人の機・Windows = FR-4.8.10）はここを通る。**開かない構えにすると
+    /// 検証そのものが回らなくなる**（`build-app.sh --verify` と Windows 実機の
+    /// セルフテストが起動できなくなる）ので、落として警告を出す
+    #[test]
+    fn 面が見えているのに当たらないときは検証用でも既定の面へ開く() {
+        assert_eq!(
+            miss_for(true, false),
+            Miss::FallBack,
+            "置き先を配線していない環境で検証用 GUI が起動できなくなる"
+        );
+    }
+
+    /// **通常起動は止めない**（`TAKO_DISPLAY` が外れても既定の面へ開く。空でも同じ）。
+    /// 指定が外れるのは検証の都合であって、tako が起動できない理由ではない
+    #[test]
+    fn 通常起動は置き先が外れても既定の面へ開く() {
+        assert_eq!(miss_for(false, false), Miss::FallBack);
+        assert_eq!(
+            miss_for(false, true),
+            Miss::FallBack,
+            "空でも通常起動は開く"
+        );
+    }
+
+    /// 列挙が空のあいだは**やり直す**（1 回引いて諦めるのが #1160 の原因）。
+    /// `TAKO_1160_LEGACY=1` では 0 回に戻るので、この検査が落ちる
+    #[test]
+    fn 置き先が無いときは列挙をやり直す() {
+        let v = retry_policy(true);
+        assert!(
+            v.retries > 0,
+            "検証用 GUI が列挙をやり直さない（起動の瞬間だけ空になる面を拾えない）"
+        );
+        let n = retry_policy(false);
+        assert!(n.retries > 0, "通常起動も 1 回で諦めない");
+        assert!(
+            v.retries > n.retries,
+            "窓を開かずに終わる側の方が長く待つ（開いてしまうと取り返せない）: \
+             検証={} 通常={}",
+            v.retries,
+            n.retries,
+        );
+    }
+
+    /// やり直しの予算は「起動が体感で止まらない」範囲（上限 2 秒・下限 0.3 秒）
+    #[test]
+    fn やり直しの予算は起動を止めない範囲() {
+        assert_eq!(
+            retry_policy(true).budget(),
+            Duration::from_millis(2000),
+            "検証用 GUI の予算"
+        );
+        assert_eq!(
+            retry_policy(false).budget(),
+            Duration::from_millis(300),
+            "通常起動の予算"
+        );
+    }
+
+    /// A/B（`TAKO_1160_LEGACY=1`）の中身: やり直さず必ず既定の面へ落ちる = #1160 前
+    #[test]
+    fn legacyは1回引いて既定の面へ落ちる() {
+        for verification in [true, false] {
+            for empty in [true, false] {
+                assert_eq!(
+                    retry_policy_for(verification, true).retries,
+                    0,
+                    "verification={verification}"
+                );
+                assert_eq!(
+                    miss_for_with(verification, empty, true),
+                    Miss::FallBack,
+                    "verification={verification} empty={empty}"
+                );
+            }
+        }
+        // 新挙動は同じ入力で構えが変わる（= A/B が本当に効いている）
+        assert_ne!(
+            miss_for_with(true, true, false),
+            miss_for_with(true, true, true),
+            "legacy と新挙動が同じなら A/B に検出力が無い"
+        );
+    }
+
+    /// 既定の面へ落ちるときも**黙らない**（#1160 の 2 つ目の要望）。
+    /// 検証用 GUI のときだけ警告を出す（通常起動の出力は増やさない）
+    #[test]
+    fn 検証用guiが既定の面へ落ちたら起動時に警告する() {
+        let fell_back = Placement {
+            requested: Some(DEFAULT_VIRTUAL_DISPLAY_NAME.into()),
+            reason: Some("該当なし".into()),
+            available: vec!["[0] id=1 name=Color LCD uuid=? (primary)".into()],
+            miss_policy: Some(Miss::FallBack),
+            verification: true,
+            ..Placement::not_requested()
+        };
+        let notice = fell_back
+            .fallback_notice()
+            .expect("検証用 GUI が既定の面へ落ちたら警告が出る");
+        assert!(notice.contains("メイン画面"), "{notice}");
+        assert!(notice.contains("virtual-display.sh ensure"), "{notice}");
+        // 通常起動では出さない
+        let normal = Placement {
+            verification: false,
+            ..fell_back.clone()
+        };
+        assert!(
+            normal.fallback_notice().is_none(),
+            "通常起動の出力は増やさない"
+        );
+        // 当たったとき・開かずに終わったときも出さない（別の文がある）
+        let hit = Placement {
+            resolved: Some(fixture()[1].clone()),
+            ..fell_back.clone()
+        };
+        assert!(hit.fallback_notice().is_none());
+        let refused = Placement {
+            refused: true,
+            ..fell_back.clone()
+        };
+        assert!(refused.fallback_notice().is_none());
+    }
+
+    /// 列挙が 0 件でも `select` は落ちず、候補が空の `NotFound` になる
+    /// （#1160 の症状そのもの: `候補=[]`）
+    #[test]
+    fn 列挙が空でも落ちずに候補が空の見つからないになる() {
+        match select(DEFAULT_VIRTUAL_DISPLAY_NAME, &[]) {
+            Selection::NotFound { spec, available } => {
+                assert_eq!(spec, DEFAULT_VIRTUAL_DISPLAY_NAME);
+                assert!(available.is_empty(), "候補は空: {available:?}");
+            }
+            other => panic!("空列挙で見つからない扱いにならない: {other:?}"),
+        }
+    }
+
+    /// 「開かずに終わった」と「既定へ落ちた」は persist.log の**別の文**になる。
+    /// 後から読む人が、窓が出たのかどうかを 1 行で判別できること
+    #[test]
+    fn 窓を開かずに終わった記録は既定へ落ちた記録と別の文になる() {
+        let refused = Placement {
+            requested: Some(DEFAULT_VIRTUAL_DISPLAY_NAME.into()),
+            reason: Some("該当なし".into()),
+            retries: VERIFICATION_RETRIES,
+            refused: true,
+            miss_policy: Some(Miss::Refuse),
+            verification: true,
+            ..Placement::not_requested()
+        };
+        let line = refused.log_line();
+        assert!(line.contains("窓を開かずに終了する"), "{line}");
+        assert!(
+            !line.contains("既定の面へ開く"),
+            "既定へ落ちたと読める文が混ざっている: {line}"
+        );
+        assert!(
+            line.contains("やり直し=20 回"),
+            "やり直した回数も残す: {line}"
+        );
+
+        // 人向けの案内（起動時に stderr へ出す分）。persist.log を読まなくても気づける
+        let notice = refused.refusal_notice().expect("refused なら案内が出る");
+        assert!(notice.contains(DEFAULT_VIRTUAL_DISPLAY_NAME), "{notice}");
+        assert!(
+            notice.contains("virtual-display.sh ensure"),
+            "直し方を書く: {notice}"
+        );
+        // 落ちた側・指定なしの側では案内を出さない（通常起動の出力を汚さない）
+        let fell_back = Placement {
+            requested: Some("nope".into()),
+            reason: Some("該当なし".into()),
+            ..Placement::not_requested()
+        };
+        assert!(fell_back.refusal_notice().is_none());
+        assert!(Placement::not_requested().refusal_notice().is_none());
+    }
+
+    /// 診断（`tako_check_health` の `display_placement`）の形を**全状態で固定する**（#1160）。
+    ///
+    /// これを GUI 側で組み立てていると、無関係な項目が機械の混み具合で落ちた日に
+    /// セルフテストがここまで届かず、形が検証できないまま merge されうる（実際に踏んだ）。
+    #[test]
+    fn 診断の形は全状態で固定されている() {
+        // ① 当たった
+        let hit = Placement {
+            requested: Some(DEFAULT_VIRTUAL_DISPLAY_NAME.into()),
+            resolved: Some(fixture()[1].clone()),
+            matched_by: Some(MatchKind::Name),
+            retries: 3,
+            verification: true,
+            ..Placement::not_requested()
+        };
+        let v = hit.describe();
+        assert_eq!(v["requested"], DEFAULT_VIRTUAL_DISPLAY_NAME);
+        assert_eq!(v["resolved"]["id"], 13);
+        assert_eq!(v["resolved"]["name"], "tako-vd");
+        assert_eq!(v["resolved"]["rect"]["width"], 1512.0);
+        assert_eq!(v["matched_by"], "name");
+        assert_eq!(v["retries"], 3);
+        assert_eq!(v["refused"], false);
+        assert!(v["miss_policy"].is_null(), "当たったので構えは出さない");
+        assert_eq!(v["verification"], true);
+        assert!(
+            hit.health_issue().is_none(),
+            "当たっているときは issues に出さない（通常起動と同じ）"
+        );
+
+        // ② 既定の面へ落ちた（= ユーザーの画面に出ている）
+        let fell_back = Placement {
+            requested: Some(DEFAULT_VIRTUAL_DISPLAY_NAME.into()),
+            reason: Some("該当なし".into()),
+            available: vec!["[0] id=1 name=Color LCD uuid=? (primary)".into()],
+            retries: 3,
+            miss_policy: Some(Miss::FallBack),
+            verification: true,
+            ..Placement::not_requested()
+        };
+        let v = fell_back.describe();
+        assert!(v["resolved"].is_null());
+        assert_eq!(v["miss_policy"], "fall_back");
+        assert_eq!(v["refused"], false);
+        assert_eq!(v["available"].as_array().map(Vec::len), Some(1));
+        let issue = fell_back.health_issue().expect("外したら申告する");
+        assert_eq!(issue["level"], "warning", "窓は出ているので warning");
+        assert_eq!(issue["check"], "display_placement");
+        let msg = issue["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("既定の面へ開いている"), "{msg}");
+        assert!(
+            msg.contains("virtual-display.sh ensure"),
+            "直し方も書く: {msg}"
+        );
+
+        // ③ 窓を開かずに終わった（#1160 の本体）
+        let refused = Placement {
+            requested: Some(DEFAULT_VIRTUAL_DISPLAY_NAME.into()),
+            reason: Some("OS のディスプレイ一覧が空".into()),
+            retries: VERIFICATION_RETRIES,
+            refused: true,
+            miss_policy: Some(Miss::Refuse),
+            verification: true,
+            ..Placement::not_requested()
+        };
+        let v = refused.describe();
+        assert_eq!(v["refused"], true);
+        assert_eq!(v["miss_policy"], "refuse");
+        assert_eq!(v["retries"], 20);
+        let issue = refused.health_issue().expect("拒否も申告する");
+        assert_eq!(
+            issue["level"], "error",
+            "起動しなかった理由なので warning では埋もれる"
+        );
+        let msg = issue["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("窓を開かずに終了した"), "{msg}");
+        assert!(
+            !msg.contains("既定の面へ開いている"),
+            "落ちたと読める文が混ざっている: {msg}"
+        );
+
+        // ④ 指定なし（通常起動）: 形は出るが申告はしない
+        let none = Placement::not_requested();
+        let v = none.describe();
+        assert!(v["requested"].is_null());
+        assert_eq!(v["retries"], 0);
+        assert_eq!(v["verification"], false);
+        assert!(none.health_issue().is_none());
+    }
+
+    /// やり直していないときログに回数を足さない（通常起動のログを増やさない）
+    #[test]
+    fn やり直していないときログに回数を足さない() {
+        let hit = Placement {
+            requested: Some("tako-vd".into()),
+            resolved: Some(fixture()[1].clone()),
+            matched_by: Some(MatchKind::Name),
+            ..Placement::not_requested()
+        };
+        assert!(!hit.log_line().contains("やり直し"), "{}", hit.log_line());
+        assert_eq!(Placement::not_requested().retries, 0);
+        assert!(!Placement::not_requested().refused);
     }
 
     #[cfg(target_os = "macos")]

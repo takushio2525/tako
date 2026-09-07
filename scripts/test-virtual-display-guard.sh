@@ -7,12 +7,14 @@
 # （vd_clamshell_raw）・器の実体数（vd_backend_instances）をすべてスタブへ差し替え、
 # 一時ディレクトリのテーブルだけを相手にする。CI（ランナーに画面が無い）でも走る。
 #
-# 見ているのは 4 点:
+# 見ているのは 5 点:
 #   1. 同名の面が 2 枚以上になったら ensure が理由つきで止まる（#1150 の増殖）
 #   2. Main 保護は「内蔵あり かつ Main が仮想」のときだけ器へ main を撃つ
 #   3. 孤児の後片付けは実行条件（内蔵が NSScreen に居る + 蓋開き）を満たすまで拒否する
 #      （満たさないまま器を再起動すると画面が 0 枚になり機械が眠る）
 #   4. 前後比較（status --snapshot）が同じ構成に対して同じ 1 枚の絵を出す
+#   5. ensure の完了条件に「面が起きている（描画可能）」が入っている（#1160）。
+#      NSScreen に居るだけで通すと、面は在るのに tako から見えず検証が始まらない
 set -uo pipefail
 cd "$(dirname "$0")/.."
 PASS=0
@@ -33,10 +35,24 @@ trap 'rm -rf "$TMP"' EXIT
 TABLE="$TMP/table"
 BD_LOG="$TMP/bd.log"
 CLAMSHELL="$TMP/clamshell"
+WAKE_LOG="$TMP/wake.log"
 : > "$BD_LOG"
+: > "$WAKE_LOG"
 
 vd_screens() { cat "$TABLE" 2>/dev/null; }
 vd_clamshell_raw() { cat "$CLAMSHELL" 2>/dev/null; }
+# CoreGraphics の描画可能判定（#1160）。既定は「テーブルの全 id が active」。
+# DRAWABLE に中身を置けばそれが答えになり、空文字なら「材料が読めない」を再現する
+vd_drawable() {
+    if [ -f "$TMP/drawable" ]; then cat "$TMP/drawable"; return 0; fi
+    awk -F'\t' 'NF { printf "%s\t1\t0\n", $6 }' "$TABLE" 2>/dev/null
+}
+# 起こす手立て（caffeinate -u）。撃った回数だけ記録し、起きた後のテーブルへ差し替える
+vd_wake_displays() {
+    echo wake >> "$WAKE_LOG"
+    [ -f "$TMP/drawable.after-wake" ] && cp "$TMP/drawable.after-wake" "$TMP/drawable"
+    return 0
+}
 vd_backend_instances() { printf '%s' "${STUB_INSTANCES:-1}"; }
 vd_backend_strays() { printf '%s' "${STUB_STRAYS:-}"; }
 vd_backend_ready() { return 0; }
@@ -56,8 +72,14 @@ sleep() { :; }
 set_table() { printf '%s\n' "$1" > "$TABLE"; }
 set_clamshell() { printf '  |   "AppleClamshellState" = %s\n' "$1" > "$CLAMSHELL"; }
 no_clamshell() { : > "$CLAMSHELL"; }
-reset_bd() { : > "$BD_LOG"; rm -f "$TMP/table.after-main" "$TMP/table.after-restart"; }
+reset_bd() {
+    : > "$BD_LOG"; : > "$WAKE_LOG"
+    rm -f "$TMP/table.after-main" "$TMP/table.after-restart" "$TMP/drawable" "$TMP/drawable.after-wake"
+}
 bd_log() { cat "$BD_LOG"; }
+wake_count() { grep -c . "$WAKE_LOG" 2>/dev/null || true; }
+# 眠っている状態を作る（$1 = 起きている id を列挙。省略なら全部眠っている）
+set_drawable() { printf '%s\n' "$1" > "$TMP/drawable"; }
 
 t() { printf '%b' "$1"; }   # \t を実タブへ
 
@@ -227,6 +249,77 @@ set_table "$FIX_OK"; set_clamshell No
 snap3=$(vd_status_snapshot)
 if [[ "$snap1" != "$snap3" ]]; then ok "構成が変われば出力も変わる（検出力）"; else ng "構成が変われば出力も変わる（検出力）" "同じ"; fi
 assert_has "内蔵が居れば builtin=1 の行が出る" "builtin=1" "$snap3"
+
+echo "== Test 13: 描画可能の判定は証明できるときだけ「置けない」と言う（#1160）=="
+DRAW_ASLEEP=$(t '1\t0\t1\n17\t0\t1')
+DRAW_AWAKE=$(t '1\t1\t0\n17\t1\t0')
+DRAW_VD_ASLEEP=$(t '1\t1\t0\n17\t0\t1')
+printf '%s' "$DRAW_AWAKE" | vd_id_drawable 17; rc=$?
+assert_eq "active=1 なら置ける" "$rc" "0"
+printf '%s' "$DRAW_ASLEEP" | vd_id_drawable 17; rc=$?
+assert_eq "active=0 なら置けない" "$rc" "1"
+printf '%s' "" | vd_id_drawable 17; rc=$?
+assert_eq "材料が 1 行も無いときは断らない（CI / osascript 不可の機）" "$rc" "0"
+printf '%s' "$DRAW_AWAKE" | vd_id_drawable 99; rc=$?
+assert_eq "一覧に居ない id は置けない" "$rc" "1"
+# status に出す名前（純関数）
+VD_TABLE_17=$(t 'Color LCD\t0\t0\t1512\t982\t1\t1\t1\ntako-vd\t1512\t0\t2560\t1440\t17\t0\t0')
+names=$(printf '%s\n' "$VD_TABLE_17" | vd_sleeping_names "$DRAW_ASLEEP")
+assert_eq "両方眠っていれば両方の名前を出す" "$names" "Color LCD, tako-vd"
+names=$(printf '%s\n' "$VD_TABLE_17" | vd_sleeping_names "$DRAW_VD_ASLEEP")
+assert_eq "眠っている面だけを出す" "$names" "tako-vd"
+names=$(printf '%s\n' "$VD_TABLE_17" | vd_sleeping_names "$DRAW_AWAKE")
+assert_eq "全部起きていれば空" "$names" ""
+
+echo "== Test 14: ensure は面が眠っていたら起こしてから成功する（#1160 の本体）=="
+reset_bd; set_table "$VD_TABLE_17"; set_clamshell No
+set_drawable "$DRAW_VD_ASLEEP"                      # tako-vd だけ眠っている
+printf '%s\n' "$DRAW_AWAKE" > "$TMP/drawable.after-wake"   # 起こせば起きる
+out=$(vd_ensure 2>&1); rc=$?
+assert_eq "起こせたら 0 で返る" "$rc" "0"
+assert_eq "起こす手立てを 1 回だけ撃つ" "$(wake_count)" "1"
+assert_has "何をしたかを 1 行出す" "眠っています" "$out"
+assert_lacks "起こせたので警告は出さない" "起こせなかった" "$out"
+assert_lacks "起こすために器へは触らない" "connected" "$(bd_log)"
+
+echo "== Test 15: 起こせなければ ensure は非ゼロ（面を用意したと嘘をつかない）=="
+reset_bd; set_table "$VD_TABLE_17"; set_clamshell No
+set_drawable "$DRAW_VD_ASLEEP"                      # after-wake を置かない = 起きない
+out=$(vd_ensure 2>&1); rc=$?
+assert_eq "起こせなければ非ゼロ" "$rc" "1"
+assert_has "起こせなかったことを言う" "起こせなかった" "$out"
+assert_has "この状態で何が起きるかを書く" "窓を開かずに終わる" "$out"
+assert_lacks "Main 保護へ進まない（締めはここで止まる）" "main=on" "$(bd_log)"
+
+echo "== Test 16: 起きている面には手を出さない（既定の道を変えない）=="
+reset_bd; set_table "$VD_TABLE_17"; set_clamshell No
+set_drawable "$DRAW_AWAKE"
+out=$(vd_ensure 2>&1); rc=$?
+assert_eq "起きていれば 0" "$rc" "0"
+assert_eq "起こす手立ては 1 度も撃たない" "$(wake_count)" "0"
+assert_eq "余計な出力を出さない" "$out" ""
+
+echo "== Test 17: status は「在る」と「置ける」を別に出す（#1160）=="
+reset_bd; set_table "$VD_TABLE_17"; set_clamshell No
+set_drawable "$DRAW_AWAKE"
+out=$(vd_status 2>&1); rc=$?
+assert_eq "起きていれば 0" "$rc" "0"
+assert_has "使用可と出る" "使用可" "$out"
+assert_has "眠っている面は「なし」" "眠っている面: なし" "$out"
+set_drawable "$DRAW_VD_ASLEEP"
+out=$(vd_status 2>&1); rc=$?
+assert_eq "眠っていれば非ゼロ" "$rc" "1"
+assert_has "眠っていると出る" "眠っている" "$out"
+assert_has "tako から見えないと書く" "tako から見えない" "$out"
+assert_has "眠っている面を名指しする" "眠っている面: tako-vd" "$out"
+assert_lacks "使用可とは言わない" "使用可" "$out"
+
+echo "== Test 18: 前後比較（--snapshot）は眠りで差分を出さない（#1160）=="
+set_table "$VD_TABLE_17"; set_clamshell No
+set_drawable "$DRAW_AWAKE"; snap_awake=$(vd_status_snapshot)
+set_drawable "$DRAW_ASLEEP"; snap_asleep=$(vd_status_snapshot)
+assert_eq "眠っただけでは構成の絵が変わらない" "$snap_awake" "$snap_asleep"
+assert_lacks "スナップショットに眠りを入れない" "asleep" "$snap_awake"
 
 echo
 echo "PASS=${PASS} FAIL=${FAIL}"

@@ -114,3 +114,11 @@
   MCP `tako_orchestrator_guide` で引く形に。予算 24 KB を `context_budget` へ追加し、超過は block 別バイト数で提案
 - takodev の生成物 59,501 B / 40,687 tok → **32,626 B / 20,366 tok**（既定 blocks 単体 21,072 B）。全 topic の
   guide 出力が移送前ブロックと byte 一致 / A/B `TAKO_1154_LEGACY=1` で新テスト 3 本が FAILED / 全 3542 件緑
+
+## 2026-09-07（#1160: 仮想ディスプレイが列挙で空のときメイン画面へ窓を開かないようにした）
+- 原因は物差しの取り違え: `cx.displays()` = `CGGetActiveDisplayList` なので眠っている面は NSScreen に残ったまま
+  列挙から落ちる（実測: 2 枚とも `CGDisplayIsActive=0`）。1 回引いて即 `NotFound` → 既定の面へ落ちていた
+- 核（純粋）の `retry_policy` / `miss_for` でやり直し（空のあいだだけ・100ms × 検証 20 / 通常 3）と落とし所を決め、
+  **列挙が空 + 検証用は窓を開かず終了**（コード 4 + stderr）。面が見えて外したときは落ちるが stderr で警告する
+  （そこで止めると `build-app.sh --verify` と Windows 実機の検証が起動できない）。`ensure` は描画可能までを完了条件にした
+- 実測: 眠ったままの隔離起動が exit=4 で無窓 / `ensure` 後は `やり直し=5 回` → tako-vd へ解決 / A/B は pre-fix で core 3・番犬 3・shell 17 件が FAILED
