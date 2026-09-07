@@ -109,3 +109,13 @@
   `固定窓のあいだに増えた数を測っていない` を追加（origin/main の 657 のループを名指し）
 - GUI 16 回（tako-vd）: 無負荷 1 + 人工高負荷 3 連続 OK（load 9.1〜15.9）/ A/B は `TAKO_1153_LEGACY=1` +
   遅れの注入 4 種で旧経路が確定 FAILED（(g) は Issue と同じ JSON）/ 回帰の注入 4 種は新経路でも FAILED
+
+## 2026-09-08（#1165: セルフテストの画面エコー待ちを固定窓から状態待ちへ寄せた）
+- 項目 1b（TERM / COLORTERM）の固定 8 × 800ms = 6.4 秒窓が load 12.9 で尽き、最初の項目なので 1c 以降が
+  全部走らなかった。同型（固定回数ループ + 肯定形 `focused_contains`）9 か所を `type_until_focused_text`
+  （`state_wait_budget` + 上限つき送り直し 2 回 + `TAKO_SELF_TEST_1165` の診断 1 行）へ寄せた
+- 番犬 `固定窓のあいだに画面の文字列を待っていない` を追加（#1153 のアンカーへ needle 追加・肯定形判定は
+  `has_positive_focused_contains` の 1 実装）。pre-fix の実ファイルを 9 行名指し、旧番犬（#796）は見逃していた
+- GUI 実測（tako-vd）: 無負荷完走 2 回 + 人工高負荷完走 1 回（判定時 load 21.9〜34.6 / 予算 37〜65 秒）/
+  A/B は `TAKO_1165_INJECT=late` で旧 `budget=6.4s` が確定 FAILED・新 `waited=8.1s` で完走 /
+  `noecho` は新経路でも `attempt=2/2 waited=46.1s` で FAILED

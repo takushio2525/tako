@@ -25383,20 +25383,24 @@ mod self_test {
     {
         let legacy = legacy_1165();
         let (limit, poll, tries) = resolve_text_wait(budget, machine_busy(), legacy);
+        // `waited` は**この検査に費たした総時間**（送り直しを含む）。成功時の 1 回ぶん
+        // だけを出すと、諦めたときに `waited=0.0s` と書いてしまい「待っていない」と
+        // 読めてしまう（各試行の内訳は `TAKO_SELF_TEST_WAIT_TIMEOUT` の行に出る）
+        let started = std::time::Instant::now();
         let mut ok = false;
         let mut used = 0usize;
-        let mut waited = 0f32;
         for attempt in 1..=tries {
             used = attempt;
             send(cx);
-            if let Some(elapsed) =
-                wait_for_focused_text_polled(window, cx, needle, limit, poll).await
+            if wait_for_focused_text_polled(window, cx, needle, limit, poll)
+                .await
+                .is_some()
             {
                 ok = true;
-                waited = elapsed.as_secs_f32();
                 break;
             }
         }
+        let waited = started.elapsed().as_secs_f32();
         // **判定した瞬間の混み具合まで出す**（#1162 と同じ理由）。冒頭の
         // `TAKO_APP_SELF_TEST_ENV` は t=0 の値なので、この項目に効いていた負荷は
         // そこからは分からない
