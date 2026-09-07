@@ -122,3 +122,11 @@
   **列挙が空 + 検証用は窓を開かず終了**（コード 4 + stderr）。面が見えて外したときは落ちるが stderr で警告する
   （そこで止めると `build-app.sh --verify` と Windows 実機の検証が起動できない）。`ensure` は描画可能までを完了条件にした
 - 実測: 眠ったままの隔離起動が exit=4 で無窓 / `ensure` 後は `やり直し=5 回` → tako-vd へ解決 / A/B は pre-fix で core 3・番犬 3・shell 17 件が FAILED
+
+## 2026-09-07（#1162: セルフテスト項目 102 の `shown=false` を根治。実因は負荷ではなくペインの高さ）
+- 診断を足して実測したら `size=Some((58, 9))` = 13 行の 25 桁 fixture の箱の上端と `❯ 1.` が画面外。
+  fixture ペインを**専用タブ（全高）**へ移し、実寸が届いてから描く（`notify_and_draw`）形にした
+- 出現判定は固定 6 秒窓 → `wait_for_dispatch_state` + `state_wait_budget`（伸ばすだけ・4 倍打ち切り）。
+  番犬 `dispatchの応答を固定窓で待っていない` は origin/main の 3 行（42006 / 42125 / 42174）を名指し・本ブランチ 0 件
+- A/B `TAKO_1162_LEGACY=1` は load 2.5 でも 102 が確定 FAILED / `TAKO_1162_INJECT=nodialog` は 3 回送り直しても FAILED。
+  項目 102 は 15 回中 15 回 ok（判定時 load 3.4〜5.0）・完走 8 回。残る中断は #816 / #1058 / #694（別件の負荷フレーク）
