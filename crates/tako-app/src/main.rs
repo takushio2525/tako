@@ -25425,11 +25425,19 @@ mod self_test {
         std::env::var_os("TAKO_1153_LEGACY").is_some()
     }
 
-    /// **#1153 の検出力の注入口**（#858 の `TAKO_858_INJECT` と同じ役目）。
+    /// **#1153 の注入口**（#858 の `TAKO_858_INJECT` と同じ役目）。2 系統ある。
     ///
-    /// 待ちを状態へ寄せたことで**本物の回帰が隠れていない**ことを実測するための口。
-    /// どの値も「期待値が出ない状態」を人工的に作るので、上限まで待ってから
-    /// その項目が FAILED になるのが正しい:
+    /// **① 遅れの再現**（`TAKO_1153_LEGACY=1` と組むと旧経路が確定で落ちる）。
+    /// 機の混み具合は再現できないので、Issue が観測した**遅れる材料そのもの**を
+    /// 人工的に作る。新経路は状態で待つので待ってから通る:
+    ///
+    /// - `busy` = (e) の restore の直前にコマンドを走らせる（`command_state=Running`。#694）
+    /// - `settle` = (g) の role の直前に生成直後の猶予（#720）へ載せ直す（#1058）
+    /// - `lateflow` = 113 の fixture の出力開始を遅らせる（#816）
+    /// - `tabgone` = 657 の押す前に使い捨てタブを 1 枚作り、押した直後に閉じる（#657）
+    ///
+    /// **② 検出力の担保**（待ちを延ばしても**本物の回帰は隠れない**ことの実測）。
+    /// 期待値が出ない状態を作るので、上限まで待ってからその項目が FAILED になるのが正しい:
     ///
     /// - `norestore` = (e) の restore を送らずに成功を騙る（#694）
     /// - `norole` = (g) の role を付けずに成功を騙る（#1058）
@@ -47619,6 +47627,27 @@ mod self_test {
                             && app.pane_display_for(base) == PaneDisplay::Terminal
                     })
                     .unwrap_or(false);
+                // 遅れの再現 `busy`: restore の直前にコマンドを走らせて
+                // `command_state=Running` を作る（= 混んだ機で (d2) の後片付けが
+                // 間に合っていない状態そのもの）。**走り出すまで待ってから**次へ進む
+                // ので、旧経路は確定で `Preparing` / `Terminal` を読む
+                if inject_1153() == "busy" {
+                    let cmd = sh.sleep(3);
+                    let _ = window.update(cx, |app, _, _| app.queue_command_flow(base, cmd));
+                    let running = wait_for_app_state(
+                        window,
+                        cx,
+                        "1153 注入(busy): 注入したコマンドが走り出す",
+                        Duration::from_secs(30),
+                        |app| {
+                            app.terminals
+                                .get(&base)
+                                .is_some_and(|s| s.command_state() != tako_core::CommandState::Idle)
+                        },
+                    )
+                    .await;
+                    println!("TAKO_SELF_TEST_1153_INJECT: busy running={running}");
+                }
                 let restore_ok = if inject_1153() == "norestore" {
                     // 検出力の注入: restore を送らずに成功を騙る（待っても戻らない）
                     true
@@ -47642,6 +47671,8 @@ mod self_test {
                     !app.starter_released.contains(&base)
                         && app.pane_display_for(base) == PaneDisplay::Starter
                 };
+                let e_budget = state_wait_budget(Duration::from_secs(12), machine_busy());
+                let e_started = std::time::Instant::now();
                 let restored_display = if legacy_1153() {
                     window.update(cx, |app, _, _| restored_state(app)).unwrap_or(false)
                 } else {
@@ -47649,23 +47680,26 @@ mod self_test {
                         window,
                         cx,
                         "694(e): restore でスターター表示へ戻る",
-                        state_wait_budget(Duration::from_secs(12), machine_busy()),
+                        e_budget,
                         restored_state,
                     )
                     .await
                 };
-                if !(released && restore_ok && restored_display) {
-                    // **判定に使った材料そのものを出す**（#796）
-                    let diag = window
-                        .update(cx, |app, _, _| pane_display_diag(app, base))
-                        .unwrap_or_default();
-                    eprintln!(
-                        "TAKO_SELF_TEST_694e: released={released} restore_ok={restore_ok} \
-                         restored={restored_display} legacy={} {diag} {}",
-                        legacy_1153(),
-                        env_line()
-                    );
-                }
+                // **判定に使った材料と、実際にどれだけ待ったかを毎回出す**（#796 / #1162）。
+                // 落ちてからでは「まだ猶予中（#720）だった」のか「解除できなかった」のか
+                // 「restore が断られた」のかを区別できない
+                let e_diag = window
+                    .update(cx, |app, _, _| pane_display_diag(app, base))
+                    .unwrap_or_default();
+                println!(
+                    "TAKO_SELF_TEST_694e: released={released} restore_ok={restore_ok} \
+                     restored={restored_display} waited={:.1}s budget={:.1}s legacy={} \
+                     {e_diag} {}",
+                    e_started.elapsed().as_secs_f32(),
+                    e_budget.as_secs_f32(),
+                    legacy_1153(),
+                    env_line()
+                );
                 check(
                     released && restore_ok && restored_display,
                     "「コマンド入力へ」でそのペインだけ解除 → restore で戻る (#694)",
@@ -47766,6 +47800,16 @@ mod self_test {
                         (starter, mode_off)
                     })
                     .unwrap_or((false, false));
+                // 遅れの再現 `settle`: role を付ける直前に生成直後の猶予（#720）へ
+                // 載せ直す（= 混んだ機で `prune_pane_settle` の 2 秒 tick が
+                // 追いついていない状態そのもの）。role を付けると猶予は Agent へ
+                // 伸びるので、旧経路は確定で `display=preparing` / `settling=true` を読む
+                if inject_1153() == "settle" {
+                    let _ = window.update(cx, |app, _, _| {
+                        app.begin_pane_settle(base, tako_core::ui_mode::SettleKind::Shell)
+                    });
+                    println!("TAKO_SELF_TEST_1153_INJECT: settle pane={}", base.as_u64());
+                }
                 // role 付き（= エージェント用途）にすると理由が変わる。
                 // ここは**配線**（判定 → 理由 → 材料）の確認で、理由の網羅は
                 // `tako_core::ui_mode` の単体テストが持つ
@@ -47833,40 +47877,50 @@ mod self_test {
                         && v["display"] == "terminal"
                         && v["materials"]["has_role"] == true
                 };
-                let role_ok = if legacy_1153() {
+                // 猶予（`SETTLE_AGENT_LIMIT`）は**ペイン生成から**数えるので、ここへ
+                // 来るまでに大半は過ぎている。跨げる長さを基準に置き、混み具合ぶん伸ばす
+                let g_budget = state_wait_budget(
+                    tako_core::ui_mode::SETTLE_AGENT_LIMIT + Duration::from_secs(5),
+                    machine_busy(),
+                );
+                let g_waited = if legacy_1153() {
                     window
                         .update(cx, |app, _, _| role_reason(app) && json_ok(&role_json(app)))
                         .unwrap_or(false)
+                        .then(|| Duration::from_secs(0))
                 } else {
                     wait_for_dispatch_state(
                         window,
                         cx,
                         "1058(g): role の理由が材料つきで確定する",
-                        // 猶予（`SETTLE_AGENT_LIMIT`）は**ペイン生成から**数えるので、
-                        // ここへ来るまでに大半は過ぎている。跨げる長さを基準に置く
-                        state_wait_budget(
-                            tako_core::ui_mode::SETTLE_AGENT_LIMIT + Duration::from_secs(5),
-                            machine_busy(),
-                        ),
+                        g_budget,
                         Duration::from_millis(200),
                         |app| role_reason(app) && json_ok(&role_json(app)),
                     )
                     .await
-                    .is_some()
                 };
-                let reasons = (starter, mode_off, role_set && role_ok);
+                let reasons = (starter, mode_off, role_set && g_waited.is_some());
+                // **材料と待った時間を毎回出す**（#796 / #1162）。`settling` が読めないと
+                // 「猶予が明けていない」ことが Issue の 1 行から分からなかった
+                let g_diag = window
+                    .update(cx, |app, _, _| pane_display_diag(app, base))
+                    .unwrap_or_default();
+                println!(
+                    "TAKO_SELF_TEST_1058g: starter={} mode_off={} role_set={role_set} \
+                     role={} waited={:?} budget={:.1}s legacy={} {g_diag} {}",
+                    reasons.0,
+                    reasons.1,
+                    reasons.2,
+                    g_waited.map(|d| format!("{:.1}s", d.as_secs_f32())),
+                    g_budget.as_secs_f32(),
+                    legacy_1153(),
+                    env_line()
+                );
                 if reasons != (true, true, true) {
                     let reason_json = window
                         .update(cx, |app, _, _| role_json(app))
                         .unwrap_or(serde_json::Value::Null);
-                    eprintln!(
-                        "TAKO_SELF_TEST_1058g: starter={} mode_off={} role={} legacy={} \
-                         json={reason_json}",
-                        reasons.0,
-                        reasons.1,
-                        reasons.2,
-                        legacy_1153()
-                    );
+                    eprintln!("TAKO_SELF_TEST_1058g_JSON: json={reason_json}");
                 }
                 check(
                     reasons == (true, true, true),
@@ -55229,9 +55283,16 @@ mod self_test {
                         for (id, mut options) in std::mem::take(&mut app.pending_attach) {
                             // 検出力の注入 `noflow` は出力なしで起こす（= 流れない）
                             if id == pane && inject_1153() != "noflow" {
-                                let argv = sh.shell_snippet_command(
-                                    &sh.emit_numbered_lines("l", 150, 20),
-                                );
+                                let emit = sh.emit_numbered_lines("l", 150, 20);
+                                // 遅れの再現 `lateflow`: 出力の**開始**を遅らせる
+                                // （1 行の間隔は変えない = バーストの密度は同じまま
+                                // 「固定 2500ms 窓では 40 行に届かない」だけを作る）
+                                let snippet = if inject_1153() == "lateflow" {
+                                    format!("{}; {emit}", sh.sleep(4))
+                                } else {
+                                    emit
+                                };
+                                let argv = sh.shell_snippet_command(&snippet);
                                 options.command = Some(tako_core::SpawnCommand {
                                     program: argv[0].clone(),
                                     args: argv[1..].to_vec(),
@@ -56888,6 +56949,31 @@ mod self_test {
                 // 押した直後にそれが起きると `tabs().len() > before` は成立せず、
                 // 実測は `invoked=true tabs=8->4`（= 4 枚消えている）だった。
                 // **押す前の ID 集合に無いタブが在るか**で見れば他のタブの増減に依らない
+
+                // 遅れの再現 `tabgone`: 押す前に使い捨てのタブを 1 枚作り、押した直後に
+                // 閉じる。「新しいタブは生まれたのに**総数は増えていない**」= #1124 の
+                // 実測（`tabs=8->4`）と同じ状況を確定的に作る。使い捨てなので
+                // 以降の項目の前提は動かさない
+                let throwaway1153 = if inject_1153() == "tabgone" {
+                    window
+                        .update(cx, |app, _, _| {
+                            tako_control::dispatch::dispatch(
+                                app,
+                                tako_control::protocol::Request::TabNew {
+                                    title: Some("st1153-throwaway".into()),
+                                    focus: Some(false),
+                                    cwd: None,
+                                },
+                                PaneOrigin::Cli,
+                            )
+                            .ok()
+                            .and_then(|v| v["pane"].as_u64())
+                        })
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
                 let tabs_before: Vec<TabId> = window
                     .update(cx, |app, _, _| {
                         app.workspace.tabs().iter().map(|t| t.id()).collect()
@@ -56912,6 +56998,21 @@ mod self_test {
                         })
                         .unwrap_or(false)
                 };
+                if let Some(pane) = throwaway1153 {
+                    let _ = window.update(cx, |app, _, cx| {
+                        let _ = tako_control::dispatch::dispatch(
+                            app,
+                            tako_control::protocol::Request::Close {
+                                pane: Some(pane),
+                                force: true,
+                                caller_role: None,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                        cx.notify();
+                    });
+                    println!("TAKO_SELF_TEST_1153_INJECT: tabgone pane={pane}");
+                }
                 // `MenuInvoke` は `pending_menu_ops` へ積むだけで、消費は render →
                 // `cx.defer` → `dispatch_action` と非同期に進む。**状態で待つ**
                 // （固定 8 回 × 300ms = 2.4 秒の窓ではない。#1153）
