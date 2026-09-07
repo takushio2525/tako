@@ -23574,6 +23574,43 @@ mod self_test {
         )
     }
 
+    /// **1 CPU あたりの混み具合**（`None` = 取れない環境。#1162）。
+    ///
+    /// unix は load1 / 論理 CPU 数、Windows は CPU 使用率 / 100。どちらも
+    /// 「1.0 = 全コアが埋まっている」へ揃えてあるので、OS をまたいで同じ係数へ通せる
+    /// （3 つ組をでっち上げない = `platform::sysload` と同じ方針）。
+    ///
+    /// 使い道は待ちの上限を決めることだけで、**判定そのものには使わない**
+    /// （混んでいるかどうかで合否が変わってはいけない）
+    fn machine_busy() -> Option<f64> {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get() as f64)
+            .unwrap_or(1.0)
+            .max(1.0);
+        match tako_control::diag::machine_load()? {
+            tako_control::platform::sysload::MachineLoad::Average([one, _, _]) => Some(one / cpus),
+            tako_control::platform::sysload::MachineLoad::CpuBusy { percent, .. } => {
+                Some(percent / 100.0)
+            }
+        }
+    }
+
+    /// **状態待ちの上限を機の混み具合で伸ばす**（純粋関数。#1162）。
+    ///
+    /// フレークの直接の原因は「描き終わる前に窓を使い切る」ことなので、一次の対策は
+    /// **状態で待つ**こと（[`wait_for_dispatch_state`]）。そのうえで上限そのものも、
+    /// 混んだ機では素直に伸ばす。
+    ///
+    /// **伸ばすだけで縮めない**のが肝: `busy` が読めない環境（`load=unknown` の
+    /// Windows 実機など）でも予算は `base` のまま残るので、判定が環境で緩くなることはない。
+    /// 係数は 4 倍で打ち切る（本物の回帰があるときに待ち続けないため）
+    pub(crate) fn state_wait_budget(base: Duration, busy: Option<f64>) -> Duration {
+        let factor = busy
+            .map(|b| (1.0 + b.max(0.0)).clamp(1.0, 4.0))
+            .unwrap_or(1.0);
+        base.mul_f64(factor)
+    }
+
     fn fail(step: &str) -> ! {
         // 環境要因（load / feature 構成）は失敗と同じ場所に出す（#796）
         println!("TAKO_APP_SELF_TEST_ENV: {}", env_line());
@@ -25331,6 +25368,51 @@ mod self_test {
             cx.background_executor()
                 .timer(Duration::from_millis(100))
                 .await;
+        }
+    }
+
+    /// **dispatch（CLI / MCP と同じ経路）の応答が期待の形になるまで待つ**（#1162）。
+    ///
+    /// [`wait_for_app_state`] の `&mut TakoApp` 版。`Request::Read` のような
+    /// dispatch を述語に置けるようにしたもの（`dispatch` は `&mut` を要る）。
+    ///
+    /// なぜ要るか: ペインへ打ち込んで描いた疑似画面の出現を
+    /// `for _ in 0..20 { wait(cx, 300) }` = **固定 6 秒窓**で読む形は、混んだ機では
+    /// 描き終わる前に窓を使い切って落ちる。項目 102（#1131）がこれで落ち、
+    /// **103 以降が 1 つも走らなくなっていた**（#1162）。上限は
+    /// [`state_wait_budget`] で機の混み具合に応じて伸ばす。
+    ///
+    /// 成立したら実測時間を返す（「予算に対して実際どれだけ掛かったか」を診断へ
+    /// 出せるように）。上限まで待って駄目なら `None` + 診断 1 行なので、検出力は
+    /// 固定窓と同じか強い（成立しない条件はいくら待っても成立しない）
+    async fn wait_for_dispatch_state<F>(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        label: &str,
+        timeout: Duration,
+        poll: Duration,
+        mut predicate: F,
+    ) -> Option<Duration>
+    where
+        F: FnMut(&mut TakoApp) -> bool,
+    {
+        let started = std::time::Instant::now();
+        loop {
+            if window
+                .update(cx, |app, _, _| predicate(app))
+                .unwrap_or(false)
+            {
+                return Some(started.elapsed());
+            }
+            if started.elapsed() >= timeout {
+                println!(
+                    "TAKO_SELF_TEST_STATE_TIMEOUT: label={label:?} waited={:.1}s {}",
+                    started.elapsed().as_secs_f32(),
+                    env_line()
+                );
+                return None;
+            }
+            cx.background_executor().timer(poll).await;
         }
     }
 
@@ -41918,8 +42000,23 @@ mod self_test {
             //      を機械検証する。実 claude を使わず画面テキストで再現できるのは、
             //      検知が文言リストではなく**構造**で判定しているため（#530 の教訓）
             {
-                // 専用ペインを分割して使う（他の項目が残した状態に依存しない。
-                // 途中で Ctrl-C を送るので、根プロセスが必ずシェルであることが要る）
+                // 専用ペインは**新しいタブ**に作る（#1162）。途中で Ctrl-C を送るので、
+                // 根プロセスが必ずシェルであることが要る。
+                //
+                // 旧実装は「端末のあるペインを 1 枚見つけて下へ分割」で、ペインの高さが
+                // **そのときのタブの中身次第**になっていた。⑤ の 25 桁 fixture は 13 行
+                // あり、9 行しかないペインでは箱の上端・問い・`❯ 1.` が画面の外へ出る
+                // （= `detect_choice_dialog` の anchor が消える）ので `shown=false` になる。
+                // これが #1162 の実因で、実測は `size=Some((58, 9))`。**load と対応しな
+                // かった理由もこれ**（混み具合ではなく先行項目が残したレイアウト次第）。
+                // 新しいタブなら 1 枚で全高を取れるので、機の状況にも項目順にも依らない。
+                // 最後のペインを閉じればタブごと畳まれるので後片付けも増えない
+                let legacy1162 = std::env::var_os("TAKO_1162_LEGACY").is_some();
+                // **検出力の注入口**（#1162）。`nodialog` は ⑤ の fixture を
+                // ダイアログでない画面へ差し替え、**送り直しが本物の回帰を隠さない**ことを
+                // 測る（#858 の `TAKO_858_INJECT` と同じ役目）
+                let inject1162 = std::env::var("TAKO_1162_INJECT").unwrap_or_default();
+                let mut dlg_base = 0u64;
                 let dlg_pane = window
                     .update(cx, |app, _, cx| {
                         let base = app
@@ -41930,19 +42027,34 @@ mod self_test {
                             .map(|p| p.id())
                             .find(|id| app.terminals.contains_key(id))
                             .unwrap_or_else(|| app.focused_pane());
-                        let r = tako_control::dispatch(
-                            app,
-                            tako_control::protocol::Request::Split {
-                                pane: Some(base.as_u64()),
-                                tab: None,
-                                direction: Some(tako_control::protocol::Direction::Down),
-                                ratio: None,
-                                command: None,
-                                cwd: None,
-                                focus: Some(true),
-                            },
-                            PaneOrigin::Cli,
-                        );
+                        dlg_base = base.as_u64();
+                        let r = if legacy1162 {
+                            tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::Split {
+                                    pane: Some(base.as_u64()),
+                                    tab: None,
+                                    direction: Some(tako_control::protocol::Direction::Down),
+                                    ratio: None,
+                                    command: None,
+                                    cwd: None,
+                                    focus: Some(true),
+                                },
+                                PaneOrigin::Cli,
+                            )
+                        } else {
+                            // 全高のペインが 1 枚だけ在るタブ。**アクティブにする**のは
+                            // レイアウトが走らないとペインに実寸が付かないため
+                            tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::TabNew {
+                                    title: Some("st1131".into()),
+                                    focus: Some(true),
+                                    cwd: None,
+                                },
+                                PaneOrigin::Cli,
+                            )
+                        };
                         cx.notify();
                         // dispatch を直接呼ぶと PTY 起動依頼は pending_attach へ積まれるだけ
                         // なので、ここで消化する（IPC ループ相当。残すとペインに端末が付かない）
@@ -41954,7 +42066,7 @@ mod self_test {
                             .unwrap_or(base.as_u64())
                     })
                     .unwrap_or(0);
-                // 分割直後はシェルの起動途中で打鍵が落ちることがあるので、
+                // 作った直後はシェルの起動途中で打鍵が落ちることがあるので、
                 // プロンプトが出る（= 画面に中身がある）まで待つ（判定は #903 の共通ヘルパー）
                 let _ = wait_for_pane_ready(
                     window,
@@ -41963,6 +42075,18 @@ mod self_test {
                     Duration::from_secs(30),
                 )
                 .await;
+                // **レイアウトの実寸をペインの端末へ届けてから描く**（#1162）。
+                //
+                // 端末は既定の 80x24 で作られ、実寸はレイアウトが走ったフレームで
+                // 初めて届く（ビューは `AnyView::cached` なので dirty でないフレームは
+                // 描き直さない = #786）。ここで 1 フレーム描かないと、**fixture を
+                // 80x24 の格子へ描いてから実寸へ縮む**という順序になり、⑤ の 13 行が
+                // 収まる回と収まらない回が入れ替わる = #1162 のフレークの正体
+                // （実測: 落ちた回の実寸は `size=Some((58, 9))`）。
+                // 幾何を読む前に「汚してから 1 フレーム描く」= `.agent/conventions.md`
+                notify_and_draw(any, window, cx);
+                wait(cx, 150).await;
+                notify_and_draw(any, window, cx);
                 // ダイアログ画面を描いて `sleep` で保持する（プロンプトが下に戻ると
                 // 最下部のカーソル行がシェルのプロンプトになり画面状態が変わる）
                 // 罫線と選択カーソルは**実文字**で書く（`\uXXXX` エスケープはシェルの
@@ -42001,33 +42125,134 @@ mod self_test {
                         PaneOrigin::Cli,
                     )
                 };
-                let _ = window.update(cx, |app, _, _| send(app, &dialog_cmd));
-                let mut shown = false;
-                for _ in 0..20 {
-                    wait(cx, 300).await;
-                    shown = window
-                        .update(cx, |app, _, _| {
-                            read(app)
-                                .ok()
-                                .is_some_and(|v| v["choice_dialog"].is_object())
-                        })
-                        .unwrap_or(false);
-                    if shown {
-                        break;
-                    }
+                // **打ち込んで描いた画面の出現は状態で待つ**（#1162）。
+                //
+                // 旧実装は `for _ in 0..20 { wait(cx, 300) }` = **固定 6 秒窓**で、
+                // 混んだ機では描き終わる前に窓を使い切って `shown=false` で落ち、
+                // 分類は無罪なのに **103 以降が 1 つも走らなくなっていた**。
+                // 予算は機の混み具合で伸ばし（`state_wait_budget`）、それでも出なければ
+                // **打鍵そのものが落ちた**可能性（#903 / #737 の実測）を疑って上限つきで
+                // 送り直す。各試行を記録するので本物の回帰は隠れない
+                // （分類が壊れれば `shown` は真のまま kind / labels の check が落ちる）
+                let dlg_budget = if legacy1162 {
+                    Duration::from_secs(6)
+                } else {
+                    state_wait_budget(Duration::from_secs(20), machine_busy())
+                };
+                let dlg_poll = Duration::from_millis(if legacy1162 { 300 } else { 150 });
+                let dlg_tries = if legacy1162 { 1 } else { 3 };
+                // 「送る → 出るまで待つ」を上限つきで繰り返す。`send` / `read` は
+                // ローカルクロージャなので関数ではなくマクロで包む（項目 137 の
+                // `paint_box!` と同じ理由）
+                macro_rules! paint_until {
+                    ($tag:expr, $label:expr, $cmd:expr, $ready:expr) => {{
+                        let mut ok = false;
+                        let mut used = 0usize;
+                        let mut waited = 0f32;
+                        let mut refused: Option<String> = None;
+                        // **fixture が収まる高さがあるか**を毎回記録する（#1162）。
+                        // 足りないと「箱の上端と `❯ 1.` が画面の外へ出て検知できない」
+                        // だけなので、`shown=false` の 1 行では原因が分からなかった。
+                        // ⑤ の 25 桁 fixture は 13 行 + プロンプト行で 14 行要る。
+                        // **レイアウトが走ったあと**（`wait_for_pane_ready` の後）に
+                        // 採るのが肝: 作った直後は既定の 80x24 が返る = 実寸ではない
+                        let size = window
+                            .update(cx, |app, _, _| {
+                                app.terminals
+                                    .get(&tako_core::PaneId::from_raw(dlg_pane))
+                                    .map(|s| s.size())
+                            })
+                            .ok()
+                            .flatten();
+                        for attempt in 1..=dlg_tries {
+                            used = attempt;
+                            if attempt > 1 {
+                                // 打鍵が落ちた疑い: Ctrl-C でプロンプトへ戻してから送り直す
+                                // （残っていれば sleep を止め、無ければ何も起きない）
+                                let _ = window.update(cx, |app, _, cx| {
+                                    if let Some(term) =
+                                        app.terminals.get(&tako_core::PaneId::from_raw(dlg_pane))
+                                    {
+                                        term.write(vec![0x03]);
+                                    }
+                                    cx.notify();
+                                });
+                                let _ = wait_for_pane_ready(
+                                    window,
+                                    cx,
+                                    tako_core::PaneId::from_raw(dlg_pane),
+                                    Duration::from_secs(30),
+                                )
+                                .await;
+                            }
+                            // 送信が**断られた**なら待っても出ない（#748 のガードが
+                            // 居座っている等）。理由を診断へ出す
+                            refused = window
+                                .update(cx, |app, _, _| {
+                                    send(app, $cmd).err().map(|e| e.to_string())
+                                })
+                                .unwrap_or(None);
+                            if let Some(elapsed) = wait_for_dispatch_state(
+                                window, cx, $label, dlg_budget, dlg_poll, $ready,
+                            )
+                            .await
+                            {
+                                ok = true;
+                                waited = elapsed.as_secs_f32();
+                                break;
+                            }
+                        }
+                        // **判定した瞬間の混み具合まで出す**（#1162）。冒頭の
+                        // `TAKO_APP_SELF_TEST_ENV` は t=0 の値なので、この項目に効いて
+                        // いた負荷は分からなかった（Issue の実測表が load と対応しない
+                        // ように見えた原因の 1 つ）
+                        println!(
+                            "TAKO_SELF_TEST_1162: item={} ok={ok} attempt={used}/{dlg_tries} \
+                             waited={waited:.1}s budget={:.1}s size={size:?} need_rows=14 \
+                             legacy={legacy1162} refused={refused:?} {}",
+                            $tag,
+                            dlg_budget.as_secs_f32(),
+                            env_line()
+                        );
+                        if !ok {
+                            // **判定に使った材料そのものを出す**（#796）。画面が空なだけでは
+                            // 「描くのが遅い」と「打鍵の宛先が死んだ」を区別できないので、
+                            // PTY の生死まで出す（#903 / 項目 137 と同じ形）
+                            let (pty, tail) = window
+                                .update(cx, |app, _, _| {
+                                    let id = tako_core::PaneId::from_raw(dlg_pane);
+                                    let session = app.terminals.get(&id);
+                                    let pty = format!(
+                                        "session={} size={:?} state={:?}",
+                                        session.is_some(),
+                                        session.map(|s| s.size()),
+                                        session.map(|s| s.command_state())
+                                    );
+                                    let tail = read(app)
+                                        .ok()
+                                        .and_then(|v| v["text"].as_str().map(str::to_string))
+                                        .unwrap_or_else(|| "(read 失敗)".into());
+                                    (pty, tail)
+                                })
+                                .unwrap_or_default();
+                            println!(
+                                "TAKO_SELF_TEST_1162_SCREEN: item={} {pty} {}",
+                                $tag,
+                                env_line()
+                            );
+                            eprintln!("TAKO_SELF_TEST_748: 画面=\n{tail}");
+                        }
+                        ok
+                    }};
                 }
-                if !shown {
-                    // 失敗時の診断: 何が画面に出ているのかを残す（検知の材料は画面テキスト）
-                    let tail = window
-                        .update(cx, |app, _, _| {
-                            read(app)
-                                .ok()
-                                .and_then(|v| v["text"].as_str().map(str::to_string))
-                                .unwrap_or_else(|| "(read 失敗)".into())
-                        })
-                        .unwrap_or_default();
-                    eprintln!("TAKO_SELF_TEST_748: 画面=\n{tail}");
-                }
+                let shown = paint_until!(
+                    "748",
+                    "選択肢ダイアログが read の choice_dialog に出る (#748)",
+                    &dialog_cmd,
+                    |app: &mut TakoApp| read(app)
+                        .ok()
+                        .is_some_and(|v| v["choice_dialog"].is_object())
+                );
                 check(shown, "選択肢ダイアログが read の choice_dialog に出る (#748)");
                 let (kind_ok, input_null, first_label) = window
                     .update(cx, |app, _, _| {
@@ -42121,18 +42346,18 @@ mod self_test {
                     }
                     cx.notify();
                 });
-                let mut cleared = false;
-                for _ in 0..20 {
-                    wait(cx, 300).await;
-                    cleared = window
-                        .update(cx, |app, _, _| {
-                            read(app).ok().is_some_and(|v| v["choice_dialog"].is_null())
-                        })
-                        .unwrap_or(false);
-                    if cleared {
-                        break;
-                    }
-                }
+                // 消えるのも固定窓では待たない（#1162）。`clear` が走るまでの時間は
+                // 機の混み具合で伸びる（打鍵は tty のバッファに残るので落ちはしない）
+                let cleared = wait_for_dispatch_state(
+                    window,
+                    cx,
+                    "ダイアログが消えれば choice_dialog は null (#748)",
+                    dlg_budget,
+                    dlg_poll,
+                    |app: &mut TakoApp| read(app).ok().is_some_and(|v| v["choice_dialog"].is_null()),
+                )
+                .await
+                .is_some();
                 check(cleared, "ダイアログが消えれば choice_dialog は null (#748)");
                 let send_ok = window
                     .update(cx, |app, _, _| send(app, "echo TAKO748_SEND_OK").is_ok())
@@ -42144,7 +42369,16 @@ mod self_test {
                 //    ラベルの列へ字下げする。実採取で裏取りした生成器の出力）。
                 //    #1131 前は選択肢は見つかるのに**ラベルが切り詰められ**、
                 //    respond のラベル一致検証と #813 の安全な選択肢の選別が静かに外れた
-                let narrow_cmd = sh.paint_and_hold(
+                //
+                //    `TAKO_1162_INJECT=nodialog` は**送り直しが本物の回帰を隠さない**ことを
+                //    測る注入口（#858 の `TAKO_858_INJECT` と同じ役目）。ダイアログの形を
+                //    していない画面を描くので、上限まで送り直しても 102 は FAILED になる
+                let narrow_body = if inject1162 == "nodialog" {
+                    concat!(
+                        "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n",
+                        "   nothing to choose\n",
+                    )
+                } else {
                     concat!(
                         "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n",
                         "   What do you want to\n",
@@ -42157,9 +42391,9 @@ mod self_test {
                         "        session limits\n",
                         "        every month\n\n",
                         "   Enter to confirm\n",
-                    ),
-                    30,
-                );
+                    )
+                };
+                let narrow_cmd = sh.paint_and_hold(narrow_body, 30);
                 // 直前に Ctrl-C + clear を打っているので、プロンプトが戻るまで待つ
                 // （起動途中 / 復帰途中の PTY は打鍵を落とす。#903）
                 let _ = wait_for_pane_ready(
@@ -42169,21 +42403,15 @@ mod self_test {
                     Duration::from_secs(30),
                 )
                 .await;
-                let _ = window.update(cx, |app, _, _| send(app, &narrow_cmd));
-                let mut narrow_shown = false;
-                for _ in 0..20 {
-                    wait(cx, 300).await;
-                    narrow_shown = window
-                        .update(cx, |app, _, _| {
-                            read(app)
-                                .ok()
-                                .is_some_and(|v| v["choice_dialog"].is_object())
-                        })
-                        .unwrap_or(false);
-                    if narrow_shown {
-                        break;
-                    }
-                }
+                // ここが #1162 で落ちていた本体（固定 6 秒窓 → 状態待ち + 上限つき送り直し）
+                let narrow_shown = paint_until!(
+                    "1131",
+                    "102: 25 桁のダイアログが read の choice_dialog に出る (#1131)",
+                    &narrow_cmd,
+                    |app: &mut TakoApp| read(app)
+                        .ok()
+                        .is_some_and(|v| v["choice_dialog"].is_object())
+                );
                 let (narrow_kind, narrow_labels) = window
                     .update(cx, |app, _, _| {
                         let v = read(app).unwrap_or_default();
@@ -42281,6 +42509,20 @@ mod self_test {
                             pane: Some(dlg_pane),
                             force: true,
                             caller_role: None,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    // 最後のペインを閉じるとタブごと畳まれる（#1162 で専用タブへ移した）。
+                    // **旧経路と同じ終了状態へ戻す**: 分割で作っていたときは
+                    // 「分割元のタブがアクティブ・分割元にフォーカス」で次の項目へ渡って
+                    // いたので、専用タブを畳んだあとに同じ状態を作る（`Focus` は
+                    // 別タブのペインならタブ切替も伴う）。後続の項目がアクティブな
+                    // タブの前提を持っていても壊さないため
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Focus {
+                            pane: Some(dlg_base),
+                            direction: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -63521,6 +63763,59 @@ mod selftest_pty_enter_watchdog {
     }
 }
 
+/// 状態待ちの上限の決め方（純粋関数。#1162）。
+///
+/// 固定窓（`for _ in 0..20 { wait(cx, 300) }` = 6 秒）で落ちていた項目 102 を
+/// 状態待ちへ移したときの予算。**伸ばすだけで縮めない**ことと**打ち切りがある**ことを
+/// 固定する（混み具合で判定が緩くなってはいけない / 本物の回帰があるときに
+/// 待ち続けてはいけない）
+#[cfg(test)]
+mod self_test_wait_budget_tests {
+    use super::self_test::state_wait_budget;
+    use std::time::Duration;
+
+    /// `load=unknown` の環境（Windows 実機で 1 か月ぶん出ていた）でも予算は残る
+    #[test]
+    fn 混み具合が読めなければ予算は基準のまま() {
+        assert_eq!(
+            state_wait_budget(Duration::from_secs(20), None),
+            Duration::from_secs(20)
+        );
+    }
+
+    /// 空いている機で**短くしない**のが肝: 予算が縮むと「空いていたのに落ちた」を
+    /// 作ってしまい、固定窓と同じ問題が別の顔で戻ってくる
+    #[test]
+    fn 空いている機でも基準を下回らない() {
+        assert_eq!(
+            state_wait_budget(Duration::from_secs(20), Some(0.0)),
+            Duration::from_secs(20)
+        );
+        // 採り損ねた負値でも縮めない
+        assert_eq!(
+            state_wait_budget(Duration::from_secs(20), Some(-1.0)),
+            Duration::from_secs(20)
+        );
+    }
+
+    /// 1.0 = 全コアが埋まっている（unix の load1 ≒ コア数 / Windows の CPU 100%）
+    #[test]
+    fn 全コアが埋まっていれば2倍まで伸びる() {
+        assert_eq!(
+            state_wait_budget(Duration::from_secs(20), Some(1.0)),
+            Duration::from_secs(40)
+        );
+    }
+
+    #[test]
+    fn 伸びは4倍で打ち切る() {
+        assert_eq!(
+            state_wait_budget(Duration::from_secs(20), Some(10.0)),
+            Duration::from_secs(80)
+        );
+    }
+}
+
 /// 項目 41 / 41b のゲートと判定（#1091）。
 ///
 /// どちらも純粋関数なので、**macOS 上から Windows 側の答えも検査できる**
@@ -65302,6 +65597,91 @@ mod selftest_wait_watchdog {
             concat!("paint_and", "_hold(body, 30)")
         );
         assert!(painted_fixture_without_ready_wait(&as_command).is_empty());
+    }
+
+    /// **dispatch の応答を固定回数の窓で待っていない**（#1162）。
+    ///
+    /// `for _ in 0..20 { wait(cx, 300).await; … read(app) … }` は
+    /// 「20 回 × 300ms = **固定 6 秒**」の予算で、混んだ機では相手が応答の形になる前に
+    /// 窓を使い切る。項目 102（#1131）はこの形で `shown=false` になり、
+    /// **分類は無罪なのに 103 以降が 1 つも走らなくなっていた**（#1162 の実測）。
+    ///
+    /// 正しい形は `wait_for_dispatch_state`（状態到達まで待ち、上限は
+    /// `state_wait_budget` で機の混み具合に応じて伸ばす）。**ループの先頭で描き直して
+    /// から読む**形（項目 137 の `paint_box!`）は対象外にする: 送り直しが入っているので
+    /// 予算切れで無検証にならない = 先頭の行が `wait` ではない。
+    /// パターンは `concat!` で分割して書く（番犬自身のソース行が検査対象に入るため）
+    fn fixed_window_then_dispatch_read(src: &str) -> Vec<usize> {
+        let reads = [concat!("read(", "app)"), concat!("choice_", "dialog")];
+        let lines: Vec<&str> = src.lines().collect();
+        let mut hits = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if !(trimmed.starts_with("for ")
+                && trimmed.contains(" in 0..")
+                && trimmed.ends_with('{'))
+            {
+                continue;
+            }
+            if !lines
+                .get(index + 1)
+                .is_some_and(|l| l.trim().starts_with(concat!("wait(cx", ", ")))
+            {
+                continue;
+            }
+            let body = lines
+                .iter()
+                .skip(index + 1)
+                .take(14)
+                .map(|l| l.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if reads.iter().any(|needle| body.contains(needle)) {
+                hits.push(index + 1);
+            }
+        }
+        hits
+    }
+
+    #[test]
+    fn dispatchの応答を固定窓で待っていない() {
+        let src = include_str!("main.rs");
+        let hits = fixed_window_then_dispatch_read(src);
+        assert!(
+            hits.is_empty(),
+            "main.rs:{hits:?} が「dispatch の応答を固定回数の窓で待つ」形で書かれている。\
+             混んだ機では応答の形になる前に窓を使い切り、**その項目以降が 1 つも\
+             走らなくなる**。`wait_for_dispatch_state`（状態待ち + `state_wait_budget` の\
+             上限）を使うこと（#1162）"
+        );
+    }
+
+    /// 検出力の担保: 番犬自身が空振りしないこと（#1162 で直した形そのものを与える）
+    #[test]
+    fn 番犬は固定窓のdispatch読みを見逃さず送り直し形は許す() {
+        let bad = format!(
+            "                for _ in 0..20 {{\n                    {}\n                    \
+             shown = window.update(cx, |app, _, _| {}.ok().is_some());",
+            concat!("wait(cx", ", 300).await;"),
+            concat!("read(", "app)")
+        );
+        assert_eq!(fixed_window_then_dispatch_read(&bad), vec![1]);
+        // ループの先頭で描き直してから読む形（項目 137）は予算切れで無検証にならない
+        let repainted = format!(
+            "                for _ in 0..20 {{\n                    \
+             let _ = window.update(cx, |app, _, cx| repaint(app, cx));\n                    \
+             ready = window.update(cx, |app, _, _| {}.is_ok());\n                    {}",
+            concat!("read(", "app)"),
+            concat!("wait(cx", ", 150).await;")
+        );
+        assert!(fixed_window_then_dispatch_read(&repainted).is_empty());
+        // 状態待ちヘルパーへ寄せた形
+        let good = format!(
+            "            let shown = {}(window, cx, label, budget, poll, |app| {}.is_ok()).await;",
+            concat!("wait_for_dispatch", "_state"),
+            concat!("read(", "app)")
+        );
+        assert!(fixed_window_then_dispatch_read(&good).is_empty());
     }
 
     #[test]
