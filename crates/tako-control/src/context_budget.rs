@@ -530,7 +530,12 @@ pub fn fix(cwd: &Path, profile: Option<&str>, dry_run: bool) -> Result<Value, St
 }
 
 /// `tako setup` / `tako master` が出す 1 行（#322 の最簡形）。
-/// 超過が無ければ `None`（黙って素通りする）
+/// 超過が無ければ `None`（黙って素通りする）。
+///
+/// #1154: **自動で直せるものが 1 件も無いときに `fix` を案内しない**
+/// （`fix` は作業ログの移送しかできないので、system prompt が超えているときに
+/// 「いま直す: fix（自動で直せる 0 件）」を出すのは嘘の案内になる）。
+/// その場合は代わりに**何が超えているか**を 1 行で名指しする
 pub fn startup_line(cwd: &Path, profile: Option<&str>) -> Option<String> {
     let r = report(cwd, profile).ok()?;
     let violations = r["violations"].as_u64().unwrap_or(0);
@@ -539,16 +544,65 @@ pub fn startup_line(cwd: &Path, profile: Option<&str>) -> Option<String> {
     }
     let tokens = r["totals"]["est_tokens"].as_u64().unwrap_or(0);
     let fixable = r["fixable"].as_u64().unwrap_or(0);
+    if fixable > 0 {
+        return Some(match tako_core::i18n::lang() {
+            tako_core::i18n::Lang::Ja => format!(
+                "起動時ロードが予算超過: {violations} 件（概算 {tokens} トークン）。\
+                 いま直す: tako context-budget fix（自動で直せる {fixable} 件）",
+            ),
+            tako_core::i18n::Lang::En => format!(
+                "Startup load is over budget: {violations} item(s) (~{tokens} tokens). \
+                 Fix now: tako context-budget fix ({fixable} auto-fixable)",
+            ),
+        });
+    }
+    let worst = worst_proposal(&r);
     Some(match tako_core::i18n::lang() {
         tako_core::i18n::Lang::Ja => format!(
-            "起動時ロードが予算超過: {violations} 件（概算 {tokens} トークン）。\
-             いま直す: tako context-budget fix（自動で直せる {fixable} 件）",
+            "起動時ロードが予算超過: {violations} 件（概算 {tokens} トークン）。{worst}\
+             内訳: tako context-budget",
         ),
         tako_core::i18n::Lang::En => format!(
-            "Startup load is over budget: {violations} item(s) (~{tokens} tokens). \
-             Fix now: tako context-budget fix ({fixable} auto-fixable)",
+            "Startup load is over budget: {violations} item(s) (~{tokens} tokens). {worst}\
+             Breakdown: tako context-budget",
         ),
     })
+}
+
+/// 1 行で名指しする対象。**master 自身の system prompt を優先する**
+/// （`tako master` はこれからその prompt を渡すところで、master 自身は
+/// 自分の prompt の大きさを他の手段では知れない）。無ければ超過分が最大のもの
+fn worst_proposal(report: &Value) -> String {
+    let empty = vec![];
+    let proposals = report["proposals"].as_array().unwrap_or(&empty);
+    let over = |p: &Value| {
+        p["actual"]
+            .as_u64()
+            .unwrap_or(0)
+            .saturating_sub(p["limit"].as_u64().unwrap_or(0))
+    };
+    let prompt_paths: Vec<&str> = report["items"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .filter(|it| it["kind"] == ItemKind::SystemPrompt.as_str())
+        .filter_map(|it| it["path"].as_str())
+        .collect();
+    let pick = proposals
+        .iter()
+        .filter(|p| prompt_paths.contains(&p["path"].as_str().unwrap_or_default()))
+        .max_by_key(|p| over(p))
+        .or_else(|| proposals.iter().max_by_key(|p| over(p)));
+    match pick {
+        Some(p) => format!(
+            "{}: {} {} > {}。",
+            p["path"].as_str().unwrap_or("?"),
+            p["metric"].as_str().unwrap_or("?"),
+            p["actual"].as_u64().unwrap_or(0),
+            p["limit"].as_u64().unwrap_or(0),
+        ),
+        None => String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -635,6 +689,41 @@ mod tests {
             "表示用パスにユーザー名が残っている: {shown}"
         );
         assert!(shown.starts_with("~/.claude/projects/"));
+    }
+
+    /// #1154: `fix` で直せないものだけが超えているときに `fix` を案内しない
+    /// （`tako master` の起動前 1 行が「自動で直せる 0 件」を勧める嘘になっていた）
+    #[test]
+    fn 自動で直せないときは何が超えているかを名指しする() {
+        let report = json!({
+            "items": [
+                { "kind": "system_prompt", "path": "master system prompt（p）" },
+                { "kind": "global_guide", "path": "~/.claude/CLAUDE.md" },
+            ],
+            "proposals": [
+                // 超過分はこちらの方が大きいが、master 自身の prompt を優先する
+                { "path": "~/.claude/CLAUDE.md", "metric": "bytes", "actual": 90000, "limit": 24576 },
+                { "path": "master system prompt（p）", "metric": "bytes", "actual": 30000, "limit": 24576 },
+            ],
+        });
+        let line = worst_proposal(&report);
+        assert!(
+            line.starts_with("master system prompt（p）: bytes 30000 > 24576"),
+            "master 自身の prompt を優先して名指しする: {line}"
+        );
+
+        // system prompt が超えていなければ超過分が最大のものを名指しする
+        let report = json!({
+            "items": [{ "kind": "global_guide", "path": "~/.claude/CLAUDE.md" }],
+            "proposals": [
+                { "path": "a.md", "metric": "lines", "actual": 100, "limit": 80 },
+                { "path": "~/.claude/CLAUDE.md", "metric": "bytes", "actual": 90000, "limit": 24576 },
+            ],
+        });
+        assert!(worst_proposal(&report).starts_with("~/.claude/CLAUDE.md: bytes 90000 > 24576"));
+
+        // 提案が無ければ黙る（1 行に余計な句読点を出さない）
+        assert_eq!(worst_proposal(&json!({})), "");
     }
 
     #[test]

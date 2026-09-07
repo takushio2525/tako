@@ -114,6 +114,7 @@ tako/
 | オーケストレーター master 引き継ぎ（#193/#749/#915/#854/#917） | `tako orchestrator handoff [--pane N] [--tab T] [--projects a,b]` |
 | **master の自動ハンドオフ（#749）** | `【tako 自動通知】` |
 | **引き継ぎファイルの管理（#915）** | `tako orchestrator handoffs list/show/write/migrate` |
+| **master の手順書を引く（#1154）** | `tako orchestrator guide <topic>` |
 | オーケストレーター worker spawn | `tako orchestrator spawn --project <key> --prompt "..."` |
 | **worker への指示送達（#790）** | `<data_dir>/persist.log` |
 | オーケストレーター worker 監視 | `tako orchestrator watch --pane <N>` |

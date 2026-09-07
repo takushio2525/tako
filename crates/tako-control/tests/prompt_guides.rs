@@ -307,3 +307,33 @@ fn 手順書に要約を混ぜたら創作として名指しする() {
     let real = guide::find("acceptance").unwrap().body;
     assert!(invented_lines(&[("acceptance", real)], &before_bag).is_empty());
 }
+
+#[test]
+fn 既定のpromptに手順の全文が載っていない() {
+    // #1154 の本体。**移送が本当に効いている**ことを、各 topic の特徴的な 1 行が
+    // prompt に載っていないことで確かめる。組み立て済みの prompt を見るので
+    // `TAKO_1154_LEGACY=1`（本文を差し戻す A/B）ではここが落ちる
+    let profile = tako_control::orchestrator::Profile::default();
+    let built = profile.build_from_template(DEFAULT_SYSTEM_PROMPT, "default");
+    let prompt = built.as_str();
+    let mut inlined: Vec<String> = Vec::new();
+    for g in GUIDES.iter().filter(|g| !g.restores.is_empty()) {
+        // その topic の本文のうち、案内文に出てこない実体行を代表として選ぶ
+        let sample = lines_of(g.body)
+            .into_iter()
+            .filter(|l| l.len() > 60 && !l.starts_with('#') && !l.starts_with('|'))
+            .max_by_key(|l| l.len())
+            .unwrap_or_default();
+        if !sample.is_empty() && prompt.contains(&sample) {
+            inlined.push(format!("  [{}] {}", g.topic, show(&sample)));
+        }
+    }
+    assert!(
+        inlined.is_empty(),
+        "手順の全文が prompt にインラインで残っている（{} 件）。\
+         起動時ロードの固定費を減らすのが #1154 の狙いなので、本文は topic 側に置き、\
+         prompt には引く条件だけを残す:\n{}",
+        inlined.len(),
+        inlined.join("\n")
+    );
+}

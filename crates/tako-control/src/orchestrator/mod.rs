@@ -1451,7 +1451,7 @@ impl Profile {
             push(name.clone(), format!("{content}\n"));
 
             // #1154 の A/B: 立てると手順書の本文を prompt へ差し戻す（変更前の量へ戻る）
-            if mode == PromptMode::Master && tako_core::context_budget::legacy_1154() {
+            if mode == PromptMode::Master && guide::legacy_restore() {
                 for g in guide::restored_at_block(name) {
                     push(format!("guide:{}", g.topic), format!("\n{}\n", g.body));
                 }

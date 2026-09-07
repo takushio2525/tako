@@ -19,11 +19,14 @@
 //!
 //! # A/B（`TAKO_1154_LEGACY=1`）
 //!
-//! 立てると `build_from_template` が **各 guide の本文を prompt へ差し戻す**ので、
-//! 同一バイナリで変更前の量・内容へ戻せる（`tako_core::context_budget::legacy_1154`
-//! が同時に system prompt の予算も外す）。差し戻しは本文と量を戻すもので、
-//! **原文の並び順とは一致しない**（`handoff` は `behavior` の一部を切り出した派生 topic
-//! なので、差し戻しでは二重に出さない）。
+//! 立てると `build_from_template` が **各 topic の本文を prompt へ差し戻す**ので、
+//! 同一バイナリで「移送しなかった場合」の prompt を作れる。**予算は外さない**ので、
+//! そのとき番犬（`crates/tako-control/tests/context_budget.rs`）が超過で落ちるのが
+//! 「移送しなければ予算を超えていた」ことの実測になる。
+//!
+//! 差し戻しは本文と量を戻すもので、移送前の prompt の byte 再現ではない
+//! （案内文は残るので原文より大きくなる。`handoff` は `behavior` の一部を切り出した
+//! 派生 topic なので、差し戻しでは二重に出さない）。
 
 use serde_json::{json, Value};
 use tako_core::context_budget as budget;
@@ -121,6 +124,12 @@ pub const GUIDES: &[Guide] = &[
         body: include_str!("guides/behavior.md"),
     },
 ];
+
+/// #1154 の A/B: 立てると各 topic の本文を prompt へ差し戻す（= 移送前の中身に戻す）。
+/// 予算は外さないので、番犬が超過で落ちることが「移送の効き」の実測になる
+pub fn legacy_restore() -> bool {
+    std::env::var_os("TAKO_1154_LEGACY").is_some_and(|v| !v.is_empty() && v != "0")
+}
 
 /// topic 名の正規化（大文字小文字と `_` / `-` の違いを吸収する）
 fn normalize(topic: &str) -> String {

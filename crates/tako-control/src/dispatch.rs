@@ -12852,6 +12852,80 @@ mod tests {
 
     /// #1002: モデル一覧は dispatch を通るので CLI・MCP・GUI が同じペイロードを見る。
     /// **書き込みツールを増やしていない**ことも応答の `apply_command` で示す
+    /// #1154: 手順書は CLI と MCP（dispatch）で**同じ 1 本**を通る。
+    /// 「MCP からは引けない」を作らないための拘束（開発不変条件 = AI フルコントロール）
+    #[test]
+    fn issue1154_手順書はdispatchからcliと同じ内容で読める() {
+        let mut host = MockHost::new();
+
+        // 一覧（topic 省略）
+        let list = dispatch(
+            &mut host,
+            Request::OrchestratorGuide {
+                topic: None,
+                profile: Some("default".into()),
+                caller_role: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        let want = crate::orchestrator::guide::json(None, "default").unwrap();
+        assert_eq!(list, want, "一覧が CLI 経路と食い違っている");
+
+        // 全 topic の全文（1 つでも MCP から欠けると master は手順を引けない）
+        for g in crate::orchestrator::guide::GUIDES {
+            let got = dispatch(
+                &mut host,
+                Request::OrchestratorGuide {
+                    topic: Some(g.topic.into()),
+                    profile: Some("default".into()),
+                    caller_role: None,
+                },
+                PaneOrigin::Mcp,
+            )
+            .unwrap();
+            assert_eq!(
+                got,
+                crate::orchestrator::guide::json(Some(g.topic), "default").unwrap(),
+                "topic {} が CLI 経路と食い違っている",
+                g.topic
+            );
+            let text = got["text"].as_str().expect("全文");
+            assert!(!text.is_empty());
+            assert!(
+                !text.contains("{CTX_THRESHOLD}"),
+                "{}: プレースホルダが解決されていない",
+                g.topic
+            );
+        }
+
+        // プロファイルは呼び出し元の role からも解決できる（master 自身が引くとき）
+        let by_role = dispatch(
+            &mut host,
+            Request::OrchestratorGuide {
+                topic: Some("acceptance".into()),
+                profile: None,
+                caller_role: Some("master:takodev".into()),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(by_role["profile"], "takodev");
+
+        // 未知の topic は引ける一覧を添えて拒否する（黙って空を返さない）
+        let err = dispatch(
+            &mut host,
+            Request::OrchestratorGuide {
+                topic: Some("nope".into()),
+                profile: None,
+                caller_role: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("monitoring"), "{err:?}");
+    }
+
     #[test]
     fn issue1002_モデル一覧はdispatchから同じ形で読める() {
         let mut host = MockHost::new();

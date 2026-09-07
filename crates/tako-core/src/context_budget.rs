@@ -123,13 +123,6 @@ pub const GLOBAL_GUIDE_MAX_BYTES: usize = 24 * 1024;
 /// `proposals` に添えて分離先を案内する
 pub const SYSTEM_PROMPT_MAX_BYTES: usize = 24 * 1024;
 
-/// #1154 の A/B: 立てると system prompt の予算を外し（= 変更前の「観測だけ」へ戻す）、
-/// prompt 側は guide の本文を丸ごと差し戻す（`tako_control::orchestrator::guide`）。
-/// **同一バイナリで旧挙動を再現できる**ようにして、新テストの検出力を実測する
-pub fn legacy_1154() -> bool {
-    std::env::var_os("TAKO_1154_LEGACY").is_some_and(|v| !v.is_empty() && v != "0")
-}
-
 /// 種別ごとの上限を引く（**判定・規約文・番犬がすべてこの 1 本を通る**）
 pub fn limits(kind: ItemKind) -> Limits {
     match kind {
@@ -156,9 +149,10 @@ pub fn limits(kind: ItemKind) -> Limits {
             max_bytes: Some(GLOBAL_GUIDE_MAX_BYTES),
             ..Limits::default()
         },
-        // #1154: system prompt は tako 自身の生成物なので上限を持つ。
-        // 旧挙動（観測だけ）へ戻す A/B は `TAKO_1154_LEGACY`
-        ItemKind::SystemPrompt if legacy_1154() => Limits::default(),
+        // #1154: system prompt は tako 自身の生成物なので上限を持つ
+        // （**予算は A/B で外さない**。旧挙動へ戻す `TAKO_1154_LEGACY` は
+        // prompt の中身だけを移送前の姿へ差し戻すので、そのとき番犬が落ちるのが
+        // 「移送しなければ超過していた」ことの実測になる）
         ItemKind::SystemPrompt => Limits {
             max_bytes: Some(SYSTEM_PROMPT_MAX_BYTES),
             ..Limits::default()
@@ -1164,8 +1158,7 @@ mod tests {
         // 手順の欠落になるので、直し方は `proposals`（guide への移送）として返すだけ
         assert_eq!(
             limits(ItemKind::SystemPrompt).max_bytes,
-            Some(SYSTEM_PROMPT_MAX_BYTES),
-            "TAKO_1154_LEGACY が立っていると予算が外れる（A/B の期待どおり）"
+            Some(SYSTEM_PROMPT_MAX_BYTES)
         );
         let m = measure(
             ItemKind::SystemPrompt,

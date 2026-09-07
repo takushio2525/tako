@@ -1275,6 +1275,40 @@ mod tests {
         assert!(msg.contains("foo"), "エラーに未知キー名を含む: {msg}");
     }
 
+    /// #1154: 手順書は MCP の `tools/call` から引ける。プロファイルは
+    /// 呼び出し元の role から解決するので、master は自分の閾値が焼かれた本文を受け取る
+    #[test]
+    fn 手順書はtools_callから引ける() {
+        let mut seen = Vec::new();
+        let mut exec = |request: Request| -> Result<Value, String> {
+            seen.push(request);
+            Ok(json!({ "topic": "monitoring" }))
+        };
+        let mut session = McpSession {
+            caller_pane: Some(3),
+            caller_role: Some("master:takodev".into()),
+            connected: true,
+            exec: &mut exec,
+            ipc_tx: None,
+        };
+        let response = handle_message(
+            &call("tako_orchestrator_guide", json!({ "topic": "monitoring" })),
+            &mut session,
+        );
+        assert!(response.as_ref().unwrap().get("error").is_none(), "{response:?}");
+        assert!(
+            matches!(
+                &seen[0],
+                Request::OrchestratorGuide { topic, profile, caller_role }
+                    if topic.as_deref() == Some("monitoring")
+                        && profile.is_none()
+                        && caller_role.as_deref() == Some("master:takodev")
+            ),
+            "role が dispatch へ渡っていない: {:?}",
+            seen[0]
+        );
+    }
+
     #[test]
     fn 正規パラメータはエラーにならない_spawn() {
         let msg = call(

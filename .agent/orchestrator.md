@@ -703,3 +703,37 @@ CLAUDE.md セクションテンプレート `06-completion-verification` が対�
 ```
 
 にファイルを配置する。このファイルが存在すれば、デフォルトより優先して使われる。
+
+## 手順書（`tako orchestrator guide <topic>`。Issue #1154）
+
+system prompt は**長寿命セッションが起動した瞬間に払う固定費**なので、
+既定 blocks には「常に握っておく規則」と「手順を引く条件」だけを置き、
+**手順の全文は topic ごとに外へ出して必要なときだけ引く**。
+
+- 正本は `crates/tako-control/src/orchestrator/guides/*.md`（本文）と
+  `orchestrator/guide.rs` の `GUIDES`（topic 名・見出し・由来ブロック）。
+  本文は**移送前のブロックと byte 一致**（要約も言い換えもしない）
+- 引くのは CLI `tako orchestrator guide <topic>` / MCP `tako_orchestrator_guide`。
+  どちらも `guide::json` の 1 本を通る。`topic` 省略で一覧 + サイズ
+- プレースホルダ（`{CTX_THRESHOLD}` / `{TAB_NAMING_CONVENTION}` / `{{platform_notes}}`）は
+  prompt と同じ `Profile::render_prompt_placeholders` で解決してから返る。
+  プロファイルは 明示指定 → 呼び出し元の `TAKO_ORCHESTRATOR_ROLE` → `default` の順
+- `handoff` は `behavior` の項目 8 を切り出した**派生 topic**（`restores` が空）。
+  閾値超過は master が最も頻繁に踏む経路なので、10 KB の `behavior` 全文を
+  引かずに済むよう単独で取れるようにしてある
+
+### 触るときの不変条件
+
+- **ブロック名は消さない・改名しない**（`prompt_blocks.disable` / `override_blocks` が
+  ユーザーのプロファイルで名指ししている）。本文を移すときも名前と案内文は残す
+- **本文を削るなら fixture も同じ PR で更新する**。
+  `crates/tako-control/tests/prompt_guides.rs` が移送前テンプレート全文
+  （`tests/fixtures/system_prompt_before_1154.md`）と突き合わせて欠落ゼロを拘束する
+- **prompt を短くするときは折り返しでキーフレーズを割らない**。既存テストが
+  `five steps` / `one worker per deliverable` / `next clean break` を**行内**で探す
+- 手順が書かれていることを確かめる番犬は `guide::master_corpus()`
+  （prompt + 全 topic）を見る。prompt だけを見ると記述の存在を見落とし、
+  「prompt に無いから足す」で量が戻る
+- 予算は `tako_core::context_budget::SYSTEM_PROMPT_MAX_BYTES`（24 KB）。
+  超過は `tako context-budget` の `proposals` が **block 別のバイト数**で出す
+  （`prompt_blocks.append` は解決したファイル名で名指しする）
