@@ -90,3 +90,10 @@
 - 101c の固定 300 秒窓を `wait_for_claude_state`（`state_wait_budget` + 診断 2 行 + `prompt_flow=` + `101c-SCREEN`）へ。
   同型 14 か所（45c / 95c ×11 / 97c ×2 / 101c）を同じ予算へ。番犬 `実claudeの応答を固定窓で待っていない`（待ちがループ末尾にある形を #1153 / #1165 は見逃す）
 - **実測で待ちは無罪**（予算 465〜701s に対し実際 93〜242s で `ok=true`）。落ちているのは目印の観測側 = スクロールするビューポートを見ている → #1175 へ起票
+
+## 2026-09-08（#1173: 器つきペインの visual-test を完走させた）
+- `subline` は待てば器つきでも直接ペインと同一値（`mirrored=true mirror_pos=0.500 direct=13961 shifted=0`）=
+  製品は動いているので #943 型の skip は要らなかった。後続 3 件も器つきだけ落ちる同型（描画途中の resize /
+  固定 800ms 窓 / 注入 fixture の `pin_chat_fixture` 漏れ）
+- 到達点 器つき 72 行 → **158 行 + `TAKO_VISUAL_TEST_OK`**（直接も 149 行で OK・A/B 両アーム緑）
+- A/B は `TAKO_1173_LEGACY` を段ごとに指定（`subline` `rows` `chat-g3` `pin` が確定 FAILED）
