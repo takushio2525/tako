@@ -1178,7 +1178,14 @@ mod tests {
 
     #[test]
     fn audit_log_writes() {
-        let dir = std::env::temp_dir().join(format!("tako-test-supervisor-{}", std::process::id()));
+        // **`test_audit_dir()` と同じ置き場を使わない**: このテストは形式を見るために
+        // ファイルを直接 `write`（= 切り詰め）し、最後に `remove_dir_all` する。
+        // 共有すると、本経路（`audit_log` → `read_audit_log`）を通る
+        // `issue1123_監査ログはテストビルドでは本番のdata_dirへ書かない` が書いた行を
+        // 横から消してしまう（テスト同士は並列に走るので、消えるかどうかは
+        // その時のスケジュール次第 = 間欠的に落ちる）。専用の置き場にすれば干渉しない
+        // （`audit_log_writes_to_real_file` と同じ作法）
+        let dir = std::env::temp_dir().join(format!("tako-sv-audit-fmt-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("supervisor.log");
         // audit_log は audit_log_path() を使うが、テスト用に直接書く

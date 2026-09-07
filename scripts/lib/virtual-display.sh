@@ -13,9 +13,9 @@
 #
 # 使い方:
 #   . scripts/lib/virtual-display.sh   # 関数として読む
-#   scripts/lib/virtual-display.sh ensure               # 無ければ作る（冪等）
+#   scripts/lib/virtual-display.sh ensure               # 無ければ作り、眠っていれば起こす（冪等）
 #   scripts/lib/virtual-display.sh bounds               # "x y w h"（Quartz グローバル・ポイント）
-#   scripts/lib/virtual-display.sh status                # 状態を 1 行
+#   scripts/lib/virtual-display.sh status                # 状態を 1 行（眠っている面も出る）
 #   scripts/lib/virtual-display.sh status --snapshot     # 前後比較用の機械可読な現況
 #   scripts/lib/virtual-display.sh move-window PID       # その窓を仮想ディスプレイへ移す
 #   scripts/lib/virtual-display.sh cleanup-orphans        # 孤児の下見（何も変えない）
@@ -26,6 +26,17 @@
 #   でやる）。ユーザーのディスプレイ構成・解像度・配置・ミラーリングにも触らない。
 #   cleanup-orphans が落とすのは **器の管理外へ外れた残骸（孤児）** だけで、
 #   tako-vd の device 定義は消さない（器を再起動しても定義は残り、ensure で繋ぎ直す）。
+#
+# NSScreen に居る = 窓を置ける、ではない（#1160）:
+#   ディスプレイスリープ中は NSScreen に面が残ったまま **CoreGraphics の active 一覧から
+#   落ちる**（実測 2026-09-07: 2 枚とも CGDisplayIsActive=0 / CGDisplayIsAsleep=1）。
+#   GPUI の `cx.displays()` は CGGetActiveDisplayList そのものなので、その状態の tako は
+#   「面が 1 枚も見えない」= 置き先が無いと判断する（#1160 以降は窓を開かずに終わる）。
+#   なので ensure の完了条件は「NSScreen に居る」だけでなく **描画可能（起きている）**まで
+#   含め、眠っていれば起こす（vd_ensure_drawable）。起こす手立ては `caffeinate -u`
+#   （ユーザー活動の宣言）だけで、解像度・配置・ミラーリング・Main には触らない。
+#   なお status --snapshot には眠りの状態を**入れない**（前後比較は「構成が変わっていない」
+#   ことを見る道具で、眠りは構成ではない = 偽の差分を出さない）。status の 1 行には出る。
 #
 # いまの実装は BetterDisplay の仮想スクリーン。他の実装（DeskPad 等）へ広げるときは
 # vd_backend_* だけを差し替える（表に出る ensure / bounds / status は変えない）。
@@ -38,6 +49,8 @@ VD_BD_BIN="${VD_BD_APP}/Contents/MacOS/BetterDisplay"
 # 仮想ディスプレイの左上からこれだけ内側へ窓を置く（move-window 用・ポイント）
 VD_PAD_X=${TAKO_VD_PAD_X:-40}
 VD_PAD_Y=${TAKO_VD_PAD_Y:-60}
+# 眠っている面を起こすときユーザー活動を宣言する秒数（#1160）
+VD_WAKE_SECS=${TAKO_VD_WAKE_SECS:-2}
 
 vd_err() { echo "ERROR: $*" >&2; }
 
@@ -94,6 +107,30 @@ if (s.count > 0) {
               $.CGDisplayIsBuiltin(did) ? 1 : 0,
               did === mainID ? 1 : 0].join("\t"));
   }
+}
+out.join("\n")' 2>/dev/null
+}
+
+# いま OS が「描画可能」と見ているかを 1 行 1 面のタブ区切りで:
+#   displayID<TAB>active(0|1)<TAB>asleep(0|1)
+#
+# **GPUI と同じ物差し**（#1160）: gpui の `cx.displays()` は `CGGetActiveDisplayList` で、
+# active = 接続済み・起きている・描画できる。NSScreen（vd_screens）は眠っている面も
+# 出し続けるので、この 2 つを別々に読まないと「面は在るのに tako から見えない」を
+# 説明できない。CGDisplayIsAsleep も併記する（なぜ active でないのかが 1 行で分かる）。
+#
+# 蓋の状態と同じく、テストから差し替えられるよう関数にしてある
+vd_drawable() {
+    osascript -l JavaScript -e '
+ObjC.import("AppKit");
+ObjC.import("CoreGraphics");
+var s = $.NSScreen.screens, out = [];
+for (var i = 0; i < s.count; i++) {
+  var sc = s.objectAtIndex(i);
+  var did = ObjC.unwrap(sc.deviceDescription.objectForKey("NSScreenNumber"));
+  out.push([did,
+            $.CGDisplayIsActive(did) ? 1 : 0,
+            $.CGDisplayIsAsleep(did) ? 1 : 0].join("\t"));
 }
 out.join("\n")' 2>/dev/null
 }
@@ -213,6 +250,41 @@ vd_main_protection_plan() {
     echo "restore ${builtin_id} ${builtin_name}"
 }
 
+# その displayID が描画可能か（純関数。$1 = displayID、stdin = vd_drawable の出力）。
+#   0 = 置ける（active=1 / **判定材料が無い**）
+#   1 = 置けない（active=0 と読めた / 一覧に居ない）
+#
+# **証明できるときだけ「置けない」と言う**（#1160）: 材料が 1 行も無い環境
+# （osascript が使えない・CI）で「眠っている」と断じると、面が使えるのに
+# ensure が止まる。読めなかったのは「眠っている」の証拠にならない
+vd_id_drawable() {
+    local want=$1 rows did active asleep
+    rows=$(cat)
+    [ -n "$rows" ] || return 0
+    while IFS=$'\t' read -r did active asleep; do
+        [ -n "${did:-}" ] || continue
+        if [ "$did" = "$want" ]; then
+            [ "${active:-0}" = 1 ] && return 0
+            return 1
+        fi
+    done <<< "$rows"
+    return 1
+}
+
+# 眠っている（描画可能でない）面の名前を「, 」区切りで（純関数。
+# $1 = vd_drawable の出力、stdin = vd_screens の出力）。status に出す用
+vd_sleeping_names() {
+    local drawable=$1
+    local name x y w h did builtin is_main out=""
+    while IFS=$'\t' read -r name x y w h did builtin is_main; do
+        [ -n "${name:-}" ] || continue
+        if ! printf '%s' "$drawable" | vd_id_drawable "${did:-}"; then
+            out="${out:+$out, }${name}"
+        fi
+    done
+    printf '%s' "$out"
+}
+
 # 蓋の状態（純関数。$1 は vd_clamshell_raw の出力）。open / closed / unknown。
 # デスクトップ機は蓋が無いのでキー自体が出ない = unknown
 vd_clamshell_state() {
@@ -265,6 +337,26 @@ vd_row() {
     row=$(vd_screens | vd_rows_named "$VD_NAME" | head -1)
     [ -n "$row" ] || return 1
     printf '%s\n' "$row" | awk -F'\t' '{print $2, $3, $4, $5}'
+}
+
+# 常設の仮想ディスプレイが**窓を置ける**状態か（#1160）。
+# NSScreen に居る かつ CoreGraphics から描画可能（= GPUI に見える）なら 0
+vd_row_drawable() {
+    local row did
+    row=$(vd_screens | vd_rows_named "$VD_NAME" | head -1)
+    [ -n "$row" ] || return 1
+    did=$(printf '%s\n' "$row" | awk -F'\t' '{print $6}')
+    vd_drawable | vd_id_drawable "$did"
+}
+
+# 眠っている面を起こす（#1160）。**手立てはユーザー活動の宣言だけ**:
+# `caffeinate -u` は「人が操作している」と OS へ伝えるので消えている画面が点く。
+# 解像度・配置・ミラーリング・Main・器の状態には一切触らない。
+# 背景で走らせて宣言を保ったまま返り、起きたかどうかは vd_drawable で読み戻す
+# （器の応答文を当てにしない作法と同じ）
+vd_wake_displays() {
+    caffeinate -u -t "$VD_WAKE_SECS" >/dev/null 2>&1 &
+    return 0
 }
 
 # BetterDisplay の仮想スクリーン一覧（tagID<TAB>displayID<TAB>name）
@@ -353,10 +445,33 @@ vd_protect_main() {
     return 0
 }
 
-# 用意できた直後に必ず通す締め（#1150）。増殖の検査 → Main 保護の順。
+# 常設の仮想ディスプレイが起きている（描画可能）ことまで確かめる（#1160）。
+# 眠っていれば起こして、起きるまで待ってから返る。
+#
+# **これを完了条件に入れないと ensure が嘘をつく**: 面は在るのに tako から見えないので、
+# #1160 以降の検証用 GUI は「置き先が無い」と言って窓を開かずに終わる（それ以前は
+# ユーザーのメイン画面へ窓が出た = #1160 の症状そのもの）。
+vd_ensure_drawable() {
+    local i
+    vd_row_drawable && return 0
+    echo "   ${VD_NAME} が眠っています（NSScreen には居るが描画可能でない）。起こします"
+    vd_wake_displays
+    for i in $(seq 1 20); do
+        vd_row_drawable && return 0
+        sleep 0.5
+    done
+    vd_err "${VD_NAME} を起こせなかった（描画可能にならない）"
+    echo "       この状態の検証用 GUI は窓を開かずに終わる（#1160。ユーザーの画面へ出さないため）" >&2
+    echo "       画面を 1 度触って起こしてから、もう一度 ensure を実行する" >&2
+    return 1
+}
+
+# 用意できた直後に必ず通す締め（#1150 / #1160）。
+# 増殖の検査 → 起きているかの確認（眠っていれば起こす）→ Main 保護の順。
 # **ensure が成功で返る道はすべてここを通る**（番犬が拘束している）
 vd_finish_ensure() {
     vd_assert_single || return 1
+    vd_ensure_drawable || return 1
     vd_protect_main
     return 0
 }
@@ -417,9 +532,16 @@ vd_bounds() {
 }
 
 vd_status() {
-    local r plan clamshell main_note rc=0
+    local r plan clamshell main_note sleeping rc=0
     if r=$(vd_row); then
-        echo "${VD_NAME}: 使用可（${r}）"
+        if vd_row_drawable; then
+            echo "${VD_NAME}: 使用可（${r}）"
+        else
+            # #1160: 「在る」と「置ける」は別。ここを黙ると、面が見えているのに
+            # 検証用 GUI が窓を開かない理由が分からなくなる
+            echo "${VD_NAME}: 眠っている（${r}。NSScreen には居るが描画可能でない = tako から見えない。ensure で起こす）"
+            rc=1
+        fi
     else
         echo "${VD_NAME}: 未接続（ensure で用意する）"
         rc=1
@@ -430,12 +552,17 @@ vd_status() {
         *) main_note="不要（${plan#noop }）" ;;
     esac
     clamshell=$(vd_clamshell_state "$(vd_clamshell_raw)")
-    echo "  Main 保護: ${main_note} / 蓋: ${clamshell} / 器の実体: $(vd_backend_instances)"
+    sleeping=$(vd_screens | vd_sleeping_names "$(vd_drawable)")
+    echo "  Main 保護: ${main_note} / 蓋: ${clamshell} / 器の実体: $(vd_backend_instances) / 眠っている面: ${sleeping:-なし}"
     return $rc
 }
 
 # 前後比較用の機械可読な現況（#1150 の受け入れ条件「作業の前後で Main と内蔵の
-# 有無が変わらない」を diff で示せる形）。行の並びは名前順で安定させる
+# 有無が変わらない」を diff で示せる形）。行の並びは名前順で安定させる。
+#
+# **眠りの状態はここに入れない**（#1160）: これは「構成を変えていない」ことを diff で
+# 示す道具で、眠っているかどうかは構成ではない。入れると作業中に画面が眠っただけで
+# 偽の差分が出る。眠りは `status` の 1 行（「眠っている面:」）で読む
 vd_status_snapshot() {
     echo "clamshell=$(vd_clamshell_state "$(vd_clamshell_raw)")"
     echo "backend_instances=$(vd_backend_instances)"
@@ -538,9 +665,9 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
             ;;
         *)
             echo "使い方: ${0} {ensure|bounds|status [--snapshot]|move-window <pid>|cleanup-orphans [--apply]}" >&2
-            echo "  ensure           仮想ディスプレイ ${VD_NAME} を用意する（冪等・消す機能は無い）" >&2
+            echo "  ensure           仮想ディスプレイ ${VD_NAME} を用意し、眠っていれば起こす（冪等・消す機能は無い）" >&2
             echo "  bounds           \"x y w h\"（Quartz グローバル・ポイント）" >&2
-            echo "  status           状態を 1 行（--snapshot は前後比較用の機械可読な現況）" >&2
+            echo "  status           状態を 1 行（眠っている面も出る。--snapshot は前後比較用の機械可読な現況）" >&2
             echo "  move-window      その pid の窓を仮想ディスプレイへ移す" >&2
             echo "  cleanup-orphans  孤児の下見（--apply は実行条件を満たすときだけ掃除）" >&2
             exit 1

@@ -22876,8 +22876,19 @@ static TARGET_DISPLAY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::n
 
 /// 置き先のディスプレイを決めて記録する（窓を 1 枚も開く前に 1 回だけ呼ぶ）。
 ///
-/// 見つからなくても**起動は止めない**: 既定の面へ落として理由を persist.log に 1 行残す
-/// （指定が外れるのは検証の都合であって、tako が起動できない理由ではない）。
+/// 見つからないときの構えは `tako_core::platform::display::miss_for` が決める（#1160）。
+/// 分かれ目は**面が 1 枚も見えていないか**:
+///
+/// - **空 + 検証用 GUI** → 窓を開かずに終わる（既定の面 = ユーザーの画面なので落とさない）
+/// - **面は見えているが当たらない** → 既定の面へ落ちる。その機に置き先が無いということで、
+///   ここで開かないと `build-app.sh --verify` や Windows 実機のセルフテストが起動できない。
+///   代わりに `fallback_notice` で起動時に見える警告を出す
+/// - **通常起動** → 常に既定の面（指定が外れるのは tako が起動できない理由ではない）
+///
+/// **待つのは空のあいだだけ**。macOS の `cx.displays()` は `CGGetActiveDisplayList` なので
+/// ディスプレイスリープ中は面が在っても 0 件になる（#1160 の実測: `NSScreen` に 2 枚
+/// 残ったまま `CGDisplayIsActive` が両方 0）。面が見えているのに当たらないなら、
+/// 待っても答えは変わらない（読めている一覧に無い）。
 fn resolve_target_display(cx: &App) -> Option<gpui::DisplayId> {
     use tako_core::platform::display as disp;
 
@@ -22897,40 +22908,71 @@ fn resolve_target_display(cx: &App) -> Option<gpui::DisplayId> {
         return None;
     };
 
-    // 名前は指定が要るときにしか引かない（通常起動はこの費用を払わない）
-    let names = disp::display_names();
+    let retry = disp::retry_policy(verification);
     let primary = cx.primary_display().map(|d| u64::from(d.id()));
-    let candidates: Vec<disp::DisplayCandidate> = cx
-        .displays()
-        .iter()
-        .enumerate()
-        .map(|(index, d)| {
-            let id = u64::from(d.id());
-            disp::DisplayCandidate {
-                index,
-                id,
-                uuid: d.uuid().ok().map(|u| u.to_string()),
-                name: names
-                    .iter()
-                    .find(|(nid, _)| *nid == id)
-                    .map(|(_, n)| n.clone()),
-                primary: primary == Some(id),
-                // **解決した時点の矩形**を持ち回る（あとから `cx.displays()` を引き直すと
-                // ディスプレイスリープや配置変更で空・別値になり得る。#1141 で実測）
-                rect: {
-                    let b = d.bounds();
-                    Some(disp::DisplayRect {
-                        x: f32::from(b.origin.x),
-                        y: f32::from(b.origin.y),
-                        width: f32::from(b.size.width),
-                        height: f32::from(b.size.height),
-                    })
-                },
-            }
-        })
-        .collect();
-
-    let selection = disp::select(&spec, &candidates);
+    // 名前引き（macOS は `system_profiler` ≈ 0.17 秒）は**顔ぶれが変わったときだけ**やり直す。
+    // やり直しごとに引くと最大 20 回ぶんの費用を払うことになる（起動が体感で止まる）。
+    // 指定が要るときにしか引かないのは従来どおり（FR-4.8.3）
+    let mut names: Vec<(u64, String)> = Vec::new();
+    let mut names_for: Option<Vec<u64>> = None;
+    // #1160 の診断 env: 最初の n 回だけ列挙を空に見せる（本物の面を眠らせずに再現する）
+    let mut inject_empty = disp::inject_empty_count();
+    let mut retries = 0u32;
+    let (selection, candidates) = loop {
+        let displays: Vec<std::rc::Rc<dyn gpui::PlatformDisplay>> = if inject_empty > 0 {
+            inject_empty -= 1;
+            Vec::new()
+        } else {
+            cx.displays()
+        };
+        let ids: Vec<u64> = displays.iter().map(|d| u64::from(d.id())).collect();
+        if names_for.as_deref() != Some(ids.as_slice()) {
+            names = disp::display_names();
+            names_for = Some(ids);
+        }
+        let candidates: Vec<disp::DisplayCandidate> = displays
+            .iter()
+            .enumerate()
+            .map(|(index, d)| {
+                let id = u64::from(d.id());
+                disp::DisplayCandidate {
+                    index,
+                    id,
+                    uuid: d.uuid().ok().map(|u| u.to_string()),
+                    name: names
+                        .iter()
+                        .find(|(nid, _)| *nid == id)
+                        .map(|(_, n)| n.clone()),
+                    primary: primary == Some(id),
+                    // **解決した時点の矩形**を持ち回る（あとから `cx.displays()` を引き直すと
+                    // ディスプレイスリープや配置変更で空・別値になり得る。#1141 で実測）
+                    rect: {
+                        let b = d.bounds();
+                        Some(disp::DisplayRect {
+                            x: f32::from(b.origin.x),
+                            y: f32::from(b.origin.y),
+                            width: f32::from(b.size.width),
+                            height: f32::from(b.size.height),
+                        })
+                    },
+                }
+            })
+            .collect();
+        let selection = disp::select(&spec, &candidates);
+        // **待つのは「面が 1 枚も見えない」あいだだけ**（#1160）。それは「置き先が無い」
+        // ではなく**まだ分からない**状態（ディスプレイスリープ）なので待つ価値がある。
+        // 面が見えているのに当たらないなら待っても答えは変わらないので即決める
+        // （`tako-vd` を配線していない環境で毎回 2 秒待たせない）
+        let blind = candidates.is_empty() && !matches!(selection, disp::Selection::Selected { .. });
+        if !blind || retries >= retry.retries {
+            break (selection, candidates);
+        }
+        retries += 1;
+        // 列挙は CoreGraphics へ直接聞くので、GPUI の run loop を回さなくても
+        // 待っているあいだに状態が変わる（#1141 で「引き直すと値が変わる」を実測済み）。
+        // ここへ来るのは指定が外れているときだけなので、通常起動は 1 度も眠らない
+        std::thread::sleep(retry.interval);
+    };
     let (target, placement) = match selection {
         disp::Selection::Selected {
             display,
@@ -22949,12 +22991,23 @@ fn resolve_target_display(cx: &App) -> Option<gpui::DisplayId> {
                         .iter()
                         .map(disp::DisplayCandidate::label)
                         .collect(),
+                    retries,
+                    refused: false,
+                    // 当たったので「外したときどうしたか」は無い
+                    miss_policy: None,
+                    verification,
                 },
             )
         }
         disp::Selection::NotFound { spec, available } => {
-            // 名前を引けない環境（Windows）で名前を指定された、を切り分けられるようにする
-            let reason = if !disp::name_lookup_supported() && !available.is_empty() {
+            // 面が 1 枚も見えないのか、見えているのに当たらないのかで落とし所が変わる
+            let miss = disp::miss_for(verification, available.is_empty());
+            // 「そもそも 1 枚も見えていない」と「見えているが当たらない」を切り分ける。
+            // 前者は #1160 の症状（ディスプレイスリープ）で、直し方が違う
+            let reason = if available.is_empty() {
+                "OS のディスプレイ一覧が空（ディスプレイスリープ中は面が在っても列挙から落ちる）"
+            } else if !disp::name_lookup_supported() {
+                // 名前を引けない環境（Windows）で名前を指定された、を切り分けられるようにする
                 "該当なし（このプラットフォームでは名前を引けないので UUID か index で指定する）"
             } else {
                 "該当なし"
@@ -22967,6 +23020,11 @@ fn resolve_target_display(cx: &App) -> Option<gpui::DisplayId> {
                     matched_by: None,
                     reason: Some(reason.to_string()),
                     available,
+                    retries,
+                    // 列挙が空 + 検証用 GUI のときだけユーザーの画面へ落ちない（#1160）
+                    refused: miss == disp::Miss::Refuse,
+                    miss_policy: Some(miss),
+                    verification,
                 },
             )
         }
@@ -22976,6 +23034,25 @@ fn resolve_target_display(cx: &App) -> Option<gpui::DisplayId> {
     persist_diag(&placement.log_line());
     if std::env::var_os("TAKO_SELF_TEST").is_some() {
         println!("TAKO_SELF_TEST_DISPLAY: {}", placement.log_line());
+    }
+    // #1160: persist.log を読むまで気づけないのが症状だったので、**起動時に見える形**で出す。
+    // 記録してから終わる（この起動で窓が 1 枚も開いていないことが診断から読める）
+    if let Some(notice) = placement.refusal_notice() {
+        eprintln!("error: {notice}");
+        // セルフテストを無音終了にしない（ハーネスが見ているのは FAILED 行）
+        if std::env::var_os("TAKO_SELF_TEST").is_some() {
+            println!(
+                "TAKO_APP_SELF_TEST_FAILED: 145: 検証用 GUI の置き先が列挙に\
+                 出ないので窓を開かずに終了した (#1160)"
+            );
+        }
+        disp::record_placement(placement);
+        std::process::exit(disp::REFUSED_EXIT_CODE);
+    }
+    // 落とさざるを得なかった道（面は見えているが置き先が無い）も**黙らない**（#1160）。
+    // 起動は続くが、検証用の窓がユーザーのメイン画面に出ていることを申告する
+    if let Some(notice) = placement.fallback_notice() {
+        eprintln!("warning: {notice}");
     }
     disp::record_placement(placement);
     let _ = TARGET_DISPLAY.set(target);
@@ -62031,6 +62108,96 @@ mod self_test {
                     placement.matched_by.map(disp::MatchKind::as_str),
                     placement.reason,
                     placement.available.len(),
+                );
+
+                // --- 145b: 列挙が空でもユーザーの画面へ落ちない（#1160）---
+                //
+                // 症状は「面は在るのに `cx.displays()` が空 → 即 NotFound → 既定の面
+                // （= ユーザーのメイン画面）へ窓が出る」。ディスプレイスリープ中は
+                // `CGGetActiveDisplayList` が 0 件を返すので、起動の瞬間だけ空になる。
+                //
+                // **ここで検査するのは構え**（やり直す予算があるか / 列挙が空のとき
+                // 既定へ落ちない構えか）。実際に落ちる道を踏むとこのセルフテスト自身が
+                // 窓を開けずに終わるので、道そのものは `TAKO_1160_INJECT_EMPTY` を
+                // 使った別の起動で測る。`TAKO_1160_LEGACY=1` ではここが両方落ちる
+                let retry = disp::retry_policy(true);
+                check(
+                    disp::miss_for(true, true) == disp::Miss::Refuse,
+                    &format!(
+                        "145b: 列挙が空なら検証用 GUI は既定の面へ落ちない (#1160。\
+                         miss={})",
+                        disp::miss_for(true, true).as_str(),
+                    ),
+                );
+                // 面が見えているのに当たらないときは落ちる（置き先を配線していない
+                // 環境で検証が回らなくならないように = この機以外で効く不変条件）
+                check(
+                    disp::miss_for(true, false) == disp::Miss::FallBack,
+                    &format!(
+                        "145b: 面が見えているのに当たらないときは既定の面へ開く (#1160。\
+                         miss={})",
+                        disp::miss_for(true, false).as_str(),
+                    ),
+                );
+                check(
+                    retry.retries > 0,
+                    &format!(
+                        "145b: 置き先が無いとき列挙をやり直す予算がある (#1160。\
+                         retries={} budget={:?})",
+                        retry.retries,
+                        retry.budget(),
+                    ),
+                );
+                // この項目が動いている = 窓が開いている = 拒否していない
+                check(
+                    !placement.refused,
+                    "145b: 窓が開いている起動は拒否として記録されていない (#1160)",
+                );
+                // 注入した空列挙は「やり直しで拾えた」ことが記録に残る
+                let injected = disp::inject_empty_count();
+                if injected > 0 {
+                    check(
+                        placement.retries >= injected,
+                        &format!(
+                            "145b: 空に見せた回数だけ列挙をやり直している (#1160。\
+                             injected={injected} retries={})",
+                            placement.retries,
+                        ),
+                    );
+                }
+                // 新しい状態も診断から読める（設計原則 5: UI と AI が 1:1）
+                let (r_retries, r_refused, r_policy, r_verification) = health
+                    .as_ref()
+                    .map(|v| {
+                        let p = &v["display_placement"];
+                        (
+                            p["retries"].as_u64(),
+                            p["refused"].as_bool(),
+                            p["miss_policy"].as_str().map(String::from),
+                            p["verification"].as_bool(),
+                        )
+                    })
+                    .unwrap_or((None, None, None, None));
+                // 当たった起動なので `miss_policy` は null（外していないので構えも無い）
+                check(
+                    r_retries == Some(u64::from(placement.retries))
+                        && r_refused == Some(false)
+                        && r_policy.is_none()
+                        && r_verification == Some(true),
+                    &format!(
+                        "145b: check_health がやり直し回数・拒否・検証用かを申告する (#1160。\
+                         retries={r_retries:?} refused={r_refused:?} \
+                         miss_policy={r_policy:?} verification={r_verification:?})",
+                    ),
+                );
+                println!(
+                    "TAKO_SELF_TEST_1160: retries={} refused={} verification={} \
+                     miss_policy={:?} budget={:?} injected={injected}",
+                    placement.retries,
+                    placement.refused,
+                    placement.verification,
+                    placement.miss_policy.map(disp::Miss::as_str),
+                    retry.budget(),
                 );
             }
 
