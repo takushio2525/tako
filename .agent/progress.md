@@ -19,24 +19,6 @@
 
 ---
 
-## 2026-09-03（#1077 + #1078: リモート PWA から Claude 公式へ送り出す + スマホから master 起動）
-- #1077: カードに「Claude で開く」（connected だけ・**PWA は URL を組み立てない**）/ 未接続は
-  理由 + PC 側の有効化コマンド（**環境阻害には opt-in コマンドを出さない**・master と solo で
-  `--solo` を出し分け）/ アカウント表示。文言は Rust が正（daemon が表示言語で解決）。
-  自前チャットはフォールバック維持
-- #1078: `GET /api/master/profiles`（Observe）+ `POST /api/tabs` / `POST /api/tabs/:id/master`
-  （**Manage**）。組み立ては新設 `orchestrator::master_launch` が正で CLI の `tako master` と
-  同じ順・同じ検証（**ペインに触る前**に落ちる）。起動できるのは PC 側に在るプロファイルだけ
-- 同梱: **daemon が表示言語を初期化しておらず #1077 の理由文が英語で凍っていた**（#983 と同型）/
-  **app が拒否した要求で IPC 接続を捨てていた**（A/B 実測 = 次の正当な操作が 503 になる）→
-  `AppCallError` で言い分け拒否は 400。ワイヤ処理は `roundtrip_detailed` の 1 実装へ
-- 検証: 実経路テスト `scripts/test-remote-master-launch.sh` **34 PASS / 0 FAIL**（偽 tailscale +
-  隔離 state/data/orchestrator で**実 daemon + 実 tako-app**。claude はスタブ）+ PWA e2e 15 件 +
-  品質ゲート全緑 + クロスチェック警告が main と一致 + 隔離セルフテスト `TAKO_APP_SELF_TEST_OK`。
-  検出力は role を Observe へ落として**observe 端末が実際にタブを作れる**ことまで実測
-- 関連: PR #1088（`Refs #1077, #1078, #1059`）。**実機スマホは未検証**
-- 次: 実機での「タップ → Claude アプリ」確認。柱1 の残りは #1059 のエピック参照
-
 ## 2026-09-03（#1093: 組織クレジット上限の見出しを検知できず自動復帰が発火しない問題を根治）
 - 症状は「解除後 1 時間以上 worker 3 体が止まったまま `supervisor.log` に記録ゼロ」。原因は
   **停止判定の文言が `hit your usage limit` 決め打ち**で、実際の見出し
@@ -121,3 +103,10 @@
   走査本体を `scan_source<R: Read + Seek>` へ出し、テストは**実際に読んだバイト数**を数える読み口を渡す形へ
 - 実測 全走査 4,194,592 B / 追記ぶんだけ 355 B（上限 64 KiB）。番犬 `追記ぶんだけ読む検査を実時間で測っていない` +
   conventions の新節。A/B は注入 5ms で旧 19/20 FAILED・新 0/20、「全文を読むが consumed は正しい」注入で新が FAILED
+
+## 2026-09-08（#995: セルフテスト項目 108 の高負荷フレークを窓ガードで根治した）
+- 外から来る全体 notify で `output=(panes +2 chrome +2)` = 意図的な全体 notify と同値になっていた。#858 の
+  ガードを 108 へ寄せ、判定（`redraw_window_clean`）と窓の作り方（`measure_output_redraw`）を 110 と 1 実装に統合
+- **証人は測る量の外側から選ぶ**: 110 = クローム / 108 = 本体の増分が 2 以上（ヘッダは #803 の A/B で毎フレーム動く）
+- A/B は `TAKO_995_LEGACY=1 INJECT=app` が Issue と同じ数字で FAILED・新経路は 2 回目で通過・`INJECT=chrome` は
+  新経路でも FAILED。110 の既存注入 2 種は #858 の表を再現。全 3576 件緑
