@@ -115,3 +115,9 @@
   `type_until_focused_text`（`state_wait_budget` + 送り直し 2 回 + `TAKO_SELF_TEST_1165` の診断）へ
 - 番犬 `固定窓のあいだに画面の文字列を待っていない` を追加（pre-fix の実ファイルを 9 行名指し・旧番犬は見逃し）
 - GUI（tako-vd）無負荷 2 + 高負荷 1 完走（判定時 load 21.9〜34.6）/ `INJECT=late` で旧のみ FAILED / `noecho` は新も FAILED
+
+## 2026-09-08（#1167: 「追記ぶんだけ読む」の検査を実時間から読み出しバイト数へ替えた）
+- `claude_remote_link` の効果テストが `Instant::elapsed` の全走査比較だったため高負荷で確率的に落ちていた。
+  走査本体を `scan_source<R: Read + Seek>` へ出し、テストは**実際に読んだバイト数**を数える読み口を渡す形へ
+- 実測 全走査 4,194,592 B / 追記ぶんだけ 355 B（上限 64 KiB）。番犬 `追記ぶんだけ読む検査を実時間で測っていない` +
+  conventions の新節。A/B は注入 5ms で旧 19/20 FAILED・新 0/20、「全文を読むが consumed は正しい」注入で新が FAILED

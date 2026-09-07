@@ -20,6 +20,13 @@
 //! ## 検出力
 //!
 //! どちらも「1 行足すと落ちる」ことを実測して入れている（PR 本文に A/B を記録）。
+//!
+//! ## 相乗りしている番犬
+//!
+//! 同じ 1 ファイル（`claude_remote_link.rs`）を守る規則なのでここに置いてある。
+//!
+//! - [`remote_link_の形は1実装だけが組む`] — 3 経路で表示が食い違わない（#1069）
+//! - [`追記ぶんだけ読む検査を実時間で測っていない`] — 効果は量で測る（#1167）
 
 use std::path::{Path, PathBuf};
 
@@ -155,5 +162,40 @@ fn remote_link_の形は1実装だけが組む() {
         "remote_link の形を RemoteLink::to_json 以外で組んでいる箇所がある\n\
          （3 経路で表示が食い違う。#1069 の FR-2.35.4）:\n{}",
         builders.join("\n")
+    );
+}
+
+/// 番犬: リンク解決のテストは**実時間で効果を測らない**（#1167）。
+///
+/// 「追記ぶんだけ読む」の効果を `Instant::elapsed` の全走査との比較で固定していた形は、
+/// 片方の計測窓にだけスケジューリングの待ちが入った回に落ちた（実測: 高負荷で 4 回に 1 回）。
+/// 守りたい性質は「読むバイト数が増えない」なので、**量**（読み出しバイト数 / `consumed`）で
+/// 測れば混み具合に依らず、同じ性質をより強く固定できる。
+///
+/// この 1 ファイルに閉じた規則にしてあるのは、待ちを検証するテスト
+/// （`mcp::tests` の「遅い応答が実際に遅い」など）まで巻き込まないため。
+/// ここは**時間を待つものが 1 つも無い**純粋な走査なので、`Instant` が要る場面が無い
+#[test]
+fn 追記ぶんだけ読む検査を実時間で測っていない() {
+    let src = std::fs::read_to_string(link_rs()).expect("claude_remote_link.rs を読む");
+    // テストモジュールだけを見る（production 側は #[cfg(test)] より手前）
+    let tests = match src.find("\n#[cfg(test)]") {
+        Some(i) => &src[i..],
+        None => return,
+    };
+    let offset = src.len() - tests.len();
+    let body = without_comments(tests);
+    assert!(
+        !body.contains("Instant"),
+        "claude_remote_link.rs のテストが `Instant` を使っている（{} 行目以降）。\n\
+         効果は実時間ではなく**読んだ量**で測る（読み出しバイト数を数える読み口を\n\
+         `scan_source` へ渡す。#1167 の `追記ぶんだけ読むと定常コストが増えない`）:\n{}",
+        src[..offset].lines().count(),
+        body.lines()
+            .enumerate()
+            .filter(|(_, l)| l.contains("Instant"))
+            .map(|(n, l)| format!("  +{}: {}", n + 1, l.trim()))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }

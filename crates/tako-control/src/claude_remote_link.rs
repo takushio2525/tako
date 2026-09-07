@@ -554,13 +554,27 @@ fn remember(
 /// claude が書いている途中の行（改行がまだ来ていない）は数えないので、
 /// 次回そこから読み直される = **境界で手がかりを取りこぼさない**
 fn scan_from(path: &std::path::Path, from: u64) -> Result<(Option<RemoteLink>, u64), String> {
-    use std::io::{BufRead, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path).map_err(|e| format!("transcript を開けない: {e}"))?;
+    let file = std::fs::File::open(path).map_err(|e| format!("transcript を開けない: {e}"))?;
+    scan_source(file, from)
+}
+
+/// 走査の本体（`scan_from` の中身をそのまま出したもの。**挙動は同じ**）。
+///
+/// **読み口を差し替えられる形**にしてあるのは、「追記ぶんだけ読む =
+/// 読み出しバイト数が増えない」をテストが**量**で測れるようにするため。
+/// 実時間（`Instant::elapsed`）で全走査と比べる形は、片方の計測窓にだけ
+/// スケジューリングの待ちが入った回に落ちる（#1167 の実測: 高負荷で 4 回に 1 回）
+fn scan_source<R: std::io::Read + std::io::Seek>(
+    mut source: R,
+    from: u64,
+) -> Result<(Option<RemoteLink>, u64), String> {
+    use std::io::{BufRead, SeekFrom};
     if from > 0 {
-        file.seek(SeekFrom::Start(from))
+        source
+            .seek(SeekFrom::Start(from))
             .map_err(|e| format!("transcript を seek できない: {e}"))?;
     }
-    let mut reader = std::io::BufReader::new(file);
+    let mut reader = std::io::BufReader::new(source);
     let mut consumed = from;
     let mut last: Option<RemoteLink> = None;
     let mut buf = String::new();
@@ -1065,9 +1079,16 @@ mod tests {
     /// **追記ぶんだけ読む形の効果**（`/api/v2/panes` は PWA がポーリングし、
     /// 生きている会話は mtime が動き続けるので「毎回読む」経路になる）。
     ///
-    /// 4 MB の会話へ 1 行追記された状況を作り、全走査と追記ぶんだけの走査を比べる
+    /// 4 MB の会話へ 1 行追記された状況を作り、**実際に読んだバイト数**で比べる。
+    /// 守りたい性質は「追記ぶんだけ読む = 読むバイト数が増えない」なので、
+    /// 量で測るほうが**混み具合に依らず・同じ性質をより強く**固定できる。
+    /// 実時間（`Instant::elapsed`）で全走査と比べていた頃は、片方の計測窓にだけ
+    /// スケジューリングの待ちが入った回に落ちていた（#1167 の実測: 高負荷で 4 回に 1 回）
     #[test]
     fn 追記ぶんだけ読むと定常コストが増えない() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
         let dir = std::env::temp_dir().join("tako-1069-incremental-bench");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("t.jsonl");
@@ -1082,30 +1103,75 @@ mod tests {
         body.push('\n');
         std::fs::write(&path, &body).unwrap();
 
-        // 全走査（初回に 1 回だけ通る）
-        let t0 = std::time::Instant::now();
-        let (link, consumed) = scan_from(&path, 0).unwrap();
-        let full = t0.elapsed();
+        /// 下のファイルから**実際に読んだバイト数**を数える読み口。
+        /// `scan_source` の seek もここを通るので「seek してから読む」全体を測れる
+        struct Counting<R> {
+            inner: R,
+            read: Arc<AtomicU64>,
+        }
+        impl<R: std::io::Read> std::io::Read for Counting<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.inner.read(buf)?;
+                self.read.fetch_add(n as u64, Ordering::Relaxed);
+                Ok(n)
+            }
+        }
+        impl<R: std::io::Seek> std::io::Seek for Counting<R> {
+            fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.inner.seek(pos)
+            }
+        }
+        let scan_counting = |from: u64| {
+            let file = std::fs::File::open(&path).expect("transcript を開く");
+            let read = Arc::new(AtomicU64::new(0));
+            let out = scan_source(
+                Counting {
+                    inner: file,
+                    read: Arc::clone(&read),
+                },
+                from,
+            )
+            .unwrap();
+            (out, read.load(Ordering::Relaxed))
+        };
+
+        // 全走査（初回に 1 回だけ通る）= 本文ぜんぶを読む
+        let ((link, consumed), full_read) = scan_counting(0);
         assert_eq!(
             link.as_ref().and_then(|l| l.session_id.as_deref()),
             Some(FAKE_COMPAT_ID)
         );
         assert_eq!(consumed, body.len() as u64);
+        assert!(
+            full_read >= body.len() as u64,
+            "全走査が本文 {} B に対して {full_read} B しか読んでいない（比べる基準が成り立っていない）",
+            body.len()
+        );
 
         // 1 行追記（= 会話が 1 ターン進んだ状況）→ 追記ぶんだけ読む
         let appended = format!("{body}{one}\n");
         std::fs::write(&path, &appended).unwrap();
-        let t1 = std::time::Instant::now();
-        let (found, consumed2) = scan_from(&path, consumed).unwrap();
-        let incremental = t1.elapsed();
+        let ((found, consumed2), append_read) = scan_counting(consumed);
         assert_eq!(found, None, "追記ぶんに手がかりは無い");
         assert_eq!(consumed2, appended.len() as u64);
 
-        eprintln!("4MB の会話: 全走査 {full:?} / 追記ぶんだけ {incremental:?}");
+        // 追記ぶんは 1 行（約 330 B）。`BufReader` は充填単位（既定 8 KiB）で読むので、
+        // 読み口の実装差を吸収しても 64 KiB を超えない。ここが本文の 4 MB 側へ跳ねたら
+        // 「毎回全文を読む」実装への回帰
+        const APPEND_READ_BUDGET: u64 = 64 * 1024;
+        eprintln!("4MB の会話: 全走査 {full_read} B / 追記ぶんだけ {append_read} B");
         assert!(
-            incremental * 5 < full,
-            "追記ぶんだけ読んでいるはずが速くなっていない（全走査 {full:?} / 追記 {incremental:?}）"
+            append_read <= APPEND_READ_BUDGET,
+            "追記ぶんだけ読んでいるはずが {append_read} B 読んでいる\
+             （追記されたのは {} B / 全走査は {full_read} B）",
+            appended.len() as u64 - consumed
         );
+
+        // 製品経路（`scan_from`）も同じ答えを返す（読み口の差し替えが本体から外れていない）
+        let (found2, consumed3) = scan_from(&path, consumed).unwrap();
+        assert_eq!(found2, None);
+        assert_eq!(consumed3, appended.len() as u64);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
