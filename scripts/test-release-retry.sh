@@ -7,6 +7,12 @@
 #   Test 1〜4: gh release create のリトライ・冪等性・エラー経路（#256）
 #   Test 5〜8: macOS / Windows 両 OS の待ち合わせと片肺リリースの検出（#965）
 #
+# モック環境は **git リポジトリ（main チェックアウト済み）** として作る。
+# 夜間リリース（#1136）は release.sh を使い捨ての worktree の中で呼ぶので、
+# 「release.sh は呼び出し元の HEAD を動かさない」が前提条件になった。
+# 各テストの最後で HEAD が main のままであることを見る（この不変条件が壊れると、
+# 共有ツリーが detached のまま残る #1136 の再発につながる）
+#
 # Test 5〜8 が落ちるということは「片方の OS しか無いリリースを検出できない」という意味で、
 # それは v0.7.8 まで実際に続いていた状態（Windows の利用者に更新が見えない）に戻ることを指す。
 set -euo pipefail
@@ -64,6 +70,16 @@ assert_not_dir() {
   fi
 }
 
+# release.sh は呼び出し元のブランチを動かさない（#1136 の前提条件）。
+# untracked は release.sh が作るビルド生成物なので tracked だけを見る
+assert_head_unchanged() {
+  local dir="$1"
+  assert_eq "HEAD が main のまま（#1136）" \
+    "main" "$(git -C "$dir" symbolic-ref --short --quiet HEAD 2>/dev/null || echo '(detached)')"
+  assert_eq "tracked に変更を残さない（#1136）" \
+    "" "$(git -C "$dir" status --porcelain --untracked-files=no)"
+}
+
 # release.sh のための最小モック環境を一時ディレクトリに構築
 make_test_env() {
   local dir
@@ -82,6 +98,17 @@ make_test_env() {
 touch "${!#}"
 EOF
   chmod +x "$dir/mock-bin/ditto"
+
+  # git リポジトリにして main をチェックアウトしておく（#1136 の不変条件を見るため）。
+  # dist/ や mock-bin/ は untracked のまま（release.sh が作り消しするので追跡しない）
+  git init --quiet "$dir"
+  git -C "$dir" symbolic-ref HEAD refs/heads/main
+  git -C "$dir" config user.name "tako release test"
+  git -C "$dir" config user.email "release@example.invalid"
+  git -C "$dir" config commit.gpgsign false
+  git -C "$dir" add Cargo.toml CHANGELOG.md scripts
+  git -C "$dir" commit --quiet -m "init mock release env"
+
   echo "$dir"
 }
 
@@ -114,6 +141,7 @@ GHEOF
   assert_contains "リトライメッセージ" "$out" "リトライ"
   assert_contains "リリース完了" "$out" "リリース完了"
   assert_not_dir "ビルド出力の後始末（#837）" "$dir/dist/tako.app"
+  assert_head_unchanged "$dir"
   rm -rf "$dir"
 }
 
@@ -139,6 +167,7 @@ GHEOF
   assert_eq "exit 1（全失敗）" "1" "$rc"
   assert_contains "手動リカバリ手順" "$out" "手動リカバリ"
   assert_contains "stderr がログに記録" "$out" "server error 500"
+  assert_head_unchanged "$dir"
   rm -rf "$dir"
 }
 
@@ -165,6 +194,7 @@ GHEOF
   assert_eq "exit 0（冪等成功）" "0" "$rc"
   assert_not_exists "create 未呼出" "$dir/create-called"
   assert_contains "既存 Release 検出" "$out" "既に存在"
+  assert_head_unchanged "$dir"
   rm -rf "$dir"
 }
 
@@ -194,6 +224,7 @@ GHEOF
 
   assert_eq "exit 0（部分成功からの回収）" "0" "$rc"
   assert_contains "前回の試行で作成" "$out" "前回の試行で作成"
+  assert_head_unchanged "$dir"
   rm -rf "$dir"
 }
 
@@ -264,6 +295,7 @@ EOF
   assert_contains "完全性の検査を通過" "$out" "両 OS の配布物が揃っている"
   assert_contains "macOS アセットを列挙" "$out" "[OK] macOS: tako-v99.0.0-macos-arm64.zip"
   assert_contains "Windows アセットを列挙" "$out" "[OK] Windows: tako-v99.0.0-windows-x86_64.exe"
+  assert_head_unchanged "$dir"
   rm -rf "$dir"
 }
 
@@ -305,6 +337,7 @@ GHEOF
   else
     echo "  FAIL: gh release edit --notes を呼んでいない"; FAIL=$((FAIL + 1))
   fi
+  assert_head_unchanged "$dir"
   rm -rf "$dir"
 }
 
@@ -328,6 +361,7 @@ test_one_sided_release_detected() {
   assert_contains "片肺と名指し" "$out" "片肺リリース"
   assert_contains "回収手順を提示" "$out" "release-windows.ps1"
   assert_contains "ノート再生成の案内" "$out" "--update-notes"
+  assert_head_unchanged "$dir"
   rm -rf "$dir"
 }
 
@@ -353,6 +387,7 @@ test_no_wait_windows_opt_out() {
   else
     echo "  PASS: ワークフローを起動していない"; PASS=$((PASS + 1))
   fi
+  assert_head_unchanged "$dir"
   rm -rf "$dir"
 }
 
@@ -380,6 +415,7 @@ EOF
   out=$(PATH="$dir/mock-bin:$PATH" "$dir/scripts/release.sh" --check-assets v99.0.0 2>&1) || rc=$?
   assert_eq "揃っていれば exit 0" "0" "$rc"
   assert_contains "揃っていると報告" "$out" "両 OS の配布物が揃っている"
+  assert_head_unchanged "$dir"
   rm -rf "$dir"
 }
 

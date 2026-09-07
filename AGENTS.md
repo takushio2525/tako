@@ -270,14 +270,19 @@ push 運用: リポジトリ公開（Phase 7）までは main 直 push 可。公
   `tako.iss` の `MinVersion` と `build-app.sh` の `LSMinimumSystemVersion` との一致を
   テストが検証する（ノートの要件と配布物の実際の下限がズレない）
 
-### 夜間リリース（自動。#166 / #1005）
+### 夜間リリース（自動。#166 / #1005 / #1136）
 
 - `scripts/nightly-release.sh` が launchd（`com.takushio.tako-nightly-release`、毎日 5:00）から
   実行され、前回タグ以降に main へ変更があった夜だけ自動リリースする
   （version bump → CHANGELOG 自動節 → コミット → annotated tag → release.sh でバイナリ付き
   GitHub Release）。クラウドルーチンでの夜間リリースはバイナリを作れず廃止した（経緯は #166）
-- 自動スキップ条件: 変更なし / worktree dirty / 手動リリース進行中（Cargo.toml version ≠ 最新タグ）/
+- 自動スキップ条件: 変更なし / 共有ツリー dirty / 手動リリース進行中（Cargo.toml version ≠ 最新タグ）/
   プレリリース版 / 多重起動。ログは `~/.claude-orchestrator/logs/tako-nightly-release.log`
+- **共有ツリー（install_root）の HEAD は動かさない（#1136）**: リリース作業は毎回
+  `git worktree add --detach` した使い捨てのツリーで行い、成功・失敗・シグナルのどれでも
+  `trap` で撤去する。ビルド中に origin/main が進んだら**何も作らず中止**する（旧版はここで
+  push が拒否されて無言で死に、未 push のリリースコミットごと detached を残していた =
+  同じ版が別 SHA で 2 本できる原因）。多重起動ロックは HOME 単位 + **リポジトリ単位**の 2 段
 - ジョブ登録は `scripts/nightly-release.sh --install-launchd`（解除は `--uninstall-launchd`、
   確認は `launchctl list | grep tako-nightly`）。plist はリポに置かず実行時に生成する
 - Homebrew cask 更新・リリースノートの日英併記は従来どおり手動で行う

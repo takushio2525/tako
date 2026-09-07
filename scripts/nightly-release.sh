@@ -22,10 +22,13 @@
 #   4. Cargo.toml の version == 最新タグのときのみ bump する
 #      （≠ は手動リリース進行中とみなしてスキップ。夜間ジョブは人間の作業に割り込まない）
 #      版数は「次回バージョン予約があればその値、無ければ patch bump」（#1005）
-#   5. origin/main へ detach → version bump + CHANGELOG 自動節 + Cargo.lock 同期をコミット
-#   6. release.sh（ビルド + zip）→ 成功後にはじめて push（main → annotated tag）
-#      → release.sh --skip-build --test（GitHub Release + Pages デプロイ）
-#   7. ビルド失敗時はローカルコミットを破棄してロールバック（リモートは無傷）
+#   5. **使い捨ての worktree** を origin/main から生やす（共有ツリーの HEAD は触らない。#1136）
+#      → version bump + CHANGELOG 自動節 + Cargo.lock 同期をその中でコミット
+#   6. release.sh（ビルド + zip）→ 成功後、origin/main の先端が動いていないことを確かめて
+#      はじめて push（main → annotated tag）→ release.sh --skip-build --test
+#      （GitHub Release + Pages デプロイ）
+#   7. 失敗経路（ビルド失敗 / 先端が進んだ / push 拒否 / シグナル）はすべて worktree ごと
+#      破棄して終わる。共有ツリーには残骸もリリースコミットも残らない（リモートは無傷）
 #
 # 両 OS 同時リリース（#965）:
 #   タグ push が GitHub Actions（.github/workflows/release-windows.yml）を起こし、
@@ -34,6 +37,16 @@
 #   **両 OS が揃うまで（既定で最大 75 分）待って**から完了する。
 #   片肺で終わった場合は release.sh が exit 3 を返し、ここで警告として通知する
 #   （Release 自体は macOS 版で成立しているので、ロールバックはしない）。
+#
+# 共有ツリーを汚さない（#1136）:
+#   リリース作業は毎回 `git worktree add --detach` した使い捨てのツリーで行い、
+#   trap で必ず撤去する。install_root（launchd の WorkingDirectory = 共有ツリー）の
+#   HEAD はブランチのまま動かない。旧版は install_root 自体を detach しており、
+#   ①正常終了でも HEAD が detached のまま残る（master / worker の `git pull --ff-only` が
+#   「You are not currently on a branch」で失敗し、detached の土台でビルドすると
+#   古いバイナリができる）②ビルド中に origin/main が進んで push が拒否された夜は、
+#   未 push のリリースコミットごと放置され、同じ版が別 SHA でもう 1 本作られる、
+#   という 2 つの実害があった（2026-09-04 の v0.8.5 が実例）。
 #
 # 次回バージョンの予約（#1005）:
 #   節目のリリース（minor / major の繰り上げ）を夜間発火に乗せるための仕組み。
@@ -269,22 +282,116 @@ for tool in git gh cargo; do
   fi
 done
 
-# ---- 多重起動ロック --------------------------------------------------------
-# mkdir はアトミック。stale ロック（前回実行の異常死）は記録 PID の生存で判定する
+# ---- 後始末（成功・失敗・シグナルのいずれでも必ず通る）---------------------
+# リリース用 worktree の撤去とロックの解放をここ 1 箇所に集約する。#1136 の
+# 「終わったのに共有ツリーが detached」「未 push のコミットが残る」は、
+# 途中で死んだときに戻す経路が無かったことが原因なので、戻す責任を trap へ寄せる
 
-mkdir -p "$(dirname "$LOCK_DIR")"
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-  old_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
-  if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
-    log "SKIP: 多重起動（実行中 PID: ${old_pid}）"
-    exit 0
+HELD_LOCKS=()
+WORKTREE=""
+WORKTREE_PARENT=""
+HEAD_REF_AT_START=""
+
+cleanup_worktree() {
+  # cwd が worktree の中だと remove が転ぶことがあるので先に出る
+  cd "$REPO_ROOT" 2>/dev/null || true
+  if [[ -n "$WORKTREE" ]]; then
+    git -C "$REPO_ROOT" worktree remove --force "$WORKTREE" >/dev/null 2>&1 || true
+    git -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
   fi
-  log "WARN: stale ロックを回収（旧 PID: ${old_pid:-不明}）"
-  rm -rf "$LOCK_DIR"
-  mkdir "$LOCK_DIR"
-fi
-echo $$ > "$LOCK_DIR/pid"
-trap 'rm -rf "$LOCK_DIR"' EXIT
+  [[ -n "$WORKTREE_PARENT" ]] && rm -rf "$WORKTREE_PARENT"
+  return 0
+}
+
+release_locks() {
+  local d
+  for d in "${HELD_LOCKS[@]:-}"; do
+    [[ -n "$d" ]] && rm -rf "$d"
+  done
+  return 0
+}
+
+# 共有ツリーの HEAD がブランチのまま終わる、が #1136 の不変条件。
+# 「入ったときは branch だったのに出るときは detached」だけを違反として報告する
+# （最初から detached だったものは人間の作業かもしれないので黙って通す）
+check_shared_tree_invariant() {
+  [[ -n "$HEAD_REF_AT_START" ]] || return 0
+  if ! git -C "$REPO_ROOT" symbolic-ref --quiet HEAD >/dev/null 2>&1; then
+    log "ERROR: 共有ツリーを detached HEAD のまま終了しようとしている（#1136 の不変条件違反）: ${REPO_ROOT}"
+    log "  復旧: git -C ${REPO_ROOT} checkout ${HEAD_REF_AT_START}"
+  fi
+  return 0
+}
+
+cleanup_all() {
+  cleanup_worktree
+  check_shared_tree_invariant
+  release_locks
+}
+trap 'cleanup_all' EXIT
+trap 'log "ABORT: シグナルを受けたのでリリースを中止する（残骸は片付ける）"; exit 130' INT TERM
+
+# ---- 多重起動ロック --------------------------------------------------------
+# mkdir はアトミック。stale ロック（前回実行の異常死）は記録 PID の生存で判定する。
+# **2 つの粒度で取る（#1136）**: HOME 単位（従来）に加えてリポジトリ単位。
+# 2026-09-04 の v0.8.5 は、この HOME のログにもロックにも痕跡を残さないもう 1 つの
+# 実行と 2 秒差で並走して同じ版のリリースコミットを 2 本作った（tree は完全同一・
+# 負けた側は push 拒否で detached のまま放置）。リポジトリ側のロックは $HOME に
+# 依らず「同じ作業リポで 2 つ走らせない」を担保する
+
+acquire_lock() {
+  local dir="$1" label="$2" old_pid="" i
+  mkdir -p "$(dirname "$dir")"
+  if ! mkdir "$dir" 2>/dev/null; then
+    # 勝った側が pid を書き終える前に覗くと空に見える（mkdir と pid 書き込みの間の窓）。
+    # 空 = stale と即断すると両方が走ってしまうので、少し待って読み直す
+    for i in 1 2 3 4 5; do
+      old_pid=$(cat "$dir/pid" 2>/dev/null || echo "")
+      [[ -n "$old_pid" ]] && break
+      sleep 0.2
+    done
+    if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+      log "SKIP: 多重起動（${label}のロックを保持中の PID: ${old_pid}）"
+      return 1
+    fi
+    log "WARN: stale ロックを回収（${label} / 旧 PID: ${old_pid:-不明}）"
+    rm -rf "$dir"
+    mkdir "$dir"
+  fi
+  echo $$ > "$dir/pid"
+  HELD_LOCKS[${#HELD_LOCKS[@]}]="$dir"
+  return 0
+}
+
+GIT_COMMON_DIR=$(git -C "$REPO_ROOT" rev-parse --git-common-dir)
+[[ "$GIT_COMMON_DIR" = /* ]] || GIT_COMMON_DIR="$REPO_ROOT/$GIT_COMMON_DIR"
+REPO_LOCK_DIR="$GIT_COMMON_DIR/tako-nightly-release.lock"
+
+acquire_lock "$REPO_LOCK_DIR" "リポジトリ単位" || exit 0
+acquire_lock "$LOCK_DIR" "HOME 単位" || exit 0
+
+# ---- 共有ツリーに残った detached HEAD を戻す（#1136 の後始末）---------------
+# 旧版が残していった detached（先端が夜間リリースのコミット・かつ clean）だけを
+# main へ戻す。人間が意図して detach している場合まで動かさないよう条件を絞る
+
+restore_detached_head() {
+  git -C "$REPO_ROOT" symbolic-ref --quiet HEAD >/dev/null 2>&1 && return 0
+  local subject
+  subject=$(git -C "$REPO_ROOT" log -1 --format=%s 2>/dev/null || echo "")
+  case "$subject" in
+    '[リリース] v'*) ;;
+    *) return 0 ;;
+  esac
+  [[ -z "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=no)" ]] || return 0
+  git -C "$REPO_ROOT" rev-parse --verify --quiet main >/dev/null 2>&1 || return 0
+  log "WARN: 共有ツリーが detached HEAD（$(git -C "$REPO_ROOT" rev-parse --short HEAD) / ${subject}）。main へ戻す（#1136 の残骸）"
+  # 別 worktree が main を掴んでいると checkout は失敗する。そこで死なせない
+  git -C "$REPO_ROOT" checkout --quiet main \
+    || log "WARN: main へ戻せなかった（別 worktree が main を掴んでいる可能性）: ${REPO_ROOT}"
+  return 0
+}
+restore_detached_head
+HEAD_REF_AT_START=$(git -C "$REPO_ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null || echo "")
 
 # ---- 次回バージョン予約の読み取り（この時点では消費しない）------------------
 # 「リリースに至ったときだけ消費する」ため、以降のスキップ経路では保持したまま抜ける
@@ -298,11 +405,11 @@ fi
 
 # ---- 変更検知 --------------------------------------------------------------
 
-# untracked はビルド残骸の可能性が高いので無視し、tracked の変更のみを作業中とみなす
-# （リリースコミットは明示 add の 3 ファイルのみのため untracked が混入する余地はない）
+# untracked はビルド残骸の可能性が高いので無視し、tracked の変更のみを作業中とみなす。
+# 見るのは共有ツリー（install_root）で、リリース作業そのものは別の使い捨て worktree で行う
 if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
-  log "SKIP: worktree が dirty（人間の作業中と判断）: ${REPO_ROOT}${RESERVE_KEPT}"
-  notify "スキップ: worktree が dirty"
+  log "SKIP: 共有ツリーが dirty（人間の作業中と判断）: ${REPO_ROOT}${RESERVE_KEPT}"
+  notify "スキップ: 共有ツリーが dirty"
   exit 0
 fi
 
@@ -371,15 +478,28 @@ if [[ $DRY_RUN -eq 1 ]]; then
   exit 0
 fi
 
+# ---- リリース用の使い捨て worktree（#1136）---------------------------------
+# 共有ツリー（install_root）の HEAD は**絶対に動かさない**。checkout / bump /
+# commit / build / push はすべてこの worktree の中だけで起き、終了時に trap の
+# cleanup_worktree が必ず撤去する。失敗経路のロールバックは「worktree ごと捨てる」
+# の 1 手に集約されるので、共有ツリーへ `git reset --hard` を撃つ経路が消える
+
+BASE_TIP=$(git rev-parse origin/main)
+WORKTREE_PARENT=$(mktemp -d "${TMPDIR:-/tmp}/tako-nightly-XXXXXX")
+WORKTREE="$WORKTREE_PARENT/release"
+git worktree add --detach --quiet "$WORKTREE" "$BASE_TIP"
+
+# ビルドキャッシュ（target/）は共有ツリーと共用する。worktree ごとに作り直すと
+# 毎晩フルビルドになるため。cargo 自身のロックで直列化されるので同時実行でも壊れない
+# （`/target` は .gitignore 済みなので worktree は clean のまま）
+if [[ -d "$REPO_ROOT/target" ]]; then
+  ln -s "$REPO_ROOT/target" "$WORKTREE/target"
+fi
+
+cd "$WORKTREE"
+log "リリース worktree: ${WORKTREE}（base: ${BASE_TIP} / 共有ツリーの HEAD は触らない）"
+
 # ---- バージョン bump + CHANGELOG 自動節 -------------------------------------
-
-git checkout --detach origin/main --quiet
-
-rollback() {
-  log "ROLLBACK: ローカル変更を破棄して origin/main へ戻す"
-  git checkout --detach origin/main --quiet || true
-  git reset --hard origin/main --quiet || true
-}
 
 # Cargo.toml: [workspace.package] の version 行（最初の完全一致行のみ）を書き換え
 awk -v old="version = \"$CUR_VERSION\"" -v new="version = \"$NEW_VERSION\"" \
@@ -405,8 +525,7 @@ rm -f "$SECTION_FILE"
 
 # Cargo.lock の workspace メンバー版数を同期
 if ! cargo update --workspace --quiet; then
-  log "ERROR: cargo update --workspace が失敗"
-  rollback
+  log "ERROR: cargo update --workspace が失敗。リリースを中止する（worktree ごと破棄する）"
   notify "失敗: Cargo.lock 同期（詳細はログ）"
   exit 1
 fi
@@ -419,26 +538,63 @@ ${LATEST_TAG} 以降の変更 ${COMMITS} 件を自動リリース。scripts/nigh
 
 $(git log --format='- %s' "$LATEST_TAG..origin/main")"
 
-# ---- ビルド（失敗したらリモートに触れる前にロールバック） --------------------
+# ---- ビルド（失敗したらリモートに触れる前に worktree ごと破棄する）----------
 
 log "ビルド開始（release.sh: build + zip）"
-if ! "$REPO_ROOT/scripts/release.sh" >> "$LOG_FILE" 2>&1; then
-  log "ERROR: ビルド失敗。リリースを中止しロールバックする"
-  rollback
+if ! "$WORKTREE/scripts/release.sh" >> "$LOG_FILE" 2>&1; then
+  log "ERROR: ビルド失敗。リリースを中止する（${NEW_TAG} は作られていない・worktree ごと破棄する）${RESERVE_KEPT}"
   notify "失敗: ビルド（$NEW_TAG は作られていない）"
   exit 1
 fi
 
 # ---- push + タグ + GitHub Release -------------------------------------------
+# ビルドは 3〜5 分かかる。その間に origin/main が進むと fast-forward できず push が
+# 拒否される。旧版はここで set -e により**無言のまま死んでいた**（ロールバックも
+# ログも通知もなし）ので、版数だけ使ったリリースコミットが共有ツリーに detached で
+# 残り、同じ版が別 SHA でもう 1 本作られていた（#1136）。押し出す前に先端を照合し、
+# 動いていたら**何も作らずに中止**する（ビルド済みバイナリは base の中身なので、
+# 進んだ先端へタグを付けると配布物とソースが食い違う）
 
 log "ビルド成功 → push + タグ + GitHub Release"
-git push origin HEAD:main --quiet
+PUSH_ERR="$WORKTREE_PARENT/push.err"
+
+git fetch origin --tags --quiet || true
+CUR_TIP=$(git rev-parse origin/main)
+if [[ "$CUR_TIP" != "$BASE_TIP" ]]; then
+  log "ERROR: ビルド中に origin/main が進んだ（${BASE_TIP} → ${CUR_TIP}）。${NEW_TAG} は作らずに中止する${RESERVE_KEPT}"
+  log "  次の夜間実行が新しい先端から作り直す（共有ツリーにもリモートにも残骸は残らない）"
+  notify "中止: ビルド中に main が進んだ（${NEW_TAG} は作られていない）"
+  exit 1
+fi
+
+# 先端が動いていなくても、同じ版のタグが別経路で出ている可能性は残る（並走）。
+# ここで気付かずに `git tag -a` へ進むと set -e で無言のまま死ぬので明示的に見る
+if git rev-parse --verify --quiet "refs/tags/${NEW_TAG}" >/dev/null 2>&1; then
+  log "ERROR: タグ ${NEW_TAG} が既に存在する（別の実行が先に出した）。何も作らずに中止する${RESERVE_KEPT}"
+  notify "中止: ${NEW_TAG} は既に存在する"
+  exit 1
+fi
+
+if ! git push origin HEAD:main --quiet 2>"$PUSH_ERR"; then
+  log "ERROR: main への push が拒否された。${NEW_TAG} は作らずに中止する${RESERVE_KEPT}"
+  sed 's/^/  /' "$PUSH_ERR" | tee -a "$LOG_FILE"
+  notify "中止: push 拒否（${NEW_TAG} は作られていない）"
+  exit 1
+fi
 
 git tag -a "$NEW_TAG" -m "tako ${NEW_TAG} — 夜間${BUMP_JA}リリース（自動）
 
 $LATEST_TAG 以降の変更:
 $(git log --format='- %s' "$LATEST_TAG..HEAD~1")"
-git push origin "$NEW_TAG" --quiet
+# タグの push に失敗したらローカルタグを消す。残すと次の夜が
+# 「Cargo.toml version ≠ 最新タグ = 手動リリース進行中」で永久にスキップし続ける
+if ! git push origin "$NEW_TAG" --quiet 2>"$PUSH_ERR"; then
+  log "ERROR: タグ ${NEW_TAG} の push に失敗。ローカルタグを消して中止する（main は push 済み）"
+  sed 's/^/  /' "$PUSH_ERR" | tee -a "$LOG_FILE"
+  git tag -d "$NEW_TAG" >/dev/null 2>&1 || true
+  notify "失敗: タグ push（${NEW_TAG}）"
+  exit 1
+fi
 
 # 予約は「次の 1 回」ぶん。**版数が確定した（タグを push した）時点で消費**する。
 # ここへ到達しなかった場合（スキップ / ビルド失敗 / dry-run）は予約を保持する（#1005）
@@ -451,7 +607,7 @@ fi
 # release.sh は Windows 配布物（tag push で起動する GitHub Actions）を待ってから
 # ノートを作り直す。終了コードは 0 = 両 OS 揃った / 3 = 片肺 / それ以外 = 作成失敗（#965）
 RELEASE_RC=0
-"$REPO_ROOT/scripts/release.sh" --skip-build --test >> "$LOG_FILE" 2>&1 || RELEASE_RC=$?
+"$WORKTREE/scripts/release.sh" --skip-build --test >> "$LOG_FILE" 2>&1 || RELEASE_RC=$?
 
 RELEASE_URL="https://github.com/takushio2525/tako/releases/tag/${NEW_TAG}"
 case "$RELEASE_RC" in
