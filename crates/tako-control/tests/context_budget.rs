@@ -84,6 +84,62 @@ fn エージェント規約が起動時ロードの予算に収まっている()
     );
 }
 
+/// #1154: tako が配る **既定 blocks だけ**で組んだ system prompt が予算に収まっていること。
+///
+/// これは tako 自身の生成物なので、超えたらユーザーに我慢させるのではなく tako を直す。
+/// ユーザー側の追記（`prompt_blocks.append`）は環境によって量が違うのでここでは見ない
+/// （実環境の合計は `tako context-budget` が測り、超過は `proposals` で block 別に出る）
+#[test]
+fn 既定のsystem_promptが起動時ロードの予算に収まっている() {
+    use tako_control::orchestrator::{Profile, PromptMode};
+    // 素のプロファイル（追記なし）= tako が配る既定の姿
+    let profile = Profile::default();
+    for (label, template, mode) in [
+        (
+            "master",
+            tako_control::orchestrator::DEFAULT_SYSTEM_PROMPT,
+            PromptMode::Master,
+        ),
+        (
+            "solo",
+            tako_control::orchestrator::SOLO_SYSTEM_PROMPT,
+            PromptMode::Solo,
+        ),
+    ] {
+        let pieces = profile.build_prompt_pieces(template, "default", mode);
+        let text = tako_control::orchestrator::join_prompt_pieces(&pieces);
+        let m = budget::measure(ItemKind::SystemPrompt, &text);
+        let over: Vec<String> = budget::violations(ItemKind::SystemPrompt, &m)
+            .into_iter()
+            .filter(|v| enforced(v.metric))
+            .map(|v| {
+                let mut top: Vec<&tako_control::orchestrator::PromptPiece> =
+                    pieces.iter().collect();
+                top.sort_by_key(|p| std::cmp::Reverse(p.bytes()));
+                let breakdown: Vec<String> = top
+                    .iter()
+                    .take(5)
+                    .map(|p| format!("{}={} B", p.name, p.bytes()))
+                    .collect();
+                format!(
+                    "  {label}: {} が {} で上限 {} を超えている（大きい順: {}）",
+                    v.metric.as_str(),
+                    v.actual,
+                    v.limit,
+                    breakdown.join(", ")
+                )
+            })
+            .collect();
+        assert!(
+            over.is_empty(),
+            "既定の system prompt が起動時ロードの予算を超えている\n{}\n\
+             直し方: 手順の詳細を crates/tako-control/src/orchestrator/guides/ の topic へ移し、\
+             prompt には「いつ引くか」だけを残す（欠落ゼロは tests/prompt_guides.rs が拘束する）",
+            over.join("\n")
+        );
+    }
+}
+
 #[test]
 fn アーカイブは毎ターン読み込まれる側に置かれていない() {
     // アーカイブを `@import` してしまうと、移送した意味がまるごと消える
@@ -151,6 +207,7 @@ fn 予算表の数値が規約文に出ている() {
         &budget::PROGRESS_MAX_ENTRIES.to_string(),
         &budget::ARCHIVE_RETAIN_DAYS.to_string(),
         &(budget::AGENTS_GUIDE_MAX_BYTES / 1024).to_string(),
+        &(budget::SYSTEM_PROMPT_MAX_BYTES / 1024).to_string(),
     ] {
         assert!(rule.contains(needle.as_str()), "規約文に {needle} が無い");
     }

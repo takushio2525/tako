@@ -2313,7 +2313,9 @@ mod tests {
     /// 対処を推測する（= #748 で「usage_limit なら待つ」と食い違い続けた形）
     #[test]
     fn master_promptは全ての異常種別の対処を書いている() {
-        let prompt = crate::orchestrator::DEFAULT_SYSTEM_PROMPT;
+        // #1154: 種別ごとの対処表は手順書（topic `monitoring`）側にある。prompt だけを
+        // 見ると記述の存在を見落とすので、master が到達できる本文の全体を見る
+        let prompt = crate::orchestrator::guide::master_corpus();
         for kind in WorkerErrorKind::ALL {
             assert!(
                 prompt.contains(kind.as_str()),

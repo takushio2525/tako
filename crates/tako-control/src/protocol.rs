@@ -1329,6 +1329,19 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         known_limitations: bool,
     },
+    /// master の手順書を引く（Issue #1154）。system prompt から外に出した手順の全文を
+    /// **引く条件が満たされたときだけ**取得する。`topic` 省略で一覧
+    OrchestratorGuide {
+        /// 引く topic（省略時は一覧）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        topic: Option<String>,
+        /// プレースホルダを解決するプロファイル（省略時は呼び出し元の role → default）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<String>,
+        /// 呼び出し元の `TAKO_ORCHESTRATOR_ROLE`（プロファイル解決に使う）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_role: Option<String>,
+    },
     /// 起動時ロードの予算（Issue #1139）。AI が起動した瞬間に強制ロードされるもの
     /// （グローバル指示・`AGENTS.md` と `@import` チェーン・system prompt・引き継ぎ）を
     /// 棚卸しし、種別ごとの上限と突き合わせる。

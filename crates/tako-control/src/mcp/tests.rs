@@ -527,7 +527,8 @@ mod tests {
         // #1002 の tako_setup_models（モデル一覧の実取得）を追加して 142
         // #1057 の tako_setup_deps（任意依存の検出とその場導入）を追加して 143
         // #1067 の tako_session_restart（会話を引き継いだ再起動）を追加して 144
-        assert_eq!(tools.len(), 145);
+        // #1154 の tako_orchestrator_guide（master の手順書）を追加して 146
+        assert_eq!(tools.len(), 146);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
@@ -1272,6 +1273,40 @@ mod tests {
         assert_eq!(err["code"], -32602);
         let msg = err["message"].as_str().unwrap();
         assert!(msg.contains("foo"), "エラーに未知キー名を含む: {msg}");
+    }
+
+    /// #1154: 手順書は MCP の `tools/call` から引ける。プロファイルは
+    /// 呼び出し元の role から解決するので、master は自分の閾値が焼かれた本文を受け取る
+    #[test]
+    fn 手順書はtools_callから引ける() {
+        let mut seen = Vec::new();
+        let mut exec = |request: Request| -> Result<Value, String> {
+            seen.push(request);
+            Ok(json!({ "topic": "monitoring" }))
+        };
+        let mut session = McpSession {
+            caller_pane: Some(3),
+            caller_role: Some("master:takodev".into()),
+            connected: true,
+            exec: &mut exec,
+            ipc_tx: None,
+        };
+        let response = handle_message(
+            &call("tako_orchestrator_guide", json!({ "topic": "monitoring" })),
+            &mut session,
+        );
+        assert!(response.as_ref().unwrap().get("error").is_none(), "{response:?}");
+        assert!(
+            matches!(
+                &seen[0],
+                Request::OrchestratorGuide { topic, profile, caller_role }
+                    if topic.as_deref() == Some("monitoring")
+                        && profile.is_none()
+                        && caller_role.as_deref() == Some("master:takodev")
+            ),
+            "role が dispatch へ渡っていない: {:?}",
+            seen[0]
+        );
     }
 
     #[test]

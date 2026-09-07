@@ -108,3 +108,9 @@
   多重起動ロックを HOME 単位 + **リポジトリ単位**の 2 段にした（$HOME が違う並走を止められていなかった）
 - 検証: test-nightly-reserve 129 PASS（新規 7 本・CI へも載せた）/ test-release-retry 55 PASS /
   A/B で修正前は 20 FAIL。失敗経路 4 種の HEAD before/after を隔離環境で実測
+
+## 2026-09-07（#1154: master / solo の system prompt を起動時ロード予算の対象にして手順書へ分離）
+- 手順の詳細を `orchestrator/guides/*.md` の 11 topic へ**原文そのまま**移し、`tako orchestrator guide <topic>` /
+  MCP `tako_orchestrator_guide` で引く形に。予算 24 KB を `context_budget` へ追加し、超過は block 別バイト数で提案
+- takodev の生成物 59,501 B / 40,687 tok → **32,626 B / 20,366 tok**（既定 blocks 単体 21,072 B）。全 topic の
+  guide 出力が移送前ブロックと byte 一致 / A/B `TAKO_1154_LEGACY=1` で新テスト 3 本が FAILED / 全 3542 件緑

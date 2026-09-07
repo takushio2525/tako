@@ -57,6 +57,39 @@ Nightly patch release (automated). Changes since v0.8.6:
 
 ### Changed
 
+- **The master / solo system prompt is now under the startup load budget, and its
+  procedures moved into on-demand guides** (#1154, follows #1139). After #1139 the
+  largest remaining fixed cost at startup was the system prompt itself (the takodev
+  profile generated 59,501 B ≈ 40.7k tokens), and a master is a long-lived session, so
+  every master paid it before doing any work. The procedure detail — the per-event
+  recovery table for monitoring, acceptance inspection, the worker prompt template, how
+  to write a handoff — now lives in eleven guides fetched only when their trigger fires
+  (`tako orchestrator guide <topic>`, MCP `tako_orchestrator_guide`); the prompt keeps
+  the rules a master must always hold plus one line saying when to fetch which guide.
+  **Not one character of the text was dropped** — each guide is byte-identical to the
+  block it came from (only the prompt's own placeholders are resolved), and a watchdog
+  compares the pre-move template in full against the new template plus every guide.
+  The budget is 24 KB per prompt; when it is exceeded, `tako context-budget` reports
+  **which block or appended file costs how many bytes**, so the fix is obvious (a user's
+  own `prompt_blocks.append` is named by its file name). Measured: 59,501 B / 40.7k
+  tokens → 32,626 B / 20.4k tokens for that profile, and the default blocks alone come
+  to 21,072 B. A/B with `TAKO_1154_LEGACY=1`.
+- **master / solo の system prompt を起動時ロードの予算の対象にし、手順を必要なときだけ
+  引く形へ移した**（#1154。#1139 の続き）。#1139 のあと残っていた起動時の最大固定費は
+  system prompt 自身（takodev プロファイルの生成物が 59,501 B ≒ 4.07 万トークン）で、
+  master は長寿命セッションなので**何も作業しないうちに全 master がこれを払っていた**。
+  手順の詳細（monitoring のイベント別対処表・acceptance の手順・worker prompt テンプレート・
+  引き継ぎの書き方など）は 11 本の手順書へ移り、**引く条件が満たされたときだけ**取得する
+  （`tako orchestrator guide <topic>` / MCP `tako_orchestrator_guide`）。prompt には
+  「常に握っておく規則」と「いつどれを引くか」の 1 行だけが残る。
+  **本文は 1 文字も捨てていない** — 各手順書は移送前のブロックと byte 一致で
+  （prompt 自身のプレースホルダだけ解決する）、移送前テンプレート全文と
+  「新テンプレート + 全手順書」の突き合わせを番犬が拘束する。
+  予算は 1 本あたり 24 KB。超えたときは `tako context-budget` が
+  **どの block / どの追記が何バイトか**を出すので直す先が分かる
+  （ユーザー自身の `prompt_blocks.append` はファイル名で名指しする）。
+  実測: そのプロファイルで 59,501 B / 4.07 万トークン → 32,626 B / 2.04 万トークン、
+  既定 blocks 単体では 21,072 B。A/B は `TAKO_1154_LEGACY=1`。
 - **Profile-level auto-resume after usage limits now covers the master / solo session
   itself** (#1140, extends #822). A profile's `limit_resume: true` used to reach only
   the workers spawned from it, so when the master itself hit a usage limit everything

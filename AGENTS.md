@@ -114,6 +114,7 @@ tako/
 | オーケストレーター master 引き継ぎ（#193/#749/#915/#854/#917） | `tako orchestrator handoff [--pane N] [--tab T] [--projects a,b]` |
 | **master の自動ハンドオフ（#749）** | `【tako 自動通知】` |
 | **引き継ぎファイルの管理（#915）** | `tako orchestrator handoffs list/show/write/migrate` |
+| **master の手順書を引く（#1154）** | `tako orchestrator guide <topic>` |
 | オーケストレーター worker spawn | `tako orchestrator spawn --project <key> --prompt "..."` |
 | **worker への指示送達（#790）** | `<data_dir>/persist.log` |
 | オーケストレーター worker 監視 | `tako orchestrator watch --pane <N>` |
@@ -227,6 +228,8 @@ CI（`.github/workflows/ci.yml`）は macOS / Windows の両ランナーで buil
   別ファイルへ出し、規約からは**バックティック参照**で案内する（`@import` にはしない）
 - `@import` の合計は **40 KB 以内**
 - 引き継ぎの運用メモは 80 行以内 / グローバル指示ファイルは 24 KB 以内
+- master / solo の **system prompt は 24 KB 以内**。手順の詳細は
+  `tako orchestrator guide <topic>` で必要なときだけ引く形にし、prompt には「いつ引くか」を残す
 
 ### 機械強制
 

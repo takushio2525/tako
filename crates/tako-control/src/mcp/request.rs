@@ -781,6 +781,11 @@ pub(super) fn build_request(
             status: str_arg(args, "status")?.map(|s| s.to_string()),
             known_limitations: bool_arg(args, "known_limitations")?.unwrap_or(false),
         },
+        "tako_orchestrator_guide" => Request::OrchestratorGuide {
+            topic: str_arg(args, "topic")?.map(|s| s.to_string()),
+            profile: str_arg(args, "profile")?.map(|s| s.to_string()),
+            caller_role: caller_role.map(str::to_string),
+        },
         "tako_context_budget" => Request::ContextBudget {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
             cwd: str_arg(args, "cwd")?.map(|s| s.to_string()),

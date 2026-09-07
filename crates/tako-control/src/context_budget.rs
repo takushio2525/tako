@@ -24,6 +24,9 @@ pub struct Item {
     pub imported: bool,
     /// どのファイルから `@import` されたか
     pub imported_by: Option<String>,
+    /// 内訳（system prompt のときだけ入る。#1154）。
+    /// **生成と同じ 1 実装**（`Profile::build_prompt_pieces`）から採るので数え直さない
+    pub pieces: Vec<(String, usize)>,
 }
 
 /// ホームを `~` へ畳んだ表示用パス（個人情報を応答へ出さない。#927）。
@@ -154,6 +157,7 @@ fn walk_imports(start: &Path, out: &mut Vec<Item>, visited: &mut BTreeSet<PathBu
                 text: body,
                 imported: true,
                 imported_by: Some(from.clone()),
+                pieces: Vec::new(),
             });
             walk_imports(&p, out, visited);
         }
@@ -185,6 +189,7 @@ pub fn inventory(cwd: &Path, profile: Option<&str>) -> Vec<Item> {
                 text,
                 imported: false,
                 imported_by: None,
+                pieces: Vec::new(),
             });
             walk_imports(&g, &mut items, &mut visited);
         }
@@ -207,6 +212,7 @@ pub fn inventory(cwd: &Path, profile: Option<&str>) -> Vec<Item> {
             text,
             imported: false,
             imported_by: None,
+            pieces: Vec::new(),
         });
         walk_imports(&p, &mut items, &mut visited);
     }
@@ -221,11 +227,14 @@ pub fn inventory(cwd: &Path, profile: Option<&str>) -> Vec<Item> {
                 text,
                 imported: false,
                 imported_by: None,
+                pieces: Vec::new(),
             });
         }
     }
 
-    // 4) master / solo の system prompt（プロファイル別）
+    // 4) master / solo の system prompt（プロファイル別）。
+    // #1154: 本文と一緒に**内訳**（どの block / 追記が何バイトか）も採る。
+    // 組み立てと同じ 1 実装から採るので、超過したときに何を分ければいいかが即座に分かる
     let profile_name = profile.unwrap_or("default");
     for kind in [
         crate::orchestrator::ProfileKind::Master,
@@ -234,14 +243,21 @@ pub fn inventory(cwd: &Path, profile: Option<&str>) -> Vec<Item> {
         let Ok(p) = crate::orchestrator::load_profile_of(kind, profile_name) else {
             continue;
         };
-        let text = p.build_system_prompt(profile_name);
+        let pieces = match kind {
+            crate::orchestrator::ProfileKind::Master => p.system_prompt_pieces(profile_name),
+            crate::orchestrator::ProfileKind::Solo => p.solo_system_prompt_pieces(profile_name),
+        };
         items.push(Item {
             kind: ItemKind::SystemPrompt,
             label: format!("{} system prompt（{profile_name}）", kind.as_str()),
             path: None,
-            text,
+            text: crate::orchestrator::join_prompt_pieces(&pieces),
             imported: false,
             imported_by: None,
+            pieces: pieces
+                .iter()
+                .map(|piece| (piece.name.clone(), piece.bytes()))
+                .collect(),
         });
     }
 
@@ -255,6 +271,7 @@ pub fn inventory(cwd: &Path, profile: Option<&str>) -> Vec<Item> {
                 text,
                 imported: false,
                 imported_by: None,
+                pieces: Vec::new(),
             });
         }
     }
@@ -278,6 +295,9 @@ fn item_json(it: &Item) -> Value {
     if let Some(by) = &it.imported_by {
         o["imported_by"] = json!(by);
     }
+    if !it.pieces.is_empty() {
+        o["pieces"] = json!(pieces_json(&it.pieces));
+    }
     if let Some(e) = m.entries {
         o["entries"] = json!(e);
         o["work_days"] = json!(m.work_days.unwrap_or(0));
@@ -288,6 +308,17 @@ fn item_json(it: &Item) -> Value {
         o["violations"] = json!(vs.iter().map(violation_json).collect::<Vec<_>>());
     }
     o
+}
+
+/// 内訳（大きい順。**何を分ければ効くか**が先頭に来る）。
+/// 個人のホームパスは名前へ入れない（`piece_name` がファイル名だけを添える。#927）
+fn pieces_json(pieces: &[(String, usize)]) -> Vec<Value> {
+    let mut sorted: Vec<&(String, usize)> = pieces.iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    sorted
+        .iter()
+        .map(|(name, bytes)| json!({ "name": name, "bytes": bytes }))
+        .collect()
 }
 
 fn violation_json(v: &budget::Violation) -> Value {
@@ -328,7 +359,7 @@ pub fn report(cwd: &Path, profile: Option<&str>) -> Result<Value, String> {
                 if v.fixable {
                     fixable += 1;
                 } else {
-                    proposals.push(json!({
+                    let mut prop = json!({
                         "path": it.label,
                         "metric": v.metric.as_str(),
                         "actual": v.actual,
@@ -336,7 +367,13 @@ pub fn report(cwd: &Path, profile: Option<&str>) -> Result<Value, String> {
                         "next_step": v.note.text(),
                         "next_step_ja": v.note.ja(),
                         "next_step_en": v.note.en(),
-                    }));
+                    });
+                    // #1154: system prompt はどの block が何バイトかまで出す
+                    // （「大きい」だけ言われても何を分ければいいか分からない）
+                    if !it.pieces.is_empty() {
+                        prop["pieces"] = json!(pieces_json(&it.pieces));
+                    }
+                    proposals.push(prop);
                 }
             }
             item_json(it)
@@ -389,6 +426,7 @@ pub fn budget_json() -> Value {
         "active_context": { "max_lines": budget::ACTIVE_CONTEXT_MAX_LINES },
         "handoff_memo": { "max_lines": budget::HANDOFF_MEMO_MAX_LINES },
         "global_guide": { "max_bytes": budget::GLOBAL_GUIDE_MAX_BYTES },
+        "system_prompt": { "max_bytes": budget::SYSTEM_PROMPT_MAX_BYTES },
     })
 }
 
@@ -492,7 +530,12 @@ pub fn fix(cwd: &Path, profile: Option<&str>, dry_run: bool) -> Result<Value, St
 }
 
 /// `tako setup` / `tako master` が出す 1 行（#322 の最簡形）。
-/// 超過が無ければ `None`（黙って素通りする）
+/// 超過が無ければ `None`（黙って素通りする）。
+///
+/// #1154: **自動で直せるものが 1 件も無いときに `fix` を案内しない**
+/// （`fix` は作業ログの移送しかできないので、system prompt が超えているときに
+/// 「いま直す: fix（自動で直せる 0 件）」を出すのは嘘の案内になる）。
+/// その場合は代わりに**何が超えているか**を 1 行で名指しする
 pub fn startup_line(cwd: &Path, profile: Option<&str>) -> Option<String> {
     let r = report(cwd, profile).ok()?;
     let violations = r["violations"].as_u64().unwrap_or(0);
@@ -501,16 +544,65 @@ pub fn startup_line(cwd: &Path, profile: Option<&str>) -> Option<String> {
     }
     let tokens = r["totals"]["est_tokens"].as_u64().unwrap_or(0);
     let fixable = r["fixable"].as_u64().unwrap_or(0);
+    if fixable > 0 {
+        return Some(match tako_core::i18n::lang() {
+            tako_core::i18n::Lang::Ja => format!(
+                "起動時ロードが予算超過: {violations} 件（概算 {tokens} トークン）。\
+                 いま直す: tako context-budget fix（自動で直せる {fixable} 件）",
+            ),
+            tako_core::i18n::Lang::En => format!(
+                "Startup load is over budget: {violations} item(s) (~{tokens} tokens). \
+                 Fix now: tako context-budget fix ({fixable} auto-fixable)",
+            ),
+        });
+    }
+    let worst = worst_proposal(&r);
     Some(match tako_core::i18n::lang() {
         tako_core::i18n::Lang::Ja => format!(
-            "起動時ロードが予算超過: {violations} 件（概算 {tokens} トークン）。\
-             いま直す: tako context-budget fix（自動で直せる {fixable} 件）",
+            "起動時ロードが予算超過: {violations} 件（概算 {tokens} トークン）。{worst}\
+             内訳: tako context-budget",
         ),
         tako_core::i18n::Lang::En => format!(
-            "Startup load is over budget: {violations} item(s) (~{tokens} tokens). \
-             Fix now: tako context-budget fix ({fixable} auto-fixable)",
+            "Startup load is over budget: {violations} item(s) (~{tokens} tokens). {worst}\
+             Breakdown: tako context-budget",
         ),
     })
+}
+
+/// 1 行で名指しする対象。**master 自身の system prompt を優先する**
+/// （`tako master` はこれからその prompt を渡すところで、master 自身は
+/// 自分の prompt の大きさを他の手段では知れない）。無ければ超過分が最大のもの
+fn worst_proposal(report: &Value) -> String {
+    let empty = vec![];
+    let proposals = report["proposals"].as_array().unwrap_or(&empty);
+    let over = |p: &Value| {
+        p["actual"]
+            .as_u64()
+            .unwrap_or(0)
+            .saturating_sub(p["limit"].as_u64().unwrap_or(0))
+    };
+    let prompt_paths: Vec<&str> = report["items"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .filter(|it| it["kind"] == ItemKind::SystemPrompt.as_str())
+        .filter_map(|it| it["path"].as_str())
+        .collect();
+    let pick = proposals
+        .iter()
+        .filter(|p| prompt_paths.contains(&p["path"].as_str().unwrap_or_default()))
+        .max_by_key(|p| over(p))
+        .or_else(|| proposals.iter().max_by_key(|p| over(p)));
+    match pick {
+        Some(p) => format!(
+            "{}: {} {} > {}。",
+            p["path"].as_str().unwrap_or("?"),
+            p["metric"].as_str().unwrap_or("?"),
+            p["actual"].as_u64().unwrap_or(0),
+            p["limit"].as_u64().unwrap_or(0),
+        ),
+        None => String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -597,6 +689,41 @@ mod tests {
             "表示用パスにユーザー名が残っている: {shown}"
         );
         assert!(shown.starts_with("~/.claude/projects/"));
+    }
+
+    /// #1154: `fix` で直せないものだけが超えているときに `fix` を案内しない
+    /// （`tako master` の起動前 1 行が「自動で直せる 0 件」を勧める嘘になっていた）
+    #[test]
+    fn 自動で直せないときは何が超えているかを名指しする() {
+        let report = json!({
+            "items": [
+                { "kind": "system_prompt", "path": "master system prompt（p）" },
+                { "kind": "global_guide", "path": "~/.claude/CLAUDE.md" },
+            ],
+            "proposals": [
+                // 超過分はこちらの方が大きいが、master 自身の prompt を優先する
+                { "path": "~/.claude/CLAUDE.md", "metric": "bytes", "actual": 90000, "limit": 24576 },
+                { "path": "master system prompt（p）", "metric": "bytes", "actual": 30000, "limit": 24576 },
+            ],
+        });
+        let line = worst_proposal(&report);
+        assert!(
+            line.starts_with("master system prompt（p）: bytes 30000 > 24576"),
+            "master 自身の prompt を優先して名指しする: {line}"
+        );
+
+        // system prompt が超えていなければ超過分が最大のものを名指しする
+        let report = json!({
+            "items": [{ "kind": "global_guide", "path": "~/.claude/CLAUDE.md" }],
+            "proposals": [
+                { "path": "a.md", "metric": "lines", "actual": 100, "limit": 80 },
+                { "path": "~/.claude/CLAUDE.md", "metric": "bytes", "actual": 90000, "limit": 24576 },
+            ],
+        });
+        assert!(worst_proposal(&report).starts_with("~/.claude/CLAUDE.md: bytes 90000 > 24576"));
+
+        // 提案が無ければ黙る（1 行に余計な句読点を出さない）
+        assert_eq!(worst_proposal(&json!({})), "");
     }
 
     #[test]

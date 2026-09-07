@@ -114,6 +114,14 @@ pub const ACTIVE_CONTEXT_MAX_LINES: usize = 80;
 pub const HANDOFF_MEMO_MAX_LINES: usize = 80;
 /// グローバル指示ファイル
 pub const GLOBAL_GUIDE_MAX_BYTES: usize = 24 * 1024;
+/// master / solo の system prompt（プロファイル別の生成物。Issue #1154）。
+///
+/// **これは tako 自身が配るものなので、超えたら tako を直す**（ユーザーに我慢させない）。
+/// 手順の詳細は `tako orchestrator guide <topic>` で必要なときだけ引く形へ移し、
+/// prompt には「いつ引くか」だけを残す。ユーザー側の追記（`prompt_blocks.append` =
+/// 個人環境固有のルール）で超えたぶんは、**どの block が何バイトか**を
+/// `proposals` に添えて分離先を案内する
+pub const SYSTEM_PROMPT_MAX_BYTES: usize = 24 * 1024;
 
 /// 種別ごとの上限を引く（**判定・規約文・番犬がすべてこの 1 本を通る**）
 pub fn limits(kind: ItemKind) -> Limits {
@@ -141,9 +149,17 @@ pub fn limits(kind: ItemKind) -> Limits {
             max_bytes: Some(GLOBAL_GUIDE_MAX_BYTES),
             ..Limits::default()
         },
+        // #1154: system prompt は tako 自身の生成物なので上限を持つ
+        // （**予算は A/B で外さない**。旧挙動へ戻す `TAKO_1154_LEGACY` は
+        // prompt の中身だけを移送前の姿へ差し戻すので、そのとき番犬が落ちるのが
+        // 「移送しなければ超過していた」ことの実測になる）
+        ItemKind::SystemPrompt => Limits {
+            max_bytes: Some(SYSTEM_PROMPT_MAX_BYTES),
+            ..Limits::default()
+        },
         // 取り込み先の 1 本ずつには上限を置かない（合計 IMPORT_TOTAL_MAX_BYTES で見る）。
-        // system prompt / memory は tako や claude が持ち主なので観測だけ
-        ItemKind::Imported | ItemKind::SystemPrompt | ItemKind::Memory => Limits::default(),
+        // claude の永続メモリは claude が持ち主なので観測だけ
+        ItemKind::Imported | ItemKind::Memory => Limits::default(),
     }
 }
 
@@ -178,6 +194,8 @@ pub fn rule_markdown() -> String {
   別ファイルへ出し、規約からは**バックティック参照**で案内する（`@import` にはしない）
 - `@import` の合計は **{import_kb} KB 以内**
 - 引き継ぎの運用メモは {handoff_lines} 行以内 / グローバル指示ファイルは {global_kb} KB 以内
+- master / solo の **system prompt は {prompt_kb} KB 以内**。手順の詳細は
+  `tako orchestrator guide <topic>` で必要なときだけ引く形にし、prompt には「いつ引くか」を残す
 
 ### 機械強制
 
@@ -195,6 +213,7 @@ pub fn rule_markdown() -> String {
         import_kb = IMPORT_TOTAL_MAX_BYTES / 1024,
         handoff_lines = HANDOFF_MEMO_MAX_LINES,
         global_kb = GLOBAL_GUIDE_MAX_BYTES / 1024,
+        prompt_kb = SYSTEM_PROMPT_MAX_BYTES / 1024,
     )
 }
 
@@ -341,6 +360,11 @@ pub mod notes {
         "グローバル指示ファイルが大きい。全プロジェクトの全ターンに載るので、領域固有の詳細は snippets へ出して必要なときだけ読む形にする",
         "The global guide is large. It rides on every turn of every project, so move domain-specific detail into snippets that are read only when needed",
     );
+
+    pub const SYSTEM_PROMPT_TOO_BIG: Note = Note::new(
+        "master / solo の system prompt が予算を超えている。長寿命セッションの起動直後の固定費なので、手順の詳細は `tako orchestrator guide <topic>` で必要なときだけ引く形へ移す。プロファイルの `prompt_blocks.append`（個人環境固有のルール）が大きい場合は、常に要る規則だけを残して残りを別ファイルへ分け、そこは AI が必要なときだけ読む",
+        "The master / solo system prompt is over budget. It is a fixed cost paid at the start of every long-lived session, so move procedure detail into `tako orchestrator guide <topic>` and fetch it on demand. If the profile's `prompt_blocks.append` (your machine-specific rules) is the large part, keep only the always-needed rules there and split the rest into a file the agent reads only when needed",
+    );
 }
 
 /// 実測値を予算と突き合わせる
@@ -355,6 +379,7 @@ pub fn violations(kind: ItemKind, m: &Measurement) -> Vec<Violation> {
         ItemKind::ActiveContext => notes::ACTIVE_CONTEXT_TOO_LONG,
         ItemKind::HandoffMemo => notes::HANDOFF_MEMO_TOO_LONG,
         ItemKind::GlobalGuide => notes::GLOBAL_GUIDE_TOO_BIG,
+        ItemKind::SystemPrompt => notes::SYSTEM_PROMPT_TOO_BIG,
         _ => notes::IMPORT_TOTAL_TOO_BIG,
     };
 
@@ -1125,6 +1150,35 @@ mod tests {
             assert!(!k.auto_fixable(), "{} は人間の判断が要る", k.as_str());
         }
         assert!(ItemKind::ProgressLog.auto_fixable());
+    }
+
+    #[test]
+    fn system_promptは予算対象で自動修正の対象外() {
+        // #1154: tako 自身が配る生成物なので上限を持つ。ただし本文を機械で削るのは
+        // 手順の欠落になるので、直し方は `proposals`（guide への移送）として返すだけ
+        assert_eq!(
+            limits(ItemKind::SystemPrompt).max_bytes,
+            Some(SYSTEM_PROMPT_MAX_BYTES)
+        );
+        let m = measure(
+            ItemKind::SystemPrompt,
+            &"x".repeat(SYSTEM_PROMPT_MAX_BYTES + 1),
+        );
+        let v = violations(ItemKind::SystemPrompt, &m);
+        let bytes = v
+            .iter()
+            .find(|x| x.metric == Metric::Bytes)
+            .expect("バイト超過を名指しする");
+        assert_eq!(bytes.limit, SYSTEM_PROMPT_MAX_BYTES);
+        assert!(!bytes.fixable, "本文の削りは自動化しない");
+        assert!(
+            bytes.note.ja().contains("guide"),
+            "直し方に guide への移送を書く: {}",
+            bytes.note.ja()
+        );
+        // 予算内なら黙る
+        let ok = measure(ItemKind::SystemPrompt, &"x".repeat(SYSTEM_PROMPT_MAX_BYTES));
+        assert!(violations(ItemKind::SystemPrompt, &ok).is_empty());
     }
 
     #[test]
