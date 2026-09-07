@@ -10,7 +10,7 @@
 //! 種別の分類（permission / usage_limit …）は文言に依るので、
 //! そちらは `tako-control::claude_tui::detect_choice_dialog` の責務に分ける。
 //!
-//! # 検知の 2 経路（いずれも実採取画面が根拠。証拠は #748）
+//! # 検知の 3 経路（いずれも実採取画面が根拠。証拠は #748 / #1143）
 //!
 //! 1. **番号つき**: カーソル行の中身が `N. …` で、画面に番号つき行が 2 つ以上
 //!    ```text
@@ -26,6 +26,19 @@
 //!       ❯ context7 · ✔ connected · 2 tools
 //!         coplay-mcp · ✔ connected · 98 tools
 //!         filesystem · ✔ connected · 14 tools
+//!    ```
+//! 3. **カーソルなしの番号つき**（#1143。狭いペインの `/model` セレクタ）:
+//!    ダイアログがペインより高いと claude は箱を上端から描いて下を切り捨てるので、
+//!    **選択カーソルの行が画面の外へ出る**（入力欄も描かれない）。番号つきの連なり
+//!    そのものを anchor にする。詳細と拒否条件は [`detect_choice_list_in`]
+//!    ```text
+//!    ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔   ← 箱の上端は見えている
+//!       Select model
+//!         1. Defaul…  Opus       ← ラベルは claude 自身が `…` で切り詰める
+//!                     5
+//!                     1M co      ← 説明列はセル単位で割れる（語境界ではない）
+//!         2. Opus (…  Opus
+//!                     …          ← 画面はここで尽きる（カーソルは 4. の行）
 //!    ```
 //!
 //! # 番号キーの実測（#748。claude v2.1.220）
@@ -43,6 +56,12 @@ pub struct ChoiceOption {
     pub label: String,
     /// 選択カーソル（`❯` / `›` / `>`）が指しているか
     pub highlighted: bool,
+    /// ラベルが TUI 自身に切り詰められているか（`…` を含む。#1143）。
+    ///
+    /// **true なら元のラベルは画面のどこにも残っていない**（折り返しと違って
+    /// 結合では戻せない）。ラベル一致でこの選択肢を確定してはいけない
+    /// = `respond` は番号での指定を要求する
+    pub label_truncated: bool,
 }
 
 /// 画面に実在する選択肢の並び
@@ -56,8 +75,10 @@ pub struct ChoiceList {
     pub numbered: bool,
     /// カーソル行より上のダイアログ本文（罫線で区切った直近ブロック）
     pub header: Vec<String>,
-    /// 選択カーソルがある画面行の添字
-    pub cursor_row: usize,
+    /// 選択カーソルがある画面行の添字。
+    /// **None = カーソルが 1 つも描かれていない**（#1143。ダイアログがペインより
+    /// 高くてカーソル行が画面外へ出た形。番号キーでは確定できる）
+    pub cursor_row: Option<usize>,
 }
 
 impl ChoiceList {
@@ -107,9 +128,13 @@ pub fn detect_choice_list(lines: &[&str]) -> Option<ChoiceList> {
 fn detect_choice_list_in(lines: &[&str]) -> Option<ChoiceList> {
     let bottom = lines.iter().rposition(|l| !l.trim().is_empty())? + 1;
     let scan_from = bottom.saturating_sub(SCAN_ROWS);
-    let cursor_row = (scan_from..bottom)
+    let Some(cursor_row) = (scan_from..bottom)
         .rev()
-        .find(|&i| cursor_content(lines[i]).is_some())?;
+        .find(|&i| cursor_content(lines[i]).is_some())
+    else {
+        // 経路 3: 選択カーソルが 1 つも描かれていない（#1143）
+        return detect_cursorless_numbered(lines, bottom);
+    };
     let content = cursor_content(lines[cursor_row])?;
 
     // 経路 1: 番号つき（カーソルが `N. …` を指している + 画面に 2 つ以上）
@@ -121,26 +146,14 @@ fn detect_choice_list_in(lines: &[&str]) -> Option<ChoiceList> {
             })
             .collect();
         if numbered.len() >= 2 {
-            let options = numbered
-                .iter()
-                .map(|&i| {
-                    let highlighted = cursor_content(lines[i]).is_some();
-                    let inner = cursor_content(lines[i]).unwrap_or_else(|| strip_indent(lines[i]));
-                    let (number, label) = numbered_choice(inner).unwrap_or((0, inner));
-                    ChoiceOption {
-                        number: Some(number),
-                        label: label.trim().to_string(),
-                        highlighted,
-                    }
-                })
-                .collect::<Vec<_>>();
+            let options = numbered_options(lines, &numbered, Some(cursor_row));
             let highlighted = options.iter().position(|o| o.highlighted);
             return Some(ChoiceList {
                 options,
                 highlighted,
                 numbered: true,
                 header: header_block(lines, numbered[0]),
-                cursor_row,
+                cursor_row: Some(cursor_row),
             });
         }
     }
@@ -178,13 +191,17 @@ fn detect_choice_list_in(lines: &[&str]) -> Option<ChoiceList> {
     let options: Vec<ChoiceOption> = rows
         .iter()
         .filter(|&&i| !is_key_hint(lines[i]))
-        .map(|&i| ChoiceOption {
-            number: None,
-            label: cursor_content(lines[i])
+        .map(|&i| {
+            let label = cursor_content(lines[i])
                 .unwrap_or_else(|| strip_indent(lines[i]))
                 .trim()
-                .to_string(),
-            highlighted: i == cursor_row,
+                .to_string();
+            ChoiceOption {
+                number: None,
+                label_truncated: label_is_truncated(&label),
+                label,
+                highlighted: i == cursor_row,
+            }
         })
         .collect();
     if options.len() < 2 {
@@ -196,8 +213,219 @@ fn detect_choice_list_in(lines: &[&str]) -> Option<ChoiceList> {
         highlighted,
         numbered: false,
         header: header_block(lines, *rows.first().unwrap_or(&cursor_row)),
-        cursor_row,
+        cursor_row: Some(cursor_row),
     })
+}
+
+// --- 2 列レイアウトとカーソルなしの検知（#1143） ---
+
+/// TUI がラベルを切り詰めるときに使う省略記号（実採取: `1. Defaul…` / `4. Sonn… ✔`）
+const LABEL_ELLIPSIS: char = '…';
+
+/// ラベルが TUI 自身に切り詰められているか。
+///
+/// claude は 2 列レイアウト（ラベル列 + 説明列）を狭幅へ潰すとき、ラベル列を
+/// `…` で打ち切る（`1. Default (recommended)` → `1. Defaul…`）。`✔` のような
+/// 印は打ち切りの**後ろ**に付く（`4. Sonn… ✔`）ので、末尾一致ではなく包含で見る。
+///
+/// 本物のラベルに `…` が入っている TUI があれば過検知になるが、そのときの代償は
+/// 「ラベル一致での確定を断って番号を要求する」= 安全側だけ（#1143）
+fn label_is_truncated(label: &str) -> bool {
+    !legacy_cursorless_dialog() && label.contains(LABEL_ELLIPSIS)
+}
+
+/// 番号つき選択肢の行から `ChoiceOption` を組む（経路 1 / 経路 3 の共通部）。
+///
+/// 2 列レイアウトなら説明列を切り落とす（[`description_column`]）
+fn numbered_options(
+    lines: &[&str],
+    rows: &[usize],
+    cursor_row: Option<usize>,
+) -> Vec<ChoiceOption> {
+    let desc_col = description_column(lines, rows);
+    rows.iter()
+        .map(|&i| {
+            let inner = cursor_content(lines[i]).unwrap_or_else(|| strip_indent(lines[i]));
+            let (number, label) = numbered_choice(inner).unwrap_or((0, inner));
+            let label = match desc_col.and_then(|c| label_before_column(lines[i], label, c)) {
+                Some(cut) => cut,
+                None => label,
+            };
+            let label = label.trim().to_string();
+            ChoiceOption {
+                number: Some(number),
+                label_truncated: label_is_truncated(&label),
+                label,
+                highlighted: Some(i) == cursor_row,
+            }
+        })
+        .collect()
+}
+
+/// 2 列レイアウト（ラベル列 + 説明列）の**説明列の桁**（#1143）。
+///
+/// 根拠は「ある選択肢の行に 2 桁以上の空白の切れ目があり、その直後の桁へ**次の行が
+/// 字下げされている**」こと = 説明列がそこで折り返した証拠。
+///
+/// ```text
+/// 25 桁:      1. Defaul…  Opus     ← 切れ目の後ろは 17 桁目
+///                         5        ← 次の行が 17 桁目 = 説明列の折り返し
+/// 80 桁:      1. Default (recommended)  Opus 5 with 1M context · Best for everyday,
+///                                       complex tasks
+/// ```
+///
+/// **列は 1 ダイアログに 1 つ**。説明が 1 行に収まる選択肢（折り返さないので証拠を
+/// 出せない）にも同じ列を当てないと、同じ一覧の中でラベルの切り方が食い違う。
+/// 証拠が食い違うときは切らない（`None`）
+fn description_column(lines: &[&str], rows: &[usize]) -> Option<usize> {
+    if legacy_cursorless_dialog() {
+        return None;
+    }
+    let mut found: Option<usize> = None;
+    for &i in rows {
+        let Some(col) = column_gap(lines[i]) else {
+            continue;
+        };
+        // 直後の行がその桁へ字下げされた「続き」か（番号つき・カーソル・罫線・
+        // キー案内は説明列の折り返しではない）
+        let Some(next) = lines.get(i + 1) else {
+            continue;
+        };
+        if next.trim().is_empty()
+            || cursor_content(next).is_some()
+            || is_key_hint(next)
+            || is_rule_line(next.trim_start())
+            || numbered_choice(strip_indent(next)).is_some()
+        {
+            continue;
+        }
+        if next.chars().take_while(|c| *c == ' ').count() != col {
+            continue;
+        }
+        match found {
+            None => found = Some(col),
+            Some(c) if c == col => {}
+            // 証拠が食い違う = 2 列レイアウトと言い切れない
+            Some(_) => return None,
+        }
+    }
+    found
+}
+
+/// 行の中身にある最初の「2 桁以上の空白」の**直後の桁**（= 列の切れ目）。
+/// 番号つき選択肢の行だけを対象にする（`N. ` の後ろから探す）
+fn column_gap(line: &str) -> Option<usize> {
+    let inner = cursor_content(line).unwrap_or_else(|| strip_indent(line));
+    let (_, label) = numbered_choice(inner)?;
+    let gap = label.find("  ")?;
+    let after = label[gap..].len() - label[gap..].trim_start_matches(' ').len();
+    if label[gap + after..].trim().is_empty() {
+        return None; // 切れ目の後ろが空白だけ = 説明列ではない（行末の余白）
+    }
+    let base = line[..subslice_offset(line, label)].chars().count();
+    Some(base + label[..gap + after].chars().count())
+}
+
+/// `label`（`line` の部分スライス）のうち、桁 `col` より手前だけを返す。
+/// `col` に切れ目が無ければ `None`（この行は説明列を持たない = 切らない）
+fn label_before_column<'a>(line: &str, label: &'a str, col: usize) -> Option<&'a str> {
+    let base = line[..subslice_offset(line, label)].chars().count();
+    let gap = label.find("  ")?;
+    let after = label[gap..].len() - label[gap..].trim_start_matches(' ').len();
+    if base + label[..gap + after].chars().count() != col {
+        return None;
+    }
+    Some(&label[..gap])
+}
+
+/// 経路 3: 選択カーソルが画面に 1 つも描かれていない番号つき一覧（#1143）。
+///
+/// 狭いペインの `/model` セレクタは、ダイアログがペインより高くなると claude が
+/// 箱を**上端から描いて下を切り捨てる**ため、選択カーソルの行もキー案内も画面の
+/// 外へ出る（実採取 = 25 桁 × 40 行）。カーソルを anchor にできないので、
+/// 番号つき選択肢の連なりそのものを anchor にする。
+///
+/// 応答本文の箇条書き（`1. …` / `2. …`）や、シェルで開いた Markdown を
+/// ダイアログと誤認しないよう、次を**すべて**満たすときだけ採る:
+///
+/// - 入力欄のプロンプト（`❯` / `›` / `>`）が画面に 1 つも無い
+///   （= 入力欄が奪われている。呼び出し元で確認済み）
+/// - 同じ桁に揃った番号つき行が 2 つ以上あり、**番号が 1 ずつ増える**
+/// - **TUI が描いた一覧**である証拠がある: 連なりの上に**罫線**がある（= 箱の中。
+///   Markdown の `---` は [`is_rule_line`] の文字集合に無いので当たらない）か、
+///   選択肢が**2 列レイアウト**（[`description_column`]）で描かれている
+/// - 連なりのあとに続くのは空行・キー案内・罫線・**より深い字下げ**（説明列の
+///   折り返し）だけ = 画面が選択肢一覧の途中で尽きている
+fn detect_cursorless_numbered(lines: &[&str], bottom: usize) -> Option<ChoiceList> {
+    if legacy_cursorless_dialog() {
+        return None;
+    }
+    let numbered_at = |i: usize| numbered_choice(strip_indent(lines[i])).map(|(n, _)| n);
+    let indent_of = |i: usize| lines[i].chars().take_while(|c| *c == ' ').count();
+
+    // 下から連なりを拾う（同じ桁・番号が 1 ずつ減る）
+    let last = (0..bottom).rev().find(|&i| numbered_at(i).is_some())?;
+    let indent = indent_of(last);
+    let mut rows = vec![last];
+    let mut want = numbered_at(last)?;
+    for i in (0..last).rev() {
+        let Some(n) = numbered_at(i) else {
+            continue;
+        };
+        if indent_of(i) != indent || n + 1 != want {
+            break;
+        }
+        rows.push(i);
+        want = n;
+    }
+    rows.reverse();
+    if rows.len() < 2 {
+        return None;
+    }
+
+    // 「TUI が描いた一覧」の証拠が要る。次のどちらかで足りる:
+    //  a) 連なりの上に罫線がある（= ダイアログの箱の中）
+    //  b) 選択肢が 2 列レイアウト（ラベル列 + 説明列）で描かれている
+    // b を認めるのは、**画面の上が切られていても判定できる**ようにするため。
+    // `worker_status` の `recent_output` は末尾 30 行に丸められる（`tail_join`）ので、
+    // 25 桁の `/model` では箱の上端が窓の外に落ちる（実測: 罫線は画面の 3 行目 =
+    // 窓に入らない）。2 列レイアウトは continuation 行が説明列の桁へぴたりと
+    // 揃っていることが根拠なので、本文の箇条書き（折り返しても列は揃わない）や
+    // Markdown の番号リストは満たさない
+    let first = rows[0];
+    let framed = (0..first).any(|i| is_rule_line(lines[i]));
+    if !framed && description_column(lines, &rows).is_none() {
+        return None;
+    }
+
+    // 連なりのあとが「説明列の折り返しだけ」で画面が尽きていること
+    let content_col = content_start_column(lines[last]).unwrap_or(indent);
+    let tail_is_continuation = ((last + 1)..bottom).all(|i| {
+        let line = lines[i];
+        line.trim().is_empty()
+            || is_key_hint(line)
+            || is_rule_line(line.trim_start())
+            || indent_of(i) > content_col
+    });
+    if !tail_is_continuation {
+        return None;
+    }
+
+    let options = numbered_options(lines, &rows, None);
+    Some(ChoiceList {
+        options,
+        highlighted: None,
+        numbered: true,
+        header: header_block(lines, first),
+        cursor_row: None,
+    })
+}
+
+/// `TAKO_1143_LEGACY=1` で #1143 前（カーソルなし検知・説明列の切り落とし・
+/// 切り詰め申告のすべて無し）へ戻す（A/B 用）
+fn legacy_cursorless_dialog() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_1143_LEGACY").is_some())
 }
 
 // --- 折り返しの結合（#1131） ---
@@ -285,7 +513,14 @@ fn starts_new_dialog_block(
 /// （`safe_choice`）が静かに外れる。
 ///
 /// 続きの判定は [`starts_new_dialog_block`]。**同じ桁の行は次の選択肢**なので、
-/// 番号なしの並び（`/mcp` のサーバー一覧）を 1 個へ畳んでしまうことはない
+/// 番号なしの並び（`/mcp` のサーバー一覧）を 1 個へ畳んでしまうことはない。
+///
+/// **2 列レイアウトの選択肢は結合しない**（#1143）。`/model` のように
+/// 「ラベル列 + 説明列」で描かれる一覧では、選択肢の下に続くのは**説明列の
+/// 折り返し**であってラベルの続きではない。しかも狭幅ではその折り返しが
+/// 語境界ではなく**セル単位**で割れる（実採取 = `1M co` / `ntext`）ので、
+/// 空白で継ぐと `1M co ntext` という壊れた語がラベルに入る。
+/// 列の判定は [`description_column`]
 pub fn unwrap_dialog_lines(lines: &[&str]) -> Vec<String> {
     if legacy_wrapped_dialog() {
         return lines.iter().map(|l| (*l).to_string()).collect();
@@ -298,6 +533,14 @@ pub fn unwrap_dialog_lines(lines: &[&str]) -> Vec<String> {
         .max()
         .unwrap_or(0)
         .saturating_sub(DIALOG_RIGHT_PAD);
+    // 2 列レイアウトの説明列（#1143）。画面全体の番号つき行から 1 つだけ決める
+    let numbered_rows: Vec<usize> = (0..lines.len())
+        .filter(|&i| {
+            numbered_choice(cursor_content(lines[i]).unwrap_or_else(|| strip_indent(lines[i])))
+                .is_some()
+        })
+        .collect();
+    let desc_col = description_column(lines, &numbered_rows);
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     // 続きを受け付けている論理行（`out` の添字と中身の桁）。None = 受け付けない
     let mut open: Option<(usize, usize, bool)> = None;
@@ -328,7 +571,13 @@ pub fn unwrap_dialog_lines(lines: &[&str]) -> Vec<String> {
         joined = 0;
         let is_numbered =
             numbered_choice(cursor_content(line).unwrap_or_else(|| strip_indent(line))).is_some();
-        open = content_start_column(line).map(|c| (out.len(), c, is_numbered));
+        // 2 列レイアウトの選択肢は続きを受け付けない（下に来るのは説明列の折り返し）
+        let two_column = is_numbered && desc_col.is_some() && column_gap(line) == desc_col;
+        open = if two_column {
+            None
+        } else {
+            content_start_column(line).map(|c| (out.len(), c, is_numbered))
+        };
         out.push((*line).to_string());
     }
     out
@@ -683,6 +932,169 @@ Antigravity CLI requires permission to read, edit, and execute files here.
 ❯
 ────────────────────────────────────────────────────────────────────────
   claude-opus-5 · ctx 23%"#;
+
+    // --- #1143: 狭いペインの `/model` セレクタ（実採取 2026-09-06。claude 2.1.258 を
+    // 隔離した tmux セッションで幅・高さだけ変えて採った 3 枚。cwd 行はサニタイズ済み） ---
+    //
+    // 25 桁 × 40 行: ダイアログがペインより高いので claude は箱を上端から描いて
+    // 下を切り捨てる。**選択カーソル `❯` も操作キーの案内も画面に無い**（Issue #1143 の再現形）。
+    // ラベルは claude 自身が `…` で切り詰め、説明列はセル単位で割れる（`1M co` / `ntext`）
+    const MODEL_25_NO_CURSOR: &str = r#"           k
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Select model
+   Switch between
+   Claude models. Your
+   pick becomes the
+   default for new
+   sessions. For
+   other/previous
+   model names,
+   specify with
+   --model.
+
+     1. Defaul…  Opus
+                 5
+                 with
+                 1M co
+                 ntext
+                 ·
+                 Best
+                 for
+                 every
+                 day,
+                 compl
+                 ex
+                 tasks
+     2. Opus (…  Opus
+                 5
+                 with
+                 1M co
+                 ntext
+                 ·
+                 Best
+                 for
+                 every
+                 day,
+                 compl
+                 ex
+                 tasks ↓"#;
+
+    // 25 桁 × 70 行: **同じ幅・同じダイアログ**で高さだけ足したもの。
+    // カーソル（`❯ 4.`）が画面に入るので経路 1 で読める = 幅由来の切り詰めだけを切り分けられる
+    const MODEL_25_CURSOR: &str = r#"           k
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Select model
+   Switch between
+   Claude models. Your
+   pick becomes the
+   default for new
+   sessions. For
+   other/previous
+   model names,
+   specify with
+   --model.
+
+     1. Defaul…  Opus
+                 5
+                 with
+                 1M co
+                 ntext
+                 ·
+                 Best
+                 for
+                 every
+                 day,
+                 compl
+                 ex
+                 tasks
+     2. Opus (…  Opus
+                 5
+                 with
+                 1M co
+                 ntext
+                 ·
+                 Best
+                 for
+                 every
+                 day,
+                 compl
+                 ex
+                 tasks
+     3. Fable    Fable
+                 5.1
+                 ·
+                 Most
+                 capab
+                 le
+                 for
+                 your
+                 harde
+                 st
+                 and
+                 longe
+                 st-ru
+                 nning
+
+                 tasks
+   ❯ 4. Sonn… ✔  Sonne
+                 t 5 ·
+                 Effi
+                 cient
+                 for
+                 routi
+                 ne
+                 tasks
+     5. Haiku    Haiku
+                 4.5
+                 · Fas
+                 test
+                 for
+                 quick ↓"#;
+
+    // 80 桁 × 40 行: ラベルは切り詰められないが、説明列は 2 行へ折り返す。
+    // 「説明列をラベルへ混ぜない」ことを 25 桁と同じ規則で確かめるための対
+    const MODEL_80_WRAPPED: &str = r#"
+ ▐▛███▛█   Claude Code v2.1.258
+▝▜██████▀  Sonnet 5 with xhigh effort · Claude Max
+  ▝▝ ▝▝    /…/example/workdir
+
+
+❯ /model
+  ⎿  Kept model as Sonnet 5
+
+❯ /model
+  ⎿  Kept model as Sonnet 5
+
+
+
+
+
+
+
+
+
+
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Select model
+   Switch between Claude models. Your pick becomes the default for new
+   sessions. For other/previous model names, specify with --model.
+
+     1. Default (recommended)  Opus 5 with 1M context · Best for everyday,
+                               complex tasks
+     2. Opus (1M context)      Opus 5 with 1M context · Best for everyday,
+                               complex tasks
+     3. Fable                  Fable 5.1 · Most capable for your hardest and
+                               longest-running tasks
+   ❯ 4. Sonnet ✔               Sonnet 5 · Efficient for routine tasks
+     5. Haiku                  Haiku 4.5 · Fastest for quick answers
+     6. Opus 4.6 (1M)          Opus 4.6 with 1M context
+
+   ◉ xHigh effort ←/→ to adjust
+
+   Enter to set as default · s to use this session only · Esc to cancel"#;
 
     #[test]
     fn 実採取のpermissionダイアログを番号つきで検知する() {
@@ -1077,6 +1489,217 @@ Antigravity CLI requires permission to read, edit, and execute files here.
                 o.label
             );
         }
+    }
+
+    // --- #1143: カーソルが画面外の番号つき一覧 / 切り詰められたラベル / 説明列 ---
+
+    /// 選択肢を `番号 -> (ラベル, 切り詰めか)` にして比べやすくする
+    fn options_of(list: &ChoiceList) -> Vec<(Option<u32>, String, bool)> {
+        list.options
+            .iter()
+            .map(|o| (o.number, o.label.clone(), o.label_truncated))
+            .collect()
+    }
+
+    #[test]
+    fn issue1143_カーソルが画面外の狭いモデルセレクタを検知する() {
+        let lines = rows(MODEL_25_NO_CURSOR);
+        assert!(
+            lines.iter().all(|l| cursor_content(l).is_none()),
+            "この fixture の前提は「選択カーソルが 1 つも無い」こと"
+        );
+        let list = detect_choice_list(&lines).expect("25 桁の /model セレクタが検知されない");
+        assert!(list.numbered, "番号キーで確定できる一覧として組む");
+        assert_eq!(list.cursor_row, None, "カーソルは画面に無い");
+        assert_eq!(list.highlighted, None, "位置を知らないなら知らないと言う");
+        assert_eq!(
+            options_of(&list),
+            vec![
+                (Some(1), "Defaul…".to_string(), true),
+                (Some(2), "Opus (…".to_string(), true),
+            ],
+            "画面に出ている 2 件がそのまま番号つきで取れる"
+        );
+        assert!(
+            list.header.iter().any(|h| h == "Select model"),
+            "本文が取れない: {:?}",
+            list.header
+        );
+    }
+
+    #[test]
+    fn issue1143_切り詰められたラベルは復元せずに申告する() {
+        let list = detect_choice_list(&rows(MODEL_25_NO_CURSOR)).expect("検知される");
+        for o in &list.options {
+            assert!(
+                o.label_truncated,
+                "{:?} が切り詰め申告されていない",
+                o.label
+            );
+            // 画面に残っていない文字を補完しない（`Default (recommended)` を作らない）
+            assert!(
+                o.label.contains('…') && o.label.chars().count() <= 8,
+                "ラベルを推測で伸ばしている: {:?}",
+                o.label
+            );
+        }
+    }
+
+    #[test]
+    fn issue1143_同じ一覧はカーソルの見え方が変わってもラベルが変わらない() {
+        // 25 桁 × 40 行（カーソル画面外）と 25 桁 × 70 行（カーソルあり）は
+        // **同じダイアログ**。高さだけが違うので、見えている選択肢のラベルは一致する
+        let short = detect_choice_list(&rows(MODEL_25_NO_CURSOR)).expect("40 行で検知される");
+        let tall = detect_choice_list(&rows(MODEL_25_CURSOR)).expect("70 行で検知される");
+        assert_eq!(tall.highlighted, Some(3), "70 行では ❯ が 4. を指す");
+        assert_eq!(
+            options_of(&short),
+            options_of(&tall)[..short.options.len()].to_vec(),
+            "高さでラベルが変わる"
+        );
+        assert_eq!(
+            options_of(&tall)[3],
+            (Some(4), "Sonn… ✔".to_string(), true),
+            "切り詰めの後ろに付く印（✔）まで残す"
+        );
+    }
+
+    #[test]
+    fn issue1143_説明列はラベルへ混ぜない() {
+        // 80 桁でも説明が 2 行へ折り返す。折り返しをラベルへ継ぐと、狭幅では
+        // セル単位で割れた語（`1M co` + `ntext`）が入って壊れる
+        let wide = detect_choice_list(&rows(MODEL_80_WRAPPED)).expect("80 桁で検知される");
+        let labels: Vec<&str> = wide.options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Default (recommended)",
+                "Opus (1M context)",
+                "Fable",
+                "Sonnet ✔",
+                "Haiku",
+                "Opus 4.6 (1M)",
+            ],
+            "説明列がラベルに混ざっている"
+        );
+        assert!(
+            wide.options.iter().all(|o| !o.label_truncated),
+            "80 桁では切り詰められない"
+        );
+        // 狭いほうも「壊れた語」を持たない
+        let narrow = detect_choice_list(&rows(MODEL_25_CURSOR)).expect("検知される");
+        for o in &narrow.options {
+            assert!(
+                !o.label.contains("1M co") && !o.label.contains("capab"),
+                "説明列の破片がラベルに残っている: {:?}",
+                o.label
+            );
+        }
+        // 説明が 1 行に収まる選択肢（折り返しの証拠を出せない）にも同じ列を当てる
+        assert_eq!(
+            detect_choice_list(&rows(MODEL_SELECT))
+                .expect("検知される")
+                .options[2]
+                .label,
+            "Fable ✔                Fable 5 · Most capable for your hardest tasks",
+            "折り返しが 1 つも無い画面では列を決められないので #748 のまま"
+        );
+    }
+
+    #[test]
+    fn issue1143_画面の上が切られていても2列レイアウトなら読める() {
+        // `worker_status` の `recent_output` は末尾 30 行に丸められる（`tail_join`）。
+        // 25 桁の `/model` では箱の上端（罫線）が画面の 3 行目にあるので窓に入らない。
+        // 実採取（25 桁 × 44 行）の末尾 30 行をそのまま材料にする
+        let full = rows(MODEL_25_NO_CURSOR);
+        let tail: Vec<&str> = full[full.len() - 30..].to_vec();
+        assert!(
+            !tail.iter().any(|l| is_rule_line(l)),
+            "この検証の前提は「窓に罫線が無い」こと"
+        );
+        let list = detect_choice_list(&tail).expect("末尾 30 行だけでも検知される");
+        assert!(list.numbered);
+        assert_eq!(list.cursor_row, None);
+        assert_eq!(
+            list.options
+                .iter()
+                .map(|o| (o.number, o.label.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(1), "Defaul…".to_string()),
+                (Some(2), "Opus (…".to_string()),
+            ],
+            "窓に入っている選択肢だけを組む"
+        );
+        assert!(list.options.iter().all(|o| o.label_truncated));
+    }
+
+    #[test]
+    fn issue1143_カーソルなし経路は本文の箇条書きを拾わない() {
+        // 罫線の無い番号つき並び（応答本文・シェルで開いた Markdown）は
+        // 入力欄が見えていなくてもダイアログではない
+        let plain = [
+            "  手順は次のとおりです。",
+            "",
+            "  1. 依存を入れる",
+            "  2. ビルドする",
+            "  3. テストを走らせる",
+        ];
+        assert!(
+            detect_choice_list(&plain).is_none(),
+            "罫線の無い箇条書きをダイアログと誤認した"
+        );
+        // 番号が連番でない（本文の引用など）
+        let gaps = [
+            "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔",
+            "  1. 最初の項目",
+            "  7. 飛んだ項目",
+        ];
+        assert!(
+            detect_choice_list(&gaps).is_none(),
+            "番号が 1 ずつ増えない並びを一覧と誤認した"
+        );
+        // 折り返しつきの箇条書き（罫線が窓の外に落ちた形を模す）。
+        // 続きの行は在るが、選択肢の行に「2 桁以上の空白の切れ目」が無いので
+        // 2 列レイアウトの証拠にならない = 採らない
+        let wrapped_prose = [
+            "  1. 依存を入れる。これは長くて",
+            "     次の行へ折り返す説明",
+            "  2. ビルドする。こちらも長くて",
+            "     折り返す",
+        ];
+        assert!(
+            detect_choice_list(&wrapped_prose).is_none(),
+            "折り返しただけの本文の箇条書きを一覧と誤認した"
+        );
+        // 一覧の後ろに本文が続く = 画面が一覧の途中で尽きていない
+        let trailing = [
+            "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔",
+            "  1. 最初の項目",
+            "  2. 次の項目",
+            "以上が手順です。",
+        ];
+        assert!(
+            detect_choice_list(&trailing).is_none(),
+            "一覧の後ろに本文がある画面をダイアログと誤認した"
+        );
+    }
+
+    #[test]
+    fn issue1143_入力欄が見えているなら従来どおりカーソルを起点にする() {
+        // 経路 3 は「カーソルが 1 つも無い」ときだけ。空の入力欄が見えている
+        // 画面（#577 の本文の箇条書き）は今までどおり棄却する
+        assert!(detect_choice_list(&rows(QUESTION_IN_BODY)).is_none());
+    }
+
+    #[test]
+    fn issue1143_列の切れ目は行末の余白と区別する() {
+        // 行末がペイン幅ぶん空白で埋まっているだけの行を「2 列」と読むと
+        // ラベルが空になる
+        assert_eq!(column_gap("   ❯ 1. Yes           "), None);
+        assert_eq!(column_gap("     1. Defaul…  Opus"), Some(17));
+        assert_eq!(column_gap("     2. 番号なしの行"), None);
+        assert_eq!(column_gap("   説明列を持たない本文  つづき"), None);
     }
 
     #[test]

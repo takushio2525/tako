@@ -1596,8 +1596,12 @@ pub fn tools() -> Vec<Value> {
                 ペインのシェルへ tako_send_input すれば文脈ごと復旧できる（自動 resume はしない）。\
                 #748: 選択肢ダイアログ（permission だけでなく usage limit の対処選択・モデル選択・\
                 plan 確認・AskUserQuestion・一覧選択も）が画面にあるときは status が waiting になり、\
-                応答の choice_dialog に構造（kind / title / options[number,label,highlighted] / numbered / \
-                recommended_action）が入る。events には choice_dialog（dialog_kind つき）が積まれ、\
+                応答の choice_dialog に構造（kind / title / options[number,label,highlighted,label_truncated] / \
+                numbered / cursor_visible / labels_truncated / recommended_action）が入る。\
+                #1143: 狭いペインでは cursor_visible=false（ダイアログがペインより高く選択カーソルが画面外）／\
+                labels_truncated=true（ラベルが `…` で打ち切られ元の文字列が画面に残っていない）になる。\
+                この画面では**必ず番号で** respond すること（ラベル指定は拒否される）。\
+                events には choice_dialog（dialog_kind つき）が積まれ、\
                 このとき question は出さない（ダイアログ待ちは本文への返信では解けない）。\
                 kind が trust / bypass のものは tako 自身が承諾するので触らないこと（auto_accepted: true）。\
                 応答は tako_orchestrator_respond（choice 省略で下見できる）。",
@@ -1866,6 +1870,11 @@ pub fn tools() -> Vec<Value> {
                 **choice を省略すると送信せず構造だけ返す**（下見。選択肢一覧・現在のハイライト・番号キーの可否）。\
                 ダイアログが画面に存在しない場合はエラー（誤爆防止）。\
                 番号つきダイアログは番号キーだけで確定し、番号なしダイアログは矢印移動 + ラベル一致検証 + Enter で応答する。\
+                #1143: 下見の結果に labels_truncated=true が付いていたら、ラベルは TUI 自身に `…` で\
+                打ち切られていて元の文字列が画面に残っていない（狭いペインの /model 等）。\
+                この画面では**番号でのみ**確定できる（ラベル指定はエラーになる。誤選択の確定を防ぐため）。\
+                cursor_visible=false はダイアログがペインより高く選択カーソルが画面外にあることを表す\
+                （highlighted も null になるが、番号キーでの確定は効く）。\
                 応答内容は persist.log に監査記録される。\
                 危険なコマンド（rm -rf / 本番 DB 操作等）への承認、および課金・モデル変更を伴う選択肢はユーザーに確認すること。",
             "inputSchema": {
@@ -1874,7 +1883,7 @@ pub fn tools() -> Vec<Value> {
                     "pane_id": { "type": "integer", "description": "対象の worker ペイン ID" },
                     "choice": {
                         "type": "string",
-                        "description": "選択肢: 番号（画面の番号 or 1 始まりの順番）／ラベルの部分一致（大小無視・複数一致はエラー）／'yes'/'allow'／'no'/'deny'。省略すると送信せず構造だけ返す",
+                        "description": "選択肢: 番号（画面の番号 or 1 始まりの順番）／ラベルの部分一致（大小無視・複数一致はエラー。#1143: 切り詰められたラベルには使えない）／'yes'/'allow'／'no'/'deny'。省略すると送信せず構造だけ返す",
                     },
                 },
                 "required": ["pane_id"],

@@ -3129,6 +3129,53 @@ Running 1 shell command...\n\
     }
 
     #[test]
+    fn issue1143_狭いモデルセレクタでもwatchがdialog_waitingを返す() {
+        // 実採取（claude 2.1.258 / 25 桁 × 40 行）。ダイアログがペインより高いので
+        // 選択カーソルもキー案内も画面に無く、ラベルは `…` で切り詰められている。
+        // 修正前は choice_dialog を組めず WORKER_IDLE として通知していた（#1143）
+        let narrow = r#"▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Select model
+   Switch between
+   Claude models. Your
+   pick becomes the
+   default for new
+   sessions.
+
+     1. Defaul…  Opus
+                 5
+                 with
+                 1M co
+                 ntext
+     2. Opus (…  Opus
+                 5
+                 with
+                 1M co
+                 ntext ↓"#;
+        let mut script = ExecScript::new(vec![
+            status("idle", narrow, "agents"),
+            status("idle", narrow, "agents"),
+            status("idle", narrow, "agents"),
+        ]);
+        let outcome = run_wait(&mut script, &watch_opts(7, None));
+        let WatchOutcome::ChoiceWaiting { choice_dialog } = outcome else {
+            panic!("ChoiceWaiting を返す（修正前は Idle）: {outcome:?}");
+        };
+        assert_eq!(choice_dialog["kind"], "select");
+        assert_eq!(choice_dialog["numbered"], true);
+        assert_eq!(choice_dialog["recommended_action"], "respond");
+        // カーソルが画面外なのでハイライトは持たない（でっち上げない）
+        assert_eq!(choice_dialog["cursor_visible"], false);
+        assert!(choice_dialog["highlighted"].is_null());
+        // master が「ラベルでは選べない」と分かる
+        assert_eq!(choice_dialog["labels_truncated"], true);
+        let options = choice_dialog["options"].as_array().unwrap();
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0]["number"], 1);
+        assert_eq!(options[0]["label"], "Defaul…");
+        assert_eq!(options[0]["label_truncated"], true);
+    }
+
+    #[test]
     fn issue748_自動承諾するダイアログはdialog_waitingにしない() {
         // trust / bypass は tako が承諾するので停止通知しない（待てば消える）。
         // 誤って ChoiceWaiting にすると spawn 直後の信頼ダイアログで watch が

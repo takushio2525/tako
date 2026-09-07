@@ -4007,11 +4007,35 @@ fn orchestrator_watch(
                     } else {
                         ""
                     };
-                    println!("  {number}. {label}{mark}");
+                    // #1143: ラベルが画面上で打ち切られている（元の文字列は残っていない）
+                    let cut = if opt.get("label_truncated").and_then(|v| v.as_bool()) == Some(true)
+                    {
+                        " [切り詰め]"
+                    } else {
+                        ""
+                    };
+                    println!("  {number}. {label}{cut}{mark}");
                 }
             }
             if choice_dialog.get("numbered").and_then(|v| v.as_bool()) == Some(false) {
                 println!("  note: 番号キーは無反応なダイアログ（tako が矢印移動で応答する）");
+            }
+            // #1143: 狭いペインではカーソルもラベルの全文も画面に残らない
+            if choice_dialog
+                .get("cursor_visible")
+                .and_then(|v| v.as_bool())
+                == Some(false)
+            {
+                println!(
+                    "  note: ダイアログがペインより高く選択カーソルが画面外（番号で応答する）"
+                );
+            }
+            if choice_dialog
+                .get("labels_truncated")
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
+                println!("  note: ラベルが切り詰められている（respond はラベルではなく番号で）");
             }
             println!(
                 "  action: {}",
