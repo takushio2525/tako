@@ -22,6 +22,9 @@ pub use agent::WorkerAgent;
 /// agent CLI の実在検査と分類済みの失敗（#983）
 pub mod agent_cli;
 
+/// system prompt から外に出した手順書（#1154）
+pub mod guide;
+
 /// バイナリ埋め込みのデフォルト system prompt（master 用）
 pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("default_system_prompt.md");
 
@@ -1326,6 +1329,15 @@ impl Profile {
     /// そうでなければ DEFAULT_SYSTEM_PROMPT をブロック分割し、prompt_blocks と
     /// worker_model_policy に基づいて合成する。
     pub fn build_system_prompt(&self, profile_name: &str) -> String {
+        if let Some(content) = self.custom_system_prompt_text() {
+            return content;
+        }
+        self.build_from_template(DEFAULT_SYSTEM_PROMPT, profile_name)
+    }
+
+    /// プロファイルがカスタム prompt を指しているならその本文（ブロック制御はスキップ）。
+    /// `system_prompt` フィールド → カスタム `master-system.md` の順に見る
+    fn custom_system_prompt_text(&self) -> Option<String> {
         // system_prompt フィールドが指定されていればファイルを丸ごと返す（既存互換）
         if let Some(ref custom) = self.system_prompt {
             let expanded = expand_tilde(custom);
@@ -1333,39 +1345,83 @@ impl Profile {
             if p.is_file() {
                 if let Ok(content) = std::fs::read_to_string(&p) {
                     // ユーザーのカスタム prompt もプレースホルダを書けば注入される（#516）
-                    return crate::platform::facts::render_current(&content);
+                    return Some(crate::platform::facts::render_current(&content));
                 }
             }
         }
         // カスタム master-system.md があればそれを使う（ブロック制御はスキップ）
-        if let Some(custom_path) = resolve_system_prompt_path() {
-            if let Ok(content) = std::fs::read_to_string(&custom_path) {
-                return crate::platform::facts::render_current(&content);
-            }
-        }
+        let custom_path = resolve_system_prompt_path()?;
+        let content = std::fs::read_to_string(&custom_path).ok()?;
+        Some(crate::platform::facts::render_current(&content))
+    }
 
-        self.build_from_template(DEFAULT_SYSTEM_PROMPT, profile_name)
+    /// prompt のプレースホルダを解決する（`{TAB_NAMING_CONVENTION}` / `{CTX_THRESHOLD}` /
+    /// `{{platform_notes}}`）。
+    ///
+    /// **master prompt / solo prompt / guide（#1154）の 3 経路が同じ 1 実装を通る**。
+    /// guide 側で解決を忘れると、master は自分の引き継ぎ閾値を `{CTX_THRESHOLD}%` と読む
+    pub fn render_prompt_placeholders(&self, text: &str) -> String {
+        let naming_convention = self.tab_naming_convention.as_deref().unwrap_or(
+            "Naming rule: describe the current activity concisely in the user's language.",
+        );
+        let out = text.replace("{TAB_NAMING_CONVENTION}", naming_convention);
+        // 引き継ぎ閾値の注入（#749）。実効値を prompt に焼くので、master は
+        // 自分の閾値を知るために毎回 tako_orchestrator_self を呼ばなくて済む
+        let out = out.replace(
+            "{CTX_THRESHOLD}",
+            &self.resolved_ctx_threshold().value.to_string(),
+        );
+        // プラットフォーム事実の注入（#516）。正本は 1 本に保ち、差分はここで入れる
+        crate::platform::facts::render_current(&out)
     }
 
     /// テンプレートテキストからブロック制御・identity / model-policy 注入を行って合成する
     pub fn build_from_template(&self, template: &str, profile_name: &str) -> String {
+        join_prompt_pieces(&self.build_prompt_pieces(template, profile_name, PromptMode::Master))
+    }
+
+    /// system prompt を組み立てる断片の列（Issue #1154）。
+    ///
+    /// `build_from_template` はこれを連結するだけなので、**予算の内訳（どの block が
+    /// 何バイトか）は生成とまったく同じ 1 実装から採れる**（別に数え直すと必ずずれる）。
+    /// プレースホルダは断片ごとに解決する（行をまたがないので全体解決と結果は同じ）
+    pub fn build_prompt_pieces(
+        &self,
+        template: &str,
+        profile_name: &str,
+        mode: PromptMode,
+    ) -> Vec<PromptPiece> {
         let blocks = parse_prompt_blocks(template);
         let pb = self.prompt_blocks.as_ref();
+        let mut out: Vec<PromptPiece> = Vec::new();
 
-        let mut result = String::new();
+        let mut push = |name: String, text: String| {
+            out.push(PromptPiece {
+                name,
+                text: self.render_prompt_placeholders(&text),
+            })
+        };
 
         if let Some(text) = pb.and_then(|b| b.prepend.as_ref()) {
-            result.push_str(&resolve_text_or_file(text));
-            result.push_str("\n\n");
+            push(
+                piece_name("prepend", text),
+                format!("{}\n\n", resolve_text_or_file(text)),
+            );
         }
 
-        let mut identity_injected = false;
+        // solo は identity を model-policy ブロックの位置で出すので注入しない
+        let mut identity_injected = mode == PromptMode::Solo;
 
         for (name, content) in &blocks {
             // identity ブロックは disable 不可: role ブロックの直後に注入する
             if !identity_injected && name != "role" {
-                result.push_str(&self.generate_identity_section(profile_name, &blocks, pb));
-                result.push_str("\n\n");
+                push(
+                    "identity".into(),
+                    format!(
+                        "{}\n\n",
+                        self.generate_identity_section(profile_name, &blocks, pb)
+                    ),
+                );
                 identity_injected = true;
             }
 
@@ -1376,46 +1432,65 @@ impl Profile {
             }
 
             if name == "model-policy" {
-                result.push_str(&self.generate_model_policy_section());
-                result.push('\n');
+                let section = match mode {
+                    PromptMode::Master => self.generate_model_policy_section(),
+                    PromptMode::Solo => self.generate_solo_model_section(profile_name),
+                };
+                push(name.clone(), format!("{section}\n"));
                 continue;
             }
 
             if let Some(override_text) = pb.and_then(|b| b.override_blocks.get(name.as_str())) {
-                result.push_str(&resolve_text_or_file(override_text));
-                result.push('\n');
+                push(
+                    piece_name(name, override_text),
+                    format!("{}\n", resolve_text_or_file(override_text)),
+                );
                 continue;
             }
 
-            result.push_str(content);
-            result.push('\n');
+            push(name.clone(), format!("{content}\n"));
+
+            // #1154 の A/B: 立てると手順書の本文を prompt へ差し戻す（変更前の量へ戻る）
+            if mode == PromptMode::Master && tako_core::context_budget::legacy_1154() {
+                for g in guide::restored_at_block(name) {
+                    push(format!("guide:{}", g.topic), format!("\n{}\n", g.body));
+                }
+            }
         }
 
         // ブロックが role のみ or 空の場合のフォールバック
         if !identity_injected {
-            result.push_str(&self.generate_identity_section(profile_name, &blocks, pb));
-            result.push('\n');
+            push(
+                "identity".into(),
+                format!(
+                    "{}\n",
+                    self.generate_identity_section(profile_name, &blocks, pb)
+                ),
+            );
         }
 
         if let Some(text) = pb.and_then(|b| b.append.as_ref()) {
-            result.push_str(&resolve_text_or_file(text));
-            result.push('\n');
+            push(
+                piece_name("append", text),
+                format!("{}\n", resolve_text_or_file(text)),
+            );
         }
 
-        let naming_convention = self.tab_naming_convention.as_deref().unwrap_or(
-            "Naming rule: describe the current activity concisely in the user's language.",
-        );
-        let result = result.replace("{TAB_NAMING_CONVENTION}", naming_convention);
-        // 引き継ぎ閾値の注入（#749）。実効値を prompt に焼くので、master は
-        // 自分の閾値を知るために毎回 tako_orchestrator_self を呼ばなくて済む
-        let result = result.replace(
-            "{CTX_THRESHOLD}",
-            &self.resolved_ctx_threshold().value.to_string(),
-        );
-        // プラットフォーム事実の注入（#516）。正本は 1 本に保ち、差分はここで入れる
-        let result = crate::platform::facts::render_current(&result);
+        out
+    }
 
-        result.trim_end().to_string()
+    /// プロファイルが実際に master へ渡す system prompt の断片（予算の内訳。#1154）。
+    ///
+    /// `system_prompt` / カスタム `master-system.md` を指定しているプロファイルは
+    /// ファイルを丸ごと使うので、内訳もその 1 本になる
+    pub fn system_prompt_pieces(&self, profile_name: &str) -> Vec<PromptPiece> {
+        if let Some(text) = self.custom_system_prompt_text() {
+            return vec![PromptPiece {
+                name: "custom system prompt".into(),
+                text,
+            }];
+        }
+        self.build_prompt_pieces(DEFAULT_SYSTEM_PROMPT, profile_name, PromptMode::Master)
     }
 
     /// worker_agent / worker_agents 設定に基づいて「利用可能な worker エージェント」の
@@ -1672,60 +1747,17 @@ impl Profile {
         )
     }
 
-    /// solo 用の system prompt を合成する
+    /// solo 用の system prompt を合成する。
+    ///
+    /// 断片への分解・プレースホルダ解決・identity の出し方は master と同じ 1 実装を通る
+    /// （違いは `PromptMode` だけ。solo は identity を model-policy の位置で出す。#1154）
     pub fn build_solo_system_prompt(&self, profile_name: &str) -> String {
-        let blocks = parse_prompt_blocks(SOLO_SYSTEM_PROMPT);
-        let pb = self.prompt_blocks.as_ref();
+        join_prompt_pieces(&self.solo_system_prompt_pieces(profile_name))
+    }
 
-        let mut result = String::new();
-
-        if let Some(text) = pb.and_then(|b| b.prepend.as_ref()) {
-            result.push_str(&resolve_text_or_file(text));
-            result.push_str("\n\n");
-        }
-
-        for (name, content) in &blocks {
-            if let Some(b) = pb {
-                if b.disable.iter().any(|d| d == name) {
-                    continue;
-                }
-            }
-
-            if name == "model-policy" {
-                result.push_str(&self.generate_solo_model_section(profile_name));
-                result.push('\n');
-                continue;
-            }
-
-            if let Some(override_text) = pb.and_then(|b| b.override_blocks.get(name.as_str())) {
-                result.push_str(&resolve_text_or_file(override_text));
-                result.push('\n');
-                continue;
-            }
-
-            result.push_str(content);
-            result.push('\n');
-        }
-
-        if let Some(text) = pb.and_then(|b| b.append.as_ref()) {
-            result.push_str(&resolve_text_or_file(text));
-            result.push('\n');
-        }
-
-        let naming_convention = self.tab_naming_convention.as_deref().unwrap_or(
-            "Naming rule: describe the current activity concisely in the user's language.",
-        );
-        let result = result.replace("{TAB_NAMING_CONVENTION}", naming_convention);
-        // 引き継ぎ閾値の注入（#749。solo は handoff を持たないが、カスタム prompt /
-        // prompt_blocks が同じプレースホルダを使えるよう master と同じ置換を通す）
-        let result = result.replace(
-            "{CTX_THRESHOLD}",
-            &self.resolved_ctx_threshold().value.to_string(),
-        );
-        // プラットフォーム事実の注入（#516）
-        let result = crate::platform::facts::render_current(&result);
-
-        result.trim_end().to_string()
+    /// solo の system prompt の断片（予算の内訳。#1154）
+    pub fn solo_system_prompt_pieces(&self, profile_name: &str) -> Vec<PromptPiece> {
+        self.build_prompt_pieces(SOLO_SYSTEM_PROMPT, profile_name, PromptMode::Solo)
     }
 
     /// solo 用のモデル情報セクションを生成する
@@ -2048,6 +2080,61 @@ pub fn one_m_model_warning(model: &str, source: &str) -> Option<String> {
     Some(format!(
         "⚠ {source} のモデル '{model}' は 1M コンテキスト版のため、Pro プランでは起動できない可能性があります（Max / API プラン向け）。\n  起動に失敗する場合は `tako orchestrator profiles set <プロファイル名> --clear-model` で解除してください"
     ))
+}
+
+// --- system prompt の組み立て（Issue #1154）---
+//
+// 予算の内訳を「生成とは別に数え直す」実装にすると必ずずれるので、
+// 組み立てを断片の列にして、連結したものが prompt・断片のバイト数が内訳になる形にした
+
+/// 組み立ての対象（identity の出し方と model-policy の中身が違う）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptMode {
+    /// `tako master`
+    Master,
+    /// `tako solo`（identity は model-policy ブロックの位置で出る）
+    Solo,
+}
+
+/// system prompt を組み立てる断片 1 個
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptPiece {
+    /// 内訳の見出し（ブロック名 / `prepend` / `append` / `identity` /
+    /// `guide:<topic>`。`~/` 指定で外部ファイルを読んだ断片はファイル名を添える）
+    pub name: String,
+    /// プレースホルダ解決済みの本文（末尾の改行まで含む）
+    pub text: String,
+}
+
+impl PromptPiece {
+    pub fn bytes(&self) -> usize {
+        self.text.len()
+    }
+}
+
+/// 断片を連結して system prompt にする（**末尾の空白の落とし方まで従来と同じ**）
+pub fn join_prompt_pieces(pieces: &[PromptPiece]) -> String {
+    let mut s = String::new();
+    for p in pieces {
+        s.push_str(&p.text);
+    }
+    s.trim_end().to_string()
+}
+
+/// 内訳の見出し。`~/` 指定で外部ファイルを読んでいるならファイル名を添える
+/// （`append (local-rules.md)` のように、どの追記が重いのかが `proposals` で分かる。
+/// **フルパスは出さない** = 応答に個人のホームパスを混ぜない。#927）
+fn piece_name(base: &str, source: &str) -> String {
+    if !source.starts_with("~/") {
+        return base.to_string();
+    }
+    match std::path::Path::new(source)
+        .file_name()
+        .and_then(|n| n.to_str())
+    {
+        Some(name) => format!("{base} ({name})"),
+        None => base.to_string(),
+    }
 }
 
 /// `<!-- block: name -->` マーカーで区切られたブロックをパースする
@@ -3382,23 +3469,39 @@ prompt_blocks:
         assert!(prompt.contains("bugfix-rooted"));
     }
 
+    /// master が到達できる本文の全体（system prompt + 手順書。#1154）。
+    ///
+    /// 手順の**全文**が在ることを確かめるテストはこちらを見る。prompt に
+    /// **インラインで残っている**ことを確かめたいものだけ prompt を直接見る
+    fn master_reachable_text(p: &Profile, profile_name: &str) -> String {
+        let mut s = p.build_system_prompt(profile_name);
+        for g in guide::GUIDES {
+            s.push('\n');
+            s.push_str(&p.render_prompt_placeholders(g.body));
+        }
+        s
+    }
+
     #[test]
     fn project_resolution_gate_in_default_prompt() {
         let p = Profile::default();
         let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "test");
+        // #1154: 5 段の骨格・Step 0 の道具・分割の規則は prompt にインラインで残す
+        assert!(prompt.contains("five steps"));
+        assert!(prompt.contains("tako_orchestrator_projects"));
+        assert!(prompt.contains("one worker per deliverable"));
+        // 手順の全文は手順書（topic `task-intake`）側。引ける本文まで含めて検査する
+        let all = master_reachable_text(&p, "test");
         // Step 0 が存在し、Step 1 より前にあること
-        let step0_pos = prompt.find("Step 0").expect("Step 0 が存在する");
-        let step1_pos = prompt.find("Step 1").expect("Step 1 が存在する");
+        let step0_pos = all.find("Step 0").expect("Step 0 が存在する");
+        let step1_pos = all.find("Step 1").expect("Step 1 が存在する");
         assert!(step0_pos < step1_pos, "Step 0 は Step 1 より前");
         // 順序制約の主要キーワードが含まれること
-        assert!(prompt.contains("Resolve target projects"));
-        assert!(prompt.contains("tako_orchestrator_projects"));
-        assert!(prompt.contains("high-confidence match"));
-        assert!(prompt.contains("Zero matches"));
-        // ステップ数が five に更新されていること
-        assert!(prompt.contains("five steps"));
+        assert!(all.contains("Resolve target projects"));
+        assert!(all.contains("high-confidence match"));
+        assert!(all.contains("Zero matches"));
         // Step 4 にプロジェクト key 明記の指示があること
-        assert!(prompt.contains("Step 0 resolved"));
+        assert!(all.contains("Step 0 resolved"));
     }
 
     #[test]
@@ -3411,8 +3514,9 @@ prompt_blocks:
             ..Default::default()
         };
         let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "test");
-        assert!(prompt.contains("Step 0"));
-        assert!(prompt.contains("Resolve target projects"));
+        // append を足しても intake の骨格が消えないこと（#1154 で骨格は要約側に在る）
+        assert!(prompt.contains("five steps"));
+        assert!(prompt.contains("Task Intake"));
         assert!(prompt.ends_with("CUSTOM_FOOTER"));
     }
 
@@ -4756,7 +4860,8 @@ worker_agents:
         let master = p.build_system_prompt("default");
         assert!(!master.contains("{CTX_THRESHOLD}"), "置換漏れ");
         assert!(master.contains("**53% context usage**"), "実効値が焼かれる");
-        // 自動発動の規範（ユーザー許可不要 / 区切りの良いタイミング / 事前に最新化）
+        // 自動発動の規範（ユーザー許可不要 / 区切りの良いタイミング）は
+        // #1154 でも prompt にインラインで残す。閾値を跨いだ瞬間に必要になるので
         assert!(
             master.contains("Do not ask the user for permission"),
             "許可不要の規範がある"
@@ -4765,17 +4870,20 @@ worker_agents:
             master.contains("next clean break"),
             "区切りの良いタイミングの規範がある"
         );
+        // 引き継ぎの書き方の全文は手順書（topic `handoff`）側。閾値の実効値も解決される
+        let all = master_reachable_text(&p, "default");
+        assert!(!all.contains("{CTX_THRESHOLD}"), "手順書側の置換漏れ");
         assert!(
-            master.contains("Refresh the handoff first"),
+            all.contains("Refresh the handoff first"),
             "handoff 最新化が前提条件だと書いてある"
         );
         // #915: プロジェクト単位の置き場と運用メモの役割分担が書いてある
         assert!(
-            master.contains("handoff/projects/<project-key>.md"),
+            all.contains("handoff/projects/<project-key>.md"),
             "プロジェクト単位の置き場が書いてある"
         );
         assert!(
-            master.contains("only the projects you own"),
+            all.contains("only the projects you own"),
             "後任へ渡るのは管轄分だけだと書いてある"
         );
         // solo にも未置換のプレースホルダを残さない
@@ -4788,7 +4896,9 @@ worker_agents:
     #[test]
     fn プロンプトの引き継ぎ規範が新書式の見出しを指している() {
         use tako_core::handoff as ho;
-        let master = Profile::default().build_system_prompt("default");
+        // #1154: 引き継ぎの書式は手順書（topic `handoff`）側に在る
+        let p = Profile::default();
+        let master = master_reachable_text(&p, "default");
         for heading in [
             ho::KNOWLEDGE_HEADING_JA,
             ho::KNOWLEDGE_HEADING_EN,

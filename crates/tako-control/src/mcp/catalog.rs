@@ -1455,6 +1455,23 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_orchestrator_guide",
+            "description": "master の手順書を引く（#1154）。system prompt には「いつ引くか」だけを置き、\
+                手順の全文（monitoring のイベント別対処表・acceptance の手順・worker prompt テンプレート・\
+                引き継ぎの書き方など）はここから取得する。長寿命セッションの起動時固定費を\
+                減らすための仕組みで、返る本文は prompt から移した原文そのまま。\
+                topic を省略すると引ける topic をサイズ付きで一覧する。\
+                `{CTX_THRESHOLD}` などのプレースホルダは prompt と同じ解決を通してから返る",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "topic": { "type": "string", "description": "引く topic（省略時は一覧。task-intake / worker-prompt / spawning / monitoring / acceptance / lifecycle / handoff / tools / quality-ops / behavior）" },
+                    "profile": { "type": "string", "description": "プレースホルダを解決するプロファイル（省略時は呼び出し元の role から解決）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_orchestrator_layout",
             "description": "worker spawn のレイアウト設定を取得・変更する（config.yaml の spawn_layout）。\
                 全パラメータ省略で現在値の取得、いずれか指定でその項目を更新して結果を返す。\

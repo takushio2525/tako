@@ -37,6 +37,8 @@
   別ファイルへ出し、規約からは**バックティック参照**で案内する（`@import` にはしない）
 - `@import` の合計は **40 KB 以内**
 - 引き継ぎの運用メモは 80 行以内 / グローバル指示ファイルは 24 KB 以内
+- master / solo の **system prompt は 24 KB 以内**。手順の詳細は
+  `tako orchestrator guide <topic>` で必要なときだけ引く形にし、prompt には「いつ引くか」を残す
 
 ### 機械強制
 

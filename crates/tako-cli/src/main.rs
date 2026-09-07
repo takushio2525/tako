@@ -1538,6 +1538,18 @@ enum OrchestratorCommand {
     /// アカウント管理（accounts.yaml の一覧 / 表示 / 追加 / 削除。#504 / #548）
     #[command(subcommand)]
     Accounts(AccountsCommand),
+    /// master の手順書を引く（#1154。topic 省略で一覧）
+    Guide {
+        /// 引く topic（省略時は一覧）
+        #[arg(value_name = "TOPIC")]
+        topic: Option<String>,
+        /// プレースホルダを解決するプロファイル（省略時は呼び出し元の role → default）
+        #[arg(long)]
+        profile: Option<String>,
+        /// 生の JSON で出力する
+        #[arg(long)]
+        json: bool,
+    },
     /// worker spawn のレイアウト設定（全オプション省略で現在値を表示）
     Layout {
         /// 配置ポリシー: master-reserved（master の取り分を維持。既定）/ legacy（従来の右等分割）
@@ -3256,6 +3268,13 @@ fn cli_main() -> ExitCode {
         // GUI が動いていない環境（移植作業中の Windows がまさにそれ）でも引けることが本質
         Command::Platform(ref args) => platform_local(args),
         Command::ContextBudget(ref args) => context_budget_local(args),
+        // 手順書（#1154）はバイナリ埋め込みの静的な本文 + プロファイル読みだけなので
+        // ローカル処理。**GUI が動いていなくても引ける**ことが本質（platform と同じ扱い）
+        Command::Orchestrator(OrchestratorCommand::Guide {
+            ref topic,
+            ref profile,
+            json,
+        }) => orchestrator_guide_local(topic.as_deref(), profile.as_deref(), json),
         Command::AgentSupport(ref args) => agent_support_local(args),
         // GUI を必要としないローカル処理（platform と同じ扱い）。
         // 実体は dispatch と共通の tako_control::shell_integration::run
@@ -4935,6 +4954,52 @@ fn agent_support_local(args: &AgentSupportArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// master の手順書（#1154）。CLI・MCP とも `orchestrator::guide::json` の 1 本を通る。
+///
+/// プレースホルダを解決するプロファイルは、明示指定 → 呼び出し元の
+/// `TAKO_ORCHESTRATOR_ROLE` → `default` の順（master 自身が引くときは env で決まる）
+fn orchestrator_guide_local(
+    topic: Option<&str>,
+    profile: Option<&str>,
+    as_json: bool,
+) -> Result<(), String> {
+    tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
+    let profile_name = profile.map(str::to_string).unwrap_or_else(|| {
+        std::env::var("TAKO_ORCHESTRATOR_ROLE")
+            .ok()
+            .as_deref()
+            .and_then(tako_core::handoff::master_profile_of_any_role)
+            .unwrap_or(tako_core::handoff::DEFAULT_PROFILE)
+            .to_string()
+    });
+    let out = tako_control::orchestrator::guide::json(topic, &profile_name)?;
+    if as_json {
+        println!("{}", pretty_json(&out));
+        return Ok(());
+    }
+    match out["text"].as_str() {
+        // 全文はそのまま出す（移動前のブロックと diff が取れる形にしておく）
+        Some(text) => print!("{text}"),
+        None => {
+            let empty = vec![];
+            println!("引ける手順書: {} 件", out["count"].as_u64().unwrap_or(0));
+            for g in out["topics"].as_array().unwrap_or(&empty) {
+                println!(
+                    "  {:<16} {:>6} bytes / 約 {:>5} tok  {}",
+                    g["topic"].as_str().unwrap_or("?"),
+                    g["bytes"].as_u64().unwrap_or(0),
+                    g["est_tokens"].as_u64().unwrap_or(0),
+                    g["title"].as_str().unwrap_or("")
+                );
+            }
+            if let Some(hint) = out["hint"].as_str() {
+                println!("\n{hint}");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 起動時ロードの予算（#1139）。GUI も IPC も要らないローカル処理。
 /// **壊れた設定で GUI が起動しないときにも引ける**ことが本質なので IPC 非依存にする
 fn context_budget_local(args: &ContextBudgetArgs) -> Result<(), String> {
@@ -5000,12 +5065,26 @@ fn print_context_budget_check(out: &serde_json::Value) {
         // 既定値で済む引数は付けない（#322 の最簡形）
         println!("いま直す: tako context-budget fix");
     }
+    print_context_budget_proposals(out);
+}
+
+/// 自動で直せなかったぶんの案内。**system prompt は内訳（大きい順）まで出す**（#1154）:
+/// 「大きい」だけ言われても、どの block を分ければ効くのか分からない
+fn print_context_budget_proposals(out: &serde_json::Value) {
+    let empty = vec![];
     for p in out["proposals"].as_array().unwrap_or(&empty) {
         println!(
             "  提案 {}: {}",
             p["path"].as_str().unwrap_or("?"),
             p["next_step"].as_str().unwrap_or("")
         );
+        for piece in p["pieces"].as_array().unwrap_or(&empty).iter().take(5) {
+            println!(
+                "        {:<34} {:>7} bytes",
+                piece["name"].as_str().unwrap_or("?"),
+                piece["bytes"].as_u64().unwrap_or(0)
+            );
+        }
     }
 }
 
@@ -5047,13 +5126,7 @@ fn print_context_budget_fix(out: &serde_json::Value, dry_run: bool) {
         }
     }
     println!("変更したファイル: {}", out["changed"].as_u64().unwrap_or(0));
-    for p in out["proposals"].as_array().unwrap_or(&empty) {
-        println!(
-            "  提案 {}: {}",
-            p["path"].as_str().unwrap_or("?"),
-            p["next_step"].as_str().unwrap_or("")
-        );
-    }
+    print_context_budget_proposals(out);
 }
 
 fn platform_local(args: &PlatformArgs) -> Result<(), String> {
@@ -6971,6 +7044,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Platform(_) => unreachable!("platform は run() を通らない（ローカル処理）"),
         Command::ContextBudget(_) => {
             unreachable!("context-budget は run() を通らない（ローカル処理）")
+        }
+        Command::Orchestrator(OrchestratorCommand::Guide { .. }) => {
+            unreachable!("orchestrator guide は run() を通らない（ローカル処理）")
         }
         Command::AgentSupport(_) => {
             unreachable!("agent-support は run() を通らない（ローカル処理）")

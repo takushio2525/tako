@@ -2084,6 +2084,24 @@
     "name": "tako_orchestrator_accounts"
   },
   {
+    "description": "master の手順書を引く（#1154）。system prompt には「いつ引くか」だけを置き、手順の全文（monitoring のイベント別対処表・acceptance の手順・worker prompt テンプレート・引き継ぎの書き方など）はここから取得する。長寿命セッションの起動時固定費を減らすための仕組みで、返る本文は prompt から移した原文そのまま。topic を省略すると引ける topic をサイズ付きで一覧する。`{CTX_THRESHOLD}` などのプレースホルダは prompt と同じ解決を通してから返る",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "profile": {
+          "description": "プレースホルダを解決するプロファイル（省略時は呼び出し元の role から解決）",
+          "type": "string"
+        },
+        "topic": {
+          "description": "引く topic（省略時は一覧。task-intake / worker-prompt / spawning / monitoring / acceptance / lifecycle / handoff / tools / quality-ops / behavior）",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "tako_orchestrator_guide"
+  },
+  {
     "description": "worker spawn のレイアウト設定を取得・変更する（config.yaml の spawn_layout）。全パラメータ省略で現在値の取得、いずれか指定でその項目を更新して結果を返す。policy=master-reserved（既定）は spawn 元（master）の取り分を維持し、worker を右側の worker 領域内に配置する。legacy は従来の右等分割（worker が増えるほど全ペインが横に圧縮される）。master_ratio は master 側へ残す取り分（0.1〜0.9。既定 0.5 = 画面半分）。algorithm は worker 領域内の配置: grid（1 体=全面 → 2 体=上下 → 3〜4 体=十字四分割）/ spiral（縦横交互に半分ずつの渦巻き分割）。worker close 時は領域内だけがリフローされ、master とユーザーが自分で開いたペインの矩形は変わらない。min_worker_cols は worker ペイン 1 枚に保証する最小の桁数（既定 60。0 = 保証しない）。これを割る spawn は同じタブへ割らず、この master の worker が居る別のタブか新しいタブへ出る（spawn 応答の placement / placement_reason / pane_cols に載る）。狭いペインでは claude TUI がメッセージをハード折り返しするので、上限・ダイアログ・報告の読み取りが同時に壊れる（#1132）。",
     "inputSchema": {
       "additionalProperties": false,

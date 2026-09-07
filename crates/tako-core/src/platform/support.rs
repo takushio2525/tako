@@ -828,6 +828,17 @@ pub const MATRIX: &[Feature] = &[
         ),
     },
     Feature {
+        // #1154: master の手順書を引く。バイナリ埋め込みの本文 + プロファイル読みだけの
+        // ローカル処理で、パスは `PathBuf::join` のみ・プラットフォーム分岐が無い
+        key: "tako_orchestrator_guide",
+        macos: Support::Supported,
+        windows: Support::Supported,
+        windows_evidence: Evidence::UnitTest(
+            "guide の単体 6 本と番犬 prompt_guides.rs（本文は include_str! の静的データで、\
+             プレースホルダ解決は platform::facts が OS 差を吸収する）",
+        ),
+    },
+    Feature {
         key: "tako_orchestrator_handoff",
         macos: Support::Supported,
         windows: Support::Supported,

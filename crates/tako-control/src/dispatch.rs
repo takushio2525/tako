@@ -3771,6 +3771,25 @@ fn dispatch_inner(
         } => crate::platform::report(platform.as_deref(), status.as_deref(), known_limitations)
             .map_err(DispatchError::InvalidParams),
 
+        // master の手順書（#1154）。system prompt から外に出した手順の全文を返す。
+        // GUI も IPC 状態も要らないので、CLI（`tako orchestrator guide`）と MCP が
+        // 同じ `orchestrator::guide::json` の 1 本を通る
+        Request::OrchestratorGuide {
+            topic,
+            profile,
+            caller_role,
+        } => {
+            let profile_name = profile.unwrap_or_else(|| {
+                caller_role
+                    .as_deref()
+                    .and_then(tako_core::handoff::master_profile_of_any_role)
+                    .unwrap_or(tako_core::handoff::DEFAULT_PROFILE)
+                    .to_string()
+            });
+            crate::orchestrator::guide::json(topic.as_deref(), &profile_name)
+                .map_err(DispatchError::InvalidParams)
+        }
+
         // 起動時ロードの予算（#1139）。判定は tako_core::context_budget の純粋関数、
         // 集めるのは crate::context_budget。CLI・MCP とも同じ 1 本を通る
         Request::ContextBudget {

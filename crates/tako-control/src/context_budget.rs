@@ -24,6 +24,9 @@ pub struct Item {
     pub imported: bool,
     /// どのファイルから `@import` されたか
     pub imported_by: Option<String>,
+    /// 内訳（system prompt のときだけ入る。#1154）。
+    /// **生成と同じ 1 実装**（`Profile::build_prompt_pieces`）から採るので数え直さない
+    pub pieces: Vec<(String, usize)>,
 }
 
 /// ホームを `~` へ畳んだ表示用パス（個人情報を応答へ出さない。#927）。
@@ -154,6 +157,7 @@ fn walk_imports(start: &Path, out: &mut Vec<Item>, visited: &mut BTreeSet<PathBu
                 text: body,
                 imported: true,
                 imported_by: Some(from.clone()),
+                pieces: Vec::new(),
             });
             walk_imports(&p, out, visited);
         }
@@ -185,6 +189,7 @@ pub fn inventory(cwd: &Path, profile: Option<&str>) -> Vec<Item> {
                 text,
                 imported: false,
                 imported_by: None,
+                pieces: Vec::new(),
             });
             walk_imports(&g, &mut items, &mut visited);
         }
@@ -207,6 +212,7 @@ pub fn inventory(cwd: &Path, profile: Option<&str>) -> Vec<Item> {
             text,
             imported: false,
             imported_by: None,
+            pieces: Vec::new(),
         });
         walk_imports(&p, &mut items, &mut visited);
     }
@@ -221,11 +227,14 @@ pub fn inventory(cwd: &Path, profile: Option<&str>) -> Vec<Item> {
                 text,
                 imported: false,
                 imported_by: None,
+                pieces: Vec::new(),
             });
         }
     }
 
-    // 4) master / solo の system prompt（プロファイル別）
+    // 4) master / solo の system prompt（プロファイル別）。
+    // #1154: 本文と一緒に**内訳**（どの block / 追記が何バイトか）も採る。
+    // 組み立てと同じ 1 実装から採るので、超過したときに何を分ければいいかが即座に分かる
     let profile_name = profile.unwrap_or("default");
     for kind in [
         crate::orchestrator::ProfileKind::Master,
@@ -234,14 +243,21 @@ pub fn inventory(cwd: &Path, profile: Option<&str>) -> Vec<Item> {
         let Ok(p) = crate::orchestrator::load_profile_of(kind, profile_name) else {
             continue;
         };
-        let text = p.build_system_prompt(profile_name);
+        let pieces = match kind {
+            crate::orchestrator::ProfileKind::Master => p.system_prompt_pieces(profile_name),
+            crate::orchestrator::ProfileKind::Solo => p.solo_system_prompt_pieces(profile_name),
+        };
         items.push(Item {
             kind: ItemKind::SystemPrompt,
             label: format!("{} system prompt（{profile_name}）", kind.as_str()),
             path: None,
-            text,
+            text: crate::orchestrator::join_prompt_pieces(&pieces),
             imported: false,
             imported_by: None,
+            pieces: pieces
+                .iter()
+                .map(|piece| (piece.name.clone(), piece.bytes()))
+                .collect(),
         });
     }
 
@@ -255,6 +271,7 @@ pub fn inventory(cwd: &Path, profile: Option<&str>) -> Vec<Item> {
                 text,
                 imported: false,
                 imported_by: None,
+                pieces: Vec::new(),
             });
         }
     }
@@ -278,6 +295,9 @@ fn item_json(it: &Item) -> Value {
     if let Some(by) = &it.imported_by {
         o["imported_by"] = json!(by);
     }
+    if !it.pieces.is_empty() {
+        o["pieces"] = json!(pieces_json(&it.pieces));
+    }
     if let Some(e) = m.entries {
         o["entries"] = json!(e);
         o["work_days"] = json!(m.work_days.unwrap_or(0));
@@ -288,6 +308,17 @@ fn item_json(it: &Item) -> Value {
         o["violations"] = json!(vs.iter().map(violation_json).collect::<Vec<_>>());
     }
     o
+}
+
+/// 内訳（大きい順。**何を分ければ効くか**が先頭に来る）。
+/// 個人のホームパスは名前へ入れない（`piece_name` がファイル名だけを添える。#927）
+fn pieces_json(pieces: &[(String, usize)]) -> Vec<Value> {
+    let mut sorted: Vec<&(String, usize)> = pieces.iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    sorted
+        .iter()
+        .map(|(name, bytes)| json!({ "name": name, "bytes": bytes }))
+        .collect()
 }
 
 fn violation_json(v: &budget::Violation) -> Value {
@@ -328,7 +359,7 @@ pub fn report(cwd: &Path, profile: Option<&str>) -> Result<Value, String> {
                 if v.fixable {
                     fixable += 1;
                 } else {
-                    proposals.push(json!({
+                    let mut prop = json!({
                         "path": it.label,
                         "metric": v.metric.as_str(),
                         "actual": v.actual,
@@ -336,7 +367,13 @@ pub fn report(cwd: &Path, profile: Option<&str>) -> Result<Value, String> {
                         "next_step": v.note.text(),
                         "next_step_ja": v.note.ja(),
                         "next_step_en": v.note.en(),
-                    }));
+                    });
+                    // #1154: system prompt はどの block が何バイトかまで出す
+                    // （「大きい」だけ言われても何を分ければいいか分からない）
+                    if !it.pieces.is_empty() {
+                        prop["pieces"] = json!(pieces_json(&it.pieces));
+                    }
+                    proposals.push(prop);
                 }
             }
             item_json(it)
@@ -389,6 +426,7 @@ pub fn budget_json() -> Value {
         "active_context": { "max_lines": budget::ACTIVE_CONTEXT_MAX_LINES },
         "handoff_memo": { "max_lines": budget::HANDOFF_MEMO_MAX_LINES },
         "global_guide": { "max_bytes": budget::GLOBAL_GUIDE_MAX_BYTES },
+        "system_prompt": { "max_bytes": budget::SYSTEM_PROMPT_MAX_BYTES },
     })
 }
 
