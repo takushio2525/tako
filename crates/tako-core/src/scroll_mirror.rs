@@ -19,7 +19,7 @@ use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::term::{test::TermSize, Config, Term};
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 
-use crate::screen::{snapshot, ScreenLine};
+use crate::screen::{snapshot_opts, ScreenLine};
 use crate::scroll::ScrollTarget;
 use crate::theme::Theme;
 use crate::tmux::run_tmux;
@@ -187,7 +187,15 @@ pub fn parse_ansi_lines(raw: &[&str], cols: usize, theme: &Theme) -> Vec<ScreenL
             parser.advance(&mut term, b"\r\n");
         }
     }
-    snapshot(&term, theme).lines
+    // **カーソルを焼き込まない**（#1122）。ここでパースするのは tmux の
+    // 履歴（capture 出力）で、カーソルは在るとしてもライブ画面の側にある。
+    // `show_cursor = true` で撮ると、この使い捨て `Term` のカーソル位置
+    // （= 最後にパースした行の末尾）へ `bg = theme.cursor` が乗り、
+    // 器つきペインでスクロールバックしたユーザーの画面に**偽のカーソルの四角**が
+    // チャンクごとに 1 つ残る（`ScrollMirror::lines` は履歴チャンクを継ぎ足すので、
+    // 遡るほど増える）。実測では visual-test の `hidden` ラウンドが
+    // 「隠したのにカーソル色が 816 px 出る」で落ちていた
+    snapshot_opts(&term, theme, false, 0.0).lines
 }
 
 #[cfg(test)]
@@ -233,6 +241,30 @@ mod tests {
         assert!(lines[0].has_wide);
         // あ=col0(幅2), i=col2, う=col3(幅2)
         assert_eq!(&lines[0].cell_cols[..3], &[0, 2, 3]);
+    }
+
+    #[test]
+    fn 履歴行にカーソルを焼き込まない() {
+        // #1122: capture 由来の履歴行はライブ画面ではないので、カーソルの
+        // 四角（`bg = theme.cursor`）を持ってはならない。持つと器つきペインの
+        // スクロールバックにチャンクごとの偽カーソルが点々と残る
+        let th = theme();
+        let raw = vec!["hello", "world"];
+        let baked: Vec<(usize, std::ops::Range<usize>)> = parse_ansi_lines(&raw, 20, &th)
+            .iter()
+            .enumerate()
+            .flat_map(|(row, line)| {
+                line.runs
+                    .iter()
+                    .filter(|r| r.bg == Some(th.cursor))
+                    .map(move |r| (row, r.range.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            baked.is_empty(),
+            "履歴行にカーソル色が焼き込まれている: {baked:?}"
+        );
     }
 
     #[test]
