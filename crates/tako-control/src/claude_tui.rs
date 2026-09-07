@@ -96,6 +96,10 @@ pub struct ChoiceDialog {
     pub highlighted: Option<usize>,
     /// 番号キーで選べるか（false = `↑`/`↓` 移動 + Enter が必要）
     pub numbered: bool,
+    /// 選択カーソルが画面に描かれているか（#1143）。
+    /// **false = ダイアログがペインより高くてカーソル行が画面外**（`highlighted` も None）。
+    /// 番号キーでは確定できるので respond は動く
+    pub cursor_visible: bool,
 }
 
 impl ChoiceDialog {
@@ -108,10 +112,17 @@ impl ChoiceDialog {
             "highlighted": self.highlighted,
             "recommended_action": self.kind.recommended_action(),
             "auto_accepted": self.kind.auto_accepted(),
+            // #1143: 狭いペインでは選択カーソルが画面外へ出る（null = 描かれていない）
+            "cursor_visible": self.cursor_visible,
+            // #1143: 1 つでもラベルが `…` で切り詰められているか
+            // （true なら master は**番号で** respond する）
+            "labels_truncated": self.labels_truncated(),
             "options": self.options.iter().map(|o| json!({
                 "number": o.number,
                 "label": o.label,
                 "highlighted": o.highlighted,
+                // #1143: 元のラベルは画面に残っていない（ラベル一致で選ばない）
+                "label_truncated": o.label_truncated,
             })).collect::<Vec<_>>(),
         })
     }
@@ -119,6 +130,11 @@ impl ChoiceDialog {
     /// 選択肢のラベル一覧（エラーメッセージ・後方互換の `PermissionDialog` 用）
     pub fn labels(&self) -> Vec<String> {
         self.options.iter().map(|o| o.label.clone()).collect()
+    }
+
+    /// 1 つでもラベルが切り詰められているか（#1143）
+    pub fn labels_truncated(&self) -> bool {
+        self.options.iter().any(|o| o.label_truncated)
     }
 }
 
@@ -138,6 +154,7 @@ pub fn detect_choice_dialog(lines: &[String]) -> Option<ChoiceDialog> {
         options: list.options,
         highlighted: list.highlighted,
         numbered: list.numbered,
+        cursor_visible: list.cursor_row.is_some(),
     })
 }
 
@@ -2024,6 +2041,92 @@ Bash ツールで「touch /tmp/te439/approval-test.txt」を実行して
             assert_eq!(input_line(&lines), None, "{name}");
             assert_eq!(detect(&lines), ClaudeScreen::ChoiceDialog, "{name}");
         }
+    }
+
+    /// #1143 実採取（2026-09-06。claude 2.1.258 / 25 桁 × 40 行）。
+    /// ダイアログがペインより高いので選択カーソルもキー案内も画面に無く、
+    /// ラベルは claude 自身が `…` で切り詰めている
+    const MODEL_SELECT_NARROW: &str = r#"           k
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Select model
+   Switch between
+   Claude models. Your
+   pick becomes the
+   default for new
+   sessions. For
+   other/previous
+   model names,
+   specify with
+   --model.
+
+     1. Defaul…  Opus
+                 5
+                 with
+                 1M co
+                 ntext
+                 ·
+                 Best
+                 for
+                 every
+                 day,
+                 compl
+                 ex
+                 tasks
+     2. Opus (…  Opus
+                 5
+                 with
+                 1M co
+                 ntext
+                 ·
+                 Best
+                 for
+                 every
+                 day,
+                 compl
+                 ex
+                 tasks ↓"#;
+
+    #[test]
+    fn issue1143_狭いモデルセレクタを種別つきで検知して申告を載せる() {
+        let lines = screen(MODEL_SELECT_NARROW);
+        let dialog = detect_choice_dialog(&lines).expect("狭い /model が検知されない");
+        assert_eq!(dialog.kind, DialogKind::Select);
+        assert!(dialog.numbered, "番号キーで確定できる");
+        assert!(!dialog.cursor_visible, "カーソルは画面外");
+        assert_eq!(dialog.highlighted, None, "位置は分からない");
+        assert!(dialog.labels_truncated(), "ラベルが切り詰められている");
+        assert_eq!(dialog.labels(), vec!["Defaul…", "Opus (…"]);
+        // 入力欄は奪われている = プロンプトを貼ってはいけない（#577 の契約）
+        assert_eq!(input_line(&lines), None);
+        assert_eq!(detect(&lines), ClaudeScreen::ChoiceDialog);
+        // permission ではないので承認カードには出さない
+        assert!(detect_permission_dialog(&lines).is_none());
+    }
+
+    #[test]
+    fn issue1143_jsonは切り詰めとカーソル可視をmasterへ伝える() {
+        // CLI（watch / respond）と MCP（read_pane / worker_status）が同じ形を読む
+        let dialog = detect_choice_dialog(&screen(MODEL_SELECT_NARROW)).expect("検知される");
+        let json = dialog.to_json();
+        assert_eq!(json["cursor_visible"], serde_json::json!(false));
+        assert_eq!(json["labels_truncated"], serde_json::json!(true));
+        assert_eq!(json["highlighted"], serde_json::Value::Null);
+        let options = json["options"].as_array().expect("options");
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0]["number"], serde_json::json!(1));
+        assert_eq!(options[0]["label_truncated"], serde_json::json!(true));
+
+        // 従来画面では今までどおり（カーソルが見えていて切り詰めも無い）
+        let wide = detect_choice_dialog(&screen(MODEL_SELECT)).expect("検知される");
+        let wide_json = wide.to_json();
+        assert_eq!(wide_json["cursor_visible"], serde_json::json!(true));
+        assert_eq!(wide_json["labels_truncated"], serde_json::json!(false));
+        assert!(wide_json["options"]
+            .as_array()
+            .expect("options")
+            .iter()
+            .all(|o| o["label_truncated"] == serde_json::json!(false)));
     }
 
     #[test]

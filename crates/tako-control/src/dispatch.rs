@@ -9521,10 +9521,19 @@ pub fn respond_to_choice_dialog(
         let mut result = dialog.to_json();
         result["pane_id"] = json!(pane_id);
         result["responded"] = json!(false);
-        result["hint"] = json!(format!(
-            "応答するには choice に番号（1-{}）かラベルの一部を渡す",
-            dialog.options.len()
-        ));
+        result["hint"] = json!(if dialog.labels_truncated() {
+            // #1143: 画面上のラベルが `…` で打ち切られている = 一致で選べない
+            format!(
+                "応答するには choice に番号（1-{}）を渡す\
+                 （この画面はラベルが切り詰められているのでラベル指定は受け付けない）",
+                dialog.options.len()
+            )
+        } else {
+            format!(
+                "応答するには choice に番号（1-{}）かラベルの一部を渡す",
+                dialog.options.len()
+            )
+        });
         return Ok(result);
     };
 
@@ -9649,6 +9658,12 @@ const NAV_ATTEMPTS: u32 = 3;
 /// - 番号（画面に出ている番号を優先。番号なしダイアログでは 1-based の順番）
 /// - ラベルの部分一致（大小無視。複数一致は曖昧としてエラー）
 /// - `yes` / `allow` / `no` / `deny` のエイリアス（#319 の互換）
+///
+/// **切り詰められたラベル（`…`。#1143）はラベルでは確定できない**。狭いペインの
+/// `/model` セレクタのように TUI 自身がラベルを打ち切っている画面では、画面に
+/// 残っている文字列は選択肢の識別子ではない（`1. Defaul…` と `2. Opus (…` の
+/// どちらも「Opus 5 の 1M」でありうる）。一致したように見えても**別の選択肢を
+/// 確定してしまう**ので、番号での指定を要求する
 fn resolve_choice_index(
     dialog: &crate::claude_tui::ChoiceDialog,
     choice: &str,
@@ -9658,9 +9673,30 @@ fn resolve_choice_index(
             .options
             .iter()
             .enumerate()
-            .map(|(i, o)| format!("{}. {}", o.number.unwrap_or((i + 1) as u32), o.label))
+            .map(|(i, o)| {
+                let mark = if o.label_truncated {
+                    "…(切り詰め)"
+                } else {
+                    ""
+                };
+                format!("{}. {}{mark}", o.number.unwrap_or((i + 1) as u32), o.label)
+            })
             .collect::<Vec<_>>()
             .join(" / ")
+    };
+    // ラベル一致で当たった選択肢が切り詰められていたら確定しない（#1143）
+    let by_label = |i: usize| -> Result<usize, DispatchError> {
+        if dialog.options[i].label_truncated {
+            return Err(DispatchError::Operation(format!(
+                "選択肢 {} のラベルは画面上で切り詰められている（`{}`）ため、\
+                 ラベル指定では確定できない。番号（--choice {}）で指定する。選択肢: {}",
+                i + 1,
+                dialog.options[i].label,
+                dialog.options[i].number.unwrap_or((i + 1) as u32),
+                labels()
+            )));
+        }
+        Ok(i)
     };
     let lower = choice.trim().to_lowercase();
     if lower.is_empty() {
@@ -9698,7 +9734,7 @@ fn resolve_choice_index(
                 .iter()
                 .position(|o| o.label.to_lowercase().starts_with(needle))
             {
-                return Ok(i);
+                return by_label(i);
             }
         }
         return Err(DispatchError::Operation(format!(
@@ -9714,10 +9750,17 @@ fn resolve_choice_index(
         .filter(|(_, o)| o.label.to_lowercase().contains(&lower))
         .map(|(i, _)| i)
         .collect();
+    // 切り詰められたラベルがある画面では「一致しなかった」も確定的ではない
+    // （消えた部分に一致していたかもしれない）ので、番号を促す（#1143）
+    let truncated_note = if dialog.labels_truncated() {
+        "（この画面はラベルが切り詰められているので、ラベルでは確定できない。番号で指定する）"
+    } else {
+        ""
+    };
     match hits.len() {
-        1 => Ok(hits[0]),
+        1 => by_label(hits[0]),
         0 => Err(DispatchError::Operation(format!(
-            "「{choice}」に一致する選択肢が無い。選択肢: {}",
+            "「{choice}」に一致する選択肢が無い{truncated_note}。選択肢: {}",
             labels()
         ))),
         _ => Err(DispatchError::Operation(format!(
@@ -16857,6 +16900,91 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("複数の選択肢に一致"), "{err}");
+    }
+
+    /// #1143 実採取（claude 2.1.258 / 25 桁 × 40 行）。カーソルもキー案内も画面外で、
+    /// ラベルは claude 自身が `…` で切り詰めている
+    const MODEL_SELECT_NARROW_1143: &str = r#"           k
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Select model
+   Switch between
+   Claude models. Your
+   pick becomes the
+   default for new
+   sessions. For
+   other/previous
+   model names,
+   specify with
+   --model.
+
+     1. Defaul…  Opus
+                 5
+                 with
+                 1M co
+                 ntext
+                 ·
+                 Best
+                 for
+                 every
+                 day,
+                 compl
+                 ex
+                 tasks
+     2. Opus (…  Opus
+                 5
+                 with
+                 1M co
+                 ntext
+                 ·
+                 Best
+                 for
+                 every
+                 day,
+                 compl
+                 ex
+                 tasks ↓"#;
+
+    #[test]
+    fn issue1143_狭いモデルセレクタは番号で確定できる() {
+        let dialog = dialog_of(MODEL_SELECT_NARROW_1143);
+        assert!(dialog.numbered && !dialog.cursor_visible);
+        assert_eq!(resolve_choice_index(&dialog, "1").unwrap(), 0);
+        assert_eq!(resolve_choice_index(&dialog, "2").unwrap(), 1);
+        // 画面に出ていない番号は範囲外（見えていない選択肢を勝手に押さない）
+        let err = resolve_choice_index(&dialog, "4").unwrap_err().to_string();
+        assert!(err.contains("範囲外"), "{err}");
+    }
+
+    #[test]
+    fn issue1143_切り詰められたラベルはラベル指定で確定させない() {
+        // `Defaul…` の消えた部分に何が入っていたかは画面から分からない。
+        // 一致したように見えても別の選択肢（`2. Opus (…` = どちらも Opus 5 の 1M）を
+        // 確定しうるので、番号を要求する
+        let dialog = dialog_of(MODEL_SELECT_NARROW_1143);
+        let err = resolve_choice_index(&dialog, "defaul")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("切り詰め") && err.contains("--choice 1"),
+            "{err}"
+        );
+        // 不一致のときも「番号で指定する」と案内する（消えた部分に一致していたかも
+        // しれないので、無いと言い切らない）
+        let err = resolve_choice_index(&dialog, "recommended")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("番号で指定する"), "{err}");
+        // 一覧の表示にも切り詰めが出る（master がラベルを信用しないための手がかり）
+        assert!(err.contains("1. Defaul……(切り詰め)"), "{err}");
+    }
+
+    #[test]
+    fn issue1143_切り詰めの無い画面ではラベル指定が今までどおり効く() {
+        let dialog = dialog_of(PERMISSION_SCREEN_577);
+        assert!(!dialog.labels_truncated());
+        assert_eq!(resolve_choice_index(&dialog, "don't ask again").unwrap(), 1);
+        assert_eq!(resolve_choice_index(&dialog, "yes").unwrap(), 0);
     }
 
     #[test]
