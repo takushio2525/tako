@@ -25818,6 +25818,69 @@ mod self_test {
         }
     }
 
+    /// **#1173 の A/B の口**: 器（tmux）つきの visual-test が完走しなかった頃の
+    /// 待ち方へ戻す（#1162 の `TAKO_1162_LEGACY` と同じ役目）。
+    ///
+    /// `1` / `all` で全部、`subline,rows,chat-input,chat-g3,pin` の**カンマ区切りで
+    /// 段ごと**にも戻せる。段ごとに指定できるのは、`check` が 1 つ目の失敗で
+    /// プロセスごと止まるため（全部戻すと `subline` しか観測できない）
+    #[cfg(feature = "visual-test")]
+    fn legacy_1173(part: &str) -> bool {
+        let Ok(value) = std::env::var("TAKO_1173_LEGACY") else {
+            return false;
+        };
+        value == "1" || value == "all" || value.split(',').any(|p| p.trim() == part)
+    }
+
+    /// **ペインの行数を付け替えたあと、その内容が実際に塗られるまで面倒を見る**（#1173）。
+    ///
+    /// 行数を変える検査（カード帯 #703 等）は 2 段で遅れる。
+    ///
+    /// 1. **セッションの `resize` は描画の途中で起きる**（`render` がテキスト領域を
+    ///    測ってから `session.resize` する）ので、その回のフレームは resize **前**の
+    ///    画面を塗って終わる。以降は誰も汚さないので `PaneBody` のキャッシュ（#786）が
+    ///    そのまま再利用され、**27 行あるのに 20 行しか塗られていないフレーム**を
+    ///    測ることになる。だから状態が届いたら**汚して描き直す**
+    /// 2. 器（tmux）つきのペインはさらに「外側 PTY の resize → tmux サーバーの
+    ///    resize → 再描画 → PTY 経由で返る」の往復が乗る（tmux は伸ばすとき履歴から
+    ///    行を戻す = 実測済みなので、待てば必ず届く）
+    ///
+    /// 直接ペインは初回のポーリングで状態が成立するので、待ちは実質入らない
+    #[cfg(feature = "visual-test")]
+    async fn settle_inked_rows(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        label: &str,
+        want: usize,
+    ) -> Option<Duration> {
+        if legacy_1173("rows") {
+            return None;
+        }
+        let waited = wait_for_dispatch_state(
+            window,
+            cx,
+            label,
+            state_wait_budget(Duration::from_secs(10), machine_busy()),
+            Duration::from_millis(100),
+            move |app| {
+                let pane = app.focused_pane();
+                let theme = app.theme.clone();
+                app.terminals.get(&pane).is_some_and(|s| {
+                    let lines = s.screen(&theme).lines;
+                    lines.len() == want
+                        && lines.iter().filter(|l| !l.text.trim().is_empty()).count() == want
+                })
+            },
+        )
+        .await;
+        let _ = window.update(cx, |_, _, cx| cx.notify());
+        for _ in 0..2 {
+            let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
+        }
+        waited
+    }
+
     /// [`measure_output_redraw`] の結果（#995）。
     pub(crate) struct RedrawWindow {
         /// 清浄だった試行の増分（全試行が汚れていたら `None` = 判定できない）
@@ -33777,6 +33840,17 @@ mod self_test {
             // ターミナルのサブラインスクロール（#159）: 半行スクロールの前後フレームを
             // 「そのまま」と「半行戻して」比較する。ピクセル単位で描画されていれば
             // 戻して比較のみほぼ一致する（行単位描画だと 1 行ずれとなりどちらも大差分）
+            //
+            // **端数の載り方はペインの器で変わる**（#1173）。直接ペインはホイールが
+            // `session.scroll_pixels` へその場で載るが、器（tmux）つきのペインは
+            // `mirror_scroll_pane` → `backend_scroll_px` のミラー経路へ入り、端数は
+            // tmux から capture して作るミラーの `position` へ**非同期に**載る。
+            // 前提を見ずに 1 フレームで測っていたため `TAKO_PERSIST=1` の実行は
+            // `direct=0 shifted=14278`（フレームが 1 px も動いていない）で必ず落ち、
+            // 以降の節が 1 つも走らなかった。**見て飛ばすのではなく製品の経路で
+            // 前提を作る**（#1122 の作法）: 実ユーザーのホイールと同じくミラーが
+            // 立つまで状態で待ってから撮る。旧挙動（待たずに撮る）は
+            // `TAKO_1173_LEGACY=subline`（`1` なら #1173 で直した段を全部戻す）
             type_text(any, cx, "seq 100", true);
             cx.background_executor()
                 .timer(Duration::from_millis(1500))
@@ -33801,6 +33875,10 @@ mod self_test {
                 })
                 .unwrap_or((None, 17.0));
             let term_area = term_area.unwrap_or_else(|| fail("visual-test ターミナル領域"));
+            let mirrored = window
+                .update(cx, |app, _, _| app.mirror_scroll_pane(app.focused_pane()))
+                .unwrap_or(false);
+            let legacy_subline = legacy_1173("subline");
             let scroll_before = capture_frame(any, cx);
             window
                 .update(cx, |app, win, cx| {
@@ -33818,6 +33896,38 @@ mod self_test {
                     cx.notify();
                 })
                 .ok();
+            // 器つきは capture が返ってミラーが立つまで待つ（直接ペインは即座に載るので
+            // 待たない = 直接ペインの測り方は 1 バイトも変えない）
+            let mirror_pos = if mirrored && !legacy_subline {
+                let _ = wait_for_dispatch_state(
+                    window,
+                    cx,
+                    "subline mirror",
+                    state_wait_budget(Duration::from_secs(10), machine_busy()),
+                    Duration::from_millis(100),
+                    |app| {
+                        let pane = app.focused_pane();
+                        app.scroll_ctls
+                            .get(&pane)
+                            .and_then(|c| c.mirror.as_ref())
+                            .is_some_and(|m| m.effective_position() > 0.0)
+                    },
+                )
+                .await;
+                window
+                    .update(cx, |app, _, cx| {
+                        cx.notify();
+                        let pane = app.focused_pane();
+                        app.scroll_ctls
+                            .get(&pane)
+                            .and_then(|c| c.mirror.as_ref())
+                            .map(|m| m.effective_position())
+                    })
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
             let scroll_after = capture_frame(any, cx);
             // 上下 2 行（部分行・カーソル行）と右端 16px（スクロールバー）を除いた内側で比較
             let inset = Bounds::new(
@@ -33833,7 +33943,19 @@ mod self_test {
                 }
                 _ => (0, usize::MAX),
             };
-            println!("TAKO_VISUAL_PIXEL: subline direct={direct} shifted={shifted}");
+            println!(
+                "TAKO_VISUAL_PIXEL: subline mirrored={mirrored} mirror_pos={} \
+                 direct={direct} shifted={shifted}",
+                mirror_pos
+                    .map(|p| format!("{p:.3}"))
+                    .unwrap_or_else(|| "-".into()),
+            );
+            // 器つきは「端数がミラー位置へ載った」ことを先に見る（載っていないのに
+            // ピクセルだけ見ると、動かないフレームを半行ずらした無意味な値で落ちる）
+            check(
+                !mirrored || legacy_subline || mirror_pos.is_some_and(|p| (p - 0.5).abs() < 0.05),
+                "visual-test サブライン: 器つきでもホイールの端数がミラー位置へ載る (#159/#1173)",
+            );
             check(direct > 200, "visual-test サブライン: 半行スクロールで画面が動く");
             check(
                 shifted.saturating_mul(4) < direct,
@@ -33842,6 +33964,9 @@ mod self_test {
             window
                 .update(cx, |app, _, cx| {
                     let pane = app.focused_pane();
+                    // 器つきはミラーを畳んでからライブへ戻す。残すと以降の節が
+                    // tmux 履歴を映したまま測ることになる（#1122 のカーソルラウンド）
+                    app.cancel_scroll_before_input(pane);
                     if let Some(s) = app.terminals.get(&pane) {
                         s.scroll_to_bottom();
                     }
@@ -34589,6 +34714,8 @@ mod self_test {
                     .update(cx, |app, _, _| geom(app))
                     .unwrap_or_else(|_| fail("visual-test #703: カード状態の取得"));
                 let area = area.unwrap_or_else(|| fail("visual-test #703: カード時のペイン領域"));
+                // 縮んだ領域ぶんの再描画が画面へ届くまで面倒を見る（#1173）
+                let _ = settle_inked_rows(any, window, cx, "card-band カード表示", rows).await;
                 let (after, _) =
                     capture_frame(any, cx).unwrap_or_else(|| fail("visual-test #703: 後フレーム"));
                 // 帯の矩形 = テキスト領域の下端 + パディング から帯の高さぶん
@@ -34637,6 +34764,9 @@ mod self_test {
                     .unwrap_or_else(|_| fail("visual-test #703: 復帰状態の取得"));
                 let closed_area =
                     closed_area.unwrap_or_else(|| fail("visual-test #703: 復帰時のペイン領域"));
+                // 戻った行ぶんの再描画（器つきは tmux が履歴から埋め直す）まで面倒を見る（#1173）
+                let _ =
+                    settle_inked_rows(any, window, cx, "card-band カード復帰", closed_rows).await;
                 let (closed, _) = capture_frame(any, cx)
                     .unwrap_or_else(|| fail("visual-test #703: 復帰フレーム"));
                 let band_after_close =
@@ -34780,6 +34910,16 @@ mod self_test {
                             ..Default::default()
                         }),
                     );
+                    // #853 の fixture 保護をこの節でも使う（#1173）。会話の定期読み取りは
+                    // **バックエンド（器つき）ペインだけ**を対象にするので、`TAKO_PERSIST=1`
+                    // の実行では注入した会話が「実 claude ではない」と正しく判定されて
+                    // 消され、以降の入力欄の検査が**別のペインの古い箱**を測っていた
+                    // （実測: `chat_panes` が空・入力欄の高さが 3 回とも 29.0px）。
+                    // persist OFF では `backend_sessions` が空なので誰も読みに来ず、
+                    // この節は器の有無で通ったり落ちたりしていた
+                    if !legacy_1173("pin") {
+                        app.pin_chat_fixture(pane);
+                    }
                     cx.notify();
                 });
                 let (gui_dark, _) = capture_frame(any, cx)
@@ -34963,9 +35103,28 @@ mod self_test {
                         PaneOrigin::User,
                     );
                 });
-                cx.background_executor()
-                    .timer(Duration::from_millis(800))
+                // 描いた入力ボックスが**ミラーとして成立する**まで状態で待つ（#1173）。
+                // 固定 800ms 窓は器（tmux）つきの往復に足りず、`typed_changed=0`
+                // （入力欄の帯が 1 px も変わらない）で落ちていた
+                if legacy_1173("chat-g3") {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(800))
+                        .await;
+                } else {
+                    let _ = wait_for_dispatch_state(
+                        window,
+                        cx,
+                        "chat-g3 入力ボックス",
+                        state_wait_budget(Duration::from_secs(15), machine_busy()),
+                        Duration::from_millis(100),
+                        move |app| {
+                            app.chat_input_mirror(pane, false)
+                                .is_some_and(|m| m.has_text)
+                        },
+                    )
                     .await;
+                    let _ = window.update(cx, |_, _, cx| cx.notify());
+                }
                 let (typed, _) = capture_frame(any, cx)
                     .unwrap_or_else(|| fail("visual-test チャット: 入力後フレーム"));
                 let typed_changed =
@@ -35005,9 +35164,37 @@ mod self_test {
                             PaneOrigin::User,
                         );
                     });
-                    cx.background_executor()
-                        .timer(Duration::from_millis(800))
+                    // 箱が**入力欄のミラーとして成立する**まで状態で待つ（#1173）。
+                    // 旧実装は固定 800ms 窓で、器（tmux）つきのペインでは
+                    // 「送信 → tmux → シェル実行 → 出力 → PTY 経由で返る」の往復が
+                    // 収まらず、1 回前の箱を測って `h1=h2=h4=29.0`（全部 1 行）に
+                    // なっていた。待つ先を画面の文字列ではなくミラーの行数にするのは、
+                    // 高さを決めているのがそれだから（`input_region` が拾えない形で
+                    // 届いても待ち続けて FAILED になる = 検出力は落ちない）
+                    if legacy_1173("chat-input") {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(800))
+                            .await;
+                    } else {
+                        let _ = wait_for_dispatch_state(
+                            window,
+                            cx,
+                            "chat-input 入力ボックス",
+                            state_wait_budget(Duration::from_secs(15), machine_busy()),
+                            Duration::from_millis(100),
+                            move |app| {
+                                app.chat_input_mirror(pane, false).map(|m| m.total_rows)
+                                    == Some(rows)
+                            },
+                        )
                         .await;
+                    }
+                    // 届いた行数で塗り直す。`chat_input_bounds` は paint 中に置かれるので、
+                    // 汚さないと `PaneBody` のキャッシュ（#786）が再利用されて
+                    // **前の高さのまま**残る（実測: ミラーは 2 行なのに箱は 29.0px = 1 行）
+                    if !legacy_1173("chat-input") {
+                        let _ = window.update(cx, |_, _, cx| cx.notify());
+                    }
                     let _ = capture_frame(any, cx);
                     let h = window
                         .update(cx, |app, _, _| {
