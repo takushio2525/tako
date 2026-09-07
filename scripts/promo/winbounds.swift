@@ -13,8 +13,25 @@ import AppKit
 import CoreGraphics
 import Foundation
 
+// `--all` を渡すと、PID を問わず画面上の全ウィンドウ（レイヤ 0・200x200 以上）を
+// "windowID pid winX winY winW winH" で列挙する（仮想ディスプレイ上の空き場所探し = #1081）
+if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "--all" {
+    let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else { exit(1) }
+    for w in list {
+        guard let ownerPid = w[kCGWindowOwnerPID as String] as? Int32,
+            let layer = w[kCGWindowLayer as String] as? Int, layer == 0,
+            let wid = w[kCGWindowNumber as String] as? Int,
+            let b = w[kCGWindowBounds as String] as? [String: CGFloat]
+        else { continue }
+        let wd = Int(b["Width"] ?? 0), ht = Int(b["Height"] ?? 0)
+        if wd < 200 || ht < 200 { continue }
+        print("\(wid) \(ownerPid) \(Int(b["X"] ?? 0)) \(Int(b["Y"] ?? 0)) \(wd) \(ht)")
+    }
+    exit(0)
+}
 guard CommandLine.arguments.count > 1, let pid = Int32(CommandLine.arguments[1]) else {
-    FileHandle.standardError.write("usage: winbounds <pid> [--activate]\n".data(using: .utf8)!)
+    FileHandle.standardError.write("usage: winbounds <pid> [--activate] | winbounds --all\n".data(using: .utf8)!)
     exit(2)
 }
 if CommandLine.arguments.contains("--activate") {

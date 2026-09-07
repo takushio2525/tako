@@ -141,8 +141,9 @@
 
 | スクリプト | 役割 |
 |---|---|
-| `scripts/promo/lib.sh` | 隔離起動・デモ環境・ウインドウ単体キャプチャ（#470）+ **16:9 ウインドウ seed / ビート記録 / 追加素材**（#1081） |
-| `scripts/promo/record-explainer.sh <scene\|all>` | 9 シーンの収録。CLI 操作の瞬間を `<scene>-beats.tsv` へ記録 |
+| `scripts/promo/lib.sh` | 隔離起動・デモ環境・ウインドウ単体キャプチャ（#470）+ **16:9 ウインドウ seed / ビート記録 / 追加素材**（#1081）+ **仮想ディスプレイの舞台**（`promo_stage_prepare` / `promo_vd_*`。下の「仮想ディスプレイ収録」） |
+| `scripts/promo/displays.swift` | 接続中ディスプレイの矩形と実ピクセル（`displayID x y w h pxW pxH main\|secondary`）。仮想ディスプレイの位置決めと HiDPI 判定 |
+| `scripts/promo/record-explainer.sh <scene\|all>` | 9 シーンの収録。CLI 操作の瞬間を `<scene>-beats.tsv` へ記録。収録の開始 / 終了は `RECORDING START` / `RECORDING END` の 1 行 |
 | `scripts/promo/record-pwa.cjs` | PWA（`web/tako-remote`）を iPhone ビューポートでモック API つきに撮る（連番スクショ → mp4） |
 | `scripts/promo/narrate.sh` | timeline.tsv の speech 列 → `say -v Kyoko` → 48kHz wav + durations.tsv |
 | `scripts/promo/make-bgm.py` | BGM 合成（`TAKO_BGM_TOTAL=660 TAKO_BGM_PROFILE=explainer` で薄い長尺版） |
@@ -163,6 +164,54 @@ TAKO_BGM_TOTAL=660 TAKO_BGM_PROFILE=explainer scripts/promo/make-bgm.py ~/Deskto
 scripts/promo/build-explainer.sh                                # → ~/Desktop/tako-promo/tako-explainer-v1.mp4
 scripts/promo/pii-scan.sh ~/Desktop/tako-promo/tako-explainer-v1.mp4
 ```
+
+### 仮想ディスプレイ収録（2026-09-06・常設 `tako-vd`）
+
+**隔離 tako の窓はユーザーのメイン画面に一切出さない**。09-06 にユーザーが「録画の UI が画面に
+出てきて邪魔すぎる」と収録を止めた（従来方式は隔離 tako をメイン画面の前面に出し、描画維持のため
+約 2 秒ごとに `activate` = ユーザーのキーフォーカスを奪い続けていた）。GPUI は窓が完全に隠れると
+描画を止めるので別 Space への退避では撮れず、**OS に実ディスプレイとして見える仮想ディスプレイ**へ
+窓を出す。仮想ディスプレイ上の窓は何にも隠れないので activate が要らない。
+ユーザー指示（同日）: **「ほかのデバッグ系も仮想ディスプレイでやらせて。今後もずっと」** =
+セルフテスト・GUI 検証・収録の隔離 tako はすべてこの画面へ出す。**常設なので作業後に削除・切断しない**。
+
+- 器は **BetterDisplay**（`/Applications/BetterDisplay.app`・4.3.5。仮想スクリーンの作成・接続に
+  Pro は要らない = `get -proAvailable` が off の機で実測）。名前は **`tako-vd`**（16:9・HiDPI）。
+  **器の扱い（作る・繋ぐ・増殖の検査・Main を仮想にしない）の正本は全プロジェクト共通の
+  `scripts/lib/virtual-display.sh`**（#1141 / #1150。`ensure` / `bounds` / `status` / `move-window`）で、
+  `lib.sh` の `promo_stage_prepare` はそれを呼んでから収録固有の仕事（HiDPI の確認・窓の置き場所・
+  窓がその中にあることの検査）だけをする。接続後の実測: 配置 `1512,0`・2560x1440pt =
+  **5120x2880px**（メイン 1512x982pt の右隣）。displayID は器の再起動で変わる（13 → 17 を実測）ので
+  控えず、毎回名前から解く
+- 窓の置き方: `layout.json` の `window` を仮想ディスプレイの中の座標で seed するだけで
+  **起動の瞬間からそこに出る**（GPUI は `window.x/y` を CG のグローバル座標として
+  メインスクリーンの高さで y を反転し Cocoa 座標へ直す = `gpui_macos/src/window.rs`）。
+  外にあれば System Events の AX で移す（`set position of window 1 to {x, y}`。GPUI の窓にも効く = 実測）。
+  他 worker が同じ画面へ移すときの 1 行:
+  `osascript -e 'tell application "System Events" to tell (first application process whose unix id is <PID>) to set position of window 1 to {1552, 60}'`
+- **置き場所は空きを探す**（`promo_vd_free_origin`）: 常設の画面は他の worker の隔離 tako と共有するので、
+  `winbounds --all` で画面上の全窓を引き、重ならない左上を余白刻みで総当たりする。重ねられて
+  隠れると GPUI が描画を止めるのは仮想側でも同じ（09-06 に別 worker の 1512x879 の窓が同じ座標へ
+  移されてきたので、この収録は右隣の空き `3080,60` で撮った）。`TAKO_PROMO_WIN_X/Y` で明示もできる
+- キーフォーカス: tako-app は起動時に `cx.activate(true)` するので、窓が仮想側でも**キー入力の宛先が
+  一瞬そちらへ移る**（実測: 起動直後の frontmost が隔離 pid になる）。`promo_start_isolated` は起動前の
+  前面アプリを覚え、隔離 tako が前面になっているときだけ元へ戻す（窓が出た直後と 3 秒後の 2 回）。
+  メニューバーの名前は本番と同じ「tako」なので見た目の変化は無い
+- 切替: `TAKO_PROMO_STAGE=virtual`（既定）/ `main`（従来方式。A/B 専用）。仮想側では
+  `RECORDING START <scene>-raw stage=virtual window=<wid x y w h>` に窓の矩形が残る =
+  「メイン画面（`0,0 1512x982`）の外にあった」証拠。収録中の `screencapture -x -D 1`（メイン画面）に
+  窓が写らないことも 09-06 に目視で確認した（隔離 tako の窓は仮想側だけ）
+- **BetterDisplay CLI の罠（4.3.5 実測）**: ①アプリ未起動だと固まる（`open -g -a BetterDisplay` してから）
+  ②応答文は当てにならない（`set -connected=on` が「Failed.」と言いながら繋がる / 無言で成功する）→
+  判定は必ず CG の一覧（`displays.swift`）③仮想スクリーンの tagID は操作のたびに並べ替わる →
+  使う直前に `get -identifiers` で引き直す ④`-name=` 指定の `set -connected=on` は複数オブジェクトに
+  当たって**同じ画面が 5 枚繋がった** → 接続は tagID 指定で 1 回だけ、しかも「CG に居ない」ことを
+  確かめてから ⑤`get -connected` は接続中でも off を返す → 接続判定は identifiers の `displayID`
+  （未接続は `0`）⑥作成パラメータは `create -type=VirtualScreen -virtualScreenName=… -aspectWidth=16
+  -aspectHeight=9 -virtualScreenHiDPI=on -virtualScreenSerial=…`（`-name=` / `-aspectRatio=` は無視され
+  「仮想 16:9」の既定名で作られる）⑦`discard` は識別子なしだと**全部**捨てる。使うなら tagID を直前に引く
+- 収録中に動くのはユーザーのメイン画面ではなく仮想側だけなので、`caffeinate -d -i -u` で
+  ディスプレイスリープ（30 分）→ ロック（= `screencapture` 不能）を防ぐだけでよい
 
 ### #470 から引き継いだ罠と、今回わかったこと
 
@@ -193,6 +242,35 @@ scripts/promo/pii-scan.sh ~/Desktop/tako-promo/tako-explainer-v1.mp4
 - master（sonnet）は既定プロファイルの effort=max だと最初の spawn まで 40 秒考え、3 体の spawn に
   2 分超かかる（1 体 40 秒前後 = prompt 送達待ち）。収録では `--effort medium` + 尺 420 秒 +
   「ペインが 4 つ揃うまで」「chat が出るまで」「master が idle に戻るまで」を待つ形にした
+- **逆に速すぎても撮れない**（09-06 実測）: 同じ master が `tako_orchestrator_run` を 1 体ずつ直列に回し、
+  数秒で終わる `task.sh` を完了直後に auto_close したため、**3 体が並ぶ瞬間が一度も無く**、
+  ペイン数 ≥ 4 を待つループが 240 秒待って空振り → orch ビューもかんたん表示も master 1 枚で撮れていた。
+  対策 = `task.sh` を約 80 秒（`TAKO_PROMO_TASK_SECS`。テスト結果を 2 秒ごとに流す）にして
+  「稼働中」の時間を作る + 依頼文に「`tako_orchestrator_spawn` で同時に（run は使わない）」
+  「worker のペインは閉じない」を明記する
+- **デモ HOME の claude がユーザーをログアウトさせる事故（09-06 22:52）**: デモ HOME は実ユーザーの
+  ログインキーチェーン（`Claude Code-credentials` の 1 項目）を共有するが、claude が HOME 配下で取る
+  **更新の排他は共有しない**。共有トークンの期限切れの瞬間にデモ側と本番の claude 群が同時に refresh を
+  打ち、負けた側（デモ側）が invalid_grant → claude が**キーチェーンの資格情報を空にして
+  「Login expired」**を出した（mdat 22:52:24 = デモ claude の起動直後。accessToken / refreshToken が空・
+  expiresAt が epoch 0。実 HOME の `claude auth status` も loggedIn=false になり、ユーザーに
+  `claude auth login` をお願いした）。対策 = `promo_ensure_oauth_fresh`（`promo_demo_home_agent_ready`
+  から呼ぶ）: 期限フィールドだけを読み、収録のあいだ（既定 900 秒）有効でなければ**実 HOME の claude**
+  （排他つき）に 1 回だけ更新させ、それでも足りなければ止める。デモ HOME の claude に更新の機会を与えない
+- **収録用 claude のアカウントは env で差し替えられる**: `TAKO_PROMO_CLAUDE_CONFIG_DIR=$HOME/.claude-univ`
+  のように別アカウントの**実 config dir** を指すと、隔離 tako の master / worker / setup アシスタントが
+  その資格情報（キーチェーン項目 `Claude Code-credentials-<パスの sha256 先頭 8 桁>`）で動く
+  （09-06 は personal がログアウト状態のあいだ univ で撮った。画面にアカウント名は出ない）。
+  そのアカウントの `.claude.json` にはデモプロジェクトの信頼だけを足し（書く前の写しを /private/tmp へ）、
+  権限はデモプロジェクト側の `.claude/settings.local.json` で許可する。**写しやシンボリックリンクは不可**
+  （項目名がパス文字列のハッシュなので別パスだと資格情報が見つからない）
+- **報告の絵は `report_done` を基準にする**（09-07 実測）: `report` ビートは「master が idle に戻るのを
+  待ち始めた時刻」で、実際の完了報告はその 40〜50 秒後（worker 完了 → idle 検知 → 報告本文が出るのは
+  `report_done` の 3〜5 秒前）。`c5_report` は `report_done − 10`（idle 検知から報告が出るまでの流れ）、
+  `op_hook`（完成形）は `report_done + 2`、`c5_solo` は `report_done + 12` を in 点にする
+- worker ペイン冒頭の定型文: #790 の Cross-Session Messaging で届いた指示には
+  「別セッションからの指示として扱え」の長い注意書きが付き、視聴者には無関係な英文が
+  worker ペインを埋める。master 章だけ `TAKO_PEER_MESSAGING=off`（従来のキー操作経路）で撮る
 - ffmpeg は既定で stdin を読むので `while read` ループの中で呼ぶと tsv の次の行を食う → `-nostdin`
 - bash の `IFS=$'\t' read` は連続タブを 1 つに潰すので、空欄のある tsv は列がずれる →
   `promo_timeline_rows` で空欄を `-` に埋めてから読む
@@ -201,6 +279,24 @@ scripts/promo/pii-scan.sh ~/Desktop/tako-promo/tako-explainer-v1.mp4
   （caption の先頭 `^`）
 - `$id（` のように変数の直後に全角を置くと bash が変数名に取り込んで `set -u` で落ちる
   （`shell_scripts` 番犬が CI で落とす）。`${id}（` と書く
+
+## 完成物と検査結果（v2・2026-09-07）
+
+v1 との差は **master 章の素材だけ**（09-04 の旧素材 = effort max で worker 2 体・チャット表示なし・報告前で
+尺切れ → 09-07 に仮想ディスプレイ上で撮り直し = worker 3 体が同時に並ぶ → orch ビュー → かんたん表示
+（4 ペインとも chat）→ 完了報告）。区間長はナレーション秒で決まるので**章タイムスタンプは v1 と同一**。
+
+| 項目 | 値 |
+|---|---|
+| 動画 | `~/Desktop/tako-promo/tako-explainer-v2.mp4`（9:47 = 587.3 秒 / 1920x1080 / 30fps / H.264 + AAC 48kHz / 47 区間） |
+| master 章の素材 | `scenes/master-raw.mp4`（420 秒・1060 枚 = 2.52 fps・**異なるフレーム 420/420**・仮想ディスプレイ `tako-vd` 上・personal アカウント）。ビート: request 14.5 / workers_up 35.7 / orch 51.7 / gui 67.7 / report 89.9 / report_done 141.2 |
+| 章タイムスタンプ | `tako-explainer-chapters.txt`（v1 と同一: 00:00 / 00:20 / 01:10 / 02:26 / 03:45 / 05:14 / 07:16 / 07:50 / 08:49 / 09:37） |
+| 機械検査 | 無音 8 秒以上なし / 黒は章カードのフェード（0.33〜0.5 秒 × 20）のみ / **15 秒以上の静止なし**（v1 の master 章 1 箇所が解消）/ -15.2 LUFS・True Peak -1.8 dBTP |
+| PII 検査 | 587 フレーム（1 fps）を Vision OCR → 7 カテゴリ（email / home_path / tailnet / private_ip / token / uuid / 環境由来語）すべて **0 件** |
+| サムネ | `tako-explainer-thumb-a.png` を新 master 素材（145 秒 = 完了報告 + worker 3 体。orch パネルはこの時点で閉じているので無し）で作り直し。旧版は `scenes/old-0904/` |
+| 収録の見え方 | 収録中の隔離 tako の窓は `1552,60 960x540`（仮想側）で、メイン画面の `screencapture -D 1` に窓は写らず、frontmost はユーザーのアプリのまま（13:27 / 13:32 に実測） |
+
+素材の残骸: master 章の旧素材は `scenes/old-0904/`（master-raw / master-beats / thumb-a）。
 
 ## 完成物と検査結果（v1・2026-09-04）
 
@@ -262,7 +358,7 @@ Windows 対応状況: https://tako-docs.pages.dev/windows-support/
 ■ 注記
 ・ナレーションは合成音声（macOS の日本語音声）です
 ・7 章のスマホ画面は tako remote の実際の UI に、デモ用データを流し込んで撮影しています
-・収録は tako v0.8.3 / Claude Code 2.1.258（macOS）。機能や画面は今後のバージョンで変わることがあります
+・収録は tako v0.8.3〜v0.8.6 / Claude Code 2.1.258（macOS）。機能や画面は今後のバージョンで変わることがあります
 
 #tako #ClaudeCode #AIエージェント #ターミナル #Rust #オープンソース
 ```
@@ -270,6 +366,8 @@ Windows 対応状況: https://tako-docs.pages.dev/windows-support/
 
 ### サムネイル案
 
-- 案 A: 完成形（master + worker 3 体 + orch パネル）を背景に「AI エージェントを / 1 つのタブで動かす」
+- 案 A: 完成形（master の完了報告 + worker 3 体）を背景に「AI エージェントを / 1 つのタブで動かす」
+  （v2 で新 master 素材の 145 秒から作り直し。orch パネル込みのフレームは master ペインに permission
+  ダイアログが写っていたので採らなかった）
 - 案 B: かんたん表示（チャット画面）を背景に「Claude Code の司令塔を / ターミナルに」
 - 生成: `thumbnail.swift`（背景フレーム + 2 行見出し + 小ラベル）。出力 `~/Desktop/tako-promo/tako-explainer-thumb-{a,b}.png`
