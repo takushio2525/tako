@@ -1465,7 +1465,7 @@ pub fn tools() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "topic": { "type": "string", "description": "引く topic（省略時は一覧。task-intake / worker-prompt / spawning / monitoring / acceptance / lifecycle / handoff / tools / quality-ops / behavior）" },
+                    "topic": { "type": "string", "description": "引く topic（省略時は一覧。context-budget / task-intake / worker-prompt / spawning / monitoring / acceptance / lifecycle / handoff / tools / quality-ops / behavior）" },
                     "profile": { "type": "string", "description": "プレースホルダを解決するプロファイル（省略時は呼び出し元の role から解決）" },
                 },
                 "additionalProperties": false,

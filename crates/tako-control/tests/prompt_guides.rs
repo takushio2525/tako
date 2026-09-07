@@ -219,6 +219,26 @@ fn テンプレートのtopic表と手順書の一覧が一致する() {
 }
 
 #[test]
+fn mcpツールの説明にも全topicが並んでいる() {
+    // topic 名の置き場が 3 つ（`GUIDES` / テンプレートの表 / MCP の inputSchema）
+    // あるので、増やしたときに取り残されないよう縛る
+    let tool = tako_control::mcp::tools()
+        .into_iter()
+        .find(|t| t["name"] == "tako_orchestrator_guide")
+        .expect("tako_orchestrator_guide がカタログに無い");
+    let desc = tool["inputSchema"]["properties"]["topic"]["description"]
+        .as_str()
+        .expect("topic の説明");
+    for g in GUIDES {
+        assert!(
+            desc.contains(g.topic),
+            "MCP ツールの topic 説明に `{}` が無い: {desc}",
+            g.topic
+        );
+    }
+}
+
+#[test]
 fn 本文を移したブロックは自分のtopicを名指ししている() {
     let template: BTreeMap<String, String> = blocks(DEFAULT_SYSTEM_PROMPT).into_iter().collect();
     for g in GUIDES {
