@@ -97,3 +97,8 @@
   固定 800ms 窓 / 注入 fixture の `pin_chat_fixture` 漏れ）
 - 到達点 器つき 72 行 → **158 行 + `TAKO_VISUAL_TEST_OK`**（直接も 149 行で OK・A/B 両アーム緑）
 - A/B は `TAKO_1173_LEGACY` を段ごとに指定（`subline` `rows` `chat-g3` `pin` が確定 FAILED）
+
+## 2026-09-08（#1177: 器つきペインの `term-grid scroll` を skip せず実測できるようにした）
+- #943 の前提ガードを外し「ミラーが立つまで待つ + 期待値の出どころを器で切り替える」へ（`settle_scroll_mirror` は `subline` 節と 1 実装）
+- 器つき `mirrored=true mirror_pos=0.500 fract=0.500 shift=17 expected=17` = 直接ペインと全数値一致・両方 `TAKO_VISUAL_TEST_OK`（checkpoint 122）
+- A/B `TAKO_943_LEGACY=1` は #943 の報告と同一数値で FAILED / 注入 `nofract` は上限待ちで FAILED / 番犬 1 本追加 / 全 3588 件緑
