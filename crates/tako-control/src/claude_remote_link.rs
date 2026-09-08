@@ -544,6 +544,87 @@ fn remember(
     }
 }
 
+/// 走査コストの実測値（**呼び出しスレッドぶんだけ**を数える。#1220 / #1167）。
+///
+/// 一覧付与（`/api/v2/panes` は PWA がポーリングする）のコストを
+/// 「速い / 遅い」の**実時間**で固定したテストは、片方の計測窓にだけ
+/// スケジューリングの待ちが入った回に落ちる（#1220 の実測: 他 worker の
+/// ビルドと同時に走って 1 回 FAILED）。守りたい性質は
+/// 「行数ぶん読まない」「定常状態では追記ぶんしか読まない」なので、
+/// **回数とバイト数**で測れば混み具合に依らない（`.agent/conventions.md`
+/// 「効果を測る単体テストは実時間で比べない」）。
+///
+/// 形は #1011 の `orchestrator::agents_scan_counters` と同じ「計測用の最小の口」。
+/// ただしこちらは**スレッドローカル**なので、並列に走る他のテストの走査が混ざらない
+/// （`link_for_session` は呼び出しスレッドで完結する）
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanCounters {
+    /// transcript を開いて走査した回数（[`scan_source`] を通った回数）
+    pub scans: u64,
+    /// 実際に読み出したバイト数（**seek より後ろの read だけ**が乗る =
+    /// 「追記ぶんだけ読む」が効いていればここが増えない）
+    pub bytes: u64,
+    /// 所在探索（`locate_transcript` = config dir ごとの `projects/` 全走査）の回数
+    pub locates: u64,
+}
+
+impl ScanCounters {
+    const ZERO: Self = Self {
+        scans: 0,
+        bytes: 0,
+        locates: 0,
+    };
+
+    /// `before` からの増分（計測窓のコスト）
+    pub fn since(self, before: Self) -> Self {
+        Self {
+            scans: self.scans.saturating_sub(before.scans),
+            bytes: self.bytes.saturating_sub(before.bytes),
+            locates: self.locates.saturating_sub(before.locates),
+        }
+    }
+}
+
+thread_local! {
+    static SCAN_STATS: std::cell::Cell<ScanCounters> = const { std::cell::Cell::new(ScanCounters::ZERO) };
+}
+
+fn bump(f: impl FnOnce(&mut ScanCounters)) {
+    SCAN_STATS.with(|cell| {
+        let mut v = cell.get();
+        f(&mut v);
+        cell.set(v);
+    });
+}
+
+/// このスレッドがこれまでに払った走査コスト（**単調増加**。計測とテストが読む）。
+///
+/// 使い方は「窓の前後で引く」（[`ScanCounters::since`]）
+pub fn scan_counters() -> ScanCounters {
+    SCAN_STATS.with(|cell| cell.get())
+}
+
+/// 読み出しバイト数を数える読み口（[`scan_counters`] が読む値の出どころ）。
+///
+/// `BufReader` の下に挟むので、数えるのは**実際に file から読んだバイト数**
+/// （行に組み立てた量ではない）。`consumed` の報告だけ正しくて全文を読んでいる
+/// 実装はここで露見する（#1167 の回帰注入 B）
+struct Counted<R>(R);
+
+impl<R: std::io::Read> std::io::Read for Counted<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.0.read(buf)?;
+        bump(|c| c.bytes += n as u64);
+        Ok(n)
+    }
+}
+
+impl<R: std::io::Seek> std::io::Seek for Counted<R> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.0.seek(pos)
+    }
+}
+
 /// `from` バイト目から末尾までを行として走査する（**追記ぶんだけ読む**）。
 ///
 /// `extract_link` は「最後の手がかり」を採るので、前回までに手がかりが無かった
@@ -565,10 +646,13 @@ fn scan_from(path: &std::path::Path, from: u64) -> Result<(Option<RemoteLink>, u
 /// 実時間（`Instant::elapsed`）で全走査と比べる形は、片方の計測窓にだけ
 /// スケジューリングの待ちが入った回に落ちる（#1167 の実測: 高負荷で 4 回に 1 回）
 fn scan_source<R: std::io::Read + std::io::Seek>(
-    mut source: R,
+    source: R,
     from: u64,
 ) -> Result<(Option<RemoteLink>, u64), String> {
-    use std::io::{BufRead, SeekFrom};
+    use std::io::{BufRead, Seek, SeekFrom};
+    // コストは**量**で測る（#1220）。読み口を Counted で包んで実読み出しを数える
+    bump(|c| c.scans += 1);
+    let mut source = Counted(source);
     if from > 0 {
         source
             .seek(SeekFrom::Start(from))
@@ -617,6 +701,8 @@ fn located(session_id: &str) -> Option<crate::transcript::TranscriptLocation> {
             }
         }
     }
+    // memo が外れた = `projects/` を全走査する（cold の支配項。#1220 で量を数える）
+    bump(|c| c.locates += 1);
     let found = crate::transcript::locate_transcript(session_id)?;
     if let Ok(mut guard) = paths.lock() {
         if guard.len() >= 512 {
