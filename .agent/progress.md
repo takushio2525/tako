@@ -19,13 +19,6 @@
 
 ---
 
-## 2026-09-08（#995: セルフテスト項目 108 の高負荷フレークを窓ガードで根治した）
-- 外から来る全体 notify で `output=(panes +2 chrome +2)` = 意図的な全体 notify と同値になっていた。#858 の
-  ガードを 108 へ寄せ、判定（`redraw_window_clean`）と窓の作り方（`measure_output_redraw`）を 110 と 1 実装に統合
-- **証人は測る量の外側から選ぶ**: 110 = クローム / 108 = 本体の増分が 2 以上（ヘッダは #803 の A/B で毎フレーム動く）
-- A/B は `TAKO_995_LEGACY=1 INJECT=app` が Issue と同じ数字で FAILED・新経路は 2 回目で通過・`INJECT=chrome` は
-  新経路でも FAILED。110 の既存注入 2 種は #858 の表を再現。全 3576 件緑
-
 ## 2026-09-08（#1122: 器つきペインの visual-test カーソルラウンドを実測で切り分けて根治した）
 - 原因 2 つ（見立ての「tmux が描く」は外れ）: 検査側 = 測るあいだミラーが立って表示が tmux 履歴 / 製品側 = `parse_ansi_lines` が履歴行にカーソルを焼いていた
 - 前者は製品と同じ `cancel_scroll_before_input` を通してから書く形へ・後者は `show_cursor=false` へ。器つき 5 通りが直接ペインと同一値（`fill=544 / stray=0`）で緑・**skip 無し**
@@ -92,3 +85,8 @@
 - 真因は**ペイン幅**（負荷でも rollout でもない）: 44 桁では codex が `• Waiting for background terminal (1m 04s •…` と自分で切るので `esc to interrupt` が消え、末尾の `›` を拾って idle になっていた。同じ理由で `prompt_undelivered`（自動再送）の抑制も外れる = 2 症状は同一原因
 - 判定を「`•` で始まり `(` の直後が経過時間 + その直後が区切り」へ。**語では判定しない**（`Waited for …` は完了後も残る履歴行 = 永久 busy になる。実測 5 回残存）。未達の断定は rollout を実際に読めたときだけにし、読めないときは `prompt_delivery_unverified` へ降格
 - 実採取 2 幅 + 実 worker（器つき隔離）で `busy` / `codex-session` / events 空。A/B `TAKO_1015_LEGACY=1` は Issue と同じ `status=idle` `prompt_delivery=undelivered` `resend_prompt` を再現。番犬 3 本 + 単体 9 本。全 3659 件緑（main 取り込み後）
+
+## 2026-09-09（#1081: かんたん表示章を手順型デモへ差し替え）
+- 旧 c5_gui（1 区間）を捨て、実クリック / 実キー入力で撮る `scene_guimode` と 11 区間の台本（`c5_gui1`〜11）を作った
+- 実収録 5 回で罠を根治: 窓の重なりでクリックが吸われる（#1149 で seed が死亡）/ 押下の前面化でユーザーのキーが流入 / master が run を選ぶ
+- 素材の検査は PII 0 件・15 秒以上の静止 0 件。worker の絵だけ撮り直しが残り（画面ロック待ち）

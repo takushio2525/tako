@@ -74,6 +74,17 @@ promo_require() {
         swiftc -O -o "$PROMO_DISPLAYS" "$PROMO_LIB_DIR/displays.swift" 2>/dev/null || {
             echo "ERROR: displays.swift のコンパイルに失敗" >&2; return 1; }
     fi
+    # GUI 操作（#1081 の GUI モード章）。実クリックと実キー入力も同じ扱いで焼いておく
+    PROMO_CLICK=/private/tmp/tako-promo-click
+    if [ ! -x "$PROMO_CLICK" ] || [ "$PROMO_LIB_DIR/click.swift" -nt "$PROMO_CLICK" ]; then
+        swiftc -O -o "$PROMO_CLICK" "$PROMO_LIB_DIR/click.swift" 2>/dev/null || {
+            echo "ERROR: click.swift のコンパイルに失敗" >&2; return 1; }
+    fi
+    PROMO_KEYTYPE=/private/tmp/tako-promo-keytype
+    if [ ! -x "$PROMO_KEYTYPE" ] || [ "$PROMO_LIB_DIR/keytype.swift" -nt "$PROMO_KEYTYPE" ]; then
+        swiftc -O -o "$PROMO_KEYTYPE" "$PROMO_LIB_DIR/keytype.swift" 2>/dev/null || {
+            echo "ERROR: keytype.swift のコンパイルに失敗" >&2; return 1; }
+    fi
 }
 
 # 画面がロックされていないか調べる（ロック中は screencapture が一切動かない）。
@@ -535,22 +546,30 @@ promo_external_config_ready() {
     [ -f "$cfg" ] || { echo "ERROR: ${cfg} が無い（そのアカウントで一度 claude を起動してログインしておく）" >&2; return 1; }
     mkdir -p /private/tmp/tako-promo-dev
     cp -p "$cfg" "/private/tmp/tako-promo-dev/claude.json.before-$(date +%H%M%S)"
-    /usr/bin/python3 - "$cfg" "$PROMO_DEMO/awesome-app" <<'PY'
+    # 信頼が要るのは**収録で claude が開くディレクトリすべて**。デモプロジェクトだけでは
+    # 足りない（#1081 の GUI 章で実測: 「+」で作った新タブの cwd はデモ HOME なので、
+    # そこで起動した claude が「Is this a project you trust?」を出して収録が壊れた）
+    /usr/bin/python3 - "$cfg" "$PROMO_DEMO/awesome-app" "$PROMO_DEMO/home" <<'PY'
 import json, os, sys, tempfile
-path, project = sys.argv[1], sys.argv[2]
+path, paths = sys.argv[1], sys.argv[2:]
 with open(path, encoding="utf-8") as f:
     data = json.load(f)
 projects = data.setdefault("projects", {})
-entry = projects.setdefault(project, {})
-if entry.get("hasTrustDialogAccepted") and entry.get("hasCompletedProjectOnboarding"):
+added = []
+for project in paths:
+    entry = projects.setdefault(project, {})
+    if entry.get("hasTrustDialogAccepted") and entry.get("hasCompletedProjectOnboarding"):
+        continue
+    entry["hasTrustDialogAccepted"] = True
+    entry["hasCompletedProjectOnboarding"] = True
+    added.append(project)
+if not added:
     sys.exit(0)
-entry["hasTrustDialogAccepted"] = True
-entry["hasCompletedProjectOnboarding"] = True
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".claude.json.")
 with os.fdopen(fd, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
 os.replace(tmp, path)
-print("   信頼を追加:", project)
+print("   信頼を追加:", " ".join(added))
 PY
     mkdir -p "$PROMO_DEMO/awesome-app/.claude"
     cat > "$PROMO_DEMO/awesome-app/.claude/settings.local.json" <<'JSON'
@@ -611,6 +630,146 @@ promo_seed_window_frame() {
     mkdir -p "$work/data"
     printf '{"version":1,"active_tab":0,"tabs":[],"window":{"x":%s,"y":%s,"width":%s,"height":%s,"state":"windowed"}}\n' \
         "$x" "$y" "$w" "$h" > "$work/data/layout.json"
+}
+
+# **layout.json の seed は位置もサイズも効かない**（2026-09-09 実測 / #1149 以降）。
+# `initial_window_bounds` は置き先ディスプレイが解決できた検証起動では保存フレームを
+# 捨てて「960x600pt をその面の中央へ」置く（`main.rs` の #1141 の分岐）。つまり
+#   ① 16:9（960x540pt = 1920x1080px）にならない
+#   ② `promo_vd_free_origin` で探した空きが使われず、**どの隔離 tako も同じ中央へ重なる**
+# の 2 つが起きる。②は絵には出ないが**クリックが別の窓に吸われる**（2026-09-09 実測:
+# 別 worker の隔離 tako が同じ 2312,420 に居て、カード押下が 3 回打ち直しても無反応。
+# frontmost がその worker の pid のまま動かないことで分かった）。
+# v1〜v3 の素材はこの分岐が入る前に撮ったので 1920x1080px だった。
+# 起動後に AX で位置とサイズを入れ直し、**他の窓と重なっていないこと**まで確かめる。
+# $1 = pid, $2 = 幅pt（既定 960）, $3 = 高さpt（既定 540）
+promo_force_window_frame() {
+    local pid=$1 w=${2:-960} h=${3:-540} i origin x y got
+    for i in 1 2 3; do
+        if [ "$PROMO_STAGE" = virtual ]; then
+            # 置き場所は**毎回引き直す**（他の worker の窓は収録の途中でも増える）
+            origin=$(promo_vd_origin_for_clicks "$w" "$h")
+            x=${origin% *}; y=${origin#* }
+            osascript -e "tell application \"System Events\" to tell (first application process whose unix id is $pid) to set position of window 1 to {$x, $y}" \
+                >/dev/null 2>&1 || true
+            sleep 0.4
+        fi
+        osascript -e "tell application \"System Events\" to tell (first application process whose unix id is $pid) to set size of window 1 to {$w, $h}" \
+            >/dev/null 2>&1 || true
+        sleep 0.6
+        got=$("$PROMO_WINBOUNDS" "$pid" 2>/dev/null | cut -d' ' -f4,5)
+        [ "$got" = "$w $h" ] || continue
+        if promo_vd_clicks_clear "$pid"; then
+            echo "   窓: $("$PROMO_WINBOUNDS" "$pid" | cut -d' ' -f2,3) ${w}x${h}pt（押す点は他の窓に覆われていない）"
+            return 0
+        fi
+    done
+    echo "ERROR: 窓を ${w}x${h}pt で押せる場所へ置けない（実測 ${got:-不明}）。" >&2
+    echo "       仮想ディスプレイが他の worker の隔離 tako で埋まっている" >&2
+    echo "       （$("$PROMO_WINBOUNDS" --all 2>/dev/null | wc -l | tr -d ' ') 窓）。空いてから撮り直すこと" >&2
+    return 1
+}
+
+# **押す点だけ**が他の窓に覆われていないことを確かめる（$1 = pid。0 = 覆われていない）。
+#
+# 「窓が 1 ピクセルも重なっていない」を条件にすると、他の worker の隔離 tako が
+# 面の中央に居るだけで撮れなくなる（2560x1440pt の面の中央に 960x600 の窓があると、
+# 960x540 を余白 40/60 の格子に置く限りどこかは必ず重なる = 2026-09-09 実測）。
+# **絵は窓単体キャプチャなので手前に何が来ても自分の中身しか写らない**（#470 の実測）。
+# 実害があるのはクリックだけ（手前の窓へ吸われる）なので、押す点だけを見る。
+# 覆う窓が自分より奥にある場合まで弾くのは過剰だが、前後関係は当てにできないので安全側に倒す。
+# 押す点は PROMO_CLICK_POINTS（"px,py px,py …" = 窓内ピクセル）で渡す
+PROMO_CLICK_POINTS=${PROMO_CLICK_POINTS:-}
+promo_vd_clicks_clear() {
+    local pid=$1 b
+    [ -n "$PROMO_CLICK_POINTS" ] || return 0
+    b=$("$PROMO_WINBOUNDS" "$pid" 2>/dev/null) || return 1
+    "$PROMO_WINBOUNDS" --all 2>/dev/null | /usr/bin/python3 -c '
+import sys
+me = sys.argv[1].split()
+mid, mx, my = me[0], float(me[1]), float(me[2])
+points = [p.split(",") for p in sys.argv[2].split()]
+others = []
+for line in sys.stdin:
+    f = line.split()
+    if len(f) < 6 or f[0] == mid:
+        continue
+    others.append((f[1], float(f[2]), float(f[3]), float(f[4]), float(f[5])))
+bad = False
+for px, py in points:
+    gx, gy = mx + float(px) / 2, my + float(py) / 2
+    for opid, ox, oy, ow, oh in others:
+        if ox <= gx < ox + ow and oy <= gy < oy + oh:
+            print(f"   押す点 {px},{py} が pid {opid} の窓に覆われている（{int(ox)},{int(oy)} {int(ow)}x{int(oh)}）")
+            bad = True
+            break
+sys.exit(1 if bad else 0)
+' "$b" "$PROMO_CLICK_POINTS"
+}
+
+# 仮想ディスプレイの中で、**押す点が他の窓に覆われない** w x h の置き場所を「x y」で返す。
+# 完全な空き（promo_vd_free_origin）が取れればそれを使い、取れなければ押す点だけで判定する
+promo_vd_origin_for_clicks() {
+    local w=$1 h=$2 free
+    free=$(promo_vd_free_origin "$w" "$h")
+    [ -n "$PROMO_CLICK_POINTS" ] || { printf '%s' "$free"; return 0; }
+    "$PROMO_WINBOUNDS" --all 2>/dev/null | /usr/bin/python3 -c '
+import sys
+w, h = float(sys.argv[1]), float(sys.argv[2])
+X, Y, W, H = (float(v) for v in sys.argv[3:7])
+padx, pady = float(sys.argv[7]), float(sys.argv[8])
+points = [tuple(float(v) for v in p.split(",")) for p in sys.argv[9].split()]
+fallback = sys.argv[10]
+mywid = sys.argv[11]
+others = []
+for line in sys.stdin:
+    f = line.split()
+    if len(f) < 6 or f[0] == mywid:   # 自分の窓は除く（点は必ずその中に入る）
+        continue
+    others.append((float(f[2]), float(f[3]), float(f[4]), float(f[5])))
+
+def clear(ox, oy):
+    for px, py in points:
+        gx, gy = ox + px / 2, oy + py / 2
+        for wx, wy, ww, wh in others:
+            if wx <= gx < wx + ww and wy <= gy < wy + wh:
+                return False
+    return True
+
+y = Y + pady
+while y + h <= Y + H:
+    x = X + padx
+    while x + w <= X + W:
+        if clear(x, y):
+            print(int(x), int(y))
+            sys.exit(0)
+        x += padx
+    y += pady
+print(fallback)
+' "$w" "$h" "$PROMO_VD_X" "$PROMO_VD_Y" "$PROMO_VD_W" "$PROMO_VD_H" \
+  "$PROMO_VD_PAD_X" "$PROMO_VD_PAD_Y" "$PROMO_CLICK_POINTS" "$free" \
+  "$("$PROMO_WINBOUNDS" "${PROMO_APP_PID:-0}" 2>/dev/null | cut -d' ' -f1)"
+}
+
+# 収録用アカウント（`TAKO_PROMO_CLAUDE_CONFIG_DIR`）を隔離インスタンスへ登録する。
+#
+# **これが無いと、かんたん表示のチャット判定が永久に立たない**（2026-09-09 実測）。
+# チャット判定の材料 `live_claude_sessions_by_backend` は `claude agents --json` の
+# 出力に乗るが、その走査対象は `agent_scan_targets`（= accounts.yaml + 既定）なので、
+# `CLAUDE_CONFIG_DIR` を env で渡しただけのアカウントの会話は 1 件も見えない
+# （既定の走査は `CLAUDE_CONFIG_DIR` を外して走る）。登録すると、その config dir でも
+# 走査が走る = チャット表示になる（実測: 登録前 terminal のまま / 登録後 25 秒で chat。
+# 認識が最悪 30 秒遅れるのは #1011 の UI 鮮度窓）。
+# 書き込み先は隔離 data_dir（`tko` が TAKO_DATA_DIR を渡す）なので本番の
+# accounts.yaml には触れない
+promo_register_recording_account() {
+    [ -n "$PROMO_CLAUDE_CONFIG_DIR" ] || return 0
+    tko orchestrator accounts add rec --config-dir "$PROMO_CLAUDE_CONFIG_DIR" \
+        --description "収録用（#1081）" >/dev/null 2>&1 || {
+        echo "ERROR: 収録用アカウントを登録できない（チャット判定が立たない）" >&2
+        return 1
+    }
+    echo "   収録用アカウント登録: rec → $PROMO_CLAUDE_CONFIG_DIR"
 }
 
 # タイムライン tsv（explainer-timeline.tsv）を bash の read で安全に読める形へ正規化する。
