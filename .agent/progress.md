@@ -80,3 +80,9 @@
 - `agent_install::AgentKind` を 3 値・`recipe(platform, agent)` を 6 マスへ（codex / agy の公式手順は実物で確認。codex は代行時 `CODEX_NON_INTERACTIVE=1` が必須 = 無いと `Start Codex now?` で返らない・agy は単一バイナリ）。`setup_bootstrap` の全操作を `_for(agent)` へ寄せ、**引数なしの claude 既定入口は残していない**
 - setup は「1 つでも使える系統があれば素通り / 無いときだけ途中まで入っているものを優先して仕上げる」形へ（単一選択を強制しない）。認証誘導・失敗案内・CLI 解決のフォールバックも系統ごと。Windows で代行するのは claude だけ（宣言 2 か所）
 - まっさら HOME + PATH 剥ぎで 3 系統の実インストール通し + 冪等（2 回目は `unchanged`）。A/B `TAKO_989_LEGACY=1` は「codex だけの HOME で claude を勧める」を再現。番犬 4 本（修正前ソースで claude 既定入口 11 個を名指しして FAILED）+ セルフテスト項目 119 拡張
+
+## 2026-09-09（#944: cargo test が本番の data dir と HOME 配下の設定へ書かないようにした）
+- 置き場を決める側を倒した: `paths::data_dir()` が**実行時に**テストバイナリを見分けて隔離先へ（`cfg(test)` はクレートを跨がない）＋ `orchestrator::agent_config_home()` の `cfg(test)` 隔離＋単体テストからは `claude agents --json` を起こさない
+- 「メインスレッド専有」は `mark_main_thread()` 済みのプロセスだけが名乗る。`setup` の移設と #577 e2e の後始末も隔離に合わせた（実ユーザーの setup / 残骸掃除が壊れる穴を先に塞いだ）
+- 番犬 `test_write_isolation`（空 HOME で子を起こし 0 ファイル）+ A/B `TAKO_944_LEGACY=1`。実測 36 → 0 ファイル。副産物で `ensure_trusted` が置き場ごと無い環境で黙って失敗する穴も直した
+

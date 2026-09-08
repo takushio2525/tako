@@ -40,8 +40,19 @@ fn referenced_paths() -> BTreeSet<(Root, String)> {
             for (marker, prefix) in MARKERS {
                 let mut from = 0usize;
                 while let Some(found) = text[from..].find(marker) {
-                    let at = from + found + marker.len();
+                    let start = from + found;
+                    let at = start + marker.len();
                     from = at;
+                    // **語の途中で当てない**: `claude_default_config_dir()` は
+                    // `~/.claude` を指す別物で、data dir 配下ではない（#944）。
+                    // 直前が識別子の文字なら別の関数名の一部
+                    if text[..start]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                    {
+                        continue;
+                    }
                     // マーカー直後の限られた範囲だけを見る（無関係な join を拾わない）。
                     // 日本語コメントを含むので、必ず char 境界で切る
                     let mut end = text.len().min(at + 300);

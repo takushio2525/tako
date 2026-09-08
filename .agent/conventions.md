@@ -1008,6 +1008,41 @@ Dock のピン留めは `.app` への **file URL ブックマーク**（`com.app
   両方が旧手順へ戻っていないことを file 単位で検査する）
 - A/B は `TAKO_1042_LEGACY=1`（修正前の手順をそのまま再現する。計測専用）
 
+## テストの書き先は本番の外（Issue #944 / #1030 / #1022 / #1123）
+
+**`cargo test` は、ユーザーの data dir にもホーム配下の設定にも 1 バイトも書かない。**
+`TAKO_DATA_DIR` を渡し忘れた `cargo test --workspace` が本番へ書いていた実測（修正前）:
+`<data_dir>` に 20 ファイル（`perf.log` / `persist.log` / `sessions.yaml` /
+`task_checkpoints.yaml` / `shell-integration/` / `*-backend.conf`）、data dir の**外**に
+`~/.claude.json`・`~/.claude/backups/`・`~/.codex/config.toml`・
+`~/.gemini/antigravity-cli/settings.json`・`~/.cache/powershell/`。
+診断ログには偽の「メインスレッド専有」が 643 行、`~/.claude.json` にはテスト用 cwd の
+事前信頼が数千件積もっていた。
+
+塞ぐのは**書く側ではなく「置き場を決める側」**。3 つの型を使い分ける。
+
+- **data dir 配下 → `tako_core::paths::data_dir()` が実行時に倒す**（1 か所で全部）。
+  `cfg(test)` は**クレートを跨がない**（`tako-control` のテストから呼ばれた
+  `tako-core::shell_integration::install` は素通りする / 統合テストから見た lib も
+  非テストビルド）ので、テストプロセスかどうかを **`current_exe()` の置き場**で判定する
+  （`<target>/<profile>/deps/<名前>-<hash>`。`cargo run` も `.app` も `deps/` を通らない）。
+  **明示の `TAKO_DATA_DIR` は常に優先**する
+- **ホーム配下の外部エージェント設定 → `orchestrator::agent_config_home()`**（`cfg(test)` で
+  隔離）。`home_dir()` 自体は倒さない（表示・比較のテストが壊れる）。
+  `CLAUDE_CONFIG_DIR` もテストでは**読まない**（テストプロセスの env は本番を指している）
+- **外部 CLI の起動 → テストビルドでは起こさない**。`claude agents --json` は claude 本体が
+  `~/.claude.json` を書き戻して `~/.claude/backups/` を積むので、単体テストからは起こさない
+  （実 CLI を通す検証は統合テスト側 = 非テストビルドの lib を束ねる方が担う）。
+  テストが `pwsh` 等を起こすときは `XDG_CACHE_HOME` / `LOCALAPPDATA` を一時 dir へ向ける
+
+- 番犬は `tako_control::test_write_isolation`（lib の**単体**テスト。`cfg(test)` の隔離を
+  見るので統合テストには置けない）。**空の `HOME` で子プロセスを起こし、そこに
+  ファイルが 1 つも出来ないこと**を実測する（「隔離したフラグが立った」では見ない）
+- A/B は `TAKO_944_LEGACY=1`。同じ子が本番相当の場所へ書くことを番犬自身が確かめるので、
+  **検査に検出力があること**もテストで固定されている
+- 新しい永続ファイルを足したら、番犬の子（`子プロセス_本番相当の書き込みを一通り行う`）へ
+  その書き込みを 1 行足す
+
 ## 設定・データファイルのスキーマ変更（Issue #916）
 
 **永続ファイルの形式や置き場を変えるときは自動移行を同梱する。手動移行を要求しない。**
