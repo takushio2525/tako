@@ -88,7 +88,7 @@ fn without_legacy(block: &str) -> String {
 fn cleanupのsocket引数を捨てていない() {
     let root = workspace_root();
     let src = read(&root, "crates/tako-control/src/dispatch.rs");
-    let arm = code_only(&block_after(&src, "Request::TmuxCleanup { socket } =>"));
+    let arm = code_only(&block_after(&src, "Request::TmuxCleanup { socket, .. } =>"));
     assert!(
         !arm.contains("let _ = socket"),
         "TmuxCleanup が socket を捨てている（#1187 の再発）:\n{arm}"
@@ -113,7 +113,7 @@ fn cleanupは見送りの理由を応答とpersistlogへ出す() {
     let src = read(&root, "crates/tako-control/src/dispatch.rs");
     let arm = without_legacy(&code_only(&block_after(
         &src,
-        "Request::TmuxCleanup { socket } =>",
+        "Request::TmuxCleanup { socket, .. } =>",
     )));
     assert!(
         arm.contains("\"skipped\""),
@@ -189,5 +189,70 @@ fn orphan判定はグループの生死をメンバー数で見る() {
     assert!(
         core.contains("session_group_size"),
         "list-sessions の書式に #{{session_group_size}} が無い（材料そのものを取っていない）"
+    );
+}
+
+/// #1192: サーバー単位の回収が「名前の接頭辞で一括 kill」へ戻らないための番犬。
+/// 落とすのは 3 つ:
+/// 1. 判定が所有者の生死（`live_owner_pids` / 生きた tako-app）を見ていない
+/// 2. 既定が dry-run でない（`apply` を渡さずに kill できてしまう）
+/// 3. `--apply` が CLI / MCP のどちらかから欠ける（AI から同じ操作ができない = 開発不変条件）
+#[test]
+fn サーバー回収は所有者の生死で判定し既定はdry_runである() {
+    let root = workspace_root();
+    let core = read(&root, "crates/tako-core/src/tmux_cleanup.rs");
+    let judge = code_only(&block_after(&core, "pub fn judge_server_with("));
+    for needle in [
+        "live_owner_pids",
+        "PeerOwned",
+        "ClientsAttached",
+        "OwnerUnknown",
+    ] {
+        assert!(
+            judge.contains(needle),
+            "サーバーの回収判定が {needle} を見ていない（所有者の生死で決めていない = #625 の事故クラス）:\n{judge}"
+        );
+    }
+    let apply = code_only(&block_after(&core, "pub fn cleanup_servers_from("));
+    assert!(
+        apply.contains("if apply && verdict.is_actionable()"),
+        "回収の実行が apply で守られていない（既定 dry-run が壊れている）:\n{apply}"
+    );
+    assert!(
+        apply.contains("client_count"),
+        "kill の直前に attach の再確認をしていない（走査からの時間差で誰かが繋いだサーバーを落とす）:\n{apply}"
+    );
+
+    // CLI と MCP の両方から同じ操作ができること（開発不変条件）
+    let cli = read(&root, "crates/tako-cli/src/main.rs");
+    assert!(
+        cli.contains("servers: bool") && cli.contains("apply: bool"),
+        "CLI に --servers / --apply が無い"
+    );
+    let mcp = read(&root, "crates/tako-control/src/mcp/request.rs");
+    let arm = code_only(&block_after(&mcp, "\"tako_tmux_cleanup\" =>"));
+    assert!(
+        arm.contains("servers") && arm.contains("apply"),
+        "MCP から servers / apply を渡せない:\n{arm}"
+    );
+}
+
+/// #1192: 使い捨てソケット（`tako-iso-<自分の pid>` / `tako-st-<自分の pid>`）は
+/// 終了時に自分で片付ける。**明示指定された `TAKO_TMUX_SOCKET` には触らない**
+/// （再起動をまたいでセッションを残す検証が実在する = #770）
+#[test]
+fn 使い捨てbackendサーバーは終了時に自分で片付ける() {
+    let root = workspace_root();
+    let app = read(&root, "crates/tako-app/src/main.rs");
+    let quit = code_only(&block_after(&app, "cx.on_app_quit("));
+    assert!(
+        quit.contains("owns_disposable_socket") && quit.contains("kill_server"),
+        "終了時に使い捨て backend サーバーを片付けていない（#1192 の溜まる側）:\n{quit}"
+    );
+    let core = read(&root, "crates/tako-core/src/tmux_cleanup.rs");
+    let owns = code_only(&block_after(&core, "pub fn owns_disposable_socket("));
+    assert!(
+        owns.contains("isolated_socket_name") && owns.contains("self_test_socket_name"),
+        "使い捨ての判定が「自分の pid から作った名前」になっていない:\n{owns}"
     );
 }

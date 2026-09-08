@@ -358,9 +358,19 @@ pub enum Request {
     /// セッション内で `window` 番号の window に切り替える。`pane` 省略時は呼び出し元ペイン
     TmuxSelectWindow { pane: Option<u64>, window: u32 },
     /// orphan tmux セッションの一括クリーンアップ（FR-2.16.11）。`socket` 省略時は
-    /// tako バックエンドサーバー。detached・非 grouped・未使用の `tako-` セッションのみ
-    /// kill する（使用中・ユーザーセッションには触れない）。kill した名前を返す
-    TmuxCleanup { socket: Option<String> },
+    /// tako バックエンドサーバー。detached・グループに仲間がいない・未使用の `tako-`
+    /// セッションのみ kill する（使用中・ユーザーセッションには触れない）。
+    ///
+    /// `servers` = true でセッションではなく**サーバー（ソケット）単位の回収**へ切り替える
+    /// （#1192。隔離・テストが立てた tmux サーバーの残骸）。既定は dry-run で、
+    /// `apply` = true のときだけ実際に kill / ソケット削除を行う
+    TmuxCleanup {
+        socket: Option<String>,
+        #[serde(default)]
+        servers: bool,
+        #[serde(default)]
+        apply: bool,
+    },
     /// タブのリネーム（FR-2.12.1）。`tab` 省略時は `pane`（呼び出し元）の属するタブ。
     /// `source` = "auto" なら `set_title_auto`（手動リネーム済みタブは上書きしない）。
     /// "manual"（既定）なら `set_title_manual`（自動リネームをブロック）。

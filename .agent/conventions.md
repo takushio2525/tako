@@ -1070,6 +1070,14 @@ env -u TAKO_SOCKET -u TAKO_TOKEN -u TAKO_PANE_ID -u TERM -u COLORTERM \
   TAKO_SELF_TEST=1 TAKO_ISOLATED=1 cargo run -p tako-app
 ```
 
+- **隔離起動が立てた tmux サーバーは終わったら消える**（#1192）。`TAKO_ISOLATED=1` /
+  `TAKO_SELF_TEST=1` で**ソケット名を指定しなかった**起動は `tako-iso-<pid>` /
+  `tako-st-<pid>` を使い、終了時（`on_app_quit`）に自分でサーバーごと落とす。
+  **`TAKO_TMUX_SOCKET` を明示した起動は落とさない**（再起動をまたいでセッションを残す
+  検証が実在する = #770）ので、明示した検証は**自分で `tmux -L <名前> kill-server`**
+  まで書く。SIGKILL や落ちた検証の残骸は `tako tmux cleanup --servers`
+  （既定 dry-run。実削除は `--apply`）で回収する。判定は所有 pid の生死なので、
+  **他 worker の生きているサーバーは対象にならない**
 - **面を指定するのは `TAKO_DISPLAY=<名前 | UUID | index>`**。`TAKO_ISOLATED` /
   `TAKO_SELF_TEST` / `TAKO_VISUAL_TEST` のどれかが立っていれば**未指定でも** `tako-vd` を狙う
 - **通常起動は 1 ビットも変わらない**（未指定 かつ 非検証なら置き先は未解決のまま）

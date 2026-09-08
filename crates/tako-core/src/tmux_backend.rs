@@ -535,11 +535,11 @@ pub fn kill_server(socket: &str) {
     remove_socket_file(socket);
 }
 
-/// tmux ソケットファイルを削除する。tmux は kill-server 後もファイルを残すことがある。
+/// tmux ソケットファイルを削除する（#1192 の残骸回収も同じ 1 実装を使う）。tmux は kill-server 後もファイルを残すことがある。
 /// tmux は TMUX_TMPDIR → /tmp の順でソケットディレクトリを決定する（TMPDIR は使わない）。
 /// macOS では /tmp → /private/tmp のシンボリックリンク解決でソケット名末尾に `=` が付くため
 /// 両方試す
-fn remove_socket_file(socket: &str) {
+pub(crate) fn remove_socket_file(socket: &str) {
     let Some(base) = socket_dir() else { return };
     let _ = std::fs::remove_file(base.join(socket));
     let _ = std::fs::remove_file(base.join(format!("{socket}=")));
@@ -548,14 +548,14 @@ fn remove_socket_file(socket: &str) {
 /// tmux がソケットを置くディレクトリ（`$TMUX_TMPDIR|/tmp` の `tmux-<uid>`）。
 /// Windows には tmux もこのレイアウトも存在しないため `None`
 #[cfg(unix)]
-fn socket_dir() -> Option<std::path::PathBuf> {
+pub(crate) fn socket_dir() -> Option<std::path::PathBuf> {
     let uid = unsafe { libc::getuid() };
     let tmpdir = std::env::var("TMUX_TMPDIR").unwrap_or_else(|_| "/tmp".into());
     Some(std::path::Path::new(&tmpdir).join(format!("tmux-{uid}")))
 }
 
 #[cfg(windows)]
-fn socket_dir() -> Option<std::path::PathBuf> {
+pub(crate) fn socket_dir() -> Option<std::path::PathBuf> {
     None
 }
 
@@ -603,10 +603,13 @@ impl TmuxTestGuard {
     }
 }
 
-/// テストソケット名（`tako-coretest-<用途>-<pid>`）の所有プロセス ID
+/// テストソケット名（`tako-coretest-<用途>-<pid>`）の所有プロセス ID。
+/// 抽出は製品コードと 1 実装（#1192 の `owner_pid_candidates`）
 #[cfg(test)]
 fn socket_owner_pid(name: &str) -> Option<u32> {
-    name.rsplit('-').next()?.parse().ok()
+    crate::tmux_cleanup::owner_pid_candidates(name)
+        .into_iter()
+        .next_back()
 }
 
 /// 掃除してよい残骸ソケットか。
@@ -628,26 +631,9 @@ fn is_stale_socket(name: &str, is_alive: impl Fn(u32) -> bool) -> bool {
     socket_owner_pid(base).is_some_and(|pid| !is_alive(pid))
 }
 
-/// プロセスが生きているか。`kill(pid, 0)` はシグナルを送らず存在と権限だけを見る
-/// （EPERM = 別ユーザーの生存プロセス）
-#[cfg(all(test, unix))]
-fn process_alive(pid: u32) -> bool {
-    if pid == 0 {
-        // 0 はプロセスグループ指定になるため所有者判定には使わない（= 触らない）
-        return true;
-    }
-    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-/// Windows には tmux ソケットのレイアウトが無く `cleanup_stale_sockets` は
-/// `socket_dir()` が None を返して早期 return するが、コンパイルは通す必要がある
-#[cfg(all(test, windows))]
-fn process_alive(_pid: u32) -> bool {
-    true
-}
+/// プロセスの生存判定は製品コードと 1 実装（#1192 で `ports::process_alive` へ集約）
+#[cfg(test)]
+use crate::ports::process_alive;
 
 #[cfg(test)]
 impl Drop for TmuxTestGuard {
