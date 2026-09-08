@@ -1399,6 +1399,13 @@ enum FileCommand {
     Open { path: String },
     /// 指定アプリで開く
     OpenWith { path: String, name: String },
+    /// tako の中で開く（ファイル = プレビューペイン / ディレクトリ = そのディレクトリの
+    /// シェル。ターミナル内のパスリンクの cmd+クリック・パスメニューと同じ動作。#1182）
+    OpenInTako {
+        path: String,
+        #[arg(long)]
+        pane: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -6560,6 +6567,13 @@ fn build_request(command: &Command) -> Result<Request, String> {
             path: resolve_cli_path(path),
             name: Some(name.clone()),
             pane: None,
+        },
+        // #1182: 開き先（プレビュー / シェル）は分割元のペインを基準に決まるので pane を渡す
+        Command::File(FileCommand::OpenInTako { path, pane }) => Request::FileOp {
+            op: tako_control::protocol::FileOpKind::OpenInTako,
+            path: resolve_cli_path(path),
+            name: None,
+            pane: target_pane(*pane)?,
         },
         Command::Video(VideoCommand::Play { pane }) => Request::VideoPlayback {
             pane: target_pane(*pane)?,

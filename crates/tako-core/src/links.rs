@@ -63,9 +63,22 @@ fn combined_screen_text(screen: &Screen) -> (String, Vec<(usize, usize, usize)>)
             combined.push(ch);
             byte_map.push((offset, row, col));
         }
+        // 右端まで埋まっているか = **最後の「空白でない」文字が右端の列に在るか**。
+        //
+        // `line.cell_cols.last()` を見てはいけない（#1182）: 実画面の `ScreenLine.text`
+        // は**行末まで空白で埋まっている**（`screen::compose_line` は未使用セルも
+        // 押し込む）ので、`cell_cols.last()` は常に最終列 = **どの行も soft wrap 扱い**に
+        // なる。すると画面全体が改行なしの 1 本へ連結され、パストークンが次の行の
+        // 先頭と融合して実在しなくなる（実測: 隣接する 2 行に何か書かれているだけで
+        // ターミナル内のパスリンクが 1 つも検出されなかった）。
+        // 単体テストの `make_screen` は空白詰めをしないので、この形は再現しない
+        let last_visible_col = trimmed
+            .chars()
+            .count()
+            .checked_sub(1)
+            .and_then(|last_idx| line.cell_cols.get(last_idx).copied());
         let line_fills_width = trimmed.chars().count() >= screen.cols
-            || (!trimmed.is_empty()
-                && line.cell_cols.last().copied().unwrap_or(0) + 1 >= screen.cols);
+            || last_visible_col.is_some_and(|col| col + 1 >= screen.cols);
         if !line_fills_width {
             let offset = combined.len();
             combined.push('\n');
@@ -747,6 +760,121 @@ mod tests {
         assert_eq!(link.spans.len(), 2);
         assert_eq!(link.spans[0].0, 0);
         assert_eq!(link.spans[1].0, 1);
+        cleanup_test_dir(&dir);
+    }
+
+    /// **実画面と同じ形**（行末まで空白で埋まった `text` + 全列ぶんの `cell_cols`）の
+    /// スクリーンを作る。`screen::compose_line` は未使用セルも押し込むので、
+    /// 実機の `ScreenLine` はこの形になる（#1182）
+    fn make_padded_screen(lines: &[&str], cols: usize) -> Screen {
+        Screen {
+            cols,
+            rows: lines.len(),
+            lines: lines
+                .iter()
+                .map(|text| {
+                    // 幅は「列」で数える（全角は 2 列）
+                    let mut cell_cols: Vec<usize> = Vec::new();
+                    let mut col = 0usize;
+                    let mut padded = String::new();
+                    for ch in text.chars() {
+                        cell_cols.push(col);
+                        padded.push(ch);
+                        col += if ch.is_ascii() { 1 } else { 2 };
+                    }
+                    // 行末まで空白で埋める（実画面と同じ）
+                    while col < cols {
+                        cell_cols.push(col);
+                        padded.push(' ');
+                        col += 1;
+                    }
+                    let has_wide = cell_cols.windows(2).any(|w| w[1] - w[0] > 1);
+                    ScreenLine {
+                        text: padded,
+                        runs: Vec::new(),
+                        cell_cols,
+                        has_wide,
+                    }
+                })
+                .collect(),
+            cursor: None,
+            ime_cursor: None,
+            display_offset: 0,
+            fract: 0.0,
+            extra_bottom: None,
+        }
+    }
+
+    /// #1182: **隣り合う行がどちらも空でない実画面**でパスを検出できること。
+    ///
+    /// 旧実装は soft wrap の判定に「空白詰めを含む最終セルの列」を使っていたため、
+    /// 実画面ではどの行も「右端まで埋まっている」= 折り返し扱いになり、画面全体が
+    /// 改行なしの 1 本へ連結された。結果、パストークンが次の行の先頭と融合して
+    /// 実在しなくなり、**ターミナル内のパスリンクが 1 つも検出されなかった**
+    /// （プロンプト行が続く実画面では常に踏む）
+    #[test]
+    fn 空白詰めの実画面でも隣接行のパスを検出する() {
+        let dir = setup_test_dir("padded");
+        // **画面に出す形は `/` 区切り**にする（`is_path_like` は `/` を含まない
+        // Windows のバックスラッシュ形式を候補にしない = #153 の既存制約。
+        // ここで見たいのは soft wrap の判定なので、両 OS で成立する形で書く）
+        let lines = [
+            // 素のファイル名は候補にならない（`is_path_like`）ので `./` を付ける
+            "./README.md 更新",
+            "src/main.rs:12 で失敗",
+            // 続くプロンプト行（実画面では空でない行が必ず来る）
+            "~ ❯",
+        ];
+        let screen = make_padded_screen(&lines, 120);
+        let links = detect_links_with_cwd(&screen, Some(dir.as_path()));
+        let targets: Vec<String> = links
+            .iter()
+            .filter(|l| l.kind == LinkKind::Path)
+            .map(|l| l.target.clone())
+            .collect();
+        let a = dir.join("README.md");
+        let b = dir.join("src/main.rs");
+        assert!(
+            targets.iter().any(|t| std::path::Path::new(t) == a),
+            "1 行目のパスが検出されない: {targets:?}"
+        );
+        assert!(
+            targets.iter().any(|t| std::path::Path::new(t) == b),
+            "2 行目のパスが検出されない: {targets:?}"
+        );
+        // ヒットテスト（クリック位置）も行ごとに正しく引ける
+        assert_eq!(
+            link_at(&links, 0, 2).map(|l| std::path::Path::new(&l.target).to_path_buf()),
+            Some(a)
+        );
+        assert_eq!(
+            link_at(&links, 1, 2).map(|l| std::path::Path::new(&l.target).to_path_buf()),
+            Some(b)
+        );
+        cleanup_test_dir(&dir);
+    }
+
+    /// 空白詰めでも**本当に右端まで埋まった行**は従来どおり次行へ直結する（折り返し）。
+    ///
+    /// 折り返しを起こすには**絶対パスの長さ**が要るので unix 限定
+    /// （Windows のバックスラッシュ形式は `is_path_like` が候補にしない = #153 の既存制約）
+    #[cfg(unix)]
+    #[test]
+    fn 空白詰めでも右端まで埋まった行は折り返しとして繋ぐ() {
+        let dir = setup_test_dir("padded_wrap");
+        let abs = dir.join("deep/nested/file.txt");
+        let quoted = format!("`{}`", abs.display());
+        let cols = 24;
+        let (first, second) = quoted.split_at(cols);
+        // 1 行目はちょうど 24 列（詰める余地が無い）、2 行目は空白詰めされる
+        let screen = make_padded_screen(&[first, second], cols);
+        let links = detect_links_with_cwd(&screen, None);
+        let link = links
+            .iter()
+            .find(|l| l.kind == LinkKind::Path)
+            .expect("折り返された絶対パスを検出する");
+        assert_eq!(link.target, abs.to_string_lossy());
+        assert_eq!(link.spans.len(), 2);
         cleanup_test_dir(&dir);
     }
 

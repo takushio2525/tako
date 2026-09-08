@@ -33,6 +33,7 @@ pub mod menu;
 pub mod palette;
 pub mod pane_menu;
 pub mod panel;
+pub mod path_menu;
 pub mod ports;
 pub mod preview;
 pub mod remote;

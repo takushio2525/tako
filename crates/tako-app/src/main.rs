@@ -1653,6 +1653,17 @@ struct TakoApp {
     ssh_connect: HashMap<PaneId, SshConnect>,
     /// ペインヘッダ / タブの右クリックメニュー（#185）
     pane_context_menu: Option<PaneContextMenu>,
+    /// ターミナル内のパスリンクの cmd+右クリックメニュー（#1182）。
+    /// ペインヘッダのメニュー（#185）とは出る場所・項目・対象が別物なので分けてある
+    /// （あちらは「このペインに対して」、こちらは「このパスに対して」）
+    path_link_menu: Option<PathLinkMenu>,
+    /// パスメニューの各項目の実描画矩形（#1182。項目 147 が**合成マウスで実際に押す**ため）。
+    ///
+    /// 何も描かない prepaint プローブ（#803 と同じ作法）で、**メニューが開いている
+    /// あいだだけ** 1 フレームに項目数ぶん書き込む。押下の処理を直呼びするテストでは
+    /// 「押した瞬間に自分が消えて `on_click` が発火しない」型のバグ（#496 / #503）を
+    /// 検出できないので、実矩形が要る
+    path_link_item_rects: PathLinkItemRects,
     /// ファイルツリーのインライン編集
     inline_edit: Option<InlineEdit>,
     /// D&D 中のペイロード種別（FR-2.16.10 / FR-3.11）。on_drag 開始でセット、
@@ -3070,6 +3081,23 @@ enum PaneContextKind {
     Preview,
 }
 
+/// パスメニューの項目 id → 実描画矩形の採取先（#1182。項目 147 が押す位置の正）
+type PathLinkItemRects = std::rc::Rc<std::cell::RefCell<Vec<(&'static str, Bounds<Pixels>)>>>;
+
+/// ターミナル内のパスリンクを cmd+右クリックしたときのメニュー（#1182）。
+///
+/// 対象は**リンク検出（`tako_core::links`）が解決した絶対パス**なので、相対パス・
+/// `~` 始まり・`path:12` のどれを押しても cmd+クリックと同じ 1 つのパスに落ちる
+struct PathLinkMenu {
+    /// リンクが載っているペイン（`open-in-tako` の分割元・相対パスの基準）
+    pane: PaneId,
+    path: std::path::PathBuf,
+    /// 開いた時点でのディレクトリ判定。**毎フレーム `is_dir()` を呼ばない**
+    /// （render は毎フレーム走るので、そこで FS を叩くと #772 と同じ主スレッド専有になる）
+    is_dir: bool,
+    position: Point<Pixels>,
+}
+
 /// ファイルツリーのインライン編集（FR-3.12）
 #[derive(Clone)]
 struct InlineEdit {
@@ -3506,6 +3534,8 @@ impl TakoApp {
             remote_file_loading: HashMap::new(),
             ssh_connect: HashMap::new(),
             pane_context_menu: None,
+            path_link_menu: None,
+            path_link_item_rects: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             inline_edit: None,
             sidebar_width: {
                 // #789: ここではまだウィンドウが無いので上限は課さない（下限だけ）。
@@ -13494,6 +13524,129 @@ impl TakoApp {
         cx.notify();
     }
 
+    /// cmd+右クリック: パスリンクのコンテキストメニューを出す（#1182）。
+    ///
+    /// **開く条件は cmd+クリックと完全に同じ**（同じ `refresh_pane_links` /
+    /// `tako_core::link_at` の材料を通す）ので、「クリックで開けるものは右クリックでも
+    /// メニューが出る」が構造で揃う。条件を満たさない右クリックは**何もしない**
+    /// （伝播も止めない = ルート側の dismiss がそのまま働く）
+    fn on_pane_right_mouse_down(
+        &mut self,
+        pane_id: PaneId,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // #1182 前の挙動（ターミナル本体は右クリックを一切扱わない）へ戻す A/B の口。
+        // 同一バイナリで「メニューが無い」状態を作れるので、セルフテスト項目 147 の
+        // 検出力をそのまま実証できる
+        if Self::path_link_menu_legacy() {
+            return;
+        }
+        // `TAKO_SELF_TEST_1182` を立てると**どこで見送ったか**を 1 行出す
+        // （「メニューが出ない」の原因を修飾キー / 座標 / リンク不在で言い分ける）
+        let diag = std::env::var_os("TAKO_SELF_TEST_1182").is_some();
+        let bail = |reason: &str| {
+            if diag {
+                println!("TAKO_SELF_TEST_1182: right_click bail={reason}");
+            }
+        };
+        if !event.modifiers.platform {
+            bail("no-cmd");
+            return;
+        }
+        // ミラースクロール表示中は視覚位置とリンク検出座標が一致しない（#159。
+        // cmd+クリックと同じ理由でここでも判定しない）
+        if self
+            .scroll_ctls
+            .get(&pane_id)
+            .is_some_and(|c| c.mirror_scrolling())
+        {
+            bail("mirror-scrolling");
+            return;
+        }
+        let Some((col, row, _right)) = self.cell_at(pane_id, event.position, window) else {
+            bail("no-cell");
+            return;
+        };
+        // ホバー中のリンク → その場で採り直したリンク の順で見る（cmd+クリックと同じ）
+        let hovered = self
+            .hovered_link
+            .as_ref()
+            .filter(|l| l.kind == tako_core::LinkKind::Path && l.contains(pane_id, row, col))
+            .map(|l| l.target.clone());
+        let target = hovered.or_else(|| {
+            self.refresh_pane_links(pane_id);
+            self.pane_links
+                .get(&pane_id)
+                .and_then(|links| tako_core::link_at(links, row, col))
+                .filter(|l| l.kind == tako_core::LinkKind::Path)
+                .map(|l| l.target.clone())
+        });
+        let Some(target) = target else {
+            if diag {
+                let n = self.pane_links.get(&pane_id).map(|l| l.len()).unwrap_or(0);
+                println!(
+                    "TAKO_SELF_TEST_1182: right_click bail=no-link cell=({row},{col}) links={n}"
+                );
+            }
+            return;
+        };
+        if diag {
+            println!("TAKO_SELF_TEST_1182: right_click hit cell=({row},{col}) target={target:?}");
+        }
+        let path = std::path::PathBuf::from(&target);
+        // ここまで来たら「このパスに対する操作」を出すので、ペインの選択・
+        // 他のメニューは畳んでからメニューを開く
+        cx.stop_propagation();
+        let _ = self.workspace.active_tab_mut().tree_mut().focus(pane_id);
+        self.pane_context_menu = None;
+        self.path_link_menu = Some(PathLinkMenu {
+            pane: pane_id,
+            is_dir: path.is_dir(),
+            path,
+            position: event.position,
+        });
+        cx.notify();
+    }
+
+    /// `TAKO_1182_LEGACY=1` で **#1182 前の挙動**（ターミナル内のパスリンクに
+    /// 右クリックメニューが無い）へ戻す。同一バイナリで A/B を取る入口
+    fn path_link_menu_legacy() -> bool {
+        std::env::var_os("TAKO_1182_LEGACY").is_some()
+    }
+
+    /// パスリンクメニューの項目を実行する（#1182）。
+    ///
+    /// **共通の項目はファイルツリー（#314）の `handle_context_action` へそのまま流す**
+    /// ので、同じ id が同じ dispatch を通る（メニューが 2 つあっても実装は 1 つ）。
+    /// ここが持つのは「tako で開く」だけ
+    fn handle_path_link_action(
+        &mut self,
+        action: &str,
+        path: &std::path::Path,
+        is_dir: bool,
+        pane: PaneId,
+        cx: &mut Context<Self>,
+    ) {
+        // リンクは「実在するパス」だけが検出されるが、メニューを開いてから押すまでに
+        // 消えることはある。**黙って何も起きない**のを避けて診断へ残す
+        if !path.exists() {
+            eprintln!(
+                "warning: パスが見つからない（メニューを開いたあとに消えた?）: {}",
+                path.display()
+            );
+            return;
+        }
+        match tako_core::path_menu::PathMenuAction::parse(action) {
+            Some(tako_core::path_menu::PathMenuAction::OpenInTako) => {
+                self.open_path_in_tako(&path.display().to_string(), pane, cx);
+            }
+            Some(_) => self.handle_context_action(action, path, is_dir, cx),
+            None => eprintln!("warning: 未知のパスメニュー項目: {action}"),
+        }
+    }
+
     /// リンクを開く。URL はデフォルトブラウザ、パスはペイン分割して表示。
     /// 将来 webview ペインに差し替える場合はここを変更する。
     fn open_link(
@@ -13508,63 +13661,48 @@ impl TakoApp {
                 let _ = tako_control::platform::os_integration::open_url(target);
             }
             tako_core::LinkKind::Path => {
-                let path = std::path::Path::new(target);
-                if path.is_dir() {
-                    // ディレクトリ: 右に分割して cd
-                    let result = tako_control::dispatch(
-                        self,
-                        tako_control::protocol::Request::Split {
-                            pane: Some(pane_id.as_u64()),
-                            tab: None,
-                            direction: Some(tako_control::protocol::Direction::Right),
-                            ratio: None,
-                            command: None,
-                            cwd: Some(target.to_string()),
-                            focus: Some(true),
-                        },
-                        PaneOrigin::User,
-                    );
-                    match result {
-                        Ok(_) => {
-                            // UI から dispatch を直接呼ぶため、IPC / MCP ループと同じ
-                            // pending_attach 後処理をここで実行する。これを欠くとツリー上に
-                            // 空ペインだけができ、PTY も cwd も存在しない（#153）。
-                            for (pane, options) in std::mem::take(&mut self.pending_attach) {
-                                if let Err(e) = self.spawn_session(pane, options, cx) {
-                                    eprintln!("warning: ディレクトリペインを開けない: {e}");
-                                    self.remove_pane(pane, cx);
-                                }
-                            }
-                            for (pane, data) in std::mem::take(&mut self.pending_writes) {
-                                if let Some(session) = self.terminals.get(&pane) {
-                                    session.write(data);
-                                }
-                            }
-                        }
-                        Err(e) => eprintln!("warning: ディレクトリを開けない: {e}"),
-                    }
-                } else {
-                    // ファイル: 右に分割してプレビュー
-                    let result = tako_control::dispatch(
-                        self,
-                        tako_control::protocol::Request::OpenFile {
-                            pane: Some(pane_id.as_u64()),
-                            path: target.to_string(),
-                            mode: None,
-                            direction: Some(tako_control::protocol::Direction::Right),
-                            focus: Some(true),
-                            new_tab: false,
-                        },
-                        PaneOrigin::User,
-                    );
-                    if let Err(e) = result {
-                        eprintln!("warning: ファイルを開けない: {e}");
-                    }
-                }
-                self.drain_pending_highlights(cx);
-                cx.notify();
+                self.open_path_in_tako(target, pane_id, cx);
             }
         }
+    }
+
+    /// パスを tako の中で開く（ファイル = プレビューペイン / ディレクトリ = そのディレクトリの
+    /// シェル。どちらも `pane_id` を右へ分割する）。
+    ///
+    /// **振り分けそのものは dispatch（`FileOpKind::OpenInTako`）が持つ**ので、ここは
+    /// 「UI から dispatch を直接呼んだとき」の後処理だけを行う。cmd+クリック（#147 / #153）と
+    /// パスリンクのメニュー（#1182）と CLI / MCP が同じ 1 実装を通る形にするため
+    fn open_path_in_tako(&mut self, target: &str, pane_id: PaneId, cx: &mut Context<Self>) {
+        let result = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::FileOp {
+                op: tako_control::protocol::FileOpKind::OpenInTako,
+                path: target.to_string(),
+                name: None,
+                pane: Some(pane_id.as_u64()),
+            },
+            PaneOrigin::User,
+        );
+        match result {
+            Ok(_) => {
+                // IPC / MCP ループと同じ pending_attach 後処理をここで実行する。
+                // これを欠くとツリー上に空ペインだけができ、PTY も cwd も存在しない（#153）
+                for (pane, options) in std::mem::take(&mut self.pending_attach) {
+                    if let Err(e) = self.spawn_session(pane, options, cx) {
+                        eprintln!("warning: ディレクトリペインを開けない: {e}");
+                        self.remove_pane(pane, cx);
+                    }
+                }
+                for (pane, data) in std::mem::take(&mut self.pending_writes) {
+                    if let Some(session) = self.terminals.get(&pane) {
+                        session.write(data);
+                    }
+                }
+            }
+            Err(e) => eprintln!("warning: パスを開けない: {e}"),
+        }
+        self.drain_pending_highlights(cx);
+        cx.notify();
     }
 
     /// 境界ハンドルの押下でドラッグ開始（リサイズ）。選択は始めない
@@ -18021,6 +18159,16 @@ impl TakoApp {
                     this.on_pane_mouse_down(pane_id, event, window, cx);
                 }),
             )
+            // #1182: cmd+右クリックでパスリンクのコンテキストメニュー。
+            // **cmd 無しの右クリックとリンクの無い場所では何もしない**
+            // （ターミナル本体はこれまで右クリックを一切扱っていないので、
+            // 従来の挙動をそのまま残す = 押しても変化なし）
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.on_pane_right_mouse_down(pane_id, event, window, cx);
+                }),
+            )
             .on_scroll_wheel(
                 cx.listener(move |this, event: &ScrollWheelEvent, window, cx| {
                     this.on_pane_scroll(pane_id, event, window, cx);
@@ -20831,6 +20979,140 @@ impl EntityInputHandler for TakoApp {
 }
 
 impl TakoApp {
+    /// ターミナル内のパスリンクの cmd+右クリックメニュー描画（#1182）。
+    ///
+    /// 幾何（幅・行高・クランプ）とクリックの作法（項目・背面で
+    /// `stop_propagation` = #496 / #503）はペインメニュー（#185）と同じ形にしてある
+    fn render_path_link_menu(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let ctx = self.path_link_menu.as_ref()?;
+        let theme = &self.theme;
+        let pane_id = ctx.pane;
+        let path = ctx.path.clone();
+        let is_dir = ctx.is_dir;
+        let pos = ctx.position;
+        // ファイルマネージャの呼び名は OS で変わる（#617）
+        let fm = tako_control::platform::os_integration::file_manager();
+        let items = path_link_menu_items(is_dir, fm);
+        // 実矩形プローブの器を毎フレーム作り直す（#1182。項目 147 が押す位置の正）
+        self.path_link_item_rects.borrow_mut().clear();
+
+        let menu_width: f32 = 220.0;
+        let item_height: f32 = 20.0;
+        let sep_height: f32 = 5.0;
+        let padding_y: f32 = 8.0;
+        // 対象のパスを見出しとして出す（どのリンクに対するメニューかを確定させる）
+        let header_height: f32 = 18.0;
+        let menu_height: f32 = items
+            .iter()
+            .map(|(id, _)| {
+                if id.starts_with("sep") {
+                    sep_height
+                } else {
+                    item_height
+                }
+            })
+            .sum::<f32>()
+            + padding_y
+            + header_height;
+        let adjusted = clamp_menu_position(pos, menu_width, menu_height, window);
+        let header_label = SharedString::from(tako_core::truncate_path_middle(
+            &path.display().to_string(),
+            34,
+        ));
+
+        let menu = div()
+            .absolute()
+            .left(adjusted.x)
+            .top(adjusted.y)
+            .w(px(menu_width))
+            .py(px(4.0))
+            .bg(rgba(theme.tab_bar_background))
+            .border_1()
+            .border_color(hsla(theme.pane_border))
+            .rounded_md()
+            .text_size(px(12.0))
+            .text_color(hsla(theme.foreground))
+            .occlude()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .w_full()
+                    .px_2()
+                    .pb(px(2.0))
+                    .h(px(header_height))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_size(px(10.0))
+                    .text_color(hsla(theme.text_muted))
+                    .child(header_label),
+            )
+            .children(items.into_iter().enumerate().map(|(i, (id, label))| {
+                if id.starts_with("sep") {
+                    return div()
+                        .h(px(1.0))
+                        .mx_1()
+                        .my(px(2.0))
+                        .bg(hsla_alpha(theme.pane_border, 0.5))
+                        .into_any_element();
+                }
+                let path = path.clone();
+                let rects = self.path_link_item_rects.clone();
+                div()
+                    .id(("path-link-item", i as u64))
+                    .relative()
+                    .w_full()
+                    .px_2()
+                    .py(px(2.0))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgba(theme.tab_active_background)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.path_link_menu = None;
+                        this.handle_path_link_action(id, &path, is_dir, pane_id, cx);
+                        cx.notify();
+                    }))
+                    .child(SharedString::from(label.to_string()))
+                    // 何も描かない矩形採取（#803 と同じ作法。見た目にもレイアウトにも出ない）
+                    .child(
+                        canvas(
+                            move |bounds, _, _| rects.borrow_mut().push((id, bounds)),
+                            |_, _, _, _| (),
+                        )
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                    )
+                    .into_any_element()
+            }));
+        let backdrop = div()
+            .id("path-link-backdrop")
+            .absolute()
+            .left(px(0.0))
+            .top(px(0.0))
+            .size_full()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.path_link_menu = None;
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _, _, cx| {
+                    this.path_link_menu = None;
+                    cx.notify();
+                }),
+            )
+            .child(menu);
+        Some(backdrop.into_any_element())
+    }
+
     /// ペインヘッダ / タブの右クリックメニュー描画（#185）
     fn render_pane_context_menu(
         &self,
@@ -21063,6 +21345,51 @@ pub(crate) struct PaneMenuFacts {
     pub restart_modes: Vec<tako_core::session_restart::SessionRestartMode>,
     /// ファイルマネージャの呼び名（#617）
     pub file_manager: tako_control::platform::os_integration::FileManager,
+}
+
+/// ターミナル内のパスリンクの cmd+右クリックメニューの項目（id, 表示名）。#1182
+///
+/// **並びと出し分けの正は `tako_core::path_menu`**（GUI を立てずに検査できる純粋関数）で、
+/// ここは id を文言へ写すだけ。文言はファイルツリー（#314）と同じ関数を引くので
+/// 「同じ操作に別の言い回し」が構造的に起きない。`sep*` は区切り線
+pub(crate) fn path_link_menu_items(
+    is_dir: bool,
+    fm: tako_control::platform::os_integration::FileManager,
+) -> Vec<(&'static str, &'static str)> {
+    use tako_core::path_menu::{PathMenuAction as A, PathMenuItem};
+    let mut sep = 0usize;
+    tako_core::path_menu::items(is_dir)
+        .into_iter()
+        .map(|item| match item {
+            PathMenuItem::Separator => {
+                sep += 1;
+                // 区切り線の id は `sep*`（render 側が高さと描画を切り替える印）。
+                // 数が増えても `sep` 始まりであれば区切り線として扱われる
+                match sep {
+                    1 => ("sep1", ""),
+                    2 => ("sep2", ""),
+                    _ => ("sep3", ""),
+                }
+            }
+            PathMenuItem::Action(a) => (
+                a.id(),
+                match a {
+                    A::OpenInTako => {
+                        if is_dir {
+                            ui_text::path_menu::open_in_tako_dir()
+                        } else {
+                            ui_text::path_menu::open_in_tako_file()
+                        }
+                    }
+                    A::OpenDefault => ui_text::path_menu::open_default(),
+                    A::OpenWith => ui_text::path_menu::open_with(),
+                    A::Reveal => ui_text::path_menu::reveal(fm),
+                    A::CopyRelativePath => ui_text::path_menu::copy_rel(),
+                    A::CopyAbsolutePath => ui_text::path_menu::copy_abs(),
+                },
+            ),
+        })
+        .collect()
 }
 
 /// ペインの右クリックメニューの項目（id, 表示名）。`sep*` は区切り線
@@ -21710,6 +22037,8 @@ impl Render for TakoApp {
         // #919: リモート行のメニュー（項目がローカル用とまったく別）
         let remote_context_overlay = self.render_remote_context_menu(window, cx);
         let pane_context_overlay = self.render_pane_context_menu(window, cx);
+        // #1182: ターミナル内のパスリンクの cmd+右クリックメニュー
+        let path_link_overlay = self.render_path_link_menu(window, cx);
         // サイドバー tmux ビューのホバープレビュー（FR-2.16.13。マウス位置に実画面サムネイル）
         let hover_preview_overlay = self.render_hover_preview(window);
         // ピン留めされた常駐プレビュー（FR-2.16.15。アプリ内フローティングウィンドウ）
@@ -22085,6 +22414,7 @@ impl Render for TakoApp {
             .children(remote_context_overlay)
             .children(context_menu_overlay)
             .children(pane_context_overlay)
+            .children(path_link_overlay)
             .children(hover_preview_overlay)
             .children(pinned_overlays)
             .children(self.render_limit_service_overlay(cx))
@@ -64408,6 +64738,639 @@ mod self_test {
                 }
             }
 
+            // --- 項目 147: ターミナル内のパスリンクの cmd+右クリックメニュー（#1182） ---
+            //
+            // 検査するのは 4 つ:
+            //   ① **開く条件が cmd+クリックと同じ**（絶対 / 引用符つき空白 + 日本語 /
+            //      ディレクトリ / 行番号つきで出る・存在しないパスでは出ない）
+            //   ② **cmd 無しの右クリックでは出ない**（ターミナル本体の従来の挙動を奪わない）
+            //   ③ **メニューが実際に描かれ、各項目に押せる矩形が在る**（prepaint プローブ）
+            //   ④ 項目を**合成マウスで実際に押すと**効く（`copy-abs` はクリップボード /
+            //      `open-in-tako` はペイン）
+            //
+            // 押下は**実 OS マウスと同じ `PlatformInput` 経路**で流す（#496 の作法）。
+            // ハンドラ直呼びでは「押した瞬間に自分が消えて `on_click` が発火しない」型
+            // （#496 / #503）を検出できない。そのために**表示モードを terminal へ倒す**
+            // 前提づくりが要る: `render_pane` は `pane_display_for` が `Starter` を返すと
+            // ターミナル本体を描かずに差し替えるので、GUI モードのままでは右クリックの
+            // ハンドラを載せた要素が存在せず、合成マウスがペインへ 1 度も届かない
+            // （症状は「`cell_at` は当たるのにハンドラが呼ばれない」。詳細は
+            // `.agent/conventions.md`「セルフテストでターミナル本体を操作するなら
+            // 表示モードを terminal へ倒す」節）。
+            //
+            // `reveal` / `open-default` / `open-with` は**押さない**: 実 Finder / 実アプリ /
+            // OS のアプリ選択ダイアログが立ち上がり、手元にも CI にも副作用が残る。
+            // これらは dispatch（`FileOp`）の 1 実装を通るので CLI の e2e と実機で見る
+            //
+            // **Windows では走らせない**: ターミナル内のパス検出は `/` を含む形だけを
+            // 候補にするので（`links::is_path_like`。#153 の既存制約）、`C:\…` の
+            // 絶対パスはそもそもリンクにならない。メニューの並び・文言・出し分けは
+            // `path_link_menu_items` の単体が macOS 上から両 OS 分を検査している
+            if cfg!(unix) {
+                // **ウィンドウの handle を採り直す**（#381 / #830 と同じ作法）。
+                // 項目 78 でウィンドウを開き直しているので、冒頭で掴んだ handle は古い
+                let any1182 = cx.update(|cx| cx.windows().first().copied()).unwrap_or(any);
+                let window1182 = any1182.downcast::<TakoApp>().unwrap_or(window);
+                // A/B の口（#1182）。`TAKO_1182_LEGACY=1` はメニューを出さない旧挙動へ戻すので
+                // ① が確定 FAILED になる = この項目に検出力があることを毎回確かめられる
+                let legacy1182 = std::env::var("TAKO_1182_LEGACY").is_ok_and(|v| !v.is_empty());
+                // fixture は**スクラッチに自分で作る**（ユーザーのファイルを開かない）
+                let base147 =
+                    std::env::temp_dir().join(format!("tako_st1182_{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&base147);
+                let plain147 = base147.join("plain.txt");
+                let spaced147 = base147.join("読み 込み.txt");
+                let dir147 = base147.join("入れ物");
+                let missing147 = base147.join("missing.txt");
+                let made147 = std::fs::create_dir_all(&dir147).is_ok()
+                    && std::fs::write(&plain147, "st1182\n").is_ok()
+                    && std::fs::write(&spaced147, "st1182\n").is_ok();
+                check(
+                    made147,
+                    "147: fixture（空白 + 日本語を含むパス）を作れる (#1182)",
+                );
+                // 画面へ出す行に引用符が混ざると `paint_and_hold` の printf 引数が割れる
+                check(
+                    !base147.display().to_string().contains(['\'', '"']),
+                    "147: 一時ディレクトリのパスに引用符が無い（fixture の前提。#1182）",
+                );
+
+                // **前提: このペインは「ターミナル表示」でなければならない**（#694 / #1182）。
+                //
+                // `render_pane` は `pane_display_for` が `Starter` / `Chat` を返すと
+                // **ターミナル本体を描かずに差し替える**ので、GUI モードのままだと
+                // 右クリックのハンドラを載せた要素がそもそも存在しない（実測: 先行項目が
+                // 残した GUI モードのせいで、`cell_at` は当たるのに合成マウスが
+                // ペインへ 1 度も届かなかった）。**項目のあいだだけ**自分で terminal へ
+                // 倒し、終わったら元へ戻す（#1175 の「前提はその項目のあいだだけ作る」）
+                let ui_mode_before147 = window1182
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        let before = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::UiMode {
+                                action: None,
+                                mode: None,
+                                pane: None,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                        .and_then(|v| v["mode"].as_str().map(str::to_string));
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::UiMode {
+                                action: Some("set".into()),
+                                mode: Some("terminal".into()),
+                                pane: None,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                        cx.notify();
+                        before
+                    })
+                    .ok()
+                    .flatten();
+
+                // 全高のペインが 1 枚だけ在るタブ。**アクティブにする**のはレイアウトが
+                // 走らないとペインに実寸が付かないため（#1162 と同じ理由）
+                let pane147 = window1182
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        let r = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::TabNew {
+                                title: Some("st1182".into()),
+                                focus: Some(true),
+                                cwd: None,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                        cx.notify();
+                        for (pane, options) in std::mem::take(&mut app.pending_attach) {
+                            let _ = app.spawn_session(pane, options, cx);
+                        }
+                        r.ok()
+                            .and_then(|v| v["pane"].as_u64())
+                            .unwrap_or_else(|| app.focused_pane().as_u64())
+                    })
+                    .unwrap_or(0);
+                let pane_id147 = tako_core::PaneId::from_raw(pane147);
+                let _ = wait_for_pane_ready(window1182, cx, pane_id147, Duration::from_secs(30)).await;
+                // 実寸をペインの端末へ届けてから描く（#1162）
+                notify_and_draw(any1182, window1182, cx);
+                wait(cx, 150).await;
+                notify_and_draw(any1182, window1182, cx);
+
+                // 5 行の fixture。空白入りは**二重引用符**で囲む（`extract_path_tokens` が
+                // 剥がす。単引用符は printf の引数を割るので使えない）
+                let body147 = format!(
+                    "{}\n\"{}\"\n{}\n{}\n{}:42:5\n",
+                    plain147.display(),
+                    spaced147.display(),
+                    dir147.display(),
+                    missing147.display(),
+                    plain147.display(),
+                );
+                let paint147 = sh.paint_and_hold(&body147, 120);
+                let _ = window1182.update(cx, |app: &mut TakoApp, _, cx| {
+                    if let Some(term) = app.terminals.get(&pane_id147) {
+                        term.write(self_test::pty_line(&paint147));
+                    }
+                    cx.notify();
+                });
+                // 出るのを**状態で**待つ（固定窓にしない。#796 / #1165）
+                let shown147 = wait_for_dispatch_state(
+                    window1182,
+                    cx,
+                    "147: fixture のパスが画面に出る (#1182)",
+                    state_wait_budget(Duration::from_secs(20), machine_busy()),
+                    Duration::from_millis(150),
+                    {
+                        // **打ち込んだコマンドのエコーで満たされない条件にする**（#796）。
+                        // `paint_and_hold` の引数にはこのパスがそのまま入っているので
+                        // `contains` だと「まだ clear も printf も走っていない画面」で
+                        // 成立し、以降の検査が全部エコー行を見ることになる
+                        let needle = plain147.display().to_string();
+                        move |app: &mut TakoApp| {
+                            let theme = app.theme.clone();
+                            app.terminals.get(&pane_id147).is_some_and(|s| {
+                                s.screen(&theme).lines.iter().any(|l| l.text.trim() == needle)
+                            })
+                        }
+                    },
+                )
+                .await;
+                check(shown147.is_some(), "147: fixture のパスが画面に出る (#1182)");
+                notify_and_draw(any1182, window1182, cx);
+
+                // ペインの幾何（`cell_at_clamped` の逆写像）。行は内容で探す
+                struct Geom147 {
+                    area: Bounds<Pixels>,
+                    cell: Size<Pixels>,
+                    subline: f32,
+                    lines: Vec<String>,
+                }
+                let geom147 = window1182
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        let theme = app.theme.clone();
+                        let area = app
+                            .pane_text_areas
+                            .iter()
+                            .find(|(id, _)| *id == pane_id147)
+                            .map(|(_, b)| *b)?;
+                        let cell = app.cell_size_for_pane(pane_id147)?;
+                        let session = app.terminals.get(&pane_id147)?;
+                        Some(Geom147 {
+                            area,
+                            cell,
+                            subline: session.scroll_subline_fract(),
+                            lines: session
+                                .screen(&theme)
+                                .lines
+                                .iter()
+                                .map(|l| l.text.clone())
+                                .collect(),
+                        })
+                    })
+                    .ok()
+                    .flatten();
+                let Some(geom147) = geom147 else {
+                    fail("147: パスリンクを載せたペインの幾何が採れない (#1182)")
+                };
+                let display147 = window1182
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        format!("{:?}", app.pane_display_for(pane_id147))
+                    })
+                    .unwrap_or_default();
+                check(
+                    display147 == "Terminal",
+                    &format!(
+                        "147: パスリンクのペインがターミナル表示（前提。#1182。\
+                         display={display147}）"
+                    ),
+                );
+                // 「その行の col 桁目」のウィンドウ座標。判定側（`cell_at_clamped`）と
+                // 同じ算術の逆で作る（セル中央を指す）
+                let at147 = |row: usize, col: usize| -> Point<Pixels> {
+                    let cw = f32::from(geom147.cell.width);
+                    let ch = f32::from(geom147.cell.height);
+                    point(
+                        geom147.area.origin.x + px(col as f32 * cw + cw / 2.0),
+                        geom147.area.origin.y
+                            + px(row as f32 * ch + ch / 2.0 - geom147.subline * ch),
+                    )
+                };
+                // 行は**その行だけが持つ形**で探す（`plain.txt` は行番号つきの行にも
+                // 現れるので、素のパスの行は「trim して一致」で採る）
+                let row_of147 = |needle: &str| -> Option<usize> {
+                    geom147.lines.iter().position(|l| l.trim() == needle)
+                };
+                println!(
+                    "TAKO_SELF_TEST_1182: legacy={legacy1182} pane={pane147} \
+                     cell={:.1}x{:.1} rows={} waited={:?}",
+                    f32::from(geom147.cell.width),
+                    f32::from(geom147.cell.height),
+                    geom147.lines.len(),
+                    shown147.map(|d| format!("{:.1}s", d.as_secs_f32())),
+                );
+
+                // **実 OS マウスと同じ `PlatformInput` 経路**で右クリックを流す（#496 の作法）。
+                // ハンドラ直呼びでは「押下の処理は動く」までしか押さえられず、
+                // 配線が外れていても気付けない。`hitbox.is_hovered` はフレーム構築時の
+                // hit test を見るので、動かしてから 1 フレーム描いてから押す
+                let right_click147 = |any: AnyWindowHandle,
+                                      cx: &mut AsyncApp,
+                                      row: usize,
+                                      col: usize,
+                                      cmd: bool| {
+                    let position = at147(row, col);
+                    let modifiers = Modifiers {
+                        platform: cmd,
+                        ..Modifiers::default()
+                    };
+                    let _ = window1182.update(cx, |app: &mut TakoApp, _, cx| {
+                        app.path_link_menu = None;
+                        app.hovered_link = None;
+                        cx.notify();
+                    });
+                    let _ = any.update(cx, |_, win, cx| {
+                        win.dispatch_event(
+                            gpui::PlatformInput::MouseMove(MouseMoveEvent {
+                                position,
+                                pressed_button: None,
+                                modifiers,
+                            }),
+                            cx,
+                        )
+                    });
+                    let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
+                    let _ = any.update(cx, |_, win, cx| {
+                        win.dispatch_event(
+                            gpui::PlatformInput::MouseDown(MouseDownEvent {
+                                button: MouseButton::Right,
+                                position,
+                                modifiers,
+                                click_count: 1,
+                                first_mouse: false,
+                            }),
+                            cx,
+                        )
+                    });
+                };
+                // メニュー項目を**実際に押す**（左クリック 1 回。配送順は
+                // mouse_down → mouse_up → click で、途中で自分が消えれば発火しない）
+                let click_item147 =
+                    |any: AnyWindowHandle, cx: &mut AsyncApp, at: Point<Pixels>| {
+                        for input in [
+                            gpui::PlatformInput::MouseMove(MouseMoveEvent {
+                                position: at,
+                                pressed_button: None,
+                                modifiers: Modifiers::default(),
+                            }),
+                            gpui::PlatformInput::MouseDown(MouseDownEvent {
+                                button: MouseButton::Left,
+                                position: at,
+                                modifiers: Modifiers::default(),
+                                click_count: 1,
+                                first_mouse: false,
+                            }),
+                            gpui::PlatformInput::MouseUp(MouseUpEvent {
+                                button: MouseButton::Left,
+                                position: at,
+                                modifiers: Modifiers::default(),
+                                click_count: 1,
+                            }),
+                        ] {
+                            let _ = any.update(cx, |_, win, cx| win.dispatch_event(input, cx));
+                        }
+                    };
+                // メニューの現在状態（対象パス・種別・項目 id）
+                let menu147 = |window: WindowHandle<TakoApp>,
+                               cx: &mut AsyncApp|
+                 -> Option<(String, bool, Vec<&'static str>)> {
+                    window
+                        .update(cx, |app: &mut TakoApp, _, _| {
+                            app.path_link_menu.as_ref().map(|m| {
+                                (
+                                    m.path.display().to_string(),
+                                    m.is_dir,
+                                    path_link_menu_items(
+                                        m.is_dir,
+                                        tako_control::platform::os_integration::file_manager(),
+                                    )
+                                    .into_iter()
+                                    .map(|(id, _)| id)
+                                    .collect::<Vec<_>>(),
+                                )
+                            })
+                        })
+                        .ok()
+                        .flatten()
+                };
+
+                // ① 絶対パス（ファイル）
+                let row_plain = row_of147(&plain147.display().to_string()).unwrap_or(0);
+                right_click147(any1182, cx, row_plain, 2, true);
+                let m1 = menu147(window1182, cx);
+                println!("TAKO_SELF_TEST_1182: file row={row_plain} menu={m1:?}");
+                check(
+                    m1.as_ref().is_some_and(|(p, is_dir, _)| {
+                        std::path::Path::new(p) == plain147.as_path() && !*is_dir
+                    }),
+                    "147: ファイルのパスリンクの cmd+右クリックでメニューが出る (#1182)",
+                );
+                check(
+                    m1.as_ref().is_some_and(|(_, _, ids)| {
+                        [
+                            "open-in-tako",
+                            "open-default",
+                            "open-with",
+                            "reveal",
+                            "copy-abs",
+                            "copy-rel",
+                        ]
+                        .iter()
+                        .all(|want| ids.contains(want))
+                    }),
+                    "147: ファイルのメニューに 6 項目が揃う (#1182)",
+                );
+
+                // ② cmd 無しの右クリックでは出ない（従来のターミナル本体の挙動）
+                right_click147(any1182, cx, row_plain, 2, false);
+                check(
+                    menu147(window1182, cx).is_none(),
+                    "147: cmd 無しの右クリックではメニューを出さない (#1182)",
+                );
+
+                // ③ 空白 + 日本語のパス（画面では引用符つき）。引用符の内側を押す
+                let row_spaced = row_of147(&format!("\"{}\"", spaced147.display())).unwrap_or(1);
+                right_click147(any1182, cx, row_spaced, 3, true);
+                let m3 = menu147(window1182, cx);
+                println!("TAKO_SELF_TEST_1182: spaced row={row_spaced} menu={m3:?}");
+                check(
+                    m3.as_ref()
+                        .is_some_and(|(p, _, _)| std::path::Path::new(p) == spaced147.as_path()),
+                    "147: 空白 + 日本語を含むパスでもメニューが出る (#1182)",
+                );
+
+                // ④ ディレクトリ: 既定アプリ系を出さない（ツリー #314 と同じ規則）
+                let row_dir = row_of147(&dir147.display().to_string()).unwrap_or(2);
+                right_click147(any1182, cx, row_dir, 2, true);
+                let m4 = menu147(window1182, cx);
+                println!("TAKO_SELF_TEST_1182: dir row={row_dir} menu={m4:?}");
+                check(
+                    m4.as_ref().is_some_and(|(p, is_dir, _)| {
+                        std::path::Path::new(p) == dir147.as_path() && *is_dir
+                    }),
+                    "147: ディレクトリのパスリンクでもメニューが出る (#1182)",
+                );
+                check(
+                    m4.as_ref().is_some_and(|(_, _, ids)| {
+                        ids.contains(&"open-in-tako")
+                            && ids.contains(&"reveal")
+                            && !ids.contains(&"open-default")
+                            && !ids.contains(&"open-with")
+                    }),
+                    "147: ディレクトリには既定アプリ系を出さない (#1182)",
+                );
+
+                // ⑤ 存在しないパスはリンクにならない = メニューも出ない
+                let row_missing = row_of147(&missing147.display().to_string()).unwrap_or(3);
+                right_click147(any1182, cx, row_missing, 2, true);
+                check(
+                    menu147(window1182, cx).is_none(),
+                    "147: 存在しないパスにはメニューを出さない (#1182)",
+                );
+
+                // ⑥ 行番号つき（`path:42:5`）は行番号を剥がした同じファイルが対象
+                let row_lineno = geom147
+                    .lines
+                    .iter()
+                    .position(|l| l.contains(":42:5"))
+                    .unwrap_or(4);
+                right_click147(any1182, cx, row_lineno, 2, true);
+                let m6 = menu147(window1182, cx);
+                println!("TAKO_SELF_TEST_1182: lineno row={row_lineno} menu={m6:?}");
+                check(
+                    m6.as_ref()
+                        .is_some_and(|(p, _, _)| std::path::Path::new(p) == plain147.as_path()),
+                    "147: 行番号つきのパスでも同じファイルがメニューの対象になる (#1182)",
+                );
+
+                // ⑦ **メニューが実際に描かれ、各項目に押せる矩形が在る**。
+                //    項目の実矩形は prepaint プローブ（#803 と同じ作法）が採る
+                right_click147(any1182, cx, row_plain, 2, true);
+                notify_and_draw(any1182, window1182, cx);
+                let rects147 = window1182
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.path_link_item_rects.borrow().clone()
+                    })
+                    .unwrap_or_default();
+                let want_ids147 = ["open-in-tako", "open-default", "open-with", "reveal"];
+                println!(
+                    "TAKO_SELF_TEST_1182: rects={:?}",
+                    rects147
+                        .iter()
+                        .map(|(id, b)| format!(
+                            "{id}@{:.0},{:.0} {:.0}x{:.0}",
+                            f32::from(b.origin.x),
+                            f32::from(b.origin.y),
+                            f32::from(b.size.width),
+                            f32::from(b.size.height)
+                        ))
+                        .collect::<Vec<_>>()
+                );
+                check(
+                    want_ids147
+                        .iter()
+                        .all(|want| rects147.iter().any(|(id, _)| id == want)),
+                    "147: メニューの各項目が実際に描かれる（押せる矩形が在る。#1182）",
+                );
+                check(
+                    rects147
+                        .iter()
+                        .all(|(_, b)| f32::from(b.size.width) > 20.0 && f32::from(b.size.height) > 5.0),
+                    "147: メニュー項目の矩形が潰れていない (#1182)",
+                );
+
+                // 任意のピクセル検証停止点（項目 69c の `TAKO_SELF_TEST_LINK_VISUAL` と
+                // 同じ作法）。通常の self-test では待機・保存をしない。
+                //
+                // **ここに置くのはレイアウトが動く前だから**（このあとの ⑨ が
+                // プレビューペインを増やすと `geom147` の座標が古くなる）。
+                // `--features visual-test` + `TAKO_VISUAL_DUMP_DIR` を付けると
+                // **GPUI が描いた実フレーム**を PNG で書き出す（仮想ディスプレイは
+                // `screencapture` が真っ黒を返すので、証拠は Metal の読み戻しから採る）
+                if std::env::var_os("TAKO_SELF_TEST_PATH_MENU_VISUAL").is_some() {
+                    for (label, row) in [("file", row_plain), ("dir", row_dir)] {
+                        right_click147(any1182, cx, row, 2, true);
+                        notify_and_draw(any1182, window1182, cx);
+                        let open = window1182
+                            .update(cx, |app: &mut TakoApp, _, _| {
+                                app.path_link_menu
+                                    .as_ref()
+                                    .map(|m| m.path.display().to_string())
+                            })
+                            .ok()
+                            .flatten();
+                        #[cfg(feature = "visual-test")]
+                        let saved = match (
+                            std::env::var("TAKO_VISUAL_DUMP_DIR"),
+                            capture_frame(any1182, cx),
+                        ) {
+                            (Ok(dir), Some((frame, _))) => frame
+                                .save(
+                                    std::path::Path::new(&dir)
+                                        .join(format!("path-menu-{label}.png")),
+                                )
+                                .is_ok(),
+                            _ => false,
+                        };
+                        #[cfg(not(feature = "visual-test"))]
+                        let saved = false;
+                        println!(
+                            "TAKO_PATH_MENU_VISUAL_READY: kind={label} open={open:?} saved={saved}"
+                        );
+                        wait(cx, 5_000).await;
+                    }
+                    let _ = window1182.update(cx, |app: &mut TakoApp, _, cx| {
+                        app.path_link_menu = None;
+                        cx.notify();
+                    });
+                    println!("TAKO_PATH_MENU_VISUAL_DONE");
+                }
+
+                // 実矩形を引くヘルパ（メニューが開いていて 1 フレーム描いた状態で呼ぶ）
+                let rect_of147 = |cx: &mut AsyncApp, id: &'static str| -> Option<Bounds<Pixels>> {
+                    window1182
+                        .update(cx, |app: &mut TakoApp, _, _| {
+                            app.path_link_item_rects
+                                .borrow()
+                                .iter()
+                                .find(|(k, _)| *k == id)
+                                .map(|(_, b)| *b)
+                        })
+                        .ok()
+                        .flatten()
+                };
+
+                // ⑧ 「絶対パスをコピー」を**実際に押す**（配送順まで通す = #496 / #503）
+                let _ = window1182.update(cx, |_, _, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string("st1182-before".into()));
+                });
+                right_click147(any1182, cx, row_plain, 2, true);
+                notify_and_draw(any1182, window1182, cx);
+                match rect_of147(cx, "copy-abs") {
+                    None => check(false, "147: 「絶対パスをコピー」の実矩形が採れる (#1182)"),
+                    Some(rect) => {
+                        click_item147(any1182, cx, rect.center());
+                        check(
+                            menu147(window1182, cx).is_none(),
+                            "147: 項目を押すとメニューが畳まれる (#1182)",
+                        );
+                    }
+                }
+                let copied147 = window1182
+                    .update(cx, |_, _, cx| cx.read_from_clipboard().and_then(|i| i.text()))
+                    .ok()
+                    .flatten();
+                println!("TAKO_SELF_TEST_1182: copied={copied147:?}");
+                check(
+                    copied147.as_deref().map(std::path::Path::new) == Some(plain147.as_path()),
+                    "147: 「絶対パスをコピー」がクリップボードへ入る (#1182)",
+                );
+
+                // ⑨ 「tako で開く」（ファイル）= プレビューペインが生える。
+                //    cmd+クリックと同じ dispatch（`FileOpKind::OpenInTako`）を通る
+                let before_panes147 = window1182
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.workspace.active_tab().tree().len()
+                    })
+                    .unwrap_or(0);
+                right_click147(any1182, cx, row_plain, 2, true);
+                notify_and_draw(any1182, window1182, cx);
+                let open_rect147 = rect_of147(cx, "open-in-tako");
+                check(
+                    open_rect147.is_some(),
+                    "147: 「tako で開く」の実矩形が採れる (#1182)",
+                );
+                if let Some(rect) = open_rect147 {
+                    click_item147(any1182, cx, rect.center());
+                }
+                let opened147 = wait_for_dispatch_state(
+                    window1182,
+                    cx,
+                    "147: 「tako で開く」でプレビューペインが生える (#1182)",
+                    state_wait_budget(Duration::from_secs(10), machine_busy()),
+                    Duration::from_millis(100),
+                    {
+                        // **末尾の 2 成分で照合する**。macOS の `/var` は `/private/var` への
+                        // シンボリックリンクなので、`std::env::temp_dir()` が返す `/var/…` と
+                        // プレビューが持つパスは前半が食い違う（実測: previews 側は
+                        // `/private/var/…`）。`canonicalize` を呼ぶと #970 の番犬に当たるので、
+                        // fixture のディレクトリ名（pid つきで一意）で見る
+                        let want: std::path::PathBuf = [
+                            base147.file_name().unwrap_or_default(),
+                            plain147.file_name().unwrap_or_default(),
+                        ]
+                        .iter()
+                        .collect();
+                        move |app: &mut TakoApp| {
+                            app.previews.values().any(|s| s.path.ends_with(&want))
+                        }
+                    },
+                )
+                .await;
+                let after_panes147 = window1182
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.workspace.active_tab().tree().len()
+                    })
+                    .unwrap_or(0);
+                let preview_paths147 = window1182
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.previews
+                            .values()
+                            .map(|s| s.path.display().to_string())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                println!(
+                    "TAKO_SELF_TEST_1182: open-in-tako panes {before_panes147} -> \
+                     {after_panes147} opened={opened147:?} previews={preview_paths147:?}"
+                );
+                check(
+                    opened147.is_some(),
+                    "147: 「tako で開く」でプレビューペインが生える (#1182)",
+                );
+                check(
+                    after_panes147 == before_panes147 + 1,
+                    "147: 「tako で開く」はペインを 1 枚だけ増やす (#1182)",
+                );
+
+                // 後片付け: この項目専用タブごと畳む + 表示モードを戻す + fixture を消す
+                let _ = window1182.update(cx, |app: &mut TakoApp, _, cx| {
+                    app.path_link_menu = None;
+                    let tab = app.workspace.active_tab().id();
+                    app.remove_tab(tab, cx);
+                    if let Some(mode) = ui_mode_before147.as_deref() {
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::UiMode {
+                                action: Some("set".into()),
+                                mode: Some(mode.to_string()),
+                                pane: None,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                    }
+                    cx.notify();
+                });
+                let _ = std::fs::remove_dir_all(&base147);
+            } else {
+                println!(
+                    "TAKO_SELF_TEST_SKIPPED: 147（Windows の `C:\\…` 形式は                      ターミナル内のパス検出の対象外 = #153 の既存制約。#1182）"
+                );
+            }
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);
@@ -69043,6 +70006,189 @@ mod chat_fixture_pin_watchdog {
         assert!(body_of(&pinned, "collect_chat_targets").contains("chat_fixture_panes"));
         // 番犬モジュール自身は走査から外れている（自分の文字列で素通りしない）
         assert!(!scanned(include_str!("main.rs")).contains("mod chat_fixture_pin_watchdog"));
+    }
+}
+
+/// パスメニューの押下が構造的に死んでいないことの番犬（#1182 / #496 / #503）。
+///
+/// ルート div の `on_mouse_down` はメニュー開閉状態をまとめて落とすので、
+/// **メニュー本体が押下の伝播を止めていないと、押した瞬間に自分が消えて
+/// `on_click` が 1 度も発火しない**（#496 の実例: コンフリクト解消の 3 択が
+/// merge 時から GUI で動いていなかった。CLI / MCP の同じ dispatch は動くので
+/// 気付けない）。素のセルフテストの窓は「完全に隠れて描画が止まる」ことがあり
+/// 合成マウスが新しいタブのペインへ当たらない（項目 147 の doc 参照）ので、
+/// この規約はソース走査で機械的に押さえる。
+#[cfg(test)]
+mod path_link_menu_click_watchdog {
+    /// `fn <name>` の本体だけを波括弧の対応で切り出す
+    fn body_of<'a>(src: &'a str, name: &str) -> &'a str {
+        let start = src
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("{name} が見つからない（構造が変わったら番犬も見直す）"));
+        let rest = &src[start..];
+        let open = rest
+            .find('{')
+            .unwrap_or_else(|| panic!("{name} の本体が見つからない"));
+        let mut depth = 0usize;
+        for (at, ch) in rest[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &rest[..open + at + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("{name} の本体が閉じていない");
+    }
+
+    #[test]
+    fn パスメニューは両ボタンの押下を止めて項目にon_clickを持つ() {
+        let body = body_of(include_str!("main.rs"), "render_path_link_menu");
+        // メニュー本体（項目の親）は左右どちらの押下も止める
+        assert!(
+            body.contains("on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())"),
+            "メニュー本体が左押下を止めていない（#496 / #503）"
+        );
+        assert!(
+            body.contains("on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())"),
+            "メニュー本体が右押下を止めていない（#496 / #503）"
+        );
+        // 項目は `on_click` で動作を呼ぶ（`on_mouse_down` で直に動かすと
+        // ドラッグ中の誤発火が起きるうえ、配送順の検証が効かない）
+        assert!(
+            body.contains("handle_path_link_action"),
+            "項目が動作ハンドラを呼んでいない"
+        );
+        assert!(
+            body.contains(".on_click(cx.listener("),
+            "項目が on_click で配線されていない"
+        );
+        // 背面（全画面 dismiss）を持つ = メニュー外クリックで閉じられる
+        assert!(
+            body.contains("path-link-backdrop"),
+            "メニュー外クリックで閉じる背面が無い"
+        );
+        // 実矩形プローブ（項目 147 が「描かれている」を見る材料）が残っている
+        assert!(
+            body.contains("path_link_item_rects"),
+            "項目の実矩形プローブが外れている（#1182 の項目 147 が空振りする）"
+        );
+    }
+
+    /// ターミナル本体の右クリックが**製品コードで配線されている**こと。
+    /// 項目 147 はハンドラ直呼びなので、配線そのものはここで見る
+    #[test]
+    fn ターミナル本体の右クリックが配線されている() {
+        let src = include_str!("main.rs");
+        let body = body_of(src, "render_pane");
+        let at = body
+            .find("MouseButton::Right")
+            .expect("ペイン本体に右クリックの配線が無い（#1182）");
+        assert!(
+            body[at..].contains("on_pane_right_mouse_down"),
+            "右クリックがパスメニューのハンドラへ繋がっていない（#1182）"
+        );
+    }
+}
+
+#[cfg(test)]
+mod path_link_menu_items_tests {
+    //! ターミナル内のパスリンクのメニュー（#1182）。
+    //!
+    //! **並びと出し分けの正は `tako_core::path_menu`**（そこに単体がある）ので、ここは
+    //! 「id が文言へ正しく写るか」と「ファイルツリー（#314）と同じ文言・同じ id を
+    //! 使っているか」= 二重実装になっていないかを見る
+    use super::path_link_menu_items;
+    use tako_control::platform::os_integration::FileManager;
+
+    fn ids(is_dir: bool) -> Vec<&'static str> {
+        path_link_menu_items(is_dir, FileManager::Finder)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    #[test]
+    fn 全項目に文言が付く() {
+        for is_dir in [false, true] {
+            for (id, label) in path_link_menu_items(is_dir, FileManager::Finder) {
+                if id.starts_with("sep") {
+                    assert_eq!(label, "", "区切り線に文言が付いている: {id}");
+                } else {
+                    assert!(!label.is_empty(), "文言が空: {id} (is_dir={is_dir})");
+                }
+            }
+        }
+    }
+
+    /// 共通の項目 id は**ファイルツリーの `handle_context_action` が解釈する id と同一**。
+    /// ここがずれると「メニューを押しても何も起きない」（`_ => {}` に落ちる）
+    #[test]
+    fn 共通項目のidはファイルツリーと同じ() {
+        let file = ids(false);
+        for id in [
+            "copy-rel",
+            "copy-abs",
+            "reveal",
+            "open-default",
+            "open-with",
+        ] {
+            assert!(file.contains(&id), "{id} が無い: {file:?}");
+        }
+        // ディレクトリでは既定アプリ系を出さない（ツリー #314 と同じ規則）
+        let dir = ids(true);
+        assert!(!dir.contains(&"open-default"), "{dir:?}");
+        assert!(!dir.contains(&"open-with"), "{dir:?}");
+        assert!(dir.contains(&"reveal"), "{dir:?}");
+    }
+
+    /// ファイルマネージャの呼び名は OS で入れ替わる（#617）。**Windows でも項目は消えない**
+    #[test]
+    fn revealの文言はosで入れ替わる_項目は消えない() {
+        for is_dir in [false, true] {
+            let mac = path_link_menu_items(is_dir, FileManager::Finder);
+            let win = path_link_menu_items(is_dir, FileManager::Explorer);
+            let mac_ids: Vec<_> = mac.iter().map(|(i, _)| *i).collect();
+            let win_ids: Vec<_> = win.iter().map(|(i, _)| *i).collect();
+            assert_eq!(mac_ids, win_ids, "OS で項目の並びが変わっている");
+            let mac_reveal = mac.iter().find(|(i, _)| *i == "reveal").unwrap().1;
+            let win_reveal = win.iter().find(|(i, _)| *i == "reveal").unwrap().1;
+            assert_ne!(mac_reveal, win_reveal, "呼び名が切り替わっていない (#617)");
+        }
+    }
+
+    /// ファイルとディレクトリで「tako で開く」の文言が変わる（何が起きるかを押す前に示す）
+    #[test]
+    fn tako_で開くの文言は種別で変わる() {
+        let label = |is_dir: bool| {
+            path_link_menu_items(is_dir, FileManager::Finder)
+                .into_iter()
+                .find(|(i, _)| *i == "open-in-tako")
+                .map(|(_, l)| l)
+                .unwrap()
+        };
+        assert_ne!(label(false), label(true));
+    }
+
+    /// 実行できる項目はすべて `handle_path_link_action` が解釈できる
+    /// （`PathMenuAction::parse` が `None` を返す id をメニューへ出していない）
+    #[test]
+    fn すべての項目が解釈できる() {
+        for is_dir in [false, true] {
+            for id in ids(is_dir) {
+                if id.starts_with("sep") {
+                    continue;
+                }
+                assert!(
+                    tako_core::path_menu::PathMenuAction::parse(id).is_some(),
+                    "解釈できない id: {id}"
+                );
+            }
+        }
     }
 }
 

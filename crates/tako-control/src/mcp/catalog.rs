@@ -944,20 +944,22 @@ pub fn tools() -> Vec<Value> {
                 create_dir = path 配下に name でフォルダ作成 /\n\
                 trash = ゴミ箱（Windows はごみ箱）へ移動。完全削除ではないので復元できる /\n\
                 open_default = デフォルトアプリで開く /\n\
-                open_with = name で指定したアプリで開く（name 必須）。\n\
+                open_with = name で指定したアプリで開く（name 必須）/\n\
+                open_in_tako = tako の中で開く（ファイル = プレビューペイン / ディレクトリ = そのディレクトリのシェル。\
+                ターミナル内のパスリンクの cmd+クリック・cmd+右クリックメニューと同じ動作）。\n\
                 rename / create_file / create_dir / open_with は name パラメータが必須。\
-                open_terminal / copy_relative_path は pane パラメータでペインを指定する。",
+                open_terminal / copy_relative_path / open_in_tako は pane パラメータでペインを指定する。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "op": {
                         "type": "string",
-                        "enum": ["copy_absolute_path","copy_relative_path","reveal","open_terminal","rename","create_file","create_dir","trash","open_default","open_with"],
+                        "enum": ["copy_absolute_path","copy_relative_path","reveal","open_terminal","rename","create_file","create_dir","trash","open_default","open_with","open_in_tako"],
                         "description": "操作種別",
                     },
                     "path": { "type": "string", "description": "対象のファイル・フォルダパス（必須）" },
                     "name": { "type": "string", "description": "新しい名前 / アプリ名（rename / create_file / create_dir / open_with で必須）" },
-                    "pane": pane_schema("対象ペイン ID（open_terminal の cd 先 / copy_relative_path の基準。省略時は呼び出し元）"),
+                    "pane": pane_schema("対象ペイン ID（open_terminal の cd 先 / copy_relative_path の基準 / open_in_tako の分割元。省略時は呼び出し元）"),
                 },
                 "required": ["op", "path"],
                 "additionalProperties": false,

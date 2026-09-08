@@ -2536,6 +2536,45 @@ fn dispatch_inner(
                         .map_err(DispatchError::Operation)?;
                     Ok(json!({ "opened": path.display().to_string(), "app": app_name }))
                 }
+                // #1182: ファイル / ディレクトリの振り分けだけをここで決め、開く実体は
+                // 既存の `OpenFile` / `Split` へ委ねる（**開き方の実装を 2 本にしない**）。
+                // UI 側の cmd+クリックもここを通るので、「リンクを開く」の意味が
+                // GUI・CLI・MCP で必ず一致する
+                FileOpKind::OpenInTako => {
+                    if !path.exists() {
+                        return Err(DispatchError::Operation(format!(
+                            "パスが存在しない: {}",
+                            path.display()
+                        )));
+                    }
+                    let is_dir = path.is_dir();
+                    let inner = if is_dir {
+                        Request::Split {
+                            pane,
+                            tab: None,
+                            direction: Some(Direction::Right),
+                            ratio: None,
+                            command: None,
+                            cwd: Some(path.display().to_string()),
+                            focus: Some(true),
+                        }
+                    } else {
+                        Request::OpenFile {
+                            pane,
+                            path: path.display().to_string(),
+                            mode: None,
+                            direction: Some(Direction::Right),
+                            focus: Some(true),
+                            new_tab: false,
+                        }
+                    };
+                    let inner_result = dispatch(host, inner, origin)?;
+                    Ok(json!({
+                        "opened": path.display().to_string(),
+                        "kind": if is_dir { "dir" } else { "file" },
+                        "result": inner_result,
+                    }))
+                }
             }
         }
         Request::GitLog { pane, max_count } => {
