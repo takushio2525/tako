@@ -19,12 +19,6 @@
 
 ---
 
-## 2026-09-07（#1143: 狭いペインの `/model` セレクタを選択肢ダイアログとして読めるようにした）
-- 実採取で原因確定: カーソル `❯` は「描かれない」のではなく**ダイアログがペインより高いと画面外へ出る**（25×70 では出る）。
-  経路 3（カーソルなしの番号つき連なりを anchor）+ `label_truncated` 申告 + 2 列レイアウトの説明列をラベルへ混ぜない、の 3 点で直した
-- fmt / clippy / `cargo test --workspace` 全緑（3521 件）+ 隔離 GUI（tako-vd）の実 claude 25 桁 × 44 行ペインで
-  CLI / MCP / watch の 3 経路を実測 / A/B `TAKO_1143_LEGACY=1` で新規 14 本中 10 本が FAILED。仕様は FR-2.25.11
-
 ## 2026-09-07（#1136: 夜間リリースが共有ツリーを detached のまま放置する問題を根治）
 - リリース作業を**使い捨て worktree**（`git worktree add --detach` → trap で撤去）へ移し、
   install_root の HEAD を一切触らない形にした。成功・ビルド失敗・片肺・SIGTERM のどれでも main のまま
@@ -107,3 +101,8 @@
 - 引き継ぎ本文は claude の TUI で 1 度だけ流れる User 発話なので `visible_lines()` 判定は後任が長く働くほど確実に落ちていた。証拠源を `chat_state` の発話へ移し、`saw_done` は Assistant 限定に（旧は手順書の「引き継ぎ完了」を後任の申告と誤読）。前提（GUI / persist）は項目内で上げて戻すので起動レシピは不変
 - 実 claude e2e 2 回連続 OK（`chat=1/6`・`1/5`・load 2.5〜3.0）/ `TAKO_1175_LEGACY=1` は Issue と同じ `saw_marker=false` で FAILED / `INJECT=nomarker` は新経路でも FAILED
 - 番犬 `実claudeの発話をビューポートで判定していない`（修正前の 52907 / 52908 を名指し）+ 純粋関数の単体 5 本。全 3595 件緑
+
+## 2026-09-08（#1180: セルフテストの器の往復待ちを予算へ移し、期限つき状態の混在を根治した）
+- Issue の grep（`0..25`）は失敗項目②（`0..20`）を漏らしていたので洗い直し、**18 か所**を `wait_for_backend_state`（状態待ち + `state_wait_budget`・駆動は毎周期）へ。番犬は region（tmux ゲート内の固定窓）+ `read_to_string` needle + #1162 へ `tako_control::dispatch(`
+- **真因は待ちの長さだけではない**: 項目 73 は「待てば立つミラー」と「1.4 秒で消えるスクロールバー」を 1 回のホイールのあと同時に見ていた（実測 `bar=false`）ので予算では解けない → ホイールを毎周期打つ形へ
+- 無負荷 + load 13.7〜16.1 で `TAKO_APP_SELF_TEST_OK` / A/B は `LEGACY=68-attach|73-wheel` + `INJECT=late` が FAILED（`waited=10.1s budget=10.0s` / `6.2s/6.0s`）・新経路は通過 / `INJECT=never` は新も FAILED
