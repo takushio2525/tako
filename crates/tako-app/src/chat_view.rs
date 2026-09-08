@@ -86,7 +86,7 @@ fn record_chat_activity_opacity(opacity: f32) -> f32 {
 }
 
 /// 生成中ドット2件の観測値（計算フレーム数, 最後の不透明度）。
-/// セルフテスト項目 132（#1012）用
+/// セルフテスト項目 134（#1012）用
 pub(crate) fn chat_pulse_probes() -> [(u64, f32); 2] {
     use std::sync::atomic::Ordering::Relaxed;
     [
@@ -4139,7 +4139,7 @@ mod tests {
         }
     }
 
-    /// セルフテスト項目 132 の待ち時間と実装の回数を同じ正本から引く
+    /// セルフテスト項目 134（#1012）の待ち時間と実装の回数を同じ正本から引く
     #[test]
     fn 生成中ドットの脈動全長は往復の整数倍() {
         assert_eq!(chat_pulse_total(), CHAT_PULSE_PERIOD * CHAT_PULSE_COUNT);
