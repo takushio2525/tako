@@ -27,6 +27,7 @@ use crate::orchestrator::agent::WorkerAgent;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use tako_core::platform::agent_install::{self, AgentKind, InstallRecipe};
+use tako_core::platform::support::Platform;
 use tako_core::platform::user_path;
 use tako_core::shell_profile::{self, PathChange, ShellKind};
 
@@ -68,6 +69,12 @@ impl Step {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallPlan {
     pub agent: &'static str,
+    /// 手順の対象プラットフォーム。**呼び名の出し分けに使う**（#925）。
+    ///
+    /// `cfg!` で分岐せず**値として持ち回す**のは #905（スリープ防止の呼び名）と同じ判断で、
+    /// これにより **macOS 上から Windows 側の文面を検査できる**（#515）。
+    /// 出どころは [`InstallRecipe::platform`] なので、手順と文面がずれることが無い
+    pub platform: Platform,
     /// 公式ドキュメントに載っているコマンド（利用者が手で打っても同じ結果になる形）
     pub official_command: String,
     /// 取得元 URL
@@ -95,13 +102,24 @@ impl InstallPlan {
             } else {
                 "以後の更新: 手動で更新が必要です".to_string()
             },
-            "sudo（管理者権限）は使いません。ホームディレクトリの中だけで完結します".to_string(),
+            privilege_line(self.platform),
         ]
+    }
+
+    /// この構成で**画面に出る文字列すべて**（導入計画の表示 + 引き継ぎの指示文）。
+    ///
+    /// 「その OS で通じない語が出ていない」を GUI も実機も無しに `cargo test` で
+    /// 固定するための入口（#925。#905 の `visible_texts` と同じ役目）
+    pub fn visible_texts(&self) -> Vec<String> {
+        let mut out = self.lines();
+        out.extend(handoff_prompt_text(self, None).lines().map(str::to_string));
+        out
     }
 
     pub fn to_json(&self) -> Value {
         json!({
             "agent": self.agent,
+            "platform": self.platform.as_str(),
             "official_command": self.official_command,
             "source_url": self.source_url,
             "launcher": self.launcher.display().to_string(),
@@ -216,12 +234,37 @@ pub fn legacy_auth_launch() -> bool {
     std::env::var_os("TAKO_1129_LEGACY").is_some()
 }
 
+/// 権限の説明（`Platform` を引数に取る純粋関数）。
+///
+/// `sudo` は **unix の概念で Windows では通じない**（#925）。Windows の昇格は UAC で、
+/// 対応する呼び名が無いので手段の名前を出さず「管理者権限」だけで書く。
+/// どちらの文面にも**プラットフォームに依らない語**「管理者権限」が入るので、
+/// セルフテスト項目 119（#920）はこの出し分けを入れても落ちない
+pub fn privilege_line(platform: Platform) -> String {
+    if legacy_privilege_line() {
+        return "sudo（管理者権限）は使いません。ホームディレクトリの中だけで完結します"
+            .to_string();
+    }
+    match platform {
+        Platform::MacOs => "sudo（管理者権限）は使いません。ホームディレクトリの中だけで完結します",
+        Platform::Windows => "管理者権限は使いません。ホームディレクトリの中だけで完結します",
+    }
+    .to_string()
+}
+
+/// `TAKO_925_LEGACY=1` で修正前（プラットフォームに依らない `sudo` 固定の文面）へ戻す。
+/// 同一バイナリで A/B を取るためだけの逃げ道（`legacy_auth_launch` と同じ形）
+pub fn legacy_privilege_line() -> bool {
+    std::env::var_os("TAKO_925_LEGACY").is_some()
+}
+
 /// 「何をどこに入れるか」
 pub fn install_plan() -> Result<InstallPlan, String> {
     let home = home_dir()?;
     let r = recipe();
     Ok(InstallPlan {
         agent: r.agent.as_str(),
+        platform: r.platform,
         official_command: r.source.official_command.to_string(),
         source_url: r.source.url.to_string(),
         launcher: r.launcher_path_in(&home),
@@ -942,6 +985,77 @@ fn homebrew_json() -> Value {
 mod tests {
     use super::*;
 
+    /// そのプラットフォームの手順から計画を組む（**手順と文面の出どころを 1 つにする**）。
+    /// `home` を引数で受けるので実 HOME を読まない
+    fn plan_for(platform: Platform, home: &Path) -> InstallPlan {
+        let r = agent_install::recipe(platform, AgentKind::Claude);
+        InstallPlan {
+            agent: r.agent.as_str(),
+            platform: r.platform,
+            official_command: r.source.official_command.to_string(),
+            source_url: r.source.url.to_string(),
+            launcher: r.launcher_path_in(home),
+            payload: r.payload_dir_in(home),
+            auto_updates: r.auto_updates,
+            can_run: r.tako_can_run,
+        }
+    }
+
+    /// 権限の呼び名がプラットフォームで変わること（#925）。
+    ///
+    /// 期待値は `Platform` を引数に取る純粋関数から作るので、**macOS から
+    /// Windows 側の文面をそのまま突き合わせられる**（#515 / #905 と同じ作法）
+    #[test]
+    fn 権限の説明はプラットフォームで呼び名が変わる() {
+        assert_eq!(
+            privilege_line(Platform::MacOs),
+            "sudo（管理者権限）は使いません。ホームディレクトリの中だけで完結します"
+        );
+        assert_eq!(
+            privilege_line(Platform::Windows),
+            "管理者権限は使いません。ホームディレクトリの中だけで完結します"
+        );
+        // どちらにも**プラットフォームに依らない語**が入る（#920 の項目 119 が
+        // `管理者権限` で見ているので、出し分けを入れても落ちない）
+        for platform in [Platform::MacOs, Platform::Windows] {
+            assert!(
+                privilege_line(platform).contains("管理者権限"),
+                "{platform:?}: 共通語が消えている"
+            );
+        }
+    }
+
+    /// Windows 構成の画面文字列に unix 固有の語が出ないこと（#925）。
+    ///
+    /// GUI も Windows 実機も要らずに `cargo test` で固定できるのが要点。
+    /// `.local/bin` は**両 OS 共通**の置き場なので禁止語に入れない（実際に Windows でも出る）
+    #[test]
+    fn windows構成にunix固有の語が出ない() {
+        const UNIX_ONLY: &[&str] = &["sudo", "sudoers", "pmset", "chmod", "bash", "install.sh"];
+        let home = Path::new("/tmp/h");
+
+        let texts = plan_for(Platform::Windows, home).visible_texts();
+        assert!(
+            texts.len() >= 6,
+            "画面に出る文字列を集められていない: {texts:?}"
+        );
+        let offenders: Vec<&String> = texts
+            .iter()
+            .filter(|t| UNIX_ONLY.iter().any(|word| t.contains(word)))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "Windows で通じない語が出ている: {offenders:?}"
+        );
+
+        // macOS 側は unix の呼び名を残す（語をまるごと消しただけの退行を捕まえる）
+        let mac = plan_for(Platform::MacOs, home).visible_texts();
+        assert!(
+            mac.iter().any(|t| t.contains("sudo")),
+            "macOS 側の sudo の案内が消えている: {mac:?}"
+        );
+    }
+
     /// 取得物の見分け方は境界（B17）が持つ。ここではこの環境の署名で
     /// **HTML エラーページを弾けること**だけを確かめる
     /// （判定そのものの総当たりは `platform::agent_install` 側のテスト）
@@ -970,22 +1084,13 @@ mod tests {
     /// 受け入れ条件 4: 実行前に「何をどこに入れるか」が必ず出ること
     #[test]
     fn 導入計画は何をどこに入れるかを必ず含む() {
-        use tako_core::platform::support::Platform;
         // **両プラットフォームぶんを macOS から検証する**（#515 / #920）。
         // リテラルを書かず「その計画の中身が行に出ているか」を見るので、
         // 手順が変わってもテストがずれない
         let home = Path::new("/tmp/h");
         for platform in [Platform::MacOs, Platform::Windows] {
             let r = agent_install::recipe(platform, AgentKind::Claude);
-            let plan = InstallPlan {
-                agent: r.agent.as_str(),
-                official_command: r.source.official_command.to_string(),
-                source_url: r.source.url.to_string(),
-                launcher: r.launcher_path_in(home),
-                payload: r.payload_dir_in(home),
-                auto_updates: r.auto_updates,
-                can_run: r.tako_can_run,
-            };
+            let plan = plan_for(platform, home);
             // 置き場所の表示は**実行中の OS** の区切りになる（`launcher_path_in` は
             // `PathBuf`）。`launcher_rel` / `payload_rel` は `/` 区切りの静的文字列なので
             // 突き合わせる前に寄せる。これを忘れると Windows でだけ落ちる（#920 の原因）
@@ -1052,19 +1157,10 @@ mod tests {
     /// **両プラットフォームぶんを macOS から検証する**
     #[test]
     fn 引き継ぎの指示文は導入計画から作られる() {
-        use tako_core::platform::support::Platform;
         let home = Path::new("/tmp/h");
         for platform in [Platform::MacOs, Platform::Windows] {
             let r = agent_install::recipe(platform, AgentKind::Claude);
-            let plan = InstallPlan {
-                agent: r.agent.as_str(),
-                official_command: r.source.official_command.to_string(),
-                source_url: r.source.url.to_string(),
-                launcher: r.launcher_path_in(home),
-                payload: r.payload_dir_in(home),
-                auto_updates: r.auto_updates,
-                can_run: r.tako_can_run,
-            };
+            let plan = plan_for(platform, home);
             let prompt = handoff_prompt_text(&plan, Some("取得が 403 で失敗した"));
             assert!(prompt.contains(r.source.official_command), "{prompt}");
             assert!(prompt.contains("取得が 403 で失敗した"), "{prompt}");
