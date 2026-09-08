@@ -8994,6 +8994,10 @@ fn finish_worker_status(
     // #983 の変更 2: 「ターンが走った」= プロンプトが届いた、という**送達の一次シグナル**。
     // 画面の送達確認より強い証拠なので、送達判定へ渡して未達の誤検知を潰す（#1015）
     let mut codex_turn_observed = false;
+    // #1015: その rollout を**実際に読めたか**。読めていないのに「未達」と断定すると、
+    // 実は働いている worker へ自動再送が飛ぶ（二重指示事故）。
+    // 「読めて 0 ターン」（= `codex_turn_observed == false` かつこれが true）だけが未達の証拠
+    let mut codex_rollout_read = false;
     let (status, mut ctx_percent) = if let Some(ref sid) = resolved_sid {
         let agent = orchestrator::query_agent_status(sid);
         (
@@ -9008,6 +9012,7 @@ fn finish_worker_status(
                 // #985: 同じ読み取りにレート制限も載っている（追加の I/O ゼロ）
                 codex_rate_limits = st.rate_limits.clone();
                 codex_turn_observed = st.prompt_arrived();
+                codex_rollout_read = true;
                 match st.status() {
                     Some(s) => (s.to_string(), st.ctx_percent),
                     None => ("unknown".to_string(), st.ctx_percent),
@@ -9083,12 +9088,20 @@ fn finish_worker_status(
         }
         let now_epoch = crate::sessions::parse_iso(&crate::sessions::now_iso()).unwrap_or(0);
         let spawned_epoch = crate::sessions::parse_iso(&effective.spawned_at).unwrap_or(now_epoch);
+        // #1015: codex の送達の裏取りは rollout（`task_started`）でしかできない。
+        // thread が解決できない / rollout が読めないときは未達と断定させない。
+        // **claude の一次シグナルは `claude agents --json` 側**なのでここでは触らない
+        // （#390 の「welcome 画面のまま未達」判定は不変）
+        let primary_signal_unreadable = !crate::orchestrator::wait::legacy_1015()
+            && effective.agent == orchestrator::agent::WorkerAgent::Codex.as_str()
+            && !codex_rollout_read;
         (
             orchestrator::registry::prompt_delivery_assessment_with(
                 &effective,
                 now_epoch,
                 orchestrator::registry::DeliveryEvidence {
                     turn_observed: codex_turn_observed,
+                    primary_signal_unreadable,
                 },
             ),
             now_epoch - spawned_epoch,
@@ -21341,6 +21354,135 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v["prompt_delivery"], "pending");
+    }
+
+    /// #1015 の現場そのもの: 背景ターミナル待ちの codex を 44 桁ペインで採った画面。
+    /// codex が行末を `…` で切るので `esc to interrupt` が残っていない
+    const CODEX_BG_WAIT_NARROW_1015: &str = "\
+• コマンドはセッション内で実行中です。引き続
+  き待機します。
+
+• Waiting for background terminal (1m 04s •…
+  └ env -u CLAUDE_CONFIG_DIR TAKO_SELF_T…
+
+
+› Ask Codex to do anything
+
+  gpt-5.6-sol high · /private/tmp/probe";
+
+    #[test]
+    fn issue1015_背景ターミナル待ちのcodexをidleと報告しない() {
+        use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
+        let path = registry_path().unwrap();
+        // 猶予（240 秒）を大きく超えた codex worker。実発生は spawn 後 779 秒
+        WorkerRegistry::mutate_at(&path, |reg| {
+            reg.workers.insert(
+                "q10151".into(),
+                WorkerEntry {
+                    pane: 10151,
+                    agent: "codex".into(),
+                    status: "active".into(),
+                    spawned_at: "2026-01-01T00:00:00Z".into(),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+
+        let v = finish_worker_status(
+            WorkerStatusCtx {
+                pane_id: 10151,
+                pane_exists: true,
+                backend_session: None,
+                live_tail: Some(CODEX_BG_WAIT_NARROW_1015.into()),
+                full_screen: Some(CODEX_BG_WAIT_NARROW_1015.into()),
+                // 実発生の観測（背景で cargo test / 隔離セルフテストが走っていた）
+                has_running_children: true,
+                limit_resume: Value::Null,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        // 受け入れ条件 5: 待機中は busy（idle にしない）
+        assert_eq!(
+            v["status"], "busy",
+            "背景ターミナル待ちを idle と報告している（#1015）: {v:#}"
+        );
+        // 受け入れ条件 6: 自動再送のトリガを出さない
+        let kinds: Vec<&str> = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["kind"].as_str())
+            .collect();
+        assert!(
+            !kinds.contains(&"prompt_undelivered"),
+            "作業中の worker へ resend_prompt を勧めている（二重指示事故）: {kinds:?}"
+        );
+        assert_eq!(v["prompt_delivery"], "pending", "{v:#}");
+    }
+
+    #[test]
+    fn issue1015_rolloutを読めないcodexは未達と断定しない() {
+        use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
+        let path = registry_path().unwrap();
+        WorkerRegistry::mutate_at(&path, |reg| {
+            reg.workers.insert(
+                "q10152".into(),
+                WorkerEntry {
+                    pane: 10152,
+                    agent: "codex".into(),
+                    status: "active".into(),
+                    spawned_at: "2026-01-01T00:00:00Z".into(),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+
+        // 入力待ちの画面（画面では裏取りできない）+ backend が無い =
+        // codex の thread が解決できないので rollout を 1 行も読めていない
+        let v = finish_worker_status(
+            WorkerStatusCtx {
+                pane_id: 10152,
+                pane_exists: true,
+                backend_session: None,
+                live_tail: Some("• You have 1 usage limit reset available.\n\n› Ask Codex to do anything\n\n  gpt-5.6-sol high · /private/tmp/probe".into()),
+                full_screen: None,
+                has_running_children: false,
+                limit_resume: Value::Null,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        let kinds: Vec<&str> = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["kind"].as_str())
+            .collect();
+        assert_eq!(
+            v["prompt_delivery"], "unverified",
+            "rollout を読めていないのに未達と断定している（#1015）: {v:#}"
+        );
+        assert!(
+            !kinds.contains(&"prompt_undelivered"),
+            "自動再送のトリガを出している: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"prompt_delivery_unverified"),
+            "黙ってもいけない（確かめてから再送を出す。#983）: {kinds:?}"
+        );
+        let ev = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["kind"] == "prompt_delivery_unverified")
+            .unwrap()
+            .clone();
+        assert_eq!(ev["recommended_action"], "verify_then_resend");
     }
 
     #[test]

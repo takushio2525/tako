@@ -19,18 +19,6 @@
 
 ---
 
-## 2026-09-08（#1165: セルフテストの画面エコー待ちを固定窓から状態待ちへ寄せた）
-- 項目 1b の固定 8 × 800ms 窓が load 12.9 で尽き 1c 以降が全部走らなかった。同型 9 か所を
-  `type_until_focused_text`（`state_wait_budget` + 送り直し 2 回 + `TAKO_SELF_TEST_1165` の診断）へ
-- 番犬 `固定窓のあいだに画面の文字列を待っていない` を追加（pre-fix の実ファイルを 9 行名指し・旧番犬は見逃し）
-- GUI（tako-vd）無負荷 2 + 高負荷 1 完走（判定時 load 21.9〜34.6）/ `INJECT=late` で旧のみ FAILED / `noecho` は新も FAILED
-
-## 2026-09-08（#1167: 「追記ぶんだけ読む」の検査を実時間から読み出しバイト数へ替えた）
-- `claude_remote_link` の効果テストが `Instant::elapsed` の全走査比較だったため高負荷で確率的に落ちていた。
-  走査本体を `scan_source<R: Read + Seek>` へ出し、テストは**実際に読んだバイト数**を数える読み口を渡す形へ
-- 実測 全走査 4,194,592 B / 追記ぶんだけ 355 B（上限 64 KiB）。番犬 `追記ぶんだけ読む検査を実時間で測っていない` +
-  conventions の新節。A/B は注入 5ms で旧 19/20 FAILED・新 0/20、「全文を読むが consumed は正しい」注入で新が FAILED
-
 ## 2026-09-08（#995: セルフテスト項目 108 の高負荷フレークを窓ガードで根治した）
 - 外から来る全体 notify で `output=(panes +2 chrome +2)` = 意図的な全体 notify と同値になっていた。#858 の
   ガードを 108 へ寄せ、判定（`redraw_window_clean`）と窓の作り方（`measure_output_redraw`）を 110 と 1 実装に統合
@@ -99,3 +87,8 @@
 - 対象解決を `tako_core::tmux::window_target`（取り込みビュー優先 → バックエンド）へ集約。旧実装は二重ネストの**外側**（tako の backend）を見ていたので別セッションの window を切り替えて成功を返していた
 - `--window` は CLI と MCP catalog の両方へ（protocol にあるのに 3 経路すべてから到達不能）。番犬 `mcp_param_reachability`（mapper が読む引数が catalog に在るか）が同型の再発を落とす
 - 隔離 GUI 実測: ラッパーだけ `window_active` が 1 → 2 へ動き元は 0 のまま / `open --window 2` と MCP の `window:1` が実際にその window を表示 / A/B `TAKO_1185_LEGACY=1` は外側に当たって FAILED
+
+## 2026-09-09（#1015: codex の背景ターミナル待ちを idle + 未達と誤検知しないようにした）
+- 真因は**ペイン幅**（負荷でも rollout でもない）: 44 桁では codex が `• Waiting for background terminal (1m 04s •…` と自分で切るので `esc to interrupt` が消え、末尾の `›` を拾って idle になっていた。同じ理由で `prompt_undelivered`（自動再送）の抑制も外れる = 2 症状は同一原因
+- 判定を「`•` で始まり `(` の直後が経過時間 + その直後が区切り」へ。**語では判定しない**（`Waited for …` は完了後も残る履歴行 = 永久 busy になる。実測 5 回残存）。未達の断定は rollout を実際に読めたときだけにし、読めないときは `prompt_delivery_unverified` へ降格
+- 実採取 2 幅 + 実 worker（器つき隔離）で `busy` / `codex-session` / events 空。A/B `TAKO_1015_LEGACY=1` は Issue と同じ `status=idle` `prompt_delivery=undelivered` `resend_prompt` を再現。番犬 3 本 + 単体 9 本。全 3659 件緑（main 取り込み後）

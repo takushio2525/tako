@@ -178,7 +178,19 @@ worker_agents:               # エージェント別の worker 設定（任意�
   を明示するとどのエージェントでも承認ありに戻る。claude・agy は `--dangerously-skip-permissions`、
   codex は `--dangerously-bypass-approvals-and-sandbox` を付けて起動する
 - **status 検知**: codex / agy は `claude agents --json` に現れないため常に画面推定
-  （status_source=screen、idle 連続 8 回で完了判定）。claude worker より完了検知が数十秒遅くなる
+  （status_source=screen、idle 連続 8 回で完了判定）。claude worker より完了検知が数十秒遅くなる。
+  codex は器（tmux）があれば rollout JSONL を一次シグナルにできる（status_source=codex-session。#984）
+- **codex の背景ターミナル待ち（#1015）**: `• Waiting for background terminal (1m 04s …)` は
+  **走っている**行、`• Waited for background terminal · <cmd>` は**完了済みの履歴**行で、
+  どちらも `• ` で始まる。狭いペインでは codex が行末を `…` で切って `esc to interrupt` が
+  消えるため、tako は「`•` で始まり括弧の直後が経過時間」の行だけを busy と読む
+  （語で判定すると履歴行に当たって**永久 busy** になる = #571 / #120）。
+  実採取と判定表は `crates/tako-control/src/orchestrator/wait.rs` の `codex_running_footer_in`
+- **未達の断定（#1015）**: `prompt_undelivered`（= supervisor の自動再送のトリガ）は
+  **一次シグナルを実際に読めて、それでもターンが 1 件も無いとき**だけ出す。codex の裏取りは
+  rollout の `task_started` でしかできないので、器が無い / thread が解決できない状況では
+  `prompt_delivery_unverified`（`verify_then_resend`）へ降格する。
+  「読めなかった」を未達と断定すると、働いている worker へ同じ依頼が二度渡る
 - **事前信頼**: spawn 時に各 CLI の信頼設定（claude: `~/.claude.json` / codex:
   `~/.codex/config.toml` / agy: `~/.gemini/antigravity-cli/settings.json`）へ書き込み、
   信頼ダイアログ自体を出さない。書けなかった場合もダイアログ検出 → Enter 承諾でフォールバック
