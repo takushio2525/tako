@@ -23575,6 +23575,10 @@ mod self_test {
 
     /// セルフテスト開始時刻（環境 1 行の `elapsed` 用。#796）
     static STARTED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    /// メインスレッドのスタック予約量（#1133）。`run()` が起動直後に 1 度だけ入れる。
+    /// `env_line()` から採り直さないのは、`fail()` が背景スレッドの `check()` から
+    /// 呼ばれたときにそのスレッドの値（Rust の既定 2 MiB）を書いてしまうため
+    static MAIN_STACK: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
 
     /// このビルドの構成（#796）。
     ///
@@ -23609,10 +23613,13 @@ mod self_test {
             "{} {} stack={} elapsed={elapsed}s",
             build_flavor(),
             tako_control::diag::format_machine_load(tako_control::diag::machine_load()),
-            // #1133: 呼び出しスレッド（= メインスレッド）のスタック予約量。
-            // Windows/MSVC の既定 1 MiB だと項目 80 で沈黙して死ぬので、
-            // 落ちたログ単体で「予約量が足りていたのか」を後から言えるようにする
-            tako_core::platform::stack::current_thread_reserve()
+            // #1133: メインスレッドのスタック予約量。Windows/MSVC の既定 1 MiB だと
+            // 項目 80 で沈黙して死ぬので、落ちたログ単体で
+            // 「予約量が足りていたのか」を後から言えるようにする
+            MAIN_STACK
+                .get()
+                .copied()
+                .flatten()
                 .map(tako_core::platform::stack::format_mib)
                 .unwrap_or_else(|| "unknown".to_string())
         )
@@ -36353,6 +36360,9 @@ mod self_test {
         // 実行環境を最初に 1 行出す（#796）。同じソースでも load とビルド構成で
         // 落ちる項目が変わるので、ログ単体で条件が再現できる状態にしておく
         let _ = STARTED_AT.set(std::time::Instant::now());
+        // #1133: env 行が `stack=` を書けるように、**印字より前に**メインスレッドで測る
+        let reserve = tako_core::platform::stack::current_thread_reserve();
+        let _ = MAIN_STACK.set(reserve);
         println!("TAKO_APP_SELF_TEST_ENV: {}", env_line());
         // #1133: Windows/MSVC の既定 1 MiB では項目 80（#380 の共有タブバー）の途中で
         // メインスレッドのスタックが尽き、判定行も `FAILED` も出さずに
@@ -36360,9 +36370,7 @@ mod self_test {
         // 前提が崩れているならここで言う = 沈黙の死を、直し方の書いてある失敗へ替える。
         // 予約量は tako-app/build.rs の `/stack:` 宣言で決まるので、ここが落ちたら
         // 「宣言が落ちた」か「宣言を効かせないリンカで作った」を疑う
-        if let Some(note) = tako_core::platform::stack::current_thread_reserve()
-            .and_then(tako_core::platform::stack::shortfall_note)
-        {
+        if let Some(note) = reserve.and_then(tako_core::platform::stack::shortfall_note) {
             if legacy_1133() {
                 // A/B のとき（TAKO_1133_LEGACY=1）だけ、足りないまま走らせて
                 // #1133 の症状（項目 80 での沈黙した死）を再現させる
