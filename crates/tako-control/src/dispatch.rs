@@ -813,7 +813,14 @@ fn dispatch_inner(
             Ok(Value::Null)
         }
 
-        Request::List => Ok(list_json(host)),
+        Request::List => {
+            // #1191: `backend_windows` を要求時点の実態へ合わせてから組み立てる。
+            // 旧実装は右パネル（fleet ビュー）の 2 秒ポーリングだけがこの値を更新して
+            // いたので、パネルを開いたことがなければ常に null・閉じているあいだは
+            // 陳腐化していた。backend ペインが 1 つも無ければ tmux は起動しない
+            host.refresh_backend_windows();
+            Ok(list_json(host))
+        }
 
         Request::ResolvePane { pane, caller_pid } => {
             Ok(resolve_pane_lenient_json(host, pane, caller_pid))
@@ -11242,6 +11249,10 @@ fn list_json(host: &dyn ControlHost) -> Value {
                         // 応答を読むだけのリモート daemon（#1080）が再現すると必ずずれる
                         "can_ssh": can_ssh_json(host, p),
                         "tmux_session": host.backend_session(p.id()),
+                        // backend セッション内の window 全件（#1191）。**右パネルの
+                        // 表示状態に依存しない**（要求のたびに実態へ合わせる）。
+                        // `null` = backend ペインでない / tmux から採取できなかった、
+                        // `[]` = backend だが window が 1 枚も無い、の区別が付く
                         "backend_windows": host.backend_windows(p.id()).map(|ws| ws.iter().map(|w| json!({
                             "index": w.index,
                             "name": w.name,
@@ -12558,6 +12569,13 @@ mod tests {
         /// 返させる結果
         cleanup_socket: std::cell::RefCell<Vec<Option<String>>>,
         cleanup_report: Option<tako_core::tmux_cleanup::CleanupReport>,
+        /// #1191: 器の**実態**（`refresh_backend_windows` を呼ばないと見えない）。
+        /// UI のポーリングでしか更新されなかった旧実装を模す
+        tmux_windows: std::collections::HashMap<u64, Vec<tako_core::TmuxWindow>>,
+        /// #1191: 採取済みの window 一覧（`backend_windows` が返すのはこちら）
+        backend_windows: std::collections::HashMap<u64, Vec<tako_core::TmuxWindow>>,
+        /// #1191: 要求時採取が呼ばれた回数（ペインごとではなく 1 応答 1 回のはず）
+        backend_windows_refreshes: std::cell::Cell<usize>,
     }
 
     impl MockHost {
@@ -12606,6 +12624,9 @@ mod tests {
                 prompt_flows: Vec::new(),
                 writes: Vec::new(),
                 command_flows: Vec::new(),
+                tmux_windows: std::collections::HashMap::new(),
+                backend_windows: std::collections::HashMap::new(),
+                backend_windows_refreshes: std::cell::Cell::new(0),
             }
         }
 
@@ -12670,6 +12691,26 @@ mod tests {
         }
         fn tmux_view(&self, pane: PaneId) -> Option<tako_core::TmuxView> {
             self.tmux_views.get(&pane.as_u64()).cloned()
+        }
+        /// #1191: 採取済みの値だけを返す（実態 `tmux_windows` は直接見ない）
+        fn backend_windows(&self, pane: PaneId) -> Option<Vec<tako_core::TmuxWindow>> {
+            self.backend_windows.get(&pane.as_u64()).cloned()
+        }
+        /// #1191: 器を 1 回引いて、backend ペイン全件を採取済みへ写す
+        /// （製品の `TakoApp::refresh_backend_windows_now` と同じ形）
+        fn refresh_backend_windows(&mut self) {
+            self.backend_windows_refreshes
+                .set(self.backend_windows_refreshes.get() + 1);
+            self.backend_windows = self
+                .backend_sessions
+                .keys()
+                .map(|pane| {
+                    (
+                        *pane,
+                        self.tmux_windows.get(pane).cloned().unwrap_or_default(),
+                    )
+                })
+                .collect();
         }
         fn track_tmux_view(
             &mut self,
@@ -22603,5 +22644,104 @@ mod tests {
         assert!(format!("{err}").contains("min_worker_cols"), "{err}");
         let err = dispatch_orchestrator_layout(None, None, None, Some(9999)).unwrap_err();
         assert!(format!("{err}").contains("min_worker_cols"), "{err}");
+    }
+
+    /// #1191: `tako list` の `backend_windows` は**要求時点の実態**を返す。
+    ///
+    /// 旧実装は右パネル（fleet ビュー）のポーリングだけがこの値を更新していたので、
+    /// パネルを開いたことがなければ常に `null` だった。`Request::List` の直前に
+    /// `refresh_backend_windows` を呼ぶ形になっているかを、
+    /// 「採取しないと見えない器」を持つモックで検出する。
+    ///
+    /// **`Request::List => Ok(list_json(host))`（修正前）ではこのテストが落ちる**（= 検出力）
+    #[test]
+    fn issue1191_listのbackend_windowsが要求時に採取される() {
+        let mut host = MockHost::new();
+        let backend = host.ws.active_tab().tree().focused();
+        let plain = dispatch(
+            &mut host,
+            Request::Split {
+                pane: Some(backend.as_u64()),
+                tab: None,
+                direction: Some(crate::protocol::Direction::Down),
+                ratio: None,
+                command: None,
+                cwd: None,
+                focus: Some(false),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap()["pane"]
+            .as_u64()
+            .expect("分割で pane が返る");
+        // 器つきペイン 1 枚と、器なしの素のペイン 1 枚
+        host.backend_sessions
+            .insert(backend.as_u64(), "tako-1191".into());
+        let win = |index: u32, name: &str, active: bool| tako_core::TmuxWindow {
+            index,
+            name: name.into(),
+            active,
+            panes: 1,
+        };
+        host.tmux_windows.insert(
+            backend.as_u64(),
+            vec![win(0, "zsh", true), win(1, "build", false)],
+        );
+
+        let windows_of = |v: &Value, pane: u64| {
+            v["tabs"][0]["panes"]
+                .as_array()
+                .expect("panes")
+                .iter()
+                .find(|p| p["id"] == pane)
+                .expect("対象ペインが載る")["backend_windows"]
+                .clone()
+        };
+
+        // パネルを一度も開いていなくても実態が載る（旧実装はここが null）
+        let list = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
+        assert_eq!(
+            windows_of(&list, backend.as_u64()),
+            json!([
+                { "index": 0, "name": "zsh", "active": true, "panes": 1 },
+                { "index": 1, "name": "build", "active": false, "panes": 1 },
+            ]),
+            "器つきペインは要求時点の window 全件を返す"
+        );
+        // 器なしのペインは「不明」= null（`[]` と区別できる）
+        assert_eq!(
+            windows_of(&list, plain),
+            Value::Null,
+            "backend でないペインは null"
+        );
+        assert_eq!(
+            host.backend_windows_refreshes.get(),
+            1,
+            "採取は 1 応答につき 1 回（ペインごとに器を叩かない）"
+        );
+
+        // window が増えれば次の要求に出る（パネルは閉じたまま）
+        host.tmux_windows
+            .get_mut(&backend.as_u64())
+            .unwrap()
+            .push(win(2, "logs", false));
+        let list = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
+        assert_eq!(
+            windows_of(&list, backend.as_u64())
+                .as_array()
+                .map(|ws| ws.len()),
+            Some(3),
+            "増えた window が反映される"
+        );
+
+        // 1 枚も無い器は `[]`（= 採取できた上で無い。null との読み分け）
+        host.tmux_windows.insert(backend.as_u64(), Vec::new());
+        let list = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
+        assert_eq!(
+            windows_of(&list, backend.as_u64()),
+            json!([]),
+            "window が無い器は空配列"
+        );
+        assert_eq!(host.backend_windows_refreshes.get(), 3, "要求ごとに 1 回");
     }
 }

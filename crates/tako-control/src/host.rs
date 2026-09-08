@@ -129,10 +129,21 @@ pub trait TmuxHost {
     ) -> Option<(usize, usize)> {
         None
     }
-    /// バックエンドセッション内の window 一覧（2+ window の場合のみ）
+    /// バックエンドセッション内の window 一覧（#1191）。
+    ///
+    /// - `None` = このペインは backend セッションを持たない、または tmux から**採取できなかった**
+    /// - `Some([])` = backend セッションはあるが window が 1 枚も無い
+    /// - `Some([..])` = その時点の window 全件（1 枚だけでも載る）
+    ///
+    /// **UI の表示状態に依存してはならない**。`tako list` / MCP `tako_list_panes` は
+    /// AI が状況把握に使う一次情報なので、右パネルを開いているかどうかで中身が
+    /// 変わってはいけない（旧実装は fleet ビューのポーリングだけがこの値を更新していた）
     fn backend_windows(&self, _pane: PaneId) -> Option<Vec<tako_core::TmuxWindow>> {
         None
     }
+    /// [`Self::backend_windows`] を**要求時点の実態**へ合わせる（#1191）。
+    /// `Request::List` の直前に 1 回だけ呼ばれる。UI を持たない実装では何もしない
+    fn refresh_backend_windows(&mut self) {}
     /// `tako tmux open` で取り込んだビューペインが指している tmux（#1185）。
     /// window 操作は **`backend_session` より優先**してこれを見る。取り込みペインは
     /// 「外側 = tako のバックエンドセッション」「内側 = 取り込んだセッション」の

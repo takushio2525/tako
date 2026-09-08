@@ -258,22 +258,60 @@ pub fn list_sessions(socket: Option<&str>) -> Vec<TmuxSession> {
         ],
     )
     .unwrap_or_default();
-    let windows = run_tmux(
-        socket,
-        &[
-            "list-windows",
-            "-a",
-            "-F",
-            "#{session_name}\t#{window_index}\t#{window_name}\t#{window_active}\t#{window_panes}",
-        ],
-    )
-    .unwrap_or_default();
+    let windows =
+        run_tmux(socket, &["list-windows", "-a", "-F", WINDOW_FORMAT]).unwrap_or_default();
     let clients = run_tmux(
         socket,
         &["list-clients", "-F", "#{session_name}\t#{client_tty}"],
     )
     .unwrap_or_default();
     parse_sessions(&sessions, &windows, &clients)
+}
+
+/// `list-windows -a` の出力フォーマット（`list_sessions` と
+/// [`list_windows_by_session`] で同一。パースも 1 実装を共有する）
+const WINDOW_FORMAT: &str =
+    "#{session_name}\t#{window_index}\t#{window_name}\t#{window_active}\t#{window_panes}";
+
+/// 指定サーバーの window 一覧を**セッション名ごと**に返す（`list-windows -a` 1 回）。
+///
+/// `list_sessions`（3 コマンド）の軽量版で、window 構造だけが要る経路のためにある
+/// （#1191: `tako list` の `backend_windows` を要求時に解決する）。
+/// **`None` = tmux を実行できなかった**（tmux 不在・サーバー未起動）で、
+/// 「window が 1 枚も無い」= 空の map と区別できる。この区別が
+/// `backend_windows` の `null`（不明）と `[]`（無い）の出どころになる
+pub fn list_windows_by_session(
+    socket: Option<&str>,
+) -> Option<std::collections::HashMap<String, Vec<TmuxWindow>>> {
+    let out = run_tmux(socket, &["list-windows", "-a", "-F", WINDOW_FORMAT]).ok()?;
+    Some(parse_windows_by_session(&out))
+}
+
+/// `list-windows -a` のフォーマット出力をセッション名ごとに畳む（純関数）
+fn parse_windows_by_session(windows: &str) -> std::collections::HashMap<String, Vec<TmuxWindow>> {
+    let mut by_session: std::collections::HashMap<String, Vec<TmuxWindow>> =
+        std::collections::HashMap::new();
+    for line in windows.lines() {
+        let mut f = line.split('\t');
+        let (Some(session), Some(index), Some(name), Some(active), Some(panes)) =
+            (f.next(), f.next(), f.next(), f.next(), f.next())
+        else {
+            continue;
+        };
+        let (Ok(index), Ok(panes)) = (index.parse(), panes.parse()) else {
+            continue;
+        };
+        by_session
+            .entry(session.to_string())
+            .or_default()
+            .push(TmuxWindow {
+                index,
+                name: name.to_string(),
+                active: active != "0",
+                panes,
+            });
+    }
+    by_session
 }
 
 /// セッションの存在確認（`has-session`、1 コマンド）。
@@ -876,23 +914,11 @@ fn parse_sessions(sessions: &str, windows: &str, clients: &str) -> Vec<TmuxSessi
             })
         })
         .collect();
-    for line in windows.lines() {
-        let mut f = line.split('\t');
-        let (Some(session), Some(index), Some(name), Some(active), Some(panes)) =
-            (f.next(), f.next(), f.next(), f.next(), f.next())
-        else {
-            continue;
-        };
-        let (Ok(index), Ok(panes)) = (index.parse(), panes.parse()) else {
-            continue;
-        };
+    // window のパースは `list_windows_by_session` と 1 実装を共有する（#1191:
+    // 「同じ事実に 2 つの経路があって片方だけ嘘をつく」を構造で防ぐ）
+    for (session, windows) in parse_windows_by_session(windows) {
         if let Some(s) = result.iter_mut().find(|s| s.name == session) {
-            s.windows.push(TmuxWindow {
-                index,
-                name: name.to_string(),
-                active: active != "0",
-                panes,
-            });
+            s.windows = windows;
         }
     }
     for line in clients.lines() {
@@ -1347,5 +1373,47 @@ mod tests {
         let scrollback = capture_scrollback_args("tako-abc123", 10);
         assert!(!scrollback.iter().any(|a| a == "-E"));
         assert!(!scrollback.iter().any(|a| a == "-J"));
+    }
+
+    /// #1191: `list-windows -a` のパースはセッション名で畳み、順序と属性を保つ
+    #[test]
+    fn windowをセッションごとに畳む() {
+        let by = parse_windows_by_session(
+            "tako-a\t0\tzsh\t1\t1\ntako-a\t1\tbuild\t0\t2\ntako-b\t3\tlogs\t1\t1\n\
+             壊れた行\ntako-a\txx\tbad\t0\t1\n",
+        );
+        assert_eq!(by.len(), 2, "壊れた行は捨てる: {by:?}");
+        assert_eq!(
+            by["tako-a"],
+            vec![
+                TmuxWindow {
+                    index: 0,
+                    name: "zsh".into(),
+                    active: true,
+                    panes: 1
+                },
+                TmuxWindow {
+                    index: 1,
+                    name: "build".into(),
+                    active: false,
+                    panes: 2
+                },
+            ]
+        );
+        assert_eq!(by["tako-b"][0].index, 3);
+        // 空入力は「window が 1 枚も無い」= 空の map（採取失敗の None とは別物）
+        assert!(parse_windows_by_session("").is_empty());
+    }
+
+    /// #1191: `list_sessions` の window と [`list_windows_by_session`] は同じパースを通る
+    /// （同じ事実に 2 つの経路を作らない）
+    #[test]
+    fn セッション一覧とwindow一覧のパースが一致する() {
+        let windows = "tako-a\t0\tzsh\t1\t1\ntako-a\t1\tbuild\t0\t2\n";
+        let sessions = parse_sessions("tako-a\t100\t1\t42\tzsh\t/tmp\t200\n", windows, "");
+        assert_eq!(
+            sessions[0].windows,
+            parse_windows_by_session(windows)["tako-a"]
+        );
     }
 }
