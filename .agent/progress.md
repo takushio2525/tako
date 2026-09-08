@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-09（#1019: setup ディレクトリを data dir の境界へ寄せ、旧 Windows パスから自動移設）
-- `setup_dir()` の macOS 直書きを `tako_control::setup::setup_dir`（= `data_dir()/setup`）へ集約。旧パスは `SchemaId::Setup` の番地 + 専用実装で移設（写す → 旧ごと `setup.pre-v1.bak` へ rename・**隔離中は移設しない**）
-- A/B 実測: 同条件の `setup --yes` が旧バイナリは HOME 側へ 16 ファイル・新は `$TAKO_DATA_DIR/setup` へ。本番 dir は隔離 6 経路の前後でハッシュ・mtime とも不変
-- 番犬 `setup_dir_boundary_watchdog` 4 本（修正前コードで 2 本が確定 FAILED）+ 単体 12 本。全 3629 件緑（main 取り込み後）。Windows 実機での移設は #467 配下で要確認
-
 ## 2026-09-09（#1187: tmux cleanup が黙って何もしない形をやめ、`--socket` を実装した）
 - 見送りの判定を「別の tako-app がいるか」から**対象ソケットの所有者**へ（相手の初期環境を `KERN_PROCARGS2` で読み `tako-iso-<pid>` 等を復元）。応答を `{socket, killed, skipped, detail}` へ広げ、見送り・kill の両方を persist.log へ 1 行
 - 実測（隔離 + tako-vd・他 tako-app 3 本稼働）: 省略時 `killed=[aaa,bbb]` / `--socket <別>` で `ccc` を kill / `--socket tako` は `skipped=peer_shares_socket`（pid 71082）で本番 17 セッションは不変
@@ -83,3 +78,8 @@
 - 並びは `tako_core::path_menu`（純粋関数）・文言はツリー（#314）の `sidebar::menu_*` を委譲で共有。新規操作は「tako で開く」= `FileOpKind::OpenInTako` の 1 つだけで **cmd+クリック自身もそこを通す**（CLI `tako file open-in-tako` / MCP `op=open_in_tako`）
 - **前提として `links::combined_screen_text` の soft wrap 判定を直した**: 実画面の行は空白詰めなので旧判定では全行が折り返し扱いになり、隣接 2 行に何か書かれているだけでパスリンクが 1 つも検出されなかった（A/B: 旧式で新テストが FAILED）
 - 項目 147（合成マウスの実配送 + 実矩形 + 前提の ui-mode 倒し・unix 限定）/ CLI・MCP e2e を隔離 GUI で実測 / 実フレーム PNG 2 枚 / `TAKO_1182_LEGACY=1` で 147 が確定 FAILED。全 3711 件緑
+
+## 2026-09-09（#1191: `tako list` の `backend_windows` を右パネルの表示状態から切り離した）
+- 採取が fleet ビューの 2 秒ポーリングだけだったのを `Request::List` の直前 1 回（`list-windows -a` = 6.9ms 中央値。`fetch_tmux_sessions` は 37ms）へ。backend ペインが無ければ tmux を起動せず、500ms 以内は使い回すので連打でも 2 回/秒（実測 889 req/30s → 56 回）
+- `null`（backend でない / 採取不能）と `[]`（backend だが window 無し）を読み分け可能に。1 window の器も載る（旧実装は 2+ のみ）。待機時の追加コストは 0 回 / CPU 差は誤差
+- A/B `TAKO_1191_LEGACY=1` は Issue の 2 症状（常に null / 開くと埋まり閉じると陳腐化）を再現。番犬 3 本 + dispatch 1 本 + tako-core 2 本 + セルフテスト項目 61g

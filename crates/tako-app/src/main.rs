@@ -103,6 +103,18 @@ const CLAUDE_SESSION_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 /// イベント駆動フラグのチェック間隔。spawn / PromptFlow 完了で立つフラグを
 /// この間隔で拾い、即時スキャンする（最悪 5s 遅延 = 旧スキャン間隔と同等）
 const CLAUDE_SESSION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// `tako list` の要求時 window 採取（#1191）を使い回してよい時間。
+/// リモート daemon は 1 リクエストにつき `Request::List` を 2 回打つ（`probe` + 本番）
+/// ので、連打で `list-windows` を毎回起動しないための間引き。右パネルの
+/// ポーリング（2 秒）より短いので、パネルを開いていても値が古くならない
+const BACKEND_WINDOWS_FRESH: Duration = Duration::from_millis(500);
+
+/// #1191 の A/B。`TAKO_1191_LEGACY=1` で**同一バイナリのまま**旧挙動
+/// （`backend_windows` を要求時に採らない = 右パネルの表示状態に依存する）へ戻す
+fn legacy_1191() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_1191_LEGACY").as_deref() == Ok("1"))
+}
 
 /// 復元時に新しいシェルへ投入する Claude resume コマンドを安全条件つきで組み立てる。
 /// backend 生存時はプロセスごと再 attach するため、二重起動を避けて None。
@@ -1606,8 +1618,13 @@ struct TakoApp {
     /// PC 再起動で tmux セッション自体が消えたときに resume する Claude session ID。
     /// `claude agents --json` と PID 祖先照合が成功した結果だけを保持する
     claude_resume_sessions: HashMap<PaneId, String>,
-    /// バックエンドセッション内の window 一覧（tmux ポーリングで更新。2+ window のみ保持）
+    /// バックエンドセッション内の window 一覧。**backend ペイン全件**にエントリが載り
+    /// （window 0 枚は空 Vec）、載っていない = 「backend でない / 採取できなかった」。
+    /// 更新は右パネルの 2 秒ポーリングと `tako list` の要求時採取の両方（#1191）
     backend_windows: HashMap<PaneId, Vec<tako_core::TmuxWindow>>,
+    /// `backend_windows` を**採取できた**最後の時刻（#1191 の要求時採取の間引き用）。
+    /// `None` = まだ採取できていない = 次の要求で必ず採り直す
+    backend_windows_at: Option<std::time::Instant>,
     /// tmux window のキャプチャテキスト（ホバープレビュー用。ポーリングで非アクティブ window を取得）
     window_captures: HashMap<(PaneId, u32), Vec<String>>,
     /// 直近に保存したレイアウトの JSON（変化したときだけ書き込むための比較用）
@@ -3594,6 +3611,7 @@ impl TakoApp {
             stale_pane_map: HashMap::new(),
             claude_resume_sessions: HashMap::new(),
             backend_windows: HashMap::new(),
+            backend_windows_at: None,
             window_captures: HashMap::new(),
             last_saved_layout: None,
             restore_report,
@@ -5875,41 +5893,104 @@ impl TakoApp {
     }
 
     /// tmux_sessions JSON からバックエンドペインの window 一覧を抽出する（メモリ操作のみ）。
-    /// 2+ window のセッションのみ backend_windows に保持し、ホバープレビュー用に
-    /// キャプチャすべき非アクティブ window（pane, session, window index）を返す。
-    /// capture-pane はサブプロセス実行のため呼び出し側が background で行い、結果を
-    /// `apply_window_captures` で適用する（Issue #113: 旧実装はここで UI スレッドの
-    /// 同期実行をしており、多 worker = 多 window 時の定常的な UI ブロック源だった）
+    /// 右パネルの 2 秒ポーリング用の入り口で、実際の反映は
+    /// [`Self::apply_backend_windows`]（要求時採取と 1 実装）が行う
     fn sync_backend_windows(&mut self) -> Vec<(PaneId, String, u32)> {
+        let by_session: HashMap<String, Vec<tako_core::TmuxWindow>> = self
+            .tmux_sessions
+            .iter()
+            .filter(|s| s["backend"].as_bool() == Some(true))
+            .filter_map(|s| {
+                let name = s["name"].as_str()?.to_string();
+                let windows = s["windows"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|w| {
+                        Some(tako_core::TmuxWindow {
+                            index: w["index"].as_u64()? as u32,
+                            name: w["name"].as_str()?.to_string(),
+                            active: w["active"].as_bool().unwrap_or(false),
+                            panes: w["panes"].as_u64().unwrap_or(1) as u32,
+                        })
+                    })
+                    .collect();
+                Some((name, windows))
+            })
+            .collect();
+        self.apply_backend_windows(Some(&by_session))
+    }
+
+    /// `tako list` / MCP `tako_list_panes` の `backend_windows` を**要求時点の実態**へ
+    /// 合わせる（#1191）。
+    ///
+    /// 旧実装は右パネルの 2 秒ポーリングだけがこの値を更新していたので、fleet ビューを
+    /// 開いたことがなければ常に `null`、閉じているあいだは最後に見た値が残っていた
+    /// （= API の戻り値が UI の表示状態に依存する。AI の一次情報としては嘘になる）。
+    ///
+    /// コストは **`list-windows -a` 1 回**（`fetch_tmux_sessions` は 6 回）で、
+    /// backend ペインが 1 つも無ければ tmux を起動すらしない。連打・リモートの
+    /// ポーリング（`AppIpcClient::probe` は毎回 `Request::List` を打つ）で毎回
+    /// 起動しないよう、直前の採取から [`BACKEND_WINDOWS_FRESH`] 以内は使い回す
+    fn refresh_backend_windows_now(&mut self) {
+        // #1191 の A/B: 修正前と同じ「要求時には採らない」へ戻す
+        if legacy_1191() {
+            return;
+        }
+        if self.backend_sessions.is_empty() {
+            // backend ペインが無い = 全ペイン「不明」が実態（残骸を残さない）
+            self.backend_windows.clear();
+            self.backend_windows_at = None;
+            return;
+        }
+        if self
+            .backend_windows_at
+            .is_some_and(|t| t.elapsed() < BACKEND_WINDOWS_FRESH)
+        {
+            return;
+        }
+        let socket = tako_core::tmux_backend::socket_name();
+        let by_session = tako_core::tmux::list_windows_by_session(Some(&socket));
+        // ホバープレビューのキャプチャ対象は捨てる: capture-pane は window 数ぶんの
+        // サブプロセスで、右パネルが見えていないときに払う理由が無い（Issue #113）
+        let _ = self.apply_backend_windows(by_session.as_ref());
+    }
+
+    /// backend セッション名 → window 一覧を `backend_windows` へ反映する（メモリ操作のみ）。
+    ///
+    /// `by_session` が `None` = **採取できなかった**（tmux 不在・サーバー未起動）。
+    /// 採取できたときは **backend ペイン全件**にエントリを作る（window 0 枚は空 Vec）ので、
+    /// 応答側は `None` = 「backend でない / 採取不能」、`Some([])` = 「backend だが
+    /// window が無い」と読み分けられる（#1191）。
+    ///
+    /// 戻り値はホバープレビュー用にキャプチャすべき非アクティブ window
+    /// （pane, session, window index）。capture-pane はサブプロセス実行のため
+    /// 呼び出し側が background で行い、結果を `apply_window_captures` で適用する
+    /// （Issue #113: 旧実装はここで UI スレッドの同期実行をしており、
+    /// 多 worker = 多 window 時の定常的な UI ブロック源だった）
+    fn apply_backend_windows(
+        &mut self,
+        by_session: Option<&HashMap<String, Vec<tako_core::TmuxWindow>>>,
+    ) -> Vec<(PaneId, String, u32)> {
         self.backend_windows.clear();
         let mut capture_targets = Vec::new();
-        for (pane_id, session_name) in &self.backend_sessions {
-            let session = self.tmux_sessions.iter().find(|s| {
-                s["name"].as_str() == Some(session_name) && s["backend"].as_bool() == Some(true)
-            });
-            let Some(session) = session else { continue };
-            let windows: Vec<tako_core::TmuxWindow> = session["windows"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|w| {
-                    Some(tako_core::TmuxWindow {
-                        index: w["index"].as_u64()? as u32,
-                        name: w["name"].as_str()?.to_string(),
-                        active: w["active"].as_bool().unwrap_or(false),
-                        panes: w["panes"].as_u64().unwrap_or(1) as u32,
-                    })
-                })
-                .collect();
-            if windows.len() > 1 {
-                for w in &windows {
-                    if !w.active {
+        if let Some(by_session) = by_session {
+            for (pane_id, session_name) in &self.backend_sessions {
+                let windows = by_session.get(session_name).cloned().unwrap_or_default();
+                // ホバープレビュー（FR-2.16.13）が要るのは「本体に映っていない window」
+                // = 2+ window のときの非アクティブ側だけ
+                if windows.len() > 1 {
+                    for w in windows.iter().filter(|w| !w.active) {
                         capture_targets.push((*pane_id, session_name.clone(), w.index));
                     }
+                } else if legacy_1191() {
+                    // 旧挙動の A/B: 1 window のセッションは載せない（= 応答が null になる）
+                    continue;
                 }
                 self.backend_windows.insert(*pane_id, windows);
             }
         }
+        self.backend_windows_at = by_session.map(|_| std::time::Instant::now());
         // 古いキャプチャを掃除する（対応するペインや window がなくなった分）
         self.window_captures.retain(|(pane, win), _| {
             self.backend_windows
@@ -18890,6 +18971,11 @@ impl TmuxHost for TakoApp {
 
     fn backend_windows(&self, pane: PaneId) -> Option<Vec<tako_core::TmuxWindow>> {
         self.backend_windows.get(&pane).cloned()
+    }
+
+    /// #1191: `tako list` は要求時点の実態を返す（右パネルの表示状態に依存しない）
+    fn refresh_backend_windows(&mut self) {
+        self.refresh_backend_windows_now();
     }
 
     fn backend_scroll_view(
@@ -40703,6 +40789,143 @@ mod self_test {
                     .unwrap_or(false);
                 check(att_killed, "attach 済みセッションの kill（dispatch TmuxKill）");
                 wait(cx, 800).await;
+
+                // 61g. `tako list` の `backend_windows` は**右パネルの表示状態に依存しない**
+                //      （#1191）。旧実装は fleet ビューの 2 秒ポーリングだけがこの値を
+                //      更新していたので、パネルを開いたことがなければ常に null、
+                //      閉じているあいだは陳腐化していた。Issue の再現手順 2 ラウンドを
+                //      そのまま機械で回す
+                {
+                    // 応答から対象ペインの backend_windows を取り出す（`tako list` と同経路）
+                    let windows_of = |cx: &mut AsyncApp, pane: PaneId| -> Option<serde_json::Value> {
+                        window
+                            .update(cx, |app, _, _| {
+                                let list = tako_control::dispatch(
+                                    app,
+                                    tako_control::protocol::Request::List,
+                                    PaneOrigin::Cli,
+                                )
+                                .ok()?;
+                                list["tabs"]
+                                    .as_array()?
+                                    .iter()
+                                    .flat_map(|t| t["panes"].as_array().cloned().unwrap_or_default())
+                                    .find(|p| p["id"] == pane.as_u64())
+                                    .map(|p| p["backend_windows"].clone())
+                            })
+                            .ok()
+                            .flatten()
+                    };
+                    let window_count = |cx: &mut AsyncApp, pane: PaneId| -> Option<usize> {
+                        windows_of(cx, pane).and_then(|v| v.as_array().map(|ws| ws.len()))
+                    };
+                    let set_panel = |cx: &mut AsyncApp, visible: bool, view| {
+                        let _ = window.update(cx, |app, _, cx| {
+                            let _ = tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::Panel {
+                                    visible: Some(visible),
+                                    width: None,
+                                    view,
+                                    filetree: None,
+                                    sidebar_width: None,
+                                    show_hidden: None,
+                                },
+                                PaneOrigin::Cli,
+                            );
+                            cx.notify();
+                        });
+                    };
+
+                    // ラウンド 1: パネルを閉じた状態でも実態（window 1 枚）が載る。
+                    // 器の window は別プロセスの状態なので状態待ち（#1180）
+                    set_panel(cx, false, None);
+                    let hidden_ok = wait_for_backend_state(
+                        cx,
+                        "61g-hidden",
+                        text_wait_budget(20, 500, 25),
+                        |cx| window_count(cx, backend_pane) == Some(1),
+                    )
+                    .await;
+                    check(
+                        hidden_ok,
+                        "#1191: パネル非表示でも backend_windows が実態を返す",
+                    );
+                    // 器なしの素のペインは null（= 「不明」。`[]` と区別できる）
+                    let plain_pane = window
+                        .update(cx, |app, _, _| {
+                            app.workspace
+                                .tabs()
+                                .iter()
+                                .flat_map(|t| t.tree().panes())
+                                .map(|p| p.id())
+                                .find(|p| !app.backend_sessions.contains_key(p))
+                        })
+                        .ok()
+                        .flatten();
+                    if let Some(plain_pane) = plain_pane {
+                        check(
+                            windows_of(cx, plain_pane) == Some(serde_json::Value::Null),
+                            "#1191: 器なしペインの backend_windows は null",
+                        );
+                    }
+
+                    // ラウンド 2: パネルを閉じたまま window を増やすと次の要求に出る
+                    let added = tako_core::tmux::tmux_command(Some(&backend_sock))
+                        .args([
+                            "new-window",
+                            "-d",
+                            "-t",
+                            &tako_core::tmux::exact_target(&format!("{backend_name}:")),
+                            "-n",
+                            "st1191",
+                        ])
+                        .output()
+                        .map(|o| o.status.success())
+                        .unwrap_or(false);
+                    check(added, "#1191: 検証用 window の追加（器へ直接）");
+                    let grew = wait_for_backend_state(
+                        cx,
+                        "61g-grow",
+                        text_wait_budget(20, 500, 25),
+                        |cx| window_count(cx, backend_pane) == Some(2),
+                    )
+                    .await;
+                    check(grew, "#1191: パネル非表示のまま増えた window が反映される");
+
+                    // ビューを切り替えても同じ値（表示状態で中身が変わらない）。
+                    // **各ビューで定期採取（2 秒 tick）を 1 回またぐ**まで待つ: 値を書く
+                    // 経路は 2 つ（fleet のポーリングと要求時採取）あるので、fleet を
+                    // 開いたまま poll をまたがせないと「2 経路が同じ答えを書く」を
+                    // 検査したことにならない。**否定検査ではなくアンカー付き**
+                    // （直前の `61g-grow` で Some(2) に到達済み。#796 の作法）
+                    let mut same_across_views = true;
+                    for view in [
+                        None,
+                        Some(tako_control::protocol::PanelViewWire::Fleet),
+                        Some(tako_control::protocol::PanelViewWire::Git),
+                    ] {
+                        set_panel(cx, view.is_some(), view);
+                        wait(cx, 2400).await;
+                        same_across_views &= window_count(cx, backend_pane) == Some(2);
+                    }
+                    check(
+                        same_across_views,
+                        "#1191: パネルの表示・ビューを変えても backend_windows は同じ",
+                    );
+
+                    // 減った window も（パネルは git ビュー = fleet ではない状態のまま）
+                    let _ = tako_core::tmux::kill_window(Some(&backend_sock), &backend_name, 1);
+                    let shrank = wait_for_backend_state(
+                        cx,
+                        "61g-shrink",
+                        text_wait_budget(20, 500, 25),
+                        |cx| window_count(cx, backend_pane) == Some(1),
+                    )
+                    .await;
+                    check(shrank, "#1191: 減った window も fleet 非表示のまま反映される");
+                    set_panel(cx, false, None);
+                }
 
                 // 62. ペインの明示 close でバックエンドセッションも破棄される
                 //     （アプリ終了では破棄されない = 永続化、は core の e2e テストで検証済み）
