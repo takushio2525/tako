@@ -25881,6 +25881,73 @@ mod self_test {
         waited
     }
 
+    /// **#1177 の注入口**（#1165 の `TAKO_1165_INJECT` と同じ役目）。
+    ///
+    /// `nofract` … 半行スクロールのホイールを**届けない**。ミラーが立つまで待つ形に
+    /// しても**本物の回帰（端数がどこにも載らない）は隠れない**ことの実測用で、
+    /// 器つきなら上限まで待ってミラーの検査が、直接ペインなら端数の検査が
+    /// FAILED になるのが正しい
+    #[cfg(feature = "visual-test")]
+    fn inject_1177() -> String {
+        std::env::var("TAKO_1177_INJECT").unwrap_or_default()
+    }
+
+    /// ペインのミラー実効位置（`ScrollMirror::effective_position`）。ミラーが立って
+    /// いなければ None。`pane` が None ならフォーカス中のペイン（`grid_geom` と同じ約束）
+    #[cfg(feature = "visual-test")]
+    fn mirror_position(app: &TakoApp, pane: Option<PaneId>) -> Option<f32> {
+        let pane = pane.unwrap_or_else(|| app.focused_pane());
+        app.scroll_ctls
+            .get(&pane)
+            .and_then(|c| c.mirror.as_ref())
+            .map(|m| m.effective_position())
+    }
+
+    /// **器（tmux）つきのペインでホイールの端数がミラー位置へ載るまで待つ**
+    /// （#1173 の `subline` 節 → #1177 の `term-grid scroll` ラウンドで 1 実装）。
+    ///
+    /// 直接ペインはホイールが `session.scroll_pixels` へその場で載る（= `screen.fract`）
+    /// が、器つきのペインは `mirror_scroll_pane` → `backend_scroll_px` のミラー経路へ
+    /// 入り、端数は tmux から capture して作るミラーの `position` へ**非同期に**載る。
+    /// 描画側（`subline_fract`）も「ミラーがあれば `ceil(pos) - pos`」を使うので、
+    /// **待てば器つきでも直接ペインと同じ半セルずれが出る**（#1173 の実測）。
+    ///
+    /// 返すのはミラーの実効位置。直接ペイン（`mirrored == false`）と旧経路（`legacy`）
+    /// では**1 回も待たず None** を返すので、直接ペインの測り方は 1 バイトも変わらない。
+    /// 上限まで待って立たなければ `None` + 診断 1 行（`TAKO_SELF_TEST_STATE_TIMEOUT`）
+    /// なので、**本物の回帰は隠れない**
+    #[cfg(feature = "visual-test")]
+    async fn settle_scroll_mirror(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        label: &str,
+        pane: Option<PaneId>,
+        mirrored: bool,
+        legacy: bool,
+    ) -> Option<f32> {
+        if !mirrored || legacy {
+            return None;
+        }
+        let _ = wait_for_dispatch_state(
+            window,
+            cx,
+            label,
+            state_wait_budget(Duration::from_secs(10), machine_busy()),
+            Duration::from_millis(100),
+            move |app| mirror_position(app, pane).is_some_and(|p| p > 0.0),
+        )
+        .await;
+        // 立ったらフレームへ反映させる（ミラーの合成は paint 中に起きるので、
+        // 汚さないと `PaneBody` のキャッシュ（#786）が前の画面を返す）
+        window
+            .update(cx, |app, _, cx| {
+                cx.notify();
+                mirror_position(app, pane)
+            })
+            .ok()
+            .flatten()
+    }
+
     /// [`measure_output_redraw`] の結果（#995）。
     pub(crate) struct RedrawWindow {
         /// 清浄だった試行の増分（全試行が汚れていたら `None` = 判定できない）
@@ -29426,25 +29493,28 @@ mod self_test {
         // **インク縦プロファイルの位相**で言う。行単位描画なら位相は 0 か 1 セルにしか
         // ならないので、半セルの位相はピクセル単位描画の直接証拠になる。
         //
-        // **測れるのは直接ペインだけ**（#943）。器（tmux）つきのペインはホイールが
-        // `mirror_scroll_pane` → `backend_scroll_px` の**ミラー経路**へ入り、
-        // `session.scroll_pixels`（= `fract` を作る側）を通らない。しかもミラーは
-        // 「tmux から capture して作る」ので 1 フレームでは立たず、画面も動かない
-        // = #159 の設計どおりの挙動。前提を見ずに測っていたため、`TAKO_PERSIST=1` を
-        // 付けた実行では `fract=0.000 shift=0 zero_cost=0.00`（フレーム完全同一）で
-        // **必ず落ち、以降の節が 1 つも走らなかった**（#943 の報告値と実測が一致）。
-        // 既定のレシピ（`TAKO_ISOLATED=1` 単独 = persist OFF）では直接ペインなので走る。
-        // 旧挙動（前提を見ずに測る）は `TAKO_943_LEGACY=1`
+        // **端数の載り方はペインの器で変わる**（#943 → #1177）。器（tmux）つきのペインは
+        // ホイールが `mirror_scroll_pane` → `backend_scroll_px` の**ミラー経路**へ入り、
+        // `session.scroll_pixels`（= `screen.fract` を作る側）を通らない。しかもミラーは
+        // 「tmux から capture して作る」ので 1 フレームでは立たない。前提を見ずに測って
+        // いたため `TAKO_PERSIST=1` を付けた実行は `fract=0.000 shift=0 zero_cost=0.00`
+        // （フレーム完全同一）で必ず落ち、**以降の節が 1 つも走らなかった**（#943）。
+        //
+        // #943 はこれを「器つきなら理由つきで飛ばす」で止めたが、**飛ばす必要は
+        // なかった**（#1177）。#1173 の `subline` 節（同じ半行スクロールを別の測り方で
+        // 見る節）の実測で、端数は器つきでもミラーの `position` へ `0.500` として載り、
+        // 描画側（`subline_fract`）も `pos.ceil() - pos` をそのまま使うことが分かって
+        // いる。だから**ミラーが立つまで状態で待ち、期待値の出どころだけを器で切り替える**:
+        // 器つき = ミラーの `ceil(pos) - pos` / 直接ペイン = `screen.fract`
+        // （= 描画側の分岐の写し）。`shift` / `first` / `last` / `ink_rows` は
+        // **実フレームから採る**ので器で分岐しない = 待てば同じ半セルずれが出る。
+        // 器の有無は診断行（`mirrored=` / `mirror_pos=`）に残す（「直接ペインのはずが
+        // 器つきだった」= 隔離の取りこぼしに気づけるのはこれのおかげ）。
+        // 旧挙動（待たない = #943 が飛ばして避けていた形）は `TAKO_943_LEGACY=1`
         let mirrored = window
             .update(cx, |app, _, _| app.mirror_scroll_pane(geom.pane))
             .unwrap_or(false);
         let legacy_943 = std::env::var_os("TAKO_943_LEGACY").is_some();
-        if mirrored && !legacy_943 {
-            println!(
-                "TAKO_VISUAL_SKIPPED: term-grid scroll（器つきペインはミラー経路 = 行単位。\
-                 直接ペイン専用の検査。persist を切ると走る。#943/#159）"
-            );
-        }
         press(any, cx, "ctrl-u");
         type_text(any, cx, "seq 400", true);
         cx.background_executor()
@@ -29480,21 +29550,35 @@ mod self_test {
             flip,
         );
         let cell_h = f32::from(flat.cell.height);
-        window
-            .update(cx, |app, win, cx| {
-                app.on_pane_scroll(
-                    geom.pane,
-                    &ScrollWheelEvent {
-                        position: flat.area.center(),
-                        delta: ScrollDelta::Pixels(point(px(0.0), px(cell_h * 0.5))),
-                        ..ScrollWheelEvent::default()
-                    },
-                    win,
-                    cx,
-                );
-                cx.notify();
-            })
-            .ok();
+        // `TAKO_1177_INJECT=nofract` はホイールを**届けない**（= 端数がどこにも載らない
+        // 本物の回帰）。待つ形にしても検出力が落ちていないことの実測用
+        if inject_1177() != "nofract" {
+            window
+                .update(cx, |app, win, cx| {
+                    app.on_pane_scroll(
+                        geom.pane,
+                        &ScrollWheelEvent {
+                            position: flat.area.center(),
+                            delta: ScrollDelta::Pixels(point(px(0.0), px(cell_h * 0.5))),
+                            ..ScrollWheelEvent::default()
+                        },
+                        win,
+                        cx,
+                    );
+                    cx.notify();
+                })
+                .ok();
+        }
+        // 器つきは capture が返ってミラーが立つまで待つ（`subline` 節と 1 実装。#1177）
+        let mirror_pos = settle_scroll_mirror(
+            window,
+            cx,
+            "term-grid scroll mirror",
+            Some(geom.pane),
+            mirrored,
+            legacy_943,
+        )
+        .await;
         let Some((frame_half, _)) = capture_frame(any, cx) else {
             fail("visual-test 端末グリッド: 半行スクロール後フレーム")
         };
@@ -29525,36 +29609,48 @@ mod self_test {
         };
         let (first_flat, last_flat, rows_flat) = ink_extent(&prof_flat);
         let (first_half, last_half, rows_half) = ink_extent(&prof_half);
+        // 端数の出どころは描画側（`subline_fract`）と同じ分岐にする（#1177）:
+        // ミラーが立っていればその `ceil(pos) - pos`、無ければセッションの `screen.fract`
+        let fract = match mirror_pos {
+            Some(pos) => pos.ceil() - pos,
+            None => half.screen.fract,
+        };
         println!(
-            "TAKO_VISUAL_PIXEL: term-grid scroll mirrored={mirrored} fract={:.3} \
-             shift={shift} expected={expected_shift} best_cost={best_cost:.2} \
-             zero_cost={zero_cost:.2} first={first_flat}->{first_half} \
-             last={last_flat}->{last_half} ink_rows={rows_flat}->{rows_half}",
-            half.screen.fract,
+            "TAKO_VISUAL_PIXEL: term-grid scroll mirrored={mirrored} mirror_pos={} \
+             fract={fract:.3} shift={shift} expected={expected_shift} \
+             best_cost={best_cost:.2} zero_cost={zero_cost:.2} \
+             first={first_flat}->{first_half} last={last_flat}->{last_half} \
+             ink_rows={rows_flat}->{rows_half}",
+            mirror_pos
+                .map(|p| format!("{p:.3}"))
+                .unwrap_or_else(|| "-".into()),
         );
-        // 器つきは上で理由を出して飛ばす（器の有無は診断行に出るので、
-        // 「直接ペインのはずが器つきだった」= 隔離の取りこぼしにも気づける）
-        if legacy_943 || !mirrored {
-            // ここへ来るのは直接ペイン（または `TAKO_943_LEGACY=1`）だけ。前提は
-            // 診断行の `mirrored=` に出るので、判定を 1 本増やしても
-            // 非 legacy では必ず真になるだけ（= 検出力にならない）ため置かない
-            check(
-                (half.screen.fract - 0.5).abs() < 0.2,
-                "visual-test 端末グリッド: 半行スクロールで端数が 0.5 行になる (#159/#787)",
-            );
-            check(
-                (shift - expected_shift).abs() <= 2 && best_cost * 2.0 < zero_cost,
-                "visual-test 端末グリッド: 描画がちょうど半セルずれる（ピクセル単位）(#159/#787)",
-            );
-            check(
-                first_half >= 0 && first_half < first_flat,
-                "visual-test 端末グリッド: 上端に部分行が出る（クリップされて先頭が繰り上がる）(#159/#787)",
-            );
-            check(
-                (last_half - last_flat).abs() as f32 <= cell_h * 0.25 * scale,
-                "visual-test 端末グリッド: 下端の部分行（extra_bottom）が隙間を埋める (#159/#787)",
-            );
-        }
+        // 器つきは「ホイールがミラー位置へ届いた」ことを先に見る（届いていないのに
+        // ピクセルだけ見ると、動かないフレームを半行ずらした無意味な値で落ちる）。
+        // **ここで見るのは「立ったか」だけ**にして、半セルぶんかどうかは次の `fract`
+        // 判定へ委ねる: 出どころは同じ `mirror_pos` だが、`fract` は `ceil(pos) - pos`
+        // なので**位置が整数ぶん育っても成立する**（位置そのものを 0.5 に縛ると、
+        // スクロール中に出力が来て位置が 1.5 へ動いた回に、絵は正しいのに落ちる）
+        check(
+            !mirrored || legacy_943 || mirror_pos.is_some_and(|p| p > 0.0),
+            "visual-test 端末グリッド: 器つきでもホイールの半行がミラー位置へ届く (#159/#1177)",
+        );
+        check(
+            (fract - 0.5).abs() < 0.2,
+            "visual-test 端末グリッド: 半行スクロールで端数が 0.5 行になる (#159/#787)",
+        );
+        check(
+            (shift - expected_shift).abs() <= 2 && best_cost * 2.0 < zero_cost,
+            "visual-test 端末グリッド: 描画がちょうど半セルずれる（ピクセル単位）(#159/#787)",
+        );
+        check(
+            first_half >= 0 && first_half < first_flat,
+            "visual-test 端末グリッド: 上端に部分行が出る（クリップされて先頭が繰り上がる）(#159/#787)",
+        );
+        check(
+            (last_half - last_flat).abs() as f32 <= cell_h * 0.25 * scale,
+            "visual-test 端末グリッド: 下端の部分行（extra_bottom）が隙間を埋める (#159/#787)",
+        );
         window
             .update(cx, |app, _, cx| {
                 if let Some(session) = app.terminals.get(&geom.pane) {
@@ -33897,37 +33993,11 @@ mod self_test {
                 })
                 .ok();
             // 器つきは capture が返ってミラーが立つまで待つ（直接ペインは即座に載るので
-            // 待たない = 直接ペインの測り方は 1 バイトも変えない）
-            let mirror_pos = if mirrored && !legacy_subline {
-                let _ = wait_for_dispatch_state(
-                    window,
-                    cx,
-                    "subline mirror",
-                    state_wait_budget(Duration::from_secs(10), machine_busy()),
-                    Duration::from_millis(100),
-                    |app| {
-                        let pane = app.focused_pane();
-                        app.scroll_ctls
-                            .get(&pane)
-                            .and_then(|c| c.mirror.as_ref())
-                            .is_some_and(|m| m.effective_position() > 0.0)
-                    },
-                )
-                .await;
-                window
-                    .update(cx, |app, _, cx| {
-                        cx.notify();
-                        let pane = app.focused_pane();
-                        app.scroll_ctls
-                            .get(&pane)
-                            .and_then(|c| c.mirror.as_ref())
-                            .map(|m| m.effective_position())
-                    })
-                    .ok()
-                    .flatten()
-            } else {
-                None
-            };
+            // 待たない = 直接ペインの測り方は 1 バイトも変えない）。待ちの実装は
+            // `term-grid scroll` ラウンドと共有する（#1177 で 1 実装へ寄せた）
+            let mirror_pos =
+                settle_scroll_mirror(window, cx, "subline mirror", None, mirrored, legacy_subline)
+                    .await;
             let scroll_after = capture_frame(any, cx);
             // 上下 2 行（部分行・カーソル行）と右端 16px（スクロールバー）を除いた内側で比較
             let inset = Bounds::new(
@@ -67467,6 +67537,87 @@ mod selftest_wait_watchdog {
         ]
         .join("\n");
         assert!(fixed_window_in_claude_e2e(&elsewhere).is_empty());
+    }
+
+    /// **器（tmux）つきだからと visual-test の節を飛ばしていない**（#1177）。
+    ///
+    /// #943 は `term-grid scroll`（半行スクロールの位相）を「器つきはミラー経路 =
+    /// 直接ペイン専用の検査」として理由つきで飛ばしていた。だが #1173 の `subline` 節
+    /// （同じ半行スクロールを別の測り方で見る節）の実測で、**ミラーが立つまで待って
+    /// 期待値の出どころを器で切り替えれば直接ペインと 1 桁も違わない値になる**ことが
+    /// 分かり、#1177 で飛ばすのをやめた。器つきの skip は既定のレシピ
+    /// （`TAKO_ISOLATED=1` 単独 = persist OFF）では走るぶん気づきにくく、
+    /// **実ユーザーに近い経路（persist ON = 器つき）だけが永久に未検証になる**
+    /// （#1091 の教訓）。
+    ///
+    /// 見分けは「skip の目印（`TAKO_VISUAL` + `_SKIPPED`）の直前に、器の有無
+    /// （`mirror…`）で分岐する `if` がある」。「未描画だから測れない」型の skip
+    /// （`screen-lines` / `ime-preedit`）は器に依らないので対象外。パターンは
+    /// `concat!` で分割して書く（番犬自身のソース行が検査対象に入るため）
+    fn container_gated_visual_skips(src: &str) -> Vec<usize> {
+        let marker = concat!("TAKO_VISUAL", "_SKIPPED");
+        let lines: Vec<&str> = src.lines().collect();
+        let mut hits = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            if !line.contains(marker) {
+                continue;
+            }
+            // 直前 6 行のうちに器の有無で分岐する `if` があれば「器つきだから飛ばす」形
+            let from = index.saturating_sub(6);
+            if lines[from..index]
+                .iter()
+                .any(|l| l.trim_start().starts_with("if ") && l.contains("mirror"))
+            {
+                hits.push(index + 1);
+            }
+        }
+        hits
+    }
+
+    #[test]
+    fn 器つきだからと視覚検査の節を飛ばしていない() {
+        let src = include_str!("main.rs");
+        let hits = container_gated_visual_skips(src);
+        assert!(
+            hits.is_empty(),
+            "main.rs:{hits:?} が「器（tmux）つきのペインだから visual-test の節を飛ばす」\
+             形で書かれている。既定のレシピ（persist OFF）では走るので気づかないまま、\
+             **実ユーザーに近い経路（persist ON = 器つき）だけが永久に未検証になる**。\
+             `settle_scroll_mirror` でミラーが立つまで待ち、期待値の出どころだけを\
+             器で切り替えること（#943 の skip は #1177 でこれに置き換えた）"
+        );
+    }
+
+    /// 検出力の担保: 番犬自身が空振りしないこと（#943 が入れていた形そのものを与える）
+    #[test]
+    fn 番犬は器つきskipを見逃さず未描画skipは許す() {
+        let marker = format!("{}{}", "TAKO_VISUAL", "_SKIPPED");
+        // #943 の形（`mirrored` で分岐して理由つきで飛ばす）
+        let bad = [
+            "        if mirrored && !legacy_943 {".to_string(),
+            "            println!(".to_string(),
+            format!("                \"{marker}: term-grid scroll（器つきペインは…）\""),
+            "            );".to_string(),
+            "        }".to_string(),
+        ]
+        .join("\n");
+        assert_eq!(container_gated_visual_skips(&bad), vec![3]);
+        // 「未描画だから測れない」型は器に依らないので許す（`screen-lines` 等）
+        let undrawn = [
+            "            if changed < 200 {".to_string(),
+            "                println!(".to_string(),
+            format!("                    \"{marker}: screen-lines（fixture が画面に出ない）\""),
+            "                );".to_string(),
+            "            }".to_string(),
+        ]
+        .join("\n");
+        assert!(container_gated_visual_skips(&undrawn).is_empty());
+        // 待って測る形（#1177）は飛ばす行そのものが無い
+        let good = format!(
+            "        let mirror_pos = {}(window, cx, label, Some(pane), mirrored, legacy).await;",
+            concat!("settle_scroll", "_mirror")
+        );
+        assert!(container_gated_visual_skips(&good).is_empty());
     }
 
     #[test]
