@@ -191,6 +191,19 @@ mod workspace_roots_tests {
         assert!(workspace_roots(vec![], vec![], None).is_empty());
     }
 
+    /// ホームフォールバックが **Windows のホームでも**効くこと（#893）。
+    /// 呼び元（`tako-app/src/sidebar.rs`）は `paths::home_dir()` を渡すので、
+    /// `%USERPROFILE%` しか無い環境でもファイルツリーが空にならない
+    #[test]
+    fn windowsのホームでもフォールバックする() {
+        let home =
+            crate::paths::home_from(None, Some(std::ffi::OsString::from("C:\\Users\\winuser")));
+        assert_eq!(
+            workspace_roots(vec![], vec![], home),
+            vec![PathBuf::from("C:\\Users\\winuser")]
+        );
+    }
+
     #[test]
     fn ルートがあればホームは足さない() {
         assert_eq!(

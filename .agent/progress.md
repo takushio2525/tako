@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-08（#771: 実 claude e2e の待ちを固定窓から負荷追従の予算へ替え、真因を #1175 へ切り出した）
-- 101c の固定 300 秒窓を `wait_for_claude_state`（`state_wait_budget` + 診断 2 行 + `prompt_flow=` + `101c-SCREEN`）へ。
-  同型 14 か所（45c / 95c ×11 / 97c ×2 / 101c）を同じ予算へ。番犬 `実claudeの応答を固定窓で待っていない`（待ちがループ末尾にある形を #1153 / #1165 は見逃す）
-- **実測で待ちは無罪**（予算 465〜701s に対し実際 93〜242s で `ok=true`）。落ちているのは目印の観測側 = スクロールするビューポートを見ている → #1175 へ起票
-
 ## 2026-09-08（#1173: 器つきペインの visual-test を完走させた）
 - `subline` は待てば器つきでも直接ペインと同一値（`mirrored=true mirror_pos=0.500 direct=13961 shifted=0`）=
   製品は動いているので #943 型の skip は要らなかった。後続 3 件も器つきだけ落ちる同型（描画途中の resize /
@@ -90,3 +85,8 @@
 - tmux のセッショングループは**メンバーが 1 つになっても残る**（実測 3.6b: ビュー kill 後も `grouped=1` / `size=1`）ので、判定材料を `#{session_group_size}` > 1 へ。行のパースと orphan 判定を `tmux_cleanup`（`LIST_FORMAT` / `is_orphan`）へ出し cleanup と find が 1 実装を見る形に
 - 実測（隔離 + tako-vd）: open 前 `grouped=0 size=` → open 中 `size=2` で cleanup は `killed=[]`（保護）→ close 後 `grouped=1 size=1` で `killed=[tako-blind-4]`
 - A/B `TAKO_1188_LEGACY=1` は Issue と同じ `killed=[]` + 残存を再現。ガードを丸ごと外す注入は表示中ビューの保護が落ちて FAILED（= 消して直したのではない）。番犬 1 本 + 単体 6 本
+
+## 2026-09-09（#893: ホーム解決と `~` 短縮の入口をワークスペース全体で 1 本に寄せた）
+- `HOME` 決め打ち 15 箇所を `paths::home_dir()` へ、`~` 短縮 10 箇所を新設 `paths::shorten_home` へ。`ssh_config` は Windows で ssh 系が効くようになり `issue652_resume_e2e` の `.expect("HOME")` panic も消えた
+- 番犬を 2 ファイル走査からワークスペース全体へ（`home_dir_watchdog.rs`）。テストの HOME 差し替えは Drop 復元の `HomeGuard` へ寄せた
+- A/B は修正前コードでホーム解決 30 行 + `~` 短縮 10 行を名指しして FAILED。全 3674 件緑・`HOME`/`USERPROFILE` 両方なしでも panic せずエラー文で止まる（実測）

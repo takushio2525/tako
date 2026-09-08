@@ -5716,14 +5716,7 @@ impl TakoApp {
                 let process = session["pane_command"].as_str().unwrap_or("").to_string();
                 let cwd = session["pane_current_path"]
                     .as_str()
-                    .map(|p| {
-                        if let Ok(home) = std::env::var("HOME") {
-                            if let Some(rest) = p.strip_prefix(&home) {
-                                return format!("~{rest}");
-                            }
-                        }
-                        p.to_string()
-                    })
+                    .map(tako_core::paths::shorten_home)
                     .unwrap_or_default();
                 let last_activity = session["last_activity"].as_i64().unwrap_or(0);
                 let last_activity_age = if last_activity > 0 {
@@ -16919,12 +16912,7 @@ impl TakoApp {
             }
             None => self.terminals.get(&pane_id).and_then(|s| s.cwd()).map(|p| {
                 let full = p.to_string_lossy().to_string();
-                let home = std::env::var("HOME").unwrap_or_default();
-                let short = if !home.is_empty() && full.starts_with(&home) {
-                    format!("~{}", &full[home.len()..])
-                } else {
-                    full.clone()
-                };
+                let short = tako_core::paths::shorten_home(&full);
                 (short, full)
             }),
         };

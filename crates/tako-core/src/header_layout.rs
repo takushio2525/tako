@@ -89,16 +89,8 @@ impl PreviewHeaderVisibility {
 /// パスの中間省略: パスが max_chars を超える場合、先頭と末尾を残して中間を省略する。
 /// 例: `/Users/foo/Documents/projects/bar/src/main.rs` → `~/…/bar/src/main.rs`
 pub fn truncate_path_middle(path: &str, max_chars: usize) -> String {
-    // ~ 置換
-    let display = if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() && path.starts_with(&home) {
-            format!("~{}", &path[home.len()..])
-        } else {
-            path.to_string()
-        }
-    } else {
-        path.to_string()
-    };
+    // ~ 置換（正本は paths::shorten_home。#893 で 10 箇所を 1 本に寄せた）
+    let display = crate::paths::shorten_home(path);
 
     let char_count = display.chars().count();
     if char_count <= max_chars || max_chars < 6 {

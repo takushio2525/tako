@@ -251,15 +251,7 @@ impl TakoApp {
         // フルパス表示（カンプ: ~/projects/ + 末尾強調。クリックでコピー）
         let sidebar_path = cwd.as_ref().map(|p| {
             let full = p.display().to_string();
-            let short = if let Ok(home) = std::env::var("HOME") {
-                if let Ok(rel) = p.strip_prefix(&home) {
-                    format!("~/{}", rel.display())
-                } else {
-                    full.clone()
-                }
-            } else {
-                full.clone()
-            };
+            let short = tako_core::paths::shorten_home(&full);
             // 末尾要素を分離（親部分は muted、末尾は明るく）
             let (parent, leaf) = match short.rfind('/') {
                 Some(i) if i + 1 < short.len() => {

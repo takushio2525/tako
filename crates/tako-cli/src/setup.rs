@@ -80,10 +80,8 @@ fn instruction_path(agent: SetupAgent) -> Option<PathBuf> {
 }
 
 fn display_home_relative(path: &Path) -> String {
-    home_dir()
-        .and_then(|home| path.strip_prefix(home).ok().map(Path::to_path_buf))
-        .map(|relative| format!("~/{}", relative.display()))
-        .unwrap_or_else(|| path.display().to_string())
+    // `~` 短縮の正本は tako_core::paths::shorten_home（#893）
+    tako_core::paths::shorten_home(&path.to_string_lossy())
 }
 
 // --- 環境チェック ---

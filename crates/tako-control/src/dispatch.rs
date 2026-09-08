@@ -10537,10 +10537,7 @@ fn check_health(host: &dyn ControlHost) -> Value {
 }
 
 fn home_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from)
-        .filter(|p| p.is_absolute())
+    tako_core::paths::home_dir().filter(|p| p.is_absolute())
 }
 
 /// コマンド名から実行ファイルを解決する（境界 B16 = [`tako_core::platform::exe::find`]）。
@@ -20078,9 +20075,8 @@ mod tests {
         });
         std::fs::write(&settings, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
 
-        // HOME を一時的に dir に向ける
-        let orig_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", &dir);
+        // HOME を一時的に dir に向ける（Drop で必ず戻る。#893）
+        let _home = crate::test_home::HomeGuard::set(&dir);
         std::fs::create_dir_all(dir.join(".claude")).unwrap();
         std::fs::write(
             dir.join(".claude").join("settings.json"),
@@ -20111,10 +20107,6 @@ mod tests {
         // 2 回目は false
         let cleaned2 = clean_legacy_settings_json();
         assert!(!cleaned2, "既に掃除済みなら false");
-
-        if let Some(h) = orig_home {
-            std::env::set_var("HOME", h);
-        }
     }
 
     #[test]

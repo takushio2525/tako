@@ -99,7 +99,10 @@ fn resumeは会話のあるconfigディレクトリでのみ成立する() {
     );
 
     // 既定 config ディレクトリに transcript ができている
-    let default_dir = PathBuf::from(std::env::var("HOME").expect("HOME")).join(".claude");
+    // ホーム解決は正本を通す（#893。`var("HOME").expect()` は Windows で panic した）
+    let default_dir = tako_core::paths::home_dir()
+        .expect("ホームディレクトリ")
+        .join(".claude");
     let located = transcript::locate_transcript_in(
         std::slice::from_ref(&default_dir),
         Some(&default_dir),

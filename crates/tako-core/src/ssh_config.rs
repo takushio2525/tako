@@ -30,11 +30,20 @@ impl SshHost {
     }
 }
 
-/// ~/.ssh/config のデフォルトパス
+/// `~/.ssh/config` のデフォルトパス。
+///
+/// ホーム解決は正本（[`crate::paths::home_dir`]）を通す（#893）。ここが `HOME`
+/// 決め打ちだったので、**Windows では ssh 系の補完・解決がまるごと無効**だった
+/// （`%USERPROFILE%` しか無い環境で必ず `None` を返す = #870 と同型）
 pub fn default_ssh_config_path() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(|h| PathBuf::from(h).join(".ssh/config"))
+    crate::paths::home_dir().map(|home| ssh_config_path_in(&home))
+}
+
+/// ホームを与えたときの `~/.ssh/config`（純粋。macOS から Windows のホームを検査できる）。
+/// `.join(".ssh/config")` と違い区切りを OS 側へ任せるので、Windows でも
+/// `C:\Users\winuser\.ssh\config` の形になる
+pub fn ssh_config_path_in(home: &Path) -> PathBuf {
+    home.join(".ssh").join("config")
 }
 
 /// 指定パスの SSH config から Host エントリを抽出する。
@@ -115,6 +124,34 @@ fn split_key_value(line: &str) -> Option<(&str, &str)> {
         let key = parts.next()?;
         let value = parts.next()?.trim();
         Some((key, value))
+    }
+}
+
+#[cfg(test)]
+mod home_tests {
+    use super::*;
+
+    /// `~/.ssh/config` が **Windows のホームでも**組み立てられること（#893）。
+    ///
+    /// 移送前はここが `HOME` 決め打ちだったので、`%USERPROFILE%` しか無い環境では
+    /// 必ず `None` を返し、ssh 系の補完・解決がまるごと無効だった（#870 と同型）
+    #[test]
+    fn windowsのホームでもsshconfigを組み立てる() {
+        // `%USERPROFILE%` だけがある環境の解決結果を模す（正本と同じ純粋関数を通す）
+        let home =
+            crate::paths::home_from(None, Some(std::ffi::OsString::from("C:\\Users\\winuser")))
+                .expect("USERPROFILE からホームが解決できる");
+        assert_eq!(
+            ssh_config_path_in(&home),
+            std::path::PathBuf::from("C:\\Users\\winuser")
+                .join(".ssh")
+                .join("config")
+        );
+        // macOS / Linux 側は従来どおり
+        assert_eq!(
+            ssh_config_path_in(std::path::Path::new("/Users/testuser")),
+            std::path::PathBuf::from("/Users/testuser/.ssh/config")
+        );
     }
 }
 

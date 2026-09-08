@@ -236,11 +236,7 @@ pub fn list_args(agent: WorkerAgent) -> Vec<String> {
 /// - agy: `~/.gemini/config/mcp_config.json`（実測: `agy mcp add` が実際に書いた先。
 ///   `HOME` を差し替えるとそちらへ付いてくる = テストで隔離できる）
 pub fn config_path(agent: WorkerAgent) -> Option<PathBuf> {
-    let home = || {
-        std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .map(PathBuf::from)
-    };
+    let home = tako_core::paths::home_dir;
     match agent {
         WorkerAgent::Codex => {
             if let Some(dir) = std::env::var_os("CODEX_HOME") {
