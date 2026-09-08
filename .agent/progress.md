@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-09（#1015: codex の背景ターミナル待ちを idle + 未達と誤検知しないようにした）
-- 真因は**ペイン幅**（負荷でも rollout でもない）: 44 桁では codex が `• Waiting for background terminal (1m 04s •…` と自分で切るので `esc to interrupt` が消え、末尾の `›` を拾って idle になっていた。同じ理由で `prompt_undelivered`（自動再送）の抑制も外れる = 2 症状は同一原因
-- 判定を「`•` で始まり `(` の直後が経過時間 + その直後が区切り」へ。**語では判定しない**（`Waited for …` は完了後も残る履歴行 = 永久 busy になる。実測 5 回残存）。未達の断定は rollout を実際に読めたときだけにし、読めないときは `prompt_delivery_unverified` へ降格
-- 実採取 2 幅 + 実 worker（器つき隔離）で `busy` / `codex-session` / events 空。A/B `TAKO_1015_LEGACY=1` は Issue と同じ `status=idle` `prompt_delivery=undelivered` `resend_prompt` を再現。番犬 3 本 + 単体 9 本。全 3659 件緑（main 取り込み後）
-
 ## 2026-09-09（#1081: かんたん表示章を手順型デモへ差し替え）
 - 旧 c5_gui（1 区間）を捨て、実クリック / 実キー入力で撮る `scene_guimode` と 11 区間の台本（`c5_gui1`〜11）を作った
 - 実収録 5 回で罠を根治: 窓の重なりでクリックが吸われる（#1149 で seed が死亡）/ 押下の前面化でユーザーのキーが流入 / master が run を選ぶ
@@ -90,3 +85,8 @@
   入力送出を持たない psmux では必ず失敗・器なしのペインは対象外（セルフテストも skip されていた）
 - 届き方を `reach::DialogAccess` へ出し `dialog_access` が in-process を先に見る形へ。手順は
   `respond_via` の 1 実装で共有し監査へ `route=`。実機 A/B で Issue と同一エラー → `DELIVERED=1`
+
+## 2026-09-09（#1223: 番号なし・選択肢 2 つの信頼ダイアログを検知して respond できるようにした）
+- 番号なし経路の「兄弟 3 行以上」を、**兄弟 2 行のときだけ「並びの直後に確定キーの案内があるか」**で補強（`dialog::confirm_hint_below`）。codex の入力待ち画面（入力行 + 直下のステータス行）は案内が無いので従来どおり非検知
+- 隔離 GUI 実測（実ペイン 79 桁・本文が折り返す状態）: 下見が `kind=trust` / 2 件 / `highlighted=0`、`--choice trust` が `Down`→ラベル一致検証→`Enter` で `resolved=true`。エミュレータ側も受領を表示
+- A/B `TAKO_1223_LEGACY=1` は Issue と同じ「選択肢ダイアログが見つからない」を再現。案内の根拠を外す注入で新旧 2 テストが FAILED。全 3757 件緑

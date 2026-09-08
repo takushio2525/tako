@@ -1132,7 +1132,8 @@ pub const MATRIX: &[AgentFeature] = &[
         evidence: AgentEvidence::Source(
             "claude_tui.rs は claude v2.1.198 / codex 0.144.1 / agy 1.1.0 の実採取画面の \
              和集合として実装され、CODEX_TRUST_DIALOG / AGY_PERMISSION_DIALOG 等の \
-             fixture が同ファイルに在る",
+             fixture が同ファイルに在る。番号なし・選択肢 2 つ（claude 2.x の信頼 \
+             ダイアログ = TRUST_DIALOG_NO_NUMBER）も #1223 で検知対象",
         ),
     },
     AgentFeature {

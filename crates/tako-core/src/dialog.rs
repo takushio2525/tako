@@ -182,10 +182,13 @@ fn detect_choice_list_in(lines: &[&str]) -> Option<ChoiceList> {
             break;
         }
     }
-    // 兄弟が 2 つ未満なら選択肢の並びとみなさない。codex の起動画面は
+    // 兄弟が 2 つ未満なら選択肢の並びとみなさない。codex の起動 / 入力待ち画面は
     // 入力行の直下にモデル / cwd のステータス行が同じ桁で 1 行だけ並ぶため、
-    // 「兄弟 1 つ」を許すとそれを選択肢と誤検知する（実採取 fixture で固定）
-    if rows.len() < 3 {
+    // 「兄弟 1 つ」を無条件に許すとそれを選択肢と誤検知する（実採取 fixture で固定）。
+    // **確定キーの案内が並びの直後にある**ときだけ兄弟 2 行を認める（#1223。
+    // claude 2.x の信頼ダイアログは選択肢 2 つ・番号なしで案内が空行で切れる）
+    let corroborated = rows.len() == 2 && confirm_hint_below(lines, rows[1], bottom);
+    if rows.len() < 3 && !corroborated {
         return None;
     }
     let options: Vec<ChoiceOption> = rows
@@ -702,6 +705,48 @@ pub fn is_key_hint(line: &str) -> bool {
         || t.contains("to cancel")
 }
 
+/// 兄弟 2 行だけの並びを「選択肢」と言い切れる追加の根拠（#1223）。
+///
+/// claude 2.x の信頼ダイアログは**選択肢 2 つ・番号なし**で、確定キーの案内が
+/// **空行で切れて**描かれるので兄弟が 2 行しか繋がらない:
+/// ```text
+///  > No, exit
+///    Yes, I trust this folder
+///
+///  Enter to confirm · Esc to cancel
+/// ```
+/// 一方 codex の入力待ち画面は入力行の直下にステータス行が同じ桁で 1 行だけ並ぶ
+/// （= これも兄弟 2 行）ので、閾値 3 を単純に緩めるとステータス行を選択肢と誤検知する:
+/// ```text
+/// › Reply with exactly: PROBE_OK (nothing else)
+///   gpt-5.6-sol high · /private/tmp/example/workdir
+/// ```
+/// 区別は**並びの直後に確定キーの案内があるか**で付く。ダイアログの下には必ず在り
+/// （claude `Enter to confirm · Esc to cancel` / codex `Press enter to continue` /
+/// agy `↑/↓ Navigate · enter Confirm` の実採取 3 種）、ステータス行の下には無い。
+///
+/// 案内との間には空行が挟まるので跨いで探し、**案内でない非空行に当たったら偽**
+/// （そこで並びが終わっている = 選択肢の下ではない）。存在判定に文言を持ち込むのは
+/// **兄弟 2 行のときだけ**で、3 行以上の経路は従来どおり構造だけで決める
+fn confirm_hint_below(lines: &[&str], last_row: usize, to: usize) -> bool {
+    if legacy_two_row_dialog() {
+        return false;
+    }
+    lines
+        .get(last_row + 1..to)
+        .unwrap_or_default()
+        .iter()
+        .find(|l| !l.trim().is_empty())
+        .is_some_and(|l| is_key_hint(l))
+}
+
+/// `TAKO_1223_LEGACY=1` で **#1223 前の挙動**（兄弟 2 行を一切認めない）へ戻す。
+/// 同一バイナリで A/B を取る入口
+fn legacy_two_row_dialog() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_1223_LEGACY").is_some())
+}
+
 /// 罫線だけでできた行か（`screen::is_frame_line` と同じ役割。ダイアログの箱の境界）。
 /// claude は `────` / `╭─╮` のほか `▔▔▔`（`/model` / `/mcp`）も使う（実採取）
 pub fn is_rule_line(line: &str) -> bool {
@@ -901,6 +946,20 @@ Enter to select · ↑/↓ to navigate · Esc to cancel"#;
 › Summarize recent commits
 
   gpt-5.6-sol high · /private/tmp/example/workdir"#;
+
+    /// claude 2.x の信頼ダイアログ（**番号なし・選択肢 2 つ**の実採取。#1223）。
+    /// 確定キーの案内が**空行で切れる**ので兄弟が 2 行しか繋がらない = 閾値 3 で落ちていた形
+    const CLAUDE_TRUST_NO_NUMBER: &str = r#" Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source
+ project, or work from your team). If not, take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ > No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel"#;
 
     /// agy の信頼ダイアログ（**番号なし**の実採取。番号なし経路が拾うべき下限）
     const AGY_TRUST: &str = r#"Accessing workspace:
@@ -1184,6 +1243,75 @@ Antigravity CLI requires permission to read, edit, and execute files here.
         assert_eq!(list.options[0].label, "Yes, I trust this folder");
         assert_eq!(list.options[1].label, "No, exit");
         assert_eq!(list.highlighted, Some(0));
+    }
+
+    #[test]
+    fn 番号なし二択のclaude信頼ダイアログを検知する() {
+        let list = detect_choice_list(&rows(CLAUDE_TRUST_NO_NUMBER)).expect("検知される");
+        assert!(!list.numbered, "番号なし経路で拾う");
+        assert_eq!(list.options.len(), 2, "{:?}", list.options);
+        assert_eq!(list.options[0].label, "No, exit");
+        assert_eq!(list.options[1].label, "Yes, I trust this folder");
+        assert_eq!(list.highlighted, Some(0), "既定は No, exit");
+        assert!(
+            list.header.iter().any(|h| h.contains("Quick safety check")),
+            "本文が header に入る: {:?}",
+            list.header
+        );
+    }
+
+    #[test]
+    fn 番号なし二択はカーソルが二つ目でも位置が取れる() {
+        let screen =
+            "   No, exit\n > Yes, I trust this folder\n\n Enter to confirm · Esc to cancel";
+        let list = detect_choice_list(&rows(screen)).expect("検知される");
+        assert_eq!(list.options.len(), 2, "{:?}", list.options);
+        assert_eq!(list.highlighted, Some(1));
+        assert_eq!(list.highlighted_label(), Some("Yes, I trust this folder"));
+    }
+
+    #[test]
+    fn 兄弟二行でも確定キーの案内が無ければ選択肢とみなさない() {
+        // codex の入力待ち画面（入力行の直下にステータス行が同じ桁で 1 行だけ並ぶ）
+        let codex_pending = "• DONE_PROBE\n────────────────────────────────────────────────────\n› Reply with exactly: PROBE_OK (nothing else)\n  gpt-5.6-sol high · /private/tmp/example/workdir";
+        assert!(
+            detect_choice_list(&rows(codex_pending)).is_none(),
+            "ステータス行を選択肢と誤検知してはいけない"
+        );
+        // 案内でない非空行が並びの直後に来る形も選択肢ではない
+        let with_status = " > No, exit\n   Yes, I trust this folder\n\n gpt-5.6-sol high · /private/tmp/example/workdir";
+        assert!(
+            detect_choice_list(&rows(with_status)).is_none(),
+            "直後の非空行が案内でなければ根拠にならない"
+        );
+    }
+
+    #[test]
+    fn 番号なし二択の規則は三択以上と狭幅の並びを壊さない() {
+        // 案内が空行の先にある 3 択（従来どおり構造だけで通る経路）
+        let three = " Pick one?\n\n > A\n   B\n   C\n\n Enter to confirm · Esc to cancel";
+        let list = detect_choice_list(&rows(three)).expect("検知される");
+        assert_eq!(list.options.len(), 3, "{:?}", list.options);
+        assert_eq!(list.highlighted, Some(0));
+
+        // 狭幅で選択肢が折り返した信頼ダイアログ（合成 30 桁）。番号なしの並びは
+        // 兄弟と続きが同じ桁に来るので**ラベルは行ごとに割れる**（`/mcp` の一覧を
+        // 1 個へ畳まないための既存の安全側。#1131 のコメント参照）。それでも
+        // ハイライト位置と「trust を含む選択肢が 1 つ」は保たれるので、
+        // `respond` のラベル一致検証は成立する
+        let narrow = " Quick safety check: Is this\n a project you created or\n one you trust?\n\n > No, exit\n   Yes, I trust this\n   folder\n\n Enter to confirm · Esc to\n cancel";
+        let list = detect_choice_list(&rows(narrow)).expect("狭幅でも検知される");
+        assert_eq!(list.highlighted, Some(0));
+        assert_eq!(list.highlighted_label(), Some("No, exit"));
+        assert_eq!(
+            list.options
+                .iter()
+                .filter(|o| o.label.contains("trust"))
+                .count(),
+            1,
+            "trust を含む選択肢は 1 つ = ラベル指定が曖昧にならない: {:?}",
+            list.options
+        );
     }
 
     #[test]
