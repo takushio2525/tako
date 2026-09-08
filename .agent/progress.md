@@ -19,16 +19,6 @@
 
 ---
 
-## 2026-09-09（#1081: かんたん表示章を手順型デモへ差し替え）
-- 旧 c5_gui（1 区間）を捨て、実クリック / 実キー入力で撮る `scene_guimode` と 11 区間の台本（`c5_gui1`〜11）を作った
-- 実収録 5 回で罠を根治: 窓の重なりでクリックが吸われる（#1149 で seed が死亡）/ 押下の前面化でユーザーのキーが流入 / master が run を選ぶ
-- 素材の検査は PII 0 件・15 秒以上の静止 0 件。worker の絵だけ撮り直しが残り（画面ロック待ち）
-
-## 2026-09-09（#1188: tmux open で取り込んだセッションが永久に掃除されない問題を根治）
-- tmux のセッショングループは**メンバーが 1 つになっても残る**（実測 3.6b: ビュー kill 後も `grouped=1` / `size=1`）ので、判定材料を `#{session_group_size}` > 1 へ。行のパースと orphan 判定を `tmux_cleanup`（`LIST_FORMAT` / `is_orphan`）へ出し cleanup と find が 1 実装を見る形に
-- 実測（隔離 + tako-vd）: open 前 `grouped=0 size=` → open 中 `size=2` で cleanup は `killed=[]`（保護）→ close 後 `grouped=1 size=1` で `killed=[tako-blind-4]`
-- A/B `TAKO_1188_LEGACY=1` は Issue と同じ `killed=[]` + 残存を再現。ガードを丸ごと外す注入は表示中ビューの保護が落ちて FAILED（= 消して直したのではない）。番犬 1 本 + 単体 6 本
-
 ## 2026-09-09（#893: ホーム解決と `~` 短縮の入口をワークスペース全体で 1 本に寄せた）
 - `HOME` 決め打ち 15 箇所を `paths::home_dir()` へ、`~` 短縮 10 箇所を新設 `paths::shorten_home` へ。`ssh_config` は Windows で ssh 系が効くようになり `issue652_resume_e2e` の `.expect("HOME")` panic も消えた
 - 番犬を 2 ファイル走査からワークスペース全体へ（`home_dir_watchdog.rs`）。テストの HOME 差し替えは Drop 復元の `HomeGuard` へ寄せた
@@ -90,3 +80,8 @@
 - 6 か所（タブバー `⌘K` / git コミット欄 / プレビュー保存 / 確認ダイアログ / 設定 / `ui-mode` の next_step）と走査で見つかった同型 4 件を `tako_core::platform::keys` と `keybindings::shortcut_hint_for(action, platform)` へ。macOS の文言は 1 文字も不変
 - **バインド表に無い「修飾 + クリック / Enter」は Windows で案内ごと落とす**（Win キーは押せない = #763）。`key_bindings()` の `cfg` をやめ `bindings_for(platform)` にしたので macOS の CI から Windows 側を検証できる
 - 番犬 2 本立て（ソース走査 `ui_key_notation.rs` の規則 A / B + 組み上がった文言の Windows 検査）。A/B 5 アームが確定 FAILED
+
+## 2026-09-09（#986: codex / agy worker から tako の MCP を呼べるようにした）
+- codex は spawn の起動コマンドへ `-c mcp_servers.tako.*` を一時注入（正本 `agent::codex_mcp_args` を master / worker / git resolve が共有）。`caller_pane` は `TAKO_PANE_ID` が無ければ **pid 祖先辿り**へ落ちる（`tako mcp serve` → `Request::ResolvePane`）
+- 実測（隔離 GUI + tako-vd / codex-cli 0.153.0 / agy 1.1.27）: 実 worker が `tako_list_panes` を呼び、**pane 省略**の `tako_set_title` が codex=pane2 / agy=pane3 と自分のペインへ当たった。効いている経路は env の指紋で判別（一時注入 5 個 / 恒久登録 4 個）。同時 2 本でも取り違えなし
+- Issue の前提「agy は親 env を渡さない」は**実測で否定**（`TAKO_*` が 15 個届く）ので docs / コメントを訂正。番犬 3 本 + 単体 9 本、A/B は `TAKO_986_LEGACY=1`。全 3737 件緑
