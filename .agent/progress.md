@@ -102,3 +102,8 @@
 - 全 47 区間の kana を機械で出して全件読み、誤読 5 件を修正（`3 つ`→みっつ / `1 行`×2 / `空のペイン` / `140 個`）
 - **ユーザー辞書は空白でトークンが割れて当たらない**（実測）ので、合成直前の置換表 `reading-overrides.tsv` を正本に
 - v4 = 9:59 / -14.9 LUFS / TP -1.5 dBTP / PII 0 件。点検は `check-readings.sh --diff`
+
+## 2026-09-09（#1019: setup ディレクトリを data dir の境界へ寄せ、旧 Windows パスから自動移設）
+- `setup_dir()` の macOS 直書きを `tako_control::setup::setup_dir`（= `data_dir()/setup`）へ集約。旧パスは `SchemaId::Setup` の番地 + 専用実装で移設（写す → 旧ごと `setup.pre-v1.bak` へ rename・**隔離中は移設しない**）
+- A/B 実測: 同条件の `setup --yes` が旧バイナリは HOME 側へ 16 ファイル・新は `$TAKO_DATA_DIR/setup` へ。本番 dir は隔離 6 経路の前後でハッシュ・mtime とも不変
+- 番犬 `setup_dir_boundary_watchdog` 4 本（修正前コードで 2 本が確定 FAILED）+ 単体 12 本。全 3619 件緑。Windows 実機での移設は #467 配下で要確認
