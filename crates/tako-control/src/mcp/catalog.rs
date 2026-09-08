@@ -21,6 +21,11 @@ pub fn tools() -> Vec<Value> {
                 listen_ports はペイン配下プロセスが listen 中の\
                 TCP ポート（dev サーバーの起動検知に使える）。エージェントや dev サーバーの\
                 実行状況の把握に使える。\
+                backend_windows はそのペインの tmux バックエンドセッション内の window 全件で、\
+                右パネルの表示状態に関わらず要求時点の実態を返す: \
+                null = backend ペインでない / tmux から採取できなかった、\
+                [] = backend だが window が 1 枚も無い、[..] = window 全件（1 枚でも載る）。\
+                window を切り替えるときは tako_tmux_select_window にこの index を渡す。\
                 ペインを操作する前にまずこれを呼び、現状のレイアウトとペイン ID を把握すること。",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
         }),
