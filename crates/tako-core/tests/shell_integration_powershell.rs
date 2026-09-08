@@ -149,20 +149,24 @@ impl Pane {
     ///
     /// 製品では tako の定期更新が `drain_osc_sinks` でこれをやる（2 秒 tick）。
     /// テストは待ちを速くするため自分で回すが、**通す経路は製品と同じ**
-    /// （`SinkCursor::take_new` → `TerminalSession::feed_osc_bytes`）
+    /// （`SinkReader::take_new` → `TerminalSession::feed_osc_bytes`。#1199 で
+    /// 待ち合わせ先が「書き手の pid つき」になったので読み口も製品と同じものを使う）
+    fn drain_sink(&mut self, reader: &mut tako_core::osc_sink::SinkReader) {
+        for bytes in reader.take_new() {
+            self.session.feed_osc_bytes(&bytes);
+        }
+    }
+
     fn wait_state_via_sink(
         &mut self,
-        sink: &Path,
-        cursor: &mut tako_core::osc_sink::SinkCursor,
+        reader: &mut tako_core::osc_sink::SinkReader,
         want: CommandState,
         timeout: Duration,
     ) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
             self.pump();
-            if let Some(bytes) = cursor.take_new(sink) {
-                self.session.feed_osc_bytes(&bytes);
-            }
+            self.drain_sink(reader);
             if self.session.command_state() == want {
                 return true;
             }
@@ -451,11 +455,39 @@ fn 器の中では統合が読み込まれてもoscが外へ出ない() {
     // 統合が動いていれば OSC 133 で Idle になるはず。**器を通らないので Unknown のまま**
     pane.send_line("cmd.exe /c exit 3");
     let leaked = pane.wait_state(CommandState::Failed(3), Duration::from_secs(15));
+    // #1199: 器の中の**別のシェル**（psmux のプリウォーム済みプール）が同じペインの
+    // 側路へ書いても、そのペインの cwd は動いてはいけない。器はペイン固有の env を
+    // グローバル環境へ入れるので、旧実装（パスだけの待ち合わせ）ではウォームプールの
+    // シェルが `OSC 7 <ホーム>` を書き、リサイズごとに cwd がホームへ巻き戻っていた
+    let foreign_home = std::env::temp_dir().join("tako-1199-foreign");
+    let foreign = tako_core::osc_sink::writer_sink_path(&data_dir, 1, 999_999);
+    let bundle = format!(
+        "\x1b]7;file:///{}\x07",
+        foreign_home.display().to_string().replace('\\', "/")
+    );
+    std::fs::write(&foreign, bundle.as_bytes()).expect("別のシェルのぶんを置ける");
+    for _ in 0..10 {
+        pane.pump();
+        pane.drain_sink(&mut reader);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let cwd_after_foreign = pane.session.cwd().map(Path::to_path_buf);
+
     let screen = pane.screen();
     let state = pane.session.command_state();
     let cwd = pane.session.cwd().map(Path::to_path_buf);
     drop(pane);
     cleanup();
+    let _ = std::fs::remove_file(&foreign);
+
+    assert!(
+        writer_pid.is_some(),
+        "器が `#{{pane_pid}}` を答えない（#1199。側路の待ち合わせ先を張れない =          cwd 追従とコマンド状態が届かなくなる）"
+    );
+    assert_eq!(
+        cwd_after_foreign, cwd,
+        "器の中の別のシェルが書いたぶんでペインの cwd が動いた（#1199 の巻き戻り）"
+    );
 
     assert!(started, "器の中でシェルが起動しない\n{screen}");
     assert!(
@@ -570,7 +602,20 @@ fn 器の中でも側路を張れば状態とcwdが届く() {
     let (session, rx) = TerminalSession::spawn(120, 40, backend.wrap_spawn(options, &name))
         .expect("psmux クライアントを起動できること");
     let mut pane = Pane { session, rx };
-    let mut cursor = tako_core::osc_sink::SinkCursor::default();
+    // #1199: 読み口は製品と同じ `SinkReader`。**そのペインのシェルの pid** を
+    // 器へ聞いて張るまで解決済みのファイルは読まない（器の中の別のシェルが
+    // 同じ待ち合わせ先へ書けてしまうため）
+    let mut reader = tako_core::osc_sink::SinkReader::new(&data_dir, 1);
+    let mut writer_pid = None;
+    for _ in 0..60 {
+        writer_pid = tako_core::tmux_backend::pane_facts(&socket, name.as_str()).pid;
+        if let Some(pid) = writer_pid {
+            reader.set_writer_pid(pid);
+            break;
+        }
+        pane.pump();
+        std::thread::sleep(Duration::from_millis(250));
+    }
 
     let cleanup = || {
         let _ = std::process::Command::new(&bin)
@@ -582,17 +627,11 @@ fn 器の中でも側路を張れば状態とcwdが届く() {
     };
 
     // ① 起動して最初のプロンプトが出たら Idle（= 133;A が側路で届いた）
-    let idle = pane.wait_state_via_sink(
-        &sink,
-        &mut cursor,
-        CommandState::Idle,
-        Duration::from_secs(45),
-    );
+    let idle = pane.wait_state_via_sink(&mut reader, CommandState::Idle, Duration::from_secs(45));
     // ② 非ゼロ終了のコマンドで Failed(3)（= 133;D;3 が側路で届いた。終了コードつき）
     pane.send_line("cmd.exe /c exit 3");
     let failed = pane.wait_state_via_sink(
-        &sink,
-        &mut cursor,
+        &mut reader,
         CommandState::Failed(3),
         Duration::from_secs(20),
     );
@@ -610,9 +649,7 @@ fn 器の中でも側路を張れば状態とcwdが届く() {
         let deadline = Instant::now() + Duration::from_secs(8);
         loop {
             pane.pump();
-            if let Some(bytes) = cursor.take_new(&sink) {
-                pane.session.feed_osc_bytes(&bytes);
-            }
+            pane.drain_sink(&mut reader);
             followed = pane
                 .session
                 .cwd()

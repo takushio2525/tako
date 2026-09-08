@@ -341,32 +341,68 @@ pub fn wrap_options(options: SpawnOptions, socket: &str, session: &str) -> Spawn
     }
 }
 
-/// バックエンドセッション内ペインの tty（`/dev/ttysNNN`）。
-/// ペイン配下のプロセスはこの tty を制御端末に持つため、listen ポート検知（FR-2.4.2）と
-/// tmuxview の tty 突き合わせ（FR-2.13.2）はこの tty に差し替えて維持する。
+/// 器の中のペインについて、器だけが知っている材料（#1199 で pid を足した）
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PaneFacts {
+    /// ペインの tty（`/dev/ttysNNN`）。psmux は実在しない値を返すので当てにしない
+    pub tty: Option<String>,
+    /// ペインのシェルの pid（`#{pane_pid}`）。側路の書き手の同一性
+    /// （[`crate::osc_sink`]）に使う
+    pub pid: Option<u32>,
+}
+
+/// 器の 1 行から `#{pane_tty}` / `#{pane_pid}` を切り出す（純粋関数）
+pub fn parse_pane_facts(line: &str) -> PaneFacts {
+    let mut fields = line.split('\t');
+    let tty = fields
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let pid = fields
+        .next()
+        .map(str::trim)
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|pid| *pid != 0);
+    PaneFacts { tty, pid }
+}
+
+/// バックエンドセッション内ペインについて器へ 1 回だけ問い合わせる（#1199）。
+///
+/// tty はペイン配下のプロセスの制御端末なので、listen ポート検知（FR-2.4.2）と
+/// tmuxview の tty 突き合わせ（FR-2.13.2）がそちらへ差し替える。pid は側路の
+/// 待ち合わせ先（`<pane>@p<pid>.osc`）を決める材料で、**同じ 1 回の呼び出しで**採る
+/// （器へのプロセス起動を増やさない）。
 /// `list-panes` を使う（`display-message -p` はクライアント無しだと空を返す）。
-/// セッション未作成・tmux 不在では None（呼び出し側がリトライする）
-pub fn pane_tty(socket: &str, session: &str) -> Option<String> {
-    let output = crate::tmux::tmux_command(Some(socket))
+/// セッション未作成・tmux 不在では既定値（呼び出し側がリトライする）
+pub fn pane_facts(socket: &str, session: &str) -> PaneFacts {
+    let Ok(output) = crate::tmux::tmux_command(Some(socket))
         .args([
             "list-panes",
             "-t",
             &crate::tmux::exact_target(session),
             "-F",
-            "#{pane_tty}",
+            "#{pane_tty}\t#{pane_pid}",
         ])
         .output()
-        .ok()?;
+    else {
+        return PaneFacts::default();
+    };
     if !output.status.success() {
-        return None;
+        return PaneFacts::default();
     }
-    let tty = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    (!tty.is_empty()).then_some(tty)
+    parse_pane_facts(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap_or(""),
+    )
+}
+
+/// バックエンドセッション内ペインの tty（`/dev/ttysNNN`）。
+/// 材料は [`pane_facts`] と同じ 1 回の問い合わせから採る
+pub fn pane_tty(socket: &str, session: &str) -> Option<String> {
+    pane_facts(socket, session).tty
 }
 
 /// セッションの現在の作業ディレクトリを取得する（orphan 復帰時のタブ名推定用）
@@ -2179,5 +2215,21 @@ set -gq copy-mode-position-format ''
             !lines.contains("^[[A") && !lines.contains("^[OA") && !lines.contains("^[[B"),
             "ホイールが矢印キーに化けている（リグレッション (1)）。画面: {lines:?}"
         );
+    }
+    #[test]
+    fn pane_factsはttyとpidを1行から切り出す() {
+        let f = super::parse_pane_facts("/dev/ttys012\t8768");
+        assert_eq!(f.tty.as_deref(), Some("/dev/ttys012"));
+        assert_eq!(f.pid, Some(8768));
+
+        // psmux は tty を持たないことがある（pid だけ採れれば側路は張れる）
+        let f = super::parse_pane_facts("\t8768");
+        assert_eq!(f.tty, None);
+        assert_eq!(f.pid, Some(8768));
+
+        // セッション未作成 / 器不在
+        assert_eq!(super::parse_pane_facts(""), super::PaneFacts::default());
+        // pid 0 は「取れなかった」と同じ扱い（張ると誰も書かないファイルを読む）
+        assert_eq!(super::parse_pane_facts("/dev/ttys012\t0").pid, None);
     }
 }

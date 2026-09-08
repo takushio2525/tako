@@ -38,6 +38,23 @@ if ($env:TAKO_PANE_ID -and -not $global:__takoShellIntegration) {
     # the SAME ones that would have gone to the console, so tako's parser and state machine
     # are unchanged.
     $global:__takoSink = $env:TAKO_OSC_SINK
+    # #1199: the sink is a rendezvous by PATH alone, and the container hands tako's
+    # per-pane environment to EVERY shell it starts -- psmux's `-e` lands in the server's
+    # GLOBAL environment (measured: show-environment -g lists TAKO_PANE_ID / TAKO_OSC_SINK)
+    # and psmux keeps a pool of pre-warmed shells built from that same table. Those shells
+    # sit in the user's home directory, so they wrote this pane's bundle and the pane cwd
+    # snapped back to the home directory on every resize (psmux resizes the pool to the
+    # client, their prompt re-renders, OSC 7 <home> lands in the file tako reads).
+    #
+    # So the path carries the writer: only the shell whose pid the container reports as the
+    # pane's lands on the file tako reads. The rule lives in tako_core::osc_sink
+    # (resolve_writer_path) and a watchdog test keeps the two in step. Idempotent, and
+    # written back to the environment so shells started INSIDE the pane (a nested pwsh, or a
+    # tmux of the user's own) keep sharing the same file and still update the pane cwd.
+    if ($global:__takoSink -and $global:__takoSink -notmatch '@p[0-9]+\.osc$') {
+        $global:__takoSink = ($global:__takoSink -replace '\.osc$', '') + '@p' + $PID + '.osc'
+        $env:TAKO_OSC_SINK = $global:__takoSink
+    }
     $global:__takoSinkBuf = ''
     # No BOM: tako reads raw bytes and the payload is ASCII by construction (paths are
     # percent-encoded). A BOM would land in front of the first ESC and break the scan.
