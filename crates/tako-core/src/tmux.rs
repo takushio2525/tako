@@ -855,6 +855,25 @@ pub fn tmux_command(socket: Option<&str>) -> Command {
     command
 }
 
+/// ソケットの**パス**を直接指す tmux 実行（`-S`）。`-L` は tmux 側が
+/// `TMUX_TMPDIR` から場所を決めるので、ディレクトリを跨いで走査する #1192 は
+/// パスで指す（テストが一時ディレクトリのサーバーだけを対象にできる）
+pub(crate) fn run_tmux_at(path: &std::path::Path, args: &[&str]) -> Result<String, String> {
+    let mut command = Command::new(tmux_bin());
+    crate::platform::process::no_console_window(&mut command);
+    command.env_remove("LC_ALL").env("LC_CTYPE", "UTF-8");
+    command.arg("-S").arg(path);
+    let output = command
+        .args(args)
+        .output()
+        .map_err(|e| format!("tmux を実行できない: {e}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
 /// tmux CLI 実行。サーバー未起動（list 系の "no server running"）はエラー文字列を返す
 /// （list 側で空扱いにする）。tmux バイナリ不在も同様
 pub(crate) fn run_tmux(socket: Option<&str>, args: &[&str]) -> Result<String, String> {

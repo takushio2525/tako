@@ -250,11 +250,17 @@ pub fn tools() -> Vec<Value> {
                 掃除しなかったときは skipped に理由コードが入る（peer_shares_socket = \
                 同じ tmux ソケットを使う別の tako-app が生きているので見送った / \
                 persist_disabled / secondary 等）。killed が空でも「対象が無かった」と\
-                「見送った」を区別できる。消し忘れ掃除の定型操作に使う。",
+                「見送った」を区別できる。消し忘れ掃除の定型操作に使う。\
+                servers=true にすると**サーバー（ソケット）単位の回収**へ切り替わり、\
+                隔離起動やテストが残した tmux サーバーと残骸ソケットを所有 pid の生死で\
+                判定する（既定は dry-run。実際に消すのは apply=true のときだけで、\
+                所有プロセスが生きているサーバーには触らない）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "socket": { "type": "string", "description": "tmux サーバー名（tmux -L 相当。省略時は tako バックエンドサーバー）" },
+                    "socket": { "type": "string", "description": "tmux サーバー名（tmux -L 相当。省略時は tako バックエンドサーバー）。servers=true とは併用できない" },
+                    "servers": { "type": "boolean", "description": "セッションではなくサーバー（ソケット）単位で回収する。隔離起動やテストが残した tmux サーバーと残骸ソケットが対象。既定は dry-run（一覧と判定理由だけ）" },
+                    "apply": { "type": "boolean", "description": "servers=true の判定どおりに実際に kill / ソケット削除を行う。所有プロセスが生きているサーバーには true でも触らない" },
                 },
                 "additionalProperties": false,
             },

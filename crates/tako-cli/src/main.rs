@@ -1283,6 +1283,15 @@ enum TmuxCommand {
         /// tmux サーバー名（`tmux -L` 相当。省略時は tako バックエンドサーバー）
         #[arg(long)]
         socket: Option<String>,
+        /// セッションではなく**サーバー（ソケット）単位**で回収する（#1192）。
+        /// 隔離起動やテストが残した tmux サーバーと残骸ソケットが対象。
+        /// **既定は dry-run**（一覧と判定理由を返すだけ）
+        #[arg(long)]
+        servers: bool,
+        /// `--servers` の判定どおりに実際に kill / ソケット削除を行う。
+        /// 所有プロセスが生きているサーバーには付けても触らない
+        #[arg(long)]
+        apply: bool,
     },
     /// セッション（--window 指定時はその window）を kill する。確認なしで即実行されるため
     /// 対象は `tako tmux list` で確認してから指定すること
@@ -6424,8 +6433,14 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Tmux(TmuxCommand::List { socket }) => Request::TmuxList {
             socket: socket.clone(),
         },
-        Command::Tmux(TmuxCommand::Cleanup { socket }) => Request::TmuxCleanup {
+        Command::Tmux(TmuxCommand::Cleanup {
+            socket,
+            servers,
+            apply,
+        }) => Request::TmuxCleanup {
             socket: socket.clone(),
+            servers: *servers,
+            apply: *apply,
         },
         Command::Tmux(TmuxCommand::Kill {
             session,

@@ -504,6 +504,30 @@ pub fn other_tako_running() -> bool {
     !other_tako_pids().is_empty()
 }
 
+/// プロセスが生きているか（#1192 の所有者判定）。`kill(pid, 0)` はシグナルを送らず
+/// 存在と権限だけを見る（EPERM = 別ユーザーの生存プロセス = 生きている）。
+///
+/// **「生きていない」と言い切れるときだけ false**（回収の可否を分ける材料なので、
+/// 迷ったら生きている側に倒す）
+#[cfg(unix)]
+pub fn process_alive(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        // 0 はプロセスグループ指定になるため所有者判定には使わない（= 触らない）
+        return true;
+    }
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Windows には tmux のソケットレイアウトが無く、回収の対象も存在しない。
+/// 「生きている」を返して**何も回収しない**側へ倒す
+#[cfg(not(unix))]
+pub fn process_alive(_pid: u32) -> bool {
+    true
+}
+
 /// 別プロセスの**初期環境変数**のうち `names` に挙げたものを読む（#1187）。
 ///
 /// 用途は「相手の tako-app がどの tmux ソケットを使っているか」の特定だけなので、

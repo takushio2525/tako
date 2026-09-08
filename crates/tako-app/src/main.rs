@@ -3859,6 +3859,24 @@ impl TakoApp {
                     tako_control::discovery::cleanup(std::process::id());
                 }
             }
+            // #1192: 自分の pid から作った使い捨てソケット（tako-iso-<pid> /
+            // tako-st-<pid>）は、このプロセスが終われば誰も再利用できない。
+            // 放っておくと tmux サーバーとソケットファイルが増え続けるので
+            // （実測 2026-09-09: 生存 93 本 / 388 MB / 最古 11 日）自分で落とす。
+            // **明示指定の TAKO_TMUX_SOCKET には触らない**（再起動をまたいで
+            // セッションを残す検証が実在する = #770）
+            let backend_socket = tako_core::tmux_backend::socket_name();
+            if !this.secondary
+                && tako_core::tmux_cleanup::owns_disposable_socket(
+                    std::process::id(),
+                    &backend_socket,
+                )
+            {
+                tako_core::tmux_backend::kill_server(&backend_socket);
+                persist_diag(&format!(
+                    "on_app_quit: 使い捨て backend サーバーを片付けた（socket={backend_socket}）"
+                ));
+            }
             // セルフテスト最終項目（フォーカス喪失状態の cmd-q。#103）の成功マーカー。
             // ここに到達した = Quit がフォーカス非依存で発火し quit 経路に入った証拠。
             // **ただし quit 経路は最終項目以外からも来る**（ウィンドウ 0 枚の自動終了・

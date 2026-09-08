@@ -384,6 +384,410 @@ pub fn legacy_1188() -> bool {
     std::env::var_os("TAKO_1188_LEGACY").is_some()
 }
 
+// ---------------------------------------------------------------------------
+// サーバー（ソケット）単位の回収（#1192）
+// ---------------------------------------------------------------------------
+//
+// セッション単位の掃除（`cleanup_orphans`）は**自分のサーバーの中**にしか届かない。
+// 隔離起動やテストが立てた tmux サーバーは 1 本ごとに別ソケットなので、放置すると
+// サーバーもソケットファイルも増え続ける（実測 2026-09-09: 生存 93 本 / 388 MB /
+// 最古 11 日・残骸ソケット 1440 個）。
+//
+// **回収の判定は名前ではなく所有プロセスの生死で行う**（#625 の事故クラス:
+// 接頭辞一致の一括 kill が、別 worker の生きている隔離バックエンドを落とした）。
+// 「自分のもの → 既定サーバー → 生きた tako-app が使っている → tako 由来でない →
+// サーバー不在 → attach 中 → 所有者不明 → 所有者が生きている → 出来たて」を順に除いた
+// 残りだけが [`ServerVerdict::Reclaimable`] になる。既定は dry-run。
+
+/// 出来たてのソケットは触らない猶予（秒）。起動途中のサーバーと競合しないため
+pub const SERVER_FRESH_SECS: u64 = 60;
+
+/// 1 つの tmux ソケットについて読み取りだけで集めた材料
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerEntry {
+    pub socket: String,
+    /// ソケットファイルの実パス（`-S` で直接指す。`-L` は `TMUX_TMPDIR` に縛られる）
+    pub path: std::path::PathBuf,
+    /// サーバーが応答したか（false = 残骸ソケット）
+    pub running: bool,
+    /// attach 中のクライアント数（`running` のときだけ意味がある）
+    pub clients: usize,
+    pub sessions: usize,
+    /// ソケットファイルのサイズ（バイト）
+    pub bytes: u64,
+    /// 最終更新からの経過秒（読めなければ `None` = 出来たて扱いで触らない）
+    pub modified_secs_ago: Option<u64>,
+    /// 名前に埋まっている所有 pid 候補（`tako-iso-<pid>` 等）。**空 = 所有者不明**
+    pub owner_pids: Vec<u32>,
+    /// そのうち生きているもの
+    pub live_owner_pids: Vec<u32>,
+}
+
+/// そのソケットをどう扱うか（`--apply` で実際に触るのは `Reclaimable` / `StaleSocket` だけ）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerVerdict {
+    /// 自分（この tako-app）の backend
+    SelfSocket,
+    /// 既定サーバー（ユーザーの実セッションが載る）
+    DefaultSocket,
+    /// 生きている別の tako-app が使っている（#1187 の所有者判定）
+    PeerOwned { pid: u32 },
+    /// tako 由来でない名前
+    Foreign,
+    /// attach 中のクライアントがいる（誰かが使っている）
+    ClientsAttached { clients: usize },
+    /// 名前から所有 pid を特定できない（**触らない**）
+    OwnerUnknown,
+    /// 名前の所有 pid が生きている
+    OwnerAlive { pids: Vec<u32> },
+    /// 出来たて（起動途中かもしれない）
+    TooFresh,
+    /// サーバー不在の残骸ソケット（ファイルだけ消す）
+    StaleSocket,
+    /// 所有者が死んだサーバー（kill + ソケット削除）
+    Reclaimable { pids: Vec<u32> },
+}
+
+impl ServerVerdict {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::SelfSocket => "self",
+            Self::DefaultSocket => "default_server",
+            Self::PeerOwned { .. } => "peer_owned",
+            Self::Foreign => "foreign",
+            Self::ClientsAttached { .. } => "clients_attached",
+            Self::OwnerUnknown => "owner_unknown",
+            Self::OwnerAlive { .. } => "owner_alive",
+            Self::TooFresh => "too_fresh",
+            Self::StaleSocket => "stale_socket",
+            Self::Reclaimable { .. } => "reclaimable",
+        }
+    }
+
+    pub fn detail(&self) -> String {
+        match self {
+            Self::SelfSocket => "自分の backend サーバー".to_string(),
+            Self::DefaultSocket => "既定の backend サーバー（ユーザーの実セッション）".to_string(),
+            Self::PeerOwned { pid } => format!("生きている別の tako-app（pid {pid}）が使っている"),
+            Self::Foreign => "tako 由来でない名前なので触らない".to_string(),
+            Self::ClientsAttached { clients } => {
+                format!("attach 中のクライアントが {clients} 個いる")
+            }
+            Self::OwnerUnknown => "名前から所有 pid を特定できないので触らない".to_string(),
+            Self::OwnerAlive { pids } => format!("所有 pid（{}）が生きている", join_pids(pids)),
+            Self::TooFresh => format!("できてから {SERVER_FRESH_SECS} 秒以内なので触らない"),
+            Self::StaleSocket => "サーバー不在の残骸ソケット（ファイルだけ消す）".to_string(),
+            Self::Reclaimable { pids } => format!(
+                "所有 pid（{}）が死んでいて attach も無い（サーバーを kill してソケットを消す）",
+                join_pids(pids)
+            ),
+        }
+    }
+
+    /// `--apply` で実際に手を入れる対象か
+    pub fn is_actionable(&self) -> bool {
+        matches!(self, Self::Reclaimable { .. } | Self::StaleSocket)
+    }
+
+    /// サーバーを kill する対象か（残骸ソケットはファイル削除だけ）
+    pub fn kills_server(&self) -> bool {
+        matches!(self, Self::Reclaimable { .. })
+    }
+}
+
+/// kill してよい名前の系統（`tako-` で始まるもの限定。既定サーバー `tako` は含まない）
+pub fn is_killable_socket_name(name: &str) -> bool {
+    name.starts_with("tako-")
+}
+
+/// 残骸ソケット（サーバー不在）としてファイルを消してよい名前の系統。
+/// サーバーが居ないので誰も壊さない = kill より広く取れる（`tk*` の使い捨ても拾う）
+pub fn is_tako_socket_name(name: &str) -> bool {
+    name.starts_with("tako") || name.starts_with("tk")
+}
+
+/// 名前に埋まっている所有 pid 候補（`-` 区切りで**まるごと数値**の区画だけ）。
+///
+/// `tako-iso-4242` → `[4242]` / `tako-972test-4242-legacy` → `[4242]`（pid が中央にある
+/// 命名が実在する）/ `tako-iso-1090mac` → `[]`（数字が語の一部 = pid と断定できない）。
+/// **候補が 1 つでも生きていれば保護**するので、余分に拾う方向は安全側に働く
+pub fn owner_pid_candidates(name: &str) -> Vec<u32> {
+    name.trim_end_matches('=')
+        .split('-')
+        .filter(|seg| !seg.is_empty() && seg.len() <= 7 && seg.bytes().all(|b| b.is_ascii_digit()))
+        .filter_map(|seg| seg.parse::<u32>().ok())
+        .filter(|&pid| pid != 0)
+        .collect()
+}
+
+/// そのソケットをどう扱うか（純粋関数）。`peers` は #1187 の
+/// [`live_peers`]（生きている別 tako-app とその backend ソケット）
+pub fn judge_server(
+    entry: &ServerEntry,
+    self_socket: &str,
+    peers: &[CleanupPeer],
+) -> ServerVerdict {
+    judge_server_with(entry, self_socket, peers, SERVER_FRESH_SECS)
+}
+
+/// [`judge_server`] の「出来たて」の閾値を差し替えられる版（テストは 0 を渡して
+/// 作りたてのダミーを判定させる）
+pub fn judge_server_with(
+    entry: &ServerEntry,
+    self_socket: &str,
+    peers: &[CleanupPeer],
+    fresh_secs: u64,
+) -> ServerVerdict {
+    if entry.socket == self_socket {
+        return ServerVerdict::SelfSocket;
+    }
+    if entry.socket == crate::tmux_backend::DEFAULT_SOCKET {
+        return ServerVerdict::DefaultSocket;
+    }
+    // 生きた tako-app が使っているソケットには触らない。**名前が pid と一致しなくても**
+    // 相手の環境から復元した名前で当たる（`TAKO_TMUX_SOCKET=tako-iso-<Issue 番号>` のような
+    // 手動指定は名前だけでは見抜けない = #625 の事故に直結する）
+    if let Some(peer) = peers
+        .iter()
+        .find(|p| p.socket.as_deref() == Some(entry.socket.as_str()))
+    {
+        return ServerVerdict::PeerOwned { pid: peer.pid };
+    }
+    if !is_tako_socket_name(&entry.socket) {
+        return ServerVerdict::Foreign;
+    }
+    let fresh = entry.modified_secs_ago.is_none_or(|secs| secs < fresh_secs);
+    if !entry.running {
+        return if fresh {
+            ServerVerdict::TooFresh
+        } else {
+            ServerVerdict::StaleSocket
+        };
+    }
+    if entry.clients > 0 {
+        return ServerVerdict::ClientsAttached {
+            clients: entry.clients,
+        };
+    }
+    if !is_killable_socket_name(&entry.socket) || entry.owner_pids.is_empty() {
+        return ServerVerdict::OwnerUnknown;
+    }
+    if !entry.live_owner_pids.is_empty() {
+        return ServerVerdict::OwnerAlive {
+            pids: entry.live_owner_pids.clone(),
+        };
+    }
+    if fresh {
+        return ServerVerdict::TooFresh;
+    }
+    ServerVerdict::Reclaimable {
+        pids: entry.owner_pids.clone(),
+    }
+}
+
+/// この起動が使っている backend ソケットが**自分の pid から作られた使い捨て**か（#1192）。
+///
+/// `tako-iso-<自分の pid>` / `tako-st-<自分の pid>` は定義上このプロセス専用で、
+/// プロセスが終われば**誰も再利用できない名前**になる（次の隔離起動は別 pid を使う）。
+/// だから終了時に自分でサーバーごと落としてよい。逆に `TAKO_TMUX_SOCKET` を明示して
+/// 起動した場合は、再起動をまたいでセッションを残す検証（#770 等）が実在するので触らない
+pub fn owns_disposable_socket(pid: u32, socket: &str) -> bool {
+    socket == isolated_socket_name(pid) || socket == self_test_socket_name(pid)
+}
+
+/// 回収の結果（dry-run と `--apply` で同じ形。何を・なぜ触った / 触らなかったかが全部載る）
+#[derive(Debug, Clone)]
+pub struct ServerCleanupOutcome {
+    pub applied: bool,
+    pub entries: Vec<(ServerEntry, ServerVerdict)>,
+    pub killed: Vec<String>,
+    pub removed_sockets: Vec<String>,
+}
+
+impl ServerCleanupOutcome {
+    pub fn count(&self, code: &str) -> usize {
+        self.entries
+            .iter()
+            .filter(|(_, v)| v.code() == code)
+            .count()
+    }
+
+    pub fn running(&self) -> usize {
+        self.entries.iter().filter(|(e, _)| e.running).count()
+    }
+
+    /// persist.log へ残す 1 行（dry-run でも「見ただけ」と分かる形で残す）
+    pub fn log_line(&self) -> String {
+        format!(
+            "tmux cleanup(servers): {} 総数={} 生存={} 回収可={} 残骸={} kill={} ソケット削除={}",
+            if self.applied { "実行" } else { "dry-run" },
+            self.entries.len(),
+            self.running(),
+            self.count("reclaimable"),
+            self.count("stale_socket"),
+            self.killed.len(),
+            self.removed_sockets.len()
+        )
+    }
+}
+
+/// ソケットディレクトリを走査してサーバー一覧を作る（読み取りのみ）
+pub fn scan_servers() -> Vec<ServerEntry> {
+    crate::tmux_backend::socket_dir()
+        .map(|dir| scan_servers_in(&dir, crate::ports::process_alive))
+        .unwrap_or_default()
+}
+
+/// [`scan_servers`] のディレクトリと pid 生存判定を差し替えられる版。
+/// **テストと検証はこれを使う**（本番のソケットディレクトリを対象にしない）
+pub fn scan_servers_in(dir: &std::path::Path, alive: impl Fn(u32) -> bool) -> Vec<ServerEntry> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let now = std::time::SystemTime::now();
+    let mut by_name: std::collections::BTreeMap<String, ServerEntry> =
+        std::collections::BTreeMap::new();
+    for file in read.flatten() {
+        let raw = file.file_name();
+        let Some(raw) = raw.to_str() else { continue };
+        // macOS は /tmp → /private/tmp の解決で末尾に `=` が付いた別名を作る（同じ実体）
+        let name = raw.trim_end_matches('=').to_string();
+        if name.is_empty() || by_name.contains_key(&name) {
+            continue;
+        }
+        let path = dir.join(raw);
+        let meta = std::fs::metadata(&path).ok();
+        let bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let modified_secs_ago = meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| now.duration_since(t).ok())
+            .map(|d| d.as_secs());
+        let running = socket_answers(&path);
+        let (sessions, clients) = if running {
+            (session_count(&path), client_count(&path))
+        } else {
+            (0, 0)
+        };
+        let owner_pids = owner_pid_candidates(&name);
+        let live_owner_pids = owner_pids.iter().copied().filter(|&p| alive(p)).collect();
+        by_name.insert(
+            name.clone(),
+            ServerEntry {
+                socket: name,
+                path,
+                running,
+                clients,
+                sessions,
+                bytes,
+                modified_secs_ago,
+                owner_pids,
+                live_owner_pids,
+            },
+        );
+    }
+    by_name.into_values().collect()
+}
+
+/// ソケットに繋がるか（= サーバーが生きているか）。**tmux を 1 本ごとに起こさない**
+/// （1700 個のソケットに対してプロセスを起こすと分単位になる）。繋いですぐ閉じるのは
+/// tmux から見れば「何も言わずに切れたクライアント」なので無害
+#[cfg(unix)]
+fn socket_answers(path: &std::path::Path) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
+#[cfg(not(unix))]
+fn socket_answers(_path: &std::path::Path) -> bool {
+    false
+}
+
+fn session_count(path: &std::path::Path) -> usize {
+    count_lines(path, &["list-sessions", "-F", "#{session_name}"])
+}
+
+/// attach 中のクライアント数。**kill の可否を分ける材料**
+fn client_count(path: &std::path::Path) -> usize {
+    count_lines(path, &["list-clients", "-F", "#{client_pid}"])
+}
+
+/// `tmux -S <path> <args>` の出力行数（失敗は 0）
+fn count_lines(path: &std::path::Path, args: &[&str]) -> usize {
+    crate::tmux::run_tmux_at(path, args)
+        .map(|out| out.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0)
+}
+
+/// サーバー単位の回収（#1192）。既定は dry-run で、`apply` のときだけ実際に触る。
+pub fn cleanup_servers(
+    self_socket: &str,
+    peers: &[CleanupPeer],
+    apply: bool,
+) -> ServerCleanupOutcome {
+    let dir = crate::tmux_backend::socket_dir();
+    let entries = dir
+        .as_ref()
+        .map(|d| scan_servers_in(d, crate::ports::process_alive))
+        .unwrap_or_default();
+    cleanup_servers_from(entries, self_socket, peers, apply, SERVER_FRESH_SECS)
+}
+
+/// 走査済みの一覧に対して判定と（`apply` なら）実行を行う。
+///
+/// **生きている所有者のサーバーには絶対に触らない**。kill の直前にもう 1 度
+/// クライアントの有無を測り直す（走査してから apply するまでの隙に attach された
+/// サーバーを落とさない）
+pub fn cleanup_servers_from(
+    entries: Vec<ServerEntry>,
+    self_socket: &str,
+    peers: &[CleanupPeer],
+    apply: bool,
+    fresh_secs: u64,
+) -> ServerCleanupOutcome {
+    let mut judged = Vec::new();
+    let mut killed = Vec::new();
+    let mut removed_sockets = Vec::new();
+    for entry in entries {
+        let mut verdict = judge_server_with(&entry, self_socket, peers, fresh_secs);
+        if apply && verdict.is_actionable() {
+            if verdict.kills_server() {
+                // 直前の再確認（走査からの時間差で attach された可能性を潰す）
+                let clients = client_count(&entry.path);
+                if clients > 0 {
+                    verdict = ServerVerdict::ClientsAttached { clients };
+                    judged.push((entry, verdict));
+                    continue;
+                }
+                let _ = crate::tmux::run_tmux_at(&entry.path, &["kill-server"]);
+                remove_socket_files(&entry.path);
+                killed.push(entry.socket.clone());
+            } else {
+                remove_socket_files(&entry.path);
+                removed_sockets.push(entry.socket.clone());
+            }
+        }
+        judged.push((entry, verdict));
+    }
+    ServerCleanupOutcome {
+        applied: apply,
+        entries: judged,
+        killed,
+        removed_sockets,
+    }
+}
+
+/// ソケットファイルを消す（macOS の `=` 付き別名も一緒に）
+fn remove_socket_files(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        if let Some(dir) = path.parent() {
+            let base = name.trim_end_matches('=');
+            let _ = std::fs::remove_file(dir.join(base));
+            let _ = std::fs::remove_file(dir.join(format!("{base}=")));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,6 +1045,119 @@ mod tests {
     fn 自分の環境からの復元はsocket_nameと一致する() {
         let mine = resolve_socket_name(std::process::id(), |k| std::env::var(k).ok());
         assert_eq!(mine, crate::tmux_backend::socket_name());
+    }
+
+    fn server(socket: &str, running: bool, clients: usize, live: &[u32]) -> ServerEntry {
+        ServerEntry {
+            socket: socket.to_string(),
+            path: std::path::PathBuf::from("/tmp/tmux-0").join(socket),
+            running,
+            clients,
+            sessions: if running { 1 } else { 0 },
+            bytes: 0,
+            modified_secs_ago: Some(3600),
+            owner_pids: owner_pid_candidates(socket),
+            live_owner_pids: live.to_vec(),
+        }
+    }
+
+    #[test]
+    fn 所有pid候補は区画まるごと数値のものだけ() {
+        assert_eq!(owner_pid_candidates("tako-iso-4242"), vec![4242]);
+        // pid が中央にある命名（tako-972test-<pid>-<用途>）が実在する
+        assert_eq!(
+            owner_pid_candidates("tako-972test-10013-legacy"),
+            vec![10013]
+        );
+        assert_eq!(
+            owner_pid_candidates("tako-e2e-1185-14479"),
+            vec![1185, 14479]
+        );
+        // 数字が語の一部 = pid と断定できない → 候補なし（= 触らない）
+        assert!(owner_pid_candidates("tako-iso-1090mac").is_empty());
+        assert!(owner_pid_candidates("tako-w1102").is_empty());
+        assert!(owner_pid_candidates("tako").is_empty());
+        // macOS の `=` 付き別名でも同じ結果
+        assert_eq!(owner_pid_candidates("tako-iso-4242="), vec![4242]);
+    }
+
+    /// #1192 の中核。**所有者が生きているものは 1 つも回収候補にしない**
+    #[test]
+    fn 生きている所有者のサーバーは回収候補にしない() {
+        let peers = [CleanupPeer {
+            pid: 71082,
+            socket: Some("tako-iso-1013".into()), // 名前の数字は pid ではない（手動指定）
+        }];
+        let cases = [
+            // 自分のもの
+            (server("tako-st-77", true, 0, &[]), "tako-st-77", "self"),
+            // 既定サーバー
+            (server("tako", true, 0, &[]), "other", "default_server"),
+            // 生きた tako-app が使っている（名前の数字は死んでいても保護される）
+            (server("tako-iso-1013", true, 0, &[]), "other", "peer_owned"),
+            // attach 中
+            (
+                server("tako-iso-4242", true, 2, &[]),
+                "other",
+                "clients_attached",
+            ),
+            // 所有 pid が生きている
+            (
+                server("tako-iso-4242", true, 0, &[4242]),
+                "other",
+                "owner_alive",
+            ),
+            // 所有者を名前から特定できない
+            (
+                server("tako-iso-1090mac", true, 0, &[]),
+                "other",
+                "owner_unknown",
+            ),
+            // tako 由来でない
+            (server("mysocket-4242", true, 0, &[]), "other", "foreign"),
+            // 回収可
+            (
+                server("tako-iso-4242", true, 0, &[]),
+                "other",
+                "reclaimable",
+            ),
+            // 残骸ソケット（サーバー不在）
+            (
+                server("tako-selftest-4242", false, 0, &[]),
+                "other",
+                "stale_socket",
+            ),
+        ];
+        for (entry, self_socket, want) in cases {
+            let verdict = judge_server(&entry, self_socket, &peers);
+            assert_eq!(
+                verdict.code(),
+                want,
+                "socket={} → {:?}",
+                entry.socket,
+                verdict
+            );
+        }
+    }
+
+    #[test]
+    fn 出来たてのソケットには触らない() {
+        let mut entry = server("tako-iso-4242", true, 0, &[]);
+        entry.modified_secs_ago = Some(5);
+        assert_eq!(judge_server(&entry, "other", &[]).code(), "too_fresh");
+        // 読めない（= 消えた直後かもしれない）ときも触らない
+        entry.modified_secs_ago = None;
+        assert_eq!(judge_server(&entry, "other", &[]).code(), "too_fresh");
+    }
+
+    #[test]
+    fn 使い捨てソケットは自分のpidから作った名前だけ() {
+        assert!(owns_disposable_socket(42, "tako-iso-42"));
+        assert!(owns_disposable_socket(42, "tako-st-42"));
+        // 別 pid の名前・明示指定の名前・既定サーバーは対象外
+        assert!(!owns_disposable_socket(42, "tako-iso-43"));
+        assert!(!owns_disposable_socket(42, "tako-ab1192-fixed"));
+        assert!(!owns_disposable_socket(42, "tako"));
     }
 
     #[test]

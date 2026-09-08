@@ -167,6 +167,15 @@ pub trait TmuxHost {
             Vec::new(),
         )
     }
+    /// tmux **サーバー（ソケット）単位**の回収（#1192）。既定は dry-run。
+    /// 実装側が自分の backend ソケットと生きている別 tako-app を除外して判定する
+    fn cleanup_tmux_servers(&self, apply: bool) -> tako_core::tmux_cleanup::ServerCleanupOutcome {
+        tako_core::tmux_cleanup::cleanup_servers(
+            &tako_core::tmux_backend::socket_name(),
+            &tako_core::tmux_cleanup::live_peers(),
+            apply,
+        )
+    }
     /// サイドバー tmux ビューでタブ枠が折りたたまれているか（FR-2.16.14）
     fn tmux_tab_collapsed(&self, _tab: TabId) -> bool {
         false

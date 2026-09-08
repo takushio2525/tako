@@ -48,6 +48,8 @@ pub(super) fn build_request(
         },
         "tako_tmux_cleanup" => Request::TmuxCleanup {
             socket: str_arg(args, "socket")?,
+            servers: bool_arg(args, "servers")?.unwrap_or(false),
+            apply: bool_arg(args, "apply")?.unwrap_or(false),
         },
         "tako_tmux_kill" => Request::TmuxKill {
             socket: str_arg(args, "socket")?,

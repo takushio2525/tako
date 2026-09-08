@@ -1424,7 +1424,62 @@ fn dispatch_inner(
             }))
         }
 
-        Request::TmuxCleanup { socket } => {
+        Request::TmuxCleanup {
+            socket,
+            servers: true,
+            apply,
+        } => {
+            // #1192: サーバー（ソケット）単位の回収。**既定は dry-run**で、
+            // `apply` のときだけ kill / ソケット削除を行う。判定は所有プロセスの生死
+            // （名前の接頭辞一致で一括 kill すると、別 worker の生きているバックエンドを
+            // 落とす = #625 の事故クラス）
+            // **黙って無視しない**（#1187 の教訓）。サーバー単位の回収はソケット置き場
+            // 全体が対象なので、1 本を名指しする `--socket` とは併用できない
+            if let Some(socket) = socket {
+                return Err(DispatchError::Operation(format!(
+                    "--servers はソケット置き場全体を対象にするので --socket（{socket}）とは併用できない。\
+                     1 つのサーバーの中を掃除するなら --servers を外す"
+                )));
+            }
+            let outcome = host.cleanup_tmux_servers(apply);
+            crate::diag::persist_log(&outcome.log_line());
+            let entries: Vec<Value> = outcome
+                .entries
+                .iter()
+                .map(|(entry, verdict)| {
+                    json!({
+                        "socket": entry.socket,
+                        "verdict": verdict.code(),
+                        "detail": verdict.detail(),
+                        "running": entry.running,
+                        "sessions": entry.sessions,
+                        "clients": entry.clients,
+                        "owner_pids": entry.owner_pids,
+                        "live_owner_pids": entry.live_owner_pids,
+                        "bytes": entry.bytes,
+                        "modified_secs_ago": entry.modified_secs_ago,
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "mode": "servers",
+                "applied": outcome.applied,
+                "summary": {
+                    "total": outcome.entries.len(),
+                    "running": outcome.running(),
+                    "reclaimable": outcome.count("reclaimable"),
+                    "stale_sockets": outcome.count("stale_socket"),
+                    "protected": outcome.entries.len()
+                        - outcome.count("reclaimable")
+                        - outcome.count("stale_socket"),
+                },
+                "killed": outcome.killed,
+                "removed_sockets": outcome.removed_sockets,
+                "servers": entries,
+            }))
+        }
+
+        Request::TmuxCleanup { socket, .. } => {
             // socket 省略時は tako バックエンドサーバーを対象にする（取り残しの主因）。
             // #1187: 以前はここで `let _ = socket;` と捨てていた（ヘルプは受け付けると
             // 書いてあるのに常に自分の backend しか見ない = 黙って無視していた）
@@ -12991,6 +13046,8 @@ mod tests {
             &mut host,
             Request::TmuxCleanup {
                 socket: Some("other-server".into()),
+                servers: false,
+                apply: false,
             },
             PaneOrigin::Cli,
         )
@@ -13022,7 +13079,11 @@ mod tests {
         ));
         let out = dispatch(
             &mut host,
-            Request::TmuxCleanup { socket: None },
+            Request::TmuxCleanup {
+                socket: None,
+                servers: false,
+                apply: false,
+            },
             PaneOrigin::Mcp,
         )
         .unwrap();
