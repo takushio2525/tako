@@ -24,15 +24,15 @@ Working with AI agents like Claude Code, a single task naturally splits into the
 - **エージェント集約監視 / Agent fleet monitoring** — 3 層の検知・制御（汎用 CLI、**設定ゼロで使える内蔵 MCP サーバー**、opt-in のパッシブ検知）/ Three integration layers: a generic CLI, a **built-in zero-config MCP server**, and opt-in passive detection
 - **Zed 級の速度 / Zed-class speed** — Rust + GPUI + alacritty_terminal によるネイティブ GPU 描画 / Native GPU rendering, no Electron
 - **軽量ワークスペース / Lightweight workspace** — cwd 連動ファイルツリー、自動更新されるコード / Markdown / 画像 / PDF プレビュー、git graph / cwd-aware file tree, live code / Markdown / image / PDF previews, git graph
-- **セッション永続化 / Persistent sessions** — tmux があれば、tako を再起動しても実行中プロセスと画面がそのまま復元される（無い場合はタブ・ペイン構成と cwd の復元まで）/ With tmux installed, running processes and screen contents survive a restart; without it, the tab/pane layout and cwds are restored
+- **セッション永続化 / Persistent sessions** — tmux（Windows は psmux）があれば、tako を再起動しても実行中プロセスと画面がそのまま復元される（無い場合はタブ・ペイン構成と cwd の復元まで）/ With tmux — psmux on Windows — running processes and screen contents survive a restart; without it, the tab/pane layout and cwds are restored
 - **クロスプラットフォーム / Cross-platform** — macOS 先行、Windows 対応必須 / macOS first, Windows is a hard requirement
 
 ## インストール / Install
 
-配布しているビルド済みバイナリは **Apple Silicon（macOS 11 以降）** 向けです。
-The prebuilt binaries target **Apple Silicon (macOS 11+)**.
+配布しているビルド済みバイナリは **macOS（Apple Silicon / macOS 11.0 以降）** と **Windows（x64 / Windows 10 バージョン 1809 以降）** 向けで、どちらも同じリリースに載ります。
+The prebuilt binaries target **macOS (Apple Silicon, macOS 11.0+)** and **Windows (x64, Windows 10 version 1809+)** — both ship in the same release.
 
-### Homebrew（推奨） / Homebrew (recommended)
+### macOS: Homebrew（推奨） / macOS: Homebrew (recommended)
 
 ```sh
 brew install --cask takushio2525/tako/tako
@@ -44,7 +44,7 @@ tako CLI も同時に PATH へ入るため、`tako` コマンドがそのまま�
 Update with `brew upgrade --cask takushio2525/tako/tako`, or from the in-app update notification.
 The cask also links the `tako` CLI into your PATH.
 
-### zip を手動で / Manual zip
+### macOS: zip を手動で / macOS: manual zip
 
 [GitHub Releases](https://github.com/takushio2525/tako/releases) から `tako-vX.X.X-macos-arm64.zip` を取得します。
 Grab `tako-vX.X.X-macos-arm64.zip` from the [Releases](https://github.com/takushio2525/tako/releases) page.
@@ -55,6 +55,25 @@ Grab `tako-vX.X.X-macos-arm64.zip` from the [Releases](https://github.com/takush
    - **システム設定 → プライバシーとセキュリティ** を開く / Open **System Settings → Privacy & Security**
    - 下部の「"tako"は開発元を確認できないため〜」の隣の **「このまま開く」** をクリック / Click **"Open Anyway"** next to the tako warning
    - もう一度 `tako.app` を起動すると「開く」ボタンが表示される / Launch again and click **"Open"**
+
+### Windows: インストーラー / ポータブル zip / Windows: installer or portable zip
+
+[GitHub Releases](https://github.com/takushio2525/tako/releases) から次のどちらかを取得します（Windows 版は macOS 版と同じリリースに載ります）。動作要件は **Windows 10 バージョン 1809（ビルド 10.0.17763）以降 / x64** です。
+Grab either of these from the [Releases](https://github.com/takushio2525/tako/releases) page (Windows builds ship in the same release as the macOS ones). Requires **Windows 10 version 1809 (build 10.0.17763) or later, x64**.
+
+- `tako-vX.X.X-windows-x86_64.exe` — **標準**のインストーラー。**管理者権限は要りません**（`%LOCALAPPDATA%\Programs\tako` に入り、スタートメニュー登録と `tako` コマンドの PATH 追加まで行います）/ **Recommended** installer. **No administrator rights required** (it installs into `%LOCALAPPDATA%\Programs\tako`, adds the Start menu entry, and puts `tako` on your PATH)
+- `tako-vX.X.X-windows-x86_64.zip` — 展開して置くだけのポータブル版。`tako-app.exe`（本体）と `tako.exe`（CLI）は**同じフォルダに置いたまま**使ってください / Portable build. Keep `tako-app.exe` (the app) and `tako.exe` (the CLI) **in the same folder**
+- 未署名のため SmartScreen の警告が出たら **詳細情報 → 実行** で進めてください / Unsigned, so if SmartScreen warns you, click **More info → Run anyway**
+
+セッション永続化には psmux を入れてください（Windows で tmux と同じ役割を担います）。
+Install psmux for persistent sessions; it plays the same role as tmux on Windows.
+
+```powershell
+winget install marlocarlo.psmux
+```
+
+移植は途中です。手順の詳細は [セットアップ](https://tako-docs.pages.dev/getting-started/)、どの機能が使えるかは [Windows 対応状況](https://tako-docs.pages.dev/windows-support/) にまとめてあります。
+The port is still in progress: see [Setup](https://tako-docs.pages.dev/getting-started/) for the full walkthrough and [Windows support status](https://tako-docs.pages.dev/windows-support/) for what works today.
 
 ## 使い始める / Getting started
 

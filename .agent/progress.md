@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-09（#1133: Windows 実機の項目 80 のスタックオーバーフローを予約量の宣言で根治した）
-- 真因の commit は無い（7 commit の伸びは合計 +12,288 B）。`-O0` の GPUI フレームが 1 関数 135〜828 KiB（製品の描画経路も含む）で、Windows/MSVC の既定 1 MiB を食い潰していた
-- `build.rs` 2 本が `/stack:8388608` を宣言（正は `platform::stack`。Zed も同型）+ セルフテストが起動直後に実測して足りなければ項目 80 前に FAILED。番犬は macOS でも走る 3 本
-- 実機は素の debug ビルドで項目 80 を 2/2 通過（完走は別件の負荷依存で項目 105 / 143 まで）。A/B は同一 exe へ `editbin /STACK:` で 1 MiB=クラッシュ / 2 MiB=通過 / 8 MiB=通過
-
 ## 2026-09-09（#1185: 取り込みペインの select-window が内側へ届くようにし、`open --window` を到達可能にした）
 - 対象解決を `tako_core::tmux::window_target`（取り込みビュー優先 → バックエンド）へ集約。旧実装は二重ネストの**外側**（tako の backend）を見ていたので別セッションの window を切り替えて成功を返していた
 - `--window` は CLI と MCP catalog の両方へ（protocol にあるのに 3 経路すべてから到達不能）。番犬 `mcp_param_reachability`（mapper が読む引数が catalog に在るか）が同型の再発を落とす
@@ -83,3 +78,7 @@
 - `warm <= cold`（実時間比較）を廃し、`claude_remote_link::scan_counters`（走査回数 / 読み出しバイト数 / 所在探索回数・**スレッドローカル**）で測る形へ。生きている会話への追記ぶんは予算へ足す
 - 番犬 `test_timing_watchdog`（`crates/*/tests` の assert 条件部に実時間の値が 2 つ以上ある形だけを落とす。コメント / 文字列は潰して見る）を新設。修正前ファイルで `remote_link_live.rs:247: warm <= cold` を名指しして FAILED
 - A/B（`yes` 36 / 72 本の負荷・交互 40 回）: 旧 2/40 FAILED（初回 34.3ms / 2 回目 45.7ms で反転）・新 0/40。memo 無効化の注入で新は確定 FAILED（20 走査 10 MB）・旧は 9/10 見逃し
+
+## 2026-09-09（#1206: README に Windows のインストール手順を足した）
+- インストール節を macOS 2 節 + Windows 1 節へ（`.exe` = 標準・管理者権限不要 / `.zip` = ポータブル / SmartScreen / psmux）。冒頭を「macOS 11.0 以降 + Windows 10 1809 以降 x64」へ直し、永続化の説明に psmux を併記
+- 数値・アセット名は `release_assets` と直近リリースの実アセットから引き、docs の「方法 C」と同文・同数値。マトリクス note（Issue の 3 点目）は生成物なので #1204 の担当（CI の `gen-windows-support-docs.mjs --check` が同期を強制している）
