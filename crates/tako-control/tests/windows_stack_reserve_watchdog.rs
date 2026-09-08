@@ -101,8 +101,9 @@ fn 宣言はmsvcターゲットだけに限っている() {
             .split("/stack:")
             .next()
             .expect("split は必ず 1 要素返す");
+        // `msvc` はコメント本文にも出てくるので、**引用符つき**（= 実際の比較文字列）で見る
         assert!(
-            head.contains("CARGO_CFG_TARGET_ENV") && head.contains("msvc"),
+            head.contains("CARGO_CFG_TARGET_ENV") && head.contains("\"msvc\""),
             "{} が `/stack:` を msvc 限定にしていない（#1133）。\
              gnu ツールチェーンは書式が違うのでリンクが落ちる",
             path.display()
