@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-08（#1177: 器つきペインの `term-grid scroll` を skip せず実測できるようにした）
-- #943 の前提ガードを外し「ミラーが立つまで待つ + 期待値の出どころを器で切り替える」へ（`settle_scroll_mirror` は `subline` 節と 1 実装）
-- 器つき `mirrored=true mirror_pos=0.500 fract=0.500 shift=17 expected=17` = 直接ペインと全数値一致・両方 `TAKO_VISUAL_TEST_OK`（checkpoint 122）
-- A/B `TAKO_943_LEGACY=1` は #943 の報告と同一数値で FAILED / 注入 `nofract` は上限待ちで FAILED / 番犬 1 本追加 / 全 3588 件緑
-
 ## 2026-09-08（#1175: 101c の引き継ぎ到達判定を後任の transcript から採るようにした）
 - 引き継ぎ本文は claude の TUI で 1 度だけ流れる User 発話なので `visible_lines()` 判定は後任が長く働くほど確実に落ちていた。証拠源を `chat_state` の発話へ移し、`saw_done` は Assistant 限定に（旧は手順書の「引き継ぎ完了」を後任の申告と誤読）。前提（GUI / persist）は項目内で上げて戻すので起動レシピは不変
 - 実 claude e2e 2 回連続 OK（`chat=1/6`・`1/5`・load 2.5〜3.0）/ `TAKO_1175_LEGACY=1` は Issue と同じ `saw_marker=false` で FAILED / `INJECT=nomarker` は新経路でも FAILED
@@ -88,3 +83,8 @@
 - `socket` 省略時の解決を `tako_core::tmux::resolve_session_socket`（既定サーバー → tako バックエンド = list の並び）へ集約し、`kill` / `resize` / `open` の 3 つで共有。応答に解決後の `socket` を追加
 - 生 stderr は `friendly_error` で日本語へ（4 分類 + `scrub_paths` で絶対パスを伏せる）。**kill 前の確認 / `--force` は #1196 の担当で入れていない**（省略でも backend へ届くようになった）
 - 隔離 GUI 実測: `--socket` 省略の resize が 80x24 → 60x15・kill --window 1 が届いてセッションは生存 / A/B `TAKO_1190_LEGACY=1` は Issue と同じ `error connecting to /private/tmp/tmux-<uid>/default` を再現
+
+## 2026-09-09（#925: 導入計画の権限説明を platform で出し分けた）
+- `InstallPlan` に `platform: Platform` を足し（出どころは `InstallRecipe::platform`）、権限行を純粋関数 `privilege_line(platform)` へ。unix = `sudo（管理者権限）は使いません…` / Windows = `管理者権限は使いません…`
+- `visible_texts()`（計画の表示 + 引き継ぎ指示文）を用意し「Windows に unix 固有語が出ない」を GUI 無しで固定。`to_json` に `platform` を追加
+- A/B `TAKO_925_LEGACY=1` は Issue と同じ `sudo（管理者権限）…` を Windows 構成で出して新テスト 2 本が FAILED。#920 の項目 119（`管理者権限` で見る）は不変

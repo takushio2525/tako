@@ -58005,9 +58005,11 @@ mod self_test {
                     normalized.contains(recipe.source.url)
                         && normalized.contains(recipe.launcher_rel)
                         && normalized.contains(recipe.payload_rel)
-                        // 権限の説明。`sudo（管理者権限）は使いません` は
-                        // `InstallPlan::lines()` の固定行で、`管理者権限` は
-                        // プラットフォームに依らない語（`sudo` は unix 固有 = #925）
+                        // 権限の説明。`InstallPlan::lines()` の権限行は
+                        // **platform で呼び名が変わる**（#925 で `privilege_line` へ
+                        // 分けた。unix = `sudo（管理者権限）は使いません…` /
+                        // Windows = `管理者権限は使いません…`）ので、
+                        // プラットフォームに依らない語だけで見る
                         && joined.contains("管理者権限")
                 };
                 check(
