@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-09（#1187: tmux cleanup が黙って何もしない形をやめ、`--socket` を実装した）
-- 見送りの判定を「別の tako-app がいるか」から**対象ソケットの所有者**へ（相手の初期環境を `KERN_PROCARGS2` で読み `tako-iso-<pid>` 等を復元）。応答を `{socket, killed, skipped, detail}` へ広げ、見送り・kill の両方を persist.log へ 1 行
-- 実測（隔離 + tako-vd・他 tako-app 3 本稼働）: 省略時 `killed=[aaa,bbb]` / `--socket <別>` で `ccc` を kill / `--socket tako` は `skipped=peer_shares_socket`（pid 71082）で本番 17 セッションは不変
-- A/B `TAKO_1187_LEGACY=1` は Issue と同じ `{"killed":[]}` + `--socket` 無視を再現。番犬 4 本（修正前ソースで全滅）+ 単体 12 本。全 3621 件緑
-
 ## 2026-09-09（#1133: Windows 実機の項目 80 のスタックオーバーフローを予約量の宣言で根治した）
 - 真因の commit は無い（7 commit の伸びは合計 +12,288 B）。`-O0` の GPUI フレームが 1 関数 135〜828 KiB（製品の描画経路も含む）で、Windows/MSVC の既定 1 MiB を食い潰していた
 - `build.rs` 2 本が `/stack:8388608` を宣言（正は `platform::stack`。Zed も同型）+ セルフテストが起動直後に実測して足りなければ項目 80 前に FAILED。番犬は macOS でも走る 3 本
@@ -83,3 +78,8 @@
 - 採取が fleet ビューの 2 秒ポーリングだけだったのを `Request::List` の直前 1 回（`list-windows -a` = 6.9ms 中央値。`fetch_tmux_sessions` は 37ms）へ。backend ペインが無ければ tmux を起動せず、500ms 以内は使い回すので連打でも 2 回/秒（実測 889 req/30s → 56 回）
 - `null`（backend でない / 採取不能）と `[]`（backend だが window 無し）を読み分け可能に。1 window の器も載る（旧実装は 2+ のみ）。待機時の追加コストは 0 回 / CPU 差は誤差
 - A/B `TAKO_1191_LEGACY=1` は Issue の 2 症状（常に null / 開くと埋まり閉じると陳腐化）を再現。番犬 3 本 + dispatch 1 本 + tako-core 2 本 + セルフテスト項目 61g
+
+## 2026-09-09（#1220: 一覧付与のコスト検査を実時間から量へ替え、番犬を tests 全体へ広げた）
+- `warm <= cold`（実時間比較）を廃し、`claude_remote_link::scan_counters`（走査回数 / 読み出しバイト数 / 所在探索回数・**スレッドローカル**）で測る形へ。生きている会話への追記ぶんは予算へ足す
+- 番犬 `test_timing_watchdog`（`crates/*/tests` の assert 条件部に実時間の値が 2 つ以上ある形だけを落とす。コメント / 文字列は潰して見る）を新設。修正前ファイルで `remote_link_live.rs:247: warm <= cold` を名指しして FAILED
+- A/B（`yes` 36 / 72 本の負荷・交互 40 回）: 旧 2/40 FAILED（初回 34.3ms / 2 回目 45.7ms で反転）・新 0/40。memo 無効化の注入で新は確定 FAILED（20 走査 10 MB）・旧は 9/10 見逃し

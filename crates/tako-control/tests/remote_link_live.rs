@@ -196,8 +196,32 @@ fn 見つからない会話はunknownになる() {
 }
 
 /// 一覧経路のコスト（`/api/v2/panes` は PWA がポーリングする）。
-/// **UI スレッドではない**（daemon 側）が、ペイン数ぶん transcript を探すので
-/// 桁を測っておく。閾値は緩め（環境差で落とさない）
+/// **UI スレッドではない**（daemon 側）が、ペイン数ぶん transcript を探して読むので
+/// コストを固定しておく。
+///
+/// ## 実時間では測らない（#1220 / #1167）
+///
+/// 旧実装は「2 回目の付与が初回より速いこと」を `Instant::elapsed` の比較
+/// （`warm <= cold`）で固定していた。これは片方の計測窓にだけスケジューリングの
+/// 待ちが入った回に落ちる（実測: 20 行の初回 23.8ms / 2 回目 1.7ms なので、
+/// 2 回目に 22ms 止まれば反転する。他 worker のビルドと同時に走って 1 回 FAILED）。
+/// 規約は `.agent/conventions.md`「効果を測る単体テストは実時間で比べない」。
+///
+/// ## 「コストが桁で問題ない」を量で書き直す
+///
+/// 1. **行数に比例しない**: 20 行の付与でも走査は distinct な会話数ぶんだけ
+///    （同じ会話を行ごとに読み直さない = 行内で memo が効く）
+/// 2. **定常状態は追記ぶんだけ**: 2 回目（= ポーリングの実態）の読み出しは
+///    **上限 64 KiB**。全走査は 1 件で MB 級なので桁で開いている
+/// 3. **所在探索は 1 会話 1 回**: `projects/` の全走査（cold の支配項）は 2 回目に 0 回
+///
+/// どれも混み具合に依らないので、他 worker のビルドと同時でも揺れない。
+/// 生きている会話は計測中も書かれ続けるので、**窓の中で実際に追記されたぶんは
+/// 予算へ足す**（読むのが正しい量なので、そこは失敗にしない）。
+///
+/// **限界**: 数えているのは transcript の走査（`scan_counters`）だけなので、
+/// 付与の中の別のコスト（`accounts.yaml` の読み直し等）はここでは見ていない。
+/// そちらを固定したくなったら、同じ形の口をその層へ開ける
 #[test]
 fn 一覧付与のコストが桁で問題ないこと() {
     let (with_bridge, without_bridge) = sample_sessions();
@@ -207,45 +231,127 @@ fn 一覧付与のコストが桁で問題ないこと() {
         eprintln!("skip: 材料が無い");
         return;
     }
-    // 20 ペイン相当（実運用の上限に近い）
+    // 20 ペイン相当（実運用の上限に近い）。同じ会話が何度も並ぶ = ポーリングの実態
     let rows = rows_for(&ids, 20);
-    // 1 回目（memo が空）
+    let used: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r["session_id"].as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let distinct = used.len() as u64;
+    // 計測窓のあいだの追記量を見るための実サイズ（**パスは出さない**。#927）
+    let sizes_before = transcript_sizes(&used);
+
+    // 1 回目（memo が空。同じ binary の他テストが先に温めていれば 0 回になりうる = 上限で見る）
+    let at = claude_remote_link::scan_counters();
     let mut first = serde_json::json!({ "agents": rows.clone() });
-    let t0 = std::time::Instant::now();
     claude_remote_link::attach_to_agents(&mut first);
-    let cold = t0.elapsed();
+    let cold = claude_remote_link::scan_counters().since(at);
 
-    // 2 回目以降（= PWA のポーリングの実態。mtime が動いていなければ memo が効く）
+    // 2 回目以降（= PWA のポーリングの実態。mtime が動いていなければ読まない）
+    let at = claude_remote_link::scan_counters();
     let mut second = serde_json::json!({ "agents": rows });
-    let t1 = std::time::Instant::now();
     claude_remote_link::attach_to_agents(&mut second);
-    let warm = t1.elapsed();
+    let warm = claude_remote_link::scan_counters().since(at);
 
-    // 初回の全走査 1 件ぶん（セッションごとに 1 回だけ通る経路）。
+    let sizes_after = transcript_sizes(&used);
+    let (appended_bytes, appended_sessions) = appended(&sizes_before, &sizes_after);
+
+    // 初回の全走査 1 件ぶん（会話ごとに 1 回だけ通る経路）を**同じカウンタ**で測る。
     // **生きている会話のポーリングはここを通らない**（追記ぶんだけ読む形なので、
     // その計測は `claude_remote_link` の `追記ぶんだけ読むと定常コストが増えない` にある）
     let paths = sample_paths();
-    let full = if paths.is_empty() {
-        None
-    } else {
-        let t2 = std::time::Instant::now();
+    let full = {
+        let at = claude_remote_link::scan_counters();
         for path in &paths {
             let _ = claude_remote_link::read_link_at(path);
         }
-        Some(t2.elapsed() / paths.len() as u32)
+        let cost = claude_remote_link::scan_counters().since(at);
+        (!paths.is_empty()).then(|| cost.bytes / paths.len() as u64)
     };
 
-    eprintln!("20 件の付与: 初回 {cold:?} / 2 回目 {warm:?}｜初回の全走査 1 件: {full:?}");
+    eprintln!(
+        "20 行 / distinct {distinct} 会話の付与: 初回 {cold:?}｜2 回目 {warm:?}｜\
+         窓の中の追記 {appended_bytes} B / {appended_sessions} 会話｜\
+         全走査 1 件の読み出し {full:?} B"
+    );
+
     // 結果は同じ（memo が値を変えていない）
     assert_eq!(first, second, "memo が結果を変えている");
+
+    // ① 行数ぶん読まない（20 行 → 走査は distinct 会話数ぶん）
     assert!(
-        cold < std::time::Duration::from_secs(3),
-        "20 件で 3 秒超は設計を見直す水準: {cold:?}"
+        cold.scans <= distinct + appended_sessions,
+        "20 行の付与で {} 回走査している（distinct は {distinct} 会話 + 窓の中で\n\
+         追記された {appended_sessions} 会話）。同じ会話を行ごとに読み直している\n\
+         = 行内で memo が効いていない",
+        cold.scans
     );
-    // ポーリングの実態が初回より遅くなっていないこと（memo が効いている証拠）。
-    // 環境差で落とさないよう「初回以下」だけを要求する
     assert!(
-        warm <= cold,
-        "2 回目が初回より遅い（memo が効いていない）: 初回 {cold:?} / 2 回目 {warm:?}"
+        cold.locates <= distinct,
+        "20 行の付与で所在探索が {} 回（distinct は {distinct} 会話）。\n\
+         `projects/` の全走査を会話ごとに 1 回より多くやっている = 所在の memo が効いていない",
+        cold.locates
     );
+
+    // ② 定常状態は追記ぶんだけ（**絶対上限**。比で書くと両方が同じ理由で伸びたときに
+    // 成立してしまう = #1167 の規約）
+    const STEADY_BUDGET: u64 = 64 * 1024;
+    assert!(
+        warm.bytes <= STEADY_BUDGET + appended_bytes,
+        "2 回目のポーリングで {} B 読んでいる（上限 {STEADY_BUDGET} B + 窓の中の追記 {appended_bytes} B）。\n\
+         mtime が動いていない会話を読み直している、または追記ぶんだけ読む形が壊れている\n\
+         （全走査は 1 件 {full:?} B）",
+        warm.bytes
+    );
+
+    assert!(
+        warm.scans <= appended_sessions,
+        "2 回目のポーリングで {} 回走査している（窓の中で追記されたのは {appended_sessions} 会話）。\n\
+         mtime が動いていない会話を読みに行っている = memo の 1 段目が効いていない",
+        warm.scans
+    );
+
+    // ③ 所在探索は 1 会話 1 回（2 回目は探し直さない）
+    assert_eq!(
+        warm.locates, 0,
+        "2 回目のポーリングで所在探索を {} 回やっている（`projects/` の全走査は cold の支配項）",
+        warm.locates
+    );
+
+    // ② の上限が桁で開いていること（材料が小さいと空振りの検査になる）
+    if let Some(full) = full {
+        assert!(
+            full > STEADY_BUDGET,
+            "全走査 1 件が {full} B しかない = 上限 {STEADY_BUDGET} B と桁が開いていない\n\
+             （`sample_paths` が 64 KiB 以上のファイルを選べていない）"
+        );
+    }
+}
+
+/// 会話 id → transcript の実サイズ（**パスも id も出さない**）。
+/// 計測窓のあいだに追記された量を出すために使う
+fn transcript_sizes(ids: &[String]) -> Vec<u64> {
+    ids.iter()
+        .map(|id| {
+            tako_control::transcript::locate_transcript(id)
+                .and_then(|loc| loc.path.metadata().ok())
+                .map(|m| m.len())
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
+/// (追記された合計バイト数, 追記された会話数)。縮んだものは 0 扱い
+fn appended(before: &[u64], after: &[u64]) -> (u64, u64) {
+    let deltas = before
+        .iter()
+        .zip(after.iter())
+        .map(|(b, a)| a.saturating_sub(*b));
+    deltas.fold((0, 0), |(bytes, sessions), d| match d {
+        0 => (bytes, sessions),
+        d => (bytes + d, sessions + 1),
+    })
 }
