@@ -71,9 +71,7 @@ pub fn claude_home() -> Option<std::path::PathBuf> {
             return Some(std::path::PathBuf::from(dir));
         }
     }
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(|h| std::path::PathBuf::from(h).join(".claude"))
+    tako_core::paths::home_dir().map(|h| h.join(".claude"))
 }
 
 /// 共有可否の分類

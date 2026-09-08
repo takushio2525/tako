@@ -162,25 +162,13 @@ impl BootstrapState {
 
 /// ホームディレクトリ。**取得できない環境では何も書かない**
 fn home_dir() -> Result<PathBuf, String> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
+    tako_core::paths::home_dir()
         .ok_or_else(|| "ホームディレクトリを特定できません（HOME が未設定）".to_string())
 }
 
 fn display_path(path: &Path) -> String {
-    let text = path.display().to_string();
-    match home_dir() {
-        Ok(home) => {
-            let home = home.display().to_string();
-            match text.strip_prefix(&home) {
-                Some(rest) => format!("~{rest}"),
-                None => text,
-            }
-        }
-        Err(_) => text,
-    }
+    // `~` 短縮の正本は tako_core::paths::shorten_home（#893）
+    tako_core::paths::shorten_home(&path.to_string_lossy())
 }
 
 /// この環境の手順

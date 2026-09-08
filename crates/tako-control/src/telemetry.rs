@@ -301,9 +301,7 @@ fn get_hostname() -> String {
 }
 
 fn dirs_home() -> Option<String> {
-    std::env::var("HOME")
-        .ok()
-        .or_else(|| std::env::var("USERPROFILE").ok())
+    tako_core::paths::home_dir().map(|h| h.to_string_lossy().into_owned())
 }
 
 fn regex_lite_replace(input: &str, pattern: &str, replacement: &str) -> String {

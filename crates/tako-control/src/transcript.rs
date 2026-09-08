@@ -1606,12 +1606,13 @@ mod tests {
         )
         .unwrap();
 
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &tmp);
-        let result = read_messages(sid, 10);
-        let missing = read_messages("99999999-9999-9999-9999-999999999999", 10);
-        if let Some(h) = original_home {
-            std::env::set_var("HOME", h);
+        let result;
+        let missing;
+        {
+            // Drop で必ず戻る（#893。旧実装は assert が落ちた回に漏れていた）
+            let _home = crate::test_home::HomeGuard::set(&tmp);
+            result = read_messages(sid, 10);
+            missing = read_messages("99999999-9999-9999-9999-999999999999", 10);
         }
         let _ = std::fs::remove_dir_all(&tmp);
 

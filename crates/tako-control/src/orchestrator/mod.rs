@@ -306,10 +306,7 @@ pub fn expand_tilde(path: &str) -> String {
 }
 
 pub(crate) fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
+    tako_core::paths::home_dir().filter(|p| p.is_absolute())
 }
 
 // --- accounts.yaml (#504) ---

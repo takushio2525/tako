@@ -3419,10 +3419,7 @@ fn print_setup_mcp_report(resp: &serde_json::Value) {
 
 /// MCP 登録パスの存在を確認し、不在なら警告を出す（master/solo 起動前のガード）
 fn check_mcp_health_warning() {
-    let home = match std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from)
-    {
+    let home = match tako_core::paths::home_dir() {
         Some(h) => h,
         None => return,
     };

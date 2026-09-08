@@ -139,18 +139,9 @@ fn profile_summary(profile: &tako_control::orchestrator::Profile) -> String {
         return txt::starter_profile_projects(&list);
     }
     if let Some(cwd) = profile.cwd.as_ref().filter(|c| !c.is_empty()) {
-        return shorten_home(cwd);
+        return tako_core::paths::shorten_home(cwd);
     }
     profile.master_model_label()
-}
-
-/// ホーム配下を `~` 表記へ（cwd チップと同じ規則）
-fn shorten_home(path: &str) -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
-    match path.strip_prefix(&home) {
-        Some(rest) if !home.is_empty() => format!("~{rest}"),
-        _ => path.to_string(),
-    }
 }
 
 impl TakoApp {
@@ -167,15 +158,11 @@ impl TakoApp {
         use crate::ui_text::ui_mode as txt;
 
         // cwd チップ（ヘッダ左。いまどのフォルダで話が始まるかを見せる）
-        let cwd_label = self.terminals.get(&pane_id).and_then(|s| s.cwd()).map(|p| {
-            let full = p.to_string_lossy().to_string();
-            let home = std::env::var("HOME").unwrap_or_default();
-            if !home.is_empty() && full.starts_with(&home) {
-                format!("~{}", &full[home.len()..])
-            } else {
-                full
-            }
-        });
+        let cwd_label = self
+            .terminals
+            .get(&pane_id)
+            .and_then(|s| s.cwd())
+            .map(|p| tako_core::paths::shorten_home(&p.to_string_lossy()));
 
         div()
             .id(("pane", pane_id.as_u64()))

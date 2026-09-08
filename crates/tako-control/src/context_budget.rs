@@ -38,10 +38,8 @@ fn display_path(p: &Path) -> String {
     let Some(home) = tako_core::paths::home_dir() else {
         return p.display().to_string();
     };
-    let shown = match p.strip_prefix(&home) {
-        Ok(rest) => format!("~/{}", rest.display()),
-        Err(_) => p.display().to_string(),
-    };
+    // `~` 短縮の正本は tako_core::paths::shorten_home（#893）
+    let shown = tako_core::paths::shorten_home(&p.to_string_lossy());
     let dashed = home.display().to_string().replace(['/', '\\'], "-");
     if dashed.len() > 1 {
         shown.replace(&dashed, "-~")

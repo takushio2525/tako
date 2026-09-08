@@ -114,15 +114,7 @@ impl TakoApp {
         // フォーカスペインの cwd（カンプ: breadcrumb。クリックでコピー）
         let cwd_breadcrumb = self.active_tab_cwd().map(|p| {
             let full = p.display().to_string();
-            let short = if let Ok(home) = std::env::var("HOME") {
-                if let Ok(rel) = p.strip_prefix(&home) {
-                    format!("~/{}", rel.display())
-                } else {
-                    full.clone()
-                }
-            } else {
-                full.clone()
-            };
+            let short = tako_core::paths::shorten_home(&full);
             let (parent, leaf) = match short.rfind('/') {
                 Some(i) if i + 1 < short.len() => {
                     (short[..=i].to_string(), short[i + 1..].to_string())

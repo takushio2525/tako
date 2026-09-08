@@ -44,9 +44,8 @@ pub fn is_granted() -> bool {
 /// FDA のプローブに使うパス群。存在する順に試行する
 #[cfg(target_os = "macos")]
 fn fda_probe_paths() -> Vec<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"));
+    // FDA は macOS 専用だが、ホーム解決は他と同じ正本を通す（#893）
+    let home = tako_core::paths::home_dir().unwrap_or_else(|| PathBuf::from("/"));
     vec![
         home.join("Library/Mail"),
         home.join("Library/Safari"),

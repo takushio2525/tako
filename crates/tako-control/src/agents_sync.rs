@@ -30,9 +30,7 @@ impl AgentKind {
     }
 
     pub fn target_path(self) -> Option<PathBuf> {
-        let home = std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .map(PathBuf::from)?;
+        let home = tako_core::paths::home_dir()?;
         Some(match self {
             Self::Claude => home.join(".claude/CLAUDE.md"),
             Self::Codex => home.join(".codex/AGENTS.md"),

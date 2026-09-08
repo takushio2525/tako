@@ -291,9 +291,7 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
+    tako_core::paths::home_dir()
 }
 
 /// 表示用にホーム配下を `~/…` へ縮める（ホームパスをそのまま見せない。#513 の可搬表記と同じ形）

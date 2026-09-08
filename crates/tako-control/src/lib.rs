@@ -77,6 +77,9 @@ pub mod stale_binary;
 pub mod tailscale;
 pub mod task_checkpoints;
 pub mod telemetry;
+/// テストが `HOME` を差し替えるためのガード（#893。Drop で必ず戻す）
+#[cfg(test)]
+mod test_home;
 pub mod transcript;
 pub mod welcome;
 

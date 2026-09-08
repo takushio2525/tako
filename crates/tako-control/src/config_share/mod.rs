@@ -64,9 +64,7 @@ fn data_dir() -> Result<PathBuf, String> {
 }
 
 fn home_dir() -> Result<PathBuf, String> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
+    tako_core::paths::home_dir()
         .ok_or_else(|| "ホームディレクトリを解決できません（$HOME 未設定）".to_string())
 }
 
