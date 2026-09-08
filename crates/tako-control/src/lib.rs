@@ -80,6 +80,9 @@ pub mod telemetry;
 /// テストが `HOME` を差し替えるためのガード（#893。Drop で必ず戻す）
 #[cfg(test)]
 mod test_home;
+/// 番犬: テストプロセスが本番相当の置き場へ書かないこと（#944 / #1030）
+#[cfg(test)]
+mod test_write_isolation;
 pub mod transcript;
 pub mod welcome;
 

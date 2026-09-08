@@ -309,6 +309,38 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
     tako_core::paths::home_dir().filter(|p| p.is_absolute())
 }
 
+/// 外部エージェント（claude / codex / agy）の**設定ファイルを置くホーム**。
+///
+/// **テストビルドでは必ず隔離先へ倒す**（#944 / #1030）。事前信頼
+/// （`ensure_trusted`）は spawn のたびに `~/.claude.json` /
+/// `~/.codex/config.toml` / `~/.gemini/antigravity-cli/settings.json` を
+/// 書き換えるので、`cargo test` がユーザーの**生きた設定ファイル**へ
+/// テスト用 cwd の信頼エントリを積み続けていた（実測: `~/.claude.json` に
+/// 2,500 件。うち大半がテスト・セルフテスト由来）。
+///
+/// [`home_dir`] 自体は倒さない: 表示・比較（`is_claude_default_config_dir` 等）は
+/// 本物のホームで判定する必要があり、まとめて倒すと**別のテストが壊れる**
+pub(crate) fn agent_config_home() -> Option<PathBuf> {
+    #[cfg(test)]
+    if !tako_core::paths::issue944_legacy() {
+        return Some(test_agent_config_home());
+    }
+    home_dir()
+}
+
+/// 外部エージェント設定のテスト隔離先（プロセスごとに 1 つ）。
+/// 作法は [`config_dir`] の隔離先と同じ
+#[cfg(test)]
+pub(crate) fn test_agent_config_home() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("tako-test-agent-home-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    })
+    .clone()
+}
+
 // --- accounts.yaml (#504) ---
 
 /// accounts.yaml のパス
@@ -2958,6 +2990,24 @@ fn agent_scan_config_dir_env(target: &AgentScanTarget) -> (String, Option<&str>)
 
 /// 単一走査先に対する `claude agents --json` の実行
 fn run_claude_agents_json_for(target: &AgentScanTarget) -> Option<Vec<u8>> {
+    // **テストビルドでは実 CLI を起こさない**（#944）。claude 本体は起動のたびに
+    // `~/.claude.json` を書き戻し `~/.claude/backups/.claude.json.backup.<epoch>` を
+    // 積むので、`cargo test` がユーザーの設定ファイルとバックアップを増やしていた
+    // （実測: 単体テスト `issue390_finish_worker_statusがprompt未達を検知する` が
+    // `claude agents --json` を 1 回起こしていた）。claude が入っていない CI と
+    // 同じ「解決できない」経路へ倒すことで、結果もローカル / CI で揃う。
+    // 実 CLI を通す検証は統合テスト（`tests/issue877_agents_scan_e2e.rs`）が担う
+    // ＝ そちらは lib を非テストビルドで束ねるのでこの分岐に入らない
+    #[cfg(test)]
+    if !tako_core::paths::issue944_legacy() {
+        crate::diag::flow_log("agents 走査: テストビルドでは実 CLI を起こさない（#944）");
+        return None;
+    }
+    run_claude_agents_json_live(target)
+}
+
+/// [`run_claude_agents_json_for`] の本体（実 CLI を起こす側）
+fn run_claude_agents_json_live(target: &AgentScanTarget) -> Option<Vec<u8>> {
     let (posix_prefix, config_dir) = agent_scan_config_dir_env(target);
     // 「ユーザーの環境で CLI を 1 回走らせる」形は OS で違う（#877。抽象境界 B21）。
     // unix はログインシェル経由（`.app` の痩せた PATH 対策）、Windows は PATH で解決した

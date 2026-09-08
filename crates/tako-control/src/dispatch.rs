@@ -17255,12 +17255,33 @@ mod tests {
         }
     }
 
+    /// e2e の事前信頼が書かれる**実ファイル**（テストの隔離を通さない側）。
+    ///
+    /// e2e は「実 claude が読む既定の config」を明示して事前信頼を書く
+    /// （`ensure_trusted_in(Some(claude_default_config_dir()), …)`）。
+    /// 一方 `config_json_paths(None)` は #944 でテストビルドでは隔離先を返すので、
+    /// **後始末にそれを使うと 1 件も消えない**。書いた先と同じ規則で解決する
+    fn e2e_trust_config_paths() -> Vec<std::path::PathBuf> {
+        let mut paths = Vec::new();
+        if let Some(dir) = crate::orchestrator::claude_default_config_dir() {
+            paths.push(dir.join(".claude.json"));
+        }
+        // 旧世代の置き場（ホーム直下）。過去の実行が残した分も掃除する
+        if let Some(home) = crate::orchestrator::home_dir() {
+            let legacy = home.join(".claude.json");
+            if !paths.contains(&legacy) {
+                paths.push(legacy);
+            }
+        }
+        paths
+    }
+
     /// e2e が書いた事前信頼エントリを claude の `.claude.json` から除去する（best-effort）。
     /// 消さないと実行のたびに `/private/tmp/tako-e2e-577-<pid>/work` が溜まり続ける
     /// （claude_tui_e2e の `remove_trust_entry` と同じ後始末）
     fn remove_e2e_trust_entry(dir: &std::path::Path) {
         let key = dir.display().to_string();
-        for path in crate::claude_tui::config_json_paths(None) {
+        for path in e2e_trust_config_paths() {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
