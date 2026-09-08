@@ -733,8 +733,10 @@ scene_guimode() {
     # かんたん表示のチャット判定は器（tmux バックエンド）が要る = persist=1
     explainer_begin guimode "$work" "$socket" 1
     trap 'promo_stop_isolated '"$socket" EXIT
-    # #1149 以降は layout.json の seed が効かないので、AX で 16:9 の空きへ置き直す
-    # （重なった窓があるとクリックが吸われる。lib.sh の注記）
+    # #1149 以降は layout.json の seed が効かないので、AX で 16:9 の置き場所へ直す。
+    # **この章で押す 4 点**を宣言しておくと、他の worker の窓に覆われない場所を選ぶ
+    # （覆われているとクリックが相手へ吸われる。lib.sh の注記）
+    PROMO_CLICK_POINTS="${GUI_PLUS_X},${GUI_PLUS_Y} ${GUI_TOGGLE_X},${GUI_TOGGLE_Y} 960,424 400,915"
     promo_force_window_frame "$PROMO_APP_PID" 960 540 || {
         promo_stop_isolated "$socket"; trap - EXIT; PROMO_EXTRA_ENV=(); return 1; }
     local base; base=$(promo_base_pane)

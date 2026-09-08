@@ -647,8 +647,8 @@ promo_force_window_frame() {
     local pid=$1 w=${2:-960} h=${3:-540} i origin x y got
     for i in 1 2 3; do
         if [ "$PROMO_STAGE" = virtual ]; then
-            # 空きは**毎回引き直す**（他の worker の窓は収録の途中でも増える）
-            origin=$(promo_vd_free_origin "$w" "$h")
+            # 置き場所は**毎回引き直す**（他の worker の窓は収録の途中でも増える）
+            origin=$(promo_vd_origin_for_clicks "$w" "$h")
             x=${origin% *}; y=${origin#* }
             osascript -e "tell application \"System Events\" to tell (first application process whose unix id is $pid) to set position of window 1 to {$x, $y}" \
                 >/dev/null 2>&1 || true
@@ -659,32 +659,96 @@ promo_force_window_frame() {
         sleep 0.6
         got=$("$PROMO_WINBOUNDS" "$pid" 2>/dev/null | cut -d' ' -f4,5)
         [ "$got" = "$w $h" ] || continue
-        if promo_vd_window_clear "$pid"; then
-            echo "   窓: $("$PROMO_WINBOUNDS" "$pid" | cut -d' ' -f2,3) ${w}x${h}pt（他の窓と重なりなし）"
+        if promo_vd_clicks_clear "$pid"; then
+            echo "   窓: $("$PROMO_WINBOUNDS" "$pid" | cut -d' ' -f2,3) ${w}x${h}pt（押す点は他の窓に覆われていない）"
             return 0
         fi
     done
-    echo "ERROR: 窓を ${w}x${h}pt の空きへ置けない（実測 ${got:-不明}）。" >&2
-    echo "       仮想ディスプレイが他の worker の隔離 tako で埋まっている可能性がある" >&2
+    echo "ERROR: 窓を ${w}x${h}pt で押せる場所へ置けない（実測 ${got:-不明}）。" >&2
+    echo "       仮想ディスプレイが他の worker の隔離 tako で埋まっている" >&2
     echo "       （$("$PROMO_WINBOUNDS" --all 2>/dev/null | wc -l | tr -d ' ') 窓）。空いてから撮り直すこと" >&2
     return 1
 }
 
-# 自分の窓（$1 = pid）に他の窓が重なっていないか（0 = 重なりなし）。
-# 重なっていると**クリックが相手の窓へ吸われる**ので、収録前に必ず確かめる
-promo_vd_window_clear() {
+# **押す点だけ**が他の窓に覆われていないことを確かめる（$1 = pid。0 = 覆われていない）。
+#
+# 「窓が 1 ピクセルも重なっていない」を条件にすると、他の worker の隔離 tako が
+# 面の中央に居るだけで撮れなくなる（2560x1440pt の面の中央に 960x600 の窓があると、
+# 960x540 を余白 40/60 の格子に置く限りどこかは必ず重なる = 2026-09-09 実測）。
+# **絵は窓単体キャプチャなので手前に何が来ても自分の中身しか写らない**（#470 の実測）。
+# 実害があるのはクリックだけ（手前の窓へ吸われる）なので、押す点だけを見る。
+# 覆う窓が自分より奥にある場合まで弾くのは過剰だが、前後関係は当てにできないので安全側に倒す。
+# 押す点は PROMO_CLICK_POINTS（"px,py px,py …" = 窓内ピクセル）で渡す
+PROMO_CLICK_POINTS=${PROMO_CLICK_POINTS:-}
+promo_vd_clicks_clear() {
     local pid=$1 b
+    [ -n "$PROMO_CLICK_POINTS" ] || return 0
     b=$("$PROMO_WINBOUNDS" "$pid" 2>/dev/null) || return 1
-    "$PROMO_WINBOUNDS" --all 2>/dev/null | awk -v me="$b" '
-        BEGIN { split(me, m, " "); mid=m[1]; mx=m[2]; my=m[3]; mw=m[4]; mh=m[5] }
-        $1 == mid { next }
-        {
-            if ($3 < mx + mw && mx < $3 + $5 && $4 < my + mh && my < $4 + $6) {
-                printf "   重なり: pid %s の窓 %s,%s %sx%s\n", $2, $3, $4, $5, $6
-                bad = 1
-            }
-        }
-        END { exit bad ? 1 : 0 }'
+    "$PROMO_WINBOUNDS" --all 2>/dev/null | /usr/bin/python3 -c '
+import sys
+me = sys.argv[1].split()
+mid, mx, my = me[0], float(me[1]), float(me[2])
+points = [p.split(",") for p in sys.argv[2].split()]
+others = []
+for line in sys.stdin:
+    f = line.split()
+    if len(f) < 6 or f[0] == mid:
+        continue
+    others.append((f[1], float(f[2]), float(f[3]), float(f[4]), float(f[5])))
+bad = False
+for px, py in points:
+    gx, gy = mx + float(px) / 2, my + float(py) / 2
+    for opid, ox, oy, ow, oh in others:
+        if ox <= gx < ox + ow and oy <= gy < oy + oh:
+            print(f"   押す点 {px},{py} が pid {opid} の窓に覆われている（{int(ox)},{int(oy)} {int(ow)}x{int(oh)}）")
+            bad = True
+            break
+sys.exit(1 if bad else 0)
+' "$b" "$PROMO_CLICK_POINTS"
+}
+
+# 仮想ディスプレイの中で、**押す点が他の窓に覆われない** w x h の置き場所を「x y」で返す。
+# 完全な空き（promo_vd_free_origin）が取れればそれを使い、取れなければ押す点だけで判定する
+promo_vd_origin_for_clicks() {
+    local w=$1 h=$2 free
+    free=$(promo_vd_free_origin "$w" "$h")
+    [ -n "$PROMO_CLICK_POINTS" ] || { printf '%s' "$free"; return 0; }
+    "$PROMO_WINBOUNDS" --all 2>/dev/null | /usr/bin/python3 -c '
+import sys
+w, h = float(sys.argv[1]), float(sys.argv[2])
+X, Y, W, H = (float(v) for v in sys.argv[3:7])
+padx, pady = float(sys.argv[7]), float(sys.argv[8])
+points = [tuple(float(v) for v in p.split(",")) for p in sys.argv[9].split()]
+fallback = sys.argv[10]
+mywid = sys.argv[11]
+others = []
+for line in sys.stdin:
+    f = line.split()
+    if len(f) < 6 or f[0] == mywid:   # 自分の窓は除く（点は必ずその中に入る）
+        continue
+    others.append((float(f[2]), float(f[3]), float(f[4]), float(f[5])))
+
+def clear(ox, oy):
+    for px, py in points:
+        gx, gy = ox + px / 2, oy + py / 2
+        for wx, wy, ww, wh in others:
+            if wx <= gx < wx + ww and wy <= gy < wy + wh:
+                return False
+    return True
+
+y = Y + pady
+while y + h <= Y + H:
+    x = X + padx
+    while x + w <= X + W:
+        if clear(x, y):
+            print(int(x), int(y))
+            sys.exit(0)
+        x += padx
+    y += pady
+print(fallback)
+' "$w" "$h" "$PROMO_VD_X" "$PROMO_VD_Y" "$PROMO_VD_W" "$PROMO_VD_H" \
+  "$PROMO_VD_PAD_X" "$PROMO_VD_PAD_Y" "$PROMO_CLICK_POINTS" "$free" \
+  "$("$PROMO_WINBOUNDS" "${PROMO_APP_PID:-0}" 2>/dev/null | cut -d' ' -f1)"
 }
 
 # 収録用アカウント（`TAKO_PROMO_CLAUDE_CONFIG_DIR`）を隔離インスタンスへ登録する。
