@@ -49,6 +49,10 @@ explainer_begin() {
     promo_seed_window_frame "$work" 960 540
     promo_start_isolated "$work" "$socket" "$persist"
     PROMO_BEATS_FILE="$PROMO_OUT/scenes/$scene-beats.tsv"
+    # 前のテイクのビート表は退避してから空にする。**中断したテイクでも空になる**ので
+    # （収録前の前提検査で落ちた回に実測）、退避が無いと「素材はあるがビートが無い」
+    # 組み合わせが残り、どのテイクの素材なのか分からなくなる
+    [ -s "$PROMO_BEATS_FILE" ] && cp "$PROMO_BEATS_FILE" "${PROMO_BEATS_FILE%.tsv}.prev.tsv"
     : > "$PROMO_BEATS_FILE"
     tko theme --size "$FONT_SIZE" >/dev/null 2>&1 || true
     # 収録機と無関係な listen ポート（他アプリ）の提案チップが写り込まないようにする
