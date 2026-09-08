@@ -37,6 +37,7 @@ const CATEGORIES = [
   ['worker の起動', [
     'worker_spawn', 'agent_select_at_spawn', 'worker_trust',
     'worker_bypass_preaccept', 'effort_control', 'account_switch',
+    'worker_model_default_inherit',
   ]],
   ['worker の監視', [
     'worker_status_detect', 'worker_status_structured',

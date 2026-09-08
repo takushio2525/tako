@@ -110,8 +110,20 @@ worker_model_policy: inherit
 | 対象 | 優先順位 |
 |---|---|
 | master | プロファイルの `model`（`master_agent` のネイティブ表記）→ 未指定ならその CLI の既定 |
-| worker（claude） | spawn の `model` 引数 → `worker_agents.claude.model` → プロファイルの worker ポリシー（inherit / fixed / delegate）→ 未指定なら claude CLI 既定 |
+| worker（claude） | spawn の `model` 引数 → アカウントの `default_model` → `worker_agents.claude.model` → プロファイルの worker ポリシー（inherit / fixed / delegate）→ 未指定なら claude CLI 既定 |
 | worker（codex / agy） | spawn の `model` 引数 → `worker_agents.<agent>.model` → 未指定ならその CLI の既定 |
+
+**claude 語彙の既定は claude 以外へ渡らない（#1013）**。アカウントの `default_model` と
+プロファイルの `worker_model` は `claude-opus-5` のような claude のモデル名なので、
+codex / agy の `--model` へ流すと存在しないモデル名で起動してしまう（実発生:
+`codex --model claude-opus-5 …` がモデル警告の画面で止まり、プロンプトもそこで消えた）。
+判断は能力マトリクスの 1 マス（`tako agent-support --agent codex` の
+`worker_model_default_inherit` = 対象外）が持つ。codex / agy のモデルは
+`worker_agents.<agent>.model` か spawn の明示指定で決め、無ければ CLI 既定に委ねる。
+
+spawn の応答は `model`（実際に使う値。`null` = CLI 既定に委ねた）と `model_source`
+（`explicit` / `account` / `agent_config` / `profile_policy` / `cli_default`）を返すので、
+`--model` が付かない理由が読み取れる（`effort` / `effort_source` も同じ形）。
 
 ### master のエージェント種別（claude / codex。Issue #127）
 
@@ -232,6 +244,10 @@ accounts:
     inherit: true                   # CLAUDE_CONFIG_DIR を設定しない（既定の資格情報）
     default_model: claude-opus-5
 ```
+
+アカウントは claude の資格情報（`CLAUDE_CONFIG_DIR`）の定義なので、`default_model` /
+`default_effort` は **claude の語彙**。codex / agy の worker には渡らない（#1013）。
+その系統のモデルは `worker_agents.<agent>.model` で書く。
 
 `master_account` は `tako master` / `tako solo` / handoff の新 master に、
 `worker_account` は spawn する worker に効く（spawn の `--account` が最優先。#547）。
