@@ -8225,6 +8225,8 @@ fn dispatch_git_resolve_agent(
     host.attach_session(new_id, options);
 
     let role_value = "conflict-resolver";
+    // MCP の一時注入（#986）。codex だけが `-c` で受け取る（他系統は 1 バイトも変わらない）
+    let tako_bin = resolve_tako_binary();
     let agent_cmd = orchestrator::agent::build_worker_cmd(&orchestrator::agent::WorkerLaunch {
         agent: worker_agent,
         role: role_value,
@@ -8236,6 +8238,7 @@ fn dispatch_git_resolve_agent(
         // 不適格なら flag は None になり、理由は `remote_control` に残る
         remote_control: remote_control.enabled(),
         extra_args: &launch.extra_args,
+        tako_bin: Some(&tako_bin),
         env: &profile_env,
     });
 
@@ -8704,6 +8707,9 @@ fn dispatch_orchestrator_spawn(
         Some(l) => format!("worker:{project}:{l}"),
         None => format!("worker:{project}"),
     };
+    // MCP の一時注入（#986）。codex だけが `-c` で受け取る（他系統は 1 バイトも変わらない）。
+    // master と同じ 1 実装（`agent::codex_mcp_args`）なので、worker だけ古い形になることが無い
+    let tako_bin = resolve_tako_binary();
     let worker_cmd = orchestrator::agent::build_worker_cmd(&orchestrator::agent::WorkerLaunch {
         agent: worker_agent,
         role: &role_value,
@@ -8715,6 +8721,7 @@ fn dispatch_orchestrator_spawn(
         // 不適格なら flag は None になり、理由は `remote_control` に残る
         remote_control: remote_control.enabled(),
         extra_args: &launch.extra_args,
+        tako_bin: Some(&tako_bin),
         env: &profile_env,
     });
 

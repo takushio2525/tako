@@ -21,8 +21,8 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 | エージェント | 対応 | 一部対応 | 未対応 | 対象外 |
 | --- | --- | --- | --- | --- |
 | Claude Code（基準） | 47 / 47 | 0 | 0 | 0 |
-| OpenAI Codex CLI | 28 / 47 | 5 | 11 | 3 |
-| Antigravity CLI | 13 / 47 | 7 | 18 | 9 |
+| OpenAI Codex CLI | 30 / 47 | 4 | 10 | 3 |
+| Antigravity CLI | 15 / 47 | 6 | 17 | 9 |
 | Local LLM | 0 / 47 | 0 | 39 | 8 |
 
 ### 状態の意味
@@ -110,7 +110,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 | **permission ダイアログを検知して応答する（#319 / #577）**<br />`worker_permission_dialog` | 対応 | 対応 | 対応 | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM のハーネスが決まっていないので可否が定まらない（codex TUI を借りる #990 なら在り、非 TUI 経路の #991 なら無い） | コード本文: claude_tui.rs の detect_permission_dialog は 3 系統のパターンを持ち、agy の「Do you want to proceed?」も対象に入っている |
 | **選択肢ダイアログを構造として読み、番号やラベルで応答する（#748）**<br />`worker_choice_dialog` | 対応 | 対応 | 対応 | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM のハーネスが決まっていないので可否が定まらない（codex TUI を借りる #990 なら在り、非 TUI 経路の #991 なら無い） | コード本文: claude_tui.rs は claude v2.1.198 / codex 0.144.1 / agy 1.1.0 の実採取画面の 和集合として実装され、CODEX_TRUST_DIALOG / AGY_PERMISSION_DIALOG 等の fixture が同ファイルに在る。番号なし・選択肢 2 つ（claude 2.x の信頼 ダイアログ = TRUST_DIALOG_NO_NUMBER）も #1223 で検知対象 |
 | **worker ペインの中から tako CLI で tako を操作できる**<br />`worker_cli_control` | 対応 | 対応 | 対応 | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: TAKO_PANE_ID / TAKO_SOCKET / TAKO_TOKEN の注入と PATH 注入（#601）は ペイン単位で agent に依らない |
-| **worker が tako の MCP ツール群を呼べる**<br />`worker_mcp` | 対応 | 未対応 [#986](https://github.com/takushio2525/tako/issues/986)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#986](https://github.com/takushio2525/tako/issues/986)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: mcp_servers を組む非テストコードは orchestrator/mod.rs（master 経路）だけで、WorkerLaunch には tako_bin も MCP 引数も無い（棚卸し §5.3 = 最大の穴） |
+| **worker が tako の MCP ツール群を呼べる**<br />`worker_mcp` | 対応 | 対応 | 対応 | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #986 の実測（2026-09-09 / 隔離 GUI + tako-vd / codex-cli 0.153.0 / agy 1.1.27）:              **codex** = spawn の起動コマンドへ master と同じ `-c mcp_servers.tako.*` を一時注入する              （正本は orchestrator::agent::codex_mcp_args の 1 実装）。実 worker が              `tako.tako_list_panes({})` を呼び、**pane を省略した** `tako_set_title` が              自分のペインへ当たった。効いているのが一時注入だと分かるのは env の指紋で、             MCP 子プロセスの初期環境は一時注入の 5 個（TAKO_TAB_ID を含む）に対し、             `TAKO_986_LEGACY=1` の旧アームでは恒久登録（#979）の 4 個（TAKO_TAB_ID 無し）だった。             **agy** = per-launch の注入手段が CLI に無い（`agy --help` 実測 1.1.27: -c / --mcp-config なし）ので              恒久登録（#979）に委ねる。agy は親 env をそのまま渡す（実測: MCP 子が TAKO_* を 15 個受け取る              = claude と同じ形）ため、実 worker から pane 省略の `tako_set_title` が自分のペインへ当たった。             `TAKO_PANE_ID` が届かない系統でも解けるよう、caller_pane は **pid 祖先辿り**へ落ちる              （`tako mcp serve` が `Request::ResolvePane` で問う。#288 / #567 と同じ 1 実装） |
 
 ## 報告と会話ログ
 
@@ -144,7 +144,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 | 能力 | Claude Code | OpenAI Codex CLI | Antigravity CLI | Local LLM | 根拠 |
 | --- | --- | --- | --- | --- | --- |
-| **コンフリクト解消エージェントとして起動する（#496）**<br />`git_resolve_agent` | 対応 | 一部対応<br />起動はできるが tako の MCP ツールを呼べない（#986） | 一部対応<br />起動はできるが tako の MCP ツールを呼べない（#986） | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: dispatch.rs の git resolve は 3 系統とも起動できるが、worker と同じ経路なので MCP の一時注入が無い（mcp_servers を組むのは orchestrator/mod.rs の master 側だけ） |
+| **コンフリクト解消エージェントとして起動する（#496）**<br />`git_resolve_agent` | 対応 | 対応 | 対応 | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: dispatch.rs の git resolve は worker spawn と**同じ `WorkerLaunch`**（#986 で              `tako_bin` を配線済み）を通るので、MCP の一時注入も同じ 1 実装で効く。             番犬 `worker_mcp_injection_watchdog::worker_を起動する経路は_tako_bin_を渡している` が              片方だけ配線が落ちる形を落とし、MCP が実際に通ることは worker 経路で実測済み              （WORKER_MCP 行） |
 
 ## この表の作り方
 

@@ -437,12 +437,6 @@ pub mod notes {
         "The spawn is recorded, but the conversation itself cannot be indexed, so the entry stays pending and expires",
     );
 
-    /// 起動はできるが MCP を話せない（#986 が埋める）
-    pub const LAUNCH_ONLY_NO_MCP: Note = Note::new(
-        "起動はできるが tako の MCP ツールを呼べない（#986）",
-        "It launches, but cannot call tako's MCP tools (#986)",
-    );
-
     // ─── 上流に概念が無い（= Unsupported） ───────────────────────
 
     /// #790 の第 1 層は claude の Cross-Session Messaging に固有
@@ -704,12 +698,11 @@ pub const MATRIX: &[AgentFeature] = &[
             "Can be launched as the merge-conflict resolver agent (#496)",
         ),
         claude: S::Supported,
-        codex: degraded(notes::LAUNCH_ONLY_NO_MCP),
-        agy: degraded(notes::LAUNCH_ONLY_NO_MCP),
+        codex: S::Supported,
+        agy: S::Supported,
         local: local_pending(),
         evidence: AgentEvidence::Source(
-            "dispatch.rs の git resolve は 3 系統とも起動できるが、worker と同じ経路なので \
-             MCP の一時注入が無い（mcp_servers を組むのは orchestrator/mod.rs の master 側だけ）",
+            "dispatch.rs の git resolve は worker spawn と**同じ `WorkerLaunch`**（#986 で              `tako_bin` を配線済み）を通るので、MCP の一時注入も同じ 1 実装で効く。             番犬 `worker_mcp_injection_watchdog::worker_を起動する経路は_tako_bin_を渡している` が              片方だけ配線が落ちる形を落とし、MCP が実際に通ることは worker 経路で実測済み              （WORKER_MCP 行）",
         ),
     },
     AgentFeature {
@@ -1298,12 +1291,11 @@ pub const MATRIX: &[AgentFeature] = &[
             "The worker can call tako's MCP tools",
         ),
         claude: S::Supported,
-        codex: pending(notes::NOT_WIRED, 986),
-        agy: pending(notes::NOT_WIRED, 986),
+        codex: S::Supported,
+        agy: S::Supported,
         local: local_pending_first_class(),
-        evidence: AgentEvidence::Source(
-            "mcp_servers を組む非テストコードは orchestrator/mod.rs（master 経路）だけで、\
-             WorkerLaunch には tako_bin も MCP 引数も無い（棚卸し §5.3 = 最大の穴）",
+        evidence: AgentEvidence::Measured(
+            "#986 の実測（2026-09-09 / 隔離 GUI + tako-vd / codex-cli 0.153.0 / agy 1.1.27）:              **codex** = spawn の起動コマンドへ master と同じ `-c mcp_servers.tako.*` を一時注入する              （正本は orchestrator::agent::codex_mcp_args の 1 実装）。実 worker が              `tako.tako_list_panes({})` を呼び、**pane を省略した** `tako_set_title` が              自分のペインへ当たった。効いているのが一時注入だと分かるのは env の指紋で、             MCP 子プロセスの初期環境は一時注入の 5 個（TAKO_TAB_ID を含む）に対し、             `TAKO_986_LEGACY=1` の旧アームでは恒久登録（#979）の 4 個（TAKO_TAB_ID 無し）だった。             **agy** = per-launch の注入手段が CLI に無い（`agy --help` 実測 1.1.27: -c / --mcp-config なし）ので              恒久登録（#979）に委ねる。agy は親 env をそのまま渡す（実測: MCP 子が TAKO_* を 15 個受け取る              = claude と同じ形）ため、実 worker から pane 省略の `tako_set_title` が自分のペインへ当たった。             `TAKO_PANE_ID` が届かない系統でも解けるよう、caller_pane は **pid 祖先辿り**へ落ちる              （`tako mcp serve` が `Request::ResolvePane` で問う。#288 / #567 と同じ 1 実装）",
         ),
     },
     AgentFeature {
@@ -1775,7 +1767,9 @@ mod tests {
     #[test]
     fn gateの診断は表示言語に追従する() {
         let _guard = i18n::testing::lang_guard();
-        let key = keys::WORKER_MCP;
+        // #986 で WORKER_MCP は codex / agy とも Supported になったので、
+        // まだ pending が残るマス（会話の resume）で診断の言語追従を見る
+        let key = keys::SESSIONS_RESUME;
         i18n::set_lang(Lang::En);
         let en = gate(Agent::Codex, key).unwrap_err();
         i18n::set_lang(Lang::Ja);
@@ -1785,7 +1779,7 @@ mod tests {
                 .any(|c| matches!(c as u32, 0x3040..=0x30FF | 0x4E00..=0x9FFF)),
             "英語の診断に日本語が残っている: {en}"
         );
-        assert!(en.contains("#986") && ja.contains("#986"));
+        assert!(en.contains("#984") && ja.contains("#984"));
         assert!(en.contains("OpenAI Codex CLI") && ja.contains("OpenAI Codex CLI"));
     }
 
