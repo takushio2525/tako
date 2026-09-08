@@ -126,9 +126,9 @@ pub fn parse_declarations(head: &str) -> Declarations {
             break;
         }
 
-        // BOM 除去（先頭行のみ）
+        // BOM 除去（先頭行のみ）。判定は `text::strip_bom` の 1 実装（#1202）
         let line = if line_idx == 0 {
-            line.strip_prefix('\u{feff}').unwrap_or(line)
+            crate::text::strip_bom(line)
         } else {
             line
         };

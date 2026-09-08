@@ -88,7 +88,7 @@
 | `registry.rs` の `prompt_delivery_assessment`（`entry.agent != "claude"`） | 文字列比較で `NotApplicable` | #983 |
 | `dispatch.rs` の worker_status の `status_source` 分岐 | 実行時の session_id 解決結果で決める | #984 |
 | `dispatch.rs` の transcript アダプタ | claude 固定（拡張点のコメントあり） | #984 |
-| `WorkerLaunch` の MCP 注入 | 配線が無い | #986 |
+| ~~`WorkerLaunch` の MCP 注入~~ | **#986 で配線済み**（`tako_bin` + `agent::codex_mcp_args` の 1 実装。番犬 `worker_mcp_injection_watchdog`。A/B は `TAKO_986_LEGACY=1`） | 済 |
 | `agent_install::AgentKind` の拡張 | Claude 1 値 | #989 |
 | モデル一覧の取得手段（`agent_models::catalog_argv`） | 系統ごとの `match`。**能力マトリクスには「ピッカーが使えるか」だけ**が載る（claude = 基準系 = 全 Supported の不変条件があるため、取得手段の差はマトリクスの 1 マスでは表せない） | #1002（済） |
 
