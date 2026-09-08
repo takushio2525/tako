@@ -1196,12 +1196,25 @@ fn dispatch_inner(
             session,
             window,
         } => {
+            // socket 省略時は list と同じ「既定サーバー → tako バックエンド」で探す（#1190）
+            let socket = tako_core::tmux::resolve_session_socket(socket.as_deref(), &session)
+                .map_err(DispatchError::Operation)?;
             match window {
                 Some(index) => tako_core::tmux::kill_window(socket.as_deref(), &session, index),
                 None => tako_core::tmux::kill_session(socket.as_deref(), &session),
             }
-            .map_err(DispatchError::Operation)?;
-            Ok(json!({ "killed": session, "window": window }))
+            .map_err(|e| {
+                tmux_error(
+                    &match window {
+                        Some(index) => format!("window {index} の kill"),
+                        None => format!("セッション {session} の kill"),
+                    },
+                    socket.as_deref(),
+                    &session,
+                    &e,
+                )
+            })?;
+            Ok(json!({ "killed": session, "window": window, "socket": socket }))
         }
 
         Request::TmuxResize {
@@ -1212,10 +1225,23 @@ fn dispatch_inner(
             rows,
             reset,
         } => {
+            // socket 省略時は list と同じ「既定サーバー → tako バックエンド」で探す（#1190）
+            let socket = tako_core::tmux::resolve_session_socket(socket.as_deref(), &session)
+                .map_err(DispatchError::Operation)?;
             if reset {
-                tako_core::tmux::reset_window_size(socket.as_deref(), &session, window)
-                    .map_err(DispatchError::Operation)?;
-                return Ok(json!({ "session": session, "window": window, "reset": true }));
+                tako_core::tmux::reset_window_size(socket.as_deref(), &session, window).map_err(
+                    |e| {
+                        tmux_error(
+                            &format!("window {window} のサイズ解除"),
+                            socket.as_deref(),
+                            &session,
+                            &e,
+                        )
+                    },
+                )?;
+                return Ok(
+                    json!({ "session": session, "window": window, "reset": true, "socket": socket }),
+                );
             }
             let (Some(cols), Some(rows)) = (cols, rows) else {
                 return Err(DispatchError::InvalidParams(
@@ -1223,12 +1249,20 @@ fn dispatch_inner(
                 ));
             };
             tako_core::tmux::resize_window(socket.as_deref(), &session, window, cols, rows)
-                .map_err(DispatchError::Operation)?;
+                .map_err(|e| {
+                    tmux_error(
+                        &format!("window {window} のリサイズ"),
+                        socket.as_deref(),
+                        &session,
+                        &e,
+                    )
+                })?;
             Ok(json!({
                 "session": session,
                 "window": window,
                 "cols": cols,
                 "rows": rows,
+                "socket": socket,
             }))
         }
 
@@ -1239,13 +1273,19 @@ fn dispatch_inner(
             pane,
             direction,
         } => {
+            // socket 省略時は list と同じ「既定サーバー → tako バックエンド」で探す（#1190。
+            // kill / resize / open で解決を揃える）。明示指定はそのまま尊重する
+            let explicit_socket = socket.is_some();
+            let socket = tako_core::tmux::resolve_session_socket(socket.as_deref(), &session)
+                .map_err(DispatchError::Operation)?;
             // 存在しないセッション名は分割前に弾く（D&D 経路では起こらないが、
             // CLI / MCP からのタイポで空ペインだけが生えるのを防ぐ）。
-            // has-session（1 コマンド）で確認（旧 list_sessions は 3 コマンドで重かった）
-            if !tako_core::tmux::has_session(socket.as_deref(), &session) {
+            // socket 省略時は上の解決が存在を証明しているので、明示指定のときだけ確認する
+            if explicit_socket && !tako_core::tmux::has_session(socket.as_deref(), &session) {
                 return Err(DispatchError::Operation(format!(
-                    "tmux セッション {session} が見つからない（socket: {}）",
-                    socket.as_deref().unwrap_or("既定")
+                    "tmux セッション {session} が見つからない（{}）。\
+                     対象は `tako tmux list` で確認すること",
+                    tako_core::tmux::socket_label(socket.as_deref())
                 )));
             }
             let (tab, target) = resolve_pane(host.workspace(), pane)?;
@@ -11049,6 +11089,18 @@ fn op_err(e: impl std::fmt::Display) -> DispatchError {
     DispatchError::Operation(e.to_string())
 }
 
+/// tmux 操作の失敗を tako の規約に沿ったエラーへ包む（#1190）。生の stderr は
+/// 英語 + ソケットの絶対パスを含み、どのサーバー・どのセッションの話かも分からない。
+/// A/B 計測用に `TAKO_1190_LEGACY=1` で旧挙動（生の stderr を素通し）へ戻せる
+fn tmux_error(action: &str, socket: Option<&str>, session: &str, raw: &str) -> DispatchError {
+    if std::env::var("TAKO_1190_LEGACY").as_deref() == Ok("1") {
+        return DispatchError::Operation(raw.to_string());
+    }
+    DispatchError::Operation(tako_core::tmux::friendly_error(
+        action, socket, session, raw,
+    ))
+}
+
 fn validate_name(name: &str) -> Result<(), DispatchError> {
     if name.is_empty() || name.contains('/') || name.contains('\\') {
         return Err(DispatchError::InvalidParams("無効なファイル名".into()));
@@ -15242,6 +15294,164 @@ mod tests {
         assert!(host.attached.is_empty());
     }
 
+    /// #1190 の e2e。実 tmux で kill / resize の socket 解決とエラー文面を確かめる。
+    /// `--socket` 明示は挙動不変、省略時に見つからなければ「どこを見たか」を日本語で返し、
+    /// tmux の生エラー（`error connecting to /private/tmp/tmux-<uid>/…`）は外へ出さない
+    #[test]
+    #[cfg(unix)]
+    fn issue1190_killとresizeのソケット解決とエラー文面() {
+        if !tako_core::tmux::version_announcement()
+            .is_some_and(tako_core::tmux::announces_only_tmux)
+        {
+            eprintln!("skip: 本物の tmux が無い環境");
+            return;
+        }
+        let socket = format!("tako-e2e-1190-{}", std::process::id());
+
+        struct Guard(String);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                // サーバーごと落とし、ソケットファイルも消す（残骸を /tmp へ溜めない。#1192）
+                tako_core::tmux_backend::kill_server(&self.0);
+            }
+        }
+        let _guard = Guard(socket.clone());
+        let tmux = |args: &[&str]| {
+            tako_core::tmux::tmux_command(Some(&socket))
+                .args(args)
+                .output()
+                .expect("tmux を実行できる")
+        };
+        let windows = || -> Vec<u32> {
+            let out = tmux(&[
+                "list-windows",
+                "-t",
+                &tako_core::tmux::exact_target("killme"),
+                "-F",
+                "#{window_index}",
+            ]);
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .collect()
+        };
+
+        assert!(
+            tmux(&["new-session", "-d", "-s", "killme", "-x", "100", "-y", "40"])
+                .status
+                .success(),
+            "tmux new-session が失敗した"
+        );
+        tmux(&[
+            "new-window",
+            "-d",
+            "-t",
+            &tako_core::tmux::exact_target("killme"),
+        ]);
+        assert_eq!(windows(), vec![0, 1], "前提: window が 2 つ");
+
+        let mut host = MockHost::new();
+
+        // --socket 明示は挙動不変（window kill → セッションは残る）
+        let result = dispatch(
+            &mut host,
+            Request::TmuxKill {
+                socket: Some(socket.clone()),
+                session: "killme".into(),
+                window: Some(1),
+            },
+            PaneOrigin::Cli,
+        )
+        .expect("window kill は成功する");
+        assert_eq!(result["socket"].as_str(), Some(socket.as_str()));
+        assert_eq!(windows(), vec![0], "window 1 が消えていない");
+
+        // resize も同じ経路（応答に解決後の socket が入る）
+        let result = dispatch(
+            &mut host,
+            Request::TmuxResize {
+                socket: Some(socket.clone()),
+                session: "killme".into(),
+                window: 0,
+                cols: Some(60),
+                rows: Some(15),
+                reset: false,
+            },
+            PaneOrigin::Cli,
+        )
+        .expect("resize は成功する");
+        assert_eq!(result["socket"].as_str(), Some(socket.as_str()));
+
+        // 存在しないサーバーを明示 → 生の英語とソケットパスを出さない
+        let err = dispatch(
+            &mut host,
+            Request::TmuxResize {
+                socket: Some(format!("tako-no-such-server-{}", std::process::id())),
+                session: "killme".into(),
+                window: 0,
+                cols: Some(80),
+                rows: Some(24),
+                reset: false,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        let DispatchError::Operation(message) = err else {
+            panic!("Operation エラーでない: {err:?}");
+        };
+        assert!(
+            message.contains("window 0 のリサイズに失敗した"),
+            "{message}"
+        );
+        assert!(message.contains("動いていない"), "{message}");
+        assert!(
+            !message.contains('/'),
+            "ソケットパスが露出している: {message}"
+        );
+        assert!(
+            !message.to_ascii_lowercase().contains("error connecting"),
+            "生の tmux メッセージが素通しになっている: {message}"
+        );
+
+        // socket 省略 + どこにも無いセッション → 「どこを見たか」を日本語で返す
+        let missing = format!("tako-nowhere-{}", std::process::id());
+        let err = dispatch(
+            &mut host,
+            Request::TmuxKill {
+                socket: None,
+                session: missing.clone(),
+                window: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        let DispatchError::Operation(message) = err else {
+            panic!("Operation エラーでない: {err:?}");
+        };
+        assert!(message.contains(&missing), "{message}");
+        assert!(
+            message.contains("既定サーバー") && message.contains("tako バックエンド"),
+            "どこを見たかが書かれていない: {message}"
+        );
+        assert!(!message.contains('/'), "パスが露出している: {message}");
+
+        // セッションごと kill（明示 socket）
+        dispatch(
+            &mut host,
+            Request::TmuxKill {
+                socket: Some(socket.clone()),
+                session: "killme".into(),
+                window: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .expect("session kill は成功する");
+        assert!(
+            !tako_core::tmux::has_session(Some(&socket), "killme"),
+            "セッションが残っている"
+        );
+    }
+
     /// #1185 の e2e。実 tmux で「3 window の自前セッションを取り込んだペイン」を作り、
     /// `select-window` が**内側**（取り込んだセッションの表示用ラッパー）へ届くことを
     /// tmux 側の `window_active` で実測する。外側の backend セッションを対象にしていた
@@ -15261,9 +15471,8 @@ mod tests {
         struct Guard(String);
         impl Drop for Guard {
             fn drop(&mut self) {
-                let _ = tako_core::tmux::tmux_command(Some(&self.0))
-                    .arg("kill-server")
-                    .output();
+                // サーバーごと落とし、ソケットファイルも消す（残骸を /tmp へ溜めない。#1192）
+                tako_core::tmux_backend::kill_server(&self.0);
             }
         }
         let _guard = Guard(socket.clone());
