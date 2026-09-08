@@ -1367,10 +1367,28 @@ fn dispatch_inner(
         }
 
         Request::TmuxCleanup { socket } => {
-            // socket 省略時は tako バックエンドサーバーを対象にする（取り残しの主因）
-            let _ = socket; // 現状は backend socket 固定（host が protected を解決して実行）
-            let killed = host.cleanup_orphan_tmux();
-            Ok(json!({ "killed": killed }))
+            // socket 省略時は tako バックエンドサーバーを対象にする（取り残しの主因）。
+            // #1187: 以前はここで `let _ = socket;` と捨てていた（ヘルプは受け付けると
+            // 書いてあるのに常に自分の backend しか見ない = 黙って無視していた）
+            let mut requested = socket.as_deref();
+            if tako_core::tmux_cleanup::legacy_1187() {
+                requested = None; // A/B: 修正前は引数をここで捨てていた
+            }
+            let report = host.cleanup_orphan_tmux(requested);
+            // #1187: 見送りは応答と persist.log の両方に理由を残す（空配列だけを返すと
+            // 呼び出し側が「掃除するものが無かった」と区別できない）
+            if let Some(line) = report.log_line(tako_core::tmux_cleanup::CleanupScope::Explicit) {
+                crate::diag::persist_log(&line);
+            }
+            if tako_core::tmux_cleanup::legacy_1187() {
+                return Ok(json!({ "killed": report.killed }));
+            }
+            Ok(json!({
+                "socket": report.socket,
+                "killed": report.killed,
+                "skipped": report.skipped.as_ref().map(|s| s.code()),
+                "detail": report.skipped.as_ref().map(|s| s.detail()),
+            }))
         }
 
         Request::TabRename {
@@ -12453,6 +12471,10 @@ mod tests {
         sessions: std::collections::HashMap<u64, TerminalSession>,
         /// #1132: タブ内容領域の幅（桁。実測の代役）。None = 実測が無い
         tab_cols: Option<f32>,
+        /// #1187: cleanup が受け取ったソケット（`--socket` が届いているかの検証用）と、
+        /// 返させる結果
+        cleanup_socket: std::cell::RefCell<Vec<Option<String>>>,
+        cleanup_report: Option<tako_core::tmux_cleanup::CleanupReport>,
     }
 
     impl MockHost {
@@ -12489,6 +12511,8 @@ mod tests {
                 backend_sessions: std::collections::HashMap::new(),
                 sessions: std::collections::HashMap::new(),
                 tab_cols: None,
+                cleanup_socket: std::cell::RefCell::new(Vec::new()),
+                cleanup_report: None,
                 welcome_banner: false,
                 autosuggest: true,
                 autosuggest_hint: true,
@@ -12559,6 +12583,18 @@ mod tests {
     impl TmuxHost for MockHost {
         fn backend_session(&self, pane: PaneId) -> Option<String> {
             self.backend_sessions.get(&pane.as_u64()).cloned()
+        }
+        /// #1187: 受け取ったソケットを記録し、仕込んだ結果を返す
+        fn cleanup_orphan_tmux(
+            &self,
+            socket: Option<&str>,
+        ) -> tako_core::tmux_cleanup::CleanupReport {
+            self.cleanup_socket
+                .borrow_mut()
+                .push(socket.map(str::to_string));
+            self.cleanup_report.clone().unwrap_or_else(|| {
+                tako_core::tmux_cleanup::CleanupReport::killed(socket.unwrap_or("tako"), Vec::new())
+            })
         }
         fn tmux_tab_collapsed(&self, tab: TabId) -> bool {
             self.collapsed.contains(&tab.as_u64())
@@ -12837,6 +12873,66 @@ mod tests {
         .unwrap()["pane"]
             .as_u64()
             .unwrap()
+    }
+
+    /// #1187: `--socket` が host まで届くこと（旧実装は `let _ = socket;` で捨てていた）。
+    /// A/B は `TAKO_1187_LEGACY=1`（= 修正前）で socket が None に落ちることで示す
+    #[test]
+    fn issue1187_cleanupはsocketをhostへ渡す() {
+        let mut host = MockHost::new();
+        host.cleanup_report = Some(tako_core::tmux_cleanup::CleanupReport::killed(
+            "other-server",
+            vec!["tako-orphan-aaa".into()],
+        ));
+        let out = dispatch(
+            &mut host,
+            Request::TmuxCleanup {
+                socket: Some("other-server".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(
+            host.cleanup_socket.borrow().as_slice(),
+            &[Some("other-server".to_string())],
+            "--socket が host へ届いていない（#1187 の `let _ = socket;`）"
+        );
+        assert_eq!(
+            out["socket"], "other-server",
+            "応答が対象ソケットを言わない"
+        );
+        assert_eq!(out["killed"][0], "tako-orphan-aaa");
+        assert!(out["skipped"].is_null(), "掃除できたのに見送り扱い");
+    }
+
+    /// #1187: 見送ったときは理由が応答に載る（空配列だけだと呼び出し側が
+    /// 「掃除するものが無かった」と区別できないのが本質的な問題だった）
+    #[test]
+    fn issue1187_見送りの理由が応答に載る() {
+        let mut host = MockHost::new();
+        host.cleanup_report = Some(tako_core::tmux_cleanup::CleanupReport::skipped(
+            "tako",
+            tako_core::tmux_cleanup::CleanupSkip::PeerSharesSocket {
+                pids: vec![71082],
+                socket: "tako".into(),
+            },
+        ));
+        let out = dispatch(
+            &mut host,
+            Request::TmuxCleanup { socket: None },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(out["killed"].as_array().map(Vec::len), Some(0));
+        assert_eq!(
+            out["skipped"], "peer_shares_socket",
+            "見送りの理由コードが応答に無い"
+        );
+        let detail = out["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("71082") && detail.contains("tako"),
+            "理由に pid / ソケットが入っていない: {detail}"
+        );
     }
 
     /// #1002: モデル一覧は dispatch を通るので CLI・MCP・GUI が同じペイロードを見る。
