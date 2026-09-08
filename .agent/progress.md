@@ -102,3 +102,8 @@
 - #943 の前提ガードを外し「ミラーが立つまで待つ + 期待値の出どころを器で切り替える」へ（`settle_scroll_mirror` は `subline` 節と 1 実装）
 - 器つき `mirrored=true mirror_pos=0.500 fract=0.500 shift=17 expected=17` = 直接ペインと全数値一致・両方 `TAKO_VISUAL_TEST_OK`（checkpoint 122）
 - A/B `TAKO_943_LEGACY=1` は #943 の報告と同一数値で FAILED / 注入 `nofract` は上限待ちで FAILED / 番犬 1 本追加 / 全 3588 件緑
+
+## 2026-09-08（#1175: 101c の引き継ぎ到達判定を後任の transcript から採るようにした）
+- 引き継ぎ本文は claude の TUI で 1 度だけ流れる User 発話なので `visible_lines()` 判定は後任が長く働くほど確実に落ちていた。証拠源を `chat_state` の発話へ移し、`saw_done` は Assistant 限定に（旧は手順書の「引き継ぎ完了」を後任の申告と誤読）。前提（GUI / persist）は項目内で上げて戻すので起動レシピは不変
+- 実 claude e2e 2 回連続 OK（`chat=1/6`・`1/5`・load 2.5〜3.0）/ `TAKO_1175_LEGACY=1` は Issue と同じ `saw_marker=false` で FAILED / `INJECT=nomarker` は新経路でも FAILED
+- 番犬 `実claudeの発話をビューポートで判定していない`（修正前の 52907 / 52908 を名指し）+ 純粋関数の単体 5 本。全 3595 件緑

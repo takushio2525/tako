@@ -52910,11 +52910,17 @@ mod self_test {
                             ),
                         );
                     }
-                    // 証拠源（後任の transcript）を立ち上げる（#1175）。`chat_state` を
-                    // 埋める定期更新（`collect_chat_targets`）は **GUI モードでしか
-                    // 回らない**ので、101c のあいだだけ GUI にする（項目 95c が
-                    // transcript を見るときと同じ前提）。直前の項目 100 が Terminal へ
-                    // 戻しているため、明示しないと `chat_state` は永久に None になる
+                    // 証拠源（後任の transcript）の前提を**この項目のあいだだけ**作る
+                    // （#1175。項目 95c / 97c が実 claude を見るときと同じ形）。2 つ要る:
+                    //
+                    // ① **GUI モード**: `chat_state` を埋める定期更新
+                    //    （`collect_chat_targets`）は GUI でしか回らない。直前の項目 100 が
+                    //    Terminal へ戻しているので、明示しないと永久に None になる
+                    // ② **persist（tmux バックエンド）**: チャットの live 解決は
+                    //    バックエンドセッション名をキーにするので、器が無いと後任の
+                    //    claude セッションに辿り着けない。セルフテストは persist 既定 OFF
+                    //    （`TAKO_ISOLATED=1` が `TAKO_PERSIST=0` を置く）なので、
+                    //    **起動レシピに前提を負わせず**ここで ON にする
                     let restore_ui_mode = window
                         .update(cx, |app, _, cx| {
                             let before = app.ui_mode;
@@ -52923,6 +52929,25 @@ mod self_test {
                             before
                         })
                         .unwrap_or(tako_core::ui_mode::UiMode::Terminal);
+                    let set_persist = |app: &mut TakoApp, enabled: Option<bool>| {
+                        tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Persist { enabled },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                        .and_then(|v| v["enabled"].as_bool())
+                    };
+                    let restore_persist = window
+                        .update(cx, |app, _, _| set_persist(app, None))
+                        .ok()
+                        .flatten();
+                    let backend_on = tako_core::backend::capabilities().survives_app_exit
+                        && window
+                            .update(cx, |app, _, _| set_persist(app, Some(true)))
+                            .ok()
+                            .flatten()
+                            == Some(true);
                     // 前任は「閾値超過を模擬した ctx 55% の master ペイン」（上で作ったもの）
                     let handoff = fire(
                         Req::OrchestratorHandoff {
@@ -53055,7 +53080,8 @@ mod self_test {
                     println!(
                         "101c-CLAUDE: closed={closed} saw_marker={saw_marker} \
                          saw_done={saw_done} prompt_flow={prompt_flow} \
-                         marker_source={marker_source} chat={chat} inject={inject_1175:?}"
+                         marker_source={marker_source} chat={chat} backend={backend_on} \
+                         inject={inject_1175:?}"
                     );
                     // 判定根拠の画面証跡（成否に関わらず。項目 45c の `45c-SCREEN` と同型）。
                     // `saw_marker=false` の切り分けには**後任が何を出したか**が要る:
@@ -53098,9 +53124,12 @@ mod self_test {
                         },
                         cx,
                     );
-                    // 証拠源のために上げた GUI モードを戻す（#1175）
+                    // 証拠源のために変えた前提（GUI モード / persist）を戻す（#1175）
                     let _ = window.update(cx, |app, _, cx| {
                         app.ui_mode = restore_ui_mode;
+                        if let Some(before) = restore_persist {
+                            set_persist(app, Some(before));
+                        }
                         cx.notify();
                     });
                 }
