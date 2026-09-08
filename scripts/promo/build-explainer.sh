@@ -64,6 +64,32 @@ beat_time() {
 narr_dur() { awk -F'\t' -v id="$1" '$1==id {print $2; exit}' "$NARR_DIR/durations.tsv"; }
 fnum() { /usr/bin/python3 -c "print(f'{$1:.3f}')"; }
 
+# ── 前提の検査（エンコードの前に落ちる）─────────────────────────────
+# **区間を飛ばしたまま完成品を作らない**（#1081）。飛ばしても警告 1 行で先へ進む形だと、
+# 素材やビート表が欠けた回に「尺だけ短い、それらしい動画」が出来てしまう
+# （2026-09-09 実測: 中断したテイクが `<scene>-beats.tsv` を空にしていたので、
+# そのまま組めば GUI 章の 11 区間が丸ごと落ちた動画になっていた）。
+# 制作中に部分ビルドをしたいときだけ `TAKO_PROMO_ALLOW_MISSING=1` を付ける
+preflight=()
+while IFS=$'\t' read -r id kind source anchor offset min_dur caption subtitle speech; do
+    [ "$kind" = clip ] || continue
+    source=$(promo_tl_field "$source")
+    if [ ! -f "$SCENES_DIR/$source-raw.mp4" ]; then
+        preflight+=("${id}: 素材 ${source}-raw.mp4 が無い"); continue
+    fi
+    beat_time "$source" "$anchor" >/dev/null 2>&1 \
+        || preflight+=("${id}: ビート ${anchor} が ${source}-beats.tsv に無い")
+done < <(promo_timeline_rows "$TSV")
+if [ "${#preflight[@]}" -gt 0 ]; then
+    printf '!! %s\n' "${preflight[@]}" >&2
+    if [ "${TAKO_PROMO_ALLOW_MISSING:-0}" != 1 ]; then
+        echo "ERROR: ${#preflight[@]} 区間の前提が欠けている。飛ばしたまま完成品は作らない" >&2
+        echo "       （制作中に部分ビルドをしたいときは TAKO_PROMO_ALLOW_MISSING=1）" >&2
+        exit 1
+    fi
+    echo "!! TAKO_PROMO_ALLOW_MISSING=1: ${#preflight[@]} 区間を飛ばして続ける" >&2
+fi
+
 parts=(); ids=(); starts=(); durs=(); missing=()
 idx=0; cursor=0
 while IFS=$'\t' read -r id kind source anchor offset min_dur caption subtitle speech; do
