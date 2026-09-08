@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-09（#1190: kill / resize の既定ソケットを list と揃え、tmux の生エラーを包んだ）
-- `socket` 省略時の解決を `tako_core::tmux::resolve_session_socket`（既定サーバー → tako バックエンド = list の並び）へ集約し、`kill` / `resize` / `open` の 3 つで共有。応答に解決後の `socket` を追加
-- 生 stderr は `friendly_error` で日本語へ（4 分類 + `scrub_paths` で絶対パスを伏せる）。**kill 前の確認 / `--force` は #1196 の担当で入れていない**（省略でも backend へ届くようになった）
-- 隔離 GUI 実測: `--socket` 省略の resize が 80x24 → 60x15・kill --window 1 が届いてセッションは生存 / A/B `TAKO_1190_LEGACY=1` は Issue と同じ `error connecting to /private/tmp/tmux-<uid>/default` を再現
-
 ## 2026-09-09（#925: 導入計画の権限説明を platform で出し分けた）
 - `InstallPlan` に `platform: Platform` を足し（出どころは `InstallRecipe::platform`）、権限行を純粋関数 `privilege_line(platform)` へ。unix = `sudo（管理者権限）は使いません…` / Windows = `管理者権限は使いません…`
 - `visible_texts()`（計画の表示 + 引き継ぎ指示文）を用意し「Windows に unix 固有語が出ない」を GUI 無しで固定。`to_json` に `platform` を追加
@@ -85,3 +80,8 @@
 - 真因は 2 つ: ①`claude agents --json` のスキャン結果でマップを丸ごと置き換え（+ 子プロセス不在で全消し）ていたので、**再起動直後の数秒**で `layout.json` の `claude_session_id` を全部捨てていた（実測: 復元直後 6 件 → 6 秒後 0 件）②復元だけが独自の最小形 `claude --resume <id>` を組んでいて役割 env / `--model` / `--effort` が落ちていた
 - 保持規則を `tako_core::claude_resume::ResumeIds`（**確認してから外す**）へ、判断とコマンドを `tako_control::sessions::restore_plan`（`resume_command` と共有）へ集約。`persist.log` に「復元の内訳」（役割つき / 役割なし / 新規シェルの理由 3 分類）を 1 行追加
 - 隔離 GUI 実測: 修正後は 76 秒後も 6 件のまま・実会話が resume されて継続（`⏺ repro-1076`）/ A/B `TAKO_1076_LEGACY=1` は同じ layout で 6 秒後 0 件 + `役割つき 0`。再 attach（8 ペイン）に回帰なし。番犬 4 本（修正前ソースで全滅）+ 単体 15 本。全 3766 件緑
+
+## 2026-09-09（#986: codex / agy worker から tako の MCP を呼べるようにした）
+- codex は spawn の起動コマンドへ `-c mcp_servers.tako.*` を一時注入（正本 `agent::codex_mcp_args` を master / worker / git resolve が共有）。`caller_pane` は `TAKO_PANE_ID` が無ければ **pid 祖先辿り**へ落ちる（`tako mcp serve` → `Request::ResolvePane`）
+- 実測（隔離 GUI + tako-vd / codex-cli 0.153.0 / agy 1.1.27）: 実 worker が `tako_list_panes` を呼び、**pane 省略**の `tako_set_title` が codex=pane2 / agy=pane3 と自分のペインへ当たった。効いている経路は env の指紋で判別（一時注入 5 個 / 恒久登録 4 個）。同時 2 本でも取り違えなし
+- Issue の前提「agy は親 env を渡さない」は**実測で否定**（`TAKO_*` が 15 個届く）ので docs / コメントを訂正。番犬 3 本 + 単体 9 本、A/B は `TAKO_986_LEGACY=1`。全 3775 件緑
