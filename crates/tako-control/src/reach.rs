@@ -173,6 +173,121 @@ pub fn detached_capture(hint: &str) -> Option<(SessionRef, &'static dyn Detached
     Some((session, capture))
 }
 
+// --- ダイアログ応答の到達（#1200） -----------------------------------------
+
+/// 選択肢ダイアログへ「画面を読んでキーを送る」ための口（#1200）。
+///
+/// 応答の手順（検知 → 番号 / カーソル移動 → 着地の検証 → 解消の検証）は
+/// [`crate::dispatch::respond_via`] の 1 実装が持ち、**届き方だけ**を
+/// ここで差し替える。実装は 2 つ:
+///
+/// - **in-process**: tako-app が当該ペインの `TerminalSession` を持っている（主経路）。
+///   画面はメモリ上のグリッド、キーは PTY へ直接書く
+/// - **detached**: tako-app が持っていない（GUI 不在・ペイン消失）。器の
+///   [`tako_core::backend::DetachedAccess`] 越しに届く
+///
+/// **in-process を先に試すのが不変条件**（#1200）。旧実装はこの口を持たず
+/// detached へ直行していたので、器が入力送出を持たない環境（psmux = Windows）では
+/// **生きているペインに対して必ず失敗**していた（tmux は `send-keys` で
+/// アウトオブプロセスにも送れるので macOS では隠れていた）
+pub trait DialogAccess {
+    /// ペインの可視画面（装飾なしの行）
+    fn capture(&self) -> Result<Vec<String>, String>;
+    /// キー名（`Enter` / `Down` / `1` 等）での送出
+    fn send_key(&self, key: &str) -> Result<(), String>;
+    /// 診断・監査ログ用の経路名（`in-process` / `detached`）
+    fn route(&self) -> &'static str;
+}
+
+/// tako-app が保持しているペインへの実装（主経路）。
+///
+/// 画面はメモリ上のグリッド、キーは PTY へ直接書く。器へ問い合わせないので、
+/// 器が入力送出を持たない環境（psmux = Windows）でも届く
+pub struct LiveDialogAccess(tako_core::PaneAccess);
+
+impl LiveDialogAccess {
+    pub fn new(access: tako_core::PaneAccess) -> Self {
+        Self(access)
+    }
+}
+
+impl DialogAccess for LiveDialogAccess {
+    fn capture(&self) -> Result<Vec<String>, String> {
+        Ok(self.0.visible_lines())
+    }
+
+    fn send_key(&self, key: &str) -> Result<(), String> {
+        // キー名の語彙は器側（`send-keys`）と共通。落とせない名前は**推測しない**
+        // （適当なバイト列を送るとダイアログを誤操作する）
+        let bytes = tako_core::backend::key_name_bytes(key)
+            .ok_or_else(|| format!("キー名 {key} をバイト列へ落とせない"))?;
+        self.0.write(bytes);
+        Ok(())
+    }
+
+    fn route(&self) -> &'static str {
+        "in-process"
+    }
+}
+
+/// 器越し（アウトオブプロセス）の実装
+pub struct DetachedDialogAccess {
+    session: SessionRef,
+    access: &'static dyn DetachedAccess,
+}
+
+impl DetachedDialogAccess {
+    pub fn new(session: SessionRef, access: &'static dyn DetachedAccess) -> Self {
+        Self { session, access }
+    }
+}
+
+impl DialogAccess for DetachedDialogAccess {
+    fn capture(&self) -> Result<Vec<String>, String> {
+        self.access
+            .capture_screen(&self.session)
+            .map_err(|e| e.to_string())
+    }
+
+    fn send_key(&self, key: &str) -> Result<(), String> {
+        self.access
+            .send_key(&self.session, key)
+            .map_err(|e| e.to_string())
+    }
+
+    fn route(&self) -> &'static str {
+        "detached"
+    }
+}
+
+/// ダイアログ応答の届き方を決める（#1200）。
+///
+/// **in-process を必ず先に見る**。`session_hint` は器のセッション名で、
+/// in-process で見つからないときだけ使う
+pub fn dialog_access(
+    host: &dyn ControlHost,
+    pane: u64,
+    session_hint: Option<&str>,
+) -> Result<Box<dyn DialogAccess>, UnreachableReason> {
+    if let Some(session) = host.session(PaneId::from_raw(pane)) {
+        return Ok(Box::new(LiveDialogAccess::new(session.access())));
+    }
+    let Some(hint) = session_hint.filter(|s| !s.is_empty()) else {
+        return Err(UnreachableReason::NoSession(pane));
+    };
+    let session = SessionRef::new(hint).map_err(|e| UnreachableReason::InvalidSession {
+        hint: hint.to_string(),
+        note: e.to_string(),
+    })?;
+    match backend().detached() {
+        Some(access) => Ok(Box::new(DetachedDialogAccess::new(session, access))),
+        None => Err(UnreachableReason::NoDetachedAccess {
+            session: session.into_string(),
+            note: no_detached_access_note(),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

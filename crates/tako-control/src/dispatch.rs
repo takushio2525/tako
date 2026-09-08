@@ -9689,43 +9689,70 @@ fn dispatch_orchestrator_respond(
 ) -> Result<Value, DispatchError> {
     let target = PaneId::from_raw(pane_id);
 
-    // バックエンドセッションの取得
-    let backend_session = host.backend_session(target).ok_or_else(|| {
-        DispatchError::Operation(format!(
-            "ペイン {pane_id} のバックエンドセッションが見つからない"
-        ))
-    })?;
-    respond_to_choice_dialog(&backend_session, pane_id, choice, caller_role)
+    // `TAKO_1200_LEGACY=1` で **#1200 前の挙動**（バックエンドセッション名を必須にして
+    // 器越しへ直行）へ戻す。同一バイナリで A/B を取る入口
+    if std::env::var_os("TAKO_1200_LEGACY").is_some() {
+        let backend_session = host.backend_session(target).ok_or_else(|| {
+            DispatchError::Operation(format!(
+                "ペイン {pane_id} のバックエンドセッションが見つからない"
+            ))
+        })?;
+        return respond_to_choice_dialog(&backend_session, pane_id, choice, caller_role);
+    }
+    // #1200: **in-process を先に見る**。旧実装はバックエンドセッション名を必須にして
+    // detached へ直行していたので、(a) 器が入力送出を持たない環境（psmux = Windows）では
+    // 生きているペインに対して必ず失敗し、(b) 器なしのペインには最初から応答できなかった
+    let access =
+        crate::reach::dialog_access(host, pane_id, host.backend_session(target).as_deref())
+            .map_err(|reason| DispatchError::Operation(reason.note()))?;
+    respond_via(access.as_ref(), pane_id, choice, caller_role)
 }
 
-/// 選択肢ダイアログへの応答本体（ホスト非依存）。
+/// 器越し（アウトオブプロセス）でダイアログへ応答する入口。
 ///
-/// `ControlHost` を必要とするのはバックエンドセッション名の解決だけなので、
-/// そこを引数で受け取る形に切り出してある。おかげで GUI の**バックグラウンド
-/// スレッド**からも同じ経路（同じ検証・同じ persist.log 監査）で応答できる
-/// （#813 の自動復帰。この関数はキー送出のたびに数百 ms スリープするので
-/// UI スレッドから呼んではいけない）
+/// `ControlHost` を持たない呼び出し元（GUI のバックグラウンドスレッド）のために
+/// **セッション名だけ**で呼べる形を残してある。この関数はキー送出のたびに
+/// 数百 ms スリープするので UI スレッドから呼んではいけない。
+///
+/// **#1200 以降、tako-app が保持しているペインへはこちらを使わない**
+/// （器が入力送出を持たない環境では届かない）。`dispatch` は
+/// [`crate::reach::dialog_access`] で in-process を先に見て [`respond_via`] を呼ぶ
 pub fn respond_to_choice_dialog(
     backend_session: &str,
     pane_id: u64,
     choice: Option<&str>,
     caller_role: Option<&str>,
 ) -> Result<Value, DispatchError> {
-    let backend_session = backend_session.to_string();
-    // 画面からダイアログの存在を検証。
-    // GUI 不在でも応答できることが本 API の意義なので、到達手段は backend 側に依存する
-    let (session, access) = crate::reach::detached_session(&backend_session).ok_or_else(|| {
+    // 器越しの経路（GUI 不在・ペイン消失）。ホストを持たない呼び出し元（#813 の
+    // 自動復帰はバックグラウンドスレッドで走る）用の入口
+    let (session, detached) = crate::reach::detached_session(backend_session).ok_or_else(|| {
         DispatchError::Operation(
             crate::reach::UnreachableReason::NoDetachedAccess {
-                session: backend_session.clone(),
+                session: backend_session.to_string(),
                 note: crate::reach::no_detached_access_note(),
             }
             .note(),
         )
     })?;
+    let access = crate::reach::DetachedDialogAccess::new(session, detached);
+    respond_via(&access, pane_id, choice, caller_role)
+}
+
+/// 応答の手順そのもの（#1200 で届き方を [`crate::reach::DialogAccess`] へ出した）。
+///
+/// in-process（tako-app が保持しているペイン）と detached（器越し）で
+/// **同じ検証・同じ persist.log の監査**を通す。ここを 1 実装に保つのが要点で、
+/// 経路ごとに書き分けると「macOS では番号キーで確定するが Windows では Enter も要る」
+/// のような差が構造的に生まれる
+pub fn respond_via(
+    access: &dyn crate::reach::DialogAccess,
+    pane_id: u64,
+    choice: Option<&str>,
+    caller_role: Option<&str>,
+) -> Result<Value, DispatchError> {
     let capture = || -> Result<Vec<String>, DispatchError> {
         access
-            .capture_screen(&session)
+            .capture()
             .map_err(|e| DispatchError::Operation(format!("画面の取得に失敗: {e}")))
     };
     let lines = capture()?;
@@ -9764,7 +9791,7 @@ pub fn respond_to_choice_dialog(
     let mut keys_sent: Vec<String> = Vec::new();
     let send = |key: &str| -> Result<(), DispatchError> {
         access
-            .send_key(&session, key)
+            .send_key(key)
             .map_err(|e| DispatchError::Operation(format!("キー {key} の送信に失敗: {e}")))
     };
     if dialog.numbered {
@@ -9843,7 +9870,8 @@ pub fn respond_to_choice_dialog(
     // 監査記録（persist.log。ペイン出力自体はキー入力の結果として画面に残る）
     let caller = caller_role.unwrap_or("unknown");
     crate::diag::persist_log(&format!(
-        "[dialog-respond] caller={caller} pane={pane_id} kind={} choice={} ({}) keys={} resolved={resolved} stray={stray_input} title={}",
+        "[dialog-respond] caller={caller} route={} pane={pane_id} kind={} choice={} ({}) keys={} resolved={resolved} stray={stray_input} title={}",
+        access.route(),
         dialog.kind.as_str(),
         index + 1,
         chosen.label,
@@ -20004,6 +20032,95 @@ mod tests {
         let can = &list["tabs"][0]["panes"][0]["can_ssh"];
         assert_eq!(can["ok"], false, "エージェントのペインは対象外");
         assert_eq!(can["reason"], "agent_role");
+    }
+
+    /// #1200 の核心: **tako-app が保持しているペインは detached へ倒れない**。
+    ///
+    /// 旧実装は `respond` の入口でバックエンドセッション名を必須にし、器越しの
+    /// 到達手段（`DetachedAccess`）へ直行していた。器が入力送出を持たない環境
+    /// （psmux = Windows）では生きているペインに対して必ず失敗し、器なしのペインには
+    /// 最初から応答できなかった（tmux は `send-keys` で out-of-process にも送れるので
+    /// macOS では隠れていた）。
+    ///
+    /// ここでは**実在しないバックエンドセッション名**を持たせる。器越しへ倒れたら
+    /// どちらのプラットフォームでも失敗する（tmux = 採取が失敗 / psmux = 到達手段なし）
+    #[test]
+    fn respondは保持しているペインへin_process経路で届く() {
+        let mut host = MockHost::new();
+        let tab_id = host.workspace().active_tab_id();
+        let pane_id = host.workspace().get_tab(tab_id).unwrap().tree().focused();
+
+        // 選択肢ダイアログを描いて保持するペイン（claude の usage_limit と同じ形）。
+        // 素のシェルへ**打ち込む**のはセルフテスト項目 748 と同じ形（方言は
+        // `shell_dialect` が選ぶので macOS / Windows の両方で同じ絵になる）
+        let (session, _rx) = TerminalSession::spawn(80, 24, SpawnOptions::default())
+            .expect("既定シェルの PTY を張れる");
+        let Some(sh) = tako_core::platform::shell_dialect::for_default_shell() else {
+            eprintln!("skip: 既定シェルの方言を決められない");
+            return;
+        };
+        let dialog_cmd = sh.paint_and_hold(
+            concat!(
+                "\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\n",
+                "   What do you want to do?\n\n",
+                "   \u{276f} 1. Stop and wait for limit to reset\n",
+                "     2. Upgrade to Max 20x for higher session limits every month\n\n",
+                "   Enter to confirm\n",
+            ),
+            30,
+        );
+        // プロンプトが出てから打つ（出る前に打つと行が食われる）
+        let ready = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while session.visible_lines().iter().all(|l| l.trim().is_empty())
+            && std::time::Instant::now() < ready
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        session.write(format!("{dialog_cmd}\r").into_bytes());
+        host.sessions.insert(pane_id.as_u64(), session);
+        // **実在しない**器のセッション名（器越しへ倒れたら必ず失敗する）
+        host.backend_sessions
+            .insert(pane_id.as_u64(), "tako-1200-no-such-session".to_string());
+
+        // 画面にダイアログが出るまで待つ（描画は PTY 経由なので即時ではない）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let seen = host
+                .sessions
+                .get(&pane_id.as_u64())
+                .map(|s| s.visible_lines())
+                .map(|lines| crate::claude_tui::detect_choice_dialog(&lines).is_some())
+                .unwrap_or(false);
+            if seen || std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let probe = dispatch(
+            &mut host,
+            Request::OrchestratorRespond {
+                pane_id: pane_id.as_u64(),
+                choice: None,
+                caller_role: Some("test".into()),
+            },
+            PaneOrigin::Cli,
+        );
+        let screen = host
+            .sessions
+            .get(&pane_id.as_u64())
+            .map(|s| s.visible_lines().join("\n"))
+            .unwrap_or_default();
+        let probe = probe.unwrap_or_else(|e| {
+            panic!("in-process 経路で応答できていない（#1200。器越しへ倒れている）: {e}\n{screen}")
+        });
+        assert_eq!(probe["responded"], false, "下見は送信しない");
+        assert_eq!(probe["kind"], "usage_limit", "{screen}");
+        assert_eq!(
+            probe["options"].as_array().map(Vec::len),
+            Some(2),
+            "選択肢を 2 つ読めていない\n{screen}"
+        );
     }
 
     #[test]

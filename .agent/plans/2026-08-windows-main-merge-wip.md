@@ -4362,3 +4362,43 @@ tmux は OSC を素通しするので側路そのものが張られない。
 明示して `schtasks /it` で session 1 へ。**器のプロセス名は `tmux.exe`** なので
 `Get-Process psmux` では 0 件に見える（`Get-CimInstance Win32_Process -Filter "Name='tmux.exe'"` で見る）。
 側路の中身は 16 進で見る（`[System.IO.File]::ReadAllBytes` + 可読化）。
+
+## #1200 の記録（`orchestrator respond` が生きているペインへ届かない。2026-09-09）
+
+**症状**: master が起こした claude のペイン（tako-app が保持している前面のペイン）へ
+`tako orchestrator respond --pane 1 --choice 1` を打つと必ず
+
+```
+error: セッション tako-<id> へ届かない: 永続バックエンド（psmux）はアウトオブプロセスの画面採取だけができ、
+入力送出はできないため、tako-app が保持していないペインへはキーを送れない
+```
+
+= **機能不能**（master が worker のダイアログへ答えられない）。同じペインへの `tako send` は通る。
+
+### 真因は「到達判定の取りこぼし」ではなく「到達判定を通っていなかった」
+
+`respond` は入口でバックエンドセッション名を必須にし、`reach::detached_session` へ**直行**していた
+（`PaneReach` を通っていない = in-process を一度も試さない）。tmux は `send-keys` で
+アウトオブプロセスにも送れるので macOS では成功してしまい、psmux は `detached_capture` を持つが
+**入力送出を持たない**ので Windows でだけ表面化した。器なしのペイン（`TAKO_PERSIST=0`）には
+最初から応答できず、**セルフテストの respond 項目はそれで skip されていた**
+（`（バックエンドセッション不在のため respond 下見をスキップ）`）。
+
+### 直し方（届き方を型で分ける）
+
+- `reach::DialogAccess` = 「画面を読む」「キーを送る」の 2 手だけ。実装は
+  `LiveDialogAccess`（in-process。グリッドを読み PTY へ書く）と `DetachedDialogAccess`（器越し）
+- `reach::dialog_access` が**唯一の入口**で **in-process を先に**見る
+- 応答の手順（検知 → 確定 → 着地の検証 → 解消の検証 → 監査ログ）は `dispatch::respond_via` の
+  1 実装が両経路で共有する。監査ログに `route=in-process|detached` を残す
+- in-process のキー送出は `backend::key_name_bytes` でキー名をバイト列へ落とす
+  （落とせない名前は**推測せずエラー**）。`TerminalSession::access()` の `PaneAccess` は
+  スレッドを越えられるので、#813 の自動復帰（バックグラウンドで数百 ms スリープ）も同じ口を使える
+- 残る縮退（tako が保持していないペインへは Windows では届かない）は `platform::support` の
+  `tako_orchestrator_respond` を `Supported` → `Degraded` へ（根拠は実測）
+
+### 測り方
+
+実機の claude は `Login expired` なので、**疑似ダイアログ**（`paint_and_hold` で
+claude の usage_limit と同じ絵を描いて保持）で到達判定を決定的に測る。
+A/B は `TAKO_1200_LEGACY=1`（#1200 前の挙動 = 器越しへ直行）。

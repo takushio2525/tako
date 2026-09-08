@@ -913,6 +913,18 @@ impl TerminalSession {
         screen::snapshot_opts(&self.term.lock(), theme, show_cursor, fract)
     }
 
+    /// ペインへ**セッションを借りずに**画面を読み・キーを書く手を取り出す（#1200）。
+    ///
+    /// tako-app が保持しているペインへの応答（選択肢ダイアログ）は、器が入力送出を
+    /// 持たない環境（psmux）では**これが唯一の送り口**になる。`Send` なので
+    /// バックグラウンドスレッド（数百 ms のスリープを挟む応答ループ）からも使える
+    pub fn access(&self) -> PaneAccess {
+        PaneAccess {
+            term: self.term.clone(),
+            notifier: Notifier(self.notifier.0.clone()),
+        }
+    }
+
     /// 表示行を文字列で返す（装飾なし。セルフテスト・将来の `tako read` 用）
     pub fn visible_lines(&self) -> Vec<String> {
         self.screen(&Theme::default())
@@ -1634,6 +1646,45 @@ fn paste_payload(text: &str, bracketed: bool) -> Vec<u8> {
         out
     } else {
         normalized.as_bytes().to_vec()
+    }
+}
+
+/// tako-app が保持しているペインへの読み書きの手（#1200）。
+///
+/// [`TerminalSession::access`] で取り出す。**画面はメモリ上のグリッド**なので
+/// 器へ問い合わせない（psmux はアウトオブプロセスの入力送出を持たないので、
+/// ここが in-process ペインへの唯一の送り口になる）。
+///
+/// `TerminalSession` そのものは `&mut` を要る操作（`resize` / `feed_osc_bytes`）を
+/// 持つのでスレッドを越えられない。こちらは**共有できるものだけ**を持つ
+#[derive(Clone)]
+pub struct PaneAccess {
+    term: std::sync::Arc<FairMutex<Term<EventProxy>>>,
+    notifier: Notifier,
+}
+
+impl std::fmt::Debug for PaneAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PaneAccess")
+    }
+}
+
+impl PaneAccess {
+    /// 可視画面の行（装飾なし）。[`TerminalSession::visible_lines`] と同じ材料
+    pub fn visible_lines(&self) -> Vec<String> {
+        screen::snapshot_opts(&self.term.lock(), &Theme::default(), true, 0.0)
+            .lines
+            .into_iter()
+            .map(|l| l.text.trim_end().to_string())
+            .collect()
+    }
+
+    /// PTY へバイト列を書く。**スクロール位置は触らない**
+    /// （`TerminalSession::write` は最下部へ戻すが、ここは「いま画面に見えている
+    /// ダイアログへ 1 キー送る」用途なので、読んだ画面と送る先をずらさない）
+    pub fn write(&self, bytes: Vec<u8>) {
+        use alacritty_terminal::event::Notify;
+        self.notifier.notify(bytes);
     }
 }
 

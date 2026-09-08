@@ -318,6 +318,46 @@ GPUI の `AnimationElement` は、**アニメーションが終わっていな�
   器の label / 素通し設定の実値 / 置き場の期待値とセッションの実値 / サーバーの継承値 /
   器の同一性 / OSC 133 の状態 / ペイン末尾 / 待った時間 / load
 
+## 「届き方」は型で分け、in-process を先に見る（Issue #1200）
+
+ペインへ届く経路は 2 つしかない（`reach` の説明）。**tako-app が保持している
+（in-process）**か、**器越し（detached）**か。`PaneReach` はこれを網羅 match で
+扱わせるためにあるが、**その型を通らない経路を書くと規律が消える**。
+
+#1200 はそれだった: `respond`（選択肢ダイアログへの応答）は入口でバックエンド
+セッション名を必須にし、`reach::detached_session` へ直行していた。tmux は
+`send-keys` でアウトオブプロセスにも送れるので macOS では成功してしまい、
+**psmux（Windows）では生きているペインに対して必ず失敗**していた
+（psmux は `detached_capture` を持つが**入力送出を持たない**）。器なしのペイン
+（`TAKO_PERSIST=0`）には最初から応答できなかった。
+
+### 書くときの決まり
+
+- **ペインへ届く操作は必ず in-process を先に試す**。`reach` の入口
+  （`PaneReach::resolve` / `dialog_access`）を通し、`tako_core::backend` の
+  `detached()` を直接引かない
+- **経路ごとに手順を書き分けない**。「画面を読む」「キーを送る」の 2 手だけを
+  trait（`reach::DialogAccess`）で抽象し、検証・再試行・監査ログは
+  1 実装（`dispatch::respond_via`）が両経路で共有する。書き分けると
+  「macOS では番号キーで確定するが Windows では Enter も要る」のような差が生まれる
+- **in-process のキー送出は自分で PTY へ書く**。器越しはキー名（`Enter` / `Down`）を
+  器が解釈するが、in-process では落とす必要がある。語彙の正本は
+  `tako_core::backend::key_name_bytes` の 1 箇所で、**落とせない名前は推測せず
+  エラーにする**（適当なバイト列はダイアログを誤操作する）
+- **`TerminalSession` はスレッドを越えられない**（`&mut` を要る操作を持つ）。
+  バックグラウンドで走る応答ループ（#813 の自動復帰は数百 ms のスリープを挟む）へは
+  `TerminalSession::access()` の `PaneAccess`（共有できるものだけを持つ手）を
+  **UI スレッドで取り出して**渡す
+- **どちらで届いたかを監査ログへ残す**（`[dialog-respond] route=in-process|detached`）。
+  残っていないと「送ったのに効かない」の切り分けが画面の推測になる
+
+### 残る縮退は 1 マスへ宣言する
+
+psmux は入力送出を持たないので、**tako-app が保持していないペイン**（GUI 不在・
+ペイン消失）へは Windows では応答できない。これは直せない差なので
+`platform::support` の `tako_orchestrator_respond` を `Degraded` + 根拠つきで宣言する
+（`Supported` のままにすると `PlatformFacts` 経由で system prompt へ誤情報が流れる）。
+
 ## 器へ渡した env は「器の中の全シェル」へ配られる（Issue #1199）
 
 #1105 の続き。`new-session -e VAR=VAL` で固定した値は**そのセッションの中だけ**に

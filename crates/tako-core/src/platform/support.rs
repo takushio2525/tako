@@ -902,9 +902,16 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_orchestrator_respond",
         macos: Support::Supported,
-        windows: Support::Supported,
-        windows_evidence: Evidence::SelfTest(
-            "項目 95 / 102 / 111（選択肢ダイアログの検知と番号 / ラベル確定）",
+        windows: Support::Degraded {
+            note: Note::new(
+                "tako が保持していないペイン（GUI 不在・ペイン消失）へは応答できない。\
+                 psmux はアウトオブプロセスの画面採取だけができ、入力送出を持たないため",
+                "Panes tako is not holding (no GUI, pane gone) cannot be answered: psmux can \
+                 capture a detached pane's screen but cannot send input to it",
+            ),
+        },
+        windows_evidence: Evidence::Measured(
+            "#1200 の Windows 11 実測: 生きているペインへ CLI / MCP の respond が in-process 経路で届き、送ったキーがペインの中のプロセスまで到達する（旧実装は器越しへ直行していたため必ず NoDetachedAccess で失敗していた）",
         ),
     },
     Feature {

@@ -133,6 +133,7 @@ impl LoopSender {
 }
 
 /// `event::Notify` / `event::OnResize` を満たす送信ラッパ（upstream の `Notifier`）
+#[derive(Clone)]
 pub struct Notifier(pub LoopSender);
 
 impl event::Notify for Notifier {

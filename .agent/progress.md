@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-09（#1185: 取り込みペインの select-window が内側へ届くようにし、`open --window` を到達可能にした）
-- 対象解決を `tako_core::tmux::window_target`（取り込みビュー優先 → バックエンド）へ集約。旧実装は二重ネストの**外側**（tako の backend）を見ていたので別セッションの window を切り替えて成功を返していた
-- `--window` は CLI と MCP catalog の両方へ（protocol にあるのに 3 経路すべてから到達不能）。番犬 `mcp_param_reachability`（mapper が読む引数が catalog に在るか）が同型の再発を落とす
-- 隔離 GUI 実測: ラッパーだけ `window_active` が 1 → 2 へ動き元は 0 のまま / `open --window 2` と MCP の `window:1` が実際にその window を表示 / A/B `TAKO_1185_LEGACY=1` は外側に当たって FAILED
-
 ## 2026-09-09（#1015: codex の背景ターミナル待ちを idle + 未達と誤検知しないようにした）
 - 真因は**ペイン幅**（負荷でも rollout でもない）: 44 桁では codex が `• Waiting for background terminal (1m 04s •…` と自分で切るので `esc to interrupt` が消え、末尾の `›` を拾って idle になっていた。同じ理由で `prompt_undelivered`（自動再送）の抑制も外れる = 2 症状は同一原因
 - 判定を「`•` で始まり `(` の直後が経過時間 + その直後が区切り」へ。**語では判定しない**（`Waited for …` は完了後も残る履歴行 = 永久 busy になる。実測 5 回残存）。未達の断定は rollout を実際に読めたときだけにし、読めないときは `prompt_delivery_unverified` へ降格
@@ -82,3 +77,16 @@
 ## 2026-09-09（#1206: README に Windows のインストール手順を足した）
 - インストール節を macOS 2 節 + Windows 1 節へ（`.exe` = 標準・管理者権限不要 / `.zip` = ポータブル / SmartScreen / psmux）。冒頭を「macOS 11.0 以降 + Windows 10 1809 以降 x64」へ直し、永続化の説明に psmux を併記
 - 数値・アセット名は `release_assets` と直近リリースの実アセットから引き、docs の「方法 C」と同文・同数値。マトリクス note（Issue の 3 点目）は生成物なので #1204 の担当（CI の `gen-windows-support-docs.mjs --check` が同期を強制している）
+
+## 2026-09-09（#1199: リサイズでペインの cwd が起動時ディレクトリへ巻き戻るのを直した）
+- 真因は「側路（#766）の待ち合わせがパスだけ」。psmux は `-e` を**サーバーのグローバル環境**へ入れ、
+  プリウォーム済みシェルの一団（cwd = ホーム）もそれを継承するので、リサイズでプールのプロンプトが
+  描き直るたびに `OSC 7 <ホーム>` が同じファイルへ落ちていた。関連コミット: `23db0c4`
+- 待ち合わせ先へ書き手の pid を載せ（`<pane>@p<pid>.osc`）、tako は器へ聞いた `#{pane_pid}` ぶんだけ
+  読む形へ。実機 A/B で 8/8 → 0/8
+
+## 2026-09-09（#1200: respond が生きているペインへ in-process 経路で届くようにした）
+- 真因は「到達判定を通っていなかった」。器のセッション名を必須にし `reach::detached_session` へ直行 →
+  入力送出を持たない psmux では必ず失敗・器なしのペインは対象外（セルフテストも skip されていた）
+- 届き方を `reach::DialogAccess` へ出し `dialog_access` が in-process を先に見る形へ。手順は
+  `respond_via` の 1 実装で共有し監査へ `route=`。実機 A/B で Issue と同一エラー → `DELIVERED=1`
