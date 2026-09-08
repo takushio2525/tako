@@ -1293,7 +1293,8 @@ enum TmuxCommand {
         /// window index（指定時は kill-window、省略時は kill-session）
         #[arg(long)]
         window: Option<u32>,
-        /// tmux サーバー名（`tmux -L` 相当）
+        /// tmux サーバー名（`tmux -L` 相当）。
+        /// 省略時は `tako tmux list` と同じく既定サーバーと tako バックエンドの両方から探す
         #[arg(long)]
         socket: Option<String>,
     },
@@ -1312,10 +1313,11 @@ enum TmuxCommand {
         /// 高さ（行数）。--reset なしなら --cols と併せて必須
         #[arg(long)]
         rows: Option<u32>,
-        /// manual サイズを解除してサーバー既定へ戻す
+        /// manual サイズを解除して自動サイズへ戻す
         #[arg(long)]
         reset: bool,
-        /// tmux サーバー名（`tmux -L` 相当）
+        /// tmux サーバー名（`tmux -L` 相当）。
+        /// 省略時は `tako tmux list` と同じく既定サーバーと tako バックエンドの両方から探す
         #[arg(long)]
         socket: Option<String>,
     },
@@ -1333,7 +1335,8 @@ enum TmuxCommand {
     Open {
         /// 対象セッション名
         session: String,
-        /// tmux サーバー名（`tmux -L` 相当。`tako tmux list` の socket をそのまま渡す）
+        /// tmux サーバー名（`tmux -L` 相当。`tako tmux list` の socket をそのまま渡す）。
+        /// 省略時は既定サーバーと tako バックエンドの両方から探す
         #[arg(long)]
         socket: Option<String>,
         /// 取り込み直後に表示する window index（省略時はセッションの現在 window）

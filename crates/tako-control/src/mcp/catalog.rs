@@ -177,13 +177,17 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_tmux_kill",
             "description": "tmux セッション（window 指定時はその window）を kill する。\
                 **破壊的操作**: 中で動いているプロセスごと終了する。必ず tako_tmux_list で\
-                対象を確認し、ユーザーの同意を得てから実行すること。",
+                対象を確認し、ユーザーの同意を得てから実行すること。\
+                socket を省略すると tako_tmux_list と同じく既定サーバーと tako バックエンドの\
+                両方から探すので、list が返した name をそのまま渡せる\
+                （= backend: true のセッションにも届く。backend_pane が居るものを kill すると\
+                そのペインの中身が消える）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session": { "type": "string", "description": "対象セッション名（必須）" },
                     "window": { "type": "integer", "minimum": 0, "description": "window index（指定時は kill-window、省略時は kill-session）" },
-                    "socket": { "type": "string", "description": "tmux サーバー名（tmux -L 相当）" },
+                    "socket": { "type": "string", "description": "tmux サーバー名（tmux -L 相当。省略時は既定サーバーと tako バックエンドの両方から探す）" },
                 },
                 "required": ["session"],
                 "additionalProperties": false,
@@ -193,7 +197,9 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_tmux_resize",
             "description": "tmux window を指定サイズ（cols × rows）へリサイズする。\
                 スマホリモート（Issue #23）のビューポート連動用で、tmux の window-size が \
-                manual に切り替わる。PC 側の表示に合わせ直すときは reset=true で解除する。",
+                manual に切り替わる。PC 側の表示に合わせ直すときは reset=true で解除する。\
+                socket を省略すると tako_tmux_list と同じく既定サーバーと tako バックエンドの\
+                両方から探すので、list が返した name をそのまま渡せる。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -201,8 +207,8 @@ pub fn tools() -> Vec<Value> {
                     "window": { "type": "integer", "minimum": 0, "default": 0, "description": "window index（省略時は 0）" },
                     "cols": { "type": "integer", "minimum": 1, "description": "幅（桁数）。reset なしなら rows と併せて必須" },
                     "rows": { "type": "integer", "minimum": 1, "description": "高さ（行数）。reset なしなら cols と併せて必須" },
-                    "reset": { "type": "boolean", "description": "true で manual サイズを解除しサーバー既定へ戻す" },
-                    "socket": { "type": "string", "description": "tmux サーバー名（tmux -L 相当）" },
+                    "reset": { "type": "boolean", "description": "true で manual サイズを解除し自動サイズへ戻す" },
+                    "socket": { "type": "string", "description": "tmux サーバー名（tmux -L 相当。省略時は既定サーバーと tako バックエンドの両方から探す）" },
                 },
                 "required": ["session"],
                 "additionalProperties": false,
@@ -221,7 +227,7 @@ pub fn tools() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "session": { "type": "string", "description": "対象セッション名（必須。tako_tmux_list の name）" },
-                    "socket": { "type": "string", "description": "tmux サーバー名（tmux -L 相当。tako_tmux_list の socket をそのまま渡す）" },
+                    "socket": { "type": "string", "description": "tmux サーバー名（tmux -L 相当。tako_tmux_list の socket をそのまま渡す。省略時は既定サーバーと tako バックエンドの両方から探す）" },
                     "window": { "type": "integer", "minimum": 0, "description": "取り込み直後に表示する window index（省略時はセッションの現在 window）" },
                     "pane": pane_schema("分割の基準ペイン ID（省略時は呼び出し元の隣に生える）"),
                     "direction": {

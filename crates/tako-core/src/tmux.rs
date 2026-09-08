@@ -363,6 +363,55 @@ pub fn session_group(socket: Option<&str>, name: &str) -> Option<String> {
     }
 }
 
+/// `socket` 省略時に「そのセッションがどのサーバーに居るか」を決める（#1190）。
+///
+/// `tako tmux list` は socket 省略時に**既定サーバーと tako バックエンドの両方**を
+/// 併記するのに、kill / resize は既定サーバーしか見ていなかった。そのため
+/// 「対象は `tako tmux list` で確認してから指定する」という案内どおりに辿ると
+/// **list に出ていたセッションに届かない**（#1190 の症状）。探す順は list の並びと
+/// 同じ「既定サーバー → tako バックエンド」。明示された socket はそのまま尊重する
+/// （`--socket` を付けさせないのが #322 の「最も簡単なコマンド」原則にも合う）
+pub fn resolve_session_socket(
+    socket: Option<&str>,
+    session: &str,
+) -> Result<Option<String>, String> {
+    resolve_session_socket_with(
+        socket,
+        session,
+        &crate::tmux_backend::socket_name(),
+        has_session,
+    )
+}
+
+/// [`resolve_session_socket`] の決め方だけを切り出した版（探し方を差し替えられる）。
+/// A/B 計測用に `TAKO_1190_LEGACY=1` で旧挙動（省略 = 既定サーバー固定）へ戻せる
+pub(crate) fn resolve_session_socket_with(
+    socket: Option<&str>,
+    session: &str,
+    backend: &str,
+    exists: impl Fn(Option<&str>, &str) -> bool,
+) -> Result<Option<String>, String> {
+    if std::env::var("TAKO_1190_LEGACY").as_deref() == Ok("1") {
+        return Ok(socket.map(str::to_string));
+    }
+    // 回帰注入（#1190 の検証用）: 明示された socket を無視して探しに行く
+    // = 「明示指定は挙動不変」を壊す
+    let ignore_explicit = std::env::var("TAKO_1190_INJECT").as_deref() == Ok("explicit_ignored");
+    if let Some(name) = socket.filter(|_| !ignore_explicit) {
+        return Ok(Some(name.to_string()));
+    }
+    if exists(None, session) {
+        return Ok(None);
+    }
+    if exists(Some(backend), session) {
+        return Ok(Some(backend.to_string()));
+    }
+    Err(format!(
+        "tmux セッション {session} が見つからない（既定サーバーと tako バックエンド\
+         （socket: {backend}）のどちらにも無い）。対象は `tako tmux list` で確認すること"
+    ))
+}
+
 /// セッションを kill する。誤爆防止の確認は呼び出し側（UI / AI）の責務
 pub fn kill_session(socket: Option<&str>, name: &str) -> Result<(), String> {
     run_tmux(socket, &["kill-session", "-t", &exact_target(name)]).map(|_| ())
@@ -905,6 +954,44 @@ mod tests {
     #[test]
     fn 器の無いペインは対象なし() {
         assert_eq!(window_target(None, None), None);
+    }
+
+    /// #1190: socket 省略時は list と同じ順（既定 → バックエンド）で探す
+    #[test]
+    fn socket省略時の対象サーバーを探す() {
+        let on_default = |socket: Option<&str>, _: &str| socket.is_none();
+        let on_backend = |socket: Option<&str>, _: &str| socket == Some("tako");
+        let nowhere = |_: Option<&str>, _: &str| false;
+
+        // 明示された socket は探さずそのまま使う（存在確認は呼び出し側の責務）
+        assert_eq!(
+            resolve_session_socket_with(Some("work"), "s", "tako", nowhere),
+            Ok(Some("work".into()))
+        );
+        // 省略時は既定サーバーが先（list の並びと同じ）
+        assert_eq!(
+            resolve_session_socket_with(None, "s", "tako", on_default),
+            Ok(None)
+        );
+        // 既定に無ければ tako バックエンドを見る（#1190 の本体）
+        assert_eq!(
+            resolve_session_socket_with(None, "s", "tako", on_backend),
+            Ok(Some("tako".into()))
+        );
+        // 両方に在れば既定サーバーを採る（list の先頭と同じ）
+        assert_eq!(
+            resolve_session_socket_with(None, "s", "tako", |_, _| true),
+            Ok(None)
+        );
+        // どちらにも無ければ「どこを見たか」を日本語で返す（パスは出さない）
+        let err = resolve_session_socket_with(None, "mywork", "tako", nowhere).unwrap_err();
+        assert!(err.contains("mywork"), "{err}");
+        assert!(
+            err.contains("既定サーバー") && err.contains("socket: tako"),
+            "{err}"
+        );
+        assert!(err.contains("tako tmux list"), "{err}");
+        assert!(!err.contains('/'), "パスが露出している: {err}");
     }
 
     /// #1190: 生の tmux エラーを日本語へ包み、ソケットの絶対パスを出さない

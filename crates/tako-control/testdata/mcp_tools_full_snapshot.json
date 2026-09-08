@@ -160,7 +160,7 @@
     "name": "tako_tmux_list"
   },
   {
-    "description": "tmux セッション（window 指定時はその window）を kill する。**破壊的操作**: 中で動いているプロセスごと終了する。必ず tako_tmux_list で対象を確認し、ユーザーの同意を得てから実行すること。",
+    "description": "tmux セッション（window 指定時はその window）を kill する。**破壊的操作**: 中で動いているプロセスごと終了する。必ず tako_tmux_list で対象を確認し、ユーザーの同意を得てから実行すること。socket を省略すると tako_tmux_list と同じく既定サーバーと tako バックエンドの両方から探すので、list が返した name をそのまま渡せる（= backend: true のセッションにも届く。backend_pane が居るものを kill するとそのペインの中身が消える）。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -169,7 +169,7 @@
           "type": "string"
         },
         "socket": {
-          "description": "tmux サーバー名（tmux -L 相当）",
+          "description": "tmux サーバー名（tmux -L 相当。省略時は既定サーバーと tako バックエンドの両方から探す）",
           "type": "string"
         },
         "window": {
@@ -186,7 +186,7 @@
     "name": "tako_tmux_kill"
   },
   {
-    "description": "tmux window を指定サイズ（cols × rows）へリサイズする。スマホリモート（Issue #23）のビューポート連動用で、tmux の window-size が manual に切り替わる。PC 側の表示に合わせ直すときは reset=true で解除する。",
+    "description": "tmux window を指定サイズ（cols × rows）へリサイズする。スマホリモート（Issue #23）のビューポート連動用で、tmux の window-size が manual に切り替わる。PC 側の表示に合わせ直すときは reset=true で解除する。socket を省略すると tako_tmux_list と同じく既定サーバーと tako バックエンドの両方から探すので、list が返した name をそのまま渡せる。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -196,7 +196,7 @@
           "type": "integer"
         },
         "reset": {
-          "description": "true で manual サイズを解除しサーバー既定へ戻す",
+          "description": "true で manual サイズを解除し自動サイズへ戻す",
           "type": "boolean"
         },
         "rows": {
@@ -209,7 +209,7 @@
           "type": "string"
         },
         "socket": {
-          "description": "tmux サーバー名（tmux -L 相当）",
+          "description": "tmux サーバー名（tmux -L 相当。省略時は既定サーバーと tako バックエンドの両方から探す）",
           "type": "string"
         },
         "window": {
@@ -251,7 +251,7 @@
           "type": "string"
         },
         "socket": {
-          "description": "tmux サーバー名（tmux -L 相当。tako_tmux_list の socket をそのまま渡す）",
+          "description": "tmux サーバー名（tmux -L 相当。tako_tmux_list の socket をそのまま渡す。省略時は既定サーバーと tako バックエンドの両方から探す）",
           "type": "string"
         },
         "window": {

@@ -19,13 +19,6 @@
 
 ---
 
-## 2026-09-08（#1173: 器つきペインの visual-test を完走させた）
-- `subline` は待てば器つきでも直接ペインと同一値（`mirrored=true mirror_pos=0.500 direct=13961 shifted=0`）=
-  製品は動いているので #943 型の skip は要らなかった。後続 3 件も器つきだけ落ちる同型（描画途中の resize /
-  固定 800ms 窓 / 注入 fixture の `pin_chat_fixture` 漏れ）
-- 到達点 器つき 72 行 → **158 行 + `TAKO_VISUAL_TEST_OK`**（直接も 149 行で OK・A/B 両アーム緑）
-- A/B は `TAKO_1173_LEGACY` を段ごとに指定（`subline` `rows` `chat-g3` `pin` が確定 FAILED）
-
 ## 2026-09-08（#1177: 器つきペインの `term-grid scroll` を skip せず実測できるようにした）
 - #943 の前提ガードを外し「ミラーが立つまで待つ + 期待値の出どころを器で切り替える」へ（`settle_scroll_mirror` は `subline` 節と 1 実装）
 - 器つき `mirrored=true mirror_pos=0.500 fract=0.500 shift=17 expected=17` = 直接ペインと全数値一致・両方 `TAKO_VISUAL_TEST_OK`（checkpoint 122）
@@ -90,3 +83,8 @@
 - `HOME` 決め打ち 15 箇所を `paths::home_dir()` へ、`~` 短縮 10 箇所を新設 `paths::shorten_home` へ。`ssh_config` は Windows で ssh 系が効くようになり `issue652_resume_e2e` の `.expect("HOME")` panic も消えた
 - 番犬を 2 ファイル走査からワークスペース全体へ（`home_dir_watchdog.rs`）。テストの HOME 差し替えは Drop 復元の `HomeGuard` へ寄せた
 - A/B は修正前コードでホーム解決 30 行 + `~` 短縮 10 行を名指しして FAILED。全 3674 件緑・`HOME`/`USERPROFILE` 両方なしでも panic せずエラー文で止まる（実測）
+
+## 2026-09-09（#1190: kill / resize の既定ソケットを list と揃え、tmux の生エラーを包んだ）
+- `socket` 省略時の解決を `tako_core::tmux::resolve_session_socket`（既定サーバー → tako バックエンド = list の並び）へ集約し、`kill` / `resize` / `open` の 3 つで共有。応答に解決後の `socket` を追加
+- 生 stderr は `friendly_error` で日本語へ（4 分類 + `scrub_paths` で絶対パスを伏せる）。**kill 前の確認 / `--force` は #1196 の担当で入れていない**（省略でも backend へ届くようになった）
+- 隔離 GUI 実測: `--socket` 省略の resize が 80x24 → 60x15・kill --window 1 が届いてセッションは生存 / A/B `TAKO_1190_LEGACY=1` は Issue と同じ `error connecting to /private/tmp/tmux-<uid>/default` を再現

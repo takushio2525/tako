@@ -152,7 +152,7 @@ tako/
 | **シェル統合（cwd 追従・コマンド状態。#525）** | `tako shell-integration [status|install|uninstall]` |
 | エージェント共通ルール同期 | `tako agents sync-rules` |
 | AI 系設定のデバイス間共有（#513） | `tako config` |
-| **tmux の一覧・取り込み・window 切替（#1185）** | `tako tmux list` / `tako tmux open <session> [--window N]` / `tako tmux select-window N` |
+| **tmux の一覧・取り込み・window 切替（#1185 / #1190）** | `tako tmux list` / `tako tmux open <session> [--window N]` / `tako tmux select-window N` |
 | レイアウト復旧（タブ・ペイン消失時。#177/#381/#770） | `tako recover` |
 | **何がいつ消えたかを調べる（#770）** | `<data_dir>/persist.log` |
 | セッションカタログ（会話の発見・復元。#112 / #1069） | `tako sessions list [--role r] [--project p]` |
