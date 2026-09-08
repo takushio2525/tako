@@ -19,12 +19,6 @@
 
 ---
 
-## 2026-09-07（#1162: セルフテスト項目 102 の `shown=false` を根治。実因は負荷ではなくペインの高さ）
-- 落ちた回の実測は `size=Some((58, 9))` = 13 行の 25 桁 fixture の箱上端と `❯ 1.` が画面外。fixture ペインを
-  **専用タブ（全高）**へ移し、実寸が届いてから描く（`notify_and_draw`）+ 出現判定を状態待ちへ（`wait_for_dispatch_state`）
-- A/B `TAKO_1162_LEGACY=1` は load 2.5 でも 102 が確定 FAILED / `TAKO_1162_INJECT=nodialog` は 3 回送り直しても FAILED
-- 項目 102 は 15/15 ok（判定時 load 3.4〜5.0）・完走 8 回。中断は #816 / #1058 / #694（別件の負荷フレーク）
-
 ## 2026-09-08（#1153: セルフテストの高負荷フレーク 4 系統を状態待ちへ寄せた）
 - (e) #694 / (g) #1058 は `pane_display` の材料（`state=Running` / 猶予 #720 が role で 25 秒へ伸びる）を
   1 回読みしていたのが原因。113 #816 は固定 2500ms 窓の「40 行増えた」、#657 は総数の差分（#1124 の `tabs=8->4`）
@@ -103,3 +97,8 @@
 - 見送りの判定を「別の tako-app がいるか」から**対象ソケットの所有者**へ（相手の初期環境を `KERN_PROCARGS2` で読み `tako-iso-<pid>` 等を復元）。応答を `{socket, killed, skipped, detail}` へ広げ、見送り・kill の両方を persist.log へ 1 行
 - 実測（隔離 + tako-vd・他 tako-app 3 本稼働）: 省略時 `killed=[aaa,bbb]` / `--socket <別>` で `ccc` を kill / `--socket tako` は `skipped=peer_shares_socket`（pid 71082）で本番 17 セッションは不変
 - A/B `TAKO_1187_LEGACY=1` は Issue と同じ `{"killed":[]}` + `--socket` 無視を再現。番犬 4 本（修正前ソースで全滅）+ 単体 12 本。全 3621 件緑
+
+## 2026-09-09（#1188: tmux open で取り込んだセッションが永久に掃除されない問題を根治）
+- tmux のセッショングループは**メンバーが 1 つになっても残る**（実測 3.6b: ビュー kill 後も `grouped=1` / `size=1`）ので、判定材料を `#{session_group_size}` > 1 へ。行のパースと orphan 判定を `tmux_cleanup`（`LIST_FORMAT` / `is_orphan`）へ出し cleanup と find が 1 実装を見る形に
+- 実測（隔離 + tako-vd）: open 前 `grouped=0 size=` → open 中 `size=2` で cleanup は `killed=[]`（保護）→ close 後 `grouped=1 size=1` で `killed=[tako-blind-4]`
+- A/B `TAKO_1188_LEGACY=1` は Issue と同じ `killed=[]` + 残存を再現。ガードを丸ごと外す注入は表示中ビューの保護が落ちて FAILED（= 消して直したのではない）。番犬 1 本 + 単体 6 本

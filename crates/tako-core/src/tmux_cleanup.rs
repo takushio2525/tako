@@ -264,6 +264,126 @@ pub fn live_peers() -> Vec<CleanupPeer> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// orphan 判定（#1188）— cleanup と find が同じ材料・同じ規則を見る
+// ---------------------------------------------------------------------------
+
+/// `list-sessions -F` に渡す書式。**順序を変えたら [`parse_session_row`] も直すこと**
+pub const LIST_FORMAT: &str = "#{session_name}\t#{session_attached}\t#{session_grouped}\t#{session_group_size}\t#{session_activity}";
+
+/// `list-sessions` の 1 行。数値が読めない古い tmux でも壊れないよう、
+/// 解釈は [`SessionRow`] を作るときに 1 回だけ行う
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRow {
+    pub name: String,
+    pub attached: bool,
+    /// `#{session_grouped}` = **グループに属しているか**。
+    /// tmux はメンバーが 1 つになってもグループを消さないので、
+    /// 「表示中ビューがあるか」の代わりには使えない（#1188 の根因）
+    pub grouped_flag: bool,
+    /// `#{session_group_size}` = グループのメンバー数。グループ無しは `None`
+    pub group_size: Option<u32>,
+    /// グループのメンバー数を読めなかった（空でないのに数値でない = 未知の tmux）
+    pub group_size_unreadable: bool,
+    pub activity: u64,
+}
+
+/// [`LIST_FORMAT`] の 1 行を解く（純粋関数）
+pub fn parse_session_row(line: &str) -> Option<SessionRow> {
+    let mut f = line.split('\t');
+    let name = f.next()?.to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let attached = f.next()? != "0";
+    let grouped_flag = f.next()? != "0";
+    let size_field = f.next().unwrap_or("");
+    let group_size = size_field.parse::<u32>().ok();
+    let group_size_unreadable = !size_field.is_empty() && group_size.is_none();
+    let activity = f.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    Some(SessionRow {
+        name,
+        attached,
+        grouped_flag,
+        group_size,
+        group_size_unreadable,
+        activity,
+    })
+}
+
+/// そのセッションのグループに**生きた仲間**がいるか（= 表示中ビューが実在するか）。
+///
+/// #1188: 旧実装は `session_grouped != 0` を「表示中ビューがある」の意味で使っていたが、
+/// tmux のセッショングループは**メンバーが 1 つになっても残る**ので、
+/// `tako tmux open` で 1 度取り込んだセッションは以後永久に掃除対象から外れていた
+/// （実測 tmux 3.6b: ビュー kill 後も `grouped=1` のまま `group_size=1`）。
+/// メンバー数を見れば「いま仲間がいるか」を正しく答えられる。
+///
+/// `legacy` = #1188 の A/B（`TAKO_1188_LEGACY=1`）で旧判定を再現する
+pub fn group_has_live_peer(row: &SessionRow, legacy: bool) -> bool {
+    if legacy {
+        return row.grouped_flag;
+    }
+    if row.group_size_unreadable {
+        return true; // 読めない tmux では安全側（従来どおり触らない）
+    }
+    row.group_size.is_some_and(|n| n > 1)
+}
+
+/// orphan 判定の用途。守る材料は同じで、除外条件だけが違う
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanPurpose {
+    /// 掃除（`cleanup_orphans`）: attached は触らない・`min_idle_secs` の猶予がある
+    Cleanup,
+    /// 発見（`find_orphans` = 起動時の自動復帰）: ラッパーは復帰対象にしない
+    Recover,
+}
+
+/// この行が orphan（= 取り残されたバックエンドセッション）か（純粋関数）。
+///
+/// 守りは四重: `tako-` 接頭辞 / attached / **グループに生きた仲間がいる** / `protected`。
+/// `min_idle_secs` を渡すと最終アクティビティの猶予が五重目になる（#113）
+pub fn is_orphan(
+    row: &SessionRow,
+    protected: &std::collections::HashSet<String>,
+    purpose: OrphanPurpose,
+    min_idle_secs: Option<u64>,
+    now: u64,
+    legacy: bool,
+) -> bool {
+    if !row.name.starts_with(crate::tmux_backend::SESSION_PREFIX) {
+        return false; // tako 由来でないものは対象外
+    }
+    if purpose == OrphanPurpose::Recover && row.name.starts_with(VIEW_PREFIX) {
+        return false; // 表示用ラッパーは復帰対象にしない
+    }
+    if purpose == OrphanPurpose::Cleanup && row.attached {
+        return false; // 使用中
+    }
+    if group_has_live_peer(row, legacy) {
+        return false; // 表示中ビューの元 or そのラッパー
+    }
+    if protected.contains(&row.name) {
+        return false; // 現存 / バックグラウンドペイン・表示中ビューが使用中
+    }
+    if let Some(min_idle) = min_idle_secs {
+        // activity が取れない（古い tmux・パース不能 = 0）場合は「idle 十分」に倒し
+        // 従来挙動（掃除する）へ劣化する
+        if now.saturating_sub(row.activity) < min_idle {
+            return false; // 直近までアクティブ = 実行中プロセスの可能性が高い
+        }
+    }
+    true
+}
+
+/// 表示用ラッパーの名前の接頭辞（`tako tmux open` が作る grouped session）
+pub const VIEW_PREFIX: &str = "tako-view-";
+
+/// #1188 の A/B。`TAKO_1188_LEGACY=1` で修正前の判定（`session_grouped`）に戻す
+pub fn legacy_1188() -> bool {
+    std::env::var_os("TAKO_1188_LEGACY").is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,6 +393,144 @@ mod tests {
             pid,
             socket: socket.map(str::to_string),
         }
+    }
+
+    fn row(line: &str) -> SessionRow {
+        parse_session_row(line).expect("行を解ける")
+    }
+
+    /// `名前\t attached \t grouped \t group_size \t activity`
+    fn line(name: &str, attached: u8, grouped: u8, size: &str, activity: u64) -> String {
+        format!("{name}\t{attached}\t{grouped}\t{size}\t{activity}")
+    }
+
+    #[test]
+    fn list_formatの列を順番どおり解く() {
+        let r = row(&line("tako-a", 1, 1, "2", 1757000000));
+        assert_eq!(r.name, "tako-a");
+        assert!(r.attached && r.grouped_flag);
+        assert_eq!(r.group_size, Some(2));
+        assert!(!r.group_size_unreadable);
+        assert_eq!(r.activity, 1757000000);
+        // グループ無し（size 列が空）
+        let r = row(&line("tako-b", 0, 0, "", 0));
+        assert_eq!(r.group_size, None);
+        assert!(!r.group_size_unreadable);
+        // 未知の tmux が書式をそのまま返す = 読めない
+        let r = row(&line("tako-c", 0, 1, "#{session_group_size}", 0));
+        assert!(r.group_size_unreadable);
+    }
+
+    /// #1188 の本体。`session_grouped` は 1 度でも表示すると 1 のままなので、
+    /// **メンバー数**で「いま仲間がいるか」を判定する
+    #[test]
+    fn issue1188_ビューを閉じた元セッションは掃除対象へ戻る() {
+        let protected = std::collections::HashSet::new();
+        // ビューを閉じた後の元セッション（grouped=1 のまま・メンバーは 1）
+        let closed = row(&line("tako-blind-4", 0, 1, "1", 0));
+        assert!(
+            is_orphan(&closed, &protected, OrphanPurpose::Cleanup, None, 0, false),
+            "ビューを閉じたら掃除対象へ戻る"
+        );
+        assert!(
+            !is_orphan(&closed, &protected, OrphanPurpose::Cleanup, None, 0, true),
+            "修正前（legacy）は永久に見送る = Issue の症状"
+        );
+        // 表示中ビューがある元セッション（メンバー 2）は守られる
+        let live = row(&line("tako-blind-4", 0, 1, "2", 0));
+        assert!(!is_orphan(
+            &live,
+            &protected,
+            OrphanPurpose::Cleanup,
+            None,
+            0,
+            false
+        ));
+        // 読めない tmux は安全側（触らない）
+        let unknown = row(&line("tako-blind-4", 0, 1, "#{session_group_size}", 0));
+        assert!(!is_orphan(
+            &unknown,
+            &protected,
+            OrphanPurpose::Cleanup,
+            None,
+            0,
+            false
+        ));
+    }
+
+    #[test]
+    fn 掃除の四重ガードは効いたまま() {
+        let empty = std::collections::HashSet::new();
+        let protected: std::collections::HashSet<String> =
+            ["tako-keep".to_string()].into_iter().collect();
+        // tako- 接頭辞でない
+        assert!(!is_orphan(
+            &row(&line("user-session", 0, 0, "", 0)),
+            &empty,
+            OrphanPurpose::Cleanup,
+            None,
+            0,
+            false
+        ));
+        // attached
+        assert!(!is_orphan(
+            &row(&line("tako-live", 1, 0, "", 0)),
+            &empty,
+            OrphanPurpose::Cleanup,
+            None,
+            0,
+            false
+        ));
+        // protected
+        assert!(!is_orphan(
+            &row(&line("tako-keep", 0, 0, "", 0)),
+            &protected,
+            OrphanPurpose::Cleanup,
+            None,
+            0,
+            false
+        ));
+        // 猶予内（#113）
+        assert!(!is_orphan(
+            &row(&line("tako-busy", 0, 0, "", 1000)),
+            &empty,
+            OrphanPurpose::Cleanup,
+            Some(3600),
+            1500,
+            false
+        ));
+        // 猶予を過ぎていれば掃除する
+        assert!(is_orphan(
+            &row(&line("tako-busy", 0, 0, "", 1000)),
+            &empty,
+            OrphanPurpose::Cleanup,
+            Some(3600),
+            9000,
+            false
+        ));
+    }
+
+    /// 発見（起動時の自動復帰）はラッパーを対象にせず、attached も見ない
+    /// （前のインスタンスが死んでいるので attach は残っていない）
+    #[test]
+    fn 発見はラッパーを対象にしない() {
+        let empty = std::collections::HashSet::new();
+        assert!(!is_orphan(
+            &row(&line("tako-view-tako-a-7", 0, 0, "", 0)),
+            &empty,
+            OrphanPurpose::Recover,
+            None,
+            0,
+            false
+        ));
+        assert!(is_orphan(
+            &row(&line("tako-a", 1, 0, "", 0)),
+            &empty,
+            OrphanPurpose::Recover,
+            None,
+            0,
+            false
+        ));
     }
 
     #[test]
