@@ -25588,15 +25588,148 @@ mod self_test {
         }
     }
 
-    /// **上限を「伸ばせるところまで伸ばした」か**（純粋関数。#771）。
+    /// **上限を「伸ばせるところまで伸ばした」か**（純粋関数。#771 → #1180 で共有）。
     ///
     /// [`state_wait_budget`] の係数は 4 倍で打ち切るので、混み具合がそれを超えている
     /// ときは「予算を最大まで積んでも足りなかった」= 機が極端に混んでいる、が言える。
     /// 診断行にこれを出しておくと、FAILED を見た人が
     /// **待ちが短かったのか相手が応答しなかったのか**を 1 行で切り分けられる
-    /// （SKIP にして隠さないのは、隠すと回帰も一緒に隠れるため）
-    pub(crate) fn claude_budget_capped(busy: Option<f64>) -> bool {
+    /// （SKIP にして隠さないのは、隠すと回帰も一緒に隠れるため）。
+    ///
+    /// 名前が中立なのは、判定しているのが `state_wait_budget` の係数であって
+    /// **相手が誰か（実 claude か tmux か）ではない**ため（#1180 で器の往復待ちも
+    /// 同じ政策へ乗せた）
+    pub(crate) fn budget_capped(busy: Option<f64>) -> bool {
         busy.is_some_and(|b| 1.0 + b.max(0.0) >= 4.0)
+    }
+
+    /// **#1180 の A/B の口**: 設定すると器（tmux）の往復待ちを旧実装の固定窓へ戻す。
+    ///
+    /// `1` / `all` で全部、タグのカンマ区切り（`68-attach,73-wheel`）で**項目ごと**にも
+    /// 戻せる。項目ごとに指定できるのは、`check` が 1 つ目の失敗でプロセスごと止まる
+    /// ため（全部戻すと最初に来る 1 か所しか観測できない = #1173 の `TAKO_1173_LEGACY`
+    /// と同じ理由）。**判定そのものは変えない**ので、旧経路でも期待値が出ていれば通る
+    fn legacy_1180(tag: &str) -> bool {
+        let Ok(value) = std::env::var("TAKO_1180_LEGACY") else {
+            return false;
+        };
+        value == "1" || value == "all" || value.split(',').any(|p| p.trim() == tag)
+    }
+
+    /// **#1180 の注入口**（#771 の `TAKO_771_INJECT` と同じ役目）。2 系統ある。
+    ///
+    /// **① 遅れの再現**（`late`）: 器の往復の**観測**を旧の固定窓を超えて遅らせる。
+    /// 機の混み具合は再現できないので、Issue が観測した「attach / capture の反映が
+    /// 窓に入らない」を人工的に作る。旧経路（固定窓）は確定で落ち、新経路は待って通る。
+    ///
+    /// **② 検出力の担保**（`never`）: 観測をずっと成立させない。待ちを延ばしても
+    /// **本物の回帰は隠れない**ことの実測で、上限まで待ってからその項目が
+    /// FAILED になるのが正しい
+    fn inject_1180() -> String {
+        std::env::var("TAKO_1180_INJECT").unwrap_or_default()
+    }
+
+    /// 注入 `late` の遅らせ幅（#1180）。**旧の固定窓 + 5 秒**にしてあるのは、
+    /// 「旧の窓 < 注入の遅れ < 新の素の上限」の不等式が A/B の成立条件だから
+    /// （等しいと旧も通ってしまい差が出ない）。不等式は
+    /// `注入の遅れは旧の窓を超えて新の上限に収まる_1180` が**ソースから採った
+    /// 全呼び出し**に対して検査する
+    pub(crate) fn inject_1180_delay(legacy_window: Duration) -> Duration {
+        legacy_window + Duration::from_secs(5)
+    }
+
+    /// 注入 `never`（= 器の往復をずっと観測しない）の遅らせ幅。
+    /// 実質無限でよいが、`Duration` の演算で驚かない長さにしておく
+    const INJECT_1180_FOREVER: Duration = Duration::from_secs(365 * 24 * 3600);
+
+    /// **器（tmux）の往復待ちの「上限 / ポーリング間隔」を決める**（純粋関数。#1180）。
+    ///
+    /// 新経路の上限は [`state_wait_budget`]（混み具合で**伸ばすだけ**・4 倍で打ち切り）。
+    /// **ポーリング間隔は旧実装のまま据え置く**のが #1165 との違いで、理由は
+    /// 「1 周期の観測が安くない」こと: `tmux list-clients` の起動・`capture-pane` の
+    /// 往復・`refresh_tmux_data` はどれも実プロセスか実 IPC を叩くので、100ms 刻みに
+    /// すると測っている相手そのものを混ませる（相手は数百 ms 単位で動くので、
+    /// 刻みを細かくしても判定は変わらない）
+    pub(crate) fn resolve_backend_wait(
+        budget: TextWaitBudget,
+        busy: Option<f64>,
+        legacy: bool,
+    ) -> (Duration, Duration) {
+        if legacy {
+            (budget.legacy_window, budget.legacy_poll)
+        } else {
+            (
+                state_wait_budget(budget.base, busy),
+                budget.legacy_poll.max(Duration::from_millis(50)),
+            )
+        }
+    }
+
+    /// **器（tmux）と外のプロセスの往復を状態で待つ**（#1180）。
+    ///
+    /// 対象は tmux バックエンド（項目 48 / 59〜62 = #159）と tmux open / ビューペイン
+    /// （項目 68 / 73 / 74 = #181）、および Web ビュー（項目 71）の dispatch 往復。
+    /// 旧実装はどれも `for _ in 0..N { wait(cx, M).await; … }` = **固定 N×M 窓**で、
+    /// 待っている相手が「別プロセス（tmux サーバー / attach クライアント）の往復」
+    /// なので混んだ機では窓を使い切って落ちていた（#1180 の実測: #1175 の検証中に
+    /// 項目 68 の attach が 1 回・項目 73 のホイールが 2 回止まり、再実行で通った）。
+    ///
+    /// - 上限は [`resolve_backend_wait`]（`state_wait_budget` = 伸ばすだけ・4 倍で打ち切り）
+    /// - `probe` は**毎周期呼ばれる**ので、`refresh_tmux_data` のように
+    ///   「待ちながら取り込む」駆動も観測と同じ場所に書ける。注入
+    ///   （`TAKO_1180_INJECT`）のあいだ止めるのは**観測（返り値）だけ**なので、
+    ///   遅れを再現しても相手は前へ進む（#771 の `step` と同じ約束）
+    /// - 上限まで待って駄目なら偽 + 診断 1 行。**SKIP にはしない**ので検出力は
+    ///   固定窓と同じか強い（成立しない条件はいくら待っても成立しない）
+    ///
+    /// 診断は毎回 1 行（`TAKO_SELF_TEST_1180` = `item=` / `ok=` / `waited=` /
+    /// `budget=` / `legacy=` / `capped=` / `inject=` + 判定した瞬間の `load=`）。
+    /// `capped=true` = 4 倍まで積んでも足りなかった印。項目ごとの材料
+    /// （`TAKO_SELF_TEST_TMUX_ATTACH` / `_181_VIEW` / `_61F` 等）は呼び出し側に残す
+    async fn wait_for_backend_state<F>(
+        cx: &mut AsyncApp,
+        tag: &str,
+        budget: TextWaitBudget,
+        mut probe: F,
+    ) -> bool
+    where
+        F: FnMut(&mut AsyncApp) -> bool,
+    {
+        let legacy = legacy_1180(tag);
+        let busy = machine_busy();
+        let (limit, poll) = resolve_backend_wait(budget, busy, legacy);
+        let inject = inject_1180();
+        let hold = match inject.as_str() {
+            "late" => Some(inject_1180_delay(budget.legacy_window)),
+            "never" => Some(INJECT_1180_FOREVER),
+            _ => None,
+        };
+        let started = std::time::Instant::now();
+        let mut ok = false;
+        loop {
+            // **駆動は毎周期・観測だけを予算で待つ**（#771 と同じ約束）。
+            // `probe` を止めてしまうと「遅れの再現」ではなく「取り込みをしない別の
+            // 失敗」になり、A/B が旧と新の差を測らなくなる
+            let observed = probe(cx);
+            if observed && hold.is_none_or(|h| started.elapsed() >= h) {
+                ok = true;
+                break;
+            }
+            if started.elapsed() >= limit {
+                break;
+            }
+            cx.background_executor().timer(poll).await;
+        }
+        let waited = started.elapsed();
+        println!(
+            "TAKO_SELF_TEST_1180: item={tag} ok={ok} waited={:.1}s budget={:.1}s \
+             legacy={legacy} capped={} inject={inject:?} {}",
+            waited.as_secs_f32(),
+            limit.as_secs_f32(),
+            budget_capped(busy),
+            env_line()
+        );
+        ok
     }
 
     /// **実 claude の応答を状態で待つ**（#771）。
@@ -25659,7 +25792,7 @@ mod self_test {
             cx.background_executor().timer(poll).await;
         }
         let waited = started.elapsed();
-        let capped = claude_budget_capped(busy);
+        let capped = budget_capped(busy);
         println!(
             "TAKO_SELF_TEST_771: item={tag} ok={ok} waited={:.1}s budget={:.1}s \
              legacy={legacy} capped={capped} inject={inject:?} {}",
@@ -39025,7 +39158,6 @@ mod self_test {
                 // `tako-test` は `tako-test2` の前方一致でもあるので、ターゲットが
                 // 完全一致になっていない実装（`=` を解さない psmux へ `=` を渡す等）だと
                 // 「消えない」か「隣も消える」のどちらかで落ちる（#866）
-                let mut sessions_up = false;
                 for name in ["tako-test", "tako-test2"] {
                     let created = tako_core::tmux::tmux_command(Some(&sock))
                         .args(["new-session", "-d", "-s", name])
@@ -39033,16 +39165,20 @@ mod self_test {
                         .map(|s| s.success())
                         .unwrap_or(false);
                     check(created, "テスト用 tmux セッション作成");
-                    // 「一覧に出る」は出来事なので固定待ちにしない（#796 の作法）
-                    for _ in 0..20 {
-                        wait(cx, 300).await;
-                        sessions_up = tako_core::tmux::list_sessions(Some(&sock))
-                            .iter()
-                            .any(|s| s.name == name);
-                        if sessions_up {
-                            break;
-                        }
-                    }
+                    // 「一覧に出る」は出来事なので固定待ちにしない（#796 の作法）。
+                    // tmux サーバーの起動と一覧への反映は**別プロセスの往復**なので、
+                    // 上限は混み具合に追従させる（#1180。旧実装は 20 × 300ms = 6 秒）
+                    let sessions_up = wait_for_backend_state(
+                        cx,
+                        "48-list",
+                        text_wait_budget(20, 300, 20),
+                        |_cx| {
+                            tako_core::tmux::list_sessions(Some(&sock))
+                                .iter()
+                                .any(|s| s.name == name)
+                        },
+                    )
+                    .await;
                     check(sessions_up, "テスト用 tmux セッションが一覧に出る");
                 }
                 press(any, cx, sh.clear_line_key());
@@ -39070,34 +39206,39 @@ mod self_test {
                 // 「消える」は出来事なので固定待ちにしない（#796 の作法）。
                 // debug CLI の起動 + IPC 往復 + tmux の後始末は環境で数秒かかる
                 let mut names: Vec<String> = Vec::new();
-                for _ in 0..24 {
-                    wait(cx, 500).await;
-                    names = window
-                        .update(cx, |app, _, _| {
-                            let value = tako_control::dispatch(
-                                app,
-                                tako_control::protocol::Request::TmuxList {
-                                    socket: Some(sock.clone()),
-                                },
-                                PaneOrigin::Cli,
-                            )
-                            .expect("tmux list は常に成功する");
-                            value["sessions"]
-                                .as_array()
-                                .map(|list| {
-                                    list.iter()
-                                        .filter_map(|s| {
-                                            s["name"].as_str().map(std::string::ToString::to_string)
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default()
-                        })
-                        .unwrap_or_default();
-                    if !names.iter().any(|n| n == "tako-test") {
-                        break;
-                    }
-                }
+                let _ = wait_for_backend_state(
+                    cx,
+                    "48-kill",
+                    text_wait_budget(24, 500, 30),
+                    |cx| {
+                        names = window
+                            .update(cx, |app, _, _| {
+                                let value = tako_control::dispatch(
+                                    app,
+                                    tako_control::protocol::Request::TmuxList {
+                                        socket: Some(sock.clone()),
+                                    },
+                                    PaneOrigin::Cli,
+                                )
+                                .expect("tmux list は常に成功する");
+                                value["sessions"]
+                                    .as_array()
+                                    .map(|list| {
+                                        list.iter()
+                                            .filter_map(|s| {
+                                                s["name"]
+                                                    .as_str()
+                                                    .map(std::string::ToString::to_string)
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default()
+                            })
+                            .unwrap_or_default();
+                        !names.iter().any(|n| n == "tako-test")
+                    },
+                )
+                .await;
                 println!("（項目 48: kill 後の一覧 = {names:?}）");
                 check(
                     !names.iter().any(|n| n == "tako-test"),
@@ -39597,16 +39738,19 @@ mod self_test {
                 let backend_name = backend_name.unwrap_or_else(|| {
                     fail("persist 有効中の新ペインにバックエンドセッション名が付く")
                 });
-                let mut session_up = false;
-                for _ in 0..20 {
-                    wait(cx, 500).await;
-                    session_up = tako_core::tmux::list_sessions(Some(&backend_sock))
-                        .iter()
-                        .any(|s| s.name == backend_name);
-                    if session_up {
-                        break;
-                    }
-                }
+                // 器（tmux）のセッション生成は**別プロセスの往復**なので固定窓にしない
+                // （#1180。旧実装は 20 × 500ms = 10 秒）
+                let session_up = wait_for_backend_state(
+                    cx,
+                    "59-session",
+                    text_wait_budget(20, 500, 25),
+                    |_cx| {
+                        tako_core::tmux::list_sessions(Some(&backend_sock))
+                            .iter()
+                            .any(|s| s.name == backend_name)
+                    },
+                )
+                .await;
                 check(session_up, "分割でバックエンドセッションが生える");
                 press(any, cx, sh.clear_line_key());
                 // 器（tmux）の client + 内側シェルの二段起動を跨ぐので
@@ -39634,22 +39778,27 @@ mod self_test {
                         .to_string();
                     press(any, cx, sh.clear_line_key());
                     type_text(any, cx, &sh.mkdir_and_cd(&osc_e2e_dir), true);
-                    let mut cwd_ok = false;
-                    for _ in 0..20 {
-                        wait(cx, 500).await;
-                        cwd_ok = window
-                            .update(cx, |app, _, _| {
-                                app.terminals
-                                    .get(&backend_pane)
-                                    .and_then(|s| s.cwd())
-                                    .map(|p| p.display().to_string().contains("tako-osc-e2e"))
-                                    .unwrap_or(false)
-                            })
-                            .unwrap_or(false);
-                        if cwd_ok {
-                            break;
-                        }
-                    }
+                    // 器のパススルー → 側路（`osc_sink`）の 2 秒 tick を跨ぐので
+                    // 固定窓にしない（#1073 の作法 + #1180。旧実装は 20 × 500ms = 10 秒）
+                    let cwd_ok = wait_for_backend_state(
+                        cx,
+                        "60-cwd",
+                        text_wait_budget(20, 500, 25),
+                        |cx| {
+                            window
+                                .update(cx, |app, _, _| {
+                                    app.terminals
+                                        .get(&backend_pane)
+                                        .and_then(|s| s.cwd())
+                                        .map(|p| {
+                                            p.display().to_string().contains("tako-osc-e2e")
+                                        })
+                                        .unwrap_or(false)
+                                })
+                                .unwrap_or(false)
+                        },
+                    )
+                    .await;
                     // #1105: 落ちたときに「何が無いか」を名指しする（#796 の作法）。
                     //
                     // この項目は「器の中のシェルがシェル統合を読み込んで OSC 7 を出し、
@@ -39784,23 +39933,27 @@ mod self_test {
 
                 // 61. tty がバックエンド側ペイン tty へ差し替わり（ポート検知・tmuxview の
                 //     突き合わせ先）、tmux list が backend: true + 対応ペインで区別される
-                let mut tty_ok = false;
-                for _ in 0..20 {
-                    wait(cx, 500).await;
-                    let inner = tako_core::tmux_backend::pane_tty(&backend_sock, &backend_name);
-                    tty_ok = inner.is_some()
-                        && window
-                            .update(cx, |app, _, _| {
-                                app.terminals
-                                    .get(&backend_pane)
-                                    .and_then(|s| s.tty_name().map(str::to_string))
-                                    == inner
-                            })
-                            .unwrap_or(false);
-                    if tty_ok {
-                        break;
-                    }
-                }
+                // 器の pane_tty の問い合わせ + tako 側の差し替えの二段なので固定窓にしない
+                // （#1180。旧実装は 20 × 500ms = 10 秒）
+                let tty_ok = wait_for_backend_state(
+                    cx,
+                    "61-tty",
+                    text_wait_budget(20, 500, 25),
+                    |cx| {
+                        let inner =
+                            tako_core::tmux_backend::pane_tty(&backend_sock, &backend_name);
+                        inner.is_some()
+                            && window
+                                .update(cx, |app, _, _| {
+                                    app.terminals
+                                        .get(&backend_pane)
+                                        .and_then(|s| s.tty_name().map(str::to_string))
+                                        == inner
+                                })
+                                .unwrap_or(false)
+                    },
+                )
+                .await;
                 check(tty_ok, "tty がバックエンドペイン tty へ差し替わる");
                 let listed_backend = window
                     .update(cx, |app, _, _| {
@@ -39850,42 +40003,48 @@ mod self_test {
                         );
                     })
                     .ok();
-                let mut wheel_scrolled = false;
-                for _ in 0..20 {
-                    wait(cx, 300).await;
-                    wheel_scrolled = window
-                        .update(cx, |app, _, _| {
-                            let mirrored = app
-                                .scroll_ctls
-                                .get(&backend_pane)
-                                .is_some_and(|c| c.mirror_scrolling());
-                            // 合成行列がライブ viewport と異なる = 過去が見えている
-                            let composed_differs = app
-                                .terminals
-                                .get(&backend_pane)
-                                .map(|s| s.screen(&app.theme))
-                                .and_then(|screen| {
-                                    let composed =
-                                        app.compose_mirror_lines(backend_pane, &screen)?;
-                                    Some(composed.first()?.text != screen.lines.first()?.text)
-                                })
+                // ミラーは capture の往復で立つ（1 フレームでは立たない）ので固定窓に
+                // しない（#1180。旧実装は 20 × 300ms = 6 秒）
+                let wheel_scrolled = wait_for_backend_state(
+                    cx,
+                    "61b-wheel",
+                    text_wait_budget(20, 300, 20),
+                    |cx| {
+                        window
+                            .update(cx, |app, _, _| {
+                                let mirrored = app
+                                    .scroll_ctls
+                                    .get(&backend_pane)
+                                    .is_some_and(|c| c.mirror_scrolling());
+                                // 合成行列がライブ viewport と異なる = 過去が見えている
+                                let composed_differs = app
+                                    .terminals
+                                    .get(&backend_pane)
+                                    .map(|s| s.screen(&app.theme))
+                                    .and_then(|screen| {
+                                        let composed =
+                                            app.compose_mirror_lines(backend_pane, &screen)?;
+                                        Some(
+                                            composed.first()?.text
+                                                != screen.lines.first()?.text,
+                                        )
+                                    })
+                                    .unwrap_or(false);
+                                // copy-mode には入っていない（キー飲まれの構造的解消）
+                                let no_copy_mode = tako_core::scroll::scroll_state(
+                                    &tako_core::scroll::ScrollTarget::Backend {
+                                        socket: backend_sock.clone(),
+                                        session: backend_name.clone(),
+                                    },
+                                )
+                                .map(|s| !s.in_mode)
                                 .unwrap_or(false);
-                            // copy-mode には入っていない（キー飲まれの構造的解消）
-                            let no_copy_mode = tako_core::scroll::scroll_state(
-                                &tako_core::scroll::ScrollTarget::Backend {
-                                    socket: backend_sock.clone(),
-                                    session: backend_name.clone(),
-                                },
-                            )
-                            .map(|s| !s.in_mode)
-                            .unwrap_or(false);
-                            mirrored && composed_differs && no_copy_mode
-                        })
-                        .unwrap_or(false);
-                    if wheel_scrolled {
-                        break;
-                    }
-                }
+                                mirrored && composed_differs && no_copy_mode
+                            })
+                            .unwrap_or(false)
+                    },
+                )
+                .await;
                 check(
                     wheel_scrolled,
                     "バックエンドのホイールがミラー表示に乗る（copy-mode 不使用）",
@@ -39932,29 +40091,32 @@ mod self_test {
                 //      （iTerm2 流。ミラー方式では copy-mode に入らないため
                 //      「キーが飲まれる」事故は構造的に起きない）
                 press(any, cx, "enter");
-                let mut key_cancelled = false;
-                for _ in 0..20 {
-                    wait(cx, 300).await;
-                    key_cancelled = window
-                        .update(cx, |app, _, _| {
-                            app.scroll_ctls
-                                .get(&backend_pane)
-                                .map(|c| !c.mirror_scrolling())
-                                .unwrap_or(true)
-                        })
-                        .unwrap_or(false)
-                        && tako_core::scroll::scroll_state(
-                            &tako_core::scroll::ScrollTarget::Backend {
-                                socket: backend_sock.clone(),
-                                session: backend_name.clone(),
-                            },
-                        )
-                        .map(|s| !s.in_mode)
-                        .unwrap_or(false);
-                    if key_cancelled {
-                        break;
-                    }
-                }
+                // ミラーの解除は capture の往復ぶん遅れるので固定窓にしない
+                // （#1180。旧実装は 20 × 300ms = 6 秒）
+                let key_cancelled = wait_for_backend_state(
+                    cx,
+                    "61d-key",
+                    text_wait_budget(20, 300, 20),
+                    |cx| {
+                        window
+                            .update(cx, |app, _, _| {
+                                app.scroll_ctls
+                                    .get(&backend_pane)
+                                    .map(|c| !c.mirror_scrolling())
+                                    .unwrap_or(true)
+                            })
+                            .unwrap_or(false)
+                            && tako_core::scroll::scroll_state(
+                                &tako_core::scroll::ScrollTarget::Backend {
+                                    socket: backend_sock.clone(),
+                                    session: backend_name.clone(),
+                                },
+                            )
+                            .map(|s| !s.in_mode)
+                            .unwrap_or(false)
+                    },
+                )
+                .await;
                 check(key_cancelled, "スクロール中のキー入力で最下部へ戻る（iTerm2 流）");
 
                 // 61e. CLI（dispatch 共有）でもバックエンドのミラー表示位置に効く
@@ -39966,28 +40128,31 @@ mod self_test {
                     &sh.discard_output(&format!("{cli} scroll --to 5")),
                     true,
                 );
-                let mut cli_scrolled = false;
-                for _ in 0..20 {
-                    wait(cx, 300).await;
-                    cli_scrolled = window
-                        .update(cx, |app, _, _| {
-                            app.scroll_ctls
-                                .get(&backend_pane)
-                                .map(|c| {
-                                    let pos = c
-                                        .mirror
-                                        .as_ref()
-                                        .map(|m| m.position)
-                                        .unwrap_or(c.pending_rows);
-                                    pos >= 4.5
-                                })
-                                .unwrap_or(false)
-                        })
-                        .unwrap_or(false);
-                    if cli_scrolled {
-                        break;
-                    }
-                }
+                // CLI の起動 + IPC 往復 + capture の往復が乗るので固定窓にしない
+                // （#1180。旧実装は 20 × 300ms = 6 秒）
+                let cli_scrolled = wait_for_backend_state(
+                    cx,
+                    "61e-cli",
+                    text_wait_budget(20, 300, 20),
+                    |cx| {
+                        window
+                            .update(cx, |app, _, _| {
+                                app.scroll_ctls
+                                    .get(&backend_pane)
+                                    .map(|c| {
+                                        let pos = c
+                                            .mirror
+                                            .as_ref()
+                                            .map(|m| m.position)
+                                            .unwrap_or(c.pending_rows);
+                                        pos >= 4.5
+                                    })
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false)
+                    },
+                )
+                .await;
                 check(cli_scrolled, "tako scroll がバックエンドのミラー表示位置に効く");
 
                 // 61f. タブ内ペインで attach 中の外部 tmux セッションはタブ枠へ紐付き、
@@ -40012,33 +40177,38 @@ mod self_test {
                     ),
                     true,
                 );
-                let mut attached_ok = false;
-                for _ in 0..20 {
-                    wait(cx, 500).await;
-                    attached_ok = window
-                        .update(cx, |app, _, _| {
-                            app.refresh_tmux_data();
-                            let groups = app.tmux_view_groups();
-                            // attach 先ペイン（backend_pane）が居るタブ枠に紐付く
-                            let in_group = groups.iter().any(|g| {
-                                g.rows.iter().any(|r| r.pane == backend_pane)
-                                    && g.sessions.iter().any(|s| {
-                                        s.name == att_name
-                                            && s.pane == backend_pane.as_u64()
-                                            && !s.windows.is_empty()
-                                    })
-                            });
-                            let not_unlisted = !app
-                                .tmux_unlisted_sessions()
-                                .iter()
-                                .any(|s| s.name == att_name);
-                            in_group && not_unlisted
-                        })
-                        .unwrap_or(false);
-                    if attached_ok {
-                        break;
-                    }
-                }
+                // 外部 tmux の new-session → attach → tako の tty 突き合わせの三段なので
+                // 固定窓にしない（#1180。旧実装は 20 × 500ms = 10 秒）。
+                // `refresh_tmux_data` は**駆動**なので毎周期呼ばれる（注入で止まるのは
+                // 観測だけ = `wait_for_backend_state` の約束）
+                let attached_ok = wait_for_backend_state(
+                    cx,
+                    "61f-attach",
+                    text_wait_budget(20, 500, 25),
+                    |cx| {
+                        window
+                            .update(cx, |app, _, _| {
+                                app.refresh_tmux_data();
+                                let groups = app.tmux_view_groups();
+                                // attach 先ペイン（backend_pane）が居るタブ枠に紐付く
+                                let in_group = groups.iter().any(|g| {
+                                    g.rows.iter().any(|r| r.pane == backend_pane)
+                                        && g.sessions.iter().any(|s| {
+                                            s.name == att_name
+                                                && s.pane == backend_pane.as_u64()
+                                                && !s.windows.is_empty()
+                                        })
+                                });
+                                let not_unlisted = !app
+                                    .tmux_unlisted_sessions()
+                                    .iter()
+                                    .any(|s| s.name == att_name);
+                                in_group && not_unlisted
+                            })
+                            .unwrap_or(false)
+                    },
+                )
+                .await;
                 // #1105: 落ちたときに「何が無いか」を名指しする（#796 の作法）。
                 // この項目は ①外部セッションが作れた ②そのセッションへ attach できた
                 // ③tako が tty 突き合わせでタブ枠へ紐付けた の 3 段で、段ごとに原因が違う
@@ -40111,16 +40281,19 @@ mod self_test {
                 // 62. ペインの明示 close でバックエンドセッションも破棄される
                 //     （アプリ終了では破棄されない = 永続化、は core の e2e テストで検証済み）
                 press(any, cx, "cmd-w");
-                let mut killed = false;
-                for _ in 0..20 {
-                    wait(cx, 500).await;
-                    killed = !tako_core::tmux::list_sessions(Some(&backend_sock))
-                        .iter()
-                        .any(|s| s.name == backend_name);
-                    if killed {
-                        break;
-                    }
-                }
+                // 器のセッション破棄は**別プロセスの往復**なので固定窓にしない
+                // （#1180。旧実装は 20 × 500ms = 10 秒）
+                let killed = wait_for_backend_state(
+                    cx,
+                    "62-close",
+                    text_wait_budget(20, 500, 25),
+                    |_cx| {
+                        !tako_core::tmux::list_sessions(Some(&backend_sock))
+                            .iter()
+                            .any(|s| s.name == backend_name)
+                    },
+                )
+                .await;
                 check(killed, "明示 close でバックエンドセッションが消える");
 
                 // 後片付け: 隔離バックエンドサーバーごと落とす
@@ -42474,26 +42647,30 @@ mod self_test {
                 // #796: 上限まで待っても繋がらないときは **tmux の言い分**（stderr）と
                 // ペイン側の状態を残す。旧実装は真偽だけで、負荷起因の遅れと
                 // 「そもそも attach が失敗している」を切り分けられなかった
-                let mut attached = false;
                 let mut attach_diag = String::from("list-clients を実行できない");
-                for _ in 0..25 {
-                    wait(cx, 400).await;
-                    let out = std::process::Command::new("tmux")
-                        .args(["-L", &dnd_sock, "list-clients"])
-                        .output();
-                    if let Ok(out) = out.as_ref() {
-                        attached = out.status.success() && !out.stdout.is_empty();
+                // 成立は tmux サーバーとの往復なので固定窓にしない（#1180。旧実装は
+                // 25 × 400ms = 10 秒で、#1175 の検証中に 1 回ここで止まった）
+                let attached = wait_for_backend_state(
+                    cx,
+                    "68-attach",
+                    text_wait_budget(25, 400, 25),
+                    |_cx| {
+                        let out = std::process::Command::new("tmux")
+                            .args(["-L", &dnd_sock, "list-clients"])
+                            .output();
+                        let Ok(out) = out.as_ref() else {
+                            return false;
+                        };
                         attach_diag = format!(
                             "status={} stdout_len={} stderr={:?}",
                             out.status,
                             out.stdout.len(),
                             String::from_utf8_lossy(&out.stderr).trim()
                         );
-                    }
-                    if attached {
-                        break;
-                    }
-                }
+                        out.status.success() && !out.stdout.is_empty()
+                    },
+                )
+                .await;
                 if !attached {
                     let pane_state = window
                         .update(cx, |app, _, _| {
@@ -42610,23 +42787,26 @@ mod self_test {
                     .unwrap_or(0);
                 let view_pane = PaneId::from_raw(view_pane_raw);
                 // attach クライアント成立 + 画面に seq 出力が映るまで待つ
-                let mut view_ready = false;
-                for _ in 0..25 {
-                    wait(cx, 400).await;
-                    view_ready = window
-                        .update(cx, |app, _, _| {
-                            app.terminals
-                                .get(&view_pane)
-                                .map(|s| {
-                                    s.visible_lines().iter().any(|l| l.contains("200"))
-                                })
-                                .unwrap_or(false)
-                        })
-                        .unwrap_or(false);
-                    if view_ready {
-                        break;
-                    }
-                }
+                // attach + 内側シェルの出力が画面へ返る往復ぶん遅れるので固定窓にしない
+                // （#1180。旧実装は 25 × 400ms = 10 秒）
+                let view_ready = wait_for_backend_state(
+                    cx,
+                    "73-screen",
+                    text_wait_budget(25, 400, 25),
+                    |cx| {
+                        window
+                            .update(cx, |app, _, _| {
+                                app.terminals
+                                    .get(&view_pane)
+                                    .map(|s| {
+                                        s.visible_lines().iter().any(|l| l.contains("200"))
+                                    })
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false)
+                    },
+                )
+                .await;
                 check(view_ready, "TmuxOpen ペインに外部セッションの画面が映る");
 
                 // 78. Web dock URL 入力欄のフォーカスと入力 (#375)
@@ -42849,48 +43029,55 @@ mod self_test {
                         );
                     })
                     .ok();
-                let mut view_scrolled = false;
                 let mut view_scroll_detail = (false, false, false);
-                for _ in 0..20 {
-                    wait(cx, 300).await;
-                    let detail = window
-                        .update(cx, |app, _, _| {
-                            let mirrored = app
-                                .scroll_ctls
-                                .get(&view_pane)
-                                .is_some_and(|c| c.mirror_scrolling());
-                            // 合成行列がライブ viewport と異なる = 過去が見えている
-                            let composed_differs = app
-                                .terminals
-                                .get(&view_pane)
-                                .map(|s| s.screen(&app.theme))
-                                .and_then(|screen| {
-                                    let composed =
-                                        app.compose_mirror_lines(view_pane, &screen)?;
-                                    Some(composed.first()?.text != screen.lines.first()?.text)
-                                })
-                                .unwrap_or(false);
-                            // バーは幾何計算の成立で判定する（実描画の text_area は
-                            // ウィンドウが背面だと新設ペインに対して確立しないため、
-                            // 固定サイズの仮領域を渡す。実 area での検証は 61c が担保）
-                            let bar = app
-                                .scrollbar_overlay(
-                                    view_pane,
-                                    Bounds {
-                                        origin: point(px(0.0), px(0.0)),
-                                        size: size(px(400.0), px(600.0)),
-                                    },
-                                )
-                                .is_some();
-                            (mirrored, composed_differs, bar)
-                        })
-                        .unwrap_or((false, false, false));
-                    view_scroll_detail = detail;
-                    view_scrolled = detail.0 && detail.1 && detail.2;
-                    if view_scrolled {
-                        break;
-                    }
-                }
+                // ミラーは capture の往復で立つ（1 フレームでは立たない）ので固定窓に
+                // しない（#1180。旧実装は 20 × 300ms = 6 秒で、#1175 の検証中に
+                // 2 回ここで止まった）
+                let view_scrolled = wait_for_backend_state(
+                    cx,
+                    "73-wheel",
+                    text_wait_budget(20, 300, 20),
+                    |cx| {
+                        let detail = window
+                            .update(cx, |app, _, _| {
+                                let mirrored = app
+                                    .scroll_ctls
+                                    .get(&view_pane)
+                                    .is_some_and(|c| c.mirror_scrolling());
+                                // 合成行列がライブ viewport と異なる = 過去が見えている
+                                let composed_differs = app
+                                    .terminals
+                                    .get(&view_pane)
+                                    .map(|s| s.screen(&app.theme))
+                                    .and_then(|screen| {
+                                        let composed =
+                                            app.compose_mirror_lines(view_pane, &screen)?;
+                                        Some(
+                                            composed.first()?.text
+                                                != screen.lines.first()?.text,
+                                        )
+                                    })
+                                    .unwrap_or(false);
+                                // バーは幾何計算の成立で判定する（実描画の text_area は
+                                // ウィンドウが背面だと新設ペインに対して確立しないため、
+                                // 固定サイズの仮領域を渡す。実 area での検証は 61c が担保）
+                                let bar = app
+                                    .scrollbar_overlay(
+                                        view_pane,
+                                        Bounds {
+                                            origin: point(px(0.0), px(0.0)),
+                                            size: size(px(400.0), px(600.0)),
+                                        },
+                                    )
+                                    .is_some();
+                                (mirrored, composed_differs, bar)
+                            })
+                            .unwrap_or((false, false, false));
+                        view_scroll_detail = detail;
+                        detail.0 && detail.1 && detail.2
+                    },
+                )
+                .await;
                 eprintln!(
                     "TAKO_SELF_TEST_181_VIEW: mirrored={} composed_differs={} bar={}",
                     view_scroll_detail.0, view_scroll_detail.1, view_scroll_detail.2
@@ -43004,16 +43191,19 @@ mod self_test {
                     ),
                     true,
                 );
-                let mut ws_ok = false;
-                for _ in 0..25 {
-                    wait(cx, 400).await;
-                    ws_ok = std::fs::read_to_string(&ws_out)
-                        .map(|s| s.contains("\"status\""))
-                        .unwrap_or(false);
-                    if ws_ok {
-                        break;
-                    }
-                }
+                // CLI プロセスの起動 + IPC 往復 + ファイルへの書き出しを待つので
+                // 固定窓にしない（#1180。旧実装は 25 × 400ms = 10 秒）
+                let ws_ok = wait_for_backend_state(
+                    cx,
+                    "74-status",
+                    text_wait_budget(25, 400, 25),
+                    |_cx| {
+                        std::fs::read_to_string(&ws_out)
+                            .map(|s| s.contains("\"status\""))
+                            .unwrap_or(false)
+                    },
+                )
+                .await;
                 check(
                     ws_ok,
                     "worker_status が IPC（background 合成）経由で応答する（#181）",
@@ -44323,26 +44513,29 @@ mod self_test {
                     .unwrap_or(false);
                 check(listed, "Web ビュー list（id / ペイン対応）");
                 // read: 実ページからのタイトル追跡（初期化スクリプト → ipc 往復）を待つ
-                let mut title_ok = false;
-                for _ in 0..25 {
-                    wait(cx, 200).await;
-                    title_ok = window
-                        .update(cx, |app, _, _cx| {
-                            let r = tako_control::dispatch(
-                                app,
-                                web_req("read", None, Some(web_id), None, None, None),
-                                PaneOrigin::Cli,
-                            )
-                            .ok()?;
-                            Some(r["title"].as_str() == Some("tako-wv-test"))
-                        })
-                        .ok()
-                        .flatten()
-                        .unwrap_or(false);
-                    if title_ok {
-                        break;
-                    }
-                }
+                // 初期化スクリプト → ipc 往復ぶん遅れるので固定窓にしない
+                // （#1180。旧実装は 25 × 200ms = 5 秒）
+                let title_ok = wait_for_backend_state(
+                    cx,
+                    "71-title",
+                    text_wait_budget(25, 200, 20),
+                    |cx| {
+                        window
+                            .update(cx, |app, _, _cx| {
+                                let r = tako_control::dispatch(
+                                    app,
+                                    web_req("read", None, Some(web_id), None, None, None),
+                                    PaneOrigin::Cli,
+                                )
+                                .ok()?;
+                                Some(r["title"].as_str() == Some("tako-wv-test"))
+                            })
+                            .ok()
+                            .flatten()
+                            .unwrap_or(false)
+                    },
+                )
+                .await;
                 if !title_ok {
                     // 切り分け診断: ipc（タイトル追跡）不達時に read の生値と
                     // evaluate_script_with_callback の生存を出力してから fail する
@@ -44398,26 +44591,29 @@ mod self_test {
                         PaneOrigin::Cli,
                     );
                 });
-                let mut nav_ok = false;
-                for _ in 0..25 {
-                    wait(cx, 200).await;
-                    nav_ok = window
-                        .update(cx, |app, _, _cx| {
-                            let r = tako_control::dispatch(
-                                app,
-                                web_req("read", None, Some(web_id), None, None, None),
-                                PaneOrigin::Cli,
-                            )
-                            .ok()?;
-                            Some(r["title"].as_str() == Some("tako-wv-2"))
-                        })
-                        .ok()
-                        .flatten()
-                        .unwrap_or(false);
-                    if nav_ok {
-                        break;
-                    }
-                }
+                // ページ遷移 → タイトル更新の ipc 往復ぶん遅れるので固定窓にしない
+                // （#1180。旧実装は 25 × 200ms = 5 秒）
+                let nav_ok = wait_for_backend_state(
+                    cx,
+                    "71-navigate",
+                    text_wait_budget(25, 200, 20),
+                    |cx| {
+                        window
+                            .update(cx, |app, _, _cx| {
+                                let r = tako_control::dispatch(
+                                    app,
+                                    web_req("read", None, Some(web_id), None, None, None),
+                                    PaneOrigin::Cli,
+                                )
+                                .ok()?;
+                                Some(r["title"].as_str() == Some("tako-wv-2"))
+                            })
+                            .ok()
+                            .flatten()
+                            .unwrap_or(false)
+                    },
+                )
+                .await;
                 check(nav_ok, "Web ビュー navigate（URL 遷移 + タイトル更新）");
                 // eval → eval_result: JS 評価（AI の画面操作経路）
                 let eval_token = window
@@ -44435,33 +44631,36 @@ mod self_test {
                 let Some(eval_token) = eval_token else {
                     fail("Web ビュー eval 発行");
                 };
-                let mut eval_ok = false;
-                for _ in 0..25 {
-                    wait(cx, 200).await;
-                    eval_ok = window
-                        .update(cx, |app, _, _cx| {
-                            let r = tako_control::dispatch(
-                                app,
-                                web_req(
-                                    "eval_result",
-                                    None,
-                                    Some(web_id),
-                                    None,
-                                    None,
-                                    Some(eval_token),
-                                ),
-                                PaneOrigin::Cli,
-                            )
-                            .ok()?;
-                            Some(r["result"].as_i64() == Some(3))
-                        })
-                        .ok()
-                        .flatten()
-                        .unwrap_or(false);
-                    if eval_ok {
-                        break;
-                    }
-                }
+                // JS 評価の結果は ipc の往復で返るので固定窓にしない
+                // （#1180。旧実装は 25 × 200ms = 5 秒）
+                let eval_ok = wait_for_backend_state(
+                    cx,
+                    "71-eval",
+                    text_wait_budget(25, 200, 20),
+                    |cx| {
+                        window
+                            .update(cx, |app, _, _cx| {
+                                let r = tako_control::dispatch(
+                                    app,
+                                    web_req(
+                                        "eval_result",
+                                        None,
+                                        Some(web_id),
+                                        None,
+                                        None,
+                                        Some(eval_token),
+                                    ),
+                                    PaneOrigin::Cli,
+                                )
+                                .ok()?;
+                                Some(r["result"].as_i64() == Some(3))
+                            })
+                            .ok()
+                            .flatten()
+                            .unwrap_or(false)
+                    },
+                )
+                .await;
                 check(eval_ok, "Web ビュー eval → eval_result（JS 評価）");
                 // hide: dock 退避（ページは生存、ペインは閉じる）
                 let hidden = window
@@ -44809,22 +45008,28 @@ mod self_test {
                     // #932 の裏タブ用の割り出しを待つ）。**出るまで待つのではなく
                     // 上限つきで待って、出なければ理由つきで飛ばす**（#796 の作法）
                     let mut full_cols = None;
-                    for _ in 0..25 {
-                        full_cols = window
-                            .update(cx, |app, _, _cx| {
-                                tako_control::host::UiStateHost::pane_cols_for_width_fraction(
-                                    app,
-                                    TabId::from_raw(lt_tab),
-                                    1.0,
-                                )
-                            })
-                            .ok()
-                            .flatten();
-                        if full_cols.is_some() {
-                            break;
-                        }
-                        wait(cx, 200).await;
-                    }
+                    // 裏タブの幅は #932 の割り出しが走ってから載るので固定窓にしない
+                    // （#1180。旧実装は 25 × 200ms = 5 秒）。**出なければ飛ばす**という
+                    // この項目の意味は変えない = 上限に届いたら `None` のまま抜ける
+                    let _ = wait_for_backend_state(
+                        cx,
+                        "72b-cols",
+                        text_wait_budget(25, 200, 20),
+                        |cx| {
+                            full_cols = window
+                                .update(cx, |app, _, _cx| {
+                                    tako_control::host::UiStateHost::pane_cols_for_width_fraction(
+                                        app,
+                                        TabId::from_raw(lt_tab),
+                                        1.0,
+                                    )
+                                })
+                                .ok()
+                                .flatten();
+                            full_cols.is_some()
+                        },
+                    )
+                    .await;
                     let floor = full_cols.map(|c| {
                         c.clamp(
                             tako_core::spawn_layout::MIN_WORKER_COLS_FLOOR,
@@ -65303,7 +65508,7 @@ mod self_test_wait_budget_tests {
 #[cfg(test)]
 mod self_test_claude_wait_tests {
     use super::self_test::{
-        claude_budget_capped, inject_771_delay, resolve_claude_wait, text_wait_budget,
+        budget_capped, inject_771_delay, resolve_claude_wait, text_wait_budget,
     };
     use std::time::Duration;
 
@@ -65410,11 +65615,11 @@ mod self_test_claude_wait_tests {
     /// SKIP にして隠さないので、これは**理由の申告**にしか使わない
     #[test]
     fn 極端な混み具合だけが打ち切りとして申告される() {
-        assert!(!claude_budget_capped(None));
-        assert!(!claude_budget_capped(Some(0.0)));
-        assert!(!claude_budget_capped(Some(2.9)));
-        assert!(claude_budget_capped(Some(3.0)));
-        assert!(claude_budget_capped(Some(30.0)));
+        assert!(!budget_capped(None));
+        assert!(!budget_capped(Some(0.0)));
+        assert!(!budget_capped(Some(2.9)));
+        assert!(budget_capped(Some(3.0)));
+        assert!(budget_capped(Some(30.0)));
     }
 }
 
@@ -65426,6 +65631,119 @@ mod self_test_claude_wait_tests {
 /// 確実に落ちる**。証拠を transcript から採ると流れない。ここでは
 /// **①本文が User 発話にあれば採れる ②後任の申告と渡したプロンプトを取り違えない**
 /// の 2 点を、実機を待たずに固定する
+/// **器（tmux）の往復待ちの予算**（純粋関数。#1180）。
+///
+/// 旧実装はどれも `for _ in 0..N { wait(cx, M).await; … }` = 固定 N×M 窓で、
+/// 待っている相手が別プロセス（tmux サーバー / attach クライアント / CLI）の往復
+/// なので混んだ機では素直に窓を使い切っていた。ここでは
+/// **①旧の固定窓を同一バイナリで再現できる ②新経路は伸ばすだけ ③注入の遅れが
+/// 旧の窓を超えて新の上限に収まる**の 3 点を、実機を待たずに固定する
+#[cfg(test)]
+mod self_test_backend_wait_tests {
+    use super::self_test::{
+        budget_capped, inject_1180_delay, resolve_backend_wait, text_wait_budget,
+    };
+    use std::time::Duration;
+
+    /// 旧経路（`TAKO_1180_LEGACY=1`）は項目 68 の固定窓をそのまま再現する
+    #[test]
+    fn 旧経路は項目68の固定窓をそのまま再現する() {
+        let (limit, poll) = resolve_backend_wait(text_wait_budget(25, 400, 25), Some(3.0), true);
+        assert_eq!(limit, Duration::from_millis(400 * 25), "旧の固定窓は 10 秒");
+        assert_eq!(poll, Duration::from_millis(400));
+    }
+
+    /// 新経路は素の上限が旧の固定窓を超える（超えないと A/B が取れない）
+    #[test]
+    fn 新経路の素の上限は旧の窓を超える() {
+        let budget = text_wait_budget(25, 400, 25);
+        let (legacy, _) = resolve_backend_wait(budget, Some(0.0), true);
+        let (idle, poll) = resolve_backend_wait(budget, Some(0.0), false);
+        assert!(idle > legacy, "新経路が旧の固定窓を超えていない");
+        // 刻みは旧のまま据え置く（1 周期の観測が実プロセスの起動を伴うので細かくしない）
+        assert_eq!(poll, Duration::from_millis(400));
+    }
+
+    /// 混み具合で伸び、4 倍で打ち切る（政策は `state_wait_budget` と 1 つ）
+    #[test]
+    fn 混んだ機で伸びて4倍で打ち切る_1180() {
+        let budget = text_wait_budget(25, 400, 25);
+        let (busy, _) = resolve_backend_wait(budget, Some(1.0), false);
+        assert_eq!(busy, Duration::from_secs(50));
+        let (extreme, _) = resolve_backend_wait(budget, Some(10.0), false);
+        assert_eq!(extreme, Duration::from_secs(100));
+        assert!(budget_capped(Some(10.0)));
+    }
+
+    /// `load=unknown` の環境（Windows 実機）でも素の上限は残る = 環境で緩くならない
+    #[test]
+    fn 混み具合が読めなくても素の上限は残る_1180() {
+        let (limit, _) = resolve_backend_wait(text_wait_budget(25, 400, 25), None, false);
+        assert_eq!(limit, Duration::from_secs(25));
+    }
+
+    /// 呼び出し側の予算を**ソースから採る**（呼び出しが増えても勝手に検査される）。
+    /// パターンは `concat!` で分割して書く（このテスト自身のソース行が対象に入るため）
+    fn backend_wait_budgets() -> Vec<(u32, u64, u64)> {
+        let src = include_str!("main.rs");
+        let call = concat!("wait_for_backend", "_state(");
+        let budget = concat!("text_wait", "_budget(");
+        let mut out = Vec::new();
+        for (index, _) in src.match_indices(call) {
+            // 文字境界で切る（日本語コメントの途中でバイト単位に切ると落ちる）
+            let head: String = src[index..].chars().take(400).collect();
+            let Some(pos) = head.find(budget) else {
+                continue;
+            };
+            let args = &head[pos + budget.len()..];
+            let Some(close) = args.find(')') else {
+                continue;
+            };
+            let nums: Vec<u64> = args[..close]
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
+            if let [times, interval, base] = nums[..] {
+                out.push((times as u32, interval, base));
+            }
+        }
+        out
+    }
+
+    /// 注入 `late` の遅れは**旧の固定窓を超え、新の素の上限に収まる**。
+    /// この不等式が崩れると「旧が落ちて新が通る」の A/B が成立しない
+    #[test]
+    fn 注入の遅れは旧の窓を超えて新の上限に収まる_1180() {
+        let sites = backend_wait_budgets();
+        assert!(
+            sites.len() >= 18,
+            "器の往復待ちの呼び出しが採れていない（採れたのは {sites:?}）"
+        );
+        assert!(
+            sites.contains(&(25, 400, 25)),
+            "項目 68（attach クライアント）の予算（旧 25 × 400ms）が採れていない: {sites:?}"
+        );
+        assert!(
+            sites.contains(&(20, 300, 20)),
+            "項目 73（ホイールのミラー）の予算（旧 20 × 300ms）が採れていない: {sites:?}"
+        );
+        for (times, interval, base) in sites {
+            let budget = text_wait_budget(times, interval, base);
+            let (legacy, _) = resolve_backend_wait(budget, Some(0.0), true);
+            let (idle, _) = resolve_backend_wait(budget, Some(0.0), false);
+            let delay = inject_1180_delay(legacy);
+            assert!(
+                delay > legacy,
+                "注入が旧の窓を超えていない: ({times}, {interval}, {base})"
+            );
+            assert!(
+                delay < idle,
+                "注入が新の上限に収まっていない: ({times}, {interval}, {base})"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod self_test_handoff_evidence_tests {
     use super::chat_view::{ChatMessage, ChatRole};
@@ -67457,7 +67775,14 @@ mod selftest_wait_watchdog {
     /// 予算切れで無検証にならない = 先頭の行が `wait` ではない。
     /// パターンは `concat!` で分割して書く（番犬自身のソース行が検査対象に入るため）
     fn fixed_window_then_dispatch_read(src: &str) -> Vec<usize> {
-        let reads = [concat!("read(", "app)"), concat!("choice_", "dialog")];
+        // #1180: `dispatch(` そのものも needle にする。Web ビュー（項目 71）の
+        // 3 か所は `dispatch(\n app,\n web_req("read", …)` の形で、行を畳んでも
+        // `read(app)` にならないので旧の needle をすり抜けていた
+        let reads = [
+            concat!("read(", "app)"),
+            concat!("choice_", "dialog"),
+            concat!("tako_control::", "dispatch("),
+        ];
         fixed_window_loop_bodies(src)
             .into_iter()
             .filter(|(_, body)| reads.iter().any(|needle| body.contains(needle)))
@@ -67557,6 +67882,15 @@ mod selftest_wait_watchdog {
             concat!("read(", "app)")
         );
         assert!(fixed_window_then_dispatch_read(&good).is_empty());
+        // #1180: Web ビュー（項目 71）の形。行を畳んでも `read(app)` にならないので
+        // 旧の needle では見つからなかった
+        let web = format!(
+            "                for _ in 0..25 {{\n                    {}\n                    \
+             title_ok = window.update(cx, |app, _, _cx| {{ let r = {}",
+            concat!("wait(cx", ", 200).await;"),
+            concat!("tako_control::", "dispatch(")
+        );
+        assert_eq!(fixed_window_then_dispatch_read(&web), vec![1]);
     }
 
     #[test]
@@ -67588,6 +67922,170 @@ mod selftest_wait_watchdog {
             concat!("wait_for_app", "_state")
         );
         assert!(fixed_window_then_growth_read(&good).is_empty());
+    }
+
+    /// **固定窓のあいだに器（tmux）・外のプロセスの往復を待っていない**（#1180）。
+    ///
+    /// `for _ in 0..25 { wait(cx, 400).await; … }` = 「25 回 × 400ms = **固定 10 秒**」の
+    /// 窓で、`tmux list-clients` の成立・capture 由来のミラー・別プロセスが書くファイルを
+    /// 待つ形。相手は**別プロセスの往復**なので混んだ機では素直に窓を使い切る
+    /// （#1180 の実測: #1175 の検証中に項目 68 の attach が 1 回・項目 73 のホイールが
+    /// 2 回止まり、どれも再実行で通った = 負荷依存）。
+    ///
+    /// なぜ既存の番犬をすり抜けたか: #1153 / #1165 / #1162 の needle は
+    /// `focused_contains` / `.len() > ` / `read(app)` で、tmux 系の判定式
+    /// （`list_sessions` / `mirror_scrolling` / `pane_tty` / `read_to_string`）を
+    /// 1 つも含んでいなかった。#771 は region 型だが gate が `claude_e2e` 限定。
+    ///
+    /// そこでアンカーを 2 つ持つ:
+    /// 1. **region**: `has_tmux…` を名乗るブロックの入口から閉じ括弧までの中にある
+    ///    固定回数ループ（`wait(cx,` と `break` を本文に持つもの = 待ちの結果を判定に
+    ///    使っているもの）。判定式が何であれ名指しできるので、**画面が映るのを待つ**
+    ///    形（項目 73 の `visible_lines`）も落ちる。`break` を持たないループ
+    ///    （片付けの叩き込み・作成のリトライ）は対象外
+    /// 2. **needle**: 器の外で「別プロセスが書いたファイル」を待つ形
+    ///    （項目 74 の `read_to_string`）。tmux ゲートの外にあるので region では拾えない
+    ///
+    /// 正しい形は `wait_for_backend_state`（状態待ち + `state_wait_budget` の上限 +
+    /// 毎周期の駆動）。パターンは `concat!` で分割して書く
+    /// （番犬自身のソース行が検査対象に入るため）
+    fn fixed_window_then_backend_state(src: &str) -> Vec<usize> {
+        let lines: Vec<&str> = src.lines().collect();
+        let wait_call = concat!("wait(cx", ", ");
+        let mut hits = Vec::new();
+        for (index, end) in tmux_gate_regions(&lines) {
+            for (offset, candidate) in lines.iter().enumerate().take(end).skip(index + 1) {
+                let trimmed = candidate.trim();
+                if !(trimmed.starts_with("for ")
+                    && trimmed.contains(" in 0..")
+                    && trimmed.ends_with('{'))
+                {
+                    continue;
+                }
+                // 本文は**インデントで閉じ括弧まで**採る（#771 と同じ理由: 行数で切ると
+                // 本文の長いループの末尾にある `wait` を見落とす）
+                let loop_indent = candidate.len() - candidate.trim_start().len();
+                let mut body = String::new();
+                for inner in lines.iter().take(end).skip(offset + 1) {
+                    let trimmed = inner.trim_start();
+                    if !trimmed.is_empty()
+                        && inner.len() - trimmed.len() == loop_indent
+                        && trimmed.starts_with('}')
+                    {
+                        break;
+                    }
+                    body.push_str(inner.trim());
+                    body.push(' ');
+                }
+                if body.contains(wait_call) && body.contains("break") {
+                    hits.push(offset + 1);
+                }
+            }
+        }
+        // 器のゲートの外で「別プロセスが書いたファイル」を待つ形
+        hits.extend(
+            fixed_window_loop_bodies(src)
+                .into_iter()
+                .filter(|(_, body)| body.contains(concat!("read_to_", "string(")))
+                .map(|(line, _)| line),
+        );
+        hits.sort_unstable();
+        hits.dedup();
+        hits
+    }
+
+    /// 器（tmux）が在ることで守られている**ブロックの入口**から閉じ括弧までを採る
+    /// （#1180。#771 の `claude_e2e_regions` と同じ形）。
+    ///
+    /// gate の名前が `has_tmux` / `has_tmux_cli` / `has_tmux_backend_e2e` の 3 通りある
+    /// ので、共通の接頭辞 1 つで拾う。`let has_tmux = …;` のような宣言は行末が `{` では
+    /// ないので region の頭にならない
+    fn tmux_gate_regions(lines: &[&str]) -> Vec<(usize, usize)> {
+        let gate = concat!("has_", "tmux");
+        let mut regions = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            if !(line.contains(gate) && line.trim_end().ends_with('{')) {
+                continue;
+            }
+            let indent = line.len() - line.trim_start().len();
+            let mut end = lines.len();
+            for (offset, candidate) in lines.iter().enumerate().skip(index + 1) {
+                let trimmed = candidate.trim_start();
+                if !trimmed.is_empty()
+                    && candidate.len() - trimmed.len() == indent
+                    && trimmed.starts_with('}')
+                {
+                    end = offset;
+                    break;
+                }
+            }
+            regions.push((index, end));
+        }
+        regions
+    }
+
+    #[test]
+    fn 固定窓のあいだに器の往復を待っていない() {
+        let src = include_str!("main.rs");
+        let hits = fixed_window_then_backend_state(src);
+        assert!(
+            hits.is_empty(),
+            "main.rs:{hits:?} が「固定回数の窓のあいだに器（tmux）・外のプロセスの往復を\
+             待つ」形で書かれている。相手は別プロセスなので混んだ機では窓を使い切り、\
+             **その項目以降が 1 つも走らなくなる**（#1180 の項目 68 / 73 は #1175 の\
+             検証中に計 3 回止まった）。`wait_for_backend_state`（状態待ち + \
+             `state_wait_budget` の上限）を使うこと"
+        );
+    }
+
+    /// 検出力の担保: 番犬自身が空振りしないこと（#1180 で直した形そのものを与える）
+    #[test]
+    fn 番犬は固定窓の器の往復を見逃さず状態待ちは許す() {
+        let gate = format!("            if {} {{", concat!("has_", "tmux"));
+        let close = "            }";
+        // 項目 68（attach クライアント）の旧実装そのもの
+        let bad = [
+            gate.as_str(),
+            "                for _ in 0..25 {",
+            &format!(
+                "                    {}",
+                concat!("wait(cx", ", 400).await;")
+            ),
+            "                    attached = out.status.success();",
+            "                    if attached {",
+            "                        break;",
+            "                    }",
+            "                }",
+            close,
+        ]
+        .join("\n");
+        assert_eq!(fixed_window_then_backend_state(&bad), vec![2]);
+        // 判定式が画面（項目 73 の `visible_lines`）でも region なら名指しできる
+        let screen = bad.replace(
+            "attached = out.status.success();",
+            "view_ready = s.visible_lines().iter().any(|l| l.contains(\"200\"));",
+        );
+        assert_eq!(fixed_window_then_backend_state(&screen), vec![2]);
+        // `break` を持たないループ（作成のリトライ・片付けの叩き込み）は対象外
+        let retry = bad.replace("                        break;\n", "");
+        assert!(fixed_window_then_backend_state(&retry).is_empty());
+        // 器のゲートの外は region では拾わない
+        let elsewhere = bad.replace(gate.as_str(), "            if other_gate {");
+        assert!(fixed_window_then_backend_state(&elsewhere).is_empty());
+        // ただし「別プロセスが書いたファイル」を待つ形は needle で拾う（項目 74）
+        let file = format!(
+            "                for _ in 0..25 {{\n                    {}\n                    \
+             ws_ok = std::fs::{}&ws_out).map(|s| s.contains(\"status\")).unwrap_or(false);",
+            concat!("wait(cx", ", 400).await;"),
+            concat!("read_to_", "string(")
+        );
+        assert_eq!(fixed_window_then_backend_state(&file), vec![1]);
+        // 状態待ちヘルパーへ寄せた形は許す
+        let good = format!(
+            "            let attached = {}(cx, \"68-attach\", budget, |_cx| probe()).await;",
+            concat!("wait_for_backend", "_state")
+        );
+        assert!(fixed_window_then_backend_state(&good).is_empty());
     }
 
     /// **実 claude の発話内容をビューポートで判定していない**（#1175）。
