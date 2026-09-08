@@ -19,16 +19,6 @@
 
 ---
 
-## 2026-09-09（#1188: tmux open で取り込んだセッションが永久に掃除されない問題を根治）
-- tmux のセッショングループは**メンバーが 1 つになっても残る**（実測 3.6b: ビュー kill 後も `grouped=1` / `size=1`）ので、判定材料を `#{session_group_size}` > 1 へ。行のパースと orphan 判定を `tmux_cleanup`（`LIST_FORMAT` / `is_orphan`）へ出し cleanup と find が 1 実装を見る形に
-- 実測（隔離 + tako-vd）: open 前 `grouped=0 size=` → open 中 `size=2` で cleanup は `killed=[]`（保護）→ close 後 `grouped=1 size=1` で `killed=[tako-blind-4]`
-- A/B `TAKO_1188_LEGACY=1` は Issue と同じ `killed=[]` + 残存を再現。ガードを丸ごと外す注入は表示中ビューの保護が落ちて FAILED（= 消して直したのではない）。番犬 1 本 + 単体 6 本
-
-## 2026-09-09（#893: ホーム解決と `~` 短縮の入口をワークスペース全体で 1 本に寄せた）
-- `HOME` 決め打ち 15 箇所を `paths::home_dir()` へ、`~` 短縮 10 箇所を新設 `paths::shorten_home` へ。`ssh_config` は Windows で ssh 系が効くようになり `issue652_resume_e2e` の `.expect("HOME")` panic も消えた
-- 番犬を 2 ファイル走査からワークスペース全体へ（`home_dir_watchdog.rs`）。テストの HOME 差し替えは Drop 復元の `HomeGuard` へ寄せた
-- A/B は修正前コードでホーム解決 30 行 + `~` 短縮 10 行を名指しして FAILED。全 3674 件緑・`HOME`/`USERPROFILE` 両方なしでも panic せずエラー文で止まる（実測）
-
 ## 2026-09-09（#1190: kill / resize の既定ソケットを list と揃え、tmux の生エラーを包んだ）
 - `socket` 省略時の解決を `tako_core::tmux::resolve_session_socket`（既定サーバー → tako バックエンド = list の並び）へ集約し、`kill` / `resize` / `open` の 3 つで共有。応答に解決後の `socket` を追加
 - 生 stderr は `friendly_error` で日本語へ（4 分類 + `scrub_paths` で絶対パスを伏せる）。**kill 前の確認 / `--force` は #1196 の担当で入れていない**（省略でも backend へ届くようになった）
@@ -90,3 +80,8 @@
 - `WIN_WELCOME_INJECTION` / `WIN_STARTER_INJECTION`（#899 修正前の宣言）を削除し、両方の Windows を `Supported` + `Evidence::Measured`（2026-09-09 の実機でボタンから setup / master が実際に走った）へ
 - 番犬 `ボタン投入を根拠にした宣言が実装と一致する` が宣言と裏づけ（PowerShell 方言で POSIX クォートに囲まれない = #899 の本体）を縛る
 - 実出力 `tako platform --platform windows` = 両方 `supported` / Known limitations から消えた / docs 再生成。A/B は Degraded へ戻すとテストと docs `--check` の両方が FAILED
+
+## 2026-09-09（#1076: 再起動後の claude resume が「起動途中の未検出」で自壊していたのを直した）
+- 真因は 2 つ: ①`claude agents --json` のスキャン結果でマップを丸ごと置き換え（+ 子プロセス不在で全消し）ていたので、**再起動直後の数秒**で `layout.json` の `claude_session_id` を全部捨てていた（実測: 復元直後 6 件 → 6 秒後 0 件）②復元だけが独自の最小形 `claude --resume <id>` を組んでいて役割 env / `--model` / `--effort` が落ちていた
+- 保持規則を `tako_core::claude_resume::ResumeIds`（**確認してから外す**）へ、判断とコマンドを `tako_control::sessions::restore_plan`（`resume_command` と共有）へ集約。`persist.log` に「復元の内訳」（役割つき / 役割なし / 新規シェルの理由 3 分類）を 1 行追加
+- 隔離 GUI 実測: 修正後は 76 秒後も 6 件のまま・実会話が resume されて継続（`⏺ repro-1076`）/ A/B `TAKO_1076_LEGACY=1` は同じ layout で 6 秒後 0 件 + `役割つき 0`。再 attach（8 ペイン）に回帰なし。番犬 4 本（修正前ソースで全滅）+ 単体 15 本。全 3766 件緑
