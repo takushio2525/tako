@@ -785,18 +785,21 @@ scene_guimode() {
     # ③ 3 枚のボタンが並んだ状態（全体）
     sleep 14
     promo_beat cards
-    # ④〜⑥ ボタンを 1 枚ずつ枠で囲んで説明する（枠の秒数は区間の尺に合わせてある）
+    # ④〜⑥ ボタンを 1 枚ずつ枠で囲んで説明する。
+    # **枠の秒数と間合いは実測したナレーション秒（narr/durations.tsv）から決めてある**
+    # （区間の尺 = max(min_dur, ナレーション秒 + 0.8)。GUI 章は 9.2〜17.5 秒）。
+    # 短いと説明の途中で枠が消え、間合いが足りないと次の操作が区間へ写り込む
     sleep 15
     promo_beat card1
-    promo_hi_at 501 352 919 141 13
+    promo_hi_at 501 352 919 141 16
     sleep 17
     promo_beat card2
-    promo_hi_at 501 509 919 142 11
+    promo_hi_at 501 509 919 142 16
     sleep 17
     promo_beat card3
-    promo_hi_at 501 666 919 142 12
-    sleep 7
-    promo_hi_at 495 828 640 104 5
+    promo_hi_at 501 666 919 142 14
+    sleep 8
+    promo_hi_at 495 828 640 104 6
 
     # ⑦ 「AI チームに任せる」を押す → 準備中… → チャット
     sleep 11
@@ -818,14 +821,15 @@ scene_guimode() {
         return 1
     fi
 
-    # ⑧ チャット画面の各部（ヘッダ → 入力欄の順に囲む）
+    # ⑧ チャット画面の各部（ヘッダ → 入力欄の順に囲む）。この区間は 17.5 秒（最長）なので
+    # 次の操作までの間合いを 20 秒とる = 説明中に入力の絵が写り込まない
     promo_beat chat
-    promo_hi_at 8 96 1904 52 6
-    sleep 7
-    promo_hi_at 25 880 1870 120 6
+    promo_hi_at 8 96 1904 52 8
+    sleep 9
+    promo_hi_at 25 880 1870 120 10
 
     # ⑨ 日本語で頼む（チャット入力欄へ実キー入力 → Enter）
-    sleep 6
+    sleep 11
     promo_beat ask
     # 入力欄は「押せたか」を読める状態が無いので、**打てたことを OCR で確かめる**のを
     # クリックの検査に兼ねる（1 回目が食われたら 2 周目で入る）
