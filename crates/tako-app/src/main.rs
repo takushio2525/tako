@@ -2099,9 +2099,11 @@ struct TakoApp {
     /// 子プロセス走査の対象指紋・前回結果・最終走査時刻（#779）。変化のない tick は
     /// tmux / ps を起動せず、この状態を sleep guard / GUI モード / close 確認で共有する。
     running_children_scan: tako_control::agents::RunningChildrenScanState,
-    /// シェル統合の側路（#766）: 器が OSC を素通ししないペインの書き先と読み取り位置。
-    /// **通す器（tmux）と器なしでは空のまま**なので、定期更新のコストはゼロ
-    osc_sinks: HashMap<PaneId, (std::path::PathBuf, tako_core::osc_sink::SinkCursor)>,
+    /// シェル統合の側路（#766）: 器が OSC を素通ししないペインの読み口。
+    /// **通す器（tmux）と器なしでは空のまま**なので、定期更新のコストはゼロ。
+    /// #1199: 待ち合わせ先は「そのペインのシェルの pid」で分かれる（器の中の別のシェルが
+    /// 同じファイルへ書けてしまうため）ので、pid が分かった時点で張り替える
+    osc_sinks: HashMap<PaneId, tako_core::osc_sink::SinkReader>,
     /// スリープ防止の最新状態（ステータスバーチップ + 詳細ポップオーバー表示用。
     /// ポーリングで更新。#173/#218/#440）
     sleep_guard_state: Option<tako_control::sleep_guard::SleepGuardState>,
@@ -6937,12 +6939,26 @@ impl TakoApp {
         let Some(path) = tako_core::osc_sink::prepare(&data_dir, pane_id.as_u64()) else {
             return;
         };
+        // 統合スクリプトへ渡すのは**解決前**のパス。スクリプトが自分の pid を載せて
+        // `<pane>@p<pid>.osc` へ解決する（#1199。`osc_sink::resolve_writer_path` が規則の正本）
         options.env.push((
             tako_core::osc_sink::SINK_ENV.into(),
             path.display().to_string(),
         ));
-        self.osc_sinks
-            .insert(pane_id, (path, tako_core::osc_sink::SinkCursor::default()));
+        self.osc_sinks.insert(
+            pane_id,
+            tako_core::osc_sink::SinkReader::new(&data_dir, pane_id.as_u64()),
+        );
+    }
+
+    /// 側路の待ち合わせ先を「そのペインのシェルの pid」で張る（#1199）。
+    ///
+    /// 器ありは器が言う `#{pane_pid}`、器なしは PTY 直下の子。これを張るまでは
+    /// 解決済みのファイルを読まない（器の中の別のシェルが書いたぶんを拾わないため）
+    fn set_osc_sink_writer(&mut self, pane_id: PaneId, pid: u32) {
+        if let Some(reader) = self.osc_sinks.get_mut(&pane_id) {
+            reader.set_writer_pid(pid);
+        }
     }
 
     /// 側路に新しい OSC が来ていたらセッションへ流す（定期更新から呼ぶ）。
@@ -6954,12 +6970,15 @@ impl TakoApp {
             return Vec::new();
         }
         let mut fed = Vec::new();
-        for (pane_id, (path, cursor)) in self.osc_sinks.iter_mut() {
-            let Some(bytes) = cursor.take_new(path) else {
+        for (pane_id, reader) in self.osc_sinks.iter_mut() {
+            let bundles = reader.take_new();
+            if bundles.is_empty() {
                 continue;
-            };
+            }
             if let Some(session) = self.terminals.get_mut(pane_id) {
-                session.feed_osc_bytes(&bytes);
+                for bytes in bundles {
+                    session.feed_osc_bytes(&bytes);
+                }
                 fed.push(*pane_id);
             }
         }
@@ -6969,8 +6988,8 @@ impl TakoApp {
     /// ペインを閉じたときに側路の残骸を消す（**3 つの close 経路すべてから呼ぶ**。
     /// 番犬テスト `close_経路は側路の後始末を集約関数に任せている` が拘束している）
     fn drop_pane_osc_sink(&mut self, pane_id: PaneId) {
-        if let Some((path, _)) = self.osc_sinks.remove(&pane_id) {
-            tako_core::osc_sink::discard(&path);
+        if let Some(reader) = self.osc_sinks.remove(&pane_id) {
+            reader.discard();
         }
     }
 
@@ -7039,6 +7058,13 @@ impl TakoApp {
             self.backend_sessions.remove(&pane_id);
         }
         let (session, mut rx) = TerminalSession::spawn(INITIAL_COLS, INITIAL_ROWS, options)?;
+        // #1199: 器なしのペインは PTY 直下の子がそのままシェルなので、側路の待ち合わせ先を
+        // ここで張れる（器ありは器へ `#{pane_pid}` を聞いてから張る = 下のリトライ）
+        if backend_session.is_none() {
+            if let Some(pid) = session.child_pid() {
+                self.set_osc_sink_writer(pane_id, pid);
+            }
+        }
         self.terminals.insert(pane_id, session);
         let delivery = self.pane_delivery.entry(pane_id).or_default().clone();
         let gate = self
@@ -7124,24 +7150,38 @@ impl TakoApp {
         if let Some(name) = backend_session {
             let socket = tako_core::tmux_backend::socket_name();
             cx.spawn(async move |this, cx| {
-                for _ in 0..20 {
+                // 250ms × 40 = 10 秒。#1199 で「側路の書き手 pid」も待つ対象になったので、
+                // 器のセッション作成が遅い機でも取り切れる長さにしてある
+                for _ in 0..40 {
                     cx.background_executor()
                         .timer(Duration::from_millis(250))
                         .await;
                     let (socket, name) = (socket.clone(), name.clone());
-                    let tty = cx
+                    let facts = cx
                         .background_executor()
-                        .spawn(async move { tako_core::tmux_backend::pane_tty(&socket, &name) })
+                        .spawn(async move { tako_core::tmux_backend::pane_facts(&socket, &name) })
                         .await;
                     let alive = this.update(cx, |app: &mut TakoApp, _| {
-                        match (&tty, app.terminals.get_mut(&pane_id)) {
-                            (Some(tty), Some(session)) => {
-                                session.set_tty_name(Some(tty.clone()));
-                                false // 解決済み → ループ終了
-                            }
-                            (None, Some(_)) => true, // 未解決 → リトライ
-                            (_, None) => false,      // ペインが先に閉じた → 打ち切り
+                        if !app.terminals.contains_key(&pane_id) {
+                            return false; // ペインが先に閉じた → 打ち切り
                         }
+                        // #1199: 側路の待ち合わせ先は器が言うペインのシェルの pid で決まる。
+                        // **tty だけ取れた時点で降りない**（降りると側路を一生張れず、
+                        // そのペインの cwd 追従とコマンド状態が黙って死ぬ）
+                        if let Some(pid) = facts.pid {
+                            app.set_osc_sink_writer(pane_id, pid);
+                        }
+                        let sink_armed = app
+                            .osc_sinks
+                            .get(&pane_id)
+                            .is_none_or(|reader| reader.writer_pid().is_some());
+                        if let (Some(tty), Some(session)) =
+                            (&facts.tty, app.terminals.get_mut(&pane_id))
+                        {
+                            session.set_tty_name(Some(tty.clone()));
+                            return !sink_armed; // tty は解決済み → 側路が張れたら終了
+                        }
+                        true // 未解決 → リトライ
                     });
                     if !matches!(alive, Ok(true)) {
                         return;

@@ -4288,3 +4288,77 @@ arm64 の表（上）と同じ形で、**x86_64 のほうが 1 関数あたり�
 - 出力が途中で途切れて `OK` も `FAILED` も無いなら**判定ではなくクラッシュ**。stderr の
   `has overflowed its stack` を見る（`.pdb` が無いのでトレースは採れない）
 - 予約だけ替えた A/B は `editbin /STACK:<bytes> <exe>` で数秒。**再ビルドは要らない**
+
+## #1199 の記録（リサイズで cwd が起動時ディレクトリへ巻き戻る。2026-09-09）
+
+**症状**（実機 UI レビューの起票）: ペインの寸法が変わると（ツリーを開く / 分割 / `tako resize`）
+tako が持つペインの cwd が**起動時のディレクトリへ巻き戻る**。シェル自身の cwd は変わらないので
+画面のプロンプトはプロジェクトのまま、tako の表示と API（ファイルツリーのルート・ステータスバー・
+`tako list` の `panes[].cwd`）だけがホームを指す = **機能不能**（AI が誤った cwd を受け取る）。
+
+### 真因は「リサイズでセッションが作り直される」ではなかった
+
+起票時の見立て（`TerminalSession.cwd` が `cwd: working_directory` へ戻る）は**外れ**。
+実測でペインのシェルの pid は不変・`terminals` の入れ替えも無い。
+
+**側路（#766）のファイルの中身そのものが「ホームの初回束」へ戻っていた**:
+
+```
+tree-off  cwd=C:\Users\winuser            sink(43B)=ESC]133;A BEL ESC]7;file:///C:/Users/winuser BEL ESC]133;B BEL
+after-cd  cwd=C:\Users\winuser\dev\tako   sink(62B)=ESC]133;D;0 BEL ESC]133;A BEL ESC]7;file:///C:/Users/winuser/dev/tako BEL ESC]133;B BEL
+tree-on   cwd=C:\Users\winuser            sink(43B)=ESC]133;A BEL ESC]7;file:///C:/Users/winuser BEL ESC]133;B BEL   <- 戻る
+```
+
+書き手を切り分ける非破壊の手順（**実機のプロセスを止めずに済む**）:
+`tako send --pane 1 '$global:__takoSink = $null'` で**ペインのシェルだけ黙らせ**、
+側路ファイルを消してからリサイズする。結果は
+
+```
+sink-deleted  cwd=C:\Users\winuser  sink= ABSENT
+after-cd      cwd=C:\Users\winuser  sink= ABSENT      <- ペインのシェルは書いていない
+tree-off      cwd=C:\Users\winuser  sink@03:08:49.478 ESC]133;A BEL ESC]7;file:///C:/Users/winuser BEL ESC]133;B BEL
+tree-on       cwd=C:\Users\winuser  sink@03:08:52.469 ESC]133;A BEL ESC]7;file:///C:/Users/winuser BEL ESC]133;B BEL
+```
+
+= **リサイズごとに、ペインのシェルではない誰かがホームの束を書いている**。正体は psmux:
+
+- `-e` は**サーバーのグローバル環境**へ入る（`show-environment -g` に `TAKO_PANE_ID` /
+  `TAKO_OSC_SINK` が並ぶ。`-t <別セッション>` でも同じ値が返る）
+- psmux は**プリウォーム済みのシェルの一団**を持つ（`tmux server -s __warm__ -L <sock> -x 120` の
+  子に `pwsh` が複数。cwd はユーザーのホーム）。tako のペインの `#{pane_id}` が `%2` なのは
+  `%0` / `%1` をプールが使ったから
+- tako がペインをリサイズすると psmux はプールもクライアントの寸法へ合わせる → プールの
+  シェルの PSReadLine がプロンプトを描き直す → `OSC 7 <ホーム>` が**同じ側路ファイル**へ落ちる
+
+### 直し方（待ち合わせ先に書き手の同一性を載せる）
+
+統合スクリプトが `<pane>.osc` を `<pane>@p<自分の pid>.osc` へ解決し、tako は
+**そのペインのシェルの pid** ぶんだけを読む（器ありは `#{pane_pid}` / 器なしは PTY 直下の子）。
+解決は冪等で、結果を `TAKO_OSC_SINK` へ書き戻すのでペインの中の子シェルは同じファイルを共有する。
+`TMUX_PANE` を同一性に使わないのは、psmux がセッションごとにサーバープロセスを持つため
+**`%0` が複数あり得る**（pid は OS が一意にする）。規約は `.agent/conventions.md`
+「器へ渡した env は『器の中の全シェル』へ配られる（Issue #1199）」。
+
+### 実機 A/B（同じ機・同じ手順・リサイズ 8 回）
+
+| arm | 結果 |
+|---|---|
+| before（更新前スクリプト + 新バイナリ） | `after-cd` の直後から **8/8 でホームへ巻き戻る**・`osc=[1.osc]` |
+| after（新スクリプト + 新バイナリ） | **0/8**（cwd は `…\dev\tako` のまま）・`osc=[1@p<pid>.osc …]` |
+
+寸法が本当に変わっていることも同じ行で見る（`split` で `w=1.000 -> 0.500`・
+`resize --share-x 0.6` で `0.600`）。**バイナリだけ入れ替えても直らない**のが要点で、
+`$PROFILE` が指す統合スクリプト（`<data_dir>/shell-integration/tako.ps1`）が
+更新されて**シェルが起き直るまで**は旧規則のまま = 解決前のパスへ書く
+（tako はそこも読み続けるので cwd 追従自体は死なない）。
+
+macOS の対照（隔離 + tako-vd）: 同じ手順で `after-cd` 以降 **巻き戻らない**
+（`tree-on` / `split` で `w=1.000 -> 0.500`）。`<data_dir>/osc/` は空 =
+tmux は OSC を素通しするので側路そのものが張られない。
+
+### 測り方（次の実機作業でそのまま使える）
+
+隔離 GUI は `TAKO_ISOLATED=1` + **`TAKO_PERSIST=1`** + `TAKO_DATA_DIR` / `TAKO_DISCOVERY_DIR` を
+明示して `schtasks /it` で session 1 へ。**器のプロセス名は `tmux.exe`** なので
+`Get-Process psmux` では 0 件に見える（`Get-CimInstance Win32_Process -Filter "Name='tmux.exe'"` で見る）。
+側路の中身は 16 進で見る（`[System.IO.File]::ReadAllBytes` + 可読化）。
