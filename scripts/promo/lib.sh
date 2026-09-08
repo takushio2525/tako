@@ -74,6 +74,17 @@ promo_require() {
         swiftc -O -o "$PROMO_DISPLAYS" "$PROMO_LIB_DIR/displays.swift" 2>/dev/null || {
             echo "ERROR: displays.swift のコンパイルに失敗" >&2; return 1; }
     fi
+    # GUI 操作（#1081 の GUI モード章）。実クリックと実キー入力も同じ扱いで焼いておく
+    PROMO_CLICK=/private/tmp/tako-promo-click
+    if [ ! -x "$PROMO_CLICK" ] || [ "$PROMO_LIB_DIR/click.swift" -nt "$PROMO_CLICK" ]; then
+        swiftc -O -o "$PROMO_CLICK" "$PROMO_LIB_DIR/click.swift" 2>/dev/null || {
+            echo "ERROR: click.swift のコンパイルに失敗" >&2; return 1; }
+    fi
+    PROMO_KEYTYPE=/private/tmp/tako-promo-keytype
+    if [ ! -x "$PROMO_KEYTYPE" ] || [ "$PROMO_LIB_DIR/keytype.swift" -nt "$PROMO_KEYTYPE" ]; then
+        swiftc -O -o "$PROMO_KEYTYPE" "$PROMO_LIB_DIR/keytype.swift" 2>/dev/null || {
+            echo "ERROR: keytype.swift のコンパイルに失敗" >&2; return 1; }
+    fi
 }
 
 # 画面がロックされていないか調べる（ロック中は screencapture が一切動かない）。
@@ -535,22 +546,30 @@ promo_external_config_ready() {
     [ -f "$cfg" ] || { echo "ERROR: ${cfg} が無い（そのアカウントで一度 claude を起動してログインしておく）" >&2; return 1; }
     mkdir -p /private/tmp/tako-promo-dev
     cp -p "$cfg" "/private/tmp/tako-promo-dev/claude.json.before-$(date +%H%M%S)"
-    /usr/bin/python3 - "$cfg" "$PROMO_DEMO/awesome-app" <<'PY'
+    # 信頼が要るのは**収録で claude が開くディレクトリすべて**。デモプロジェクトだけでは
+    # 足りない（#1081 の GUI 章で実測: 「+」で作った新タブの cwd はデモ HOME なので、
+    # そこで起動した claude が「Is this a project you trust?」を出して収録が壊れた）
+    /usr/bin/python3 - "$cfg" "$PROMO_DEMO/awesome-app" "$PROMO_DEMO/home" <<'PY'
 import json, os, sys, tempfile
-path, project = sys.argv[1], sys.argv[2]
+path, paths = sys.argv[1], sys.argv[2:]
 with open(path, encoding="utf-8") as f:
     data = json.load(f)
 projects = data.setdefault("projects", {})
-entry = projects.setdefault(project, {})
-if entry.get("hasTrustDialogAccepted") and entry.get("hasCompletedProjectOnboarding"):
+added = []
+for project in paths:
+    entry = projects.setdefault(project, {})
+    if entry.get("hasTrustDialogAccepted") and entry.get("hasCompletedProjectOnboarding"):
+        continue
+    entry["hasTrustDialogAccepted"] = True
+    entry["hasCompletedProjectOnboarding"] = True
+    added.append(project)
+if not added:
     sys.exit(0)
-entry["hasTrustDialogAccepted"] = True
-entry["hasCompletedProjectOnboarding"] = True
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".claude.json.")
 with os.fdopen(fd, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
 os.replace(tmp, path)
-print("   信頼を追加:", project)
+print("   信頼を追加:", " ".join(added))
 PY
     mkdir -p "$PROMO_DEMO/awesome-app/.claude"
     cat > "$PROMO_DEMO/awesome-app/.claude/settings.local.json" <<'JSON'
@@ -611,6 +630,46 @@ promo_seed_window_frame() {
     mkdir -p "$work/data"
     printf '{"version":1,"active_tab":0,"tabs":[],"window":{"x":%s,"y":%s,"width":%s,"height":%s,"state":"windowed"}}\n' \
         "$x" "$y" "$w" "$h" > "$work/data/layout.json"
+}
+
+# **seed だけでは 16:9 にならない**（2026-09-09 実測 / #1149 以降）。
+# `initial_window_bounds` は置き先ディスプレイが解決できた検証起動では保存フレームを
+# 捨てて「960x600pt をその面の中央へ」置く（`main.rs` の #1141 の分岐）ので、
+# layout.json の seed は位置もサイズも効かない。v1〜v3 の素材はこの分岐が入る前に
+# 撮ったので 1920x1080px だった。起動後に AX でサイズだけ直す（位置は置き先が正しい）。
+# $1 = pid, $2 = 幅pt（既定 960）, $3 = 高さpt（既定 540）
+promo_force_window_size() {
+    local pid=$1 w=${2:-960} h=${3:-540} i got
+    for i in $(seq 1 10); do
+        osascript -e "tell application \"System Events\" to tell (first application process whose unix id is $pid) to set size of window 1 to {$w, $h}" \
+            >/dev/null 2>&1 || true
+        sleep 0.6
+        got=$("$PROMO_WINBOUNDS" "$pid" 2>/dev/null | cut -d' ' -f4,5)
+        [ "$got" = "$w $h" ] && { echo "   窓サイズ: ${w}x${h}pt"; return 0; }
+    done
+    echo "ERROR: 窓を ${w}x${h}pt にできない（実測 ${got:-不明}）" >&2
+    return 1
+}
+
+# 収録用アカウント（`TAKO_PROMO_CLAUDE_CONFIG_DIR`）を隔離インスタンスへ登録する。
+#
+# **これが無いと、かんたん表示のチャット判定が永久に立たない**（2026-09-09 実測）。
+# チャット判定の材料 `live_claude_sessions_by_backend` は `claude agents --json` の
+# 出力に乗るが、その走査対象は `agent_scan_targets`（= accounts.yaml + 既定）なので、
+# `CLAUDE_CONFIG_DIR` を env で渡しただけのアカウントの会話は 1 件も見えない
+# （既定の走査は `CLAUDE_CONFIG_DIR` を外して走る）。登録すると、その config dir でも
+# 走査が走る = チャット表示になる（実測: 登録前 terminal のまま / 登録後 25 秒で chat。
+# 認識が最悪 30 秒遅れるのは #1011 の UI 鮮度窓）。
+# 書き込み先は隔離 data_dir（`tko` が TAKO_DATA_DIR を渡す）なので本番の
+# accounts.yaml には触れない
+promo_register_recording_account() {
+    [ -n "$PROMO_CLAUDE_CONFIG_DIR" ] || return 0
+    tko orchestrator accounts add rec --config-dir "$PROMO_CLAUDE_CONFIG_DIR" \
+        --description "収録用（#1081）" >/dev/null 2>&1 || {
+        echo "ERROR: 収録用アカウントを登録できない（チャット判定が立たない）" >&2
+        return 1
+    }
+    echo "   収録用アカウント登録: rec → $PROMO_CLAUDE_CONFIG_DIR"
 }
 
 # タイムライン tsv（explainer-timeline.tsv）を bash の read で安全に読める形へ正規化する。
