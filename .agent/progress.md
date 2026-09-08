@@ -19,14 +19,6 @@
 
 ---
 
-## 2026-09-08（#1153: セルフテストの高負荷フレーク 4 系統を状態待ちへ寄せた）
-- (e) #694 / (g) #1058 は `pane_display` の材料（`state=Running` / 猶予 #720 が role で 25 秒へ伸びる）を
-  1 回読みしていたのが原因。113 #816 は固定 2500ms 窓の「40 行増えた」、#657 は総数の差分（#1124 の `tabs=8->4`）
-- 全 4 系統を状態待ち + `state_wait_budget` へ。#657 は押す前のタブ ID 集合で判定。番犬
-  `固定窓のあいだに増えた数を測っていない` を追加（origin/main の 657 のループを名指し）
-- GUI 16 回（tako-vd）: 無負荷 1 + 人工高負荷 3 連続 OK（load 9.1〜15.9）/ A/B は `TAKO_1153_LEGACY=1` +
-  遅れの注入 4 種で旧経路が確定 FAILED（(g) は Issue と同じ JSON）/ 回帰の注入 4 種は新経路でも FAILED
-
 ## 2026-09-08（#1165: セルフテストの画面エコー待ちを固定窓から状態待ちへ寄せた）
 - 項目 1b の固定 8 × 800ms 窓が load 12.9 で尽き 1c 以降が全部走らなかった。同型 9 か所を
   `type_until_focused_text`（`state_wait_budget` + 送り直し 2 回 + `TAKO_SELF_TEST_1165` の診断）へ
@@ -102,3 +94,8 @@
 - 真因の commit は無い（7 commit の伸びは合計 +12,288 B）。`-O0` の GPUI フレームが 1 関数 135〜828 KiB（製品の描画経路も含む）で、Windows/MSVC の既定 1 MiB を食い潰していた
 - `build.rs` 2 本が `/stack:8388608` を宣言（正は `platform::stack`。Zed も同型）+ セルフテストが起動直後に実測して足りなければ項目 80 前に FAILED。番犬は macOS でも走る 3 本
 - 実機は素の debug ビルドで項目 80 を 2/2 通過（完走は別件の負荷依存で項目 105 / 143 まで）。A/B は同一 exe へ `editbin /STACK:` で 1 MiB=クラッシュ / 2 MiB=通過 / 8 MiB=通過
+
+## 2026-09-09（#1185: 取り込みペインの select-window が内側へ届くようにし、`open --window` を到達可能にした）
+- 対象解決を `tako_core::tmux::window_target`（取り込みビュー優先 → バックエンド）へ集約。旧実装は二重ネストの**外側**（tako の backend）を見ていたので別セッションの window を切り替えて成功を返していた
+- `--window` は CLI と MCP catalog の両方へ（protocol にあるのに 3 経路すべてから到達不能）。番犬 `mcp_param_reachability`（mapper が読む引数が catalog に在るか）が同型の再発を落とす
+- 隔離 GUI 実測: ラッパーだけ `window_active` が 1 → 2 へ動き元は 0 のまま / `open --window 2` と MCP の `window:1` が実際にその window を表示 / A/B `TAKO_1185_LEGACY=1` は外側に当たって FAILED

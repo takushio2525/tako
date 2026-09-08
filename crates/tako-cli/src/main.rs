@@ -1336,6 +1336,9 @@ enum TmuxCommand {
         /// tmux サーバー名（`tmux -L` 相当。`tako tmux list` の socket をそのまま渡す）
         #[arg(long)]
         socket: Option<String>,
+        /// 取り込み直後に表示する window index（省略時はセッションの現在 window）
+        #[arg(long)]
+        window: Option<u32>,
         /// 分割の基準ペイン ID（省略時は呼び出し元）
         #[arg(long)]
         pane: Option<u64>,
@@ -6455,6 +6458,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Tmux(TmuxCommand::Open {
             session,
             socket,
+            window,
             pane,
             right: _,
             down,
@@ -6463,7 +6467,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
         }) => Request::TmuxOpen {
             socket: socket.clone(),
             session: session.clone(),
-            window: None,
+            window: *window,
             pane: target_pane(*pane)?,
             direction: match (down, up, left) {
                 (true, _, _) => Some(Direction::Down),
@@ -8711,6 +8715,25 @@ mod tests {
                 session: "s1".into(),
                 window: None,
                 pane: Some(3),
+                direction: Some(Direction::Right),
+            }
+        );
+    }
+
+    /// #1185: protocol にある `window`（特定 window のみ attach）が CLI から到達できる
+    #[test]
+    fn tmux_openはwindow指定を解釈する() {
+        let command = parse(&[
+            "tako", "tmux", "open", "mywork", "--socket", "usersock", "--window", "2", "--pane",
+            "9",
+        ]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::TmuxOpen {
+                socket: Some("usersock".into()),
+                session: "mywork".into(),
+                window: Some(2),
+                pane: Some(9),
                 direction: Some(Direction::Right),
             }
         );

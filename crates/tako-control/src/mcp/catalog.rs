@@ -214,12 +214,15 @@ pub fn tools() -> Vec<Value> {
                 pane を direction（省略時は右）へ分割した新ペインで attach クライアントを\
                 起動する。管理外・kill 漏れセッション（tako_tmux_list で発見したもの）の\
                 中身をユーザーに見せる・自分で確認するときに使う。\
-                新ペインを閉じてもセッション側は終了しない（kill ではない）。",
+                新ペインを閉じてもセッション側は終了しない（kill ではない）。\
+                複数 window を持つセッションは window で最初に見せる window を指定でき、\
+                取り込んだあとの切替は tako_tmux_select_window で行う。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session": { "type": "string", "description": "対象セッション名（必須。tako_tmux_list の name）" },
                     "socket": { "type": "string", "description": "tmux サーバー名（tmux -L 相当。tako_tmux_list の socket をそのまま渡す）" },
+                    "window": { "type": "integer", "minimum": 0, "description": "取り込み直後に表示する window index（省略時はセッションの現在 window）" },
                     "pane": pane_schema("分割の基準ペイン ID（省略時は呼び出し元の隣に生える）"),
                     "direction": {
                         "type": "string",
@@ -252,9 +255,10 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_tmux_select_window",
-            "description": "バックエンドセッション内の tmux window を切り替える。\
-                pane のバックエンドセッション内で指定した window index をアクティブにする。\
-                tako tmux list でペインの backend セッションの windows を確認してから使う。",
+            "description": "ペインが表示している tmux セッションの window を切り替える。\
+                対象は tako_tmux_open で取り込んだビューペインならその**取り込んだ**\
+                セッション、通常のペインなら tako 自身のバックエンドセッション。\
+                tako_tmux_list で対象セッションの windows を確認してから使う。",
             "inputSchema": {
                 "type": "object",
                 "properties": {

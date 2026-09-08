@@ -530,6 +530,7 @@ FR-2.12.6〜9 は 2026-07-27 に #552 で追加）:
 | FR-2.13.3 | 一覧から個別に kill できる（kill-session / kill-window。誤爆防止の確認つき） | S |
 | FR-2.13.4 | 一覧・対応付け・kill はコマンド層（dispatch）に乗せ、CLI / MCP から同じ操作ができる（開発不変条件） | M |
 | FR-2.13.5 | データ取得層（tmux クエリ・対応付け）と表示を分離する（表示方法は変わる前提とユーザーが明言） | M |
+| FR-2.13.6 | **window 操作の対象は「そのペインが attach しているセッション」**（#1185）。`tako tmux open` の取り込みペインは「外側 = tako のバックエンドセッション（FR-5）」「内側 = 取り込んだセッション（表示用の `tako-view-*` grouped ラッパー）」の二重ネストなので、`backend_session` だけで解決すると**別セッションの window を切り替えて成功を返す**。解決は `tako_core::tmux::window_target`（ビュー優先 → バックエンド）の 1 実装に集約し、応答は `session`（論理名）/ `target`（実際に打った相手）/ `socket` を返す。どちらも無いペインは成功を返さずエラー。取り込み時の window 指定（`TmuxOpen.window`）は CLI `--window` と MCP `tako_tmux_open` の `window` の**両方**から到達できること（開発不変条件。到達性は番犬 `mcp_param_reachability` が機械検証する） | M |
 
 実装メモ（着手時に設計する）:
 

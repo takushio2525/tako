@@ -285,6 +285,31 @@ mod tests {
             .contains("session"));
     }
 
+    /// #1185: protocol にある `window` が MCP から到達できる
+    /// （catalog の inputSchema に無いと `additionalProperties: false` が弾いていた）
+    #[test]
+    fn tmux_openのwindowがmcpから到達できる() {
+        let (response, requests) = run(
+            call(
+                "tako_tmux_open",
+                json!({ "session": "mywork", "socket": "usersock", "window": 2 }),
+            ),
+            Some(3),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::TmuxOpen {
+                socket: Some("usersock".into()),
+                session: "mywork".into(),
+                window: Some(2),
+                pane: Some(3),
+                direction: None,
+            }]
+        );
+        assert_eq!(response.unwrap()["result"]["isError"], false);
+    }
+
     #[test]
     fn tako_setup_changesはsetup_changesリクエストに変換される() {
         let (response, requests) = run(call("tako_setup_changes", json!({})), None, true);

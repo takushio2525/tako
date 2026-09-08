@@ -227,7 +227,7 @@
     "name": "tako_tmux_resize"
   },
   {
-    "description": "tmux セッションを現在のタブへ取り込んで表示する。pane を direction（省略時は右）へ分割した新ペインで attach クライアントを起動する。管理外・kill 漏れセッション（tako_tmux_list で発見したもの）の中身をユーザーに見せる・自分で確認するときに使う。新ペインを閉じてもセッション側は終了しない（kill ではない）。",
+    "description": "tmux セッションを現在のタブへ取り込んで表示する。pane を direction（省略時は右）へ分割した新ペインで attach クライアントを起動する。管理外・kill 漏れセッション（tako_tmux_list で発見したもの）の中身をユーザーに見せる・自分で確認するときに使う。新ペインを閉じてもセッション側は終了しない（kill ではない）。複数 window を持つセッションは window で最初に見せる window を指定でき、取り込んだあとの切替は tako_tmux_select_window で行う。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -253,6 +253,11 @@
         "socket": {
           "description": "tmux サーバー名（tmux -L 相当。tako_tmux_list の socket をそのまま渡す）",
           "type": "string"
+        },
+        "window": {
+          "description": "取り込み直後に表示する window index（省略時はセッションの現在 window）",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
@@ -277,7 +282,7 @@
     "name": "tako_tmux_cleanup"
   },
   {
-    "description": "バックエンドセッション内の tmux window を切り替える。pane のバックエンドセッション内で指定した window index をアクティブにする。tako tmux list でペインの backend セッションの windows を確認してから使う。",
+    "description": "ペインが表示している tmux セッションの window を切り替える。対象は tako_tmux_open で取り込んだビューペインならその**取り込んだ**セッション、通常のペインなら tako 自身のバックエンドセッション。tako_tmux_list で対象セッションの windows を確認してから使う。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {

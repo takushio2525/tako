@@ -1621,8 +1621,9 @@ struct TakoApp {
     /// バックグラウンド行 + バックグラウンドを隠す）。タブ並べ替え / クローズに強い TabId キー
     collapsed_tmux_tabs: std::collections::HashSet<TabId>,
     /// TmuxOpen で作成されたペインの監視対象。対象セッションが消滅したら
-    /// ペインを自動クローズする（ポーリングで検知）
-    tmux_view_panes: HashMap<PaneId, TmuxViewTarget>,
+    /// ペインを自動クローズする（ポーリングで検知）。型は `tako_core::TmuxView`
+    /// （dispatch の window 対象解決と同じ 1 実装。#1185）
+    tmux_view_panes: HashMap<PaneId, tako_core::TmuxView>,
     /// ファイルツリーのコンテキストメニュー（FR-3.12）
     context_menu: Option<ContextMenu>,
     /// リモート（SSH 先）ツリー行のコンテキストメニュー（#919）。
@@ -2414,19 +2415,6 @@ struct GitFeedback {
 enum MirrorSource {
     Backend(String),
     Fixed(tako_core::scroll::ScrollTarget),
-}
-
-/// TmuxOpen でペインに表示している外部 tmux セッションの監視情報
-#[derive(Debug, Clone)]
-struct TmuxViewTarget {
-    /// 監視・再 attach 対象の**元セッション**（ラッパー名は入れない）。
-    /// これが消滅したらペインを自動クローズする
-    session: String,
-    /// 表示用の `tako-view-*` grouped session 名。ペイン close 時にこれを kill する。
-    /// `None` = 元セッションを直接 attach した（復帰経路）ので close 時も kill しない
-    wrapper: Option<String>,
-    /// 元セッションが居る tmux サーバーの socket（`-L` 値。既定サーバーは None）
-    socket: Option<String>,
 }
 
 /// terminal_screen_lines の 1 文字ぶんの描画情報（#39 / #64）
@@ -18673,7 +18661,7 @@ impl TmuxHost for TakoApp {
     ) {
         self.tmux_view_panes.insert(
             pane,
-            TmuxViewTarget {
+            tako_core::TmuxView {
                 session,
                 wrapper,
                 socket,
@@ -18735,6 +18723,11 @@ impl TmuxHost for TakoApp {
 
     fn backend_session(&self, pane: PaneId) -> Option<String> {
         self.backend_sessions.get(&pane).cloned()
+    }
+
+    /// #1185: 取り込みビューの window 操作は内側（このビュー）へ向く
+    fn tmux_view(&self, pane: PaneId) -> Option<tako_core::TmuxView> {
+        self.tmux_view_panes.get(&pane).cloned()
     }
 
     fn is_mirror_scroll_pane(&self, pane: PaneId) -> bool {
