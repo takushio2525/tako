@@ -1317,7 +1317,12 @@ fn run_fda_check(interactive: bool) {
     eprintln!(
         "      システム設定を開きました。tako を「フルディスクアクセス」に追加してください。"
     );
-    eprintln!("      [警告] 付与後、tako アプリの再起動が必要です（⌘Q で終了 → 再度起動）。");
+    // 打鍵の表記は正本から引く（この経路は macOS 限定だが、案内へ直書きしない = #1203）
+    let quit_key =
+        tako_core::platform::keys::quit(tako_core::platform::support::Platform::current());
+    eprintln!(
+        "      [警告] 付与後、tako アプリの再起動が必要です（{quit_key} で終了 → 再度起動）。"
+    );
     eprintln!("        再起動するまで許可ダイアログが表示され続けることがあります。");
 
     // 再チェック（FDA は再起動後に有効になるため通常ここでは検出できないが、

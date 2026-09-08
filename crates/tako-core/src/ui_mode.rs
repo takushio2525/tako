@@ -7,7 +7,9 @@
 //! 判定を純関数にしてあるのは、誤爆（チャット化・スターター化すべきでないペインを
 //! 置き換える）が実害の大きい失敗だから。GUI を起動せずに表の全行を unit test できる。
 
-use crate::platform::support::Note;
+use crate::i18n::Text;
+use crate::platform::keys;
+use crate::platform::support::{Note, Platform};
 use crate::terminal::CommandState;
 use std::time::Duration;
 
@@ -281,21 +283,36 @@ impl TerminalReason {
         }
     }
 
-    /// 次の一手（無いものは `None`）。**「理由 + 次の一手」を必ず対で出す**規約に合わせる
-    pub fn next_step(self) -> Option<Note> {
+    /// 次の一手（無いものは `None`）。**「理由 + 次の一手」を必ず対で出す**規約に合わせる。
+    ///
+    /// 実行中のプラットフォームで解決する。打鍵表記を含む案内があるので、
+    /// テストは [`Self::next_step_for`] を使って両プラットフォームを検証する
+    pub fn next_step(self) -> Option<Text> {
+        self.next_step_for(Platform::current())
+    }
+
+    /// 次の一手（プラットフォームを引数で受ける純粋関数。#1203）。
+    ///
+    /// 案内に打鍵を載せるときは必ず `platform::keys` から引く。`⌘K` を直書きすると
+    /// Windows でも `⌘K` と出て、押しても効かない案内になる（GPUI の `cmd` は
+    /// Windows では Win キー = `Win+K` は OS のキャスト。#585 / #1203）
+    pub fn next_step_for(self, platform: Platform) -> Option<Text> {
         match self {
-            Self::ModeTerminal => Some(Note::new(
-                "`tako ui-mode gui` / 表示メニューの「表示モードを切り替え」/ ⌘K パレットのいずれかで切り替える",
-                "Switch it with `tako ui-mode gui`, View menu > \"Toggle display mode\", or the command palette",
-            )),
+            Self::ModeTerminal => {
+                let palette = keys::command_palette(platform);
+                Some(Text::new(
+                    format!("`tako ui-mode gui` / 表示メニューの「表示モードを切り替え」/ {palette} パレットのいずれかで切り替える"),
+                    format!("Switch it with `tako ui-mode gui`, View menu > \"Toggle display mode\", or the {palette} command palette"),
+                ))
+            }
             Self::Released => Some(Note::new(
                 "`tako ui-mode restore --pane <N>` でこのペインの解除を戻す",
                 "Undo it for this pane with `tako ui-mode restore --pane <N>`",
-            )),
+            ).into()),
             Self::ShellStateUnknown => Some(Note::new(
                 "`tako shell-integration` で配置と実効を確認する（Windows は `install` が必要）",
                 "Check placement and effectiveness with `tako shell-integration` (Windows needs `install`)",
-            )),
+            ).into()),
             // 残りは「そういう状態だから出さない」= 正常な判断なので次の一手は無い
             Self::AltScreen | Self::Role | Self::BusyChildren | Self::Running | Self::Failed => None,
         }
@@ -707,6 +724,45 @@ mod tests {
         // 正常な判断（TUI 稼働中など）には次の一手を付けない
         assert!(TerminalReason::AltScreen.next_step().is_none());
         assert!(TerminalReason::Running.next_step().is_none());
+    }
+
+    /// #1203: 打鍵を含む案内はプラットフォームで表記が変わる。
+    /// `⌘K` を直書きすると Windows でも `⌘K` と出て、押すと OS のキャストが開く
+    #[test]
+    fn 次の一手の打鍵はプラットフォームで変わる() {
+        let mac = TerminalReason::ModeTerminal
+            .next_step_for(Platform::MacOs)
+            .expect("macOS の次の一手");
+        let win = TerminalReason::ModeTerminal
+            .next_step_for(Platform::Windows)
+            .expect("Windows の次の一手");
+        println!("[macos] next_step_ja = {}", mac.ja());
+        println!("[macos] next_step_en = {}", mac.en());
+        println!("[windows] next_step_ja = {}", win.ja());
+        println!("[windows] next_step_en = {}", win.en());
+        for t in [mac.ja(), mac.en()] {
+            assert!(t.contains(keys::command_palette(Platform::MacOs)), "{t:?}");
+        }
+        for t in [win.ja(), win.en()] {
+            assert!(
+                t.contains(keys::command_palette(Platform::Windows)),
+                "{t:?}"
+            );
+            let mac = keys::platform_modifier(Platform::MacOs).expect("macOS の修飾");
+            assert!(
+                !t.contains(mac.symbol),
+                "Windows の案内に macOS の修飾記号が出ている: {t:?}"
+            );
+            assert!(
+                !t.contains(mac.word),
+                "Windows の案内に macOS の修飾語が出ている: {t:?}"
+            );
+        }
+        // 打鍵に触れない案内はプラットフォームで変わらない
+        assert_eq!(
+            TerminalReason::Released.next_step_for(Platform::MacOs),
+            TerminalReason::Released.next_step_for(Platform::Windows)
+        );
     }
 
     /// チャット判定の起点（3 つの証拠が揃った状態）

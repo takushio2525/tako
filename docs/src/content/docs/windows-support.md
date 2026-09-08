@@ -90,7 +90,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 | `tako_preview_view` | 一部対応 | PDF はページ画像として表示できるが、Windows のレンダラが文字位置を返さないため文字選択・目次・PDF 内リンクは使えない（#693） | 実機セルフテスト: 項目 66b-2 / 70 / 112 / 114（コード・md・画像は緑。PDF はページ画像だけ通り文字座標の検査はスキップ） |
 | `tako_preview_outline` | 一部対応 | PDF はページ画像として表示できるが、Windows のレンダラが文字位置を返さないため文字選択・目次・PDF 内リンクは使えない（#693） | 実機セルフテスト: 項目 114（Markdown 目次のジャンプは緑。PDF 目次は text_layer 不在でスキップ） |
 | `tako_preview_link_list` | 一部対応 | PDF はページ画像として表示できるが、Windows のレンダラが文字位置を返さないため文字選択・目次・PDF 内リンクは使えない（#693） | 実機セルフテスト: 項目 90 / 114（Markdown リンク索引は緑。PDF 注釈リンクは不可） |
-| `tako_preview_follow_link` | 一部対応 | PDF はページ画像として表示できるが、Windows のレンダラが文字位置を返さないため文字選択・目次・PDF 内リンクは使えない（#693） | 実機セルフテスト: 項目 90（Markdown の ⌘+クリックは緑。URL は cmd /C start で開く。PDF 内リンクは不可） |
+| `tako_preview_follow_link` | 一部対応 | PDF はページ画像として表示できるが、Windows のレンダラが文字位置を返さないため文字選択・目次・PDF 内リンクは使えない（#693） | 実機セルフテスト: 項目 90（Markdown の修飾キー + クリックは緑。URL は cmd /C start で開く。PDF 内リンクは不可） |
 | `tako_preview_copy_code` | 対応 | — | 実機セルフテスト: 項目 90 / 114（画面外のコードブロックも含めてコピー） |
 | `tako_preview_reload` | 対応 | — | 実機セルフテスト: 項目 66c（実 CLI の ON/OFF と OS イベントでの再生成） |
 | `tako_preview_cache` | 対応 | — | 実機セルフテスト: 項目 33d / 66c（MCP と CLI から同じ LRU 上限へ反映） |

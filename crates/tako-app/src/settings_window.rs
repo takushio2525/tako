@@ -2955,7 +2955,12 @@ impl SettingsWindow {
                     .pt_1()
                     .text_color(to_hsla(theme.text_faint))
                     .text_size(px(11.))
-                    .child(txt::advanced_edit_help()),
+                    // #1203: 確定は platform 修飾（Windows は Win+Enter = 押せない）
+                    .child(txt::advanced_edit_help(
+                        tako_core::platform::keys::platform_modifier(
+                            tako_core::platform::support::Platform::current(),
+                        ),
+                    )),
             )
             .child(
                 div()

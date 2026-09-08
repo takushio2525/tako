@@ -5280,7 +5280,10 @@ fn recover_list(path: &std::path::Path) -> Result<(), String> {
     let good = path.with_extension("json.good");
     println!("layout.json.good    : {}", describe(&good));
     eprintln!();
-    eprintln!("復元するには: tako を終了（Cmd-Q）してから `tako recover --apply <世代>` →");
+    // 打鍵の表記は正本から引く（Windows は Ctrl+Shift+Q。#1203）
+    let quit_key =
+        tako_core::platform::keys::quit(tako_core::platform::support::Platform::current());
+    eprintln!("復元するには: tako を終了（{quit_key}）してから `tako recover --apply <世代>` →");
     eprintln!("tako を再起動すると復元されたレイアウトで立ち上がります。");
     eprintln!("実体の tmux セッションが生きていれば、実行中プロセスごと画面に戻ります。");
     eprintln!("（good = 最後に復元へ成功した良品。`tako recover --apply good` で戻せます）");
@@ -5304,8 +5307,10 @@ fn recover_apply(path: &std::path::Path, generation: &str, force: bool) -> Resul
     // control.json は消えている・別を指していることがある）
     if !force {
         if let Some(pid) = tako_control::discovery::live_primary_pid() {
+            let quit_key =
+                tako_core::platform::keys::quit(tako_core::platform::support::Platform::current());
             return Err(format!(
-                "tako（pid {pid}）が稼働中です。終了（Cmd-Q）してから実行してください（--force で強制実行）"
+                "tako（pid {pid}）が稼働中です。終了（{quit_key}）してから実行してください（--force で強制実行）"
             ));
         }
         if tako_core::ports::other_tako_running() {

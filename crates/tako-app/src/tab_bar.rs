@@ -901,7 +901,12 @@ impl TakoApp {
                             .rounded(px(4.0))
                             .px(px(5.0))
                             .py(px(1.0))
-                            .child("⌘K"),
+                            // #1203: 打鍵の表記は正本から引く（Windows は
+                            // Ctrl+Shift+P。`⌘K` を直書きすると Win+K =
+                            // OS のキャストを案内することになる）
+                            .child(tako_core::platform::keys::command_palette(
+                                tako_core::platform::support::Platform::current(),
+                            )),
                     ),
             )
             // 通知ベル + 未読バッジ（カンプ: 30×30 / バッジ 14px red）
