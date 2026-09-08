@@ -709,7 +709,7 @@ fn resume_command_with_env(
 /// 新規シェルで開き直す理由（#1076。復元内訳のログに出す）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FreshShellReason {
-    /// 保存時に claude が動いていなかった（= 復元すべき会話が無い）
+    /// 保存時に claude を検出できていなかった（= 復元すべき会話が記録されていない）
     NoSessionId,
     /// 保存値の形式が不正（パストラバーサル対策で弾いた）
     InvalidSessionId,

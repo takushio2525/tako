@@ -121,8 +121,8 @@ fn legacy_1191() -> bool {
 /// 復元時の resume コマンドを PTY（新しいログインシェルの stdin）へ流す形にする。
 ///
 /// **明示コマンド spawn ではなく入力のキュー**なので、claude を終了したあとは
-/// 元のシェルへ戻れる（明示コマンドだとペインごと終了する）。末尾は端末の
-/// 「Enter」= CR で、LF だと確定しないシェルがある
+/// 元のシェルへ戻れる（明示コマンドだとペインごと終了する）。末尾は CR
+/// （端末の Enter キーが送るバイト。行編集はこれで確定する）
 fn resume_input(command: &str) -> Vec<u8> {
     format!("{command}\r").into_bytes()
 }
@@ -4117,7 +4117,7 @@ impl TakoApp {
                     .collect();
                 reasons.sort();
                 persist_diag(&format!(
-                    "復元の内訳: Claude resume {resumed_claude}（役割つき {resumed_with_role} / 最小形 {}）\
+                    "復元の内訳: Claude resume {resumed_claude}（役割つき {resumed_with_role} / 役割なし {}）\
                      / 新規シェル {fresh_shells}{}",
                     resumed_claude - resumed_with_role,
                     if reasons.is_empty() {
