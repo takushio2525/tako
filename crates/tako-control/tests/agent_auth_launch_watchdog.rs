@@ -95,7 +95,7 @@ fn 認証コマンドの起動が製品コードに残っていない() {
         offenders.is_empty(),
         "tako が `claude auth login` を自分で起こしている（#1129）。\n\
          ブラウザ操作待ちで終わらないプロセスなので、tako は案内だけを出すこと\n\
-         （文面の正本は `setup_bootstrap::auth_instructions`）。\n\
+         （文面の正本は `setup_bootstrap::auth_instructions_for`）。\n\
          A/B 用に意図して残す 1 か所だけ `watchdog-allow` を付ける:\n{}",
         offenders.join("\n")
     );
@@ -122,24 +122,45 @@ fn 検出力と逃げ道が効く() {
     assert!(auth_login_argv_sites(status).is_empty());
 }
 
-/// 案内の文面は 1 か所（`setup_bootstrap::auth_instructions`）から出す。
+/// 案内の文面は 1 か所（`setup_bootstrap::auth_instructions_for`）から出す。
 /// 実行するコマンドは #983 の `agent_cli::auth_command` が正本なので、
 /// そこを変えれば案内も追従する
 #[test]
 fn 案内はコマンドの正本を引く() {
-    let lines = tako_control::setup_bootstrap::auth_instructions();
-    let joined = lines.join("\n");
-    let cmd = tako_control::orchestrator::agent_cli::auth_command(
-        tako_core::agent_support::Agent::Claude,
+    // #989: 3 系統とも「理由 + その系統の実コマンド + やり直し方」を持つ。
+    // ログインコマンドの正本は `agent_cli::auth_command`（実物で確認した形）
+    for agent in tako_core::platform::agent_install::AgentKind::ALL {
+        let joined = tako_control::setup_bootstrap::auth_instructions_for(agent).join("\n");
+        let cmd = tako_control::orchestrator::agent_cli::auth_command(agent.into())
+            .expect("3 系統ともログインの入口がある");
+        assert!(
+            joined.contains(cmd),
+            "{} の次の 1 手が入っていない: {joined}",
+            agent.as_str()
+        );
+        assert!(
+            joined.contains("tako setup"),
+            "{} のやり直し方が入っていない: {joined}",
+            agent.as_str()
+        );
+        assert!(
+            joined.contains("代行しません"),
+            "{} で代行しないことが書かれていない: {joined}",
+            agent.as_str()
+        );
+    }
+    // 系統ごとに**違う**コマンドを案内する（claude 決め打ちへ戻っていない）
+    let claude = tako_control::setup_bootstrap::auth_instructions_for(
+        tako_core::platform::agent_install::AgentKind::Claude,
     )
-    .expect("claude にはログインコマンドがある");
-    assert!(joined.contains(cmd), "次の 1 手が入っていない: {joined}");
+    .join("\n");
+    let codex = tako_control::setup_bootstrap::auth_instructions_for(
+        tako_core::platform::agent_install::AgentKind::Codex,
+    )
+    .join("\n");
+    assert_ne!(claude, codex, "3 系統で同じ文面が出ている");
     assert!(
-        joined.contains("tako setup"),
-        "やり直し方が入っていない: {joined}"
-    );
-    assert!(
-        joined.contains("代行しません"),
-        "代行しないことが書かれていない: {joined}"
+        !codex.contains("claude auth login"),
+        "codex の案内が claude: {codex}"
     );
 }

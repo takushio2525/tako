@@ -876,6 +876,12 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
             "macOS 限定（pmset / osascript / defaults）",
         ),
         (
+            "crates/tako-control/src/test_write_isolation.rs",
+            1,
+            "番犬（#944）が**自分と同じテストバイナリ**を空の HOME で起こす 1 件。\
+             製品コードの起動ではないので Windows の GUI からは到達しない",
+        ),
+        (
             "crates/tako-control/src/telemetry.rs",
             3,
             "`hostname`（`#[cfg(unix)]`）と macOS 限定の OS 情報取得（sw_vers / uname）",
@@ -910,10 +916,10 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
         ),
         (
             "crates/tako-core/src/platform/release_assets.rs",
-            4,
+            3,
             "テストモジュール内。シェル関数との一致を見る `sh` 2 件（#594 のアセット名 / \
-             #965 の片肺判定）と、PowerShell 側の写しとの一致を見る `pwsh` / \
-             インストーラー検査（#587）",
+             #965 の片肺判定）と、インストーラー検査（#587）。pwsh の起動は \
+             `pwsh_command`（#944 でキャッシュを一時 dir へ倒す共通口）へ寄せた 1 か所のみ",
         ),
         (
             "crates/tako-core/src/platform/shell.rs",

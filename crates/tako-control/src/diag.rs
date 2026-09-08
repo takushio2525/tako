@@ -214,7 +214,7 @@ static PERF_WATCH: Mutex<PerfWatch> = Mutex::new(PerfWatch {
 });
 
 /// メインスレッドの ThreadId（`mark_main_thread` で登録）。
-/// **未登録なら「全部メインスレッド扱い」** = 従来の挙動（CLI・テストは登録しない）
+/// **未登録のプロセスはメインスレッドを持たない扱い**（#944）
 static MAIN_THREAD: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
 
 /// 呼んだスレッドをメインスレッドとして登録する（GUI プロセスの起動時に 1 回）。
@@ -229,12 +229,59 @@ pub fn mark_main_thread() {
     *MAIN_THREAD.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::thread::current().id());
 }
 
-/// 呼び出し元がメインスレッドか（未登録時は true = 従来挙動）
+/// 呼び出し元が**登録済みの**メインスレッドか。
+///
+/// Issue #944: 未登録なら真（= 全部メインスレッド扱い）だったので、
+/// `mark_main_thread()` を呼ばないプロセス（テストバイナリ・CLI・daemon）が
+/// background の区間まで「メインスレッド専有」として記録していた。実測では
+/// ユーザーの perf.log に `メインスレッド専有: pdf_rasterize が 71ms` が 643 行
+/// 溜まっており、**製品側は background executor で回している**のに
+/// UI ストールの容疑者に見えていた。名乗れるのは登録したプロセスだけにする
 fn on_main_thread() -> bool {
-    MAIN_THREAD
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_none_or(|id| id == std::thread::current().id())
+    let registered = *MAIN_THREAD.lock().unwrap_or_else(|e| e.into_inner());
+    if tako_core::paths::issue944_legacy() {
+        // A/B: 旧挙動（未登録なら全部メインスレッド扱い）
+        return registered.is_none_or(|id| id == std::thread::current().id());
+    }
+    is_registered_main(registered, std::thread::current().id())
+}
+
+/// [`on_main_thread`] の純粋ロジック（登録状態と現在スレッドだけで決まる）
+fn is_registered_main(
+    registered: Option<std::thread::ThreadId>,
+    current: std::thread::ThreadId,
+) -> bool {
+    registered == Some(current)
+}
+
+/// テスト専用: 呼んだスレッドを一時的にメインスレッドとして登録する（#944）。
+///
+/// `perf_span` の**区間追跡そのもの**を見るテストは登録が要るが、
+/// 登録はプロセス全体に効くので、`Drop` で必ず元へ戻し、
+/// さらに専用ロックで直列化する（並列テストが互いの登録を覗かない）
+#[cfg(test)]
+pub(crate) fn scoped_main_thread() -> MainThreadGuard {
+    static LOCK: Mutex<()> = Mutex::new(());
+    let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut slot = MAIN_THREAD.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = *slot;
+    *slot = Some(std::thread::current().id());
+    drop(slot);
+    MainThreadGuard { prev, _lock: lock }
+}
+
+/// [`scoped_main_thread`] の後始末（登録を元へ戻す）
+#[cfg(test)]
+pub(crate) struct MainThreadGuard {
+    prev: Option<std::thread::ThreadId>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for MainThreadGuard {
+    fn drop(&mut self) {
+        *MAIN_THREAD.lock().unwrap_or_else(|e| e.into_inner()) = self.prev;
+    }
 }
 
 /// verbose 実測モード（`TAKO_PERF_VERBOSE=1`）。プロセス内で 1 回だけ判定
@@ -524,6 +571,37 @@ mod tests {
         assert_eq!(format_utc(1_704_067_199), "2023-12-31T23:59:59Z");
     }
 
+    // --- #944: メインスレッド未登録のプロセスは「メインスレッド専有」と名乗らない ---
+
+    #[test]
+    fn メインスレッド未登録なら専有として記録しない() {
+        let current = std::thread::current().id();
+        let other = std::thread::spawn(|| std::thread::current().id())
+            .join()
+            .expect("別スレッドの id");
+
+        // 未登録（テストバイナリ・CLI・daemon の既定）: 誰もメインスレッドではない
+        assert!(!is_registered_main(None, current));
+        assert!(!is_registered_main(None, other));
+        // 登録済み（GUI プロセスの main）: 登録したスレッドだけが真
+        assert!(is_registered_main(Some(current), current));
+        assert!(!is_registered_main(Some(other), current));
+    }
+
+    #[test]
+    fn このテストプロセスはメインスレッドを登録していない() {
+        // `mark_main_thread()` は tako-app の main() でしか呼ばない。
+        // テストバイナリで真になっていたら #944 の誤記録が復活している。
+        // `scoped_main_thread()` を使うテストと同じロックを取って直列化する
+        // （`--test-threads=1` だと同じスレッドで前後するため）
+        // ロックを持ったまま「元の登録」を見る（drop 後に見ると並列テストと競合する）
+        let guard = scoped_main_thread();
+        assert_eq!(
+            guard.prev, None,
+            "テストバイナリがメインスレッドを名乗っている（#944）"
+        );
+    }
+
     // --- #643: UI ストールの原因分類 ---
 
     #[test]
@@ -584,6 +662,8 @@ mod tests {
 
     #[test]
     fn perf_spanのネストで現在区間が内側優先になり復元される() {
+        // 区間追跡はメインスレッドでだけ働く（#944）ので、このテストの間だけ登録する
+        let _main = scoped_main_thread();
         {
             let _outer = perf_span_over("outer", u64::MAX);
             assert_eq!(

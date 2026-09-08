@@ -947,15 +947,18 @@ pub const MATRIX: &[AgentFeature] = &[
     AgentFeature {
         key: keys::SETUP_AUTH_LAUNCH,
         summary: Note::new(
-            "未認証なら setup がログインまで案内・代行する",
-            "When unauthenticated, setup guides and performs the login",
+            "未認証なら setup がその系統のログインコマンドを案内する",
+            "When unauthenticated, setup points at that CLI's own login command",
         ),
         claude: S::Supported,
-        codex: pending(notes::NOT_WIRED, 989),
-        agy: pending(notes::NOT_WIRED, 989),
+        codex: S::Supported,
+        agy: S::Supported,
         local: local_pending(),
-        evidence: AgentEvidence::Source(
-            "setup.rs の認証誘導は claude の導線しか持たない（#868 のゼロスタートも claude 限定）",
+        evidence: AgentEvidence::Measured(
+            "#989: `setup_bootstrap::auth_instructions_for` が claude = `claude auth login` / \
+             codex = `codex login` / agy = 引数なしの `agy` を案内する（agy は専用の \
+             ログインサブコマンドを持たず、公式 docs の sign-in も引数なし起動）。\
+             ログイン自体はブラウザ操作が要るので tako は 3 系統とも代行しない（#1129）",
         ),
     },
     AgentFeature {
@@ -965,12 +968,14 @@ pub const MATRIX: &[AgentFeature] = &[
             "Setup installs the CLI itself on a machine that does not have it (#868)",
         ),
         claude: S::Supported,
-        codex: pending(notes::NOT_WIRED, 989),
-        agy: pending(notes::NOT_WIRED, 989),
+        codex: S::Supported,
+        agy: S::Supported,
         local: local_pending(),
-        evidence: AgentEvidence::Source(
-            "platform/agent_install.rs の AgentKind が Claude 1 値しか持たず、\
-             recipe() も claude ぶんしか無い（#868 の Out of scope。拡張は #989）",
+        evidence: AgentEvidence::Measured(
+            "#989: platform/agent_install.rs の recipe() が 3 系統 × 2 プラットフォームぶんの \
+             公式手順を持ち、まっさら HOME + PATH 剥ぎで 3 系統とも \
+             `tako setup bootstrap install` が通る（実測）。**Windows の実行代行は claude だけ** \
+             （codex / agy は can_run=false = 状態照会と案内まで。#525）",
         ),
     },
     AgentFeature {
@@ -1494,6 +1499,27 @@ impl From<crate::platform::agent_install::AgentKind> for Agent {
         use crate::platform::agent_install::AgentKind as K;
         match v {
             K::Claude => Self::Claude,
+            K::Codex => Self::Codex,
+            K::Agy => Self::Agy,
+        }
+    }
+}
+
+/// `Agent` → `agent_install::AgentKind` は**部分写像**（`Local` を落とす）。
+///
+/// ローカル LLM は「エージェント CLI を公式インストーラで入れる」形ではない
+/// （runtime を入れてモデルを pull する = #990）。手順が持てるようになった時点で
+/// ここが変換できるようになり、`AgentKind` へ値を足す必要があると分かる（#989）
+impl TryFrom<Agent> for crate::platform::agent_install::AgentKind {
+    type Error = Agent;
+
+    fn try_from(v: Agent) -> Result<Self, Self::Error> {
+        use crate::platform::agent_install::AgentKind as K;
+        match v {
+            Agent::Claude => Ok(K::Claude),
+            Agent::Codex => Ok(K::Codex),
+            Agent::Agy => Ok(K::Agy),
+            Agent::Local => Err(v),
         }
     }
 }
@@ -1807,12 +1833,24 @@ mod tests {
         for v in LimitService::ALL {
             assert_eq!(Agent::from(v).as_str(), v.as_str());
         }
-        // agent_install は claude 1 値のみ（拡張は #989）
-        assert_eq!(Agent::from(AgentKind::Claude), Agent::Claude);
-        assert_eq!(
-            support_for(Agent::Codex, keys::SETUP_CLI_INSTALL).map(|s| s.status()),
-            Some("pending"),
-            "agent_install が codex へ拡張されたらマトリクスも更新すること"
-        );
+        // agent_install は TUI 3 系統と 1:1（#989）。ローカル LLM だけ写らない
+        let from_install: Vec<Agent> = AgentKind::ALL.iter().map(|v| Agent::from(*v)).collect();
+        assert_eq!(from_install, Agent::TUI.to_vec());
+        for v in AgentKind::ALL {
+            assert_eq!(Agent::from(v).as_str(), v.as_str());
+            // 逆向きも通る（部分写像の全射部分）
+            assert_eq!(AgentKind::try_from(Agent::from(v)), Ok(v));
+        }
+        assert_eq!(AgentKind::try_from(Agent::Local), Err(Agent::Local));
+        // 手順を持つ 3 系統はマトリクスでも導入できる側に居ること
+        // （`AgentKind` へ値を足したのにマトリクスが pending のままだとここで落ちる）
+        for v in AgentKind::ALL {
+            assert_eq!(
+                support_for(Agent::from(v), keys::SETUP_CLI_INSTALL).map(|s| s.status()),
+                Some("supported"),
+                "{} は agent_install に手順があるのにマトリクスが未対応",
+                v.as_str()
+            );
+        }
     }
 }

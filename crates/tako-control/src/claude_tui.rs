@@ -647,17 +647,32 @@ pub fn input_residual(lines: &[String], prompt: &str) -> bool {
 pub fn config_json_paths(config_dir: Option<&str>) -> Vec<PathBuf> {
     let dir = config_dir
         .map(|d| PathBuf::from(crate::orchestrator::expand_tilde(d)))
-        .or_else(|| {
-            std::env::var_os(crate::orchestrator::CLAUDE_CONFIG_DIR_ENV)
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-        })
-        .or_else(crate::orchestrator::claude_default_config_dir);
-    let home = crate::orchestrator::home_dir();
+        .or_else(env_config_dir)
+        .or_else(default_config_dir);
+    let home = crate::orchestrator::agent_config_home();
     let legacy_exists = home
         .as_ref()
         .is_some_and(|h| h.join(".claude.json").is_file());
     resolve_config_json_paths(dir, home.as_deref(), legacy_exists)
+}
+
+/// `CLAUDE_CONFIG_DIR` からの解決。**テストビルドでは見ない**（#944 / #1030）:
+/// テストプロセスの環境変数はユーザーの生きた config dir を指しているので、
+/// 読んだ瞬間に本番の `.claude.json` へ書きに行ってしまう。
+/// config dir を明示する引数（#558 の経路）はテストでもそのまま効く
+fn env_config_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    if !tako_core::paths::issue944_legacy() {
+        return None;
+    }
+    std::env::var_os(crate::orchestrator::CLAUDE_CONFIG_DIR_ENV)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// 既定の config dir（`<ホーム>/.claude`）。ホームはテストで隔離される
+fn default_config_dir() -> Option<PathBuf> {
+    crate::orchestrator::agent_config_home().map(|h| h.join(".claude"))
 }
 
 /// `config_json_paths` の解決規則そのもの（ファイルシステムに触らない純関数）。
@@ -776,11 +791,7 @@ fn ensure_bypass_accepted_at(path: &Path) -> Result<bool, String> {
     }
     obj.insert("bypassPermissionsModeAccepted".into(), json!(true));
 
-    let tmp = path.with_extension("json.tako-tmp");
-    let serialized =
-        serde_json::to_string_pretty(&root).map_err(|e| format!("設定を直列化できない: {e}"))?;
-    std::fs::write(&tmp, serialized).map_err(|e| format!("{} を書けない: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("{} を置換できない: {e}", path.display()))?;
+    write_claude_json(path, &root)?;
     Ok(true)
 }
 
@@ -813,13 +824,27 @@ fn ensure_trusted_at(path: &Path, cwd: &str) -> Result<bool, String> {
     }
     entry.insert("hasTrustDialogAccepted".into(), json!(true));
 
-    // claude 本体も読み書きするファイルのため、一時ファイル + rename で原子的に置き換える
+    write_claude_json(path, &root)?;
+    Ok(true)
+}
+
+/// `.claude.json` を原子的に置き換える（claude 本体も読み書きするファイルなので
+/// 一時ファイル + rename）。**置き場が無ければ作る**。
+///
+/// 実ユーザーの `~/.claude` は claude 自身が作るので普段は在るが、まっさらな環境
+/// （claude を一度も起動していない / config dir を明示した初回）では**無い**。
+/// 作らないと rename が NotFound で落ち、事前信頼が黙って効かない
+/// （#944 の検証で判明。codex / agy の `ensure_*_trusted_at` は元から作っていた）
+fn write_claude_json(path: &Path, root: &serde_json::Value) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("{} のディレクトリを作れない: {e}", parent.display()))?;
+    }
     let tmp = path.with_extension("json.tako-tmp");
     let serialized =
-        serde_json::to_string_pretty(&root).map_err(|e| format!("設定を直列化できない: {e}"))?;
+        serde_json::to_string_pretty(root).map_err(|e| format!("設定を直列化できない: {e}"))?;
     std::fs::write(&tmp, serialized).map_err(|e| format!("{} を書けない: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("{} を置換できない: {e}", path.display()))?;
-    Ok(true)
+    std::fs::rename(&tmp, path).map_err(|e| format!("{} を置換できない: {e}", path.display()))
 }
 
 // --- tmux 経由の送達確認つき配送 ---
@@ -1443,6 +1468,24 @@ mod tests {
         );
         assert_eq!(root["projects"]["/existing"]["history"], json!([1, 2])); // 既存の他キーを保持
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_trustedは置き場ごと無くても作る() {
+        // まっさらな環境（claude を一度も起動していない = `~/.claude` が無い）でも
+        // 事前信頼が効くこと。rename は親が無いと NotFound で落ちる（#944）
+        let dir = std::env::temp_dir().join(format!("tako-944-nodir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("missing").join(".claude.json");
+        assert_eq!(ensure_trusted_at(&path, "/fresh"), Ok(true));
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["projects"]["/fresh"]["hasTrustDialogAccepted"], true);
+        // bypass の事前承諾も同じ 1 実装を通る
+        let path2 = dir.join("missing2").join(".claude.json");
+        assert_eq!(ensure_bypass_accepted_at(&path2), Ok(true));
+        assert!(path2.is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
