@@ -2729,10 +2729,13 @@ enum SetupCommand {
         #[arg(long)]
         json: bool,
     },
-    /// エージェント CLI の導入状況を確認・実行する（#868 / #1057）
+    /// エージェント CLI の導入状況を確認・実行する（#868 / #1057 / #989）
     Bootstrap {
-        /// status（既定・読み取り専用）/ install / path / undo-path / handoff
+        /// status（既定・読み取り専用）/ status-all / install / path / undo-path / handoff
         action: Option<String>,
+        /// 対象の系統（claude / codex / agy。省略で claude）
+        #[arg(long)]
+        agent: Option<String>,
         /// install で実行せず「何をどこに入れるか」だけ出す
         #[arg(long)]
         dry_run: bool,
@@ -2998,11 +3001,12 @@ fn cli_main() -> ExitCode {
                 setup::run_models(agent.as_deref(), json)
             } else if let Some(SetupCommand::Bootstrap {
                 ref action,
+                ref agent,
                 dry_run,
                 json,
             }) = args.command
             {
-                setup::run_bootstrap(action.as_deref(), dry_run, json)
+                setup::run_bootstrap(action.as_deref(), agent.as_deref(), dry_run, json)
             } else if let Some(SetupCommand::Deps {
                 ref action,
                 ref dep,

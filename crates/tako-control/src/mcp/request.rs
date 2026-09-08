@@ -821,6 +821,7 @@ pub(super) fn build_request(
         "tako_setup_changes" => Request::SetupChanges,
         "tako_setup_bootstrap" => Request::SetupBootstrap {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
+            agent: str_arg(args, "agent")?.map(|s| s.to_string()),
             dry_run: bool_arg(args, "dry_run")?,
             reason: str_arg(args, "reason")?.map(|s| s.to_string()),
         },

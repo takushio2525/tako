@@ -66,8 +66,9 @@ const WATCHED: &[Watched] = &[
     Watched {
         path: "crates/tako-core/src/platform/agent_install.rs",
         name: "AgentKind",
-        variants: &["Claude"],
-        why: "自動インストールに対応する系統（#868）。codex / agy への拡張は #989",
+        variants: &["Claude", "Codex", "Agy"],
+        why: "公式インストーラの手順を持つ系統（#868 → #989 で 3 系統へ）。\
+              ローカル LLM は runtime + モデル pull で手順の形が違うので入らない（#990）",
     },
     Watched {
         path: "crates/tako-core/src/terminal.rs",

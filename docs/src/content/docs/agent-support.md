@@ -21,8 +21,8 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 | エージェント | 対応 | 一部対応 | 未対応 | 対象外 |
 | --- | --- | --- | --- | --- |
 | Claude Code（基準） | 47 / 47 | 0 | 0 | 0 |
-| OpenAI Codex CLI | 30 / 47 | 4 | 10 | 3 |
-| Antigravity CLI | 15 / 47 | 6 | 17 | 9 |
+| OpenAI Codex CLI | 32 / 47 | 4 | 8 | 3 |
+| Antigravity CLI | 17 / 47 | 6 | 15 | 9 |
 | Local LLM | 0 / 47 | 0 | 39 | 8 |
 
 ### 状態の意味
@@ -60,9 +60,9 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 | --- | --- | --- | --- | --- | --- |
 | **setup がこの CLI の導入を検出する**<br />`setup_detect` | 対応 | 対応 | 対応 | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: setup.rs の SetupAgent が 3 系統を列挙し、platform::exe::find（B16）で解決する |
 | **setup が認証済みかどうかを判定できる**<br />`setup_auth_check` | 対応 | 対応 | 一部対応<br />認証の有無は分かるがプランを取れないので、推奨プロファイルの規模を決められない | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: tako-cli/src/setup.rs のプラン解決は認証済み・導入済みの provider だけを巡る （#262）。agy は provider としてプランを返さない |
-| **未認証なら setup がログインまで案内・代行する**<br />`setup_auth_launch` | 対応 | 未対応 [#989](https://github.com/takushio2525/tako/issues/989)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#989](https://github.com/takushio2525/tako/issues/989)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: setup.rs の認証誘導は claude の導線しか持たない（#868 のゼロスタートも claude 限定） |
+| **未認証なら setup がその系統のログインコマンドを案内する**<br />`setup_auth_launch` | 対応 | 対応 | 対応 | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #989: `setup_bootstrap::auth_instructions_for` が claude = `claude auth login` / codex = `codex login` / agy = 引数なしの `agy` を案内する（agy は専用の ログインサブコマンドを持たず、公式 docs の sign-in も引数なし起動）。ログイン自体はブラウザ操作が要るので tako は 3 系統とも代行しない（#1129） |
 | **setup が契約プランを検出して推奨規模を決める**<br />`setup_plan_detect` | 対応 | 対応 | 対象外<br />agy はプラン情報を出さないので検出できない | 対象外<br />ローカルモデルに契約プランという概念が無い | コード本文: setup.rs の Provider は Claude / Gpt / Google の 3 値だが、プラン取得は claude / gpt の 2 経路しか実装が無い（#226） |
-| **CLI 自体が入っていない環境へ setup が導入する（#868）**<br />`setup_cli_install` | 対応 | 未対応 [#989](https://github.com/takushio2525/tako/issues/989)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#989](https://github.com/takushio2525/tako/issues/989)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: platform/agent_install.rs の AgentKind が Claude 1 値しか持たず、recipe() も claude ぶんしか無い（#868 の Out of scope。拡張は #989） |
+| **CLI 自体が入っていない環境へ setup が導入する（#868）**<br />`setup_cli_install` | 対応 | 対応 | 対応 | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #989: platform/agent_install.rs の recipe() が 3 系統 × 2 プラットフォームぶんの 公式手順を持ち、まっさら HOME + PATH 剥ぎで 3 系統とも `tako setup bootstrap install` が通る（実測）。**Windows の実行代行は claude だけ** （codex / agy は can_run=false = 状態照会と案内まで。#525） |
 | **setup が起動プロファイルを組み立てる**<br />`setup_profile_recommend` | 対応 | 対応 | 一部対応<br />worker としてのプロファイルは作れるが、master には別系統が自動で選ばれる | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: setup.rs は選択した agent を worker_agent へ書くが、master_agent は claude / codex しか受け付けない（agy は起動前エラーになるため） |
 | **共通ルールをこの CLI のグローバル指示ファイルへ同期する（#136）**<br />`setup_rules_sync` | 対応 | 対応 | 対応 | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: agents_sync.rs の AgentKind が 3 系統ぶんの書き先を持つ （~/.claude/CLAUDE.md / ~/.codex/AGENTS.md / ~/.gemini/GEMINI.md） |
 | **setup が tako の MCP サーバーをこの CLI へ恒久登録する**<br />`setup_mcp_register` | 対応 | 対応 | 対応 | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #979（main の 63a7c26）で `tako setup-mcp` が 3 系統へ登録するようになった。書き先は claude = ~/.claude.json / codex = ~/.codex/config.toml の [mcp_servers.tako] / agy = ~/.gemini/config/mcp_config.json で、codex は env_vars 許可リストまで足して実セッションから tako_list_panes が通ることを実測。正本は tako-control::agent_mcp |
