@@ -25624,9 +25624,23 @@ mod self_test {
     ///
     /// **② 検出力の担保**（`never`）: 観測をずっと成立させない。待ちを延ばしても
     /// **本物の回帰は隠れない**ことの実測で、上限まで待ってからその項目が
-    /// FAILED になるのが正しい
+    /// FAILED になるのが正しい。
+    ///
+    /// 書式は `<種別>[:<タグ,タグ…>]`（[`inject_1180_mode`] が解く）
     fn inject_1180() -> String {
         std::env::var("TAKO_1180_INJECT").unwrap_or_default()
+    }
+
+    /// 注入の書式を解く（純粋関数。#1180）。`<種別>[:<タグ,タグ…>]` で、**タグを付けると
+    /// その項目だけに効く**。項目を絞れるようにしてあるのは `check` が 1 つ目の失敗で
+    /// プロセスごと止まるからで、手前の項目まで巻き込むと観たい項目へ届かない
+    /// （`TAKO_1180_LEGACY` のタグ指定と同じ理由）
+    pub(crate) fn inject_1180_mode<'a>(spec: &'a str, tag: &str) -> &'a str {
+        match spec.split_once(':') {
+            None => spec.trim(),
+            Some((mode, scope)) if scope.split(',').any(|t| t.trim() == tag) => mode.trim(),
+            Some(_) => "",
+        }
     }
 
     /// 注入 `late` の遅らせ幅（#1180）。**旧の固定窓 + 5 秒**にしてあるのは、
@@ -25698,8 +25712,9 @@ mod self_test {
         let legacy = legacy_1180(tag);
         let busy = machine_busy();
         let (limit, poll) = resolve_backend_wait(budget, busy, legacy);
-        let inject = inject_1180();
-        let hold = match inject.as_str() {
+        let inject_spec = inject_1180();
+        let inject = inject_1180_mode(&inject_spec, tag);
+        let hold = match inject {
             "late" => Some(inject_1180_delay(budget.legacy_window)),
             "never" => Some(INJECT_1180_FOREVER),
             _ => None,
@@ -43008,38 +43023,41 @@ mod self_test {
                     "git ステージング: staged / unstaged の分類とバッジ (#487)",
                 );
 
-                // ホイール = ミラー表示 + スクロールバー表示（#159 と同じ機構に乗る）
-                window
-                    .update(cx, |app, win, cx| {
-                        let center = app
-                            .pane_text_areas
-                            .iter()
-                            .find(|(id, _)| *id == view_pane)
-                            .map(|(_, b)| b.center())
-                            .unwrap_or_default();
-                        app.on_pane_scroll(
-                            view_pane,
-                            &ScrollWheelEvent {
-                                position: center,
-                                delta: ScrollDelta::Lines(point(0.0, 4.0)),
-                                ..ScrollWheelEvent::default()
-                            },
-                            win,
-                            cx,
-                        );
-                    })
-                    .ok();
+                // ホイール = ミラー表示 + スクロールバー表示（#159 と同じ機構に乗る）。
+                //
+                // **ホイールは毎周期打つ**（#1180）。ミラーは tmux の capture の往復で
+                // 立つので**待てば立つ**が、スクロールバーは最後のスクロールから
+                // `SCROLLBAR_SHOW_MS + SCROLLBAR_FADE_MS` = **1.4 秒で消える**
+                // （FR-2.5.13 の意図した挙動）。1 回だけ打って待つ旧実装は、混んだ機で
+                // ミラーの成立が 1.4 秒に入らないと **`bar` が先に消えて、いくら待っても
+                // 成立しない**（実測: `mirrored=true composed_differs=true bar=false`）。
+                // 予算を伸ばすだけでは解けない = 期限のある状態と溜まる状態を
+                // 混ぜて測っていたのが本体で、実ユーザーもミラーが出るまでホイールを
+                // 回し続けるので、駆動を毎周期に寄せるのが素直
                 let mut view_scroll_detail = (false, false, false);
-                // ミラーは capture の往復で立つ（1 フレームでは立たない）ので固定窓に
-                // しない（#1180。旧実装は 20 × 300ms = 6 秒で、#1175 の検証中に
-                // 2 回ここで止まった）
                 let view_scrolled = wait_for_backend_state(
                     cx,
                     "73-wheel",
                     text_wait_budget(20, 300, 20),
                     |cx| {
                         let detail = window
-                            .update(cx, |app, _, _| {
+                            .update(cx, |app, win, cx| {
+                                let center = app
+                                    .pane_text_areas
+                                    .iter()
+                                    .find(|(id, _)| *id == view_pane)
+                                    .map(|(_, b)| b.center())
+                                    .unwrap_or_default();
+                                app.on_pane_scroll(
+                                    view_pane,
+                                    &ScrollWheelEvent {
+                                        position: center,
+                                        delta: ScrollDelta::Lines(point(0.0, 4.0)),
+                                        ..ScrollWheelEvent::default()
+                                    },
+                                    win,
+                                    cx,
+                                );
                                 let mirrored = app
                                     .scroll_ctls
                                     .get(&view_pane)
@@ -65623,14 +65641,6 @@ mod self_test_claude_wait_tests {
     }
 }
 
-/// **引き継ぎが後任へ届いた証拠の採り方**（#1175）。
-///
-/// 元の 101c はこれを「いまのビューポート」から探していた。引き継ぎ本文は claude の
-/// TUI では起動直後に 1 度だけ流れる User 発話なので、後任が数分喋れば確実に画面外へ
-/// 出る（実測: `3m 58s · ↓ 14.1k tokens` 喋った時点で不在）= **後任が長く働くほど
-/// 確実に落ちる**。証拠を transcript から採ると流れない。ここでは
-/// **①本文が User 発話にあれば採れる ②後任の申告と渡したプロンプトを取り違えない**
-/// の 2 点を、実機を待たずに固定する
 /// **器（tmux）の往復待ちの予算**（純粋関数。#1180）。
 ///
 /// 旧実装はどれも `for _ in 0..N { wait(cx, M).await; … }` = 固定 N×M 窓で、
@@ -65641,7 +65651,7 @@ mod self_test_claude_wait_tests {
 #[cfg(test)]
 mod self_test_backend_wait_tests {
     use super::self_test::{
-        budget_capped, inject_1180_delay, resolve_backend_wait, text_wait_budget,
+        budget_capped, inject_1180_delay, inject_1180_mode, resolve_backend_wait, text_wait_budget,
     };
     use std::time::Duration;
 
@@ -65710,6 +65720,20 @@ mod self_test_backend_wait_tests {
         out
     }
 
+    /// 注入はタグを付けるとその項目だけに効く（`check` が 1 つ目の失敗で止まるので、
+    /// 手前の項目を巻き込むと観たい項目へ届かない）
+    #[test]
+    fn 注入はタグで項目を絞れる() {
+        assert_eq!(inject_1180_mode("late", "68-attach"), "late");
+        assert_eq!(inject_1180_mode("late:73-wheel", "73-wheel"), "late");
+        assert_eq!(inject_1180_mode("late:73-wheel", "68-attach"), "");
+        assert_eq!(
+            inject_1180_mode("never: 68-attach , 73-wheel ", "73-wheel"),
+            "never"
+        );
+        assert_eq!(inject_1180_mode("", "68-attach"), "");
+    }
+
     /// 注入 `late` の遅れは**旧の固定窓を超え、新の素の上限に収まる**。
     /// この不等式が崩れると「旧が落ちて新が通る」の A/B が成立しない
     #[test]
@@ -65744,6 +65768,14 @@ mod self_test_backend_wait_tests {
     }
 }
 
+/// **引き継ぎが後任へ届いた証拠の採り方**（#1175）。
+///
+/// 元の 101c はこれを「いまのビューポート」から探していた。引き継ぎ本文は claude の
+/// TUI では起動直後に 1 度だけ流れる User 発話なので、後任が数分喋れば確実に画面外へ
+/// 出る（実測: `3m 58s · ↓ 14.1k tokens` 喋った時点で不在）= **後任が長く働くほど
+/// 確実に落ちる**。証拠を transcript から採ると流れない。ここでは
+/// **①本文が User 発話にあれば採れる ②後任の申告と渡したプロンプトを取り違えない**
+/// の 2 点を、実機を待たずに固定する
 #[cfg(test)]
 mod self_test_handoff_evidence_tests {
     use super::chat_view::{ChatMessage, ChatRole};
