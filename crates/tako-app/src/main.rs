@@ -25481,6 +25481,80 @@ mod self_test {
         std::env::var("TAKO_771_INJECT").unwrap_or_default()
     }
 
+    /// 引き継ぎ e2e（101c）の目印。**引き継ぎファイルの本文**に置き、後任へ渡る
+    /// プロンプト（`handoff::successor_prompt` が全文を埋める）に載って届く
+    const HANDOFF_MARKER_749: &str = "TAKO749-HANDOFF-MARKER";
+
+    /// **#1175 の A/B の口**: 設定すると 101c の証拠源を旧実装（いまのビューポート）へ戻す。
+    ///
+    /// 旧実装は後任の発話を `visible_lines()` から探していた。引き継ぎ本文は
+    /// claude の TUI では起動直後に 1 度だけ流れる User 発話なので、後任が数分喋れば
+    /// 確実に画面外へ出る（#1175 の実測: `3m 58s · ↓ 14.1k tokens` 喋った時点で不在）。
+    /// **負荷と無関係な決定的な欠陥**だったので、同じバイナリで再現できるようにしておく
+    fn legacy_1175() -> bool {
+        std::env::var_os("TAKO_1175_LEGACY").is_some()
+    }
+
+    /// **#1175 の注入口**（検出力の担保）。`nomarker` = 引き継ぎファイルから目印を抜く。
+    ///
+    /// 後任は**本当に目印を受け取っていない**状態になるので、新しい証拠源（transcript）
+    /// でも `saw_marker=false` = FAILED になるのが正しい。`TAKO_771_INJECT=nomarker`
+    /// （観測そのものを止める）とは別物で、あちらは「待っても来ない」の再現、
+    /// こちらは「来ていないものを来たと言わない」の実測
+    fn inject_1175() -> String {
+        std::env::var("TAKO_1175_INJECT").unwrap_or_default()
+    }
+
+    /// 「引き継ぎ完了」の申告とみなす文字列（純粋関数。日英）。
+    /// 画面から採るときと transcript から採るときで**同じ規則**を使う
+    pub(crate) fn is_handoff_done_text(text: &str) -> bool {
+        text.contains("引き継ぎ完了") || text.to_lowercase().contains("handoff complete")
+    }
+
+    /// 後任へ引き継ぎが届いた証拠（#1175）
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct HandoffEvidence {
+        /// 引き継ぎ本文（= 目印）が後任の **User 発話**として残っている
+        pub(crate) marker: bool,
+        /// 後任が **Assistant 発話**で引き継ぎ完了を申告した
+        pub(crate) done: bool,
+        pub(crate) messages: usize,
+        pub(crate) user_messages: usize,
+    }
+
+    /// 後任の transcript から証拠を採る（純粋関数。#1175）。
+    ///
+    /// **transcript は流れない**ので、後任がどれだけ働いても最初の User 発話は残る。
+    /// 判定の強さは元の意図（= 実 claude が引き継ぎ本文を受け取った）そのままで、
+    /// TUI の畳み方（`[Pasted text #N]`）にもスクロール位置にも依存しない。
+    ///
+    /// 役割で分けるのも要点: 引き継ぎプロンプトの本文には手順として
+    /// 「『引き継ぎ完了』と報告する」が入っているので、役割を見ないと
+    /// **渡したプロンプト自身**を後任の申告と読み違える（旧実装の画面判定はこれを
+    /// 区別できていなかった）
+    pub(crate) fn handoff_evidence(
+        messages: &[chat_view::ChatMessage],
+        marker: &str,
+    ) -> HandoffEvidence {
+        let mut evidence = HandoffEvidence {
+            messages: messages.len(),
+            ..HandoffEvidence::default()
+        };
+        for message in messages {
+            match message.role {
+                chat_view::ChatRole::User => {
+                    evidence.user_messages += 1;
+                    evidence.marker |= message.text.contains(marker);
+                }
+                chat_view::ChatRole::Assistant => {
+                    evidence.done |= is_handoff_done_text(&message.text);
+                }
+                chat_view::ChatRole::System => {}
+            }
+        }
+        evidence
+    }
+
     /// 注入 `slow` の遅らせ幅（純粋関数。#771）。**旧経路の固定窓を必ず超え、
     /// 新経路の素の上限には収まる**長さにする（超えないと「旧が落ちて新が通る」の
     /// A/B が成立せず、収まらないと新経路も落ちて差が出ない）
@@ -52814,17 +52888,41 @@ mod self_test {
                 //      引き継ぎファイルを読み実態を突き合わせ → 前任ペインを閉じる。
                 //      claude CLI + 認証 + tmux が要るので既定ではスキップする（#749 受け入れ 1）
                 if claude_e2e_enabled("749") {
-                    // 引き継ぎファイルへ目印を入れる（後任が読んだことを画面で確認するため）
+                    // 引き継ぎファイルへ目印を入れる（後任へ本文が届いたことの証拠）。
+                    // 注入 `nomarker`（#1175）のときだけ目印を抜く = 後任は本当に
+                    // 受け取っていない状態になるので、新しい証拠源でも FAILED が正しい
+                    let legacy_1175 = legacy_1175();
+                    let inject_1175 = inject_1175();
+                    let marker_line = if inject_1175 == "nomarker" {
+                        "- 目印: なし（TAKO_1175_INJECT=nomarker）".to_string()
+                    } else {
+                        format!("- 目印: {HANDOFF_MARKER_749}")
+                    };
                     if let Some(ref path) = handoff_path {
                         let _ = std::fs::write(
                             path,
-                            "## 引き継ぎ（セルフテスト）\n\
-                             - 目印: TAKO749-HANDOFF-MARKER\n\
-                             - 進行中タスク: なし（この引き継ぎの検証のみ）\n\
-                             - spawn 済み worker: なし\n\
-                             - 次の一手: 引き継ぎを確認したら手順どおり前任ペインを閉じる\n",
+                            format!(
+                                "## 引き継ぎ（セルフテスト）\n\
+                                 {marker_line}\n\
+                                 - 進行中タスク: なし（この引き継ぎの検証のみ）\n\
+                                 - spawn 済み worker: なし\n\
+                                 - 次の一手: 引き継ぎを確認したら手順どおり前任ペインを閉じる\n"
+                            ),
                         );
                     }
+                    // 証拠源（後任の transcript）を立ち上げる（#1175）。`chat_state` を
+                    // 埋める定期更新（`collect_chat_targets`）は **GUI モードでしか
+                    // 回らない**ので、101c のあいだだけ GUI にする（項目 95c が
+                    // transcript を見るときと同じ前提）。直前の項目 100 が Terminal へ
+                    // 戻しているため、明示しないと `chat_state` は永久に None になる
+                    let restore_ui_mode = window
+                        .update(cx, |app, _, cx| {
+                            let before = app.ui_mode;
+                            app.ui_mode = tako_core::ui_mode::UiMode::Gui;
+                            cx.notify();
+                            before
+                        })
+                        .unwrap_or(tako_core::ui_mode::UiMode::Terminal);
                     // 前任は「閾値超過を模擬した ctx 55% の master ペイン」（上で作ったもの）
                     let handoff = fire(
                         Req::OrchestratorHandoff {
@@ -52878,8 +52976,17 @@ mod self_test {
                     // 不成立）。上限を `state_wait_budget` へ通して混み具合に追従させ、
                     // 諦めたときは診断行（`waited=` / `budget=` / `load=` / `screen_tail=`）
                     // で「待ちが短かったのか相手が応答しなかったのか」を切り分ける
+                    //
+                    // **証拠はビューポートから採らない**（#1175）。引き継ぎ本文は
+                    // claude の TUI では起動直後に 1 度だけ流れる User 発話なので、
+                    // 後任が数分喋れば確実に画面外へ出る（実測: `3m 58s · ↓ 14.1k tokens`
+                    // 喋った時点で不在 = 後任が長く働くほど確実に落ちる構造）。
+                    // 後任の **transcript**（`chat_state` の発話。項目 95c と同じ経路）は
+                    // 流れないので、そこから採る
                     let mut saw_marker = false;
                     let mut saw_done = false;
+                    let mut evidence = HandoffEvidence::default();
+                    let mut chat_seen = false;
                     let closed = wait_for_claude_state(
                         window,
                         cx,
@@ -52903,10 +53010,17 @@ mod self_test {
                             if !observe {
                                 return false;
                             }
-                            let joined = lines.join("\n");
-                            saw_marker |= joined.contains("TAKO749-HANDOFF-MARKER");
-                            saw_done |= joined.contains("引き継ぎ完了")
-                                || joined.to_lowercase().contains("handoff complete");
+                            if legacy_1175 {
+                                // 旧経路（#1175 の A/B）: いまのビューポートを見る
+                                let joined = lines.join("\n");
+                                saw_marker |= joined.contains(HANDOFF_MARKER_749);
+                                saw_done |= is_handoff_done_text(&joined);
+                            } else if let Some(state) = app.chat_state(new_pane) {
+                                chat_seen = true;
+                                evidence = handoff_evidence(&state.messages, HANDOFF_MARKER_749);
+                                saw_marker |= evidence.marker;
+                                saw_done |= evidence.done;
+                            }
                             app.workspace
                                 .tabs()
                                 .iter()
@@ -52927,9 +53041,21 @@ mod self_test {
                                 .unwrap_or_else(|| "none".to_string())
                         })
                         .unwrap_or_else(|_| "unknown".to_string());
+                    // 証拠源を明示する（#1175）。`saw_marker=false` を見た人が
+                    // 「後任へ届かなかった」のか「証拠源が立ち上がらなかった」のかを
+                    // 1 行で切り分けられるようにする（`chat=none` = 後者）
+                    let marker_source = if legacy_1175 { "screen" } else { "transcript" };
+                    let chat = if legacy_1175 {
+                        "n/a".to_string()
+                    } else if chat_seen {
+                        format!("{}/{}", evidence.user_messages, evidence.messages)
+                    } else {
+                        "none".to_string()
+                    };
                     println!(
                         "101c-CLAUDE: closed={closed} saw_marker={saw_marker} \
-                         saw_done={saw_done} prompt_flow={prompt_flow}"
+                         saw_done={saw_done} prompt_flow={prompt_flow} \
+                         marker_source={marker_source} chat={chat} inject={inject_1175:?}"
                     );
                     // 判定根拠の画面証跡（成否に関わらず。項目 45c の `45c-SCREEN` と同型）。
                     // `saw_marker=false` の切り分けには**後任が何を出したか**が要る:
@@ -52972,6 +53098,11 @@ mod self_test {
                         },
                         cx,
                     );
+                    // 証拠源のために上げた GUI モードを戻す（#1175）
+                    let _ = window.update(cx, |app, _, cx| {
+                        app.ui_mode = restore_ui_mode;
+                        cx.notify();
+                    });
                 }
 
                 // 後片付け（プロファイル・handoff ファイル・検証用ペイン）
@@ -65258,6 +65389,102 @@ mod self_test_claude_wait_tests {
     }
 }
 
+/// **引き継ぎが後任へ届いた証拠の採り方**（#1175）。
+///
+/// 元の 101c はこれを「いまのビューポート」から探していた。引き継ぎ本文は claude の
+/// TUI では起動直後に 1 度だけ流れる User 発話なので、後任が数分喋れば確実に画面外へ
+/// 出る（実測: `3m 58s · ↓ 14.1k tokens` 喋った時点で不在）= **後任が長く働くほど
+/// 確実に落ちる**。証拠を transcript から採ると流れない。ここでは
+/// **①本文が User 発話にあれば採れる ②後任の申告と渡したプロンプトを取り違えない**
+/// の 2 点を、実機を待たずに固定する
+#[cfg(test)]
+mod self_test_handoff_evidence_tests {
+    use super::chat_view::{ChatMessage, ChatRole};
+    use super::self_test::{handoff_evidence, is_handoff_done_text};
+
+    const MARKER: &str = "TAKO749-HANDOFF-MARKER";
+
+    fn message(role: ChatRole, text: &str) -> ChatMessage {
+        ChatMessage {
+            role,
+            text: text.to_string(),
+            thinking: None,
+            tools: Vec::new(),
+            images: 0,
+            notices: 0,
+            queued: false,
+            key: 0,
+        }
+    }
+
+    /// 後任へ渡ったプロンプト（引き継ぎ本文を全文含む User 発話）から目印が採れる
+    #[test]
+    fn 引き継ぎ本文は後任へ渡ったプロンプトから採れる() {
+        let messages = [message(
+            ChatRole::User,
+            &format!(
+                "あなたは前任 master から引き継ぎを受けた新しい master です。\n- 目印: {MARKER}\n"
+            ),
+        )];
+        let evidence = handoff_evidence(&messages, MARKER);
+        assert!(evidence.marker);
+        assert_eq!(evidence.user_messages, 1);
+        assert_eq!(evidence.messages, 1);
+    }
+
+    /// 後任が何十件喋っても、最初の User 発話は transcript に残る
+    /// （ビューポートならとうに流れている状況）
+    #[test]
+    fn 後任が長く喋っても証拠は残る() {
+        let mut messages = vec![message(ChatRole::User, &format!("- 目印: {MARKER}"))];
+        for i in 0..40 {
+            messages.push(message(
+                ChatRole::Assistant,
+                &format!("作業 {i} を進めています"),
+            ));
+        }
+        assert!(handoff_evidence(&messages, MARKER).marker);
+    }
+
+    /// **渡したプロンプト自身を後任の申告と読み違えない**。引き継ぎ手順の本文には
+    /// 「『引き継ぎ完了』と報告する」が入っているので、役割を見ないと User 発話で
+    /// `saw_done` が立つ（旧実装の画面判定はこれを区別できていなかった）
+    #[test]
+    fn 完了申告は後任の発話だけを見る() {
+        let prompt = message(
+            ChatRole::User,
+            "2. 把握できたら「引き継ぎ完了」と報告する。",
+        );
+        assert!(!handoff_evidence(std::slice::from_ref(&prompt), MARKER).done);
+        let reported = [
+            prompt,
+            message(ChatRole::Assistant, "引き継ぎ完了。食い違いはありません"),
+        ];
+        assert!(handoff_evidence(&reported, MARKER).done);
+    }
+
+    /// 目印が本当に無ければ立たない（`TAKO_1175_INJECT=nomarker` が実機で示すのと同じこと）
+    #[test]
+    fn 目印が無ければ立たない() {
+        let messages = [
+            message(ChatRole::User, "- 目印: なし"),
+            message(ChatRole::Assistant, "引き継ぎ完了"),
+        ];
+        let evidence = handoff_evidence(&messages, MARKER);
+        assert!(!evidence.marker);
+        assert!(evidence.done);
+    }
+
+    /// 完了申告の規則は日英とも大文字小文字を問わない（旧実装と同じ規則を共有する）
+    #[test]
+    fn 完了申告は日英どちらでも読む() {
+        assert!(is_handoff_done_text("引き継ぎ完了しました"));
+        assert!(is_handoff_done_text("Handoff complete; closing the pane"));
+        assert!(is_handoff_done_text("HANDOFF COMPLETE"));
+        assert!(!is_handoff_done_text("Handoff verification in progress"));
+    }
+}
+
 /// **測る窓が汚れているかの判定**（#858 / #995）。
 ///
 /// 項目 108（#786。クロームを測る）と項目 110（#803。ヘッダを測る）は、どちらも
@@ -67334,6 +67561,226 @@ mod selftest_wait_watchdog {
         assert!(fixed_window_then_growth_read(&good).is_empty());
     }
 
+    /// **実 claude の発話内容をビューポートで判定していない**（#1175）。
+    ///
+    /// 項目 101c は「引き継ぎ本文が後任へ届いた」を `visible_lines()` から探していた。
+    /// 引き継ぎ本文は claude の TUI では**起動直後に 1 度だけ流れる User 発話**なので、
+    /// 後任が数分喋れば確実に画面外へ出る（実測: `3m 58s · ↓ 14.1k tokens` 喋った時点で
+    /// 不在）。負荷とは無関係で、**後任が長く働くほど確実に落ちる**決定的な欠陥だった。
+    ///
+    /// 見分けは「画面から採った値を**周期をまたいで溜める**（`|=`）」形。溜めるのは
+    /// 「一度でも見えたか」を問うている印で、それはビューポートでは答えられない
+    /// （transcript = `chat_state` の発話から採る）。**溜めない**使い方は対象外:
+    /// 信頼ダイアログの承諾（毎周期の駆動）・未送信の入力欄の検査（45c は送信していない
+    /// ので transcript に無い）・`pane_display_for` の遷移（95c / 97c）はどれも
+    /// 「いまどうなっているか」なのでビューポートが正しい証拠源。
+    ///
+    /// **A/B の口（`legacy` を名乗るアーム）は対象外**: 旧挙動を同じバイナリで
+    /// 再現するために意図して残してある
+    fn screen_latched_in_claude_e2e(src: &str) -> Vec<usize> {
+        let lines: Vec<&str> = src.lines().collect();
+        let screen_read = concat!("visible_", "lines()");
+        let latch = concat!("|", "=");
+        let mut hits = Vec::new();
+        for (index, end) in claude_e2e_regions(&lines) {
+            // 旧経路のアーム（`legacy` を名乗るブロック）は丸ごと落とす
+            let mut skipped = vec![false; lines.len()];
+            let mut arm: Option<usize> = None;
+            for (offset, candidate) in lines.iter().enumerate().take(end).skip(index + 1) {
+                let trimmed = candidate.trim();
+                let indent = candidate.len() - candidate.trim_start().len();
+                if let Some(arm_indent) = arm {
+                    skipped[offset] = true;
+                    if !trimmed.is_empty() && indent == arm_indent && trimmed.starts_with('}') {
+                        arm = None;
+                    }
+                } else if trimmed.contains("legacy") && trimmed.ends_with('{') {
+                    arm = Some(indent);
+                    skipped[offset] = true;
+                }
+            }
+            // 画面から採った値に付いた名前を集める。**束縛の範囲はインデントで採る**
+            // （`;` まで繋ぐ形は、閉包の中に `;` を持つ `let closed = wait…(…)` で
+            // 内側の `let` を丸ごと飲み込んでしまい、#1175 の実物を見逃した）
+            let mut screen_vars: Vec<&str> = Vec::new();
+            for (offset, candidate) in lines.iter().enumerate().take(end).skip(index + 1) {
+                if skipped[offset] {
+                    continue;
+                }
+                let Some(name) = binding_name(candidate.trim()) else {
+                    continue;
+                };
+                let body = indented_body(&lines, offset, end);
+                if body.contains(screen_read) || screen_vars.iter().any(|v| mentions(&body, v)) {
+                    screen_vars.push(name);
+                }
+            }
+            // 溜める代入（`x |= …`）の右辺が画面由来なら名指しする
+            for (offset, candidate) in lines.iter().enumerate().take(end).skip(index + 1) {
+                if skipped[offset] {
+                    continue;
+                }
+                let Some((_, rhs)) = candidate.trim().split_once(latch) else {
+                    continue;
+                };
+                let rhs = format!("{rhs} {}", indented_body(&lines, offset, end));
+                if rhs.contains(screen_read) || screen_vars.iter().any(|v| mentions(&rhs, v)) {
+                    hits.push(offset + 1);
+                }
+            }
+        }
+        hits.sort_unstable();
+        hits.dedup();
+        hits
+    }
+
+    /// `let x = …` / `let mut x = …` の束縛名（それ以外は None）
+    fn binding_name(trimmed: &str) -> Option<&str> {
+        let rest = trimmed.strip_prefix("let ")?;
+        let rest = rest.strip_prefix("mut ").unwrap_or(rest);
+        let name = rest.split(['=', ':', ' ', '(', ')']).next()?.trim();
+        let ok = !name.is_empty()
+            && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        ok.then_some(name)
+    }
+
+    /// その行に続く**より深いインデントの行**を繋いだもの（式の続き）
+    fn indented_body(lines: &[&str], at: usize, end: usize) -> String {
+        let indent = lines[at].len() - lines[at].trim_start().len();
+        let mut body = lines[at].trim().to_string();
+        for candidate in lines.iter().take(end).skip(at + 1) {
+            let trimmed = candidate.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if candidate.len() - candidate.trim_start().len() <= indent {
+                break;
+            }
+            body.push(' ');
+            body.push_str(trimmed);
+        }
+        body
+    }
+
+    /// 識別子としての出現か（部分一致で `lines` が `visible_lines` に当たるのを避ける）
+    fn mentions(haystack: &str, name: &str) -> bool {
+        let bytes = haystack.as_bytes();
+        let mut from = 0;
+        while let Some(at) = haystack[from..].find(name) {
+            let start = from + at;
+            let end = start + name.len();
+            let before_ok = start == 0 || !is_ident_byte(bytes[start - 1]);
+            let after_ok = end == bytes.len() || !is_ident_byte(bytes[end]);
+            if before_ok && after_ok {
+                return true;
+            }
+            from = end;
+        }
+        false
+    }
+
+    fn is_ident_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+
+    #[test]
+    fn 実claudeの発話をビューポートで判定していない() {
+        let src = include_str!("main.rs");
+        let hits = screen_latched_in_claude_e2e(src);
+        assert!(
+            hits.is_empty(),
+            "main.rs:{hits:?} が「実 claude の発話内容をいまのビューポートから溜めて判定する」\
+             形で書かれている。実 claude の発話は流れるので、後任が長く働くほど確実に\
+             落ちる（#1175 の項目 101c は負荷と無関係に 2/2 回 `saw_marker=false`）。\
+             証拠は流れない場所 = 後任の transcript（`chat_state` の発話）から採ること"
+        );
+    }
+
+    /// 検出力の担保: 番犬自身が空振りしないこと（#1175 で直した形そのものを与える）
+    #[test]
+    fn 番犬は画面から溜める判定を見逃さず駆動と旧経路は許す() {
+        let gate = format!(
+            "                if {}_enabled(\"749\") {{",
+            concat!("claude_", "e2e")
+        );
+        let close = "                }";
+        // 実物と同じ整形（**複数行の `let`**）で与える。1 行に畳むと、束縛を `;` まで
+        // 繋いで採る実装でも通ってしまい「#1175 の実物を見逃す番犬」を許してしまう
+        let map_line = format!(
+            "                        .map(|s| s.{})",
+            concat!("visible_", "lines()")
+        );
+        let read = [
+            "                    let lines = app",
+            "                        .terminals",
+            "                        .get(&new_pane)",
+            map_line.as_str(),
+            "                        .unwrap_or_default();",
+        ]
+        .join("\n");
+        let latch = format!(
+            "                    saw_marker {} joined.contains(MARKER);",
+            concat!("|", "=")
+        );
+        // 画面から採った値を周期をまたいで溜める形（#1175 の欠陥そのもの）
+        let bad = [
+            gate.as_str(),
+            read.as_str(),
+            "                    let joined = lines.join(\"\\n\");",
+            latch.as_str(),
+            close,
+        ]
+        .join("\n");
+        assert_eq!(screen_latched_in_claude_e2e(&bad), vec![8]);
+        // transcript から採る形は許す
+        let good = [
+            gate.as_str(),
+            read.as_str(),
+            "                    let evidence = handoff_evidence(&state.messages, MARKER);",
+            &format!(
+                "                    saw_marker {} evidence.marker;",
+                concat!("|", "=")
+            ),
+            close,
+        ]
+        .join("\n");
+        assert!(screen_latched_in_claude_e2e(&good).is_empty());
+        // 毎周期の駆動（信頼ダイアログの承諾）は溜めないので対象外
+        let drive = [
+            gate.as_str(),
+            read.as_str(),
+            "                    if lines.iter().any(|l| l.contains(\"Yes, I trust\")) {",
+            "                        accept_trust_dialog(app, pane);",
+            "                    }",
+            close,
+        ]
+        .join("\n");
+        assert!(screen_latched_in_claude_e2e(&drive).is_empty());
+        // A/B の口（旧経路のアーム）は意図して残すので対象外
+        let legacy = [
+            gate.as_str(),
+            read.as_str(),
+            "                    if legacy_1175 {",
+            "                        let joined = lines.join(\"\\n\");",
+            latch.as_str(),
+            "                    }",
+            close,
+        ]
+        .join("\n");
+        assert!(screen_latched_in_claude_e2e(&legacy).is_empty());
+        // 実 claude の e2e の外は対象外
+        let elsewhere = [
+            "                if other_gate {",
+            read.as_str(),
+            "                    let joined = lines.join(\"\\n\");",
+            latch.as_str(),
+            close,
+        ]
+        .join("\n");
+        assert!(screen_latched_in_claude_e2e(&elsewhere).is_empty());
+    }
+
     /// **固定窓のあいだに画面の文字列を待っていない**（#1165）。
     ///
     /// `for _ in 0..8 { wait(cx, 800).await; ok = focused_contains(…) }` は
@@ -67414,11 +67861,9 @@ mod selftest_wait_watchdog {
     /// 「早く抜ける（`break`）か」= 待ちの結果を判定に使っているか、で付ける
     /// （片付けは何回叩いたかだけが意味を持つので `break` を持たない）。
     /// パターンは `concat!` で分割して書く（番犬自身のソース行が検査対象に入るため）
-    fn fixed_window_in_claude_e2e(src: &str) -> Vec<usize> {
-        let lines: Vec<&str> = src.lines().collect();
+    fn claude_e2e_regions(lines: &[&str]) -> Vec<(usize, usize)> {
         let gate = concat!("claude_", "e2e");
-        let wait_call = concat!("wait(cx", ", ");
-        let mut hits = Vec::new();
+        let mut regions = Vec::new();
         for (index, line) in lines.iter().enumerate() {
             // 実 claude の e2e で守られている**ブロックの入口**だけを region の頭にする
             // （`let claude_e2e = …;` のような宣言は行末が `{` ではないので入らない）
@@ -67437,6 +67882,16 @@ mod selftest_wait_watchdog {
                     break;
                 }
             }
+            regions.push((index, end));
+        }
+        regions
+    }
+
+    fn fixed_window_in_claude_e2e(src: &str) -> Vec<usize> {
+        let lines: Vec<&str> = src.lines().collect();
+        let wait_call = concat!("wait(cx", ", ");
+        let mut hits = Vec::new();
+        for (index, end) in claude_e2e_regions(&lines) {
             for (offset, candidate) in lines.iter().enumerate().take(end).skip(index + 1) {
                 let trimmed = candidate.trim();
                 if !(trimmed.starts_with("for ")
