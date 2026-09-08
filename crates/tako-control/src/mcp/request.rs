@@ -359,6 +359,7 @@ pub(super) fn build_request(
                 "trash" => crate::protocol::FileOpKind::Trash,
                 "open_default" => crate::protocol::FileOpKind::OpenDefault,
                 "open_with" => crate::protocol::FileOpKind::OpenWith,
+                "open_in_tako" => crate::protocol::FileOpKind::OpenInTako,
                 other => return Err(format!("op が不正: {other}")),
             };
             Request::FileOp {
@@ -367,9 +368,9 @@ pub(super) fn build_request(
                 name: str_arg(args, "name")?,
                 pane: match op {
                     crate::protocol::FileOpKind::OpenTerminal
-                    | crate::protocol::FileOpKind::CopyRelativePath => {
-                        Some(target_pane(args, caller)?)
-                    }
+                    | crate::protocol::FileOpKind::CopyRelativePath
+                    // #1182: 分割元 = 開き先の決定に使う
+                    | crate::protocol::FileOpKind::OpenInTako => Some(target_pane(args, caller)?),
                     _ => None,
                 },
             }

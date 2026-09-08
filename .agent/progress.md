@@ -19,16 +19,6 @@
 
 ---
 
-## 2026-09-08（#1081: 解説動画の読み間違いを全区間点検して v4 を合成）
-- 全 47 区間の kana を機械で出して全件読み、誤読 5 件を修正（`3 つ`→みっつ / `1 行`×2 / `空のペイン` / `140 個`）
-- **ユーザー辞書は空白でトークンが割れて当たらない**（実測）ので、合成直前の置換表 `reading-overrides.tsv` を正本に
-- v4 = 9:59 / -14.9 LUFS / TP -1.5 dBTP / PII 0 件。点検は `check-readings.sh --diff`
-
-## 2026-09-09（#1013: codex / agy の spawn に claude 語彙のモデル既定を渡さないようにした）
-- 真因はアカウント（#504）の `default_model` を spawn の明示指定と同じ段へ畳んでいたこと。`AccountDefaults` で段を分け、継承の可否は新 1 マス `worker_model_default_inherit`（claude のみ対応）へ問う形に（#982）。応答に `model_source` / `effort_source` を追加
-- 実 spawn（隔離 + tako-vd）: codex は自分の既定 `gpt-5.6-sol medium` で起動して `OK1013` を返した / agy も `--model` `--effort` なし / claude は `--model claude-opus-5 --effort max` のまま不変
-- A/B `TAKO_1013_LEGACY=1` は Issue と同じ `codex --model claude-opus-5 …` を再現。番犬 3 本 + 単体 7 本。全 3613 件緑
-
 ## 2026-09-09（#1019: setup ディレクトリを data dir の境界へ寄せ、旧 Windows パスから自動移設）
 - `setup_dir()` の macOS 直書きを `tako_control::setup::setup_dir`（= `data_dir()/setup`）へ集約。旧パスは `SchemaId::Setup` の番地 + 専用実装で移設（写す → 旧ごと `setup.pre-v1.bak` へ rename・**隔離中は移設しない**）
 - A/B 実測: 同条件の `setup --yes` が旧バイナリは HOME 側へ 16 ファイル・新は `$TAKO_DATA_DIR/setup` へ。本番 dir は隔離 6 経路の前後でハッシュ・mtime とも不変
@@ -88,3 +78,8 @@
 - `tako tmux cleanup --servers`（既定 dry-run・実削除は `--apply`）を追加。判定は名前ではなく**所有プロセスの生死**（自分 / 既定 / 生きた tako-app の env 復元 / attach 中 / 所有者不明 / 出来たて を除いた残りだけ回収可）。溜めない側は使い捨て backend（`tako-iso-<自分の pid>`）の終了時 self-kill
 - 実測: 本番置き場へ dry-run = 総数 1838 / 生存 126 / 回収可 116 / 残骸 1708 / 保護 14（何も消していない）。隔離した置き場のダミーで `--apply` = 生きた所有者は `owner_alive` で無傷・死んだ所有者だけ kill + ソケット削除
 - 番犬 2 本（修正前ソースで FAILED）+ 実物テスト 3 本 + 純粋 4 本。所有者の生死ガードを外す注入で必須テストが FAILED
+
+## 2026-09-09（#1182: ターミナルのパスリンクに cmd+右クリックメニューを付けた）
+- 並びは `tako_core::path_menu`（純粋関数）・文言はツリー（#314）の `sidebar::menu_*` を委譲で共有。新規操作は「tako で開く」= `FileOpKind::OpenInTako` の 1 つだけで **cmd+クリック自身もそこを通す**（CLI `tako file open-in-tako` / MCP `op=open_in_tako`）
+- **前提として `links::combined_screen_text` の soft wrap 判定を直した**: 実画面の行は空白詰めなので旧判定では全行が折り返し扱いになり、隣接 2 行に何か書かれているだけでパスリンクが 1 つも検出されなかった（A/B: 旧式で新テストが FAILED）
+- 項目 147（合成マウスの実配送 + 実矩形 + 前提の ui-mode 倒し・unix 限定）/ CLI・MCP e2e を隔離 GUI で実測 / 実フレーム PNG 2 枚 / `TAKO_1182_LEGACY=1` で 147 が確定 FAILED。全 3711 件緑

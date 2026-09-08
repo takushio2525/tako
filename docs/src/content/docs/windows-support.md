@@ -194,7 +194,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 
 | 機能 | 状態 | 差分 | 根拠 |
 | --- | --- | --- | --- |
-| `tako_file_op` | 対応 | — | 実機実測: #617 の Windows 11 実測: 空白 + 日本語名 / 読み取り専用 / ディレクトリ / 315 文字のパスがいずれも復元可能な状態でごみ箱へ入り、reveal で対象が選択され、既定アプリが起動する。実機で緑のテスト: os_integration の windows モジュール（FOF_ALLOWUNDO のフラグ構成 / 絶対化 / /select, の形） |
+| `tako_file_op` | 対応 | — | 実機実測: #617 の Windows 11 実測: 空白 + 日本語名 / 読み取り専用 / ディレクトリ / 315 文字のパスがいずれも復元可能な状態でごみ箱へ入り、reveal で対象が選択され、既定アプリが起動する。実機で緑のテスト: os_integration の windows モジュール（FOF_ALLOWUNDO のフラグ構成 / 絶対化 / /select, の形）。#1182 のターミナル内パスリンクの cmd+右クリックメニューもこの op 群（open_in_tako / open_default / open_with / reveal / copy_*）だけで出来ているので、**Windows でも項目は 1 つも消えない**（「Finder で表示」が「エクスプローラーで表示」へ入れ替わるだけ = #617 の呼び名 1 実装。文言の入れ替えと項目の並びが変わらないことは path_link_menu_items の単体が macOS 上から両 OS 分を検査する）。ただし**メニューを出す前段のパス検出は Windows では狭い**: links::is_path_like が `/` を含む形だけを候補にするので `C:\…` の絶対パスはリンクにならず（`src/main.rs` のような `/` 区切りの相対パスは効く）、これは #1182 以前からの #153 の範囲の制約 |
 | `tako_sleep_guard` | 対応 | — | 実機実測: powercfg /requests の SYSTEM に tako のアサーションが出て mode=off で消える。蓋閉じは lid-guard.json の生成まで確認 + セルフテスト項目 120 / 121 |
 | `tako_port_detect` | 対応 | — | 実機実測: スライス 9 で tako list が 8123/node.exe を拾い、psmux の偽 listen 21 個を 1 つも報告しない + セルフテスト項目 55（ON/OFF） |
 | `tako_fda` | 対象外 | Windows に macOS の TCC（フルディスクアクセス）に相当する仕組みが無い | OS の仕様: Windows に TCC（フルディスクアクセス）相当の仕組みが無いので許可を求める対象が無い（#515 の判定テストが固定） |
