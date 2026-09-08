@@ -532,6 +532,7 @@ FR-2.12.6〜9 は 2026-07-27 に #552 で追加）:
 | FR-2.13.5 | データ取得層（tmux クエリ・対応付け）と表示を分離する（表示方法は変わる前提とユーザーが明言） | M |
 | FR-2.13.6 | **window 操作の対象は「そのペインが attach しているセッション」**（#1185）。`tako tmux open` の取り込みペインは「外側 = tako のバックエンドセッション（FR-5）」「内側 = 取り込んだセッション（表示用の `tako-view-*` grouped ラッパー）」の二重ネストなので、`backend_session` だけで解決すると**別セッションの window を切り替えて成功を返す**。解決は `tako_core::tmux::window_target`（ビュー優先 → バックエンド）の 1 実装に集約し、応答は `session`（論理名）/ `target`（実際に打った相手）/ `socket` を返す。どちらも無いペインは成功を返さずエラー。取り込み時の window 指定（`TmuxOpen.window`）は CLI `--window` と MCP `tako_tmux_open` の `window` の**両方**から到達できること（開発不変条件。到達性は番犬 `mcp_param_reachability` が機械検証する） | M |
 | FR-2.13.7 | **`socket` 省略時の解決を系統内で揃える**（#1190）。`tako tmux list` は socket 省略時に既定サーバーと tako バックエンドの**両方**を併記するので、`kill` / `resize` / `open` も同じ順（既定サーバー → tako バックエンド）で探す（`tako_core::tmux::resolve_session_socket` の 1 実装）。明示された socket はそのまま尊重する。`--socket` を付けさせないのが #322 の原則。**tmux の生 stderr を応答へ素通ししない**: `friendly_error` で日本語へ包み、ソケットの絶対パスを出さない（#927 の方針）。応答には解決後の `socket` を含める。なお `kill` が backend セッションへ届くようになるため、生きたペインを壊す前の確認 / `--force` が別途必要（#1196） | M |
+| FR-2.13.8 | **`resize --reset` は実際に window を戻す**（#1186）。`set-window-option -u window-size` は「オプションを未設定へ戻す」だけで**その場ではリサイズしない**ため、`resize-window -A` を**先に**打つ（`-A` は window-size を manual にするので順序は逆にできない）。`-A` に失敗してもオプション解除は行い、**エラーはそのまま返す**（成功を返しながら効かないのが #1186 の症状）。クライアントがその window を見ているあいだは `-u` だけでも戻るため、**別 window を見ている / クライアント不在**のときだけ症状が出る（`resize` はスマホリモートのビューポート連動 #23 用なので、PC に戻ったとき縮んだままだと復旧手段が無い） | M |
 
 実装メモ（着手時に設計する）:
 
