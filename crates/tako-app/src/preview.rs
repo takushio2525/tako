@@ -1312,7 +1312,14 @@ fn parse_markdown_blocks(text: &str) -> Vec<MdBlock> {
     options.insert(Options::ENABLE_TASKLISTS);
     // Issue #656: 表を表構造として受け取る（従来は素のテキストへ潰れていた）
     options.insert(Options::ENABLE_TABLES);
-    let parser = Parser::new_ext(text, options);
+    // Issue #1202: 先頭の UTF-8 BOM を落としてから渡す。BOM が `#` の直前に居ると
+    // pulldown-cmark は行頭の `#` を見出しと認識せず、**1 行目だけ**生テキストで出る。
+    // Windows は BOM 付き UTF-8 が既定で作られる場面が多い（PowerShell 5.1 の
+    // `Set-Content -Encoding UTF8` / メモ帳）ので遭遇率が高い。
+    // ここは Markdown の唯一の入口（プレビュー / チャット / 更新ノート / md_view が通る）。
+    // **剥がすのはパーサへ渡す本文だけ**で、編集・保存が持つ生テキストには触らないので
+    // BOM 付きファイルを保存し直しても BOM は消えない
+    let parser = Parser::new_ext(tako_core::text::strip_bom(text), options);
 
     let mut blocks: Vec<MdBlock> = Vec::new();
     let mut spans: Vec<MdSpan> = Vec::new();
@@ -1832,6 +1839,67 @@ mod tests {
         assert!(!state.truncated);
         assert!(!state.markdown_capable());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1202: 先頭に UTF-8 BOM が付いた Markdown でも **1 行目の見出しが H1 になる**。
+    ///
+    /// BOM が `#` の直前に居ると pulldown-cmark は行頭の `#` を見出しと認識せず、
+    /// 1 行目だけ生テキストの段落になる（2 行目以降は正しく描かれるので気付きにくい）。
+    /// Windows は BOM 付き UTF-8 が既定で作られる場面が多い
+    /// （PowerShell 5.1 の `Set-Content -Encoding UTF8` / メモ帳）
+    #[test]
+    fn bom付きmarkdownでも先頭行が見出しになる() {
+        let body = "# sample project\n\n## Sections\n\n本文\n";
+        let with_bom = format!("\u{feff}{body}");
+        // 先頭 3 バイトが EF BB BF であること（PowerShell が作る形と同じ）
+        assert_eq!(&with_bom.as_bytes()[..3], &[0xEF, 0xBB, 0xBF]);
+
+        let bom = markdown_blocks(&with_bom);
+        let plain = markdown_blocks(body);
+        // BOM の有無でブロック列が 1 つも変わらない
+        assert_eq!(
+            format!("{bom:?}"),
+            format!("{plain:?}"),
+            "BOM の有無でパース結果が変わっている"
+        );
+        assert!(
+            matches!(
+                &bom[0].kind,
+                MdBlockKind::Heading { level: 1, spans } if spans[0].text == "sample project"
+            ),
+            "1 行目が H1 になっていない: {:?}",
+            bom[0]
+        );
+        // 2 行目以降は元から効いていた（回帰していないことの確認）
+        assert!(bom.iter().any(
+            |b| matches!(&b.kind, MdBlockKind::Heading { level: 2, spans }
+                if spans[0].text == "Sections")
+        ));
+    }
+
+    /// #1202 のエッジ: BOM しかない / BOM + 空行 + 見出し / 文中の U+FEFF
+    #[test]
+    fn bomのエッジケースで壊れない() {
+        // BOM だけ = 空文書（panic せず空のブロック列）
+        assert!(markdown_blocks("\u{feff}").is_empty());
+        // BOM + 空行 + 見出し（BOM の行に本文が無い形）
+        let blocks = markdown_blocks("\u{feff}\n# 後ろの見出し\n");
+        assert!(
+            matches!(
+                &blocks[0].kind,
+                MdBlockKind::Heading { level: 1, spans } if spans[0].text == "後ろの見出し"
+            ),
+            "BOM + 空行のあとの見出しが H1 になっていない: {blocks:?}"
+        );
+        // 文中の U+FEFF は本文として残す（剥がすのは先頭 1 個だけ）
+        let inline = markdown_blocks("段落\u{feff}中\n");
+        let MdBlockKind::Paragraph { spans } = &inline[0].kind else {
+            panic!("段落になる: {inline:?}");
+        };
+        assert!(
+            spans.iter().any(|s| s.text.contains('\u{feff}')),
+            "文中の U+FEFF まで落としている: {spans:?}"
+        );
     }
 
     #[test]
