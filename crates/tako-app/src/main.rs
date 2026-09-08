@@ -82,10 +82,12 @@ use gpui::{
     UTF16Selection, UnderlineStyle, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
+use tako_control::sessions::RestorePlan;
 use tako_control::{
     IncomingRequest, IpcServer, McpServer, PreviewHost, RemoteHost, SessionHost, SystemHost,
     TmuxHost, UiStateHost, WebViewHost, WorkspaceHost,
 };
+use tako_core::claude_resume::legacy_1076;
 use tako_core::pane_log::CloseOrigin;
 use tako_core::{
     ratio_for_position, AgentMetrics, CommandState, Pane, PaneId, PaneOrigin, Rect, SelectionKind,
@@ -116,24 +118,21 @@ fn legacy_1191() -> bool {
     *LEGACY.get_or_init(|| std::env::var("TAKO_1191_LEGACY").as_deref() == Ok("1"))
 }
 
-/// 復元時に新しいシェルへ投入する Claude resume コマンドを安全条件つきで組み立てる。
-/// backend 生存時はプロセスごと再 attach するため、二重起動を避けて None。
+/// 復元時の resume コマンドを PTY（新しいログインシェルの stdin）へ流す形にする。
 ///
-/// `env_prefix` は transcript の所在から決まる `CLAUDE_CONFIG_DIR` の指定
-/// （`tako_control::transcript::resume_env_prefix`）。`None` = transcript が
-/// 見つからない = 会話が残っていないので resume しない（Issue #652）
-fn claude_resume_command(
-    backend_alive: bool,
-    session_id: Option<&str>,
-    env_prefix: Option<&str>,
-) -> Option<Vec<u8>> {
-    let session_id = (!backend_alive)
-        .then_some(session_id)
-        .flatten()
-        .filter(|id| tako_control::transcript::is_valid_session_id(id))?;
-    let env_prefix = env_prefix?;
-    Some(format!("{env_prefix}claude --resume {session_id}\r").into_bytes())
+/// **明示コマンド spawn ではなく入力のキュー**なので、claude を終了したあとは
+/// 元のシェルへ戻れる（明示コマンドだとペインごと終了する）。末尾は CR
+/// （端末の Enter キーが送るバイト。行編集はこれで確定する）
+fn resume_input(command: &str) -> Vec<u8> {
+    format!("{command}\r").into_bytes()
 }
+
+// 復元時に投入する resume コマンドの**組み立てはここに置かない**（#1076）。
+// 正本は `tako_control::sessions::restore_plan`（= `resume_command` と同じ形を使う）で、
+// 役割 env / `--model` / `--effort` / アカウントの config dir まで復元する。
+// ここに 2 つ目の組み立てを置くと、片方だけが起動条件を落とす形で分岐する
+// （旧 `claude_resume_command` が実際にそうなっていた）。番犬テスト
+// `crates/tako-control/tests/claude_resume_watchdog.rs` が再発を落とす。
 
 /// タブバーの高さ（px）
 const TAB_BAR_HEIGHT: f32 = 44.0;
@@ -1616,8 +1615,9 @@ struct TakoApp {
     /// dispatch で resolve 失敗 → このマップで新 pane ID に解決する（#210）
     stale_pane_map: HashMap<PaneId, PaneId>,
     /// PC 再起動で tmux セッション自体が消えたときに resume する Claude session ID。
-    /// `claude agents --json` と PID 祖先照合が成功した結果だけを保持する
-    claude_resume_sessions: HashMap<PaneId, String>,
+    /// 保持規則（**確認してから外す**）は `tako_core::claude_resume` が正本で、
+    /// 復元由来の未確認 ID をスキャンの不在で落とさない（#1076）
+    claude_resume_sessions: tako_core::claude_resume::ResumeIds,
     /// バックエンドセッション内の window 一覧。**backend ペイン全件**にエントリが載り
     /// （window 0 枚は空 Vec）、載っていない = 「backend でない / 採取できなかった」。
     /// 更新は右パネルの 2 秒ポーリングと `tako list` の要求時採取の両方（#1191）
@@ -3611,7 +3611,7 @@ impl TakoApp {
             quitting: false,
             backend_sessions: HashMap::new(),
             stale_pane_map: HashMap::new(),
-            claude_resume_sessions: HashMap::new(),
+            claude_resume_sessions: tako_core::claude_resume::ResumeIds::new(),
             backend_windows: HashMap::new(),
             backend_windows_at: None,
             window_captures: HashMap::new(),
@@ -3968,8 +3968,14 @@ impl TakoApp {
                 .collect();
             let mut reattached = 0usize;
             let mut resumed_claude = 0usize;
+            let mut resumed_with_role = 0usize;
             let mut fresh_shells = 0usize;
             let mut restored_previews = 0usize;
+            // 新規シェルへ落ちた理由の内訳（#1076。「なぜ claude が出なかったか」を残す）
+            let mut fresh_reasons: HashMap<&'static str, usize> = HashMap::new();
+            // セッションカタログ（#112）は復元ループの外で 1 回だけ読む。
+            // 起動条件（役割 / model / effort）の出どころで、読めなければ最小形へ落ちる
+            let catalog = tako_control::sessions::SessionCatalog::load().ok();
             for r in &restored {
                 let Some(&pane) = pane_ids.iter().find(|p| p.as_u64() == r.pane) else {
                     continue;
@@ -4033,21 +4039,20 @@ impl TakoApp {
                     app.pane_logs_lock()
                         .seed_history(pane.as_u64(), &meta, history as usize);
                 }
-                // transcript の所在から resume 時の CLAUDE_CONFIG_DIR を決める（Issue #652）。
-                // アカウント（#504）のペインは会話が `~/.claude` に無いため、
-                // 既定 config dir のままだと会話が見つからず新規シェルに落ちていた
-                let resume_env = r
-                    .claude_session_id
-                    .as_deref()
-                    .and_then(tako_control::transcript::resume_env_prefix);
-                let resume_command = claude_resume_command(
+                // このペインをどう起こすか（#1076）。判断とコマンドの形は
+                // `tako_control::sessions::restore_plan` が正本で、**役割 env /
+                // `--model` / `--effort` / アカウントの config dir までカタログの
+                // 記録から復元する**（最小形 `claude --resume <id>` だと戻ってきた
+                // claude が master / worker として認識されない = #1076）
+                let plan = tako_control::sessions::restore_plan(
                     backend_alive,
                     r.claude_session_id.as_deref(),
-                    resume_env.as_deref(),
+                    catalog.as_ref(),
                 );
                 if let Some(session_id) = &r.claude_session_id {
                     if tako_control::transcript::is_valid_session_id(session_id) {
-                        app.claude_resume_sessions.insert(pane, session_id.clone());
+                        // **未確認**として持つ（スキャンの不在では落とさない。#1076）
+                        app.claude_resume_sessions.seed(pane, session_id);
                     }
                 }
                 let options = SpawnOptions {
@@ -4062,18 +4067,24 @@ impl TakoApp {
                     eprintln!("warning: ペイン {pane} を復元できない: {e}");
                     continue;
                 }
-                if backend_alive {
-                    reattached += 1;
-                } else if let Some(command) = resume_command {
-                    // tmux サーバーごと消える PC 再起動では新しいログインシェルを起動し、
-                    // 保存済みの会話だけを明示 resume する。入力を PTY にキューすることで、
-                    // Claude 終了後は元のシェルへ戻れる（明示コマンド spawn だとペインも終了する）。
-                    if let Some(session) = app.terminals.get(&pane) {
-                        session.write(command);
-                        resumed_claude += 1;
+                match plan {
+                    RestorePlan::Reattach => reattached += 1,
+                    RestorePlan::ResumeClaude { command, with_role } => {
+                        // tmux サーバーごと消える PC 再起動では新しいログインシェルを起動し、
+                        // 保存済みの会話だけを明示 resume する。入力を PTY にキューすることで、
+                        // Claude 終了後は元のシェルへ戻れる（明示コマンド spawn だとペインも終了する）。
+                        if let Some(session) = app.terminals.get(&pane) {
+                            session.write(resume_input(&command));
+                            resumed_claude += 1;
+                            if with_role {
+                                resumed_with_role += 1;
+                            }
+                        }
                     }
-                } else {
-                    fresh_shells += 1;
+                    RestorePlan::FreshShell(reason) => {
+                        fresh_shells += 1;
+                        *fresh_reasons.entry(reason.label()).or_insert(0usize) += 1;
+                    }
                 }
             }
             if app.terminals.is_empty()
@@ -4096,6 +4107,26 @@ impl TakoApp {
             );
             app.restore_report = Some(report.clone());
             persist_diag(&report);
+            // 経路の内訳（#1076）。1 行目は形を変えない（読む側が居る）ので別行で足す。
+            // 「新規シェル N」だけでは、claude が出なかった理由（ID なし / 形式不正 /
+            // 会話が見つからない）が分からず、同じ報告が何度も上がっていた
+            if resumed_claude + fresh_shells > 0 {
+                let mut reasons: Vec<String> = fresh_reasons
+                    .iter()
+                    .map(|(label, n)| format!("{label} {n}"))
+                    .collect();
+                reasons.sort();
+                persist_diag(&format!(
+                    "復元の内訳: Claude resume {resumed_claude}（役割つき {resumed_with_role} / 役割なし {}）\
+                     / 新規シェル {fresh_shells}{}",
+                    resumed_claude - resumed_with_role,
+                    if reasons.is_empty() {
+                        String::new()
+                    } else {
+                        format!("（{}）", reasons.join(" / "))
+                    }
+                ));
+            }
             // 復元時のプレビューも background でハイライト / 読み込みする
             for (pane, path, text) in std::mem::take(&mut app.pending_highlights) {
                 app.spawn_highlight(pane, path, text, cx);
@@ -4351,10 +4382,12 @@ impl TakoApp {
                 if !has_children {
                     last_scan = std::time::Instant::now();
                     let _ = this.update(cx, |app: &mut TakoApp, _| {
-                        if !app.claude_resume_sessions.is_empty() {
-                            app.claude_resume_sessions.clear();
-                            app.save_layout();
-                        }
+                        // #1076: ここを `clear()` にすると、**再起動直後**（claude が
+                        // まだ起動途中でどのペインも子プロセスを持たない数秒間）に
+                        // 復元した ID を全部捨ててしまう。「検出できなかった 1 回」
+                        // として保持規則へ渡し、確認済みのペインだけが落ちる形にする
+                        app.apply_claude_resume_sessions(&[]);
+                        app.save_layout();
                     });
                     continue;
                 }
@@ -7975,7 +8008,7 @@ impl TakoApp {
     /// セッションは生きているか他インスタンスが引き継いでいる。残骸は起動時の
     /// orphan クリーンアップ（FR-2.16.11）と tmux ビューの「kill漏れ?」表示が拾う）
     fn drop_backend_session_with(&mut self, pane_id: PaneId, reason: CloseReason) {
-        self.claude_resume_sessions.remove(&pane_id);
+        self.claude_resume_sessions.remove(pane_id);
         if reason.is_explicit() {
             self.drop_backend_session(pane_id, reason.origin(), None);
         } else {
@@ -8408,7 +8441,7 @@ impl TakoApp {
                     .get(&pane)
                     .and_then(|s| s.cwd())
                     .map(|p| p.display().to_string()),
-                claude_session_id: claude_resume_sessions.get(&pane).cloned(),
+                claude_session_id: claude_resume_sessions.get(pane).map(str::to_string),
                 logged_history: pane_log_history.get(&pane.as_u64()).copied(),
                 preview: previews
                     .get(&pane)
@@ -8471,11 +8504,15 @@ impl TakoApp {
 
     /// 1 回の `claude agents --json` 成功結果を「ペイン → claude セッション」へ落とす
     /// （layout.json に保存し、復元時の `claude --resume` に使う。#652）。
-    /// 成功結果に存在しないペインは Claude が終了済みなので関連を外し、次回 PC 起動で
-    /// 古い会話を勝手に resume しない。スキャン自体が失敗した場合は呼ばれない。
+    /// スキャン自体が失敗した場合は呼ばれない。
     ///
     /// #728: 器のセッション名だけでなく**ペイン ID 直付け**の検出も受ける。
     /// 器が無い構成ではセッション名が付かず、以前はここで全部こぼれていた
+    ///
+    /// #1076: **検出結果でマップを丸ごと置き換えてはいけない**。検出は
+    /// 「いま動いているか」しか答えないので、不在は「終了した」の証拠にならない
+    /// （再起動直後は resume した claude が起動途中で 1 件も出ない）。落とし方の
+    /// 規約は `tako_core::claude_resume`（確認してから外す）が持つ
     fn apply_claude_resume_sessions(
         &mut self,
         detected: &[tako_control::sessions::DetectedSession],
@@ -8488,9 +8525,9 @@ impl TakoApp {
             .iter()
             .filter_map(|d| Some((d.pane?, d.session_id.as_str())))
             .collect();
-        self.claude_resume_sessions = self
-            .terminals
-            .keys()
+        let panes: Vec<PaneId> = self.terminals.keys().copied().collect();
+        let found: HashMap<PaneId, String> = panes
+            .iter()
             .filter_map(|pane| {
                 let id = self
                     .backend_sessions
@@ -8501,6 +8538,12 @@ impl TakoApp {
                     .then(|| (*pane, (*id).to_string()))
             })
             .collect();
+        if legacy_1076() {
+            // A/B（#1076）: 修正前の「検出結果で丸ごと置き換える」を再現する
+            self.claude_resume_sessions.replace_all_legacy(&found);
+            return;
+        }
+        self.claude_resume_sessions.apply_scan(&panes, &found);
     }
 
     /// ペインログ（Issue #112 B）のロック（毒化耐性: 追記状態の破損より継続を優先）
@@ -22675,11 +22718,18 @@ impl TakoApp {
                                         .child(crate::ui_text::dialog::close_enter()),
                                 ),
                         )
-                        .child(
-                            div()
-                                .text_size(px(11.0))
-                                .text_color(hsla(theme.text_overlay))
-                                .child(crate::ui_text::dialog::close_skip_hint()),
+                        // #1203: スキップ判定は GPUI の platform 修飾を直接見ているので、
+                        // Windows（= Win キー・実質押せない）では案内ごと出さない
+                        .children(
+                            tako_core::platform::keys::platform_modifier(
+                                tako_core::platform::support::Platform::current(),
+                            )
+                            .map(|m| {
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(hsla(theme.text_overlay))
+                                    .child(crate::ui_text::dialog::close_skip_hint(m.symbol))
+                            }),
                         ),
                 ),
         )
@@ -67482,42 +67532,65 @@ mod self_test_isolation_tests {
 
 #[cfg(test)]
 mod persist_resume_tests {
-    use super::claude_resume_command;
+    use super::resume_input;
+    use tako_control::sessions::{
+        restore_plan_in, FreshShellReason, RestorePlan, SessionCatalog, SessionEntry,
+    };
 
+    /// 復元の判断（何を起こすか・どんなコマンドか）は
+    /// `tako_control::sessions::restore_plan` が正本。ここでは
+    /// **PTY へ流す形**（入力のキュー = 末尾 CR）だけを固定する
     #[test]
-    fn backend消失時だけ検証済みclaudeをresumeする() {
-        let id = "a45899a8-96a6-4fa6-9bf6-71df53307878";
-        let default_env = "unset CLAUDE_CONFIG_DIR; ";
+    fn resumeコマンドは入力としてキューされる() {
         assert_eq!(
-            claude_resume_command(false, Some(id), Some(default_env)),
-            Some(format!("{default_env}claude --resume {id}\r").into_bytes())
+            resume_input("unset CLAUDE_CONFIG_DIR; claude --resume abc"),
+            b"unset CLAUDE_CONFIG_DIR; claude --resume abc\r".to_vec()
         );
-        // 通常の tako 再起動は既存プロセスへ再 attach し、Claude を二重起動しない
-        assert_eq!(
-            claude_resume_command(true, Some(id), Some(default_env)),
-            None
-        );
-        // transcript 不在（= env プレフィクス不明）・不正 ID・ID 不明を推測で起動しない
-        assert_eq!(claude_resume_command(false, Some(id), None), None);
-        assert_eq!(
-            claude_resume_command(false, Some("../../bad"), Some(default_env)),
-            None
-        );
-        assert_eq!(claude_resume_command(false, None, Some(default_env)), None);
     }
 
-    /// Issue #652: アカウント（`CLAUDE_CONFIG_DIR`）のペインは、その config
-    /// ディレクトリを明示しないと `No conversation found` で resume に失敗する
+    /// Issue #1076: PC 再起動（= 器ごと消える）は保存済みの会話へ戻す。
+    /// **役割 env まで復元する**ので、戻ってきた claude が master として認識される
     #[test]
-    fn アカウントのconfigdirをresumeコマンドへ前置する() {
-        let id = "e16cde37-c0e0-4126-9ef4-9c6b0bfeccc4";
-        let env = "export CLAUDE_CONFIG_DIR=/Users/me/.claude-univ; ";
+    fn backend消失時は起動条件ごとresumeする() {
+        let id = "a45899a8-96a6-4fa6-9bf6-71df53307878";
+        let env = "unset CLAUDE_CONFIG_DIR; ";
+        let mut catalog = SessionCatalog::default();
+        catalog.entries.insert(
+            id.into(),
+            SessionEntry {
+                kind: "master".into(),
+                profile: Some("default".into()),
+                agent: Some("claude".into()),
+                ..Default::default()
+            },
+        );
+        let plan = restore_plan_in(false, Some(id), Some(env), Some(&catalog));
+        let RestorePlan::ResumeClaude { command, with_role } = plan else {
+            panic!("resume されない");
+        };
+        assert!(with_role);
         assert_eq!(
-            claude_resume_command(false, Some(id), Some(env)),
-            Some(
-                format!("export CLAUDE_CONFIG_DIR=/Users/me/.claude-univ; claude --resume {id}\r")
-                    .into_bytes()
-            )
+            resume_input(&command),
+            format!("{env}TAKO_ORCHESTRATOR_ROLE=master claude --resume {id}\r").into_bytes()
+        );
+
+        // 通常の tako 再起動は既存プロセスへ再 attach し、Claude を二重起動しない
+        assert_eq!(
+            restore_plan_in(true, Some(id), Some(env), Some(&catalog)),
+            RestorePlan::Reattach
+        );
+        // transcript 不在（= env プレフィクス不明）・不正 ID・ID 不明を推測で起動しない
+        assert_eq!(
+            restore_plan_in(false, Some(id), None, None),
+            RestorePlan::FreshShell(FreshShellReason::TranscriptMissing)
+        );
+        assert_eq!(
+            restore_plan_in(false, Some("../../bad"), Some(env), None),
+            RestorePlan::FreshShell(FreshShellReason::InvalidSessionId)
+        );
+        assert_eq!(
+            restore_plan_in(false, None, Some(env), None),
+            RestorePlan::FreshShell(FreshShellReason::NoSessionId)
         );
     }
 }

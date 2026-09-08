@@ -72,6 +72,55 @@ impl LangSetting {
     }
 }
 
+/// 所有版の日英ペア（`platform::support::Note` の動的版。#1203）。
+///
+/// `Note` は `&'static str` の対なので、**実行 OS で中身が変わる文章**
+/// （打鍵表記を埋め込む案内など）は表せない。組み立てた結果を返したい場所は
+/// こちらを使う。参照系のメソッド名は `Note` と揃えてあるので、
+/// 呼び出し側（`.text()` / `.ja()` / `.en()`）は書き換え不要。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Text {
+    ja: String,
+    en: String,
+}
+
+impl Text {
+    pub fn new(ja: impl Into<String>, en: impl Into<String>) -> Self {
+        Self {
+            ja: ja.into(),
+            en: en.into(),
+        }
+    }
+
+    /// 現在の表示言語での文言
+    pub fn text(&self) -> &str {
+        self.text_in(lang())
+    }
+
+    /// 言語を明示しての文言。**言語グローバルに触らず解決できる**ようにするため、
+    /// 実体はこちらの純粋関数に置く（`Note::text_in` と同じ規約 = #608）
+    pub fn text_in(&self, l: Lang) -> &str {
+        match l {
+            Lang::Ja => &self.ja,
+            Lang::En => &self.en,
+        }
+    }
+
+    pub fn ja(&self) -> &str {
+        &self.ja
+    }
+
+    pub fn en(&self) -> &str {
+        &self.en
+    }
+}
+
+impl From<crate::platform::support::Note> for Text {
+    fn from(n: crate::platform::support::Note) -> Self {
+        Self::new(n.ja(), n.en())
+    }
+}
+
 /// 現在の表示言語（Ja=0 / En=1 を AtomicU8 で保持）
 static CURRENT: AtomicU8 = AtomicU8::new(1);
 

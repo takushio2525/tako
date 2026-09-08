@@ -189,18 +189,6 @@ pub mod notes {
         "Checking for updates and rendering the release notes work, but applying an update (running the installer and restarting) has not been measured on Windows (#937)",
     );
 
-    /// #899。**画面は出るがボタンが効かない**（PR #931 が実機検証待ちで open）
-    pub const WIN_WELCOME_INJECTION: Note = Note::new(
-        "バナーの表示と案内コマンドの取得は動くが、ボタンからのコマンド投入が LF + POSIX クォート決め打ちなので Windows では実行されない（#899。PR #931 が実機検証待ち）",
-        "The banner renders and the suggested commands can be read, but the command injection behind its buttons hardcodes LF and POSIX quoting, so nothing runs on Windows (#899; PR #931 is awaiting verification on real hardware)",
-    );
-
-    /// #899。表示レイヤは動くがスターターのボタンだけが効かない
-    pub const WIN_STARTER_INJECTION: Note = Note::new(
-        "表示モードの切替とチャット表示は動くが、スターターカードのボタンからのコマンド投入が LF + POSIX クォート決め打ちなので Windows では実行されない（#899。PR #931 が実機検証待ち）",
-        "Switching the display mode and the chat view work, but the command injection behind the starter cards hardcodes LF and POSIX quoting, so nothing runs on Windows (#899; PR #931 is awaiting verification on real hardware)",
-    );
-
     /// #1057。検出は両 OS で動くが、パッケージ導入の代行は brew（macOS）だけ
     pub const WIN_SETUP_DEPS: Note = Note::new(
         "依存の検出はできるが、導入の実行代行は macOS（Homebrew）だけ。Windows は winget のコマンドを案内する",
@@ -1082,7 +1070,7 @@ pub const MATRIX: &[Feature] = &[
             note: notes::WIN_PDF_NO_TEXT_LAYER,
         },
         windows_evidence: Evidence::SelfTest(
-            "項目 90（Markdown の ⌘+クリックは緑。URL は cmd /C start で開く。PDF 内リンクは不可）",
+            "項目 90（Markdown の修飾キー + クリックは緑。URL は cmd /C start で開く。PDF 内リンクは不可）",
         ),
     },
     Feature {
@@ -1651,11 +1639,9 @@ pub const MATRIX: &[Feature] = &[
         // `tako_chat_copy`（WIN_GUI_CHAT）側で追跡する
         key: "tako_ui_mode",
         macos: Support::Supported,
-        windows: Support::Degraded {
-            note: notes::WIN_STARTER_INJECTION,
-        },
-        windows_evidence: Evidence::SelfTest(
-            "項目 93 / 94 / 97 / 100 / 114 / 115（G1 スターター〜チャット表示と仮想化は緑）。スターターのボタンの投入経路は main が LF + POSIX クォート決め打ちのまま（#899）",
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "項目 93 / 94 / 97 / 100 / 114 / 115（G1 スターター〜チャット表示と仮想化）に加え、2026-09-09 の Windows 11 実機でスターターカード「AI チームに任せる」からペインが tako master を実行し、role=orchestrator-master / state=running とタブ名 master まで到達した。投入経路の #899 は PR #931（2026-08-27 merge）で解消済み",
         ),
     },
     Feature {
@@ -1715,11 +1701,9 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_welcome",
         macos: Support::Supported,
-        windows: Support::Degraded {
-            note: notes::WIN_WELCOME_INJECTION,
-        },
-        windows_evidence: Evidence::SelfTest(
-            "項目 88（初回起動バナーと案内コマンドの取得は緑）。ボタンの投入経路は main が LF + POSIX クォート決め打ちのまま（#899）",
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "項目 88（バナーと案内コマンドの取得）に加え、2026-09-09 の Windows 11 実機で「セットアップを実行」ボタンから新しいタブが開き tako.exe setup が実際に走った（ゼロスタート導入の 3/3 まで到達）。投入経路の #899 は PR #931（2026-08-27 merge）で ShellDialect::command_word 経由になり、LF 側は #897 の番犬が禁じている",
         ),
     },
     Feature {

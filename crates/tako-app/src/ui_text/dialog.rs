@@ -67,10 +67,16 @@ pub fn cancel_esc() -> &'static str {
 pub fn close_enter() -> &'static str {
     tr!("閉じる (Enter)", "Close (Enter)")
 }
-pub fn close_skip_hint() -> &'static str {
+/// 「修飾 + クリックで確認を飛ばす」パワーユーザー動線の案内。
+///
+/// スキップ判定は GPUI の platform 修飾を直接見ている（`close_pane_with_confirm` の
+/// `cmd_held`）。Windows では Win+クリックになり実質押せないので、**案内自体を出さない**
+/// （`tako_core::platform::keys::platform_modifier` が `None` を返す = 呼び出し側が
+/// 行ごと落とす）。#1203
+pub fn close_skip_hint(modifier: &str) -> String {
     tr!(
-        "⌘クリックで確認なしで閉じる",
-        "⌘click closes without confirmation"
+        format!("{modifier}クリックで確認なしで閉じる"),
+        format!("{modifier}click closes without confirmation")
     )
 }
 
@@ -98,7 +104,7 @@ mod tests {
                 lost_tmux(1),
                 cancel_esc().to_string(),
                 close_enter().to_string(),
-                close_skip_hint().to_string(),
+                close_skip_hint(tests_support::mac_modifier().expect("macOS").symbol),
             ]
         });
     }

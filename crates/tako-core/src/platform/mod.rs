@@ -18,6 +18,7 @@ pub mod exe;
 pub mod font;
 pub mod ime;
 pub mod install_info;
+pub mod keys;
 pub mod locale;
 pub mod path;
 pub mod process;

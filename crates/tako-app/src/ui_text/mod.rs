@@ -118,6 +118,18 @@ pub(crate) mod tests_support {
         i18n::set_lang(original);
     }
 
+    /// macOS の platform 修飾（`⌘` / `Cmd`）。**正本から引く**（#1203。
+    /// カタログテストへ記号を直書きすると、番犬が見張っている経路の外で
+    /// 手書き表記が増えていく）
+    pub(crate) fn mac_modifier() -> Option<tako_core::platform::keys::ModifierLabel> {
+        tako_core::platform::keys::platform_modifier(tako_core::platform::support::Platform::MacOs)
+    }
+
+    /// macOS の「修飾 + Enter」表記（`Cmd+Enter`）
+    pub(crate) fn mac_modifier_enter() -> Option<String> {
+        tako_core::platform::keys::modifier_enter(tako_core::platform::support::Platform::MacOs)
+    }
+
     fn assert_no_emoji(s: &str) {
         for c in s.chars() {
             let cp = c as u32;

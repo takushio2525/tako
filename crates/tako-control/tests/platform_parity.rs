@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use tako_control::mcp;
-use tako_core::platform::support::MATRIX;
+use tako_core::platform::support::{Support, MATRIX};
 
 /// リポジトリルート（`crates/tako-control` から 2 つ上）
 fn repo_root() -> PathBuf {
@@ -94,6 +94,47 @@ fn mcpツール表とスナップショットが一致する() {
          スナップショットに残存: {removed:?}\n\
          → {} を実際のツール表に合わせて更新してください",
         snap_path.display()
+    );
+}
+
+/// #1204: **ボタンからのコマンド投入**を根拠にした宣言が、実装と食い違っていないこと。
+///
+/// `tako_welcome`（初回起動バナー）と `tako_ui_mode`（かんたん表示のスターターカード）は
+/// #899 の間「ボタンの投入が LF + POSIX クォート決め打ちなので Windows では実行されない」と
+/// 宣言していた。#899 は PR #931（2026-08-27）で解消し、2026-09-09 の Windows 11 実機で
+/// 両ボタンとも実際にコマンドが走ることを確認したので `Supported` へ直した（#1204）。
+///
+/// **過小申告は使える機能を AI に回避させる**（T7 がそもそも禁じている側）ので、
+/// 宣言をその裏づけ（方言に合った実行される形になる = #899 の本体）に縛りつけておく。
+/// どちらかが片方だけ戻ったらここで落ちる
+#[test]
+fn ボタン投入を根拠にした宣言が実装と一致する() {
+    use tako_core::platform::shell_dialect::ShellDialect;
+
+    for key in ["tako_welcome", "tako_ui_mode"] {
+        let f = MATRIX
+            .iter()
+            .find(|f| f.key == key)
+            .unwrap_or_else(|| panic!("{key} がマトリクスに無い"));
+        assert_eq!(
+            f.windows,
+            Support::Supported,
+            "{key}: 2026-09-09 の Windows 実機で動作を確認済みなのに縮退宣言のままになっている\n\
+             → 実際に動かなくなったなら理由と追跡先を書いて縮退させ、そうでなければ Supported に戻す"
+        );
+    }
+
+    // 宣言の裏づけ: ボタンが積む行が **PowerShell で実行される形**であること。
+    // #899 の症状はここが POSIX クォート決め打ちだったこと（`'C:\…\tako.exe' master` は
+    // PowerShell が式として評価するので実行されず、そのまま表示される）
+    let line = tako_control::welcome::launch_command_line_in(ShellDialect::PowerShell, "master");
+    assert!(
+        line.ends_with(" master"),
+        "起動行にサブコマンドが付いていない: {line:?}"
+    );
+    assert!(
+        !line.starts_with('\''),
+        "PowerShell の起動行が POSIX クォートで囲まれている（#899 の症状）: {line:?}"
     );
 }
 

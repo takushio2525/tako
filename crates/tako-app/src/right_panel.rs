@@ -3466,7 +3466,15 @@ impl TakoApp {
                                 .text_color(hsla(theme.text_muted))
                                 .text_ellipsis()
                                 .child(SharedString::from(
-                                    crate::ui_text::panel::git_commit_placeholder(&branch_name),
+                                    // #1203: 確定は platform 修飾（Windows は Win+Enter =
+                                    // 押せない）なので、打鍵の案内は macOS のときだけ出す
+                                    crate::ui_text::panel::git_commit_placeholder(
+                                        &branch_name,
+                                        tako_core::platform::keys::modifier_enter(
+                                            tako_core::platform::support::Platform::current(),
+                                        )
+                                        .as_deref(),
+                                    ),
                                 )),
                         )
                     })

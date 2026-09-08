@@ -2759,7 +2759,11 @@ impl TakoApp {
                                             let _ = this.save_preview_local(pane_id);
                                             cx.notify();
                                         }))
-                                        .child(crate::ui_text::preview::save_cmd_s()),
+                                        .child(crate::ui_text::preview::save_with_key(
+                                            tako_core::platform::keys::save_preview(
+                                                tako_core::platform::support::Platform::current(),
+                                            ),
+                                        )),
                                 )
                             })
                             // 閉じるボタン（常に表示。右側に統一 #185）
