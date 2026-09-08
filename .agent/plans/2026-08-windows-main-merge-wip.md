@@ -3244,6 +3244,14 @@ macOS 側のベースライン: `test --workspace` **2386 passed / 0 failed**（
 スライス 5 後は 2228、#873 時点は 2377、**#1063 時点は 3036**）/ visual-test **98 checkpoint** /
 クロスチェック **エラー 0・警告 10**（#1063 時点は 12。`--all-targets` は #1063 で 3 → 0）。
 
+**2026-09-09（#1133）追記**: **`editbin` の迂回なしの素の debug ビルドで項目 80 を通過する**
+ようになった（2/2。それまでは 2/2 でプロセスごと落ちていた）。同じ 2 回の到達点は
+**項目 105 付近（#813 の fixture 描画）と項目 143（#1031 の失敗コマンド案内）**で、
+どちらも**別件の負荷依存**（停止位置が run ごとに動く = 作法どおり製品の回帰とは判定しない）。
+このときの実機は**別 worker のレビュー GUI が同時稼働**していて CPU 14〜43% で競合していた。
+実機で「出力が途切れた」ときは `TAKO_APP_SELF_TEST_ENV` の `stack=` を最初に見る
+（詳細は本文末尾の #1133 の記録）。
+
 **2026-09-02（#1063）にベースラインを取り直した。** それまでの表は当てにならない:
 #983（PR #1029）が `std::os::unix::fs::PermissionsExt` を無条件で使うテストを足した時点から
 **`tako-control` のテストバイナリが Windows でコンパイルできず、`cargo test --workspace` が
@@ -3303,6 +3311,15 @@ macOS 側のベースライン: `test --workspace` **2386 passed / 0 failed**（
   「このバイナリはどちらのアームか」を確かめる手段としては**使えない**（#884 で 1 回誤用した）。
   ビルド時の `git rev-parse HEAD` を記録し、アーム間で `Get-FileHash` が違うことと、
   **観測された挙動そのもの**を根拠にする
+- **Windows の debug ビルドはメインスレッドのスタックが既定 1 MiB しかない**（#1133）。
+  GPUI アプリの `-O0` フレームは 1 関数で数百 KiB（実測: `render_tmux_view` 564 KiB /
+  `mcp::catalog::tools` 828 KiB）になるので、入れ子で呼ぶと**判定行も `FAILED` も
+  出さずにプロセスごと落ちる**（`thread 'main' has overflowed its stack` だけが残る）。
+  macOS / Linux は既定 8 MiB なので**原理的に再現しない**。`build.rs` の
+  `cargo:rustc-link-arg=/stack:8388608` で宣言済み。**「途中で出力が途切れた」を見たら
+  まず `TAKO_APP_SELF_TEST_ENV` の `stack=` を見る**（`unknown` か 1 MiB 台なら宣言が
+  効いていない）。フレーム量は `.pdb` が無くてもプロローグの `sub sp` から読める
+  （#1133 の記録に手順）
 - **fresh worktree は `web/tako-remote/dist/` を持たない**（`.gitignore` 済み = 未追跡）。
   `rust_embed` の `#[folder = "../../web/tako-remote/dist/"]` が解決できず
   **tako-control のコンパイルが即失敗する**（`PwaAssets::get` の E0599 が連鎖）。
@@ -4154,3 +4171,120 @@ macOS: `test --workspace` 3383 passed 0 failed / fmt / clippy（両 feature）/
 `RUSTFLAGS=-C link-arg=/STACK:…` でも同じことができるが、全クレートの再ビルド
 （約 20 分）になるので `editbin` のほうが安い（再リンク不要・数秒）。
 **#1133 が直るまで実機セルフテストにはこの 1 行が要る**。
+
+#### #1133 の記録（2026-09-09。項目 80 のスタックオーバーフローは「予約量の宣言漏れ」だった）
+
+**結論: 真因の commit は無い**。7 commit ぶんのフレームの伸びは合計 **+12,288 B（12 KiB）**で、
+「どれかが壊した」のではなく**既知の良 commit の時点で余裕が 12 KiB 未満だった**。
+直したのは tako の論理ではなく、**実行ファイルが宣言するスタック予約量**
+（Windows/MSVC の既定 1 MiB → 8 MiB。macOS / Linux の既定と揃えた）。
+
+##### 測り方（実機の bisect より速い。次に同種を追うならここから）
+
+`.pdb` が無くてもフレーム量は**プロローグの `sub sp` を読めば出る**。macOS arm64 なら
+シンボル表と組み合わせて全関数を機械で並べられる（1 ビルド 50〜65 秒 × 8 = 実機 1 反復ぶん）:
+
+```
+# 巨大フレームの検出（プローグの `sub x9, sp, #N, lsl #12` + `sub sp, sp, #M` を足す）
+objdump -d --start-address=<addr> --stop-address=<addr+0x100> target/debug/tako-app
+# 例（main 8a94263 のセルフテスト poll）:
+#   sub x9, sp, #0x77, lsl #12   ; =0x77000   ← プローブループの到達点
+#   sub sp, sp, #0xa80
+#   → 0x77000 + 0xa80 + 0x20(stp) = 490,144 B = 478.7 KiB
+```
+
+**フレーム上位（main `8a94263` / macOS arm64 / debug）**。テスト専用は 1 本だけで、
+残りは**製品の描画経路**である点が重要（セルフテストを畳んでも解決しない）:
+
+| 関数 | フレーム |
+|---|---|
+| `tako_control::mcp::catalog::tools` | 828.4 KiB |
+| `TakoApp::render_tmux_view` | 564.4 KiB |
+| `TakoApp::render_git_view` | 482.8 KiB |
+| `self_test::run` の async ブロック（poll） | 478.7 KiB |
+| `TakoApp::render_preview_pane` | 326.7 KiB |
+| `tako_control::dispatch::dispatch_inner` | 224.3 KiB |
+| `TakoApp::render_status_bar` | 199.6 KiB |
+| `TakoApp::render_tab_bar` | 182.1 KiB |
+| `<TakoApp as Render>::render` | 135.7 KiB |
+
+`-O0` では LLVM のスタックスロット再利用（stack coloring）が走らないので、
+**関数内のローカル全部の合計**がフレームになる。GPUI のビルダー形（`div().child(…)`）は
+中間値が大量に生まれるため、1 関数で数百 KiB に届く。`render` → 右パネル →
+プレビューのように入れ子で呼ぶので、実行時の谷は連鎖の合計になる。
+
+##### 7 commit のフレーム推移（= 実質の bisect。macOS arm64）
+
+| SHA | Issue | poll フレーム | 74c6a43 からの累積 |
+|---|---|---|---|
+| `74c6a43` | 項目 80 を**通過**していた土台 | 408,704 B / 399.1 KiB | — |
+| `07ab4ec` | #1117 | 410,896 B / 401.3 KiB | +2,192 |
+| `283fa5b` | #1116 | 410,896 B / 401.3 KiB | +2,192 |
+| `1b391b9` | v0.8.5（版数のみ） | 測らず | — |
+| `6f8f2de` | #1118 | 410,992 B / 401.4 KiB | +2,288 |
+| `eb0a141` | #1120 | 410,992 B / 401.4 KiB | +2,288 |
+| `5d190f9` | #1121 | 413,648 B / 404.0 KiB | +4,944 |
+| `72aaf58` | #1125 | 419,376 B / 409.5 KiB | +10,672 |
+| `eba05b6` | #1128（**2/2 クラッシュ**） | 420,992 B / 411.1 KiB | **+12,288** |
+| `8a94263` | 現 main（参考） | 490,144 B / 478.7 KiB | +81,440 |
+
+`5d190f9`（+95 行）と `72aaf58`（+225 行）だけが 28,000 行の async ブロックの**内側**を
+触っている。伸びはその行数どおりで、**異常な 1 commit は無い**。
+
+##### 直し方（GPUI 本家と同じ）
+
+`tako-app` / `tako-cli` の `build.rs` が `cargo:rustc-link-arg=/stack:8388608` を出す
+（msvc ターゲット限定。gnu は `-Wl,--stack` で書式が違う）。数値の正は
+`tako_core::platform::stack::REQUIRED_MAIN_STACK_BYTES`。Zed も同じ理由で
+`crates/zed/build.rs` に `println!("cargo:rustc-link-arg=/stack:{}", 8 * 1024 * 1024)` を
+`todo(windows): This is to avoid stack overflow.` のコメントつきで置いている。
+**予約はアドレス空間だけ**なので 64bit では実コストが無い（`editbin` の 32 MiB も同じ理屈）。
+
+`RUSTFLAGS=-C link-arg=/STACK:…` を使わないのは全クレート再ビルド（約 20 分）になるため。
+`build.rs` の `rustc-link-arg` は**そのクレートのリンクだけ**に効くので再リンクで済む。
+
+##### 二段構え（`dpi` #1063 と同じ作法）
+
+1. **macOS でも走る番犬** `crates/tako-control/tests/windows_stack_reserve_watchdog.rs`:
+   両 `build.rs` に宣言が在り、数値が core の要求量と一致し、msvc 限定で、
+   セルフテスト側の実測も残っていること
+2. **実プロセス**: セルフテストが `cx.spawn` の**前**に
+   `platform::stack::current_thread_reserve()` を実測し、足りなければ
+   項目 80 へ行かずに `FAILED`（`shortfall_note` の文言）を出す。
+   `TAKO_APP_SELF_TEST_ENV` に `stack=` を足したので、落ちたログ単体で予約量が言える
+
+**下限（4 MiB）と宣言（8 MiB）を分けてある**のは、OS が返す値が宣言値と端数で違うため。
+実測: macOS のメインスレッドは 8 MiB 予約なのに `pthread_get_stacksize_np` は
+**8,372,224 B（7.984 MiB）**を返す。宣言ちょうどを下限にすると macOS が誤検知になる。
+
+##### 実機 A/B（**同じ exe**。`editbin /STACK:` で PE の予約だけ替える = コードは 1 バイトも違わない）
+
+再ビルドせずに変数を 1 つに絞れるので、これが #1133 の A/B の正しい形。
+`TAKO_1133_LEGACY=1` は起動直後の前提チェックだけを飛ばす（修正前の挙動へ戻す口）。
+
+| arm | PE の予約 | env | 結果 |
+|---|---|---|---|
+| plain ×2 | 8,388,608 | — | **項目 80 を通過**（2/2）。到達点 = 項目 105 付近 / **143**（別件の負荷依存） |
+| legacy1m | 1,048,576 | `TAKO_1133_LEGACY=1` | **`thread 'main' (15460) has overflowed its stack`**。`TAKO_APP_SELF_TEST_OK` も `FAILED` も **0 件** = #1133 の症状そのもの（出力は項目 66 で途切れる。`eba05b6` の頃の 79B より手前なのは、現 main の poll フレームが 411.1 → 478.7 KiB へ育っているため） |
+| guard1m | 1,048,576 | — | **起動直後に `FAILED`**（`実測 1.00MiB / 下限 4.00MiB / 宣言 8.00MiB` + 直し方）= 沈黙の死が診断可能な失敗へ替わった |
+| probe2m | 2,097,152 | `TAKO_1133_LEGACY=1` | **項目 80 を通過**（項目 81 まで到達）→ **項目 80 の谷は 1 MiB 超 2 MiB 以下**。宣言 8 MiB は 4 倍以上の余裕 |
+
+`PE_APP` / `PE_CLI` は PE ヘッダの `SizeOfStackReserve` を直読みして確認する
+（`.pdb` が無くても分かる。`e_lfanew` → +24 が Optional Header、PE32+ はその **+0x48**）:
+
+| バイナリ | 予約量 |
+|---|---|
+| 修正前（main の tako-app.exe / tako.exe） | **1,048,576**（= MSVC 既定） |
+| #1127 の回避で `editbin` した exe | 33,554,432 |
+| **修正後（この PR の tako-app.exe / tako.exe）** | **8,388,608** |
+
+x86_64 実機の debug バイナリを `mov eax,imm32; call __chkstk` の飛び先で絞って走査した実測:
+**最大 774,320 B（756.2 KiB）= 1 MiB の 74% を 1 関数で食う**。64 KiB 超が 87 本 / 256 KiB 超が 9 本。
+arm64 の表（上）と同じ形で、**x86_64 のほうが 1 関数あたり大きい**。
+
+##### 次に同じ形を疑うときの入口
+
+- `TAKO_APP_SELF_TEST_ENV` の `stack=` が `1.00MiB` か `unknown` なら宣言が効いていない
+- 出力が途中で途切れて `OK` も `FAILED` も無いなら**判定ではなくクラッシュ**。stderr の
+  `has overflowed its stack` を見る（`.pdb` が無いのでトレースは採れない）
+- 予約だけ替えた A/B は `editbin /STACK:<bytes> <exe>` で数秒。**再ビルドは要らない**
