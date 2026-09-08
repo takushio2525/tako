@@ -305,6 +305,29 @@ master の話が完結したあとに「初心者向けの同じこと」を見�
   窓では割った worker が 59 桁になるため。`tako orchestrator layout --min-worker-cols 40` で下げる
 - 押下後にチャット表示にならなかったら**収録を中止する**（壊れたテイクで先へ進まない）
 
+#### 残っていること（2026-09-09 01:40 時点）
+
+`guimode-raw.mp4` は**担当 AI のペインが立つ前のテイク**（`c5_gui10` の絵だけが足りない。
+他の 10 区間と検査値は下の表のとおり揃っている）。ローカルルールで run を禁止する修正は
+プローブで spawn が同じタブに立つことを確認済みで、**あとは 1 回撮り直すだけ**。
+撮り直しには画面のロック解除が必要（01:25 に蓋が閉じてロックされ、
+`screencapture` が `could not create image from rect` になった）。
+
+```sh
+scripts/lib/virtual-display.sh ensure
+bash scripts/promo/record-explainer.sh guimode     # 「タブ 2 のペイン数: 2」を確認する
+bash scripts/promo/pii-scan.sh ~/Desktop/tako-promo/scenes/guimode-raw.mp4
+bash scripts/promo/build-explainer.sh              # → v5
+```
+
+| 項目 | 値（撮り直し前のテイク） |
+|---|---|
+| 素材 | `scenes/guimode-raw.mp4`（360 秒 / 1920x1080 / 30fps）+ `guimode-plain.mp4`（注釈なし）+ `guimode-beats.tsv` / `guimode-clicks.tsv` |
+| ビート | newtab 8.5 / togui 25.8 / cards 42.1 / card1 57.1 / card2 74.2 / card3 91.2 / press 109.3 / chat 118.5 / ask 131.6 / worker 244.5 / back 274.5 |
+| 動き | 1 fps 360 枚中**異なる 318 枚** / 最長の静止 **2 秒**（15 秒以上は 0 件） |
+| PII | 360 フレーム → 認識 12,651 行 → 7 カテゴリすべて **0 件** |
+| ペイン数 | 同時に最大 2 枚（要件の 4 枚以下） |
+
 ### #470 から引き継いだ罠と、今回わかったこと
 
 - #470 の技術制約（`screencapture -v` は黒 / 画面全体を撮らずウインドウ単体 / 隠れると描画停止 →
