@@ -885,11 +885,25 @@ pub fn advanced_editor_header() -> &'static str {
     tr!("settings.json 直接編集", "Edit settings.json directly")
 }
 
-pub fn advanced_edit_help() -> &'static str {
-    tr!(
-        "本文をクリックすると編集できる（⌘+Enter または 保存 で確定 / Esc で取消）",
-        "Click the text to edit (Cmd+Enter or Save to apply, Esc to cancel)"
-    )
+/// settings.json 直接編集の操作説明。
+///
+/// `modifier` は確定の修飾キー（macOS = `⌘` / `Cmd`）。**確定は GPUI の platform
+/// 修飾を直接見ている**ので Windows では Win+Enter になり、押せる打鍵が無い。
+/// そのときは `None` を渡して打鍵に触れない文にする（保存ボタンが入口。#1203）
+pub fn advanced_edit_help(modifier: Option<tako_core::platform::keys::ModifierLabel>) -> String {
+    match modifier {
+        Some(m) => {
+            let (symbol, word) = (m.symbol, m.word);
+            tr!(
+                format!("本文をクリックすると編集できる（{symbol}+Enter または 保存 で確定 / Esc で取消）"),
+                format!("Click the text to edit ({word}+Enter or Save to apply, Esc to cancel)")
+            )
+        }
+        None => tr!(
+            "本文をクリックすると編集できる（保存 で確定 / Esc で取消）".to_string(),
+            "Click the text to edit (Save to apply, Esc to cancel)".to_string()
+        ),
+    }
 }
 
 pub fn advanced_save() -> &'static str {
@@ -1515,7 +1529,8 @@ mod tests {
                 remote_devices_header().into(),
                 desc_remote_devices().into(),
                 advanced_editor_header().into(),
-                advanced_edit_help().into(),
+                advanced_edit_help(crate::ui_text::tests_support::mac_modifier()),
+                advanced_edit_help(None),
                 advanced_save().into(),
                 advanced_reload().into(),
                 advanced_reveal(FileManager::Finder).into(),

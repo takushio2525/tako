@@ -22675,11 +22675,18 @@ impl TakoApp {
                                         .child(crate::ui_text::dialog::close_enter()),
                                 ),
                         )
-                        .child(
-                            div()
-                                .text_size(px(11.0))
-                                .text_color(hsla(theme.text_overlay))
-                                .child(crate::ui_text::dialog::close_skip_hint()),
+                        // #1203: スキップ判定は GPUI の platform 修飾を直接見ているので、
+                        // Windows（= Win キー・実質押せない）では案内ごと出さない
+                        .children(
+                            tako_core::platform::keys::platform_modifier(
+                                tako_core::platform::support::Platform::current(),
+                            )
+                            .map(|m| {
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(hsla(theme.text_overlay))
+                                    .child(crate::ui_text::dialog::close_skip_hint(m.symbol))
+                            }),
                         ),
                 ),
         )

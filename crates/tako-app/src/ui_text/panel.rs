@@ -91,11 +91,22 @@ pub fn git_branches(n: usize) -> String {
 pub fn git_commits(n: usize) -> String {
     tr!(format!(" コミット ({n})"), format!(" Commits ({n})"))
 }
-pub fn git_commit_placeholder(branch: &str) -> String {
-    tr!(
-        format!("メッセージ (Cmd+Enter で \"{branch}\" にコミット)"),
-        format!("Message (Cmd+Enter to commit on \"{branch}\")")
-    )
+/// コミットメッセージ欄のプレースホルダ。
+///
+/// `key` は確定の打鍵（macOS = `Cmd+Enter`）。**確定は GPUI の platform 修飾を
+/// 直接見ている**ので Windows では Win+Enter になり、押せる打鍵が無い。
+/// そのときは `None` を渡して打鍵に触れない文にする（隣のコミットボタンが入口。#1203）
+pub fn git_commit_placeholder(branch: &str, key: Option<&str>) -> String {
+    match key {
+        Some(key) => tr!(
+            format!("メッセージ ({key} で \"{branch}\" にコミット)"),
+            format!("Message ({key} to commit on \"{branch}\")")
+        ),
+        None => tr!(
+            format!("メッセージ (\"{branch}\" にコミット)"),
+            format!("Message (commit on \"{branch}\")")
+        ),
+    }
 }
 pub fn git_commit_btn() -> &'static str {
     tr!("コミット", "Commit")
@@ -423,7 +434,8 @@ mod tests {
                 git_detecting().to_string(),
                 git_branches(2),
                 git_commits(10),
-                git_commit_placeholder("main"),
+                git_commit_placeholder("main", tests_support::mac_modifier_enter().as_deref()),
+                git_commit_placeholder("main", None),
                 git_commit_btn().to_string(),
                 git_not_a_repo().to_string(),
                 git_staged_section(2),

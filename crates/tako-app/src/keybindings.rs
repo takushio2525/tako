@@ -1,4 +1,5 @@
 use gpui::{actions, KeyBinding, Keystroke, Modifiers};
+use tako_core::platform::support::Platform;
 
 actions!(
     tako,
@@ -70,9 +71,32 @@ actions!(
     ]
 );
 
-/// iTerm2 の操作感を踏襲したキーバインド
+/// iTerm2 の操作感を踏襲したキーバインド（実行中のプラットフォームに実際に張るもの）
 pub(crate) fn key_bindings() -> Vec<KeyBinding> {
-    let mut bindings = vec![
+    bindings_for(Platform::current())
+}
+
+/// **プラットフォームを引数で受ける**バインド表（#1203）。
+///
+/// 案内文の打鍵表記（[`shortcut_hint_for`]）はここから導出するので、
+/// **macOS 上からも Windows 側の表記を検証できる**。両プラットフォームの表を
+/// コンパイル時に持つのはそのためで、`cfg` で片方を消すと「Windows でどう見えるか」
+/// を macOS の CI で押さえられなくなる（対応マトリクス = #515 と同じ方針）。
+///
+/// 実際に GPUI へ登録するのは `Platform::current()` の分だけなので、
+/// **張るキーの集合は #585 / #517 当時から 1 本も変わっていない**
+fn bindings_for(platform: Platform) -> Vec<KeyBinding> {
+    let mut bindings = base_bindings();
+    match platform {
+        Platform::MacOs => bindings.extend(macos_only_bindings()),
+        Platform::Windows => bindings.extend(non_macos_bindings()),
+    }
+    bindings
+}
+
+/// 両プラットフォーム共通のバインド（`cmd-` は macOS = Command / Windows = Win キー）
+fn base_bindings() -> Vec<KeyBinding> {
+    vec![
         KeyBinding::new("cmd-d", SplitRight, None),
         KeyBinding::new("cmd-shift-d", SplitDown, None),
         KeyBinding::new("cmd-w", ClosePane, None),
@@ -115,10 +139,7 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-shift-z", RedoPreview, None),
         KeyBinding::new("cmd-f", FindPreview, None),
         KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
-    ];
-    bindings.extend(macos_only_bindings());
-    bindings.extend(platform_bindings());
-    bindings
+    ]
 }
 
 /// macOS 固有の概念に張るバインド（#485）。**macOS でのみ張る**（#517 / #585）
@@ -135,20 +156,18 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
 /// 「アプリを隠す」「他を隠す」「最小化」はいずれも macOS の概念で、Windows 版に
 /// 対応するアクションが無い。ハンドラ側で防ぐのではなく**バインドを張らない**ことで
 /// 経路ごと塞ぐ。なお cmd 付きの未バインドキーはシェルへ流れない
-/// （＝ ターミナル入力を奪わない。handle_key の platform 修飾ガードを参照）
-#[cfg(target_os = "macos")]
+/// （＝ ターミナル入力を奪わない。handle_key の platform 修飾ガードを参照）。
+///
+/// #1203: `cfg` で消すのをやめ、[`bindings_for`] が `Platform` で選ぶ形にした。
+/// **Windows へ張らないことは変わらない**（`bindings_for(Platform::Windows)` は
+/// こちらを足さない）。表をコンパイル時に残すのは、macOS の CI から
+/// 「Windows ではどのキーが案内されるか」を検証できるようにするため
 fn macos_only_bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("cmd-h", HideApp, None),
         KeyBinding::new("cmd-alt-h", HideOthers, None),
         KeyBinding::new("cmd-m", MinimizeWindow, None),
     ]
-}
-
-/// macOS 以外では張らない（[`macos_only_bindings`] の doc を参照）
-#[cfg(not(target_os = "macos"))]
-fn macos_only_bindings() -> Vec<KeyBinding> {
-    Vec::new()
 }
 
 /// コマンドパレットの項目 ID から、そこに併記するショートカットの表示文字列を引く（#648）
@@ -161,7 +180,7 @@ fn macos_only_bindings() -> Vec<KeyBinding> {
 /// プラットフォーム差や将来のキー変更で確実に食い違うため
 /// （`パレットのショートカット表示はバインド表と一致する` テストが番犬）
 pub(crate) fn palette_shortcut(command_id: &str) -> Option<String> {
-    shortcut_hint(action_for_palette_command(command_id)?)
+    shortcut_hint_for(action_for_palette_command(command_id)?, Platform::current())
 }
 
 /// パレット項目 ID → アクション名。ショートカットを持たない項目は `None`
@@ -177,31 +196,36 @@ fn action_for_palette_command(command_id: &str) -> Option<&'static str> {
     }
 }
 
-/// アクション名から、**このプラットフォームで実際に届く**バインドの表示文字列を作る
+/// アクション名から、**そのプラットフォームで実際に届く**バインドの表示文字列を作る
 ///
 /// 非 macOS で `cmd-` のバインドを案内してはいけない。GPUI の `cmd` は platform
 /// 修飾で Windows では Win キーへ解決され、シェルが先に奪うので届かない（#585）。
-/// ＝ 案内に出すと「書いてあるのに効かない」という最悪の体験になる
-fn shortcut_hint(action: &str) -> Option<String> {
-    let binding = key_bindings().into_iter().find(|b| {
+/// ＝ 案内に出すと「書いてあるのに効かない」という最悪の体験になる。
+///
+/// #1203 で `Platform` を引数に取る純粋関数にした。macOS 上から Windows 側の
+/// 表記を検証できるので、案内文の打鍵（`tako_core::platform::keys`）との一致を
+/// 両プラットフォーム分まとめて番犬に見せられる
+pub(crate) fn shortcut_hint_for(action: &str, platform: Platform) -> Option<String> {
+    let binding = bindings_for(platform).into_iter().find(|b| {
         b.action().name() == action
-            && !(cfg!(not(target_os = "macos"))
+            && !(platform != Platform::MacOs
                 && b.keystrokes().iter().any(|k| k.inner().modifiers.platform))
     })?;
     let hint = binding
         .keystrokes()
         .iter()
-        .map(|k| format_keystroke(k.inner()))
+        .map(|k| format_keystroke_for(k.inner(), platform))
         .collect::<Vec<_>>()
         .join(" ");
     (!hint.is_empty()).then_some(hint)
 }
 
-/// 1 打鍵をその OS の慣習で表記する（macOS は記号、Windows / Linux は語）
-fn format_keystroke(k: &Keystroke) -> String {
+/// 1 打鍵をその OS の慣習で表記する（macOS は記号、Windows / Linux は語）。
+/// **`Platform` を引数で受ける純粋関数**（#1203）
+fn format_keystroke_for(k: &Keystroke, platform: Platform) -> String {
     let m = k.modifiers;
     let key = format_key(&k.key);
-    if cfg!(target_os = "macos") {
+    if platform == Platform::MacOs {
         // macOS のメニュー表記順（⌃⌥⇧⌘）
         let mut s = String::new();
         if m.control {
@@ -302,9 +326,11 @@ fn format_key(key: &str) -> String {
 /// （下分割）に置く。Ctrl+Shift+D は 0x04 へ潰れる ＝ Ctrl+D 側の EOF は無傷。
 ///
 /// 慣習の出典は Windows Terminal / VS Code / kitty / ブラウザ。キー 1 本ごとの
-/// 根拠は #585 の対応表
-#[cfg(not(target_os = "macos"))]
-fn platform_bindings() -> Vec<KeyBinding> {
+/// 根拠は #585 の対応表。
+///
+/// #1203: `cfg` をやめて [`bindings_for`] が `Platform` で選ぶ形にした
+/// （[`macos_only_bindings`] と同じ理由。macOS へ張らないことは変わらない）
+fn non_macos_bindings() -> Vec<KeyBinding> {
     vec![
         // --- タブ（Windows Terminal / kitty / ブラウザ）---
         KeyBinding::new("ctrl-shift-t", NewTab, None),
@@ -394,12 +420,6 @@ fn platform_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-shift-p", OpenCommandPalette, None),
         KeyBinding::new("ctrl-shift-k", OpenCommandPalette, None),
     ]
-}
-
-/// macOS は `cmd-` が本来の Command キーに解決されるため追加は不要
-#[cfg(target_os = "macos")]
-fn platform_bindings() -> Vec<KeyBinding> {
-    Vec::new()
 }
 
 /// CSI u（kitty keyboard protocol）の送出範囲
@@ -1509,16 +1529,24 @@ mod tests {
         );
     }
 
-    /// macOS 側は従来どおり cmd- のみ（#467 / #585 の追加バインドが漏れ出していない）
-    #[cfg(target_os = "macos")]
+    /// macOS 側は従来どおり cmd- のみ（#467 / #585 の追加バインドが漏れ出していない）。
+    ///
+    /// #1203 で表を `cfg` から `Platform` 引数へ移したので、**macOS 上でも Windows 上でも
+    /// 同じことを検査できる**（以前は macOS の CI でしか走らなかった）
     #[test]
     fn macosには非platform修飾のバインドが無い() {
-        assert!(platform_bindings().is_empty());
         assert!(
-            key_bindings()
+            bindings_for(Platform::MacOs)
                 .iter()
                 .all(|b| b.keystrokes().iter().all(|k| k.inner().modifiers.platform)),
             "macOS に非 platform 修飾のバインドが混入している"
+        );
+        // 逆に Windows 側は #585 の追加バインドが確実に載っていること
+        assert!(
+            bindings_for(Platform::Windows)
+                .iter()
+                .any(|b| b.keystrokes().iter().any(|k| !k.inner().modifiers.platform)),
+            "Windows に非 platform 修飾のバインドが 1 本も無い"
         );
     }
 
@@ -1540,7 +1568,7 @@ mod tests {
                 b.action().name() == action
                     && b.keystrokes()
                         .iter()
-                        .map(|k| format_keystroke(k.inner()))
+                        .map(|k| format_keystroke_for(k.inner(), Platform::current()))
                         .collect::<Vec<_>>()
                         .join(" ")
                         == hint
@@ -1555,6 +1583,159 @@ mod tests {
                 "{id}: バインドが無いのにショートカットを表示している"
             );
         }
+    }
+
+    /// #1203: 案内文（UI 文言 / CLI / MCP）へ載せる打鍵表記の正本
+    /// `tako_core::platform::keys` が、**実際に張っているバインド**と一致していること。
+    ///
+    /// `shortcut_hint_for` が `Platform` を引数に取るので、macOS の CI からでも
+    /// Windows 側の表記を突き合わせられる（片方の CI でしか見られないと、
+    /// もう片方の列が黙って腐る）。ここが落ちたらキーを変えた側が正で、
+    /// `platform/keys.rs` の文字列を直す
+    #[test]
+    fn 案内文の打鍵表記はバインド表と一致する() {
+        for platform in [Platform::MacOs, Platform::Windows] {
+            for (action, actual) in [
+                (
+                    "tako::OpenCommandPalette",
+                    tako_core::platform::keys::command_palette(platform),
+                ),
+                (
+                    "tako::SavePreview",
+                    tako_core::platform::keys::save_preview(platform),
+                ),
+            ] {
+                let from_bindings = shortcut_hint_for(action, platform).unwrap_or_else(|| {
+                    panic!("{platform:?}: {action} に届くバインドが 1 本も無い")
+                });
+                assert_eq!(
+                    actual, from_bindings,
+                    "{platform:?}: 案内の {action} が \"{actual}\" なのに、実際のバインドは \"{from_bindings}\"\n\
+                     → crates/tako-core/src/platform/keys.rs を実際のバインドへ合わせてください"
+                );
+            }
+        }
+    }
+
+    /// #1203: platform 修飾（macOS = command / Windows = Win キー）を直接見ている
+    /// 操作は、非 macOS では**案内を出さない**こと。
+    ///
+    /// `shortcut_hint_for` が非 macOS の platform 修飾バインドを落とす規則と
+    /// 同じで、こちらはバインド表に載っていない「修飾 + クリック」「修飾 + Enter」用。
+    /// Win+クリック / Win+Enter は押せない（#763）ので、案内すると嘘になる
+    #[test]
+    fn platform修飾の案内は非macosでは出ない() {
+        use tako_core::platform::keys;
+        assert!(keys::platform_modifier(Platform::MacOs).is_some());
+        assert_eq!(keys::platform_modifier(Platform::Windows), None);
+        assert_eq!(keys::modifier_enter(Platform::Windows), None);
+        // macOS 側は「バインド表の ⌘ と同じ記号」であること（記号がずれると
+        // 同じ画面に ⌘ と Cmd が混在する）
+        let cmd_k = Keystroke::parse("cmd-k").expect("cmd-k");
+        let mac = format_keystroke_for(&cmd_k, Platform::MacOs);
+        let symbol = keys::platform_modifier(Platform::MacOs)
+            .expect("macOS")
+            .symbol;
+        assert!(
+            mac.starts_with(symbol),
+            "バインド表は {mac:?} と書くのに案内の修飾記号は {symbol:?} で食い違っている"
+        );
+    }
+
+    /// #1203: 打鍵を含む案内文が Windows 構成で macOS の表記を出さないこと。
+    ///
+    /// **画面 / CLI に実際に出る文字列**を両プラットフォーム分組んで見る
+    /// （`settings_sleep::SleepTabPlan::visible_texts` = #727 と同じ形）。
+    /// 描画側に文言を足したらこちらにも足す
+    fn key_hint_texts(platform: Platform) -> Vec<String> {
+        use tako_core::platform::keys;
+        use tako_core::ui_mode::TerminalReason;
+        let mut out = vec![
+            // タブバーの検索ボックスのバッジ
+            keys::command_palette(platform).to_string(),
+            // プレビューの保存ボタン
+            crate::ui_text::preview::save_with_key(keys::save_preview(platform)),
+            // git パネルのコミット入力欄
+            crate::ui_text::panel::git_commit_placeholder(
+                "main",
+                keys::modifier_enter(platform).as_deref(),
+            ),
+            // 設定の「settings.json 直接編集」
+            crate::ui_text::settings::advanced_edit_help(keys::platform_modifier(platform)),
+        ];
+        // 確認ダイアログのスキップ案内（非 macOS では行ごと出ない）
+        if let Some(m) = keys::platform_modifier(platform) {
+            out.push(crate::ui_text::dialog::close_skip_hint(m.symbol));
+        }
+        // `tako ui-mode` の next_step（CLI / MCP の機械可読な案内）
+        if let Some(step) = TerminalReason::ModeTerminal.next_step_for(platform) {
+            out.push(step.ja().to_string());
+            out.push(step.en().to_string());
+        }
+        out
+    }
+
+    #[test]
+    fn windowsの案内文にmacosのキー表記が出ない() {
+        crate::ui_text::tests_support::for_each_lang(|| {
+            let texts = key_hint_texts(Platform::Windows);
+            for t in &texts {
+                assert!(
+                    !t.contains('\u{2318}'),
+                    "Windows の案内に ⌘ が出ている: {t:?}"
+                );
+                assert!(!t.contains("Cmd"), "Windows の案内に Cmd が出ている: {t:?}");
+                assert!(
+                    !t.contains("Win+"),
+                    "Windows の案内に Win+ が出ている（押せない打鍵は案内しない）: {t:?}"
+                );
+            }
+            // 「何も組んでいないから通った」を防ぐ
+            assert!(texts.len() >= 6, "検査対象の文言が少なすぎる: {texts:?}");
+            assert!(
+                texts.iter().any(|t| t.contains("Ctrl+Shift+P")),
+                "パレットの実キーが案内に出ていない: {texts:?}"
+            );
+            assert!(
+                texts.iter().any(|t| t.contains("Ctrl+Shift+S")),
+                "保存の実キーが案内に出ていない: {texts:?}"
+            );
+        });
+    }
+
+    /// macOS 側は従来どおりの表記が残る（#1203 で Windows を直した巻き添えで
+    /// macOS の見た目を変えていないこと）
+    #[test]
+    fn macosの案内文は従来の記号表記のまま() {
+        crate::ui_text::tests_support::with_lang(tako_core::i18n::Lang::Ja, || {
+            let texts = key_hint_texts(Platform::MacOs);
+            for expect in [
+                "\u{2318}K",
+                "保存 \u{2318}S",
+                "メッセージ (Cmd+Enter で \"main\" にコミット)",
+                "本文をクリックすると編集できる（\u{2318}+Enter または 保存 で確定 / Esc で取消）",
+                "\u{2318}クリックで確認なしで閉じる",
+            ] {
+                assert!(
+                    texts.iter().any(|t| t == expect),
+                    "macOS の文言 {expect:?} が消えている: {texts:?}"
+                );
+            }
+        });
+        crate::ui_text::tests_support::with_lang(tako_core::i18n::Lang::En, || {
+            let texts = key_hint_texts(Platform::MacOs);
+            for expect in [
+                "Save \u{2318}S",
+                "Message (Cmd+Enter to commit on \"main\")",
+                "Click the text to edit (Cmd+Enter or Save to apply, Esc to cancel)",
+                "\u{2318}click closes without confirmation",
+            ] {
+                assert!(
+                    texts.iter().any(|t| t == expect),
+                    "macOS の英語文言 {expect:?} が消えている: {texts:?}"
+                );
+            }
+        });
     }
 
     /// #648: 非 macOS のパレット表示に `cmd-` 由来のキーが混ざらない。

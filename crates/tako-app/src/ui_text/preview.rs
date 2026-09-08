@@ -20,8 +20,10 @@ pub fn editing() -> &'static str {
 pub fn edit() -> &'static str {
     tr!("編集", "Edit")
 }
-pub fn save_cmd_s() -> &'static str {
-    tr!("保存 ⌘S", "Save ⌘S")
+/// 保存ボタン。打鍵は正本（`tako_core::platform::keys::save_preview`）から
+/// 受け取る（Windows は `Ctrl+Shift+S`。#1203）
+pub fn save_with_key(key: &str) -> String {
+    tr!(format!("保存 {key}"), format!("Save {key}"))
 }
 pub fn outline_button() -> &'static str {
     tr!("目次", "Outline")
@@ -177,7 +179,9 @@ mod tests {
                 history().to_string(),
                 editing().to_string(),
                 edit().to_string(),
-                save_cmd_s().to_string(),
+                save_with_key(tako_core::platform::keys::save_preview(
+                    tako_core::platform::support::Platform::MacOs,
+                )),
                 outline_button().to_string(),
                 run_button().to_string(),
                 run_no_command().to_string(),

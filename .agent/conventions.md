@@ -1167,6 +1167,37 @@ AI が**起動した瞬間に強制ロードされるもの**には上限があ�
   無ければバックティック参照にする（`@.agent/architecture.md` と書くと毎ターン全文載る）
 - 予算を超えたまま放置しない。`tako context-budget fix` は冪等なのでいつ流してもよい
 
+## 案内文の打鍵は正本から引く（Issue #1203）
+
+画面 / CLI / MCP に出す文章へ `⌘K` / `Cmd+Enter` のようなキー表記を**直書きしない**。
+GPUI の `cmd` は platform 修飾で、Windows では **Win キー**へ解決される（#585）。
+`Win+K` は OS のキャストが開くので、案内どおりに押すと**別のことが起きる**。
+このリポジトリ自身が `keybindings.rs:181-184` に同じ規約を書いていたのに、
+2026-09-09 の Windows 実機レビューで 6 か所の直書きが見つかった（= 仕組みはあり、
+通し忘れだけが問題）。
+
+- **バインド表にあるキー**（パレット・保存など）は `keybindings::shortcut_hint_for(action, platform)`
+  から導出する。案内文へ埋めるだけなら `tako_core::platform::keys`（`command_palette` /
+  `save_preview` / `quit`）を引く。両者の一致は番犬
+  `案内文の打鍵表記はバインド表と一致する` が **macOS / Windows の両方**について検査する
+- **バインド表に無い「修飾 + クリック」「修飾 + Enter」**（確認スキップ・コミット確定・
+  設定の確定）は `keys::platform_modifier` / `keys::modifier_enter` を引く。
+  **非 macOS は `None`** = その案内を出さない。Win+クリック / Win+Enter は押せない（#763）ので、
+  表記を Windows 風に置き換えるのではなく**案内ごと落とす**のが正しい
+  （`shortcut_hint_for` が非 macOS の platform 修飾バインドを落とすのと同じ規則）
+- 判定はすべて **`Platform` を引数に取る純粋関数**。`cfg!` で分けると
+  「Windows でどう見えるか」を macOS の CI で押さえられない（#515 と同じ方針）。
+  そのため `key_bindings()` の表も `cfg` をやめ、`bindings_for(platform)` が
+  両プラットフォームの表から選ぶ形にしてある（**張るキーの集合は不変**）
+- 番犬は 2 本立て。`crates/tako-control/tests/ui_key_notation.rs` が**直書きの混入**を
+  ソース走査で止め（規則 A = 案内文を組む場所 / 規則 B = render への直書き）、
+  `keybindings::tests::windowsの案内文にmacosのキー表記が出ない` が
+  **組み上がった文言**を Windows 構成で検査する。前者だけだと「文言は正しいが
+  Windows で嘘になる」を拾えず、後者だけだと新しい直書きを未然に止められない
+- セルフテストの項目名（`check(cond, "visual-test md: ⌘C 相当の…")`）と
+  実装の意図を書くコメントは対象外（画面に出ない診断文）。
+  claude の TUI から採った fixture も同じ（tako の文言ではない）
+
 ## 個人情報を現行コードへ書かない（Issue #927）
 
 tako は public リポなので、**実ユーザー名・実ホームパス・実ホスト名・実メールアドレス・
