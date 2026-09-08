@@ -103,3 +103,9 @@
 - 見送りの判定を「別の tako-app がいるか」から**対象ソケットの所有者**へ（相手の初期環境を `KERN_PROCARGS2` で読み `tako-iso-<pid>` 等を復元）。応答を `{socket, killed, skipped, detail}` へ広げ、見送り・kill の両方を persist.log へ 1 行
 - 実測（隔離 + tako-vd・他 tako-app 3 本稼働）: 省略時 `killed=[aaa,bbb]` / `--socket <別>` で `ccc` を kill / `--socket tako` は `skipped=peer_shares_socket`（pid 71082）で本番 17 セッションは不変
 - A/B `TAKO_1187_LEGACY=1` は Issue と同じ `{"killed":[]}` + `--socket` 無視を再現。番犬 4 本（修正前ソースで全滅）+ 単体 12 本。全 3621 件緑
+
+## 2026-09-09（#1133: Windows 実機の項目 80 のスタックオーバーフローを予約量の宣言で根治した）
+- 真因の commit は無い（7 commit のフレーム伸びは合計 +12,288 B）。`-O0` の GPUI フレームは
+  1 関数 135〜828 KiB（製品の描画経路も含む）で、Windows/MSVC の既定 1 MiB を食い潰していた
+- `build.rs` 2 本が `cargo:rustc-link-arg=/stack:8388608` を宣言（正は `platform::stack`。Zed も同型）+
+  セルフテストが起動直後に実測して足りなければ項目 80 前に FAILED（沈黙の死を診断可能な失敗へ）

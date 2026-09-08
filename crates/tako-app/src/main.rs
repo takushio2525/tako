@@ -23606,9 +23606,15 @@ mod self_test {
             .map(|s| s.elapsed().as_secs())
             .unwrap_or_default();
         format!(
-            "{} {} elapsed={elapsed}s",
+            "{} {} stack={} elapsed={elapsed}s",
             build_flavor(),
-            tako_control::diag::format_machine_load(tako_control::diag::machine_load())
+            tako_control::diag::format_machine_load(tako_control::diag::machine_load()),
+            // #1133: 呼び出しスレッド（= メインスレッド）のスタック予約量。
+            // Windows/MSVC の既定 1 MiB だと項目 80 で沈黙して死ぬので、
+            // 落ちたログ単体で「予約量が足りていたのか」を後から言えるようにする
+            tako_core::platform::stack::current_thread_reserve()
+                .map(tako_core::platform::stack::format_mib)
+                .unwrap_or_else(|| "unknown".to_string())
         )
     }
 
@@ -25473,6 +25479,19 @@ mod self_test {
                 2,
             )
         }
+    }
+
+    /// **#1133 の A/B の口**: 設定すると起動直後のスタック予約チェックを飛ばし、
+    /// 予約が足りないまま項目 80 まで走る「修正前」の挙動へ戻る。
+    ///
+    /// 同じバイナリで旧挙動を再現できるようにしておくのは、直したことを実測で示すため。
+    /// #1133 の変数は**コードではなく PE ヘッダのスタック予約量**なので、実機の A/B は
+    /// 「リンク済みの exe へ `editbin /STACK:1048576` を当てて予約だけ 1 MiB へ戻す」と
+    /// この env の 2 手で作る（再ビルド不要・コードは 1 バイトも違わない）。
+    /// これを立てずに予約だけ戻すと、前提チェックが `FAILED` を出して項目 80 へ
+    /// 到達しない = 番犬の検出力そのものの確認になる
+    fn legacy_1133() -> bool {
+        std::env::var_os("TAKO_1133_LEGACY").is_some()
     }
 
     /// **#1165 の A/B の口**: 設定すると「固定窓・1 回・送り直しなし」の旧経路へ戻る。
@@ -36335,6 +36354,23 @@ mod self_test {
         // 落ちる項目が変わるので、ログ単体で条件が再現できる状態にしておく
         let _ = STARTED_AT.set(std::time::Instant::now());
         println!("TAKO_APP_SELF_TEST_ENV: {}", env_line());
+        // #1133: Windows/MSVC の既定 1 MiB では項目 80（#380 の共有タブバー）の途中で
+        // メインスレッドのスタックが尽き、判定行も `FAILED` も出さずに
+        // **プロセスごと落ちる**（`thread 'main' has overflowed its stack` だけが残る）。
+        // 前提が崩れているならここで言う = 沈黙の死を、直し方の書いてある失敗へ替える。
+        // 予約量は tako-app/build.rs の `/stack:` 宣言で決まるので、ここが落ちたら
+        // 「宣言が落ちた」か「宣言を効かせないリンカで作った」を疑う
+        if let Some(note) = tako_core::platform::stack::current_thread_reserve()
+            .and_then(tako_core::platform::stack::shortfall_note)
+        {
+            if legacy_1133() {
+                // A/B のとき（TAKO_1133_LEGACY=1）だけ、足りないまま走らせて
+                // #1133 の症状（項目 80 での沈黙した死）を再現させる
+                println!("TAKO_SELF_TEST_1133: legacy=1 前提チェックを飛ばす: {note}");
+            } else {
+                fail(&note);
+            }
+        }
         cx.spawn(async move |cx| {
             let any: AnyWindowHandle = window.into();
             let wait = |cx: &mut AsyncApp, ms: u64| {
