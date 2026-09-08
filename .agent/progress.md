@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-08（#1175: 101c の引き継ぎ到達判定を後任の transcript から採るようにした）
-- 引き継ぎ本文は claude の TUI で 1 度だけ流れる User 発話なので `visible_lines()` 判定は後任が長く働くほど確実に落ちていた。証拠源を `chat_state` の発話へ移し、`saw_done` は Assistant 限定に（旧は手順書の「引き継ぎ完了」を後任の申告と誤読）。前提（GUI / persist）は項目内で上げて戻すので起動レシピは不変
-- 実 claude e2e 2 回連続 OK（`chat=1/6`・`1/5`・load 2.5〜3.0）/ `TAKO_1175_LEGACY=1` は Issue と同じ `saw_marker=false` で FAILED / `INJECT=nomarker` は新経路でも FAILED
-- 番犬 `実claudeの発話をビューポートで判定していない`（修正前の 52907 / 52908 を名指し）+ 純粋関数の単体 5 本。全 3595 件緑
-
 ## 2026-09-08（#1180: セルフテストの器の往復待ちを予算へ移し、期限つき状態の混在を根治した）
 - Issue の grep（`0..25`）は失敗項目②（`0..20`）を漏らしていたので洗い直し、**18 か所**を `wait_for_backend_state`（状態待ち + `state_wait_budget`・駆動は毎周期）へ。番犬は region（tmux ゲート内の固定窓）+ `read_to_string` needle + #1162 へ `tako_control::dispatch(`
 - **真因は待ちの長さだけではない**: 項目 73 は「待てば立つミラー」と「1.4 秒で消えるスクロールバー」を 1 回のホイールのあと同時に見ていた（実測 `bar=false`）ので予算では解けない → ホイールを毎周期打つ形へ
@@ -88,3 +83,8 @@
 - `InstallPlan` に `platform: Platform` を足し（出どころは `InstallRecipe::platform`）、権限行を純粋関数 `privilege_line(platform)` へ。unix = `sudo（管理者権限）は使いません…` / Windows = `管理者権限は使いません…`
 - `visible_texts()`（計画の表示 + 引き継ぎ指示文）を用意し「Windows に unix 固有語が出ない」を GUI 無しで固定。`to_json` に `platform` を追加
 - A/B `TAKO_925_LEGACY=1` は Issue と同じ `sudo（管理者権限）…` を Windows 構成で出して新テスト 2 本が FAILED。#920 の項目 119（`管理者権限` で見る）は不変
+
+## 2026-09-09（#1186: resize --reset が実際に window サイズを戻すようにした）
+- `reset_window_size` を `resize-window -A` → `set-window-option -u window-size` の 2 段へ。**順序は逆にできない**（`-A` が window-size を manual にする = 実測）。`-A` 失敗時も解除は行い**エラーはそのまま返す**
+- 真因は「オプション解除はその場でリサイズしない」こと。クライアントがその window を見ているあいだは偶然戻るので、**別 window / クライアント不在**のときだけ症状が出る（実測で切り分け）
+- 隔離 GUI 実測: 見ていない window 1 が 119x21 → 60x15 → reset で 119x21・option 空 / A/B `TAKO_1186_LEGACY=1` は `{"reset":true}` を返しつつ 60x15 のまま

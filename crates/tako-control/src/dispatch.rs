@@ -15294,6 +15294,99 @@ mod tests {
         assert!(host.attached.is_empty());
     }
 
+    /// #1186 の e2e。実 tmux で `resize --reset` が**実際に window サイズを戻す**ことを
+    /// 確かめる。旧実装は `set-window-option -u window-size` だけで、これは
+    /// 「オプションを未設定へ戻す」だけで**その場ではリサイズしない**
+    /// （実測: クライアントがその window を見ていないあいだは縮んだサイズが残る）。
+    /// 戻し切るには `resize-window -A` が要り、しかも `-A` は window-size を manual に
+    /// するので**順序は `-A` → `-u`**でなければオプションが残る（実測）
+    #[test]
+    #[cfg(unix)]
+    fn issue1186_resetがwindowサイズを実際に戻す() {
+        if !tako_core::tmux::version_announcement()
+            .is_some_and(tako_core::tmux::announces_only_tmux)
+        {
+            eprintln!("skip: 本物の tmux が無い環境");
+            return;
+        }
+        let socket = format!("tako-e2e-1186-{}", std::process::id());
+
+        struct Guard(String);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                // サーバーごと落とし、ソケットファイルも消す（残骸を /tmp へ溜めない。#1192）
+                tako_core::tmux_backend::kill_server(&self.0);
+            }
+        }
+        let _guard = Guard(socket.clone());
+        let tmux = |args: &[&str]| {
+            tako_core::tmux::tmux_command(Some(&socket))
+                .args(args)
+                .output()
+                .expect("tmux を実行できる")
+        };
+        let size = || -> String {
+            let out = tmux(&[
+                "list-windows",
+                "-t",
+                &tako_core::tmux::exact_target("sizeme"),
+                "-F",
+                "#{window_index}:#{window_width}x#{window_height}",
+            ]);
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .find_map(|l| l.strip_prefix("0:").map(str::to_string))
+                .unwrap_or_default()
+        };
+        // window ごとの `window-size` 設定値（未設定なら空 = グローバル継承）
+        let option = || -> String {
+            let out = tmux(&[
+                "show-options",
+                "-w",
+                "-t",
+                &tako_core::tmux::exact_target("sizeme:0"),
+                "window-size",
+            ]);
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        assert!(
+            tmux(&["new-session", "-d", "-s", "sizeme", "-x", "100", "-y", "40"])
+                .status
+                .success(),
+            "tmux new-session が失敗した"
+        );
+        assert_eq!(size(), "100x40", "前提: 作成時の寸法");
+        assert_eq!(option(), "", "前提: window-size は未設定");
+
+        let mut host = MockHost::new();
+        let resize = |host: &mut MockHost, cols, rows, reset| {
+            dispatch(
+                host,
+                Request::TmuxResize {
+                    socket: Some(socket.clone()),
+                    session: "sizeme".into(),
+                    window: 0,
+                    cols,
+                    rows,
+                    reset,
+                },
+                PaneOrigin::Cli,
+            )
+        };
+
+        let result = resize(&mut host, Some(60), Some(15), false).expect("resize は成功する");
+        assert_eq!(result["cols"].as_u64(), Some(60));
+        assert_eq!(size(), "60x15", "縮んでいない");
+        assert_eq!(option(), "window-size manual", "manual になっていない");
+
+        let result = resize(&mut host, None, None, true).expect("reset は成功する");
+        assert_eq!(result["reset"].as_bool(), Some(true));
+        // ここが #1186 の本体: 応答が成功なら**実際に戻っている**こと
+        assert_eq!(size(), "100x40", "reset が window サイズを戻していない");
+        assert_eq!(option(), "", "window-size の manual が残っている");
+    }
+
     /// #1190 の e2e。実 tmux で kill / resize の socket 解決とエラー文面を確かめる。
     /// `--socket` 明示は挙動不変、省略時に見つからなければ「どこを見たか」を日本語で返し、
     /// tmux の生エラー（`error connecting to /private/tmp/tmux-<uid>/…`）は外へ出さない

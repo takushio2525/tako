@@ -455,19 +455,38 @@ pub fn resize_window(
     .map(|_| ())
 }
 
-/// `resize_window` による manual サイズを解除し、window-size をサーバー既定へ戻す
+/// `resize_window` による manual サイズを解除し、自動サイズへ戻す（#1186）。
+///
+/// **2 段が必要**。`set-window-option -u window-size` は「オプションを未設定へ戻す」
+/// だけで、**その場では window をリサイズしない**（実測: クライアントがその window を
+/// 見ていないあいだは縮んだサイズが残り続ける = #1186 の症状。見ている window だけは
+/// 偶然戻るので「効いている」ように見える）。先に `resize-window -A`
+/// （クライアントの最大寸法へ戻す）で実際にリサイズし、そのあとオプションを未設定へ
+/// 戻す。**順序は逆にできない**: `-A` は window-size を manual にするので、
+/// 先に解除すると manual が残る（実測）。
+///
+/// `-A` に失敗しても（`-A` を解さない器 = psmux 等）オプションの解除は行い、
+/// **エラーはそのまま返す**（黙って「成功」を返すのが #1186 の本質だったため）
 pub fn reset_window_size(socket: Option<&str>, session: &str, window: u32) -> Result<(), String> {
-    run_tmux(
-        socket,
-        &[
-            "set-window-option",
-            "-t",
-            &exact_target(&format!("{session}:{window}")),
-            "-u",
-            "window-size",
-        ],
-    )
-    .map(|_| ())
+    let target = exact_target(&format!("{session}:{window}"));
+    // A/B 計測用（#1186）: `TAKO_1186_LEGACY=1` で旧実装（オプション解除のみ = 戻らない）
+    // へ戻す。`TAKO_1186_INJECT=nooption` は回帰注入で、実サイズは戻るが
+    // window-size が manual のまま残る（= 解除できていない）
+    let legacy = std::env::var("TAKO_1186_LEGACY").as_deref() == Ok("1");
+    let resized = if legacy {
+        Ok(String::new())
+    } else {
+        run_tmux(socket, &["resize-window", "-t", &target, "-A"])
+    };
+    let cleared = if std::env::var("TAKO_1186_INJECT").as_deref() == Ok("nooption") {
+        Ok(String::new())
+    } else {
+        run_tmux(
+            socket,
+            &["set-window-option", "-t", &target, "-u", "window-size"],
+        )
+    };
+    resized.and(cleared).map(|_| ())
 }
 
 /// アクティブ window を切り替える（`session:index` 指定）。
