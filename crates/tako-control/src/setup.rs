@@ -428,6 +428,202 @@ pub fn config_yaml_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "ホームディレクトリが取得できない（$HOME 未設定）".into())
 }
 
+// --- setup ディレクトリの置き場（Issue #1019） -------------------------------
+
+/// 旧実装（tako-cli）が直書きしていた相対パス。**macOS の形**なので、
+/// Windows / Linux ではその OS に存在しない形のディレクトリを作っていた
+const LEGACY_SETUP_REL: &str = "Library/Application Support/tako/setup";
+
+/// `tako setup` が生成物（`setup-instructions.md` / `CLAUDE.md` / `AGENTS.md` /
+/// `GEMINI.md` / `changes.yaml` / `setup-context.yaml` / `pending-changes.md` /
+/// `templates/`）を置くディレクトリ = `<data_dir>/setup`。
+///
+/// **data dir の境界（[`tako_core::paths::data_dir`]）を必ず通す**（#1019）。
+/// 以前は tako-cli 側で `~/Library/Application Support/tako/setup` を直書きしていたので、
+///
+/// 1. Windows で `%USERPROFILE%\Library\Application Support\tako\setup` という
+///    **その OS に存在しない形**の場所へ書いていた（書く場所と読む場所は同じなので
+///    機能はするが、data dir の外なので `tako recover` / 設定共有（#513）/
+///    バックアップの対象から外れ、アンインストールでも残る）
+/// 2. `TAKO_DATA_DIR` / `TAKO_ISOLATED=1` で隔離したはずの `tako setup` が
+///    **本番の setup ディレクトリを書き換えて**いた（#1002 の検証で実際に踏んだ）
+pub fn setup_dir() -> Result<PathBuf, String> {
+    tako_core::paths::data_dir()
+        .map(|d| d.join("setup"))
+        .ok_or_else(|| "ホームディレクトリが取得できない（$HOME 未設定）".into())
+}
+
+/// 旧実装が書いていた場所（`<home>/Library/Application Support/tako/setup`）。
+///
+/// macOS の既定ではここが `<data_dir>/setup` と**同じ場所**になるので、移設の要否は
+/// OS で分岐せず「新旧が違うか」で決める（[`relocation_pair`]）
+pub fn legacy_setup_dir() -> Option<PathBuf> {
+    tako_core::paths::home_dir().map(|h| h.join(LEGACY_SETUP_REL))
+}
+
+/// 旧い場所からの移設（#1019）で何が起きるか。`Check` と `Apply` で同じ形を返す
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupRelocation {
+    /// 旧い場所
+    pub from: PathBuf,
+    /// 新しい場所（`<data_dir>/setup`）
+    pub to: PathBuf,
+    /// 旧ディレクトリの退避先。移設後は**旧内容がまるごとここに残る**
+    pub backup: PathBuf,
+    /// 新しい場所へ写した（写す）相対パス（`/` 区切りに正規化）
+    pub copied: Vec<String>,
+    /// 既に新しい場所にあるので触らなかった相対パス
+    pub kept: Vec<String>,
+}
+
+/// 移設の要否を決める純粋関数（env も fs も読まない = Windows の解決をテストで再現できる）。
+///
+/// `Some((旧, 新))` を返すのは**すべて**満たすときだけ:
+///
+/// 1. `TAKO_DATA_DIR` が立っていない — 隔離した検証が**本番の setup を吸い上げない**ため。
+///    「隔離したつもりが本番を触る」がこの Issue そのものなので、移設側で同じ穴を開けない。
+///    隔離中は旧い場所を見つけても触らず、本番の実行で改めて移す
+/// 2. 新旧の場所が違う — macOS の既定では同じ場所なので**既存ユーザーは無移行**
+pub(crate) fn relocation_pair(
+    legacy: Option<PathBuf>,
+    data_dir_overridden: bool,
+    data_dir: Option<PathBuf>,
+) -> Option<(PathBuf, PathBuf)> {
+    if data_dir_overridden {
+        return None;
+    }
+    let legacy = legacy?;
+    let to = data_dir?.join("setup");
+    if legacy == to {
+        return None;
+    }
+    Some((legacy, to))
+}
+
+/// 実環境での新旧の場所（[`relocation_pair`] へ env を渡すだけの薄い口）
+fn live_relocation_pair() -> Option<(PathBuf, PathBuf)> {
+    let overridden = std::env::var_os("TAKO_DATA_DIR").is_some_and(|v| !v.is_empty());
+    relocation_pair(legacy_setup_dir(), overridden, tako_core::paths::data_dir())
+}
+
+/// 移設すべき旧い場所と移設先（`(旧, 新)`）。移設が要らなければ None。
+///
+/// **冪等性の門番はここ**: 移設が済むと旧ディレクトリは退避先へ rename されて
+/// 無くなるので、2 回目は `is_dir` が偽 = None になる
+/// （「移行済み」を別ファイルへ記録しない。#513 の設定共有で必ず壊れるため）
+pub fn setup_relocation_target() -> Option<(PathBuf, PathBuf)> {
+    let (from, to) = live_relocation_pair()?;
+    from.is_dir().then_some((from, to))
+}
+
+/// 旧い場所を新しい場所へ移す。`apply = false` なら**1 バイトも書かず**同じ内訳を返す
+/// （`status` の予告と `run` の報告が食い違わないよう、走査も失敗の出方も 1 実装にする）。
+///
+/// 旧ディレクトリは**消さずに** `setup.pre-v1.bak` へ退避する
+pub fn relocate_setup_dir(from: &Path, to: &Path, apply: bool) -> Result<SetupRelocation, String> {
+    let backup = free_backup_path(from);
+    let mut copied = Vec::new();
+    let mut kept = Vec::new();
+    walk(from, from, to, apply, 0, &mut copied, &mut kept)?;
+    if apply {
+        // **写してから退避する**。退避（rename）が済んだ時点で旧い場所は消えるので、
+        // 次回は `setup_relocation_target` が None を返す = 冪等
+        std::fs::rename(from, &backup).map_err(|e| {
+            format!(
+                "旧 setup ディレクトリの退避に失敗（{} -> {}）: {e}",
+                from.display(),
+                backup.display()
+            )
+        })?;
+    }
+    copied.sort();
+    kept.sort();
+    Ok(SetupRelocation {
+        from: from.to_path_buf(),
+        to: to.to_path_buf(),
+        backup,
+        copied,
+        kept,
+    })
+}
+
+/// 旧い場所を 1 段ずつ写す。**移設先に同名がある場合は触らない**
+/// （新しい場所の内容の方が新しいので、旧い写しで上書きしない）
+#[allow(clippy::too_many_arguments)]
+fn walk(
+    root: &Path,
+    dir: &Path,
+    to_root: &Path,
+    apply: bool,
+    depth: usize,
+    copied: &mut Vec<String>,
+    kept: &mut Vec<String>,
+) -> Result<(), String> {
+    // setup ディレクトリは 2 段（`templates/`）しか無い。循環したリンクを
+    // 掴んでも無限に潜らないための保険
+    if depth > 8 {
+        return Ok(());
+    }
+    let reader =
+        std::fs::read_dir(dir).map_err(|e| format!("{} を読めない: {e}", dir.display()))?;
+    for entry in reader {
+        let entry = entry.map_err(|e| format!("{} の走査に失敗: {e}", dir.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("{} の種別を読めない: {e}", path.display()))?;
+        if file_type.is_dir() {
+            walk(root, &path, to_root, apply, depth + 1, copied, kept)?;
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        let dest = to_root.join(rel);
+        let label = rel_label(rel);
+        if dest.exists() {
+            kept.push(label);
+            continue;
+        }
+        if apply {
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("{} を作れない: {e}", parent.display()))?;
+            }
+            std::fs::copy(&path, &dest)
+                .map_err(|e| format!("{} を {} へ写せない: {e}", path.display(), dest.display()))?;
+        }
+        copied.push(label);
+    }
+    Ok(())
+}
+
+/// 相対パスの表示（OS によらず `/` 区切り。報告とテストの期待値を揃える）
+fn rel_label(rel: &Path) -> String {
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// 旧ディレクトリの退避先。既に埋まっていたら番号を足す
+/// （古い tako をもう一度動かして旧い場所が復活した場合でも前の退避を潰さない）
+fn free_backup_path(dir: &Path) -> PathBuf {
+    let base = tako_core::migration::backup_path(dir, 1);
+    if !base.exists() {
+        return base;
+    }
+    for n in 2..100u32 {
+        let mut name = base.as_os_str().to_os_string();
+        name.push(format!(".{n}"));
+        let candidate = PathBuf::from(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    base
+}
+
 pub fn load_config() -> Result<SetupConfig, String> {
     let path = config_yaml_path()?;
     load_config_from(&path)
@@ -800,6 +996,252 @@ pub fn render_pending_markdown(pending: &[SetupChange], applied_revision: u32) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- setup ディレクトリの置き場（Issue #1019） ---------------------------
+
+    /// `TAKO_DATA_DIR` はプロセス全体のグローバルなので、触るテストは直列化する
+    /// （`platform::path` の `LEGACY_ENV` と同じ形）
+    static DATA_DIR_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 一時ディレクトリ（テスト間で衝突しない名前）
+    fn tmp(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tako-1019-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れる");
+        dir
+    }
+
+    fn write(path: &Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("親を作れる");
+        }
+        std::fs::write(path, body).expect("書ける");
+    }
+
+    /// Windows の環境をエミュレートする（`%USERPROFILE%` と `%APPDATA%` は別の場所）。
+    /// 実機がオフラインでも移設の判定と挙動をここで固定できる
+    #[test]
+    fn windowsの旧パスから_appdata_配下へ移す判定になる() {
+        let home = PathBuf::from(r"C:\Users\winuser");
+        let appdata = PathBuf::from(r"C:\Users\winuser\AppData\Roaming\tako");
+        let pair = relocation_pair(
+            Some(home.join(LEGACY_SETUP_REL)),
+            false,
+            Some(appdata.clone()),
+        );
+        assert_eq!(
+            pair,
+            Some((home.join(LEGACY_SETUP_REL), appdata.join("setup"))),
+            "%USERPROFILE%\\Library\\... から %APPDATA%\\tako\\setup へ移す"
+        );
+    }
+
+    /// **macOS の既定は無移行**（新旧が同じ場所）。既存ユーザーの回帰ゼロがこの形で保たれる
+    #[test]
+    fn macosの既定では新旧が同じ場所なので移設しない() {
+        let home = PathBuf::from("/Users/testuser");
+        let data = home.join("Library/Application Support/tako");
+        assert_eq!(
+            relocation_pair(Some(home.join(LEGACY_SETUP_REL)), false, Some(data)),
+            None,
+            "macOS の既定では data_dir()/setup が旧パスと同一"
+        );
+    }
+
+    /// **隔離中は本番を吸い上げない**（この Issue の症状を移設側で再現しないための鍵）。
+    /// `TAKO_DATA_DIR` が立っているあいだは旧い場所を見つけても触らず、
+    /// 本番の実行で改めて移す
+    #[test]
+    fn 隔離中は旧い場所を見つけても移設しない() {
+        let home = PathBuf::from("/Users/testuser");
+        assert_eq!(
+            relocation_pair(
+                Some(home.join(LEGACY_SETUP_REL)),
+                true,
+                Some(PathBuf::from("/tmp/tako-iso")),
+            ),
+            None,
+            "TAKO_DATA_DIR が立っているあいだは移設しない"
+        );
+        // 上書きが無ければ同じ入力でも移設する（隔離だけが理由であることの対照）
+        assert!(relocation_pair(
+            Some(home.join(LEGACY_SETUP_REL)),
+            false,
+            Some(PathBuf::from("/tmp/tako-iso")),
+        )
+        .is_some());
+    }
+
+    /// 旧い場所の中身が新しい場所へ写り、**旧側は消えずに退避**される。
+    /// 2 回目は旧い場所が無いので何も起きない（冪等）
+    #[test]
+    fn 移設は写して退避し二回目は何もしない() {
+        let root = tmp("relocate");
+        let from = root.join("legacy/setup");
+        let to = root.join("data/setup");
+        write(&from.join("setup-context.yaml"), "agent: claude\n");
+        write(&from.join("templates/config-default.yaml"), "a: 1\n");
+
+        let done = relocate_setup_dir(&from, &to, true).expect("移設できる");
+        assert_eq!(
+            done.copied,
+            vec![
+                "setup-context.yaml".to_string(),
+                "templates/config-default.yaml".to_string()
+            ]
+        );
+        assert!(done.kept.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(to.join("setup-context.yaml")).expect("読める"),
+            "agent: claude\n",
+            "選んだ agent の状態が新しい場所へ移る"
+        );
+        assert!(to.join("templates/config-default.yaml").is_file());
+        assert!(
+            !from.exists(),
+            "旧い場所は空く（次回は検出されない = 冪等）"
+        );
+        assert_eq!(done.backup, from.with_file_name("setup.pre-v1.bak"));
+        assert_eq!(
+            std::fs::read_to_string(done.backup.join("setup-context.yaml")).expect("読める"),
+            "agent: claude\n",
+            "旧内容は消さずに退避されている"
+        );
+
+        // 2 回目: 公開の入口（setup_relocation_target）が `is_dir` で門番しているので
+        // ここへ来ない = 冪等
+        assert!(!from.is_dir(), "2 回目は移設の対象にならない");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **移設先に同名があれば触らない**（新しい場所の内容の方が新しい）。
+    /// 旧い写しで上書きすると、移設が「巻き戻し」になってしまう
+    #[test]
+    fn 移設先に既にある内容は上書きしない() {
+        let root = tmp("keep");
+        let from = root.join("legacy/setup");
+        let to = root.join("data/setup");
+        write(&from.join("setup-context.yaml"), "agent: codex\n");
+        write(&from.join("changes.yaml"), "rev: 1\n");
+        write(&to.join("setup-context.yaml"), "agent: claude\n");
+
+        let done = relocate_setup_dir(&from, &to, true).expect("移設できる");
+        assert_eq!(done.copied, vec!["changes.yaml".to_string()]);
+        assert_eq!(done.kept, vec!["setup-context.yaml".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(to.join("setup-context.yaml")).expect("読める"),
+            "agent: claude\n",
+            "移設先の内容は残る"
+        );
+        assert_eq!(
+            std::fs::read_to_string(done.backup.join("setup-context.yaml")).expect("読める"),
+            "agent: codex\n",
+            "写さなかった旧内容も退避側には残る"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 見るだけ（`apply = false`）は **1 バイトも書かない**。
+    /// `status` の予告と `run` の報告が同じ走査から出ることも一緒に固定する
+    #[test]
+    fn 見るだけの走査は書き込まない() {
+        let root = tmp("dry");
+        let from = root.join("legacy/setup");
+        let to = root.join("data/setup");
+        write(&from.join("setup-context.yaml"), "agent: claude\n");
+
+        let dry = relocate_setup_dir(&from, &to, false).expect("走査できる");
+        assert_eq!(dry.copied, vec!["setup-context.yaml".to_string()]);
+        assert!(!to.exists(), "移設先を作らない");
+        assert!(from.is_dir(), "旧い場所も触らない");
+
+        let done = relocate_setup_dir(&from, &to, true).expect("移設できる");
+        assert_eq!(dry.copied, done.copied, "予告と結果が一致する");
+        assert_eq!(dry.backup, done.backup);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 退避先が既に埋まっていても前の退避を潰さない
+    /// （古い tako をもう一度動かして旧い場所が復活した場合）
+    #[test]
+    fn 退避先が埋まっていたら番号を足す() {
+        let root = tmp("backup2");
+        let from = root.join("legacy/setup");
+        write(&from.join("changes.yaml"), "rev: 2\n");
+        write(
+            &from.with_file_name("setup.pre-v1.bak").join("changes.yaml"),
+            "rev: 1\n",
+        );
+        let done = relocate_setup_dir(&from, &root.join("data/setup"), true).expect("移設できる");
+        assert_eq!(done.backup, from.with_file_name("setup.pre-v1.bak.2"));
+        assert_eq!(
+            std::fs::read_to_string(from.with_file_name("setup.pre-v1.bak").join("changes.yaml"))
+                .expect("読める"),
+            "rev: 1\n",
+            "前の退避は無傷"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 旧い場所が無い環境（新規ユーザー・macOS の既存ユーザー）は no-op
+    #[test]
+    fn 旧い場所が無ければ何もしない() {
+        // `setup_relocation_target` は env を読むので、TAKO_DATA_DIR を触るテストと直列化する
+        let _guard = DATA_DIR_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tmp("absent");
+        assert!(
+            setup_relocation_target().is_none() || std::env::var_os("TAKO_DATA_DIR").is_some(),
+            "実環境でも旧い場所が無ければ None"
+        );
+        // 走査そのものは「読めない」でエラーになる（呼び出し側が is_dir で門番している）
+        assert!(relocate_setup_dir(&root.join("nope"), &root.join("to"), false).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **macOS のパスが変わっていない**こと（受け入れ条件 3 = 既存ユーザーの回帰ゼロ）。
+    /// `TAKO_DATA_DIR` 未指定のとき、正本経由の setup dir が旧実装の直書きと一致する
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macosのsetupディレクトリは旧実装と同じ場所を指す() {
+        let _guard = DATA_DIR_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var_os("TAKO_DATA_DIR");
+        std::env::remove_var("TAKO_DATA_DIR");
+        let resolved = setup_dir();
+        let legacy = legacy_setup_dir();
+        if let Some(saved) = saved {
+            std::env::set_var("TAKO_DATA_DIR", saved);
+        }
+        assert_eq!(
+            resolved.ok(),
+            legacy,
+            "macOS の既定は ~/Library/Application Support/tako/setup のまま"
+        );
+    }
+
+    /// `TAKO_DATA_DIR` を渡したら**その中**を指す（隔離が効く = 受け入れ条件 1 の土台）
+    #[test]
+    fn 隔離時のsetupディレクトリはtako_data_dirの中を指す() {
+        let _guard = DATA_DIR_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var_os("TAKO_DATA_DIR");
+        let iso = tmp("isolated");
+        std::env::set_var("TAKO_DATA_DIR", &iso);
+        let resolved = setup_dir();
+        let plan = setup_relocation_target();
+        match saved {
+            Some(saved) => std::env::set_var("TAKO_DATA_DIR", saved),
+            None => std::env::remove_var("TAKO_DATA_DIR"),
+        }
+        assert_eq!(resolved.ok(), Some(iso.join("setup")));
+        assert!(
+            plan.is_none(),
+            "隔離中は本番の setup ディレクトリへ手を出さない"
+        );
+        let _ = std::fs::remove_dir_all(&iso);
+    }
 
     /// #566: config.yaml が無い環境（新規ユーザー・隔離起動）でも
     /// serde の既定値（confirm_close=true / ctx_threshold=未設定）と一致すること。

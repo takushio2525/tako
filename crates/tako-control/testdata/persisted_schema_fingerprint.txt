@@ -52,5 +52,6 @@ version profiles: v3 steps=2
 version solo_profiles: v3 steps=2
 version ledger: v1 steps=0
 version handoff: v1 steps=0
+version setup: v1 steps=0
 version discovery_instance: v1 steps=0
 version remote_devices: v1 steps=0

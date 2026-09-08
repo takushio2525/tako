@@ -19,12 +19,6 @@
 
 ---
 
-## 2026-09-07（#1154: master / solo の system prompt を起動時ロード予算の対象にして手順書へ分離）
-- 手順の詳細を `orchestrator/guides/*.md` の 11 topic へ**原文そのまま**移し、`tako orchestrator guide <topic>` /
-  MCP `tako_orchestrator_guide` で引く形に。予算 24 KB を `context_budget` へ追加し、超過は block 別バイト数で提案
-- takodev の生成物 59,501 B / 40,687 tok → **32,626 B / 20,366 tok**（既定 blocks 単体 21,072 B）。全 topic の
-  guide 出力が移送前ブロックと byte 一致 / A/B `TAKO_1154_LEGACY=1` で新テスト 3 本が FAILED / 全 3542 件緑
-
 ## 2026-09-07（#1160: 仮想ディスプレイが列挙で空のときメイン画面へ窓を開かないようにした）
 - 原因は物差しの取り違え: `cx.displays()` = `CGGetActiveDisplayList` なので眠っている面は NSScreen に残ったまま
   列挙から落ちる（実測: 2 枚とも `CGDisplayIsActive=0`）。1 回引いて即 `NotFound` → 既定の面へ落ちていた
@@ -107,3 +101,8 @@
 - 真因はアカウント（#504）の `default_model` を spawn の明示指定と同じ段へ畳んでいたこと。`AccountDefaults` で段を分け、継承の可否は新 1 マス `worker_model_default_inherit`（claude のみ対応）へ問う形に（#982）。応答に `model_source` / `effort_source` を追加
 - 実 spawn（隔離 + tako-vd）: codex は自分の既定 `gpt-5.6-sol medium` で起動して `OK1013` を返した / agy も `--model` `--effort` なし / claude は `--model claude-opus-5 --effort max` のまま不変
 - A/B `TAKO_1013_LEGACY=1` は Issue と同じ `codex --model claude-opus-5 …` を再現。番犬 3 本 + 単体 7 本。全 3613 件緑
+
+## 2026-09-09（#1019: setup ディレクトリを data dir の境界へ寄せ、旧 Windows パスから自動移設）
+- `setup_dir()` の macOS 直書きを `tako_control::setup::setup_dir`（= `data_dir()/setup`）へ集約。旧パスは `SchemaId::Setup` の番地 + 専用実装で移設（写す → 旧ごと `setup.pre-v1.bak` へ rename・**隔離中は移設しない**）
+- A/B 実測: 同条件の `setup --yes` が旧バイナリは HOME 側へ 16 ファイル・新は `$TAKO_DATA_DIR/setup` へ。本番 dir は隔離 6 経路の前後でハッシュ・mtime とも不変
+- 番犬 `setup_dir_boundary_watchdog` 4 本（修正前コードで 2 本が確定 FAILED）+ 単体 12 本。全 3629 件緑（main 取り込み後）。Windows 実機での移設は #467 配下で要確認

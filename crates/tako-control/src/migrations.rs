@@ -366,6 +366,12 @@ pub const SPECS: &[SchemaSpec] = &[
     // ここは**発火と可視化だけ**を引き受ける（[`handoff_reports`]）。
     // 「どこで直るか」を 1 本に保つのが番地に載せる目的
     pristine(SchemaId::Handoff, None),
+    // setup の生成物（#1019）は「置き場の変更」なので引き継ぎと同じ形。
+    // 旧実装が macOS のパスを直書きしていたため、Windows / Linux では data dir の
+    // 外（`<home>/Library/Application Support/tako/setup`）へ書かれている。
+    // 手順は `setup::relocate_setup_dir`、ここは**発火と可視化だけ**を引き受ける。
+    // `validate` を持たないのは中身が md と yaml の混在（1 つの形式で読めない）ため
+    pristine(SchemaId::Setup, None),
     // 認証トークンを持ち、次回起動で作り直される。退避すると寿命を超えて
     // トークンの写しが残るので**退避しない**（読めない残骸は discovery 側の
     // prune_unparsable_instances が pid 生存で掃除する）
@@ -416,6 +422,8 @@ pub fn targets(id: SchemaId) -> Vec<PathBuf> {
         // 引き継ぎは**1 ファイル → 複数ファイル**の分割移行（#915）なので、
         // テキスト置換の Step では表せない。専用実装へ委譲する（[`handoff_reports`]）
         SchemaId::Handoff => Vec::new(),
+        // setup も**置き場の変更**（#1019）なので走査ではなく専用実装へ委譲する
+        SchemaId::Setup => Vec::new(),
         SchemaId::DiscoveryInstance => {
             dir_entries(data.as_ref().map(|d| d.join("instances")), ".json")
         }
@@ -524,6 +532,12 @@ pub fn run(mode: Mode, only: Option<SchemaId>) -> MigrationReport {
             }
             continue;
         }
+        if spec.id == SchemaId::Setup {
+            for file in setup_reports(mode) {
+                report.push(file);
+            }
+            continue;
+        }
         for path in targets(spec.id) {
             report.push(migrate_one(spec, &path, mode));
         }
@@ -616,6 +630,55 @@ fn handoff_reports(mode: Mode) -> Vec<FileReport> {
     }
     reports
 }
+
+/// setup の生成物の置き場の是正（#1019）を共通の記録へ載せる。
+///
+/// 手順は `setup::relocate_setup_dir` が持つ（ディレクトリごとの移設なので
+/// テキスト置換の [`Step`] では表せない）。ここがやるのは**同じ発火点から呼ぶこと**と、
+/// 結果を [`MigrationReport`] の語彙へ翻訳することだけ。
+///
+/// 隔離中（`TAKO_DATA_DIR` あり）は `setup` 側が None を返すので何も出ない
+/// = 隔離した検証が本番の setup ディレクトリを吸い上げない
+fn setup_reports(mode: Mode) -> Vec<FileReport> {
+    let Some((from, to)) = crate::setup::setup_relocation_target() else {
+        return Vec::new();
+    };
+    // Check と Apply で**同じ 1 本**を通す（予告と報告が食い違わない。読めない旧
+    // ディレクトリのような失敗も、見るだけの `status` の段で人へ出る）
+    match crate::setup::relocate_setup_dir(&from, &to, mode == Mode::Apply) {
+        Ok(done) => vec![setup_migrated(&done.to, done.backup)],
+        Err(reason) => vec![setup_failed(&to, reason)],
+    }
+}
+
+/// 移設できた（できる）ときの記録。報告するパスは**移設先**
+/// （利用者がこれから読み書きする場所）
+fn setup_migrated(to: &Path, backup: PathBuf) -> FileReport {
+    FileReport {
+        id: SchemaId::Setup,
+        path: to.to_path_buf(),
+        outcome: FileOutcome::Migrated {
+            from: 1,
+            to: 2,
+            backup,
+            applied: vec![SETUP_V1_TO_V2],
+        },
+    }
+}
+
+/// 移設に失敗したときの記録。**旧い場所はそのまま残る**ので次回また試される
+fn setup_failed(to: &Path, reason: String) -> FileReport {
+    FileReport {
+        id: SchemaId::Setup,
+        path: to.to_path_buf(),
+        outcome: FileOutcome::Failed { reason },
+    }
+}
+
+const SETUP_V1_TO_V2: Note = Note::new(
+    "setup の生成物を data dir の外から <data_dir>/setup へ移す（#1019）",
+    "Move the setup artifacts from outside the data dir into <data_dir>/setup (#1019)",
+);
 
 /// `handoff_store` の書き込みが作る世代バックアップ（`<name>.bak.1`）。
 /// 分割が起きず形式マーカーの付与だけだった場合の退避先はこちら
@@ -1261,6 +1324,51 @@ mod tests {
             targets(SchemaId::Handoff).is_empty(),
             "ファイル走査ではなく handoff_store へ委譲する"
         );
+    }
+
+    /// setup の生成物（#1019）も**置き場の変更**なので Step では表せないが、
+    /// 番地には載っている。載せないと `tako migrate` から見えず発火点が分かれる
+    #[test]
+    fn setupは番地に載るが走査対象を持たない() {
+        let spec = spec(SchemaId::Setup).expect("登録されている");
+        assert!(spec.is_pristine(), "テキスト置換の手順は持たない");
+        assert!(
+            targets(SchemaId::Setup).is_empty(),
+            "ファイル走査ではなく setup::relocate_setup_dir へ委譲する"
+        );
+        assert!(
+            spec.validate.is_none(),
+            "中身は md と yaml の混在なので 1 つの形式では読めない"
+        );
+    }
+
+    /// 置き場の移設の結果が**共通の語彙**へ翻訳されること（#1019）。
+    ///
+    /// macOS では移設そのものが起きない（新旧が同じ場所）ので、実環境で
+    /// `setup_reports` を Migrated まで走らせられるのは Windows / Linux だけ。
+    /// 翻訳の形（種別・報告するパス・退避先・見るだけと当てたあとのキー名）は
+    /// ここで OS によらず固定する
+    #[test]
+    fn setupの移設は共通の語彙へ翻訳される() {
+        let to = PathBuf::from("/data/tako/setup");
+        let backup = PathBuf::from("/home/u/Library/Application Support/tako/setup.pre-v1.bak");
+        let report = setup_migrated(&to, backup.clone());
+        assert_eq!(report.id, SchemaId::Setup);
+        assert_eq!(report.path, to, "報告するのは移設先");
+        assert!(report.outcome.changed(), "書き換えたことになる");
+        // 見るだけのときは「これからこうなる」と分かるキー名になる（退避済みと誤読させない）
+        let planned = file_json(&report, false);
+        assert_eq!(planned["state"], "migrated");
+        assert_eq!(planned["backup_planned"], backup.display().to_string());
+        assert!(planned.get("backup").is_none());
+        let done = file_json(&report, true);
+        assert_eq!(done["backup"], backup.display().to_string());
+        assert_eq!(done["steps"][0], SETUP_V1_TO_V2.text());
+
+        // 失敗は「人が気にするべき状態」として出す（黙って成功にしない）
+        let failed = setup_failed(&to, "退避に失敗".into());
+        assert!(failed.outcome.needs_attention());
+        assert_eq!(file_json(&failed, true)["state"], "failed");
     }
 
     /// トークン・秘匿情報を持つ種別は読めなくても**写しを残さない**。
