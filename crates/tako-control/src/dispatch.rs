@@ -8444,14 +8444,20 @@ fn dispatch_orchestrator_spawn(
     // 無ければ「理由 + 次の一手」を返す（無言死を作らない）
     let agent_cli_path = orchestrator::agent_cli::preflight(worker_agent)
         .map_err(|e| DispatchError::Operation(e.message()))?;
-    // アカウントの default_model / default_effort をフォールバックに使う（#504）
-    let effective_model = model.or(resolved_account
-        .as_ref()
-        .and_then(|a| a.default_model.as_deref()));
-    let effective_effort = effort.or(resolved_account
-        .as_ref()
-        .and_then(|a| a.default_effort.as_deref()));
-    let launch = profile.resolve_agent_launch(worker_agent, effective_model, effective_effort);
+    // アカウントの default_model / default_effort をフォールバックに使う（#504）。
+    // **claude 語彙なので明示指定と同じ段に混ぜない**（#1013: 混ぜていたため
+    // `codex --model claude-opus-5` が組み立てられていた）。継承の可否は
+    // resolve_agent_launch_with_account が能力マトリクスへ問う
+    let account_defaults = orchestrator::AccountDefaults {
+        model: resolved_account
+            .as_ref()
+            .and_then(|a| a.default_model.as_deref()),
+        effort: resolved_account
+            .as_ref()
+            .and_then(|a| a.default_effort.as_deref()),
+    };
+    let launch =
+        profile.resolve_agent_launch_with_account(worker_agent, model, effort, account_defaults);
     // Remote Control（#1068）。opt-in が無ければ何も起きない。
     // opt-in なのに不適格なら、フラグは付けずに理由を spawn 応答の warnings へ載せる
     // （無言で「繋がっているはず」にしない）
@@ -8736,7 +8742,12 @@ fn dispatch_orchestrator_spawn(
         // #983: tako がどの実行ファイルを起動したか（無ければ preflight で落ちている）
         "agent_path": agent_cli_path,
         "model": launch.model,
+        // #1013: どの段が model を決めたか（explicit / account / agent_config /
+        // profile_policy / cli_default）。null の model が「CLI 既定に委ねた」のか
+        // 「設定を読み落とした」のかを master が区別できるようにする
+        "model_source": launch.model_source.as_str(),
         "effort": launch.effort,
+        "effort_source": launch.effort_source.as_str(),
         "command": worker_cmd,
         // 旧フィールド名の互換（#120 以前のクライアント / ドキュメント向け）
         "claude_command": worker_cmd,

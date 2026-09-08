@@ -730,12 +730,95 @@ pub fn launch_command(base: &str, profile_name: &str) -> String {
     }
 }
 
+/// アカウント（#504）が持つモデル / effort の既定。
+///
+/// **claude の語彙で書かれている**（`AccountEntry` は `CLAUDE_CONFIG_DIR` を指す
+/// claude アカウントの定義なので、`default_model` は `claude-opus-5` のような値になる）。
+/// これを worker へ継承してよいかは能力マトリクスの 1 マスが決める（#1013 / #982）
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AccountDefaults<'a> {
+    pub model: Option<&'a str>,
+    pub effort: Option<&'a str>,
+}
+
+/// 解決された model / effort が**どの段から来たか**（#1013）。
+/// spawn の応答へ出すので、`--model` が付かない理由を master が読み取れる
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchValueSource {
+    /// spawn の明示指定（MCP / CLI の引数）
+    Explicit,
+    /// アカウントの `default_model` / `default_effort`（claude 語彙。#504）
+    Account,
+    /// `worker_agents.<agent>` の設定（その系統のネイティブ表記）
+    AgentConfig,
+    /// プロファイルの `worker_model_policy` 解決（claude 語彙）
+    ProfilePolicy,
+    /// どの段も決めていない = エージェント CLI の既定に委ねる（`--model` を付けない）
+    CliDefault,
+}
+
+impl LaunchValueSource {
+    /// 応答・ログ用の表記
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::Account => "account",
+            Self::AgentConfig => "agent_config",
+            Self::ProfilePolicy => "profile_policy",
+            Self::CliDefault => "cli_default",
+        }
+    }
+}
+
+/// claude 語彙で書かれたモデル / effort の既定を継承する系統か（#1013）。
+///
+/// **判断の正本は能力マトリクス**（#982）。`if agent == claude` を散らさないための唯一の入口
+pub fn inherits_claude_vocabulary_defaults(agent: WorkerAgent) -> bool {
+    tako_core::agent_support::supports(
+        tako_core::agent_support::Agent::from(agent),
+        tako_core::agent_support::keys::WORKER_MODEL_DEFAULT_INHERIT,
+    )
+}
+
+/// #1013 の A/B。`TAKO_1013_LEGACY=1` で**同一バイナリのまま**
+/// 「アカウント既定を系統に関係なく明示指定と同じ段で流す」旧挙動へ戻す
+fn legacy_claude_vocabulary_defaults() -> bool {
+    std::env::var("TAKO_1013_LEGACY")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// 上位の段から最初に決まった値とその出どころを返す（#1013）。
+/// **model と effort で同じ順序を使う**ための 1 実装
+pub fn pick_launch_value<'a>(
+    explicit: Option<&'a str>,
+    account: Option<&'a str>,
+    agent_config: Option<&'a str>,
+    profile_policy: Option<&'a str>,
+) -> (Option<&'a str>, LaunchValueSource) {
+    for (value, source) in [
+        (explicit, LaunchValueSource::Explicit),
+        (account, LaunchValueSource::Account),
+        (agent_config, LaunchValueSource::AgentConfig),
+        (profile_policy, LaunchValueSource::ProfilePolicy),
+    ] {
+        if let Some(v) = value {
+            return (Some(v), source);
+        }
+    }
+    (None, LaunchValueSource::CliDefault)
+}
+
 /// `Profile::resolve_agent_launch` の解決結果（spawn で使う worker 起動パラメータ）
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedWorkerLaunch {
     pub agent: WorkerAgent,
     pub model: Option<String>,
+    /// `model` がどの段から来たか（`None` = `CliDefault`。#1013）
+    pub model_source: LaunchValueSource,
     pub effort: Option<String>,
+    /// `effort` がどの段から来たか（#1013）
+    pub effort_source: LaunchValueSource,
     pub skip_permissions: bool,
     /// プロファイルの `bypass_sandbox`（Issue #981）。codex worker の
     /// `--dangerously-bypass-approvals-and-sandbox` はこれが true のときだけ付く
@@ -1216,41 +1299,96 @@ impl Profile {
     }
 
     /// worker 起動パラメータ（モデル・effort・許可スキップ・追加引数）を解決する。
-    /// - claude: 明示指定 → `worker_agents.claude` → 従来の worker_model_policy 解決
-    ///   （effort は既定 "max" まで必ず埋まる = 従来挙動の維持）
-    /// - codex / agy: 明示指定 → `worker_agents.<agent>` → CLI 既定（None のまま）
+    /// アカウント（#504）の既定を混ぜない形。spawn は
+    /// [`Self::resolve_agent_launch_with_account`] を使う
     pub fn resolve_agent_launch(
         &self,
         agent: WorkerAgent,
         explicit_model: Option<&str>,
         explicit_effort: Option<&str>,
     ) -> ResolvedWorkerLaunch {
+        self.resolve_agent_launch_with_account(
+            agent,
+            explicit_model,
+            explicit_effort,
+            AccountDefaults::default(),
+        )
+    }
+
+    /// アカウントの既定込みで worker 起動パラメータを解決する（#504 / #1013）。
+    ///
+    /// 解決順:
+    /// - claude: 明示指定 → アカウントの既定 → `worker_agents.claude` →
+    ///   従来の worker_model_policy 解決（effort は既定 "max" まで必ず埋まる）
+    /// - codex / agy: 明示指定 → `worker_agents.<agent>` → CLI 既定（`None` のまま）
+    ///
+    /// **claude 語彙の既定（アカウントの `default_model` / プロファイルの `worker_model`）を
+    /// 他系統へ渡さない**のがこの関数の要点（#1013 の実発生: `codex --model claude-opus-5`）。
+    /// 判断は `if agent == claude` を散らさず能力マトリクスの 1 マス
+    /// （`keys::WORKER_MODEL_DEFAULT_INHERIT`）へ問う（#982）。
+    /// 旧挙動（アカウント既定を系統に関係なく明示指定と同じ段で流す）へは
+    /// `TAKO_1013_LEGACY=1` で戻せる
+    pub fn resolve_agent_launch_with_account(
+        &self,
+        agent: WorkerAgent,
+        explicit_model: Option<&str>,
+        explicit_effort: Option<&str>,
+        account: AccountDefaults<'_>,
+    ) -> ResolvedWorkerLaunch {
+        self.resolve_agent_launch_in(
+            agent,
+            explicit_model,
+            explicit_effort,
+            account,
+            legacy_claude_vocabulary_defaults(),
+        )
+    }
+
+    /// 旧挙動かどうかを明示して解決する（#1013 の A/B）。
+    /// **判断を引数に置く**ので env グローバルを触らずに新旧どちらも検査できる
+    /// （env を触るテストは並列で競合する。#608 / #807 / #1002 の `agy_effort_suffix` と同じ作法）
+    pub fn resolve_agent_launch_in(
+        &self,
+        agent: WorkerAgent,
+        explicit_model: Option<&str>,
+        explicit_effort: Option<&str>,
+        account: AccountDefaults<'_>,
+        legacy: bool,
+    ) -> ResolvedWorkerLaunch {
         let cfg = self.worker_agents.get(agent.as_str());
         let cfg_model = cfg.and_then(|c| c.model.as_deref());
         let cfg_effort = cfg.and_then(|c| c.effort.as_deref());
-        let (model, effort) = if agent == WorkerAgent::Claude {
-            (
-                explicit_model
-                    .or(cfg_model)
-                    .or_else(|| self.resolve_worker_model())
-                    .map(str::to_string),
-                Some(
-                    explicit_effort
-                        .or(cfg_effort)
-                        .unwrap_or_else(|| self.resolve_worker_effort())
-                        .to_string(),
-                ),
-            )
+        // claude 語彙で書かれた 2 つの段（アカウント既定 / worker_model_policy 解決）を
+        // 通してよい系統か。**旧挙動ではアカウント既定だけが「明示指定と同じ段」に
+        // 混ざっていて系統に関係なく通っていた**（#1013 の実発生の経路）ので、
+        // legacy はそちらの段にしか効かせない（policy 側は元から claude 専用だった）
+        let inherit_policy = inherits_claude_vocabulary_defaults(agent);
+        let inherit_account = legacy || inherit_policy;
+        let (account_model, account_effort) = if inherit_account {
+            (account.model, account.effort)
         } else {
-            (
-                explicit_model.or(cfg_model).map(str::to_string),
-                explicit_effort.or(cfg_effort).map(str::to_string),
-            )
+            (None, None)
         };
+        let policy_model = if inherit_policy {
+            self.resolve_worker_model()
+        } else {
+            None
+        };
+        let policy_effort = if inherit_policy {
+            Some(self.resolve_worker_effort())
+        } else {
+            None
+        };
+        let (model, model_source) =
+            pick_launch_value(explicit_model, account_model, cfg_model, policy_model);
+        let (effort, effort_source) =
+            pick_launch_value(explicit_effort, account_effort, cfg_effort, policy_effort);
         ResolvedWorkerLaunch {
             agent,
-            model,
-            effort,
+            model: model.map(str::to_string),
+            model_source,
+            effort: effort.map(str::to_string),
+            effort_source,
             skip_permissions: cfg
                 .map(|c| c.skip_permissions)
                 .unwrap_or_else(|| agent.default_skip_permissions()),
@@ -4491,6 +4629,252 @@ prompt_blocks:
         // claude は既定で承認あり
         let launch_claude = p.resolve_agent_launch(WorkerAgent::Claude, None, None);
         assert!(!launch_claude.skip_permissions, "claude は既定で承認あり");
+    }
+
+    // ─── #1013: claude 語彙のモデル既定を他系統へ渡さない ───────────────
+    //
+    // 実発生は「profile（worker_model: claude-opus-5）+ アカウント
+    // （default_model: claude-opus-5）の master が agent=codex・model 省略で spawn」→
+    // `codex --model claude-opus-5 …`。アカウント既定が spawn の明示指定と
+    // **同じ段**に混ざっていたのが原因。新旧の A/B は `legacy` 引数で取る
+    // （env を触るテストは並列で競合する。#608 / #807）
+
+    /// #1013 の再現条件をそのまま持つプロファイル（claude 語彙の既定 2 段）
+    fn profile_1013(codex_cfg: Option<AgentWorkerConfig>) -> Profile {
+        let mut agents = std::collections::BTreeMap::new();
+        if let Some(cfg) = codex_cfg {
+            agents.insert("codex".to_string(), cfg);
+        }
+        Profile {
+            model: Some("claude-fable-5-1".into()),
+            effort: "high".into(),
+            worker_model_policy: WorkerModelPolicy::Fixed,
+            worker_model: Some("claude-opus-5".into()),
+            worker_effort: Some("max".into()),
+            worker_agents: agents,
+            ..Default::default()
+        }
+    }
+
+    /// 実発生のアカウント既定（claude 語彙）
+    const ACCOUNT_1013: AccountDefaults<'static> = AccountDefaults {
+        model: Some("claude-opus-5"),
+        effort: None,
+    };
+
+    /// 起動コマンドまで組んで確かめる（`model_source` のラベルだけを見ると
+    /// 「出どころは正しいが値が漏れる」形を素通りする）
+    fn worker_cmd_of(launch: &ResolvedWorkerLaunch) -> String {
+        agent::build_worker_cmd_in(
+            &agent::WorkerLaunch {
+                agent: launch.agent,
+                role: "worker:demo",
+                model: launch.model.as_deref(),
+                effort: launch.effort.as_deref(),
+                skip_permissions: launch.skip_permissions,
+                allow_sandbox_bypass: launch.allow_sandbox_bypass,
+                remote_control: launch.remote_control,
+                extra_args: &launch.extra_args,
+                env: &EMPTY_ENV_PLAN,
+            },
+            crate::launch_cmd::ShellDialect::Posix,
+        )
+    }
+
+    #[test]
+    fn i1013_codex_はアカウントの_claude_モデル既定を受け取らない() {
+        // 受け入れ条件 1: model 省略の codex spawn に --model が付かない
+        let p = profile_1013(Some(AgentWorkerConfig {
+            effort: Some("medium".into()),
+            skip_permissions: true,
+            ..Default::default()
+        }));
+        // spawn が実際に通る入口（env を読む公開 API）でも確かめる。
+        // これが `TAKO_1013_LEGACY=1` を付けた実行で落ちる = A/B の旧アーム
+        let via_public =
+            p.resolve_agent_launch_with_account(WorkerAgent::Codex, None, None, ACCOUNT_1013);
+        assert_eq!(
+            via_public.model, None,
+            "spawn の入口でも claude 語彙を渡さない（TAKO_1013_LEGACY=1 なら落ちる）"
+        );
+        let launch = p.resolve_agent_launch_in(WorkerAgent::Codex, None, None, ACCOUNT_1013, false);
+        assert_eq!(launch, via_public, "既定は新挙動（legacy=false）と同じ");
+        assert_eq!(launch.model, None, "codex は CLI 既定に委ねる");
+        assert_eq!(launch.model_source, LaunchValueSource::CliDefault);
+        // effort は worker_agents.codex の設定（codex のネイティブ表記）が残る
+        assert_eq!(launch.effort.as_deref(), Some("medium"));
+        assert_eq!(launch.effort_source, LaunchValueSource::AgentConfig);
+        let cmd = worker_cmd_of(&launch);
+        assert!(!cmd.contains("--model"), "--model 自体を付けない: {cmd}");
+        assert!(
+            !cmd.contains("claude-opus-5"),
+            "claude 語彙が漏れている: {cmd}"
+        );
+        assert!(
+            cmd.contains("codex -c model_reasoning_effort=medium"),
+            "codex の効果指定は残る: {cmd}"
+        );
+    }
+
+    #[test]
+    fn i1013_旧挙動は実発生と同じコマンドを組む() {
+        // A/B の旧アーム（= TAKO_1013_LEGACY=1）。Issue の観測と同じ文字列になる
+        let p = profile_1013(Some(AgentWorkerConfig {
+            effort: Some("medium".into()),
+            skip_permissions: true,
+            ..Default::default()
+        }));
+        let legacy = p.resolve_agent_launch_in(WorkerAgent::Codex, None, None, ACCOUNT_1013, true);
+        assert_eq!(legacy.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(legacy.model_source, LaunchValueSource::Account);
+        let cmd = worker_cmd_of(&legacy);
+        assert!(
+            cmd.contains("codex --model claude-opus-5 -c model_reasoning_effort=medium"),
+            "#1013 の観測を再現する: {cmd}"
+        );
+    }
+
+    #[test]
+    fn i1013_per_agent_のモデル設定は使われる() {
+        // 受け入れ条件 2: worker_agents.codex.model はアカウント既定に負けない
+        let p = profile_1013(Some(AgentWorkerConfig {
+            model: Some("gpt-5.6-sol".into()),
+            effort: Some("medium".into()),
+            skip_permissions: true,
+            ..Default::default()
+        }));
+        let launch = p.resolve_agent_launch_in(WorkerAgent::Codex, None, None, ACCOUNT_1013, false);
+        assert_eq!(launch.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(launch.model_source, LaunchValueSource::AgentConfig);
+        let cmd = worker_cmd_of(&launch);
+        assert!(cmd.contains("codex --model gpt-5.6-sol"), "{cmd}");
+        // 明示指定は per-agent 設定より強い（優先順位の確認）
+        let explicit = p.resolve_agent_launch_in(
+            WorkerAgent::Codex,
+            Some("gpt-5.6-luna"),
+            None,
+            ACCOUNT_1013,
+            false,
+        );
+        assert_eq!(explicit.model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(explicit.model_source, LaunchValueSource::Explicit);
+    }
+
+    #[test]
+    fn i1013_agy_も同じ規則で守られる() {
+        // 受け入れ条件 3: agy でも claude 語彙の既定は渡らない。
+        // agy の effort は low|medium|high しか受けない（#1002 の実測）ので、
+        // claude 語彙の "max" が漏れると不正値で起動してしまう
+        let p = profile_1013(None);
+        let account = AccountDefaults {
+            model: Some("claude-opus-5"),
+            effort: Some("max"),
+        };
+        let launch = p.resolve_agent_launch_in(WorkerAgent::Agy, None, None, account, false);
+        assert_eq!(launch.model, None);
+        assert_eq!(launch.effort, None, "agy に claude の max を渡さない");
+        let cmd = worker_cmd_of(&launch);
+        assert!(!cmd.contains("--model"), "{cmd}");
+        assert!(!cmd.contains("--effort"), "{cmd}");
+        // 旧挙動なら両方漏れていた
+        let legacy = p.resolve_agent_launch_in(WorkerAgent::Agy, None, None, account, true);
+        let legacy_cmd = worker_cmd_of(&legacy);
+        assert!(
+            legacy_cmd.contains("--model claude-opus-5") && legacy_cmd.contains("--effort max"),
+            "旧挙動の再現: {legacy_cmd}"
+        );
+    }
+
+    #[test]
+    fn i1013_claude_の解決順は変わらない() {
+        // claude 経路は不変（明示 → アカウント → worker_agents.claude → ポリシー）
+        let p = profile_1013(None);
+        let launch =
+            p.resolve_agent_launch_in(WorkerAgent::Claude, None, None, ACCOUNT_1013, false);
+        assert_eq!(launch.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(launch.model_source, LaunchValueSource::Account);
+        assert_eq!(
+            launch.effort.as_deref(),
+            Some("max"),
+            "ポリシー解決で埋まる"
+        );
+        assert_eq!(launch.effort_source, LaunchValueSource::ProfilePolicy);
+        // アカウント既定が無ければ worker_agents.claude → ポリシー解決へ落ちる
+        let mut with_cfg = p.clone();
+        with_cfg.worker_agents.insert(
+            "claude".to_string(),
+            AgentWorkerConfig {
+                model: Some("claude-haiku-4-5".into()),
+                ..Default::default()
+            },
+        );
+        let from_cfg = with_cfg.resolve_agent_launch_in(
+            WorkerAgent::Claude,
+            None,
+            None,
+            AccountDefaults::default(),
+            false,
+        );
+        assert_eq!(from_cfg.model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(from_cfg.model_source, LaunchValueSource::AgentConfig);
+        let from_policy = p.resolve_agent_launch_in(
+            WorkerAgent::Claude,
+            None,
+            None,
+            AccountDefaults::default(),
+            false,
+        );
+        assert_eq!(from_policy.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(from_policy.model_source, LaunchValueSource::ProfilePolicy);
+        // legacy との差が claude では出ない（= claude 経路を変えていない）
+        assert_eq!(
+            launch,
+            p.resolve_agent_launch_in(WorkerAgent::Claude, None, None, ACCOUNT_1013, true)
+        );
+    }
+
+    #[test]
+    fn i1013_出どころは段の順に決まる() {
+        use LaunchValueSource as Src;
+        // 純粋関数だけを見る（model / effort が同じ順序を使う根拠）
+        assert_eq!(
+            pick_launch_value(Some("e"), Some("a"), Some("c"), Some("p")),
+            (Some("e"), Src::Explicit)
+        );
+        assert_eq!(
+            pick_launch_value(None, Some("a"), Some("c"), Some("p")),
+            (Some("a"), Src::Account)
+        );
+        assert_eq!(
+            pick_launch_value(None, None, Some("c"), Some("p")),
+            (Some("c"), Src::AgentConfig)
+        );
+        assert_eq!(
+            pick_launch_value(None, None, None, Some("p")),
+            (Some("p"), Src::ProfilePolicy)
+        );
+        assert_eq!(
+            pick_launch_value(None, None, None, None),
+            (None, Src::CliDefault)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "claude 語彙が漏れている")]
+    fn i1013_注入_出どころは正しいが値だけ漏れる形を検査が落とす() {
+        // 回帰を隠していないことの確認（#1167 の作法）。`model_source` は
+        // `cli_default` と正しく報告したまま model の値だけ漏らした偽の解決結果を
+        // 同じ検査へ通す。ラベルだけを見るテストならここが素通りしてしまう
+        let p = profile_1013(None);
+        let mut leaked =
+            p.resolve_agent_launch_in(WorkerAgent::Codex, None, None, ACCOUNT_1013, false);
+        assert_eq!(leaked.model_source, LaunchValueSource::CliDefault);
+        leaked.model = Some("claude-opus-5".into());
+        let cmd = worker_cmd_of(&leaked);
+        assert!(
+            !cmd.contains("claude-opus-5"),
+            "claude 語彙が漏れている: {cmd}"
+        );
     }
 
     #[test]
