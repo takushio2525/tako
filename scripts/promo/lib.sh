@@ -632,23 +632,59 @@ promo_seed_window_frame() {
         "$x" "$y" "$w" "$h" > "$work/data/layout.json"
 }
 
-# **seed だけでは 16:9 にならない**（2026-09-09 実測 / #1149 以降）。
+# **layout.json の seed は位置もサイズも効かない**（2026-09-09 実測 / #1149 以降）。
 # `initial_window_bounds` は置き先ディスプレイが解決できた検証起動では保存フレームを
-# 捨てて「960x600pt をその面の中央へ」置く（`main.rs` の #1141 の分岐）ので、
-# layout.json の seed は位置もサイズも効かない。v1〜v3 の素材はこの分岐が入る前に
-# 撮ったので 1920x1080px だった。起動後に AX でサイズだけ直す（位置は置き先が正しい）。
+# 捨てて「960x600pt をその面の中央へ」置く（`main.rs` の #1141 の分岐）。つまり
+#   ① 16:9（960x540pt = 1920x1080px）にならない
+#   ② `promo_vd_free_origin` で探した空きが使われず、**どの隔離 tako も同じ中央へ重なる**
+# の 2 つが起きる。②は絵には出ないが**クリックが別の窓に吸われる**（2026-09-09 実測:
+# 別 worker の隔離 tako が同じ 2312,420 に居て、カード押下が 3 回打ち直しても無反応。
+# frontmost がその worker の pid のまま動かないことで分かった）。
+# v1〜v3 の素材はこの分岐が入る前に撮ったので 1920x1080px だった。
+# 起動後に AX で位置とサイズを入れ直し、**他の窓と重なっていないこと**まで確かめる。
 # $1 = pid, $2 = 幅pt（既定 960）, $3 = 高さpt（既定 540）
-promo_force_window_size() {
-    local pid=$1 w=${2:-960} h=${3:-540} i got
-    for i in $(seq 1 10); do
+promo_force_window_frame() {
+    local pid=$1 w=${2:-960} h=${3:-540} i origin x y got
+    for i in 1 2 3; do
+        if [ "$PROMO_STAGE" = virtual ]; then
+            # 空きは**毎回引き直す**（他の worker の窓は収録の途中でも増える）
+            origin=$(promo_vd_free_origin "$w" "$h")
+            x=${origin% *}; y=${origin#* }
+            osascript -e "tell application \"System Events\" to tell (first application process whose unix id is $pid) to set position of window 1 to {$x, $y}" \
+                >/dev/null 2>&1 || true
+            sleep 0.4
+        fi
         osascript -e "tell application \"System Events\" to tell (first application process whose unix id is $pid) to set size of window 1 to {$w, $h}" \
             >/dev/null 2>&1 || true
         sleep 0.6
         got=$("$PROMO_WINBOUNDS" "$pid" 2>/dev/null | cut -d' ' -f4,5)
-        [ "$got" = "$w $h" ] && { echo "   窓サイズ: ${w}x${h}pt"; return 0; }
+        [ "$got" = "$w $h" ] || continue
+        if promo_vd_window_clear "$pid"; then
+            echo "   窓: $("$PROMO_WINBOUNDS" "$pid" | cut -d' ' -f2,3) ${w}x${h}pt（他の窓と重なりなし）"
+            return 0
+        fi
     done
-    echo "ERROR: 窓を ${w}x${h}pt にできない（実測 ${got:-不明}）" >&2
+    echo "ERROR: 窓を ${w}x${h}pt の空きへ置けない（実測 ${got:-不明}）。" >&2
+    echo "       仮想ディスプレイが他の worker の隔離 tako で埋まっている可能性がある" >&2
+    echo "       （$("$PROMO_WINBOUNDS" --all 2>/dev/null | wc -l | tr -d ' ') 窓）。空いてから撮り直すこと" >&2
     return 1
+}
+
+# 自分の窓（$1 = pid）に他の窓が重なっていないか（0 = 重なりなし）。
+# 重なっていると**クリックが相手の窓へ吸われる**ので、収録前に必ず確かめる
+promo_vd_window_clear() {
+    local pid=$1 b
+    b=$("$PROMO_WINBOUNDS" "$pid" 2>/dev/null) || return 1
+    "$PROMO_WINBOUNDS" --all 2>/dev/null | awk -v me="$b" '
+        BEGIN { split(me, m, " "); mid=m[1]; mx=m[2]; my=m[3]; mw=m[4]; mh=m[5] }
+        $1 == mid { next }
+        {
+            if ($3 < mx + mw && mx < $3 + $5 && $4 < my + mh && my < $4 + $6) {
+                printf "   重なり: pid %s の窓 %s,%s %sx%s\n", $2, $3, $4, $5, $6
+                bad = 1
+            }
+        }
+        END { exit bad ? 1 : 0 }'
 }
 
 # 収録用アカウント（`TAKO_PROMO_CLAUDE_CONFIG_DIR`）を隔離インスタンスへ登録する。
