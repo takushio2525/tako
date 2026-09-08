@@ -19,15 +19,6 @@
 
 ---
 
-## 2026-09-07（#1136: 夜間リリースが共有ツリーを detached のまま放置する問題を根治）
-- リリース作業を**使い捨て worktree**（`git worktree add --detach` → trap で撤去）へ移し、
-  install_root の HEAD を一切触らない形にした。成功・ビルド失敗・片肺・SIGTERM のどれでも main のまま
-- 重複コミットの経路は「ビルド中に origin/main が進む → push 拒否 → `set -e` で無言死 →
-  未 push のリリースコミットごと detached が残る」。押し出す前に先端を照合して中止するようにし、
-  多重起動ロックを HOME 単位 + **リポジトリ単位**の 2 段にした（$HOME が違う並走を止められていなかった）
-- 検証: test-nightly-reserve 129 PASS（新規 7 本・CI へも載せた）/ test-release-retry 55 PASS /
-  A/B で修正前は 20 FAIL。失敗経路 4 種の HEAD before/after を隔離環境で実測
-
 ## 2026-09-07（#1154: master / solo の system prompt を起動時ロード予算の対象にして手順書へ分離）
 - 手順の詳細を `orchestrator/guides/*.md` の 11 topic へ**原文そのまま**移し、`tako orchestrator guide <topic>` /
   MCP `tako_orchestrator_guide` で引く形に。予算 24 KB を `context_budget` へ追加し、超過は block 別バイト数で提案
@@ -106,3 +97,8 @@
 - Issue の grep（`0..25`）は失敗項目②（`0..20`）を漏らしていたので洗い直し、**18 か所**を `wait_for_backend_state`（状態待ち + `state_wait_budget`・駆動は毎周期）へ。番犬は region（tmux ゲート内の固定窓）+ `read_to_string` needle + #1162 へ `tako_control::dispatch(`
 - **真因は待ちの長さだけではない**: 項目 73 は「待てば立つミラー」と「1.4 秒で消えるスクロールバー」を 1 回のホイールのあと同時に見ていた（実測 `bar=false`）ので予算では解けない → ホイールを毎周期打つ形へ
 - 無負荷 + load 13.7〜16.1 で `TAKO_APP_SELF_TEST_OK` / A/B は `LEGACY=68-attach|73-wheel` + `INJECT=late` が FAILED（`waited=10.1s budget=10.0s` / `6.2s/6.0s`）・新経路は通過 / `INJECT=never` は新も FAILED
+
+## 2026-09-08（#1081: 解説動画の読み間違いを全区間点検して v4 を合成）
+- 全 47 区間の kana を機械で出して全件読み、誤読 5 件を修正（`3 つ`→みっつ / `1 行`×2 / `空のペイン` / `140 個`）
+- **ユーザー辞書は空白でトークンが割れて当たらない**（実測）ので、合成直前の置換表 `reading-overrides.tsv` を正本に
+- v4 = 9:59 / -14.9 LUFS / TP -1.5 dBTP / PII 0 件。点検は `check-readings.sh --diff`
