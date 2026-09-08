@@ -178,6 +178,13 @@ pub struct WorkerLaunch<'a> {
     pub remote_control: bool,
     /// プロファイル worker_agents.<agent>.args の追加 CLI 引数（上級者向け）
     pub extra_args: &'a [String],
+    /// MCP stdio ブリッジ（`<tako_bin> mcp serve`）の起動パス（Issue #986）。
+    /// **codex だけが使う**（起動時の `-c mcp_servers.tako.*` 一時注入）。
+    /// `None` のときは MCP 引数を 1 バイトも足さない = 呼び出し側が
+    /// 「MCP を配線しない」と明示した状態。spawn 経路は必ず
+    /// `dispatch::resolve_tako_binary()` の結果を渡す（番犬
+    /// `worker_mcp_injection_watchdog` が渡し忘れを落とす）
+    pub tako_bin: Option<&'a str>,
     /// プロファイル + アカウント解決の env 計画（展開済み）。コマンド先頭で
     /// `export K=V;` / `unset K;` として注入し、direnv が同変数を設定していても
     /// 明示指定が勝つようにする（Issue #500 / #512）
@@ -195,6 +202,7 @@ impl Default for WorkerLaunch<'_> {
             allow_sandbox_bypass: false,
             remote_control: false,
             extra_args: &[],
+            tako_bin: None,
             env: &EMPTY_ENV_PLAN,
         }
     }
@@ -218,6 +226,55 @@ pub(crate) fn agy_effort_suffix(
         return String::new();
     }
     format!(" --effort {}", crate::launch_cmd::quote(dialect, effort))
+}
+
+/// codex の MCP stdio サーバー（`tako mcp serve`）へ親環境から引き継ぐ環境変数。
+/// codex は既定で MCP 子プロセスの環境を最小構成（PATH / HOME 等）に絞るため、
+/// tako の接続情報は `mcp_servers.<name>.env_vars`（引き継ぎホワイトリスト）で明示する。
+/// TAKO_ORCHESTRATOR_ROLE は MCP セッションの caller_role（Issue #109 の複数 master
+/// 混線対策）に使われる。
+///
+/// **値ではなく名前**を並べるので、ペインごとに違う値がそのまま届き、
+/// トークンを設定ファイルへ書き残さない。恒久登録（#979）側の正本は
+/// `crate::agent_mcp::CODEX_FORWARD_ENV` で、こちらは TAKO_TAB_ID を余分に含む
+/// （同期テスト `一時注入の env_vars は恒久登録の上位集合` が包含関係を縛る）
+pub(crate) const CODEX_MCP_ENV_VARS: &str =
+    r#"["TAKO_SOCKET","TAKO_TOKEN","TAKO_PANE_ID","TAKO_TAB_ID","TAKO_ORCHESTRATOR_ROLE"]"#;
+
+/// codex へ付ける MCP 一時注入の断片（**master / worker / git resolve が共有する正本**。Issue #986）。
+///
+/// 恒久登録（`codex mcp add` = #979）ではなく起動時の `-c` 一時注入なのは、
+/// `~/.codex/config.toml` を汚さず **tako の外で起動した codex にツールを出さない**
+/// ため（FR-2.3.2 と同方針）。恒久登録がある機でも `-c` が後勝ちするので、
+/// 登録が古いバイナリを指していても spawn した worker は正しいブリッジへ繋がる。
+///
+/// `args` / `env_vars` は TOML 配列リテラルをそのまま渡すため、方言に依らず
+/// シングルクオートで囲む（PowerShell のシングルクオートもリテラル文字列）。
+/// **master の出力と 1 バイトも変えない**ことを `mcp 一時注入の断片は master と worker で同一`
+/// が縛る
+pub fn codex_mcp_args(tako_bin: &str, dialect: crate::launch_cmd::ShellDialect) -> String {
+    use crate::launch_cmd as lc;
+    let mut s = String::new();
+    s.push_str(&format!(
+        " -c {}",
+        lc::quote(
+            dialect,
+            &format!("mcp_servers.tako.command={}", toml_quote(tako_bin))
+        )
+    ));
+    s.push_str(r#" -c 'mcp_servers.tako.args=["mcp","serve"]'"#);
+    s.push_str(&format!(
+        " -c 'mcp_servers.tako.env_vars={CODEX_MCP_ENV_VARS}'"
+    ));
+    s
+}
+
+/// #986 の A/B 用の env。`TAKO_986_LEGACY=1` で**同一バイナリのまま**
+/// 「worker には MCP を注入しない / caller_pane は env だけで解決する」旧挙動へ戻す
+pub fn legacy_no_worker_mcp() -> bool {
+    std::env::var("TAKO_986_LEGACY")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 /// #1002 の A/B 用の env。`TAKO_1002_LEGACY=1` で**同一バイナリのまま**
@@ -295,6 +352,15 @@ pub fn build_worker_cmd_in(
     if launch.remote_control && launch.agent == WorkerAgent::Claude {
         cmd.push(' ');
         cmd.push_str(crate::claude_remote::REMOTE_CONTROL_FLAG);
+    }
+    // MCP の一時注入（#986）。**codex だけ**が `-c` で受け取れる。
+    // claude は恒久登録（`tako setup-mcp`）+ 親 env の継承で繋がり、agy は
+    // per-launch の注入手段が CLI に無い（`agy --help` に -c / --mcp-config が無い =
+    // 実測 1.1.27）ので恒久登録に委ねる。詳細は `.agent/orchestrator.md`
+    if let (WorkerAgent::Codex, Some(tako_bin)) = (launch.agent, launch.tako_bin) {
+        if !legacy_no_worker_mcp() {
+            cmd.push_str(&codex_mcp_args(tako_bin, dialect));
+        }
     }
     for arg in launch.extra_args {
         cmd.push(' ');
@@ -915,5 +981,147 @@ mod tests {
             "codex にも env export: {cmd}"
         );
         assert!(cmd.contains("codex"), "codex コマンド: {cmd}");
+    }
+
+    // ---- Issue #986: worker への MCP 一時注入 ----
+
+    /// 受け入れ条件 1: codex worker の起動コマンドに master と同じ
+    /// `-c mcp_servers.tako.*` が 3 つとも付く
+    #[test]
+    fn i986_codex_workerに_mcp_の一時注入が付く() {
+        let cmd = build_worker_cmd_in(
+            &WorkerLaunch {
+                agent: WorkerAgent::Codex,
+                role: "worker:demo",
+                tako_bin: Some("/usr/local/bin/tako"),
+                ..Default::default()
+            },
+            POSIX,
+        );
+        assert!(
+            cmd.contains(r#"-c 'mcp_servers.tako.command="/usr/local/bin/tako"'"#),
+            "command: {cmd}"
+        );
+        assert!(
+            cmd.contains(r#"-c 'mcp_servers.tako.args=["mcp","serve"]'"#),
+            "args: {cmd}"
+        );
+        assert!(
+            cmd.contains(r#"-c 'mcp_servers.tako.env_vars=["TAKO_SOCKET","TAKO_TOKEN","TAKO_PANE_ID","TAKO_TAB_ID","TAKO_ORCHESTRATOR_ROLE"]'"#),
+            "env_vars: {cmd}"
+        );
+        // extra_args より前（ユーザー指定の引数を最後に残す）
+        let cmd = build_worker_cmd_in(
+            &WorkerLaunch {
+                agent: WorkerAgent::Codex,
+                role: "worker:demo",
+                tako_bin: Some("/usr/local/bin/tako"),
+                extra_args: &["--search".to_string()],
+                ..Default::default()
+            },
+            POSIX,
+        );
+        assert!(
+            cmd.find("mcp_servers.tako.env_vars") < cmd.find("--search"),
+            "MCP 注入は extra_args より前: {cmd}"
+        );
+    }
+
+    /// 受け入れ条件 3: claude / agy の出力は 1 バイトも変わらない
+    /// （claude は `-c` を解釈しない・agy は per-launch の注入手段が CLI に無い）
+    #[test]
+    fn i986_claude_と_agy_の起動コマンドは変わらない() {
+        for agent in [WorkerAgent::Claude, WorkerAgent::Agy] {
+            let without = build_worker_cmd_in(
+                &WorkerLaunch {
+                    agent,
+                    role: "worker:demo",
+                    ..Default::default()
+                },
+                POSIX,
+            );
+            let with = build_worker_cmd_in(
+                &WorkerLaunch {
+                    agent,
+                    role: "worker:demo",
+                    tako_bin: Some("/usr/local/bin/tako"),
+                    ..Default::default()
+                },
+                POSIX,
+            );
+            assert_eq!(
+                without,
+                with,
+                "{} で tako_bin が出力を変えた",
+                agent.as_str()
+            );
+            assert!(
+                !with.contains("mcp_servers"),
+                "{} に MCP 注入が漏れている: {with}",
+                agent.as_str()
+            );
+        }
+    }
+
+    /// `tako_bin` を渡さない呼び出し側（claude 用の互換ラッパー等）は
+    /// codex でも MCP 引数を足さない = 「配線しない」を明示できる
+    #[test]
+    fn i986_tako_bin_なしなら_mcp_引数は付かない() {
+        let cmd = build_worker_cmd_in(
+            &WorkerLaunch {
+                agent: WorkerAgent::Codex,
+                role: "worker:demo",
+                tako_bin: None,
+                ..Default::default()
+            },
+            POSIX,
+        );
+        assert!(!cmd.contains("mcp_servers"), "{cmd}");
+    }
+
+    /// A/B: `TAKO_986_LEGACY=1` 相当（純粋関数側で旧挙動を再現できること）。
+    /// env を読む経路は `legacy_no_worker_mcp()` の 1 箇所しか無いので、
+    /// ここでは「注入の断片が master と同一」を縛って片方だけ古くなる形を落とす
+    #[test]
+    fn i986_mcp一時注入の断片は_master_と_worker_で同一() {
+        let bin = "/Applications/tako.app/Contents/MacOS/tako";
+        for dialect in [POSIX, crate::launch_cmd::ShellDialect::PowerShell] {
+            let fragment = codex_mcp_args(bin, dialect);
+            let worker = build_worker_cmd_in(
+                &WorkerLaunch {
+                    agent: WorkerAgent::Codex,
+                    role: "worker:demo",
+                    tako_bin: Some(bin),
+                    ..Default::default()
+                },
+                dialect,
+            );
+            assert!(worker.contains(&fragment), "worker: {worker}");
+            let profile = crate::orchestrator::Profile {
+                master_agent: Some("codex".into()),
+                ..Default::default()
+            };
+            let master = crate::orchestrator::build_master_cmd_in(
+                "master:demo",
+                &profile,
+                std::path::Path::new("/tmp/prompt.md"),
+                bin,
+                dialect,
+            )
+            .expect("master コマンドが組める");
+            assert!(master.contains(&fragment), "master: {master}");
+        }
+    }
+
+    /// 一時注入（#986）の `env_vars` は恒久登録（#979）の転送リストを**含む**。
+    /// 2 つのリストが別々に育って「一時注入だけ足りない」形にならないよう縛る
+    #[test]
+    fn i986_一時注入の_env_vars_は恒久登録の上位集合() {
+        for name in crate::agent_mcp::CODEX_FORWARD_ENV {
+            assert!(
+                CODEX_MCP_ENV_VARS.contains(&format!("\"{name}\"")),
+                "{name} が一時注入の env_vars に無い: {CODEX_MCP_ENV_VARS}"
+            );
+        }
     }
 }

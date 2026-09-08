@@ -147,9 +147,11 @@ effort: xhigh           # codex: none/minimal/low/medium/high/xhigh/max/ultra
   `effort` は claude worker へ**継承されない**（inherit / delegate / fixed フォールバックの
   全経路で claude CLI 既定 / max に落ちる）。codex master + claude worker を混在させる場合、
   worker のモデルは `worker_agents.claude` か `worker_model`（fixed）で明示する
-- **agy が master 非対応の理由**: agy の MCP 設定（JSON ファイル）にはペイン毎の接続情報
-  （TAKO_* 環境変数）を子プロセスへ引き継ぐ手段が無く、system prompt 注入オプションも無い。
-  `master_agent: agy` は設定時・起動時ともに明示エラーになる
+- **agy が master 非対応の理由**: agy には **system prompt 注入オプションが無い**
+  （`agy --help` 実測 1.1.27）。`master_agent: agy` は設定時・起動時ともに明示エラーになる。
+  **かつて併記していた「ペイン毎の接続情報（TAKO_* 環境変数）を子プロセスへ引き継ぐ手段が無い」は
+  実測で否定された**（#979 / #986: agy は親環境をそのまま MCP 子へ渡す = 実測 1.1.27 で `TAKO_*` が
+  15 個届く）。#986 で `caller_pane` の pid 祖先辿りも入ったので、残る障害は system prompt だけ（#987）
 - **初回のフォルダ信頼**: codex は初回起動時に作業フォルダの信頼確認を出すことがある。
   master は対話セッションなのでその場で承認すればよい（worker と違い事前信頼は書き込まない）
 
@@ -202,6 +204,22 @@ worker_agents:               # エージェント別の worker 設定（任意�
   codex = rollout の `task_started` / agy = 実況 JSONL の `USER_INPUT` でしかできないので、
   器が無い / 会話が解決できない状況では `prompt_delivery_unverified`（`verify_then_resend`）へ
   降格する。「読めなかった」を未達と断定すると、働いている worker へ同じ依頼が二度渡る
+- **MCP 接続（#986）**: worker からも tako の MCP ツール（`tako_*`）が呼べる。経路は系統で違う:
+  - **codex** = spawn の起動コマンドへ `-c mcp_servers.tako.command/args/env_vars` を
+    **一時注入**する（master と同じ `orchestrator::agent::codex_mcp_args` の 1 実装）。
+    codex は MCP 子プロセスへ親環境を渡さないので `env_vars` の許可リストが要る
+    （実測 0.153.0: 一時注入した 5 個 = `TAKO_SOCKET` / `TAKO_TOKEN` / `TAKO_PANE_ID` /
+    `TAKO_TAB_ID` / `TAKO_ORCHESTRATOR_ROLE` だけが届く）。**恒久登録を待たない**ので
+    `tako setup-mcp` を打っていない機でも繋がり、登録が古いバイナリを指していても `-c` が後勝ちする
+  - **claude / agy** = 恒久登録（`tako setup` / `tako setup-mcp` = #979）+ 親環境の継承。
+    agy には per-launch の注入手段が CLI に無い（`agy --help` 実測 1.1.27 に `-c` /
+    `--mcp-config` が無い）ので、**`tako setup-mcp` を打っていない機では agy worker に
+    tako のツールが出ない**（codex にはこの依存が無い）
+  - **`pane` を省略した呼び出しは自分のペインに当たる**。`TAKO_PANE_ID` が届かない
+    クライアントでも解けるよう、`tako mcp serve` は **pid 祖先辿り**へ落ちる（#986）。
+    解決したときは persist.log に `mcp serve: caller_pane を pid 祖先辿りで解決（pane=N …）` が 1 行残る
+  - tako の**外**で起動した codex / agy には従来どおりツールが出ない（`tako mcp serve` は
+    `TAKO_SOCKET` + `TAKO_TOKEN` が無いと 0 ツール = FR-2.3.2）
 - **事前信頼**: spawn 時に各 CLI の信頼設定（claude: `~/.claude.json` / codex:
   `~/.codex/config.toml` / agy: `~/.gemini/antigravity-cli/settings.json`）へ書き込み、
   信頼ダイアログ自体を出さない。書けなかった場合もダイアログ検出 → Enter 承諾でフォールバック

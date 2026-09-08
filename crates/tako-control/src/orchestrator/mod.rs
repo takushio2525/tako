@@ -1981,8 +1981,12 @@ pub fn solo_default_profile() -> Profile {
 }
 
 /// master として利用可能なエージェント種別の検証（Issue #127）。
-/// agy は MCP のペイン毎接続情報（TAKO_SOCKET / TAKO_PANE_ID 等）を子プロセスへ
-/// 引き継ぐ設定手段と system prompt 注入手段が無いため master 非対応（worker のみ）
+///
+/// agy が master 非対応なのは **system prompt の注入手段が無い**から（`agy --help`
+/// 実測 1.1.27）。**併記していた「ペイン毎接続情報を子プロセスへ引き継げない」は
+/// 実測で否定された**（#979 / #986: agy は親環境をそのまま MCP 子へ渡す = 実測で
+/// `TAKO_*` が 15 個届く）。#986 で `caller_pane` の pid 祖先辿りも入ったので、
+/// 残る障害は system prompt だけ（#987）
 pub fn validate_master_agent(name: &str) -> Result<WorkerAgent, String> {
     let agent = WorkerAgent::parse(name)?;
     match agent {
@@ -1992,14 +1996,6 @@ pub fn validate_master_agent(name: &str) -> Result<WorkerAgent, String> {
         ),
     }
 }
-
-/// codex の MCP stdio サーバー（`tako mcp serve`）へ親環境から引き継ぐ環境変数。
-/// codex は既定で MCP 子プロセスの環境を最小構成（PATH / HOME 等）に絞るため、
-/// tako の接続情報は `mcp_servers.<name>.env_vars`（引き継ぎホワイトリスト）で明示する。
-/// TAKO_ORCHESTRATOR_ROLE は MCP セッションの caller_role（Issue #109 の複数 master
-/// 混線対策）に使われる
-const CODEX_MCP_ENV_VARS: &str =
-    r#"["TAKO_SOCKET","TAKO_TOKEN","TAKO_PANE_ID","TAKO_TAB_ID","TAKO_ORCHESTRATOR_ROLE"]"#;
 
 /// master 起動用のコマンドを組み立てる（master_agent 対応。Issue #127）。
 /// claude の出力は従来の claude 固定実装と同一文字列（完全後方互換）。
@@ -2090,18 +2086,9 @@ pub fn build_master_cmd_in(
                 cmd.push_str(" --dangerously-bypass-approvals-and-sandbox");
             }
             // MCP 接続は起動時の -c 一時注入（~/.codex/config.toml を汚さず、
-            // tako 外で起動した codex にツールを公開しない = FR-2.3.2 と同方針）
-            cmd.push_str(&format!(
-                " -c {}",
-                lc::quote(
-                    dialect,
-                    &format!("mcp_servers.tako.command={}", agent::toml_quote(tako_bin))
-                )
-            ));
-            cmd.push_str(r#" -c 'mcp_servers.tako.args=["mcp","serve"]'"#);
-            cmd.push_str(&format!(
-                " -c 'mcp_servers.tako.env_vars={CODEX_MCP_ENV_VARS}'"
-            ));
+            // tako 外で起動した codex にツールを公開しない = FR-2.3.2 と同方針）。
+            // **worker / git resolve と同じ 1 実装**を通す（#986。片方だけ直る形を作らない）
+            cmd.push_str(&agent::codex_mcp_args(tako_bin, dialect));
             // system prompt は developer_instructions（developer ロールメッセージとして
             // モデル可視プロンプトへ注入されることを codex debug prompt-input で実証済み）。
             // `"$( … )"` はダブルクォート内の部分式展開なので、ファイル内容の $ / " / '
@@ -4672,6 +4659,9 @@ prompt_blocks:
                 allow_sandbox_bypass: launch.allow_sandbox_bypass,
                 remote_control: launch.remote_control,
                 extra_args: &launch.extra_args,
+                // #1013 はモデル / effort の語彙だけを見るので MCP 注入は入れない
+                // （注入そのものは #986 のテストが見る）
+                tako_bin: None,
                 env: &EMPTY_ENV_PLAN,
             },
             crate::launch_cmd::ShellDialect::Posix,

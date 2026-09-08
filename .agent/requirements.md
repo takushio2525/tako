@@ -198,7 +198,21 @@ FR-2.2.7 の環境変数解決のまま（誤ったペインへ副作用を起�
   `claude mcp add --scope user tako -- <tako のパス> mcp serve` を登録すれば、以後は
   どのプロジェクト・どのペインでも設定なしで使える（ブリッジが起動毎に TAKO_* を読むため、
   セッション毎に変わる URL / トークンに依存しない）。tako の外では 0 ツールを返し無害
-- FR-2.3.3: 呼び出し元ペインの特定は stdio = `TAKO_PANE_ID`、HTTP = `X-Tako-Pane` ヘッダ。
+- FR-2.3.2 の worker への適用（#986）: **master だけでなく worker / git resolve でも
+  ゼロコンフィグで繋がる**。codex は MCP 子プロセスへ親環境を渡さない
+  （実測 0.153.0: `env_vars` に挙げた名前だけが届く）ので、起動コマンドへ
+  `-c mcp_servers.tako.command/args/env_vars` を**一時注入**する（正本は
+  `orchestrator::agent::codex_mcp_args` の 1 実装で、master / worker / git resolve が共有）。
+  恒久登録（`tako setup-mcp` = #979）ではなく `-c` なのは、`~/.codex/config.toml` を汚さず
+  **tako の外で起動した codex にツールを出さない**ため。恒久登録がある機でも `-c` が
+  後勝ちするので、登録が古いバイナリを指していても worker は正しいブリッジへ繋がる。
+  claude / agy は親環境をそのまま子へ渡す（agy は実測 1.1.27 で `TAKO_*` 15 個が届く）ので
+  一時注入は不要・agy の CLI にその手段も無い（`agy --help` に `-c` / `--mcp-config` が無い）
+- FR-2.3.3: 呼び出し元ペインの特定は stdio = `TAKO_PANE_ID`、HTTP = `X-Tako-Pane` ヘッダ、
+  **どちらも無いときは pid 祖先辿り**（#986。`tako mcp serve` が `Request::ResolvePane` で
+  アプリに問い、#288 / #567 と同じ 1 実装で backend セッション → ペイン ID を解く）。
+  env が在るときは 1 往復も増やさない（claude 経路は 1 バイトも変わらない）し、
+  接続情報が無いとき（= tako の外）は問い合わせに行かない（FR-2.3.2 の 0 ツールを保つ）。
   pane 省略時のデフォルト対象が呼び出し元（= 同タブ）になる。タブを越える操作は
   ID の明示指定が必要。**ハードなスコープ強制は未実装**（FR-2.3.5 のポリシー制御と併せて後段）
 - FR-2.3.4: 実装済み。localhost バインド + Bearer トークン（IPC と共有）+ Origin 検証。
