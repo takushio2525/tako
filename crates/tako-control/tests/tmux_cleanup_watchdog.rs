@@ -11,6 +11,11 @@
 //!    隔離インスタンスは別ソケットなので本番の掃除を止める理由が無い。判定材料は
 //!    プロセスの有無ではなく**そのソケットの所有者**（`tmux_cleanup::blocker`）である
 //!
+//! 4. **`session_grouped` を「表示中ビューがあるか」の代わりに使う**（#1188）。tmux の
+//!    セッショングループは**メンバーが 1 つになっても残る**ので、`tako tmux open` で 1 度
+//!    取り込んだセッションは以後永久に掃除対象から外れる。判定材料は
+//!    `#{session_group_size}`（= いま仲間がいるか）でなければならない
+//!
 //! ソース走査なので、実装が別の書き方に変わっても「その材料を見ているか」で落ちる。
 
 use std::path::{Path, PathBuf};
@@ -153,5 +158,36 @@ fn 隔離ソケット名の生成はcoreと1実装() {
         src.contains("tmux_cleanup::isolated_socket_name")
             && src.contains("tmux_cleanup::self_test_socket_name"),
         "一括隔離が core のソケット名生成を通っていない"
+    );
+}
+
+/// #1188: 掃除・発見の判定が `session_grouped`（グループに属しているか）ではなく
+/// **メンバー数**を見ていること。ここが戻ると「1 度覗いたセッションは永久に残る」
+#[test]
+fn orphan判定はグループの生死をメンバー数で見る() {
+    let root = workspace_root();
+    let backend = read(&root, "crates/tako-core/src/tmux_backend.rs");
+    let code = code_only(&backend);
+    assert!(
+        !code.contains("grouped != \"0\""),
+        "orphan 判定が session_grouped を「表示中ビューがある」の代わりに使っている（#1188 の再発）"
+    );
+    for f in ["fn find_orphans_with(", "fn cleanup_orphans_with("] {
+        let body = code_only(&block_after(&backend, f));
+        assert!(
+            body.contains("is_orphan"),
+            "{f} が共通の orphan 判定（tmux_cleanup::is_orphan）を通っていない:\n{body}"
+        );
+    }
+    let core = read(&root, "crates/tako-core/src/tmux_cleanup.rs");
+    let body = code_only(&block_after(&core, "pub fn group_has_live_peer("));
+    let checked = without_legacy(&body);
+    assert!(
+        checked.contains("group_size"),
+        "グループの生死をメンバー数で見ていない:\n{body}"
+    );
+    assert!(
+        core.contains("session_group_size"),
+        "list-sessions の書式に #{{session_group_size}} が無い（材料そのものを取っていない）"
     );
 }

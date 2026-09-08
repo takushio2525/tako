@@ -433,50 +433,47 @@ pub fn kill_session(socket: &str, session: &str) {
     let _ = crate::tmux::kill_session(Some(socket), session);
 }
 
-/// orphan セッションの一括クリーンアップ（FR-2.16.11）。backend socket 上の
-/// `tako-` プレフィックス・**detached**・**非 grouped**・`protected` 外のセッションを
-/// kill し、kill した名前を返す。
-///
 /// layout.json に載っていない生存中の `tako-*` セッション（orphan）を返す。
-/// cleanup_orphans と同じ list-sessions を読むが、kill せずに名前一覧だけ返す。
-/// 起動時の自動復帰（#191）で、layout 復元では拾えなかったセッションを発見するのに使う
+/// [`cleanup_orphans`] と**同じ材料・同じ判定**（`tmux_cleanup::is_orphan`）を通すが、
+/// kill せずに名前一覧だけ返す。起動時の自動復帰（#191）で、layout 復元では拾えなかった
+/// セッションを発見するのに使う（表示用ラッパー `tako-view-*` は復帰対象にしない）
 pub fn find_orphans(socket: &str, protected: &std::collections::HashSet<String>) -> Vec<String> {
-    let listing = crate::tmux::run_tmux(
+    find_orphans_with(socket, protected, crate::tmux_cleanup::legacy_1188())
+}
+
+/// `find_orphans` の A/B 用（`legacy` = #1188 前の `session_grouped` 判定）
+pub fn find_orphans_with(
+    socket: &str,
+    protected: &std::collections::HashSet<String>,
+    legacy: bool,
+) -> Vec<String> {
+    use crate::tmux_cleanup::{is_orphan, OrphanPurpose};
+    list_session_rows(socket)
+        .into_iter()
+        .filter(|row| is_orphan(row, protected, OrphanPurpose::Recover, None, 0, legacy))
+        .map(|row| row.name)
+        .collect()
+}
+
+/// `list-sessions` を 1 回引いて行を解く（cleanup / find が同じ材料を見る）
+fn list_session_rows(socket: &str) -> Vec<crate::tmux_cleanup::SessionRow> {
+    crate::tmux::run_tmux(
         Some(socket),
-        &[
-            "list-sessions",
-            "-F",
-            "#{session_name}\t#{session_attached}\t#{session_grouped}",
-        ],
+        &["list-sessions", "-F", crate::tmux_cleanup::LIST_FORMAT],
     )
-    .unwrap_or_default();
-    let mut orphans = Vec::new();
-    for line in listing.lines() {
-        let mut f = line.split('\t');
-        let (Some(name), Some(_attached), Some(grouped)) = (f.next(), f.next(), f.next()) else {
-            continue;
-        };
-        if !name.starts_with("tako-") {
-            continue;
-        }
-        if name.starts_with("tako-view-") {
-            continue;
-        }
-        if grouped != "0" {
-            continue;
-        }
-        if protected.contains(name) {
-            continue;
-        }
-        orphans.push(name.to_string());
-    }
-    orphans
+    .unwrap_or_default()
+    .lines()
+    .filter_map(crate::tmux_cleanup::parse_session_row)
+    .collect()
 }
 
 /// 安全設計（誤爆防止の四重ガード）:
 /// - **attached**（= いずれかのペイン/クライアントが使用中）は決して触らない
-/// - **grouped**（= 表示中ビューの元セッション or その `tako-view-*` ラッパー）も触らない。
-///   生きているビューの足元を崩さないため
+/// - **グループに生きた仲間がいる**（= 表示中ビューの元セッション or その `tako-view-*`
+///   ラッパー）も触らない。生きているビューの足元を崩さないため。判定は
+///   `#{session_group_size}` > 1 で、**`session_grouped` は使わない**（tmux は
+///   メンバーが 1 つになってもグループを消さないので、1 度でも `tako tmux open` した
+///   セッションが永久に掃除対象から外れる = #1188）
 /// - `protected`（現存ペイン・バックグラウンドペインの backend 名、表示中ビューの元/ラッパー名）は二重の安全網
 /// - `min_idle_secs` を指定すると、最終アクティビティ（`session_activity`）がそれより
 ///   新しいセッションも触らない。起動時の自動実行が「直前まで動いていた実行中セッション」を
@@ -492,47 +489,40 @@ pub fn cleanup_orphans(
     protected: &std::collections::HashSet<String>,
     min_idle_secs: Option<u64>,
 ) -> Vec<String> {
-    let listing = crate::tmux::run_tmux(
-        Some(socket),
-        &[
-            "list-sessions",
-            "-F",
-            "#{session_name}\t#{session_attached}\t#{session_grouped}\t#{session_activity}",
-        ],
+    cleanup_orphans_with(
+        socket,
+        protected,
+        min_idle_secs,
+        crate::tmux_cleanup::legacy_1188(),
     )
-    .unwrap_or_default();
+}
+
+/// `cleanup_orphans` の A/B 用（`legacy` = #1188 前の `session_grouped` 判定）
+pub fn cleanup_orphans_with(
+    socket: &str,
+    protected: &std::collections::HashSet<String>,
+    min_idle_secs: Option<u64>,
+    legacy: bool,
+) -> Vec<String> {
+    use crate::tmux_cleanup::{is_orphan, OrphanPurpose};
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let mut killed = Vec::new();
-    for line in listing.lines() {
-        let mut f = line.split('\t');
-        let (Some(name), Some(attached), Some(grouped)) = (f.next(), f.next(), f.next()) else {
+    for row in list_session_rows(socket) {
+        if !is_orphan(
+            &row,
+            protected,
+            OrphanPurpose::Cleanup,
+            min_idle_secs,
+            now,
+            legacy,
+        ) {
             continue;
-        };
-        if !name.starts_with("tako-") {
-            continue; // tako 由来でないものは対象外
         }
-        if attached != "0" {
-            continue; // 使用中
-        }
-        if grouped != "0" {
-            continue; // 表示中ビュー関連（元 or ラッパー）
-        }
-        if protected.contains(name) {
-            continue; // 現存/バックグラウンドペイン・表示中ビューが使用中
-        }
-        if let Some(min_idle) = min_idle_secs {
-            // activity が取れない（古い tmux・パース不能 = 0）場合は「idle 十分」に倒し
-            // 従来挙動（掃除する）へ劣化する
-            let activity: u64 = f.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-            if now.saturating_sub(activity) < min_idle {
-                continue; // 直近までアクティブ = 実行中プロセスの可能性が高い。この回は見送る
-            }
-        }
-        kill_session(socket, name);
-        killed.push(name.to_string());
+        kill_session(socket, &row.name);
+        killed.push(row.name);
     }
     killed
 }
@@ -1027,6 +1017,98 @@ set -gq copy-mode-position-format ''
     /// layout.json から漏れた実行中 worker 相当）は、起動時経路（min_idle_secs 付き）では
     /// kill されず、明示操作（None = 従来挙動）では従来どおり kill される。
     /// 修正前の cleanup（猶予なし相当）ならこのセッションは消えていた
+    /// #1188: `tako tmux open` で 1 度取り込んだセッションが、ビューを閉じた後に
+    /// 掃除対象へ戻ること。実 tmux で「グループは残るがメンバー数は戻る」を踏む
+    #[test]
+    fn issue1188_ビューを閉じた元セッションは掃除対象へ戻る() {
+        if !crate::backend::capabilities().survives_app_exit {
+            eprintln!("skip: tmux が無い環境");
+            return;
+        }
+        let socket = format!("tako-coretest-{}-grouped", std::process::id());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
+        let orig = "tako-grouped-orig";
+        let view = "tako-view-tako-grouped-orig-7";
+        let run = |args: &[&str]| {
+            crate::tmux::tmux_command(Some(&socket))
+                .args(args)
+                .output()
+                .expect("tmux を実行できる")
+        };
+        assert!(
+            run(&[
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                orig,
+                "sleep",
+                "300"
+            ])
+            .status
+            .success(),
+            "元セッションを作れる"
+        );
+        let unprotected: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let row_of = |name: &str| {
+            list_session_rows(&socket)
+                .into_iter()
+                .find(|r| r.name == name)
+                .unwrap_or_else(|| panic!("{name} が list-sessions に無い"))
+        };
+
+        // ① 取り込む前は素の orphan
+        let row = row_of(orig);
+        assert!(!row.grouped_flag && row.group_size.is_none(), "{row:?}");
+
+        // ② ビュー（grouped session）を作ると、元もラッパーも守られる
+        assert!(
+            run(&["new-session", "-d", "-t", orig, "-s", view])
+                .status
+                .success(),
+            "ビューを作れる"
+        );
+        for name in [orig, view] {
+            let row = row_of(name);
+            assert_eq!(row.group_size, Some(2), "{name} のメンバー数: {row:?}");
+        }
+        assert!(
+            cleanup_orphans(&socket, &unprotected, None).is_empty(),
+            "表示中ビューがあるあいだは元もラッパーも kill しない"
+        );
+
+        // ③ ビューを kill すると `grouped` は 1 のままメンバー数だけ 1 に戻る
+        //    （ここが #1188 の本体。旧実装は grouped を見ていたので永久に見送っていた）
+        assert!(
+            run(&["kill-session", "-t", &crate::tmux::exact_target(view)])
+                .status
+                .success()
+        );
+        let row = row_of(orig);
+        assert!(
+            row.grouped_flag,
+            "tmux はメンバーが 1 つでもグループを消さない（前提が崩れたら判定を見直す）: {row:?}"
+        );
+        assert_eq!(row.group_size, Some(1), "メンバー数は戻る: {row:?}");
+
+        // ④ 修正前（legacy）は見送り、修正後は掃除する
+        assert!(
+            cleanup_orphans_with(&socket, &unprotected, None, true).is_empty(),
+            "#1188 の修正前は永久に見送る（A/B の片側）"
+        );
+        assert!(
+            crate::tmux::session_alive(Some(&socket), orig),
+            "legacy アームでは生き残っている"
+        );
+        assert_eq!(
+            cleanup_orphans_with(&socket, &unprotected, None, false),
+            vec![orig.to_string()],
+            "修正後は掃除対象へ戻る"
+        );
+        assert!(!crate::tmux::session_alive(Some(&socket), orig));
+    }
+
     #[test]
     #[cfg(unix)]
     fn cleanup_orphansは直近アクティブなdetachedセッションを猶予する() {

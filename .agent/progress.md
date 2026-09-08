@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-08（#1122: 器つきペインの visual-test カーソルラウンドを実測で切り分けて根治した）
-- 原因 2 つ（見立ての「tmux が描く」は外れ）: 検査側 = 測るあいだミラーが立って表示が tmux 履歴 / 製品側 = `parse_ansi_lines` が履歴行にカーソルを焼いていた
-- 前者は製品と同じ `cancel_scroll_before_input` を通してから書く形へ・後者は `show_cursor=false` へ。器つき 5 通りが直接ペインと同一値（`fill=544 / stray=0`）で緑・**skip 無し**
-- A/B は `TAKO_1122_LEGACY=1` が Issue と同じ `fill=272/0/0/0` で FAILED。全 3578 件緑。次に落ちる `subline` 節（#943 の前提ガード無し）は #1173 へ起票
-
 ## 2026-09-08（#771: 実 claude e2e の待ちを固定窓から負荷追従の予算へ替え、真因を #1175 へ切り出した）
 - 101c の固定 300 秒窓を `wait_for_claude_state`（`state_wait_budget` + 診断 2 行 + `prompt_flow=` + `101c-SCREEN`）へ。
   同型 14 か所（45c / 95c ×11 / 97c ×2 / 101c）を同じ予算へ。番犬 `実claudeの応答を固定窓で待っていない`（待ちがループ末尾にある形を #1153 / #1165 は見逃す）
@@ -90,3 +85,8 @@
 - 旧 c5_gui（1 区間）を捨て、実クリック / 実キー入力で撮る `scene_guimode` と 11 区間の台本（`c5_gui1`〜11）を作った
 - 実収録 5 回で罠を根治: 窓の重なりでクリックが吸われる（#1149 で seed が死亡）/ 押下の前面化でユーザーのキーが流入 / master が run を選ぶ
 - 素材の検査は PII 0 件・15 秒以上の静止 0 件。worker の絵だけ撮り直しが残り（画面ロック待ち）
+
+## 2026-09-09（#1188: tmux open で取り込んだセッションが永久に掃除されない問題を根治）
+- tmux のセッショングループは**メンバーが 1 つになっても残る**（実測 3.6b: ビュー kill 後も `grouped=1` / `size=1`）ので、判定材料を `#{session_group_size}` > 1 へ。行のパースと orphan 判定を `tmux_cleanup`（`LIST_FORMAT` / `is_orphan`）へ出し cleanup と find が 1 実装を見る形に
+- 実測（隔離 + tako-vd）: open 前 `grouped=0 size=` → open 中 `size=2` で cleanup は `killed=[]`（保護）→ close 後 `grouped=1 size=1` で `killed=[tako-blind-4]`
+- A/B `TAKO_1188_LEGACY=1` は Issue と同じ `killed=[]` + 残存を再現。ガードを丸ごと外す注入は表示中ビューの保護が落ちて FAILED（= 消して直したのではない）。番犬 1 本 + 単体 6 本
