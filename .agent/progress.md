@@ -102,3 +102,8 @@
 - 全 47 区間の kana を機械で出して全件読み、誤読 5 件を修正（`3 つ`→みっつ / `1 行`×2 / `空のペイン` / `140 個`）
 - **ユーザー辞書は空白でトークンが割れて当たらない**（実測）ので、合成直前の置換表 `reading-overrides.tsv` を正本に
 - v4 = 9:59 / -14.9 LUFS / TP -1.5 dBTP / PII 0 件。点検は `check-readings.sh --diff`
+
+## 2026-09-09（#1013: codex / agy の spawn に claude 語彙のモデル既定を渡さないようにした）
+- 真因はアカウント（#504）の `default_model` を spawn の明示指定と同じ段へ畳んでいたこと。`AccountDefaults` で段を分け、継承の可否は新 1 マス `worker_model_default_inherit`（claude のみ対応）へ問う形に（#982）。応答に `model_source` / `effort_source` を追加
+- 実 spawn（隔離 + tako-vd）: codex は自分の既定 `gpt-5.6-sol medium` で起動して `OK1013` を返した / agy も `--model` `--effort` なし / claude は `--model claude-opus-5 --effort max` のまま不変
+- A/B `TAKO_1013_LEGACY=1` は Issue と同じ `codex --model claude-opus-5 …` を再現。番犬 3 本 + 単体 7 本。全 3613 件緑

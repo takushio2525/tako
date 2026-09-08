@@ -1538,8 +1538,13 @@ pub fn tools() -> Vec<Value> {
                         "enum": ["claude", "codex", "agy"],
                         "description": "worker のエージェント CLI（省略時はプロファイルの worker_agent → claude）",
                     },
-                    "model": { "type": "string", "description": "worker のモデル（agent のネイティブ表記。省略時はプロファイル設定に従う）" },
-                    "effort": { "type": "string", "description": "thinking / reasoning effort（claude・codex のみ。agy はモデル名に組込みのため無視。省略時はプロファイル設定に従う）" },
+                    "model": { "type": "string", "description": "worker のモデル（agent のネイティブ表記。省略時はプロファイル設定に従う）。\
+                        codex / agy は claude 語彙の既定（アカウントの default_model / プロファイルの worker_model）を\
+                        受け取らないので、worker_agents.<agent>.model が無ければ CLI 既定で起動する（#1013）。\
+                        実際に使う値と出どころは応答の model / model_source に返る" },
+                    "effort": { "type": "string", "description": "thinking / reasoning effort（3 系統とも指定できる。\
+                        claude = --effort / codex = -c model_reasoning_effort= / agy = --effort（low|medium|high のみ。#1002）。\
+                        省略時はプロファイル設定に従う（claude 語彙の既定は claude 以外へ渡らない。#1013）" },
                     "pane": pane_schema("分割元ペイン ID（省略時は呼び出し元。このペインの右に子が生える）。\
                         pane と tab の両方を指定した場合は pane を優先する"),
                     "tab": { "type": "integer", "minimum": 0, "description": "子を出すタブ ID。\

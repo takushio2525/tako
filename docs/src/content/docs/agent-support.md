@@ -16,14 +16,14 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 ## 全体
 
-能力 46 件の内訳です。
+能力 47 件の内訳です。
 
 | エージェント | 対応 | 一部対応 | 未対応 | 対象外 |
 | --- | --- | --- | --- | --- |
-| Claude Code（基準） | 46 / 46 | 0 | 0 | 0 |
-| OpenAI Codex CLI | 28 / 46 | 5 | 11 | 2 |
-| Antigravity CLI | 13 / 46 | 7 | 18 | 8 |
-| Local LLM | 0 / 46 | 0 | 39 | 7 |
+| Claude Code（基準） | 47 / 47 | 0 | 0 | 0 |
+| OpenAI Codex CLI | 28 / 47 | 5 | 11 | 3 |
+| Antigravity CLI | 13 / 47 | 7 | 18 | 9 |
+| Local LLM | 0 / 47 | 0 | 39 | 8 |
 
 ### 状態の意味
 
@@ -90,6 +90,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 | **起動直後の Bypass 確認ダイアログを事前に承諾しておく（#407）**<br />`worker_bypass_preaccept` | 対応 | 未対応 [#983](https://github.com/takushio2525/tako/issues/983)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#983](https://github.com/takushio2525/tako/issues/983)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM のハーネスが決まっていないので可否が定まらない（codex TUI を借りる #990 なら在り、非 TUI 経路の #991 なら無い） | コード本文: dispatch.rs の事前承諾は 2 箇所とも WorkerAgent::Claude を条件にしている。codex / agy は default_skip_permissions() が true なので常に skip 側なのに 事前承諾が無い（棚卸し §1.3(c)） |
 | **thinking / reasoning effort を tako から指定する**<br />`effort_control` | 対応 | 対応 | 対応 | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #1002 の実測（agy 1.1.22）: `--effort（low\|medium\|high）` が --help に実在し、`agy models` が挙げる 6 モデルすべてで不正値が `invalid --effort "bogus" (valid: low, medium, high)` として咎められる = 表示名に "(High)" 等を含むモデルでも --effort の検証が走る。正しい組み合わせは 検証を通り API 呼び出しへ進む。**未知のモデル名のときだけ** `--effort is not supported for model "…"` になる（この文言を「agy は effort 非対応」と 読み違えないこと）。orchestrator/agent.rs は claude = --effort / codex = -c model_reasoning_effort= / agy = --effort へ写像する（旧挙動は TAKO_1002_LEGACY=1） |
 | **アカウント（資格情報）の切替に追従する**<br />`account_switch` | 対応 | 未対応 [#975](https://github.com/takushio2525/tako/issues/975)<br />設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない | 未対応 [#975](https://github.com/takushio2525/tako/issues/975)<br />設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: orchestrator/agent.rs の事前信頼は claude だけ CLAUDE_CONFIG_DIR（#512 / #558）を 見て書き先を決め、codex は ~/.codex/config.toml、agy は ~/.gemini/antigravity-cli/settings.json を固定で開く（同ファイルのコメントが明示） |
+| **claude 語彙で書かれたモデル / effort の既定（プロファイルの worker_model / アカウントの default_model）を worker へ継承する（#1013）**<br />`worker_model_default_inherit` | 対応 | 対象外<br />モデル名はベンダー固有の語彙なので claude 用の既定を渡せない（渡すと存在しないモデル名で起動する）。この系統のモデルは `worker_agents.<agent>.model` か spawn の明示指定で決め、無ければ CLI の既定に委ねる | 対象外<br />モデル名はベンダー固有の語彙なので claude 用の既定を渡せない（渡すと存在しないモデル名で起動する）。この系統のモデルは `worker_agents.<agent>.model` か spawn の明示指定で決め、無ければ CLI の既定に委ねる | 対象外<br />モデル名はベンダー固有の語彙なので claude 用の既定を渡せない（渡すと存在しないモデル名で起動する）。この系統のモデルは `worker_agents.<agent>.model` か spawn の明示指定で決め、無ければ CLI の既定に委ねる | 実測: #1013 の実発生: profile（worker_model: claude-opus-5）+ アカウント（default_model: claude-opus-5）の master が agent=codex・model 省略で spawn した 結果、`codex --model claude-opus-5 …` が組み立てられ、codex がモデル警告の画面で 止まってプロンプトも届かなかった。orchestrator/mod.rs の resolve_agent_launch は claude 以外へ profile の worker_model を渡さない設計だったが、アカウントの default_model が spawn の明示指定と同じ段に混ざっていた |
 
 ## worker の監視
 
