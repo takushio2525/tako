@@ -85,3 +85,8 @@
 - 真因は 2 つ: ①`claude agents --json` のスキャン結果でマップを丸ごと置き換え（+ 子プロセス不在で全消し）ていたので、**再起動直後の数秒**で `layout.json` の `claude_session_id` を全部捨てていた（実測: 復元直後 6 件 → 6 秒後 0 件）②復元だけが独自の最小形 `claude --resume <id>` を組んでいて役割 env / `--model` / `--effort` が落ちていた
 - 保持規則を `tako_core::claude_resume::ResumeIds`（**確認してから外す**）へ、判断とコマンドを `tako_control::sessions::restore_plan`（`resume_command` と共有）へ集約。`persist.log` に「復元の内訳」（役割つき / 役割なし / 新規シェルの理由 3 分類）を 1 行追加
 - 隔離 GUI 実測: 修正後は 76 秒後も 6 件のまま・実会話が resume されて継続（`⏺ repro-1076`）/ A/B `TAKO_1076_LEGACY=1` は同じ layout で 6 秒後 0 件 + `役割つき 0`。再 attach（8 ペイン）に回帰なし。番犬 4 本（修正前ソースで全滅）+ 単体 15 本。全 3766 件緑
+
+## 2026-09-09（#1137: 多重化が無いプラットフォームで無言の SSH 成功が畳まれないのを直した）
+- `pane` 経路 + 多重化なし（Windows）は `master_socket` が常に false で成功の出口が 1 つも無かった。規則 ⑥「**打った行を除いて**中身が出たら畳む」を追加（ゲートは `ConnectInputs::multiplexing` の値 = **macOS は 1 ビットも不変**）
+- 併発の穴（起点の陳腐化）も `ssh_progress::effective_from` で修正。`connecting` は rebase しないので相手が画面を消すと `new_lines` が全部空になっていた
+- A/B: 規則 ⑥ を無効化した注入で `無言の接続成功でも畳む` が FAILED / 打った行の除外を外すと `打った行だけでは畳まない` が FAILED。macOS 実測（隔離 GUI・実 pane 経路）は従来どおり `connecting`→`connected`
