@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-09（#925: 導入計画の権限説明を platform で出し分けた）
-- `InstallPlan` に `platform: Platform` を足し（出どころは `InstallRecipe::platform`）、権限行を純粋関数 `privilege_line(platform)` へ。unix = `sudo（管理者権限）は使いません…` / Windows = `管理者権限は使いません…`
-- `visible_texts()`（計画の表示 + 引き継ぎ指示文）を用意し「Windows に unix 固有語が出ない」を GUI 無しで固定。`to_json` に `platform` を追加
-- A/B `TAKO_925_LEGACY=1` は Issue と同じ `sudo（管理者権限）…` を Windows 構成で出して新テスト 2 本が FAILED。#920 の項目 119（`管理者権限` で見る）は不変
-
 ## 2026-09-09（#1186: resize --reset が実際に window サイズを戻すようにした）
 - `reset_window_size` を `resize-window -A` → `set-window-option -u window-size` の 2 段へ。**順序は逆にできない**（`-A` が window-size を manual にする = 実測）。`-A` 失敗時も解除は行い**エラーはそのまま返す**
 - 真因は「オプション解除はその場でリサイズしない」こと。クライアントがその window を見ているあいだは偶然戻るので、**別 window / クライアント不在**のときだけ症状が出る（実測で切り分け）
@@ -85,3 +80,8 @@
 - codex は spawn の起動コマンドへ `-c mcp_servers.tako.*` を一時注入（正本 `agent::codex_mcp_args` を master / worker / git resolve が共有）。`caller_pane` は `TAKO_PANE_ID` が無ければ **pid 祖先辿り**へ落ちる（`tako mcp serve` → `Request::ResolvePane`）
 - 実測（隔離 GUI + tako-vd / codex-cli 0.153.0 / agy 1.1.27）: 実 worker が `tako_list_panes` を呼び、**pane 省略**の `tako_set_title` が codex=pane2 / agy=pane3 と自分のペインへ当たった。効いている経路は env の指紋で判別（一時注入 5 個 / 恒久登録 4 個）。同時 2 本でも取り違えなし
 - Issue の前提「agy は親 env を渡さない」は**実測で否定**（`TAKO_*` が 15 個届く）ので docs / コメントを訂正。番犬 3 本 + 単体 9 本、A/B は `TAKO_986_LEGACY=1`。全 3775 件緑
+
+## 2026-09-09（#1202: Markdown プレビューが UTF-8 BOM を剥がさず先頭行の見出しを潰す問題を直した）
+- `tako_core::text::strip_bom` を新設し、`runner.rs:131` の既存処理と Markdown パーサ入口（`parse_markdown_blocks`）が 1 実装を共有。プレビュー / チャット / 更新ノート / md_view はここが唯一の入口
+- **剥がすのはパーサへ渡す本文だけ**（編集・保存の生テキストには触らないので BOM 付きファイルは保存しても BOM を保つ）
+- 隔離 GUI 実測: BOM 付き `README.md` の `preview-outline` が BOM 無しと同一（`sample project` level=1 block=0）。A/B 3 アーム（パース / 描画 / 先頭 1 個だけ）が確定 FAILED。全 3769 件緑

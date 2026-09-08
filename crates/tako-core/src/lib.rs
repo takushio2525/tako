@@ -58,6 +58,7 @@ pub mod ssh_reconnect;
 pub mod tab;
 pub mod task_checkpoint;
 pub mod terminal;
+pub mod text;
 pub mod text_block;
 pub mod text_edit;
 pub mod theme;
