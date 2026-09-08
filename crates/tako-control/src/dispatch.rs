@@ -1351,17 +1351,35 @@ fn dispatch_inner(
 
         Request::TmuxSelectWindow { pane, window } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
-            let session = host
-                .backend_session(target)
-                .ok_or_else(|| DispatchError::Operation(format!(
-                    "ペイン {target} にバックエンドセッションがない（tmux 永続化が無効 or 直接 spawn）"
-                )))?;
-            let socket = tako_core::tmux_backend::socket_name();
-            tako_core::tmux::select_window(Some(&socket), &session, window)
-                .map_err(DispatchError::Operation)?;
+            // 取り込みビュー（内側）をバックエンド（外側）より優先する（#1185）。
+            // 素朴に backend_session だけを見ると、取り込みペインでは**別セッション**の
+            // window を切り替えて「成功」を返してしまう
+            let resolved = tako_core::tmux::window_target(
+                host.tmux_view(target).as_ref(),
+                host.backend_session(target).as_deref(),
+            )
+            .ok_or_else(|| {
+                DispatchError::Operation(format!(
+                    "ペイン {target} に tmux セッションがない\
+                     （tmux 永続化が無効 / 直接 spawn / 取り込みビューでもない）"
+                ))
+            })?;
+            tako_core::tmux::select_window(resolved.socket.as_deref(), &resolved.target, window)
+                .map_err(|e| {
+                    DispatchError::Operation(tako_core::tmux::friendly_error(
+                        &format!("window {window} の選択"),
+                        resolved.socket.as_deref(),
+                        &resolved.target,
+                        &e,
+                    ))
+                })?;
             Ok(json!({
                 "pane": target.as_u64(),
-                "session": session,
+                // 論理的なセッション名（取り込みビューなら取り込んだ元セッション）
+                "session": resolved.session,
+                // 実際に select-window を打った相手（取り込みビューは表示用ラッパー）
+                "target": resolved.target,
+                "socket": resolved.socket,
                 "window": window,
             }))
         }
@@ -12449,6 +12467,9 @@ mod tests {
         menu_ops: Vec<crate::protocol::MenuOp>,
         /// ペイン → バックエンド tmux セッション名（#571 の e2e で実セッションを差す）
         backend_sessions: std::collections::HashMap<u64, String>,
+        /// #1185: ペイン → 取り込みビュー（`tako tmux open` の登録先）。
+        /// `track_tmux_view` が入れるので、製品と同じ経路で埋まる
+        tmux_views: std::collections::HashMap<u64, tako_core::TmuxView>,
         /// #549: ウェルカムバナーの表示状態
         welcome_banner: bool,
         /// #600: 入力予測（既定 ON）
@@ -12509,6 +12530,7 @@ mod tests {
                 menu_bar: sample_menu_bar(),
                 menu_ops: Vec::new(),
                 backend_sessions: std::collections::HashMap::new(),
+                tmux_views: std::collections::HashMap::new(),
                 sessions: std::collections::HashMap::new(),
                 tab_cols: None,
                 cleanup_socket: std::cell::RefCell::new(Vec::new()),
@@ -12583,6 +12605,25 @@ mod tests {
     impl TmuxHost for MockHost {
         fn backend_session(&self, pane: PaneId) -> Option<String> {
             self.backend_sessions.get(&pane.as_u64()).cloned()
+        }
+        fn tmux_view(&self, pane: PaneId) -> Option<tako_core::TmuxView> {
+            self.tmux_views.get(&pane.as_u64()).cloned()
+        }
+        fn track_tmux_view(
+            &mut self,
+            pane: PaneId,
+            session: String,
+            wrapper: Option<String>,
+            socket: Option<String>,
+        ) {
+            self.tmux_views.insert(
+                pane.as_u64(),
+                tako_core::TmuxView {
+                    session,
+                    wrapper,
+                    socket,
+                },
+            );
         }
         /// #1187: 受け取ったソケットを記録し、仕込んだ結果を返す
         fn cleanup_orphan_tmux(
@@ -15189,6 +15230,154 @@ mod tests {
         // 分割もセッション起動も起きていない
         assert_eq!(host.ws.active_tab().tree().len(), 1);
         assert!(host.attached.is_empty());
+    }
+
+    /// #1185 の e2e。実 tmux で「3 window の自前セッションを取り込んだペイン」を作り、
+    /// `select-window` が**内側**（取り込んだセッションの表示用ラッパー）へ届くことを
+    /// tmux 側の `window_active` で実測する。外側の backend セッションを対象にしていた
+    /// 旧実装では、この経路は別サーバー（`socket_name()`）を見て失敗するか、
+    /// 無関係なセッションの window を切り替えて「成功」を返していた
+    #[test]
+    #[cfg(unix)]
+    fn issue1185_取り込みビューのselect_windowが内側へ届く() {
+        if !tako_core::tmux::version_announcement()
+            .is_some_and(tako_core::tmux::announces_only_tmux)
+        {
+            eprintln!("skip: 本物の tmux が無い（grouped session と完全一致ターゲットが前提）");
+            return;
+        }
+        let socket = format!("tako-e2e-1185-{}", std::process::id());
+
+        struct Guard(String);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = tako_core::tmux::tmux_command(Some(&self.0))
+                    .arg("kill-server")
+                    .output();
+            }
+        }
+        let _guard = Guard(socket.clone());
+
+        let tmux = |args: &[&str]| {
+            tako_core::tmux::tmux_command(Some(&socket))
+                .args(args)
+                .output()
+                .expect("tmux を実行できる")
+        };
+        // アクティブ window の実測（`display-message -p` はクライアント不在だと
+        // 空を返すので list-windows で採る。#1185 の検証で実測）
+        let active = |session: &str| -> Option<u32> {
+            let out = tmux(&[
+                "list-windows",
+                "-t",
+                &tako_core::tmux::exact_target(session),
+                "-F",
+                "#{window_index}:#{window_active}",
+            ]);
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .find_map(|line| line.strip_suffix(":1")?.parse().ok())
+        };
+
+        // ユーザー自前の 3 window セッション（`tako tmux open` の主用途）
+        assert!(
+            tmux(&[
+                "new-session",
+                "-d",
+                "-s",
+                "mywork",
+                "-n",
+                "editor",
+                "-x",
+                "100",
+                "-y",
+                "40"
+            ])
+            .status
+            .success(),
+            "tmux new-session が失敗した"
+        );
+        for name in ["server", "tests"] {
+            tmux(&[
+                "new-window",
+                "-d",
+                "-t",
+                &tako_core::tmux::exact_target("mywork"),
+                "-n",
+                name,
+            ]);
+        }
+        // TmuxOpen が作るのと同じ表示用ラッパー（grouped session）
+        let wrapper = "tako-view-mywork-9";
+        assert!(
+            tmux(&[
+                "new-session",
+                "-d",
+                "-t",
+                &tako_core::tmux::exact_target("mywork"),
+                "-s",
+                wrapper,
+            ])
+            .status
+            .success(),
+            "tmux new-session -t（grouped ラッパー）が失敗した"
+        );
+        assert_eq!(active("mywork"), Some(0), "元セッションの前提");
+        assert_eq!(active(wrapper), Some(0), "ラッパーの前提");
+
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        // 二重ネストの再現: 外側 = tako のバックエンド / 内側 = 取り込んだビュー
+        host.backend_sessions
+            .insert(pane, "tako-outer-decoy".into());
+        host.track_tmux_view(
+            PaneId::from_raw(pane),
+            "mywork".into(),
+            Some(wrapper.into()),
+            Some(socket.clone()),
+        );
+
+        let result = dispatch(
+            &mut host,
+            Request::TmuxSelectWindow {
+                pane: Some(pane),
+                window: 1,
+            },
+            PaneOrigin::Cli,
+        )
+        .expect("取り込みビューの window 切替は成功する");
+        assert_eq!(result["target"].as_str(), Some(wrapper), "対象が内側でない");
+        assert_eq!(result["session"].as_str(), Some("mywork"));
+        assert_eq!(result["socket"].as_str(), Some(socket.as_str()));
+
+        // 実測: ラッパーだけが window 1 へ動き、元セッション（親クライアントの表示）は無傷
+        assert_eq!(
+            active(wrapper),
+            Some(1),
+            "内側の window が切り替わっていない"
+        );
+        assert_eq!(active("mywork"), Some(0), "元セッションを巻き込んでいる");
+
+        // 存在しない window 番号は成功を返さず、日本語でソケットパスを出さずに落ちる
+        let err = dispatch(
+            &mut host,
+            Request::TmuxSelectWindow {
+                pane: Some(pane),
+                window: 9,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        let DispatchError::Operation(message) = err else {
+            panic!("Operation エラーでない: {err:?}");
+        };
+        assert!(message.contains("window 9 の選択に失敗した"), "{message}");
+        assert!(message.contains(wrapper), "{message}");
+        assert!(
+            !message.contains('/'),
+            "ソケットパスが露出している: {message}"
+        );
+        assert_eq!(active(wrapper), Some(1), "失敗したのに動いている");
     }
 
     #[test]

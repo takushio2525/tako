@@ -180,6 +180,72 @@ pub struct TmuxSession {
     pub last_activity: i64,
 }
 
+/// `tako tmux open` で取り込んだビューペイン（FR-2.16.10）が指している tmux（#1185）。
+/// 取り込みペインは「**外側** = tako 自身のバックエンドセッション」と
+/// 「**内側** = 取り込んだセッション」の二重ネストで、ユーザーが画面で見ているのは内側。
+/// window 操作の対象はこちらでなければならない
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxView {
+    /// 監視・再 attach 対象の**元セッション**名（ラッパー名は入れない）。
+    /// これが消滅したらペインを自動クローズする
+    pub session: String,
+    /// 表示用ラッパー（`tako-view-*` grouped session）名。ペイン close 時にこれを kill する。
+    /// `None` = 元セッションを直接 attach した（復帰経路）ので close 時も kill しない
+    pub wrapper: Option<String>,
+    /// 元セッションが居る tmux サーバーの socket（`-L` 値。既定サーバーは `None`）
+    pub socket: Option<String>,
+}
+
+impl TmuxView {
+    /// そのペインが実際に attach しているセッション名。grouped ラッパーは元と同じ
+    /// window 群を共有しつつ**表示 window だけが独立**なので、window 操作は必ず
+    /// こちらへ向ける（元へ向けると親クライアントの表示まで巻き込む。実測 #1185）
+    pub fn attached_session(&self) -> &str {
+        self.wrapper.as_deref().unwrap_or(&self.session)
+    }
+}
+
+/// window 操作（`select_window`）の対象（#1185）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowTarget {
+    /// 対象 tmux サーバーの socket（`-L` 値。既定サーバーは `None`）
+    pub socket: Option<String>,
+    /// 論理的なセッション名（取り込みビューなら取り込んだ元セッション）。応答用
+    pub session: String,
+    /// 実際に tmux の `-t` へ渡すセッション名（取り込みビューは表示用ラッパー）
+    pub target: String,
+}
+
+/// ペインの window 操作の対象を決める（#1185）。
+/// **取り込みビューをバックエンドより優先する**のが要点。ビューペインには外側の
+/// バックエンドセッションも紐づいているため、素朴に `backend_session` だけを見ると
+/// 「別セッションの window を切り替えて成功を返す」ことになる（#1185 の症状）。
+/// どちらも無い（tmux 永続化 OFF / 直接 spawn）なら `None`
+pub fn window_target(view: Option<&TmuxView>, backend: Option<&str>) -> Option<WindowTarget> {
+    // A/B 計測用（#1185）: `TAKO_1185_LEGACY=1` で旧経路（取り込みビューを見ず
+    // バックエンド決め打ち）へ戻す。`TAKO_1185_INJECT=original` は回帰注入で、
+    // ラッパーではなく元セッションを対象にする（grouped の独立表示が壊れる）
+    let legacy = std::env::var("TAKO_1185_LEGACY").as_deref() == Ok("1");
+    let inject_original = std::env::var("TAKO_1185_INJECT").as_deref() == Ok("original");
+    if let Some(view) = view.filter(|_| !legacy) {
+        return Some(WindowTarget {
+            socket: view.socket.clone(),
+            session: view.session.clone(),
+            target: if inject_original {
+                view.session.clone()
+            } else {
+                view.attached_session().to_string()
+            },
+        });
+    }
+    let backend = backend?;
+    Some(WindowTarget {
+        socket: Some(crate::tmux_backend::socket_name()),
+        session: backend.to_string(),
+        target: backend.to_string(),
+    })
+}
+
 /// 対象 tmux サーバー。`None` は既定サーバー、`Some(name)` は `tmux -L <name>`
 /// （セルフテストの隔離や複数サーバー運用に使う）
 pub fn list_sessions(socket: Option<&str>) -> Vec<TmuxSession> {
@@ -355,7 +421,10 @@ pub fn reset_window_size(socket: Option<&str>, session: &str, window: u32) -> Re
     .map(|_| ())
 }
 
-/// アクティブ window を切り替える（`session:index` 指定）
+/// アクティブ window を切り替える（`session:index` 指定）。
+/// `session` には**そのクライアントが実際に attach しているセッション**を渡すこと
+/// （取り込みビューは `tako-view-*` ラッパー）。grouped ラッパーは元と window 群を
+/// 共有しつつ表示 window だけが独立するので、元へ向けると親の表示を巻き込む（#1185）
 pub fn select_window(socket: Option<&str>, session: &str, index: u32) -> Result<(), String> {
     run_tmux(
         socket,
@@ -366,6 +435,64 @@ pub fn select_window(socket: Option<&str>, session: &str, index: u32) -> Result<
         ],
     )
     .map(|_| ())
+}
+
+/// tmux サーバーの呼び名（エラー文面・診断用）。**ソケットの絶対パスは出さない**
+/// （`/private/tmp/tmux-<uid>/default` のような実パスの露出は #927 の方針に反する）
+pub fn socket_label(socket: Option<&str>) -> String {
+    match socket {
+        Some(name) => format!("socket: {name}"),
+        None => "既定サーバー".to_string(),
+    }
+}
+
+/// 絶対パスらしいトークンを伏せる（ソケットパス・ホームパスを応答へ出さない。#927 / #1190）
+fn scrub_paths(raw: &str) -> String {
+    raw.split_whitespace()
+        .map(|token| {
+            let bare = token.trim_start_matches('(').trim_end_matches(')');
+            if bare.starts_with('/') || bare.starts_with("\\\\") || bare.contains(":\\") {
+                "<path>"
+            } else {
+                token
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// tmux の生 stderr を tako の規約に沿った日本語へ包む（#1185 / #1190）。
+/// 生のまま返すと (1) 英語のまま (2) `error connecting to /private/tmp/tmux-<uid>/default`
+/// のようにソケットの絶対パスが露出する (3) どのサーバー・どのセッションの話か
+/// 分からない、の 3 点で規約に反する。
+/// `action` は「何をしようとしたか」を日本語で渡す（例: `window 3 の選択`）
+pub fn friendly_error(action: &str, socket: Option<&str>, session: &str, raw: &str) -> String {
+    let server = socket_label(socket);
+    let lower = raw.to_ascii_lowercase();
+    let cause = if lower.contains("no server running") || lower.contains("error connecting to") {
+        format!("tmux サーバー（{server}）が動いていない")
+    } else if lower.contains("can't find session") || lower.contains("session not found") {
+        format!("tmux セッション {session} が {server} に無い")
+    } else if lower.contains("can't find window") {
+        format!("その window が tmux セッション {session}（{server}）に無い")
+    } else if lower.contains("no such file or directory") {
+        format!("tmux サーバー（{server}）へ接続できない")
+    } else if raw.trim().is_empty() {
+        format!("tmux が理由を返さずに失敗した（{server}）")
+    } else {
+        format!("tmux が失敗した（{server}）: {}", scrub_paths(raw))
+    };
+    // 半角英数で終わる action は「killに」と詰まって読めないので 1 マス空ける
+    let joiner = if action
+        .chars()
+        .last()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+    {
+        " "
+    } else {
+        ""
+    };
+    format!("{action}{joiner}に失敗した: {cause}。対象は `tako tmux list` で確認すること")
 }
 
 /// 特定 window のペイン内容をテキストとして取得する（ホバープレビュー用）。
@@ -734,6 +861,89 @@ fn parse_sessions(sessions: &str, windows: &str, clients: &str) -> Vec<TmuxSessi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn view(session: &str, wrapper: Option<&str>, socket: Option<&str>) -> TmuxView {
+        TmuxView {
+            session: session.into(),
+            wrapper: wrapper.map(Into::into),
+            socket: socket.map(Into::into),
+        }
+    }
+
+    /// #1185: 取り込みビューの window 操作は**内側**（表示用ラッパー）へ向く。
+    /// 外側のバックエンドセッションが同時にあっても、そちらは対象にしない
+    #[test]
+    fn 取り込みビューのwindow対象はラッパー側() {
+        let v = view("mywork", Some("tako-view-mywork-9"), Some("usersock"));
+        let t = window_target(Some(&v), Some("tako-273ea18b4460")).expect("対象が決まる");
+        assert_eq!(t.target, "tako-view-mywork-9");
+        assert_eq!(t.session, "mywork");
+        assert_eq!(t.socket.as_deref(), Some("usersock"));
+    }
+
+    /// 復帰経路（`tako-view-*` を開き直した場合）はラッパーを作らず元へ直接 attach
+    /// しているので、対象も元セッションそのもの
+    #[test]
+    fn ラッパー無しのビューは元セッションが対象() {
+        let v = view("master-tako", None, None);
+        let t = window_target(Some(&v), Some("tako-abc")).expect("対象が決まる");
+        assert_eq!(t.target, "master-tako");
+        assert_eq!(t.session, "master-tako");
+        assert_eq!(t.socket, None, "既定サーバーの取り込みは socket なし");
+    }
+
+    /// ビューでないペインは従来どおりバックエンドセッション + バックエンド socket
+    #[test]
+    fn 直接ペインはバックエンドセッションが対象() {
+        let t = window_target(None, Some("tako-abc")).expect("対象が決まる");
+        assert_eq!(t.target, "tako-abc");
+        assert_eq!(t.session, "tako-abc");
+        assert_eq!(t.socket, Some(crate::tmux_backend::socket_name()));
+    }
+
+    /// どちらも無い（tmux 永続化 OFF / 直接 spawn）なら対象なし = 呼び出し側がエラーにする
+    #[test]
+    fn 器の無いペインは対象なし() {
+        assert_eq!(window_target(None, None), None);
+    }
+
+    /// #1190: 生の tmux エラーを日本語へ包み、ソケットの絶対パスを出さない
+    #[test]
+    fn tmuxの生エラーを日本語へ包む() {
+        let msg = friendly_error(
+            "window 4 の kill",
+            Some("tkrev0909"),
+            "tako-02695e295bb1",
+            "error connecting to /private/tmp/tmux-501/default (No such file or directory)",
+        );
+        assert!(msg.contains("window 4 の kill に失敗した"), "{msg}");
+        assert!(msg.contains("動いていない"), "{msg}");
+        assert!(msg.contains("socket: tkrev0909"), "{msg}");
+        assert!(
+            !msg.contains('/'),
+            "ソケットの絶対パスが露出している: {msg}"
+        );
+
+        let msg = friendly_error("window 9 の選択", None, "mywork", "can't find window: 9");
+        assert!(msg.contains("window 9 の選択に失敗した"), "詰め方: {msg}");
+        assert!(msg.contains("window が tmux セッション mywork"), "{msg}");
+        assert!(msg.contains("既定サーバー"), "{msg}");
+
+        let msg = friendly_error("kill", Some("s"), "x", "can't find session: x");
+        assert!(
+            msg.contains("tmux セッション x が socket: s に無い"),
+            "{msg}"
+        );
+
+        // 未知の文面は素通しするが、パスらしいトークンだけは伏せる
+        let msg = friendly_error("resize", None, "x", "lost server /tmp/tmux-0/x oops");
+        assert!(msg.contains("lost server <path> oops"), "{msg}");
+        assert!(!msg.contains("/tmp/"), "{msg}");
+
+        // 理由が空でも「成功」に見える文面にはしない
+        let msg = friendly_error("resize", None, "x", "   ");
+        assert!(msg.contains("失敗した"), "{msg}");
+    }
 
     /// 本物の tmux は `-V` で tmux しか名乗らない（macOS / Linux の実出力）
     #[test]

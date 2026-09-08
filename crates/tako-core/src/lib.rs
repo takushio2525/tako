@@ -111,7 +111,7 @@ pub use terminal::{
 };
 pub use text_edit::{CursorMovement, SearchHit, TextBuffer, TextEditError};
 pub use theme::{Rgb, Theme};
-pub use tmux::{TmuxSession, TmuxWindow};
+pub use tmux::{TmuxSession, TmuxView, TmuxWindow};
 pub use ui_mode::{pane_display, PaneDisplay, PaneDisplayInput, StarterAction, UiMode};
 pub use workspace::{BackgroundPane, WindowId, Workspace, WorkspaceError, WorkspaceWindow};
 

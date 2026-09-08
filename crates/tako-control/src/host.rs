@@ -133,6 +133,13 @@ pub trait TmuxHost {
     fn backend_windows(&self, _pane: PaneId) -> Option<Vec<tako_core::TmuxWindow>> {
         None
     }
+    /// `tako tmux open` で取り込んだビューペインが指している tmux（#1185）。
+    /// window 操作は **`backend_session` より優先**してこれを見る。取り込みペインは
+    /// 「外側 = tako のバックエンドセッション」「内側 = 取り込んだセッション」の
+    /// 二重ネストで、ユーザーが画面で見ている window は内側にある
+    fn tmux_view(&self, _pane: PaneId) -> Option<tako_core::TmuxView> {
+        None
+    }
     /// TmuxOpen ペインの監視対象を登録する。`session` は監視・再 attach 対象の
     /// **元セッション**（ラッパー名は入れない）。`wrapper` は表示用の `tako-view-*`
     /// grouped session 名で、ペイン close 時に kill する（`None` = 元セッションを直接
