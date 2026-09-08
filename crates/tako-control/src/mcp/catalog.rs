@@ -2796,31 +2796,41 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_setup_bootstrap",
-            "description": "エージェント CLI（Claude Code）のゼロスタート導入を確認・実行する（Issue #868）。\
-                **claude が入っていない環境で `tako setup` を通すための前段**。\
+            "description": "エージェント CLI（claude / codex / agy）のゼロスタート導入を確認・実行する（Issue #868 / #989）。\
+                **その CLI が入っていない環境で `tako setup` を通すための前段**。\
+                agent で対象の系統を選ぶ（省略時は claude）。\
                 action=status（既定・読み取り専用）は「次に何をすべきか」を next_step で返す\
                 （install = 未導入 / path = PATH に無い / auth = 未ログイン / ready = 導入済み）。\
-                install_plan には「何をどこに入れるか」（公式コマンド・取得元・置き場所・\
-                自動更新の有無）が入るので、実行前に必ずユーザーへ提示すること。\
-                action=install で公式インストーラ（macOS は curl -fsSL https://claude.ai/install.sh | bash、\
-                Windows は irm https://claude.ai/install.ps1 | iex 相当）を実行する。\
+                action=status-all（読み取り専用）は 3 系統ぶんをまとめて返すので、\
+                「どれが使える状態か」を 1 回で把握できる。\
+                install_plan には「何をどこに入れるか」（製品名・公式コマンド・取得元・置き場所・\
+                以後の更新のされ方）が入るので、実行前に必ずユーザーへ提示すること。\
+                action=install で公式インストーラを実行する\
+                （claude = https://claude.ai/install.sh、codex = https://chatgpt.com/codex/install.sh、\
+                agy = https://antigravity.google/cli/install.sh。Windows は各 install.ps1 相当）。\
                 dry_run=true なら実行せず計画だけ返す。\
+                **Windows で代行できるのは claude だけ**（codex / agy は can_run=false = 状態照会と案内まで。#525）。\
                 action=path でランチャーの置き場所を「新しく開いたターミナルが見る PATH」へ通す（冪等。\
                 unix はログインシェルの profile、Windows はユーザー環境変数 Path）。\
                 action=undo-path で置いた設定を取り除く。\
                 action=handoff（読み取り専用）は**自動導入が通らなかったときの引き継ぎ計画**を返す（#1057）。\
-                導入済みの別系統 CLI（codex / agy）が居れば candidates と prompt が入るので、\
+                対象以外で導入済みの系統が居れば candidates と prompt が入るので、\
                 tako_orchestrator_spawn / tako_run でその CLI へ prompt を渡して代行させる。\
                 available=false なら fallback の案内（公式コマンド）をユーザーへ提示する。\
-                認証（auth）はブラウザ操作を伴うため自動化せず、ユーザーに \
-                `claude auth login` の実行を案内すること。",
+                認証（auth）はブラウザ操作を伴うため自動化せず、その系統のログインコマンド\
+                （claude auth login / codex login / 引数なしの agy）の実行をユーザーへ案内すること。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["status", "install", "path", "undo-path", "handoff"],
+                        "enum": ["status", "status-all", "install", "path", "undo-path", "handoff"],
                         "description": "操作種別（省略時は status）",
+                    },
+                    "agent": {
+                        "type": "string",
+                        "enum": ["claude", "codex", "agy"],
+                        "description": "対象のエージェント CLI（省略時は claude）。action=status-all では無視される",
                     },
                     "dry_run": {
                         "type": "boolean",

@@ -16,8 +16,8 @@ tako platform --status pending      # まだ使えないものだけ
 
 | 状態 | 件数 | 意味 |
 | --- | --- | --- |
-| 対応 | 117 / 146（80%） | macOS と同じように使えます |
-| 一部対応 | 13 | 使えますが機能が落ちます。落ち方は各表の「差分」列 |
+| 対応 | 116 / 146（79%） | macOS と同じように使えます |
+| 一部対応 | 14 | 使えますが機能が落ちます。落ち方は各表の「差分」列 |
 | 未実測 | 1 | 実装はあり macOS と同じ経路を通るが、Windows 実機でまだ動かしていないもの |
 | 未対応 | 13 | Windows 側の実装が無い、または動かないことが分かっているもの |
 | 対象外 | 2 | Windows にその概念が無い、または OS が同等機能を標準で持つ |
@@ -205,12 +205,12 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 
 ## セットアップと設定
 
-対応 11・一部対応 1・未対応 / 未実測 1
+対応 10・一部対応 2・未対応 / 未実測 1
 
 | 機能 | 状態 | 差分 | 根拠 |
 | --- | --- | --- | --- |
 | `tako_setup` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako setup --check` が claude（未認証）/ psmux / git / tailscale / スリープ防止 / MCP 未登録を正しく列挙し、`--changes --json` が revision 17 と未適用一覧を返す。対話の通し（エージェント起動）は実機の claude が未認証のため未実測 |
-| `tako_setup_bootstrap` | 対応 | — | 実機実測: #1057 の Windows 11 実測: 隔離 USERPROFILE + PATH 剥ぎで `tako setup` が install（install.ps1 を -ExecutionPolicy Bypass -File で実行）→ path（ユーザー環境変数 Path へ追記・undo-path で完全復帰）→ auth 誘導 まで到達。2 回目は無言で素通り |
+| `tako_setup_bootstrap` | 一部対応 | 3 系統とも状態照会と公式手順の案内はできるが、導入の実行代行は claude だけ（#1057 で実機実測）。codex / agy の install.ps1 は実在するが未実測なので代行せずコマンドを案内する（実行代行は #525 の範囲） | 実機実測: #1057 の Windows 11 実測: 隔離 USERPROFILE + PATH 剥ぎで `tako setup` が install（install.ps1 を -ExecutionPolicy Bypass -File で実行）→ path（ユーザー環境変数 Path へ追記・undo-path で完全復帰）→ auth 誘導 まで到達。2 回目は無言で素通り。#989 で足した codex / agy は recipe の tako_can_run=false（状態照会・PATH・認証誘導は動くが install は代行しない） |
 | `tako_setup_changes` | 対応 | — | 実機テスト: changes.yaml の連番・platforms 絞り込みテストが実機で緑（#525 が platforms: を最初に使う） |
 | `tako_setup_deps` | 一部対応 | 依存の検出はできるが、導入の実行代行は macOS（Homebrew）だけ。Windows は winget のコマンドを案内する | 実機実測: #1057 の Windows 11 実測: `tako setup deps` が器（psmux）/ git / tailscale を実際の解決結果つきで列挙し、install は winget を代行せず not_delegable で理由 + コマンドを返す |
 | `tako_setup_mcp` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako setup-mcp` が claude の設定（スクラッチ HOME 側）へ tako を登録し旧内容を backups へ退避する。別途、実 HOME の登録に対して `claude mcp list` が `tako.exe mcp serve` を Connected と健康判定したので、stdio ブリッジ自体も Windows で通る |

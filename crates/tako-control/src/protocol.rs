@@ -1220,13 +1220,17 @@ pub enum Request {
     /// 適用済みリビジョン・現在リビジョン・未適用の setup 関連変更の一覧を返す。
     /// 適用自体は `tako setup`（自動適用、個別見直しは --review）が行い、これは読み取り専用
     SetupChanges,
-    /// ゼロスタート導入の状態照会と実行（Issue #868 / #1057）。
-    /// `action` = "status"（既定・読み取り専用）/ "install"（エージェント CLI の導入）/
+    /// ゼロスタート導入の状態照会と実行（Issue #868 / #1057 / #989）。
+    /// `action` = "status"（既定・読み取り専用）/ "status-all"（3 系統ぶんを一度に。
+    /// **読み取り専用**）/ "install"（エージェント CLI の導入）/
     /// "path"（ランチャーを PATH へ通す）/ "undo-path"（置いた PATH ブロックを取り除く）/
     /// "handoff"（自動導入が通らないときの引き継ぎ計画。**読み取り専用**）
     SetupBootstrap {
         #[serde(default)]
         action: Option<String>,
+        /// 対象のエージェント CLI（claude / codex / agy）。省略で claude（#989）
+        #[serde(default)]
+        agent: Option<String>,
         /// install で実行せず計画だけ返す
         #[serde(default)]
         dry_run: Option<bool>,
@@ -2008,6 +2012,7 @@ mod tests {
         assert_eq!(
             Request::SetupBootstrap {
                 action: None,
+                agent: None,
                 dry_run: None,
                 reason: None,
             }
