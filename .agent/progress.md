@@ -109,3 +109,5 @@
   1 関数 135〜828 KiB（製品の描画経路も含む）で、Windows/MSVC の既定 1 MiB を食い潰していた
 - `build.rs` 2 本が `cargo:rustc-link-arg=/stack:8388608` を宣言（正は `platform::stack`。Zed も同型）+
   セルフテストが起動直後に実測して足りなければ項目 80 前に FAILED（沈黙の死を診断可能な失敗へ）
+- 実機は素の debug ビルドで**項目 80 を 2/2 通過**（完走は別件の負荷依存で項目 105 / 143 まで）。
+  A/B は同一 exe に `editbin /STACK:` を当てる形で 1 MiB=クラッシュ / 2 MiB=通過 / 8 MiB=通過
