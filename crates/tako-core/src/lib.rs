@@ -61,6 +61,7 @@ pub mod text_edit;
 pub mod theme;
 pub mod tmux;
 pub mod tmux_backend;
+pub mod tmux_cleanup;
 pub mod ui_mode;
 pub mod workspace;
 

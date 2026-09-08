@@ -146,10 +146,19 @@ pub trait TmuxHost {
     ) {
     }
     /// orphan tmux セッションの一括クリーンアップ（FR-2.16.11）。実装側が現存ペイン・
-    /// バックグラウンドペイン・表示中ビューを protected として除外し、backend socket 上の取り残し
-    /// セッションを kill する。kill した名前を返す
-    fn cleanup_orphan_tmux(&self) -> Vec<String> {
-        Vec::new()
+    /// バックグラウンドペイン・表示中ビューを protected として除外し、対象 socket 上の取り残し
+    /// セッションを kill する。
+    ///
+    /// `socket` は対象の tmux サーバー名（`None` = 自分の backend サーバー。#1187 まで
+    /// 引数が捨てられていた）。戻り値は kill した名前**と見送った理由**
+    /// （`killed` が空でも「対象が無かった」と「見送った」を区別できる）
+    fn cleanup_orphan_tmux(&self, socket: Option<&str>) -> tako_core::tmux_cleanup::CleanupReport {
+        tako_core::tmux_cleanup::CleanupReport::killed(
+            socket
+                .map(str::to_string)
+                .unwrap_or_else(tako_core::tmux_backend::socket_name),
+            Vec::new(),
+        )
     }
     /// サイドバー tmux ビューでタブ枠が折りたたまれているか（FR-2.16.14）
     fn tmux_tab_collapsed(&self, _tab: TabId) -> bool {

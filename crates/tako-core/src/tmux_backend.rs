@@ -24,13 +24,22 @@ use crate::terminal::{SpawnCommand, SpawnOptions};
 /// 判定する目印（ソケット名も同じ接頭辞）なので変更時はスクリプト側も揃えること
 pub const SESSION_PREFIX: &str = "tako-";
 
+/// backend ソケット名を差し替える環境変数（セルフテスト・隔離起動の一括隔離が使う）
+pub const SOCKET_ENV: &str = "TAKO_TMUX_SOCKET";
+
+/// 既定の backend ソケット名（`TAKO_TMUX_SOCKET` 未指定時）
+pub const DEFAULT_SOCKET: &str = "tako";
+
 /// 専用 tmux サーバーのソケット名（`tmux -L`）。ユーザーの既定サーバーと分離する。
-/// `TAKO_TMUX_SOCKET` で差し替え可能（セルフテストの隔離に使う）
+/// `TAKO_TMUX_SOCKET` で差し替え可能（セルフテストの隔離に使う）。
+///
+/// **他プロセスのソケット名は [`crate::tmux_cleanup::resolve_socket_name`] が復元する**
+/// （こちらは自分の環境だけを見る。CLI プロセスで隔離名へ化けないため）
 pub fn socket_name() -> String {
-    std::env::var("TAKO_TMUX_SOCKET")
+    std::env::var(SOCKET_ENV)
         .ok()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "tako".into())
+        .unwrap_or_else(|| DEFAULT_SOCKET.into())
 }
 
 /// tmux バイナリが実在して動くか（`tmux -V` が成功するか）。プロセス内でキャッシュする。
