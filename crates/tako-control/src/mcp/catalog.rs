@@ -214,12 +214,15 @@ pub fn tools() -> Vec<Value> {
                 pane を direction（省略時は右）へ分割した新ペインで attach クライアントを\
                 起動する。管理外・kill 漏れセッション（tako_tmux_list で発見したもの）の\
                 中身をユーザーに見せる・自分で確認するときに使う。\
-                新ペインを閉じてもセッション側は終了しない（kill ではない）。",
+                新ペインを閉じてもセッション側は終了しない（kill ではない）。\
+                複数 window を持つセッションは window で最初に見せる window を指定でき、\
+                取り込んだあとの切替は tako_tmux_select_window で行う。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session": { "type": "string", "description": "対象セッション名（必須。tako_tmux_list の name）" },
                     "socket": { "type": "string", "description": "tmux サーバー名（tmux -L 相当。tako_tmux_list の socket をそのまま渡す）" },
+                    "window": { "type": "integer", "minimum": 0, "description": "取り込み直後に表示する window index（省略時はセッションの現在 window）" },
                     "pane": pane_schema("分割の基準ペイン ID（省略時は呼び出し元の隣に生える）"),
                     "direction": {
                         "type": "string",
@@ -234,10 +237,14 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_tmux_cleanup",
             "description": "取り残された orphan tmux セッションを一括クリーンアップする。\
-                tako バックエンドサーバー上の detached・非 grouped・未使用の tako- セッション\
-                （前回クラッシュ等で残った裸のバックエンドセッション）だけを kill し、kill した\
-                名前を返す。**使用中（attached）・表示中ビュー・ユーザーの実セッションには\
-                一切触れない**ため tako_tmux_kill より安全。消し忘れ掃除の定型操作に使う。",
+                対象サーバー上の detached・非 grouped・未使用の tako- セッション\
+                （前回クラッシュ等で残った裸のバックエンドセッション）だけを kill し、\
+                {socket, killed, skipped, detail} を返す。**使用中（attached）・表示中ビュー・\
+                ユーザーの実セッションには一切触れない**ため tako_tmux_kill より安全。\
+                掃除しなかったときは skipped に理由コードが入る（peer_shares_socket = \
+                同じ tmux ソケットを使う別の tako-app が生きているので見送った / \
+                persist_disabled / secondary 等）。killed が空でも「対象が無かった」と\
+                「見送った」を区別できる。消し忘れ掃除の定型操作に使う。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -248,9 +255,10 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_tmux_select_window",
-            "description": "バックエンドセッション内の tmux window を切り替える。\
-                pane のバックエンドセッション内で指定した window index をアクティブにする。\
-                tako tmux list でペインの backend セッションの windows を確認してから使う。",
+            "description": "ペインが表示している tmux セッションの window を切り替える。\
+                対象は tako_tmux_open で取り込んだビューペインならその**取り込んだ**\
+                セッション、通常のペインなら tako 自身のバックエンドセッション。\
+                tako_tmux_list で対象セッションの windows を確認してから使う。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1538,8 +1546,13 @@ pub fn tools() -> Vec<Value> {
                         "enum": ["claude", "codex", "agy"],
                         "description": "worker のエージェント CLI（省略時はプロファイルの worker_agent → claude）",
                     },
-                    "model": { "type": "string", "description": "worker のモデル（agent のネイティブ表記。省略時はプロファイル設定に従う）" },
-                    "effort": { "type": "string", "description": "thinking / reasoning effort（claude・codex のみ。agy はモデル名に組込みのため無視。省略時はプロファイル設定に従う）" },
+                    "model": { "type": "string", "description": "worker のモデル（agent のネイティブ表記。省略時はプロファイル設定に従う）。\
+                        codex / agy は claude 語彙の既定（アカウントの default_model / プロファイルの worker_model）を\
+                        受け取らないので、worker_agents.<agent>.model が無ければ CLI 既定で起動する（#1013）。\
+                        実際に使う値と出どころは応答の model / model_source に返る" },
+                    "effort": { "type": "string", "description": "thinking / reasoning effort（3 系統とも指定できる。\
+                        claude = --effort / codex = -c model_reasoning_effort= / agy = --effort（low|medium|high のみ。#1002）。\
+                        省略時はプロファイル設定に従う（claude 語彙の既定は claude 以外へ渡らない。#1013）" },
                     "pane": pane_schema("分割元ペイン ID（省略時は呼び出し元。このペインの右に子が生える）。\
                         pane と tab の両方を指定した場合は pane を優先する"),
                     "tab": { "type": "integer", "minimum": 0, "description": "子を出すタブ ID。\

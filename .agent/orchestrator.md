@@ -110,8 +110,20 @@ worker_model_policy: inherit
 | 対象 | 優先順位 |
 |---|---|
 | master | プロファイルの `model`（`master_agent` のネイティブ表記）→ 未指定ならその CLI の既定 |
-| worker（claude） | spawn の `model` 引数 → `worker_agents.claude.model` → プロファイルの worker ポリシー（inherit / fixed / delegate）→ 未指定なら claude CLI 既定 |
+| worker（claude） | spawn の `model` 引数 → アカウントの `default_model` → `worker_agents.claude.model` → プロファイルの worker ポリシー（inherit / fixed / delegate）→ 未指定なら claude CLI 既定 |
 | worker（codex / agy） | spawn の `model` 引数 → `worker_agents.<agent>.model` → 未指定ならその CLI の既定 |
+
+**claude 語彙の既定は claude 以外へ渡らない（#1013）**。アカウントの `default_model` と
+プロファイルの `worker_model` は `claude-opus-5` のような claude のモデル名なので、
+codex / agy の `--model` へ流すと存在しないモデル名で起動してしまう（実発生:
+`codex --model claude-opus-5 …` がモデル警告の画面で止まり、プロンプトもそこで消えた）。
+判断は能力マトリクスの 1 マス（`tako agent-support --agent codex` の
+`worker_model_default_inherit` = 対象外）が持つ。codex / agy のモデルは
+`worker_agents.<agent>.model` か spawn の明示指定で決め、無ければ CLI 既定に委ねる。
+
+spawn の応答は `model`（実際に使う値。`null` = CLI 既定に委ねた）と `model_source`
+（`explicit` / `account` / `agent_config` / `profile_policy` / `cli_default`）を返すので、
+`--model` が付かない理由が読み取れる（`effort` / `effort_source` も同じ形）。
 
 ### master のエージェント種別（claude / codex。Issue #127）
 
@@ -166,7 +178,19 @@ worker_agents:               # エージェント別の worker 設定（任意�
   を明示するとどのエージェントでも承認ありに戻る。claude・agy は `--dangerously-skip-permissions`、
   codex は `--dangerously-bypass-approvals-and-sandbox` を付けて起動する
 - **status 検知**: codex / agy は `claude agents --json` に現れないため常に画面推定
-  （status_source=screen、idle 連続 8 回で完了判定）。claude worker より完了検知が数十秒遅くなる
+  （status_source=screen、idle 連続 8 回で完了判定）。claude worker より完了検知が数十秒遅くなる。
+  codex は器（tmux）があれば rollout JSONL を一次シグナルにできる（status_source=codex-session。#984）
+- **codex の背景ターミナル待ち（#1015）**: `• Waiting for background terminal (1m 04s …)` は
+  **走っている**行、`• Waited for background terminal · <cmd>` は**完了済みの履歴**行で、
+  どちらも `• ` で始まる。狭いペインでは codex が行末を `…` で切って `esc to interrupt` が
+  消えるため、tako は「`•` で始まり括弧の直後が経過時間」の行だけを busy と読む
+  （語で判定すると履歴行に当たって**永久 busy** になる = #571 / #120）。
+  実採取と判定表は `crates/tako-control/src/orchestrator/wait.rs` の `codex_running_footer_in`
+- **未達の断定（#1015）**: `prompt_undelivered`（= supervisor の自動再送のトリガ）は
+  **一次シグナルを実際に読めて、それでもターンが 1 件も無いとき**だけ出す。codex の裏取りは
+  rollout の `task_started` でしかできないので、器が無い / thread が解決できない状況では
+  `prompt_delivery_unverified`（`verify_then_resend`）へ降格する。
+  「読めなかった」を未達と断定すると、働いている worker へ同じ依頼が二度渡る
 - **事前信頼**: spawn 時に各 CLI の信頼設定（claude: `~/.claude.json` / codex:
   `~/.codex/config.toml` / agy: `~/.gemini/antigravity-cli/settings.json`）へ書き込み、
   信頼ダイアログ自体を出さない。書けなかった場合もダイアログ検出 → Enter 承諾でフォールバック
@@ -232,6 +256,10 @@ accounts:
     inherit: true                   # CLAUDE_CONFIG_DIR を設定しない（既定の資格情報）
     default_model: claude-opus-5
 ```
+
+アカウントは claude の資格情報（`CLAUDE_CONFIG_DIR`）の定義なので、`default_model` /
+`default_effort` は **claude の語彙**。codex / agy の worker には渡らない（#1013）。
+その系統のモデルは `worker_agents.<agent>.model` で書く。
 
 `master_account` は `tako master` / `tako solo` / handoff の新 master に、
 `worker_account` は spawn する worker に効く（spawn の `--account` が最優先。#547）。

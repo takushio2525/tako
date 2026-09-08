@@ -71,6 +71,7 @@ fn 共有対象の設定ファイルは移行の番地にも載っている() {
         ("orchestrator/solo-profiles/", SchemaId::SoloProfiles),
         ("orchestrator/ledger.yaml", SchemaId::Ledger),
         ("orchestrator/handoff/", SchemaId::Handoff),
+        ("setup/", SchemaId::Setup),
         ("instances/", SchemaId::DiscoveryInstance),
         ("remote/", SchemaId::RemoteDevices),
     ];

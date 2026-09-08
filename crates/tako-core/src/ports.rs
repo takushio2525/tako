@@ -481,24 +481,147 @@ fn process_name(pid: i32) -> String {
     String::from_utf8_lossy(&buf[..len as usize]).into_owned()
 }
 
-/// 自分以外の `tako-app` プロセスが生きているか（二重起動ガード用）
+/// 自分以外の生きた `tako-app` プロセスの pid（二重起動ガード + #1187 の所有者判定）。
+/// **見送りの理由に pid を出す**ため、bool ではなく一覧を返すのが正
 #[cfg(target_os = "macos")]
-pub fn other_tako_running() -> bool {
+pub fn other_tako_pids() -> Vec<u32> {
     let my_pid = std::process::id() as i32;
-    for pid in all_pids() {
-        if pid == my_pid {
-            continue;
-        }
-        if process_name(pid) == "tako-app" {
-            return true;
-        }
-    }
-    false
+    all_pids()
+        .into_iter()
+        .filter(|&pid| pid != my_pid && pid > 0 && process_name(pid) == "tako-app")
+        .map(|pid| pid as u32)
+        .collect()
+}
+
+/// 非 macOS はプロセス名の取得手段が未整備のため空（多重起動ガードは効かない = 従来挙動）
+#[cfg(not(target_os = "macos"))]
+pub fn other_tako_pids() -> Vec<u32> {
+    Vec::new()
+}
+
+/// 自分以外の `tako-app` プロセスが生きているか（二重起動ガード用）
+pub fn other_tako_running() -> bool {
+    !other_tako_pids().is_empty()
+}
+
+/// 別プロセスの**初期環境変数**のうち `names` に挙げたものを読む（#1187）。
+///
+/// 用途は「相手の tako-app がどの tmux ソケットを使っているか」の特定だけなので、
+/// 環境全体は返さず**要求されたキーだけ**を返す（`TAKO_TOKEN` 等を不用意に持ち回らない。
+/// `conventions.md`「ログに書かない」の趣旨）。
+///
+/// macOS は `sysctl(KERN_PROCARGS2)`。これは **exec 時点**の環境なので、相手が
+/// 起動後に `setenv` した値は見えない（tako-app の一括隔離は exec 後に行うため、
+/// 呼び出し側は [`crate::tmux_cleanup::resolve_socket_name`] で同じ導出をやり直す）。
+/// 読めなければ `None`（= 呼び出し側は安全側に倒す）
+#[cfg(target_os = "macos")]
+pub fn process_env_vars(pid: u32, names: &[&str]) -> Option<HashMap<String, String>> {
+    let raw = procargs2(pid)?;
+    Some(pick_env(&parse_procargs2(&raw), names))
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn other_tako_running() -> bool {
-    false
+pub fn process_env_vars(_pid: u32, _names: &[&str]) -> Option<HashMap<String, String>> {
+    None
+}
+
+/// `KERN_PROCARGS2` の生バイト列（argc + exec path + argv + env）
+#[cfg(target_os = "macos")]
+fn procargs2(pid: u32) -> Option<Vec<u8>> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return None;
+    }
+    // バッファ長は kern.argmax（環境ごとに違う。既定 1 MB 前後）
+    let mut argmax: libc::c_int = 0;
+    let mut size = size_of::<libc::c_int>();
+    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    let ok = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            (&mut argmax as *mut libc::c_int).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ok != 0 || argmax <= 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; argmax as usize];
+    let mut len = buf.len();
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let ok = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    // 別ユーザーのプロセス・既に死んだ pid は EPERM / EINVAL で失敗する（= 不明）
+    if ok != 0 || len < size_of::<u32>() {
+        return None;
+    }
+    buf.truncate(len);
+    Some(buf)
+}
+
+/// `KERN_PROCARGS2` のレイアウトを解く（純粋関数）。
+/// `[argc: u32][exec path\0][詰めの \0…][argv × argc][env…][\0]`
+#[cfg(target_os = "macos")]
+fn parse_procargs2(buf: &[u8]) -> Vec<(String, String)> {
+    if buf.len() < 4 {
+        return Vec::new();
+    }
+    let argc = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    let body = &buf[4..];
+    let mut pos = 0usize;
+    // exec path（最初の NUL まで）
+    let Some(end) = body.iter().position(|&b| b == 0) else {
+        return Vec::new();
+    };
+    pos = pos.max(end + 1);
+    // 詰めの NUL を飛ばす
+    while body.get(pos) == Some(&0) {
+        pos += 1;
+    }
+    // argv を argc 個読み飛ばす
+    for _ in 0..argc {
+        let Some(end) = body[pos..].iter().position(|&b| b == 0) else {
+            return Vec::new();
+        };
+        pos += end + 1;
+    }
+    // 以降が env。空文字列（連続 NUL）か末尾で終わり
+    let mut env = Vec::new();
+    while pos < body.len() {
+        let end = body[pos..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|e| pos + e)
+            .unwrap_or(body.len());
+        if end == pos {
+            break; // 空エントリ = env の終端
+        }
+        let entry = String::from_utf8_lossy(&body[pos..end]);
+        if let Some((k, v)) = entry.split_once('=') {
+            env.push((k.to_string(), v.to_string()));
+        }
+        pos = end + 1;
+    }
+    env
+}
+
+/// 読んだ env から要求されたキーだけを取り出す（純粋関数）
+#[cfg(target_os = "macos")]
+fn pick_env(env: &[(String, String)], names: &[&str]) -> HashMap<String, String> {
+    env.iter()
+        .filter(|(k, _)| names.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
 }
 
 /// `pid` が生きている `tako-app` プロセスか（多重起動ガード用。Issue #113）。
@@ -783,6 +906,59 @@ mod tests {
         assert!(listening_ports_of_pid(0x7fff_fff0).is_empty());
         assert!(scan(&[]).is_empty());
         assert!(tty_rdev("/dev/no-such-tty").is_none());
+    }
+
+    /// `KERN_PROCARGS2` のレイアウト（argc → exec path → 詰め → argv → env）を
+    /// 合成バッファで解けること。実バッファはプロセスごとに違うのでここは純粋関数で拘束する
+    #[test]
+    fn procargs2のレイアウトを解いてenvだけ取り出す() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&2u32.to_ne_bytes()); // argc = 2
+        buf.extend_from_slice(b"/path/to/tako-app\0");
+        buf.extend_from_slice(b"\0\0"); // 詰め
+        buf.extend_from_slice(b"tako-app\0"); // argv[0]
+        buf.extend_from_slice(b"--flag\0"); // argv[1]
+        buf.extend_from_slice(b"TAKO_TMUX_SOCKET=tako-iso-42\0");
+        buf.extend_from_slice(b"PATH=/usr/bin:/bin\0");
+        buf.extend_from_slice(b"TAKO_ISOLATED=1\0");
+        buf.extend_from_slice(b"\0"); // env 終端
+        let env = parse_procargs2(&buf);
+        assert_eq!(
+            env.iter()
+                .find(|(k, _)| k == "TAKO_TMUX_SOCKET")
+                .map(|(_, v)| v.as_str()),
+            Some("tako-iso-42")
+        );
+        // 要求したキーだけが返る（TAKO_TOKEN 等を不用意に持ち回らない）
+        let picked = pick_env(&env, &["TAKO_ISOLATED"]);
+        assert_eq!(picked.get("TAKO_ISOLATED").map(String::as_str), Some("1"));
+        assert_eq!(picked.len(), 1);
+        // argv を env と取り違えていない（`--flag` に = が無いので混ざれば消えるだけ。
+        // 取り違えると argv 由来の値が env に載るので、件数で拘束する）
+        assert_eq!(env.len(), 3);
+    }
+
+    /// 実プロセス（自分自身）の初期環境を読めること。読めなければ呼び出し側は
+    /// 「不明 = 見送り」に倒すので、ここが動くことが #1187 のガード緩和の前提になる
+    #[test]
+    fn 自分の初期環境をsysctlで読める() {
+        let env = process_env_vars(std::process::id(), &["PATH"])
+            .expect("自分のプロセスの環境は読めるはず");
+        assert!(
+            env.get("PATH").is_some_and(|p| !p.is_empty()),
+            "PATH が読めない: {env:?}"
+        );
+        // 死んだ pid は None（不明）
+        assert!(process_env_vars(0x7fff_fff0, &["PATH"]).is_none());
+        assert!(process_env_vars(0, &["PATH"]).is_none());
+    }
+
+    /// #1187: 見送りの理由に pid を出せること（bool では pid が出せない）
+    #[test]
+    fn other_tako_pidsは自分を含まない() {
+        let pids = other_tako_pids();
+        assert!(!pids.contains(&std::process::id()));
+        assert_eq!(other_tako_running(), !pids.is_empty());
     }
 
     /// Issue #113 多重起動ガードの生存判定: 死んだ pid と tako-app でないプロセス

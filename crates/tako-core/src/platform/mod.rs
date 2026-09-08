@@ -28,6 +28,7 @@ pub mod release_assets;
 pub mod shell;
 pub mod shell_dialect;
 pub mod ssh_client;
+pub mod stack;
 pub mod support;
 pub mod user_path;
 pub mod window_lifecycle;

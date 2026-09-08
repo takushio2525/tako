@@ -530,6 +530,7 @@ FR-2.12.6〜9 は 2026-07-27 に #552 で追加）:
 | FR-2.13.3 | 一覧から個別に kill できる（kill-session / kill-window。誤爆防止の確認つき） | S |
 | FR-2.13.4 | 一覧・対応付け・kill はコマンド層（dispatch）に乗せ、CLI / MCP から同じ操作ができる（開発不変条件） | M |
 | FR-2.13.5 | データ取得層（tmux クエリ・対応付け）と表示を分離する（表示方法は変わる前提とユーザーが明言） | M |
+| FR-2.13.6 | **window 操作の対象は「そのペインが attach しているセッション」**（#1185）。`tako tmux open` の取り込みペインは「外側 = tako のバックエンドセッション（FR-5）」「内側 = 取り込んだセッション（表示用の `tako-view-*` grouped ラッパー）」の二重ネストなので、`backend_session` だけで解決すると**別セッションの window を切り替えて成功を返す**。解決は `tako_core::tmux::window_target`（ビュー優先 → バックエンド）の 1 実装に集約し、応答は `session`（論理名）/ `target`（実際に打った相手）/ `socket` を返す。どちらも無いペインは成功を返さずエラー。取り込み時の window 指定（`TmuxOpen.window`）は CLI `--window` と MCP `tako_tmux_open` の `window` の**両方**から到達できること（開発不変条件。到達性は番犬 `mcp_param_reachability` が機械検証する） | M |
 
 実装メモ（着手時に設計する）:
 
@@ -629,7 +630,7 @@ FR-2.12.6〜9 は 2026-07-27 に #552 で追加）:
 | FR-2.16.8 | 統合 tmux ビューに**どのタブにも表示されていないものを検知・表示するセクション**を設ける。対象は (a) **tako 管理外**の tmux セッション（ユーザーが直接立てたもの等）と (b) **kill 漏れ?** = tako から起動されたが対応ペインを失った orphan バックエンドセッション。両者をラベルで見た目区別し、どちらも**確認つき kill** ができる（FR-2.18 の自動サーフェスとは別物 = こちらは可視化と手動 kill） | M | ✅ 2026-06-12 |
 | FR-2.16.9 | **タブ内 attach 済みセッションのタブ紐付け表示**: tako ペイン内で `tmux attach` されている外部 tmux セッション（例: orchestrator の master セッションを別サーバーから attach）は「管理外」へ落とさず、attach クライアントの tty と tako ペインの tty 突き合わせで**該当タブの枠内に紐付けて表示**する（セッション名 + window 一覧。window 単位の確認つき kill も可能）。**2026-06-15 二重化解消**: セッションを独立ブロックで重複表示せず、**ホストペイン行の下にインデントして入れ子表示**し（ホスト行が「どのペインが attach しているか」を示すので「ペイン N で attach 中」は省く）、ホスト行の detail にセッション名を出して **1 セッション = タブツリー上 1 箇所**に統合する。CLI / MCP は既存 `tako tmux list` / `tako_tmux_list` の `clients[].tab/pane` で同じ対応情報を取得できる（新規操作なし = 開発不変条件充足） | M | ✅ 2026-06-13 / 2026-06-15 統合 |
 | FR-2.16.10 | **tmux セッションの D&D 取り込み**: 統合 tmux ビューに並ぶセッション（タブ枠内の attach 済み・管理外・kill 漏れ? のすべて）を**ドラッグ&ドロップで現在のタブ内へ取り込み、ドロップ位置のペインを分割して表示**できる。実体は新ペインで `TMUX= tmux [-L socket] attach-session` クライアントを起動する（= ネスト attach。多重 attach は tmux の通常動作として許容）。**ドラッグ中はドロップ先ペインのハイライト + 挿入プレビュー必須**: カーソル位置の象限（上下左右）から分割方向を判定し、「ドロップしたら新ペインが占める半面」を強調表示してラベルで結果を示す。同等操作は dispatch `TmuxOpen` + CLI `tako tmux open` + MCP `tako_tmux_open`（開発不変条件） | M | ✅ 2026-06-13 |
-| FR-2.16.11 | **orphan tmux セッションの一括クリーンアップ**: 前回クラッシュ等で取り残された tako 由来の裸のバックエンドセッションを掃除する。**起動時に自動実行**するほか、同等操作を dispatch `TmuxCleanup` + CLI `tako tmux cleanup` + MCP `tako_tmux_cleanup`（開発不変条件）で公開する。対象は backend socket 上の **`tako-` プレフィックス・detached・非 grouped・protected 外**のみで、使用中（attached）・表示中ビュー（grouped）・ユーザーの実セッション（既定サーバー・非 `tako-` 名）には構造上一切触れない。**起動時の自動実行のみ第四のガード**として、最終アクティビティが直近 1 時間以内のセッションは kill しない（Issue #113: layout.json が多重起動事故で巻き戻った場合に protected から漏れる実行中 worker を巻き込まないための猶予。明示操作は従来どおり全対象） | M | ✅ 2026-06-15（猶予は 2026-07-08） |
+| FR-2.16.11 | **orphan tmux セッションの一括クリーンアップ**: 前回クラッシュ等で取り残された tako 由来の裸のバックエンドセッションを掃除する。**起動時に自動実行**するほか、同等操作を dispatch `TmuxCleanup` + CLI `tako tmux cleanup` + MCP `tako_tmux_cleanup`（開発不変条件）で公開する。対象は backend socket 上の **`tako-` プレフィックス・detached・非 grouped・protected 外**のみで、使用中（attached）・表示中ビュー（grouped）・ユーザーの実セッション（既定サーバー・非 `tako-` 名）には構造上一切触れない。**起動時の自動実行のみ第四のガード**として、最終アクティビティが直近 1 時間以内のセッションは kill しない（Issue #113: layout.json が多重起動事故で巻き戻った場合に protected から漏れる実行中 worker を巻き込まないための猶予。明示操作は従来どおり全対象）。**多重起動時の見送りはソケットの所有者で決め、理由を必ず返す（#1187）**: 明示操作が見送るのは「対象 tmux ソケットを**共有する**別 tako-app が生きている」ときと「相手のソケットを特定できない」ときだけ（隔離インスタンスは別ソケットなので本番の掃除を止めない）。起動時の自動実行は従来どおり別 tako-app が 1 つでも生きていれば見送る。応答は `{socket, killed, skipped, detail}` で、`skipped` に理由コード（`peer_shares_socket` / `peer_socket_unknown` / `other_tako_running` / `persist_disabled` / `secondary` / `backend_not_persistent`）と根拠（pid・ソケット名）が入り、同じ 1 行が persist.log にも残る。`--socket` / `socket` は対象サーバーとして**実際に効く**（それまで dispatch が捨てていた） | M | ✅ 2026-06-15（猶予は 2026-07-08 / 理由と `--socket` は 2026-09-09） |
 | FR-2.16.12 | **子の表示分類（表示中 / バックグラウンド）**: 統合 tmux ビューの各ペイン行に、前面表示中か裏で実行中かのバッジを付ける。**foreground（表示中）= アクティブタブ所属（タイル表示で画面に出ている）**、**background（バックグラウンド）= 非アクティブタブ所属または退避中**。バックグラウンドの子は親（タブ枠 / 由来タブ）が表示位置で明示される。状態取得は `tako list` / `tako_list_panes` の各ペイン `surface`（`foreground` / `background`）で AI からも可能（開発不変条件。退避ペインは `tako_shelved_list` の `surface` が常に `background`） | M | ✅ 2026-06-15 |
 | FR-2.16.13 | **バックグラウンド行のホバープレビュー**: 統合 tmux ビューの**バックグラウンド行**（前面に出ていないペイン）をホバーすると、そのペイン / ターミナルの**実画面サムネイル**（`terminal_screen_lines` をクリップ表示）をマウス位置の左側にポップアップ表示する。**ソース端末はリサイズしない**（バックグラウンドのプログラムを乱さない）ため現在グリッドのクリップになり、**ライブ更新**（`on_term_event` の出力ごとの再描画）で常に最新を映す。ポップアップは読み取り専用（ピン留め操作は行 / カード側のボタン = FR-2.16.15）。前面表示中の行はペインエリアで見えるため対象外 | M | ✅ 2026-06-15 |
 | FR-2.16.14 | **タブ枠の折りたたみ（バックグラウンド + 退避を隠す）**: タブ見出しの逆三角トグル（▾/▸）で各タブ枠を折りたたむ。折りたたむと、そのタブ配下の**バックグラウンド項目（裏で実行中のペイン行 + 退避行）を隠し、前面表示中（アクティブタブ）の行は残す**（非アクティブタブは全行がバックグラウンドなので見出しのみになる）。折りたたみ状態は**タブ並べ替え / クローズに強い `TabId` キー**で管理し、`layout.json` に永続化（再起動後も保たれる）。状態取得・操作は `tako list`／`tako_list_panes` の各タブ `collapsed` と、`tako collapse [--tab N] [on/off]`／MCP `tako_collapse_tab`（`collapsed` 省略でトグル）で AI からも可能（開発不変条件） | M | ✅ 2026-06-15 |
@@ -671,6 +672,17 @@ FR-2.12.6〜9 は 2026-07-27 に #552 で追加）:
   protected = 現存ペイン・退避ペインの backend 名 + 表示中ビューの元/ラッパー名。
   **grouped と attached は対象外**にすることで、protected の構築タイミングに依らず
   使用中セッションを誤爆しない三重ガードにしている
+- 多重起動時の見送りの判定は `tako_core::tmux_cleanup`（#1187）。**プロセス名ではなく
+  ソケットの所有者**を見る: 生きている別 tako-app の**初期環境**（macOS は
+  `KERN_PROCARGS2` = `ports::process_env_vars`）から `TAKO_TMUX_SOCKET` /
+  `TAKO_ISOLATED` / `TAKO_SELF_TEST` を読み、一括隔離と同じ順序（`resolve_socket_name`）で
+  相手の backend ソケット名を復元して対象と突き合わせる。**読めなければ「不明」= 見送る**
+  （安全側）。ソケット名の生成（`tako-iso-<pid>` / `tako-st-<pid>`）は core と main.rs で
+  1 実装（ズレると所有者判定が静かに外れるので番犬
+  `crates/tako-control/tests/tmux_cleanup_watchdog.rs` が落とす）
+- `--socket` で自分の backend 以外を対象にしたときの protected は
+  **そのソケットのビューだけ**（`tmux_view_panes` の `socket` で絞る）。
+  自分の backend セッションは他サーバーには存在しないので混ぜない
 
 ### ペインタイトルバー（FR-2.1.3 の表示更新。2026-06-12 実装）
 

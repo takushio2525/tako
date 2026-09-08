@@ -1351,26 +1351,62 @@ fn dispatch_inner(
 
         Request::TmuxSelectWindow { pane, window } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
-            let session = host
-                .backend_session(target)
-                .ok_or_else(|| DispatchError::Operation(format!(
-                    "ペイン {target} にバックエンドセッションがない（tmux 永続化が無効 or 直接 spawn）"
-                )))?;
-            let socket = tako_core::tmux_backend::socket_name();
-            tako_core::tmux::select_window(Some(&socket), &session, window)
-                .map_err(DispatchError::Operation)?;
+            // 取り込みビュー（内側）をバックエンド（外側）より優先する（#1185）。
+            // 素朴に backend_session だけを見ると、取り込みペインでは**別セッション**の
+            // window を切り替えて「成功」を返してしまう
+            let resolved = tako_core::tmux::window_target(
+                host.tmux_view(target).as_ref(),
+                host.backend_session(target).as_deref(),
+            )
+            .ok_or_else(|| {
+                DispatchError::Operation(format!(
+                    "ペイン {target} に tmux セッションがない\
+                     （tmux 永続化が無効 / 直接 spawn / 取り込みビューでもない）"
+                ))
+            })?;
+            tako_core::tmux::select_window(resolved.socket.as_deref(), &resolved.target, window)
+                .map_err(|e| {
+                    DispatchError::Operation(tako_core::tmux::friendly_error(
+                        &format!("window {window} の選択"),
+                        resolved.socket.as_deref(),
+                        &resolved.target,
+                        &e,
+                    ))
+                })?;
             Ok(json!({
                 "pane": target.as_u64(),
-                "session": session,
+                // 論理的なセッション名（取り込みビューなら取り込んだ元セッション）
+                "session": resolved.session,
+                // 実際に select-window を打った相手（取り込みビューは表示用ラッパー）
+                "target": resolved.target,
+                "socket": resolved.socket,
                 "window": window,
             }))
         }
 
         Request::TmuxCleanup { socket } => {
-            // socket 省略時は tako バックエンドサーバーを対象にする（取り残しの主因）
-            let _ = socket; // 現状は backend socket 固定（host が protected を解決して実行）
-            let killed = host.cleanup_orphan_tmux();
-            Ok(json!({ "killed": killed }))
+            // socket 省略時は tako バックエンドサーバーを対象にする（取り残しの主因）。
+            // #1187: 以前はここで `let _ = socket;` と捨てていた（ヘルプは受け付けると
+            // 書いてあるのに常に自分の backend しか見ない = 黙って無視していた）
+            let mut requested = socket.as_deref();
+            if tako_core::tmux_cleanup::legacy_1187() {
+                requested = None; // A/B: 修正前は引数をここで捨てていた
+            }
+            let report = host.cleanup_orphan_tmux(requested);
+            // #1187: 見送りは応答と persist.log の両方に理由を残す（空配列だけを返すと
+            // 呼び出し側が「掃除するものが無かった」と区別できない）
+            if let Some(line) = report.log_line(tako_core::tmux_cleanup::CleanupScope::Explicit) {
+                crate::diag::persist_log(&line);
+            }
+            if tako_core::tmux_cleanup::legacy_1187() {
+                return Ok(json!({ "killed": report.killed }));
+            }
+            Ok(json!({
+                "socket": report.socket,
+                "killed": report.killed,
+                "skipped": report.skipped.as_ref().map(|s| s.code()),
+                "detail": report.skipped.as_ref().map(|s| s.detail()),
+            }))
         }
 
         Request::TabRename {
@@ -8444,14 +8480,20 @@ fn dispatch_orchestrator_spawn(
     // 無ければ「理由 + 次の一手」を返す（無言死を作らない）
     let agent_cli_path = orchestrator::agent_cli::preflight(worker_agent)
         .map_err(|e| DispatchError::Operation(e.message()))?;
-    // アカウントの default_model / default_effort をフォールバックに使う（#504）
-    let effective_model = model.or(resolved_account
-        .as_ref()
-        .and_then(|a| a.default_model.as_deref()));
-    let effective_effort = effort.or(resolved_account
-        .as_ref()
-        .and_then(|a| a.default_effort.as_deref()));
-    let launch = profile.resolve_agent_launch(worker_agent, effective_model, effective_effort);
+    // アカウントの default_model / default_effort をフォールバックに使う（#504）。
+    // **claude 語彙なので明示指定と同じ段に混ぜない**（#1013: 混ぜていたため
+    // `codex --model claude-opus-5` が組み立てられていた）。継承の可否は
+    // resolve_agent_launch_with_account が能力マトリクスへ問う
+    let account_defaults = orchestrator::AccountDefaults {
+        model: resolved_account
+            .as_ref()
+            .and_then(|a| a.default_model.as_deref()),
+        effort: resolved_account
+            .as_ref()
+            .and_then(|a| a.default_effort.as_deref()),
+    };
+    let launch =
+        profile.resolve_agent_launch_with_account(worker_agent, model, effort, account_defaults);
     // Remote Control（#1068）。opt-in が無ければ何も起きない。
     // opt-in なのに不適格なら、フラグは付けずに理由を spawn 応答の warnings へ載せる
     // （無言で「繋がっているはず」にしない）
@@ -8736,7 +8778,12 @@ fn dispatch_orchestrator_spawn(
         // #983: tako がどの実行ファイルを起動したか（無ければ preflight で落ちている）
         "agent_path": agent_cli_path,
         "model": launch.model,
+        // #1013: どの段が model を決めたか（explicit / account / agent_config /
+        // profile_policy / cli_default）。null の model が「CLI 既定に委ねた」のか
+        // 「設定を読み落とした」のかを master が区別できるようにする
+        "model_source": launch.model_source.as_str(),
         "effort": launch.effort,
+        "effort_source": launch.effort_source.as_str(),
         "command": worker_cmd,
         // 旧フィールド名の互換（#120 以前のクライアント / ドキュメント向け）
         "claude_command": worker_cmd,
@@ -8947,6 +8994,10 @@ fn finish_worker_status(
     // #983 の変更 2: 「ターンが走った」= プロンプトが届いた、という**送達の一次シグナル**。
     // 画面の送達確認より強い証拠なので、送達判定へ渡して未達の誤検知を潰す（#1015）
     let mut codex_turn_observed = false;
+    // #1015: その rollout を**実際に読めたか**。読めていないのに「未達」と断定すると、
+    // 実は働いている worker へ自動再送が飛ぶ（二重指示事故）。
+    // 「読めて 0 ターン」（= `codex_turn_observed == false` かつこれが true）だけが未達の証拠
+    let mut codex_rollout_read = false;
     let (status, mut ctx_percent) = if let Some(ref sid) = resolved_sid {
         let agent = orchestrator::query_agent_status(sid);
         (
@@ -8961,6 +9012,7 @@ fn finish_worker_status(
                 // #985: 同じ読み取りにレート制限も載っている（追加の I/O ゼロ）
                 codex_rate_limits = st.rate_limits.clone();
                 codex_turn_observed = st.prompt_arrived();
+                codex_rollout_read = true;
                 match st.status() {
                     Some(s) => (s.to_string(), st.ctx_percent),
                     None => ("unknown".to_string(), st.ctx_percent),
@@ -9036,12 +9088,20 @@ fn finish_worker_status(
         }
         let now_epoch = crate::sessions::parse_iso(&crate::sessions::now_iso()).unwrap_or(0);
         let spawned_epoch = crate::sessions::parse_iso(&effective.spawned_at).unwrap_or(now_epoch);
+        // #1015: codex の送達の裏取りは rollout（`task_started`）でしかできない。
+        // thread が解決できない / rollout が読めないときは未達と断定させない。
+        // **claude の一次シグナルは `claude agents --json` 側**なのでここでは触らない
+        // （#390 の「welcome 画面のまま未達」判定は不変）
+        let primary_signal_unreadable = !crate::orchestrator::wait::legacy_1015()
+            && effective.agent == orchestrator::agent::WorkerAgent::Codex.as_str()
+            && !codex_rollout_read;
         (
             orchestrator::registry::prompt_delivery_assessment_with(
                 &effective,
                 now_epoch,
                 orchestrator::registry::DeliveryEvidence {
                     turn_observed: codex_turn_observed,
+                    primary_signal_unreadable,
                 },
             ),
             now_epoch - spawned_epoch,
@@ -12420,6 +12480,9 @@ mod tests {
         menu_ops: Vec<crate::protocol::MenuOp>,
         /// ペイン → バックエンド tmux セッション名（#571 の e2e で実セッションを差す）
         backend_sessions: std::collections::HashMap<u64, String>,
+        /// #1185: ペイン → 取り込みビュー（`tako tmux open` の登録先）。
+        /// `track_tmux_view` が入れるので、製品と同じ経路で埋まる
+        tmux_views: std::collections::HashMap<u64, tako_core::TmuxView>,
         /// #549: ウェルカムバナーの表示状態
         welcome_banner: bool,
         /// #600: 入力予測（既定 ON）
@@ -12442,6 +12505,10 @@ mod tests {
         sessions: std::collections::HashMap<u64, TerminalSession>,
         /// #1132: タブ内容領域の幅（桁。実測の代役）。None = 実測が無い
         tab_cols: Option<f32>,
+        /// #1187: cleanup が受け取ったソケット（`--socket` が届いているかの検証用）と、
+        /// 返させる結果
+        cleanup_socket: std::cell::RefCell<Vec<Option<String>>>,
+        cleanup_report: Option<tako_core::tmux_cleanup::CleanupReport>,
     }
 
     impl MockHost {
@@ -12476,8 +12543,11 @@ mod tests {
                 menu_bar: sample_menu_bar(),
                 menu_ops: Vec::new(),
                 backend_sessions: std::collections::HashMap::new(),
+                tmux_views: std::collections::HashMap::new(),
                 sessions: std::collections::HashMap::new(),
                 tab_cols: None,
+                cleanup_socket: std::cell::RefCell::new(Vec::new()),
+                cleanup_report: None,
                 welcome_banner: false,
                 autosuggest: true,
                 autosuggest_hint: true,
@@ -12548,6 +12618,37 @@ mod tests {
     impl TmuxHost for MockHost {
         fn backend_session(&self, pane: PaneId) -> Option<String> {
             self.backend_sessions.get(&pane.as_u64()).cloned()
+        }
+        fn tmux_view(&self, pane: PaneId) -> Option<tako_core::TmuxView> {
+            self.tmux_views.get(&pane.as_u64()).cloned()
+        }
+        fn track_tmux_view(
+            &mut self,
+            pane: PaneId,
+            session: String,
+            wrapper: Option<String>,
+            socket: Option<String>,
+        ) {
+            self.tmux_views.insert(
+                pane.as_u64(),
+                tako_core::TmuxView {
+                    session,
+                    wrapper,
+                    socket,
+                },
+            );
+        }
+        /// #1187: 受け取ったソケットを記録し、仕込んだ結果を返す
+        fn cleanup_orphan_tmux(
+            &self,
+            socket: Option<&str>,
+        ) -> tako_core::tmux_cleanup::CleanupReport {
+            self.cleanup_socket
+                .borrow_mut()
+                .push(socket.map(str::to_string));
+            self.cleanup_report.clone().unwrap_or_else(|| {
+                tako_core::tmux_cleanup::CleanupReport::killed(socket.unwrap_or("tako"), Vec::new())
+            })
         }
         fn tmux_tab_collapsed(&self, tab: TabId) -> bool {
             self.collapsed.contains(&tab.as_u64())
@@ -12826,6 +12927,66 @@ mod tests {
         .unwrap()["pane"]
             .as_u64()
             .unwrap()
+    }
+
+    /// #1187: `--socket` が host まで届くこと（旧実装は `let _ = socket;` で捨てていた）。
+    /// A/B は `TAKO_1187_LEGACY=1`（= 修正前）で socket が None に落ちることで示す
+    #[test]
+    fn issue1187_cleanupはsocketをhostへ渡す() {
+        let mut host = MockHost::new();
+        host.cleanup_report = Some(tako_core::tmux_cleanup::CleanupReport::killed(
+            "other-server",
+            vec!["tako-orphan-aaa".into()],
+        ));
+        let out = dispatch(
+            &mut host,
+            Request::TmuxCleanup {
+                socket: Some("other-server".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(
+            host.cleanup_socket.borrow().as_slice(),
+            &[Some("other-server".to_string())],
+            "--socket が host へ届いていない（#1187 の `let _ = socket;`）"
+        );
+        assert_eq!(
+            out["socket"], "other-server",
+            "応答が対象ソケットを言わない"
+        );
+        assert_eq!(out["killed"][0], "tako-orphan-aaa");
+        assert!(out["skipped"].is_null(), "掃除できたのに見送り扱い");
+    }
+
+    /// #1187: 見送ったときは理由が応答に載る（空配列だけだと呼び出し側が
+    /// 「掃除するものが無かった」と区別できないのが本質的な問題だった）
+    #[test]
+    fn issue1187_見送りの理由が応答に載る() {
+        let mut host = MockHost::new();
+        host.cleanup_report = Some(tako_core::tmux_cleanup::CleanupReport::skipped(
+            "tako",
+            tako_core::tmux_cleanup::CleanupSkip::PeerSharesSocket {
+                pids: vec![71082],
+                socket: "tako".into(),
+            },
+        ));
+        let out = dispatch(
+            &mut host,
+            Request::TmuxCleanup { socket: None },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(out["killed"].as_array().map(Vec::len), Some(0));
+        assert_eq!(
+            out["skipped"], "peer_shares_socket",
+            "見送りの理由コードが応答に無い"
+        );
+        let detail = out["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("71082") && detail.contains("tako"),
+            "理由に pid / ソケットが入っていない: {detail}"
+        );
     }
 
     /// #1002: モデル一覧は dispatch を通るので CLI・MCP・GUI が同じペイロードを見る。
@@ -15082,6 +15243,154 @@ mod tests {
         // 分割もセッション起動も起きていない
         assert_eq!(host.ws.active_tab().tree().len(), 1);
         assert!(host.attached.is_empty());
+    }
+
+    /// #1185 の e2e。実 tmux で「3 window の自前セッションを取り込んだペイン」を作り、
+    /// `select-window` が**内側**（取り込んだセッションの表示用ラッパー）へ届くことを
+    /// tmux 側の `window_active` で実測する。外側の backend セッションを対象にしていた
+    /// 旧実装では、この経路は別サーバー（`socket_name()`）を見て失敗するか、
+    /// 無関係なセッションの window を切り替えて「成功」を返していた
+    #[test]
+    #[cfg(unix)]
+    fn issue1185_取り込みビューのselect_windowが内側へ届く() {
+        if !tako_core::tmux::version_announcement()
+            .is_some_and(tako_core::tmux::announces_only_tmux)
+        {
+            eprintln!("skip: 本物の tmux が無い（grouped session と完全一致ターゲットが前提）");
+            return;
+        }
+        let socket = format!("tako-e2e-1185-{}", std::process::id());
+
+        struct Guard(String);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = tako_core::tmux::tmux_command(Some(&self.0))
+                    .arg("kill-server")
+                    .output();
+            }
+        }
+        let _guard = Guard(socket.clone());
+
+        let tmux = |args: &[&str]| {
+            tako_core::tmux::tmux_command(Some(&socket))
+                .args(args)
+                .output()
+                .expect("tmux を実行できる")
+        };
+        // アクティブ window の実測（`display-message -p` はクライアント不在だと
+        // 空を返すので list-windows で採る。#1185 の検証で実測）
+        let active = |session: &str| -> Option<u32> {
+            let out = tmux(&[
+                "list-windows",
+                "-t",
+                &tako_core::tmux::exact_target(session),
+                "-F",
+                "#{window_index}:#{window_active}",
+            ]);
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .find_map(|line| line.strip_suffix(":1")?.parse().ok())
+        };
+
+        // ユーザー自前の 3 window セッション（`tako tmux open` の主用途）
+        assert!(
+            tmux(&[
+                "new-session",
+                "-d",
+                "-s",
+                "mywork",
+                "-n",
+                "editor",
+                "-x",
+                "100",
+                "-y",
+                "40"
+            ])
+            .status
+            .success(),
+            "tmux new-session が失敗した"
+        );
+        for name in ["server", "tests"] {
+            tmux(&[
+                "new-window",
+                "-d",
+                "-t",
+                &tako_core::tmux::exact_target("mywork"),
+                "-n",
+                name,
+            ]);
+        }
+        // TmuxOpen が作るのと同じ表示用ラッパー（grouped session）
+        let wrapper = "tako-view-mywork-9";
+        assert!(
+            tmux(&[
+                "new-session",
+                "-d",
+                "-t",
+                &tako_core::tmux::exact_target("mywork"),
+                "-s",
+                wrapper,
+            ])
+            .status
+            .success(),
+            "tmux new-session -t（grouped ラッパー）が失敗した"
+        );
+        assert_eq!(active("mywork"), Some(0), "元セッションの前提");
+        assert_eq!(active(wrapper), Some(0), "ラッパーの前提");
+
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        // 二重ネストの再現: 外側 = tako のバックエンド / 内側 = 取り込んだビュー
+        host.backend_sessions
+            .insert(pane, "tako-outer-decoy".into());
+        host.track_tmux_view(
+            PaneId::from_raw(pane),
+            "mywork".into(),
+            Some(wrapper.into()),
+            Some(socket.clone()),
+        );
+
+        let result = dispatch(
+            &mut host,
+            Request::TmuxSelectWindow {
+                pane: Some(pane),
+                window: 1,
+            },
+            PaneOrigin::Cli,
+        )
+        .expect("取り込みビューの window 切替は成功する");
+        assert_eq!(result["target"].as_str(), Some(wrapper), "対象が内側でない");
+        assert_eq!(result["session"].as_str(), Some("mywork"));
+        assert_eq!(result["socket"].as_str(), Some(socket.as_str()));
+
+        // 実測: ラッパーだけが window 1 へ動き、元セッション（親クライアントの表示）は無傷
+        assert_eq!(
+            active(wrapper),
+            Some(1),
+            "内側の window が切り替わっていない"
+        );
+        assert_eq!(active("mywork"), Some(0), "元セッションを巻き込んでいる");
+
+        // 存在しない window 番号は成功を返さず、日本語でソケットパスを出さずに落ちる
+        let err = dispatch(
+            &mut host,
+            Request::TmuxSelectWindow {
+                pane: Some(pane),
+                window: 9,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        let DispatchError::Operation(message) = err else {
+            panic!("Operation エラーでない: {err:?}");
+        };
+        assert!(message.contains("window 9 の選択に失敗した"), "{message}");
+        assert!(message.contains(wrapper), "{message}");
+        assert!(
+            !message.contains('/'),
+            "ソケットパスが露出している: {message}"
+        );
+        assert_eq!(active(wrapper), Some(1), "失敗したのに動いている");
     }
 
     #[test]
@@ -21045,6 +21354,135 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v["prompt_delivery"], "pending");
+    }
+
+    /// #1015 の現場そのもの: 背景ターミナル待ちの codex を 44 桁ペインで採った画面。
+    /// codex が行末を `…` で切るので `esc to interrupt` が残っていない
+    const CODEX_BG_WAIT_NARROW_1015: &str = "\
+• コマンドはセッション内で実行中です。引き続
+  き待機します。
+
+• Waiting for background terminal (1m 04s •…
+  └ env -u CLAUDE_CONFIG_DIR TAKO_SELF_T…
+
+
+› Ask Codex to do anything
+
+  gpt-5.6-sol high · /private/tmp/probe";
+
+    #[test]
+    fn issue1015_背景ターミナル待ちのcodexをidleと報告しない() {
+        use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
+        let path = registry_path().unwrap();
+        // 猶予（240 秒）を大きく超えた codex worker。実発生は spawn 後 779 秒
+        WorkerRegistry::mutate_at(&path, |reg| {
+            reg.workers.insert(
+                "q10151".into(),
+                WorkerEntry {
+                    pane: 10151,
+                    agent: "codex".into(),
+                    status: "active".into(),
+                    spawned_at: "2026-01-01T00:00:00Z".into(),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+
+        let v = finish_worker_status(
+            WorkerStatusCtx {
+                pane_id: 10151,
+                pane_exists: true,
+                backend_session: None,
+                live_tail: Some(CODEX_BG_WAIT_NARROW_1015.into()),
+                full_screen: Some(CODEX_BG_WAIT_NARROW_1015.into()),
+                // 実発生の観測（背景で cargo test / 隔離セルフテストが走っていた）
+                has_running_children: true,
+                limit_resume: Value::Null,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        // 受け入れ条件 5: 待機中は busy（idle にしない）
+        assert_eq!(
+            v["status"], "busy",
+            "背景ターミナル待ちを idle と報告している（#1015）: {v:#}"
+        );
+        // 受け入れ条件 6: 自動再送のトリガを出さない
+        let kinds: Vec<&str> = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["kind"].as_str())
+            .collect();
+        assert!(
+            !kinds.contains(&"prompt_undelivered"),
+            "作業中の worker へ resend_prompt を勧めている（二重指示事故）: {kinds:?}"
+        );
+        assert_eq!(v["prompt_delivery"], "pending", "{v:#}");
+    }
+
+    #[test]
+    fn issue1015_rolloutを読めないcodexは未達と断定しない() {
+        use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
+        let path = registry_path().unwrap();
+        WorkerRegistry::mutate_at(&path, |reg| {
+            reg.workers.insert(
+                "q10152".into(),
+                WorkerEntry {
+                    pane: 10152,
+                    agent: "codex".into(),
+                    status: "active".into(),
+                    spawned_at: "2026-01-01T00:00:00Z".into(),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+
+        // 入力待ちの画面（画面では裏取りできない）+ backend が無い =
+        // codex の thread が解決できないので rollout を 1 行も読めていない
+        let v = finish_worker_status(
+            WorkerStatusCtx {
+                pane_id: 10152,
+                pane_exists: true,
+                backend_session: None,
+                live_tail: Some("• You have 1 usage limit reset available.\n\n› Ask Codex to do anything\n\n  gpt-5.6-sol high · /private/tmp/probe".into()),
+                full_screen: None,
+                has_running_children: false,
+                limit_resume: Value::Null,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        let kinds: Vec<&str> = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["kind"].as_str())
+            .collect();
+        assert_eq!(
+            v["prompt_delivery"], "unverified",
+            "rollout を読めていないのに未達と断定している（#1015）: {v:#}"
+        );
+        assert!(
+            !kinds.contains(&"prompt_undelivered"),
+            "自動再送のトリガを出している: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"prompt_delivery_unverified"),
+            "黙ってもいけない（確かめてから再送を出す。#983）: {kinds:?}"
+        );
+        let ev = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["kind"] == "prompt_delivery_unverified")
+            .unwrap()
+            .clone();
+        assert_eq!(ev["recommended_action"], "verify_then_resend");
     }
 
     #[test]

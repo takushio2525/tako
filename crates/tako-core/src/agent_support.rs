@@ -319,6 +319,9 @@ pub mod keys {
     pub const WORKER_LIMIT_METRICS: &str = "worker_limit_metrics";
     /// worker からの MCP 接続
     pub const WORKER_MCP: &str = "worker_mcp";
+    /// claude 語彙で書かれたモデル / effort の既定（プロファイルの `worker_model` /
+    /// アカウントの `default_model`）を worker へ継承する（#1013）
+    pub const WORKER_MODEL_DEFAULT_INHERIT: &str = "worker_model_default_inherit";
     /// permission ダイアログの検知と応答
     pub const WORKER_PERMISSION_DIALOG: &str = "worker_permission_dialog";
     /// 初期プロンプトの送達
@@ -486,6 +489,12 @@ pub mod notes {
     pub const NO_LOCAL_USAGE_LIMIT: Note = Note::new(
         "自分のマシンで動かすモデルなので利用上限という概念が無い",
         "The model runs on your own machine, so there is no notion of a usage limit",
+    );
+
+    /// #1013: モデル名はベンダー固有の語彙なので、claude の既定を他系統へ渡せない
+    pub const MODEL_NAME_NOT_PORTABLE: Note = Note::new(
+        "モデル名はベンダー固有の語彙なので claude 用の既定を渡せない（渡すと存在しないモデル名で起動する）。この系統のモデルは `worker_agents.<agent>.model` か spawn の明示指定で決め、無ければ CLI の既定に委ねる",
+        "Model names are vendor-specific vocabulary, so a claude default cannot be handed to this agent (doing so launches it with a non-existent model name). Set this agent's model in `worker_agents.<agent>.model` or explicitly at spawn time; otherwise tako leaves it to the CLI default",
     );
 }
 
@@ -1294,6 +1303,27 @@ pub const MATRIX: &[AgentFeature] = &[
         evidence: AgentEvidence::Source(
             "mcp_servers を組む非テストコードは orchestrator/mod.rs（master 経路）だけで、\
              WorkerLaunch には tako_bin も MCP 引数も無い（棚卸し §5.3 = 最大の穴）",
+        ),
+    },
+    AgentFeature {
+        key: keys::WORKER_MODEL_DEFAULT_INHERIT,
+        summary: Note::new(
+            "claude 語彙で書かれたモデル / effort の既定（プロファイルの worker_model / アカウントの default_model）を worker へ継承する（#1013）",
+            "Defaults written in claude's vocabulary (the profile's worker_model, an account's default_model) are inherited by the worker (#1013)",
+        ),
+        claude: S::Supported,
+        codex: unsupported(notes::MODEL_NAME_NOT_PORTABLE),
+        agy: unsupported(notes::MODEL_NAME_NOT_PORTABLE),
+        // ローカル LLM でも `claude-opus-5` が通る余地は無い（ハーネスが #990 の
+        // codex TUI でも #991 の非 TUI でも、モデル名は Ollama 側の語彙になる）
+        local: unsupported(notes::MODEL_NAME_NOT_PORTABLE),
+        evidence: AgentEvidence::Measured(
+            "#1013 の実発生: profile（worker_model: claude-opus-5）+ アカウント\
+             （default_model: claude-opus-5）の master が agent=codex・model 省略で spawn した \
+             結果、`codex --model claude-opus-5 …` が組み立てられ、codex がモデル警告の画面で \
+             止まってプロンプトも届かなかった。orchestrator/mod.rs の resolve_agent_launch は \
+             claude 以外へ profile の worker_model を渡さない設計だったが、アカウントの \
+             default_model が spawn の明示指定と同じ段に混ざっていた",
         ),
     },
     AgentFeature {

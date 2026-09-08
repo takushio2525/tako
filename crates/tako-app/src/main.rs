@@ -1621,8 +1621,9 @@ struct TakoApp {
     /// バックグラウンド行 + バックグラウンドを隠す）。タブ並べ替え / クローズに強い TabId キー
     collapsed_tmux_tabs: std::collections::HashSet<TabId>,
     /// TmuxOpen で作成されたペインの監視対象。対象セッションが消滅したら
-    /// ペインを自動クローズする（ポーリングで検知）
-    tmux_view_panes: HashMap<PaneId, TmuxViewTarget>,
+    /// ペインを自動クローズする（ポーリングで検知）。型は `tako_core::TmuxView`
+    /// （dispatch の window 対象解決と同じ 1 実装。#1185）
+    tmux_view_panes: HashMap<PaneId, tako_core::TmuxView>,
     /// ファイルツリーのコンテキストメニュー（FR-3.12）
     context_menu: Option<ContextMenu>,
     /// リモート（SSH 先）ツリー行のコンテキストメニュー（#919）。
@@ -2414,19 +2415,6 @@ struct GitFeedback {
 enum MirrorSource {
     Backend(String),
     Fixed(tako_core::scroll::ScrollTarget),
-}
-
-/// TmuxOpen でペインに表示している外部 tmux セッションの監視情報
-#[derive(Debug, Clone)]
-struct TmuxViewTarget {
-    /// 監視・再 attach 対象の**元セッション**（ラッパー名は入れない）。
-    /// これが消滅したらペインを自動クローズする
-    session: String,
-    /// 表示用の `tako-view-*` grouped session 名。ペイン close 時にこれを kill する。
-    /// `None` = 元セッションを直接 attach した（復帰経路）ので close 時も kill しない
-    wrapper: Option<String>,
-    /// 元セッションが居る tmux サーバーの socket（`-L` 値。既定サーバーは None）
-    socket: Option<String>,
 }
 
 /// terminal_screen_lines の 1 文字ぶんの描画情報（#39 / #64）
@@ -4083,12 +4071,15 @@ impl TakoApp {
         // 直近 1 時間にアクティビティのあるセッションは対象外（Issue #113: layout.json が
         // 多重起動で巻き戻った場合に protected から漏れる実行中 worker を巻き込まない猶予。
         // 真の残骸はクラッシュから時間が経っており、次回以降の起動で掃除される）
-        let cleaned = app.cleanup_orphan_tmux_with(Some(CLEANUP_STARTUP_GRACE_SECS));
-        if !cleaned.is_empty() {
-            eprintln!(
-                "info: orphan tmux セッションを {} 件クリーンアップした",
-                cleaned.len()
-            );
+        let report = app.cleanup_orphan_tmux_with(
+            None,
+            tako_core::tmux_cleanup::CleanupScope::Startup,
+            Some(CLEANUP_STARTUP_GRACE_SECS),
+        );
+        // #1187: 見送った理由も persist.log へ残す（stderr だけだと .app 起動では
+        // どこにも残らず、呼び出し側は「対象が無かった」と区別できない）
+        if let Some(line) = report.log_line(tako_core::tmux_cleanup::CleanupScope::Startup) {
+            persist_diag(&line);
         }
 
         // IPC リクエストを UI スレッドで dispatch するループ。
@@ -8162,37 +8153,63 @@ impl TakoApp {
         recovered
     }
 
-    fn cleanup_orphan_tmux_with(&self, min_idle_secs: Option<u64>) -> Vec<String> {
+    /// `socket` は対象の tmux サーバー（`None` = 自分の backend）。`scope` で
+    /// 起動時の自動実行と明示操作のガードの強さを分ける（#1187）
+    fn cleanup_orphan_tmux_with(
+        &self,
+        socket: Option<&str>,
+        scope: tako_core::tmux_cleanup::CleanupScope,
+        min_idle_secs: Option<u64>,
+    ) -> tako_core::tmux_cleanup::CleanupReport {
+        use tako_core::tmux_cleanup::{CleanupReport, CleanupSkip};
+        let backend_socket = tako_core::tmux_backend::socket_name();
+        let target = socket.unwrap_or(&backend_socket).to_string();
         // セカンダリモードは backend_sessions（= protected）が空でプライマリの
         // セッションを全部 orphan と誤認するため、判定自体を行わない（Issue #113）
-        if self.secondary
-            || !self.tmux_persist
-            || !tako_core::backend::capabilities().survives_app_exit
-        {
-            return Vec::new();
+        if self.secondary {
+            return CleanupReport::skipped(target, CleanupSkip::Secondary);
         }
-        if tako_core::ports::other_tako_running() {
-            eprintln!("info: 別の tako プロセスが動作中のため orphan クリーンアップをスキップ");
-            return Vec::new();
+        if !self.tmux_persist {
+            return CleanupReport::skipped(target, CleanupSkip::PersistDisabled);
         }
-        let mut protected: std::collections::HashSet<String> =
-            self.backend_sessions.values().cloned().collect();
-        // バックグラウンド中ペインの backend セッションは backend_sessions に残るため上で網羅されるが、
-        // 念のため明示的に保護する（生かしたまま隠れている）
-        for pane in self.workspace.shelved_panes() {
-            if let Some(name) = self.backend_sessions.get(&pane.id()) {
-                protected.insert(name.clone());
+        if !tako_core::backend::capabilities().survives_app_exit {
+            return CleanupReport::skipped(target, CleanupSkip::BackendNotPersistent);
+        }
+        // #1187: 「別の tako-app が動いている」だけで止めない。止めるのは
+        // **対象ソケットを共有する相手**が生きているとき（= 相手の detached セッションを
+        // 巻き込みうるとき）と、相手のソケットを特定できないときだけ。理由は呼び出し側へ返す
+        let peers = tako_core::tmux_cleanup::live_peers();
+        if let Some(skip) = tako_core::tmux_cleanup::blocker(scope, &target, &peers) {
+            return CleanupReport::skipped(target, skip);
+        }
+        let mut protected: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if target == backend_socket {
+            protected.extend(self.backend_sessions.values().cloned());
+            // バックグラウンド中ペインの backend セッションは backend_sessions に残るため上で網羅されるが、
+            // 念のため明示的に保護する（生かしたまま隠れている）
+            for pane in self.workspace.shelved_panes() {
+                if let Some(name) = self.backend_sessions.get(&pane.id()) {
+                    protected.insert(name.clone());
+                }
             }
         }
-        // 表示中ビューの元セッション・ラッパーも保護（足元を崩さない）
-        for target in self.tmux_view_panes.values() {
-            protected.insert(target.session.clone());
-            if let Some(wrapper) = &target.wrapper {
+        // 表示中ビューの元セッション・ラッパーも保護（足元を崩さない）。
+        // ビューは別サーバーのセッションも開けるので、対象ソケットのものだけを見る
+        for view in self.tmux_view_panes.values() {
+            let view_socket = view
+                .socket
+                .clone()
+                .unwrap_or_else(|| backend_socket.clone());
+            if view_socket != target {
+                continue;
+            }
+            protected.insert(view.session.clone());
+            if let Some(wrapper) = &view.wrapper {
                 protected.insert(wrapper.clone());
             }
         }
-        let socket = tako_core::tmux_backend::socket_name();
-        tako_core::tmux_backend::cleanup_orphans(&socket, &protected, min_idle_secs)
+        let killed = tako_core::tmux_backend::cleanup_orphans(&target, &protected, min_idle_secs);
+        CleanupReport::killed(target, killed)
     }
 
     /// レイアウトの保存（Phase 5.5 / FR-5）。構造が変わったときだけ書き込む。
@@ -18644,7 +18661,7 @@ impl TmuxHost for TakoApp {
     ) {
         self.tmux_view_panes.insert(
             pane,
-            TmuxViewTarget {
+            tako_core::TmuxView {
                 session,
                 wrapper,
                 socket,
@@ -18653,11 +18670,18 @@ impl TmuxHost for TakoApp {
     }
 
     /// orphan tmux セッションの一括クリーンアップ（FR-2.16.11）。現存ペイン・バックグラウンドペインの
-    /// backend セッション、表示中ビューの元/ラッパー名を protected として渡し、backend
+    /// backend セッション、表示中ビューの元/ラッパー名を protected として渡し、対象
     /// socket 上の取り残しだけを kill する。tmux 永続化 OFF / tmux 不在では何もしない
-    fn cleanup_orphan_tmux(&self) -> Vec<String> {
+    fn cleanup_orphan_tmux(&self, socket: Option<&str>) -> tako_core::tmux_cleanup::CleanupReport {
+        // #1187 の A/B: legacy は socket を捨て、起動時と同じ「他 tako-app がいれば見送る」
+        let legacy = tako_core::tmux_cleanup::legacy_1187();
+        let scope = if legacy {
+            tako_core::tmux_cleanup::CleanupScope::Startup
+        } else {
+            tako_core::tmux_cleanup::CleanupScope::Explicit
+        };
         // 明示操作（tako tmux cleanup / MCP）は従来どおり猶予なし
-        self.cleanup_orphan_tmux_with(None)
+        self.cleanup_orphan_tmux_with(if legacy { None } else { socket }, scope, None)
     }
 
     fn tmux_tab_collapsed(&self, tab: TabId) -> bool {
@@ -18699,6 +18723,11 @@ impl TmuxHost for TakoApp {
 
     fn backend_session(&self, pane: PaneId) -> Option<String> {
         self.backend_sessions.get(&pane).cloned()
+    }
+
+    /// #1185: 取り込みビューの window 操作は内側（このビュー）へ向く
+    fn tmux_view(&self, pane: PaneId) -> Option<tako_core::TmuxView> {
+        self.tmux_view_panes.get(&pane).cloned()
     }
 
     fn is_mirror_scroll_pane(&self, pane: PaneId) -> bool {
@@ -23259,10 +23288,12 @@ fn main() {
         if std::env::var_os("TAKO_PERSIST").is_none() {
             std::env::set_var("TAKO_PERSIST", "0");
         }
-        if std::env::var_os("TAKO_TMUX_SOCKET").is_none() {
+        if std::env::var_os(tako_core::tmux_backend::SOCKET_ENV).is_none() {
+            // 名前の生成は core と 1 実装（#1187: 他インスタンスの所有ソケットを
+            // 同じ規則で復元するので、ここだけ変えると所有者判定が外れる）
             std::env::set_var(
-                "TAKO_TMUX_SOCKET",
-                format!("tako-iso-{}", std::process::id()),
+                tako_core::tmux_backend::SOCKET_ENV,
+                tako_core::tmux_cleanup::isolated_socket_name(std::process::id()),
             );
         }
         if std::env::var_os("TAKO_DISCOVERY_DIR").is_none() {
@@ -23307,11 +23338,11 @@ fn main() {
     // セルフテストの tmux バックエンド項目は、ユーザーの実バックエンド（tako サーバー）を
     // 汚さない隔離ソケットで行う（終了時に self_test 側が kill-server で片付ける）
     if std::env::var_os("TAKO_SELF_TEST").is_some()
-        && std::env::var_os("TAKO_TMUX_SOCKET").is_none()
+        && std::env::var_os(tako_core::tmux_backend::SOCKET_ENV).is_none()
     {
         std::env::set_var(
-            "TAKO_TMUX_SOCKET",
-            format!("tako-st-{}", std::process::id()),
+            tako_core::tmux_backend::SOCKET_ENV,
+            tako_core::tmux_cleanup::self_test_socket_name(std::process::id()),
         );
     }
     // セルフテストの接続情報はメインの control.json に**触らない**（2026-06-12 バグ (8):
@@ -23537,6 +23568,10 @@ mod self_test {
 
     /// セルフテスト開始時刻（環境 1 行の `elapsed` 用。#796）
     static STARTED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    /// メインスレッドのスタック予約量（#1133）。`run()` が起動直後に 1 度だけ入れる。
+    /// `env_line()` から採り直さないのは、`fail()` が背景スレッドの `check()` から
+    /// 呼ばれたときにそのスレッドの値（Rust の既定 2 MiB）を書いてしまうため
+    static MAIN_STACK: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
 
     /// このビルドの構成（#796）。
     ///
@@ -23568,9 +23603,18 @@ mod self_test {
             .map(|s| s.elapsed().as_secs())
             .unwrap_or_default();
         format!(
-            "{} {} elapsed={elapsed}s",
+            "{} {} stack={} elapsed={elapsed}s",
             build_flavor(),
-            tako_control::diag::format_machine_load(tako_control::diag::machine_load())
+            tako_control::diag::format_machine_load(tako_control::diag::machine_load()),
+            // #1133: メインスレッドのスタック予約量。Windows/MSVC の既定 1 MiB だと
+            // 項目 80 で沈黙して死ぬので、落ちたログ単体で
+            // 「予約量が足りていたのか」を後から言えるようにする
+            MAIN_STACK
+                .get()
+                .copied()
+                .flatten()
+                .map(tako_core::platform::stack::format_mib)
+                .unwrap_or_else(|| "unknown".to_string())
         )
     }
 
@@ -25435,6 +25479,19 @@ mod self_test {
                 2,
             )
         }
+    }
+
+    /// **#1133 の A/B の口**: 設定すると起動直後のスタック予約チェックを飛ばし、
+    /// 予約が足りないまま項目 80 まで走る「修正前」の挙動へ戻る。
+    ///
+    /// 同じバイナリで旧挙動を再現できるようにしておくのは、直したことを実測で示すため。
+    /// #1133 の変数は**コードではなく PE ヘッダのスタック予約量**なので、実機の A/B は
+    /// 「リンク済みの exe へ `editbin /STACK:1048576` を当てて予約だけ 1 MiB へ戻す」と
+    /// この env の 2 手で作る（再ビルド不要・コードは 1 バイトも違わない）。
+    /// これを立てずに予約だけ戻すと、前提チェックが `FAILED` を出して項目 80 へ
+    /// 到達しない = 番犬の検出力そのものの確認になる
+    fn legacy_1133() -> bool {
+        std::env::var_os("TAKO_1133_LEGACY").is_some()
     }
 
     /// **#1165 の A/B の口**: 設定すると「固定窓・1 回・送り直しなし」の旧経路へ戻る。
@@ -36296,7 +36353,25 @@ mod self_test {
         // 実行環境を最初に 1 行出す（#796）。同じソースでも load とビルド構成で
         // 落ちる項目が変わるので、ログ単体で条件が再現できる状態にしておく
         let _ = STARTED_AT.set(std::time::Instant::now());
+        // #1133: env 行が `stack=` を書けるように、**印字より前に**メインスレッドで測る
+        let reserve = tako_core::platform::stack::current_thread_reserve();
+        let _ = MAIN_STACK.set(reserve);
         println!("TAKO_APP_SELF_TEST_ENV: {}", env_line());
+        // #1133: Windows/MSVC の既定 1 MiB では項目 80（#380 の共有タブバー）の途中で
+        // メインスレッドのスタックが尽き、判定行も `FAILED` も出さずに
+        // **プロセスごと落ちる**（`thread 'main' has overflowed its stack` だけが残る）。
+        // 前提が崩れているならここで言う = 沈黙の死を、直し方の書いてある失敗へ替える。
+        // 予約量は tako-app/build.rs の `/stack:` 宣言で決まるので、ここが落ちたら
+        // 「宣言が落ちた」か「宣言を効かせないリンカで作った」を疑う
+        if let Some(note) = reserve.and_then(tako_core::platform::stack::shortfall_note) {
+            if legacy_1133() {
+                // A/B のとき（TAKO_1133_LEGACY=1）だけ、足りないまま走らせて
+                // #1133 の症状（項目 80 での沈黙した死）を再現させる
+                println!("TAKO_SELF_TEST_1133: legacy=1 前提チェックを飛ばす: {note}");
+            } else {
+                fail(&note);
+            }
+        }
         cx.spawn(async move |cx| {
             let any: AnyWindowHandle = window.into();
             let wait = |cx: &mut AsyncApp, ms: u64| {

@@ -19,46 +19,6 @@
 
 ---
 
-## 2026-09-07（#1154: master / solo の system prompt を起動時ロード予算の対象にして手順書へ分離）
-- 手順の詳細を `orchestrator/guides/*.md` の 11 topic へ**原文そのまま**移し、`tako orchestrator guide <topic>` /
-  MCP `tako_orchestrator_guide` で引く形に。予算 24 KB を `context_budget` へ追加し、超過は block 別バイト数で提案
-- takodev の生成物 59,501 B / 40,687 tok → **32,626 B / 20,366 tok**（既定 blocks 単体 21,072 B）。全 topic の
-  guide 出力が移送前ブロックと byte 一致 / A/B `TAKO_1154_LEGACY=1` で新テスト 3 本が FAILED / 全 3542 件緑
-
-## 2026-09-07（#1160: 仮想ディスプレイが列挙で空のときメイン画面へ窓を開かないようにした）
-- 原因は物差しの取り違え: `cx.displays()` = `CGGetActiveDisplayList` なので眠っている面は NSScreen に残ったまま
-  列挙から落ちる（実測: 2 枚とも `CGDisplayIsActive=0`）。1 回引いて即 `NotFound` → 既定の面へ落ちていた
-- 核（純粋）の `retry_policy` / `miss_for` でやり直し（空のあいだだけ・100ms × 検証 20 / 通常 3）と落とし所を決め、
-  **列挙が空 + 検証用は窓を開かず終了**（コード 4 + stderr）。面が見えて外したときは落ちるが stderr で警告する
-  （そこで止めると `build-app.sh --verify` と Windows 実機の検証が起動できない）。`ensure` は描画可能までを完了条件にした
-- 実測: 眠ったままの隔離起動が exit=4 で無窓 / `ensure` 後は `やり直し=5 回` → tako-vd へ解決 / A/B は pre-fix で core 3・番犬 3・shell 17 件が FAILED
-
-## 2026-09-07（#1162: セルフテスト項目 102 の `shown=false` を根治。実因は負荷ではなくペインの高さ）
-- 落ちた回の実測は `size=Some((58, 9))` = 13 行の 25 桁 fixture の箱上端と `❯ 1.` が画面外。fixture ペインを
-  **専用タブ（全高）**へ移し、実寸が届いてから描く（`notify_and_draw`）+ 出現判定を状態待ちへ（`wait_for_dispatch_state`）
-- A/B `TAKO_1162_LEGACY=1` は load 2.5 でも 102 が確定 FAILED / `TAKO_1162_INJECT=nodialog` は 3 回送り直しても FAILED
-- 項目 102 は 15/15 ok（判定時 load 3.4〜5.0）・完走 8 回。中断は #816 / #1058 / #694（別件の負荷フレーク）
-
-## 2026-09-08（#1153: セルフテストの高負荷フレーク 4 系統を状態待ちへ寄せた）
-- (e) #694 / (g) #1058 は `pane_display` の材料（`state=Running` / 猶予 #720 が role で 25 秒へ伸びる）を
-  1 回読みしていたのが原因。113 #816 は固定 2500ms 窓の「40 行増えた」、#657 は総数の差分（#1124 の `tabs=8->4`）
-- 全 4 系統を状態待ち + `state_wait_budget` へ。#657 は押す前のタブ ID 集合で判定。番犬
-  `固定窓のあいだに増えた数を測っていない` を追加（origin/main の 657 のループを名指し）
-- GUI 16 回（tako-vd）: 無負荷 1 + 人工高負荷 3 連続 OK（load 9.1〜15.9）/ A/B は `TAKO_1153_LEGACY=1` +
-  遅れの注入 4 種で旧経路が確定 FAILED（(g) は Issue と同じ JSON）/ 回帰の注入 4 種は新経路でも FAILED
-
-## 2026-09-08（#1165: セルフテストの画面エコー待ちを固定窓から状態待ちへ寄せた）
-- 項目 1b の固定 8 × 800ms 窓が load 12.9 で尽き 1c 以降が全部走らなかった。同型 9 か所を
-  `type_until_focused_text`（`state_wait_budget` + 送り直し 2 回 + `TAKO_SELF_TEST_1165` の診断）へ
-- 番犬 `固定窓のあいだに画面の文字列を待っていない` を追加（pre-fix の実ファイルを 9 行名指し・旧番犬は見逃し）
-- GUI（tako-vd）無負荷 2 + 高負荷 1 完走（判定時 load 21.9〜34.6）/ `INJECT=late` で旧のみ FAILED / `noecho` は新も FAILED
-
-## 2026-09-08（#1167: 「追記ぶんだけ読む」の検査を実時間から読み出しバイト数へ替えた）
-- `claude_remote_link` の効果テストが `Instant::elapsed` の全走査比較だったため高負荷で確率的に落ちていた。
-  走査本体を `scan_source<R: Read + Seek>` へ出し、テストは**実際に読んだバイト数**を数える読み口を渡す形へ
-- 実測 全走査 4,194,592 B / 追記ぶんだけ 355 B（上限 64 KiB）。番犬 `追記ぶんだけ読む検査を実時間で測っていない` +
-  conventions の新節。A/B は注入 5ms で旧 19/20 FAILED・新 0/20、「全文を読むが consumed は正しい」注入で新が FAILED
-
 ## 2026-09-08（#995: セルフテスト項目 108 の高負荷フレークを窓ガードで根治した）
 - 外から来る全体 notify で `output=(panes +2 chrome +2)` = 意図的な全体 notify と同値になっていた。#858 の
   ガードを 108 へ寄せ、判定（`redraw_window_clean`）と窓の作り方（`measure_output_redraw`）を 110 と 1 実装に統合
@@ -102,6 +62,36 @@
 - 全 47 区間の kana を機械で出して全件読み、誤読 5 件を修正（`3 つ`→みっつ / `1 行`×2 / `空のペイン` / `140 個`）
 - **ユーザー辞書は空白でトークンが割れて当たらない**（実測）ので、合成直前の置換表 `reading-overrides.tsv` を正本に
 - v4 = 9:59 / -14.9 LUFS / TP -1.5 dBTP / PII 0 件。点検は `check-readings.sh --diff`
+
+## 2026-09-09（#1013: codex / agy の spawn に claude 語彙のモデル既定を渡さないようにした）
+- 真因はアカウント（#504）の `default_model` を spawn の明示指定と同じ段へ畳んでいたこと。`AccountDefaults` で段を分け、継承の可否は新 1 マス `worker_model_default_inherit`（claude のみ対応）へ問う形に（#982）。応答に `model_source` / `effort_source` を追加
+- 実 spawn（隔離 + tako-vd）: codex は自分の既定 `gpt-5.6-sol medium` で起動して `OK1013` を返した / agy も `--model` `--effort` なし / claude は `--model claude-opus-5 --effort max` のまま不変
+- A/B `TAKO_1013_LEGACY=1` は Issue と同じ `codex --model claude-opus-5 …` を再現。番犬 3 本 + 単体 7 本。全 3613 件緑
+
+## 2026-09-09（#1019: setup ディレクトリを data dir の境界へ寄せ、旧 Windows パスから自動移設）
+- `setup_dir()` の macOS 直書きを `tako_control::setup::setup_dir`（= `data_dir()/setup`）へ集約。旧パスは `SchemaId::Setup` の番地 + 専用実装で移設（写す → 旧ごと `setup.pre-v1.bak` へ rename・**隔離中は移設しない**）
+- A/B 実測: 同条件の `setup --yes` が旧バイナリは HOME 側へ 16 ファイル・新は `$TAKO_DATA_DIR/setup` へ。本番 dir は隔離 6 経路の前後でハッシュ・mtime とも不変
+- 番犬 `setup_dir_boundary_watchdog` 4 本（修正前コードで 2 本が確定 FAILED）+ 単体 12 本。全 3629 件緑（main 取り込み後）。Windows 実機での移設は #467 配下で要確認
+
+## 2026-09-09（#1187: tmux cleanup が黙って何もしない形をやめ、`--socket` を実装した）
+- 見送りの判定を「別の tako-app がいるか」から**対象ソケットの所有者**へ（相手の初期環境を `KERN_PROCARGS2` で読み `tako-iso-<pid>` 等を復元）。応答を `{socket, killed, skipped, detail}` へ広げ、見送り・kill の両方を persist.log へ 1 行
+- 実測（隔離 + tako-vd・他 tako-app 3 本稼働）: 省略時 `killed=[aaa,bbb]` / `--socket <別>` で `ccc` を kill / `--socket tako` は `skipped=peer_shares_socket`（pid 71082）で本番 17 セッションは不変
+- A/B `TAKO_1187_LEGACY=1` は Issue と同じ `{"killed":[]}` + `--socket` 無視を再現。番犬 4 本（修正前ソースで全滅）+ 単体 12 本。全 3621 件緑
+
+## 2026-09-09（#1133: Windows 実機の項目 80 のスタックオーバーフローを予約量の宣言で根治した）
+- 真因の commit は無い（7 commit の伸びは合計 +12,288 B）。`-O0` の GPUI フレームが 1 関数 135〜828 KiB（製品の描画経路も含む）で、Windows/MSVC の既定 1 MiB を食い潰していた
+- `build.rs` 2 本が `/stack:8388608` を宣言（正は `platform::stack`。Zed も同型）+ セルフテストが起動直後に実測して足りなければ項目 80 前に FAILED。番犬は macOS でも走る 3 本
+- 実機は素の debug ビルドで項目 80 を 2/2 通過（完走は別件の負荷依存で項目 105 / 143 まで）。A/B は同一 exe へ `editbin /STACK:` で 1 MiB=クラッシュ / 2 MiB=通過 / 8 MiB=通過
+
+## 2026-09-09（#1185: 取り込みペインの select-window が内側へ届くようにし、`open --window` を到達可能にした）
+- 対象解決を `tako_core::tmux::window_target`（取り込みビュー優先 → バックエンド）へ集約。旧実装は二重ネストの**外側**（tako の backend）を見ていたので別セッションの window を切り替えて成功を返していた
+- `--window` は CLI と MCP catalog の両方へ（protocol にあるのに 3 経路すべてから到達不能）。番犬 `mcp_param_reachability`（mapper が読む引数が catalog に在るか）が同型の再発を落とす
+- 隔離 GUI 実測: ラッパーだけ `window_active` が 1 → 2 へ動き元は 0 のまま / `open --window 2` と MCP の `window:1` が実際にその window を表示 / A/B `TAKO_1185_LEGACY=1` は外側に当たって FAILED
+
+## 2026-09-09（#1015: codex の背景ターミナル待ちを idle + 未達と誤検知しないようにした）
+- 真因は**ペイン幅**（負荷でも rollout でもない）: 44 桁では codex が `• Waiting for background terminal (1m 04s •…` と自分で切るので `esc to interrupt` が消え、末尾の `›` を拾って idle になっていた。同じ理由で `prompt_undelivered`（自動再送）の抑制も外れる = 2 症状は同一原因
+- 判定を「`•` で始まり `(` の直後が経過時間 + その直後が区切り」へ。**語では判定しない**（`Waited for …` は完了後も残る履歴行 = 永久 busy になる。実測 5 回残存）。未達の断定は rollout を実際に読めたときだけにし、読めないときは `prompt_delivery_unverified` へ降格
+- 実採取 2 幅 + 実 worker（器つき隔離）で `busy` / `codex-session` / events 空。A/B `TAKO_1015_LEGACY=1` は Issue と同じ `status=idle` `prompt_delivery=undelivered` `resend_prompt` を再現。番犬 3 本 + 単体 9 本。全 3659 件緑（main 取り込み後）
 
 ## 2026-09-09（#1081: かんたん表示章を手順型デモへ差し替え）
 - 旧 c5_gui（1 区間）を捨て、実クリック / 実キー入力で撮る `scene_guimode` と 11 区間の台本（`c5_gui1`〜11）を作った

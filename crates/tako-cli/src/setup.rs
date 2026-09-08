@@ -49,17 +49,19 @@ pub fn load_answers(input: Option<&str>) -> Result<SetupAnswers, String> {
 
 // --- パスユーティリティ ---
 
+/// ホーム解決の入口は [`tako_core::paths::home_dir`]（#870）。ここで
+/// `HOME` / `USERPROFILE` を読み直すと、同じ意味論が 2 箇所になって片方だけ直る。
+/// 相対パスを弾くのはこの経路の追加条件（agent の設定ファイルを相対で組まない）
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
+    tako_core::paths::home_dir().filter(|p| p.is_absolute())
 }
 
+/// setup の生成物の置き場。**正本は [`tako_control::setup::setup_dir`]**（#1019）。
+///
+/// ここで `~/Library/Application Support/tako/setup` を直書きしていたのが Issue #1019 で、
+/// Windows では存在しない形の場所へ書き、`TAKO_DATA_DIR` での隔離も効かなかった
 fn setup_dir() -> Result<PathBuf, String> {
-    home_dir()
-        .map(|h| h.join("Library/Application Support/tako/setup"))
-        .ok_or_else(|| "ホームディレクトリが取得できない（$HOME 未設定）".into())
+    tako_control::setup::setup_dir()
 }
 
 fn codex_home_dir() -> Option<PathBuf> {

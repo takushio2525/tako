@@ -701,6 +701,17 @@ pub struct DeliveryEvidence {
     /// 「claude が起動した」証拠であって「プロンプトが届いた」証拠ではない（#530）。
     /// 入るのは codex の `task_started` のように**投入されてはじめて起きる**事象だけ
     pub turn_observed: bool,
+    /// この系統の一次シグナルを**読もうとして読めなかった**（Issue #1015）。
+    ///
+    /// 「読めた上でターンが 1 件も無い」と「読めていない」は**別物**なのに、
+    /// 旧実装はどちらも猶予超過で `OverdueSuspect`（= `prompt_undelivered` +
+    /// 自動再送）へ倒していた。codex の裏取りは rollout（`$CODEX_HOME/sessions/`）
+    /// でしかできないので、thread が解決できない / rollout が読めない状況では
+    /// **働いている worker へ再送を撃つ**（#1015 の二重指示事故）。
+    ///
+    /// **既定 `false` = 従来どおり**。claude の一次シグナルは `claude agents --json`
+    /// 側なのでここは触らない（#390 の判定は不変）
+    pub primary_signal_unreadable: bool,
 }
 
 /// prompt 送達状態を判定する（Issue #390 要件 4 / #983 の変更 2）。
@@ -755,9 +766,16 @@ pub fn prompt_delivery_assessment_with(
         return PromptDelivery::Pending;
     }
     // 猶予超過。**何をもって未達と言えるか**は系統ごとに違う（マトリクスが正本）。
-    // 知らない agent 名は「観測手段が無い」側へ倒す（黙らず、断定もしない）
+    // 知らない agent 名は「観測手段が無い」側へ倒す（黙らず、断定もしない）。
+    //
+    // #1015: 一次シグナルを持つ系統でも、**そのシグナルを実際に読めていなければ
+    // 未達と断定しない**。「読めて 0 ターン」だけが未達の証拠で、「読めなかった」は
+    // 未確認（`verify_then_resend`）に留める。断定すると supervisor の自動再送が走り、
+    // 実際には働いている worker へ同じ依頼が二度渡る
     match Agent::parse(&entry.agent).map(agent_support::delivery_observation) {
-        Some(DeliveryObservation::Structured) => PromptDelivery::OverdueSuspect,
+        Some(DeliveryObservation::Structured) if !evidence.primary_signal_unreadable => {
+            PromptDelivery::OverdueSuspect
+        }
         _ => PromptDelivery::Unverified,
     }
 }
@@ -1119,10 +1137,79 @@ mod tests {
                 &entry,
                 now_epoch + 10_000,
                 DeliveryEvidence {
-                    turn_observed: true
+                    turn_observed: true,
+                    ..Default::default()
                 }
             ),
             PromptDelivery::Delivered
+        );
+    }
+
+    #[test]
+    fn i1015_一次シグナルを読めていないなら未達と断定しない() {
+        // #1015 の受け入れ条件 6: `prompt_undelivered`（= 自動再送のトリガ）は
+        // 「rollout を読めて、それでもターンが 1 件も無い」ときだけ出す。
+        // rollout が読めない状況（thread が解決できない / ファイルが無い）で断定すると、
+        // 実際には働いている worker へ同じ依頼が二度渡る
+        let now_epoch = crate::sessions::parse_iso(&crate::sessions::now_iso()).unwrap();
+        let codex = WorkerEntry {
+            agent: "codex".into(),
+            status: "active".into(),
+            spawned_at: crate::sessions::now_iso(),
+            ..Default::default()
+        };
+        let overdue = now_epoch + PROMPT_DELIVERY_GRACE_SECS + 10;
+        // ① 読めて 0 ターン = 本当に未達（従来どおり断定する）
+        assert_eq!(
+            prompt_delivery_assessment_with(&codex, overdue, DeliveryEvidence::default()),
+            PromptDelivery::OverdueSuspect,
+            "読めて 0 ターンなら未達と言ってよい"
+        );
+        // ② 読めていない = 未確認へ降格（自動再送は撃たれない）
+        assert_eq!(
+            prompt_delivery_assessment_with(
+                &codex,
+                overdue,
+                DeliveryEvidence {
+                    primary_signal_unreadable: true,
+                    ..Default::default()
+                }
+            ),
+            PromptDelivery::Unverified,
+            "rollout を読めていないのに未達と断定している（#1015）"
+        );
+        // ③ ターンを観測できたら読めなさに関係なく delivered
+        assert_eq!(
+            prompt_delivery_assessment_with(
+                &codex,
+                overdue,
+                DeliveryEvidence {
+                    turn_observed: true,
+                    primary_signal_unreadable: true,
+                }
+            ),
+            PromptDelivery::Delivered
+        );
+        // ④ 猶予内は読めなさに関係なく pending（降格が猶予判定を食わない）
+        assert_eq!(
+            prompt_delivery_assessment_with(
+                &codex,
+                now_epoch,
+                DeliveryEvidence {
+                    primary_signal_unreadable: true,
+                    ..Default::default()
+                }
+            ),
+            PromptDelivery::Pending
+        );
+        // ⑤ claude は不変（一次シグナルは agents API 側なので #390 の判定を変えない）
+        let claude = WorkerEntry {
+            agent: "claude".into(),
+            ..codex.clone()
+        };
+        assert_eq!(
+            prompt_delivery_assessment(&claude, overdue),
+            PromptDelivery::OverdueSuspect
         );
     }
 

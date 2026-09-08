@@ -74,6 +74,8 @@ pub enum SchemaId {
     Ledger,
     /// `<data_dir>/orchestrator/handoff/`（引き継ぎ。プロジェクト単位化は #915）
     Handoff,
+    /// `<data_dir>/setup/`（`tako setup` の生成物。置き場の是正は #1019）
+    Setup,
     /// `<data_dir>/instances/control-*.json`（インスタンス発見。#113）
     DiscoveryInstance,
     /// `<data_dir>/remote/devices.json`（リモートのペアリング。#283）
@@ -100,6 +102,7 @@ impl SchemaId {
             Self::SoloProfiles => "solo_profiles",
             Self::Ledger => "ledger",
             Self::Handoff => "handoff",
+            Self::Setup => "setup",
             Self::DiscoveryInstance => "discovery_instance",
             Self::RemoteDevices => "remote_devices",
         }
@@ -128,6 +131,7 @@ impl SchemaId {
             Self::SoloProfiles,
             Self::Ledger,
             Self::Handoff,
+            Self::Setup,
             Self::DiscoveryInstance,
             Self::RemoteDevices,
         ]

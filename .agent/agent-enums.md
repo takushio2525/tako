@@ -72,6 +72,12 @@
 `WorkerAgent::has_agents_api()` は #982 で**マトリクスへ吸収済み**
 （`keys::WORKER_STATUS_STRUCTURED` を引く。`TAKO_982_LEGACY=1` で吸収前へ戻せる）。
 
+`Profile::resolve_agent_launch_in` の「claude 語彙のモデル / effort 既定を継承するか」も
+#1013 で吸収済み（`orchestrator::inherits_claude_vocabulary_defaults` →
+`keys::WORKER_MODEL_DEFAULT_INHERIT`。`TAKO_1013_LEGACY=1` で吸収前へ戻せる）。
+番犬 `crates/tako-control/tests/agent_model_vocabulary_watchdog.rs` が
+`WorkerAgent::Claude` の直比較の再登場を落とす。
+
 残りの能力判断は各スライスが**その機能を実装するときに**マトリクス経由へ寄せる。
 先に全部の呼び出し側を書き換えると、実装が無いまま「使える / 使えない」の分岐だけが
 増えて、どのマスが本当に効いているのか分からなくなる。

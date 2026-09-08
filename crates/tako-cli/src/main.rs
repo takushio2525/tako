@@ -1274,7 +1274,11 @@ enum TmuxCommand {
     },
     /// 取り残された orphan tmux セッションを一括クリーンアップする（FR-2.16.11）。
     /// detached・非 grouped・未使用の `tako-` バックエンドセッションだけを kill する
-    /// （使用中・ユーザーのセッションには触れない）。kill した名前を JSON で返す
+    /// （使用中・ユーザーのセッションには触れない）。
+    ///
+    /// 応答は `{socket, killed, skipped, detail}`。掃除しなかったときは `skipped` に
+    /// 理由コード（`peer_shares_socket` = 同じソケットを使う別の tako-app が生きている 等）が
+    /// 入るので、「対象が無かった」と「見送った」を区別できる
     Cleanup {
         /// tmux サーバー名（`tmux -L` 相当。省略時は tako バックエンドサーバー）
         #[arg(long)]
@@ -1332,6 +1336,9 @@ enum TmuxCommand {
         /// tmux サーバー名（`tmux -L` 相当。`tako tmux list` の socket をそのまま渡す）
         #[arg(long)]
         socket: Option<String>,
+        /// 取り込み直後に表示する window index（省略時はセッションの現在 window）
+        #[arg(long)]
+        window: Option<u32>,
         /// 分割の基準ペイン ID（省略時は呼び出し元）
         #[arg(long)]
         pane: Option<u64>,
@@ -6451,6 +6458,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Tmux(TmuxCommand::Open {
             session,
             socket,
+            window,
             pane,
             right: _,
             down,
@@ -6459,7 +6467,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
         }) => Request::TmuxOpen {
             socket: socket.clone(),
             session: session.clone(),
-            window: None,
+            window: *window,
             pane: target_pane(*pane)?,
             direction: match (down, up, left) {
                 (true, _, _) => Some(Direction::Down),
@@ -8707,6 +8715,25 @@ mod tests {
                 session: "s1".into(),
                 window: None,
                 pane: Some(3),
+                direction: Some(Direction::Right),
+            }
+        );
+    }
+
+    /// #1185: protocol にある `window`（特定 window のみ attach）が CLI から到達できる
+    #[test]
+    fn tmux_openはwindow指定を解釈する() {
+        let command = parse(&[
+            "tako", "tmux", "open", "mywork", "--socket", "usersock", "--window", "2", "--pane",
+            "9",
+        ]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::TmuxOpen {
+                socket: Some("usersock".into()),
+                session: "mywork".into(),
+                window: Some(2),
+                pane: Some(9),
                 direction: Some(Direction::Right),
             }
         );
