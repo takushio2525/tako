@@ -16,8 +16,8 @@ tako platform --status pending      # まだ使えないものだけ
 
 | 状態 | 件数 | 意味 |
 | --- | --- | --- |
-| 対応 | 116 / 146（79%） | macOS と同じように使えます |
-| 一部対応 | 14 | 使えますが機能が落ちます。落ち方は各表の「差分」列 |
+| 対応 | 115 / 146（79%） | macOS と同じように使えます |
+| 一部対応 | 15 | 使えますが機能が落ちます。落ち方は各表の「差分」列 |
 | 未実測 | 1 | 実装はあり macOS と同じ経路を通るが、Windows 実機でまだ動かしていないもの |
 | 未対応 | 13 | Windows 側の実装が無い、または動かないことが分かっているもの |
 | 対象外 | 2 | Windows にその概念が無い、または OS が同等機能を標準で持つ |
@@ -119,7 +119,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 
 ## AI 連携（オーケストレーション）
 
-対応 27・一部対応 1
+対応 26・一部対応 2
 
 | 機能 | 状態 | 差分 | 根拠 |
 | --- | --- | --- | --- |
@@ -134,7 +134,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 | `tako_orchestrator_layout` | 対応 | — | 実機セルフテスト: 項目 72（master-reserved の配置と close 後のリフロー） |
 | `tako_orchestrator_workers` | 対応 | — | 実機セルフテスト: 項目 105（レジストリの登録・再読込・再解決） |
 | `tako_orchestrator_worker_status` | 対応 | — | 実機セルフテスト: 項目 74 / 105（IPC 応答と busy 中の後続 send）+ #877 で agents 経由の status=idle を実機実測 |
-| `tako_orchestrator_respond` | 対応 | — | 実機セルフテスト: 項目 95 / 102 / 111（選択肢ダイアログの検知と番号 / ラベル確定） |
+| `tako_orchestrator_respond` | 一部対応 | tako が保持していないペイン（GUI 不在・ペイン消失）へは応答できない。psmux はアウトオブプロセスの画面採取だけができ、入力送出を持たないため | 実機実測: #1200 の Windows 11 実測: 生きているペインへ CLI / MCP の respond が in-process 経路で届き、送ったキーがペインの中のプロセスまで到達する（旧実装は器越しへ直行していたため必ず NoDetachedAccess で失敗していた） |
 | `tako_orchestrator_report` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako orchestrator report --pane <p>` が source=scrollback で実ペインの出力を返す（第 1 層）。transcript 層は実機の claude が未認証で会話を作れず未実測 |
 | `tako_orchestrator_run` | 対応 | — | 実機実測: #937 の Windows 11 実測: MCP `tako_orchestrator_run` が run_id を即返して worker を spawn し、CLI の同期版は status=timeout + 出力 + closed=true まで返す（完遂は実機の claude が未認証のため未実測） |
 | `tako_orchestrator_run_status` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako orchestrator run-status` が starting/running → timeout/finished と elapsed_seconds を返す（MCP と CLI の両経路） |

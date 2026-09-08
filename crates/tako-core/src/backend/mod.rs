@@ -631,6 +631,41 @@ pub trait DetachedAccess: DetachedCapture {
     ) -> Result<(), BackendError>;
 }
 
+/// キー名（[`DetachedAccess::send_key`] の語彙）を端末へ書くバイト列へ直す（#1200）。
+///
+/// **器の外から送るときはキー名のまま器へ渡せる**（tmux の `send-keys` が解釈する）が、
+/// tako-app が保持しているペインへは**自分で PTY へ書く**ので、同じ語彙を
+/// バイト列へ落とす必要がある。器が入力送出を持たない環境（psmux）では
+/// こちらが唯一の送り口なので、語彙は 1 箇所に置く。
+///
+/// 対応しないキー名は `None`（呼び出し側が「送れない」と言えるようにする。
+/// 適当なバイト列を送るとダイアログを誤操作しうるので、推測はしない）
+pub fn key_name_bytes(key: &str) -> Option<Vec<u8>> {
+    // 端末の Enter は CR（LF は「改行挿入」と解釈され送信にならない。#95）
+    let seq: &[u8] = match key {
+        "Enter" | "C-m" => b"\r",
+        "Up" => b"\x1b[A",
+        "Down" => b"\x1b[B",
+        "Right" => b"\x1b[C",
+        "Left" => b"\x1b[D",
+        "Escape" => b"\x1b",
+        "Space" => b" ",
+        "Tab" => b"\t",
+        // 1 文字の印字可能 ASCII（選択肢の番号 `1` / `y` / `n` 等）はそのまま
+        other => {
+            let mut chars = other.chars();
+            let (Some(c), None) = (chars.next(), chars.next()) else {
+                return None;
+            };
+            if !c.is_ascii_graphic() {
+                return None;
+            }
+            return Some(vec![c as u8]);
+        }
+    };
+    Some(seq.to_vec())
+}
+
 // --- 本番 spawn 経路の配線（#519 M1） --------------------------------------
 
 /// ペインへ器を割り当てる。**本番の spawn 経路と、dispatch の事前予約が共有する 1 箇所**。
@@ -1957,5 +1992,22 @@ mod tests {
                 "{known} が一覧から落ちている"
             );
         }
+    }
+    #[test]
+    fn キー名はバイト列へ落ちる() {
+        // 端末の Enter は CR（LF は「改行挿入」で送信にならない。#95）
+        assert_eq!(super::key_name_bytes("Enter").as_deref(), Some(&b"\r"[..]));
+        assert_eq!(super::key_name_bytes("Up").as_deref(), Some(&b"\x1b[A"[..]));
+        assert_eq!(
+            super::key_name_bytes("Down").as_deref(),
+            Some(&b"\x1b[B"[..])
+        );
+        // 選択肢の番号・y/n は 1 文字そのまま
+        assert_eq!(super::key_name_bytes("1").as_deref(), Some(&b"1"[..]));
+        assert_eq!(super::key_name_bytes("y").as_deref(), Some(&b"y"[..]));
+        // 落とせない名前は**推測しない**（適当なバイト列はダイアログを誤操作する）
+        assert_eq!(super::key_name_bytes("PageDown"), None);
+        assert_eq!(super::key_name_bytes(""), None);
+        assert_eq!(super::key_name_bytes("あ"), None);
     }
 }

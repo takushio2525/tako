@@ -44207,39 +44207,44 @@ mod self_test {
                     enter_err.is_some_and(|e| e.contains("選択肢ダイアログ")),
                     "ダイアログ中の Enter 単独送信も断られる（勝手に確定させない。#748）",
                 );
-                // ③ respond の下見（バックエンドセッションが要る = tmux 環境のみ）
+                // ③ respond の下見。#1200 で **in-process 経路**（tako-app が保持している
+                // ペイン）が使えるようになったので、バックエンドセッションの有無に関わらず
+                // 走る（旧実装は器越ししか無く、器なしのペインでは skip していた）
+                let probe = window
+                    .update(cx, |app, _, _| {
+                        tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::OrchestratorRespond {
+                                pane_id: dlg_pane,
+                                choice: None,
+                                caller_role: Some("selftest".into()),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                    })
+                    .ok()
+                    .and_then(|r| r.ok());
                 let has_backend = window
                     .update(cx, |app, _, _| {
                         app.backend_sessions
                             .contains_key(&tako_core::PaneId::from_raw(dlg_pane))
                     })
                     .unwrap_or(false);
-                if has_backend {
-                    let probe = window
-                        .update(cx, |app, _, _| {
-                            tako_control::dispatch(
-                                app,
-                                tako_control::protocol::Request::OrchestratorRespond {
-                                    pane_id: dlg_pane,
-                                    choice: None,
-                                    caller_role: Some("selftest".into()),
-                                },
-                                PaneOrigin::Cli,
-                            )
-                        })
-                        .ok()
-                        .and_then(|r| r.ok());
-                    check(
-                        probe.as_ref().is_some_and(|v| {
-                            v["responded"] == false
-                                && v["options"].as_array().map(|o| o.len()) == Some(2)
-                                && v["kind"] == "usage_limit"
-                        }),
-                        "respond の choice 省略が送信せず構造を返す (#748)",
-                    );
-                } else {
-                    eprintln!("（バックエンドセッション不在のため respond 下見をスキップ）");
-                }
+                println!(
+                    "TAKO_SELF_TEST_1200: backend_session={has_backend} probe={}",
+                    probe
+                        .as_ref()
+                        .map(|v| v["kind"].to_string())
+                        .unwrap_or_else(|| "none".into())
+                );
+                check(
+                    probe.as_ref().is_some_and(|v| {
+                        v["responded"] == false
+                            && v["options"].as_array().map(|o| o.len()) == Some(2)
+                            && v["kind"] == "usage_limit"
+                    }),
+                    "respond の choice 省略が送信せず構造を返す (#748 / #1200)",
+                );
                 // ④ ダイアログを消せば送信は通常どおり通る（ガードが居座らない）。
                 // Ctrl-C（sleep を止める）→ clear（画面からダイアログの絵を消す）を
                 // PTY へ直接書く。dispatch の Send はいま断られる状態なので使えない

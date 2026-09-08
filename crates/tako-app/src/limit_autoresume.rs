@@ -12,8 +12,10 @@
 //! # 動作の分担
 //!
 //! - idle 型 = 継続ナッジ。既存の `queue_prompt_flow`（送達確認つき。#32 / #790）へ積むだけ
-//! - ダイアログ型 = キー送出を伴うので**バックグラウンド**で `respond_to_choice_dialog`
-//!   を通す（1 回あたり数百 ms のスリープが入るので UI スレッドでは走らせない）
+//! - ダイアログ型 = キー送出を伴うので**バックグラウンド**で `respond_via` を通す
+//!   （1 回あたり数百 ms のスリープが入るので UI スレッドでは走らせない）。
+//!   届き方（in-process / 器越し）は **UI スレッドで**決めて手を持たせる（#1200。
+//!   `TerminalSession` はスレッドを越えられないが `PaneAccess` は越えられる）
 
 use std::collections::HashMap;
 
@@ -103,8 +105,13 @@ pub(crate) struct LimitResumeTracker {
 /// バックグラウンドで実行する復帰動作（UI スレッドでは組み立てるだけ）
 pub(crate) struct LimitResumeJob {
     pub(crate) pane: PaneId,
-    pub(crate) backend_session: String,
     pub(crate) worker_id: String,
+    /// tako-app が保持しているペインへの手（#1200）。**UI スレッドで取り出しておく**
+    /// （`TerminalSession` はスレッドを越えられないが、この手は越えられる）。
+    /// 器が入力送出を持たない環境（psmux = Windows）ではこれが唯一の送り口
+    pub(crate) access: Option<tako_core::PaneAccess>,
+    /// 器越しの手（GUI が保持していないペイン。`access` が無いときの経路）
+    pub(crate) backend_session: Option<String>,
 }
 
 /// 監査ログの action 名（#749 の `ctx_handoff_nudge` と同じ場所・同じ形式）
@@ -220,17 +227,21 @@ impl TakoApp {
                 }
                 ResumeAction::RespondDialog => {
                     // ダイアログへの応答はキー送出（数百 ms のスリープ込み）なので
-                    // バックグラウンドへ回す。到達手段が無ければ触らずに記録だけ残す
-                    let Some(backend_session) = TmuxHost::backend_session(self, pane) else {
+                    // バックグラウンドへ回す。到達手段が無ければ触らずに記録だけ残す。
+                    // #1200: **in-process を先に見る**（器が入力送出を持たない環境では
+                    // 器越しの手が無いので、ここで諦めると Windows で一生応答できない）
+                    let access = SessionHost::session(self, pane).map(|s| s.access());
+                    let backend_session = TmuxHost::backend_session(self, pane);
+                    if access.is_none() && backend_session.is_none() {
                         let tracker = self.limit_resume.get_mut(&pane).expect("直前に挿入済み");
-                        tracker.note_attempt(now, "no backend session (cannot respond)");
+                        tracker.note_attempt(now, "no route (cannot respond)");
                         audit(
                             &worker_id,
                             pane,
-                            "skipped: ペインに永続バックエンドが無く、ダイアログへ応答できない",
+                            "skipped: ペインへ届く手が無く、ダイアログへ応答できない",
                         );
                         continue;
-                    };
+                    }
                     let tracker = self.limit_resume.get_mut(&pane).expect("直前に挿入済み");
                     tracker.note_attempt(now, "responding to limit dialog");
                     tracker.in_flight = true;
@@ -245,8 +256,9 @@ impl TakoApp {
                     );
                     jobs.push(LimitResumeJob {
                         pane,
-                        backend_session,
                         worker_id,
+                        access,
+                        backend_session,
                     });
                 }
             }
@@ -371,18 +383,39 @@ impl LimitResumeTracker {
 /// 2. 安全な選択肢をラベルで選ぶ（無ければ何も送らずに諦める）
 /// 3. そのラベルで応答する（送出経路・検証・persist.log の監査は `respond` と同じ）
 pub(crate) fn run_limit_resume_job(job: &LimitResumeJob) -> String {
-    use tako_control::dispatch::respond_to_choice_dialog;
-
     let caller = Some("limit-autoresume");
-    let probe =
-        match respond_to_choice_dialog(&job.backend_session, job.pane.as_u64(), None, caller) {
-            Ok(v) => v,
-            Err(e) => {
-                let msg = format!("dialog probe failed: {e}");
-                audit(&job.worker_id, job.pane, &msg);
-                return msg;
+    // #1200: 届き方は in-process（UI スレッドで取り出した手）を先に使う。
+    // 器が入力送出を持たない環境（psmux = Windows）では器越しの手が存在しない
+    let access: Box<dyn tako_control::reach::DialogAccess> = match &job.access {
+        Some(access) => Box::new(tako_control::reach::LiveDialogAccess::new(access.clone())),
+        None => {
+            let hint = job.backend_session.as_deref().unwrap_or_default();
+            match tako_control::reach::detached_session(hint) {
+                Some((session, detached)) => Box::new(
+                    tako_control::reach::DetachedDialogAccess::new(session, detached),
+                ),
+                None => {
+                    let msg = format!(
+                        "dialog probe failed: {}",
+                        tako_control::reach::no_detached_access_note()
+                    );
+                    audit(&job.worker_id, job.pane, &msg);
+                    return msg;
+                }
             }
-        };
+        }
+    };
+    let respond = |choice: Option<&str>| {
+        tako_control::dispatch::respond_via(access.as_ref(), job.pane.as_u64(), choice, caller)
+    };
+    let probe = match respond(None) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("dialog probe failed: {e}");
+            audit(&job.worker_id, job.pane, &msg);
+            return msg;
+        }
+    };
     // 下見の時点で種別が usage_limit でなければ触らない（画面が入れ替わった）
     if probe.get("kind").and_then(|k| k.as_str()) != Some("usage_limit") {
         let msg = format!(
@@ -425,7 +458,7 @@ pub(crate) fn run_limit_resume_job(job: &LimitResumeJob) -> String {
         return msg;
     };
     // 番号ではなくラベルで応答する（選択肢の並びが版で変わっても課金系を掴まない）
-    match respond_to_choice_dialog(&job.backend_session, job.pane.as_u64(), Some(label), caller) {
+    match respond(Some(label)) {
         Ok(v) => {
             let resolved = v.get("resolved").and_then(|r| r.as_bool()).unwrap_or(false);
             let msg = format!("responded: 「{label}」 resolved={resolved}");
