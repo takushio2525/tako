@@ -1080,9 +1080,15 @@ pub fn detect_screen_agent(output: &str) -> Option<Agent> {
 ///
 /// `agent` が `None`（不明）のときは従来どおり和集合 = 挙動不変
 pub fn screen_looks_busy_for(output: &str, agent: Option<Agent>) -> bool {
+    screen_looks_busy_in(output, agent, legacy_1015())
+}
+
+/// 旧挙動かどうかを明示して判定する（#1015 の A/B）。
+/// **判断を引数に置く**ので env グローバルを触らずに新旧どちらも検査できる
+pub(crate) fn screen_looks_busy_in(output: &str, agent: Option<Agent>, legacy: bool) -> bool {
     let strong = tail_lines(output, BUSY_STRONG_TAIL)
         .iter()
-        .any(|l| strong_marker(l, agent));
+        .any(|l| strong_marker_in(l, agent, legacy));
     if strong {
         return true;
     }
@@ -1098,8 +1104,97 @@ pub fn screen_looks_busy_for(output: &str, agent: Option<Agent>) -> bool {
 /// 「画面の推測を外したときに本物の busy を見落とす」新しい失敗を作ってしまう
 /// （例: claude が busy で `esc to interrupt` を出しているのに、出力本文に
 /// `esc to cancel` の文字列が混ざって agy と誤推測されると強マーカーを引けない）
-fn strong_marker(line: &str, _agent: Option<Agent>) -> bool {
-    line.contains("esc to interrupt") || line.contains("esc to cancel") || is_spinner(line)
+fn strong_marker_in(line: &str, _agent: Option<Agent>, legacy: bool) -> bool {
+    line.contains("esc to interrupt")
+        || line.contains("esc to cancel")
+        || is_spinner(line)
+        || codex_running_footer_in(line, legacy)
+}
+
+/// codex の「いま走っている」フッター行か（Issue #1015）。
+///
+/// **`esc to interrupt` を当てにできない**のが要点。codex は自分でフッター行を
+/// ペイン幅に合わせて `…` で切るので、語句が長いと打ち切られて消える。
+/// 実採取（codex-cli 0.153.0・素の tmux）:
+///
+/// ```text
+/// 100 桁: • Waiting for background terminal (1m 08s • esc to interrupt) · 1 background terminal…
+///  44 桁: • Waiting for background terminal (1m 04s •…
+/// ```
+///
+/// 44 桁側は `esc to interrupt` も `… (`（`is_spinner` の目印）も残らないため、
+/// 旧実装では busy を引けず、末尾の入力欄 `›` を拾って **idle** と判定していた
+/// （#1015 の実害: `WORKER_IDLE` + `prompt_undelivered` の誤検知）。
+///
+/// 見るのは **`•` で始まる行の `(` の直後が経過時間で、その直後が区切り（`•` / `·` /
+/// `)` / `…`）か行末か**だけ。これで
+/// 「走っている行」と「履歴として残り続ける行」を切り分けられる:
+///
+/// | 実採取の行 | 判定 | なぜ |
+/// |---|---|---|
+/// | `• Waiting for background terminal (1m 04s •…` | busy | `(` の直後が経過時間 |
+/// | `• Working (13s • esc to interrupt) · 1 back…` | busy | 同じ（`is_spinner` でも引ける） |
+/// | `• Waited for background terminal · sleep 300; …` | **busy にしない** | 完了済みツールの履歴行（括弧なし）。実測で同一画面に 5 回残った |
+/// | `─ Worked for 5m 08s ─────` | **busy にしない** | ターン完了の区切り線（`•` で始まらない・括弧なし） |
+///
+/// 履歴行を busy にすると worker が永遠に完了しなくなる（#571 / #120 の「永久 busy」）
+pub(crate) fn codex_running_footer_in(line: &str, legacy: bool) -> bool {
+    if legacy {
+        return false;
+    }
+    let t = line.trim_start();
+    if !t.starts_with('•') {
+        return false;
+    }
+    t.split('(').skip(1).any(|rest| {
+        let Some(n) = elapsed_prefix_len(rest) else {
+            return false;
+        };
+        // 経過時間の**直後**がフッターの区切り（`•` / `·` / `)` / `…`）か行末であること。
+        // これが無いと codex の通常メッセージに混ざった `(12s ago)` のような表記を
+        // 拾って**永久 busy** になる（誤検知の実害は不検知より大きい。#571 / #120）
+        let after = rest[n..].trim_start();
+        after.is_empty() || after.starts_with(['•', '·', ')', '…'])
+    })
+}
+
+/// 先頭の経過時間表記を読み切り、その長さ（バイト数）を返す。
+/// 実採取の形: `13s` / `1m 04s` / `1h 22m 18s`（`starts_with_elapsed` は先頭 1 単位だけを
+/// 見るので、その後ろに何が続くかを問うにはこちらが要る。#1015）
+fn elapsed_prefix_len(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let mut units = 0;
+    loop {
+        let digits_start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == digits_start {
+            break;
+        }
+        if i < b.len() && matches!(b[i], b'h' | b'm' | b's') {
+            i += 1;
+            units += 1;
+        } else {
+            break;
+        }
+        // 単位のあいだの空白（`1m 04s`）。次が数字のときだけ続ける
+        if i + 1 < b.len() && b[i] == b' ' && b[i + 1].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    (units > 0).then_some(i)
+}
+
+/// #1015 の A/B。`TAKO_1015_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
+/// （codex の進行中フッターを強マーカーに入れない + 一次シグナルの読めなさを無視する）。
+/// 一度だけ読んでキャッシュする（判定は 1 画面あたり数十回呼ばれる）
+pub fn legacy_1015() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_1015_LEGACY").map(|v| v == "1") == Ok(true))
 }
 
 /// 弱マーカー（完了後の出力にも現れる一般語）。末尾の狭い範囲だけを見る。
@@ -3415,6 +3510,204 @@ Antigravity CLI requires permission to read, edit, and execute files here.
         );
         // 信頼ダイアログ待ちも busy ではない（人間 / PromptFlow の承諾待ち）
         assert!(!screen_looks_busy(AGY_TRUST_REAL));
+    }
+
+    // ─── #1015: codex の背景ターミナル待ちを idle と誤読しない ──────────
+    //
+    // 実採取（codex-cli 0.153.0・素の tmux・2026-09-09）。同じ状態を 2 つの幅で採り、
+    // **codex 自身が行末を `…` で切る**ことを確かめてある。パスは
+    // `/private/tmp/probe` へ置換（#927。ユーザー名は含まれていない）
+
+    /// 背景ターミナル待ち（100 桁）。`esc to interrupt` が残っている = 旧実装でも busy
+    const CODEX_BG_WAIT_WIDE: &str = "\
+• コマンドは起動済みです。現在はまだ実行中で、完了出力を待っています。
+
+• Waiting for background terminal (1m 08s • esc to interrupt) · 1 background terminal running · /ps…
+  └ sleep 300; echo DONE1015
+
+
+› Ask Codex to do anything
+
+  gpt-5.6-sol high · /private/tmp/probe";
+
+    /// **同じ状態を 44 桁のペインで採ったもの**（#1015 の現場）。
+    /// codex が行を切ったので `esc to interrupt` も `… (` も残っていない
+    const CODEX_BG_WAIT_NARROW: &str = "\
+• コマンドはセッション内で実行中です。引き続
+  き待機します。
+
+• Waiting for background terminal (1m 04s •…
+  └ sleep 300; echo DONE1015
+
+
+› Ask Codex to do anything
+
+  gpt-5.6-sol high · /private/tmp/probe";
+
+    /// **完了済みツールの履歴行**（`Waited for` = 過去形・括弧なし）。
+    /// 実測では同一スクロールバックに 5 回残り、ターン完了後も消えない。
+    /// ここを busy にすると worker が永遠に完了しなくなる（#571 / #120 の「永久 busy」）
+    const CODEX_BG_DONE_NARROW: &str = "\
+• Waited for background terminal · sleep
+300; echo DONE1015
+
+• 完了しました。終了コードは 0、出力は
+  DONE1015 です。ファイルは変更していませ
+  ん。
+
+─ Worked for 5m 08s ────────────────────────
+
+
+› Ask Codex to do anything
+
+  gpt-5.6-sol high · /private/tmp/probe";
+
+    #[test]
+    fn i1015_codex_の背景ターミナル待ちをbusyと読む() {
+        for (label, screen) in [
+            ("100 桁", CODEX_BG_WAIT_WIDE),
+            ("44 桁", CODEX_BG_WAIT_NARROW),
+        ] {
+            assert_eq!(detect_screen_agent(screen), Some(Agent::Codex), "{label}");
+            assert!(
+                screen_looks_busy_in(screen, Some(Agent::Codex), false),
+                "{label}: 背景ターミナル待ちを busy と読めていない（#1015）"
+            );
+            // 入力欄 `›` は出ているので idle にも見える。**busy が勝つ**ことが要点
+            assert!(screen_looks_idle(screen), "{label}: 入力欄は出ている");
+        }
+        // 旧挙動（A/B）: 44 桁側だけが busy を引けない = #1015 の観測そのもの
+        assert!(
+            screen_looks_busy_in(CODEX_BG_WAIT_WIDE, Some(Agent::Codex), true),
+            "100 桁は旧実装でも esc to interrupt を引ける"
+        );
+        assert!(
+            !screen_looks_busy_in(CODEX_BG_WAIT_NARROW, Some(Agent::Codex), true),
+            "旧実装は 44 桁で busy を引けない（この差が #1015 の原因）"
+        );
+    }
+
+    #[test]
+    fn i1015_完了済みの背景ターミナル履歴はbusyにしない() {
+        // `Waited for background terminal`（過去形）と `Worked for 5m 08s` は
+        // 画面に残り続けるので、busy にすると完了を永久に検知できない
+        assert!(
+            !screen_looks_busy_in(CODEX_BG_DONE_NARROW, Some(Agent::Codex), false),
+            "履歴行を busy と誤読している（永久 busy になる。#571 / #120）"
+        );
+        assert!(
+            screen_looks_idle(CODEX_BG_DONE_NARROW),
+            "完了後の入力欄を idle と読めていない"
+        );
+        // 行単位でも確かめる（判定の境目を固定する）
+        assert!(!codex_running_footer_in(
+            "• Waited for background terminal · sleep",
+            false
+        ));
+        assert!(!codex_running_footer_in(
+            "─ Worked for 5m 08s ────────────────────────",
+            false
+        ));
+        assert!(!codex_running_footer_in(
+            "• You have 3 usage limit resets available. Run /usage to use one.",
+            false
+        ));
+        assert!(codex_running_footer_in(
+            "• Waiting for background terminal (1m 04s •…",
+            false
+        ));
+        assert!(codex_running_footer_in("• Working (13s • esc to…", false));
+        // `•` で始まらない行は対象外（他系統の出力に `(12s` が混ざっても引かない）
+        assert!(!codex_running_footer_in("  ran in (12s)", false));
+        // 経過時間の**直後**が区切りでない = codex の通常メッセージ（永久 busy の芽）
+        assert!(!codex_running_footer_in(
+            "• コマンドを起動しました (12s ago)",
+            false
+        ));
+        assert!(!codex_running_footer_in(
+            "• 待機しました (3m elapsed)",
+            false
+        ));
+        // 実採取のフッターは 3 種の区切りで終わる
+        assert!(codex_running_footer_in(
+            "• Working (12s • Esc to interrupt)",
+            false
+        ));
+        assert!(codex_running_footer_in(
+            "• Waiting for background terminal (1h 22m 18s)",
+            false
+        ));
+        assert!(codex_running_footer_in("• Working (2m 34s", false));
+    }
+
+    #[test]
+    fn i1015_経過時間の読み切り() {
+        // `starts_with_elapsed` は先頭 1 単位だけを見るので、後続を問うには長さが要る
+        assert_eq!(elapsed_prefix_len("13s • esc"), Some(3));
+        assert_eq!(elapsed_prefix_len("1m 04s •…"), Some(6));
+        assert_eq!(elapsed_prefix_len("1h 22m 18s)"), Some(10));
+        assert_eq!(elapsed_prefix_len("12s ago)"), Some(3));
+        assert_eq!(elapsed_prefix_len("thinking)"), None);
+        assert_eq!(
+            elapsed_prefix_len("8.4k tokens"),
+            None,
+            "単位が h/m/s でない"
+        );
+    }
+
+    /// #1015 で**採らなかった案**: Issue 本文が提案した「`Waiting for…` /
+    /// `Waited for background terminal` の文言を busy として扱う」実装。
+    /// これが駄目なことを機械で示すために置いてある（下のテストで使う）
+    fn codex_footer_by_wording(line: &str) -> bool {
+        line.contains("Waiting for") || line.contains("Waited for background terminal")
+    }
+
+    #[test]
+    fn i1015_注入_文言で判定する実装は履歴行に誤爆する() {
+        // 回帰を隠していないことの確認: 文言判定なら**完了後の画面まで busy** になり、
+        // worker の完了を永久に検知できなくなる（#571 / #120 で踏んだ形）
+        assert!(
+            CODEX_BG_DONE_NARROW.lines().any(codex_footer_by_wording),
+            "文言判定は完了済みの履歴行にも当たる（永久 busy の回帰）"
+        );
+        // 採った実装（`•` + 括弧の直後が経過時間）は当たらない
+        assert!(!CODEX_BG_DONE_NARROW
+            .lines()
+            .any(|l| codex_running_footer_in(l, false)));
+        // 走っている行にはどちらも当たる（文言判定が「弱い」のではなく「広すぎる」）
+        assert!(CODEX_BG_WAIT_NARROW.lines().any(codex_footer_by_wording));
+        assert!(CODEX_BG_WAIT_NARROW
+            .lines()
+            .any(|l| codex_running_footer_in(l, false)));
+    }
+
+    #[test]
+    fn i1015_注入_経過時間まで切られた行は新経路でも引けない() {
+        // 限界を明示する: さらに狭いペインで `(1m 04s` まで切られると経過時間が
+        // 残らないので、新経路でも busy を引けない。**ここを語句で埋めない**のが
+        // #1015 の判断（履歴行と区別できず永久 busy へ戻る）。
+        // 代わりに送達側は「rollout を読めたときだけ未達と断定する」で守ってある
+        let screen = "• Waiting for background terminal…\n\n› Ask Codex to do anything\n";
+        assert!(
+            !screen_looks_busy_in(screen, Some(Agent::Codex), false),
+            "経過時間が無い行を busy と読んでいる（履歴行にも当たる実装になっている）"
+        );
+    }
+
+    #[test]
+    fn i1015_既存のcodex画面の判定は変わらない() {
+        // 受け入れ条件 7: 本当に入力待ちの画面は従来どおり idle のまま
+        assert!(!screen_looks_busy_in(CODEX_IDLE, Some(Agent::Codex), false));
+        assert!(screen_looks_idle(CODEX_IDLE));
+        assert!(screen_looks_busy_in(CODEX_BUSY, Some(Agent::Codex), false));
+        // 新旧で差が出ないこと（この画面群は #1015 の変更の影響を受けない）
+        for screen in [CODEX_IDLE, CODEX_BUSY, CLAUDE_IDLE, AGY_IDLE_REAL] {
+            assert_eq!(
+                screen_looks_busy_in(screen, detect_screen_agent(screen), false),
+                screen_looks_busy_in(screen, detect_screen_agent(screen), true),
+                "既存画面の判定が #1015 で変わっている:\n{screen}"
+            );
+        }
     }
 
     #[test]

@@ -725,6 +725,39 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
     Web ビューの 3 か所は `dispatch(\n app,\n web_req("read", …)` の形で行を畳んでも
     `read(app)` にならないので、#1162 の番犬へ `tako_control::dispatch(` を足した
 
+## TUI の画面マーカーは「幅で切られる」前提で選ぶ（Issue #1015）
+
+エージェント CLI は**フッター行を自分でペイン幅に合わせて `…` で切る**。だから
+「行のどこかに `esc to interrupt` がある」を根拠にしたマーカーは、**狭いペインでだけ**
+外れる。実採取（codex-cli 0.153.0・同じ状態を 2 つの幅で採取）:
+
+```text
+100 桁: • Waiting for background terminal (1m 08s • esc to interrupt) · 1 background terminal…
+ 44 桁: • Waiting for background terminal (1m 04s •…
+```
+
+44 桁側は `esc to interrupt` も `… (`（スピナー判定の目印）も残らないので busy を引けず、
+末尾の入力欄 `›` を拾って **idle** になる。#1015 はこれで `WORKER_IDLE` +
+`prompt_undelivered`（自動再送 = 二重指示事故）を誤発火していた。#1132 のとおり
+worker ペインは 21〜25 桁まで狭まりうるので、幅の仮定は必ず外れる。
+
+- **見るのは行頭側に来る不変部分**にする。上の例なら「`•` で始まり、`(` の直後が
+  経過時間」= 語句が伸びても切られても残る位置
+- **語（wording）で判定しない**。同じ語の**過去形**が履歴として残り続けることがある:
+  `• Waited for background terminal · <cmd>` は完了済みツールの記録で、実測では
+  同一スクロールバックに **5 回**残り、ターン完了後の画面にも
+  `─ Worked for 5m 08s ─` として出る。ここを busy にすると worker が
+  **永遠に完了しなくなる**（#571 / #120 の「永久 busy」= 不検知より実害が大きい）
+- **採らなかった案は機械で否定しておく**。単体テスト
+  `i1015_注入_文言で判定する実装は履歴行に誤爆する` は「語で判定する実装」を
+  テスト内に置いて、それが履歴画面に当たることを assert する（Issue 本文の提案どおりに
+  直すと壊れることの証拠）。番犬 `codex_wait_detection_watchdog` が
+  `"Waited for"` / `"Worked for"` / `"Waiting for"` の照合文字列の再登場を落とす
+- **画面で裏取りできないものは画面以外で守る**。さらに狭いペインでは経過時間まで
+  切られる（`• Waiting for background terminal…`）ので画面判定には穴が残る。
+  未達の断定は「一次シグナル（codex なら rollout の `task_started`）を**実際に読めた**
+  ときだけ」にして、読めていないときは `prompt_delivery_unverified` へ降格する
+
 ## 効果を測る単体テストは実時間で比べない（Issue #1167）
 
 「速くなっている」を `Instant::elapsed` の**比較**で固定したテストは、片方の計測窓にだけ
