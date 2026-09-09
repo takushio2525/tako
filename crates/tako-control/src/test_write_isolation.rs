@@ -34,12 +34,28 @@ mod tests {
     const CHILD_TEST: &str =
         "test_write_isolation::tests::子プロセス_本番相当の書き込みを一通り行う";
 
+    /// 子に**実シェルを起こさせる**ときの目印（#1253）
+    const SHELL_PROBE_ENV: &str = "TAKO_1253_SHELL_PROBE";
+
+    /// シェル probe が打つコマンドの目印
+    const SHELL_PROBE_MARKER: &str = "TAKO_1253_HISTORY_MARKER";
+
     /// 空の `HOME`（と必要なら `TAKO_DATA_DIR`）で子テストを 1 回走らせる。
     /// 戻り値は `(子の終了状態が成功か, 子の標準出力, HOME 配下に出来たファイル)`
     fn run_child(
         fake_home: &Path,
         data_dir: Option<&Path>,
         legacy: bool,
+    ) -> (bool, String, Vec<String>) {
+        run_child_with(fake_home, data_dir, legacy, &[])
+    }
+
+    /// [`run_child`] に**追加の環境変数**を渡す版（#1253 のシェル probe / A/B 用）
+    fn run_child_with(
+        fake_home: &Path,
+        data_dir: Option<&Path>,
+        legacy: bool,
+        extra: &[(&str, &str)],
     ) -> (bool, String, Vec<String>) {
         let exe = std::env::current_exe().expect("テストバイナリのパス");
         let mut cmd = std::process::Command::new(&exe);
@@ -65,6 +81,9 @@ mod tests {
             cmd.env("TAKO_944_LEGACY", "1");
         } else {
             cmd.env_remove("TAKO_944_LEGACY");
+        }
+        for (key, val) in extra {
+            cmd.env(key, val);
         }
         let out = cmd.output().expect("子テストプロセスを起こせる");
         let mut stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -162,6 +181,51 @@ mod tests {
         // 6. worker の状態問い合わせ（本番は `claude agents --json` を起こし、
         //    claude 本体が ~/.claude.json を書き戻して ~/.claude/backups/ を積む）
         let _ = crate::agents::list_agents();
+
+        // 7. ペインのシェル（#1253）。**名指しされたときだけ**動かす:
+        //    実シェルを起こすので、0 ファイルを見る他の親テストの前提を壊さない
+        #[cfg(unix)]
+        if std::env::var_os(SHELL_PROBE_ENV).is_some() {
+            shell_probe();
+        }
+    }
+
+    /// 既定シェルを PTY で起こして 1 行打つ（#1253 の子 probe 本体）。
+    ///
+    /// 本番ならここで**対話ログインシェル**がユーザーの `~/.zsh_history` へ積む。
+    /// 待ちは固定時間ではなく**画面の状態**で切る（`conventions.md` の待ち条件）
+    #[cfg(unix)]
+    fn shell_probe() {
+        use tako_core::terminal::{SpawnOptions, TerminalSession};
+
+        let Ok((session, _rx)) = TerminalSession::spawn(80, 24, SpawnOptions::default()) else {
+            eprintln!("skip: 既定シェルの PTY を張れない");
+            return;
+        };
+        let poll = std::time::Duration::from_millis(50);
+        // プロンプトが出てから打つ（出る前に打つと行が食われる）
+        let ready = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while session.visible_lines().iter().all(|l| l.trim().is_empty())
+            && std::time::Instant::now() < ready
+        {
+            std::thread::sleep(poll);
+        }
+        session.write(format!("echo {SHELL_PROBE_MARKER}\r").into_bytes());
+        // 打った行のエコーと出力の 2 本が見えたら、履歴も書かれている
+        // （`INC_APPEND_HISTORY` はコマンド確定時に追記する）
+        let done = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < done {
+            let hits = session
+                .visible_lines()
+                .iter()
+                .filter(|l| l.contains(SHELL_PROBE_MARKER))
+                .count();
+            if hits >= 2 {
+                return;
+            }
+            std::thread::sleep(poll);
+        }
+        eprintln!("warn: シェル probe のマーカーが画面に出そろわなかった");
     }
 
     #[test]
@@ -267,6 +331,64 @@ mod tests {
             "旧挙動でエントリが増えていない（検出力が無い）: {after:?}"
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #1253: **検証プロセスはユーザーのシェル履歴へ書かない**。
+    ///
+    /// tako が開くペインのシェルは対話ログインシェルなので、テストやセルフテストが
+    /// 打ち込んだコマンドがそのまま `~/.zsh_history` に積もっていた（実測: `cargo test
+    /// --workspace` 1 回で 1 行）。`HISTFILE` を渡すだけでは足りない —— macOS の
+    /// `/etc/zshrc` が `HISTFILE=${ZDOTDIR:-$HOME}/.zsh_history` を**無条件で代入**する
+    /// ので、その形の rc を空の HOME へ置いて**同じ条件**を作ってから測る
+    #[test]
+    #[cfg(unix)]
+    fn 検証プロセスはユーザーのシェル履歴へ書かない() {
+        // `/etc/zshrc`（macOS）と同じ形。CI の機械に何が入っていても同じ条件になる
+        let rc = "HISTFILE=${ZDOTDIR:-$HOME}/.zsh_history\n\
+                  HISTSIZE=2000\n\
+                  SAVEHIST=1000\n\
+                  setopt INC_APPEND_HISTORY\n";
+        let prepare = |tag: &str| -> PathBuf {
+            let home = scratch(tag);
+            std::fs::write(home.join(".zshrc"), rc).expect("rc を置ける");
+            std::fs::write(home.join(".zshenv"), "").expect("rc を置ける");
+            home
+        };
+        let history_files = |created: &[String]| -> Vec<String> {
+            created
+                .iter()
+                .filter(|f| f.contains("history"))
+                .cloned()
+                .collect()
+        };
+
+        let home = prepare("histfix");
+        let (ok, stdout, created) = run_child_with(&home, None, false, &[(SHELL_PROBE_ENV, "1")]);
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(ok, "子テストが失敗した\n{stdout}");
+        assert!(
+            history_files(&created).is_empty(),
+            "検証プロセスがユーザーのシェル履歴へ書いた（#1253）: {:#?}",
+            history_files(&created)
+        );
+
+        // A/B: 隔離を切る（`TAKO_1253_LEGACY=1`）と同じ子が履歴を残す。
+        // 既定シェルが履歴を持たない機械では実証できないので、そのときは明示して落とさない
+        let home = prepare("histlegacy");
+        let (ok, stdout, created) = run_child_with(
+            &home,
+            None,
+            false,
+            &[(SHELL_PROBE_ENV, "1"), ("TAKO_1253_LEGACY", "1")],
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(ok, "子テストが失敗した\n{stdout}");
+        if history_files(&created).is_empty() {
+            eprintln!(
+                "skip(A/B のみ): 既定シェル（{}）が履歴ファイルを持たないので旧挙動を実証できない",
+                std::env::var("SHELL").unwrap_or_default()
+            );
+        }
     }
 
     /// data dir の隔離が**明示の `TAKO_DATA_DIR` を上書きしない**こと（受け入れ条件のエッジ）。

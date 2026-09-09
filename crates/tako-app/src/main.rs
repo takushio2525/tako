@@ -4017,6 +4017,13 @@ impl TakoApp {
                     "on_app_quit: 使い捨て backend サーバーを片付けた（socket={backend_socket}）"
                 ));
             }
+            // #1253: 検証起動（隔離 / セルフテスト / visual-test）が使った
+            // 使い捨ての設定置き場（事前信頼とシェル履歴の書き先）を片付ける。
+            // pid つきなのでこのプロセス専用 = 誰の邪魔にもならない
+            if tako_core::paths::is_verification_process() {
+                let dir = tako_core::paths::verification_agent_home();
+                let _ = std::fs::remove_dir_all(&dir);
+            }
             // セルフテスト最終項目（フォーカス喪失状態の cmd-q。#103）の成功マーカー。
             // ここに到達した = Quit がフォーカス非依存で発火し quit 経路に入った証拠。
             // **ただし quit 経路は最終項目以外からも来る**（ウィンドウ 0 枚の自動終了・

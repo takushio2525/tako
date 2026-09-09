@@ -760,13 +760,13 @@ pub fn config_json_paths(config_dir: Option<&str>) -> Vec<PathBuf> {
     resolve_config_json_paths(dir, home.as_deref(), legacy_exists)
 }
 
-/// `CLAUDE_CONFIG_DIR` からの解決。**テストビルドでは見ない**（#944 / #1030）:
-/// テストプロセスの環境変数はユーザーの生きた config dir を指しているので、
+/// `CLAUDE_CONFIG_DIR` からの解決。**検証プロセスでは見ない**（#944 / #1030 / #1253）:
+/// 検証プロセスの環境変数はユーザーの生きた config dir を指しているので、
 /// 読んだ瞬間に本番の `.claude.json` へ書きに行ってしまう。
-/// config dir を明示する引数（#558 の経路）はテストでもそのまま効く
+/// config dir を明示する引数（#558 の経路）は検証プロセスでもそのまま効く
+/// （テストが一時ディレクトリを指して書き先を確かめる経路がここに乗っている）
 fn env_config_dir() -> Option<PathBuf> {
-    #[cfg(test)]
-    if !tako_core::paths::issue944_legacy() {
+    if tako_core::paths::is_verification_process() {
         return None;
     }
     std::env::var_os(crate::orchestrator::CLAUDE_CONFIG_DIR_ENV)
