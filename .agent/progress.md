@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-09（#1236: 信頼ダイアログの自動承諾がハイライトを見ずに Enter を送る問題を直した）
-- 送達フロー（`main.rs` の `drive_trust_accept`）と器越しの送達（`deliver_via_tmux`）を `claude_tui::accept_step` の 1 実装へ寄せ、移動の向き・歩数・「Enter を送ってよいか」は `tako_core::dialog::confirm_step`（respond の番号なし経路と共有）へ。**承諾側を特定できないあいだは Enter を送らない**（理由は `persist.log` の `[auto-accept]` 行）
-- 模擬 TUI（実 tmux・GUI 不要）で実キーの A/B: 新 = `Down`→`Enter` で `Yes, I trust this folder` が確定 / `TAKO_1236_LEGACY=1` = `Enter` 1 発で **`No, exit` が確定**（= 事故の再現）。ベースラインの Windows 警告 10 件と一致
-- 番犬 4 本（修正前ソースを 4 本すべてが名指しで FAILED）+ 単体 8 本 + `confirm_step` 4 本。全 3905 件緑
-
 ## 2026-09-09（#1248: CLI の --help が実装とずれていた 2 か所を正本から引く形に直した）
 - `setup-mcp` の help（書き先は `~/.claude.json` / `<cwd>/.mcp.json`・claude 以外にも登録）と `--agent-effort` の「agy は無視」（#1002 で否定済み）を訂正。同じずれが残っていた protocol / MCP catalog / `orchestrator/agent.rs` / `mod.rs` / `.agent/orchestrator.md` も同時に直した
 - 再発防止は**文どうしを比べない**形: 書き先は `dispatch::mcp_target_path`（`MCP_TARGET_FILE_*` へ切り出し）、能力は `agent_support` の `effort_control` と突き合わせる。番犬 3 本（CLI の実 `--help` 2 本 + 全 rs / md 走査 1 本）
@@ -68,6 +63,7 @@
 - 真因は #289 の**帰属ミス**（修正は原形のまま生きていた）。claude 2.1.258 の `agents --json` は `isLoading || delegatedActive` で状態を決め、背景シェル / Monitor が生きているあいだ**生 status が busy**（本番 4 ペイン同時観測: 申告のある 3 本が busy・無い 1 本だけ idle / `has_running_children` は 4 本とも true = 判別不能）。#289 の腕は `status == "idle"` 限定なので一度も入らず、busy → idle の経路がそもそも無かった
 - claude 自身の描き分け（ターン終了 = `· <内訳> still running` / 完了待ち = suffix なし）を借り、**生成中の目印ゼロ + 空の入力欄 + 折りたたみでない + 申告あり**のときだけ倒す（`wait::input_waiting_with_background_work` の 1 実装。応答に `background_work` / `idle_despite_primary_busy`・MATRIX へ `worker_idle_with_background`）
 - 番犬 6 本が故障注入 6 通りをそれぞれ 1 本だけ名指しで落とす。実 tmux の e2e 2 本（本物の `sleep 3600 &` 付き）+ 単体 12 本。A/B `TAKO_1273_LEGACY=1` で再現テスト 2 本が FAILED。狭いペインは行が切られて覆せない（安全側に劣化・#1277 で codex / agy を調査）
+
 ## 2026-09-09（#1264: Windows で cargo test がコンパイルできない問題を直し CI に番犬を置いた）
 - #1199 の検証ブロックが 1 つ手前の関数に入っていた（`E0425` × 3）ので本来の関数へ移し、あわせて `assert_eq!(cwd_after_foreign, cwd)`（書いた後の値どうしで必ず通る）を**書く前の cwd** との比較へ直した。実機 A/B: `--no-run` が **exit 101 / 263s** → **exit 0 / 4s**・`shell_integration_powershell` 8/0
 - CI の穴（macOS は `#![cfg(windows)]` を空クレート化・Windows は `cargo build` が `tests/` を作らず `cargo test` は `continue-on-error`）を Windows ジョブの blocking `cargo test --workspace --no-run` で塞いだ。番犬 `ci_windows_test_compile`。追加時間は実質ゼロ（実機で 2 回目の `--no-run` は 2s = 再コンパイル 0）
