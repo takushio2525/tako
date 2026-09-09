@@ -1042,6 +1042,13 @@ Dock のピン留めは `.app` への **file URL ブックマーク**（`com.app
   **検査に検出力があること**もテストで固定されている
 - 新しい永続ファイルを足したら、番犬の子（`子プロセス_本番相当の書き込みを一通り行う`）へ
   その書き込みを 1 行足す
+- **実 claude を使う e2e（`#[ignore]` の手動実行専用）は例外**: worker を既定 config dir で
+  走らせる必要があるので事前信頼は**実ファイル**（`~/.claude/.claude.json`）へ書く
+  （倒すと実 claude が信頼を読めず e2e が成立しない）。代わりに `Drop` で
+  `remove_e2e_trust_entry(&<信頼した cwd>)` を呼んで**自分の分を消す**（#612 / #577 / #1022）。
+  `#[ignore]` なので CI は本体を走らせない = 番犬
+  `crates/tako-control/tests/e2e_trust_cleanup_watchdog.rs`（`impl Drop for E2e…Guard` を
+  走査して後始末の欠落を名指しする）だけが再発を止める
 - **過去の残骸は自動で消さない**。`bash scripts/clean-trust-residue.sh`（既定 dry-run。
   実削除は `--apply` で、元ファイルは `.residue-backup.<epoch>` へ退避）が一覧を出すので、
   消すかどうかはユーザーが決める。判定は「一時ディレクトリの下 **かつ** tako のテスト名」の
