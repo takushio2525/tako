@@ -22,6 +22,19 @@
 //! このインジケータの仕事は**沈黙を覆うこと**なので、パスワードを聞かれた時点でも
 //! 役目は終わり（画面に指示が出ている）。逆に ssh 自身が失敗したときは
 //! **消さずに理由へ置き換える**（#919 の契約と同じ考え方）
+//!
+//! # 多重化が無いプラットフォームには別の出口が要る（#1137）
+//!
+//! `pane` 経路の成功は本来 ControlMaster のソケットで見る（規則 ⑤）。ところが
+//! **Windows の OpenSSH は多重化を実装していない**（`platform::ssh_client::multiplexing`
+//! = #1090）ので、そのソケットは**構造的に作られない** = `master_socket` は常に false。
+//! つまり `pane` 経路 + Windows には「成功して静かに入った」を表せる規則が 1 つも無く、
+//! 鍵認証で無言のまま入れる相手だと `connecting` が [`SILENT_CAP_SECS`] まで居座る。
+//!
+//! そこで「**打った行を除いて**中身が出たら畳む」を規則 ⑥ として足す。ゲートは
+//! [`ConnectInputs::multiplexing`] の値なので、macOS の挙動は 1 ビットも変わらず、
+//! macOS 上から Windows 側の形を検査できる。打った行は呼び出し側が持っているので
+//! （[`ConnectInputs::typed_line`]）、`tako_prints` とまったく同じ形で除外する
 
 use crate::i18n::Lang;
 
@@ -83,6 +96,20 @@ pub struct ConnectInputs<'a> {
     pub screen_changed: bool,
     /// tako が印字したものしか載っていないペインか（`split` / `tab` = true）
     pub fresh_pane: bool,
+    /// このプラットフォームで接続多重化（ControlMaster）を使うか（#1137）。
+    ///
+    /// **false のときは規則 ⑤ の材料（`master_socket`）が構造的に作られない**
+    /// （`platform::ssh_client::multiplexing(Platform::Windows) == false` = #1090）ので、
+    /// `pane` 経路（`fresh_pane = false`）では「成功して静かに入った」を表せる出口が
+    /// 1 つも無くなる。そこを規則 ⑥ で埋める。判定を純粋に保つため**値で受け取る**
+    /// （macOS 上から両プラットフォームぶんを検査できる）
+    pub multiplexing: bool,
+    /// 呼び出し側が既存シェルへ**打った 1 行**（`pane` 経路の ssh コマンド / 打ち直しの行）。
+    ///
+    /// 打った行はプロンプトの続きに echo され端末幅で折り返されるので、
+    /// これを除かないと規則 ⑥ が**自分の打鍵**で当たる（相手はまだ何も言っていない）。
+    /// `fresh_pane` のときは打っていないので見ない
+    pub typed_line: &'a str,
     /// tako がこのペインへ印字した文面（[`crate::remote_fs::pane_prints`]）。
     ///
     /// **折り返しの続き行を見分けるために要る**（#1090）。物理行は端末幅で折り返され、
@@ -165,6 +192,42 @@ fn is_tako_fragment(line: &str, prints: &[String]) -> bool {
 /// 続き行と見なす最短の長さ（これ未満は偶然一致しうるので見ない）
 const MIN_FRAGMENT_CHARS: usize = 2;
 
+/// 行末が打った行の頭と重なっている、と見なす最短の長さ（#1137）。
+///
+/// 一致の根拠がいちばん弱い形なので [`MIN_FRAGMENT_CHARS`] より厳しくする
+/// （`ss` で終わる相手の行を残響と読まない）
+const MIN_TYPED_HEAD_OVERLAP: usize = 3;
+
+/// 呼び出し側が打った 1 行の**残響**か（#1137）。
+///
+/// 打鍵はプロンプトの続きに echo されるので、画面の物理行は 3 通りの形になる:
+///
+/// ```text
+/// PS C:\Users\winuser> ssh win    ← ① 打った行を丸ごと含む（1 行に収まった）
+/// PS C:\Users\winuser> ssh w      ← ② 行末が打った行の頭と重なる（幅で切れた）
+/// in                                 ③ 打った行の一部そのもの（折り返しの続き行）
+/// ```
+///
+/// [`is_tako_fragment`] と同じ「部分文字列で見分ける」形。取りこぼすと規則 ⑥ が
+/// **自分の打鍵**で当たる（相手はまだ何も言っていない）ので、迷ったら残響と見る側
+/// = 畳まない側 = 安全側に倒す
+fn is_typed_echo(line: &str, typed: &str) -> bool {
+    let t = line.trim();
+    let typed = typed.trim();
+    if typed.is_empty() || t.chars().count() < MIN_FRAGMENT_CHARS {
+        return false;
+    }
+    if t.contains(typed) || typed.contains(t) {
+        return true; // ① / ③
+    }
+    // ②: 行末から順に長さを詰めて、打った行の頭と重なるところを探す
+    let chars: Vec<char> = t.chars().collect();
+    (MIN_TYPED_HEAD_OVERLAP..=chars.len()).any(|k| {
+        let tail: String = chars[chars.len() - k..].iter().collect();
+        typed.starts_with(&tail)
+    })
+}
+
 /// 判定（詳細はモジュール doc）
 pub fn classify(inputs: &ConnectInputs) -> ConnectPhase {
     // 「tako 以外が書いた中身のある行」だけを見る
@@ -189,6 +252,11 @@ pub fn classify(inputs: &ConnectInputs) -> ConnectPhase {
             return ConnectPhase::Failed { reason };
         }
         if is_tako_line(trimmed) || is_tako_fragment(trimmed, inputs.tako_prints) {
+            continue;
+        }
+        // #1137: 既存シェルへ打った行の残響は「相手が喋った」ではない。
+        // まっさらなペインでは何も打っていないので見ない（バナーの続き行は上で落ちる）
+        if !inputs.fresh_pane && is_typed_echo(trimmed, inputs.typed_line) {
             continue;
         }
         interesting.push(trimmed);
@@ -246,7 +314,49 @@ pub fn classify(inputs: &ConnectInputs) -> ConnectPhase {
         return ConnectPhase::Opened;
     }
 
+    // ⑥ 多重化が無いプラットフォーム（Windows）では ⑤ の材料が**構造的に作られない**
+    //    （ソケットは接続の多重化で初めて出来るもので、`master_socket` は常に false）。
+    //    そのため `pane` 経路には「成功して静かに入った」を表せる出口が 1 つも残らず、
+    //    鍵認証で無言のまま入れる相手だと `connecting` が上限（[`SILENT_CAP_SECS`]）まで
+    //    居座る（#1137）。⑤ の代わりに「**打った行を除いて**中身が出たら畳む」を使う。
+    //
+    //    ここで畳むのも ④ と同じで「沈黙が破れた」以上のことは言っていない
+    //    （器や下のシェルが描いた行でも当たる）。**「一度でも繋がった」の判定に
+    //    使ってはいけない**のは ④ と同じで、そちらはソケットだけが証明する
+    if !inputs.multiplexing && inputs.screen_changed && !interesting.is_empty() {
+        return ConnectPhase::Opened;
+    }
+
     ConnectPhase::Connecting
+}
+
+/// 「新しく出た行」の起点を現在の画面に合わせ直す（#1137）。
+///
+/// [`baseline_index`] は**覚え始めた時点**の最後の非空行なので、接続後に相手が画面を
+/// 消すと起点が現在の中身を追い越し、`new_lines` が全部空になる（= どの規則にも
+/// 当たらないので `Connecting` のまま居座る）。`Connected` / `Reconnecting` は
+/// 状態が動くたびに `rebase` するので実害が出にくいが、**`Connecting` のあいだは
+/// rebase しない**のでこの経路だけ穴が残る。
+///
+/// 画面が縮んだ = **その上に古い中身はもう無い**ので、全体を見て安全
+pub fn effective_from(baseline: usize, lines: &[String]) -> usize {
+    match lines.iter().rposition(|l| !l.trim().is_empty()) {
+        // 起点が現在の最後の非空行より下 = 画面が消された（追い越された）
+        Some(last) if baseline > last => 0,
+        Some(_) => baseline.min(lines.len()),
+        // 画面が全部空なら見るものが無い = 全体でよい
+        None => 0,
+    }
+}
+
+/// `TAKO_1137_LEGACY=1` で **#1137 前の挙動**（多重化なしの出口なし + 起点の陳腐化
+/// そのまま）へ戻す。同一バイナリで A/B を取る入口。
+///
+/// **判定そのものは純粋関数のまま**にしたいので、env を読むのはここだけ。
+/// 何を渡すか（`multiplexing` / 起点）は呼び出し側が決める
+pub fn legacy_silent_success() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_1137_LEGACY").is_some())
 }
 
 /// 覚え始めた時点の「新しく出た行」の起点（`pane` 経路用）。
@@ -305,6 +415,9 @@ mod tests {
             master_socket: false,
             screen_changed: false,
             fresh_pane: fresh,
+            // 既定は macOS（多重化あり）= #1137 の前とバイト等価
+            multiplexing: true,
+            typed_line: "",
             tako_prints: prints(),
         }
     }
@@ -391,6 +504,119 @@ mod tests {
             "pport/tako/ssh/win-0123456789abcdef\" -o ControlMaster=auto win",
         ]);
         assert_eq!(classify(&inputs(&l, false)), ConnectPhase::Connecting);
+    }
+
+    /// `pane` 経路で打つ ssh の 1 行（Windows は ControlMaster を渡さない = #1090）
+    const TYPED_1137: &str = "ssh win";
+
+    fn pane_inputs<'a>(new_lines: &'a [String], multiplexing: bool) -> ConnectInputs<'a> {
+        let mut i = inputs(new_lines, false);
+        i.multiplexing = multiplexing;
+        i.typed_line = TYPED_1137;
+        // 打った行が画面に出た時点で画面は動いている
+        i.screen_changed = true;
+        i
+    }
+
+    #[test]
+    fn issue1137_多重化が無い経路は無言の接続成功でも畳む() {
+        // 打った行の残響 + 相手のプロンプト（鍵認証で無言のまま入れた形）
+        let l = lines(&["PS C:\\Users\\winuser> ssh win", "winuser@remote:~$ "]);
+        // 多重化が無い（Windows）= ⑤ に到達できないので ⑥ で畳む
+        assert_eq!(classify(&pane_inputs(&l, false)), ConnectPhase::Opened);
+        // 多重化が在る（macOS）= ソケットが出るまで従来どおり待つ（挙動は不変）
+        assert_eq!(classify(&pane_inputs(&l, true)), ConnectPhase::Connecting);
+    }
+
+    #[test]
+    fn issue1137_打った行だけでは畳まない() {
+        // ここが要点: 自分の打鍵を「相手が喋った」と読むと、接続前に畳んでしまう
+        let l = lines(&["PS C:\\Users\\winuser> ssh win"]);
+        assert_eq!(classify(&pane_inputs(&l, false)), ConnectPhase::Connecting);
+        // 端末幅で折り返された続き行も残響（打った行の一部）
+        let wrapped = lines(&["PS C:\\Users\\winuser> ssh w", "in"]);
+        assert_eq!(
+            classify(&pane_inputs(&wrapped, false)),
+            ConnectPhase::Connecting
+        );
+    }
+
+    #[test]
+    fn issue1137_多重化が無くても失敗と入力待ちの分類は変わらない() {
+        // ① / ② ssh 自身の失敗行
+        let failed = lines(&[
+            "PS C:\\Users\\winuser> ssh win",
+            "ssh: connect to host win port 22: Connection refused",
+            "PS C:\\Users\\winuser> ",
+        ]);
+        assert_eq!(
+            classify(&pane_inputs(&failed, false)),
+            ConnectPhase::Failed {
+                reason: Some("ssh: connect to host win port 22: Connection refused".into())
+            }
+        );
+        // ③ 入力待ち（パスワード）
+        let asking = lines(&["PS C:\\Users\\winuser> ssh win", "winuser@win's password:"]);
+        assert_eq!(classify(&pane_inputs(&asking, false)), ConnectPhase::Opened);
+        // スクリプト経路の失敗マーカー（`split` / `tab`）も同じ
+        let script = lines(&[
+            "tako: win へ接続しています…（中止は Ctrl+C）",
+            "ssh: Could not resolve hostname win: nodename nor servname provided",
+            "tako: win への接続に失敗しました（ssh exit 255）。理由は上の行です",
+        ]);
+        let mut i = inputs(&script, true);
+        i.multiplexing = false;
+        match classify(&i) {
+            ConnectPhase::Failed { reason } => {
+                assert!(reason.unwrap().contains("Could not resolve hostname"))
+            }
+            other => panic!("失敗として読めていない: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn issue1137_画面が動いていなければ畳まない() {
+        // 起点が中身を追い越した直後など、materials が揃っていない形
+        let l = lines(&["winuser@remote:~$ "]);
+        let mut i = pane_inputs(&l, false);
+        i.screen_changed = false;
+        assert_eq!(classify(&i), ConnectPhase::Connecting);
+    }
+
+    #[test]
+    fn issue1137_起点が中身を追い越したら画面全体を見る() {
+        // 相手が画面を消したあとの形（起点 10 / 中身は 1 行目だけ）
+        let after_clear = lines(&["winuser@remote:~$ ", "", "", ""]);
+        assert_eq!(effective_from(10, &after_clear), 0);
+        // 追い越していなければそのまま（既存の切り出しは 1 ビットも変えない）
+        let normal = lines(&["a", "b", "c"]);
+        assert_eq!(effective_from(2, &normal), 2);
+        assert_eq!(effective_from(1, &normal), 1);
+        // 起点が行数を超えていても panic しない
+        assert_eq!(effective_from(99, &normal), 0);
+        // 全部空なら 0
+        assert_eq!(effective_from(3, &lines(&["", "  ", ""])), 0);
+    }
+
+    #[test]
+    fn issue1137_プラットフォームの申告と一致している() {
+        use crate::platform::ssh_client;
+        use crate::platform::support::Platform;
+        // ⑥ が要るのは多重化が無いプラットフォームだけ（マトリクスの申告と同値）
+        assert!(ssh_client::multiplexing(Platform::MacOs));
+        assert!(!ssh_client::multiplexing(Platform::Windows));
+        // 実行中のプラットフォームでも同じ判定を通す（実機で走らせたときの裏取り）
+        let l = lines(&["PS C:\\Users\\winuser> ssh win", "winuser@remote:~$ "]);
+        let here = classify(&pane_inputs(
+            &l,
+            ssh_client::multiplexing(Platform::current()),
+        ));
+        let expected = if ssh_client::multiplexing(Platform::current()) {
+            ConnectPhase::Connecting
+        } else {
+            ConnectPhase::Opened
+        };
+        assert_eq!(here, expected, "platform={:?}", Platform::current());
     }
 
     #[test]

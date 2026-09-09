@@ -9661,6 +9661,13 @@ impl TakoApp {
             // 同じ行をもう一度「切断」と読んで無限に往復する（隔離セルフテストで実測）
             let from = if st.fresh_pane && matches!(st.phase, ConnectPhase::Connecting) {
                 0
+            } else if matches!(st.phase, ConnectPhase::Connecting)
+                && !ssh_progress::legacy_silent_success()
+            {
+                // #1137: `Connecting` のあいだは rebase しないので、接続後に相手が
+                // 画面を消すと起点が現在の中身を追い越して `new_lines` が全部空になる
+                // （= どの規則にも当たらず居座る）。追い越していたら全体を見る
+                ssh_progress::effective_from(st.baseline_index, &lines)
             } else {
                 st.baseline_index.min(lines.len())
             };
@@ -9674,6 +9681,12 @@ impl TakoApp {
             let master_socket = tako_core::remote_fs::control_path(&st.host)
                 .map(|p| p.exists())
                 .unwrap_or(false);
+            // #1137: 多重化が無いプラットフォームでは上のソケットが**構造的に作られない**
+            // ので、`pane` 経路には成功を言える出口が残らない。代わりの出口（規則 ⑥）を
+            // 使うかどうかはここで決める。A/B の legacy では「多重化が在る」と申告して
+            // ⑥ を止める（= #1137 前）
+            let multiplexing = tako_core::platform::ssh_client::multiplexing_available()
+                || ssh_progress::legacy_silent_success();
             if std::env::var("TAKO_1090_DIAG").as_deref() == Ok("1") {
                 let nonempty: Vec<&String> =
                     new_lines.iter().filter(|l| !l.trim().is_empty()).collect();
@@ -9696,6 +9709,9 @@ impl TakoApp {
                         master_socket,
                         screen_changed: fingerprint != st.baseline_fingerprint,
                         fresh_pane: st.fresh_pane,
+                        multiplexing,
+                        // #1137: 既存シェルへ打った行の残響を「相手が喋った」と読まない
+                        typed_line: &st.reconnect_line,
                         // #1090: 折り返されたバナーの続き行を ssh の出力と読まない
                         tako_prints: &prints,
                     });
@@ -9775,6 +9791,9 @@ impl TakoApp {
                             screen_changed: fingerprint != st.baseline_fingerprint,
                             // 打ち直しは**必ず既存シェルへ 1 行**なので fresh ではない
                             fresh_pane: false,
+                            multiplexing,
+                            // #1137: 打ち直した行そのものは相手の発話ではない
+                            typed_line: &st.reconnect_line,
                             tako_prints: &prints,
                         });
                         match phase {
