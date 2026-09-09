@@ -66,7 +66,8 @@ impl WorkerAgent {
     ///
     /// **判定の正本は `tako_core::agent_support`**（#982 のマトリクス）。
     /// claude は `claude agents --json`、codex は rollout JSONL の
-    /// `task_started` / `task_complete`（#984 で実測）。
+    /// `task_started` / `task_complete`（#984 で実測）、agy は実況 JSONL の
+    /// `USER_INPUT` / 終端 `PLANNER_RESPONSE`（#1033 で実測）。
     /// `TAKO_982_LEGACY=1` でマトリクス参照前（claude だけ true）へ戻せる
     pub fn has_structured_status(&self) -> bool {
         if legacy_capability_check() {
@@ -409,7 +410,8 @@ pub fn ensure_trusted_in(
 
 /// codex: `~/.codex/config.toml` に `[projects."<cwd>"] trust_level = "trusted"` を追記する
 fn ensure_codex_trusted(cwd: &str) -> Result<bool, String> {
-    let home = crate::orchestrator::home_dir().ok_or("ホームディレクトリを特定できない")?;
+    let home =
+        crate::orchestrator::agent_config_home().ok_or("ホームディレクトリを特定できない")?;
     ensure_codex_trusted_at(&home.join(".codex/config.toml"), cwd)
 }
 
@@ -447,7 +449,8 @@ pub(crate) fn toml_quote(s: &str) -> String {
 
 /// agy: `~/.gemini/antigravity-cli/settings.json` の `trustedWorkspaces` 配列に cwd を追加する
 fn ensure_agy_trusted(cwd: &str) -> Result<bool, String> {
-    let home = crate::orchestrator::home_dir().ok_or("ホームディレクトリを特定できない")?;
+    let home =
+        crate::orchestrator::agent_config_home().ok_or("ホームディレクトリを特定できない")?;
     ensure_agy_trusted_at(&home.join(".gemini/antigravity-cli/settings.json"), cwd)
 }
 
@@ -499,8 +502,8 @@ mod tests {
         }
     }
 
-    /// 汎用の「構造化された状態を持つか」はマトリクスから引く（#982 / #984）。
-    /// claude と codex が持ち、agy はまだ持たない
+    /// 汎用の「構造化された状態を持つか」はマトリクスから引く（#982 / #984 / #1033）。
+    /// 実 CLI の 3 系統は持ち、ハーネス未定のローカル LLM だけがまだ持たない
     #[test]
     fn 構造化状態の判定はマトリクスから引く() {
         assert!(WorkerAgent::Claude.has_structured_status());
@@ -508,7 +511,19 @@ mod tests {
             WorkerAgent::Codex.has_structured_status(),
             "codex は rollout JSONL の task_started / task_complete を持つ（#984 で実測）"
         );
-        assert!(!WorkerAgent::Agy.has_structured_status());
+        assert!(
+            WorkerAgent::Agy.has_structured_status(),
+            "agy は実況 JSONL の USER_INPUT / 終端 PLANNER_RESPONSE を持つ（#1033 で実測）"
+        );
+        // ローカル LLM は WorkerAgent に無い（enum の対応表は `.agent/agent-enums.md`）
+        // のでマトリクス側で見る。ハーネス未定 = 一次シグナルの有無が決まらない唯一の系統
+        assert!(
+            !agent_support::supports(
+                agent_support::Agent::Local,
+                agent_support::keys::WORKER_STATUS_STRUCTURED
+            ),
+            "ローカル LLM はハーネス未定なので一次シグナルの有無が決まらない"
+        );
     }
 
     /// POSIX 形式を固定するスナップショット群なので構文を明示する（#867。

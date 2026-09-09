@@ -698,6 +698,27 @@ mod tests {
         }
     }
 
+    /// テストから pwsh を起こすときの共通設定（#944）。
+    ///
+    /// PowerShell は起動のたびにキャッシュ（`~/.cache/powershell/` の
+    /// `StartupProfileData-*` と `telemetry.uuid`）を作る。`cargo test` が
+    /// ユーザーのホームへこれを撒かないよう、置き場を一時ディレクトリへ倒し
+    /// テレメトリと更新確認も切る（unix は `XDG_CACHE_HOME`、Windows は `LOCALAPPDATA`）
+    fn pwsh_command(bin: &str) -> std::process::Command {
+        let cache =
+            std::env::temp_dir().join(format!("tako-test-pwsh-cache-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&cache);
+        let mut cmd = std::process::Command::new(bin);
+        if crate::paths::issue944_legacy() {
+            return cmd; // A/B: 旧挙動（ユーザーの ~/.cache/powershell へ撒く）
+        }
+        cmd.env("XDG_CACHE_HOME", &cache)
+            .env("LOCALAPPDATA", &cache)
+            .env("POWERSHELL_TELEMETRY_OPTOUT", "1")
+            .env("POWERSHELL_UPDATECHECK", "Off");
+        cmd
+    }
+
     /// PowerShell 関数を実際に実行して Rust の生成結果と突き合わせる（最も強い同期検証）。
     ///
     /// pwsh が無い環境（素の Linux コンテナ等）では**検証をスキップする**。
@@ -706,7 +727,7 @@ mod tests {
     #[test]
     fn powershell_mirror_generates_identical_names() {
         let Some(pwsh) = ["pwsh", "powershell"].into_iter().find(|bin| {
-            std::process::Command::new(bin)
+            pwsh_command(bin)
                 .args(["-NoProfile", "-Command", "exit 0"])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -756,7 +777,7 @@ mod tests {
             }
         }
 
-        let out = std::process::Command::new(pwsh)
+        let out = pwsh_command(pwsh)
             .args(["-NoProfile", "-Command", &script])
             .output()
             .expect("pwsh の実行に失敗");

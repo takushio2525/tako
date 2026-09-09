@@ -1076,11 +1076,13 @@ mod tests {
     #[test]
     fn 一次シグナルの無い系統は未達と断定せず未確認を返す() {
         // #983 の受け入れ条件 5。旧実装は agent != "claude" を NotApplicable で
-        // 即返していた = **何も言わない**。agy は送達の一次シグナルを持たないので、
-        // 「未達」と断定はしないが「未確認」とは言う
+        // 即返していた = **何も言わない**。一次シグナルを持たない系統は
+        // 「未達」と断定はしないが「未確認」とは言う。
+        // #1033 で agy が実況 JSONL を得たので、この役はローカル LLM が担う
+        // （ハーネス未定 = 観測手段が決まっていない唯一の系統）
         let now_epoch = crate::sessions::parse_iso(&crate::sessions::now_iso()).unwrap();
         let agy = WorkerEntry {
-            agent: "agy".into(),
+            agent: "local".into(),
             status: "active".into(),
             spawned_at: crate::sessions::now_iso(),
             ..Default::default()
@@ -1229,8 +1231,13 @@ mod tests {
         );
         assert_eq!(
             delivery_observation(Agent::Agy),
+            DeliveryObservation::Structured,
+            "#1033 で実況 JSONL（USER_INPUT）を読めるようになった"
+        );
+        assert_eq!(
+            delivery_observation(Agent::Local),
             DeliveryObservation::ScreenOnly,
-            "会話が SQLite で一次シグナルが無い"
+            "ハーネス未定なので観測手段が決まっていない"
         );
     }
 

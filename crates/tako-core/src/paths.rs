@@ -84,17 +84,110 @@ fn is_path_separator(c: char) -> bool {
 /// （無ければ `~/.local/share/tako`）、Windows: `%APPDATA%\tako`
 /// （無ければ `%USERPROFILE%\AppData\Roaming\tako`）。
 /// `TAKO_DATA_DIR` で上書き可能（隔離検証用。#177 / #112: 本番の layout.json /
-/// settings.json / token / persist.log に一切触れない起動を 1 変数で作れる）
+/// settings.json / token / persist.log に一切触れない起動を 1 変数で作れる）。
+///
+/// **テストプロセスでは常に隔離先へ倒す**（#944）。`TAKO_DATA_DIR` を渡し忘れた
+/// `cargo test --workspace` が本番の `perf.log` / `persist.log` / `sessions.yaml` /
+/// `shell-integration/` を書き換えていた（実測: 診断ログに偽の
+/// 「メインスレッド専有」が 643 行）。判定は [`is_test_process`] を参照。
+/// 明示の `TAKO_DATA_DIR` は**テストでも優先**する（隔離セルフテスト・
+/// 既存テストの置き場指定を壊さないため）
 pub fn data_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("TAKO_DATA_DIR") {
         if !dir.is_empty() {
             return Some(PathBuf::from(dir));
         }
     }
+    if is_test_process() && !issue944_legacy() {
+        return Some(test_data_dir());
+    }
     default_data_dir()
 }
 
-fn default_data_dir() -> Option<PathBuf> {
+/// A/B 用の逃げ道（`TAKO_944_LEGACY=1`）。#944 の隔離を切って**旧挙動を再現**する。
+///
+/// 番犬（`tako_control::test_write_isolation`）が「これを立てると本番相当の場所へ
+/// 書いてしまう」ことを実測して、検査に検出力があること自体を固定する。
+/// 製品の経路には効かない（隔離はテストプロセスでしか働かないため）
+pub fn issue944_legacy() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_944_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
+/// このプロセスが `cargo test` の起こしたテストバイナリか。
+///
+/// **`cfg!(test)` では足りない**（#944）: `cfg(test)` はそのクレートを
+/// テストビルドしたときだけ真なので、`tako-control` のテストから呼ばれた
+/// `tako-core` の関数（`shell_integration::install` 等）は素通りする。
+/// 統合テスト（`crates/*/tests/*.rs`）から見た lib も同じく非テストビルドになる。
+/// 書き先を 1 か所（[`data_dir`]）で塞ぐには**実行時に**判定するしかない。
+///
+/// 判定材料は実行ファイルの置き場: libtest のバイナリは必ず
+/// `<target>/<profile>/deps/<名前>-<cargo のメタデータハッシュ>` に置かれる。
+/// 製品の起動経路（`cargo run` = `<target>/<profile>/<名前>`・`.app` バンドル・
+/// `~/.cargo/bin`・インストーラの配置先）は **`deps/` を通らない**ので誤検知しない
+pub fn is_test_process() -> bool {
+    static IS_TEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *IS_TEST.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .is_some_and(|exe| is_test_exe_path(&exe))
+    })
+}
+
+/// [`is_test_process`] の純粋ロジック（`current_exe` と分離してテストする）。
+/// 親ディレクトリが `deps` かつファイル名の末尾が `-<小文字 hex>` であること。
+///
+/// 区切りは `/` と `\` の両方を見る（[`shorten_home_with`] と同じ作法）。
+/// `std::path` の区切りは cfg で変わるので、そのままだと
+/// **macOS から Windows のパスを検査できない** = 判定をテストで固定できない
+fn is_test_exe_path(exe: &Path) -> bool {
+    let text = exe.to_string_lossy();
+    let mut parts = text.rsplit(is_path_separator);
+    let Some(name) = parts.next() else {
+        return false;
+    };
+    if parts.next() != Some("deps") {
+        return false;
+    }
+    // Windows の `.exe` だけ落とす（クレート名にドットは入らない）
+    let stem = match name.rsplit_once('.') {
+        Some((head, ext)) if ext.eq_ignore_ascii_case("exe") => head,
+        _ => name,
+    };
+    // cargo の `-C extra-filename=-<hash>`。桁数は将来変わりうるので下限だけ見る
+    let Some((head, hash)) = stem.rsplit_once('-') else {
+        return false;
+    };
+    !head.is_empty()
+        && hash.len() >= 8
+        && hash
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+}
+
+/// テストプロセス専用のデータ置き場（プロセスごとに 1 つ）。
+/// 作法は `tako_control::orchestrator::config_dir` の隔離先と揃えてある
+fn test_data_dir() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("tako-test-data-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    })
+    .clone()
+}
+
+/// 製品（非テスト）での既定のデータディレクトリ。[`data_dir`] の本体。
+///
+/// テストプロセスでは [`data_dir`] が隔離先を返す（#944）ので、
+/// 「既定の置き場が変わっていないこと」を検査するテストはこちらを見る
+pub fn default_data_dir() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         std::env::var_os("HOME")
@@ -250,5 +343,61 @@ mod tests {
             shorten_home_with("/Users/testuser/dev", home_from(None, None).as_deref()),
             "/Users/testuser/dev"
         );
+    }
+    // --- #944: テストプロセスの判定と data_dir の隔離 ---
+
+    #[test]
+    fn テストバイナリの置き場だけをテストプロセスとみなす() {
+        // libtest のバイナリ（unit / integration とも `deps/<名前>-<hash>`）
+        assert!(is_test_exe_path(Path::new(
+            "/w/target/debug/deps/tako_control-16d08f68b5f56d87"
+        )));
+        assert!(is_test_exe_path(Path::new(
+            "/w/target/debug/deps/issue652_resume_e2e-f1035392670f1b59"
+        )));
+        assert!(is_test_exe_path(Path::new(
+            r"C:\w\target\debug\deps\tako_core-0123456789abcdef.exe"
+        )));
+        assert!(!is_test_exe_path(Path::new(
+            r"C:\w\target\debug\tako-app.exe"
+        )));
+
+        // 製品の起動経路（cargo run / .app / インストール先）は deps/ を通らない
+        assert!(!is_test_exe_path(Path::new("/w/target/debug/tako-app")));
+        assert!(!is_test_exe_path(Path::new("/w/target/release/tako")));
+        assert!(!is_test_exe_path(Path::new(
+            "/Applications/tako.app/Contents/MacOS/tako"
+        )));
+        assert!(!is_test_exe_path(Path::new("/opt/homebrew/bin/tako")));
+        // deps/ でもハッシュが付いていなければテストではない（ビルド副産物）
+        assert!(!is_test_exe_path(Path::new("/w/target/debug/deps/libfoo")));
+        // 大文字 hex・短すぎるサフィックスは cargo の形ではない
+        assert!(!is_test_exe_path(Path::new(
+            "/w/target/debug/deps/foo-ABCDEF0123456789"
+        )));
+        assert!(!is_test_exe_path(Path::new("/w/target/debug/deps/foo-abc")));
+        // 名前が空（先頭がハイフン）は弾く
+        assert!(!is_test_exe_path(Path::new(
+            "/w/target/debug/deps/-0123456789abcdef"
+        )));
+    }
+
+    #[test]
+    fn テストプロセスのdata_dirはホーム配下を指さない() {
+        // このテスト自身がテストバイナリなので、判定は必ず真になる
+        assert!(is_test_process(), "テストバイナリで is_test_process が偽");
+        // `TAKO_DATA_DIR` が明示されている環境（隔離セルフテスト等）はそちらが優先。
+        // 明示が無いときだけ「ホーム配下でない」ことを見る
+        if std::env::var_os("TAKO_DATA_DIR").is_none_or(|v| v.is_empty()) {
+            let dir = data_dir().expect("テストプロセスでは必ず解決する");
+            assert_eq!(dir, test_data_dir());
+            if let Some(home) = home_dir() {
+                assert!(
+                    !dir.starts_with(&home),
+                    "テストの data_dir がホーム配下を指している: {}",
+                    dir.display()
+                );
+            }
+        }
     }
 }

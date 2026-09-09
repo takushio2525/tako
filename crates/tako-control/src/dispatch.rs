@@ -3490,34 +3490,45 @@ fn dispatch_inner(
 
         Request::SetupBootstrap {
             action,
+            agent,
             dry_run,
             reason,
         } => {
             // 読み取り・書き込みともプロセス内で完結する（アプリ状態に依存しない）
             let action = action.as_deref().unwrap_or("status");
+            // 対象の系統。**省略時は claude**（#868 からの既定を変えない）。
+            // 未知の名前は黙って claude にしない（別の系統を入れてしまうため）
+            let target = match agent.as_deref() {
+                Some(name) => crate::setup_bootstrap::parse_agent(name)
+                    .map_err(DispatchError::InvalidParams)?,
+                None => tako_core::platform::agent_install::AgentKind::Claude,
+            };
             match action {
-                "status" => crate::setup_bootstrap::status()
+                "status" => crate::setup_bootstrap::status_for(target)
                     .map(|s| s.to_json())
                     .map_err(DispatchError::Operation),
-                "install" => {
-                    crate::setup_bootstrap::install(crate::setup_bootstrap::InstallOptions {
+                // 3 系統ぶんを一度に（`tako setup --check` と同じ材料。#989）
+                "status-all" => Ok(crate::setup_bootstrap::status_all_json()),
+                "install" => crate::setup_bootstrap::install_for(
+                    target,
+                    crate::setup_bootstrap::InstallOptions {
                         dry_run: dry_run.unwrap_or(false),
                         // GUI 内 dispatch には端末が無いので出力は捕捉して応答へ載せる
                         interactive: false,
-                    })
-                    .map_err(DispatchError::Operation)
-                }
-                "path" => crate::setup_bootstrap::ensure_path().map_err(DispatchError::Operation),
-                "undo-path" => {
-                    crate::setup_bootstrap::undo_path().map_err(DispatchError::Operation)
-                }
+                    },
+                )
+                .map_err(DispatchError::Operation),
+                "path" => crate::setup_bootstrap::ensure_path_for(target)
+                    .map_err(DispatchError::Operation),
+                "undo-path" => crate::setup_bootstrap::undo_path_for(target)
+                    .map_err(DispatchError::Operation),
                 // 自動導入が通らないときの引き継ぎ計画（#1057。**読み取り専用**）。
                 // 実際に相手を起こすのは端末を持つ側（CLI）か、AI なら
                 // `tako_orchestrator_spawn` / `tako_run` の仕事
-                "handoff" => crate::setup_bootstrap::handoff_plan(reason.as_deref())
+                "handoff" => crate::setup_bootstrap::handoff_plan_for(target, reason.as_deref())
                     .map_err(DispatchError::Operation),
                 other => Err(DispatchError::InvalidParams(format!(
-                    "不明な action: {other:?}（status / install / path / undo-path / handoff のいずれか）"
+                    "不明な action: {other:?}（status / status-all / install / path / undo-path / handoff のいずれか）"
                 ))),
             }
         }
@@ -7658,6 +7669,21 @@ fn dispatch_orchestrator_report(
         result["transcript_agent"] = json!("codex");
         Some(texts)
     });
+    // #1033: codex でもなければ agy の実況を読む（`brain/<id>/.system_generated/logs/
+    // transcript.jsonl` の `PLANNER_RESPONSE` で本文を持つ行が発話）。
+    // これで `report --messages N` が agy worker でも実データを返す
+    // （北極星実測では agy だけ `messages` が 0 件だった）
+    let transcript = transcript.or_else(|| {
+        let backend = backend.as_deref()?;
+        let cid = crate::agy_session::resolve_conversation_id_for_backend(backend)?;
+        let texts = crate::agy_session::last_agent_texts(&cid, msg_count).ok()?;
+        if texts.is_empty() {
+            return None;
+        }
+        result["session_id"] = json!(cid);
+        result["transcript_agent"] = json!("agy");
+        Some(texts)
+    });
 
     match (&transcript, &scrollback) {
         (Some(texts), _) => {
@@ -9050,6 +9076,17 @@ fn normalize_agent_status(raw: &str) -> &'static str {
     }
 }
 
+/// その `status_source` が**エージェント自身の実況ログ**由来か（#984 / #1033）。
+///
+/// codex の rollout JSONL（`codex-session`）と agy の実況 JSONL（`agy-session`）は
+/// どちらも「agent 本人が書いた一次情報」なので、`claude agents --json` と同じ権威を持つ。
+/// **判定をここ 1 箇所に寄せる**のは、系統を足したときに片方の分岐だけ直して
+/// 「構造化ソースを足したのに idle が has_children で busy へ上書きされる」
+/// （#571 で claude、#984 で codex について踏んだ形）を繰り返さないため
+fn is_live_log_source(status_source: &str) -> bool {
+    status_source == "codex-session" || status_source == "agy-session"
+}
+
 /// codex の `rate_limits` を応答 JSON へ落とす（#985）。
 /// **キー名は codex の rollout と同じ**にして、上流のドキュメントと突き合わせられるようにする
 fn rate_limits_json(rl: &crate::codex_session::RateLimits) -> serde_json::Value {
@@ -9108,6 +9145,9 @@ fn finish_worker_status(
     // rollout JSONL に `task_started` / `task_complete` が逐次書かれる。実測済み）。
     // 画面推定へ落ちるのは「claude でも codex でもない」ときだけになる
     let mut codex_thread: Option<String> = None;
+    // #1033: agy の実況（`brain/<id>/.system_generated/logs/transcript.jsonl`）。
+    // 棚卸しが「会話は SQLite だけ」と記録していたのは実態とズレていた（実物調査で訂正）
+    let mut agy_conversation: Option<String> = None;
     let (resolved_sid, status_source);
     if let Some(sid) = session_id {
         resolved_sid = Some(sid.to_string());
@@ -9122,6 +9162,12 @@ fn finish_worker_status(
                 codex_thread = Some(tid);
                 resolved_sid = None;
                 status_source = "codex-session";
+            } else if let Some(cid) =
+                crate::agy_session::resolve_conversation_id_for_backend(backend)
+            {
+                agy_conversation = Some(cid);
+                resolved_sid = None;
+                status_source = "agy-session";
             } else {
                 resolved_sid = None;
                 status_source = "screen";
@@ -9146,6 +9192,10 @@ fn finish_worker_status(
     // 実は働いている worker へ自動再送が飛ぶ（二重指示事故）。
     // 「読めて 0 ターン」（= `codex_turn_observed == false` かつこれが true）だけが未達の証拠
     let mut codex_rollout_read = false;
+    // #1033: agy も同じ約束。`USER_INPUT` が 1 件でもあれば送達の一次証拠になり、
+    // transcript を**読めなかった**ときは未達を断定しない（読めて 0 件だけが未達の証拠）
+    let mut agy_turn_observed = false;
+    let mut agy_transcript_read = false;
     let (status, mut ctx_percent) = if let Some(ref sid) = resolved_sid {
         let agent = orchestrator::query_agent_status(sid);
         (
@@ -9164,6 +9214,21 @@ fn finish_worker_status(
                 match st.status() {
                     Some(s) => (s.to_string(), st.ctx_percent),
                     None => ("unknown".to_string(), st.ctx_percent),
+                }
+            }
+            None => ("unknown".to_string(), None),
+        }
+    } else if let Some(ref cid) = agy_conversation {
+        // #1033: agy の実況 JSONL。**終端の最終発話が書かれるまでは busy**
+        // （ツール結果の本文や「喋りながらツールを呼ぶ」行を完了と読まない）。
+        // ctx% は transcript に載っていないので触らない（画面 / claude_ctx 側が解決する）
+        match crate::agy_session::read_turn_state(cid) {
+            Some(st) => {
+                agy_turn_observed = st.prompt_arrived();
+                agy_transcript_read = true;
+                match st.status() {
+                    Some(s) => (s.to_string(), None),
+                    None => ("unknown".to_string(), None),
                 }
             }
             None => ("unknown".to_string(), None),
@@ -9240,15 +9305,23 @@ fn finish_worker_status(
         // thread が解決できない / rollout が読めないときは未達と断定させない。
         // **claude の一次シグナルは `claude agents --json` 側**なのでここでは触らない
         // （#390 の「welcome 画面のまま未達」判定は不変）
+        // #1033: agy も一次シグナル（実況 JSONL）を持つようになったので同じ扱いにする。
+        // **マトリクスが Structured と宣言した系統は「読めなかった」を未達と断定しない**
+        // （でないと自動再送で二重指示になる）
         let primary_signal_unreadable = !crate::orchestrator::wait::legacy_1015()
-            && effective.agent == orchestrator::agent::WorkerAgent::Codex.as_str()
-            && !codex_rollout_read;
+            && if effective.agent == orchestrator::agent::WorkerAgent::Codex.as_str() {
+                !codex_rollout_read
+            } else if effective.agent == orchestrator::agent::WorkerAgent::Agy.as_str() {
+                !agy_transcript_read
+            } else {
+                false
+            };
         (
             orchestrator::registry::prompt_delivery_assessment_with(
                 &effective,
                 now_epoch,
                 orchestrator::registry::DeliveryEvidence {
-                    turn_observed: codex_turn_observed,
+                    turn_observed: codex_turn_observed || agy_turn_observed,
                     primary_signal_unreadable,
                 },
             ),
@@ -9355,10 +9428,11 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     // 一次シグナル扱い（idle 連続 3 回で確定）してしまう。source を実態に合わせる
     //
     // #984: codex の実況（codex-session）も同じ扱い。rollout がまだ無い＝ターン未実行の
-    // ときは構造化ソースとして何も言えないので、根拠を画面へ落とす
+    // ときは構造化ソースとして何も言えないので、根拠を画面へ落とす。
+    // #1033: agy の実況（agy-session）も同じ
     let mut status_source = status_source;
     if status == "unknown"
-        && (status_source.starts_with("agents") || status_source == "codex-session")
+        && (status_source.starts_with("agents") || is_live_log_source(&status_source))
     {
         status_source = "screen".to_string();
     }
@@ -9375,7 +9449,7 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     // 上書きされてしまう（#571 で claude について踏んだのと同じ形）
     let agents_authoritative = status_source == "agents"
         || status_source == "agents-auto"
-        || status_source == "codex-session";
+        || is_live_log_source(&status_source);
     if status == "idle" {
         let screen_busy = recent_output
             .as_ref()
@@ -17244,12 +17318,33 @@ mod tests {
         }
     }
 
+    /// e2e の事前信頼が書かれる**実ファイル**（テストの隔離を通さない側）。
+    ///
+    /// e2e は「実 claude が読む既定の config」を明示して事前信頼を書く
+    /// （`ensure_trusted_in(Some(claude_default_config_dir()), …)`）。
+    /// 一方 `config_json_paths(None)` は #944 でテストビルドでは隔離先を返すので、
+    /// **後始末にそれを使うと 1 件も消えない**。書いた先と同じ規則で解決する
+    fn e2e_trust_config_paths() -> Vec<std::path::PathBuf> {
+        let mut paths = Vec::new();
+        if let Some(dir) = crate::orchestrator::claude_default_config_dir() {
+            paths.push(dir.join(".claude.json"));
+        }
+        // 旧世代の置き場（ホーム直下）。過去の実行が残した分も掃除する
+        if let Some(home) = crate::orchestrator::home_dir() {
+            let legacy = home.join(".claude.json");
+            if !paths.contains(&legacy) {
+                paths.push(legacy);
+            }
+        }
+        paths
+    }
+
     /// e2e が書いた事前信頼エントリを claude の `.claude.json` から除去する（best-effort）。
     /// 消さないと実行のたびに `/private/tmp/tako-e2e-577-<pid>/work` が溜まり続ける
     /// （claude_tui_e2e の `remove_trust_entry` と同じ後始末）
     fn remove_e2e_trust_entry(dir: &std::path::Path) {
         let key = dir.display().to_string();
-        for path in crate::claude_tui::config_json_paths(None) {
+        for path in e2e_trust_config_paths() {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
@@ -17743,6 +17838,34 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("一致する選択肢が無い"), "{err}");
+    }
+
+    /// claude 2.x の信頼ダイアログ（**番号なし・選択肢 2 つ**の実採取。#1223）
+    const TRUST_NO_NUMBER_1223: &str = r#" Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source
+ project, or work from your team). If not, take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ > No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel"#;
+
+    #[test]
+    fn issue1223_番号なし二択の信頼ダイアログをラベルで解決する() {
+        let dialog = dialog_of(TRUST_NO_NUMBER_1223);
+        assert!(!dialog.numbered, "矢印移動 + ラベル検証の経路");
+        // ラベルの部分一致（master が使う形）
+        assert_eq!(resolve_choice_index(&dialog, "trust").unwrap(), 1);
+        // 番号なしでも表示順の 1-origin で指定できる
+        assert_eq!(resolve_choice_index(&dialog, "1").unwrap(), 0);
+        assert_eq!(resolve_choice_index(&dialog, "2").unwrap(), 1);
+        // エイリアス（`no` は `No,` 始まりに当たる = 既定の `No, exit`）
+        assert_eq!(resolve_choice_index(&dialog, "no").unwrap(), 0);
+        let err = resolve_choice_index(&dialog, "3").unwrap_err().to_string();
+        assert!(err.contains("範囲外"), "{err}");
     }
 
     #[test]

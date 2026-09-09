@@ -480,16 +480,17 @@ pub struct SetupRelocation {
 ///
 /// `Some((旧, 新))` を返すのは**すべて**満たすときだけ:
 ///
-/// 1. `TAKO_DATA_DIR` が立っていない — 隔離した検証が**本番の setup を吸い上げない**ため。
+/// 1. **data dir が隔離されていない** — 隔離した検証が**本番の setup を吸い上げない**ため。
 ///    「隔離したつもりが本番を触る」がこの Issue そのものなので、移設側で同じ穴を開けない。
-///    隔離中は旧い場所を見つけても触らず、本番の実行で改めて移す
+///    隔離中は旧い場所を見つけても触らず、本番の実行で改めて移す。隔離は
+///    `TAKO_DATA_DIR` とテストプロセス（#944）の 2 通りある（[`live_relocation_pair`]）
 /// 2. 新旧の場所が違う — macOS の既定では同じ場所なので**既存ユーザーは無移行**
 pub(crate) fn relocation_pair(
     legacy: Option<PathBuf>,
-    data_dir_overridden: bool,
+    data_dir_isolated: bool,
     data_dir: Option<PathBuf>,
 ) -> Option<(PathBuf, PathBuf)> {
-    if data_dir_overridden {
+    if data_dir_isolated {
         return None;
     }
     let legacy = legacy?;
@@ -500,10 +501,16 @@ pub(crate) fn relocation_pair(
     Some((legacy, to))
 }
 
-/// 実環境での新旧の場所（[`relocation_pair`] へ env を渡すだけの薄い口）
+/// 実環境での新旧の場所（[`relocation_pair`] へ env を渡すだけの薄い口）。
+///
+/// 隔離の判定は **`TAKO_DATA_DIR` だけではない**（#944）: テストプロセスの
+/// `data_dir()` も隔離先を指すので、そのまま渡すと「旧 = 実ユーザーのホーム /
+/// 新 = 一時ディレクトリ」となり、`cargo test` がユーザーの本物の setup を
+/// 吸い上げて `setup.pre-v1.bak` へ退避しかねない
 fn live_relocation_pair() -> Option<(PathBuf, PathBuf)> {
-    let overridden = std::env::var_os("TAKO_DATA_DIR").is_some_and(|v| !v.is_empty());
-    relocation_pair(legacy_setup_dir(), overridden, tako_core::paths::data_dir())
+    let isolated = std::env::var_os("TAKO_DATA_DIR").is_some_and(|v| !v.is_empty())
+        || (tako_core::paths::is_test_process() && !tako_core::paths::issue944_legacy());
+    relocation_pair(legacy_setup_dir(), isolated, tako_core::paths::data_dir())
 }
 
 /// 移設すべき旧い場所と移設先（`(旧, 新)`）。移設が要らなければ None。
@@ -1193,9 +1200,11 @@ mod tests {
         // `setup_relocation_target` は env を読むので、TAKO_DATA_DIR を触るテストと直列化する
         let _guard = DATA_DIR_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let root = tmp("absent");
+        // テストプロセスは data dir が隔離されている（#944）ので、実環境の旧い場所が
+        // 在っても None になる = ユーザーの setup を吸い上げない
         assert!(
-            setup_relocation_target().is_none() || std::env::var_os("TAKO_DATA_DIR").is_some(),
-            "実環境でも旧い場所が無ければ None"
+            setup_relocation_target().is_none(),
+            "テストプロセスは実環境の setup を移設対象にしない"
         );
         // 走査そのものは「読めない」でエラーになる（呼び出し側が is_dir で門番している）
         assert!(relocate_setup_dir(&root.join("nope"), &root.join("to"), false).is_err());
@@ -1207,17 +1216,13 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn macosのsetupディレクトリは旧実装と同じ場所を指す() {
-        let _guard = DATA_DIR_ENV.lock().unwrap_or_else(|e| e.into_inner());
-        let saved = std::env::var_os("TAKO_DATA_DIR");
-        std::env::remove_var("TAKO_DATA_DIR");
-        let resolved = setup_dir();
+        // #944 でテストプロセスの `data_dir()` は隔離先を返すようになったので、
+        // 「製品での既定」を見る `default_data_dir()` と突き合わせる
+        // （`setup_dir()` は `data_dir()/setup` = 実装そのもの）
+        let resolved = tako_core::paths::default_data_dir().map(|d| d.join("setup"));
         let legacy = legacy_setup_dir();
-        if let Some(saved) = saved {
-            std::env::set_var("TAKO_DATA_DIR", saved);
-        }
         assert_eq!(
-            resolved.ok(),
-            legacy,
+            resolved, legacy,
             "macOS の既定は ~/Library/Application Support/tako/setup のまま"
         );
     }
