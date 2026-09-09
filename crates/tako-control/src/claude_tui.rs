@@ -1308,6 +1308,23 @@ mod tests {
 
  Enter to confirm · Esc to cancel"#;
 
+    /// auto mode の環境学習の確認（**番号つき 3 択の下に空の入力欄がある**実採取。#1263）。
+    /// 既定アカウント（`~/.claude`）を初めて auto mode で使う worker で 1 回は必ず出る。
+    /// ダイアログの 6 行は 2026-09-09 の worker ペインの実採取（Issue #1263 本文）
+    const TEACH_AUTO_MODE_DIALOG: &str = r#"  Teach auto mode about your environment?
+
+  Auto mode works better when it knows your environment. Takes about a minute.
+
+  ❯ 1. Yes
+    2. Not now
+    3. Don't show again
+
+  Enter to confirm · Esc to cancel
+────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────
+  claude-opus-5 · ctx 12%"#;
+
     #[test]
     fn 信頼ダイアログを検出する() {
         let lines = screen(TRUST_DIALOG);
@@ -2347,6 +2364,36 @@ Bash ツールで「touch /tmp/te439/approval-test.txt」を実行して
         let bypass = detect_choice_dialog(&screen(BYPASS_DIALOG)).expect("検知される");
         assert_eq!(bypass.kind, DialogKind::Bypass);
         assert!(bypass.kind.auto_accepted());
+    }
+
+    #[test]
+    fn issue1263_auto_mode確認は種別selectで応答対象になる() {
+        let lines = screen(TEACH_AUTO_MODE_DIALOG);
+        let dialog = detect_choice_dialog(&lines).expect("検知される（#1263）");
+        assert_eq!(
+            dialog.kind,
+            DialogKind::Select,
+            "文言はどの特別扱いにも当たらない = 既定の select"
+        );
+        assert!(dialog.numbered, "番号キーで確定できる");
+        assert!(dialog.cursor_visible, "選択カーソルは画面に在る");
+        assert_eq!(dialog.highlighted, Some(0));
+        assert_eq!(dialog.labels(), vec!["Yes", "Not now", "Don't show again"]);
+        assert_eq!(
+            dialog.kind.recommended_action(),
+            "respond",
+            "master が respond で選ぶ（tako は勝手に潰さない）"
+        );
+        assert!(
+            !dialog.kind.auto_accepted(),
+            "auto mode の学習可否はユーザーの選択なので自動承諾しない"
+        );
+        // 空の入力欄はダイアログに奪われている扱いになる（= 送達がここへ打ち込まない）
+        assert!(
+            input_line(&lines).is_none(),
+            "空の入力欄を「入力できる状態」と誤認しない"
+        );
+        assert!(is_choice_dialog(&lines));
     }
 
     #[test]
