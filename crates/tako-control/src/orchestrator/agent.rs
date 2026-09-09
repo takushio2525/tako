@@ -410,7 +410,8 @@ pub fn ensure_trusted_in(
 
 /// codex: `~/.codex/config.toml` に `[projects."<cwd>"] trust_level = "trusted"` を追記する
 fn ensure_codex_trusted(cwd: &str) -> Result<bool, String> {
-    let home = crate::orchestrator::home_dir().ok_or("ホームディレクトリを特定できない")?;
+    let home =
+        crate::orchestrator::agent_config_home().ok_or("ホームディレクトリを特定できない")?;
     ensure_codex_trusted_at(&home.join(".codex/config.toml"), cwd)
 }
 
@@ -448,7 +449,8 @@ pub(crate) fn toml_quote(s: &str) -> String {
 
 /// agy: `~/.gemini/antigravity-cli/settings.json` の `trustedWorkspaces` 配列に cwd を追加する
 fn ensure_agy_trusted(cwd: &str) -> Result<bool, String> {
-    let home = crate::orchestrator::home_dir().ok_or("ホームディレクトリを特定できない")?;
+    let home =
+        crate::orchestrator::agent_config_home().ok_or("ホームディレクトリを特定できない")?;
     ensure_agy_trusted_at(&home.join(".gemini/antigravity-cli/settings.json"), cwd)
 }
 

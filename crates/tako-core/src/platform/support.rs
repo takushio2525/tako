@@ -190,6 +190,12 @@ pub mod notes {
     );
 
     /// #1057。検出は両 OS で動くが、パッケージ導入の代行は brew（macOS）だけ
+    /// #989。3 系統とも `install.ps1` は実在するが、実機で通したのは claude だけ（#1057）
+    pub const WIN_SETUP_BOOTSTRAP_AGENTS: Note = Note::new(
+        "3 系統とも状態照会と公式手順の案内はできるが、導入の実行代行は claude だけ（#1057 で実機実測）。codex / agy の install.ps1 は実在するが未実測なので代行せずコマンドを案内する（実行代行は #525 の範囲）",
+        "State checks and official-command guidance work for all three CLIs, but tako only runs the installer for you for claude (measured on real Windows in #1057). The codex / agy install.ps1 scripts exist but are unverified, so tako prints the command instead of running it (running it is tracked in #525)",
+    );
+
     pub const WIN_SETUP_DEPS: Note = Note::new(
         "依存の検出はできるが、導入の実行代行は macOS（Homebrew）だけ。Windows は winget のコマンドを案内する",
         "Dependency detection works, but tako only runs the installer for you on macOS (Homebrew); on Windows it prints the winget command instead",
@@ -1404,10 +1410,14 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_setup_bootstrap",
         macos: Support::Supported,
-        // #1057 で実行代行（install / path）を Windows へ配線し実機で通した
-        windows: Support::Supported,
+        // #1057 で claude の実行代行（install / path）を Windows へ配線し実機で通した。
+        // #989 で対象が 3 系統になったが、codex / agy の Windows は未実測なので
+        // 代行せず案内まで = 全体としては Degraded（過大申告しない）
+        windows: Support::Degraded {
+            note: notes::WIN_SETUP_BOOTSTRAP_AGENTS,
+        },
         windows_evidence: Evidence::Measured(
-            "#1057 の Windows 11 実測: 隔離 USERPROFILE + PATH 剥ぎで `tako setup` が install（install.ps1 を -ExecutionPolicy Bypass -File で実行）→ path（ユーザー環境変数 Path へ追記・undo-path で完全復帰）→ auth 誘導 まで到達。2 回目は無言で素通り",
+            "#1057 の Windows 11 実測: 隔離 USERPROFILE + PATH 剥ぎで `tako setup` が install（install.ps1 を -ExecutionPolicy Bypass -File で実行）→ path（ユーザー環境変数 Path へ追記・undo-path で完全復帰）→ auth 誘導 まで到達。2 回目は無言で素通り。#989 で足した codex / agy は recipe の tako_can_run=false（状態照会・PATH・認証誘導は動くが install は代行しない）",
         ),
     },
     Feature {

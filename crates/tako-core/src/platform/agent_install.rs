@@ -1,6 +1,6 @@
-//! エージェント CLI の公式インストール手順（抽象境界 B17。#868 / #525）
+//! エージェント CLI の公式インストール手順（抽象境界 B17。#868 / #525 / #989）
 //!
-//! 「Claude Code をどう入れるか」のプラットフォーム差をここへ閉じ込める。
+//! 「各エージェント CLI をどう入れるか」のプラットフォーム差をここへ閉じ込める。
 //!
 //! ## なぜ純粋関数にするか
 //!
@@ -45,21 +45,95 @@
 //! - 設置先は `~\.local\bin\claude.exe`。ここは
 //!   [`crate::platform::exe`] の走査対象なので、PATH が再ログインまで
 //!   伝播しない Windows でも導入直後に検出できる
+//!
+//! ## codex の調査の根拠（2026-09-09 実測。#989）
+//!
+//! `https://chatgpt.com/codex/install.sh` は 302 で
+//! `https://releases.openai.com/codex/install.sh` へ飛ぶ 1,209 行の `#!/bin/sh`。
+//!
+//! - **`sudo` の参照が 0 件**。`BIN_DIR="${CODEX_INSTALL_DIR:-$HOME/.local/bin}"` /
+//!   `CODEX_HOME_DIR="${CODEX_HOME:-$HOME/.codex}"` /
+//!   `STANDALONE_ROOT="$CODEX_HOME_DIR/packages/standalone"` で、ホームの中だけで完結する
+//! - `codex-package_SHA256SUMS` を落として突き合わせる = **署名検証はインストーラ自身が行う**
+//! - PATH も**インストーラ自身**がマーカーブロックで profile へ書く（`pick_profile` が
+//!   darwin + zsh なら `~/.zprofile`）。tako の置き場所も同じ `~/.local/bin` なので
+//!   [`InstallRecipe::launcher_dir_rel`] が返す 1 個のブロックで 3 系統ぶんを兼ねる
+//! - **最後に `maybe_launch_codex_now` が `Start Codex now? [y/N]` を `/dev/tty` から聞く**。
+//!   代行するときは [`InstallRecipe::installer_env`] の `CODEX_NON_INTERACTIVE=1` が必須
+//!   （無いと codex の TUI が立ってインストーラが返らない）
+//! - `uname -s` が Darwin / Linux 以外なら
+//!   `install.sh supports macOS and Linux. Use install.ps1 on Windows.` で exit 1
+//! - **背景の自動更新は無い**。`codex doctor` が
+//!   `↑ updates 0.153.4 available (current 0.153.0, dismissed 0.144.5)` と知らせるだけで、
+//!   更新は `codex update`（実測）
+//! - Windows の設置先は `%LOCALAPPDATA%\Programs\OpenAI\Codex\bin`
+//!   （`install.ps1` の `$defaultVisibleBinDir`。claude と違って `~\.local\bin` ではない）
+//!
+//! ## agy の調査の根拠（2026-09-09 実測。#989）
+//!
+//! 公式 docs（`https://antigravity.google/docs/cli/install.md`）の
+//! 「macOS and Linux」が `curl -fsSL https://antigravity.google/cli/install.sh | bash`。
+//! 取得物は 239 行の `#!/bin/bash`。
+//!
+//! - **`sudo` の参照が 0 件**。`TARGET_DIR="$HOME/.local/bin"` /
+//!   `BINARY_PATH="$TARGET_DIR/agy"` で、マニフェストの `sha512` と突き合わせてから置く
+//!   （**署名検証はインストーラ自身が行う**）
+//! - **単一バイナリ**なのでバージョンごとの実体ディレクトリが無い
+//!   （= [`InstallRecipe::payload_rel`] は `None`）。展開前の置き場は
+//!   `~/.cache/antigravity/staging` で、`trap cleanup EXIT` が消す
+//! - 既に在れば `Notice: 'agy' is already installed at …` で **exit 0**（= 冪等）
+//! - 同じ出力に `The Antigravity CLI automatically self-updates in the background during
+//!   regular runs.` と明記があるので `auto_updates: true`
+//! - 対話プロンプトを持たない（`read` / `/dev/tty` の参照なし）ので env の追加は要らない
+//! - 最後に `"$BINARY_PATH" install` を呼んで PATH を設定する
+//!   （`agy install` = 「Configure environment paths and shell settings」。実測の `agy help install`）
+//! - Windows の設置先は `%LOCALAPPDATA%\agy\bin`（公式 docs の Windows 節）
+//!
+//! ## Windows で codex / agy の実行を代行しない理由（#989）
+//!
+//! `install.ps1` は 3 系統とも実在するが、実機で通したのは claude だけ（#1057）。
+//! 未実測の経路を `tako_can_run: true` にすると「代行できるはず」で失敗して詰まるので、
+//! codex / agy の Windows は **状態照会と公式手順の案内まで**にしてある
+//! （実行代行は #525 の範囲。宣言は [`crate::platform::support`] の
+//! `tako_setup_bootstrap` 行と [`crate::agent_support`] のマトリクス）
 
 use super::support::Platform;
 use std::path::PathBuf;
 
-/// 自動インストールに対応するエージェント CLI。
-/// codex / agy は将来拡張（#868 の Out of scope）で、いまは列挙だけしない
+/// 公式インストーラの手順を持っているエージェント CLI（#868 → #989 で 3 系統へ）。
+///
+/// **ローカル LLM（`agent_support::Agent::Local`）はここに無い**。Ollama は
+/// 「エージェント CLI」ではなく runtime で、導入したあとにモデルを pull する段が
+/// 増えるので手順の形が違う（#990 の担当）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentKind {
     Claude,
+    Codex,
+    Agy,
 }
 
 impl AgentKind {
+    /// 列挙の正本。並びは「基準系 → master を務められる系統 → worker 専用」
+    pub const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Agy];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Agy => "agy",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.as_str() == value)
+    }
+
+    /// 利用者へ見せる製品名（コマンド名ではなく「何を入れるのか」）
+    pub fn product(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude Code",
+            Self::Codex => "Codex CLI",
+            Self::Agy => "Antigravity CLI",
         }
     }
 }
@@ -157,24 +231,44 @@ pub struct InstallRecipe {
     pub source: InstallerSource,
     /// インストール後にランチャーが置かれるパス（`$HOME` からの相対）
     pub launcher_rel: &'static str,
-    /// 実体（バージョンごとのディレクトリ）が置かれるパス（`$HOME` からの相対）
-    pub payload_rel: &'static str,
-    /// バックグラウンド自動更新が効くか
+    /// 実体（バージョンごとのディレクトリ）が置かれるパス（`$HOME` からの相対）。
+    ///
+    /// **単一バイナリの系統は `None`**（agy はランチャー自身が本体なので、
+    /// 「本体の置き場所」を別に見せると同じパスを 2 回言うことになる）
+    pub payload_rel: Option<&'static str>,
+    /// バックグラウンド自動更新が効くか（機械が読む側）
     pub auto_updates: bool,
+    /// 以後どう更新されるかの 1 行（人が読む側）。**`auto_updates` の真偽から
+    /// 文面を組まない**のは、codex が「自動ではないが自分で知らせる」の第 3 の形だから
+    /// （`codex doctor` の `↑ updates … available`。実測）
+    pub update_note: &'static str,
     /// tako が実行を代行してよいか。false = 手順を案内するだけ
     pub tako_can_run: bool,
+    /// インストールが失敗したときに案内する公式ページ（2026-09-09 に 200 を実測）。
+    /// **系統ごとに違う**ので、claude のトラブルシュートを codex の失敗に出さない
+    pub troubleshoot_url: &'static str,
+    /// インストーラへ渡す環境変数。**対話プロンプトを黙らせるため**に使う
+    /// （codex は `CODEX_NON_INTERACTIVE=1` が無いと最後に `Start Codex now?` を
+    /// `/dev/tty` から聞いて返ってこない。実測）
+    pub installer_env: &'static [(&'static str, &'static str)],
     /// 取得したインストーラの走らせ方（`source.interpreter` は人へ見せる名前、
     /// こちらは実際に組む argv）
     pub runner: InterpreterSpec,
 }
 
 impl InstallRecipe {
-    /// PATH へ通すべきディレクトリ（`$HOME` からの相対）
+    /// PATH へ通すべきディレクトリ（`$HOME` からの相対）。
+    ///
+    /// **ランチャーのパスから導出する**（プラットフォームで `match` しない）。
+    /// #989 で codex / agy を足した時点で「どの OS でも `.local/bin`」が
+    /// 成り立たなくなった（Windows の codex は
+    /// `%LOCALAPPDATA%\Programs\OpenAI\Codex\bin`、agy は `%LOCALAPPDATA%\agy\bin`）。
+    /// 導出にすれば置き場所の正本が `launcher_rel` の 1 箇所になり、両者がずれない
     pub fn launcher_dir_rel(&self) -> &'static str {
-        match self.platform {
-            // どちらも `<home>/.local/bin/<name>` 形式
-            Platform::MacOs | Platform::Windows => ".local/bin",
-        }
+        self.launcher_rel
+            .rsplit_once('/')
+            .map(|(dir, _)| dir)
+            .unwrap_or(".")
     }
 
     /// 実際のランチャーパス（home を与えて解決する。**環境変数を読まない**ので
@@ -188,9 +282,9 @@ impl InstallRecipe {
         rel_join(home, self.launcher_dir_rel())
     }
 
-    /// 実体ディレクトリの絶対パス
-    pub fn payload_dir_in(&self, home: &std::path::Path) -> PathBuf {
-        rel_join(home, self.payload_rel)
+    /// 実体ディレクトリの絶対パス（単一バイナリの系統は `None`）
+    pub fn payload_dir_in(&self, home: &std::path::Path) -> Option<PathBuf> {
+        self.payload_rel.map(|rel| rel_join(home, rel))
     }
 }
 
@@ -218,9 +312,12 @@ pub fn recipe(platform: Platform, agent: AgentKind) -> InstallRecipe {
                 official_command: "curl -fsSL https://claude.ai/install.sh | bash",
             },
             launcher_rel: ".local/bin/claude",
-            payload_rel: ".local/share/claude/versions",
+            payload_rel: Some(".local/share/claude/versions"),
             auto_updates: true,
+            update_note: "Claude Code が自分でバックグラウンド更新します",
+            troubleshoot_url: "https://code.claude.com/docs/en/troubleshoot-install",
             tako_can_run: true,
+            installer_env: &[],
             runner: InterpreterSpec {
                 candidates: &["bash"],
                 fallback: "/bin/bash",
@@ -238,36 +335,133 @@ pub fn recipe(platform: Platform, agent: AgentKind) -> InstallRecipe {
                 official_command: "irm https://claude.ai/install.ps1 | iex",
             },
             launcher_rel: ".local/bin/claude.exe",
-            payload_rel: ".local/share/claude/versions",
+            payload_rel: Some(".local/share/claude/versions"),
             auto_updates: true,
+            update_note: "Claude Code が自分でバックグラウンド更新します",
+            troubleshoot_url: "https://code.claude.com/docs/en/troubleshoot-install",
             // #1057 で Windows 11 実機の通し実測を経て true へ倒した
             // （記録は `.agent/plans/2026-08-windows-main-merge-wip.md` の #1057 節）
             tako_can_run: true,
-            runner: InterpreterSpec {
-                // **5.1（`powershell.exe`）を先に置く**。Windows へ必ず同梱されている
-                // 側を既定にするとマシンごとの差が出ない（pwsh 7 は任意導入）。
-                // `install.ps1` は 5.1 / 7 のどちらでも動く（`Set-StrictMode` /
-                // `Invoke-RestMethod` / `Get-FileHash` はいずれも 5.1 に在る）
-                candidates: &["powershell", "pwsh"],
-                fallback: "powershell.exe",
-                // `-ExecutionPolicy Bypass` は**このプロセスだけ**に効く（マシンの
-                // 設定は変えない）。公式の `irm | iex` は文字列を食わせるので
-                // ExecutionPolicy の対象外だが、ファイルへ落として `-File` で
-                // 走らせるこちらは既定の `RemoteSigned` に弾かれる（実機実測）。
-                // `-NoProfile` はユーザーの profile を挟まないため
-                leading_args: &[
-                    "-NoLogo",
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-File",
-                ],
-                script_ext: "ps1",
-                signature: ScriptSignature::PowerShell,
+            installer_env: &[],
+            runner: WINDOWS_POWERSHELL_RUNNER,
+        },
+        // codex（2026-09-09 実測。モジュールドキュメントの「codex の調査の根拠」）
+        (Platform::MacOs, AgentKind::Codex) => InstallRecipe {
+            agent,
+            platform,
+            source: InstallerSource {
+                url: "https://chatgpt.com/codex/install.sh",
+                // 取得物の shebang は `#!/bin/sh`（公式の 1 行も `| sh`）
+                interpreter: "sh",
+                official_command: "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
             },
+            launcher_rel: ".local/bin/codex",
+            payload_rel: Some(".codex/packages/standalone"),
+            // 背景更新は無い。`codex doctor` が知らせるだけ（実測）
+            auto_updates: false,
+            update_note: "codex が新しい版を知らせます（`codex update` で更新します）",
+            troubleshoot_url: "https://learn.chatgpt.com/docs/codex/cli",
+            tako_can_run: true,
+            // これが無いと最後の `Start Codex now? [y/N]` で返ってこない（実測）
+            installer_env: &[("CODEX_NON_INTERACTIVE", "1")],
+            runner: InterpreterSpec {
+                candidates: &["sh"],
+                fallback: "/bin/sh",
+                leading_args: &[],
+                script_ext: "sh",
+                signature: ScriptSignature::Shebang,
+            },
+        },
+        (Platform::Windows, AgentKind::Codex) => InstallRecipe {
+            agent,
+            platform,
+            source: InstallerSource {
+                url: "https://chatgpt.com/codex/install.ps1",
+                interpreter: "powershell",
+                official_command: "irm https://chatgpt.com/codex/install.ps1 | iex",
+            },
+            // `install.ps1` の `$defaultVisibleBinDir`（claude と違い `~\.local\bin` ではない）
+            launcher_rel: "AppData/Local/Programs/OpenAI/Codex/bin/codex.exe",
+            payload_rel: Some(".codex/packages/standalone"),
+            auto_updates: false,
+            update_note: "codex が新しい版を知らせます（`codex update` で更新します）",
+            troubleshoot_url: "https://learn.chatgpt.com/docs/codex/cli",
+            // Windows は状態照会と案内まで（実行代行は #525 の範囲。#989）
+            tako_can_run: false,
+            installer_env: &[("CODEX_NON_INTERACTIVE", "1")],
+            runner: WINDOWS_POWERSHELL_RUNNER,
+        },
+        // agy（2026-09-09 実測。モジュールドキュメントの「agy の調査の根拠」）
+        (Platform::MacOs, AgentKind::Agy) => InstallRecipe {
+            agent,
+            platform,
+            source: InstallerSource {
+                url: "https://antigravity.google/cli/install.sh",
+                // 取得物の shebang は `#!/bin/bash`（`set -euo pipefail` を使う）
+                interpreter: "bash",
+                official_command: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
+            },
+            launcher_rel: ".local/bin/agy",
+            // 単一バイナリなので実体ディレクトリが無い
+            payload_rel: None,
+            auto_updates: true,
+            update_note: "Antigravity CLI が実行のたびに自分で背景更新します",
+            troubleshoot_url: "https://antigravity.google/docs/cli/troubleshooting",
+            tako_can_run: true,
+            installer_env: &[],
+            runner: InterpreterSpec {
+                candidates: &["bash"],
+                fallback: "/bin/bash",
+                leading_args: &[],
+                script_ext: "sh",
+                signature: ScriptSignature::Shebang,
+            },
+        },
+        (Platform::Windows, AgentKind::Agy) => InstallRecipe {
+            agent,
+            platform,
+            source: InstallerSource {
+                url: "https://antigravity.google/cli/install.ps1",
+                interpreter: "powershell",
+                official_command: "irm https://antigravity.google/cli/install.ps1 | iex",
+            },
+            // 公式 docs の Windows 節（`C:\Users\<username>\AppData\Local\agy\bin`）
+            launcher_rel: "AppData/Local/agy/bin/agy.exe",
+            payload_rel: None,
+            auto_updates: true,
+            update_note: "Antigravity CLI が実行のたびに自分で背景更新します",
+            troubleshoot_url: "https://antigravity.google/docs/cli/troubleshooting",
+            // Windows は状態照会と案内まで（実行代行は #525 の範囲。#989）
+            tako_can_run: false,
+            installer_env: &[],
+            runner: WINDOWS_POWERSHELL_RUNNER,
         },
     }
 }
+
+/// Windows の `install.ps1` を走らせる形（3 系統で同じなので 1 箇所に置く）。
+///
+/// - **5.1（`powershell.exe`）を先に置く**。Windows へ必ず同梱されている側を既定に
+///   するとマシンごとの差が出ない（pwsh 7 は任意導入）。3 系統の `install.ps1` は
+///   どれも `Set-StrictMode` / `Invoke-RestMethod` 止まりなので 5.1 で動く
+/// - `-ExecutionPolicy Bypass` は**このプロセスだけ**に効く（マシンの設定は変えない）。
+///   公式の `irm | iex` は文字列を食わせるので ExecutionPolicy の対象外だが、
+///   ファイルへ落として `-File` で走らせるこちらは既定の `RemoteSigned` に弾かれる
+///   （claude で実機実測。#1057）
+/// - `-NoProfile` はユーザーの profile を挟まないため
+const WINDOWS_POWERSHELL_RUNNER: InterpreterSpec = InterpreterSpec {
+    candidates: &["powershell", "pwsh"],
+    leading_args: &[
+        "-NoLogo",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+    ],
+    fallback: "powershell.exe",
+    script_ext: "ps1",
+    signature: ScriptSignature::PowerShell,
+};
 
 /// この実行環境のプラットフォーム
 pub fn current_platform() -> Platform {
@@ -392,17 +586,172 @@ mod tests {
         assert_eq!(r.launcher_dir_in(home), home.join(".local/bin"));
         assert_eq!(
             r.payload_dir_in(home),
-            home.join(".local/share/claude/versions")
+            Some(home.join(".local/share/claude/versions"))
         );
     }
 
+    /// macOS は 3 系統とも `~/.local/bin`（= tako の PATH ブロック 1 個で足りる。#989 の
+    /// やること 4）。**Windows は違う**ので、そこを取り違えないように両方を固定する
     #[test]
-    fn 両プラットフォームで同じランチャーディレクトリを使う() {
-        for p in [Platform::MacOs, Platform::Windows] {
+    fn macosの置き場は3系統とも同じでwindowsは系統ごとに違う() {
+        for agent in AgentKind::ALL {
             assert_eq!(
-                recipe(p, AgentKind::Claude).launcher_dir_rel(),
-                ".local/bin"
+                recipe(Platform::MacOs, agent).launcher_dir_rel(),
+                ".local/bin",
+                "{} の macOS の置き場",
+                agent.as_str()
             );
         }
+        assert_eq!(
+            recipe(Platform::Windows, AgentKind::Claude).launcher_dir_rel(),
+            ".local/bin"
+        );
+        assert_eq!(
+            recipe(Platform::Windows, AgentKind::Codex).launcher_dir_rel(),
+            "AppData/Local/Programs/OpenAI/Codex/bin"
+        );
+        assert_eq!(
+            recipe(Platform::Windows, AgentKind::Agy).launcher_dir_rel(),
+            "AppData/Local/agy/bin"
+        );
+    }
+
+    /// 3 系統 × 2 プラットフォームの手順が**全部揃っていて素性が矛盾しない**
+    /// （#989。1 マスでも埋め忘れると `recipe` が組めないので、埋まっている中身を見る）
+    #[test]
+    fn 全系統全プラットフォームの手順が揃っている() {
+        let home = std::path::Path::new("/tmp/h");
+        for platform in [Platform::MacOs, Platform::Windows] {
+            for agent in AgentKind::ALL {
+                let r = recipe(platform, agent);
+                let who = format!("{}/{}", platform.as_str(), agent.as_str());
+                assert_eq!(r.agent, agent, "{who}");
+                assert_eq!(r.platform, platform, "{who}");
+                assert!(r.source.url.starts_with("https://"), "{who} は https 必須");
+                // 公式の 1 行に取得元 URL がそのまま出ている（案内と実行がずれない）
+                assert!(
+                    r.source.official_command.contains(r.source.url),
+                    "{who} の official_command に URL が無い"
+                );
+                assert!(!r.update_note.is_empty(), "{who} の更新の説明が空");
+                assert!(
+                    r.troubleshoot_url.starts_with("https://"),
+                    "{who} のトラブルシュート URL"
+                );
+                // ランチャーはコマンド名で終わる（`.exe` は Windows だけ）
+                assert!(
+                    r.launcher_rel.ends_with(agent.as_str())
+                        || r.launcher_rel.ends_with(&format!("{}.exe", agent.as_str())),
+                    "{who} の launcher_rel={}",
+                    r.launcher_rel
+                );
+                assert_eq!(
+                    r.launcher_rel.ends_with(".exe"),
+                    platform == Platform::Windows,
+                    "{who} の拡張子"
+                );
+                // 置き場所は必ずホームの中（管理者権限が要らないことの裏付け）
+                assert!(
+                    !r.launcher_rel.starts_with('/') && !r.launcher_rel.contains(':'),
+                    "{who} の置き場所がホームの外"
+                );
+                assert!(r.launcher_dir_in(home).starts_with(home), "{who}");
+                if let Some(payload) = r.payload_dir_in(home) {
+                    assert!(payload.starts_with(home), "{who} の本体がホームの外");
+                }
+                assert!(!agent.product().is_empty(), "{who} の製品名が空");
+            }
+        }
+    }
+
+    /// 失敗の案内は系統ごとに違う（claude のページを codex の失敗に出さない。#989）
+    #[test]
+    fn トラブルシュートの案内は系統ごとに違う() {
+        for platform in [Platform::MacOs, Platform::Windows] {
+            let urls: Vec<&str> = AgentKind::ALL
+                .into_iter()
+                .map(|a| recipe(platform, a).troubleshoot_url)
+                .collect();
+            for (i, a) in urls.iter().enumerate() {
+                for b in urls.iter().skip(i + 1) {
+                    assert_ne!(a, b, "{platform:?}: 案内先が同じ");
+                }
+            }
+            // 他系統の失敗に claude のページを出さない（実際に踏んだ退行。#989）
+            assert!(!recipe(platform, AgentKind::Codex)
+                .troubleshoot_url
+                .contains("claude"));
+            assert!(!recipe(platform, AgentKind::Agy)
+                .troubleshoot_url
+                .contains("claude"));
+        }
+    }
+
+    /// 単一バイナリの系統は「本体の置き場所」を持たない（同じパスを 2 回言わない）
+    #[test]
+    fn 単一バイナリのagyは本体の置き場所を持たない() {
+        for platform in [Platform::MacOs, Platform::Windows] {
+            assert!(recipe(platform, AgentKind::Agy).payload_rel.is_none());
+            assert!(recipe(platform, AgentKind::Claude).payload_rel.is_some());
+            assert!(recipe(platform, AgentKind::Codex).payload_rel.is_some());
+        }
+    }
+
+    /// 代行してよいのは**実機で通した組み合わせだけ**（過大申告しない。#989 / #1057）
+    #[test]
+    fn windowsで代行するのはclaudeだけ() {
+        for agent in AgentKind::ALL {
+            assert!(
+                recipe(Platform::MacOs, agent).tako_can_run,
+                "macOS は 3 系統とも代行する（{}）",
+                agent.as_str()
+            );
+        }
+        assert!(recipe(Platform::Windows, AgentKind::Claude).tako_can_run);
+        assert!(
+            !recipe(Platform::Windows, AgentKind::Codex).tako_can_run,
+            "Windows の codex は案内まで（#525）"
+        );
+        assert!(
+            !recipe(Platform::Windows, AgentKind::Agy).tako_can_run,
+            "Windows の agy は案内まで（#525）"
+        );
+    }
+
+    /// codex のインストーラは最後に `Start Codex now? [y/N]` を聞く（実測）。
+    /// **この env が落ちると代行が返ってこない**ので、両プラットフォームで固定する
+    #[test]
+    fn codexのインストーラは非対話envを必ず渡す() {
+        for platform in [Platform::MacOs, Platform::Windows] {
+            assert_eq!(
+                recipe(platform, AgentKind::Codex).installer_env,
+                &[("CODEX_NON_INTERACTIVE", "1")],
+                "{}",
+                platform.as_str()
+            );
+            // 他の系統は対話プロンプトを持たないので env を足さない（推測で増やさない）
+            assert!(recipe(platform, AgentKind::Claude).installer_env.is_empty());
+            assert!(recipe(platform, AgentKind::Agy).installer_env.is_empty());
+        }
+    }
+
+    /// codex は「自動更新ではないが自分で知らせる」第 3 の形（実測）。
+    /// `auto_updates` の真偽から文面を組むと嘘になるので、両方を別に固定する
+    #[test]
+    fn 更新のされ方は系統ごとに違う() {
+        let mac = |a| recipe(Platform::MacOs, a);
+        assert!(mac(AgentKind::Claude).auto_updates);
+        assert!(mac(AgentKind::Agy).auto_updates);
+        assert!(!mac(AgentKind::Codex).auto_updates);
+        assert!(mac(AgentKind::Codex).update_note.contains("codex update"));
+    }
+
+    #[test]
+    fn 系統名は文字列と往復する() {
+        for agent in AgentKind::ALL {
+            assert_eq!(AgentKind::parse(agent.as_str()), Some(agent));
+        }
+        assert_eq!(AgentKind::parse("ollama"), None);
+        assert_eq!(AgentKind::parse(""), None);
     }
 }
