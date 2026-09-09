@@ -103,6 +103,7 @@ impl Pane {
                 command: Some(command),
                 cwd: Some(cwd),
                 env: vec![("TAKO_PANE_ID".into(), "1".into())],
+                scrollback_lines: None,
             },
         )
         .expect("PowerShell ペインを起動できること");
@@ -435,6 +436,7 @@ fn 器の中では統合が読み込まれてもoscが外へ出ない() {
         }),
         cwd: Some(std::env::temp_dir()),
         env: vec![("TAKO_PANE_ID".into(), "1".into())],
+        scrollback_lines: None,
     };
     let (session, rx) = TerminalSession::spawn(120, 40, backend.wrap_spawn(options, &name))
         .expect("psmux クライアントを起動できること");
@@ -569,6 +571,7 @@ fn 器の中でも側路を張れば状態とcwdが届く() {
                 sink.display().to_string(),
             ),
         ],
+        scrollback_lines: None,
     };
     let (session, rx) = TerminalSession::spawn(120, 40, backend.wrap_spawn(options, &name))
         .expect("psmux クライアントを起動できること");
@@ -733,6 +736,7 @@ fn 統合なしのペインでは状態もcwdも報告されない() {
             }),
             cwd: Some(std::env::temp_dir()),
             env: vec![],
+            scrollback_lines: None,
         },
     )
     .expect("ペインを起動できること");

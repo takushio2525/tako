@@ -66,6 +66,7 @@ impl Pane {
                 command: Some(command),
                 cwd: Some(std::env::temp_dir()),
                 env: Vec::new(),
+                scrollback_lines: None,
             },
         )
         .expect("ConPTY を起動できること");
