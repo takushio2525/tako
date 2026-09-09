@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-09（#1034: 送達後に実行を断られた worker を完了と誤読しないようにした）
-- `execution_refused`（`WorkerErrorKind` / `AgentCliProblem` の新分類・`recommended_action = retry_spawn`）を追加。**#983 のゲートは緩めず**、別ゲート「一次シグナルで作業を 1 歩も観測していない」で分類する（画面推定の busy は TUI の起動描画を拾うので使えない）
-- 判定の文言は系統ごとに宣言（`execution_refused_patterns`）。実採取は agy のみで**版で文言が変わる**（1.1.22 = `Verifying your account` / 1.1.27 = `Unable to verify account eligibility`）ので共通語 `account eligibility` を軸にした。claude 2.1.258 / codex 0.153.0 のバイナリに一時的な検証待ちの文言が無いことは実物の走査で確認
-- MATRIX に `worker_refusal_detect` を新設し docs を同期。番犬 4 本 + dispatch の e2e 1 本 + 単体 8 本。A/B は `TAKO_1034_LEGACY=1`
-
 ## 2026-09-09（#1236: 信頼ダイアログの自動承諾がハイライトを見ずに Enter を送る問題を直した）
 - 送達フロー（`main.rs` の `drive_trust_accept`）と器越しの送達（`deliver_via_tmux`）を `claude_tui::accept_step` の 1 実装へ寄せ、移動の向き・歩数・「Enter を送ってよいか」は `tako_core::dialog::confirm_step`（respond の番号なし経路と共有）へ。**承諾側を特定できないあいだは Enter を送らない**（理由は `persist.log` の `[auto-accept]` 行）
 - 模擬 TUI（実 tmux・GUI 不要）で実キーの A/B: 新 = `Down`→`Enter` で `Yes, I trust this folder` が確定 / `TAKO_1236_LEGACY=1` = `Enter` 1 発で **`No, exit` が確定**（= 事故の再現）。ベースラインの Windows 警告 10 件と一致
@@ -68,3 +63,8 @@
 - 真因は**顛末の記録が後続 send では全経路空振り**すること。`record_prompt_delivery_at` は先頭で `if flow != SpawnPrompt { return }`（spawn 専用）・保留と打ち切りは `eprintln!`（GUI の stderr は誰も読めない）・`persist.log` へ書くのは貼り付け段へ到達した後の `try_peer` / `log_fallback` だけ。本番の pane 1627 は `送達:` 行が 1 本も無く（同時刻の他ペインは記録あり）、`WaitPromptReady` で `input_line` が唯一の入口という穴と、peer の背景試行・起動コマンド待ちの**上限なしの待ち**が重なっていた（Issue の見立て「busy だと送らない」は否定 = 送達フローは `has_running_children` を参照しない）
 - 語彙と方針を `tako_core::prompt_delivery` の 1 本へ（`Stall` 11 種 + `Journal` の心拍 15 秒 + `peer_wait` の段階判定）。応答は `tako_send_input` / `tako_read_pane` の `delivery`、CLI は `[delivery]` 行、`persist.log` は `送達フロー: pane=… 理由=…`。peer は 25 秒で諦めるが**送る前の段階だけ**キー経路へ落ちる（判定は `PeerAttemptState` の CAS。段階を読むだけでは読んだ直後に背景スレッドが書き始めて二重投函になる = #790 の不変条件）
 - A/B `TAKO_1259_LEGACY=1` で無音と無限待ちを再現（実ファイル検証）。番犬 6 本のうち 5 本が修正前 `main.rs` を行番号で名指し（6440 / 6445 / 6457 / 6472 / 6738 / 6797）。模擬 TUI e2e（`sleep 3600` の子を抱えた idle ペイン）で送達成立を実測
+
+## 2026-09-09（#1264: Windows で cargo test がコンパイルできない問題を直し CI に番犬を置いた）
+- #1199 の検証ブロックが 1 つ手前の関数に入っていた（`E0425` × 3）ので本来の関数へ移し、あわせて `assert_eq!(cwd_after_foreign, cwd)`（書いた後の値どうしで必ず通る）を**書く前の cwd** との比較へ直した。実機 A/B: `--no-run` が **exit 101 / 263s** → **exit 0 / 4s**・`shell_integration_powershell` 8/0
+- CI の穴（macOS は `#![cfg(windows)]` を空クレート化・Windows は `cargo build` が `tests/` を作らず `cargo test` は `continue-on-error`）を Windows ジョブの blocking `cargo test --workspace --no-run` で塞いだ。番犬 `ci_windows_test_compile`。追加時間は実質ゼロ（実機で 2 回目の `--no-run` は 2s = 再コンパイル 0）
+- **その CI ステップが初回で実在の回帰を捕まえた**: #818 が `SpawnOptions::scrollback_lines` を足したとき Windows 専用テスト 3 本（8 か所）が追従漏れ。同 PR で修正。ベースラインは 5 日ぶりに全数が採れて **19 → 24 件**（増えた 8 件は本 PR 以前から main に在ったもの。表は plan へ）

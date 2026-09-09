@@ -3761,6 +3761,34 @@ mode ビット / `~` 展開 / `links` の絶対パス / `shell_profile`、と既
 > **2026-09-04 更新: ベースラインは 24 → 19 件**。#935 が `acceptance_gates` の
 > 5 件（下の最初の 5 行）を解消した（実測: `UNIQUE_FAILS=19` で残りの名前は完全一致・
 > 新規ゼロ）。以後の照合は**この 5 行を除いた 19 件**と突き合わせること。
+>
+> **2026-09-09 更新（#1264）: ベースラインは 19 → 24 件**。#1264 で
+> `cargo test --workspace` が再び走るようになったので**5 日ぶりに全数が採れた**
+> （実測: head `2a91d44` / `--no-fail-fast` が **655 秒 / TEST_EXITCODE=101** /
+> 一意な失敗 **24 件**）。19 件のうち **16 件はそのまま**で、消えた 3 件と
+> 増えた 8 件の内訳は下の表。**#1264 の PR が触ったのは Windows 専用テストと CI
+> だけ**なので、増えた 8 件はどれもこの PR より前から main に在ったもの
+> （= コンパイルできないあいだに溜まった Windows 側の未検出）。
+>
+> | 差分 | 名前 | メモ |
+> |---|---|---|
+> | 消えた | `stale_binary::tests::test_pidpath_self` | #936 で解消（`pidpath` の Windows 実装） |
+> | 消えた | `stale_binary::tests::ランチャ探索は実行可能な通常ファイルだけを拾う` | 同上 |
+> | 消えた | `解決できないホストは接続前に分類される` | **#930 のハング枝を踏んだ**。今回は 536 秒ぶら下がり、`ssh` を落として初めて `ok` になった（= 分類そのものは正しい。戻ってこない経路が残っている） |
+> | 増えた | `keybindings::tests::非macosにmacos固有アクションのバインドが無い` | tako-app（bin） |
+> | 増えた | `agent_models::tests::cliが無いときは983の導入案内をそのまま返す` | tako-control |
+> | 増えた | `setup::tests::未導入の系統も選択肢に並び選ぶと導入案内が返る` | tako-control |
+> | 増えた | `context_budget::tests::表示用パスはスラグの中のホームも畳む` | tako-control（#1139 由来） |
+> | 増えた | `paths::tests::テストプロセスのdata_dirはホーム配下を指さない` | tako-control |
+> | 増えた | `platform::shell::tests_1031::配線された失敗時の保持が既定で有効` | tako-control（#1031 由来） |
+> | 増えた | `tmux_backend::tests::issue1188_ビューを閉じた元セッションは掃除対象へ戻る` | tako-core（#1188 由来） |
+> | 増えた | `所有者が生きているサーバーはapplyでも消えない` | tako-core `tests/tmux_server_reclaim.rs`（表に無かった新スイート） |
+>
+> **この日の緑**: `shell_integration_powershell` 8/0（#1199 の検証を含む）/
+> `psmux_backend` 18/0（#1114 の状態待ちが効いている）/ `encoding_conpty` 5/0 /
+> `spawn_arg_quoting` 3/0 / `ci_windows_test_compile` 2/0。
+> スイート別は tako-app 612/1・tako-cli 66/1・tako-control 1558/8・tako-core 1393/13・
+> `tmux_server_reclaim` 2/1。
 
 ```
 acceptance_gates::tests::execute_command_true_false   ← #935 で解消（2026-09-04）
