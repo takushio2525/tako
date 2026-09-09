@@ -19,6 +19,12 @@ use std::time::{Duration, Instant};
 use tako_core::backend::{PsmuxBackend, SessionBackend, SessionRef};
 use tako_core::terminal::{SpawnCommand, SpawnOptions};
 
+/// psmux を叩く経路は**すべて期限つき**（#1271）。素の `Command` で待つと
+/// 返らない回にテストプロセスごと固まり、`Fixture::drop` が 1 つも走らずに
+/// 器（サーバー）と中の pwsh が残る
+#[path = "common/psmux_ctl.rs"]
+mod psmux_ctl;
+
 /// テスト用の psmux バイナリ。無ければ `None`（= スキップ）
 fn psmux_bin() -> Option<String> {
     if let Some(bin) = std::env::var("TAKO_PSMUX_BIN")
@@ -31,11 +37,7 @@ fn psmux_bin() -> Option<String> {
 }
 
 fn runnable(bin: &str) -> bool {
-    Command::new(bin)
-        .arg("-V")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    psmux_ctl::probe(bin)
 }
 
 /// 隔離ソケット上の backend。Drop でサーバーごと落とす
@@ -68,14 +70,12 @@ impl Fixture {
 
     /// 隔離ソケット上での生 psmux 実行（psmux 側の生の挙動を観測する用）
     fn raw(&self, args: &[&str]) -> (bool, String) {
-        let out = Command::new(&self.bin)
-            .args(["-L", &self.socket])
-            .args(args)
-            .output()
-            .expect("psmux を実行できる");
-        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-        text.push_str(&String::from_utf8_lossy(&out.stderr));
-        (out.status.success(), text)
+        let mut all: Vec<&str> = vec!["-L", &self.socket];
+        all.extend_from_slice(args);
+        // **期限つき**（#1271）。`send-keys -X scroll-up` が返らない実測があり、
+        // ここで無限に待つと後始末がまるごと走らなくなる
+        let ran = psmux_ctl::psmux(&self.bin, &all, psmux_ctl::BASE);
+        (ran.ok, ran.text)
     }
 
     /// セッションの接続クライアント数（`None` = そのセッションがもう無い）。
@@ -101,10 +101,9 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        // **-L 必須**（省くと全ソケットのサーバーが死ぬ）
-        let _ = Command::new(&self.bin)
-            .args(["-L", &self.socket, "kill-server"])
-            .output();
+        // **-L 必須**（省くと全ソケットのサーバーが死ぬ）。期限つきの待ちと
+        // pid 指定の止めは `psmux_ctl::kill_server` の 1 実装（#1271）
+        psmux_ctl::kill_server(&self.bin, &self.socket);
         let _ = std::fs::remove_dir_all(&self.owner_dir);
     }
 }
@@ -147,17 +146,9 @@ const DETACH_BASE: Duration = Duration::from_secs(15);
 /// 再 attach で画面が戻るまでの素の上限（旧 20 秒。実測は 1.3 秒未満）
 const REATTACH_BASE: Duration = Duration::from_secs(30);
 
-/// この機の混み具合。**プロセスで 1 回だけ読む**
-/// （Windows の読み手は 120ms ブロックするので毎周期は呼ばない）
-fn busy() -> Option<f64> {
-    static BUSY: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
-    *BUSY.get_or_init(tako_core::wait_budget::machine_busy)
-}
-
-/// 状態待ちの上限（**伸ばすだけ**・4 倍で打ち切り）。政策は `tako_core::wait_budget` の 1 実装
-fn budget_for(base: Duration) -> Duration {
-    tako_core::wait_budget::state_wait_budget(base, busy())
-}
+/// この機の混み具合 / 状態待ちの上限。**器を叩く経路と同じ 1 実装**を通す
+/// （`psmux_ctl` 側が `tako_core::wait_budget` へ委譲する。政策を 2 か所に書かない）
+use psmux_ctl::{budget_for, busy};
 
 /// 旧の固定窓を再現するアーム（A/B 用）。`TAKO_1114_LEGACY=1`
 fn legacy_1114() -> bool {
@@ -526,17 +517,14 @@ fn confは警告なしで受理されwarm_offが効く() {
         eprintln!("skip: data_dir が無い環境");
         return;
     };
-    let out = Command::new(&f.bin)
-        .args(["-L", &f.socket, "-f"])
-        .arg(&conf)
-        .args(["new-session", "-d", "-s", "tako-m2conf00001"])
-        .output()
-        .expect("psmux を実行できる");
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let mut cmd = Command::new(&f.bin);
+    cmd.args(["-L", &f.socket, "-f"]).arg(&conf).args([
+        "new-session",
+        "-d",
+        "-s",
+        "tako-m2conf00001",
+    ]);
+    let text = psmux_ctl::wait_bounded(&mut cmd, psmux_ctl::BASE).text;
     assert!(
         !text.contains("warning") && !text.contains("unknown option"),
         "conf に psmux が知らないオプションがある（ペインへ警告が出る）: {text}"
@@ -570,17 +558,14 @@ fn 本番が書くconfも警告なしで受理される() {
     let path = std::env::temp_dir().join(format!("tako-974-{}.conf", std::process::id()));
     std::fs::write(&path, &conf_body).expect("conf を書ける");
 
-    let out = Command::new(&f.bin)
-        .args(["-L", &f.socket, "-f"])
-        .arg(&path)
-        .args(["new-session", "-d", "-s", "tako-m2conf974x"])
-        .output()
-        .expect("psmux を実行できる");
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let mut cmd = Command::new(&f.bin);
+    cmd.args(["-L", &f.socket, "-f"]).arg(&path).args([
+        "new-session",
+        "-d",
+        "-s",
+        "tako-m2conf974x",
+    ]);
+    let text = psmux_ctl::wait_bounded(&mut cmd, psmux_ctl::BASE).text;
     let _ = std::fs::remove_file(&path);
     assert!(
         !text.contains("warning") && !text.contains("unknown option"),

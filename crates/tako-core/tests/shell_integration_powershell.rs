@@ -25,6 +25,11 @@ use tako_core::terminal::{
     CommandState, SessionEvent, SpawnCommand, SpawnOptions, TerminalSession,
 };
 
+/// psmux を叩く経路は**すべて期限つき**（#1271）。素の `Command` で待つと
+/// 返らない回にテストプロセスごと固まり、器（サーバー）と中の pwsh が残る
+#[path = "common/psmux_ctl.rs"]
+mod psmux_ctl;
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn FreeConsole() -> i32;
@@ -444,9 +449,7 @@ fn 器の中では統合が読み込まれてもoscが外へ出ない() {
 
     // 器の後始末は assert より先に必ず通す（**-L 必須**。省くと全ソケットのサーバーが死ぬ）
     let cleanup = || {
-        let _ = std::process::Command::new(&bin)
-            .args(["-L", &socket, "kill-server"])
-            .output();
+        psmux_ctl::kill_server(&bin, &socket);
         let _ = std::fs::remove_dir_all(&owner_dir);
     };
 
@@ -592,9 +595,7 @@ fn 器の中でも側路を張れば状態とcwdが届く() {
     }
 
     let cleanup = || {
-        let _ = std::process::Command::new(&bin)
-            .args(["-L", &socket, "kill-server"])
-            .output();
+        psmux_ctl::kill_server(&bin, &socket);
         let _ = std::fs::remove_dir_all(&owner_dir);
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_dir_all(&target);
@@ -709,12 +710,7 @@ fn psmux_bin() -> Option<String> {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "psmux".to_string());
-    std::process::Command::new(&candidate)
-        .arg("-V")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|_| candidate)
+    psmux_ctl::probe(&candidate).then_some(candidate)
 }
 
 /// 統合を入れていないペインでは何も起きない（= 統合が状態の唯一の出どころだと確かめる）。
