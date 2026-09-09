@@ -281,7 +281,14 @@ fn 毎ターン読まれるファイルにマージの残骸が無い() {
     // 3 文字までにしてこのファイル自身の説明文に当たらないようにする
     let markers = ["<<<<<<<", "=======", ">>>>>>>", "|||||||"];
     let mut bad: Vec<String> = Vec::new();
-    for rel in [".agent/progress.md", ".agent/activeContext.md", "AGENTS.md"] {
+    // `progress-archive.md` は `@import` されないが**同じ移送とマージの経路で壊れる**
+    // （実際に #1241 の merge で progress.md と一緒に残骸が入った）ので併せて見る
+    for rel in [
+        ".agent/progress.md",
+        ".agent/progress-archive.md",
+        ".agent/activeContext.md",
+        "AGENTS.md",
+    ] {
         let path = repo_root().join(rel);
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
