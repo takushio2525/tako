@@ -125,8 +125,13 @@ fn session(name: &str) -> SessionRef {
 // **状態で待つ + 上限を `state_wait_budget` で伸ばす**（伸ばすだけ・4 倍で打ち切り）。
 // 予算切れの診断には「待っていたもの / 届いたもの」を必ず出す。
 
-/// ポーリング間隔。器は CLI / PTY 越しなのでこれより細かく回しても分解能が上がらない
+/// 画面のポーリング間隔（PTY のイベントを汲むだけなので安い）
 const POLL: Duration = Duration::from_millis(100);
+
+/// 器の状態のポーリング間隔。**1 回ごとに psmux の CLI プロセスが立つ**ので、
+/// 画面と同じ 100ms で回すと 18 本並列のこのバイナリが自分で負荷を作ってしまう
+/// （旧実装の 200〜500ms と同じ粒度に留める）
+const STATE_POLL: Duration = Duration::from_millis(250);
 
 /// マーカーが器の中のシェルから出るまでの素の上限。
 /// 旧の実効上限（6 周 × (プロンプト 6 秒 + マーカー 6 秒) ≒ 72 秒）より**広く**採る
@@ -205,7 +210,7 @@ fn wait_state(base: Duration, mut probe: impl FnMut() -> bool) -> Waited {
                 resends: 0,
             };
         }
-        std::thread::sleep(POLL);
+        std::thread::sleep(STATE_POLL);
         polls += 1;
     }
 }
