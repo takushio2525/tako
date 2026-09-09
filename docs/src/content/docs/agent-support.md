@@ -16,14 +16,14 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 ## 全体
 
-能力 47 件の内訳です。
+能力 48 件の内訳です。
 
 | エージェント | 対応 | 一部対応 | 未対応 | 対象外 |
 | --- | --- | --- | --- | --- |
-| Claude Code（基準） | 47 / 47 | 0 | 0 | 0 |
-| OpenAI Codex CLI | 28 / 47 | 5 | 11 | 3 |
-| Antigravity CLI | 13 / 47 | 7 | 18 | 9 |
-| Local LLM | 0 / 47 | 0 | 39 | 8 |
+| Claude Code（基準） | 48 / 48 | 0 | 0 | 0 |
+| OpenAI Codex CLI | 29 / 48 | 5 | 11 | 3 |
+| Antigravity CLI | 14 / 48 | 7 | 18 | 9 |
+| Local LLM | 0 / 48 | 0 | 40 | 8 |
 
 ### 状態の意味
 
@@ -122,6 +122,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 | **過去の会話を復元して続ける（`tako sessions resume`）**<br />`sessions_resume` | 対応 | 未対応 [#984](https://github.com/takushio2525/tako/issues/984)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#984](https://github.com/takushio2525/tako/issues/984)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: dispatch.rs の resume は claude --resume <session_id> を組み、~/.claude/projects の transcript を前提にする（claude 以外は分類済みエラーで 手動の代替を案内する） |
 | **会話を保ったまま CLI プロセスだけ建て直す（#1067。CLI の自動更新に追いつく手段）**<br />`session_restart_harness` | 対応 | 未対応 [#984](https://github.com/takushio2525/tako/issues/984)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#984](https://github.com/takushio2525/tako/issues/984)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: session_restart の harness は sessions::resume_command（claude --resume）を              組んで送るので、resume を配線していない系統では成立しない              （手段自体は上流にある: codex resume / agy --conversation） |
 | **引き継ぎを書かせてセッションを交代する（#1067。ペインの右クリック / `tako session-restart --mode handoff`）**<br />`session_restart_handoff` | 対応 | 未対応 [#1067](https://github.com/takushio2525/tako/issues/1067)<br />手段は揃っているが実機で確かめていない（claude で先行実装した） | 未対応 [#987](https://github.com/takushio2525/tako/issues/987)<br />agy は worker 専用で、master / solo としては起動前にエラーになる（#127） | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: 引き継ぎ再起動は master ペインへ定型文を送り、エージェント自身が              tako_orchestrator_handoff を呼ぶ形（handoff.rs の restart_prompt）。             codex master は #979 で MCP が届くので成立しうるが未実測。             agy は master になれない（#987）ので対象そのものが無い |
+| **PC 再起動（tmux サーバーごと消える）後の復元で会話ごと戻る（#1238）**<br />`restore_after_reboot` | 対応 | 対応 | 対応 | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #1238 の実測（2026-09-09 / codex-cli 0.153.0 / agy 1.1.27）: 生きた codex は $CODEX_HOME/thread-writer-locks/<id>.lock を、生きた agy は ~/.gemini/antigravity-cli/presence/<id>.lock を開いたまま持つ。ペイン → 子孫 pid → lsof でその ID を採り layout.json へ保存すると、tmux サーバーを kill したあとの復元で `codex resume <id>` / `agy --conversation <id>` が会話を履歴ごと戻した。**Windows は lsof が無いので ID を採れない**（復元の内訳は `resume 非対応` と出す。判定は tako_core::agent_resume::restore_support） |
 
 ## 利用制限
 

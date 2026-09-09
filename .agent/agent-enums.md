@@ -88,6 +88,7 @@
 | `registry.rs` の `prompt_delivery_assessment`（`entry.agent != "claude"`） | 文字列比較で `NotApplicable` | #983 |
 | `dispatch.rs` の worker_status の `status_source` 分岐 | 実行時の session_id 解決結果で決める | #984 |
 | `dispatch.rs` の transcript アダプタ | claude 固定（拡張点のコメントあり） | #984 |
+| 再起動後の復元の resume コマンド | **#1238 で 3 系統へ広げ済み**（`tako_core::agent_resume::resume_spec` の 1 マス + `restore_support` の可否判定。番犬 `agent_resume_watchdog`。A/B は `TAKO_1238_LEGACY=1`） | 済 |
 | `WorkerLaunch` の MCP 注入 | 配線が無い | #986 |
 | `agent_install::AgentKind` の拡張 | Claude 1 値 | #989 |
 | モデル一覧の取得手段（`agent_models::catalog_argv`） | 系統ごとの `match`。**能力マトリクスには「ピッカーが使えるか」だけ**が載る（claude = 基準系 = 全 Supported の不変条件があるため、取得手段の差はマトリクスの 1 マスでは表せない） | #1002（済） |

@@ -349,17 +349,9 @@ pub fn is_valid_thread_id(id: &str) -> bool {
 /// 行は `n<パス>` の形。`thread-writer-locks/<id>.lock` だけを見る
 /// （`.coordination.lock` のような id でないものは弾く）
 pub fn thread_id_from_lsof(out: &str) -> Option<String> {
-    for line in out.lines() {
-        let path = line.strip_prefix('n').unwrap_or(line);
-        let Some(rest) = path.split("thread-writer-locks/").nth(1) else {
-            continue;
-        };
-        let id = rest.strip_suffix(".lock").unwrap_or(rest);
-        if is_valid_thread_id(id) && id.contains('-') {
-            return Some(id.to_string());
-        }
-    }
-    None
+    // 読み取りの実装は `agent_resume`（agy の presence ロックと共有。#1238）。
+    // 置き場の marker だけが系統で違う
+    crate::agent_resume::lock_id_from_lsof(out, "thread-writer-locks/")
 }
 
 /// 生きている codex プロセスが握るロックから thread_id を得る。

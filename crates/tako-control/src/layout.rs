@@ -211,6 +211,12 @@ pub struct PaneLayout {
     /// 消えていた場合だけ `claude --resume` へ渡す。旧ファイルは None で後方互換
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_session_id: Option<String>,
+    /// claude 以外（codex / agy）で実行中だった会話への参照（#1238）。
+    /// `claude_session_id` と対称で、tmux セッションごと消えたときに
+    /// `codex resume <id>` / `agy --conversation <id>` を投入するために使う。
+    /// **旧ファイルには無いので serde default で後方互換**（移行 Step は不要）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_resume: Option<AgentResumeLayout>,
     /// ペインログ（Issue #112 B）が取り込み済みの履歴行数。tako 停止中に tmux 側へ
     /// 積もった出力を再起動後の差分として取り込むための基準値。旧ファイル後方互換
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -241,6 +247,19 @@ fn is_false(v: &bool) -> bool {
     !*v
 }
 
+/// claude 以外のエージェントの会話への参照（#1238）。
+///
+/// `id` が `None` = **その系統が動いていたことは分かるが会話 ID を採れていない**
+/// （agy は最初のターンまで会話が生まれない / Windows には `lsof` が無い）。
+/// これを保存しておくと、復元の内訳ログが `ID なし` と `resume 非対応` を言い分けられる
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentResumeLayout {
+    /// 系統名（`tako_core::agent_support::Agent::as_str` と同一表記）
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
 /// プレビューペインの保存内容（復元時はファイルを開き直す。PTY は起動しない）
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PreviewLayout {
@@ -255,6 +274,8 @@ pub struct PaneMeta {
     pub session: Option<String>,
     pub cwd: Option<String>,
     pub claude_session_id: Option<String>,
+    /// claude 以外のエージェントの会話参照（#1238）
+    pub agent_resume: Option<AgentResumeLayout>,
     /// ペインログの取り込み済み履歴行数（Issue #112 B）
     pub logged_history: Option<u64>,
     pub preview: Option<PreviewLayout>,
@@ -270,6 +291,8 @@ pub struct RestoredPane {
     pub cwd: Option<String>,
     /// tmux セッション消失時に復旧する Claude Code の session ID
     pub claude_session_id: Option<String>,
+    /// 同上（codex / agy。#1238）
+    pub agent_resume: Option<AgentResumeLayout>,
     /// ペインログの取り込み済み履歴行数（Issue #112 B。再起動後の差分取り込み基準）
     pub logged_history: Option<u64>,
     /// Some ならプレビューペインとして復元する（spawn しない）
@@ -330,6 +353,7 @@ pub fn capture(
                     origin: origin_str(pane.origin()).to_string(),
                     cwd: m.cwd,
                     claude_session_id: m.claude_session_id,
+                    agent_resume: m.agent_resume,
                     logged_history: m.logged_history,
                     preview: m.preview,
                     webview: m.webview,
@@ -380,6 +404,7 @@ fn capture_node(node: &PaneNode, meta: &dyn Fn(PaneId) -> PaneMeta) -> NodeLayou
                 origin: origin_str(pane.origin()).to_string(),
                 cwd: m.cwd,
                 claude_session_id: m.claude_session_id,
+                agent_resume: m.agent_resume,
                 logged_history: m.logged_history,
                 preview: m.preview,
                 webview: m.webview,
@@ -519,6 +544,7 @@ pub fn restore(file: &LayoutFile) -> Result<(Workspace, Vec<RestoredPane>), Layo
             session: p.session.clone(),
             cwd: p.cwd.clone(),
             claude_session_id: p.claude_session_id.clone(),
+            agent_resume: p.agent_resume.clone(),
             logged_history: p.logged_history,
             preview: p.preview.clone(),
             webview: p.webview.clone(),
@@ -579,6 +605,7 @@ fn restore_node(
                 session: p.session.clone(),
                 cwd: p.cwd.clone(),
                 claude_session_id: p.claude_session_id.clone(),
+                agent_resume: p.agent_resume.clone(),
                 logged_history: p.logged_history,
                 preview: p.preview.clone(),
                 webview: p.webview.clone(),
@@ -1010,6 +1037,7 @@ mod tests {
                 session: Some(format!("tako-s{}", pane.as_u64())),
                 cwd: Some("/tmp".into()),
                 claude_session_id: Some(format!("claude-session-{}", pane.as_u64())),
+                agent_resume: None,
                 logged_history: None,
                 preview: Some(PreviewLayout {
                     path: format!("/tmp/p{}.md", pane.as_u64()),
@@ -1291,6 +1319,7 @@ mod tests {
                 origin: "user".into(),
                 cwd: None,
                 claude_session_id: None,
+                agent_resume: None,
                 logged_history: None,
                 preview: None,
                 webview: None,
@@ -1350,6 +1379,7 @@ mod tests {
             origin: "user".into(),
             cwd: None,
             claude_session_id: None,
+            agent_resume: None,
             logged_history: None,
             preview: None,
             webview: None,
@@ -1442,6 +1472,7 @@ mod tests {
                 origin: "user".into(),
                 cwd: None,
                 claude_session_id: None,
+                agent_resume: None,
                 logged_history: None,
                 preview: session.is_none().then(|| PreviewLayout {
                     path: format!("/tmp/p{id}.pdf"),
@@ -1540,6 +1571,7 @@ mod tests {
             origin: "user".into(),
             cwd: None,
             claude_session_id: None,
+            agent_resume: None,
             logged_history: None,
             preview: None,
             webview: None,
