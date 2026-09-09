@@ -25,6 +25,7 @@ const CATEGORIES = [
   ['ターミナルの基本', [
     'tako_split_pane', 'tako_close_pane', 'tako_focus_pane', 'tako_resize_pane',
     'tako_equalize_layout', 'tako_move_pane_to_tab', 'tako_scroll_pane',
+    'tako_scrollback',
     'tako_send_input', 'tako_read_pane', 'tako_list_panes', 'tako_set_title',
     'tako_create_tab', 'tako_select_tab', 'tako_rename_tab', 'tako_reorder_tab',
     'tako_collapse_tab', 'tako_pin_tab_title', 'tako_confirm_close',

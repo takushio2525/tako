@@ -16,9 +16,9 @@ tako platform --status pending      # まだ使えないものだけ
 
 | 状態 | 件数 | 意味 |
 | --- | --- | --- |
-| 対応 | 116 / 146（79%） | macOS と同じように使えます |
+| 対応 | 116 / 147（79%） | macOS と同じように使えます |
 | 一部対応 | 14 | 使えますが機能が落ちます。落ち方は各表の「差分」列 |
-| 未実測 | 1 | 実装はあり macOS と同じ経路を通るが、Windows 実機でまだ動かしていないもの |
+| 未実測 | 2 | 実装はあり macOS と同じ経路を通るが、Windows 実機でまだ動かしていないもの |
 | 未対応 | 13 | Windows 側の実装が無い、または動かないことが分かっているもの |
 | 対象外 | 2 | Windows にその概念が無い、または OS が同等機能を標準で持つ |
 
@@ -42,7 +42,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 
 ## ターミナルの基本
 
-対応 30・一部対応 1・対象外 1
+対応 30・一部対応 1・未対応 / 未実測 1・対象外 1
 
 | 機能 | 状態 | 差分 | 根拠 |
 | --- | --- | --- | --- |
@@ -53,6 +53,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 | `tako_equalize_layout` | 対応 | — | 実機セルフテスト: 項目 23（tako equalize） |
 | `tako_move_pane_to_tab` | 対応 | — | 実機セルフテスト: 項目 26 / 68c（tako tab move-pane・target + direction） |
 | `tako_scroll_pane` | 対応 | — | 実機セルフテスト: 項目 43 / 44 / 44b（ホイールの出し分け・tako scroll・ピクセル単位スクロール） |
+| `tako_scrollback` | 未対応 / 未実測 | 実装はプラットフォーム共通で macOS と同じ経路を通るが、Windows 実機での実測がまだ無い（動く見込み。失敗したらまずここを疑う） | 未実測 |
 | `tako_send_input` | 対応 | — | 実機セルフテスト: 項目 19（tako send）。非 ASCII は #907 で器の注入口へ迂回済み |
 | `tako_read_pane` | 対応 | — | 実機セルフテスト: 項目 20 / 33（tako read・MCP tako_read_pane） |
 | `tako_list_panes` | 対応 | — | 実機セルフテスト: 項目 17 / 33（tako list・MCP tako_list_panes） |
