@@ -346,6 +346,14 @@ pub fn detect_install_method_full() -> InstallMethod {
     if fast != InstallMethod::Zip {
         return fast;
     }
+    // **テストプロセスからは外部コマンドを起こさない**（#1253。#944 の
+    // `claude agents --json` と同型）。ここは `brew --version` / `brew list --cask` を
+    // 起こすので、`cargo test` がユーザーの `~/Library/Caches/Homebrew` を
+    // 書き換えていた（実測: 空の HOME で回すと 698 ファイル出来る）。
+    // 判定材料はファイルパスだけの高速パスに落とす = Zip
+    if tako_core::paths::is_test_process() && !tako_core::paths::issue944_legacy() {
+        return InstallMethod::Zip;
+    }
     // Zip 判定だが、実は broken-brew かもしれない — brew の台帳を確認
     if applications_tako_app_exists() && is_brew_available() && !is_brew_cask_registered() {
         return InstallMethod::BrokenBrew;
@@ -1306,6 +1314,107 @@ mod tests {
             assert!(result.is_err());
             assert!(result.unwrap_err().contains("修復は不要"));
         }
+    }
+
+    // --- #1253: テストプロセスから brew を起こさない ---
+
+    /// 子を名指しするときの目印（無ければ子の本体は走らない）
+    const BREW_PROBE_ENV: &str = "TAKO_1253_BREW_PROBE";
+
+    /// 子のテスト名（`--exact` で名指しするので、改名したらここも直す）
+    const BREW_PROBE_CHILD: &str = "update_checker::tests::子プロセス_配布系統を判別する";
+
+    /// 親から起こされたときだけ配布系統の判別を通す（本番なら brew を起こす経路）
+    #[test]
+    fn 子プロセス_配布系統を判別する() {
+        if std::env::var_os(BREW_PROBE_ENV).is_none() {
+            return;
+        }
+        let _ = detect_install_method_full();
+    }
+
+    /// **テストプロセスが `brew` を起こさない**ことを実測する（#1253）。
+    ///
+    /// 起きているかどうかは PATH の先頭へ置いた**偽 brew**が目印ファイルを
+    /// 作るかで見る。`~/Library/Caches/Homebrew` の増減で見ると、キャッシュが
+    /// 温まっている間は起きても増えない（実測で 1 度そう誤った）
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn テストプロセスはbrewを起こさない() {
+        let dir = std::env::temp_dir().join(format!(
+            "tako-1253-brew-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れる");
+        let marker = dir.join("called");
+        let fake = dir.join("brew");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 1\n", marker.display()),
+        )
+        .expect("偽 brew を書ける");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+                .expect("偽 brew に実行権を付けられる");
+        }
+
+        let run = |legacy: bool| -> (bool, String) {
+            let _ = std::fs::remove_file(&marker);
+            let exe = std::env::current_exe().expect("テストバイナリのパス");
+            let path = format!(
+                "{}:{}",
+                dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.args(["--exact", BREW_PROBE_CHILD, "--test-threads=1"])
+                .env(BREW_PROBE_ENV, "1")
+                .env("PATH", path);
+            if legacy {
+                cmd.env("TAKO_944_LEGACY", "1");
+            } else {
+                cmd.env_remove("TAKO_944_LEGACY");
+            }
+            let out = cmd.output().expect("子テストプロセスを起こせる");
+            let mut log = String::from_utf8_lossy(&out.stdout).to_string();
+            log.push_str(&String::from_utf8_lossy(&out.stderr));
+            assert!(
+                log.contains("1 passed"),
+                "子テストが実行されていない\n{log}"
+            );
+            (
+                marker.is_file(),
+                std::fs::read_to_string(&marker).unwrap_or_default(),
+            )
+        };
+
+        let (called, calls) = run(false);
+        assert!(
+            !called,
+            "テストプロセスが brew を起こした（#1253）: {calls}"
+        );
+
+        // A/B: 門番を切る（`TAKO_944_LEGACY=1`）と同じ子が brew を起こす。
+        // **`/Applications/tako.app` が無い機械では経路自体に入らない**ので、
+        // 検出力の実証はそのときだけ黙って落とす（測れていないことを明示する）
+        if applications_tako_app_exists() {
+            let (called, calls) = run(true);
+            assert!(
+                called,
+                "旧挙動でも brew が起きない（検査に検出力が無い）: {calls}"
+            );
+        } else {
+            eprintln!(
+                "skip(A/B のみ): /Applications/tako.app が無い機械では \
+                 detect_install_method_full が brew の経路へ入らない"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- #416: parse_releases / gh トークン / キャッシュ ---
