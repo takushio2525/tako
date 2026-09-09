@@ -60,6 +60,7 @@ const C = {
  */
 const SECTIONS = [
   [/^getting-started(\/|$)|^releases$|^windows-support$/, 'はじめに'],
+  [/^agents(\/|$)|^agent-support$/, 'エージェント CLI'],
   [/^features\/(orchestration|orchestrator|mcp-server)$/, 'AI と使う'],
   [/^features\//, '機能紹介'],
   [/^guides\//, '使い方ガイド'],

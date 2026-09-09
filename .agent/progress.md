@@ -19,16 +19,6 @@
 
 ---
 
-## 2026-09-09（#1203: UI の macOS キー表記を正本経由にし、Windows で実際のキーを出すようにした）
-- 6 か所（タブバー `⌘K` / git コミット欄 / プレビュー保存 / 確認ダイアログ / 設定 / `ui-mode` の next_step）と走査で見つかった同型 4 件を `tako_core::platform::keys` と `keybindings::shortcut_hint_for(action, platform)` へ。macOS の文言は 1 文字も不変
-- **バインド表に無い「修飾 + クリック / Enter」は Windows で案内ごと落とす**（Win キーは押せない = #763）。`key_bindings()` の `cfg` をやめ `bindings_for(platform)` にしたので macOS の CI から Windows 側を検証できる
-- 番犬 2 本立て（ソース走査 `ui_key_notation.rs` の規則 A / B + 組み上がった文言の Windows 検査）。A/B 5 アームが確定 FAILED
-
-## 2026-09-09（#1204: マトリクスの tako_welcome / tako_ui_mode の過小申告を実挙動へ直した）
-- `WIN_WELCOME_INJECTION` / `WIN_STARTER_INJECTION`（#899 修正前の宣言）を削除し、両方の Windows を `Supported` + `Evidence::Measured`（2026-09-09 の実機でボタンから setup / master が実際に走った）へ
-- 番犬 `ボタン投入を根拠にした宣言が実装と一致する` が宣言と裏づけ（PowerShell 方言で POSIX クォートに囲まれない = #899 の本体）を縛る
-- 実出力 `tako platform --platform windows` = 両方 `supported` / Known limitations から消えた / docs 再生成。A/B は Degraded へ戻すとテストと docs `--check` の両方が FAILED
-
 ## 2026-09-09（#1076: 再起動後の claude resume が「起動途中の未検出」で自壊していたのを直した）
 - 真因は 2 つ: ①`claude agents --json` のスキャン結果でマップを丸ごと置き換え（+ 子プロセス不在で全消し）ていたので、**再起動直後の数秒**で `layout.json` の `claude_session_id` を全部捨てていた（実測: 復元直後 6 件 → 6 秒後 0 件）②復元だけが独自の最小形 `claude --resume <id>` を組んでいて役割 env / `--model` / `--effort` が落ちていた
 - 保持規則を `tako_core::claude_resume::ResumeIds`（**確認してから外す**）へ、判断とコマンドを `tako_control::sessions::restore_plan`（`resume_command` と共有）へ集約。`persist.log` に「復元の内訳」（役割つき / 役割なし / 新規シェルの理由 3 分類）を 1 行追加
@@ -73,6 +63,16 @@
 - 番号なし経路の「兄弟 3 行以上」を、**兄弟 2 行のときだけ「並びの直後に確定キーの案内があるか」**で補強（`dialog::confirm_hint_below`）。codex の入力待ち画面（入力行 + 直下のステータス行）は案内が無いので従来どおり非検知
 - 隔離 GUI 実測（Windows 実機 + macOS）: 下見が `kind=trust` / 2 件 / `highlighted=0`、`--choice trust` が `Down`→ラベル一致検証→`Enter` で `resolved=true`。相手側 TUI も受領を表示
 - A/B `TAKO_1223_LEGACY=1` は両 OS で Issue と同じ「選択肢ダイアログが見つからない」を再現。案内の根拠を外す注入で新旧 2 テストが FAILED。全 3785 件緑
+
+## 2026-09-09（#1022: #571 e2e が本番の事前信頼エントリを残さないようにした）
+- `E2e571Guard::drop` で `remove_e2e_trust_entry(&dir/work)` を呼ぶ形へ（#612 / #577 と同じ後始末）。この e2e は worker を既定 config dir で走らせるので隔離では倒せない
+- 番犬 `e2e_trust_cleanup_watchdog`（`impl Drop for E2e…Guard` を走査して後始末の欠落を名指し）。`#[ignore]` の本体は CI で走らないのでここだけが再発を止める
+- A/B: 後始末を外すと `crates/tako-control/src/dispatch.rs: E2e571Guard` を名指しで FAILED
+
+## 2026-09-09（#992: agent 別のセットアップガイドと縮退の明記を docs へ入れた）
+- 系統別ガイド 5 ページ（`docs/.../agents/` = 選び方 / claude / codex / agy / ローカル LLM）を新設し、サイドバーに「エージェント CLI」群を追加。#357 の agy 利用制限の調査結果と、getting-started の `settings.json` ドリフト（正は `~/.claude.json` / `.mcp.json`）もここで回収
+- `gen-agent-support-docs.mjs` に**系統ごとの縮退ダイジェスト**（理由でまとめた degraded / pending / unsupported）を足して `agent-support.md` を再生成。生成物なので手書きと違ってずれない
+- OG が #982 以降落ちていた（`agent-support` が `SECTIONS` 未分類で `npm run og` が例外で止まる）ので分類を足して再生成。24 → 30 枚
 
 ## 2026-09-09（#1034: 送達後に実行を断られた worker を完了と誤読しないようにした）
 - `execution_refused`（`WorkerErrorKind` / `AgentCliProblem` の新分類・`recommended_action = retry_spawn`）を追加。**#983 のゲートは緩めず**、別ゲート「一次シグナルで作業を 1 歩も観測していない」で分類する（画面推定の busy は TUI の起動描画を拾うので使えない）
