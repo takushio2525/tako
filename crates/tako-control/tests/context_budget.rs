@@ -266,3 +266,50 @@ fn 規約文が予算表とずれたら落ちる() {
         "ずれた規約文を一致とみなしてはいけない"
     );
 }
+
+/// 番犬: **毎ターン読まれるファイルにマージの残骸を混ぜない**。
+///
+/// #1241 の merge commit が `.agent/progress.md` へコンフリクトマーカーを 2 箇所
+/// 持ち込み、**AI の起動時ロードにそのまま載った**（`@import` されるファイルなので
+/// 全ターンに効く）。人が読めば一目だが、マージの解消は機械的に繰り返すので
+/// 目視は当てにならない。
+///
+/// 検査対象は「予算表が `@import` されると宣言しているファイル」に限る
+/// （リポジトリ全体を走査すると、コンフリクトの実例を載せた docs に当たる）。
+#[test]
+fn 毎ターン読まれるファイルにマージの残骸が無い() {
+    // 3 文字までにしてこのファイル自身の説明文に当たらないようにする
+    let markers = ["<<<<<<<", "=======", ">>>>>>>", "|||||||"];
+    let mut bad: Vec<String> = Vec::new();
+    // `progress-archive.md` は `@import` されないが**同じ移送とマージの経路で壊れる**
+    // （実際に #1241 の merge で progress.md と一緒に残骸が入った）ので併せて見る
+    for rel in [
+        ".agent/progress.md",
+        ".agent/progress-archive.md",
+        ".agent/activeContext.md",
+        "AGENTS.md",
+    ] {
+        let path = repo_root().join(rel);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for (i, line) in text.lines().enumerate() {
+            // **行頭にある**ものだけを見る（本文中の `=======` 区切りや
+            // コードブロックの引用に当たらない）。`=======` は Markdown の
+            // 見出し下線でもありうるので、他のマーカーと同居する行だけ数える
+            if markers[..3].iter().any(|m| line.starts_with(m)) && line.starts_with("<<<<<<<")
+                || line.starts_with(">>>>>>>")
+                || line.starts_with("|||||||")
+            {
+                bad.push(format!("  {rel}:{}: {line}", i + 1));
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "毎ターン @import されるファイルにマージのコンフリクトマーカーが残っている\
+         （{} 行）。AI の起動時ロードにそのまま載るので、解消してからコミットする:\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
+}
