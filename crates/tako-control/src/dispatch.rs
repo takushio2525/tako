@@ -17840,6 +17840,34 @@ mod tests {
         assert!(err.contains("一致する選択肢が無い"), "{err}");
     }
 
+    /// claude 2.x の信頼ダイアログ（**番号なし・選択肢 2 つ**の実採取。#1223）
+    const TRUST_NO_NUMBER_1223: &str = r#" Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source
+ project, or work from your team). If not, take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ > No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel"#;
+
+    #[test]
+    fn issue1223_番号なし二択の信頼ダイアログをラベルで解決する() {
+        let dialog = dialog_of(TRUST_NO_NUMBER_1223);
+        assert!(!dialog.numbered, "矢印移動 + ラベル検証の経路");
+        // ラベルの部分一致（master が使う形）
+        assert_eq!(resolve_choice_index(&dialog, "trust").unwrap(), 1);
+        // 番号なしでも表示順の 1-origin で指定できる
+        assert_eq!(resolve_choice_index(&dialog, "1").unwrap(), 0);
+        assert_eq!(resolve_choice_index(&dialog, "2").unwrap(), 1);
+        // エイリアス（`no` は `No,` 始まりに当たる = 既定の `No, exit`）
+        assert_eq!(resolve_choice_index(&dialog, "no").unwrap(), 0);
+        let err = resolve_choice_index(&dialog, "3").unwrap_err().to_string();
+        assert!(err.contains("範囲外"), "{err}");
+    }
+
     #[test]
     fn issue748_曖昧なラベルは確定させずエラーにする() {
         // モデル選択の「opus」は 2 つの選択肢に一致する（Default … Opus 5 /
