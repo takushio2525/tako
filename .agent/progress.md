@@ -19,16 +19,6 @@
 
 ---
 
-## 2026-09-09（#1137: 多重化が無いプラットフォームで無言の SSH 成功が畳まれないのを直した）
-- `pane` 経路 + 多重化なし（Windows）は `master_socket` が常に false で成功の出口が 1 つも無かった。規則 ⑥「**打った行を除いて**中身が出たら畳む」を追加（ゲートは `ConnectInputs::multiplexing` の値 = **macOS は 1 ビットも不変**）
-- 併発の穴（起点の陳腐化）も `ssh_progress::effective_from` で修正。`connecting` は rebase しないので相手が画面を消すと `new_lines` が全部空になっていた
-- A/B: 規則 ⑥ 無効化の注入で `無言の接続成功でも畳む` が FAILED / 打った行の除外を外すと `打った行だけでは畳まない` が FAILED。Windows 実機で単体 32 件緑・macOS 実 pane 経路は従来どおり `connecting`→`connected`
-
-## 2026-09-09（#1238: 再起動後の復元で codex / agy も会話ごと戻るようにした）
-- 会話 ID は**生きたプロセスが開いているもの**から採れる（実測: codex 0.153.0 = `thread-writer-locks/<id>.lock`・起動直後から / agy 1.1.27 = `brain/<id>`・最初のターンの後）。`layout.json` へ `agent_resume`（系統 + ID）を `claude_session_id` と対称に保存し、`restore_plan` の分岐で `codex resume <id>` / `agy --conversation <id>` を投入する
-- 規則は `tako_core::agent_resume` へ 1 本化（保持 = #1076 の「確認してから外す」を一般化 / 書式 = `resume_spec` / 可否 = `restore_support`）。ID を引く実装は系統ごとのモジュール（#984 / #1033）へ委譲。**Windows は lsof が無く ID を採れない**ので、内訳の理由を `ID なし` と分けて `resume 非対応` に
-- 隔離 GUI 実測: tmux サーバー kill → 起動で `Claude resume 1 / agy resume 1 / codex resume 1 / 新規シェル 0` と 3 系統の会話が画面に復帰。A/B `TAKO_1238_LEGACY=1` は同じ layout で `新規シェル 3（ID なし 3）`。番犬 7 本 + 単体
-
 ## 2026-09-09（#1246: .agent の md のコンフリクトマーカーを CI で落とす番犬）
 - 走査を `.agent/` 配下の md 全部 + 規約 2 本（4 → 38 ファイル）へ広げ、#1241 / #1247 の狭い版を置換。旧版は `&&` が `||` より強く判定の前半が死んでいて `=======` を一度も拾えず、8 文字以上の罫線を誤検知していた
 - `=======` は `<<<<<<<` が開いた領域の中だけで見て setext 見出しと弁別（git は必ずこの順で書くので検出力は落ちない）。実物へ 3 行挿入 → 行番号つきで名指し FAILED → 復元で緑
@@ -73,3 +63,8 @@
 - 先にフェーズ別の余裕を実測: プロンプト待ちの固定 6 秒だけが**スイート並列（18 本）だけで既に超過**（6.1〜7.1s・`rounds=2` が 10/10）。4 多重 + 負荷 12 で 20〜34s になり 6 周を使い切って **9/16 FAILED**（全件 phase 1・画面は `PS …> Write-O` = 打鍵は届いていた）
 - 固定窓を全廃して**期限 + `wait_budget::state_wait_budget`** へ。`machine_busy()` を Windows でも読めるようにし（`GetSystemTimes`）、`sleep(800ms)`→`exists` は「接続クライアントが 1 でなくなった」状態待ちへ。番犬 `psmux_e2e_wait_watchdog` が修正前の 9 か所を名指しで落とす
 - A/B（修正前後の 2 バイナリを同一ラウンドで交互）: before **6/24** → after **0/24**。追加で after 0/100。副産物で **#1264**（main の Windows `cargo test --workspace` がコンパイル不能）を起票
+
+## 2026-09-09（#1259: send_input が queued:true を返して無音で届かない問題を直した）
+- 真因は**顛末の記録が後続 send では全経路空振り**すること。`record_prompt_delivery_at` は先頭で `if flow != SpawnPrompt { return }`（spawn 専用）・保留と打ち切りは `eprintln!`（GUI の stderr は誰も読めない）・`persist.log` へ書くのは貼り付け段へ到達した後の `try_peer` / `log_fallback` だけ。本番の pane 1627 は `送達:` 行が 1 本も無く（同時刻の他ペインは記録あり）、`WaitPromptReady` で `input_line` が唯一の入口という穴と、peer の背景試行・起動コマンド待ちの**上限なしの待ち**が重なっていた（Issue の見立て「busy だと送らない」は否定 = 送達フローは `has_running_children` を参照しない）
+- 語彙と方針を `tako_core::prompt_delivery` の 1 本へ（`Stall` 11 種 + `Journal` の心拍 15 秒 + `peer_wait` の段階判定）。応答は `tako_send_input` / `tako_read_pane` の `delivery`、CLI は `[delivery]` 行、`persist.log` は `送達フロー: pane=… 理由=…`。peer は 25 秒で諦めるが**送る前の段階だけ**キー経路へ落ちる（判定は `PeerAttemptState` の CAS。段階を読むだけでは読んだ直後に背景スレッドが書き始めて二重投函になる = #790 の不変条件）
+- A/B `TAKO_1259_LEGACY=1` で無音と無限待ちを再現（実ファイル検証）。番犬 6 本のうち 5 本が修正前 `main.rs` を行番号で名指し（6440 / 6445 / 6457 / 6472 / 6738 / 6797）。模擬 TUI e2e（`sleep 3600` の子を抱えた idle ペイン）で送達成立を実測

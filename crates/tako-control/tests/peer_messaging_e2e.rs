@@ -249,6 +249,7 @@ fn peer_送達が_idle_の_worker_へ届く() {
         &guard.session,
         &format!("What is 40 + 2? {SPELL_SUFFIX}"),
         true,
+        Default::default(),
     );
     let outcome = match attempt {
         delivery::PeerAttempt::Sent(outcome) => outcome,
@@ -302,6 +303,7 @@ fn peer_送達が_busy_の_worker_へ届く() {
         &guard.session,
         "Count from 1 to 120, one number per line, with its English word. Do not use tools.",
         true,
+        Default::default(),
     ) {
         delivery::PeerAttempt::Sent(_) => {}
         other => panic!("1 通目が peer で送れるはず: {}", attempt_label(&other)),
@@ -331,6 +333,7 @@ fn peer_送達が_busy_の_worker_へ届く() {
         &guard.session,
         &format!("Ignore the counting task. What is 900 + 5? {SPELL_SUFFIX}"),
         true,
+        Default::default(),
     ) {
         delivery::PeerAttempt::Sent(outcome) => outcome,
         other => panic!("生成中でも peer で送れるはず: {}", attempt_label(&other)),
@@ -370,7 +373,7 @@ fn peer_が使えないときはキー経路で届く() {
     wait_for_input_line(&guard.session);
 
     // ① 経路選択が従来経路を選ぶ
-    match delivery::try_peer(&guard.session, "dummy", true) {
+    match delivery::try_peer(&guard.session, "dummy", true, Default::default()) {
         delivery::PeerAttempt::Fallback { reason, .. } => assert_eq!(reason, "disabled"),
         other => panic!("従来経路へ落ちるはず: {}", attempt_label(&other)),
     }

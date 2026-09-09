@@ -86,6 +86,10 @@ pub fn tools() -> Vec<Value> {
                 信頼ダイアログの自動承諾 → bracketed paste 貼り付け → 分離 Enter → \
                 入力欄が空になったことの検証 + Enter 単独再送（マルチラインもそのまま送れる。\
                 応答は queued: true が即座に返り、実際の送達確認はバックグラウンドで行われる）。\
+                #1259: 応答の delivery が**その後を追う口**になる（state = queued / waiting / \
+                delivered / gave_up、reason = 止まっている理由コード、note = 次の一手）。\
+                積む前に未決着のフローがあればその状態が出る = この送達はその後ろに並ぶ。\
+                続きは tako_read_pane の delivery で読み、persist.log にも同じ理由が 1 行残る。\
                 text を空にして newline: true にすると Enter 単独送信になる: 入力欄に残った\
                 テキストの送信代行に使え、入力欄が空へ戻るまで Enter を自動再送する。\
                 #748: **選択肢ダイアログ表示中は送信を拒否してエラーを返す**（入力欄が奪われており、\
@@ -108,7 +112,8 @@ pub fn tools() -> Vec<Value> {
                         "type": "boolean",
                         "description": "true にすると claude TUI の ❯ プロンプト表示を待ってから送信する（省略時 false）。\
                             子の Claude Code にメッセージを送るときに使う。送信はバックグラウンドで行われ、\
-                            応答は即座に返る（queued: true）",
+                            応答は即座に返る（queued: true。顛末は応答の delivery と \
+                            tako_read_pane の delivery で追う）",
                     },
                 },
                 "required": ["pane", "text"],
@@ -131,7 +136,13 @@ pub fn tools() -> Vec<Value> {
                 choice_dialog が非 null なら**選択肢ダイアログが表示中**で入力欄は存在しない（#748）。\
                 このとき input_status は null になる（ダイアログの選択カーソルは入力欄と同じ字面なので、\
                 かつては選択肢テキストが style=user の残留入力として報告されていた）。\
-                応答は tako_send_input ではなく tako_orchestrator_respond を使う。",
+                応答は tako_send_input ではなく tako_orchestrator_respond を使う。\
+                delivery が非 null なら**このペインへの送達フローの顛末**（#1259）: \
+                state = queued / waiting / delivered / gave_up、reason = 止まっている理由コード\
+                （peer_pending / no_input_box / choice_dialog / hold_for_command_flow 等）、\
+                transient = 待てば解ける見込みか、note = 人が読む説明、elapsed_secs = 経過。\
+                tako_send_input が queued: true を返したのに画面が動かないときは**ここを見る**\
+                （同じ理由が persist.log の「送達フロー:」行にも残る）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {

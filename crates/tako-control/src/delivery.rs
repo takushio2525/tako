@@ -60,12 +60,53 @@ pub fn plan(mode: Mode, agent_managed: bool) -> Result<(), Unavailable> {
     Ok(())
 }
 
+/// peer 送達 1 回の観測口（Issue #1259）。
+///
+/// **`pane`**: ログの突き合わせ用。旧実装のログはバックエンドセッション名しか
+/// 持たなかったので、`tako_send_input` が返した `queued: true` とログの行を
+/// ペイン番号で結べなかった（#1259 の調査でここが効いた）。
+/// tmux セッション経路（ペインが解決できない送達）は None。
+///
+/// **`progress`**: どこまで進んだかを呼び出し側へ知らせ、**進んでよいかを訊く**。
+/// 呼び出し側は待ちに上限をつけるが、
+/// [`tako_core::prompt_delivery::PeerPhase::Sending`] 以降で落ちると同じ指示が
+/// 2 回届く（#790 の不変条件）。だから「1 バイト目を書く」直前に false が返ったら
+/// **書かずに諦める**（呼び出し側が既にキー操作経路へ落ちた印。判定は
+/// [`tako_core::prompt_delivery::PeerAttemptState`] の CAS なので、
+/// どちらか一方だけが勝つ）
+#[derive(Default)]
+pub struct PeerObserver<'a> {
+    pub pane: Option<u64>,
+    pub progress: Option<&'a dyn Fn(tako_core::prompt_delivery::PeerPhase) -> bool>,
+}
+
+impl PeerObserver<'_> {
+    /// 段階を知らせ、続けてよいかを返す（観測口が無ければ常に続ける）
+    fn mark(&self, phase: tako_core::prompt_delivery::PeerPhase) -> bool {
+        self.progress.is_none_or(|f| f(phase))
+    }
+
+    /// ログ用のペイン表記（持たない経路は `-`）
+    fn pane_label(&self) -> String {
+        self.pane.map_or_else(|| "-".to_string(), |p| p.to_string())
+    }
+}
+
 /// バックエンド tmux セッションへ peer 送達を試みる
-pub fn try_peer(backend_session: &str, text: &str, agent_managed: bool) -> PeerAttempt {
+pub fn try_peer(
+    backend_session: &str,
+    text: &str,
+    agent_managed: bool,
+    observer: PeerObserver<'_>,
+) -> PeerAttempt {
+    use tako_core::prompt_delivery::PeerPhase;
     let mode = peer_messaging::mode();
     if let Err(reason) = plan(mode, agent_managed) {
         return fallback(backend_session, reason, mode);
     }
+    // 宛先の解決は `ps` / `tmux list-panes -a` を上限なしで叩く。まだ 1 バイトも
+    // 送っていない段階なので、呼び出し側はここで諦めて従来経路へ落ちてよい
+    let _ = observer.mark(PeerPhase::Resolving);
     let target = match peer_messaging::resolve_for_backend(backend_session) {
         Ok(t) => t,
         Err(reason) => return fallback(backend_session, reason, mode),
@@ -74,10 +115,19 @@ pub fn try_peer(backend_session: &str, text: &str, agent_managed: bool) -> PeerA
     // 送信の直前に transcript の読み取り位置を控える
     // （追記分だけを今回の証拠にする。時刻文字列では同じ秒の痕跡を取りこぼす）
     let mut cursor = peer_messaging::TranscriptCursor::capture(&target.session.session_id);
+    // ここから先は落ちてはならない（書き切ったら受信側のキューに入る）。
+    // 呼び出し側が上限で先に諦めていたら **1 バイトも書かずに**引き返す（#1259）
+    if !observer.mark(PeerPhase::Sending) {
+        return PeerAttempt::Fallback {
+            reason: "peer_cancelled",
+            transient: false,
+        };
+    }
+    let pane = observer.pane_label();
     if let Err(e) = peer_messaging::send(&target, text) {
         // 接続・書き込みの失敗。受信側はまだ 1 行も読めていないので従来経路へ落ちてよい
         crate::diag::persist_log(&format!(
-            "送達: peer 送信に失敗し従来経路へ（session={backend_session} 理由={e}）"
+            "送達: peer 送信に失敗し従来経路へ（pane={pane} session={backend_session} 理由={e}）"
         ));
         if mode == Mode::Only {
             return PeerAttempt::Refused {
@@ -90,10 +140,11 @@ pub fn try_peer(backend_session: &str, text: &str, agent_managed: bool) -> PeerA
         };
     }
 
+    let _ = observer.mark(PeerPhase::Verifying);
     let verification =
         peer_messaging::verify_delivered(&mut cursor, std::time::Instant::now() + VERIFY_TIMEOUT);
     crate::diag::persist_log(&format!(
-        "送達: peer（session={backend_session} pid={} 状態={} 確認={}）",
+        "送達: peer（pane={pane} session={backend_session} pid={} 状態={} 確認={}）",
         target.session.pid,
         target.session.status.as_deref().unwrap_or("?"),
         verification.as_str()
@@ -103,6 +154,24 @@ pub fn try_peer(backend_session: &str, text: &str, agent_managed: bool) -> PeerA
         verification: Some(verification),
         fallback_reason: None,
     })
+}
+
+/// 送達フローの顛末を `persist.log` へ 1 行残す（Issue #1259）。**記録の 1 実装**。
+///
+/// 呼ぶのは送達フロー（tako-app の `drive_prompt_flows`）と tmux セッション経路
+/// （`dispatch::spawn_tmux_delivery`）の両方。旧実装はどちらも `eprintln!` だけで、
+/// GUI（.app）の stderr は誰も読めないので「送ったのに何も起きない」を後から追えなかった。
+///
+/// `TAKO_1259_LEGACY=1` では書かない = **修正前の無音**（同一バイナリの A/B 入口）
+pub fn log_status(
+    pane: Option<u64>,
+    session: Option<&str>,
+    status: &tako_core::prompt_delivery::Status,
+) {
+    if tako_core::prompt_delivery::legacy_silent() {
+        return;
+    }
+    crate::diag::persist_log(&status.log_line(pane, session));
 }
 
 /// `TAKO_PEER_MESSAGING=only` の説明（エラー文で使う）
@@ -140,12 +209,13 @@ pub fn keys_outcome(reason: &'static str) -> DeliveryOutcome {
 /// keys 経路に確定したことを診断ログへ 1 回だけ残す（#790 の可観測性要件）。
 /// 設計どおりそちらを通る 2 つ（off 指定 / 人間由来の送達）は書かない
 /// （常時発生するので persist.log が埋まる）
-pub fn log_fallback(backend_session: &str, reason: &str) {
+pub fn log_fallback(pane: Option<u64>, backend_session: &str, reason: &str) {
     if reason == "disabled" || reason == "not_agent_managed" {
         return;
     }
+    let pane = pane.map_or_else(|| "-".to_string(), |p| p.to_string());
     crate::diag::persist_log(&format!(
-        "送達: keys 経路（session={backend_session} peer 不成立={reason}）"
+        "送達: keys 経路（pane={pane} session={backend_session} peer 不成立={reason}）"
     ));
 }
 

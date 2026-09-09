@@ -838,13 +838,17 @@ fn dispatch_inner(
             if await_prompt {
                 return match resolve_pane(host.workspace(), pane) {
                     Ok((_, target)) => {
+                        // #1259: 既に未決着のフローがあるなら、この送達はその後ろに並ぶ。
+                        // 「いま何を待っているのか」を queued の応答からそのまま読めるように
+                        // 積む**前**の状態を採る（無ければ queued）
+                        let pending = host.prompt_delivery_state(target);
                         host.queue_prompt_flow(target, text.clone());
-                        Ok(json!({ "queued": true }))
+                        Ok(queued_json(Some(target), pending))
                     }
                     Err(e) => match tmux_session {
                         Some(ref ts) => {
                             spawn_tmux_delivery(ts.clone(), text.clone(), true);
-                            Ok(json!({ "queued": true }))
+                            Ok(queued_json(None, None))
                         }
                         None => Err(e),
                     },
@@ -874,14 +878,16 @@ fn dispatch_inner(
                         // （Issue #95: 素の CR 1 発は claude TUI に取りこぼされることがあり、
                         // LF は「改行挿入」と解釈され送信にならない）
                         if send_is_enter_only(&text, newline) {
+                            let pending = host.prompt_delivery_state(target);
                             host.queue_enter_flow(target);
-                            return Ok(json!({ "queued": true }));
+                            return Ok(queued_json(Some(target), pending));
                         }
                         // 全画面 TUI（claude 等）への改行つき送信は送達確認フローへ（Issue #32:
                         // 一括書き込みは改行が「送信」と解釈されず入力欄に残留する）
                         if newline {
+                            let pending = host.prompt_delivery_state(target);
                             host.queue_send_flow(target, text.clone());
-                            return Ok(json!({ "queued": true }));
+                            return Ok(queued_json(Some(target), pending));
                         }
                     }
                     // シェルへの送信は従来どおり即時書き込み（挙動・レイテンシ据え置き）。
@@ -927,7 +933,7 @@ fn dispatch_inner(
                                 ));
                             }
                             spawn_tmux_delivery(ts.clone(), text.clone(), false);
-                            Ok(json!({ "queued": true }))
+                            Ok(queued_json(None, None))
                         } else {
                             let (session, access) =
                                 crate::reach::detached_session(ts).ok_or_else(|| {
@@ -1041,6 +1047,9 @@ fn dispatch_inner(
                 // #1010: SSH の接続待ち / 失敗（null = どちらでもない）。
                 // 画面がまだ空でも「何を待っているか」が応答から分かる
                 "ssh_connect": host.ssh_connect_state(PaneId::from_raw(pane_id)),
+                // #1259: 送達フローの顛末（null = 未決着のフローが無い）。
+                // send_input が返した queued: true の**その後**をここで問う
+                "delivery": host.prompt_delivery_state(PaneId::from_raw(pane_id)),
             }))
         }
 
@@ -6407,13 +6416,32 @@ fn normalize_newlines_for_keys(text: &str) -> String {
 /// 送達手順（capture → 貼り付け → 分離 Enter → 空検証）そのものであり、
 /// 案 B-1（器だけの ConPTY セッションホスト）が入ったら同等の手順を
 /// その実装向けに用意して `DetachedAccess` 側へ載せる（設計 §5.1）
+/// `queued: true` の応答（Issue #1259）。
+///
+/// 旧実装は `{"queued": true}` だけを返していたので、**その後どうなったかを問う口が
+/// 無かった**（送達フローの保留・打ち切りは GUI の stderr へしか出ず、後続 send の
+/// 未達は worker レジストリからも弾かれる = `record_prompt_delivery_at` は spawn 専用）。
+/// `pane` と `delivery` を載せて `tako_read_pane` の `delivery` で追える形にする
+fn queued_json(pane: Option<PaneId>, pending: Option<Value>) -> Value {
+    json!({
+        "queued": true,
+        "pane": pane.map(|p| p.as_u64()),
+        // 積む前に未決着のフローがあればその状態（= この送達はその後ろに並ぶ）。
+        // 無ければ queued
+        "delivery": pending
+            .unwrap_or_else(|| tako_core::prompt_delivery::Status::queued().to_json()),
+    })
+}
+
 fn spawn_tmux_delivery(session: String, text: String, wait_ready: bool) {
     std::thread::spawn(move || {
+        // #1259: 顛末の行に載せる経過（`経過=0s` と書くと嘘になる）
+        let started = std::time::Instant::now();
         // Enter 単独送達（#95。入力欄に残留したテキストの送信代行）は
         // 「キーを送れ」という要求そのものなので peer 送達の対象外
         if !text.trim().is_empty() {
             let agent_managed = crate::peer_messaging::backend_is_registered_worker(&session);
-            match crate::delivery::try_peer(&session, &text, agent_managed) {
+            match crate::delivery::try_peer(&session, &text, agent_managed, Default::default()) {
                 crate::delivery::PeerAttempt::Sent(outcome) => {
                     if outcome.verification.is_some_and(|v| !v.is_received()) {
                         eprintln!("warning: peer 送達の受信を確認できない（session={session}）");
@@ -6422,24 +6450,47 @@ fn spawn_tmux_delivery(session: String, text: String, wait_ready: bool) {
                 }
                 crate::delivery::PeerAttempt::Refused { note } => {
                     eprintln!("warning: {note}（session={session}）");
+                    log_tmux_delivery(&session, "peer_refused", started);
                     return;
                 }
                 crate::delivery::PeerAttempt::Fallback { reason, .. } => {
-                    crate::delivery::log_fallback(&session, reason);
+                    crate::delivery::log_fallback(None, &session, reason);
                 }
             }
         }
         let socket = tako_core::tmux_backend::socket_name();
+        // #1259: 顛末は **persist.log** へ残す。GUI（.app）の stderr は誰も読めないので、
+        // eprintln だけだと「送ったのに何も起きない」を後から追えない
         match crate::claude_tui::deliver_via_tmux(Some(&socket), &session, &text, wait_ready) {
             Ok(report) if !report.verified => {
                 eprintln!("warning: tmux 経由のプロンプト送達を検証できない（session={session}）");
+                log_tmux_delivery(&session, "unverified", started);
             }
             Err(e) => {
                 eprintln!("warning: tmux 経由のプロンプト送達に失敗（session={session}）: {e}");
+                log_tmux_delivery(&session, "failed", started);
             }
-            Ok(_) => {}
+            Ok(_) => log_tmux_delivery(&session, "delivered", started),
         }
     });
+}
+
+/// tmux セッション経路（ペインが解決できない送達）の顛末を `persist.log` へ 1 行残す（#1259）。
+///
+/// ペイン番号を持たない経路なので `pane=-` と書き、代わりにセッション名で突き合わせる。
+/// 画面内容・送信テキストは出さない（絶対ルール）
+fn log_tmux_delivery(session: &str, outcome: &str, started: std::time::Instant) {
+    use tako_core::prompt_delivery::Status;
+    let elapsed = started.elapsed().as_secs() as u32;
+    let status = if outcome == "delivered" {
+        Status::delivered("keys", outcome, elapsed)
+    } else {
+        Status::gave_up(outcome, None, elapsed)
+    };
+    // 書式と legacy ゲート（`TAKO_1259_LEGACY=1` = eprintln だけの旧挙動）は
+    // `delivery::log_status` の 1 実装が持つ。ペイン番号が無い経路なので
+    // 突き合わせはセッション名で行う
+    crate::delivery::log_status(None, Some(session), &status);
 }
 
 /// 解決済みアカウント 1 件の JSON 表現（list / show / add で共通。#504 / #512）
@@ -12849,6 +12900,8 @@ mod tests {
         clipboard: Vec<String>,
         /// #749: 積まれたプロンプト送達フロー（後任 master への初期プロンプト検証用）
         prompt_flows: Vec<(PaneId, String)>,
+        /// #1259: ペインごとの送達フローの顛末（GUI が持つものの代役）
+        prompt_delivery_states: std::collections::HashMap<u64, Value>,
         /// #761: 積まれた遅延書き込みの検証用（#640 以降、起動コマンドはここへ来ない）
         writes: Vec<(PaneId, String)>,
         /// #640: 送達確認つきで積まれた起動コマンド（pane, 本文）
@@ -12915,6 +12968,7 @@ mod tests {
                 command_cards: tako_core::CommandCards::new(),
                 clipboard: Vec::new(),
                 prompt_flows: Vec::new(),
+                prompt_delivery_states: std::collections::HashMap::new(),
                 writes: Vec::new(),
                 command_flows: Vec::new(),
                 tmux_windows: std::collections::HashMap::new(),
@@ -12959,6 +13013,9 @@ mod tests {
         }
         fn queue_prompt_flow(&mut self, pane: PaneId, prompt: String) {
             self.prompt_flows.push((pane, prompt));
+        }
+        fn prompt_delivery_state(&self, pane: PaneId) -> Option<Value> {
+            self.prompt_delivery_states.get(&pane.as_u64()).cloned()
         }
         fn queue_write(&mut self, pane: PaneId, data: Vec<u8>) {
             self.writes
@@ -13310,6 +13367,128 @@ mod tests {
         .unwrap()["pane"]
             .as_u64()
             .unwrap()
+    }
+
+    // -----------------------------------------------------------------
+    // #1259: send_input が返した queued: true の**その後**を問える口
+    // -----------------------------------------------------------------
+
+    /// `await_prompt=true` の応答は「積んだ」だけで終わらず、対象ペインと
+    /// 送達の顛末を持つ。旧実装は `{"queued": true}` だけで、届かなかったときに
+    /// 呼び出し側が問える口が 1 つも無かった（#1259 の症状の中核）
+    #[test]
+    fn issue1259_awaitpromptの応答が対象ペインと顛末を持つ() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let out = dispatch(
+            &mut host,
+            Request::Send {
+                pane: Some(pane),
+                text: "やること".into(),
+                newline: true,
+                tmux_session: None,
+                await_prompt: true,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(out["queued"], true, "従来の queued は不変");
+        assert_eq!(out["pane"], pane, "どのペインへ積んだかが応答に無い");
+        assert_eq!(
+            out["delivery"]["state"], "queued",
+            "顛末の入口が応答に無い: {out}"
+        );
+        assert!(
+            out["delivery"]["reason"].is_null(),
+            "積んだ直後は止まっていない"
+        );
+        assert_eq!(
+            host.prompt_flows.len(),
+            1,
+            "送達フローは従来どおり積まれる（応答の追加で経路は変わらない）"
+        );
+    }
+
+    /// 未決着のフローが残っているペインへ送ると、**その理由がそのまま応答に出る**。
+    /// #1259 の本番では前のフローが何を待っているのか分からず、master は
+    /// 90 秒待ってから画面を見るしかなかった
+    #[test]
+    fn issue1259_未決着のフローの理由がqueuedの応答に出る() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        host.prompt_delivery_states.insert(
+            pane,
+            tako_core::prompt_delivery::Status::waiting(
+                tako_core::prompt_delivery::Stall::PeerPending,
+                42,
+            )
+            .to_json(),
+        );
+        let out = dispatch(
+            &mut host,
+            Request::Send {
+                pane: Some(pane),
+                text: "やること".into(),
+                newline: true,
+                tmux_session: None,
+                await_prompt: true,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(out["delivery"]["state"], "waiting");
+        assert_eq!(out["delivery"]["reason"], "peer_pending");
+        assert_eq!(out["delivery"]["elapsed_secs"], 42);
+        assert_eq!(
+            out["delivery"]["transient"], true,
+            "待てば解ける見込みかが応答から読めない"
+        );
+    }
+
+    /// `read_pane` は画面と一緒に送達の顛末も返す（#1259）。
+    /// 「queued: true なのに画面が動かない」ときに **master が最初に見る場所**
+    #[test]
+    fn issue1259_readpaneの応答が送達の顛末を持つ() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let (session, _rx) = TerminalSession::spawn(80, 24, SpawnOptions::default())
+            .expect("既定シェルの PTY を張れる");
+        host.sessions.insert(pane, session);
+        // 未決着が無ければ null（成功した過去の送達で応答を賑やかにしない）
+        let out = dispatch(
+            &mut host,
+            Request::Read {
+                pane: Some(pane),
+                lines: Some(5),
+                tmux_session: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert!(out["delivery"].is_null(), "未決着が無いのに顛末が出る");
+
+        host.prompt_delivery_states.insert(
+            pane,
+            tako_core::prompt_delivery::Status::gave_up(
+                "flow_timeout",
+                Some(tako_core::prompt_delivery::Stall::NoInputBox),
+                120,
+            )
+            .to_json(),
+        );
+        let out = dispatch(
+            &mut host,
+            Request::Read {
+                pane: Some(pane),
+                lines: Some(5),
+                tmux_session: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(out["delivery"]["state"], "gave_up");
+        assert_eq!(out["delivery"]["outcome"], "flow_timeout");
+        assert_eq!(out["delivery"]["reason"], "no_input_box");
     }
 
     /// #1187: `--socket` が host まで届くこと（旧実装は `let _ = socket;` で捨てていた）。

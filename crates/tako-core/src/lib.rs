@@ -37,6 +37,7 @@ pub mod preview_cache;
 pub mod preview_outline;
 pub mod preview_reload;
 pub mod preview_view;
+pub mod prompt_delivery;
 pub mod pty_loop;
 pub mod recent;
 pub mod remote_fs;
