@@ -3739,12 +3739,18 @@ skip の行に `script` のパスを出したので後から言い分けられ�
 > 照合のたびに 0 / 1 が入れ替わっていた（原因と実測は下の「#1114 の記録」）。
 > **状態待ちへ寄せて解消済み**なので、以後この 1 件が出たら本物の回帰として扱ってよい。
 >
-> **2026-09-09 更新 ②（#1264）**: main（`da6bf2f`）の時点で
-> **Windows の `cargo test --workspace` がコンパイルエラーで 1 件も走らない**
-> （#1199 が足したブロックが変数の無い関数に入っている）。ベースライン照合は
-> #1264 が直るまで**バイナリ単位**（`cargo test -p <crate> --test <name>`）で行うこと。
-> CI がすり抜けるのは Windows のテストが `continue-on-error: true`（#583）で、
-> `cargo build --workspace` は `tests/` をコンパイルしないため。
+> **2026-09-09 更新 ②（#1264。解消済み）**: main（`da6bf2f`〜`0b7bd21`）の時点で
+> **Windows の `cargo test --workspace` がコンパイルエラーで 1 件も走らなかった**
+> （#1199 が足したブロックが変数の無い関数に入り `E0425` × 3。実機実測:
+> `cargo test --workspace --no-run` が **263 秒で exit 101**）。ブロックを本来の関数
+> （`器の中でも側路を張れば状態とcwdが届く`）へ移して解消した。
+>
+> CI がすり抜けたのは Windows のテストが `continue-on-error: true`（#583）で、
+> `cargo build --workspace` は `tests/` をコンパイルしないため。**同じ穴は
+> `cargo test --workspace --no-run` を blocking ステップとして塞いだ**
+> （番犬 `crates/tako-control/tests/ci_windows_test_compile.rs`）。
+> macOS からの先行検出は `scripts/check-windows.sh --tests`（作法 10 の `--all-targets` の
+> 狭い版。実測: 修正前ソースで 3 件の `E0425` を **1 秒**で名指しした）。
 
 **2026-09-02 のベースラインは件数だけで名前を残していない**ので厳密な集合差は取れない。
 以後のために**失敗名の一覧をここへ残す**（24 件。内訳は POSIX 前提のテスト = symlink /
@@ -3755,6 +3761,34 @@ mode ビット / `~` 展開 / `links` の絶対パス / `shell_profile`、と既
 > **2026-09-04 更新: ベースラインは 24 → 19 件**。#935 が `acceptance_gates` の
 > 5 件（下の最初の 5 行）を解消した（実測: `UNIQUE_FAILS=19` で残りの名前は完全一致・
 > 新規ゼロ）。以後の照合は**この 5 行を除いた 19 件**と突き合わせること。
+>
+> **2026-09-09 更新（#1264）: ベースラインは 19 → 24 件**。#1264 で
+> `cargo test --workspace` が再び走るようになったので**5 日ぶりに全数が採れた**
+> （実測: head `2a91d44` / `--no-fail-fast` が **655 秒 / TEST_EXITCODE=101** /
+> 一意な失敗 **24 件**）。19 件のうち **16 件はそのまま**で、消えた 3 件と
+> 増えた 8 件の内訳は下の表。**#1264 の PR が触ったのは Windows 専用テストと CI
+> だけ**なので、増えた 8 件はどれもこの PR より前から main に在ったもの
+> （= コンパイルできないあいだに溜まった Windows 側の未検出）。
+>
+> | 差分 | 名前 | メモ |
+> |---|---|---|
+> | 消えた | `stale_binary::tests::test_pidpath_self` | #936 で解消（`pidpath` の Windows 実装） |
+> | 消えた | `stale_binary::tests::ランチャ探索は実行可能な通常ファイルだけを拾う` | 同上 |
+> | 消えた | `解決できないホストは接続前に分類される` | **#930 のハング枝を踏んだ**。今回は 536 秒ぶら下がり、`ssh` を落として初めて `ok` になった（= 分類そのものは正しい。戻ってこない経路が残っている） |
+> | 増えた | `keybindings::tests::非macosにmacos固有アクションのバインドが無い` | tako-app（bin） |
+> | 増えた | `agent_models::tests::cliが無いときは983の導入案内をそのまま返す` | tako-control |
+> | 増えた | `setup::tests::未導入の系統も選択肢に並び選ぶと導入案内が返る` | tako-control |
+> | 増えた | `context_budget::tests::表示用パスはスラグの中のホームも畳む` | tako-control（#1139 由来） |
+> | 増えた | `paths::tests::テストプロセスのdata_dirはホーム配下を指さない` | tako-control |
+> | 増えた | `platform::shell::tests_1031::配線された失敗時の保持が既定で有効` | tako-control（#1031 由来） |
+> | 増えた | `tmux_backend::tests::issue1188_ビューを閉じた元セッションは掃除対象へ戻る` | tako-core（#1188 由来） |
+> | 増えた | `所有者が生きているサーバーはapplyでも消えない` | tako-core `tests/tmux_server_reclaim.rs`（表に無かった新スイート） |
+>
+> **この日の緑**: `shell_integration_powershell` 8/0（#1199 の検証を含む）/
+> `psmux_backend` 18/0（#1114 の状態待ちが効いている）/ `encoding_conpty` 5/0 /
+> `spawn_arg_quoting` 3/0 / `ci_windows_test_compile` 2/0。
+> スイート別は tako-app 612/1・tako-cli 66/1・tako-control 1558/8・tako-core 1393/13・
+> `tmux_server_reclaim` 2/1。
 
 ```
 acceptance_gates::tests::execute_command_true_false   ← #935 で解消（2026-09-04）

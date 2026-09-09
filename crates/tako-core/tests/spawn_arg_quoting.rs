@@ -103,6 +103,7 @@ fn 空白を含む引数が1語のまま子へ届く() {
         }),
         cwd: Some(std::env::temp_dir()),
         env: Vec::new(),
+        scrollback_lines: None,
     });
     let done = pane.wait_for("PROBE-DONE", Duration::from_secs(30));
     let screen = pane.screen_text();
@@ -160,6 +161,7 @@ fn 器ありでも空白入りcwdのペインが生き残る() {
             command: None,
             cwd: Some(space_dir.clone()),
             env: vec![("TAKO_PANE_ID".into(), "1".into())],
+            scrollback_lines: None,
         },
         &socket,
         &session,
@@ -263,6 +265,7 @@ fn 空白を含むenvの値も1語のまま器へ届く() {
             command: None,
             cwd: Some(std::env::temp_dir()),
             env: vec![("TAKO_PANE_ID".into(), want.into())],
+            scrollback_lines: None,
         },
         &socket,
         &session,
