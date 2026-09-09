@@ -90,6 +90,91 @@ impl ChoiceList {
     }
 }
 
+/// ハイライト付きダイアログを目標の選択肢で確定するための「次の 1 手」（#1236）。
+///
+/// **矢印移動で確定する画面の規則を 1 実装に保つための型**。respond
+/// （`tako-control::dispatch::respond_via` の番号なし経路）と自動承諾
+/// （信頼 / Bypass ダイアログ）が同じ判断を通る。片方だけが「素の Enter を送る」
+/// 実装を持つと、既定ハイライトが拒否側の画面（claude 2.x の信頼ダイアログは
+/// `No, exit` が既定）でエージェントを終了させる（#1236 の事故）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmStep {
+    /// ハイライトを目標へ動かす（`key` を `steps` 回送る）。
+    /// **送ったら画面を採り直してハイライトを読み直す**（キーを飲まれることがある）
+    Move {
+        /// `"Down"` / `"Up"`（[`crate::backend::key_name_bytes`] の語彙）
+        key: &'static str,
+        /// 送る回数（1 以上）
+        steps: usize,
+    },
+    /// ハイライトが目標に乗っている = Enter で確定してよい
+    Confirm,
+    /// 判断材料が足りない = **Enter を送ってはいけない**
+    Blocked(ConfirmBlock),
+}
+
+/// 確定を見送る理由（診断ログに残す機械可読コード）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmBlock {
+    /// 選択カーソルが画面に描かれていない（どこがハイライトか読めない。#1143 の形）
+    NoHighlight,
+    /// 目標 / ハイライトの添字が選択肢の範囲外（画面が書き換わった直後）
+    OutOfRange,
+}
+
+impl ConfirmBlock {
+    /// 診断ログ・応答に載せる機械可読 slug
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoHighlight => "no_highlight",
+            Self::OutOfRange => "out_of_range",
+        }
+    }
+
+    /// 人向けの理由（CLI / MCP のエラー本文）
+    pub fn note(self) -> &'static str {
+        match self {
+            Self::NoHighlight => {
+                "選択カーソルが画面に無くハイライト位置を特定できない（Enter は送らない）"
+            }
+            Self::OutOfRange => {
+                "選択肢の並びが採取のあいだに変わった（添字が範囲外。Enter は送らない）"
+            }
+        }
+    }
+}
+
+/// 目標の選択肢を確定するための次の 1 手を決める（#1236）。
+///
+/// `count` = 画面に見えている選択肢の数、`highlighted` = 現在のハイライト位置
+/// （`None` = カーソルが描かれていない）、`target` = 確定したい選択肢の添字。
+///
+/// **ハイライトが読めなければ [`ConfirmStep::Confirm`] を返さない**のがこの関数の契約。
+/// 呼び出し側は `Move` を送ったあと画面を採り直して**もう一度この関数に聞く**ことで、
+/// 「ラベル一致を確認してから Enter」を構造的に守れる
+pub fn confirm_step(count: usize, highlighted: Option<usize>, target: usize) -> ConfirmStep {
+    if target >= count {
+        return ConfirmStep::Blocked(ConfirmBlock::OutOfRange);
+    }
+    let Some(current) = highlighted else {
+        return ConfirmStep::Blocked(ConfirmBlock::NoHighlight);
+    };
+    if current >= count {
+        return ConfirmStep::Blocked(ConfirmBlock::OutOfRange);
+    }
+    match target.cmp(&current) {
+        std::cmp::Ordering::Equal => ConfirmStep::Confirm,
+        std::cmp::Ordering::Greater => ConfirmStep::Move {
+            key: "Down",
+            steps: target - current,
+        },
+        std::cmp::Ordering::Less => ConfirmStep::Move {
+            key: "Up",
+            steps: current - target,
+        },
+    }
+}
+
 /// 選択肢ダイアログが画面に実在するか（= 入力欄が奪われているか）。
 ///
 /// `tako-control::claude_tui::is_choice_dialog` はこれに委譲する（実装を 1 本にして、
@@ -1843,6 +1928,84 @@ Antigravity CLI requires permission to read, edit, and execute files here.
             offset < line.len() - inner.len(),
             "末尾に空白があるぶん素朴な引き算より小さい: offset={offset} naive={}",
             line.len() - inner.len()
+        );
+    }
+
+    // --- #1236: 矢印移動で確定する画面の「次の 1 手」 ---
+
+    #[test]
+    fn issue1236_ハイライトが目標に乗っていれば確定する() {
+        assert_eq!(confirm_step(2, Some(1), 1), ConfirmStep::Confirm);
+        // 選択肢が 1 つでも同じ（旧 claude の番号つき信頼ダイアログは既定が承諾側）
+        assert_eq!(confirm_step(1, Some(0), 0), ConfirmStep::Confirm);
+    }
+
+    #[test]
+    fn issue1236_目標までの向きと歩数を返す() {
+        // 既定が `No, exit`（添字 0）で承諾側が下（添字 1）= claude 2.x の信頼ダイアログ
+        assert_eq!(
+            confirm_step(2, Some(0), 1),
+            ConfirmStep::Move {
+                key: "Down",
+                steps: 1
+            }
+        );
+        // 承諾側が上にある形（agy）でも同じ規則で戻れる
+        assert_eq!(
+            confirm_step(4, Some(3), 0),
+            ConfirmStep::Move {
+                key: "Up",
+                steps: 3
+            }
+        );
+    }
+
+    #[test]
+    fn issue1236_ハイライトが読めなければ確定しない() {
+        // カーソルが画面外（#1143 の形）= どこが選ばれているか分からない
+        assert_eq!(
+            confirm_step(2, None, 1),
+            ConfirmStep::Blocked(ConfirmBlock::NoHighlight)
+        );
+        // 目標が範囲外 / ハイライトが範囲外（採取のあいだに画面が書き換わった）
+        assert_eq!(
+            confirm_step(2, Some(0), 2),
+            ConfirmStep::Blocked(ConfirmBlock::OutOfRange)
+        );
+        assert_eq!(
+            confirm_step(2, Some(5), 1),
+            ConfirmStep::Blocked(ConfirmBlock::OutOfRange)
+        );
+        assert_eq!(
+            confirm_step(0, None, 0),
+            ConfirmStep::Blocked(ConfirmBlock::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn issue1236_実採取の番号なし信頼ダイアログから承諾側へ動ける() {
+        // 画面 → 構造 → 次の 1 手 が繋がっていることの確認（fixture は #1223 由来）
+        let lines = [
+            " Quick safety check: Is this a project you created or one you trust?",
+            "",
+            " > No, exit",
+            "   Yes, I trust this folder",
+            "",
+            " Enter to confirm · Esc to cancel",
+        ];
+        let list = detect_choice_list(&lines).expect("番号なし 2 択を検知する");
+        assert_eq!(list.highlighted, Some(0), "既定は拒否側");
+        let target = list
+            .options
+            .iter()
+            .position(|o| o.label.starts_with("Yes,"))
+            .expect("承諾側がある");
+        assert_eq!(
+            confirm_step(list.options.len(), list.highlighted, target),
+            ConfirmStep::Move {
+                key: "Down",
+                steps: 1
+            }
         );
     }
 }

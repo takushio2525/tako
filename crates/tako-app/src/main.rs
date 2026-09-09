@@ -523,8 +523,12 @@ struct PromptFlow {
     created_at: std::time::Instant,
     /// 現在のステートに遷移した時刻（ステート内タイムアウト用）
     state_entered_at: std::time::Instant,
-    /// 信頼ダイアログを承諾した回数（無限承諾ループ防止。上限 3）
-    trust_accepts: u8,
+    /// 信頼ダイアログを Enter で確定した回数
+    /// （無限承諾ループ防止。上限 [`claude_tui::AUTO_ACCEPT_CONFIRMS`]）
+    trust_accepts: u32,
+    /// 信頼ダイアログのハイライトを承諾側へ動かすために送ったキーの回数（#1236。
+    /// 上限 [`claude_tui::AUTO_ACCEPT_MOVES`]）
+    trust_moves: u32,
     /// 入力欄残留に対する Enter 単独再送の残り回数
     enter_retries_left: u8,
     /// 貼り付けが入力欄に反映されなかった場合の再貼り付け残り回数（#390）。
@@ -622,6 +626,7 @@ impl PromptFlow {
             created_at: now,
             state_entered_at: now,
             trust_accepts: 0,
+            trust_moves: 0,
             enter_retries_left: 4,
             paste_retries_left: 2,
             wait_tui,
@@ -6543,14 +6548,10 @@ impl TakoApp {
                         }
                         flow.unverified_reason = Some("choice_dialog");
                     } else if claude_tui::is_trust_dialog(&lines) {
-                        // 信頼ダイアログがプロンプトを消費するのを防ぐ: 先に Enter で承諾する
+                        // 信頼ダイアログがプロンプトを消費するのを防ぐ: 先に承諾しておく
                         // （事前信頼が書けなかった場合のフォールバック）。tick 間隔 500ms が
-                        // 承諾間の自然な遅延になる。3 回で打ち切り（総合タイムアウトに委ねる）
-                        if flow.trust_accepts < 3 {
-                            session.write(b"\r".to_vec());
-                            flow.trust_accepts += 1;
-                            flow.state_entered_at = now;
-                        }
+                        // キー操作のあいだの自然な遅延になり、次 tick で画面を読み直す
+                        Self::drive_trust_accept(&mut flow, session, &lines, now);
                     } else if flow.enter_only {
                         // Enter 単独送達（Issue #95）: 貼り付けせず、入力欄の現内容を
                         // 残留判定の基準に控えて Enter を送る。プロンプト記号が見えない画面
@@ -6873,6 +6874,61 @@ impl TakoApp {
         }
         self.prompt_flows
             .push(PromptFlow::new_enter_verify(pane, baseline));
+    }
+
+    /// 信頼ダイアログの自動承諾を 1 tick ぶん進める（Issue #1236）。
+    ///
+    /// 旧実装は**素の Enter を最大 3 回**送っていた。番号つきの旧ダイアログは既定が
+    /// `❯ 1. Yes, I trust this folder` なのでそれで承諾できていたが、claude 2.x の
+    /// 番号なしダイアログは**既定ハイライトが `No, exit`** なので、Enter は拒否側を
+    /// 確定して claude を終了させる（プロンプトはシェルへ流れ、worker が黙って死ぬ）。
+    ///
+    /// 規則は [`claude_tui::accept_step`] の 1 実装（respond の番号なし経路と共有）:
+    /// ハイライトを読む → 承諾側でなければ矢印で動かす → **承諾側に乗ったことを
+    /// 画面で確認してから** Enter。承諾側を特定できないあいだは**何も送らない**
+    /// （理由を persist.log へ 1 行だけ残し、総合タイムアウトに委ねる）
+    fn drive_trust_accept(
+        flow: &mut PromptFlow,
+        session: &tako_core::TerminalSession,
+        lines: &[String],
+        now: std::time::Instant,
+    ) {
+        use tako_control::claude_tui;
+        match claude_tui::accept_step(lines) {
+            claude_tui::AcceptStep::Confirm => {
+                if flow.trust_accepts < claude_tui::AUTO_ACCEPT_CONFIRMS {
+                    session.write(b"\r".to_vec());
+                    flow.trust_accepts += 1;
+                    flow.state_entered_at = now;
+                }
+            }
+            claude_tui::AcceptStep::Move { key, steps } => {
+                // キー名 → バイト列は器の外と同じ語彙で引く（#1200 の `key_name_bytes`）。
+                // 解釈できないキー名は送らない（推測でダイアログを誤操作しない）
+                let Some(bytes) = tako_core::backend::key_name_bytes(key) else {
+                    return;
+                };
+                if flow.trust_moves < claude_tui::AUTO_ACCEPT_MOVES {
+                    for _ in 0..steps {
+                        session.write(bytes.clone());
+                        flow.trust_moves += 1;
+                    }
+                    flow.state_entered_at = now;
+                }
+            }
+            claude_tui::AcceptStep::Blocked(reason) => {
+                // 描画途中・未知の形でハイライトが読めない画面。ここで Enter を送ると
+                // 既定が拒否側のダイアログでエージェントを終了させるので送らない
+                if flow.unverified_reason.is_none() {
+                    flow.unverified_reason = Some("trust_dialog_blocked");
+                    tako_control::diag::persist_log(&format!(
+                        "[auto-accept] pane={} kind=trust blocked={reason} \
+                         （ハイライトを確認できないため Enter を送らない。#1236）",
+                        flow.pane.as_u64()
+                    ));
+                }
+            }
+        }
     }
 
     /// 入力欄に **ユーザーが打った実テキスト** があればそれを返す（#572）。

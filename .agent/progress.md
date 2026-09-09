@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-09（#1033: agy に一次シグナルを与え、完了検知を claude 同等にした）
-- 前提の訂正: 「agy の会話は SQLite だけ」は実態とズレ。`brain/<id>/.system_generated/logs/transcript.jsonl` が逐次追記される平文 JSONL（**依存追加なし**）。ペイン → 会話は生きた agy が開いたままの `brain/<id>` を lsof で引く
-- `agy_session` を新設し `status_source=agy-session` / `report` の transcript 層 / 送達の一次証拠（`USER_INPUT`）へ配線。補正層の権威判定は `is_live_log_source` の 1 実装へ寄せた（**ここを忘れると `has_children` で永久 busy** = #571 / #984 と同じ罠を実機で踏んだ）
-- 隔離 GUI での A/B 実測（北極星と同じ測り方・各 3 標本）: 検知遅延の中央値 39.46s → **13.92s**（claude 15.40 / codex 11.68 と同水準）。`report` は scrollback/messages 0 → transcript/`transcript_agent=agy`/messages 1〜2。偽 idle は増えず watch の偽イベント 0 件
-
 ## 2026-09-09（#989: ゼロスタート導入を claude 専用から 3 系統へ広げた）
 - `agent_install::AgentKind` を 3 値・`recipe(platform, agent)` を 6 マスへ（codex / agy の公式手順は実物で確認。codex は代行時 `CODEX_NON_INTERACTIVE=1` が必須 = 無いと `Start Codex now?` で返らない・agy は単一バイナリ）。`setup_bootstrap` の全操作を `_for(agent)` へ寄せ、**引数なしの claude 既定入口は残していない**
 - setup は「1 つでも使える系統があれば素通り / 無いときだけ途中まで入っているものを優先して仕上げる」形へ（単一選択を強制しない）。認証誘導・失敗案内・CLI 解決のフォールバックも系統ごと。Windows で代行するのは claude だけ（宣言 2 か所）
@@ -78,3 +73,8 @@
 - `execution_refused`（`WorkerErrorKind` / `AgentCliProblem` の新分類・`recommended_action = retry_spawn`）を追加。**#983 のゲートは緩めず**、別ゲート「一次シグナルで作業を 1 歩も観測していない」で分類する（画面推定の busy は TUI の起動描画を拾うので使えない）
 - 判定の文言は系統ごとに宣言（`execution_refused_patterns`）。実採取は agy のみで**版で文言が変わる**（1.1.22 = `Verifying your account` / 1.1.27 = `Unable to verify account eligibility`）ので共通語 `account eligibility` を軸にした。claude 2.1.258 / codex 0.153.0 のバイナリに一時的な検証待ちの文言が無いことは実物の走査で確認
 - MATRIX に `worker_refusal_detect` を新設し docs を同期。番犬 4 本 + dispatch の e2e 1 本 + 単体 8 本。A/B は `TAKO_1034_LEGACY=1`
+
+## 2026-09-09（#1236: 信頼ダイアログの自動承諾がハイライトを見ずに Enter を送る問題を直した）
+- 送達フロー（`main.rs` の `drive_trust_accept`）と器越しの送達（`deliver_via_tmux`）を `claude_tui::accept_step` の 1 実装へ寄せ、移動の向き・歩数・「Enter を送ってよいか」は `tako_core::dialog::confirm_step`（respond の番号なし経路と共有）へ。**承諾側を特定できないあいだは Enter を送らない**（理由は `persist.log` の `[auto-accept]` 行）
+- 模擬 TUI（実 tmux・GUI 不要）で実キーの A/B: 新 = `Down`→`Enter` で `Yes, I trust this folder` が確定 / `TAKO_1236_LEGACY=1` = `Enter` 1 発で **`No, exit` が確定**（= 事故の再現）。ベースラインの Windows 警告 10 件と一致
+- 番犬 4 本（修正前ソースを 4 本すべてが名指しで FAILED）+ 単体 8 本 + `confirm_step` 4 本。全 3905 件緑

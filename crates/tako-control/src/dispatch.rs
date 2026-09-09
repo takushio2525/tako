@@ -9960,26 +9960,29 @@ pub fn respond_via(
             std::thread::sleep(std::time::Duration::from_millis(400));
         }
     } else {
-        // 番号なし: ハイライトから目標までカーソルを動かし、着地をラベルで検証する
-        let mut current = dialog.highlighted.ok_or_else(|| {
-            DispatchError::Operation(
-                "番号なしダイアログでハイライト位置を特定できない（手動で応答してください）"
-                    .to_string(),
-            )
-        })?;
+        // 番号なし: ハイライトから目標までカーソルを動かし、着地をラベルで検証する。
+        // **向き・歩数・「Enter を送ってよいか」の判断は
+        // `tako_core::dialog::confirm_step` の 1 実装**（#1236 で自動承諾と共有した。
+        // 片方だけが素の Enter を送る実装を持つと、既定ハイライトが拒否側の画面で
+        // エージェントを終了させる）
+        let mut count = dialog.options.len();
+        let mut current = dialog.highlighted;
         for _ in 0..NAV_ATTEMPTS {
-            if current == index {
-                break;
-            }
-            let (key, steps) = if index > current {
-                ("Down", index - current)
-            } else {
-                ("Up", current - index)
-            };
-            for _ in 0..steps {
-                send(key)?;
-                keys_sent.push(key.to_string());
-                std::thread::sleep(std::time::Duration::from_millis(120));
+            match tako_core::dialog::confirm_step(count, current, index) {
+                tako_core::dialog::ConfirmStep::Confirm => break,
+                tako_core::dialog::ConfirmStep::Blocked(block) => {
+                    return Err(DispatchError::Operation(format!(
+                        "番号なしダイアログで{}（手動で応答してください）",
+                        block.note()
+                    )));
+                }
+                tako_core::dialog::ConfirmStep::Move { key, steps } => {
+                    for _ in 0..steps {
+                        send(key)?;
+                        keys_sent.push(key.to_string());
+                        std::thread::sleep(std::time::Duration::from_millis(120));
+                    }
+                }
             }
             // 移動後の実画面から現在位置を読み直す（キーを飲まれた場合の再試行）
             let after = crate::claude_tui::detect_choice_dialog(&capture()?).ok_or_else(|| {
@@ -9987,10 +9990,13 @@ pub fn respond_via(
                     "カーソル移動中にダイアログが消えた（応答は送っていません）".to_string(),
                 )
             })?;
-            current = after
-                .highlighted
-                .ok_or_else(|| DispatchError::Operation("ハイライト位置を再取得できない".into()))?;
-            if after.options.get(current).map(|o| o.label.as_str()) == Some(chosen.label.as_str()) {
+            count = after.options.len();
+            current = after.highlighted;
+            if current
+                .and_then(|i| after.options.get(i))
+                .map(|o| o.label.as_str())
+                == Some(chosen.label.as_str())
+            {
                 break;
             }
         }
