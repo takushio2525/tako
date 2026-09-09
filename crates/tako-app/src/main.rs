@@ -24352,12 +24352,13 @@ mod self_test {
     ///
     /// **伸ばすだけで縮めない**のが肝: `busy` が読めない環境（`load=unknown` の
     /// Windows 実機など）でも予算は `base` のまま残るので、判定が環境で緩くなることはない。
-    /// 係数は 4 倍で打ち切る（本物の回帰があるときに待ち続けないため）
+    /// 係数は 4 倍で打ち切る（本物の回帰があるときに待ち続けないため）。
+    ///
+    /// 計算そのものは `tako_core::wait_budget` に置いてある（#1252）。tako-core の
+    /// 器 e2e（`tmux_backend` のマウスレポート）も同じ予算で待つので、
+    /// **政策を 2 か所に書かない**ためにそちらを正本にしている
     pub(crate) fn state_wait_budget(base: Duration, busy: Option<f64>) -> Duration {
-        let factor = busy
-            .map(|b| (1.0 + b.max(0.0)).clamp(1.0, 4.0))
-            .unwrap_or(1.0);
-        base.mul_f64(factor)
+        tako_core::wait_budget::state_wait_budget(base, busy)
     }
 
     /// **やり直しの上限回数を機の混み具合で伸ばす**（純粋関数。#995）。

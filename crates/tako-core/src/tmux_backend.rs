@@ -730,6 +730,279 @@ mod tests {
     use super::*;
     use std::process::Command;
 
+    // ── #1252: 器（tmux）越しの状態待ちの共通部品 ────────────────────────────
+    //
+    // **偽のアンカーを二度と使わないための置き場**。バックエンド conf は
+    // `set -g mouse on`（このファイルの `DIRECTIVES`）なので、tmux は
+    // **クライアント attach の時点で**外側端末（tako の `Term`）のマウスレポートを
+    // 有効にする。つまり外側の `TerminalSession::mouse_reporting()` は
+    // **内側アプリの `\033[?1000h` とは無関係に**真になる（実測: spawn から 20 ms・
+    // その時点で器のペインは `mouse_any_flag=0`）。
+    //
+    // 要求前にホイールを打つと **tmux 自身がそれを食って copy-mode へ入り**
+    // （実測 `pane_in_mode=1`）、以後のホイールは copy-mode のスクロールになるので
+    // **待ちをいくら伸ばしても内側アプリへは永久に届かない**。これが #1252 の
+    // 「画面が改行だけのまま assert に到達する」の正体で、待ちの長さの問題ではない。
+    // 唯一の直接の証跡は器のペイン側のフラグ（`mouse_sgr_flag` / `mouse_any_flag`）。
+
+    /// 状態待ちが予算切れしたときの材料（#1252）。
+    /// 規約どおり「**何を待っていたか** / **実際に何が届いたか**」を必ず持つ
+    #[cfg(unix)]
+    struct WaitTimeout {
+        what: String,
+        observed: String,
+        waited: std::time::Duration,
+        budget: std::time::Duration,
+        attempts: u32,
+        busy: Option<f64>,
+    }
+
+    #[cfg(unix)]
+    impl WaitTimeout {
+        /// 観測材料を後から載せる。待ちのあいだ `session` を可変で借りている
+        /// 呼び出し側でも、`wait_for_state` から戻ったあとなら画面を読める
+        fn observed(mut self, observed: impl Into<String>) -> Self {
+            self.observed = observed.into();
+            self
+        }
+    }
+
+    #[cfg(unix)]
+    impl std::fmt::Display for WaitTimeout {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "TAKO_1252_WAIT: 待っていたもの={} / 届いたもの={} \
+                 waited={:.1}s budget={:.1}s attempts={} load={}",
+                self.what,
+                self.observed,
+                self.waited.as_secs_f64(),
+                self.budget.as_secs_f64(),
+                self.attempts,
+                self.busy
+                    .map(|b| format!("{b:.2}"))
+                    .unwrap_or_else(|| "unknown".into()),
+            )
+        }
+    }
+
+    /// **状態待ちの共通ドライバ**（#1252）。
+    ///
+    /// `step` を `tick` 間隔で呼び、`Some` を返したら到達。上限は
+    /// `wait_budget::state_wait_budget`（混み具合で**伸ばすだけ**・4 倍で打ち切り）で、
+    /// 固定の回数上限は持たない。予算切れなら診断つきの [`WaitTimeout`] を返す。
+    ///
+    /// `step` は**毎周期の駆動**（イベントの取り込み・ホイールの打ち直し）も担う
+    /// = 「1 回だけ打って待つ」形を作れないようにしてある
+    #[cfg(unix)]
+    fn wait_for_state<T>(
+        what: &str,
+        base: std::time::Duration,
+        tick: std::time::Duration,
+        mut step: impl FnMut() -> Option<T>,
+    ) -> Result<T, WaitTimeout> {
+        let busy = crate::wait_budget::machine_busy();
+        let budget = crate::wait_budget::state_wait_budget(base, busy);
+        let started = std::time::Instant::now();
+        let mut attempts = 0u32;
+        loop {
+            attempts += 1;
+            if let Some(value) = step() {
+                return Ok(value);
+            }
+            if started.elapsed() >= budget {
+                return Err(WaitTimeout {
+                    what: what.to_string(),
+                    observed: String::new(),
+                    waited: started.elapsed(),
+                    budget,
+                    attempts,
+                    busy,
+                });
+            }
+            std::thread::sleep(tick);
+        }
+    }
+
+    /// 器のペイン側のマウス要求の状態（#1252）
+    #[cfg(unix)]
+    #[derive(Clone, Debug, Default)]
+    struct PaneMouse {
+        /// 内側アプリが何らかのマウスレポートを要求している（`#{mouse_any_flag}`）
+        any: bool,
+        /// 内側アプリが SGR 形式を要求している（`#{mouse_sgr_flag}`）
+        sgr: bool,
+        /// 器がペインを copy-mode にしている（`#{pane_in_mode}`。
+        /// **要求前にホイールを食われた印**）
+        in_mode: bool,
+        /// `display-message` の生の応答（`None` = 器を呼べなかった / 失敗した）
+        raw: Option<String>,
+    }
+
+    #[cfg(unix)]
+    impl PaneMouse {
+        fn ready(&self) -> bool {
+            self.any && self.sgr
+        }
+
+        fn describe(&self) -> String {
+            format!(
+                "器のペイン any={} sgr={} inmode={} 応答={}",
+                self.any,
+                self.sgr,
+                self.in_mode,
+                self.raw.as_deref().unwrap_or("器を呼べない")
+            )
+        }
+    }
+
+    /// 器のペインのマウス要求を 1 回問い合わせる（#1252）
+    #[cfg(unix)]
+    fn probe_pane_mouse(socket: &str, session: &str) -> PaneMouse {
+        let output = crate::tmux::tmux_command(Some(socket))
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                session,
+                // **区切りはカンマ**。空白区切りだと `split_whitespace` が空欄を
+                // 畳んでしまい、器が知らないフォーマット（空文字で返る）が
+                // 隣の値へずれて無言で誤読する
+                "#{mouse_any_flag},#{mouse_sgr_flag},#{pane_in_mode}",
+            ])
+            .output();
+        let out = match output {
+            Ok(out) if out.status.success() => out,
+            Ok(out) => {
+                return PaneMouse {
+                    raw: Some(format!(
+                        "rc={:?} stderr={:?}",
+                        out.status.code(),
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    )),
+                    ..PaneMouse::default()
+                }
+            }
+            Err(e) => {
+                return PaneMouse {
+                    raw: Some(format!("起動できない: {e}")),
+                    ..PaneMouse::default()
+                }
+            }
+        };
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let mut fields = text.split(',');
+        let any = fields.next() == Some("1");
+        let sgr = fields.next() == Some("1");
+        let in_mode = fields.next() == Some("1");
+        PaneMouse {
+            any,
+            sgr,
+            in_mode,
+            raw: Some(text),
+        }
+    }
+
+    /// 内側アプリが**器のペイン側で** SGR マウスレポートを要求し終えるのを待つ（#1252）。
+    ///
+    /// これが唯一の正しいアンカー（理由はこのブロック冒頭）。`drive` は毎周期
+    /// 呼ばれるので、`rx` の取り込みが要る呼び出し側はそこへ渡す
+    #[cfg(unix)]
+    fn wait_pane_mouse_ready(
+        socket: &str,
+        session: &str,
+        mut drive: impl FnMut(),
+    ) -> Result<PaneMouse, WaitTimeout> {
+        wait_for_state(
+            "内側アプリが器のペインで SGR マウスを要求する（#{mouse_sgr_flag}=1）",
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_millis(100),
+            || {
+                drive();
+                let pane = probe_pane_mouse(socket, session);
+                pane.ready().then_some(pane)
+            },
+        )
+        .map_err(|e| {
+            let pane = probe_pane_mouse(socket, session);
+            e.observed(pane.describe())
+        })
+    }
+
+    /// 器のペインの内容（#1252）。`text` が `None` = **器を呼べなかった**で、
+    /// 「呼べたが空だった」と区別できる（旧実装は両方 `""` に潰していたので、
+    /// 「1 件も届いていない」の原因が診断から分からなかった）
+    #[cfg(unix)]
+    #[derive(Clone, Debug, Default)]
+    struct PaneCapture {
+        text: Option<String>,
+        note: String,
+    }
+
+    #[cfg(unix)]
+    fn capture_pane_text(socket: &str, session: &str) -> PaneCapture {
+        match crate::tmux::tmux_command(Some(socket))
+            .args(["capture-pane", "-t", session, "-p", "-S", "-", "-J"])
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                let text = String::from_utf8_lossy(&out.stdout).into_owned();
+                PaneCapture {
+                    note: format!("capture ok bytes={}", text.len()),
+                    text: Some(text),
+                }
+            }
+            Ok(out) => PaneCapture {
+                text: None,
+                note: format!(
+                    "capture 失敗 rc={:?} stderr={:?}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+            },
+            Err(e) => PaneCapture {
+                text: None,
+                note: format!("capture を起動できない: {e}"),
+            },
+        }
+    }
+
+    /// A/B: `TAKO_1252_LEGACY=1` は #1252 **前**の待ちへ戻す
+    /// （アンカー = 外側 `mouse_reporting()` / ホイールは 1 発 / 固定回数の窓）
+    #[cfg(unix)]
+    fn legacy_1252() -> bool {
+        std::env::var("TAKO_1252_LEGACY").is_ok_and(|v| v == "1")
+    }
+
+    /// 注入: 混み具合は再現できないので**遅れそのもの**を入れる（#1252）。
+    ///
+    /// - `late` = 内側アプリのマウス要求を 3 秒遅らせる（旧経路が確定で FAILED になる）
+    /// - `never` = 内側アプリがマウスを要求しない（**新経路でも FAILED になるのが正しい**
+    ///   = 状態待ちが本物の回帰を隠さないことの確認）
+    #[cfg(unix)]
+    fn inject_1252() -> Option<String> {
+        std::env::var("TAKO_1252_INJECT")
+            .ok()
+            .filter(|v| !v.is_empty())
+    }
+
+    /// 内側アプリの「SGR マウス要求（+ 任意で kitty 要求）」の一行を注入つきで組む（#1252）
+    #[cfg(unix)]
+    fn mouse_request_prelude(kitty: bool) -> String {
+        let request = if kitty {
+            "printf '\\033[?1000h\\033[?1006h\\033[>1u'; "
+        } else {
+            "printf '\\033[?1000h\\033[?1006h'; "
+        };
+        match inject_1252().as_deref() {
+            // 要求そのものを出さない（検出力の確認）
+            Some("never") => String::new(),
+            // 要求を 3 秒遅らせる（混んだ機で起きている順序の再現）
+            Some("late") => format!("sleep 3; {request}"),
+            _ => request.to_string(),
+        }
+    }
+
     /// #974 の判定に使う器の能力は、**器の実装そのものから採る**
     /// （テスト側でハードコードすると本体と無言でずれ、検出力が消える）
     fn tmux_caps() -> BackendCapabilities {
@@ -1508,74 +1781,152 @@ set -gq copy-mode-position-format ''
         }
         let socket = format!("tako-coretest-mouse-{}", std::process::id());
         let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
+        let session_name = "tako-e2e-mouse";
         // 内側アプリ: SGR マウス + kitty keyboard を要求してから受信バイトを表示
         let options = SpawnOptions {
             command: Some(SpawnCommand {
                 program: "/bin/sh".into(),
                 args: vec![
                     "-c".into(),
-                    r"printf '\033[?1000h\033[?1006h\033[>1u'; exec cat -v".into(),
+                    format!("{}exec cat -v", mouse_request_prelude(true)),
                 ],
             }),
             cwd: Some(std::env::temp_dir()),
             env: vec![],
         };
         let (session, _rx) =
-            crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, "tako-e2e-mouse"))
+            crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, session_name))
                 .expect("tmux クライアントを spawn できる");
 
-        // 内側のマウス要求が tmux → 外側端末（tako の Term）まで伝わる
-        let mut mouse_on = false;
-        for _ in 0..100 {
-            if session.mouse_reporting() {
-                mouse_on = true;
-                break;
+        // **アンカーは器のペイン側の要求**（#1252。理由は `wait_pane_mouse_ready` の上）。
+        // 外側 `mouse_reporting()` は conf の `set -g mouse on` で attach の時点で
+        // 真になるので、内側アプリが立ち上がった証跡にはならない
+        if legacy_1252() {
+            // TAKO_1252_LEGACY_ARM 開始（#1252 **前**の待ち。番犬はここを対象外にする）
+            // 旧アンカー: 外側 `mouse_reporting()` を固定 100 回窓で待つ
+            let mut mouse_on = false;
+            for _ in 0..100 {
+                if session.mouse_reporting() {
+                    mouse_on = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        assert!(
-            mouse_on,
-            "内側アプリのマウス要求が外側端末モードへ伝わる。画面: {:?}",
-            session.visible_lines().join("\n")
-        );
-
-        // ホイール → 生の SGR マウスイベントが内側アプリへ届く（矢印キー変換は禁止）
-        session.scroll_wheel(1, 5, 5);
-        let mut delivered = false;
-        for _ in 0..50 {
-            let lines = session.visible_lines().join("\n");
             assert!(
-                !lines.contains("^[[A") && !lines.contains("^[OA"),
-                "ホイールが矢印キーに化けている（リグレッション）。画面: {lines:?}"
+                mouse_on,
+                "内側アプリのマウス要求が外側端末モードへ伝わる。画面: {:?}",
+                session.visible_lines().join("\n")
             );
-            if lines.contains("[<64;6;6M") {
-                delivered = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            // TAKO_1252_LEGACY_ARM 終了
+        } else {
+            let pane = wait_pane_mouse_ready(&socket, session_name, || {}).unwrap_or_else(|e| {
+                panic!(
+                    "内側アプリのマウス要求が器のペインへ届かない（#1252）。{e} 画面: {:?}",
+                    session.visible_lines().join("\n")
+                )
+            });
+            eprintln!("TAKO_1252: {} legacy=false", pane.describe());
         }
-        assert!(
-            delivered,
-            "生の SGR ホイールイベントが届かない。画面: {:?}",
-            session.visible_lines().join("\n")
-        );
+
+        // 器の `set -g mouse on` が外側端末（tako の Term）へ伝わっている。
+        // **内側の要求が伝わった証跡ではない**（#1252 で取り違えていた点）ので、
+        // ここは「器のマウス設定が効いている」ことだけを見る
+        wait_for_state(
+            "器の mouse on が外側端末（tako の Term）へ伝わる",
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(100),
+            || session.mouse_reporting().then_some(()),
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "器の mouse on が外側端末モードへ伝わらない。{} 画面: {:?}",
+                e.observed(format!("mouse_reporting={}", session.mouse_reporting())),
+                session.visible_lines().join("\n")
+            )
+        });
+
+        // ホイール → 生の SGR マウスイベントが内側アプリへ届く（矢印キー変換は禁止）。
+        // **毎周期打ち直す**（#1180 の項目 73 と同じ形）: ホイールは器が食いうる
+        // 相対イベントなので、1 発だけ打って待つ形は「食われたら永久に届かない」
+        enum Wheel {
+            Delivered,
+            /// 矢印キーに化けた（リグレッション）。画面をそのまま持たせる
+            Arrow(String),
+        }
+        let wheel = if legacy_1252() {
+            // TAKO_1252_LEGACY_ARM 開始（#1252 **前**の待ち。番犬はここを対象外にする）
+            // 旧経路: ホイールを 1 発だけ打って固定 50 回窓で待つ
+            session.scroll_wheel(1, 5, 5);
+            let mut out = None;
+            for _ in 0..50 {
+                let lines = session.visible_lines().join("\n");
+                if lines.contains("^[[A") || lines.contains("^[OA") {
+                    out = Some(Wheel::Arrow(lines));
+                    break;
+                }
+                if lines.contains("[<64;6;6M") {
+                    out = Some(Wheel::Delivered);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            // TAKO_1252_LEGACY_ARM 終了
+            out.ok_or_else(|| "固定窓（#1252 前）を使い切った".to_string())
+        } else {
+            wait_for_state(
+                "内側アプリへ生の SGR ホイール `[<64;6;6M` が届く",
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_millis(100),
+                || {
+                    let lines = session.visible_lines().join("\n");
+                    if lines.contains("^[[A") || lines.contains("^[OA") {
+                        return Some(Wheel::Arrow(lines));
+                    }
+                    if lines.contains("[<64;6;6M") {
+                        return Some(Wheel::Delivered);
+                    }
+                    session.scroll_wheel(1, 5, 5);
+                    None
+                },
+            )
+            .map_err(|e| {
+                e.observed(format!(
+                    "画面={:?} {}",
+                    session.visible_lines().join("\n"),
+                    probe_pane_mouse(&socket, session_name).describe()
+                ))
+                .to_string()
+            })
+        };
+        match wheel {
+            Ok(Wheel::Delivered) => {}
+            Ok(Wheel::Arrow(lines)) => {
+                panic!("ホイールが矢印キーに化けている（リグレッション）。画面: {lines:?}")
+            }
+            Err(diag) => panic!("生の SGR ホイールイベントが届かない（#1252）。{diag}"),
+        }
 
         // Shift+Enter（CSI u）も tmux 越しで**kitty 形式のまま**内側へ届く
         // （extended-keys always + extended-keys-format csi-u。FR の常用要件）
         session.write(b"\x1b[13;2u".to_vec());
-        let mut key_delivered = false;
-        for _ in 0..50 {
-            if session.visible_lines().join("\n").contains("[13;2u") {
-                key_delivered = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        assert!(
-            key_delivered,
-            "Shift+Enter（CSI u）が tmux 越しに kitty 形式で届かない。画面: {:?}",
-            session.visible_lines().join("\n")
-        );
+        wait_for_state(
+            "Shift+Enter（CSI u）のエコー `[13;2u`",
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(100),
+            || {
+                session
+                    .visible_lines()
+                    .join("\n")
+                    .contains("[13;2u")
+                    .then_some(())
+            },
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "Shift+Enter（CSI u）が tmux 越しに kitty 形式で届かない。{}",
+                e.observed(format!("画面={:?}", session.visible_lines().join("\n")))
+            )
+        });
         // 外側（tako の Term）には拡張キーモードが伝わらない（tmux の仕様）。
         // そのため UI 層はバックエンドペインで disambiguate を強制する（main.rs の
         // handle_key）。ここでは前提（伝わらない）が変わったら気づけるよう記録する
@@ -1591,19 +1942,24 @@ set -gq copy-mode-position-format ''
         // 素の \e は escape-time で正しく解釈され素のまま届く（その固定）
         session.write(b"\x1b".to_vec());
         session.write(b"ESC-RAW\r".to_vec());
-        let mut esc_delivered = false;
-        for _ in 0..50 {
-            if session.visible_lines().join("\n").contains("^[ESC-RAW") {
-                esc_delivered = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        assert!(
-            esc_delivered,
-            "Esc（素の \\e）が tmux 越しに素のまま届かない。画面: {:?}",
-            session.visible_lines().join("\n")
-        );
+        wait_for_state(
+            "Esc（素の \\e）のエコー `^[ESC-RAW`",
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(100),
+            || {
+                session
+                    .visible_lines()
+                    .join("\n")
+                    .contains("^[ESC-RAW")
+                    .then_some(())
+            },
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "Esc（素の \\e）が tmux 越しに素のまま届かない。{}",
+                e.observed(format!("画面={:?}", session.visible_lines().join("\n")))
+            )
+        });
         assert!(
             !session.visible_lines().join("\n").contains("27u"),
             "Esc が CSI 27u 断片として漏れている（2026-06-12 実機バグの回帰）。画面: {:?}",
@@ -1629,11 +1985,14 @@ set -gq copy-mode-position-format ''
         let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
         // 内側アプリ: SGR マウス要求 + raw mode + ESC を「^[」に可視化して即時 echo
         // （claude 等の raw mode TUI が受け取るバイト列の観測装置）
-        let inner = r#"stty raw -echo; printf '\033[?1000h\033[?1006h'; exec perl -e '$|=1; while (sysread(STDIN,$b,4096)) { $b =~ s/\x1b/^[/g; syswrite(STDOUT,$b) }'"#;
+        let inner = format!(
+            r#"stty raw -echo; {}exec perl -e '$|=1; while (sysread(STDIN,$b,4096)) {{ $b =~ s/\x1b/^[/g; syswrite(STDOUT,$b) }}'"#,
+            mouse_request_prelude(false)
+        );
         let options = SpawnOptions {
             command: Some(SpawnCommand {
                 program: "/bin/sh".into(),
-                args: vec!["-c".into(), inner.into()],
+                args: vec!["-c".into(), inner],
             }),
             cwd: Some(std::env::temp_dir()),
             env: vec![],
@@ -1643,21 +2002,41 @@ set -gq copy-mode-position-format ''
             crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, session_name))
                 .expect("tmux クライアントを spawn できる");
 
-        // 内側のマウス要求が外側端末モードへ伝わるのを待つ。
-        // rx（PtyWrite = tmux の端末クエリへの応答）を実運用の UI 層と同様に処理する
-        // （捨てると tmux クライアントが応答待ちのままになり、経路の再現にならない）
-        let mut mouse_on = false;
-        for _ in 0..100 {
-            while let Ok(event) = rx.try_recv() {
-                session.process_event(event);
+        // **アンカーは器のペイン側の要求**（#1252）。要求前に洪水を打つと器が
+        // 1 発目を食って copy-mode へ入り、2,100 イベント全部がスクロールに消える
+        // （= `intact=0` で「転送が死んでいる」に見える）。
+        // rx（PtyWrite = tmux の端末クエリへの応答）は実運用の UI 層と同様に毎周期
+        // 処理する（捨てると tmux クライアントが応答待ちのままになり、経路の再現にならない）
+        if legacy_1252() {
+            // TAKO_1252_LEGACY_ARM 開始（#1252 **前**の待ち。番犬はここを対象外にする）
+            // 旧アンカー: 外側 `mouse_reporting()` を固定 100 回窓で待つ
+            let mut mouse_on = false;
+            for _ in 0..100 {
+                while let Ok(event) = rx.try_recv() {
+                    session.process_event(event);
+                }
+                if session.mouse_reporting() {
+                    mouse_on = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            if session.mouse_reporting() {
-                mouse_on = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(mouse_on, "内側アプリのマウス要求が外側端末モードへ伝わる");
+            // TAKO_1252_LEGACY_ARM 終了
+        } else {
+            let pane = wait_pane_mouse_ready(&socket, session_name, || {
+                while let Ok(event) = rx.try_recv() {
+                    session.process_event(event);
+                }
+            })
+            .unwrap_or_else(|e| {
+                panic!(
+                    "内側アプリのマウス要求が器のペインへ届かない（#1252）。{e} 画面: {:?}",
+                    session.visible_lines().join("\n")
+                )
+            });
+            eprintln!("TAKO_1252: {} legacy=false", pane.describe());
         }
-        assert!(mouse_on, "内側アプリのマウス要求が外側端末モードへ伝わる");
 
         // 洪水: 慣性スクロール相当（2,100 イベント要求）を全速で連打
         for _ in 0..700 {
@@ -1667,32 +2046,31 @@ set -gq copy-mode-position-format ''
             }
         }
 
-        // 配送が安定するまで待つ（capture の intact 数が変化しなくなるまで）
-        let capture = || -> String {
-            crate::tmux::tmux_command(Some(&socket))
-                .args(["capture-pane", "-t", session_name, "-p", "-S", "-", "-J"])
-                .output()
-                .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-                .unwrap_or_default()
-        };
+        // 配送が安定するまで待つ（intact 数が 1 件以上 かつ 前周期と同数になるまで）。
+        // 予算切れでも **最後に観測した値をそのまま使う**（届いてはいるが増え続けている
+        // = 洪水がまだ飛行中、という状態は #167 の主題とは別物なので落とさない）
         const INTACT: &str = "^[[<64;6;6M";
-        let mut all = String::new();
-        let mut last_count = usize::MAX;
-        for _ in 0..50 {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            while let Ok(event) = rx.try_recv() {
-                session.process_event(event);
-            }
-            all = capture();
-            let count = all.matches(INTACT).count();
-            if count > 0 && count == last_count {
-                break;
-            }
-            last_count = count;
-        }
-
+        let mut last_count: Option<usize> = None;
+        let mut last_capture = PaneCapture::default();
+        let settled = wait_for_state(
+            "洪水の配送が安定する（intact >= 1 かつ前周期と同数）",
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_millis(200),
+            || {
+                while let Ok(event) = rx.try_recv() {
+                    session.process_event(event);
+                }
+                let capture = capture_pane_text(&socket, session_name);
+                let count = capture.text.as_deref().map(|t| t.matches(INTACT).count());
+                let stable = matches!((count, last_count), (Some(c), Some(l)) if c > 0 && c == l);
+                last_count = count;
+                last_capture = capture;
+                stable.then_some(())
+            },
+        );
+        let all = last_capture.text.clone().unwrap_or_default();
         let intact_count = all.matches(INTACT).count();
+
         // intact な SGR レポートを全部取り除いた残りに座標断片が残っていたら、
         // ESC 欠落断片がテキストとして内側へ届いている（= #167 の症状）
         let stripped = all.replace(INTACT, "");
@@ -1706,10 +2084,22 @@ set -gq copy-mode-position-format ''
                 .take(3)
                 .collect::<Vec<_>>()
         );
-        // レート制限が全イベントを殺していないこと（正常なレポートは届く）
+        // レート制限が全イベントを殺していないこと（正常なレポートは届く）。
+        // ここが #1252 の落ちどころだったので、**何を待って何が届いたか**を出す
+        // （`capture` の成否も含める = 「器を呼べなかった」と「呼べたが空」を混ぜない）
         assert!(
             intact_count > 0,
-            "SGR レポートが 1 件も届いていない（転送が死んでいる）。画面: {:?}",
+            "SGR レポートが 1 件も届いていない（転送が死んでいる）。{} {} 画面: {:?}",
+            settled
+                .as_ref()
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "配送は安定した".into()),
+            format_args!(
+                "{} / {}",
+                last_capture.note,
+                probe_pane_mouse(&socket, session_name).describe()
+            ),
             session.visible_lines().join("\n")
         );
         // レート制限が生きていること（2,100 イベントの洪水がそのまま流れていない。
@@ -1718,7 +2108,13 @@ set -gq copy-mode-position-format ''
             intact_count < 200,
             "洪水がレート制限されずそのまま転送されている（#167 の防御が消失）: {intact_count}"
         );
-        eprintln!("洪水 2100 イベント要求 → intact 配送 {intact_count} 件・断片ゼロ");
+        eprintln!(
+            "洪水 2100 イベント要求 → intact 配送 {intact_count} 件・断片ゼロ（{}・{}）",
+            last_capture.note,
+            settled
+                .map(|()| "配送は安定".to_string())
+                .unwrap_or_else(|e| format!("安定待ちは予算切れ: {e}"))
+        );
     }
 
     /// Esc 単押しが「kitty を要求していない」内側アプリ（素の zsh 相当）にも
