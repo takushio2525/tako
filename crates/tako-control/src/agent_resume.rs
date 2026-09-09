@@ -76,11 +76,21 @@ fn conversation_id_for_pid(agent: Agent, pid: u32) -> Option<String> {
 /// 候補が複数あれば**いちばん新しいもの**（pid の大きいもの）を採る
 /// （`codex_session::resolve_thread_ids_with` と同じ選び方）
 pub fn agent_pid_in(probe: &PaneProbe, snap: &ProcessSnapshot) -> Option<(Agent, u32)> {
+    // **ペインのプロセスそのものも見る**（`descendants_with_root`）。器のペインは
+    // ふつうログインシェルでエージェントはその子だが、コマンドを直接起動した
+    // ペイン（`tako run` / 器へ直に流し込んだ場合）ではエージェントがペイン
+    // プロセス自身になる。`descendant_pids` はペインの pid を除くので、そこだけを
+    // 見ると採り逃す（実測で踏んだ）
     let mut pids: Vec<u32> = match (&probe.backend, probe.pty_pid) {
-        (Some(backend), _) => snap.descendant_pids(backend),
+        (Some(backend), _) => snap
+            .pane_pids_of(backend)
+            .into_iter()
+            .flat_map(|pid| snap.descendants_with_root(pid))
+            .collect(),
         (None, Some(pid)) => snap.descendants_with_root(pid),
         (None, None) => return None,
     };
+    pids.dedup();
     pids.sort_unstable();
     pids.reverse();
     pids.into_iter()
@@ -141,6 +151,53 @@ mod tests {
         assert_eq!(agent_of_command("tail -f codex.log"), None);
         // claude はこの経路の担当ではない（`claude agents --json` が持つ）
         assert_eq!(agent_of_command("claude --resume abc"), None);
+    }
+
+    /// 器のペインの**プロセスそのもの**がエージェントでも見つける（実測で踏んだ穴）。
+    ///
+    /// ふつうペインはログインシェルでエージェントはその子だが、器へコマンドを
+    /// 直接起動した形（`tmux new-session … "codex"`）ではエージェントが
+    /// ペインプロセス自身になる。`descendant_pids` はペインの pid を除くので、
+    /// そこだけを見ると「動いているのに採れない」になる
+    #[test]
+    fn ペインプロセス自身がエージェントでも見つける() {
+        let snap = ProcessSnapshot::from_parts_for_test(
+            vec![("w1:0.0".into(), 100)],
+            HashMap::new(),
+            HashMap::from([(100u32, "/Users/testuser/.local/bin/agy".to_string())]),
+        );
+        let probe = PaneProbe {
+            pane: 1,
+            backend: Some("w1".into()),
+            pty_pid: None,
+        };
+        assert_eq!(agent_pid_in(&probe, &snap), Some((Agent::Agy, 100)));
+    }
+
+    /// 子として動いている通常の形（ログインシェル → codex）も従来どおり
+    #[test]
+    fn ペインの子で動くエージェントも見つける() {
+        let snap = ProcessSnapshot::from_parts_for_test(
+            vec![("w1:0.0".into(), 100)],
+            HashMap::from([(200u32, 100u32)]),
+            HashMap::from([
+                (100u32, "-zsh".to_string()),
+                (200u32, "/usr/local/bin/codex".to_string()),
+            ]),
+        );
+        let probe = PaneProbe {
+            pane: 1,
+            backend: Some("w1".into()),
+            pty_pid: None,
+        };
+        assert_eq!(agent_pid_in(&probe, &snap), Some((Agent::Codex, 200)));
+        // 器を持たないペイン（PTY 直下の子から辿る）も同じ答えになる
+        let no_backend = PaneProbe {
+            pane: 1,
+            backend: None,
+            pty_pid: Some(100),
+        };
+        assert_eq!(agent_pid_in(&no_backend, &snap), Some((Agent::Codex, 200)));
     }
 
     /// 会話の有無を見る先は「resume が実際に開くファイル」。
