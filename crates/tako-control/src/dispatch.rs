@@ -9610,7 +9610,7 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     let work_unobserved = agent_work_started != Some(true)
         && registry_agent
             .as_deref()
-            .and_then(|a| tako_core::agent_support::Agent::parse(a))
+            .and_then(tako_core::agent_support::Agent::parse)
             .is_some_and(|a| {
                 tako_core::agent_support::supports(
                     a,
