@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-09（#1137: 多重化が無いプラットフォームで無言の SSH 成功が畳まれないのを直した）
-- `pane` 経路 + 多重化なし（Windows）は `master_socket` が常に false で成功の出口が 1 つも無かった。規則 ⑥「**打った行を除いて**中身が出たら畳む」を追加（ゲートは `ConnectInputs::multiplexing` の値 = **macOS は 1 ビットも不変**）
-- 併発の穴（起点の陳腐化）も `ssh_progress::effective_from` で修正。`connecting` は rebase しないので相手が画面を消すと `new_lines` が全部空になっていた
-- A/B: 規則 ⑥ 無効化の注入で `無言の接続成功でも畳む` が FAILED / 打った行の除外を外すと `打った行だけでは畳まない` が FAILED。Windows 実機で単体 32 件緑・macOS 実 pane 経路は従来どおり `connecting`→`connected`
-
 ## 2026-09-09（#1238: 再起動後の復元で codex / agy も会話ごと戻るようにした）
 - 会話 ID は**生きたプロセスが開いているもの**から採れる（実測: codex 0.153.0 = `thread-writer-locks/<id>.lock`・起動直後から / agy 1.1.27 = `brain/<id>`・最初のターンの後）。`layout.json` へ `agent_resume`（系統 + ID）を `claude_session_id` と対称に保存し、`restore_plan` の分岐で `codex resume <id>` / `agy --conversation <id>` を投入する
 - 規則は `tako_core::agent_resume` へ 1 本化（保持 = #1076 の「確認してから外す」を一般化 / 書式 = `resume_spec` / 可否 = `restore_support`）。ID を引く実装は系統ごとのモジュール（#984 / #1033）へ委譲。**Windows は lsof が無く ID を採れない**ので、内訳の理由を `ID なし` と分けて `resume 非対応` に
@@ -73,6 +68,7 @@
 - 正本は `tako_core::scrollback`（既定 10,000 / 100〜100,000 / 24 B・セル）。`settings.json` の `scrollback_lines`（`#[serde(default)]` = 旧ファイルはそのまま読める・移行 Step 不要）→ CLI `tako scrollback [lines]` / MCP `tako_scrollback` / 設定画面「ターミナル」節が同じ dispatch を通る
 - **生存中のペインにもその場で当たる**（`Term::set_options` → `Grid::update_history` が `Row` を解放）。隔離 GUI 実測（119 桁・persist OFF・debug）: 起動 15 MB → 12,000 行で 46 MB（+31・理論 27.2）→ 上限 1,000 で 30 MB。上限を下げた後に作った新ペインは 12,000 行流しても +2.0 MB（理論 1.8）
 - 番犬: 実 PTY の単体 3 本（上限で打ち切る / 既定なら残る / 下げると既存も縮む）+ dispatch 1 本 + MCP / CLI マッピング各 1 本
+
 ## 2026-09-09（#1114: psmux の永続化 e2e の間欠失敗を待ち不足として直した）
 - 先にフェーズ別の余裕を実測: プロンプト待ちの固定 6 秒だけが**スイート並列（18 本）だけで既に超過**（6.1〜7.1s・`rounds=2` が 10/10）。4 多重 + 負荷 12 で 20〜34s になり 6 周を使い切って **9/16 FAILED**（全件 phase 1・画面は `PS …> Write-O` = 打鍵は届いていた）
 - 固定窓を全廃して**期限 + `wait_budget::state_wait_budget`** へ。`machine_busy()` を Windows でも読めるようにし（`GetSystemTimes`）、`sleep(800ms)`→`exists` は「接続クライアントが 1 でなくなった」状態待ちへ。番犬 `psmux_e2e_wait_watchdog` が修正前の 9 か所を名指しで落とす
