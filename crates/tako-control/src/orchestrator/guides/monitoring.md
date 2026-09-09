@@ -106,6 +106,16 @@ Recover by `kind` (also in `tako_orchestrator_worker_status` as
   CLI, not logged in, immediate exit, local runtime down). The `detail` already
   carries the reason and the next step; do that first (install / log in / start
   the runtime). Nudges and waiting cannot help, and respawning repeats it.
+- `execution_refused` (action: retry_spawn) — the CLI **did** start and the
+  instruction **did** arrive, but the agent refused to run for its own reason
+  (measured: agy waiting on an account-eligibility check). tako only reports
+  this when its primary signal shows the agent took **zero** steps, so the
+  worker did no work at all and holds no state worth keeping. Unlike
+  `launch_failed` nothing is broken, and unlike `entitlement_blocked` **time
+  does fix it**: wait a short while, then close the pane and spawn the same
+  instruction again. A continue nudge does nothing here (no turn ever started).
+  If repeated retries keep landing here, treat it as an account problem and
+  show the user the `detail` line.
 
 ### When you receive WORKER_STALLED
 

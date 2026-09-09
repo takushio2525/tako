@@ -19,40 +19,6 @@
 
 ---
 
-<<<<<<< HEAD
-## 2026-09-09（#1192: 隔離・テストの tmux サーバーを所有者の生死で安全に回収できるようにした）
-- `tako tmux cleanup --servers`（既定 dry-run・実削除は `--apply`）を追加。判定は名前ではなく**所有プロセスの生死**（自分 / 既定 / 生きた tako-app の env 復元 / attach 中 / 所有者不明 / 出来たて を除いた残りだけ回収可）。溜めない側は使い捨て backend（`tako-iso-<自分の pid>`）の終了時 self-kill
-- 実測: 本番置き場へ dry-run = 総数 1838 / 生存 126 / 回収可 116 / 残骸 1708 / 保護 14（何も消していない）。隔離した置き場のダミーで `--apply` = 生きた所有者は `owner_alive` で無傷・死んだ所有者だけ kill + ソケット削除
-- 番犬 2 本（修正前ソースで FAILED）+ 実物テスト 3 本 + 純粋 4 本。所有者の生死ガードを外す注入で必須テストが FAILED
-
-||||||| 253f56a
-## 2026-09-09（#1186: resize --reset が実際に window サイズを戻すようにした）
-- `reset_window_size` を `resize-window -A` → `set-window-option -u window-size` の 2 段へ。**順序は逆にできない**（`-A` が window-size を manual にする = 実測）。`-A` 失敗時も解除は行い**エラーはそのまま返す**
-- 真因は「オプション解除はその場でリサイズしない」こと。クライアントがその window を見ているあいだは偶然戻るので、**別 window / クライアント不在**のときだけ症状が出る（実測で切り分け）
-- 隔離 GUI 実測: 見ていない window 1 が 119x21 → 60x15 → reset で 119x21・option 空 / A/B `TAKO_1186_LEGACY=1` は `{"reset":true}` を返しつつ 60x15 のまま
-
-## 2026-09-09（#1192: 隔離・テストの tmux サーバーを所有者の生死で安全に回収できるようにした）
-- `tako tmux cleanup --servers`（既定 dry-run・実削除は `--apply`）を追加。判定は名前ではなく**所有プロセスの生死**（自分 / 既定 / 生きた tako-app の env 復元 / attach 中 / 所有者不明 / 出来たて を除いた残りだけ回収可）。溜めない側は使い捨て backend（`tako-iso-<自分の pid>`）の終了時 self-kill
-- 実測: 本番置き場へ dry-run = 総数 1838 / 生存 126 / 回収可 116 / 残骸 1708 / 保護 14（何も消していない）。隔離した置き場のダミーで `--apply` = 生きた所有者は `owner_alive` で無傷・死んだ所有者だけ kill + ソケット削除
-- 番犬 2 本（修正前ソースで FAILED）+ 実物テスト 3 本 + 純粋 4 本。所有者の生死ガードを外す注入で必須テストが FAILED
-
-=======
->>>>>>> origin/main
-## 2026-09-09（#1182: ターミナルのパスリンクに cmd+右クリックメニューを付けた）
-- 並びは `tako_core::path_menu`（純粋関数）・文言はツリー（#314）の `sidebar::menu_*` を委譲で共有。新規操作は「tako で開く」= `FileOpKind::OpenInTako` の 1 つだけで **cmd+クリック自身もそこを通す**（CLI `tako file open-in-tako` / MCP `op=open_in_tako`）
-- **前提として `links::combined_screen_text` の soft wrap 判定を直した**: 実画面の行は空白詰めなので旧判定では全行が折り返し扱いになり、隣接 2 行に何か書かれているだけでパスリンクが 1 つも検出されなかった（A/B: 旧式で新テストが FAILED）
-- 項目 147（合成マウスの実配送 + 実矩形 + 前提の ui-mode 倒し・unix 限定）/ CLI・MCP e2e を隔離 GUI で実測 / 実フレーム PNG 2 枚 / `TAKO_1182_LEGACY=1` で 147 が確定 FAILED。全 3711 件緑
-
-## 2026-09-09（#1191: `tako list` の `backend_windows` を右パネルの表示状態から切り離した）
-- 採取が fleet ビューの 2 秒ポーリングだけだったのを `Request::List` の直前 1 回（`list-windows -a` = 6.9ms 中央値。`fetch_tmux_sessions` は 37ms）へ。backend ペインが無ければ tmux を起動せず、500ms 以内は使い回すので連打でも 2 回/秒（実測 889 req/30s → 56 回）
-- `null`（backend でない / 採取不能）と `[]`（backend だが window 無し）を読み分け可能に。1 window の器も載る（旧実装は 2+ のみ）。待機時の追加コストは 0 回 / CPU 差は誤差
-- A/B `TAKO_1191_LEGACY=1` は Issue の 2 症状（常に null / 開くと埋まり閉じると陳腐化）を再現。番犬 3 本 + dispatch 1 本 + tako-core 2 本 + セルフテスト項目 61g
-
-## 2026-09-09（#1220: 一覧付与のコスト検査を実時間から量へ替え、番犬を tests 全体へ広げた）
-- `warm <= cold`（実時間比較）を廃し、`claude_remote_link::scan_counters`（走査回数 / 読み出しバイト数 / 所在探索回数・**スレッドローカル**）で測る形へ。生きている会話への追記ぶんは予算へ足す
-- 番犬 `test_timing_watchdog`（`crates/*/tests` の assert 条件部に実時間の値が 2 つ以上ある形だけを落とす。コメント / 文字列は潰して見る）を新設。修正前ファイルで `remote_link_live.rs:247: warm <= cold` を名指しして FAILED
-- A/B（`yes` 36 / 72 本の負荷・交互 40 回）: 旧 2/40 FAILED（初回 34.3ms / 2 回目 45.7ms で反転）・新 0/40。memo 無効化の注入で新は確定 FAILED（20 走査 10 MB）・旧は 9/10 見逃し
-
 ## 2026-09-09（#1206: README に Windows のインストール手順を足した）
 - インストール節を macOS 2 節 + Windows 1 節へ（`.exe` = 標準・管理者権限不要 / `.zip` = ポータブル / SmartScreen / psmux）。冒頭を「macOS 11.0 以降 + Windows 10 1809 以降 x64」へ直し、永続化の説明に psmux を併記
 - 数値・アセット名は `release_assets` と直近リリースの実アセットから引き、docs の「方法 C」と同文・同数値。マトリクス note（Issue の 3 点目）は生成物なので #1204 の担当（CI の `gen-windows-support-docs.mjs --check` が同期を強制している）
@@ -95,13 +61,6 @@
 - **剥がすのはパーサへ渡す本文だけ**（編集・保存の生テキストには触らないので BOM 付きファイルは保存しても BOM を保つ）
 - 隔離 GUI 実測: BOM 付き `README.md` の `preview-outline` が BOM 無しと同一（`sample project` level=1 block=0）。A/B 3 アーム（パース / 描画 / 先頭 1 個だけ）が確定 FAILED。全 3769 件緑
 
-<<<<<<< HEAD
-## 2026-09-09（#1033: agy に一次シグナルを与え、完了検知を claude 同等にした）
-- 前提の訂正: 「agy の会話は SQLite だけ」は実態とズレ。`brain/<id>/.system_generated/logs/transcript.jsonl` が逐次追記される平文 JSONL（**依存追加なし**）。ペイン → 会話は生きた agy が開いたままの `brain/<id>` を lsof で引く
-- `agy_session` を新設し `status_source=agy-session` / `report` の transcript 層 / 送達の一次証拠（`USER_INPUT`）へ配線。補正層の権威判定は `is_live_log_source` の 1 実装へ寄せた（**ここを忘れると `has_children` で永久 busy** = #571 / #984 と同じ罠を実機で踏んだ）
-- 隔離 GUI での A/B 実測（北極星と同じ測り方・各 3 標本）: 検知遅延の中央値 39.46s → **13.92s**（claude 15.40 / codex 11.68 と同水準）。`report` は scrollback/messages 0 → transcript/`transcript_agent=agy`/messages 1〜2。偽 idle は増えず watch の偽イベント 0 件
-||||||| 253f56a
-=======
 ## 2026-09-09（#989: ゼロスタート導入を claude 専用から 3 系統へ広げた）
 - `agent_install::AgentKind` を 3 値・`recipe(platform, agent)` を 6 マスへ（codex / agy の公式手順は実物で確認。codex は代行時 `CODEX_NON_INTERACTIVE=1` が必須 = 無いと `Start Codex now?` で返らない・agy は単一バイナリ）。`setup_bootstrap` の全操作を `_for(agent)` へ寄せ、**引数なしの claude 既定入口は残していない**
 - setup は「1 つでも使える系統があれば素通り / 無いときだけ途中まで入っているものを優先して仕上げる」形へ（単一選択を強制しない）。認証誘導・失敗案内・CLI 解決のフォールバックも系統ごと。Windows で代行するのは claude だけ（宣言 2 か所）
@@ -112,4 +71,12 @@
 - 「メインスレッド専有」は `mark_main_thread()` 済みのプロセスだけが名乗る。`setup` の移設と #577 e2e の後始末も隔離に合わせた（実ユーザーの setup / 残骸掃除が壊れる穴を先に塞いだ）
 - 番犬 `test_write_isolation`（空 HOME で子を起こし 0 ファイル）+ A/B `TAKO_944_LEGACY=1`。実測 36 → 0 ファイル。副産物で `ensure_trusted` が置き場ごと無い環境で黙って失敗する穴も直した
 
->>>>>>> origin/main
+## 2026-09-09（#1033: agy に一次シグナルを与え、完了検知を claude 同等にした）
+- 前提の訂正: 「agy の会話は SQLite だけ」は実態とズレ。`brain/<id>/.system_generated/logs/transcript.jsonl` が逐次追記される平文 JSONL（**依存追加なし**）。ペイン → 会話は生きた agy が開いたままの `brain/<id>` を lsof で引く
+- `agy_session` を新設し `status_source=agy-session` / `report` の transcript 層 / 送達の一次証拠（`USER_INPUT`）へ配線。補正層の権威判定は `is_live_log_source` の 1 実装へ寄せた（**ここを忘れると `has_children` で永久 busy** = #571 / #984 と同じ罠を実機で踏んだ）
+- 隔離 GUI での A/B 実測（北極星と同じ測り方・各 3 標本）: 検知遅延の中央値 39.46s → **13.92s**（claude 15.40 / codex 11.68 と同水準）。`report` は scrollback/messages 0 → transcript/`transcript_agent=agy`/messages 1〜2。偽 idle は増えず watch の偽イベント 0 件
+
+## 2026-09-09（#1034: 送達後に実行を断られた worker を完了と誤読しないようにした）
+- `execution_refused`（`WorkerErrorKind` / `AgentCliProblem` の新分類・`recommended_action = retry_spawn`）を追加。**#983 のゲートは緩めず**、別ゲート「一次シグナルで作業を 1 歩も観測していない」で分類する（画面推定の busy は TUI の起動描画を拾うので使えない）
+- 判定の文言は系統ごとに宣言（`execution_refused_patterns`）。実採取は agy のみで**版で文言が変わる**（1.1.22 = `Verifying your account` / 1.1.27 = `Unable to verify account eligibility`）ので共通語 `account eligibility` を軸にした。claude 2.1.258 / codex 0.153.0 のバイナリに一時的な検証待ちの文言が無いことは実物の走査で確認
+- MATRIX に `worker_refusal_detect` を新設し docs を同期。番犬 4 本 + dispatch の e2e 1 本 + 単体 8 本。A/B は `TAKO_1034_LEGACY=1`
