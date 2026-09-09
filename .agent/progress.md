@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-09（#944: cargo test が本番の data dir と HOME 配下の設定へ書かないようにした）
-- 置き場を決める側を倒した: `paths::data_dir()` が**実行時に**テストバイナリを見分けて隔離先へ（`cfg(test)` はクレートを跨がない）＋ `orchestrator::agent_config_home()` の `cfg(test)` 隔離＋単体テストからは `claude agents --json` を起こさない
-- 「メインスレッド専有」は `mark_main_thread()` 済みのプロセスだけが名乗る。`setup` の移設と #577 e2e の後始末も隔離に合わせた（実ユーザーの setup / 残骸掃除が壊れる穴を先に塞いだ）
-- 番犬 `test_write_isolation`（空 HOME で子を起こし 0 ファイル）+ A/B `TAKO_944_LEGACY=1`。実測 36 → 0 ファイル。副産物で `ensure_trusted` が置き場ごと無い環境で黙って失敗する穴も直した
-
 ## 2026-09-09（#1030: テスト由来の事前信頼エントリの掃除口を用意した）
 - 書き先は #944 で塞ぎ済み。残骸掃除に `scripts/clean-trust-residue.sh`（dry-run 既定・`--apply` で退避つき削除）と偽 HOME のモックテスト 10 件（CI 登録）を追加
 - 番犬へ `claudeの設定エントリはテスト実行で増えない`（種を置いた HOME で子を回し件数不変を実測。A/B `TAKO_944_LEGACY=1` で増える）
@@ -78,3 +73,8 @@
 - `setup-mcp` の help（書き先は `~/.claude.json` / `<cwd>/.mcp.json`・claude 以外にも登録）と `--agent-effort` の「agy は無視」（#1002 で否定済み）を訂正。同じずれが残っていた protocol / MCP catalog / `orchestrator/agent.rs` / `mod.rs` / `.agent/orchestrator.md` も同時に直した
 - 再発防止は**文どうしを比べない**形: 書き先は `dispatch::mcp_target_path`（`MCP_TARGET_FILE_*` へ切り出し）、能力は `agent_support` の `effort_control` と突き合わせる。番犬 3 本（CLI の実 `--help` 2 本 + 全 rs / md 走査 1 本）
 - A/B: 旧文言へ戻すと 3 本とも FAILED（`main.rs:2023` / `agent.rs:165` を行番号で名指し）。全 3892 件緑
+
+## 2026-09-09（#1081: GUI 章の撮り直しは画面ロックで着手できず・収録開始条件を 3 つに定義した）
+- 10:51〜12:22 の 90 分（30 秒 × 180 回）待って **180 回すべて施錠のまま**。`screencapture` は終始 `could not create image from rect` で、収録には入っていない（素材・完成品は前回のまま・隔離 tako も起動なし）
+- 収穫は判定条件: **HID idle 単独は誤発火する**（施錠中も伸びる。10:50 実測で idle 165 秒 > 120 秒でも撮れない）。「解錠 + tako-vd 使用可 + idle 120 秒以上 + `screencapture` の試し撮り」の 4 段を plan へ明文化
+- 次: 解錠後に `record-explainer.sh guimode` → `pii-scan.sh` → `build-explainer.sh … v5.mp4`
