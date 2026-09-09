@@ -81,6 +81,19 @@ pub trait SessionHost {
     /// テキストの送信代行: 貼り付けせず Enter を送り、入力欄が空へ戻るまで
     /// 単独再送する。既定実装は何もしない（テスト用モック等）
     fn queue_enter_flow(&mut self, _pane: PaneId) {}
+
+    /// ペインへの送達フローの顛末（Issue #1259）。フローが積まれていなければ None。
+    ///
+    /// `tako_send_input(await_prompt=true)` は `{"queued": true}` を即返すので、
+    /// **その後どうなったかを問う口がここ**になる（`tako_read_pane` の `delivery` /
+    /// `tako send --await-prompt` の `[delivery]` 行）。旧実装は保留・打ち切りを
+    /// `eprintln!` へしか出さず、後続 send の未達は worker レジストリからも
+    /// 弾かれていた（`record_prompt_delivery_at` は spawn 専用）ので、
+    /// 「queued: true なのに何も起きない」を誰も観測できなかった。
+    /// 既定は None（GUI が居ない host では騙らない。`ssh_connect_state` と同規約）
+    fn prompt_delivery_state(&self, _pane: PaneId) -> Option<Value> {
+        None
+    }
     /// **新規に作ったペイン**の素のシェルへ起動コマンドを送達確認つきで送る（Issue #640）。
     ///
     /// `queue_write` で本文 + Enter を書きっぱなしにすると、器（psmux）が入力を

@@ -73,3 +73,8 @@
 - 先にフェーズ別の余裕を実測: プロンプト待ちの固定 6 秒だけが**スイート並列（18 本）だけで既に超過**（6.1〜7.1s・`rounds=2` が 10/10）。4 多重 + 負荷 12 で 20〜34s になり 6 周を使い切って **9/16 FAILED**（全件 phase 1・画面は `PS …> Write-O` = 打鍵は届いていた）
 - 固定窓を全廃して**期限 + `wait_budget::state_wait_budget`** へ。`machine_busy()` を Windows でも読めるようにし（`GetSystemTimes`）、`sleep(800ms)`→`exists` は「接続クライアントが 1 でなくなった」状態待ちへ。番犬 `psmux_e2e_wait_watchdog` が修正前の 9 か所を名指しで落とす
 - A/B（修正前後の 2 バイナリを同一ラウンドで交互）: before **6/24** → after **0/24**。追加で after 0/100。副産物で **#1264**（main の Windows `cargo test --workspace` がコンパイル不能）を起票
+
+## 2026-09-09（#1259: send_input が queued:true を返して無音で届かない問題を直した）
+- 真因は**顛末の記録が後続 send では全経路空振り**すること。`record_prompt_delivery_at` は先頭で `if flow != SpawnPrompt { return }`（spawn 専用）・保留と打ち切りは `eprintln!`（GUI の stderr は誰も読めない）・`persist.log` へ書くのは貼り付け段へ到達した後の `try_peer` / `log_fallback` だけ。本番の pane 1627 は `送達:` 行が 1 本も無く（同時刻の他ペインは記録あり）、`WaitPromptReady` で `input_line` が唯一の入口という穴と、peer の背景試行・起動コマンド待ちの**上限なしの待ち**が重なっていた（Issue の見立て「busy だと送らない」は否定 = 送達フローは `has_running_children` を参照しない）
+- 語彙と方針を `tako_core::prompt_delivery` の 1 本へ（`Stall` 11 種 + `Journal` の心拍 15 秒 + `peer_wait` の段階判定）。応答は `tako_send_input` / `tako_read_pane` の `delivery`、CLI は `[delivery]` 行、`persist.log` は `送達フロー: pane=… 理由=…`。peer は 25 秒で諦めるが**送る前の段階だけ**キー経路へ落ちる（判定は `PeerAttemptState` の CAS。段階を読むだけでは読んだ直後に背景スレッドが書き始めて二重投函になる = #790 の不変条件）
+- A/B `TAKO_1259_LEGACY=1` で無音と無限待ちを再現（実ファイル検証）。番犬 6 本のうち 5 本が修正前 `main.rs` を行番号で名指し（6440 / 6445 / 6457 / 6472 / 6738 / 6797）。模擬 TUI e2e（`sleep 3600` の子を抱えた idle ペイン）で送達成立を実測

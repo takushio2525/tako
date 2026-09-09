@@ -7937,6 +7937,39 @@ fn print_gate_result(result: &Value) {
     }
 }
 
+/// 送達フローの顛末を 1 行で出す（Issue #1259。MCP の `delivery` と同じ材料）。
+///
+/// `tako_send_input` / `tako send --await-prompt` は `queued: true` を即返すので、
+/// **その後どうなったか**を問える口がここ。理由コードは `persist.log` の
+/// 「送達フロー:」行と同じ語彙（`tako_core::prompt_delivery`）
+fn print_delivery(result: &Value) {
+    if let Some(line) = delivery_line(result) {
+        eprintln!("{line}");
+    }
+}
+
+/// `[delivery] …` の 1 行を組む（機械検証できるよう印字と分けてある）
+fn delivery_line(result: &Value) -> Option<String> {
+    let d = result.get("delivery").filter(|v| !v.is_null())?;
+    let mut line = format!("[delivery] state={}", d["state"].as_str().unwrap_or("?"));
+    if let Some(reason) = d["reason"].as_str() {
+        line.push_str(&format!(" reason={reason}"));
+    }
+    if let Some(outcome) = d["outcome"].as_str() {
+        line.push_str(&format!(" outcome={outcome}"));
+    }
+    if let Some(transport) = d["transport"].as_str() {
+        line.push_str(&format!(" transport={transport}"));
+    }
+    if let Some(secs) = d["elapsed_secs"].as_u64() {
+        line.push_str(&format!(" elapsed={secs}s"));
+    }
+    if let Some(note) = d["note"].as_str() {
+        line.push_str(&format!("（{note}）"));
+    }
+    Some(line)
+}
+
 fn print_result(command: &Command, result: &Value) {
     match command {
         // 新ペイン ID をそのままスクリプトで使えるよう数値のみ出力する
@@ -7956,7 +7989,11 @@ fn print_result(command: &Command, result: &Value) {
                     status["text"].as_str().unwrap_or(""),
                 );
             }
+            print_delivery(result);
         }
+        // #1259: 送達は queued が即返るだけなので、顛末の入口を必ず 1 行出す
+        // （MCP の応答に delivery を足したので CLI にも同じものを出す = 1:1）
+        Command::Send(_) => print_delivery(result),
         Command::Scroll(_) => println!("{result}"),
         Command::List => {
             println!("{}", pretty_json(result));
@@ -8352,6 +8389,30 @@ mod tests {
             }
             _ => panic!("想定外の Command（run 以外にパースされた）"),
         }
+    }
+
+    /// #1259: MCP の `delivery` と同じ材料を CLI も 1 行で出す（1:1）。
+    /// 応答に `delivery` が無い（GUI が居ない host 等）ときは何も出さない
+    #[test]
+    fn issue1259_deliveryの1行が理由と経過を出す() {
+        let status = tako_core::prompt_delivery::Status::waiting(
+            tako_core::prompt_delivery::Stall::NoInputBox,
+            42,
+        );
+        let result =
+            serde_json::json!({ "queued": true, "pane": 1627, "delivery": status.to_json() });
+        let line = delivery_line(&result).expect("delivery があれば 1 行出る");
+        assert!(line.starts_with("[delivery] state=waiting"), "{line}");
+        assert!(line.contains("reason=no_input_box"), "{line}");
+        assert!(line.contains("elapsed=42s"), "{line}");
+        assert!(
+            delivery_line(&serde_json::json!({ "queued": true })).is_none(),
+            "delivery が無ければ出さない"
+        );
+        assert!(
+            delivery_line(&serde_json::json!({ "delivery": serde_json::Value::Null })).is_none(),
+            "null なら出さない"
+        );
     }
 
     #[test]
