@@ -24,6 +24,7 @@
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Value;
     use std::path::{Path, PathBuf};
 
     /// 子プロセスを起こすときの目印（これが無ければ子の本体は走らない）
@@ -211,6 +212,61 @@ mod tests {
             "旧挙動で codex の設定が出ない: {created:#?}"
         );
         assert!(has(".gemini/"), "旧挙動で agy の設定が出ない: {created:#?}");
+    }
+
+    /// #1030: **claude の設定エントリ数がテスト実行で変わらない**。
+    ///
+    /// 「何も作られない」（上の番犬）とは別に、**既にある設定ファイルを書き換えない**ことを見る。
+    /// 実害はこちらで、ユーザーの生きた `~/.claude.json` に一時ディレクトリの事前信頼が
+    /// 数千件積もっていた（実測: `~/.claude.json` 2,573 件中 2,216 件がテスト由来）
+    #[test]
+    fn claudeの設定エントリはテスト実行で増えない() {
+        let seed = r#"{"installMethod":"brew","projects":{"/work/real-project":{"hasTrustDialogAccepted":true}}}"#;
+
+        let prepare = |tag: &str| -> PathBuf {
+            let home = scratch(tag);
+            std::fs::create_dir_all(home.join(".claude")).expect(".claude を作れる");
+            for name in [".claude.json", ".claude/.claude.json"] {
+                std::fs::write(home.join(name), seed).expect("種ファイルを書ける");
+            }
+            home
+        };
+        let projects = |path: &std::path::Path| -> Vec<String> {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|v| v.get("projects").and_then(|p| p.as_object()).cloned())
+                .map(|m| {
+                    let mut keys: Vec<String> = m.keys().cloned().collect();
+                    keys.sort();
+                    keys
+                })
+                .unwrap_or_default()
+        };
+
+        // 修正後: 2 ファイルとも 1 件のまま
+        let home = prepare("cfgcount");
+        let (ok, stdout, _) = run_child(&home, None, false);
+        assert!(ok, "子テストが失敗した\n{stdout}");
+        for name in [".claude.json", ".claude/.claude.json"] {
+            assert_eq!(
+                projects(&home.join(name)),
+                vec!["/work/real-project".to_string()],
+                "{name} のエントリが変わった（#1030）"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&home);
+
+        // A/B: 隔離を切ると同じ子がエントリを足す
+        let home = prepare("cfgcount-legacy");
+        let (ok, stdout, _) = run_child(&home, None, true);
+        assert!(ok, "子テストが失敗した\n{stdout}");
+        let after = projects(&home.join(".claude/.claude.json"));
+        assert!(
+            after.len() > 1,
+            "旧挙動でエントリが増えていない（検出力が無い）: {after:?}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// data dir の隔離が**明示の `TAKO_DATA_DIR` を上書きしない**こと（受け入れ条件のエッジ）。
