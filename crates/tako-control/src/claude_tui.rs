@@ -1162,6 +1162,21 @@ mod tests {
 ────────────────────────────────────────────────────
   ctx  20% ██░░░░░░░░"#;
 
+    /// claude 2.x の信頼ダイアログ（**番号なし・選択肢 2 つ**の実採取。#1223）。
+    /// 版によって番号なしで出るぶんが漏れていた形。既定は `No, exit` なので
+    /// ラベル一致の検証なしに Enter を送ってはいけない
+    const TRUST_DIALOG_NO_NUMBER: &str = r#" Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source
+ project, or work from your team). If not, take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ > No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel"#;
+
     #[test]
     fn 信頼ダイアログを検出する() {
         let lines = screen(TRUST_DIALOG);
@@ -2201,6 +2216,31 @@ Bash ツールで「touch /tmp/te439/approval-test.txt」を実行して
         let bypass = detect_choice_dialog(&screen(BYPASS_DIALOG)).expect("検知される");
         assert_eq!(bypass.kind, DialogKind::Bypass);
         assert!(bypass.kind.auto_accepted());
+    }
+
+    #[test]
+    fn issue1223_番号なし二択の信頼ダイアログも種別と選択肢が取れる() {
+        let lines = screen(TRUST_DIALOG_NO_NUMBER);
+        // 入力欄はダイアログに奪われている（プロンプト送信不可）
+        assert!(is_choice_dialog(&lines));
+        assert!(is_trust_dialog(&lines));
+        assert_eq!(detect(&lines), ClaudeScreen::TrustDialog);
+        assert!(
+            input_line(&lines).is_none(),
+            "選択カーソルを入力欄と誤認しない"
+        );
+
+        let dialog = detect_choice_dialog(&lines).expect("検知される");
+        assert_eq!(dialog.kind, DialogKind::Trust);
+        assert!(!dialog.numbered, "番号キーでは確定できない");
+        assert_eq!(
+            dialog.labels(),
+            vec!["No, exit", "Yes, I trust this folder"]
+        );
+        // 既定は `No, exit`。ここを取り違えると worker を落とす
+        assert_eq!(dialog.highlighted, Some(0));
+        assert!(dialog.cursor_visible);
+        assert!(!dialog.labels_truncated(), "ラベル一致で確定できる");
     }
 
     #[test]

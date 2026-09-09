@@ -19,12 +19,6 @@
 
 ---
 
-## 2026-09-09（#1200: respond が生きているペインへ in-process 経路で届くようにした）
-- 真因は「到達判定を通っていなかった」。器のセッション名を必須にし `reach::detached_session` へ直行 →
-  入力送出を持たない psmux では必ず失敗・器なしのペインは対象外（セルフテストも skip されていた）
-- 届き方を `reach::DialogAccess` へ出し `dialog_access` が in-process を先に見る形へ。手順は
-  `respond_via` の 1 実装で共有し監査へ `route=`。実機 A/B で Issue と同一エラー → `DELIVERED=1`
-
 ## 2026-09-09（#1203: UI の macOS キー表記を正本経由にし、Windows で実際のキーを出すようにした）
 - 6 か所（タブバー `⌘K` / git コミット欄 / プレビュー保存 / 確認ダイアログ / 設定 / `ui-mode` の next_step）と走査で見つかった同型 4 件を `tako_core::platform::keys` と `keybindings::shortcut_hint_for(action, platform)` へ。macOS の文言は 1 文字も不変
 - **バインド表に無い「修飾 + クリック / Enter」は Windows で案内ごと落とす**（Win キーは押せない = #763）。`key_bindings()` の `cfg` をやめ `bindings_for(platform)` にしたので macOS の CI から Windows 側を検証できる
@@ -74,6 +68,11 @@
 - 真因は時間でも共有状態でもなく**入力の偶然**。`ツリーに出ていないルートは拒否される` が「未知の id」に `fx.root_id().to_uppercase()` を使っていたが、id は 12 桁の小文字 16 進なので (10/16)^12 ≒ 1/280 で数字だけになり、その回は大文字化しても実在の id のまま素通りしていた（fixture のパスに pid が入る = 綴りが毎回変わる）
 - 綴り違いは長さで必ず外れる形（1 文字短い / 長い）へ替え、大小文字の区別は英字入りの id を据える別テストへ分離。番犬 `root_id_case_watchdog.rs` が修正前ソースの `remote_files.rs:2240` を名指しで落とす
 - A/B（`remote_files::tests::` 全体・同一条件）: 修正前 12/4000 FAILED（落ちた 12 件の id はすべて数字だけ）/ 修正後 0/5000（高負荷 load 15.9・並列度 1 と既定の両方）。全 3848 件緑
+
+## 2026-09-09（#1223: 番号なし・選択肢 2 つの信頼ダイアログを検知して respond できるようにした）
+- 番号なし経路の「兄弟 3 行以上」を、**兄弟 2 行のときだけ「並びの直後に確定キーの案内があるか」**で補強（`dialog::confirm_hint_below`）。codex の入力待ち画面（入力行 + 直下のステータス行）は案内が無いので従来どおり非検知
+- 隔離 GUI 実測（Windows 実機 + macOS）: 下見が `kind=trust` / 2 件 / `highlighted=0`、`--choice trust` が `Down`→ラベル一致検証→`Enter` で `resolved=true`。相手側 TUI も受領を表示
+- A/B `TAKO_1223_LEGACY=1` は両 OS で Issue と同じ「選択肢ダイアログが見つからない」を再現。案内の根拠を外す注入で新旧 2 テストが FAILED。全 3785 件緑
 
 ## 2026-09-09（#1034: 送達後に実行を断られた worker を完了と誤読しないようにした）
 - `execution_refused`（`WorkerErrorKind` / `AgentCliProblem` の新分類・`recommended_action = retry_spawn`）を追加。**#983 のゲートは緩めず**、別ゲート「一次シグナルで作業を 1 歩も観測していない」で分類する（画面推定の busy は TUI の起動描画を拾うので使えない）
