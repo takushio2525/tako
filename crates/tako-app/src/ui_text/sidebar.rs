@@ -28,6 +28,17 @@ pub fn menu_open_default() -> &'static str {
 pub fn menu_open_with() -> &'static str {
     tr!("このアプリで開く...", "Open with...")
 }
+/// ターミナル内のパスを cmd+クリックして開けなかったときの理由（#1283）。
+///
+/// この経路は以前 `eprintln!("warning: パスを開けない")` だけで、GUI の stderr は
+/// 誰も読めないので**押しても無言**だった。サイドバーの通知（`remote_notice` =
+/// リモート専用ではなく共有の通知欄）へ出して読める形にする
+pub fn notice_open_failed(path: &str, reason: &str) -> String {
+    tr!(
+        format!("パスを開けません（{path}）: {reason}"),
+        format!("Cannot open path ({path}): {reason}")
+    )
+}
 pub fn menu_rename() -> &'static str {
     tr!("名前変更", "Rename")
 }

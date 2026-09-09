@@ -43,6 +43,12 @@ pub(super) fn build_request(
             lines: u64_arg(args, "lines")?.map(|n| n as usize),
             tmux_session: str_arg(args, "tmux_session")?,
         },
+        "tako_links" => Request::Links {
+            pane: u64_arg(args, "pane")?,
+            text: str_arg(args, "text")?,
+            cols: u64_arg(args, "cols")?.map(|n| n as usize),
+            cwd: str_arg(args, "cwd")?,
+        },
         "tako_tmux_list" => Request::TmuxList {
             socket: str_arg(args, "socket")?,
         },

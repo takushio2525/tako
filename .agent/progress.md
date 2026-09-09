@@ -19,21 +19,6 @@
 
 ---
 
-## 2026-09-09（#1022: #571 e2e が本番の事前信頼エントリを残さないようにした）
-- `E2e571Guard::drop` で `remove_e2e_trust_entry(&dir/work)` を呼ぶ形へ（#612 / #577 と同じ後始末）。この e2e は worker を既定 config dir で走らせるので隔離では倒せない
-- 番犬 `e2e_trust_cleanup_watchdog`（`impl Drop for E2e…Guard` を走査して後始末の欠落を名指し）。`#[ignore]` の本体は CI で走らないのでここだけが再発を止める
-- A/B: 後始末を外すと `crates/tako-control/src/dispatch.rs: E2e571Guard` を名指しで FAILED
-
-## 2026-09-09（#992: agent 別のセットアップガイドと縮退の明記を docs へ入れた）
-- 系統別ガイド 5 ページ（`docs/.../agents/` = 選び方 / claude / codex / agy / ローカル LLM）を新設し、サイドバーに「エージェント CLI」群を追加。#357 の agy 利用制限の調査結果と、getting-started の `settings.json` ドリフト（正は `~/.claude.json` / `.mcp.json`）もここで回収
-- `gen-agent-support-docs.mjs` に**系統ごとの縮退ダイジェスト**（理由でまとめた degraded / pending / unsupported）を足して `agent-support.md` を再生成。生成物なので手書きと違ってずれない
-- OG が #982 以降落ちていた（`agent-support` が `SECTIONS` 未分類で `npm run og` が例外で止まる）ので分類を足して再生成。24 → 30 枚
-
-## 2026-09-09（#1137: 多重化が無いプラットフォームで無言の SSH 成功が畳まれないのを直した）
-- `pane` 経路 + 多重化なし（Windows）は `master_socket` が常に false で成功の出口が 1 つも無かった。規則 ⑥「**打った行を除いて**中身が出たら畳む」を追加（ゲートは `ConnectInputs::multiplexing` の値 = **macOS は 1 ビットも不変**）
-- 併発の穴（起点の陳腐化）も `ssh_progress::effective_from` で修正。`connecting` は rebase しないので相手が画面を消すと `new_lines` が全部空になっていた
-- A/B: 規則 ⑥ 無効化の注入で `無言の接続成功でも畳む` が FAILED / 打った行の除外を外すと `打った行だけでは畳まない` が FAILED。Windows 実機で単体 32 件緑・macOS 実 pane 経路は従来どおり `connecting`→`connected`
-
 ## 2026-09-09（#1238: 再起動後の復元で codex / agy も会話ごと戻るようにした）
 - 会話 ID は**生きたプロセスが開いているもの**から採れる（実測: codex 0.153.0 = `thread-writer-locks/<id>.lock`・起動直後から / agy 1.1.27 = `brain/<id>`・最初のターンの後）。`layout.json` へ `agent_resume`（系統 + ID）を `claude_session_id` と対称に保存し、`restore_plan` の分岐で `codex resume <id>` / `agy --conversation <id>` を投入する
 - 規則は `tako_core::agent_resume` へ 1 本化（保持 = #1076 の「確認してから外す」を一般化 / 書式 = `resume_spec` / 可否 = `restore_support`）。ID を引く実装は系統ごとのモジュール（#984 / #1033）へ委譲。**Windows は lsof が無く ID を採れない**ので、内訳の理由を `ID なし` と分けて `resume 非対応` に
@@ -73,3 +58,13 @@
 - 判定を `cfg(test)` から実行時 `paths::is_verification_process()`（テストバイナリ **または** `TAKO_ISOLATED` / `TAKO_SELF_TEST` / `TAKO_VISUAL_TEST`）へ。GUI セルフテストは製品バイナリなので `cfg(test)` が 1 ビットも効いていなかった。書き先は `<temp>/tako-agent-config-<pid>/` で終了時に片付く
 - 履歴は **`HISTFILE` だけでは対話 zsh に効かない**（macOS の `/etc/zshrc` が無条件で代入する）ので、rc の後に走る precmd で当て直す（`zshenv.zsh` の `TAKO_VERIFY_HISTFILE`）。brew は #944 と同型の門番で単体テストから起こさない
 - 空 HOME の実測（`cargo test --workspace`）: Homebrew 698 → 0 ファイル / シェル履歴 1 → 0 行。A/B `TAKO_1253_LEGACY=1` で両方とも旧挙動が再現。番犬 3 本（走査）+ 挙動 2 本、修正前ソースで 3 本とも FAILED
+
+## 2026-09-09（#1271: psmux の後始末に期限をつけて器のリークを止めた）
+- 真因は二段: 後始末が素の `Command::output()` で**期限なし**に待つ（返らない回はテストごと固まり Drop が全部走らない）ことと、**本体が先に退役した後の `__warm__` サーバーは `display-message` に映らない**こと（実測: 注入時 10 ソケット中 9 個が `server_pid=None`・残骸は全部 `__warm__`）。消せるのは `kill-server` だけ
+- psmux を叩く経路を `tests/common/psmux_ctl.rs` の 1 実装へ（期限つき + 出力は一時ファイル + pid を聞く → `kill-server` → `taskkill /PID /T /F` → 掃き掃除）。番犬が 3 ファイルの `.output()` / `.status()` / 殺していない `.wait()` を落とす（修正前ソースで 8 か所を名指し FAILED）
+- 実機 A/B: 注入で旧アームは**完走せず器 +10/回**（0→10→20）→ 新アームは 18 passed で**器 0**（3 回）。12 回連続実行で残骸ゼロ。交互 6 回の所要は before 31.1s → after 22.5s（全ラウンドで速い）
+
+## 2026-09-09（#1283: ~ 始まりのパスを地の文の中でも cmd+クリックで開けるようにした）
+- 真因は見立て（`~` 展開 / `.mp4` のプレビュー非対応 / soft wrap）と別で、**トークンの区切りが ASCII の空白と `()[]{}<>,;` だけ**だったこと。日本語の文にパスが埋まると**文ごと 1 トークン**になり実在チェックで落ちる（実測トークン: `` 動画は`~/…mp4`、確認して。`` / `~/…mp4このリンクが` = **素の形だけが飛べていた**）
+- 区切り集合は増やさず（`資料（最新）.pdf` のような実在名を落とす）**トークン全体 → 文字種の切り替わりで削った候補**を長い順に試す形へ（`links::path_candidates`。全 ASCII は候補を増やさない / `/` 終わりは採らない）。囲みの前に地の文がくっつく形（空白入りパス）は**途中のバッククォートで切る**ことで回収。`open_plan` を「拡張子 → 開き方」の正本にし（`.mp4` = 動画プレビュー）、開けなかったときの `eprintln!` を通知 + persist.log へ。CLI `tako links` / MCP `tako_links` を新設
+- A/B `TAKO_1283_LEGACY=1` で 2 形が `[]` に戻る（素の形は残る）。隔離 GUI（tako-vd）の実画面で 3 形すべて検出 + `open=video`・セルフテスト項目 147 に 2 形を追加して `TAKO_APP_SELF_TEST_OK`

@@ -57,6 +57,8 @@ enum Command {
     List,
     /// ペインの画面内容をテキストで出力する
     Read(ReadArgs),
+    /// ターミナル画面のリンク（cmd+クリックで開けるもの）を列挙する（Issue #1283）
+    Links(LinksArgs),
     /// スクロールバック表示を動かす（--to 0 で最下部へ）
     Scroll(ScrollArgs),
     /// 直接ペインのスクロールバック保持上限（行）の確認・変更（Issue #818）
@@ -2437,6 +2439,24 @@ struct LimitResumeArgs {
 struct PreviewCacheArgs {
     /// キャッシュ上限（MiB、256〜8192。省略時は利用状況を表示）
     max_mb: Option<u64>,
+}
+
+/// リンク列挙の引数（Issue #1283）。
+/// 最簡形（#322）: `tako links` で呼び出し元ペインの画面を見る
+#[derive(Args)]
+struct LinksArgs {
+    /// 対象ペイン ID（省略時は呼び出し元ペイン）
+    #[arg(long)]
+    pane: Option<u64>,
+    /// ペインの画面の代わりに検査する画面テキスト（改行区切り。`-` で標準入力）
+    #[arg(long)]
+    text: Option<String>,
+    /// --text の想定桁数（省略時は 120）
+    #[arg(long)]
+    cols: Option<usize>,
+    /// 相対パスの解決基準（省略時はペインの cwd）
+    #[arg(long)]
+    cwd: Option<String>,
 }
 
 /// スクロールバック保持上限の引数（Issue #818）。
@@ -6042,6 +6062,29 @@ fn build_request(command: &Command) -> Result<Request, String> {
             max_mb: args.max_mb,
         },
         Command::Scrollback(args) => Request::Scrollback { lines: args.lines },
+        Command::Links(args) => {
+            // `--text -` は標準入力から読む（画面の写しをパイプで流せる形）
+            let text = match args.text.as_deref() {
+                Some("-") => {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+                        .map_err(|e| format!("標準入力の読み取りに失敗: {e}"))?;
+                    Some(buf)
+                }
+                other => other.map(str::to_string),
+            };
+            Request::Links {
+                // `--text` を渡したときはペインを見ないので呼び出し元の解決も要らない
+                pane: if text.is_some() {
+                    args.pane
+                } else {
+                    target_pane(args.pane)?
+                },
+                text,
+                cols: args.cols,
+                cwd: args.cwd.clone(),
+            }
+        }
         Command::PreviewChangelog(args) => Request::PreviewChangelog {
             pane: target_pane(args.pane)?,
             enabled: args.mode.as_deref().map(|s| s == "on"),
@@ -8019,6 +8062,8 @@ fn print_result(command: &Command, result: &Value) {
             println!("{result}")
         }
         Command::PreviewLinkList(_) => println!("{}", pretty_json(result)),
+        // #1283: 検出結果はスパンまで読みたいので整形して出す
+        Command::Links(_) => println!("{}", pretty_json(result)),
         Command::PreviewFollowLink(_) => println!("{result}"),
         // #680: コピーしたコード全文は改行込みで読みたいので整形して出す
         Command::PreviewCopyCode(_) => println!("{}", pretty_json(result)),
@@ -8847,6 +8892,40 @@ mod tests {
             let parsed = parse(&argv);
             assert_eq!(build_request(&parsed).unwrap(), expect, "{argv:?}");
         }
+    }
+
+    /// #1283: `tako links` が最簡形（引数なし = 呼び出し元ペイン）で通り、
+    /// `--text` を渡したときはペインの解決を要求しない
+    #[test]
+    fn linksは画面テキストとペインのどちらでも操作へ写す() {
+        let by_text = parse(&[
+            "tako",
+            "links",
+            "--text",
+            "見て `/tmp/x.md`。",
+            "--cols",
+            "80",
+        ]);
+        assert_eq!(
+            build_request(&by_text).unwrap(),
+            Request::Links {
+                pane: None,
+                text: Some("見て `/tmp/x.md`。".into()),
+                cols: Some(80),
+                cwd: None,
+            }
+        );
+
+        let by_pane = parse(&["tako", "links", "--pane", "7", "--cwd", "/tmp"]);
+        assert_eq!(
+            build_request(&by_pane).unwrap(),
+            Request::Links {
+                pane: Some(7),
+                text: None,
+                cols: None,
+                cwd: Some("/tmp".into()),
+            }
+        );
     }
 
     #[test]
