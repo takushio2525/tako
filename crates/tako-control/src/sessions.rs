@@ -33,6 +33,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use tako_core::agent_support::Agent;
+use tako_core::platform::support::Platform;
+
 /// カタログに保持する最大エントリ数（last_seen_at の新しい順に残す）
 const MAX_ENTRIES: usize = 500;
 
@@ -633,15 +636,40 @@ pub fn show_payload(id_prefix: &str) -> Result<Value, String> {
     }))
 }
 
-/// resume 用の起動コマンドを組み立てる（claude のみ。Issue #112 の制限:
-/// codex / agy は session 参照手段が tako から安定して取れないため対象外）。
+/// resume 用の起動コマンドを組み立てる。
+///
+/// **系統ごとの書式は `tako_core::agent_resume::resume_spec` が正本**（#1238）。
+/// claude だけが `--model` / `--effort` を載せられる（`codex resume` は受け取らず、
+/// agy は会話に記録された設定を上書きしないため足さない）。
 /// 会話が既定以外の config ディレクトリにあれば `CLAUDE_CONFIG_DIR` を前置する（Issue #652）
 pub fn resume_command(id: &str, entry: &SessionEntry) -> Result<String, String> {
-    resume_command_with_env(
-        id,
-        entry,
-        crate::transcript::resume_env_prefix(id).as_deref(),
-    )
+    let agent = agent_of(entry);
+    resume_command_with_env(id, entry, conversation_env(agent, id).as_deref())
+}
+
+/// カタログの記録が指す系統（未記録は claude = 既定）
+fn agent_of(entry: &SessionEntry) -> Agent {
+    entry
+        .agent
+        .as_deref()
+        .and_then(Agent::parse)
+        .unwrap_or(Agent::Claude)
+}
+
+/// 会話の所在を確かめ、必要なら起動コマンドへ前置きする env を返す（#1238）。
+///
+/// `None` = **どこにも会話が無い**（resume しても「見つからない」で終わるので起こさない）。
+/// claude だけが所在によって `CLAUDE_CONFIG_DIR` の指定を要する（#652）ので、
+/// 他系統は「見つかった」を空文字で表す
+fn conversation_env(agent: Agent, id: &str) -> Option<String> {
+    if agent == Agent::Claude {
+        return crate::transcript::resume_env_prefix(id);
+    }
+    // claude 以外は config ディレクトリの概念が無いので、
+    // 「見つかった」を空文字で表す（所在の判定は agent_resume が系統ごとに持つ）
+    crate::agent_resume::conversation_exists(agent, id)
+        .unwrap_or(false)
+        .then(String::new)
 }
 
 /// `resume_command` の本体（env プレフィクスを引数で受け取るテスト可能版）
@@ -650,12 +678,14 @@ fn resume_command_with_env(
     entry: &SessionEntry,
     env_prefix: Option<&str>,
 ) -> Result<String, String> {
-    let agent = entry.agent.as_deref().unwrap_or("claude");
-    if agent != "claude" {
-        return Err(format!(
-            "agent '{agent}' のセッションは resume 非対応（claude のみ。codex は `codex resume`、agy は `agy --conversation` を手動で実行）"
-        ));
-    }
+    let agent = agent_of(entry);
+    let spec = tako_core::agent_resume::resume_spec(agent).ok_or_else(|| {
+        format!(
+            "agent '{}' のセッションは resume 非対応（対応: claude / codex / agy）",
+            agent.as_str()
+        )
+    })?;
+    // 書式検証は全系統共通（パストラバーサル防止。codex / agy の会話 ID も UUID）
     if !crate::transcript::is_valid_session_id(id) {
         return Err("session_id の形式が不正".into());
     }
@@ -688,33 +718,47 @@ fn resume_command_with_env(
             crate::orchestrator::agent::sh_quote(&role)
         ));
     }
-    cmd.push_str("claude");
-    if let Some(model) = entry.model.as_deref() {
-        cmd.push_str(&format!(
-            " --model {}",
-            crate::orchestrator::agent::sh_quote(model)
-        ));
+    cmd.push_str(spec.program);
+    if spec.accepts_launch_flags {
+        if let Some(model) = entry.model.as_deref() {
+            cmd.push_str(&format!(
+                " --model {}",
+                crate::orchestrator::agent::sh_quote(model)
+            ));
+        }
+        if let Some(effort) = entry.effort.as_deref() {
+            cmd.push_str(&format!(" --effort {effort}"));
+        }
     }
-    if let Some(effort) = entry.effort.as_deref() {
-        cmd.push_str(&format!(" --effort {effort}"));
+    for head in spec.head {
+        cmd.push(' ');
+        cmd.push_str(head);
     }
-    cmd.push_str(&format!(" --resume {id}"));
+    if let Some(flag) = spec.id_flag {
+        cmd.push(' ');
+        cmd.push_str(flag);
+    }
+    cmd.push(' ');
+    cmd.push_str(id);
     Ok(cmd)
 }
 
 // ---------------------------------------------------------------------------
-// 復元（PC 再起動後）の 1 ペインぶんの判断（Issue #1076）
+// 復元（PC 再起動後）の 1 ペインぶんの判断（Issue #1076 / #1238）
 // ---------------------------------------------------------------------------
 
 /// 新規シェルで開き直す理由（#1076。復元内訳のログに出す）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FreshShellReason {
-    /// 保存時に claude を検出できていなかった（= 復元すべき会話が記録されていない）
+    /// 保存時に会話を検出できていなかった（= 復元すべき会話が記録されていない）
     NoSessionId,
     /// 保存値の形式が不正（パストラバーサル対策で弾いた）
     InvalidSessionId,
-    /// 会話ファイル（transcript）がどの config ディレクトリにも無い
+    /// 会話ファイル（transcript / rollout / conversations の db）が無い
     TranscriptMissing,
+    /// **その系統をこの環境では復元できない**（#1238）。
+    /// 「保存されていない」（`NoSessionId`）と混ぜると原因が読めない
+    ResumeUnsupported,
 }
 
 impl FreshShellReason {
@@ -724,90 +768,191 @@ impl FreshShellReason {
             Self::NoSessionId => "ID なし",
             Self::InvalidSessionId => "形式不正",
             Self::TranscriptMissing => "会話が見つからない",
+            Self::ResumeUnsupported => "resume 非対応",
         }
     }
 }
 
 /// 復元時に 1 ペインをどう起こすか（#1076）。**理由まで返す**ので、
-/// 復元内訳のログが「なぜ claude が出なかったか」を言える
+/// 復元内訳のログが「なぜエージェントが出なかったか」を言える
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestorePlan {
     /// 器（tmux セッション）が生きている = 実行中プロセスごと再 attach する
     Reattach,
-    /// 保存済みの会話を明示 resume する
-    ResumeClaude {
+    /// 保存済みの会話を明示 resume する（#1238 で claude 以外へ広げた）
+    Resume {
+        /// どの系統として起こすか（診断ログ・件数の内訳に出す）
+        agent: Agent,
         /// シェルへ投入するコマンド（改行は投入側が付ける）
         command: String,
-        /// カタログの記録から役割・モデルまで組み立てられたか（診断ログ用）
+        /// カタログ / spawn 記録から役割・モデルまで組み立てられたか（診断ログ用）
         with_role: bool,
     },
     /// 保存 cwd で新しいシェルを開くだけ
     FreshShell(FreshShellReason),
 }
 
-/// 復元時の 1 ペインの判断（`env_prefix` / カタログを引数で受け取る純粋版）。
+/// 復元対象のペインに紐づく「どの系統の・どの会話か」（#1238）。
 ///
-/// `env_prefix` は transcript の所在から決まる `CLAUDE_CONFIG_DIR` の指定
-/// （[`crate::transcript::resume_env_prefix`]）。`None` = 会話ファイルが
-/// 見つからない = resume しても `No conversation found` になるので起こさない（#652）。
+/// `id` が `None` = **系統は分かるが会話 ID を採れていない**
+/// （agy は最初のターンまで会話が生まれない / Windows には `lsof` が無い）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneResume<'a> {
+    pub agent: Agent,
+    pub id: Option<&'a str>,
+}
+
+/// 復元時の 1 ペインの判断材料（#1076 / #1238）
+#[derive(Debug, Clone, Copy)]
+pub struct RestoreInput<'a> {
+    /// 器（tmux セッション）が生きているか
+    pub backend_alive: bool,
+    /// `layout.json` に保存されていた系統と会話 ID
+    pub resume: Option<PaneResume<'a>>,
+    /// 会話が見つかったか。`Some` の中身は claude の `CLAUDE_CONFIG_DIR` 前置き
+    /// （[`crate::transcript::resume_env_prefix`]）で、他系統は空文字。
+    /// `None` = 会話ファイルがどこにも無い = resume しても失敗するので起こさない（#652）
+    pub conversation: Option<&'a str>,
+    /// 起動条件（役割 / モデル / effort）の記録
+    pub catalog: Option<&'a SessionCatalog>,
+    /// 起動条件を spawn 記録から引くためのキー（#728 と同じ「器の名前 → ペイン ID」）
+    pub backend_session: Option<&'a str>,
+    pub pane: Option<u64>,
+    /// 判定する OS（**引数で受ける**ので macOS 上から Windows 側を検証できる）
+    pub platform: Platform,
+}
+
+/// 復元時の 1 ペインの判断（材料を引数で受け取る純粋版）。
 ///
 /// コマンドの形は [`resume_command`] が正本（役割 env / `--model` / `--effort` /
-/// config dir までカタログの記録から復元する）。カタログに記録が無いときだけ
-/// 最小形（config dir + `--resume`）へ落ちる
-pub fn restore_plan_in(
-    backend_alive: bool,
-    session_id: Option<&str>,
-    env_prefix: Option<&str>,
-    catalog: Option<&SessionCatalog>,
-) -> RestorePlan {
-    // 器が生きているなら実行中プロセスごと戻る（claude を二重起動しない）
-    if backend_alive {
+/// config dir までカタログの記録から復元する）。カタログにも spawn 記録にも
+/// 無いときだけ最小形（config dir + resume の引数）へ落ちる
+pub fn restore_plan_in(input: RestoreInput<'_>) -> RestorePlan {
+    // 器が生きているなら実行中プロセスごと戻る（エージェントを二重起動しない）
+    if input.backend_alive {
         return RestorePlan::Reattach;
     }
-    let Some(id) = session_id else {
+    let Some(resume) = input.resume else {
+        return RestorePlan::FreshShell(FreshShellReason::NoSessionId);
+    };
+    // **「保存されていない」と「手段が無い」を分ける**（#1238）。判定の正本は
+    // tako_core::agent_resume（Windows に lsof が無い = codex / agy の ID を採れない）
+    if !tako_core::agent_resume::restore_support(resume.agent, input.platform).is_wired() {
+        return RestorePlan::FreshShell(FreshShellReason::ResumeUnsupported);
+    }
+    let Some(id) = resume.id else {
         return RestorePlan::FreshShell(FreshShellReason::NoSessionId);
     };
     if !crate::transcript::is_valid_session_id(id) {
         return RestorePlan::FreshShell(FreshShellReason::InvalidSessionId);
     }
-    let Some(env_prefix) = env_prefix else {
+    let Some(env_prefix) = input.conversation else {
         return RestorePlan::FreshShell(FreshShellReason::TranscriptMissing);
     };
-    // カタログに記録があれば起動条件ごと復元する。**役割 env が復元されないと、
-    // 戻ってきた claude は master / worker として認識されない**（オーケストレーター
-    // からも MCP からも見えない）ので、ここは最小形へ落とさずに済ませたい
-    let entry = catalog.and_then(|c| c.entries.get(id));
-    if let Some(entry) = entry {
-        if let Ok(command) = resume_command_with_env(id, entry, Some(env_prefix)) {
+    // 起動条件が分かれば復元する。**役割 env が復元されないと、戻ってきた
+    // エージェントは master / worker として認識されない**（オーケストレーターからも
+    // MCP からも見えない）ので、ここは最小形へ落とさずに済ませたい
+    if let Some(entry) = launch_record(&input, id, resume.agent) {
+        if let Ok(command) = resume_command_with_env(id, &entry, Some(env_prefix)) {
             let with_role = matches!(entry.kind.as_str(), "master" | "worker" | "solo");
-            return RestorePlan::ResumeClaude { command, with_role };
+            return RestorePlan::Resume {
+                agent: resume.agent,
+                command,
+                with_role,
+            };
         }
     }
-    RestorePlan::ResumeClaude {
-        command: format!("{env_prefix}claude --resume {id}"),
-        with_role: false,
+    let minimal = SessionEntry {
+        agent: Some(resume.agent.as_str().to_string()),
+        ..SessionEntry::default()
+    };
+    match resume_command_with_env(id, &minimal, Some(env_prefix)) {
+        Ok(command) => RestorePlan::Resume {
+            agent: resume.agent,
+            command,
+            with_role: false,
+        },
+        // 系統が resume を持たない場合はここに来ない（上で弾いてある）が、
+        // ID の書式で弾かれた場合の保険
+        Err(_) => RestorePlan::FreshShell(FreshShellReason::InvalidSessionId),
     }
 }
 
-/// [`restore_plan_in`] の実環境版（transcript の走査とカタログの読み込みを行う）。
+/// 起動条件の記録を引く（**カタログ本体が先・spawn 記録が後**）。
+///
+/// claude はセッション検出でカタログ本体へ昇格するが、codex / agy は
+/// 昇格経路が無く `pending`（spawn 時の記録）にしか残らない（FR-5.12 の制限）。
+/// 器の名前 / ペイン ID で引けば役割・プロジェクト・ラベルは復元できる
+fn launch_record(input: &RestoreInput<'_>, id: &str, agent: Agent) -> Option<SessionEntry> {
+    let catalog = input.catalog?;
+    if let Some(entry) = catalog.entries.get(id) {
+        // **系統は layout 由来が正**（記録が食い違っていても、実際に動いていた
+        // 系統のコマンドを組む。claude の ID に codex の記録が付いている等の齟齬で
+        // 会話への入口を失わない）
+        return Some(SessionEntry {
+            agent: Some(agent.as_str().to_string()),
+            ..entry.clone()
+        });
+    }
+    let pending = catalog
+        .pending
+        .iter()
+        .find(|p| p.matches(input.backend_session, input.pane))?;
+    // 系統が食い違う記録は使わない（別のエージェントを起動していたペイン）
+    if pending
+        .agent
+        .as_deref()
+        .and_then(Agent::parse)
+        .is_some_and(|a| a != agent)
+    {
+        return None;
+    }
+    Some(SessionEntry {
+        kind: pending.kind.clone(),
+        label: pending.label.clone(),
+        project: pending.project.clone(),
+        // spawn 記録はプロファイル名を持たない（master:<profile> は既定名へ落ちる）
+        profile: None,
+        agent: Some(agent.as_str().to_string()),
+        model: pending.model.clone(),
+        effort: pending.effort.clone(),
+        ..SessionEntry::default()
+    })
+}
+
+/// [`restore_plan_in`] の実環境版（会話の所在の走査とカタログの読み込みを行う）。
 /// カタログは復元ループの外で 1 回だけ読んで渡す
 pub fn restore_plan(
     backend_alive: bool,
-    session_id: Option<&str>,
+    resume: Option<PaneResume<'_>>,
     catalog: Option<&SessionCatalog>,
+    backend_session: Option<&str>,
+    pane: Option<u64>,
 ) -> RestorePlan {
-    // 器が生きているなら transcript の走査（read_dir）自体が要らない
+    // 器が生きているなら会話ファイルの走査（read_dir）自体が要らない
     if backend_alive {
         return RestorePlan::Reattach;
     }
-    let env_prefix = session_id.and_then(crate::transcript::resume_env_prefix);
+    // A/B（#1238）: 修正前は claude 以外の会話参照を保存も復元もしていなかった
+    let resume = resume.filter(|r| r.agent == Agent::Claude || !crate::agent_resume::legacy_1238());
+    let conversation = resume
+        .and_then(|r| Some((r.agent, r.id?)))
+        .and_then(|(agent, id)| conversation_env(agent, id));
     // A/B（#1076）: 修正前は起動条件を復元せず最小形 `claude --resume <id>` だった
     let catalog = if tako_core::claude_resume::legacy_1076() {
         None
     } else {
         catalog
     };
-    restore_plan_in(backend_alive, session_id, env_prefix.as_deref(), catalog)
+    restore_plan_in(RestoreInput {
+        backend_alive,
+        resume,
+        conversation: conversation.as_deref(),
+        catalog,
+        backend_session,
+        pane,
+        platform: Platform::current(),
+    })
 }
 
 /// 現在時刻の ISO 表記（カタログの記録時刻用）
@@ -1215,7 +1360,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_commandの組み立てとcodex拒否() {
+    fn resume_commandの組み立てと系統ごとの書式() {
         let entry = SessionEntry {
             kind: "worker".into(),
             project: Some("tako".into()),
@@ -1243,18 +1388,51 @@ mod tests {
             "{cmd}"
         );
 
+        // #1238: codex は `resume` サブコマンド + 位置引数。**`--model` は付けない**
+        // （`codex resume --help` に無い = 付けると起動しない）
         let codex = SessionEntry {
+            kind: "worker".into(),
+            project: Some("tako".into()),
             agent: Some("codex".into()),
+            model: Some("gpt-5.6-sol".into()),
+            effort: Some("high".into()),
             ..Default::default()
         };
-        let err = resume_command_with_env("abc", &codex, None).unwrap_err();
+        assert_eq!(
+            resume_command_with_env("01a08347-543b-7a20-8e49-a93380efb375", &codex, None).unwrap(),
+            "TAKO_ORCHESTRATOR_ROLE='worker:tako' codex resume 01a08347-543b-7a20-8e49-a93380efb375"
+        );
+
+        // #1238: agy はグローバルフラグ。会話に記録された設定を上書きしない
+        let agy = SessionEntry {
+            agent: Some("agy".into()),
+            model: Some("Claude Opus 4.6 (Thinking)".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resume_command_with_env("874efd16-af95-4b2e-8036-84f6c3eaded3", &agy, None).unwrap(),
+            "agy --conversation 874efd16-af95-4b2e-8036-84f6c3eaded3"
+        );
+
+        // ローカル LLM は会話の器が定まっていない（#991）ので断る
+        let local = SessionEntry {
+            agent: Some("local".into()),
+            ..Default::default()
+        };
+        let err = resume_command_with_env("abc", &local, None).unwrap_err();
         assert!(err.contains("resume 非対応"), "{err}");
 
-        let invalid = SessionEntry {
-            agent: Some("claude".into()),
-            ..Default::default()
-        };
-        assert!(resume_command_with_env("../etc", &invalid, None).is_err());
+        // 書式検証（パストラバーサル防止）は全系統に効く
+        for agent in ["claude", "codex", "agy"] {
+            let invalid = SessionEntry {
+                agent: Some(agent.into()),
+                ..Default::default()
+            };
+            assert!(
+                resume_command_with_env("../etc", &invalid, None).is_err(),
+                "{agent} が不正な ID を通した"
+            );
+        }
     }
 
     /// Issue #652: アカウントの会話は `CLAUDE_CONFIG_DIR` を前置しないと
@@ -1282,6 +1460,22 @@ mod tests {
         );
     }
 
+    /// テスト用の最小の判断材料（claude・macOS・器は死んでいる）
+    fn input<'a>(id: Option<&'a str>, env: Option<&'a str>) -> RestoreInput<'a> {
+        RestoreInput {
+            backend_alive: false,
+            resume: id.map(|id| PaneResume {
+                agent: Agent::Claude,
+                id: Some(id),
+            }),
+            conversation: env,
+            catalog: None,
+            backend_session: None,
+            pane: None,
+            platform: Platform::MacOs,
+        }
+    }
+
     /// Issue #1076: PC 再起動後の復元は、器が消えたペインを保存済みの会話へ戻す。
     /// **役割 env / `--model` まで復元する**（最小形 `claude --resume <id>` だと
     /// 戻ってきた claude が master / worker として認識されない）
@@ -1300,10 +1494,14 @@ mod tests {
                 ..Default::default()
             },
         );
-        let plan = restore_plan_in(false, Some(id), Some(env), Some(&catalog));
+        let plan = restore_plan_in(RestoreInput {
+            catalog: Some(&catalog),
+            ..input(Some(id), Some(env))
+        });
         assert_eq!(
             plan,
-            RestorePlan::ResumeClaude {
+            RestorePlan::Resume {
+                agent: Agent::Claude,
                 command: format!(
                     "{env}TAKO_ORCHESTRATOR_ROLE='master:takodev' \
                      claude --model claude-opus-5 --resume {id}"
@@ -1318,53 +1516,150 @@ mod tests {
     fn restore_planはカタログ不在なら最小形へ落ちる() {
         let id = "a45899a8-96a6-4fa6-9bf6-71df53307878";
         let env = "unset CLAUDE_CONFIG_DIR; ";
-        let plan = restore_plan_in(false, Some(id), Some(env), Some(&SessionCatalog::default()));
+        let empty = SessionCatalog::default();
+        let minimal = RestorePlan::Resume {
+            agent: Agent::Claude,
+            command: format!("{env}claude --resume {id}"),
+            with_role: false,
+        };
         assert_eq!(
-            plan,
-            RestorePlan::ResumeClaude {
-                command: format!("{env}claude --resume {id}"),
-                with_role: false,
-            }
+            restore_plan_in(RestoreInput {
+                catalog: Some(&empty),
+                ..input(Some(id), Some(env))
+            }),
+            minimal
         );
         // カタログそのものが読めなかった場合も同じ
-        assert_eq!(
-            restore_plan_in(false, Some(id), Some(env), None),
-            RestorePlan::ResumeClaude {
-                command: format!("{env}claude --resume {id}"),
-                with_role: false,
-            }
-        );
+        assert_eq!(restore_plan_in(input(Some(id), Some(env))), minimal);
     }
 
-    /// 新規シェルへ落ちる 3 つの理由が区別できる（復元内訳のログに出す。#1076）
+    /// 新規シェルへ落ちる理由が区別できる（復元内訳のログに出す。#1076 / #1238）
     #[test]
     fn restore_planは新規シェルの理由を返す() {
         let id = "a45899a8-96a6-4fa6-9bf6-71df53307878";
         let env = "unset CLAUDE_CONFIG_DIR; ";
         // 器が生きている = 実行中プロセスごと再 attach（claude を二重起動しない）
         assert_eq!(
-            restore_plan_in(true, Some(id), Some(env), None),
+            restore_plan_in(RestoreInput {
+                backend_alive: true,
+                ..input(Some(id), Some(env))
+            }),
             RestorePlan::Reattach
         );
         assert_eq!(
-            restore_plan_in(false, None, Some(env), None),
+            restore_plan_in(input(None, Some(env))),
             RestorePlan::FreshShell(FreshShellReason::NoSessionId)
         );
         assert_eq!(
-            restore_plan_in(false, Some("../../bad"), Some(env), None),
+            restore_plan_in(input(Some("../../bad"), Some(env))),
             RestorePlan::FreshShell(FreshShellReason::InvalidSessionId)
         );
         // transcript が見つからない = resume しても `No conversation found` になる
         assert_eq!(
-            restore_plan_in(false, Some(id), None, None),
+            restore_plan_in(input(Some(id), None)),
             RestorePlan::FreshShell(FreshShellReason::TranscriptMissing)
+        );
+        // #1238: 系統は分かるが ID が採れていない（agy の最初のターン前）
+        assert_eq!(
+            restore_plan_in(RestoreInput {
+                resume: Some(PaneResume {
+                    agent: Agent::Agy,
+                    id: None
+                }),
+                ..input(None, Some(env))
+            }),
+            RestorePlan::FreshShell(FreshShellReason::NoSessionId)
         );
     }
 
-    /// カタログの記録が resume 非対応（codex 等）でも、claude 検出由来の ID は
-    /// 最小形で復元を試みる（記録の齟齬で会話への入口を失わない）
+    /// #1238: 「保存されていない」と「この環境には手段が無い」を別の理由として出す。
+    /// Windows には `lsof` が無いので codex / agy の ID をそもそも採れない
     #[test]
-    fn restore_planはcodex記録でも最小形へ落ちる() {
+    fn restore_planはwindowsのcodexとagyをresume非対応と言う() {
+        let id = "01a08347-543b-7a20-8e49-a93380efb375";
+        for agent in [Agent::Codex, Agent::Agy] {
+            assert_eq!(
+                restore_plan_in(RestoreInput {
+                    resume: Some(PaneResume {
+                        agent,
+                        id: Some(id)
+                    }),
+                    platform: Platform::Windows,
+                    ..input(None, Some(""))
+                }),
+                RestorePlan::FreshShell(FreshShellReason::ResumeUnsupported),
+                "{agent:?}"
+            );
+        }
+        // claude の ID は OS に依らず取れる（`claude agents --json`）
+        assert!(matches!(
+            restore_plan_in(RestoreInput {
+                platform: Platform::Windows,
+                ..input(Some(id), Some(""))
+            }),
+            RestorePlan::Resume { .. }
+        ));
+        assert_eq!(
+            FreshShellReason::ResumeUnsupported.label(),
+            "resume 非対応",
+            "内訳ログのラベルが変わると commands.md の読み方が合わなくなる"
+        );
+    }
+
+    /// #1238: codex / agy は spawn 記録（pending）から役割ごと復元する。
+    /// claude と違ってカタログ本体へ昇格しない（FR-5.12 の制限）ので、
+    /// ここを見ないと戻ってきた worker がオーケストレーターから見えない
+    #[test]
+    fn restore_planはcodexとagyをpending記録の役割ごと復元する() {
+        let id = "01a08347-543b-7a20-8e49-a93380efb375";
+        let mut catalog = SessionCatalog::default();
+        catalog.pending.push(PendingSpawn {
+            tmux_session: Some("tako-w2".into()),
+            kind: "worker".into(),
+            project: Some("tako".into()),
+            label: Some("1238".into()),
+            agent: Some("codex".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            restore_plan_in(RestoreInput {
+                resume: Some(PaneResume {
+                    agent: Agent::Codex,
+                    id: Some(id)
+                }),
+                catalog: Some(&catalog),
+                backend_session: Some("tako-w2"),
+                ..input(None, Some(""))
+            }),
+            RestorePlan::Resume {
+                agent: Agent::Codex,
+                command: format!("TAKO_ORCHESTRATOR_ROLE='worker:tako:1238' codex resume {id}"),
+                with_role: true,
+            }
+        );
+        // 別の系統を起動していたペインの記録は使わない（役割を取り違えない）
+        assert_eq!(
+            restore_plan_in(RestoreInput {
+                resume: Some(PaneResume {
+                    agent: Agent::Agy,
+                    id: Some(id)
+                }),
+                catalog: Some(&catalog),
+                backend_session: Some("tako-w2"),
+                ..input(None, Some(""))
+            }),
+            RestorePlan::Resume {
+                agent: Agent::Agy,
+                command: format!("agy --conversation {id}"),
+                with_role: false,
+            }
+        );
+    }
+
+    /// カタログの記録の系統が layout と食い違っても、**実際に動いていた系統**の
+    /// コマンドを組む（記録の齟齬で会話への入口を失わない）
+    #[test]
+    fn restore_planは記録の齟齬よりlayoutの系統を優先する() {
         let id = "a45899a8-96a6-4fa6-9bf6-71df53307878";
         let env = "unset CLAUDE_CONFIG_DIR; ";
         let mut catalog = SessionCatalog::default();
@@ -1376,8 +1671,12 @@ mod tests {
             },
         );
         assert_eq!(
-            restore_plan_in(false, Some(id), Some(env), Some(&catalog)),
-            RestorePlan::ResumeClaude {
+            restore_plan_in(RestoreInput {
+                catalog: Some(&catalog),
+                ..input(Some(id), Some(env))
+            }),
+            RestorePlan::Resume {
+                agent: Agent::Claude,
                 command: format!("{env}claude --resume {id}"),
                 with_role: false,
             }

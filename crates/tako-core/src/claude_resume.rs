@@ -38,11 +38,14 @@
 
 use std::collections::HashMap;
 
+use crate::agent_resume::AgentResumeIds;
+use crate::agent_support::Agent;
 use crate::PaneId;
 
 /// 確認済みのペインの ID を落とすまでに必要な連続不在回数。
-/// 1 回の取りこぼし（スキャンが Node 起動に失敗した等）で落とさないための猶予
-pub const FORGET_AFTER_MISSES: u32 = 2;
+/// 1 回の取りこぼし（スキャンが Node 起動に失敗した等）で落とさないための猶予。
+/// **規則の正本は [`crate::agent_resume`]**（#1238 で claude 以外へも広げた）
+pub use crate::agent_resume::FORGET_AFTER_MISSES;
 
 /// #1076 の A/B。`TAKO_1076_LEGACY=1` で修正前の挙動
 /// （検出結果でマップを丸ごと置き換える + 起動条件を落とした最小形の resume）へ戻す
@@ -50,21 +53,14 @@ pub fn legacy_1076() -> bool {
     std::env::var_os("TAKO_1076_LEGACY").is_some()
 }
 
-/// 1 ペインぶんの保持状態
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Entry {
-    id: String,
-    /// このプロセスの生存中に一度でもスキャンで検出できたか。
-    /// **false（= `layout.json` 由来のまま）はスキャンの不在で落とさない**
-    confirmed: bool,
-    /// 連続で検出できなかった回数（検出できたら 0 に戻る）
-    misses: u32,
-}
-
-/// ペインごとの復元用 claude セッション ID（[`crate::claude_resume`] の規約を実装する）
+/// ペインごとの復元用 claude セッション ID（[`crate::claude_resume`] の規約を実装する）。
+///
+/// **中身は [`AgentResumeIds`] の claude 固定の view**（#1238）。
+/// 保持規則（確認してから外す）の実装を 2 つに割らないため、
+/// ここはコンテナを持たず委譲だけを行う
 #[derive(Debug, Clone, Default)]
 pub struct ResumeIds {
-    entries: HashMap<PaneId, Entry>,
+    inner: AgentResumeIds,
 }
 
 impl ResumeIds {
@@ -75,17 +71,7 @@ impl ResumeIds {
     /// `layout.json` から復元した ID を**未確認**として入れる。
     /// すでに確認済みの ID があるペインは触らない（検出結果のほうが新しい）
     pub fn seed(&mut self, pane: PaneId, id: &str) {
-        if self.entries.get(&pane).is_some_and(|e| e.confirmed) {
-            return;
-        }
-        self.entries.insert(
-            pane,
-            Entry {
-                id: id.to_string(),
-                confirmed: false,
-                misses: 0,
-            },
-        );
+        self.inner.seed(pane, Agent::Claude, Some(id));
     }
 
     /// スキャン 1 回ぶんの結果を反映する。
@@ -96,78 +82,46 @@ impl ResumeIds {
     /// **スキャンが失敗した回は呼ばない**（呼ぶと全ペインが不在扱いになる）。
     /// 「検出できたペインが 0 件」は呼んでよい（それが不在の 1 回になる）
     pub fn apply_scan(&mut self, panes: &[PaneId], detected: &HashMap<PaneId, String>) {
-        self.entries.retain(|pane, _| panes.contains(pane));
-        for pane in panes {
-            match detected.get(pane) {
-                Some(id) => {
-                    self.entries.insert(
-                        *pane,
-                        Entry {
-                            id: id.clone(),
-                            confirmed: true,
-                            misses: 0,
-                        },
-                    );
-                }
-                None => {
-                    let drop = match self.entries.get_mut(pane) {
-                        // 未確認（= layout.json 由来）は不在では落とさない
-                        Some(entry) if !entry.confirmed => false,
-                        Some(entry) => {
-                            entry.misses += 1;
-                            entry.misses >= FORGET_AFTER_MISSES
-                        }
-                        None => false,
-                    };
-                    if drop {
-                        self.entries.remove(pane);
-                    }
-                }
-            }
-        }
+        self.inner.apply_scan(panes, &tag_claude(detected));
     }
 
     /// **#1076 の A/B 専用**（`TAKO_1076_LEGACY=1`）。修正前の
     /// 「検出結果でマップを丸ごと置き換える」を再現する。
     /// 製品経路では使わない（使うと #1076 が再発する）
     pub fn replace_all_legacy(&mut self, detected: &HashMap<PaneId, String>) {
-        self.entries = detected
-            .iter()
-            .map(|(pane, id)| {
-                (
-                    *pane,
-                    Entry {
-                        id: id.clone(),
-                        confirmed: true,
-                        misses: 0,
-                    },
-                )
-            })
-            .collect();
+        self.inner.replace_all_legacy(&tag_claude(detected));
     }
 
     /// ペインを閉じたときに記録を外す
     pub fn remove(&mut self, pane: PaneId) {
-        self.entries.remove(&pane);
+        self.inner.remove(pane);
     }
 
     /// そのペインの復元用 session ID
     pub fn get(&self, pane: PaneId) -> Option<&str> {
-        self.entries.get(&pane).map(|e| e.id.as_str())
+        self.inner.get(pane).and_then(|(_, id)| id)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.inner.is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.inner.len()
     }
 
     /// 確認済み（スキャンで実際に見えた）ペインの数。診断ログ用
     pub fn confirmed_count(&self) -> usize {
-        self.entries.values().filter(|e| e.confirmed).count()
+        self.inner.confirmed_count()
     }
+}
+
+/// 検出結果へ claude の札を付ける（このマップは claude 専用なので一律）
+fn tag_claude(detected: &HashMap<PaneId, String>) -> HashMap<PaneId, (Agent, Option<String>)> {
+    detected
+        .iter()
+        .map(|(pane, id)| (*pane, (Agent::Claude, Some(id.clone()))))
+        .collect()
 }
 
 #[cfg(test)]

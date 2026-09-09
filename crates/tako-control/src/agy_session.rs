@@ -123,6 +123,23 @@ pub fn conversation_id_for_pid(pid: u32) -> Option<String> {
     conversation_id_from_lsof(&String::from_utf8_lossy(&out.stdout))
 }
 
+/// 会話そのものの実体（`conversations/<id>.db`。SQLite）。
+///
+/// **中身は読まない**（依存を増やさない）。`agy --conversation <id>` が開くのはここなので、
+/// 復元の可否（会話が在るか）はこのファイルの有無で判断する（#1238）。
+/// 実況 JSONL（[`transcript_path`]）は**ターンが無いと生まれない**ので、
+/// 「会話は在るがまだ喋っていない」を「会話が無い」と誤判定しないためにここを見る
+pub fn conversation_db(conversation_id: &str) -> Option<PathBuf> {
+    if !is_valid_conversation_id(conversation_id) {
+        return None;
+    }
+    Some(
+        agy_home()?
+            .join("conversations")
+            .join(format!("{conversation_id}.db")),
+    )
+}
+
 /// 会話の実況 JSONL の置き場。**存在しなければ `None`**（= まだターンが無い）
 pub fn transcript_path(conversation_id: &str) -> Option<PathBuf> {
     if !is_valid_conversation_id(conversation_id) {
