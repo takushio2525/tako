@@ -158,6 +158,29 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_links",
+            "description": "ターミナル画面の**リンク**（cmd+クリックで開けるもの）を列挙する。\
+                GUI の cmd+クリックと同じ判定（tako_core::links）を通すので、\
+                人手のクリック無しに「この画面のこのパスはリンクになるのか」を確かめられる（#1283）。\
+                応答の links[] は kind（url / path）・target（解決済みの絶対パス or URL）・\
+                text（画面に見えている文字列 = 下線が付く範囲）・spans（[row, start_col, end_col]）。\
+                kind=path には open（cmd+クリックの行き先: terminal / code / markdown / image / pdf / video）と \
+                is_dir が付く。パスは**実在するものだけ**がリンクになるので、\
+                「飛べない」の切り分けは検出（ここが空か）と開き方（open）の 2 段で見る。\
+                text を渡すとペインの画面の代わりにその文字列（改行区切り）を材料にする\
+                （画面の写しを貼って判定を再現できる）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": { "type": "integer", "minimum": 0, "description": "対象ペイン ID（text 省略時は必須）" },
+                    "text": { "type": "string", "description": "ペインの画面の代わりに検査する画面テキスト（改行区切り）" },
+                    "cols": { "type": "integer", "minimum": 1, "description": "text の想定桁数（省略時は 120）" },
+                    "cwd": { "type": "string", "description": "相対パスの解決基準（省略時はペインの cwd）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_scroll_pane",
             "description": "ペインのスクロールバック表示を動かす。\
                 to は絶対位置（0 = 最下部、大きいほど過去）、delta は相対行数（正 = 過去方向）。\

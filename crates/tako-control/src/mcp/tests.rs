@@ -569,7 +569,8 @@ mod tests {
         // #1067 の tako_session_restart（会話を引き継いだ再起動）を追加して 144
         // #1154 の tako_orchestrator_guide（master の手順書）を追加して 146
         // #818 の tako_scrollback（スクロールバック保持上限）を追加して 147
-        assert_eq!(tools.len(), 147);
+        // #1283 の tako_links（画面のリンク検出）を追加して 148
+        assert_eq!(tools.len(), 148);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
@@ -688,6 +689,39 @@ mod tests {
         );
         assert!(seen.is_empty());
         assert_eq!(response.unwrap()["error"]["code"], -32602);
+
+        // #1283: リンク検出は pane / text のどちらでも渡せる
+        let (_, seen_links) = run(
+            call("tako_links", json!({ "pane": 4 })),
+            None,
+            true,
+        );
+        assert_eq!(
+            seen_links,
+            vec![Request::Links {
+                pane: Some(4),
+                text: None,
+                cols: None,
+                cwd: None,
+            }]
+        );
+        let (_, seen_links) = run(
+            call(
+                "tako_links",
+                json!({ "text": "見て `/tmp/x.md`。", "cols": 80, "cwd": "/tmp" }),
+            ),
+            None,
+            true,
+        );
+        assert_eq!(
+            seen_links,
+            vec![Request::Links {
+                pane: None,
+                text: Some("見て `/tmp/x.md`。".into()),
+                cols: Some(80),
+                cwd: Some("/tmp".into()),
+            }]
+        );
 
         let (_, seen) = run(
             call("tako_read_pane", json!({ "pane": 4, "lines": 10 })),

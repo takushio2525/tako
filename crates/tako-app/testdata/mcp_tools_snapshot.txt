@@ -35,6 +35,7 @@ tako_git_unstage
 tako_lang
 tako_limit_resume
 tako_limit_service
+tako_links
 tako_list_panes
 tako_logs
 tako_menu

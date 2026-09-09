@@ -305,6 +305,21 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tmux_session: Option<String>,
     },
+    /// ターミナル画面のリンク検出結果（Issue #1283）。
+    ///
+    /// **cmd+クリックで開けるもの**（URL とパス）を、GUI と同じ判定
+    /// （`tako_core::links`）で列挙する。人手のクリック無しに
+    /// 「この画面のこのパスはリンクになるのか」を確かめるための口。
+    /// `text` を渡すとペインの画面の代わりにその行を材料にする（改行区切り）
+    Links {
+        pane: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cols: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
     /// スクロールバック表示の操作（FR-2.5.13）。`to` は絶対位置（0 = 最下部）、
     /// `delta` は相対行数（正 = 過去方向）。両方省略はエラー
     Scroll {

@@ -53,6 +53,20 @@ impl DispatchError {
     }
 }
 
+/// 拡張子からプレビュー種別（ワイヤ表現）を決める。
+///
+/// 対応表の正本は `tako_core::open_plan`（#1283）。ここは列挙の写しを作らずに
+/// 変換だけを行う（両方の enum を足し忘れるとコンパイルが落ちる形にしてある）
+fn preview_mode_wire(path: &std::path::Path) -> PreviewModeWire {
+    match tako_core::open_plan::preview_route(path) {
+        tako_core::open_plan::PreviewRoute::Code => PreviewModeWire::Code,
+        tako_core::open_plan::PreviewRoute::Markdown => PreviewModeWire::Markdown,
+        tako_core::open_plan::PreviewRoute::Image => PreviewModeWire::Image,
+        tako_core::open_plan::PreviewRoute::Pdf => PreviewModeWire::Pdf,
+        tako_core::open_plan::PreviewRoute::Video => PreviewModeWire::Video,
+    }
+}
+
 /// リクエストを実行し、成功時の `result` 値を返す。
 /// `origin` は新規生成ペインの生成主体（Layer 1 CLI なら `Cli`、Phase 3 の MCP なら `Mcp`）
 /// dispatch は UI スレッド（GPUI のイベントループ）で実行されるため、ここでの遅延は
@@ -1054,6 +1068,81 @@ fn dispatch_inner(
             }))
         }
 
+        Request::Links {
+            pane,
+            text,
+            cols,
+            cwd,
+        } => {
+            // 材料は 2 通り。`text` があればその行、無ければペインの実画面。
+            // どちらも `tako_core::links` の**同じ検出**を通すので、GUI の
+            // cmd+クリックと判定が一致する（#1283）
+            let cwd_override = cwd.map(std::path::PathBuf::from);
+            let (pane_id, screen, cwd) = match text {
+                Some(text) => {
+                    let lines: Vec<String> = text.lines().map(str::to_string).collect();
+                    let cols = cols.unwrap_or(120).max(1);
+                    (
+                        None,
+                        tako_core::links::screen_from_lines(&lines, cols),
+                        cwd_override,
+                    )
+                }
+                None => {
+                    let (_, target) = resolve_pane(host.workspace(), pane)?;
+                    let session = host.session(target).ok_or_else(|| {
+                        DispatchError::Operation(format!(
+                            "ペイン {} にターミナルセッションが無い",
+                            target.as_u64()
+                        ))
+                    })?;
+                    let cwd = cwd_override.or_else(|| session.cwd().map(Path::to_path_buf));
+                    (
+                        Some(target.as_u64()),
+                        session.screen(&tako_core::theme::Theme::default()),
+                        cwd,
+                    )
+                }
+            };
+            let home = tako_core::paths::home_dir();
+            let links =
+                tako_core::links::detect_links_with_home(&screen, cwd.as_deref(), home.as_deref());
+            let items: Vec<Value> = links
+                .iter()
+                .map(|link| {
+                    let mut item = json!({
+                        "kind": match link.kind {
+                            tako_core::LinkKind::Url => "url",
+                            tako_core::LinkKind::Path => "path",
+                        },
+                        "target": link.target,
+                        "text": tako_core::links::screen_text_of(&screen, link),
+                        "spans": link
+                            .spans
+                            .iter()
+                            .map(|&(row, sc, ec)| json!([row, sc, ec]))
+                            .collect::<Vec<_>>(),
+                    });
+                    // パスは「cmd+クリックでどう開くか」まで答える（#1283 の受け入れ条件 3）。
+                    // 対応表の正本は `tako_core::open_plan`
+                    if link.kind == tako_core::LinkKind::Path {
+                        let path = std::path::Path::new(&link.target);
+                        let is_dir = path.is_dir();
+                        item["open"] = json!(tako_core::open_plan::route(path, is_dir).as_str());
+                        item["is_dir"] = json!(is_dir);
+                    }
+                    item
+                })
+                .collect();
+            Ok(json!({
+                "pane": pane_id,
+                "cols": screen.cols,
+                "cwd": cwd.as_ref().map(|c| c.display().to_string()),
+                "source": if pane_id.is_some() { "pane" } else { "text" },
+                "count": items.len(),
+                "links": items,
+            }))
+        }
         Request::Scroll { pane, to, delta } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
             let session = host
@@ -2024,29 +2113,10 @@ fn dispatch_inner(
                     resolved.display()
                 )));
             }
-            let mode =
-                mode.unwrap_or_else(|| match resolved.extension().and_then(|e| e.to_str()) {
-                    Some(ext) if ext.eq_ignore_ascii_case("md") => PreviewModeWire::Markdown,
-                    Some(ext) if ext.eq_ignore_ascii_case("markdown") => PreviewModeWire::Markdown,
-                    Some(ext)
-                        if matches!(
-                            ext.to_ascii_lowercase().as_str(),
-                            "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg"
-                        ) =>
-                    {
-                        PreviewModeWire::Image
-                    }
-                    Some(ext) if ext.eq_ignore_ascii_case("pdf") => PreviewModeWire::Pdf,
-                    Some(ext)
-                        if matches!(
-                            ext.to_ascii_lowercase().as_str(),
-                            "mp4" | "webm" | "mov" | "avi" | "mkv"
-                        ) =>
-                    {
-                        PreviewModeWire::Video
-                    }
-                    _ => PreviewModeWire::Code,
-                });
+            // 拡張子 → プレビュー種別の対応表は `tako_core::open_plan` が正本（#1283）。
+            // リンク検出の応答（`tako links` の `open`）が同じ表を引くので、
+            // 「cmd+クリックがどう開くか」は機械で読める
+            let mode = mode.unwrap_or_else(|| preview_mode_wire(&resolved));
             // 表示先の解決: new_tab 指定（FR-3.22 = Finder の「このアプリケーションで
             // 開く」）なら新しいタブ 1 枚をそのファイル専用にする。direction 指定
             // （FR-3.11 = D&D のドロップ位置）なら再利用せず必ずその方向へ分割。
@@ -15721,6 +15791,104 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, DispatchError::InvalidParams(_)));
+    }
+
+    /// #1283: 画面テキストからのリンク検出が dispatch で読めること。
+    ///
+    /// **地の文に埋まったパス**（Issue の 3 形: バッククォート + 全角句読点囲み /
+    /// CJK 直後 / 素）が全部 1 本ずつ出て、`open` に cmd+クリックの行き先
+    /// （`.mp4` = video）が載る。
+    ///
+    /// ここは**絶対パス**で書く: `~` 展開の入口は `HOME`（プロセス全体の状態）なので、
+    /// 差し替えると並列で走る他のテストと混ざる（#1274 の教訓）。`~` 起点の解決は
+    /// `links.rs` の単体（ホームを引数で注入）と隔離 GUI の実測が担保する
+    #[test]
+    fn links_は画面テキストの3形から地の文に埋まったパスを検出する_1283() {
+        let mut host = MockHost::new();
+        let dir = std::env::temp_dir().join(format!("tako_dispatch_1283_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("tako-promo")).unwrap();
+        let mp4 = dir.join("tako-promo/tako-explainer-v4.mp4");
+        std::fs::write(&mp4, "").unwrap();
+        let shown = mp4.display().to_string();
+
+        let text = format!(
+            "動画は`{shown}`、確認して。\n\
+             > {shown}このリンクが CMD＋クリックで飛べない\n\
+             {shown}"
+        );
+        let result = dispatch(
+            &mut host,
+            Request::Links {
+                pane: None,
+                text: Some(text),
+                cols: Some(240),
+                cwd: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(result["source"], "text");
+        assert_eq!(result["count"], 3, "3 形すべてが 1 本ずつ出る: {result}");
+        let links = result["links"].as_array().unwrap();
+        for (i, link) in links.iter().enumerate() {
+            assert_eq!(link["kind"], "path", "形 {}", i + 1);
+            assert_eq!(
+                std::path::Path::new(link["target"].as_str().unwrap()),
+                mp4.as_path(),
+                "形 {} の解決先",
+                i + 1
+            );
+            assert_eq!(
+                link["text"],
+                shown,
+                "形 {} の画面上の文字列（下線が付く範囲）",
+                i + 1
+            );
+            // cmd+クリックの行き先（`.mp4` = 動画プレビュー）。表の正本は open_plan
+            assert_eq!(link["open"], "video", "形 {}", i + 1);
+            assert_eq!(link["is_dir"], false, "形 {}", i + 1);
+            assert_eq!(link["spans"][0][0], i, "形 {} は {} 行目", i + 1, i);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1283: `open` はディレクトリと拡張子で変わる（表の正本は `tako_core::open_plan`）
+    #[test]
+    fn links_の_open_はディレクトリと拡張子で変わる_1283() {
+        let mut host = MockHost::new();
+        let dir =
+            std::env::temp_dir().join(format!("tako_dispatch_1283_open_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("README.md"), "").unwrap();
+        std::fs::write(dir.join("archive.zip"), "").unwrap();
+
+        let text = format!(
+            "{}\n{}\n{}",
+            dir.join("sub").display(),
+            dir.join("README.md").display(),
+            dir.join("archive.zip").display()
+        );
+        let result = dispatch(
+            &mut host,
+            Request::Links {
+                pane: None,
+                text: Some(text),
+                cols: Some(200),
+                cwd: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        let links = result["links"].as_array().unwrap();
+        assert_eq!(links.len(), 3, "{result}");
+        assert_eq!(links[0]["open"], "terminal");
+        assert_eq!(links[0]["is_dir"], true);
+        assert_eq!(links[1]["open"], "markdown");
+        // 未知の拡張子はテキストとして開く（読めなければ preview が「バイナリファイル」を出す）
+        assert_eq!(links[2]["open"], "code");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #818: 上限の取得・変更が 1 経路（dispatch）で完結し、範囲外は理由つきで弾く。

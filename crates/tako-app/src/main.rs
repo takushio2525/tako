@@ -14407,7 +14407,20 @@ impl TakoApp {
                     }
                 }
             }
-            Err(e) => eprintln!("warning: パスを開けない: {e}"),
+            // #1283: 失敗を `eprintln!` だけにしない（GUI の stderr は誰も読めないので
+            // 「cmd+クリックしても無言で何も起きない」になる）。理由をサイドバーの
+            // 通知欄へ出し、同じ 1 行を persist.log にも残す
+            Err(e) => {
+                let reason = e.to_string();
+                tako_control::diag::persist_log(&format!(
+                    "パスを開けない: pane={} 理由={reason}",
+                    pane_id.as_u64()
+                ));
+                self.set_remote_notice(
+                    crate::ui_text::sidebar::notice_open_failed(target, &reason),
+                    true,
+                );
+            }
         }
         self.drain_pending_highlights(cx);
         cx.notify();
@@ -65869,15 +65882,22 @@ mod self_test {
                 wait(cx, 150).await;
                 notify_and_draw(any1182, window1182, cx);
 
-                // 5 行の fixture。空白入りは**二重引用符**で囲む（`extract_path_tokens` が
-                // 剥がす。単引用符は printf の引数を割るので使えない）
+                // 7 行の fixture。空白入りは**二重引用符**で囲む（`extract_path_tokens` が
+                // 剥がす。単引用符は printf の引数を割るので使えない）。
+                // 末尾 2 行は #1283 の**地の文に埋まった形**（バッククォート + 全角句読点
+                // 囲み / CJK 直後）。`printf '%b' '…'` の単引用符の中なので
+                // バッククォートはそのまま出せる（この項目は unix 限定）
+                let prose_quoted147 = format!("動画は`{}`、確認して。", plain147.display());
+                let prose_cjk147 = format!("> {}このリンクが飛べない", plain147.display());
                 let body147 = format!(
-                    "{}\n\"{}\"\n{}\n{}\n{}:42:5\n",
+                    "{}\n\"{}\"\n{}\n{}\n{}:42:5\n{}\n{}\n",
                     plain147.display(),
                     spaced147.display(),
                     dir147.display(),
                     missing147.display(),
                     plain147.display(),
+                    prose_quoted147,
+                    prose_cjk147,
                 );
                 let paint147 = sh.paint_and_hold(&body147, 120);
                 let _ = window1182.update(cx, |app: &mut TakoApp, _, cx| {
@@ -65980,6 +66000,61 @@ mod self_test {
                     f32::from(geom147.cell.height),
                     geom147.lines.len(),
                     shown147.map(|d| format!("{:.1}s", d.as_secs_f32())),
+                );
+
+                // #1283: **地の文に埋まったパス**も同じ検出でリンクになること。
+                //
+                // 修正前はトークンの区切りが ASCII の空白と `()[]{}<>,;` だけだったので、
+                // 日本語の文の中にパスが出ると**文ごと 1 トークン**になり、実在チェックで
+                // 落ちて 1 つもリンクにならなかった（素の形だけが飛べていた = Issue の症状）。
+                //
+                // **行番号では照合しない**: 地の文つきの行は幅を超えて折り返すので
+                // （実測: 84 桁のペインで `動画は`+76 桁のパス+`、確認して。` = 96 桁 →
+                // 囲みの行が 2 行に割れる）、「その行の text と一致」では永久に引けない。
+                // 代わりに **`plain147` を指すリンクの本数とスパン幅**で見る。
+                // fixture の 7 行のうち `plain147` を指すのは 4 本
+                // （素 / `:42:5` / バッククォート囲み / CJK 直後）で、修正前は 2 本
+                let want147 = plain147.display().to_string();
+                let plain_widths147 = window1182
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.refresh_pane_links(pane_id147);
+                        let mut widths: Vec<usize> = app
+                            .pane_links
+                            .get(&pane_id147)
+                            .map(|links| {
+                                links
+                                    .iter()
+                                    .filter(|l| {
+                                        l.kind == tako_core::LinkKind::Path && l.target == want147
+                                    })
+                                    .map(|l| l.spans.iter().map(|&(_, sc, ec)| ec - sc).sum())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        widths.sort_unstable();
+                        widths
+                    })
+                    .unwrap_or_default();
+                let len147 = want147.len();
+                println!(
+                    "TAKO_SELF_TEST_1283: plain_widths={plain_widths147:?} path_len={len147}"
+                );
+                check(
+                    plain_widths147.len() == 4,
+                    &format!(
+                        "147: 地の文に埋まったパスもリンクになる（バッククォート + 全角句読点 / \
+                         CJK 直後。#1283。plain を指すリンク {} 本 / 期待 4 本）",
+                        plain_widths147.len()
+                    ),
+                );
+                // 下線の範囲は**パスの部分だけ**（地の文まで伸びない）。
+                // 3 本はパスちょうど、1 本は `:42:5` を含む長さになる
+                check(
+                    plain_widths147 == vec![len147, len147, len147, len147 + ":42:5".len()],
+                    &format!(
+                        "147: 地の文に埋まったパスのスパンがパスの長さと一致する (#1283。\
+                         widths={plain_widths147:?} len={len147})"
+                    ),
                 );
 
                 // **実 OS マウスと同じ `PlatformInput` 経路**で右クリックを流す（#496 の作法）。

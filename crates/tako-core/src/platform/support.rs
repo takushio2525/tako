@@ -110,6 +110,11 @@ pub mod notes {
 
     // ─── 実測で分かっている縮退 ───────────────────────────────────
 
+    /// #153 / #1283。ターミナル内のパス検出は `/` を含む形だけを候補にする
+    pub const WIN_PATH_LINK_BACKSLASH: Note = Note::new(
+        "`C:\\…` のバックスラッシュ絶対パスはリンクにならない（`/` を含む形だけが候補。`src/main.rs` のような相対パスは効く）",
+        "Backslash absolute paths (`C:\\…`) are not detected as links; only forms containing `/` are candidates (relative paths like `src/main.rs` work).",
+    );
     /// #693。Windows.Data.Pdf はページ画像は返すが文字位置を返さない
     pub const WIN_PDF_NO_TEXT_LAYER: Note = Note::new(
         "PDF はページ画像として表示できるが、Windows のレンダラが文字位置を返さないため文字選択・目次・PDF 内リンクは使えない（#693）",
@@ -724,6 +729,23 @@ pub const MATRIX: &[Feature] = &[
         windows: Support::Supported,
         windows_evidence: Evidence::Measured(
             "#937 の Windows 11 実測: `tako limit-service` が現在サービスを返し、claude → codex → claude の切替が反映される",
+        ),
+    },
+    Feature {
+        key: "tako_links",
+        macos: Support::Supported,
+        // 検出そのものは OS に依らない（`tako links --text` は両 OS で同じ答えを出す）。
+        // ただし **`C:\…` のバックスラッシュ絶対パスはリンクにならない**
+        // （`links::is_path_like` が `/` を含む形だけを候補にする = #153 の既存制約。
+        // `src/main.rs` のような `/` 区切りの相対パスは効く）。#1283 で足した
+        // 「地の文に埋まったパスを削って探す」側は文字種で判断するので両 OS 同じ
+        windows: Support::Degraded {
+            note: notes::WIN_PATH_LINK_BACKSLASH,
+        },
+        // 検出は純粋関数（画面テキスト → リンク）なので、両 OS で走る単体が根拠になる。
+        // 縮退（バックスラッシュ絶対パス）は #153 からの設計判断で、実測を待つ余地が無い
+        windows_evidence: Evidence::UnitTest(
+            "links の単体（地の文に埋まったホーム起点のパス / 全角記号入りのファイル名 / 候補の切り出し規則）と dispatch の links 経路。どちらも OS 非依存で Windows ランナーでも走る",
         ),
     },
     Feature {
