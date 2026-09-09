@@ -1669,6 +1669,7 @@ mod tests {
             command: None,
             cwd: Some(std::path::PathBuf::from("/tmp/work")),
             env: vec![("TAKO_PANE_ID".into(), "7".into())],
+            scrollback_lines: None,
         };
         let (wrapped, session) = wrap_spawn_for_pane(
             host,
@@ -1750,6 +1751,7 @@ mod tests {
             }),
             cwd: None,
             env: vec![],
+            scrollback_lines: None,
         };
 
         // persist OFF: 器を持つ backend でも器は配らない（ユーザー設定が最優先）

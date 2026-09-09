@@ -316,6 +316,7 @@ mod tests {
             }),
             cwd: Some(std::env::temp_dir()),
             env: vec![],
+            scrollback_lines: None,
         };
         let (session, _rx) =
             crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, "tako-e2e-mir"))
@@ -392,6 +393,7 @@ mod tests {
             }),
             cwd: Some(std::env::temp_dir()),
             env: vec![],
+            scrollback_lines: None,
         };
         let (session, _rx) =
             crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, "tako-e2e-sw"))

@@ -161,6 +161,7 @@ tako/
 | **再起動後にエージェントが戻らないとき（#1076 / #1238）** | `<data_dir>/persist.log` の「復元の内訳」 |
 | セッションカタログ（会話の発見・復元。#112 / #1069） | `tako sessions list [--role r] [--project p]` |
 | ペインの平文ログ（ペイン死亡後も出力を遡る。#112） | `tako logs list` |
+| **スクロールバック保持上限（直接ペインの RAM。#818）** | `tako scrollback [lines]` |
 | スリープ防止 | `tako sleep-guard status` |
 | **会話を引き継いだセッション再起動（ペインの右クリック。#1067）** | `tako session-restart [--mode harness|handoff] [--pane N]` |
 | **リミット後の自動復帰（ペイン単位。#813）** | `tako limit-resume [on|off] [--pane N] [--all]` |

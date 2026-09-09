@@ -410,6 +410,7 @@ mod tests {
                 ("TAKO_TOKEN".into(), "secret".into()),
                 ("TAKO_TAB_ID".into(), "3".into()),
             ],
+            scrollback_lines: None,
         };
         let wrapped = b.wrap_spawn(options.clone(), &session);
         let cmd = wrapped
@@ -484,6 +485,7 @@ mod tests {
             }),
             cwd: None,
             env: vec![],
+            scrollback_lines: None,
         };
         let args = b.wrap_spawn(options, &session).command.unwrap().args;
         let inner = args.last().unwrap();

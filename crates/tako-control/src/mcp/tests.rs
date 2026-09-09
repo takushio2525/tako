@@ -530,6 +530,21 @@ mod tests {
         assert_eq!(requests, vec![Request::PreviewCache { max_mb: Some(768) }]);
     }
 
+    /// #818: 状態取得と上限変更が Request へ 1:1 で写る
+    #[test]
+    fn scrollbackは状態取得と上限変更をrequestへ写す() {
+        let (_, requests) = run(call("tako_scrollback", json!({})), None, true);
+        assert_eq!(requests, vec![Request::Scrollback { lines: None }]);
+
+        let (_, requests) = run(call("tako_scrollback", json!({ "lines": 2000 })), None, true);
+        assert_eq!(
+            requests,
+            vec![Request::Scrollback {
+                lines: Some(2_000)
+            }]
+        );
+    }
+
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
@@ -553,7 +568,8 @@ mod tests {
         // #1057 の tako_setup_deps（任意依存の検出とその場導入）を追加して 143
         // #1067 の tako_session_restart（会話を引き継いだ再起動）を追加して 144
         // #1154 の tako_orchestrator_guide（master の手順書）を追加して 146
-        assert_eq!(tools.len(), 146);
+        // #818 の tako_scrollback（スクロールバック保持上限）を追加して 147
+        assert_eq!(tools.len(), 147);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

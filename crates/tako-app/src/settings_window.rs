@@ -95,6 +95,7 @@ enum EditField {
     /// 既存拡張子のコマンド編集（拡張子）
     RunnerCmd(String),
     PreviewCacheMb,
+    ScrollbackLines,
     PaneLogMaxMb,
     PaneLogTotalMaxMb,
     /// settings.json 直接編集（複数行）
@@ -120,6 +121,7 @@ impl EditField {
             EditField::RunnerNewCmd => "runner-new-cmd".into(),
             EditField::RunnerCmd(ext) => format!("runner-cmd-{ext}"),
             EditField::PreviewCacheMb => "preview-cache".into(),
+            EditField::ScrollbackLines => "scrollback-lines".into(),
             EditField::PaneLogMaxMb => "pane-log-max".into(),
             EditField::PaneLogTotalMaxMb => "pane-log-total".into(),
             EditField::AdvancedJson => "advanced-json".into(),
@@ -468,6 +470,10 @@ impl SettingsWindow {
                 Ok(mb) => self.run(Request::PreviewCache { max_mb: Some(mb) }, cx),
                 Err(_) => self.message = Some((txt::error_number().to_string(), true)),
             },
+            EditField::ScrollbackLines => match value.parse::<usize>() {
+                Ok(lines) => self.run(Request::Scrollback { lines: Some(lines) }, cx),
+                Err(_) => self.message = Some((txt::error_number().to_string(), true)),
+            },
             EditField::PaneLogMaxMb => match value.parse::<u64>() {
                 Ok(mb) => self.run(logs_set(Some(mb), None), cx),
                 Err(_) => self.message = Some((txt::error_number().to_string(), true)),
@@ -647,6 +653,9 @@ impl SettingsWindow {
             },
             Request::PreviewCache {
                 max_mb: Some(s.preview_cache_max_mb),
+            },
+            Request::Scrollback {
+                lines: Some(s.resolved_scrollback_lines()),
             },
             Request::LimitService {
                 action: Some("set".into()),
@@ -1530,6 +1539,25 @@ impl SettingsWindow {
                         action: Some("set".into()),
                         service: Some(value.to_string()),
                     },
+                ),
+            ))
+            // ターミナル（Issue #818）
+            .child(
+                div()
+                    .pt_3()
+                    .border_t_1()
+                    .border_color(to_hsla(theme.border_subtle))
+                    .child(self.section(txt::section_terminal())),
+            )
+            .child(self.row(
+                txt::label_scrollback_lines(),
+                txt::desc_scrollback_lines(),
+                self.text_field(
+                    EditField::ScrollbackLines,
+                    &s.resolved_scrollback_lines().to_string(),
+                    "10000",
+                    Some(px(90.)),
+                    cx,
                 ),
             ))
             .child(

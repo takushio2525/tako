@@ -833,6 +833,25 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_scrollback",
+            "description": "直接ペイン（tmux バックエンドを使わないペイン）のスクロールバック保持上限を確認・変更する。\
+                lines 省略時は現在値と既定・下限・上限・適用中のペイン数を返す。変更値は settings.json に永続化し、\
+                生存中のペインへもその場で適用する（下げれば履歴が切り詰められて RAM が戻る）。\
+                飽和時のフットプリントは 行 × 桁 × 24 バイトに比例するので、軽量運用では下げる。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "lines": {
+                        "type": "integer",
+                        "minimum": 100,
+                        "maximum": 100000,
+                        "description": "保持行数（既定 10000）"
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_preview_edit",
             "description": "コードプレビューの編集モードを開始・終了する。enabled 省略時は状態取得。\
                 PDF・画像・動画・末尾省略された巨大ファイルは編集できない。状態は editing / dirty で返す。",

@@ -1261,6 +1261,7 @@ set -gq copy-mode-position-format ''
             }),
             cwd: Some("/tmp".into()),
             env: vec![("TAKO_PANE_ID".into(), "3".into())],
+            scrollback_lines: None,
         };
         let wrapped = wrap_options(options, "tako-test", "tako-abc123");
         let command = wrapped.command.expect("tmux コマンドに置き換わる");
@@ -1546,6 +1547,7 @@ set -gq copy-mode-position-format ''
             }),
             cwd: Some(std::env::temp_dir()),
             env: vec![],
+            scrollback_lines: None,
         };
 
         fn wait_for(session: &crate::TerminalSession, needle: &str) -> bool {
@@ -1614,6 +1616,7 @@ set -gq copy-mode-position-format ''
             command: None,
             cwd: Some("/".into()),
             env,
+            scrollback_lines: None,
         };
         let (mut session, mut rx) =
             crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, "tako-e2e-osc"))
@@ -1693,6 +1696,7 @@ set -gq copy-mode-position-format ''
                 ("TAKO_PANE_ID".into(), "1".into()),
                 ("SHELL".into(), "/bin/zsh".into()),
             ],
+            scrollback_lines: None,
         };
         let (mut session, mut rx) =
             crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, "tako-e2e-stale"))
@@ -1748,6 +1752,7 @@ set -gq copy-mode-position-format ''
                 ("TAKO_PANE_ID".into(), "1".into()),
                 ("SHELL".into(), "/bin/zsh".into()),
             ],
+            scrollback_lines: None,
         };
         let (mut session, mut rx) =
             crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, "tako-e2e-name"))
@@ -1793,6 +1798,7 @@ set -gq copy-mode-position-format ''
             }),
             cwd: Some(std::env::temp_dir()),
             env: vec![],
+            scrollback_lines: None,
         };
         let (session, _rx) =
             crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, session_name))
@@ -1996,6 +2002,7 @@ set -gq copy-mode-position-format ''
             }),
             cwd: Some(std::env::temp_dir()),
             env: vec![],
+            scrollback_lines: None,
         };
         let session_name = "tako-e2e-flood";
         let (mut session, mut rx) =
@@ -2141,6 +2148,7 @@ set -gq copy-mode-position-format ''
             }),
             cwd: Some(std::env::temp_dir()),
             env: vec![],
+            scrollback_lines: None,
         };
         let (session, _rx) =
             crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, "tako-e2e-esc"))
@@ -2217,6 +2225,7 @@ set -gq copy-mode-position-format ''
             }),
             cwd: Some(std::env::temp_dir()),
             env: vec![],
+            scrollback_lines: None,
         };
         let (session, _rx) = crate::TerminalSession::spawn(
             80,
@@ -2364,6 +2373,7 @@ set -gq copy-mode-position-format ''
             // .app（Finder 起動）のロケール無し環境を再現する（テスト実行シェルの
             // LANG を C で上書き。子プロセスへは合成 env が優先で渡る）
             env: vec![("LC_ALL".into(), "C".into()), ("LANG".into(), "C".into())],
+            scrollback_lines: None,
         };
         let (session, _rx) =
             crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, "tako-e2e-cjk"))
@@ -2412,6 +2422,7 @@ set -gq copy-mode-position-format ''
             }),
             cwd: Some(std::env::temp_dir()),
             env: vec![],
+            scrollback_lines: None,
         };
         let (session, _rx) =
             crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, "tako-e2e-ind"))
@@ -2582,6 +2593,7 @@ set -gq copy-mode-position-format ''
             }),
             cwd: Some(std::env::temp_dir()),
             env: vec![],
+            scrollback_lines: None,
         };
         let (session, _rx) =
             crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, "tako-e2e-alt"))

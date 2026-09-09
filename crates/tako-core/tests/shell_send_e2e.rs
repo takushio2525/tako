@@ -91,6 +91,7 @@ fn spawn_wrapped(bin: &str, socket: &str, tag: &str) -> TerminalSession {
             command: None,
             cwd: None,
             env: Vec::new(),
+            scrollback_lines: None,
         },
         &SessionRef::new(format!("tako-e640-{tag}-{}", std::process::id())).unwrap(),
     );

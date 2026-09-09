@@ -752,6 +752,12 @@ fn initial_ssh_auto_folders() -> bool {
     tako_control::settings::load().ssh_auto_folders
 }
 
+/// 直接ペインのスクロールバック保持上限（Issue #818）の起動時の値。
+/// 設定ファイルが無い / 手書きの範囲外値でも起動は成立させる（`clamp_lines`）
+fn initial_scrollback_lines() -> usize {
+    tako_control::settings::load().resolved_scrollback_lines()
+}
+
 /// listen ポート検知（FR-2.4.4）の起動時の有効判定。
 /// セルフテストでは検知経路そのものを機械検証するため常に有効で始める
 fn initial_port_detect() -> bool {
@@ -1640,6 +1646,9 @@ struct TakoApp {
     dismissed_ports: std::collections::HashSet<(PaneId, u16)>,
     /// tmux バックエンド永続化（Phase 5.5 / FR-5）の有効状態（dispatch から切替）
     tmux_persist: bool,
+    /// 直接ペインのスクロールバック保持上限（行。Issue #818。dispatch から変更）。
+    /// 新規ペインの `SpawnOptions` へ載せ、変更時は生存中のペインへも適用する
+    scrollback_lines: usize,
     /// セカンダリモード（Issue #113）: 別インスタンス（別プロセス or 同一プロセスの先行
     /// ウィンドウ）がプライマリとして生きている間 true。復元・layout.json への書き込み /
     /// 削除・tmux バックエンド・persist トグルを封じ、プライマリの作業を一切壊さない
@@ -3654,6 +3663,7 @@ impl TakoApp {
             remote_recovery: HashMap::new(),
             dismissed_ports: std::collections::HashSet::new(),
             tmux_persist,
+            scrollback_lines: initial_scrollback_lines(),
             secondary,
             quitting: false,
             backend_sessions: HashMap::new(),
@@ -7517,6 +7527,11 @@ impl TakoApp {
         } else {
             self.backend_sessions.remove(&pane_id);
         }
+        // #818: スクロールバック上限は設定値を既定にする。呼び出し側が明示していれば
+        // そちらを尊重する（`get_or_insert` なので上書きしない）
+        options
+            .scrollback_lines
+            .get_or_insert(self.scrollback_lines);
         let (session, mut rx) = TerminalSession::spawn(INITIAL_COLS, INITIAL_ROWS, options)?;
         // #1199: 器なしのペインは PTY 直下の子がそのままシェルなので、側路の待ち合わせ先を
         // ここで張れる（器ありは器へ `#{pane_pid}` を聞いてから張る = 下のリトライ）
@@ -19441,6 +19456,37 @@ impl SessionHost for TakoApp {
         self.scroll_ctls.remove(&pane);
         self.drop_tmux_view_session(pane);
         self.drop_backend_session(pane, origin, caller);
+    }
+
+    fn scrollback_status(&self) -> tako_core::scrollback::ScrollbackStatus {
+        tako_core::scrollback::ScrollbackStatus {
+            lines: self.scrollback_lines,
+            panes: self.terminals.len(),
+            max_cols: self
+                .terminals
+                .values()
+                .map(|s| s.size().0)
+                .max()
+                .unwrap_or(0),
+        }
+    }
+
+    fn set_scrollback_lines(&mut self, lines: usize) {
+        let lines = tako_core::scrollback::clamp_lines(lines);
+        self.scrollback_lines = lines;
+        // **生存中のペインへもその場で当てる**（下げたぶんの履歴は解放される）。
+        // 次回作成からにすると「設定したのに RAM が戻らない」になる
+        for session in self.terminals.values_mut() {
+            session.set_scrollback_limit(lines);
+        }
+        // セルフテスト中はユーザー設定を汚さない（preview cache と同じ規約）
+        if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            let mut settings = tako_control::settings::load();
+            settings.scrollback_lines = lines;
+            if let Err(e) = tako_control::settings::save(&settings) {
+                eprintln!("warning: 設定を保存できない: {e}");
+            }
+        }
     }
 
     fn reattach_backgrounded(&mut self, pane: PaneId) {

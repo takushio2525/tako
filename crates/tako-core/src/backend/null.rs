@@ -119,6 +119,7 @@ mod tests {
             }),
             cwd: Some(PathBuf::from("/tmp")),
             env: vec![("TAKO_PANE_ID".into(), "7".into())],
+            scrollback_lines: None,
         }
     }
 

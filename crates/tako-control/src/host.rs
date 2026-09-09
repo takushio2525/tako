@@ -45,6 +45,14 @@ pub trait SessionHost {
     /// `origin` / `caller` は close の発生源（Issue #566）。この経路は CLI / MCP の
     /// dispatch だけが通るため、ペインログのクローズマーカーへ「誰が閉じたか」を残す
     fn detach_session(&mut self, pane: PaneId, origin: CloseOrigin, caller: Option<&str>);
+    /// 直接ペインのスクロールバック保持上限の現在状態（Issue #818）
+    fn scrollback_status(&self) -> tako_core::scrollback::ScrollbackStatus {
+        tako_core::scrollback::ScrollbackStatus::default()
+    }
+
+    /// 保持上限を変更する（Issue #818）。生存中のペインへも適用し、
+    /// settings.json へ永続化するのは実装側（GUI）の責務
+    fn set_scrollback_lines(&mut self, _lines: usize) {}
     /// バックグラウンドから復帰させたペインのセッションを再接続する（FR-2.15.3）。
     /// セッション自体はバックグラウンド送り時に破棄していないため、UI 層で再描画するだけでよい場合が多い
     fn reattach_backgrounded(&mut self, _pane: PaneId) {}

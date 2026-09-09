@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-09（#1246: .agent の md のコンフリクトマーカーを CI で落とす番犬）
-- 走査を `.agent/` 配下の md 全部 + 規約 2 本（4 → 38 ファイル）へ広げ、#1241 / #1247 の狭い版を置換。旧版は `&&` が `||` より強く判定の前半が死んでいて `=======` を一度も拾えず、8 文字以上の罫線を誤検知していた
-- `=======` は `<<<<<<<` が開いた領域の中だけで見て setext 見出しと弁別（git は必ずこの順で書くので検出力は落ちない）。実物へ 3 行挿入 → 行番号つきで名指し FAILED → 復元で緑
-- `.gitattributes` に `.agent/progress*.md merge=union`。実測で merge / diff3 / rebase とも衝突ゼロ。移送 + 追記も安全（領域が重ならない）。両採用になるのは双方が同じ領域を書き換えたときだけで、限界は conventions へ表で明記
-
 ## 2026-09-09（#1034: 送達後に実行を断られた worker を完了と誤読しないようにした）
 - `execution_refused`（`WorkerErrorKind` / `AgentCliProblem` の新分類・`recommended_action = retry_spawn`）を追加。**#983 のゲートは緩めず**、別ゲート「一次シグナルで作業を 1 歩も観測していない」で分類する（画面推定の busy は TUI の起動描画を拾うので使えない）
 - 判定の文言は系統ごとに宣言（`execution_refused_patterns`）。実採取は agy のみで**版で文言が変わる**（1.1.22 = `Verifying your account` / 1.1.27 = `Unable to verify account eligibility`）ので共通語 `account eligibility` を軸にした。claude 2.1.258 / codex 0.153.0 のバイナリに一時的な検証待ちの文言が無いことは実物の走査で確認
@@ -58,6 +53,11 @@
 - 真因は待ち不足ではなく**アンカーが偽**。conf の `set -g mouse on` で tmux は attach 時に外側端末のマウスを有効にするので、外側 `mouse_reporting()` は内側アプリと無関係に真（実測 20 ms・器側 `any=0`）。要求前のホイールは **tmux が食って copy-mode へ入り**（`pane_in_mode=1`）、以後は待ちを伸ばしても永久に届かない
 - アンカーを器のペインの `#{mouse_sgr_flag}` へ（`wait_pane_mouse_ready`）・待ちは `wait_for_state`（状態待ち + `state_wait_budget`・診断は「待っていたもの / 届いたもの」）。予算政策は `tako_core::wait_budget` の 1 実装へ寄せ tako-app が委譲。番犬 `mouse_report_wait_watchdog`
 - A/B（同一ビルド・交互・load 12〜18）: 旧待ち **7/75 FAILED** → 状態待ち **0/315**。`LEGACY=1 INJECT=late` は確定 FAILED（`inmode=true`）/ `INJECT=never` は新経路でも FAILED。副産物の osc7 系フレークは #1265 へ分離
+
+## 2026-09-09（#818: 直接ペインのスクロールバック上限を設定可能にした）
+- 正本は `tako_core::scrollback`（既定 10,000 / 100〜100,000 / 24 B・セル）。`settings.json` の `scrollback_lines`（`#[serde(default)]` = 旧ファイルはそのまま読める・移行 Step 不要）→ CLI `tako scrollback [lines]` / MCP `tako_scrollback` / 設定画面「ターミナル」節が同じ dispatch を通る
+- **生存中のペインにもその場で当たる**（`Term::set_options` → `Grid::update_history` が `Row` を解放）。隔離 GUI 実測（119 桁・persist OFF・debug）: 起動 15 MB → 12,000 行で 46 MB（+31・理論 27.2）→ 上限 1,000 で 30 MB。上限を下げた後に作った新ペインは 12,000 行流しても +2.0 MB（理論 1.8）
+- 番犬: 実 PTY の単体 3 本（上限で打ち切る / 既定なら残る / 下げると既存も縮む）+ dispatch 1 本 + MCP / CLI マッピング各 1 本
 
 ## 2026-09-09（#1114: psmux の永続化 e2e の間欠失敗を待ち不足として直した）
 - 先にフェーズ別の余裕を実測: プロンプト待ちの固定 6 秒だけが**スイート並列（18 本）だけで既に超過**（6.1〜7.1s・`rounds=2` が 10/10）。4 多重 + 負荷 12 で 20〜34s になり 6 周を使い切って **9/16 FAILED**（全件 phase 1・画面は `PS …> Write-O` = 打鍵は届いていた）
