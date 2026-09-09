@@ -891,6 +891,36 @@ fn persist_diag(msg: &str) {
     tako_control::diag::persist_log(&msg);
 }
 
+/// #777 の検証専用の注入。`TAKO_777_INJECT` が `kind` を指しているときだけ、その場で
+/// **メインスレッドを止める**（戻らない）。
+///
+/// SIGTERM の読み替え（`quit_signal`）は「握るからにはハングしても必ず死ぬ」ことと対でしか
+/// 入れられない。ウォッチドッグが本当に効くことは、応答しないアプリを実際に作らないと
+/// 示せないので、2 つの形を再現できる口を置く:
+///
+/// - `hang-main`: 受ける前からメインスレッドが固まっている（quit を撃つ機会すら無い）
+/// - `hang-quit`: 終了処理（`on_app_quit`）に入ったまま返らない
+///
+/// **未設定の通常起動は 1 ビットも変わらない**（env の比較 1 回だけ）
+fn inject_777_hang(kind: &str) {
+    // env の読みは 1 度だけ（500ms ループから毎周期呼ばれる + 起動時の `set_var` と
+    // 競合させない）。`legacy_1191` と同じ形
+    static WANT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    if WANT
+        .get_or_init(|| std::env::var("TAKO_777_INJECT").ok())
+        .as_deref()
+        != Some(kind)
+    {
+        return;
+    }
+    persist_diag(&format!(
+        "#777 の注入: {kind}（ここでメインスレッドを止める。ウォッチドッグの検証専用）"
+    ));
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
+}
+
 /// GPUI ウィンドウの close に失敗したときの診断行（#828）。
 ///
 /// `sync_viewports` は対応表を先に落としてから close を投げるので、ここで失敗すると
@@ -3931,6 +3961,8 @@ impl TakoApp {
         // 「全ペイン終了」経路（quitting=true）は layout.json の削除 / 保持を
         // close_pane 側で確定済みのため、ここでは触らない（#30 / #113 の挙動を維持）
         cx.on_app_quit(|this: &mut TakoApp, _cx| {
+            // #777 の検証専用の注入: 終了処理に入ったまま返らないアプリを作る
+            inject_777_hang("hang-quit");
             // 終了の痕跡を必ず残す（#381: silent death 調査で「このログがあるのに次の
             // 起動が無い = 正常終了、ログすら無い = kill / パニック」を切り分けるため）
             if !this.secondary {
@@ -4628,7 +4660,26 @@ impl TakoApp {
             cx.background_executor()
                 .timer(Duration::from_millis(500))
                 .await;
+            // SIGTERM を正規の quit（`on_app_quit` を通る）として扱う（#777。元は #770 の
+            // 隔離検証限定だった）。Cmd+Q と同じ `cx.quit()` を通すので、走るのは本番の
+            // 終了経路そのもの = layout が最新化されてから終わる。**2 秒 tick ではなく
+            // ここで見る**のは、新しいタイマーを増やさずに最悪待ちを 1/4 にできるため
+            // （既存ループへの追加コストはアトミック 1 回）
+            if tako_core::platform::quit_signal::take_quit_request() {
+                // 「SIGTERM 由来の quit だった」と後から切り分けられるように 1 行残す
+                // （FR-5.7 の診断可能性。セカンダリは persist.log を汚さない = FR-5.15）
+                let _ = this.update(cx, |app: &mut TakoApp, _| {
+                    if !app.secondary {
+                        persist_diag(&tako_core::platform::quit_signal::received_log_line());
+                    }
+                });
+                cx.update(|cx| cx.quit());
+                break;
+            }
             let ok = this.update(cx, |app: &mut TakoApp, _| {
+                // #777 の検証専用の注入: 受ける前からメインスレッドが固まっているアプリを
+                // 作る（quit を撃つ機会すら無い = まさに `pkill` したくなる状況）
+                inject_777_hang("hang-main");
                 if !app.alt_screen_writes.is_empty() {
                     app.flush_alt_screen_writes();
                 }
@@ -4655,13 +4706,7 @@ impl TakoApp {
             let mut pane_log_tick: u32 = 0;
             loop {
                 cx.background_executor().timer(Duration::from_secs(2)).await;
-                // 隔離インスタンスへの SIGTERM を正規の quit として扱う（#770）。
-                // 本番では仕掛けが入らないので何も起きない。Cmd+Q と同じ
-                // `cx.quit()` を通すので、実測しているのは本番と同じ終了経路
-                if tako_core::platform::quit_signal::take_quit_request() {
-                    cx.update(|cx| cx.quit());
-                    break;
-                }
+                // SIGTERM の読み替えはここではなく 500ms ループで見る（#777）
                 // リモート接続の承認待ち・接続端末を更新（#283。状態確認 + admin API は
                 // すべて background で行い、UI スレッドをブロックしない。daemon 停止中は
                 // running=false になるだけ）
@@ -24318,10 +24363,12 @@ fn main() {
     // 登録前は従来どおり全スレッドが対象なので、この行より前の計測は変わらない
     tako_control::diag::mark_main_thread();
     tako_control::diag::spawn_stall_watchdog();
-    // #770: 隔離インスタンスに限り SIGTERM を正規の quit（`on_app_quit` を通る）へ
-    // 読み替える。「quit がセッションを kill しない」ことを pid 指定で実測するため。
-    // 本番は仕掛けを入れないので SIGTERM の挙動は不変
-    tako_core::platform::quit_signal::install_for_isolated_verification();
+    // #777: SIGTERM を正規の quit（`on_app_quit` を通る）へ読み替える。**本番も対象**
+    // （#770 では隔離インスタンス限定だった）。`kill -TERM` / スクリプトからの停止でも
+    // 直前の構成が layout.json に載り、蓋閉じ防止も解除される。握るからには
+    // 「猶予（既定 5 秒）を過ぎたら必ず死ぬ」ウォッチドッグが対で要る = install が両方入れる。
+    // 強制終了の理由は persist.log に残す（A/B は `TAKO_777_LEGACY=1`）
+    tako_core::platform::quit_signal::install(persist_diag);
     // 一括隔離モード（#177）: TAKO_ISOLATED=1 だけで本番リソース（layout.json /
     // tmux バックエンド / discovery）に一切触れない起動になる。実験・検証で個別の
     // 隔離変数を指定し漏らす事故（TAKO_DISCOVERY_DIR だけ隔離した dev 起動が

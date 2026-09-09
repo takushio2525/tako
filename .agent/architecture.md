@@ -460,7 +460,10 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
   再現（`Pane::restore` 等が採番カウンタを fetch_max で先へ進める）。これで tmux 内で
   生き続けるプロセスの `TAKO_PANE_ID` / `TAKO_TAB_ID` が再起動後も有効。旧 socket/token は
   CLI / MCP ブリッジの control.json フォールバック（FR-2.2.9）が吸収する。
-  保存は 2 秒ポーリング + dispatch 後 + cmd+Q 時（差分時のみ書き込み）
+  保存は 2 秒ポーリング + dispatch 後 + cmd+Q 時 + **`SIGTERM` 時**（差分時のみ書き込み）。
+  `SIGTERM` は quit 要求へ読み替えて Cmd+Q と同じ `cx.quit()` を通す（#777。`tako_core::platform::quit_signal`）。
+  握るからには「猶予（5 秒）を過ぎたら必ず `std::process::exit`」するウォッチドッグと**対**で入れる —
+  でないとハング中に `kill` が効かないアプリになる。Windows は `SIGTERM` が無いので対象外
 - **PC 再起動時の Claude 会話復旧**（Issue #139）: `tako-control::agents` が
   `claude agents --json` を 1 回取得し、tmux `pane_pid` への祖先照合で確定した
   backend session → Claude session ID 対応を 5 秒ごとにバックグラウンド更新する。

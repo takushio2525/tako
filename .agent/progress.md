@@ -19,26 +19,6 @@
 
 ---
 
-## 2026-09-09（#1263: auto mode の環境学習ダイアログを select として検知できるようにした）
-- 真因は**ダイアログの下に空の入力欄が描かれる**こと（実測: Issue の 6 行だけなら旧実装でも検知でき、入力欄を足すと `None`）。`dialog.rs` に経路 4 を足し、**入力欄はダイアログの外**とみなして上を見る。開放するのは番号つき経路だけ（番号なしまで広げると複数行の user 発話の継続行を選択肢と誤検知する）
-- 生きたダイアログと**会話ログへ流れた残骸**の区別は「並びと入力欄のあいだがダイアログの一部だけでできているか」（#577 の fixture は `✽ Misting…` が挟まる = 非検知。この条件を入れる前は #577 のテストが実際に落ちた）。確定キーの案内が無い形は拾わない = 安全側
-- 模擬 TUI（実 tmux・GUI 不要）で respond の実キー: ラベル `Don't show again` / 番号 `3` どちらも `keys=["3"]` で `resolved=true`。A/B `TAKO_1263_LEGACY=1` と修正前ソースで新テスト 6 本が FAILED。全 3928 件緑
-
-## 2026-09-09（#1252: マウスレポート e2e のフレークを止めた・真因は偽アンカー）
-- 真因は待ち不足ではなく**アンカーが偽**。conf の `set -g mouse on` で tmux は attach 時に外側端末のマウスを有効にするので、外側 `mouse_reporting()` は内側アプリと無関係に真（実測 20 ms・器側 `any=0`）。要求前のホイールは **tmux が食って copy-mode へ入り**（`pane_in_mode=1`）、以後は待ちを伸ばしても永久に届かない
-- アンカーを器のペインの `#{mouse_sgr_flag}` へ（`wait_pane_mouse_ready`）・待ちは `wait_for_state`（状態待ち + `state_wait_budget`・診断は「待っていたもの / 届いたもの」）。予算政策は `tako_core::wait_budget` の 1 実装へ寄せ tako-app が委譲。番犬 `mouse_report_wait_watchdog`
-- A/B（同一ビルド・交互・load 12〜18）: 旧待ち **7/75 FAILED** → 状態待ち **0/315**。`LEGACY=1 INJECT=late` は確定 FAILED（`inmode=true`）/ `INJECT=never` は新経路でも FAILED。副産物の osc7 系フレークは #1265 へ分離
-
-## 2026-09-09（#818: 直接ペインのスクロールバック上限を設定可能にした）
-- 正本は `tako_core::scrollback`（既定 10,000 / 100〜100,000 / 24 B・セル）。`settings.json` の `scrollback_lines`（`#[serde(default)]` = 旧ファイルはそのまま読める・移行 Step 不要）→ CLI `tako scrollback [lines]` / MCP `tako_scrollback` / 設定画面「ターミナル」節が同じ dispatch を通る
-- **生存中のペインにもその場で当たる**（`Term::set_options` → `Grid::update_history` が `Row` を解放）。隔離 GUI 実測（119 桁・persist OFF・debug）: 起動 15 MB → 12,000 行で 46 MB（+31・理論 27.2）→ 上限 1,000 で 30 MB。上限を下げた後に作った新ペインは 12,000 行流しても +2.0 MB（理論 1.8）
-- 番犬: 実 PTY の単体 3 本（上限で打ち切る / 既定なら残る / 下げると既存も縮む）+ dispatch 1 本 + MCP / CLI マッピング各 1 本
-
-## 2026-09-09（#1114: psmux の永続化 e2e の間欠失敗を待ち不足として直した）
-- 先にフェーズ別の余裕を実測: プロンプト待ちの固定 6 秒だけが**スイート並列（18 本）だけで既に超過**（6.1〜7.1s・`rounds=2` が 10/10）。4 多重 + 負荷 12 で 20〜34s になり 6 周を使い切って **9/16 FAILED**（全件 phase 1・画面は `PS …> Write-O` = 打鍵は届いていた）
-- 固定窓を全廃して**期限 + `wait_budget::state_wait_budget`** へ。`machine_busy()` を Windows でも読めるようにし（`GetSystemTimes`）、`sleep(800ms)`→`exists` は「接続クライアントが 1 でなくなった」状態待ちへ。番犬 `psmux_e2e_wait_watchdog` が修正前の 9 か所を名指しで落とす
-- A/B（修正前後の 2 バイナリを同一ラウンドで交互）: before **6/24** → after **0/24**。追加で after 0/100。副産物で **#1264**（main の Windows `cargo test --workspace` がコンパイル不能）を起票
-
 ## 2026-09-09（#1259: send_input が queued:true を返して無音で届かない問題を直した）
 - 真因は**顛末の記録が後続 send では全経路空振り**すること。`record_prompt_delivery_at` は先頭で `if flow != SpawnPrompt { return }`（spawn 専用）・保留と打ち切りは `eprintln!`（GUI の stderr は誰も読めない）・`persist.log` へ書くのは貼り付け段へ到達した後の `try_peer` / `log_fallback` だけ。本番の pane 1627 は `送達:` 行が 1 本も無く（同時刻の他ペインは記録あり）、`WaitPromptReady` で `input_line` が唯一の入口という穴と、peer の背景試行・起動コマンド待ちの**上限なしの待ち**が重なっていた（Issue の見立て「busy だと送らない」は否定 = 送達フローは `has_running_children` を参照しない）
 - 語彙と方針を `tako_core::prompt_delivery` の 1 本へ（`Stall` 11 種 + `Journal` の心拍 15 秒 + `peer_wait` の段階判定）。応答は `tako_send_input` / `tako_read_pane` の `delivery`、CLI は `[delivery]` 行、`persist.log` は `送達フロー: pane=… 理由=…`。peer は 25 秒で諦めるが**送る前の段階だけ**キー経路へ落ちる（判定は `PeerAttemptState` の CAS。段階を読むだけでは読んだ直後に背景スレッドが書き始めて二重投函になる = #790 の不変条件）
@@ -63,3 +43,28 @@
 - 真因は二段: 後始末が素の `Command::output()` で**期限なし**に待つ（返らない回はテストごと固まり Drop が全部走らない）ことと、**本体が先に退役した後の `__warm__` サーバーは `display-message` に映らない**こと（実測: 注入時 10 ソケット中 9 個が `server_pid=None`・残骸は全部 `__warm__`）。消せるのは `kill-server` だけ
 - psmux を叩く経路を `tests/common/psmux_ctl.rs` の 1 実装へ（期限つき + 出力は一時ファイル + pid を聞く → `kill-server` → `taskkill /PID /T /F` → 掃き掃除）。番犬が 3 ファイルの `.output()` / `.status()` / 殺していない `.wait()` を落とす（修正前ソースで 8 か所を名指し FAILED）
 - 実機 A/B: 注入で旧アームは**完走せず器 +10/回**（0→10→20）→ 新アームは 18 passed で**器 0**（3 回）。12 回連続実行で残骸ゼロ。交互 6 回の所要は before 31.1s → after 22.5s（全ラウンドで速い）
+
+## 2026-09-09（#1022: #571 e2e が本番の事前信頼エントリを残さないようにした）
+- `E2e571Guard::drop` で `remove_e2e_trust_entry(&dir/work)` を呼ぶ形へ（#612 / #577 と同じ後始末）。この e2e は worker を既定 config dir で走らせるので隔離では倒せない
+- 番犬 `e2e_trust_cleanup_watchdog`（`impl Drop for E2e…Guard` を走査して後始末の欠落を名指し）。`#[ignore]` の本体は CI で走らないのでここだけが再発を止める
+- A/B: 後始末を外すと `crates/tako-control/src/dispatch.rs: E2e571Guard` を名指しで FAILED
+
+## 2026-09-09（#992: agent 別のセットアップガイドと縮退の明記を docs へ入れた）
+- 系統別ガイド 5 ページ（`docs/.../agents/` = 選び方 / claude / codex / agy / ローカル LLM）を新設し、サイドバーに「エージェント CLI」群を追加。#357 の agy 利用制限の調査結果と、getting-started の `settings.json` ドリフト（正は `~/.claude.json` / `.mcp.json`）もここで回収
+- `gen-agent-support-docs.mjs` に**系統ごとの縮退ダイジェスト**（理由でまとめた degraded / pending / unsupported）を足して `agent-support.md` を再生成。生成物なので手書きと違ってずれない
+- OG が #982 以降落ちていた（`agent-support` が `SECTIONS` 未分類で `npm run og` が例外で止まる）ので分類を足して再生成。24 → 30 枚
+
+## 2026-09-09（#1137: 多重化が無いプラットフォームで無言の SSH 成功が畳まれないのを直した）
+- `pane` 経路 + 多重化なし（Windows）は `master_socket` が常に false で成功の出口が 1 つも無かった。規則 ⑥「**打った行を除いて**中身が出たら畳む」を追加（ゲートは `ConnectInputs::multiplexing` の値 = **macOS は 1 ビットも不変**）
+- 併発の穴（起点の陳腐化）も `ssh_progress::effective_from` で修正。`connecting` は rebase しないので相手が画面を消すと `new_lines` が全部空になっていた
+- A/B: 規則 ⑥ 無効化の注入で `無言の接続成功でも畳む` が FAILED / 打った行の除外を外すと `打った行だけでは畳まない` が FAILED。Windows 実機で単体 32 件緑・macOS 実 pane 経路は従来どおり `connecting`→`connected`
+
+## 2026-09-09（#1238: 再起動後の復元で codex / agy も会話ごと戻るようにした）
+- 会話 ID は**生きたプロセスが開いているもの**から採れる（実測: codex 0.153.0 = `thread-writer-locks/<id>.lock`・起動直後から / agy 1.1.27 = `brain/<id>`・最初のターンの後）。`layout.json` へ `agent_resume`（系統 + ID）を `claude_session_id` と対称に保存し、`restore_plan` の分岐で `codex resume <id>` / `agy --conversation <id>` を投入する
+- 規則は `tako_core::agent_resume` へ 1 本化（保持 = #1076 の「確認してから外す」を一般化 / 書式 = `resume_spec` / 可否 = `restore_support`）。ID を引く実装は系統ごとのモジュール（#984 / #1033）へ委譲。**Windows は lsof が無く ID を採れない**ので、内訳の理由を `ID なし` と分けて `resume 非対応` に
+- 隔離 GUI 実測: tmux サーバー kill → 起動で `Claude resume 1 / agy resume 1 / codex resume 1 / 新規シェル 0` と 3 系統の会話が画面に復帰。A/B `TAKO_1238_LEGACY=1` は同じ layout で `新規シェル 3（ID なし 3）`。番犬 7 本 + 単体
+
+## 2026-09-09（#777: 本番でも SIGTERM で layout を保存して終了するようにした）
+- `SIGTERM` の quit 読み替えを隔離限定から本番へ（`quit_signal::install`）。拾うのは 2 秒 tick ではなく既存の **500ms ループ**（新しいタイマー無しで最悪待ちを 1/4 に）。握る以上は対で必要なウォッチドッグ（到着から 5 秒で `exit(143)`・専用スレッド）を同じ入口が立てる
+- 連打は 1 度しか quit を撃たない（`QUIT_DISPATCHED`）・ハンドラはアトミック 1 回だけ・Windows は `SIGTERM` が無いので見張りごと立てない。読み替えと強制終了は `persist.log` へ 1 行
+- 隔離 GUI 実測（各 5 回）: 直前の窓リサイズが layout に載る **新 5/5 → 旧 0/5**（`TAKO_777_LEGACY=1`）・終了まで中央値 287ms・器のセッションは全回生存。注入したハング 2 形は猶予 2000ms に対し 2135 / 2101ms で `exit=143`。連打は読み替え 1 回 / `on_app_quit` 1 回、起動 0.3 秒後の SIGTERM でも layout は壊れない。番犬 4 本（修正前ソースで全滅）+ 単体 5 本、セルフテスト `TAKO_APP_SELF_TEST_OK`。全 3893 件緑
