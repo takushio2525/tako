@@ -1082,15 +1082,18 @@ mod tests {
     fn test_channel_label() {
         assert_eq!(Channel::Stable.label(), "stable");
         assert_eq!(Channel::Test.label(), "test");
-        // 表示ラベルは言語カタログ依存（#435）。相対比較で言語グローバルに依存しない
-        assert_eq!(
-            Channel::Stable.display_label(),
-            crate::ui_text::update::channel_stable()
-        );
-        assert_eq!(
-            Channel::Test.display_label(),
-            crate::ui_text::update::channel_test()
-        );
+        // 表示ラベルは言語カタログ依存（#435）。**相対比較でも言語を固定しないと
+        // 落ちる**ので、比較は言語が固定された 1 区間の中で行う（#1274）
+        crate::ui_text::tests_support::for_each_lang(|| {
+            assert_eq!(
+                Channel::Stable.display_label(),
+                crate::ui_text::update::channel_stable()
+            );
+            assert_eq!(
+                Channel::Test.display_label(),
+                crate::ui_text::update::channel_test()
+            );
+        });
     }
 
     #[test]
@@ -1183,17 +1186,28 @@ mod tests {
             .unwrap()
             .as_secs()
             + 300;
-        let s = format_reset_time(future);
-        // 言語カタログ依存（#435）: 分または秒の相対表記のどちらか
-        assert!(
-            s == crate::ui_text::update::eta_minutes(4)
-                || s == crate::ui_text::update::eta_minutes(5)
-                || s.contains(&crate::ui_text::update::eta_seconds(0)[..2]),
-            "相対表記になっていない: {s:?}"
-        );
+        // 比較の 2 点（実装の出力とカタログ）は**同じ言語のもと**で読む（#1274）。
+        // 表示言語はプロセス全体のグローバルなので、ロックの外で読み比べると
+        // 別スレッドのテストが切り替えた瞬間に日英を突き合わせて落ちる
+        crate::ui_text::tests_support::for_each_lang(|| {
+            let s = format_reset_time(future);
+            // 秒表記の頭（Ja: 「約」/ En: 「in ~」）。**バイトで切ると日本語で
+            // 文字境界を割って panic する**ので文字単位で取る
+            let secs_head: String = crate::ui_text::update::eta_seconds(0)
+                .chars()
+                .take_while(|c| !c.is_ascii_digit())
+                .collect();
+            // 言語カタログ依存（#435）: 分または秒の相対表記のどちらか
+            assert!(
+                s == crate::ui_text::update::eta_minutes(4)
+                    || s == crate::ui_text::update::eta_minutes(5)
+                    || s.contains(&secs_head),
+                "相対表記になっていない: {s:?}"
+            );
 
-        // 過去の timestamp → 「まもなく」
-        assert_eq!(format_reset_time(0), crate::ui_text::update::eta_soon());
+            // 過去の timestamp → 「まもなく」
+            assert_eq!(format_reset_time(0), crate::ui_text::update::eta_soon());
+        });
     }
 
     // --- broken-brew 判定ロジックの単体テスト（サブプロセス不要） ---

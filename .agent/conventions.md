@@ -52,6 +52,12 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は
   `ui_text::tests_support::check_ja_en` に集約する（並列テストの競合防止）
+- **相対比較でも「比較の 2 点が同じ言語」は保証されない**（#1274）。言語依存の関数を
+  1 つのテストで 2 回以上呼ぶなら、`tests_support::for_each_lang` / `with_lang` /
+  `check_ja_en` の**区間の中**で比較するか、本体の先頭で `tests_support::lang_guard()`
+  を束縛する（ロックの外だと、2 回の読み取りのあいだに別スレッドのテストが言語を
+  切り替えて別言語同士を比べる）。番犬は `ui_text::lang_watchdog`、
+  競合の再現は `ui_text_lang_race`（A/B は `TAKO_1274_LEGACY=1`）
 - **言語グローバルを読む処理には言語を引数で受ける版を必ず添える**
   （`Note::text` / `text_in`、`gate` / `gate_in`、`autosuggest_hint_texts` /
   `autosuggest_hint_texts_for`）。1 つの出力を組み立てる間に `i18n::lang()` を

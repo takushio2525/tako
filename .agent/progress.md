@@ -68,3 +68,8 @@
 - #1199 の検証ブロックが 1 つ手前の関数に入っていた（`E0425` × 3）ので本来の関数へ移し、あわせて `assert_eq!(cwd_after_foreign, cwd)`（書いた後の値どうしで必ず通る）を**書く前の cwd** との比較へ直した。実機 A/B: `--no-run` が **exit 101 / 263s** → **exit 0 / 4s**・`shell_integration_powershell` 8/0
 - CI の穴（macOS は `#![cfg(windows)]` を空クレート化・Windows は `cargo build` が `tests/` を作らず `cargo test` は `continue-on-error`）を Windows ジョブの blocking `cargo test --workspace --no-run` で塞いだ。番犬 `ci_windows_test_compile`。追加時間は実質ゼロ（実機で 2 回目の `--no-run` は 2s = 再コンパイル 0）
 - **その CI ステップが初回で実在の回帰を捕まえた**: #818 が `SpawnOptions::scrollback_lines` を足したとき Windows 専用テスト 3 本（8 か所）が追従漏れ。同 PR で修正。ベースラインは 5 日ぶりに全数が採れて **19 → 24 件**（増えた 8 件は本 PR 以前から main に在ったもの。表は plan へ）
+
+## 2026-09-09（#1274: ui_text の言語依存テストを言語固定の下で比較させフレークを止めた）
+- 真因は「相対比較なら安全」という前提。表示言語はプロセス全体の AtomicU8 なので、ロック外で 2 点を読むと**読み取りのあいだに別テストが切り替えて日英を比べる**。`tests_support` を RAII の `lang_guard`（drop で言語復元 → ロック解放）へ寄せ、ui_text の 17 本 + ui_text 外の 3 本（`update_checker` 2 / `preview` / `right_panel`）を `for_each_lang` の区間へ入れた
+- 番犬 `ui_text::lang_watchdog`（`tr!` を起点にした推移閉包 × ヘルパ区間を除いた残りの走査）が**修正前ソースの 17 本を file:line で名指し**。再現 `ui_text::lang_race` は `ui_text/` の外に置く（legacy 経路が番犬の禁止形そのもの）
+- A/B `TAKO_1274_LEGACY=1`: 負荷下（load 20 / 18 コア）で legacy 40/40・3 本同時 30/30 FAILED（実出力は `"エクスプローラーで表示"` vs `"Reveal in Explorer"`）→ 修正後 0/40。負荷下 `cargo test -p tako-app` 12 回 0 FAILED・全 3997 件緑

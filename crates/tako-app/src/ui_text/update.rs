@@ -273,15 +273,18 @@ mod tests {
     /// 配布系統の表示名は 3 系統すべてに解があり、未知の値でも空にならない（#616）
     #[test]
     fn install_method_display_covers_all_kinds() {
-        for m in ["homebrew", "zip", "broken-brew", "unknown"] {
-            assert!(
-                !install_method_display(m).is_empty(),
-                "{m} の表示名が空になっている"
-            );
-        }
-        assert_eq!(install_method_display("homebrew"), "Homebrew");
-        assert_eq!(install_method_display("broken-brew"), method_zip_broken());
-        // 未知の値は zip 扱い（表示が消えるより「zip です」と言い切るほうが安全）
-        assert_eq!(install_method_display("unknown"), method_zip());
+        // 相対比較は言語を固定した区間の中で行う（#1274）
+        tests_support::for_each_lang(|| {
+            for m in ["homebrew", "zip", "broken-brew", "unknown"] {
+                assert!(
+                    !install_method_display(m).is_empty(),
+                    "{m} の表示名が空になっている"
+                );
+            }
+            assert_eq!(install_method_display("homebrew"), "Homebrew");
+            assert_eq!(install_method_display("broken-brew"), method_zip_broken());
+            // 未知の値は zip 扱い（表示が消えるより「zip です」と言い切るほうが安全）
+            assert_eq!(install_method_display("unknown"), method_zip());
+        });
     }
 }

@@ -47,11 +47,27 @@ pub mod update;
 pub mod webdock;
 pub mod welcome;
 
+/// 言語グローバル競合の番犬（#1274）。このモジュール配下のテストが
+/// 言語依存の文字列をロック外で読み比べていないことをソース走査で拘束する
+#[cfg(test)]
+mod lang_watchdog;
+
+/// 言語グローバル競合の再現テスト（#1274）。
+///
+/// **実体を `src/ui_text/` の外に置いてある**のは、再現の legacy 経路が
+/// 「ロック外で言語依存の関数を読む」形そのもので、`lang_watchdog` の走査対象へ
+/// 入れると自分自身に噛みつくから。`main.rs` 側へ `mod` を足すと、本番コードを
+/// 「最初の `#[cfg(test)]` まで」で切り出している番犬（`pane_content_geometry_tests`）が
+/// 空振りするので、宣言はここから行う
+#[cfg(test)]
+#[path = "../ui_text_lang_race.rs"]
+mod lang_race;
+
 #[cfg(test)]
 pub(crate) mod tests_support {
     use tako_core::i18n::{self, Lang};
 
-    /// 言語グローバルを触るテストの直列化ロック（#496）。
+    /// 言語グローバルを触るテストの直列化ロック（#496 / #1274）。
     ///
     /// `check_ja_en` はプロセス全体で共有される言語設定を Ja → En → 復元と切り替える。
     /// カタログテストは各モジュールに 1 本ずつあり、cargo test は既定で並列実行するため、
@@ -63,18 +79,53 @@ pub(crate) mod tests_support {
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
     }
 
+    /// 言語グローバルを排他し、drop で元の言語へ戻すガード（#1274）。
+    ///
+    /// **言語依存の文字列を 2 つ以上読み比べるテストは、必ずこのガード
+    /// （またはこれを内蔵する `check_ja_en` / `for_each_lang` / `with_lang`）の
+    /// 区間の中で比較する。** 表示言語はプロセス全体の AtomicU8 なので、ロックの外で
+    /// 2 回読むと**読み取りのあいだに別スレッドのテストが言語を切り替え、
+    /// 別言語同士を比較して落ちる**（#1274。`共通項目はファイルツリーと同一文言` が
+    /// `cargo test --workspace` でだけ低頻度に落ちていた実害）。
+    ///
+    /// フィールドの drop より先に `Drop::drop` が走るので、**言語を復元してから
+    /// ロックを解放する**（次のテストは復元後の状態から始まる）。途中で assert が
+    /// 落ちても復元されるので、後続テストへ汚染が漏れない
+    pub(crate) struct LangGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        original: Lang,
+    }
+
+    impl Drop for LangGuard {
+        fn drop(&mut self) {
+            i18n::set_lang(self.original);
+        }
+    }
+
+    /// 言語グローバルを排他する。**ガードが生きているあいだ、他のテストは
+    /// 言語を切り替えられない**（切替は必ずこのロックを通るため）
+    pub(crate) fn lang_guard() -> LangGuard {
+        // 前のテストが assert で落ちてロックが毒されても、検査自体は続行してよい
+        let lock = lang_lock().lock().unwrap_or_else(|e| e.into_inner());
+        LangGuard {
+            _lock: lock,
+            original: i18n::lang(),
+        }
+    }
+
     /// 日英カタログの機械検査。collect を Ja / En それぞれで実行し、
     /// 全文字列が非空・絵文字なし（#217）・英語側に日本語が残っていないことを検査する。
-    /// 言語グローバルを切り替えるため、lang 依存の他テストは相対比較で書くこと
+    ///
+    /// **相対比較（`結果 == カタログ関数()`）で書くだけでは足りない**（#1274）。
+    /// 比較の 2 点のあいだに別スレッドがここへ入って言語を切り替えると、
+    /// 別言語同士を比べて落ちる。相対比較のテストも `for_each_lang` などで
+    /// 言語を固定した 1 区間の中に入れること
     pub(crate) fn check_ja_en(collect: impl Fn() -> Vec<String>) {
-        // 前のテストが assert で落ちてロックが毒されても、検査自体は続行してよい
-        let _guard = lang_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let original = i18n::lang();
+        let _guard = lang_guard();
         i18n::set_lang(Lang::Ja);
         let ja = collect();
         i18n::set_lang(Lang::En);
         let en = collect();
-        i18n::set_lang(original);
         assert_eq!(ja.len(), en.len());
         for (j, e) in ja.iter().zip(en.iter()) {
             assert!(!j.trim().is_empty(), "日本語文字列が空");
@@ -96,13 +147,11 @@ pub(crate) mod tests_support {
     /// 「この文字列が出ない / 出る」のような**独自の検査を両言語で**やりたい場所もある。
     /// 言語グローバルは共有なので、切り替えは同じロックの下で行う
     pub(crate) fn for_each_lang(body: impl Fn()) {
-        let _guard = lang_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let original = i18n::lang();
+        let _guard = lang_guard();
         for lang in [Lang::Ja, Lang::En] {
             i18n::set_lang(lang);
             body();
         }
-        i18n::set_lang(original);
     }
 
     /// 指定した言語で `body` を 1 回走らせる（#905）。
@@ -111,11 +160,9 @@ pub(crate) mod tests_support {
     /// 言語を固定しないと書けない。ロックは呼び出しごとに取り直すので、
     /// 続けて 2 回呼んでも他テストと競合しない
     pub(crate) fn with_lang(lang: Lang, body: impl FnOnce()) {
-        let _guard = lang_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let original = i18n::lang();
+        let _guard = lang_guard();
         i18n::set_lang(lang);
         body();
-        i18n::set_lang(original);
     }
 
     /// macOS の platform 修飾（`⌘` / `Cmd`）。**正本から引く**（#1203。
