@@ -94,7 +94,15 @@ function matrix() {
 }
 
 function escapeCell(s) {
-  return String(s ?? '').replace(/\|/g, '\\|').replace(/\n+/g, ' ');
+  // `<` を残すと `brain/<id>` のような書き方が HTML タグ扱いで**消える**（実測）。
+  // 表のセルへ入るのは常に平文なので、山括弧はここで実体参照へ倒す。
+  // `<br />` は呼び出し側が escapeCell の外で足すので影響しない
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\|/g, '\\|')
+    .replace(/\n+/g, ' ');
 }
 
 function render() {
@@ -127,6 +135,13 @@ function render() {
   out.push('worker を立てて使えますが、機能によっては落ちるか、まだ使えません。');
   out.push('このページは **tako 本体が持っている能力マトリクスから生成**しているので、');
   out.push('実装とずれません。手元で最新を引くには次を実行してください。');
+  out.push('');
+  out.push('入れ方・つなぎ方は系統ごとのページにあります:');
+  out.push('[エージェントの選び方](/agents/) /');
+  out.push('[Claude Code](/agents/claude/) /');
+  out.push('[OpenAI Codex CLI](/agents/codex/) /');
+  out.push('[Antigravity CLI](/agents/agy/) /');
+  out.push('[ローカル LLM](/agents/local-llm/)。');
   out.push('');
   out.push('```sh');
   out.push('tako agent-support                        # 全系統の表');
@@ -177,6 +192,52 @@ function render() {
   out.push('第一歩は codex CLI を Ollama へ向ける経路で、TUI 前提を外した一級対応は');
   out.push('その次の段階です。');
   out.push('');
+
+  // 系統ごとの縮退ダイジェスト（#992）。**能力別の表と同じ 1 つのマトリクスから作る**ので、
+  // 「選ぶ前に何が落ちるか」を読むための別の切り口でありながら本文とずれない。
+  // 同じ理由のマスは 1 つにまとめる（agy の master 系 / ローカル LLM の未成立が
+  // 1 行ずつ並ぶと読めなくなるため）
+  for (const a of agents) {
+    if (a.baseline) continue;
+    const c = m.counts[a.key];
+    // 1 つも成立していない系統に「選ぶと落ちる」は成り立たない（そもそも選べない）
+    const usable = c.supported > 0;
+    out.push(`## ${a.label} ${usable ? 'を選ぶと落ちるもの' : 'でまだ使えないもの'}`);
+    out.push('');
+    out.push(
+      usable
+        ? `対応 ${c.supported} / ${total} 件。以下は Claude Code との差分です` +
+            '（同じ理由のものはまとめています）。'
+        : `対応 ${c.supported} / ${total} 件。この系統が成立したときに埋まるマスの一覧です` +
+            '（同じ理由のものはまとめています）。',
+    );
+    out.push('');
+    for (const status of ['degraded', 'pending', 'unsupported']) {
+      const rows = m.features.filter((f) => f.agents[a.key].status === status);
+      if (!rows.length) continue;
+      out.push(`### ${STATUS_LABEL[status]}（${rows.length} 件）`);
+      out.push('');
+      // 理由（note_ja + issue）でまとめる。挿入順 = マトリクスの並びを保つ
+      const groups = new Map();
+      for (const f of rows) {
+        const cell = f.agents[a.key];
+        const key = `${cell.note_ja ?? ''}\u0000${cell.issue ?? ''}`;
+        if (!groups.has(key)) groups.set(key, { cell, items: [] });
+        groups.get(key).items.push(f);
+      }
+      for (const { cell, items } of groups.values()) {
+        const issue = cell.issue
+          ? `（追跡: [#${cell.issue}](https://github.com/takushio2525/tako/issues/${cell.issue})）`
+          : '';
+        const reason = cell.note_ja ? escapeCell(cell.note_ja) : '理由の記載がありません';
+        out.push(`- **${reason}**${issue}`);
+        for (const f of items) {
+          out.push(`  - ${escapeCell(f.summary_ja)}（\`${f.key}\`）`);
+        }
+      }
+      out.push('');
+    }
+  }
 
   for (const [label, keys] of CATEGORIES) {
     out.push(`## ${label}`);

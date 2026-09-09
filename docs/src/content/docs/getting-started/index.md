@@ -171,7 +171,7 @@ tako setup
 
 1. **エージェント CLI と依存ツールのチェック** — claude / codex / agy をすべて検出します。認証済み CLI が1つなら自動選択し、複数なら前回値または安全な既定を採用します。**1 つも使える系統が無いときだけ**、その場で導入を案内します（上の tip 参照）。tmux / git は任意依存として状態と導入コマンドだけを表示します
 2. **認証・プラン確認** — Claude は認証と Pro / Max 等、Codex は認証と ChatGPT プランを取得できる範囲で自動判定します。検出不能でも安全に未指定にできる情報は `unknown` を採用します。token やアカウント情報は保存・表示しません
-3. **MCP 接続の準備** — claude を選んだ場合は `~/.claude/settings.json` へ自動登録します。codex は `tako master` の起動時だけ MCP 設定を注入するため、グローバル設定を変更しません。agy は worker 専用です
+3. **MCP 接続の準備** — 検出したエージェント CLI すべてへ tako の MCP サーバーを登録します。書き込み先は claude が `~/.claude.json`、codex が `~/.codex/config.toml` の `[mcp_servers.tako]`、agy が `~/.gemini/config/mcp_config.json` です（claude だけは `tako setup-mcp --project` で `<cwd>/.mcp.json` にも入れられます）。**書き先が `~/.claude/settings.json` だったのは古い tako で、いまはそこに残った設定を掃除する側です。** codex はこれに加えて、master / worker として起動するときに起動コマンドへその場でも MCP 設定を渡します（tako の外で立ち上げた codex にツールを出さないための経路です）
 4. **推奨 profile の生成** — プラン規模に応じて master / worker、effort、worker ポリシーを `profiles/default.yaml` へ生成します。モデル名は固定せず、各 CLI の最新の既定モデルを使います。既存 profile はそのまま維持します
 5. **指示とテンプレートの準備** — 指示ファイルが未作成なら安全な開発ルールの既定値を作り、セットアップ用ファイル一式を tako のデータディレクトリ配下（macOS は `~/Library/Application Support/tako/setup/`、Windows は `%APPDATA%\tako\setup\`）に展開します。既存の指示は上書きしません
 6. **同梱推奨ルールとの比較** — 既存の指示ファイルを、tako が同梱する推奨ルール（言語 / 対話スタイル / Git 運用 / コード品質 / 安全ルール / 提案品質 / 完了検証の 7 項目）と項目レベルで突き合わせ、不足の可能性を具体的に表示します。差分がなければ「差分なし」と明示します。表示のみで、ファイルは書き換えません
@@ -207,7 +207,7 @@ printf '%s' '{"selected_agent":"codex","provider_plans":{"gpt":"plus"}}' \
 tako setup --review
 ```
 
-agy は setup と worker には使えますが、MCP 接続方式の制約から master には使えません。agy だけが入っている環境では setup を完了できますが、`tako master` を使う前に claude または codex を追加してください。
+agy は setup と worker には使えますが、**worker 専用として設計されている**ため master / solo には使えません（[#127](https://github.com/takushio2525/tako/issues/127)）。agy だけが入っている環境では setup を完了できますが、`tako master` を使う前に claude または codex を追加してください。系統ごとの入れ方・つなぎ方は [エージェントの選び方](/agents/) にまとめています。
 
 ### 別の PC でも同じ設定を使いたいとき
 
