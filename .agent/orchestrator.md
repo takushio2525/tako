@@ -179,20 +179,31 @@ worker_agents:               # エージェント別の worker 設定（任意�
   claude は既定で承認あり（Claude Code 側の設定に委ねる）。プロファイルで `skip_permissions: false`
   を明示するとどのエージェントでも承認ありに戻る。claude・agy は `--dangerously-skip-permissions`、
   codex は `--dangerously-bypass-approvals-and-sandbox` を付けて起動する
-- **status 検知**: codex / agy は `claude agents --json` に現れないため常に画面推定
-  （status_source=screen、idle 連続 8 回で完了判定）。claude worker より完了検知が数十秒遅くなる。
-  codex は器（tmux）があれば rollout JSONL を一次シグナルにできる（status_source=codex-session。#984）
+- **status 検知**: codex / agy は `claude agents --json` に現れないが、**どちらも自分の
+  実況ログを一次シグナルにできる**ので画面推定へは落ちない（idle 連続 3 回で完了判定 =
+  claude と同じ確定速度）。
+  - codex = rollout JSONL の `task_started` / `task_complete`（status_source=codex-session。#984）
+  - agy = 会話ごとの実況 JSONL（status_source=agy-session。#1033）。置き場は
+    `~/.gemini/antigravity-cli/brain/<会話 ID>/.system_generated/logs/transcript.jsonl` で、
+    ペイン → 会話 ID は**生きた agy が開いたままの `brain/<会話 ID>`** を lsof で引く。
+    完了は「`MODEL` の `PLANNER_RESPONSE` で `content` があり **`tool_calls` が無い**行」。
+    `content` の有無だけで決めると、**喋りながらツールを呼ぶ行**（実物のコーパス 28 会話に
+    58 件）を完了と誤読して偽 idle になる
+  - どちらも**実況が読めるまでは画面推定のまま**（会話ディレクトリは最初のプロンプトが
+    入るまで作られない）。「まだ何も言えない」を idle と誤認しないための正しい側
+  - `TAKO_984_LEGACY=1`（codex）/ `TAKO_1033_LEGACY=1`（agy）で同一バイナリのまま
+    画面推定だけの旧挙動へ戻せる
 - **codex の背景ターミナル待ち（#1015）**: `• Waiting for background terminal (1m 04s …)` は
   **走っている**行、`• Waited for background terminal · <cmd>` は**完了済みの履歴**行で、
   どちらも `• ` で始まる。狭いペインでは codex が行末を `…` で切って `esc to interrupt` が
   消えるため、tako は「`•` で始まり括弧の直後が経過時間」の行だけを busy と読む
   （語で判定すると履歴行に当たって**永久 busy** になる = #571 / #120）。
   実採取と判定表は `crates/tako-control/src/orchestrator/wait.rs` の `codex_running_footer_in`
-- **未達の断定（#1015）**: `prompt_undelivered`（= supervisor の自動再送のトリガ）は
-  **一次シグナルを実際に読めて、それでもターンが 1 件も無いとき**だけ出す。codex の裏取りは
-  rollout の `task_started` でしかできないので、器が無い / thread が解決できない状況では
-  `prompt_delivery_unverified`（`verify_then_resend`）へ降格する。
-  「読めなかった」を未達と断定すると、働いている worker へ同じ依頼が二度渡る
+- **未達の断定（#1015 / #1033）**: `prompt_undelivered`（= supervisor の自動再送のトリガ）は
+  **一次シグナルを実際に読めて、それでもターンが 1 件も無いとき**だけ出す。裏取りは
+  codex = rollout の `task_started` / agy = 実況 JSONL の `USER_INPUT` でしかできないので、
+  器が無い / 会話が解決できない状況では `prompt_delivery_unverified`（`verify_then_resend`）へ
+  降格する。「読めなかった」を未達と断定すると、働いている worker へ同じ依頼が二度渡る
 - **MCP 接続（#986）**: worker からも tako の MCP ツール（`tako_*`）が呼べる。経路は系統で違う:
   - **codex** = spawn の起動コマンドへ `-c mcp_servers.tako.command/args/env_vars` を
     **一時注入**する（master と同じ `orchestrator::agent::codex_mcp_args` の 1 実装）。

@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-09（#1220: 一覧付与のコスト検査を実時間から量へ替え、番犬を tests 全体へ広げた）
-- `warm <= cold`（実時間比較）を廃し、`claude_remote_link::scan_counters`（走査回数 / 読み出しバイト数 / 所在探索回数・**スレッドローカル**）で測る形へ。生きている会話への追記ぶんは予算へ足す
-- 番犬 `test_timing_watchdog`（`crates/*/tests` の assert 条件部に実時間の値が 2 つ以上ある形だけを落とす。コメント / 文字列は潰して見る）を新設。修正前ファイルで `remote_link_live.rs:247: warm <= cold` を名指しして FAILED
-- A/B（`yes` 36 / 72 本の負荷・交互 40 回）: 旧 2/40 FAILED（初回 34.3ms / 2 回目 45.7ms で反転）・新 0/40。memo 無効化の注入で新は確定 FAILED（20 走査 10 MB）・旧は 9/10 見逃し
-
 ## 2026-09-09（#1206: README に Windows のインストール手順を足した）
 - インストール節を macOS 2 節 + Windows 1 節へ（`.exe` = 標準・管理者権限不要 / `.zip` = ポータブル / SmartScreen / psmux）。冒頭を「macOS 11.0 以降 + Windows 10 1809 以降 x64」へ直し、永続化の説明に psmux を併記
 - 数値・アセット名は `release_assets` と直近リリースの実アセットから引き、docs の「方法 C」と同文・同数値。マトリクス note（Issue の 3 点目）は生成物なので #1204 の担当（CI の `gen-windows-support-docs.mjs --check` が同期を強制している）
@@ -75,6 +70,11 @@
 - 置き場を決める側を倒した: `paths::data_dir()` が**実行時に**テストバイナリを見分けて隔離先へ（`cfg(test)` はクレートを跨がない）＋ `orchestrator::agent_config_home()` の `cfg(test)` 隔離＋単体テストからは `claude agents --json` を起こさない
 - 「メインスレッド専有」は `mark_main_thread()` 済みのプロセスだけが名乗る。`setup` の移設と #577 e2e の後始末も隔離に合わせた（実ユーザーの setup / 残骸掃除が壊れる穴を先に塞いだ）
 - 番犬 `test_write_isolation`（空 HOME で子を起こし 0 ファイル）+ A/B `TAKO_944_LEGACY=1`。実測 36 → 0 ファイル。副産物で `ensure_trusted` が置き場ごと無い環境で黙って失敗する穴も直した
+
+## 2026-09-09（#1033: agy に一次シグナルを与え、完了検知を claude 同等にした）
+- 前提の訂正: 「agy の会話は SQLite だけ」は実態とズレ。`brain/<id>/.system_generated/logs/transcript.jsonl` が逐次追記される平文 JSONL（**依存追加なし**）。ペイン → 会話は生きた agy が開いたままの `brain/<id>` を lsof で引く
+- `agy_session` を新設し `status_source=agy-session` / `report` の transcript 層 / 送達の一次証拠（`USER_INPUT`）へ配線。補正層の権威判定は `is_live_log_source` の 1 実装へ寄せた（**ここを忘れると `has_children` で永久 busy** = #571 / #984 と同じ罠を実機で踏んだ）
+- 隔離 GUI での A/B 実測（北極星と同じ測り方・各 3 標本）: 検知遅延の中央値 39.46s → **13.92s**（claude 15.40 / codex 11.68 と同水準）。`report` は scrollback/messages 0 → transcript/`transcript_agent=agy`/messages 1〜2。偽 idle は増えず watch の偽イベント 0 件
 
 ## 2026-09-09（#1238: 再起動後の復元で codex / agy も会話ごと戻るようにした）
 - 会話 ID は**生きたプロセスが開いているロック**から採れる（実測: codex 0.153.0 = `thread-writer-locks/<id>.lock`・起動直後から / agy 1.1.27 = `presence/<id>.lock`・最初のターンの後）。`layout.json` へ `agent_resume`（系統 + ID）を `claude_session_id` と対称に保存し、`restore_plan` の分岐で `codex resume <id>` / `agy --conversation <id>` を投入する

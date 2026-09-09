@@ -383,10 +383,15 @@ pub mod notes {
         "agy is worker-only; launching it as master or solo fails before start-up (#127)",
     );
 
-    /// #984 の実物調査。agy の会話は SQLite なので読むには新しい依存が要る
-    pub const AGY_CONVERSATION_SQLITE: Note = Note::new(
-        "agy は会話を SQLite で持つため（~/.gemini/antigravity-cli/conversations/）読むには新しい依存が要る。生存は presence のロックで分かるがターンの開始・完了は取れない",
-        "agy stores conversations in SQLite (~/.gemini/antigravity-cli/conversations/), so reading them needs a new dependency; liveness is visible via its presence lock, but turn start/completion is not",
+    /// #1033 の実物調査（agy 1.1.27）。実況 JSONL に**トークン数は載っていない**。
+    ///
+    /// #984 は「agy の会話は SQLite だけなので読むには新しい依存が要る」と記録していたが、
+    /// それは会話の保管庫（`conversations/<id>.db`）を見ただけで、実況は
+    /// `brain/<id>/.system_generated/logs/transcript.jsonl` に平文で別途書かれていた。
+    /// 状態と発話はそこから取れる（#1033 で実装）が、**ctx% の材料だけは無い**
+    pub const AGY_CTX_NOT_IN_TRANSCRIPT: Note = Note::new(
+        "agy の実況ログ（brain/<id>/.system_generated/logs/transcript.jsonl）には codex の token_count に相当するトークン数が無く、残量は対話の画面にも常時出ないので読む口が無い（#1033 で agy 1.1.27 の全ステップ種別を確認）",
+        "agy's live log (brain/<id>/.system_generated/logs/transcript.jsonl) carries no token counts equivalent to codex's token_count, and the headroom is not permanently on screen either, so there is no way to read it (all step types verified on agy 1.1.27 in #1033)",
     );
 
     /// #985 の再調査（agy 1.1.22）。**窓つきの利用上限という概念自体が無い**
@@ -781,12 +786,13 @@ pub const MATRIX: &[AgentFeature] = &[
             "worker の状態照会では構造化ソースから ctx% が取れるが、master の自動ハンドオフは画面のパターンを見るので master 経路では未確認",
             "The context ratio is available from the structured source for worker status queries, but the master auto-handoff reads screen patterns, so the master path is unverified",
         )),
-        agy: pending(notes::AGY_CONVERSATION_SQLITE, 984),
+        agy: pending(notes::AGY_CTX_NOT_IN_TRANSCRIPT, 1033),
         local: local_pending_first_class(),
         evidence: AgentEvidence::Measured(
             "#984: rollout の token_count に last_token_usage.total_tokens と \
              model_context_window があり、worker_status の ctx_percent へ載せた（実測で 8%）。\
-             master の #749 は terminal.rs の画面パターンを見る別経路なのでそこは未確認",
+             master の #749 は terminal.rs の画面パターンを見る別経路なのでそこは未確認。\
+             #1033: agy の実況 JSONL は状態と発話を持つがトークン数は持たない",
         ),
     },
     AgentFeature {
@@ -1388,7 +1394,7 @@ pub const MATRIX: &[AgentFeature] = &[
         ),
         claude: S::Supported,
         codex: S::Supported,
-        agy: degraded(notes::SCREEN_ONLY_DELIVERY),
+        agy: S::Supported,
         local: local_pending_first_class(),
         evidence: AgentEvidence::UnitTest(
             "#983 の変更 2 で prompt_delivery_assessment の判断を delivery_observation \
@@ -1423,12 +1429,14 @@ pub const MATRIX: &[AgentFeature] = &[
         ),
         claude: S::Supported,
         codex: S::Supported,
-        agy: pending(notes::AGY_CONVERSATION_SQLITE, 984),
+        agy: S::Supported,
         local: local_pending_first_class(),
         evidence: AgentEvidence::Measured(
             "#984 で codex アダプタを実装。rollout JSONL の response_item（role=assistant）を \
              読むので `report --messages N` が codex でも実データを返す。応答の \
-             transcript_agent でどちらを読んだか分かる。agy は会話が SQLite なので未対応",
+             transcript_agent でどれを読んだか分かる。#1033 で agy アダプタを追加: \
+             実況 JSONL の PLANNER_RESPONSE で本文を持つ行が発話なので同じく実データを返す \
+             （北極星実測では agy だけ messages が 0 件だった）",
         ),
     },
     AgentFeature {
@@ -1454,15 +1462,21 @@ pub const MATRIX: &[AgentFeature] = &[
         ),
         claude: S::Supported,
         codex: S::Supported,
-        agy: degraded(notes::SCREEN_ONLY_STATUS),
+        agy: S::Supported,
         local: local_pending_first_class(),
         evidence: AgentEvidence::Measured(
             "#984: codex は構造化ソース（codex-session）を得たので need_streak が 8 → 3 に \
              なり claude と同じ確定速度になる。同一タスクの A/B 実測（primes 25 個）で \
              before = source=screen / ctx=None / **開始前の t=3s・6s に idle を出す**、\
              after = t=9s から source=codex-session で busy を 2 標本とも捉え t=15s から \
-             idle + ctx=8。agy は画面推定のままだが、弱マーカーを agent 別に分離したので \
-             (Thinking) 型の誤爆は構造的に起こらない（残る差は確定までの回数だけ）",
+             idle + ctx=8。#1033: agy も実況 JSONL（agy-session）を得て need_streak が \
+             8 → 3 になった。北極星と同じ測り方の A/B 実測（同一タスク・各 3 標本・\
+             TAKO_1033_LEGACY での同一バイナリ A/B）で検知遅延の中央値が \
+             39.46s（38.25 / 39.46 / 41.49）→ 13.92s（13.30 / 13.92 / 14.04）。\
+             claude 15.40s / codex 11.68s と同水準で、旧側は北極星の 39.38s を再現する。\
+             偽 idle（回答前に単発 status が idle を返す最早時刻）は 3.5〜6.1s → \
+             4.3〜5.7s で増えておらず、watch の偽イベントは 6 ラウンドとも 0 件。\
+             (Thinking) 型の誤爆（#120）は弱マーカーの agent 別分離で構造的に起こらない",
         ),
     },
     AgentFeature {
@@ -1473,14 +1487,18 @@ pub const MATRIX: &[AgentFeature] = &[
         ),
         claude: S::Supported,
         codex: S::Supported,
-        agy: pending(notes::AGY_CONVERSATION_SQLITE, 984),
+        agy: S::Supported,
         local: local_pending_first_class(),
         evidence: AgentEvidence::Measured(
             "#984 で codex-cli 0.150.1 を実物調査: $CODEX_HOME/sessions/ の rollout JSONL に \
              task_started / task_complete が**逐次**書かれる（250 語生成を 1 秒刻みで観測: \
              t=1s 開始 → t=27s 完了）。tako は status_source=codex-session として読む。\
-             agy は会話が SQLite（~/.gemini/antigravity-cli/conversations/<id>.db）で、\
-             生存は presence/<id>.lock で分かるがターンの開始・完了は取れない",
+             #1033 で agy 1.1.27 を実物調査: 会話ごとの \
+             brain/<id>/.system_generated/logs/transcript.jsonl が**逐次追記**され、\
+             画面に答えが出た時刻と終端 PLANNER_RESPONSE が書かれた時刻が同一標本 \
+             （0.2 秒ポーリングで差 0.00 秒）。tako は status_source=agy-session として読む。\
+             ペイン → 会話は生きた agy が開いたままの brain/<id> を lsof で引く \
+             （codex の thread-writer-locks と同じ形）",
         ),
     },
     AgentFeature {
@@ -1779,14 +1797,15 @@ mod tests {
 
     /// 構造化された状態の出口を持つ系統（`has_structured_status` の参照先）。
     ///
-    /// #982 の時点では claude だけだったが、**#984 で codex も持つことが分かった**
-    /// （rollout JSONL の `task_started` / `task_complete`。実測）。
-    /// agy は会話が SQLite なので未対応
+    /// #982 の時点では claude だけだったが、**#984 で codex**、**#1033 で agy** も
+    /// 持つことが実測で分かった（codex = rollout JSONL の `task_started` /
+    /// `task_complete`、agy = 実況 JSONL の `USER_INPUT` / 終端 `PLANNER_RESPONSE`）。
+    /// 残るのはハーネス未定のローカル LLM だけ
     #[test]
-    fn 構造化シグナルはclaudeとcodex() {
+    fn 構造化シグナルは実物の3系統が持つ() {
         assert!(supports(Agent::Claude, keys::WORKER_STATUS_STRUCTURED));
         assert!(supports(Agent::Codex, keys::WORKER_STATUS_STRUCTURED));
-        assert!(!supports(Agent::Agy, keys::WORKER_STATUS_STRUCTURED));
+        assert!(supports(Agent::Agy, keys::WORKER_STATUS_STRUCTURED));
         assert!(!supports(Agent::Local, keys::WORKER_STATUS_STRUCTURED));
     }
 
