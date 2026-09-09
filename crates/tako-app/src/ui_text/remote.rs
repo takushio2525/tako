@@ -281,6 +281,7 @@ mod tests {
     /// 未知の item キーは空文字を返す（呼び出し側がキーそのものを出す。#590）
     #[test]
     fn setup_item_labelは未知キーで空を返す() {
-        assert!(setup_item_label("unknown_item").is_empty());
+        // 言語依存の関数はヘルパの区間の中で呼ぶ（#1274）
+        tests_support::for_each_lang(|| assert!(setup_item_label("unknown_item").is_empty()));
     }
 }

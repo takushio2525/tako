@@ -5728,14 +5728,16 @@ mod tests {
             predicted_conflicts: Vec::new(),
             ..merge_preview_fixture()
         };
-        let lines = merge_confirm_lines(&preview);
-        let joined = lines.join("\n");
-        let no_conflict = crate::ui_text::panel::git_merge_no_conflict();
-        assert!(
-            !joined.contains(no_conflict),
-            "予測不能なのに「コンフリクトなし」と出している: {joined}"
-        );
-        assert!(joined.contains(crate::ui_text::panel::git_merge_prediction_unavailable()));
+        // 実装が組んだ行とカタログの比較は言語を固定した区間の中で行う（#1274）
+        crate::ui_text::tests_support::for_each_lang(|| {
+            let joined = merge_confirm_lines(&preview).join("\n");
+            let no_conflict = crate::ui_text::panel::git_merge_no_conflict();
+            assert!(
+                !joined.contains(no_conflict),
+                "予測不能なのに「コンフリクトなし」と出している: {joined}"
+            );
+            assert!(joined.contains(crate::ui_text::panel::git_merge_prediction_unavailable()));
+        });
     }
 }
 

@@ -2266,10 +2266,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("bin.dat");
         std::fs::write(&path, [0u8, 159, 146, 150]).unwrap();
-        let state = load(&path, PreviewMode::Code);
-        assert!(
-            matches!(&state.content, PreviewContent::Error(m) if m == crate::ui_text::preview::binary_file())
-        );
+        // 実装が組んだ文言とカタログの比較は言語を固定した区間の中で行う（#1274）
+        crate::ui_text::tests_support::for_each_lang(|| {
+            let state = load(&path, PreviewMode::Code);
+            assert!(
+                matches!(&state.content, PreviewContent::Error(m) if m == crate::ui_text::preview::binary_file())
+            );
+        });
         let state = load(&dir.join("no-such.txt"), PreviewMode::Code);
         assert!(matches!(&state.content, PreviewContent::Error(_)));
         let _ = std::fs::remove_dir_all(&dir);

@@ -277,8 +277,10 @@ mod tests {
         }
     }
 
-    // 分岐テストは相対比較（chip_label の結果 == 対応する文言関数の結果）なので、
-    // 表示言語グローバルがどちらでも成立する
+    // 分岐テストは相対比較（chip_label の結果 == 対応する文言関数の結果）。
+    // **相対比較でも言語を固定しないと落ちる**ので、比較は `for_each_lang` の中で
+    // 行う（#1274。表示言語はプロセス全体のグローバルなので、ロックの外で 2 点を
+    // 読むと読み取りのあいだに別スレッドのテストが言語を切り替える）
 
     #[test]
     fn chip_hidden_when_nothing_active() {
@@ -289,7 +291,7 @@ mod tests {
             false,
             ThermalState::Nominal,
         );
-        assert_eq!(chip_label(&s, dev()), None);
+        tests_support::for_each_lang(|| assert_eq!(chip_label(&s, dev()), None));
     }
 
     #[test]
@@ -301,26 +303,30 @@ mod tests {
             false,
             ThermalState::Nominal,
         );
-        assert_eq!(chip_label(&s, dev()), Some(chip_active(dev())));
+        tests_support::for_each_lang(|| {
+            assert_eq!(chip_label(&s, dev()), Some(chip_active(dev())))
+        });
     }
 
     #[test]
     fn chip_lid_ok() {
         let s = state(true, SleepGuardMode::On, 0, true, ThermalState::Nominal);
-        assert_eq!(chip_label(&s, dev()), Some(chip_active_lid()));
+        tests_support::for_each_lang(|| assert_eq!(chip_label(&s, dev()), Some(chip_active_lid())));
     }
 
     #[test]
     fn chip_lid_without_assertion_still_shows() {
         // 手動 pmset disablesleep 等でアサーション無しでも防止は効いている
         let s = state(false, SleepGuardMode::Off, 0, true, ThermalState::Nominal);
-        assert_eq!(chip_label(&s, dev()), Some(chip_active_lid()));
+        tests_support::for_each_lang(|| assert_eq!(chip_label(&s, dev()), Some(chip_active_lid())));
     }
 
     #[test]
     fn chip_thermal_warning() {
         let s = state(true, SleepGuardMode::On, 0, true, ThermalState::Serious);
-        assert_eq!(chip_label(&s, dev()), Some(chip_active_thermal()));
+        tests_support::for_each_lang(|| {
+            assert_eq!(chip_label(&s, dev()), Some(chip_active_thermal()))
+        });
     }
 
     #[test]
@@ -333,17 +339,21 @@ mod tests {
             false,
             ThermalState::Critical,
         );
-        assert_eq!(chip_label(&s, dev()), Some(chip_active(dev())));
+        tests_support::for_each_lang(|| {
+            assert_eq!(chip_label(&s, dev()), Some(chip_active(dev())))
+        });
     }
 
     #[test]
     fn mode_labels() {
-        assert_eq!(mode_label(SleepGuardMode::Off), mode_off());
-        assert_eq!(mode_label(SleepGuardMode::On), mode_on());
-        assert_eq!(
-            mode_label(SleepGuardMode::WhileAgentsRunning),
-            mode_while_agents()
-        );
+        tests_support::for_each_lang(|| {
+            assert_eq!(mode_label(SleepGuardMode::Off), mode_off());
+            assert_eq!(mode_label(SleepGuardMode::On), mode_on());
+            assert_eq!(
+                mode_label(SleepGuardMode::WhileAgentsRunning),
+                mode_while_agents()
+            );
+        });
     }
 
     #[test]
@@ -355,13 +365,13 @@ mod tests {
             false,
             ThermalState::Nominal,
         );
-        assert!(reason(&s, dev()).contains('3'));
+        tests_support::for_each_lang(|| assert!(reason(&s, dev()).contains('3')));
     }
 
     #[test]
     fn reason_always_on_selected() {
         let s = state(true, SleepGuardMode::On, 0, false, ThermalState::Nominal);
-        assert_eq!(reason(&s, dev()), reason_always_on(dev()));
+        tests_support::for_each_lang(|| assert_eq!(reason(&s, dev()), reason_always_on(dev())));
     }
 
     #[test]
@@ -373,13 +383,15 @@ mod tests {
             false,
             ThermalState::Nominal,
         );
-        assert_eq!(reason(&s, dev()), reason_agents_finishing());
+        tests_support::for_each_lang(|| assert_eq!(reason(&s, dev()), reason_agents_finishing()));
     }
 
     #[test]
     fn reason_system_disabled_without_assertion() {
         let s = state(false, SleepGuardMode::Off, 0, true, ThermalState::Nominal);
-        assert_eq!(reason(&s, dev()), reason_system_disabled(Device::detect()));
+        tests_support::for_each_lang(|| {
+            assert_eq!(reason(&s, dev()), reason_system_disabled(Device::detect()))
+        });
     }
 
     #[test]
@@ -391,19 +403,34 @@ mod tests {
             false,
             ThermalState::Nominal,
         );
-        assert_eq!(reason(&s, dev()), reason_idle());
+        tests_support::for_each_lang(|| assert_eq!(reason(&s, dev()), reason_idle()));
     }
 
     #[test]
     fn lid_behavior_variants() {
         let with_lid = state(true, SleepGuardMode::On, 0, true, ThermalState::Nominal);
-        assert_eq!(lid_behavior(&with_lid, dev()), lid_keeps_running());
         let without_lid = state(true, SleepGuardMode::On, 0, false, ThermalState::Nominal);
-        assert_eq!(lid_behavior(&without_lid, dev()), lid_sleeps(dev()));
+        tests_support::for_each_lang(|| {
+            assert_eq!(lid_behavior(&with_lid, dev()), lid_keeps_running());
+            assert_eq!(lid_behavior(&without_lid, dev()), lid_sleeps(dev()));
+        });
     }
 
     /// macOS 固有の語。Windows の画面に出たらそれが症状そのもの（#905）
     const MAC_ONLY_WORDS: &[&str] = &["Mac", "pmset", "sudoers"];
+
+    /// macOS 向けの実文字列（`macosの文言は従来どおり` の検査対象）。
+    /// クロージャではなく関数として括り出してあるのは、言語依存の呼び出しを
+    /// **ヘルパの区間の中だけ**に置くため（#1274。番犬 `ui_text::lang_watchdog`）
+    fn mac_texts() -> Vec<String> {
+        vec![
+            chip_active(Device::Mac).to_string(),
+            reason_always_on(Device::Mac).to_string(),
+            reason_agents_running(2, Device::Mac),
+            lid_sleeps(Device::Mac).to_string(),
+            thermal_note(Device::Mac).to_string(),
+        ]
+    }
 
     /// チップ + ポップオーバーが取り得る状態（renderer の分岐を全部通る組み合わせ）
     fn representative_states() -> Vec<(&'static str, SleepGuardState)> {
@@ -492,18 +519,9 @@ mod tests {
             "The Mac sleeps as usual, stopping running processes",
             "The Mac is running hot. Open the lid to let it cool down",
         ];
-        let collect = || {
-            vec![
-                chip_active(Device::Mac).to_string(),
-                reason_always_on(Device::Mac).to_string(),
-                reason_agents_running(2, Device::Mac),
-                lid_sleeps(Device::Mac).to_string(),
-                thermal_note(Device::Mac).to_string(),
-            ]
-        };
         use tako_core::i18n::Lang;
-        tests_support::with_lang(Lang::Ja, || assert_eq!(collect(), expected_ja));
-        tests_support::with_lang(Lang::En, || assert_eq!(collect(), expected_en));
+        tests_support::with_lang(Lang::Ja, || assert_eq!(mac_texts(), expected_ja));
+        tests_support::with_lang(Lang::En, || assert_eq!(mac_texts(), expected_en));
     }
 
     #[test]

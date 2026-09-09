@@ -59,15 +59,22 @@ mod tests {
     }
 
     /// ツリー（#314）と**同じ文言**を出していること。
-    /// 片方だけ言い回しを変える改変をここで落とす
+    /// 片方だけ言い回しを変える改変をここで落とす。
+    ///
+    /// 比較は `for_each_lang` の中で行う（#1274）。表示言語はプロセス全体の
+    /// グローバルなので、ロックの外で 2 点を読むと**読み取りのあいだに別スレッドの
+    /// テストが言語を切り替え、別言語同士を比べて落ちる**。日英それぞれで見るので
+    /// 検査としても強くなる
     #[test]
     fn 共通項目はファイルツリーと同一文言() {
-        assert_eq!(open_default(), super::super::sidebar::menu_open_default());
-        assert_eq!(open_with(), super::super::sidebar::menu_open_with());
-        assert_eq!(copy_rel(), super::super::sidebar::menu_copy_rel());
-        assert_eq!(copy_abs(), super::super::sidebar::menu_copy_abs());
-        for fm in [FileManager::Finder, FileManager::Explorer] {
-            assert_eq!(reveal(fm), super::super::sidebar::menu_reveal(fm));
-        }
+        tests_support::for_each_lang(|| {
+            assert_eq!(open_default(), super::super::sidebar::menu_open_default());
+            assert_eq!(open_with(), super::super::sidebar::menu_open_with());
+            assert_eq!(copy_rel(), super::super::sidebar::menu_copy_rel());
+            assert_eq!(copy_abs(), super::super::sidebar::menu_copy_abs());
+            for fm in [FileManager::Finder, FileManager::Explorer] {
+                assert_eq!(reveal(fm), super::super::sidebar::menu_reveal(fm));
+            }
+        });
     }
 }
