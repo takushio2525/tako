@@ -3749,7 +3749,8 @@ skip の行に `script` のパスを出したので後から言い分けられ�
 > `cargo build --workspace` は `tests/` をコンパイルしないため。**同じ穴は
 > `cargo test --workspace --no-run` を blocking ステップとして塞いだ**
 > （番犬 `crates/tako-control/tests/ci_windows_test_compile.rs`）。
-> macOS からの先行検出は `scripts/check-windows.sh --tests`（作法 10 と同じ）。
+> macOS からの先行検出は `scripts/check-windows.sh --tests`（作法 10 の `--all-targets` の
+> 狭い版。実測: 修正前ソースで 3 件の `E0425` を **1 秒**で名指しした）。
 
 **2026-09-02 のベースラインは件数だけで名前を残していない**ので厳密な集合差は取れない。
 以後のために**失敗名の一覧をここへ残す**（24 件。内訳は POSIX 前提のテスト = symlink /

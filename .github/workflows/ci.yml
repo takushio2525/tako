@@ -132,6 +132,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: ビルド
         run: cargo build --workspace
+      # **テストの「コンパイル」だけは blocking** にする（#1264）。
+      # 上の `cargo build --workspace` は `tests/` のターゲットをコンパイルしないので、
+      # Windows 専用の統合テスト（`#![cfg(windows)]` = macOS では空クレート）が
+      # 壊れても両ジョブが緑のまま通る。実際に main が「テストが 1 件も走らない」
+      # 状態で放置された（#1264。#1199 の検証ブロックが変数の無い関数に入り E0425 × 3）。
+      # テスト結果の非ブロッキング（#583）は据え置いたまま、コンパイル可能性だけを守る。
+      # **追加の所要時間は実質ゼロ**: 下のテスト実行はここで作ったテストバイナリを
+      # そのまま使う（実機実測: `--no-run` の後の `cargo test --workspace` は再コンパイル 0）
+      - name: テストのコンパイル検査（#1264。結果ではなくビルドを守る）
+        run: cargo test --workspace --no-run
       # Windows のテストは #574 でビルドが通るようになって初めて実行され、POSIX 前提の
       # 既存テスト 18 件（ps / symlink / `~` 展開 / sh 前提の spawn 等）が落ちている。
       # 内訳と対応は Issue #583（#467 Windows 移植の子タスク）。
