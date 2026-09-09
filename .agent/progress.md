@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-09（#1030: テスト由来の事前信頼エントリの掃除口を用意した）
-- 書き先は #944 で塞ぎ済み。残骸掃除に `scripts/clean-trust-residue.sh`（dry-run 既定・`--apply` で退避つき削除）と偽 HOME のモックテスト 10 件（CI 登録）を追加
-- 番犬へ `claudeの設定エントリはテスト実行で増えない`（種を置いた HOME で子を回し件数不変を実測。A/B `TAKO_944_LEGACY=1` で増える）
-- dry-run 実測: `~/.claude.json` 2,573 件中 2,216 件 / `~/.claude/.claude.json` 874 件中 736 件が対象。**うち約 2,145 件は GUI セルフテスト由来**で射程外（Issue へ報告済み）
-
 ## 2026-09-09（#1229: remote_files のテストの約 1/350 フレークを直した）
 - 真因は時間でも共有状態でもなく**入力の偶然**。`ツリーに出ていないルートは拒否される` が「未知の id」に `fx.root_id().to_uppercase()` を使っていたが、id は 12 桁の小文字 16 進なので (10/16)^12 ≒ 1/280 で数字だけになり、その回は大文字化しても実在の id のまま素通りしていた（fixture のパスに pid が入る = 綴りが毎回変わる）
 - 綴り違いは長さで必ず外れる形（1 文字短い / 長い）へ替え、大小文字の区別は英字入りの id を据える別テストへ分離。番犬 `root_id_case_watchdog.rs` が修正前ソースの `remote_files.rs:2240` を名指しで落とす
@@ -78,3 +73,8 @@
 - 真因は「判定のたびに書く」こと。`apply_ssh_scan` は 2 秒 tick のたびに呼ばれ、走査を間引いた tick でも `scan` が `prev.skipped` を持ち越す（「見ていない」を「消えた」と読み替えない仕様）ので同じ行が積もっていた（実測 3 時間で 866 行）
 - 鍵を **(ペイン, ssh の pid, 理由)** にした `ssh_detect::SshSkipLog` を通してから書く形へ（`SkippedSsh` に `pid` を追加・`remote-folder auto` の `skipped` にも `pid` を出す）。記憶は現に見送られている鍵だけ残すので打ち直しループでも伸びない
 - A/B `TAKO_1258_LEGACY=1`: 60 回評価で既定 1 行 / legacy 60 行。番犬 3 本が修正前ソース（`ssh_folders.rs:208`）と pid 落ちを名指しで FAILED。全 3929 件緑
+
+## 2026-09-09（#1081: GUI 章の撮り直しは画面ロックで着手できず・収録開始条件を 3 つに定義した）
+- 10:51〜12:22 の 90 分（30 秒 × 180 回）待って **180 回すべて施錠のまま**。`screencapture` は終始 `could not create image from rect` で、収録には入っていない（素材・完成品は前回のまま・隔離 tako も起動なし）
+- 収穫は判定条件: **HID idle 単独は誤発火する**（施錠中も伸びる。10:50 実測で idle 165 秒 > 120 秒でも撮れない）。「解錠 + tako-vd 使用可 + idle 120 秒以上 + `screencapture` の試し撮り」の 4 段を plan へ明文化
+- 次: 解錠後に `record-explainer.sh guimode` → `pii-scan.sh` → `build-explainer.sh … v5.mp4`

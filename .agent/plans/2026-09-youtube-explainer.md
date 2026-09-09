@@ -305,13 +305,32 @@ master の話が完結したあとに「初心者向けの同じこと」を見�
   窓では割った worker が 59 桁になるため。`tako orchestrator layout --min-worker-cols 40` で下げる
 - 押下後にチャット表示にならなかったら**収録を中止する**（壊れたテイクで先へ進まない）
 
-#### 残っていること（2026-09-09 01:40 時点）
+#### 残っていること（2026-09-09 12:25 時点）
 
 `guimode-raw.mp4` は**担当 AI のペインが立つ前のテイク**（`c5_gui10` の絵だけが足りない。
 他の 10 区間と検査値は下の表のとおり揃っている）。ローカルルールで run を禁止する修正は
 プローブで spawn が同じタブに立つことを確認済みで、**あとは 1 回撮り直すだけ**。
 撮り直しには画面のロック解除が必要（01:25 に蓋が閉じてロックされ、
 `screencapture` が `could not create image from rect` になった）。
+
+##### 収録に入ってよい条件は 3 つ（HID idle だけを合図にしない）
+
+10:46 に一度ロックが解けたが 10:48 に再施錠され、**10:51〜12:22 の 90 分（30 秒 × 180 回）は
+180 回すべて施錠のまま**で撮れなかった（idle は 5,782 秒まで伸びた = ユーザーは終始不在）。
+
+**施錠中は無操作時間が伸び続けるので、HID idle を単独の合図にすると必ず誤発火する。**
+10:50 の実測がそれで、idle 165 秒（> 120 秒）でも `screencapture` は
+`could not create image from rect` だった。次の 3 つが同時に成り立ってから収録を始める。
+
+| 条件 | 測り方 | 欠けるとどうなる |
+|---|---|---|
+| 施錠されていない | `ioreg -n Root -d1 -a` の `CGSSessionScreenIsLocked` が `<true/>` でない | `screencapture` が `could not create image from rect` |
+| `tako-vd` が使用可 | `scripts/lib/virtual-display.sh status` の 1 行目が「使用可」 | 面が眠っていて tako から見えない（解錠後に `ensure` で起こす） |
+| 無操作が 120 秒以上 | `ioreg -c IOHIDSystem` の `HIDIdleTime` | 実クリックがカーソルを動かし、ユーザーの操作を邪魔する |
+
+3 つが揃ったら `screencapture` を 1 枚だけ試し撮りし、**実際に通ることまで確かめてから**本番へ入る
+（判定と実効性がずれる余地を残さない）。収録は約 10 分かかるので、開始時と終了時の
+`HIDIdleTime` を記録し、途中で idle がリセットされていたらそのテイクは捨てる。
 
 ```sh
 scripts/lib/virtual-display.sh ensure
