@@ -4082,7 +4082,10 @@ impl TakoApp {
                         app.claude_resume_sessions.seed(pane, session_id);
                     }
                 }
-                if let Some(saved) = saved_agent {
+                // claude の ID があるペインは claude が勝つので、claude 以外の記録は
+                // 引き継がない（**seed した記録は未確認のまま落ちない**ので、
+                // 引き継ぐと使われない古い会話参照が layout に居座り続ける）
+                if let (None, Some(saved)) = (&r.claude_session_id, saved_agent) {
                     // ID が無くても系統は覚えておく（保存し直せるまでのあいだ、
                     // 内訳ログが `ID なし` と `resume 非対応` を言い分けられる）
                     app.agent_resume_sessions.seed(pane, saved.agent, saved.id);
@@ -4141,12 +4144,12 @@ impl TakoApp {
             }
             // claude 以外の resume（#1238）。**0 件なら 1 行目の形は従来のまま**
             // （codex / agy を使っていない環境の見え方を変えない）
-            let mut other_agents: Vec<&&'static str> = resumed_other.keys().collect();
+            let mut other_agents: Vec<&'static str> = resumed_other.keys().copied().collect();
             other_agents.sort_unstable();
             let resumed_other_total: usize = resumed_other.values().map(|(n, _)| n).sum();
             let other_segment: String = other_agents
                 .iter()
-                .map(|agent| format!("{agent} resume {} / ", resumed_other[**agent].0))
+                .map(|agent| format!("{agent} resume {} / ", resumed_other[agent].0))
                 .collect();
             let report = format!(
                 "復元成功: {} タブ / {} ペイン（tmux 再 attach {} / Claude resume {} / {}新規シェル {} / プレビュー {}）",
@@ -4172,7 +4175,7 @@ impl TakoApp {
                 let others: String = other_agents
                     .iter()
                     .map(|agent| {
-                        let (n, with_role) = resumed_other[**agent];
+                        let (n, with_role) = resumed_other[agent];
                         format!(
                             " / {agent} resume {n}（役割つき {with_role} / 役割なし {}）",
                             n - with_role
