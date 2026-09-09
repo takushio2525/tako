@@ -77,6 +77,26 @@ impl Fixture {
         text.push_str(&String::from_utf8_lossy(&out.stderr));
         (out.status.success(), text)
     }
+
+    /// セッションの接続クライアント数（`None` = そのセッションがもう無い）。
+    ///
+    /// 「クライアントが死んでも器は生きている」を**固定 sleep ではなく状態**で
+    /// 見るための材料（#1114）。psmux 3.3.7 が `#{session_attached}` を持つことは
+    /// 実機で確認済み
+    fn attached(&self, name: &SessionRef) -> Option<u32> {
+        let (ok, text) = self.raw(&[
+            "list-sessions",
+            "-F",
+            "#{session_name}\t#{session_attached}",
+        ]);
+        if !ok {
+            return None;
+        }
+        text.lines()
+            .filter_map(|l| l.split_once('\t'))
+            .find(|(n, _)| n.trim() == name.as_str())
+            .and_then(|(_, v)| v.trim().parse::<u32>().ok())
+    }
 }
 
 impl Drop for Fixture {
@@ -91,6 +111,220 @@ impl Drop for Fixture {
 
 fn session(name: &str) -> SessionRef {
     SessionRef::new(name).unwrap()
+}
+
+// ── 状態待ち（#1114）─────────────────────────────────────────────────────
+//
+// **固定回数で待たない**。旧実装は「100ms × N 回」を 1 単位に最大 6 周する形で、
+// 予算が固定（プロンプト待ち 60 回 ≒ 6 秒 × 6 周）だった。実測（Windows 実機・
+// このバイナリを 4 多重 + プロセス生成負荷 12）では器の中の pwsh がプロンプトを
+// 出すまでに **20〜34 秒**かかり、6 周すべてをプロンプト待ちで使い切って FAILED に
+// なる（9/16。落ちた画面は `PS …> Write-O` = 打鍵のエコーが途中で切れた形）。
+//
+// 直し方は `.agent/conventions.md`「セルフテストの待ち条件の書き方」と同じで、
+// **状態で待つ + 上限を `state_wait_budget` で伸ばす**（伸ばすだけ・4 倍で打ち切り）。
+// 予算切れの診断には「待っていたもの / 届いたもの」を必ず出す。
+
+/// 画面のポーリング間隔（PTY のイベントを汲むだけなので安い）
+const POLL: Duration = Duration::from_millis(100);
+
+/// 器の状態のポーリング間隔。**1 回ごとに psmux の CLI プロセスが立つ**ので、
+/// 画面と同じ 100ms で回すと 18 本並列のこのバイナリが自分で負荷を作ってしまう
+/// （旧実装の 200〜500ms と同じ粒度に留める）
+const STATE_POLL: Duration = Duration::from_millis(250);
+
+/// マーカーが器の中のシェルから出るまでの素の上限。
+/// 旧の実効上限（6 周 × (プロンプト 6 秒 + マーカー 6 秒) ≒ 72 秒）より**広く**採る
+/// ＝ 空いている機でも新旧が同じにならず、A/B が取れる（#771 と同じ理由）
+const MARKER_BASE: Duration = Duration::from_secs(90);
+
+/// 打ち直しの間隔。旧の 1 周ぶん（≒6 秒）より少しだけ長く採る
+const RESEND_BASE: Duration = Duration::from_secs(10);
+
+/// クライアント切断が器へ届くまでの素の上限（実測は 1 秒未満）
+const DETACH_BASE: Duration = Duration::from_secs(15);
+
+/// 再 attach で画面が戻るまでの素の上限（旧 20 秒。実測は 1.3 秒未満）
+const REATTACH_BASE: Duration = Duration::from_secs(30);
+
+/// この機の混み具合。**プロセスで 1 回だけ読む**
+/// （Windows の読み手は 120ms ブロックするので毎周期は呼ばない）
+fn busy() -> Option<f64> {
+    static BUSY: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *BUSY.get_or_init(tako_core::wait_budget::machine_busy)
+}
+
+/// 状態待ちの上限（**伸ばすだけ**・4 倍で打ち切り）。政策は `tako_core::wait_budget` の 1 実装
+fn budget_for(base: Duration) -> Duration {
+    tako_core::wait_budget::state_wait_budget(base, busy())
+}
+
+/// 旧の固定窓を再現するアーム（A/B 用）。`TAKO_1114_LEGACY=1`
+fn legacy_1114() -> bool {
+    std::env::var("TAKO_1114_LEGACY").is_ok_and(|v| v == "1")
+}
+
+/// 待ちの結果。診断に**待っていたもの / 届いたもの**を必ず出すための材料
+#[derive(Debug)]
+struct Waited {
+    ok: bool,
+    waited: Duration,
+    budget: Duration,
+    polls: u32,
+    /// 打ち直した回数（打たない待ちでは 0）
+    resends: u32,
+}
+
+impl Waited {
+    /// 予算切れの 1 行。`got` は「実際に届いていたもの」（画面・器の状態）
+    fn diag(&self, want: &str, got: &str) -> String {
+        format!(
+            "TAKO_1114_WAIT 待っていたもの={want:?} 届いたもの={got:?} \
+             ok={} waited={:.1}s budget={:.1}s polls={} resends={} load={}",
+            self.ok,
+            self.waited.as_secs_f64(),
+            self.budget.as_secs_f64(),
+            self.polls,
+            self.resends,
+            busy()
+                .map(|b| format!("{b:.2}"))
+                .unwrap_or_else(|| "unknown".to_string()),
+        )
+    }
+}
+
+/// 器やファイルの状態が満ちるまで待つ（期限式）
+fn wait_state(base: Duration, mut probe: impl FnMut() -> bool) -> Waited {
+    let budget = budget_for(base);
+    let started = Instant::now();
+    let mut polls = 0;
+    loop {
+        let ok = probe();
+        let waited = started.elapsed();
+        if ok || waited >= budget {
+            return Waited {
+                ok,
+                waited,
+                budget,
+                polls,
+                resends: 0,
+            };
+        }
+        std::thread::sleep(STATE_POLL);
+        polls += 1;
+    }
+}
+
+type Events = futures::channel::mpsc::UnboundedReceiver<tako_core::SessionEvent>;
+
+/// 画面が条件を満たすまで PTY イベントを汲みながら待つ（期限式）。
+///
+/// **rx を汲むのが必須**: psmux クライアントは端末クエリ（DA / DSR）への応答を待つ。
+/// 捨てると応答待ちのまま描画が進まない（tmux の洪水テストと同じ理由）
+fn pump_until(
+    term: &mut tako_core::TerminalSession,
+    rx: &mut Events,
+    base: Duration,
+    hit: impl Fn(&str) -> bool,
+) -> Waited {
+    pump_inner(term, rx, base, hit, None)
+}
+
+/// 画面が条件を満たすまで待ち、**満たないあいだは同じ行を打ち直す**（期限式。#1114）。
+///
+/// 打ち直しが要るのは、器の中のシェルが起動しきる前の打鍵が食われることがあるため
+/// （導入時の実測: `Write-Output (AKO-PSMUX' …` のように先頭が欠ける）。
+/// ただし**打つのは「素のプロンプトで止まっている」ときだけ**にする: エコーの途中
+/// （`PS …> Write-O`）へ重ねても行が壊れるだけで復旧しない。継続行（PowerShell の
+/// `>>` = 引用符が閉じていない）へ落ちていたら Ctrl-C で素のプロンプトへ戻す
+fn pump_until_typed(
+    term: &mut tako_core::TerminalSession,
+    rx: &mut Events,
+    base: Duration,
+    line: &[u8],
+    hit: impl Fn(&str) -> bool,
+) -> Waited {
+    pump_inner(term, rx, base, hit, Some(line))
+}
+
+/// 画面末尾から読む「いま打ってよいか」
+#[derive(PartialEq, Eq, Debug)]
+enum Prompt {
+    /// 素のプロンプトで止まっている（打ってよい）
+    Fresh,
+    /// 継続行に落ちている（Ctrl-C で戻す）
+    Continuation,
+    /// 起動途中 / 実行中 / エコーの途中（打たない）
+    Busy,
+}
+
+fn prompt_state(lines: &[String]) -> Prompt {
+    let Some(tail) = lines.iter().rev().find(|l| !l.trim().is_empty()) else {
+        return Prompt::Busy;
+    };
+    // `visible_lines` は行末を trim 済み
+    if cfg!(windows) {
+        if tail.ends_with(">>") {
+            return Prompt::Continuation;
+        }
+        if tail.ends_with('>') && tail.contains("PS ") {
+            return Prompt::Fresh;
+        }
+    } else if tail.ends_with('$') || tail.ends_with('%') || tail.ends_with('#') {
+        return Prompt::Fresh;
+    }
+    Prompt::Busy
+}
+
+fn pump_inner(
+    term: &mut tako_core::TerminalSession,
+    rx: &mut Events,
+    base: Duration,
+    hit: impl Fn(&str) -> bool,
+    line: Option<&[u8]>,
+) -> Waited {
+    let budget = budget_for(base);
+    let resend_after = budget_for(RESEND_BASE);
+    let started = Instant::now();
+    let mut polls = 0;
+    let mut resends = 0;
+    let mut typed_at: Option<Instant> = None;
+    loop {
+        while let Ok(event) = rx.try_recv() {
+            term.process_event(event);
+        }
+        let lines = term.visible_lines();
+        let ok = lines.iter().any(|l| hit(l));
+        let waited = started.elapsed();
+        if ok || waited >= budget {
+            return Waited {
+                ok,
+                waited,
+                budget,
+                polls,
+                resends,
+            };
+        }
+        if let Some(line) = line {
+            let due = typed_at.is_none_or(|t| t.elapsed() >= resend_after);
+            if due {
+                match prompt_state(&lines) {
+                    Prompt::Fresh => {
+                        term.write(line.to_vec());
+                        typed_at = Some(Instant::now());
+                        resends += 1;
+                    }
+                    Prompt::Continuation => {
+                        term.write(vec![0x03]);
+                        typed_at = Some(Instant::now());
+                    }
+                    Prompt::Busy => {}
+                }
+            }
+        }
+        std::thread::sleep(POLL);
+        polls += 1;
+    }
 }
 
 macro_rules! fixture {
@@ -120,30 +354,6 @@ fn 器はクライアント切断後もattachで内容ごと戻る() {
         env: vec![],
     };
 
-    // **rx を汲む**のが必須: psmux クライアントは端末クエリ（DA / DSR）への応答を待つ。
-    // 捨てると応答待ちのまま描画が進まない（tmux の洪水テストと同じ理由）
-    fn wait_for(
-        session: &mut tako_core::TerminalSession,
-        rx: &mut futures::channel::mpsc::UnboundedReceiver<tako_core::SessionEvent>,
-        needle: &str,
-        attempts: usize,
-    ) -> bool {
-        for _ in 0..attempts {
-            while let Ok(event) = rx.try_recv() {
-                session.process_event(event);
-            }
-            if session
-                .visible_lines()
-                .iter()
-                .any(|line| line.contains(needle))
-            {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        false
-    }
-
     // 入力のエコーと出力を区別するため、マーカーはシェルに組み立てさせる
     let marker_command: &[u8] = if cfg!(windows) {
         b"Write-Output ('TAKO-PSMUX' + '-OK')\r"
@@ -155,46 +365,104 @@ fn 器はクライアント切断後もattachで内容ごと戻る() {
     let (mut first, mut rx1) =
         tako_core::TerminalSession::spawn(80, 24, f.backend.wrap_spawn(base.clone(), &name))
             .expect("psmux クライアントを spawn できる");
-    // シェルが入力を受けられるようになるまで待つ。**固定 sleep では足りない**:
-    // 並列テストで負荷がかかると pwsh の起動が遅れ、先頭の数文字が食われる
-    // （実測: `Write-Output (AKO-PSMUX' …` のように打鍵が欠ける）。
-    // プロンプトを待ってから打ち、それでも駄目なら打ち直す
-    let prompt = if cfg!(windows) { "PS " } else { "$" };
-    let mut delivered = false;
-    for _ in 0..6 {
-        if !wait_for(&mut first, &mut rx1, prompt, 60) {
-            continue;
-        }
-        first.write(marker_command.to_vec());
-        if wait_for(&mut first, &mut rx1, "TAKO-PSMUX-OK", 60) {
-            delivered = true;
-            break;
-        }
-    }
+    // 器の中のシェルが**素のプロンプトで止まる**まで待ってから打ち、出力が出るまで
+    // 期限で待つ（起動前の打鍵は先頭が食われるので、素のプロンプトでだけ打ち直す）
+    let delivered = if legacy_1114() {
+        legacy_deliver_marker(&mut first, &mut rx1, marker_command)
+    } else {
+        pump_until_typed(&mut first, &mut rx1, MARKER_BASE, marker_command, |line| {
+            line.contains("TAKO-PSMUX-OK")
+        })
+    };
     assert!(
-        delivered,
-        "1 回目の器でマーカーが出力される。画面: {:?}",
-        first.visible_lines().join("\n")
+        delivered.ok,
+        "1 回目の器でマーカーが出力される。{}",
+        delivered.diag("TAKO-PSMUX-OK", &first.visible_lines().join("\n"))
     );
     // クライアント破棄（tako 終了相当）。器はサーバー側に残る
     drop(first);
-    std::thread::sleep(Duration::from_millis(800));
+    // **固定 sleep で「もう切断済み」を仮定しない**（#1114）。器が切断を認識した
+    // ことを状態で待ってから生存を見る。器ごと死んでいれば `attached` は `None` に
+    // なってこの待ちは即座に抜け、判定は下の `exists` が行う ＝ 検出力は落ちない
+    let detached = wait_state(DETACH_BASE, || f.attached(&name) != Some(1));
     assert!(
         f.backend.exists(&name),
-        "クライアントが死んでも器は生きている"
+        "クライアントが死んでも器は生きている。{}",
+        detached.diag(
+            "attached != Some(1)",
+            &format!("attached={:?}", f.attached(&name))
+        )
     );
 
     // 2 回目: 同じ名前で開き直すと画面内容ごと戻る
     let (mut second, mut rx2) =
         tako_core::TerminalSession::spawn(80, 24, f.backend.wrap_spawn(base, &name))
             .expect("再 attach の psmux クライアントを spawn できる");
+    let restored = pump_until(&mut second, &mut rx2, REATTACH_BASE, |line| {
+        line.contains("TAKO-PSMUX-OK")
+    });
     assert!(
-        wait_for(&mut second, &mut rx2, "TAKO-PSMUX-OK", 200),
-        "再 attach で画面内容（scrollback）が復元される。画面: {:?}",
-        second.visible_lines().join("\n")
+        restored.ok,
+        "再 attach で画面内容（scrollback）が復元される。{}",
+        restored.diag("TAKO-PSMUX-OK", &second.visible_lines().join("\n"))
     );
     drop(second);
     let _ = f.backend.kill(&name);
+}
+
+/// **旧の固定窓**（`TAKO_1114_LEGACY=1` の A/B アーム）。
+///
+/// 「プロンプト待ち 60 回 × 100ms → 打つ → マーカー待ち 60 回」を最大 6 周する形。
+/// 予算が機の混み具合に追従しないので、器の起動が 20 秒を超える負荷では 6 周を
+/// プロンプト待ちだけで使い切って偽 FAILED になる（#1114 の実測: 9/16）
+fn legacy_deliver_marker(
+    term: &mut tako_core::TerminalSession,
+    rx: &mut Events,
+    line: &[u8],
+) -> Waited {
+    fn fixed_window(
+        term: &mut tako_core::TerminalSession,
+        rx: &mut Events,
+        needle: &str,
+        attempts: usize,
+    ) -> bool {
+        for _ in 0..attempts {
+            while let Ok(event) = rx.try_recv() {
+                term.process_event(event);
+            }
+            if term.visible_lines().iter().any(|l| l.contains(needle)) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+    let prompt = if cfg!(windows) { "PS " } else { "$" };
+    let started = Instant::now();
+    let mut resends = 0;
+    for _ in 0..6 {
+        if !fixed_window(term, rx, prompt, 60) {
+            continue;
+        }
+        term.write(line.to_vec());
+        resends += 1;
+        if fixed_window(term, rx, "TAKO-PSMUX-OK", 60) {
+            return Waited {
+                ok: true,
+                waited: started.elapsed(),
+                budget: Duration::from_secs(72),
+                polls: 0,
+                resends,
+            };
+        }
+    }
+    Waited {
+        ok: false,
+        waited: started.elapsed(),
+        budget: Duration::from_secs(72),
+        polls: 0,
+        resends,
+    }
 }
 
 /// **要件 1**: `=`（exact-match 接頭辞）を付けない kill が効く。
@@ -557,22 +825,20 @@ fn 明示コマンドつきの器が起動する() {
     let cmd = wrapped.command.expect("起動コマンドが組まれる");
     // クライアントは PTY 無しでは即終了しうるので、器の中身だけを見る
     let child = Command::new(&cmd.program).args(&cmd.args).spawn();
-    // 並列テストで負荷がかかると器の起動は数秒ずれる。固定 sleep ではなくポーリングで待つ
+    // 並列テストで負荷がかかると器の起動は数秒ずれる。**固定回数ではなく期限**で待つ（#1114）
     let mut captured = String::new();
-    for _ in 0..60 {
-        std::thread::sleep(Duration::from_millis(500));
+    let started = wait_state(Duration::from_secs(30), || {
         captured = f.raw(&["capture-pane", "-t", name.as_str(), "-p"]).1;
-        if captured.contains("TAKO-M2-CMD-OK") {
-            break;
-        }
-    }
+        captured.contains("TAKO-M2-CMD-OK")
+    });
     if let Ok(mut child) = child {
         let _ = child.kill();
         let _ = child.wait();
     }
     assert!(
-        captured.contains("TAKO-M2-CMD-OK"),
-        "明示コマンドが器の中で起動していない（引数の組み立て規則が壊れた）: {captured}"
+        started.ok,
+        "明示コマンドが器の中で起動していない（引数の組み立て規則が壊れた）。{}",
+        started.diag("TAKO-M2-CMD-OK", &captured)
     );
     let _ = f.backend.kill(&name);
 }
@@ -582,7 +848,7 @@ fn 明示コマンドつきの器が起動する() {
 /// セッションの履歴が `want` 行を超えるまで待つ（並列テストの負荷でずれるので固定 sleep にしない）
 fn wait_for_history(f: &Fixture, name: &SessionRef, want: usize) -> usize {
     let mut history = 0;
-    let deadline = Instant::now() + Duration::from_secs(45);
+    let deadline = Instant::now() + budget_for(Duration::from_secs(45));
     while Instant::now() < deadline {
         history = f
             .backend
@@ -629,7 +895,7 @@ fn 保持していないセッションの画面と履歴を採れる() {
     );
 
     // シェルが入力を受けられるようになるまで待ってから流し込む
-    let deadline = Instant::now() + Duration::from_secs(45);
+    let deadline = Instant::now() + budget_for(Duration::from_secs(45));
     while Instant::now() < deadline {
         let screen = capture.capture_screen(&name).unwrap_or_default().join("\n");
         if screen.contains(if cfg!(windows) { "PS " } else { "$" }) {
@@ -657,7 +923,7 @@ fn 保持していないセッションの画面と履歴を採れる() {
         "printf '\\u3042\\u3044\\u3046\\u3048\\u304a%.0s' $(seq 1 24); echo"
     };
     f.raw(&["send-keys", "-t", name.as_str(), jp, "Enter"]);
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + budget_for(Duration::from_secs(30));
     while Instant::now() < deadline {
         if capture
             .capture_history_joined(&name, 400)
@@ -764,7 +1030,7 @@ fn copy_mode_の位置を読み戻せる() {
     assert!(ok, "器を作れる: {out}");
     let capture = f.backend.detached_capture().expect("採取の到達手段");
 
-    let deadline = Instant::now() + Duration::from_secs(45);
+    let deadline = Instant::now() + budget_for(Duration::from_secs(45));
     while Instant::now() < deadline {
         let screen = capture.capture_screen(&name).unwrap_or_default().join("\n");
         if screen.contains(if cfg!(windows) { "PS " } else { "$" }) {
@@ -818,16 +1084,14 @@ fn 器の中のシェルのpidが取れる() {
     assert!(ok, "器を作れる: {out}");
 
     let mut pids = Vec::new();
-    for _ in 0..40 {
+    let got = wait_state(Duration::from_secs(8), || {
         pids = f.backend.pane_pids(&name);
-        if !pids.is_empty() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
+        !pids.is_empty()
+    });
     assert!(
-        !pids.is_empty(),
-        "器の中のペインの pid が取れない（#659 の再発。コードページ固定が届かなくなる）"
+        got.ok,
+        "器の中のペインの pid が取れない（#659 の再発。コードページ固定が届かなくなる）。{}",
+        got.diag("pane_pids が空でない", &format!("{pids:?}"))
     );
     assert!(pids.iter().all(|pid| *pid != 0));
     // 存在しない器には答えない（`unwrap_or_default` が空を返す経路）
@@ -869,14 +1133,9 @@ fn 器の中のシェルのコードページをutf8へ固定できる() {
     assert!(ok, "器を作れる: {out}");
 
     let capture = |f: &Fixture| f.raw(&["capture-pane", "-t", name.as_str(), "-p"]).1;
+    // **固定回数ではなく期限**で待つ（#1114）
     let wait_for = |f: &Fixture, needle: &str| -> bool {
-        for _ in 0..50 {
-            if capture(f).contains(needle) {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        false
+        wait_state(Duration::from_secs(10), || capture(f).contains(needle)).ok
     };
     let send = |f: &Fixture, line: &str| {
         f.raw(&["send-keys", "-t", name.as_str(), line, "Enter"]);
@@ -937,21 +1196,7 @@ fn 器の中のシェルのコードページをutf8へ固定できる() {
     let _ = f.backend.kill(&name);
 }
 
-#[cfg(windows)]
-type Events = futures::channel::mpsc::UnboundedReceiver<tako_core::SessionEvent>;
-
-/// 画面に `needle` が出るまで PTY イベントを汲む
-#[cfg(windows)]
-fn pump(
-    term: &mut tako_core::TerminalSession,
-    rx: &mut Events,
-    needle: &str,
-    attempts: usize,
-) -> bool {
-    pump_with(term, rx, attempts, |line| line.contains(needle))
-}
-
-/// `needle` **ちょうど**の行が出るまで汲む。
+/// `needle` **ちょうど**の行が出るまで汲む（期限式。#1114）。
 /// 計算結果（`42`）のように短いマーカーは、入力エコーや `LINE 42` と
 /// 区別するために行全体の一致で見る
 #[cfg(windows)]
@@ -959,28 +1204,9 @@ fn pump_line(
     term: &mut tako_core::TerminalSession,
     rx: &mut Events,
     needle: &str,
-    attempts: usize,
-) -> bool {
-    pump_with(term, rx, attempts, |line| line.trim() == needle)
-}
-
-#[cfg(windows)]
-fn pump_with(
-    term: &mut tako_core::TerminalSession,
-    rx: &mut Events,
-    attempts: usize,
-    hit: impl Fn(&str) -> bool,
-) -> bool {
-    for _ in 0..attempts {
-        while let Ok(event) = rx.try_recv() {
-            term.process_event(event);
-        }
-        if term.visible_lines().iter().any(|l| hit(l)) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    false
+    base: Duration,
+) -> Waited {
+    pump_until(term, rx, base, |line| line.trim() == needle)
 }
 
 /// 遡れるだけの履歴を持つ psmux ペインを開く（#686 の 2 本が共有）。
@@ -1004,21 +1230,17 @@ fn open_pane_with_history(f: &Fixture, name: &SessionRef) -> (tako_core::Termina
     )
     .expect("psmux クライアントを spawn できる");
 
-    let mut made = false;
-    for _ in 0..6 {
-        if !pump(&mut term, &mut rx, "PS ", 100) {
-            continue;
-        }
-        term.write(b"1..80 | ForEach-Object { \"LINE $_\" }\r".to_vec());
-        if pump(&mut term, &mut rx, "LINE 80", 100) {
-            made = true;
-            break;
-        }
-    }
+    let made = pump_until_typed(
+        &mut term,
+        &mut rx,
+        MARKER_BASE,
+        b"1..80 | ForEach-Object { \"LINE $_\" }\r",
+        |line| line.contains("LINE 80"),
+    );
     assert!(
-        made,
-        "遡るための履歴が作れない: {}",
-        term.visible_lines().join("\n")
+        made.ok,
+        "遡るための履歴が作れない。{}",
+        made.diag("LINE 80", &term.visible_lines().join("\n"))
     );
     (term, rx)
 }
@@ -1048,13 +1270,10 @@ fn copy_mode滞在中の打鍵がin_band解除で届く() {
         f.raw(&["send-keys", "-X", "-t", &format!("{name}:"), "cancel"]);
         std::thread::sleep(Duration::from_millis(300));
         term.scroll_wheel(3, 10, 10);
-        for _ in 0..30 {
-            std::thread::sleep(Duration::from_millis(150));
-            if f.backend.pane_in_mode(&name) == Some(true) {
-                return true;
-            }
-        }
-        false
+        wait_state(Duration::from_secs(5), || {
+            f.backend.pane_in_mode(&name) == Some(true)
+        })
+        .ok
     };
 
     // --- 上へ遡る → 器が copy mode に入る ---
@@ -1080,9 +1299,13 @@ fn copy_mode滞在中の打鍵がin_band解除で届く() {
 
     // --- before: 解除を仕込まずに打鍵 → copy mode に食われて届かない ---
     type_keys(&mut term, "20+20");
+    // **否定検査**なので窓は「伸ばすだけ」で安全に効く（長く見るほど検出力が上がり、
+    // 短くなることは無い ＝ 混んだ機で偽 PASS になりにくくなる）
+    let leaked = pump_line(&mut term, &mut rx, "40", Duration::from_secs(2));
     assert!(
-        !pump_line(&mut term, &mut rx, "40", 20),
-        "copy mode 中なのに打鍵が届いている（症状が再現していない）"
+        !leaked.ok,
+        "copy mode 中なのに打鍵が届いている（症状が再現していない）。{}",
+        leaked.diag("40 が出ないこと", &term.visible_lines().join("\n"))
     );
 
     // --- after: 器へ確かめてから in-band 解除を仕込む → 同じ打鍵が届く ---
@@ -1101,7 +1324,7 @@ fn copy_mode滞在中の打鍵がin_band解除で届く() {
         }
         term.arm_copy_mode_exit(exit);
         type_keys(&mut term, "31+11");
-        if pump_line(&mut term, &mut rx, "42", 100) {
+        if pump_line(&mut term, &mut rx, "42", Duration::from_secs(20)).ok {
             delivered = true;
             break;
         }
@@ -1156,13 +1379,10 @@ fn 器のホイールは上下対称で最下部でcopy_modeを抜ける() {
     };
     let settle = |f: &Fixture, want: Option<bool>| -> Option<bool> {
         let mut got = None;
-        for _ in 0..30 {
-            std::thread::sleep(Duration::from_millis(150));
+        wait_state(Duration::from_secs(5), || {
             got = f.backend.pane_in_mode(&name);
-            if got == want {
-                break;
-            }
-        }
+            got == want
+        });
         got
     };
 
