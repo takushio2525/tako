@@ -345,6 +345,110 @@ pub fn is_bypass_dialog(lines: &[String]) -> bool {
         && lines.iter().any(|l| l.contains("Yes, I accept"))
 }
 
+// --- 自動承諾（信頼 / Bypass ダイアログ）の 1 手（Issue #1236） ---
+
+/// 自動承諾で Enter を送る上限（#1236 以前から 3。承諾しても消えないダイアログを
+/// 無限に叩かないための予算）
+pub const AUTO_ACCEPT_CONFIRMS: u32 = 3;
+
+/// 自動承諾でカーソル移動を送る上限（#1236）。実採取の信頼 / Bypass ダイアログは
+/// 2〜4 択なので 1 手で足りるが、キーを飲まれた場合の読み直しぶんを見込む
+pub const AUTO_ACCEPT_MOVES: u32 = 6;
+
+/// 自動承諾で送る「次の 1 手」（#1236）。
+///
+/// 旧実装は**素の Enter を送るだけ**だった。番号つきの旧ダイアログは既定が
+/// `❯ 1. Yes, I trust this folder` なのでそれで承諾できていたが、claude 2.x の
+/// 番号なしダイアログは**既定が `No, exit`** なので Enter は拒否側を確定し、
+/// claude が終了してプロンプトがシェルへ流れる（worker が黙って死ぬ）。
+///
+/// そこで respond（`dispatch::respond_via` の番号なし経路）と**同じ規則**にする:
+/// ハイライトを読む → 承諾側でなければ矢印で動かす → **承諾側に乗ったことを
+/// 確認してから** Enter。移動の判断は [`tako_core::dialog::confirm_step`] の 1 実装
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceptStep {
+    /// ハイライトを承諾側へ動かす（送ったら画面を採り直して読み直す）
+    Move {
+        /// `"Down"` / `"Up"`
+        key: &'static str,
+        /// 送る回数
+        steps: usize,
+    },
+    /// ハイライトが承諾側に乗っている = Enter で確定してよい
+    Confirm,
+    /// 承諾側を特定できない = **何も送らない**（理由コードは診断ログへ）
+    Blocked(&'static str),
+}
+
+/// 承諾側の選択肢の添字を返す（#1236）。
+///
+/// 判定はラベルの字面（`Yes, I trust this folder` / `Yes, continue` /
+/// `Yes, proceed` / `Yes, I accept` = 実採取の 4 種はすべて `Yes` 始まり）。
+/// **一意でなければ None**（`Yes, and always allow …` が並ぶ許可ダイアログのような
+/// 形で「どれか」を勝手に確定しないため。そもそも許可ダイアログは
+/// [`is_trust_dialog`] に一致しないので自動承諾の対象外）
+fn accept_option_index(options: &[tako_core::dialog::ChoiceOption]) -> Option<usize> {
+    let mut found = None;
+    for (i, o) in options.iter().enumerate() {
+        let label = o.label.trim().to_lowercase();
+        // `yes` 単独 / `yes,` / `yes ` のみを承諾側とみなす（`yesterday` 等を除く）
+        let accepts = label == "yes"
+            || label.starts_with("yes,")
+            || label.starts_with("yes ")
+            || label.starts_with("yes:");
+        if accepts {
+            if found.is_some() {
+                return None; // 複数一致 = どれが承諾側か決められない
+            }
+            found = Some(i);
+        }
+    }
+    found
+}
+
+/// 信頼 / Bypass ダイアログを**承諾側で確定する**ための次の 1 手を決める（#1236）。
+///
+/// 呼び出し側は `Move` を送ったら画面を採り直して**もう一度呼ぶ**。
+/// `Confirm` が返るのは承諾側にハイライトが乗っていることを画面で確認できたときだけで、
+/// `Blocked` のあいだは Enter を送らない（上限回数まで待って諦める）。
+///
+/// 送達フローの tick（tako-app）と器越しのループ（[`deliver_via_tmux`]）が
+/// この 1 実装を共有する
+pub fn accept_step(lines: &[String]) -> AcceptStep {
+    accept_step_with(lines, legacy_auto_accept())
+}
+
+/// [`accept_step`] の本体（A/B のフラグを引数で受ける版。テストは env を触らない）。
+///
+/// `legacy = true` は **#1236 前の挙動**（ハイライトを見ずに素の Enter）
+pub fn accept_step_with(lines: &[String], legacy: bool) -> AcceptStep {
+    if legacy {
+        return AcceptStep::Confirm;
+    }
+    let Some(dialog) = detect_choice_dialog(lines) else {
+        // 文言は信頼ダイアログだが選択肢の構造が読めない（描画途中・未知の形）。
+        // ここで Enter を送ると既定が拒否側の画面でエージェントを終了させる
+        return AcceptStep::Blocked("no_choice_list");
+    };
+    if !dialog.kind.auto_accepted() {
+        return AcceptStep::Blocked("not_auto_accepted");
+    }
+    let Some(target) = accept_option_index(&dialog.options) else {
+        return AcceptStep::Blocked("no_accept_option");
+    };
+    match tako_core::dialog::confirm_step(dialog.options.len(), dialog.highlighted, target) {
+        tako_core::dialog::ConfirmStep::Confirm => AcceptStep::Confirm,
+        tako_core::dialog::ConfirmStep::Move { key, steps } => AcceptStep::Move { key, steps },
+        tako_core::dialog::ConfirmStep::Blocked(b) => AcceptStep::Blocked(b.as_str()),
+    }
+}
+
+/// `TAKO_1236_LEGACY=1` で **#1236 前の自動承諾**（ハイライトを見ずに素の Enter）へ戻す。
+/// 同一バイナリで A/B を取る入口
+fn legacy_auto_accept() -> bool {
+    std::env::var_os("TAKO_1236_LEGACY").is_some()
+}
+
 /// 入力欄の内容を返す。会話ログの送信済みメッセージも同じプロンプト文字で始まるため、
 /// 入力欄 = **画面の一番下にある**プロンプト行とみなし、プロンプト文字以降を trim して返す。
 /// プロンプト文字は claude `❯` / codex `›` / agy `>` の和集合（Issue #120）。
@@ -889,6 +993,8 @@ pub fn deliver_via_tmux(
 ) -> Result<DeliveryReport, String> {
     let text = text.trim_end_matches(['\n', '\r']); // 送信の Enter は分離して送るため末尾改行は落とす
     let mut report = DeliveryReport::default();
+    // 自動承諾で送ったカーソル移動の回数（#1236。無限に叩かないための予算）
+    let mut accept_moves: u32 = 0;
 
     // ① 信頼ダイアログの処理と（必要なら）入力欄待ち
     let ready_deadline = Instant::now()
@@ -899,26 +1005,51 @@ pub fn deliver_via_tmux(
         };
     loop {
         let lines = tako_core::tmux::capture_session(socket, session)?;
-        if is_trust_dialog(&lines) {
-            if report.trust_dialogs_accepted >= 3 {
-                return Err("信頼ダイアログを承諾しても消えない".into());
+        // 信頼ダイアログ（#32）と Bypass Permissions 確認ダイアログ（#407）の自動承諾。
+        // #1236: **素の Enter を送ってはいけない**。claude 2.x の番号なし信頼ダイアログは
+        // 既定ハイライトが `No, exit` なので、Enter は拒否側を確定して claude を終了させる。
+        // ハイライトを読み → 承諾側へ矢印で動かし → 乗ったことを確認してから Enter
+        // （判断は `accept_step` の 1 実装。respond の番号なし経路と同じ規則）
+        if is_trust_dialog(&lines) || is_bypass_dialog(&lines) {
+            let what = if is_bypass_dialog(&lines) {
+                "Bypass 確認"
+            } else {
+                "信頼"
+            };
+            if report.trust_dialogs_accepted >= AUTO_ACCEPT_CONFIRMS
+                || accept_moves >= AUTO_ACCEPT_MOVES
+            {
+                return Err(format!("{what}ダイアログを承諾しても消えない"));
             }
-            tako_core::tmux::send_key(socket, session, "Enter")?;
-            report.trust_dialogs_accepted += 1;
-            std::thread::sleep(Duration::from_millis(700));
-            continue;
-        }
-        // Bypass Permissions 確認ダイアログ（#407）: 既定選択が「No, exit」のため
-        // ↓ で「Yes, I accept」へ移動してから Enter で確定する
-        if is_bypass_dialog(&lines) {
-            if report.trust_dialogs_accepted >= 3 {
-                return Err("Bypass 確認ダイアログを承諾しても消えない".into());
+            match accept_step(&lines) {
+                AcceptStep::Confirm => {
+                    tako_core::tmux::send_key(socket, session, "Enter")?;
+                    report.trust_dialogs_accepted += 1;
+                    std::thread::sleep(Duration::from_millis(700));
+                }
+                AcceptStep::Move { key, steps } => {
+                    for _ in 0..steps {
+                        tako_core::tmux::send_key(socket, session, key)?;
+                        accept_moves += 1;
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                }
+                AcceptStep::Blocked(reason) => {
+                    // 承諾側を特定できない画面（描画途中・未知の形）。待って読み直す。
+                    // 猶予を過ぎたら**諦める**（Enter を送って誤確定するより良い）
+                    if Instant::now() >= ready_deadline {
+                        crate::diag::persist_log(&format!(
+                            "[auto-accept] session={session} kind={what} blocked={reason} \
+                             （ハイライトを確認できないため Enter を送らずに諦めた。#1236）"
+                        ));
+                        return Err(format!(
+                            "{what}ダイアログの承諾側を特定できない（{reason}）。\
+                             ペインで選択を確定してから再送する"
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(300));
+                }
             }
-            tako_core::tmux::send_key(socket, session, "Down")?;
-            std::thread::sleep(Duration::from_millis(200));
-            tako_core::tmux::send_key(socket, session, "Enter")?;
-            report.trust_dialogs_accepted += 1;
-            std::thread::sleep(Duration::from_millis(700));
             continue;
         }
         // 未知の番号付き選択ダイアログ（テーマ選択・ログイン方法選択等。#530）。
@@ -2241,6 +2372,184 @@ Bash ツールで「touch /tmp/te439/approval-test.txt」を実行して
         assert_eq!(dialog.highlighted, Some(0));
         assert!(dialog.cursor_visible);
         assert!(!dialog.labels_truncated(), "ラベル一致で確定できる");
+    }
+
+    // --- #1236: 自動承諾はハイライトを見てから確定する ---
+
+    /// 番号なし信頼ダイアログでカーソルを 1 つ下げた画面（`Down` を送った後の姿）。
+    /// #1223 の `TRUST_DIALOG_NO_NUMBER` と同じ並びで、選択カーソルだけが動いている
+    const TRUST_DIALOG_NO_NUMBER_MOVED: &str = r#" Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source
+ project, or work from your team). If not, take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+   No, exit
+ > Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel"#;
+
+    #[test]
+    fn issue1236_番号なしの信頼ダイアログは承諾側へ動かしてから確定する() {
+        // ① 既定は `No, exit`（添字 0）なので、まず ↓ を 1 回
+        let lines = screen(TRUST_DIALOG_NO_NUMBER);
+        assert_eq!(
+            accept_step_with(&lines, false),
+            AcceptStep::Move {
+                key: "Down",
+                steps: 1
+            },
+            "素の Enter は `No, exit` を確定して claude を終了させる"
+        );
+        // ② 動いた画面を読み直すと承諾側に乗っている = ここで初めて Enter
+        let moved = screen(TRUST_DIALOG_NO_NUMBER_MOVED);
+        let dialog = detect_choice_dialog(&moved).expect("検知される");
+        assert_eq!(dialog.highlighted, Some(1), "カーソルが承諾側へ動いている");
+        assert_eq!(accept_step_with(&moved, false), AcceptStep::Confirm);
+    }
+
+    #[test]
+    fn issue1236_既定が承諾側のダイアログは従来どおりenter一回() {
+        // claude の番号つき旧形（`❯ 1. Yes, I trust this folder`）
+        assert_eq!(
+            accept_step_with(&screen(TRUST_DIALOG), false),
+            AcceptStep::Confirm
+        );
+        // codex（`› 1. Yes, continue`）
+        assert_eq!(
+            accept_step_with(&screen(CODEX_TRUST_DIALOG), false),
+            AcceptStep::Confirm
+        );
+        // agy（番号なしで承諾側が最上段 = 動かす必要が無い）
+        assert_eq!(
+            accept_step_with(&screen(AGY_TRUST_DIALOG), false),
+            AcceptStep::Confirm
+        );
+    }
+
+    #[test]
+    fn issue1236_bypass確認も同じ規則で承諾側を確定する() {
+        // #407 の実測は「↓ + Enter」。ハイライトを読む形でも同じ手になる
+        let lines = screen(BYPASS_DIALOG);
+        assert_eq!(
+            accept_step_with(&lines, false),
+            AcceptStep::Move {
+                key: "Down",
+                steps: 1
+            }
+        );
+    }
+
+    #[test]
+    fn issue1236_承諾側が読めない画面ではenterを送らない() {
+        // 文言だけは信頼ダイアログだが選択肢の構造が無い（描画途中・未知の形）
+        let half_drawn = screen(" Do you trust the files in this folder?");
+        assert!(is_trust_dialog(&half_drawn), "文言では信頼ダイアログ");
+        assert_eq!(
+            accept_step_with(&half_drawn, false),
+            AcceptStep::Blocked("no_choice_list")
+        );
+
+        // 承諾側の選択肢が無い（拒否だけが並ぶ形）
+        let no_accept = screen(
+            " Do you trust the files in this folder?\n\n > No, exit\n   Not now\n\n Enter to confirm",
+        );
+        assert_eq!(
+            accept_step_with(&no_accept, false),
+            AcceptStep::Blocked("no_accept_option")
+        );
+
+        // 承諾側が複数（どれを確定すべきか決められない）
+        let ambiguous = screen(
+            " Do you trust the files in this folder?\n\n > No, exit\n   Yes, once\n   Yes, always\n\n Enter to confirm",
+        );
+        assert_eq!(
+            accept_step_with(&ambiguous, false),
+            AcceptStep::Blocked("no_accept_option")
+        );
+
+        // 許可ダイアログ（`Do you want to proceed?`）は自動承諾の対象外。
+        // 万一ここへ来ても種別で弾く（任意コマンドの承認を代行しない）
+        assert_eq!(
+            accept_step_with(&screen(AGY_PERMISSION_DIALOG), false),
+            AcceptStep::Blocked("not_auto_accepted")
+        );
+    }
+
+    #[test]
+    fn issue1236_三択以上でも歩数と向きが合う() {
+        // 承諾側が最下段（↓ を 2 回）
+        let bottom = screen(
+            " Do you trust the files in this folder?\n\n > No, exit\n   Ask me later\n   Yes, I trust this folder\n\n Enter to confirm",
+        );
+        assert_eq!(
+            accept_step_with(&bottom, false),
+            AcceptStep::Move {
+                key: "Down",
+                steps: 2
+            }
+        );
+        // 承諾側が最上段でカーソルが最下段（↑ を 2 回 = 戻る向きも出る）
+        let top = screen(
+            " Do you trust the files in this folder?\n\n   Yes, I trust this folder\n   Ask me later\n > No, exit\n\n Enter to confirm",
+        );
+        assert_eq!(
+            accept_step_with(&top, false),
+            AcceptStep::Move {
+                key: "Up",
+                steps: 2
+            }
+        );
+    }
+
+    #[test]
+    fn issue1236_承諾側が最下段でハイライト済みなら動かさない() {
+        // 「下へ動かす」を決め打ちにしていると、ここで範囲外へ出て取り違える
+        let landed = screen(
+            " Do you trust the files in this folder?\n\n   No, exit\n   Ask me later\n > Yes, I trust this folder\n\n Enter to confirm",
+        );
+        assert_eq!(accept_step_with(&landed, false), AcceptStep::Confirm);
+    }
+
+    #[test]
+    fn issue1236_画面が書き換わっても毎回読み直して合わせる() {
+        // ① 送った矢印が飲まれてハイライトが戻った画面 → もう一度動かす
+        let swallowed = screen(TRUST_DIALOG_NO_NUMBER);
+        assert_eq!(
+            accept_step_with(&swallowed, false),
+            AcceptStep::Move {
+                key: "Down",
+                steps: 1
+            }
+        );
+        // ② 並び順が入れ替わった画面 → 添字を覚えず**ラベルで**承諾側を引き直す
+        let swapped = screen(
+            " Do you trust the files in this folder?\n\n   Yes, I trust this folder\n > No, exit\n\n Enter to confirm",
+        );
+        let dialog = detect_choice_dialog(&swapped).expect("検知される");
+        assert_eq!(dialog.highlighted, Some(1));
+        assert_eq!(
+            accept_step_with(&swapped, false),
+            AcceptStep::Move {
+                key: "Up",
+                steps: 1
+            },
+            "承諾側が上に来たら ↑ へ向きが変わる"
+        );
+    }
+
+    #[test]
+    fn issue1236_legacyフラグで素のenterへ戻る() {
+        // A/B（`TAKO_1236_LEGACY=1`）: ハイライトを見ずに Enter = #1236 の事故そのもの
+        assert_eq!(
+            accept_step_with(&screen(TRUST_DIALOG_NO_NUMBER), true),
+            AcceptStep::Confirm
+        );
+        assert_eq!(
+            accept_step_with(&screen(TRUST_DIALOG), true),
+            AcceptStep::Confirm
+        );
     }
 
     #[test]
