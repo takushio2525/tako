@@ -1,0 +1,25 @@
+# X（Twitter）向けショート #1284 のタイムライン。約 3 分・無音再生前提。
+# ナレーションは付けない（TAKO_PROMO_NO_NARR=1）。意味は**大見出しの字幕**と映像だけで運ぶ。
+# 列: id / kind / source / anchor / offset / min_dur / caption / subtitle / speech
+# subtitle と speech は常に "-"（小さなサブタイトル行は使わない = ユーザー指示）。
+# **2:20 版の切り出し点は x_cta1 の終わり = 131 秒**。そこまでで「散らかる → 1 タブ →
+# master が担当を立てる → かんたん表示 → 入手方法」が閉じるように並べてある。
+x_hook	slide	s_x_hook	-	0	6	-	-	-
+x_scatter	clip	scatter	tabs	0	7	タブとウインドウに散らばる	-	-
+x_solve	slide	s_x_solve	-	0	8	-	-	-
+x_agent	clip	agent	req1	0	12	日本語で頼むと、AI が自分でペインを割る	-	-
+x_agent2	clip	agent	req2	0	10	dev サーバーもプレビューも、同じタブに生える	-	-
+x_master_s	slide	s_c5_flow	-	0	9	-	-	-
+x_master	clip	master	request	-14	9	tako master と打つだけ	-	-
+x_grid	clip	master	workers_up	0	13	担当 AI が、同じタブに並ぶ	-	-
+x_orch	clip	master	orch	0	8	進み具合は右パネルで俯瞰できる	-	-
+x_report	clip	master	report_done	-10	11	検収してから報告してくれる	-	-
+x_gui_s	slide	s_c6_three	-	0	9	-	-	-
+x_gui	clip	guimode	42.11	0	9	コマンドを知らなくても、3 つのボタンから	-	-
+x_chat	clip	guimode	118.54	0	10	押すと、その画面がチャットになる	-	-
+x_cta1	slide	s_outro	-	0	10	-	-	-
+x_persist_s	slide	s_c7_persist	-	0	9	-	-	-
+x_restore	clip	restore-after	0	0	9	再起動しても、画面ごと戻ってくる	-	-
+x_phone	clip	pwa	list	0	10	スマホからも見られる（画面はデモ用データ）	-	-
+x_win	slide	s_c9_win	-	0	9	-	-	-
+x_cta2	slide	s_outro	-	0	10	-	-	-

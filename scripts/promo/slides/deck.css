@@ -1,0 +1,152 @@
+/* tako 解説動画 v6（#1081）のスライド意匠。
+ * 配色は既存の titlecard.swift / caption.swift と同じ tako ダークテーマに揃える
+ * （背景 #0d1117 → #161b22 / アクセント #ed598c）。絵文字は使わない（ブランド方針）。
+ * アイコン・図形はすべて CSS か インライン SVG で描く。 */
+
+:root {
+    --bg-top: #0d1117;
+    --bg-bottom: #161b22;
+    --accent: #ed598c;
+    --accent-dim: rgba(237, 89, 140, 0.16);
+    --ink: rgba(255, 255, 255, 0.96);
+    --ink-2: rgba(255, 255, 255, 0.78);
+    --ink-3: rgba(255, 255, 255, 0.55);
+    --line: rgba(255, 255, 255, 0.14);
+    --panel: rgba(255, 255, 255, 0.045);
+    --panel-2: rgba(255, 255, 255, 0.075);
+    --ok: #4ec9a6;
+    --warn: #e3b341;
+    --font: "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", system-ui, sans-serif;
+    --mono: "SF Mono", "Menlo", "Consolas", monospace;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body { background: #000; font-family: var(--font); }
+
+/* 1 枚 = 1920x1080。render-slides.mjs がこの要素ごとに PNG を撮る */
+.slide {
+    position: relative;
+    width: 1920px;
+    height: 1080px;
+    overflow: hidden;
+    background: linear-gradient(180deg, var(--bg-top) 0%, var(--bg-bottom) 100%);
+    color: var(--ink);
+    padding: 96px 120px 88px 132px;
+    display: flex;
+    flex-direction: column;
+}
+
+/* 左端のアクセント帯（titlecard.swift と同じ主張） */
+.slide::before {
+    content: "";
+    position: absolute;
+    left: 0; top: 0; bottom: 0;
+    width: 12px;
+    background: var(--accent);
+}
+
+/* 背景の薄い格子（titlecard.swift の罫と同じ役割） */
+.slide::after {
+    content: "";
+    position: absolute; inset: 0;
+    background-image:
+        linear-gradient(rgba(255,255,255,0.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.035) 1px, transparent 1px);
+    background-size: 120px 120px;
+    pointer-events: none;
+}
+
+.slide > * { position: relative; z-index: 1; }
+
+/* ── 見出し ───────────────────────────────────────── */
+.eyebrow {
+    font-size: 30px;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    color: var(--accent);
+    margin-bottom: 18px;
+}
+h1 { font-size: 82px; font-weight: 700; line-height: 1.18; letter-spacing: 0.01em; }
+h2 { font-size: 64px; font-weight: 700; line-height: 1.22; margin-bottom: 12px; }
+.lede { font-size: 38px; font-weight: 400; color: var(--ink-2); line-height: 1.5; margin-top: 22px; }
+
+.body { flex: 1; min-height: 0; display: flex; align-items: center; margin-top: 40px; }
+.body.top { align-items: flex-start; }
+
+/* ── 章扉 ─────────────────────────────────────────── */
+.chapter { justify-content: center; }
+.chapter .num {
+    font-size: 200px; font-weight: 800; line-height: 1;
+    color: var(--accent); opacity: 0.9; letter-spacing: -0.03em;
+}
+.chapter h1 { font-size: 96px; margin-top: 24px; }
+
+/* ── タイトル / 締め ──────────────────────────────── */
+.hero { justify-content: center; align-items: flex-start; }
+.hero .wordmark { font-size: 172px; font-weight: 800; letter-spacing: -0.02em; line-height: 1; }
+.hero .tagline { font-size: 46px; color: var(--ink-2); margin-top: 30px; font-weight: 500; }
+
+/* ── カード / 箱 ─────────────────────────────────── */
+.cards { display: flex; gap: 32px; width: 100%; }
+.card {
+    flex: 1;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 22px;
+    padding: 40px 36px;
+}
+.card.accent { border-color: rgba(237,89,140,0.5); background: var(--accent-dim); }
+.card .k { font-size: 27px; color: var(--accent); font-weight: 700; letter-spacing: 0.08em; margin-bottom: 16px; }
+.card .t { font-size: 40px; font-weight: 700; line-height: 1.32; }
+.card .d { font-size: 28px; color: var(--ink-3); line-height: 1.6; margin-top: 16px; }
+
+/* ── 箇条 ─────────────────────────────────────────── */
+ul.points { list-style: none; width: 100%; }
+ul.points li {
+    font-size: 40px; line-height: 1.5; color: var(--ink-2);
+    padding-left: 52px; position: relative; margin-bottom: 30px;
+}
+ul.points li::before {
+    content: ""; position: absolute; left: 6px; top: 22px;
+    width: 20px; height: 20px; border-radius: 5px; background: var(--accent);
+}
+ul.points li b { color: var(--ink); font-weight: 700; }
+
+/* ── コマンド表記 ─────────────────────────────────── */
+.cmd {
+    font-family: var(--mono);
+    font-size: 34px;
+    background: rgba(0,0,0,0.42);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 22px 30px;
+    color: #9fe6c8;
+    display: inline-block;
+}
+.cmd .p { color: var(--ink-3); }
+
+/* ── SVG 図解の共通指定 ───────────────────────────── */
+svg { width: 100%; height: auto; overflow: visible; }
+svg .box { fill: rgba(255,255,255,0.06); stroke: rgba(255,255,255,0.2); stroke-width: 2; }
+svg .box-accent { fill: rgba(237,89,140,0.15); stroke: #ed598c; stroke-width: 2.5; }
+svg .box-tab { fill: rgba(78,201,166,0.12); stroke: #4ec9a6; stroke-width: 2.5; }
+svg .lbl { fill: rgba(255,255,255,0.95); font-family: var(--font); font-size: 27px; font-weight: 600; }
+svg .lbl-sm { fill: rgba(255,255,255,0.62); font-family: var(--font); font-size: 22px; }
+svg .lbl-lg { fill: rgba(255,255,255,0.98); font-family: var(--font); font-size: 34px; font-weight: 700; }
+svg .arrow { stroke: rgba(255,255,255,0.45); stroke-width: 3; fill: none; }
+svg .arrow-accent { stroke: #ed598c; stroke-width: 3.5; fill: none; }
+svg .dash { stroke-dasharray: 10 9; }
+
+.note { font-size: 25px; color: var(--ink-3); margin-top: 26px; line-height: 1.55; }
+
+/* 図解は本文領域を使い切る（viewBox は 1660x660 に統一する）。
+ * 横長すぎる viewBox だと縦に大きな死に余白ができるので、寸法をここで縛る。 */
+/* 図版は本文領域の実高に追従させる（固定値だと見出しや注記の長さで簡単に溢れる）*/
+.body > svg { width: 100%; max-height: 100%; }
+.body > div { width: 100%; max-height: 100%; }
+.body > div > svg { width: 100%; max-height: 100%; }
+.diagram { width: 100%; }
+
+/* 矢印の定義は文書に 1 つだけ置き、全スライドから参照する */
+#svg-defs { position: absolute; width: 0; height: 0; overflow: hidden; }

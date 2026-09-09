@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-09（#1259: send_input が queued:true を返して無音で届かない問題を直した）
-- 真因は**顛末の記録が後続 send では全経路空振り**すること。`record_prompt_delivery_at` は先頭で `if flow != SpawnPrompt { return }`（spawn 専用）・保留と打ち切りは `eprintln!`（GUI の stderr は誰も読めない）・`persist.log` へ書くのは貼り付け段へ到達した後の `try_peer` / `log_fallback` だけ。本番の pane 1627 は `送達:` 行が 1 本も無く（同時刻の他ペインは記録あり）、`WaitPromptReady` で `input_line` が唯一の入口という穴と、peer の背景試行・起動コマンド待ちの**上限なしの待ち**が重なっていた（Issue の見立て「busy だと送らない」は否定 = 送達フローは `has_running_children` を参照しない）
-- 語彙と方針を `tako_core::prompt_delivery` の 1 本へ（`Stall` 11 種 + `Journal` の心拍 15 秒 + `peer_wait` の段階判定）。応答は `tako_send_input` / `tako_read_pane` の `delivery`、CLI は `[delivery]` 行、`persist.log` は `送達フロー: pane=… 理由=…`。peer は 25 秒で諦めるが**送る前の段階だけ**キー経路へ落ちる（判定は `PeerAttemptState` の CAS。段階を読むだけでは読んだ直後に背景スレッドが書き始めて二重投函になる = #790 の不変条件）
-- A/B `TAKO_1259_LEGACY=1` で無音と無限待ちを再現（実ファイル検証）。番犬 6 本のうち 5 本が修正前 `main.rs` を行番号で名指し（6440 / 6445 / 6457 / 6472 / 6738 / 6797）。模擬 TUI e2e（`sleep 3600` の子を抱えた idle ペイン）で送達成立を実測
-
 ## 2026-09-09（#1273: 背景シェルが残る worker で watch が WORKER_IDLE を出さない問題を直した）
 - 真因は #289 の**帰属ミス**（修正は原形のまま生きていた）。claude 2.1.258 の `agents --json` は `isLoading || delegatedActive` で状態を決め、背景シェル / Monitor が生きているあいだ**生 status が busy**（本番 4 ペイン同時観測: 申告のある 3 本が busy・無い 1 本だけ idle / `has_running_children` は 4 本とも true = 判別不能）。#289 の腕は `status == "idle"` 限定なので一度も入らず、busy → idle の経路がそもそも無かった
 - claude 自身の描き分け（ターン終了 = `· <内訳> still running` / 完了待ち = suffix なし）を借り、**生成中の目印ゼロ + 空の入力欄 + 折りたたみでない + 申告あり**のときだけ倒す（`wait::input_waiting_with_background_work` の 1 実装。応答に `background_work` / `idle_despite_primary_busy`・MATRIX へ `worker_idle_with_background`）
@@ -68,3 +63,8 @@
 - `SIGTERM` の quit 読み替えを隔離限定から本番へ（`quit_signal::install`）。拾うのは 2 秒 tick ではなく既存の **500ms ループ**（新しいタイマー無しで最悪待ちを 1/4 に）。握る以上は対で必要なウォッチドッグ（到着から 5 秒で `exit(143)`・専用スレッド）を同じ入口が立てる
 - 連打は 1 度しか quit を撃たない（`QUIT_DISPATCHED`）・ハンドラはアトミック 1 回だけ・Windows は `SIGTERM` が無いので見張りごと立てない。読み替えと強制終了は `persist.log` へ 1 行
 - 隔離 GUI 実測（各 5 回）: 直前の窓リサイズが layout に載る **新 5/5 → 旧 0/5**（`TAKO_777_LEGACY=1`）・終了まで中央値 287ms・器のセッションは全回生存。注入したハング 2 形は猶予 2000ms に対し 2135 / 2101ms で `exit=143`。連打は読み替え 1 回 / `on_app_quit` 1 回、起動 0.3 秒後の SIGTERM でも layout は壊れない。番犬 4 本（修正前ソースで全滅）+ 単体 5 本、セルフテスト `TAKO_APP_SELF_TEST_OK`。全 3893 件緑
+
+## 2026-09-09（#1081 / #1284: 解説動画をスライド主軸へ作り直し、X 向けショートも作った）
+- v6（#1081）= HTML/CSS スライド + SVG 図解 30 枚を主軸に、実 UI を要所へ挿す構成へ。実 UI の割合は **92.2%（v4・665 秒）→ 37.6%（v6・192 秒）**。8:29 / PII 7 カテゴリ 0 件。小さなサブタイトル行は全廃
+- **v5 のブロッカーが構成側で解けた**: 唯一足りなかった `c5_gui10`（担当 AI のペインが生える実写）は図解 `s_c6_grow` が担うので、撮り直しゼロで完成した（画面ロック待ちは 2 回・7.5 時間で撮れずじまいだった）
+- X 向け（#1284）= 無音再生前提・ナレーション無し・字幕 68px の 178 秒。**2:11 で 1 本として完結**させ 2:20 版（131 秒）も出した。PII 0 件
