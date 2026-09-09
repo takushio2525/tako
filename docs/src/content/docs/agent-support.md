@@ -28,8 +28,8 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 | エージェント | 対応 | 一部対応 | 未対応 | 対象外 |
 | --- | --- | --- | --- | --- |
 | Claude Code（基準） | 48 / 48 | 0 | 0 | 0 |
-| OpenAI Codex CLI | 29 / 48 | 5 | 11 | 3 |
-| Antigravity CLI | 18 / 48 | 5 | 16 | 9 |
+| OpenAI Codex CLI | 33 / 48 | 4 | 8 | 3 |
+| Antigravity CLI | 22 / 48 | 4 | 13 | 9 |
 | Local LLM | 0 / 48 | 0 | 39 | 9 |
 
 ### 状態の意味
@@ -63,12 +63,10 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 ## OpenAI Codex CLI を選ぶと落ちるもの
 
-対応 29 / 48 件。以下は Claude Code との差分です（同じ理由のものはまとめています）。
+対応 33 / 48 件。以下は Claude Code との差分です（同じ理由のものはまとめています）。
 
-### 一部対応（5 件）
+### 一部対応（4 件）
 
-- **起動はできるが tako の MCP ツールを呼べない（#986）**
-  - コンフリクト解消エージェントとして起動する（#496）（`git_resolve_agent`）
 - **worker の状態照会では構造化ソースから ctx% が取れるが、master の自動ハンドオフは画面のパターンを見るので master 経路では未確認**
   - コンテキスト残量を画面から読み取れる（`master_ctx_percent`）
 - **spawn の記録は残るが、会話の実体を索引できないので pending のまま期限切れで消える**
@@ -78,7 +76,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 - **設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない**
   - 作業フォルダを起動前に信頼済みにしておく（信頼ダイアログで止まらない）（`worker_trust`）
 
-### 未対応（11 件）
+### 未対応（8 件）
 
 - **設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない**（追跡: [#975](https://github.com/takushio2525/tako/issues/975)）
   - アカウント（資格情報）の切替に追従する（`account_switch`）
@@ -92,13 +90,8 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
   - 会話を保ったまま CLI プロセスだけ建て直す（#1067。CLI の自動更新に追いつく手段）（`session_restart_harness`）
   - 過去の会話を復元して続ける（`tako sessions resume`）（`sessions_resume`）
   - 突然死を検知して復旧コマンドを提示する（#390）（`worker_death_resume`）
-- **tako の実装が claude 専用で、この系統への配線がまだ無い**（追跡: [#989](https://github.com/takushio2525/tako/issues/989)）
-  - 未認証なら setup がログインまで案内・代行する（`setup_auth_launch`）
-  - CLI 自体が入っていない環境へ setup が導入する（#868）（`setup_cli_install`）
 - **tako の実装が claude 専用で、この系統への配線がまだ無い**（追跡: [#983](https://github.com/takushio2525/tako/issues/983)）
   - 起動直後の Bypass 確認ダイアログを事前に承諾しておく（#407）（`worker_bypass_preaccept`）
-- **tako の実装が claude 専用で、この系統への配線がまだ無い**（追跡: [#986](https://github.com/takushio2525/tako/issues/986)）
-  - worker が tako の MCP ツール群を呼べる（`worker_mcp`）
 
 ### 対象外（3 件）
 
@@ -111,12 +104,10 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 ## Antigravity CLI を選ぶと落ちるもの
 
-対応 18 / 48 件。以下は Claude Code との差分です（同じ理由のものはまとめています）。
+対応 22 / 48 件。以下は Claude Code との差分です（同じ理由のものはまとめています）。
 
-### 一部対応（5 件）
+### 一部対応（4 件）
 
-- **起動はできるが tako の MCP ツールを呼べない（#986）**
-  - コンフリクト解消エージェントとして起動する（#496）（`git_resolve_agent`）
 - **spawn の記録は残るが、会話の実体を索引できないので pending のまま期限切れで消える**
   - 会話がセッションカタログに索引される（#112）（`sessions_catalog`）
 - **認証の有無は分かるがプランを取れないので、推奨プロファイルの規模を決められない**
@@ -126,7 +117,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 - **設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない**
   - 作業フォルダを起動前に信頼済みにしておく（信頼ダイアログで止まらない）（`worker_trust`）
 
-### 未対応（16 件）
+### 未対応（13 件）
 
 - **設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない**（追跡: [#975](https://github.com/takushio2525/tako/issues/975)）
   - アカウント（資格情報）の切替に追従する（`account_switch`）
@@ -144,13 +135,8 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
   - 会話を保ったまま CLI プロセスだけ建て直す（#1067。CLI の自動更新に追いつく手段）（`session_restart_harness`）
   - 過去の会話を復元して続ける（`tako sessions resume`）（`sessions_resume`）
   - 突然死を検知して復旧コマンドを提示する（#390）（`worker_death_resume`）
-- **tako の実装が claude 専用で、この系統への配線がまだ無い**（追跡: [#989](https://github.com/takushio2525/tako/issues/989)）
-  - 未認証なら setup がログインまで案内・代行する（`setup_auth_launch`）
-  - CLI 自体が入っていない環境へ setup が導入する（#868）（`setup_cli_install`）
 - **tako の実装が claude 専用で、この系統への配線がまだ無い**（追跡: [#983](https://github.com/takushio2525/tako/issues/983)）
   - 起動直後の Bypass 確認ダイアログを事前に承諾しておく（#407）（`worker_bypass_preaccept`）
-- **tako の実装が claude 専用で、この系統への配線がまだ無い**（追跡: [#986](https://github.com/takushio2525/tako/issues/986)）
-  - worker が tako の MCP ツール群を呼べる（`worker_mcp`）
 
 ### 対象外（9 件）
 
@@ -183,7 +169,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
   - コンフリクト解消エージェントとして起動する（#496）（`git_resolve_agent`）
   - ステータスバーの利用制限表示をこの系統へ切り替えられる（#217 / #357）（`limit_service_switch`）
   - setup が認証済みかどうかを判定できる（`setup_auth_check`）
-  - 未認証なら setup がログインまで案内・代行する（`setup_auth_launch`）
+  - 未認証なら setup がその系統のログインコマンドを案内する（`setup_auth_launch`）
   - CLI 自体が入っていない環境へ setup が導入する（#868）（`setup_cli_install`）
   - setup がこの CLI の導入を検出する（`setup_detect`）
   - setup が tako の MCP サーバーをこの CLI へ恒久登録する（`setup_mcp_register`）
@@ -244,9 +230,9 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 | --- | --- | --- | --- | --- | --- |
 | **setup がこの CLI の導入を検出する**<br />`setup_detect` | 対応 | 対応 | 対応 | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: setup.rs の SetupAgent が 3 系統を列挙し、platform::exe::find（B16）で解決する |
 | **setup が認証済みかどうかを判定できる**<br />`setup_auth_check` | 対応 | 対応 | 一部対応<br />認証の有無は分かるがプランを取れないので、推奨プロファイルの規模を決められない | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: tako-cli/src/setup.rs のプラン解決は認証済み・導入済みの provider だけを巡る （#262）。agy は provider としてプランを返さない |
-| **未認証なら setup がログインまで案内・代行する**<br />`setup_auth_launch` | 対応 | 未対応 [#989](https://github.com/takushio2525/tako/issues/989)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#989](https://github.com/takushio2525/tako/issues/989)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: setup.rs の認証誘導は claude の導線しか持たない（#868 のゼロスタートも claude 限定） |
+| **未認証なら setup がその系統のログインコマンドを案内する**<br />`setup_auth_launch` | 対応 | 対応 | 対応 | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #989: `setup_bootstrap::auth_instructions_for` が claude = `claude auth login` / codex = `codex login` / agy = 引数なしの `agy` を案内する（agy は専用の ログインサブコマンドを持たず、公式 docs の sign-in も引数なし起動）。ログイン自体はブラウザ操作が要るので tako は 3 系統とも代行しない（#1129） |
 | **setup が契約プランを検出して推奨規模を決める**<br />`setup_plan_detect` | 対応 | 対応 | 対象外<br />agy はプラン情報を出さないので検出できない | 対象外<br />ローカルモデルに契約プランという概念が無い | コード本文: setup.rs の Provider は Claude / Gpt / Google の 3 値だが、プラン取得は claude / gpt の 2 経路しか実装が無い（#226） |
-| **CLI 自体が入っていない環境へ setup が導入する（#868）**<br />`setup_cli_install` | 対応 | 未対応 [#989](https://github.com/takushio2525/tako/issues/989)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#989](https://github.com/takushio2525/tako/issues/989)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: platform/agent_install.rs の AgentKind が Claude 1 値しか持たず、recipe() も claude ぶんしか無い（#868 の Out of scope。拡張は #989） |
+| **CLI 自体が入っていない環境へ setup が導入する（#868）**<br />`setup_cli_install` | 対応 | 対応 | 対応 | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #989: platform/agent_install.rs の recipe() が 3 系統 × 2 プラットフォームぶんの 公式手順を持ち、まっさら HOME + PATH 剥ぎで 3 系統とも `tako setup bootstrap install` が通る（実測）。**Windows の実行代行は claude だけ** （codex / agy は can_run=false = 状態照会と案内まで。#525） |
 | **setup が起動プロファイルを組み立てる**<br />`setup_profile_recommend` | 対応 | 対応 | 一部対応<br />worker としてのプロファイルは作れるが、master には別系統が自動で選ばれる | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: setup.rs は選択した agent を worker_agent へ書くが、master_agent は claude / codex しか受け付けない（agy は起動前エラーになるため） |
 | **共通ルールをこの CLI のグローバル指示ファイルへ同期する（#136）**<br />`setup_rules_sync` | 対応 | 対応 | 対応 | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: agents_sync.rs の AgentKind が 3 系統ぶんの書き先を持つ （~/.claude/CLAUDE.md / ~/.codex/AGENTS.md / ~/.gemini/GEMINI.md） |
 | **setup が tako の MCP サーバーをこの CLI へ恒久登録する**<br />`setup_mcp_register` | 対応 | 対応 | 対応 | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #979（main の 63a7c26）で `tako setup-mcp` が 3 系統へ登録するようになった。書き先は claude = ~/.claude.json / codex = ~/.codex/config.toml の [mcp_servers.tako] / agy = ~/.gemini/config/mcp_config.json で、codex は env_vars 許可リストまで足して実セッションから tako_list_panes が通ることを実測。正本は tako-control::agent_mcp |
@@ -293,9 +279,9 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 | **初期プロンプトが送達確認つきで届く（#32 / #530）**<br />`worker_prompt_delivery` | 対応 | 対応 | 対応 | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: 第 2 層のキー操作経路（claude_tui::deliver_via_tmux）は 3 系統の入力欄 （❯ / › / &gt;）を見分けるので agent 非依存に動く |
 | **画面を介さずに指示を直送する（生成中でも取りこぼさない。#790）**<br />`worker_delivery_peer` | 対応 | 対象外<br />画面を介さない直送は claude の受信箱（Cross-Session Messaging）に固有の仕組みで、他系統には相当物が無い | 対象外<br />画面を介さない直送は claude の受信箱（Cross-Session Messaging）に固有の仕組みで、他系統には相当物が無い | 対象外<br />画面を介さない直送は claude の受信箱（Cross-Session Messaging）に固有の仕組みで、他系統には相当物が無い | 上流の仕様: 第 1 層は claude の Cross-Session Messaging（受信箱の socket へ直送）に固有。AGENTS.md「worker への指示送達（#790）」も codex / agy / Windows は常に 第 2 層と明記している |
 | **permission ダイアログを検知して応答する（#319 / #577）**<br />`worker_permission_dialog` | 対応 | 対応 | 対応 | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM のハーネスが決まっていないので可否が定まらない（codex TUI を借りる #990 なら在り、非 TUI 経路の #991 なら無い） | コード本文: claude_tui.rs の detect_permission_dialog は 3 系統のパターンを持ち、agy の「Do you want to proceed?」も対象に入っている |
-| **選択肢ダイアログを構造として読み、番号やラベルで応答する（#748）**<br />`worker_choice_dialog` | 対応 | 対応 | 対応 | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM のハーネスが決まっていないので可否が定まらない（codex TUI を借りる #990 なら在り、非 TUI 経路の #991 なら無い） | コード本文: claude_tui.rs は claude v2.1.198 / codex 0.144.1 / agy 1.1.0 の実採取画面の 和集合として実装され、CODEX_TRUST_DIALOG / AGY_PERMISSION_DIALOG 等の fixture が同ファイルに在る |
+| **選択肢ダイアログを構造として読み、番号やラベルで応答する（#748）**<br />`worker_choice_dialog` | 対応 | 対応 | 対応 | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM のハーネスが決まっていないので可否が定まらない（codex TUI を借りる #990 なら在り、非 TUI 経路の #991 なら無い） | コード本文: claude_tui.rs は claude v2.1.198 / codex 0.144.1 / agy 1.1.0 の実採取画面の 和集合として実装され、CODEX_TRUST_DIALOG / AGY_PERMISSION_DIALOG 等の fixture が同ファイルに在る。番号なし・選択肢 2 つ（claude 2.x の信頼 ダイアログ = TRUST_DIALOG_NO_NUMBER）も #1223 で検知対象 |
 | **worker ペインの中から tako CLI で tako を操作できる**<br />`worker_cli_control` | 対応 | 対応 | 対応 | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: TAKO_PANE_ID / TAKO_SOCKET / TAKO_TOKEN の注入と PATH 注入（#601）は ペイン単位で agent に依らない |
-| **worker が tako の MCP ツール群を呼べる**<br />`worker_mcp` | 対応 | 未対応 [#986](https://github.com/takushio2525/tako/issues/986)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#986](https://github.com/takushio2525/tako/issues/986)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: mcp_servers を組む非テストコードは orchestrator/mod.rs（master 経路）だけで、WorkerLaunch には tako_bin も MCP 引数も無い（棚卸し §5.3 = 最大の穴） |
+| **worker が tako の MCP ツール群を呼べる**<br />`worker_mcp` | 対応 | 対応 | 対応 | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #986 の実測（2026-09-09 / 隔離 GUI + tako-vd / codex-cli 0.153.0 / agy 1.1.27）:              **codex** = spawn の起動コマンドへ master と同じ `-c mcp_servers.tako.*` を一時注入する              （正本は orchestrator::agent::codex_mcp_args の 1 実装）。実 worker が              `tako.tako_list_panes({})` を呼び、**pane を省略した** `tako_set_title` が              自分のペインへ当たった。効いているのが一時注入だと分かるのは env の指紋で、             MCP 子プロセスの初期環境は一時注入の 5 個（TAKO_TAB_ID を含む）に対し、             `TAKO_986_LEGACY=1` の旧アームでは恒久登録（#979）の 4 個（TAKO_TAB_ID 無し）だった。             **agy** = per-launch の注入手段が CLI に無い（`agy --help` 実測 1.1.27: -c / --mcp-config なし）ので              恒久登録（#979）に委ねる。agy は親 env をそのまま渡す（実測: MCP 子が TAKO_* を 15 個受け取る              = claude と同じ形）ため、実 worker から pane 省略の `tako_set_title` が自分のペインへ当たった。             `TAKO_PANE_ID` が届かない系統でも解けるよう、caller_pane は **pid 祖先辿り**へ落ちる              （`tako mcp serve` が `Request::ResolvePane` で問う。#288 / #567 と同じ 1 実装） |
 
 ## 報告と会話ログ
 
@@ -329,7 +315,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 | 能力 | Claude Code | OpenAI Codex CLI | Antigravity CLI | Local LLM | 根拠 |
 | --- | --- | --- | --- | --- | --- |
-| **コンフリクト解消エージェントとして起動する（#496）**<br />`git_resolve_agent` | 対応 | 一部対応<br />起動はできるが tako の MCP ツールを呼べない（#986） | 一部対応<br />起動はできるが tako の MCP ツールを呼べない（#986） | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: dispatch.rs の git resolve は 3 系統とも起動できるが、worker と同じ経路なので MCP の一時注入が無い（mcp_servers を組むのは orchestrator/mod.rs の master 側だけ） |
+| **コンフリクト解消エージェントとして起動する（#496）**<br />`git_resolve_agent` | 対応 | 対応 | 対応 | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: dispatch.rs の git resolve は worker spawn と**同じ `WorkerLaunch`**（#986 で              `tako_bin` を配線済み）を通るので、MCP の一時注入も同じ 1 実装で効く。             番犬 `worker_mcp_injection_watchdog::worker_を起動する経路は_tako_bin_を渡している` が              片方だけ配線が落ちる形を落とし、MCP が実際に通ることは worker 経路で実測済み              （WORKER_MCP 行） |
 
 ## この表の作り方
 
