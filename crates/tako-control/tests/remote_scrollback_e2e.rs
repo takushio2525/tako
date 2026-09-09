@@ -72,10 +72,17 @@ fn start_session(bin: &str, socket: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 器の CLI を 1 回叩く。失敗は stderr つきで返す
+/// 器の CLI を 1 回叩く。失敗は stderr つきで返す。
+///
+/// **検証用の env を自分で持ち込む**（#1253）: この e2e は tako の spawn 経路を
+/// 通さず器を直に起こすので、tako が撒く「シェル履歴の書き先」と
+/// 「シェル統合の置き場」が器のサーバーへ届かない。無いと器の中の対話 zsh が
+/// ユーザーの `~/.zsh_history` へ 1 行積む（実測で踏んだ）
 fn run(bin: &str, args: &[&str]) -> Result<String, String> {
     let out = Command::new(bin)
         .args(args)
+        .envs(tako_core::shell_integration::env().iter().cloned())
+        .envs(tako_core::paths::verification_histfile_env())
         .output()
         .map_err(|e| format!("{bin} を実行できない: {e}"))?;
     if out.status.success() {

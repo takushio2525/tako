@@ -1207,6 +1207,38 @@ OS で分岐すると「macOS だけ通る道」が増えて、この等価性�
 `cfg(test)` で必ず隔離先へ倒れる。`migrations::run` は `TAKO_DATA_DIR` が明示されていない
 テストビルドでは何もしない。
 
+### 検証プロセスの隔離は `cfg(test)` で書かない（Issue #1253）
+
+**GUI セルフテストは `cargo test` ではなく製品バイナリ**（`tako-app` が
+`TAKO_SELF_TEST=1` で立つ）なので、`cfg(test)` も
+`paths::is_test_process()` も 1 ビットも効かない。#944 でここを `cfg(test)` にしていた
+ぶんが素通りし、隔離セルフテストがユーザーの `~/.claude.json` へ事前信頼を
+積み続けていた（残骸 3,050 件のうち約 70%）。
+
+書き先を決める判定は **`tako_core::paths::is_verification_process()`**（実行時）を引く。
+真になるのは「テストバイナリ」または「検証のための起動」で、後者の規則は
+**窓をユーザーの画面に出すかの判定と同じ 1 実装**（`platform::display::is_verification_gui`）
+を引く。片方だけ広げると「窓は仮想ディスプレイ・設定は本番」という半端な状態になる。
+
+| 対象 | 隔離先 | 決めている場所 |
+|---|---|---|
+| 外部エージェントの設定（`.claude.json` / `config.toml` / `settings.json`） | `<temp>/tako-agent-config-<pid>/` | `orchestrator::agent_config_home()` / `claude_tui::env_config_dir()` |
+| シェル履歴 | 同上の `shell_history` | `terminal.rs` の PTY env + `backend::session_pinned_pairs` の `-e` |
+
+- **`config dir` を明示する引数（#558）は隔離しない**。テストが一時ディレクトリを
+  指して書き先を確かめる経路と、アカウント指定の spawn がここに乗っている
+- **`HISTFILE` を渡すだけでは対話 zsh に効かない**: macOS の `/etc/zshrc` が
+  `HISTFILE=${ZDOTDIR:-$HOME}/.zsh_history` を**無条件で代入**する。rc の後に必ず走る
+  precmd で当て直す（`shell-integration/zshenv.zsh` の `TAKO_VERIFY_HISTFILE`）
+- **テストプロセスから外部コマンドを起こさない**（#944 の `claude agents --json` と同型）。
+  `update_checker::detect_install_method_full()` の `brew` は空 HOME の実測で
+  `~/Library/Caches/Homebrew` に 698 ファイル作っていた
+- **器を直に起こす e2e は検証用の env を自分で持ち込む**（`tmux -L … new-session` を
+  `Command::new` で叩く形）。tako の spawn 経路を通らないので自動では届かない
+- A/B は `TAKO_1253_LEGACY=1`（旧挙動を同一バイナリで再現）。番犬は
+  `crates/tako-control/tests/verification_isolation_watchdog.rs`（判定の形を走査）と
+  `test_write_isolation` / `update_checker`（空 HOME・偽 brew で挙動を実測）の 2 段
+
 ## 起動時ロードの予算（Issue #1139）
 
 AI が**起動した瞬間に強制ロードされるもの**には上限がある。書いただけの規約は守られない
@@ -1387,6 +1419,12 @@ scripts/lib/virtual-display.sh ensure   # 無ければ作る（冪等・消す�
 env -u TAKO_SOCKET -u TAKO_TOKEN -u TAKO_PANE_ID -u TERM -u COLORTERM \
   TAKO_SELF_TEST=1 TAKO_ISOLATED=1 cargo run -p tako-app
 ```
+
+- **隔離するのは data dir だけではない**（#1253）。`TAKO_ISOLATED` / `TAKO_SELF_TEST` /
+  `TAKO_VISUAL_TEST` のどれかが立っていれば、外部エージェントの設定
+  （`~/.claude.json` 等）とシェル履歴（`~/.zsh_history`）の書き先も
+  `<temp>/tako-agent-config-<pid>/` へ倒れ、終了時に片付く。規則は
+  「検証プロセスの隔離は `cfg(test)` で書かない」節
 
 - **隔離起動が立てた tmux サーバーは終わったら消える**（#1192）。`TAKO_ISOLATED=1` /
   `TAKO_SELF_TEST=1` で**ソケット名を指定しなかった**起動は `tako-iso-<pid>` /

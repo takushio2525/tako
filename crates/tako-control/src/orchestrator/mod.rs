@@ -311,34 +311,24 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
 
 /// 外部エージェント（claude / codex / agy）の**設定ファイルを置くホーム**。
 ///
-/// **テストビルドでは必ず隔離先へ倒す**（#944 / #1030）。事前信頼
+/// **検証プロセスでは必ず隔離先へ倒す**（#944 / #1030 / #1253）。事前信頼
 /// （`ensure_trusted`）は spawn のたびに `~/.claude.json` /
 /// `~/.codex/config.toml` / `~/.gemini/antigravity-cli/settings.json` を
-/// 書き換えるので、`cargo test` がユーザーの**生きた設定ファイル**へ
-/// テスト用 cwd の信頼エントリを積み続けていた（実測: `~/.claude.json` に
-/// 2,500 件。うち大半がテスト・セルフテスト由来）。
+/// 書き換えるので、検証がユーザーの**生きた設定ファイル**へテスト用 cwd の
+/// 信頼エントリを積み続けていた（実測: `~/.claude.json` に 2,500 件）。
+///
+/// 判定が `cfg(test)` ではなく実行時（[`tako_core::paths::is_verification_process`]）
+/// なのが #1253 の要点。GUI セルフテストは `cargo test` ではなく**製品バイナリ**が
+/// `TAKO_SELF_TEST=1` で立つので、`cfg(test)` の手はそこに届かない
+/// （残骸 3,050 件のうち約 70% がこの経路だった）。
 ///
 /// [`home_dir`] 自体は倒さない: 表示・比較（`is_claude_default_config_dir` 等）は
 /// 本物のホームで判定する必要があり、まとめて倒すと**別のテストが壊れる**
 pub(crate) fn agent_config_home() -> Option<PathBuf> {
-    #[cfg(test)]
-    if !tako_core::paths::issue944_legacy() {
-        return Some(test_agent_config_home());
+    if tako_core::paths::is_verification_process() {
+        return Some(tako_core::paths::verification_agent_home());
     }
     home_dir()
-}
-
-/// 外部エージェント設定のテスト隔離先（プロセスごとに 1 つ）。
-/// 作法は [`config_dir`] の隔離先と同じ
-#[cfg(test)]
-pub(crate) fn test_agent_config_home() -> PathBuf {
-    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    DIR.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("tako-test-agent-home-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        dir
-    })
-    .clone()
 }
 
 // --- accounts.yaml (#504) ---

@@ -215,6 +215,14 @@ pub fn session_pinned_pairs(
             .unwrap_or(socket);
         out.push((BACKEND_SOCKET_ENV.to_string(), name.to_string()));
     }
+    // 検証プロセスのシェル履歴は使い捨ての置き場へ（#1253）。器の中のシェルは
+    // **サーバー継承でしか env を受け取らない**ので、外側 PTY へ入れただけでは
+    // 「先に立っていたサーバー」に当たったときに素通りする（#1105 と同じ理由）
+    for (key, value) in crate::paths::verification_histfile_env() {
+        if !out.iter().any(|(k, _)| *k == key) {
+            out.push((key, value));
+        }
+    }
     out
 }
 
@@ -1056,6 +1064,28 @@ pub(crate) fn now_unix() -> u64 {
 pub(crate) fn strip_integration_env(args: &mut Vec<String>) -> Vec<String> {
     let mut removed = Vec::new();
     for (key, _) in crate::shell_integration::env() {
+        let Some(at) = args
+            .iter()
+            .position(|a| a.starts_with(&format!("{key}=")))
+            .filter(|at| *at > 0 && args[at - 1] == "-e")
+        else {
+            continue;
+        };
+        removed.push(args.remove(at));
+        args.remove(at - 1);
+    }
+    removed.sort();
+    removed
+}
+
+/// 検証プロセスの履歴の書き先（#1253）を `-e <key>=<value>` ごと取り出す。
+///
+/// 値が pid 依存なのでスナップショットには載せられない。[`strip_integration_env`] と
+/// 同じ作法で外し、**外した値そのもの**を返して呼び出し側が別途突き合わせる
+#[cfg(test)]
+pub(crate) fn strip_verification_histfile_env(args: &mut Vec<String>) -> Vec<String> {
+    let mut removed = Vec::new();
+    for (key, _) in crate::paths::verification_histfile_env() {
         let Some(at) = args
             .iter()
             .position(|a| a.starts_with(&format!("{key}=")))

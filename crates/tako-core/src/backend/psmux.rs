@@ -1154,6 +1154,18 @@ mod tests {
             integration, expected_integration,
             "シェル統合の置き場がセッションへ固定されていない（#1105）"
         );
+        // #1253: 検証プロセス（このテストもそう）のシェル履歴は使い捨てへ向ける。
+        // 値は pid 依存なのでスナップショットからは外して別途突き合わせる
+        let histfile = crate::backend::strip_verification_histfile_env(&mut args);
+        let mut expected_histfile: Vec<String> = crate::paths::verification_histfile_env()
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        expected_histfile.sort();
+        assert_eq!(
+            histfile, expected_histfile,
+            "検証プロセスの履歴の書き先がセッションへ固定されていない（#1253）"
+        );
         assert_eq!(
             args,
             vec![

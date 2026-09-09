@@ -343,6 +343,13 @@ impl TerminalSession {
         ) {
             env.insert(key, value);
         }
+        // 使い捨ての検証（`cargo test` / セルフテスト / 隔離起動）では、シェルの履歴を
+        // ユーザーの `~/.zsh_history` ではなく使い捨ての置き場へ向ける（#1253）。
+        // ペインのシェルは対話ログインシェルなので、検証が打ち込んだコマンドが
+        // そのまま本番の履歴に積もっていた（実測: #1200 のテストが 1 行残した）
+        for (key, value) in crate::paths::verification_histfile_env() {
+            env.insert(key, value);
+        }
         // シェル統合（OSC 7/133 発行）の自動注入。options.env が常に優先
         env.extend(crate::shell_integration::env().iter().cloned());
         env.extend(options.env);

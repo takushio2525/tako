@@ -119,6 +119,104 @@ pub fn issue944_legacy() -> bool {
     })
 }
 
+/// A/B 用の逃げ道（`TAKO_1253_LEGACY=1`）。#1253 の隔離を切って**旧挙動を再現**する。
+///
+/// 隔離セルフテスト（`TAKO_ISOLATED=1 TAKO_SELF_TEST=1`）の spawn が、ユーザーの
+/// 生きた `~/.claude.json` へ事前信頼のエントリを書いていた（実測: 残骸 3,050 件の
+/// うち約 70% がこの経路。うち `tako-selftest-822-<pid>` だけで 731 件）。
+/// これを立てると同じ手順で本番へ書く = 検査に検出力があること自体を実測で固定できる
+pub fn issue1253_legacy() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_1253_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
+/// このプロセスが**使い捨ての検証**か（#944 / #1253）。
+///
+/// 真なら、ユーザーの**生きた個人ファイル**（外部エージェントの設定 `~/.claude.json` /
+/// シェル履歴 `~/.zsh_history`）へ書いてはいけない。判定材料は 2 つ:
+///
+/// - テストバイナリか（[`is_test_process`]。#944 で塞いだぶん）
+/// - **検証のための起動**か（`TAKO_ISOLATED` / `TAKO_SELF_TEST` / `TAKO_VISUAL_TEST`。#1253）
+///
+/// 後者を足すのが #1253 の要点。`cfg(test)` も [`is_test_process`] も
+/// **製品バイナリで走る GUI セルフテスト**には効かない（`cargo test` ではなく
+/// `tako-app` 自身が `TAKO_SELF_TEST=1` で立つ）ので、隔離したはずの検証が
+/// ユーザーの `~/.claude.json` を書き換え続けていた。
+///
+/// 起動の判定規則は「窓をユーザーの画面に出すか」（#1141）と**同じ 1 実装**
+/// （[`crate::platform::display::is_verification_gui`]）を引く。片方だけ広げると
+/// 「窓は仮想ディスプレイへ・設定は本番へ」という半端な状態になる
+pub fn is_verification_process() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        if issue944_legacy() || issue1253_legacy() {
+            return false;
+        }
+        is_test_process()
+            || crate::platform::display::is_verification_gui(
+                std::env::var("TAKO_ISOLATED").ok().as_deref(),
+                std::env::var_os("TAKO_SELF_TEST").is_some(),
+                std::env::var_os("TAKO_VISUAL_TEST").is_some(),
+            )
+    })
+}
+
+/// 検証プロセスが外部エージェント（claude / codex / agy）の設定を書く「ホーム」。
+/// プロセスごとに 1 つで、[`test_data_dir`] と作法を揃えてある。
+///
+/// **データディレクトリの下には置かない**: `TAKO_SELF_TEST=1` だけの起動
+/// （AGENTS.md の実 claude e2e）は data dir が本番のままなので、そこへ置くと
+/// 「本番の置き場へ書かない」という前提が崩れる
+pub fn verification_agent_home() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("tako-agent-config-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    })
+    .clone()
+}
+
+/// 検証プロセスの `HISTFILE` を tako 側から指す環境変数（#1253）。
+///
+/// `HISTFILE` を直接渡すだけでは **macOS の zsh には効かない**: `/etc/zshrc` が
+/// `HISTFILE=${ZDOTDIR:-$HOME}/.zsh_history` を**無条件で代入**するので、
+/// 対話シェルでは rc の時点で本番へ戻される（実測で確認した）。そこで
+/// 「tako が意図した書き先」をこの変数で別に運び、シェル統合（`zshenv.zsh`）が
+/// **rc の後に走る precmd** で当て直す。値は [`verification_histfile_env`] が作る
+pub const VERIFY_HISTFILE_ENV: &str = "TAKO_VERIFY_HISTFILE";
+
+/// 検証プロセスがシェルへ注入する履歴の書き先（#1253）。通常起動では空。
+///
+/// tako が起こすペインのシェルは**対話ログインシェル**なので、テストや
+/// セルフテストが打ち込んだコマンドがそのままユーザーの `~/.zsh_history` に積もる
+/// （実測: `cargo test --workspace` 1 回で `dispatch` の #1200 のテストが
+/// claude の上限ダイアログ fixture を 1 行残した）。
+/// 履歴そのものを止めるのではなく**書き先を使い捨てへ向ける**のが要点で、
+/// こうすると「履歴が要る前提のシェル挙動」は本番と同じまま残る。
+///
+/// 2 つ返すのは方言差のため。`HISTFILE` は bash と**非対話**の zsh に効き、
+/// [`VERIFY_HISTFILE_ENV`] は `/etc/zshrc` に潰される**対話 zsh**を拾う
+/// （fish は履歴の置き場が別系統なので対象外）
+pub fn verification_histfile_env() -> Vec<(String, String)> {
+    if !is_verification_process() {
+        return Vec::new();
+    }
+    let path = verification_agent_home()
+        .join("shell_history")
+        .display()
+        .to_string();
+    vec![
+        ("HISTFILE".to_string(), path.clone()),
+        (VERIFY_HISTFILE_ENV.to_string(), path),
+    ]
+}
+
 /// このプロセスが `cargo test` の起こしたテストバイナリか。
 ///
 /// **`cfg!(test)` では足りない**（#944）: `cfg(test)` はそのクレートを

@@ -58,6 +58,24 @@ if [[ -n ${TAKO_PANE_ID-} && ( ! -o interactive || -n ${ZSH_EXECUTION_STRING-} )
   _tako_add_cli_path
 fi
 
+# 検証（cargo test / セルフテスト / 隔離起動）の履歴をユーザーの ~/.zsh_history へ
+# 積まない（#1253）。tako は書き先を HISTFILE でも渡しているが、macOS の
+# /etc/zshrc が `HISTFILE=${ZDOTDIR:-$HOME}/.zsh_history` を**無条件で代入**するため、
+# 対話シェルでは rc の時点で本番へ戻される（実測）。rc より後に必ず走る precmd で
+# 当て直す —— 最初のプロンプトの前に回るので、1 行目が書かれる前に間に合う。
+#
+# **TAKO_PANE_ID では絞らない**のが要点: 履歴を汚していたのはペイン ID を持たない
+# 素の PTY（`TerminalSession::spawn(SpawnOptions::default())` を使うテスト）だった。
+# 通常起動ではこの変数自体が無いので 1 ビットも効かない
+if [[ -o interactive && -n ${TAKO_VERIFY_HISTFILE-} ]]; then
+  _tako_verify_histfile() {
+    [[ $HISTFILE == "$TAKO_VERIFY_HISTFILE" ]] && return 0
+    HISTFILE="$TAKO_VERIFY_HISTFILE"
+  }
+  typeset -ga precmd_functions
+  precmd_functions+=(_tako_verify_histfile)
+fi
+
 if [[ -o interactive && -n ${TAKO_PANE_ID-} ]]; then
   # tako の tmux バックエンド（Phase 5.5 / FR-5）配下なら:
   # 1) OSC をパススルー（DCS tmux; … ST。allow-passthrough）で包み、外の tako へ届かせる
