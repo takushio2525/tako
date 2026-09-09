@@ -1172,7 +1172,9 @@ pub const MATRIX: &[AgentFeature] = &[
             "claude_tui.rs は claude v2.1.198 / codex 0.144.1 / agy 1.1.0 の実採取画面の \
              和集合として実装され、CODEX_TRUST_DIALOG / AGY_PERMISSION_DIALOG 等の \
              fixture が同ファイルに在る。番号なし・選択肢 2 つ（claude 2.x の信頼 \
-             ダイアログ = TRUST_DIALOG_NO_NUMBER）も #1223 で検知対象",
+             ダイアログ = TRUST_DIALOG_NO_NUMBER）も #1223 で検知対象。\
+             claude の auto mode 環境学習の確認（番号つき 3 択の**下に空の入力欄**が \
+             描かれる形 = TEACH_AUTO_MODE_DIALOG）は #1263 で検知対象",
         ),
     },
     AgentFeature {

@@ -19,16 +19,6 @@
 
 ---
 
-## 2026-09-09（#1229: remote_files のテストの約 1/350 フレークを直した）
-- 真因は時間でも共有状態でもなく**入力の偶然**。`ツリーに出ていないルートは拒否される` が「未知の id」に `fx.root_id().to_uppercase()` を使っていたが、id は 12 桁の小文字 16 進なので (10/16)^12 ≒ 1/280 で数字だけになり、その回は大文字化しても実在の id のまま素通りしていた（fixture のパスに pid が入る = 綴りが毎回変わる）
-- 綴り違いは長さで必ず外れる形（1 文字短い / 長い）へ替え、大小文字の区別は英字入りの id を据える別テストへ分離。番犬 `root_id_case_watchdog.rs` が修正前ソースの `remote_files.rs:2240` を名指しで落とす
-- A/B（`remote_files::tests::` 全体・同一条件）: 修正前 12/4000 FAILED（落ちた 12 件の id はすべて数字だけ）/ 修正後 0/5000（高負荷 load 15.9・並列度 1 と既定の両方）。全 3848 件緑
-
-## 2026-09-09（#1223: 番号なし・選択肢 2 つの信頼ダイアログを検知して respond できるようにした）
-- 番号なし経路の「兄弟 3 行以上」を、**兄弟 2 行のときだけ「並びの直後に確定キーの案内があるか」**で補強（`dialog::confirm_hint_below`）。codex の入力待ち画面（入力行 + 直下のステータス行）は案内が無いので従来どおり非検知
-- 隔離 GUI 実測（Windows 実機 + macOS）: 下見が `kind=trust` / 2 件 / `highlighted=0`、`--choice trust` が `Down`→ラベル一致検証→`Enter` で `resolved=true`。相手側 TUI も受領を表示
-- A/B `TAKO_1223_LEGACY=1` は両 OS で Issue と同じ「選択肢ダイアログが見つからない」を再現。案内の根拠を外す注入で新旧 2 テストが FAILED。全 3785 件緑
-
 ## 2026-09-09（#1022: #571 e2e が本番の事前信頼エントリを残さないようにした）
 - `E2e571Guard::drop` で `remove_e2e_trust_entry(&dir/work)` を呼ぶ形へ（#612 / #577 と同じ後始末）。この e2e は worker を既定 config dir で走らせるので隔離では倒せない
 - 番犬 `e2e_trust_cleanup_watchdog`（`impl Drop for E2e…Guard` を走査して後始末の欠落を名指し）。`#[ignore]` の本体は CI で走らないのでここだけが再発を止める
@@ -78,3 +68,13 @@
 - 10:51〜12:22 の 90 分（30 秒 × 180 回）待って **180 回すべて施錠のまま**。`screencapture` は終始 `could not create image from rect` で、収録には入っていない（素材・完成品は前回のまま・隔離 tako も起動なし）
 - 収穫は判定条件: **HID idle 単独は誤発火する**（施錠中も伸びる。10:50 実測で idle 165 秒 > 120 秒でも撮れない）。「解錠 + tako-vd 使用可 + idle 120 秒以上 + `screencapture` の試し撮り」の 4 段を plan へ明文化
 - 次: 解錠後に `record-explainer.sh guimode` → `pii-scan.sh` → `build-explainer.sh … v5.mp4`
+
+## 2026-09-09（#1263: auto mode の環境学習ダイアログを select として検知できるようにした）
+- 真因は**ダイアログの下に空の入力欄が描かれる**こと（実測: Issue の 6 行だけなら旧実装でも検知でき、入力欄を足すと `None`）。`dialog.rs` に経路 4 を足し、**入力欄はダイアログの外**とみなして上を見る。開放するのは番号つき経路だけ（番号なしまで広げると複数行の user 発話の継続行を選択肢と誤検知する）
+- 生きたダイアログと**会話ログへ流れた残骸**の区別は「並びと入力欄のあいだがダイアログの一部だけでできているか」（#577 の fixture は `✽ Misting…` が挟まる = 非検知。この条件を入れる前は #577 のテストが実際に落ちた）。確定キーの案内が無い形は拾わない = 安全側
+- 模擬 TUI（実 tmux・GUI 不要）で respond の実キー: ラベル `Don't show again` / 番号 `3` どちらも `keys=["3"]` で `resolved=true`。A/B `TAKO_1263_LEGACY=1` と修正前ソースで新テスト 6 本が FAILED。全 3928 件緑
+
+## 2026-09-09（#1252: マウスレポート e2e のフレークを止めた・真因は偽アンカー）
+- 真因は待ち不足ではなく**アンカーが偽**。conf の `set -g mouse on` で tmux は attach 時に外側端末のマウスを有効にするので、外側 `mouse_reporting()` は内側アプリと無関係に真（実測 20 ms・器側 `any=0`）。要求前のホイールは **tmux が食って copy-mode へ入り**（`pane_in_mode=1`）、以後は待ちを伸ばしても永久に届かない
+- アンカーを器のペインの `#{mouse_sgr_flag}` へ（`wait_pane_mouse_ready`）・待ちは `wait_for_state`（状態待ち + `state_wait_budget`・診断は「待っていたもの / 届いたもの」）。予算政策は `tako_core::wait_budget` の 1 実装へ寄せ tako-app が委譲。番犬 `mouse_report_wait_watchdog`
+- A/B（同一ビルド・交互・load 12〜18）: 旧待ち **7/75 FAILED** → 状態待ち **0/315**。`LEGACY=1 INJECT=late` は確定 FAILED（`inmode=true`）/ `INJECT=never` は新経路でも FAILED。副産物の osc7 系フレークは #1265 へ分離
