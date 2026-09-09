@@ -4461,9 +4461,12 @@ A/B は `TAKO_1200_LEGACY=1`（#1200 前の挙動 = 器越しへ直行）。
 
 - phase 1: 「6 周 × 固定窓」→ **1 本の期限（素の上限 90 秒）+ 期限内の打ち直し**。
   打ち直すのは**素のプロンプトで止まっているときだけ**（エコーの途中に重ねても壊れるだけ）。
-  継続行（PowerShell の `>>`）に落ちていたら Ctrl-C で戻す
+  継続行（PowerShell の `>>`）に落ちていたら Ctrl-C で戻す。
+  **継続行の綴りと Ctrl-C の復帰は実機で確認済み**（先頭が欠けた `Write-Output ('TAKO` を送ると
+  末尾行はちょうど `>>`、`C-c` で `PS …>` へ戻る = `prompt_state` の判定はこの実測に対応する）
 - phase 2: `sleep(800ms)` → **「接続クライアントが 1 でなくなった」を状態で待ってから** `exists`。
   器ごと死んでいれば `attached` は `None` になって待ちは即座に抜けるので**検出力は落ちない**
+  （`psmux 3.3.7` が `list-sessions -F '#{session_attached}'` を持つことは実機で確認）
 - phase 3 と同ファイルの兄弟（`open_pane_with_history` / copy mode / capture 待ち / pid 待ち）も
   同じ形へ。既に期限式だった 4 か所（45s ×3 / 30s）も `budget_for` を通す
 
