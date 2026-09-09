@@ -67,6 +67,7 @@ pub mod tmux;
 pub mod tmux_backend;
 pub mod tmux_cleanup;
 pub mod ui_mode;
+pub mod wait_budget;
 pub mod workspace;
 
 pub use byte_lru::ByteLru;
