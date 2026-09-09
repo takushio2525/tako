@@ -141,7 +141,7 @@ master が裏でやっていることを少しだけ紹介します。すべて�
 | `master-system.md` | （置いた場合のみ）master の system prompt を差し替えるカスタムファイル |
 | `conflict-resolver.md` | （置いた場合のみ）git コンフリクト解消エージェントへ渡す文面 |
 
-worker のモデルはプロファイルの `worker_model_policy` で決まります: `inherit`（master と同じ・既定）/ `fixed`（別の固定モデル）/ `delegate`（master がタスク内容を見て判断）。master / worker のエージェント CLI は `master_agent`（claude / codex）・`worker_agent`（claude / codex / agy）で選べます。master が claude 以外のときは、プロファイルの `model` / `effort` は claude worker へ継承されません。
+worker のモデルはプロファイルの `worker_model_policy` で決まります: `inherit`（master と同じ・既定）/ `fixed`（別の固定モデル）/ `delegate`（master がタスク内容を見て判断）。master / worker のエージェント CLI は `master_agent`（claude / codex）・`worker_agent`（claude / codex / agy）で選べます。master が claude 以外のときは、プロファイルの `model` / `effort` は claude worker へ継承されません。worker は spawn のたびに `--agent` で上書きできるので、プロファイルの指定は「既定」であって「固定」ではありません。系統ごとの入れ方・つなぎ方と Claude Code との差分は [エージェントの選び方](/agents/) にまとめています。
 
 CLI から手動で操作したい場合は [CLI リファレンス](/guides/cli-reference/#オーケストレーター)を参照してください。master が内部で使っているのと同じ操作を、スクリプトからも実行できます。
 
