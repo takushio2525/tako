@@ -146,6 +146,9 @@ fn fingerprint() -> BTreeMap<String, Vec<String>> {
                 "TabLayout",
                 "NodeLayout",
                 "PaneLayout",
+                // #1238: `AgentResumeLayout` は `PaneLayout.agent_resume` として
+                // layout.json へ直に serde される永続構造体
+                "AgentResumeLayout",
                 "PreviewLayout",
                 // #1041: `RemoteFolderLayout` は `TabLayout.remote_folders` として
                 // layout.json へ直に serde される永続構造体なのに、この表から漏れて

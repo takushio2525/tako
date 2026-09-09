@@ -1618,6 +1618,10 @@ struct TakoApp {
     /// 保持規則（**確認してから外す**）は `tako_core::claude_resume` が正本で、
     /// 復元由来の未確認 ID をスキャンの不在で落とさない（#1076）
     claude_resume_sessions: tako_core::claude_resume::ResumeIds,
+    /// 同上の claude 以外（codex / agy）版（#1238）。保持規則は同じ
+    /// `tako_core::agent_resume`（確認してから外す）で、ID の出どころだけが違う
+    /// （`claude agents --json` ではなく、生きたプロセスが開いているロック）
+    agent_resume_sessions: tako_core::agent_resume::AgentResumeIds,
     /// バックエンドセッション内の window 一覧。**backend ペイン全件**にエントリが載り
     /// （window 0 枚は空 Vec）、載っていない = 「backend でない / 採取できなかった」。
     /// 更新は右パネルの 2 秒ポーリングと `tako list` の要求時採取の両方（#1191）
@@ -3612,6 +3616,7 @@ impl TakoApp {
             backend_sessions: HashMap::new(),
             stale_pane_map: HashMap::new(),
             claude_resume_sessions: tako_core::claude_resume::ResumeIds::new(),
+            agent_resume_sessions: tako_core::agent_resume::AgentResumeIds::new(),
             backend_windows: HashMap::new(),
             backend_windows_at: None,
             window_captures: HashMap::new(),
@@ -3971,7 +3976,10 @@ impl TakoApp {
             let mut resumed_with_role = 0usize;
             let mut fresh_shells = 0usize;
             let mut restored_previews = 0usize;
-            // 新規シェルへ落ちた理由の内訳（#1076。「なぜ claude が出なかったか」を残す）
+            // claude 以外（codex / agy）の resume 件数（#1238）。系統ごとに分けて数えるのは、
+            // 「戻らなかったのはどの系統か」が内訳ログだけで分かるようにするため
+            let mut resumed_other: HashMap<&'static str, (usize, usize)> = HashMap::new();
+            // 新規シェルへ落ちた理由の内訳（#1076。「なぜエージェントが出なかったか」を残す）
             let mut fresh_reasons: HashMap<&'static str, usize> = HashMap::new();
             // セッションカタログ（#112）は復元ループの外で 1 回だけ読む。
             // 起動条件（役割 / model / effort）の出どころで、読めなければ最小形へ落ちる
@@ -4044,16 +4052,43 @@ impl TakoApp {
                 // `--model` / `--effort` / アカウントの config dir までカタログの
                 // 記録から復元する**（最小形 `claude --resume <id>` だと戻ってきた
                 // claude が master / worker として認識されない = #1076）
+                //
+                // #1238: claude 以外（codex / agy）も同じ経路で戻す。どちらの保存も
+                // 無いペインは従来どおり新規シェル。**layout の系統が正**（記録の齟齬で
+                // 別系統のコマンドを組まない）
+                let saved_agent = r.agent_resume.as_ref().and_then(|a| {
+                    Some(tako_control::sessions::PaneResume {
+                        agent: tako_core::agent_support::Agent::parse(&a.agent)?,
+                        id: a.id.as_deref(),
+                    })
+                });
+                let resume = match &r.claude_session_id {
+                    Some(id) => Some(tako_control::sessions::PaneResume {
+                        agent: tako_core::agent_support::Agent::Claude,
+                        id: Some(id.as_str()),
+                    }),
+                    None => saved_agent,
+                };
                 let plan = tako_control::sessions::restore_plan(
                     backend_alive,
-                    r.claude_session_id.as_deref(),
+                    resume,
                     catalog.as_ref(),
+                    r.session.as_deref(),
+                    Some(r.pane),
                 );
                 if let Some(session_id) = &r.claude_session_id {
                     if tako_control::transcript::is_valid_session_id(session_id) {
                         // **未確認**として持つ（スキャンの不在では落とさない。#1076）
                         app.claude_resume_sessions.seed(pane, session_id);
                     }
+                }
+                // claude の ID があるペインは claude が勝つので、claude 以外の記録は
+                // 引き継がない（**seed した記録は未確認のまま落ちない**ので、
+                // 引き継ぐと使われない古い会話参照が layout に居座り続ける）
+                if let (None, Some(saved)) = (&r.claude_session_id, saved_agent) {
+                    // ID が無くても系統は覚えておく（保存し直せるまでのあいだ、
+                    // 内訳ログが `ID なし` と `resume 非対応` を言い分けられる）
+                    app.agent_resume_sessions.seed(pane, saved.agent, saved.id);
                 }
                 let options = SpawnOptions {
                     cwd: r
@@ -4069,15 +4104,26 @@ impl TakoApp {
                 }
                 match plan {
                     RestorePlan::Reattach => reattached += 1,
-                    RestorePlan::ResumeClaude { command, with_role } => {
+                    RestorePlan::Resume {
+                        agent,
+                        command,
+                        with_role,
+                    } => {
                         // tmux サーバーごと消える PC 再起動では新しいログインシェルを起動し、
                         // 保存済みの会話だけを明示 resume する。入力を PTY にキューすることで、
-                        // Claude 終了後は元のシェルへ戻れる（明示コマンド spawn だとペインも終了する）。
+                        // エージェント終了後は元のシェルへ戻れる（明示コマンド spawn だと
+                        // ペインも終了する）。
                         if let Some(session) = app.terminals.get(&pane) {
                             session.write(resume_input(&command));
-                            resumed_claude += 1;
-                            if with_role {
-                                resumed_with_role += 1;
+                            if agent == tako_core::agent_support::Agent::Claude {
+                                resumed_claude += 1;
+                                if with_role {
+                                    resumed_with_role += 1;
+                                }
+                            } else {
+                                let e = resumed_other.entry(agent.as_str()).or_insert((0, 0));
+                                e.0 += 1;
+                                e.1 += usize::from(with_role);
                             }
                         }
                     }
@@ -4096,29 +4142,49 @@ impl TakoApp {
                 persist_diag("fatal: 復元したペインを 1 つも起動できない");
                 std::process::exit(1);
             }
+            // claude 以外の resume（#1238）。**0 件なら 1 行目の形は従来のまま**
+            // （codex / agy を使っていない環境の見え方を変えない）
+            let mut other_agents: Vec<&'static str> = resumed_other.keys().copied().collect();
+            other_agents.sort_unstable();
+            let resumed_other_total: usize = resumed_other.values().map(|(n, _)| n).sum();
+            let other_segment: String = other_agents
+                .iter()
+                .map(|agent| format!("{agent} resume {} / ", resumed_other[agent].0))
+                .collect();
             let report = format!(
-                "復元成功: {} タブ / {} ペイン（tmux 再 attach {} / Claude resume {} / 新規シェル {} / プレビュー {}）",
+                "復元成功: {} タブ / {} ペイン（tmux 再 attach {} / Claude resume {} / {}新規シェル {} / プレビュー {}）",
                 app.workspace.tabs().len(),
                 restored.len(),
                 reattached,
                 resumed_claude,
+                other_segment,
                 fresh_shells,
                 restored_previews
             );
             app.restore_report = Some(report.clone());
             persist_diag(&report);
-            // 経路の内訳（#1076）。1 行目は形を変えない（読む側が居る）ので別行で足す。
-            // 「新規シェル N」だけでは、claude が出なかった理由（ID なし / 形式不正 /
-            // 会話が見つからない）が分からず、同じ報告が何度も上がっていた
-            if resumed_claude + fresh_shells > 0 {
+            // 経路の内訳（#1076 / #1238）。1 行目の件数だけでは、エージェントが
+            // 出なかった理由（ID なし / 形式不正 / 会話が見つからない / resume 非対応）が
+            // 分からず、同じ報告が何度も上がっていた
+            if resumed_claude + resumed_other_total + fresh_shells > 0 {
                 let mut reasons: Vec<String> = fresh_reasons
                     .iter()
                     .map(|(label, n)| format!("{label} {n}"))
                     .collect();
                 reasons.sort();
+                let others: String = other_agents
+                    .iter()
+                    .map(|agent| {
+                        let (n, with_role) = resumed_other[agent];
+                        format!(
+                            " / {agent} resume {n}（役割つき {with_role} / 役割なし {}）",
+                            n - with_role
+                        )
+                    })
+                    .collect();
                 persist_diag(&format!(
                     "復元の内訳: Claude resume {resumed_claude}（役割つき {resumed_with_role} / 役割なし {}）\
-                     / 新規シェル {fresh_shells}{}",
+                     {others} / 新規シェル {fresh_shells}{}",
                     resumed_claude - resumed_with_role,
                     if reasons.is_empty() {
                         String::new()
@@ -4343,28 +4409,37 @@ impl TakoApp {
                 // #728: 走査対象は「器のセッション」と「器を持たないペインの PTY 子 pid」の
                 // 両方。以前は前者が空なら丸ごとスキップしていたので、psmux 未導入の
                 // Windows（と tmux 不在の macOS）ではカタログも resume マップも永久に空だった
-                let (should_scan, backends, pane_pids) = this
+                let (should_scan, backends, pane_pids, probes) = this
                     .update(cx, |app: &mut TakoApp, _| {
                         let mut backends: Vec<String> = Vec::new();
                         // 器を持たないペインの (tako ペイン ID, PTY 直下の子 pid)
                         let mut pane_pids: Vec<(u64, u32)> = Vec::new();
+                        // codex / agy の会話 ID を引くための材料（#1238）。
+                        // 器の有無で辿り方が変わるので、ペイン ID と一緒に持つ
+                        let mut probes: Vec<tako_control::agent_resume::PaneProbe> = Vec::new();
                         for (pane, session) in &app.terminals {
-                            match app.backend_sessions.get(pane) {
-                                Some(backend) => backends.push(backend.clone()),
-                                None => pane_pids
-                                    .extend(session.child_pid().map(|pid| (pane.as_u64(), pid))),
+                            let backend = app.backend_sessions.get(pane).cloned();
+                            let pty_pid = session.child_pid();
+                            match &backend {
+                                Some(b) => backends.push(b.clone()),
+                                None => pane_pids.extend(pty_pid.map(|pid| (pane.as_u64(), pid))),
                             }
+                            probes.push(tako_control::agent_resume::PaneProbe {
+                                pane: pane.as_u64(),
+                                backend,
+                                pty_pid,
+                            });
                         }
                         let should = app.tmux_persist
                             && !app.secondary
                             && !(backends.is_empty() && pane_pids.is_empty())
                             && std::env::var_os("TAKO_SELF_TEST").is_none();
                         match should {
-                            true => (true, backends, pane_pids),
-                            false => (false, Vec::new(), Vec::new()),
+                            true => (true, backends, pane_pids, probes),
+                            false => (false, Vec::new(), Vec::new(), Vec::new()),
                         }
                     })
-                    .unwrap_or((false, Vec::new(), Vec::new()));
+                    .unwrap_or((false, Vec::new(), Vec::new(), Vec::new()));
                 if !should_scan {
                     last_scan = std::time::Instant::now();
                     continue;
@@ -4387,6 +4462,9 @@ impl TakoApp {
                         // 復元した ID を全部捨ててしまう。「検出できなかった 1 回」
                         // として保持規則へ渡し、確認済みのペインだけが落ちる形にする
                         app.apply_claude_resume_sessions(&[]);
+                        // #1238: codex / agy 側も同じ「不在の 1 回」として渡す
+                        // （ここで捨てると #1076 と同じ形で復元の種を失う）
+                        app.apply_agent_resume_sessions(&HashMap::new());
                         app.save_layout();
                     });
                     continue;
@@ -4402,8 +4480,19 @@ impl TakoApp {
                     continue;
                 };
                 let detected = tako_control::sessions::detect_from_agents_value(&agents_value);
+                // codex / agy の会話 ID（#1238）。**プロセス表 1 枚 + agent ペインぶんの
+                // `lsof`** で済み、claude の検出（Node 起動）に比べれば桁が小さい。
+                // background で採るのは `lsof` を UI スレッドで起こさないため
+                let detected_agents = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let snap = tako_control::agents::ProcessSnapshot::capture();
+                        tako_control::agent_resume::detect_resume_ids(&probes, &snap)
+                    })
+                    .await;
                 let pane_meta = this.update(cx, |app: &mut TakoApp, _| {
                     app.apply_claude_resume_sessions(&detected);
+                    app.apply_agent_resume_sessions(&detected_agents);
                     app.save_layout();
                     app.collect_pane_meta_snapshots()
                 });
@@ -8009,6 +8098,7 @@ impl TakoApp {
     /// orphan クリーンアップ（FR-2.16.11）と tmux ビューの「kill漏れ?」表示が拾う）
     fn drop_backend_session_with(&mut self, pane_id: PaneId, reason: CloseReason) {
         self.claude_resume_sessions.remove(pane_id);
+        self.agent_resume_sessions.remove(pane_id);
         if reason.is_explicit() {
             self.drop_backend_session(pane_id, reason.origin(), None);
         } else {
@@ -8423,6 +8513,7 @@ impl TakoApp {
         let _span = tako_control::diag::perf_span("save_layout");
         let backend_sessions = &self.backend_sessions;
         let claude_resume_sessions = &self.claude_resume_sessions;
+        let agent_resume_sessions = &self.agent_resume_sessions;
         let terminals = &self.terminals;
         let previews = &self.previews;
         let webviews = &self.webviews;
@@ -8442,6 +8533,13 @@ impl TakoApp {
                     .and_then(|s| s.cwd())
                     .map(|p| p.display().to_string()),
                 claude_session_id: claude_resume_sessions.get(pane).map(str::to_string),
+                // #1238: codex / agy の会話参照。ID がまだ採れていなくても系統は残す
+                agent_resume: agent_resume_sessions.get(pane).map(|(agent, id)| {
+                    tako_control::layout::AgentResumeLayout {
+                        agent: agent.as_str().to_string(),
+                        id: id.map(str::to_string),
+                    }
+                }),
                 logged_history: pane_log_history.get(&pane.as_u64()).copied(),
                 preview: previews
                     .get(&pane)
@@ -8544,6 +8642,26 @@ impl TakoApp {
             return;
         }
         self.claude_resume_sessions.apply_scan(&panes, &found);
+    }
+
+    /// codex / agy の検出結果を「ペイン → (系統, 会話 ID)」へ落とす（#1238）。
+    ///
+    /// claude 版（[`Self::apply_claude_resume_sessions`]）と**同じ保持規則**
+    /// （`tako_core::agent_resume` = 確認してから外す）を通す。ここを
+    /// 「検出結果で置き換える」形にすると #1076 と同じ壊れ方が別の系統で再発する
+    fn apply_agent_resume_sessions(
+        &mut self,
+        detected: &HashMap<u64, (tako_core::agent_support::Agent, Option<String>)>,
+    ) {
+        let panes: Vec<PaneId> = self.terminals.keys().copied().collect();
+        let found: HashMap<PaneId, (tako_core::agent_support::Agent, Option<String>)> = panes
+            .iter()
+            .filter_map(|pane| {
+                let (agent, id) = detected.get(&pane.as_u64())?;
+                Some((*pane, (*agent, id.clone())))
+            })
+            .collect();
+        self.agent_resume_sessions.apply_scan(&panes, &found);
     }
 
     /// ペインログ（Issue #112 B）のロック（毒化耐性: 追記状態の破損より継続を優先）
@@ -67655,8 +67773,24 @@ mod self_test_isolation_tests {
 mod persist_resume_tests {
     use super::resume_input;
     use tako_control::sessions::{
-        restore_plan_in, FreshShellReason, RestorePlan, SessionCatalog, SessionEntry,
+        restore_plan_in, FreshShellReason, PaneResume, RestoreInput, RestorePlan, SessionCatalog,
+        SessionEntry,
     };
+    use tako_core::agent_support::Agent;
+    use tako_core::platform::support::Platform;
+
+    /// テスト用の最小の判断材料（器は死んでいる・macOS）
+    fn input<'a>(agent: Agent, id: Option<&'a str>, env: Option<&'a str>) -> RestoreInput<'a> {
+        RestoreInput {
+            backend_alive: false,
+            resume: Some(PaneResume { agent, id }),
+            conversation: env,
+            catalog: None,
+            backend_session: None,
+            pane: None,
+            platform: Platform::MacOs,
+        }
+    }
 
     /// 復元の判断（何を起こすか・どんなコマンドか）は
     /// `tako_control::sessions::restore_plan` が正本。ここでは
@@ -67685,10 +67819,19 @@ mod persist_resume_tests {
                 ..Default::default()
             },
         );
-        let plan = restore_plan_in(false, Some(id), Some(env), Some(&catalog));
-        let RestorePlan::ResumeClaude { command, with_role } = plan else {
+        let plan = restore_plan_in(RestoreInput {
+            catalog: Some(&catalog),
+            ..input(Agent::Claude, Some(id), Some(env))
+        });
+        let RestorePlan::Resume {
+            agent,
+            command,
+            with_role,
+        } = plan
+        else {
             panic!("resume されない");
         };
+        assert_eq!(agent, Agent::Claude);
         assert!(with_role);
         assert_eq!(
             resume_input(&command),
@@ -67697,21 +67840,53 @@ mod persist_resume_tests {
 
         // 通常の tako 再起動は既存プロセスへ再 attach し、Claude を二重起動しない
         assert_eq!(
-            restore_plan_in(true, Some(id), Some(env), Some(&catalog)),
+            restore_plan_in(RestoreInput {
+                backend_alive: true,
+                catalog: Some(&catalog),
+                ..input(Agent::Claude, Some(id), Some(env))
+            }),
             RestorePlan::Reattach
         );
         // transcript 不在（= env プレフィクス不明）・不正 ID・ID 不明を推測で起動しない
         assert_eq!(
-            restore_plan_in(false, Some(id), None, None),
+            restore_plan_in(input(Agent::Claude, Some(id), None)),
             RestorePlan::FreshShell(FreshShellReason::TranscriptMissing)
         );
         assert_eq!(
-            restore_plan_in(false, Some("../../bad"), Some(env), None),
+            restore_plan_in(input(Agent::Claude, Some("../../bad"), Some(env))),
             RestorePlan::FreshShell(FreshShellReason::InvalidSessionId)
         );
         assert_eq!(
-            restore_plan_in(false, None, Some(env), None),
+            restore_plan_in(RestoreInput {
+                resume: None,
+                ..input(Agent::Claude, None, Some(env))
+            }),
             RestorePlan::FreshShell(FreshShellReason::NoSessionId)
+        );
+    }
+
+    /// Issue #1238: codex / agy も同じ経路で会話ごと戻る（PTY へ流す形まで）
+    #[test]
+    fn codexとagyも同じ経路でresumeされる() {
+        let codex_id = "01a08347-543b-7a20-8e49-a93380efb375";
+        let agy_id = "874efd16-af95-4b2e-8036-84f6c3eaded3";
+        let RestorePlan::Resume { command, .. } =
+            restore_plan_in(input(Agent::Codex, Some(codex_id), Some("")))
+        else {
+            panic!("codex が resume されない");
+        };
+        assert_eq!(
+            resume_input(&command),
+            format!("codex resume {codex_id}\r").into_bytes()
+        );
+        let RestorePlan::Resume { command, .. } =
+            restore_plan_in(input(Agent::Agy, Some(agy_id), Some("")))
+        else {
+            panic!("agy が resume されない");
+        };
+        assert_eq!(
+            resume_input(&command),
+            format!("agy --conversation {agy_id}\r").into_bytes()
         );
     }
 }

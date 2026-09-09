@@ -271,6 +271,8 @@ pub mod keys {
     pub const MASTER_SYSTEM_PROMPT: &str = "master_system_prompt";
     /// ベンダー公式のリモート操作（スマホアプリ / Web）への会話の委譲
     pub const REMOTE_CONTROL: &str = "remote_control";
+    /// PC 再起動（tmux サーバーごと消える）後の復元で、会話ごと戻せるか（#1238）
+    pub const RESTORE_AFTER_REBOOT: &str = "restore_after_reboot";
     /// ハーネスだけ建て直して会話を続ける（#1067。ペインの右クリック / `tako session-restart`）
     pub const SESSION_RESTART_HARNESS: &str = "session_restart_harness";
     /// 引き継ぎを書かせてセッションを交代する（#1067。#749 の手動版）
@@ -874,6 +876,27 @@ pub const MATRIX: &[AgentFeature] = &[
         ),
     },
     AgentFeature {
+        key: keys::RESTORE_AFTER_REBOOT,
+        summary: Note::new(
+            "PC 再起動（tmux サーバーごと消える）後の復元で会話ごと戻る（#1238）",
+            "After a reboot (which takes the tmux server with it), the pane comes back with its conversation (#1238)",
+        ),
+        claude: S::Supported,
+        codex: S::Supported,
+        agy: S::Supported,
+        local: local_pending_first_class(),
+        evidence: AgentEvidence::Measured(
+            "#1238 の実測（2026-09-09 / codex-cli 0.153.0 / agy 1.1.27）: \
+             生きた codex は $CODEX_HOME/thread-writer-locks/<id>.lock を、\
+             生きた agy は ~/.gemini/antigravity-cli/brain/<id> を開いたまま持つ（#1033 の実測）。\
+             ペイン → 子孫 pid → lsof でその ID を採り layout.json へ保存すると、\
+             tmux サーバーを kill したあとの復元で `codex resume <id>` / \
+             `agy --conversation <id>` が会話を履歴ごと戻した。\
+             **Windows は lsof が無いので ID を採れない**（復元の内訳は `resume 非対応` と出す。\
+             判定は tako_core::agent_resume::restore_support）",
+        ),
+    },
+    AgentFeature {
         key: keys::SESSION_RESTART_HANDOFF,
         summary: Note::new(
             "引き継ぎを書かせてセッションを交代する（#1067。ペインの右クリック / `tako session-restart --mode handoff`）",
@@ -898,7 +921,10 @@ pub const MATRIX: &[AgentFeature] = &[
         agy: pending(notes::NOT_WIRED, 984),
         local: local_pending_first_class(),
         evidence: AgentEvidence::Source(
-            "session_restart の harness は sessions::resume_command（claude --resume）を              組んで送るので、resume を配線していない系統では成立しない              （手段自体は上流にある: codex resume / agy --conversation）",
+            "resume コマンド自体は #1238 で 3 系統ぶん組めるようになった（agent_resume::resume_spec）。\
+             残る欠けは**ペイン → 会話 ID の解決**で、session_restart は claude の検出\
+             （agents --json / セッションカタログ）に依るため codex / agy では ID が出てこない。\
+             #1238 が採る ID は復元用に layout.json へ保存する経路で、まだここへは配線していない",
         ),
     },
     AgentFeature {
@@ -927,9 +953,10 @@ pub const MATRIX: &[AgentFeature] = &[
         agy: pending(notes::NOT_WIRED, 984),
         local: local_pending_first_class(),
         evidence: AgentEvidence::Source(
-            "dispatch.rs の resume は claude --resume <session_id> を組み、\
-             ~/.claude/projects の transcript を前提にする（claude 以外は分類済みエラーで \
-             手動の代替を案内する）",
+            "コマンドの組み立ては #1238 で 3 系統に広がったが、`tako sessions resume` が引くのは\
+             カタログ本体（entries）で、そこへ昇格するのは claude だけ（sessions_catalog 参照）。\
+             codex / agy の会話は pending にしか残らないので一覧に出ない。\
+             dispatch.rs の実在確認も ~/.claude/projects の transcript 固定",
         ),
     },
     AgentFeature {
