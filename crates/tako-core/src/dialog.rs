@@ -41,6 +41,24 @@
 //!                     …          ← 画面はここで尽きる（カーソルは 4. の行）
 //!    ```
 //!
+//! 4. **空の入力欄の上の番号つき**（#1263。claude の auto mode 環境学習の確認）:
+//!    番号つき 3 択の**下に空の入力欄が描かれる**形。最下部のカーソル行は入力欄なので
+//!    経路 1 の起点にならず、旧実装はそこで打ち切っていた（`choice_dialog` が null =
+//!    watch も `WORKER_DIALOG` を出せない）。詳細と拒否条件は
+//!    [`numbered_above_empty_input`]
+//!    ```text
+//!      Teach auto mode about your environment?
+//!
+//!      ❯ 1. Yes
+//!        2. Not now
+//!        3. Don't show again
+//!
+//!      Enter to confirm · Esc to cancel
+//!    ────────────────────────────────
+//!    ❯                                ← 空の入力欄（ダイアログの外）
+//!    ────────────────────────────────
+//!    ```
+//!
 //! # 番号キーの実測（#748。claude v2.1.220）
 //!
 //! - 番号つきダイアログは**番号キーだけで確定する**（Enter 不要。permission /
@@ -224,28 +242,17 @@ fn detect_choice_list_in(lines: &[&str]) -> Option<ChoiceList> {
 
     // 経路 1: 番号つき（カーソルが `N. …` を指している + 画面に 2 つ以上）
     if numbered_choice(content).is_some() {
-        let numbered: Vec<usize> = (0..bottom)
-            .filter(|&i| {
-                let inner = cursor_content(lines[i]).unwrap_or_else(|| strip_indent(lines[i]));
-                numbered_choice(inner).is_some()
-            })
-            .collect();
+        let numbered = numbered_rows(lines, bottom);
         if numbered.len() >= 2 {
-            let options = numbered_options(lines, &numbered, Some(cursor_row));
-            let highlighted = options.iter().position(|o| o.highlighted);
-            return Some(ChoiceList {
-                options,
-                highlighted,
-                numbered: true,
-                header: header_block(lines, numbered[0]),
-                cursor_row: Some(cursor_row),
-            });
+            return Some(numbered_list(lines, &numbered, cursor_row));
         }
     }
 
     // 経路 2: 番号なし（開始列の揃った兄弟行が隣接している）
     if content.trim().is_empty() {
-        return None; // 空のカーソル行（= 空の入力欄）は選択肢ではない
+        // 空のカーソル行 = 空の入力欄。**入力欄はダイアログの外**なので、その上に
+        // 番号つきダイアログが在れば拾う（経路 4。#1263）
+        return numbered_above_empty_input(lines, scan_from, cursor_row);
     }
     let indent = content_column(lines[cursor_row])?;
     if framed_as_input_box(lines, cursor_row, indent, scan_from, bottom) {
@@ -303,6 +310,108 @@ fn detect_choice_list_in(lines: &[&str]) -> Option<ChoiceList> {
         header: header_block(lines, *rows.first().unwrap_or(&cursor_row)),
         cursor_row: Some(cursor_row),
     })
+}
+
+// --- 番号つき経路の共通部と「入力欄の上のダイアログ」（#1263） ---
+
+/// 画面の `to` 行までにある番号つき選択肢の行（選択カーソル行も含む）。
+/// 経路 1 と経路 4（#1263）で共有する
+fn numbered_rows(lines: &[&str], to: usize) -> Vec<usize> {
+    (0..to)
+        .filter(|&i| {
+            let inner = cursor_content(lines[i]).unwrap_or_else(|| strip_indent(lines[i]));
+            numbered_choice(inner).is_some()
+        })
+        .collect()
+}
+
+/// 番号つきの行から `ChoiceList` を組む（経路 1 と経路 4 の共通部）
+fn numbered_list(lines: &[&str], numbered: &[usize], cursor_row: usize) -> ChoiceList {
+    let options = numbered_options(lines, numbered, Some(cursor_row));
+    let highlighted = options.iter().position(|o| o.highlighted);
+    ChoiceList {
+        options,
+        highlighted,
+        numbered: true,
+        header: header_block(lines, numbered.first().copied().unwrap_or(cursor_row)),
+        cursor_row: Some(cursor_row),
+    }
+}
+
+/// 経路 4: **空の入力欄より上**にある番号つきダイアログを拾う（#1263）。
+///
+/// claude の auto mode 環境学習の確認（`Teach auto mode about your environment?`）は
+/// 番号つき 3 択の**下に空の入力欄を描く**。判定の起点は「最下部の選択カーソル行」
+/// なので、旧実装はその入力欄を起点に選び、中身が空なので選択肢なしと結論していた
+/// （実測: 同じ 6 行から入力欄を外すと検知できる = 入力欄が原因）。
+///
+/// 入力欄を跨いで上を見るのは**番号つきに限る**。番号なし経路（開始列の揃った兄弟行）
+/// まで開放すると、**複数行の user 発話の継続行**が選択肢と同じ桁に並ぶので会話ログを
+/// 選択肢の並びと誤検知する（claude の発話は行頭 `❯` で始まり、継続行が同じ桁へ
+/// 字下げされる = 番号なし経路の条件をそのまま満たす）。
+///
+/// 番号つきでも会話ログは誤検知しうる（**解決済みのダイアログが上流に流れている**形 =
+/// #577 の fixture、ユーザーが番号つきリストで指示を書いた形）。字面は生きたダイアログと
+/// 同じなので、区別は「**並びと入力欄のあいだがダイアログの一部だけでできているか**」で
+/// 付ける（[`dialog_reaches_input_box`]）。
+///
+/// **確定キーの案内が 1 行も無い / あいだに他の行が挟まるダイアログはこの経路では
+/// 拾わない**（= 旧挙動どおり非検知）。誤検知の代償（アイドル画面をダイアログと誤認して
+/// 番号キーを送る）のほうが重いので安全側に倒してある
+fn numbered_above_empty_input(
+    lines: &[&str],
+    scan_from: usize,
+    input_row: usize,
+) -> Option<ChoiceList> {
+    if legacy_input_box_below() {
+        return None;
+    }
+    // 入力欄より上で、番号つき選択肢を指している選択カーソル行
+    let cursor_row = (scan_from..input_row)
+        .rev()
+        .find(|&i| cursor_content(lines[i]).is_some_and(|c| numbered_choice(c).is_some()))?;
+    let numbered = numbered_rows(lines, input_row);
+    if numbered.len() < 2 {
+        return None;
+    }
+    if !dialog_reaches_input_box(lines, *numbered.last()?, input_row) {
+        return None;
+    }
+    Some(numbered_list(lines, &numbered, cursor_row))
+}
+
+/// 番号つきの並びと**空の入力欄のあいだ**が、ダイアログの一部だけでできているか（#1263）。
+///
+/// 通すのは 4 種だけ: 空行 / 選択肢の説明列の折り返し（ラベル列以降へ字下げされた行。
+/// 実採取: `❯ 1. そのまま変更する（推奨）` の続きが同じ画面で 5 桁 = ラベル列）/
+/// 確定キーの案内 / 罫線（入力ボックスの上端）。**そのうえで案内が 1 行は要る**。
+///
+/// これが「そのダイアログが**生きている**」ことの根拠になる。会話ログへ流れた
+/// **解決済みの**ダイアログは字面が同じなので、案内の有無だけでは区別できない。
+/// 区別が付くのは**あいだに何が挟まるか**で、実採取では claude の生成中インジケータや
+/// 応答本文が入る（`✽ Misting… (1m 4s · ↓ 2.1k tokens)` = #577 の fixture）。
+/// 旧実装は「最下部の選択カーソル行」を起点にすることで偶然この区別をしていたので、
+/// 入力欄を跨いで上を見るならこの条件を明示的に置く必要がある
+fn dialog_reaches_input_box(lines: &[&str], last_row: usize, input_row: usize) -> bool {
+    let content_col = content_start_column(lines[last_row]).unwrap_or(0);
+    let mut hint = false;
+    for line in lines.get(last_row + 1..input_row).unwrap_or_default() {
+        if line.trim().is_empty() || line.chars().take_while(|c| *c == ' ').count() >= content_col {
+            continue; // 空行 / 説明列の折り返し
+        }
+        if is_key_hint(line) {
+            hint = true;
+        } else if !is_rule_line(line) {
+            return false; // ダイアログの一部でない行が挟まっている（= 会話ログの残骸）
+        }
+    }
+    hint
+}
+
+/// `TAKO_1263_LEGACY=1` で #1263 前（空の入力欄で打ち切る）へ戻す（A/B 用）
+fn legacy_input_box_below() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_1263_LEGACY").is_some())
 }
 
 // --- 2 列レイアウトとカーソルなしの検知（#1143） ---
@@ -1077,6 +1186,64 @@ Antigravity CLI requires permission to read, edit, and execute files here.
 ────────────────────────────────────────────────────────────────────────
   claude-opus-5 · ctx 23%"#;
 
+    // --- #1263: auto mode の環境学習の確認（**番号つき 3 択の下に空の入力欄がある**形） ---
+    //
+    // ダイアログの 6 行は 2026-09-09 11:50 の worker ペインの実採取（Issue #1263 本文）。
+    // 下の入力欄はその画面に在ったもので、枠の形は同じファイルの実採取 `INPUT_READY` に
+    // 合わせてある（枠の有無で結果が変わらないことは `TEACH_AUTO_MODE_BARE` で固定する）
+    const TEACH_AUTO_MODE: &str = r#"  Teach auto mode about your environment?
+
+  Auto mode works better when it knows your environment. Takes about a minute.
+
+  ❯ 1. Yes
+    2. Not now
+    3. Don't show again
+
+  Enter to confirm · Esc to cancel
+────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────
+  claude-opus-5 · ctx 12%"#;
+
+    /// 同じダイアログで**入力欄に枠が無い**形（枠の描き方に判定を依存させないための対）
+    const TEACH_AUTO_MODE_BARE: &str = r#"  Teach auto mode about your environment?
+
+  Auto mode works better when it knows your environment. Takes about a minute.
+
+  ❯ 1. Yes
+    2. Not now
+    3. Don't show again
+
+  Enter to confirm · Esc to cancel
+
+❯"#;
+
+    /// 会話ログに残った**番号つきの user 発話** + 空の入力欄（#1263 の拒否条件）。
+    /// 番号つきの並びとカーソルは揃っているが、並びと入力欄のあいだに claude の応答本文が
+    /// 挟まる（確定キーの案内も無い）
+    const NUMBERED_USER_MESSAGE: &str = r#"❯ 1. まず A をやって
+  2. 次に B をやって
+
+⏺ 了解しました。順に進めます。
+
+────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────
+  claude-opus-5 · ctx 8%"#;
+
+    /// **複数行の user 発話**（継続行が選択肢と同じ桁）+ 空の入力欄。
+    /// 経路 4 を番号なしへ広げると誤検知する形なので、案内行まで足した最悪ケースで固定する
+    /// （案内行は合成。実画面の発話の下に案内は出ない）
+    const MULTILINE_USER_MESSAGE: &str = r#"❯ 1 行目のお願い
+  2 行目のお願い
+  3 行目のお願い
+
+  Enter to confirm · Esc to cancel
+
+────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────"#;
+
     // --- #1143: 狭いペインの `/model` セレクタ（実採取 2026-09-06。claude 2.1.258 を
     // 隔離した tmux セッションで幅・高さだけ変えて採った 3 枚。cwd 行はサニタイズ済み） ---
     //
@@ -1311,6 +1478,9 @@ Antigravity CLI requires permission to read, edit, and execute files here.
             ("本文の箇条書き", QUESTION_IN_BODY),
             ("codex 起動画面", CODEX_READY),
             ("agy 空入力欄", AGY_READY),
+            // #1263: 入力欄の上を見る経路を足しても会話ログは拾わないこと
+            ("番号つきの user 発話", NUMBERED_USER_MESSAGE),
+            ("複数行の user 発話", MULTILINE_USER_MESSAGE),
         ] {
             assert!(
                 detect_choice_list(&rows(s)).is_none(),
@@ -2007,5 +2177,127 @@ Antigravity CLI requires permission to read, edit, and execute files here.
                 steps: 1
             }
         );
+    }
+
+    // --- #1263: 空の入力欄より上のダイアログ ---
+
+    /// **解決済みの** permission ダイアログが会話ログへ流れた画面（#577 の実採取型）。
+    /// 字面は生きたダイアログと同じで確定キーの案内まで在るが、claude は生成中で
+    /// 入力欄は健在 = ダイアログではない。区別は「あいだに生成中インジケータが挟まる」こと
+    const RESOLVED_DIALOG_IN_LOG: &str = r#"⏺ Running 1 shell command…
+────────────────────────────────────────────────
+ Bash command
+   for i in {1..12}; do echo $i; sleep 1; done; echo done
+ Contains brace_expression
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for echo commands
+   3. No, and tell Claude what to do differently (esc)
+ Esc to cancel · Tab to amend · ctrl+e to explain
+✽ Misting… (1m 4s · ↓ 2.1k tokens)
+────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────
+  ctx 23%"#;
+
+    #[test]
+    fn issue1263_会話ログへ流れた解決済みダイアログは拾わない() {
+        assert!(
+            detect_choice_list(&rows(RESOLVED_DIALOG_IN_LOG)).is_none(),
+            "生成中インジケータを挟んだ残骸をダイアログと誤検知してはいけない（#577）"
+        );
+        // インジケータを取り除くと「入力欄まで途切れず届く」形になる = 判定材料はそこだけ
+        let live = RESOLVED_DIALOG_IN_LOG.replace("✽ Misting… (1m 4s · ↓ 2.1k tokens)\n", "");
+        let list = detect_choice_list(&rows(&live)).expect("生きたダイアログなら検知される");
+        assert_eq!(list.options.len(), 3);
+    }
+
+    #[test]
+    fn issue1263_実採取のauto_mode確認を検知する() {
+        let list = detect_choice_list(&rows(TEACH_AUTO_MODE)).expect("検知される");
+        assert!(list.numbered, "番号つき = 番号キーで確定できる");
+        assert_eq!(list.highlighted, Some(0), "既定のハイライトは 1. Yes");
+        assert_eq!(
+            list.options
+                .iter()
+                .map(|o| (o.number, o.label.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(1), "Yes".to_string()),
+                (Some(2), "Not now".to_string()),
+                (Some(3), "Don't show again".to_string()),
+            ]
+        );
+        assert!(
+            list.cursor_row.is_some(),
+            "選択カーソルは画面に在る（#1143 の画面外とは別の形）"
+        );
+        assert!(
+            list.header.iter().any(|h| h.contains("Teach auto mode")),
+            "ダイアログ本文が header に入る: {:?}",
+            list.header
+        );
+    }
+
+    #[test]
+    fn issue1263_入力欄の枠の有無で結果は変わらない() {
+        let framed = detect_choice_list(&rows(TEACH_AUTO_MODE)).expect("枠つきで検知される");
+        let bare = detect_choice_list(&rows(TEACH_AUTO_MODE_BARE)).expect("枠なしでも検知される");
+        assert_eq!(options_of(&framed), options_of(&bare));
+        assert_eq!(framed.highlighted, bare.highlighted);
+    }
+
+    #[test]
+    fn issue1263_入力欄が無い形でも同じ選択肢になる() {
+        // 入力欄を外した 6 行は元から検知できていた（= 入力欄が原因だった証拠）
+        let without = TEACH_AUTO_MODE
+            .lines()
+            .take_while(|l| !l.starts_with('\u{2500}'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let a = detect_choice_list(&rows(&without)).expect("入力欄なしで検知される");
+        let b = detect_choice_list(&rows(TEACH_AUTO_MODE)).expect("入力欄ありでも検知される");
+        assert_eq!(options_of(&a), options_of(&b));
+        assert_eq!(a.highlighted, b.highlighted);
+    }
+
+    #[test]
+    fn issue1263_ハイライトが二番目でも位置が取れる() {
+        let moved = TEACH_AUTO_MODE
+            .replace("  \u{276f} 1. Yes", "    1. Yes")
+            .replace("    2. Not now", "  \u{276f} 2. Not now");
+        let list = detect_choice_list(&rows(&moved)).expect("検知される");
+        assert_eq!(list.highlighted, Some(1));
+        assert_eq!(list.options.len(), 3);
+    }
+
+    #[test]
+    fn issue1263_確定キーの案内が無い並びは拾わない() {
+        // 案内行だけを落とす（他は実採取のまま）= 安全側の非検知を固定する
+        let without_hint = TEACH_AUTO_MODE.replace("  Enter to confirm \u{b7} Esc to cancel\n", "");
+        assert!(
+            detect_choice_list(&rows(&without_hint)).is_none(),
+            "案内が無ければ入力欄の上は見ない（誤検知より非検知を採る）"
+        );
+    }
+
+    #[test]
+    fn issue1263_選択肢ごとに説明行が付いても案内へ辿り着ける() {
+        // AskUserQuestion 型（各選択肢の下に説明行）+ 空の入力欄
+        let text = concat!(
+            "  質問です\n",
+            "\n",
+            "  ❯ 1. はい\n",
+            "       そのまま進める\n",
+            "    2. いいえ\n",
+            "       やめる\n",
+            "\n",
+            "  Enter to confirm · Esc to cancel\n",
+            "\n",
+            "❯"
+        );
+        let list = detect_choice_list(&rows(text)).expect("説明行を跨いで案内を見つける");
+        assert_eq!(list.options.len(), 2);
+        assert_eq!(list.highlighted, Some(0));
     }
 }

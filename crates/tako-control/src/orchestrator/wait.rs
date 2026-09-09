@@ -3239,6 +3239,50 @@ Running 1 shell command...\n\
     }
 
     #[test]
+    fn issue1263_auto_mode確認でwatchがdialog_waitingを返す() {
+        // 実採取（2026-09-09 の worker ペイン）。番号つき 3 択の**下に空の入力欄**が
+        // 描かれる形で、修正前は choice_dialog が null のまま
+        // WORKER_IDLE も WORKER_DIALOG も出せなかった（#1263）
+        let teach = r#"  Teach auto mode about your environment?
+
+  Auto mode works better when it knows your environment. Takes about a minute.
+
+  ❯ 1. Yes
+    2. Not now
+    3. Don't show again
+
+  Enter to confirm · Esc to cancel
+────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────
+  claude-opus-5 · ctx 12%"#;
+        let mut script = ExecScript::new(vec![
+            status("idle", teach, "agents"),
+            status("idle", teach, "agents"),
+            status("idle", teach, "agents"),
+        ]);
+        let outcome = run_wait(&mut script, &watch_opts(7, None));
+        let WatchOutcome::ChoiceWaiting { choice_dialog } = outcome else {
+            panic!("ChoiceWaiting を返す（修正前は Idle）: {outcome:?}");
+        };
+        assert_eq!(choice_dialog["kind"], "select");
+        assert_eq!(choice_dialog["numbered"], true);
+        assert_eq!(choice_dialog["highlighted"], 0);
+        assert_eq!(choice_dialog["cursor_visible"], true);
+        assert_eq!(choice_dialog["recommended_action"], "respond");
+        let options = choice_dialog["options"].as_array().expect("options");
+        assert_eq!(options.len(), 3);
+        assert_eq!(options[2]["number"], 3);
+        assert_eq!(options[2]["label"], "Don't show again");
+        // question としては通知しない（master が本文へ返信しようとするのを防ぐ。#748）
+        let events = collect_worker_events("idle", Some(teach), None);
+        assert!(
+            !events.iter().any(|e| e.kind == WorkerEventKind::Question),
+            "ダイアログ実在時に question は出さない: {events:?}"
+        );
+    }
+
+    #[test]
     fn issue1143_狭いモデルセレクタでもwatchがdialog_waitingを返す() {
         // 実採取（claude 2.1.258 / 25 桁 × 40 行）。ダイアログがペインより高いので
         // 選択カーソルもキー案内も画面に無く、ラベルは `…` で切り詰められている。
