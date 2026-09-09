@@ -76,6 +76,18 @@ events — see above). When `collapsed` is true, the pane text may be incomplete
 — use `has_running_children` and the `status` field as the primary signals, not
 the screen text.
 
+**`N shells still running` does not mean the worker is busy** (Issue #1273). A
+background shell or monitor keeps claude's own `agents --json` reporting `busy`
+long after the turn ended, so tako overrides it to `idle` when — and only when —
+the screen proves the turn is over: no busy indicator anywhere, an input box that
+exists and is empty, not folded, and the status line declaring what is still
+running (`background_work`, e.g. `1 shell, 1 monitor`). When that override fires,
+`idle_despite_primary_busy` is true and `status_source` still says `agents`.
+Priority: a visible busy indicator always wins over the empty input box (claude
+draws the input box while generating too), and `Waiting for … to finish` — claude
+blocking *on* the background work — stays `busy`. On very narrow panes the status
+line is truncated, the evidence is lost, and the worker stays `busy` as before.
+
 ### When you receive WORKER_ERROR
 
 The worker stalled — it did NOT complete. Do not run Acceptance Inspection.

@@ -9584,6 +9584,53 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         }
     }
 
+    // #224 折りたたみ検出: TUI が「N new messages (click) ↓」で折りたたまれている。
+    // **#1273 の判定より前に要る**（折りたたみ中は画面本文が欠けるので画面を根拠にしない）
+    let collapsed = full_screen
+        .as_ref()
+        .is_some_and(|s| crate::orchestrator::wait::screen_is_collapsed(s));
+
+    // 画面の状態行が申告している「まだ生きている背景作業」（#1273。申告なしは null）
+    let background_work = recent_output
+        .as_deref()
+        .and_then(crate::orchestrator::wait::background_work_summary);
+
+    // #1273（#289 の再発）: **一次シグナルの busy を画面で覆す唯一の経路**。
+    //
+    // claude 2.1.258 の `agents --json` は `isLoading || delegatedActive` で状態を決めるので、
+    // Bash の背景シェルや Monitor が生きているあいだ **busy を返し続ける**
+    // （2026-09-09 実測。同時刻の本番 4 ペインで、背景作業の申告がある 3 本が busy・
+    // 無い 1 本だけが idle。どれも入力欄は空でスピナー無し）。
+    // #289 はこの症状を「tako の `has_running_children` 補正が原因」と推定して
+    // 上の `status == "idle"` の腕を直したが、**生 status が busy なのでそこへ入らない**。
+    // ここで倒さない限り watch は `WORKER_IDLE` を出せない（`"busy"` の腕は
+    // `idle_streak` を無条件に 0 へ戻す）。
+    //
+    // 倒す条件は `input_waiting_with_background_work` の 1 実装が持つ（優先順位もそこ）。
+    // **画面が「なぜ busy なのか」を説明できるときだけ**倒すので、説明のつかない busy
+    // （生成中・背景作業の完了待ちで止まっている `Waiting for … to finish`）はそのまま
+    //
+    // `has_children` も要求する: 子が 1 つも無い busy は #224 の `stalled`
+    // （もっと具体的な停止種別）が拾うべきもので、そこを先取りしない
+    let mut idle_despite_primary_busy = false;
+    if status == "busy" && agents_authoritative && has_children {
+        let agent = registry_agent
+            .as_deref()
+            .and_then(tako_core::agent_support::Agent::parse)
+            .or_else(|| {
+                recent_output
+                    .as_deref()
+                    .and_then(crate::orchestrator::wait::detect_screen_agent)
+            });
+        let waiting = recent_output.as_deref().and_then(|out| {
+            crate::orchestrator::wait::input_waiting_with_background_work(out, collapsed, agent)
+        });
+        if waiting.is_some() {
+            status = "idle".to_string();
+            idle_despite_primary_busy = true;
+        }
+    }
+
     // #577: 画面に permission ダイアログ（ツール実行の承認要求）が**実在すれば**
     // waiting へ格上げする。旧実装は「agents の生 status が waiting」だけを根拠に
     // していたため、**agents がその worker を見られない状況で丸ごと落ちていた**。
@@ -9749,11 +9796,6 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         }
     }
 
-    // #224 折りたたみ検出: TUI が「N new messages (click) ↓」で折りたたまれている
-    let collapsed = full_screen
-        .as_ref()
-        .is_some_and(|s| crate::orchestrator::wait::screen_is_collapsed(s));
-
     // #243: events 配列（question / model_switched / context_high / permission_dialog）
     let mut events: Vec<Value> = crate::orchestrator::wait::collect_worker_events(
         &status,
@@ -9886,6 +9928,12 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         "error": error_info,
         "stalled": stalled_info,
         "has_running_children": has_children,
+        // #1273: 画面の状態行が申告する「まだ生きている背景作業」（`1 shell, 1 monitor` 等）。
+        // null = 申告なし（背景作業が無い / 狭いペインで行が切られて読めない）
+        "background_work": background_work,
+        // #1273: 一次シグナルは busy だったが、画面が「ターン終了 + 入力待ち」と
+        // 決定的に言っていたので idle へ倒したか
+        "idle_despite_primary_busy": idle_despite_primary_busy,
         "collapsed": collapsed,
         "events": events,
         // #572: true = 人間が busy 中に打った指示がキューに未送信で残っている
@@ -17397,6 +17445,234 @@ mod tests {
         assert_eq!(
             v["status"], "busy",
             "画面から判断できなければ busy 側に倒す"
+        );
+    }
+
+    // --- #1273（#289 の再発）: 背景作業が残る入力待ちを idle と判定する ---
+    //
+    // #289 の推定（tako の has_children 補正が犯人）は実測されていなかった。
+    // 実物（2026-09-09 / claude 2.1.258）の生 status は **busy** で、
+    // `apply_worker_status_corrections` には busy → idle の経路がそもそも無かった
+
+    /// 実採取の形（#927 に沿ってラベルはプレースホルダ）。ターンは終わり、
+    /// 背景シェルと Monitor だけが生きている
+    const I1273_IDLE_WITH_BACKGROUND: &str = "\
+⏺ リリースビルド中です。完了を待ちます。
+
+⏺ 終わり次第、最終報告を出します。
+
+✻ Worked for 1m 11s · done 2:54 PM · 1 shell, 1 monitor still running
+
+─────────────────────────────────────────────
+❯
+─────────────────────────────────────────────
+  [model placeholder]  worker: placeholder task
+  ctx  40% ████░░░░░░
+  5h    9% ░░░░░░░░░░ (→4h25m)
+  7d   94% █████████░ (→1d16h)
+  ⏵⏵ auto mode on · 1 shell, 1 monitor · ← for agents";
+
+    /// 同じペインの**生成中**。スピナーが出ていて、背景作業の申告も残っている
+    const I1273_BUSY_WITH_BACKGROUND: &str = "\
+⏺ 続きを進めます。
+
+✻ Cooking… (12s · ↓ 1.2k tokens)
+
+─────────────────────────────────────────────
+❯
+─────────────────────────────────────────────
+  [model placeholder]  worker: placeholder task
+  ctx  41% ████░░░░░░
+  ⏵⏵ auto mode on · 1 shell, 1 monitor · ← for agents";
+
+    /// 背景作業の完了を**待って止まっている**変種。claude は同じ行を
+    /// `Waiting for … to finish` にし、`still running` を付けない
+    const I1273_WAITING_FOR_BACKGROUND: &str = "\
+⏺ 背景の作業を待ちます。
+
+✻ Waiting for 2 background agents and 1 dynamic workflow to finish
+
+─────────────────────────────────────────────
+❯
+─────────────────────────────────────────────
+  [model placeholder]  worker: placeholder task
+  ⏵⏵ auto mode on · 2 agents · ← for agents";
+
+    fn i1273_resolved(recent: &str) -> ResolvedWorkerStatus {
+        ResolvedWorkerStatus {
+            status: "busy".into(),
+            status_source: "agents".into(),
+            resolved_sid: Some("test-session".into()),
+            pane_exists: true,
+            has_children: true,
+            recent_output: Some(recent.into()),
+            registry_agent: Some("claude".into()),
+            ..Default::default()
+        }
+    }
+
+    /// 受け入れ条件 1: 再現 —— 一次シグナルが busy でも入力待ちなら idle
+    #[test]
+    fn issue1273_背景作業が残る入力待ちはidleになる() {
+        let v =
+            apply_worker_status_corrections(i1273_resolved(I1273_IDLE_WITH_BACKGROUND)).unwrap();
+        assert_eq!(v["status"], "idle", "watch が WORKER_IDLE を出せる状態");
+        assert_eq!(v["idle_despite_primary_busy"], true);
+        assert_eq!(v["background_work"], "1 shell, 1 monitor");
+        // 一次シグナルの出所は偽らない（watch の need_streak は 3 のまま）
+        assert_eq!(v["status_source"], "agents");
+        assert_eq!(v["has_running_children"], true);
+    }
+
+    /// A/B: 同一バイナリのまま旧挙動（`TAKO_1273_LEGACY=1`）へ戻すと busy のまま
+    #[test]
+    fn issue1273_legacyでは従来どおりbusyのまま() {
+        let waiting = crate::orchestrator::wait::input_waiting_with_background_work_in(
+            I1273_IDLE_WITH_BACKGROUND,
+            false,
+            Some(tako_core::agent_support::Agent::Claude),
+            true,
+        );
+        assert!(waiting.is_none(), "legacy では画面で覆さない");
+    }
+
+    /// 受け入れ条件 3: 生成中（スピナーあり）は busy のまま
+    #[test]
+    fn issue1273_生成中は背景作業の申告があってもbusy() {
+        let v =
+            apply_worker_status_corrections(i1273_resolved(I1273_BUSY_WITH_BACKGROUND)).unwrap();
+        assert_eq!(v["status"], "busy");
+        assert_eq!(v["idle_despite_primary_busy"], false);
+    }
+
+    /// 背景作業の完了を**待って止まっている**あいだは入力待ちではない
+    #[test]
+    fn issue1273_背景作業の完了待ちはbusyのまま() {
+        let v =
+            apply_worker_status_corrections(i1273_resolved(I1273_WAITING_FOR_BACKGROUND)).unwrap();
+        assert_eq!(v["status"], "busy");
+        assert_eq!(v["background_work"], Value::Null, "待機中は申告を読まない");
+    }
+
+    /// エッジ: 折りたたみ画面（`collapsed`）では画面を根拠にしない
+    #[test]
+    fn issue1273_折りたたみ画面ではbusyのまま() {
+        let mut r = i1273_resolved(I1273_IDLE_WITH_BACKGROUND);
+        r.full_screen = Some(format!(
+            "95 new messages (click) ↓\n{I1273_IDLE_WITH_BACKGROUND}"
+        ));
+        let v = apply_worker_status_corrections(r).unwrap();
+        assert_eq!(v["collapsed"], true);
+        assert_eq!(v["status"], "busy");
+    }
+
+    /// エッジ: 背景作業が 0 に戻った直後（申告行が消える）は覆さない。
+    /// このとき一次シグナルはすぐ idle を返すので実害は無い
+    #[test]
+    fn issue1273_背景作業の申告が無ければ覆さない() {
+        let without = I1273_IDLE_WITH_BACKGROUND
+            .replace(" · 1 shell, 1 monitor still running", "")
+            .replace(" · 1 shell, 1 monitor · ← for agents", " · ← for agents");
+        let v = apply_worker_status_corrections(i1273_resolved(&without)).unwrap();
+        assert_eq!(v["status"], "busy");
+        assert_eq!(v["background_work"], Value::Null);
+    }
+
+    /// エッジ: 人間が入力欄へ打ちかけているときは覆さない（入力待ちの決定的兆候ではない）
+    #[test]
+    fn issue1273_入力欄に下書きがあれば覆さない() {
+        let drafted = I1273_IDLE_WITH_BACKGROUND.replace("\n❯\n", "\n❯ draft by human\n");
+        let v = apply_worker_status_corrections(i1273_resolved(&drafted)).unwrap();
+        assert_eq!(v["status"], "busy");
+    }
+
+    /// 子プロセスが 1 つも無い busy は #224 の stalled が拾う（先取りしない）
+    #[test]
+    fn issue1273_子プロセスが無ければstalledのまま() {
+        let mut r = i1273_resolved(I1273_IDLE_WITH_BACKGROUND);
+        r.has_children = false;
+        let v = apply_worker_status_corrections(r).unwrap();
+        assert_eq!(v["status"], "stalled");
+        assert_eq!(v["idle_despite_primary_busy"], false);
+    }
+
+    /// 宣言の無い系統（codex / agy）では覆さない（#982 のマトリクスが唯一の判断）
+    #[test]
+    fn issue1273_宣言の無い系統では覆さない() {
+        for agent in ["codex", "agy"] {
+            let mut r = i1273_resolved(I1273_IDLE_WITH_BACKGROUND);
+            r.registry_agent = Some(agent.into());
+            r.status_source = "codex-session".into();
+            let v = apply_worker_status_corrections(r).unwrap();
+            assert_eq!(v["status"], "busy", "{agent} は宣言していない");
+        }
+    }
+
+    /// 受け入れ条件 1 + 4: **watch まで通して** `WORKER_IDLE` が出る（1 実装を共有）。
+    ///
+    /// dispatch が idle にしても、watch の `"idle"` の腕は `screen_looks_busy(recent)`
+    /// で再検査する。ここが食い違うと `idle_streak` が永久に積まれない
+    /// （= 別の形の不検知）ので、同じ画面で両方が一致することを固定する
+    #[test]
+    fn issue1273_watchがworker_idleを出す() {
+        use crate::orchestrator::wait::{wait_for_worker, WatchOptions, WatchOutcome};
+        use std::time::Duration;
+
+        let response =
+            apply_worker_status_corrections(i1273_resolved(I1273_IDLE_WITH_BACKGROUND)).unwrap();
+        assert_eq!(response["status"], "idle");
+        let mut polls = 0u32;
+        let mut exec = |_req: crate::protocol::Request| {
+            polls += 1;
+            Ok(response.clone())
+        };
+        let opts = WatchOptions {
+            pane_id: 1627,
+            session_id: Some("test-session".into()),
+            tmux_session: None,
+            timeout: Some(Duration::from_secs(5)),
+            initial_delay: Duration::ZERO,
+            interval: Duration::ZERO,
+        };
+        let outcome = wait_for_worker(&mut exec, &opts, None);
+        assert_eq!(outcome, WatchOutcome::Idle { ctx_percent: None });
+        assert_eq!(polls, 3, "一次シグナル経路の need_streak は 3");
+    }
+
+    /// 対照: 生成中の画面なら watch はタイムアウトまで何も出さない（誤発火なし）
+    #[test]
+    fn issue1273_生成中はwatchが何も出さない() {
+        use crate::orchestrator::wait::{wait_for_worker, WatchOptions, WatchOutcome};
+        use std::time::Duration;
+
+        let response =
+            apply_worker_status_corrections(i1273_resolved(I1273_BUSY_WITH_BACKGROUND)).unwrap();
+        assert_eq!(response["status"], "busy");
+        let mut exec = |_req: crate::protocol::Request| Ok(response.clone());
+        let opts = WatchOptions {
+            pane_id: 1627,
+            session_id: Some("test-session".into()),
+            tmux_session: None,
+            timeout: Some(Duration::from_millis(50)),
+            initial_delay: Duration::ZERO,
+            interval: Duration::from_millis(5),
+        };
+        assert_eq!(
+            wait_for_worker(&mut exec, &opts, None),
+            WatchOutcome::Timeout
+        );
+    }
+
+    /// 会話本文にたまたま `… still running` があっても内訳の形でなければ拾わない
+    #[test]
+    fn issue1273_本文の似た文字列は内訳として読まない() {
+        let prose = I1273_IDLE_WITH_BACKGROUND.replace(
+            "✻ Worked for 1m 11s · done 2:54 PM · 1 shell, 1 monitor still running",
+            "⏺ ビルド · the dev server is still running",
+        );
+        assert_eq!(
+            crate::orchestrator::wait::background_work_summary(&prose),
+            None
         );
     }
 

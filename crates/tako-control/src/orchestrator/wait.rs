@@ -1288,6 +1288,152 @@ pub fn screen_looks_idle(output: &str) -> bool {
     })
 }
 
+// --- 背景作業が残ったままの入力待ち（Issue #1273 / #289 の再発） ---
+
+/// 背景作業の残りを申告する状態行の suffix（#1273）。
+///
+/// claude 2.1.258 は入力欄の 1 つ上の状態行へ `` ` · ${内訳} still running` `` を継ぎ足す。
+/// **継ぎ足すのはターンが終わっているときだけ**で、背景作業の完了を待って
+/// 止まっているあいだは同じ行が完了待ちの案内に変わり、**この suffix は付かない**
+/// （実物の描画コードで確認: 継ぎ足しの条件が「完了待ちの案内を出していない」で
+/// ガードされている）。この描き分けがそのまま
+/// 「終わった（= idle）」と「待っている（= busy）」の区別になるので、
+/// **こちらで完了待ちの文言を照合する必要は無い**（#1015 の「語で判定しない」）。
+/// 万一 suffix と完了待ちが同時に出る設定があっても、
+/// そのときは生成中の目印が出ているので [`screen_looks_busy`] が先に止める
+const BACKGROUND_STILL_RUNNING: &str = " still running";
+
+/// 内訳の 1 項目として認める語（数を伴わない形。#1273）。
+/// claude の内訳生成は「`<数> <名詞>`」が大半で、数を持たないのはこれらだけ
+const BACKGROUND_ITEM_WORDS: [&str; 3] = ["dreaming", "auto-mode scan", "ultraplan"];
+
+/// 内訳（`1 shell, 1 monitor` / `3 background tasks` 等）が claude の生成する形か（#1273）。
+///
+/// **文言では判定しない**（#1015 の規約）。claude 側の生成は
+/// 「`<数> <名詞>` をカンマで連ねる」か、数を持たない少数の固定語のどちらかなので、
+/// **その構造**だけを見る。会話本文にたまたま `· … still running` があっても、
+/// 内訳の位置が数で始まっていなければ拾わない
+fn looks_like_background_items(summary: &str) -> bool {
+    if summary.is_empty() || summary.chars().count() > 64 {
+        return false;
+    }
+    summary.split(',').all(|part| {
+        let part = part.trim();
+        if part.is_empty() {
+            return false;
+        }
+        if BACKGROUND_ITEM_WORDS.iter().any(|w| part.contains(w)) {
+            return true;
+        }
+        // `1 shell` / `2 shells` / `<glyph> 3 cloud sessions`。
+        // **数は先頭**（装飾グリフ 1 つだけ読み飛ばす）で、その後ろに名詞が要る。
+        // 「どこかに数がある」で通すと本文の `· step 3 still running` を拾う
+        let mut words = part.split_whitespace();
+        let Some(first) = words.next() else {
+            return false;
+        };
+        let count = match first.chars().any(char::is_alphanumeric) {
+            true => first,
+            false => words.next().unwrap_or_default(),
+        };
+        !count.is_empty() && count.chars().all(|c| c.is_ascii_digit()) && words.next().is_some()
+    })
+}
+
+/// 画面の状態行が申告している「まだ生きている背景作業」の内訳（#1273）。
+///
+/// 例: `✻ Worked for 1m 11s · done 2:54 PM · 1 shell, 1 monitor still running`
+/// → `Some("1 shell, 1 monitor")`
+///
+/// **狭いペインでは取れない**: claude はこの行をペイン幅で `…` に切るので、
+/// suffix ごと落ちると `None` になる（#1015 と同じ制約）。取れないときは
+/// 呼び出し側が従来どおり一次シグナルを信じる = 安全側に倒れる
+pub fn background_work_summary(output: &str) -> Option<String> {
+    tail_lines(output, BUSY_STRONG_TAIL)
+        .iter()
+        .find_map(|line| {
+            let head = line.rsplit_once(BACKGROUND_STILL_RUNNING)?.0;
+            // 状態行の組み立ては ` · <内訳> still running`。
+            // **区切りが無い行は本文とみなす**（`rsplit_once` は `·` が無ければ None）
+            let summary = head.rsplit_once('·')?.1.trim();
+            looks_like_background_items(summary).then(|| summary.to_string())
+        })
+}
+
+/// 一次シグナルが busy でも、画面が「ターンは終わっていて入力待ち・残っているのは
+/// 背景作業だけ」と決定的に言っているか（#1273）。言えるなら背景作業の内訳を返す。
+///
+/// ## なぜ要るか
+///
+/// claude 2.1.258 の `agents --json` は `isLoading || delegatedActive` で状態を決めるので、
+/// **背景シェル / Monitor が生きているあいだ busy を返し続ける**（2026-09-09 実測）。
+/// tako 側にはそこから idle へ戻る経路が無く、watch が `WORKER_IDLE` を出せなかった。
+/// #289 は同じ症状を「tako の `has_running_children` 補正が原因」と推定して直したが、
+/// 実際の生 status が busy だったのでその補正には一度も入らない（推定が実測されていなかった）。
+///
+/// ## 判定の優先順位（誤発火を増やさないための順序）
+///
+/// 1. **生成中の目印が 1 つでもあれば一次シグナルを疑わない**（`screen_looks_busy`）。
+///    claude は生成中も入力欄を描くので、空の `❯` があるだけでは入力待ちと言えない
+///    （既存テストが `screen_looks_idle(CLAUDE_BUSY_SCREEN_V2)` = true を固定している）
+/// 2. **折りたたみ画面は根拠にしない**（本文が欠けているので busy 側へ倒す）
+/// 3. **入力欄が空で実在する**こと（Issue の決定的兆候。`read_pane` の `input_status` と
+///    同じ `claude_tui` の 1 実装を通す）
+/// 4. **背景作業の残存が画面から読める**こと。ここまで揃って初めて
+///    「一次シグナルの busy は背景作業のせいだ」と説明がつく。説明がつかない busy は
+///    そのままにする
+pub fn input_waiting_with_background_work(
+    output: &str,
+    collapsed: bool,
+    agent: Option<Agent>,
+) -> Option<String> {
+    input_waiting_with_background_work_in(output, collapsed, agent, legacy_1273())
+}
+
+/// 旧挙動かどうかを明示して判定する（#1273 の A/B）。
+/// **判断を引数に置く**ので env グローバルを触らずに新旧どちらも検査できる
+/// （公開関数はこれに [`legacy_1273`] を渡すだけ = env が唯一の差になる）
+pub fn input_waiting_with_background_work_in(
+    output: &str,
+    collapsed: bool,
+    agent: Option<Agent>,
+    legacy: bool,
+) -> Option<String> {
+    if legacy {
+        return None;
+    }
+    // 系統の宣言（#982）。宣言の無い系統では画面の申告の形を実物で採っていない
+    let agent = agent?;
+    if !tako_core::agent_support::supports(
+        agent,
+        tako_core::agent_support::keys::WORKER_IDLE_WITH_BACKGROUND,
+    ) {
+        return None;
+    }
+    if collapsed {
+        return None;
+    }
+    // **判定器はパイプライン全体で同じものを使う**: ここだけ agent 指定版を使うと、
+    // dispatch が idle と言った画面を watch の再検査（`screen_looks_busy`）が busy と読み、
+    // idle_streak が永久に積まれない形になる
+    if screen_looks_busy(output) {
+        return None;
+    }
+    let lines: Vec<String> = output.lines().map(str::to_string).collect();
+    let input = crate::claude_tui::input_line(&lines)?;
+    if !crate::claude_tui::input_content_is_empty(input) {
+        return None;
+    }
+    background_work_summary(output)
+}
+
+/// #1273 の A/B。`TAKO_1273_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
+/// （一次シグナルの busy を画面で覆さない = 背景シェルが残るあいだ永久 busy）
+pub fn legacy_1273() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_1273_LEGACY").map(|v| v == "1") == Ok(true))
+}
+
 /// 画面テキストに permission ダイアログが実在すれば、その構造化 JSON を返す（#319 / #577）。
 ///
 /// `worker_status` の `permission_dialog` フィールドと watch のフォールバック判定で

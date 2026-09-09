@@ -313,6 +313,9 @@ pub mod keys {
     pub const WORKER_DELIVERY_PEER: &str = "worker_delivery_peer";
     /// 時間では解けない利用阻害（座席種別・管理者による無効化・組織ポリシー等）の検知
     pub const WORKER_ENTITLEMENT_DETECT: &str = "worker_entitlement_detect";
+    /// 背景作業（Bash の背景シェル・Monitor 等）が残っていても、
+    /// ターンが終わって入力待ちになったことを検知できるか（#1273）
+    pub const WORKER_IDLE_WITH_BACKGROUND: &str = "worker_idle_with_background";
     /// 利用上限からの自動復帰
     pub const WORKER_LIMIT_AUTORESUME: &str = "worker_limit_autoresume";
     /// 利用上限で止まったことの検知
@@ -498,6 +501,12 @@ pub mod notes {
     pub const NO_LOCAL_REFUSAL: Note = Note::new(
         "自分のマシンで動かすモデルなので、アカウントや座席の確認で実行を断られるという事象が起こらない（断る主体がそもそも存在しない）",
         "The model runs on your own machine, so it cannot be refused execution over an account or seat check: there is no party to refuse it",
+    );
+
+    /// #1273: 背景作業が残る入力待ちの画面を、この系統では実物で採っていない
+    pub const BACKGROUND_IDLE_NOT_MEASURED: Note = Note::new(
+        "背景作業が残ったまま入力待ちになった画面をこの系統では採取していない（claude の状態行と同じ形を出すか未確認）",
+        "A screen where this agent waits for input while background work is still alive has not been captured yet (whether it renders the same status line as claude is unknown)",
     );
 
     /// #1013: モデル名はベンダー固有の語彙なので、claude の既定を他系統へ渡せない
@@ -1267,6 +1276,31 @@ pub const MATRIX: &[AgentFeature] = &[
              `issue1107_codexの上限系は従来どおり時間で解ける扱い` が固定している。\
              **残高を 0 にして実際に踏ませる再現はしていない**（課金・管理者権限が要る）。\
              ローカル LLM にはベンダーの座席・クレジット・組織ポリシーが無い",
+        ),
+    },
+    AgentFeature {
+        key: keys::WORKER_IDLE_WITH_BACKGROUND,
+        summary: Note::new(
+            "背景作業（背景シェル・Monitor 等）が残っていても、ターンが終わって入力待ちになったことを検知する（#1273）",
+            "Detects that a turn has ended and the agent is waiting for input even while background work (background shells, monitors) is still alive (#1273)",
+        ),
+        claude: S::Supported,
+        codex: pending(notes::BACKGROUND_IDLE_NOT_MEASURED, 1277),
+        agy: pending(notes::BACKGROUND_IDLE_NOT_MEASURED, 1277),
+        local: local_pending_first_class(),
+        evidence: AgentEvidence::Measured(
+            "#1273（2026-09-09 実測）: claude 2.1.258 の `agents --json` は \
+             `isLoading || delegatedActive ? \"busy\" : \"idle\"` で状態を決め、\
+             **背景シェル / Monitor が生きているあいだ busy を返し続ける**。\
+             同時刻の本番 4 ペインで相関を確認: フッターに背景作業の申告がある 3 本 \
+             （`1 shell` / `2 shells` / `1 shell, 1 monitor`）はすべて busy、\
+             申告の無い 1 本だけが idle で、どれも入力欄は空・スピナー無し。\
+             よって tako 側は画面の状態行 `· <内訳> still running` を根拠に idle へ倒す。\
+             この行は claude 自身が **ターンが終わっているときだけ**継ぎ足す \
+             （背景作業の完了を待って止まっているあいだは `Waiting for … to finish` になり \
+             suffix が付かない = 実物の描画コードで確認）ので、\
+             「終わった」と「待っている」を取り違えない。codex / agy は同じ申告を出すか \
+             実物で採っていないので宣言しない（#1277）",
         ),
     },
     AgentFeature {
