@@ -3739,12 +3739,17 @@ skip の行に `script` のパスを出したので後から言い分けられ�
 > 照合のたびに 0 / 1 が入れ替わっていた（原因と実測は下の「#1114 の記録」）。
 > **状態待ちへ寄せて解消済み**なので、以後この 1 件が出たら本物の回帰として扱ってよい。
 >
-> **2026-09-09 更新 ②（#1264）**: main（`da6bf2f`）の時点で
-> **Windows の `cargo test --workspace` がコンパイルエラーで 1 件も走らない**
-> （#1199 が足したブロックが変数の無い関数に入っている）。ベースライン照合は
-> #1264 が直るまで**バイナリ単位**（`cargo test -p <crate> --test <name>`）で行うこと。
-> CI がすり抜けるのは Windows のテストが `continue-on-error: true`（#583）で、
-> `cargo build --workspace` は `tests/` をコンパイルしないため。
+> **2026-09-09 更新 ②（#1264。解消済み）**: main（`da6bf2f`〜`0b7bd21`）の時点で
+> **Windows の `cargo test --workspace` がコンパイルエラーで 1 件も走らなかった**
+> （#1199 が足したブロックが変数の無い関数に入り `E0425` × 3。実機実測:
+> `cargo test --workspace --no-run` が **263 秒で exit 101**）。ブロックを本来の関数
+> （`器の中でも側路を張れば状態とcwdが届く`）へ移して解消した。
+>
+> CI がすり抜けたのは Windows のテストが `continue-on-error: true`（#583）で、
+> `cargo build --workspace` は `tests/` をコンパイルしないため。**同じ穴は
+> `cargo test --workspace --no-run` を blocking ステップとして塞いだ**
+> （番犬 `crates/tako-control/tests/ci_windows_test_compile.rs`）。
+> macOS からの先行検出は `scripts/check-windows.sh --tests`（作法 10 と同じ）。
 
 **2026-09-02 のベースラインは件数だけで名前を残していない**ので厳密な集合差は取れない。
 以後のために**失敗名の一覧をここへ残す**（24 件。内訳は POSIX 前提のテスト = symlink /

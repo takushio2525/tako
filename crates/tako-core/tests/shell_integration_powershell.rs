@@ -455,40 +455,11 @@ fn 器の中では統合が読み込まれてもoscが外へ出ない() {
     // 統合が動いていれば OSC 133 で Idle になるはず。**器を通らないので Unknown のまま**
     pane.send_line("cmd.exe /c exit 3");
     let leaked = pane.wait_state(CommandState::Failed(3), Duration::from_secs(15));
-    // #1199: 器の中の**別のシェル**（psmux のプリウォーム済みプール）が同じペインの
-    // 側路へ書いても、そのペインの cwd は動いてはいけない。器はペイン固有の env を
-    // グローバル環境へ入れるので、旧実装（パスだけの待ち合わせ）ではウォームプールの
-    // シェルが `OSC 7 <ホーム>` を書き、リサイズごとに cwd がホームへ巻き戻っていた
-    let foreign_home = std::env::temp_dir().join("tako-1199-foreign");
-    let foreign = tako_core::osc_sink::writer_sink_path(&data_dir, 1, 999_999);
-    let bundle = format!(
-        "\x1b]7;file:///{}\x07",
-        foreign_home.display().to_string().replace('\\', "/")
-    );
-    std::fs::write(&foreign, bundle.as_bytes()).expect("別のシェルのぶんを置ける");
-    for _ in 0..10 {
-        pane.pump();
-        pane.drain_sink(&mut reader);
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let cwd_after_foreign = pane.session.cwd().map(Path::to_path_buf);
-
     let screen = pane.screen();
     let state = pane.session.command_state();
     let cwd = pane.session.cwd().map(Path::to_path_buf);
     drop(pane);
     cleanup();
-    let _ = std::fs::remove_file(&foreign);
-
-    assert!(
-        writer_pid.is_some(),
-        "器が `#{{pane_pid}}` を答えない（#1199。側路の待ち合わせ先を張れない =          cwd 追従とコマンド状態が届かなくなる）"
-    );
-    assert_eq!(
-        cwd_after_foreign, cwd,
-        "器の中の別のシェルが書いたぶんでペインの cwd が動いた（#1199 の巻き戻り）"
-    );
-
     assert!(started, "器の中でシェルが起動しない\n{screen}");
     assert!(
         !leaked,
@@ -663,6 +634,28 @@ fn 器の中でも側路を張れば状態とcwdが届く() {
             break;
         }
     }
+    // ④ #1199: 器の中の**別のシェル**（psmux のプリウォーム済みプール）が同じペインの
+    // 側路へ書いても、そのペインの cwd は動いてはいけない。器はペイン固有の env を
+    // サーバーのグローバル環境へ入れるので、旧実装（パスだけの待ち合わせ）では
+    // ウォームプールのシェルが `OSC 7 <ホーム>` を書き、リサイズのたびに
+    // ペインの cwd がホームへ巻き戻っていた。
+    //
+    // **比べる相手は「書く前の cwd」**にする。書いた後の値を 2 回読んで比べると、
+    // 巻き戻っていても両方が巻き戻り先を指すので必ず等しくなり検証にならない
+    let cwd_before_foreign = pane.session.cwd().map(Path::to_path_buf);
+    let foreign_home = std::env::temp_dir().join("tako-1199-foreign");
+    let foreign = tako_core::osc_sink::writer_sink_path(&data_dir, 1, 999_999);
+    let bundle = format!(
+        "\x1b]7;file:///{}\x07",
+        foreign_home.display().to_string().replace('\\', "/")
+    );
+    std::fs::write(&foreign, bundle.as_bytes()).expect("別のシェルのぶんを置ける");
+    for _ in 0..10 {
+        pane.pump();
+        pane.drain_sink(&mut reader);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let cwd_after_foreign = pane.session.cwd().map(Path::to_path_buf);
 
     let screen = pane.screen();
     let state = pane.session.command_state();
@@ -670,6 +663,13 @@ fn 器の中でも側路を張れば状態とcwdが届く() {
     drop(pane);
     cleanup();
 
+    // 器が `#{pane_pid}` を答えないと側路の待ち合わせ先を張れない（#1199）。
+    // ここが偽なら以下の 3 本も必ず落ちるので、原因が分かる形で先に見る
+    assert!(
+        writer_pid.is_some(),
+        "器が `#{{pane_pid}}` を答えない（#1199。側路の待ち合わせ先を張れない = \
+         cwd 追従とコマンド状態が届かなくなる）\n{screen}"
+    );
     assert!(idle, "側路で 133;A が届かない（state={state:?}）\n{screen}");
     assert!(
         failed,
@@ -682,6 +682,11 @@ fn 器の中でも側路を張れば状態とcwdが届く() {
     assert!(
         followed,
         "側路で OSC 7 が届かない（cwd={cwd:?} 期待={leaf}）\n{screen}"
+    );
+    assert_eq!(
+        cwd_after_foreign, cwd_before_foreign,
+        "器の中の別のシェルが書いたぶんでペインの cwd が動いた（#1199 の巻き戻り。\
+         別のシェルの書き先={foreign:?} その cwd={foreign_home:?}）\n{screen}"
     );
 
     // 器の能力申告は変えていない: psmux は今も素通ししない（側路がそれを補っている）
