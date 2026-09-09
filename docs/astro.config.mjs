@@ -35,6 +35,16 @@ export default defineConfig({
 						{ label: 'クイックスタート', slug: 'getting-started/quickstart' },
 						{ label: 'リリースノート', slug: 'releases' },
 						{ label: 'Windows 対応状況', slug: 'windows-support' },
+					],
+				},
+				{
+					label: 'エージェント CLI',
+					items: [
+						{ label: 'エージェントの選び方', slug: 'agents' },
+						{ label: 'Claude Code', slug: 'agents/claude' },
+						{ label: 'OpenAI Codex CLI', slug: 'agents/codex' },
+						{ label: 'Antigravity CLI', slug: 'agents/agy' },
+						{ label: 'ローカル LLM', slug: 'agents/local-llm' },
 						{ label: 'エージェント別の対応状況', slug: 'agent-support' },
 					],
 				},

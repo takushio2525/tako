@@ -3,6 +3,12 @@
   "width": 1200,
   "height": 630,
   "pages": {
+    "/agent-support/": "/og/agent-support.png",
+    "/agents/agy/": "/og/agents-agy.png",
+    "/agents/claude/": "/og/agents-claude.png",
+    "/agents/codex/": "/og/agents-codex.png",
+    "/agents/": "/og/agents.png",
+    "/agents/local-llm/": "/og/agents-local-llm.png",
     "/development/architecture/": "/og/development-architecture.png",
     "/development/building/": "/og/development-building.png",
     "/features/file-preview/": "/og/features-file-preview.png",
