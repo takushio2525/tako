@@ -195,6 +195,7 @@ CI（`.github/workflows/ci.yml`）は macOS / Windows の両ランナーで buil
 - agent 種別 enum の対応表（統合しない理由・寄せ先一覧）: `.agent/agent-enums.md`
 - 手動確認チェックリスト（IME・.app 等、機械検証できない項目）: `.agent/manual-checks.md`
 - オーケストレーター使い方ガイド: `.agent/orchestrator.md`
+- 解説動画 / X 向けショートの作り方: `.agent/plans/2026-09-youtube-explainer.md` / `.agent/plans/2026-09-x-short.md`
 
 ### 作業履歴メモ（毎ターン参照・更新）
 

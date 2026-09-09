@@ -22,6 +22,69 @@
 - PII ゼロ: 全フレームを Vision OCR にかけ、メール / 実ホームパス / ユーザー名 / ホスト名 /
   tailnet / トークン / UUID の各パターンが 0 件になるまで「完成」と言わない
 
+## v6（現行）: スライド主軸への方針転換（2026-09-09 20:45・ユーザー指示）
+
+> 実 UI の画面収録を主軸にした v1〜v5 の構成は**採らない**。以下が現行の作り方。
+> 下の「構成（8 章 …）」以降は v1〜v5 の記録で、罠と裏取りは今も有効だが、
+> **章立てとタイムラインの正本は `scripts/promo/explainer-timeline-v6.tsv`**。
+
+ユーザーの言葉:
+
+> 解説動画見ました．方針転換で，今は実UI１００パーでやってると思うんだけど，そうじゃなく，
+> 普通にもうちょいスライドっぽく，UIじゃなくてわかりやすくHTMLっぽい感じでわかりやすく図で
+> 解説しつつ，実UIも織り交ぜる感じで解説するようにして欲しい
+
+- **主軸は HTML / CSS のスライドと SVG 図解**。実 UI は「実物を見せると伝わる」場面にだけ挿す
+- **小さなサブタイトル行は全廃**（同日の追加指示）。テロップは大見出しだけ。
+  タイムラインの `subtitle` 列は常に `-`
+- 実測の効果: **実 UI の割合 92.2%（v4・665 秒）→ 37.6%（v6・192 秒）**
+
+### 作り方（3 段）
+
+| 段 | もの | コマンド |
+|---|---|---|
+| 1 | スライドを描く | `node scripts/promo/render-slides.mjs`（HTML → PNG 1920x1080） |
+| 2 | ナレーションを作る | `bash scripts/promo/narrate.sh scripts/promo/explainer-timeline-v6.tsv ~/Desktop/tako-promo/audio/narr-v6` |
+| 3 | 組む | `TAKO_PROMO_TIMELINE=scripts/promo/explainer-timeline-v6.tsv TAKO_PROMO_NARR=~/Desktop/tako-promo/audio/narr-v6 bash scripts/promo/build-explainer.sh ~/Desktop/tako-promo/tako-explainer-v6.mp4` |
+
+- スライドのソースは `scripts/promo/slides/deck.html` + `deck.css`（1 section = 1 枚 = 1920x1080）。
+  配色は `titlecard.swift` と同じ tako ダークテーマ（`#0d1117`→`#161b22` / アクセント `#ed598c`）。
+  **アイコンは絵文字を使わず SVG / CSS 図形で描く**（ブランド方針）
+- 描画は**実機の Google Chrome**（`channel: 'chrome'`）。Playwright 同梱の Chromium は
+  実機に落ちていないので、動画のために 150MB のブラウザを増やさない。
+  `TAKO_SLIDE_CHROME` で実行ファイルを明示もできる
+- `render-slides.mjs` は撮る前に**実寸 1920x1080** と**中身のはみ出し**を検査して落とす
+  （実測: 見出しと注記の長さで 4 枚が 1102px になっていたのをここで捕まえた）
+- `build-explainer.sh` に `kind=slide` を足した。PNG が無ければ preflight で落ちる（#1214 と同じ思想）
+
+### v6 の構成表（46 区間 = スライド 28 / 実 UI 18・8 分 29 秒）
+
+| 章 | スライド（図解） | 挿し込む実 UI（素材 / ビート / 秒） |
+|---|---|---|
+| 0 オープニング | タイトル | `master` report_done+2（9 秒） |
+| 1 課題 | 章扉 / 4 つに分裂 / 散らばる / 自前の配線 / 1 グループ = 1 タブ | `scatter` tabs（7 秒）/ `scatter` collect（7 秒） |
+| 2 思想 | 章扉 / 原則 1・2・3 | `agent` req1（14 秒）/ `control` theme_light（11 秒） |
+| 3 導入 | 章扉 / 導入の流れ / AI 未導入からでも | `setup` setup（13 秒） |
+| 4 基本操作 | 章扉 / 画面の作り | `basics` split_right・md・run（各 9〜10 秒） |
+| 5 AI に任せる | 章扉 / master→worker の流れ / 投げっぱなしにしない | `master` request・workers_up・orch（9〜13 秒） |
+| 6 かんたん表示 | 章扉 / 3 つのボタン / 担当 AI が隣に並ぶ | `guimode` 42.11s・118.54s（9〜12 秒） |
+| 7 永続化 | 章扉 / tmux バックエンド | `restore-after` 0（12 秒） |
+| 8 スマホ | 章扉 / tailnet と二層認証 | `pwa` list（11 秒）/ `remote` profile（14 秒） |
+| 9 Windows と OSS | 章扉 / 対応の書き方 | `windows` winsupport（10 秒） |
+| 10 クロージング | brew 1 行 + URL | — |
+
+**`c5_gui10`（担当 AI のペインが隣に生える実写）は不要になった**。v5 で唯一足りなかった
+この絵は、スライド `s_c6_grow` の図解が担う。**撮り直しは 1 回も要らない**（v1〜v4 の素材だけで
+v6 が完成した）ので、#1081 の長期ブロッカーだった「画面ロック待ち」はここで解消した。
+
+### guimode 素材のビート表に注意（2026-09-09 20:29 実測）
+
+`scenes/guimode-beats.tsv` が **01:23 の mp4 と対応していない**。20:27 頃に別セッションが
+収録を試みて途中で終わり、ビート 9 件だけを書いた新しい表が残っている（`ask` が
+131.61 → 137.79 秒などズレる）。**mp4 に対応する正しい表は `guimode-beats.prev.tsv`**。
+v6 のタイムラインは事故を避けるため、guimode の 2 区間だけ**秒数を直接**指定している
+（`42.11` / `118.54`。`beat_time` は数値の anchor をそのまま受け取る）。
+
 ## 構成（8 章 + オープニング / クロージング）
 
 | # | 章 | 見せる実画面 | 主張（要約） |

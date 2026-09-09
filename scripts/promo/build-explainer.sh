@@ -25,7 +25,10 @@ source "$SCRIPT_DIR/lib.sh"
 OUT=${1:-"$PROMO_OUT/tako-explainer-v1.mp4"}
 TSV=${TAKO_PROMO_TIMELINE:-"$SCRIPT_DIR/explainer-timeline.tsv"}
 SCENES_DIR="$PROMO_OUT/scenes"
-NARR_DIR="$PROMO_OUT/audio/narr"
+# v6（#1081）のスライド PNG。scripts/promo/render-slides.mjs が HTML から描く
+SLIDES_DIR=${TAKO_PROMO_SLIDES:-"$PROMO_OUT/slides"}
+# v6 は別台本なのでナレーションも別ディレクトリ（v4 の 57 本を壊さない）
+NARR_DIR=${TAKO_PROMO_NARR:-"$PROMO_OUT/audio/narr"}
 BGM="$PROMO_OUT/audio/bgm-explainer.wav"
 # ナレーションの声のクレジット（VOICEVOX 利用規約）。エンジンが応答すればそこから引き、
 # 応答しなければ環境変数の値を使う（合成済みの wav から再合成せずに組めるようにする）。
@@ -37,7 +40,7 @@ VOICE_CREDIT=${TAKO_PROMO_VOICE_CREDIT-$(
 WORK=/private/tmp/tako-promo-explainer-build
 W=1920; H=1080; FPS=30
 PAD_AFTER_SPEECH=${TAKO_PROMO_PAD:-0.8}
-CAPTION_FONT_PX=52
+CAPTION_FONT_PX=${TAKO_PROMO_CAPTION_PX:-52}
 
 CAPTION_BIN=/private/tmp/tako-promo-caption
 TITLE_BIN=/private/tmp/tako-promo-titlecard
@@ -47,7 +50,12 @@ for pair in "caption.swift:$CAPTION_BIN" "titlecard.swift:$TITLE_BIN"; do
         swiftc -O -o "$bin" "$SCRIPT_DIR/$src" || { echo "ERROR: $src のコンパイルに失敗" >&2; exit 1; }
     fi
 done
-[ -f "$NARR_DIR/durations.tsv" ] || { echo "ERROR: ナレーションが無い。先に scripts/promo/narrate.sh を実行" >&2; exit 1; }
+# ナレーション無しで組む構成（#1284 の X 向けショート = 無音再生前提で字幕が意味を運ぶ）は
+# TAKO_PROMO_NO_NARR=1 を立てる。既定は今までどおりナレーション必須。
+NO_NARR=${TAKO_PROMO_NO_NARR:-0}
+if [ "$NO_NARR" != 1 ]; then
+    [ -f "$NARR_DIR/durations.tsv" ] || { echo "ERROR: ナレーションが無い。先に scripts/promo/narrate.sh を実行" >&2; exit 1; }
+fi
 
 rm -rf "$WORK"; mkdir -p "$WORK"
 mkdir -p "$(dirname "$OUT")"
@@ -61,7 +69,10 @@ beat_time() {
     awk -F'\t' -v n="$anchor" '$1==n {print $2; found=1; exit} END {if (!found) exit 1}' "$f" \
         || { echo "ERROR: ビート $anchor が $f に無い" >&2; return 1; }
 }
-narr_dur() { awk -F'\t' -v id="$1" '$1==id {print $2; exit}' "$NARR_DIR/durations.tsv"; }
+narr_dur() {
+    [ -f "$NARR_DIR/durations.tsv" ] || return 0
+    awk -F'\t' -v id="$1" '$1==id {print $2; exit}' "$NARR_DIR/durations.tsv"
+}
 fnum() { /usr/bin/python3 -c "print(f'{$1:.3f}')"; }
 
 # ── 前提の検査（エンコードの前に落ちる）─────────────────────────────
@@ -72,8 +83,13 @@ fnum() { /usr/bin/python3 -c "print(f'{$1:.3f}')"; }
 # 制作中に部分ビルドをしたいときだけ `TAKO_PROMO_ALLOW_MISSING=1` を付ける
 preflight=()
 while IFS=$'\t' read -r id kind source anchor offset min_dur caption subtitle speech; do
-    [ "$kind" = clip ] || continue
     source=$(promo_tl_field "$source")
+    # スライド（v6）は HTML から描いた PNG が要る。描き忘れたまま組まない
+    if [ "$kind" = slide ]; then
+        [ -f "$SLIDES_DIR/$source.png" ] || preflight+=("${id}: スライド ${source}.png が無い")
+        continue
+    fi
+    [ "$kind" = clip ] || continue
     if [ ! -f "$SCENES_DIR/$source-raw.mp4" ]; then
         preflight+=("${id}: 素材 ${source}-raw.mp4 が無い"); continue
     fi
@@ -112,6 +128,14 @@ while IFS=$'\t' read -r id kind source anchor offset min_dur caption subtitle sp
         "$TITLE_BIN" "$png" "$W" "$H" "$caption" "$subtitle" "$source" "$card_footer"
         ffmpeg -nostdin -v error -y -loop 1 -framerate "$FPS" -t "$dur" -i "$png" \
             -vf "format=yuv420p,fade=t=in:st=0:d=0.5,fade=t=out:st=${fo_start}:d=0.6" \
+            -c:v libx264 -preset medium -crf 18 -pix_fmt yuv420p -r "$FPS" "$seg"
+        ;;
+    slide)
+        # HTML から描いた 1920x1080 の PNG をそのまま尺ぶん流す。
+        # 文字はスライド自身が持っているのでテロップは重ねない（v6）
+        png="$SLIDES_DIR/$source.png"
+        ffmpeg -nostdin -v error -y -loop 1 -framerate "$FPS" -t "$dur" -i "$png" \
+            -vf "scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=0x0d1117,setsar=1,format=yuv420p,fade=t=in:st=0:d=0.4,fade=t=out:st=${fo_start}:d=0.5" \
             -c:v libx264 -preset medium -crf 18 -pix_fmt yuv420p -r "$FPS" "$seg"
         ;;
     clip)
@@ -178,7 +202,16 @@ for i in "${!ids[@]}"; do
     printf '[%d:a]adelay=%d|%d[n%d];\n' "$n" "$ms" "$ms" "$n" >> "$fc"
     mix+="[n$n]"; n=$((n + 1))
 done
-[ "$n" -gt 0 ] || { echo "ERROR: ナレーション wav が 1 つも無い" >&2; exit 1; }
+if [ "$n" = 0 ]; then
+    if [ "$NO_NARR" != 1 ]; then
+        echo "ERROR: ナレーション wav が 1 つも無い" >&2; exit 1
+    fi
+    # 無音前提の構成: ナレーションのバスを作らず BGM だけを敷く
+    echo "   ナレーション無し（TAKO_PROMO_NO_NARR=1）。BGM のみで組む"
+    narr_only="$WORK/narr.wav"
+    ffmpeg -nostdin -v error -y -f lavfi -i "anullsrc=r=48000:cl=stereo" -t "$VDUR" "$narr_only"
+fi
+if [ "$n" -gt 0 ]; then
 # ナレーションのバスを目標ラウドネスへそろえる。**固定ゲインで持ち上げてはいけない**:
 # 声を替えるとクレストファクタが変わるので、同じピークにそろえてもラウドネスは一致しない
 # （実測: ピーク -12.3dB で say は -25.3 LUFS・VOICEVOX/ずんだもんは -31.9 LUFS = 6.6dB 差）。
@@ -202,6 +235,7 @@ if [ -n "$narr_i" ]; then
 else
     echo "!! ナレーションのラウドネスを測れなかった。ゲイン調整なしで進む" >&2
     cp "$narr_flat" "$narr_only"
+fi
 fi
 
 mixwav="$WORK/mix.wav"
@@ -239,7 +273,7 @@ ffmpeg -nostdin -v error -y -i "$video" -i "$mixwav" -filter_complex "[1:a]${afi
 chap="$WORK/chapters.txt"; : > "$chap"
 for i in "${!ids[@]}"; do
     case "${ids[$i]}" in
-    op_card|c*_card|outro_card)
+    op_card|c*_card|outro_card|op_title|c?_title|outro)
         s=${starts[$i]}
         /usr/bin/python3 -c "s=int(round($s)); print(f'{s//60:02d}:{s%60:02d}  ${ids[$i]}')" >> "$chap"
         ;;

@@ -1,0 +1,513 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>tako 解説動画 v6 スライド</title>
+<link rel="stylesheet" href="deck.css">
+<!-- tako 解説動画 v6（#1081）のスライド。1 section = 1 枚 = 1920x1080。
+     render-slides.mjs が id ごとに PNG を書き出し、build-explainer.sh の kind=slide が使う。
+     主張は .agent/concept.md と plan の「訴求と裏取り」を正とする。絵文字は使わない。 -->
+
+<svg id="svg-defs" aria-hidden="true"><defs>
+  <marker id="a1" markerWidth="11" markerHeight="11" refX="9.5" refY="5.5" orient="auto">
+    <path d="M0,0 L11,5.5 L0,11 z" fill="#ed598c"/></marker>
+  <marker id="a2" markerWidth="11" markerHeight="11" refX="9.5" refY="5.5" orient="auto">
+    <path d="M0,0 L11,5.5 L0,11 z" fill="rgba(255,255,255,0.5)"/></marker>
+</defs></svg>
+
+<section class="slide hero" id="s_title">
+  <div class="body hero">
+    <div>
+      <div class="wordmark">tako</div>
+      <div class="tagline">AI エージェント時代の GUI ターミナル</div>
+      <div class="lede" style="margin-top:44px">1 グループ = 1 タブ。エージェントの群れを、1 つの画面で集約監視する。</div>
+    </div>
+  </div>
+  <div class="note">github.com/takushio2525/tako　/　GPL-3.0-or-later</div>
+</section>
+
+<!-- ここから下は X 向けショート（#1284）専用のスライド -->
+<section class="slide hero" id="s_x_hook">
+  <div class="body hero">
+    <div>
+      <div class="eyebrow" style="font-size:34px">AI エージェントで開発すると</div>
+      <h1 style="font-size:104px;margin-top:12px">画面が、散らかる。</h1>
+      <div class="lede" style="font-size:40px;margin-top:36px">エージェント本体・子エージェント・dev サーバー・ログ。<br>1 つの作業が、いくつものタブとウインドウに分かれていく。</div>
+    </div>
+  </div>
+</section>
+
+<section class="slide hero" id="s_x_solve">
+  <div class="body hero">
+    <div>
+      <div class="eyebrow" style="font-size:34px">tako の答え</div>
+      <h1 style="font-size:104px;margin-top:12px">1 グループ = 1 タブ。</h1>
+      <div class="lede" style="font-size:40px;margin-top:36px">AI が起こしたものは、全部おなじタブに生える。<br>だから、いま何が動いているかが一目で分かる。</div>
+    </div>
+  </div>
+</section>
+
+<section class="slide chapter" id="s_c1_title">
+  <div class="body chapter">
+    <div>
+      <div class="num">1</div>
+      <h1>課題</h1>
+      <div class="lede">AI に任せるほど、画面が散らかる</div>
+    </div>
+  </div>
+</section>
+
+<section class="slide" id="s_c1_split">
+  <div class="eyebrow">1. 課題</div>
+  <h2>1 つの作業が、4 つに分裂する</h2>
+  <div class="body">
+    <svg viewBox="0 0 1660 660">
+  <rect class="box-accent" x="0" y="235" width="390" height="190" rx="18"/>
+  <text class="lbl-lg" x="195" y="315" text-anchor="middle">あなたの依頼</text>
+  <text class="lbl-sm" x="195" y="360" text-anchor="middle">「この機能を作って」</text>
+  <path class="arrow-accent" d="M400 330 L495 330" marker-end="url(#a1)"/>
+  <path class="arrow" d="M510 75 L510 585"/>
+  <rect class="box" x="560" y="10" width="620" height="130" rx="16"/>
+  <text class="lbl" x="870" y="85" text-anchor="middle">エージェント本体</text>
+  <rect class="box" x="560" y="180" width="620" height="130" rx="16"/>
+  <text class="lbl" x="870" y="255" text-anchor="middle">子エージェント</text>
+  <rect class="box" x="560" y="350" width="620" height="130" rx="16"/>
+  <text class="lbl" x="870" y="425" text-anchor="middle">dev サーバー</text>
+  <rect class="box" x="560" y="520" width="620" height="130" rx="16"/>
+  <text class="lbl" x="870" y="595" text-anchor="middle">ログ監視</text>
+  <path class="arrow" d="M510 75 L545 75" marker-end="url(#a2)"/>
+  <path class="arrow" d="M510 245 L545 245" marker-end="url(#a2)"/>
+  <path class="arrow" d="M510 415 L545 415" marker-end="url(#a2)"/>
+  <path class="arrow" d="M510 585 L545 585" marker-end="url(#a2)"/>
+  <text class="lbl-sm" x="1240" y="300">それぞれが別プロセスとして</text>
+  <text class="lbl-sm" x="1240" y="345">動きつづける</text>
+</svg>
+  </div>
+</section>
+
+<section class="slide" id="s_c1_scatter">
+  <div class="eyebrow">1. 課題</div>
+  <h2>既存のターミナルでは、タブとウインドウに散らばる</h2>
+  <div class="body">
+    <svg viewBox="0 0 1660 660">
+  <rect class="box" x="10" y="40" width="500" height="330" rx="16"/>
+  <rect x="10" y="40" width="500" height="52" rx="16" fill="rgba(255,255,255,0.09)"/>
+  <text class="lbl-sm" x="38" y="74">ウインドウ 1</text>
+  <text class="lbl" x="260" y="235" text-anchor="middle">エージェント本体</text>
+  <rect class="box" x="560" y="180" width="500" height="330" rx="16"/>
+  <rect x="560" y="180" width="500" height="52" rx="16" fill="rgba(255,255,255,0.09)"/>
+  <text class="lbl-sm" x="588" y="214">ウインドウ 2</text>
+  <text class="lbl" x="810" y="375" text-anchor="middle">子エージェント</text>
+  <rect class="box" x="1110" y="10" width="500" height="330" rx="16"/>
+  <rect x="1110" y="10" width="500" height="52" rx="16" fill="rgba(255,255,255,0.09)"/>
+  <text class="lbl-sm" x="1138" y="44">ウインドウ 3</text>
+  <text class="lbl" x="1360" y="205" text-anchor="middle">dev サーバー</text>
+  <rect class="box" x="1000" y="330" width="500" height="320" rx="16"/>
+  <rect x="1000" y="330" width="500" height="52" rx="16" fill="rgba(255,255,255,0.09)"/>
+  <text class="lbl-sm" x="1028" y="364">ウインドウ 4</text>
+  <text class="lbl" x="1250" y="520" text-anchor="middle">ログ</text>
+  <rect class="box" x="120" y="420" width="500" height="230" rx="16"/>
+  <rect x="120" y="420" width="500" height="52" rx="16" fill="rgba(255,255,255,0.09)"/>
+  <text class="lbl-sm" x="148" y="454">ウインドウ 5</text>
+  <text class="lbl" x="370" y="570" text-anchor="middle">別のプロジェクト</text>
+</svg>
+  </div>
+  <div class="note">どこで何が動いているのか、誰が止まっているのか。追いかけるだけで手間がかかる。</div>
+</section>
+
+<section class="slide" id="s_c1_wire">
+  <div class="eyebrow">1. 課題</div>
+  <h2>AI に操作させるにも、繋ぎ込みが要る</h2>
+  <div class="body">
+    <div class="cards">
+      <div class="card"><div class="k">従来</div><div class="t">tmux</div>
+        <div class="d">セッションとペインを自分で組む</div></div>
+      <div class="card"><div class="k">従来</div><div class="t">スクリプト</div>
+        <div class="d">起動・送信・回収を自前で書く</div></div>
+      <div class="card"><div class="k">従来</div><div class="t">MCP 設定</div>
+        <div class="d">プロジェクトごとに登録して回る</div></div>
+    </div>
+  </div>
+  <div class="note">やりたいのは開発なのに、その手前の配線に時間がかかる。</div>
+</section>
+
+<section class="slide" id="s_c1_answer">
+  <div class="eyebrow">1. 課題</div>
+  <h2>tako の答え: 1 グループ = 1 タブ</h2>
+  <div class="body">
+    <svg viewBox="0 0 1660 660">
+  <rect class="box-tab" x="10" y="10" width="1640" height="640" rx="22"/>
+  <rect x="10" y="10" width="1640" height="66" rx="22" fill="rgba(78,201,166,0.18)"/>
+  <text class="lbl" x="46" y="54">1 つのタブ = 1 つの作業グループ</text>
+  <rect class="box-accent" x="44" y="110" width="520" height="500" rx="16"/>
+  <text class="lbl-lg" x="304" y="345" text-anchor="middle">エージェント本体</text>
+  <text class="lbl-sm" x="304" y="392" text-anchor="middle">ここから全部が生える</text>
+  <rect class="box" x="600" y="110" width="500" height="240" rx="16"/>
+  <text class="lbl" x="850" y="240" text-anchor="middle">子エージェント</text>
+  <rect class="box" x="600" y="370" width="500" height="240" rx="16"/>
+  <text class="lbl" x="850" y="500" text-anchor="middle">dev サーバー</text>
+  <rect class="box" x="1136" y="110" width="478" height="500" rx="16"/>
+  <text class="lbl" x="1375" y="345" text-anchor="middle">ログ / プレビュー</text>
+</svg>
+  </div>
+  <div class="note">散らばっていたものが、同じタブのペインとして並ぶ。</div>
+</section>
+
+<section class="slide chapter" id="s_c2_title">
+  <div class="body chapter">
+    <div><div class="num">2</div><h1>tako の思想</h1>
+    <div class="lede">3 つの原則で作られている</div></div>
+  </div>
+</section>
+
+<section class="slide" id="s_c2_p1">
+  <div class="eyebrow">原則 1</div>
+  <h2>1 グループ = 1 タブ</h2>
+  <div class="body">
+    <svg viewBox="0 0 1660 660">
+  <rect class="box-accent" x="10" y="230" width="400" height="200" rx="18"/>
+  <text class="lbl-lg" x="210" y="310" text-anchor="middle">日本語で頼む</text>
+  <text class="lbl-sm" x="210" y="358" text-anchor="middle">「dev サーバー立てて」</text>
+  <path class="arrow-accent" d="M424 330 L514 330" marker-end="url(#a1)"/>
+  <rect class="box" x="530" y="230" width="400" height="200" rx="18"/>
+  <text class="lbl-lg" x="730" y="310" text-anchor="middle">AI が内蔵 MCP を呼ぶ</text>
+  <text class="lbl-sm" x="730" y="358" text-anchor="middle">tako_split_pane ほか</text>
+  <path class="arrow-accent" d="M944 330 L1034 330" marker-end="url(#a1)"/>
+  <rect class="box-tab" x="1050" y="60" width="600" height="540" rx="18"/>
+  <rect x="1050" y="60" width="600" height="58" rx="18" fill="rgba(78,201,166,0.18)"/>
+  <text class="lbl-sm" x="1080" y="98">呼び出し元と同じタブ</text>
+  <rect class="box" x="1086" y="150" width="260" height="180" rx="14"/>
+  <text class="lbl-sm" x="1216" y="248" text-anchor="middle">エージェント</text>
+  <rect class="box" x="1364" y="150" width="260" height="180" rx="14"/>
+  <text class="lbl-sm" x="1494" y="248" text-anchor="middle">dev サーバー</text>
+  <rect class="box" x="1086" y="356" width="538" height="212" rx="14"/>
+  <text class="lbl-sm" x="1355" y="470" text-anchor="middle">プレビュー</text>
+</svg>
+  </div>
+  <div class="note">AI が起こした子プロセスのペインは、必ず呼び出し元と同じタブに生える。</div>
+</section>
+
+<section class="slide" id="s_c2_p2">
+  <div class="eyebrow">原則 2</div>
+  <h2>ゼロコンフィグ</h2>
+  <div class="body">
+    <div style="width:100%">
+      <div class="cards">
+        <div class="card"><div class="k">従来</div><div class="t">プロジェクトごとに<br>MCP を登録</div>
+          <div class="d">設定ファイルを開いて、パスを書いて、起動し直す</div></div>
+        <div class="card accent"><div class="k">tako</div><div class="t">MCP サーバーが<br>内蔵されている</div>
+          <div class="d">初回に登録するだけ。以後どのプロジェクトでも設定は要らない</div></div>
+      </div>
+      <div class="note" style="margin-top:38px">公開しているツールは 144 個。ペイン操作・ファイル・git・オーケストレーションまで AI から呼べる。</div>
+    </div>
+  </div>
+</section>
+
+<section class="slide" id="s_c2_p3">
+  <div class="eyebrow">原則 3</div>
+  <h2>AI フルコントロール</h2>
+  <div class="body">
+    <svg viewBox="0 0 1660 660">
+  <rect class="box" x="10" y="90" width="480" height="480" rx="20"/>
+  <text class="lbl-lg" x="250" y="200" text-anchor="middle">人間</text>
+  <text class="lbl-sm" x="250" y="262" text-anchor="middle">GUI で操作する</text>
+  <rect x="70" y="330" width="360" height="70" rx="12" fill="rgba(255,255,255,0.08)"/>
+  <text class="lbl-sm" x="250" y="375" text-anchor="middle">クリック / キーボード</text>
+  <rect class="box-accent" x="590" y="90" width="480" height="480" rx="20"/>
+  <text class="lbl-lg" x="830" y="200" text-anchor="middle">tako</text>
+  <text class="lbl-sm" x="830" y="262" text-anchor="middle">操作 API は 1 本だけ</text>
+  <rect x="650" y="330" width="360" height="70" rx="12" fill="rgba(237,89,140,0.22)"/>
+  <text class="lbl-sm" x="830" y="375" text-anchor="middle">タブ / ペイン / 表示</text>
+  <text class="lbl-sm" x="830" y="470" text-anchor="middle">同じ操作を、どちらからでも</text>
+  <rect class="box" x="1170" y="90" width="480" height="480" rx="20"/>
+  <text class="lbl-lg" x="1410" y="200" text-anchor="middle">AI</text>
+  <text class="lbl-sm" x="1410" y="262" text-anchor="middle">CLI と MCP で操作する</text>
+  <rect x="1230" y="330" width="360" height="70" rx="12" fill="rgba(255,255,255,0.08)"/>
+  <text class="lbl-sm" x="1410" y="375" text-anchor="middle">tako コマンド / MCP</text>
+  <path class="arrow" d="M500 330 L578 330" marker-end="url(#a2)"/>
+  <path class="arrow" d="M1160 330 L1082 330" marker-end="url(#a2)"/>
+</svg>
+  </div>
+  <div class="note">人にできてエージェントにできない操作を作らない。これを開発の不変条件にしている。</div>
+</section>
+
+<section class="slide chapter" id="s_c3_title">
+  <div class="body chapter">
+    <div><div class="num">3</div><h1>導入</h1><div class="lede">brew 1 行、setup 一発</div></div>
+  </div>
+</section>
+
+<section class="slide" id="s_c3_flow">
+  <div class="eyebrow">3. 導入</div>
+  <h2>入れてから使い始めるまで</h2>
+  <div class="body">
+    <svg viewBox="0 0 1660 660">
+  <rect class="box-accent" x="10" y="230" width="360" height="200" rx="18"/>
+  <text class="lbl-lg" x="190" y="308" text-anchor="middle">1. インストール</text>
+  <text class="lbl-sm" x="190" y="356" text-anchor="middle">brew 1 行</text>
+  <path class="arrow-accent" d="M384 330 L444 330" marker-end="url(#a1)"/>
+  <rect class="box" x="458" y="230" width="360" height="200" rx="18"/>
+  <text class="lbl-lg" x="638" y="308" text-anchor="middle">2. tako setup</text>
+  <text class="lbl-sm" x="638" y="356" text-anchor="middle">質問ゼロで検出する</text>
+  <path class="arrow-accent" d="M832 330 L892 330" marker-end="url(#a1)"/>
+  <rect class="box" x="906" y="230" width="360" height="200" rx="18"/>
+  <text class="lbl-lg" x="1086" y="308" text-anchor="middle">3. MCP 登録</text>
+  <text class="lbl-sm" x="1086" y="356" text-anchor="middle">プロファイルまで自動</text>
+  <path class="arrow-accent" d="M1280 330 L1340 330" marker-end="url(#a1)"/>
+  <rect class="box-tab" x="1354" y="230" width="296" height="200" rx="18"/>
+  <text class="lbl-lg" x="1502" y="308" text-anchor="middle">対話開始</text>
+  <text class="lbl-sm" x="1502" y="356" text-anchor="middle">あとは話すだけ</text>
+  <text class="lbl-sm" x="830" y="560" text-anchor="middle">認証済みの CLI が 1 つ見つかれば、人間への質問は無い</text>
+</svg>
+  </div>
+  <div class="note">認証済みの CLI が 1 つ見つかれば、人間への質問は無い。</div>
+</section>
+
+<section class="slide" id="s_c3_zero">
+  <div class="eyebrow">3. 導入</div>
+  <h2>AI がまだ無い環境からでも始められる</h2>
+  <div class="body">
+    <ul class="points">
+      <li><b>インストール</b>　公式の手順で、エージェント CLI を入れるところから代行する</li>
+      <li><b>PATH の設定</b>　どこに何を置くかを、実行前に必ず画面へ出す</li>
+      <li><b>ログイン</b>　認証の画面まで案内する。claude / codex / agy の 3 系統に対応</li>
+    </ul>
+  </div>
+  <div class="note">「AI で開発したいが、何から入れればいいか分からない」を tako 側で引き受ける。</div>
+</section>
+
+<section class="slide chapter" id="s_c4_title">
+  <div class="body chapter">
+    <div><div class="num">4</div><h1>基本操作</h1><div class="lede">ターミナルとしての使い勝手</div></div>
+  </div>
+</section>
+
+<section class="slide" id="s_c4_map">
+  <div class="eyebrow">4. 基本操作</div>
+  <h2>画面の作り</h2>
+  <div class="body">
+    <svg viewBox="0 0 1660 660">
+  <rect class="box" x="10" y="10" width="1640" height="640" rx="20"/>
+  <rect x="10" y="10" width="1640" height="70" rx="20" fill="rgba(255,255,255,0.09)"/>
+  <text class="lbl-sm" x="46" y="54">タブ = 作業グループ　Cmd+T で新規 / Cmd+1〜9 で切替</text>
+  <rect class="box-accent" x="44" y="112" width="360" height="500" rx="14"/>
+  <text class="lbl" x="224" y="340" text-anchor="middle">ファイルツリー</text>
+  <text class="lbl-sm" x="224" y="386" text-anchor="middle">Cmd+B</text>
+  <rect class="box" x="436" y="112" width="620" height="500" rx="14"/>
+  <text class="lbl" x="746" y="326" text-anchor="middle">ターミナルのペイン</text>
+  <text class="lbl-sm" x="746" y="378" text-anchor="middle">Cmd+D で右</text>
+  <text class="lbl-sm" x="746" y="418" text-anchor="middle">Cmd+Shift+D で下</text>
+  <rect class="box-tab" x="1088" y="112" width="526" height="500" rx="14"/>
+  <text class="lbl" x="1351" y="300" text-anchor="middle">プレビュー</text>
+  <text class="lbl-sm" x="1351" y="352" text-anchor="middle">Markdown / PDF / 画像 / コード</text>
+  <text class="lbl-sm" x="1351" y="398" text-anchor="middle">クリックすると隣に開く</text>
+</svg>
+  </div>
+</section>
+
+<section class="slide chapter" id="s_c5_title">
+  <div class="body chapter">
+    <div><div class="num">5</div><h1>AI に任せる</h1><div class="lede">tako master と担当エージェント</div></div>
+  </div>
+</section>
+
+<section class="slide" id="s_c5_flow">
+  <div class="eyebrow">5. AI に任せる</div>
+  <h2>司令塔が分解し、担当を立てる</h2>
+  <div class="body">
+    <svg viewBox="0 0 1660 660">
+  <rect class="box-accent" x="0" y="240" width="330" height="180" rx="18"/>
+  <text class="lbl-lg" x="165" y="315" text-anchor="middle">master</text>
+  <text class="lbl-sm" x="165" y="360" text-anchor="middle">あなたが話しかける相手</text>
+  <path class="arrow-accent" d="M342 330 L432 330" marker-end="url(#a1)"/>
+  <text class="lbl-sm" x="387" y="300" text-anchor="middle">分解</text>
+  <path class="arrow-accent" d="M450 90 L450 570"/>
+  <rect class="box" x="500" y="20" width="560" height="140" rx="16"/>
+  <text class="lbl" x="780" y="80" text-anchor="middle">worker A</text>
+  <text class="lbl-sm" x="780" y="122" text-anchor="middle">1 worker = 1 成果物</text>
+  <rect class="box" x="500" y="260" width="560" height="140" rx="16"/>
+  <text class="lbl" x="780" y="320" text-anchor="middle">worker B</text>
+  <text class="lbl-sm" x="780" y="362" text-anchor="middle">型つきの指示で届く</text>
+  <rect class="box" x="500" y="500" width="560" height="140" rx="16"/>
+  <text class="lbl" x="780" y="560" text-anchor="middle">worker C</text>
+  <text class="lbl-sm" x="780" y="602" text-anchor="middle">送達確認つき</text>
+  <path class="arrow-accent" d="M450 90 L486 90" marker-end="url(#a1)"/>
+  <path class="arrow-accent" d="M450 330 L486 330" marker-end="url(#a1)"/>
+  <path class="arrow-accent" d="M450 570 L486 570" marker-end="url(#a1)"/>
+  <path class="arrow dash" d="M1060 90 L1150 90 L1150 320"/>
+  <path class="arrow dash" d="M1060 330 L1150 330"/>
+  <path class="arrow dash" d="M1060 570 L1150 570 L1150 340"/>
+  <path class="arrow" d="M1150 330 L1216 330" marker-end="url(#a2)"/>
+  <rect class="box-tab" x="1232" y="215" width="424" height="230" rx="18"/>
+  <text class="lbl-lg" x="1444" y="300" text-anchor="middle">検収してから報告</text>
+  <text class="lbl-sm" x="1444" y="352" text-anchor="middle">完了・入力待ち・消滅を</text>
+  <text class="lbl-sm" x="1444" y="392" text-anchor="middle">master が自動で検知する</text>
+</svg>
+  </div>
+  <div class="note">worker の起動・監視・片付けまで master が持つ。あなたは日本語で話しかけるだけ。</div>
+</section>
+
+<section class="slide" id="s_c5_quality">
+  <div class="eyebrow">5. AI に任せる</div>
+  <h2>「投げっぱなし」にしない仕組み</h2>
+  <div class="body">
+    <div class="cards">
+      <div class="card"><div class="k">指示</div><div class="t">型で渡す</div>
+        <div class="d">背景・スコープ・受け入れ条件・検証手順まで埋めた形で届く</div></div>
+      <div class="card"><div class="k">送達</div><div class="t">届いたか確かめる</div>
+        <div class="d">送ったつもりで進まない、を無くす</div></div>
+      <div class="card accent"><div class="k">検収</div><div class="t">報告を鵜呑みにしない</div>
+        <div class="d">完了報告の証拠を master が検査してから、あなたへ届ける</div></div>
+    </div>
+  </div>
+</section>
+
+<section class="slide chapter" id="s_c6_title">
+  <div class="body chapter">
+    <div><div class="num">6</div><h1>かんたん表示</h1><div class="lede">コマンドを知らなくても使える</div></div>
+  </div>
+</section>
+
+<section class="slide" id="s_c6_three">
+  <div class="eyebrow">6. かんたん表示</div>
+  <h2>まだ何もしていないペインは、3 つのボタンになる</h2>
+  <div class="body">
+    <div class="cards">
+      <div class="card accent"><div class="k">1</div><div class="t">AI チームに任せる</div>
+        <div class="d">司令塔の AI が話を聞いて、必要なだけ担当 AI を集めて進めます</div></div>
+      <div class="card"><div class="k">2</div><div class="t">AI と 1 対 1 で話す</div>
+        <div class="d">1 体の AI とじっくり相談したいときはこちら</div></div>
+      <div class="card"><div class="k">3</div><div class="t">コマンド入力へ</div>
+        <div class="d">この画面をターミナル表示に戻します。何も止まりません</div></div>
+    </div>
+  </div>
+  <div class="note">押すと、その画面で AI が起動してチャットになる。表示を切り替えても裏のターミナルは動いたまま。</div>
+</section>
+
+<section class="slide" id="s_c6_grow">
+  <div class="eyebrow">6. かんたん表示</div>
+  <h2>担当 AI も、同じチャット画面で隣に並ぶ</h2>
+  <div class="body">
+    <svg viewBox="0 0 1660 660">
+  <rect class="box-tab" x="10" y="10" width="1640" height="640" rx="20"/>
+  <rect x="10" y="10" width="1640" height="62" rx="20" fill="rgba(78,201,166,0.18)"/>
+  <text class="lbl-sm" x="46" y="52">1 つのタブ</text>
+  <rect class="box-accent" x="44" y="104" width="770" height="508" rx="16"/>
+  <rect x="70" y="130" width="718" height="60" rx="10" fill="rgba(237,89,140,0.22)"/>
+  <text class="lbl-sm" x="94" y="169">司令塔の AI　待機中</text>
+  <text class="lbl-lg" x="429" y="360" text-anchor="middle">チャット画面</text>
+  <rect x="70" y="512" width="718" height="72" rx="12" fill="rgba(0,0,0,0.35)"/>
+  <text class="lbl-sm" x="94" y="557">日本語で書いて送るだけ</text>
+  <path class="arrow-accent" d="M826 358 L866 358" marker-end="url(#a1)"/>
+  <rect class="box" x="880" y="104" width="734" height="508" rx="16"/>
+  <rect x="906" y="130" width="682" height="60" rx="10" fill="rgba(255,255,255,0.1)"/>
+  <text class="lbl-sm" x="930" y="169">担当の AI　作業中</text>
+  <text class="lbl-lg" x="1247" y="340" text-anchor="middle">同じチャット画面</text>
+  <text class="lbl-sm" x="1247" y="404" text-anchor="middle">ここから直接お願いすることもできる</text>
+</svg>
+  </div>
+  <div class="note">通常は司令塔の AI が指示を出す。増えたペインを閉じるのも AI の仕事。</div>
+</section>
+
+<section class="slide chapter" id="s_c7_title">
+  <div class="body chapter">
+    <div><div class="num">7</div><h1>再起動しても戻る</h1><div class="lede">長い作業を任せたときに効く</div></div>
+  </div>
+</section>
+
+<section class="slide" id="s_c7_persist">
+  <div class="eyebrow">7. 永続化</div>
+  <h2>プロセスは裏で生き続けている</h2>
+  <div class="body">
+    <svg viewBox="0 0 1660 660">
+  <rect class="box" x="10" y="40" width="470" height="230" rx="18"/>
+  <text class="lbl-lg" x="245" y="130" text-anchor="middle">閉じる直前</text>
+  <text class="lbl-sm" x="245" y="182" text-anchor="middle">エージェントも dev サーバーも</text>
+  <text class="lbl-sm" x="245" y="222" text-anchor="middle">稼働中</text>
+  <path class="arrow-accent" d="M245 286 L245 356" marker-end="url(#a1)"/>
+  <rect class="box-accent" x="10" y="372" width="470" height="180" rx="18"/>
+  <text class="lbl-lg" x="245" y="475" text-anchor="middle">tako を終了する</text>
+  <rect class="box-tab" x="580" y="180" width="440" height="300" rx="18"/>
+  <text class="lbl-lg" x="800" y="280" text-anchor="middle">tmux バックエンド</text>
+  <text class="lbl-sm" x="800" y="340" text-anchor="middle">画面が消えても</text>
+  <text class="lbl-sm" x="800" y="384" text-anchor="middle">プロセスは走り続ける</text>
+  <path class="arrow-accent" d="M1034 330 L1114 330" marker-end="url(#a1)"/>
+  <rect class="box" x="1130" y="100" width="520" height="460" rx="18"/>
+  <text class="lbl-lg" x="1390" y="200" text-anchor="middle">再起動すると</text>
+  <text class="lbl-sm" x="1390" y="278" text-anchor="middle">タブ構成 / ペイン</text>
+  <text class="lbl-sm" x="1390" y="326" text-anchor="middle">画面の中身 / スクロールバック</text>
+  <text class="lbl-sm" x="1390" y="374" text-anchor="middle">エージェントの会話の続き</text>
+  <text class="lbl" x="1390" y="466" text-anchor="middle">まとめて戻ってくる</text>
+</svg>
+  </div>
+  <div class="note">一晩かかる作業を任せて寝る、が現実的にできる。</div>
+</section>
+
+<section class="slide chapter" id="s_c8_title">
+  <div class="body chapter">
+    <div><div class="num">8</div><h1>スマホから</h1><div class="lede">席を離れても進み具合が見られる</div></div>
+  </div>
+</section>
+
+<section class="slide" id="s_c8_net">
+  <div class="eyebrow">8. スマホから</div>
+  <h2>tailnet の中だけに存在する固定 URL</h2>
+  <div class="body">
+    <svg viewBox="0 0 1660 660">
+  <rect x="10" y="30" width="1030" height="600" rx="22" fill="rgba(78,201,166,0.07)" stroke="#4ec9a6" stroke-width="2.5" stroke-dasharray="12 8"/>
+  <text class="lbl-sm" x="46" y="82">Tailscale のネットワーク（同じ tailnet の端末だけが到達できる）</text>
+  <rect class="box-accent" x="70" y="180" width="400" height="280" rx="18"/>
+  <text class="lbl-lg" x="270" y="300" text-anchor="middle">Mac の tako</text>
+  <text class="lbl-sm" x="270" y="356" text-anchor="middle">エージェントが動いている本体</text>
+  <path class="arrow-accent" d="M486 320 L586 320" marker-end="url(#a1)"/>
+  <text class="lbl-sm" x="536" y="288" text-anchor="middle">端から端まで暗号化</text>
+  <rect class="box" x="600" y="180" width="400" height="280" rx="18"/>
+  <text class="lbl-lg" x="800" y="300" text-anchor="middle">スマホのブラウザ</text>
+  <text class="lbl-sm" x="800" y="356" text-anchor="middle">一覧 / 会話 / 承認カード</text>
+  <text class="lbl-sm" x="525" y="560" text-anchor="middle">公開インターネットには存在しない固定 URL</text>
+  <rect class="box" x="1090" y="90" width="560" height="480" rx="20"/>
+  <text class="lbl-lg" x="1370" y="190" text-anchor="middle">二層認証</text>
+  <rect x="1140" y="250" width="460" height="110" rx="14" fill="rgba(255,255,255,0.07)"/>
+  <text class="lbl-sm" x="1370" y="292" text-anchor="middle">1. tailnet の identity</text>
+  <text class="lbl-sm" x="1370" y="332" text-anchor="middle">同じネットワークに居ること</text>
+  <rect x="1140" y="386" width="460" height="130" rx="14" fill="rgba(237,89,140,0.16)" stroke="#ed598c" stroke-width="2"/>
+  <text class="lbl-sm" x="1370" y="428" text-anchor="middle">2. Mac の画面での機器承認</text>
+  <text class="lbl-sm" x="1370" y="468" text-anchor="middle">承認するまで何も見られない</text>
+  <text class="lbl-sm" x="1370" y="500" text-anchor="middle">ここだけは AI にできない</text>
+</svg>
+  </div>
+  <div class="note">公開インターネットには存在しない。機器の承認だけは AI にできない、人間の操作。</div>
+</section>
+
+<section class="slide chapter" id="s_c9_title">
+  <div class="body chapter">
+    <div><div class="num">9</div><h1>Windows と OSS</h1><div class="lede">対応環境と入手先</div></div>
+  </div>
+</section>
+
+<section class="slide" id="s_c9_win">
+  <div class="eyebrow">9. Windows と OSS</div>
+  <h2>同じリリースに Windows 版が入っている</h2>
+  <div class="body">
+    <div style="width:100%">
+      <div class="cards">
+        <div class="card"><div class="k">macOS</div><div class="t">11.0 以降</div>
+          <div class="d">Homebrew / zip</div></div>
+        <div class="card"><div class="k">Windows</div><div class="t">10 1809 以降 x64</div>
+          <div class="d">インストーラ / ポータブル</div></div>
+        <div class="card accent"><div class="k">対応の書き方</div><div class="t">実機で確かめた<br>ものだけ「対応」</div>
+          <div class="d">自動生成の対応状況ページで公開している</div></div>
+      </div>
+      <div class="note" style="margin-top:38px">GPL-3.0-or-later のオープンソース。ソースコードは GitHub で公開している。</div>
+    </div>
+  </div>
+</section>
+
+<section class="slide hero" id="s_outro">
+  <div class="body hero">
+    <div>
+      <div class="wordmark">tako</div>
+      <div class="tagline">AI に任せる開発を、ひとつの画面で。</div>
+      <div style="margin-top:52px" class="cmd"><span class="p">$</span> brew install --cask takushio2525/tako/tako</div>
+      <div class="lede" style="font-size:32px;margin-top:34px">github.com/takushio2525/tako　/　tako-docs.pages.dev</div>
+    </div>
+  </div>
+</section>
