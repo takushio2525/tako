@@ -888,7 +888,7 @@ pub const MATRIX: &[AgentFeature] = &[
         evidence: AgentEvidence::Measured(
             "#1238 の実測（2026-09-09 / codex-cli 0.153.0 / agy 1.1.27）: \
              生きた codex は $CODEX_HOME/thread-writer-locks/<id>.lock を、\
-             生きた agy は ~/.gemini/antigravity-cli/presence/<id>.lock を開いたまま持つ。\
+             生きた agy は ~/.gemini/antigravity-cli/brain/<id> を開いたまま持つ（#1033 の実測）。\
              ペイン → 子孫 pid → lsof でその ID を採り layout.json へ保存すると、\
              tmux サーバーを kill したあとの復元で `codex resume <id>` / \
              `agy --conversation <id>` が会話を履歴ごと戻した。\

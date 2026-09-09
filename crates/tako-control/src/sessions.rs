@@ -662,16 +662,14 @@ fn agent_of(entry: &SessionEntry) -> Agent {
 /// claude だけが所在によって `CLAUDE_CONFIG_DIR` の指定を要する（#652）ので、
 /// 他系統は「見つかった」を空文字で表す
 fn conversation_env(agent: Agent, id: &str) -> Option<String> {
-    match agent {
-        Agent::Claude => crate::transcript::resume_env_prefix(id),
-        // codex は rollout（`sessions/<Y>/<M>/<D>/rollout-<ts>-<id>.jsonl`）が会話の実体
-        Agent::Codex => crate::codex_session::find_rollout(id).map(|_| String::new()),
-        // agy は `conversations/<id>.db`（SQLite）が会話の実体
-        Agent::Agy => crate::agent_resume::agy_conversation_db(id)
-            .filter(|p| p.is_file())
-            .map(|_| String::new()),
-        Agent::Local => None,
+    if agent == Agent::Claude {
+        return crate::transcript::resume_env_prefix(id);
     }
+    // claude 以外は config ディレクトリの概念が無いので、
+    // 「見つかった」を空文字で表す（所在の判定は agent_resume が系統ごとに持つ）
+    crate::agent_resume::conversation_exists(agent, id)
+        .unwrap_or(false)
+        .then(String::new)
 }
 
 /// `resume_command` の本体（env プレフィクスを引数で受け取るテスト可能版）

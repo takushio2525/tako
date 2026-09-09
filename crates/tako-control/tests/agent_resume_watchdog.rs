@@ -198,7 +198,7 @@ fn 会話idの在り処が実測つきで記録されている() {
     let doc = read(CORE_RULE);
     for marker in [
         "thread-writer-locks",
-        "presence/",
+        "brain/<id>",
         "codex resume",
         "--conversation",
         "lsof",

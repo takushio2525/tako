@@ -18,11 +18,14 @@
 //! |---|---|---|---|
 //! | claude | `claude agents --json`（`transcript` が正本） | 起動後まもなく | `claude --resume <id>` |
 //! | codex | `$CODEX_HOME/thread-writer-locks/<id>.lock` を**開いたまま持つ** | **起動直後** | `codex resume <id>` |
-//! | agy | `~/.gemini/antigravity-cli/presence/<id>.lock` を**開いたまま持つ** | **最初のターンの後** | `agy --conversation <id>` |
+//! | agy | `~/.gemini/antigravity-cli/brain/<id>` を**開いたまま持つ** | **最初のターンの後** | `agy --conversation <id>` |
 //!
-//! 実測は codex-cli 0.153.0 / agy 1.1.27。どちらもロックファイルは
-//! **プロセス終了後も残る**ので、「ファイルが在る」ではなく
-//! 「生きたプロセスが開いている」（`lsof`）を根拠にする。
+//! 実測は codex-cli 0.153.0 / agy 1.1.27。**プロセス終了後も置き場は残る**ので、
+//! 「在る」ではなく「生きたプロセスが開いている」（`lsof`）を根拠にする。
+//! 引く実装は各系統のモジュール（`codex_session` = #984 / `agy_session` = #1033）が持ち、
+//! 復元はそれを束ねるだけ（`tako_control::agent_resume`）。
+//! agy は同じ ID で `presence/<id>.lock` と `conversations/<id>.db` も開くが、
+//! **会話の実体は `conversations/<id>.db`**（`agy --conversation` が読む先）。
 //!
 //! # なぜ Windows では成立しないか
 //!
