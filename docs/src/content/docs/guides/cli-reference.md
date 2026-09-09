@@ -76,6 +76,7 @@ tako orchestrator spawn --help
 | [`persist`](#表示設定のトグル) | セッション永続化の ON/OFF |
 | [`recover`](#tako-recover) | レイアウトをバックアップ世代から復旧 |
 | [`logs`](#tako-logs--sessions) | ペインの平文ログの参照・設定 |
+| [`scrollback`](#tako-scrollback) | スクロールバック保持行数の確認・変更 |
 | [`sessions`](#tako-logs--sessions) | 会話セッションの発見と復元 |
 
 ### git
@@ -678,6 +679,23 @@ tako tmux select-window 1 --pane 3
 tako tmux resize --session my-session --cols 80 --rows 24
 tako tmux resize --session my-session --reset
 ```
+
+### tako scrollback
+
+ペインが遡れる行数（スクロールバック保持上限）です。**既定は 10,000 行**で、範囲は 100〜100,000。
+
+```bash
+tako scrollback         # 現在値・既定・下限・上限・適用中のペイン数・飽和時の見積り
+tako scrollback 2000    # 2,000 行に下げる
+```
+
+履歴が飽和したペインは `行数 × 桁数 × 24 バイト` を保持します（119 桁 10,000 行で約 29 MB / ペイン）。
+下げると**その場で既存ペインの履歴も切り詰められる**ので、メモリはすぐ戻ります。
+
+:::note[効くのは直接ペインだけ]
+セッション永続化（`tako persist on`。既定 ON）が有効なペインは tmux 側が履歴を持ち、
+tako の alacritty 側には積もりません。この設定で減るのは **persist OFF のペイン・tmux が無い環境**です。
+:::
 
 ### tako recover
 

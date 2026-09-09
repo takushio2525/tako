@@ -289,6 +289,21 @@ pub fn desc_preview_cache() -> &'static str {
     )
 }
 
+pub fn section_terminal() -> &'static str {
+    tr!("ターミナル", "Terminal")
+}
+
+pub fn label_scrollback_lines() -> &'static str {
+    tr!("スクロールバック行数", "Scrollback lines")
+}
+
+pub fn desc_scrollback_lines() -> &'static str {
+    tr!(
+        "ペインが遡れる行数（100〜100000）。下げるとメモリを節約できる",
+        "How far a pane can scroll back (100-100000). Lower values save memory"
+    )
+}
+
 pub fn section_logs() -> &'static str {
     tr!("ペインログ", "Pane logs")
 }

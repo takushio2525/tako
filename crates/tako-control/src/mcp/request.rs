@@ -308,6 +308,9 @@ pub(super) fn build_request(
         "tako_preview_cache" => Request::PreviewCache {
             max_mb: u64_arg(args, "max_mb")?,
         },
+        "tako_scrollback" => Request::Scrollback {
+            lines: u64_arg(args, "lines")?.map(|n| n as usize),
+        },
         "tako_preview_edit" => Request::PreviewEdit {
             pane: Some(target_pane(args, caller)?),
             enabled: bool_arg(args, "enabled")?,

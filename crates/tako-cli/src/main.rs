@@ -59,6 +59,8 @@ enum Command {
     Read(ReadArgs),
     /// スクロールバック表示を動かす（--to 0 で最下部へ）
     Scroll(ScrollArgs),
+    /// 直接ペインのスクロールバック保持上限（行）の確認・変更（Issue #818）
+    Scrollback(ScrollbackArgs),
     /// ペインを閉じる（タブ最後の 1 ペインならタブごと閉じる）
     Close(CloseArgs),
     /// ペインのタイトル・役割ラベルを設定する（空文字でクリア）
@@ -2435,6 +2437,14 @@ struct LimitResumeArgs {
 struct PreviewCacheArgs {
     /// キャッシュ上限（MiB、256〜8192。省略時は利用状況を表示）
     max_mb: Option<u64>,
+}
+
+/// スクロールバック保持上限の引数（Issue #818）。
+/// 最簡形（#322）: `tako scrollback` で現在値、`tako scrollback 2000` で変更
+#[derive(Args)]
+struct ScrollbackArgs {
+    /// 保持行数（100〜100000。省略時は現在値と適用中のペイン数を表示）
+    lines: Option<usize>,
 }
 
 /// チェンジログビューの引数（Issue #338）
@@ -6031,6 +6041,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::PreviewCache(args) => Request::PreviewCache {
             max_mb: args.max_mb,
         },
+        Command::Scrollback(args) => Request::Scrollback { lines: args.lines },
         Command::PreviewChangelog(args) => Request::PreviewChangelog {
             pane: target_pane(args.pane)?,
             enabled: args.mode.as_deref().map(|s| s == "on"),
@@ -7974,7 +7985,10 @@ fn print_result(command: &Command, result: &Value) {
         Command::PreviewFollowLink(_) => println!("{result}"),
         // #680: コピーしたコード全文は改行込みで読みたいので整形して出す
         Command::PreviewCopyCode(_) => println!("{}", pretty_json(result)),
-        Command::PreviewReload(_) | Command::PreviewCache(_) | Command::PreviewChangelog(_) => {
+        Command::PreviewReload(_)
+        | Command::PreviewCache(_)
+        | Command::PreviewChangelog(_)
+        | Command::Scrollback(_) => {
             println!("{result}")
         }
         // #666: カードの内容（論理文字列）は改行込みで読みたいので整形して出す
@@ -8785,6 +8799,21 @@ mod tests {
         assert_eq!(
             build_request(&changed).unwrap(),
             Request::PreviewCache { max_mb: Some(768) }
+        );
+    }
+
+    /// #818: 最簡形（引数なし = 現在値 / 数値 1 個 = 変更）が操作へ写る
+    #[test]
+    fn scrollbackは状態取得と上限変更を操作へ写す() {
+        let status = parse(&["tako", "scrollback"]);
+        assert_eq!(
+            build_request(&status).unwrap(),
+            Request::Scrollback { lines: None }
+        );
+        let changed = parse(&["tako", "scrollback", "2000"]);
+        assert_eq!(
+            build_request(&changed).unwrap(),
+            Request::Scrollback { lines: Some(2_000) }
         );
     }
 

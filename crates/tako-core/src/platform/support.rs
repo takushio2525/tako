@@ -1343,6 +1343,17 @@ pub const MATRIX: &[Feature] = &[
         ),
     },
     Feature {
+        key: "tako_scrollback",
+        macos: Support::Supported,
+        // 上限は alacritty の `Term` 設定 + settings.json なので構造上は OS に依らないが、
+        // Windows 実機での往復は**未実測**。#591 の規約どおり Pending + 追跡 #937 で置く
+        windows: Support::Pending {
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
+        },
+        windows_evidence: Evidence::Unverified,
+    },
+    Feature {
         key: "tako_select_tab",
         macos: Support::Supported,
         windows: Support::Supported,

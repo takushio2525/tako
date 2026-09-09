@@ -54,8 +54,20 @@ pub enum CommandState {
     Failed(i32),
 }
 
-/// スクロールバックの保持行数
-const SCROLLBACK_LINES: usize = 10_000;
+/// alacritty の `Term` 設定を組み立てる（Issue #818）。
+///
+/// tako が既定から変えるのは 2 つだけ。`scrolling_history` はペイン単位の
+/// スクロールバック上限（正本は [`crate::scrollback`]）、`kitty_keyboard` は
+/// CSI > u の push/pop 受理（既定 false だと Shift+Enter 等を区別できない）。
+/// **[`TerminalSession::set_scrollback_limit`] が同じ関数で作り直す**ので、
+/// 上限の動的変更で他の設定が巻き添えで既定へ戻ることはない
+fn term_config(scrollback_lines: usize) -> Config {
+    Config {
+        scrolling_history: scrollback_lines,
+        kitty_keyboard: true,
+        ..Config::default()
+    }
+}
 
 /// シェルの既定 cwd（ホームディレクトリ）。解決は [`crate::paths::home_dir`] 1 本に寄せている
 /// （#870。ホーム解決を 2 か所に持つと片方だけ直る）。取得できなければ None
@@ -117,6 +129,10 @@ pub struct SpawnOptions {
     pub cwd: Option<PathBuf>,
     /// 追加で注入する環境変数
     pub env: Vec<(String, String)>,
+    /// スクロールバックの保持上限（行。Issue #818）。None なら
+    /// [`crate::scrollback::DEFAULT_LINES`]。器（tmux / psmux）越しのペインでも
+    /// 外側 alacritty の履歴上限としてそのまま効く（`..options` で持ち回る）
+    pub scrollback_lines: Option<usize>,
 }
 
 /// マウス選択の種類（クリック回数に対応: 1=文字、2=単語、3=行）
@@ -215,6 +231,9 @@ pub struct TerminalSession {
     copy_mode: std::sync::Mutex<CopyModeGate>,
     /// PTY 直下の子プロセスの pid（#592。取得できない環境では None）
     child_pid: Option<u32>,
+    /// スクロールバックの保持上限（行。Issue #818）。`Term` の設定と同じ値を
+    /// 持つのは、上限を問い合わせるのに `Term` のロックを取りたくないため
+    scrollback_lines: usize,
 }
 
 /// ホイール転送レート制限（#167）の状態。tokens = 残イベント数、last = 最終補充時刻
@@ -289,13 +308,12 @@ impl TerminalSession {
         let (tx, rx) = unbounded::<SessionEvent>();
         let proxy = EventProxy(tx.clone());
 
-        let config = Config {
-            scrolling_history: SCROLLBACK_LINES,
-            // kitty keyboard protocol（CSI > u の push/pop）を受理する。
-            // 既定 false だと TUI の有効化要求が無視され Shift+Enter 等を区別できない
-            kitty_keyboard: true,
-            ..Config::default()
-        };
+        let scrollback_lines = crate::scrollback::clamp_lines(
+            options
+                .scrollback_lines
+                .unwrap_or(crate::scrollback::DEFAULT_LINES),
+        );
+        let config = term_config(scrollback_lines);
         let term_size = TermSize::new(cols, rows);
         let term = Arc::new(FairMutex::new(Term::new(config, &term_size, proxy.clone())));
 
@@ -396,6 +414,7 @@ impl TerminalSession {
                 wheel_carry: std::sync::Mutex::new(0.0),
                 copy_mode: std::sync::Mutex::new(CopyModeGate::default()),
                 child_pid,
+                scrollback_lines,
                 wheel_rate: std::sync::Mutex::new(WheelRateState {
                     tokens: WHEEL_FORWARD_BURST,
                     last: std::time::Instant::now(),
@@ -680,9 +699,25 @@ impl TerminalSession {
         self.term.lock().grid().history_size()
     }
 
-    /// スクロールバックの保持上限（ペインログの飽和判定用。Issue #112）
+    /// スクロールバックの保持上限（ペインログの飽和判定用。Issue #112 / #818）
     pub fn scrollback_limit(&self) -> usize {
-        SCROLLBACK_LINES
+        self.scrollback_lines
+    }
+
+    /// スクロールバックの保持上限を変更する（Issue #818）。
+    ///
+    /// **既存ペインにもその場で効く**: alacritty の `set_options` は
+    /// `Grid::update_history` を通り、下げたぶんの `Row`（= 桁数ぶんの
+    /// `Vec<Cell>`）を実際に解放する。alt screen 中は非アクティブ側
+    /// （= 履歴を持つ主グリッド）へ当たるので、TUI 表示中に変えても取りこぼさない。
+    /// 範囲外の値は [`crate::scrollback::clamp_lines`] で丸める
+    pub fn set_scrollback_limit(&mut self, lines: usize) {
+        let lines = crate::scrollback::clamp_lines(lines);
+        if lines == self.scrollback_lines {
+            return;
+        }
+        self.scrollback_lines = lines;
+        self.term.lock().set_options(term_config(lines));
     }
 
     /// スクロールバック履歴の末尾から `skip_newest` 行飛ばして `count` 行を
@@ -1752,6 +1787,92 @@ mod tests {
             }
         }
         assert!(resumed, "ゲートを倒しても Wakeup が再開しない");
+    }
+
+    /// **#818**: スクロールバック上限は `SpawnOptions` で決まり、その行数で履歴が
+    /// 打ち切られる。1,200 行流して上限 1,000 で止まることを実 PTY で固定する
+    /// （直接ペインの飽和時フットプリントは `行 × 桁 × 24 B` に比例するので、
+    /// ここが効かないと上限を下げても RAM は減らない）
+    #[cfg(unix)]
+    #[test]
+    fn スクロールバック上限は設定した行数で履歴を打ち切る() {
+        let session = spawn_lines(1_200, Some(1_000));
+        assert_eq!(session.scrollback_limit(), 1_000);
+        // 上限に達したら増えない = 到達を待てば値は安定する（時間には依らない）
+        assert!(
+            wait_history(&session, |h| h >= 1_000),
+            "履歴が上限まで伸びない: {}",
+            session.history_size()
+        );
+        assert_eq!(session.history_size(), 1_000, "上限を超えて保持している");
+    }
+
+    /// 対照: 既定（10,000 行）なら同じ 1,200 行がすべて残る。
+    /// 上限が「効いている」ことを片側だけで主張しないための A 側
+    #[cfg(unix)]
+    #[test]
+    fn 既定の上限では同じ出力がすべて履歴に残る() {
+        let session = spawn_lines(1_200, None);
+        assert_eq!(session.scrollback_limit(), crate::scrollback::DEFAULT_LINES);
+        assert!(
+            wait_history(&session, |h| h >= 1_100),
+            "履歴が伸びない: {}",
+            session.history_size()
+        );
+    }
+
+    /// **#818**: 上限を下げると**既存ペインの履歴もその場で切り詰められる**
+    /// （alacritty の `Grid::update_history` が `Row` を解放する）。
+    /// これが無いと「設定を変えたのに再起動するまで RAM が戻らない」になる
+    #[cfg(unix)]
+    #[test]
+    fn 上限を下げると既存ペインの履歴もその場で縮む() {
+        let mut session = spawn_lines(1_200, None);
+        assert!(
+            wait_history(&session, |h| h >= 1_100),
+            "履歴が伸びない: {}",
+            session.history_size()
+        );
+        session.set_scrollback_limit(500);
+        assert_eq!(session.scrollback_limit(), 500);
+        assert_eq!(session.history_size(), 500, "既存の履歴が切り詰められない");
+        // 範囲外は丸める（settings.json を手で書いた場合の経路）
+        session.set_scrollback_limit(0);
+        assert_eq!(session.scrollback_limit(), crate::scrollback::MIN_LINES);
+    }
+
+    /// 20 桁 4 行のペインへ `count` 行流す。上限は `limit`（None = 既定）
+    #[cfg(unix)]
+    fn spawn_lines(count: usize, limit: Option<usize>) -> TerminalSession {
+        let script =
+            format!("i=0; while [ $i -lt {count} ]; do printf 'L%d\\n' $i; i=$((i+1)); done");
+        let (session, _rx) = TerminalSession::spawn(
+            20,
+            4,
+            SpawnOptions {
+                command: Some(SpawnCommand {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), script],
+                }),
+                scrollback_lines: limit,
+                ..SpawnOptions::default()
+            },
+        )
+        .expect("PTY を張れる");
+        session
+    }
+
+    /// 履歴が条件を満たすまで待つ（満たしたら true。予算内に満たさなければ false）
+    #[cfg(unix)]
+    fn wait_history(session: &TerminalSession, done: impl Fn(usize) -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            if done(session.history_size()) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        done(session.history_size())
     }
 
     /// #816 で `history_plain_lines` は「後ろから境界を探して 1 本だけ組み立てる」形に

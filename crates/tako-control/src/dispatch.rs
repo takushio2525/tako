@@ -689,6 +689,7 @@ fn dispatch_inner(
                         .map(|p| p.to_path_buf())
                 }),
                 env: Vec::new(),
+                scrollback_lines: None,
             };
             host.attach_session(new_id, options);
             // MCP/CLI 経由のデフォルトはフォーカスを移さない（ユーザーの入力を奪わない）
@@ -1384,6 +1385,7 @@ fn dispatch_inner(
                     }),
                     cwd: None,
                     env: Vec::new(),
+                    scrollback_lines: None,
                 },
             );
             Ok(json!({
@@ -2251,6 +2253,30 @@ fn dispatch_inner(
                 "used_bytes": stats.used_bytes,
                 "entries": stats.entries,
             }))
+        }
+        Request::Scrollback { lines } => {
+            if let Some(lines) = lines {
+                let lines = tako_core::scrollback::validate_lines(lines)
+                    .map_err(DispatchError::InvalidParams)?;
+                host.set_scrollback_lines(lines);
+            }
+            let status = host.scrollback_status();
+            let mut out = json!({
+                "lines": status.lines,
+                "default_lines": tako_core::scrollback::DEFAULT_LINES,
+                "min_lines": tako_core::scrollback::MIN_LINES,
+                "max_lines": tako_core::scrollback::MAX_LINES,
+                "panes": status.panes,
+            });
+            // 見積りは実在するペインの最大桁数がある時だけ出す（架空の桁で数字を作らない）
+            if status.max_cols > 0 {
+                out["max_cols"] = json!(status.max_cols);
+                out["estimated_bytes_per_pane"] = json!(tako_core::scrollback::estimated_bytes(
+                    status.lines,
+                    status.max_cols
+                ));
+            }
+            Ok(out)
         }
         Request::PreviewEdit { pane, enabled } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
@@ -5412,6 +5438,7 @@ fn spawn_command_pane(
             )),
             cwd,
             env: Vec::new(),
+            scrollback_lines: None,
         },
     );
 
@@ -5676,6 +5703,7 @@ fn dispatch_sessions_resume(
         command: None,
         cwd: cwd.clone(),
         env: Vec::new(),
+        scrollback_lines: None,
     };
     host.attach_session(new_id, options);
     // シェル起動後に resume コマンドを注入する（送達確認つき。#640）
@@ -8095,6 +8123,7 @@ fn dispatch_orchestrator_handoff(
         command: None,
         cwd: Some(cwd.clone()),
         env: profile_env.exports.clone(),
+        scrollback_lines: None,
     };
     host.attach_session(new_id, options);
 
@@ -8247,6 +8276,7 @@ fn dispatch_git_resolve_agent(
         command: None,
         cwd: Some(repo.clone()),
         env: profile_env.exports.clone(),
+        scrollback_lines: None,
     };
     host.attach_session(new_id, options);
 
@@ -8726,6 +8756,7 @@ fn dispatch_orchestrator_spawn(
         command: None,
         cwd: Some(std::path::PathBuf::from(&cwd)),
         env: profile_env.exports.clone(),
+        scrollback_lines: None,
     };
     host.attach_session(new_id, options);
 
@@ -12825,6 +12856,8 @@ mod tests {
         limit_service: tako_core::LimitService,
         preview_reload: tako_core::PreviewReloadState,
         preview_cache: tako_core::PreviewCacheStats,
+        /// #818: スクロールバック上限（適用先のペインは `scrollback_applied` が数える）
+        scrollback: tako_core::scrollback::ScrollbackStatus,
         /// #584: UI 層へ依頼したウィンドウ表示状態の操作（window ID, 操作）
         window_state_ops: Vec<(u64, crate::protocol::WindowStateOp)>,
         /// #657: メニューバーの構成（UI 層が持つものの代役）
@@ -12899,6 +12932,11 @@ mod tests {
                     used_bytes: 32 * 1024 * 1024,
                     entries: 2,
                 },
+                scrollback: tako_core::scrollback::ScrollbackStatus {
+                    lines: tako_core::scrollback::DEFAULT_LINES,
+                    panes: 2,
+                    max_cols: 119,
+                },
                 window_state_ops: Vec::new(),
                 menu_bar: sample_menu_bar(),
                 menu_ops: Vec::new(),
@@ -12950,6 +12988,12 @@ mod tests {
     }
 
     impl SessionHost for MockHost {
+        fn scrollback_status(&self) -> tako_core::scrollback::ScrollbackStatus {
+            self.scrollback
+        }
+        fn set_scrollback_lines(&mut self, lines: usize) {
+            self.scrollback.lines = tako_core::scrollback::clamp_lines(lines);
+        }
         fn session(&self, pane: PaneId) -> Option<&TerminalSession> {
             self.sessions.get(&pane.as_u64())
         }
@@ -15450,6 +15494,51 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, DispatchError::InvalidParams(_)));
+    }
+
+    /// #818: 上限の取得・変更が 1 経路（dispatch）で完結し、範囲外は理由つきで弾く。
+    /// 見積り（`行 × 桁 × 24 B`）も同じ応答から読めることを固定する
+    #[test]
+    fn scrollbackは上限を取得変更でき範囲外を弾く() {
+        let mut host = MockHost::new();
+        let initial = dispatch(
+            &mut host,
+            Request::Scrollback { lines: None },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(initial["lines"], 10_000);
+        assert_eq!(initial["default_lines"], 10_000);
+        assert_eq!(initial["min_lines"], 100);
+        assert_eq!(initial["max_lines"], 100_000);
+        assert_eq!(initial["panes"], 2);
+        assert_eq!(initial["max_cols"], 119);
+        // #818 の実測と同じ理論値（10,000 行 × 119 桁 × 24 B = 28.56 MB）
+        assert_eq!(initial["estimated_bytes_per_pane"], 28_560_000);
+
+        let changed = dispatch(
+            &mut host,
+            Request::Scrollback { lines: Some(1_000) },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(changed["lines"], 1_000);
+        assert_eq!(changed["estimated_bytes_per_pane"], 2_856_000);
+        assert_eq!(host.scrollback.lines, 1_000);
+
+        for bad in [0_usize, 99, 1_000_000] {
+            let error = dispatch(
+                &mut host,
+                Request::Scrollback { lines: Some(bad) },
+                PaneOrigin::Cli,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, DispatchError::InvalidParams(_)),
+                "{bad} が弾かれていない"
+            );
+        }
+        assert_eq!(host.scrollback.lines, 1_000, "弾いた値で書き換えていない");
     }
 
     #[test]

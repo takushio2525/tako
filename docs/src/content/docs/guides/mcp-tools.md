@@ -1,9 +1,9 @@
 ---
 title: MCP ツール一覧
-description: tako が AI エージェントに公開する 139 個の MCP ツールの全リスト
+description: tako が AI エージェントに公開する 147 個の MCP ツールの全リスト
 ---
 
-tako は **139 個の MCP ツール**を AI エージェント（Claude Code / Codex 等）に公開しています。ほぼすべてが `tako` CLI のコマンドと 1:1 で対応しているため、細かい引数や挙動は [CLI リファレンス](/guides/cli-reference/)の対応コマンドも合わせて参照してください。
+tako は **147 個の MCP ツール**を AI エージェント（Claude Code / Codex 等）に公開しています。ほぼすべてが `tako` CLI のコマンドと 1:1 で対応しているため、細かい引数や挙動は [CLI リファレンス](/guides/cli-reference/)の対応コマンドも合わせて参照してください。
 
 :::tip[登録は一度きり]
 MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度行えば、以降はどのプロジェクトでも自動的に使えます。codex を master にする場合は `tako master` の起動時にだけ設定が注入されるため、グローバル設定の変更すら不要です。
@@ -24,6 +24,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_resize_pane` | ペインの取り分（サイズ比率）を変える |
 | `tako_equalize_layout` | タブ内の全ペインを均等化する |
 | `tako_scroll_pane` | スクロールバック表示を動かす |
+| `tako_scrollback` | スクロールバック保持行数（直接ペインのメモリ）の確認・変更 |
 | `tako_move_pane_to_tab` | ペインを別のタブへ移動する |
 | `tako_window` | 複数ウィンドウの操作（一覧 / 新規 / 閉じる / タブ移動 / フォーカス） |
 

@@ -198,7 +198,9 @@ pub struct PaneLogManager {
 pub struct PaneObservation {
     /// 現在の履歴行数
     pub history: usize,
-    /// 履歴の保持上限（飽和判定に使う。直接ペイン = SCROLLBACK_LINES、tmux = history-limit）
+    /// 履歴の保持上限（飽和判定に使う。直接ペインは
+    /// [`crate::TerminalSession::scrollback_limit`] = 設定値（#818。既定
+    /// [`crate::scrollback::DEFAULT_LINES`]）、tmux は器の `history-limit`）
     pub history_limit: usize,
     /// 履歴バイト数（tmux `#{history_bytes}`。飽和後の変化検知用。直接ペインは 0）
     pub bytes: u64,

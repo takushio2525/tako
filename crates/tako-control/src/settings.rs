@@ -62,6 +62,11 @@ pub struct Settings {
     /// ログディレクトリ全体の上限（MB。超過で古いファイルから削除）
     #[serde(default = "default_pane_log_total_max_mb")]
     pub pane_log_total_max_mb: u64,
+    /// 直接ペインのスクロールバック保持上限（行。Issue #818。既定 10,000）。
+    /// 飽和すると `行 × 桁 × 24 B` を保持するので、軽量運用では下げられる。
+    /// tmux バックエンドペイン（persist ON）は alt screen のため元々ほぼ 0
+    #[serde(default = "default_scrollback_lines")]
+    pub scrollback_lines: usize,
     /// UI テーマ（Issue #217。"dark" / "light"。既定 dark）
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -145,6 +150,10 @@ fn default_pane_log_total_max_mb() -> u64 {
     200
 }
 
+fn default_scrollback_lines() -> usize {
+    tako_core::scrollback::DEFAULT_LINES
+}
+
 fn default_preview_cache_max_mb() -> u64 {
     tako_core::PREVIEW_CACHE_DEFAULT_MB
 }
@@ -175,6 +184,7 @@ impl Default for Settings {
             pane_logs: true,
             pane_log_max_mb: default_pane_log_max_mb(),
             pane_log_total_max_mb: default_pane_log_total_max_mb(),
+            scrollback_lines: default_scrollback_lines(),
             theme: default_theme(),
             ui_mode: default_ui_mode(),
             sidebar_width: default_sidebar_width(),
@@ -230,6 +240,13 @@ impl Settings {
             max_bytes_per_pane: self.pane_log_max_mb.max(1) * 1024 * 1024,
             max_total_bytes: self.pane_log_total_max_mb.max(1) * 1024 * 1024,
         }
+    }
+
+    /// スクロールバック保持上限を解決する（Issue #818）。
+    /// **手書きの範囲外値は丸める**（`pane_log_config` と同じ方針。
+    /// 0 を書かれて履歴ゼロのペインが立つより、下限で起動するほうが直せる）
+    pub fn resolved_scrollback_lines(&self) -> usize {
+        tako_core::scrollback::clamp_lines(self.scrollback_lines)
     }
 
     /// テーマモードを tako-core の型へ解決する（不明値は既定ダーク。Issue #217）
@@ -382,6 +399,7 @@ mod tests {
             pane_logs: false,
             pane_log_max_mb: 10,
             pane_log_total_max_mb: 300,
+            scrollback_lines: 2_000,
             theme: "light".into(),
             ui_mode: "gui".into(),
             sidebar_width: 300,
@@ -409,6 +427,15 @@ mod tests {
         // 空オブジェクトでも既定が立つ（後方互換）
         let parsed: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(parsed.language, "system");
+        // #818: 旧ファイル（キー無し）はそのまま読めて既定 10,000 が使われる
+        assert_eq!(
+            parsed.scrollback_lines,
+            tako_core::scrollback::DEFAULT_LINES
+        );
+        assert_eq!(
+            parsed.resolved_scrollback_lines(),
+            tako_core::scrollback::DEFAULT_LINES
+        );
         assert_eq!(parsed.lang_setting(), tako_core::i18n::LangSetting::System);
         assert!(parsed.auto_rename);
         assert!(parsed.port_detect);

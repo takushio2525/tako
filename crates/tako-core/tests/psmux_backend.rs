@@ -118,6 +118,7 @@ fn 器はクライアント切断後もattachで内容ごと戻る() {
         command: None,
         cwd: Some(std::env::temp_dir()),
         env: vec![],
+        scrollback_lines: None,
     };
 
     // **rx を汲む**のが必須: psmux クライアントは端末クエリ（DA / DSR）への応答を待つ。
@@ -552,6 +553,7 @@ fn 明示コマンドつきの器が起動する() {
         command: Some(SpawnCommand { program, args }),
         cwd: None,
         env: vec![],
+        scrollback_lines: None,
     };
     let wrapped = f.backend.wrap_spawn(options, &name);
     let cmd = wrapped.command.expect("起動コマンドが組まれる");
@@ -998,6 +1000,7 @@ fn open_pane_with_history(f: &Fixture, name: &SessionRef) -> (tako_core::Termina
                 command: None,
                 cwd: Some(std::env::temp_dir()),
                 env: vec![],
+                scrollback_lines: None,
             },
             name,
         ),
