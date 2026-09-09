@@ -82,7 +82,8 @@ impl WorkerAgent {
     /// この CLI が受け付ける effort の既知の値（選択式 UI 用。#721）。
     /// **語彙の網羅ではなく「よく使う既知の値」**: 上流 CLI が値を増やしても既存の
     /// 設定値は保持され、CLI（`profiles set --effort`）から任意の値を指定できる。
-    /// agy は effort 指定手段が無い（モデル名の "(High)" 等に組み込み）ため空を返す
+    /// agy も `--effort low|medium|high` を受け付ける（モデル表示名の "(High)" 等は
+    /// モデル側の設定で `--effort` とは別物。#1002）
     pub fn effort_options(&self) -> &'static [&'static str] {
         match self {
             // claude の --effort
@@ -160,8 +161,8 @@ pub struct WorkerLaunch<'a> {
     /// TAKO_ORCHESTRATOR_ROLE の値（codex / agy は読まないが識別用に一律注入する）
     pub role: &'a str,
     pub model: Option<&'a str>,
-    /// thinking / reasoning effort。claude は `--effort`、codex は
-    /// `-c model_reasoning_effort=`、agy は指定手段が無いため無視される
+    /// thinking / reasoning effort。claude / agy は `--effort`、codex は
+    /// `-c model_reasoning_effort=` へ写像する（#1002。旧挙動は `TAKO_1002_LEGACY=1`）
     pub effort: Option<&'a str>,
     /// 許可プロンプトのスキップ（claude / agy: `--dangerously-skip-permissions`）。
     /// codex / agy は既定 true。**codex は承認スキップだけを頼む手段が無い**ため、

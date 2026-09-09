@@ -206,8 +206,11 @@ enum Command {
     /// 質問ゼロの自動セットアップ。claude / codex / agy を検出して環境を最適化する。
     /// アプリ未起動でも実行できる
     Setup(SetupArgs),
-    /// Claude Code の settings.json に tako MCP サーバーの接続設定を追加する。
-    /// アプリ未起動でも実行できる（settings.json の書き換えのみ）
+    /// エージェント CLI に tako MCP サーバーの接続設定を追加する（アプリ未起動でも実行できる）
+    ///
+    /// 引数なしで claude + この環境に導入済みの codex / agy へまとめて登録する。
+    /// claude の書き先は ~/.claude.json（--project のときは <cwd>/.mcp.json）、
+    /// codex / agy はそれぞれの CLI の mcp add に書かせる。
     SetupMcp(SetupMcpArgs),
     /// 動画操作（play / pause / seek。プレビューペインが動画モードの場合のみ有効）
     #[command(subcommand)]
@@ -2020,7 +2023,7 @@ enum ProfilesCommand {
         /// 対象エージェントのモデル指定を解除する
         #[arg(long, requires = "agent")]
         clear_agent_model: bool,
-        /// 対象エージェントの worker 既定 effort（agy は無視。--clear-agent-effort と排他）
+        /// 対象エージェントの worker 既定 effort（claude / codex / agy 共通。--clear-agent-effort と排他）
         #[arg(long, requires = "agent", conflicts_with = "clear_agent_effort")]
         agent_effort: Option<String>,
         /// 対象エージェントの effort 指定を解除する
@@ -3415,7 +3418,8 @@ fn mcp_serve() -> Result<(), String> {
     Ok(())
 }
 
-/// MCP セットアップ（アプリ未起動でも動作）。settings.json に tako MCP 設定を追加する
+/// MCP セットアップ（アプリ未起動でも動作）。書き先の正本は `dispatch::mcp_target_path`
+/// （claude = `~/.claude.json` / `--project` = `<cwd>/.mcp.json`。codex / agy は各 CLI の `mcp add`）
 fn setup_mcp_local(args: &SetupMcpArgs) -> Result<(), String> {
     let (scope, scope_label) = if args.project {
         let cwd = std::env::current_dir()
@@ -9253,5 +9257,116 @@ mod platform_matrix_parity {
         for pref in CLI_ONLY {
             assert!(used(pref), "CLI_ONLY の {pref} に該当するコマンドが無い");
         }
+    }
+}
+
+/// `--help` の文言が実装の正本からずれていないことを機械検査する（Issue #1248）。
+///
+/// **狙い**: 実装が動いたのに help だけ古いまま残る形を落とす。#1248 の実例は 2 つで、
+/// どちらも「実装は正しく、説明文だけが数か月前の姿を語っていた」:
+///
+/// 1. `setup-mcp` の書き先が `~/.claude/settings.json` から `~/.claude.json` /
+///    `<cwd>/.mcp.json` へ移り（旧経路は `clean_legacy_settings_json` が掃除する側になった）、
+///    さらに #979 で codex / agy へもまとめて登録するようになったのに、help は
+///    「Claude Code の settings.json に…」のままだった
+/// 2. `--agent-effort` は #1002 で agy にも `--effort` を渡すようになったのに、
+///    help は「agy は無視」のままだった
+///
+/// なので検査も**説明文どうしを比べない**。書き先は [`mcp_target_path`] が組む実パス、
+/// 能力の有無は [`agent_support`] のマトリクスという、**挙動を決めている側**と突き合わせる。
+#[cfg(test)]
+mod help_text_parity {
+    use super::*;
+    use clap::CommandFactory as _;
+    use tako_control::dispatch::{
+        mcp_target_path, McpScope, MCP_TARGET_FILE_PROJECT, MCP_TARGET_FILE_USER,
+    };
+    use tako_core::agent_support::{self, keys, Agent};
+
+    /// サブコマンドを名前でたどる（`tako orchestrator profiles set` のような多段用）
+    fn subcommand(path: &[&str]) -> clap::Command {
+        let mut cmd = Cli::command();
+        for name in path {
+            cmd = cmd
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("サブコマンド {name} が無い（{path:?}）"))
+                .clone();
+        }
+        cmd
+    }
+
+    /// `tako setup-mcp --help` が**実際に書く場所**を述べている（#1248 の①）
+    #[test]
+    fn setup_mcpのhelpが書き先の正本と一致する() {
+        let help = subcommand(&["setup-mcp"]).render_long_help().to_string();
+
+        // 正本が組む実パスの末尾要素 = help に出るべきファイル名
+        let user = mcp_target_path(&McpScope::User);
+        let project = mcp_target_path(&McpScope::Project(std::path::PathBuf::from("/tmp/x")));
+        assert!(
+            user.ends_with(MCP_TARGET_FILE_USER) && project.ends_with(MCP_TARGET_FILE_PROJECT),
+            "正本の定数と mcp_target_path がずれている: {user:?} / {project:?}"
+        );
+        for name in [MCP_TARGET_FILE_USER, MCP_TARGET_FILE_PROJECT] {
+            assert!(
+                help.contains(name),
+                "setup-mcp の --help が書き先 {name} を述べていない:\n{help}"
+            );
+        }
+
+        // 旧経路。掃除される側なので「書き先」として案内してはいけない
+        assert!(
+            !help.contains("settings.json"),
+            "setup-mcp の --help が旧経路 settings.json を書き先として案内している:\n{help}"
+        );
+
+        // #979: 引数なしで claude 以外にも登録する
+        for agent in ["claude", "codex", "agy"] {
+            assert!(
+                help.contains(agent),
+                "setup-mcp の --help が {agent} に触れていない（#979 でまとめて登録する）:\n{help}"
+            );
+        }
+    }
+
+    /// 「その系統では効かない」と書いてよいのは、マトリクスがそう宣言しているときだけ
+    fn assert_no_stale_unsupported_claim(help: &str, key: &str, where_: &str) {
+        for agent in Agent::ALL {
+            if !agent_support::supports(agent, key) {
+                continue;
+            }
+            let name = agent.as_str();
+            for phrase in [
+                format!("{name} は無視"),
+                format!("{name} は指定手段が無"),
+                format!("{name} は非対応"),
+                format!("{name} は対応していない"),
+                format!("{name}: 無視"),
+                format!("{name} 無視"),
+            ] {
+                assert!(
+                    !help.contains(&phrase),
+                    "{where_} が「{phrase}」と書いているが、マトリクスは {name} の {key} を \
+                     supported と宣言している（どちらかが古い）:\n{help}"
+                );
+            }
+        }
+    }
+
+    /// `profiles set --agent-effort` の説明が effort_control の宣言と一致する（#1248 の②）
+    #[test]
+    fn agent_effortのhelpが能力マトリクスと一致する() {
+        let cmd = subcommand(&["orchestrator", "profiles", "set"]);
+        let arg = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "agent_effort")
+            .expect("--agent-effort が無い");
+        let help = arg.get_help().map(|h| h.to_string()).unwrap_or_default();
+
+        assert!(
+            agent_support::supports(Agent::Agy, keys::EFFORT_CONTROL),
+            "この検査は agy = supported を前提にしている（#1002）"
+        );
+        assert_no_stale_unsupported_claim(&help, keys::EFFORT_CONTROL, "--agent-effort の help");
     }
 }

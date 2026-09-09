@@ -1865,7 +1865,7 @@
           "type": "array"
         },
         "agent_effort": {
-          "description": "対象エージェントの worker 既定 effort（claude: --effort / codex: model_reasoning_effort。agy は無視される）",
+          "description": "対象エージェントの worker 既定 effort（claude / agy: --effort / codex: model_reasoning_effort）",
           "type": "string"
         },
         "agent_model": {
