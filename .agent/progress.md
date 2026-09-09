@@ -19,12 +19,6 @@
 
 ---
 
-## 2026-09-09（#1200: respond が生きているペインへ in-process 経路で届くようにした）
-- 真因は「到達判定を通っていなかった」。器のセッション名を必須にし `reach::detached_session` へ直行 →
-  入力送出を持たない psmux では必ず失敗・器なしのペインは対象外（セルフテストも skip されていた）
-- 届き方を `reach::DialogAccess` へ出し `dialog_access` が in-process を先に見る形へ。手順は
-  `respond_via` の 1 実装で共有し監査へ `route=`。実機 A/B で Issue と同一エラー → `DELIVERED=1`
-
 ## 2026-09-09（#1203: UI の macOS キー表記を正本経由にし、Windows で実際のキーを出すようにした）
 - 6 か所（タブバー `⌘K` / git コミット欄 / プレビュー保存 / 確認ダイアログ / 設定 / `ui-mode` の next_step）と走査で見つかった同型 4 件を `tako_core::platform::keys` と `keybindings::shortcut_hint_for(action, platform)` へ。macOS の文言は 1 文字も不変
 - **バインド表に無い「修飾 + クリック / Enter」は Windows で案内ごと落とす**（Win キーは押せない = #763）。`key_bindings()` の `cfg` をやめ `bindings_for(platform)` にしたので macOS の CI から Windows 側を検証できる
@@ -79,3 +73,8 @@
 - 番号なし経路の「兄弟 3 行以上」を、**兄弟 2 行のときだけ「並びの直後に確定キーの案内があるか」**で補強（`dialog::confirm_hint_below`）。codex の入力待ち画面（入力行 + 直下のステータス行）は案内が無いので従来どおり非検知
 - 隔離 GUI 実測（Windows 実機 + macOS）: 下見が `kind=trust` / 2 件 / `highlighted=0`、`--choice trust` が `Down`→ラベル一致検証→`Enter` で `resolved=true`。相手側 TUI も受領を表示
 - A/B `TAKO_1223_LEGACY=1` は両 OS で Issue と同じ「選択肢ダイアログが見つからない」を再現。案内の根拠を外す注入で新旧 2 テストが FAILED。全 3785 件緑
+
+## 2026-09-09（#1022: #571 e2e が本番の事前信頼エントリを残さないようにした）
+- `E2e571Guard::drop` で `remove_e2e_trust_entry(&dir/work)` を呼ぶ形へ（#612 / #577 と同じ後始末）。この e2e は worker を既定 config dir で走らせるので隔離では倒せない
+- 番犬 `e2e_trust_cleanup_watchdog`（`impl Drop for E2e…Guard` を走査して後始末の欠落を名指し）。`#[ignore]` の本体は CI で走らないのでここだけが再発を止める
+- A/B: 後始末を外すと `crates/tako-control/src/dispatch.rs: E2e571Guard` を名指しで FAILED

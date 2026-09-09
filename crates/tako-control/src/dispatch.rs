@@ -17140,6 +17140,11 @@ mod tests {
                 .args(["-L", E2E_SOCKET_571, "kill-server"])
                 .output();
             remove_e2e_571_dir(&self.dir);
+            // #1022: この e2e は worker を既定 config dir で走らせるので、事前信頼も
+            // **実ファイル**（`~/.claude/.claude.json`）へ書く（テストの隔離は通さない）。
+            // 消さないと実行のたびに `/private/tmp/tako-e2e-571-<pid>/work` が積もる
+            // （#612 / #577 と同じ後始末。実測で 10 件残っていた）
+            remove_e2e_trust_entry(&self.dir.join("work"));
         }
     }
 
