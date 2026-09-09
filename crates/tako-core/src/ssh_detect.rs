@@ -41,8 +41,11 @@ pub struct SshCommand {
 }
 
 /// 自動追加を見送る理由。**理由を持ち帰る**ので `tako remote-folder auto` で
-/// 「なぜ出てこないのか」を説明できる（黙って何もしない、をしない）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 「なぜ出てこないのか」を説明できる（黙って何もしない、をしない）。
+///
+/// `Hash` を持つのは、見送りログの重複抑止（#1258）が
+/// **(ペイン, ssh の pid, この理由)** を鍵にするから
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SkipReason {
     /// そもそも ssh ではない
     NotSsh,

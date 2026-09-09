@@ -6,7 +6,7 @@
 //! | 層 | 中身 |
 //! |---|---|
 //! | `tako_core::ssh_detect` | コマンド行 → 宛先（純関数） |
-//! | ここ | 「どのペインの配下に ssh が居るか」の判定と**再走査の間引き** |
+//! | ここ | 「どのペインの配下に ssh が居るか」の判定・**再走査の間引き**・見送りログの重複抑止（#1258） |
 //! | `tako-app` | 自動追加の実行（background で接続 → ルートを足す）と切断の表示 |
 //!
 //! # 毎 tick 走らせない（#772 / #779 / #782 の教訓）
@@ -68,6 +68,9 @@ pub struct DetectedSsh {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkippedSsh {
     pub pane: u64,
+    /// 見送った ssh プロセスの pid。**見送りログの重複抑止（#1258）の鍵の一部**で、
+    /// 「同じ ssh がまだ生きている」と「打ち直された別の ssh」を分ける
+    pub pid: u32,
     pub reason: SkipReason,
 }
 
@@ -88,6 +91,81 @@ impl SshScanState {
     pub fn is_live(&self, destination: &str) -> bool {
         self.sessions.iter().any(|s| s.destination == destination)
     }
+}
+
+/// 見送りログの重複抑止（Issue #1258）。
+///
+/// # なぜ要るのか
+///
+/// 見送りの判定は 2 秒 tick のたびに読み直される。走査を間引いた tick では
+/// [`scan`] が `prev.skipped` をそのまま複製して返す（= 「見ていない」を
+/// 「消えた」と読み替えないための仕様）ので、**判定のたびに書くと同じ行が
+/// ペインの ssh が生きている間ずっと積もる**（実測: 非対話 ssh が 3 時間
+/// ぶら下がって 866 行 = #1258）。他の行（送達・復元・kill）が埋もれ、
+/// `grep` で追う運用（#770 / #790）が壊れる。
+///
+/// # 何を 1 エピソードと見るか
+///
+/// 鍵は **(ペイン, ssh の pid, 理由)**。`pid` を鍵に入れるので:
+///
+/// - 同じ ssh が生きている間は何回評価しても 1 行
+/// - 打ち直した（pid が替わった）ら、それは別のエピソードなので再び 1 行
+/// - 同じ pid で理由が変わる形（argv の読み替え）も別の 1 行
+///
+/// ペイン ID はプロセス生存期間中**単調増加**（`tako_core::PaneId`）なので、
+/// 閉じたペインの ID が別のペインへ回ってきて記憶が混ざることはない。
+///
+/// # 記憶の刈り取り
+///
+/// 覚えるのは**いま見送られている鍵だけ**。消えた鍵は落とす（= ssh を打ち直す
+/// ループを回されても記憶が無限に伸びない）。落としたぶんは次に同じ形が
+/// 現れたら再び 1 行書く = 「プロセスが替わったら再び 1 回」と同じ扱い。
+///
+/// 見送り → 対話 ssh へ切り替えた場合も、見送りが消えた時点で記憶が落ちるので
+/// 次の見送りは新しいエピソードとして 1 行残る。
+#[derive(Debug, Clone, Default)]
+pub struct SshSkipLog {
+    /// 既に記録した (ペイン, pid, 理由)
+    logged: HashSet<(u64, u32, SkipReason)>,
+}
+
+impl SshSkipLog {
+    /// **今回書くべき見送り**だけを返し、書いたことを覚える。
+    ///
+    /// `legacy` = `TAKO_1258_LEGACY=1`（[`legacy_1258`]）のときは抑止せず
+    /// 全部返す（同一バイナリで #1258 前の挙動を再現する A/B の口）
+    pub fn take_new(&mut self, skipped: &[SkippedSsh], legacy: bool) -> Vec<SkippedSsh> {
+        if legacy {
+            return skipped.to_vec();
+        }
+        let mut fresh: Vec<SkippedSsh> = Vec::new();
+        let mut present: HashSet<(u64, u32, SkipReason)> = HashSet::new();
+        for skip in skipped {
+            let key = (skip.pane, skip.pid, skip.reason);
+            // 同じ鍵が 1 回の走査に 2 度現れても書くのは 1 行
+            if !present.insert(key) {
+                continue;
+            }
+            if !self.logged.contains(&key) {
+                fresh.push(skip.clone());
+            }
+        }
+        // いま見送られていない鍵は忘れる（記憶を現状へ揃える）
+        self.logged = present;
+        fresh
+    }
+
+    /// 覚えている鍵の数（テストが**量**で性質を固定するための口。#1167 の規約）
+    pub fn remembered(&self) -> usize {
+        self.logged.len()
+    }
+}
+
+/// #1258 の A/B。`TAKO_1258_LEGACY=1` で**修正前の挙動**（見送りを判定のたびに
+/// `persist.log` へ書く）を同一バイナリで再現する
+pub fn legacy_1258() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_1258_LEGACY").is_some())
 }
 
 /// プロセス表を採り直す必要があるか。**メモリ上の材料だけ**で判定する。
@@ -179,6 +257,7 @@ pub fn scan(
                 Err(SkipReason::NotSsh) => {}
                 Err(reason) => skipped.push(SkippedSsh {
                     pane: target.pane,
+                    pid,
                     reason,
                 }),
             }
@@ -304,6 +383,8 @@ mod tests {
         assert!(state.sessions.is_empty());
         assert_eq!(state.skipped.len(), 1);
         assert_eq!(state.skipped[0].reason, SkipReason::PortOverride);
+        // #1258: どの ssh プロセスの見送りかまで持ち帰る（重複抑止の鍵）
+        assert_eq!(state.skipped[0].pid, 200);
     }
 
     #[test]
@@ -336,6 +417,136 @@ mod tests {
         );
         assert!(state.sessions.is_empty());
         assert!(state.argv_unavailable, "argv 不在を申告していない");
+    }
+
+    fn skip(pane: u64, pid: u32, reason: SkipReason) -> SkippedSsh {
+        SkippedSsh { pane, pid, reason }
+    }
+
+    #[test]
+    fn 同じ見送りを何回評価してもログは一行だけ() {
+        // #1258: 2 秒 tick × 3 時間 = 5400 回ぶんの評価を 60 回で代表させる
+        // （走査を間引いた tick でも `state.skipped` は前回ぶんが載っている）
+        let skipped = vec![skip(1627, 4242, SkipReason::RemoteCommand)];
+        let mut log = SshSkipLog::default();
+        let mut lines = 0usize;
+        for _ in 0..60 {
+            lines += log.take_new(&skipped, false).len();
+        }
+        assert_eq!(
+            lines, 1,
+            "同じ ssh の見送りで {lines} 行書いている（#1258）"
+        );
+        assert_eq!(log.remembered(), 1, "記憶が現状より膨らんでいる");
+    }
+
+    #[test]
+    fn sshを打ち直したら再び一行だけ書く() {
+        let mut log = SshSkipLog::default();
+        let first = vec![skip(1627, 4242, SkipReason::RemoteCommand)];
+        assert_eq!(log.take_new(&first, false).len(), 1);
+        assert_eq!(log.take_new(&first, false).len(), 0);
+        // 同じペイン・同じ理由でも pid が替わったら別のエピソード
+        let second = vec![skip(1627, 5151, SkipReason::RemoteCommand)];
+        let fresh = log.take_new(&second, false);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].pid, 5151);
+        assert_eq!(log.take_new(&second, false).len(), 0);
+        // 消えた pid の記憶は落ちている（ループで打ち直されても伸びない）
+        assert_eq!(log.remembered(), 1, "記憶が刈り取られていない");
+    }
+
+    #[test]
+    fn 理由やペインが変わったら別の一行として書く() {
+        let mut log = SshSkipLog::default();
+        let both = vec![
+            skip(1, 200, SkipReason::RemoteCommand),
+            // 同じ pid で理由が変わる形（argv の読み替え）も別の 1 行
+            skip(1, 200, SkipReason::PortOverride),
+            // 別のペインは当然別の 1 行
+            skip(2, 200, SkipReason::RemoteCommand),
+        ];
+        assert_eq!(log.take_new(&both, false).len(), 3);
+        assert_eq!(log.take_new(&both, false).len(), 0);
+        // 1 回の走査に同じ鍵が 2 度現れても書くのは 1 行
+        let dup = vec![
+            skip(9, 300, SkipReason::NoShell),
+            skip(9, 300, SkipReason::NoShell),
+        ];
+        assert_eq!(log.take_new(&dup, false).len(), 1);
+    }
+
+    #[test]
+    fn 対話sshへ切り替えると記憶が落ちて次の見送りが残る() {
+        let mut log = SshSkipLog::default();
+        let skipped = vec![skip(1627, 4242, SkipReason::RemoteCommand)];
+        assert_eq!(log.take_new(&skipped, false).len(), 1);
+        // `ssh host` へ入り直す = 見送りが消える（`sessions` 側で拾われる）
+        assert!(log.take_new(&[], false).is_empty());
+        assert_eq!(log.remembered(), 0, "見送りが消えても記憶が残っている");
+        // 同じ pid が返ってくる（= 一時的に読めなかった）形でも 1 行で済む
+        let fresh = log.take_new(&skipped, false);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(log.take_new(&skipped, false).len(), 0);
+    }
+
+    #[test]
+    fn 間引いた_tick_で持ち越された見送りも一行に畳まれる() {
+        // #1258 の温床そのものを再現する: 走査は 60 秒に 1 回しか走らないが、
+        // `scan` は間引いた tick で `prev.skipped` を持ち越すので、**2 秒 tick の
+        // たびに `state.skipped` には同じ見送りが載っている**
+        let snap = snapshot(
+            vec![],
+            &[(200, 100)],
+            &[(
+                200,
+                "ssh -o ConnectTimeout=30 win powershell -File probe.ps1",
+            )],
+        );
+        let targets = vec![target(1, 100, CommandState::Running)];
+        let mut state = SshScanState::default();
+        let mut log = SshSkipLog::default();
+        let mut lines = 0usize;
+        let mut carried = 0usize;
+        let t0 = Instant::now();
+        // 2 秒 tick を 60 回 = 実測（3 時間）と同じ形を 2 分ぶんで代表させる
+        for tick in 0..60u64 {
+            let now = t0 + Duration::from_secs(2 * tick);
+            let rescan = should_rescan(&state, &targets, false, now);
+            state = scan(&state, targets.clone(), rescan.then_some(&snap), now);
+            carried += state.skipped.len();
+            lines += log.take_new(&state.skipped, false).len();
+        }
+        assert_eq!(state.skipped[0].reason, SkipReason::RemoteCommand);
+        // 持ち越しは 60 tick ぶん載り続ける（= 素朴に書くと 60 行になっていた）
+        assert_eq!(carried, 60, "持ち越しの前提が変わっている");
+        assert_eq!(
+            lines, 1,
+            "持ち越された見送りで {lines} 行書いている（#1258）"
+        );
+    }
+
+    #[test]
+    fn 見送りログの抑止は同一バイナリで旧挙動へ戻せる() {
+        // A/B: `TAKO_1258_LEGACY=1` を付けて同じテストバイナリを走らせると
+        // 「判定のたびに書く」= #1258 の症状が再現する
+        let legacy = legacy_1258();
+        let skipped = vec![skip(1627, 4242, SkipReason::RemoteCommand)];
+        let mut log = SshSkipLog::default();
+        let mut lines = 0usize;
+        for _ in 0..60 {
+            lines += log.take_new(&skipped, legacy).len();
+        }
+        // 報告用（`-- --nocapture` で A/B の実数がそのまま読める）
+        eprintln!(
+            "[#1258 A/B] arm={} 60 回評価 -> {lines} 行",
+            if legacy { "legacy" } else { "default" }
+        );
+        if legacy {
+            assert_eq!(lines, 60, "TAKO_1258_LEGACY=1 で旧挙動が再現していない");
+        } else {
+            assert_eq!(lines, 1, "既定で {lines} 行書いている（#1258）");
+        }
     }
 
     #[test]

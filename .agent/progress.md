@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-09（#1223: 番号なし・選択肢 2 つの信頼ダイアログを検知して respond できるようにした）
-- 番号なし経路の「兄弟 3 行以上」を、**兄弟 2 行のときだけ「並びの直後に確定キーの案内があるか」**で補強（`dialog::confirm_hint_below`）。codex の入力待ち画面（入力行 + 直下のステータス行）は案内が無いので従来どおり非検知
-- 隔離 GUI 実測（Windows 実機 + macOS）: 下見が `kind=trust` / 2 件 / `highlighted=0`、`--choice trust` が `Down`→ラベル一致検証→`Enter` で `resolved=true`。相手側 TUI も受領を表示
-- A/B `TAKO_1223_LEGACY=1` は両 OS で Issue と同じ「選択肢ダイアログが見つからない」を再現。案内の根拠を外す注入で新旧 2 テストが FAILED。全 3785 件緑
-
 ## 2026-09-09（#1022: #571 e2e が本番の事前信頼エントリを残さないようにした）
 - `E2e571Guard::drop` で `remove_e2e_trust_entry(&dir/work)` を呼ぶ形へ（#612 / #577 と同じ後始末）。この e2e は worker を既定 config dir で走らせるので隔離では倒せない
 - 番犬 `e2e_trust_cleanup_watchdog`（`impl Drop for E2e…Guard` を走査して後始末の欠落を名指し）。`#[ignore]` の本体は CI で走らないのでここだけが再発を止める
@@ -63,6 +58,11 @@
 - `setup-mcp` の help（書き先は `~/.claude.json` / `<cwd>/.mcp.json`・claude 以外にも登録）と `--agent-effort` の「agy は無視」（#1002 で否定済み）を訂正。同じずれが残っていた protocol / MCP catalog / `orchestrator/agent.rs` / `mod.rs` / `.agent/orchestrator.md` も同時に直した
 - 再発防止は**文どうしを比べない**形: 書き先は `dispatch::mcp_target_path`（`MCP_TARGET_FILE_*` へ切り出し）、能力は `agent_support` の `effort_control` と突き合わせる。番犬 3 本（CLI の実 `--help` 2 本 + 全 rs / md 走査 1 本）
 - A/B: 旧文言へ戻すと 3 本とも FAILED（`main.rs:2023` / `agent.rs:165` を行番号で名指し）。全 3892 件緑
+
+## 2026-09-09（#1258: ssh 自動追加の見送りログを同一プロセスで 1 回だけにした）
+- 真因は「判定のたびに書く」こと。`apply_ssh_scan` は 2 秒 tick のたびに呼ばれ、走査を間引いた tick でも `scan` が `prev.skipped` を持ち越す（「見ていない」を「消えた」と読み替えない仕様）ので同じ行が積もっていた（実測 3 時間で 866 行）
+- 鍵を **(ペイン, ssh の pid, 理由)** にした `ssh_detect::SshSkipLog` を通してから書く形へ（`SkippedSsh` に `pid` を追加・`remote-folder auto` の `skipped` にも `pid` を出す）。記憶は現に見送られている鍵だけ残すので打ち直しループでも伸びない
+- A/B `TAKO_1258_LEGACY=1`: 60 回評価で既定 1 行 / legacy 60 行。番犬 3 本が修正前ソース（`ssh_folders.rs:208`）と pid 落ちを名指しで FAILED。全 3929 件緑
 
 ## 2026-09-09（#1081: GUI 章の撮り直しは画面ロックで着手できず・収録開始条件を 3 つに定義した）
 - 10:51〜12:22 の 90 分（30 秒 × 180 回）待って **180 回すべて施錠のまま**。`screencapture` は終始 `could not create image from rect` で、収録には入っていない（素材・完成品は前回のまま・隔離 tako も起動なし）

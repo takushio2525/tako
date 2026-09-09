@@ -1596,6 +1596,8 @@ struct TakoApp {
     ssh_auto_folders: bool,
     /// ssh 検知の最後の走査結果 + 再走査の間引き用の指紋（#976）
     ssh_scan: tako_control::ssh_detect::SshScanState,
+    /// 見送りログを既に書いた (ペイン, pid, 理由)（#1258。2 秒 tick で同じ行を積まない）
+    ssh_skip_log: tako_control::ssh_detect::SshSkipLog,
     /// 宛先 → 自動追加の状態（#976。切断してもルートは消さず、ここの `live` が落ちる）
     ssh_links: HashMap<String, ssh_folders::SshAutoLink>,
     /// ホスト → リモートフォルダの復帰待ち（#1040。**切断中だけ**存在する）
@@ -3612,6 +3614,7 @@ impl TakoApp {
             port_suggestions: Vec::new(),
             ssh_auto_folders: initial_ssh_auto_folders(),
             ssh_scan: tako_control::ssh_detect::SshScanState::default(),
+            ssh_skip_log: tako_control::ssh_detect::SshSkipLog::default(),
             ssh_links: HashMap::new(),
             remote_recovery: HashMap::new(),
             dismissed_ports: std::collections::HashSet::new(),
