@@ -36,3 +36,14 @@
 # LFS
 *.dmg filter=lfs diff=lfs merge=lfs -text
 *.zip filter=lfs diff=lfs merge=lfs -text
+
+# 作業ログの衝突は「末尾追記どうし」なので両方採用する（Issue #1246）
+# worker が並走すると progress.md は rebase のたびに衝突し、解消し損ねたマーカーが
+# 2 回 commit された（#1232 / #1241）。union は merge / rebase の両方で効く。
+#
+# union が両採用にするのは**双方が同じ領域を書き換えた**ときだけ。移送
+# （context-budget fix）は先頭を削るだけなので末尾への追記と領域が重ならず、実測でも
+# 移送 + 追記・移送 2 本同時のどちらも正しい結果になる。危ないのは既存エントリの
+# 本文を片方が書き換え片方が消す形で、union は衝突を報告せず両方を残す。
+# その取りこぼしは CI の番犬 crates/tako-control/tests/context_budget.rs が落とす
+.agent/progress*.md merge=union

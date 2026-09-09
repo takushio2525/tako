@@ -267,49 +267,216 @@ fn 規約文が予算表とずれたら落ちる() {
     );
 }
 
-/// 番犬: **毎ターン読まれるファイルにマージの残骸を混ぜない**。
+// ─── コンフリクトマーカーの番犬（Issue #1246） ────────────────────────
+
+/// 走査対象 = **毎ターン読まれる md**（`.agent/` 配下の md 全部 + 規約 2 本）。
 ///
-/// #1241 の merge commit が `.agent/progress.md` へコンフリクトマーカーを 2 箇所
-/// 持ち込み、**AI の起動時ロードにそのまま載った**（`@import` されるファイルなので
-/// 全ターンに効く）。人が読めば一目だが、マージの解消は機械的に繰り返すので
-/// 目視は当てにならない。
+/// `progress.md` は「全 PR が末尾へ 1〜3 行追記する」規約なので 6〜8 本の worker が
+/// 並走すると rebase のたびに衝突し、#1232 / #1241 では**解消し損ねたマーカーが
+/// 2 回 commit された**。`AGENTS.md` から `@import` される先なので、残骸は
+/// 毎ターンのトークンを浪費し、`context_budget` の件数・バイト判定もズラす。
+/// 2 回とも「解消したつもりの取りこぼし」だったので、目視ではなく機械検査で落とす。
 ///
-/// 検査対象は「予算表が `@import` されると宣言しているファイル」に限る
-/// （リポジトリ全体を走査すると、コンフリクトの実例を載せた docs に当たる）。
-#[test]
-fn 毎ターン読まれるファイルにマージの残骸が無い() {
-    // 3 文字までにしてこのファイル自身の説明文に当たらないようにする
-    let markers = ["<<<<<<<", "=======", ">>>>>>>", "|||||||"];
-    let mut bad: Vec<String> = Vec::new();
-    // `progress-archive.md` は `@import` されないが**同じ移送とマージの経路で壊れる**
-    // （実際に #1241 の merge で progress.md と一緒に残骸が入った）ので併せて見る
-    for rel in [
-        ".agent/progress.md",
-        ".agent/progress-archive.md",
-        ".agent/activeContext.md",
-        "AGENTS.md",
-    ] {
-        let path = repo_root().join(rel);
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
+/// #1241 で入れた狭い版（4 ファイル固定）を**置き換えた**もの。旧版には
+/// ①`=======` を一度も拾えない（`&&` が `||` より強いので判定の前半が死んでいた）
+/// ②`.agent/plans/` や `conventions.md` を見ない ③8 文字以上の装飾罫線を誤検知する、
+/// の 3 点があった。番犬を 2 本並べると片方だけ直って乖離するので 1 本に寄せる。
+fn scanned_markdown() -> Vec<(String, String)> {
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
         };
-        for (i, line) in text.lines().enumerate() {
-            // **行頭にある**ものだけを見る（本文中の `=======` 区切りや
-            // コードブロックの引用に当たらない）。`=======` は Markdown の
-            // 見出し下線でもありうるので、他のマーカーと同居する行だけ数える
-            if markers[..3].iter().any(|m| line.starts_with(m)) && line.starts_with("<<<<<<<")
-                || line.starts_with(">>>>>>>")
-                || line.starts_with("|||||||")
-            {
-                bad.push(format!("  {rel}:{}: {line}", i + 1));
+        let mut entries: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                walk(&path, root, out);
+            } else if path.extension().is_some_and(|e| e == "md") {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    out.push((rel, text));
+                }
             }
         }
     }
+
+    let root = repo_root();
+    let mut out = Vec::new();
+    walk(&root.join(".agent"), &root, &mut out);
+    for rel in ["AGENTS.md", "CLAUDE.md"] {
+        out.push((rel.to_string(), read(rel)));
+    }
+    out
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct MarkerHit {
+    /// 1 始まりの行番号（エディタ・`file:line` 参照と同じ数え方）
+    line: usize,
+    marker: &'static str,
+}
+
+/// git が書いたコンフリクトマーカーだけを拾う。
+///
+/// - 記号は **7 文字ちょうど**で、後ろは行末か空白（git が書く `<<<<<<< HEAD` の形）。
+///   8 文字以上の飾り罫線（`========`）は対象外
+/// - **`=======` は単独では見ない**。Markdown の setext 見出し（見出し文の下の `===`）と
+///   同形で、7 文字ちょうどの見出しは正規の Markdown として在りうるため。
+///   git は必ず `<<<<<<<` → (`|||||||`) → `=======` → `>>>>>>>` の順に書くので、
+///   **`<<<<<<<` が開いた領域の中にあるときだけ**マーカーとみなせば検出力は落ちない
+/// - `>>>>>>>` は領域の外でも拾う（`<<<<<<<` 側だけ消した中途半端な解消を落とすため）
+fn scan_conflict_markers(text: &str) -> Vec<MarkerHit> {
+    let mut hits = Vec::new();
+    let mut inside = false;
+    for (i, raw) in text.lines().enumerate() {
+        let Some(marker) = git_conflict_marker(raw.strip_suffix('\r').unwrap_or(raw)) else {
+            continue;
+        };
+        let hit = MarkerHit {
+            line: i + 1,
+            marker,
+        };
+        match marker {
+            "<<<<<<<" => {
+                inside = true;
+                hits.push(hit);
+            }
+            "|||||||" | "=======" if inside => hits.push(hit),
+            ">>>>>>>" => {
+                inside = false;
+                hits.push(hit);
+            }
+            _ => {}
+        }
+    }
+    hits
+}
+
+/// 行が git のマーカー行そのものなら記号を返す（行頭固定・7 文字ちょうど）
+fn git_conflict_marker(line: &str) -> Option<&'static str> {
+    ["<<<<<<<", "|||||||", "=======", ">>>>>>>"]
+        .into_iter()
+        .find(|m| {
+            line.strip_prefix(m)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+        })
+}
+
+#[test]
+fn 毎ターン読まれる_md_にコンフリクトマーカーが残っていない() {
+    let files = scanned_markdown();
+    // 走査が空振りしていない自己検査（置き場を動かしたら緑のまま素通りする事故を防ぐ）
     assert!(
-        bad.is_empty(),
-        "毎ターン @import されるファイルにマージのコンフリクトマーカーが残っている\
-         （{} 行）。AI の起動時ロードにそのまま載るので、解消してからコミットする:\n{}",
-        bad.len(),
-        bad.join("\n")
+        !files.is_empty(),
+        "走査対象が見つからない — {} 配下の md 列挙が壊れている",
+        repo_root().join(".agent").display()
     );
+    assert!(
+        files.iter().any(|(rel, _)| rel == ".agent/progress.md"),
+        "この番犬が守るべき .agent/progress.md が走査対象に入っていない（列挙: {:?}）",
+        files.iter().map(|(rel, _)| rel).collect::<Vec<_>>()
+    );
+
+    let found: Vec<String> = files
+        .iter()
+        .flat_map(|(rel, text)| {
+            scan_conflict_markers(text)
+                .into_iter()
+                .map(move |h| format!("  {rel}:{} に `{}` が残っている", h.line, h.marker))
+        })
+        .collect();
+    assert!(
+        found.is_empty(),
+        "コンフリクトマーカーが commit されている（{} 件）\n{}\n\
+         直し方: 該当行の前後を読み、両方の版を残す形へ手で直してマーカー行を消す。\n\
+         progress.md の衝突は**末尾追記どうし**なので両方残すのが正解\n\
+         （.agent/conventions.md「作業ログの衝突は両方残す」節）",
+        found.len(),
+        found.join("\n")
+    );
+}
+
+#[test]
+fn 残ったコンフリクトマーカーを行番号つきで名指しする() {
+    // 実物（.agent/progress.md）の末尾へ、rebase が残すのと同じ 3 行を挿し込む
+    let real = read(".agent/progress.md");
+    let base_lines = real.lines().count();
+    let injected = format!("{real}<<<<<<< HEAD\n- 自版\n=======\n- 他版\n>>>>>>> origin/main\n");
+
+    let hits = scan_conflict_markers(&injected);
+    assert_eq!(
+        hits,
+        vec![
+            MarkerHit {
+                line: base_lines + 1,
+                marker: "<<<<<<<"
+            },
+            MarkerHit {
+                line: base_lines + 3,
+                marker: "======="
+            },
+            MarkerHit {
+                line: base_lines + 5,
+                marker: ">>>>>>>"
+            },
+        ],
+        "3 行すべてを行番号つきで名指しする"
+    );
+
+    // `|||||||`（diff3 スタイル）と、`<<<<<<<` 側だけ消した中途半端な解消も落とす
+    assert_eq!(
+        scan_conflict_markers("a\n<<<<<<< ours\nb\n||||||| base\nc\n=======\nd\n>>>>>>> theirs\n")
+            .iter()
+            .map(|h| h.line)
+            .collect::<Vec<_>>(),
+        vec![2, 4, 6, 8],
+        "diff3 スタイルの 4 種すべてを拾う"
+    );
+    assert_eq!(
+        scan_conflict_markers("a\n=======\nb\n>>>>>>> theirs\n")
+            .iter()
+            .map(|h| h.marker)
+            .collect::<Vec<_>>(),
+        vec![">>>>>>>"],
+        "`<<<<<<<` 側だけ消した中途半端な解消も `>>>>>>>` で落ちる"
+    );
+}
+
+#[test]
+fn setext_見出しをコンフリクトマーカーと誤認しない() {
+    // 7 文字ちょうどの setext 見出し（= 誤検知の唯一の危険地帯）と、
+    // 罫線・インラインコードでの例示。どれも `<<<<<<<` が開いた領域の外なので拾わない
+    let md = "\
+Progress
+=======
+
+本文。マーカー（`<<<<<<<` / `=======` / `>>>>>>>`）はインラインコードなら行頭に来ない。
+
+小見出し
+-------
+
+========
+--------
+";
+    assert_eq!(
+        scan_conflict_markers(md),
+        vec![],
+        "正規の Markdown を 1 行も拾ってはいけない"
+    );
+
+    // 検出の根拠（`<<<<<<<` が開いていれば同じ `=======` を拾う）
+    assert_eq!(
+        scan_conflict_markers("<<<<<<< HEAD\nProgress\n=======\n>>>>>>> x\n").len(),
+        3,
+        "領域の中の `=======` は拾う（見分けているのであって見逃しているのではない）"
+    );
+
+    // 8 文字以上・6 文字以下は git が書く形ではない
+    for line in ["========", "======", "<<<<<<<<", "<<<<<<"] {
+        assert_eq!(git_conflict_marker(line), None, "{line} はマーカーではない");
+    }
 }
