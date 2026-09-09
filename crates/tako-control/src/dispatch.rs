@@ -7669,6 +7669,21 @@ fn dispatch_orchestrator_report(
         result["transcript_agent"] = json!("codex");
         Some(texts)
     });
+    // #1033: codex でもなければ agy の実況を読む（`brain/<id>/.system_generated/logs/
+    // transcript.jsonl` の `PLANNER_RESPONSE` で本文を持つ行が発話）。
+    // これで `report --messages N` が agy worker でも実データを返す
+    // （北極星実測では agy だけ `messages` が 0 件だった）
+    let transcript = transcript.or_else(|| {
+        let backend = backend.as_deref()?;
+        let cid = crate::agy_session::resolve_conversation_id_for_backend(backend)?;
+        let texts = crate::agy_session::last_agent_texts(&cid, msg_count).ok()?;
+        if texts.is_empty() {
+            return None;
+        }
+        result["session_id"] = json!(cid);
+        result["transcript_agent"] = json!("agy");
+        Some(texts)
+    });
 
     match (&transcript, &scrollback) {
         (Some(texts), _) => {
@@ -9061,6 +9076,17 @@ fn normalize_agent_status(raw: &str) -> &'static str {
     }
 }
 
+/// その `status_source` が**エージェント自身の実況ログ**由来か（#984 / #1033）。
+///
+/// codex の rollout JSONL（`codex-session`）と agy の実況 JSONL（`agy-session`）は
+/// どちらも「agent 本人が書いた一次情報」なので、`claude agents --json` と同じ権威を持つ。
+/// **判定をここ 1 箇所に寄せる**のは、系統を足したときに片方の分岐だけ直して
+/// 「構造化ソースを足したのに idle が has_children で busy へ上書きされる」
+/// （#571 で claude、#984 で codex について踏んだ形）を繰り返さないため
+fn is_live_log_source(status_source: &str) -> bool {
+    status_source == "codex-session" || status_source == "agy-session"
+}
+
 /// codex の `rate_limits` を応答 JSON へ落とす（#985）。
 /// **キー名は codex の rollout と同じ**にして、上流のドキュメントと突き合わせられるようにする
 fn rate_limits_json(rl: &crate::codex_session::RateLimits) -> serde_json::Value {
@@ -9119,6 +9145,9 @@ fn finish_worker_status(
     // rollout JSONL に `task_started` / `task_complete` が逐次書かれる。実測済み）。
     // 画面推定へ落ちるのは「claude でも codex でもない」ときだけになる
     let mut codex_thread: Option<String> = None;
+    // #1033: agy の実況（`brain/<id>/.system_generated/logs/transcript.jsonl`）。
+    // 棚卸しが「会話は SQLite だけ」と記録していたのは実態とズレていた（実物調査で訂正）
+    let mut agy_conversation: Option<String> = None;
     let (resolved_sid, status_source);
     if let Some(sid) = session_id {
         resolved_sid = Some(sid.to_string());
@@ -9133,6 +9162,12 @@ fn finish_worker_status(
                 codex_thread = Some(tid);
                 resolved_sid = None;
                 status_source = "codex-session";
+            } else if let Some(cid) =
+                crate::agy_session::resolve_conversation_id_for_backend(backend)
+            {
+                agy_conversation = Some(cid);
+                resolved_sid = None;
+                status_source = "agy-session";
             } else {
                 resolved_sid = None;
                 status_source = "screen";
@@ -9157,6 +9192,10 @@ fn finish_worker_status(
     // 実は働いている worker へ自動再送が飛ぶ（二重指示事故）。
     // 「読めて 0 ターン」（= `codex_turn_observed == false` かつこれが true）だけが未達の証拠
     let mut codex_rollout_read = false;
+    // #1033: agy も同じ約束。`USER_INPUT` が 1 件でもあれば送達の一次証拠になり、
+    // transcript を**読めなかった**ときは未達を断定しない（読めて 0 件だけが未達の証拠）
+    let mut agy_turn_observed = false;
+    let mut agy_transcript_read = false;
     let (status, mut ctx_percent) = if let Some(ref sid) = resolved_sid {
         let agent = orchestrator::query_agent_status(sid);
         (
@@ -9175,6 +9214,21 @@ fn finish_worker_status(
                 match st.status() {
                     Some(s) => (s.to_string(), st.ctx_percent),
                     None => ("unknown".to_string(), st.ctx_percent),
+                }
+            }
+            None => ("unknown".to_string(), None),
+        }
+    } else if let Some(ref cid) = agy_conversation {
+        // #1033: agy の実況 JSONL。**終端の最終発話が書かれるまでは busy**
+        // （ツール結果の本文や「喋りながらツールを呼ぶ」行を完了と読まない）。
+        // ctx% は transcript に載っていないので触らない（画面 / claude_ctx 側が解決する）
+        match crate::agy_session::read_turn_state(cid) {
+            Some(st) => {
+                agy_turn_observed = st.prompt_arrived();
+                agy_transcript_read = true;
+                match st.status() {
+                    Some(s) => (s.to_string(), None),
+                    None => ("unknown".to_string(), None),
                 }
             }
             None => ("unknown".to_string(), None),
@@ -9251,15 +9305,23 @@ fn finish_worker_status(
         // thread が解決できない / rollout が読めないときは未達と断定させない。
         // **claude の一次シグナルは `claude agents --json` 側**なのでここでは触らない
         // （#390 の「welcome 画面のまま未達」判定は不変）
+        // #1033: agy も一次シグナル（実況 JSONL）を持つようになったので同じ扱いにする。
+        // **マトリクスが Structured と宣言した系統は「読めなかった」を未達と断定しない**
+        // （でないと自動再送で二重指示になる）
         let primary_signal_unreadable = !crate::orchestrator::wait::legacy_1015()
-            && effective.agent == orchestrator::agent::WorkerAgent::Codex.as_str()
-            && !codex_rollout_read;
+            && if effective.agent == orchestrator::agent::WorkerAgent::Codex.as_str() {
+                !codex_rollout_read
+            } else if effective.agent == orchestrator::agent::WorkerAgent::Agy.as_str() {
+                !agy_transcript_read
+            } else {
+                false
+            };
         (
             orchestrator::registry::prompt_delivery_assessment_with(
                 &effective,
                 now_epoch,
                 orchestrator::registry::DeliveryEvidence {
-                    turn_observed: codex_turn_observed,
+                    turn_observed: codex_turn_observed || agy_turn_observed,
                     primary_signal_unreadable,
                 },
             ),
@@ -9366,10 +9428,11 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     // 一次シグナル扱い（idle 連続 3 回で確定）してしまう。source を実態に合わせる
     //
     // #984: codex の実況（codex-session）も同じ扱い。rollout がまだ無い＝ターン未実行の
-    // ときは構造化ソースとして何も言えないので、根拠を画面へ落とす
+    // ときは構造化ソースとして何も言えないので、根拠を画面へ落とす。
+    // #1033: agy の実況（agy-session）も同じ
     let mut status_source = status_source;
     if status == "unknown"
-        && (status_source.starts_with("agents") || status_source == "codex-session")
+        && (status_source.starts_with("agents") || is_live_log_source(&status_source))
     {
         status_source = "screen".to_string();
     }
@@ -9386,7 +9449,7 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     // 上書きされてしまう（#571 で claude について踏んだのと同じ形）
     let agents_authoritative = status_source == "agents"
         || status_source == "agents-auto"
-        || status_source == "codex-session";
+        || is_live_log_source(&status_source);
     if status == "idle" {
         let screen_busy = recent_output
             .as_ref()
