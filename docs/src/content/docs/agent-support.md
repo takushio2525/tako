@@ -23,14 +23,14 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 ## 全体
 
-能力 49 件の内訳です。
+能力 50 件の内訳です。
 
 | エージェント | 対応 | 一部対応 | 未対応 | 対象外 |
 | --- | --- | --- | --- | --- |
-| Claude Code（基準） | 49 / 49 | 0 | 0 | 0 |
-| OpenAI Codex CLI | 34 / 49 | 4 | 8 | 3 |
-| Antigravity CLI | 23 / 49 | 4 | 13 | 9 |
-| Local LLM | 0 / 49 | 0 | 40 | 9 |
+| Claude Code（基準） | 50 / 50 | 0 | 0 | 0 |
+| OpenAI Codex CLI | 34 / 50 | 4 | 9 | 3 |
+| Antigravity CLI | 23 / 50 | 4 | 14 | 9 |
+| Local LLM | 0 / 50 | 0 | 41 | 9 |
 
 ### 状態の意味
 
@@ -63,7 +63,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 ## OpenAI Codex CLI を選ぶと落ちるもの
 
-対応 34 / 49 件。以下は Claude Code との差分です（同じ理由のものはまとめています）。
+対応 34 / 50 件。以下は Claude Code との差分です（同じ理由のものはまとめています）。
 
 ### 一部対応（4 件）
 
@@ -76,7 +76,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 - **設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない**
   - 作業フォルダを起動前に信頼済みにしておく（信頼ダイアログで止まらない）（`worker_trust`）
 
-### 未対応（8 件）
+### 未対応（9 件）
 
 - **設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない**（追跡: [#975](https://github.com/takushio2525/tako/issues/975)）
   - アカウント（資格情報）の切替に追従する（`account_switch`）
@@ -92,6 +92,8 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
   - 突然死を検知して復旧コマンドを提示する（#390）（`worker_death_resume`）
 - **tako の実装が claude 専用で、この系統への配線がまだ無い**（追跡: [#983](https://github.com/takushio2525/tako/issues/983)）
   - 起動直後の Bypass 確認ダイアログを事前に承諾しておく（#407）（`worker_bypass_preaccept`）
+- **背景作業が残ったまま入力待ちになった画面をこの系統では採取していない（claude の状態行と同じ形を出すか未確認）**（追跡: [#1277](https://github.com/takushio2525/tako/issues/1277)）
+  - 背景作業（背景シェル・Monitor 等）が残っていても、ターンが終わって入力待ちになったことを検知する（#1273）（`worker_idle_with_background`）
 
 ### 対象外（3 件）
 
@@ -104,7 +106,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 ## Antigravity CLI を選ぶと落ちるもの
 
-対応 23 / 49 件。以下は Claude Code との差分です（同じ理由のものはまとめています）。
+対応 23 / 50 件。以下は Claude Code との差分です（同じ理由のものはまとめています）。
 
 ### 一部対応（4 件）
 
@@ -117,7 +119,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 - **設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない**
   - 作業フォルダを起動前に信頼済みにしておく（信頼ダイアログで止まらない）（`worker_trust`）
 
-### 未対応（13 件）
+### 未対応（14 件）
 
 - **設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない**（追跡: [#975](https://github.com/takushio2525/tako/issues/975)）
   - アカウント（資格情報）の切替に追従する（`account_switch`）
@@ -137,6 +139,8 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
   - 突然死を検知して復旧コマンドを提示する（#390）（`worker_death_resume`）
 - **tako の実装が claude 専用で、この系統への配線がまだ無い**（追跡: [#983](https://github.com/takushio2525/tako/issues/983)）
   - 起動直後の Bypass 確認ダイアログを事前に承諾しておく（#407）（`worker_bypass_preaccept`）
+- **背景作業が残ったまま入力待ちになった画面をこの系統では採取していない（claude の状態行と同じ形を出すか未確認）**（追跡: [#1277](https://github.com/takushio2525/tako/issues/1277)）
+  - 背景作業（背景シェル・Monitor 等）が残っていても、ターンが終わって入力待ちになったことを検知する（#1273）（`worker_idle_with_background`）
 
 ### 対象外（9 件）
 
@@ -158,9 +162,9 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 ## Local LLM でまだ使えないもの
 
-対応 0 / 49 件。この系統が成立したときに埋まるマスの一覧です（同じ理由のものはまとめています）。
+対応 0 / 50 件。この系統が成立したときに埋まるマスの一覧です（同じ理由のものはまとめています）。
 
-### 未対応（40 件）
+### 未対応（41 件）
 
 - **ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）**（追跡: [#990](https://github.com/takushio2525/tako/issues/990)）
   - アカウント（資格情報）の切替に追従する（`account_switch`）
@@ -193,6 +197,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
   - 1 対 1 対話の solo として起動する（`tako solo`）（`solo_launch`）
   - worker ペインの中から tako CLI で tako を操作できる（`worker_cli_control`）
   - 突然死を検知して復旧コマンドを提示する（#390）（`worker_death_resume`）
+  - 背景作業（背景シェル・Monitor 等）が残っていても、ターンが終わって入力待ちになったことを検知する（#1273）（`worker_idle_with_background`）
   - worker が tako の MCP ツール群を呼べる（`worker_mcp`）
   - 初期プロンプトが送達確認つきで届く（#32 / #530）（`worker_prompt_delivery`）
   - プロンプトが届かなかったことを検知して再送手段を出す（#390 / #530）（`worker_prompt_undelivered`）
@@ -269,6 +274,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 | --- | --- | --- | --- | --- | --- |
 | **作業中か終わったかを判定する**<br />`worker_status_detect` | 対応 | 対応 | 対応 | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #984: codex は構造化ソース（codex-session）を得たので need_streak が 8 → 3 に なり claude と同じ確定速度になる。同一タスクの A/B 実測（primes 25 個）で before = source=screen / ctx=None / **開始前の t=3s・6s に idle を出す**、after = t=9s から source=codex-session で busy を 2 標本とも捉え t=15s から idle + ctx=8。#1033: agy も実況 JSONL（agy-session）を得て need_streak が 8 → 3 になった。北極星と同じ測り方の A/B 実測（同一タスク・各 3 標本・TAKO_1033_LEGACY での同一バイナリ A/B）で検知遅延の中央値が 39.46s（38.25 / 39.46 / 41.49）→ 13.92s（13.30 / 13.92 / 14.04）。claude 15.40s / codex 11.68s と同水準で、旧側は北極星の 39.38s を再現する。偽 idle（回答前に単発 status が idle を返す最早時刻）は 3.5〜6.1s → 4.3〜5.7s で増えておらず、watch の偽イベントは 6 ラウンドとも 0 件。(Thinking) 型の誤爆（#120）は弱マーカーの agent 別分離で構造的に起こらない |
 | **画面に依らない一次シグナルで状態を取れる（`claude agents --json` 相当）**<br />`worker_status_structured` | 対応 | 対応 | 対応 | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #984 で codex-cli 0.150.1 を実物調査: $CODEX_HOME/sessions/ の rollout JSONL に task_started / task_complete が**逐次**書かれる（250 語生成を 1 秒刻みで観測: t=1s 開始 → t=27s 完了）。tako は status_source=codex-session として読む。#1033 で agy 1.1.27 を実物調査: 会話ごとの brain/&lt;id&gt;/.system_generated/logs/transcript.jsonl が**逐次追記**され、画面に答えが出た時刻と終端 PLANNER_RESPONSE が書かれた時刻が同一標本 （0.2 秒ポーリングで差 0.00 秒）。tako は status_source=agy-session として読む。ペイン → 会話は生きた agy が開いたままの brain/&lt;id&gt; を lsof で引く （codex の thread-writer-locks と同じ形） |
+| **背景作業（背景シェル・Monitor 等）が残っていても、ターンが終わって入力待ちになったことを検知する（#1273）**<br />`worker_idle_with_background` | 対応 | 未対応 [#1277](https://github.com/takushio2525/tako/issues/1277)<br />背景作業が残ったまま入力待ちになった画面をこの系統では採取していない（claude の状態行と同じ形を出すか未確認） | 未対応 [#1277](https://github.com/takushio2525/tako/issues/1277)<br />背景作業が残ったまま入力待ちになった画面をこの系統では採取していない（claude の状態行と同じ形を出すか未確認） | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #1273（2026-09-09 実測）: claude 2.1.258 の `agents --json` は `isLoading \|\| delegatedActive ? "busy" : "idle"` で状態を決め、**背景シェル / Monitor が生きているあいだ busy を返し続ける**。同時刻の本番 4 ペインで相関を確認: フッターに背景作業の申告がある 3 本 （`1 shell` / `2 shells` / `1 shell, 1 monitor`）はすべて busy、申告の無い 1 本だけが idle で、どれも入力欄は空・スピナー無し。よって tako 側は画面の状態行 `· &lt;内訳&gt; still running` を根拠に idle へ倒す。この行は claude 自身が **ターンが終わっているときだけ**継ぎ足す （背景作業の完了を待って止まっているあいだは `Waiting for … to finish` になり suffix が付かない = 実物の描画コードで確認）ので、「終わった」と「待っている」を取り違えない。codex / agy は同じ申告を出すか 実物で採っていないので宣言しない（#1277） |
 | **プロンプトが届かなかったことを検知して再送手段を出す（#390 / #530）**<br />`worker_prompt_undelivered` | 対応 | 対応 | 対応 | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | テスト: #983 の変更 2 で prompt_delivery_assessment の判断を delivery_observation （このマトリクスの WORKER_STATUS_STRUCTURED）から引く形にした。codex は rollout の task_started を送達の証拠にできるので claude と同じく未達を断定し、agy は画面確認しか 無いので未達ではなく unverified（+ verify_then_resend）を返す。緑のテスト: registry の「一次シグナルの無い系統は未達と断定せず未確認を返す」「送達の観測手段はマトリクスから引く」「ターンが走った証拠は画面検証の失敗より強い」/ dispatch の「issue983_観測手段の無い系統でも送達判定が黙らない」 |
 | **突然死を検知して復旧コマンドを提示する（#390）**<br />`worker_death_resume` | 対応 | 未対応 [#984](https://github.com/takushio2525/tako/issues/984)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#984](https://github.com/takushio2525/tako/issues/984)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: dispatch.rs のレジストリの resume_command はコメントどおり claude のみ （session ID から claude --resume を組む） |
 | **「起動も送達も成立したのに実行を断られた」停止を、完了ではなく error として検知する（#1034）**<br />`worker_refusal_detect` | 対応 | 対応 | 対応 | 対象外<br />自分のマシンで動かすモデルなので、アカウントや座席の確認で実行を断られるという事象が起こらない（断る主体がそもそも存在しない） | 実測: #1034: 北極星実測（#975）で agy worker がアカウントの適格性の検証待ちに当たり、1 文字も作業していないのに status=idle / prompt_delivery=delivered / WORKER_IDLE（50.07 秒後）を返した。#983 の分類は「まだ送達の証拠が無い worker」に限るゲートを持つので設計どおりその外だった。#1033 で agy が 実況 JSONL を得たので、**送達後でも「MODEL のステップを 1 件も観測して いない」**を条件に分類できるようになった（画面推定の busy は TUI の 起動描画を拾うので根拠にならない）。**文言は版で変わる**（agy 1.1.22 = `Verifying your account...` / `We're finishing verifying your account eligibility.`、1.1.27 = `Unable to verify account eligibility.` / `Eligibility check failed:`）ので、両版に共通して残る `account eligibility` を軸にした。**claude 2.1.258 / codex 0.153.0 のバイナリには一時的な検証待ちの文言が 無い**（2026-09-09 に実物を走査。`eligibility` の該当はすべて内部識別子・API パス・models cache の判定で、画面へ出る拒否の文ではない）ので、この 2 系統には判定パターンを宣言していない（`execution_refused_patterns` が空 = 推測を置かない）。両系統で観測されている拒否の形は未認証 （`not_authenticated`。#983）と時間で解けない利用阻害 （`entitlement_blocked`。#1106 / #1107）で、どちらも既に error になる |
