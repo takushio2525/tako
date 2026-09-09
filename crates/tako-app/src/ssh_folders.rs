@@ -11,6 +11,8 @@
 //!   自動処理が数百 ms〜数秒のストールとして現れ、原因の見当がつかない（#212 / #772）
 //! - 1 エピソード（ssh が生きている間）につき試行は 1 回。失敗しても繰り返さない。
 //!   抜けて入り直したら再試行する
+//! - **見送りの診断ログも 1 エピソードにつき 1 行**（#1258）。抑止の鍵は
+//!   `tako_control::ssh_detect::SshSkipLog` が持つ
 //! - **切断してもルートは消さない**（#976 受け入れ条件 3）。行にバッジで状態を出し、
 //!   右クリックの「再読み込み」で復帰できる
 //!
@@ -195,11 +197,22 @@ impl TakoApp {
                 tab: session.tab,
             });
         }
-        // 見送った形は理由を残す（なぜ出てこないのかを `auto` で説明できるように）
-        for skipped in &state.skipped {
+        // 見送った形は理由を残す（なぜ出てこないのかを `auto` で説明できるように）。
+        //
+        // **1 エピソードにつき 1 行**（#1258）。この関数は 2 秒 tick のたびに呼ばれ、
+        // 走査を間引いた tick でも `state.skipped` は前回ぶんが載っている（`scan` が
+        // 「見ていない」を「消えた」と読み替えない仕様）ので、判定のたびに書くと
+        // 同じ行が ssh の生存中ずっと積もる（実測 3 時間で 866 行）。
+        // いま見送られている姿は `remote-folder auto` の `skipped` がいつでも返すので、
+        // ログに要るのは「いつ起きたか」の 1 行だけ
+        let fresh = self
+            .ssh_skip_log
+            .take_new(&state.skipped, tako_control::ssh_detect::legacy_1258());
+        for skipped in &fresh {
             tako_control::diag::persist_log(&format!(
-                "ssh 自動追加を見送り: pane={} 理由={}",
+                "ssh 自動追加を見送り: pane={} pid={} 理由={}",
                 skipped.pane,
+                skipped.pid,
                 skipped.reason.note().ja()
             ));
         }
@@ -337,6 +350,9 @@ impl TakoApp {
             .map(|s| {
                 serde_json::json!({
                     "pane": s.pane,
+                    // #1258: ログは 1 エピソード 1 行になったので、どの ssh を
+                    // 指しているかは pid で突き合わせる
+                    "pid": s.pid,
                     "reason": s.reason.label(),
                 })
             })

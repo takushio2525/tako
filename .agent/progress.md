@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-09（#944: cargo test が本番の data dir と HOME 配下の設定へ書かないようにした）
-- 置き場を決める側を倒した: `paths::data_dir()` が**実行時に**テストバイナリを見分けて隔離先へ（`cfg(test)` はクレートを跨がない）＋ `orchestrator::agent_config_home()` の `cfg(test)` 隔離＋単体テストからは `claude agents --json` を起こさない
-- 「メインスレッド専有」は `mark_main_thread()` 済みのプロセスだけが名乗る。`setup` の移設と #577 e2e の後始末も隔離に合わせた（実ユーザーの setup / 残骸掃除が壊れる穴を先に塞いだ）
-- 番犬 `test_write_isolation`（空 HOME で子を起こし 0 ファイル）+ A/B `TAKO_944_LEGACY=1`。実測 36 → 0 ファイル。副産物で `ensure_trusted` が置き場ごと無い環境で黙って失敗する穴も直した
-
 ## 2026-09-09（#1030: テスト由来の事前信頼エントリの掃除口を用意した）
 - 書き先は #944 で塞ぎ済み。残骸掃除に `scripts/clean-trust-residue.sh`（dry-run 既定・`--apply` で退避つき削除）と偽 HOME のモックテスト 10 件（CI 登録）を追加
 - 番犬へ `claudeの設定エントリはテスト実行で増えない`（種を置いた HOME で子を回し件数不変を実測。A/B `TAKO_944_LEGACY=1` で増える）
@@ -78,3 +73,8 @@
 - `setup-mcp` の help（書き先は `~/.claude.json` / `<cwd>/.mcp.json`・claude 以外にも登録）と `--agent-effort` の「agy は無視」（#1002 で否定済み）を訂正。同じずれが残っていた protocol / MCP catalog / `orchestrator/agent.rs` / `mod.rs` / `.agent/orchestrator.md` も同時に直した
 - 再発防止は**文どうしを比べない**形: 書き先は `dispatch::mcp_target_path`（`MCP_TARGET_FILE_*` へ切り出し）、能力は `agent_support` の `effort_control` と突き合わせる。番犬 3 本（CLI の実 `--help` 2 本 + 全 rs / md 走査 1 本）
 - A/B: 旧文言へ戻すと 3 本とも FAILED（`main.rs:2023` / `agent.rs:165` を行番号で名指し）。全 3892 件緑
+
+## 2026-09-09（#1258: ssh 自動追加の見送りログを同一プロセスで 1 回だけにした）
+- 真因は「判定のたびに書く」こと。`apply_ssh_scan` は 2 秒 tick のたびに呼ばれ、走査を間引いた tick でも `scan` が `prev.skipped` を持ち越す（「見ていない」を「消えた」と読み替えない仕様）ので同じ行が積もっていた（実測 3 時間で 866 行）
+- 鍵を **(ペイン, ssh の pid, 理由)** にした `ssh_detect::SshSkipLog` を通してから書く形へ（`SkippedSsh` に `pid` を追加・`remote-folder auto` の `skipped` にも `pid` を出す）。記憶は現に見送られている鍵だけ残すので打ち直しループでも伸びない
+- A/B `TAKO_1258_LEGACY=1`: 60 回評価で既定 1 行 / legacy 60 行。番犬 3 本が修正前ソース（`ssh_folders.rs:208`）と pid 落ちを名指しで FAILED。全 3929 件緑
