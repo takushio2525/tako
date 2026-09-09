@@ -853,7 +853,7 @@ pub enum Request {
         agent_model: Option<String>,
         #[serde(default)]
         clear_agent_model: bool,
-        /// 対象エージェントの worker 既定 effort（agy は無視される）
+        /// 対象エージェントの worker 既定 effort（claude / codex / agy 共通）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_effort: Option<String>,
         #[serde(default)]

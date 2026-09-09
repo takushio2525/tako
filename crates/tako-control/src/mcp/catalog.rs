@@ -1421,7 +1421,7 @@ pub fn tools() -> Vec<Value> {
                     },
                     "agent_model": { "type": "string", "description": "対象エージェントの worker 既定モデル（CLI ネイティブ表記。codex: gpt-5.6-terra 等 / agy: 'Gemini 3.5 Flash (High)' 等）" },
                     "clear_agent_model": { "type": "boolean", "description": "対象エージェントのモデル指定を解除する" },
-                    "agent_effort": { "type": "string", "description": "対象エージェントの worker 既定 effort（claude: --effort / codex: model_reasoning_effort。agy は無視される）" },
+                    "agent_effort": { "type": "string", "description": "対象エージェントの worker 既定 effort（claude / agy: --effort / codex: model_reasoning_effort）" },
                     "clear_agent_effort": { "type": "boolean", "description": "対象エージェントの effort 指定を解除する" },
                     "agent_skip_permissions": { "type": "boolean", "description": "対象エージェントの許可プロンプトをスキップして起動する（明示 opt-in。agy は既定でコマンド毎に許可が出るため自律 worker 運用ではほぼ必須）" },
                     "agent_args": {

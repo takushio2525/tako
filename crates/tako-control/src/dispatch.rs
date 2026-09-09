@@ -10453,12 +10453,25 @@ pub fn setup_mcp_agents(
     Ok(resp)
 }
 
-fn mcp_target_path(scope: &McpScope) -> std::path::PathBuf {
+/// claude の MCP 設定の書き先ファイル名（user スコープ）。
+///
+/// **`~/.claude/settings.json` は旧経路**（`clean_legacy_settings_json` が掃除する側）。
+/// CLI の `--help` / 案内文はこの定数から文言を組むので、書き先を変えたら help も一緒に動く
+/// （#1248: 実装が `.claude.json` へ移ったあとも help だけ `settings.json` と言い続けていた）。
+pub const MCP_TARGET_FILE_USER: &str = ".claude.json";
+
+/// claude の MCP 設定の書き先ファイル名（project スコープ = `<cwd>/.mcp.json`）
+pub const MCP_TARGET_FILE_PROJECT: &str = ".mcp.json";
+
+/// claude の MCP 設定の書き先（**文言の正本**。`MCP_TARGET_FILE_*` と対で 1 実装）
+pub fn mcp_target_path(scope: &McpScope) -> std::path::PathBuf {
     match scope {
+        // ホームが引けないときの表示用フォールバック。`~` を join で繋ぐのは
+        // `format!("~/{…}")` が `~` 短縮の番犬（#893）に引っかかるため
         McpScope::User => home_dir()
-            .map(|h| h.join(".claude.json"))
-            .unwrap_or_else(|| std::path::PathBuf::from("~/.claude.json")),
-        McpScope::Project(cwd) => cwd.join(".mcp.json"),
+            .map(|h| h.join(MCP_TARGET_FILE_USER))
+            .unwrap_or_else(|| std::path::PathBuf::from("~").join(MCP_TARGET_FILE_USER)),
+        McpScope::Project(cwd) => cwd.join(MCP_TARGET_FILE_PROJECT),
     }
 }
 
@@ -16407,7 +16420,7 @@ mod tests {
                 "旧フィールド名の互換を維持"
             );
 
-            // agy は effort を無視し、モデル表示名をクオートして渡す
+            // agy はモデル表示名をクオートして渡し、effort も `--effort` で渡す（#1002）
             let mut params = test_spawn_params("テスト", None);
             params.agent = Some("agy");
             params.model = Some("Gemini 3.5 Flash (High)");

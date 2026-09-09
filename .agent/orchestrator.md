@@ -169,12 +169,14 @@ worker_agents:               # エージェント別の worker 設定（任意�
     model: gpt-5.6-terra     # CLI ネイティブ表記
     effort: medium           # codex は -c model_reasoning_effort= へ写像
   agy:
-    model: "Gemini 3.5 Flash (High)"   # agy はモデル表示名。effort はモデル名に組込みのため無視
+    model: "Gemini 3.5 Flash (High)"   # agy はモデル表示名（表示名の "(High)" と --effort は別物）
+    effort: high             # agy は --effort（low/medium/high）へ写像
     skip_permissions: false  # 明示 false で承認ダイアログを有効化（agy / codex は既定 true）
     args: []                 # 追加 CLI 引数（上級者向け）
 ```
 
-- **effort の写像**: claude `--effort` / codex `-c model_reasoning_effort=`（low/medium/high/xhigh/max/ultra）/ agy 無視
+- **effort の写像**: claude `--effort` / codex `-c model_reasoning_effort=`（low/medium/high/xhigh/max/ultra）/
+  agy `--effort`（low/medium/high。#1002 で実測。旧挙動 = 渡さない は `TAKO_1002_LEGACY=1`）
 - **skip_permissions**: codex / agy は**既定で承認スキップ**（worker が承認ダイアログで停止するのを防ぐ）。
   claude は既定で承認あり（Claude Code 側の設定に委ねる）。プロファイルで `skip_permissions: false`
   を明示するとどのエージェントでも承認ありに戻る。claude・agy は `--dangerously-skip-permissions`、

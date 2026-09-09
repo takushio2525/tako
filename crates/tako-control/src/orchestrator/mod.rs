@@ -736,7 +736,7 @@ pub const CLAUDE_DEFAULT_LABEL: &str = "(claude CLI default)";
 pub struct AgentWorkerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// claude: `--effort` / codex: `-c model_reasoning_effort=` / agy: 無視される
+    /// claude / agy: `--effort` / codex: `-c model_reasoning_effort=`（#1002）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
     /// 許可プロンプトのスキップ。codex / agy は `WorkerAgent::default_skip_permissions()`

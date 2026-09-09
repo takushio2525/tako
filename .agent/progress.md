@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-09（#989: ゼロスタート導入を claude 専用から 3 系統へ広げた）
-- `agent_install::AgentKind` を 3 値・`recipe(platform, agent)` を 6 マスへ（codex / agy の公式手順は実物で確認。codex は代行時 `CODEX_NON_INTERACTIVE=1` が必須 = 無いと `Start Codex now?` で返らない・agy は単一バイナリ）。`setup_bootstrap` の全操作を `_for(agent)` へ寄せ、**引数なしの claude 既定入口は残していない**
-- setup は「1 つでも使える系統があれば素通り / 無いときだけ途中まで入っているものを優先して仕上げる」形へ（単一選択を強制しない）。認証誘導・失敗案内・CLI 解決のフォールバックも系統ごと。Windows で代行するのは claude だけ（宣言 2 か所）
-- まっさら HOME + PATH 剥ぎで 3 系統の実インストール通し + 冪等（2 回目は `unchanged`）。A/B `TAKO_989_LEGACY=1` は「codex だけの HOME で claude を勧める」を再現。番犬 4 本（修正前ソースで claude 既定入口 11 個を名指しして FAILED）+ セルフテスト項目 119 拡張
-
 ## 2026-09-09（#944: cargo test が本番の data dir と HOME 配下の設定へ書かないようにした）
 - 置き場を決める側を倒した: `paths::data_dir()` が**実行時に**テストバイナリを見分けて隔離先へ（`cfg(test)` はクレートを跨がない）＋ `orchestrator::agent_config_home()` の `cfg(test)` 隔離＋単体テストからは `claude agents --json` を起こさない
 - 「メインスレッド専有」は `mark_main_thread()` 済みのプロセスだけが名乗る。`setup` の移設と #577 e2e の後始末も隔離に合わせた（実ユーザーの setup / 残骸掃除が壊れる穴を先に塞いだ）
@@ -78,3 +73,8 @@
 - 送達フロー（`main.rs` の `drive_trust_accept`）と器越しの送達（`deliver_via_tmux`）を `claude_tui::accept_step` の 1 実装へ寄せ、移動の向き・歩数・「Enter を送ってよいか」は `tako_core::dialog::confirm_step`（respond の番号なし経路と共有）へ。**承諾側を特定できないあいだは Enter を送らない**（理由は `persist.log` の `[auto-accept]` 行）
 - 模擬 TUI（実 tmux・GUI 不要）で実キーの A/B: 新 = `Down`→`Enter` で `Yes, I trust this folder` が確定 / `TAKO_1236_LEGACY=1` = `Enter` 1 発で **`No, exit` が確定**（= 事故の再現）。ベースラインの Windows 警告 10 件と一致
 - 番犬 4 本（修正前ソースを 4 本すべてが名指しで FAILED）+ 単体 8 本 + `confirm_step` 4 本。全 3905 件緑
+
+## 2026-09-09（#1248: CLI の --help が実装とずれていた 2 か所を正本から引く形に直した）
+- `setup-mcp` の help（書き先は `~/.claude.json` / `<cwd>/.mcp.json`・claude 以外にも登録）と `--agent-effort` の「agy は無視」（#1002 で否定済み）を訂正。同じずれが残っていた protocol / MCP catalog / `orchestrator/agent.rs` / `mod.rs` / `.agent/orchestrator.md` も同時に直した
+- 再発防止は**文どうしを比べない**形: 書き先は `dispatch::mcp_target_path`（`MCP_TARGET_FILE_*` へ切り出し）、能力は `agent_support` の `effort_control` と突き合わせる。番犬 3 本（CLI の実 `--help` 2 本 + 全 rs / md 走査 1 本）
+- A/B: 旧文言へ戻すと 3 本とも FAILED（`main.rs:2023` / `agent.rs:165` を行番号で名指し）。全 3892 件緑
