@@ -19,6 +19,25 @@
 
 ---
 
+<<<<<<< HEAD
+## 2026-09-09（#1192: 隔離・テストの tmux サーバーを所有者の生死で安全に回収できるようにした）
+- `tako tmux cleanup --servers`（既定 dry-run・実削除は `--apply`）を追加。判定は名前ではなく**所有プロセスの生死**（自分 / 既定 / 生きた tako-app の env 復元 / attach 中 / 所有者不明 / 出来たて を除いた残りだけ回収可）。溜めない側は使い捨て backend（`tako-iso-<自分の pid>`）の終了時 self-kill
+- 実測: 本番置き場へ dry-run = 総数 1838 / 生存 126 / 回収可 116 / 残骸 1708 / 保護 14（何も消していない）。隔離した置き場のダミーで `--apply` = 生きた所有者は `owner_alive` で無傷・死んだ所有者だけ kill + ソケット削除
+- 番犬 2 本（修正前ソースで FAILED）+ 実物テスト 3 本 + 純粋 4 本。所有者の生死ガードを外す注入で必須テストが FAILED
+
+||||||| 253f56a
+## 2026-09-09（#1186: resize --reset が実際に window サイズを戻すようにした）
+- `reset_window_size` を `resize-window -A` → `set-window-option -u window-size` の 2 段へ。**順序は逆にできない**（`-A` が window-size を manual にする = 実測）。`-A` 失敗時も解除は行い**エラーはそのまま返す**
+- 真因は「オプション解除はその場でリサイズしない」こと。クライアントがその window を見ているあいだは偶然戻るので、**別 window / クライアント不在**のときだけ症状が出る（実測で切り分け）
+- 隔離 GUI 実測: 見ていない window 1 が 119x21 → 60x15 → reset で 119x21・option 空 / A/B `TAKO_1186_LEGACY=1` は `{"reset":true}` を返しつつ 60x15 のまま
+
+## 2026-09-09（#1192: 隔離・テストの tmux サーバーを所有者の生死で安全に回収できるようにした）
+- `tako tmux cleanup --servers`（既定 dry-run・実削除は `--apply`）を追加。判定は名前ではなく**所有プロセスの生死**（自分 / 既定 / 生きた tako-app の env 復元 / attach 中 / 所有者不明 / 出来たて を除いた残りだけ回収可）。溜めない側は使い捨て backend（`tako-iso-<自分の pid>`）の終了時 self-kill
+- 実測: 本番置き場へ dry-run = 総数 1838 / 生存 126 / 回収可 116 / 残骸 1708 / 保護 14（何も消していない）。隔離した置き場のダミーで `--apply` = 生きた所有者は `owner_alive` で無傷・死んだ所有者だけ kill + ソケット削除
+- 番犬 2 本（修正前ソースで FAILED）+ 実物テスト 3 本 + 純粋 4 本。所有者の生死ガードを外す注入で必須テストが FAILED
+
+=======
+>>>>>>> origin/main
 ## 2026-09-09（#1182: ターミナルのパスリンクに cmd+右クリックメニューを付けた）
 - 並びは `tako_core::path_menu`（純粋関数）・文言はツリー（#314）の `sidebar::menu_*` を委譲で共有。新規操作は「tako で開く」= `FileOpKind::OpenInTako` の 1 つだけで **cmd+クリック自身もそこを通す**（CLI `tako file open-in-tako` / MCP `op=open_in_tako`）
 - **前提として `links::combined_screen_text` の soft wrap 判定を直した**: 実画面の行は空白詰めなので旧判定では全行が折り返し扱いになり、隣接 2 行に何か書かれているだけでパスリンクが 1 つも検出されなかった（A/B: 旧式で新テストが FAILED）
@@ -76,6 +95,13 @@
 - **剥がすのはパーサへ渡す本文だけ**（編集・保存の生テキストには触らないので BOM 付きファイルは保存しても BOM を保つ）
 - 隔離 GUI 実測: BOM 付き `README.md` の `preview-outline` が BOM 無しと同一（`sample project` level=1 block=0）。A/B 3 アーム（パース / 描画 / 先頭 1 個だけ）が確定 FAILED。全 3769 件緑
 
+<<<<<<< HEAD
+## 2026-09-09（#1033: agy に一次シグナルを与え、完了検知を claude 同等にした）
+- 前提の訂正: 「agy の会話は SQLite だけ」は実態とズレ。`brain/<id>/.system_generated/logs/transcript.jsonl` が逐次追記される平文 JSONL（**依存追加なし**）。ペイン → 会話は生きた agy が開いたままの `brain/<id>` を lsof で引く
+- `agy_session` を新設し `status_source=agy-session` / `report` の transcript 層 / 送達の一次証拠（`USER_INPUT`）へ配線。補正層の権威判定は `is_live_log_source` の 1 実装へ寄せた（**ここを忘れると `has_children` で永久 busy** = #571 / #984 と同じ罠を実機で踏んだ）
+- 隔離 GUI での A/B 実測（北極星と同じ測り方・各 3 標本）: 検知遅延の中央値 39.46s → **13.92s**（claude 15.40 / codex 11.68 と同水準）。`report` は scrollback/messages 0 → transcript/`transcript_agent=agy`/messages 1〜2。偽 idle は増えず watch の偽イベント 0 件
+||||||| 253f56a
+=======
 ## 2026-09-09（#989: ゼロスタート導入を claude 専用から 3 系統へ広げた）
 - `agent_install::AgentKind` を 3 値・`recipe(platform, agent)` を 6 マスへ（codex / agy の公式手順は実物で確認。codex は代行時 `CODEX_NON_INTERACTIVE=1` が必須 = 無いと `Start Codex now?` で返らない・agy は単一バイナリ）。`setup_bootstrap` の全操作を `_for(agent)` へ寄せ、**引数なしの claude 既定入口は残していない**
 - setup は「1 つでも使える系統があれば素通り / 無いときだけ途中まで入っているものを優先して仕上げる」形へ（単一選択を強制しない）。認証誘導・失敗案内・CLI 解決のフォールバックも系統ごと。Windows で代行するのは claude だけ（宣言 2 か所）
@@ -86,3 +112,4 @@
 - 「メインスレッド専有」は `mark_main_thread()` 済みのプロセスだけが名乗る。`setup` の移設と #577 e2e の後始末も隔離に合わせた（実ユーザーの setup / 残骸掃除が壊れる穴を先に塞いだ）
 - 番犬 `test_write_isolation`（空 HOME で子を起こし 0 ファイル）+ A/B `TAKO_944_LEGACY=1`。実測 36 → 0 ファイル。副産物で `ensure_trusted` が置き場ごと無い環境で黙って失敗する穴も直した
 
+>>>>>>> origin/main
