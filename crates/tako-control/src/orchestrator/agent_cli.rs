@@ -54,17 +54,25 @@ pub enum AgentCliProblem {
     LocalRuntimeDown,
     /// 指定のモデルがローカルに取得されていない（`ollama pull` 前）
     LocalModelMissing,
+    /// **起動も送達も成立したのに、agent 側の理由で実行そのものを拒否された**（#1034）。
+    ///
+    /// 実採取（北極星の agy r1）は「アカウントの適格性を検証中」で、CLI は起動し
+    /// 認証も通っているのに 1 文字も作業しなかった。`NotAuthenticated` と同型だが
+    /// **一時的で、時間を置いた再試行が有効**という性質が違うので分けてある
+    /// （`not_authenticated` はログインし直さない限り解けない）
+    ExecutionRefused,
 }
 
 impl AgentCliProblem {
     /// 全種別（テストが 4 系統 × 全種別を総当たりするための正本）
-    pub const ALL: [AgentCliProblem; 6] = [
+    pub const ALL: [AgentCliProblem; 7] = [
         Self::NotFound,
         Self::NotAuthenticated,
         Self::TrustWriteFailed,
         Self::ExitedImmediately,
         Self::LocalRuntimeDown,
         Self::LocalModelMissing,
+        Self::ExecutionRefused,
     ];
 
     /// 機械可読な種別（応答 JSON・ログ用）
@@ -76,6 +84,7 @@ impl AgentCliProblem {
             Self::ExitedImmediately => "exited_immediately",
             Self::LocalRuntimeDown => "local_runtime_down",
             Self::LocalModelMissing => "local_model_missing",
+            Self::ExecutionRefused => "execution_refused",
         }
     }
 
@@ -92,6 +101,10 @@ impl AgentCliProblem {
             Self::NotAuthenticated | Self::TrustWriteFailed => agent != Agent::Local,
             // runtime とモデルの取得はローカル固有
             Self::LocalRuntimeDown | Self::LocalModelMissing => agent == Agent::Local,
+            // #1034: 「ベンダー側が実行を断る」という事象は、アカウント・座席・
+            // 適格性を持つホスト型の系統でしか起こらない。自分のマシンで動く
+            // ローカル LLM には断る主体がそもそも居ない
+            Self::ExecutionRefused => agent != Agent::Local,
         }
     }
 
@@ -122,6 +135,10 @@ impl AgentCliProblem {
             Self::LocalModelMissing => Note::new(
                 "に指定のモデルがありません（まだ取得していない可能性）",
                 " does not have the requested model (it may not have been pulled yet)",
+            ),
+            Self::ExecutionRefused => Note::new(
+                "は起動して指示も届きましたが、アカウントの確認が終わっていないため実行を断られました（作業は 1 文字も進んでいません）",
+                " started and received the instruction, but refused to run because the account check has not finished (no work was done at all)",
             ),
         };
         format!("{name} CLI{}", note.text_in(lang))
@@ -208,6 +225,37 @@ impl AgentCliProblem {
                     Note::new(
                         "次の一手: `ollama serve` が動いているか確認する（起動していなければ立ち上げてから spawn し直す）",
                         "Next: check that `ollama serve` is running (start it, then spawn again)",
+                    )
+                    .text_in(lang)
+                    .to_string(),
+                );
+            }
+            Self::ExecutionRefused => {
+                // **これは時間で解ける**（`not_authenticated` と正反対）ので、
+                // 最初の一手は「待ってから spawn し直す」にする
+                out.push(
+                    Note::new(
+                        "次の一手: 少し時間を置いてから spawn し直す（アカウントの確認は通常すぐ終わる一時的な状態です）",
+                        "Next: wait a moment and spawn again (the account check is a temporary state that usually clears quickly)",
+                    )
+                    .text_in(lang)
+                    .to_string(),
+                );
+                out.push(
+                    Note::new(
+                        "何度やっても同じなら、`{cmd}` でログイン状態とプランを確認する",
+                        "If it keeps happening, check the sign-in state and plan with `{cmd}`",
+                    )
+                    .text_in(lang)
+                    .replace(
+                        "{cmd}",
+                        auth_command(agent).unwrap_or_else(|| cli_name(agent)),
+                    ),
+                );
+                out.push(
+                    Note::new(
+                        "この worker は作業を 1 文字も進めていないので、同じ指示をそのまま渡し直して構いません",
+                        "This worker did no work at all, so the same instruction can simply be handed to it again",
                     )
                     .text_in(lang)
                     .to_string(),
@@ -420,6 +468,74 @@ pub fn detect_launch_failure(agent: WorkerAgent, output: &str) -> Option<AgentCl
         return Some(AgentCliProblem::NotAuthenticated);
     }
     None
+}
+
+/// 「実行を拒否された」と読める画面の文言を**系統ごとに宣言する**（#1034 / #982 の規約）。
+///
+/// 空を返す系統は「まだ実採取していない」という意味で、**推測の文言を置かない**
+/// （能力マトリクスの `worker_launch_execution_refused` が同じことを宣言している）。
+///
+/// ## agy の実採取（版で文言が変わる）
+///
+/// | 版 | 画面 |
+/// |---|---|
+/// | 1.1.22（#1034 の実画面） | `Verifying your account...` / `We're finishing verifying your account eligibility.` / `This usually takes a moment. Please try again shortly.` |
+/// | 1.1.27（実バイナリの文字列） | `Unable to verify account eligibility.` / `Eligibility check failed: <理由>` / `This usually takes about 30 seconds. Please try again later.` |
+///
+/// 両版に共通して残るのは **`account eligibility`** なので、そこを軸に版差を吸収する。
+/// **`please try again later` 単体は採らない**: 一時的な API エラーの常套句と衝突して
+/// `api_error`（続行指示で復帰できる）を誤って `execution_refused` にしてしまう
+fn execution_refused_patterns(agent: Agent) -> &'static [&'static str] {
+    match agent {
+        // 実採取済み（#1034 の実画面 + agy 1.1.27 のバイナリ文字列）。すべて小文字で持つ
+        Agent::Agy => &[
+            "account eligibility",
+            "verifying your account",
+            "eligibility check failed",
+        ],
+        // **未調査**（同型のメッセージを実物で採れていない）。推測を置かない
+        Agent::Claude | Agent::Codex => &[],
+        // 断る主体が居ない（`applies_to` も false）
+        Agent::Local => &[],
+    }
+}
+
+/// ペインの画面から**実行そのものの拒否**を分類する（#1034）。
+///
+/// [`detect_launch_failure`] と分けてあるのは**ゲートが違う**ため。あちらは
+/// 「まだ送達の証拠が無い worker」に限るが、こちらは**送達が成立したあと**に起こる
+/// （#1034 の実測では `prompt_delivery = delivered` だった）。
+///
+/// **呼び出し側の責務**: 「agent が作業を 1 歩も始めていない」ことを一次シグナルで
+/// 確かめてから呼ぶこと。仕事を始めた worker の scrollback には、agent 自身が読んだ
+/// ファイルやコマンド出力として同じ文字列が普通に流れる（#983 が `command not found`
+/// で踏んだのと同じ形）。画面推定の busy は TUI の起動描画を拾うので根拠にならない
+pub fn detect_execution_refused(agent: WorkerAgent, output: &str) -> Option<AgentCliProblem> {
+    if legacy_execution_refused() {
+        return None;
+    }
+    let patterns = execution_refused_patterns(agent_of(agent));
+    if patterns.is_empty() {
+        return None;
+    }
+    // 末尾 20 行だけを見る（`detect_launch_failure` と同じ約束。
+    // 拒否は「いま画面に出ている」ことに意味があり、古い行まで遡ると誤検知が増える）
+    let all: Vec<&str> = output.lines().collect();
+    let tail = &all[all.len().saturating_sub(20)..];
+    tail.iter()
+        .any(|l| {
+            let lower = l.to_ascii_lowercase();
+            patterns.iter().any(|p| lower.contains(p))
+        })
+        .then_some(AgentCliProblem::ExecutionRefused)
+}
+
+/// #1034 の A/B 用の env。`TAKO_1034_LEGACY=1` で**同一バイナリのまま**分類をやめ、
+/// 旧挙動（`idle` + `delivered` = 完了に見える）へ戻す
+pub fn legacy_execution_refused() -> bool {
+    std::env::var("TAKO_1034_LEGACY")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 /// 画面 1 行が「ログインしていない」と言っているか（**実採取の文言だけ**）。

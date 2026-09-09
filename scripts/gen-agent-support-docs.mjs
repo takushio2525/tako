@@ -42,6 +42,7 @@ const CATEGORIES = [
   ['worker の監視', [
     'worker_status_detect', 'worker_status_structured',
     'worker_prompt_undelivered', 'worker_death_resume',
+    'worker_refusal_detect',
   ]],
   ['worker への指示と応答', [
     'worker_prompt_delivery', 'worker_delivery_peer',

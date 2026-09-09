@@ -330,6 +330,8 @@ pub mod keys {
     pub const WORKER_PROMPT_DELIVERY: &str = "worker_prompt_delivery";
     /// プロンプト未達の検知
     pub const WORKER_PROMPT_UNDELIVERED: &str = "worker_prompt_undelivered";
+    /// 実行を断られて止まったことの検知（#1034）
+    pub const WORKER_REFUSAL_DETECT: &str = "worker_refusal_detect";
     /// 報告の第 1 層（scrollback）
     pub const WORKER_REPORT_SCROLLBACK: &str = "worker_report_scrollback";
     /// 報告の第 2 層（transcript）
@@ -490,6 +492,12 @@ pub mod notes {
     pub const NO_LOCAL_USAGE_LIMIT: Note = Note::new(
         "自分のマシンで動かすモデルなので利用上限という概念が無い",
         "The model runs on your own machine, so there is no notion of a usage limit",
+    );
+
+    /// #1034: ローカルで動かすモデルには「実行を断る」主体が居ない
+    pub const NO_LOCAL_REFUSAL: Note = Note::new(
+        "自分のマシンで動かすモデルなので、アカウントや座席の確認で実行を断られるという事象が起こらない（断る主体がそもそも存在しない）",
+        "The model runs on your own machine, so it cannot be refused execution over an account or seat check: there is no party to refuse it",
     );
 
     /// #1013: モデル名はベンダー固有の語彙なので、claude の既定を他系統へ渡せない
@@ -1405,6 +1413,41 @@ pub const MATRIX: &[AgentFeature] = &[
              registry の「一次シグナルの無い系統は未達と断定せず未確認を返す」\
              「送達の観測手段はマトリクスから引く」「ターンが走った証拠は画面検証の失敗より強い」/ \
              dispatch の「issue983_観測手段の無い系統でも送達判定が黙らない」",
+        ),
+    },
+    AgentFeature {
+        key: keys::WORKER_REFUSAL_DETECT,
+        summary: Note::new(
+            "「起動も送達も成立したのに実行を断られた」停止を、完了ではなく error として検知する（#1034）",
+            "Detects a stop where the CLI started and the instruction arrived but the agent still refused to run, reporting it as an error rather than a completion (#1034)",
+        ),
+        // **観測されている拒否の形がすべて分類されていれば Supported**。
+        // claude / codex は未認証（#983）と利用阻害（#1106）の 2 形だけが実物で
+        // 見つかっており、どちらも既存の分類で error になる。agy にはそれに加えて
+        // **一時的な検証待ち**という第 3 の形があり、#1034 でそれを分類できるようにした
+        claude: S::Supported,
+        codex: S::Supported,
+        agy: S::Supported,
+        local: unsupported(notes::NO_LOCAL_REFUSAL),
+        evidence: AgentEvidence::Measured(
+            "#1034: 北極星実測（#975）で agy worker がアカウントの適格性の検証待ちに当たり、\
+             1 文字も作業していないのに status=idle / prompt_delivery=delivered / \
+             WORKER_IDLE（50.07 秒後）を返した。#983 の分類は「まだ送達の証拠が無い \
+             worker」に限るゲートを持つので設計どおりその外だった。#1033 で agy が \
+             実況 JSONL を得たので、**送達後でも「MODEL のステップを 1 件も観測して \
+             いない」**を条件に分類できるようになった（画面推定の busy は TUI の \
+             起動描画を拾うので根拠にならない）。\
+             **文言は版で変わる**（agy 1.1.22 = `Verifying your account...` / \
+             `We're finishing verifying your account eligibility.`、1.1.27 = \
+             `Unable to verify account eligibility.` / `Eligibility check failed:`）ので、\
+             両版に共通して残る `account eligibility` を軸にした。\
+             **claude 2.1.258 / codex 0.153.0 のバイナリには一時的な検証待ちの文言が \
+             無い**（2026-09-09 に実物を走査。`eligibility` の該当はすべて内部識別子・\
+             API パス・models cache の判定で、画面へ出る拒否の文ではない）ので、\
+             この 2 系統には判定パターンを宣言していない（`execution_refused_patterns` \
+             が空 = 推測を置かない）。両系統で観測されている拒否の形は未認証 \
+             （`not_authenticated`。#983）と時間で解けない利用阻害 \
+             （`entitlement_blocked`。#1106 / #1107）で、どちらも既に error になる",
         ),
     },
     AgentFeature {

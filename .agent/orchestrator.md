@@ -199,6 +199,23 @@ worker_agents:               # エージェント別の worker 設定（任意�
   消えるため、tako は「`•` で始まり括弧の直後が経過時間」の行だけを busy と読む
   （語で判定すると履歴行に当たって**永久 busy** になる = #571 / #120）。
   実採取と判定表は `crates/tako-control/src/orchestrator/wait.rs` の `codex_running_footer_in`
+- **実行拒否の分類（#1034）**: 「起動も送達も成立したのに、agent 側の理由で実行が
+  始まらなかった」停止は `error.kind = execution_refused`（`recommended_action =
+  retry_spawn`）として返す。**旧来はここが `idle` + `delivered` = 完了に見えていた**
+  （北極星実測で agy がアカウントの適格性の検証待ちに当たり、1 文字も作業して
+  いないのに `WORKER_IDLE` が出た）。
+  - **#983 のゲートは緩めていない**。あちらは「まだ送達の証拠が無い worker」に限る
+    ままで、こちらは**別のゲート**「一次シグナルで agent の作業ステップを 1 件も
+    観測していない」で分類する。画面推定の busy は TUI の起動描画を拾うので
+    根拠にならない（実測では `first_busy` が 0.67s に出ていたが 1 文字も進んでいない）
+  - 判定の文言は**系統ごとに宣言**する（`agent_cli::execution_refused_patterns`）。
+    実採取できているのは agy だけで、**claude 2.1.258 / codex 0.153.0 のバイナリには
+    一時的な検証待ちの文言が無い**（2026-09-09 に走査）。両系統で観測されている
+    拒否の形は未認証（#983）と時間で解けない利用阻害（#1106）で、どちらも既に error
+  - **supervisor は自動復旧しない**（`launch_failed` と同じ扱い）。ただし
+    `detail` の次の一手が「少し待って spawn し直す」を伝える。`entitlement_blocked`
+    とは逆に**時間で解ける**ので、待つ / ナッジするのではなく**やり直す**のが正解
+  - A/B は `TAKO_1034_LEGACY=1`（同一バイナリのまま分類をやめる）
 - **未達の断定（#1015 / #1033）**: `prompt_undelivered`（= supervisor の自動再送のトリガ）は
   **一次シグナルを実際に読めて、それでもターンが 1 件も無いとき**だけ出す。裏取りは
   codex = rollout の `task_started` / agy = 実況 JSONL の `USER_INPUT` でしかできないので、

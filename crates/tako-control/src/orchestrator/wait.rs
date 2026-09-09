@@ -107,16 +107,23 @@ pub enum WorkerErrorKind {
     /// 管理者 / プラン / クレジットの対処（= 人）が要る。
     /// 文言の正本は `tako_core::limit_resume::entitlement_block_line`
     EntitlementBlocked,
+    /// **起動も送達も成立したのに、agent 側の理由で実行が始まらなかった**（#1034）。
+    ///
+    /// 実測はアカウントの適格性の検証待ち（agy）。`LaunchFailed` と分けてあるのは
+    /// **時間で解ける**ため —— 導入もログインも直す必要が無く、少し待って
+    /// spawn し直せば通る。`UsageLimit` とも違い、待つべき解除時刻が存在しない
+    ExecutionRefused,
 }
 
 impl WorkerErrorKind {
     /// 全種別（往復・prompt の記載漏れを網羅検査するため）
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::ApiError,
         Self::UsageLimit,
         Self::LimitDialog,
         Self::LaunchFailed,
         Self::EntitlementBlocked,
+        Self::ExecutionRefused,
     ];
 
     /// JSON / イベント行に載せる機械可読 slug
@@ -127,6 +134,7 @@ impl WorkerErrorKind {
             Self::LimitDialog => "limit_dialog",
             Self::LaunchFailed => "launch_failed",
             Self::EntitlementBlocked => "entitlement_blocked",
+            Self::ExecutionRefused => "execution_refused",
         }
     }
 
@@ -138,6 +146,7 @@ impl WorkerErrorKind {
             "limit_dialog" => Some(Self::LimitDialog),
             "launch_failed" => Some(Self::LaunchFailed),
             "entitlement_blocked" => Some(Self::EntitlementBlocked),
+            "execution_refused" => Some(Self::ExecutionRefused),
             _ => None,
         }
     }
@@ -157,6 +166,10 @@ impl WorkerErrorKind {
             // **時間では解けない**（#1106）。ナッジも待機も respawn も効かないので、
             // 管理者 / プラン / クレジットの対処をユーザーへ伝えるのが唯一の前進
             Self::EntitlementBlocked => "needs_human",
+            // #1034: 一時的な拒否なので**再試行が正解**。作業は 1 文字も進んでいないので
+            // 同じ指示をそのまま渡し直してよい（続行ナッジでは復帰しない = ターンが
+            // そもそも始まっていないため、spawn し直す側）
+            Self::ExecutionRefused => "retry_spawn",
         }
     }
 }

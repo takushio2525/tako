@@ -9196,6 +9196,10 @@ fn finish_worker_status(
     // transcript を**読めなかった**ときは未達を断定しない（読めて 0 件だけが未達の証拠）
     let mut agy_turn_observed = false;
     let mut agy_transcript_read = false;
+    // #1034: 一次シグナルで「agent が作業を 1 歩でも始めた」ことを観測できたか。
+    // **None = 何も言えない**（読めない系統・まだ会話が無い）ので、
+    // 実行拒否の分類はここが `Some(false)` のときだけに限る
+    let mut agent_work_started: Option<bool> = None;
     let (status, mut ctx_percent) = if let Some(ref sid) = resolved_sid {
         let agent = orchestrator::query_agent_status(sid);
         (
@@ -9211,6 +9215,9 @@ fn finish_worker_status(
                 codex_rate_limits = st.rate_limits.clone();
                 codex_turn_observed = st.prompt_arrived();
                 codex_rollout_read = true;
+                // #1034: codex は `task_started` が 1 件でもあれば作業に入っている
+                // （rollout のターンは投入されたプロンプトでしか始まらない）
+                agent_work_started = Some(st.prompt_arrived());
                 match st.status() {
                     Some(s) => (s.to_string(), st.ctx_percent),
                     None => ("unknown".to_string(), st.ctx_percent),
@@ -9226,6 +9233,8 @@ fn finish_worker_status(
             Some(st) => {
                 agy_turn_observed = st.prompt_arrived();
                 agy_transcript_read = true;
+                // #1034: 「実行が始まったか」の一次証拠。**画面の busy とは別物**
+                agent_work_started = Some(st.agent_work_started());
                 match st.status() {
                     Some(s) => (s.to_string(), None),
                     None => ("unknown".to_string(), None),
@@ -9348,6 +9357,7 @@ fn finish_worker_status(
         agent_process_alive,
         limit_resume,
         codex_rate_limits,
+        agent_work_started,
     })
 }
 
@@ -9383,6 +9393,16 @@ struct ResolvedWorkerStatus {
     limit_resume: Value,
     /// #985: codex の構造化されたレート制限（rollout の `rate_limits`。他 agent は None）
     codex_rate_limits: Option<crate::codex_session::RateLimits>,
+    /// #1034: **一次シグナルで「agent が作業を 1 歩でも始めた」ことを観測できたか**。
+    ///
+    /// `Some(true)` = 仕事に入っている（実行拒否ではありえない）/
+    /// `Some(false)` = 一次シグナルを読めて、そこに作業のステップが 1 件も無い /
+    /// `None` = 一次シグナルで何も言えない（読めない系統・まだ会話が無い）。
+    ///
+    /// **画面推定の busy は使えない**: agent CLI の TUI は起動描画だけで busy に見える
+    /// （#1034 の実測では `first_busy` が 0.67s に出ているが、実際は 1 文字も
+    /// 進んでいなかった）
+    agent_work_started: Option<bool>,
 }
 
 /// worker_status の初期状態に補正ロジックを適用し、最終的な JSON 応答を構築する。
@@ -9391,6 +9411,7 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     let ResolvedWorkerStatus {
         mut status,
         status_source,
+        agent_work_started,
         codex_rate_limits,
         ctx_percent,
         ctx,
@@ -9560,6 +9581,56 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
                         "detail": err.message(),
                         "recommended_action": kind.recommended_action(),
                         // 機械が分岐できる細分類（cli_not_found / not_authenticated / …）
+                        "launch_problem": problem.kind(),
+                    }));
+                }
+            }
+        }
+    }
+
+    // #1034: **起動も送達も成立したのに、agent 側の理由で実行が始まらなかった**。
+    // #983 の分類（上）は「まだ送達の証拠が無い worker」に限るゲートを持つので、
+    // 送達が成立していたこの事象はそこから落ちて `idle` + `delivered` = 完了に見えていた。
+    //
+    // **ゲートを緩めるのではなく、別のゲートで分類する**のが肝:
+    // **一次シグナルで agent の作業を 1 歩も観測していない**ときだけ見る。これで
+    // 「仕事を始めた worker の scrollback に同じ文字列が流れる」型の誤検知
+    // （#983 が `command not found` で避けたもの）を構造的に避けられる。
+    // **画面推定の busy は根拠にならない**（TUI の起動描画だけで busy に見える。
+    // #1034 の実測では `first_busy` が 0.67s に出ていたが 1 文字も進んでいなかった）。
+    //
+    // **`None`（会話そのものが無い）も「作業ゼロ」に数える**のが実挙動に要る:
+    // 拒否は会話が作られる前に起こるので（#1034 の実画面は CLI の起動直後）、
+    // `Some(false)` だけに限ると本来の事象で発火しない。`None` を数えても危なくないのは
+    // **ペイン → 会話の解決が sticky** だから ——  一度でも解決できたペインは以後
+    // ずっと `Some(..)` を返す（`agy_session::resolve_conversation_id_for_backend`）ので、
+    // ここで `None` = そのペインが生きているあいだ一度も会話を開いていない、が durable に言える。
+    // ただし**一次シグナルを持つ系統に限る**（持たない系統では `None` が
+    // 「見えないだけ」と区別できない）
+    let work_unobserved = agent_work_started != Some(true)
+        && registry_agent
+            .as_deref()
+            .and_then(tako_core::agent_support::Agent::parse)
+            .is_some_and(|a| {
+                tako_core::agent_support::supports(
+                    a,
+                    tako_core::agent_support::keys::WORKER_STATUS_STRUCTURED,
+                )
+            });
+    if error_info.is_none() && work_unobserved && (status == "idle" || status == "unknown") {
+        if let (Some(agent_name), Some(out)) = (registry_agent.as_deref(), recent_output.as_deref())
+        {
+            if let Ok(agent) = crate::orchestrator::agent::WorkerAgent::parse(agent_name) {
+                if let Some(problem) =
+                    crate::orchestrator::agent_cli::detect_execution_refused(agent, out)
+                {
+                    let kind = crate::orchestrator::wait::WorkerErrorKind::ExecutionRefused;
+                    let err = crate::orchestrator::agent_cli::AgentCliError { agent, problem };
+                    status = "error".to_string();
+                    error_info = Some(json!({
+                        "kind": kind.as_str(),
+                        "detail": err.message(),
+                        "recommended_action": kind.recommended_action(),
                         "launch_problem": problem.kind(),
                     }));
                 }
@@ -22265,6 +22336,91 @@ mod tests {
         )
         .unwrap();
         assert_ne!(v["status"], "error", "動いている worker を落とさない");
+    }
+
+    #[test]
+    fn issue1034_送達後に実行を断られた画面をerrorにする() {
+        use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
+        let path = registry_path().unwrap();
+        // **送達済み**の agy worker（#983 のゲートの外 = 旧実装では idle に見えていた形）
+        WorkerRegistry::mutate_at(&path, |reg| {
+            reg.workers.insert(
+                "q10341".into(),
+                WorkerEntry {
+                    pane: 10341,
+                    agent: "agy".into(),
+                    status: "active".into(),
+                    spawned_at: "2026-01-01T00:00:00Z".into(),
+                    prompt_delivered_at: Some(crate::sessions::now_iso()),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+
+        // #1034 の実画面（agy 1.1.22。#927 に従いプレースホルダへ置換済み）。
+        // `backend_session: None` = 会話が 1 つも解決できない = 作業ゼロの側
+        let refused = |screen: &str| {
+            finish_worker_status(
+                WorkerStatusCtx {
+                    pane_id: 10341,
+                    pane_exists: true,
+                    backend_session: None,
+                    live_tail: Some(screen.into()),
+                    full_screen: None,
+                    has_running_children: false,
+                    limit_resume: Value::Null,
+                },
+                None,
+                None,
+            )
+            .unwrap()
+        };
+
+        let v = refused(
+            "[testuser@host:proj]$ TAKO_ORCHESTRATOR_ROLE='worker:p1034' agy --model x\n\
+             ⚠ Verifying your account...\n\
+             \u{2523}  We're finishing verifying your account eligibility.\n\
+             This usually takes a moment. Please try again shortly.\n",
+        );
+        assert_eq!(v["status"], "error", "idle（= 完了）に見せない");
+        assert_eq!(v["error"]["kind"], "execution_refused");
+        assert_eq!(v["error"]["launch_problem"], "execution_refused");
+        assert_eq!(v["error"]["recommended_action"], "retry_spawn");
+        let detail = v["error"]["detail"].as_str().unwrap();
+        assert!(detail.contains("agy"), "どの CLI の話か: {detail}");
+        // **表示言語は環境で変わる**（テストの並列実行で日英どちらにもなる）ので、
+        // 「再試行が正解」を言語ごとの語で見る。文言そのものの固定は
+        // `issue1034_execution_refused` が日英とも総当たりで行う
+        assert!(
+            detail.contains("時間を置いて") || detail.contains("wait a moment"),
+            "再試行が正解であることが入っていること: {detail}"
+        );
+        // 版が変わった文言でも同じく分類される
+        let v = refused("⚠ Unable to verify account eligibility.\n");
+        assert_eq!(v["error"]["kind"], "execution_refused");
+
+        // **正常に仕事をした worker の画面は落とさない**（受け入れ条件 2）
+        let v = refused(
+            "  ガイドラインを確認しました。\n  sample.txt の行数を数えました。\n  RESULT: 137\n",
+        );
+        assert_ne!(v["status"], "error", "動いている worker を落とさない");
+
+        // **判定パターンを実採取していない系統では分類しない**（#982 の規約）。
+        // なお「一次シグナルを持つ系統に限る」というゲート側の条件は、実データでは
+        // この経路と重なって見えない（パターンを持つ agy は一次シグナルも持つ）ので、
+        // ゲートの形そのものは番犬 `agy_execution_refused_watchdog` が固定する
+        WorkerRegistry::mutate_at(&path, |reg| {
+            if let Some(e) = reg.workers.get_mut("q10341") {
+                e.agent = "local".into();
+            }
+        })
+        .unwrap();
+        let v = refused("⚠ Unable to verify account eligibility.\n");
+        assert_ne!(
+            v["error"]["kind"], "execution_refused",
+            "一次シグナルの無い系統では分類しない"
+        );
     }
 
     #[test]

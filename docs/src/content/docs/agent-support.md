@@ -23,14 +23,14 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 ## 全体
 
-能力 48 件の内訳です。
+能力 49 件の内訳です。
 
 | エージェント | 対応 | 一部対応 | 未対応 | 対象外 |
 | --- | --- | --- | --- | --- |
-| Claude Code（基準） | 48 / 48 | 0 | 0 | 0 |
-| OpenAI Codex CLI | 33 / 48 | 4 | 8 | 3 |
-| Antigravity CLI | 22 / 48 | 4 | 13 | 9 |
-| Local LLM | 0 / 48 | 0 | 40 | 8 |
+| Claude Code（基準） | 49 / 49 | 0 | 0 | 0 |
+| OpenAI Codex CLI | 34 / 49 | 4 | 8 | 3 |
+| Antigravity CLI | 23 / 49 | 4 | 13 | 9 |
+| Local LLM | 0 / 49 | 0 | 40 | 9 |
 
 ### 状態の意味
 
@@ -63,7 +63,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 ## OpenAI Codex CLI を選ぶと落ちるもの
 
-対応 33 / 48 件。以下は Claude Code との差分です（同じ理由のものはまとめています）。
+対応 34 / 49 件。以下は Claude Code との差分です（同じ理由のものはまとめています）。
 
 ### 一部対応（4 件）
 
@@ -104,7 +104,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 ## Antigravity CLI を選ぶと落ちるもの
 
-対応 22 / 48 件。以下は Claude Code との差分です（同じ理由のものはまとめています）。
+対応 23 / 49 件。以下は Claude Code との差分です（同じ理由のものはまとめています）。
 
 ### 一部対応（4 件）
 
@@ -158,7 +158,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 ## Local LLM でまだ使えないもの
 
-対応 0 / 48 件。この系統が成立したときに埋まるマスの一覧です（同じ理由のものはまとめています）。
+対応 0 / 49 件。この系統が成立したときに埋まるマスの一覧です（同じ理由のものはまとめています）。
 
 ### 未対応（40 件）
 
@@ -207,7 +207,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 - **ローカル LLM のハーネスが決まっていないので可否が定まらない（codex TUI を借りる #990 なら在り、非 TUI 経路の #991 なら無い）**（追跡: [#990](https://github.com/takushio2525/tako/issues/990)）
   - 作業フォルダを起動前に信頼済みにしておく（信頼ダイアログで止まらない）（`worker_trust`）
 
-### 対象外（8 件）
+### 対象外（9 件）
 
 - **自分のマシンで動かすモデルなので利用上限という概念が無い**
   - エージェント CLI 自身が上限解除後に続行する（同じプロセスが生き続けているあいだだけ。#1140）（`limit_autocontinue_upstream`）
@@ -222,6 +222,8 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
   - 時間では解けない利用阻害で止まったことを検知する（#1106）（`worker_entitlement_detect`）
 - **モデル名はベンダー固有の語彙なので claude 用の既定を渡せない（渡すと存在しないモデル名で起動する）。この系統のモデルは `worker_agents.&lt;agent&gt;.model` か spawn の明示指定で決め、無ければ CLI の既定に委ねる**
   - claude 語彙で書かれたモデル / effort の既定（プロファイルの worker_model / アカウントの default_model）を worker へ継承する（#1013）（`worker_model_default_inherit`）
+- **自分のマシンで動かすモデルなので、アカウントや座席の確認で実行を断られるという事象が起こらない（断る主体がそもそも存在しない）**
+  - 「起動も送達も成立したのに実行を断られた」停止を、完了ではなく error として検知する（#1034）（`worker_refusal_detect`）
 
 ## セットアップ
 
@@ -269,6 +271,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 | **画面に依らない一次シグナルで状態を取れる（`claude agents --json` 相当）**<br />`worker_status_structured` | 対応 | 対応 | 対応 | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #984 で codex-cli 0.150.1 を実物調査: $CODEX_HOME/sessions/ の rollout JSONL に task_started / task_complete が**逐次**書かれる（250 語生成を 1 秒刻みで観測: t=1s 開始 → t=27s 完了）。tako は status_source=codex-session として読む。#1033 で agy 1.1.27 を実物調査: 会話ごとの brain/&lt;id&gt;/.system_generated/logs/transcript.jsonl が**逐次追記**され、画面に答えが出た時刻と終端 PLANNER_RESPONSE が書かれた時刻が同一標本 （0.2 秒ポーリングで差 0.00 秒）。tako は status_source=agy-session として読む。ペイン → 会話は生きた agy が開いたままの brain/&lt;id&gt; を lsof で引く （codex の thread-writer-locks と同じ形） |
 | **プロンプトが届かなかったことを検知して再送手段を出す（#390 / #530）**<br />`worker_prompt_undelivered` | 対応 | 対応 | 対応 | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | テスト: #983 の変更 2 で prompt_delivery_assessment の判断を delivery_observation （このマトリクスの WORKER_STATUS_STRUCTURED）から引く形にした。codex は rollout の task_started を送達の証拠にできるので claude と同じく未達を断定し、agy は画面確認しか 無いので未達ではなく unverified（+ verify_then_resend）を返す。緑のテスト: registry の「一次シグナルの無い系統は未達と断定せず未確認を返す」「送達の観測手段はマトリクスから引く」「ターンが走った証拠は画面検証の失敗より強い」/ dispatch の「issue983_観測手段の無い系統でも送達判定が黙らない」 |
 | **突然死を検知して復旧コマンドを提示する（#390）**<br />`worker_death_resume` | 対応 | 未対応 [#984](https://github.com/takushio2525/tako/issues/984)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#984](https://github.com/takushio2525/tako/issues/984)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: dispatch.rs のレジストリの resume_command はコメントどおり claude のみ （session ID から claude --resume を組む） |
+| **「起動も送達も成立したのに実行を断られた」停止を、完了ではなく error として検知する（#1034）**<br />`worker_refusal_detect` | 対応 | 対応 | 対応 | 対象外<br />自分のマシンで動かすモデルなので、アカウントや座席の確認で実行を断られるという事象が起こらない（断る主体がそもそも存在しない） | 実測: #1034: 北極星実測（#975）で agy worker がアカウントの適格性の検証待ちに当たり、1 文字も作業していないのに status=idle / prompt_delivery=delivered / WORKER_IDLE（50.07 秒後）を返した。#983 の分類は「まだ送達の証拠が無い worker」に限るゲートを持つので設計どおりその外だった。#1033 で agy が 実況 JSONL を得たので、**送達後でも「MODEL のステップを 1 件も観測して いない」**を条件に分類できるようになった（画面推定の busy は TUI の 起動描画を拾うので根拠にならない）。**文言は版で変わる**（agy 1.1.22 = `Verifying your account...` / `We're finishing verifying your account eligibility.`、1.1.27 = `Unable to verify account eligibility.` / `Eligibility check failed:`）ので、両版に共通して残る `account eligibility` を軸にした。**claude 2.1.258 / codex 0.153.0 のバイナリには一時的な検証待ちの文言が 無い**（2026-09-09 に実物を走査。`eligibility` の該当はすべて内部識別子・API パス・models cache の判定で、画面へ出る拒否の文ではない）ので、この 2 系統には判定パターンを宣言していない（`execution_refused_patterns` が空 = 推測を置かない）。両系統で観測されている拒否の形は未認証 （`not_authenticated`。#983）と時間で解けない利用阻害 （`entitlement_blocked`。#1106 / #1107）で、どちらも既に error になる |
 
 ## worker への指示と応答
 

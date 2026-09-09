@@ -1037,6 +1037,16 @@ pub fn supervisor_loop(
                 WorkerErrorKind::EntitlementBlocked => {
                     report_needs_human(&mut ctx, "entitlement_blocked", detail, &mut state)
                 }
+                // #1034: 起動も送達も成立したのに agent 側が実行を断った
+                // （アカウントの適格性の検証待ち等）。**自動では復旧しない**:
+                // 続行ナッジはターンがそもそも始まっていないので効かず、
+                // 自動 respawn は「同じ拒否をもう一度踏むだけ」になりうる
+                // （時間の当てが無いまま繰り返すと指示が二重に渡る恐れもある）。
+                // 再試行が正解であること自体は detail の次の一手が伝えるので、
+                // 判断は人 / master へ返す（`launch_failed` と同じ扱い = Issue の 4）
+                WorkerErrorKind::ExecutionRefused => {
+                    report_needs_human(&mut ctx, "execution_refused", detail, &mut state)
+                }
             },
             WatchOutcome::AgentDead { resume_command } => {
                 recover_dead(&mut ctx, resume_command.as_deref(), &mut state)

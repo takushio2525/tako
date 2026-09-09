@@ -165,6 +165,12 @@ pub struct TurnState {
     pub events: usize,
     /// ユーザーの投入（`USER_INPUT`）を 1 件でも観測したか
     pub user_input_seen: bool,
+    /// **モデルが 1 歩でも動いたか**（`source = MODEL` のステップを 1 件でも観測した）。
+    ///
+    /// #1034 のゲートが使う。送達は成立したのに agent 側の理由で実行が始まらない
+    /// （アカウント検証待ち等）と、`USER_INPUT` はあっても `MODEL` のステップが
+    /// 1 件も書かれない。**画面推定の busy は TUI の起動描画を拾う**ので使えない
+    pub model_step_seen: bool,
 }
 
 impl TurnState {
@@ -186,6 +192,15 @@ impl TurnState {
     /// 言い切れる。これは画面の送達確認（#32 / #640）より強い証拠
     pub fn prompt_arrived(&self) -> bool {
         self.user_input_seen
+    }
+
+    /// **agent が実際に作業を始めた証拠があるか**（#1034）。
+    ///
+    /// `MODEL` のステップ（思考・ツール呼び出し・発話）が 1 件でも書かれていれば、
+    /// その worker は仕事に入っている。1 件も無ければ「起動も送達も成立したのに
+    /// 1 文字も進んでいない」状態で、画面に拒否の文言があれば分類してよい
+    pub fn agent_work_started(&self) -> bool {
+        self.model_step_seen
     }
 }
 
@@ -276,6 +291,7 @@ pub fn parse_turn_state(lines: &[&str]) -> TurnState {
     st.user_input_seen = steps
         .iter()
         .any(|s| s.source == "USER_EXPLICIT" && s.kind == "USER_INPUT");
+    st.model_step_seen = steps.iter().any(|s| s.source == "MODEL");
     // `step_index` 最大 → 同値ならファイルで後にある方（追記順が新しい）
     let last = steps
         .iter()
