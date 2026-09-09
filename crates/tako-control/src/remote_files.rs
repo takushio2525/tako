@@ -2233,17 +2233,70 @@ mod tests {
     #[test]
     fn ツリーに出ていないルートは拒否される() {
         let fx = Fixture::new("unknown");
+        // 実在 id の綴り違い。**大文字化した id は使わない**: id は 12 桁の小文字
+        // 16 進なので (10/16)^12 ≒ 1/280 の割合で数字だけになり、その回は
+        // `to_uppercase()` が元と同じ綴り = 実在の id になる（#1229 の真因）。
+        // 代わりに長さで必ず外れる形（1 文字短い / 1 文字長い）を置き、
+        // 前方一致・後方一致で通してしまう実装も落とす。
+        // 大小文字の区別は `ルートidの照合は大小文字を区別する` が別に見る
+        let too_short = fx.root_id()[..fx.root_id().len() - 1].to_string();
+        let too_long = format!("{}0", fx.root_id());
         for bogus in [
             "",
             "deadbeefdead",
             "../",
-            fx.root_id().to_uppercase().as_str(),
+            too_short.as_str(),
+            too_long.as_str(),
         ] {
             let err = resolve_in_root(&fx.roots, bogus, "hello.txt")
                 .err()
                 .unwrap_or_else(|| panic!("未知のルートが素通りした: {bogus:?}"));
             assert_eq!(err, Denial::UnknownRoot, "bogus={bogus:?}");
             assert_eq!(err.status(), 403);
+        }
+    }
+
+    #[test]
+    fn ルートidの照合は大小文字を区別する() {
+        let fx = Fixture::new("case");
+        // fixture のルートは pid 由来のパスなので id の綴りが毎回変わる。
+        // ここで見たいのは照合の大小文字区別だけなので、**英字を含む id を据える**
+        // （毎回変わる id に「大文字化すれば必ず別物」を期待すると #1229 になる）
+        let mut roots = fx.roots.clone();
+        roots[0].id = "a1b2c3d4e5f6".to_string();
+        assert!(
+            resolve_in_root(&roots, "a1b2c3d4e5f6", "hello.txt").is_ok(),
+            "据えた id そのものは読める"
+        );
+        let err = resolve_in_root(&roots, "A1B2C3D4E5F6", "hello.txt")
+            .expect_err("大文字の id が素通りした");
+        assert_eq!(err, Denial::UnknownRoot);
+        assert_eq!(err.status(), 403);
+    }
+
+    #[test]
+    fn root_idは小文字16進で数字だけにもなりうる() {
+        // 「id を大文字化すれば必ず別の綴りになる」は**成り立たない**。
+        // 実測（#1229）: これを前提にしたテストは 1000 回中 4 回落ちていた。
+        // 入力は固定なので、この検査自体は偶然に依らない
+        let all_digits = root_id_of("/tako-1229/2020");
+        assert_eq!(
+            all_digits, "502281113308",
+            "root_id_of の作り方を変えたら、数字だけになる入力を探し直してここへ据えること"
+        );
+        assert_eq!(
+            all_digits.to_uppercase(),
+            all_digits,
+            "数字だけの id は大文字化しても変わらない"
+        );
+        for path in ["", "/tako-1229/0", "/tako-1229/2020"] {
+            let id = root_id_of(path);
+            assert_eq!(id.len(), 12, "id={id}");
+            assert!(
+                id.chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "id は小文字 16 進であること: {id}"
+            );
         }
     }
 
