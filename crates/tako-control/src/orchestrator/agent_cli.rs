@@ -290,10 +290,8 @@ pub struct InstallGuidance {
 ///
 /// - claude: 手順の正本は境界 B17（`platform::agent_install`）が持つので**そこから引く**
 ///   （#868 と食い違わせない。プラットフォーム差もそちらが面倒を見る）
-/// - codex: codex 自身の更新ダイアログが提示する形（実測。0.144.4 の
-///   `Update now (runs sh -c 'curl -fsSL https://chatgpt.com/codex/install.sh | …')`）
-/// - agy: 公開された 1 行コマンドを**確認できていない**（実体は Antigravity 同梱の
-///   単一バイナリ）。推測を書かず「導入して PATH へ通す」だけを案内する
+/// - codex / agy: #989 で公式の 1 行を実測したので、claude と同じく**境界 B17 から引く**
+///   （案内・ゼロスタート導入・docs が 1 つの正本を見る）
 pub fn guidance(agent: Agent) -> InstallGuidance {
     use tako_core::platform::agent_install::{self, AgentKind};
     match agent {
@@ -307,7 +305,11 @@ pub fn guidance(agent: Agent) -> InstallGuidance {
             manual: None,
         },
         Agent::Codex => InstallGuidance {
-            command: Some("curl -fsSL https://chatgpt.com/codex/install.sh | sh"),
+            command: Some(
+                agent_install::current_recipe(AgentKind::Codex)
+                    .source
+                    .official_command,
+            ),
             docs_url: Some("https://developers.openai.com/codex/cli"),
             manual: None,
         },
@@ -317,13 +319,16 @@ pub fn guidance(agent: Agent) -> InstallGuidance {
             docs_url: Some("https://ollama.com/download"),
             manual: None,
         },
+        // #989 で公式の 1 行を実測（docs の `Installation & auth`）。それまでは
+        // 「確認できていない」ので推測を書かず manual だけを出していた
         Agent::Agy => InstallGuidance {
-            command: None,
-            docs_url: None,
-            manual: Some(Note::new(
-                "Antigravity CLI（agy）を導入して PATH へ通してください",
-                "Install the Antigravity CLI (agy) and put it on your PATH",
-            )),
+            command: Some(
+                agent_install::current_recipe(AgentKind::Agy)
+                    .source
+                    .official_command,
+            ),
+            docs_url: Some("https://antigravity.google/docs/cli/install"),
+            manual: None,
         },
     }
 }
@@ -541,8 +546,11 @@ pub fn locate(agent: WorkerAgent) -> Result<String, AgentCliError> {
         if let Some(found) = tako_core::platform::exe::find(agent.as_str()) {
             return Ok(found);
         }
-        if agent == WorkerAgent::Claude {
-            if let Some(found) = crate::setup_bootstrap::resolve_binary() {
+        // **入れた直後は PATH 経由で引けない**ので、公式インストーラの置き場所を見る。
+        // #989 までここは claude 専用だったため、codex / agy は「入れたのに
+        // 見つかりません」で止まっていた（`AgentKind` が Claude 1 値だったのが原因）
+        if let Ok(kind) = tako_core::platform::agent_install::AgentKind::try_from(agent_of(agent)) {
+            if let Some(found) = crate::setup_bootstrap::resolve_binary_for(kind) {
                 return Ok(found);
             }
         }
@@ -593,25 +601,30 @@ mod tests {
 
     #[test]
     fn 導入案内は推測のコマンドを持たない() {
-        // 実物で確認した agent だけがコマンドを持つ（agy は単一バイナリで
-        // 公開された 1 行コマンドを確認できていない）
-        assert!(guidance(Agent::Claude).command.is_some());
-        assert!(guidance(Agent::Codex).command.is_some());
-        assert!(guidance(Agent::Agy).command.is_none());
+        use tako_core::platform::agent_install::{self as install, AgentKind};
+        // **手順を持つ 3 系統はすべて B17 の正本から引く**（#868 / #989 と二重管理しない）。
+        // agy は #989 で公式 docs の 1 行を実測したのでコマンドを持つようになった
+        for kind in AgentKind::ALL {
+            let agent = Agent::from(kind);
+            assert_eq!(
+                guidance(agent).command,
+                Some(install::current_recipe(kind).source.official_command),
+                "{} の案内が境界 B17 から引かれていない",
+                kind.as_str()
+            );
+            assert!(
+                guidance(agent).docs_url.is_some(),
+                "{} の参考 URL が無い",
+                kind.as_str()
+            );
+        }
+        // ローカル LLM は「CLI を入れる」形ではないので B17 に手順が無い（#990）。
+        // 推測を書かないため、案内はコマンドか言い換えのどちらかを必ず持つ
+        assert!(AgentKind::try_from(Agent::Local).is_err());
+        let local = guidance(Agent::Local);
         assert!(
-            guidance(Agent::Agy).manual.is_some(),
+            local.command.is_some() || local.manual.is_some(),
             "コマンドが無い agent には言い換えを用意する（無言にしない）"
-        );
-        // claude の手順は B17 の正本から引く（#868 と二重管理しない）
-        assert_eq!(
-            guidance(Agent::Claude).command,
-            Some(
-                tako_core::platform::agent_install::current_recipe(
-                    tako_core::platform::agent_install::AgentKind::Claude
-                )
-                .source
-                .official_command
-            )
         );
     }
 

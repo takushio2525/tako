@@ -744,6 +744,42 @@ mod tests {
         sink
     }
 
+    /// #1202: 先頭に UTF-8 BOM が付いた Markdown でも **1 行目が H1 として描かれる**。
+    ///
+    /// パース結果（`markdown_blocks`）だけでなく**描画まで**見るのは、症状が
+    /// 「1 行目だけ本文と同じ字送りで出る」= 見た目だったため。BOM が残ると
+    /// 1 行目は段落になり、H1 の太さ（`FontWeight::EXTRA_BOLD`）も
+    /// 大きさ（base × 1.65）も付かない
+    #[test]
+    fn bom付きmarkdownでも先頭行がh1として描かれる() {
+        let theme = Theme::default();
+        let body = "# sample project\n\n## Sections\n\n本文\n";
+        let bom = render_all(&format!("\u{feff}{body}"), &theme);
+        let plain = render_all(body, &theme);
+
+        // 描いた行（文字・色・太さ）が BOM の有無で 1 つも変わらない
+        assert_eq!(bom.rows, plain.rows, "BOM の有無で描画が変わっている");
+
+        let h1 = heading_look(1, theme.font_size, &theme, theme.foreground);
+        let (text, _, color, weight) = &bom.rows[0];
+        assert_eq!(text, "sample project");
+        assert_eq!(
+            *weight,
+            Some(h1.weight),
+            "1 行目が H1 の太さで描かれていない（本文へ落ちている）"
+        );
+        assert_eq!(*color, h1.color);
+        // 見出しは本文より大きい（段落は太さ None・素の font_size で描かれる）
+        assert!(h1.size > theme.font_size, "H1 が本文より大きくない");
+        assert!(
+            bom.rows
+                .iter()
+                .any(|(t, _, _, w)| t == "本文" && w.is_none()),
+            "本文が太さなしで描かれていない: {:?}",
+            bom.rows
+        );
+    }
+
     /// 受け皿が呼ばれる順序が `md_block_line_texts` の並びと一致する（#690 の前提）。
     /// ここがずれると選択・リンクの行番号が全部ずれる
     #[test]

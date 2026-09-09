@@ -15,7 +15,7 @@
 | `orchestrator::agent::WorkerAgent` | `tako-control/src/orchestrator/agent.rs` | tako-control | Claude / Codex / Agy | worker として起動できる系統（コマンド組み立て・事前信頼） |
 | `setup::SetupAgent` | `tako-cli/src/setup.rs` | tako-cli | Claude / Codex / Agy | setup を進行できる系統（**非公開 enum**） |
 | `agents_sync::AgentKind` | `tako-control/src/agents_sync.rs` | tako-control | Claude / Codex / Agy | 共通ルールの同期先（#136） |
-| `platform::agent_install::AgentKind` | `tako-core/src/platform/agent_install.rs` | tako-core | **Claude のみ** | 自動インストールに対応する系統（#868） |
+| `platform::agent_install::AgentKind` | `tako-core/src/platform/agent_install.rs` | tako-core | Claude / Codex / Agy | 公式インストーラの手順を持つ系統（#868 → #989 で 3 系統へ） |
 | `terminal::LimitService` | `tako-core/src/terminal.rs` | tako-core | Claude / Codex / Agy | 利用制限の表示対象（#357） |
 
 ## なぜ 1 つに統合していないか
@@ -24,9 +24,10 @@
 
 - `Agent::Local`（ローカル LLM）は **`WorkerAgent` に無い**のが正しい。
   `WorkerAgent` は「TUI をキー操作で駆動する」前提の型で、その前提を外すのが #991
-- `agent_install::AgentKind` が Claude 1 値なのは **実装がそうだから**（#868 の Out of scope）。
-  ここに codex / agy を足すのは #989 の仕事で、足した瞬間に能力マトリクスの
-  `setup_cli_install` 行も動く
+- `agent_install::AgentKind` に `Local` が無いのが正しい。ローカル LLM は
+  「エージェント CLI を公式インストーラで入れる」形ではなく **runtime を入れてモデルを
+  pull する**ので手順の形が違う（#990）。#989 で Claude 1 値から 3 系統へ広げたときに
+  能力マトリクスの `setup_cli_install` / `setup_auth_launch` 行も動いた
 - `LimitService` に Local が無いのは、ローカルモデルに利用制限の概念が無いから
 
 つまり **5 つは「正本の部分集合」であって重複ではない**。統合ではなく
@@ -55,10 +56,10 @@
 | 変換 | 置き場 |
 |---|---|
 | `LimitService` → `Agent` | `tako-core/src/agent_support.rs`（`From`） |
-| `agent_install::AgentKind` → `Agent` | 同上 |
+| `agent_install::AgentKind` ⇄ `Agent` | 同上（`From` / `TryFrom`。`Local` を落とす部分写像） |
 | `WorkerAgent` ⇄ `Agent` | `tako-control/src/orchestrator/agent.rs`（`From` / `TryFrom`） |
 | `agents_sync::AgentKind` → `Agent` | 変換は持たず `label()` の表記一致で縛る |
-| `SetupAgent` → `WorkerAgent` | `tako-cli/src/setup.rs`（`worker_agent_of`。**非公開 enum なので `From` を持てない**ので、`as_str()` 一致を単体テスト `系統の写しは新しいenumを作らずに済んでいる` で縛る。#1002） |
+| `SetupAgent` → `WorkerAgent` / `agent_install::AgentKind` / `Agent` | `tako-cli/src/setup.rs`（`worker_agent_of` / `install_kind` / `support_agent`。**非公開 enum なので `From` を持てない**ので、`as_str()` 一致と往復を単体テスト `系統の写しは新しいenumを作らずに済んでいる` で縛る。#1002 / #989） |
 
 **`Agent` → `WorkerAgent` は `TryFrom`**（`Local` を落とす部分写像）。
 ローカル LLM を worker として起動できるようになったら、ここが変換できるようになる時点で
@@ -89,8 +90,8 @@
 | `dispatch.rs` の worker_status の `status_source` 分岐 | 実行時の session_id 解決結果で決める | #984 |
 | `dispatch.rs` の transcript アダプタ | claude 固定（拡張点のコメントあり） | #984 |
 | 再起動後の復元の resume コマンド | **#1238 で 3 系統へ広げ済み**（`tako_core::agent_resume::resume_spec` の 1 マス + `restore_support` の可否判定。番犬 `agent_resume_watchdog`。A/B は `TAKO_1238_LEGACY=1`） | 済 |
-| `WorkerLaunch` の MCP 注入 | 配線が無い | #986 |
-| `agent_install::AgentKind` の拡張 | Claude 1 値 | #989 |
+| ~~`WorkerLaunch` の MCP 注入~~ | **#986 で配線済み**（`tako_bin` + `agent::codex_mcp_args` の 1 実装。番犬 `worker_mcp_injection_watchdog`。A/B は `TAKO_986_LEGACY=1`） | 済 |
+| ~~`agent_install::AgentKind` の拡張~~ | **#989 で 3 系統へ**（`recipe(platform, agent)` が 6 マス。番犬 `setup_bootstrap_agent_watchdog`。A/B は `TAKO_989_LEGACY=1`） | 済 |
 | モデル一覧の取得手段（`agent_models::catalog_argv`） | 系統ごとの `match`。**能力マトリクスには「ピッカーが使えるか」だけ**が載る（claude = 基準系 = 全 Supported の不変条件があるため、取得手段の差はマトリクスの 1 マスでは表せない） | #1002（済） |
 
 ## 新しい系統を足すとき

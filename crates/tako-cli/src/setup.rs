@@ -17,6 +17,7 @@ use tako_control::setup::{
     SetupValueSource, CHANGES_YAML, INSTRUCTIONS_DEFAULT, RECOMMENDED_SECTIONS,
 };
 use tako_control::setup_bootstrap::{self, InstallOptions, Step};
+use tako_core::platform::agent_install::AgentKind;
 // 依存表と導入の実行は `tako_control::setup_deps` が正本（#1057）。
 // CLI・MCP・`--review` が同じ実装を通るので「UI からしか到達できない経路」を作らない
 use tako_control::setup_deps::{self, DepInstallOptions};
@@ -161,11 +162,50 @@ impl SetupAgent {
         !matches!(self, Self::Agy)
     }
 
-    fn install_hint(self) -> &'static str {
+    /// 導入の案内 1 行。**正本は境界 B17（`platform::agent_install`）**なので
+    /// そこから引く（#989。それまでは URL 文字列を別に持っていて、
+    /// ゼロスタート導入が実行するコマンドとずれていた）。
+    /// 最簡形（#322）= そのまま打てば入る 1 行を出す
+    fn install_hint(self) -> String {
+        let guidance = tako_control::orchestrator::agent_cli::guidance(self.support_agent());
+        match (guidance.command, guidance.docs_url) {
+            (Some(cmd), _) => cmd.to_string(),
+            (None, Some(url)) => url.to_string(),
+            (None, None) => guidance
+                .manual
+                .map(|m| m.text().to_string())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// 能力マトリクスの正本（`agent_support::Agent`）へ写す
+    fn support_agent(self) -> tako_core::agent_support::Agent {
         match self {
-            Self::Claude => "https://docs.anthropic.com/en/docs/claude-code",
-            Self::Codex => "https://developers.openai.com/codex/cli",
-            Self::Agy => "agy install",
+            Self::Claude => tako_core::agent_support::Agent::Claude,
+            Self::Codex => tako_core::agent_support::Agent::Codex,
+            Self::Agy => tako_core::agent_support::Agent::Agy,
+        }
+    }
+
+    /// 公式インストーラの手順を持つ系統（境界 B17）へ写す。
+    /// **網羅 match なので `AgentKind` へ値が増えたらここが落ちる**
+    fn install_kind(self) -> AgentKind {
+        match self {
+            Self::Claude => AgentKind::Claude,
+            Self::Codex => AgentKind::Codex,
+            Self::Agy => AgentKind::Agy,
+        }
+    }
+
+    /// `AgentKind` からの逆写し。**写しが 1:1 であることを縛るためだけに在る**
+    /// （製品コードは `install_kind` の向きしか使わない）。`cfg(test)` にしてあるのは
+    /// 使わない関数を製品バイナリへ残さないため
+    #[cfg(test)]
+    fn from_install_kind(kind: AgentKind) -> Self {
+        match kind {
+            AgentKind::Claude => Self::Claude,
+            AgentKind::Codex => Self::Codex,
+            AgentKind::Agy => Self::Agy,
         }
     }
 }
@@ -194,10 +234,10 @@ fn command_output(path: &str, args: &[&str]) -> Option<std::process::Output> {
 /// シェルや書き込み失敗では届かない）。その場合でもインストーラが置く場所を見て拾う。
 /// ここで拾えないと「入れたのに見つかりません」で setup が止まる（#868）
 fn find_agent_command(kind: SetupAgent) -> Option<String> {
-    find_command(kind.as_str()).or_else(|| match kind {
-        SetupAgent::Claude => setup_bootstrap::resolve_binary(),
-        _ => None,
-    })
+    // #989 までここは claude 専用で、codex / agy は `_ => None` だった。
+    // 入れた直後は profile へ書いた PATH がまだ届かないので、
+    // **3 系統ともインストーラの置き場所を見る**
+    find_command(kind.as_str()).or_else(|| setup_bootstrap::resolve_binary_for(kind.install_kind()))
 }
 
 fn detect_agents() -> Vec<DetectedAgent> {
@@ -575,28 +615,44 @@ fn print_model_hint(kind: SetupAgent, profile_model: Option<&str>) {
 
 /// `tako setup bootstrap`。MCP `tako_setup_bootstrap` と同じ dispatch 相当を
 /// ローカルで実行する（GUI 不要の処理なので IPC を経由しない）
-pub fn run_bootstrap(action: Option<&str>, dry_run: bool, json: bool) -> Result<(), String> {
+pub fn run_bootstrap(
+    action: Option<&str>,
+    agent: Option<&str>,
+    dry_run: bool,
+    json: bool,
+) -> Result<(), String> {
     let action = action.unwrap_or("status");
+    // 省略時は claude（#868 からの既定を変えない）。未知の名前は黙って claude にしない
+    let target = match agent {
+        Some(name) => setup_bootstrap::parse_agent(name)?,
+        None => AgentKind::Claude,
+    };
     let value = match action {
-        "status" => setup_bootstrap::status()?.to_json(),
-        "install" => setup_bootstrap::install(InstallOptions {
-            dry_run,
-            // CLI は端末を持つので進捗をそのまま流す
-            interactive: std::io::IsTerminal::is_terminal(&std::io::stdin()),
-        })?,
-        "path" => setup_bootstrap::ensure_path()?,
-        "undo-path" => setup_bootstrap::undo_path()?,
+        "status" => setup_bootstrap::status_for(target)?.to_json(),
+        // 3 系統ぶんをまとめて（`tako setup --check` と同じ材料。#989）
+        "status-all" => setup_bootstrap::status_all_json(),
+        "install" => setup_bootstrap::install_for(
+            target,
+            InstallOptions {
+                dry_run,
+                // CLI は端末を持つので進捗をそのまま流す
+                interactive: std::io::IsTerminal::is_terminal(&std::io::stdin()),
+            },
+        )?,
+        "path" => setup_bootstrap::ensure_path_for(target)?,
+        "undo-path" => setup_bootstrap::undo_path_for(target)?,
         // 引き継ぎ（#1057）。**端末があれば計画を見せて起動まで**、
         // 無ければ計画だけ返す（対話エージェントは端末なしでは意味がない）
         "handoff" => {
-            let plan = setup_bootstrap::handoff_plan(None)?;
+            let plan = setup_bootstrap::handoff_plan_for(target, None)?;
             if !json
                 && plan["available"].as_bool() == Some(true)
                 && std::io::IsTerminal::is_terminal(&std::io::stdin())
             {
                 print_handoff_plan(&plan);
-                if try_agent_handoff("tako setup bootstrap handoff から手動で依頼", false) {
-                    eprintln!("  [OK] Claude Code が導入されました");
+                if try_agent_handoff(target, "tako setup bootstrap handoff から手動で依頼", false)
+                {
+                    eprintln!("  [OK] {} が導入されました", target.product());
                 }
                 return Ok(());
             }
@@ -604,7 +660,7 @@ pub fn run_bootstrap(action: Option<&str>, dry_run: bool, json: bool) -> Result<
         }
         other => {
             return Err(format!(
-            "不明な action: {other:?}（status / install / path / undo-path / handoff のいずれか）"
+            "不明な action: {other:?}（status / status-all / install / path / undo-path / handoff のいずれか）"
         ))
         }
     };
@@ -618,12 +674,21 @@ pub fn run_bootstrap(action: Option<&str>, dry_run: bool, json: bool) -> Result<
 
 fn print_bootstrap_human(action: &str, value: &serde_json::Value) {
     match action {
+        "status-all" => {
+            eprintln!("エージェント CLI の導入状況");
+            eprintln!("─────────────────────────");
+            for state in value["agents"].as_array().into_iter().flatten() {
+                print_bootstrap_agent_line(state);
+            }
+            eprintln!("  → `tako setup` を実行すると、使える状態になるまで案内します");
+        }
         "status" => {
             let step = value["next_step"].as_str().unwrap_or("?");
+            let agent = value["agent"].as_str().unwrap_or("?");
             eprintln!("エージェント CLI の導入状況");
             eprintln!("─────────────────────────");
             eprintln!(
-                "  claude: {}",
+                "  {agent}: {}",
                 value["binary"]
                     .as_str()
                     .map_or("未導入".to_string(), |p| display_home_relative(
@@ -680,9 +745,42 @@ fn print_bootstrap_human(action: &str, value: &serde_json::Value) {
     }
 }
 
+/// `status-all` の 1 系統ぶんの行（導入 / PATH / 認証を 1 行にまとめる）
+fn print_bootstrap_agent_line(state: &serde_json::Value) {
+    let agent = state["agent"].as_str().unwrap_or("?");
+    if let Some(error) = state["error"].as_str() {
+        eprintln!("  {agent}: 状態を確認できません（{error}）");
+        return;
+    }
+    let binary = state["binary"].as_str().map_or("未導入".to_string(), |p| {
+        display_home_relative(Path::new(p))
+    });
+    let step = state["next_step"].as_str().unwrap_or("?");
+    let mark = if step == "ready" { "[OK]" } else { "[不足]" };
+    eprintln!("  {mark} {agent}: {binary}");
+    eprintln!(
+        "        PATH: {} / 認証: {} / 次の一歩: {}",
+        if state["launcher_dir_on_path"].as_bool() == Some(true) {
+            "通っています"
+        } else {
+            "通っていません"
+        },
+        if state["authenticated"].as_bool() == Some(true) {
+            "済み"
+        } else {
+            "未ログイン"
+        },
+        state["next_step_description"].as_str().unwrap_or("")
+    );
+}
+
 /// 引き継ぎ計画の表示（誰へ・何を頼むか）
 fn print_handoff_plan(plan: &serde_json::Value) {
-    eprintln!("Claude Code の導入をエージェントへ引き継ぎます");
+    // 製品名は計画そのものから引く（3 系統あるので claude 決め打ちにしない。#989）
+    eprintln!(
+        "{} の導入をエージェントへ引き継ぎます",
+        plan["product"].as_str().unwrap_or("エージェント CLI")
+    );
     eprintln!("─────────────────────────────────────");
     for c in plan["candidates"].as_array().into_iter().flatten() {
         eprintln!(
@@ -733,8 +831,8 @@ fn confirm(prompt: &str, default_yes: bool, assume_yes: bool) -> bool {
 ///
 /// 戻り値 = 代行の結果 claude が導入できたか。**「起動した」ではなく
 /// 「入った」を確かめてから true を返す**
-fn try_agent_handoff(reason: &str, assume_yes: bool) -> bool {
-    let Ok(plan) = setup_bootstrap::handoff_plan(Some(reason)) else {
+fn try_agent_handoff(target: AgentKind, reason: &str, assume_yes: bool) -> bool {
+    let Ok(plan) = setup_bootstrap::handoff_plan_for(target, Some(reason)) else {
         return false;
     };
     if plan["available"].as_bool() != Some(true) {
@@ -750,7 +848,10 @@ fn try_agent_handoff(reason: &str, assume_yes: bool) -> bool {
         return false;
     };
     eprintln!();
-    eprintln!("  導入済みの {agent} が見つかりました。{agent} へ導入の代行を頼めます");
+    eprintln!(
+        "  導入済みの {agent} が見つかりました。{agent} へ {} の導入の代行を頼めます",
+        target.product()
+    );
     for (name, found) in &candidates {
         eprintln!("    - {name}: {}", display_home_relative(Path::new(found)));
     }
@@ -760,7 +861,7 @@ fn try_agent_handoff(reason: &str, assume_yes: bool) -> bool {
         return false;
     }
     if !confirm(
-        &format!("{agent} に Claude Code の導入を任せますか？"),
+        &format!("{agent} に {} の導入を任せますか？", target.product()),
         true,
         false,
     ) {
@@ -790,13 +891,13 @@ fn try_agent_handoff(reason: &str, assume_yes: bool) -> bool {
         }
     }
     // 代行のあと**本当に入ったか**を確かめる（報告を信じない）
-    setup_bootstrap::status().is_ok_and(|s| s.step != Step::Install)
+    setup_bootstrap::status_for(target).is_ok_and(|s| s.step != Step::Install)
 }
 
 /// 自動導入も代行も通らなかったときの最終案内。
 /// **次の一手が必ず 1 つ以上ある**形にする
-fn install_failure_message(reason: &str) -> String {
-    let plan = setup_bootstrap::handoff_plan(Some(reason)).ok();
+fn install_failure_message(target: AgentKind, reason: &str) -> String {
+    let plan = setup_bootstrap::handoff_plan_for(target, Some(reason)).ok();
     let official = plan
         .as_ref()
         .and_then(|p| p["install_plan"]["official_command"].as_str())
@@ -810,10 +911,11 @@ fn install_failure_message(reason: &str) -> String {
     if handoff_available {
         // 代行を起こさなかった / 断られた / 失敗した場合の次の一手。
         // AI からは MCP `tako_setup_bootstrap` の `action: "handoff"` で同じ計画が引ける
-        message.push_str(
+        message.push_str(&format!(
             "\n導入済みの別のエージェント CLI へ代行を頼めます:\n  \
-             tako setup bootstrap handoff\n",
-        );
+             tako setup bootstrap handoff{}\n",
+            setup_bootstrap::agent_flag(target)
+        ));
     }
     message.push_str(&format!(
         "\n自分で入れる場合は次のコマンドを実行してから `tako setup` をやり直してください:\n  {official}\n"
@@ -821,34 +923,117 @@ fn install_failure_message(reason: &str) -> String {
     message
 }
 
-/// ゼロスタート導入の段（#868）。**導入済みなら何も出さずに素通りする**
+/// ゼロスタート導入の段（#868 → #989 で 3 系統へ）。
+/// **1 つでも使える系統があれば何も出さずに素通りする**
 /// （検出型 setup の従来体験を変えないため）。
 ///
-/// 未導入なら インストール → PATH 通し → 認証誘導 の順に進め、
-/// どの段で失敗したかが分かる形でエラーを返す
+/// ## 「1 つ選ばせる」形にしない（#989 のやること 5）
+///
+/// #989 前はここが claude 決め打ちだったので、codex だけ入れている人が
+/// `tako setup` を叩くと **claude の導入を勧められた**。setup の目的は
+/// 「導入済みのものを全部使える状態にする」ことなので、
+///
+/// - どれか 1 つでも `ready` なら**何も勧めない**（素通り）
+/// - 1 つも使えないときだけ 1 系統を選んで最後まで案内する
+/// - 案内が済んだら、**残りの系統を足すコマンドを出す**（強制せず導線だけ残す）
+///
+/// 選ぶ順は「途中まで入っているもの（PATH / 認証だけ足りない）を先に仕上げる」→
+/// それも無ければ推奨（claude）。非対話・`--yes` では質問せず推奨で進む
 fn run_bootstrap_stage(assume_yes: bool) -> Result<(), String> {
-    let state = setup_bootstrap::status()?;
-    if state.step == Step::Ready {
+    let states = setup_bootstrap::status_all();
+    if states.is_empty() {
         return Ok(());
     }
-    // ここへ来るのは「claude が無い / PATH に無い / 未ログイン」のいずれか。
+    // 1 つでも使える状態なら、この段は何もしない
+    if states
+        .iter()
+        .any(|(_, state)| state.as_ref().is_ok_and(|s| s.step == Step::Ready))
+    {
+        return Ok(());
+    }
+    // 全滅の理由が「状態を読めない」なら、その理由を返して止まる
+    if states.iter().all(|(_, state)| state.is_err()) {
+        let (_, first) = states.into_iter().next().expect("空でないことを確認済み");
+        return Err(first.expect_err("全部 Err のはず"));
+    }
+
+    let target = choose_bootstrap_target(&states);
+    let state = setup_bootstrap::status_for(target)?;
+
+    // ここへ来るのは「どの系統も使えない」= 未導入 / PATH に無い / 未ログインのいずれか。
     // 何が起きるのかを先に伝えてから進む
     eprintln!("はじめてのセットアップ");
     eprintln!("─────────────────────");
-    eprintln!("  Claude Code を使えるところまで、このまま案内します");
+    eprintln!(
+        "  {} を使えるところまで、このまま案内します",
+        target.product()
+    );
     eprintln!();
 
+    run_bootstrap_for(target, &state, assume_yes)?;
+
+    eprintln!();
+    eprintln!("  導入が完了しました。続けて設定を行います");
+    print_additional_agent_hints(target);
+    eprintln!();
+    Ok(())
+}
+
+/// どの系統を仕上げるか。**途中まで入っているものを優先する**
+/// （入れ直しではなく再開になるので、一番短い道になる）
+fn choose_bootstrap_target(
+    states: &[(AgentKind, Result<setup_bootstrap::BootstrapState, String>)],
+) -> AgentKind {
+    let started = states.iter().find_map(|(agent, state)| {
+        state
+            .as_ref()
+            .ok()
+            .filter(|s| matches!(s.step, Step::Path | Step::Auth))
+            .map(|_| *agent)
+    });
+    if let Some(agent) = started {
+        return agent;
+    }
+    // どれも未導入。代行できる系統のうち先頭（= 推奨）を採る。
+    // `bootstrap_agents()` の並びが「基準系 → master 可 → worker 専用」なので、
+    // ここで別の優先順位を作らない
+    states
+        .iter()
+        .find_map(|(agent, state)| {
+            state
+                .as_ref()
+                .ok()
+                .filter(|s| s.plan.can_run)
+                .map(|_| *agent)
+        })
+        .or_else(|| states.first().map(|(agent, _)| *agent))
+        .unwrap_or(AgentKind::Claude)
+}
+
+/// 1 系統ぶんの 3 段（インストール → PATH → 認証誘導）。
+/// **どの段で失敗したかが分かる形でエラーを返す**
+fn run_bootstrap_for(
+    target: AgentKind,
+    state: &setup_bootstrap::BootstrapState,
+    assume_yes: bool,
+) -> Result<(), String> {
     if state.step == Step::Install {
-        eprintln!("  [1/3] {}", Step::Install.describe());
+        eprintln!("  [1/3] {}", Step::Install.describe_for(target));
         print_install_plan(&state.plan.to_json());
         if !state.plan.can_run {
             // 代行できない環境。**案内で終わらせず**、別のエージェント CLI が
             // 居ればそちらへ引き継ぐ（#1057）
-            let reason = "この環境では tako が自動インストールを代行できません";
-            if try_agent_handoff(reason, assume_yes) {
-                eprintln!("  [OK] 引き継ぎ先のエージェントが Claude Code を導入しました");
+            let reason = format!(
+                "この環境では tako が {} の自動インストールを代行できません",
+                target.product()
+            );
+            if try_agent_handoff(target, &reason, assume_yes) {
+                eprintln!(
+                    "  [OK] 引き継ぎ先のエージェントが {} を導入しました",
+                    target.product()
+                );
             } else {
-                return Err(install_failure_message(reason));
+                return Err(install_failure_message(target, &reason));
             }
         } else {
             if !confirm("この内容でインストールしますか？", true, assume_yes) {
@@ -859,29 +1044,35 @@ fn run_bootstrap_stage(assume_yes: bool) -> Result<(), String> {
                 ));
             }
             eprintln!();
-            if let Err(e) = setup_bootstrap::install(InstallOptions {
-                dry_run: false,
-                interactive: std::io::IsTerminal::is_terminal(&std::io::stdin()),
-            }) {
+            if let Err(e) = setup_bootstrap::install_for(
+                target,
+                InstallOptions {
+                    dry_run: false,
+                    interactive: std::io::IsTerminal::is_terminal(&std::io::stdin()),
+                },
+            ) {
                 // **案内だけで人間へ丸投げしない**（#1057）。導入済みの別系統 CLI が
                 // 居れば、その setup エージェントへ導入の代行を引き継ぐ
                 eprintln!("  [失敗] {e}");
-                if !try_agent_handoff(&e, assume_yes) {
-                    return Err(install_failure_message(&e));
+                if !try_agent_handoff(target, &e, assume_yes) {
+                    return Err(install_failure_message(target, &e));
                 }
-                eprintln!("  [OK] 引き継ぎ先のエージェントが Claude Code を導入しました");
+                eprintln!(
+                    "  [OK] 引き継ぎ先のエージェントが {} を導入しました",
+                    target.product()
+                );
             } else {
-                eprintln!("  [OK] Claude Code を導入しました");
+                eprintln!("  [OK] {} を導入しました", target.product());
             }
         }
     }
 
     // PATH（インストール直後は必ずここを通る）
-    let state = setup_bootstrap::status()?;
+    let state = setup_bootstrap::status_for(target)?;
     if state.step == Step::Path {
         eprintln!();
-        eprintln!("  [2/3] {}", Step::Path.describe());
-        let result = setup_bootstrap::ensure_path()
+        eprintln!("  [2/3] {}", Step::Path.describe_for(target));
+        let result = setup_bootstrap::ensure_path_for(target)
             .map_err(|e| format!("[2/3] PATH の設定に失敗しました。\n{e}"))?;
         let profile = result["profile_display"].as_str().unwrap_or("(不明)");
         match result["change"].as_str() {
@@ -899,28 +1090,48 @@ fn run_bootstrap_stage(assume_yes: bool) -> Result<(), String> {
         }
     }
 
-    // 認証（**tako は代行しない**。理由と文面は `setup_bootstrap::auth_instructions`。#1129）
+    // 認証（**tako は代行しない**。理由と文面は `setup_bootstrap::auth_instructions_for`。#1129）
     //
     // 修正前はここで `claude auth login` を起こして `.status()` で待っていた。
     // ブラウザ操作待ちのプロセスは自分では終わらないので、実機（Windows）では
     // セルフテストが打ち込む `tako setup` 経由で 1 日 46 本まで積み上がり、
     // インスタンスを閉じても孫が回収されず CPU が 100% に張り付いた（#1129）。
-    let state = setup_bootstrap::status()?;
+    let state = setup_bootstrap::status_for(target)?;
     if state.step == Step::Auth {
         eprintln!();
-        eprintln!("  [3/3] {}", Step::Auth.describe());
-        if setup_bootstrap::legacy_auth_launch() {
+        eprintln!("  [3/3] {}", Step::Auth.describe_for(target));
+        if setup_bootstrap::legacy_auth_launch() && target == AgentKind::Claude {
             // `TAKO_1129_LEGACY=1` で修正前へ戻す（同一バイナリで A/B を取る逃げ道）
             legacy_launch_auth_login(&state, assume_yes)?;
         } else {
-            return Err(setup_bootstrap::auth_instructions().join("\n"));
+            return Err(setup_bootstrap::auth_instructions_for(target).join("\n"));
         }
     }
-
-    eprintln!();
-    eprintln!("  導入が完了しました。続けて設定を行います");
-    eprintln!();
     Ok(())
+}
+
+/// 仕上げた系統以外を**足せること**だけ伝える（選ばせない・強制しない。#989 のやること 5）
+fn print_additional_agent_hints(installed: AgentKind) {
+    let others: Vec<AgentKind> = setup_bootstrap::bootstrap_agents()
+        .into_iter()
+        .filter(|agent| *agent != installed)
+        .filter(|agent| {
+            // 既に使える系統は案内しない
+            !setup_bootstrap::status_for(*agent).is_ok_and(|s| s.step == Step::Ready)
+        })
+        .collect();
+    if others.is_empty() {
+        return;
+    }
+    eprintln!();
+    eprintln!("  ほかの系統も同じように追加できます（今は不要です）:");
+    for agent in others {
+        eprintln!(
+            "    {}: tako setup bootstrap install{}",
+            agent.product(),
+            setup_bootstrap::agent_flag(agent)
+        );
+    }
 }
 
 /// `TAKO_1129_LEGACY=1` のときだけ通る修正前の認証段（#1129 の A/B 用）。
@@ -938,7 +1149,7 @@ fn legacy_launch_auth_login(
         .ok_or("claude コマンドを解決できません")?;
     let interactive = !assume_yes && std::io::IsTerminal::is_terminal(&std::io::stdin());
     if !interactive {
-        return Err(setup_bootstrap::auth_instructions().join("\n"));
+        return Err(setup_bootstrap::auth_instructions_for(AgentKind::Claude).join("\n"));
     }
     eprintln!("  ブラウザが開きます。画面の指示にしたがってログインしてください");
     eprintln!();
@@ -955,14 +1166,14 @@ fn legacy_launch_auth_login(
         return Err(format!(
             "[3/3] ログインが完了しませんでした（exit {}）。\n{}",
             status.code().unwrap_or(-1),
-            setup_bootstrap::auth_instructions().join("\n")
+            setup_bootstrap::auth_instructions_for(AgentKind::Claude).join("\n")
         ));
     }
     // 「起動した」ではなく「ログインできた」ことを確かめてから次へ進む
-    if !setup_bootstrap::is_authenticated(&binary) {
+    if !setup_bootstrap::is_authenticated_for(AgentKind::Claude, &binary) {
         return Err(format!(
             "[3/3] ログインを確認できませんでした。\n{}",
-            setup_bootstrap::auth_instructions().join("\n")
+            setup_bootstrap::auth_instructions_for(AgentKind::Claude).join("\n")
         ));
     }
     eprintln!("  [OK] ログインしました");
@@ -2719,21 +2930,37 @@ pub fn run_check() -> Result<(), String> {
     eprintln!("tako セットアップ 環境チェック");
     eprintln!("─────────────────────────────");
 
-    // ゼロスタート導入の状況（#868）。未導入・PATH 未通し・未ログインのどれで
-    // 止まっているかを、実行はせずに先に出す
-    match setup_bootstrap::status() {
-        Ok(state) if state.step == Step::Ready => {
-            eprintln!("  [OK] エージェント CLI の導入: 完了（claude / PATH / ログイン）");
-        }
-        Ok(state) => {
-            eprintln!(
-                "  [不足] エージェント CLI の導入: {} ({})",
-                state.step.describe(),
+    // ゼロスタート導入の状況（#868 → #989 で 3 系統）。未導入・PATH 未通し・
+    // 未ログインのどれで止まっているかを、系統ごとに実行はせずに先に出す。
+    // **1 つでも ready なら tako は使える**ので、そこを最初に言う
+    let bootstrap_states = setup_bootstrap::status_all();
+    let ready: Vec<&str> = bootstrap_states
+        .iter()
+        .filter(|(_, state)| state.as_ref().is_ok_and(|s| s.step == Step::Ready))
+        .map(|(agent, _)| agent.as_str())
+        .collect();
+    if ready.is_empty() {
+        eprintln!("  [不足] エージェント CLI の導入: 使える系統がありません");
+        eprintln!("         tako setup を実行すると、ここから最後まで案内します");
+    } else {
+        eprintln!(
+            "  [OK] エージェント CLI の導入: 使える系統 {}（導入 / PATH / ログイン）",
+            ready.join(" / ")
+        );
+    }
+    for (agent, state) in &bootstrap_states {
+        match state {
+            Ok(state) if state.step == Step::Ready => {
+                eprintln!("         [OK] {}: 完了", agent.as_str())
+            }
+            Ok(state) => eprintln!(
+                "         [不足] {}: {} ({})",
+                agent.as_str(),
+                state.step_description(),
                 state.step.as_str()
-            );
-            eprintln!("         tako setup を実行すると、ここから最後まで案内します");
+            ),
+            Err(e) => eprintln!("         [警告] {}: 確認できません（{e}）", agent.as_str()),
         }
-        Err(e) => eprintln!("  [警告] 導入状況を確認できません: {e}"),
     }
 
     // エージェント CLI + 任意依存。--check では表示のみ。
@@ -3705,8 +3932,29 @@ mod tests {
         // ここでの値の突き合わせで担保する（`.agent/agent-enums.md`）
         for kind in SetupAgent::ALL {
             assert_eq!(worker_agent_of(kind).as_str(), kind.as_str());
+            // ゼロスタート導入の系統（境界 B17）とも 1:1（#989）。
+            // 往復するので「片方だけ増えた」が検出できる
+            assert_eq!(kind.install_kind().as_str(), kind.as_str());
+            assert_eq!(SetupAgent::from_install_kind(kind.install_kind()), kind);
+            assert_eq!(kind.support_agent().as_str(), kind.as_str());
         }
         assert_eq!(WorkerAgent::ALL.len(), SetupAgent::ALL.len());
+        assert_eq!(AgentKind::ALL.len(), SetupAgent::ALL.len());
+    }
+
+    /// 未導入案内の 1 行が**境界 B17 の公式コマンド**になっている（#989 / #322）。
+    /// それまでは URL 文字列を別に持っていて、実際に走るコマンドとずれていた
+    #[test]
+    fn 未導入案内は公式コマンドを出す() {
+        for kind in SetupAgent::ALL {
+            let hint = kind.install_hint();
+            let official = tako_core::platform::agent_install::current_recipe(kind.install_kind())
+                .source
+                .official_command;
+            assert_eq!(hint, official, "{} の案内", kind.as_str());
+            // そのまま打てる形（#322 の最簡形）
+            assert!(hint.contains("://"), "{}: {hint}", kind.as_str());
+        }
     }
 
     #[test]

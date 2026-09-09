@@ -309,6 +309,38 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
     tako_core::paths::home_dir().filter(|p| p.is_absolute())
 }
 
+/// 外部エージェント（claude / codex / agy）の**設定ファイルを置くホーム**。
+///
+/// **テストビルドでは必ず隔離先へ倒す**（#944 / #1030）。事前信頼
+/// （`ensure_trusted`）は spawn のたびに `~/.claude.json` /
+/// `~/.codex/config.toml` / `~/.gemini/antigravity-cli/settings.json` を
+/// 書き換えるので、`cargo test` がユーザーの**生きた設定ファイル**へ
+/// テスト用 cwd の信頼エントリを積み続けていた（実測: `~/.claude.json` に
+/// 2,500 件。うち大半がテスト・セルフテスト由来）。
+///
+/// [`home_dir`] 自体は倒さない: 表示・比較（`is_claude_default_config_dir` 等）は
+/// 本物のホームで判定する必要があり、まとめて倒すと**別のテストが壊れる**
+pub(crate) fn agent_config_home() -> Option<PathBuf> {
+    #[cfg(test)]
+    if !tako_core::paths::issue944_legacy() {
+        return Some(test_agent_config_home());
+    }
+    home_dir()
+}
+
+/// 外部エージェント設定のテスト隔離先（プロセスごとに 1 つ）。
+/// 作法は [`config_dir`] の隔離先と同じ
+#[cfg(test)]
+pub(crate) fn test_agent_config_home() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("tako-test-agent-home-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    })
+    .clone()
+}
+
 // --- accounts.yaml (#504) ---
 
 /// accounts.yaml のパス
@@ -1981,8 +2013,12 @@ pub fn solo_default_profile() -> Profile {
 }
 
 /// master として利用可能なエージェント種別の検証（Issue #127）。
-/// agy は MCP のペイン毎接続情報（TAKO_SOCKET / TAKO_PANE_ID 等）を子プロセスへ
-/// 引き継ぐ設定手段と system prompt 注入手段が無いため master 非対応（worker のみ）
+///
+/// agy が master 非対応なのは **system prompt の注入手段が無い**から（`agy --help`
+/// 実測 1.1.27）。**併記していた「ペイン毎接続情報を子プロセスへ引き継げない」は
+/// 実測で否定された**（#979 / #986: agy は親環境をそのまま MCP 子へ渡す = 実測で
+/// `TAKO_*` が 15 個届く）。#986 で `caller_pane` の pid 祖先辿りも入ったので、
+/// 残る障害は system prompt だけ（#987）
 pub fn validate_master_agent(name: &str) -> Result<WorkerAgent, String> {
     let agent = WorkerAgent::parse(name)?;
     match agent {
@@ -1992,14 +2028,6 @@ pub fn validate_master_agent(name: &str) -> Result<WorkerAgent, String> {
         ),
     }
 }
-
-/// codex の MCP stdio サーバー（`tako mcp serve`）へ親環境から引き継ぐ環境変数。
-/// codex は既定で MCP 子プロセスの環境を最小構成（PATH / HOME 等）に絞るため、
-/// tako の接続情報は `mcp_servers.<name>.env_vars`（引き継ぎホワイトリスト）で明示する。
-/// TAKO_ORCHESTRATOR_ROLE は MCP セッションの caller_role（Issue #109 の複数 master
-/// 混線対策）に使われる
-const CODEX_MCP_ENV_VARS: &str =
-    r#"["TAKO_SOCKET","TAKO_TOKEN","TAKO_PANE_ID","TAKO_TAB_ID","TAKO_ORCHESTRATOR_ROLE"]"#;
 
 /// master 起動用のコマンドを組み立てる（master_agent 対応。Issue #127）。
 /// claude の出力は従来の claude 固定実装と同一文字列（完全後方互換）。
@@ -2090,18 +2118,9 @@ pub fn build_master_cmd_in(
                 cmd.push_str(" --dangerously-bypass-approvals-and-sandbox");
             }
             // MCP 接続は起動時の -c 一時注入（~/.codex/config.toml を汚さず、
-            // tako 外で起動した codex にツールを公開しない = FR-2.3.2 と同方針）
-            cmd.push_str(&format!(
-                " -c {}",
-                lc::quote(
-                    dialect,
-                    &format!("mcp_servers.tako.command={}", agent::toml_quote(tako_bin))
-                )
-            ));
-            cmd.push_str(r#" -c 'mcp_servers.tako.args=["mcp","serve"]'"#);
-            cmd.push_str(&format!(
-                " -c 'mcp_servers.tako.env_vars={CODEX_MCP_ENV_VARS}'"
-            ));
+            // tako 外で起動した codex にツールを公開しない = FR-2.3.2 と同方針）。
+            // **worker / git resolve と同じ 1 実装**を通す（#986。片方だけ直る形を作らない）
+            cmd.push_str(&agent::codex_mcp_args(tako_bin, dialect));
             // system prompt は developer_instructions（developer ロールメッセージとして
             // モデル可視プロンプトへ注入されることを codex debug prompt-input で実証済み）。
             // `"$( … )"` はダブルクォート内の部分式展開なので、ファイル内容の $ / " / '
@@ -2971,6 +2990,24 @@ fn agent_scan_config_dir_env(target: &AgentScanTarget) -> (String, Option<&str>)
 
 /// 単一走査先に対する `claude agents --json` の実行
 fn run_claude_agents_json_for(target: &AgentScanTarget) -> Option<Vec<u8>> {
+    // **テストビルドでは実 CLI を起こさない**（#944）。claude 本体は起動のたびに
+    // `~/.claude.json` を書き戻し `~/.claude/backups/.claude.json.backup.<epoch>` を
+    // 積むので、`cargo test` がユーザーの設定ファイルとバックアップを増やしていた
+    // （実測: 単体テスト `issue390_finish_worker_statusがprompt未達を検知する` が
+    // `claude agents --json` を 1 回起こしていた）。claude が入っていない CI と
+    // 同じ「解決できない」経路へ倒すことで、結果もローカル / CI で揃う。
+    // 実 CLI を通す検証は統合テスト（`tests/issue877_agents_scan_e2e.rs`）が担う
+    // ＝ そちらは lib を非テストビルドで束ねるのでこの分岐に入らない
+    #[cfg(test)]
+    if !tako_core::paths::issue944_legacy() {
+        crate::diag::flow_log("agents 走査: テストビルドでは実 CLI を起こさない（#944）");
+        return None;
+    }
+    run_claude_agents_json_live(target)
+}
+
+/// [`run_claude_agents_json_for`] の本体（実 CLI を起こす側）
+fn run_claude_agents_json_live(target: &AgentScanTarget) -> Option<Vec<u8>> {
     let (posix_prefix, config_dir) = agent_scan_config_dir_env(target);
     // 「ユーザーの環境で CLI を 1 回走らせる」形は OS で違う（#877。抽象境界 B21）。
     // unix はログインシェル経由（`.app` の痩せた PATH 対策）、Windows は PATH で解決した
@@ -4672,6 +4709,9 @@ prompt_blocks:
                 allow_sandbox_bypass: launch.allow_sandbox_bypass,
                 remote_control: launch.remote_control,
                 extra_args: &launch.extra_args,
+                // #1013 はモデル / effort の語彙だけを見るので MCP 注入は入れない
+                // （注入そのものは #986 のテストが見る）
+                tako_bin: None,
                 env: &EMPTY_ENV_PLAN,
             },
             crate::launch_cmd::ShellDialect::Posix,

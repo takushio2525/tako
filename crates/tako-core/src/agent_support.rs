@@ -439,12 +439,6 @@ pub mod notes {
         "The spawn is recorded, but the conversation itself cannot be indexed, so the entry stays pending and expires",
     );
 
-    /// 起動はできるが MCP を話せない（#986 が埋める）
-    pub const LAUNCH_ONLY_NO_MCP: Note = Note::new(
-        "起動はできるが tako の MCP ツールを呼べない（#986）",
-        "It launches, but cannot call tako's MCP tools (#986)",
-    );
-
     // ─── 上流に概念が無い（= Unsupported） ───────────────────────
 
     /// #790 の第 1 層は claude の Cross-Session Messaging に固有
@@ -706,12 +700,11 @@ pub const MATRIX: &[AgentFeature] = &[
             "Can be launched as the merge-conflict resolver agent (#496)",
         ),
         claude: S::Supported,
-        codex: degraded(notes::LAUNCH_ONLY_NO_MCP),
-        agy: degraded(notes::LAUNCH_ONLY_NO_MCP),
+        codex: S::Supported,
+        agy: S::Supported,
         local: local_pending(),
         evidence: AgentEvidence::Source(
-            "dispatch.rs の git resolve は 3 系統とも起動できるが、worker と同じ経路なので \
-             MCP の一時注入が無い（mcp_servers を組むのは orchestrator/mod.rs の master 側だけ）",
+            "dispatch.rs の git resolve は worker spawn と**同じ `WorkerLaunch`**（#986 で              `tako_bin` を配線済み）を通るので、MCP の一時注入も同じ 1 実装で効く。             番犬 `worker_mcp_injection_watchdog::worker_を起動する経路は_tako_bin_を渡している` が              片方だけ配線が落ちる形を落とし、MCP が実際に通ることは worker 経路で実測済み              （WORKER_MCP 行）",
         ),
     },
     AgentFeature {
@@ -981,15 +974,18 @@ pub const MATRIX: &[AgentFeature] = &[
     AgentFeature {
         key: keys::SETUP_AUTH_LAUNCH,
         summary: Note::new(
-            "未認証なら setup がログインまで案内・代行する",
-            "When unauthenticated, setup guides and performs the login",
+            "未認証なら setup がその系統のログインコマンドを案内する",
+            "When unauthenticated, setup points at that CLI's own login command",
         ),
         claude: S::Supported,
-        codex: pending(notes::NOT_WIRED, 989),
-        agy: pending(notes::NOT_WIRED, 989),
+        codex: S::Supported,
+        agy: S::Supported,
         local: local_pending(),
-        evidence: AgentEvidence::Source(
-            "setup.rs の認証誘導は claude の導線しか持たない（#868 のゼロスタートも claude 限定）",
+        evidence: AgentEvidence::Measured(
+            "#989: `setup_bootstrap::auth_instructions_for` が claude = `claude auth login` / \
+             codex = `codex login` / agy = 引数なしの `agy` を案内する（agy は専用の \
+             ログインサブコマンドを持たず、公式 docs の sign-in も引数なし起動）。\
+             ログイン自体はブラウザ操作が要るので tako は 3 系統とも代行しない（#1129）",
         ),
     },
     AgentFeature {
@@ -999,12 +995,14 @@ pub const MATRIX: &[AgentFeature] = &[
             "Setup installs the CLI itself on a machine that does not have it (#868)",
         ),
         claude: S::Supported,
-        codex: pending(notes::NOT_WIRED, 989),
-        agy: pending(notes::NOT_WIRED, 989),
+        codex: S::Supported,
+        agy: S::Supported,
         local: local_pending(),
-        evidence: AgentEvidence::Source(
-            "platform/agent_install.rs の AgentKind が Claude 1 値しか持たず、\
-             recipe() も claude ぶんしか無い（#868 の Out of scope。拡張は #989）",
+        evidence: AgentEvidence::Measured(
+            "#989: platform/agent_install.rs の recipe() が 3 系統 × 2 プラットフォームぶんの \
+             公式手順を持ち、まっさら HOME + PATH 剥ぎで 3 系統とも \
+             `tako setup bootstrap install` が通る（実測）。**Windows の実行代行は claude だけ** \
+             （codex / agy は can_run=false = 状態照会と案内まで。#525）",
         ),
     },
     AgentFeature {
@@ -1324,12 +1322,11 @@ pub const MATRIX: &[AgentFeature] = &[
             "The worker can call tako's MCP tools",
         ),
         claude: S::Supported,
-        codex: pending(notes::NOT_WIRED, 986),
-        agy: pending(notes::NOT_WIRED, 986),
+        codex: S::Supported,
+        agy: S::Supported,
         local: local_pending_first_class(),
-        evidence: AgentEvidence::Source(
-            "mcp_servers を組む非テストコードは orchestrator/mod.rs（master 経路）だけで、\
-             WorkerLaunch には tako_bin も MCP 引数も無い（棚卸し §5.3 = 最大の穴）",
+        evidence: AgentEvidence::Measured(
+            "#986 の実測（2026-09-09 / 隔離 GUI + tako-vd / codex-cli 0.153.0 / agy 1.1.27）:              **codex** = spawn の起動コマンドへ master と同じ `-c mcp_servers.tako.*` を一時注入する              （正本は orchestrator::agent::codex_mcp_args の 1 実装）。実 worker が              `tako.tako_list_panes({})` を呼び、**pane を省略した** `tako_set_title` が              自分のペインへ当たった。効いているのが一時注入だと分かるのは env の指紋で、             MCP 子プロセスの初期環境は一時注入の 5 個（TAKO_TAB_ID を含む）に対し、             `TAKO_986_LEGACY=1` の旧アームでは恒久登録（#979）の 4 個（TAKO_TAB_ID 無し）だった。             **agy** = per-launch の注入手段が CLI に無い（`agy --help` 実測 1.1.27: -c / --mcp-config なし）ので              恒久登録（#979）に委ねる。agy は親 env をそのまま渡す（実測: MCP 子が TAKO_* を 15 個受け取る              = claude と同じ形）ため、実 worker から pane 省略の `tako_set_title` が自分のペインへ当たった。             `TAKO_PANE_ID` が届かない系統でも解けるよう、caller_pane は **pid 祖先辿り**へ落ちる              （`tako mcp serve` が `Request::ResolvePane` で問う。#288 / #567 と同じ 1 実装）",
         ),
     },
     AgentFeature {
@@ -1528,6 +1525,27 @@ impl From<crate::platform::agent_install::AgentKind> for Agent {
         use crate::platform::agent_install::AgentKind as K;
         match v {
             K::Claude => Self::Claude,
+            K::Codex => Self::Codex,
+            K::Agy => Self::Agy,
+        }
+    }
+}
+
+/// `Agent` → `agent_install::AgentKind` は**部分写像**（`Local` を落とす）。
+///
+/// ローカル LLM は「エージェント CLI を公式インストーラで入れる」形ではない
+/// （runtime を入れてモデルを pull する = #990）。手順が持てるようになった時点で
+/// ここが変換できるようになり、`AgentKind` へ値を足す必要があると分かる（#989）
+impl TryFrom<Agent> for crate::platform::agent_install::AgentKind {
+    type Error = Agent;
+
+    fn try_from(v: Agent) -> Result<Self, Self::Error> {
+        use crate::platform::agent_install::AgentKind as K;
+        match v {
+            Agent::Claude => Ok(K::Claude),
+            Agent::Codex => Ok(K::Codex),
+            Agent::Agy => Ok(K::Agy),
+            Agent::Local => Err(v),
         }
     }
 }
@@ -1801,7 +1819,9 @@ mod tests {
     #[test]
     fn gateの診断は表示言語に追従する() {
         let _guard = i18n::testing::lang_guard();
-        let key = keys::WORKER_MCP;
+        // #986 で WORKER_MCP は codex / agy とも Supported になったので、
+        // まだ pending が残るマス（会話の resume）で診断の言語追従を見る
+        let key = keys::SESSIONS_RESUME;
         i18n::set_lang(Lang::En);
         let en = gate(Agent::Codex, key).unwrap_err();
         i18n::set_lang(Lang::Ja);
@@ -1811,7 +1831,7 @@ mod tests {
                 .any(|c| matches!(c as u32, 0x3040..=0x30FF | 0x4E00..=0x9FFF)),
             "英語の診断に日本語が残っている: {en}"
         );
-        assert!(en.contains("#986") && ja.contains("#986"));
+        assert!(en.contains("#984") && ja.contains("#984"));
         assert!(en.contains("OpenAI Codex CLI") && ja.contains("OpenAI Codex CLI"));
     }
 
@@ -1839,12 +1859,24 @@ mod tests {
         for v in LimitService::ALL {
             assert_eq!(Agent::from(v).as_str(), v.as_str());
         }
-        // agent_install は claude 1 値のみ（拡張は #989）
-        assert_eq!(Agent::from(AgentKind::Claude), Agent::Claude);
-        assert_eq!(
-            support_for(Agent::Codex, keys::SETUP_CLI_INSTALL).map(|s| s.status()),
-            Some("pending"),
-            "agent_install が codex へ拡張されたらマトリクスも更新すること"
-        );
+        // agent_install は TUI 3 系統と 1:1（#989）。ローカル LLM だけ写らない
+        let from_install: Vec<Agent> = AgentKind::ALL.iter().map(|v| Agent::from(*v)).collect();
+        assert_eq!(from_install, Agent::TUI.to_vec());
+        for v in AgentKind::ALL {
+            assert_eq!(Agent::from(v).as_str(), v.as_str());
+            // 逆向きも通る（部分写像の全射部分）
+            assert_eq!(AgentKind::try_from(Agent::from(v)), Ok(v));
+        }
+        assert_eq!(AgentKind::try_from(Agent::Local), Err(Agent::Local));
+        // 手順を持つ 3 系統はマトリクスでも導入できる側に居ること
+        // （`AgentKind` へ値を足したのにマトリクスが pending のままだとここで落ちる）
+        for v in AgentKind::ALL {
+            assert_eq!(
+                support_for(Agent::from(v), keys::SETUP_CLI_INSTALL).map(|s| s.status()),
+                Some("supported"),
+                "{} は agent_install に手順があるのにマトリクスが未対応",
+                v.as_str()
+            );
+        }
     }
 }

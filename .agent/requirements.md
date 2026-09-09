@@ -198,7 +198,21 @@ FR-2.2.7 の環境変数解決のまま（誤ったペインへ副作用を起�
   `claude mcp add --scope user tako -- <tako のパス> mcp serve` を登録すれば、以後は
   どのプロジェクト・どのペインでも設定なしで使える（ブリッジが起動毎に TAKO_* を読むため、
   セッション毎に変わる URL / トークンに依存しない）。tako の外では 0 ツールを返し無害
-- FR-2.3.3: 呼び出し元ペインの特定は stdio = `TAKO_PANE_ID`、HTTP = `X-Tako-Pane` ヘッダ。
+- FR-2.3.2 の worker への適用（#986）: **master だけでなく worker / git resolve でも
+  ゼロコンフィグで繋がる**。codex は MCP 子プロセスへ親環境を渡さない
+  （実測 0.153.0: `env_vars` に挙げた名前だけが届く）ので、起動コマンドへ
+  `-c mcp_servers.tako.command/args/env_vars` を**一時注入**する（正本は
+  `orchestrator::agent::codex_mcp_args` の 1 実装で、master / worker / git resolve が共有）。
+  恒久登録（`tako setup-mcp` = #979）ではなく `-c` なのは、`~/.codex/config.toml` を汚さず
+  **tako の外で起動した codex にツールを出さない**ため。恒久登録がある機でも `-c` が
+  後勝ちするので、登録が古いバイナリを指していても worker は正しいブリッジへ繋がる。
+  claude / agy は親環境をそのまま子へ渡す（agy は実測 1.1.27 で `TAKO_*` 15 個が届く）ので
+  一時注入は不要・agy の CLI にその手段も無い（`agy --help` に `-c` / `--mcp-config` が無い）
+- FR-2.3.3: 呼び出し元ペインの特定は stdio = `TAKO_PANE_ID`、HTTP = `X-Tako-Pane` ヘッダ、
+  **どちらも無いときは pid 祖先辿り**（#986。`tako mcp serve` が `Request::ResolvePane` で
+  アプリに問い、#288 / #567 と同じ 1 実装で backend セッション → ペイン ID を解く）。
+  env が在るときは 1 往復も増やさない（claude 経路は 1 バイトも変わらない）し、
+  接続情報が無いとき（= tako の外）は問い合わせに行かない（FR-2.3.2 の 0 ツールを保つ）。
   pane 省略時のデフォルト対象が呼び出し元（= 同タブ）になる。タブを越える操作は
   ID の明示指定が必要。**ハードなスコープ強制は未実装**（FR-2.3.5 のポリシー制御と併せて後段）
 - FR-2.3.4: 実装済み。localhost バインド + Bearer トークン（IPC と共有）+ Origin 検証。
@@ -1231,7 +1245,7 @@ FR-2.8〜2.32 はいずれも設計原則 5（AI フルコントロール）の�
 | FR-2.33.6 | **任意依存のその場導入を復活させる**。依存表と導入実行の正本は `setup_deps` 1 か所で、CLI（`tako setup deps [install]`）・MCP（`tako_setup_deps`）・`--review` が同じ実装を通る。**質問するのは `--review` だけ**（標準 `tako setup` は質問ゼロ = #262。標準経路は状態 + `いま入れる: tako setup deps install` の 1 行 = #322） | M | ✅ |
 | FR-2.33.7 | **代行するのは実測済みの手段だけ**。macOS = `brew install`、Windows の winget は**案内のみ**（`can_run: false`）。導入済みは触らない（冪等）。手段が無い・代行できない・導入器が無いものは実行せず理由つきで `skipped` に載せる（黙って飛ばさない）。導入後は「引けるようになったか」を確かめてから成功と言う | M | ✅ |
 | FR-2.33.8 | **依存の名前はプラットフォームで変わる**。永続化の器は macOS = `tmux` / Windows = `psmux` で、`tmux` を探すと器が動いていても「見つかりません」になる。器の解決は `exe::find` → `backend::binary()`（`TAKO_TMUX_BIN` / 既知の置き場 / 別名の psmux を拾う）の順で、**検出と導入後の確認が同じ規則を通る** | M | ✅ |
-| FR-2.33.9 | **ブラウザ操作待ちのプロセスは tako が起こさない**（#1129）。`tako setup` の認証段は `claude auth login` を**実行せず案内だけ**を出して止まる（文面の正本は `setup_bootstrap::auth_instructions`、コマンドの正本は #983 の `agent_cli::auth_command`）。理由は寿命の持ち主が居なくなること: ログインは自分では終わらないので tako が `.status()` で待つ形になり、Windows は子プロセスの終了要求（#1067 の境界 B5）が未実装なのでペイン close も隔離インスタンスの終了も**孫を回収しない**（実機で 1 日 46 本・CPU 100%）。**stdin が端末かで「人が見ているか」は判別できない**（セルフテストがペインへ打ち込む `tako setup` も PTY 上では端末に見える）ので条件で絞らず構造的に起こさない。番犬は `crates/tako-control/tests/agent_auth_launch_watchdog.rs`（argv として `auth` + `login` を渡す形をソース走査で禁じる。A/B 用の 1 か所だけ `watchdog-allow`）、run ごとの機械検証はセルフテスト項目 144（**tako の直接の子**になっているエージェント CLI が 0 件。判定は純粋関数 `platform::procinfo::agent_children_of_tako` なので macOS から Windows の名前も検査できる）。**祖先ではなく直接の親だけ**を見る（器なし構成ではペインのシェルが `tako-app` の子になるので、祖先を辿るとシェルから正しく起動したエージェントまで拾う）うえ、**そのインスタンスのペイン配下へ絞る**（`agent_children_of_tako_under`。`tako → claude` は #391 の setup 対話エージェントとして本番でも正当に存在するので、機械全体で見ると人が `tako setup` を開いているだけで落ちる = 開発機で実測） | M | ✅ 2026-09-04 |
+| FR-2.33.9 | **ブラウザ操作待ちのプロセスは tako が起こさない**（#1129）。`tako setup` の認証段は `claude auth login` を**実行せず案内だけ**を出して止まる（文面の正本は `setup_bootstrap::auth_instructions_for`、コマンドの正本は #983 の `agent_cli::auth_command`。#989 で 3 系統ぶんになった）。理由は寿命の持ち主が居なくなること: ログインは自分では終わらないので tako が `.status()` で待つ形になり、Windows は子プロセスの終了要求（#1067 の境界 B5）が未実装なのでペイン close も隔離インスタンスの終了も**孫を回収しない**（実機で 1 日 46 本・CPU 100%）。**stdin が端末かで「人が見ているか」は判別できない**（セルフテストがペインへ打ち込む `tako setup` も PTY 上では端末に見える）ので条件で絞らず構造的に起こさない。番犬は `crates/tako-control/tests/agent_auth_launch_watchdog.rs`（argv として `auth` + `login` を渡す形をソース走査で禁じる。A/B 用の 1 か所だけ `watchdog-allow`）、run ごとの機械検証はセルフテスト項目 144（**tako の直接の子**になっているエージェント CLI が 0 件。判定は純粋関数 `platform::procinfo::agent_children_of_tako` なので macOS から Windows の名前も検査できる）。**祖先ではなく直接の親だけ**を見る（器なし構成ではペインのシェルが `tako-app` の子になるので、祖先を辿るとシェルから正しく起動したエージェントまで拾う）うえ、**そのインスタンスのペイン配下へ絞る**（`agent_children_of_tako_under`。`tako → claude` は #391 の setup 対話エージェントとして本番でも正当に存在するので、機械全体で見ると人が `tako setup` を開いているだけで落ちる = 開発機で実測） | M | ✅ 2026-09-04 |
 
 A/B は `TAKO_1057_LEGACY=1`（Windows は代行しない / PATH 判定は `exe::find` / 引き継ぎ先を探さない /
 依存の質問をしない = #1057 前の挙動）。
@@ -1320,6 +1334,32 @@ AI エージェントが**起動した瞬間に強制ロードされるもの**�
 | FR-2.36.7 | **AI フルコントロール**: `tako context-budget [check\|fix] [--cwd] [--profile] [--dry-run] [--json]` と MCP `tako_context_budget`（action = check / fix）へ 1:1 公開する。GUI も IPC も要らないローカル処理（**壊れた設定で GUI が起動しないときにも引ける**ことが本質） | M | ✅ |
 | FR-2.36.8 | **`@import` は行頭に限らない**。実際の `AGENTS.md` は箇条書きの途中に `@.agent/progress.md` と書く（そう書いても展開される）ので、行頭限定で数えると**毎ターン全文ロードされている当のファイルを 1 つも数えられない**。誤検出はバックティック参照の除外と**実在するファイルに解決できること**の 2 段で落とす | M | ✅ |
 | FR-2.36.9 | **master / solo の system prompt も予算の対象**（✅ 2026-09-07、#1154）。上限は **24 KB**。これは tako 自身の生成物なので、超えたらユーザーに我慢させるのではなく tako を直す。手順の詳細（monitoring のイベント別対処表・acceptance・worker prompt テンプレート・引き継ぎの書き方など）は `tako orchestrator guide <topic>` / MCP `tako_orchestrator_guide` で**引く条件が満たされたときだけ**取得する形へ移し、既定 blocks には「いつ引くか」と常に握っておく規則だけを残す（#322 の「既定を賢く」）。**本文は 1 文字も捨てない**（移送前のブロックと byte 一致。プレースホルダだけ prompt と同じ解決を通す）。内訳は**組み立てと同じ 1 実装**から採る（`build_prompt_pieces` が断片の列を返し `join_prompt_pieces` が prompt になる）ので、超過時の `proposals` は **どの block / どの追記が何バイトか**を大きい順に出す（ユーザーの `prompt_blocks.append` は解決したファイル名で名指しする = 個人環境固有のルールの分離先を案内できる）。欠落ゼロは移送前テンプレート全文の fixture と多重集合で突き合わせて拘束する（`tests/prompt_guides.rs`）。A/B は `TAKO_1154_LEGACY=1`（本文を prompt へ差し戻す。予算は外さないので番犬が超過で落ちる） | M | ✅ |
+
+### FR-2.37 ゼロスタート導入を 3 系統へ（✅ 2026-09-09、#989。基盤は #868 / #1057、エピック #975）
+
+> #868 のゼロスタート導入（インストール → PATH → 認証誘導）は **claude 専用**だった。
+> `platform::agent_install::AgentKind` が Claude 1 値で、`setup_bootstrap` の全 API が
+> 引数なし（= claude 固定）。codex / agy は「URL を見せるだけ」で、
+> **codex だけ入れている人が `tako setup` を叩くと claude の導入を勧められた**
+> （A/B `TAKO_989_LEGACY=1` で再現できる）。#975 の基準 2（他人の環境で通るセットアップ）の
+> 一番大きなギャップ。
+
+| ID | 要件 | 優先度 | 状態 |
+|---|---|---|---|
+| FR-2.37.1 | **手順の正本は境界 B17 の 1 表**（`platform::agent_install::recipe(platform, agent)` = 3 系統 × 2 プラットフォームの 6 マス）。取得元 URL・公式コマンド・置き場所・以後の更新のされ方・トラブルシュート先・インストーラへ渡す env を**データとして**持ち、`Platform` を引数で受ける純粋関数なので **macOS から Windows 側も検証できる**。値は 2026-09-09 に実物で確認したものだけ（codex = `https://chatgpt.com/codex/install.sh` → 302 → `releases.openai.com`・sudo 参照 0 件・SHA256 検証はインストーラ自身 / agy = 公式 docs の `https://antigravity.google/cli/install.sh`・SHA512 検証・単一バイナリ） | M | ✅ |
+| FR-2.37.2 | **段の実装は 1 本で、系統は引数で受ける**（`status_for` / `install_for` / `ensure_path_for` / `auth_instructions_for` …）。**引数なしの claude 既定 API は置かない**。claude 既定の入口を残すと新しい機能がそこへ吸い寄せられて 1 系統だけ通る形に戻る（`AgentKind` が 1 値だった理由がそれ）。番犬 `crates/tako-control/tests/setup_bootstrap_agent_watchdog.rs` がソース走査で禁じる | M | ✅ |
+| FR-2.37.3 | **単一選択を強制しない**（#988 と整合）。`tako setup` は「1 つ選ばせる」のではなく **1 つでも使える系統があれば導入の段を素通りする**。1 つも使えないときだけ 1 系統を仕上げ、**途中まで入っているもの（PATH / 認証だけ足りない）を優先**する。仕上げたあとは残りを足すコマンドを出すだけで、選択は迫らない | M | ✅ |
+| FR-2.37.4 | **認証誘導は系統ごとの実コマンド**（正本は #983 の `agent_cli::auth_command`）。claude = `claude auth login` / codex = `codex login` / **agy = 引数なしの `agy`**（専用のログインサブコマンドを持たず、公式 docs の sign-in も引数なし起動。keyring に有効なセッションがあれば無言で通る）。**3 系統とも tako は代行しない**（#1129 の理由がそのまま効く） | M | ✅ |
+| FR-2.37.5 | **PATH のマーカーブロックは 1 個**。macOS は 3 系統とも `~/.local/bin` なので、#868 が置くブロック 1 個で足りる（実測: claude の段で `installed`、codex / agy の段は `unchanged`）。**Windows は系統ごとに置き場が違う**（claude = `~\.local\bin` / codex = `%LOCALAPPDATA%\Programs\OpenAI\Codex\bin` / agy = `%LOCALAPPDATA%\agy\bin`）ので、PATH へ通すディレクトリは `launcher_rel` から導出する（プラットフォームで `match` しない） | M | ✅ |
+| FR-2.37.6 | **Windows で実行を代行するのは実測済みの組み合わせだけ**。claude は #1057 で実機実測済み = `tako_can_run: true`、codex / agy は `install.ps1` が実在するが未実測なので **状態照会と公式手順の案内まで**（`tako_can_run: false`。実行代行は #525 の範囲）。宣言は `platform::support` の `tako_setup_bootstrap`（Degraded + 理由）と `agent_support::MATRIX` の 2 か所へ載り、`tako platform --platform windows` / `tako agent-support` から読める | M | ✅ |
+| FR-2.37.7 | **CLI 解決のフォールバックも 3 系統へ**。入れた直後は profile へ書いた PATH がまだ届かないので、`find_agent_command`（`tako-cli`）と `agent_cli::locate`（worker 起動の実在検査）の両方が**インストーラの置き場所**を見る。#989 まではどちらも claude 専用（`_ => None` / `if agent == WorkerAgent::Claude`）で、codex / agy は「入れたのに見つかりません」で止まっていた | M | ✅ |
+| FR-2.37.8 | **失敗の案内も系統ごと**。インストーラが失敗したときのトラブルシュート先は recipe が持つ（claude のページを codex の失敗に出さない。エッジ検証で実際に踏んだ）。codex のインストーラは最後に `Start Codex now? [y/N]` を `/dev/tty` から聞くので、代行時は `CODEX_NON_INTERACTIVE=1` を渡す（無いと codex の TUI が立って返ってこない） | M | ✅ |
+| FR-2.37.9 | **AI フルコントロール**: `tako setup bootstrap [status\|status-all\|install\|path\|undo-path\|handoff] [--agent claude\|codex\|agy]` と MCP `tako_setup_bootstrap`（`agent` パラメータ）へ 1:1 公開する。`--agent` 省略は claude（#868 からの既定を変えない）で、**未知の名前は黙って claude にせず選択肢つきで拒否する**。`status-all` は 3 系統ぶんを 1 回で返し `tako setup --check` の材料になる。案内するコマンドは最簡形（claude は `--agent` を付けない = #322） | M | ✅ |
+
+A/B は `TAKO_989_LEGACY=1`（面倒を見る系統が claude 1 つへ戻る = #989 前の挙動。
+実測: codex だけ入っている HOME で既定は `Codex CLI を使えるところまで…` → `codex login`、
+legacy は `Claude Code をインストールします` へ戻る）。
+
 
 ## FR-3 コンセプト②: 軽量 IDE 的ワークスペース
 

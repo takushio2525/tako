@@ -25,7 +25,7 @@ AI 連携を使わず「ただのターミナル」として使う場合は、�
 |---|---|---|
 | macOS（Apple Silicon）または Windows | 必須 | 主な配布は Apple Silicon Mac（M1 以降）向けです。Windows 版は移植を進めており、どの機能が使えるかは [Windows 対応状況](/windows-support/) にまとめています |
 | [Homebrew](https://brew.sh/ja/) | 推奨 | macOS 用のアプリ管理ツール。インストールとアップデートが 1 コマンドで済みます |
-| AI エージェント CLI | AI 連携に1つ以上必要 | `claude`（Claude Code）/ `codex`（OpenAI Codex CLI）/ `agy`（Gemini 系）のいずれか。あらかじめ各 CLI でログインしてください |
+| AI エージェント CLI | AI 連携に1つ以上必要 | `claude`（Claude Code）/ `codex`（OpenAI Codex CLI）/ `agy`（Antigravity CLI）のいずれか。**入っていなくても大丈夫です** — `tako setup` が公式インストーラで導入まで案内します（ログインだけは、ブラウザ操作が必要なのでご自身で行います） |
 | tmux | あると便利 | ターミナルのセッション（作業状態）を保持するツール。入っていると **tako を再起動しても実行中のプロセスと画面が丸ごと復元**されるほか、**スマホからのリモート接続（`tako remote`）とオーケストレーターの worker 管理にはこれが必須**です。`brew install tmux` で導入。**Windows では psmux が同じ役割を担います**（`winget install marlocarlo.psmux`。attach を前提にする一部の tmux 操作は使えません → [Windows 対応状況](/windows-support/)） |
 | [Tailscale](https://tailscale.com/) | リモート接続に必須 | `tako remote`（スマホからの接続）の transport。Mac とスマホの両方にアプリを入れて同一アカウントでログインすると、tailnet 内限定の固定 URL で安全に接続できます |
 | git | あると便利 | git パネル（ブランチ・コミットグラフ・diff 表示）で使います。macOS では `xcode-select --install` で入っていることが多いです |
@@ -35,7 +35,7 @@ tmux（ティーマックス）は「ターミナルの中身を裏で生かし�
 :::
 
 :::tip[入っているか分からないときは]
-`tako setup` を実行すると、最初に claude / codex / agy と依存ツール（tmux / git）を自動チェックします。認証済み CLI とプランは検出結果、前回値、安全な既定値の順で自動決定します。チェックだけしたい場合は `tako setup --check` を使ってください。
+`tako setup` を実行すると、最初に claude / codex / agy と依存ツール（tmux / git）を自動チェックします。認証済み CLI とプランは検出結果、前回値、安全な既定値の順で自動決定します。チェックだけしたい場合は `tako setup --check` を使ってください（**3 系統それぞれについて「入っているか / PATH が通っているか / ログイン済みか」を一覧で出します**）。
 :::
 
 ## 1. インストール
@@ -157,15 +157,19 @@ AI 連携に必要な設定を、**1 コマンドで自動的に**行います�
 tako setup
 ```
 
-:::caution[エージェント CLI を1つ以上準備してください]
-`claude` / `codex` / `agy` のいずれかをインストールし、その CLI を単独で一度起動してログインを済ませてください。`tako setup` はインストール代行は行わず、見つからない場合は各 CLI の導入先を案内します。
+:::tip[エージェント CLI が 1 つも入っていなくても始められます]
+`claude` / `codex` / `agy` が 1 つも見つからないときは、`tako setup` が **インストール → PATH 通し → ログイン案内** の 3 段をそのまま案内します。実行する前に「何をどこに入れるか」（公式コマンド・取得元・置き場所・以後の更新のされ方）を必ず表示して確認を取り、**管理者権限は使いません**（ホームディレクトリの中だけで完結します）。
+
+**すでに 1 つでも使える状態なら、この案内は出ません**（余計な導入を勧めません）。たとえば `codex` だけが入っている環境では codex をそのまま使い、claude を入れるよう促したりはしません。あとから系統を増やしたくなったら `tako setup bootstrap install --agent codex` のように 1 コマンドで足せます。
+
+**ログインだけはご自身で**行ってください。ブラウザでの操作が必要なので tako は代行しません（案内するコマンドは claude なら `claude auth login`、codex なら `codex login`、agy は引数なしの `agy` 起動です）。
 :::
 
 ### `tako setup` は何をするのか
 
 実行すると、次の処理が自動で順に行われます。
 
-1. **エージェント CLI と依存ツールのチェック** — claude / codex / agy をすべて検出します。認証済み CLI が1つなら自動選択し、複数なら前回値または安全な既定を採用します。tmux / git は任意依存として状態と導入コマンドだけを表示します
+1. **エージェント CLI と依存ツールのチェック** — claude / codex / agy をすべて検出します。認証済み CLI が1つなら自動選択し、複数なら前回値または安全な既定を採用します。**1 つも使える系統が無いときだけ**、その場で導入を案内します（上の tip 参照）。tmux / git は任意依存として状態と導入コマンドだけを表示します
 2. **認証・プラン確認** — Claude は認証と Pro / Max 等、Codex は認証と ChatGPT プランを取得できる範囲で自動判定します。検出不能でも安全に未指定にできる情報は `unknown` を採用します。token やアカウント情報は保存・表示しません
 3. **MCP 接続の準備** — claude を選んだ場合は `~/.claude/settings.json` へ自動登録します。codex は `tako master` の起動時だけ MCP 設定を注入するため、グローバル設定を変更しません。agy は worker 専用です
 4. **推奨 profile の生成** — プラン規模に応じて master / worker、effort、worker ポリシーを `profiles/default.yaml` へ生成します。モデル名は固定せず、各 CLI の最新の既定モデルを使います。既存 profile はそのまま維持します

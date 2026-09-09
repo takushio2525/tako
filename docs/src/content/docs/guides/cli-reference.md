@@ -177,34 +177,52 @@ tako setup --reset
 
 ### tako setup bootstrap
 
-Claude Code（`claude` コマンド）がまだ入っていない環境で、導入から認証までを案内・実行します。**`tako setup` が未導入を見つけたら自動でこの段を通る**ので、普段このコマンドを直接叩く必要はありません。AI から段ごとに操作したいときや、状態だけ確認したいときに使います。
+エージェント CLI（`claude` / `codex` / `agy`）がまだ入っていない環境で、導入から認証までを案内・実行します。**`tako setup` が「1 つも使える系統が無い」ことを見つけたら自動でこの段を通る**ので、普段このコマンドを直接叩く必要はありません。AI から段ごとに操作したいときや、状態だけ確認したいときに使います。
 
 ```bash
-tako setup bootstrap                      # 状態確認（既定。読み取り専用）
-tako setup bootstrap install --dry-run    # 何をどこに入れるかだけ表示
-tako setup bootstrap install              # 公式インストーラを実行
-tako setup bootstrap path                 # claude をどのターミナルからも使えるようにする
-tako setup bootstrap undo-path            # path で入れた設定を取り除く
-tako setup bootstrap handoff              # 別のエージェントへ導入を頼む
+tako setup bootstrap                          # 状態確認（既定。読み取り専用）
+tako setup bootstrap status-all               # 3 系統ぶんをまとめて確認（読み取り専用）
+tako setup bootstrap install --dry-run        # 何をどこに入れるかだけ表示
+tako setup bootstrap install                  # 公式インストーラを実行
+tako setup bootstrap install --agent codex    # 系統を選んで入れる
+tako setup bootstrap path                     # claude をどのターミナルからも使えるようにする
+tako setup bootstrap undo-path                # path で入れた設定を取り除く
+tako setup bootstrap handoff                  # 別のエージェントへ導入を頼む
 ```
+
+`--agent` を省略すると `claude` が対象です。`claude` / `codex` / `agy` から選べます
+（それ以外の名前は、間違って別の系統を入れないよう選択肢つきで拒否します）。
+
+系統ごとの導入手順は次のとおりです（すべて公式のもの）。
+
+| 系統 | macOS の公式コマンド | コマンドの置き場所 | 以後の更新 |
+|---|---|---|---|
+| `claude` | `curl -fsSL https://claude.ai/install.sh \| bash` | `~/.local/bin/claude` | Claude Code が自分でバックグラウンド更新 |
+| `codex` | `curl -fsSL https://chatgpt.com/codex/install.sh \| sh` | `~/.local/bin/codex` | 新しい版が出ると知らせるだけ（`codex update` で更新） |
+| `agy` | `curl -fsSL https://antigravity.google/cli/install.sh \| bash` | `~/.local/bin/agy` | 実行のたびに自分で背景更新 |
 
 `次の一歩`（`next_step`）は 4 つのいずれかです。
 
 | 値 | 意味 |
 |---|---|
-| `install` | `claude` がまだ入っていない |
-| `path` | 入っているが、ターミナルから `claude` が呼べない |
-| `auth` | 入っているが、Claude アカウントにログインしていない |
+| `install` | その CLI がまだ入っていない |
+| `path` | 入っているが、ターミナルからコマンドが呼べない |
+| `auth` | 入っているが、アカウントにログインしていない |
 | `ready` | 導入は済んでいる |
+
+ログインのコマンドは系統ごとに違います（`claude auth login` / `codex login` / **引数なしの `agy`**）。
+どれも**ブラウザ操作が必要なので tako は代行せず、コマンドを案内するところまで**です。
 
 インストール前には必ず「実行するコマンド・取得元・置き場所・以後の更新」を表示します。管理者権限は使わず、ホームディレクトリの中だけで完結します。
 
-「どのターミナルからも使えるようにする」のやり方は OS で違います。macOS / Linux はログインシェルの設定ファイル（zsh なら `~/.zprofile`）へ 1 ブロック追記し、Windows は**ユーザー環境変数 `Path`** へ追記します（Windows 版の公式インストーラは PATH を自動では通さず、手作業を案内して終わるためです）。どちらも `undo-path` で元に戻せます。
+「どのターミナルからも使えるようにする」のやり方は OS で違います。macOS / Linux はログインシェルの設定ファイル（zsh なら `~/.zprofile`）へ 1 ブロック追記し、Windows は**ユーザー環境変数 `Path`** へ追記します（Windows 版の公式インストーラは PATH を自動では通さず、手作業を案内して終わるためです）。どちらも `undo-path` で元に戻せます。macOS では 3 系統とも同じ場所（`~/.local/bin`）に入るので、**追記されるブロックは 1 つだけ**です。
+
+**Windows で tako が実際にインストーラを走らせるのは `claude` だけ**です。`codex` / `agy` は状態の確認と公式コマンドの案内までで、実行は行いません（Windows 実機での確認が済んでいないためです）。表示される公式コマンドをご自身で実行すれば、そのあとの PATH 通しと状態確認は tako が引き継げます。詳しくは [Windows 対応状況](/windows-support/) をご覧ください。
 
 :::note[うまく入らないときは別のエージェントに頼めます]
-ネットワークやプロキシの都合でインストーラが動かないことがあります。そのとき codex / agy がすでに入っていれば、`tako setup` はそのエージェントへ「Claude Code を入れて」と頼むことを提案します（`tako setup bootstrap handoff` でも同じことができます）。1 つも入っていなければ、自分で実行するコマンドを表示して終わります。
+ネットワークやプロキシの都合でインストーラが動かないことがあります。そのとき**入れようとしている系統以外**がすでに入っていれば、`tako setup` はそのエージェントへ「これを入れて」と頼むことを提案します（`tako setup bootstrap handoff` でも同じことができます）。1 つも入っていなければ、自分で実行するコマンドを表示して終わります。
 
-ログインだけはブラウザ操作が必要なので代行しません。`claude auth login` の実行をお願いし、そこで `tako setup` はいったん終わります（ログインしたらもう一度 `tako setup` を実行してください）。tako がログインを起こさないのは、ブラウザの操作が終わるまで終わらないプロセスになるためです。誰も終わらせられないまま残り続けると CPU を食い続けます。
+ログインだけはブラウザ操作が必要なので代行しません。その系統のログインコマンドの実行をお願いし、そこで `tako setup` はいったん終わります（ログインしたらもう一度 `tako setup` を実行してください）。tako がログインを起こさないのは、ブラウザの操作が終わるまで終わらないプロセスになるためです。誰も終わらせられないまま残り続けると CPU を食い続けます。
 :::
 
 ### tako setup deps

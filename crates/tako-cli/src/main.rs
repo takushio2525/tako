@@ -2729,10 +2729,13 @@ enum SetupCommand {
         #[arg(long)]
         json: bool,
     },
-    /// エージェント CLI の導入状況を確認・実行する（#868 / #1057）
+    /// エージェント CLI の導入状況を確認・実行する（#868 / #1057 / #989）
     Bootstrap {
-        /// status（既定・読み取り専用）/ install / path / undo-path / handoff
+        /// status（既定・読み取り専用）/ status-all / install / path / undo-path / handoff
         action: Option<String>,
+        /// 対象の系統（claude / codex / agy。省略で claude）
+        #[arg(long)]
+        agent: Option<String>,
         /// install で実行せず「何をどこに入れるか」だけ出す
         #[arg(long)]
         dry_run: bool,
@@ -2998,11 +3001,12 @@ fn cli_main() -> ExitCode {
                 setup::run_models(agent.as_deref(), json)
             } else if let Some(SetupCommand::Bootstrap {
                 ref action,
+                ref agent,
                 dry_run,
                 json,
             }) = args.command
             {
-                setup::run_bootstrap(action.as_deref(), dry_run, json)
+                setup::run_bootstrap(action.as_deref(), agent.as_deref(), dry_run, json)
             } else if let Some(SetupCommand::Deps {
                 ref action,
                 ref dep,
@@ -3337,7 +3341,36 @@ fn mcp_serve() -> Result<(), String> {
         (std::env::var("TAKO_SOCKET"), std::env::var("TAKO_TOKEN")),
         (Ok(s), Ok(t)) if !s.is_empty() && !t.is_empty()
     );
-    let caller = caller_pane();
+    // 呼び出し元ペインの決め方は純粋関数で決めてから実行する（#986）
+    let plan = caller_pane_plan(caller_pane(), connected, legacy_no_pid_fallback());
+    let caller = match plan {
+        CallerPanePlan::FromEnv(pane) => Some(pane),
+        CallerPanePlan::ResolveByPid => {
+            // env が届かない系統（agy / 親 env を渡さない MCP クライアント）向けの
+            // pid 祖先辿り。アプリ側の `Request::ResolvePane` = #288 / #567 と同じ 1 実装
+            let resolved = resolve_caller_pane_via_app(None)
+                .ok()
+                .flatten()
+                .map(|c| (c.pane, c.method.unwrap_or_else(|| "unknown".into())));
+            match resolved {
+                Some((pane, method)) => {
+                    tako_control::diag::persist_log(&format!(
+                        "mcp serve: caller_pane を pid 祖先辿りで解決（pane={pane} method={method} pid={}）",
+                        std::process::id()
+                    ));
+                    Some(pane)
+                }
+                None => {
+                    tako_control::diag::persist_log(&format!(
+                        "mcp serve: caller_pane を解決できない（TAKO_PANE_ID 無し + pid 祖先辿りも不一致。pid={}）",
+                        std::process::id()
+                    ));
+                    None
+                }
+            }
+        }
+        CallerPanePlan::Unresolved => None,
+    };
     let caller_role = std::env::var("TAKO_ORCHESTRATOR_ROLE").ok();
 
     let stdin = std::io::stdin();
@@ -5592,6 +5625,40 @@ fn run(command: Command) -> Result<(), String> {
 /// `TAKO_PANE_ID`（呼び出し元ペイン）。tako 内のシェルなら必ず入っている（FR-2.1.1）
 fn caller_pane() -> Option<u64> {
     std::env::var("TAKO_PANE_ID").ok()?.parse().ok()
+}
+
+/// MCP stdio ブリッジが呼び出し元ペインをどう決めるか（Issue #986）。
+///
+/// **判断を純粋関数に置く**ので、env とアプリを触らずに新旧どちらの形も検査できる
+/// （env グローバルを触るテストは並列で競合する。#608 / #807）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallerPanePlan {
+    /// `TAKO_PANE_ID` が届いている（claude / codex の `env_vars` 経路）
+    FromEnv(u64),
+    /// env が届かないので pid 祖先辿りでアプリに問う（agy / 親 env を渡さない
+    /// クライアント。#987 の agy master もここで解ける）
+    ResolveByPid,
+    /// tako の外（接続情報が無い = tools/list が 0 件になるので問う相手も居ない）
+    Unresolved,
+}
+
+/// 解決順を決める。**env が在れば 1 バイトも変えない**（claude 経路への回帰ゼロ）。
+/// `legacy` は #986 の A/B（`TAKO_986_LEGACY=1` で pid 祖先辿りを止める）
+fn caller_pane_plan(env_pane: Option<u64>, connected: bool, legacy: bool) -> CallerPanePlan {
+    match env_pane {
+        Some(pane) => CallerPanePlan::FromEnv(pane),
+        // 接続情報が無ければ tako の外なので、IPC を張らない（FR-2.3.2）
+        None if !connected || legacy => CallerPanePlan::Unresolved,
+        None => CallerPanePlan::ResolveByPid,
+    }
+}
+
+/// #986 の A/B 用の env。`TAKO_986_LEGACY=1` で**同一バイナリのまま**
+/// 「caller_pane は `TAKO_PANE_ID` だけで決める」旧挙動へ戻す
+fn legacy_no_pid_fallback() -> bool {
+    std::env::var("TAKO_986_LEGACY")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 /// master / solo の起動先ペイン（Issue #567）
@@ -8952,6 +9019,55 @@ mod tests {
         assert!(
             !without.contains("unset TAKO_PANE_ID"),
             "そもそも設定されていないなら unset は案内しない: {without}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod issue986_caller_pane {
+    use super::*;
+
+    /// 受け入れ条件 3: `TAKO_PANE_ID` が在るときは 1 バイトも変わらない
+    /// （claude / codex の `env_vars` 経路は IPC を 1 往復も増やさない）
+    #[test]
+    fn env_が在れば_env_をそのまま使う() {
+        assert_eq!(
+            caller_pane_plan(Some(42), true, false),
+            CallerPanePlan::FromEnv(42)
+        );
+        // 接続情報の有無・A/B にも影響されない（env が最優先）
+        assert_eq!(
+            caller_pane_plan(Some(42), false, true),
+            CallerPanePlan::FromEnv(42)
+        );
+    }
+
+    /// 受け入れ条件 2: env が無いときは pid 祖先辿りへ落ちる（agy / #987 の経路）
+    #[test]
+    fn env_が無ければ_pid_祖先辿りへ落ちる() {
+        assert_eq!(
+            caller_pane_plan(None, true, false),
+            CallerPanePlan::ResolveByPid
+        );
+    }
+
+    /// 受け入れ条件 4（FR-2.3.2 の回帰）: tako の外では IPC を張らない。
+    /// `connected` が false = `TAKO_SOCKET` / `TAKO_TOKEN` が無い状態で、
+    /// ここで問い合わせに行くと tako 外の Claude セッションから見える挙動が変わる
+    #[test]
+    fn tako_の外では問い合わせに行かない() {
+        assert_eq!(
+            caller_pane_plan(None, false, false),
+            CallerPanePlan::Unresolved
+        );
+    }
+
+    /// A/B: `TAKO_986_LEGACY=1` 相当で pid 祖先辿りが止まる（旧挙動 = env だけ）
+    #[test]
+    fn legacy_なら_pid_祖先辿りをしない() {
+        assert_eq!(
+            caller_pane_plan(None, true, true),
+            CallerPanePlan::Unresolved
         );
     }
 }

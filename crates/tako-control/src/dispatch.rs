@@ -3490,34 +3490,45 @@ fn dispatch_inner(
 
         Request::SetupBootstrap {
             action,
+            agent,
             dry_run,
             reason,
         } => {
             // 読み取り・書き込みともプロセス内で完結する（アプリ状態に依存しない）
             let action = action.as_deref().unwrap_or("status");
+            // 対象の系統。**省略時は claude**（#868 からの既定を変えない）。
+            // 未知の名前は黙って claude にしない（別の系統を入れてしまうため）
+            let target = match agent.as_deref() {
+                Some(name) => crate::setup_bootstrap::parse_agent(name)
+                    .map_err(DispatchError::InvalidParams)?,
+                None => tako_core::platform::agent_install::AgentKind::Claude,
+            };
             match action {
-                "status" => crate::setup_bootstrap::status()
+                "status" => crate::setup_bootstrap::status_for(target)
                     .map(|s| s.to_json())
                     .map_err(DispatchError::Operation),
-                "install" => {
-                    crate::setup_bootstrap::install(crate::setup_bootstrap::InstallOptions {
+                // 3 系統ぶんを一度に（`tako setup --check` と同じ材料。#989）
+                "status-all" => Ok(crate::setup_bootstrap::status_all_json()),
+                "install" => crate::setup_bootstrap::install_for(
+                    target,
+                    crate::setup_bootstrap::InstallOptions {
                         dry_run: dry_run.unwrap_or(false),
                         // GUI 内 dispatch には端末が無いので出力は捕捉して応答へ載せる
                         interactive: false,
-                    })
-                    .map_err(DispatchError::Operation)
-                }
-                "path" => crate::setup_bootstrap::ensure_path().map_err(DispatchError::Operation),
-                "undo-path" => {
-                    crate::setup_bootstrap::undo_path().map_err(DispatchError::Operation)
-                }
+                    },
+                )
+                .map_err(DispatchError::Operation),
+                "path" => crate::setup_bootstrap::ensure_path_for(target)
+                    .map_err(DispatchError::Operation),
+                "undo-path" => crate::setup_bootstrap::undo_path_for(target)
+                    .map_err(DispatchError::Operation),
                 // 自動導入が通らないときの引き継ぎ計画（#1057。**読み取り専用**）。
                 // 実際に相手を起こすのは端末を持つ側（CLI）か、AI なら
                 // `tako_orchestrator_spawn` / `tako_run` の仕事
-                "handoff" => crate::setup_bootstrap::handoff_plan(reason.as_deref())
+                "handoff" => crate::setup_bootstrap::handoff_plan_for(target, reason.as_deref())
                     .map_err(DispatchError::Operation),
                 other => Err(DispatchError::InvalidParams(format!(
-                    "不明な action: {other:?}（status / install / path / undo-path / handoff のいずれか）"
+                    "不明な action: {other:?}（status / status-all / install / path / undo-path / handoff のいずれか）"
                 ))),
             }
         }
@@ -8225,6 +8236,8 @@ fn dispatch_git_resolve_agent(
     host.attach_session(new_id, options);
 
     let role_value = "conflict-resolver";
+    // MCP の一時注入（#986）。codex だけが `-c` で受け取る（他系統は 1 バイトも変わらない）
+    let tako_bin = resolve_tako_binary();
     let agent_cmd = orchestrator::agent::build_worker_cmd(&orchestrator::agent::WorkerLaunch {
         agent: worker_agent,
         role: role_value,
@@ -8236,6 +8249,7 @@ fn dispatch_git_resolve_agent(
         // 不適格なら flag は None になり、理由は `remote_control` に残る
         remote_control: remote_control.enabled(),
         extra_args: &launch.extra_args,
+        tako_bin: Some(&tako_bin),
         env: &profile_env,
     });
 
@@ -8704,6 +8718,9 @@ fn dispatch_orchestrator_spawn(
         Some(l) => format!("worker:{project}:{l}"),
         None => format!("worker:{project}"),
     };
+    // MCP の一時注入（#986）。codex だけが `-c` で受け取る（他系統は 1 バイトも変わらない）。
+    // master と同じ 1 実装（`agent::codex_mcp_args`）なので、worker だけ古い形になることが無い
+    let tako_bin = resolve_tako_binary();
     let worker_cmd = orchestrator::agent::build_worker_cmd(&orchestrator::agent::WorkerLaunch {
         agent: worker_agent,
         role: &role_value,
@@ -8715,6 +8732,7 @@ fn dispatch_orchestrator_spawn(
         // 不適格なら flag は None になり、理由は `remote_control` に残る
         remote_control: remote_control.enabled(),
         extra_args: &launch.extra_args,
+        tako_bin: Some(&tako_bin),
         env: &profile_env,
     });
 
@@ -17237,12 +17255,33 @@ mod tests {
         }
     }
 
+    /// e2e の事前信頼が書かれる**実ファイル**（テストの隔離を通さない側）。
+    ///
+    /// e2e は「実 claude が読む既定の config」を明示して事前信頼を書く
+    /// （`ensure_trusted_in(Some(claude_default_config_dir()), …)`）。
+    /// 一方 `config_json_paths(None)` は #944 でテストビルドでは隔離先を返すので、
+    /// **後始末にそれを使うと 1 件も消えない**。書いた先と同じ規則で解決する
+    fn e2e_trust_config_paths() -> Vec<std::path::PathBuf> {
+        let mut paths = Vec::new();
+        if let Some(dir) = crate::orchestrator::claude_default_config_dir() {
+            paths.push(dir.join(".claude.json"));
+        }
+        // 旧世代の置き場（ホーム直下）。過去の実行が残した分も掃除する
+        if let Some(home) = crate::orchestrator::home_dir() {
+            let legacy = home.join(".claude.json");
+            if !paths.contains(&legacy) {
+                paths.push(legacy);
+            }
+        }
+        paths
+    }
+
     /// e2e が書いた事前信頼エントリを claude の `.claude.json` から除去する（best-effort）。
     /// 消さないと実行のたびに `/private/tmp/tako-e2e-577-<pid>/work` が溜まり続ける
     /// （claude_tui_e2e の `remove_trust_entry` と同じ後始末）
     fn remove_e2e_trust_entry(dir: &std::path::Path) {
         let key = dir.display().to_string();
-        for path in crate::claude_tui::config_json_paths(None) {
+        for path in e2e_trust_config_paths() {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };

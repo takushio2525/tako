@@ -1,4 +1,4 @@
-//! ゼロスタート導入（#868）
+//! ゼロスタート導入（#868 → #989 で 3 系統へ）
 //!
 //! 「エージェント CLI を入れたことがない人」が `tako setup` 一発で始められるようにする。
 //! 検出型の setup（導入済み CLI を見つけて最適化する）の**手前**に、
@@ -8,9 +8,20 @@
 //!
 //! 1. [`Step::Install`] — エージェント CLI を公式インストーラで導入する
 //! 2. [`Step::Path`] — ランチャーの置き場所をログインシェルの PATH へ通す
-//! 3. [`Step::Auth`] — `claude auth login` の実行を**ユーザーへ依頼する**
-//!    （tako は代行しない。#1129 の理由は [`auth_instructions`]）
+//! 3. [`Step::Auth`] — その系統のログインコマンドの実行を**ユーザーへ依頼する**
+//!    （tako は代行しない。#1129 の理由は [`auth_instructions_for`]）
 //! 4. [`Step::Ready`] — 既存の検出型 setup へ引き継ぐ
+//!
+//! ## agent を引数で受ける（#989）
+//!
+//! 4 段の形は 3 系統（claude / codex / agy）で同じで、違うのは
+//! **手順・ログインコマンド・認証の確かめ方**だけ。だから段の実装は 1 本にして、
+//! 系統は [`AgentKind`] を**引数で受ける**。こうすると
+//! 「claude だけ通る経路」が構造的に作れない（#989 の再発防止）。
+//!
+//! 引数なしの旧 API（[`status`] / [`install`] / [`ensure_path`] …）は
+//! **残していない**。claude 既定の入口を残すと、新しい機能がそこへ吸い寄せられて
+//! また 1 系統だけ通る形に戻る（`AgentKind` が Claude 1 値だった理由がそれ）
 //!
 //! ## 設計の要点
 //!
@@ -54,21 +65,83 @@ impl Step {
         }
     }
 
-    /// 利用者向けの 1 行説明
-    pub fn describe(self) -> &'static str {
+    /// 利用者向けの 1 行説明（**どの系統の話かを必ず含める**。#989）。
+    ///
+    /// 引数なしの `describe()` は置いていない。3 系統を並べて出す画面で
+    /// 「Claude Code をインストールします」が codex の段に出ると嘘になる
+    pub fn describe_for(self, agent: AgentKind) -> String {
         match self {
-            Self::Install => "Claude Code をインストールします",
-            Self::Path => "claude コマンドをどのターミナルからも使えるようにします",
-            Self::Auth => "Claude アカウントにログインします",
-            Self::Ready => "導入は済んでいます",
+            Self::Install => format!("{} をインストールします", agent.product()),
+            Self::Path => format!(
+                "{} コマンドをどのターミナルからも使えるようにします",
+                agent.as_str()
+            ),
+            Self::Auth => format!("{}にログインします", account_label(agent)),
+            Self::Ready => "導入は済んでいます".to_string(),
         }
     }
+}
+
+/// 認証の相手（誰のアカウントへログインするのか）。
+///
+/// 実測で確かめた呼び名だけを書く: codex は `codex login status` が
+/// `Logged in using ChatGPT` を返す / agy は公式 docs の sign-in が Google アカウント
+fn account_label(agent: AgentKind) -> &'static str {
+    match agent {
+        AgentKind::Claude => "Claude アカウント",
+        AgentKind::Codex => "ChatGPT アカウント",
+        AgentKind::Agy => "Google アカウント",
+    }
+}
+
+/// ゼロスタート導入が面倒を見る系統。
+///
+/// `TAKO_989_LEGACY=1` で **claude 1 系統だけ**（#989 前）へ戻る
+/// = 同一バイナリで A/B が取れる
+pub fn bootstrap_agents() -> Vec<AgentKind> {
+    if legacy_single_agent() {
+        return vec![AgentKind::Claude];
+    }
+    AgentKind::ALL.to_vec()
+}
+
+/// `TAKO_989_LEGACY=1` で #989 前（claude 専用のゼロスタート導入）へ戻す
+pub fn legacy_single_agent() -> bool {
+    std::env::var_os("TAKO_989_LEGACY").is_some()
+}
+
+/// コマンドへ付ける `--agent` 断片。**claude は既定なので付けない**
+/// （#322 の「最も簡単なコマンドを提案する」原則。CLI の案内文と
+/// 引き継ぎの指示文が同じ形になるよう正本をここに置く）
+pub fn agent_flag(agent: AgentKind) -> String {
+    match agent {
+        AgentKind::Claude => String::new(),
+        other => format!(" --agent {}", other.as_str()),
+    }
+}
+
+/// 文字列から系統を決める。**未知の名前は黙って claude にしない**
+/// （取り違えたまま別の系統を入れてしまうため）
+pub fn parse_agent(value: &str) -> Result<AgentKind, String> {
+    AgentKind::parse(value).ok_or_else(|| {
+        format!(
+            "不明なエージェント: {value:?}（{} のいずれか）",
+            AgentKind::ALL
+                .iter()
+                .map(|a| a.as_str())
+                .collect::<Vec<_>>()
+                .join(" / ")
+        )
+    })
 }
 
 /// 「何をどこに入れるか」。**実行前に必ずこれを見せる**（受け入れ条件 4）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallPlan {
     pub agent: &'static str,
+    /// 利用者へ見せる製品名（「何を入れるのか」）。コマンド名だけだと
+    /// 3 系統を並べたときにどれの話か分からない（#989）
+    pub product: &'static str,
     /// 手順の対象プラットフォーム。**呼び名の出し分けに使う**（#925）。
     ///
     /// `cfg!` で分岐せず**値として持ち回す**のは #905（スリープ防止の呼び名）と同じ判断で、
@@ -81,10 +154,12 @@ pub struct InstallPlan {
     pub source_url: String,
     /// コマンド本体の置き場所
     pub launcher: PathBuf,
-    /// 実体（バージョンごと）の置き場所
-    pub payload: PathBuf,
-    /// バックグラウンド自動更新が効くか
+    /// 実体（バージョンごと）の置き場所。**単一バイナリの系統は `None`**
+    pub payload: Option<PathBuf>,
+    /// バックグラウンド自動更新が効くか（機械が読む側）
     pub auto_updates: bool,
+    /// 以後どう更新されるかの 1 行（人が読む側。出どころは [`InstallRecipe::update_note`]）
+    pub update_note: &'static str,
     /// tako が実行を代行できるか。false = 手順を案内するだけ
     pub can_run: bool,
 }
@@ -92,18 +167,20 @@ pub struct InstallPlan {
 impl InstallPlan {
     /// 表示用の行（CLI・GUI・MCP のどこから出しても同じ文面になるよう 1 か所で作る）
     pub fn lines(&self) -> Vec<String> {
-        vec![
+        let mut out = vec![
+            format!("入れるもの: {}（{} コマンド）", self.product, self.agent),
             format!("実行するコマンド: {}", self.official_command),
             format!("取得元: {}", self.source_url),
             format!("コマンドの置き場所: {}", display_path(&self.launcher)),
-            format!("本体の置き場所: {}", display_path(&self.payload)),
-            if self.auto_updates {
-                "以後の更新: Claude Code が自分でバックグラウンド更新します".to_string()
-            } else {
-                "以後の更新: 手動で更新が必要です".to_string()
-            },
-            privilege_line(self.platform),
-        ]
+        ];
+        // 単一バイナリの系統（agy）はランチャー自身が本体なので、
+        // 同じパスを 2 回言わない
+        if let Some(payload) = &self.payload {
+            out.push(format!("本体の置き場所: {}", display_path(payload)));
+        }
+        out.push(format!("以後の更新: {}", self.update_note));
+        out.push(privilege_line(self.platform));
+        out
     }
 
     /// この構成で**画面に出る文字列すべて**（導入計画の表示 + 引き継ぎの指示文）。
@@ -119,12 +196,14 @@ impl InstallPlan {
     pub fn to_json(&self) -> Value {
         json!({
             "agent": self.agent,
+            "product": self.product,
             "platform": self.platform.as_str(),
             "official_command": self.official_command,
             "source_url": self.source_url,
             "launcher": self.launcher.display().to_string(),
-            "payload": self.payload.display().to_string(),
+            "payload": self.payload.as_ref().map(|p| p.display().to_string()),
             "auto_updates": self.auto_updates,
+            "update_note": self.update_note,
             "can_run": self.can_run,
             "lines": self.lines(),
         })
@@ -142,7 +221,7 @@ pub struct DepState {
 /// いまの導入状況
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapState {
-    pub agent: &'static str,
+    pub agent: AgentKind,
     /// 解決できた実行ファイル（PATH 外のランチャーも含む）
     pub binary: Option<String>,
     pub authenticated: bool,
@@ -158,9 +237,15 @@ pub struct BootstrapState {
 }
 
 impl BootstrapState {
+    /// この状態の段の 1 行説明（**自分の系統で**組む。#989）
+    pub fn step_description(&self) -> String {
+        self.step.describe_for(self.agent)
+    }
+
     pub fn to_json(&self) -> Value {
         json!({
-            "agent": self.agent,
+            "agent": self.agent.as_str(),
+            "product": self.agent.product(),
             "installed": self.binary.is_some(),
             "binary": self.binary,
             "authenticated": self.authenticated,
@@ -170,7 +255,7 @@ impl BootstrapState {
             "profile_has_block": self.profile_has_block,
             "shell": self.shell.map(ShellKind::as_str),
             "next_step": self.step.as_str(),
-            "next_step_description": self.step.describe(),
+            "next_step_description": self.step_description(),
             "install_plan": self.plan.to_json(),
             "deps": deps_json(),
             "homebrew": homebrew_json(),
@@ -189,9 +274,9 @@ fn display_path(path: &Path) -> String {
     tako_core::paths::shorten_home(&path.to_string_lossy())
 }
 
-/// この環境の手順
-pub fn recipe() -> InstallRecipe {
-    agent_install::current_recipe(AgentKind::Claude)
+/// この環境の手順（系統を引数で受ける。#989）
+pub fn recipe_for(agent: AgentKind) -> InstallRecipe {
+    agent_install::current_recipe(agent)
 }
 
 /// `TAKO_1057_LEGACY=1` で #1057 前の挙動へ戻す（**同一バイナリで A/B が取れる**）。
@@ -217,15 +302,34 @@ pub fn legacy_mode() -> bool {
 /// だから条件で絞るのではなく**構造的に起こさない**。
 /// これは AGENTS.md / docs / MCP の説明（#1057「認証は代行させない」）と同じ契約で、
 /// コードだけがそこから外れていた。
-pub fn auth_instructions() -> Vec<String> {
-    let cmd = crate::orchestrator::agent_cli::auth_command(tako_core::agent_support::Agent::Claude)
-        .unwrap_or("claude auth login");
-    vec![
-        "Claude アカウントへのログインが必要です。".to_string(),
+pub fn auth_instructions_for(agent: AgentKind) -> Vec<String> {
+    let mut out = vec![
+        format!("{}へのログインが必要です。", account_label(agent)),
         "ブラウザでの操作が要るため tako は代行しません。".to_string(),
-        format!("次の 1 手: {cmd}"),
-        "ログインしたら tako setup をやり直してください".to_string(),
-    ]
+    ];
+    // ログインコマンドの正本は `agent_cli::auth_command`（3 系統とも実物で確認済み）。
+    // **無い系統を推測で埋めない**ので、取れなければ次の 1 手の行を出さない
+    match crate::orchestrator::agent_cli::auth_command(agent.into()) {
+        Some(cmd) => {
+            out.push(format!("次の 1 手: {cmd}"));
+            // **ログインコマンドが CLI 名そのもの = 専用のサブコマンドが無い**
+            // （agy がこれ。公式 docs: keyring に有効なセッションがあれば無言で通り、
+            // 無ければ既定のブラウザが開く。SSH 先では URL とコードの手入力になる）。
+            // 系統名で分岐せずコマンドの形から導くので、同じ形の CLI が増えても効く
+            if cmd.trim() == agent.as_str() {
+                out.push(format!(
+                    "（{} は専用のログインコマンドを持たないので、引数なしの起動が入口です）",
+                    agent.as_str()
+                ));
+            }
+        }
+        None => out.push(format!(
+            "次の 1 手: {} の公式手順にしたがってログインしてください",
+            agent.product()
+        )),
+    }
+    out.push("ログインしたら tako setup をやり直してください".to_string());
+    out
 }
 
 /// `TAKO_1129_LEGACY=1` で修正前（tako が `claude auth login` を起こす）へ戻す。
@@ -259,19 +363,26 @@ pub fn legacy_privilege_line() -> bool {
 }
 
 /// 「何をどこに入れるか」
-pub fn install_plan() -> Result<InstallPlan, String> {
+pub fn install_plan_for(agent: AgentKind) -> Result<InstallPlan, String> {
     let home = home_dir()?;
-    let r = recipe();
-    Ok(InstallPlan {
+    Ok(plan_from(&recipe_for(agent), &home))
+}
+
+/// 手順 + home から計画を組む（**環境変数を読まない純粋関数**なので、
+/// 隔離 HOME のテストがそのまま書ける）
+pub fn plan_from(r: &InstallRecipe, home: &Path) -> InstallPlan {
+    InstallPlan {
         agent: r.agent.as_str(),
+        product: r.agent.product(),
         platform: r.platform,
         official_command: r.source.official_command.to_string(),
         source_url: r.source.url.to_string(),
-        launcher: r.launcher_path_in(&home),
-        payload: r.payload_dir_in(&home),
+        launcher: r.launcher_path_in(home),
+        payload: r.payload_dir_in(home),
         auto_updates: r.auto_updates,
+        update_note: r.update_note,
         can_run: r.tako_can_run,
-    })
+    }
 }
 
 /// エージェント CLI を解決する。PATH に無くても**インストーラが置く場所**を見る。
@@ -279,8 +390,8 @@ pub fn install_plan() -> Result<InstallPlan, String> {
 /// インストール直後は profile へ書いた PATH が現プロセスにも
 /// `$SHELL -l -c` にも反映されない（シェルを開き直すまで）。ここで拾わないと
 /// 「入れたのに見つかりません」で setup が止まる
-pub fn resolve_binary() -> Option<String> {
-    let r = recipe();
+pub fn resolve_binary_for(agent: AgentKind) -> Option<String> {
+    let r = recipe_for(agent);
     if let Some(found) = tako_core::platform::exe::find(r.agent.as_str()) {
         return Some(found);
     }
@@ -300,12 +411,30 @@ fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
-/// 認証済みか。`claude auth status --json` の `loggedIn` を見る。
-/// **メールアドレスや組織名は読み捨てる**（診断ログへ個人情報を出さないため）
-pub fn is_authenticated(binary: &str) -> bool {
+/// 認証を確かめるために叩く引数（**3 系統の正本はここ 1 箇所**。#989）。
+///
+/// すべて実出力で確認した形だけを置く:
+///
+/// - claude: `claude auth status --json` → `{"loggedIn": true}`
+/// - codex: `codex login status` → `Logged in using ChatGPT` / exit 0
+/// - agy: `agy models` → 一覧 / exit 0（`agy` は認証判定用のサブコマンドを持たず、
+///   未認証だと `Please sign in to view available models.` になる。#1002 の実測）
+pub fn auth_probe_argv(agent: AgentKind) -> &'static [&'static str] {
+    match agent {
+        AgentKind::Claude => &["auth", "status", "--json"],
+        AgentKind::Codex => &["login", "status"],
+        AgentKind::Agy => &["models"],
+    }
+}
+
+/// 認証済みか。**メールアドレスや組織名は読み捨てる**（診断ログへ個人情報を出さないため）。
+///
+/// claude だけ exit code では判断できない（未ログインでも 0 を返しうるので
+/// `loggedIn` を見る）。他の 2 系統は exit code が判定そのもの
+pub fn is_authenticated_for(agent: AgentKind, binary: &str) -> bool {
     let Some(output) =
         tako_core::platform::process::no_console_window(&mut std::process::Command::new(binary))
-            .args(["auth", "status", "--json"])
+            .args(auth_probe_argv(agent))
             .stdin(std::process::Stdio::null())
             .output()
             .ok()
@@ -315,10 +444,13 @@ pub fn is_authenticated(binary: &str) -> bool {
     if !output.status.success() {
         return false;
     }
-    serde_json::from_slice::<Value>(&output.stdout)
-        .ok()
-        .and_then(|v| v["loggedIn"].as_bool())
-        .unwrap_or(false)
+    match agent {
+        AgentKind::Claude => serde_json::from_slice::<Value>(&output.stdout)
+            .ok()
+            .and_then(|v| v["loggedIn"].as_bool())
+            .unwrap_or(false),
+        AgentKind::Codex | AgentKind::Agy => true,
+    }
 }
 
 /// ログインシェルの種別と profile
@@ -338,14 +470,16 @@ fn shell_target() -> (Option<ShellKind>, Option<PathBuf>) {
 }
 
 /// いまの導入状況を調べる（読み取りだけ。副作用なし）
-pub fn status() -> Result<BootstrapState, String> {
+pub fn status_for(agent: AgentKind) -> Result<BootstrapState, String> {
     let home = home_dir()?;
-    let r = recipe();
-    let plan = install_plan()?;
-    let binary = resolve_binary();
-    let authenticated = binary.as_deref().is_some_and(is_authenticated);
+    let r = recipe_for(agent);
+    let plan = plan_from(&r, &home);
+    let binary = resolve_binary_for(agent);
+    let authenticated = binary
+        .as_deref()
+        .is_some_and(|b| is_authenticated_for(agent, b));
     let launcher_dir = r.launcher_dir_in(&home);
-    let on_path = launcher_dir_on_path(&launcher_dir);
+    let on_path = launcher_dir_on_path(agent, &launcher_dir);
     let (shell, profile) = shell_target();
     let profile_has_block = profile
         .as_deref()
@@ -362,7 +496,7 @@ pub fn status() -> Result<BootstrapState, String> {
     };
 
     Ok(BootstrapState {
-        agent: r.agent.as_str(),
+        agent,
         binary,
         authenticated,
         launcher_dir,
@@ -372,6 +506,30 @@ pub fn status() -> Result<BootstrapState, String> {
         shell,
         step,
         plan,
+    })
+}
+
+/// 3 系統ぶんの導入状況（**面倒を見る系統だけ**。`TAKO_989_LEGACY=1` なら claude だけ）。
+///
+/// 読めなかった系統は落とさず理由つきで並べる（無言で消えると
+/// 「なぜ出てこないのか」が追えない）
+pub fn status_all() -> Vec<(AgentKind, Result<BootstrapState, String>)> {
+    bootstrap_agents()
+        .into_iter()
+        .map(|agent| (agent, status_for(agent)))
+        .collect()
+}
+
+/// 3 系統ぶんの状況を JSON へ（CLI / MCP が同じ内容を見る）
+pub fn status_all_json() -> Value {
+    json!({
+        "agents": status_all()
+            .into_iter()
+            .map(|(agent, state)| match state {
+                Ok(state) => state.to_json(),
+                Err(e) => json!({ "agent": agent.as_str(), "error": e }),
+            })
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -387,7 +545,7 @@ pub fn status() -> Result<BootstrapState, String> {
 ///
 /// unix は `exe::find` がログインシェルの `command -v` なので PATH の実態を
 /// そのまま反映する（`.app` の痩せた PATH 対策として必要）＝従来のまま
-fn launcher_dir_on_path(dir: &Path) -> bool {
+fn launcher_dir_on_path(agent: AgentKind, dir: &Path) -> bool {
     let path_var = std::env::var("PATH").unwrap_or_default();
     if user_path::is_supported() && !legacy_mode() {
         return user_path::contains_entry(&path_var, dir)
@@ -397,7 +555,7 @@ fn launcher_dir_on_path(dir: &Path) -> bool {
     }
     shell_profile::path_contains(&path_var, dir)
         || login_shell_sees(dir)
-        || tako_core::platform::exe::find(recipe().agent.as_str()).is_some()
+        || tako_core::platform::exe::find(agent.as_str()).is_some()
 }
 
 /// ログインシェルの PATH に `dir` が入っているか（`.app` の痩せた PATH 対策）
@@ -456,8 +614,8 @@ fn login_shell_sees(dir: &Path) -> bool {
 /// エラーページ）」「実行が失敗した」を切り分けて具体的に報告できる。
 /// 公式のトラブルシュートにも `syntax error near unexpected token '<'` として
 /// 載っている実在の失敗モードで、パイプのままだと利用者には理由が見えない
-pub fn install(opts: InstallOptions) -> Result<Value, String> {
-    let plan = install_plan()?;
+pub fn install_for(agent: AgentKind, opts: InstallOptions) -> Result<Value, String> {
+    let plan = install_plan_for(agent)?;
     if opts.dry_run {
         return Ok(json!({
             "performed": false,
@@ -482,13 +640,13 @@ pub fn install(opts: InstallOptions) -> Result<Value, String> {
             plan.official_command,
         ));
     }
-    let script = fetch_installer(&plan)?;
-    let result = run_installer(&script, opts.interactive);
+    let script = fetch_installer(agent, &plan)?;
+    let result = run_installer(agent, &script, opts.interactive);
     // 一時ファイルは成否にかかわらず片付ける
     let _ = std::fs::remove_file(&script);
     let log = result?;
 
-    let binary = resolve_binary().ok_or_else(|| {
+    let binary = resolve_binary_for(agent).ok_or_else(|| {
         format!(
             "インストーラは正常終了しましたが {} が見つかりません。\n\
              `{}` を手で実行して、出力に出るエラーを確認してください",
@@ -549,8 +707,8 @@ $ProgressPreference = 'SilentlyContinue'\n\
 Invoke-WebRequest -UseBasicParsing -Uri $env:TAKO_FETCH_URL -OutFile $env:TAKO_FETCH_DEST\n";
 
 /// インストーラを一時ファイルへ取得する。取得できた中身が本物かまで見る
-fn fetch_installer(plan: &InstallPlan) -> Result<PathBuf, String> {
-    let runner = recipe().runner;
+fn fetch_installer(agent: AgentKind, plan: &InstallPlan) -> Result<PathBuf, String> {
+    let runner = recipe_for(agent).runner;
     let downloader = Downloader::detect().ok_or_else(|| {
         "curl も wget も見つかりません。どちらかを導入してから再実行してください\n\
          （macOS なら通常 curl が標準で入っています）"
@@ -558,7 +716,8 @@ fn fetch_installer(plan: &InstallPlan) -> Result<PathBuf, String> {
     })?;
     // 拡張子はインタプリタが要求するもの（PowerShell は `.ps1` 以外を実行しない）
     let dest = std::env::temp_dir().join(format!(
-        "tako-claude-install-{}.{}",
+        "tako-{}-install-{}.{}",
+        agent.as_str(),
         std::process::id(),
         runner.script_ext
     ));
@@ -643,8 +802,9 @@ pub struct InstallOptions {
 ///
 /// 端末があるときは出力をそのまま流す（インストーラは進捗と TUI を出す）。
 /// GUI 内 dispatch から呼ばれたときは端末が無いので捕捉し、失敗時の診断へ回す
-fn run_installer(script: &Path, interactive: bool) -> Result<String, String> {
-    let runner = recipe().runner;
+fn run_installer(agent: AgentKind, script: &Path, interactive: bool) -> Result<String, String> {
+    let r = recipe_for(agent);
+    let runner = r.runner;
     // インタプリタと引数はプラットフォーム境界（B17）が持つデータから組む。
     // ここに `bash` / `powershell` を書かない = 経路の取り違えが起きない
     let shell = runner
@@ -656,6 +816,11 @@ fn run_installer(script: &Path, interactive: bool) -> Result<String, String> {
     // #586: GUI プロセスから到達するのでコンソールウィンドウを出させない
     tako_core::platform::process::no_console_window(&mut command);
     command.args(runner.args_for(script));
+    // インストーラの対話プロンプトを黙らせる env（codex の `Start Codex now?` 対策）。
+    // **手順の側が持つデータ**なので、ここに系統名を書かない
+    for (key, value) in r.installer_env {
+        command.env(key, value);
+    }
     let (status, log) = if interactive {
         let status = command
             .stdin(std::process::Stdio::inherit())
@@ -698,9 +863,13 @@ fn run_installer(script: &Path, interactive: bool) -> Result<String, String> {
             "インストールが途中で強制終了しました（exit {c}）。\
              もう一度実行するか、上に出ているメッセージを確認してください{detail}"
         ),
+        // 案内先は**その系統の公式ページ**（claude のトラブルシュートを
+        // codex / agy の失敗に出さない。#989 のエッジ検証で踏んだ）
         c => format!(
-            "インストーラが失敗しました（exit {c}）。上に出ているエラーを確認してください。\
-             解決しない場合は https://code.claude.com/docs/en/troubleshoot-install を参照してください{detail}"
+            "{} のインストーラが失敗しました（exit {c}）。上に出ているエラーを確認してください。\
+             解決しない場合は {} を参照してください{detail}",
+            agent.product(),
+            r.troubleshoot_url,
         ),
     })
 }
@@ -708,12 +877,12 @@ fn run_installer(script: &Path, interactive: bool) -> Result<String, String> {
 // --- PATH 通し ---
 
 /// ランチャーの置き場所を「新しく開いたターミナルが見る PATH」へ通す（冪等）
-pub fn ensure_path() -> Result<Value, String> {
+pub fn ensure_path_for(agent: AgentKind) -> Result<Value, String> {
     let home = home_dir()?;
-    let r = recipe();
+    let r = recipe_for(agent);
     let dir = r.launcher_dir_in(&home);
     if user_path::is_supported() {
-        return ensure_user_path(&dir);
+        return ensure_user_path(agent, &dir);
     }
     let (shell, _) = shell_target();
     let Some(shell) = shell else {
@@ -736,6 +905,7 @@ pub fn ensure_path() -> Result<Value, String> {
     // 「書いたはず」で終わらせない（.zshrc へ書いて届かなかった類の失敗を検出する）
     let verified = outcome.change == PathChange::AlreadyOnPath || login_shell_sees(&dir);
     Ok(json!({
+        "agent": agent.as_str(),
         "shell": shell.as_str(),
         "profile": outcome.profile.display().to_string(),
         "profile_display": display_path(&outcome.profile),
@@ -745,10 +915,14 @@ pub fn ensure_path() -> Result<Value, String> {
         "wrote": outcome.change.wrote(),
         "verified": verified,
         "note": if verified {
-            "新しく開くターミナルから claude コマンドが使えます"
+            format!(
+                "新しく開くターミナルから {} コマンドが使えます",
+                agent.as_str()
+            )
         } else {
             "設定は書きましたが、いまのシェルにはまだ反映されていません。\
              ターミナルを開き直すと有効になります"
+                .to_string()
         },
     }))
 }
@@ -757,7 +931,7 @@ pub fn ensure_path() -> Result<Value, String> {
 ///
 /// **末尾へ足す**ので、ユーザーが自分で並べた優先順位は動かない。
 /// 書いたあと**読み直して確かめる**（「書いたはず」で終わらせない）
-fn ensure_user_path(dir: &Path) -> Result<Value, String> {
+fn ensure_user_path(agent: AgentKind, dir: &Path) -> Result<Value, String> {
     let current = user_path::read()?;
     let process_has = user_path::contains_entry(&std::env::var("PATH").unwrap_or_default(), dir);
     let change = match user_path::append_entry(&current.raw, dir) {
@@ -783,6 +957,7 @@ fn ensure_user_path(dir: &Path) -> Result<Value, String> {
     // 再ログイン / 新しいプロセス起動まで伝播しない。#525 実測）
     let verified = change == PathChange::AlreadyOnPath || process_has;
     Ok(json!({
+        "agent": agent.as_str(),
         "shell": "windows-user-path",
         // 書き先は「ファイル」ではないので、人へはレジストリのキーを見せる
         "profile": "HKCU\\Environment\\Path",
@@ -793,24 +968,29 @@ fn ensure_user_path(dir: &Path) -> Result<Value, String> {
         "wrote": change.wrote(),
         "verified": verified,
         "note": if verified {
-            "claude コマンドがどのターミナルからも使えます"
+            format!(
+                "{} コマンドがどのターミナルからも使えます",
+                agent.as_str()
+            )
         } else {
             "ユーザー環境変数へ追加しました。いま開いているターミナルには反映されないので、\
              新しいターミナルを開いてください"
+                .to_string()
         },
     }))
 }
 
 /// 置いた PATH ブロックを取り除く（元のバイト列へ戻す）
-pub fn undo_path() -> Result<Value, String> {
+pub fn undo_path_for(agent: AgentKind) -> Result<Value, String> {
     let home = home_dir()?;
     if user_path::is_supported() {
-        return undo_user_path(&recipe().launcher_dir_in(&home));
+        return undo_user_path(agent, &recipe_for(agent).launcher_dir_in(&home));
     }
     let (shell, _) = shell_target();
     let shell = shell.ok_or("使っているシェルの設定ファイルが分かりません")?;
     let outcome = shell_profile::remove_from_profile_in(&home, shell)?;
     Ok(json!({
+        "agent": agent.as_str(),
         "shell": shell.as_str(),
         "profile": outcome.profile.display().to_string(),
         "change": outcome.change.as_str(),
@@ -829,7 +1009,7 @@ pub fn undo_path() -> Result<Value, String> {
 /// 明示的に叩くコマンドで、外した結果は `tako setup bootstrap path` で戻せるので
 /// この非対称は受け入れる。目印のための状態ファイルは作らない
 /// （#513 の共有カタログへ分類が要るものを、可逆な 1 操作のために増やさない）
-fn undo_user_path(dir: &Path) -> Result<Value, String> {
+fn undo_user_path(agent: AgentKind, dir: &Path) -> Result<Value, String> {
     let current = user_path::read()?;
     let change = match user_path::remove_entry(&current.raw, dir) {
         None => PathChange::Absent,
@@ -842,6 +1022,7 @@ fn undo_user_path(dir: &Path) -> Result<Value, String> {
         }
     };
     Ok(json!({
+        "agent": agent.as_str(),
         "shell": "windows-user-path",
         "profile": "HKCU\\Environment\\Path",
         "change": change.as_str(),
@@ -850,19 +1031,19 @@ fn undo_user_path(dir: &Path) -> Result<Value, String> {
 
 // --- 自動導入が通らなかったときの引き継ぎ（#1057）---
 
-/// 引き継ぎ先の候補（**claude 以外**の導入済みエージェント CLI）。
+/// 引き継ぎ先の並び（**入れる対象の系統は呼び出し側が外す**）。
 ///
-/// claude を入れるための代行なので claude 自身は候補にしない。
-/// 順序は codex → agy（master を務められる系統を先に置く）。
+/// 順序は claude → codex → agy（master を務められる系統を先に置く）。
 ///
 /// # なぜ能力マトリクス（#982）の 1 マスにしないか
 ///
 /// 「この CLI へ導入の代行を頼めるか」を [`crate::agent_support`] のキーにすると
-/// **claude が `Unsupported`** になる（claude を入れるための代行なので claude は
-/// 対象になりえない）。マトリクスは `claudeは基準系なので全て対応済み` で
-/// claude = 全 Supported を強制するため、これは表せない（#1002 が同じ壁に当たった）。
-/// なので候補の集合はここで宣言し、テスト（`引き継ぎ先にclaudeを選ばない`）で拘束する
-const HANDOFF_AGENTS: &[WorkerAgent] = &[WorkerAgent::Codex, WorkerAgent::Agy];
+/// **入れる対象の系統が `Unsupported`** になるが、それは相手の能力ではなく
+/// 「いま入れようとしているのがそれだから」でしかない。マトリクスは
+/// `claudeは基準系なので全て対応済み` で claude = 全 Supported を強制するので、
+/// claude を入れる場合の「claude は候補にならない」は表せない（#1002 が同じ壁に当たった）。
+/// なので候補の集合はここで宣言し、テスト（`引き継ぎ先に入れる対象自身を選ばない`）で拘束する
+const HANDOFF_AGENTS: &[WorkerAgent] = &[WorkerAgent::Claude, WorkerAgent::Codex, WorkerAgent::Agy];
 
 /// 引き継ぎ先 1 件
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -871,14 +1052,15 @@ pub struct HandoffCandidate {
     pub path: String,
 }
 
-/// この環境で引き継げる相手
-pub fn handoff_candidates() -> Vec<HandoffCandidate> {
+/// この環境で引き継げる相手（`target` = いま入れようとしている系統は外す）
+pub fn handoff_candidates_for(target: AgentKind) -> Vec<HandoffCandidate> {
     if legacy_mode() {
         // #1057 前は「案内だけ」で引き継ぎ先を探さなかった
         return Vec::new();
     }
     HANDOFF_AGENTS
         .iter()
+        .filter(|agent| agent.as_str() != target.as_str())
         .filter_map(|agent| {
             crate::orchestrator::agent_cli::locate(*agent)
                 .ok()
@@ -896,25 +1078,38 @@ pub fn handoff_candidates() -> Vec<HandoffCandidate> {
 /// 認証はブラウザ操作が要るので**代行させない**（ユーザーへ依頼させる）
 pub fn handoff_prompt_text(plan: &InstallPlan, reason: Option<&str>) -> String {
     let reason = reason.unwrap_or("tako の自動インストールが通らなかった");
+    // 系統名は `--agent` の値にそのまま使える形で出す（AI がコマンドを組めるように）
+    let agent = plan.agent;
+    let payload_line = match &plan.payload {
+        Some(payload) => format!("         - 本体の置き場所: {}\n", display_path(payload)),
+        // 単一バイナリの系統は本体 = コマンド自身（同じパスを 2 回言わない）
+        None => String::new(),
+    };
+    let kind = AgentKind::parse(agent);
+    let auth_command = kind
+        .and_then(|a| crate::orchestrator::agent_cli::auth_command(a.into()))
+        .unwrap_or("公式手順のログイン");
+    // claude は既定なので `--agent` を付けない（#322 の最簡形）
+    let flag = kind.map(agent_flag).unwrap_or_default();
     format!(
-        "tako から引き継ぎ: Claude Code（claude CLI）の導入を代行してください。\n\
+        "tako から引き継ぎ: {product}（{agent} CLI）の導入を代行してください。\n\
          \n\
          ## 状況\n\
          \n\
          - この環境で tako 自身の自動インストールが成立しませんでした（理由: {reason}）\n\
          - 公式の導入コマンド: {command}\n\
          - コマンドの置き場所: {launcher}\n\
-         - 本体の置き場所: {payload}\n\
+         {payload_line}\
          - 管理者権限は不要です。ホームディレクトリの中だけで完結します\n\
          \n\
          ## やること（この順に）\n\
          \n\
-         1. 上の公式コマンドを実行して claude を導入する。失敗したら出力のエラーを読み、\n\
+         1. 上の公式コマンドを実行して {agent} を導入する。失敗したら出力のエラーを読み、\n\
          \x20  ネットワーク・プロキシ・ディスク容量などの原因を切り分けて対処する\n\
-         2. `tako setup bootstrap status --json` で `next_step` を確認する\n\
+         2. `tako setup bootstrap status{flag} --json` で `next_step` を確認する\n\
          \x20  （`install` のままなら導入できていない）\n\
-         3. `next_step` が `path` なら `tako setup bootstrap path` を実行する\n\
-         4. `next_step` が `auth` なら**ユーザーへ `claude auth login` の実行を依頼する**\n\
+         3. `next_step` が `path` なら `tako setup bootstrap path{flag}` を実行する\n\
+         4. `next_step` が `auth` なら**ユーザーへ `{auth_command}` の実行を依頼する**\n\
          \x20  （ブラウザ操作が要るので代行しない）\n\
          5. `next_step` が `ready` になったら `tako setup` を実行して設定を完了させる\n\
          \n\
@@ -923,20 +1118,22 @@ pub fn handoff_prompt_text(plan: &InstallPlan, reason: Option<&str>) -> String {
          - 上の手順以外でユーザーの設定ファイル・PATH・レジストリを書き換えない\n\
          - 別の入れ方（Homebrew・npm 等）へ勝手に切り替えない。公式の native インストーラを使う\n\
          - うまくいかないときは、何がどこで失敗したかを日本語で報告して止まる\n",
+        product = plan.product,
         command = plan.official_command,
         launcher = display_path(&plan.launcher),
-        payload = display_path(&plan.payload),
     )
 }
 
 /// 引き継ぎの計画。CLI・MCP が同じ内容を見る（`available` が false なら
 /// 従来どおり公式コマンドの案内へ落とす）
-pub fn handoff_plan(reason: Option<&str>) -> Result<Value, String> {
-    let plan = install_plan()?;
-    let candidates = handoff_candidates();
+pub fn handoff_plan_for(agent: AgentKind, reason: Option<&str>) -> Result<Value, String> {
+    let plan = install_plan_for(agent)?;
+    let candidates = handoff_candidates_for(agent);
     let prompt = handoff_prompt_text(&plan, reason);
     let recommended = candidates.first();
     Ok(json!({
+        "agent": agent.as_str(),
+        "product": agent.product(),
         "available": !candidates.is_empty(),
         "reason": reason,
         "candidates": candidates
@@ -985,20 +1182,15 @@ fn homebrew_json() -> Value {
 mod tests {
     use super::*;
 
-    /// そのプラットフォームの手順から計画を組む（**手順と文面の出どころを 1 つにする**）。
+    /// そのプラットフォーム・系統の手順から計画を組む
+    /// （**手順と文面の出どころを 1 つにする**。組み立ては製品と同じ `plan_from`）。
     /// `home` を引数で受けるので実 HOME を読まない
     fn plan_for(platform: Platform, home: &Path) -> InstallPlan {
-        let r = agent_install::recipe(platform, AgentKind::Claude);
-        InstallPlan {
-            agent: r.agent.as_str(),
-            platform: r.platform,
-            official_command: r.source.official_command.to_string(),
-            source_url: r.source.url.to_string(),
-            launcher: r.launcher_path_in(home),
-            payload: r.payload_dir_in(home),
-            auto_updates: r.auto_updates,
-            can_run: r.tako_can_run,
-        }
+        plan_of(platform, AgentKind::Claude, home)
+    }
+
+    fn plan_of(platform: Platform, agent: AgentKind, home: &Path) -> InstallPlan {
+        plan_from(&agent_install::recipe(platform, agent), home)
     }
 
     /// 権限の呼び名がプラットフォームで変わること（#925）。
@@ -1061,7 +1253,7 @@ mod tests {
     /// （判定そのものの総当たりは `platform::agent_install` 側のテスト）
     #[test]
     fn この環境の署名でhtmlエラーページを弾く() {
-        let signature = recipe().runner.signature;
+        let signature = recipe_for(AgentKind::Claude).runner.signature;
         assert!(!agent_install::looks_like_installer(
             signature,
             b"<!DOCTYPE html>"
@@ -1076,8 +1268,20 @@ mod tests {
         assert_eq!(Step::Path.as_str(), "path");
         assert_eq!(Step::Auth.as_str(), "auth");
         assert_eq!(Step::Ready.as_str(), "ready");
+        // 段の説明は**どの系統の話か**を必ず含む（#989）
         for step in [Step::Install, Step::Path, Step::Auth, Step::Ready] {
-            assert!(!step.describe().is_empty());
+            for agent in AgentKind::ALL {
+                assert!(!step.describe_for(agent).is_empty());
+            }
+        }
+        // Ready 以外は系統名か製品名が出る（claude 決め打ちへ戻っていない）
+        for step in [Step::Install, Step::Path, Step::Auth] {
+            let codex = step.describe_for(AgentKind::Codex);
+            assert!(
+                !codex.contains("Claude"),
+                "codex の段に claude の語が出ている: {codex}"
+            );
+            assert_ne!(codex, step.describe_for(AgentKind::Claude));
         }
     }
 
@@ -1103,10 +1307,12 @@ mod tests {
                 lines.contains(r.launcher_rel),
                 "{platform:?}: 置き場所が出ていない: {lines}"
             );
-            assert!(
-                lines.contains(r.payload_rel),
-                "{platform:?}: 本体の置き場所が出ていない: {lines}"
-            );
+            if let Some(payload) = r.payload_rel {
+                assert!(
+                    lines.contains(payload),
+                    "{platform:?}: 本体の置き場所が出ていない: {lines}"
+                );
+            }
             assert!(
                 lines.contains("管理者権限"),
                 "{platform:?}: 権限の説明が無い: {lines}"
@@ -1187,14 +1393,22 @@ mod tests {
         }
     }
 
-    /// 引き継ぎ先に claude 自身を選ばない（入れる対象なので候補になりえない）
+    /// 引き継ぎ先に**入れる対象自身**を選ばない（入れる対象なので候補になりえない）。
+    /// #989 で対象が 3 系統になったので、どの系統を入れるときも自分を外す
     #[test]
-    fn 引き継ぎ先にclaudeを選ばない() {
-        assert!(!HANDOFF_AGENTS.contains(&WorkerAgent::Claude));
-        // master を務められる系統を先に置く（codex → agy）
-        assert_eq!(HANDOFF_AGENTS.first(), Some(&WorkerAgent::Codex));
-        for candidate in handoff_candidates() {
-            assert_ne!(candidate.agent, "claude");
+    fn 引き継ぎ先に入れる対象自身を選ばない() {
+        // master を務められる系統を先に置く（claude → codex → agy）
+        assert_eq!(HANDOFF_AGENTS.first(), Some(&WorkerAgent::Claude));
+        assert_eq!(HANDOFF_AGENTS.len(), AgentKind::ALL.len());
+        for target in AgentKind::ALL {
+            for candidate in handoff_candidates_for(target) {
+                assert_ne!(
+                    candidate.agent,
+                    target.as_str(),
+                    "{} を入れるのに自分が候補",
+                    target.as_str()
+                );
+            }
         }
     }
 
@@ -1202,18 +1416,21 @@ mod tests {
     #[test]
     fn 候補が居なければ公式コマンドの案内へ落ちる() {
         let _guard = crate::orchestrator::agent_cli::test_force_missing(&[
+            WorkerAgent::Claude,
             WorkerAgent::Codex,
             WorkerAgent::Agy,
         ]);
-        let plan = handoff_plan(Some("テスト")).expect("計画は作れる");
-        assert_eq!(plan["available"], false);
-        assert!(plan["candidates"].as_array().is_some_and(|a| a.is_empty()));
-        assert_eq!(plan["recommended"], serde_json::Value::Null);
-        let fallback = plan["fallback"].as_str().unwrap_or_default();
-        assert!(
-            fallback.contains(recipe().source.official_command),
-            "{fallback}"
-        );
+        for target in AgentKind::ALL {
+            let plan = handoff_plan_for(target, Some("テスト")).expect("計画は作れる");
+            assert_eq!(plan["available"], false, "{}", target.as_str());
+            assert!(plan["candidates"].as_array().is_some_and(|a| a.is_empty()));
+            assert_eq!(plan["recommended"], serde_json::Value::Null);
+            let fallback = plan["fallback"].as_str().unwrap_or_default();
+            assert!(
+                fallback.contains(recipe_for(target).source.official_command),
+                "{fallback}"
+            );
+        }
     }
 
     /// 候補が居れば「誰へ頼むか」が決まる
@@ -1223,9 +1440,91 @@ mod tests {
             WorkerAgent::Codex,
             "/tmp/fake/codex",
         )]);
-        let plan = handoff_plan(None).expect("計画は作れる");
+        let plan = handoff_plan_for(AgentKind::Claude, None).expect("計画は作れる");
         assert_eq!(plan["available"], true);
         assert_eq!(plan["recommended"], "codex");
         assert!(plan["prompt"].as_str().is_some_and(|p| !p.is_empty()));
+    }
+
+    /// 3 系統ぶんの状態を一度に返す（`tako setup --check` と同じ材料。#989）
+    #[test]
+    fn 状態は3系統ぶんまとめて返せる() {
+        let value = status_all_json();
+        let agents = value["agents"].as_array().expect("配列");
+        assert_eq!(agents.len(), AgentKind::ALL.len());
+        let names: Vec<&str> = agents.iter().filter_map(|a| a["agent"].as_str()).collect();
+        for agent in AgentKind::ALL {
+            assert!(names.contains(&agent.as_str()), "{names:?}");
+        }
+    }
+
+    /// `TAKO_989_LEGACY=1` で claude 1 系統だけへ戻る（同一バイナリでの A/B）。
+    ///
+    /// **env を触るので直列前提**（他のテストが `bootstrap_agents` を見ないよう、
+    /// このテストの中だけで立てて必ず落とす）
+    #[test]
+    fn legacy_envで対象がclaudeだけへ戻る() {
+        assert_eq!(bootstrap_agents(), AgentKind::ALL.to_vec());
+        // SAFETY: このテストだけが `TAKO_989_LEGACY` を触る
+        unsafe { std::env::set_var("TAKO_989_LEGACY", "1") };
+        let legacy = bootstrap_agents();
+        unsafe { std::env::remove_var("TAKO_989_LEGACY") };
+        assert_eq!(legacy, vec![AgentKind::Claude]);
+    }
+
+    /// 3 系統の計画が**それぞれ違う中身**になる（1 系統ぶんを 3 回出していない）
+    #[test]
+    fn 系統ごとに違う計画が出る() {
+        let home = Path::new("/tmp/h");
+        for platform in [Platform::MacOs, Platform::Windows] {
+            let plans: Vec<InstallPlan> = AgentKind::ALL
+                .into_iter()
+                .map(|agent| plan_of(platform, agent, home))
+                .collect();
+            for (i, a) in plans.iter().enumerate() {
+                for b in plans.iter().skip(i + 1) {
+                    assert_ne!(a.official_command, b.official_command, "{platform:?}");
+                    assert_ne!(a.launcher, b.launcher, "{platform:?}");
+                    assert_ne!(a.product, b.product, "{platform:?}");
+                }
+                // 各計画の行に自分の系統名が出る（どれの話か分かる）
+                let lines = a.lines().join("\n");
+                assert!(lines.contains(a.product), "{lines}");
+                assert!(lines.contains(a.update_note), "{lines}");
+            }
+        }
+    }
+
+    /// 引き継ぎの指示文が系統ごとにその系統のログインコマンドを案内する（#989）
+    #[test]
+    fn 引き継ぎの指示文は系統ごとのログインコマンドを案内する() {
+        let home = Path::new("/tmp/h");
+        for agent in AgentKind::ALL {
+            let plan = plan_of(Platform::MacOs, agent, home);
+            let prompt = handoff_prompt_text(&plan, None);
+            let cmd = crate::orchestrator::agent_cli::auth_command(agent.into())
+                .expect("3 系統ともログインの入口がある");
+            assert!(
+                prompt.contains(cmd),
+                "{} の指示文にログインコマンドが無い: {prompt}",
+                agent.as_str()
+            );
+            // 次の一手は**そのまま打てる最簡形**（claude は `--agent` を付けない）
+            assert!(
+                prompt.contains(&format!(
+                    "tako setup bootstrap status{} --json",
+                    agent_flag(agent)
+                )),
+                "{} の指示文の次の一手が最簡形でない: {prompt}",
+                agent.as_str()
+            );
+            // 単一バイナリの系統は「本体の置き場所」を言わない（同じパスを 2 回言わない）
+            assert_eq!(
+                prompt.contains("本体の置き場所"),
+                plan.payload.is_some(),
+                "{}",
+                agent.as_str()
+            );
+        }
     }
 }

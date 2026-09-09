@@ -58724,27 +58724,32 @@ mod self_test {
             // （`install` は必ず dry_run で呼ぶ）。CLI / MCP はこの dispatch を
             // そのまま通るので、ここが緑なら 3 経路とも同じ答えを返す
             {
-                let mut dispatch_bootstrap = |action: &str, dry_run: Option<bool>| {
+                // **1 本の口**にする（`cx` の可変借用が 1 つで済むので、
+                // 成功も失敗も同じ経路から観測できる）
+                let mut probe_bootstrap = |action: &str,
+                                           agent: Option<&str>,
+                                           dry_run: Option<bool>|
+                 -> Result<serde_json::Value, String> {
                     window
                         .update(cx, |app, _, _cx| {
                             tako_control::dispatch(
                                 app,
                                 tako_control::protocol::Request::SetupBootstrap {
                                     action: Some(action.into()),
+                                    agent: agent.map(Into::into),
                                     dry_run,
                                     reason: None,
                                 },
                                 PaneOrigin::Cli,
                             )
-                            .ok()
+                            .map_err(|e| e.to_string())
                         })
-                        .ok()
-                        .flatten()
+                        .unwrap_or_else(|e| Err(e.to_string()))
                 };
 
                 // status: 読み取り専用。next_step は 4 値のいずれかで、
                 // install_plan は「何をどこに入れるか」を必ず持つ（受け入れ条件 4）
-                let status = dispatch_bootstrap("status", None);
+                let status = probe_bootstrap("status", None, None).ok();
                 let step = status
                     .as_ref()
                     .and_then(|v| v["next_step"].as_str())
@@ -58785,7 +58790,10 @@ mod self_test {
                 } else {
                     normalized.contains(recipe.source.url)
                         && normalized.contains(recipe.launcher_rel)
-                        && normalized.contains(recipe.payload_rel)
+                        // 単一バイナリの系統（agy）は「本体の置き場所」を持たない
+                        && recipe
+                            .payload_rel
+                            .is_none_or(|payload| normalized.contains(payload))
                         // 権限の説明。`InstallPlan::lines()` の権限行は
                         // **platform で呼び名が変わる**（#925 で `privilege_line` へ
                         // 分けた。unix = `sudo（管理者権限）は使いません…` /
@@ -58805,7 +58813,7 @@ mod self_test {
                 );
 
                 // install の dry_run は**実行せず**計画だけ返す
-                let dry = dispatch_bootstrap("install", Some(true));
+                let dry = probe_bootstrap("install", None, Some(true)).ok();
                 check(
                     dry.as_ref().and_then(|v| v["performed"].as_bool()) == Some(false)
                         && dry.as_ref().and_then(|v| v["reason"].as_str()) == Some("dry_run"),
@@ -58817,7 +58825,7 @@ mod self_test {
 
                 // handoff（#1057）: **読み取り専用**で、代行を頼む指示文と
                 // 候補が無いときの案内を必ず持つ
-                let handoff = dispatch_bootstrap("handoff", None);
+                let handoff = probe_bootstrap("handoff", None, None).ok();
                 let available = handoff
                     .as_ref()
                     .and_then(|v| v["available"].as_bool())
@@ -58861,22 +58869,7 @@ mod self_test {
                 );
 
                 // 不明な action は選択肢つきで拒否される（黙って何かしない）
-                let bad = window
-                    .update(cx, |app, _, _cx| {
-                        tako_control::dispatch(
-                            app,
-                            tako_control::protocol::Request::SetupBootstrap {
-                                action: Some("nope".into()),
-                                dry_run: None,
-                                reason: None,
-                            },
-                            PaneOrigin::Cli,
-                        )
-                        .err()
-                        .map(|e| e.to_string())
-                    })
-                    .ok()
-                    .flatten();
+                let bad = probe_bootstrap("nope", None, None).err();
                 check(
                     bad.as_deref().is_some_and(|m| m.contains("status")
                         && m.contains("install")
@@ -58903,6 +58896,115 @@ mod self_test {
                          step={step:?} installed={installed} on_path={on_path}"
                     ),
                 );
+
+                // ゼロスタート導入の 3 系統化（#989）。**実 dispatch 経路**で
+                // 「系統ごとに違う計画が出る」「status-all が 3 行返す」
+                // 「Windows で代行するのは claude だけ」を固定する。
+                // この項目も決して実インストールを行わない（install は必ず dry_run）
+                {
+                    use tako_core::platform::agent_install::{self as install, AgentKind};
+                    let mut per_agent: Vec<(String, String, String, bool)> = Vec::new();
+                    let mut all_ok = true;
+                    for kind in AgentKind::ALL {
+                        let name = kind.as_str();
+                        let st = probe_bootstrap("status", Some(name), None).ok();
+                        // 期待値は**その系統の手順そのもの**から作る（#920 と同じ作法）
+                        let r = install::current_recipe(kind);
+                        let lines = st
+                            .as_ref()
+                            .and_then(|v| v["install_plan"]["lines"].as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|l| l.as_str().map(String::from))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            })
+                            .unwrap_or_default();
+                        let normalized = lines.replace('\\', "/");
+                        let answered = st.as_ref().and_then(|v| v["agent"].as_str());
+                        let step_here = st
+                            .as_ref()
+                            .and_then(|v| v["next_step"].as_str())
+                            .unwrap_or("?")
+                            .to_string();
+                        // その系統の公式コマンド・置き場所・製品名が出ていること
+                        let facts = answered == Some(name)
+                            && normalized.contains(r.source.url)
+                            && normalized.contains(r.launcher_rel)
+                            && lines.contains(kind.product())
+                            && lines.contains(r.update_note)
+                            && lines.contains("管理者権限");
+                        // 代行の可否が手順の宣言と一致すること
+                        // （Windows は claude だけ true = #989 のやること 6）
+                        let can_run = st
+                            .as_ref()
+                            .and_then(|v| v["install_plan"]["can_run"].as_bool())
+                            .unwrap_or(false);
+                        // dry_run は実行せず計画だけ返す（代行できない系統でも同じ）
+                        let dry_here = probe_bootstrap("install", Some(name), Some(true)).ok();
+                        let dry_ok = dry_here
+                            .as_ref()
+                            .and_then(|v| v["performed"].as_bool())
+                            == Some(false);
+                        // 認証誘導がその系統の実コマンドを案内すること
+                        let auth = tako_control::setup_bootstrap::auth_instructions_for(kind)
+                            .join("\n");
+                        let auth_cmd =
+                            tako_control::orchestrator::agent_cli::auth_command(kind.into())
+                                .unwrap_or_default();
+                        let auth_ok = !auth_cmd.is_empty() && auth.contains(auth_cmd);
+                        let ok = facts && can_run == r.tako_can_run && dry_ok && auth_ok;
+                        all_ok &= ok;
+                        per_agent.push((
+                            name.to_string(),
+                            step_here,
+                            auth_cmd.to_string(),
+                            ok,
+                        ));
+                    }
+                    // status-all は面倒を見る系統ぶんを 1 回で返す
+                    let all = probe_bootstrap("status-all", None, None).ok();
+                    let listed: Vec<String> = all
+                        .as_ref()
+                        .and_then(|v| v["agents"].as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x["agent"].as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let expected: Vec<String> = tako_control::setup_bootstrap::bootstrap_agents()
+                        .into_iter()
+                        .map(|a| a.as_str().to_string())
+                        .collect();
+                    // 未知の系統名は黙って claude にせず拒否する
+                    let bad_agent = probe_bootstrap("status", Some("ollama"), None).err();
+                    println!(
+                        "TAKO_SELF_TEST_989: per_agent={per_agent:?} listed={listed:?} \
+                         expected={expected:?} bad_agent={bad_agent:?} legacy={}",
+                        tako_control::setup_bootstrap::legacy_single_agent()
+                    );
+                    check(
+                        all_ok,
+                        &format!(
+                            "119: 3 系統とも自分の手順・代行可否・ログインコマンドを返す (#989) \
+                             per_agent={per_agent:?}"
+                        ),
+                    );
+                    check(
+                        listed == expected && !listed.is_empty(),
+                        &format!(
+                            "119: status-all が面倒を見る系統をすべて返す (#989) \
+                             listed={listed:?} expected={expected:?}"
+                        ),
+                    );
+                    check(
+                        bad_agent
+                            .as_deref()
+                            .is_some_and(|m| m.contains("claude") && m.contains("agy")),
+                        &format!("119: 未知の系統を選択肢つきで拒否する (#989) err={bad_agent:?}"),
+                    );
+                }
 
                 // 「走ったこと」を観測可能にする（#796: 出るはずのものが出ないと
                 // 素通りしたのか通ったのか区別が付かない）
