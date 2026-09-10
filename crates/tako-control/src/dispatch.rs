@@ -17880,6 +17880,47 @@ mod tests {
         assert_eq!(v["background_work"], Value::Null);
     }
 
+    /// エッジ: **生成中**。一次シグナルが busy を返すので busy のまま。
+    /// 内訳は読める（申告は生成中も同じ形で出るため = これが claude との違いの実体）
+    #[test]
+    fn issue1277_生成中は内訳を読めてもbusyのまま() {
+        // codex の生成中フッター（#120 の実採取。申告つき）
+        let codex = "\
+• Working (3s • esc to interrupt) · 1 background terminal running
+› Ask Codex to do anything
+  gpt-5.6-sol high · Context 96% left";
+        let mut r = i1277_resolved("codex", "codex-session", codex);
+        r.status = "busy".into();
+        let v = apply_worker_status_corrections(r).unwrap();
+        assert_eq!(v["status"], "busy", "生成中に idle へ倒れている");
+        assert_eq!(v["background_work"], "1 background terminal");
+        assert_eq!(v["idle_despite_primary_busy"], false);
+
+        // 一次シグナルが idle でも画面が生成中なら busy（#289 の腕。取り違え防止）
+        let v = apply_worker_status_corrections(i1277_resolved("codex", "codex-session", codex))
+            .unwrap();
+        assert_eq!(v["status"], "busy", "画面の生成中を無視している");
+    }
+
+    /// エッジ: **折りたたみ表示**。両系統は画面で覆わないので判定は変わらない
+    /// （一次シグナルの idle がそのまま返る = 折りたたみで劣化しない）
+    #[test]
+    fn issue1277_折りたたみでも判定は変わらない() {
+        for (agent, source, screen) in [
+            ("codex", "codex-session", I1277_CODEX_IDLE_WITH_BACKGROUND),
+            ("agy", "agy-session", I1277_AGY_IDLE_WITH_BACKGROUND),
+        ] {
+            let mut r = i1277_resolved(agent, source, screen);
+            r.full_screen = Some(format!("95 new messages (click) ↓\n{screen}"));
+            let v = apply_worker_status_corrections(r).unwrap();
+            assert_eq!(
+                v["collapsed"], true,
+                "{agent}: 折りたたみを検知できていない"
+            );
+            assert_eq!(v["status"], "idle", "{agent}: 折りたたみで判定が変わった");
+        }
+    }
+
     /// A/B: 同一バイナリのまま旧挙動（`TAKO_1277_LEGACY=1`）へ戻すと内訳を読まない。
     /// **status は旧挙動でも idle**（一次シグナルが張り付かないので実害が無い）のが
     /// claude（#1273）との違い
