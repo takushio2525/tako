@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-09（#777: 本番でも SIGTERM で layout を保存して終了するようにした）
-- `SIGTERM` の quit 読み替えを隔離限定から本番へ（`quit_signal::install`）。拾うのは 2 秒 tick ではなく既存の **500ms ループ**（新しいタイマー無しで最悪待ちを 1/4 に）。握る以上は対で必要なウォッチドッグ（到着から 5 秒で `exit(143)`・専用スレッド）を同じ入口が立てる
-- 連打は 1 度しか quit を撃たない（`QUIT_DISPATCHED`）・ハンドラはアトミック 1 回だけ・Windows は `SIGTERM` が無いので見張りごと立てない。読み替えと強制終了は `persist.log` へ 1 行
-- 隔離 GUI 実測（各 5 回）: 直前の窓リサイズが layout に載る **新 5/5 → 旧 0/5**（`TAKO_777_LEGACY=1`）・終了まで中央値 287ms・器のセッションは全回生存。注入したハング 2 形は猶予 2000ms に対し 2135 / 2101ms で `exit=143`。連打は読み替え 1 回 / `on_app_quit` 1 回、起動 0.3 秒後の SIGTERM でも layout は壊れない。番犬 4 本（修正前ソースで全滅）+ 単体 5 本、セルフテスト `TAKO_APP_SELF_TEST_OK`。全 3893 件緑
-
 ## 2026-09-09（#1081 / #1284: 解説動画をスライド主軸へ作り直し、X 向けショートも作った）
 - v6（#1081）= HTML/CSS スライド + SVG 図解 30 枚を主軸に、実 UI を要所へ挿す構成へ。実 UI の割合は **92.2%（v4・665 秒）→ 37.6%（v6・192 秒）**。8:29 / PII 7 カテゴリ 0 件。小さなサブタイトル行は全廃
 - **v5 のブロッカーが構成側で解けた**: 唯一足りなかった `c5_gui10`（担当 AI のペインが生える実写）は図解 `s_c6_grow` が担うので、撮り直しゼロで完成した（画面ロック待ちは 2 回・7.5 時間で撮れずじまいだった）
@@ -68,3 +63,8 @@
 - 起動元は空 HOME + 偽 CLI の shim で 2 本に特定（`setup_bootstrap::tests::状態は3系統ぶんまとめて返せる` = `agy models` / `codex login status` / `claude auth status --json`、`stale_binary::tests::test_check_stale_different_binary` = `claude --version`）。**tako が書かなくても実 CLI は起動しただけで自分のホームを作る**
 - 問い合わせ起動を `tako_control::agent_probe::run` の 1 か所へ寄せた。判定は実行時（`paths::is_test_process`。#1253 の brew と同型）で、#586 のコンソール窓抑止もここが当てる
 - 空 HOME の `cargo test --workspace` 実測: 36 → 1 ファイル（`.gemini` 32 / `.codex` 1 / `.claude` 2 が 0。残る `.zsh_history` は 0 バイトで修正前から同じ）。番犬 5 本が修正前ソースで FAILED
+
+## 2026-09-11（#1265: osc7 系 3 テストの真因を測り直し、状態待ちへ寄せた）
+- 見立て（固定 10 秒窓が短い）は**実測で否定**。修正前のまま CPU だけの負荷（load 11〜46 / PTY 99〜103・上限 511）で 150 回 = **0 FAILED**、OSC 7 の到達は 744〜1,171 ms（p50 858 ms・90 サンプル）で窓に 8 倍以上の余裕。元の 8/150 は PTY 404/511・tmux 135 本の枯渇（サーバーが `openpty` で止まる `sample`）の副作用だった。仮説②（`.zshenv` の競合）もテストの data dir が pid ごとに隔離（#944）されていて成立しない
+- それでも固定窓は「窓が短い / 器が動いていない」を診断から消すので `wait_osc7_cwd` + `probe_osc7`（状態待ち + `state_wait_budget`・器のペインの `#{pane_dead}` / `#{pane_current_command}` / `#{pane_current_path}`・`ZDOTDIR` セッション/サーバー・`.zshenv` のバイト数）へ。**診断の採取にも期限**をつけた（器が応答しない場面でこそ要るのに素の `output()` では診断ごと固まる = #1271 の罠）
+- A/B は `TAKO_1265_INJECT=late`（起動を 12 秒遅らせる）: 旧アーム（`TAKO_1265_LEGACY=1`）は **Issue と同じ画面**で 75/75 FAILED・新アーム 0/75。`nointegration` は両アーム FAILED（検出力）。番犬 `osc7_wait_watchdog` が固定回数窓の復活を落とす（修正前ソースで 9 件を名指し）

@@ -61,38 +61,13 @@ const GUARDED: [&str; 2] = [
 const ARM_BEGIN: &str = "TAKO_1252_LEGACY_ARM 開始";
 const ARM_END: &str = "TAKO_1252_LEGACY_ARM 終了";
 
-/// `fn <name>(` から、インデント 4 の閉じ括弧までを関数本体として切り出す。
-/// テストモジュールの中の関数は必ずこの形（`rustfmt` が保証する）
-fn body_of(src: &str, name: &str) -> Option<String> {
-    let head = format!("    fn {name}() {{");
-    let start = src.find(&head)?;
-    let rest = &src[start..];
-    let end = rest.find("\n    }\n")?;
-    Some(rest[..end].to_string())
-}
+/// 切り出しとアーム除去は #1265 の番犬と共有する（前処理を 2 か所に書かない）
+#[path = "common/test_source.rs"]
+mod test_source;
+use test_source::{body_of, strip_arms};
 
-/// A/B の旧経路アーム（マーカーで囲んだ範囲）を落とす。
-/// 落とした件数も返す（マーカーの綴り違いで**何も見ていない番犬**になるのを防ぐ）
 fn strip_legacy_arms(body: &str) -> (String, usize) {
-    let mut out = String::new();
-    let mut dropped = 0usize;
-    let mut inside = false;
-    for line in body.lines() {
-        if line.contains(ARM_BEGIN) {
-            inside = true;
-            dropped += 1;
-            continue;
-        }
-        if line.contains(ARM_END) {
-            inside = false;
-            continue;
-        }
-        if !inside {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    (out, dropped)
+    strip_arms(body, ARM_BEGIN, ARM_END)
 }
 
 #[test]
