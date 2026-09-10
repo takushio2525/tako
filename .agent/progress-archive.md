@@ -4,33 +4,6 @@
 
 ---
 
-## 2026-06-11（プロジェクト開始）
-- リポジトリ初期化 + AGENTS.md / .agent/ 構成導入 + 仕様書一式作成
-
-## 2026-06-11（Phase 0 完了）
-- GPUI + alacritty_terminal PoC macOS 成功。スタック採用確定
-
-## 2026-06-11（Phase 1 前半完了 + 仕様拡充）
-- 4 クレートワークスペース + PaneTree モデル + CI macOS/Windows 両緑
-
-## 2026-06-11（Phase 1 後半完了 + ビジョン・要件拡充）
-- Theme / screen / TerminalSession 拡張 + タブ・ペイン分割 UI
-
-## 2026-06-11（Phase 2 完了）
-- Layer 1: TAKO_* env 注入 + IPC + tako CLI（split/send/focus/list 等）
-
-## 2026-06-11（Phase 3 コア完了）
-- Layer 2: MCP エンジン + Streamable HTTP + stdio ブリッジ
-
-## 2026-06-11（Phase 3.5 完了）
-- IME 変換中表示 + .app バンドル化
-
-## 2026-06-11（常用初日バグ修正 + 境界ドラッグリサイズ）
-- TERM/cwd 修正 + ペイン境界ドラッグリサイズ
-
-## 2026-06-11（常用クラッシュ根治 + Phase 3 完了 + Phase 4 前半）
-- login ラッパ→$SHELL 直接 spawn + role/title UI + OSC 7/133 検知 + シェル統合
-
 ## 2026-06-12（接続情報の永続化 FR-2.2.9）
 - control.json 永続化 + CLI env→ファイル解決
 

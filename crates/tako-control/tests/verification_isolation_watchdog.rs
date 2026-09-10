@@ -122,3 +122,73 @@ fn 検証の履歴はrcの後に当て直される() {
          履歴を汚していたのはペイン ID を持たない素の PTY（#1253）"
     );
 }
+
+/// エージェント CLI の**問い合わせ起動**は正本の門番（`agent_probe::run`）を通る（#1261）。
+///
+/// tako 側が 1 バイトも書かなくても、実 CLI は起動しただけで自分のホームを作る
+/// （実測: 空 HOME で `cargo test --workspace` → `~/.gemini` 32 ファイル /
+/// `~/.codex/tmp/arg0/…/.lock` / `~/.claude.json` と `~/.claude/backups/`）。
+/// 呼ぶ側それぞれに `if` を散らすと**新しい問い合わせを足したときに素通りする**ので、
+/// 起動は 1 か所を通す形そのものを拘束する
+#[test]
+fn エージェントcliの問い合わせ起動は正本の門番を通る() {
+    for (rel, func) in [
+        (
+            "crates/tako-control/src/setup_bootstrap.rs",
+            "is_authenticated_for",
+        ),
+        ("crates/tako-control/src/agent_models.rs", "catalog"),
+        (
+            "crates/tako-control/src/stale_binary.rs",
+            "extract_version_via_cli",
+        ),
+    ] {
+        let text = read(rel);
+        let body =
+            fn_body(&text, func).unwrap_or_else(|| panic!("{rel}: fn {func} が見つからない"));
+        assert!(
+            body.contains("agent_probe::run"),
+            "{rel}: {func} が正本の門番（agent_probe::run）を通っていない。\
+             テストプロセスから実 claude / codex / agy が起きる（#1261）"
+        );
+        assert!(
+            !body.contains(".output()"),
+            "{rel}: {func} が子プロセスを直に起こしている。\
+             起動は agent_probe::run へ寄せる（#1261）"
+        );
+    }
+}
+
+/// 門番自身は**実行時**にテストプロセスを見分け、判定してから起こす（#1261）。
+///
+/// `cfg(test)` だと統合テスト（`crates/*/tests/`）から呼ばれた lib は非テストビルドなので
+/// 素通りする —— #1253 が GUI セルフテストで踏んだのと同じ穴
+#[test]
+fn 問い合わせの門番はテストプロセスを実行時に見分ける() {
+    let rel = "crates/tako-control/src/agent_probe.rs";
+    let text = read(rel);
+    let gate = fn_body(&text, "blocked").expect("fn blocked が見つからない");
+    assert!(
+        gate.contains("is_test_process"),
+        "{rel}: blocked が実行時判定（paths::is_test_process）を引いていない（#1261）"
+    );
+    assert!(
+        !gate.contains("cfg(test)"),
+        "{rel}: blocked が cfg(test) で判定している。\
+         クレートを跨がないので統合テストが素通りする（#1261）"
+    );
+    let body = fn_body(&text, "run").expect("fn run が見つからない");
+    // 呼ぶ側から `no_console_window` を取り上げた以上、内側で必ず当てる（#586 / #628）。
+    // `platform_parity::コンソール窓を抑止していない子プロセス起動が増えていない` は
+    // `agent_probe::run` を抑止済みとして数えるので、その前提をここで押さえる
+    assert!(
+        body.contains("no_console_window"),
+        "{rel}: run が #586 のコンソール窓抑止を当てていない（#1261）"
+    );
+    let guard = body.find("blocked()").expect("run が門番を呼んでいない");
+    let launch = body.find(".output()").expect("run が起動していない");
+    assert!(
+        guard < launch,
+        "{rel}: 起こした後で門番を通している（順番が逆だと外部コマンドが走る。#1261）"
+    );
+}

@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-09（#1238: 再起動後の復元で codex / agy も会話ごと戻るようにした）
-- 会話 ID は**生きたプロセスが開いているもの**から採れる（実測: codex 0.153.0 = `thread-writer-locks/<id>.lock`・起動直後から / agy 1.1.27 = `brain/<id>`・最初のターンの後）。`layout.json` へ `agent_resume`（系統 + ID）を `claude_session_id` と対称に保存し、`restore_plan` の分岐で `codex resume <id>` / `agy --conversation <id>` を投入する
-- 規則は `tako_core::agent_resume` へ 1 本化（保持 = #1076 の「確認してから外す」を一般化 / 書式 = `resume_spec` / 可否 = `restore_support`）。ID を引く実装は系統ごとのモジュール（#984 / #1033）へ委譲。**Windows は lsof が無く ID を採れない**ので、内訳の理由を `ID なし` と分けて `resume 非対応` に
-- 隔離 GUI 実測: tmux サーバー kill → 起動で `Claude resume 1 / agy resume 1 / codex resume 1 / 新規シェル 0` と 3 系統の会話が画面に復帰。A/B `TAKO_1238_LEGACY=1` は同じ layout で `新規シェル 3（ID なし 3）`。番犬 7 本 + 単体
-
 ## 2026-09-09（#777: 本番でも SIGTERM で layout を保存して終了するようにした）
 - `SIGTERM` の quit 読み替えを隔離限定から本番へ（`quit_signal::install`）。拾うのは 2 秒 tick ではなく既存の **500ms ループ**（新しいタイマー無しで最悪待ちを 1/4 に）。握る以上は対で必要なウォッチドッグ（到着から 5 秒で `exit(143)`・専用スレッド）を同じ入口が立てる
 - 連打は 1 度しか quit を撃たない（`QUIT_DISPATCHED`）・ハンドラはアトミック 1 回だけ・Windows は `SIGTERM` が無いので見張りごと立てない。読み替えと強制終了は `persist.log` へ 1 行
@@ -68,3 +63,8 @@
 - 真因は見立て（`~` 展開 / `.mp4` のプレビュー非対応 / soft wrap）と別で、**トークンの区切りが ASCII の空白と `()[]{}<>,;` だけ**だったこと。日本語の文にパスが埋まると**文ごと 1 トークン**になり実在チェックで落ちる（実測トークン: `` 動画は`~/…mp4`、確認して。`` / `~/…mp4このリンクが` = **素の形だけが飛べていた**）
 - 区切り集合は増やさず（`資料（最新）.pdf` のような実在名を落とす）**トークン全体 → 文字種の切り替わりで削った候補**を長い順に試す形へ（`links::path_candidates`。全 ASCII は候補を増やさない / `/` 終わりは採らない）。囲みの前に地の文がくっつく形（空白入りパス）は**途中のバッククォートで切る**ことで回収。`open_plan` を「拡張子 → 開き方」の正本にし（`.mp4` = 動画プレビュー）、開けなかったときの `eprintln!` を通知 + persist.log へ。CLI `tako links` / MCP `tako_links` を新設
 - A/B `TAKO_1283_LEGACY=1` で 2 形が `[]` に戻る（素の形は残る）。隔離 GUI（tako-vd）の実画面で 3 形すべて検出 + `open=video`・セルフテスト項目 147 に 2 形を追加して `TAKO_APP_SELF_TEST_OK`
+
+## 2026-09-11（#1261: 単体テストが実 agy / codex を起こして本番ホームへ書かないようにした）
+- 起動元は空 HOME + 偽 CLI の shim で 2 本に特定（`setup_bootstrap::tests::状態は3系統ぶんまとめて返せる` = `agy models` / `codex login status` / `claude auth status --json`、`stale_binary::tests::test_check_stale_different_binary` = `claude --version`）。**tako が書かなくても実 CLI は起動しただけで自分のホームを作る**
+- 問い合わせ起動を `tako_control::agent_probe::run` の 1 か所へ寄せた。判定は実行時（`paths::is_test_process`。#1253 の brew と同型）で、#586 のコンソール窓抑止もここが当てる
+- 空 HOME の `cargo test --workspace` 実測: 36 → 1 ファイル（`.gemini` 32 / `.codex` 1 / `.claude` 2 が 0。残る `.zsh_history` は 0 バイトで修正前から同じ）。番犬 5 本が修正前ソースで FAILED
