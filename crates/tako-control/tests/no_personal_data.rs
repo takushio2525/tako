@@ -17,6 +17,15 @@
 //!    （#927 で除去した 2 箇所目 `contains("<実ユーザー名>")` は 1 では捕まらない形だった）。
 //!    値を漏らすのは「自分の値を貼った人」なので、**その人の手元で必ず落ちる**。
 //!
+//! # 走査対象は「public リポに出るファイル」だけ（#1035）
+//!
+//! `git` が ignore しているファイル（= **未追跡かつ ignore 済み**）は public リポへ
+//! 出ないので走査しない。ツールが手元で自動生成する設定（`.claude/settings.local.json` 等）で
+//! 恒久的に赤くなると、「落ちていても気にしない」を誘発して本物の混入を見逃す。
+//! `.gitignore` へ書いて検査を逃れる抜け道は残るが、**一度追跡下に入ったファイルは
+//! ignore パターンに一致しても走査から外れない**ので（`check-ignore` は索引を見る）、
+//! 検査 1 が CI で最後の砦になる。
+//!
 //! # なぜ検出語のハッシュをリポに置かないか
 //!
 //! Issue #927 は「検出語はハッシュ化 or 環境変数で持つ」を案として挙げていたが、
@@ -27,7 +36,9 @@
 //! （GitHub Actions なら secret 経由。リポには何も残らない）。
 
 use std::collections::BTreeSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 /// ホームパスの `<名前>` として置いてよいプレースホルダ。
 ///
@@ -120,6 +131,20 @@ fn text_files(root: &Path) -> Vec<(PathBuf, String)> {
         skipped.sort();
         eprintln!("[#927] {MAX_FILE_BYTES} バイトを超えるため走査しなかったファイル: {skipped:?}");
     }
+    // #1035: git が ignore しているファイルは public リポへ出ないので走査しない
+    let paths: Vec<PathBuf> = out.iter().map(|(p, _)| p.clone()).collect();
+    match git_ignored(root, &paths) {
+        Some(ignored) => {
+            let before = out.len();
+            out.retain(|(p, _)| !ignored.contains(slash_path(p).as_str()));
+            let dropped = before - out.len();
+            if dropped > 0 {
+                eprintln!("[#1035] git が ignore しているため走査しなかったファイル: {dropped} 件");
+            }
+        }
+        // git で判定できない環境（git が無い / リポジトリの外）は絞り込まない = 安全側
+        None => eprintln!("[#1035] git で ignore を判定できないので全ファイルを走査する"),
+    }
     out
 }
 
@@ -151,6 +176,117 @@ fn collect(dir: &Path, root: &Path, out: &mut Vec<(PathBuf, String)>, skipped: &
             out.push((rel, text));
         }
     }
+}
+
+// --- 走査対象の絞り込みと、失敗の読み違い防止（#1035）---
+
+/// パスを `/` 区切りの文字列にする（Windows の `\` をそのまま git へ渡さないため）
+fn slash_path(path: &Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// `git` を走らせて NUL 区切りの一覧を得る。
+///
+/// `git` が起動できない / リポジトリの外 / 致命的エラーなら `None` を返す。
+/// 呼び出し側は「判定できなかった」として**絞り込まない**（安全側に倒す）。
+fn git_nul_list(
+    root: &Path,
+    args: &[&str],
+    stdin_paths: Option<&[PathBuf]>,
+    ok_codes: &[i32],
+) -> Option<BTreeSet<String>> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(root)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(if stdin_paths.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+    let mut child = cmd.spawn().ok()?;
+    if let Some(paths) = stdin_paths {
+        let mut buf = Vec::new();
+        for path in paths {
+            buf.extend_from_slice(slash_path(path).as_bytes());
+            buf.push(0);
+        }
+        let mut stdin = child.stdin.take()?;
+        // パイプが詰まっても止まらないように、書き込みは別スレッドで行う
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&buf);
+        });
+    }
+    let out = child.wait_with_output().ok()?;
+    if !ok_codes.contains(&out.status.code().unwrap_or(-1)) {
+        return None;
+    }
+    Some(
+        out.stdout
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect(),
+    )
+}
+
+/// git が ignore しているファイル（= **未追跡かつ ignore 済み**）を集める。
+///
+/// `check-ignore` は既定で**索引を見る**ので、`git add -f` で追跡下へ入れたファイルは
+/// ignore 済みと報告されない = 走査に残る。**`--no-index` を付けてはいけない**
+/// （付けると「`.gitignore` へ書けば混入を隠せる」抜け道ができる）。
+fn git_ignored(root: &Path, paths: &[PathBuf]) -> Option<BTreeSet<String>> {
+    if paths.is_empty() {
+        return Some(BTreeSet::new());
+    }
+    // 1 件も ignore されていなければ終了コードは 1（エラーではない）
+    git_nul_list(
+        root,
+        &["check-ignore", "-z", "--stdin"],
+        Some(paths),
+        &[0, 1],
+    )
+}
+
+/// 追跡下にあるファイルの一覧（失敗メッセージの案内にだけ使う）
+fn git_tracked(root: &Path) -> Option<BTreeSet<String>> {
+    git_nul_list(root, &["ls-files", "-z"], None, &[0])
+}
+
+/// 失敗メッセージの末尾へ足す、git 管理外のファイルについての案内。
+///
+/// ignore 済みは走査から外れるが、**未追跡でまだ ignore もされていない**ファイル
+/// （ツールが作った作業物など）は走査に残る。これで落ちたときは CI（クリーンな
+/// チェックアウト）では再現しないので、「自分の変更で番犬を壊した」と誤読しないよう
+/// 一言添える。
+fn untracked_note(root: &Path, files: &BTreeSet<PathBuf>) -> String {
+    let Some(tracked) = git_tracked(root) else {
+        return String::new();
+    };
+    let untracked: Vec<String> = files
+        .iter()
+        .map(|p| slash_path(p))
+        .filter(|p| !tracked.contains(p.as_str()))
+        .collect();
+    if untracked.is_empty() {
+        return String::new();
+    }
+    let head = if untracked.len() == files.len() {
+        "落ちた原因はすべて"
+    } else {
+        "このうち一部"
+    };
+    format!(
+        "\n※ {head} git 管理外（未追跡）のファイルです: {}\
+         \n  CI（クリーンなチェックアウト）には無いので CI は緑のままです。\
+         手元のファイル側を直してください（#1035）",
+        untracked.join(", ")
+    )
 }
 
 // --- 検査 1: ホームパス形の名前 ---
@@ -282,21 +418,29 @@ fn offending_segments(line: &str) -> Vec<String> {
 fn ホームパス形の名前はプレースホルダだけ() {
     let root = repo_root();
     let mut offenders = Vec::new();
+    let mut files = BTreeSet::new();
     for (rel, text) in text_files(&root) {
         for (ln, line) in text.lines().enumerate() {
             for seg in offending_segments(line) {
                 offenders.push(format!("{}:{} → {:?}", rel.display(), ln + 1, seg));
+                files.insert(rel.clone());
             }
         }
     }
+    let note = if offenders.is_empty() {
+        String::new()
+    } else {
+        untracked_note(&root, &files)
+    };
     assert!(
         offenders.is_empty(),
         "実在しそうなユーザー名がホームパスに書かれている（#927）:\n  {}\n\
          → 実機の採取物をそのまま貼っていないか確認し、\n\
          crates/tako-control/tests/no_personal_data.rs の PLACEHOLDER_NAMES にある\n\
          プレースホルダ（testuser / winuser / 山田 等）へ置き換えてください。\n\
-         架空だと一目で分かる名前を新しく増やす場合だけ PLACEHOLDER_NAMES に追記します",
-        offenders.join("\n  ")
+         架空だと一目で分かる名前を新しく増やす場合だけ PLACEHOLDER_NAMES に追記します{}",
+        offenders.join("\n  "),
+        note
     );
 }
 
@@ -358,6 +502,7 @@ fn このマシンの識別子がリポに出ていない() {
     let lowered: Vec<String> = terms.iter().map(|t| t.to_ascii_lowercase()).collect();
     let root = repo_root();
     let mut offenders = Vec::new();
+    let mut files = BTreeSet::new();
     for (rel, text) in text_files(&root) {
         // このテスト自身は検出語を持たない（環境から作る）ので走査対象のままでよい
         for (ln, line) in text.lines().enumerate() {
@@ -370,17 +515,24 @@ fn このマシンの識別子がリポに出ていない() {
                         ln + 1,
                         terms.iter().nth(i).map(|t| t.chars().count()).unwrap_or(0)
                     ));
+                    files.insert(rel.clone());
                 }
             }
         }
     }
+    let note = if offenders.is_empty() {
+        String::new()
+    } else {
+        untracked_note(&root, &files)
+    };
     assert!(
         offenders.is_empty(),
         "このマシンの識別子（ユーザー名 / ホスト名）がリポに出ている（#927）:\n  {}\n\
          → public リポなので除去してください。値そのものはここに出しません\n\
          （出すとテスト出力・CI ログ経由で再び漏れるため）。\n\
-         該当行を開いて、自分のユーザー名・ホスト名をプレースホルダへ置き換えます",
-        offenders.join("\n  ")
+         該当行を開いて、自分のユーザー名・ホスト名をプレースホルダへ置き換えます{}",
+        offenders.join("\n  "),
+        note
     );
 }
 
@@ -455,5 +607,76 @@ fn 検出語の組み立ては汎用語とプレースホルダを外す() {
                 .iter()
                 .any(|p| p.eq_ignore_ascii_case(real_ish)),
         "実名らしい語が除外リストに入っている"
+    );
+}
+
+// --- 走査対象の絞り込みの検出力（#1035）---
+
+#[test]
+fn ignore済みでも追跡下のファイルは走査に残る() {
+    // 除外の基準は「public リポに出るか」。`git add -f` で追跡下へ入れたファイルは
+    // ignore パターンに一致しても走査から外さない（= `--no-index` を付けない）。
+    // これがあるので「`.gitignore` へ書いて混入を隠す」抜け道が塞がる
+    let dir = std::env::temp_dir().join(format!("tako-1035-repo-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("secret")).expect("一時ディレクトリを作れない");
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(args)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    if !git(&["init", "-q"]) {
+        eprintln!("[#1035] git init に失敗したのでこの検査は飛ばす");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    std::fs::write(dir.join(".gitignore"), "secret/\n").expect("書けない");
+    std::fs::write(dir.join("secret/untracked.txt"), "x").expect("書けない");
+    std::fs::write(dir.join("secret/forced.txt"), "x").expect("書けない");
+    assert!(
+        git(&["add", "-f", "secret/forced.txt"]),
+        "add -f に失敗した"
+    );
+
+    let paths = [
+        PathBuf::from("secret/untracked.txt"),
+        PathBuf::from("secret/forced.txt"),
+        PathBuf::from(".gitignore"),
+    ];
+    let ignored = git_ignored(&dir, &paths).expect("リポジトリ内なら判定できる");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        ignored.contains("secret/untracked.txt"),
+        "未追跡かつ ignore 済みは走査から外れるべき"
+    );
+    assert!(
+        !ignored.contains("secret/forced.txt"),
+        "追跡下のファイルは ignore 済みでも走査に残るべき（--no-index を付けてはいけない）"
+    );
+    assert!(
+        !ignored.contains(".gitignore"),
+        "ignore されていないファイルを外してはいけない"
+    );
+}
+
+#[test]
+fn gitで判定できないときは全部走査する() {
+    // git が無い / リポジトリの外 / 致命的エラーのときは `None` を返し、
+    // 呼び出し側は絞り込まずに全ファイルを走査する（安全側に倒す）
+    let missing = std::env::temp_dir().join(format!("tako-1035-missing-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&missing);
+    assert_eq!(
+        git_ignored(&missing, &[PathBuf::from("a.txt")]),
+        None,
+        "存在しない場所では ignore を判定しない"
+    );
+    assert_eq!(
+        git_tracked(&missing),
+        None,
+        "存在しない場所では追跡状況を判定しない"
     );
 }
