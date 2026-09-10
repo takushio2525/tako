@@ -421,6 +421,43 @@ pub struct ServerEntry {
     pub owner_pids: Vec<u32>,
     /// そのうち生きているもの
     pub live_owner_pids: Vec<u32>,
+    /// 器の指し方（#1282）。ソケットファイルが無いプラットフォーム（Windows / psmux）は
+    /// 名前と器の pid で指す
+    pub kind: ServerKind,
+    /// 器そのもののプロセス pid（[`ServerKind::Named`] のときだけ埋まる）。
+    /// **回収はこの pid を名指しして行う**（名前一致の一括 kill は #625 の事故クラス）
+    pub server_pids: Vec<u32>,
+    /// [`Self::owner_pids`] の出どころ。回収の強さが変わる（[`OwnerSource`]）
+    pub owner_source: OwnerSource,
+    /// この機で生きている tako-app の pid（[`ServerKind::Named`] のときだけ埋まる）。
+    /// ソケット名が再利用されうる器の**回収の最終ゲート**（[`ServerVerdict::PeerMayReattach`]）
+    pub live_app_pids: Vec<u32>,
+}
+
+/// 器の指し方。unix はソケットファイル、Windows / psmux は名前付きパイプなので
+/// 走査できるファイルが無く、**プロセスのコマンドライン**（`-L <名前>`）で見つける
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ServerKind {
+    /// ソケットファイル（`tmux -S <path>`）
+    #[default]
+    SocketFile,
+    /// 名前付き（`tmux -L <名前>`）。器の pid が分かっている
+    Named,
+}
+
+/// 所有 pid をどこから読んだか（#1282）。**回収してよい強さが違う**
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OwnerSource {
+    /// 材料が無い（触らない）
+    #[default]
+    Unknown,
+    /// ソケット名に埋まっている（`tako-iso-<pid>`）。この名前は pid ごとに変わるので
+    /// **所有者が死んだら誰も再利用しない** = 回収してよい
+    SocketName,
+    /// 器のコマンドラインに載っていた隔離マーカー（`tako-iso-data-<pid>`）由来。
+    /// ソケット名自体（`TAKO_TMUX_SOCKET` の手動指定）は**再起動した tako-app が
+    /// 同じ名前で再 attach しうる**ので、生きた tako-app が居る間は回収しない
+    CommandLine,
 }
 
 /// そのソケットをどう扱うか（`--apply` で実際に触るのは `Reclaimable` / `StaleSocket` だけ）
@@ -444,6 +481,9 @@ pub enum ServerVerdict {
     TooFresh,
     /// サーバー不在の残骸ソケット（ファイルだけ消す）
     StaleSocket,
+    /// 所有 pid はコマンドライン由来で、ソケット名は再利用されうる。
+    /// 生きた tako-app が居る間は回収しない（#1282）
+    PeerMayReattach { pids: Vec<u32> },
     /// 所有者が死んだサーバー（kill + ソケット削除）
     Reclaimable { pids: Vec<u32> },
 }
@@ -459,6 +499,7 @@ impl ServerVerdict {
             Self::OwnerUnknown => "owner_unknown",
             Self::OwnerAlive { .. } => "owner_alive",
             Self::TooFresh => "too_fresh",
+            Self::PeerMayReattach { .. } => "peer_may_reattach",
             Self::StaleSocket => "stale_socket",
             Self::Reclaimable { .. } => "reclaimable",
         }
@@ -476,6 +517,12 @@ impl ServerVerdict {
             Self::OwnerUnknown => "名前から所有 pid を特定できないので触らない".to_string(),
             Self::OwnerAlive { pids } => format!("所有 pid（{}）が生きている", join_pids(pids)),
             Self::TooFresh => format!("できてから {SERVER_FRESH_SECS} 秒以内なので触らない"),
+            Self::PeerMayReattach { pids } => format!(
+                "所有者はコマンドライン由来でソケット名は再利用されうる。\
+                 生きている tako-app（pid {}）が同じ名前へ再 attach しうるので見送った\
+                 （すべての tako-app を終了してから叩き直す）",
+                join_pids(pids)
+            ),
             Self::StaleSocket => "サーバー不在の残骸ソケット（ファイルだけ消す）".to_string(),
             Self::Reclaimable { pids } => format!(
                 "所有 pid（{}）が死んでいて attach も無い（サーバーを kill してソケットを消す）",
@@ -580,6 +627,15 @@ pub fn judge_server_with(
     if fresh {
         return ServerVerdict::TooFresh;
     }
+    // #1282: 所有者をコマンドラインの隔離マーカーから読んだ器は、**ソケット名自体が
+    // 再利用されうる**（`TAKO_TMUX_SOCKET=tako-w1133` のような手動指定は、tako-app が
+    // 再起動しても同じ名前を使う）。所有者だった pid が死んでいても、生きている
+    // tako-app が同じ名前へ再 attach していれば、それは現役の器である
+    if entry.owner_source == OwnerSource::CommandLine && !entry.live_app_pids.is_empty() {
+        return ServerVerdict::PeerMayReattach {
+            pids: entry.live_app_pids.clone(),
+        };
+    }
     ServerVerdict::Reclaimable {
         pids: entry.owner_pids.clone(),
     }
@@ -631,11 +687,24 @@ impl ServerCleanupOutcome {
     }
 }
 
-/// ソケットディレクトリを走査してサーバー一覧を作る（読み取りのみ）
+/// サーバー一覧を作る（読み取りのみ）。**器の見つけ方はプラットフォームで違う**（#1282）:
+/// ソケットディレクトリがある unix はファイルを走査し、名前付きパイプの
+/// Windows / psmux はプロセスのコマンドライン（`-L <名前>`）から見つける
 pub fn scan_servers() -> Vec<ServerEntry> {
-    crate::tmux_backend::socket_dir()
-        .map(|dir| scan_servers_in(&dir, crate::ports::process_alive))
-        .unwrap_or_default()
+    match crate::tmux_backend::socket_dir() {
+        Some(dir) => scan_servers_in(&dir, crate::ports::process_alive),
+        // A/B: 修正前はここが「置き場が無い = 器も無い」で空を返していた
+        None if legacy_1282() => Vec::new(),
+        None => scan_named_servers(),
+    }
+}
+
+/// #1282 の A/B。`TAKO_1282_LEGACY=1` で**修正前の挙動**へ戻す:
+/// ソケットファイルの走査しか持たないので、名前付きパイプの Windows / psmux では
+/// 器が 1 つも見つからない（実機に 24 個残っていても 0 件と答える）。
+/// **macOS は 1 ビットも変わらない**（置き場があるので常に走査の側へ行く）
+pub fn legacy_1282() -> bool {
+    std::env::var_os("TAKO_1282_LEGACY").is_some()
 }
 
 /// [`scan_servers`] のディレクトリと pid 生存判定を差し替えられる版。
@@ -671,6 +740,11 @@ pub fn scan_servers_in(dir: &std::path::Path, alive: impl Fn(u32) -> bool) -> Ve
         };
         let owner_pids = owner_pid_candidates(&name);
         let live_owner_pids = owner_pids.iter().copied().filter(|&p| alive(p)).collect();
+        let owner_source = if owner_pids.is_empty() {
+            OwnerSource::Unknown
+        } else {
+            OwnerSource::SocketName
+        };
         by_name.insert(
             name.clone(),
             ServerEntry {
@@ -683,6 +757,10 @@ pub fn scan_servers_in(dir: &std::path::Path, alive: impl Fn(u32) -> bool) -> Ve
                 modified_secs_ago,
                 owner_pids,
                 live_owner_pids,
+                kind: ServerKind::SocketFile,
+                server_pids: Vec::new(),
+                owner_source,
+                live_app_pids: Vec::new(),
             },
         );
     }
@@ -724,12 +802,7 @@ pub fn cleanup_servers(
     peers: &[CleanupPeer],
     apply: bool,
 ) -> ServerCleanupOutcome {
-    let dir = crate::tmux_backend::socket_dir();
-    let entries = dir
-        .as_ref()
-        .map(|d| scan_servers_in(d, crate::ports::process_alive))
-        .unwrap_or_default();
-    cleanup_servers_from(entries, self_socket, peers, apply, SERVER_FRESH_SECS)
+    cleanup_servers_from(scan_servers(), self_socket, peers, apply, SERVER_FRESH_SECS)
 }
 
 /// 走査済みの一覧に対して判定と（`apply` なら）実行を行う。
@@ -750,7 +823,16 @@ pub fn cleanup_servers_from(
     for entry in entries {
         let mut verdict = judge_server_with(&entry, self_socket, peers, fresh_secs);
         if apply && verdict.is_actionable() {
-            if verdict.kills_server() {
+            if entry.kind == ServerKind::Named {
+                // #1282: 名前付きパイプの器（psmux）は落とすソケットファイルが無い。
+                // **器の pid を名指し**して落とす（残骸ソケットの概念も無いので、
+                // ここへ来るのは Reclaimable だけ）
+                match reclaim_named(&entry) {
+                    Ok(pids) if !pids.is_empty() => killed.push(entry.socket.clone()),
+                    Ok(_) => {}
+                    Err(clients) => verdict = ServerVerdict::ClientsAttached { clients },
+                }
+            } else if verdict.kills_server() {
                 // 直前の再確認（走査からの時間差で attach された可能性を潰す）
                 let clients = client_count(&entry.path);
                 if clients > 0 {
@@ -786,6 +868,340 @@ fn remove_socket_files(path: &std::path::Path) {
             let _ = std::fs::remove_file(dir.join(format!("{base}=")));
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// 名前で列挙する器（Windows / psmux。#1282）
+// ---------------------------------------------------------------------------
+//
+// unix の走査（[`scan_servers_in`]）は**ソケットファイル**が置き場にあることに依っている。
+// psmux は名前付きパイプ（`-L <名前>`）なので、走査できるファイルが 1 つも無く、
+// `socket_dir()` は Windows で `None`・`socket_answers` は常に false = **器が 1 つも
+// 見つからない**（実機には隔離 GUI 由来の器が 24 個残っていたのに 0 件と答えていた）。
+//
+// そこで Windows は**プロセスのコマンドライン**から器を見つける。psmux のパッケージは
+// `psmux.exe` / `tmux.exe` / `pmux.exe` を同じ実体で配り、**サーバーは起動した
+// クライアントの実行ファイル名を名乗る**（#1271 の実測）ので 3 名すべてを数える。
+//
+// 回収は**器の pid を名指し**して行う（`Stop-Process -Name` / `taskkill /IM` は
+// 別インスタンス・別ワーカーの器を巻き込む = #625 の事故クラス）。psmux の
+// `kill-server` は `-L` を落とすと全ソケットを殺し、しかも返らないことがある（#1271）
+// ので、この経路では一切使わない。
+
+/// 器の実行ファイル名（拡張子・大文字小文字は無視して照合する）
+pub const MUX_PROCESS_NAMES: [&str; 3] = ["tmux", "psmux", "pmux"];
+
+/// psmux が 1 ソケットにつき 1 本持つ先読み用サーバーのセッション名。
+/// **利用者のセッションではない**ので数に入れない（#1271 の実測）
+pub const WARM_SESSION: &str = "__warm__";
+
+/// 値を取るオプション。サブコマンド（`server` / `list-sessions` …）を見つけるとき、
+/// **オプションの値をサブコマンドと読み違えない**ために使う
+const VALUE_FLAGS: [&str; 11] = [
+    "-c", "-f", "-L", "-S", "-T", "-s", "-e", "-x", "-y", "-t", "-n",
+];
+
+/// コマンドライン 1 本から読んだ器のプロセス（純粋関数の出力）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuxProcess {
+    pub pid: u32,
+    /// `-L <名前>`（`-S <パス>` ならその名前部分）
+    pub socket: String,
+    /// サブコマンドが `server` か（false = クライアント = 誰かが使っている印）
+    pub is_server: bool,
+    /// `-s <名前>`（サーバーが持つセッション名）
+    pub session: Option<String>,
+    /// コマンドラインに載っていた隔離マーカー由来の所有 pid
+    pub marker_pids: Vec<u32>,
+    /// プロセスの起動時刻（UNIX 秒）
+    pub started_unix: Option<u64>,
+}
+
+/// コマンドラインを語へ割る（純粋関数）。
+///
+/// `"` で囲まれた区間の空白は割らない。**バックスラッシュのエスケープは解釈しない**:
+/// Windows のパスは `C:\\Users\\...` のように `\\` を素で含み、`\\"` の形は器の
+/// コマンドラインに現れないため、解釈するほうが誤りを増やす
+pub fn split_command_line(cmd: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut word = String::new();
+    let mut quoted = false;
+    for ch in cmd.chars() {
+        match ch {
+            '"' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => {
+                if !word.is_empty() {
+                    out.push(std::mem::take(&mut word));
+                }
+            }
+            c => word.push(c),
+        }
+    }
+    if !word.is_empty() {
+        out.push(word);
+    }
+    out
+}
+
+/// 器のコマンドライン 1 本を読む（純粋関数）。`-L` / `-S` が無ければ `None`
+/// （既定のソケットを使う素の tmux / psmux は tako の管理外なので**触らない**）
+pub fn parse_mux_process(pid: u32, cmd: &str, started_unix: Option<u64>) -> Option<MuxProcess> {
+    let words = split_command_line(cmd);
+    let mut socket: Option<String> = None;
+    let mut session: Option<String> = None;
+    let mut subcommand: Option<String> = None;
+    let mut i = 1; // argv[0] は実行ファイル
+    while i < words.len() {
+        let word = words[i].as_str();
+        let value = words.get(i + 1).cloned();
+        match word {
+            "-L" => socket = value.filter(|v| !v.is_empty()),
+            "-S" => {
+                socket = value.and_then(|v| {
+                    std::path::Path::new(&v)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().trim_end_matches('=').to_string())
+                        .filter(|n| !n.is_empty())
+                })
+            }
+            "-s" => session = value,
+            _ => {}
+        }
+        if VALUE_FLAGS.contains(&word) {
+            i += 2;
+            continue;
+        }
+        if !word.starts_with('-') && subcommand.is_none() {
+            subcommand = Some(word.to_string());
+        }
+        i += 1;
+    }
+    Some(MuxProcess {
+        pid,
+        socket: socket?,
+        is_server: subcommand.as_deref() == Some("server"),
+        session,
+        marker_pids: marker_owner_pids(cmd),
+        started_unix,
+    })
+}
+
+/// コマンドラインに載っている**隔離マーカー**から所有 tako-app の pid を読む（純粋関数）。
+///
+/// 隔離起動（`TAKO_ISOLATED=1`）は data / discovery / sessions / pane-logs / remote の
+/// 置き場をすべて `tako-iso-<用途>-<自分の pid>` にする（`tako-app` の一括隔離）。
+/// 器のプロセスにはそれが `-e TAKO_OSC_SINK=<temp>\tako-iso-data-<pid>\osc\7.osc` の形で
+/// 載るので、**ソケット名が手動指定（`TAKO_TMUX_SOCKET=tako-w1133`）でも所有者が分かる**。
+///
+/// pid の切り出しは [`owner_pid_candidates`] と 1 実装（規則がズレると所有者判定が外れる）
+pub fn marker_owner_pids(cmd: &str) -> Vec<u32> {
+    const MARKER: &str = "tako-iso-";
+    let bytes = cmd.as_bytes();
+    let mut out: Vec<u32> = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = cmd[from..].find(MARKER) {
+        let start = from + rel;
+        let mut end = start;
+        // マーカーの語は ASCII の英数字と `-` / `_` だけ（`.yaml` や `\` で切れる）
+        while end < bytes.len()
+            && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'-' || bytes[end] == b'_')
+        {
+            end += 1;
+        }
+        for pid in owner_pid_candidates(&cmd[start..end]) {
+            if !out.contains(&pid) {
+                out.push(pid);
+            }
+        }
+        from = end.max(start + MARKER.len());
+    }
+    out
+}
+
+/// 読み取った器のプロセスを**ソケット単位**へ畳む（純粋関数）。
+///
+/// - `alive`: pid の生死（テストは固定の集合を渡す）
+/// - `now_unix`: いまの UNIX 秒（出来たての猶予の基準）
+/// - `live_app_pids`: この機で生きている `tako-app`（再 attach の見張り）。
+///   **この操作を提供している GUI 自身は含めない**（含めると常に見送りになる）
+///
+/// 器のプロセスが 1 つも無いソケット（クライアントだけが残っている）は返さない
+/// ＝ 落とすものが無い
+pub fn named_server_entries(
+    procs: &[MuxProcess],
+    alive: impl Fn(u32) -> bool,
+    now_unix: u64,
+    live_app_pids: &[u32],
+) -> Vec<ServerEntry> {
+    let mut by_socket: std::collections::BTreeMap<&str, Vec<&MuxProcess>> =
+        std::collections::BTreeMap::new();
+    for proc in procs {
+        by_socket
+            .entry(proc.socket.as_str())
+            .or_default()
+            .push(proc);
+    }
+    let mut out = Vec::new();
+    for (socket, group) in by_socket {
+        let servers: Vec<&&MuxProcess> = group.iter().filter(|p| p.is_server).collect();
+        if servers.is_empty() {
+            continue; // 器が居ない = 落とすものが無い（クライアントの残骸だけ）
+        }
+        let clients = group.len() - servers.len();
+        let mut sessions: Vec<&str> = servers
+            .iter()
+            .filter_map(|p| p.session.as_deref())
+            .filter(|name| *name != WARM_SESSION)
+            .collect();
+        sessions.sort_unstable();
+        sessions.dedup();
+        // 出来たての判定は**いちばん新しい器**で見る（起動途中のソケットを守る）。
+        // 1 つでも起動時刻が読めなければ `None` = 出来たて扱い（触らない）
+        let modified_secs_ago = servers
+            .iter()
+            .map(|p| p.started_unix)
+            .try_fold(0u64, |newest, at| at.map(|at| newest.max(at)))
+            .map(|newest| now_unix.saturating_sub(newest));
+
+        let name_pids = owner_pid_candidates(socket);
+        let mut marker_pids: Vec<u32> = Vec::new();
+        for proc in &servers {
+            for pid in &proc.marker_pids {
+                if !marker_pids.contains(pid) {
+                    marker_pids.push(*pid);
+                }
+            }
+        }
+        // ソケット名から読めたなら**そちらが強い**（`tako-iso-<pid>` は pid ごとに
+        // 名前が変わるので誰も再利用しない）。守りを厚くするため候補は合流させる
+        let (mut owner_pids, owner_source) = if !name_pids.is_empty() {
+            (name_pids, OwnerSource::SocketName)
+        } else if !marker_pids.is_empty() {
+            (Vec::new(), OwnerSource::CommandLine)
+        } else {
+            (Vec::new(), OwnerSource::Unknown)
+        };
+        for pid in marker_pids {
+            if !owner_pids.contains(&pid) {
+                owner_pids.push(pid);
+            }
+        }
+        let live_owner_pids: Vec<u32> = owner_pids.iter().copied().filter(|&p| alive(p)).collect();
+        out.push(ServerEntry {
+            socket: socket.to_string(),
+            path: std::path::PathBuf::new(), // ソケットファイルが無い
+            running: true,                   // プロセスとして見つかった = 生きている
+            clients,
+            sessions: sessions.len(),
+            bytes: 0,
+            modified_secs_ago,
+            owner_pids,
+            live_owner_pids,
+            kind: ServerKind::Named,
+            server_pids: servers.iter().map(|p| p.pid).collect(),
+            owner_source,
+            live_app_pids: live_app_pids.to_vec(),
+        });
+    }
+    out
+}
+
+/// いまの UNIX 秒（読めなければ 0 = すべて「出来たて」に倒れて何も触らない）
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 名前で列挙した器の一覧（読み取りのみ）。コマンドラインを読めない
+/// プラットフォームでは空 = 何もしない
+pub fn scan_named_servers() -> Vec<ServerEntry> {
+    let procs = read_mux_processes();
+    let live_apps = crate::platform::procinfo::live_tako_app_pids(
+        &crate::platform::procinfo::snapshot(),
+        std::process::id(),
+    );
+    named_server_entries(
+        &procs,
+        crate::platform::process::pid_alive,
+        now_unix(),
+        &live_apps,
+    )
+}
+
+/// いま動いている器のプロセスを読む（コマンドラインが取れないものは捨てる）
+fn read_mux_processes() -> Vec<MuxProcess> {
+    crate::platform::procinfo::details_by_name(&MUX_PROCESS_NAMES)
+        .into_iter()
+        .filter_map(|detail| {
+            let cmd = detail.command_line?;
+            parse_mux_process(detail.pid, &cmd, detail.started_unix)
+        })
+        .collect()
+}
+
+/// 回収の直前にもう一度測り直す（走査から apply までの隙に attach された器を落とさない）。
+/// 戻り値は `(クライアント数, まだ生きている器の pid)`
+fn recheck_named(socket: &str) -> (usize, Vec<u32>) {
+    let procs = read_mux_processes();
+    let clients = procs
+        .iter()
+        .filter(|p| p.socket == socket && !p.is_server)
+        .count();
+    let servers = procs
+        .iter()
+        .filter(|p| p.socket == socket && p.is_server)
+        .map(|p| p.pid)
+        .collect();
+    (clients, servers)
+}
+
+/// **pid を名指し**して器を落とす。名前一致（`taskkill /IM` / `Stop-Process -Name`）は
+/// 他インスタンスの器を巻き込むので絶対に使わない。
+/// Windows は `/T` で器の中の pwsh ごと落とす
+fn force_kill_pid(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        let mut cmd = std::process::Command::new("taskkill");
+        crate::platform::process::no_console_window(&mut cmd);
+        let _ = cmd.args(["/PID", &pid.to_string(), "/T", "/F"]).output();
+    }
+    #[cfg(not(windows))]
+    {
+        // unix でこの経路へ来るのは名前で列挙した器だけ（ソケットファイルがある
+        // 環境では生じない）。実装を空にすると「落としたつもり」になるので、
+        // 同じ意味の操作を置く。**子プロセスは起こさない**（`kill(1)` を spawn すると
+        // Windows のコンソール窓抑止の境界検査に引っかかるうえ、ここでは不要）
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return;
+        };
+        if pid > 0 {
+            // SAFETY: 正の pid（プロセスグループ / 全プロセスの特別値ではない）へ
+            // SIGKILL を送るだけ。引数は値渡しでポインタを触らない
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+}
+
+/// 名前で列挙した器を回収する。**生きている器の pid だけ**を名指しで落とす
+fn reclaim_named(entry: &ServerEntry) -> Result<Vec<u32>, usize> {
+    let (clients, live_pids) = recheck_named(&entry.socket);
+    if clients > 0 {
+        return Err(clients); // 走査後に attach された
+    }
+    let mut killed = Vec::new();
+    for pid in entry.server_pids.iter().copied() {
+        if !live_pids.contains(&pid) {
+            continue; // もう居ない
+        }
+        force_kill_pid(pid);
+        killed.push(pid);
+    }
+    Ok(killed)
 }
 
 #[cfg(test)]
@@ -1058,6 +1474,14 @@ mod tests {
             modified_secs_ago: Some(3600),
             owner_pids: owner_pid_candidates(socket),
             live_owner_pids: live.to_vec(),
+            kind: ServerKind::SocketFile,
+            server_pids: Vec::new(),
+            owner_source: if owner_pid_candidates(socket).is_empty() {
+                OwnerSource::Unknown
+            } else {
+                OwnerSource::SocketName
+            },
+            live_app_pids: Vec::new(),
         }
     }
 
@@ -1182,5 +1606,258 @@ mod tests {
             CleanupReport::killed("tako", Vec::new()).log_line(CleanupScope::Explicit),
             None
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 名前で列挙する器（Windows / psmux。#1282）
+    // -----------------------------------------------------------------------
+
+    /// 実機（Windows 11 / psmux 3.3.7）の器のコマンドラインの形。
+    /// **実ユーザー名は置かない**（#927。実機の採取物は `winuser` へ置換してある）
+    const WARM_LINE: &str = r"tmux.exe server -s __warm__ -L tako-w1133 -x 120 -y 30";
+    const SESSION_LINE: &str = r#"tmux.exe server -s tako-123456789012 -L tako-w1133 -e TAKO_PANE_ID=71 -e "TAKO_OSC_SINK=C:\Users\winuser\AppData\Local\Temp\tako-iso-data-4242\osc\71.osc" -x 120 -y 30"#;
+
+    fn mux(pid: u32, cmd: &str, started: Option<u64>) -> MuxProcess {
+        parse_mux_process(pid, cmd, started).expect("器のコマンドラインを解ける")
+    }
+
+    #[test]
+    fn コマンドラインを引用符ごと語へ割る() {
+        assert_eq!(
+            split_command_line(WARM_LINE),
+            vec![
+                "tmux.exe",
+                "server",
+                "-s",
+                "__warm__",
+                "-L",
+                "tako-w1133",
+                "-x",
+                "120",
+                "-y",
+                "30"
+            ]
+        );
+        // `"` の中の空白では割らない。`\` はエスケープとして解釈しない（Windows のパス）
+        let words = split_command_line(r#"tmux.exe -L s -e "A=C:\Program Files\x" run"#);
+        assert_eq!(words[4], r"A=C:\Program Files\x");
+        assert_eq!(words[5], "run");
+    }
+
+    #[test]
+    fn issue1282_サーバーとクライアントを見分ける() {
+        let warm = mux(11, WARM_LINE, Some(1_000));
+        assert_eq!(warm.socket, "tako-w1133");
+        assert!(warm.is_server);
+        assert_eq!(warm.session.as_deref(), Some(WARM_SESSION));
+        assert!(warm.marker_pids.is_empty(), "先読み器には所有者の印が無い");
+
+        let session = mux(12, SESSION_LINE, Some(1_000));
+        assert!(session.is_server);
+        assert_eq!(session.session.as_deref(), Some("tako-123456789012"));
+        assert_eq!(
+            session.marker_pids,
+            vec![4242],
+            "隔離データ置き場から所有者が読める"
+        );
+
+        // クライアント（`-L` の値をサブコマンドと読み違えないこと）
+        let client = mux(
+            13,
+            "tmux.exe -L tako-w1133 list-sessions -F #{session_name}",
+            None,
+        );
+        assert_eq!(client.socket, "tako-w1133");
+        assert!(!client.is_server);
+
+        // `-S <パス>` はファイル名がソケット名
+        let by_path = mux(14, "tmux -S /tmp/tmux-501/tako-iso-99= list-clients", None);
+        assert_eq!(by_path.socket, "tako-iso-99");
+
+        // `-L` も `-S` も無い = tako の管理外（触らない）
+        assert!(parse_mux_process(15, "tmux.exe server", None).is_none());
+    }
+
+    #[test]
+    fn issue1282_隔離マーカーから所有pidを読む() {
+        assert_eq!(marker_owner_pids(SESSION_LINE), vec![4242]);
+        // 5 種類の置き場すべてが同じ規則（`.yaml` や `\` で語が切れる）
+        assert_eq!(
+            marker_owner_pids(
+                r"-e A=C:\t\tako-iso-sessions-777.yaml -e B=C:\t\tako-iso-pane-logs-777"
+            ),
+            vec![777]
+        );
+        // 数字が語の一部なら pid と断定しない（`owner_pid_candidates` と同じ規則）
+        assert!(marker_owner_pids("tako-iso-data-1090mac").is_empty());
+        assert!(marker_owner_pids("印は無い").is_empty());
+    }
+
+    /// 実機の形そのまま: 1 つのソケットに先読み器 + セッション器 + クライアント
+    #[test]
+    fn issue1282_ソケット単位へ畳む() {
+        let procs = vec![
+            mux(11, WARM_LINE, Some(1_000)),
+            mux(12, SESSION_LINE, Some(1_200)),
+            mux(13, "tmux.exe -L tako-w1133 list-sessions", Some(1_500)),
+        ];
+        let entries = named_server_entries(&procs, |_| false, 9_000, &[]);
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e.socket, "tako-w1133");
+        assert_eq!(e.kind, ServerKind::Named);
+        assert_eq!(e.server_pids, vec![11, 12], "クライアントは器に数えない");
+        assert_eq!(e.clients, 1);
+        assert_eq!(e.sessions, 1, "先読み器（__warm__）はセッションに数えない");
+        assert!(e.running);
+        assert_eq!(e.owner_pids, vec![4242]);
+        assert_eq!(e.owner_source, OwnerSource::CommandLine);
+        // 出来たての判定は**いちばん新しい器**（クライアントは見ない）
+        assert_eq!(e.modified_secs_ago, Some(9_000 - 1_200));
+    }
+
+    #[test]
+    fn issue1282_器が居ないソケットは返さない() {
+        let procs = vec![mux(13, "tmux.exe -L tako-iso-9 kill-server", Some(1))];
+        assert!(named_server_entries(&procs, |_| false, 9_000, &[]).is_empty());
+    }
+
+    #[test]
+    fn issue1282_起動時刻が読めない器は出来たて扱い() {
+        // 所有者が読める器で見る（所有者不明はそれより前の関門で見送られる）
+        let procs = vec![mux(
+            11,
+            "tmux.exe server -s tako-a -L tako-iso-4242 -x 80 -y 24",
+            None,
+        )];
+        let entries = named_server_entries(&procs, |_| false, 9_000, &[]);
+        assert_eq!(entries[0].modified_secs_ago, None);
+        assert_eq!(
+            judge_server(&entries[0], "tako", &[]),
+            ServerVerdict::TooFresh,
+            "材料が読めないときは触らない"
+        );
+    }
+
+    /// #1282 の本体: ソケット名に pid が埋まっていれば unix と同じ規則で回収できる
+    #[test]
+    fn issue1282_名前由来の所有者は生死で回収可否が決まる() {
+        let line = |sock: &str| format!("psmux.exe server -s tako-abc -L {sock} -x 80 -y 24");
+        let procs = vec![mux(21, &line("tako-iso-4242"), Some(1_000))];
+
+        let dead = named_server_entries(&procs, |_| false, 9_000, &[]);
+        assert_eq!(dead[0].owner_source, OwnerSource::SocketName);
+        assert_eq!(
+            judge_server(&dead[0], "tako", &[]),
+            ServerVerdict::Reclaimable { pids: vec![4242] }
+        );
+
+        let alive = named_server_entries(&procs, |pid| pid == 4242, 9_000, &[]);
+        assert_eq!(
+            judge_server(&alive[0], "tako", &[]),
+            ServerVerdict::OwnerAlive { pids: vec![4242] }
+        );
+
+        // 名前由来は tako-app が生きていても回収してよい（その名前は再利用されない）
+        let with_app = named_server_entries(&procs, |_| false, 9_000, &[777]);
+        assert_eq!(
+            judge_server(&with_app[0], "tako", &[]),
+            ServerVerdict::Reclaimable { pids: vec![4242] }
+        );
+    }
+
+    /// コマンドライン由来の所有者は**ソケット名が再利用されうる**ので、
+    /// 生きた tako-app が居る間は回収しない（再 attach された器を落とさない）
+    #[test]
+    fn issue1282_コマンドライン由来は生きたtako_appが居れば見送る() {
+        let procs = vec![mux(12, SESSION_LINE, Some(1_000))];
+
+        let alone = named_server_entries(&procs, |_| false, 9_000, &[]);
+        assert_eq!(
+            judge_server(&alone[0], "tako", &[]),
+            ServerVerdict::Reclaimable { pids: vec![4242] }
+        );
+
+        let with_app = named_server_entries(&procs, |_| false, 9_000, &[5150]);
+        assert_eq!(
+            judge_server(&with_app[0], "tako", &[]),
+            ServerVerdict::PeerMayReattach { pids: vec![5150] }
+        );
+        assert_eq!(
+            judge_server(&with_app[0], "tako", &[]).code(),
+            "peer_may_reattach"
+        );
+        assert!(!judge_server(&with_app[0], "tako", &[]).is_actionable());
+    }
+
+    /// 材料が 1 つも取れない器は**見送る**（名前にも印にも pid が無い）
+    #[test]
+    fn issue1282_所有者不明の器は消さない() {
+        let procs = vec![mux(
+            31,
+            "tmux.exe server -s tako-x -L tako-manual -x 80 -y 24",
+            Some(1),
+        )];
+        let entries = named_server_entries(&procs, |_| false, 9_000, &[]);
+        assert_eq!(entries[0].owner_source, OwnerSource::Unknown);
+        assert!(entries[0].owner_pids.is_empty());
+        assert_eq!(
+            judge_server(&entries[0], "tako", &[]),
+            ServerVerdict::OwnerUnknown
+        );
+    }
+
+    /// 使用中（クライアントが attach 中）と、自分・既定サーバーは Named でも守られる
+    #[test]
+    fn issue1282_使用中と自分の器は守られる() {
+        let procs = vec![
+            mux(
+                41,
+                "tmux.exe server -s tako-a -L tako-iso-4242 -x 80 -y 24",
+                Some(1_000),
+            ),
+            mux(
+                42,
+                "tmux.exe -L tako-iso-4242 attach -t tako-a",
+                Some(1_100),
+            ),
+        ];
+        let entries = named_server_entries(&procs, |_| false, 9_000, &[]);
+        assert_eq!(
+            judge_server(&entries[0], "tako", &[]),
+            ServerVerdict::ClientsAttached { clients: 1 }
+        );
+        // 自分の backend は名前で守られる
+        assert_eq!(
+            judge_server(&entries[0], "tako-iso-4242", &[]),
+            ServerVerdict::SelfSocket
+        );
+        // 既定サーバーも守られる
+        let default_procs = vec![mux(
+            43,
+            &format!(
+                "tmux.exe server -s tako-a -L {} -x 80 -y 24",
+                crate::tmux_backend::DEFAULT_SOCKET
+            ),
+            Some(1_000),
+        )];
+        let default_entries = named_server_entries(&default_procs, |_| false, 9_000, &[]);
+        assert_eq!(
+            judge_server(&default_entries[0], "tako-iso-1", &[]),
+            ServerVerdict::DefaultSocket
+        );
+    }
+
+    /// pid の再利用は**安全側**へ倒す: 所有 pid が生きて見えるなら（別プロセスが
+    /// その pid を取っていても）触らない。取り違えて落とすより残すほうがよい
+    #[test]
+    fn issue1282_所有pidが生きて見えるなら触らない() {
+        let procs = vec![mux(
+            51,
+            "tmux.exe server -s tako-a -L tako-iso-4242 -x 80 -y 24",
+            Some(1_000),
+        )];
+        let entries = named_server_entries(&procs, |pid| pid == 4242, 9_000, &[]);
+        assert!(!judge_server(&entries[0], "tako", &[]).is_actionable());
     }
 }

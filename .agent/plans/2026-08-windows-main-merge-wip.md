@@ -4627,3 +4627,88 @@ Get-CimInstance Win32_Process -Filter "Name='tmux.exe' OR Name='psmux.exe'" |
   素直に片付く経路まで遅くする）
 - 自然発生のハングは再現していない。効いていることの証拠は注入 A/B と、
   12 回連続で残骸が増えないことの 2 本
+
+## #1282: `tako tmux cleanup --servers` を psmux の器でも使えるようにした（2026-09-11）
+
+**実機作業の入口でこれを 1 回叩く**（#1271 の「残骸の数え方」を手で回す代わり）:
+
+```powershell
+# ① まず見るだけ（既定は dry-run）。器を名前つきで列挙し、判定理由まで返す
+tako tmux cleanup --servers
+# ② 所有者不在と判定されたものだけを pid 指定で落とす
+tako tmux cleanup --servers --apply
+```
+
+応答は unix と同じ形（`mode=servers` / `summary` / `servers[]`）で、Windows では
+1 件ごとに `kind="named"` / `server_pids` / `owner_source` が付く。
+
+### なぜ今まで 0 件だったか
+
+`cleanup_servers` は `tmux_backend::socket_dir()`（`$TMUX_TMPDIR/tmux-<uid>`）を走査して
+**ソケットファイル**を見つけ、`tmux -S <path>` で叩いていた。psmux は名前付きパイプ
+（`-L <名前>`）なので走査できるファイルが 1 つも無く、`socket_dir()` は Windows で `None`・
+`socket_answers` は `#[cfg(not(unix))]` で常に false。**実機に器が 24 個残っていても
+「0 件」と答えていた**。
+
+### 器の見つけ方（Windows）
+
+プロセスのコマンドラインから見つける。psmux のパッケージは `psmux.exe` / `tmux.exe` /
+`pmux.exe` を同じ実体で配り、**サーバーは起動したクライアントの実行ファイル名を名乗る**
+（#1271 の実測）ので 3 名すべてを数える。
+
+- コマンドラインは `NtQueryInformationProcess(ProcessCommandLineInformation)`。
+  `PROCESS_QUERY_LIMITED_INFORMATION` だけで読めるので、PEB を `ReadProcessMemory` で
+  辿る手口（bit 幅を跨ぐと壊れる）は使わない。起動時刻は `GetProcessTimes`
+  （**pid の再利用を見分ける材料**）。どちらも `platform::procinfo` の既存 FFI と同じ流儀で、
+  依存クレートは足していない
+- `-L <名前>`（無ければ `-S <パス>` のファイル名）でソケット単位へ畳み、
+  サブコマンドが `server` のものを器、それ以外をクライアントと数える。
+  先読み器（`-s __warm__`）はセッションに数えない
+
+### 所有者の決め方（**回収してよい強さが 2 段ある**）
+
+| 出どころ | 例 | 回収の条件 |
+|---|---|---|
+| `socket_name` | `-L tako-iso-<pid>` / `tako-st-<pid>` / `tako-m2test-<pid>` | その pid が死んでいれば回収（unix と同じ規則。名前は pid ごとに変わるので**誰も再利用しない**） |
+| `command_line` | `-L tako-w1133` + `-e TAKO_OSC_SINK=…\tako-iso-data-<pid>\osc\…` | その pid が死んでいて、**かつ自分以外の生きた `tako-app` が 1 つも無い**とき（手動指定のソケット名は再起動した GUI が再 attach しうる = `peer_may_reattach`） |
+| `unknown` | 名前にも印にも pid が無い | **回収しない**（`owner_unknown`） |
+
+`live_app_pids` から**自分（この操作を提供している GUI）は除く**。CLI は IPC で GUI へ
+投げるので、除かないと常に「生きた tako-app が居る」= 永久に見送りになる。
+
+### 落とし方
+
+**pid を名指しした `taskkill /PID <pid> /T /F` だけ**。`kill-server` はこの経路では使わない
+（`-L` を落とすと全ソケットの器が死に、しかも返らないことがある = #1271）。`/T` で器の中の
+pwsh ごと落とす。apply の直前にプロセス一覧を取り直し、**クライアントが 0 のまま**で
+**まだ器として生きている pid だけ**を落とす（走査から apply までの隙に attach された器と、
+pid が別プロセスへ再利用された場合を潰す）。
+
+### A/B と番犬
+
+- `TAKO_1282_LEGACY=1` で修正前（ソケットファイル走査だけ = Windows は 0 件）へ戻る。
+  **macOS は 1 ビットも変わらない**（置き場があるので常に走査の側へ行く）
+- 番犬 `crates/tako-control/tests/tmux_named_cleanup_watchdog.rs`（5 本）。
+  修正前のソースを `TAKO_1282_WATCHDOG_ROOT` に指すと **4 本が FAILED**
+  （残る 1 本は「名前一致の一括 kill が無いこと」= 修正前も満たしていて当然）
+- **FFI は CI の Windows ランナーで実行して確かめる**。`platform::procinfo` の
+  `自分のコマンドラインと起動時刻をffiで読める` / `自分のプロセスを名前で引ける` が
+  自分自身を対象に叩くので、権限を要さずランナーで走る。
+  ただし既存の `cargo test --workspace` は **tako-app の既知失敗（#583）でそこで打ち切られ
+  tako-core まで届かない**（実測 2026-09-11: `622 passed / 1 failed` で終了 =
+  以降のクレートは 1 件も走っていない）ので、`cargo test -p tako-core --lib platform::procinfo`
+  を**別ステップ（blocking）**として足した。構造体レイアウトの転記ミス・情報クラス番号・
+  `FILETIME` の起点は、macOS のクロスチェックでも純粋関数のテストでも捕まらない
+
+### 実機実測
+
+**未取得（2026-09-11 時点で Windows 実機が offline。Tailscale の最終接続は 1 日前）。**
+機が戻ったら以下を採ってこの節へ表を足し、`platform::support` の `tako_tmux_cleanup` の
+`windows_evidence` へも反映する（それまで宣言は変えない = 過大申告しない）:
+
+1. dry-run（`tako tmux cleanup --servers`）が器を名前つきで列挙し、`owner_source` /
+   `verdict` が上表どおりに出ること
+2. `--apply` の before / after で `tmux.exe` / `psmux.exe` / `pwsh.exe` の 3 つを数え、
+   **所有者不在の器だけ**が消えて生きた所有者の器が残ること
+3. 材料が取れない器が `owner_unknown` として残ること
+4. 器が 0 のとき / psmux が PATH に無いとき / 所有者 pid が再利用されているとき
