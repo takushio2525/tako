@@ -749,6 +749,9 @@ mod tests {
     /// 規約どおり「**何を待っていたか** / **実際に何が届いたか**」を必ず持つ
     #[cfg(unix)]
     struct WaitTimeout {
+        /// 診断行の見出し（CI ログを Issue 番号で grep できるようにする）。
+        /// 既定は #1252 で、呼び出し側が [`WaitTimeout::tagged`] で名乗り直す
+        tag: &'static str,
         what: String,
         observed: String,
         waited: std::time::Duration,
@@ -765,6 +768,12 @@ mod tests {
             self.observed = observed.into();
             self
         }
+
+        /// 診断行の見出しを呼び出し側の Issue 番号にする（#1265）
+        fn tagged(mut self, tag: &'static str) -> Self {
+            self.tag = tag;
+            self
+        }
     }
 
     #[cfg(unix)]
@@ -772,8 +781,9 @@ mod tests {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(
                 f,
-                "TAKO_1252_WAIT: 待っていたもの={} / 届いたもの={} \
+                "{}: 待っていたもの={} / 届いたもの={} \
                  waited={:.1}s budget={:.1}s attempts={} load={}",
+                self.tag,
                 self.what,
                 self.observed,
                 self.waited.as_secs_f64(),
@@ -812,6 +822,7 @@ mod tests {
             }
             if started.elapsed() >= budget {
                 return Err(WaitTimeout {
+                    tag: "TAKO_1252_WAIT",
                     what: what.to_string(),
                     observed: String::new(),
                     waited: started.elapsed(),
@@ -1001,6 +1012,266 @@ mod tests {
             Some("late") => format!("sleep 3; {request}"),
             _ => request.to_string(),
         }
+    }
+
+    // ── #1265: シェル統合の OSC 7 を待つ共通部品 ──────────────────────────────
+    //
+    // **なぜ固定回数の窓をやめるのか**。この下の 3 本は元々どれも
+    // `for _ in 0..100 { … sleep 100ms }` = 固定 10 秒窓で、尽きたら
+    // tako 側の画面だけを出して panic していた。そのため「打った行のエコーしか
+    // 無い」画面から先が読めず、**窓が足りないのか / 器が動いていないのか**を
+    // 区別できなかった（#1265 の最初の見立てが「窓不足」で外れたのはこのため）。
+    //
+    // 測り直しの実測（macOS / tmux 3.6b / 18 コア）:
+    //
+    // - CPU だけの人工負荷（load 11〜46）で修正前のまま 150 回 → **0 FAILED**。
+    //   OSC 7 の到達は 744〜1,171 ms（p50 858 ms・90 サンプル）で、
+    //   10 秒窓に対して **8 倍以上の余裕**がある = 窓の長さは効いていない
+    // - 元の 8/150 を採った回は `/dev/ttys*` が 404 / `kern.tty.ptmx_max` 511・
+    //   機上の tmux が 135 本という状態で、tmux **サーバー**が
+    //   `spawn_pane → forkpty → openpty` で止まっている `sample` が採れていた。
+    //   つまり真因は**機の PTY 枯渇**（テスト / 製品の欠陥ではない）
+    //
+    // 予算を伸ばしても PTY 枯渇そのものは救えない。それでも状態待ちへ寄せるのは、
+    // **次に落ちたときに原因が診断から分かる**ようにするため（規約
+    // `.agent/conventions.md`「セルフテストの待ち条件の書き方」）。予算切れでは
+    // 「待っていたもの / 届いたもの」に加えて、**器が見ているペインの状態**
+    // （`#{pane_dead}` / `#{pane_current_command}` / `#{pane_current_path}`）と
+    // シェル統合の置き場（`ZDOTDIR` と `.zshenv` のバイト数）を必ず出す。
+    //
+    // この 3 材料で候補が 1 発で割れる:
+    //
+    // | 診断 | 読み |
+    // |---|---|
+    // | `pane_current_path` が目的地 | `cd` は実行済み = **パススルー側**の不着 |
+    // | `pane_current_command` が `zsh` でない / `capture 失敗` | 器 / シェルがまだ立っていない（PTY 枯渇はここ） |
+    // | `zshenv=None` | シェル統合スクリプトが置けていない |
+
+    /// 予算切れのときに OSC 7 の不着の原因を切り分ける材料（#1265）
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct Osc7Probe {
+        /// `#{pane_dead},#{pane_current_command},#{pane_current_path}` の生の応答
+        /// （`None` = 器を呼べなかった）
+        raw: Option<String>,
+        /// 器が見ているペインの cwd。**OSC 7 とは独立に** tmux が知っている値なので、
+        /// ここが目的地なら `cd` は実行済み = 不着はパススルー側の問題
+        pane_path: String,
+        /// 器が見ている実行中コマンド（`zsh` でなければシェルがまだ立っていない）
+        pane_command: String,
+        /// ペインが死んでいるか（`#{pane_dead}`）
+        pane_dead: bool,
+        /// **セッションへ固定された** `ZDOTDIR`（`None` = 固定されていない。#1105）
+        zdotdir: Option<String>,
+        /// 器のサーバーが持つグローバルの `ZDOTDIR`（前のインスタンスから継承した値）
+        zdotdir_server: Option<String>,
+        /// 実際に効く `ZDOTDIR`（セッション優先）の `.zshenv` のバイト数。
+        /// `None` = 読めない = シェル統合が置けていない
+        zshenv: Option<u64>,
+        /// 器のペインの内容（`capture-pane`）。呼べなかったのか空なのかを区別する
+        capture: PaneCapture,
+    }
+
+    #[cfg(unix)]
+    impl Osc7Probe {
+        fn describe(&self) -> String {
+            let zshenv = self
+                .zshenv
+                .map(|n| format!("{n}B"))
+                .unwrap_or_else(|| "読めない".into());
+            // **器の画面の中身は出さない**: 内容は tako 側の画面と同じものになる一方で、
+            // ここが割れる場面（器が固まる / 死ぬ）は `capture.note` の
+            // `capture 失敗` / `bytes=0` で足りる。画面はプロンプト行に
+            // ユーザー名・ホスト名が乗るので、出す回数は 1 つに絞る（#927）
+            format!(
+                "器のペイン dead={} command={:?} path={:?} 応答={} / \
+                 ZDOTDIR セッション={:?} サーバー={:?} .zshenv={} / {}",
+                self.pane_dead,
+                self.pane_command,
+                self.pane_path,
+                self.raw.as_deref().unwrap_or("器を呼べない"),
+                self.zdotdir,
+                self.zdotdir_server,
+                zshenv,
+                self.capture.note,
+            )
+        }
+    }
+
+    /// 文字列の末尾から空でない行を最大 `n` 本（診断を 1 行に収めるため）
+    #[cfg(unix)]
+    fn tail_of(text: &str, n: usize) -> String {
+        let mut lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        if lines.len() > n {
+            lines = lines.split_off(lines.len() - n);
+        }
+        lines.join(" ⏎ ")
+    }
+
+    /// OSC 7 の不着の材料を 1 回採る（#1265）
+    #[cfg(unix)]
+    fn probe_osc7(socket: &str, session: &str) -> Osc7Probe {
+        let mut probe = Osc7Probe {
+            capture: capture_pane_text(socket, session),
+            // #1105 の核心は「セッションへ固定できたか」なので、セッションと
+            // サーバーのグローバルを**並べて**出す（片方だけでは読めない）
+            zdotdir: crate::tmux::show_environment(Some(socket), Some(session), "ZDOTDIR"),
+            zdotdir_server: crate::tmux::show_environment(Some(socket), None, "ZDOTDIR"),
+            ..Osc7Probe::default()
+        };
+        probe.zshenv = probe
+            .zdotdir
+            .as_ref()
+            .or(probe.zdotdir_server.as_ref())
+            .and_then(|d| std::fs::metadata(std::path::Path::new(d).join(".zshenv")).ok())
+            .map(|m| m.len());
+        // **区切りはカンマ**（理由は `probe_pane_mouse` と同じ。空白区切りは空欄を畳む）
+        if let Ok(out) = crate::tmux::tmux_command(Some(socket))
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                session,
+                "#{pane_dead},#{pane_current_command},#{pane_current_path}",
+            ])
+            .output()
+        {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let mut fields = text.split(',');
+                probe.pane_dead = fields.next() == Some("1");
+                probe.pane_command = fields.next().unwrap_or_default().to_string();
+                probe.pane_path = fields.next().unwrap_or_default().to_string();
+                probe.raw = Some(text);
+            } else {
+                probe.raw = Some(format!(
+                    "rc={:?} stderr={:?}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+        }
+        probe
+    }
+
+    /// 診断の採取に**期限**をつける（#1265）。
+    ///
+    /// この診断がいちばん要るのは「器が応答しない」場面（PTY 枯渇で tmux サーバーが
+    /// `openpty` で止まる）だが、`tmux` を叩く採取はどれも素の `output()` = **期限なし**
+    /// なので、そのまま呼ぶと**診断ごと固まって FAILED すら出ない**（#1271 と同じ罠）。
+    /// 期限切れそのものが「器が応答しない」という最も強い証跡なので、そう出す。
+    ///
+    /// 採取スレッドは置き去りにする（テストはこの直後に panic する = プロセスが畳まれる）
+    #[cfg(unix)]
+    fn probe_osc7_bounded(socket: &str, session: &str) -> String {
+        const BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (socket, session) = (socket.to_string(), session.to_string());
+        std::thread::spawn(move || {
+            let _ = tx.send(probe_osc7(&socket, &session).describe());
+        });
+        rx.recv_timeout(BUDGET).unwrap_or_else(|_| {
+            format!(
+                "診断の採取が {} 秒で期限切れ（器が応答しない = PTY 枯渇 / \
+                 tmux サーバーの停止が濃厚。`ls /dev/ttys* | wc -l` と \
+                 `sysctl kern.tty.ptmx_max` を比べること）",
+                BUDGET.as_secs()
+            )
+        })
+    }
+
+    /// **シェル統合の OSC 7 で cwd が `want` になるのを待つ**（#1265）。
+    ///
+    /// 待ちは状態待ち + `state_wait_budget`（混み具合で**伸ばすだけ**・4 倍で打ち切り）で、
+    /// 固定の回数上限は持たない。予算切れなら [`probe_osc7_bounded`] の材料つきで返す
+    #[cfg(unix)]
+    fn wait_osc7_cwd(
+        session: &mut crate::TerminalSession,
+        rx: &mut futures::channel::mpsc::UnboundedReceiver<crate::SessionEvent>,
+        want: &std::path::Path,
+        socket: &str,
+        session_name: &str,
+    ) -> Result<(), WaitTimeout> {
+        let outcome = wait_for_state(
+            &format!("シェル統合の OSC 7 で cwd が {} になる", want.display()),
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_millis(100),
+            || {
+                while let Ok(event) = rx.try_recv() {
+                    session.process_event(event);
+                }
+                (session.cwd() == Some(want)).then_some(())
+            },
+        );
+        // ここまで来れば待ちのクロージャは落ちている = `session` をもう一度読める
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(timeout) => {
+                let probe = probe_osc7_bounded(socket, session_name);
+                let screen = session.visible_lines().join("\n");
+                Err(timeout
+                    .tagged("TAKO_1265_WAIT")
+                    .observed(format!("{probe} / tako 側の画面={:?}", tail_of(&screen, 3))))
+            }
+        }
+    }
+
+    /// A/B: `TAKO_1265_LEGACY=1` は #1265 **前**の待ちへ戻す
+    /// （固定 100 回 × 100 ms の窓・予算なし・診断は tako 側の画面だけ）
+    #[cfg(unix)]
+    fn legacy_1265() -> bool {
+        std::env::var("TAKO_1265_LEGACY").is_ok_and(|v| v == "1")
+    }
+
+    /// 注入: 混み具合そのものは再現できないので**遅れ / 不着**を入れる（#1265）。
+    ///
+    /// - `late` = ログインシェルが最初のプロンプトへ着くのを [`INJECT_LATE_SECS`] 秒
+    ///   遅らせる（PTY 枯渇で器の起動が伸びたときと同じ形）。**旧アームは固定
+    ///   10 秒窓なので確定で FAILED**・新アームは混んだ機なら予算が伸びて通る
+    ///   （`state_wait_budget` は伸ばすだけなので、**無負荷では両アームとも
+    ///   FAILED になるのが正しい**）
+    /// - `nointegration` = シェル統合の置き場を空ディレクトリへ向けて zsh を起こす。
+    ///   OSC 7 は**永久に来ない**ので**両アームとも FAILED になるのが正しい**
+    ///   = 状態待ちが本物の回帰を隠さないことの確認。
+    ///   **`/bin/sh` へ替えるのでは無効化にならない**（実測: 統合は
+    ///   `PROMPT_COMMAND` でも届くので macOS の `/bin/sh` = bash が読んでしまう）
+    #[cfg(unix)]
+    fn inject_1265() -> Option<String> {
+        std::env::var("TAKO_1265_INJECT")
+            .ok()
+            .filter(|v| !v.is_empty())
+    }
+
+    /// `late` 注入の遅れ（旧アームの固定 10 秒窓より確実に長い）
+    #[cfg(unix)]
+    const INJECT_LATE_SECS: u32 = 12;
+
+    /// 注入を反映したログインシェルの置き場（#1265）。
+    /// 注入があるときだけ「前処理してから zsh を exec する」包みを一時ディレクトリへ置く
+    /// （包みは実行中のシェルが握っているので消せない。**注入したときだけ**
+    /// `<temp>/tako-1265-*-<pid>` が残る = 通常の実行では 1 つも作らない）
+    #[cfg(unix)]
+    fn injected_shell() -> String {
+        let prelude = match inject_1265().as_deref() {
+            Some("late") => format!("sleep {INJECT_LATE_SECS}\n"),
+            Some("nointegration") => {
+                let empty =
+                    std::env::temp_dir().join(format!("tako-1265-nozdot-{}", std::process::id()));
+                let _ = std::fs::create_dir_all(&empty);
+                format!("ZDOTDIR='{}'\nexport ZDOTDIR\n", empty.display())
+            }
+            _ => return "/bin/zsh".into(),
+        };
+        let path = std::env::temp_dir().join(format!("tako-1265-shell-{}.sh", std::process::id()));
+        let _ = std::fs::write(
+            &path,
+            format!("#!/bin/sh\n{prelude}exec /bin/zsh -i \"$@\"\n"),
+        );
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+        }
+        path.display().to_string()
     }
 
     /// #974 の判定に使う器の能力は、**器の実装そのものから採る**
@@ -1611,30 +1882,44 @@ set -gq copy-mode-position-format ''
         // ログインシェルが直接 spawn され、シェル統合が本番と同じ経路で効く
         let mut env: Vec<(String, String)> = crate::shell_integration::env().to_vec();
         env.push(("TAKO_PANE_ID".into(), "1".into()));
-        env.push(("SHELL".into(), "/bin/zsh".into()));
+        env.push(("SHELL".into(), injected_shell()));
         let options = SpawnOptions {
             command: None,
             cwd: Some("/".into()),
             env,
             scrollback_lines: None,
         };
+        let session_name = "tako-e2e-osc";
         let (mut session, mut rx) =
-            crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, "tako-e2e-osc"))
+            crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, session_name))
                 .expect("tmux クライアントを spawn できる");
         session.write(b"cd /private/tmp\r".to_vec());
-        for _ in 0..100 {
-            while let Ok(event) = rx.try_recv() {
-                session.process_event(event);
+        // TAKO_1265_LEGACY_ARM 開始（#1265 前の固定 10 秒窓を再現する A/B のアーム）
+        if legacy_1265() {
+            for _ in 0..100 {
+                while let Ok(event) = rx.try_recv() {
+                    session.process_event(event);
+                }
+                if session.cwd() == Some(std::path::Path::new("/private/tmp")) {
+                    return; // OSC 7 がパススルーで届いた
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            if session.cwd() == Some(std::path::Path::new("/private/tmp")) {
-                return; // OSC 7 がパススルーで届いた
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            panic!(
+                "OSC 7 が届かない。画面: {:?}",
+                session.visible_lines().join("\n")
+            );
         }
-        panic!(
-            "OSC 7 が届かない。画面: {:?}",
-            session.visible_lines().join("\n")
-        );
+        // TAKO_1265_LEGACY_ARM 終了
+        if let Err(e) = wait_osc7_cwd(
+            &mut session,
+            &mut rx,
+            std::path::Path::new("/private/tmp"),
+            &socket,
+            session_name,
+        ) {
+            panic!("OSC 7 が届かない。{e}");
+        }
     }
 
     /// #1105 回帰: **器のサーバーが別インスタンスのシェル統合を指している**状態でも
@@ -1680,6 +1965,11 @@ set -gq copy-mode-position-format ''
                 "120",
             ])
             .env("ZDOTDIR", &stale)
+            // `default-shell` は**サーバー起動時の環境**から決まるので、ここで
+            // 明示しないと器の中のシェルが「テストランナーの SHELL」になる。
+            // 注入（#1265 の `late` / `nointegration`）もここを通さないと
+            // このテストにだけ効かない
+            .env("SHELL", injected_shell())
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
@@ -1694,33 +1984,53 @@ set -gq copy-mode-position-format ''
             cwd: Some("/".into()),
             env: vec![
                 ("TAKO_PANE_ID".into(), "1".into()),
-                ("SHELL".into(), "/bin/zsh".into()),
+                ("SHELL".into(), injected_shell()),
             ],
             scrollback_lines: None,
         };
+        let session_name = "tako-e2e-stale";
         let (mut session, mut rx) =
-            crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, "tako-e2e-stale"))
+            crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, session_name))
                 .expect("tmux クライアントを spawn できる");
         session.write(b"cd /private/tmp\r".to_vec());
-        for _ in 0..100 {
-            while let Ok(event) = rx.try_recv() {
-                session.process_event(event);
+        // TAKO_1265_LEGACY_ARM 開始（#1265 前の固定 10 秒窓を再現する A/B のアーム）
+        if legacy_1265() {
+            for _ in 0..100 {
+                while let Ok(event) = rx.try_recv() {
+                    session.process_event(event);
+                }
+                if session.cwd() == Some(std::path::Path::new("/private/tmp")) {
+                    let _ = std::fs::remove_dir_all(&stale);
+                    return; // OSC 7 が届いた
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            if session.cwd() == Some(std::path::Path::new("/private/tmp")) {
-                let _ = std::fs::remove_dir_all(&stale);
-                return; // OSC 7 が届いた
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            let screen = session.visible_lines().join("\n");
+            let server_zdotdir = crate::tmux::show_environment(Some(&socket), None, "ZDOTDIR");
+            let session_zdotdir =
+                crate::tmux::show_environment(Some(&socket), Some(session_name), "ZDOTDIR");
+            let _ = std::fs::remove_dir_all(&stale);
+            panic!(
+                "OSC 7 が届かない（#1105）。server_zdotdir={server_zdotdir:?} \
+                 session_zdotdir={session_zdotdir:?} 画面: {screen:?}"
+            );
         }
-        let screen = session.visible_lines().join("\n");
-        let server_zdotdir = crate::tmux::show_environment(Some(&socket), None, "ZDOTDIR");
-        let session_zdotdir =
-            crate::tmux::show_environment(Some(&socket), Some("tako-e2e-stale"), "ZDOTDIR");
-        let _ = std::fs::remove_dir_all(&stale);
-        panic!(
-            "OSC 7 が届かない（#1105）。server_zdotdir={server_zdotdir:?} \
-             session_zdotdir={session_zdotdir:?} 画面: {screen:?}"
+        // TAKO_1265_LEGACY_ARM 終了
+        let outcome = wait_osc7_cwd(
+            &mut session,
+            &mut rx,
+            std::path::Path::new("/private/tmp"),
+            &socket,
+            session_name,
         );
+        // 先行サーバー用の空 ZDOTDIR は成否によらず片付ける
+        let _ = std::fs::remove_dir_all(&stale);
+        if let Err(e) = outcome {
+            // #1105 の核心（サーバーの stale な値をセッションが上書きできたか）は
+            // 診断の `ZDOTDIR セッション= / サーバー=` に出る。**ここで別途
+            // 器を叩き足さない**（器が応答しない場面で診断ごと固まるため）
+            panic!("OSC 7 が届かない（#1105）。{e}");
+        }
     }
 
     /// #1105 回帰: **ソケット名が `tako` で始まらなくても** OSC 7 が届く。
@@ -1750,27 +2060,41 @@ set -gq copy-mode-position-format ''
             cwd: Some("/".into()),
             env: vec![
                 ("TAKO_PANE_ID".into(), "1".into()),
-                ("SHELL".into(), "/bin/zsh".into()),
+                ("SHELL".into(), injected_shell()),
             ],
             scrollback_lines: None,
         };
+        let session_name = "tako-e2e-name";
         let (mut session, mut rx) =
-            crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, "tako-e2e-name"))
+            crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, session_name))
                 .expect("tmux クライアントを spawn できる");
         session.write(b"cd /private/tmp\r".to_vec());
-        for _ in 0..100 {
-            while let Ok(event) = rx.try_recv() {
-                session.process_event(event);
+        // TAKO_1265_LEGACY_ARM 開始（#1265 前の固定 10 秒窓を再現する A/B のアーム）
+        if legacy_1265() {
+            for _ in 0..100 {
+                while let Ok(event) = rx.try_recv() {
+                    session.process_event(event);
+                }
+                if session.cwd() == Some(std::path::Path::new("/private/tmp")) {
+                    return; // OSC 7 が届いた
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            if session.cwd() == Some(std::path::Path::new("/private/tmp")) {
-                return; // OSC 7 が届いた
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            panic!(
+                "OSC 7 が届かない（#1105。socket={socket} = tako で始まらない名前）。画面: {:?}",
+                session.visible_lines().join("\n")
+            );
         }
-        panic!(
-            "OSC 7 が届かない（#1105。socket={socket} = tako で始まらない名前）。画面: {:?}",
-            session.visible_lines().join("\n")
-        );
+        // TAKO_1265_LEGACY_ARM 終了
+        if let Err(e) = wait_osc7_cwd(
+            &mut session,
+            &mut rx,
+            std::path::Path::new("/private/tmp"),
+            &socket,
+            session_name,
+        ) {
+            panic!("OSC 7 が届かない（#1105。socket={socket} = tako で始まらない名前）。{e}");
+        }
     }
 
     /// マウスレポートと拡張キー（CSI u）が tmux 越しでも**生のまま**内側アプリへ届く e2e。
