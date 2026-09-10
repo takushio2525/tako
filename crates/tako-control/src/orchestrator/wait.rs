@@ -1340,15 +1340,61 @@ fn looks_like_background_items(summary: &str) -> bool {
     })
 }
 
-/// 画面の状態行が申告している「まだ生きている背景作業」の内訳（#1273）。
+/// 画面が申告している「まだ生きている背景作業」の内訳（#1273 / #1277）。
 ///
-/// 例: `✻ Worked for 1m 11s · done 2:54 PM · 1 shell, 1 monitor still running`
+/// 例（claude）: `✻ Worked for 1m 11s · done 2:54 PM · 1 shell, 1 monitor still running`
 /// → `Some("1 shell, 1 monitor")`
 ///
-/// **狭いペインでは取れない**: claude はこの行をペイン幅で `…` に切るので、
-/// suffix ごと落ちると `None` になる（#1015 と同じ制約）。取れないときは
+/// **系統は画面から見分ける**（#984 の `detect_screen_agent`）。呼び出し側が
+/// レジストリの宣言を持っているなら [`background_work_summary_for`] へ渡すほうが正確。
+///
+/// **狭いペインでは取れない**: どの CLI もこの行をペイン幅で `…` に切るので、
+/// 申告ごと落ちると `None` になる（#1015 と同じ制約）。取れないときは
 /// 呼び出し側が従来どおり一次シグナルを信じる = 安全側に倒れる
 pub fn background_work_summary(output: &str) -> Option<String> {
+    background_work_summary_for(output, detect_screen_agent(output))
+}
+
+/// 画面が申告している背景作業の内訳を、**その系統の申告の形**で読む（#1277）。
+///
+/// 申告の形は系統ごとに別物で、実採取はこの 3 つ:
+///
+/// | 系統 | 申告（実採取） | 読み取り |
+/// |---|---|---|
+/// | claude 2.1.258 | `✻ Worked for 1m 11s · done 2:54 PM · 1 shell, 1 monitor still running` | `1 shell, 1 monitor` |
+/// | codex-cli 0.154.0 | `1 background terminal running · /ps to view · /stop to close` | `1 background terminal` |
+/// | Antigravity CLI 1.2.0 | `? for shortcuts   Claude Opus 4.6 (Thinking) · 1 task(s) · /tasks` | `1 task(s)` |
+///
+/// **申告が読めても「ターンが終わった」ことにはならない**（系統差は
+/// [`declaration_implies_turn_end`]）。ここが返すのは
+/// 「画面がいま何本の背景作業を申告しているか」だけで、
+/// `worker_status` の `background_work` フィールドがそのまま使う
+pub fn background_work_summary_for(output: &str, agent: Option<Agent>) -> Option<String> {
+    background_work_summary_in(output, agent, legacy_1277())
+}
+
+/// 旧挙動かどうかを明示して読む（#1277 の A/B）。
+/// **判断を引数に置く**ので env グローバルを触らずに新旧どちらも検査できる
+pub(crate) fn background_work_summary_in(
+    output: &str,
+    agent: Option<Agent>,
+    legacy: bool,
+) -> Option<String> {
+    // 旧挙動: 系統を問わず claude の状態行だけを読む（codex / agy は常に None）
+    if legacy {
+        return claude_background_work_summary(output);
+    }
+    match agent {
+        Some(Agent::Codex) => codex_background_work_summary(output),
+        Some(Agent::Agy) => agy_background_work_summary(output),
+        // claude と**系統不明**は claude の状態行を読む（#1273 から挙動不変）。
+        // ローカル LLM（#991）は系統そのものが成立していないので同じ扱い
+        _ => claude_background_work_summary(output),
+    }
+}
+
+/// claude の状態行から内訳を読む（#1273 の実装。**挙動は変えない**）
+fn claude_background_work_summary(output: &str) -> Option<String> {
     tail_lines(output, BUSY_STRONG_TAIL)
         .iter()
         .find_map(|line| {
@@ -1358,6 +1404,110 @@ pub fn background_work_summary(output: &str) -> Option<String> {
             let summary = head.rsplit_once('·')?.1.trim();
             looks_like_background_items(summary).then(|| summary.to_string())
         })
+}
+
+/// codex / agy のフッター行を ` · ` 区切りの項目へ割る（#1277）。
+///
+/// どちらの TUI も申告を**フッターの 1 項目**として置くので、
+/// 「行のどこかに語がある」ではなく「項目そのものが申告の形か」で見られる
+/// （本文に同じ語が出ても項目にはならない = #1015 の「語で判定しない」と同じ考え）
+fn footer_items(line: &str) -> impl Iterator<Item = &str> {
+    line.split(" · ").map(str::trim)
+}
+
+/// `<数> <名詞>` の形の項目を、数が 1 以上のときだけ返す（#1277）。
+///
+/// 数を先頭に要求するのは claude 側 [`looks_like_background_items`] と同じ理由
+/// （「どこかに数がある」で通すと本文の `step 3` を拾う）。
+/// **0 は申告ではない**ので落とす（実採取では 0 本になった瞬間に項目ごと消える）
+fn counted_item(item: &str, nouns: &[&str]) -> Option<String> {
+    let (count, noun) = item.split_once(' ')?;
+    let n: u32 = count.parse().ok()?;
+    (n > 0 && nouns.contains(&noun)).then(|| item.to_string())
+}
+
+/// codex の申告を読む（実採取・codex-cli 0.154.0。#1277）。
+///
+/// ```text
+///   1 background terminal running · /ps to view · /stop to close
+/// ```
+///
+/// **生成中のフッターにも同じ項目が付く**（#120 採取の
+/// `• Working (3s • esc to interrupt) · 1 background terminal running` /
+/// #1015 採取の 100 桁 `… (1m 08s • esc to interrupt) · 1 background terminal…`）。
+/// つまりこの項目は「背景作業が在る」しか言っていないので、
+/// ターンの終了は一次シグナル（rollout の `task_complete`）に任せる。
+///
+/// 行が codex の UI 部品であることを構造で確かめる（本文の同語に当たらない）:
+/// 案内つきの独立行（`/ps`）か、走っているフッター行（`•` 始まり）のどちらか。
+/// **狭いペインでは codex が行末を `…` で切る**ので項目が壊れて `None` になる
+/// （claude と同じ制約 = 取れないときは申告なしとして扱う）
+fn codex_background_work_summary(output: &str) -> Option<String> {
+    tail_lines(output, BUSY_STRONG_TAIL)
+        .iter()
+        .find_map(|line| {
+            let is_codex_ui = line.contains("/ps") || line.trim_start().starts_with('•');
+            if !is_codex_ui {
+                return None;
+            }
+            footer_items(line).find_map(|item| {
+                let head = item.strip_suffix(" running")?;
+                counted_item(head, &["background terminal", "background terminals"])
+            })
+        })
+}
+
+/// agy の申告を読む（実採取・Antigravity CLI 1.2.0。#1277）。
+///
+/// ```text
+/// ? for shortcuts        Claude Opus 4.6 (Thinking) · 1 task(s) · /tasks
+/// ```
+///
+/// **入力欄の下の実況行**（`● [07:15:49] sleep 600 running`）は読まない:
+/// 実行中のコマンド全文が載るので、`worker_status` の応答や persist.log へ
+/// 流すと作業内容がそのまま出てしまう（#927 と同じ配慮）。
+/// フッターの件数だけで master の判断には足りる。
+///
+/// この項目もタスクが在るあいだ**常時**出る（生成中も同じ）ので、
+/// ターンの終了は一次シグナル（実況 JSONL の終端）に任せる
+fn agy_background_work_summary(output: &str) -> Option<String> {
+    tail_lines(output, BUSY_STRONG_TAIL)
+        .iter()
+        .find_map(|line| {
+            if !line.contains("/tasks") {
+                return None;
+            }
+            // 実採取は `1 task(s)`。単数・複数の別表記も構造として認める
+            // （**採ったのは `task(s)` の形だけ**なので、他は保険）
+            footer_items(line).find_map(|item| counted_item(item, &["task(s)", "task", "tasks"]))
+        })
+}
+
+/// その系統の「背景作業の申告」が**ターンの終了**まで含意するか（#1273 / #1277）。
+///
+/// claude 2.1.258 だけが `· <内訳> still running` を**ターンが終わっている行にだけ**
+/// 継ぎ足す（背景作業の完了を待って止まっているあいだは `Waiting for … to finish` に
+/// なり suffix が付かない = 実物の描画コードで確認）。だから claude では
+/// **画面の申告が一次シグナルの busy を覆す根拠になる**。
+///
+/// codex 0.154.0 / agy 1.2.0 の申告は「背景作業が在る」しか言っておらず、
+/// **生成中も同じ項目が出る**（#1277 実採取 + #120 / #1015 の採取）。
+/// これを覆す根拠に使うと、フッターが幅で切られて `screen_looks_busy` が
+/// 引けない場面で偽 idle が出る（#1015 で実際に起きた事故と同じ形）。
+///
+/// そして両系統は**そもそも覆す必要が無い**: 一次シグナル
+/// （codex = rollout の `task_complete` / agy = 実況 JSONL の終端 `PLANNER_RESPONSE`）が
+/// 背景作業が生きたままでもターン終了で idle へ落ちることを実測した（#1277）。
+/// 能力そのものは 3 系統とも `Supported`（`agent_support::MATRIX`）で、
+/// **違うのは経路だけ**という宣言がここ
+fn declaration_implies_turn_end(agent: Agent) -> bool {
+    match agent {
+        Agent::Claude => true,
+        // 一次シグナルがターン終了で idle へ落ちるので画面で覆さない（#1277 実測）
+        Agent::Codex | Agent::Agy => false,
+        // 系統そのものが成立していない（#991）
+        Agent::Local => false,
+    }
 }
 
 /// 一次シグナルが busy でも、画面が「ターンは終わっていて入力待ち・残っているのは
@@ -1402,12 +1552,18 @@ pub fn input_waiting_with_background_work_in(
     if legacy {
         return None;
     }
-    // 系統の宣言（#982）。宣言の無い系統では画面の申告の形を実物で採っていない
+    // 系統の宣言（#982）。まず能力そのもの、次に**その系統の申告の意味**を見る
     let agent = agent?;
     if !tako_core::agent_support::supports(
         agent,
         tako_core::agent_support::keys::WORKER_IDLE_WITH_BACKGROUND,
     ) {
+        return None;
+    }
+    // 画面の申告が「ターンが終わった」まで言っている系統だけが覆せる（#1277）。
+    // codex / agy は申告が状態しか言わない代わりに一次シグナルが idle へ落ちるので、
+    // ここを通さなくても能力は満たされている
+    if !declaration_implies_turn_end(agent) {
         return None;
     }
     if collapsed {
@@ -1424,7 +1580,7 @@ pub fn input_waiting_with_background_work_in(
     if !crate::claude_tui::input_content_is_empty(input) {
         return None;
     }
-    background_work_summary(output)
+    background_work_summary_for(output, Some(agent))
 }
 
 /// #1273 の A/B。`TAKO_1273_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
@@ -1432,6 +1588,13 @@ pub fn input_waiting_with_background_work_in(
 pub fn legacy_1273() -> bool {
     static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *LEGACY.get_or_init(|| std::env::var("TAKO_1273_LEGACY").map(|v| v == "1") == Ok(true))
+}
+
+/// #1277 の A/B。`TAKO_1277_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
+/// （codex / agy の申告を読まず、`background_work` が両系統で null のまま）
+pub fn legacy_1277() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_1277_LEGACY").map(|v| v == "1") == Ok(true))
 }
 
 /// 画面テキストに permission ダイアログが実在すれば、その構造化 JSON を返す（#319 / #577）。
@@ -4000,5 +4163,304 @@ Antigravity CLI requires permission to read, edit, and execute files here.
         assert!(screen_looks_busy_for("Working (3s", None));
         assert!(screen_looks_busy_for("esc to cancel", None));
         assert!(screen_looks_busy_for("esc to interrupt", None));
+    }
+}
+
+/// 背景作業の申告を系統別に読む（Issue #1277 = #1273 の横展開）。
+///
+/// **fixture は隔離 tmux 上の実 CLI からの採取**（2026-09-11。
+/// codex-cli 0.154.0 / Antigravity CLI 1.2.0）。どちらも「背景作業を残したまま
+/// ターンを終わらせる」1 ターンを実際に走らせて `capture-pane` で採り、
+/// 実パス・実ユーザー名は置換した（#927）
+#[cfg(test)]
+mod issue1277_background_declarations {
+    use super::*;
+
+    /// codex: 背景ターミナルが生きたままの入力待ち（**実採取**）。
+    /// 申告は入力欄の 1 つ上に `1 background terminal running · /ps to view · /stop to close`
+    const CODEX_IDLE_WITH_BG: &str = "\
+• You have 2 usage limit resets available. Run /usage to use one.
+
+› Start the command `sleep 600` with your exec tool and immediately yield WITHOUT waiting
+  done
+
+• done
+
+  1 background terminal running · /ps to view · /stop to close
+
+› Ask Codex to do anything
+
+  gpt-5.6-sol high · Context 96% left · weekly 5% left";
+
+    /// codex: 背景ターミナルが終了した直後（**実採取**。`sleep 600` を kill してから 2 秒で
+    /// 申告行だけが消え、`/ps` の履歴セルは残る）
+    const CODEX_IDLE_NO_BG: &str = "\
+• done
+
+/ps
+
+Background terminals
+
+  • sleep 600
+
+› Ask Codex to do anything
+
+  gpt-5.6-sol high · Context 96% left · weekly 4% left";
+
+    /// codex: 生成中でも同じ項目がフッターへ付く（#120 の実採取画面）。
+    /// **申告だけではターン終了を言えない**根拠がこれ
+    const CODEX_BUSY_WITH_BG: &str = "\
+• Working (3s • esc to interrupt) · 1 background terminal running
+› Summarize recent commits
+  gpt-5.6-sol high · /work/dir";
+
+    /// agy: 背景タスクが生きたままの入力待ち（**実採取**）。
+    /// フッター右端に `· 1 task(s) · /tasks`、入力欄の下に実況行が 1 本
+    const AGY_IDLE_WITH_BG: &str = "\
+○ Bash(sleep 600) (ctrl+o to expand)
+
+  done
+
+────────────────────────────────
+>
+────────────────────────────────
+  ● [07:15:49] sleep 600 running
+────────────────────────────────
+? for shortcuts                    Claude Opus 4.6 (Thinking) · 1 task(s) · /tasks";
+
+    /// agy: 背景タスクが終わった直後（**実採取**。タスクが 0 本になると
+    /// フッターの項目も実況行もまとめて消える）
+    const AGY_IDLE_NO_BG: &str = "\
+● Bash(sleep 600) (ctrl+o to expand)
+
+  done
+
+  sleep 600 のバックグラウンドタスクが正常終了しました（exit code 0）。
+
+────────────────────────────────
+>
+────────────────────────────────
+? for shortcuts                    Claude Opus 4.6 (Thinking)";
+
+    /// agy: 生成中（**実採取**。背景タスクの終了で起き上がった直後の画面）。
+    /// 実採取の瞬間はタスクが 0 本だったので、申告つきの生成中は
+    /// **同じ 2 つの実採取を組み合わせて**作る（下の `agy_busy_with_bg`）
+    const AGY_BUSY: &str = "\
+● Bash(sleep 600) (ctrl+o to expand)
+
+  done
+⣾  Working...
+└ Tip: Press ctrl+g to open an external editor for long prompts.
+────────────────────────────────
+>
+────────────────────────────────
+esc to cancel                      Claude Opus 4.6 (Thinking)";
+
+    /// 生成中 + 背景タスクありの画面（実採取 2 枚の合成。
+    /// フッターの申告は `AGY_IDLE_WITH_BG` から、生成中の目印は `AGY_BUSY` から）
+    fn agy_busy_with_bg() -> String {
+        AGY_BUSY.replace(
+            "esc to cancel                      Claude Opus 4.6 (Thinking)",
+            "esc to cancel                      Claude Opus 4.6 (Thinking) · 1 task(s) · /tasks",
+        )
+    }
+
+    #[test]
+    fn codexの申告を内訳として読む() {
+        assert_eq!(
+            background_work_summary_in(CODEX_IDLE_WITH_BG, Some(Agent::Codex), false),
+            Some("1 background terminal".to_string())
+        );
+        // 生成中でも同じ項目が出る = 申告は「在る」しか言っていない
+        assert_eq!(
+            background_work_summary_in(CODEX_BUSY_WITH_BG, Some(Agent::Codex), false),
+            Some("1 background terminal".to_string())
+        );
+        // 0 本に戻れば申告は消える（`/ps` の履歴セルは残るが内訳にはしない）
+        assert_eq!(
+            background_work_summary_in(CODEX_IDLE_NO_BG, Some(Agent::Codex), false),
+            None
+        );
+    }
+
+    #[test]
+    fn agyの申告を内訳として読む() {
+        assert_eq!(
+            background_work_summary_in(AGY_IDLE_WITH_BG, Some(Agent::Agy), false),
+            Some("1 task(s)".to_string())
+        );
+        assert_eq!(
+            background_work_summary_in(&agy_busy_with_bg(), Some(Agent::Agy), false),
+            Some("1 task(s)".to_string())
+        );
+        assert_eq!(
+            background_work_summary_in(AGY_IDLE_NO_BG, Some(Agent::Agy), false),
+            None
+        );
+    }
+
+    /// **実行中のコマンド全文を内訳にしない**（#927）。
+    /// agy は入力欄の下へ `● [07:15:49] sleep 600 running` を出すが、
+    /// ここを読むと作業内容が `worker_status` の応答へそのまま出る
+    #[test]
+    fn agyの実況行のコマンド名を内訳にしない() {
+        let got = background_work_summary_in(AGY_IDLE_WITH_BG, Some(Agent::Agy), false);
+        assert_eq!(got.as_deref(), Some("1 task(s)"));
+        assert!(
+            !got.unwrap().contains("sleep"),
+            "実況行のコマンド名を拾っている（診断の応答へ作業内容が漏れる）"
+        );
+    }
+
+    /// 申告が読めても**ターン終了の根拠にはしない**（#1277 の要点）。
+    /// codex / agy は一次シグナルがターン終了で idle へ落ちるので覆す必要が無く、
+    /// 覆すと幅で切られた画面で偽 idle を出す（#1015 と同じ事故）
+    #[test]
+    fn codexとagyの申告では一次シグナルのbusyを覆さない() {
+        for (label, screen, agent) in [
+            ("codex", CODEX_IDLE_WITH_BG, Agent::Codex),
+            ("agy", AGY_IDLE_WITH_BG, Agent::Agy),
+        ] {
+            assert_eq!(
+                input_waiting_with_background_work_in(screen, false, Some(agent), false),
+                None,
+                "{label}: 申告を覆す根拠に使っている"
+            );
+        }
+        // claude は従来どおり覆せる（回帰していないこと）
+        let claude = "✻ Worked for 1m 11s · done 2:54 PM · 1 shell, 1 monitor still running\n❯ \n";
+        assert_eq!(
+            input_waiting_with_background_work_in(claude, false, Some(Agent::Claude), false),
+            Some("1 shell, 1 monitor".to_string())
+        );
+    }
+
+    /// 実採取の 3 状態（申告あり / 生成中 / 0 本）で**画面の busy 判定が変わらない**こと。
+    /// ここが崩れると一次シグナルの idle が画面で busy へ覆され、
+    /// 背景作業が残るあいだ worker が完了しなくなる（#1273 の症状の逆流）
+    #[test]
+    fn 申告があっても画面はbusyに見えない() {
+        for (label, screen) in [
+            ("codex 申告あり", CODEX_IDLE_WITH_BG),
+            ("codex 0 本", CODEX_IDLE_NO_BG),
+            ("agy 申告あり", AGY_IDLE_WITH_BG),
+            ("agy 0 本", AGY_IDLE_NO_BG),
+        ] {
+            assert!(
+                !screen_looks_busy(screen),
+                "{label}: 申告を busy マーカーと読んでいる（一次シグナルの idle が覆る）"
+            );
+            assert!(screen_looks_idle(screen), "{label}: 入力欄を拾えていない");
+        }
+        // 生成中は従来どおり busy（申告があっても優先順位 1 が先に止める）
+        assert!(screen_looks_busy(CODEX_BUSY_WITH_BG));
+        assert!(screen_looks_busy(&agy_busy_with_bg()));
+    }
+
+    /// 折りたたみ表示では画面を根拠にしない（#224 / #1273 の優先順位 2）。
+    /// codex / agy はそもそも覆さないので、折りたたみでも結果は同じ = None
+    #[test]
+    fn 折りたたみでも判定は変わらない() {
+        for (label, screen, agent) in [
+            ("codex", CODEX_IDLE_WITH_BG, Agent::Codex),
+            ("agy", AGY_IDLE_WITH_BG, Agent::Agy),
+        ] {
+            assert_eq!(
+                input_waiting_with_background_work_in(screen, true, Some(agent), false),
+                None,
+                "{label}: 折りたたみで判定が変わった"
+            );
+        }
+    }
+
+    /// 系統を渡さない経路は claude の状態行を読む（#1273 から挙動不変）。
+    /// codex / agy の画面は claude の語彙を持たないので `None`
+    #[test]
+    fn 系統不明なら従来どおりclaudeの状態行だけを読む() {
+        assert_eq!(
+            background_work_summary_in(CODEX_IDLE_WITH_BG, None, false),
+            None
+        );
+        assert_eq!(
+            background_work_summary_in(AGY_IDLE_WITH_BG, None, false),
+            None
+        );
+    }
+
+    /// 画面から系統を見分ける経路（`background_work_summary` の 1 引数版）でも読めること。
+    /// dispatch はレジストリの宣言を優先するが、宣言が無い worker はこの経路を通る
+    #[test]
+    fn 画面から系統を見分けても読める() {
+        assert_eq!(detect_screen_agent(CODEX_IDLE_WITH_BG), Some(Agent::Codex));
+        assert_eq!(detect_screen_agent(AGY_IDLE_WITH_BG), Some(Agent::Agy));
+        assert_eq!(
+            background_work_summary(CODEX_IDLE_WITH_BG),
+            Some("1 background terminal".to_string())
+        );
+        assert_eq!(
+            background_work_summary(AGY_IDLE_WITH_BG),
+            Some("1 task(s)".to_string())
+        );
+    }
+
+    /// A/B（`TAKO_1277_LEGACY=1` 相当）: 旧挙動では codex / agy の申告を読まない。
+    /// **同一バイナリのまま**旧挙動が再現できることを固定する
+    #[test]
+    fn 旧挙動では両系統の申告を読まない() {
+        assert_eq!(
+            background_work_summary_in(CODEX_IDLE_WITH_BG, Some(Agent::Codex), true),
+            None,
+            "legacy で codex の申告を読んでいる"
+        );
+        assert_eq!(
+            background_work_summary_in(AGY_IDLE_WITH_BG, Some(Agent::Agy), true),
+            None,
+            "legacy で agy の申告を読んでいる"
+        );
+        // claude は legacy でも読める（#1273 の腕は #1277 の A/B の対象外）
+        let claude = "✻ Worked for 12s · done 2:54 PM · 2 shells still running\n❯ \n";
+        assert_eq!(
+            background_work_summary_in(claude, Some(Agent::Claude), true),
+            Some("2 shells".to_string())
+        );
+    }
+
+    /// 本文にたまたま同じ語が出ても内訳にしない（#1015 の「語で判定しない」）。
+    /// 申告は**フッターの項目**なので、行が UI 部品であることまで見る
+    #[test]
+    fn 本文の同語を申告と読まない() {
+        // ① 項目の形になっていない（文の途中に語がある）
+        let codex_prose = "\
+• I left 1 background terminal running for you, as requested.
+› Ask Codex to do anything
+  gpt-5.6-sol high · Context 96% left";
+        assert_eq!(
+            background_work_summary_in(codex_prose, Some(Agent::Codex), false),
+            None,
+            "本文の `1 background terminal running` を項目として読んでいる"
+        );
+        // ② 項目の形そのものが本文の 1 行として出た（agent が申告を書き写した）。
+        // **UI 部品の行だけを見る**ので拾わない
+        let codex_echo = "\
+⏺ Status:
+1 background terminal running
+› Ask Codex to do anything
+  gpt-5.6-sol high · Context 96% left";
+        assert_eq!(
+            background_work_summary_in(codex_echo, Some(Agent::Codex), false),
+            None,
+            "本文が書き写した申告を UI の申告と読んでいる（`/ps` も `•` も無い行）"
+        );
+        let agy_prose = "\
+  There are 2 tasks left in the queue.
+────────────────────────────────
+>
+────────────────────────────────
+? for shortcuts                    Claude Opus 4.6 (Thinking)";
+        assert_eq!(
+            background_work_summary_in(agy_prose, Some(Agent::Agy), false),
+            None,
+            "本文の `2 tasks` を項目として読んでいる"
+        );
     }
 }
