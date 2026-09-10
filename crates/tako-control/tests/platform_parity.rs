@@ -1345,11 +1345,16 @@ fn collect_unguarded_spawns(
         let lines: Vec<&str> = text.lines().collect();
         let is_comment = |l: &str| l.trim_start().starts_with("//");
 
-        // 抑止呼び出しの行番号（コメント中の言及は数えない）
+        // 抑止呼び出しの行番号（コメント中の言及は数えない）。
+        // `agent_probe::run` は抑止を**内側で一度だけ**当てる正本（#1261）なので、
+        // 直呼びと同じく「抑止済み」として数える。中身が抑止を通していることは
+        // `verification_isolation_watchdog::問い合わせの門番はテストプロセスを実行時に見分ける`
+        // が別途拘束する
+        let is_guard = |l: &str| l.contains("no_console_window") || l.contains("agent_probe::run");
         let mut guards: Vec<(usize, bool)> = lines
             .iter()
             .enumerate()
-            .filter(|(_, l)| l.contains("no_console_window") && !is_comment(l))
+            .filter(|(_, l)| is_guard(l) && !is_comment(l))
             .map(|(i, _)| (i, false))
             .collect();
 

@@ -432,13 +432,13 @@ pub fn auth_probe_argv(agent: AgentKind) -> &'static [&'static str] {
 /// claude だけ exit code では判断できない（未ログインでも 0 を返しうるので
 /// `loggedIn` を見る）。他の 2 系統は exit code が判定そのもの
 pub fn is_authenticated_for(agent: AgentKind, binary: &str) -> bool {
-    let Some(output) =
-        tako_core::platform::process::no_console_window(&mut std::process::Command::new(binary))
+    // #1261: 問い合わせの起動は正本の門番を通す。テストプロセスでは 1 つも起こさない
+    // （実 CLI は起動しただけで `~/.gemini` / `~/.codex/tmp` / `~/.claude.json` を作る）
+    let Some(output) = crate::agent_probe::run(
+        std::process::Command::new(binary)
             .args(auth_probe_argv(agent))
-            .stdin(std::process::Stdio::null())
-            .output()
-            .ok()
-    else {
+            .stdin(std::process::Stdio::null()),
+    ) else {
         return false;
     };
     if !output.status.success() {

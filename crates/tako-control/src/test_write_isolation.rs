@@ -34,6 +34,10 @@ mod tests {
     const CHILD_TEST: &str =
         "test_write_isolation::tests::子プロセス_本番相当の書き込みを一通り行う";
 
+    /// 子が「エージェント CLI を何個解決できたか」を親へ渡す目印（#1261）。
+    /// **パスは載せない**（public リポなので実ホームパスを出さない。#927）
+    const RESOLVED_MARKER: &str = "TAKO_1261_RESOLVED=";
+
     /// 子に**実シェルを起こさせる**ときの目印（#1253）
     const SHELL_PROBE_ENV: &str = "TAKO_1253_SHELL_PROBE";
 
@@ -59,7 +63,10 @@ mod tests {
     ) -> (bool, String, Vec<String>) {
         let exe = std::env::current_exe().expect("テストバイナリのパス");
         let mut cmd = std::process::Command::new(&exe);
-        cmd.args(["--exact", CHILD_TEST, "--test-threads=1"])
+        // `--nocapture`: 子が自分の観測（[`RESOLVED_MARKER`]）を親へ渡す唯一の口。
+        // libtest は既定で子テストの標準出力を飲み込むので、これが無いと親は
+        // 「子が CLI を解決できたのか」を知れない
+        cmd.args(["--exact", CHILD_TEST, "--test-threads=1", "--nocapture"])
             .env(CHILD_ENV, "1")
             // 空の HOME。unix / Windows の両方の解決元を差し替える
             .env("HOME", fake_home)
@@ -182,7 +189,29 @@ mod tests {
         //    claude 本体が ~/.claude.json を書き戻して ~/.claude/backups/ を積む）
         let _ = crate::agents::list_agents();
 
-        // 7. ペインのシェル（#1253）。**名指しされたときだけ**動かす:
+        // 7. エージェント CLI への問い合わせ（#1261）。本番なら**実 CLI が起動**し、
+        //    tako が 1 バイトも書かなくても CLI 自身が自分のホームを作る（実測:
+        //    agy = `~/.gemini` 32 ファイル / codex = `~/.codex/tmp/arg0/…/.lock` /
+        //    claude = `~/.claude.json` と `~/.claude/backups/`）
+        let states = crate::setup_bootstrap::status_all();
+        // 解決できた数 = `is_authenticated_for` が実 CLI を起こしうる系統の数。
+        // 親の PATH で数えると食い違う（`exe::find` は unix ではログインシェル経由なので、
+        // **子の空 HOME では rc が無く `~/.local/bin` が PATH に入らない**）
+        let resolved = states
+            .iter()
+            .filter(|(_, state)| state.as_ref().is_ok_and(|s| s.binary.is_some()))
+            .count();
+        println!("{RESOLVED_MARKER}{resolved}");
+        let _ = crate::stale_binary::check_stale(&crate::stale_binary::PaneClaudeInfo {
+            spawned_binary: PathBuf::from("/fake/old/claude-cli-2.1.218/claude"),
+            pid: None,
+            dismissed: false,
+        });
+        // モデル一覧は `agent_cli::locate` が cfg(test) で存在しないパスへ倒すので
+        // 現状ここから実 CLI へは届かないが、その stub が外れたときに素通りしないよう通す
+        let _ = crate::agent_models::catalog_all();
+
+        // 8. ペインのシェル（#1253）。**名指しされたときだけ**動かす:
         //    実シェルを起こすので、0 ファイルを見る他の親テストの前提を壊さない
         #[cfg(unix)]
         if std::env::var_os(SHELL_PROBE_ENV).is_some() {
@@ -389,6 +418,71 @@ mod tests {
                 std::env::var("SHELL").unwrap_or_default()
             );
         }
+    }
+
+    /// #1261: **テストプロセスは実 claude / codex / agy を起こさない**。
+    ///
+    /// tako 側が 1 バイトも書かなくても、実 CLI は起動しただけで自分のホームを作る
+    /// （実測: 空 HOME で `cargo test --workspace` → `~/.gemini` 32 ファイル /
+    /// `~/.codex/tmp/arg0/…/.lock` / `~/.claude/backups/`）。上の「何も書かない」番犬でも
+    /// 0 件で落ちるが、こちらは**CLI だけが作るファイル**を名指しで押さえるので、
+    /// 落ちたときに「tako が書いた」のか「CLI を起こした」のかが分かる
+    #[test]
+    fn テストプロセスは実エージェントcliを起こさない() {
+        // tako 自身の `ensure_trusted` が書く設定ファイル
+        // （`.gemini/antigravity-cli/settings.json` / `.codex/config.toml` / `.claude.json`）
+        // とは別物 —— これらは**CLI 本体しか作らない**
+        let cli_made = |created: &[String]| -> Vec<String> {
+            created
+                .iter()
+                .filter(|f| {
+                    (f.starts_with(".gemini/") && !f.ends_with("antigravity-cli/settings.json"))
+                        || f.starts_with(".codex/tmp/")
+                        || f.starts_with(".claude/backups/")
+                })
+                .cloned()
+                .collect()
+        };
+
+        let home = scratch("agentcli");
+        let (ok, stdout, created) = run_child(&home, None, false);
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(ok, "子テストが失敗した\n{stdout}");
+        assert!(
+            cli_made(&created).is_empty(),
+            "テストプロセスが実エージェント CLI を起こした（#1261）: {:#?}",
+            cli_made(&created)
+        );
+
+        // A/B: 隔離を切ると同じ子が実 CLI を起こし、CLI が自分のホームを作る。
+        // CLI が入っていない機械（CI）では実証できないので、そのときは明示して落とさない。
+        // 判断材料は**子自身の報告**（親の PATH で数えると、子の空 HOME では
+        // ログインシェルが `~/.local/bin` を PATH へ入れないので食い違う）
+        let home = scratch("agentcli-legacy");
+        let (ok, stdout, created) = run_child(&home, None, true);
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(ok, "子テストが失敗した\n{stdout}");
+        // `--nocapture` の libtest は `test <名前> ... ` を**改行せずに**出すので、
+        // 子の 1 行目はその後ろへ連結される。行頭ではなく**部分一致**で拾う
+        let resolved: usize = stdout
+            .split(RESOLVED_MARKER)
+            .nth(1)
+            .map(|rest| {
+                rest.chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+            })
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("子が解決数を報告していない\n{stdout}"));
+        if resolved == 0 {
+            eprintln!("skip(A/B のみ): 子から claude / codex / agy をどれも解決できない");
+            return;
+        }
+        assert!(
+            !cli_made(&created).is_empty(),
+            "旧挙動でも実 CLI の痕跡が出ない（検出力が無い）。\
+             子が解決できた系統: {resolved} / 出来たもの: {created:#?}"
+        );
     }
 
     /// data dir の隔離が**明示の `TAKO_DATA_DIR` を上書きしない**こと（受け入れ条件のエッジ）。

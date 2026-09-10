@@ -610,13 +610,9 @@ pub fn catalog(agent: WorkerAgent) -> ModelCatalog {
         agent,
         agent_cli::locate,
         |path, args| {
-            // #586: dispatch（GUI 内）からも呼ばれるのでコンソール窓を出さない
-            let output = tako_core::platform::process::no_console_window(
-                &mut std::process::Command::new(path),
-            )
-            .args(args)
-            .output()
-            .ok()?;
+            // #1261: 問い合わせの起動は正本の門番を通す（#586 のコンソール窓抑止もそこで当たる）。
+            // テストプロセスでは実 codex / agy を起こさない
+            let output = crate::agent_probe::run(std::process::Command::new(path).args(args))?;
             Some(CommandRun {
                 success: output.status.success(),
                 stdout: String::from_utf8_lossy(&output.stdout).to_string(),

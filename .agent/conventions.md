@@ -1108,6 +1108,10 @@ Dock のピン留めは `.app` への **file URL ブックマーク**（`com.app
   `~/.claude.json` を書き戻して `~/.claude/backups/` を積むので、単体テストからは起こさない
   （実 CLI を通す検証は統合テスト側 = 非テストビルドの lib を束ねる方が担う）。
   テストが `pwsh` 等を起こすときは `XDG_CACHE_HOME` / `LOCALAPPDATA` を一時 dir へ向ける
+- **エージェント CLI への問い合わせは `tako_control::agent_probe::run` の 1 か所を通す**（#1261）。
+  tako が 1 バイトも書かなくても、実 CLI は**起動しただけで自分のホームを作る**（空 HOME の実測:
+  agy = `~/.gemini` 32 ファイル / codex = `~/.codex/tmp/arg0/…/.lock` / claude = `~/.claude.json`）。
+  判定は実行時（`paths::is_test_process`）で、#586 のコンソール窓抑止もこの 1 か所が当てる
 
 - 番犬は `tako_control::test_write_isolation`（lib の**単体**テスト。`cfg(test)` の隔離を
   見るので統合テストには置けない）。**空の `HOME` で子プロセスを起こし、そこに

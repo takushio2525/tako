@@ -212,21 +212,20 @@ fn version_from_segments(segments: &[String]) -> Option<String> {
 }
 
 fn extract_version_via_cli(binary: &Path) -> String {
-    // #586: GUI プロセスから到達するのでコンソールウィンドウを出させない
-    tako_core::platform::process::no_console_window(
-        std::process::Command::new(binary).arg("--version"),
-    )
-    .output()
-    .ok()
-    .filter(|o| o.status.success())
-    .and_then(|o| {
-        let text = String::from_utf8_lossy(&o.stdout).to_string();
-        // "claude v2.1.220" 形式
-        text.split_whitespace()
-            .find(|w| w.starts_with('v') || w.chars().next().is_some_and(|c| c.is_ascii_digit()))
-            .map(|w| w.trim_start_matches('v').to_string())
-    })
-    .unwrap_or_default()
+    // #1261: 問い合わせの起動は正本の門番を通す（#586 のコンソール窓抑止もそこで当たる）。
+    // テストプロセスでは実 claude を起こさない = 版は空文字（版が取れない環境と同じ経路）
+    crate::agent_probe::run(std::process::Command::new(binary).arg("--version"))
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let text = String::from_utf8_lossy(&o.stdout).to_string();
+            // "claude v2.1.220" 形式
+            text.split_whitespace()
+                .find(|w| {
+                    w.starts_with('v') || w.chars().next().is_some_and(|c| c.is_ascii_digit())
+                })
+                .map(|w| w.trim_start_matches('v').to_string())
+        })
+        .unwrap_or_default()
 }
 
 /// 稼働中プロセスのバイナリパスを取得する。
