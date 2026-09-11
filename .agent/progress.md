@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-12（#1406: 脅威モデルの「別 OS ユーザーの到達は消滅した」を現行の既定へ揃えた）
-- #1038 でループバック TCP が既定になったのに「残存リスク」節（`:249`）と「listen 範囲」節（`:87`）が UDS 前提のままだった。実測（`parse_endpoint_spec(None)` = Loopback / 本番 `endpoint_kind: loopback-tcp`）で確定させ、受容するリスクとして書き直した（Windows は `unix_supported()` = false で opt-in が無いことも明記）
-- 番犬 `issue1406_threat_model_endpoint_watchdog` 5 本が**コードの既定 ↔ 文書**を双方向で縛る。注入 A/B: 旧記述を戻すと `:87` / `:249` を名指しで FAILED、コードの既定を UDS へ反転すると `local_endpoint.rs:8` と `:83` を名指しで FAILED
-- #841 を Windows 限定から「ループバック TCP を使う全プラットフォーム」へ広げた（表題 + 本文追記）。docs + テストのみなので install 不要
-
 ## 2026-09-12（#1401: remote stop の stale 経路にも PID の正体確認を通した）
 - #329 の fail-safe が stale 経路（PID ファイル無し → `/api/health` の pid を撃つ）に無かった。確認を `kill_stale_daemon` の**内側**へ移して結果型にし（呼び出し側で忘れられない形）、`ps` 出力が**空**のときも「確認できない = 撃たない」へ倒した（判定は `ps_args_is_tako_remote_serve` の 1 実装）。中止時は state を残し理由 + 手順を返す
 - 修正前の実測（隔離 state・偽 health + 使い捨て `/bin/sleep`）: 実 CLI が sleep を殺して `{"stopped":true}` を返す / health が停止操作プロセス自身の pid を返す形ではテストバイナリが `signal: 15` で落ちた。修正後は sleep 生存・exit=1・state 残存
@@ -59,3 +54,8 @@
 - 項目 18 / 19 / 21 / 23〜28 / 47 / 47b / 50 / 51b / 66b / 73c / 73f を `wait_for_cli_state`（`wait_for_app_state` + `cli_state_budget` の 1 実装。A/B の口・注入・診断行 `TAKO_SELF_TEST_1375` をここへ集約）へ寄せ、`KNOWN_FIXED_CLI_WAITS` を空にした。分割して新ペインを操作する 4 件は `split_focus_new_pane` で「着地 → アイドル」の 2 段に割り、以降は**返ったペイン ID** を見る（旧 73f は**打ったあとに**分割前のフォーカスを読んでいたので、着地が先だと窓を使い切るまで真にならない = 待ちを伸ばしても直らない形）
 - 実測（隔離 GUI・tako-vd）: `INJECT=late` 全項目で 17 か所とも `ok=true`（`waited` = 旧予算 + 5 秒）で完走 / `LEGACY=all` は旧の固定予算（0.8〜15.0s）を再現して完走 / 項目ごとの `LEGACY+late` は **17/17 FAILED**（73f は Issue が観測した `73f: split で新ペインへフォーカスが移らない` そのまま）/ `never` は新経路でも **16/16 FAILED**。高負荷 3 回（load 6.5〜8.4）と load 10〜37 は完走、load 65〜80 の人工負荷では 73c が 4 倍上限（80 秒）を使い切って FAILED = 上限の政策どおり
 - 予算の不等式は手書きの表をやめ**ソースから採った 21 か所**を検査（`cli_wait_budgets`）。番犬は空リストで緑
+
+## 2026-09-12（#1397: 器なし（tmux 無し / persist OFF）でもチャットビューが立つようにした）
+- 原因は 3 つ重なっていた: ①列挙が `backend_sessions` 起点 ②live 解決のキーが器のセッション名だけ ③**判定表が alt screen をチャットより先に見る**（器なしでは claude の TUI 自身が alt screen = Issue に無かった 3 つ目）。キーを `agents::LiveSessionKey`（器あり = セッション名 / 器なし = (ペイン ID, PTY 直下の子 pid)）へ広げ、列挙を `terminals` 起点に、表を「チャット確定 → alt screen」へ
+- 隔離 GUI（tako-vd・tmux サーバー無し・persist OFF）の A/B: 新 = `pane_display=chat`（`alt_screen:true` / `claude_chat:true`）で実会話も読める。legacy（`TAKO_1397_LEGACY=1`）は実 claude TUI が生きたまま 21 サンプル（約 105 秒）すべて `terminal`。器あり（persist ON）と混在は前後どちらも `chat` で不変
+- 番犬 9 本 + 単体 8 本（注入 7 通りで file:line 名指し）。波及で **#853 の fixture 保護が器の有無を問わず必須**になり、旧順序を固定していた項目 94 の alt screen 節（#702）を新規則へ寄せた（`main.rs` は 9 行）。隔離セルフテスト完走・legacy では項目 94 が落ちる

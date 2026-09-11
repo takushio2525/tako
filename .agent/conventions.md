@@ -1002,15 +1002,15 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
   （`render` がテキスト領域を測ってから `session.resize`）ので、その回のフレームは
   resize **前**の画面を塗って終わる = 「27 行あるのに 20 行しか塗られていない」。
   行数を変える検査は `settle_inked_rows`（状態待ち → notify → 2 枚描く）を通す
-- **注入した fixture は `pin_chat_fixture` で守る**（#853 の機構・#1173 で踏んだ）。
-  会話の定期読み取り（`collect_chat_targets`）は **`backend_sessions` = 器つきペイン
-  だけ**を対象にするので、persist OFF では誰も読みに来ず fixture が生き残り、
-  persist ON では「実 claude ではない」と正しく判定されて消える。
-  **器の有無で通ったり落ちたりする検査**はこれを疑う。
-  #1367 で `agent_running` の**判定**は器なしペインでも真になるようになったが、
-  **列挙**（この `backend_sessions` 起点）は器つきのままなので、器なし構成では
-  チャットビューそのものが立ち上がらない状態は続いている（live 解決が器の
-  セッション名をキーにしているため。器なしへ広げるのは別 Issue）
+- **注入した fixture は `pin_chat_fixture` で守る**（#853 の機構・#1173 で踏んだ・
+  **#1397 以降は器の有無を問わず必須**）。会話の定期読み取り（`collect_chat_targets`）は
+  「実 claude が動いていないペイン」を正しく «チャットではない» と判定して
+  `chat_panes` から落とすので、GUI モードで 2 秒 tick を跨ぐ検査は注入した会話を
+  失う。**#1397 までは persist OFF だけが偶然守られていた**（列挙が
+  `backend_sessions` 起点で、器の無いペインは 1 件も対象にならなかった）。
+  #1397 で列挙を `terminals` 起点へ広げた = **器なしでも読みに来る**ので、
+  「persist OFF なら pin 無しで通る」は**もう成り立たない**。
+  **器の有無で通ったり落ちたりする検査**はこれを疑う
 
 - **器（tmux）と外のプロセスの往復を固定窓で待たない**（#1180）。相手が別プロセス
   （tmux サーバー / attach クライアント / CLI + IPC / webview の ipc）の往復である

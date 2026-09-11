@@ -175,6 +175,17 @@ impl PaneDisplayInput {
     }
 }
 
+/// #1397 の A/B。`TAKO_1397_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す。
+///
+/// 旧挙動 = ①判定表が alt screen をチャットより先に見る ②チャット対象の列挙が
+/// 器のセッション（`backend_sessions`）起点 ③live 解決が器のセッション名キーだけ。
+/// 器を持たないペイン（tmux 未導入 / persist OFF = Homebrew cask の既定構成）では
+/// この 3 つが重なって**チャットビューが 1 度も立たない**（= #1397）
+pub fn legacy_1397() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_1397_LEGACY").map(|v| v == "1") == Ok(true))
+}
+
 /// ペイン表示の決定（判定表を上から先勝ちで評価する）。
 ///
 /// **保守的に倒す**のが原則: 置き換えるのは確信がある場合だけで、
@@ -185,16 +196,36 @@ impl PaneDisplayInput {
 /// 映って消える（direnv のロードログやプロンプトのちらつき）。確定するまでの
 /// 上限つきの猶予を `settle` で与え、その間は準備中プレースホルダで覆う
 pub fn pane_display(input: PaneDisplayInput) -> PaneDisplay {
+    pane_display_in(input, legacy_1397())
+}
+
+/// 判定表の本体（A/B のため旧挙動を引数で受ける。#1397）。
+///
+/// `legacy_alt_screen_first` が真なら alt screen をチャットより先に見る = #1397 前の挙動
+pub fn pane_display_in(input: PaneDisplayInput, legacy_alt_screen_first: bool) -> PaneDisplay {
     if !input.mode.is_gui() {
         return PaneDisplay::Terminal;
     }
-    // 「コマンド入力へ」で明示的にターミナルにしたペインと alt screen TUI は
-    // 過渡期より優先して即ターミナル（待たせる理由が無い / 覆っても中身を描けない）
-    if input.released || input.alt_screen {
+    // 「コマンド入力へ」で明示的にターミナルにしたペインは過渡期より優先して即ターミナル
+    if input.released {
         return PaneDisplay::Terminal;
     }
+    if legacy_alt_screen_first && input.alt_screen {
+        return PaneDisplay::Terminal;
+    }
+    // **チャット確定は alt screen より先**（#1397）。alt screen の材料は
+    // 「覆ってはいけない全画面 TUI」を指すが、**器を持たないペインでは claude の
+    // 対話 TUI 自身が alt screen を使う**（実測: tmux 未導入 / persist OFF の
+    // GUI モードで `alt_screen=true`）。ここで alt screen を先に見ると、覆う対象
+    // そのものを理由にチャットを拒否して永久にターミナル表示になる。
+    // 器ありは `pane_inner_alt_screen` が常に false を返すので**結果は不変**
+    // （器つき経路の回帰は構造的に起こらない）
     if input.claude_chat {
         return PaneDisplay::Chat;
+    }
+    // claude のチャットでない全画面 TUI（vim 等）は覆っても中身を描けないのでターミナル
+    if input.alt_screen {
+        return PaneDisplay::Terminal;
     }
     if input.is_idle_shell() {
         return PaneDisplay::Starter;
@@ -540,13 +571,45 @@ mod tests {
     }
 
     #[test]
-    fn alt_screenはチャットより優先してターミナル表示() {
+    fn claude確定ペインはalt_screenでもチャット() {
+        // #1397: 器を持たないペインでは claude の対話 TUI 自身が alt screen を使う
+        // （実測: tmux 未導入 / persist OFF の GUI モードで `alt_screen=true`）。
+        // alt screen を先に見ると覆う対象そのものを理由にチャットを拒否する
         let input = PaneDisplayInput {
             alt_screen: true,
             claude_chat: true,
             ..gui_idle()
         };
-        assert_eq!(pane_display(input), PaneDisplay::Terminal);
+        assert_eq!(pane_display_in(input, false), PaneDisplay::Chat);
+        // A/B: 旧挙動（alt screen が先勝ち）では永久にターミナル表示
+        assert_eq!(pane_display_in(input, true), PaneDisplay::Terminal);
+    }
+
+    #[test]
+    fn claudeでないalt_screen_tuiはターミナル表示() {
+        // vim 等（チャット確定していない全画面 TUI）は覆っても中身を描けない
+        let input = PaneDisplayInput {
+            alt_screen: true,
+            state: CommandState::Running,
+            busy_children: true,
+            ..gui_idle()
+        };
+        assert_eq!(pane_display_in(input, false), PaneDisplay::Terminal);
+        assert_eq!(terminal_reason(input), Some(TerminalReason::AltScreen));
+    }
+
+    #[test]
+    fn 揮発解除はチャット確定より先勝ち() {
+        // 「コマンド入力へ」で外したペインは alt screen / チャットより優先（#1397 で
+        // 順序を入れ替えたときに released が後ろへ回らないことを固定する）
+        let input = PaneDisplayInput {
+            released: true,
+            alt_screen: true,
+            claude_chat: true,
+            ..gui_idle()
+        };
+        assert_eq!(pane_display_in(input, false), PaneDisplay::Terminal);
+        assert_eq!(terminal_reason(input), Some(TerminalReason::Released));
     }
 
     #[test]

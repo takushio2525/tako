@@ -3771,8 +3771,9 @@ const CHAT_FOLLOW_EPSILON: f32 = 8.0;
 /// `visible_lines()` で足りる。ここで tmux を叩くと 2 秒ごとの UI 専有になる（#212 の教訓）
 pub(crate) struct ChatRefreshTarget {
     pane: PaneId,
-    /// tmux バックエンドセッション名（live 解決の対応キー）
-    backend: String,
+    /// live 解決の対応キー（#1397）。器あり = 器のセッション名 /
+    /// 器なし = (tako のペイン ID, PTY 直下の子 pid)
+    key: tako_control::agents::LiveSessionKey,
     /// このペインに実行中の子プロセスがある（= claude が生きている。#372 の判定を流用）
     agent_running: bool,
     read_only: bool,
@@ -3843,31 +3844,52 @@ impl TakoApp {
             .flat_map(|t| t.tree().panes())
             .map(|p| (p.id(), p.role().map(|r| r.to_string())))
             .collect();
-        self.backend_sessions
+        // #1397: 列挙の起点は **`terminals`（全ペイン）**。`backend_sessions` 起点だと
+        // 器を持たないペイン（tmux 未導入 / persist OFF = Homebrew cask の既定構成）は
+        // 1 件も載らず、チャットビューが 1 度も立たない
+        let legacy = tako_core::ui_mode::legacy_1397();
+        self.terminals
             .iter()
             // #853: セルフテストが注入した fixture のペインは読みに行かない。
             // 実 claude が動いていないので読めば必ず「チャットではない」になり、
             // `apply_chat_refresh` が注入した会話を消してしまう（判定は正しいので
             // 判定は変えず、対象から外して race そのものを無くす）
             .filter(|(pane, _)| !self.chat_fixture_panes.contains(*pane))
-            .filter_map(|(pane, backend)| {
+            .filter_map(|(pane, session)| {
                 let role = roles.get(pane)?;
-                let session = self.terminals.get(pane);
-                // alt screen（vim 等）は判定表でターミナル表示に落ちるので読みに行かない。
-                // **外側のフラグではなく中身の判定を使う**（tmux クライアントは常に
-                // alt screen なので、素直に見るとバックエンドペインが全部除外される）
-                if self.pane_inner_alt_screen(*pane) {
+                let backend = self.backend_sessions.get(pane);
+                // 旧挙動（A/B）では器を持つペインしか列挙しない
+                if legacy && backend.is_none() {
                     return None;
                 }
-                let lines = session.map(|s| s.visible_lines()).unwrap_or_default();
-                let metrics = session.and_then(|s| s.agent_metrics());
+                let key = match backend {
+                    Some(backend) => tako_control::agents::LiveSessionKey::Backend(backend.clone()),
+                    // 器なしの起点は PTY 直下の子 pid（#728 / #372 と同じ二段構え）。
+                    // pid が取れないペインは live 解決の手がかりが無いので対象外
+                    None => tako_control::agents::LiveSessionKey::pane(
+                        pane.as_u64(),
+                        session.child_pid()?,
+                    ),
+                };
+                // #1367: 判定は `RunningChildrenScanState::is_pane_busy` の 1 実装。
+                // `busy_sessions` を直に引くと器なしペインが必ず false になる
+                let agent_running = self.pane_has_busy_children(*pane);
+                // alt screen（vim 等）は判定表でターミナル表示に落ちるので読みに行かない。
+                // **外側のフラグではなく中身の判定を使う**（tmux クライアントは常に
+                // alt screen なので、素直に見るとバックエンドペインが全部除外される）。
+                // #1397: ただし**器なしペインでは claude の対話 TUI 自身が alt screen を
+                // 使う**（実測）。子プロセスが動いているペインは読みに行く
+                // （claude でなければ live 解決が付かないので、そこで落ちる）
+                if self.pane_inner_alt_screen(*pane) && (legacy || !agent_running) {
+                    return None;
+                }
+                let lines = session.visible_lines();
+                let metrics = session.agent_metrics();
                 let previous = self.chat_panes.get(pane);
                 Some(ChatRefreshTarget {
                     pane: *pane,
-                    backend: backend.clone(),
-                    // #1367: 判定は `RunningChildrenScanState::is_pane_busy` の 1 実装。
-                    // `busy_sessions` を直に引くと器なしペインが必ず false になる
-                    agent_running: self.pane_has_busy_children(*pane),
+                    key,
+                    agent_running,
                     read_only: role
                         .as_deref()
                         .is_some_and(tako_core::ui_mode::is_read_only_role),
@@ -4033,11 +4055,32 @@ pub(crate) fn load_chat_refresh(targets: Vec<ChatRefreshTarget>) -> Vec<ChatRefr
             })
             .collect();
     }
-    let live = tako_control::agents::live_claude_sessions_by_backend();
+    // #1397: 器なしペインの起点（PTY 直下の子 pid）も一緒に渡す。
+    // 器のセッション名だけをキーにした解決では、器を持たないペインが必ず外れる
+    let direct: Vec<(u64, u32)> = targets
+        .iter()
+        .filter_map(|t| match &t.key {
+            tako_control::agents::LiveSessionKey::Pane { pane, pid } => Some((*pane, *pid)),
+            tako_control::agents::LiveSessionKey::Backend(_) => None,
+        })
+        .collect();
+    let live = match tako_core::ui_mode::legacy_1397() {
+        // 旧挙動（A/B）: 器のセッション名キーだけで解決する
+        true => tako_control::agents::live_claude_sessions_by_backend()
+            .into_iter()
+            .map(|(backend, session)| {
+                (
+                    tako_control::agents::LiveSessionKey::Backend(backend),
+                    session,
+                )
+            })
+            .collect(),
+        false => tako_control::agents::live_claude_sessions(&direct),
+    };
     targets
         .into_iter()
         .map(|target| {
-            let session = live.get(&target.backend);
+            let session = live.get(&target.key);
             let eligibility = tako_core::ui_mode::ChatEligibility {
                 session_id: session.map(|s| s.session_id.as_str()),
                 interactive: session.is_some_and(|s| s.interactive),

@@ -52003,7 +52003,11 @@ mod self_test {
                             if !app.pane_inner_alt_screen(direct_pane) {
                                 return false;
                             }
-                            // チャット状態があっても alt screen が勝つ（保守的判定）
+                            // #702: チャット確定でない alt screen はターミナル表示のまま。
+                            // #1397: **チャット確定したペインは alt screen でもチャット**
+                            // （器なしでは claude の対話 TUI 自身が alt screen を使うので、
+                            // ここで alt screen を勝たせると器なしのチャットが 1 度も立たない）
+                            let plain = app.pane_display_for(direct_pane);
                             app.chat_panes.insert(
                                 direct_pane,
                                 std::rc::Rc::new(chat_view::ChatPaneState {
@@ -52011,9 +52015,9 @@ mod self_test {
                                     ..Default::default()
                                 }),
                             );
-                            let display = app.pane_display_for(direct_pane);
+                            let chat = app.pane_display_for(direct_pane);
                             app.chat_panes.remove(&direct_pane);
-                            display == PaneDisplay::Terminal
+                            plain == PaneDisplay::Terminal && chat == PaneDisplay::Chat
                         })
                         .unwrap_or(false);
                     if e2 {
@@ -52024,8 +52028,9 @@ mod self_test {
                     let note = window
                         .update(cx, |app, _, _| {
                             format!(
-                                "inner_alt={} backend={:?} tail={:?}",
+                                "inner_alt={} plain={:?} backend={:?} tail={:?}",
                                 app.pane_inner_alt_screen(direct_pane),
+                                app.pane_display_for(direct_pane),
                                 app.backend_sessions.get(&direct_pane).cloned(),
                                 app.terminals
                                     .get(&direct_pane)
