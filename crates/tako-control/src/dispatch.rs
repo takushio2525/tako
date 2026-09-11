@@ -24168,6 +24168,8 @@ mod tests {
                     live_tail: Some(screen.clone()),
                     full_screen: None,
                     has_running_children: false,
+                    // #1297: 入力欄の属性は見ない判定なので None（文字列だけで読む旧挙動）
+                    input_style: None,
                     limit_resume: Value::Null,
                 },
                 None,
