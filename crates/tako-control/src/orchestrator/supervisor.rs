@@ -795,6 +795,20 @@ fn report_needs_human(
     false
 }
 
+/// `worker_status` の応答から「プロンプトの自動再送を撃つか」を決める（#1294）。
+///
+/// **引き金は `prompt_undelivered` イベントだけ**。`prompt_delivery_unverified`
+/// （= 送ったかもしれない / 一次シグナルが読めない）では撃たない: 未達と断定できて
+/// いないので、撃つと同じ依頼が二度渡る（#790 / #1015 / #1294 の二重投函）。
+/// 救済は master が画面と `delivery` を見て手で送り直す形にする
+/// （イベントの `recommended_action` は `verify_then_resend`）
+pub fn wants_prompt_resend(status: &Value) -> bool {
+    status["events"].as_array().is_some_and(|evts| {
+        evts.iter()
+            .any(|e| e["kind"].as_str() == Some("prompt_undelivered"))
+    })
+}
+
 /// prompt_undelivered の自動再送
 pub fn recover_prompt_undelivered(
     ctx: &mut SupervisorContext,
@@ -1001,19 +1015,14 @@ pub fn supervisor_loop(
         // watch の TIMEOUT で idle が積めなかったケースの追加検知
         let has_prompt_undelivered = if matches!(outcome, WatchOutcome::Timeout) {
             // Timeout 後に worker_status を 1 回取得して prompt_undelivered チェック
-            if let Ok(val) = (ctx.exec)(Request::OrchestratorWorkerStatus {
+            (ctx.exec)(Request::OrchestratorWorkerStatus {
                 pane_id: Some(watch_opts.pane_id),
                 session_id: None,
                 tmux_session: None,
                 worker: None,
-            }) {
-                val["events"].as_array().is_some_and(|evts| {
-                    evts.iter()
-                        .any(|e| e["kind"].as_str() == Some("prompt_undelivered"))
-                })
-            } else {
-                false
-            }
+            })
+            .as_ref()
+            .is_ok_and(wants_prompt_resend)
         } else {
             false
         };

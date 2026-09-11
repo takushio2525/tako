@@ -921,6 +921,15 @@ worker ペインは 21〜25 桁まで狭まりうるので、幅の仮定は必�
   未達の断定は「一次シグナル（codex なら rollout の `task_started`）を**実際に読めた**
   ときだけ」にして、読めていないときは `prompt_delivery_unverified` へ降格する
 
+## 送達は「届いた / 未達 / 送ったかもしれない」の 3 値で記録する（Issue #1294 / #790）
+
+送達フローが「再送してはいけない」と宣言した顛末（peer の書き込みが始まった後に確認が
+取れない = `peer_send_stalled` / `peer_unconfirmed`）を worker レジストリが **bool の未達**へ
+潰していたので、`prompt_undelivered` → supervisor の自動再送で同じ依頼が二度渡っていた。
+3 値目の宣言は `tako_core::prompt_delivery::outcome_confidence`（顛末コードごとの表）に
+1 本化し、記録側（`record_prompt_delivery`）と判定側（`prompt_delivery_assessment_with`）が
+同じ表を引く。**既定は未達側**で、再送禁止側へ入れてよいのは「1 バイト以上書いた後」の顛末だけ。
+
 ## 一次シグナルを画面で覆すときは「なぜそう見えるか」まで揃える（Issue #1273 / #289）
 
 worker の状態は**一次シグナル**（claude = `agents --json` / codex = rollout /

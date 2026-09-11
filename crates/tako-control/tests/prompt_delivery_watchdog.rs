@@ -297,6 +297,8 @@ fn 理由コードの語彙は一箇所から来ている() {
         "enter_resend",
         "queue_drain",
         "peer_send_stalled",
+        // #1294: 「送ったかもしれない」側の綴りも正本（`PEER_UNCONFIRMED`）から引く
+        "peer_unconfirmed",
     ] {
         let quoted = format!("\"{code}\"");
         assert!(
@@ -305,4 +307,122 @@ fn 理由コードの語彙は一箇所から来ている() {
              （`tako_core::prompt_delivery::Stall` から引く）"
         );
     }
+}
+
+const SUPERVISOR: &str = "crates/tako-control/src/orchestrator/supervisor.rs";
+
+/// `at` 行（`if …{`）が開くブロックの中身を、同じインデントで閉じる `}` まで返す
+fn block_body(body: &[(usize, String)], at: usize) -> Vec<&str> {
+    let indent_of = |s: &str| s.len() - s.trim_start().len();
+    let open = indent_of(&body[at].1);
+    let mut out = Vec::new();
+    for (_, line) in body.iter().skip(at + 1) {
+        let trimmed = line.trim_start();
+        if !trimmed.is_empty() && indent_of(line) == open && trimmed.starts_with('}') {
+            break;
+        }
+        out.push(line.as_str());
+    }
+    out
+}
+
+/// ⑥ 送達の記録は「届いた / 未達 / 送ったかもしれない」の 3 値で渡す（Issue #1294）
+///
+/// `Stall::PeerSendStalled` は「届いた可能性があるので再送してはいけない」と宣言して
+/// いるのに、記録側が bool の `false`（= 未達確定）を渡していたのが #1294 の真因。
+/// レジストリが `undelivered` を返すと `prompt_undelivered` が立ち、supervisor の
+/// 自動再送が同じ依頼を撃つ（二重投函）
+#[test]
+fn 送達の記録は顛末コードから三値を引く() {
+    let src = read(APP);
+    let body = function_lines(&src, "fn report_prompt_delivery(flow: &PromptFlow");
+    let joined = body
+        .iter()
+        .map(|(_, l)| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("outcome_confidence("),
+        "{APP} の report_prompt_delivery が確からしさを顛末コードから引いていない\
+         （#1294: `peer_send_stalled` / `peer_unconfirmed` は「送ったかもしれない」なので\
+         未達として記録すると supervisor の自動再送が二重投函する）"
+    );
+    let offenders: Vec<String> = body
+        .iter()
+        .filter(|(_, l)| matches!(l.trim(), "false," | "true,"))
+        .map(|(lineno, line)| format!("{APP}:{lineno}: {}", line.trim()))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "送達の記録へ bool を直に渡している（#1294: 3 値 \
+         `tako_core::prompt_delivery::Confidence` で渡す）:\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// ⑦ 「送ったかもしれない」をレジストリが未達と断定しない（Issue #1294）
+///
+/// `prompt_delivery_failed_at` が立っているだけで `OverdueSuspect` を返すと、
+/// 送達フローの宣言（再送禁止）とレジストリの記録が食い違う
+#[test]
+fn 再送禁止と宣言した顛末をレジストリが未達確定にしない() {
+    let src = read(REGISTRY);
+    let body = function_lines(&src, "pub fn prompt_delivery_assessment_with(");
+    let at = body
+        .iter()
+        .position(|(_, l)| l.contains("entry.prompt_delivery_failed_at.is_some()"))
+        .expect("送達フローの記録を見る枝が見つからない（関数が変わった？）");
+    let block = block_body(&body, at).join("\n");
+    assert!(
+        block.contains("failure_assessment(") || block.contains("outcome_confidence("),
+        "{REGISTRY}:{} 送達フローの記録を顛末コードで分けずに未達と断定している\
+         （#1294: `peer_send_stalled` / `peer_unconfirmed` は書き込みが始まった後の\
+         顛末なので、`Unverified`（verify_then_resend）へ倒す）:\n{block}",
+        body[at].0
+    );
+}
+
+/// ⑧ 自動再送の引き金は `prompt_undelivered` だけ（Issue #1294 / #1015 / #983）
+///
+/// 「撃ってよいか」の規則は 1 箇所（`wants_prompt_resend`）に理由ごと置く。
+/// supervisor のループが events を自前で見に行く形へ戻ると、`unverified` を
+/// 引き金に足す改変が理由の無いまま通ってしまう
+#[test]
+fn 自動再送の引き金は一箇所で決まる() {
+    let src = read(SUPERVISOR);
+    let rule = function_lines(&src, "pub fn wants_prompt_resend(")
+        .iter()
+        .map(|(_, l)| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rule.contains("\"prompt_undelivered\""),
+        "{SUPERVISOR} の wants_prompt_resend が未達イベントを見ていない"
+    );
+    assert!(
+        !rule.contains("\"prompt_delivery_unverified\""),
+        "{SUPERVISOR} の wants_prompt_resend が未確認イベントも引き金にしている\
+         （#1294 / #1015: 未達と断定できていないので撃つと二重投函）"
+    );
+    let loop_body = function_lines(&src, "pub fn supervisor_loop(");
+    let offenders: Vec<String> = loop_body
+        .iter()
+        .filter(|(_, l)| l.contains("\"prompt_undelivered\"") && l.contains("as_str()"))
+        .map(|(lineno, line)| format!("{SUPERVISOR}:{lineno}: {}", line.trim()))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "supervisor_loop が events を自前で照合している（#1294: 引き金の規則は \
+         `wants_prompt_resend` の 1 実装に理由ごと置く）:\n{}",
+        offenders.join("\n")
+    );
+    let joined = loop_body
+        .iter()
+        .map(|(_, l)| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("wants_prompt_resend"),
+        "{SUPERVISOR} の supervisor_loop が wants_prompt_resend を通っていない"
+    );
 }

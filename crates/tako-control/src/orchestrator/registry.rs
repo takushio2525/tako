@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tako_core::prompt_delivery::Confidence;
 
 /// prompt 未達検知の猶予秒数（Issue #390 要件 4）。
 /// spawn からこの時間を超えても claude transcript（session_id）が観測できない
@@ -446,9 +447,16 @@ pub fn record_session_detected(tmux_session: &str, session_id: &str) -> Result<(
     })
 }
 
-/// 送達フロー（PromptFlow）の結果をレジストリへ記録する（Issue #530）。
-/// `verified = true` は「貼り付けが入力欄へ反映され、送信後に残留が消えた」という
-/// 積極的な証拠。`false` は未達の疑い（理由コードつき）。
+/// 送達フロー（PromptFlow）の結果をレジストリへ記録する（Issue #530 / #1294）。
+///
+/// `confidence` は 3 値（[`tako_core::prompt_delivery::Confidence`]）:
+/// 届いた / 未達確定 / **送ったかもしれない**。旧実装の bool では 3 つ目が
+/// 未達へ潰れ、supervisor の自動再送が「届いたかもしれない依頼」を撃っていた（#1294）。
+///
+/// **`Undelivered` と `Unverified` の記録の形は同じ**（未確認時刻 + 顛末コード）で、
+/// どちらだったかは**顛末コードが持つ**（正本は
+/// [`tako_core::prompt_delivery::outcome_confidence`]）。読み出し側の
+/// [`prompt_delivery_assessment_with`] が同じ表を引き直すので、記録と判定が食い違わない。
 ///
 /// pane 番号で引く（PromptFlow が持つキー）。同番号ペインの再利用による誤更新を防ぐため、
 /// active かつ既に決着（delivered / failed）していないエントリだけを対象にする。
@@ -456,25 +464,26 @@ pub fn record_session_detected(tmux_session: &str, session_id: &str) -> Result<(
 pub fn record_prompt_delivery(
     pane: u64,
     flow: PromptDeliveryFlow,
-    verified: bool,
+    confidence: Confidence,
     reason: &str,
 ) -> Result<(), String> {
     let Some(path) = registry_path() else {
         return Ok(());
     };
-    record_prompt_delivery_at(&path, pane, flow, verified, reason)
+    record_prompt_delivery_at(&path, pane, flow, confidence, reason)
 }
 
 fn record_prompt_delivery_at(
     path: &Path,
     pane: u64,
     flow: PromptDeliveryFlow,
-    verified: bool,
+    confidence: Confidence,
     reason: &str,
 ) -> Result<(), String> {
     if flow != PromptDeliveryFlow::SpawnPrompt {
         return Ok(());
     }
+    let verified = confidence == Confidence::Delivered;
     if !path.is_file() {
         return Ok(());
     }
@@ -714,6 +723,22 @@ pub struct DeliveryEvidence {
     pub primary_signal_unreadable: bool,
 }
 
+/// 送達フローが残した顛末コードから 3 値目を引き直す（Issue #1294）。
+///
+/// `legacy = true` は **#1294 前**の挙動（何であれ未達と断定する）。A/B の入口で、
+/// 製品経路では `tako_core::prompt_delivery::legacy_undelivered()` が渡る。
+/// 顛末コードが無い古い記録は**未達側**へ倒す（従来どおり = 救済を減らさない）
+fn failure_assessment(reason: Option<&str>, legacy: bool) -> PromptDelivery {
+    use tako_core::prompt_delivery::{outcome_confidence, Confidence};
+    if legacy {
+        return PromptDelivery::OverdueSuspect;
+    }
+    match reason.map(outcome_confidence) {
+        Some(Confidence::Unverified) => PromptDelivery::Unverified,
+        _ => PromptDelivery::OverdueSuspect,
+    }
+}
+
 /// prompt 送達状態を判定する（Issue #390 要件 4 / #983 の変更 2）。
 /// OverdueSuspect は「疑い」であり、最終的な未達イベントの発火は呼び出し側が
 /// 画面状態（busy でない・実行中子プロセスなし）と組み合わせて決める
@@ -742,12 +767,20 @@ pub fn prompt_delivery_assessment_with(
     if evidence.turn_observed && !super::agent_cli::legacy_mode() {
         return PromptDelivery::Delivered;
     }
-    // 送達フローが未達を確定させていれば、それを次に優先する（Issue #530）。
+    // 送達フローが確認できずに決着していれば、それを次に優先する（Issue #530）。
     // session 検出は「claude が起動した」証拠であって「プロンプトが届いた」証拠ではない
     // （初回のテーマ選択・ログイン方法選択ダイアログにプロンプトが食われても
-    // claude 自体は起動するため session_id は付く = 旧実装の delivered 偽陽性）
+    // claude 自体は起動するため session_id は付く = 旧実装の delivered 偽陽性）。
+    //
+    // #1294: **未達確定か「送ったかもしれない」か**は顛末コードが持つ
+    // （正本は `tako_core::prompt_delivery::outcome_confidence`）。後者を
+    // `OverdueSuspect` にすると `prompt_undelivered` → supervisor の自動再送が撃たれ、
+    // peer の受信箱へ既に入っている依頼をもう一度渡す（#790 / #1015 の二重投函）
     if entry.prompt_delivery_failed_at.is_some() {
-        return PromptDelivery::OverdueSuspect;
+        return failure_assessment(
+            entry.prompt_delivery_failure.as_deref(),
+            tako_core::prompt_delivery::legacy_undelivered(),
+        );
     }
     if entry.session_id.is_some() || entry.prompt_delivered_at.is_some() {
         return PromptDelivery::Delivered;
@@ -1330,7 +1363,7 @@ mod tests {
             &path,
             778,
             PromptDeliveryFlow::FollowUpSend,
-            false,
+            Confidence::Undelivered,
             "flow_timeout",
         )
         .unwrap();
@@ -1366,7 +1399,7 @@ mod tests {
             &path,
             530,
             PromptDeliveryFlow::SpawnPrompt,
-            false,
+            Confidence::Undelivered,
             "choice_dialog",
         )
         .unwrap();
@@ -1382,6 +1415,119 @@ mod tests {
             prompt_delivery_assessment(entry, now_epoch),
             PromptDelivery::OverdueSuspect
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #1294: peer の書き込みが始まった後に確認が取れなかった顛末は、
+    /// レジストリでも**未達と断定しない**（断定すると supervisor が自動再送 = 二重投函）
+    #[test]
+    fn 送ったかもしれない顛末はundeliveredにならない() {
+        for reason in [
+            tako_core::prompt_delivery::Stall::PeerSendStalled.code(),
+            tako_core::prompt_delivery::PEER_UNCONFIRMED,
+        ] {
+            let path = temp_registry_file(&format!("unverified-{reason}"));
+            register_at(&path, sample_record(1294));
+            record_prompt_delivery_at(
+                &path,
+                1294,
+                PromptDeliveryFlow::SpawnPrompt,
+                Confidence::Unverified,
+                reason,
+            )
+            .unwrap();
+
+            let reg = WorkerRegistry::load_from(&path).unwrap();
+            let (_, entry) = reg.find_active_by_pane(1294).unwrap();
+            // 顛末は記録される（無音にはしない）
+            assert_eq!(entry.prompt_delivery_failure.as_deref(), Some(reason));
+            assert!(entry.prompt_delivery_failed_at.is_some());
+            let now_epoch = crate::sessions::parse_iso(&crate::sessions::now_iso()).unwrap();
+            assert_eq!(
+                prompt_delivery_assessment(entry, now_epoch),
+                PromptDelivery::Unverified,
+                "{reason} は未達と断定できない"
+            );
+            assert_eq!(
+                prompt_delivery_assessment(entry, now_epoch).as_str(),
+                "unverified"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// #1294 の A/B（純粋関数側）。旧挙動は顛末に関係なく `undelivered` へ倒していた
+    #[test]
+    fn 顛末から3値を引く判定はabで切り替わる() {
+        let stalled = tako_core::prompt_delivery::Stall::PeerSendStalled.code();
+        assert_eq!(
+            failure_assessment(Some(stalled), false),
+            PromptDelivery::Unverified
+        );
+        assert_eq!(
+            failure_assessment(Some(stalled), true),
+            PromptDelivery::OverdueSuspect,
+            "TAKO_1294_LEGACY=1 は修正前（未達と断定）へ戻る"
+        );
+        // 本当に未達の顛末・顛末コードを持たない古い記録は従来どおり未達
+        assert_eq!(
+            failure_assessment(Some("paste_not_reflected"), false),
+            PromptDelivery::OverdueSuspect
+        );
+        assert_eq!(
+            failure_assessment(None, false),
+            PromptDelivery::OverdueSuspect
+        );
+    }
+
+    /// 一次シグナルが「ターンが走った」と言えば、未確認の記録があっても delivered へ昇格する
+    /// （#1015 と同じ順序。#1294 でも壊さない）
+    #[test]
+    fn 未確認でもターン観測があれば届いた側へ昇格する() {
+        let path = temp_registry_file("unverified-turn");
+        register_at(&path, sample_record(1295));
+        record_prompt_delivery_at(
+            &path,
+            1295,
+            PromptDeliveryFlow::SpawnPrompt,
+            Confidence::Unverified,
+            tako_core::prompt_delivery::PEER_UNCONFIRMED,
+        )
+        .unwrap();
+        let reg = WorkerRegistry::load_from(&path).unwrap();
+        let (_, entry) = reg.find_active_by_pane(1295).unwrap();
+        let now_epoch = crate::sessions::parse_iso(&crate::sessions::now_iso()).unwrap();
+        assert_eq!(
+            prompt_delivery_assessment_with(
+                entry,
+                now_epoch,
+                DeliveryEvidence {
+                    turn_observed: true,
+                    ..Default::default()
+                },
+            ),
+            PromptDelivery::Delivered
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// spawn プロンプト以外（後続 send）はレジストリを触らない（#778。#1294 でも不変）
+    #[test]
+    fn 後続sendの未確認はレジストリを触らない() {
+        let path = temp_registry_file("unverified-followup");
+        register_at(&path, sample_record(1296));
+        record_prompt_delivery_at(
+            &path,
+            1296,
+            PromptDeliveryFlow::FollowUpSend,
+            Confidence::Unverified,
+            tako_core::prompt_delivery::Stall::PeerSendStalled.code(),
+        )
+        .unwrap();
+        let reg = WorkerRegistry::load_from(&path).unwrap();
+        let (_, entry) = reg.find_active_by_pane(1296).unwrap();
+        assert!(entry.prompt_delivery_failed_at.is_none());
+        assert!(entry.prompt_delivery_failure.is_none());
         let _ = std::fs::remove_file(&path);
     }
 
