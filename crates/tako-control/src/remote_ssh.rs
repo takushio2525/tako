@@ -290,22 +290,24 @@ fn request_via_app(
     request: crate::protocol::Request,
     unavailable: &str,
 ) -> Result<Value, (u16, String)> {
-    let mut conn = app_conn
-        .write()
-        .map_err(|_| (500u16, "内部エラー".to_string()))?;
-    let client = conn.get().ok_or((503u16, unavailable.to_string()))?;
-    match client.request(request) {
-        Ok(v) => Ok(v),
-        Err(e) => {
-            // 「このペインは SSH 化できない」は dispatch の**正常な拒否**（#1006）なので、
-            // IPC が壊れたことにして接続を捨ててはいけない（次の操作まで巻き添えになる）
-            if is_refusal(&e) {
-                return Err((409, e));
+    // #1403: daemon → app の往復は `remote::with_app_ipc` の 1 実装を通す
+    // （HTTP 受信が複数ワーカーになったので、ここで同時に 2 本走らせない）
+    crate::remote::with_app_ipc(app_conn, |conn| {
+        let client = conn.get().ok_or((503u16, unavailable.to_string()))?;
+        match client.request(request) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                // 「このペインは SSH 化できない」は dispatch の**正常な拒否**（#1006）なので、
+                // IPC が壊れたことにして接続を捨ててはいけない（次の操作まで巻き添えになる）
+                if is_refusal(&e) {
+                    return Err((409, e));
+                }
+                conn.invalidate();
+                Err((502, e))
             }
-            conn.invalidate();
-            Err((502, e))
         }
-    }
+    })
+    .map_err(|_| (500u16, "内部エラー".to_string()))?
 }
 
 /// dispatch の拒否（呼び出し側の指定が通らない）か、経路の故障かを見分ける。

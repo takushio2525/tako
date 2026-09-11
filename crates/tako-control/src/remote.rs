@@ -938,6 +938,84 @@ impl AppConnection {
     }
 }
 
+// --- daemon → app の IPC の直列化（#1403）------------------------------------
+
+/// IPC 往復の同時実行数（[`with_app_ipc`] の中だけが増減させる）
+static IPC_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// 観測した同時実行数の最大（テストが「2 本同時に走っていない」を固定する量）
+static IPC_INFLIGHT_PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 同時実行数の観測値を 0 に戻す（測る窓の手前で呼ぶ）。
+///
+/// **`#[cfg(test)]` にはしない**: `remote.rs` を走査する番犬のうち
+/// `issue1401_stale_stop_identity_watchdog` は「最初の `#[cfg(test)]` まで」を
+/// production の範囲として切るので、ファイル途中に置くと走査範囲が
+/// **ここで終わってしまい**、#1401 の 6 本が丸ごと素通りする（実測）。
+/// 読み手がテストだけなのは `PANE_MAPPING_TTL` と同じ形で `allow` に留める
+#[allow(dead_code)]
+pub(crate) fn reset_ipc_inflight_peak() {
+    IPC_INFLIGHT_PEAK.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// 観測した IPC 往復の同時実行数の最大。**1 を超えたら直列化が壊れている**
+/// （`#[cfg(test)]` にしない理由は [`reset_ipc_inflight_peak`] を参照）
+#[allow(dead_code)]
+pub(crate) fn ipc_inflight_peak() -> usize {
+    IPC_INFLIGHT_PEAK.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// daemon → app の IPC を 1 本ずつ通す（#1403 の不変条件の**正本**）。
+///
+/// ## なぜ 1 本ずつなのか
+///
+/// #1403 で HTTP の受信ループを複数ワーカーにしたので、`/api/files` と
+/// `/api/v2/panes` が**別スレッドから同時に** app を呼びうるようになった。
+/// 往復そのものは接続を毎回張り直す（[`AppIpcClient::roundtrip_detailed`] が
+/// `connect_stream` する）ので 1 本のソケットにフレームが混ざることは無いが、
+/// 直列化をやめる判断は app 側の dispatch の並行性まで確かめてからにする。
+/// **daemon 側は「同時に 1 本」を明示的に守る**のが #1403 の結論。
+///
+/// ## この関数を通す理由（= 散らさない理由）
+///
+/// 直列化の実体は [`AppConnection`] の排他ロックを**往復の間ずっと握る**ことで、
+/// 呼び出し側が `get()` の直後にガードを落とすと静かに壊れる。ロックの取得と
+/// 解放を 1 実装に閉じ、呼び出し側には `&mut AppConnection` しか渡さない形に
+/// してあるので、**構造的に往復の間ロックが生きている**。
+/// 番犬 `issue1403_http_workers_watchdog` が `app_conn` のロックを
+/// ここ以外で取る形を落とす。
+///
+/// 返り値の `Err` はロックが毒（= 他スレッドが握ったまま panic した）のときだけ
+pub(crate) fn with_app_ipc<T>(
+    app_conn: &Arc<RwLock<AppConnection>>,
+    call: impl FnOnce(&mut AppConnection) -> T,
+) -> Result<T, IpcLockPoisoned> {
+    let mut guard = app_conn.write().map_err(|_| IpcLockPoisoned)?;
+    // 往復の間だけ在籍する（`call` が panic しても Drop で戻るので、
+    // 観測値が回帰の有無と無関係にずれない）
+    let _inflight = InflightGuard::enter();
+    Ok(call(&mut guard))
+}
+
+/// [`with_app_ipc`] のロックが毒だった（呼び出し側は 500 相当で返す）
+pub(crate) struct IpcLockPoisoned;
+
+/// 在籍数の増減を Drop に寄せた観測ガード
+struct InflightGuard;
+
+impl InflightGuard {
+    fn enter() -> Self {
+        let now = IPC_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        IPC_INFLIGHT_PEAK.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        IPC_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 // --- ペイン ID マッピング（tmux target ↔ tako PaneId。#281）---
 
 /// tmux target（`session:window.pane`）から tako PaneId への解決結果キャッシュ
@@ -1471,6 +1549,131 @@ fn probe_serve(base_url: &str, timeout: std::time::Duration) -> ServeReachabilit
     classify_self_check(result)
 }
 
+// --- HTTP 受信ループの並列化（#1403）---------------------------------------
+
+/// 受信ワーカーの既定本数。
+///
+/// 遅い 1 本（`/api/files` の SSH 先 = daemon → app の IPC read timeout 10 秒 /
+/// `/api/v2/panes` の tmux 5 秒 / 層① の `tailscale whois`）が
+/// `/api/health` や `/ws` のアップグレードを塞がないだけの本数があればよく、
+/// 相手（app / tmux / tailscaled）が直列なので増やしても伸びない。
+/// PWA の同時ポーリング（画面 + 一覧 + health）に 1 本の余りを足した値
+const DEFAULT_HTTP_WORKERS: usize = 4;
+
+/// 受信ワーカーの上限。これ以上はスレッドが増えるだけで捌ける量は変わらない
+const MAX_HTTP_WORKERS: usize = 32;
+
+/// 受信ワーカー数を決める（#1403）。
+///
+/// - `TAKO_REMOTE_HTTP_WORKERS=<n>`: 1..=[`MAX_HTTP_WORKERS`] に丸めて採用する
+///   （解釈できない値は既定へ倒す = 起動を拒否しない）
+/// - `TAKO_1403_LEGACY=1`: **1 本**（= #1403 以前の直列ループと等価）。A/B 用
+fn http_worker_count() -> usize {
+    if env_on("TAKO_1403_LEGACY") {
+        // A/B の旧アーム（= #1403 以前の直列受信）。`LEGACY_ARM` マーカーは付けない:
+        // あれは `test_timing_watchdog` が**実時間アサートを除外する**ための仕組みで、
+        // ここには実時間の比較が無い（付けると同番犬の「アームは 1 つ」が崩れる）
+        return 1;
+    }
+    match std::env::var("TAKO_REMOTE_HTTP_WORKERS") {
+        Ok(v) => match v.trim().parse::<usize>() {
+            Ok(n) if n >= 1 => n.min(MAX_HTTP_WORKERS),
+            _ => DEFAULT_HTTP_WORKERS,
+        },
+        Err(_) => DEFAULT_HTTP_WORKERS,
+    }
+}
+
+/// HTTP 受信ループ（#1403）。`workers` 本のスレッドが**同じ [`tiny_http::Server`] から
+/// recv する**ので、遅い 1 本が他のリクエストを塞がない。
+///
+/// `tiny_http` の `Server` は `Sync` で、複数スレッドからの `recv` / `recv_timeout` を
+/// 想定している（crate の doc が `Arc<Server>` + 4 スレッドの形をそのまま載せている）。
+///
+/// **不変条件**:
+///
+/// - **合流を忘れられない形にする**。[`std::thread::scope`] を使うので、
+///   `shutdown` が立って全ワーカーが抜けるまでこの関数は返らない。返った時点で
+///   ワーカーは 1 本も残っていない（後始末の `serve_stop_if_ours_on` /
+///   `cleanup_state_files` が走る前に、リクエストを捌く側は全部畳まれている）
+/// - **1 本の panic で daemon を落とさない**。`dispatch` は `catch_unwind` の下で
+///   呼ぶ。直列ループだった頃は panic が `run_daemon` まで抜けて daemon ごと死んだので、
+///   これは並列化に伴う後退ではなく改善。握り潰さずに `on_panic` へ渡す
+///   （daemon は監査ログへ落とす。**stdout / stderr へは書かない** =
+///   `.agent/plans/tako-remote-plan.md` §10）
+/// - **`recv` が壊れたら全員で降りる**。1 本だけ抜けて残りが回り続けると、
+///   「終了したのに終了しない」状態になる
+///
+/// daemon → app の IPC を同時に使わないことは、この関数ではなく
+/// [`with_app_ipc`] の 1 実装が担保する（そちらの不変条件を参照）
+fn serve_http_requests<D, P>(
+    server: &Arc<tiny_http::Server>,
+    shutdown: &AtomicBool,
+    workers: usize,
+    dispatch: D,
+    on_panic: P,
+) where
+    D: Fn(tiny_http::Request) + Sync,
+    P: Fn(usize, String) + Sync,
+{
+    let workers = workers.clamp(1, MAX_HTTP_WORKERS);
+    // recv が壊れた（= server が閉じた）ことを全ワーカーへ伝える。
+    // 旧実装の `Err(_) => break` を「全員で降りる」へ広げたもの
+    let fatal = AtomicBool::new(false);
+    let dispatch = &dispatch;
+    let on_panic = &on_panic;
+    let fatal = &fatal;
+    // ワーカー 1 本ぶんの受信ループ（spawn できなかったときは呼び出し元スレッドで回す）
+    let worker = move |index: usize, server: Arc<tiny_http::Server>| {
+        while !shutdown.load(Ordering::Relaxed) && !fatal.load(Ordering::Relaxed) {
+            match server.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(Some(request)) => {
+                    let guarded = std::panic::AssertUnwindSafe(|| dispatch(request));
+                    if let Err(payload) = std::panic::catch_unwind(guarded) {
+                        on_panic(index, describe_panic(payload.as_ref()));
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    fatal.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+    };
+    std::thread::scope(|scope| {
+        let mut spawned = 0usize;
+        for index in 0..workers {
+            let server = Arc::clone(server);
+            let builder = std::thread::Builder::new().name(format!("remote-http-{index}"));
+            if builder
+                .spawn_scoped(scope, move || worker(index, server))
+                .is_err()
+            {
+                // スレッドを立てられない = 資源が尽きている。立った本数で回す
+                break;
+            }
+            spawned += 1;
+        }
+        if spawned == 0 {
+            // 1 本も立たなかったら**呼び出し元スレッドで**回す。
+            // ここで諦めると daemon が「起動しているのに何も答えない」形で黙って死ぬ
+            worker(0, Arc::clone(server));
+        }
+    });
+}
+
+/// `catch_unwind` が返すペイロードを 1 行の文字列にする（監査ログ用）
+fn describe_panic(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "不明な panic".to_string()
+    }
+}
+
 /// 独立デーモンとして HTTP サーバーを起動し、SIGTERM まで待機する。
 /// `tako remote serve` から呼ばれる内部用関数。
 ///
@@ -1516,6 +1719,8 @@ pub fn run_daemon() -> io::Result<()> {
         }
     }
     let (server, endpoint) = local_endpoint::bind(&spec)?;
+    // #1403: 受信は複数ワーカーで行うので共有できる形にする（`tiny_http::Server` は `Sync`）
+    let server = Arc::new(server);
     // 到達先を state ファイルへ残す（CLI / status がここから再構成する）。
     // ループバック TCP はポートが毎回変わるので、これが唯一の手がかりになる
     if let Some(port) = endpoint.port() {
@@ -1808,14 +2013,25 @@ pub fn run_daemon() -> io::Result<()> {
     }
     println!("{info}");
 
-    // HTTP サーバーループ
-    while !shutdown.load(Ordering::Relaxed) {
-        match server.recv_timeout(std::time::Duration::from_millis(200)) {
-            Ok(Some(request)) => dispatch_one(request),
-            Ok(None) => {}
-            Err(_) => break,
-        }
-    }
+    // HTTP サーバーループ（#1403: 少数のワーカーが同じ Server から recv する）。
+    // 遅い 1 本（/api/files の SSH 先・/api/v2/panes の tmux・層① の whois）が
+    // health / 一覧 / WS のアップグレードを塞がないようにするのが目的。
+    // 全ワーカーの合流までここで待つので、下の後始末はリクエストを捌く側が
+    // 畳まれてから走る
+    serve_http_requests(
+        &server,
+        &shutdown,
+        http_worker_count(),
+        dispatch_one,
+        |index, message| {
+            // stdout / stderr へは書かない（`spawn_daemon` が pipe を捨てるので
+            // EPIPE panic になる = plan §10）。監査ログへ落として次のワーカーで続行する
+            audit_serve(
+                "http_worker_panic",
+                serde_json::json!({ "worker": index, "panic": message }),
+            );
+        },
+    );
 
     // クリーンアップ: 自分が公開に使った serve 設定のみ解除する
     // （test_mode では serve を張っていないので触らない = 本番設定を壊さない）
@@ -3593,17 +3809,19 @@ fn app_request(
     app_conn: &Arc<RwLock<AppConnection>>,
     req: crate::protocol::Request,
 ) -> Result<Value, String> {
-    let mut conn = app_conn.write().map_err(|_| "内部エラー".to_string())?;
-    let client = conn.get().ok_or("tako app が稼働していない".to_string())?;
-    match client.request_checked(req) {
-        Ok(v) => Ok(v),
-        // app が答えた = 接続は健全。理由だけ返す
-        Err(AppCallError::Rejected { message, .. }) => Err(message),
-        Err(AppCallError::Transport(e)) => {
-            conn.invalidate();
-            Err(e)
+    with_app_ipc(app_conn, |conn| {
+        let client = conn.get().ok_or("tako app が稼働していない".to_string())?;
+        match client.request_checked(req) {
+            Ok(v) => Ok(v),
+            // app が答えた = 接続は健全。理由だけ返す
+            Err(AppCallError::Rejected { message, .. }) => Err(message),
+            Err(AppCallError::Transport(e)) => {
+                conn.invalidate();
+                Err(e)
+            }
         }
-    }
+    })
+    .map_err(|_| "内部エラー".to_string())?
 }
 
 /// IPC 経由でペイン一覧を取得し、マッピングを更新する。
@@ -3612,20 +3830,24 @@ fn refresh_pane_mapping(
     app_conn: &Arc<RwLock<AppConnection>>,
     pane_mapping: &Arc<RwLock<PaneMapping>>,
 ) -> Option<Value> {
-    let mut conn = app_conn.write().ok()?;
-    let client = conn.get()?;
-    match client.request(crate::protocol::Request::List) {
-        Ok(list) => {
-            if let Ok(mut mapping) = pane_mapping.write() {
-                mapping.update_from_list(&list);
+    let list = with_app_ipc(app_conn, |conn| {
+        let client = conn.get()?;
+        match client.request(crate::protocol::Request::List) {
+            Ok(list) => Some(list),
+            Err(_) => {
+                conn.invalidate();
+                None
             }
-            Some(list)
         }
-        Err(_) => {
-            conn.invalidate();
-            None
-        }
+    })
+    .ok()
+    .flatten()?;
+    // マッピングの更新は IPC のロックの**外**で行う（別の錠を往復の間ずっと
+    // 握らないため。#1403）
+    if let Ok(mut mapping) = pane_mapping.write() {
+        mapping.update_from_list(&list);
     }
+    Some(list)
 }
 
 /// pane パラメータ（数値 PaneId または tmux ターゲット）を tmux ターゲットに解決する。
@@ -4814,9 +5036,21 @@ fn handle_api_v2_routes(
             let cols = parsed["cols"].as_u64().map(|c| c as u32);
             let rows = parsed["rows"].as_u64().map(|r| r as u32);
 
-            // IPC 経由で TmuxResize を呼ぶ
-            let mut conn_guard = match app_conn.write() {
-                Ok(g) => g,
+            // IPC 経由で TmuxResize を呼ぶ（#1403: 往復は with_app_ipc の 1 実装を通す）
+            let result = with_app_ipc(app_conn, |conn| {
+                conn.get().map(|client| {
+                    client.request(crate::protocol::Request::TmuxResize {
+                        socket: Some(tako_core::tmux_backend::socket_name()),
+                        session: session_part.to_string(),
+                        window: window_part,
+                        cols: if reset { None } else { cols },
+                        rows: if reset { None } else { rows },
+                        reset,
+                    })
+                })
+            });
+            let result = match result {
+                Ok(v) => v,
                 Err(_) => {
                     return respond(
                         request,
@@ -4825,24 +5059,12 @@ fn handle_api_v2_routes(
                     );
                 }
             };
-            match conn_guard.get() {
-                Some(client) => {
-                    let result = client.request(crate::protocol::Request::TmuxResize {
-                        socket: Some(tako_core::tmux_backend::socket_name()),
-                        session: session_part.to_string(),
-                        window: window_part,
-                        cols: if reset { None } else { cols },
-                        rows: if reset { None } else { rows },
-                        reset,
-                    });
-                    drop(conn_guard);
-                    match result {
-                        Ok(_) => respond(request, 200, Some(json!({ "ok": true }).to_string())),
-                        Err(e) => respond(request, 502, Some(json!({ "error": e }).to_string())),
-                    }
-                }
+            match result {
+                Some(result) => match result {
+                    Ok(_) => respond(request, 200, Some(json!({ "ok": true }).to_string())),
+                    Err(e) => respond(request, 502, Some(json!({ "error": e }).to_string())),
+                },
                 None => {
-                    drop(conn_guard);
                     // app 不在時は tmux 直接操作にフォールバック（resize は読み取りに近い操作）
                     let window_target = tako_core::tmux::exact_target(&window_target_of(&target));
                     let result = if reset {
@@ -7637,5 +7859,427 @@ mod tests {
         assert_eq!(focused_pane_of_tab(&list, 3), None);
         assert_eq!(focused_pane_of_tab(&list, 99), None);
         assert_eq!(focused_pane_of_tab(&json!({}), 1), None);
+    }
+
+    // --- #1403: HTTP 受信ループの並列化と IPC の直列化 ------------------------
+
+    /// 状態待ちの上限。混み具合で**伸ばすだけ**（`.agent/conventions.md`）
+    fn budget_1403(base_ms: u64) -> std::time::Duration {
+        tako_core::wait_budget::state_wait_budget(
+            std::time::Duration::from_millis(base_ms),
+            tako_core::wait_budget::machine_busy(),
+        )
+    }
+
+    /// 状態が立つまで待つ（立たなければ false）。**実時間の比較には使わない**
+    fn wait_until_1403(mut cond: impl FnMut() -> bool, budget: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + budget;
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        cond()
+    }
+
+    /// `shutdown` を**必ず**立てる番人（#1403 のテスト用）。
+    ///
+    /// 受信ループは `std::thread::scope` の中で回るので、`shutdown` を立てる前に
+    /// scope の中で assert が落ちると、**join が終わらず FAILED がハングに化ける**
+    /// （実測: `catch_unwind` を外す注入で 22 分待っても終わらなかった）。
+    /// scope 内のローカルは巻き戻しの途中で drop されるので、ここで立てておけば
+    /// ワーカーが抜けて join が完了し、テストは素直に FAILED になる
+    struct StopOnDrop<'a>(&'a AtomicBool);
+
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// 1 本の HTTP GET を投げて応答本文を読む（Connection: close）
+    fn get_1403(port: u16, path: &str) -> String {
+        use std::io::Write as _;
+        let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).expect("接続");
+        sock.set_read_timeout(Some(std::time::Duration::from_secs(60)))
+            .ok();
+        write!(
+            sock,
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        )
+        .expect("送信");
+        let mut raw = String::new();
+        sock.read_to_string(&mut raw).expect("受信");
+        raw
+    }
+
+    /// #1403 の A/B を 1 実装で回す。
+    ///
+    /// A（`/slow`）は解放の合図が来るまで返らないリクエスト、B（`/fast`）はすぐ返る
+    /// リクエスト。**「B の応答が A の完了より先か」を順序で判定する**
+    /// （実時間は比較しない = `.agent/conventions.md`「効果を測る単体テストは
+    /// 実時間で比べない」）。戻り値は `(B の順番, A の順番)`
+    fn slow_then_fast_order(workers: usize) -> (usize, usize) {
+        use std::sync::atomic::AtomicUsize;
+
+        let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("bind"));
+        let port = server.server_addr().to_ip().expect("ip").port();
+        let shutdown = AtomicBool::new(false);
+
+        // 事象が起きた順に 1, 2, ... を振る（負荷に依らない量）
+        let order = AtomicUsize::new(0);
+        let a_entered = AtomicBool::new(false);
+        let a_done = AtomicUsize::new(0);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        // 回帰時（直列）に固まらないための上限。合図が来れば即座に抜ける
+        let hold = budget_1403(3_000);
+
+        let dispatch = |request: tiny_http::Request| {
+            let path = request.url().to_string();
+            if path == "/slow" {
+                a_entered.store(true, Ordering::SeqCst);
+                // 「B が返った」を状態で待つ（来なければ予算で降りる）
+                let _ = release_rx.lock().expect("受信口").recv_timeout(hold);
+                a_done.store(order.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+            }
+            let _ = request.respond(tiny_http::Response::from_string("ok"));
+        };
+
+        let b_order = std::thread::scope(|scope| {
+            // 途中で落ちても必ず受信ループを畳む（ハングではなく FAILED にする）
+            let _stop = StopOnDrop(&shutdown);
+            let loop_handle = scope.spawn(|| {
+                serve_http_requests(&server, &shutdown, workers, dispatch, |_, _| {});
+            });
+            // A を投げる（応答は待たない）
+            let a_client = scope.spawn(|| get_1403(port, "/slow"));
+            // **A がハンドラに入ったことを待つ**。ここを待たないと、直列でも
+            // たまたま B が先に捌かれて偽 PASS になる
+            assert!(
+                wait_until_1403(|| a_entered.load(Ordering::SeqCst), budget_1403(3_000)),
+                "A がハンドラへ入らない（受信ループが動いていない）"
+            );
+            // B を投げて応答を待つ
+            let b = get_1403(port, "/fast");
+            assert!(b.contains("200 OK"), "B の応答: {b}");
+            let b_order = order.fetch_add(1, Ordering::SeqCst) + 1;
+            // A を解放して畳む
+            let _ = release_tx.send(());
+            let a = a_client.join().expect("A のクライアント");
+            assert!(a.contains("200 OK"), "A の応答: {a}");
+            shutdown.store(true, Ordering::SeqCst);
+            loop_handle.join().expect("受信ループ");
+            b_order
+        });
+        (b_order, a_done.load(Ordering::SeqCst))
+    }
+
+    /// **#1403 の本体**: 遅い 1 本が走っている最中でも別のリクエストが返る。
+    ///
+    /// 修正前（直列ループ = ワーカー 1 本）では B が A の完了を待たされ、
+    /// 隔離 daemon の実測で `B(no-xff) 401 2.713462s` になっていた
+    #[test]
+    fn 遅い1本の最中でも別のリクエストが先に返る() {
+        let (b_order, a_order) = slow_then_fast_order(4);
+        assert!(
+            b_order < a_order,
+            "B は A の完了より先に返るはず（B={b_order} / A={a_order}）"
+        );
+    }
+
+    /// **ワーカー 1 本は #1403 以前の直列ループと等価**（A/B の旧アーム）。
+    ///
+    /// 同じ材料で順序が反転することを固定しておくと、上のテストが
+    /// 「並列だから通った」ことの証拠になる（材料が緩くて通ったのではない）
+    #[test]
+    fn ワーカー1本では遅い1本が別のリクエストを塞ぐ() {
+        let (b_order, a_order) = slow_then_fast_order(1);
+        assert!(
+            a_order < b_order,
+            "直列なら A の完了が先になるはず（B={b_order} / A={a_order}）"
+        );
+    }
+
+    /// ワーカーが panic しても daemon は受信を続ける（#1403）。
+    ///
+    /// 直列ループだった頃は panic が `run_daemon` まで抜けて daemon ごと死んだので、
+    /// これは並列化に伴う後退ではなく改善。握り潰さず `on_panic` へ渡る
+    #[test]
+    fn ワーカーのpanicで受信が止まらない() {
+        let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("bind"));
+        let port = server.server_addr().to_ip().expect("ip").port();
+        let shutdown = AtomicBool::new(false);
+        let panics: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+        let dispatch = |request: tiny_http::Request| {
+            if request.url() == "/boom" {
+                // 応答を返さずに落ちる（クライアント側は接続断になる）
+                panic!("#1403 のテスト用 panic");
+            }
+            let _ = request.respond(tiny_http::Response::from_string("ok"));
+        };
+
+        std::thread::scope(|scope| {
+            // 途中で落ちても必ず受信ループを畳む（ハングではなく FAILED にする）
+            let _stop = StopOnDrop(&shutdown);
+            let loop_handle = scope.spawn(|| {
+                serve_http_requests(&server, &shutdown, 2, dispatch, |_, message| {
+                    panics.lock().expect("記録").push(message);
+                });
+            });
+            // 落ちる経路を踏ませる（応答は返らないので中身は見ない）
+            let _ = get_1403(port, "/boom");
+            assert!(
+                wait_until_1403(
+                    || !panics.lock().expect("記録").is_empty(),
+                    budget_1403(3_000)
+                ),
+                "panic が on_panic へ渡らない"
+            );
+            // **落ちたあとも捌ける**
+            let after = get_1403(port, "/fine");
+            assert!(after.contains("200 OK"), "panic 後の応答: {after}");
+            shutdown.store(true, Ordering::SeqCst);
+            loop_handle.join().expect("受信ループ");
+        });
+
+        let recorded = panics.lock().expect("記録").clone();
+        assert_eq!(recorded.len(), 1, "panic の記録: {recorded:?}");
+        assert!(
+            recorded[0].contains("#1403 のテスト用 panic"),
+            "panic の理由がそのまま渡る: {recorded:?}"
+        );
+    }
+
+    /// `shutdown` で**全ワーカーが合流してから**関数が返る（#1403）。
+    ///
+    /// 後始末（serve 解除・state ファイル削除）はこの後に走るので、
+    /// 「まだリクエストを捌いている最中に片付けが始まる」ことがあってはならない
+    #[test]
+    fn shutdownで全ワーカーが合流してから返る() {
+        use std::sync::atomic::AtomicUsize;
+
+        let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("bind"));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        // ワーカーの在籍数（Drop まで数える）
+        let alive = Arc::new(AtomicUsize::new(0));
+
+        let server_thread = Arc::clone(&server);
+        let shutdown_thread = Arc::clone(&shutdown);
+        let alive_thread = Arc::clone(&alive);
+        let handle = std::thread::spawn(move || {
+            let dispatch = |request: tiny_http::Request| {
+                let _ = request.respond(tiny_http::Response::from_string("ok"));
+            };
+            alive_thread.fetch_add(1, Ordering::SeqCst);
+            serve_http_requests(&server_thread, &shutdown_thread, 4, dispatch, |_, _| {});
+            alive_thread.fetch_sub(1, Ordering::SeqCst);
+        });
+
+        assert!(
+            wait_until_1403(|| alive.load(Ordering::SeqCst) == 1, budget_1403(3_000)),
+            "受信ループが始まらない"
+        );
+        shutdown.store(true, Ordering::SeqCst);
+        handle.join().expect("受信ループ");
+        assert_eq!(
+            alive.load(Ordering::SeqCst),
+            0,
+            "合流せずに返っている（scope を外したら落ちる）"
+        );
+    }
+
+    /// ワーカー数の決め方（#1403）。既定 4 / env で 1..=32 / 壊れた値は既定へ倒す
+    #[test]
+    fn ワーカー数はenvで1から32に丸められる() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let restore = std::env::var("TAKO_REMOTE_HTTP_WORKERS").ok();
+        let legacy = std::env::var("TAKO_1403_LEGACY").ok();
+        std::env::remove_var("TAKO_1403_LEGACY");
+
+        std::env::remove_var("TAKO_REMOTE_HTTP_WORKERS");
+        assert_eq!(http_worker_count(), DEFAULT_HTTP_WORKERS);
+        std::env::set_var("TAKO_REMOTE_HTTP_WORKERS", "1");
+        assert_eq!(http_worker_count(), 1, "1 本（= 直列）も選べる");
+        std::env::set_var("TAKO_REMOTE_HTTP_WORKERS", "  8 ");
+        assert_eq!(http_worker_count(), 8, "前後の空白は無視する");
+        std::env::set_var("TAKO_REMOTE_HTTP_WORKERS", "999");
+        assert_eq!(http_worker_count(), MAX_HTTP_WORKERS, "上限で丸める");
+        // 解釈できない値で**起動を拒否しない**（既定へ倒す）
+        for bad in ["0", "-3", "four", ""] {
+            std::env::set_var("TAKO_REMOTE_HTTP_WORKERS", bad);
+            assert_eq!(http_worker_count(), DEFAULT_HTTP_WORKERS, "不正値: {bad:?}");
+        }
+        // A/B の口
+        std::env::set_var("TAKO_REMOTE_HTTP_WORKERS", "8");
+        std::env::set_var("TAKO_1403_LEGACY", "1");
+        assert_eq!(
+            http_worker_count(),
+            1,
+            "legacy は env より優先して直列へ倒す"
+        );
+
+        std::env::remove_var("TAKO_1403_LEGACY");
+        match restore {
+            Some(v) => std::env::set_var("TAKO_REMOTE_HTTP_WORKERS", v),
+            None => std::env::remove_var("TAKO_REMOTE_HTTP_WORKERS"),
+        }
+        if let Some(v) = legacy {
+            std::env::set_var("TAKO_1403_LEGACY", v);
+        }
+    }
+
+    /// **#1403 の不変条件**: HTTP が複数ワーカーになっても daemon → app の IPC は
+    /// 同時に 1 本しか走らない（フレームが混ざらない）。
+    ///
+    /// 偽 app（実 UDS・接続ごとにスレッド = 本物と同じ形）を相手に、
+    /// 複数スレッドから同時に `app_request` を撃つ。見るのは**量**（同時に開いた
+    /// 接続数の最大）と**対応**（自分が送った marker が自分へ返るか）で、
+    /// どちらも負荷に依らない
+    #[cfg(unix)]
+    #[test]
+    fn ipcの往復は同時に1本しか走らない() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use std::sync::Condvar;
+
+        const CALLERS: usize = 4;
+
+        let dir = std::env::temp_dir().join(format!(
+            "tako-1403-ipc-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("一時ディレクトリ");
+        let sock = dir.join("app.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).expect("UDS");
+
+        /// 偽 app 側で観測する「いま何本開いているか / 最大何本開いたか」
+        #[derive(Default)]
+        struct Open {
+            now: usize,
+            peak: usize,
+        }
+        let observed = Arc::new((Mutex::new(Open::default()), Condvar::new()));
+        // 2 本目が来れば即座に気づく。来なければ予算で降りる（直列なら毎回こちら）
+        let overlap_window = budget_1403(250);
+
+        // 受け付けをやめる合図（**待ち続けない**: 呼び出しが 1 本でも届かなかった回に
+        // accept で固まると、原因の違うテストが「ハング」になって読めなくなる）
+        let stop = Arc::new(AtomicBool::new(false));
+        listener.set_nonblocking(true).expect("nonblocking");
+        let observed_app = Arc::clone(&observed);
+        let stop_app = Arc::clone(&stop);
+        let app = std::thread::spawn(move || {
+            let mut conns = Vec::new();
+            while !stop_app.load(Ordering::SeqCst) {
+                let stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                stream.set_nonblocking(false).expect("blocking");
+                let observed_conn = Arc::clone(&observed_app);
+                conns.push(std::thread::spawn(move || {
+                    let (lock, cv) = &*observed_conn;
+                    {
+                        let mut st = lock.lock().expect("観測");
+                        st.now += 1;
+                        st.peak = st.peak.max(st.now);
+                        cv.notify_all();
+                        // 「同時に 2 本開いた」を状態で待つ（直列なら予算で降りる）
+                        if st.now < 2 {
+                            let (g, _) = cv.wait_timeout(st, overlap_window).expect("待ち");
+                            st = g;
+                        }
+                        st.now -= 1;
+                    }
+                    let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                    let mut line = String::new();
+                    let _ = reader.read_line(&mut line);
+                    // 受け取った marker を**そのまま**返す（混ざれば対応が崩れる）。
+                    // `RequestEnvelope` は `#[serde(flatten)]` なので params は最上位に出る
+                    let sent: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+                    let marker = sent["params"]["title"].clone();
+                    let body = serde_json::to_string(&crate::protocol::ResponseEnvelope::ok(
+                        1,
+                        json!({ "echo": marker }),
+                    ))
+                    .expect("JSON");
+                    let mut w = stream;
+                    let _ = writeln!(w, "{body}");
+                }));
+            }
+            for c in conns {
+                let _ = c.join();
+            }
+        });
+
+        let app_conn = Arc::new(RwLock::new(AppConnection {
+            client: Some(AppIpcClient {
+                socket: sock.display().to_string(),
+                token: "t".into(),
+            }),
+            last_attempt: std::time::Instant::now(),
+        }));
+
+        reset_ipc_inflight_peak();
+        let results: Vec<(String, Result<Value, String>)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..CALLERS)
+                .map(|i| {
+                    let app_conn = Arc::clone(&app_conn);
+                    scope.spawn(move || {
+                        let marker = format!("marker-{i}");
+                        let got = app_request(
+                            &app_conn,
+                            crate::protocol::Request::Title {
+                                pane: None,
+                                title: Some(marker.clone()),
+                                role: None,
+                            },
+                        );
+                        (marker, got)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("呼び出し"))
+                .collect()
+        });
+        let peak_daemon = ipc_inflight_peak();
+        stop.store(true, Ordering::SeqCst);
+        app.join().expect("偽 app");
+
+        // ① daemon 側: 往復が重なっていない
+        assert_eq!(
+            peak_daemon, 1,
+            "IPC の往復が同時に {peak_daemon} 本走った（直列化が壊れている）"
+        );
+        // ② app 側: 接続も同時に開いていない
+        let peak_app = observed.0.lock().expect("観測").peak;
+        assert_eq!(
+            peak_app, 1,
+            "app 側で同時に {peak_app} 本の接続が開いた（直列化が壊れている）"
+        );
+        // ③ フレームが混ざっていない（自分の marker が自分へ返る）
+        for (marker, got) in &results {
+            let value = got.as_ref().unwrap_or_else(|e| panic!("{marker}: {e}"));
+            assert_eq!(
+                value["echo"].as_str(),
+                Some(marker.as_str()),
+                "応答が別の要求のものになっている: {value}"
+            );
+        }
+        assert_eq!(results.len(), CALLERS);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

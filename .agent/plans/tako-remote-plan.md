@@ -315,3 +315,40 @@ Geist / Geist Mono。**フォントは自己ホスト**（Google Fonts 参照禁
 - whois は系統をまたいでも解決する（同一 tailnet の netmap）ので、**認証経路は tailscaled の
   入れ替わりの影響を受けない**
 - 検証は `bash scripts/test-serve-watch.sh`（偽 tailscale + 隔離 state・本番不可侵・37 件）
+
+## 11. daemon の HTTP 受信を触るときの不変条件（#1403。2026-09-12）
+
+受信ループは **少数のワーカーが同じ `tiny_http::Server` から recv する**形
+（`remote::serve_http_requests`）。直列だった頃は遅い 1 本が全リクエストを塞いでいた
+（隔離 daemon の実測: 偽 tailscale の `whois` を 3 秒眠らせると、本来 0.0007 秒の
+`/api/health` が **2.71 秒**待たされる）。塞がれる側に health・`/api/v2/panes` の
+ポーリング・`/ws` のアップグレードが並ぶので、体感では PWA 全体が固まる。
+
+- **本数は `http_worker_count()` の 1 実装で決める**（既定 4 / `TAKO_REMOTE_HTTP_WORKERS`
+  で 1..=32 / 解釈できない値は既定へ倒して**起動は拒否しない**）。相手（app / tmux /
+  tailscaled）が直列なので増やしても捌ける量は伸びない。A/B は `TAKO_1403_LEGACY=1`（= 1 本）
+- **合流を忘れられない形にする**。`std::thread::scope` を使うので、`shutdown` が立って
+  全ワーカーが抜けるまで `serve_http_requests` は返らない。後始末（serve 解除・
+  `cleanup_state_files`）は**リクエストを捌く側が畳まれてから**走る
+- **1 本の panic で daemon を落とさない**。`dispatch` は `catch_unwind` の下で呼び、
+  理由は `audit_serve("http_worker_panic", …)` へ残す（**stdout / stderr へは書かない** =
+  §10 と同じ理由）。直列の頃は panic が `run_daemon` まで抜けて daemon ごと死んだ
+- **`recv` が壊れたら全ワーカーで降りる**。1 本だけ抜けて残りが回ると
+  「終了したのに終了しない」状態になる
+- **daemon → app の IPC は同時に 1 本だけ**。往復そのものは毎回接続を張り直すので
+  1 本のソケットにフレームが混ざることは無いが、直列化をやめる判断は app 側の
+  dispatch の並行性まで確かめてからにする。守り方は `remote::with_app_ipc` の
+  **1 実装**で、`AppConnection` の排他ロックを**往復の間ずっと**握る（呼び出し側には
+  `&mut AppConnection` しか渡さないので、構造的に早期 drop できない）。
+  同時実行数は `ipc_inflight_peak()` で観測でき、テストが **1 を超えないこと**を固定する
+- **監査ログは 1 行を 1 回の write で出す**（`remote_auth::append_audit`）。`writeln!` は
+  本文と改行を別々に書くので、`O_APPEND` でも**行が混ざる**。書く者が増えた
+  （受信 4 ワーカー + serve 自己検査 + セッションスイープ + WS 中継）ぶん確度が上がる
+- **残る限界: 遅いリクエストが本数ぶん来れば health も待つ**（並列化は待ち行列を
+  消さない）。隔離 daemon の実測（whois 3 秒 × N 本同時 / ワーカー 4 本）:
+  `A=3` なら health **0.002 秒** / `A=4` で **2.51 秒** / `A=6` は health 2.53 秒 +
+  溢れた A5・A6 が **6.04 秒**（次の空きを待つ）。SSH 先が固まる環境では
+  `TAKO_REMOTE_HTTP_WORKERS` を上げるのが逃げ道だが、**本筋は遅い経路側に
+  タイムアウトを置くこと**（`/api/files` の IPC は 10 秒・`/api/v2/panes` の tmux は 5 秒）
+- 検証は `cargo test -p tako-control --lib remote::tests`（順序・IPC の直列化・panic 耐性・
+  合流・本数の解釈）と番犬 `issue1403_http_workers_watchdog`
