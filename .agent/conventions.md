@@ -1407,6 +1407,12 @@ CI 完了前に merge され（merge 04:24:10 / Windows 完了 04:48:24）、過
 - **警告が出たら、merge 前に main を取り込んで CI を回し直すのが原則**。ただし変更が
   独立していると判断できるなら警告のまま merge してよい（#1343 のような意味的
   コンフリクトのリスクは残る、と分かったうえで通す）
+- **merge 後のリモートブランチ削除は `gh` に任せない**（#1347）。`gh pr merge --delete-branch` は
+  「ローカルへ切り替え → ローカル削除 → リモート削除」の順なので、**専用 worktree から実行すると**
+  最初の切り替えが `fatal: '<既定ブランチ>' is already used by worktree` で落ち、**リモートまで
+  到達しない**（PR #1337 で実発生。棚卸しでは merge 済み PR の head が origin に 5 本残っていた）。
+  `merge-pr.sh` は MERGED を確認してから**自分で消す**（冪等・**その PR の head 1 本だけ**・
+  head == base と fork の PR は触らない）。A/B は `TAKO_1347_LEGACY=1`（gh 任せの腕）
 
 ## 設定・データファイルのスキーマ変更（Issue #916）
 
