@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-11（#1277: codex / agy の「背景作業つき入力待ち」を MATRIX へ確定した）
-- 隔離 tmux で実 CLI を起こして採取（codex-cli 0.154.0 / Antigravity CLI 1.2.0）。**両系統は一次シグナルが張り付かない**（背景作業が生きたまま rollout の `task_complete` / 実況 JSONL の終端が書かれ `read_turn_state` → idle）ので #1273 の覆す腕は要らず、MATRIX の `worker_idle_with_background` を 3 系統とも `Supported` へ
-- 画面の申告は系統別に読めるようにした（codex = `1 background terminal running · /ps to view · /stop to close` / agy = フッターの `· 1 task(s) · /tasks`）。ただし**両系統の申告は生成中も同じ形で出る**ので `declaration_implies_turn_end` で claude 限定にし、番犬 3 本 + 単体 15 本 + A/B `TAKO_1277_LEGACY=1` で固定
-- agy の実況行（`● [07:15:49] <コマンド> running`）は内訳にしない（コマンド全文が応答へ漏れる。#927）。docs 再生成で codex 34→35 / agy 23→24
-
 ## 2026-09-11（#1035: 番犬が gitignore 済みの未追跡ファイルで落ちないようにした）
 - `no_personal_data` の走査対象を「public リポに出るファイル」= `git check-ignore` で**未追跡かつ ignore 済み**でないものへ限定。`.claude/settings.local.json` で手元が恒久的に赤い状態を解消（手元 2 failed → 6 passed）
 - **索引を見る既定の `check-ignore` を使う**ので `git add -f` した tracked は ignore に一致しても走査に残る（`--no-index` 禁止 = `.gitignore` で隠す抜け道を塞ぐ）。`git` が無い / リポ外は全部走査（実測で旧挙動どおり 2 failed）
@@ -48,6 +43,7 @@
 - 真因は #625 と同型。tmp 名が pid 止まりなので A の rename 後に B が**本番ファイルになった同じ inode** へ書き込む（実測の途中状態 `len=8194 head="S\ns\nLLLLLLLL" tail=…lll` = 短い本文が長い本文の先頭を潰した形）+ B の rename は ENOENT で失敗
 - `shell_integration::write_state_file` を `tmux_backend::write_conf_in` と同じ作法へ（pid + `AtomicU64` の seq・rename 失敗時は tmp を掃除）。tmp 名は純粋関数 `state_tmp_name` に出して両アームを単体で固定
 - A/B `TAKO_638_LEGACY=1`: 8 スレッド × 300 書き込みの再現テストが旧アーム **50/50 FAILED** → 新アーム **0/100**（CPU 負荷 load 92〜113 下でも 0/50）
+
 ## 2026-09-11（#1208: remote_link_live の実時間比較は #1220 で修正済みと確認し、再現の作法を規約へ）
 - Issue は #1220（`3a0ea26`）の重複で、現行 main のテストは既に `scan_counters` の量比較。番犬 `test_timing_watchdog` は `crates/*/tests` 全体を見ており（`tako-core` への注入も名指し）、旧版を戻すと `remote_link_live.rs:247: assert(… warm <= cold …)` で FAILED
 - 症状解消を実測: 新実装は負荷下 330 回 + 同時 16 本 × 10 ラウンドで **0 FAILED**。旧実装は `yes` 負荷では 0/170 だが**バイナリ多重同時起動**で 3/160 反転（1 件は Issue と同じ `初回 24.5ms / 2 回目 38.8ms`）
