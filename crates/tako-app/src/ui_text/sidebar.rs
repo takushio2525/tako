@@ -39,6 +39,26 @@ pub fn notice_open_failed(path: &str, reason: &str) -> String {
         format!("Cannot open path ({path}): {reason}")
     )
 }
+/// ファイルツリーの**ローカル行**の操作が失敗したときの理由（#1399）。
+///
+/// この経路は以前 `let _ = dispatch(..)` / `if result.is_ok()` / `eprintln!` で
+/// 結果を捨てていたので、**ごみ箱移動やリネームが失敗しても画面が無反応**だった
+/// （同じファイルのリモート行は #919 から通知欄へ出していた）。`op` はユーザーが
+/// 実際に押したメニュー項目の文言（`menu_*` / `hidden_*` の戻り値）をそのまま渡す =
+/// 「押したもの」と「失敗したもの」の名前が必ず一致する。
+/// `target` が `None` なのは対象パスを持たない操作（隠しファイル表示トグル）
+pub fn notice_op_failed(op: &str, target: Option<&str>, reason: &str) -> String {
+    match target {
+        Some(t) => tr!(
+            format!("{op} に失敗しました（{t}）: {reason}"),
+            format!("{op} failed ({t}): {reason}")
+        ),
+        None => tr!(
+            format!("{op} に失敗しました: {reason}"),
+            format!("{op} failed: {reason}")
+        ),
+    }
+}
 pub fn menu_rename() -> &'static str {
     tr!("名前変更", "Rename")
 }
@@ -102,6 +122,55 @@ mod tests {
     use super::super::tests_support;
     use super::*;
     use tako_core::i18n::Lang;
+
+    /// ローカル操作の失敗の文言が**押した項目の名前を先頭に置いて日英で出る**（#1399）。
+    ///
+    /// `op` はメニューの文言そのもの（`menu_*` の戻り値）を渡す約束なので、
+    /// 「押したもの」と「失敗したもの」が必ず一致する。対象を持たない操作
+    /// （隠しファイルトグル）では括弧ごと落ちることも固定する
+    #[test]
+    fn ローカル操作の失敗文言が日英で出る() {
+        tests_support::with_lang(Lang::Ja, || {
+            assert_eq!(
+                notice_op_failed(
+                    menu_trash(FileManager::Finder),
+                    Some("/tmp/x"),
+                    "パスが存在しない"
+                ),
+                "削除 に失敗しました（/tmp/x）: パスが存在しない"
+            );
+            assert_eq!(
+                notice_op_failed(hidden_show(), None, "無効なパラメータ"),
+                "隠しファイルを表示 に失敗しました: 無効なパラメータ"
+            );
+        });
+        tests_support::with_lang(Lang::En, || {
+            assert_eq!(
+                notice_op_failed(
+                    menu_trash(FileManager::Explorer),
+                    Some("/tmp/x"),
+                    "no such path"
+                ),
+                "Move to Recycle Bin failed (/tmp/x): no such path"
+            );
+            assert_eq!(
+                notice_op_failed(hidden_hide(), None, "invalid params"),
+                "Hide hidden files failed: invalid params"
+            );
+            assert_eq!(
+                notice_open_failed("/tmp/x", "not a file"),
+                "Cannot open path (/tmp/x): not a file"
+            );
+        });
+        // 対象の有無で形が変わる（同じ文字列を 2 回返す形へ退化していない）
+        tests_support::for_each_lang(|| {
+            assert_ne!(
+                notice_op_failed("Op", Some("/tmp/x"), "why"),
+                notice_op_failed("Op", None, "why"),
+                "target の有無が文言に出ていない"
+            );
+        });
+    }
 
     /// ファイルマネージャ / ごみ箱の呼び名が **OS ごとに実際に分かれている**（#617）。
     ///
@@ -172,6 +241,12 @@ mod tests {
                 menu_open_term().to_string(),
                 menu_open_default().to_string(),
                 menu_open_with().to_string(),
+                // #1283 / #1399: 失敗の理由（cmd+クリック / ツリーのローカル操作）。
+                // 差し込む値は**言語非依存の placeholder** にする（`op` / `reason` は
+                // 呼び出し側が渡す文字列で、英語側に日本語が残っていないかの検査対象外）
+                notice_open_failed("/tmp/x", "no such path"),
+                notice_op_failed("Trash", Some("/tmp/x"), "no such path"),
+                notice_op_failed("Toggle", None, "no such path"),
                 menu_rename().to_string(),
                 menu_new_file().to_string(),
                 menu_new_dir().to_string(),

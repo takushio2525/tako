@@ -48799,6 +48799,124 @@ mod self_test {
                 }
             }
 
+            // 84b. #1399: ファイルツリーの**ローカル行**の操作が失敗したら、共有の
+            // 通知欄（`remote_notice` = サイドバー上部のバナー）へ理由が 1 行出る。
+            // リネーム / 新規作成の失敗では**打った名前と入力欄が残る**（打ち直しに
+            // ならない）。旧実装は結果を `let _ =` / `if result.is_ok()` で捨てていて
+            // 押しても無言だったので、**A/B は `TAKO_1399_LEGACY=1`**（legacy アームは
+            // ここが FAILED になる = この 1 項目で前後比較が取れる）。
+            //
+            // 失敗させるのは **dispatch が OS へ行く前に返す形**にしてある（存在しない
+            // パス / 既にある名前）。macOS のごみ箱移動は Finder（osascript）委譲なので、
+            // 実際に OS を呼ぶ形で失敗させると自動化から Finder を起こしてしまう
+            {
+                let fixture =
+                    std::env::temp_dir().join(format!("tako-st1399-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&fixture);
+                let _ = std::fs::create_dir_all(&fixture);
+                let _ = std::fs::write(fixture.join("keep.txt"), "x");
+                let _ = std::fs::write(fixture.join("taken.txt"), "x");
+                // 作らない = 「対象が既に消えている」行（#1399 のエッジ）
+                let gone = fixture.join("gone.txt");
+                let keep = fixture.join("keep.txt");
+                let fixture_prefix = fixture.display().to_string();
+                // 通知本文は一時ディレクトリを含むので、診断へ出すときは畳む
+                let fold = move |s: &str| s.replace(&fixture_prefix, "<fixture>");
+                let type_name = |app: &mut TakoApp, cx: &mut Context<TakoApp>, name: &str| {
+                    for _ in 0.."keep.txt".len() {
+                        app.handle_inline_edit_key(&Keystroke::parse("backspace").unwrap(), cx);
+                    }
+                    for ch in name.chars() {
+                        app.handle_inline_edit_key(
+                            &Keystroke {
+                                modifiers: Modifiers::default(),
+                                key: ch.to_string(),
+                                key_char: Some(ch.to_string()),
+                            },
+                            cx,
+                        );
+                    }
+                    app.handle_inline_edit_key(&Keystroke::parse("enter").unwrap(), cx);
+                };
+                let (trash_notice, rename_notice, kept_text, ok_silent, last_wins) = window
+                    .update(cx, |app, _, cx| {
+                        app.filetree.set_show_hidden(false);
+                        app.filetree.set_roots(vec![fixture.clone()]);
+                        app.remote_notice = None;
+                        app.inline_edit = None;
+
+                        // ① シナリオ 1: 消えている対象を「削除」→ 理由が通知欄へ出る
+                        app.handle_context_action("trash", &gone, false, cx);
+                        let trash_notice = app
+                            .remote_notice
+                            .as_ref()
+                            .filter(|n| n.is_error)
+                            .map(|n| n.text.clone());
+
+                        // ② シナリオ 2: 既にある名前へリネーム → 理由が出て入力が残る
+                        app.remote_notice = None;
+                        app.handle_context_action("rename", &keep, false, cx);
+                        type_name(app, cx, "taken.txt");
+                        let rename_notice = app
+                            .remote_notice
+                            .as_ref()
+                            .filter(|n| n.is_error)
+                            .map(|n| n.text.clone());
+                        let kept_text = app.inline_edit.as_ref().map(|e| e.text.clone());
+
+                        // ③ 裏取り: 成功する操作では通知を出さない（誤検知していない）
+                        app.remote_notice = None;
+                        app.inline_edit = None;
+                        app.handle_context_action("rename", &keep, false, cx);
+                        type_name(app, cx, "ok.txt");
+                        let ok_silent = app.remote_notice.is_none()
+                            && app.inline_edit.is_none()
+                            && fixture.join("ok.txt").is_file();
+
+                        // ④ エッジ: 失敗が 2 件続いたら通知欄には最後の 1 件が残る
+                        app.handle_context_action("trash", &gone, false, cx);
+                        app.handle_context_action("reveal", &gone, false, cx);
+                        let last_wins = app.remote_notice.as_ref().is_some_and(|n| {
+                            n.is_error
+                                && n.text
+                                    .starts_with(crate::ui_text::sidebar::menu_reveal(
+                                        tako_control::platform::os_integration::file_manager(),
+                                    ))
+                        });
+                        app.remote_notice = None;
+                        cx.notify();
+                        (trash_notice, rename_notice, kept_text, ok_silent, last_wins)
+                    })
+                    .unwrap_or((None, None, None, false, false));
+                println!(
+                    "TAKO_SELF_TEST_1399: legacy={} trash={:?} rename={:?} kept={:?} \
+                     ok_silent={ok_silent} last_wins={last_wins}",
+                    TakoApp::legacy_1399(),
+                    trash_notice.as_deref().map(&fold),
+                    rename_notice.as_deref().map(&fold),
+                    kept_text,
+                );
+                let trash_ok = trash_notice
+                    .as_deref()
+                    .is_some_and(|t| t.contains("gone.txt") && t.contains("パスが存在しない"));
+                let rename_ok = rename_notice
+                    .as_deref()
+                    .is_some_and(|t| t.contains("taken.txt") && t.contains("既に存在する"));
+                let kept_ok = kept_text.as_deref() == Some("taken.txt");
+                check(trash_ok, "ツリー: ごみ箱移動の失敗が通知欄へ出る（#1399）");
+                check(
+                    rename_ok && kept_ok,
+                    "ツリー: リネーム失敗の理由が出て打った名前が残る（#1399）",
+                );
+                check(
+                    ok_silent && last_wins,
+                    "ツリー: 成功時は無言・失敗が続いたら最後の 1 件が残る（#1399）",
+                );
+                if fixture.starts_with(std::env::temp_dir()) {
+                    let _ = std::fs::remove_dir_all(&fixture);
+                }
+            }
+
             // 85. git タブのセクション表示順（#551 案 2）。
             // 「変更 → コミット → ブランチ → リモート → diff」の順に積まれることを
             // render が実際に記録した並び（`git_body_sections`）で固定する。

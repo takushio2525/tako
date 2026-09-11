@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-12（#1370: IPC 由来のレイアウト変更のあと 1 フレーム強制描画するようにした）
-- 真因は「cols / rows の書き手が描画の中だけ」+「macOS の gpui では notify でフレームが作られない」（display link は窓が可視でないと起動しない）。IPC ループ（全 dispatch が通る 1 箇所）で**レイアウトを変える Request のときだけ**応答を返す前に全ビューポートを 1 フレーム描く形へ。判定は `protocol::changes_layout` の純粋関数 1 実装（ワイルドカード無し = 155 バリアント全網羅・読み取り系は偽）
-- 隔離 GUI（tako-vd・入力イベント無し）の A/B（`TAKO_1370_LEGACY=1`）: resize は legacy **0/5**（20 秒待っても cols/rows 不変・rect だけ動く）→ 新 **5/5**（応答直後に反映）。equalize / split（新ペインが 80x24 のまま 2 枚 → 0 枚）/ theme toggle（`ipc_frame` +0 → +1）も同様。**`list` × 30 で `ipc_frame` +0**（読み取りは描かない = #786 の固定費が乗らない）
-- 隔離セルフテスト項目 22b（意図的に `notify_and_draw` を呼ばない）は新で ok（rows 13 → 5）・legacy で FAILED（25.1s 待って届かず）。番犬 `issue1370_ipc_redraw_watchdog` 8 本が注入 5 通りを file:line で名指し。全体は `TAKO_APP_SELF_TEST_OK` で完走
-
 ## 2026-09-12（#1390: terminal-core のテストの穴 4 件を埋めた）
 - 項目 1/3 はテスト追加（スクロール中の `visible_lines_filled` / `set_scrollback_limit` の副作用）、項目 2 は `history_plain_lines` の末尾トリムを `compose_grid_row` の 1 実装へ寄せて履歴行をスクロールで可視化して突き合わせ、項目 4 は罫線剥がしを `strip_box_border` 1 実装へ（`screen.rs` / `terminal.rs` / #1387 の番犬）
 - 項目 4 は「2 行目以降だけ剥がす」最小修正だと**枠線つきでプロンプト行にだけ本文がある箱が false** になるので、プロンプト行も同じ作法で見る形にした（1 行の箱の誤答は修正前から在った）
@@ -64,3 +59,8 @@
 - 状態を `Section` の 2 値へ（`Match` / `Include` のあとは「どの Host にも属さない位置」）。キーワードは行頭の最初のトークンで切る（`Match exec "test -f a=b"` で検知が抜けていた）。複数パターンは全部エントリ・`Include` は `~/.ssh/` 起点 + glob + 深さ 16 + 循環検出つきで解決し、読めない理由は `warnings` へ返す
 - 隔離 GUI（tako-vd・fixture HOME）で `tako ssh-hosts` の A/B: 修正前は `web1` と `prod(user=root port=2222)` の 2 件、修正後は `edge` / `inner`（Include 配下）/ `web1` / `web2` / `prod(user=null port=null)` の 5 件
 - 番犬 `issue1400_ssh_config_watchdog` 7 本。注入 2 通りで file:line 名指し FAILED（`ssh_config.rs:175` ×2 / `:190`）。#1004 の `guides/remote.md`「Include は読まない」も同一 PR で実態へ寄せた
+
+## 2026-09-12（#1399: ファイルツリーのローカル操作の失敗を共有の通知欄へ出した）
+- ローカル行の 13 か所が dispatch の結果を `let _ =` / `if result.is_ok()` / `eprintln!` で捨てていて、**ごみ箱移動・リネームが無言で失敗**していた（同じサイドバーのリモート行は #919 から通知欄へ出していた = 1 画面に 2 方針）。出し口を `sidebar::notify_tree_failure` の 1 実装へ寄せ、リモート行と同じ `set_remote_notice` + persist.log（載せるのは操作名と `DispatchError::class()` の分類だけ）へ通した。`commit_inline_edit` の先頭 `take()` をやめ、**失敗時は入力欄と打った名前を残す**
+- 隔離 GUI（tako-vd）セルフテスト項目 84b の A/B: 新 = `trash="削除 に失敗しました（<fixture>/gone.txt）: パスが存在しない…"` / `rename="名前変更 に失敗しました（taken.txt）: 既に存在する…"` / `kept="taken.txt"` / 成功時は無言・連続失敗は最後の 1 件が残る → 完走（`TAKO_APP_SELF_TEST_OK`・FAILED 0）。legacy（`TAKO_1399_LEGACY=1`）は `trash=None rename=None kept=None` で **FAILED**
+- 番犬 `issue1399_tree_notice_watchdog` 8 本（UI モジュールの dispatch 走査 + `eprintln!` + 1 実装 + `take()` + 分類 + 検出力）。修正前ソースで 6/7 が file:line 名指し FAILED（`sidebar.rs:1540/1570/1613/1630/1646/1659/1705/1718/1732/1740/1971/2014/2019`）。別画面の同型 3 件は `KNOWN_DISCARDED` で段階導入
