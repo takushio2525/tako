@@ -1105,15 +1105,25 @@ TAIL
                 .expect("実行権を付けられる");
         }
 
+        let limit = Duration::from_secs(2);
         let started = Instant::now();
-        let run = spawn_claude(&bin, "prompt", true, Duration::from_millis(600));
+        let run = spawn_claude(&bin, "prompt", true, limit);
         let waited = started.elapsed();
         assert_eq!(run, ClaudeRun::Failed, "打ち切りが非ゼロ終了に化けている");
         assert!(
-            waited < Duration::from_secs(10),
-            "上限で打ち切っていない（{waited:?} 待った）"
+            waited >= limit,
+            "上限まで待たずに失敗している（{waited:?}）"
         );
-        assert_eq!(arg_lines(&log).len(), 1, "打ち切りなのに起動が 2 回ある");
+        // 偽 claude の孫は 30 秒眠る。`join` で待つ実装ならここが 30 秒を超える
+        assert!(
+            waited < Duration::from_secs(20),
+            "上限で打ち切っていない（{waited:?} 待った = 孫が stdout を握ったまま）"
+        );
+        // 起動回数は「2 回目が無い」だけを見る。**1 回目が何行書けたかは測らない**
+        // （負荷が高いと偽 CLI が `echo` へ到達する前に kill されるので、
+        // ちょうど 1 行を期待すると時間の当てずっぽうになる = #1167 / #1220 の規約）
+        let calls = arg_lines(&log);
+        assert!(calls.len() <= 1, "打ち切りなのに再試行している: {calls:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
