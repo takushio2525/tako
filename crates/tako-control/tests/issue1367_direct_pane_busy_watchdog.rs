@@ -132,8 +132,11 @@ fn guiモードの判定材料も1実装を通す() {
 fn チャットのagent_runningも1実装を通す() {
     let body = fn_body(CHAT, "    pub(crate) fn collect_chat_targets(");
     let code = compact(&body);
+    // #1397 で `agent_running` は alt screen の判定にも使うので let 束縛になった。
+    // **見るのは形ではなく規則**（1 実装を通しているか）なので両方の形を認める
     assert!(
-        code.contains("agent_running:self.pane_has_busy_children("),
+        code.contains("agent_running:self.pane_has_busy_children(")
+            || code.contains("letagent_running=self.pane_has_busy_children("),
         "{CHAT}: collect_chat_targets の agent_running が pane_has_busy_children を\n\
          通っていない。器なしペインではエージェントが動いていても\n\
          「稼働中」に見えない（#1367）"

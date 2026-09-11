@@ -27,7 +27,8 @@
 **Non-goals（v1 でやらないこと）**:
 
 - codex / agy ペインのチャット化（transcript 正規化が claude 形式のみ。将来 #120 の agent 抽象で拡張）
-- alt_screen TUI（vim 等）のチャット化（構造的に不可能。ターミナル表示へフォールバック）
+- alt_screen TUI（vim 等）のチャット化（構造的に不可能。ターミナル表示へフォールバック。
+  **claude 自身の TUI は例外** = alt screen でもチャットにする。#1397）
 - ペイン単位の表示モード永続化（§1.3。「コマンド入力へ」ボタンによる揮発的な解除のみ）
 - リモート PWA の置き換え・変更（データ源を共有するだけ。§3.3）
 - チャット履歴の横断検索・過去セッション一覧（sessions カタログ #112 との統合は将来）
@@ -85,8 +86,8 @@ GUI モード時、各ペインは毎 render 時に以下で表示を決める�
 | 条件 | 表示 |
 |---|---|
 | スターター揮発解除フラグあり | ターミナル表示 |
-| alt_screen 中（`is_alt_screen()`） | ターミナル表示 |
 | claude 対話 TUI 稼働（`agents::live_claude_sessions` の pid 祖先解決で session_id が取れる、または role が master / solo / worker で claude） | チャットビュー |
+| alt_screen 中（`is_alt_screen()`） | ターミナル表示 |
 | 子プロセスなしのアイドルシェル（既存 sleep_guard 系の子プロセス判定を再利用） | スターター |
 | **過渡期の猶予が残っている（#720。ペイン生成 / エージェント起動から上限内）** | **準備中プレースホルダ** |
 | それ以外（コマンド実行中・不明 TUI・codex / agy） | ターミナル表示 |
@@ -140,8 +141,18 @@ tako-core / tako-control 側に純関数で切り出し、unit test 可能にす
 > 行き先がエージェントなので長い方の上限を使う。
 >
 > `released` / `alt_screen` は**過渡期より優先**する。前者は「待たせる理由が無い」から、
-> 後者は tmux 不在構成で claude TUI が外側の alt screen として見えるためで、そこは
-> そもそもチャットにできない（G2 の帰結）= ターミナル表示が正しい行き先だから。
+> 後者は覆っても中身を描けないから（vim 等）。
+>
+> **#1397 の訂正: `alt_screen` はチャット確定より後**。上の 2 行を「alt_screen が
+> チャットより先」と書いていた版には、`tmux 不在構成で claude TUI が外側の alt screen
+> として見えるので、そこはそもそもチャットにできない` という前提があった。**これは
+> 誤り**で、チャットビューは transcript を読んで自前で描くので端末の中身に依存しない
+> （器ありの claude も tmux の中で alt screen を使っており、そこでは `pane_inner_alt_screen`
+> が無条件 false を返すためチャットになっている = 器の有無で同じ画面が違う扱いを
+> 受けていた）。器なし（tmux 未導入 / persist OFF = Homebrew cask の既定）で
+> `alt_screen=true` / `claude_chat=false` / `display=terminal` を隔離 GUI で実測し、
+> 表の順序を「チャット確定 → alt_screen」へ入れ替えた。**器ありは
+> `pane_inner_alt_screen` が常に false なので結果は不変**。A/B は `TAKO_1397_LEGACY=1`。
 
 ### 2.2 スターター（空ペインの 3 ボタン）
 
@@ -336,7 +347,7 @@ PWA のコードには触れない。将来 codex 対応等でデータ源を拡
 >   md 本文は #690 の `md_view::render_document` を通すので、プレビューペイン・
 >   アップデート詳細と**同じ見た目**（見出し / GFM 表 / コード / 引用 / 強調）になる
 > - 読み取りは定期更新（2 秒）へ相乗り: `collect_chat_targets`（UI・材料集め）→
->   `load_chat_refresh`（background・`live_claude_sessions_by_backend` 1 回 +
+>   `load_chat_refresh`（background・`live_claude_sessions` 1 回 +
 >   transcript の mtime / サイズが変わったときだけ再読込）→ `apply_chat_refresh`。
 >   **新規ポーリングはゼロ**。terminal モードでは collect が即空を返す
 > - **判定を仕様より 1 段厳しくした**（§2.1 の「または role が master / solo / worker で
@@ -346,9 +357,13 @@ PWA のコードには触れない。将来 codex 対応等でデータ源を拡
 >   ので、生存の根拠をプロセス側（実行中の子プロセス）から取る必要がある。
 >   結果、`tako_core::ui_mode::chat_session` は session_id + interactive +
 >   子プロセス実行中の 3 点が揃ったときだけチャットにする
-> - 上の帰結として、**チャットになるのは tmux バックエンドを持つペインだけ**
+> - ~~上の帰結として、**チャットになるのは tmux バックエンドを持つペインだけ**
 >   （live 解決の対応キーがバックエンドセッション名のため）。tmux 不在環境の直接
->   spawn ペインは GUI モードでもターミナル表示のまま
+>   spawn ペインは GUI モードでもターミナル表示のまま~~
+>   → **#1397 で解消**。live 解決の対応キーを `agents::LiveSessionKey`（器あり =
+>   セッション名 / 器なし = (tako ペイン ID, PTY 直下の子 pid)）へ広げ、列挙も
+>   `terminals` 起点にした。器なしの sticky（#466）は **pid も鍵に含める**ので、
+>   閉じて作り直したペイン（ID は再利用される #390）に前の会話が貼り付かない
 > - busy の判定は `claude agents --json` の `status` を優先し、取れないときだけ
 >   画面採取（`claude_tui::is_busy`）へ落とす（#571 の階層に合わせた）
 > - ctx バーは 80% 超で警告色まで実装。**「/compact で会話を軽くできます」ヒントは
