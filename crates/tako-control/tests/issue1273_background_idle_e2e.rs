@@ -225,7 +225,8 @@ fn 実端末の画面で背景作業つき入力待ちを見分ける() {
         "実端末の画面から背景作業の内訳を読めない:\n{screen}"
     );
     assert_eq!(
-        wait::input_waiting_with_background_work(&screen, false, Some(Agent::Claude)).as_deref(),
+        wait::input_waiting_with_background_work(&screen, false, Some(Agent::Claude), None)
+            .overriding(),
         Some("1 shell"),
         "実端末の入力待ちを判定できない:\n{screen}"
     );
@@ -246,8 +247,8 @@ fn 実端末の画面で背景作業つき入力待ちを見分ける() {
         "生成中の画面を busy と読めていない:\n{busy_screen}"
     );
     assert_eq!(
-        wait::input_waiting_with_background_work(&busy_screen, false, Some(Agent::Claude)),
-        None,
+        wait::input_waiting_with_background_work(&busy_screen, false, Some(Agent::Claude), None),
+        wait::BackgroundIdle::No,
         "生成中の画面を入力待ちと誤読している:\n{busy_screen}"
     );
 
@@ -261,8 +262,10 @@ fn 実端末の画面で背景作業つき入力待ちを見分ける() {
     );
     let draft_screen = capture(&session);
     assert_eq!(
-        wait::input_waiting_with_background_work(&draft_screen, false, Some(Agent::Claude)),
-        None,
+        wait::input_waiting_with_background_work(&draft_screen, false, Some(Agent::Claude), None),
+        // 属性の取れない素の tmux capture なので、下書きとゴースト提案を
+        // 見分けられない = 安全側（覆さない）へ倒れる（#1297）
+        wait::BackgroundIdle::DraftIndistinguishable("1 shell".into()),
         "下書きのある入力欄を「空の入力待ち」と読んでいる:\n{draft_screen}"
     );
 
@@ -271,7 +274,9 @@ fn 実端末の画面で背景作業つき入力待ちを見分ける() {
     assert!(
         wait_until(Duration::from_secs(10), || {
             let s = capture(&session);
-            wait::input_waiting_with_background_work(&s, false, Some(Agent::Claude)).is_some()
+            wait::input_waiting_with_background_work(&s, false, Some(Agent::Claude), None)
+                .overriding()
+                .is_some()
         }),
         "ターン終了へ戻しても判定できない:\n{}",
         capture(&session)
@@ -291,12 +296,14 @@ fn 折りたたみ画面では実端末でも判定しない() {
     let guard = launch_emulator("collapsed");
     let screen = capture(&guard.session);
     assert!(
-        wait::input_waiting_with_background_work(&screen, false, Some(Agent::Claude)).is_some(),
+        wait::input_waiting_with_background_work(&screen, false, Some(Agent::Claude), None)
+            .overriding()
+            .is_some(),
         "前提（折りたたみでなければ判定できる）が崩れている:\n{screen}"
     );
     assert_eq!(
-        wait::input_waiting_with_background_work(&screen, true, Some(Agent::Claude)),
-        None,
+        wait::input_waiting_with_background_work(&screen, true, Some(Agent::Claude), None),
+        wait::BackgroundIdle::No,
         "折りたたみ中に画面を根拠にしている"
     );
 }

@@ -137,9 +137,11 @@ fn 空の入力欄だけでは倒さない() {
         body.contains("background_work_summary"),
         "背景作業の申告を見ていない。説明のつかない busy まで覆すことになる"
     );
+    // #1297: 「空か」は**属性込み**の分類器が決める（文字列だけに戻したら
+    // ゴースト提案が下書きに見えて覆せなくなる。詳細は issue1297 の番犬）
     assert!(
-        body.contains("input_content_is_empty"),
-        "入力欄が空であることを見ていない（人間の下書きを踏み潰す）"
+        body.contains("classify_input_draft"),
+        "入力欄に人の下書きが無いことを見ていない（人間の下書きを踏み潰す）"
     );
     assert!(
         body.contains("collapsed"),
@@ -152,8 +154,8 @@ fn 空の入力欄だけでは倒さない() {
         "✻ Cooking… (12s · ↓ 1.2k tokens)\n\n✻ … · 1 shell, 1 monitor still running",
     );
     assert_eq!(
-        wait::input_waiting_with_background_work(&generating, false, Some(Agent::Claude)),
-        None,
+        wait::input_waiting_with_background_work(&generating, false, Some(Agent::Claude), None),
+        wait::BackgroundIdle::No,
         "スピナーが出ている画面を入力待ちと読んでいる"
     );
 }
@@ -193,8 +195,8 @@ fn 背景作業の完了待ちは完了と読まない() {
          完了として読んでいる"
     );
     assert_eq!(
-        wait::input_waiting_with_background_work(&waiting, false, Some(Agent::Claude)),
-        None
+        wait::input_waiting_with_background_work(&waiting, false, Some(Agent::Claude), None),
+        wait::BackgroundIdle::No
     );
     // 対照: 終わっている形はちゃんと読める（番犬が常に通るだけの形になっていない）
     assert_eq!(

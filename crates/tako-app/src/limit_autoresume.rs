@@ -175,12 +175,9 @@ impl TakoApp {
             };
             // 入力欄に人間の下書きがあるか。ダイアログ中は入力欄自体が無いので見ない
             let user_draft = matches!(stop.kind, LimitStopKind::Idle)
-                && session.analyze_input().is_some_and(|s| {
-                    matches!(
-                        s.style,
-                        tako_core::InputStyle::User | tako_core::InputStyle::Mixed
-                    )
-                });
+                && session
+                    .analyze_input()
+                    .is_some_and(|s| s.style.is_user_draft());
 
             let tracker = self
                 .limit_resume
