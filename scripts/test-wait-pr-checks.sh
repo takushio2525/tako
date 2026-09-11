@@ -58,15 +58,37 @@ emit() {
   if [[ -n "${q}" ]]; then jq -r "${q}" "${file}"; else cat "${file}"; fi
 }
 
-# 鮮度チェック（merge 直前に main が進んでいないか）が使う口。
+# 鮮度チェック（merge 直前に main が進んでいないか）と後始末（リモート head ブランチ）が使う口。
 # 応答ファイルを置かないテストでは失敗して返る = 助言を諦めて merge へ進む経路になる
 if [[ "$1" == "api" ]]; then
-  case "$2" in
+  path=""; method="GET"
+  prev=""
+  for a in "$@"; do
+    case "${a}" in
+      repos/*) [[ -z "${path}" ]] && path="${a}" ;;
+    esac
+    if [[ "${prev}" == "-X" || "${prev}" == "--method" ]]; then method="${a}"; fi
+    prev="${a}"
+  done
+  case "${path}" in
+    */git/ref/heads/* | */git/refs/heads/*)
+      # リモートブランチの有無は ${M}/remote-branches が正（1 行 1 本）
+      br="${path#*/git/ref}"; br="${br#s}"; br="${br#/heads/}"
+      if [[ "${method}" == "DELETE" ]]; then
+        grep -qxF "${br}" "${M}/remote-branches" 2>/dev/null || { echo "mock: 無いブランチの削除: ${br}" >&2; exit 1; }
+        grep -vxF "${br}" "${M}/remote-branches" > "${M}/remote-branches.new" 2>/dev/null || true
+        mv "${M}/remote-branches.new" "${M}/remote-branches"
+        exit 0
+      fi
+      grep -qxF "${br}" "${M}/remote-branches" 2>/dev/null || { echo "mock: 404 ${br}" >&2; exit 1; }
+      echo "{\"ref\":\"refs/heads/${br}\"}"
+      exit 0
+      ;;
     */commits/*) f="${M}/api-commit.json" ;;
     */compare/*) f="${M}/api-compare.json" ;;
     *) f="" ;;
   esac
-  [[ -n "${f}" && -f "${f}" ]] || { echo "mock: api の応答が無い: $2" >&2; exit 1; }
+  [[ -n "${f}" && -f "${f}" ]] || { echo "mock: api の応答が無い: ${path}" >&2; exit 1; }
   emit "${f}" "$@"
   exit 0
 fi
@@ -107,8 +129,19 @@ case "$1 ${2:-}" in
     ;;
   "pr merge")
     echo "$*" >> "${M}/merged"
+    rc="$(cat "${M}/merge.rc" 2>/dev/null || echo 0)"
+    if [[ "${rc}" != "0" ]]; then
+      # worktree 事故: ローカルの切り替えで落ちるので**リモートは消えない**（#1347 の実測）
+      cat "${M}/merge.err" 2>/dev/null || echo "failed to run git" >&2
+      exit "${rc}"
+    fi
+    # 成功したときは本物と同じくリモート head も消える
+    if [[ -f "${M}/remote-branches" && -f "${M}/merge-head" ]]; then
+      grep -vxF "$(cat "${M}/merge-head")" "${M}/remote-branches" > "${M}/remote-branches.new" 2>/dev/null || true
+      mv "${M}/remote-branches.new" "${M}/remote-branches"
+    fi
     echo "Merged pull request via mock"
-    exit "$(cat "${M}/merge.rc" 2>/dev/null || echo 0)"
+    exit 0
     ;;
 esac
 echo "mock: 未対応の呼び出し: $*" >&2
@@ -427,6 +460,80 @@ echo '{"behind_by":2}' > "${TAKO_GH_MOCK_DIR}/api-compare.json"
 out="$(run_merge 1334 --timeout 20 --interval 1)"
 assert_eq "run より古い main の先頭では警告しない（run の merge 結果に入っている）" "$?" "0"
 assert_hasnt "余計な警告を出さない" "警告: CI が緑になった後に" "${out}"
+
+echo "== Test 16: worktree 事故で gh が落ちてもリモート head ブランチを消し切る（#1347）=="
+BR="fix/1347-delete-remote-branch"
+setup_1347() { # $1 = ケース名
+  new_case "$1"
+  checks_json "${CF}|pass|2026-09-11T04:24:00Z" "${MAC}|pass|2026-09-11T04:36:50Z" "${WIN}|pass|2026-09-11T04:39:33Z" \
+    > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+  cat > "${TAKO_GH_MOCK_DIR}/view.json" <<JSON
+{"number":1348,"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN",
+ "headRefName":"${BR}","headRefOid":"cafebabe","baseRefName":"main","isCrossRepository":false,
+ "title":"[修正] テスト用","url":"https://example.invalid/pr/1348"}
+JSON
+  printf '%s\n' "${BR}" > "${TAKO_GH_MOCK_DIR}/remote-branches"
+  printf '%s' "${BR}" > "${TAKO_GH_MOCK_DIR}/merge-head"
+}
+remote_has() { grep -qxF "${BR}" "${TAKO_GH_MOCK_DIR}/remote-branches" 2>/dev/null && echo yes || echo no; }
+
+setup_1347 t16
+echo 1 > "${TAKO_GH_MOCK_DIR}/merge.rc"
+printf "failed to run git: fatal: 'main' is already used by worktree at '/tmp/shared'\n" > "${TAKO_GH_MOCK_DIR}/merge.err"
+out="$(run_merge 1348 --timeout 20 --interval 1)"
+rc=$?
+assert_eq "merge 自体が済んでいれば 0 で終わる" "${rc}" "0"
+assert_has "消したことを 1 行で言う" "リモートブランチ ${BR} を削除した" "${out}"
+assert_eq "リモート head ブランチが残らない" "$(remote_has)" "no"
+
+setup_1347 t16legacy
+echo 1 > "${TAKO_GH_MOCK_DIR}/merge.rc"
+printf "failed to run git: fatal: 'main' is already used by worktree at '/tmp/shared'\n" > "${TAKO_GH_MOCK_DIR}/merge.err"
+out="$(TAKO_1347_LEGACY=1 run_merge 1348 --timeout 20 --interval 1)"
+assert_eq "修正前（gh 任せ）はリモートに残る = 検出力" "$(remote_has)" "yes"
+assert_hasnt "修正前は削除の行も出ない" "を削除した" "${out}"
+
+echo "== Test 17: gh が消せていれば何もしない（冪等）=="
+setup_1347 t17
+out="$(run_merge 1348 --timeout 20 --interval 1)"
+rc=$?
+assert_eq "正常な merge も 0" "${rc}" "0"
+assert_has "削除済みと言う" "リモートブランチ ${BR} は削除済み" "${out}"
+assert_eq "DELETE は呼ばない" "$(grep -c 'X DELETE' "${TAKO_GH_MOCK_DIR}/calls.log" 2>/dev/null || true)" "0"
+assert_eq "リモートにも残っていない" "$(remote_has)" "no"
+
+echo "== Test 18: head と base が同じときは触らない（main を消す経路を作らない）=="
+new_case t18
+checks_json "${CF}|pass|2026-09-11T04:24:00Z" "${MAC}|pass|2026-09-11T04:36:50Z" "${WIN}|pass|2026-09-11T04:39:33Z" \
+  > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+cat > "${TAKO_GH_MOCK_DIR}/view.json" <<'JSON'
+{"number":1348,"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN",
+ "headRefName":"main","headRefOid":"cafebabe","baseRefName":"main","isCrossRepository":false,
+ "title":"[修正] テスト用","url":"https://example.invalid/pr/1348"}
+JSON
+printf 'main\n' > "${TAKO_GH_MOCK_DIR}/remote-branches"
+echo 1 > "${TAKO_GH_MOCK_DIR}/merge.rc"
+printf 'failed to run git\n' > "${TAKO_GH_MOCK_DIR}/merge.err"
+out="$(run_merge 1348 --timeout 20 --interval 1)"
+assert_has "head と base が同じなら後始末をしない" "head と base が同じ" "${out}"
+assert_eq "既定ブランチは消さない" "$(grep -c 'X DELETE' "${TAKO_GH_MOCK_DIR}/calls.log" 2>/dev/null || true)" "0"
+assert_eq "main はリモートに残る" "$(grep -cxF main "${TAKO_GH_MOCK_DIR}/remote-branches")" "1"
+
+echo "== Test 19: fork からの PR の head には触らない =="
+new_case t19
+checks_json "${CF}|pass|2026-09-11T04:24:00Z" "${MAC}|pass|2026-09-11T04:36:50Z" "${WIN}|pass|2026-09-11T04:39:33Z" \
+  > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+cat > "${TAKO_GH_MOCK_DIR}/view.json" <<'JSON'
+{"number":1348,"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN",
+ "headRefName":"patch-1","headRefOid":"cafebabe","baseRefName":"main","isCrossRepository":true,
+ "title":"[修正] テスト用","url":"https://example.invalid/pr/1348"}
+JSON
+printf 'patch-1\n' > "${TAKO_GH_MOCK_DIR}/remote-branches"
+echo 1 > "${TAKO_GH_MOCK_DIR}/merge.rc"
+printf 'failed to run git\n' > "${TAKO_GH_MOCK_DIR}/merge.err"
+out="$(run_merge 1348 --timeout 20 --interval 1)"
+assert_has "fork の head には触らないと言う" "fork からの PR なので head ブランチには触らない" "${out}"
+assert_eq "DELETE は呼ばない" "$(grep -c 'X DELETE' "${TAKO_GH_MOCK_DIR}/calls.log" 2>/dev/null || true)" "0"
 
 echo
 echo "=== 結果: PASS=${PASS} FAIL=${FAIL} ==="

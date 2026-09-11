@@ -11,12 +11,22 @@
 # #1295 のテストに #1297 が足したフィールドが無い）はここを通り抜けるので、
 # merge の直前に「緑を出した run の後に main が進んでいないか」を見て警告する。
 #
+# merge の後始末（リモート head ブランチの削除）も自分で閉じる。`gh pr merge --delete-branch` は
+# 「ローカルへ切り替えてから消す」順で処理するので、**専用 worktree から実行すると**
+# `fatal: '<既定ブランチ>' is already used by worktree` で打ち切られ、**リモートも消え残る**
+# （#1347 = PR #1337 の実測。この機序はこのリポの標準手順が毎回踏む）。
+#
 # 使い方: bash scripts/merge-pr.sh <PR番号> [--timeout <秒>] [--interval <秒>]
 # 終了コード: 0 = merge した / 1 = merge しなかった（CI 失敗・コンフリクト等）/
 #             2 = CI が揃わずタイムアウト / 3 = 引数・gh のエラー
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# A/B（検出力の確認・計測専用）。1 = **修正前**のまま gh の --delete-branch に後始末を任せる
+# 腕。worktree から実行するとリモート head ブランチが消え残る（#1347）。
+# scripts/test-wait-pr-checks.sh の Test 16 がこの腕で残ることを固定している
+LEGACY_1347="${TAKO_1347_LEGACY:-0}"
 
 die() {
   echo "エラー: $*" >&2
@@ -66,7 +76,7 @@ fetch_pr() {
   local err rc
   err="$(mktemp)"
   set +e
-  PR_JSON="$(gh pr view "${PR}" --json number,state,isDraft,mergeable,mergeStateStatus,headRefName,headRefOid,baseRefName,title,url 2>"${err}")"
+  PR_JSON="$(gh pr view "${PR}" --json number,state,isDraft,mergeable,mergeStateStatus,headRefName,headRefOid,baseRefName,isCrossRepository,title,url 2>"${err}")"
   rc=$?
   set -e
   if [[ ${rc} -ne 0 || -z "${PR_JSON}" ]]; then
@@ -123,6 +133,38 @@ gate_state() {
       refuse "PR #${PR} は保護ルールで止まっている（mergeStateStatus=BLOCKED）"
       ;;
   esac
+}
+
+# merge 成立後にリモートの head ブランチが残っていたら自分で消す（#1347）。
+# gh は --delete-branch を「ローカルへ切り替え → ローカル削除 → リモート削除」の順で行うので、
+# 専用 worktree（共有ツリーが既定ブランチを握っている）だと最初の切り替えで落ちて
+# **リモートまで到達しない**。冪等（既に無ければ何もしない）で、消すのは**この PR の head だけ**。
+delete_remote_head_branch() {
+  local head base cross
+  # A/B: 修正前は gh の後始末に任せきりだった
+  [[ "${LEGACY_1347}" != "1" ]] || return 0
+  head="$(pr_field headRefName)"
+  base="$(pr_field baseRefName)"
+  cross="$(pr_field isCrossRepository)"
+  [[ -n "${head}" ]] || return 0
+  # 取り込み先（= この PR の base）には絶対に触らない。main を消す経路を作らないための門
+  if [[ "${head}" == "${base}" ]]; then
+    echo "警告: head と base が同じ（${head}）ので後始末をしない" >&2
+    return 0
+  fi
+  if [[ "${cross}" == "true" ]]; then
+    echo "fork からの PR なので head ブランチには触らない（${head}）"
+    return 0
+  fi
+  if ! gh api "repos/{owner}/{repo}/git/ref/heads/${head}" >/dev/null 2>&1; then
+    echo "リモートブランチ ${head} は削除済み"
+    return 0
+  fi
+  if gh api -X DELETE "repos/{owner}/{repo}/git/refs/heads/${head}" >/dev/null 2>&1; then
+    echo "リモートブランチ ${head} を削除した"
+  else
+    echo "警告: リモートブランチ ${head} を削除できなかった（手で: git push origin --delete ${head}）" >&2
+  fi
 }
 
 # 緑を出した CI run の**後に** main が進んでいたら警告する。
@@ -187,7 +229,8 @@ if [[ "${STATE}" != "MERGED" ]]; then
   exit 1
 fi
 if [[ ${MERGE_RC} -ne 0 ]]; then
-  echo "警告: merge は済んだが gh が ${MERGE_RC} で終わった（ローカルブランチの後始末を確認する）" >&2
+  echo "警告: merge は済んだが gh が ${MERGE_RC} で終わった（ローカルブランチの後始末は環境依存なので手で確認する）" >&2
 fi
+delete_remote_head_branch
 echo "PR #${PR} は ${STATE}（$(pr_field url)）"
 exit 0
