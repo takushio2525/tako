@@ -1096,7 +1096,7 @@ fn error_account_json(error: &serde_json::Map<String, Value>) -> Option<Value> {
             out.insert(key.to_string(), v.clone());
         }
     }
-    (!out.is_empty()).then(|| Value::Object(out))
+    (!out.is_empty()).then_some(Value::Object(out))
 }
 
 /// 空行を除いた末尾 N 行を返す（新しい行が先頭）

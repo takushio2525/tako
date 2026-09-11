@@ -52,6 +52,17 @@ jobs:
       # （feature が違うのはこの経路だけで、残りの依存はそのまま再利用される）
       - name: Clippy（visual-test feature。#1072）
         run: cargo clippy -p tako-app --features visual-test --all-targets -- -D warnings
+      # 上の `--workspace` 形は **全メンバーの feature を統合した 1 つの宇宙**しか見ない。
+      # gpui（zed 由来）が `serde_json/preserve_order` を要求するので、workspace 形では
+      # `serde_json::Map` が IndexMap 実装になり `Value` が**有意な Drop** を持つ
+      # → clippy の `unnecessary_lazy_evaluations` は `then_some` を提案しなくなる。
+      # 一方 GUI を含まない `-p tako-control` の宇宙では Map は BTreeMap 実装（Drop は
+      # insignificant）なので同じ行に lint が出る。**CI 緑なのに手元の `-p` が赤**という
+      # 食い違いがこれで生まれた（#1383。実測は .agent/commands.md の lint 行）。
+      # そこで **gpui を含まない宇宙**を 1 回だけ別に lint する。tako-app 側の宇宙は
+      # 上の 2 ステップが既に見ているので、足すのはこの 3 クレートだけでよい
+      - name: Clippy（gpui 抜きの feature 宇宙。#1383）
+        run: cargo clippy -p tako-core -p tako-control -p tako-cli --all-targets -- -D warnings
       - name: ビルド
         run: cargo build --workspace
       - name: テスト
