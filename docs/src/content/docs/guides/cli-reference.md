@@ -986,6 +986,12 @@ tako recent                           # 最近開いた項目
 tako ssh-hosts                        # ~/.ssh/config の Host 一覧
 ```
 
+一覧は `Include` の取り込み先（`Include config.d/*` のような相対パスは `~/.ssh/` 起点・glob 対応）まで
+辿るので、`ssh` で繋げるホストが一覧から漏れません。`Host web1 web2` のように 1 行へ複数書いた場合は
+**両方**が別のエントリとして並びます。`Match` ブロックの中の設定（`Match host bastion` 配下の
+`User` / `Port` など）は、その直前の `Host` には付きません（`ssh` 自身と同じ扱い）。ワイルドカード
+（`*` / `?`）や否定（`!host`）のパターンは繋ぎ先が決まらないので一覧に出ません。
+
 SSH の開き先は `--target` で選べます（省略時 `split`）。
 
 ```bash
