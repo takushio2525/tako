@@ -1271,6 +1271,42 @@ claude は空欄へ **AI のゴースト提案**を dim で描き、文面は
   作るので、走査系のテストはこちらでも 1 本用意する
 - **`text` を読む側は `trim_end()` を通す**（`visible_lines` 等の既存コードは全部そうしている）
 
+## 画面テキストは 0 幅の結合文字ごと組む（Issue #1387）
+
+alacritty は 0 幅の結合文字（NFD の濁点 `U+3099`・アクセント `U+0301`・異体字セレクタ）を
+`Cell::c` ではなく **`Cell::extra.zerowidth`** に持つ。`c` だけを読むと結合文字は画面テキストを
+組む経路で**黙って落ちる**。
+
+- **`zerowidth` を読むのは `screen::cell_text` の 1 実装だけ**。テキストを組む側は
+  `screen::push_cell_text`（`Cell` から直接組む経路）か `resolve_cell`（色解決と同時に組む
+  `Screen` の経路）を通す。#1387 の修正前は落ちる実装が 3 つ在り（`resolve_cell` =
+  描画 / GUI モード / links の材料・`compose_grid_row` = `tail_lines` / `visible_lines_filled`・
+  `history_plain_lines` = ペインログ）、**選択コピーだけ**が alacritty 自身の
+  `selection_to_string` を通っていたので、同じセルの内容が「見た目 / `read_pane` /
+  ペインログ」と「Cmd+C」で食い違っていた
+- **実害は「コピーしたパスは開けるが画面のリンクは開けない」**（実測: macOS の NFD
+  ファイル名 `画像か` + `U+3099` + `ある.txt` が `画像かある.txt` として読み出され、`links` の
+  実在チェックが false = cmd+クリックが無反応。#153 / #1283 で通した経路がここで死ぬ）
+- **`text` へ結合文字を足したら `cell_cols` へ同じ列を積む**。`cell_cols` は「`text` の各 char が
+  占めるグリッド列」なので、積まないと描画のセル写像と links のスパンが 1 文字ずつずれる
+  （`has_wide` の `w[1] - w[0] > 1` は同列が並ぶと差 0 になるだけなので影響しない）
+- **末尾の空白詰めを切る境界も同じ 1 実装で見る**（`screen::cell_is_trailing_blank`）。
+  行頭に単独の結合文字が来ると本体が `' '` のセルへ載る（alacritty の `width == 0` 経路は
+  1 つ左のセルへ寄せ、列 0 ではその場に載る）ので、素の空白扱いで切ると落ちる。
+  #801 の空白セルの近道（`is_plain_blank`）も同じ理由で結合文字の有無を見る
+- **hot path を太らせない**: 結合文字を持つセルは稀なので、`snapshot` のフラット配列は
+  そのままにして**在るセルだけ**を `(添字, 借りたスライス)` で横に持つ（結合文字ゼロの画面では
+  確保も探索もしない。実測 120x24 を 3000 回 snapshot = 修正前 68.6〜69.3ms /
+  修正後 65.3〜67.9ms）
+- 番犬は `crates/tako-control/tests/issue1387_combining_watchdog.rs`（1 実装の位置 /
+  3 経路の配線 / `cell_cols` の同列積み / 近道の除外）。挙動は
+  `terminal::tests::結合文字は画面テキストの全経路に残る` が `visible_lines` /
+  `tail_lines` / `history_plain_lines` / `selection_text` の**4 経路の一致**で見るので、
+  片方だけ直すと落ちる（= 3 実装の同時修正を構造的に要求する）
+- `links::screen_from_lines`（`tako links --text` の経路）の列は「ASCII = 1 / それ以外 = 2」の
+  近似なので結合文字も 2 列として数えるが、**どのパスがリンクになるかは変わらない**
+  （実測: `detect_in_lines` で NFD のファイル名が引ける）ので近似のまま据えている
+
 ## 画面テキストの切り出しは「区切りを増やす」より「削って実在で決める」（Issue #1283）
 
 ターミナル画面からパスを拾う `links::extract_path_tokens` の区切りは、

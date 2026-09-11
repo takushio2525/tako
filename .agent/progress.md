@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-11（#651: 狭い実行ペインで割れた exit マーカーを拾えるようにした）
-- 折り返しの判定を `TerminalSession::visible_lines_filled`（alacritty の `line_length()` = WRAPLINE + 占有列数）で**列**で持ち、`dispatch::find_exit_marker` が「埋まった行の行末 → 次の非空行の行頭」だけをまたいでマーカーを再構成する形へ。数字のあとは行の残りが空白であることを要求するので無関係な行は繋がない（案 2 の OSC 化は器越え + Windows 実機が要るので Issue へ理由を残して見送り）
-- 隔離 GUI 実測（直接 PTY と tmux バックエンドの両方）: 幅 7 / 10 / 13 / 40 桁すべて `exited exit_code=0`・幅 10 桁の `--wait` が返る（修正前は 40 秒返らない）・3 桁の `127` は幅 13 桁で `__TAKO_EXIT=1` + `27` に割れても 127。legacy アーム（`TAKO_651_LEGACY=1`）は永久 running と **`exit_code=1` の誤報**を再現
-- 番犬 2 本（製品コードへのマーカー literal 増殖 / 文字数で測る物差し）+ 実 PTY の単体テスト（幅 10 桁で割れる形と全角で埋まった行）
-
 ## 2026-09-11（#1372: exe::find が npm シムの裸スクリプトを PATHEXT より先に返さないようにした）
 - 真因は `find_in_windows_path` が `<base>\<name>` を名前によらず採っていたこと。npm の cmd-shim は `<name>`（`#!/bin/sh` のスクリプト）/ `.cmd` / `.ps1` を置くので `find("claude")` が PE でないスクリプトを返し `Command::new` で起動できない一方、同じモジュールの `is_executable_file` は同じパスに false = 境界の中で答えが矛盾していた。土台をそのまま採るのは「名前が既に `PATHEXT` の拡張子を持つとき」だけへ（`resolve_with_pathext` へ切り出し、パス指定の経路も同じ判定を通す）
 - 修正前ソースで新テスト 3 本が `exe.rs:411` / `:422` / `:466` を名指しで FAILED（`Some("…\\npm\\claude")` = Issue 実測値の逐語再現）。修正後は exe 15/15・workspace 4311 passed / 0 failed・`scripts/check-windows.sh` error 0。パス指定の経路だけ旧実装へ戻す A/B で整合テストが `C:\tools\claude` を名指しで落ちる
@@ -64,3 +59,8 @@
 - 判定を `tako_core::url_guard` の 1 実装へ（`check_browser_url` = http / https / `check_os_handler_url` = 境界 B8 の許可集合。`md_links::browser_url` は再公開）。経路側（(a)）= `follow_pdf_link` / `follow_preview_pdf_link` / `open_preview` と、保険（(b)）= `os_integration::open_url` / `open_url_wait` の両方を締めた。弾いたら通知欄 + 理由の分類だけを persist.log へ（リンク文字列は出さない）
 - 隔離 GUI（tako-vd・`open` の PATH shim で OS ランチャの引数を観測）: 最小 PDF の `file:///Applications/Calculator.app` は `許可していないスキーム` で弾かれ **`open` は 1 回も起きない**、`https://example.com/ok?a=1&b=2` は `opened_url` + shim に 1 つの値のまま到達
 - 番犬 8 本（経路 3 か所・B8・大域走査・診断の中身・1 実装・行番号の物差し）。修正前ソースで 6/8 が file:line 名指し FAILED（`main.rs:1096` / `11648` / `20751` = Issue 記載の 3 行 + `os_integration.rs:88` + `md_links.rs`）。Windows 実機は未検証
+
+## 2026-09-12（#1387: NFD の結合文字が画面テキストから落ちるのを 3 経路まとめて直した）
+- alacritty が `Cell::extra.zerowidth` に持つ 0 幅の結合文字をどこも読んでいなかった（grep 0 件）ので、`screen::cell_text` / `push_cell_text` / `cell_is_trailing_blank` の 1 実装へ寄せ、`resolve_cell`（Screen = 描画 / links）・`compose_grid_row`（tail_lines）・`history_plain_lines`（ペインログ）の 3 経路と #801 の空白セルの近道を通した。`text` へ積んだぶんは `cell_cols` へ同じ列を積む
+- 実測（隔離 GUI・tako-vd）: `printf 'e\xcc\x81'` の画面が `U+0065 U+0301`・NFD 名のファイルを `find` で出すと `tako links` の target が `U+304B U+3099` を保って実在 true（濁点を落とした形は false）。legacy アームでは新テスト 6 本 + 番犬 3 本が file:line 名指しで FAILED（`画像かある.txt` / `VIS_か_e` を逐語再現）
+- 番犬 `issue1387_combining_watchdog` 5 本 + 実 PTY の 4 経路一致テスト（visible_lines / tail_lines / history_plain_lines / selection_text）。hot path は 120x24 を 3000 回 snapshot で 68.6〜69.3ms → 65.3〜67.9ms

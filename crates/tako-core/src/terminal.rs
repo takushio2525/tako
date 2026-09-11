@@ -885,7 +885,6 @@ impl TerminalSession {
     /// 履歴が足りない分は取れた範囲だけ返す
     pub fn history_plain_lines(&self, skip_newest: usize, count: usize) -> Vec<String> {
         use alacritty_terminal::index::{Column, Line};
-        use alacritty_terminal::term::cell::Flags;
 
         let term = self.term.lock();
         let grid = term.grid();
@@ -903,28 +902,18 @@ impl TerminalSession {
             let row = &grid[line];
             // #816: 行の大半は末尾の未使用セル（空白）で、`trim_end` で必ず落ちる。
             // 先に後ろから境界を探し、そこまでしか組み立てない（`String` の確保も
-            // 1 本で済ませる）。取り出す文字列は従来と 1 バイトも変わらない
+            // 1 本で済ませる）。境界探しは切るだけなので取り出す文字列を変えない。
+            // 境界の判定とテキストの組み立ては `screen` の 1 実装を通す（#1387）:
+            // 0 幅の結合文字（NFD の濁点・アクセント）は `Cell::c` ではなく
+            // `zerowidth` に在るので、ここで読まないとペインログだけが
+            // 「端末が実際に受け取ったバイト列と違う文字列」を記録する
             let mut end = cols;
-            while end > 0 {
-                let cell = &row[Column(end - 1)];
-                let spacer = cell
-                    .flags
-                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER);
-                if !spacer && cell.c != ' ' {
-                    break;
-                }
+            while end > 0 && crate::screen::cell_is_trailing_blank(&row[Column(end - 1)]) {
                 end -= 1;
             }
             let mut text = String::with_capacity(end);
             for col in 0..end {
-                let cell = &row[Column(col)];
-                if cell
-                    .flags
-                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-                {
-                    continue;
-                }
-                text.push(cell.c);
+                crate::screen::push_cell_text(&row[Column(col)], &mut text);
             }
             // 空白以外の末尾空白類（タブ等）は従来どおり `trim_end` に任せる
             text.truncate(text.trim_end().len());
@@ -1173,31 +1162,18 @@ impl TerminalSession {
         cols: usize,
     ) -> String {
         use alacritty_terminal::index::Column;
-        use alacritty_terminal::term::cell::Flags;
 
         // #816 と同じ作法: 行の大半は末尾の未使用セル（空白）で `trim_end` で必ず落ちる。
-        // 先に後ろから境界を探し、そこまでしか組み立てない
-        // 全角の後続セル（スペーサー）と `\0` は `compose_line` が落とすので同じく落とす
-        let dropped = |cell: &alacritty_terminal::term::cell::Cell| {
-            cell.flags
-                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-                || cell.c == '\0'
-        };
+        // 先に後ろから境界を探し、そこまでしか組み立てない。
+        // 「落とすセル」（全角の後続スペーサーと `\0`）と「0 幅の結合文字を積む」
+        // 判断は `screen` の 1 実装を通すので、`visible_lines` と定義上一致する（#1387）
         let mut end = cols;
-        while end > 0 {
-            let cell = &row[Column(end - 1)];
-            if !dropped(cell) && cell.c != ' ' {
-                break;
-            }
+        while end > 0 && crate::screen::cell_is_trailing_blank(&row[Column(end - 1)]) {
             end -= 1;
         }
         let mut text = String::with_capacity(end);
         for col in 0..end {
-            let cell = &row[Column(col)];
-            if dropped(cell) {
-                continue;
-            }
-            text.push(cell.c);
+            crate::screen::push_cell_text(&row[Column(col)], &mut text);
         }
         // 空白以外の末尾空白類（全角空白等）は `visible_lines` と同じく `trim_end` に任せる
         text.truncate(text.trim_end().len());
@@ -2410,6 +2386,107 @@ mod tests {
                 "画面 {i}: 末尾 {AGENT_TUI_TAIL_LINES} 行だけだと結果が変わる（窓が足りない）"
             );
         }
+    }
+
+    /// 画面に `needle` が出るまで待つ（#1387。作法は #1308 と同じ）。
+    ///
+    /// 上限は [`crate::wait_budget::state_wait_budget`]（混み具合で**伸ばすだけ**・
+    /// 4 倍で打ち切り）で、**尽きたらその場で panic** する = 呼び出し側が
+    /// 「待ったつもりで検査せず進む」形にならない
+    #[cfg(unix)]
+    fn i1387_wait_visible(session: &TerminalSession, needle: &str, what: &str) {
+        use std::time::{Duration, Instant};
+
+        let busy = crate::wait_budget::machine_busy();
+        let budget = crate::wait_budget::state_wait_budget(Duration::from_secs(20), busy);
+        let start = Instant::now();
+        let mut last: Vec<String> = Vec::new();
+        while start.elapsed() < budget {
+            last = session.visible_lines();
+            if last.iter().any(|l| l.contains(needle)) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!(
+            "{what}: `{needle}` が出ない（waited={:.2?} budget={budget:?} busy={busy:?}）\n\
+             画面: {last:?}",
+            start.elapsed()
+        );
+    }
+
+    /// #1387: 0 幅の結合文字（NFD の濁点 `U+3099` / アクセント `U+0301`）が
+    /// 画面テキストの**4 経路すべて**に残ること。
+    ///
+    /// - `visible_lines()` … `screen::compose_line`（描画 / GUI モード / links の材料）
+    /// - `tail_lines(n)` … `compose_grid_row`（#1301 / #651）
+    /// - `history_plain_lines` … ペインログ（#112）
+    /// - `selection_text()` … alacritty 自身の `selection_to_string`（Cmd+C）
+    ///
+    /// 4 つの一致を見るので**3 実装が同時に直っていること**を構造的に要求する
+    /// （修正前は 4 番目だけが結合文字を残し、「コピーしたパスは開けるが画面の
+    /// リンクは開けない」という非対称になっていた）
+    #[cfg(unix)]
+    #[test]
+    fn 結合文字は画面テキストの全経路に残る() {
+        const ROWS: usize = 6;
+        // NFD: か + U+3099（全角 + 濁点）/ e + U+0301（半角 + アクセント）
+        let nfd = "か\u{3099}_e\u{301}";
+        let hist = format!("HIST_{nfd}");
+        let vis = format!("VIS_{nfd}");
+        // HIST は 8 行の詰め物で履歴へ押し出す（ROWS = 6）
+        let script = format!(
+            "printf '{hist}\\n'; \
+             for i in 1 2 3 4 5 6 7 8; do printf 'PAD%s\\n' \"$i\"; done; \
+             printf '{vis}\\n'; printf 'READY\\n'; sleep 30"
+        );
+        let (session, _rx) = TerminalSession::spawn(
+            30,
+            ROWS,
+            SpawnOptions {
+                command: Some(SpawnCommand {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), script],
+                }),
+                ..SpawnOptions::default()
+            },
+        )
+        .expect("PTY を張れる");
+
+        i1387_wait_visible(&session, "READY", "結合文字の 4 経路");
+
+        // (1) 描画の材料
+        let visible = session.visible_lines();
+        assert!(
+            visible.iter().any(|l| l == &vis),
+            "描画の材料（visible_lines）から結合文字が落ちている: {visible:?}"
+        );
+        // (2) tail_lines は visible_lines の末尾と 1 バイトも変わらない
+        assert_eq!(
+            session.tail_lines(ROWS),
+            visible,
+            "tail_lines（compose_grid_row）が visible_lines と食い違う"
+        );
+        // (3) ペインログ（履歴へ押し出した行）
+        let history = session.history_plain_lines(0, 20);
+        assert!(
+            history.iter().any(|l| l == &hist),
+            "ペインログ（history_plain_lines）から結合文字が落ちている: {history:?}"
+        );
+        // (4) Cmd+C（alacritty の selection_to_string）と一致する
+        let row = visible
+            .iter()
+            .position(|l| l == &vis)
+            .expect("画面に VIS 行がある");
+        session.start_selection(SelectionKind::Line, 0, row, false);
+        let copied = session.selection_text().expect("選択テキストが取れる");
+        assert_eq!(
+            copied.trim_end(),
+            vis,
+            "画面テキストと選択コピー（selection_to_string）が食い違う\
+             （#1387 の非対称）: {copied:?}"
+        );
+        session.clear_selection();
     }
 
     /// `tail_lines(n)` が `visible_lines()` の末尾 n 行と**1 バイトも変わらない**こと。

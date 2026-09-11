@@ -648,6 +648,46 @@ mod tests {
         assert_eq!(total, seg.text.len());
     }
 
+    /// #1387: 0 幅の結合文字（NFD の濁点）は**基底セルと同じ列**で `text` に載る。
+    ///
+    /// `cell_cols` が同じ列を指すので基底セルの `cols` は 0 になり、埋めの
+    /// スペースは結合文字側（`cols` = 全角の 2 列）が持つ。結合文字を
+    /// シェイプ対象へ渡すのがここの契約で、落とすと画面から濁点が消える
+    /// （フォントが合成すればグリフ数 = 列数の仮定も保たれる）
+    #[test]
+    fn nfdの結合文字は基底セルと同じ列でシェイプへ渡る_1387() {
+        let l = ScreenLine {
+            text: "か\u{3099}ab".to_string(),
+            runs: vec![StyleRun {
+                range: 0.."か\u{3099}ab".len(),
+                fg: Rgb::new(200, 200, 200),
+                bg: None,
+                bold: false,
+                italic: false,
+                underline: false,
+                strikeout: false,
+                dim: false,
+            }],
+            // `か` は全角（列 0、スペーサーが列 1）/ 濁点も列 0 / `a` = 列 2 / `b` = 列 3
+            cell_cols: vec![0, 0, 2, 3],
+            has_wide: true,
+        };
+        let plan = plan_row(&l, fg(), None, link_style());
+        assert_eq!(plan.segments.len(), 1);
+        let seg = &plan.segments[0];
+        assert_eq!(seg.col, 0);
+        assert_eq!(
+            seg.text, "か\u{3099} ab",
+            "結合文字が基底の直後に載り、全角の 2 セル目だけが空白で埋まる"
+        );
+        let total: usize = seg.styles.iter().map(|s| s.len).sum();
+        assert_eq!(
+            total,
+            seg.text.len(),
+            "TextRun のバイト長がテキストと合わない"
+        );
+    }
+
     #[test]
     fn 行頭行末の空白は落ちて列位置は保たれる() {
         let plan = plan_row(&line("   ab   "), fg(), None, link_style());
