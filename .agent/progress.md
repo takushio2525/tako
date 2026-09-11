@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-11（#1320 / #1324 / #1319: AI 向け規約ファイルの取り残し 3 件）
-- `AGENTS.md` の「状況」行（Phase 5 中断中のまま = 3 か月前）と push 運用（「公開まで main 直 push 可」）を実態へ。フェーズ詳細は `.agent/roadmap.md` 参照に寄せ、Phase 7 見出しも「✅ 公開済み・残は README 図版と CONTRIBUTING.md」へ棚卸し（#1320）
-- `.agent/commands.md` に `tako file open-in-tako`（#1182）の行を追加。コマンド名で正規化した `comm` の差分は設計上の畳み込み `tako setup bootstrap` 1 件のみ（#1324）
-- `.agent/requirements.md` の重複 FR を解消（#1319）。コードが 12 か所参照する **FR-3.18 = Code Runner は不動**、#496 の 2 行を FR-3.25 / 3.26 へ、参照ゼロの #1067 セクションを FR-2.38 へ（`:1653` の相互参照も追従）
-
 ## 2026-09-11（#1313: config_io の tmp 名を書き込み 1 回ごとに分けた）
 - #638 の同型を `config_io::atomic_write` へ。ロック無しで呼ぶ経路は 11 か所（`with_backup` 経由込み。Issue にコメントで列挙）で、legacy 実測は 3 形 = `len=0`（空 = #169 の全消失の入口）/ 短い本文が長い本文の先頭を潰した `len=5610` / rename の ENOENT
 - tmp suffix を `.tmp.{pid}.{seq}` へ（`AtomicU64`）。`.tmp.` を含む形は保つ（共有カタログが `contains(".tmp.")` で派生を外すため。catalog のテストへ新形を追加）
@@ -73,3 +68,8 @@
 - `refresh_agent_metrics` / `drive_queued_message_recovery` が毎 tick 全ペインの `Screen`（行ごとに `String` + `Vec<StyleRun>` + `Vec<usize>` の 3 確保）を組んで文字列だけ取って捨てていた（#1001 の H2 / H3）。`TerminalSession::tail_lines(n)`（`Screen` を通さずグリッドから末尾 n 行）+ alt screen ゲート + C3 の判定順入れ替えへ。窓の正本は `AGENT_TUI_TAIL_LINES`=48（Issue 記載の 8 では #1093 / #1123 の上限見出し窓 24 を割る）
 - 実測（隔離 GUI・`tako-vd`・1/4/12/22 ペイン・各 20 秒 × 3 窓）: 傾き **0.271 → 0.068 M 命令/秒/ペイン**（全 12 窓の最小二乗）= 2 秒 tick 1 回あたり 0.543 → 0.135 M 命令/ペイン。22 ペインの footprint 46.4 → 39.9 MB
 - A/B は `TAKO_1001_C2_LEGACY=1` / `TAKO_1001_C3_LEGACY=1`。番犬 4 本が修正前ソースで file:line 名指し FAILED、`tail_lines` は故障注入 3 種で単体テストが落ちる
+
+## 2026-09-11（#1349: コピー行の「選択なしなら Ctrl+C 送信」を実態へ）
+- 隔離 GUI（tako-vd・pid 指定の CGEventPostToPid）で実測: 選択なし cmd+C は `sleep` を殺さず `^C` も出ず クリップボードも不変。同じ経路で撃った本物の Ctrl+C は殺した（= 観測に検出力あり）。選択あり cmd+C はコピーになる（回帰なし）
+- docs の行を「選択が無いときは何も起きない」へ直し、注記で「中断の Ctrl+C は tako が横取りしない」を明示。実装を docs へ寄せる案 (b) は挙動変更なので Issue へ比較を残して master 判断へ
+- 番犬 2 本（コピー行の説明文と `copy_selection` の両方向 / 素の ctrl-c 未バインド）を `docs_keyboard_shortcuts.rs` へ。注入 5 通りで file:line 名指し FAILED
