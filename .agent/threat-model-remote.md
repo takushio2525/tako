@@ -95,6 +95,21 @@ v0.6.0〜v0.8.1 は UDS（socket 0600 + 親ディレクトリ 0700）のみで�
 - **tailnet / 外部から到達する経路は serve 経由だけ**（ローカルからの直結が
   既定では可能なことは上記）
 
+### 停止経路が撃つ相手の確認（#329 / #1401）
+
+- `tako remote stop` の kill 経路は **2 本ともが**「その PID は `tako remote serve` か」を
+  確認してからでないと撃たない（正規経路 = PID ファイルの PID / stale 経路 = PID ファイルが
+  消えていて `/api/health` が答えた PID）。判定は `verify_pid_identity` の 1 実装で、
+  **確認できないとき**（`ps` を起こせない / 出力が空）は**撃たない**側へ倒す
+- 確認できなければ state も消さず、中止の理由と手で確かめる手順を返す
+  （応答しているのが本物の daemon だったときに記録を消すと到達不能にしてしまう）
+- 到達条件は「PID ファイルだけが消える」+「記録済みポートの再利用」。ループバック TCP は
+  同一 OS ユーザーの任意プロセスが bind できるので、隔離インスタンスと本番を並走させる
+  運用では現実に起こる（同型の事故 #445）
+- **残る限界**: 別 data_dir の tako daemon が同じポートを掴んでいた場合は
+  `tako remote serve` として確認が通る（health は state の置き場を返さないので区別できない）。
+  番犬は `crates/tako-control/tests/issue1401_stale_stop_identity_watchdog.rs`
+
 ### 入力操作の role 制限
 
 - observe（画面閲覧のみ）は既定 role

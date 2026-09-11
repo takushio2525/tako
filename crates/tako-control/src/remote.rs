@@ -2154,9 +2154,72 @@ fn parse_pid_file() -> Result<PidInfo, String> {
     })
 }
 
+/// `ps -p <pid> -o args=` の出力から「この PID は `tako remote serve` か」を決める純関数。
+///
+/// **空の出力は「確認できない」= false**（#1401）。#329 で `ps` の**起動失敗**は
+/// false に倒したが、起動できて出力が空のときは `!cmd.is_empty() && !is_tako_remote`
+/// の形のせいで**検証を通していた** = fail-safe の向きと逆だった
+#[cfg(unix)]
+fn ps_args_is_tako_remote_serve(args: &str) -> bool {
+    let cmd = args.trim();
+    !cmd.is_empty() && cmd.contains("tako") && cmd.contains("remote") && cmd.contains("serve")
+}
+
+/// 「PID の正体を確認できなかったので撃たなかった」ときの共通の前置き
+/// （#329 / #1401 の 1 実装）。
+///
+/// 正規経路（PID ファイル）と stale 経路（health の PID）で同じ文言にしておく。
+/// 診断ログではなく**操作の結果**なので、何を中止したのかを最初に言う
+fn pid_identity_refusal(pid: u32) -> String {
+    format!(
+        "PID {pid} が tako remote serve であることを確認できません\
+         （PID 再利用または検証コマンド実行不能）。安全のため停止操作を中止しました。"
+    )
+}
+
+/// stale 経路（PID ファイルが無い）で撃たずに中止したときの説明（#1401）。
+///
+/// state は**消さない**。応答している相手が本物の daemon かもしれないうちに記録を消すと、
+/// 生きている daemon を到達不能にしてしまう（`daemon_stop_impl` の stale 分岐と同じ理由）。
+/// 代わりに「誰が居るのか」と「記録を消す手順」を返し、人の判断に委ねる
+fn stale_stop_refusal(pid: u32) -> String {
+    let endpoint = current_endpoint();
+    let reach = endpoint
+        .as_ref()
+        .map(|e| e.describe())
+        .unwrap_or_else(|| "不明".to_string());
+    let record = endpoint
+        .as_ref()
+        .and_then(|e| e.socket_path())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(port_path);
+    // 手順は打つ OS のものを出す（Windows に ps / rm は無い）
+    let (inspect, remove) = if cfg!(windows) {
+        (
+            format!("tasklist /FI \"PID eq {pid}\""),
+            format!("Remove-Item {}", record.display()),
+        )
+    } else {
+        (
+            format!("ps -p {pid} -o args="),
+            format!("rm {}", record.display()),
+        )
+    };
+    format!(
+        "{prefix}\n\
+         記録された待ち受け（{reach}）が答えた PID です。state ファイルは残しました。\n\
+         {indent}この PID の正体を確認する: {inspect}\n\
+         {indent}tako の daemon でなければ記録を消す: {remove}\n\
+         {indent}そのうえで起動し直す: tako remote start",
+        prefix = pid_identity_refusal(pid),
+        indent = "  ",
+    )
+}
+
 /// P0-4: PID が本当に tako remote serve プロセスか検証する。
 /// 実行ファイルパスまたは ps の args で確認し、起動時刻もチェックする。
-/// ps の起動自体が失敗した場合は安全側に倒す（検証不能 = false = kill しない）
+/// ps の起動自体が失敗した場合・**出力が空の場合**は安全側に倒す
+/// （検証不能 = false = kill しない。#329 / #1401）
 fn verify_pid_identity(info: &PidInfo) -> bool {
     if !is_process_alive(info.pid) {
         return false;
@@ -2172,11 +2235,8 @@ fn verify_pid_identity(info: &PidInfo) -> bool {
             .output();
         match ps_result {
             Ok(output) => {
-                let cmd = String::from_utf8_lossy(&output.stdout);
-                let cmd = cmd.trim();
-                let is_tako_remote =
-                    cmd.contains("tako") && cmd.contains("remote") && cmd.contains("serve");
-                if !cmd.is_empty() && !is_tako_remote {
+                // 判定は 1 実装（#1401）。**空の出力も false**（確認できない = 撃たない）
+                if !ps_args_is_tako_remote_serve(&String::from_utf8_lossy(&output.stdout)) {
                     return false;
                 }
             }
@@ -2318,10 +2378,13 @@ fn daemon_stop_impl(force: bool) -> Result<Value, String> {
                         if let Some(body) = resp.split_once("\r\n\r\n").map(|(_, b)| b) {
                             if let Ok(v) = serde_json::from_str::<Value>(body.trim()) {
                                 if let Some(pid) = v["pid"].as_u64() {
+                                    let pid = pid as u32;
                                     eprintln!(
-                                        "PID ファイルが消失していますが、稼働中デーモン（PID {pid}）を検出。停止します…"
+                                        "PID ファイルが消失していますが、記録された待ち受けが応答しました（PID {pid}）。正体を確認します…"
                                     );
-                                    kill_stale_daemon(pid as u32);
+                                    // 正体確認は kill_stale_daemon の中（#1401）。
+                                    // 確認できなければ撃たずに中止の理由を返す
+                                    kill_stale_daemon(pid)?;
                                     cleanup_serve_leftover();
                                     return Ok(json!({ "stopped": true, "stale_pid": pid }));
                                 }
@@ -2349,10 +2412,8 @@ fn daemon_stop_impl(force: bool) -> Result<Value, String> {
     if !verify_pid_identity(&pid_info) {
         cleanup_state_files();
         return Err(format!(
-            "PID {pid_num} が tako remote serve であることを確認できません\
-             （PID 再利用または検証コマンド実行不能）。\
-             安全のため停止操作を中止し、state ファイルを掃除しました。\
-             手動で停止するには: kill {pid_num}"
+            "{prefix}state ファイルは掃除しました。手動で停止するには: kill {pid_num}",
+            prefix = pid_identity_refusal(pid_num),
         ));
     }
     crate::platform::process::terminate(pid_num, force)?;
@@ -2719,9 +2780,24 @@ fn wait_for_termination_with(
     out
 }
 
-/// stale なデーモンプロセスを kill し、終了を確認して state ファイルを掃除する。
-/// SIGTERM → 最大 5 秒ポーリング → 終了しなければ SIGKILL
-fn kill_stale_daemon(pid: u32) {
+/// PID ファイルが消えていて health が答えた PID だけが手掛かりのときの停止（stale 経路）。
+///
+/// **正体を確認できたときだけ**撃つ: SIGTERM → 最大 5 秒ポーリング → 終了しなければ
+/// SIGKILL → state ファイルの掃除。確認できなければ何も撃たず state も残し、
+/// 中止の理由と手で確かめる手順を `Err` で返す（#1401）
+fn kill_stale_daemon(pid: u32) -> Result<(), String> {
+    // **正体確認をこの関数の中で行う**（#1401）。呼び出し側に委ねていた旧実装では、
+    // 記録済みポートを再利用した無関係プロセスへ SIGTERM → 5 秒後 SIGKILL を撃てた
+    // （#329 で正規経路に入れた fail-safe が stale 側には無かった）。
+    // 手掛かりは PID だけ（exe と起動時刻の記録は PID ファイルと一緒に消えている）
+    let info = PidInfo {
+        pid,
+        exe: None,
+        start_time: None,
+    };
+    if !verify_pid_identity(&info) {
+        return Err(stale_stop_refusal(pid));
+    }
     #[cfg(unix)]
     {
         unsafe {
@@ -2732,18 +2808,15 @@ fn kill_stale_daemon(pid: u32) {
             .timed_out()
         {
             cleanup_state_files();
-            return;
+            return Ok(());
         }
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGKILL);
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-    }
     cleanup_state_files();
+    Ok(())
 }
 
 // --- ローカル管理クライアント（GUI / CLI / MCP → daemon の admin API。#283）---
@@ -6557,7 +6630,7 @@ mod tests {
     }
 
     #[test]
-    fn kill_stale_daemonは存在しないpidで安全に完了する() {
+    fn kill_stale_daemonは存在しないpidを撃たずに中止する() {
         // cleanup_state_files が state_dir を掃除するため、env var 窓中の他テストを壊さないよう直列化
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // **state_dir をテンポラリへ差し替えてから呼ぶこと**。差し替えないと
@@ -6567,9 +6640,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tako-test-kill-stale-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         std::env::set_var("TAKO_REMOTE_STATE_DIR", dir.as_os_str());
-        // is_process_alive が false なので即 cleanup_state_files して return
-        kill_stale_daemon(999_999_999);
+        // is_process_alive が false = 正体を確認できない → 撃たずに理由を返す（#1401）
+        let err = kill_stale_daemon(999_999_999).expect_err("確認できない PID は撃たない");
         std::env::remove_var("TAKO_REMOTE_STATE_DIR");
+        assert!(err.contains("確認できません"), "中止理由が返る: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6716,15 +6790,24 @@ mod tests {
         assert!(!verify_pid_identity(&info));
     }
 
+    /// 使い捨ての犠牲プロセスを起動する（#329 / #1401 のテストが共有する 1 実装）。
+    ///
+    /// 「PID を再利用した / ポートを再利用した無関係プロセス」の見立て。
+    /// 呼び出し側が末尾で `kill` + `wait` して回収する（ゾンビを残さない）
+    #[cfg(unix)]
+    fn spawn_disposable_sleep() -> std::process::Child {
+        std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .expect("sleep プロセスの起動")
+    }
+
     #[cfg(unix)]
     #[test]
     fn daemon_stop_implはps実行不能でもkillしない() {
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 使い捨てプロセスを起動して PID を取得（テスト末尾で kill + wait 回収）
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("60")
-            .spawn()
-            .expect("sleep プロセスの起動");
+        let mut child = spawn_disposable_sleep();
         let child_pid = child.id();
 
         let dir = std::env::temp_dir().join(format!("tako-test-ps-fail-{}", std::process::id()));
@@ -6737,8 +6820,10 @@ mod tests {
         let result = daemon_stop_impl(false);
         std::env::remove_var("TAKO_REMOTE_STATE_DIR");
 
-        // sleep プロセスがまだ生存していることを確認（SIGTERM されていない）
-        let alive = unsafe { libc::kill(child_pid as libc::pid_t, 0) } == 0;
+        // sleep プロセスがまだ生存していることを確認（SIGTERM されていない）。
+        // 観測は `has_terminated`: sleep は自分の子なので SIGTERM 後はゾンビになり、
+        // `kill(pid, 0)` は**ゾンビにも成功する** = 撃たれたことが見えない（#619 / #1401）
+        let alive = !has_terminated(child_pid);
         assert!(alive, "sleep プロセスが SIGTERM されていないこと");
 
         // 後始末（kill + wait で zombie を残さない）
@@ -6752,6 +6837,208 @@ mod tests {
             err.contains("確認できません"),
             "検証不能時のエラーメッセージ: {err}"
         );
+    }
+
+    /// 偽の `/api/health` を答えるループバック listener（#1401 の再現・回帰に使う）。
+    ///
+    /// stale 経路は ①`probe_alive` の接続 ②health の往復 で **2 回**繋ぐので accept を
+    /// 回し続ける。停止は旗 + nonblocking accept で、`Drop` が join まで見届ける
+    /// （テストが終わったあとにポートを掴んだスレッドを残さない）
+    #[cfg(unix)]
+    struct FakeHealthServer {
+        port: u16,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(unix)]
+    impl FakeHealthServer {
+        /// `pid` を載せた health を返す listener を立てる（`None` = `pid` を載せない応答）
+        fn start(pid: Option<u32>) -> Self {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener の bind");
+            let port = listener.local_addr().expect("listener の addr").port();
+            listener.set_nonblocking(true).expect("nonblocking");
+            let body = match pid {
+                Some(p) => format!("{{\"status\":\"ok\",\"version\":\"test\",\"pid\":{p}}}"),
+                None => "{\"status\":\"ok\",\"version\":\"test\"}".to_string(),
+            };
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = stop.clone();
+            let handle = std::thread::spawn(move || {
+                while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut s, _)) => {
+                            let _ = s.set_nonblocking(false);
+                            // 要求は読み捨てる（probe_alive は何も送らずに切る）
+                            let mut buf = [0u8; 1024];
+                            let _ = s.read(&mut buf);
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = s.write_all(resp.as_bytes());
+                            let _ = s.flush();
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                port,
+                stop,
+                handle: Some(handle),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeHealthServer {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// stale 経路（PID ファイルが無く、記録された待ち受けだけが残る）を作って
+    /// `daemon_stop_impl` を呼ぶ。戻りは `(停止結果, sleep が生きているか)`。
+    ///
+    /// 使い捨ての `/bin/sleep` を「ポートを再利用した無関係プロセス」に見立てる
+    /// （#329 のテストと同じ形）。`health_pid` は sleep の PID を受け取って
+    /// **health に載せる pid** を返すクロージャ
+    #[cfg(unix)]
+    fn stale_stop_against_sleep(
+        tag: &str,
+        health_pid: impl FnOnce(u32) -> Option<u32>,
+    ) -> (Result<Value, String>, bool) {
+        let mut child = spawn_disposable_sleep();
+        let child_pid = child.id();
+        let server = FakeHealthServer::start(health_pid(child_pid));
+
+        let dir = std::env::temp_dir().join(format!("tako-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("TAKO_REMOTE_STATE_DIR", dir.as_os_str());
+        // 停止の成功経路は cleanup_serve_leftover で tailscale CLI を起こす。
+        // 本番の serve 設定へ触らせないため存在しないパスへ向けておく（#445 の二重防御）
+        std::env::set_var("TAKO_TAILSCALE_BIN", "/nonexistent/tako-test-tailscale");
+        // PID ファイルは**書かない**（= stale 経路の入口）。port ファイルだけ残す
+        std::fs::write(port_path(), server.port.to_string()).expect("port ファイルを書く");
+        assert!(!pid_path().exists(), "PID ファイルが無い状態を作る");
+
+        let result = daemon_stop_impl(false);
+
+        std::env::remove_var("TAKO_REMOTE_STATE_DIR");
+        std::env::remove_var("TAKO_TAILSCALE_BIN");
+        // **kill の有無を観測してから**自分で後片付けする（順序を逆にすると検出力が消える）。
+        // 観測は `has_terminated`: sleep は自分の子なので SIGTERM 後はゾンビになり、
+        // `kill(pid, 0)` は**ゾンビにも成功する** = 生存判定では撃たれたことが見えない（#619）
+        let alive = !has_terminated(child_pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+        (result, alive)
+    }
+
+    /// **#1401 の回帰**: stale 経路も PID の正体確認を通す。
+    ///
+    /// health が返した PID が `tako remote serve` でなければ SIGTERM を撃たず、
+    /// 「確認できないので中止した」と手動手順を返す。修正前は `kill_stale_daemon` が
+    /// 正体確認なしに SIGTERM → 5 秒後 SIGKILL を撃っていた（= sleep が死ぬ）
+    #[cfg(unix)]
+    #[test]
+    fn daemon_stop_implはstale経路でも正体不明のpidをkillしない() {
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (result, alive) = stale_stop_against_sleep("stale-foreign", Some);
+        assert!(
+            alive,
+            "stale 経路が正体不明の PID へ SIGTERM を撃っている（#1401）"
+        );
+        let err = result.expect_err("撃たずに中止する = Err");
+        assert!(err.contains("確認できません"), "中止理由が返る: {err}");
+        assert!(err.contains("ps -p"), "正体を確かめる手順が返る: {err}");
+        assert!(err.contains("tako remote start"), "復旧の手順が返る: {err}");
+    }
+
+    /// stale 経路の縁①: health が `pid` を載せてこないなら撃つ相手が決まらない。
+    /// 「起動していない（PID ファイルが無い）」で終わり、記録も残る
+    #[cfg(unix)]
+    #[test]
+    fn daemon_stop_implはhealthがpidを返さなければ何も撃たない() {
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (result, alive) = stale_stop_against_sleep("stale-nopid", |_| None);
+        assert!(alive, "pid が無い応答で誰かを撃っている");
+        let err = result.expect_err("撃つ相手が決まらない = Err");
+        assert!(
+            err.contains("起動していない"),
+            "撃たずに「起動していない」で終わる: {err}"
+        );
+    }
+
+    /// stale 経路の縁②: health が**停止操作をしている自分自身**の PID を返しても撃たない
+    /// （テストプロセスが死ぬ形。#329 の flaky と同じ壊れ方）
+    #[cfg(unix)]
+    #[test]
+    fn daemon_stop_implはhealthが自分のpidを返しても撃たない() {
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let my_pid = std::process::id();
+        let (result, _alive) = stale_stop_against_sleep("stale-self", move |_| Some(my_pid));
+        // ここに到達している = 自プロセスが SIGTERM されていない
+        let err = result.expect_err("自分自身も正体確認で弾かれる");
+        assert!(err.contains("確認できません"), "中止理由が返る: {err}");
+    }
+
+    /// `ps` の出力が**空**のときは「確認できない」= kill しない（#1401 の受け入れ条件 3）。
+    ///
+    /// #329 で `ps` の**起動失敗**は false へ倒したが、起動できて出力が空のときは
+    /// `!cmd.is_empty() && !is_tako_remote` の形のせいで**検証を通していた**。
+    /// 生きたプロセスで空出力を作れないので、判定の純関数でこの向きを固定する
+    #[cfg(unix)]
+    #[test]
+    fn ps出力が空なら確認できない扱いになる() {
+        assert!(
+            !ps_args_is_tako_remote_serve(""),
+            "空の出力は確認できない = kill しない"
+        );
+        assert!(
+            !ps_args_is_tako_remote_serve("   \n"),
+            "空白だけの出力も確認できない"
+        );
+        assert!(
+            !ps_args_is_tako_remote_serve("/bin/sleep 60"),
+            "無関係なプロセスは false"
+        );
+        assert!(
+            !ps_args_is_tako_remote_serve("/usr/local/bin/tako master"),
+            "tako でも remote serve でなければ false"
+        );
+        assert!(
+            ps_args_is_tako_remote_serve("/Applications/tako.app/Contents/MacOS/tako remote serve"),
+            "配布バイナリの daemon は true"
+        );
+        assert!(
+            ps_args_is_tako_remote_serve("target/debug/tako remote serve"),
+            "dev ビルドの daemon も true"
+        );
+    }
+
+    /// stale 経路の縁③: health が**死んだ PID** を返したときも撃たず中止する
+    /// （応答した相手とその PID が別 = 正体不明）
+    #[cfg(unix)]
+    #[test]
+    fn daemon_stop_implはhealthが死んだpidを返しても中止する() {
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (result, alive) = stale_stop_against_sleep("stale-dead", |_| Some(999_999_999));
+        assert!(alive, "無関係な sleep が死んでいる");
+        let err = result.expect_err("正体が確認できない = Err");
+        assert!(err.contains("確認できません"), "中止理由が返る: {err}");
     }
 
     #[cfg(unix)]
