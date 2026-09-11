@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-11（#946: ペインの TERM 注入を「最後に無条件上書き」へ寄せ、1b の失敗理由を名指しできるようにした）
-- Issue の見立て（親の TERM がペインへ素通し）は**実測で否定**。修正前バイナリ（`f1af0cc`）を tako のペインの中（親 `TERM=tmux-256color`）から起こしても項目 1b は **3/3 通過**（`ok=true waited=0.1s`）。alacritty は `Options.env` を親 env の上に当てる（`tty/unix.rs:235`）ので注入は元から勝っていた。報告時点（`e703e40`）の 3/3 失敗は**同じ項目を落とす #1165 の固定 6.4 秒窓**で、9/8（`4d84695`）に解消済み
-- 残っていた穴は「注入が既定でしかない」こと（`env.extend(options.env)` が後 = 呼び出し側の env 1 つで無言で消える）。`finalize_pane_env` で TERM / COLORTERM を**最後に上書き**へ寄せ、番犬 `端末申告の注入はoptions_envより後にある` が修正前ソースで FAILED。項目 1b の失敗時だけ `TAKO_SELF_TEST_946: cause=injected|inherited|unexpected|no-echo` を出す（SKIP にはしない）
-- 実測: 修正後 × 継承あり / `-u TERM` とも `TAKO_APP_SELF_TEST_OK`（316s / 294s）。注入口 `TAKO_946_INJECT=inherit` では 1b が `cause=inherited`（観測 `tmux-256color,truecolor`）で FAILED。`cargo test -p tako-core --test pane_term_env` が親 TERM 6 系統 + `options.env` の `TERM=dumb` でも `xterm-256color` を実シェルで固定
-
 ## 2026-09-11（#1309: 新規 worktree で PWA の dist が無くてもビルドが通るようにした）
 - 真因は #574 の手当てが CI にしか無かったこと。`crates/tako-control/build.rs` を新設し、`dist/index.html` が無ければ npm でビルドする（**既にある dist は触らない**。rust_embed の埋め込み元へ `rerun-if-changed` も張った）。npm 無し / npm 失敗は**1 行目に手順が出る**エラーで止める（空埋め込みで通す案は不採用 = 製品バイナリに PWA が入らない事故の余地を作る）
 - PWA ビルドの正本を `scripts/build-pwa.sh` へ 1 本化（`build-app.sh` / `check-windows.sh` が呼ぶ。既定は毎回作り直す = #60、`--if-missing` は dist があれば何もしない）
@@ -64,6 +59,7 @@
 - `crates/tako-control/tests/fr_number_watchdog.rs` 1 本。定義の形は 3 つ（章 `## FR-5` / 節 `### FR-2.34` / 表 ID `| FR-2.34.1 |`）で **1 段も拾う**（`NFR-1`〜`8` が 1 段なので 2 段以上だけ見ると見逃す。1 段を定義に持つと章番号への言及も偽の参照切れにならない）。定義 482 件 / コード参照 613 件を実測
 - A/B は fixture を置かず**現行テキストへの逆置換**（#1319 の変更は番号 14 行だけなので `84c16c7^` と同値。置換が空振りしたら落ちるガード付き）。実データ検証も実施: `84c16c7^` を置くと `要件番号は一意` が **FAILED で 3 系統 11 番号を行番号つきで名指し**（FR-2.34 + 配下 8 / FR-3.17 / FR-3.18）
 - 自分自身も走査対象なので**架空の番号を書くと自分で拾う**（実装中に 2 度拾われた）。例外リストは作らず例を実在番号へ寄せ、参照切れの検出力は「定義側を 1 つ削る」形で証明。参照切れは現行 0 件
+
 ## 2026-09-11（#1333: PR の「CI 3 本緑を待って merge」を共通の待ちスクリプトへ寄せた）
 - 「出ているチェックが全部非 pending = 完了」は push 直後に Cloudflare Pages しか登録されていない瞬間に通る（#1313 = PR #1328 が CI 完了前 merge・過去に #1253 / #1282）。判定を `scripts/wait-pr-checks.sh` の 1 実装へ寄せ、**期待名が全部そろって全部 completed** を **2 回連続**観測してから確定する形にした（期待名は `.github/workflows/*.yml` の pull_request job から導出・外部連携の Cloudflare Pages だけ定数）
 - merge は `scripts/merge-pr.sh`（揃わなければ merge しない / CONFLICTING・BEHIND は待たずに拒否）。モックテスト 14 ケース（偽 gh + 偽リポジトリ）は CI の macOS ジョブで走り、A/B `TAKO_1333_LEGACY=1` の腕が「1 本だけで完了」「揺れの 1 回目で確定」を再現して Test 13 / 14 が固定する
