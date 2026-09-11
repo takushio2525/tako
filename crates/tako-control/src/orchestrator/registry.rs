@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tako_core::pane_log::CloseOrigin;
 use tako_core::prompt_delivery::Confidence;
 
 /// prompt 未達検知の猶予秒数（Issue #390 要件 4）。
@@ -341,10 +342,49 @@ pub fn record_spawn(record: RegisterSpawn) -> Result<String, String> {
     })
 }
 
+/// 明示 close の `close_reason` をひと所で綴る（#775）。
+///
+/// 綴りは**ペインログのクローズマーカーと同じ 1 実装**（`CloseOrigin::marker_with_caller`）
+/// から採る。`close:gui` / `close:gui-tab` / `close:kbd` / `close:dispatch(cli, caller=…)`
+/// のように発生源が載るので、`workers.yaml` と persist.log / ペインログの監査行を
+/// **同じ語彙**で突き合わせられる（#770 の調査で「誰がどの経路で閉じたか」を
+/// 消去法でしか絞れなかったことへの手当て）。
+///
+/// 旧値 `explicit_close` は「明示 close」以上の情報を持たず、値で分岐する消費側も
+/// 無い（書き込みと `workers` の JSON 露出だけ）ので置き換える。過去のファイルに
+/// 残る `explicit_close` は `Option<String>` のまま読めるので移行は要らない。
+/// A/B は `TAKO_775_LEGACY=1`（旧の固定値へ戻す）
+pub fn close_reason_for(origin: CloseOrigin, caller_role: Option<&str>) -> String {
+    if std::env::var("TAKO_775_LEGACY").as_deref() == Ok("1") {
+        return "explicit_close".to_string();
+    }
+    origin.marker_with_caller(caller_role)
+}
+
+/// 明示 close されたペインの active worker を closed にする（発生源つき。#775）。
+///
+/// **close 経路（GUI / CLI / MCP）はすべてこの入口を通る**。`close_reason` の綴りを
+/// 呼び出し側が各々決めると経路ごとに語彙がずれるので、[`close_reason_for`] へ寄せた。
+///
+/// プロセス終了（`CloseOrigin::ProcessExit`）は**記録しない**。#390 の
+/// 「ペインが消えても worker は生きている」追跡を壊さないための不変条件で、
+/// 呼び出し側の取り違えをここでも止める（消えたままなら GC が 5 分後に `gone` で倒す）
+pub fn mark_closed_by_origin(
+    pane: u64,
+    origin: CloseOrigin,
+    caller_role: Option<&str>,
+) -> Result<(), String> {
+    if origin == CloseOrigin::ProcessExit {
+        return Ok(());
+    }
+    mark_closed_by_pane(pane, &close_reason_for(origin, caller_role))
+}
+
 /// 明示 close されたペインの active worker を closed にする。
 /// レジストリ不在（orchestrator 未使用）は何もしない（通常ペインの close に
 /// ファイル IO のコストを掛けない）。**worker でないペインでも書き込まない**
-/// （全ペインの close 経路から呼ばれるため。#658 で GUI 経路にも配線した）
+/// （全ペインの close 経路から呼ばれるため。#658 で GUI 経路にも配線した）。
+/// 発生源を持っている呼び出し側は [`mark_closed_by_origin`] を使うこと（#775）
 pub fn mark_closed_by_pane(pane: u64, reason: &str) -> Result<(), String> {
     let Some(path) = registry_path() else {
         return Ok(());
@@ -1940,5 +1980,100 @@ mod tests {
         let reg = WorkerRegistry::load_from(&path).unwrap();
         assert_eq!(reg.workers[&id].status, "closed");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// #775: `close_reason` の綴りはペインログのクローズマーカーと同じ 1 実装から採る。
+    /// 経路ごとに別の語彙を作らないことがこの関数の存在理由
+    #[test]
+    fn close_reasonは発生源の語彙をペインログと共有する() {
+        for (origin, expected) in [
+            (CloseOrigin::PaneButton, "close:gui"),
+            (CloseOrigin::TabButton, "close:gui-tab"),
+            (CloseOrigin::Keyboard, "close:kbd"),
+            (CloseOrigin::Cli, "close:dispatch(cli)"),
+            (CloseOrigin::Mcp, "close:dispatch(mcp)"),
+        ] {
+            assert_eq!(close_reason_for(origin, None), expected);
+            // ペインログのマーカーと**同じ文字列**（突き合わせの前提）
+            assert_eq!(close_reason_for(origin, None), origin.marker());
+        }
+        // dispatch 経路は呼び出し元 role も載る（GUI 経路には載らない）
+        assert_eq!(
+            close_reason_for(CloseOrigin::Cli, Some("orchestrator-master:default")),
+            "close:dispatch(cli, caller=orchestrator-master:default)"
+        );
+        assert_eq!(
+            close_reason_for(CloseOrigin::PaneButton, Some("orchestrator-master:default")),
+            "close:gui"
+        );
+    }
+
+    /// #775: 発生源つきの記録が実ファイルへ入ること。#390 の不変条件
+    /// （PTY 死亡では倒さない）をこの入口でも守る
+    #[test]
+    fn mark_closed_by_originは発生源をclose_reasonへ残す() {
+        let path = temp_registry_file("mark-closed-origin");
+        let id = register_at(&path, sample_record(4321));
+        // 器は `registry_path()`（#[cfg(test)] ではプロセス固有の一時ファイル）を
+        // 使うので、ここでは綴りの決定とファイル反映を別々に突き合わせる
+        let reason = close_reason_for(CloseOrigin::TabButton, None);
+        mark_closed_by_pane_at(&path, 4321, &reason).unwrap();
+        let reg = WorkerRegistry::load_from(&path).unwrap();
+        assert_eq!(reg.workers[&id].status, "closed");
+        assert_eq!(
+            reg.workers[&id].close_reason.as_deref(),
+            Some("close:gui-tab"),
+            "タブ × で閉じた発生源が残る"
+        );
+        assert!(reg.workers[&id].closed_at.is_some());
+
+        // 既に closed のエントリは再度の close で書き換えない（冪等）
+        let after = std::fs::read_to_string(&path).unwrap();
+        mark_closed_by_pane_at(&path, 4321, &close_reason_for(CloseOrigin::Keyboard, None))
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            after,
+            "closed 済みのエントリを二度目の close が上書きしない"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #775: PTY 死亡（`ProcessExit`）はこの入口でも倒さない。
+    ///
+    /// #390 の不変条件（ペインが消えても worker は生きている）を、呼び出し側の
+    /// 取り違えから守る二重の防御。`mark_closed_by_origin` は `registry_path()` を
+    /// 見るので、共有の一時レジストリ（`#[cfg(test)]` ではプロセス固有）へ登録して測る
+    #[test]
+    fn pty死亡はmark_closed_by_originで倒さない() {
+        let shared = registry_path().unwrap();
+        let id = record_spawn(sample_record(43_221)).expect("共有レジストリへ登録できる");
+        let before = std::fs::read_to_string(&shared).unwrap();
+
+        mark_closed_by_origin(43_221, CloseOrigin::ProcessExit, None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&shared).unwrap(),
+            before,
+            "PTY 死亡でファイルを書き換えてはいけない"
+        );
+        let reg = WorkerRegistry::load_from(&shared).unwrap();
+        assert!(
+            reg.workers[&id].is_active(),
+            "PTY 死亡で active を倒してはいけない（#390）"
+        );
+
+        // 明示 close なら同じ入口で倒れる（ガードが全部を止めていない検出力）
+        mark_closed_by_origin(43_221, CloseOrigin::TabButton, None).unwrap();
+        let reg = WorkerRegistry::load_from(&shared).unwrap();
+        assert_eq!(reg.workers[&id].status, "closed");
+        assert_eq!(
+            reg.workers[&id].close_reason.as_deref(),
+            Some("close:gui-tab")
+        );
+        // 後始末（共有ファイルなので自分のエントリだけ消す）
+        let _ = WorkerRegistry::mutate_at(&shared, |reg| {
+            reg.workers.remove(&id);
+        });
     }
 }
