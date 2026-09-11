@@ -30,17 +30,20 @@
 
 use std::path::{Path, PathBuf};
 
+// 本番コードの範囲取りは 1 実装（#1420）。**切らずにテスト領域だけを潰す**ので、
+// ファイル途中のテスト用ヘルパで走査範囲が消えない
+#[path = "common/production_range.rs"]
+mod production_range;
+
 fn link_rs() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/claude_remote_link.rs")
 }
 
-/// テストモジュールより手前だけを見る（番犬自身の文字列や fixture に当たらない。
-/// #913 の `open_files` 番犬と同じ作法）
-fn production_source(src: &str) -> &str {
-    match src.find("\n#[cfg(test)]") {
-        Some(i) => &src[..i],
-        None => src,
-    }
+/// テスト領域を空白へ潰して本番コードだけを見る（番犬自身の文字列や fixture に
+/// 当たらない）。切らない理由と「黙って縮んだ」の検出は
+/// `common/production_range.rs`（#1420）
+fn production_source(src: &str) -> String {
+    production_range::scan(src).text
 }
 
 /// コメント行を落とす（説明文の中の `eprintln!` / `ownerAccountUuid` を拾わない）
@@ -57,7 +60,7 @@ fn without_comments(body: &str) -> String {
 #[test]
 fn リンク解決の実装は診断ログへ書かない() {
     let src = std::fs::read_to_string(link_rs()).expect("claude_remote_link.rs を読む");
-    let body = without_comments(production_source(&src));
+    let body = without_comments(&production_source(&src));
     // 診断ログの入口すべて。**新しい記録先を作ったらここへ足す**
     const FORBIDDEN: &[&str] = &[
         "println!",
@@ -87,7 +90,7 @@ fn リンク解決の実装は診断ログへ書かない() {
 #[test]
 fn アカウント_uuid_を読む経路がリンク解決に無い() {
     let src = std::fs::read_to_string(link_rs()).expect("claude_remote_link.rs を読む");
-    let body = without_comments(production_source(&src));
+    let body = without_comments(&production_source(&src));
     for key in ["ownerAccountUuid", "ownerOrganizationUuid"] {
         assert!(
             !body.contains(key),
@@ -134,7 +137,7 @@ fn remote_link_の形は1実装だけが組む() {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            let production = without_comments(production_source(&text));
+            let production = without_comments(&production_source(&text));
             // **代入だけを見る**（`&result["remote_link"]` のような読み出しは正当）。
             // 値が次の行へ折り返すので、代入の直後 240 文字を窓にして `to_json` を探す
             let mut from = 0usize;
@@ -178,24 +181,20 @@ fn remote_link_の形は1実装だけが組む() {
 #[test]
 fn 追記ぶんだけ読む検査を実時間で測っていない() {
     let src = std::fs::read_to_string(link_rs()).expect("claude_remote_link.rs を読む");
-    // テストモジュールだけを見る（production 側は #[cfg(test)] より手前）
-    let tests = match src.find("\n#[cfg(test)]") {
-        Some(i) => &src[i..],
-        None => return,
-    };
-    let offset = src.len() - tests.len();
-    let body = without_comments(tests);
+    // テスト領域だけを見る（本番側は空白へ潰す）。**行番号が保たれる**ので
+    // 「N 行目以降の +M 行目」ではなくファイルの絶対行で名指せる（#1420）
+    let tests = production_range::tests_only(&src);
+    let offenders: Vec<String> = tests
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim_start().starts_with("//") && l.contains("Instant"))
+        .map(|(n, l)| format!("  claude_remote_link.rs:{}: {}", n + 1, l.trim()))
+        .collect();
     assert!(
-        !body.contains("Instant"),
-        "claude_remote_link.rs のテストが `Instant` を使っている（{} 行目以降）。\n\
+        offenders.is_empty(),
+        "claude_remote_link.rs のテストが `Instant` を使っている。\n\
          効果は実時間ではなく**読んだ量**で測る（読み出しバイト数を数える読み口を\n\
          `scan_source` へ渡す。#1167 の `追記ぶんだけ読むと定常コストが増えない`）:\n{}",
-        src[..offset].lines().count(),
-        body.lines()
-            .enumerate()
-            .filter(|(_, l)| l.contains("Instant"))
-            .map(|(n, l)| format!("  +{}: {}", n + 1, l.trim()))
-            .collect::<Vec<_>>()
-            .join("\n")
+        offenders.join("\n")
     );
 }

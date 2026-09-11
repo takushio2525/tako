@@ -19,6 +19,11 @@ use std::path::{Path, PathBuf};
 
 use tako_control::platform::os_integration::windows_url_launch;
 
+// 本番コードの範囲取りは 1 実装（#1420）。**切らずにテスト領域だけを潰す**ので、
+// ファイル途中のテスト用ヘルパで走査範囲が消えない
+#[path = "common/production_range.rs"]
+mod production_range;
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -33,12 +38,10 @@ fn source() -> String {
     std::fs::read_to_string(repo_root().join(SOURCE)).expect("境界 B8 の実装本体を読める")
 }
 
-/// 実装部（`#[cfg(test)]` より前）だけを返す。
-/// 目印が消えたら「走査範囲が空 = いつでも通る」になるので先に落とす
-fn production(src: &str) -> &str {
-    let (impl_src, _) = src
-        .split_once("#[cfg(test)]")
-        .expect("os_integration.rs に #[cfg(test)] の目印がある");
+/// 実装部（`#[cfg(test)]` の付いた item を空白へ潰した眺め）だけを返す。
+/// 切らない理由と「黙って縮んだ」の検出は `common/production_range.rs`（#1420）
+fn production(src: &str) -> String {
+    let impl_src = production_range::production(src, SOURCE);
     assert!(
         impl_src.contains("pub fn open_url"),
         "open_url が見つからない: 走査先が間違っている"
@@ -125,7 +128,7 @@ fn urlを開く経路にシェルが挟まっていない() {
 #[test]
 fn windowsのurl起動はshellexecuteへ寄っている() {
     let src = source();
-    let (base, win) = windows_imp(production(&src));
+    let (base, win) = windows_imp(&production(&src));
 
     let open_url_at = line_at(&win, base, "pub fn open_url(url: &str)");
     let open_url = win
@@ -231,7 +234,7 @@ fn クエリ文字列の後半が落ちない() {
 #[test]
 fn 名指しする行番号がファイルと一致する() {
     let src = source();
-    let (base, win) = windows_imp(production(&src));
+    let (base, win) = windows_imp(&production(&src));
     const NEEDLE: &str = "Command::new(\"explorer.exe\")";
     let reported = line_at(&win, base, NEEDLE);
     let actual = src

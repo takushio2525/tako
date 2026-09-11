@@ -34,6 +34,11 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+// 本番コードの範囲取りは 1 実装（#1420）。**切らずにテスト領域だけを潰す**ので、
+// ファイル途中のテスト用ヘルパで走査範囲が消えない
+#[path = "common/production_range.rs"]
+mod production_range;
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -79,11 +84,10 @@ fn code_only(src: &str) -> String {
         .join("\n")
 }
 
-/// 本番コード（最初の `#[cfg(test)]` より前）だけを返す
+/// 本番コード（`#[cfg(test)]` の付いた item を空白へ潰した眺め）だけを返す。
+/// 切らない理由と「黙って縮んだ」の検出は `common/production_range.rs`（#1420）
 fn production(rel: &str) -> String {
-    let src = read(rel);
-    let cut = src.find("\n#[cfg(test)]").unwrap_or(src.len());
-    src[..cut].to_string()
+    production_range::production(&read(rel), rel)
 }
 
 /// IPC 受信ループの「dispatch → 応答」区間
