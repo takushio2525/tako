@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-11（#633: 承認カードの command を「承認を求めている操作」から始める）
-- 実測で真因を絞った: 本文の境界は「当たったら捨てる」3 つ（罫線 / 0 桁の非空行 = #1293 / 番号つき行）しか無く、**罫線を引かず箱ごと 0 桁で描く**許可ダイアログ（agy / claude の箱なし 2 形）では捨てる材料が無い。Issue 実測値の `⏺` 行そのものは #1293 が既に切っていた
-- `dialog::BODY_START_MARKERS` + `body_start_row` で**本体の開始マーカーを起点**にし、無ければ従来のブロック抽出へフォールバック（起点を下げるだけ = 結果は必ず従来の接尾辞）。FR-2.25.12 / conventions #1293 節に追記
-- 番犬 `crates/tako-control/tests/issue633_permission_command_anchor.rs` 8 本 + 単体 3 本。A/B `TAKO_633_LEGACY=1` で 2 本 FAILED（agy に発話が混ざる / 罫線の無い画面が `⎿` 行から始まる）
-
 ## 2026-09-11（#651: 狭い実行ペインで割れた exit マーカーを拾えるようにした）
 - 折り返しの判定を `TerminalSession::visible_lines_filled`（alacritty の `line_length()` = WRAPLINE + 占有列数）で**列**で持ち、`dispatch::find_exit_marker` が「埋まった行の行末 → 次の非空行の行頭」だけをまたいでマーカーを再構成する形へ。数字のあとは行の残りが空白であることを要求するので無関係な行は繋がない（案 2 の OSC 化は器越え + Windows 実機が要るので Issue へ理由を残して見送り）
 - 隔離 GUI 実測（直接 PTY と tmux バックエンドの両方）: 幅 7 / 10 / 13 / 40 桁すべて `exited exit_code=0`・幅 10 桁の `--wait` が返る（修正前は 40 秒返らない）・3 桁の `127` は幅 13 桁で `__TAKO_EXIT=1` + `27` に割れても 127。legacy アーム（`TAKO_651_LEGACY=1`）は永久 running と **`exit_code=1` の誤報**を再現
@@ -64,3 +59,8 @@
 - 真因は feature unification。`--workspace` は必ず gpui を含むので `serde_json/preserve_order` が有効 = `Map` が IndexMap 実装 → `Value` が**有意な Drop** を持ち `unnecessary_lazy_evaluations` が黙る。gpui 抜きの `-p` 宇宙は BTreeMap 実装（insignificant）なので同じ行で落ちる
 - `wait.rs:1099` を `then_some` へ（挙動不変）。CI の macOS ジョブへ `-p tako-core -p tako-control -p tako-cli` の clippy を追加（温まっていれば実測 10.5 秒）
 - 番犬: 修正前の行を戻すと新ステップが EXIT=101・既存の workspace ステップは EXIT=0 で見逃す（実出力で確認）
+
+## 2026-09-11（#1376: PDF のリンク注釈と提案チップにスキーム検査を通した）
+- 判定を `tako_core::url_guard` の 1 実装へ（`check_browser_url` = http / https / `check_os_handler_url` = 境界 B8 の許可集合。`md_links::browser_url` は再公開）。経路側（(a)）= `follow_pdf_link` / `follow_preview_pdf_link` / `open_preview` と、保険（(b)）= `os_integration::open_url` / `open_url_wait` の両方を締めた。弾いたら通知欄 + 理由の分類だけを persist.log へ（リンク文字列は出さない）
+- 隔離 GUI（tako-vd・`open` の PATH shim で OS ランチャの引数を観測）: 最小 PDF の `file:///Applications/Calculator.app` は `許可していないスキーム` で弾かれ **`open` は 1 回も起きない**、`https://example.com/ok?a=1&b=2` は `opened_url` + shim に 1 つの値のまま到達
+- 番犬 8 本（経路 3 か所・B8・大域走査・診断の中身・1 実装・行番号の物差し）。修正前ソースで 6/8 が file:line 名指し FAILED（`main.rs:1096` / `11648` / `20751` = Issue 記載の 3 行 + `os_integration.rs:88` + `md_links.rs`）。Windows 実機は未検証

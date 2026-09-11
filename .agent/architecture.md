@@ -2220,6 +2220,36 @@ tmux クライアント自身が alt screen へ入るので、**中身が素の�
   daemon は 127.0.0.1 bind。認証は二層: ① Tailscale identity + ② 機器ペアリング。
   公開インターネットへの露出なし。脅威モデルは `.agent/threat-model-remote.md`）
 
+### OS の URL ハンドラへ渡す前の検査（境界 B8。#1376）
+
+tako が「開く」URL の出どころは**第三者が書ける場所**しかない（ターミナル画面 /
+Markdown / PDF のリンク注釈 / ポート検知の提案チップ）。OS の既定ハンドラ
+（macOS の `open` / Windows の `ShellExecuteW`）は **URL でない文字列も開く**ので、
+`file:` URL・UNC パス（`\\host\share\payload.exe`）・ローカルの実行ファイルパスを
+そのまま渡すと、受け取った PDF のリンクを 1 回クリックするだけで任意のプログラムが起動する。
+
+判定の正本は `tako_core::url_guard` の 1 実装で、**2 段構え**で使う:
+
+| 段 | 関数 | 通すもの | 掛かる場所 |
+|---|---|---|---|
+| 経路側 | `check_browser_url` | http / https のみ | 画面リンク（検出時点で `links.rs`）/ md / **PDF のリンク注釈** / **提案チップ** |
+| 境界側 | `check_os_handler_url` | 上 + `OS_HANDLER_SCHEMES` | `os_integration::open_url` / `open_url_wait`（B8） |
+
+境界側の許可集合（`OS_HANDLER_SCHEMES` = http / https / `x-apple.systempreferences`）は
+**tako 自身が組み立てる URL** の棚卸しで決めてある（FDA のパネル = `fda::open_settings`、
+バッテリ設定 = `sleep_guard::open_battery_settings`）。第三者由来の文字列が届く経路は
+経路側で http / https に絞ってあるので、ここへ足したスキームはその経路からは届かない。
+
+- **経路側を 1 行外しても B8 で止まり、B8 の許可集合が広がっても経路側で止まる**。
+  片方だけで守らない（#1371 が消したのは cmd.exe = 「URL が途中で切れない」話で、
+  スキームの検査ではない）
+- **1 文字のスキームは URL と見ない**（`C:\payload.exe` のドライブレター）。
+  RFC 3986 上は合法だが実在しないので、ここを通すとローカルの実行ファイルが
+  「URL」として OS へ渡る
+- 弾いたときは**黙って捨てず**通知へ出す（共有の通知欄 = `remote_notice`）。
+  診断に残すのは理由の分類（`UrlBlocked`）だけで、**リンク文字列そのものは出さない**
+  （PDF の中身はペイン内容に相当する）
+
 ### remote デーモンのローカルエンドポイント（#1038 / #971）
 
 `tailscale serve` が中継する先（= daemon の待ち受け）は **127.0.0.1 のエフェメラル

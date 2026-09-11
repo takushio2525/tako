@@ -71,6 +71,7 @@ pub mod tmux;
 pub mod tmux_backend;
 pub mod tmux_cleanup;
 pub mod ui_mode;
+pub mod url_guard;
 pub mod wait_budget;
 pub mod workspace;
 
