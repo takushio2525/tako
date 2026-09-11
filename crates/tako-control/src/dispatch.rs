@@ -22029,6 +22029,170 @@ mod tests {
         assert_eq!(can["reason"], "agent_role");
     }
 
+    // --- #1308: 実 PTY の fixture を「状態で待つ」ための小さなドライバ ---
+    //
+    // 固定窓へ戻ると、落ちたときに「窓が足りないのか / 相手が動いていないのか」が
+    // 出力から消える（#1265 と同じ理由）。番犬
+    // `crates/tako-control/tests/issue1308_pty_wait_watchdog.rs` が復活を落とす。
+
+    /// #1308 **前**の固定窓（素のシェルのプロンプト待ち）
+    const I1308_LEGACY_PROMPT_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+    /// #1308 **前**の固定窓（ダイアログの描画待ち）
+    const I1308_LEGACY_DIALOG_WINDOW: std::time::Duration = std::time::Duration::from_secs(20);
+    /// 素の上限（混み具合で伸ばす前）。**旧の固定窓より広く採る**
+    /// （等しいと空いている機で旧と同じ = A/B が取れない。#771 と同じ理由）
+    const I1308_PROMPT_BASE: std::time::Duration = std::time::Duration::from_secs(30);
+    /// 同上（ダイアログの描画）
+    const I1308_DIALOG_BASE: std::time::Duration = std::time::Duration::from_secs(30);
+    /// 送り直しの回数の上限（間隔 = 予算 / これ。**予算を伸ばしても回数は増えない**）
+    const I1308_MAX_SENDS: u32 = 8;
+    /// `TAKO_1308_INJECT=late` の遅れ。旧の固定窓 10 秒より長く、新の素の上限 30 秒より短い
+    /// （不等式は `issue1308_注入の遅れは旧の窓を超えて新の上限に収まる` が拘束する）
+    const I1308_INJECT_LATE_SECS: u64 = 15;
+
+    /// A/B: `TAKO_1308_LEGACY=1` は #1308 **前**の待ちへ戻す
+    /// （固定窓・送り直しなし・**尽きても検査せず素通り**）
+    fn legacy_1308() -> bool {
+        std::env::var("TAKO_1308_LEGACY").is_ok_and(|v| v == "1")
+    }
+
+    /// **状態待ちの共通ドライバ**（#1308）。`ready` が真になるまで待つ。
+    ///
+    /// 上限は `wait_budget::state_wait_budget`（混み具合で**伸ばすだけ**・4 倍で打ち切り）で、
+    /// 固定の回数上限は持たない。要点は 3 つ:
+    ///
+    /// - `send` を渡すと最初に 1 回送り、届かないあいだ**上限つきで送り直す**（#1165 と同じ形）。
+    ///   「プロンプトが出た」は zle が上がった証拠としては弱く、起動途中の PTY は打鍵を
+    ///   落とす（#640）
+    /// - **尽きたら素通りせず panic** する。旧実装は固定窓が尽きても検査せず次へ進んで
+    ///   いたので、起動前の PTY へ打ち込んだ行はエコーされるだけになり、最後の `dispatch`
+    ///   が「器越しへ倒れている（#1200）」という**無関係な原因**を名指ししていた
+    ///   （実測 2026-09-11: `prompt_ok=false waited=10.03s dialog_seen=false
+    ///   waited=20.04s load=3.89` / 全件走 19 回に 1 回）
+    /// - 診断は Issue 番号で名乗る（`TAKO_1308_WAIT`）。「何を待っていたか」と
+    ///   「実際に何が届いたか」を必ず出す（#1252 / #1265 の規約）
+    fn i1308_wait_for_state(
+        what: &str,
+        base: std::time::Duration,
+        legacy_window: std::time::Duration,
+        send: Option<&dyn Fn()>,
+        screen: impl Fn() -> String,
+        ready: impl Fn() -> bool,
+    ) {
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        if let Some(send) = send {
+            send();
+        }
+        // TAKO_1308_LEGACY_ARM 開始
+        if legacy_1308() {
+            // #1308 前: 固定窓で待ち、**尽きても検査せず素通り**する（送り直しも無い）
+            while !ready() && started.elapsed() < legacy_window {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            return;
+        }
+        // TAKO_1308_LEGACY_ARM 終了
+        let busy = tako_core::wait_budget::machine_busy();
+        let budget = tako_core::wait_budget::state_wait_budget(base, busy);
+        // 送り直しの間隔は予算に比例する = 混み具合が変わっても送る回数は変わらない
+        let every = budget / I1308_MAX_SENDS;
+        let mut sends = u32::from(send.is_some());
+        let mut next_send = started + every;
+        let mut attempts = 0u32;
+        loop {
+            attempts += 1;
+            if ready() {
+                return;
+            }
+            if started.elapsed() >= budget {
+                panic!(
+                    "TAKO_1308_WAIT: 待っていたもの={what} / 届いたもの=画面（下）\n\
+                     waited={:.1}s budget={:.1}s base={:.1}s attempts={attempts} \
+                     sends={sends} load={}\n\
+                     固定窓ではなく状態で待っている。ここで素通りすると、原因は\
+                     別の場所で別の顔をして現れる（#1308）\n{}",
+                    started.elapsed().as_secs_f64(),
+                    budget.as_secs_f64(),
+                    base.as_secs_f64(),
+                    busy.map(|b| format!("{b:.2}"))
+                        .unwrap_or_else(|| "unknown".into()),
+                    screen(),
+                );
+            }
+            if Instant::now() >= next_send {
+                if let Some(send) = send {
+                    send();
+                    sends += 1;
+                }
+                next_send = Instant::now() + every;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// 注入（#1308）: 混み具合そのものは再現できないので**遅れ**を入れる
+    /// （#1265 の `late` と同じ考え方）。
+    ///
+    /// `TAKO_1308_INJECT=late` で素のシェルの起動を [`I1308_INJECT_LATE_SECS`] 秒遅らせる。
+    /// 待っているあいだの打鍵は `cat` が食うので**起動前に打ち込んだ行は実行されず**、
+    /// #1308 の実失敗（画面にコマンドのエコーだけが残る）と同じ形になる。
+    /// 旧アーム（固定 10 秒 + 20 秒）は確定 FAILED・新アーム（素の上限 30 秒）は通る。
+    ///
+    /// `cat` の入力を **`/dev/tty` と明示するのが肝**。非対話シェルの `&` は
+    /// バックグラウンドジョブの stdin を `/dev/null` へ向けるので、省くと打鍵が
+    /// tty のキューに残り、遅れて起きたシェルが**後から実行してしまう**
+    /// （実測: 旧アームまで通ってしまい A/B にならなかった）。
+    ///
+    /// POSIX 限定（`/bin/sh` を使う）。CI はこの env を置かない
+    fn i1308_spawn_options() -> SpawnOptions {
+        if cfg!(windows) || !std::env::var("TAKO_1308_INJECT").is_ok_and(|v| v == "late") {
+            return SpawnOptions::default();
+        }
+        let shell = tako_core::platform::shell::default_shell()
+            .map(|s| s.program)
+            .unwrap_or_else(|| "/bin/sh".to_string());
+        let quoted = tako_core::shell::quote_for_shell(&shell);
+        SpawnOptions {
+            command: Some(tako_core::SpawnCommand {
+                program: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    format!(
+                        "cat </dev/tty >/dev/null & drain=$!; \
+                         sleep {I1308_INJECT_LATE_SECS}; kill $drain 2>/dev/null; \
+                         exec {quoted} -l"
+                    ),
+                ],
+            }),
+            ..SpawnOptions::default()
+        }
+    }
+
+    /// #1308 の A/B が成立する不等式（**旧の固定窓 < 注入の遅れ < 新の素の上限**）。
+    ///
+    /// 等しいと「空いている機では旧と同じ」になり `TAKO_1308_LEGACY=1` との差が出ない
+    /// （#771 と同じ理由）。定数を動かしたらここで落ちる
+    #[test]
+    fn issue1308_注入の遅れは旧の窓を超えて新の上限に収まる() {
+        let late = std::time::Duration::from_secs(I1308_INJECT_LATE_SECS);
+        assert!(
+            I1308_LEGACY_PROMPT_WINDOW < late,
+            "注入の遅れ（{late:?}）が旧の固定窓（{I1308_LEGACY_PROMPT_WINDOW:?}）を\
+             超えないと legacy アームが落ちない = A/B にならない"
+        );
+        assert!(
+            late < I1308_PROMPT_BASE,
+            "注入の遅れ（{late:?}）が新の素の上限（{I1308_PROMPT_BASE:?}）を超えると、\
+             空いている機では新アームまで落ちる"
+        );
+        assert!(
+            I1308_LEGACY_DIALOG_WINDOW < I1308_DIALOG_BASE,
+            "新の上限は旧の固定窓より広く採る（等しいと空いている機で差が出ない）"
+        );
+    }
+
     /// #1200 の核心: **tako-app が保持しているペインは detached へ倒れない**。
     ///
     /// 旧実装は `respond` の入口でバックエンドセッション名を必須にし、器越しの
@@ -22048,7 +22212,7 @@ mod tests {
         // 選択肢ダイアログを描いて保持するペイン（claude の usage_limit と同じ形）。
         // 素のシェルへ**打ち込む**のはセルフテスト項目 748 と同じ形（方言は
         // `shell_dialect` が選ぶので macOS / Windows の両方で同じ絵になる）
-        let (session, _rx) = TerminalSession::spawn(80, 24, SpawnOptions::default())
+        let (session, _rx) = TerminalSession::spawn(80, 24, i1308_spawn_options())
             .expect("既定シェルの PTY を張れる");
         let Some(sh) = tako_core::platform::shell_dialect::for_default_shell() else {
             eprintln!("skip: 既定シェルの方言を決められない");
@@ -22064,33 +22228,36 @@ mod tests {
             ),
             30,
         );
-        // プロンプトが出てから打つ（出る前に打つと行が食われる）
-        let ready = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while session.visible_lines().iter().all(|l| l.trim().is_empty())
-            && std::time::Instant::now() < ready
-        {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        session.write(format!("{dialog_cmd}\r").into_bytes());
+
+        // ① プロンプトが出てから打つ（出る前に打つと行が食われる）。**状態で待つ**
+        //    = 旧実装はここを固定 10 秒窓で待ち、尽きても検査せず打ち込んでいた（#1308）
+        i1308_wait_for_state(
+            "素のシェルのプロンプト",
+            I1308_PROMPT_BASE,
+            I1308_LEGACY_PROMPT_WINDOW,
+            None,
+            || session.visible_lines().join("\n"),
+            || !session.visible_lines().iter().all(|l| l.trim().is_empty()),
+        );
+
+        // ② 画面にダイアログが出るまで待つ（描画は PTY 経由なので即時ではない）。
+        //    届かないあいだは上限つきで打ち直す
+        let retype = || {
+            session.write(format!("{dialog_cmd}\r").into_bytes());
+        };
+        i1308_wait_for_state(
+            "選択肢ダイアログの描画",
+            I1308_DIALOG_BASE,
+            I1308_LEGACY_DIALOG_WINDOW,
+            Some(&retype),
+            || session.visible_lines().join("\n"),
+            || crate::claude_tui::detect_choice_dialog(&session.visible_lines()).is_some(),
+        );
+
         host.sessions.insert(pane_id.as_u64(), session);
         // **実在しない**器のセッション名（器越しへ倒れたら必ず失敗する）
         host.backend_sessions
             .insert(pane_id.as_u64(), "tako-1200-no-such-session".to_string());
-
-        // 画面にダイアログが出るまで待つ（描画は PTY 経由なので即時ではない）
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        loop {
-            let seen = host
-                .sessions
-                .get(&pane_id.as_u64())
-                .map(|s| s.visible_lines())
-                .map(|lines| crate::claude_tui::detect_choice_dialog(&lines).is_some())
-                .unwrap_or(false);
-            if seen || std::time::Instant::now() >= deadline {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
 
         let probe = dispatch(
             &mut host,
