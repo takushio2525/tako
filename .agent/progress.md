@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-11（#1301: 2 秒 tick の全ペイン フルスナップショット 2 本を末尾窓へ）
-- `refresh_agent_metrics` / `drive_queued_message_recovery` が毎 tick 全ペインの `Screen`（行ごとに `String` + `Vec<StyleRun>` + `Vec<usize>` の 3 確保）を組んで文字列だけ取って捨てていた（#1001 の H2 / H3）。`TerminalSession::tail_lines(n)`（`Screen` を通さずグリッドから末尾 n 行）+ alt screen ゲート + C3 の判定順入れ替えへ。窓の正本は `AGENT_TUI_TAIL_LINES`=48（Issue 記載の 8 では #1093 / #1123 の上限見出し窓 24 を割る）
-- 実測（隔離 GUI・`tako-vd`・1/4/12/22 ペイン・各 20 秒 × 3 窓）: 傾き **0.271 → 0.068 M 命令/秒/ペイン**（全 12 窓の最小二乗）= 2 秒 tick 1 回あたり 0.543 → 0.135 M 命令/ペイン。22 ペインの footprint 46.4 → 39.9 MB
-- A/B は `TAKO_1001_C2_LEGACY=1` / `TAKO_1001_C3_LEGACY=1`。番犬 4 本が修正前ソースで file:line 名指し FAILED、`tail_lines` は故障注入 3 種で単体テストが落ちる
-
 ## 2026-09-11（#775: GUI 経路の close が workers.yaml へ発生源つきで closed を記録する）
 - #658 で 3 経路（ペイン × / タブ × / cmd+W）は配線済みで、残っていたのは**たまり場カードの kill**（退避中ペインはどのタブにも居ないので `remove_pane_with` を通らず、drawer の on_click が後始末を独自列挙）と **`close_reason` が固定文字列 `explicit_close`**（発生源なし）の 2 つ。前者は `kill_shelved_pane` へ集約、後者は `registry::close_reason_for` の 1 実装へ寄せてペインログのクローズマーカーと同語彙（`close:kbd` / `close:gui` / `close:gui-tab` / `close:dispatch(cli)`）にした。CLI / MCP 側の対の経路 `Request::BackgroundKill` も同じ穴だったので併せて配線（スキーマ変更・移行なし）
 - 隔離 GUI セルフテスト（`tako-vd`）で 4 経路を実操作して全項目通過: `kbd=closed/close:kbd gui=closed/close:gui cli=closed/close:dispatch(cli, caller=…)` / `tab=closed/close:gui-tab shelf=closed/close:gui` / `active=[]`（`orchestrator workers` に出ない）/ `all_has_tab=true`（--all では残る）/ `plain_entries=15->15`（worker でないペインは増やさない）
@@ -68,3 +63,8 @@
 - 実測で真因を絞った: 本文の境界は「当たったら捨てる」3 つ（罫線 / 0 桁の非空行 = #1293 / 番号つき行）しか無く、**罫線を引かず箱ごと 0 桁で描く**許可ダイアログ（agy / claude の箱なし 2 形）では捨てる材料が無い。Issue 実測値の `⏺` 行そのものは #1293 が既に切っていた
 - `dialog::BODY_START_MARKERS` + `body_start_row` で**本体の開始マーカーを起点**にし、無ければ従来のブロック抽出へフォールバック（起点を下げるだけ = 結果は必ず従来の接尾辞）。FR-2.25.12 / conventions #1293 節に追記
 - 番犬 `crates/tako-control/tests/issue633_permission_command_anchor.rs` 8 本 + 単体 3 本。A/B `TAKO_633_LEGACY=1` で 2 本 FAILED（agy に発話が混ざる / 罫線の無い画面が `⎿` 行から始まる）
+
+## 2026-09-11（#651: 狭い実行ペインで割れた exit マーカーを拾えるようにした）
+- 折り返しの判定を `TerminalSession::visible_lines_filled`（alacritty の `line_length()` = WRAPLINE + 占有列数）で**列**で持ち、`dispatch::find_exit_marker` が「埋まった行の行末 → 次の非空行の行頭」だけをまたいでマーカーを再構成する形へ。数字のあとは行の残りが空白であることを要求するので無関係な行は繋がない（案 2 の OSC 化は器越え + Windows 実機が要るので Issue へ理由を残して見送り）
+- 隔離 GUI 実測（直接 PTY と tmux バックエンドの両方）: 幅 7 / 10 / 13 / 40 桁すべて `exited exit_code=0`・幅 10 桁の `--wait` が返る（修正前は 40 秒返らない）・3 桁の `127` は幅 13 桁で `__TAKO_EXIT=1` + `27` に割れても 127。legacy アーム（`TAKO_651_LEGACY=1`）は永久 running と **`exit_code=1` の誤報**を再現
+- 番犬 2 本（製品コードへのマーカー literal 増殖 / 文字数で測る物差し）+ 実 PTY の単体テスト（幅 10 桁で割れる形と全角で埋まった行）
