@@ -36,7 +36,9 @@ v0.6.0〜v0.8.1 は UDS（socket 0600 + 親ディレクトリ 0700）のみで�
   管理トークンが正しくても拒否する ④層②の機器ペアリング（Mac 画面での明示承認）は
   そのまま効く
 - **強い分離が要る環境向けの opt-in**: standalone tailscaled しか使わないと
-  分かっているなら `TAKO_REMOTE_ENDPOINT=unix` で UDS へ戻せる（挙動は v0.8.1 以前と同じ）
+  分かっているなら `TAKO_REMOTE_ENDPOINT=unix` で UDS へ戻せる（挙動は v0.8.1 以前と同じ）。
+  **成立するのは unix 系だけ**で、Windows は `local_endpoint::unix_supported()` = `cfg!(unix)`
+  が false なので理由つきで拒否される（#971）
 
 ## 信頼しないもの
 
@@ -84,8 +86,14 @@ v0.6.0〜v0.8.1 は UDS（socket 0600 + 親ディレクトリ 0700）のみで�
 
 - daemon は 127.0.0.1 のループバック TCP で待ち受ける（#1038。外部インタフェースには
   バインドしない）。`TAKO_REMOTE_ENDPOINT=unix` で UDS（0600）へ戻せる（#287 P1-2 の形）
-- LAN 上の別端末・同一ホストの別ユーザーからは接続不能（OS のファイルパーミッションで強制）
-- serve 経由（tailnet 内）のアクセスのみが到達する
+- **LAN 上の別端末からは接続不能**（外部インタフェースへバインドしないので経路が無い。
+  既定・UDS のどちらでも同じ）
+- **同一ホストの別ユーザーからの接続は、既定のループバック TCP では防げない**。
+  OS のファイルパーミッションで遮断できるのは `TAKO_REMOTE_ENDPOINT=unix` を明示した
+  UDS（socket 0600 + 親ディレクトリ 0700）のときだけで、既定では同一マシンの誰でも
+  `127.0.0.1:<port>` へ接続できる（上の「ループバック TCP のトレードオフ」節 / #841）
+- **tailnet / 外部から到達する経路は serve 経由だけ**（ローカルからの直結が
+  既定では可能なことは上記）
 
 ### 入力操作の role 制限
 
@@ -246,7 +254,18 @@ Mac の所有者が決めており、role 昇格も Mac 画面での明示承認
   軽減可能だが、完全な防止は不可能）
 - ローカルの root / 管理者権限を持つ攻撃者は daemon のプロセスメモリや
   devices.json を直接読み書きできる（OS レベルの侵害であり tako の防護範囲外）
-- 同一 OS ユーザーの悪意あるプロセスと root は、socket への接続・token /
-  devices.json の直接読み取りが可能（OS レベルの侵害であり tako の防護範囲外。
-  従来どおり）。別 OS ユーザーによる daemon への到達経路は UDS 化（#287 P1-2）で
-  消滅した
+- 同一 OS ユーザーの悪意あるプロセスと root は、ローカルエンドポイントへの接続・
+  token / devices.json の直接読み取りが可能（OS レベルの侵害であり tako の防護範囲外。
+  従来どおり）
+- **別 OS ユーザーからの daemon への到達は、既定（ループバック TCP）では受容するリスク**。
+  同一マシンなら誰でも `127.0.0.1:<port>` へ接続でき、偽の `X-Forwarded-For` で
+  層①を騙られうる（#841。緩和は「ループバック TCP のトレードオフ」節の「残る緩和」）。
+  この経路をカーネルで塞げるのは `TAKO_REMOTE_ENDPOINT=unix` を**明示**して
+  UDS（socket 0600 + 親ディレクトリ 0700）にしたときだけ（#287 P1-2 の形。socket の
+  権限は `platform::local_endpoint` の `bind_unix` / 親ディレクトリは `remote::state_dir`）。
+  **Windows にはその opt-in が無い**（`local_endpoint::unix_supported()` = `cfg!(unix)`）ので、
+  ループバック TCP を使う全プラットフォームのうち Windows だけは回避手段なしでこれを受容する。
+  **v0.8.1 以前は UDS が既定だったのでこの項は「到達する経路が無い」と書いてあった**が、
+  #1038 で既定が変わった時点でその前提は失効している（判定の正は
+  `tako_control::remote::parse_endpoint_spec(None)` = 番犬
+  `crates/tako-control/tests/issue1406_threat_model_endpoint_watchdog.rs`）

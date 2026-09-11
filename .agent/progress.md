@@ -20,16 +20,6 @@
 
 ---
 
-## 2026-09-11（#1362: 全選択 Cmd+A がターミナルでは効かないことを実測し docs を実態へ寄せた）
-- 隔離 GUI（tako-vd・`CGEventPostToPid`）で確定: ターミナルの cmd+A は選択を作らず PTY にも届かない（`abc` に cmd+A → `x` で `abcx` 3/3。本物の Ctrl+A は `xabc` 3/3 = 検出力あり）。cmd+A → cmd+C も sentinel のまま 3/3
-- 同じ経路でプレビュー本文 3/3・編集中バッファ 3/3 は全文が入るので「端末には実装が無い」が確定。表の行へ効く先を書き注記を 1 つ追加（コード変更なし = install 不要。案 (b) = ターミナルの全選択は別 Issue 候補として Issue へ残した）
-- 番犬 2 本（説明文 ↔ `select_all_text` の両方向 / 効く先の列挙）。注入 5 通りで file:line 名指しの FAILED → 復帰後 7/7 緑
-
-## 2026-09-11（#1383: clippy が単体形と workspace 形で違う lint を見る理由を確定し CI へ 1 本足した）
-- 真因は feature unification。`--workspace` は必ず gpui を含むので `serde_json/preserve_order` が有効 = `Map` が IndexMap 実装 → `Value` が**有意な Drop** を持ち `unnecessary_lazy_evaluations` が黙る。gpui 抜きの `-p` 宇宙は BTreeMap 実装（insignificant）なので同じ行で落ちる
-- `wait.rs:1099` を `then_some` へ（挙動不変）。CI の macOS ジョブへ `-p tako-core -p tako-control -p tako-cli` の clippy を追加（温まっていれば実測 10.5 秒）
-- 番犬: 修正前の行を戻すと新ステップが EXIT=101・既存の workspace ステップは EXIT=0 で見逃す（実出力で確認）
-
 ## 2026-09-11（#1376: PDF のリンク注釈と提案チップにスキーム検査を通した）
 - 判定を `tako_core::url_guard` の 1 実装へ（`check_browser_url` = http / https / `check_os_handler_url` = 境界 B8 の許可集合。`md_links::browser_url` は再公開）。経路側（(a)）= `follow_pdf_link` / `follow_preview_pdf_link` / `open_preview` と、保険（(b)）= `os_integration::open_url` / `open_url_wait` の両方を締めた。弾いたら通知欄 + 理由の分類だけを persist.log へ（リンク文字列は出さない）
 - 隔離 GUI（tako-vd・`open` の PATH shim で OS ランチャの引数を観測）: 最小 PDF の `file:///Applications/Calculator.app` は `許可していないスキーム` で弾かれ **`open` は 1 回も起きない**、`https://example.com/ok?a=1&b=2` は `opened_url` + shim に 1 つの値のまま到達
@@ -69,3 +59,8 @@
 - 手順の全文を `guides/remote.md`（6,903 B）へ置き、prompt 側は master の topic 表 1 行 + solo の `### Remote / SSH` 節だけ（`tako context-budget` 実測 master +83 B / solo +242 B = 依頼上限 500 B 内）。移送でない本文は fixture へ宣言する道（#1154 の `guides_added_after_1154.md`）に乗せた
 - 実測で Issue 案と食い違った点を本文へ反映: ①`ssh_config` は **`Include` を読まない**（ssh 自身は読む = 一覧に出ないホストへ名前指定で繋がる）②config の `Port` が 22 以外だと **tako 自身が開いたペインも自動検知に見送られる**（`-p` を渡すため）。失敗 5 種（unresolved / refused / auth / hostkey / conflict 経路）を実 sshd 相手に end-to-end で確認
 - 番犬 `remote_guide.rs` 7 本（topic 消失 / master・solo のトリガー消失 / トリガーの肥大 / 手順の prompt インライン化）を注入 5 通りで file:line 名指し FAILED。隔離 solo の実会話は `tako_ssh_hosts` → `tako_orchestrator_guide{topic:"remote"}` → `remote_folder ls` → 接続情報の確認要求へ到達
+
+## 2026-09-12（#1406: 脅威モデルの「別 OS ユーザーの到達は消滅した」を現行の既定へ揃えた）
+- #1038 でループバック TCP が既定になったのに「残存リスク」節（`:249`）と「listen 範囲」節（`:87`）が UDS 前提のままだった。実測（`parse_endpoint_spec(None)` = Loopback / 本番 `endpoint_kind: loopback-tcp`）で確定させ、受容するリスクとして書き直した（Windows は `unix_supported()` = false で opt-in が無いことも明記）
+- 番犬 `issue1406_threat_model_endpoint_watchdog` 5 本が**コードの既定 ↔ 文書**を双方向で縛る。注入 A/B: 旧記述を戻すと `:87` / `:249` を名指しで FAILED、コードの既定を UDS へ反転すると `local_endpoint.rs:8` と `:83` を名指しで FAILED
+- #841 を Windows 限定から「ループバック TCP を使う全プラットフォーム」へ広げた（表題 + 本文追記）。docs + テストのみなので install 不要
