@@ -2710,6 +2710,29 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_test_residue",
+            "description": "テスト・検証プロセスが一時ディレクトリへ残した使い捨て dir を掃除する（Issue #1296）。\
+                対象は `<TMPDIR>/tako-test-data-<pid>`（cargo test の data dir = #944 の隔離先）と \
+                `<TMPDIR>/tako-agent-config-<pid>`（検証プロセスのエージェント設定 = #1253 の隔離先）。\
+                macOS の TMPDIR は再起動でも消えないので、放っておくと数千件積もる。\
+                **既定は dry-run**（1 つも消さず、件数・バイト数・判定理由だけを返す）。\
+                apply=true で実削除。消すのは**所有プロセスが生きていないもの**だけで、\
+                生きている別の cargo test の置き場には触らない（pid の再利用は\
+                プロセスの起動時刻と dir の作成時刻の比較で見分け、見送る）。\
+                応答の verdict: stale=消せる / in_use=使用中 / reused_pid=pid 再利用で見送り / \
+                own=このプロセス自身 / unknown=生死が読めない。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "apply": {
+                        "type": "boolean",
+                        "description": "実際に削除する（既定 false = dry-run で 1 つも消さない）",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_context_budget",
             "description": "起動時ロードの予算の確認と自動修正（Issue #1139）。\
                 AI が**起動した瞬間に強制ロードされるもの**（グローバル指示ファイル・\
