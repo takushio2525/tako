@@ -41,10 +41,14 @@ without asking, and delegate the other half explicitly instead of stalling on it
 `tako_ssh_hosts` returns the `Host` entries of `~/.ssh/config` — that file only.
 
 - Patterns containing `*` or `?` are excluded (a `Host *` defaults block is not a host).
-- **`Include`d files are not read.** A host defined only in an included file connects
-  normally but never appears in the list, so "not in the list" does not mean "not
-  reachable" — measured: action `ls` on such a host returned its directory while
-  `tako_ssh_hosts` still listed only the hosts written in the main file.
+- **`Include`d files are read** (#1400): relative paths resolve under `~/.ssh/`, `*` and
+  `?` globs expand, nesting stops at 16 levels and cycles are detected. A host defined
+  only in an included file appears in the list like any other — measured: `Include
+  config.d/*.conf` put the hosts of both included files into `tako_ssh_hosts`.
+  Files that cannot be read are skipped with the reason in the diagnostic log.
+- **Settings under a `Match` block do not belong to the `Host` above it** (#1400), just
+  as `ssh` itself treats them. `Match host bastion` / `User root` does not make the
+  preceding `Host prod` connect as root.
 - Registering a host means appending a `Host` block to `~/.ssh/config`. It shows up on
   the next call; nothing needs restarting. **Never invent the connection details** —
   ask the user for host name, login user, port and which key to use, then write the
@@ -100,8 +104,8 @@ need back.
 Every remote failure comes back as reason, next step and the raw client output. The
 classes and the move each one implies (all measured through `ls`):
 
-- **host name could not be resolved** — the `Host` / `HostName` is wrong or lives only
-  in an `Include`. Fix the entry; do not start guessing host names.
+- **host name could not be resolved** — the `Host` / `HostName` is wrong, or there is no
+  entry for it at all. Fix the entry; do not start guessing host names.
 - **connection refused** — reached the machine, nothing listening. Port or no sshd.
 - **connection timed out** — network, VPN or the machine being off. User's move.
 - **authentication failed** (`Permission denied (publickey)`) — the key is not

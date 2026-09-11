@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-12（#1387: NFD の結合文字が画面テキストから落ちるのを 3 経路まとめて直した）
-- alacritty が `Cell::extra.zerowidth` に持つ 0 幅の結合文字をどこも読んでいなかった（grep 0 件）ので、`screen::cell_text` / `push_cell_text` / `cell_is_trailing_blank` の 1 実装へ寄せ、`resolve_cell`（Screen = 描画 / links）・`compose_grid_row`（tail_lines）・`history_plain_lines`（ペインログ）の 3 経路と #801 の空白セルの近道を通した。`text` へ積んだぶんは `cell_cols` へ同じ列を積む
-- 実測（隔離 GUI・tako-vd）: `printf 'e\xcc\x81'` の画面が `U+0065 U+0301`・NFD 名のファイルを `find` で出すと `tako links` の target が `U+304B U+3099` を保って実在 true（濁点を落とした形は false）。legacy アームでは新テスト 6 本 + 番犬 3 本が file:line 名指しで FAILED（`画像かある.txt` / `VIS_か_e` を逐語再現）
-- 番犬 `issue1387_combining_watchdog` 5 本 + 実 PTY の 4 経路一致テスト（visible_lines / tail_lines / history_plain_lines / selection_text）。hot path は 120x24 を 3000 回 snapshot で 68.6〜69.3ms → 65.3〜67.9ms
-
 ## 2026-09-12（#1370: IPC 由来のレイアウト変更のあと 1 フレーム強制描画するようにした）
 - 真因は「cols / rows の書き手が描画の中だけ」+「macOS の gpui では notify でフレームが作られない」（display link は窓が可視でないと起動しない）。IPC ループ（全 dispatch が通る 1 箇所）で**レイアウトを変える Request のときだけ**応答を返す前に全ビューポートを 1 フレーム描く形へ。判定は `protocol::changes_layout` の純粋関数 1 実装（ワイルドカード無し = 155 バリアント全網羅・読み取り系は偽）
 - 隔離 GUI（tako-vd・入力イベント無し）の A/B（`TAKO_1370_LEGACY=1`）: resize は legacy **0/5**（20 秒待っても cols/rows 不変・rect だけ動く）→ 新 **5/5**（応答直後に反映）。equalize / split（新ペインが 80x24 のまま 2 枚 → 0 枚）/ theme toggle（`ipc_frame` +0 → +1）も同様。**`list` × 30 で `ipc_frame` +0**（読み取りは描かない = #786 の固定費が乗らない）
@@ -64,3 +59,8 @@
 - #329 の fail-safe が stale 経路（PID ファイル無し → `/api/health` の pid を撃つ）に無かった。確認を `kill_stale_daemon` の**内側**へ移して結果型にし（呼び出し側で忘れられない形）、`ps` 出力が**空**のときも「確認できない = 撃たない」へ倒した（判定は `ps_args_is_tako_remote_serve` の 1 実装）。中止時は state を残し理由 + 手順を返す
 - 修正前の実測（隔離 state・偽 health + 使い捨て `/bin/sleep`）: 実 CLI が sleep を殺して `{"stopped":true}` を返す / health が停止操作プロセス自身の pid を返す形ではテストバイナリが `signal: 15` で落ちた。修正後は sleep 生存・exit=1・state 残存
 - 番犬 `issue1401_stale_stop_identity_watchdog` 7 本（注入 6 通りで `remote.rs:2185` / `2223` / `2364` / `2788` を file:line 名指し）。workspace 4430 passed 0 failed・check-windows error 0。**install 要**
+
+## 2026-09-12（#1400: ssh config の Match の設定が直前の Host へ混入して宛先が化けるのを直した）
+- 状態を `Section` の 2 値へ（`Match` / `Include` のあとは「どの Host にも属さない位置」）。キーワードは行頭の最初のトークンで切る（`Match exec "test -f a=b"` で検知が抜けていた）。複数パターンは全部エントリ・`Include` は `~/.ssh/` 起点 + glob + 深さ 16 + 循環検出つきで解決し、読めない理由は `warnings` へ返す
+- 隔離 GUI（tako-vd・fixture HOME）で `tako ssh-hosts` の A/B: 修正前は `web1` と `prod(user=root port=2222)` の 2 件、修正後は `edge` / `inner`（Include 配下）/ `web1` / `web2` / `prod(user=null port=null)` の 5 件
+- 番犬 `issue1400_ssh_config_watchdog` 7 本。注入 2 通りで file:line 名指し FAILED（`ssh_config.rs:175` ×2 / `:190`）。#1004 の `guides/remote.md`「Include は読まない」も同一 PR で実態へ寄せた
