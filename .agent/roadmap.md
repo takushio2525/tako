@@ -245,7 +245,12 @@ filetree CLI roundtrip）は達成。見た目は manual-checks.md で常用確�
 
 **Exit Criteria**: Windows ユーザーに「使ってみて」と言える品質。
 
-## Phase 7: 公開準備（v0.1.0）
+## Phase 7: 公開準備 → ✅ 公開済み（リポジトリ public 化・v0.8.x を配布中）
+
+> Homebrew cask（`takushio2525/tako/tako`）+ GitHub Releases の二本立てで配布中。
+> MCP ゼロコンフィグ（`tako setup` / `tako setup-mcp`）・ネスト tmux 診断
+> （`tmux_backend::NESTED_TMUX_SNIPPET`）・アプリ内自動アップデート（`tako update`）も着地。
+> **残は README の図版（スクリーンショット / デモ GIF）と CONTRIBUTING.md** の 2 つ。
 
 - [ ] MCP ゼロコンフィグオンボーディング（FR-2.14。MCP クライアント検出 + ワンクリック
       登録 + 診断表示 + instructions 品質整備。**セットアップ画面 = 自動診断チェックリスト +

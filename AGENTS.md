@@ -10,8 +10,8 @@ iTerm2 + Zed の思想で Zed 級に高速・軽量。macOS 先行、Windows 対
 
 - 目的: AI エージェント（Claude Code 等）+ 子エージェント + dev サーバーを「1 グループ = 1 タブ」で集約監視する
 - 対象: AI エージェントで開発する開発者。**ただしゼロコンフィグで一般ユーザーが使えることが最優先の設計原則**
-- 状況: **Phase 1〜4 + 5.5 完了（macOS MVP / CLI / MCP / パッシブ検知 / tmux バックエンド永続化）。
-  Phase 5（ワークスペース機能）はファイルツリーまで完了で中断中 → 次は FR-3.2 から再開**
+- 状況: **公開済み OSS（v0.8.x）。macOS は Homebrew cask + GitHub Releases で配布中、
+  Windows 本格対応（Phase 6）が進行中**。フェーズ進捗は `.agent/roadmap.md`、現在地は `.agent/activeContext.md`
 
 ## 技術スタック
 
@@ -252,7 +252,8 @@ CI（`.github/workflows/ci.yml`）は macOS / Windows の両ランナーで buil
 ## コミット規約
 
 グローバル CLAUDE.md（`~/.claude/CLAUDE.md`）の「Git コミット」節に従う。
-push 運用: リポジトリ公開（Phase 7）までは main 直 push 可。公開後はブランチ + PR 経由に切り替える。
+push 運用: リポジトリは公開済みなので **main 直 push はしない**。作業ブランチから PR を出し、
+CI（macOS / Windows / docs）が緑になってから `gh pr merge --squash --delete-branch` する。
 
 ## リリース運用
 

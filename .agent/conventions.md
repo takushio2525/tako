@@ -1020,12 +1020,40 @@ watch の再検査が busy と読むと `idle_streak` が永久に積まれな�
 - `remote_link_watchdog.rs` の `追記ぶんだけ読む検査を実時間で測っていない` —
   `claude_remote_link.rs` のテストは `Instant` そのものを禁止（1 ファイルの強い規則）
 - `test_timing_watchdog.rs` の `効果を実時間で比べているテストが無い` —
-  `crates/*/tests/` 全体を見て、**`assert` の条件部に実時間の値が 2 つ以上**
-  現れる形だけを落とす（`assert!(warm <= cold, …)`）。誤検知しないよう、
-  タイムアウト（`while t0.elapsed() < limit`）・絶対予算（`assert!(elapsed <
-  Duration::from_secs(3))` = `psmux_backend` の kill）・報告のみ（`println!`）は
-  対象外。コメントと文字列リテラルは潰してから見るので、期待値の文字列に
-  当たらない
+  **`crates/*/tests/` と `crates/*/src/` の両方**を見て（#962 で src へ広げた）、
+  **`assert` の条件部に実時間の値が 2 つ以上**現れる形を落とす
+  （`assert!(warm <= cold, …)`）。誤検知しないよう、タイムアウト
+  （`while t0.elapsed() < limit`）・報告のみ（`println!`）は対象外。
+  コメントと文字列リテラルは潰してから見るので、期待値の文字列に当たらない
+- `test_timing_watchdog.rs` の `実時間の絶対予算は宣言したものだけ` —
+  実時間の値 **1 つ**と `Duration::from_*` の比較（絶対予算）は、
+  `ABSOLUTE_BUDGET_ALLOWLIST` に**根拠つきで宣言したものだけ**許す（#962）
+
+### 絶対予算は「桁が開いている」ことを宣言して置く（Issue #962）
+
+単一の絶対予算（`assert!(elapsed < Duration::from_secs(N), …)`）そのものは悪ではないが、
+**落ちる側と桁が開いていないと負荷で反転する**。#962 の
+`remote::tests::daemon_stop_implはゾンビpidを終了済みとして扱う` は予算 **2 秒**に対し、
+落ちる側（`daemon_stop_impl` のタイムアウト経路）が **5 秒** = 2.5 倍しか開いていなかった。
+しかも正常でも観測 1 回ぶんの `/bin/ps`（fork+exec）が詰まれば所要は実測
+2.27 / 5.10 / **10.07 秒**まで伸びる。
+
+- **「速いこと」で構造的な性質を代弁させない**。「タイムアウト経路へ落ちていない」を
+  実時間で見ると、混んだ機で正しく動いた回が落ちる。見るのは**機構の観測値**:
+  `remote::TerminationWait`（どの経路で抜けたか = `via` / 何回待ったか = `polls`）を
+  `last_termination_wait()` で読み、`via == Some(Zombie)` を固定する。
+  こちらは負荷でも注入された遅延でも変わらない
+- **観測は「量を観る口」と同じ作り**（スレッドローカル + `pub fn` の読み口）。
+  待ちの本体は観測を差し替えられる形（`wait_for_termination_with`）にしておくと、
+  待ち回数と経路の意味づけを**実時間に一切依存せず**単体テストで固定できる
+- **桁が開いていると言うなら宣言する**。ソースからは正常時の値が判らないので、
+  番犬の `ABSOLUTE_BUDGET_ALLOWLIST` に「予算 / 正常時 / 回帰時」を書いて足す。
+  開かないなら測る軸を替える
+- A/B は `TAKO_962_LEGACY=1`（旧アサートを再現するアーム。囲みは
+  `// TAKO_962_LEGACY_ARM 開始` 〜 `終了` で、番犬が対象外にする）。
+  注入は `TAKO_962_INJECT_DELAY_MS=<ms>`（観測 1 回を遅らせる = `ps` の詰まり）と
+  `TAKO_962_INJECT=blind_zombie`（#619 前の誤判定 = タイムアウト経路へ落とす）。
+  どちらも **`cfg(test)` 限定**なので製品バイナリには入らない
 
 ### 量を観る口の作り方（#1011 / #1220）
 
