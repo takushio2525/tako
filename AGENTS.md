@@ -183,6 +183,7 @@ tako/
 | 設定画面（#459/#721） | `tako settings [--tab <名>]` |
 | 初回起動バナー（#549） | `tako welcome [show|dismiss]` |
 | アプリ内更新（#36/#403/#616/#690/#1042） | `tako update [status|check|apply|apply-zip|repair]` |
+| **テスト・検証プロセスの残骸の後片付け（一時 dir。既定は dry-run。#1296）** | `tako test-residue [--apply]` |
 | target 掃除 | `scripts/clean-target.sh` |
 
 CI（`.github/workflows/ci.yml`）は macOS / Windows の両ランナーで build + test を回す。

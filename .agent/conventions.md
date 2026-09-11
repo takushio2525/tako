@@ -1236,6 +1236,28 @@ Dock のピン留めは `.app` への **file URL ブックマーク**（`com.app
   （モックテスト `scripts/test-clean-trust-residue.sh` が偽の HOME で実プロジェクトの
   巻き添えを落とす。CI の macOS ジョブで毎 PR 走る）
 
+### 使い捨ての置き場は作った経路が消す（Issue #1296）
+
+**`<TMPDIR>/<名前>-<pid>` を作る経路は、消す経路も同じ場所で持つ。**
+#944 / #1253 の隔離は「本番の外へ倒す」までで止まっていて、macOS の `TMPDIR`
+（`/var/folders/…/T/`）は**再起動でも消えない**ため `cargo test` 1 回につき 1 dir が
+積もっていた（実測 2026-09-11: `tako-test-data-*` 2,188 件 + `tako-agent-config-*` 784 件）。
+
+- 後始末は 2 段構え: `tako_core::test_residue::arm_self_cleanup`（`libc::atexit` =
+  正常終了と `std::process::exit` の両方で走る）+ `sweep_stale_on_start`
+  （SIGKILL / abort で 1 が走らなかった回を、次のテストプロセスが回収する）
+- **消してよいのは自分の pid のものと、pid が生きていないものだけ**。名前の一致で
+  消すと**並行して走る別 worker の `cargo test`** を巻き込む（#625 の事故クラス）。
+  pid は再利用されるので、生きていても「dir の作成時刻より後に始まったプロセス」は
+  `reused_pid` として**見送る**（判定は `test_residue::judge` の 1 実装）
+- 過去の残骸は自動では消さない口も用意する: `tako test-residue`（既定 dry-run・
+  `--apply` で実削除。MCP は `tako_test_residue`）。`clean-trust-residue.sh` と同じ作法
+- 番犬は `crates/tako-control/tests/test_residue_watchdog.rs`（`paths.rs` の
+  「作る経路」が `arm_self_cleanup` を持つか・接頭辞が `KINDS` に載っているか・
+  判定を通さない `remove_dir_all` が増えていないか）と、
+  `crates/tako-core/tests/test_data_residue.rs`（子プロセスを起こして**実際に
+  dir が消えること / 生きている子の dir が残ること**を見る）の 2 段。A/B は `TAKO_1296_LEGACY=1`
+
 ## 実 tmux の e2e は器をプロセスごとに分ける（Issue #1300）
 
 **`-L` に渡す器の名前に固定名を使わない**（`tmux_e2e::socket_for("<Issue 番号>")` が
