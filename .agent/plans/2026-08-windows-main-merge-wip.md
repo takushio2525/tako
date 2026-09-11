@@ -2714,6 +2714,11 @@ BEFORE でも検知は動いていた。無効になる実条件は「インス�
 伝播していない」か「claude が npm シム（`claude.cmd`）で入っている」（高速路は `claude.exe`
 しか stat しない）。**症状の再現条件を作ってから A/B を取る**。
 
+npm シム側は #1372 まで**フォールバックの `exe::find` も効いていなかった**（裸の
+`claude`（sh スクリプト）を `.cmd` より先に返しており、`file_version` は `None`・
+`claude --version` の起動も失敗した）。#1372 で `find` が `.cmd` を返すようになったので、
+この経路は「高速路が空振りしても検知は動く」へ変わっている。
+
 ##### #899 との関係（統合しない判断）
 
 `welcome::launch_command_line` は `resolve_tako_binary()` を `shell_quote` に通す。

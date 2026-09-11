@@ -324,6 +324,33 @@ GPUI の `AnimationElement` は、**アニメーションが終わっていな�
   器の label / 素通し設定の実値 / 置き場の期待値とセッションの実値 / サーバーの継承値 /
   器の同一性 / OSC 133 の状態 / ペイン末尾 / 待った時間 / load
 
+## 実行ファイルの解決は「起動できる形」だけを返す（Issue #1372）
+
+境界 B16（`tako_core::platform::exe`）は「どこに在るか（`find`）」と
+「それは実行できるか（`is_executable_file`）」の 2 つの答えを持つ。
+**この 2 つを食い違わせない**。`find` が返したパスは必ず `is_executable_file` を満たす。
+
+- Windows の判定材料は**拡張子が `PATHEXT` に在るか**の 1 本（実行ビットという概念が無い）。
+  `find` 側も同じ `has_executable_extension` を通し、**土台をそのまま採るのは
+  名前が既に `PATHEXT` の拡張子を持つときだけ**にする（`psmux.exe` はそのまま、
+  `claude` は `PATHEXT` の順序に従う）
+- 「在れば採る」にすると **npm でグローバル導入した CLI が壊れる**。cmd-shim は
+  `<name>`（`#!/bin/sh` のスクリプト）/ `<name>.cmd` / `<name>.ps1` の 3 つを置くので、
+  裸のスクリプトが `.cmd` より先に採られて `Command::new` が
+  「有効な Win32 アプリケーションではありません」で落ちる。**`tako setup` の「見つかった」
+  判定だけは通る**ので「未検出」より原因が分かりにくい形になる（#1372 は claude / agy が全滅）
+- **起動できないものは `None` を返す**（見つけたことにしない）。`.ps1` しか無い導入も同じ
+  （既定の `PATHEXT` に `.PS1` は無い = 直接は起動できない）
+- 素の名前へのフォールバック（`Command::new("gh")`）は **`.exe` しか足さない**
+  （`std/src/sys/process/windows.rs` の `resolve_exe`。PATH 探索では拡張子が 1 つも
+  無いときに `.exe` を足すだけ / パス指定は `.exe` を試して無ければ**足す前のパスを
+  そのまま渡す**）。「Windows でも解決できる」の根拠にしてよいのは `.exe` の導入だけで、
+  `platform_parity.rs` の B16 免除もその範囲で書く
+- 判定は OS 非依存の純粋関数（`find_in_windows_path` / `resolve_with_pathext` /
+  `has_executable_extension`）に置き、**macOS 上で走るテストで固定する**。
+  整合テスト（`find` の戻り値が必ず `is_executable_file` を満たす）は
+  パス指定の経路まで含めて拘束する
+
 ## 「届き方」は型で分け、in-process を先に見る（Issue #1200）
 
 ペインへ届く経路は 2 つしかない（`reach` の説明）。**tako-app が保持している

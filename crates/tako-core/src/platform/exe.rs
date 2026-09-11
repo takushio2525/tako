@@ -20,6 +20,13 @@
 //! - PATH に無くても**ユーザーが手で入れがちな場所**を追って探す。Windows は
 //!   インストーラが PATH を書き換えても**再ログインするまで実行中プロセスへ伝播しない**。
 //!   「入れたのに見つからない」を避けるための保険
+//! - **拡張子を持たない同名ファイルは解決結果にしない**（#1372）。npm の cmd-shim は
+//!   `<name>`（`#!/bin/sh` のスクリプト）/ `<name>.cmd` / `<name>.ps1` の 3 つを置くので、
+//!   「在れば採る」にすると PE でない裸のスクリプトが `.cmd` より先に採られる
+//!   = **見つかるのに起動できない**（`Command::new` は `.exe` を足して探し、無ければ
+//!   足す前のパスをそのまま `CreateProcessW` へ渡す = `std/src/sys/process/windows.rs`
+//!   の `resolve_exe`）。採否の判定は [`is_executable_file`] と同じ `PATHEXT` の
+//!   突き合わせ 1 本にしてあるので、**境界の中で答えが食い違わない**
 //!
 //! ## 「実行できるファイルか」と「版はいくつか」（#936）
 //!
@@ -40,7 +47,8 @@
 /// コマンド名から実行ファイルの絶対パスを解決する。見つからなければ `None`。
 ///
 /// 返り値はそのまま [`std::process::Command::new`] に渡せる
-/// （Windows の `.cmd` / `.bat` シムも Rust 標準ライブラリが解釈する）
+/// （Windows の `.cmd` / `.bat` シムも Rust 標準ライブラリが解釈する）。
+/// 返り値は必ず [`is_executable_file`] を満たす（#1372）
 pub fn find(name: &str) -> Option<String> {
     imp::find(name)
 }
@@ -300,27 +308,50 @@ fn find_in_windows_path(
     extra_dirs: &[String],
     is_file: &dyn Fn(&str) -> bool,
 ) -> Option<String> {
-    // 区切りを含む場合はコマンド名ではなくパス指定。PATH 探索の対象外
+    // 区切りを含む場合はコマンド名ではなくパス指定なので PATH 探索の対象外。
+    // ただし**拡張子を補うぶんは同じ**（cmd.exe も完全修飾のパスへ `PATHEXT` を足す。
+    // `Command::new` は `.exe` だけを足し、無ければ足す前のパスをそのまま渡す）
     if name.contains('\\') || name.contains('/') {
-        return is_file(name).then(|| name.to_string());
+        return resolve_with_pathext(name, pathext, is_file);
     }
     for dir in path_dirs.iter().chain(extra_dirs.iter()) {
         let base = dir.trim_end_matches(['\\', '/']);
         if base.is_empty() {
             continue;
         }
-        let bare = format!("{base}\\{name}");
-        if is_file(&bare) {
-            return Some(bare);
+        if let Some(found) = resolve_with_pathext(&format!("{base}\\{name}"), pathext, is_file) {
+            return Some(found);
         }
-        for ext in pathext {
-            // `PATHEXT` は慣習的に大文字（`.EXE`）。Windows のパスは大小を区別しないので
-            // 解決には影響しないが、そのまま連結すると `git.EXE` という見慣れない
-            // パスを表示することになるため小文字へ寄せる
-            let candidate = format!("{bare}{}", ext.to_ascii_lowercase());
-            if is_file(&candidate) {
-                return Some(candidate);
-            }
+    }
+    None
+}
+
+/// 1 つの土台（`<dir>\<name>` かパス指定そのもの）を `PATHEXT` で補って解決する
+/// （純粋関数。**macOS 上でもテストできる**）。
+///
+/// **土台をそのまま採るのは、名前が既に `PATHEXT` の拡張子を持つときだけ**（#1372）。
+/// 判定を名前によらず「在れば採る」にすると、npm の cmd-shim
+/// （`<name>` = `#!/bin/sh` のスクリプト / `<name>.cmd` / `<name>.ps1` の 3 つを置く）で
+/// **PE ではない裸のスクリプトが `.cmd` より先に採られる** = 見つかるのに起動できない。
+/// 同じモジュールの [`is_executable_file`] は同じパスに false を返すので、
+/// 境界の中で答えが食い違う状態でもあった
+#[cfg_attr(not(windows), allow(dead_code))]
+fn resolve_with_pathext(
+    stem: &str,
+    pathext: &[String],
+    is_file: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    let file_name = stem.rsplit(['\\', '/']).next().unwrap_or(stem);
+    if has_executable_extension(file_name, pathext) && is_file(stem) {
+        return Some(stem.to_string());
+    }
+    for ext in pathext {
+        // `PATHEXT` は慣習的に大文字（`.EXE`）。Windows のパスは大小を区別しないので
+        // 解決には影響しないが、そのまま連結すると `git.EXE` という見慣れない
+        // パスを表示することになるため小文字へ寄せる
+        let candidate = format!("{stem}{}", ext.to_ascii_lowercase());
+        if is_file(&candidate) {
+            return Some(candidate);
         }
     }
     None
@@ -393,6 +424,83 @@ mod tests {
             p == "C:\\bin\\psmux.exe"
         });
         assert_eq!(got.as_deref(), Some("C:\\bin\\psmux.exe"));
+    }
+
+    /// **#1372**: npm でグローバル導入した CLI の形。cmd-shim は
+    /// `<name>`（`#!/bin/sh` のスクリプト）/ `<name>.cmd` / `<name>.ps1` の 3 つを置く。
+    /// 裸のスクリプトを採ると `Command::new` が
+    /// 「有効な Win32 アプリケーションではありません」で落ちる（PE ではないので）
+    #[test]
+    fn npmのシム構成では裸のスクリプトではなくcmdを採る() {
+        let npm = "C:\\Users\\testuser\\AppData\\Roaming\\npm";
+        let script = format!("{npm}\\claude");
+        let cmd = format!("{npm}\\claude.cmd");
+        let ps1 = format!("{npm}\\claude.ps1");
+        let got = find_in_windows_path("claude", &dirs(&[npm]), &ext(), &[], &|p| {
+            p == script || p == cmd || p == ps1
+        });
+        assert_eq!(got.as_deref(), Some(cmd.as_str()));
+    }
+
+    /// **#1372**: 裸のスクリプトだけが在る導入では `None` を返す。
+    /// 「見つかったのに起動できない」より「未検出」のほうが原因に辿れる
+    /// （`tako setup` の案内・`stale_binary` の版取得が空振りせず「無い」と言える）
+    #[test]
+    fn 拡張子を持たない実体だけなら見つけたことにしない() {
+        let got = find_in_windows_path("claude", &dirs(&["C:\\bin"]), &ext(), &[], &|p| {
+            p == "C:\\bin\\claude"
+        });
+        assert_eq!(got, None);
+    }
+
+    /// **#1372 の整合テスト**: 境界 B16 の 2 つの答えを食い違わせない。
+    /// `find` が返したパスは必ず [`is_executable_file`] を満たす
+    /// （Windows の判定は `has_executable_extension` そのものなので、
+    /// この純粋関数の組で macOS 上から固定できる）
+    #[test]
+    fn findの戻り値は常に実行できる拡張子を持つ() {
+        let ext = ext();
+        // 「拡張子を持たない実体が同居する」構成を並べる（1 つめが npm の cmd-shim）
+        let layouts: &[&[&str]] = &[
+            &[
+                "C:\\bin\\claude",
+                "C:\\bin\\claude.cmd",
+                "C:\\bin\\claude.ps1",
+            ],
+            &["C:\\bin\\claude"],
+            &["C:\\bin\\claude", "C:\\bin\\claude.exe"],
+            &["C:\\bin\\psmux.exe"],
+            &["C:\\tools\\claude", "C:\\tools\\claude.cmd"],
+        ];
+        const NAMES: &[&str] = &[
+            "claude",
+            "claude.exe",
+            "claude.ps1",
+            "psmux",
+            "psmux.exe",
+            "C:\\tools\\claude",
+            "C:\\tools\\claude.cmd",
+        ];
+        for files in layouts {
+            for name in NAMES {
+                let got = find_in_windows_path(name, &dirs(&["C:\\bin"]), &ext, &[], &|p| {
+                    files.contains(&p)
+                });
+                let Some(path) = got else {
+                    continue;
+                };
+                assert!(
+                    files.contains(&path.as_str()),
+                    "在りもしないパスを返した: {path}（構成 {files:?} / 名前 {name}）"
+                );
+                let file_name = path.rsplit(['\\', '/']).next().unwrap_or_default();
+                assert!(
+                    has_executable_extension(file_name, &ext),
+                    "find が起動できないパスを返した: {path}（構成 {files:?} / 名前 {name}）\n\
+                     → is_executable_file が false を返すものを解決結果にしてはいけない（#1372）"
+                );
+            }
+        }
     }
 
     #[test]

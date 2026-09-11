@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-11（#775: GUI 経路の close が workers.yaml へ発生源つきで closed を記録する）
-- #658 で 3 経路（ペイン × / タブ × / cmd+W）は配線済みで、残っていたのは**たまり場カードの kill**（退避中ペインはどのタブにも居ないので `remove_pane_with` を通らず、drawer の on_click が後始末を独自列挙）と **`close_reason` が固定文字列 `explicit_close`**（発生源なし）の 2 つ。前者は `kill_shelved_pane` へ集約、後者は `registry::close_reason_for` の 1 実装へ寄せてペインログのクローズマーカーと同語彙（`close:kbd` / `close:gui` / `close:gui-tab` / `close:dispatch(cli)`）にした。CLI / MCP 側の対の経路 `Request::BackgroundKill` も同じ穴だったので併せて配線（スキーマ変更・移行なし）
-- 隔離 GUI セルフテスト（`tako-vd`）で 4 経路を実操作して全項目通過: `kbd=closed/close:kbd gui=closed/close:gui cli=closed/close:dispatch(cli, caller=…)` / `tab=closed/close:gui-tab shelf=closed/close:gui` / `active=[]`（`orchestrator workers` に出ない）/ `all_has_tab=true`（--all では残る）/ `plain_entries=15->15`（worker でないペインは増やさない）
-- A/B: `TAKO_775_LEGACY=1` で 3 経路が `closed/explicit_close` に戻り項目 87 が FAILED、`kill_shelved_pane` の記録フックを外した注入では項目 148 が `shelf=active/` で FAILED。番犬 5 本は注入 5 種すべてを file:line 名指しで落とす。`drop_backend_session` の境界番犬は drawer.rs の一括免除を撤去して締めた
-
 ## 2026-09-11（#757: ログイン失効を接続断・上限とは別種として検知するようにした）
 - `WorkerErrorKind::LoginExpired`（`login_expired` / `relogin`）を新設。文言の正本は `agent_cli::login_expired_line` の 1 か所（#983 の起動時未認証検知もそこへ委譲。種別は呼び出し側のゲートで決まる）。判定順序は「ライブのダイアログ > 失効 > 上限メッセージ」で、上限行のほうが新しければ見送る
 - 対象アカウント（`error.config_dir` / `error.account`）は会話の transcript の所在から逆引きし、失効を検知したときだけ走らせる。watch / MCP は `wait::error_json` の 1 実装で同形。仕様は FR-2.39
@@ -68,3 +63,8 @@
 - 折り返しの判定を `TerminalSession::visible_lines_filled`（alacritty の `line_length()` = WRAPLINE + 占有列数）で**列**で持ち、`dispatch::find_exit_marker` が「埋まった行の行末 → 次の非空行の行頭」だけをまたいでマーカーを再構成する形へ。数字のあとは行の残りが空白であることを要求するので無関係な行は繋がない（案 2 の OSC 化は器越え + Windows 実機が要るので Issue へ理由を残して見送り）
 - 隔離 GUI 実測（直接 PTY と tmux バックエンドの両方）: 幅 7 / 10 / 13 / 40 桁すべて `exited exit_code=0`・幅 10 桁の `--wait` が返る（修正前は 40 秒返らない）・3 桁の `127` は幅 13 桁で `__TAKO_EXIT=1` + `27` に割れても 127。legacy アーム（`TAKO_651_LEGACY=1`）は永久 running と **`exit_code=1` の誤報**を再現
 - 番犬 2 本（製品コードへのマーカー literal 増殖 / 文字数で測る物差し）+ 実 PTY の単体テスト（幅 10 桁で割れる形と全角で埋まった行）
+
+## 2026-09-11（#1372: exe::find が npm シムの裸スクリプトを PATHEXT より先に返さないようにした）
+- 真因は `find_in_windows_path` が `<base>\<name>` を名前によらず採っていたこと。npm の cmd-shim は `<name>`（`#!/bin/sh` のスクリプト）/ `.cmd` / `.ps1` を置くので `find("claude")` が PE でないスクリプトを返し `Command::new` で起動できない一方、同じモジュールの `is_executable_file` は同じパスに false = 境界の中で答えが矛盾していた。土台をそのまま採るのは「名前が既に `PATHEXT` の拡張子を持つとき」だけへ（`resolve_with_pathext` へ切り出し、パス指定の経路も同じ判定を通す）
+- 修正前ソースで新テスト 3 本が `exe.rs:411` / `:422` / `:466` を名指しで FAILED（`Some("…\\npm\\claude")` = Issue 実測値の逐語再現）。修正後は exe 15/15・workspace 4311 passed / 0 failed・`scripts/check-windows.sh` error 0。パス指定の経路だけ旧実装へ戻す A/B で整合テストが `C:\tools\claude` を名指しで落ちる
+- 併せて `platform_parity.rs` の B16 免除 3 件の根拠を「`.exe` なら解決できる」へ訂正（std の `resolve_exe` は PATH 探索で拡張子が無いときに `.exe` を足すだけ = `.cmd` シムには届かない）。Windows 実機での `where.exe` 比較は未検証
