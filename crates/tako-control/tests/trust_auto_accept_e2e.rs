@@ -20,8 +20,15 @@ use std::time::{Duration, Instant};
 
 use tako_control::claude_tui;
 
-/// 本番のバックエンドや他の実験と混ざらない専用ソケット
-const SOCKET: &str = "tako-e2e-1236";
+#[path = "common/tmux_e2e.rs"]
+mod tmux_e2e;
+
+/// 本番のバックエンドや**他プロセスのテスト**と混ざらない専用の器（#1300）。
+/// 固定名だと `cargo test --workspace` が 2 本走った瞬間に同名セッションを
+/// 取り合って `duplicate session` で落ちる（実測は `tmux_e2e` のモジュール doc）
+fn socket() -> &'static str {
+    tmux_e2e::socket_for("1236")
+}
 
 /// 模擬 TUI が描く選択肢（claude 2.x の実採取と同じ並び。既定は拒否側）
 const DECLINE: &str = "No, exit";
@@ -45,9 +52,9 @@ struct EmuGuard {
 
 impl Drop for EmuGuard {
     fn drop(&mut self) {
-        let _ = Command::new("tmux")
-            .args(["-L", SOCKET, "kill-session", "-t", &self.session])
-            .output();
+        // 器はこのプロセス専用。セッションを畳み、**このプロセスの最後の 1 本**なら
+        // サーバーごと退役させてソケットファイルまで消す（tmux は残す）
+        tmux_e2e::release_session(socket(), &self.session);
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -126,11 +133,14 @@ fn launch_emulator(tag: &str) -> (EmuGuard, PathBuf) {
 
     let log = dir.join("keys.log");
     let session = format!("tako1236{tag}");
-    let status = Command::new("tmux")
-        .args([
-            "-L",
-            SOCKET,
-            "new-session",
+    // 起動より**先に**ガードを作る。起動が落ちたときも作業ディレクトリと器が残らない
+    let guard = EmuGuard {
+        session: session.clone(),
+        dir: dir.clone(),
+    };
+    if let Err(diag) = tmux_e2e::new_session(
+        socket(),
+        &[
             "-d",
             "-s",
             &session,
@@ -145,17 +155,13 @@ fn launch_emulator(tag: &str) -> (EmuGuard, PathBuf) {
                 script.to_str().expect("UTF-8"),
                 log.to_str().expect("UTF-8")
             ),
-        ])
-        .status()
-        .expect("tmux を実行できる");
-    assert!(status.success(), "tmux new-session が失敗した");
-    let guard = EmuGuard {
-        session: session.clone(),
-        dir,
-    };
+        ],
+    ) {
+        panic!("{diag}");
+    }
     // ダイアログが描かれるまで待つ（描画前に送ると自動承諾の材料が無い）
     let drawn = wait_until(Duration::from_secs(10), || {
-        tako_core::tmux::capture_session(Some(SOCKET), &session)
+        tako_core::tmux::capture_session(Some(socket()), &session)
             .map(|l| claude_tui::is_trust_dialog(&l) && claude_tui::is_choice_dialog(&l))
             .unwrap_or(false)
     });
@@ -179,7 +185,7 @@ fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
 }
 
 fn dump(session: &str) -> String {
-    tako_core::tmux::capture_session(Some(SOCKET), session)
+    tako_core::tmux::capture_session(Some(socket()), session)
         .map(|l| l.join("\n"))
         .unwrap_or_else(|e| format!("<capture 失敗: {e}>"))
 }
@@ -202,7 +208,7 @@ fn run_auto_accept(tag: &str) -> (Vec<String>, Option<String>) {
     let (guard, log) = launch_emulator(tag);
     // wait_ready=false: 模擬 TUI は claude ではないので入力欄待ちに長く付き合わせない。
     // 自動承諾（信頼ダイアログの処理）は wait_ready に関係なく行われる
-    let report = claude_tui::deliver_via_tmux(Some(SOCKET), &guard.session, "PROBE1236", false);
+    let report = claude_tui::deliver_via_tmux(Some(socket()), &guard.session, "PROBE1236", false);
     let confirmed = wait_until(Duration::from_secs(5), || read_log(&log).1.is_some());
     let (keys, chose) = read_log(&log);
     eprintln!(

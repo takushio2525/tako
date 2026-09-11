@@ -19,8 +19,15 @@ use std::time::{Duration, Instant};
 
 use tako_control::reach::DialogAccess;
 
-/// 本番のバックエンドや他の実験と混ざらない専用ソケット
-const SOCKET: &str = "tako-e2e-1263";
+#[path = "common/tmux_e2e.rs"]
+mod tmux_e2e;
+
+/// 本番のバックエンドや**他プロセスのテスト**と混ざらない専用の器（#1300）。
+/// 固定名だと `cargo test --workspace` が 2 本走った瞬間に同名セッションを
+/// 取り合って `duplicate session` で落ちる（実測は `tmux_e2e` のモジュール doc）
+fn socket() -> &'static str {
+    tmux_e2e::socket_for("1263")
+}
 
 /// 模擬 TUI が描く選択肢（Issue #1263 本文の実採取と同じ並び）
 const LABELS: [&str; 3] = ["Yes", "Not now", "Don't show again"];
@@ -43,9 +50,9 @@ struct EmuGuard {
 
 impl Drop for EmuGuard {
     fn drop(&mut self) {
-        let _ = Command::new("tmux")
-            .args(["-L", SOCKET, "kill-session", "-t", &self.session])
-            .output();
+        // 器はこのプロセス専用。セッションを畳み、**このプロセスの最後の 1 本**なら
+        // サーバーごと退役させてソケットファイルまで消す（tmux は残す）
+        tmux_e2e::release_session(socket(), &self.session);
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -58,11 +65,11 @@ struct TmuxAccess {
 
 impl DialogAccess for TmuxAccess {
     fn capture(&self) -> Result<Vec<String>, String> {
-        tako_core::tmux::capture_session(Some(SOCKET), &self.session)
+        tako_core::tmux::capture_session(Some(socket()), &self.session)
     }
 
     fn send_key(&self, key: &str) -> Result<(), String> {
-        tako_core::tmux::send_key(Some(SOCKET), &self.session, key)
+        tako_core::tmux::send_key(Some(socket()), &self.session, key)
     }
 
     fn route(&self) -> &'static str {
@@ -163,11 +170,14 @@ fn launch_emulator(tag: &str) -> (EmuGuard, PathBuf) {
 
     let log = dir.join("keys.log");
     let session = format!("tako1263{tag}");
-    let status = Command::new("tmux")
-        .args([
-            "-L",
-            SOCKET,
-            "new-session",
+    // 起動より**先に**ガードを作る。起動が落ちたときも作業ディレクトリと器が残らない
+    let guard = EmuGuard {
+        session: session.clone(),
+        dir: dir.clone(),
+    };
+    if let Err(diag) = tmux_e2e::new_session(
+        socket(),
+        &[
             "-d",
             "-s",
             &session,
@@ -182,17 +192,13 @@ fn launch_emulator(tag: &str) -> (EmuGuard, PathBuf) {
                 script.to_str().expect("UTF-8"),
                 log.to_str().expect("UTF-8")
             ),
-        ])
-        .status()
-        .expect("tmux を実行できる");
-    assert!(status.success(), "tmux new-session が失敗した");
-    let guard = EmuGuard {
-        session: session.clone(),
-        dir,
-    };
+        ],
+    ) {
+        panic!("{diag}");
+    }
     // ダイアログが検知されるまで待つ（描画前に応答させると材料が無い）
     let drawn = wait_until(Duration::from_secs(10), || {
-        tako_core::tmux::capture_session(Some(SOCKET), &session)
+        tako_core::tmux::capture_session(Some(socket()), &session)
             .map(|l| tako_control::claude_tui::is_choice_dialog(&l))
             .unwrap_or(false)
     });
@@ -216,7 +222,7 @@ fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
 }
 
 fn dump(session: &str) -> String {
-    tako_core::tmux::capture_session(Some(SOCKET), session)
+    tako_core::tmux::capture_session(Some(socket()), session)
         .map(|l| l.join("\n"))
         .unwrap_or_else(|e| format!("<capture 失敗: {e}>"))
 }

@@ -19,8 +19,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-/// 本番のバックエンドや他の実験と混ざらない専用ソケット
-const SOCKET: &str = "tako-e2e-1259";
+#[path = "common/tmux_e2e.rs"]
+mod tmux_e2e;
+
+/// 本番のバックエンドや**他プロセスのテスト**と混ざらない専用の器（#1300）。
+/// 固定名だと `cargo test --workspace` が 2 本走った瞬間に同名セッションを
+/// 取り合って `duplicate session` で落ちる（実測は `tmux_e2e` のモジュール doc）
+fn socket() -> &'static str {
+    tmux_e2e::socket_for("1259")
+}
 
 /// 送る本文（実採取物は貼らない = #927。到達判定に使うので一意にする）
 const PAYLOAD: &str = "E2E1259 please answer with the word pineapple";
@@ -42,9 +49,9 @@ struct EmuGuard {
 
 impl Drop for EmuGuard {
     fn drop(&mut self) {
-        let _ = Command::new("tmux")
-            .args(["-L", SOCKET, "kill-session", "-t", &self.session])
-            .output();
+        // 器はこのプロセス専用。セッションを畳み、**このプロセスの最後の 1 本**なら
+        // サーバーごと退役させてソケットファイルまで消す（tmux は残す）
+        tmux_e2e::release_session(socket(), &self.session);
         // 模擬 TUI が抱えていた背景の子（sleep 3600）はセッションごと落ちるが、
         // 取りこぼしがあっても pid ファイル経由で確実に片付ける
         if let Ok(pid) = std::fs::read_to_string(self.dir.join("child.pid")) {
@@ -158,11 +165,14 @@ fn launch_emulator_with(tag: &str, with_child: bool) -> (EmuGuard, PathBuf) {
     let log = dir.join("input.log");
     let pidfile = dir.join("child.pid");
     let session = format!("tako1259{tag}");
-    let status = Command::new("tmux")
-        .args([
-            "-L",
-            SOCKET,
-            "new-session",
+    // 起動より**先に**ガードを作る。起動が落ちたときも作業ディレクトリと器が残らない
+    let guard = EmuGuard {
+        session: session.clone(),
+        dir: dir.clone(),
+    };
+    if let Err(diag) = tmux_e2e::new_session(
+        socket(),
+        &[
             "-d",
             "-s",
             &session,
@@ -179,17 +189,13 @@ fn launch_emulator_with(tag: &str, with_child: bool) -> (EmuGuard, PathBuf) {
                 pidfile.to_str().expect("UTF-8"),
                 if with_child { "1" } else { "0" },
             ),
-        ])
-        .status()
-        .expect("tmux を実行できる");
-    assert!(status.success(), "tmux new-session が失敗した");
-    let guard = EmuGuard {
-        session: session.clone(),
-        dir,
-    };
+        ],
+    ) {
+        panic!("{diag}");
+    }
     // 入力欄が描かれるまで待つ（描画前に送ると材料が無い）
     let drawn = wait_until(Duration::from_secs(15), || {
-        tako_core::tmux::capture_session(Some(SOCKET), &session)
+        tako_core::tmux::capture_session(Some(socket()), &session)
             .map(|l| tako_control::claude_tui::input_line(&l).is_some())
             .unwrap_or(false)
     });
@@ -213,7 +219,7 @@ fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
 }
 
 fn dump(session: &str) -> String {
-    tako_core::tmux::capture_session(Some(SOCKET), session)
+    tako_core::tmux::capture_session(Some(socket()), session)
         .map(|l| l.join("\n"))
         .unwrap_or_else(|e| format!("<capture 失敗: {e}>"))
 }
@@ -260,7 +266,7 @@ fn 背景シェルが生き残ったidleペインへも送達が成立する() {
 
     // ② 画面の判定: 番号つきの並びが会話ログに残っていても入力欄は読める。
     //    #1259 の調査で「画面が原因で `input_line` が None だった」説を否定した根拠
-    let lines = tako_core::tmux::capture_session(Some(SOCKET), &session).expect("capture できる");
+    let lines = tako_core::tmux::capture_session(Some(socket()), &session).expect("capture できる");
     assert!(
         !tako_control::claude_tui::is_choice_dialog(&lines),
         "会話ログの番号つきの並びを選択肢ダイアログと誤検知している:\n{}",
@@ -273,8 +279,9 @@ fn 背景シェルが生き残ったidleペインへも送達が成立する() {
     );
 
     // ③ 送達（キー操作経路。peer は実 claude が要るのでここでは通らない）
-    let report = tako_control::claude_tui::deliver_via_tmux(Some(SOCKET), &session, PAYLOAD, true)
-        .expect("送達フローが完走する");
+    let report =
+        tako_control::claude_tui::deliver_via_tmux(Some(socket()), &session, PAYLOAD, true)
+            .expect("送達フローが完走する");
     assert!(
         report.verified,
         "送達を検証できない（report={report:?}）:\n{}",
@@ -313,9 +320,9 @@ fn 人間の下書きは送達で壊れない() {
     let session = guard.session.clone();
 
     // 人間が打ちかけの行を作る
-    tako_core::tmux::send_keys(Some(SOCKET), &session, "draft by human").expect("打てる");
+    tako_core::tmux::send_keys(Some(socket()), &session, "draft by human").expect("打てる");
     let shown = wait_until(Duration::from_secs(10), || {
-        tako_core::tmux::capture_session(Some(SOCKET), &session)
+        tako_core::tmux::capture_session(Some(socket()), &session)
             .map(|l| l.iter().any(|x| x.contains("draft by human")))
             .unwrap_or(false)
     });
@@ -323,7 +330,7 @@ fn 人間の下書きは送達で壊れない() {
 
     // Enter 単独送達（text 空）= 「入力欄に残っているものを送れ」。
     // 貼り付けは起きないので、相手が受け取るのは**下書きそのもの**
-    let report = tako_control::claude_tui::deliver_via_tmux(Some(SOCKET), &session, "", true)
+    let report = tako_control::claude_tui::deliver_via_tmux(Some(socket()), &session, "", true)
         .expect("Enter 単独送達が完走する");
     assert!(
         report.verified,
@@ -361,8 +368,9 @@ fn 子プロセスが無い通常のidleでも送達が成立する() {
         !child_alive(&guard.dir),
         "対照なのに背景の子が居る（fixture の切り替えが効いていない）"
     );
-    let report = tako_control::claude_tui::deliver_via_tmux(Some(SOCKET), &session, PAYLOAD, true)
-        .expect("送達フローが完走する");
+    let report =
+        tako_control::claude_tui::deliver_via_tmux(Some(socket()), &session, PAYLOAD, true)
+            .expect("送達フローが完走する");
     assert!(
         report.verified,
         "送達を検証できない（report={report:?}）:\n{}",

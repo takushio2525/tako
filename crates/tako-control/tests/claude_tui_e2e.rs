@@ -17,13 +17,19 @@
 //!   「ダイアログが出ない」で落ちる場合は祖先の信頼済みエントリを疑うこと
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use tako_control::claude_tui;
 
-/// 専用ソケットで tako 本体のバックエンド（tako-backend）や実験用 tmux と隔離する
-const SOCKET: &str = "tako-e2e-32";
+#[path = "common/tmux_e2e.rs"]
+mod tmux_e2e;
+
+/// 本番のバックエンドや**他プロセスのテスト**と混ざらない専用の器（#1300）。
+/// 固定名だと `cargo test --workspace` が 2 本走った瞬間に同名セッションを
+/// 取り合って `duplicate session` で落ちる（実測は `tmux_e2e` のモジュール doc）
+fn socket() -> &'static str {
+    tmux_e2e::socket_for("32")
+}
 
 /// 3 テスト共通の応答マーカー（40+2 / 50−8 / 6×7 の答えを英語綴りで返させる）。
 /// 数字の "42" はステータスライン（`5h 45% (→4h42m)` 等）と誤マッチするため使わない
@@ -46,9 +52,9 @@ struct SessionGuard {
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        let _ = Command::new("tmux")
-            .args(["-L", SOCKET, "kill-session", "-t", &self.session])
-            .output();
+        // 器はこのプロセス専用。セッションを畳み、**このプロセスの最後の 1 本**なら
+        // サーバーごと退役させてソケットファイルまで消す（tmux は残す）
+        tmux_e2e::release_session(socket(), &self.session);
         let _ = std::fs::remove_dir_all(&self.dir);
         remove_trust_entry(&self.dir);
     }
@@ -79,11 +85,14 @@ fn remove_trust_entry(dir: &Path) {
 /// 指定ディレクトリで claude を tmux セッションとして起動する
 fn launch_claude(session: &str, dir: &Path) -> SessionGuard {
     std::fs::create_dir_all(dir).expect("作業ディレクトリを作れる");
-    let status = Command::new("tmux")
-        .args([
-            "-L",
-            SOCKET,
-            "new-session",
+    // 起動より**先に**ガードを作る。起動が落ちたときも作業ディレクトリと器が残らない
+    let guard = SessionGuard {
+        session: session.to_string(),
+        dir: dir.to_path_buf(),
+    };
+    if let Err(diag) = tmux_e2e::new_session(
+        socket(),
+        &[
             "-d",
             "-s",
             session,
@@ -94,14 +103,11 @@ fn launch_claude(session: &str, dir: &Path) -> SessionGuard {
             "-c",
             dir.to_str().expect("テストパスは UTF-8"),
             "claude --model haiku",
-        ])
-        .status()
-        .expect("tmux を実行できる");
-    assert!(status.success(), "tmux new-session が失敗した");
-    SessionGuard {
-        session: session.to_string(),
-        dir: dir.to_path_buf(),
+        ],
+    ) {
+        panic!("{diag}");
     }
+    guard
 }
 
 /// 画面にマーカー文字列が現れるまで待つ（claude の応答確認用。大文字小文字を無視）
@@ -109,7 +115,7 @@ fn wait_for_marker(session: &str, marker: &str, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     let marker = marker.to_lowercase();
     while Instant::now() < deadline {
-        if let Ok(lines) = tako_core::tmux::capture_session(Some(SOCKET), session) {
+        if let Ok(lines) = tako_core::tmux::capture_session(Some(socket()), session) {
             if lines.iter().any(|l| l.to_lowercase().contains(&marker)) {
                 return true;
             }
@@ -120,13 +126,13 @@ fn wait_for_marker(session: &str, marker: &str, timeout: Duration) -> bool {
 }
 
 fn dump_screen(session: &str) -> String {
-    tako_core::tmux::capture_session(Some(SOCKET), session)
+    tako_core::tmux::capture_session(Some(socket()), session)
         .map(|l| l.join("\n"))
         .unwrap_or_else(|e| format!("<capture 失敗: {e}>"))
 }
 
 fn capture(session: &str) -> Option<Vec<String>> {
-    tako_core::tmux::capture_session(Some(SOCKET), session).ok()
+    tako_core::tmux::capture_session(Some(socket()), session).ok()
 }
 
 /// 条件が成立するまで待つ（500ms 間隔）
@@ -155,26 +161,24 @@ fn wait_for_input_line(session: &str) {
 /// 人間のタイプ相当: 1 バイトずつ送る（GUI の handle_key は 1 キーずつ PTY へ書く）
 fn type_like_human(session: &str, text: &str) {
     for byte in text.as_bytes() {
-        let status = Command::new("tmux")
-            .args([
-                "-L",
-                SOCKET,
-                "send-keys",
+        if let Err(diag) = tmux_e2e::send_keys(
+            socket(),
+            &[
                 "-t",
                 &tako_core::tmux::session_pane_target(session),
                 "-H",
                 &format!("{byte:02x}"),
-            ])
-            .status()
-            .expect("tmux を実行できる");
-        assert!(status.success(), "send-keys -H が失敗した");
+            ],
+        ) {
+            panic!("{diag}");
+        }
         std::thread::sleep(Duration::from_millis(30));
     }
     std::thread::sleep(Duration::from_millis(500));
 }
 
 fn send_key(session: &str, key: &str) {
-    tako_core::tmux::send_key(Some(SOCKET), session, key).expect("キー送信できる");
+    tako_core::tmux::send_key(Some(socket()), session, key).expect("キー送信できる");
 }
 
 /// Issue #32 問題 1（フォールバック経路）: 未信頼フォルダの初回起動で信頼ダイアログが
@@ -186,7 +190,7 @@ fn 未信頼フォルダでダイアログ承諾からの送達が通る() {
     // 事前信頼はしない → 信頼ダイアログが表示されるはず
     let guard = launch_claude("trust-fallback", &dir);
     let report = claude_tui::deliver_via_tmux(
-        Some(SOCKET),
+        Some(socket()),
         &guard.session,
         &format!("What is 40 + 2? {SPELL_SUFFIX}"),
         true,
@@ -226,7 +230,7 @@ fn 事前信頼でダイアログなしの送達が通る() {
     let guard = launch_claude("pretrust", &dir);
 
     let report = claude_tui::deliver_via_tmux(
-        Some(SOCKET),
+        Some(socket()),
         &guard.session,
         &format!("What is 50 - 8? {SPELL_SUFFIX}"),
         true,
@@ -265,7 +269,7 @@ fn 残留テキストをenter単独送達で送信できる() {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let lines =
-            tako_core::tmux::capture_session(Some(SOCKET), &guard.session).expect("画面を読める");
+            tako_core::tmux::capture_session(Some(socket()), &guard.session).expect("画面を読める");
         if claude_tui::input_line(&lines).is_some() {
             break;
         }
@@ -278,23 +282,21 @@ fn 残留テキストをenter単独送達で送信できる() {
     }
 
     // 人間のタイプ相当: テキストだけ入力欄に載せる（Enter は送らない = 残留状態）
-    let status = Command::new("tmux")
-        .args([
-            "-L",
-            SOCKET,
-            "send-keys",
+    if let Err(diag) = tmux_e2e::send_keys(
+        socket(),
+        &[
             "-t",
             &tako_core::tmux::session_pane_target(&guard.session),
             "-l",
             &format!("What is 3 * 7? {SPELL_SUFFIX}"),
-        ])
-        .status()
-        .expect("tmux を実行できる");
-    assert!(status.success(), "send-keys が失敗した");
+        ],
+    ) {
+        panic!("{diag}");
+    }
     std::thread::sleep(Duration::from_millis(1500));
 
     // Enter 単独送達（tako_send_input text:"" + newline:true の tmux 経路と同じ）
-    let report = claude_tui::deliver_via_tmux(Some(SOCKET), &guard.session, "", false)
+    let report = claude_tui::deliver_via_tmux(Some(socket()), &guard.session, "", false)
         .expect("送達が完了する");
     assert!(
         report.verified,
@@ -335,7 +337,7 @@ fn busy中にタイプした指示がキューに入り誤検知されない() {
 
     // ① 長めのタスクを送って busy にする
     claude_tui::deliver_via_tmux(
-        Some(SOCKET),
+        Some(socket()),
         &guard.session,
         "Write a numbered list from 1 to 120. Each line is one short English sentence. No tools.",
         true,
@@ -371,7 +373,7 @@ fn busy中にタイプした指示がキューに入り誤検知されない() {
 
     // ④ この状態への Enter 単独送達は「送信済み」と正しく判定される
     //    （修正前は 5 回空撃ちして enter_retries=4 / verified=false で終わっていた）
-    let report = claude_tui::deliver_via_tmux(Some(SOCKET), &guard.session, "", false)
+    let report = claude_tui::deliver_via_tmux(Some(socket()), &guard.session, "", false)
         .expect("送達が完了する");
     assert!(
         report.verified,
@@ -410,7 +412,7 @@ fn 長文マルチラインsendが送達される() {
          \n\
          Final line: What is 6 * 7? {SPELL_SUFFIX}\n"
     );
-    let report = claude_tui::deliver_via_tmux(Some(SOCKET), &guard.session, &text, true)
+    let report = claude_tui::deliver_via_tmux(Some(socket()), &guard.session, &text, true)
         .expect("送達が完了する");
     assert!(
         report.verified,
@@ -430,11 +432,14 @@ fn 長文マルチラインsendが送達される() {
 /// `--permission-mode manual` が要る。既定は auto でツール実行が自動承認される）
 fn launch_claude_mode(session: &str, dir: &Path, mode: &str) -> SessionGuard {
     std::fs::create_dir_all(dir).expect("作業ディレクトリを作れる");
-    let status = Command::new("tmux")
-        .args([
-            "-L",
-            SOCKET,
-            "new-session",
+    // 起動より**先に**ガードを作る。起動が落ちたときも作業ディレクトリと器が残らない
+    let guard = SessionGuard {
+        session: session.to_string(),
+        dir: dir.to_path_buf(),
+    };
+    if let Err(diag) = tmux_e2e::new_session(
+        socket(),
+        &[
             "-d",
             "-s",
             session,
@@ -445,14 +450,11 @@ fn launch_claude_mode(session: &str, dir: &Path, mode: &str) -> SessionGuard {
             "-c",
             dir.to_str().expect("テストパスは UTF-8"),
             &format!("claude --model haiku --permission-mode {mode}"),
-        ])
-        .status()
-        .expect("tmux を実行できる");
-    assert!(status.success(), "tmux new-session が失敗した");
-    SessionGuard {
-        session: session.to_string(),
-        dir: dir.to_path_buf(),
+        ],
+    ) {
+        panic!("{diag}");
     }
+    guard
 }
 
 /// ダイアログが実在するまで待って構造を返す
@@ -489,7 +491,7 @@ fn issue748_実permissionダイアログを構造化して番号キーで確定�
 
     // 許可リストに無いコマンド（perl）を頼む → permission ダイアログが出る
     let report = claude_tui::deliver_via_tmux(
-        Some(SOCKET),
+        Some(socket()),
         &guard.session,
         "Run exactly this with the Bash tool and nothing else: perl -e 'print 7'",
         true,
@@ -528,7 +530,7 @@ fn issue748_実permissionダイアログを構造化して番号キーで確定�
 
     // ③ ダイアログ中のテキスト送達は貼らずに失敗する（入力欄へ混入しない）
     let blocked = claude_tui::deliver_via_tmux(
-        Some(SOCKET),
+        Some(socket()),
         &guard.session,
         "この指示はダイアログに食われてはいけない",
         false,

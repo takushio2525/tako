@@ -63,3 +63,7 @@
 - 真因は「積む前の状態」を未決着かどうかで分けていなかったこと。`prompt_delivery_states` はペインを閉じるまで消えないので、素通しすると 1 時間前の `gave_up` や 10 秒前の `delivered` を新しい送達が名乗る（後者は master が届いたと判断して**監視をやめる**）
 - 判定は `tako_core::prompt_delivery::pending_predecessor`（`State::is_pending` = Queued / Waiting だけ）の 1 実装へ。絞り込みは `queued_json` の 1 箇所なので send フロー / Enter 単独 / tmux フォールバックが全部通る。MCP の説明文も一致させた
 - 隔離 GUI + 模擬 TUI の実測: 1 通目を flow_timeout（120s）させた後の 2 通目が legacy `gave_up … elapsed=120s` → 修正後 `queued elapsed=0s`。番犬 3 本が修正前ソースを file:line 名指し FAILED
+## 2026-09-11（#1300: trust_auto_accept_e2e の tmux 起動失敗を診断で割れる形にして真因を直した）
+- 真因は見立て（#1265 と同じ PTY 枯渇）と別で**固定名の取り合い**。器のソケットもセッション名も定数なので、同じ機で `cargo test --workspace` が 2 本並ぶと片方が 0.03 秒で `duplicate session: tako1236new` に当たり、後始末の `kill-session -t <固定名>` は相手のセッションまで消す（失敗時の実測は PTY 103/511・ソケット 206 = 枯渇していない）
+- 器の名前・起動・後始末・診断を `tests/common/tmux_e2e.rs` の 1 実装へ（pid つきソケット + 期限つき + 失敗時に stderr / そのソケットのセッション / PTY / ソケット / サーバー数 / load、**このプロセスの最後の 1 本**でだけ器を畳む）。tako-control の実 tmux e2e 7 本を寄せ、番犬 2 本が修正前ソースの 28 か所を名指し FAILED
+- A/B: 2 本同時 × 110 ラウンドで旧（origin/main バイナリ）= 110/110 ラウンド FAILED（115 プロセス・全て duplicate）→ 新 = 0/110。診断の有無は `TAKO_1300_INJECT=duplicate` で同一バイナリ対比。「負荷で待ちが足りない」説は**否定**（固定の待ちのまま load 12.15 で 30 回 0 失敗。当初の 11/12 は自分の A/B ハーネスの `rm -rf` が走行中の作業 dir を消していた artifact で、並走 sweeper で同じ署名を再現）
