@@ -1039,6 +1039,8 @@ mod tests {
         std::fs::create_dir_all(&tmp).expect("子の TMPDIR を作れる");
         let exe = std::env::current_exe().expect("テストバイナリのパス");
         let mut cmd = std::process::Command::new(exe);
+        // Windows でコンソール窓を出さない（#628 / #586 の 1 実装を通す）
+        crate::platform::process::no_console_window(&mut cmd);
         if let Some(f) = filter {
             cmd.arg(f);
         }
