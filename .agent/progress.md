@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-12（#1390: terminal-core のテストの穴 4 件を埋めた）
-- 項目 1/3 はテスト追加（スクロール中の `visible_lines_filled` / `set_scrollback_limit` の副作用）、項目 2 は `history_plain_lines` の末尾トリムを `compose_grid_row` の 1 実装へ寄せて履歴行をスクロールで可視化して突き合わせ、項目 4 は罫線剥がしを `strip_box_border` 1 実装へ（`screen.rs` / `terminal.rs` / #1387 の番犬）
-- 項目 4 は「2 行目以降だけ剥がす」最小修正だと**枠線つきでプロンプト行にだけ本文がある箱が false** になるので、プロンプト行も同じ作法で見る形にした（1 行の箱の誤答は修正前から在った）
-- 注入 6 通り（起点 1 ずらし / トリム規則 / ループ 2 実装化 / `kitty_keyboard` 落とし / `set_options` 直渡し / 罫線剥がし戻し）で file:line 名指しの FAILED。workspace 4381 passed 0 failed・check-windows error 0
-
 ## 2026-09-12（#1388: 読み手のいない「行に全角が在るか」の旗を落とした）
 - `ScreenLine` の旗は #787 以降 production の読み手が 0（grep で確定）なのに毎行 `windows(2)` を走らせ、doc だけが「描画で使う」と言っていた。フィールドと書き手 4 か所（`screen.rs` / `links.rs` ×2 / `terminal_grid.rs`）を落とし、assert 3 件は「全角のぶん `cell_cols` が 2 列飛ぶ」へ置き換え
 - 修正前ソースの実測: 右端だけが全角の行は旗が **false**（`windows(2)` 版の構造的な見落とし）/ 途中に全角なら true。`text` / `cell_cols` は前後で完全一致（右端全角・空行・全角のみ・途中全角の 4 ケースを `screen_from_lines` で固定）
@@ -64,3 +59,8 @@
 - ローカル行の 13 か所が dispatch の結果を `let _ =` / `if result.is_ok()` / `eprintln!` で捨てていて、**ごみ箱移動・リネームが無言で失敗**していた（同じサイドバーのリモート行は #919 から通知欄へ出していた = 1 画面に 2 方針）。出し口を `sidebar::notify_tree_failure` の 1 実装へ寄せ、リモート行と同じ `set_remote_notice` + persist.log（載せるのは操作名と `DispatchError::class()` の分類だけ）へ通した。`commit_inline_edit` の先頭 `take()` をやめ、**失敗時は入力欄と打った名前を残す**
 - 隔離 GUI（tako-vd）セルフテスト項目 84b の A/B: 新 = `trash="削除 に失敗しました（<fixture>/gone.txt）: パスが存在しない…"` / `rename="名前変更 に失敗しました（taken.txt）: 既に存在する…"` / `kept="taken.txt"` / 成功時は無言・連続失敗は最後の 1 件が残る → 完走（`TAKO_APP_SELF_TEST_OK`・FAILED 0）。legacy（`TAKO_1399_LEGACY=1`）は `trash=None rename=None kept=None` で **FAILED**
 - 番犬 `issue1399_tree_notice_watchdog` 8 本（UI モジュールの dispatch 走査 + `eprintln!` + 1 実装 + `take()` + 分類 + 検出力）。修正前ソースで 6/7 が file:line 名指し FAILED（`sidebar.rs:1540/1570/1613/1630/1646/1659/1705/1718/1732/1740/1971/2014/2019`）。別画面の同型 3 件は `KNOWN_DISCARDED` で段階導入
+
+## 2026-09-12（#1411: tako 自身が開いた SSH ペインを自分の自動検知が見送るのを直した）
+- 物差しを「ポートが 22 か」から「**宛先の名前だけでそのポートへ行けるか**」へ（`ConfiguredPorts` = `~/.ssh/config` の `Port`・判断は `port_reachable_by_name` の 1 箇所・材料は `scan` が走る tick だけ読む）。tako の `-p` は config の書き写しなので全部この側に入り、手打ちの `-p`（config に無い）と `-F <別 config>` は従来どおり見送る
+- 同じ症状の 2 つ目の原因を同時に直した: tako の `-o ControlPath="…"` は macOS 既定 data_dir に空白があるので `ps` の 1 行が割れ、**続きの語が宛先に見えて** `RemoteCommand` で見送られていた（ポートが 22 でも起きる）。隔離 GUI + 使い捨て sshd の A/B（`TAKO_1411_LEGACY=1`）で legacy = `sessions:[]`（空白あり data dir は `RemoteCommand`・空白なしは Issue と同じ `PortOverride`）→ 新 = pane が `sessions` に `live` で載り、手打ちの `-p` だけが `PortOverride` で残る
+- 番犬 `issue1411_self_opened_ssh_watchdog` 8 本（注入 6 通りで `ssh_detect.rs:378` / `:421` / `:423` / `remote.md:107` を file:line 名指し）。単体 16 本・workspace 4442 passed 0 failed・check-windows error 0。**install 要**

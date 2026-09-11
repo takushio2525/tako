@@ -104,14 +104,16 @@ is reported as unknown.
 Entering `ssh` in a pane adds that host's home to the tree by itself (on by default;
 `action: "auto"` reads and toggles it). It deliberately skips forms where the real
 destination is not the name on the command line, and action `auto` returns each skip
-with its reason: a non-default port, `ProxyJump` / `ProxyCommand` / `HostName`
-overrides, a one-shot remote command, `-N`, or a subsystem call.
+with its reason: a port the config does not account for, `ProxyJump` /
+`ProxyCommand` / `HostName` overrides, a one-shot remote command, `-N`, or a
+subsystem call.
 
-- **A host whose config sets a non-default `Port` will not appear by itself**, even in
-  the pane tako opened for it — tako passes `-p <port>` on that command line, and the
-  detector treats any non-22 port as possibly another machine (measured: both the pane
-  from `open` and the pane from `tako_open_remote` came back under `skipped` with that
-  reason). For those hosts, open the folder explicitly with action `open`.
+- A non-default `Port` is fine when the config is the one declaring it (an `Include`d
+  file counts): the check is not "is the port 22" but "does the name alone reach that
+  port", so a host with `Port 2222` in the config appears by itself, including in the
+  pane tako opened for it (#1411). A `-p` that the config does not account for is still
+  skipped — someone typing `ssh -p 2222 <host>` may be reaching a different machine
+  than that name resolves to.
 - Windows cannot read process command lines, so auto-detection does not run there. Use
   the explicit path.
 
