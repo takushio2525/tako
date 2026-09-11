@@ -146,10 +146,10 @@ enum Command {
     // show_file / show_diff / show_url と揃えた提示系の語彙。名前を崩さず allow する
     #[allow(clippy::enum_variant_names)]
     ShowCommand(ShowCommandArgs),
-    /// プラットフォーム対応マトリクスの参照（Issue #515）。
-    /// この環境でどの機能が使えるか・縮退しているか・未実装かを表示する
     /// agent 能力マトリクスを表示する（どの CLI でどこまで使えるか。Issue #982）
     AgentSupport(AgentSupportArgs),
+    /// プラットフォーム対応マトリクスの参照（Issue #515）。
+    /// この環境でどの機能が使えるか・縮退しているか・未実装かを表示する
     Platform(PlatformArgs),
     /// 起動時ロードの予算の確認と自動修正（Issue #1139）。
     /// AI が起動した瞬間に強制ロードされるもの（グローバル指示・AGENTS.md と
@@ -1087,7 +1087,7 @@ enum AgentsCommand {
 #[derive(Subcommand)]
 enum RemoteCommand {
     /// リモートアクセス API サーバーを起動し、QR コードを表示する
-    /// （transport は Tailscale Serve + UDS。未セットアップなら不足項目を案内して停止）
+    /// （transport は Tailscale Serve + ループバック TCP。未セットアップなら不足項目を案内して停止）
     Start,
     /// リモートアクセス API サーバーを停止する
     Stop {
