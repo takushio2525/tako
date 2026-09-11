@@ -76,6 +76,12 @@ fn validate_remote_devices(text: &str) -> Result<(), String> {
     json_ok::<crate::remote_auth::DevicesFile>(text)
 }
 
+/// 蓋閉じ継続の残留記録（#697 / #1373）。中身は Windows 専用だが、
+/// **読めない記録を「記録なし」へ丸めない**のは両 OS 共通の要件なので検査も共通
+fn validate_lid_guard(text: &str) -> Result<(), String> {
+    json_ok::<crate::platform::lid::SavedLidState>(text)
+}
+
 fn validate_discovery_instance(text: &str) -> Result<(), String> {
     json_ok::<crate::discovery::ControlInfo>(text)
 }
@@ -348,7 +354,7 @@ pub const SPECS: &[SchemaSpec] = &[
     pristine(SchemaId::Recent, Some(validate_recent)),
     pristine(SchemaId::ConfigShare, Some(validate_config_share)),
     // 蓋閉じの残留状態。中身は Windows 専用だが読める形かの検査は両 OS で同じ
-    pristine(SchemaId::LidGuard, None),
+    pristine(SchemaId::LidGuard, Some(validate_lid_guard)),
     pristine(
         SchemaId::OrchestratorConfig,
         Some(validate_orchestrator_config),

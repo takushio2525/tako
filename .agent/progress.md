@@ -20,16 +20,6 @@
 
 ---
 
-## 2026-09-11（#1349: コピー行の「選択なしなら Ctrl+C 送信」を実態へ）
-- 隔離 GUI（tako-vd・pid 指定の CGEventPostToPid）で実測: 選択なし cmd+C は `sleep` を殺さず `^C` も出ず クリップボードも不変。同じ経路で撃った本物の Ctrl+C は殺した（= 観測に検出力あり）。選択あり cmd+C はコピーになる（回帰なし）
-- docs の行を「選択が無いときは何も起きない」へ直し、注記で「中断の Ctrl+C は tako が横取りしない」を明示。実装を docs へ寄せる案 (b) は挙動変更なので Issue へ比較を残して master 判断へ
-- 番犬 2 本（コピー行の説明文と `copy_selection` の両方向 / 素の ctrl-c 未バインド）を `docs_keyboard_shortcuts.rs` へ。注入 5 通りで file:line 名指し FAILED
-
-## 2026-09-11（#1347: merge 後のリモートブランチ削除を merge-pr.sh 自身で閉じた）
-- 真因は gh の順序（ローカル切り替え → ローカル削除 → リモート削除）。専用 worktree から実行すると 1 手目が `fatal: 'main' is already used by worktree` で落ち**リモートまで到達しない**（`git switch main` 単体で逐語再現・PR #1337 で実発生・棚卸しで merge 済み PR の head が origin に 5 本残存）
-- `delete_remote_head_branch` を MERGED 確認の後に置いた（`gh api` で存在確認 → DELETE・冪等・**その PR の head 1 本だけ**・head == base と fork は触らない）。A/B `TAKO_1347_LEGACY=1` が gh 任せの腕で、モック 4 ケース（消し切る / legacy では残る / 冪等 / 門）を追加して 72 assert 緑
-- ドッグフーディングで PR #1348 を修正版の `merge-pr.sh` から merge: gh は同じ worktree 事故で 1 を返したが `リモートブランチ … を削除した` が出て `git ls-remote` は空。**GitHub は `.gitattributes` の `merge=union` を適用しない**（実測）ので progress 系を触る PR は CI 中の他 PR 追記だけで CONFLICTING になると分かった（#1246 の前提が GitHub 側では成立しない）
-
 ## 2026-09-11（#1357: PWA の Playwright e2e を CI へ載せ、実行手順を置いた）
 - 6 spec 50 項目が CI で 1 度も走らず実行手順もどこにも無かった（#425 の契約変更で spec が取り残され #632 が 6 週間放置 → #1089 として再起票）。`package.json` に `e2e` / `e2e:install`・`web/tako-remote/README.md` 新設・AGENTS.md と commands.md に 1 行
 - CI の macOS ジョブ末尾で `npm run e2e:install` → `npm run e2e` を **blocking** で実行。追加は実測 **46〜87 秒**（2 run。差は worker 数がランナーの CPU 数に従うため = 33 秒 / 71 秒。3 分のゲート内なので採用）
@@ -68,3 +58,8 @@
 - 真因は `cmd /C start "" <url>`。`std::process::Command` の Windows 実装は空白を含まない引数を引用符で囲まない（`Quote::Auto`）ので、cmd.exe が引用符の外の `&` をコマンド区切りとして解釈する。tako が拾う URL は構造的に空白を含まず `&` は正規の文字なので、クエリ文字列つきリンクは常にそこで切れ、残りが別コマンドとして走っていた（画面 / PDF / Markdown が第三者由来ならクリック 1 回で任意コマンド実行）
 - `open_url` / `open_url_wait` を既存の `shell_execute`（`ShellExecuteW`）へ寄せ、引数の正本を境界の外の純粋関数 `windows_url_launch` に置いた（macOS からも Windows の形を検査できる）。待つ版は戻り値判定（> 32）で足りる = `SEE_MASK_NOCLOSEPROCESS` はハンドラ本体のハンドルを返すのでブラウザを閉じるまで返らない
 - 番犬 5 本（シェル起動のソース走査 / ShellExecuteW への配線 / メタ文字 URL が 1 つの値のまま / `&` 以降が落ちない / 名指しの行番号がずれない）。注入 3 種（旧 cmd 経路・`&` で切る・lpParameters へ載せる）が file:line 名指しで FAILED。**Windows 実機は未検証**。到達経路側（PDF / 提案チップのスキーム検査なし）は #1376 へ分離
+
+## 2026-09-11（#1373: 蓋閉じ継続の記録に所有者を持たせ、原子書き込み + fail-loud にした）
+- `lid-guard.json` は data_dir に 1 つで複数の tako-app が共有するのに「書き換えるのはこのプロセスだけ」が前提だった。記録へ所有者（pid + 起動時刻）を足し、戻すのは「自分の / 所有者が死んだ / 所有者を持たない旧形式」だけへ（**生きた他プロセスの記録は倒す側も解除側も触らない**）。判定は `claim_for` → `decide` の純粋関数 2 本で、probe を引数に取るので macOS の CI で 4 通り全部を固定できる
+- 書き込みを `config_io::atomic_write` + `<path>.lock` の flock（**書くと決まってから**取り、その下で読み直す）へ。読めない記録は「記録なし」へ丸めず `<name>.unreadable.bak` へ写して Err（元ファイルは触らない）。旧形式は `serde(default)` でそのまま読めるので移行は不要（指紋へ `SavedLidState` / `RecordOwner` を登録）
+- A/B: 修正前ソースで番犬 6 本が file:line 名指し FAILED。注入 5 種それぞれで対応する番犬 / 単体が落ちる。**Windows 実機（2 プロセス構成）は未検証**（電源待ち）。`main.rs` の `apply_sleep_guard` がセカンダリで止まらない件は所有権で無害化したので別 Issue は立てない
