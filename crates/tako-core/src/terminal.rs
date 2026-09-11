@@ -1193,6 +1193,26 @@ impl TerminalSession {
     /// の両方を 1 つの物差しで見られる。**空白詰めの行を soft wrap 扱いにしてはいけない**
     /// （#1182 の実害: `Screen` の `cell_cols.last()` は空白詰めのせいで常に最終列を指すので、
     /// 画面全体が 1 本に連結された）ので、`Screen` 経由では判定しない
+    ///
+    /// # 既知の限界: 行末が全角のときは 1 列足りない（#1389）
+    ///
+    /// `line_length()` は**末尾から `cell.c != ' '` のセルを探す**実装なので、全角の
+    /// 後続セル（`WIDE_CHAR_SPACER`）は `c == ' '` = **空きと数える**。だから
+    /// **行末が全角の行は物理的に右端まで埋まっていても `filled=false` になる**
+    /// （実測・10 桁: `abcdefghあ` で `line_length=9` / 右端セルは
+    /// `Flags(WIDE_CHAR_SPACER)`）。端末自身が折り返した行だけは `WRAPLINE` が立って
+    /// 全幅を返すので真になる = **救えないのは「行末が全角 + 以降の出力なし」と
+    /// 「器が `CUP` で描き直した行」**で、上で名指しした器（tmux / psmux）の
+    /// ペインこそここに当たる。
+    ///
+    /// 現行の消費者（`find_exit_marker`）はマーカーの断片を持つ行しか見ず、マーカーは
+    /// 全 ASCII なのでその行の最終セルは必ず半角 = この取りこぼしは今の判定を
+    /// 1 ビットも変えない。**この API を「折り返しの結合」一般へ使い回すなら右端の
+    /// 全角を自分で検査する**こと（#1132 のとおり worker のペインは 21〜25 桁まで
+    /// 狭まるので、狭いほど行末が全角になる確率は上がる）。限界は
+    /// `visible_lines_filled_は行末の全角を取りこぼす` が固定し、兄弟実装
+    /// `links::combined_screen_text` の同じ穴は `.agent/conventions.md` の
+    /// #1283 節に並べてある
     pub fn visible_lines_filled(&self) -> Vec<(String, bool)> {
         use alacritty_terminal::index::Line;
         use alacritty_terminal::term::cell::LineLength;
@@ -2676,6 +2696,178 @@ mod tests {
         assert_eq!(got2[at + 1].0, "__TAKO_EXI", "続きの行が違う: {got2:?}");
         assert!(got2[at + 1].1, "続きの行も右端まで埋まっている: {got2:?}");
         assert_eq!(got2[at + 2].0, "T=1", "続きの行が違う: {got2:?}");
+    }
+
+    /// **限界の固定**: `visible_lines_filled` は**行末が全角**の行を
+    /// 「右端まで埋まっていない」と読む（#1389）。
+    ///
+    /// alacritty の `line_length()` は末尾から `cell.c != ' '` のセルを探すので、
+    /// 全角の後続セル（`WIDE_CHAR_SPACER`）を**空きと数える**。
+    /// [`TerminalSession::visible_lines_filled`] の doc に書いた「既知の限界」の
+    /// 機械検査で、**判定を直すと落ちる** = 直すときは doc と
+    /// `.agent/conventions.md` の #1283 節も同じコミットで直すこと。
+    ///
+    /// 10 桁の実 PTY で採った 6 形（2026-09-12 実測）:
+    ///
+    /// ```text
+    /// A 右端が全角・以降の出力なし  abcdefghあ  filled=false line_length=9  WIDE_CHAR_SPACER
+    /// B 右端が全角・続きあり        abcdefghあ  filled=true  line_length=10 WRAPLINE | WIDE_CHAR_SPACER
+    /// C 右端が半角でちょうど埋まる  abcdefghij  filled=true  line_length=10
+    /// D 途中に全角・右端は半角      あいうabcd  filled=true  line_length=10
+    /// E CUP で描き直し・右端が全角  abcdefghあ  filled=false line_length=9  WIDE_CHAR_SPACER
+    /// F 右端に届かない              abc         filled=false line_length=3
+    /// ```
+    ///
+    /// 限界は **A / E**（物理的には 10 桁とも埋まっているのに偽）。B だけ真になるのは
+    /// alacritty 自身が折り返して `WRAPLINE` を立てたからで、**器（tmux / psmux）が
+    /// `CUP` で描き直した行（= E）は救えない**。C / D / F は従来どおりで、
+    /// 全角が**途中**に在るだけなら列で正しく測れている（文字数で測る実装との差は
+    /// `visible_lines_filled_は折り返しを右端で見分ける` が押さえる）
+    #[cfg(unix)]
+    #[test]
+    fn visible_lines_filled_は行末の全角を取りこぼす() {
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::{Flags, LineLength};
+
+        /// 10 桁のペインへ 1 行だけ描く形
+        struct Form {
+            /// 形の名前（診断に出す）
+            name: &'static str,
+            /// 描く指令。**行末で出力を止める**（改行しない）
+            script: &'static str,
+            /// 描き終わりの目印（これが画面に出るまで待つ）
+            needle: &'static str,
+            /// 期待する画面テキスト（`visible_lines_filled()[0].0`）
+            text: &'static str,
+            /// 期待する `filled`（**A / E の false が限界**）
+            filled: bool,
+            /// 期待する `line_length()`
+            line_length: usize,
+            /// 右端セルが全角の後続セル（`WIDE_CHAR_SPACER`）か
+            spacer_at_edge: bool,
+        }
+
+        /// 幅。全角 1 つ（2 列）+ 半角 8 つでちょうど埋まる
+        const COLS: usize = 10;
+
+        let forms = [
+            Form {
+                name: "A 右端が全角・以降の出力なし",
+                script: "printf 'abcdefghあ'; sleep 30",
+                needle: "abcdefghあ",
+                text: "abcdefghあ",
+                filled: false,
+                line_length: 9,
+                spacer_at_edge: true,
+            },
+            Form {
+                name: "B 右端が全角・続きあり",
+                script: "printf 'abcdefghあxyz'; sleep 30",
+                needle: "xyz",
+                text: "abcdefghあ",
+                filled: true,
+                line_length: 10,
+                spacer_at_edge: true,
+            },
+            Form {
+                name: "C 右端が半角でちょうど埋まる",
+                script: "printf 'abcdefghij'; sleep 30",
+                needle: "abcdefghij",
+                text: "abcdefghij",
+                filled: true,
+                line_length: 10,
+                spacer_at_edge: false,
+            },
+            Form {
+                name: "D 途中に全角・右端は半角",
+                script: "printf 'あいうabcd'; sleep 30",
+                needle: "あいうabcd",
+                text: "あいうabcd",
+                filled: true,
+                line_length: 10,
+                spacer_at_edge: false,
+            },
+            Form {
+                // 器（tmux / psmux）の再描画を `CUP` で模した形。埋まっていた行を
+                // 描き直しても `WRAPLINE` は立たないので A と同じ穴に落ちる
+                name: "E CUP で描き直し・右端が全角",
+                script:
+                    "printf '0123456789\\n'; printf '\\033[1;1H'; printf 'abcdefghあ'; sleep 30",
+                needle: "abcdefghあ",
+                text: "abcdefghあ",
+                filled: false,
+                line_length: 9,
+                spacer_at_edge: true,
+            },
+            Form {
+                name: "F 右端に届かない",
+                script: "printf 'abc'; sleep 30",
+                needle: "abc",
+                text: "abc",
+                filled: false,
+                line_length: 3,
+                spacer_at_edge: false,
+            },
+        ];
+
+        for form in forms {
+            let (session, _rx) = TerminalSession::spawn(
+                COLS,
+                6,
+                SpawnOptions {
+                    command: Some(SpawnCommand {
+                        program: "/bin/sh".to_string(),
+                        args: vec!["-c".to_string(), form.script.to_string()],
+                    }),
+                    ..SpawnOptions::default()
+                },
+            )
+            .expect("PTY を張れる");
+            // 待ちは状態待ち（`state_wait_budget` + 尽きたらその場で panic。#1308 の作法）
+            i1387_wait_visible(&session, form.needle, form.name);
+            let child = session.child_pid();
+            let got = session.visible_lines_filled();
+            let (line_length, spacer_at_edge, edge_flags) = {
+                let term = session.term.lock();
+                let grid = term.grid();
+                assert_eq!(grid.columns(), COLS, "{}: 幅が {COLS} 桁でない", form.name);
+                let row = &grid[Line(0)];
+                let edge = &row[Column(COLS - 1)];
+                (
+                    row.line_length().0,
+                    edge.flags.contains(Flags::WIDE_CHAR_SPACER),
+                    format!("{:?}", edge.flags),
+                )
+            };
+            // 自分が張った PTY の子だけを倒す（名前一致の `pkill` は使わない）
+            drop(session);
+            if let Some(pid) = child {
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+            }
+            assert_eq!(
+                got[0].0, form.text,
+                "{}: 画面テキストが違う（形の前提が崩れている）: {got:?}",
+                form.name
+            );
+            assert_eq!(
+                line_length, form.line_length,
+                "{}: line_length が違う（alacritty の仕様が変わった? edge_flags={edge_flags}）",
+                form.name
+            );
+            assert_eq!(
+                spacer_at_edge, form.spacer_at_edge,
+                "{}: 右端の全角スペーサーの有無が違う（edge_flags={edge_flags}）",
+                form.name
+            );
+            assert_eq!(
+                got[0].1, form.filled,
+                "{}: filled が違う（line_length={line_length} edge_flags={edge_flags}）。\n\
+                 行末が全角の A / E で true になったなら**限界を直した**ので、\n\
+                 `visible_lines_filled` の doc の「既知の限界」と\n\
+                 `.agent/conventions.md` の #1283 節も同じコミットで直すこと: {got:?}",
+                form.name
+            );
+        }
     }
 
     /// スクロール中（`display_offset > 0`）でも `tail_lines` と
