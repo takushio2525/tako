@@ -20,6 +20,11 @@
 
 ---
 
+## 2026-09-11（#1314: psmux の conf を tmp → rename で差し替えるようにした）
+- `backend::psmux::ensure_conf` が `new-session -f` の直前に最終パスへ直書きしていた（#625 の機序③が psmux 側に残存）。`write_conf_in`（pid + 連番の tmp → rename・rename 失敗時は tmp を掃除）へ寄せ、tmux 側（#625）と同じ作法に揃えた。**内容が同じなら書かない**ので、2 回目以降の spawn は最終パスに触らない（Windows の `FILE_SHARE_DELETE` 依存の置換そのものを避ける）
+- A/B `TAKO_1314_LEGACY=1`（修正前の直書き）: 8 スレッド × 200 書き込みの再現テストが旧アーム **60/60 FAILED**（`len=0` / 短い本文が長い本文の先頭を潰した `len=55296`）→ 新アーム 0/60・負荷下（load 8 / 55〜60）0/50 × 2
+- **Windows CI で tako-core のテストが 1 件も走っていなかった**（`cargo test --workspace` は非ブロッキング + #583 で打ち切り）ので、#1282 と同じ形で `backend::psmux` の実行検査を blocking ステップとして追加。実機確認は Windows 機が offline のため Issue に手順を残した
+
 ## 2026-09-11（#1312: テスト本体が作る使い捨て dir を「スコープで消える器」へ寄せた）
 - #1296 の射程は**置き場を決める側**だけで、テストが個別に `temp_dir().join(…)` で作る使い捨ては残っていた（実測: `cargo test -p tako-core --lib` で 14 件 / `-p tako-cli -p tako-control --lib` で 31 件）。`tako_core::test_residue` に `ScratchDir`（スコープで消える）と `process_scratch`（プロセス寿命）を 1 実装し、親を `<TMPDIR>/tako-test-scratch-<pid>` 1 つへ畳んで #1296 の 2 段構え（atexit + 次回起動の pid 回収 + `tako test-residue`）にそのまま乗せた
 - 実測（空 TMPDIR の前後）: tako-core `--lib` **14 → 0**・全 target **16 → 0**・tako-cli + tako-control `--lib` **31 → 7**（残 7 は `dispatch.rs` の `tako-mcp-test-*` = 別 worker が編集中で射程外・#1312 にコメント）。libtest が `process::exit` する失敗回でも 0、SIGKILL 相当の残骸は次回起動で掃かれ、生きている pid の置き場は残る
