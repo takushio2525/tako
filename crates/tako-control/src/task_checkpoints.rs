@@ -282,14 +282,10 @@ fn checkpoint_to_json(c: &TaskCheckpoint) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("tako-task-cp-test-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// テスト 1 本ぶんの使い捨ての置き場（**スコープを抜けると消える** = #1312）
+    fn temp_dir(tag: &str) -> tako_core::test_residue::ScratchDir {
+        tako_core::test_residue::ScratchDir::new(&format!("task-cp-{tag}"))
     }
 
     #[test]

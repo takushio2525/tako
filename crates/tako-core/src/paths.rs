@@ -177,6 +177,14 @@ pub fn verification_agent_home() -> PathBuf {
     DIR.get_or_init(|| {
         let dir = std::env::temp_dir().join(format!("tako-agent-config-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
+        // **テストプロセスのときだけ**終了時に自分の dir を消す（#1312）。
+        // #1296 がここを自動掃除の対象から外したのは、これを作るのが
+        // テストバイナリだけでなく製品バイナリの検証起動（`TAKO_ISOLATED` /
+        // `TAKO_SELF_TEST`）でもあるため。`is_test_process` で絞れば
+        // 製品の挙動は 1 ビットも変わらず、`cargo test` の残骸だけが消える
+        if is_test_process() {
+            crate::test_residue::arm_self_cleanup(&dir);
+        }
         dir
     })
     .clone()

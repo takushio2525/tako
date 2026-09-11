@@ -950,7 +950,8 @@ mod tests {
             "psmux".into(),
             VERIFIED_VERSION.into(),
             "tako-unit".into(),
-            std::env::temp_dir().join(format!("tako-psmux-unit-{}", std::process::id())),
+            // 器の置き場はプロセスの終わりに親ごと消える（#1312）
+            crate::test_residue::process_scratch("psmux-unit"),
         )
     }
 

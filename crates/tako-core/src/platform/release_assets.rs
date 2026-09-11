@@ -705,9 +705,9 @@ mod tests {
     /// ユーザーのホームへこれを撒かないよう、置き場を一時ディレクトリへ倒し
     /// テレメトリと更新確認も切る（unix は `XDG_CACHE_HOME`、Windows は `LOCALAPPDATA`）
     fn pwsh_command(bin: &str) -> std::process::Command {
-        let cache =
-            std::env::temp_dir().join(format!("tako-test-pwsh-cache-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&cache);
+        // 子プロセス（pwsh）が使うので「スコープ」が無い。プロセスの終わりに
+        // 親（test_residue::scratch_root）ごと消える置き場を使う（#1312）
+        let cache = crate::test_residue::process_scratch("pwsh-cache");
         let mut cmd = std::process::Command::new(bin);
         if crate::paths::issue944_legacy() {
             return cmd; // A/B: 旧挙動（ユーザーの ~/.cache/powershell へ撒く）
