@@ -120,7 +120,7 @@ Recover by `kind` (also in `tako_orchestrator_worker_status` as
   `resume`**: it surfaces as `API Error: Unable to connect to API (ENOTFOUND /
   ECONNRESET)`, so a continue nudge looks like the right move and tako used to
   classify it as `api_error` — but not one request gets through until a human
-  re-authenticates (measured three times in 2026-08; every time the master span
+  re-authenticates (measured three times in 2026-08; every time the master spun
   in circles). So do NOT nudge, do NOT wait for a reset, and do NOT close →
   respawn. **Ask the user to run `/login` in that worker's pane** — tako never
   runs it for them, it needs a browser — and **name the account**:
