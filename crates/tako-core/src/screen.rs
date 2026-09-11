@@ -393,6 +393,21 @@ pub enum InputStyle {
     None,
 }
 
+impl InputStyle {
+    /// 入力欄に**人が打った下書き**があるか（#1297）。
+    ///
+    /// 「空でない」と「下書きがある」は別物で、claude は AI のゴースト提案を
+    /// dim で入力欄へ描く（文面は任意なので文字列リストでは網羅できない）。
+    /// 下書きと言えるのは通常輝度の文字が 1 つでもあるとき = `User` / `Mixed` だけ。
+    ///
+    /// **この述語をここ 1 箇所に置く**のは、同じ `matches!(style, User | Mixed)` が
+    /// 判定ごとに散ると「片方だけ Ghost を下書きに数える」形で安全側が崩れるため
+    /// （#1297 はまさに、属性を見る判定と見ない判定が並存していたことで起きた）
+    pub fn is_user_draft(self) -> bool {
+        matches!(self, Self::User | Self::Mixed)
+    }
+}
+
 /// Claude TUI 入力行の分析結果
 #[derive(Debug, Clone)]
 pub struct InputStatus {
@@ -779,6 +794,27 @@ mod tests {
         let s = make_screen("❯ \x1b[2mghost\x1b[0m real".as_bytes());
         let status = analyze_input_line(&s).expect("❯ 行がある");
         assert_eq!(status.style, InputStyle::Mixed);
+    }
+
+    /// #1297: 「人が打った下書きがあるか」の述語。**通常輝度が 1 文字でもあるか**が境界で、
+    /// dim だけ（= AI のゴースト提案）と空欄はどちらも下書きではない
+    #[test]
+    fn 下書き述語はghostと空を下書きに数えない() {
+        assert!(InputStyle::User.is_user_draft());
+        assert!(InputStyle::Mixed.is_user_draft());
+        assert!(!InputStyle::Ghost.is_user_draft());
+        assert!(!InputStyle::None.is_user_draft());
+        // 実画面から採った分類とも一致する（述語と分析器が食い違わない）
+        for (bytes, want) in [
+            ("❯ \x1b[2mmerge the PR once CI is green\x1b[0m", false),
+            ("❯ draft by human", true),
+            ("❯ \x1b[2mghost\x1b[0m real", true),
+            ("❯ ", false),
+        ] {
+            let s = make_screen(bytes.as_bytes());
+            let status = analyze_input_line(&s).expect("❯ 行がある");
+            assert_eq!(status.style.is_user_draft(), want, "{bytes:?}");
+        }
     }
 
     #[test]

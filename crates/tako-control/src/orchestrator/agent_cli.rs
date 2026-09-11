@@ -515,7 +515,8 @@ pub fn detect_execution_refused(agent: WorkerAgent, output: &str) -> Option<Agen
         return None;
     }
     let patterns = execution_refused_patterns(agent_of(agent));
-    if patterns.is_empty() {
+    let injected = injected_refusal_pattern();
+    if patterns.is_empty() && injected.is_none() {
         return None;
     }
     // 末尾 20 行だけを見る（`detect_launch_failure` と同じ約束。
@@ -526,8 +527,24 @@ pub fn detect_execution_refused(agent: WorkerAgent, output: &str) -> Option<Agen
         .any(|l| {
             let lower = l.to_ascii_lowercase();
             patterns.iter().any(|p| lower.contains(p))
+                || injected.as_deref().is_some_and(|p| lower.contains(p))
         })
         .then_some(AgentCliProblem::ExecutionRefused)
+}
+
+/// #1295 の**検証用の注入口**。`TAKO_1295_INJECT_PATTERN=<小文字の文字列>` を置くと、
+/// 実採取していない系統（claude / codex）にもその 1 語だけを判定パターンとして足す。
+///
+/// なぜ要るか: #1295 のゲートの穴（claude では `agent_work_started` が常に `None` なので
+/// 「作業ゼロ」と読まれる）は、`execution_refused_patterns(Claude)` が空なあいだは
+/// **画面から発火しない**ので end-to-end で再現できない。文言を推測で足すのは
+/// #982 の規約違反なので、代わりに**テストからだけ**足せる口を開けてある。
+/// **env が無ければ 1 文字も足さない**ので製品挙動は変わらない
+fn injected_refusal_pattern() -> Option<String> {
+    std::env::var("TAKO_1295_INJECT_PATTERN")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
 }
 
 /// #1034 の A/B 用の env。`TAKO_1034_LEGACY=1` で**同一バイナリのまま**分類をやめ、
