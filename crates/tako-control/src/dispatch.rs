@@ -16621,6 +16621,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1398 の段 3: 開く側は**リンクを辿る**（`Path::is_file()` + 前段の
+    /// `canonicalize`）。ファイルへのリンクはそのまま開け、ディレクトリへの
+    /// リンクは「ファイルではない」で弾かれる。
+    ///
+    /// ツリーはこの弾かれる経路へ**来なくなった**（`filetree.rs` が種別を
+    /// リンク先で決めて toggle 経路へ回す = 同ファイルの
+    /// `ディレクトリへのリンクは開く経路へ行かない` が固定する）。ここは
+    /// **開く側の判定を変えていない**ことの固定
+    #[cfg(unix)]
+    #[test]
+    fn open_fileはリンクを辿って種別を判定する() {
+        let dir =
+            std::env::temp_dir().join(format!("tako-dispatch-open-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::fs::write(dir.join("real/a.rs"), "fn main() {}").unwrap();
+        std::os::unix::fs::symlink(dir.join("real/a.rs"), dir.join("file-link.rs")).unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("dir-link")).unwrap();
+
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let open = |host: &mut MockHost, path: std::path::PathBuf| {
+            dispatch(
+                host,
+                Request::OpenFile {
+                    pane: Some(root),
+                    path: path.display().to_string(),
+                    mode: None,
+                    direction: None,
+                    focus: None,
+                    new_tab: false,
+                },
+                PaneOrigin::User,
+            )
+        };
+        assert!(
+            open(&mut host, dir.join("file-link.rs")).is_ok(),
+            "ファイルへのリンクが開けない"
+        );
+        let err = open(&mut host, dir.join("dir-link")).unwrap_err();
+        let message = format!("{err:?}");
+        assert!(
+            message.contains("ファイルではない"),
+            "ディレクトリへのリンクの理由が変わっている: {message}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn preview編集の開始適用保存を同じdispatchで操作できる() {
         let dir =

@@ -117,6 +117,18 @@ pub fn note_external_change() -> &'static str {
     )
 }
 
+/// ツリーの展開をシンボリックリンクの循環で打ち切ったときの説明行（#1398）。
+///
+/// #1398 でリンクを辿るようになり、`a/link -> a` のように**同じ実体へ戻る展開**が
+/// 起こり得るようになった。打ち切りを黙って行うと「押しても何も出ない」= #1398 で
+/// 直した症状に戻るので、行として理由を出す。差し込む `real` は言語非依存のパス
+pub fn note_symlink_loop(real: &str) -> String {
+    tr!(
+        format!("シンボリックリンクの循環のため展開を打ち切りました（同じ場所: {real}）"),
+        format!("Stopped expanding: symlink loops back to {real}")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests_support;
@@ -260,6 +272,8 @@ mod tests {
                 rename_placeholder().to_string(),
                 note_save_before_mode_switch().to_string(),
                 note_external_change().to_string(),
+                // #1398: 打ち切りの説明（差し込むパスは言語非依存）
+                note_symlink_loop("/tmp/x"),
             ]
         });
     }

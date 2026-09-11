@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-12（#1389: visible_lines_filled の「行末が全角」の取りこぼしを限界として固定した）
-- `line_length()` は末尾から `cell.c != ' '` を探すので全角の後続セル（`WIDE_CHAR_SPACER`）を空きと数える = 行末が全角の行は右端まで埋まっていても `filled=false`。挙動は変えず、doc の「既知の限界」+ `.agent/conventions.md` #1283 節（兄弟実装 `combined_screen_text` と**同じ穴**であること）+ 10 桁の実 PTY で 6 形を採る単体テストで固定した
-- 実測（10 桁）: A 行末が全角・以降の出力なし = `line_length=9 filled=false WIDE_CHAR_SPACER` / E `CUP` で描き直し = 同じ / B 続きあり = `WRAPLINE` が立って 10・true / C・D・F は従来どおり。現行の消費者 `find_exit_marker` は全 ASCII のマーカー断片しか見ないので実害は無い（(b) 判定の修正は別 Issue 候補）
-- 番犬 `issue1389_filled_wide_limit_watchdog` 5 本が doc / 規約 / 固定テストの欠落を file:line で名指し（注入 4 通りで確認）。製品コードの差分は doc コメントのみ・削除 0 行 = **install 不要**
-
 ## 2026-09-12（#1367: 器なしペインの busy を close 確認 / GUI 判定 / agent_running へ届けた）
 - #372 で走査は器なしペインも数えていたのに**引く側**が器のセッション名（`busy_sessions`）を見たままで、tmux 未導入 / persist OFF（= cask の既定）では close 確認（#566）が出ず・`busy_children`（#694）が false でスターターが被り・`agent_running` も false だった。問う口を `RunningChildrenScanState::is_pane_busy` の 1 実装へ寄せ、3 経路を `TakoApp::pane_has_busy_children` から通した（旧キャッシュ `busy_backend_sessions` はフィールドごと削除）
 - 隔離 GUI（tako-vd・persist OFF・実 Cmd+W = `CGEventPostToPid`）の A/B: legacy（`TAKO_1367_LEGACY=1`）は `busy_agents=1` なのに `busy_children=false` / `display=starter` / **確認なしで即 close**、新は `busy_children=true`（1.0s）/ `terminal` / ダイアログが出てペインが残る。停止後は確認なし・承認経路の監査ログ（`close:kbd`）も器なしで残る
@@ -64,3 +59,8 @@
 - 受信ループを `serve_http_requests` へ切り出し、`Arc<tiny_http::Server>` を既定 4 本（`TAKO_REMOTE_HTTP_WORKERS` で 1..=32）のワーカーが recv する形へ。合流は `thread::scope`（忘れられない）・1 本の panic は `catch_unwind` で監査ログへ・recv 破損は全員で降りる。daemon → app の IPC は `with_app_ipc` の 1 実装が往復の間ロックを握る（呼び出し 4 か所を集約）。波及で `append_audit` を 1 行 1 write へ（書く者が増えたので `writeln!` だと行が混ざる）
 - 隔離 daemon（偽 tailscale の whois 3 秒・本番 pid 64092 は不可侵）の A/B: 修正前 B = **2.71 秒** → 新 **0.0004 秒**（A は 3.03 秒のまま）。`TAKO_1403_LEGACY=1` / `TAKO_REMOTE_HTTP_WORKERS=1` はどちらも 2.72 秒で旧挙動を再現。飽和の限界も実測（4 本同時で health 2.51 秒・6 本で溢れた 2 本が 6.04 秒）
 - 番犬 `issue1403_http_workers_watchdog` 7 本 + 単体 6 本。注入 9 通りで file:line 名指し FAILED（IPC は `left: 4 / right: 1`）。**mid-file の `#[cfg(test)]` は禁止**（#1401 番犬の走査範囲が切れる）・`LEGACY_ARM` マーカーは実時間アサート用なので付けない。workspace 4487 passed 0 failed × 5・check-windows error 0
+
+## 2026-09-12（#1398: ディレクトリへのシンボリックリンクがファイル扱いになるのを直した）
+- 種別を「**辿った先**」で決める 1 実装（`filetree::entry_is_dir`。リンクのときだけ追加 `metadata`）へ寄せ、開く側（`OpenFile` の `is_file()` / `open_plan::route`）と向きを揃えた。辿って初めて起こる循環は `collect_rows` が canonical パスの照合で打ち切り、**打ち切りを行として見せる**（`RowNote::Error`・描画はリモート行と同じ `render_note_row` の 1 実装）
+- 修正前ソースの実測: `link` 行が `("link", 1, is_dir=false)` で `toggle_dir` しても増えない → 修正後は展開でき `inner.txt` が depth 2 に出る。実注入の A/B は `file_type()` へ戻すと番犬が `filetree.rs:699` / `:690` を名指し FAILED、照合を落とすと祖先リンクの 2 周目（depth 3 に `README.md`）が出て loop テスト 2 本が FAILED
+- 単体 10 本追加（切れたリンク / 相対 / `..` / 相互 ELOOP / 往復 / 500 件超 / git のしるし / 開く経路）+ 番犬 3 本（注入 5 通り）。workspace 4488 passed 0 failed・clippy 両宇宙 0・check-windows error 0。**install 要**
