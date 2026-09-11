@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-11（#1353 / #1364: セルフテスト 3 項目の固定予算を状態待ちへ、番犬を状態読みへ広げた）
-- 項目 22（固定 800ms）/ 44（固定 1 秒）/ 63（固定 6 秒窓 + 40 秒）を `wait_for_app_state` + `cli_state_budget` へ。**項目 63 の真因は待ち不足ではなく証拠源の取り違え + 再描画の不発**（旧は描画を `focused_pane()` で見て分割元で真になる偽陽性 = legacy 実測 `pane=Some(2)`。新ペインは誰も汚さないと `AnyView::cached` のまま一度も描かれず、シェルが 1 行も出さない）→ 作った ID のペイン + `wait_for_drawn_state`（毎周期 notify + draw）
-- 番犬 `打ち込んだcliの結果を固定予算で待っていない` を追加（アンカー = 手前の `type_text` + `{cli}`）。修正前ソースで 3 項目を file:line 名指し（`38244` / `39998` / `41809`）。同型 16 件は `KNOWN_FIXED_CLI_WAITS` で段階導入 = #1375 で空にする
-- 実測: 高負荷 4 回（load 73〜142）で 3 項目 0 FAILED・うち 2 回は完走。**人工負荷では旧も落ちない**（`yes` 68 本 load 134 で `waited=0.1s budget=0.8s`）ので注入で確定: `late` で旧 3/3 FAILED・新は待って通る / `never:44` は新でも FAILED
-
 ## 2026-09-11（#1362: 全選択 Cmd+A がターミナルでは効かないことを実測し docs を実態へ寄せた）
 - 隔離 GUI（tako-vd・`CGEventPostToPid`）で確定: ターミナルの cmd+A は選択を作らず PTY にも届かない（`abc` に cmd+A → `x` で `abcx` 3/3。本物の Ctrl+A は `xabc` 3/3 = 検出力あり）。cmd+A → cmd+C も sentinel のまま 3/3
 - 同じ経路でプレビュー本文 3/3・編集中バッファ 3/3 は全文が入るので「端末には実装が無い」が確定。表の行へ効く先を書き注記を 1 つ追加（コード変更なし = install 不要。案 (b) = ターミナルの全選択は別 Issue 候補として Issue へ残した）
@@ -59,6 +54,7 @@
 - `ScreenLine` の旗は #787 以降 production の読み手が 0（grep で確定）なのに毎行 `windows(2)` を走らせ、doc だけが「描画で使う」と言っていた。フィールドと書き手 4 か所（`screen.rs` / `links.rs` ×2 / `terminal_grid.rs`）を落とし、assert 3 件は「全角のぶん `cell_cols` が 2 列飛ぶ」へ置き換え
 - 修正前ソースの実測: 右端だけが全角の行は旗が **false**（`windows(2)` 版の構造的な見落とし）/ 途中に全角なら true。`text` / `cell_cols` は前後で完全一致（右端全角・空行・全角のみ・途中全角の 4 ケースを `screen_from_lines` で固定）
 - 番犬 `issue1388_has_wide_watchdog` 6 本（識別子の再登場 / 旗を組む形 / フィールド指紋 + 注入 3）。修正前ソースで 3 本が file:line 名指し FAILED（`screen.rs:55` / `476` / `481`・`links.rs:122` / `127`・`terminal_grid.rs:627`）
+
 ## 2026-09-12（#1389: visible_lines_filled の「行末が全角」の取りこぼしを限界として固定した）
 - `line_length()` は末尾から `cell.c != ' '` を探すので全角の後続セル（`WIDE_CHAR_SPACER`）を空きと数える = 行末が全角の行は右端まで埋まっていても `filled=false`。挙動は変えず、doc の「既知の限界」+ `.agent/conventions.md` #1283 節（兄弟実装 `combined_screen_text` と**同じ穴**であること）+ 10 桁の実 PTY で 6 形を採る単体テストで固定した
 - 実測（10 桁）: A 行末が全角・以降の出力なし = `line_length=9 filled=false WIDE_CHAR_SPACER` / E `CUP` で描き直し = 同じ / B 続きあり = `WRAPLINE` が立って 10・true / C・D・F は従来どおり。現行の消費者 `find_exit_marker` は全 ASCII のマーカー断片しか見ないので実害は無い（(b) 判定の修正は別 Issue 候補）
@@ -68,3 +64,8 @@
 - #372 で走査は器なしペインも数えていたのに**引く側**が器のセッション名（`busy_sessions`）を見たままで、tmux 未導入 / persist OFF（= cask の既定）では close 確認（#566）が出ず・`busy_children`（#694）が false でスターターが被り・`agent_running` も false だった。問う口を `RunningChildrenScanState::is_pane_busy` の 1 実装へ寄せ、3 経路を `TakoApp::pane_has_busy_children` から通した（旧キャッシュ `busy_backend_sessions` はフィールドごと削除）
 - 隔離 GUI（tako-vd・persist OFF・実 Cmd+W = `CGEventPostToPid`）の A/B: legacy（`TAKO_1367_LEGACY=1`）は `busy_agents=1` なのに `busy_children=false` / `display=starter` / **確認なしで即 close**、新は `busy_children=true`（1.0s）/ `terminal` / ダイアログが出てペインが残る。停止後は確認なし・承認経路の監査ログ（`close:kbd`）も器なしで残る
 - 番犬 5 本 + A/B + 単体 5 本 + セルフテスト項目 73g（legacy アームで `waited=93.1s busy=false` の FAILED を実測）。注入 5 通りが file:line 名指し。**チャットの列挙（`collect_chat_targets`）は器つき前提のまま**なので器なしの会話表示は別 Issue
+
+## 2026-09-12（#1004: リモート / SSH の手順を新 topic `remote` へ明文化した）
+- 手順の全文を `guides/remote.md`（6,903 B）へ置き、prompt 側は master の topic 表 1 行 + solo の `### Remote / SSH` 節だけ（`tako context-budget` 実測 master +83 B / solo +242 B = 依頼上限 500 B 内）。移送でない本文は fixture へ宣言する道（#1154 の `guides_added_after_1154.md`）に乗せた
+- 実測で Issue 案と食い違った点を本文へ反映: ①`ssh_config` は **`Include` を読まない**（ssh 自身は読む = 一覧に出ないホストへ名前指定で繋がる）②config の `Port` が 22 以外だと **tako 自身が開いたペインも自動検知に見送られる**（`-p` を渡すため）。失敗 5 種（unresolved / refused / auth / hostkey / conflict 経路）を実 sshd 相手に end-to-end で確認
+- 番犬 `remote_guide.rs` 7 本（topic 消失 / master・solo のトリガー消失 / トリガーの肥大 / 手順の prompt インライン化）を注入 5 通りで file:line 名指し FAILED。隔離 solo の実会話は `tako_ssh_hosts` → `tako_orchestrator_guide{topic:"remote"}` → `remote_folder ls` → 接続情報の確認要求へ到達
