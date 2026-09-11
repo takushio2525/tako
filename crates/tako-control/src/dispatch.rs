@@ -12530,11 +12530,14 @@ fn tree_git_status_payload(tab: u64, roots: &[PathBuf], limit: Option<usize>) ->
     let map = tako_core::git_tree::scan(roots);
     let limit = limit.unwrap_or(DEFAULT_LIMIT);
     let all = map.sorted_entries();
-    let total = all.len();
-    let truncated = total > limit;
+    // #1402: 「何件見せたか / 総数 / 切り詰めたか」の判断はサイドバーの行
+    // （`filetree::read_dir_sorted`）と**同じ 1 実装**から出す。ここで
+    // `total > limit` を手で書き直すと、画面と応答のどちらかだけが申告する
+    // 非対称（#1402 の症状そのもの）へ戻る
+    let cut = tako_core::sidebar::Truncation::new(all.len(), limit);
     let entries: Vec<Value> = all
         .into_iter()
-        .take(limit)
+        .take(cut.shown)
         .map(|(path, status)| {
             json!({
                 "path": path.display().to_string(),
@@ -12565,8 +12568,8 @@ fn tree_git_status_payload(tab: u64, roots: &[PathBuf], limit: Option<usize>) ->
         "roots": roots.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
         "repos": repos,
         "entries": entries,
-        "total": total,
-        "truncated": truncated,
+        "total": cut.total,
+        "truncated": cut.truncated(),
     })
 }
 

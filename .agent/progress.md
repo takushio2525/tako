@@ -54,3 +54,8 @@
 - 範囲取りを「最初の `#[cfg(test)]` で切る」から「**テスト領域だけ空白へ潰す**」1 実装（`common/production_range.rs`）へ。バイト長と行番号が保たれるので `file:line` がずれず、途中のテスト用ヘルパでも本番コードが消えない。下限（既定 30%）を割ったら潰した先頭の領域を名指して落ちる
 - 実測 A/B: `remote.rs` の検査対象の**後ろ**へ 4 行のヘルパを注入すると legacy は 5,903 → 3,124 行（70.7% → 37.1%）へ縮んで **7 本とも緑のまま**・**手前**へ注入すると「改名したら番犬も直す」で 6 本 FAILED（誤診）。新は両方 8 本緑・本番 70.7% を維持。縮める注入では `remote.rs:1505 走査範囲が全体の 18.3% まで縮んだ（下限 30.0%）` で FAILED
 - 棚卸しで 8 本を寄せた（`platform_parity` は 4 クレートの src を丸ごと走査していて `orchestrator/mod.rs` を 1.5%・`mcp/mod.rs` を 10.5% しか見ていなかった）。番犬 `issue1420_production_range_watchdog` 12 本 + 実ファイル 254 本の不変条件。寄せられない 4 件（製品コード内の番犬）は `KNOWN_COARSE` へ件数つきで宣言。**テストのみ = install 不要**
+
+## 2026-09-12（#1402: ツリーが上限超過ぶんを黙って捨てるのを直した）
+- `read_dir_sorted` の戻り値を `DirListing`（entries + 切り詰め + 読み取り失敗）へ広げ、切り詰めと「読めない」を #1398 の器（`RowNote` / `render_note_row`）の行として出した。判断は CLI の `tree git-status` と同じ 1 実装 `tako_core::sidebar::Truncation`（`total > limit` の手書きを両側から排除）
+- A/B（`TAKO_1402_LEGACY=1`）: legacy = 560 件で **行 501 / note 0**（Issue の実測そのもの）・権限なしが空と同じ → 新 = 行 502 で `Truncated{shown:500,total:560}`・読めないは Error 行。番犬 3 本（注入 6 通りで file:line 名指し）+ 単体 8 本
+- 次: 上限そのもの（500）の見直しは別 Issue（暴走防止として妥当なことは perf 実測済み）

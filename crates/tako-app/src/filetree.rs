@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use tako_core::remote_fs::{RemoteEntry, RemoteFolder, RemoteOrigin, RemoteRef};
+use tako_core::sidebar::Truncation;
 
 /// 1 ディレクトリの最大表示エントリ数（巨大ディレクトリの暴走防止）
 const MAX_ENTRIES: usize = 500;
@@ -60,6 +61,27 @@ pub enum RowNote {
     Error(String),
     /// 空ディレクトリ
     Empty,
+    /// 表示を上限（[`MAX_ENTRIES`]）で切り詰めた（#1402）。
+    /// **失敗ではない**ので描画は red ではなく muted（`sidebar::render_note_row`）
+    Truncated { shown: usize, total: usize },
+}
+
+/// 1 ディレクトリの読み取り結果（#1402）。
+///
+/// 以前は `Vec<Entry>` だけを返していたので、**上限で切り詰めた**ことと
+/// **読めなかった**ことが呼び出し側に届かず、どちらも「空のディレクトリ」と
+/// 同じ見え方になっていた（機械可読側の `tree git-status` は `truncated` を
+/// 申告するのに画面だけ黙る = #1402 の非対称）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirListing {
+    /// 表示するエントリ（上限で切り詰めたあと）
+    pub entries: Vec<Entry>,
+    /// 上限で切り詰めた事実。判断は CLI / MCP（`tree git-status` の `truncated`）と
+    /// **同じ 1 実装**（`tako_core::sidebar::Truncation`）
+    pub truncation: Truncation,
+    /// `read_dir` が失敗した理由（`None` = 読めた）。
+    /// **空ディレクトリと区別する**ために持つ（権限なしを黙って空にしない）
+    pub error: Option<String>,
 }
 
 /// 1 リモートディレクトリの読み込み状態
@@ -79,7 +101,8 @@ pub struct FileTree {
     roots: Vec<PathBuf>,
     /// 展開中ディレクトリ（ルート自身も含む。絶対パスがキーなのでルート間で共有できる）
     expanded: HashSet<PathBuf>,
-    cache: HashMap<PathBuf, Vec<Entry>>,
+    /// ディレクトリごとの読み取り結果（#1402 で `Vec<Entry>` から広げた）
+    cache: HashMap<PathBuf, DirListing>,
     /// git status キャッシュ（#1009。絶対パス → 状態。ディレクトリ伝播込み）
     git_cache: TreeGitMap,
     /// rows() の結果キャッシュ（状態変化時に無効化し、render での再構築を回避する）
@@ -288,10 +311,10 @@ impl FileTree {
         if depth >= MAX_DEPTH {
             return;
         }
-        let Some(entries) = self.cache.get(dir) else {
+        let Some(listing) = self.cache.get(dir) else {
             return;
         };
-        for entry in entries {
+        for entry in &listing.entries {
             // #550: ドット始まりは既定で隠す（ルート見出しは対象外 = ユーザーが
             // 明示的に開いた `~/.claude` 等は隠さない）
             if !self.show_hidden && is_hidden_name(&entry.name) {
@@ -324,6 +347,12 @@ impl FileTree {
             chain.push(real);
             self.collect_rows(&entry.path, depth + 1, chain, rows);
             chain.pop();
+        }
+        // #1402: 「読めなかった」「上限で切り詰めた」を**このディレクトリの最後の行**
+        // として見せる（黙って捨てると「ファイルが存在しない」ように見える）。
+        // リモート行（#919）・リンクの打ち切り（#1398）と同じ器・同じ描画経路
+        if let Some(note) = local_note_of(listing) {
+            rows.push(local_note_row(dir, depth, note));
         }
     }
 
@@ -592,10 +621,10 @@ impl FileTree {
     }
 
     /// background executor の結果を適用する。変化があれば true
-    pub fn apply_refresh(&mut self, results: Vec<(PathBuf, Option<Vec<Entry>>)>) -> bool {
+    pub fn apply_refresh(&mut self, results: Vec<(PathBuf, Option<DirListing>)>) -> bool {
         let mut changed = false;
-        for (dir, entries) in results {
-            if let Some(fresh) = entries {
+        for (dir, listing) in results {
+            if let Some(fresh) = listing {
                 if self.cache.get(&dir) != Some(&fresh) {
                     self.cache.insert(dir, fresh);
                     changed = true;
@@ -613,8 +642,9 @@ impl FileTree {
 }
 
 /// ディレクトリ列をスキャンする（background executor で呼べる純粋 I/O）。
-/// 存在しないディレクトリは None を返す
-pub fn scan_dirs(targets: &[PathBuf]) -> Vec<(PathBuf, Option<Vec<Entry>>)> {
+/// 存在しないディレクトリは None を返す（**読めないだけ**のディレクトリは
+/// `Some` で理由つき = #1402。消滅とは扱いが違う）
+pub fn scan_dirs(targets: &[PathBuf]) -> Vec<(PathBuf, Option<DirListing>)> {
     targets
         .iter()
         .map(|dir| {
@@ -633,7 +663,60 @@ pub fn is_hidden_name(name: &str) -> bool {
     name.starts_with('.')
 }
 
-/// 展開の打ち切りを**行として見せる**情報行（#1398）。
+/// このディレクトリについて出す情報行（#1402）。`None` = 出すものが無い。
+///
+/// 読めなかったことを先に出す（切り詰めは読めたときだけ起こるので同時には立たない）。
+/// **空ディレクトリには何も出さない**: ローカル行に `RowNote::Empty` を足すと
+/// 空フォルダ全部の見え方が変わる = この Issue の範囲を超える（リモート行が
+/// `Empty` を出すのは、読み込みが非同期で「待っている / 空だった」の区別が
+/// 必要なため）。区別すべきは「読めなかった」と「空」で、それは Error 行で足りる
+fn local_note_of(listing: &DirListing) -> Option<RowNote> {
+    if legacy_1402() {
+        return None;
+    }
+    if let Some(err) = &listing.error {
+        return Some(RowNote::Error(crate::ui_text::sidebar::note_read_failed(
+            err,
+        )));
+    }
+    if listing.truncation.truncated() {
+        return Some(RowNote::Truncated {
+            shown: listing.truncation.shown,
+            total: listing.truncation.total,
+        });
+    }
+    None
+}
+
+/// ローカル行の情報行（押せない行）。描画はリモート行・リンクの打ち切りと
+/// 同じ 1 実装（`sidebar::render_note_row`）を通る
+fn local_note_row(path: &Path, depth: usize, note: RowNote) -> Row {
+    Row {
+        entry: Entry {
+            // 行の同定にだけ使う（押せない行なので FS へは渡らない）
+            path: path.to_path_buf(),
+            // 表示は note が持つ（名前を入れると実在の行のように見える）
+            name: String::new(),
+            is_dir: false,
+        },
+        depth,
+        expanded: false,
+        root: false,
+        git_status: None,
+        remote: None,
+        note: Some(note),
+    }
+}
+
+/// #1402 の A/B。`TAKO_1402_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
+/// （切り詰めたぶんと読めなかった事実を行に出さない = 「黙って捨てる」の再現）
+fn legacy_1402() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_1402_LEGACY").map(|v| v == "1") == Ok(true))
+}
+
+/// 展開の打ち切りを**行として見せる**情報行（#1398。行の形は
+/// [`local_note_row`] と同じで、こちらは理由の組み立てを持つ）。
 ///
 /// リンクを辿るようになった結果、同じ実体へ戻る展開が起こり得る。黙って空にすると
 /// 「押しても何も出ない」= #1398 で直した症状そのものに戻るので、理由と戻り先の実体を
@@ -686,10 +769,25 @@ fn entry_is_dir(path: &Path, file_type: &std::fs::FileType) -> bool {
 }
 
 /// ディレクトリを読んで「ディレクトリ先・名前（大文字小文字無視）順」に並べる。
-/// 読めない場合は空（権限・消滅は正常系として無害に劣化）
-fn read_dir_sorted(path: &Path) -> Vec<Entry> {
-    let Ok(reader) = std::fs::read_dir(path) else {
-        return Vec::new();
+///
+/// #1402: 結果は `Vec<Entry>` ではなく [`DirListing`] を返す。**切り詰めた**ことと
+/// **読めなかった**ことは呼び出し側（描画）が知らなければ行に出せず、どちらも
+/// 「空のディレクトリ」と同じ見え方になる（ユーザーには「ファイルが存在しない」に
+/// 見える = #1402 の実害。`conventions.md`「弾いたら黙って捨てない」）。
+///
+/// 切り詰めは `sort_by` の**あと**なので、サブディレクトリが上限ぶんあるディレクトリでは
+/// ファイルが 1 つも残らない（= 総数を添えて申告する意味がここにある）。
+fn read_dir_sorted(path: &Path) -> DirListing {
+    let reader = match std::fs::read_dir(path) {
+        Ok(reader) => reader,
+        Err(err) => {
+            // 権限なし・消滅を**空と区別して**返す（行として見せるのは呼び出し側）
+            return DirListing {
+                entries: Vec::new(),
+                truncation: Truncation::default(),
+                error: Some(err.to_string()),
+            };
+        }
     };
     let mut entries: Vec<Entry> = reader
         .flatten()
@@ -705,8 +803,13 @@ fn read_dir_sorted(path: &Path) -> Vec<Entry> {
             .cmp(&a.is_dir)
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
-    entries.truncate(MAX_ENTRIES);
-    entries
+    let truncation = Truncation::new(entries.len(), MAX_ENTRIES);
+    entries.truncate(truncation.shown);
+    DirListing {
+        entries,
+        truncation,
+        error: None,
+    }
 }
 
 #[cfg(test)]
@@ -733,6 +836,15 @@ mod tests {
         std::fs::write(dir.join("README.md"), "x").unwrap();
         std::fs::write(dir.join("src/main.rs"), "x").unwrap();
         dir
+    }
+
+    /// 中身を自分で作る空の使い捨てディレクトリ（件数を数える検査用。#1402）。
+    ///
+    /// 上の `fixture` は #1312 より前の書き方（作って最後に自分で消す = **panic で
+    /// 落ちた回は残る**）。新しいテストは #1312 の器を使う: スコープを抜けた時点で
+    /// 消え、`Drop` は巻き戻しでも走るので落ちた回も残骸を出さない
+    fn empty_scratch(tag: &str) -> tako_core::test_residue::ScratchDir {
+        tako_core::test_residue::ScratchDir::new(&format!("filetree-{tag}"))
     }
 
     /// (name, depth, root) のタプル列に写す（検証用）
@@ -835,11 +947,12 @@ mod tests {
         }
 
         let t0 = Instant::now();
-        let entries = read_dir_sorted(&big);
+        let listing = read_dir_sorted(&big);
         eprintln!(
-            "[perf] read_dir_sorted 5000 エントリ: {:?}（{} 行に切り詰め）",
+            "[perf] read_dir_sorted 5000 エントリ: {:?}（{} 行に切り詰め / 全 {} 件）",
             t0.elapsed(),
-            entries.len()
+            listing.entries.len(),
+            listing.truncation.total
         );
 
         // 実リポジトリ相当: tako リポジトリルートを root に、複数ディレクトリ展開
@@ -930,13 +1043,199 @@ mod tests {
         remove_temp_dir(&dir);
     }
 
+    /// #1402 で期待値を更新: 以前は「見出しだけ残り中身は空」= 読めなかったことが
+    /// **どこにも出ない**（空フォルダと同じ見え方）を固定していた。読めない理由を
+    /// 行として出す（`conventions.md`「弾いたら黙って捨てない」）
     #[test]
-    fn 読めないルートは見出しだけ残り中身は空() {
+    fn 読めないルートは見出しの下に理由の行が出る() {
         let mut tree = FileTree::default();
         tree.set_roots(vec![PathBuf::from("/no/such/dir")]);
         let rows = tree.rows();
-        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), 2, "理由の行が出ていない（#1402 の症状）");
         assert!(rows[0].root);
+        let note = &rows[1];
+        assert_eq!(note.depth, 1, "ルートの中身と同じ深さに出る");
+        assert!(
+            note.entry.name.is_empty(),
+            "押せる行のように見えてはいけない"
+        );
+        assert!(!note.entry.is_dir && !note.root && note.remote.is_none());
+        match &note.note {
+            // 理由（OS のメッセージ）をそのまま載せる = 空と区別が付く
+            Some(RowNote::Error(report)) => assert!(!report.is_empty(), "理由が空"),
+            other => panic!("読めない理由が Error 行として出ていない: {other:?}"),
+        }
+        // **消滅した**パスは次の refresh で対象外として畳まれる（従来どおり）。
+        // 読めるのに読めない状態が**続く**ケース（権限なし）の持続は
+        // `読めないディレクトリは空と区別して行に出る` が見ている
+        tree.refresh();
+        assert_eq!(
+            tree.rows().len(),
+            1,
+            "消滅したルートは畳まれる（従来の挙動）"
+        );
+    }
+
+    /// #1402 (a): 上限を超えたディレクトリは「何件まで表示 / 全何件」を行で申告する。
+    ///
+    /// Issue の実測（560 件 → 行 501 / note 0）を回帰として固定する。
+    /// 切り詰めたぶんは行として存在しないので、**申告が無いと
+    /// 「そのファイルが存在しない」と読める**のがこのバグの実害
+    #[test]
+    fn 上限を超えたディレクトリは切り詰めを行で申告する() {
+        let total = MAX_ENTRIES + 60;
+        let scratch = empty_scratch("trunc-over");
+        let dir = scratch.path();
+        for i in 0..total {
+            std::fs::write(dir.join(format!("f-{i:05}.txt")), "x").unwrap();
+        }
+        let mut tree = FileTree::default();
+        tree.set_roots(vec![dir.to_path_buf()]);
+        let rows = tree.rows();
+        assert_eq!(
+            rows.len(),
+            1 + MAX_ENTRIES + 1,
+            "ルート見出し + 上限ぶん + 申告の 1 行にならない（#1402）"
+        );
+        let note = rows.last().expect("行がある");
+        assert_eq!(
+            note.note,
+            Some(RowNote::Truncated {
+                shown: MAX_ENTRIES,
+                total
+            }),
+            "切り詰めの申告が最後の行に無い"
+        );
+        assert_eq!(note.depth, 1, "中身と同じ深さに出る");
+        assert!(note.entry.name.is_empty() && !note.entry.is_dir);
+        // 501 件目以降は行として存在しない（= だから申告が要る）
+        let dropped = format!("f-{MAX_ENTRIES:05}.txt");
+        assert!(
+            !rows.iter().any(|r| r.entry.name == dropped),
+            "{dropped} が行として出ている（前提が崩れている）"
+        );
+        // 画面に出る文言（`render_note_row` が引くのと同じ関数）に総数が載る。
+        // 数字は日英どちらの文言にも入るので言語を固定せずに見られる
+        let text = crate::ui_text::sidebar::note_truncated(MAX_ENTRIES, total);
+        assert!(
+            text.contains(&total.to_string()) && text.contains(&MAX_ENTRIES.to_string()),
+            "件数が文言に出ていない: {text}"
+        );
+    }
+
+    /// #1402 (c) + 受け入れ条件 5: 申告の有無は上限ちょうどで切り替わり、
+    /// **CLI / MCP（`tree git-status` の `truncated`）と同じ判断**から出る。
+    ///
+    /// 画面だけが黙る / 画面だけが申告する、のどちらへも倒れないことを
+    /// 境界の 3 点（上限 -1 / ちょうど / +1）で固定する
+    #[test]
+    fn 切り詰めの申告は上限ちょうどでは出ない() {
+        for count in [MAX_ENTRIES - 1, MAX_ENTRIES, MAX_ENTRIES + 1] {
+            let scratch = empty_scratch(&format!("trunc-{count}"));
+            let dir = scratch.path();
+            for i in 0..count {
+                std::fs::write(dir.join(format!("f-{i:05}.txt")), "x").unwrap();
+            }
+            let mut tree = FileTree::default();
+            tree.set_roots(vec![dir.to_path_buf()]);
+            let rows = tree.rows();
+            let notes: Vec<&Row> = rows.iter().filter(|r| r.note.is_some()).collect();
+            // 機械可読側と同じ 1 実装が出す答え
+            let expected = Truncation::new(count, MAX_ENTRIES).truncated();
+            assert_eq!(
+                !notes.is_empty(),
+                expected,
+                "{count} 件のとき画面の申告と `Truncation::truncated()` が食い違う"
+            );
+            assert_eq!(
+                rows.len(),
+                1 + count.min(MAX_ENTRIES) + usize::from(expected),
+                "{count} 件のときの行数"
+            );
+        }
+    }
+
+    /// #1402: サブディレクトリが上限ぶんあるディレクトリでは**ファイルが 1 行も出ない**
+    /// （並びがディレクトリ先なので切り詰めがファイルを丸ごと食う）。
+    /// この形が申告なしで起きるのが Issue の壊れるシナリオそのもの
+    #[test]
+    fn ディレクトリが上限ぶんあるとファイルは出ないが申告は出る() {
+        let scratch = empty_scratch("trunc-dirs");
+        let dir = scratch.path();
+        for i in 0..MAX_ENTRIES {
+            std::fs::create_dir(dir.join(format!("d-{i:05}"))).unwrap();
+        }
+        std::fs::write(dir.join("only-file.txt"), "x").unwrap();
+        let mut tree = FileTree::default();
+        tree.set_roots(vec![dir.to_path_buf()]);
+        let rows = tree.rows();
+        assert!(
+            !rows.iter().any(|r| r.entry.name == "only-file.txt"),
+            "前提（ディレクトリ先の並びで切り詰める）が変わっている"
+        );
+        assert_eq!(
+            rows.last().and_then(|r| r.note.clone()),
+            Some(RowNote::Truncated {
+                shown: MAX_ENTRIES,
+                total: MAX_ENTRIES + 1
+            }),
+            "ファイルが消えたのに申告が無い（#1402 の壊れるシナリオ）"
+        );
+    }
+
+    /// #1402 (b): 読めないディレクトリ（権限なし）が**空ディレクトリと区別**して見える。
+    ///
+    /// 空は行なし・読めないは理由の行。`chmod` は unix 限定なので cfg で囲む
+    /// （消滅したパスでの経路は `読めないルートは見出しの下に理由の行が出る` が
+    /// 両 OS で見ている）
+    #[cfg(unix)]
+    #[test]
+    fn 読めないディレクトリは空と区別して行に出る() {
+        use std::os::unix::fs::PermissionsExt;
+
+        /// 0o000 にしたディレクトリを**必ず**読める形へ戻す器（`Drop` は panic の
+        /// 巻き戻しでも走る）。戻さないと使い捨ての親ごと消せない
+        /// （`remove_dir_all` が中を読めずに失敗して残骸になる）
+        struct Unlocked(PathBuf);
+        impl Drop for Unlocked {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        let scratch = empty_scratch("unreadable");
+        let dir = scratch.path();
+        let empty = dir.join("empty");
+        let locked = dir.join("locked");
+        std::fs::create_dir(&empty).unwrap();
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("hidden-by-permission.txt"), "x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let _unlock = Unlocked(locked.clone());
+
+        let mut tree = FileTree::default();
+        tree.set_roots(vec![dir.to_path_buf()]);
+        tree.expand_dir(&empty);
+        tree.expand_dir(&locked);
+        let rows = tree.rows();
+        let note_of = |parent: &Path| -> Option<RowNote> {
+            rows.iter()
+                .find(|r| r.note.is_some() && r.entry.path == parent)
+                .and_then(|r| r.note.clone())
+        };
+        // 空ディレクトリには何も足さない（見え方を変えない）
+        assert_eq!(note_of(&empty), None, "空ディレクトリに行が増えている");
+        match note_of(&locked) {
+            Some(RowNote::Error(report)) => assert!(
+                !report.is_empty(),
+                "読めない理由が空（空ディレクトリと区別が付かない）"
+            ),
+            other => panic!("読めないディレクトリが Error 行にならない: {other:?}"),
+        }
+        // 中身は出ていない（出せないから理由を出している）
+        assert!(!rows
+            .iter()
+            .any(|r| r.entry.name == "hidden-by-permission.txt"));
     }
 
     /// #1009: git の状態は**ファイル行だけでなくディレクトリ行とルート見出し行**にも載る。
@@ -1300,7 +1599,7 @@ mod tests {
         symlink(&dir.join("real"), &dir.join("link"));
         symlink(&dir.join("README.md"), &dir.join("alias.md"));
 
-        let entries = read_dir_sorted(&dir);
+        let entries = read_dir_sorted(&dir).entries;
         let pick = |name: &str| {
             entries
                 .iter()
@@ -1335,12 +1634,20 @@ mod tests {
         for i in 0..600 {
             symlink(&dir.join("real"), &dir.join(format!("l{i:04}")));
         }
-        let entries = read_dir_sorted(&dir);
-        assert_eq!(entries.len(), MAX_ENTRIES, "切り詰めの上限が変わっている");
+        let listing = read_dir_sorted(&dir);
+        assert_eq!(
+            listing.entries.len(),
+            MAX_ENTRIES,
+            "切り詰めの上限が変わっている"
+        );
         assert!(
-            entries.iter().all(|e| e.is_dir),
+            listing.entries.iter().all(|e| e.is_dir),
             "ディレクトリ先の並びにファイル行が混ざっている"
         );
+        // #1402: 切り詰めたことは黙らない（リンクが混ざっても総数は実数のまま）
+        let on_disk = std::fs::read_dir(&dir).unwrap().count();
+        assert!(listing.truncation.truncated());
+        assert_eq!(listing.truncation.total, on_disk, "総数が実数と一致しない");
         remove_temp_dir(&dir);
     }
 }
