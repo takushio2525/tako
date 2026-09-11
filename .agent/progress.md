@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-11（#1376: PDF のリンク注釈と提案チップにスキーム検査を通した）
-- 判定を `tako_core::url_guard` の 1 実装へ（`check_browser_url` = http / https / `check_os_handler_url` = 境界 B8 の許可集合。`md_links::browser_url` は再公開）。経路側（(a)）= `follow_pdf_link` / `follow_preview_pdf_link` / `open_preview` と、保険（(b)）= `os_integration::open_url` / `open_url_wait` の両方を締めた。弾いたら通知欄 + 理由の分類だけを persist.log へ（リンク文字列は出さない）
-- 隔離 GUI（tako-vd・`open` の PATH shim で OS ランチャの引数を観測）: 最小 PDF の `file:///Applications/Calculator.app` は `許可していないスキーム` で弾かれ **`open` は 1 回も起きない**、`https://example.com/ok?a=1&b=2` は `opened_url` + shim に 1 つの値のまま到達
-- 番犬 8 本（経路 3 か所・B8・大域走査・診断の中身・1 実装・行番号の物差し）。修正前ソースで 6/8 が file:line 名指し FAILED（`main.rs:1096` / `11648` / `20751` = Issue 記載の 3 行 + `os_integration.rs:88` + `md_links.rs`）。Windows 実機は未検証
-
 ## 2026-09-12（#1387: NFD の結合文字が画面テキストから落ちるのを 3 経路まとめて直した）
 - alacritty が `Cell::extra.zerowidth` に持つ 0 幅の結合文字をどこも読んでいなかった（grep 0 件）ので、`screen::cell_text` / `push_cell_text` / `cell_is_trailing_blank` の 1 実装へ寄せ、`resolve_cell`（Screen = 描画 / links）・`compose_grid_row`（tail_lines）・`history_plain_lines`（ペインログ）の 3 経路と #801 の空白セルの近道を通した。`text` へ積んだぶんは `cell_cols` へ同じ列を積む
 - 実測（隔離 GUI・tako-vd）: `printf 'e\xcc\x81'` の画面が `U+0065 U+0301`・NFD 名のファイルを `find` で出すと `tako links` の target が `U+304B U+3099` を保って実在 true（濁点を落とした形は false）。legacy アームでは新テスト 6 本 + 番犬 3 本が file:line 名指しで FAILED（`画像かある.txt` / `VIS_か_e` を逐語再現）
@@ -64,3 +59,8 @@
 - #1038 でループバック TCP が既定になったのに「残存リスク」節（`:249`）と「listen 範囲」節（`:87`）が UDS 前提のままだった。実測（`parse_endpoint_spec(None)` = Loopback / 本番 `endpoint_kind: loopback-tcp`）で確定させ、受容するリスクとして書き直した（Windows は `unix_supported()` = false で opt-in が無いことも明記）
 - 番犬 `issue1406_threat_model_endpoint_watchdog` 5 本が**コードの既定 ↔ 文書**を双方向で縛る。注入 A/B: 旧記述を戻すと `:87` / `:249` を名指しで FAILED、コードの既定を UDS へ反転すると `local_endpoint.rs:8` と `:83` を名指しで FAILED
 - #841 を Windows 限定から「ループバック TCP を使う全プラットフォーム」へ広げた（表題 + 本文追記）。docs + テストのみなので install 不要
+
+## 2026-09-12（#1401: remote stop の stale 経路にも PID の正体確認を通した）
+- #329 の fail-safe が stale 経路（PID ファイル無し → `/api/health` の pid を撃つ）に無かった。確認を `kill_stale_daemon` の**内側**へ移して結果型にし（呼び出し側で忘れられない形）、`ps` 出力が**空**のときも「確認できない = 撃たない」へ倒した（判定は `ps_args_is_tako_remote_serve` の 1 実装）。中止時は state を残し理由 + 手順を返す
+- 修正前の実測（隔離 state・偽 health + 使い捨て `/bin/sleep`）: 実 CLI が sleep を殺して `{"stopped":true}` を返す / health が停止操作プロセス自身の pid を返す形ではテストバイナリが `signal: 15` で落ちた。修正後は sleep 生存・exit=1・state 残存
+- 番犬 `issue1401_stale_stop_identity_watchdog` 7 本（注入 6 通りで `remote.rs:2185` / `2223` / `2364` / `2788` を file:line 名指し）。workspace 4430 passed 0 failed・check-windows error 0。**install 要**
