@@ -205,6 +205,55 @@ TUI（claude 等）はそこで画面を作り直すので、「タブを切り�
 - タブ切り替え・分割比変更・ウィンドウ寸法変更でグリッドが空になる →
   1〜5ms 刻みのトレースで**一度も**基準を割らない（`grid_blackouts=0`）
 
+### 描画が来ない窓では IPC が自分で 1 フレーム描く（#1370。2026-09-12）
+
+上の 2 節（#647 / #932）が塞いだのは「描かれるフレームはあるが、そのフレームが
+裏タブのペインを見ていない」ケース。**フレームが 1 枚も来ない**ケースはそれでは塞がらない。
+
+macOS の gpui では `cx.notify()` は dirty を立てるだけで、フレームを作るのは
+`on_request_frame` のコールバック 1 か所だけ（`gpui/src/window.rs`）。それを呼ぶのは
+CVDisplayLink の `step` / AppKit の `displayLayer:` / `windowDidBecomeKey` の 3 つで、
+しかも display link を起動する側は窓が `NSWindowOcclusionStateVisible` でなければ即 return する。
+= **他窓に完全に覆われた窓・最小化した窓・仮想ディスプレイ上の窓ではフレームが来ない**。
+
+cols / rows を PTY へ渡す唯一の書き手は描画の中（`render_pane` /
+`sync_offscreen_pane_sizes`）なので、この状態で MCP / CLI から `resize` / `split` /
+`equalize` を撃つと、**取り分（share）だけが変わってペインの中のシェル・TUI は
+古い winsize のまま残る**（#1370 の実測: 30 秒 × 5 回で cols 不変・ペインの `stty size` が
+`21 21`）。「UI でできることはすべて AI からもできる」（設計原則 5）が、AI からだけ壊れる形。
+
+対策は IPC 受信ループ（`crates/tako-app/src/main.rs`。**全 dispatch が必ず通る 1 箇所**）で、
+**レイアウトを変える Request のときだけ**応答を返す前に 1 フレーム描く:
+
+- 判定は `tako_control::protocol::changes_layout(&Request)` の**純粋関数 1 実装**。
+  UI 層に `if` を散らさない。**ワイルドカードを置かない**ので、Request を増やすと
+  ビルドが落ちて分類を強制される
+- **読み取り・問い合わせ系は必ず偽**（`List` / `Read` / `OrchestratorWorkerStatus` /
+  `Send` / `Scroll`）。master のポーリングが秒単位で撃つので、ここを真にすると
+  #786 の描画固定費（実測 5.1M instr/frame）が毎回乗る
+- 描く相手は**その entity を root view にした全ビューポート**（#339）。
+  `TakoApp` の `update` の中で `draw` すると root view の二重借用でパニックするので、
+  ハンドルだけ持ち出して外で描く（`self_test::notify_and_draw` と同じ形）
+- **応答を返す前に描く**ので、`tako resize` が返った時点で PTY のサイズも新しい
+  （呼び出し側が別途待たなくてよい）
+- `Window::draw` は末尾で `needs_present` を立てるため、見えている窓では次の
+  display link フレームがそのまま present する = 絵が古いまま残ることはない
+- 費用は `perf_span("ipc_frame")` に出る（`TAKO_PERF_VERBOSE=1` の 10 秒ごとの分布）
+
+実測（隔離 GUI・仮想ディスプレイ `tako-vd`・入力イベント無し。A/B は `TAKO_1370_LEGACY=1`）:
+
+| | resize（cols/rows） | equalize | split の新ペイン | theme toggle の `ipc_frame` | `list` × 30 の `ipc_frame` |
+|---|---|---|---|---|---|
+| 旧（legacy） | **0/5 更新**（20 秒待っても不変） | 不変 | **80x24 のまま 2 枚** | +0 | +0 |
+| 新 | **5/5 更新**（応答直後に反映） | 更新 | 0 枚 | +1 | **+0** |
+
+旧の側で `rect`（取り分）だけは 5/5 で即座に変わるので、「効いていないように見えて
+実は木は変わっている」= cols / rows だけが取り残される、という #1370 の症状が再現する。
+
+**案 B（サイズ反映を描画から切り離す）は採っていない**。フレーム費用はゼロになるが
+直るのは寸法だけで、theme / スクロール幾何 / `AnyView::cached` のキャッシュビューは
+残る。逆に案 A は「描画依存の状態すべて」が同時に直る。詳細は #1370 のコメント。
+
 ## ドメインモデル
 
 ```

@@ -4402,7 +4402,19 @@ impl TakoApp {
                     }
                     continue;
                 }
-                let result = this.update(cx, |app: &mut TakoApp, cx| {
+                // #1370: レイアウトを変える dispatch のあとは **1 フレーム強制描画**する。
+                // ペインの cols / rows を PTY へ渡す唯一の書き手は描画の中
+                // （`render_pane` / `sync_offscreen_pane_sizes`）にあるが、macOS の gpui では
+                // `cx.notify()` は dirty を立てるだけで、フレームを作る `on_request_frame` は
+                // display link / `displayLayer:` / `windowDidBecomeKey` からしか呼ばれず、
+                // display link は窓が `NSWindowOcclusionStateVisible` でないと起動しない。
+                // = 隠れた窓・最小化した窓・仮想ディスプレイ上の窓では notify を何十回積んでも
+                // フレームが 1 枚も作られず、ペインの中のシェルは古い winsize のまま残る。
+                // 判定は `protocol::changes_layout` の 1 実装（読み取り系では偽 = ポーリングに
+                // #786 の描画固定費を乗せない）。`request` は dispatch へ move するのでここで読む
+                let needs_frame = !TakoApp::ipc_redraw_legacy()
+                    && tako_control::protocol::changes_layout(&incoming.request);
+                let outcome = this.update(cx, |app: &mut TakoApp, cx| {
                     // Issue #168: dispatch + 後処理（pending 消化 + save_layout）込みの
                     // IPC 1 件あたりのメインスレッド専有を計測（dispatch 単体とネスト計測）
                     let _span = tako_control::diag::perf_span("ipc_turn");
@@ -4488,11 +4500,33 @@ impl TakoApp {
                     // AI / CLI 操作によるレイアウト変化を即座に永続化する（Phase 5.5）
                     app.save_layout();
                     cx.notify();
-                    result
+                    // #1370: 描く相手は**この entity を root view にした全ビューポート**
+                    // （#339）。TakoApp の update の中で `draw` すると root view の
+                    // 二重借用でパニックするので、ハンドルだけ持ち出して外で描く
+                    // （`self_test::notify_and_draw` と同じ形・`main.rs` の poc 注記）
+                    let redraw: Vec<gpui::AnyWindowHandle> = if needs_frame {
+                        app.viewports.iter().map(|(_, h)| *h).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    (result, redraw)
                 });
-                match result {
+                match outcome {
                     // 接続が先に切れていても無視してよい
-                    Ok(result) => {
+                    Ok((result, redraw)) => {
+                        // **応答を返す前に描く**（`tako resize` が返った時点で PTY の
+                        // サイズも新しい = 呼び出し側が別途待たなくてよい）。
+                        // `draw` は末尾で `needs_present` を立てるので、見えている窓では
+                        // 次の display link フレームがそのまま present する（絵は古くならない）
+                        if !redraw.is_empty() {
+                            // #1370: 強制描画の費用と回数を `ipc_turn` と同じ物差しで残す
+                            // （`TAKO_PERF_VERBOSE=1` の 10 秒ごとの分布に count が出るので、
+                            // 「読み取り系では描いていない」を実測で言える）
+                            let _span = tako_control::diag::perf_span("ipc_frame");
+                            for any in redraw {
+                                let _ = any.update(cx, |_, window, cx| window.draw(cx).clear());
+                            }
+                        }
                         let _ = incoming.reply.send(result);
                     }
                     Err(_) => break, // View が破棄された
@@ -12146,6 +12180,13 @@ impl TakoApp {
     /// 隔離セルフテスト項目 141 の検出力の実証にも使う
     fn autosave_dispatch_legacy() -> bool {
         std::env::var_os("TAKO_973_LEGACY").is_some()
+    }
+
+    /// `TAKO_1370_LEGACY=1` で **#1370 前の挙動**（IPC 由来のレイアウト変更のあと
+    /// `cx.notify()` だけで終わり、フレームを作らない）へ戻す。同一バイナリで A/B を
+    /// 取る入口で、隔離セルフテスト項目 22b の検出力の実証にも使う
+    fn ipc_redraw_legacy() -> bool {
+        std::env::var_os("TAKO_1370_LEGACY").is_some()
     }
 
     /// #973: 自動保存の**唯一の入口**。保留フラグとタイマーを分けない。
@@ -38437,6 +38478,72 @@ mod self_test {
                 env_line()
             );
             check(resized, "tako resize");
+
+            // 22b. #1370: レイアウトを変える dispatch のあと、**描画を挟まずに**
+            //      PTY のサイズ（cols / rows）が新しい取り分へ届く。
+            //
+            //      cols / rows を PTY へ渡す唯一の書き手は描画の中（`render_pane` /
+            //      `sync_offscreen_pane_sizes`）にあるのに、macOS の gpui では
+            //      `cx.notify()` は dirty を立てるだけで、フレームを作る
+            //      `on_request_frame` は display link / `displayLayer:` /
+            //      `windowDidBecomeKey` からしか呼ばれず、display link は窓が
+            //      `NSWindowOcclusionStateVisible` でないと起動しない。隠れた窓・
+            //      最小化した窓・仮想ディスプレイ上の窓ではフレームが 1 枚も来ないので、
+            //      `tako resize` のあともペインの中のシェルは古い winsize のまま残っていた
+            //      （#1370 の実測: 30 秒 × 5 回で cols 不変・ペインの `stty size` が 21 21）。
+            //
+            //      **この項目は意図的に `notify_and_draw` を呼ばない**。呼ぶと製品側の
+            //      強制描画が無くても通ってしまい、検出力が丸ごと消える（「待ちは
+            //      汚してから描く」という他項目の作法とはここだけ役割が逆）。
+            //      不変条件は番犬 `issue1370_ipc_redraw_watchdog` が守る。
+            //      A/B は `TAKO_1370_LEGACY=1`（IPC ループの強制描画を抜く = 旧挙動）
+            let pty_rows = |app: &TakoApp| app.terminals.get(&pane2).map(|s| s.size().1);
+            let rows_before = window.update(cx, |app, _, _| pty_rows(app)).ok().flatten();
+            type_text(
+                any,
+                cx,
+                &format!("{cli} resize --pane {pane2} --share-y 0.35"),
+                true,
+            );
+            let budget1370 = state_wait_budget(Duration::from_secs(20), machine_busy());
+            // 前提: 取り分そのものは描画に依らず dispatch の中で更新される（#1370 の実測）。
+            // ここを待たずに PTY を見ると「CLI がまだ届いていない」と「描かれていない」を
+            // 区別できない
+            check(
+                wait_for_app_state(
+                    window,
+                    cx,
+                    "22b の前提: tako resize --share-y 0.35 がツリーの取り分へ届く",
+                    budget1370,
+                    |app| (share_of_pane2(app) - 0.35).abs() < 0.01,
+                )
+                .await,
+                "22b の前提: tako resize がツリーへ届く",
+            );
+            let started1370 = std::time::Instant::now();
+            let legacy1370 = TakoApp::ipc_redraw_legacy();
+            let pty_ok = wait_for_app_state(
+                window,
+                cx,
+                "22b: 描画を挟まずに PTY の rows が新しい取り分へ届く",
+                budget1370,
+                |app| match (pty_rows(app), rows_before) {
+                    // 取り分は 0.7 → 0.35 なので rows は必ず減る（「変わった」より強い）
+                    (Some(now), Some(before)) => now < before,
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                },
+            )
+            .await;
+            let rows_after = window.update(cx, |app, _, _| pty_rows(app)).ok().flatten();
+            println!(
+                "TAKO_SELF_TEST_1370: item=22b ok={pty_ok} rows_before={rows_before:?} \
+                 rows_after={rows_after:?} waited={:.1}s budget={:.1}s legacy={legacy1370} {}",
+                started1370.elapsed().as_secs_f32(),
+                budget1370.as_secs_f32(),
+                env_line()
+            );
+            check(pty_ok, "#1370 レイアウト変更 dispatch 後に PTY サイズが届く");
 
             // 23. tako equalize（FR-2.5.7。呼び出し元ペインのタブを均等化）
             type_text(any, cx, &format!("{cli} equalize"), true);

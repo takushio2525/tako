@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-11（#1372: exe::find が npm シムの裸スクリプトを PATHEXT より先に返さないようにした）
-- 真因は `find_in_windows_path` が `<base>\<name>` を名前によらず採っていたこと。npm の cmd-shim は `<name>`（`#!/bin/sh` のスクリプト）/ `.cmd` / `.ps1` を置くので `find("claude")` が PE でないスクリプトを返し `Command::new` で起動できない一方、同じモジュールの `is_executable_file` は同じパスに false = 境界の中で答えが矛盾していた。土台をそのまま採るのは「名前が既に `PATHEXT` の拡張子を持つとき」だけへ（`resolve_with_pathext` へ切り出し、パス指定の経路も同じ判定を通す）
-- 修正前ソースで新テスト 3 本が `exe.rs:411` / `:422` / `:466` を名指しで FAILED（`Some("…\\npm\\claude")` = Issue 実測値の逐語再現）。修正後は exe 15/15・workspace 4311 passed / 0 failed・`scripts/check-windows.sh` error 0。パス指定の経路だけ旧実装へ戻す A/B で整合テストが `C:\tools\claude` を名指しで落ちる
-- 併せて `platform_parity.rs` の B16 免除 3 件の根拠を「`.exe` なら解決できる」へ訂正（std の `resolve_exe` は PATH 探索で拡張子が無いときに `.exe` を足すだけ = `.cmd` シムには届かない）。Windows 実機での `where.exe` 比較は未検証
-
 ## 2026-09-11（#1371: Windows の URL 起動から cmd.exe を外した）
 - 真因は `cmd /C start "" <url>`。`std::process::Command` の Windows 実装は空白を含まない引数を引用符で囲まない（`Quote::Auto`）ので、cmd.exe が引用符の外の `&` をコマンド区切りとして解釈する。tako が拾う URL は構造的に空白を含まず `&` は正規の文字なので、クエリ文字列つきリンクは常にそこで切れ、残りが別コマンドとして走っていた（画面 / PDF / Markdown が第三者由来ならクリック 1 回で任意コマンド実行）
 - `open_url` / `open_url_wait` を既存の `shell_execute`（`ShellExecuteW`）へ寄せ、引数の正本を境界の外の純粋関数 `windows_url_launch` に置いた（macOS からも Windows の形を検査できる）。待つ版は戻り値判定（> 32）で足りる = `SEE_MASK_NOCLOSEPROCESS` はハンドラ本体のハンドルを返すのでブラウザを閉じるまで返らない
@@ -64,3 +59,8 @@
 - alacritty が `Cell::extra.zerowidth` に持つ 0 幅の結合文字をどこも読んでいなかった（grep 0 件）ので、`screen::cell_text` / `push_cell_text` / `cell_is_trailing_blank` の 1 実装へ寄せ、`resolve_cell`（Screen = 描画 / links）・`compose_grid_row`（tail_lines）・`history_plain_lines`（ペインログ）の 3 経路と #801 の空白セルの近道を通した。`text` へ積んだぶんは `cell_cols` へ同じ列を積む
 - 実測（隔離 GUI・tako-vd）: `printf 'e\xcc\x81'` の画面が `U+0065 U+0301`・NFD 名のファイルを `find` で出すと `tako links` の target が `U+304B U+3099` を保って実在 true（濁点を落とした形は false）。legacy アームでは新テスト 6 本 + 番犬 3 本が file:line 名指しで FAILED（`画像かある.txt` / `VIS_か_e` を逐語再現）
 - 番犬 `issue1387_combining_watchdog` 5 本 + 実 PTY の 4 経路一致テスト（visible_lines / tail_lines / history_plain_lines / selection_text）。hot path は 120x24 を 3000 回 snapshot で 68.6〜69.3ms → 65.3〜67.9ms
+
+## 2026-09-12（#1370: IPC 由来のレイアウト変更のあと 1 フレーム強制描画するようにした）
+- 真因は「cols / rows の書き手が描画の中だけ」+「macOS の gpui では notify でフレームが作られない」（display link は窓が可視でないと起動しない）。IPC ループ（全 dispatch が通る 1 箇所）で**レイアウトを変える Request のときだけ**応答を返す前に全ビューポートを 1 フレーム描く形へ。判定は `protocol::changes_layout` の純粋関数 1 実装（ワイルドカード無し = 155 バリアント全網羅・読み取り系は偽）
+- 隔離 GUI（tako-vd・入力イベント無し）の A/B（`TAKO_1370_LEGACY=1`）: resize は legacy **0/5**（20 秒待っても cols/rows 不変・rect だけ動く）→ 新 **5/5**（応答直後に反映）。equalize / split（新ペインが 80x24 のまま 2 枚 → 0 枚）/ theme toggle（`ipc_frame` +0 → +1）も同様。**`list` × 30 で `ipc_frame` +0**（読み取りは描かない = #786 の固定費が乗らない）
+- 隔離セルフテスト項目 22b（意図的に `notify_and_draw` を呼ばない）は新で ok（rows 13 → 5）・legacy で FAILED（25.1s 待って届かず）。番犬 `issue1370_ipc_redraw_watchdog` 8 本が注入 5 通りを file:line で名指し。全体は `TAKO_APP_SELF_TEST_OK` で完走
