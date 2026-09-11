@@ -196,7 +196,6 @@ mod tests {
                 text: line.to_string(),
                 runs: Vec::new(),
                 cell_cols: line.chars().enumerate().map(|(i, _)| i).collect(),
-                has_wide: false,
             }],
             cursor: None,
             ime_cursor: None,
