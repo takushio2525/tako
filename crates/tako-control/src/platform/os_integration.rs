@@ -5,7 +5,7 @@
 //!
 //! - macOS: `open` 系（`-R` / `-a` / `-t` / `-n`）と `osascript`
 //! - Windows: 表示は `explorer.exe /select,`、開く系は `ShellExecuteW`、
-//!   ゴミ箱は `SHFileOperationW` + `FOF_ALLOWUNDO`（#617）。URL は `cmd /C start`（既存挙動）
+//!   ゴミ箱は `SHFileOperationW` + `FOF_ALLOWUNDO`（#617）。URL も `ShellExecuteW`（#1371）
 //! - その他 unix: URL は `xdg-open`
 //!
 //! 呼び出し側（`dispatch` / UI / CLI）はこのモジュールだけを見る。
@@ -80,16 +80,60 @@ pub fn open_in_text_editor(path: &Path) -> Result<(), String> {
 }
 
 /// URL を既定ブラウザ / ハンドラで開く（起動するだけで完了は待たない）。
-/// `x-apple.systempreferences:` のような OS 固有スキームもここを通す
+/// `x-apple.systempreferences:` のような OS 固有スキームもここを通す。
+///
+/// **URL はどのプラットフォームでも「1 つの値」のまま OS へ渡る**（#1371）。
+/// シェルのコマンドライン文字列へ連結しないので、`&` `|` `^` `%` を含む URL が
+/// 途中で切れたり、残りが別コマンドとして走ったりしない
 pub fn open_url(url: &str) -> Result<(), String> {
     imp::open_url(url)
 }
 
-/// URL を開き、**ハンドラの終了ステータスまで待つ**。
+/// URL を開き、**ハンドラを起動できたかまで確かめる**。
 /// 候補 URL を順に試して最初に成功したものを採る用途（FDA のシステム設定パネル）で使う。
-/// 成功可否が要らない場合は [`open_url`] を使う（待たない分ブロックしない）
+/// 成功可否が要らない場合は [`open_url`] を使う（macOS では待たない分ブロックしない）。
+///
+/// 待つのは**ランチャ**（macOS の `open` コマンド / Windows の `ShellExecuteW`）までで、
+/// **ハンドラ本体（ブラウザや設定アプリ）の終了は待たない**。呼び出し側が知りたいのは
+/// 「この URL を開けるハンドラがあるか」だけなので、粒度はこれで揃っている
 pub fn open_url_wait(url: &str) -> Result<(), String> {
     imp::open_url_wait(url)
+}
+
+/// Windows で URL を開くときに `ShellExecuteW` へ渡す引数（#1371 の正本）。
+///
+/// 値で持ち回すのは **macOS 上からも Windows 側の形を検査できる**ようにするため
+/// （[`FileManager`] と同じ作法。#617 / #905）。Windows 実機が無くても
+/// 「cmd.exe が経路に居ない」「URL が 1 つの値のまま渡る」を番犬で固定できる
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowsUrlLaunch {
+    /// `lpOperation`。`None` = 既定の動詞（無ければ `open` に落ちる）。
+    /// プロトコルハンドラが `open` 以外を既定にしていても開けるようにこちらを使う
+    pub verb: Option<&'static str>,
+    /// `lpFile`。**URL そのもの**（加工も分割もしない）
+    pub file: String,
+    /// `lpParameters` = **常に `None`**。ここは生のコマンドライン文字列なので、
+    /// URL を入れるとシェルのメタ文字が効く余地を作ってしまう
+    pub parameters: Option<String>,
+}
+
+/// Windows で URL を開くときの `ShellExecuteW` 引数を組む（純粋関数）。
+///
+/// **`cmd /C start` は使わない**（#1371）。`std::process::Command` の Windows 実装は
+/// 空白かタブを含まない引数を引用符で囲まない（`Quote::Auto`）ため、cmd.exe が
+/// 引用符の外の `&` を**コマンド区切り**として解釈する。tako が検出する URL は
+/// 構造的に空白を含まず `&` は URL の正規の文字なので、クエリ文字列つきのリンクは
+/// 常にそこで切れ、残りが別コマンドとして実行される（画面 / PDF / Markdown の中身が
+/// 第三者由来なら、クリック 1 回で任意コマンドが走る）。
+///
+/// `ShellExecuteW` はコマンドラインを組まず `lpFile` をそのままハンドラへ渡すので、
+/// シェルが経路から消える = メタ文字を解釈する層が無くなる
+pub fn windows_url_launch(url: &str) -> WindowsUrlLaunch {
+    WindowsUrlLaunch {
+        verb: None,
+        file: url.to_string(),
+        parameters: None,
+    }
 }
 
 /// アプリケーションを**新しいプロセスとして**起動する（macOS の `open -n` 相当）。
@@ -524,31 +568,26 @@ mod imp {
         quoted
     }
 
-    /// URL は従来どおり `cmd /C start`（挙動を変えない）
+    /// URL も `ShellExecuteW` で開く（#1371）。引数の組み方は境界の外に置いた
+    /// [`windows_url_launch`] が正本で、macOS からも同じ形を検査できる
     pub fn open_url(url: &str) -> Result<(), String> {
-        url_command(url)
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| format!("URL を開けない: {e}"))
+        let launch = windows_url_launch(url);
+        shell_execute(
+            launch.verb,
+            OsStr::new(&launch.file),
+            launch.parameters.as_deref().map(OsStr::new),
+            "URL を開けない",
+        )
     }
 
+    /// `ShellExecuteW` は**ハンドラを起動できたかを戻り値で返す**（32 より大きければ成功）
+    /// ので、待つ版も同じ呼び出しで足りる。macOS の `open` コマンドもハンドラへ渡した
+    /// 時点で終了するため、呼び出し側（FDA の候補 URL 総当たり）が見る意味は変わらない。
+    ///
+    /// **`ShellExecuteExW` + `SEE_MASK_NOCLOSEPROCESS` は使わない**。返るのはハンドラ本体
+    /// （ブラウザ / 設定アプリ）のハンドルなので、待つとユーザーがそれを閉じるまで返らない
     pub fn open_url_wait(url: &str) -> Result<(), String> {
-        let status = url_command(url)
-            .status()
-            .map_err(|e| format!("URL ハンドラの実行に失敗: {e}"))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("URL を開けない（終了コード {status}）: {url}"))
-        }
-    }
-
-    fn url_command(url: &str) -> std::process::Command {
-        // `start` は cmd の内蔵コマンド。第 1 引数はウィンドウタイトル扱いなので空文字を挟む
-        let mut cmd = std::process::Command::new("cmd");
-        cmd.args(["/C", "start", "", url]);
-        tako_core::platform::process::no_console_window(&mut cmd);
-        cmd
+        open_url(url)
     }
 
     pub fn open_new_instance(_app: &Path) -> Result<(), String> {

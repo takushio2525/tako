@@ -1098,7 +1098,7 @@ pub const MATRIX: &[Feature] = &[
             note: notes::WIN_PDF_NO_TEXT_LAYER,
         },
         windows_evidence: Evidence::SelfTest(
-            "項目 90（Markdown の修飾キー + クリックは緑。URL は cmd /C start で開く。PDF 内リンクは不可）",
+            "項目 90（Markdown の修飾キー + クリックは緑。URL は ShellExecuteW で開く = #1371。PDF 内リンクは不可）",
         ),
     },
     Feature {
