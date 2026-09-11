@@ -120,6 +120,9 @@ role / title の設定・取得自体はセルフテスト（`tako title / role 
 - [ ] `tako tab rename --tab N ''`（空文字）で手動指定が解除され、自動リネームが再開する
 - [ ] `tako autorename off` で止まり、再起動後も OFF が維持される（settings.json）
 - [ ] claude CLI の無い環境（PATH から外す）で OSC タイトル / cwd 由来の名前に劣化する
+- [ ] 古い claude CLI（`--strict-mcp-config` を知らない版）でも自動命名が働く（#758）。
+      `TAKO_AUTORENAME_DIAG=1` の stderr に「`--strict-mcp-config` を拒否された → 以後付けない」
+      が 1 度だけ出て、以後は再試行なしで命名が続く（偽 CLI での機械検証は単体テスト側にある）
 
 ## listen ポート検知と提案チップ（FR-2.4.2〜2.4.4）
 
