@@ -4084,12 +4084,22 @@ fn orchestrator_watch(
             println!("WORKER_QUESTION: tako:{pane}");
             print_events(&mut exec);
         }
-        wait::WatchOutcome::Error { kind, detail } => {
+        wait::WatchOutcome::Error {
+            kind,
+            detail,
+            account,
+        } => {
             println!("WORKER_ERROR: tako:{pane} ({})", kind.as_str());
             if !detail.is_empty() {
                 println!("  detail: {detail}");
             }
             println!("  action: {}", kind.recommended_action());
+            // #757: ログイン失効は「どのアカウントを再ログインするか」まで出す
+            // （MCP の `tako_orchestrator_worker_status` の `error.config_dir` /
+            // `error.account` と同じ内容・同じ逆引き = CLI / MCP 1:1）
+            if let Some(account) = account.as_ref() {
+                println!("  {}", wait::account_suffix(account));
+            }
             print_events(&mut exec);
         }
         wait::WatchOutcome::Stalled { detail } => {

@@ -1666,9 +1666,12 @@ pub fn tools() -> Vec<Value> {
                 launch_failed = エージェント CLI の起動そのものが失敗（#983） / \
                 entitlement_blocked = 座席種別・管理者による無効化・グループ枠 $0・クレジット要求など \
                 **時間では解けない**利用阻害（#1106。待つ・ナッジ・respawn では直らないので \
-                detail をユーザーへ見せて管理者 / プラン / クレジットの対処を促す））と \
+                detail をユーザーへ見せて管理者 / プラン / クレジットの対処を促す） / \
+                login_expired = アカウントのログインが失効した（#757。**resume では解けない** —— \
+                画面には接続エラーとして出るが 1 リクエストも通らないので、対象アカウント \
+                （error.account / error.config_dir）を名指しして再ログインをユーザーへ依頼する））と \
                 detail（検知した画面上の行）、\
-                recommended_action（resume / wait_reset / respond_dialog / fix_launch / needs_human）が入る。\
+                recommended_action（resume / wait_reset / respond_dialog / fix_launch / needs_human / relogin）が入る。\
                 events 配列に直近の検知イベントが入る（#243）: \
                 question = worker が質問中（idle 時のみ。画面末尾に ? 終端行・選択肢・Should I 等のパターン）/ \
                 model_switched = 自動モデル切替が発生（from/to つき。limit reached, now using ... の検知）/ \

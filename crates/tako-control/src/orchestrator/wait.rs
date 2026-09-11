@@ -71,6 +71,10 @@ pub enum WatchOutcome {
     Error {
         kind: WorkerErrorKind,
         detail: String,
+        /// #757: `login_expired` のときの対象アカウント
+        /// （`{config_dir, is_default, account}`。dispatch が逆引きした結果）。
+        /// 種別がほかのときや逆引きできなかったときは `None`
+        account: Option<Value>,
     },
     /// worker が停滞: 実行中子プロセスなし + 画面不変（#224）
     Stalled { detail: String },
@@ -107,6 +111,18 @@ pub enum WorkerErrorKind {
     /// 管理者 / プラン / クレジットの対処（= 人）が要る。
     /// 文言の正本は `tako_core::limit_resume::entitlement_block_line`
     EntitlementBlocked,
+    /// **ログインが失効した**（#757）。OAuth のリフレッシュトークンが無効化され、
+    /// ユーザーが `/login` をやり直すまで 1 リクエストも通らない状態。
+    ///
+    /// `ApiError` と分けてあるのは助言が正反対になるため —— 実観測では
+    /// `API Error: Unable to connect to API (ENOTFOUND / ECONNRESET)` として現れるので
+    /// 従来は `resume`（続行ナッジ）を返していたが、**何度ナッジしても永久に復帰しない**
+    /// （2026-08-01 / 08-03 / 08-05 に 3 回、master が誤診して空回りした）。
+    /// `LaunchFailed` とも分けてある: あちらは「まだ一度も起動できていない」worker で、
+    /// こちらは**動いていた worker が途中で失効した**（文脈は残っているので、
+    /// 再ログイン後は同じペインで続けられる）。
+    /// 文言の正本は `orchestrator::agent_cli::login_expired_line`（仕様は FR-2.39）
+    LoginExpired,
     /// **起動も送達も成立したのに、agent 側の理由で実行が始まらなかった**（#1034）。
     ///
     /// 実測はアカウントの適格性の検証待ち（agy）。`LaunchFailed` と分けてあるのは
@@ -117,12 +133,13 @@ pub enum WorkerErrorKind {
 
 impl WorkerErrorKind {
     /// 全種別（往復・prompt の記載漏れを網羅検査するため）
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::ApiError,
         Self::UsageLimit,
         Self::LimitDialog,
         Self::LaunchFailed,
         Self::EntitlementBlocked,
+        Self::LoginExpired,
         Self::ExecutionRefused,
     ];
 
@@ -134,6 +151,7 @@ impl WorkerErrorKind {
             Self::LimitDialog => "limit_dialog",
             Self::LaunchFailed => "launch_failed",
             Self::EntitlementBlocked => "entitlement_blocked",
+            Self::LoginExpired => "login_expired",
             Self::ExecutionRefused => "execution_refused",
         }
     }
@@ -146,6 +164,7 @@ impl WorkerErrorKind {
             "limit_dialog" => Some(Self::LimitDialog),
             "launch_failed" => Some(Self::LaunchFailed),
             "entitlement_blocked" => Some(Self::EntitlementBlocked),
+            "login_expired" => Some(Self::LoginExpired),
             "execution_refused" => Some(Self::ExecutionRefused),
             _ => None,
         }
@@ -166,6 +185,13 @@ impl WorkerErrorKind {
             // **時間では解けない**（#1106）。ナッジも待機も respawn も効かないので、
             // 管理者 / プラン / クレジットの対処をユーザーへ伝えるのが唯一の前進
             Self::EntitlementBlocked => "needs_human",
+            // #757: **resume では絶対に解けない**（実観測で 3 回空回りした）。
+            // 待っても・ナッジしても・respawn しても同じ壁に当たるので、
+            // ユーザーに `/login` をやり直してもらうのが唯一の前進。
+            // `needs_human` と分けてあるのは「誰が何をすれば直るか」が違うため ——
+            // 管理者やプランの話ではなく**本人が 1 コマンド打てば直る**ので、
+            // master は対象アカウント（`error.config_dir` / `error.account`）を添えて依頼する
+            Self::LoginExpired => "relogin",
             // #1034: 一時的な拒否なので**再試行が正解**。作業は 1 文字も進んでいないので
             // 同じ指示をそのまま渡し直してよい（続行ナッジでは復帰しない = ターンが
             // そもそも始まっていないため、spawn し直す側）
@@ -349,11 +375,20 @@ pub fn wait_for_worker(
                                 .and_then(|d| d.as_str())
                                 .unwrap_or("")
                                 .to_string();
-                            Some((kind, detail))
+                            // #757: 対象アカウントは dispatch が逆引きしたものをそのまま運ぶ
+                            // （watch 側で引き直さない = 判定も逆引きも 1 実装）
+                            let account = error_account_json(e);
+                            Some((kind, detail, account))
                         })
-                        .or_else(|| detect_worker_error(recent));
-                    if let Some((kind, detail)) = error {
-                        return WatchOutcome::Error { kind, detail };
+                        .or_else(|| {
+                            detect_worker_error(recent).map(|(kind, detail)| (kind, detail, None))
+                        });
+                    if let Some((kind, detail, account)) = error {
+                        return WatchOutcome::Error {
+                            kind,
+                            detail,
+                            account,
+                        };
                     }
                     // #577: permission ダイアログは question より具体的な停止種別
                     // （master の対応が `respond` になる）なので question より先に見る。
@@ -534,12 +569,13 @@ pub fn run_worker(
         "duration_seconds": start.elapsed().as_secs(),
         "closed": closed,
     });
-    if let WatchOutcome::Error { kind, detail } = &outcome {
-        result["error"] = json!({
-            "kind": kind.as_str(),
-            "detail": detail,
-            "recommended_action": kind.recommended_action(),
-        });
+    if let WatchOutcome::Error {
+        kind,
+        detail,
+        account,
+    } = &outcome
+    {
+        result["error"] = error_json(*kind, detail, account.as_ref());
     }
     if let WatchOutcome::Stalled { detail } = &outcome {
         result["stalled"] = json!({
@@ -808,12 +844,13 @@ pub fn run_status(run_id: &str) -> Result<Value, String> {
             "phase": "finished",
             "elapsed_seconds": c.elapsed_secs,
         });
-        if let WatchOutcome::Error { kind, detail } = &c.outcome {
-            result["error"] = json!({
-                "kind": kind.as_str(),
-                "detail": detail,
-                "recommended_action": kind.recommended_action(),
-            });
+        if let WatchOutcome::Error {
+            kind,
+            detail,
+            account,
+        } = &c.outcome
+        {
+            result["error"] = error_json(*kind, detail, account.as_ref());
         }
         if let WatchOutcome::Stalled { detail } = &c.outcome {
             result["stalled"] = json!({
@@ -923,12 +960,13 @@ pub fn run_result(run_id: &str, exec: Exec) -> Result<Value, String> {
         "duration_seconds": c.elapsed_secs,
         "closed": closed,
     });
-    if let WatchOutcome::Error { kind, detail } = &c.outcome {
-        result["error"] = json!({
-            "kind": kind.as_str(),
-            "detail": detail,
-            "recommended_action": kind.recommended_action(),
-        });
+    if let WatchOutcome::Error {
+        kind,
+        detail,
+        account,
+    } = &c.outcome
+    {
+        result["error"] = error_json(*kind, detail, account.as_ref());
     }
     if let WatchOutcome::Stalled { detail } = &c.outcome {
         result["stalled"] = json!({
@@ -1011,6 +1049,55 @@ fn tmux_session_alive(session: Option<&str>) -> bool {
 }
 
 // --- worker 画面の完了判定ヒューリスティック ---
+
+/// `error` オブジェクトの組み立て（#157 / #757）。
+///
+/// watch / run / run_result / dispatch が**同じ形**を返すための 1 実装。
+/// `account` は `login_expired` のときだけ入る（#757。中身は
+/// `orchestrator::login_expired_account` が逆引きした `config_dir` / `account` /
+/// `is_default`）。ほかの種別では 1 キーも増えない
+pub fn error_json(kind: WorkerErrorKind, detail: &str, account: Option<&Value>) -> Value {
+    let mut v = json!({
+        "kind": kind.as_str(),
+        "detail": detail,
+        "recommended_action": kind.recommended_action(),
+    });
+    if let (Some(obj), Some(account)) = (v.as_object_mut(), account.and_then(Value::as_object)) {
+        for (k, val) in account {
+            obj.insert(k.clone(), val.clone());
+        }
+    }
+    v
+}
+
+/// 対象アカウントを 1 行へ添える表記（#757）。
+///
+/// `account=<名前 | -> config_dir=<パス>` の形。名前は accounts.yaml に登録が
+/// あるときだけ引けるので、無ければ `-`（**推測で埋めない**）。
+/// CLI の `WORKER_ERROR` と supervisor の `SUPERVISOR_DETECTED` が同じ形を使う
+pub fn account_suffix(account: &Value) -> String {
+    let name = account
+        .get("account")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let dir = account
+        .get("config_dir")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    format!("account={name} config_dir={dir}")
+}
+
+/// dispatch の `error` オブジェクトからアカウントの併記だけを取り出す（#757）。
+/// キーが 1 つも無ければ `None`（= 逆引きできなかった / 別種別）
+fn error_account_json(error: &serde_json::Map<String, Value>) -> Option<Value> {
+    let mut out = serde_json::Map::new();
+    for key in ["config_dir", "is_default", "account"] {
+        if let Some(v) = error.get(key) {
+            out.insert(key.to_string(), v.clone());
+        }
+    }
+    (!out.is_empty()).then(|| Value::Object(out))
+}
 
 /// 空行を除いた末尾 N 行を返す（新しい行が先頭）
 pub fn tail_lines(output: &str, n: usize) -> Vec<&str> {
@@ -1736,6 +1823,23 @@ pub fn legacy_1277() -> bool {
     *LEGACY.get_or_init(|| std::env::var("TAKO_1277_LEGACY").map(|v| v == "1") == Ok(true))
 }
 
+/// #757 の A/B。`TAKO_757_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
+/// （ログイン失効を専用種別として検知せず、画面に `API Error` が残っていれば
+/// `api_error` + `resume`、無ければ検知なし = idle に見える）。
+///
+/// **ゲートは検知段の側に置く**（`login_expired_line` の中ではない）。文言の正本は
+/// #983 の起動時未認証検知も使っているので、述語ごと無効化すると #757 と無関係な
+/// `launch_failed` の腕まで一緒に変わり、A/B が「何を測ったのか」を言えなくなる
+pub fn legacy_757() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_757_LEGACY").map(|v| v == "1") == Ok(true))
+}
+
+/// ログイン失効を探す画面末尾の行数（#757）。`api_error`（15 行）と同じ
+/// 「いまの阻害」窓にそろえてある。スクロールバックへ流れた古い失効行や、
+/// agent 自身が読んだコード・ドキュメントの引用を拾わないための歯止め
+const LOGIN_EXPIRED_TAIL: usize = 15;
+
 /// 画面テキストに permission ダイアログが実在すれば、その構造化 JSON を返す（#319 / #577）。
 ///
 /// `worker_status` の `permission_dialog` フィールドと watch のフォールバック判定で
@@ -1794,16 +1898,36 @@ pub fn screen_is_collapsed(output: &str) -> bool {
 /// 実採取画面由来（claude / codex。2026-07-12〜13 の夜間バッチ等）。
 ///
 /// 検知の優先順位は復帰コストの高い順:
-/// usage_limit > entitlement_blocked > limit_dialog > api_error
+/// limit ダイアログ > login_expired > usage_limit > entitlement_blocked >
+/// limit_dialog > api_error
 /// （codex は limit 到達時に limit メッセージとモデル切替ダイアログが同時に出るため、
 /// 本質である limit 到達を優先する。usage_limit と entitlement_blocked の文言は
 /// 排他なので、この 2 つの間では順序が結果に出ない = #1106）。
+///
+/// **`login_expired` を上限メッセージより先に見る理由**（#757）: ログイン失効は
+/// 上限ダイアログの背後に隠れていることがあり（`You've hit your session limit` を
+/// 解除した直後に初めて露出する = 実観測）、解除後もメッセージ行は画面に残る。
+/// 上限を先に取ると**残骸のメッセージで `wait_reset` を返し続ける**ので、
+/// 解除時刻を待っても永久に復帰しない（#757 の二段で詰まる形）。
+/// ただし**ライブのダイアログ（段 0）には勝たせない** —— ダイアログは応答が要る UI で、
+/// その応答こそが失効を露出させる。さらに「上限行のほうが新しい」ときは見送るので、
+/// 古い失効行が現在の上限停止を奪うことも無い。
 ///
 /// **種別は変えない**（#748 で一度 limit ダイアログを `limit_dialog` へ寄せる案を試したが、
 /// codex の limit 画面が supervisor の「解除まで待つ」復旧から外れて即再発するため戻した）。
 /// 代わりに、対処ダイアログの**選択肢構造**は `worker_status` / watch の
 /// `choice_dialog` に載るので、master は WORKER_ERROR を受けた後 respond で確定できる
 pub fn detect_worker_error(output: &str) -> Option<(WorkerErrorKind, String)> {
+    detect_worker_error_in(output, legacy_757())
+}
+
+/// [`detect_worker_error`] の本体。`legacy_login_expired` に true を渡すと
+/// #757 前（失効を `api_error` / 検知なしへ落とす）へ戻る（A/B 用。
+/// 公開関数は [`legacy_757`] を渡すだけなので、env が唯一の差になる）
+pub fn detect_worker_error_in(
+    output: &str,
+    legacy_login_expired: bool,
+) -> Option<(WorkerErrorKind, String)> {
     // tail_lines は新しい行が先頭 = 最初のマッチが画面最下部に最も近い
     let lines = tail_lines(output, 30);
     // 折り返しを結合した論理行（#1123）。**物理行で外れたときだけ**見る二段目で、
@@ -1832,6 +1956,47 @@ pub fn detect_worker_error(output: &str) -> Option<(WorkerErrorKind, String)> {
         .or_else(|| limit_dialog_line(&mut unwrapped.iter().map(String::as_str)))
     {
         return Some((WorkerErrorKind::UsageLimit, l));
+    }
+
+    // 0b. ログイン失効（#757）。**時間でもナッジでも解けず、ユーザーの `/login` が要る**。
+    //    文言の正本は `agent_cli::login_expired_line`（起動時の未認証検知と同じ 1 か所。
+    //    どちらの種別になるかは呼び出し側のゲートで決まる —— 送達の証拠がまだ無い worker は
+    //    `launch_failed`、動いていた worker が途中で失効したのがこちら）。
+    //
+    //    窓は末尾 15 行（`api_error` と同じ「いまの阻害」窓）。画面には agent の作業出力も
+    //    流れるので、古い失効行やコード・ドキュメントの引用まで遡ると誤検知が増える。
+    //    物理行 → 論理行の順で見るのは #1123 と同じ理由（狭いペインでは
+    //    `Login expired · Please run /login` が中黒で割れる）
+    let login_hit = if legacy_login_expired {
+        None
+    } else {
+        let login_tail = tail_lines(output, LOGIN_EXPIRED_TAIL);
+        let newest = |pool: &[&str]| -> Option<(usize, String)> {
+            pool.iter()
+                .position(|l| crate::orchestrator::agent_cli::login_expired_line(l))
+                .map(|i| (i, pool[i].trim().to_string()))
+        };
+        // **上限行のほうが新しければ見送る**。再ログイン後に上限へ当たった画面では
+        // 失効行が上に残っているので、そこで `relogin` を返すと今度は上限側が黙る
+        let limit_is_newer = |login_idx: usize, pool: &[&str]| -> bool {
+            pool.iter()
+                .position(|l| {
+                    tako_core::limit_resume::is_limit_exhausted_line(l)
+                        || tako_core::limit_resume::entitlement_block_line(l)
+                })
+                .is_some_and(|limit_idx| limit_idx < login_idx)
+        };
+        newest(&login_tail)
+            .filter(|(idx, _)| !limit_is_newer(*idx, &login_tail))
+            .or_else(|| {
+                // 論理行（折り返しの結合）側。同じ窓・同じ規則へ通す
+                let joined = tako_core::limit_resume::unwrapped_tail_of(output, LOGIN_EXPIRED_TAIL);
+                let pool: Vec<&str> = joined.iter().map(String::as_str).collect();
+                newest(&pool).filter(|(idx, _)| !limit_is_newer(*idx, &pool))
+            })
+    };
+    if let Some((_, line)) = login_hit {
+        return Some((WorkerErrorKind::LoginExpired, line));
     }
 
     // 1. usage limit 到達（claude / codex）。
@@ -2727,6 +2892,176 @@ mod tests {
         assert_eq!(kind.recommended_action(), "respond_dialog");
     }
 
+    // --- #757: ログイン失効（login_expired） ---
+
+    /// #757 の実観測 3 文言を、実採取どおりのペイン画面の形（ツール結果の罫線 +
+    /// 入力欄）へ載せたもの。**個人情報はプレースホルダ**（#927）
+    const LOGIN_EXPIRED_SCREENS: [(&str, &str); 3] = [
+        (
+            "refresh token",
+            "⏺ テストを実行します\n\n  ⎿  OAuth refresh token is no longer valid; run /login to re-authenticate\n\n──────\n❯ \n──────",
+        ),
+        (
+            "Login expired の見出し",
+            "⏺ 実装を続けます\n\n  ⎿  Login expired · Please run /login\n\n──────\n❯ \n──────",
+        ),
+        (
+            "後半だけ",
+            "⏺ 差分を確認します\n\n  ⎿  Please run /login\n\n──────\n❯ \n──────",
+        ),
+    ];
+
+    #[test]
+    fn detect_worker_errorはログイン失効を別種として検知する() {
+        for (label, screen) in LOGIN_EXPIRED_SCREENS {
+            let (kind, detail) =
+                detect_worker_error(screen).unwrap_or_else(|| panic!("{label}: 検知されない"));
+            assert_eq!(kind, WorkerErrorKind::LoginExpired, "{label}");
+            assert_eq!(kind.as_str(), "login_expired", "{label}");
+            // **resume ではない**（#757 の実害はここが resume だったこと）
+            assert_eq!(kind.recommended_action(), "relogin", "{label}");
+            assert!(!detail.is_empty(), "{label}: 画面上の行が空");
+        }
+    }
+
+    /// #757 の受け入れ条件 3: 真のネットワーク断は従来どおり `api_error` / `resume`
+    #[test]
+    fn detect_worker_errorは接続断をログイン失効へ倒さない() {
+        let enotfound = "⏺ 実装を続けます\n\n  ⎿  API Error: Unable to connect to API (ENOTFOUND api.anthropic.com)\n\n──────\n❯ \n──────";
+        let econnreset = "⏺ 実装を続けます\n\n  ⎿  API Error: Unable to connect to API (ECONNRESET)\n\n──────\n❯ \n──────";
+        for screen in [enotfound, econnreset, API_ERROR_SCREEN] {
+            let (kind, _) = detect_worker_error(screen).expect("検知される");
+            assert_eq!(kind, WorkerErrorKind::ApiError, "{screen}");
+            assert_eq!(kind.recommended_action(), "resume");
+        }
+    }
+
+    /// #757 の受け入れ条件 2 の後半: 上限ダイアログを解除すると失効へ遷移する。
+    /// **ダイアログが出ているあいだは `usage_limit`**（応答が要る UI が最優先）で、
+    /// 解除後は上限メッセージが画面に残っていても失効を返す
+    #[test]
+    fn detect_worker_errorは上限ダイアログ解除後にログイン失効へ遷移する() {
+        let with_dialog = "■ You've hit your session limit.\n\n  What do you want to do?\n\n› 1. Stop and wait for limit to reset\n  2. Upgrade plan\n\n  Press enter to confirm";
+        let (kind, _) = detect_worker_error(with_dialog).expect("検知される");
+        assert_eq!(
+            kind,
+            WorkerErrorKind::UsageLimit,
+            "ダイアログが出ているあいだは応答が要る = usage_limit のまま"
+        );
+
+        // ダイアログに応答した直後の画面。上限のメッセージ行は残り、その下に失効が出る
+        let after_dialog = "■ You've hit your session limit.\n\n⏺ 続けます\n\n  ⎿  OAuth refresh token is no longer valid; run /login to re-authenticate\n\n──────\n❯ \n──────";
+        let (kind, detail) = detect_worker_error(after_dialog).expect("検知される");
+        assert_eq!(
+            kind,
+            WorkerErrorKind::LoginExpired,
+            "解除後は失効へ遷移する（残った上限メッセージで wait_reset を返し続けない）"
+        );
+        assert!(detail.contains("OAuth refresh token"));
+    }
+
+    /// 逆向き: 再ログイン後に上限へ当たった画面（失効行が**上に残っている**）では
+    /// 上限を勝たせる。位置の比較をしないと、古い失効行が現在の上限停止を奪う
+    #[test]
+    fn detect_worker_errorは新しい上限をログイン失効より優先する() {
+        let relogged_then_limit = "  ⎿  Please run /login\n\n⏺ 再ログインしました。続けます\n\n■ You've hit your session limit. Your limit will reset at 4pm.\n\n──────\n❯ \n──────";
+        let (kind, detail) = detect_worker_error(relogged_then_limit).expect("検知される");
+        assert_eq!(kind, WorkerErrorKind::UsageLimit);
+        assert!(detail.contains("session limit"));
+    }
+
+    /// スクロールバックに残っているだけの失効行（現在の入力欄は正常）は検知しない。
+    /// 画面には agent 自身の作業出力が流れるので、窓を広げると
+    /// 「コードやドキュメントの引用」で誤検知する（#983 が `command not found` で踏んだ形）
+    #[test]
+    fn detect_worker_errorは窓の外の失効行を検知しない() {
+        let mut lines = vec!["  ⎿  Please run /login".to_string()];
+        // 15 行の窓の外へ押し出す（空行は tail_lines が除くので詰め物も実体のある行にする）
+        for i in 0..20 {
+            lines.push(format!("⏺ 手順 {i} を実行しました"));
+        }
+        lines.push("──────".into());
+        lines.push("❯ ".into());
+        lines.push("──────".into());
+        assert_eq!(detect_worker_error(&lines.join("\n")), None);
+    }
+
+    /// 狭いペインで中黒の前後が割れた形（#1123 の折り返し）も 1 本へ戻して読む
+    #[test]
+    fn detect_worker_errorは折り返した失効の見出しも読む() {
+        let wrapped = "⏺ 実装を続けます\n\n  ⎿  Login\n     expired ·\n     Please run\n     /login\n\n──────\n❯ \n──────";
+        let (kind, _) = detect_worker_error(wrapped).expect("検知される");
+        assert_eq!(kind, WorkerErrorKind::LoginExpired);
+    }
+
+    /// 英日どちらの UI 文言が周りにあっても判定は変わらない
+    /// （失効の文言そのものは agent が英語で出すが、周囲は worker の作業言語になる）
+    #[test]
+    fn detect_worker_errorはログイン失効を周囲の言語に依らず読む() {
+        for around in ["作業を続けます", "Continuing the task"] {
+            let screen = format!(
+                "⏺ {around}\n\n  ⎿  Login expired · Please run /login\n\n──────\n❯ \n──────"
+            );
+            let (kind, _) = detect_worker_error(&screen).expect("検知される");
+            assert_eq!(kind, WorkerErrorKind::LoginExpired, "{around}");
+        }
+    }
+
+    /// A/B の既定側（引数で旧挙動を指定できることの確認。env を触らないぶん）。
+    /// legacy では失効を種別として拾わず、画面に残る `API Error` 行へ落ちる
+    #[test]
+    fn detect_worker_errorのlegacy腕はログイン失効をapi_errorへ落とす() {
+        let both = "⏺ 実装を続けます\n\n  ⎿  API Error: Unable to connect to API (ENOTFOUND api.anthropic.com)\n  ⎿  OAuth refresh token is no longer valid; run /login to re-authenticate\n\n──────\n❯ \n──────";
+        let (kind, _) = detect_worker_error_in(both, false).expect("検知される");
+        assert_eq!(kind, WorkerErrorKind::LoginExpired, "既定は失効を分離する");
+
+        let (kind, detail) = detect_worker_error_in(both, true).expect("検知される");
+        assert_eq!(
+            kind,
+            WorkerErrorKind::ApiError,
+            "legacy は #757 前の分類（api_error + resume）へ戻る"
+        );
+        assert_eq!(kind.recommended_action(), "resume");
+        assert!(detail.contains("API Error"));
+    }
+
+    /// `error` オブジェクトの形（#757）。アカウントの併記は
+    /// **`login_expired` のときだけ**入り、ほかの種別では 1 キーも増えない
+    #[test]
+    fn error_jsonはログイン失効のときだけアカウントを載せる() {
+        let account = json!({
+            "config_dir": "/tmp/tako-test/.claude-alt",
+            "is_default": false,
+            "account": "alt",
+        });
+        let v = error_json(
+            WorkerErrorKind::LoginExpired,
+            "Please run /login",
+            Some(&account),
+        );
+        assert_eq!(v["kind"], "login_expired");
+        assert_eq!(v["recommended_action"], "relogin");
+        assert_eq!(v["account"], "alt");
+        assert_eq!(v["config_dir"], "/tmp/tako-test/.claude-alt");
+        assert_eq!(v["is_default"], false);
+        assert_eq!(
+            account_suffix(&account),
+            "account=alt config_dir=/tmp/tako-test/.claude-alt"
+        );
+
+        let plain = error_json(WorkerErrorKind::ApiError, "API Error: x", None);
+        assert_eq!(
+            plain.as_object().map(serde_json::Map::len),
+            Some(3),
+            "アカウント無しのときにキーが増えている: {plain}"
+        );
+        // 逆引きできなかったときは `-` で埋める（**推測の名前を出さない**）
+        assert_eq!(
+            account_suffix(&json!({ "config_dir": "/tmp/x", "account": null })),
+            "account=- config_dir=/tmp/x"
+        );
+    }
+
     // --- #1106: 時間では解けない利用阻害（entitlement_blocked） ---
 
     /// claude 2.1.258 の `dCt` / `pCt` / `Par` から採った実文言（6 分類 / 8 文言）を、
@@ -2987,7 +3322,7 @@ mod tests {
         let mut script = ExecScript::new(vec![error_resp(), error_resp(), error_resp()]);
         let outcome = run_wait(&mut script, &watch_opts(7, None));
         match outcome {
-            WatchOutcome::Error { kind, detail } => {
+            WatchOutcome::Error { kind, detail, .. } => {
                 assert_eq!(kind, WorkerErrorKind::ApiError);
                 assert!(detail.contains("Connection closed mid-response"));
             }

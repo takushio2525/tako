@@ -1383,6 +1383,34 @@ A/B は `TAKO_989_LEGACY=1`（面倒を見る系統が claude 1 つへ戻る = #
 legacy は `Claude Code をインストールします` へ戻る）。
 
 
+### FR-2.39 ログイン失効は接続断・上限とは別種として扱う（✅ 2026-09-11、#757）
+
+> worker アカウントのログイン失効（OAuth リフレッシュトークンの無効化）は、
+> 画面には先に `API Error: Unable to connect to API (ENOTFOUND / ECONNRESET)` として出る。
+> #757 前はそれを `api_error`（推奨 `resume`）に分類していたので、master は
+> 「ネットワーク断」と誤診して続行ナッジを撃ち続けた —— **`/login` をやり直すまで
+> 1 リクエストも通らない**ので永久に復帰せず、2026-08-01 / 08-03 / 08-05 に 3 回、
+> 同じ空回りを踏んだ。利用上限のダイアログの背後に隠れ、解除してから露出するケースもある。
+> 先行事例は #1106（時間では解けない利用阻害を上限から分離した）で、骨格を揃えてある。
+
+| ID | 要件 | 優先度 | 状態 |
+|---|---|---|---|
+| FR-2.39.1 | **専用種別 `WorkerErrorKind::LoginExpired`**（slug `login_expired` / 推奨アクション **`relogin`**）を `ApiError` から分離する。文言は #757 の実観測 3 件（`OAuth refresh token is no longer valid` / `Login expired · Please run /login` / `Please run /login`）。`needs_human`（#1106）と分けるのは「誰が何をすれば直るか」が違うため —— 管理者やプランの話ではなく**本人が 1 コマンド打てば直る**ので、master は待たず・ナッジせず・respawn せずに**再ログインを依頼する** | M | ✅ |
+| FR-2.39.2 | **文言の正本は 1 か所**（`orchestrator::agent_cli::login_expired_line`）。#983 の起動時未認証検知（`looks_unauthenticated_screen`）も同じ語句を使うので、正本へ委譲させて二重管理をなくす。**どちらの種別になるかは呼び出し側のゲートで決まる**: 送達の証拠がまだ無い worker は `launch_failed`（まだ一度も起動できていない）、動いていた worker が途中で失効したのが `login_expired`（文脈は残っているので再ログイン後は同じペインで続けられる） | M | ✅ |
+| FR-2.39.3 | **判定順序は「ライブのダイアログ > 失効 > 上限メッセージ」**。上限ダイアログが出ているあいだは応答が要る UI なので `usage_limit` のまま（その応答こそが失効を露出させる = Issue の提案 2）。解除後は上限のメッセージ行が画面に残っていても失効を返す（残骸で `wait_reset` を返し続けると解除時刻を待っても永久に復帰しない）。逆に**上限行のほうが新しいときは見送る**ので、再ログイン後に上限へ当たった画面で古い失効行が現在の停止を奪うことも無い。窓は末尾 15 行（`api_error` と同じ「いまの阻害」窓）で、スクロールバックへ流れた古い行や agent 自身が読んだコード・ドキュメントの引用は拾わない。狭いペインで中黒の前後が割れた形は #1123 の結合で 1 本へ戻してから同じ規則へ通す | M | ✅ |
+| FR-2.39.4 | **対象アカウントを併記する**。複数アカウント運用では「どれを再ログインするのか」が分からないと直せないので、`error.config_dir`（その worker の `CLAUDE_CONFIG_DIR`）と `error.account`（accounts.yaml の名前）を返す。逆引きは会話（session_id）の transcript の所在から行う（`orchestrator::login_expired_account`。#652 の resume と同じ根拠）。**引けなければキーごと出さない**（推測の名前を出すと、ユーザーは正しい方を再ログインしないまま「直らない」と思うことになる）。逆引きは transcript のディレクトリ走査を伴うので**失効を検知したときだけ**呼ぶ（watch は 5 秒ごとに回るため、毎ポーリングの I/O にはしない） | M | ✅ |
+| FR-2.39.5 | **`api_error` は従来どおり `resume`**（回帰）。`Unable to connect to API (ENOTFOUND / ECONNRESET)` だけの画面は失効へ倒さない。**自動復帰（#813）も発動しない**（`detect_limit_stop` が `None` = 解除を待つ相手が居ないので追跡そのものを作らない）。**supervisor（#401）は自動復旧を試みず**、`action=login_expired_report` として未復旧で上げ、`SUPERVISOR_DETECTED` の 1 行へ対象アカウントを載せる | M | ✅ |
+| FR-2.39.6 | **AI フルコントロール**: `tako orchestrator watch` の `WORKER_ERROR` と MCP `tako_orchestrator_worker_status` の `error` が**同じ内容**を返す（`kind` / `recommended_action` / `config_dir` / `account`。組み立ては `wait::error_json` の 1 実装で、watch 側は dispatch が逆引きした結果をそのまま運ぶ = 引き直さない）。master の手順書（`tako orchestrator guide monitoring`）に「`relogin` は `resume` では解けない。対象アカウントを名指しして `/login` をユーザーへ依頼する」を明記し、**全種別が手順書に載っていること**を機械検証する（`master_promptは全ての異常種別の対処を書いている`）。系統差は `agent_support::MATRIX` の `worker_login_expired_detect` として宣言する（claude = 実観測ずみ / codex・agy = 失効時の実画面を採れていないので `pending`（**推測の文言を置かない**）/ ローカル LLM は失効する資格情報が無いので対象外） | M | ✅ |
+
+A/B は `TAKO_757_LEGACY=1`（#757 前の分類へ戻る = 接続エラー行があれば `api_error` +
+`resume`、無ければ**検知なし** = idle（作業完了）に見える）。番犬は
+`issue757_login_expired_watchdog.rs`（検知段の位置・正本の一本化・手順書の言い切り・
+**手順書が自分の文言で自分を釣らない**こと）と `issue757_legacy_ab.rs`。
+**実機で失効させる再現はしていない**（同一アカウントを別マシンから使った直後に起きるもので
+任意のタイミングでは作れない）ので、検証は実観測の文言を描いた fixture と
+隔離 tmux のペインで行った。
+
+
 ## FR-3 コンセプト②: 軽量 IDE 的ワークスペース
 
 | ID | 要件 | 優先度 |

@@ -990,11 +990,21 @@ pub fn supervisor_loop(
 
         // 通知イベント生成（全モードで master へ通知する）
         let event_line = match &outcome {
-            WatchOutcome::Error { kind, detail } => Some(format!(
-                "SUPERVISOR_DETECTED: worker={worker_id} pane={} trigger={} detail={}",
+            WatchOutcome::Error {
+                kind,
+                detail,
+                account,
+            } => Some(format!(
+                "SUPERVISOR_DETECTED: worker={worker_id} pane={} trigger={} detail={}{}",
                 watch_opts.pane_id,
                 kind.as_str(),
-                detail
+                detail,
+                // #757: 再ログインを頼む相手を master がそのまま伝えられるように、
+                // 対象アカウントをこの 1 行へ載せる（ほかの種別では 1 文字も増えない）
+                account
+                    .as_ref()
+                    .map(|a| format!(" {}", crate::orchestrator::wait::account_suffix(a)))
+                    .unwrap_or_default(),
             )),
             WatchOutcome::AgentDead { resume_command } => Some(format!(
                 "SUPERVISOR_DETECTED: worker={worker_id} pane={} trigger=agent_dead resume={}",
@@ -1029,7 +1039,7 @@ pub fn supervisor_loop(
 
         // 復旧アクション実行
         let recovered = match &outcome {
-            WatchOutcome::Error { kind, detail } => match kind {
+            WatchOutcome::Error { kind, detail, .. } => match kind {
                 WorkerErrorKind::UsageLimit => recover_usage_limit(&mut ctx, detail, &mut state),
                 WorkerErrorKind::ApiError => recover_api_error(&mut ctx, detail, &mut state),
                 WorkerErrorKind::LimitDialog => recover_limit_dialog(&mut ctx, detail, &mut state),
@@ -1045,6 +1055,14 @@ pub fn supervisor_loop(
                 // 待っても解けないので `recover_usage_limit` の「解除まで待つ」は通さない
                 WorkerErrorKind::EntitlementBlocked => {
                     report_needs_human(&mut ctx, "entitlement_blocked", detail, &mut state)
+                }
+                // #757: ログインが失効した（OAuth リフレッシュトークンの無効化）。
+                // **続行ナッジは 1 リクエストも通らない** —— 実観測では
+                // `api_error` と誤分類されて `resume` が撃たれ、master が 3 回空回りした。
+                // 直せるのはユーザーだけ（`/login` のやり直し）なので自動復旧は試みず、
+                // 対象アカウントを添えて未復旧として上げる（`launch_failed` と同じ 1 実装）
+                WorkerErrorKind::LoginExpired => {
+                    report_needs_human(&mut ctx, "login_expired", detail, &mut state)
                 }
                 // #1034: 起動も送達も成立したのに agent 側が実行を断った
                 // （アカウントの適格性の検証待ち等）。**自動では復旧しない**:

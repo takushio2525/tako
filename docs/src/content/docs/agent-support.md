@@ -23,14 +23,14 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 ## 全体
 
-能力 51 件の内訳です。
+能力 52 件の内訳です。
 
 | エージェント | 対応 | 一部対応 | 未対応 | 対象外 |
 | --- | --- | --- | --- | --- |
-| Claude Code（基準） | 51 / 51 | 0 | 0 | 0 |
-| OpenAI Codex CLI | 36 / 51 | 4 | 8 | 3 |
-| Antigravity CLI | 24 / 51 | 4 | 13 | 10 |
-| Local LLM | 0 / 51 | 0 | 41 | 10 |
+| Claude Code（基準） | 52 / 52 | 0 | 0 | 0 |
+| OpenAI Codex CLI | 36 / 52 | 4 | 9 | 3 |
+| Antigravity CLI | 24 / 52 | 4 | 14 | 10 |
+| Local LLM | 0 / 52 | 0 | 41 | 11 |
 
 ### 状態の意味
 
@@ -63,7 +63,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 ## OpenAI Codex CLI を選ぶと落ちるもの
 
-対応 36 / 51 件。以下は Claude Code との差分です（同じ理由のものはまとめています）。
+対応 36 / 52 件。以下は Claude Code との差分です（同じ理由のものはまとめています）。
 
 ### 一部対応（4 件）
 
@@ -76,7 +76,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 - **設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない**
   - 作業フォルダを起動前に信頼済みにしておく（信頼ダイアログで止まらない）（`worker_trust`）
 
-### 未対応（8 件）
+### 未対応（9 件）
 
 - **設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない**（追跡: [#975](https://github.com/takushio2525/tako/issues/975)）
   - アカウント（資格情報）の切替に追従する（`account_switch`）
@@ -92,6 +92,8 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
   - 突然死を検知して復旧コマンドを提示する（#390）（`worker_death_resume`）
 - **tako の実装が claude 専用で、この系統への配線がまだ無い**（追跡: [#983](https://github.com/takushio2525/tako/issues/983)）
   - 起動直後の Bypass 確認ダイアログを事前に承諾しておく（#407）（`worker_bypass_preaccept`）
+- **この系統でログイン失効時に画面へ何が出るかを実物で採れていない（#757 の 3 文言は claude の実観測。推測の文言は置かない）**（追跡: [#757](https://github.com/takushio2525/tako/issues/757)）
+  - アカウントのログイン失効で止まったことを検知する（#757）（`worker_login_expired_detect`）
 
 ### 対象外（3 件）
 
@@ -104,7 +106,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 ## Antigravity CLI を選ぶと落ちるもの
 
-対応 24 / 51 件。以下は Claude Code との差分です（同じ理由のものはまとめています）。
+対応 24 / 52 件。以下は Claude Code との差分です（同じ理由のものはまとめています）。
 
 ### 一部対応（4 件）
 
@@ -117,7 +119,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 - **設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない**
   - 作業フォルダを起動前に信頼済みにしておく（信頼ダイアログで止まらない）（`worker_trust`）
 
-### 未対応（13 件）
+### 未対応（14 件）
 
 - **設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない**（追跡: [#975](https://github.com/takushio2525/tako/issues/975)）
   - アカウント（資格情報）の切替に追従する（`account_switch`）
@@ -137,6 +139,8 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
   - 突然死を検知して復旧コマンドを提示する（#390）（`worker_death_resume`）
 - **tako の実装が claude 専用で、この系統への配線がまだ無い**（追跡: [#983](https://github.com/takushio2525/tako/issues/983)）
   - 起動直後の Bypass 確認ダイアログを事前に承諾しておく（#407）（`worker_bypass_preaccept`）
+- **この系統でログイン失効時に画面へ何が出るかを実物で採れていない（#757 の 3 文言は claude の実観測。推測の文言は置かない）**（追跡: [#757](https://github.com/takushio2525/tako/issues/757)）
+  - アカウントのログイン失効で止まったことを検知する（#757）（`worker_login_expired_detect`）
 
 ### 対象外（10 件）
 
@@ -160,7 +164,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 ## Local LLM でまだ使えないもの
 
-対応 0 / 51 件。この系統が成立したときに埋まるマスの一覧です（同じ理由のものはまとめています）。
+対応 0 / 52 件。この系統が成立したときに埋まるマスの一覧です（同じ理由のものはまとめています）。
 
 ### 未対応（41 件）
 
@@ -210,7 +214,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 - **ローカル LLM のハーネスが決まっていないので可否が定まらない（codex TUI を借りる #990 なら在り、非 TUI 経路の #991 なら無い）**（追跡: [#990](https://github.com/takushio2525/tako/issues/990)）
   - 作業フォルダを起動前に信頼済みにしておく（信頼ダイアログで止まらない）（`worker_trust`）
 
-### 対象外（10 件）
+### 対象外（11 件）
 
 - **自分のマシンで動かすモデルなので利用上限という概念が無い**
   - エージェント CLI 自身が上限解除後に続行する（同じプロセスが生き続けているあいだだけ。#1140）（`limit_autocontinue_upstream`）
@@ -223,6 +227,8 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
   - 画面を介さずに指示を直送する（生成中でも取りこぼさない。#790）（`worker_delivery_peer`）
 - **自分のマシンで動かすモデルなので、座席種別・クレジット・組織ポリシーという概念が無い（阻害される権利がそもそも存在しない）**
   - 時間では解けない利用阻害で止まったことを検知する（#1106）（`worker_entitlement_detect`）
+- **自分のマシンで動かすモデルなので、ベンダーへのログインとその失効という概念が無い（失効する資格情報がそもそも存在しない）**
+  - アカウントのログイン失効で止まったことを検知する（#757）（`worker_login_expired_detect`）
 - **モデル名はベンダー固有の語彙なので claude 用の既定を渡せない（渡すと存在しないモデル名で起動する）。この系統のモデルは `worker_agents.&lt;agent&gt;.model` か spawn の明示指定で決め、無ければ CLI の既定に委ねる**
   - claude 語彙で書かれたモデル / effort の既定（プロファイルの worker_model / アカウントの default_model）を worker へ継承する（#1013）（`worker_model_default_inherit`）
 - **自分のマシンで動かすモデルなので、アカウントや座席の確認で実行を断られるという事象が起こらない（断る主体がそもそも存在しない）**
@@ -278,6 +284,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 | **突然死を検知して復旧コマンドを提示する（#390）**<br />`worker_death_resume` | 対応 | 未対応 [#984](https://github.com/takushio2525/tako/issues/984)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#984](https://github.com/takushio2525/tako/issues/984)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: dispatch.rs のレジストリの resume_command はコメントどおり claude のみ （session ID から claude --resume を組む） |
 | **「起動も送達も成立したのに実行を断られた」停止を、完了ではなく error として検知する（#1034）**<br />`worker_refusal_detect` | 対応 | 対応 | 対応 | 対象外<br />自分のマシンで動かすモデルなので、アカウントや座席の確認で実行を断られるという事象が起こらない（断る主体がそもそも存在しない） | 実測: #1034: 北極星実測（#975）で agy worker がアカウントの適格性の検証待ちに当たり、1 文字も作業していないのに status=idle / prompt_delivery=delivered / WORKER_IDLE（50.07 秒後）を返した。#983 の分類は「まだ送達の証拠が無い worker」に限るゲートを持つので設計どおりその外だった。#1033 で agy が 実況 JSONL を得たので、**送達後でも「MODEL のステップを 1 件も観測して いない」**を条件に分類できるようになった（画面推定の busy は TUI の 起動描画を拾うので根拠にならない）。**文言は版で変わる**（agy 1.1.22 = `Verifying your account...` / `We're finishing verifying your account eligibility.`、1.1.27 = `Unable to verify account eligibility.` / `Eligibility check failed:`）ので、両版に共通して残る `account eligibility` を軸にした。**claude 2.1.258 / codex 0.153.0 のバイナリには一時的な検証待ちの文言が 無い**（2026-09-09 に実物を走査。`eligibility` の該当はすべて内部識別子・API パス・models cache の判定で、画面へ出る拒否の文ではない）ので、この 2 系統には判定パターンを宣言していない（`execution_refused_patterns` が空 = 推測を置かない）。両系統で観測されている拒否の形は未認証 （`not_authenticated`。#983）と時間で解けない利用阻害 （`entitlement_blocked`。#1106 / #1107）で、どちらも既に error になる |
 | **実行拒否と判定する前に「作業を 1 歩も始めていない」ことの直接の証拠（一次シグナルの実観測）を要求できる（#1295）**<br />`worker_refusal_work_proof` | 対応 | 対応 | 対象外<br />実行の拒否が会話の作成前に起こるので、作業を 1 歩も始めていないことを実況ログで直接は確かめられない（#1034 の実物では拒否の時点で会話がまだ無い）。代わりに「会話が 1 件も解決できない」ことを作業ゼロの代理の証拠として使う | 対象外<br />自分のマシンで動かすモデルなので、アカウントや座席の確認で実行を断られるという事象が起こらない（断る主体がそもそも存在しない） | 実測: #1034: agy の実物では拒否が **CLI の起動直後**（会話が作られる前）に出るので、実況 JSONL がまだ無く「作業ゼロ」を直接は観測できない。代わりに会話が 1 件も 解決できないことを代理の証拠にしている（`agy_session::resolve_conversation_id_for_backend` の解決は sticky なので、一度でも会話を開いたペインは以後ずっと `Some(..)` を返す = 「解決できない」が durable に言える）。#1295: claude / codex にはこの代理が要らない。両系統で観測されている拒否は 未認証（#983 の `detect_launch_failure`）と時間で解けない利用阻害（#1106）で、どちらも別の分類が先に error にする。むしろ代理を許すと害がある: **claude の腕（`dispatch.rs` の `query_agent_status`）は `agent_work_started` を一度も代入しない**ので、`None` を作業ゼロと数えると 正常に働いた worker（`status=idle` / `prompt_delivery=delivered`）の画面に 同じ文字列が流れただけで完了を `error` / `retry_spawn` へ落とす （#983 が `command not found` で避けた誤検知と同型）。再現は `dispatch::tests::issue1295_claudeの正常完了を実行拒否へ落とさない`。local は断る主体がそもそも居ない（`worker_refusal_detect` と同じ理由） |
+| **アカウントのログイン失効で止まったことを検知する（#757）**<br />`worker_login_expired_detect` | 対応 | 未対応 [#757](https://github.com/takushio2525/tako/issues/757)<br />この系統でログイン失効時に画面へ何が出るかを実物で採れていない（#757 の 3 文言は claude の実観測。推測の文言は置かない） | 未対応 [#757](https://github.com/takushio2525/tako/issues/757)<br />この系統でログイン失効時に画面へ何が出るかを実物で採れていない（#757 の 3 文言は claude の実観測。推測の文言は置かない） | 対象外<br />自分のマシンで動かすモデルなので、ベンダーへのログインとその失効という概念が無い（失効する資格情報がそもそも存在しない） | 実測: #757（2026-08-01 / 08-03 / 08-05 の実観測を 3 回）: claude の worker が              `OAuth refresh token is no longer valid; run /login to re-authenticate` /              `Login expired · Please run /login` / `Please run /login` を出して止まる。             画面には先に `API Error: Unable to connect to API (ENOTFOUND / ECONNRESET)` が              出るため、#757 前は `api_error`（推奨 `resume`）に分類され、**続行ナッジを              何度撃っても復帰しなかった**（master が 3 回空回りした）。この 3 文言を              `orchestrator::agent_cli::login_expired_line`（#983 の起動時未認証検知と              **同じ正本**）で受け、`WorkerErrorKind::LoginExpired`（`relogin`）として返す。             対象アカウントは会話（session_id）の transcript の所在から逆引きする              （`orchestrator::login_expired_account`。#652 の resume と同じ根拠）ので、             **会話が claude の config ディレクトリに在る系統でしか名指しできない**。             codex / agy は失効時の実画面を採れていないので文言を足していない              （推測を置かないのは #1034 の `execution_refused_patterns` と同じ作法）。             **実機で失効させる再現はしていない**（同一アカウントを別マシンから使った              直後に起きるもので、任意のタイミングでは作れない）ので、検証は実観測の              文言を描いた fixture と隔離 tmux のペインで行った |
 
 ## worker への指示と応答
 
