@@ -74,7 +74,7 @@ const CATEGORIES = [
   ['OS 連携', [
     'tako_file_op', 'tako_sleep_guard', 'tako_port_detect', 'tako_fda',
     'tako_shell_integration', 'tako_stale_binary', 'tako_check_health',
-    'tako_telemetry',
+    'tako_telemetry', 'tako_test_residue',
   ]],
   ['セットアップと設定', [
     'tako_setup', 'tako_setup_bootstrap', 'tako_setup_changes', 'tako_setup_deps',

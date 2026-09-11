@@ -157,6 +157,12 @@ enum Command {
     /// `fix` で作業ログの archive 移送だけを自動で直す
     #[command(name = "context-budget")]
     ContextBudget(ContextBudgetArgs),
+    /// テスト・検証プロセスが一時ディレクトリへ残した使い捨て dir を掃除する（Issue #1296）。
+    /// 対象は `<TMPDIR>/tako-test-data-<pid>`（cargo test の data dir）と
+    /// `<TMPDIR>/tako-agent-config-<pid>`（検証プロセスのエージェント設定）で、
+    /// **所有プロセスが生きていないものだけ**。**既定は dry-run**（1 つも消さない）
+    #[command(name = "test-residue")]
+    TestResidue(TestResidueArgs),
     /// シェル統合（OSC 7 / 133 = ペインの cwd 追従とコマンド実行状態）の
     /// 配置状態の確認と配置・解除（Issue #525）。引数なしで現在の状態を表示。
     /// unix は環境変数の注入だけで完結するので配置操作は不要
@@ -2637,6 +2643,18 @@ struct ContextBudgetArgs {
     json: bool,
 }
 
+/// テスト・検証プロセスの残骸掃除の引数（Issue #1296）
+#[derive(Args)]
+struct TestResidueArgs {
+    /// 判定どおりに**実際に削除する**（既定は dry-run = 1 つも消さない）。
+    /// 所有プロセスが生きているものには付けても触らない
+    #[arg(long)]
+    apply: bool,
+    /// 生の JSON で出力する
+    #[arg(long)]
+    json: bool,
+}
+
 /// シェル統合の配置操作の引数（Issue #525）
 #[derive(Args)]
 struct ShellIntegrationArgs {
@@ -3334,6 +3352,9 @@ fn cli_main() -> ExitCode {
         // GUI が動いていない環境（移植作業中の Windows がまさにそれ）でも引けることが本質
         Command::Platform(ref args) => platform_local(args),
         Command::ContextBudget(ref args) => context_budget_local(args),
+        // 残骸の掃除もローカル処理（IPC 不要）。**GUI が動いていなくても掃ける**ことが
+        // 本質（掃除の対象は一時ディレクトリで、GUI の状態とは無関係）
+        Command::TestResidue(ref args) => test_residue_local(args),
         // 手順書（#1154）はバイナリ埋め込みの静的な本文 + プロファイル読みだけなので
         // ローカル処理。**GUI が動いていなくても引ける**ことが本質（platform と同じ扱い）
         Command::Orchestrator(OrchestratorCommand::Guide {
@@ -5095,6 +5116,103 @@ fn orchestrator_guide_local(
 
 /// 起動時ロードの予算（#1139）。GUI も IPC も要らないローカル処理。
 /// **壊れた設定で GUI が起動しないときにも引ける**ことが本質なので IPC 非依存にする
+/// テスト・検証プロセスの残骸の掃除（Issue #1296）。
+///
+/// **既定は dry-run**。判定は `tako_core::test_residue` の 1 実装で、
+/// 起動時の自動掃除（テストプロセス）とまったく同じ規則を使う
+/// （「pid が生きていない」だけが削除の条件で、pid 再利用は起動時刻で見分けて見送る）
+fn test_residue_local(args: &TestResidueArgs) -> Result<(), String> {
+    use tako_core::test_residue as residue;
+
+    let (temp, items, outcome) = residue::sweep_temp(args.apply);
+    if args.apply {
+        tako_control::diag::persist_log(&outcome.log_line());
+    }
+    if args.json {
+        println!(
+            "{}",
+            pretty_json(&residue::report_json(&temp, &items, &outcome))
+        );
+        return Ok(());
+    }
+
+    println!("一時ディレクトリ: {}", temp.display());
+    if items.is_empty() {
+        println!("残骸はありません");
+        return Ok(());
+    }
+    let total_bytes: u64 = items.iter().map(|r| r.bytes).sum();
+    println!("残骸: {} 件 / {}", items.len(), human_bytes(total_bytes));
+    for kind in residue::KINDS {
+        let mine: Vec<&residue::Residue> =
+            items.iter().filter(|r| r.prefix == kind.prefix).collect();
+        if mine.is_empty() {
+            continue;
+        }
+        let bytes: u64 = mine.iter().map(|r| r.bytes).sum();
+        let removable = mine.iter().filter(|r| r.verdict.removable()).count();
+        println!(
+            "  {:<20} {:>5} 件 / {:>9}（消せる {removable}）  {}",
+            kind.prefix,
+            mine.len(),
+            human_bytes(bytes),
+            kind.note
+        );
+    }
+    // 見送った理由は**黙って飲み込まない**（「対象が無かった」と区別できるように）
+    for (code, count) in &outcome.skipped {
+        let detail = items
+            .iter()
+            .find(|r| r.verdict.code() == code)
+            .map(|r| r.verdict.detail())
+            .unwrap_or("消す直前の再判定で対象から外れた");
+        println!("  見送り {count} 件: {detail}");
+    }
+    let removable_bytes: u64 = items
+        .iter()
+        .filter(|r| r.verdict.removable())
+        .map(|r| r.bytes)
+        .sum();
+    if args.apply {
+        println!(
+            "\n消した: {} 件 / {}（失敗 {}{}）",
+            outcome.removed,
+            human_bytes(outcome.removed_bytes),
+            outcome.failed,
+            outcome
+                .last_error
+                .as_deref()
+                .map(|e| format!(": {e}"))
+                .unwrap_or_default()
+        );
+    } else {
+        println!(
+            "\n消せる: {} 件 / {}（まだ 1 つも消していない）",
+            items.iter().filter(|r| r.verdict.removable()).count(),
+            human_bytes(removable_bytes)
+        );
+        // 既定値で済む引数は付けない（#322 の最簡形）
+        println!("いま消す: tako test-residue --apply");
+    }
+    Ok(())
+}
+
+/// バイト数を人が読める形へ（1 桁小数・1024 進）
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 fn context_budget_local(args: &ContextBudgetArgs) -> Result<(), String> {
     tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
     let cwd = match args.cwd {
@@ -7214,6 +7332,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Platform(_) => unreachable!("platform は run() を通らない（ローカル処理）"),
         Command::ContextBudget(_) => {
             unreachable!("context-budget は run() を通らない（ローカル処理）")
+        }
+        Command::TestResidue(_) => {
+            unreachable!("test-residue は run() を通らない（ローカル処理）")
         }
         Command::Orchestrator(OrchestratorCommand::Guide { .. }) => {
             unreachable!("orchestrator guide は run() を通らない（ローカル処理）")

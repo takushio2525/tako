@@ -1375,6 +1375,17 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller_role: Option<String>,
     },
+    /// テスト・検証プロセスが一時ディレクトリへ残した使い捨て dir の掃除（Issue #1296）。
+    ///
+    /// 対象は `<TMPDIR>/tako-test-data-<pid>`（cargo test の data dir）と
+    /// `<TMPDIR>/tako-agent-config-<pid>`（検証プロセスのエージェント設定）で、
+    /// **所有プロセスが生きていないものだけ**。既定は dry-run（`apply` で実削除）
+    TestResidue {
+        /// 判定どおりに実際に削除する（既定 false = 1 つも消さない）
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        apply: bool,
+    },
+
     /// 起動時ロードの予算（Issue #1139）。AI が起動した瞬間に強制ロードされるもの
     /// （グローバル指示・`AGENTS.md` と `@import` チェーン・system prompt・引き継ぎ）を
     /// 棚卸しし、種別ごとの上限と突き合わせる。
