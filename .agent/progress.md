@@ -66,7 +66,7 @@
 
 ## 2026-09-11（#1357: PWA の Playwright e2e を CI へ載せ、実行手順を置いた）
 - 6 spec 50 項目が CI で 1 度も走らず実行手順もどこにも無かった（#425 の契約変更で spec が取り残され #632 が 6 週間放置 → #1089 として再起票）。`package.json` に `e2e` / `e2e:install`・`web/tako-remote/README.md` 新設・AGENTS.md と commands.md に 1 行
-- CI の macOS ジョブ末尾で `npm run e2e:install` → `npm run e2e` を **blocking** で実行。追加は実測 **46 秒**（ブラウザ取得 13 + テスト 33。3 分のゲート内なので採用。macOS ジョブ全体 8 分 8 秒）
+- CI の macOS ジョブ末尾で `npm run e2e:install` → `npm run e2e` を **blocking** で実行。追加は実測 **46〜87 秒**（2 run。差は worker 数がランナーの CPU 数に従うため = 33 秒 / 71 秒。3 分のゲート内なので採用）
 - 実測: ローカル `50 passed (12.4s)`。空キャッシュから `e2e:install` 14 秒で復旧（#632 の `Executable doesn't exist` を隔離した `PLAYWRIGHT_BROWSERS_PATH` で再現）。ポート衝突は `reuseExistingServer: true` が黙って再利用し `waitForSelector` タイムアウトの形で落ちる
 
 ## 2026-09-11（#632: 承認カード e2e 3 本は #1089 で修正済みと実測確定）
