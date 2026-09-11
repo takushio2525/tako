@@ -224,6 +224,10 @@ fn fingerprint() -> BTreeMap<String, Vec<String>> {
             "crates/tako-control/src/config_share/mod.rs",
             &["ShareState"],
         ),
+        (
+            "crates/tako-control/src/platform/lid.rs",
+            &["SavedLidState", "RecordOwner"],
+        ),
     ];
     let mut out = BTreeMap::new();
     for (file, names) in TARGETS {

@@ -904,7 +904,8 @@ trait で抽象化し、core/ と control/ は platform/ の trait のみに依�
 3. read-modify-write に直列化がなく（GUI の MCP dispatch と CLI は別プロセス）、
    0 件を読んだ側の add が「その 1 件だけ」を書き戻して全件を消した
 
-対策（`config_io.rs` に共通部品化。projects.yaml / profiles/*.yaml / config.yaml が使う）:
+対策（`config_io.rs` に共通部品化。projects.yaml / profiles/*.yaml / config.yaml /
+lid-guard.json が使う）:
 
 - **アトミック書き込み**: tmp ファイル（pid 付き）+ fsync + rename。並行 reader には
   旧内容か新内容しか見えない（空・書きかけの瞬間が存在しない）
@@ -919,6 +920,11 @@ trait で抽象化し、core/ と control/ は platform/ の trait のみに依�
   ローテーション（本体 → .bak.1 は copy。rename だと本体不在の瞬間が生まれるため）。
   内容不変の save は書き込みもバックアップ回転もしない
 - 読み取り側はロック不要（rename により常に完全なスナップショットが見える）
+
+**プロセス間で共有する記録には所有者（pid + 起動時刻）も要る**（#1373）。
+原子書き込みは「壊れた内容を読ませない」までしか守らないので、
+「他インスタンスが書いた完全な記録を自分のものと取り違える」（#449 と同型）は別に塞ぐ。
+書き方は `conventions.md`「機械全体の設定を倒す記録には「所有者」を書く」。
 
 ## 多重インスタンスの資源保護（#177。復元強奪ガード + 縮退保存ガード）
 

@@ -1637,6 +1637,48 @@ OS で分岐すると「macOS だけ通る道」が増えて、この等価性�
   `crates/tako-control/tests/verification_isolation_watchdog.rs`（判定の形を走査）と
   `test_write_isolation` / `update_checker`（空 HOME・偽 brew で挙動を実測）の 2 段
 
+## 機械全体の設定を倒す記録には「所有者」を書く（Issue #1373 / #449）
+
+**`data_dir` の記録は複数の tako-app プロセスで共有される**（隔離されるのは
+`TAKO_ISOLATED` / `TAKO_DATA_DIR` を立てたときだけ）。「書き換えるのはこのプロセスだけ」を
+前提にした記録は、2 個目のインスタンスが起きた瞬間に前提が崩れる。
+
+蓋閉じ継続（`lid-guard.json`。Windows の `GUID_LIDCLOSE_ACTION` を 0 へ倒し、元値を
+そこへ記録する）で実際にこうなった:
+
+- busy な A が倒す → idle な B の tick が `set_stay_awake(false, …)` で**A の記録**を読み、
+  元値へ戻して記録を消す。A は自分の写しを信じて倒し直さないので、
+  **A の画面は「有効」のまま実機は蓋を閉じると眠る**（macOS 側で #449 として直した事故と同型）
+- 記録が素の `fs::write`（truncate → write）で、窓に当たった読み手が serde 失敗を
+  「記録なし」へ丸め、倒した 0 を元値として記録し直す = **ユーザーの設定が永久に失われる**
+  （#169 の三段連鎖がそのまま再現する）
+
+### 書くときの決まり
+
+- **記録に所有者（pid + 起動時刻）を持たせる**。`RecordOwner::current()` で書き、
+  戻すのは「自分の記録」「所有者が死んでいる記録」「所有者を持たない旧形式」だけ。
+  **生きた他プロセスの記録には倒す側も解除側も触らない**（相手が解除した次の tick で取り直す）
+- pid だけでは**pid の再利用**を見分けられない。起動時刻
+  （`procinfo::start_time_unix`）と対にして、食い違ったら「所有者は死んだ」と読む。
+  生死を判定できないときは**触らない側**へ倒す（語彙は `test_residue::Owner` の 1 実装）
+- 所有権の判定は**probe を引数で受ける純粋関数**にする（`lid::claim_for`）。
+  OS 依存を追い出しておかないと、Windows 実機の無い CI で分岐を 1 つも固定できない
+- 「誰の記録か」と「何をするか」を分ける（`claim_for` → `decide` → 実行器）。
+  入口（毎 tick 呼ばれる `set_stay_awake`）が直接 `restore` を呼ぶ形に戻さない
+- 所有者の居ない記録を引き取るときは**必ず「戻してから倒し直す」**。
+  倒れたままの現在値を元値として記録し直すと、ユーザーの設定が消える
+- 書き込みは `config_io::atomic_write`、read-modify-write は `config_io::lock_exclusive` の下で
+  **ディスクを読み直してから**（ロックは「書くと決まってから」取る = 上節）
+- 読めない記録は「記録なし」へ丸めず `<name>.unreadable.bak` へ写して Err
+  （#916 の作法。**元のファイルは触らない**）。丸めた先に待っているのが上の消失
+- 記録の型は `migration_registry` の指紋へ載せる。フィールドを足すときは
+  `serde(default)` で旧ファイルがそのまま読めるかを明示する
+
+番犬は `crates/tako-control/tests/lid_guard_ownership.rs`（原子書き込み / 丸めない /
+ロックの下で読み直す / 所有権を確かめてから戻す / 所有者を記録する / probe を注入する、の 6 本を
+ソースで見て file:line で名指しする）と `platform::lid` の単体テスト（疑似プロセスの
+probe で 4 通りの立場と判定表を固定する。**macOS でも走る**）。
+
 ## 起動時ロードの予算（Issue #1139）
 
 AI が**起動した瞬間に強制ロードされるもの**には上限がある。書いただけの規約は守られない
