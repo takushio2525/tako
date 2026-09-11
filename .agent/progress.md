@@ -20,15 +20,6 @@
 
 ---
 
-## 2026-09-11（#1317 / #1322 / #1323: docs サイトの取り残し 3 ページを実挙動へ合わせた）
-- settings（8 タブ・`--tab` は英語スラッグのみ）/ architecture（存在しない `shelve` → `background`・IPC に Windows の named pipe）/ keyboard-shortcuts（macOS / Windows の 3 列表へ作り直し）
-- 表は `keybindings.rs` から全件起こした（macOS 45 本 / Windows 45 本・差分 0）。番犬 `crates/tako-control/tests/docs_keyboard_shortcuts.rs` が両方向を検査する（注入 3 通りでキーを名指し FAILED）
-
-## 2026-09-11（#1316: docs の MCP / CLI の件数と掲載漏れを直し、番犬で拘束した）
-- 実測（`mcp::tools()` = 149 / `tako --help` = 84）に対し docs は 147 / 128 / 69 / 68 を名乗り、MCP 11 ツール・CLI 10 コマンドが一覧に 1 度も出てこなかった。件数 11 か所を直し欠落を既存カテゴリへ追加（`mcp-tools.md` の「機械的に抽出」note も手書き + 番犬の事実へ）
-- 番犬 `crates/tako-control/tests/docs_tool_inventory.rs` 6 本が件数と名前集合の両方を拘束。CLI 集合は `main.rs` の `enum Command` のソース走査（実バイナリの `--help` と差分 0 を実測）で、**記述が見つからないことも FAILED** にして黙って通らない形
-- A/B（修正前 docs へ戻す）: 4/6 FAILED = 件数 11 か所を file:line で・欠落 21 件を名前で名指し → 修正後 6/6 緑。案 (a)（ページの生成物化）は構成変更なので未実施・ユーザー相談へ回す
-
 ## 2026-09-11（#1301: 2 秒 tick の全ペイン フルスナップショット 2 本を末尾窓へ）
 - `refresh_agent_metrics` / `drive_queued_message_recovery` が毎 tick 全ペインの `Screen`（行ごとに `String` + `Vec<StyleRun>` + `Vec<usize>` の 3 確保）を組んで文字列だけ取って捨てていた（#1001 の H2 / H3）。`TerminalSession::tail_lines(n)`（`Screen` を通さずグリッドから末尾 n 行）+ alt screen ゲート + C3 の判定順入れ替えへ。窓の正本は `AGENT_TUI_TAIL_LINES`=48（Issue 記載の 8 では #1093 / #1123 の上限見出し窓 24 を割る）
 - 実測（隔離 GUI・`tako-vd`・1/4/12/22 ペイン・各 20 秒 × 3 窓）: 傾き **0.271 → 0.068 M 命令/秒/ペイン**（全 12 窓の最小二乗）= 2 秒 tick 1 回あたり 0.543 → 0.135 M 命令/ペイン。22 ペインの footprint 46.4 → 39.9 MB
@@ -72,3 +63,8 @@
 ## 2026-09-11（#372: 器を持たないペインも sleep guard の busy に数えた）
 - 走査対象が器のセッションだけで、tmux 未導入 / persist OFF（cask の既定）では常に空 = `busy_agents` が無条件に 0。全ペイン対象 + 器なしは PTY 直下の子から辿る二段構え（判定 `has_running_descendants` / 数え方 `busy_count()`）へ。CLI の `status` も IPC でアプリの値を採る（保持フラグと busy はプロセスローカル static）
 - 隔離 GUI（persist OFF・tako-vd）: 修正前は `sleep 300` 稼働 75 秒で 0 のまま → 修正後 1 + pmset に assertion、停止で 2 秒で解放。器あり構成も回帰なし。A/B `TAKO_372_LEGACY=1`・番犬 4 本が修正前ソースで file:line 名指し FAILED
+
+## 2026-09-11（#633: 承認カードの command を「承認を求めている操作」から始める）
+- 実測で真因を絞った: 本文の境界は「当たったら捨てる」3 つ（罫線 / 0 桁の非空行 = #1293 / 番号つき行）しか無く、**罫線を引かず箱ごと 0 桁で描く**許可ダイアログ（agy / claude の箱なし 2 形）では捨てる材料が無い。Issue 実測値の `⏺` 行そのものは #1293 が既に切っていた
+- `dialog::BODY_START_MARKERS` + `body_start_row` で**本体の開始マーカーを起点**にし、無ければ従来のブロック抽出へフォールバック（起点を下げるだけ = 結果は必ず従来の接尾辞）。FR-2.25.12 / conventions #1293 節に追記
+- 番犬 `crates/tako-control/tests/issue633_permission_command_anchor.rs` 8 本 + 単体 3 本。A/B `TAKO_633_LEGACY=1` で 2 本 FAILED（agy に発話が混ざる / 罫線の無い画面が `⎿` 行から始まる）
