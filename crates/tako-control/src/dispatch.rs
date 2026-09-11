@@ -51,6 +51,23 @@ impl DispatchError {
             _ => error_code::OPERATION,
         }
     }
+
+    /// 診断ログ用の**理由の分類**（#1399）。
+    ///
+    /// 失敗を GUI の通知欄へ出す経路は、同じ失敗を persist.log にも残す。
+    /// そのとき載せてよいのは**分類だけ**で、本文（パス・OS のエラー文）は載せない
+    /// （#1376 の `UrlBlocked` と同じ作法。診断に第三者由来の文字列を溜めない）。
+    /// 網羅 match なのでバリアントを増やすとここが落ちる = 分類の付け忘れが残らない
+    pub fn class(&self) -> &'static str {
+        match self {
+            DispatchError::PaneNotFound(_) => "pane_not_found",
+            DispatchError::TabNotFound(_) => "tab_not_found",
+            DispatchError::NoTargetPane => "no_target_pane",
+            DispatchError::NoSession(_) => "no_session",
+            DispatchError::InvalidParams(_) => "invalid_params",
+            DispatchError::Operation(_) => "operation",
+        }
+    }
 }
 
 /// 拡張子からプレビュー種別（ワイヤ表現）を決める。

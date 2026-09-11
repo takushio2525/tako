@@ -1537,7 +1537,7 @@ impl TakoApp {
     /// CLI `tako panel --show-hidden` / MCP `tako_panel` と同じ dispatch 経路を通す
     pub(crate) fn toggle_hidden_files(&mut self, cx: &mut Context<Self>) {
         let next = !self.filetree.show_hidden();
-        let _ = tako_control::dispatch(
+        let result = tako_control::dispatch(
             self,
             tako_control::protocol::Request::Panel {
                 visible: None,
@@ -1549,16 +1549,30 @@ impl TakoApp {
             },
             PaneOrigin::User,
         );
+        if let Err(e) = result {
+            // #1399: 失敗を黙って捨てない。対象パスを持たない操作なので target は None
+            let op = if next {
+                crate::ui_text::sidebar::hidden_show()
+            } else {
+                crate::ui_text::sidebar::hidden_hide()
+            };
+            self.notify_tree_dispatch_failed(op, None, &e);
+        }
         cx.notify();
     }
 
     pub(crate) fn commit_inline_edit(&mut self, cx: &mut Context<Self>) {
         use tako_control::protocol::{FileOpKind, Request};
-        let Some(edit) = self.inline_edit.take() else {
+        // #1399: **ここで `take()` してはいけない**。`Err` のときに入力欄が閉じて
+        // 打った名前ごと消えるので（既存名へのリネームが打ち直しになる）、
+        // 閉じるのは成功してからにする
+        let Some(edit) = self.inline_edit.clone() else {
             return;
         };
         let name = edit.text.trim().to_string();
         if name.is_empty() {
+            // 空 Enter は従来どおり「取り消し」（入力欄を閉じる）
+            self.inline_edit = None;
             cx.notify();
             return;
         }
@@ -1577,22 +1591,38 @@ impl TakoApp {
             },
             PaneOrigin::User,
         );
-        if result.is_ok() {
-            // #550 × #559: ドット始まりを作ったのに非表示設定で消える（= 何も起きて
-            // いないように見える）のを防ぐ。明示的に作った物は必ず見せる
-            if filetree::is_hidden_name(&name) && !self.filetree.show_hidden() {
-                self.toggle_hidden_files(cx);
+        match result {
+            Ok(_) => {
+                self.inline_edit = None;
+                // #550 × #559: ドット始まりを作ったのに非表示設定で消える（= 何も起きて
+                // いないように見える）のを防ぐ。明示的に作った物は必ず見せる
+                if filetree::is_hidden_name(&name) && !self.filetree.show_hidden() {
+                    self.toggle_hidden_files(cx);
+                }
+                // #559: 2 秒ポーリングを待たず、作った項目を正しい並び順の位置へ即座に出す
+                let dir = match edit.kind {
+                    InlineEditKind::Rename => edit
+                        .parent
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| edit.parent.clone()),
+                    _ => edit.parent.clone(),
+                };
+                self.filetree.refresh_dir(&dir);
             }
-            // #559: 2 秒ポーリングを待たず、作った項目を正しい並び順の位置へ即座に出す
-            let dir = match edit.kind {
-                InlineEditKind::Rename => edit
-                    .parent
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| edit.parent.clone()),
-                _ => edit.parent.clone(),
-            };
-            self.filetree.refresh_dir(&dir);
+            // #1399: 理由を通知欄へ出し、**入力欄と打った文字列は残す**
+            // （legacy アームだけ旧挙動 = 閉じて無言）
+            Err(e) => {
+                if Self::legacy_1399() {
+                    self.inline_edit = None;
+                }
+                let op_label = match edit.kind {
+                    InlineEditKind::Rename => crate::ui_text::sidebar::menu_rename(),
+                    InlineEditKind::NewFile => crate::ui_text::sidebar::menu_new_file(),
+                    InlineEditKind::NewDir => crate::ui_text::sidebar::menu_new_dir(),
+                };
+                self.notify_tree_dispatch_failed(op_label, Some(&name), &e);
+            }
         }
         self.sync_filetree_roots();
         cx.notify();
@@ -1608,9 +1638,14 @@ impl TakoApp {
     ) {
         use tako_control::protocol::{FileOpKind, Request};
         let path_str = path.display().to_string();
+        // #1399: 失敗の通知に出す対象と操作名。`path_str` は Request へ move するので
+        // 先に控える。操作名は**メニューに出ている文言そのもの**を使う（#617 の
+        // OS 出し分けもそのまま効く = 押した項目と失敗した項目の名前が一致する）
+        let target = path_str.clone();
+        let fm = tako_control::platform::os_integration::file_manager();
         match action {
             "copy-abs" => {
-                if let Ok(result) = tako_control::dispatch(
+                match tako_control::dispatch(
                     self,
                     Request::FileOp {
                         op: FileOpKind::CopyAbsolutePath,
@@ -1620,14 +1655,21 @@ impl TakoApp {
                     },
                     PaneOrigin::User,
                 ) {
-                    if let Some(p) = result["path"].as_str() {
-                        cx.write_to_clipboard(ClipboardItem::new_string(p.to_string()));
+                    Ok(result) => {
+                        if let Some(p) = result["path"].as_str() {
+                            cx.write_to_clipboard(ClipboardItem::new_string(p.to_string()));
+                        }
                     }
+                    Err(e) => self.notify_tree_dispatch_failed(
+                        crate::ui_text::sidebar::menu_copy_abs(),
+                        Some(&target),
+                        &e,
+                    ),
                 }
             }
             "copy-rel" => {
                 let pane = self.focused_pane().as_u64();
-                if let Ok(result) = tako_control::dispatch(
+                match tako_control::dispatch(
                     self,
                     Request::FileOp {
                         op: FileOpKind::CopyRelativePath,
@@ -1637,13 +1679,20 @@ impl TakoApp {
                     },
                     PaneOrigin::User,
                 ) {
-                    if let Some(p) = result["path"].as_str() {
-                        cx.write_to_clipboard(ClipboardItem::new_string(p.to_string()));
+                    Ok(result) => {
+                        if let Some(p) = result["path"].as_str() {
+                            cx.write_to_clipboard(ClipboardItem::new_string(p.to_string()));
+                        }
                     }
+                    Err(e) => self.notify_tree_dispatch_failed(
+                        crate::ui_text::sidebar::menu_copy_rel(),
+                        Some(&target),
+                        &e,
+                    ),
                 }
             }
             "reveal" => {
-                let _ = tako_control::dispatch(
+                let result = tako_control::dispatch(
                     self,
                     Request::FileOp {
                         op: FileOpKind::Reveal,
@@ -1653,10 +1702,17 @@ impl TakoApp {
                     },
                     PaneOrigin::User,
                 );
+                if let Err(e) = result {
+                    self.notify_tree_dispatch_failed(
+                        crate::ui_text::sidebar::menu_reveal(fm),
+                        Some(&target),
+                        &e,
+                    );
+                }
             }
             "open-term" => {
                 let pane = self.focused_pane().as_u64();
-                let _ = tako_control::dispatch(
+                let result = tako_control::dispatch(
                     self,
                     Request::FileOp {
                         op: FileOpKind::OpenTerminal,
@@ -1666,6 +1722,13 @@ impl TakoApp {
                     },
                     PaneOrigin::User,
                 );
+                if let Err(e) = result {
+                    self.notify_tree_dispatch_failed(
+                        crate::ui_text::sidebar::menu_open_term(),
+                        Some(&target),
+                        &e,
+                    );
+                }
             }
             "rename" | "new-file" | "new-dir" => {
                 let init_text = if action == "rename" {
@@ -1702,7 +1765,9 @@ impl TakoApp {
                 }
             }
             "trash" => {
-                let _ = tako_control::dispatch(
+                // #1399: **削除を約束しているラベル**なので、失敗を無言にすると
+                // 「消えたのか押せていないのか」がユーザーに区別できない
+                let result = tako_control::dispatch(
                     self,
                     Request::FileOp {
                         op: FileOpKind::Trash,
@@ -1712,10 +1777,17 @@ impl TakoApp {
                     },
                     PaneOrigin::User,
                 );
+                if let Err(e) = result {
+                    self.notify_tree_dispatch_failed(
+                        crate::ui_text::sidebar::menu_trash(fm),
+                        Some(&target),
+                        &e,
+                    );
+                }
                 self.sync_filetree_roots();
             }
             "open-default" => {
-                let _ = tako_control::dispatch(
+                let result = tako_control::dispatch(
                     self,
                     Request::FileOp {
                         op: FileOpKind::OpenDefault,
@@ -1725,11 +1797,32 @@ impl TakoApp {
                     },
                     PaneOrigin::User,
                 );
+                if let Err(e) = result {
+                    self.notify_tree_dispatch_failed(
+                        crate::ui_text::sidebar::menu_open_default(),
+                        Some(&target),
+                        &e,
+                    );
+                }
             }
             "open-with" => {
                 let path_owned = path.to_path_buf();
-                cx.spawn(async move |_, _| {
-                    let _ = pick_app_and_open(&path_owned);
+                // #1399: OS のアプリ選択ダイアログは dispatch を通らないので、
+                // 結果は背景タスクからモデルへ戻して通知欄へ出す
+                cx.spawn(async move |this, cx| {
+                    let outcome = pick_app_and_open(&path_owned);
+                    let target = path_owned.display().to_string();
+                    this.update(cx, |this, cx| {
+                        if let Err(e) = outcome {
+                            this.notify_tree_op_failed(
+                                crate::ui_text::sidebar::menu_open_with(),
+                                Some(&target),
+                                &e,
+                            );
+                        }
+                        cx.notify();
+                    })
+                    .ok();
                 })
                 .detach();
             }
@@ -1737,7 +1830,7 @@ impl TakoApp {
                 self.toggle_hidden_files(cx);
             }
             "remove-root" => {
-                let _ = tako_control::dispatch(
+                let result = tako_control::dispatch(
                     self,
                     Request::TreeFolder {
                         action: "remove".into(),
@@ -1748,6 +1841,13 @@ impl TakoApp {
                     },
                     PaneOrigin::User,
                 );
+                if let Err(e) = result {
+                    self.notify_tree_dispatch_failed(
+                        crate::ui_text::sidebar::menu_remove_root(),
+                        Some(&target),
+                        &e,
+                    );
+                }
                 self.sync_filetree_roots();
             }
             _ => {}
@@ -1866,7 +1966,12 @@ impl TakoApp {
         *LEGACY.get_or_init(|| std::env::var_os("TAKO_1010_LEGACY").is_some())
     }
 
-    /// リモート操作の通知を出す（#919）。失敗は自動で消さない
+    /// リモート操作の通知を出す（#919）。失敗は自動で消さない。
+    ///
+    /// **名前に remote が入っているが、実体はサイドバー共有の通知欄**
+    /// （`render_sidebar` がツリーの上へ無条件で描くバナー。クリックで消える）。
+    /// #1376 の URL ブロック・#1399 のローカル操作もここへ出す。呼び出し側の
+    /// 差分を増やさないため名前は変えていない（正体はこの doc が正）
     pub(crate) fn set_remote_notice(&mut self, text: String, is_error: bool) {
         if is_error {
             // 理由が読めなければ意味が無いので、閉じているサイドバーを開く
@@ -1877,6 +1982,72 @@ impl TakoApp {
             is_error,
             at: std::time::Instant::now(),
         });
+    }
+
+    /// ファイルツリーの**ローカル行**の操作が失敗したことを画面へ出す唯一の口（#1399）。
+    ///
+    /// ローカル行の操作は以前 `let _ = dispatch(..)` / `if result.is_ok()` /
+    /// `eprintln!` で結果を捨てていたので、**ごみ箱移動やリネームが失敗しても
+    /// 画面が無反応**だった（同じサイドバーのリモート行は #919 から通知欄へ
+    /// 出していたので、1 つの画面に 2 つのエラー方針が同居していた）。
+    ///
+    /// 出し先はリモート行と同じ [`Self::set_remote_notice`] = 共有の通知欄で、
+    /// 同じ失敗を persist.log にも 1 行残す。**診断へ載せるのは操作名と
+    /// 理由の分類だけ**（パス・OS のエラー文は載せない = #1376 と同じ作法）。
+    /// 通知本文にはユーザーが見て分かる対象（パス・打った名前）と理由を出す
+    fn notify_tree_failure(&mut self, diag_op: &str, class: &str, text: String) {
+        // #1399 の A/B: 旧挙動（結果を捨てて画面にも診断にも何も出さない）へ戻す
+        if Self::legacy_1399() {
+            return;
+        }
+        tako_control::diag::persist_log(&format!(
+            "ツリーのローカル操作に失敗: op={diag_op} 分類={class}"
+        ));
+        self.set_remote_notice(text, true);
+    }
+
+    /// 右クリックメニュー・トグルの dispatch が `Err` を返したときの通知（#1399）。
+    /// `op` は**ユーザーが押した項目の文言**をそのまま渡す（押したものと失敗した
+    /// ものの名前が必ず一致する）。`target` が `None` なのは対象パスを持たない操作
+    pub(crate) fn notify_tree_dispatch_failed(
+        &mut self,
+        op: &str,
+        target: Option<&str>,
+        err: &tako_control::DispatchError,
+    ) {
+        let reason = err.to_string();
+        self.notify_tree_failure(
+            op,
+            err.class(),
+            crate::ui_text::sidebar::notice_op_failed(op, target, &reason),
+        );
+    }
+
+    /// dispatch を経由しない経路（OS ダイアログ・PTY 起動）の失敗の通知（#1399）。
+    /// 理由は `String` しか無いので分類は `operation` 固定
+    pub(crate) fn notify_tree_op_failed(&mut self, op: &str, target: Option<&str>, reason: &str) {
+        self.notify_tree_failure(
+            op,
+            "operation",
+            crate::ui_text::sidebar::notice_op_failed(op, target, reason),
+        );
+    }
+
+    /// ファイル行を開けなかったときの通知（#1283 の cmd+クリックと同じ文言。#1399）
+    pub(crate) fn notify_tree_open_failed(&mut self, diag_op: &str, path: &str, reason: &str) {
+        self.notify_tree_failure(
+            diag_op,
+            "operation",
+            crate::ui_text::sidebar::notice_open_failed(path, reason),
+        );
+    }
+
+    /// #1399 の A/B。`TAKO_1399_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
+    /// （ローカル操作の失敗を通知欄にも persist.log にも出さず、リネーム / 新規作成の
+    /// 失敗では打った名前も捨てる = 「押しても無言」の再現）
+    pub(crate) fn legacy_1399() -> bool {
+        static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *LEGACY.get_or_init(|| std::env::var("TAKO_1399_LEGACY").map(|v| v == "1") == Ok(true))
     }
 
     /// リモート行の右クリックメニューの実行（#919）
@@ -1968,7 +2139,11 @@ impl TakoApp {
             PaneOrigin::User,
         );
         if let Err(e) = result {
-            eprintln!("warning: ファイルを開けない: {e}");
+            // #1399: `eprintln!` だけだと GUI では誰も読めない（= 行を押しても無言。
+            // #1398 のシンボリックリンクはここで完全に無反応になっていた）。
+            // 文言は #1283 の cmd+クリックと同じものを共有する
+            let reason = e.to_string();
+            self.notify_tree_open_failed("open-file", &path.display().to_string(), &reason);
         }
         self.drain_pending_highlights(cx);
         cx.notify();
@@ -1983,6 +2158,11 @@ impl TakoApp {
         cx: &mut Context<Self>,
     ) {
         use crate::open_files::OpenTarget;
+        // #1399: 失敗の通知に出す対象（どちらの経路でもパス 1 本）
+        let target_label = match target {
+            OpenTarget::PreviewInNewTab(path) => path.display().to_string(),
+            OpenTarget::ShellInNewTab(dir) => dir.display().to_string(),
+        };
         let request = match target {
             OpenTarget::PreviewInNewTab(path) => tako_control::protocol::Request::OpenFile {
                 pane: None,
@@ -2011,12 +2191,22 @@ impl TakoApp {
                 // （残すと空のペインが残り、後続 dispatch が巻き添えを食う）
                 for (pane, options) in std::mem::take(&mut self.pending_attach) {
                     if let Err(e) = self.spawn_session(pane, options, cx) {
-                        eprintln!("warning: フォルダのターミナルを起動できない: {e}");
+                        // #1399: ペインを消してしまうので、消した理由を画面へ残す
+                        // （残さないと「新しいタブが一瞬出て消えた」だけになる）
+                        let reason = e.to_string();
+                        self.notify_tree_op_failed(
+                            crate::ui_text::sidebar::menu_open_term(),
+                            Some(&target_label),
+                            &reason,
+                        );
                         self.remove_pane(pane, cx);
                     }
                 }
             }
-            Err(e) => eprintln!("warning: Finder から渡されたものを開けない: {e}"),
+            Err(e) => {
+                let reason = e.to_string();
+                self.notify_tree_open_failed("open-from-finder", &target_label, &reason);
+            }
         }
         self.drain_pending_highlights(cx);
         cx.notify();
@@ -2173,7 +2363,12 @@ impl TakoApp {
             .retain(|path, _| keep.contains(path));
         if let Some(watcher) = self.preview_file_watcher.as_mut() {
             if watcher.sync_paths(paths).is_err() {
-                eprintln!("warning: プレビューの監視対象を更新できない");
+                // #1399: `eprintln!` は GUI では誰も読めないので persist.log へ。
+                // **通知欄には出さない**（ユーザーの操作が無い背景の保守処理で、
+                // バナーを出すと押していない操作の失敗が画面に居座る）
+                tako_control::diag::persist_log(
+                    "プレビューの監視対象を更新できない: 分類=watcher_sync",
+                );
             }
         }
     }
