@@ -136,12 +136,46 @@ pub fn set_autosuggest(enabled: bool) {
 }
 
 /// 状態ファイルを 1 行 1 値で書く（部分書き込みを読ませないよう tmp → rename）。
-/// tmp 名はプロセス固有にする（プライマリ / セカンダリが同じ data_dir を共有しうるため）
+///
+/// tmp 名は **書き込み 1 回ごと**に固有にする（#638）。プロセス単位までしか分けないと、
+/// 同一プロセスの 2 スレッドが同じ tmp を共有し、A が rename したあとに B が
+/// **本番ファイルになった同じ inode へ書き込む**（B の fd は rename に付いていく）。
+/// 短い本文が長い本文へ上書きされて途中状態がそのまま読まれるうえ、B の rename は
+/// 消えた tmp を探して ENOENT で失敗する。#625 で `tmux-backend.conf` に対して
+/// 実測した穴と同型なので、[`crate::tmux_backend`] の `write_conf_in` と同じ作法で閉じる。
+/// data_dir はプライマリ / セカンダリでも共有されうるので pid も併記する
 fn write_state_file(root: &Path, name: &str, body: &str) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
     std::fs::create_dir_all(root)?;
-    let tmp = root.join(format!("{name}.{}.tmp", std::process::id()));
+    let tmp = root.join(state_tmp_name(
+        name,
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed),
+        legacy_tmp_name(),
+    ));
     std::fs::write(&tmp, body)?;
-    std::fs::rename(&tmp, root.join(name))
+    if let Err(e) = std::fs::rename(&tmp, root.join(name)) {
+        // 置き場に tmp のゴミを残さない（rename に失敗する経路でも #625 と同じ後始末）
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// 状態ファイルの tmp 名。`seq` が書き込み 1 回ごとに進むので、同一プロセス内で
+/// 並行に書いても tmp を奪い合わない。`legacy` は #638 の A/B（修正前の pid 止まり）
+fn state_tmp_name(name: &str, pid: u32, seq: u64, legacy: bool) -> String {
+    if legacy {
+        return format!("{name}.{pid}.tmp");
+    }
+    format!("{name}.{pid}.{seq}.tmp")
+}
+
+/// #638 の A/B。`TAKO_638_LEGACY=1` で**同一バイナリのまま**修正前の tmp 名へ戻す
+fn legacy_tmp_name() -> bool {
+    std::env::var_os("TAKO_638_LEGACY").is_some_and(|v| !v.is_empty())
 }
 
 /// 確定キーのヒントの残り回数（Issue #614）。`None` = 恒久 OFF。
@@ -1244,6 +1278,193 @@ mod tests {
         std::fs::write(root.join("autosuggest"), "garbage").unwrap();
         assert!(autosuggest_state_in(&root));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// テスト用一時ディレクトリの後始末。**一時ディレクトリ配下であることを検証してから**
+    /// 消す（変数名の取り違えで実ファイルを消す事故を構造的に防ぐ）
+    fn remove_temp_dir(dir: &Path) {
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "一時ディレクトリ以外を削除しようとしている: {}",
+            dir.display()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 置き場に残っている tmp ファイルの一覧（書き終えたあとは 0 件が正しい）
+    fn tmp_leftovers(root: &Path) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return Vec::new();
+        };
+        let mut left: Vec<String> = entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        left.sort();
+        left
+    }
+
+    /// #638: tmp 名は**書き込み 1 回ごと**に分かれる。修正前（pid 止まり）は
+    /// 2 回目の書き込みが同じ名前を使う = 同一プロセスの書き手同士が奪い合う
+    #[test]
+    fn 状態ファイルのtmp名は書き込みごとに固有になる() {
+        let first = state_tmp_name("autosuggest", 42, 0, false);
+        let second = state_tmp_name("autosuggest", 42, 1, false);
+        assert_ne!(first, second, "書き込みごとに tmp 名が変わること");
+        // 修正前の形。pid が同じなら seq が進んでも同じ名前になる
+        assert_eq!(
+            state_tmp_name("autosuggest", 42, 0, true),
+            state_tmp_name("autosuggest", 42, 1, true),
+            "A/B の legacy アームは修正前（プロセス単位まで）の名前へ戻ること"
+        );
+        // 本番ファイル名とは衝突せず、同じディレクトリに置ける形であること
+        // （rename が原子的である条件 = 同一ディレクトリ内であること）
+        assert!(first.starts_with("autosuggest."), "{first}");
+        assert!(first.ends_with(".tmp"), "{first}");
+        assert!(!first.contains(std::path::MAIN_SEPARATOR), "{first}");
+    }
+
+    /// #638 の再現 + 回帰。同一プロセス内で 8 スレッドが同じ状態ファイルへ書き、
+    /// 読み手が本番ファイルを読み続ける。tmp 名がプロセス単位までしか分かれていないと、
+    /// A の rename のあとに B が**本番ファイルになった同じ inode** へ書き込むため、
+    /// 読み手が「どちらの本文でもない混ざった内容」を観測し、B の rename は ENOENT で失敗する。
+    ///
+    /// **待ちは状態待ち**（書き手の完了フラグ）で、実時間の比較はしない。
+    /// A/B: `TAKO_638_LEGACY=1` を付けるとこのテストが FAILED になる
+    #[test]
+    fn 同一プロセス内の並行書き込みでも途中状態が読まれない() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        const THREADS: usize = 8;
+        const WRITES: usize = 300;
+        const NAME: &str = "autosuggest-hint-text";
+
+        let root = std::env::temp_dir().join(format!("tako-638-race-{}", std::process::id()));
+        remove_temp_dir(&root);
+        std::fs::create_dir_all(&root).expect("置き場を作る");
+
+        // 長短 2 種類の本文。**長さが違う**ことが要点で、短い側が長い側の上に書かれると
+        // 末尾が残って「どちらの本文でもない内容」になる = 途中状態を観測できる
+        let long = ("L".repeat(4096), "l".repeat(4096));
+        let short = ("S".to_string(), "s".to_string());
+        let body = |t: &(String, String)| format!("{}\n{}\n", t.0, t.1);
+        let valid = [body(&long), body(&short)];
+
+        let done = Arc::new(AtomicBool::new(false));
+        let torn = Arc::new(Mutex::new(Vec::<String>::new()));
+        let write_errors = Arc::new(Mutex::new(Vec::<String>::new()));
+        let reads = Arc::new(AtomicUsize::new(0));
+
+        let reader = {
+            let path = root.join(NAME);
+            let done = Arc::clone(&done);
+            let torn = Arc::clone(&torn);
+            let reads = Arc::clone(&reads);
+            let valid = valid.clone();
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    // 不在（1 回目の rename より前）は異常ではないので読めた回だけ数える
+                    if let Ok(seen) = std::fs::read_to_string(&path) {
+                        reads.fetch_add(1, Ordering::Relaxed);
+                        if !valid.contains(&seen) {
+                            let mut g = torn.lock().expect("torn");
+                            if g.len() < 8 {
+                                // 全文（8 KiB）は出さない。長さと先頭・末尾だけで形が分かる
+                                let head: String = seen.chars().take(12).collect();
+                                let tail: String = seen.chars().rev().take(12).collect::<String>();
+                                g.push(format!(
+                                    "len={} head={head:?} tail(逆順)={tail:?}",
+                                    seen.len()
+                                ));
+                            }
+                        }
+                    }
+                }
+            })
+        };
+
+        let writers: Vec<_> = (0..THREADS)
+            .map(|i| {
+                let root = root.clone();
+                // 半々で長短を書く。どちらの上書き方向も起こす必要がある
+                let texts = if i % 2 == 0 {
+                    long.clone()
+                } else {
+                    short.clone()
+                };
+                let write_errors = Arc::clone(&write_errors);
+                std::thread::spawn(move || {
+                    for _ in 0..WRITES {
+                        if let Err(e) = write_autosuggest_hint_text_in(&root, &texts) {
+                            let mut g = write_errors.lock().expect("write_errors");
+                            if g.len() < 8 {
+                                g.push(format!("{e}"));
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for w in writers {
+            w.join().expect("書き手の合流");
+        }
+        done.store(true, Ordering::Relaxed);
+        reader.join().expect("読み手の合流");
+
+        let torn = torn.lock().expect("torn").clone();
+        let errors = write_errors.lock().expect("write_errors").clone();
+        let reads = reads.load(Ordering::Relaxed);
+
+        // 読み手が 1 度も読めていないと検査が空回りする（検出力の確認）
+        assert!(reads > 0, "読み手が本番ファイルを 1 度も読めていない");
+        // 2 つの症状（途中状態の観測 / rename の失敗）は同じ競合の裏表なので一緒に報告する
+        assert!(
+            torn.is_empty() && errors.is_empty(),
+            "並行書き込みが競合した（読み手は {reads} 回読んだ）: \
+             読み手が観測した途中状態={torn:?} / 書き込みの失敗={errors:?}"
+        );
+        assert!(
+            tmp_leftovers(&root).is_empty(),
+            "tmp が置き場に残っている: {:?}",
+            tmp_leftovers(&root)
+        );
+        let last = std::fs::read_to_string(root.join(NAME)).expect("最終状態を読む");
+        assert!(valid.contains(&last), "最終内容がどちらの本文でもない");
+
+        remove_temp_dir(&root);
+    }
+
+    /// #638 の周辺条件。置き場が無くても書けること・連続トグルで最後の値が残ること・
+    /// 読み手が空ファイルを見たときの既定（ON 側へ倒す）
+    #[test]
+    fn 状態ファイルは置き場が無くても書けて連続トグルでも最後の値が残る() {
+        let base = std::env::temp_dir().join(format!("tako-638-edge-{}", std::process::id()));
+        remove_temp_dir(&base);
+        let root = base.join("nested").join("shell-integration");
+
+        // 置き場がまだ無い状態から書ける（create_dir_all がある）
+        write_autosuggest_state_in(&root, false).expect("置き場が無くても書ける");
+        assert!(!autosuggest_state_in(&root));
+
+        // 連続トグル（同じスレッドから間を置かず 2 回）。最後の値が残り、tmp は残らない
+        write_autosuggest_state_in(&root, true).expect("書ける");
+        write_autosuggest_state_in(&root, false).expect("書ける");
+        assert!(!autosuggest_state_in(&root));
+        assert!(
+            tmp_leftovers(&root).is_empty(),
+            "tmp が置き場に残っている: {:?}",
+            tmp_leftovers(&root)
+        );
+
+        // 読み手が空ファイルを見たら既定（ON）へ倒す。tmp → rename がある限りこの状態は
+        // 並行書き込みでは作られないが、外から壊されたときの倒し方は変えていない
+        std::fs::write(root.join("autosuggest"), "").expect("空にする");
+        assert!(autosuggest_state_in(&root));
+
+        remove_temp_dir(&base);
     }
 }
 
