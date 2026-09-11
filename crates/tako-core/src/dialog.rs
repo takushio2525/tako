@@ -1118,6 +1118,14 @@ fn framed_as_input_box(
 ///   （agy の信頼ダイアログ）ではこの規則は自動的に無効 = 従来どおり罫線だけが境界
 /// - **選択肢に採らなかった番号つき行**（[`numbered_block`] が切った側）も境界にする。
 ///   別の一覧がそこで終わっている証拠なので、それより上は本文ではない
+///
+/// #633 で**起点**を足した。上の 3 つはどれも「境界に当たったら捨てる」形なので、
+/// 罫線を引かず・箱ごと 0 桁で描く許可ダイアログ（agy の `Requesting permission for:` /
+/// claude の `Claude wants to run:`）では捨てる材料が 1 つも無く、直前の発話が
+/// そのまま `command` の先頭に残っていた。そこで
+/// [`BODY_START_MARKERS`] に一致する行が在れば**そこから**集める
+/// （[`body_start_row`]）。起点は選択肢に最も近い一致で、無ければ従来どおり画面の上端。
+/// **起点を下げるだけなので結果は必ず従来の本文の接尾辞**（行が増えることはない）
 fn header_block(lines: &[&str], option_rows: &[usize]) -> Vec<String> {
     let first_option_row = option_rows.first().copied().unwrap_or(0);
     // 箱の左端（並びの最も浅い行）。0 = 箱ごと 0 桁で描く TUI なので会話ログと区別できない
@@ -1132,7 +1140,8 @@ fn header_block(lines: &[&str], option_rows: &[usize]) -> Vec<String> {
             .unwrap_or(0)
     };
     let mut block: Vec<String> = Vec::new();
-    for line in lines.iter().take(first_option_row) {
+    let start = body_start_row(lines, first_option_row);
+    for line in lines.iter().take(first_option_row).skip(start) {
         let t = line.trim();
         if t.is_empty() || is_key_hint(line) {
             continue;
@@ -1155,6 +1164,56 @@ fn header_block(lines: &[&str], option_rows: &[usize]) -> Vec<String> {
         }
     }
     block
+}
+
+/// ダイアログ本体の開始マーカー（#633）。**実採取の画面にだけ**由来する。
+///
+/// - `Claude wants to run:` — claude の Bash 承認（罫線なし・箱は 2 桁 / 選択肢は 0 桁）
+/// - `Claude requested permissions to` — claude のファイル承認（先頭に `? ` が付く）
+/// - `Requesting permission for:` — agy の許可（箱ごと 0 桁）
+/// - `Bash command` — claude 2.x の罫線ボックスの見出し
+///
+/// 罫線で囲まれた形（claude 2.x）は罫線が起点になるのでマーカーは要らないが、
+/// #633 の実測値（`⏺ … Bash command rm -rf build/ Do you want to proceed?`）は
+/// **罫線がその画面に無かった**ことを示すので見出しも入れてある。
+/// **採取していない見出し（`Edit file` 等）を当て推量で足さない**
+/// — 一致しなければ従来のブロック抽出へ落ちるだけで、増やす利得より
+/// 「会話文が偶然一致して起点が上へずれる」害のほうが大きい
+pub const BODY_START_MARKERS: &[&str] = &[
+    "Claude wants to run:",
+    "Claude requested permissions to",
+    "Requesting permission for:",
+    "Bash command",
+];
+
+/// 本文を集め始める行（#633）。[`BODY_START_MARKERS`] の**最後の一致**
+/// （= 選択肢に最も近い = 会話文の言及より下）。無ければ 0 = 従来どおり画面の上端
+fn body_start_row(lines: &[&str], first_option_row: usize) -> usize {
+    if legacy_body_anchor() {
+        return 0;
+    }
+    lines
+        .iter()
+        .take(first_option_row)
+        .rposition(|l| is_body_start_marker(l))
+        .unwrap_or(0)
+}
+
+/// ダイアログ本体の開始行か（#633）。行頭の飾り（`? ` / `❯ ` / `> `）は
+/// [`header_block`] と同じ規則で剥がしてから見る
+fn is_body_start_marker(line: &str) -> bool {
+    let t = line
+        .trim()
+        .trim_start_matches("? ")
+        .trim_start_matches("❯ ")
+        .trim_start_matches("> ");
+    BODY_START_MARKERS.iter().any(|m| t.starts_with(m))
+}
+
+/// `TAKO_633_LEGACY=1` で #633 前（本文は常に画面の上端から集める）へ戻す（A/B 用）
+fn legacy_body_anchor() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_633_LEGACY").is_some())
 }
 
 #[cfg(test)]
@@ -2678,5 +2737,61 @@ Antigravity CLI requires permission to read, edit, and execute files here.
         let list = detect_choice_list(&rows(text)).expect("説明行を跨いで案内を見つける");
         assert_eq!(list.options.len(), 2);
         assert_eq!(list.highlighted, Some(0));
+    }
+
+    // --- #633: 本文の起点（承認カードの command に直前の発話が混ざる） ---
+
+    #[test]
+    fn issue633_起点は選択肢に最も近いマーカー() {
+        // 会話文が同じ語に触れていても、起点は**下**の本物の見出しになる
+        let lines = rows(concat!(
+            "⏺ Bash command の承認を求めます。\n",
+            "  少し時間がかかります。\n",
+            "\n",
+            " Bash command\n",
+            "   rm -rf build/\n",
+            " Do you want to proceed?\n"
+        ));
+        assert_eq!(body_start_row(&lines, lines.len()), 3);
+        // マーカーが 1 つも無ければ従来どおり画面の上端から
+        assert_eq!(body_start_row(&rows("⏺ ふつうの応答\n  つづき\n"), 2), 0);
+    }
+
+    #[test]
+    fn issue633_行頭の飾りを剥がしてから見る() {
+        // claude のファイル承認は `? ` 付き・agy の選択カーソルは `> ` 付き
+        assert!(is_body_start_marker(
+            "? Claude requested permissions to write to .../main.aux"
+        ));
+        assert!(is_body_start_marker("  Claude wants to run:"));
+        assert!(is_body_start_marker("Requesting permission for:"));
+        assert!(is_body_start_marker(" Bash command"));
+        // 語の途中や別の文言には当たらない
+        assert!(!is_body_start_marker("  the Bash command failed"));
+        assert!(!is_body_start_marker(" Select model"));
+    }
+
+    #[test]
+    fn issue633_起点は既存の実採取ダイアログの本文を変えない() {
+        // 罫線ボックス（PERMISSION）は見出しが起点、罫線を引かない画面
+        // （TEACH_AUTO_MODE / MODEL_SELECT / MCP_LIST）はマーカー不一致で従来どおり
+        for (name, text, want) in [
+            ("permission", PERMISSION, "Bash command"),
+            (
+                "auto mode",
+                TEACH_AUTO_MODE,
+                "Teach auto mode about your environment?",
+            ),
+            ("model select", MODEL_SELECT, "Select model"),
+            ("mcp list", MCP_LIST, "Manage MCP servers"),
+        ] {
+            let list = detect_choice_list(&rows(text)).unwrap_or_else(|| panic!("{name} 未検知"));
+            assert_eq!(
+                list.header.first().map(String::as_str),
+                Some(want),
+                "{name}: 本文の先頭が変わった: {:?}",
+                list.header
+            );
+        }
     }
 }

@@ -1182,6 +1182,25 @@ claude は空欄へ **AI のゴースト提案**を dim で描き、文面は
 - A/B は `TAKO_1293_LEGACY=1`。実経路の番犬は模擬 TUI の e2e
   （`crates/tako-control/tests/issue1293_dialog_numbered_block_e2e.rs`）
 
+### 境界が 1 つも無い画面には「起点」を置く（Issue #633）
+
+上の 3 つはどれも**当たったら捨てる**形なので、**罫線を引かず・箱ごと 0 桁で描く**
+許可ダイアログでは捨てる材料が 1 つも無く、上に在る会話がすべて本文（`command` / `title`）へ入る。
+実採取の 3 形のうち agy（`Requesting permission for:`）と claude の箱なし
+（`Claude wants to run:` / `? Claude requested permissions to …`）がこれに当たる。
+
+- **本体の開始マーカー（`dialog::BODY_START_MARKERS`）に一致する行が在れば、そこから集める**
+  （`body_start_row`）。一致が無ければ従来どおり画面の上端から = **フォールバックが既定**
+- 起点は**選択肢に最も近い一致**（会話文が同じ語に触れていても本物の見出しが勝つ）。
+  **起点を下げるだけなので結果は必ず従来の本文の接尾辞**で、拾えていた本文が減ることはない
+- マーカーは**実採取の画面に在る文言だけ**を載せる。採っていない見出し（`Edit file` 等）を
+  当て推量で足さない — 一致しなければ従来の抽出へ落ちるだけで、増やす利得より
+  「会話文が偶然一致して起点が上へずれる」害のほうが大きい。
+  死に文字列を防ぐ番犬が `issue633_起点マーカーは実採取に実在する`
+- **空行を境界にする案は採れない**（claude の実ダイアログは本体に空行を 3 つ挟む = 実採取）
+- A/B は `TAKO_633_LEGACY=1`。番犬は
+  `crates/tako-control/tests/issue633_permission_command_anchor.rs`（legacy 腕で 2 本 FAILED）
+
 ## セルフテストでターミナル本体を操作するなら表示モードを terminal へ倒す（Issue #1182）
 
 `render_pane` は `pane_display_for` が `Starter` / `Chat` を返すと
