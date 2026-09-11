@@ -38,7 +38,7 @@
 //! 「動くつもりで半端に壊れた永続化」が最悪なので、黙って使うことはしない。
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -191,24 +191,87 @@ fn run_with(bin: &str, socket: Option<&str>, args: &[&str]) -> Result<String, St
     }
 }
 
-/// 専用 conf をデータディレクトリへ書き出す（毎起動上書き = バージョン更新追従）。
-/// 書けない環境では `None` を返し、`-f` を付けずに起動する（ユーザー conf を読む
-/// 可能性は残るが、器が作れないよりはよい）。
+/// psmux が受理することを実バイナリで確かめてある conf の中身
+/// （統合テスト `psmux_backend::confは警告なしで受理されwarm_offが効く` が検証する）。
 ///
 /// `pub` なのは統合テストが「この conf を psmux が警告なしで受理するか」を
 /// 実バイナリで確かめるため（未知のオプションが 1 行でもあるとペインに警告が出る）
-/// psmux が受理することを実バイナリで確かめてある conf の中身
-/// （統合テスト `psmux_backend::confは警告なしで受理されwarm_offが効く` が検証する）
 pub fn verified_conf() -> &'static str {
     BACKEND_CONF
 }
 
+/// 専用 conf の置き場でのファイル名（置き場は [`data_dir`]）
+const CONF_FILE_NAME: &str = "psmux-backend.conf";
+
+/// 専用 conf をデータディレクトリへ書き出し、そのパスを返す（内容が変わっていれば
+/// 上書き = バージョン更新追従）。書けない環境では `None` を返し、`-f` を付けずに
+/// 起動する（ユーザー conf を読む可能性は残るが、器が作れないよりはよい）
 pub fn ensure_conf() -> Option<PathBuf> {
-    let dir = data_dir()?;
-    std::fs::create_dir_all(&dir).ok()?;
-    let path = dir.join("psmux-backend.conf");
-    std::fs::write(&path, BACKEND_CONF).ok()?;
-    Some(path)
+    write_conf_in(&data_dir()?, BACKEND_CONF).ok()
+}
+
+/// conf を `dir` へ**原子的に**置き、そのパスを返す（#1314）。
+///
+/// **一時ファイル → rename で差し替える**。[`PsmuxBackend::wrap_spawn`] はペインを
+/// spawn するたびにここを通るので、複数ペイン・複数インスタンス（本番 GUI + 隔離 GUI +
+/// テスト）が重なると「書き手が truncate している最中の conf」を、別ペインが起動した
+/// psmux サーバーが `-f` で読みうる。読ませると器は既定設定（status on / warm on /
+/// history-limit 既定）で立ち上がり、ステータスバーが出る・warm pane が pwsh を
+/// 1 本余計に常駐させる（#519 の実測で +112MB/session）。rename は同一ディレクトリ内で
+/// 原子的なので、読み手は常に完全な conf を見る。tmux 側の
+/// [`crate::tmux_backend`] `write_conf_in`（#625）と同じ作法。
+///
+/// **内容が同じなら書かない**（[`conf_needs_write`]）。`BACKEND_CONF` は定数なので
+/// 2 回目以降の spawn は読むだけで終わり、差し替えの窓そのものが消える。Windows では
+/// rename 先を別プロセスが `FILE_SHARE_DELETE` 無しで開いていると置換に失敗しうるので、
+/// 「最終パスに触らずに済ませる回」を増やす意味もある（失敗時の縮退は修正前と同じ =
+/// `None` を返して `-f` を付けない）
+fn write_conf_in(dir: &Path, body: &str) -> std::io::Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(CONF_FILE_NAME);
+    if legacy_direct_write() {
+        // #1314 の A/B。修正前（最終パスへ毎回直書き）をそのまま再現する
+        std::fs::write(&path, body)?;
+        return Ok(path);
+    }
+    if !conf_needs_write(&path, body) {
+        return Ok(path);
+    }
+    let tmp = dir.join(conf_tmp_name(
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(&tmp, body)?;
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        // 置き場に tmp のゴミを残さない（#638 と同じ後始末）
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(path)
+}
+
+/// 置いてある conf が `body` と違う（= 書き直す必要がある）か。読めない・不在は
+/// 「違う」へ倒す。tmp → rename しか書き手が居ないので、ここで読めるのは常に
+/// 完全な内容（途中状態と比べて誤判定する余地がない）
+fn conf_needs_write(path: &Path, body: &str) -> bool {
+    !std::fs::read(path).is_ok_and(|cur| cur == body.as_bytes())
+}
+
+/// conf の tmp 名。**書き込み 1 回ごと**に固有にする（pid + 連番）。プロセス単位までしか
+/// 分けないと、同一プロセスの書き手同士が同じ tmp を奪い合い、A が rename したあとに
+/// B が**本番ファイルになった同じ inode** へ書く（#638 で実測）。data_dir は
+/// プライマリ / セカンダリでも共有されうるので pid も併記する
+fn conf_tmp_name(pid: u32, seq: u64) -> String {
+    format!("{CONF_FILE_NAME}.{pid}.{seq}.tmp")
+}
+
+/// #1314 の A/B。`TAKO_1314_LEGACY=1` で**同一バイナリのまま**修正前
+/// （最終パスへ毎回直書き）へ戻す
+fn legacy_direct_write() -> bool {
+    std::env::var_os("TAKO_1314_LEGACY").is_some_and(|v| !v.is_empty())
 }
 
 impl SessionBackend for PsmuxBackend {
@@ -1360,5 +1423,236 @@ mod tests {
         assert!(!b.is_orphan_candidate(&info("tako-view-x"), &empty));
         let protected: HashSet<SessionRef> = [session("tako-dddddddddddd")].into_iter().collect();
         assert!(!b.is_orphan_candidate(&info("tako-dddddddddddd"), &protected));
+    }
+
+    // ---- #1314: conf の書き込みが原子的であること ----
+
+    /// テスト用一時ディレクトリの後始末。**一時ディレクトリ配下であることを検証してから**
+    /// 消す（変数名の取り違えで実ファイルを消す事故を構造的に防ぐ）
+    fn remove_temp_dir(dir: &Path) {
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "一時ディレクトリ以外を削除しようとしている: {}",
+            dir.display()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// このテスト専用の空の置き場（pid + 用途で分ける）
+    fn conf_test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tako-1314-{tag}-{}", std::process::id()));
+        remove_temp_dir(&dir);
+        dir
+    }
+
+    /// 置き場に残っている tmp ファイルの一覧（書き終えたあとは 0 件が正しい）
+    fn tmp_leftovers(root: &Path) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return Vec::new();
+        };
+        let mut left: Vec<String> = entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        left.sort();
+        left
+    }
+
+    /// #1314: tmp 名は**書き込み 1 回ごと**に分かれ、本番ファイルと同じ置き場に収まる
+    /// （rename が原子的である条件 = 同一ディレクトリ内であること）
+    #[test]
+    fn confのtmp名は書き込みごとに固有で同じ置き場に収まる() {
+        let first = conf_tmp_name(42, 0);
+        let second = conf_tmp_name(42, 1);
+        assert_ne!(first, second, "書き込みごとに tmp 名が変わること");
+        assert_ne!(
+            conf_tmp_name(42, 0),
+            conf_tmp_name(43, 0),
+            "別プロセス同士も分かれること（data_dir は共有されうる）"
+        );
+        assert!(first.starts_with(CONF_FILE_NAME), "{first}");
+        assert!(first.ends_with(".tmp"), "{first}");
+        assert_ne!(first, CONF_FILE_NAME, "本番ファイル名と衝突しないこと");
+        assert!(!first.contains(std::path::MAIN_SEPARATOR), "{first}");
+    }
+
+    /// #1314 の再現 + 回帰。同一プロセス内で 8 スレッドが同じ conf へ書き、
+    /// 読み手が本番ファイルを読み続ける。最終パスへ直書き（truncate + write）すると、
+    /// 読み手は「空」や「書きかけ」= どちらの本文でもない途中状態を観測する。
+    /// psmux はこれを `-f` で読むと既定設定で立ち上がる（status バーが出る / warm on）。
+    ///
+    /// **待ちは状態待ち**（書き手の完了フラグ）で、実時間の比較はしない。
+    /// A/B: `TAKO_1314_LEGACY=1` を付けるとこのテストが FAILED になる
+    #[test]
+    fn 並行書き込みでもconfの途中状態が読まれない() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        const THREADS: usize = 8;
+        const WRITES: usize = 200;
+
+        let root = conf_test_dir("race");
+        std::fs::create_dir_all(&root).expect("置き場を作る");
+
+        // 長短 2 種類の本文。**長さが違う**ことが要点で、短い側が長い側の上に書かれると
+        // 末尾が残って「どちらの本文でもない内容」になる = 途中状態を観測できる。
+        // 長い側は実際の conf（BACKEND_CONF）より十分大きくして truncate の窓を広げる
+        let long = "set -g history-limit 50000\n".repeat(2048);
+        let short = "set -g warm off\n".to_string();
+        let valid = [long.clone(), short.clone()];
+
+        let done = Arc::new(AtomicBool::new(false));
+        let torn = Arc::new(Mutex::new(Vec::<String>::new()));
+        let write_errors = Arc::new(Mutex::new(Vec::<String>::new()));
+        let reads = Arc::new(AtomicUsize::new(0));
+
+        let reader = {
+            let path = root.join(CONF_FILE_NAME);
+            let done = Arc::clone(&done);
+            let torn = Arc::clone(&torn);
+            let reads = Arc::clone(&reads);
+            let valid = valid.clone();
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    // 不在（1 回目の rename より前）は異常ではないので読めた回だけ数える
+                    if let Ok(seen) = std::fs::read_to_string(&path) {
+                        reads.fetch_add(1, Ordering::Relaxed);
+                        if !valid.contains(&seen) {
+                            let mut g = torn.lock().expect("torn");
+                            if g.len() < 8 {
+                                // 全文は出さない。長さと先頭だけで形が分かる
+                                let head: String = seen.chars().take(16).collect();
+                                g.push(format!("len={} head={head:?}", seen.len()));
+                            }
+                        }
+                    }
+                }
+            })
+        };
+
+        let writers: Vec<_> = (0..THREADS)
+            .map(|i| {
+                let root = root.clone();
+                // 半々で長短を書く。どちらの上書き方向も起こす必要がある
+                let body = if i % 2 == 0 {
+                    long.clone()
+                } else {
+                    short.clone()
+                };
+                let write_errors = Arc::clone(&write_errors);
+                std::thread::spawn(move || {
+                    for _ in 0..WRITES {
+                        if let Err(e) = write_conf_in(&root, &body) {
+                            let mut g = write_errors.lock().expect("write_errors");
+                            if g.len() < 8 {
+                                g.push(format!("{e}"));
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for w in writers {
+            w.join().expect("書き手の合流");
+        }
+        done.store(true, Ordering::Relaxed);
+        reader.join().expect("読み手の合流");
+
+        let torn = torn.lock().expect("torn").clone();
+        let errors = write_errors.lock().expect("write_errors").clone();
+        let reads = reads.load(Ordering::Relaxed);
+
+        // 読み手が 1 度も読めていないと検査が空回りする（検出力の確認）
+        assert!(reads > 0, "読み手が本番ファイルを 1 度も読めていない");
+        assert!(
+            torn.is_empty() && errors.is_empty(),
+            "並行書き込みが競合した（読み手は {reads} 回読んだ）: \
+             読み手が観測した途中状態={torn:?} / 書き込みの失敗={errors:?}"
+        );
+        assert!(
+            tmp_leftovers(&root).is_empty(),
+            "tmp が置き場に残っている: {:?}",
+            tmp_leftovers(&root)
+        );
+        let last = std::fs::read_to_string(root.join(CONF_FILE_NAME)).expect("最終状態を読む");
+        assert!(valid.contains(&last), "最終内容がどちらの本文でもない");
+
+        remove_temp_dir(&root);
+    }
+
+    /// #1314 の周辺条件: 置き場が無くても作って置ける・置いたパスは `-f` に渡せる形
+    #[test]
+    fn confは置き場が無くても作って置ける() {
+        // 親ごと存在しない深い置き場（data_dir の初回起動と同じ状況）
+        let base = conf_test_dir("mkdir");
+        let root = base.join("nested").join("data");
+        let path = write_conf_in(&root, BACKEND_CONF).expect("置き場ごと作って書ける");
+        assert_eq!(path, root.join(CONF_FILE_NAME));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("読み戻せる"),
+            BACKEND_CONF
+        );
+        assert!(tmp_leftovers(&root).is_empty(), "tmp が残っている");
+
+        // 内容が変わったら（= バージョン更新）ちゃんと追従する
+        let next = format!("{BACKEND_CONF}set -g status off\n");
+        write_conf_in(&root, &next).expect("上書きできる");
+        assert_eq!(std::fs::read_to_string(&path).expect("読み戻せる"), next);
+
+        remove_temp_dir(&base);
+    }
+
+    /// #1314: 内容が同じなら書き直さない（`BACKEND_CONF` は定数なので 2 回目以降の
+    /// spawn は読むだけで終わる）。判断そのものを固定する
+    #[test]
+    fn 同じ内容のconfは書き直さない() {
+        let root = conf_test_dir("skip");
+        std::fs::create_dir_all(&root).expect("置き場を作る");
+        let path = root.join(CONF_FILE_NAME);
+
+        assert!(conf_needs_write(&path, BACKEND_CONF), "不在なら書く");
+        write_conf_in(&root, BACKEND_CONF).expect("1 回目");
+        assert!(
+            !conf_needs_write(&path, BACKEND_CONF),
+            "同じ内容なら書かない"
+        );
+        assert!(
+            conf_needs_write(&path, "set -g warm off\n"),
+            "内容が変わったら書く"
+        );
+
+        remove_temp_dir(&root);
+    }
+
+    /// #1314: 「書かない」が実際に最終パスへ触っていないことを、置き場を読み取り専用に
+    /// して確かめる（書こうとすれば tmp の作成で失敗する）。権限で検査するので unix 限定
+    #[cfg(unix)]
+    #[test]
+    fn 同じ内容なら読み取り専用の置き場でも成功する() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = conf_test_dir("readonly");
+        std::fs::create_dir_all(&root).expect("置き場を作る");
+        write_conf_in(&root, BACKEND_CONF).expect("1 回目は書ける");
+
+        let restore = std::fs::metadata(&root).expect("属性").permissions();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555))
+            .expect("置き場を読み取り専用にする");
+
+        // root 権限では権限検査が効かない。効いていない環境では検出力が無いので飛ばす
+        let enforced = std::fs::write(root.join("probe.tmp"), b"x").is_err();
+        if enforced {
+            write_conf_in(&root, BACKEND_CONF)
+                .expect("同じ内容なら最終パスにも tmp にも触らないので成功する");
+            assert!(
+                write_conf_in(&root, "set -g warm off\n").is_err(),
+                "内容が違えば書こうとして失敗するはず（検出力の確認）"
+            );
+        }
+
+        std::fs::set_permissions(&root, restore).expect("属性を戻す");
+        remove_temp_dir(&root);
     }
 }

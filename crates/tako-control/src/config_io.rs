@@ -58,14 +58,34 @@ pub fn lock_exclusive(target: &Path) -> Result<ConfigLock, String> {
 
 /// tmp ファイル + rename によるアトミック書き込み。
 /// rename は同一ファイルシステム内で原子的なので、並行プロセスの読み取りには
-/// 「旧内容」か「新内容」しか見えない（空・書きかけが見える瞬間がない）
+/// 「旧内容」か「新内容」しか見えない（空・書きかけが見える瞬間がない）。
+///
+/// tmp 名は **書き込み 1 回ごと**に固有にする（#1313）。pid までしか分けないと、
+/// 同一プロセスの 2 スレッドが同じ tmp を共有し、A が rename したあとに B が
+/// **本番ファイルになった同じ inode へ書き込む**（B のハンドルは rename に付いていく）。
+/// 短い本文が長い本文の先頭を潰した「どちらでもない中身」が本番へ残り、B の rename は
+/// 消えた tmp を探して失敗する。[`lock_exclusive`] を取ってから呼ぶ経路は flock が
+/// 同一プロセスのスレッドも直列化するので無事だが、ロック無しで直接呼ぶ経路がある
+/// （#638 が `shell_integration::write_state_file` で、#625 が `tmux-backend.conf` で
+/// 閉じたのと同じ穴）
 pub fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
     let Some(parent) = path.parent() else {
         return Err(format!("親ディレクトリがない: {}", path.display()));
     };
     std::fs::create_dir_all(parent).map_err(|e| format!("ディレクトリの作成に失敗: {e}"))?;
-    // pid 入りの tmp 名でプロセス間の衝突を防ぐ（同一ディレクトリ = 同一 FS で rename 可能）
-    let tmp = sibling_with_suffix(path, &format!(".tmp.{}", std::process::id()));
+    // pid でプロセス間の衝突を、連番で同一プロセス内の衝突を防ぐ
+    // （同一ディレクトリ = 同一 FS なので rename できる）
+    let tmp = sibling_with_suffix(
+        path,
+        &tmp_suffix(
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+            legacy_tmp_name(),
+        ),
+    );
     let write_result = (|| -> std::io::Result<()> {
         let mut f = File::create(&tmp)?;
         f.write_all(content.as_bytes())?;
@@ -127,6 +147,23 @@ pub fn rotate_backups(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// tmp ファイルの suffix。`seq` が書き込み 1 回ごとに進むので、同一プロセス内で
+/// 並行に書いても tmp を奪い合わない。`legacy` は #1313 の A/B（修正前の pid 止まり）。
+///
+/// **`.tmp.` を含む形は変えない**。共有カタログ（[`crate::config_share`]）が
+/// `contains(".tmp.")` で派生ファイルを共有対象から外しているため
+fn tmp_suffix(pid: u32, seq: u64, legacy: bool) -> String {
+    if legacy {
+        return format!(".tmp.{pid}");
+    }
+    format!(".tmp.{pid}.{seq}")
+}
+
+/// #1313 の A/B。`TAKO_1313_LEGACY=1` で**同一バイナリのまま**修正前の tmp 名へ戻す
+fn legacy_tmp_name() -> bool {
+    std::env::var_os("TAKO_1313_LEGACY").is_some_and(|v| !v.is_empty())
+}
+
 /// `path` と同じディレクトリの「ファイル名 + suffix」のパスを作る
 fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
@@ -162,6 +199,24 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "tmp が残った: {leftovers:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1313: tmp 名は**書き込み 1 回ごと**に分かれる。修正前（pid 止まり）は
+    /// 2 回目の書き込みが同じ名前を使う = 同一プロセスの書き手同士が奪い合う
+    #[test]
+    fn tmp_suffix_differs_per_write() {
+        let first = tmp_suffix(42, 0, false);
+        let second = tmp_suffix(42, 1, false);
+        assert_ne!(first, second, "書き込みごとに tmp 名が変わること");
+        // 修正前の形。pid が同じなら連番が進んでも同じ名前になる
+        assert_eq!(
+            tmp_suffix(42, 0, true),
+            tmp_suffix(42, 1, true),
+            "A/B の legacy アームは修正前（プロセス単位まで）の名前へ戻ること"
+        );
+        // 共有カタログが派生ファイルを外す手がかり（`.tmp.`）を保つこと
+        assert!(first.contains(".tmp."), "{first}");
+        assert!(!first.contains(std::path::MAIN_SEPARATOR), "{first}");
     }
 
     #[test]
