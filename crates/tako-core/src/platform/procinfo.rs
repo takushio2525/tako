@@ -115,7 +115,12 @@ pub fn command_line(pid: u32) -> Option<String> {
 /// 実行中プロセスの起動時刻（UNIX 秒）。取れなければ `None`。
 ///
 /// **pid の再利用を見分ける材料**（#1282: 所有者が死んだ後に別プロセスが
-/// 同じ pid を取っていないかを、器の起動時刻と突き合わせて確かめる）
+/// 同じ pid を取っていないかを、器の起動時刻と突き合わせて確かめる /
+/// #1296: 使い捨て dir より後に始まったプロセスはその dir の持ち主ではない）。
+///
+/// Windows は `GetProcessTimes` の生成時刻、macOS は libproc
+/// （`proc_pidinfo(PROC_PIDTBSDINFO)` の `pbi_start_tvsec`）。
+/// **それ以外の unix は `None`**（材料が無いときは呼び出し側が見送る側へ倒れる）
 pub fn start_time_unix(pid: u32) -> Option<u64> {
     imp::start_time_unix(pid)
 }
@@ -684,6 +689,31 @@ mod imp {
         None
     }
 
+    /// macOS は libproc の `proc_bsdinfo`（`ports.rs` の `bsd_info` と同じ呼び出しだが、
+    /// あちらは制御端末の取得用に private なので、ここでは起動時刻だけを取る）。
+    /// pid 再利用の判別（#1296）に使う
+    #[cfg(target_os = "macos")]
+    pub(super) fn start_time_unix(pid: u32) -> Option<u64> {
+        let pid = i32::try_from(pid).ok()?;
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: 渡すバッファは size ぴったりのローカル変数で、
+        // 書き込まれたバイト数が size と一致したときだけ中身を読む
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        (written == size).then_some(info.pbi_start_tvsec)
+    }
+
+    /// macOS 以外の unix は取得手段を持たない（`/proc/<pid>/stat` の
+    /// starttime は boot 時刻との合成が要る。tako の対象 OS ではないので入れない）
+    #[cfg(not(target_os = "macos"))]
     pub(super) fn start_time_unix(_pid: u32) -> Option<u64> {
         None
     }
@@ -763,13 +793,41 @@ mod tests {
         assert!(me.started_unix.is_some());
     }
 
-    /// 取得手段が無いプラットフォームは `None` を返す（呼び出し側は見送る）
+    /// 取得手段が無いプラットフォームは `None` を返す（呼び出し側は見送る）。
+    /// 起動時刻だけは macOS にも実装がある（#1296 の pid 再利用の判別に要る）ので別扱い
     #[cfg(not(windows))]
     #[test]
     fn コマンドラインを引けない環境では見送りへ倒れる() {
         assert_eq!(super::command_line(std::process::id()), None);
-        assert_eq!(super::start_time_unix(std::process::id()), None);
         assert!(super::details_by_name(&["tmux"]).is_empty());
+    }
+
+    /// #1296: macOS の起動時刻は libproc で読める（Windows は上の FFI テストが見る）。
+    /// 転記ミス（情報クラス番号・フィールド位置）はここでしか捕まらない
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn 自分の起動時刻をlibprocで読める() {
+        let started = super::start_time_unix(std::process::id()).expect("自分の起動時刻");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        assert!(
+            (1_600_000_000..=now + 60).contains(&started),
+            "UNIX 秒に見えない: {started} / now={now}"
+        );
+        assert_eq!(
+            super::start_time_unix(0),
+            None,
+            "pid 0 は起動時刻を持たない（読めたら判定材料として誤り）"
+        );
+    }
+
+    /// macOS 以外の unix には取得手段が無い（呼び出し側は見送る）
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn 起動時刻を引けない環境では見送りへ倒れる() {
+        assert_eq!(super::start_time_unix(std::process::id()), None);
     }
 
     /// #1282: 回収の最終ゲートに使う「生きた GUI」の数え方。
