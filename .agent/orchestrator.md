@@ -814,7 +814,7 @@ system prompt は**長寿命セッションが起動した瞬間に払う固定�
 
 - 正本は `crates/tako-control/src/orchestrator/guides/*.md`（本文）と
   `orchestrator/guide.rs` の `GUIDES`（topic 名・見出し・由来ブロック）。
-  本文は**移送前のブロックと byte 一致**（要約も言い換えもしない）
+  移送ぶんの本文は**移送前のブロックと byte 一致**（要約も言い換えもしない）
 - 引くのは CLI `tako orchestrator guide <topic>` / MCP `tako_orchestrator_guide`。
   どちらも `guide::json` の 1 本を通る。`topic` 省略で一覧 + サイズ
 - プレースホルダ（`{CTX_THRESHOLD}` / `{TAB_NAMING_CONVENTION}` / `{{platform_notes}}`）は
@@ -823,6 +823,14 @@ system prompt は**長寿命セッションが起動した瞬間に払う固定�
 - `handoff` は `behavior` の項目 8 を切り出した**派生 topic**（`restores` が空）。
   閾値超過は master が最も頻繁に踏む経路なので、10 KB の `behavior` 全文を
   引かずに済むよう単独で取れるようにしてある
+- **移送ではない新しい topic を足す道**（`restores` が空 + 新規本文）も開いている。
+  #1004 の `remote`（リモートフォルダ / SSH の手順）がその 1 本目で、prompt 側は
+  master の topic 表 1 行 + solo の `### Remote / SSH` 節だけ
+  （`tako context-budget` 実測で master +83 B / solo +242 B）。
+  本文は `tests/fixtures/guides_added_after_1154.md` へ **1 文字も変えずに宣言**する
+  （宣言していない行は今までどおり「創作」として落ちる）。番犬は
+  `crates/tako-control/tests/remote_guide.rs`（topic の消失 / トリガーの消失 /
+  トリガーが手順を抱えていないか・prompt が予算内か）
 
 ### 触るときの不変条件
 

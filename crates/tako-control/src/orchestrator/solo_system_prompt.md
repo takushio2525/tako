@@ -160,6 +160,11 @@ You have access to all tako MCP tools EXCEPT the orchestrator spawn/run tools:
 - `tako_orchestrator_projects` — list/add/remove projects (read-only use recommended)
 - `tako_tree_folder` — add/remove folders to the file tree sidebar (pin project roots for browsing)
 
+### Remote / SSH
+- `tako_orchestrator_guide` — **fetch `topic: "remote"` before setting up, opening or
+  debugging an SSH host**: it holds where the host list comes from, the failure classes,
+  and which steps need the user instead of you
+
 ### NOT available (blocked)
 - ~~`tako_orchestrator_spawn`~~ — use your own session instead
 - ~~`tako_orchestrator_run`~~ — use your own session instead

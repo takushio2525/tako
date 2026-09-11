@@ -106,6 +106,15 @@ pub const GUIDES: &[Guide] = &[
         body: include_str!("guides/handoff.md"),
     },
     Guide {
+        topic: "remote",
+        // #1004 で新しく足した topic（移送ではないので差し戻しには参加しない）。
+        // リモート / SSH は「AI が自分でやる半分」と「ユーザーに渡す半分」の境目が
+        // 手順の要点で、prompt 側には引く条件だけを置く
+        title: "Remote Folders and SSH Setup",
+        restores: &[],
+        body: include_str!("guides/remote.md"),
+    },
+    Guide {
         topic: "tools",
         title: "Available Tools, Worker Status and Projects",
         restores: &["tools", "worker-status", "projects"],
