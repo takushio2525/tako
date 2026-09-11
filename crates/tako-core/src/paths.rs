@@ -270,12 +270,24 @@ fn is_test_exe_path(exe: &Path) -> bool {
 }
 
 /// テストプロセス専用のデータ置き場（プロセスごとに 1 つ）。
-/// 作法は `tako_control::orchestrator::config_dir` の隔離先と揃えてある
+/// 作法は `tako_control::orchestrator::config_dir` の隔離先と揃えてある。
+///
+/// **作る経路がそのまま消す経路を持つ**（#1296）。#944 ではここが「作るだけ」で、
+/// macOS の `TMPDIR`（`/var/folders/…/T/`）は再起動でも消えないため
+/// `cargo test` 1 回につき 1 dir が積もっていた（実測 2026-09-11: 2,188 件・`du` で 115 MB）。
+/// 後始末は 2 段構えで、どちらも [`crate::test_residue`] の 1 実装:
+///
+/// - [`crate::test_residue::arm_self_cleanup`] = 自分の dir を終了時に消す
+/// - [`crate::test_residue::sweep_stale_on_start`] = 前回までの残骸のうち
+///   **所有 pid が生きていないもの**を掃く（生きている別 worker の
+///   `cargo test` の置き場は消さない）
 fn test_data_dir() -> PathBuf {
     static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
         let dir = std::env::temp_dir().join(format!("tako-test-data-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
+        crate::test_residue::arm_self_cleanup(&dir);
+        crate::test_residue::sweep_stale_on_start();
         dir
     })
     .clone()

@@ -130,6 +130,7 @@ tako_task_gate_show
 tako_task_list
 tako_task_resume
 tako_telemetry
+tako_test_residue
 tako_theme
 tako_tmux_cleanup
 tako_tmux_kill

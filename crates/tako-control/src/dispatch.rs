@@ -4098,6 +4098,19 @@ fn dispatch_inner(
                 .map_err(DispatchError::InvalidParams)
         }
 
+        // テスト・検証プロセスの残骸の掃除（#1296）。判定・削除・JSON 化は
+        // tako_core::test_residue の 1 実装で、CLI（tako test-residue）と同じ経路を通る。
+        // **既定は dry-run**（apply のときだけ消す）
+        Request::TestResidue { apply } => {
+            let (temp, items, outcome) = tako_core::test_residue::sweep_temp(apply);
+            if apply {
+                crate::diag::persist_log(&outcome.log_line());
+            }
+            Ok(tako_core::test_residue::report_json(
+                &temp, &items, &outcome,
+            ))
+        }
+
         // 起動時ロードの予算（#1139）。判定は tako_core::context_budget の純粋関数、
         // 集めるのは crate::context_budget。CLI・MCP とも同じ 1 本を通る
         Request::ContextBudget {
@@ -13820,6 +13833,28 @@ mod tests {
             queued_delivery(Some(json!({ "state": "unknown_state" })))["state"],
             "queued"
         );
+    }
+
+    /// #1296: MCP 経由の残骸掃除は**既定 dry-run**（`apply` を省いたら 1 つも消さない）。
+    /// 実体は CLI（`tako test-residue`）と同じ `tako_core::test_residue` の 1 実装なので、
+    /// ここで見るのは「dispatch の腕が配線されていて、既定で削除に倒れないこと」
+    #[test]
+    fn issue1296_残骸の掃除は既定でdry_runになる() {
+        let mut host = MockHost::new();
+        let out = dispatch(
+            &mut host,
+            Request::TestResidue { apply: false },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(out["applied"], false, "既定で削除に倒れている");
+        assert_eq!(out["summary"]["removed"], 0, "dry-run なのに消している");
+        assert_eq!(out["summary"]["removed_bytes"], 0);
+        assert!(out["temp_dir"].is_string(), "対象の置き場を言っていない");
+        // 種別の表（KINDS）がそのまま応答に載る = 何が対象かを呼び出し側が読める
+        let kinds = out["kinds"].as_array().expect("kinds");
+        assert_eq!(kinds.len(), tako_core::test_residue::KINDS.len());
+        assert!(kinds.iter().any(|k| k["prefix"] == "tako-test-data-"));
     }
 
     /// #1187: `--socket` が host まで届くこと（旧実装は `let _ = socket;` で捨てていた）。

@@ -798,6 +798,9 @@ pub(super) fn build_request(
             profile: str_arg(args, "profile")?.map(|s| s.to_string()),
             caller_role: caller_role.map(str::to_string),
         },
+        "tako_test_residue" => Request::TestResidue {
+            apply: bool_arg(args, "apply")?.unwrap_or(false),
+        },
         "tako_context_budget" => Request::ContextBudget {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
             cwd: str_arg(args, "cwd")?.map(|s| s.to_string()),

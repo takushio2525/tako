@@ -1606,6 +1606,16 @@ pub const MATRIX: &[Feature] = &[
         ),
     },
     Feature {
+        // テスト・検証プロセスの残骸の掃除（#1296）。生死判定は Windows も実装がある
+        // （Toolhelp の在籍 + GetProcessTimes の生成時刻）ので縮退しない
+        key: "tako_test_residue",
+        macos: Support::Supported,
+        windows: Support::Supported,
+        windows_evidence: Evidence::UnitTest(
+            "test_residue の単体 12 本 + tako-core の test_data_residue（子プロセスを起こして dir の有無を実測。TMP / TEMP を使い捨てへ向けるので Windows でも同じ経路を通る）",
+        ),
+    },
+    Feature {
         key: "tako_theme",
         macos: Support::Supported,
         windows: Support::Supported,
