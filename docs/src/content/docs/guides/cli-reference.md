@@ -850,12 +850,14 @@ tako lang system     # OS のロケールに追従
 
 ### tako settings
 
-設定画面（独立ウィンドウ）を開きます。<kbd>Cmd</kbd>+<kbd>,</kbd> と同じです。一般・外観・Code Runner・セットアップ・スリープ防止・リモート・高度の 7 タブがあります。
+設定画面（独立ウィンドウ）を開きます。<kbd>Cmd</kbd>+<kbd>,</kbd> と同じです。一般・外観・Code Runner・プロファイル・セットアップ・スリープ防止・リモート・高度の 8 タブがあります。
 
 ```bash
 tako settings
-tako settings --tab 外観
+tako settings --tab appearance
 ```
+
+`--tab` は英語スラッグ（`general` / `appearance` / `runner` / `profiles` / `setup` / `sleep` / `remote` / `advanced`）だけを受け付けます。日本語のタブ名を渡すと一般タブが開きます。
 
 ### tako autosuggest
 
