@@ -91,6 +91,14 @@ jobs:
       # **実プロジェクトを巻き添えで消す形へ変わったらここで落ちる**（#1030 / #1022）
       - name: 事前信頼の残骸掃除のモックテスト
         run: bash scripts/test-clean-trust-residue.sh
+      # PR の CI 完了待ちのモックテスト。偽 gh を PATH に挿し、一時ディレクトリの偽リポジトリ
+      # （.github/workflows つき）だけを相手にするので本番の PR には触らない。
+      # **「出ているチェックが全部 pending でなければ完了」へ戻ったらここで落ちる**
+      # （push 直後は Cloudflare Pages しか登録されておらず、そこで merge すると
+      # CI 完了前 merge になる = #1313 / #1253 / #1282。判定の正は
+      # scripts/wait-pr-checks.sh の 1 実装で、master / worker もこれを呼ぶ = #1333）
+      - name: CI 完了待ちのモックテスト
+        run: bash scripts/test-wait-pr-checks.sh
 
   windows:
     name: Windows（build + test スモーク）
