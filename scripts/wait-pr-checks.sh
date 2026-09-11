@@ -19,9 +19,20 @@
 #   - 外部連携のチェック（Cloudflare Pages）はワークフローから導出できないので EXTERNAL_CHECKS に持つ
 #   - 一時的に別の集合で待ちたいときだけ TAKO_WAIT_PR_CHECKS_EXPECT="A,B" で上書きできる
 #
+# 「待っても絶対に揃わない」状態は待たない（#1365）:
+#   base が進んで衝突すると GitHub は merge コミットを作れず **pull_request の run を作らない**。
+#   期待名は永久に未登録のままなので、未登録が残っている間は `mergeable` も見て、
+#   衝突していたら名指しで案内して終わる（判定と案内文は lib/pr-conflict.sh の 1 実装）。
+#
 # 使い方: bash scripts/wait-pr-checks.sh <PR番号> [--timeout <秒>] [--interval <秒>]
-# 終了コード: 0 = 全部緑 / 1 = 失敗あり / 2 = タイムアウト / 3 = 引数・gh のエラー
+# 終了コード: 0 = 全部緑 / 1 = 失敗あり / 2 = タイムアウト / 3 = 引数・gh のエラー /
+#             4 = base と衝突していて CI の run が作られない
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 衝突の判定・案内・終了コード（PR_CONFLICT_EXIT）は merge-pr.sh と共有する
+# shellcheck source=lib/pr-conflict.sh
+. "${SCRIPT_DIR}/lib/pr-conflict.sh"
 
 # 外部連携のチェック（GitHub App が PR ごとに 1 本出す）。ワークフローから導出できないぶんはここ
 EXTERNAL_CHECKS=("Cloudflare Pages")
@@ -41,6 +52,11 @@ HEARTBEAT=300
 #   scripts/test-wait-pr-checks.sh の Test 13 / 14 がこの腕で穴が開くことを固定している
 LEGACY="${TAKO_1333_LEGACY:-0}"
 
+# A/B（検出力の確認・計測専用）。1 = **#1365 の前**へ戻す = 衝突を見ずに、
+#   run が作られない PR をタイムアウトまで待ち続ける腕。
+#   scripts/test-wait-pr-checks.sh の Test 20legacy がこの腕で待ち続けることを固定している
+LEGACY_1365="${TAKO_1365_LEGACY:-0}"
+
 die() {
   echo "エラー: $*" >&2
   exit 3
@@ -53,7 +69,8 @@ usage() {
   PR の CI が「期待するチェックが全部そろって、全部完了」するまで待つ。
   同じ結論を 2 回連続で観測するまで確定しない（GitHub API の揺れ対策）。
 
-終了コード: 0 = 全部緑 / 1 = 失敗あり / 2 = タイムアウト / 3 = 引数・gh のエラー
+終了コード: 0 = 全部緑 / 1 = 失敗あり / 2 = タイムアウト / 3 = 引数・gh のエラー /
+            4 = base と衝突していて CI の run が作られない（取り込んで push し直す）
 USAGE
 }
 
@@ -244,6 +261,25 @@ evaluate() {
   fi
 }
 
+# 未登録が残っているときだけ引く PR の状態（#1365）。
+# 既存の待ち（gh pr checks）とは別の口なので、**取れなかったら黙って諦める**
+# （衝突の判定材料が無いだけで、CI の結論は pr checks が正）。
+PR_MERGEABLE=""
+PR_MERGE_STATE=""
+PR_BASE_REF=""
+probe_mergeable() {
+  local out rc
+  set +e
+  out="$(gh pr view "${PR}" --json mergeable,mergeStateStatus,baseRefName 2>/dev/null)"
+  rc=$?
+  set -e
+  [[ ${rc} -eq 0 && -n "${out}" ]] || return 1
+  PR_MERGEABLE="$(jq -r '.mergeable // "" | tostring' <<<"${out}" 2>/dev/null)" || return 1
+  PR_MERGE_STATE="$(jq -r '.mergeStateStatus // "" | tostring' <<<"${out}" 2>/dev/null)" || return 1
+  PR_BASE_REF="$(jq -r '.baseRefName // "" | tostring' <<<"${out}" 2>/dev/null)" || return 1
+  return 0
+}
+
 # 「同じ結論か」を比べるための指紋（報告された name=bucket と、未登録の期待名）
 signature() {
   {
@@ -278,6 +314,8 @@ PREV_STATE=""
 CONFIRM_SIG=""
 LAST_HEARTBEAT=0
 POLLS=0
+CONFLICT_SEEN=0
+PROBE_WARNED=0
 
 while :; do
   if ! poll_checks; then
@@ -324,6 +362,34 @@ while :; do
   elif [[ -n "${CONFIRM_SIG}" ]]; then
     echo "[$(now)] 揺れ: 完了の観測を取り消す（未登録 ${#MISSING[@]} 本 / 実行中 ${PENDING_N} 本）"
     CONFIRM_SIG=""
+  fi
+
+  # 未登録が残っているなら、それが「まだ run が始まっていない」のか
+  # 「衝突して run が作られない」のかを見分ける（#1365）。
+  # 揃ってしまえば引かない = 通常の待ちで増える gh の呼び出しは最初の数回だけ
+  if [[ "${LEGACY_1365}" == "1" || ${#MISSING[@]} -eq 0 ]]; then
+    CONFLICT_SEEN=0
+  elif probe_mergeable; then
+    case "$(pr_conflict_verdict "${PR_MERGEABLE}" "${PR_MERGE_STATE}")" in
+      conflicting)
+        # チェックの結論と同じく、1 回の観測では確定しない（push 直後は古い値が返る）
+        if [[ ${CONFLICT_SEEN} -eq 1 ]]; then
+          pr_conflict_report wait "${PR}" "${PR_BASE_REF}" "${PR_MERGEABLE}" "${PR_MERGE_STATE}"
+          echo "  未登録のまま: $(join_names "${MISSING[@]}")" >&2
+          exit "${PR_CONFLICT_EXIT}"
+        fi
+        echo "[$(now)] 衝突を観測（mergeable=${PR_MERGEABLE} / ${PR_MERGE_STATE}）。同じ結論をもう 1 回見るまで確定しない"
+        CONFLICT_SEEN=1
+        ;;
+      # UNKNOWN = GitHub がまだ計算していない。待ちを続ける
+      *) CONFLICT_SEEN=0 ;;
+    esac
+  else
+    CONFLICT_SEEN=0
+    if [[ ${PROBE_WARNED} -eq 0 ]]; then
+      echo "[$(now)] 警告: gh pr view が取れないので衝突の判定を省く（待ちは続ける）" >&2
+      PROBE_WARNED=1
+    fi
   fi
 
   NOW_ELAPSED=$(($(date +%s) - START))

@@ -12,6 +12,7 @@
 #   3. 1 本 FAILURE で 1
 #   4. タイムアウトで 2
 #   5. 揺れ（1 回 completed → 次 in_progress）で確定しない
+#   6. base と衝突していて **run が作られない**状態は待たずに 4 で終わる（#1365）
 # 併せて期待名の導出（pull_request で起動する job のみ / name 無しは job id）と、
 # merge-pr.sh が「揃っていないときに merge を呼ばない」ことも見る。
 set -uo pipefail
@@ -366,8 +367,10 @@ cat > "${TAKO_GH_MOCK_DIR}/view.json" <<'JSON'
 JSON
 out="$(run_merge 1334 --timeout 20 --interval 1)"
 rc=$?
-assert_eq "衝突していれば 1" "${rc}" "1"
+assert_eq "衝突していれば 4（#1365 で待ち側と共通の値になった）" "${rc}" "4"
 assert_has "理由を出す" "main と衝突している" "${out}"
+assert_has "run が作られないことまで言う" "pull_request の run を作らない" "${out}"
+assert_has "取り込み方を案内する" "git fetch origin && git merge origin/main && git push" "${out}"
 assert_eq "merge を呼ばない" "$(cat "${TAKO_GH_MOCK_DIR}/merged" 2>/dev/null)" ""
 assert_eq "CI も待たない" "$(calls_of 'pr checks')" "0"
 
@@ -534,6 +537,117 @@ printf 'failed to run git\n' > "${TAKO_GH_MOCK_DIR}/merge.err"
 out="$(run_merge 1348 --timeout 20 --interval 1)"
 assert_has "fork の head には触らないと言う" "fork からの PR なので head ブランチには触らない" "${out}"
 assert_eq "DELETE は呼ばない" "$(grep -c 'X DELETE' "${TAKO_GH_MOCK_DIR}/calls.log" 2>/dev/null || true)" "0"
+
+echo "== Test 20: 衝突で run が作られない状態は待たずに 4 で終わる（#1365）=="
+setup_1365_conflict() { # $1 = ケース名, $2 = view.json の中身を足す（空可）
+  new_case "$1"
+  # 症状: 外部連携の Cloudflare Pages だけが並び、macOS / Windows は永久に登録されない
+  checks_json "${CF}|pass|2026-09-11T04:24:00Z" > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+  cat > "${TAKO_GH_MOCK_DIR}/view.json" <<JSON
+{"number":1359,"state":"OPEN","isDraft":${2:-false},"mergeable":"CONFLICTING","mergeStateStatus":"DIRTY",
+ "headRefName":"fix/775-close-origin","headRefOid":"cafebabe","baseRefName":"main","isCrossRepository":false,
+ "title":"[修正] テスト用","url":"https://example.invalid/pr/1359"}
+JSON
+}
+
+setup_1365_conflict t20
+out="$(run_wait 1359 --timeout 60 --interval 1)"
+rc=$?
+assert_eq "衝突していれば 4（タイムアウトの 2 ではない）" "${rc}" "4"
+assert_has "衝突を名指しする" "PR #1359 は base の main と衝突している（mergeable=CONFLICTING / mergeStateStatus=DIRTY）" "${out}"
+assert_has "run が作られない理由を言う" "GitHub は merge コミットを作れないので pull_request の run を作らない" "${out}"
+assert_has "次の一手を最簡形で出す" "git fetch origin && git merge origin/main && git push" "${out}"
+assert_has "未登録のまま残っている名前も出す" "未登録のまま: ${MAC}, ${WIN}" "${out}"
+assert_hasnt "タイムアウトとは言わない" "タイムアウト（" "${out}"
+assert_eq "確定には 2 回連続の観測が要る（= ポーリング 2 回で終わる）" "$(calls_of 'pr checks')" "2"
+assert_eq "mergeable は未登録が残っている間だけ引く" "$(calls_of 'pr view')" "2"
+assert_has "1 回目は保留すると言う" "衝突を観測（mergeable=CONFLICTING / DIRTY）" "${out}"
+
+setup_1365_conflict t20legacy
+out="$(TAKO_1365_LEGACY=1 run_wait 1359 --timeout 3 --interval 1)"
+rc=$?
+assert_eq "修正前（衝突を見ない）はタイムアウトまで待つ = 検出力" "${rc}" "2"
+assert_hasnt "修正前は衝突を名指しできない" "と衝突している" "${out}"
+assert_eq "修正前は mergeable を引かない" "$(calls_of 'pr view')" "0"
+
+setup_1365_conflict t20merge
+out="$(run_merge 1359 --timeout 60 --interval 1)"
+rc=$?
+assert_eq "merge-pr.sh も同じ 4 で止まる" "${rc}" "4"
+assert_has "同じ案内を出す（1 実装）" "GitHub は merge コミットを作れないので pull_request の run を作らない" "${out}"
+assert_eq "merge を呼ばない" "$(cat "${TAKO_GH_MOCK_DIR}/merged" 2>/dev/null)" ""
+
+echo "== Test 21: UNKNOWN（計算中）は待ち続け、MERGEABLE に遷移すれば従来どおり緑判定へ進む =="
+new_case t21
+checks_json "${CF}|pass|2026-09-11T04:24:00Z" > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+checks_json "${CF}|pass|2026-09-11T04:24:00Z" > "${TAKO_GH_MOCK_DIR}/checks.2.json"
+checks_json "${CF}|pass|2026-09-11T04:24:00Z" "${MAC}|pass|2026-09-11T04:36:50Z" "${WIN}|pass|2026-09-11T04:39:33Z" \
+  > "${TAKO_GH_MOCK_DIR}/checks.3.json"
+cat > "${TAKO_GH_MOCK_DIR}/view.1.json" <<'JSON'
+{"number":1360,"state":"OPEN","isDraft":false,"mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN",
+ "headRefName":"improve/x","baseRefName":"main","title":"[改善] テスト用","url":"https://example.invalid/pr/1360"}
+JSON
+cat > "${TAKO_GH_MOCK_DIR}/view.2.json" <<'JSON'
+{"number":1360,"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN",
+ "headRefName":"improve/x","baseRefName":"main","title":"[改善] テスト用","url":"https://example.invalid/pr/1360"}
+JSON
+out="$(run_wait 1360 --timeout 60 --interval 1)"
+rc=$?
+assert_eq "UNKNOWN では打ち切らず、揃えば 0" "${rc}" "0"
+assert_hasnt "UNKNOWN を衝突と決めつけない" "と衝突している" "${out}"
+assert_hasnt "UNKNOWN で保留の行も出さない" "衝突を観測" "${out}"
+assert_has "揃ったことを言う" "CI が全部緑で揃った（期待 3 本 / 報告 3 本）" "${out}"
+assert_eq "未登録が残っている 2 回だけ引く" "$(calls_of 'pr view')" "2"
+
+echo "== Test 22: 待っている間に生まれた衝突は merge 直前の門で 4 になる =="
+new_case t22
+checks_json "${CF}|pass|2026-09-11T04:24:00Z" "${MAC}|pass|2026-09-11T04:36:50Z" "${WIN}|pass|2026-09-11T04:39:33Z" \
+  > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+cat > "${TAKO_GH_MOCK_DIR}/view.1.json" <<'JSON'
+{"number":1348,"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN",
+ "headRefName":"improve/x","headRefOid":"cafebabe","baseRefName":"main","isCrossRepository":false,
+ "title":"[改善] テスト用","url":"https://example.invalid/pr/1348"}
+JSON
+cat > "${TAKO_GH_MOCK_DIR}/view.2.json" <<'JSON'
+{"number":1348,"state":"OPEN","isDraft":false,"mergeable":"CONFLICTING","mergeStateStatus":"DIRTY",
+ "headRefName":"improve/x","headRefOid":"cafebabe","baseRefName":"main","isCrossRepository":false,
+ "title":"[改善] テスト用","url":"https://example.invalid/pr/1348"}
+JSON
+out="$(run_merge 1348 --timeout 60 --interval 1)"
+rc=$?
+assert_eq "CI は緑でも衝突していれば 4" "${rc}" "4"
+assert_has "衝突を名指しする" "merge しない: PR #1348 は base の main と衝突している" "${out}"
+assert_eq "merge を呼ばない" "$(cat "${TAKO_GH_MOCK_DIR}/merged" 2>/dev/null)" ""
+assert_has "CI 自体は緑だったことも残る" "CI が全部緑で揃った" "${out}"
+
+echo "== Test 23: 判定材料が無いときは既存の扱いを壊さない（#1365 の縁）=="
+new_case t23a
+checks_json "${CF}|pass|2026-09-11T04:24:00Z" > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+# view の応答ファイルを置かない = gh pr view が失敗する（ネットワーク断・権限不足）
+out="$(run_wait 1361 --timeout 3 --interval 1)"
+rc=$?
+assert_eq "gh pr view が取れなくても待ちは続く（従来どおり 2）" "${rc}" "2"
+assert_eq "警告は 1 回だけ出す" "$(grep -c '衝突の判定を省く' <<<"${out}")" "1"
+assert_hasnt "衝突と決めつけない" "と衝突している" "${out}"
+
+new_case t23b
+checks_json "${CF}|pass|2026-09-11T04:24:00Z" > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+cat > "${TAKO_GH_MOCK_DIR}/view.json" <<'JSON'
+{"number":1362,"state":"OPEN","isDraft":false,"mergeable":"","mergeStateStatus":"",
+ "headRefName":"improve/x","baseRefName":"main","title":"[改善] テスト用","url":"https://example.invalid/pr/1362"}
+JSON
+out="$(run_wait 1362 --timeout 3 --interval 1)"
+rc=$?
+assert_eq "mergeable が空文字でも衝突にしない（従来どおり 2）" "${rc}" "2"
+assert_hasnt "空文字を衝突と読まない" "と衝突している" "${out}"
+
+setup_1365_conflict t23c true
+out="$(run_wait 1359 --timeout 60 --interval 1)"
+assert_eq "draft でも run は作られないので待ち側は 4" "$?" "4"
+out="$(run_merge 1359 --timeout 60 --interval 1)"
+rc=$?
+assert_eq "merge 側は draft の門が先（従来どおり 1）" "${rc}" "1"
+assert_has "draft だと言う" "draft のまま" "${out}"
 
 echo
 echo "=== 結果: PASS=${PASS} FAIL=${FAIL} ==="

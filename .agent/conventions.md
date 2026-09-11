@@ -1389,10 +1389,22 @@ CI 完了前に merge され（merge 04:24:10 / Windows 完了 04:48:24）、過
 - merge は `scripts/merge-pr.sh <PR>`（待ち → 揃わなければ merge しない → squash +
   `--delete-branch`）。CONFLICTING / BEHIND / BLOCKED は待たずに理由を出して止まる。
   **worker も master もこの 1 実装を呼ぶ**（手順の記憶ではなく構造で守る）
-- 終了コードは共通で **0 = 全部緑 / 1 = 失敗・拒否 / 2 = タイムアウト / 3 = 引数・gh のエラー**
+- 終了コードは共通で **0 = 全部緑 / 1 = 失敗・拒否 / 2 = タイムアウト / 3 = 引数・gh のエラー /
+  4 = base と衝突している**
+- **衝突しているあいだ CI の run は作られないので、待たずに 4 で終わる**（#1365）。base が進んで
+  衝突すると GitHub は merge コミットを作れず **`pull_request` の run を作らない**ので、
+  `gh pr checks` には外部連携の `Cloudflare Pages` だけが並び、macOS / Windows は永久に未登録のまま
+  （#775 の PR #1359 で 3 回。症状から原因 = `mergeable=CONFLICTING` へ辿るのに時間を食った）。
+  待ち側は**未登録が 1 本でも残っているあいだだけ** `gh pr view --json mergeable` を引き、
+  衝突を **2 回連続**で観測したら名指しで案内して終わる（`UNKNOWN` = 計算中と空文字は待ちを続ける。
+  `gh pr view` が取れなければ判定を省いて待ちは従来どおり）。判定・案内文・終了コードは
+  `scripts/lib/pr-conflict.sh` の 1 実装で、**待ち側と `merge-pr.sh` の門が同じ言い方をする**。
+  A/B は `TAKO_1365_LEGACY=1`（衝突を見ずにタイムアウトまで待つ腕）
 - 検証は `bash scripts/test-wait-pr-checks.sh`（偽 gh + 偽リポジトリ。**CI の macOS ジョブで
   毎 PR 走る**）。A/B は `TAKO_1333_LEGACY=1` = 修正前の判定をそのまま再現する腕で、
-  Test 13 / 14 が「1 本だけで完了と返る」「揺れの 1 回目で確定する」を固定している
+  Test 13 / 14 が「1 本だけで完了と返る」「揺れの 1 回目で確定する」を固定している。
+  衝突（#1365）は Test 20〜23 が「待たずに 4」「legacy はタイムアウトまで待つ」
+  「`UNKNOWN` は待ち続けて緑まで進む」「判定材料が無いときは従来どおり」を固定する
 - **緑を見た後に main が進んだら、取り込んで回し直す**。PR の CI が検査しているのは
   ブランチ head ではなく **merge 結果**（`actions/checkout` の既定が `refs/pull/<PR>/merge`。
   実測: PR #1337 の run が読んだ `progress.md` は 12442 bytes = ブランチ head の 11196 でも
