@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-11（#1282: `tako tmux cleanup --servers` を psmux の器でも使えるようにした）
-- 器の列挙を 2 実装へ（unix = ソケットファイル走査 / Windows = 器のプロセスのコマンドライン `-L <名前>`。psmux は名前付きパイプで走査できるファイルが無く、実機に 24 個残っていても 0 件と答えていた）。コマンドラインは `NtQueryInformationProcess(ProcessCommandLineInformation)`・起動時刻は `GetProcessTimes` で、依存クレートは足していない
-- 所有者は 2 段（ソケット名の pid = unix と同じ強さ / コマンドラインの隔離マーカー = 自分以外の生きた tako-app が居れば `peer_may_reattach` で見送る）。材料が無ければ従来どおり `owner_unknown`。回収は `taskkill /PID /T /F` の **pid 指定のみ**
-- macOS: fmt / clippy / `test --workspace` 4074 件緑・クロスチェック エラー 0（警告は既存箇所のみ）。番犬 5 本（修正前ソースで 4 本 FAILED）+ 単体 11 本（応答の形は dispatch で固定）。FFI は CI の Windows ランナーで実行検査（既存の `cargo test --workspace` は #583 の失敗で tako-core まで届かないので blocking の別ステップを追加）。**Windows 実機実測は未取得**（機が offline。手順は plan の「#1282」節）
-
 ## 2026-09-11（#1294: peer 送達の「送ったかもしれない」を未達扱いにせず二重投函を止めた）
 - `Stall::PeerSendStalled`（再送禁止の宣言）と registry の記録が逆を向いていた。送達の記録を 3 値（`tako_core::prompt_delivery::Confidence`）にし、`peer_send_stalled` / `peer_unconfirmed` は `Unverified`（#983 の `verify_then_resend`）へ。3 値目の宣言は `outcome_confidence` の表 1 本で、記録側と判定側が同じ表を引く（**既定は未達側**）
 - A/B（`TAKO_1294_LEGACY=1`）: 旧アーム = `prompt_delivery=undelivered` / events `prompt_undelivered` / **自動再送 1 回**、新アーム = `unverified` / `prompt_delivery_unverified` / **0 回**。本当に未達（`paste_not_reflected`）は両アームとも 1 回で回帰なし
@@ -64,3 +59,8 @@
 - #944 の隔離は「本番の外へ倒す」までで消す仕掛けが無く、再起動でも消えない macOS の `TMPDIR` に積もっていた（実測 2,188 件 + `tako-agent-config-*` 784 件 = `du` で 115 MB）。`tako_core::test_residue` に後始末を 1 実装し、作る経路（`paths::test_data_dir`）が `arm_self_cleanup`（`libc::atexit`）+ `sweep_stale_on_start`（SIGKILL 分を次回起動で回収）を持つ形へ
 - 消すのは**自分の pid か pid が生きていないもの**だけ。pid 再利用は「dir の作成時刻より後に始まったプロセス」として見分けて見送る（実測 19 件）。消す直前に生死と作成時刻を取り直して、列挙後に作り直された置き場を巻き込まない
 - 既存残骸の口は `tako test-residue`（既定 dry-run・`--apply` で実削除・MCP `tako_test_residue`）。番犬 2 本（修正前ソースで 2 件 FAILED）+ 子プロセス実測 2 本 + 単体 12 本。A/B は `TAKO_1296_LEGACY=1`
+
+## 2026-09-11（#1295: 実行拒否ゲートが claude では常に真だったのを締めた）
+- 真因は `None`（観測ゼロ）を無条件に作業ゼロと数えていたこと。claude の腕（`query_agent_status`）は `agent_work_started` を一度も代入しないので `!= Some(true)` が常に真で、`execution_refused_patterns(Claude)` に文言を 1 つ足した瞬間に正常完了した worker が `error` / `retry_spawn` へ落ちる形だった。判定を `dispatch::refusal_gate_open` の 1 実装へ閉じ、`None` を通せる系統は `agent_support::MATRIX` の新マス `worker_refusal_work_proof`（agy だけ対象外 = 代理の証拠を使う）が宣言する
+- A/B（`TAKO_1295_LEGACY=1`）: 旧アーム = 正常完了の claude worker が `status=error` / `kind=execution_refused` / `retry_spawn`、新アーム = `error` なし。#1034 の agy 経路は両アームとも分類されたまま（既存テスト緑）
+- 番犬は 4 → 7 本で doc と assert を機械で結んだ（doc の「ゲートの形」1 行を assert の入力にする）。ゲートを旧形へ戻す A/B で 4 本が `dispatch.rs:9343` 等を名指し FAILED

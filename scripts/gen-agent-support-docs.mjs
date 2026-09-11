@@ -43,7 +43,7 @@ const CATEGORIES = [
     'worker_status_detect', 'worker_status_structured',
     'worker_idle_with_background',
     'worker_prompt_undelivered', 'worker_death_resume',
-    'worker_refusal_detect',
+    'worker_refusal_detect', 'worker_refusal_work_proof',
   ]],
   ['worker への指示と応答', [
     'worker_prompt_delivery', 'worker_delivery_peer',
