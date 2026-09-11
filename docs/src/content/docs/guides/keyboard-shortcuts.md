@@ -63,13 +63,19 @@ Windows では Command キーにあたる修飾が Win キーになり、多く�
 |---|---|---|
 | 選択テキストをコピー（選択が無いときは何も起きない） | <kbd>Cmd</kbd>+<kbd>C</kbd> | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> |
 | ペースト（ブラケットペースト対応） | <kbd>Cmd</kbd>+<kbd>V</kbd> | <kbd>Ctrl</kbd>+<kbd>V</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>V</kbd> / <kbd>Shift</kbd>+<kbd>Insert</kbd> |
-| 全選択 | <kbd>Cmd</kbd>+<kbd>A</kbd> | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd> |
+| 全選択（プレビュー / チャット表示の本文。ターミナルの画面には効かない） | <kbd>Cmd</kbd>+<kbd>A</kbd> | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd> |
 | 入力予測（ゴーストテキスト）を確定 | <kbd>→</kbd> / <kbd>Tab</kbd> | <kbd>→</kbd> / <kbd>Tab</kbd> |
 
 :::note[コピーと「中断の Ctrl+C」は別のキー]
 コピーの打鍵（macOS は <kbd>Cmd</kbd>+<kbd>C</kbd>、Windows は <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd>）が効くのは、テキストを選択しているときだけです。選択が無いときは何も起きません（ペインへ打鍵が送られることもありません）。
 
 ペインの中で走っているプログラムを中断する <kbd>Ctrl</kbd>+<kbd>C</kbd> は tako が横取りしないので、どちらの OS でもそのままペインへ届きます。
+:::
+
+:::note[全選択が効くのはプレビューとチャット表示です]
+全選択の打鍵が選択するのは、プレビューペインの本文（編集中ならその編集テキスト）と、かんたん表示（GUI モード）のチャット本文です。ターミナルの画面には効かないので、押しても選択は作られず、続けてコピーの打鍵をしても何も入りません。
+
+ターミナルの文字はマウスでドラッグして選んでください。選んだ時点でクリップボードへ入ります（下の「マウス操作」の copy-on-select）。
 :::
 
 ## プレビューの操作
