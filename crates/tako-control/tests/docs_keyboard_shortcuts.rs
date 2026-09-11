@@ -469,3 +469,224 @@ fn 素のctrl_cはバインドされていない() {
         );
     }
 }
+
+// ---- 全選択行の説明と実装の一致（Issue #1362） ----
+//
+// #1323 の時点の docs は「全選択」とだけ書いており、どこに効くかを言っていなかった。
+// 実装（`select_all_text`）が見るのは **プレビューの編集バッファ → チャット本文 →
+// プレビュー本文**の 3 つだけで、素のターミナルペインでは早期 return する。
+//
+// 隔離 GUI（tako-vd）の実測でも、ターミナルペインで ⌘A → ⌘C はクリップボードを
+// 変えず（sentinel のまま 3/3）、⌘A が PTY へ届くこともなかった（`abc` に ⌘A →
+// `x` で `abcx`。同じ経路で撃った**本物の Ctrl+A** は行頭へ入って `xabc` になるので、
+// 観測に検出力はある）。同じ経路でプレビューペインへ撃つと本文 2 行が入る（3/3）。
+//
+// キー集合を見る 3 本も、コピー行を見る 2 本もこの行の説明は見ないので、
+// 「どこに効くか」を**両方向**で突き合わせる。
+
+/// docs が「ターミナルには効かない」と書いていると読める言い回し
+const TERMINAL_DENY_PHRASES: &[&str] = &[
+    "ターミナルの画面には効かない",
+    "ターミナルの画面には効きません",
+    "ターミナルでは効かない",
+    "ターミナルでは効きません",
+];
+
+/// docs が「ターミナルにも効く」と書いていると読める言い回し。
+/// 網羅はできないので、主役は下の DENY 側（実装が対応したら**消さないと落ちる**）
+const TERMINAL_CLAIM_PHRASES: &[&str] = &[
+    "ターミナルの画面を全選択",
+    "ターミナルの画面も全選択",
+    "画面全体を全選択",
+    "スクロールバックを全選択",
+];
+
+/// `select_all_text` の本体のうち**端末（PTY / TerminalSession）に触る**行。
+/// プレビュー・チャットの選択（`preview_selections` / `select_all_chat`）は端末ではない
+fn terminal_touch_lines(body: &str) -> Vec<String> {
+    const MARKERS: &[&str] = &[
+        "focused_session",
+        "session",
+        "terminal",
+        "scrollback",
+        "start_selection",
+        "extend_selection",
+    ];
+    body.lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with("//"))
+        .filter(|l| {
+            let lower = l.to_lowercase();
+            MARKERS.iter().any(|m| lower.contains(m))
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// docs の「全選択」の表の行（行番号, 操作セル）。
+/// **無い / 複数あるのも FAILED**（行ごと消えたのに黙って通るのを避ける）
+fn select_all_row(md: &str) -> (usize, String) {
+    let rows: Vec<(usize, String)> = md
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.trim_start().starts_with('|') && l.contains("全選択"))
+        .map(|(i, l)| {
+            let cells: Vec<&str> = l
+                .trim()
+                .trim_matches('|')
+                .split('|')
+                .map(str::trim)
+                .collect();
+            (i + 1, cells[0].to_string())
+        })
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "{DOC} の「全選択」の行が {} 本ある（1 本であること。\
+         文言を変える・行を消すなら実装との一致も見直す）",
+        rows.len()
+    );
+    rows.into_iter().next().expect("1 本ある")
+}
+
+/// 全選択について docs が語っている本文 = 表の行 + 見出しに「全選択」を含む `:::note` の中身。
+/// 「プレビュー」「チャット」はこの文書のあちこちに出るので、**この範囲だけ**を見る
+fn select_all_prose(md: &str) -> String {
+    let (_, row) = select_all_row(md);
+    let mut prose = row;
+    let mut in_note = false;
+    for line in md.lines() {
+        if in_note {
+            if line.trim() == ":::" {
+                in_note = false;
+                continue;
+            }
+            prose.push('\n');
+            prose.push_str(line);
+            continue;
+        }
+        if line.starts_with(":::note[") && line.contains("全選択") {
+            in_note = true;
+        }
+    }
+    prose
+}
+
+/// Issue #1362: 全選択行の説明が `select_all_text` の実装と食い違わないこと。
+///
+/// 実装が端末に触らないのに docs が「ターミナルにも効く」と読めたら落とし、
+/// 逆に実装が端末へ対応したのに docs が「効かない」と言い続けていても落とす
+/// （= ターミナルの全選択を実装するなら、同じコミットでこの行と注記を直すことになる）
+#[test]
+fn 全選択行の説明がselect_all_textの実装と一致する() {
+    let root = repo_root();
+    let md = std::fs::read_to_string(root.join(DOC)).expect("keyboard-shortcuts.md を読めない");
+    let app = std::fs::read_to_string(root.join(APP_SRC)).expect("main.rs を読めない");
+
+    let (fn_line, body) = fn_body(&app, "select_all_text");
+    let touches = terminal_touch_lines(&body);
+    let impl_covers_terminal = !touches.is_empty();
+
+    let (row_line, op) = select_all_row(&md);
+    let prose = select_all_prose(&md);
+    let denies: Vec<&&str> = TERMINAL_DENY_PHRASES
+        .iter()
+        .filter(|p| prose.contains(**p))
+        .collect();
+    let doc_denies = !denies.is_empty();
+
+    assert_eq!(
+        doc_denies,
+        !impl_covers_terminal,
+        "docs の全選択行と実装が食い違っている\n\
+         - docs（{DOC}:{row_line}）: {} → {op}\n\
+         - 実装（{APP_SRC}:{fn_line} の select_all_text）: {}\n\
+         直し方は 2 通り: docs を実態へ寄せる（ターミナルの画面には効かない）か、\
+         実装を docs へ寄せて（端末の画面 / スクロールバックを選択する）同じコミットで行も直す",
+        if doc_denies {
+            format!("ターミナルには効かないと書いてある（{denies:?}）")
+        } else {
+            "ターミナルには効かないとは書いていない".to_string()
+        },
+        if impl_covers_terminal {
+            format!("端末に触っている（{touches:?}）")
+        } else {
+            "端末には触っていない（プレビュー / チャットのみ）".to_string()
+        }
+    );
+
+    // 表の行だけを読む人が誤解しないこと。注記を読まないと分からない状態にしない
+    if !impl_covers_terminal {
+        assert!(
+            op.contains("ターミナル"),
+            "{DOC}:{row_line} の全選択行が「ターミナル」に触れていない（{op}）。\
+             表だけ見た人が押しても効かないので、行の側にも効かない先を書く"
+        );
+    }
+
+    // 「ターミナルにも効く」と読める記述が文書のどこにも残っていないこと
+    let claims: Vec<String> = md
+        .lines()
+        .enumerate()
+        .flat_map(|(i, l)| {
+            TERMINAL_CLAIM_PHRASES
+                .iter()
+                .filter(move |p| l.contains(**p))
+                .map(move |p| format!("{DOC}:{}: 「{p}」", i + 1))
+        })
+        .collect();
+    assert_eq!(
+        !claims.is_empty(),
+        impl_covers_terminal,
+        "全選択がターミナルに効くという記述と実装が食い違っている:\n{}",
+        if claims.is_empty() {
+            "（記述なし。実装は端末に触っているので docs へ書く）".to_string()
+        } else {
+            claims.join("\n")
+        }
+    );
+}
+
+/// Issue #1362: 「どこに効くか」の列挙が実装と一致すること。
+///
+/// プレビュー（`preview_*`）とチャット（`select_all_chat`）は実装が持っている経路なので、
+/// docs から落ちたら落とす。逆に実装から経路が消えたのに docs が残っていても落とす
+#[test]
+fn 全選択が効く先の列挙がselect_all_textの実装と一致する() {
+    let root = repo_root();
+    let md = std::fs::read_to_string(root.join(DOC)).expect("keyboard-shortcuts.md を読めない");
+    let app = std::fs::read_to_string(root.join(APP_SRC)).expect("main.rs を読めない");
+
+    let (fn_line, body) = fn_body(&app, "select_all_text");
+    let prose = select_all_prose(&md);
+
+    for (label, marker, word) in [
+        ("プレビュー", "preview", "プレビュー"),
+        ("チャット", "select_all_chat", "チャット"),
+    ] {
+        let impl_has = body
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with("//"))
+            .any(|l| l.contains(marker));
+        let doc_has = prose.contains(word);
+        assert_eq!(
+            doc_has,
+            impl_has,
+            "全選択の効く先（{label}）で docs と実装が食い違っている\n\
+             - docs（{DOC} の全選択行 + 注記）: {}\n\
+             - 実装（{APP_SRC}:{fn_line} の select_all_text）: {}",
+            if doc_has {
+                "書いてある"
+            } else {
+                "書いていない"
+            },
+            if impl_has {
+                format!("{marker} を見ている")
+            } else {
+                format!("{marker} を見ていない")
+            }
+        );
+    }
+}
