@@ -20,16 +20,6 @@
 
 ---
 
-## 2026-09-12（#1367: 器なしペインの busy を close 確認 / GUI 判定 / agent_running へ届けた）
-- #372 で走査は器なしペインも数えていたのに**引く側**が器のセッション名（`busy_sessions`）を見たままで、tmux 未導入 / persist OFF（= cask の既定）では close 確認（#566）が出ず・`busy_children`（#694）が false でスターターが被り・`agent_running` も false だった。問う口を `RunningChildrenScanState::is_pane_busy` の 1 実装へ寄せ、3 経路を `TakoApp::pane_has_busy_children` から通した（旧キャッシュ `busy_backend_sessions` はフィールドごと削除）
-- 隔離 GUI（tako-vd・persist OFF・実 Cmd+W = `CGEventPostToPid`）の A/B: legacy（`TAKO_1367_LEGACY=1`）は `busy_agents=1` なのに `busy_children=false` / `display=starter` / **確認なしで即 close**、新は `busy_children=true`（1.0s）/ `terminal` / ダイアログが出てペインが残る。停止後は確認なし・承認経路の監査ログ（`close:kbd`）も器なしで残る
-- 番犬 5 本 + A/B + 単体 5 本 + セルフテスト項目 73g（legacy アームで `waited=93.1s busy=false` の FAILED を実測）。注入 5 通りが file:line 名指し。**チャットの列挙（`collect_chat_targets`）は器つき前提のまま**なので器なしの会話表示は別 Issue
-
-## 2026-09-12（#1004: リモート / SSH の手順を新 topic `remote` へ明文化した）
-- 手順の全文を `guides/remote.md`（6,903 B）へ置き、prompt 側は master の topic 表 1 行 + solo の `### Remote / SSH` 節だけ（`tako context-budget` 実測 master +83 B / solo +242 B = 依頼上限 500 B 内）。移送でない本文は fixture へ宣言する道（#1154 の `guides_added_after_1154.md`）に乗せた
-- 実測で Issue 案と食い違った点を本文へ反映: ①`ssh_config` は **`Include` を読まない**（ssh 自身は読む = 一覧に出ないホストへ名前指定で繋がる）②config の `Port` が 22 以外だと **tako 自身が開いたペインも自動検知に見送られる**（`-p` を渡すため）。失敗 5 種（unresolved / refused / auth / hostkey / conflict 経路）を実 sshd 相手に end-to-end で確認
-- 番犬 `remote_guide.rs` 7 本（topic 消失 / master・solo のトリガー消失 / トリガーの肥大 / 手順の prompt インライン化）を注入 5 通りで file:line 名指し FAILED。隔離 solo の実会話は `tako_ssh_hosts` → `tako_orchestrator_guide{topic:"remote"}` → `remote_folder ls` → 接続情報の確認要求へ到達
-
 ## 2026-09-12（#1406: 脅威モデルの「別 OS ユーザーの到達は消滅した」を現行の既定へ揃えた）
 - #1038 でループバック TCP が既定になったのに「残存リスク」節（`:249`）と「listen 範囲」節（`:87`）が UDS 前提のままだった。実測（`parse_endpoint_spec(None)` = Loopback / 本番 `endpoint_kind: loopback-tcp`）で確定させ、受容するリスクとして書き直した（Windows は `unix_supported()` = false で opt-in が無いことも明記）
 - 番犬 `issue1406_threat_model_endpoint_watchdog` 5 本が**コードの既定 ↔ 文書**を双方向で縛る。注入 A/B: 旧記述を戻すと `:87` / `:249` を名指しで FAILED、コードの既定を UDS へ反転すると `local_endpoint.rs:8` と `:83` を名指しで FAILED
@@ -64,6 +54,7 @@
 - 種別を「**辿った先**」で決める 1 実装（`filetree::entry_is_dir`。リンクのときだけ追加 `metadata`）へ寄せ、開く側（`OpenFile` の `is_file()` / `open_plan::route`）と向きを揃えた。辿って初めて起こる循環は `collect_rows` が canonical パスの照合で打ち切り、**打ち切りを行として見せる**（`RowNote::Error`・描画はリモート行と同じ `render_note_row` の 1 実装）
 - 修正前ソースの実測: `link` 行が `("link", 1, is_dir=false)` で `toggle_dir` しても増えない → 修正後は展開でき `inner.txt` が depth 2 に出る。実注入の A/B は `file_type()` へ戻すと番犬が `filetree.rs:699` / `:690` を名指し FAILED、照合を落とすと祖先リンクの 2 周目（depth 3 に `README.md`）が出て loop テスト 2 本が FAILED
 - 単体 10 本追加（切れたリンク / 相対 / `..` / 相互 ELOOP / 往復 / 500 件超 / git のしるし / 開く経路）+ 番犬 3 本（注入 5 通り）。workspace 4488 passed 0 failed・clippy 両宇宙 0・check-windows error 0。**install 要**
+
 ## 2026-09-12（#1375: セルフテストの「固定予算 + CLI の状態読み」16 件を状態待ちへ移し既知リストを空にした）
 - 項目 18 / 19 / 21 / 23〜28 / 47 / 47b / 50 / 51b / 66b / 73c / 73f を `wait_for_cli_state`（`wait_for_app_state` + `cli_state_budget` の 1 実装。A/B の口・注入・診断行 `TAKO_SELF_TEST_1375` をここへ集約）へ寄せ、`KNOWN_FIXED_CLI_WAITS` を空にした。分割して新ペインを操作する 4 件は `split_focus_new_pane` で「着地 → アイドル」の 2 段に割り、以降は**返ったペイン ID** を見る（旧 73f は**打ったあとに**分割前のフォーカスを読んでいたので、着地が先だと窓を使い切るまで真にならない = 待ちを伸ばしても直らない形）
 - 実測（隔離 GUI・tako-vd）: `INJECT=late` 全項目で 17 か所とも `ok=true`（`waited` = 旧予算 + 5 秒）で完走 / `LEGACY=all` は旧の固定予算（0.8〜15.0s）を再現して完走 / 項目ごとの `LEGACY+late` は **17/17 FAILED**（73f は Issue が観測した `73f: split で新ペインへフォーカスが移らない` そのまま）/ `never` は新経路でも **16/16 FAILED**。高負荷 3 回（load 6.5〜8.4）と load 10〜37 は完走、load 65〜80 の人工負荷では 73c が 4 倍上限（80 秒）を使い切って FAILED = 上限の政策どおり
