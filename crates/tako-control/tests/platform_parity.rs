@@ -522,8 +522,15 @@ fn agents走査がposixシェルの直起動へ戻っていない() {
 /// 「Windows に無いコマンドを起こす」形、こちらは「Windows に無いシェルを起こす」形
 #[test]
 fn 実行ファイルの探索がログインシェル経由で境界の外に残っていない() {
-    // 素の名前（`Command::new("gh")`）へ先にフォールバックする実装は Windows でも
-    // 解決できるので許可する。**握り潰す形だけ**を落とす
+    // 素の名前（`Command::new("gh")`）へ先にフォールバックする実装は許可する。
+    // **握り潰す形だけ**を落とす。
+    //
+    // **免除の根拠は `.exe` の導入に限る**（#1372）。素の名前のフォールバックが足すのは
+    // `.exe` だけで（`std/src/sys/process/windows.rs` の `resolve_exe`:
+    // PATH 探索では拡張子が 1 つも無いときに `.exe` を足すだけ）、`.cmd` / `.bat` の
+    // シムしか無い導入は解決できない。gh / pandoc は通常 `.exe` なので実害は無いが、
+    // 「Windows でも解決できる」ではなく「`.exe` なら解決できる」が正しい。
+    // 重複実装 2 本を境界 B16 へ寄せる話は #1374（提案）
     const ALLOWED: &[(&str, &str)] = &[
         (
             "crates/tako-core/src/platform/exe.rs",
@@ -531,16 +538,16 @@ fn 実行ファイルの探索がログインシェル経由で境界の外に�
         ),
         (
             "crates/tako-core/src/lib.rs",
-            "resolve_bin(): 素の名前へフォールバックするので Windows でも解決できる\
-             （PATHEXT とユーザー導入先を見ないぶん B16 より弱いだけ）",
+            "resolve_bin(): 素の名前へフォールバックするので Windows でも `.exe` なら解決できる\
+             （PATHEXT とユーザー導入先を見ないので `.cmd` シムには届かない = B16 より弱い）",
         ),
         (
             "crates/tako-app/src/preview.rs",
-            "resolve_bin() と同型のヘルパー。理由も同じ（素の名前へフォールバックする）",
+            "resolve_bin() と同型のヘルパー。理由も同じ（素の名前へフォールバックする = `.exe` 限定）",
         ),
         (
             "crates/tako-control/src/config_share/env.rs",
-            "find_gh(): `gh --version`（素の名前）を先に試し、シェル経路は #[cfg(unix)] の中",
+            "find_gh(): `gh --version`（素の名前 = `.exe` 限定）を先に試し、シェル経路は #[cfg(unix)] の中",
         ),
     ];
 
