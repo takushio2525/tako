@@ -937,6 +937,12 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
              「失敗時は終了コードと案内を出す」「語を割らない」を見る。`#[cfg(unix)]`）",
         ),
         (
+            "crates/tako-core/src/platform/shell_dialect.rs",
+            1,
+            "テストモジュール内（#1367。背景ジョブを `;` で並べた行を `sh -n` へ通し、\
+             どの POSIX シェルでも構文が壊れないことを実測する。`#[cfg(unix)]`）",
+        ),
+        (
             "crates/tako-core/src/tmux.rs",
             1,
             "tmux e2e テスト内（`#[cfg(unix)]`）",

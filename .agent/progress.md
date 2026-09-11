@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-11（#1308: 実 PTY の fixture を待つテストを状態待ちへ寄せた）
-- 真因は「固定窓の待ち + 尽きても結果を検査せず素通り」。混んだ機で素のシェルの起動が固定 10 秒窓を超えると、起動前の PTY へ打ち込んだ行はエコーされるだけで実行されず、それでも `dispatch` するので panic が**「器越しへ倒れている（#1200）」という無関係な原因**を名指ししていた（実測 `prompt_ok=false waited=10.03s dialog_seen=false waited=20.04s load=3.89`）
-- 待ちを `i1308_wait_for_state`（状態待ち + `state_wait_budget`・**上限に達したらドライバ自身が panic**・届かないあいだは予算に比例した間隔で打ち直す）へ寄せ、呼び出し側が素通りできない構造にした。番犬 `issue1308_pty_wait_watchdog` 4 本が注入 5 通りを file:line で名指し
-- 高負荷 A/B（全件走 18 スレッド）: legacy `TAKO_1308_LEGACY=1` は **3/35 FAILED**（69.5〜70.7 秒・load 66.8〜68.9・Issue と同一の panic 本文）、新アームは **0/35 FAILED**（load p50 96.9・最長 74 秒の run も通過）。注入 `TAKO_1308_INJECT=late`（`cat </dev/tty` で打鍵を食う）は legacy 確定 FAILED 30.09 秒 / 新 ok 15.50 秒
-
 ## 2026-09-11（#1353 / #1364: セルフテスト 3 項目の固定予算を状態待ちへ、番犬を状態読みへ広げた）
 - 項目 22（固定 800ms）/ 44（固定 1 秒）/ 63（固定 6 秒窓 + 40 秒）を `wait_for_app_state` + `cli_state_budget` へ。**項目 63 の真因は待ち不足ではなく証拠源の取り違え + 再描画の不発**（旧は描画を `focused_pane()` で見て分割元で真になる偽陽性 = legacy 実測 `pane=Some(2)`。新ペインは誰も汚さないと `AnyView::cached` のまま一度も描かれず、シェルが 1 行も出さない）→ 作った ID のペイン + `wait_for_drawn_state`（毎周期 notify + draw）
 - 番犬 `打ち込んだcliの結果を固定予算で待っていない` を追加（アンカー = 手前の `type_text` + `{cli}`）。修正前ソースで 3 項目を file:line 名指し（`38244` / `39998` / `41809`）。同型 16 件は `KNOWN_FIXED_CLI_WAITS` で段階導入 = #1375 で空にする
@@ -68,3 +63,8 @@
 - `line_length()` は末尾から `cell.c != ' '` を探すので全角の後続セル（`WIDE_CHAR_SPACER`）を空きと数える = 行末が全角の行は右端まで埋まっていても `filled=false`。挙動は変えず、doc の「既知の限界」+ `.agent/conventions.md` #1283 節（兄弟実装 `combined_screen_text` と**同じ穴**であること）+ 10 桁の実 PTY で 6 形を採る単体テストで固定した
 - 実測（10 桁）: A 行末が全角・以降の出力なし = `line_length=9 filled=false WIDE_CHAR_SPACER` / E `CUP` で描き直し = 同じ / B 続きあり = `WRAPLINE` が立って 10・true / C・D・F は従来どおり。現行の消費者 `find_exit_marker` は全 ASCII のマーカー断片しか見ないので実害は無い（(b) 判定の修正は別 Issue 候補）
 - 番犬 `issue1389_filled_wide_limit_watchdog` 5 本が doc / 規約 / 固定テストの欠落を file:line で名指し（注入 4 通りで確認）。製品コードの差分は doc コメントのみ・削除 0 行 = **install 不要**
+
+## 2026-09-12（#1367: 器なしペインの busy を close 確認 / GUI 判定 / agent_running へ届けた）
+- #372 で走査は器なしペインも数えていたのに**引く側**が器のセッション名（`busy_sessions`）を見たままで、tmux 未導入 / persist OFF（= cask の既定）では close 確認（#566）が出ず・`busy_children`（#694）が false でスターターが被り・`agent_running` も false だった。問う口を `RunningChildrenScanState::is_pane_busy` の 1 実装へ寄せ、3 経路を `TakoApp::pane_has_busy_children` から通した（旧キャッシュ `busy_backend_sessions` はフィールドごと削除）
+- 隔離 GUI（tako-vd・persist OFF・実 Cmd+W = `CGEventPostToPid`）の A/B: legacy（`TAKO_1367_LEGACY=1`）は `busy_agents=1` なのに `busy_children=false` / `display=starter` / **確認なしで即 close**、新は `busy_children=true`（1.0s）/ `terminal` / ダイアログが出てペインが残る。停止後は確認なし・承認経路の監査ログ（`close:kbd`）も器なしで残る
+- 番犬 5 本 + A/B + 単体 5 本 + セルフテスト項目 73g（legacy アームで `waited=93.1s busy=false` の FAILED を実測）。注入 5 通りが file:line 名指し。**チャットの列挙（`collect_chat_targets`）は器つき前提のまま**なので器なしの会話表示は別 Issue
