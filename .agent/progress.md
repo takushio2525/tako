@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-11（#1300: trust_auto_accept_e2e の tmux 起動失敗を診断で割れる形にして真因を直した）
-- 真因は見立て（#1265 と同じ PTY 枯渇）と別で**固定名の取り合い**。器のソケットもセッション名も定数なので、同じ機で `cargo test --workspace` が 2 本並ぶと片方が 0.03 秒で `duplicate session: tako1236new` に当たり、後始末の `kill-session -t <固定名>` は相手のセッションまで消す（失敗時の実測は PTY 103/511・ソケット 206 = 枯渇していない）
-- 器の名前・起動・後始末・診断を `tests/common/tmux_e2e.rs` の 1 実装へ（pid つきソケット + 期限つき + 失敗時に stderr / そのソケットのセッション / PTY / ソケット / サーバー数 / load、**このプロセスの最後の 1 本**でだけ器を畳む）。tako-control の実 tmux e2e 7 本を寄せ、番犬 2 本が修正前ソースの 28 か所を名指し FAILED
-- A/B: 2 本同時 × 110 ラウンドで旧（origin/main バイナリ）= 110/110 ラウンド FAILED（115 プロセス・全て duplicate）→ 新 = 0/110。診断の有無は `TAKO_1300_INJECT=duplicate` で同一バイナリ対比。「負荷で待ちが足りない」説は**否定**（固定の待ちのまま load 12.15 で 30 回 0 失敗。当初の 11/12 は自分の A/B ハーネスの `rm -rf` が走行中の作業 dir を消していた artifact で、並走 sweeper で同じ署名を再現）
-
 ## 2026-09-11（#962: ゾンビ pid テストの「2 秒以内に返る」を機構の観測値へ替えた）
 - 真因は見立てどおり**アサートの取り方**（予算 2 秒に対して落ちる側のタイムアウト経路が 5 秒 = 桁が開いておらず、正常でも観測 1 回ぶんの `/bin/ps` が詰まると 10.07 秒まで伸びる）。`TerminationWait`（`via` / `polls`）+ `last_termination_wait()` を開け `via == Some(Zombie)` で固定。待ち本体は観測を差し替えられる `wait_for_termination_with`（`kill_stale_daemon` も同じ 1 実装へ）
 - A/B `TAKO_962_LEGACY=1` + `TAKO_962_INJECT_DELAY_MS=1500`（`cfg(test)` 限定）: 旧 12/12 FAILED（`実際: 3.03s`）→ 新 **60/60 PASSED**。検出力は `TAKO_962_INJECT=blind_zombie` で `TerminationWait { via: None, polls: 48 }` を名指し FAILED。エッジ 4 形の戻り値は修正前と同一
@@ -64,3 +59,8 @@
 - `backend::psmux::ensure_conf` が `new-session -f` の直前に最終パスへ直書きしていた（#625 の機序③が psmux 側に残存）。`write_conf_in`（pid + 連番の tmp → rename・rename 失敗時は tmp を掃除）へ寄せ、tmux 側（#625）と同じ作法に揃えた。**内容が同じなら書かない**ので、2 回目以降の spawn は最終パスに触らない（Windows の `FILE_SHARE_DELETE` 依存の置換そのものを避ける）
 - A/B `TAKO_1314_LEGACY=1`（修正前の直書き）: 8 スレッド × 200 書き込みの再現テストが旧アーム **60/60 FAILED**（`len=0` / 短い本文が長い本文の先頭を潰した `len=55296`）→ 新アーム 0/60・負荷下（load 8 / 55〜60）0/50 × 2
 - **Windows CI で tako-core のテストが 1 件も走っていなかった**（`cargo test --workspace` は非ブロッキング + #583 で打ち切り）ので、#1282 と同じ形で `backend::psmux` の実行検査を blocking ステップとして追加。実機確認は Windows 機が offline のため Issue に手順を残した
+
+## 2026-09-11（#1333: PR の「CI 3 本緑を待って merge」を共通の待ちスクリプトへ寄せた）
+- 「出ているチェックが全部非 pending = 完了」は push 直後に Cloudflare Pages しか登録されていない瞬間に通る（#1313 = PR #1328 が CI 完了前 merge・過去に #1253 / #1282）。判定を `scripts/wait-pr-checks.sh` の 1 実装へ寄せ、**期待名が全部そろって全部 completed** を **2 回連続**観測してから確定する形にした（期待名は `.github/workflows/*.yml` の pull_request job から導出・外部連携の Cloudflare Pages だけ定数）
+- merge は `scripts/merge-pr.sh`（揃わなければ merge しない / CONFLICTING・BEHIND は待たずに拒否）。モックテスト 14 ケース（偽 gh + 偽リポジトリ）は CI の macOS ジョブで走り、A/B `TAKO_1333_LEGACY=1` の腕が「1 本だけで完了」「揺れの 1 回目で確定」を再現して Test 13 / 14 が固定する
+- この PR 自身をこの経路で merge する（初回の実運用）。あわせて main を赤にしていた `.agent/progress.md` の予算超過（13335 > 12288）を `context-budget fix` で解消
