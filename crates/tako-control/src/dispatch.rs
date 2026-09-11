@@ -9312,6 +9312,73 @@ fn rate_limits_json(rl: &crate::codex_session::RateLimits) -> serde_json::Value 
     })
 }
 
+/// #1034 / #1295: 実行拒否（`execution_refused`）を分類してよいか
+/// = **一次シグナルで agent の作業を 1 歩も観測していない**か。
+///
+/// ゲートを分けてあるのは #983 の誤検知を戻さないため。仕事を始めた worker の
+/// scrollback には、agent 自身が読んだファイルやコマンド出力として同じ文字列が
+/// 普通に流れる（#983 が `command not found` で踏んだ形）。**画面推定の busy は
+/// 根拠にならない**（TUI の起動描画だけで busy に見える。#1034 の実測では
+/// `first_busy` が 0.67s に出ていたが 1 文字も進んでいなかった）。
+///
+/// ## `None`（観測ゼロ）の扱いが #1295
+///
+/// 旧実装は `agent_work_started != Some(true)` で `None` を**無条件に**作業ゼロと
+/// 数えていた。ところが **claude の腕（`query_agent_status`）は `agent_work_started`
+/// を一度も代入しない**ので、claude では worker の実状態と無関係に常に真になる。
+/// `execution_refused_patterns(Claude)` に文言を 1 つ足した瞬間、正常に働いた worker
+/// （`status=idle` / `prompt_delivery=delivered`）が `error` / `retry_spawn` へ落ちる。
+///
+/// `None` を作業ゼロと読めるのは「拒否が**会話の成立前**に起こるので直接の証拠を
+/// 採る対象がそもそも無い」系統（= agy）だけで、その宣言は**能力マトリクスの 1 マス**
+/// [`tako_core::agent_support::keys::WORKER_REFUSAL_WORK_PROOF`] が持つ（#982 の規約）。
+fn refusal_gate_open(
+    agent: tako_core::agent_support::Agent,
+    agent_work_started: Option<bool>,
+) -> bool {
+    refusal_gate_open_in(agent, agent_work_started, legacy_refusal_gate())
+}
+
+/// [`refusal_gate_open`] の A/B を引数で受ける版（env を触らずに両アームを検査できる）
+fn refusal_gate_open_in(
+    agent: tako_core::agent_support::Agent,
+    agent_work_started: Option<bool>,
+    legacy: bool,
+) -> bool {
+    use tako_core::agent_support::{self, keys, RefusalWorkProof};
+    // 一次シグナルを持たない系統では「作業ゼロ」と「見えないだけ」が区別できない
+    if !agent_support::supports(agent, keys::WORKER_STATUS_STRUCTURED) {
+        return false;
+    }
+    if legacy {
+        return legacy_work_unobserved(agent_work_started);
+    }
+    match agent_work_started {
+        // 観測できた側は素直に読む（作業を 1 歩でも観測したら分類しない）
+        Some(started) => !started,
+        // 観測ゼロ。代理の証拠（会話が 1 件も解決できない）を使える系統だけ通す
+        None => matches!(
+            agent_support::refusal_work_proof(agent),
+            RefusalWorkProof::NoConversation
+        ),
+    }
+}
+
+/// #1295 の A/B（`TAKO_1295_LEGACY=1`）でだけ通る**修正前**のゲート。
+/// `None`（= 観測ゼロ）を無条件に作業ゼロと数えるので、`agent_work_started` を
+/// 代入しない claude では常に真になる
+fn legacy_work_unobserved(agent_work_started: Option<bool>) -> bool {
+    agent_work_started != Some(true)
+}
+
+/// #1295 の A/B 用の env。`TAKO_1295_LEGACY=1` で**同一バイナリのまま**
+/// 修正前のゲート（`None` を無条件に作業ゼロと数える）へ戻す
+fn legacy_refusal_gate() -> bool {
+    std::env::var("TAKO_1295_LEGACY")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 fn finish_worker_status(
     ctx: WorkerStatusCtx,
     session_id: Option<&str>,
@@ -9400,7 +9467,10 @@ fn finish_worker_status(
     let mut agy_transcript_read = false;
     // #1034: 一次シグナルで「agent が作業を 1 歩でも始めた」ことを観測できたか。
     // **None = 何も言えない**（読めない系統・まだ会話が無い）ので、
-    // 実行拒否の分類はここが `Some(false)` のときだけに限る
+    // 実行拒否の分類はここが `Some(false)` のときだけに限る。
+    // #1295: 例外は「拒否が会話の成立前に起こる」とマトリクスが宣言した系統だけで、
+    // その判断は [`refusal_gate_open`] が持つ（claude の腕はここを代入しないので、
+    // `None` を無条件に作業ゼロと数えるとゲートが claude で常に開く）
     let mut agent_work_started: Option<bool> = None;
     let (status, mut ctx_percent) = if let Some(ref sid) = resolved_sid {
         let agent = orchestrator::query_agent_status(sid);
@@ -9871,27 +9941,14 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     // **一次シグナルで agent の作業を 1 歩も観測していない**ときだけ見る。これで
     // 「仕事を始めた worker の scrollback に同じ文字列が流れる」型の誤検知
     // （#983 が `command not found` で避けたもの）を構造的に避けられる。
-    // **画面推定の busy は根拠にならない**（TUI の起動描画だけで busy に見える。
-    // #1034 の実測では `first_busy` が 0.67s に出ていたが 1 文字も進んでいなかった）。
     //
-    // **`None`（会話そのものが無い）も「作業ゼロ」に数える**のが実挙動に要る:
-    // 拒否は会話が作られる前に起こるので（#1034 の実画面は CLI の起動直後）、
-    // `Some(false)` だけに限ると本来の事象で発火しない。`None` を数えても危なくないのは
-    // **ペイン → 会話の解決が sticky** だから ——  一度でも解決できたペインは以後
-    // ずっと `Some(..)` を返す（`agy_session::resolve_conversation_id_for_backend`）ので、
-    // ここで `None` = そのペインが生きているあいだ一度も会話を開いていない、が durable に言える。
-    // ただし**一次シグナルを持つ系統に限る**（持たない系統では `None` が
-    // 「見えないだけ」と区別できない）
-    let work_unobserved = agent_work_started != Some(true)
-        && registry_agent
-            .as_deref()
-            .and_then(tako_core::agent_support::Agent::parse)
-            .is_some_and(|a| {
-                tako_core::agent_support::supports(
-                    a,
-                    tako_core::agent_support::keys::WORKER_STATUS_STRUCTURED,
-                )
-            });
+    // 判定の中身は [`refusal_gate_open`] に閉じてある（#1295）。**ここで条件を
+    // 書き足さない**: `None` を作業ゼロと数えてよい系統かどうかは能力マトリクスの
+    // 1 マスが宣言していて、呼び出し側が系統を直書きすると宣言が 2 箇所になる
+    let work_unobserved = registry_agent
+        .as_deref()
+        .and_then(tako_core::agent_support::Agent::parse)
+        .is_some_and(|a| refusal_gate_open(a, agent_work_started));
     if error_info.is_none() && work_unobserved && (status == "idle" || status == "unknown") {
         if let (Some(agent_name), Some(out)) = (registry_agent.as_deref(), recent_output.as_deref())
         {
@@ -24033,6 +24090,132 @@ mod tests {
         assert_ne!(
             v["error"]["kind"], "execution_refused",
             "一次シグナルの無い系統では分類しない"
+        );
+    }
+
+    /// #1295: ゲートの真理値表（env を触らない純粋関数の A/B）。
+    ///
+    /// **`None` の扱いだけが系統で割れる**。claude / codex の `None` は
+    /// 「観測していない」なので通さず、agy の `None` は「会話がまだ無い」
+    /// （= 拒否は会話の成立前に起こる）ので通す
+    #[test]
+    fn issue1295_ゲートはnoneをマトリクスの宣言でだけ通す() {
+        use tako_core::agent_support::Agent;
+        let open = |a, w| refusal_gate_open_in(a, w, false);
+        let legacy = |a, w| refusal_gate_open_in(a, w, true);
+
+        for a in [Agent::Claude, Agent::Codex] {
+            assert!(!open(a, Some(true)), "{a:?}: 作業を観測したら分類しない");
+            assert!(open(a, Some(false)), "{a:?}: 作業ゼロを観測したら分類する");
+            assert!(
+                !open(a, None),
+                "{a:?}: 観測ゼロ（= 何も言えない）を作業ゼロと数えない"
+            );
+            // 修正前は `None` を無条件に通していた（= claude では常に開く）
+            assert!(legacy(a, None), "{a:?}: 修正前のゲートの再現が消えている");
+        }
+
+        // agy は会話が作られる前に拒否されるので、代理の証拠で通す（#1034 の本来の事象）
+        assert!(open(Agent::Agy, None), "#1034 の分類が発火しなくなっている");
+        assert!(!open(Agent::Agy, Some(true)));
+        assert!(open(Agent::Agy, Some(false)));
+
+        // 一次シグナルを持たない系統はどのアームでも落ちる
+        for w in [Some(true), Some(false), None] {
+            assert!(!open(Agent::Local, w));
+            assert!(!legacy(Agent::Local, w));
+        }
+    }
+
+    /// #1295: **claude の正常完了を実行拒否へ落とさない**（end-to-end の再現）。
+    ///
+    /// claude の腕（`query_agent_status`）は `agent_work_started` を一度も代入しないので、
+    /// 修正前のゲート（`agent_work_started != Some(true)`）は **claude では worker の
+    /// 実状態と無関係に常に真**だった。`execution_refused_patterns(Claude)` が空な
+    /// あいだは画面から発火しないので、判定パターンだけを注入口
+    /// （`TAKO_1295_INJECT_PATTERN`）から足して**将来文言を 1 つ足した状態**を作る。
+    #[test]
+    fn issue1295_claudeの正常完了を実行拒否へ落とさない() {
+        use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
+        let path = registry_path().unwrap();
+        // **送達済みで正常に働いた** claude worker
+        WorkerRegistry::mutate_at(&path, |reg| {
+            reg.workers.insert(
+                "q12951".into(),
+                WorkerEntry {
+                    pane: 12951,
+                    agent: "claude".into(),
+                    status: "active".into(),
+                    spawned_at: "2026-01-01T00:00:00Z".into(),
+                    prompt_delivered_at: Some(crate::sessions::now_iso()),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+
+        // 「agent 自身が読んだファイルの中身」として拒否文言が画面末尾に流れている形
+        // （#983 が `command not found` で踏んだのと同じ = 仕事はちゃんと終わっている）
+        const PHRASE: &str = "tako-1295-injected-refusal";
+        let screen =
+            format!("  仕様を確認しました。\n  grep で {PHRASE} を数えました。\n  RESULT: 3\n");
+        let status_of = || {
+            finish_worker_status(
+                WorkerStatusCtx {
+                    pane_id: 12951,
+                    pane_exists: true,
+                    backend_session: None,
+                    live_tail: Some(screen.clone()),
+                    full_screen: None,
+                    has_running_children: false,
+                    // #1297: 入力欄の属性は見ない判定なので None（文字列だけで読む旧挙動）
+                    input_style: None,
+                    limit_resume: Value::Null,
+                },
+                None,
+                None,
+            )
+            .unwrap()
+        };
+
+        std::env::set_var("TAKO_1295_INJECT_PATTERN", PHRASE);
+        // 修正後: claude の `None` は「観測していない」なので作業ゼロと数えない
+        let v = status_of();
+        assert_ne!(
+            v["status"], "error",
+            "正常に働いた claude worker を error に落としている: {v}"
+        );
+        assert!(
+            v["error"].is_null(),
+            "実行拒否として分類してはいけない: {v}"
+        );
+
+        // 修正前のゲート（`None` を無条件に作業ゼロと数える）へ戻すと再現する
+        std::env::set_var("TAKO_1295_LEGACY", "1");
+        let v = status_of();
+        std::env::remove_var("TAKO_1295_LEGACY");
+        std::env::remove_var("TAKO_1295_INJECT_PATTERN");
+        assert_eq!(
+            v["status"], "error",
+            "修正前のゲートは claude で常に開いていた（再現が消えている）: {v}"
+        );
+        assert_eq!(v["error"]["kind"], "execution_refused");
+        assert_eq!(v["error"]["recommended_action"], "retry_spawn");
+
+        // **系統が解決できない worker** は修正前のゲートでも分類しない
+        // （マトリクスを引けないので「見えないだけ」と区別できない）
+        WorkerRegistry::mutate_at(&path, |reg| {
+            if let Some(e) = reg.workers.get_mut("q12951") {
+                e.agent = "gemini".into();
+            }
+        })
+        .unwrap();
+        std::env::set_var("TAKO_1295_INJECT_PATTERN", PHRASE);
+        let v = status_of();
+        std::env::remove_var("TAKO_1295_INJECT_PATTERN");
+        assert_ne!(
+            v["status"], "error",
+            "系統が解決できない worker を実行拒否へ落としている: {v}"
         );
     }
 
