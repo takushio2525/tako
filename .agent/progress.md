@@ -59,6 +59,11 @@
 - 実測（隔離 GUI・`tako-vd`・1/4/12/22 ペイン・各 20 秒 × 3 窓）: 傾き **0.271 → 0.068 M 命令/秒/ペイン**（全 12 窓の最小二乗）= 2 秒 tick 1 回あたり 0.543 → 0.135 M 命令/ペイン。22 ペインの footprint 46.4 → 39.9 MB
 - A/B は `TAKO_1001_C2_LEGACY=1` / `TAKO_1001_C3_LEGACY=1`。番犬 4 本が修正前ソースで file:line 名指し FAILED、`tail_lines` は故障注入 3 種で単体テストが落ちる
 
+## 2026-09-11（#1349: コピー行の「選択なしなら Ctrl+C 送信」を実態へ）
+- 隔離 GUI（tako-vd・pid 指定の CGEventPostToPid）で実測: 選択なし cmd+C は `sleep` を殺さず `^C` も出ず クリップボードも不変。同じ経路で撃った本物の Ctrl+C は殺した（= 観測に検出力あり）。選択あり cmd+C はコピーになる（回帰なし）
+- docs の行を「選択が無いときは何も起きない」へ直し、注記で「中断の Ctrl+C は tako が横取りしない」を明示。実装を docs へ寄せる案 (b) は挙動変更なので Issue へ比較を残して master 判断へ
+- 番犬 2 本（コピー行の説明文と `copy_selection` の両方向 / 素の ctrl-c 未バインド）を `docs_keyboard_shortcuts.rs` へ。注入 5 通りで file:line 名指し FAILED
+
 ## 2026-09-11（#1347: merge 後のリモートブランチ削除を merge-pr.sh 自身で閉じた）
 - 真因は gh の順序（ローカル切り替え → ローカル削除 → リモート削除）。専用 worktree から実行すると 1 手目が `fatal: 'main' is already used by worktree` で落ち**リモートまで到達しない**（`git switch main` 単体で逐語再現・PR #1337 で実発生・棚卸しで merge 済み PR の head が origin に 5 本残存）
 - `delete_remote_head_branch` を MERGED 確認の後に置いた（`gh api` で存在確認 → DELETE・冪等・**その PR の head 1 本だけ**・head == base と fork は触らない）。A/B `TAKO_1347_LEGACY=1` が gh 任せの腕で、モック 4 ケース（消し切る / legacy では残る / 冪等 / 門）を追加して 72 assert 緑

@@ -281,3 +281,191 @@ fn docsのwindows列にcmd由来の打鍵が無い() {
         "Windows 列に Cmd の打鍵が載っている（Windows では Win キーになり OS に奪われる）: {offenders:?}"
     );
 }
+
+// ---- コピー行の説明と実装の一致（Issue #1349） ----
+//
+// #1323 の時点の docs は「選択テキストをコピー（**選択なしの場合は Ctrl+C を
+// ペインへ送信**）」と書いていたが、実装（`copy_selection`）は選択が無ければ
+// 何もしない。隔離 GUI（tako-vd）の実測でも、走っている `sleep` は生き残り、
+// 入力途中の行も消えず、クリップボードも変わらなかった（同じ経路で撃った
+// **本物の Ctrl+C** は sleep を殺したので、観測に検出力はある）。
+//
+// キー集合の一致を見る上の 3 本は**説明文を見ない**ので、この種の食い違いは
+// すり抜ける。そこで「ペインへ送ると書いてあるか」と「実装が送るか」を
+// **両方向**で突き合わせる。
+
+const APP_SRC: &str = "crates/tako-app/src/main.rs";
+
+/// 「ペインへ打鍵を送る」と読める言い回し。#1349 の誤記はこの形だった
+const SEND_CLAIM_PHRASES: &[&str] = &[
+    "ペインへ送信",
+    "ペインへ送る",
+    "ペインに送信",
+    "ペインに送る",
+    "C をペイン",
+];
+
+/// `fn <name>(` の本体を波括弧の対応で切り出す。返すのは (1 始まりの行番号, 本体)
+fn fn_body(src: &str, name: &str) -> (usize, String) {
+    let head = format!("fn {name}(");
+    let at = src
+        .find(&head)
+        .unwrap_or_else(|| panic!("{APP_SRC} に {name}( が見つからない（構造が変わった？）"));
+    // 行番号は改行の数で数える（`lines().count()` はインデントの有無で 1 ずれる）
+    let line = src[..at].matches('\n').count() + 1;
+    assert!(
+        src.lines().nth(line - 1).is_some_and(|l| l.contains(&head)),
+        "行番号の計算がずれている（{APP_SRC}:{line} に {head} が無い）"
+    );
+    let open = at + src[at..].find('{').expect("本体の { が無い");
+    let mut depth = 0usize;
+    for (i, ch) in src[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return (line, src[open + 1..open + i].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("{name}() の本体が閉じていない");
+}
+
+/// `copy_selection` の本体のうち**ペイン（PTY）へバイトを書く**行。
+/// クリップボードへの書き込み（`cx.write_to_clipboard`）は PTY ではないので外す
+fn pane_write_lines(body: &str) -> Vec<String> {
+    body.lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with("//"))
+        .filter(|l| {
+            let l = l.replace("write_to_clipboard", "");
+            l.contains(".write(")
+                || l.contains("0x03")
+                || l.contains("\\x03")
+                || l.contains("send_input")
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// docs の「選択テキストをコピー」の表の行（行番号, 操作セル）。
+/// **無い / 複数あるのも FAILED**（行ごと消えたのに黙って通るのを避ける）
+fn copy_row(md: &str) -> (usize, String) {
+    let rows: Vec<(usize, String)> = md
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.trim_start().starts_with('|') && l.contains("選択テキストをコピー"))
+        .map(|(i, l)| {
+            let cells: Vec<&str> = l
+                .trim()
+                .trim_matches('|')
+                .split('|')
+                .map(str::trim)
+                .collect();
+            (i + 1, cells[0].to_string())
+        })
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "{DOC} の「選択テキストをコピー」の行が {} 本ある（1 本であること。\
+         文言を変える・行を消すなら実装との一致も見直す）",
+        rows.len()
+    );
+    rows.into_iter().next().expect("1 本ある")
+}
+
+/// Issue #1349: コピー行の説明が `copy_selection` の実装と食い違わないこと。
+///
+/// 実装が送らないのに docs が「送る」と書いていたら落とし、逆に実装が
+/// 送るようになったのに docs が黙っていても落とす（= 挙動を iTerm2 流へ
+/// 寄せるなら、同じコミットでこの行を直すことになる）
+#[test]
+fn コピー行の説明がcopy_selectionの実装と一致する() {
+    let root = repo_root();
+    let md = std::fs::read_to_string(root.join(DOC)).expect("keyboard-shortcuts.md を読めない");
+    let app = std::fs::read_to_string(root.join(APP_SRC)).expect("main.rs を読めない");
+
+    let (fn_line, body) = fn_body(&app, "copy_selection");
+    let writes = pane_write_lines(&body);
+    let impl_sends = !writes.is_empty();
+
+    let (row_line, op) = copy_row(&md);
+    let claims: Vec<&&str> = SEND_CLAIM_PHRASES
+        .iter()
+        .filter(|p| op.contains(**p))
+        .collect();
+    let doc_claims = !claims.is_empty();
+
+    assert_eq!(
+        doc_claims,
+        impl_sends,
+        "docs のコピー行と実装が食い違っている\n\
+         - docs（{DOC}:{row_line}）: {} → {op}\n\
+         - 実装（{APP_SRC}:{fn_line} の copy_selection）: {}\n\
+         直し方は 2 通り: docs を実態へ寄せる（選択が無いときは何も起きない）か、\
+         実装を docs へ寄せて（選択なしなら Ctrl+C を送る）同じコミットで行も直す",
+        if doc_claims {
+            format!("ペインへ送ると書いてある（{claims:?}）")
+        } else {
+            "ペインへ送るとは書いていない".to_string()
+        },
+        if impl_sends {
+            format!("ペインへ書いている（{writes:?}）")
+        } else {
+            "ペインへは何も書いていない".to_string()
+        }
+    );
+
+    // 表のセル以外（注記・本文）に同じ言い回しが残っていないか。
+    // 実装が送らないときだけ見る（送るようになったら書いてあって当然）
+    if !impl_sends {
+        let elsewhere: Vec<String> = md
+            .lines()
+            .enumerate()
+            .filter(|(i, _)| i + 1 != row_line)
+            .flat_map(|(i, l)| {
+                SEND_CLAIM_PHRASES
+                    .iter()
+                    .filter(move |p| l.contains(**p))
+                    .map(move |p| format!("{DOC}:{}: 「{p}」", i + 1))
+            })
+            .collect();
+        assert!(
+            elsewhere.is_empty(),
+            "コピーの打鍵はペインへ何も送らないのに、表の外にそう読める記述が残っている:\n{}",
+            elsewhere.join("\n")
+        );
+    }
+}
+
+/// docs の注記「中断の <kbd>Ctrl</kbd>+<kbd>C</kbd> は tako が横取りしない」が
+/// 本当であること。素の `ctrl-c` をバインドへ足すと注記が嘘になる
+/// （そのうえ端末の中断が効かなくなる。`keybindings.rs` 側の
+/// `端末へ流すべきキーを奪っていない` は非 macOS ビルドだけで走るので、
+/// ここは**どの OS でも**ソースを読んで見る）
+#[test]
+fn 素のctrl_cはバインドされていない() {
+    let root = repo_root();
+    let src = std::fs::read_to_string(root.join(SRC)).expect("keybindings.rs を読めない");
+    let bound: BTreeSet<String> = ["base_bindings", "macos_only_bindings", "non_macos_bindings"]
+        .iter()
+        .flat_map(|f| specs_in_fn(&src, f))
+        .map(|s| canon_spec(&s))
+        .collect();
+    assert!(
+        !bound.contains("ctrl+c"),
+        "素の Ctrl+C がバインドされた（docs は「中断の Ctrl+C はそのままペインへ届く」と \
+         書いている。バインドするなら {DOC} の注記も直す）"
+    );
+    // コピーの打鍵そのものは在ること（行ごと消えたのに気づけるように）
+    for spec in ["cmd+c", "ctrl+shift+c"] {
+        assert!(
+            bound.contains(spec),
+            "{spec} のバインドが無い（docs のコピー行と食い違う）"
+        );
+    }
+}
