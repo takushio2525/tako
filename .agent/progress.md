@@ -54,6 +54,11 @@
 - A/B（`TAKO_1294_LEGACY=1`）: 旧アーム = `prompt_delivery=undelivered` / events `prompt_undelivered` / **自動再送 1 回**、新アーム = `unverified` / `prompt_delivery_unverified` / **0 回**。本当に未達（`paste_not_reflected`）は両アームとも 1 回で回帰なし
 - 番犬 3 本（記録が bool を渡す形 / 判定が無条件 `OverdueSuspect` / 自動再送の引き金の一本化）が修正前ソースで file:line 名指し FAILED。単体 8 本・dispatch e2e 1 本
 
+## 2026-09-11（#1208: remote_link_live の実時間比較は #1220 で修正済みと確認し、再現の作法を規約へ）
+- Issue は #1220（`3a0ea26`）の重複で、現行 main のテストは既に `scan_counters` の量比較。番犬 `test_timing_watchdog` は `crates/*/tests` 全体を見ており（`tako-core` への注入も名指し）、旧版を戻すと `remote_link_live.rs:247: assert(… warm <= cold …)` で FAILED
+- 症状解消を実測: 新実装は負荷下 330 回 + 同時 16 本 × 10 ラウンドで **0 FAILED**。旧実装は `yes` 負荷では 0/170 だが**バイナリ多重同時起動**で 3/160 反転（1 件は Issue と同じ `初回 24.5ms / 2 回目 38.8ms`）
+- 検出力の差が決定的: リンク memo を殺すと旧は 2/10 しか落ちない（8 回見逃し）・所在 memo は 0/10。新は両方 10/10。コード修正は不要で #1208 は close、再現の作法だけ `.agent/conventions.md` へ残した
+
 ## 2026-09-11（#1300: trust_auto_accept_e2e の tmux 起動失敗を診断で割れる形にして真因を直した）
 - 真因は見立て（#1265 と同じ PTY 枯渇）と別で**固定名の取り合い**。器のソケットもセッション名も定数なので、同じ機で `cargo test --workspace` が 2 本並ぶと片方が 0.03 秒で `duplicate session: tako1236new` に当たり、後始末の `kill-session -t <固定名>` は相手のセッションまで消す（失敗時の実測は PTY 103/511・ソケット 206 = 枯渇していない）
 - 器の名前・起動・後始末・診断を `tests/common/tmux_e2e.rs` の 1 実装へ（pid つきソケット + 期限つき + 失敗時に stderr / そのソケットのセッション / PTY / ソケット / サーバー数 / load、**このプロセスの最後の 1 本**でだけ器を畳む）。tako-control の実 tmux e2e 7 本を寄せ、番犬 2 本が修正前ソースの 28 か所を名指し FAILED
@@ -63,3 +68,7 @@
 - 真因は見立てどおり**アサートの取り方**。予算 2 秒に対して落ちる側（`daemon_stop_impl` の タイムアウト経路）が 5 秒で桁が開いておらず、正常でも観測 1 回ぶんの `/bin/ps`（fork+exec）が詰まれば所要が 10.07 秒まで伸びた。`TerminationWait`（`via` / `polls`）+ `last_termination_wait()` を開け、`via == Some(Zombie)` で固定。待ち本体は観測を差し替えられる `wait_for_termination_with` にして回数と経路を実時間なしで単体固定（`kill_stale_daemon` の待ちも同じ 1 実装へ寄せた）
 - A/B `TAKO_962_LEGACY=1` + `TAKO_962_INJECT_DELAY_MS=1500`（どちらも `cfg(test)` 限定）: 旧アーム 12/12 FAILED（`実際: 3.03s` = Issue と同じ形）・新アーム **60/60 PASSED**（load 4〜13）。検出力は `TAKO_962_INJECT=blind_zombie`（#619 前の誤判定）で新アサートが `TerminationWait { via: None, polls: 48 }` を名指し FAILED。素の fork 圧では旧アームも 12/12 通る = 棚卸しの実測どおり注入が要る
 - 番犬は走査を `crates/*/src/` へ広げ（#962 の現場は `src` の `mod tests` で**最初から見えていなかった**）、絶対予算は根拠つき許可リスト制に。修正前ソースで `remote.rs:6994（daemon_stop_implはゾンビpidを終了済みとして扱う）` を名指し FAILED。src 走査で露出した既存の誤検知（同名の `let waited = ….elapsed()` を 3 つと数えて `main.rs:70010` を拾う）も畳んだ
+## 2026-09-11（#1296: テストの pid ごとの data dir が消えずに溜まるのを直した）
+- #944 の隔離は「本番の外へ倒す」までで消す仕掛けが無く、再起動でも消えない macOS の `TMPDIR` に積もっていた（実測 2,188 件 + `tako-agent-config-*` 784 件 = `du` で 115 MB）。`tako_core::test_residue` に後始末を 1 実装し、作る経路（`paths::test_data_dir`）が `arm_self_cleanup`（`libc::atexit`）+ `sweep_stale_on_start`（SIGKILL 分を次回起動で回収）を持つ形へ
+- 消すのは**自分の pid か pid が生きていないもの**だけ。pid 再利用は「dir の作成時刻より後に始まったプロセス」として見分けて見送る（実測 19 件）。消す直前に生死と作成時刻を取り直して、列挙後に作り直された置き場を巻き込まない
+- 既存残骸の口は `tako test-residue`（既定 dry-run・`--apply` で実削除・MCP `tako_test_residue`）。番犬 2 本（修正前ソースで 2 件 FAILED）+ 子プロセス実測 2 本 + 単体 12 本。A/B は `TAKO_1296_LEGACY=1`

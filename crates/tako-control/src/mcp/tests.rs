@@ -570,7 +570,8 @@ mod tests {
         // #1154 の tako_orchestrator_guide（master の手順書）を追加して 146
         // #818 の tako_scrollback（スクロールバック保持上限）を追加して 147
         // #1283 の tako_links（画面のリンク検出）を追加して 148
-        assert_eq!(tools.len(), 148);
+        // #1296 の tako_test_residue（テスト・検証プロセスの残骸の掃除）を追加して 149
+        assert_eq!(tools.len(), 149);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

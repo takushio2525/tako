@@ -1061,6 +1061,24 @@ watch の再検査が busy と読むと `idle_streak` が永久に積まれな�
   追記が来た回に落ちる）。実測: 20 行 / 10 会話の付与は初回 10 走査 5.0 MB /
   2 回目 0 走査 0 B（上限は 64 KiB + 追記ぶん）
 
+### この形を疑ったときの負荷の掛け方（Issue #1208）
+
+**`yes` のような CPU スピナーでは再現しない**。実時間比較が反転するのは「片方の窓にだけ
+待ちが入る」ときで、2 回目の窓は 0.2 ms しかないので、純粋な CPU 競合はその窓をまず踏まない
+（実測: `yes` 36〜72 本 + `nice -n 20` で旧実装 **0/170 FAILED**）。
+
+再現する負荷は**テストバイナリ自身の多重同時起動**（= `cargo test --workspace` の実態）。
+同じ材料を読むプロセスが競合すると page cache と**グローバル memo**が先に温まって
+**`cold` 側が 0.2 ms へ潰れ**、2 つの窓が同桁になる（実測: 同時 16 本 × 10 ラウンドで旧実装
+**3/160 FAILED**。うち 1 件は Issue と同じ `初回 24.5ms / 2 回目 38.8ms` の形）。
+
+- 疑わしいテストが**同じ binary の兄弟テストと材料を共有**しているなら、まずこれを疑う。
+  `--exact` の単独実行は兄弟が memo を温めないので、**いちばん再現しない走らせ方**
+- **反転の再現は「直った」の証拠には足りない**。実回帰を注入して検出力を比べること。
+  実測: リンク memo を殺すと旧実装は **2/10 しか落ちず 8 回見逃す**（cold も warm も
+  同じ理由で ~35 ms になるので `warm <= cold` がコイン投げになる）・所在 memo を殺すと
+  **0/10**。量で測る新実装はどちらも **10/10 で確定 FAILED**
+
 ## 実画面の行は空白詰め（Issue #1182）
 
 `Screen`（`tako_core::screen`）の 1 行は **`compose_line` が未使用セルまで押し込む**ので、
@@ -1246,6 +1264,28 @@ Dock のピン留めは `.app` への **file URL ブックマーク**（`com.app
   （モックテスト `scripts/test-clean-trust-residue.sh` が偽の HOME で実プロジェクトの
   巻き添えを落とす。CI の macOS ジョブで毎 PR 走る）
 
+### 使い捨ての置き場は作った経路が消す（Issue #1296）
+
+**`<TMPDIR>/<名前>-<pid>` を作る経路は、消す経路も同じ場所で持つ。**
+#944 / #1253 の隔離は「本番の外へ倒す」までで止まっていて、macOS の `TMPDIR`
+（`/var/folders/…/T/`）は**再起動でも消えない**ため `cargo test` 1 回につき 1 dir が
+積もっていた（実測 2026-09-11: `tako-test-data-*` 2,188 件 + `tako-agent-config-*` 784 件）。
+
+- 後始末は 2 段構え: `tako_core::test_residue::arm_self_cleanup`（`libc::atexit` =
+  正常終了と `std::process::exit` の両方で走る）+ `sweep_stale_on_start`
+  （SIGKILL / abort で 1 が走らなかった回を、次のテストプロセスが回収する）
+- **消してよいのは自分の pid のものと、pid が生きていないものだけ**。名前の一致で
+  消すと**並行して走る別 worker の `cargo test`** を巻き込む（#625 の事故クラス）。
+  pid は再利用されるので、生きていても「dir の作成時刻より後に始まったプロセス」は
+  `reused_pid` として**見送る**（判定は `test_residue::judge` の 1 実装）
+- 過去の残骸は自動では消さない口も用意する: `tako test-residue`（既定 dry-run・
+  `--apply` で実削除。MCP は `tako_test_residue`）。`clean-trust-residue.sh` と同じ作法
+- 番犬は `crates/tako-control/tests/test_residue_watchdog.rs`（`paths.rs` の
+  「作る経路」が `arm_self_cleanup` を持つか・接頭辞が `KINDS` に載っているか・
+  判定を通さない `remove_dir_all` が増えていないか）と、
+  `crates/tako-core/tests/test_data_residue.rs`（子プロセスを起こして**実際に
+  dir が消えること / 生きている子の dir が残ること**を見る）の 2 段。A/B は `TAKO_1296_LEGACY=1`
+
 ## 実 tmux の e2e は器をプロセスごとに分ける（Issue #1300）
 
 **`-L` に渡す器の名前に固定名を使わない**（`tmux_e2e::socket_for("<Issue 番号>")` が
@@ -1260,7 +1300,6 @@ stderr・そのソケットのセッション一覧・PTY / ソケット / サ�
 診断になる（#1300 の観測は理由が 1 ビットも残らず、枯渇か否かの切り分けに測り直しが
 1 往復要った。実測の答えは PTY 103/511 = **枯渇ではなく名前の取り合い**）。
 番犬は `crates/tako-control/tests/tmux_e2e_watchdog.rs`、A/B は `TAKO_1300_LEGACY=1`。
-
 ## 設定・データファイルのスキーマ変更（Issue #916）
 
 **永続ファイルの形式や置き場を変えるときは自動移行を同梱する。手動移行を要求しない。**
