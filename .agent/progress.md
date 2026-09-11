@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-09（#1283: ~ 始まりのパスを地の文の中でも cmd+クリックで開けるようにした）
-- 真因は見立て（`~` 展開 / `.mp4` のプレビュー非対応 / soft wrap）と別で、**トークンの区切りが ASCII の空白と `()[]{}<>,;` だけ**だったこと。日本語の文にパスが埋まると**文ごと 1 トークン**になり実在チェックで落ちる（実測トークン: `` 動画は`~/…mp4`、確認して。`` / `~/…mp4このリンクが` = **素の形だけが飛べていた**）
-- 区切り集合は増やさず（`資料（最新）.pdf` のような実在名を落とす）**トークン全体 → 文字種の切り替わりで削った候補**を長い順に試す形へ（`links::path_candidates`。全 ASCII は候補を増やさない / `/` 終わりは採らない）。囲みの前に地の文がくっつく形（空白入りパス）は**途中のバッククォートで切る**ことで回収。`open_plan` を「拡張子 → 開き方」の正本にし（`.mp4` = 動画プレビュー）、開けなかったときの `eprintln!` を通知 + persist.log へ。CLI `tako links` / MCP `tako_links` を新設
-- A/B `TAKO_1283_LEGACY=1` で 2 形が `[]` に戻る（素の形は残る）。隔離 GUI（tako-vd）の実画面で 3 形すべて検出 + `open=video`・セルフテスト項目 147 に 2 形を追加して `TAKO_APP_SELF_TEST_OK`
-
 ## 2026-09-11（#1261: 単体テストが実 agy / codex を起こして本番ホームへ書かないようにした）
 - 起動元は空 HOME + 偽 CLI の shim で 2 本に特定（`setup_bootstrap::tests::状態は3系統ぶんまとめて返せる` = `agy models` / `codex login status` / `claude auth status --json`、`stale_binary::tests::test_check_stale_different_binary` = `claude --version`）。**tako が書かなくても実 CLI は起動しただけで自分のホームを作る**
 - 問い合わせ起動を `tako_control::agent_probe::run` の 1 か所へ寄せた。判定は実行時（`paths::is_test_process`。#1253 の brew と同型）で、#586 のコンソール窓抑止もここが当てる
@@ -63,3 +58,8 @@
 - 真因は見立て（#1265 と同じ PTY 枯渇）と別で**固定名の取り合い**。器のソケットもセッション名も定数なので、同じ機で `cargo test --workspace` が 2 本並ぶと片方が 0.03 秒で `duplicate session: tako1236new` に当たり、後始末の `kill-session -t <固定名>` は相手のセッションまで消す（失敗時の実測は PTY 103/511・ソケット 206 = 枯渇していない）
 - 器の名前・起動・後始末・診断を `tests/common/tmux_e2e.rs` の 1 実装へ（pid つきソケット + 期限つき + 失敗時に stderr / そのソケットのセッション / PTY / ソケット / サーバー数 / load、**このプロセスの最後の 1 本**でだけ器を畳む）。tako-control の実 tmux e2e 7 本を寄せ、番犬 2 本が修正前ソースの 28 か所を名指し FAILED
 - A/B: 2 本同時 × 110 ラウンドで旧（origin/main バイナリ）= 110/110 ラウンド FAILED（115 プロセス・全て duplicate）→ 新 = 0/110。診断の有無は `TAKO_1300_INJECT=duplicate` で同一バイナリ対比。「負荷で待ちが足りない」説は**否定**（固定の待ちのまま load 12.15 で 30 回 0 失敗。当初の 11/12 は自分の A/B ハーネスの `rm -rf` が走行中の作業 dir を消していた artifact で、並走 sweeper で同じ署名を再現）
+
+## 2026-09-11（#962: ゾンビ pid テストの「2 秒以内に返る」を機構の観測値へ替えた）
+- 真因は見立てどおり**アサートの取り方**。予算 2 秒に対して落ちる側（`daemon_stop_impl` の タイムアウト経路）が 5 秒で桁が開いておらず、正常でも観測 1 回ぶんの `/bin/ps`（fork+exec）が詰まれば所要が 10.07 秒まで伸びた。`TerminationWait`（`via` / `polls`）+ `last_termination_wait()` を開け、`via == Some(Zombie)` で固定。待ち本体は観測を差し替えられる `wait_for_termination_with` にして回数と経路を実時間なしで単体固定（`kill_stale_daemon` の待ちも同じ 1 実装へ寄せた）
+- A/B `TAKO_962_LEGACY=1` + `TAKO_962_INJECT_DELAY_MS=1500`（どちらも `cfg(test)` 限定）: 旧アーム 12/12 FAILED（`実際: 3.03s` = Issue と同じ形）・新アーム **60/60 PASSED**（load 4〜13）。検出力は `TAKO_962_INJECT=blind_zombie`（#619 前の誤判定）で新アサートが `TerminationWait { via: None, polls: 48 }` を名指し FAILED。素の fork 圧では旧アームも 12/12 通る = 棚卸しの実測どおり注入が要る
+- 番犬は走査を `crates/*/src/` へ広げ（#962 の現場は `src` の `mod tests` で**最初から見えていなかった**）、絶対予算は根拠つき許可リスト制に。修正前ソースで `remote.rs:6994（daemon_stop_implはゾンビpidを終了済みとして扱う）` を名指し FAILED。src 走査で露出した既存の誤検知（同名の `let waited = ….elapsed()` を 3 つと数えて `main.rs:70010` を拾う）も畳んだ
