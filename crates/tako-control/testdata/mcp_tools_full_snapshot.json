@@ -2673,7 +2673,7 @@
     "name": "tako_orchestrator_report"
   },
   {
-    "description": "リモートアクセス API サーバーを起動する。スマホからブラウザ経由でペインを操作するための HTTP API サーバーが Unix domain socket で開始される。transport は Tailscale Serve のみ: daemon は UDS（0600）のみで listen し、tailnet 内限定の恒久固定 URL（https://<ホスト名>.<tailnet>.ts.net）で公開される（WireGuard E2E 暗号化・TCP ポートは一切開かない）。Tailscale が未セットアップ（未導入・未ログイン・HTTPS 未有効等）の場合は不足項目を列挙して起動を拒否するので、ユーザーに `tako remote setup` を案内する。接続には機器ペアリングが必要: 初回アクセス時に Mac 画面へ承認ダイアログが表示され、ユーザーが許可した端末だけが role（observe / interact / manage / admin）に応じて操作できる。承認・role 変更は Mac の GUI 限定で AI からは行えない。注意: interact 以上を許可した端末はターミナルへ任意コマンドを送信できる（実質シェルアクセス）。",
+    "description": "リモートアクセス API サーバーを起動する。スマホからブラウザ経由でペインを操作するための HTTP API サーバーがローカルエンドポイントで開始される。transport は Tailscale Serve のみ: daemon の待ち受けは既定でループバック TCP（127.0.0.1 のエフェメラルポート）で、tailnet 内限定の恒久固定 URL（https://<ホスト名>.<tailnet>.ts.net）で公開される（WireGuard E2E 暗号化・LAN や外部インタフェースへはバインドしない）。Tailscale が未セットアップ（未導入・未ログイン・HTTPS 未有効等）の場合は不足項目を列挙して起動を拒否するので、ユーザーに `tako remote setup` を案内する。接続には機器ペアリングが必要: 初回アクセス時に Mac 画面へ承認ダイアログが表示され、ユーザーが許可した端末だけが role（observe / interact / manage / admin）に応じて操作できる。承認・role 変更は Mac の GUI 限定で AI からは行えない。注意: interact 以上を許可した端末はターミナルへ任意コマンドを送信できる（実質シェルアクセス）。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {},

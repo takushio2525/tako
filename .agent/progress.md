@@ -20,16 +20,6 @@
 
 ---
 
-## 2026-09-11（#1309: 新規 worktree で PWA の dist が無くてもビルドが通るようにした）
-- 真因は #574 の手当てが CI にしか無かったこと。`crates/tako-control/build.rs` を新設し、`dist/index.html` が無ければ npm でビルドする（**既にある dist は触らない**。rust_embed の埋め込み元へ `rerun-if-changed` も張った）。npm 無し / npm 失敗は**1 行目に手順が出る**エラーで止める（空埋め込みで通す案は不採用 = 製品バイナリに PWA が入らない事故の余地を作る）
-- PWA ビルドの正本を `scripts/build-pwa.sh` へ 1 本化（`build-app.sh` / `check-windows.sh` が呼ぶ。既定は毎回作り直す = #60、`--if-missing` は dist があれば何もしない）
-- 実測: クリーン worktree で修正前 = `PwaAssets::get` 未定義 4 件で失敗 → 修正後は成功（npm ci + build が自動で走り dist 生成）。npm を PATH から外すと `scripts/build-pwa.sh` の 1 行案内で停止。no-op 再ビルド 3 回 = before 0.17/0.15/0.15s → after 0.16/0.17/0.17s。release rlib に dist のハッシュ付きアセット名を確認。テスト 10 本（偽 npm + 一時 dir、実 npm は起こさない）
-
-## 2026-09-11（#1296: テストの pid ごとの data dir が消えずに溜まるのを直した）
-- #944 の隔離は「本番の外へ倒す」までで消す仕掛けが無く、再起動でも消えない macOS の `TMPDIR` に積もっていた（実測 2,188 件 + `tako-agent-config-*` 784 件 = `du` で 115 MB）。`tako_core::test_residue` に後始末を 1 実装し、作る経路（`paths::test_data_dir`）が `arm_self_cleanup`（`libc::atexit`）+ `sweep_stale_on_start`（SIGKILL 分を次回起動で回収）を持つ形へ
-- 消すのは**自分の pid か pid が生きていないもの**だけ。pid 再利用は「dir の作成時刻より後に始まったプロセス」として見分けて見送る（実測 19 件）。消す直前に生死と作成時刻を取り直して、列挙後に作り直された置き場を巻き込まない
-- 既存残骸の口は `tako test-residue`（既定 dry-run・`--apply` で実削除・MCP `tako_test_residue`）。番犬 2 本（修正前ソースで 2 件 FAILED）+ 子プロセス実測 2 本 + 単体 12 本。A/B は `TAKO_1296_LEGACY=1`
-
 ## 2026-09-11（#1295: 実行拒否ゲートが claude では常に真だったのを締めた）
 - 真因は `None`（観測ゼロ）を無条件に作業ゼロと数えていたこと。claude の腕（`query_agent_status`）は `agent_work_started` を一度も代入しないので `!= Some(true)` が常に真で、`execution_refused_patterns(Claude)` に文言を 1 つ足した瞬間に正常完了した worker が `error` / `retry_spawn` へ落ちる形だった。判定を `dispatch::refusal_gate_open` の 1 実装へ閉じ、`None` を通せる系統は `agent_support::MATRIX` の新マス `worker_refusal_work_proof`（agy だけ対象外 = 代理の証拠を使う）が宣言する
 - A/B（`TAKO_1295_LEGACY=1`）: 旧アーム = 正常完了の claude worker が `status=error` / `kind=execution_refused` / `retry_spawn`、新アーム = `error` なし。#1034 の agy 経路は両アームとも分類されたまま（既存テスト緑）
@@ -59,6 +49,10 @@
 - #1296 の射程は**置き場を決める側**だけで、テストが個別に `temp_dir().join(…)` で作る使い捨ては残っていた（実測: `cargo test -p tako-core --lib` で 14 件 / `-p tako-cli -p tako-control --lib` で 31 件）。`tako_core::test_residue` に `ScratchDir`（スコープで消える）と `process_scratch`（プロセス寿命）を 1 実装し、親を `<TMPDIR>/tako-test-scratch-<pid>` 1 つへ畳んで #1296 の 2 段構え（atexit + 次回起動の pid 回収 + `tako test-residue`）にそのまま乗せた
 - 実測（空 TMPDIR の前後）: tako-core `--lib` **14 → 0**・全 target **16 → 0**・tako-cli + tako-control `--lib` **31 → 7**（残 7 は `dispatch.rs` の `tako-mcp-test-*` = 別 worker が編集中で射程外・#1312 にコメント）。libtest が `process::exit` する失敗回でも 0、SIGKILL 相当の残骸は次回起動で掃かれ、生きている pid の置き場は残る
 - 番犬は動的 1 本（このテストバイナリを使い捨て TMPDIR で回して**実際に数える**。修正前の作り手で 15 件を名指し FAILED）+ 静的 8 本（修正前ソースで 4 本 FAILED）。A/B は `TAKO_1312_LEGACY=1`（器を作りっぱなしへ戻す = 19 件残る）
+## 2026-09-11（#1336: 要件番号の一意性と参照の実在を番犬で固定した）
+- `crates/tako-control/tests/fr_number_watchdog.rs` 1 本。定義の形は 3 つ（章 `## FR-5` / 節 `### FR-2.34` / 表 ID `| FR-2.34.1 |`）で **1 段も拾う**（`NFR-1`〜`8` が 1 段なので 2 段以上だけ見ると見逃す。1 段を定義に持つと章番号への言及も偽の参照切れにならない）。定義 482 件 / コード参照 613 件を実測
+- A/B は fixture を置かず**現行テキストへの逆置換**（#1319 の変更は番号 14 行だけなので `84c16c7^` と同値。置換が空振りしたら落ちるガード付き）。実データ検証も実施: `84c16c7^` を置くと `要件番号は一意` が **FAILED で 3 系統 11 番号を行番号つきで名指し**（FR-2.34 + 配下 8 / FR-3.17 / FR-3.18）
+- 自分自身も走査対象なので**架空の番号を書くと自分で拾う**（実装中に 2 度拾われた）。例外リストは作らず例を実在番号へ寄せ、参照切れの検出力は「定義側を 1 つ削る」形で証明。参照切れは現行 0 件
 
 ## 2026-09-11（#1333: PR の「CI 3 本緑を待って merge」を共通の待ちスクリプトへ寄せた）
 - 「出ているチェックが全部非 pending = 完了」は push 直後に Cloudflare Pages しか登録されていない瞬間に通る（#1313 = PR #1328 が CI 完了前 merge・過去に #1253 / #1282）。判定を `scripts/wait-pr-checks.sh` の 1 実装へ寄せ、**期待名が全部そろって全部 completed** を **2 回連続**観測してから確定する形にした（期待名は `.github/workflows/*.yml` の pull_request job から導出・外部連携の Cloudflare Pages だけ定数）
@@ -69,3 +63,17 @@
 - README の日英を #1038 後の実態（Tailscale `serve` → ループバック TCP `127.0.0.1` のエフェメラルポート・LAN / 外部から到達不可）へ。事実に反する「TCP ポートを一切開きません」を削除し、`tako remote --help` の `Tailscale Serve + UDS` も同じ形へ
 - #982 で `AgentSupport` が `Platform` の doc の上へ挿し込まれ 3 行すべてが agent-support の説明になっていたのを分離。`platform` は `PlatformArgs` の「参照引数」露出をやめて自前の doc を持つ（`--help` 実出力で確認）
 - 挙動は不変（doc コメント / README のみ）。`remote.rs:45` / `:1473` の同じ #1038 前の記述は #1332 へ切り出した
+
+## 2026-09-11（#1332: remote.rs の doc が #1038 前の保証を語っていたのを実態へ）
+- モジュール doc（`remote.rs:44`）と `run_daemon` doc が「UDS のみで listen・TCP ポートを一切開かない・別 OS ユーザーは接続自体が不能」のままで、同ファイルの実装（`:135-147`）と `threat-model-remote.md` と逆を向いていた。既定 = ループバック TCP / UDS は `TAKO_REMOTE_ENDPOINT=unix` の opt-in / 失われた保証と緩和は threat-model へ誘導、の形へ
+- 横断 grep（`TCP ポートを一切` / `接続自体が不能` / `UDS + Tailscale` / `UDS 専用`）で同じ誤りが 3 か所残っていた: `protocol.rs:1137` の `RemoteStart` doc・MCP カタログ `tako_remote_start` の説明文（+ スナップショット）・`admin_request` の「UDS 専用」（実装は `local_endpoint` 経由で両対応）
+- 挙動は不変。`remote.rs` / `protocol.rs` の diff はコメント行のみであることを `git diff -U0` で機械確認
+
+## 2026-09-11（#1317 / #1322 / #1323: docs サイトの取り残し 3 ページを実挙動へ合わせた）
+- settings（8 タブ・`--tab` は英語スラッグのみ）/ architecture（存在しない `shelve` → `background`・IPC に Windows の named pipe）/ keyboard-shortcuts（macOS / Windows の 3 列表へ作り直し）
+- 表は `keybindings.rs` から全件起こした（macOS 45 本 / Windows 45 本・差分 0）。番犬 `crates/tako-control/tests/docs_keyboard_shortcuts.rs` が両方向を検査する（注入 3 通りでキーを名指し FAILED）
+
+## 2026-09-11（#1316: docs の MCP / CLI の件数と掲載漏れを直し、番犬で拘束した）
+- 実測（`mcp::tools()` = 149 / `tako --help` = 84）に対し docs は 147 / 128 / 69 / 68 を名乗り、MCP 11 ツール・CLI 10 コマンドが一覧に 1 度も出てこなかった。件数 11 か所を直し欠落を既存カテゴリへ追加（`mcp-tools.md` の「機械的に抽出」note も手書き + 番犬の事実へ）
+- 番犬 `crates/tako-control/tests/docs_tool_inventory.rs` 6 本が件数と名前集合の両方を拘束。CLI 集合は `main.rs` の `enum Command` のソース走査（実バイナリの `--help` と差分 0 を実測）で、**記述が見つからないことも FAILED** にして黙って通らない形
+- A/B（修正前 docs へ戻す）: 4/6 FAILED = 件数 11 か所を file:line で・欠落 21 件を名前で名指し → 修正後 6/6 緑。案 (a)（ページの生成物化）は構成変更なので未実施・ユーザー相談へ回す
