@@ -623,7 +623,7 @@ for jsfile in "$PWA_DIST"/assets/*.js; do
 done
 if [[ $PWA_MARKER_FOUND -eq 0 ]]; then
   echo "エラー: PWA dist の JS に「ペイン」マーカーが見つからない" >&2
-  echo "  dist が stale です。npm run build を実行してから再試行してください" >&2
+  echo "  dist が stale です。scripts/build-pwa.sh を実行してから再試行してください" >&2
   exit 1
 fi
 echo "    OK: dist の JS にソース由来マーカーを確認"

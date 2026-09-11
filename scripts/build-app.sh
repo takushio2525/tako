@@ -47,19 +47,10 @@ fi
 # --- PWA ビルド（web/tako-remote）---
 # rust_embed が web/tako-remote/dist/ をコンパイル時に埋め込むため、
 # cargo build より前に npm build を済ませる必要がある。
-# Issue #60: リリース zip に stale な dist が同梱されるのを防止
-PWA_DIR="$REPO_ROOT/web/tako-remote"
-if command -v npm >/dev/null; then
-  echo "==> PWA ビルド（web/tako-remote）"
-  (cd "$PWA_DIR" && npm ci --no-audit --no-fund && npm run build)
-else
-  if [[ -d "$PWA_DIR/dist/assets" ]]; then
-    echo "警告: npm が見つからないため PWA の再ビルドをスキップ（既存 dist を使用）" >&2
-  else
-    echo "エラー: npm が見つからず、PWA の dist も存在しない。npm をインストールしてください" >&2
-    exit 1
-  fi
-fi
+# Issue #60: リリース zip に stale な dist が同梱されるのを防止（= 引数なし = 毎回作り直す）。
+# 手順の正本は scripts/build-pwa.sh（#1309。crates/tako-control/build.rs も同じ手順を持つ）
+echo "==> PWA ビルド（web/tako-remote）"
+"$REPO_ROOT/scripts/build-pwa.sh"
 
 echo "==> リリースビルド（tako-app + tako-cli, profile.release）"
 cargo build --release -p tako-app -p tako-cli

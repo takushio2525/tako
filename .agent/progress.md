@@ -11,6 +11,7 @@
 ## 追記フォーマット
 
 ```markdown
+
 ## YYYY-MM-DD（#Issue 一言）
 - {何を / どこを / 結果}
 - 関連コミット: `{shortsha}` `[種別] 概要`
@@ -44,6 +45,11 @@
 - A/B（`TAKO_1294_LEGACY=1`）: 旧アーム = `prompt_delivery=undelivered` / events `prompt_undelivered` / **自動再送 1 回**、新アーム = `unverified` / `prompt_delivery_unverified` / **0 回**。本当に未達（`paste_not_reflected`）は両アームとも 1 回で回帰なし
 - 番犬 3 本（記録が bool を渡す形 / 判定が無条件 `OverdueSuspect` / 自動再送の引き金の一本化）が修正前ソースで file:line 名指し FAILED。単体 8 本・dispatch e2e 1 本
 
+## 2026-09-11（#1292: send_input の queued 応答が前回の決着済み送達の顛末を名乗らないようにした）
+- 真因は「積む前の状態」を未決着かどうかで分けていなかったこと。`prompt_delivery_states` はペインを閉じるまで消えないので、素通しすると 1 時間前の `gave_up` や 10 秒前の `delivered` を新しい送達が名乗る（後者は master が届いたと判断して**監視をやめる**）
+- 判定は `tako_core::prompt_delivery::pending_predecessor`（`State::is_pending` = Queued / Waiting だけ）の 1 実装へ。絞り込みは `queued_json` の 1 箇所なので send フロー / Enter 単独 / tmux フォールバックが全部通る。MCP の説明文も一致させた
+- 隔離 GUI + 模擬 TUI の実測: 1 通目を flow_timeout（120s）させた後の 2 通目が legacy `gave_up … elapsed=120s` → 修正後 `queued elapsed=0s`。番犬 3 本が修正前ソースを file:line 名指し FAILED
+
 ## 2026-09-11（#638: 状態ファイルの tmp 名を書き込み 1 回ごとに分けた）
 - 真因は #625 と同型。tmp 名が pid 止まりなので A の rename 後に B が**本番ファイルになった同じ inode** へ書き込む（実測の途中状態 `len=8194 head="S\ns\nLLLLLLLL" tail=…lll` = 短い本文が長い本文の先頭を潰した形）+ B の rename は ENOENT で失敗
 - `shell_integration::write_state_file` を `tmux_backend::write_conf_in` と同じ作法へ（pid + `AtomicU64` の seq・rename 失敗時は tmp を掃除）。tmp 名は純粋関数 `state_tmp_name` に出して両アームを単体で固定
@@ -63,6 +69,10 @@
 - `autorename` の起動を `spawn_claude` 1 本へ寄せ `--strict-mcp-config` を付ける。**再試行の引き金は非ゼロ終了だけ**で、フラグ無しの再試行が通ったときにだけ「使えない」と学習する（打ち切り・起動失敗では再試行しない）。A/B は `TAKO_758_LEGACY=1`
 - macOS 実測（順序交互 10 ラウンド。順序固定の初回 15 ラウンドは 2 番目の腕が系統的に遅く測り直した）: 命名プロンプト p50 18.4→16.9s（対応差の中央値 -3.8s・9/10）/ 最小プロンプト 5.8→3.7s / **子孫プロセス 17→2**。隔離 GUI の 1 対 1 は 32.8s→16.6s。`CLAUDE_TIMEOUT` は縮めない（最大 43.6s）
 - 単体 6 本（フォールバックを外すと 3 本 FAILED = 検出力）。上限テストが**上限が効いていない**のを発見（kill しても stdout の `join` は孫 = MCP サーバーが握る限り返らない。実測 上限 0.6s が 30.3s）→ 読み出しを `mpsc` の期限付き受信へ
+## 2026-09-11（#1309: 新規 worktree で PWA の dist が無くてもビルドが通るようにした）
+- 真因は #574 の手当てが CI にしか無かったこと。`crates/tako-control/build.rs` を新設し、`dist/index.html` が無ければ npm でビルドする（**既にある dist は触らない**。rust_embed の埋め込み元へ `rerun-if-changed` も張った）。npm 無し / npm 失敗は**1 行目に手順が出る**エラーで止める（空埋め込みで通す案は不採用 = 製品バイナリに PWA が入らない事故の余地を作る）
+- PWA ビルドの正本を `scripts/build-pwa.sh` へ 1 本化（`build-app.sh` / `check-windows.sh` が呼ぶ。既定は毎回作り直す = #60、`--if-missing` は dist があれば何もしない）
+- 実測: クリーン worktree で修正前 = `PwaAssets::get` 未定義 4 件で失敗 → 修正後は成功（npm ci + build が自動で走り dist 生成）。npm を PATH から外すと `scripts/build-pwa.sh` の 1 行案内で停止。no-op 再ビルド 3 回 = before 0.17/0.15/0.15s → after 0.16/0.17/0.17s。release rlib に dist のハッシュ付きアセット名を確認。テスト 10 本（偽 npm + 一時 dir、実 npm は起こさない）
 
 ## 2026-09-11（#1296: テストの pid ごとの data dir が消えずに溜まるのを直した）
 - #944 の隔離は「本番の外へ倒す」までで消す仕掛けが無く、再起動でも消えない macOS の `TMPDIR` に積もっていた（実測 2,188 件 + `tako-agent-config-*` 784 件 = `du` で 115 MB）。`tako_core::test_residue` に後始末を 1 実装し、作る経路（`paths::test_data_dir`）が `arm_self_cleanup`（`libc::atexit`）+ `sweep_stale_on_start`（SIGKILL 分を次回起動で回収）を持つ形へ
