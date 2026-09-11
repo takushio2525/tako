@@ -2352,25 +2352,21 @@ fn daemon_stop_impl(force: bool) -> Result<Value, String> {
     // プロセスの終了をポーリングで確認（最大 5 秒）。
     // 刈り取り前のゾンビも終了として数える（#619。刈り取れるのは起動した親だけで、
     // 停止側が別プロセスのときは自分では消せない）
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if has_terminated(pid_num) {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            if force {
-                // force でも終了しない場合はエラー（state は残す）
-                return Err(format!(
-                    "PID {pid_num} が SIGKILL 後 5 秒経っても終了しない。state ファイルは残してあります"
-                ));
-            }
-            // 通常 stop は SIGKILL にエスカレートせず、エラーを返して state を残す
+    // **どう抜けたか**は `last_termination_wait()` で観測できる（#962）
+    let wait = wait_for_termination(pid_num, TERMINATION_WAIT_BUDGET, TERMINATION_POLL_INTERVAL);
+    if wait.timed_out() {
+        let secs = TERMINATION_WAIT_BUDGET.as_secs();
+        if force {
+            // force でも終了しない場合はエラー（state は残す）
             return Err(format!(
-                "PID {pid_num} が SIGTERM 後 5 秒経っても終了しない。\
-                 `tako remote stop --force` で SIGKILL を試みてください"
+                "PID {pid_num} が SIGKILL 後 {secs} 秒経っても終了しない。state ファイルは残してあります"
             ));
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // 通常 stop は SIGKILL にエスカレートせず、エラーを返して state を残す
+        return Err(format!(
+            "PID {pid_num} が SIGTERM 後 {secs} 秒経っても終了しない。\
+             `tako remote stop --force` で SIGKILL を試みてください"
+        ));
     }
     // SIGTERM ならデーモン自身が serve を解除して終了する。SIGKILL（--force）や
     // 異常終了で残った serve 設定はここでベストエフォート回収する（冪等）
@@ -2633,6 +2629,89 @@ fn has_terminated(pid: u32) -> bool {
     crate::platform::process::has_terminated(pid)
 }
 
+/// 停止の終了待ちの上限（#619 の 5 秒）
+const TERMINATION_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+/// 終了待ちの観測の間隔
+const TERMINATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// 終了待ちの**結末**（#962）。
+///
+/// 「ゾンビを終了済みと読めたか」「タイムアウト経路へ落ちたか」は、
+/// **速く返ったかどうか**（混んだ機では `/bin/ps` の fork+exec が秒単位ブロックして
+/// 10 秒まで伸びる = #962 の実測）ではなくこの観測値で判る
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminationWait {
+    /// 終了と読めた理由。`None` = 予算を使い切った（= タイムアウト経路）
+    pub via: Option<crate::platform::process::TerminatedVia>,
+    /// 抜けるまでに**挟んだ待ちの回数**（0 = 最初の観測で終了と読めた）
+    pub polls: u32,
+}
+
+impl TerminationWait {
+    /// 予算を使い切った（タイムアウト経路へ落ちた）か
+    pub fn timed_out(self) -> bool {
+        self.via.is_none()
+    }
+}
+
+thread_local! {
+    /// 直近の終了待ちの結末（#962 の観測口。**同じスレッドの**観測だけが見える）
+    static LAST_TERMINATION_WAIT: std::cell::Cell<Option<TerminationWait>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// 直近の終了待ちがどう抜けたかを返す（#962）。
+///
+/// `cargo test` は並列なのでスレッドローカルで持つ
+/// （`.agent/conventions.md`「量を観る口の作り方」と同じ形）
+pub fn last_termination_wait() -> Option<TerminationWait> {
+    LAST_TERMINATION_WAIT.with(|c| c.get())
+}
+
+/// 停止要求を出したあとの終了待ち（#619 / #962）。ゾンビも終了として数える。
+///
+/// `budget` を使い切ったら諦めて返し、そのあとの経路（エラー / SIGKILL への
+/// エスカレート）は呼び出し側が決める
+fn wait_for_termination(
+    pid: u32,
+    budget: std::time::Duration,
+    interval: std::time::Duration,
+) -> TerminationWait {
+    wait_for_termination_with(
+        || crate::platform::process::terminated_via(pid),
+        budget,
+        interval,
+    )
+}
+
+/// 終了待ちの本体（観測を差し替えられる形。#962）。
+///
+/// 観測の順序・回数は旧実装と同じ（**観測 → 期限 → 待ち**）。観測を注入できるので、
+/// 「何回待ったか / どの経路で抜けたか」を実時間に依らず決定的に固定できる
+fn wait_for_termination_with(
+    mut observe: impl FnMut() -> Option<crate::platform::process::TerminatedVia>,
+    budget: std::time::Duration,
+    interval: std::time::Duration,
+) -> TerminationWait {
+    let deadline = std::time::Instant::now() + budget;
+    let mut polls = 0u32;
+    let out = loop {
+        if let Some(via) = observe() {
+            break TerminationWait {
+                via: Some(via),
+                polls,
+            };
+        }
+        if std::time::Instant::now() >= deadline {
+            break TerminationWait { via: None, polls };
+        }
+        std::thread::sleep(interval);
+        polls += 1;
+    };
+    LAST_TERMINATION_WAIT.with(|c| c.set(Some(out)));
+    out
+}
+
 /// stale なデーモンプロセスを kill し、終了を確認して state ファイルを掃除する。
 /// SIGTERM → 最大 5 秒ポーリング → 終了しなければ SIGKILL
 fn kill_stale_daemon(pid: u32) {
@@ -2641,14 +2720,12 @@ fn kill_stale_daemon(pid: u32) {
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGTERM);
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            // ゾンビも終了として扱う（#619）
-            if has_terminated(pid) {
-                cleanup_state_files();
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+        // ゾンビも終了として扱う（#619）。待ちの形は daemon_stop_impl と 1 実装（#962）
+        if !wait_for_termination(pid, TERMINATION_WAIT_BUDGET, TERMINATION_POLL_INTERVAL)
+            .timed_out()
+        {
+            cleanup_state_files();
+            return;
         }
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGKILL);
@@ -6943,6 +7020,87 @@ mod tests {
         );
     }
 
+    /// #962: 終了待ちは「どの経路で抜けたか / 何回待ったか」を返す。
+    ///
+    /// 観測を差し替えるので**実時間に一切依存しない**（`interval` を 0 にすれば
+    /// 待ちは即座に返る）。実プロセスを使う下のテストは「ゾンビを Zombie と
+    /// 読めること」を担い、回数と経路の意味づけはここで固定する
+    #[test]
+    fn 終了待ちは経路と待ち回数を返す() {
+        use crate::platform::process::TerminatedVia;
+        let zero = std::time::Duration::ZERO;
+
+        // 3 回「まだ動いている」と読まれたら、待ちを 3 回挟んでから抜ける
+        let mut seen = 0u32;
+        let wait = wait_for_termination_with(
+            || {
+                seen += 1;
+                (seen > 3).then_some(TerminatedVia::Zombie)
+            },
+            std::time::Duration::from_secs(5),
+            zero,
+        );
+        assert_eq!(
+            wait,
+            TerminationWait {
+                via: Some(TerminatedVia::Zombie),
+                polls: 3
+            },
+            "ゾンビと読めた回で抜け、挟んだ待ちの回数を返す"
+        );
+        assert!(!wait.timed_out(), "予算は使い切っていない");
+
+        // 予算を使い切ったら経路は None（= タイムアウト経路）。
+        // 予算 0 なら「1 回観測して期限切れ」= 待ちは 0 回で決定的
+        let wait = wait_for_termination_with(|| None, zero, zero);
+        assert_eq!(
+            wait,
+            TerminationWait {
+                via: None,
+                polls: 0
+            },
+            "終了と読めないまま予算が尽きたらタイムアウト経路"
+        );
+        assert!(wait.timed_out(), "予算を使い切ったことが判る");
+
+        // 最初の観測で終了と読めたら待ちは挟まない
+        let wait = wait_for_termination_with(|| Some(TerminatedVia::Gone), zero, zero);
+        assert_eq!(
+            wait,
+            TerminationWait {
+                via: Some(TerminatedVia::Gone),
+                polls: 0
+            }
+        );
+        // 直近の結末は観測口から読める（`daemon_stop_impl` の検査が使う経路）
+        assert_eq!(last_termination_wait(), Some(wait));
+    }
+
+    /// #962: 実 pid でも経路の読み分けが合っている（刈り取り済み = `Gone`）。
+    ///
+    /// 予算 0 で「1 回だけ観測する」形にしてあるので、`/bin/ps` が何秒詰まっても
+    /// 結果は変わらない
+    #[cfg(unix)]
+    #[test]
+    fn 終了待ちは刈り取り済みのpidを消滅として読む() {
+        let mut done = spawn_throwaway_child(&[]);
+        let gone_pid = done.id();
+        let _ = done.wait(); // 起動した本人として刈り取る = pid ごと消える
+        let wait = wait_for_termination(
+            gone_pid,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(
+            wait,
+            TerminationWait {
+                via: Some(crate::platform::process::TerminatedVia::Gone),
+                polls: 0
+            },
+            "刈り取り済みの pid は Gone（ゾンビ判定の `ps` を待たずに読める）"
+        );
+    }
+
     /// #619: 停止側は刈り取り前のゾンビを「終了済み」と読む。
     ///
     /// GUI が起動した daemon を CLI から止める経路では停止側で `wait(2)` できない。
@@ -6980,21 +7138,48 @@ mod tests {
             .expect("sleep を起動できる");
         let pid = child.id();
         arm(pid);
+        // 直近の結末は同じスレッドで先に走ったテストが残していることがあるので空にする
+        LAST_TERMINATION_WAIT.with(|c| c.set(None));
         let started = std::time::Instant::now();
         let result = daemon_stop_impl(false);
         let elapsed = started.elapsed();
+        let wait = last_termination_wait();
         std::env::remove_var("TAKO_REMOTE_STATE_DIR");
         let pid_file_left = pid_file.exists();
         let zombie_during_wait = crate::platform::process::is_zombie(pid);
         let _ = child.wait(); // 起動した本人として刈り取る（= spawn_daemon 側の役目）
+
+        // #962: 「速く返ったか」で見てはいけない。混んだ機では観測 1 回ぶんの
+        // `/bin/ps`（fork+exec）が秒単位ブロックするので、正しく動いていても所要は
+        // 2.27 / 5.10 / 10.07 秒まで伸びる（Issue の実測）。
+        // 見るのは機構の観測値で、#619 の回帰は必ず「Zombie と読めない」形で出る
+        // （読めなければ予算を使い切って `timed_out` になる）
+        let wait = wait.unwrap_or_else(|| {
+            panic!("終了待ちまで到達していない（実際: {result:?}、所要 {elapsed:?}）")
+        });
+        assert!(
+            !wait.timed_out(),
+            "終了待ちの予算（{} 秒）を使い切っていない（実際: {wait:?}、所要 {elapsed:?}）",
+            TERMINATION_WAIT_BUDGET.as_secs()
+        );
+        assert_eq!(
+            wait.via,
+            Some(crate::platform::process::TerminatedVia::Zombie),
+            "刈り取り前のゾンビとして終了を読む（実際: {wait:?}、所要 {elapsed:?}）"
+        );
         assert!(
             result.is_ok(),
             "ゾンビを終了と読めるので停止は成功する（実際: {result:?}、所要 {elapsed:?}）"
         );
-        assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "終了待ちのタイムアウト（5 秒）に落ちない（実際: {elapsed:?}）"
-        );
+        // TAKO_962_LEGACY_ARM 開始（#962 **前**の「2 秒以内に返る」を再現する A/B のアーム。
+        // 番犬 `test_timing_watchdog` はここを対象外にする）
+        if std::env::var("TAKO_962_LEGACY").is_ok_and(|v| v == "1") {
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "終了待ちのタイムアウト（5 秒）に落ちない（実際: {elapsed:?}）"
+            );
+        }
+        // TAKO_962_LEGACY_ARM 終了
         assert!(
             zombie_during_wait,
             "前提: 停止直後の子は刈り取り前なので defunct として見える"
