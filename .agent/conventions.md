@@ -1924,6 +1924,41 @@ OS で分岐すると「macOS だけ通る道」が増えて、この等価性�
   `crates/tako-control/tests/verification_isolation_watchdog.rs`（判定の形を走査）と
   `test_write_isolation` / `update_checker`（空 HOME・偽 brew で挙動を実測）の 2 段
 
+## 「変わっていないから書かない」の材料は保存内容から機械的に導く（Issue #1425）
+
+`save_layout` は 2 秒 tick と dispatch ごとに呼ばれる。ここで「変わったか」を
+**実物を組んでから比べる**（`capture` + `serde_json::to_string` の文字列比較）と、
+変化が無い tick でも全ペインの `PaneMeta` 構築と全体の直列化を払う
+（#1001 C6 の実測: `メインスレッド専有: save_layout が 32ms` / 22 ペインで
+**確保 319 回・29893 バイト**）。判定は**組む前**に置く。
+
+- **判定材料は借用のまま流す**。`PaneMeta` はペインあたり `String` を 7 本作るので、
+  変化検出のためだけに組んではいけない。`layout::PaneMetaRef`（借用版）を
+  ダイジェストへ流し、`to_meta()` で保存形へ落とすのは**変化があったときだけ**
+  （実測: 借用のままなら確保 **0 回**）
+- **保存漏れは速さより重い**（「消えた」系 #30 / #177 / #770 の根はすべてここ）。
+  キーに載せ忘れたフィールドは**保存されなくなる**ので、載せ忘れを 3 段で止める:
+  1. **コンパイルで止める**: `PaneMetaRef::to_meta` / `feed` は全フィールドを
+     網羅的に分解する（`let PaneMetaRef { .. } = self`）。`PaneMeta` / `PaneMetaRef` /
+     `WindowFrame` / `LayoutExtras` にフィールドを足すとコンパイルが通らない
+  2. **テストで止める**: `layout::CHANGE_KEY_FIELDS`（`(構造体, フィールド)` の宣言）を
+     番犬 `issue1425_save_layout_change_key_watchdog` が #916 の指紋
+     （`testdata/persisted_schema_fingerprint.txt`）と**集合として**突き合わせ、
+     さらに宣言 1 件ごとに「動かすとキーも JSON も動く」検査を要求する
+  3. **実行時の保険**: 連続スキップが `layout::RECONCILE_AFTER_SKIPS`（30 回 = 約 60 秒）に
+     達したら、キーが一致していても必ず実物と突き合わせる。載せ忘れがあっても
+     「永久に保存されない」にはしない
+- **「変化したら書く」の判定と「保存内容を埋める」は同じ値を使う**。`capture` では
+  埋まらない UI 側の付帯情報（ウィンドウのフレーム・折りたたみ・Web ビュー dock）は
+  `layout::LayoutExtras` に**1 度だけ**組み、キーの算出と capture 後の穴埋めの両方が
+  それを読む。2 か所で別々に組むと片方だけ更新されて保存漏れになる
+- **並びが揺れる入れ物は判定の前に整える**。折りたたみ中のタブは `HashSet` 由来なので、
+  そのまま JSON へ流すと**中身が同じでも並びが変わって毎回書く**。`collapsed` は
+  昇順に整えてから渡す
+- 内訳は `tako persist`（MCP `tako_persist`）の `save_layout`
+  （`calls` / `skipped` / `captured` / `written` / `reconciled`）で読める。
+  A/B は `TAKO_1425_LEGACY=1`（旧の「組んでから比べる」を同一バイナリで再現）
+
 ## 機械全体の設定を倒す記録には「所有者」を書く（Issue #1373 / #449）
 
 **`data_dir` の記録は複数の tako-app プロセスで共有される**（隔離されるのは

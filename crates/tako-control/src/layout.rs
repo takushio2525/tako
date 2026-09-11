@@ -9,7 +9,10 @@
 //! 壊れたファイル・不明バージョン・ID 重複を None で拒否し、呼び出し側が
 //! 新規ワークスペースへ無害にフォールバックする。
 
+use std::borrow::Cow;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -431,6 +434,408 @@ fn capture_node(node: &PaneNode, meta: &dyn Fn(PaneId) -> PaneMeta) -> NodeLayou
     }
 }
 
+// ---------------------------------------------------------------------------
+// 変化検出キー（Issue #1425）
+// ---------------------------------------------------------------------------
+
+/// `save_layout` が「変わっていない」と判断してよい連続スキップ数の上限（#1425）。
+///
+/// キーに載せ忘れたフィールドがあっても**永久に保存されない**状態にはしないための
+/// 保険。2 秒 tick でこの回数ぶんスキップしたら、次の 1 回は必ず capture +
+/// 直列化まで通して実物と突き合わせる（= 最悪でも 60 秒で追いつく）。
+/// 「消えた」系（#30 / #177 / #770）の根が保存漏れなので、速さより先に置く
+pub const RECONCILE_AFTER_SKIPS: u32 = 30;
+
+/// `capture` では埋まらない UI 層の付帯情報（#1425）。
+///
+/// **1 実装**にしてある: 変化検出キー（[`change_key`]）と capture 後の穴埋め
+/// （[`LayoutExtras::apply`]）が**同じ値**を見るので、片方だけ更新して
+/// 「キーは変わらないのに保存内容は変わる」= 保存漏れ、にならない
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LayoutExtras {
+    /// 旧スキーマ互換の単一フレーム（アクティブウィンドウのもの。Issue #339）
+    pub window: Option<WindowFrame>,
+    /// ウィンドウ ID → OS フレーム（`LayoutFile.windows[].frame` を埋める）
+    pub window_frames: Vec<(u64, Option<WindowFrame>)>,
+    /// 折りたたみ中のタブ ID（FR-2.16.14）。**呼び出し側で昇順に整えて渡す**
+    /// （元は HashSet なので、並びが揺れると同じ内容でも JSON が変わる）
+    pub collapsed: Vec<u64>,
+    /// Web ビュー dock の退避分（#155）
+    pub webview_dock: Vec<String>,
+}
+
+impl LayoutExtras {
+    /// capture 済みの `LayoutFile` へ反映する
+    pub fn apply(&self, layout: &mut LayoutFile) {
+        let LayoutExtras {
+            window: _,
+            window_frames,
+            collapsed,
+            webview_dock,
+        } = self;
+        for w in &mut layout.windows {
+            w.frame = window_frames
+                .iter()
+                .find(|(id, _)| *id == w.id)
+                .and_then(|(_, f)| f.clone());
+        }
+        layout.collapsed = collapsed.clone();
+        layout.webview_dock = webview_dock.clone();
+    }
+
+    fn feed(&self, h: &mut KeyHasher) {
+        // 網羅的な分解: フィールドを足したらここがコンパイルできない
+        let LayoutExtras {
+            window,
+            window_frames,
+            collapsed,
+            webview_dock,
+        } = self;
+        feed_frame(window.as_ref(), h);
+        window_frames.len().hash(h);
+        for (id, frame) in window_frames {
+            id.hash(h);
+            feed_frame(frame.as_ref(), h);
+        }
+        collapsed.hash(h);
+        webview_dock.hash(h);
+    }
+}
+
+/// `PaneMeta` の材料を**借用のまま**束ねた形（#1425）。
+///
+/// `PaneMeta` は `String` を 7 本まで作るので、変化検出のためだけに組むと
+/// 「変わっていないことを確かめる」のに毎 tick 全ペインぶんの確保を払う。
+/// 変化検出はこの形のままダイジェストへ流し、実際に変わったときだけ
+/// [`PaneMetaRef::to_meta`] で `PaneMeta` へ落とす。
+///
+/// **`PaneMeta` と 1:1**: [`PaneMetaRef::to_meta`] も [`PaneMetaRef::feed`] も
+/// 全フィールドを網羅的に分解するので、どちらかにフィールドを足すと
+/// もう一方がコンパイルできない
+#[derive(Debug, Clone, Default)]
+pub struct PaneMetaRef<'a> {
+    pub session: Option<&'a str>,
+    pub cwd: Option<&'a Path>,
+    pub claude_session_id: Option<&'a str>,
+    /// (系統名, 会話 ID)。`AgentResumeLayout` の借用版（#1238）
+    pub agent_resume: Option<(&'a str, Option<&'a str>)>,
+    pub logged_history: Option<u64>,
+    /// (パス, モード)。`PreviewLayout` の借用版
+    pub preview: Option<(&'a Path, &'a str)>,
+    /// Web ビューの URL。採取が `String` を返す経路（ロック越し）なので `Cow`
+    pub webview: Option<Cow<'a, str>>,
+}
+
+impl PaneMetaRef<'_> {
+    /// 保存形（`String` を持つ形）へ落とす。capture へ渡すのはこれだけ
+    pub fn to_meta(&self) -> PaneMeta {
+        let PaneMetaRef {
+            session,
+            cwd,
+            claude_session_id,
+            agent_resume,
+            logged_history,
+            preview,
+            webview,
+        } = self;
+        PaneMeta {
+            session: session.map(str::to_string),
+            cwd: cwd.map(|p| p.display().to_string()),
+            claude_session_id: claude_session_id.map(str::to_string),
+            agent_resume: agent_resume.map(|(agent, id)| AgentResumeLayout {
+                agent: agent.to_string(),
+                id: id.map(str::to_string),
+            }),
+            logged_history: *logged_history,
+            preview: preview.map(|(path, mode)| PreviewLayout {
+                path: path.display().to_string(),
+                mode: mode.to_string(),
+            }),
+            webview: webview.as_ref().map(|u| u.to_string()),
+        }
+    }
+
+    fn feed(&self, h: &mut KeyHasher) {
+        // 網羅的な分解: フィールドを足したらここがコンパイルできない
+        let PaneMetaRef {
+            session,
+            cwd,
+            claude_session_id,
+            agent_resume,
+            logged_history,
+            preview,
+            webview,
+        } = self;
+        session.hash(h);
+        cwd.map(Path::as_os_str).hash(h);
+        claude_session_id.hash(h);
+        agent_resume.hash(h);
+        logged_history.hash(h);
+        preview.map(|(p, m)| (p.as_os_str(), m)).hash(h);
+        webview.as_deref().hash(h);
+    }
+}
+
+/// 変化検出キー（#1425）。`capture` + `serde_json::to_string` を払う**前**に
+/// 「保存内容が変わったか」を判定するための 128bit ダイジェスト。
+///
+/// ## 不変条件
+///
+/// **`layout.json` に載る値が 1 つでも変われば、このキーも変わる**。破ると
+/// 「保存されないフィールド」が生まれる（「消えた」系 #30 / #177 / #770 の根）。
+/// 守り方は 3 段:
+///
+/// 1. ペイン付帯情報は [`PaneMetaRef`] の**網羅的な分解**（足すとコンパイルが通らない）
+/// 2. layout 側の永続フィールドは [`CHANGE_KEY_FIELDS`] の宣言を番犬
+///    `issue1425_save_layout_change_key_watchdog` が永続スキーマの指紋と突き合わせる
+/// 3. それでも漏れたときの保険として、呼び出し側は連続スキップが
+///    [`RECONCILE_AFTER_SKIPS`] に達したら必ず全経路を通す
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangeKey(u64, u64);
+
+/// 変化検出キーが見ている永続フィールドの宣言（#1425）。
+///
+/// `(構造体, フィールド)` の全件。番犬が
+/// `crates/tako-control/testdata/persisted_schema_fingerprint.txt`（#916 が
+/// ソースと一致させている指紋）の layout 側と**集合として一致する**ことを見るので、
+/// 永続フィールドを足した PR はここを更新するまで落ちる。
+/// 更新するときは [`change_key`] に実際に流す 1 行も同時に足すこと
+/// （番犬は宣言ごとに「動かしたらキーが変わる」検査があることまで要求する）
+pub const CHANGE_KEY_FIELDS: &[(&str, &str)] = &[
+    // LayoutFile
+    ("LayoutFile", "version"),
+    ("LayoutFile", "active_tab"),
+    ("LayoutFile", "tabs"),
+    ("LayoutFile", "window"),
+    ("LayoutFile", "backgrounded"),
+    ("LayoutFile", "collapsed"),
+    ("LayoutFile", "webview_dock"),
+    ("LayoutFile", "windows"),
+    // WindowLayout
+    ("WindowLayout", "id"),
+    ("WindowLayout", "tabs"),
+    ("WindowLayout", "active_tab"),
+    ("WindowLayout", "frame"),
+    // WindowFrame
+    ("WindowFrame", "x"),
+    ("WindowFrame", "y"),
+    ("WindowFrame", "width"),
+    ("WindowFrame", "height"),
+    ("WindowFrame", "state"),
+    // TabLayout
+    ("TabLayout", "id"),
+    ("TabLayout", "title"),
+    ("TabLayout", "title_source"),
+    ("TabLayout", "focused"),
+    ("TabLayout", "tree"),
+    ("TabLayout", "pinned_folders"),
+    ("TabLayout", "remote_folders"),
+    // NodeLayout（enum: バリアントも指紋に載る）
+    ("NodeLayout", "Pane"),
+    ("NodeLayout", "Split"),
+    ("NodeLayout", "axis"),
+    ("NodeLayout", "ratio"),
+    ("NodeLayout", "first"),
+    ("NodeLayout", "second"),
+    // PaneLayout
+    ("PaneLayout", "id"),
+    ("PaneLayout", "session"),
+    ("PaneLayout", "title"),
+    ("PaneLayout", "title_source"),
+    ("PaneLayout", "role"),
+    ("PaneLayout", "origin"),
+    ("PaneLayout", "cwd"),
+    ("PaneLayout", "claude_session_id"),
+    ("PaneLayout", "agent_resume"),
+    ("PaneLayout", "logged_history"),
+    ("PaneLayout", "preview"),
+    ("PaneLayout", "webview"),
+    ("PaneLayout", "origin_tab"),
+    ("PaneLayout", "origin_tab_title"),
+    ("PaneLayout", "limit_autoresume"),
+    // AgentResumeLayout
+    ("AgentResumeLayout", "agent"),
+    ("AgentResumeLayout", "id"),
+    // PreviewLayout
+    ("PreviewLayout", "path"),
+    ("PreviewLayout", "mode"),
+    // RemoteFolderLayout
+    ("RemoteFolderLayout", "host"),
+    ("RemoteFolderLayout", "path"),
+    ("RemoteFolderLayout", "origin"),
+];
+
+/// 独立した 2 本のハッシャで 128bit を作る（衝突 = 「違うのに保存されない」なので、
+/// 64bit では足りないと見なす）
+struct KeyHasher {
+    a: DefaultHasher,
+    b: DefaultHasher,
+}
+
+impl KeyHasher {
+    fn new() -> Self {
+        let mut b = DefaultHasher::new();
+        // 2 本目だけ別の初期値を食わせて独立させる（同じ種だと 64bit のまま）
+        b.write_u64(0x9E37_79B9_7F4A_7C15);
+        Self {
+            a: DefaultHasher::new(),
+            b,
+        }
+    }
+
+    fn key(&self) -> ChangeKey {
+        ChangeKey(self.a.finish(), self.b.finish())
+    }
+}
+
+impl Hasher for KeyHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        self.a.write(bytes);
+        self.b.write(bytes);
+    }
+
+    fn finish(&self) -> u64 {
+        self.a.finish()
+    }
+}
+
+/// `capture` が作る `LayoutFile` と**同じ材料**を、`String` も JSON も作らずに
+/// 128bit へ畳む（#1425）。`capture` 側に項目を足したらここにも足すこと
+/// （不変条件と番犬は [`ChangeKey`] の doc を参照）
+pub fn change_key<'a>(
+    ws: &Workspace,
+    meta: &dyn Fn(PaneId) -> PaneMetaRef<'a>,
+    extras: &LayoutExtras,
+) -> ChangeKey {
+    let mut h = KeyHasher::new();
+    // LayoutFile.version（定数だが、上げたときに必ずキーが動くよう流しておく）
+    LAYOUT_VERSION.hash(&mut h);
+    // LayoutFile.active_tab
+    ws.active_tab_id().as_u64().hash(&mut h);
+    // LayoutFile.tabs
+    ws.tabs().len().hash(&mut h);
+    for tab in ws.tabs() {
+        tab.id().as_u64().hash(&mut h);
+        tab.title().hash(&mut h);
+        title_source_str(tab.title_source()).hash(&mut h);
+        tab.tree().focused().as_u64().hash(&mut h);
+        // TabLayout.tree
+        feed_node(tab.tree().root(), meta, &mut h);
+        // TabLayout.pinned_folders
+        tab.pinned_folders().len().hash(&mut h);
+        for p in tab.pinned_folders() {
+            p.as_os_str().hash(&mut h);
+        }
+        // TabLayout.remote_folders
+        tab.remote_folders().len().hash(&mut h);
+        for f in tab.remote_folders() {
+            f.remote.host.hash(&mut h);
+            f.remote.path.hash(&mut h);
+            f.origin.as_str().hash(&mut h);
+        }
+    }
+    // LayoutFile.backgrounded
+    ws.shelved_panes().len().hash(&mut h);
+    for shelved in ws.shelved_panes() {
+        feed_pane(shelved.pane(), meta, &mut h);
+        shelved.origin_tab().as_u64().hash(&mut h);
+        shelved.origin_tab_title().hash(&mut h);
+    }
+    // LayoutFile.windows（capture と同じ条件: 1 枚なら出力しない）
+    let multi = ws.windows().len() > 1;
+    multi.hash(&mut h);
+    if multi {
+        for w in ws.windows() {
+            w.id().as_u64().hash(&mut h);
+            let tabs = ws.window_tab_ids(w.id());
+            tabs.len().hash(&mut h);
+            for t in tabs {
+                t.as_u64().hash(&mut h);
+            }
+            w.active_tab().as_u64().hash(&mut h);
+        }
+    }
+    // LayoutFile.window / windows[].frame / collapsed / webview_dock
+    extras.feed(&mut h);
+    h.key()
+}
+
+fn feed_node<'a>(node: &PaneNode, meta: &dyn Fn(PaneId) -> PaneMetaRef<'a>, h: &mut KeyHasher) {
+    match node {
+        PaneNode::Leaf(pane) => {
+            // NodeLayout::Pane
+            0u8.hash(h);
+            feed_pane(pane, meta, h);
+        }
+        PaneNode::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => {
+            // NodeLayout::Split
+            1u8.hash(h);
+            match axis {
+                tako_core::SplitAxis::Horizontal => "x",
+                tako_core::SplitAxis::Vertical => "y",
+            }
+            .hash(h);
+            // f32 はそのままでは Hash できないので**ビット列**で流す
+            // （JSON の表記が変わる差分と 1:1 になる）
+            ratio.to_bits().hash(h);
+            feed_node(first, meta, h);
+            feed_node(second, meta, h);
+        }
+    }
+}
+
+fn feed_pane<'a>(pane: &Pane, meta: &dyn Fn(PaneId) -> PaneMetaRef<'a>, h: &mut KeyHasher) {
+    pane.id().as_u64().hash(h);
+    pane.title().hash(h);
+    title_source_str(pane.title_source()).hash(h);
+    pane.role().hash(h);
+    origin_str(pane.origin()).hash(h);
+    pane.limit_autoresume().hash(h);
+    meta(pane.id()).feed(h);
+}
+
+fn feed_frame(frame: Option<&WindowFrame>, h: &mut KeyHasher) {
+    match frame {
+        None => 0u8.hash(h),
+        // 網羅的な分解: フィールドを足したらここがコンパイルできない
+        Some(WindowFrame {
+            x,
+            y,
+            width,
+            height,
+            state,
+        }) => {
+            1u8.hash(h);
+            x.to_bits().hash(h);
+            y.to_bits().hash(h);
+            width.to_bits().hash(h);
+            height.to_bits().hash(h);
+            state.hash(h);
+        }
+    }
+}
+
+/// `save_layout` の内訳（#1425）。`tako persist` / MCP `tako_persist` から読める
+/// （設計原則 5「AI フルコントロール」: スキップが効いているかを AI が確かめられる）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveStats {
+    /// `save_layout` が呼ばれた回数（早期 return するモードを除く）
+    pub calls: u64,
+    /// 変化検出キーが一致して capture / 直列化を省いた回数
+    pub skipped: u64,
+    /// capture + 直列化まで通した回数
+    pub captured: u64,
+    /// 実際にディスクへ書いた回数
+    pub written: u64,
+    /// 連続スキップの上限に達して**念のため**全経路を通した回数（保険の発動数）
+    pub reconciled: u64,
+}
+
 /// レイアウトから Workspace を復元する。ID はそのまま再現される（採番カウンタは
 /// tako-core 側で先へ進む）。バージョン不一致・空・ID 重複・不正値は理由付きで拒否し、
 /// 呼び出し側が新規ワークスペースへフォールバック + 理由をログに残す
@@ -846,6 +1251,98 @@ mod tests {
         let tab2_pane = Pane::new(PaneOrigin::Mcp);
         ws.create_tab("2", tab2_pane);
         ws
+    }
+
+    /// #1425: 付帯情報が 1 つも無い最小構成でもキーは安定し、
+    /// ペインが増えれば動く（`terminals` が空の起動直後・器なしの経路）
+    #[test]
+    fn issue1425_最小構成でもキーは安定しペインが増えれば動く() {
+        let root = Pane::new(PaneOrigin::User);
+        let root_id = root.id();
+        let mut ws = Workspace::new("1", root);
+        let empty = LayoutExtras::default();
+        let meta = |_: PaneId| PaneMetaRef::default();
+        let before = change_key(&ws, &meta, &empty);
+        assert_eq!(
+            before,
+            change_key(&ws, &meta, &empty),
+            "同じ状態でキーが揺れる"
+        );
+
+        let second = Pane::new(PaneOrigin::Cli);
+        ws.active_tab_mut()
+            .tree_mut()
+            .split(root_id, SplitDirection::Right, second)
+            .unwrap();
+        assert_ne!(
+            before,
+            change_key(&ws, &meta, &empty),
+            "ペインが増えてもキーが動かない = 新しいペインが保存されない"
+        );
+    }
+
+    /// #1425: ワークスペースが同じでも UI 側の付帯情報（dock / 折りたたみ /
+    /// ウィンドウのフレーム）だけが動けばキーは動く
+    #[test]
+    fn issue1425_付帯情報だけの変化でもキーは動く() {
+        let ws = sample_workspace();
+        let meta = |_: PaneId| PaneMetaRef::default();
+        let base = LayoutExtras::default();
+        let key = change_key(&ws, &meta, &base);
+
+        let mut dock = base.clone();
+        dock.webview_dock.push("https://example.invalid/a".into());
+        assert_ne!(key, change_key(&ws, &meta, &dock), "dock の URL が載らない");
+
+        let mut collapsed = base.clone();
+        collapsed.collapsed.push(1);
+        assert_ne!(
+            key,
+            change_key(&ws, &meta, &collapsed),
+            "折りたたみが載らない"
+        );
+
+        let mut frame = base.clone();
+        frame.window = Some(WindowFrame {
+            x: 1.0,
+            y: 2.0,
+            width: 3.0,
+            height: 4.0,
+            state: "windowed".into(),
+        });
+        assert_ne!(
+            key,
+            change_key(&ws, &meta, &frame),
+            "ウィンドウのフレームが載らない"
+        );
+    }
+
+    /// #1425: プレビューだけのペイン（PTY を持たない）でも、開いた / 閉じた /
+    /// モードを変えたが全部キーに出る
+    #[test]
+    fn issue1425_プレビューだけのペインも追える() {
+        let ws = sample_workspace();
+        let extras = LayoutExtras::default();
+        let md = std::path::Path::new("/srv/doc.md");
+        let none = change_key(&ws, &|_| PaneMetaRef::default(), &extras);
+        let markdown = change_key(
+            &ws,
+            &|_| PaneMetaRef {
+                preview: Some((md, "markdown")),
+                ..PaneMetaRef::default()
+            },
+            &extras,
+        );
+        let code = change_key(
+            &ws,
+            &|_| PaneMetaRef {
+                preview: Some((md, "code")),
+                ..PaneMetaRef::default()
+            },
+            &extras,
+        );
+        assert_ne!(none, markdown, "プレビューを開いたことが載らない");
+        assert_ne!(markdown, code, "プレビューのモード変更が載らない");
     }
 
     /// #813: 自動復帰のオプトインが再起動をまたいで残る。
