@@ -165,6 +165,22 @@ pub fn code_copied() -> &'static str {
     tr!("コピーしました", "Copied")
 }
 
+// --- リンクを開かなかったときの通知（#1376。キー: preview.notice_link_*） ---
+
+/// PDF のリンク注釈・提案チップを開かなかった理由（#1376）。
+///
+/// PDF のリンク注釈は **PDF ファイルが持つ任意の文字列**で、OS の既定ハンドラは
+/// `file:` URL やローカルの実行ファイルパスも開く。開かないと決めたときに
+/// `eprintln!` だけで済ませると GUI では**押しても無言**になる（#1283 と同じ穴）ので、
+/// 共有の通知欄（`remote_notice`）へ出す。**リンク文字列そのものは載せない**
+/// （PDF の内容 = ペイン内容に相当）
+pub fn notice_link_blocked() -> &'static str {
+    tr!(
+        "このリンクは開けません（http / https のみ対応）",
+        "This link cannot be opened (http / https only)"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests_support;
@@ -211,6 +227,7 @@ mod tests {
                 pdf_unsupported_platform().to_string(),
                 binary_file().to_string(),
                 code_copied().to_string(),
+                notice_link_blocked().to_string(),
             ]
         });
     }

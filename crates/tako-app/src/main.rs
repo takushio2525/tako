@@ -1093,6 +1093,17 @@ fn open_preview(url: &str) {
     if std::env::var_os("TAKO_SELF_TEST").is_some() {
         return;
     }
+    // OS の既定ハンドラは URL でない文字列（ローカルの実行ファイルパス・UNC パス・
+    // `file:` URL）も開くので、渡す前に http / https へ絞る（#1376）。
+    // ここへ来る URL は tako が組み立てたもの（`http://localhost:<port>` / About の
+    // 固定 URL）だけなので、弾かれたら**組み立て側の不具合**。理由だけを診断へ残す
+    let url = match tako_core::url_guard::check_browser_url(url) {
+        Ok(url) => url,
+        Err(reason) => {
+            eprintln!("warning: ブラウザで開けない URL（{reason}）");
+            return;
+        }
+    };
     if let Err(e) = tako_control::platform::os_integration::open_url(url) {
         eprintln!("warning: ブラウザを開けない: {e}");
     }
@@ -11643,9 +11654,31 @@ impl TakoApp {
             Some(l) => l,
             None => return,
         };
-        match &link.target {
+        // 通知欄の更新で `self` を可変借用するので、先に借用を切る
+        let target = link.target.clone();
+        match &target {
             tako_core::PdfLinkTarget::Url { url } => {
-                let _ = tako_control::platform::os_integration::open_url(url);
+                // PDF のリンク注釈は **PDF ファイルが持つ任意の文字列**なので、
+                // OS の既定ハンドラへ渡す前に http / https だけへ絞る（#1376）。
+                // 弾いたときは黙って捨てず理由を通知欄へ出す（#1283 と同じ
+                // 「押しても無言」対策）。**リンク文字列そのものは診断へ出さない**
+                match tako_core::url_guard::check_browser_url(url) {
+                    Ok(url) => {
+                        if let Err(e) = tako_control::platform::os_integration::open_url(url) {
+                            eprintln!("warning: PDF リンクを開けない: {e}");
+                        }
+                    }
+                    Err(reason) => {
+                        tako_control::diag::persist_log(&format!(
+                            "PDF リンクを開かない: pane={} 理由={reason}",
+                            pane_id.as_u64()
+                        ));
+                        self.set_remote_notice(
+                            crate::ui_text::preview::notice_link_blocked().to_string(),
+                            true,
+                        );
+                    }
+                }
             }
             tako_core::PdfLinkTarget::Page { page } => {
                 if let Err(e) = <TakoApp as PreviewHost>::update_preview_view(
@@ -20748,7 +20781,13 @@ impl PreviewHost for TakoApp {
             .ok_or_else(|| format!("リンクインデックス範囲外: {index}"))?;
         match &link.target {
             tako_core::PdfLinkTarget::Url { url } => {
-                let _ = tako_control::platform::os_integration::open_url(url);
+                // md 経路（FR-3.3.2）と同じ規則で http / https だけを OS のハンドラへ
+                // 渡す（#1376）。理由は分類だけを返し、リンク文字列は載せない
+                // （PDF の内容。一覧が要るなら `tako preview-link-list`）
+                let url = tako_core::url_guard::check_browser_url(url).map_err(|reason| {
+                    format!("ブラウザで開けないリンク（http / https のみ対応）: {reason}")
+                })?;
+                tako_control::platform::os_integration::open_url(url)?;
                 Ok(serde_json::json!({
                     "pane": pane.as_u64(),
                     "action": "opened_url",

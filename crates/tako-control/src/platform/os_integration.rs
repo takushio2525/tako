@@ -84,9 +84,23 @@ pub fn open_in_text_editor(path: &Path) -> Result<(), String> {
 ///
 /// **URL はどのプラットフォームでも「1 つの値」のまま OS へ渡る**（#1371）。
 /// シェルのコマンドライン文字列へ連結しないので、`&` `|` `^` `%` を含む URL が
-/// 途中で切れたり、残りが別コマンドとして走ったりしない
+/// 途中で切れたり、残りが別コマンドとして走ったりしない。
+///
+/// **渡す前にスキームを検査する**（#1376）。OS のハンドラは URL でない文字列
+/// （ローカルの実行ファイルパス・UNC パス・`file:` URL）も開くので、ここを素通りさせると
+/// 第三者由来の PDF / 画面のリンク 1 クリックで任意のプログラムが起動しうる
 pub fn open_url(url: &str) -> Result<(), String> {
-    imp::open_url(url)
+    imp::open_url(guarded_url(url)?)
+}
+
+/// 境界 B8 のスキーム検査（#1376 の保険）。判定は
+/// [`tako_core::url_guard::check_os_handler_url`] の 1 実装が正本で、ここは通すだけ。
+///
+/// **エラーへ URL そのものを載せない**。呼び出し元の URL は PDF / ペインの内容に
+/// 相当し、エラー文は診断ログへ流れる（AGENTS.md の絶対ルール）
+fn guarded_url(url: &str) -> Result<&str, String> {
+    tako_core::url_guard::check_os_handler_url(url)
+        .map_err(|reason| format!("この URL は開けない（{reason}）"))
 }
 
 /// URL を開き、**ハンドラを起動できたかまで確かめる**。
@@ -97,7 +111,7 @@ pub fn open_url(url: &str) -> Result<(), String> {
 /// **ハンドラ本体（ブラウザや設定アプリ）の終了は待たない**。呼び出し側が知りたいのは
 /// 「この URL を開けるハンドラがあるか」だけなので、粒度はこれで揃っている
 pub fn open_url_wait(url: &str) -> Result<(), String> {
-    imp::open_url_wait(url)
+    imp::open_url_wait(guarded_url(url)?)
 }
 
 /// Windows で URL を開くときに `ShellExecuteW` へ渡す引数（#1371 の正本）。
