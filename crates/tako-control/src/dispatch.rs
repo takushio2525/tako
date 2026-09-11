@@ -855,10 +855,12 @@ fn dispatch_inner(
                     Ok((_, target)) => {
                         // #1259: 既に未決着のフローがあるなら、この送達はその後ろに並ぶ。
                         // 「いま何を待っているのか」を queued の応答からそのまま読めるように
-                        // 積む**前**の状態を採る（無ければ queued）
-                        let pending = host.prompt_delivery_state(target);
+                        // 積む**前**の状態を採る（無ければ queued）。
+                        // #1292: この値は決着済みの前任かもしれないので、未決着だけを
+                        // 通す絞り込みは `queued_json` が行う
+                        let predecessor = host.prompt_delivery_state(target);
                         host.queue_prompt_flow(target, text.clone());
-                        Ok(queued_json(Some(target), pending))
+                        Ok(queued_json(Some(target), predecessor))
                     }
                     Err(e) => match tmux_session {
                         Some(ref ts) => {
@@ -893,16 +895,16 @@ fn dispatch_inner(
                         // （Issue #95: 素の CR 1 発は claude TUI に取りこぼされることがあり、
                         // LF は「改行挿入」と解釈され送信にならない）
                         if send_is_enter_only(&text, newline) {
-                            let pending = host.prompt_delivery_state(target);
+                            let predecessor = host.prompt_delivery_state(target);
                             host.queue_enter_flow(target);
-                            return Ok(queued_json(Some(target), pending));
+                            return Ok(queued_json(Some(target), predecessor));
                         }
                         // 全画面 TUI（claude 等）への改行つき送信は送達確認フローへ（Issue #32:
                         // 一括書き込みは改行が「送信」と解釈されず入力欄に残留する）
                         if newline {
-                            let pending = host.prompt_delivery_state(target);
+                            let predecessor = host.prompt_delivery_state(target);
                             host.queue_send_flow(target, text.clone());
-                            return Ok(queued_json(Some(target), pending));
+                            return Ok(queued_json(Some(target), predecessor));
                         }
                     }
                     // シェルへの送信は従来どおり即時書き込み（挙動・レイテンシ据え置き）。
@@ -6532,14 +6534,21 @@ fn normalize_newlines_for_keys(text: &str) -> String {
 /// 旧実装は `{"queued": true}` だけを返していたので、**その後どうなったかを問う口が
 /// 無かった**（送達フローの保留・打ち切りは GUI の stderr へしか出ず、後続 send の
 /// 未達は worker レジストリからも弾かれる = `record_prompt_delivery_at` は spawn 専用）。
-/// `pane` と `delivery` を載せて `tako_read_pane` の `delivery` で追える形にする
-fn queued_json(pane: Option<PaneId>, pending: Option<Value>) -> Value {
+/// `pane` と `delivery` を載せて `tako_read_pane` の `delivery` で追える形にする。
+///
+/// `predecessor` は積む**前**のそのペインの送達状態（`host.prompt_delivery_state`）。
+/// **絞り込みはここで行う**ので、積む応答を組む経路（send フロー / Enter 単独 /
+/// tmux フォールバック）は全部この 1 箇所を通る（#1292）
+fn queued_json(pane: Option<PaneId>, predecessor: Option<Value>) -> Value {
     json!({
         "queued": true,
         "pane": pane.map(|p| p.as_u64()),
-        // 積む前に未決着のフローがあればその状態（= この送達はその後ろに並ぶ）。
-        // 無ければ queued
-        "delivery": pending
+        // 積む前に**未決着**（queued / waiting）のフローがあればその状態
+        // （= この送達はその後ろに並ぶ）。無ければ queued。
+        // #1292: 決着済み（delivered / gave_up）は前任の顛末なので捨てる。
+        // `prompt_delivery_states` はペインを閉じるまで消えないため、素通しすると
+        // 1 時間前の打ち切りや 10 秒前の成功を**この送達が名乗って**しまう
+        "delivery": tako_core::prompt_delivery::pending_predecessor(predecessor)
             .unwrap_or_else(|| tako_core::prompt_delivery::Status::queued().to_json()),
     })
 }
@@ -13685,6 +13694,132 @@ mod tests {
         assert_eq!(out["delivery"]["state"], "gave_up");
         assert_eq!(out["delivery"]["outcome"], "flow_timeout");
         assert_eq!(out["delivery"]["reason"], "no_input_box");
+    }
+
+    /// 積む応答の `delivery` だけを取り出す（絞り込み点である `queued_json` を直に叩く）
+    fn queued_delivery(predecessor: Option<Value>) -> Value {
+        queued_json(Some(PaneId::from_raw(1627)), predecessor)["delivery"].clone()
+    }
+
+    /// #1292: **決着済み**の前任の顛末を、新しい送達の応答が名乗らない。
+    ///
+    /// `prompt_delivery_states` はペインを閉じたときにしか消えないので、素通しすると
+    /// 1 時間前の打ち切りが「積んだ瞬間に失敗した」と読める。逆向き（`delivered`）は
+    /// もっと重く、master が届いたと判断して**監視をやめる**
+    #[test]
+    fn issue1292_決着済みの顛末をqueuedの応答が名乗らない() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        host.prompt_delivery_states.insert(
+            pane,
+            tako_core::prompt_delivery::Status::gave_up(
+                "flow_timeout",
+                Some(tako_core::prompt_delivery::Stall::NoInputBox),
+                120,
+            )
+            .to_json(),
+        );
+        let out = dispatch(
+            &mut host,
+            Request::Send {
+                pane: Some(pane),
+                text: "やること".into(),
+                newline: true,
+                tmux_session: None,
+                await_prompt: true,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(
+            out["delivery"]["state"], "queued",
+            "前回の打ち切りを新しい送達が名乗っている: {out}"
+        );
+        assert!(
+            out["delivery"]["outcome"].is_null() && out["delivery"]["reason"].is_null(),
+            "前任の理由コードが残っている: {out}"
+        );
+        assert_eq!(out["delivery"]["elapsed_secs"], 0, "経過秒まで前任のもの");
+        assert_eq!(
+            host.prompt_flows.len(),
+            1,
+            "送達フローは従来どおり積まれる（応答の絞り込みで経路は変わらない）"
+        );
+    }
+
+    /// #1292: 成功側も同じ（こちらは master が監視をやめるので実害が重い）。
+    /// `still_visible` の表示寿命（300 秒）より内か外かで応答が変わらないことも見る
+    #[test]
+    fn issue1292_直前の成功を新しい送達が名乗らない() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        host.prompt_delivery_states.insert(
+            pane,
+            tako_core::prompt_delivery::Status::delivered("peer", "delivered", 3).to_json(),
+        );
+        let out = dispatch(
+            &mut host,
+            Request::Send {
+                pane: Some(pane),
+                text: "やること".into(),
+                newline: true,
+                tmux_session: None,
+                await_prompt: true,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(
+            out["delivery"]["state"], "queued",
+            "直前の成功を新しい送達が名乗っている（master が監視をやめる）: {out}"
+        );
+        assert!(out["delivery"]["transport"].is_null(), "経路まで前任のもの");
+
+        // 300 秒を過ぎた成功は host 側（`still_visible`）で消えるが、応答は同じ queued。
+        // 状態が無いペインも同じ（前任の有無で応答がブレない）
+        host.prompt_delivery_states.remove(&pane);
+        let out = dispatch(
+            &mut host,
+            Request::Send {
+                pane: Some(pane),
+                text: "やること".into(),
+                newline: true,
+                tmux_session: None,
+                await_prompt: true,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(out["delivery"]["state"], "queued");
+    }
+
+    /// #1292: 絞り込みは `queued_json` の 1 箇所なので、積む応答を組む経路
+    /// （send フロー / Enter 単独 / tmux フォールバック）は全部同じ判定を通る。
+    /// 4 状態を直に通して表の形で固定する
+    #[test]
+    fn issue1292_積む応答の絞り込みは四状態すべてで決まる() {
+        use tako_core::prompt_delivery::{Stall, Status};
+        // 未決着 = 後ろに並ぶ（#1259 の挙動は据え置き）
+        let waiting = queued_delivery(Some(Status::waiting(Stall::PeerPending, 42).to_json()));
+        assert_eq!(waiting["state"], "waiting");
+        assert_eq!(waiting["reason"], "peer_pending");
+        assert_eq!(waiting["elapsed_secs"], 42);
+        let queued = queued_delivery(Some(Status::queued().to_json()));
+        assert_eq!(queued["state"], "queued");
+        // 決着済み = 捨てる（この送達はまだ 1 tick も回っていない）
+        for settled in [
+            Status::delivered("keys", "delivered", 9).to_json(),
+            Status::gave_up("flow_timeout", Some(Stall::NoInputBox), 120).to_json(),
+        ] {
+            let out = queued_delivery(Some(settled.clone()));
+            assert_eq!(out["state"], "queued", "決着済みを名乗っている: {settled}");
+        }
+        // 前任なし / 読めない綴り = queued（嘘にならない側へ倒す）
+        assert_eq!(queued_delivery(None)["state"], "queued");
+        assert_eq!(
+            queued_delivery(Some(json!({ "state": "unknown_state" })))["state"],
+            "queued"
+        );
     }
 
     /// #1187: `--socket` が host まで届くこと（旧実装は `let _ = socket;` で捨てていた）。

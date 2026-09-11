@@ -88,7 +88,9 @@ pub fn tools() -> Vec<Value> {
                 応答は queued: true が即座に返り、実際の送達確認はバックグラウンドで行われる）。\
                 #1259: 応答の delivery が**その後を追う口**になる（state = queued / waiting / \
                 delivered / gave_up、reason = 止まっている理由コード、note = 次の一手）。\
-                積む前に未決着のフローがあればその状態が出る = この送達はその後ろに並ぶ。\
+                積む前に**未決着**（queued / waiting）のフローがあればその状態が出る = \
+                この送達はその後ろに並ぶ。#1292: 決着済み（delivered / gave_up）の前回の\
+                顛末は出ない（この送達はまだ 1 tick も回っていないので queued になる）。\
                 続きは tako_read_pane の delivery で読み、persist.log にも同じ理由が 1 行残る。\
                 text を空にして newline: true にすると Enter 単独送信になる: 入力欄に残った\
                 テキストの送信代行に使え、入力欄が空へ戻るまで Enter を自動再送する。\
