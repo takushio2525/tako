@@ -9,7 +9,10 @@
 //!
 //! 1. **欠落ゼロ** — 移送前の 1 行 1 行が、テンプレートか手順書のどちらかに残っている
 //! 2. **手順書は原文以外を含まない** — 要約・言い換え・創作が混ざっていない
-//!    （テンプレート側の案内文は新しく書いてよい。そちらは 3 で量を縛る）
+//!    （テンプレート側の案内文は新しく書いてよい。そちらは 3 で量を縛る）。
+//!    **新機能の手順を手順書へ足す道**は fixture `guides_added_after_1154.md` への
+//!    宣言（Issue 番号 + 本文そのまま）で開いている —— テンプレート側へ書くと
+//!    #1154 の方向と逆（起動時ロードの固定費が増え、同じ表が 2 か所へ割れる）ため
 //! 3. **行き先が申告どおり** — ブロック B の本文は「新テンプレートの B」か
 //!    「`restores` に B を持つ手順書」にしか行っていない（monitoring の本文が
 //!    acceptance の手順書へ紛れ込む、が起きない）
@@ -117,12 +120,29 @@ fn missing_lines(before_text: &str, have: &BTreeMap<String, usize>) -> Vec<Strin
     missing
 }
 
-/// 移送前の本文に無い行（= 手順書側の要約・言い換え・創作）
+/// 移送後に**新しく足した**手順書の本文（Issue 番号つきで宣言してあるもの）。
+///
+/// 移送の番犬が止めたいのは「要約・言い換えで意味が変わる」ことなので、
+/// **新機能の手順を足す道**は別に開けてある。fixture へ 1 文字も変えずに貼れば通り、
+/// 宣言していない行は今までどおり創作として落ちる。
+/// 注記（`<!-- … -->` で始まる行）は宣言に数えない
+fn added_after() -> String {
+    let p = repo_root().join("crates/tako-control/tests/fixtures/guides_added_after_1154.md");
+    let text =
+        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{} が読めない: {e}", p.display()));
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with("<!--"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 移送前の本文にも「後から足した」宣言にも無い行（= 手順書側の要約・言い換え・創作）
 fn invented_lines(bodies: &[(&str, &str)], before_bag: &BTreeMap<String, usize>) -> Vec<String> {
+    let allowed_added = bag(&added_after());
     let mut out: Vec<String> = Vec::new();
     for (topic, body) in bodies {
         for line in lines_of(body) {
-            if !before_bag.contains_key(&line) {
+            if !before_bag.contains_key(&line) && !allowed_added.contains_key(&line) {
                 out.push(format!("  [{topic}] {}", show(&line)));
             }
         }
@@ -154,7 +174,9 @@ fn 手順書は原文以外の行を含まない() {
     assert!(
         invented.is_empty(),
         "手順書に移送前の本文に無い行がある（{} 行）。要約・言い換えは手順書に置かない\
-         （置くならテンプレート側の案内文にする）:\n{}",
+         （置くならテンプレート側の案内文にする）。**新機能の手順を足したのなら** \
+         その本文を crates/tako-control/tests/fixtures/guides_added_after_1154.md へ \
+         Issue 番号つきで宣言する（1 文字も変えずに貼る）:\n{}",
         invented.len(),
         invented.join("\n")
     );
@@ -326,6 +348,29 @@ fn 手順書に要約を混ぜたら創作として名指しする() {
     // 原文そのままの行は創作扱いしない
     let real = guide::find("acceptance").unwrap().body;
     assert!(invented_lines(&[("acceptance", real)], &before_bag).is_empty());
+}
+
+#[test]
+fn 後から足した本文は宣言したものだけ通る() {
+    // 新機能の手順を足す道（`added_after`）が**素通しになっていない**ことの証拠。
+    // 宣言と 1 文字でも違えば創作として落ちる
+    let before_bag = bag(&before());
+    let declared = lines_of(&added_after());
+    assert!(
+        !declared.is_empty(),
+        "宣言 fixture の読み出しが壊れている（注記だけになっている）"
+    );
+    let first = declared[0].clone();
+    assert!(
+        invented_lines(&[("monitoring", &first)], &before_bag).is_empty(),
+        "宣言した行が創作扱いされている: {first}"
+    );
+    let tampered = format!("{first}（言い換え）");
+    assert_eq!(
+        invented_lines(&[("monitoring", &tampered)], &before_bag).len(),
+        1,
+        "宣言と違う行が素通りしている: {tampered}"
+    );
 }
 
 #[test]

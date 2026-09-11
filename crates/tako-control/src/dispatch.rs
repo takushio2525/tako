@@ -9622,9 +9622,21 @@ fn finish_worker_status(
         )
     });
 
+    // #757: ログイン失効を検知したときだけ「どのアカウントか」を逆引きする。
+    // 逆引きは transcript の所在を読む（= ディレクトリ走査）ので、**失敗経路でしか
+    // 呼ばれない閉包**として渡す。毎ポーリング（watch は 5 秒ごと）に走らせない。
+    // 会話 ID は解決済み > レジストリ記録の順（ペインが消えた後も引けるように）
+    let sid_for_account = resolved_sid.clone().or_else(|| {
+        registry_worker
+            .as_ref()
+            .and_then(|(_, e)| e.session_id.clone())
+    });
     apply_worker_status_corrections(ResolvedWorkerStatus {
         status,
         status_source: status_source.to_string(),
+        login_account_resolver: Some(Box::new(move || {
+            orchestrator::login_expired_account(sid_for_account.as_deref())
+        })),
         ctx_percent,
         ctx,
         resolved_sid,
@@ -9679,6 +9691,13 @@ struct ResolvedWorkerStatus {
     agent_process_alive: bool,
     /// #813: 利用上限後の自動復帰の状態（UI スレッドで写し取った値をそのまま載せる）
     limit_resume: Value,
+    /// #757: ログイン失効を検知したときだけ呼ぶアカウントの逆引き
+    /// （`config_dir` / `account` / `is_default` を返す）。
+    ///
+    /// 中身は transcript の所在を読むので**失敗経路でしか呼ばない**ために閉包で渡す。
+    /// `None` = 逆引きしない（テストの既定。実ホームを走査させないため）
+    #[allow(clippy::type_complexity)]
+    login_account_resolver: Option<Box<dyn Fn() -> Option<Value>>>,
     /// #985: codex の構造化されたレート制限（rollout の `rate_limits`。他 agent は None）
     codex_rate_limits: Option<crate::codex_session::RateLimits>,
     /// #1034: **一次シグナルで「agent が作業を 1 歩でも始めた」ことを観測できたか**。
@@ -9717,6 +9736,7 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         registry_resume_command,
         agent_process_alive,
         limit_resume,
+        login_account_resolver,
     } = resolved;
     // #267: agents が "gone" を返しても pane が workspace にある場合は
     // セッション未発見なだけで worker は健在 → unknown に降格
@@ -9988,11 +10008,29 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
             .and_then(|out| crate::orchestrator::wait::detect_worker_error(out))
         {
             status = "error".to_string();
-            error_info = Some(json!({
+            let mut info = json!({
                 "kind": kind.as_str(),
                 "detail": detail,
                 "recommended_action": kind.recommended_action(),
-            }));
+            });
+            // #757: ログイン失効は「どのアカウントを再ログインするか」まで出す。
+            // 複数アカウント運用では config_dir だけでは人が名前と結び付けられないので、
+            // accounts.yaml の名前も併記する（解決できないときはキーごと出さない =
+            // 推測を載せない）。会話の所在から引くので claude worker のみ解決できる
+            // （codex / agy は `agent_support::MATRIX` の
+            // `worker_login_expired_detect` が未調査として宣言している）
+            if kind == crate::orchestrator::wait::WorkerErrorKind::LoginExpired {
+                if let Some(account) = login_account_resolver.as_ref().and_then(|f| f()) {
+                    if let Some(obj) = info.as_object_mut() {
+                        for key in ["config_dir", "is_default", "account"] {
+                            if let Some(v) = account.get(key) {
+                                obj.insert(key.to_string(), v.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            error_info = Some(info);
         }
     }
 

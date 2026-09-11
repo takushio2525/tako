@@ -322,6 +322,9 @@ pub mod keys {
     pub const WORKER_LIMIT_DETECT: &str = "worker_limit_detect";
     /// 利用上限メトリクス（残量%）の取得
     pub const WORKER_LIMIT_METRICS: &str = "worker_limit_metrics";
+    /// アカウントのログイン失効（OAuth リフレッシュトークンの無効化）で
+    /// 止まったことの検知（#757）
+    pub const WORKER_LOGIN_EXPIRED_DETECT: &str = "worker_login_expired_detect";
     /// worker からの MCP 接続
     pub const WORKER_MCP: &str = "worker_mcp";
     /// claude 語彙で書かれたモデル / effort の既定（プロファイルの `worker_model` /
@@ -486,6 +489,18 @@ pub mod notes {
     pub const NO_LOCAL_ENTITLEMENT: Note = Note::new(
         "自分のマシンで動かすモデルなので、座席種別・クレジット・組織ポリシーという概念が無い（阻害される権利がそもそも存在しない）",
         "The model runs on your own machine, so there is no seat type, credit balance, or org policy to be blocked by",
+    );
+
+    /// #757: ローカル LLM にはベンダーのログインという段が無い
+    pub const NO_LOCAL_LOGIN: Note = Note::new(
+        "自分のマシンで動かすモデルなので、ベンダーへのログインとその失効という概念が無い（失効する資格情報がそもそも存在しない）",
+        "The model runs on your own machine, so there is no vendor login to expire in the first place",
+    );
+
+    /// #757: 失効の文言を実物で採っていない（無いと確定したわけではない）
+    pub const LOGIN_EXPIRY_NOT_MEASURED: Note = Note::new(
+        "この系統でログイン失効時に画面へ何が出るかを実物で採れていない（#757 の 3 文言は claude の実観測。推測の文言は置かない）",
+        "What this agent prints on screen when its login expires has not been captured from a real run (the three phrases in #757 were observed on claude; no guessed wording is added)",
     );
 
     /// #1140: codex は「解除まで待って自分で続行する」機構を持たない
@@ -1412,6 +1427,20 @@ pub const MATRIX: &[AgentFeature] = &[
              出ない = 常時見えるところに `primary NN%` は無い）ので、構造化ソースが正になった。\
              両者の解除時刻が一致することも確認（rollout の 1787840583 = 画面の 23:23）。\
              agy 1.1.22 は前払いクレジットで枠が無い（`/credits` を実行して確認）",
+        ),
+    },
+    AgentFeature {
+        key: keys::WORKER_LOGIN_EXPIRED_DETECT,
+        summary: Note::new(
+            "アカウントのログイン失効で止まったことを検知する（#757）",
+            "Detects that the agent has stopped because the account's login expired (#757)",
+        ),
+        claude: S::Supported,
+        codex: pending(notes::LOGIN_EXPIRY_NOT_MEASURED, 757),
+        agy: pending(notes::LOGIN_EXPIRY_NOT_MEASURED, 757),
+        local: unsupported(notes::NO_LOCAL_LOGIN),
+        evidence: AgentEvidence::Measured(
+            "#757（2026-08-01 / 08-03 / 08-05 の実観測を 3 回）: claude の worker が              `OAuth refresh token is no longer valid; run /login to re-authenticate` /              `Login expired · Please run /login` / `Please run /login` を出して止まる。             画面には先に `API Error: Unable to connect to API (ENOTFOUND / ECONNRESET)` が              出るため、#757 前は `api_error`（推奨 `resume`）に分類され、**続行ナッジを              何度撃っても復帰しなかった**（master が 3 回空回りした）。この 3 文言を              `orchestrator::agent_cli::login_expired_line`（#983 の起動時未認証検知と              **同じ正本**）で受け、`WorkerErrorKind::LoginExpired`（`relogin`）として返す。             対象アカウントは会話（session_id）の transcript の所在から逆引きする              （`orchestrator::login_expired_account`。#652 の resume と同じ根拠）ので、             **会話が claude の config ディレクトリに在る系統でしか名指しできない**。             codex / agy は失効時の実画面を採れていないので文言を足していない              （推測を置かないのは #1034 の `execution_refused_patterns` と同じ作法）。             **実機で失効させる再現はしていない**（同一アカウントを別マシンから使った              直後に起きるもので、任意のタイミングでは作れない）ので、検証は実観測の              文言を描いた fixture と隔離 tmux のペインで行った",
         ),
     },
     AgentFeature {
