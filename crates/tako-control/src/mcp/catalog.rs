@@ -2086,10 +2086,11 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_remote_start",
             "description": "リモートアクセス API サーバーを起動する。スマホからブラウザ経由で\
-                ペインを操作するための HTTP API サーバーが Unix domain socket で開始される。\
-                transport は Tailscale Serve のみ: daemon は UDS（0600）のみで listen し、\
-                tailnet 内限定の恒久固定 URL（https://<ホスト名>.<tailnet>.ts.net）で公開される\
-                （WireGuard E2E 暗号化・TCP ポートは一切開かない）。\
+                ペインを操作するための HTTP API サーバーがローカルエンドポイントで開始される。\
+                transport は Tailscale Serve のみ: daemon の待ち受けは既定でループバック TCP\
+                （127.0.0.1 のエフェメラルポート）で、tailnet 内限定の恒久固定 URL\
+                （https://<ホスト名>.<tailnet>.ts.net）で公開される\
+                （WireGuard E2E 暗号化・LAN や外部インタフェースへはバインドしない）。\
                 Tailscale が未セットアップ（未導入・未ログイン・HTTPS 未有効等）の場合は\
                 不足項目を列挙して起動を拒否するので、ユーザーに `tako remote setup` を案内する。\
                 接続には機器ペアリングが必要: 初回アクセス時に Mac 画面へ承認ダイアログが表示され、\

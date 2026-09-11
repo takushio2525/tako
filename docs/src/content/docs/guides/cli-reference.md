@@ -1,11 +1,11 @@
 ---
 title: CLI リファレンス
-description: tako コマンド全 69 種の逆引き一覧 — 目的・使い方・実行例・よく使うオプション
+description: tako コマンド全 84 種の逆引き一覧 — 目的・使い方・実行例・よく使うオプション
 ---
 
 `tako` CLI は、ターミナルの画面操作（ペイン分割・テキスト送信・レイアウト変更など）をコマンドとして実行するためのツールです。シェルスクリプトからの自動化にも、AI エージェントからの操作にも使われます。
 
-トップレベルのコマンドは **69 種**、サブコマンドまで含めると 223 種あります。ほぼすべてが同名の MCP ツールと 1:1 で対応しており（[MCP ツール一覧](/guides/mcp-tools/)）、人ができる操作は AI も同じ経路で実行できます。
+トップレベルのコマンドは **84 種**で、その多くがさらにサブコマンドを持ちます。ほぼすべてが同名の MCP ツールと 1:1 で対応しており（[MCP ツール一覧](/guides/mcp-tools/)）、人ができる操作は AI も同じ経路で実行できます。
 
 ## 共通の前提
 
@@ -22,7 +22,7 @@ tako orchestrator spawn --help
 
 ## コマンド早見表
 
-やりたいことから引くための全 69 コマンドの一覧です。詳細のあるものはリンクから飛べます。
+やりたいことから引くための全 84 コマンドの一覧です。詳細のあるものはリンクから飛べます。
 
 ### 画面を操作する
 
@@ -31,6 +31,7 @@ tako orchestrator spawn --help
 | [`split`](#tako-split) | 隣に新しいペインを生やす |
 | [`send`](#tako-send) | ペインへテキスト・コマンドを送る |
 | [`read`](#tako-read) | ペインの画面内容を読む |
+| [`links`](#tako-links) | 画面のリンク（cmd+クリックで開けるもの）を列挙する |
 | [`list`](#tako-list) | タブ・ペインの構成を JSON で得る |
 | [`focus`](#tako-focus) | フォーカスを移す |
 | [`scroll`](#tako-scroll) | スクロールバックを動かす |
@@ -40,6 +41,7 @@ tako orchestrator spawn --help
 | [`equalize`](#tako-equalize) | 全ペインを均等化する |
 | [`tab`](#tako-tab) | タブの作成・切替・改名・ペイン移動 |
 | [`window`](#tako-window) | 複数ウィンドウの操作 |
+| [`menu`](#tako-menu) | メニューバーの構成取得・開閉・項目の実行 |
 | [`collapse`](#タブ枠の折りたたみ) | サイドバーのタブ枠を折りたたむ |
 | [`pin`](#表示設定のトグル) | プレビューをフローティング化する |
 
@@ -52,6 +54,7 @@ tako orchestrator spawn --help
 | [`preview-outline`](#プレビューの操作) | Markdown 見出し・PDF 目次へジャンプ |
 | [`preview-link-list`](#プレビューの操作) | PDF 内リンクの一覧 |
 | [`preview-follow-link`](#プレビューの操作) | PDF 内リンクをたどる |
+| [`preview-copy-code`](#プレビューの操作) | Markdown コードブロック全文をコピーする |
 | [`preview-reload`](#プレビューの操作) | ライブリロードの ON/OFF |
 | [`preview-cache`](#プレビューの操作) | 画像キャッシュ上限の確認・変更 |
 | [`preview-changelog`](#プレビューの操作) | git 履歴ビューへの切替 |
@@ -133,10 +136,17 @@ tako orchestrator spawn --help
 | コマンド | 何をするか |
 |---|---|
 | [`remote`](#リモートアクセス) | スマホ等からの接続サーバー |
+| [`remote-folder`](#リモートアクセス) | SSH 先のフォルダをワークスペースとして開く |
 | [`setup`](#tako-setup) | 質問ゼロの自動セットアップ |
 | [`setup-mcp`](#tako-setup-mcp) | MCP 登録だけ行う |
 | [`update`](#tako-update) | アプリの更新確認・実行 |
+| [`migrate`](#tako-migrate) | 設定・データファイルの形式確認と自動移行 |
+| [`config`](#tako-config) | AI 系設定のデバイス間共有（git ベース） |
 | [`platform`](#tako-platform) | この環境で使える機能の一覧 |
+| [`agent-support`](#tako-agent-support) | エージェント系統ごとの能力差 |
+| [`shell-integration`](#その他) | シェル統合（cwd 追従・コマンド状態）の確認・配置 |
+| [`context-budget`](#その他) | 起動時ロードの予算の確認と作業ログの自動移送 |
+| [`test-residue`](#その他) | テスト・検証が残した一時 dir の掃除 |
 | [`fda`](#その他) | フルディスクアクセスの状態確認 |
 | [`sleep-guard`](#その他) | スリープ防止 |
 | [`telemetry`](#その他) | エラーレポート送信の ON/OFF |
@@ -341,6 +351,16 @@ tako read --pane 3
 tako read --pane 3 --lines 50
 ```
 
+### tako links
+
+画面の中で **cmd+クリックで開けるもの**（URL・実在するパス）を列挙します。GUI のクリック判定と同じ経路を通るので、「この画面のこのパスはリンクになるのか」を人手のクリック無しに確かめられます。`--text` を渡すと画面の代わりにその文字列を材料にするため、画面の写しを貼って判定を再現できます。
+
+```bash
+tako links                           # 呼び出し元ペインの画面
+tako links --pane 3
+tako links --text "$(cat out.txt)"   # 画面の写しで判定を再現する
+```
+
 ### tako list
 
 タブ・ペインの構成を JSON で出力します。各ペインの ID・タイトル・作業ディレクトリ（cwd）・実行状態・listen 中のポートなどが含まれます。ペイン ID を調べる出発点です。
@@ -439,6 +459,17 @@ tako window new --tab 3                   # 既存タブ 3 を分離して新ウ
 tako window move-tab --tab 3 --window 2   # タブを別ウィンドウへ移動
 tako window focus 2                       # ウィンドウを前面化
 tako window close 2                       # 閉じる（タブは残存ウィンドウへ合流）
+```
+
+### tako menu
+
+メニューバーの構成取得・開閉・項目の実行を行います。**開閉は Windows 限定**です（macOS のメニューは OS 側のメニューバーに載るため、tako から開閉できません）。項目の実行はどちらの OS でも使えます。
+
+```bash
+tako menu list                       # メニュー構成と開閉状態（項目名とショートカット付き）
+tako menu invoke ファイル/新規タブ   # 項目を実行する
+tako menu open 表示                  # メニューを開く（Windows のみ）
+tako menu close                      # 閉じる（Windows のみ）
 ```
 
 ### タブ枠の折りたたみ
@@ -999,6 +1030,17 @@ tako remote messages <session-id> --tail 30 # 会話ログ末尾
 tako remote scrollback <pane-id> --lines 1000
 ```
 
+SSH 先のフォルダをワークスペースとして開くのは別コマンド（`tako remote-folder`）です。ファイルツリーにリモートのディレクトリが並び、ファイルはプレビューで開いて編集・保存できます。認証は `~/.ssh/config`・鍵・ControlMaster をそのまま使うので追加設定は要りません。
+
+```bash
+tako remote-folder open myhost               # リモートのホームをツリーへ（SSH 済みのターミナルも用意される）
+tako remote-folder open myhost /srv/app      # パス指定
+tako remote-folder open myhost --no-terminal # ツリーへ開くだけ
+tako remote-folder list                      # 開いているリモートフォルダ
+tako remote-folder ls myhost /srv            # ツリーを開かずに覗く
+tako remote-folder close myhost              # 閉じる（省略で全ホスト）
+```
+
 Tailscale が未セットアップの場合、`tako remote start` は不足項目を列挙して `tako remote setup` を案内します。ステータスバーのリモートチップからも同じ起動ができます。
 
 ## オーケストレーター
@@ -1246,6 +1288,17 @@ tako platform --status pending      # 未実装のものだけ
 tako platform --json
 ```
 
+### tako agent-support
+
+エージェント系統（claude / codex / agy / ローカル LLM）ごとに、どの機能が claude 同等に使えるか・縮退しているか・まだ使えないかを表示します。**worker を codex / agy で立てる前**と、その worker が期待どおり動かないときに引くコマンドです。
+
+```bash
+tako agent-support                        # 全系統ぶんの表
+tako agent-support --agent codex          # 系統を 1 つに絞る
+tako agent-support --status unsupported   # 上流の CLI に手段が無いものだけ
+tako agent-support --json
+```
+
 ### その他
 
 ```bash
@@ -1260,6 +1313,15 @@ tako telemetry on
 tako telemetry off
 
 tako stale-binary            # 稼働中セッションの claude バイナリの鮮度確認・張り直し
+
+tako shell-integration           # シェル統合（cwd 追従・コマンド実行状態）が効いているか
+tako shell-integration install   # 配置する（unix は環境変数の注入で完結するので不要）
+
+tako context-budget          # 起動時ロードの予算の確認（何も書き換えない）
+tako context-budget fix      # 積もった作業ログを archive へ移送する
+
+tako test-residue            # テスト・検証が残した一時 dir の下見（1 つも消さない）
+tako test-residue --apply    # 実際に削除する（生きているプロセスの置き場には触らない）
 ```
 
 ## MCP

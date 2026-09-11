@@ -1,16 +1,16 @@
 ---
 title: MCP ツール一覧
-description: tako が AI エージェントに公開する 147 個の MCP ツールの全リスト
+description: tako が AI エージェントに公開する 149 個の MCP ツールの全リスト
 ---
 
-tako は **147 個の MCP ツール**を AI エージェント（Claude Code / Codex 等）に公開しています。ほぼすべてが `tako` CLI のコマンドと 1:1 で対応しているため、細かい引数や挙動は [CLI リファレンス](/guides/cli-reference/)の対応コマンドも合わせて参照してください。
+tako は **149 個の MCP ツール**を AI エージェント（Claude Code / Codex 等）に公開しています。ほぼすべてが `tako` CLI のコマンドと 1:1 で対応しているため、細かい引数や挙動は [CLI リファレンス](/guides/cli-reference/)の対応コマンドも合わせて参照してください。
 
 :::tip[登録は一度きり]
 MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度行えば、以降はどのプロジェクトでも自動的に使えます。codex を master にする場合は `tako master` の起動時にだけ設定が注入されるため、グローバル設定の変更すら不要です。
 :::
 
 :::note[この一覧の作り方]
-このページの一覧は tako 本体のツール定義（`tako-control` の `mcp::tools()`）から機械的に抽出したものです。数と名前は実装のスナップショット（`crates/tako-app/testdata/mcp_tools_snapshot.txt`）と一致しています。
+このページの表は手書きです。ただし**名乗っている個数と掲載漏れは CI の番犬が拘束**しています（`crates/tako-control/tests/docs_tool_inventory.rs`）。tako 本体のツール定義（`tako-control` の `mcp::tools()`）と突き合わせ、個数がずれたとき・実装にあるツールがこのページに 1 度も出てこないとき・実装に無いツール名がここに残っているときにテストが落ちます。
 :::
 
 ## 画面とレイアウト
@@ -27,6 +27,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_scrollback` | スクロールバック保持行数（直接ペインのメモリ）の確認・変更 |
 | `tako_move_pane_to_tab` | ペインを別のタブへ移動する |
 | `tako_window` | 複数ウィンドウの操作（一覧 / 新規 / 閉じる / タブ移動 / フォーカス） |
+| `tako_menu` | メニューバーの構成取得・開閉・項目の実行（開閉は Windows の in-window メニューバー限定） |
 
 ## テキストの読み書き
 
@@ -143,6 +144,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_orchestrator_accounts` | アカウントレジストリの管理（worker ごとの使い分け） |
 | `tako_orchestrator_layout` | worker spawn 時のレイアウト方針の設定 |
 | `tako_orchestrator_ledger` | 委任台帳の操作 |
+| `tako_orchestrator_guide` | master の手順書を topic 単位で引く（system prompt に全文を置かずに済ませるための仕組み） |
 
 ## タスク管理
 
@@ -176,6 +178,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_remote_agents` | 動作中のエージェント一覧 |
 | `tako_remote_messages` | エージェントの会話ログ取得 |
 | `tako_remote_scrollback` | ペインのスクロールバック履歴取得 |
+| `tako_remote_folder` | SSH 先のフォルダをワークスペースとして開く / 閉じる / 一覧（プレビューでの編集・保存まで可） |
 
 :::note[承認と権限変更は AI からはできません]
 機器ペアリングの**承認**と**権限（role）の変更**は Mac 画面の承認ダイアログ限定で、MCP / CLI には API がありません。これは「tako を操作できる端末を増やす」操作を必ず人間の手を経由させるためのセキュリティ境界です（「AI フルコントロール」原則の明示的な例外）。start / stop / status / devices は AI からも操作できます。
@@ -189,6 +192,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_open_remote` | SSH ホストに接続する（`target`: `split` = いまのタブに新ペイン（既定）/ `tab` = 新しいタブ / `pane` = 既存ペインをそのまま SSH 化） |
 | `tako_ssh_hosts` | `~/.ssh/config` の Host 一覧を返す |
 | `tako_recent` | 最近開いたディレクトリ / リポジトリ / SSH ホストの一覧・クリア |
+| `tako_links` | ターミナル画面のリンク（cmd+クリックで開けるもの）を列挙する（種別・行き先・画面上の範囲つき） |
 | `tako_web` | ネイティブ Web ビューペインの操作（開く / 退避 / ナビゲート / JS 評価） |
 
 ## 表示・設定
@@ -218,6 +222,11 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_setup` | `tako setup` を非対話で実行する（日本語の希望を回答 JSON にして代行） |
 | `tako_setup_changes` | setup のアップデート追従状況を照会する |
 | `tako_setup_mcp` | claude / codex / agy へ MCP 接続設定を追加する（`agent` 省略で導入済みの全 CLI） |
+| `tako_setup_bootstrap` | エージェント CLI（claude / codex / agy）が未導入の環境へのゼロスタート導入 |
+| `tako_setup_deps` | 任意依存（tmux / psmux / git / tailscale）の検出とその場導入 |
+| `tako_setup_models` | エージェント CLI が使えるモデル一覧の実取得（モデルを勧める前に引く） |
+| `tako_agent_support` | agent 能力マトリクスの参照（系統ごとに使える / 縮退 / 未実装） |
+| `tako_shell_integration` | シェル統合（OSC 7 / 133）の配置状態の確認と配置・解除 |
 | `tako_migrate` | 設定・データファイルの形式の確認と自動マイグレーションの手動発火 |
 | `tako_check_health` | tako 環境の健全性を診断する |
 | `tako_platform` | プラットフォーム対応マトリクスの参照（使える / 縮退 / 未実装） |
@@ -229,6 +238,8 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_config_share` | AI 系設定（claude のグローバル指示 + tako の宣言的設定）の git ベース共有 |
 | `tako_sessions` | セッションカタログの参照と会話の復元 |
 | `tako_logs` | ペインの平文ターミナルログの参照・設定 |
+| `tako_context_budget` | 起動時ロードの予算の確認と、積もった作業ログの自動移送 |
+| `tako_test_residue` | テスト・検証が一時ディレクトリへ残した使い捨て dir の掃除（既定は下見だけ） |
 
 ## ペインの自動特定
 
