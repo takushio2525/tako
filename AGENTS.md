@@ -128,6 +128,7 @@ tako/
 | **スマホから会話を操作する（Claude 公式 Remote Control。#1068 / #1069 / #1077 / #1078）** | `tako orchestrator profiles set <名前> --remote-control true` |
 | オーケストレーター アカウント管理（#504/#548） | `tako orchestrator accounts list/show/add/remove` |
 | worker spawn のレイアウト設定 | `tako orchestrator layout [--policy master-reserved|legacy] [--master-ratio 0.5] [--algorithm grid|spiral]` |
+| **PWA を単独でビルドする（新規 worktree で dist が無いとき。#1309）** | `scripts/build-pwa.sh` |
 | build | `cargo build --workspace` |
 | lint | `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` |
 | test | `cargo test --workspace` |
