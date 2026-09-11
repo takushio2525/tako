@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-11（#1357: PWA の Playwright e2e を CI へ載せ、実行手順を置いた）
-- 6 spec 50 項目が CI で 1 度も走らず実行手順もどこにも無かった（#425 の契約変更で spec が取り残され #632 が 6 週間放置 → #1089 として再起票）。`package.json` に `e2e` / `e2e:install`・`web/tako-remote/README.md` 新設・AGENTS.md と commands.md に 1 行
-- CI の macOS ジョブ末尾で `npm run e2e:install` → `npm run e2e` を **blocking** で実行。追加は実測 **46〜87 秒**（2 run。差は worker 数がランナーの CPU 数に従うため = 33 秒 / 71 秒。3 分のゲート内なので採用）
-- 実測: ローカル `50 passed (12.4s)`。空キャッシュから `e2e:install` 14 秒で復旧（#632 の `Executable doesn't exist` を隔離した `PLAYWRIGHT_BROWSERS_PATH` で再現）。ポート衝突は `reuseExistingServer: true` が黙って再利用し `waitForSelector` タイムアウトの形で落ちる
-
 ## 2026-09-11（#632: 承認カード e2e 3 本は #1089 で修正済みと実測確定）
 - 現状 main で `screenshots-5b.spec.js` は 9/9 PASS・PWA e2e 全 6 spec も 50/50 PASS。`cf85756`（#1089 / PR #1100）が #632 の「対応案」（モックへ `permission_dialog` / assert を `/respond` + `choice`）を既に実装していた
 - A/B（`cf85756^` の spec を現行実装へ当てる）で `.approval-card` の 10 秒タイムアウト × 3 を再現 = 症状は実在。旧契約（`/input` へ `y`/`n`）の grep は 0 件、境界の選択肢 N=2 / N=1 も一時 spec で PASS
@@ -63,3 +58,8 @@
 - `lid-guard.json` は data_dir に 1 つで複数の tako-app が共有するのに「書き換えるのはこのプロセスだけ」が前提だった。記録へ所有者（pid + 起動時刻）を足し、戻すのは「自分の / 所有者が死んだ / 所有者を持たない旧形式」だけへ（**生きた他プロセスの記録は倒す側も解除側も触らない**）。判定は `claim_for` → `decide` の純粋関数 2 本で、probe を引数に取るので macOS の CI で 4 通り全部を固定できる
 - 書き込みを `config_io::atomic_write` + `<path>.lock` の flock（**書くと決まってから**取り、その下で読み直す）へ。読めない記録は「記録なし」へ丸めず `<name>.unreadable.bak` へ写して Err（元ファイルは触らない）。旧形式は `serde(default)` でそのまま読めるので移行は不要（指紋へ `SavedLidState` / `RecordOwner` を登録）
 - A/B: 修正前ソースで番犬 6 本が file:line 名指し FAILED。注入 5 種それぞれで対応する番犬 / 単体が落ちる。**Windows 実機（2 プロセス構成）は未検証**（電源待ち）。`main.rs` の `apply_sleep_guard` がセカンダリで止まらない件は所有権で無害化したので別 Issue は立てない
+
+## 2026-09-11（#1308: 実 PTY の fixture を待つテストを状態待ちへ寄せた）
+- 真因は「固定窓の待ち + 尽きても結果を検査せず素通り」。混んだ機で素のシェルの起動が固定 10 秒窓を超えると、起動前の PTY へ打ち込んだ行はエコーされるだけで実行されず、それでも `dispatch` するので panic が**「器越しへ倒れている（#1200）」という無関係な原因**を名指ししていた（実測 `prompt_ok=false waited=10.03s dialog_seen=false waited=20.04s load=3.89`）
+- 待ちを `i1308_wait_for_state`（状態待ち + `state_wait_budget`・**上限に達したらドライバ自身が panic**・届かないあいだは予算に比例した間隔で打ち直す）へ寄せ、呼び出し側が素通りできない構造にした。番犬 `issue1308_pty_wait_watchdog` 4 本が注入 5 通りを file:line で名指し
+- 高負荷 A/B（全件走 18 スレッド）: legacy `TAKO_1308_LEGACY=1` は **3/35 FAILED**（69.5〜70.7 秒・load 66.8〜68.9・Issue と同一の panic 本文）、新アームは **0/35 FAILED**（load p50 96.9・最長 74 秒の run も通過）。注入 `TAKO_1308_INJECT=late`（`cat </dev/tty` で打鍵を食う）は legacy 確定 FAILED 30.09 秒 / 新 ok 15.50 秒
