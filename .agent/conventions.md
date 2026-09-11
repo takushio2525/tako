@@ -986,6 +986,29 @@ watch の再検査が busy と読むと `idle_streak` が永久に積まれな�
 そこで「読めない = 覆さない」= 従来どおり一次シグナルを信じる、にしておけば
 劣化はしても誤報は増えない。
 
+### 「入力欄が空か」は文字列では決まらない（Issue #1297）
+
+覆す条件の 1 つ「入力欄に人の下書きが無い」を**文字列だけ**で見ていたせいで、
+#1273 の腕は本番でほとんど発火していなかった（pane 1636 / 1761 / 1775 / 1784）。
+claude は空欄へ **AI のゴースト提案**を dim で描き、文面は
+`merge the PR once CI is green` のような任意の自然文なので、
+`INPUT_PLACEHOLDERS` のような**文言リストでは原理的に網羅できない**。
+
+- **属性で決める**。判定は `read_pane` の `input_status.style` と同じ 1 実装
+  （`tako_core::screen::analyze_input_line`）を通し、`Ghost` / `None` は下書きなし・
+  `User` / `Mixed` は下書きあり。述語の正本は `InputStyle::is_user_draft` の 1 箇所で、
+  `matches!(style, User | Mixed)` を判定ごとに書き直さない
+  （#1297 はまさに、属性を見る判定と見ない判定が並存していたことで起きた）
+- **属性の取り口は「画面テキストを採る場所」と同じ場所で採る**。
+  `worker_status` は `collect_worker_status_ctx`（GUI のセッション）で両方を採る。
+  片方だけ後から採り直すと、別フレームの画面と属性を突き合わせることになる
+- **取れない経路では旧挙動へ落とし、落ちたことを応答に残す**。素の tmux capture には
+  属性が無いので従来の文字列判定に戻るが、そのとき
+  `worker_status` の `idle_override_blocked` に `input_draft_unreadable` を出す
+  （「覆せなかった」と「覆す理由が無かった」を master が区別できる）。
+  番犬は `issue1297_ghost_input_watchdog`（判定が文字列だけへ戻る / ghost を
+  下書きに数える / user・mixed を空に数える / dispatch の配線が消える の 4 本）
+
 ## 効果を測る単体テストは実時間で比べない（Issue #1167 / #1220）
 
 「速くなっている」を `Instant::elapsed` の**比較**で固定したテストは、片方の計測窓にだけ

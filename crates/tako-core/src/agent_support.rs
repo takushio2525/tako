@@ -1303,7 +1303,15 @@ pub const MATRIX: &[AgentFeature] = &[
              agy = フッターの `· 1 task(s) · /tasks`）ので `worker_status` の \
              `background_work` はその内訳を返すが、**この申告は生成中も同じ形で出る** \
              （#120 / #1015 の採取）ため claude と違ってターン終了の根拠には使わない \
-             （`wait::declaration_implies_turn_end`）",
+             （`wait::declaration_implies_turn_end`）。\
+             **claude の入力欄は属性で読む**（#1297・2026-09-09 本番観測）: claude は空欄へ \
+             AI のゴースト提案を dim で描くので、文字列だけで「空か」を見ると提案が \
+             人の下書きに見えて覆せない（本番 pane 1636 / 1761 / 1775 / 1784 が永久 busy）。\
+             判定は `read_pane` の `input_status.style` と同じ 1 実装 \
+             （`screen::analyze_input_line`）を通し、ghost / none は下書きなし・\
+             user / mixed は下書きありとして扱う。属性の取れない素の tmux capture では \
+             従来の文字列判定へ落ち、`worker_status` の `idle_override_blocked` に \
+             `input_draft_unreadable` を残す",
         ),
     },
     AgentFeature {

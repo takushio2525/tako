@@ -64,3 +64,8 @@
 - #638 の同型を `config_io::atomic_write` へ。ロック無しで呼ぶ経路は 11 か所（`with_backup` 経由込み。Issue にコメントで列挙）で、legacy 実測は 3 形 = `len=0`（空 = #169 の全消失の入口）/ 短い本文が長い本文の先頭を潰した `len=5610` / rename の ENOENT
 - tmp suffix を `.tmp.{pid}.{seq}` へ（`AtomicU64`）。`.tmp.` を含む形は保つ（共有カタログが `contains(".tmp.")` で派生を外すため。catalog のテストへ新形を追加）
 - A/B `TAKO_1313_LEGACY=1`: 8 スレッド × 100 書き込みの再現は旧 **50/50 FAILED** → 新 **0/100**（負荷 81〜99 下でも 0/50）。並行テストは**統合テスト側**へ置く（同一プロセスの `ipc::tests::連続接続でfdが漏れない` の fd 計測を押し上げるため）
+
+## 2026-09-11（#1297: 入力欄の AI ゴースト提案を「人の下書き」と読まないようにした）
+- #1273 の最後の関門（入力欄が空か）が**文字列だけ**だったので、claude が空欄へ dim で描く AI ゴースト提案が下書きに見えて覆せなかった（本番 pane 1636 / 1761 / 1775 / 1784 が永久 busy）。判定へ `read_pane` の `input_status.style` と同じ 1 実装から採った属性を渡し、ghost / none = 下書きなし・user / mixed = 下書きあり（#1273 の安全側は維持）。述語の正本は `InputStyle::is_user_draft`
+- 属性の取れない素の tmux capture は従来の文字列判定へ落とし、`worker_status` の新フィールド `idle_override_blocked=input_draft_unreadable` に理由を残す（MCP / CLI 1:1）
+- 実測: 実 PTY の dim 提案で `InputStyle::Ghost` → `status=idle` / 修正前ソースでは単体 5 本が `busy` で FAILED。A/B は `TAKO_1297_LEGACY=1`。番犬 4 本が 5 種の注入（文字列へ戻す / ghost を下書き / mixed を空 / 渡さない / 採らない）を file:line 名指しで落とす。実 claude 2.1.258 の入力欄プレースホルダが `ESC[2m` であることも隔離 tmux で確認
