@@ -17,11 +17,15 @@
 # （#1347 = PR #1337 の実測。この機序はこのリポの標準手順が毎回踏む）。
 #
 # 使い方: bash scripts/merge-pr.sh <PR番号> [--timeout <秒>] [--interval <秒>]
-# 終了コード: 0 = merge した / 1 = merge しなかった（CI 失敗・コンフリクト等）/
-#             2 = CI が揃わずタイムアウト / 3 = 引数・gh のエラー
+# 終了コード: 0 = merge した / 1 = merge しなかった（CI 失敗・BEHIND・BLOCKED・draft 等）/
+#             2 = CI が揃わずタイムアウト / 3 = 引数・gh のエラー /
+#             4 = base と衝突している（#1365。待ち側と同じ値 = 判定も案内も 1 実装）
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 衝突の判定・案内・終了コード（PR_CONFLICT_EXIT）は wait-pr-checks.sh と共有する
+# shellcheck source=lib/pr-conflict.sh
+. "${SCRIPT_DIR}/lib/pr-conflict.sh"
 
 # A/B（検出力の確認・計測専用）。1 = **修正前**のまま gh の --delete-branch に後始末を任せる
 # 腕。worktree から実行するとリモート head ブランチが消え残る（#1347）。
@@ -54,7 +58,8 @@ while [[ $# -gt 0 ]]; do
   CI が「期待するチェックが全部そろって全部緑」になるまで待ってから squash merge する
   （待ちの判定は scripts/wait-pr-checks.sh）。揃わなければ merge しない。
 
-終了コード: 0 = merge した / 1 = merge しなかった / 2 = タイムアウト / 3 = 引数・gh のエラー
+終了コード: 0 = merge した / 1 = merge しなかった / 2 = タイムアウト / 3 = 引数・gh のエラー /
+            4 = base と衝突している（取り込んで push し直す）
 USAGE
       exit 0
       ;;
@@ -90,44 +95,41 @@ fetch_pr() {
 
 pr_field() { jq -r --arg k "$1" '.[$k] // "" | tostring' <<<"${PR_JSON}"; }
 
-# merge して構わない状態かを見る。駄目なら理由を出して 1 で終わる
+# merge して構わない状態かを見る。駄目なら理由を出して終わる（衝突は 4 / それ以外は 1）
 gate_state() {
-  local phase="$1" state draft mergeable status tries
+  local phase="$1" state draft mergeable status verdict tries
   state="$(pr_field state)"
   draft="$(pr_field isDraft)"
   [[ "${state}" == "OPEN" ]] || refuse "PR #${PR} は OPEN ではない（${state}）"
   [[ "${draft}" != "true" ]] || refuse "PR #${PR} は draft のまま"
 
-  # mergeable は GitHub が遅延計算するので UNKNOWN は数回待つ
+  # mergeable は GitHub が遅延計算するので、確定しないあいだは数回待つ
   tries=0
   while :; do
     mergeable="$(pr_field mergeable)"
     status="$(pr_field mergeStateStatus)"
-    [[ "${mergeable}" == "UNKNOWN" ]] || break
+    verdict="$(pr_conflict_verdict "${mergeable}" "${status}")"
+    [[ "${verdict}" == "unknown" ]] || break
     tries=$((tries + 1))
     if [[ ${tries} -ge 5 ]]; then
-      echo "警告: mergeable が UNKNOWN のまま（${phase}）。gh pr merge の判断に任せる" >&2
+      echo "警告: mergeable が確定しない（値 '${mergeable}' / ${phase}）。gh pr merge の判断に任せる" >&2
       break
     fi
     sleep 3
     fetch_pr
   done
 
-  case "${mergeable}" in
-    CONFLICTING)
-      refuse "PR #${PR} は main と衝突している（mergeable=CONFLICTING / ${status}）。
-  ローカルで main を取り込んでから push し直す:
-    git fetch origin && git merge origin/main && git push"
-      ;;
-  esac
+  # base と衝突している = merge できないだけでなく **CI の run も作られない**（#1365）。
+  # 判定も案内文も待ち側と同じ lib/pr-conflict.sh を通すので、待ちで落ちたときと同じ言い方になる
+  if [[ "${verdict}" == "conflicting" ]]; then
+    pr_conflict_report merge "${PR}" "$(pr_field baseRefName)" "${mergeable}" "${status}"
+    exit "${PR_CONFLICT_EXIT}"
+  fi
   case "${status}" in
     BEHIND)
       refuse "PR #${PR} のブランチが main より古い（mergeStateStatus=BEHIND）。
   ローカルで main を取り込んでから push し直す:
     git fetch origin && git merge origin/main && git push"
-      ;;
-    DIRTY)
-      refuse "PR #${PR} は merge できない状態（mergeStateStatus=DIRTY）"
       ;;
     BLOCKED)
       refuse "PR #${PR} は保護ルールで止まっている（mergeStateStatus=BLOCKED）"
@@ -202,7 +204,12 @@ echo
 RC=0
 "${SCRIPT_DIR}/wait-pr-checks.sh" "${PR}" ${FORWARD[@]+"${FORWARD[@]}"} || RC=$?
 if [[ ${RC} -ne 0 ]]; then
-  echo "merge しない: CI が揃っていない（wait-pr-checks.sh の終了コード ${RC}）" >&2
+  if [[ ${RC} -eq ${PR_CONFLICT_EXIT} ]]; then
+    # 待ち側が案内を出しているので繰り返さない（#1365）
+    echo "merge しない: base と衝突している（wait-pr-checks.sh の終了コード ${RC}）" >&2
+  else
+    echo "merge しない: CI が揃っていない（wait-pr-checks.sh の終了コード ${RC}）" >&2
+  fi
   exit "${RC}"
 fi
 

@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-11（#1332: remote.rs の doc が #1038 前の保証を語っていたのを実態へ）
-- モジュール doc（`remote.rs:44`）と `run_daemon` doc が「UDS のみで listen・TCP ポートを一切開かない・別 OS ユーザーは接続自体が不能」のままで、同ファイルの実装（`:135-147`）と `threat-model-remote.md` と逆を向いていた。既定 = ループバック TCP / UDS は `TAKO_REMOTE_ENDPOINT=unix` の opt-in / 失われた保証と緩和は threat-model へ誘導、の形へ
-- 横断 grep（`TCP ポートを一切` / `接続自体が不能` / `UDS + Tailscale` / `UDS 専用`）で同じ誤りが 3 か所残っていた: `protocol.rs:1137` の `RemoteStart` doc・MCP カタログ `tako_remote_start` の説明文（+ スナップショット）・`admin_request` の「UDS 専用」（実装は `local_endpoint` 経由で両対応）
-- 挙動は不変。`remote.rs` / `protocol.rs` の diff はコメント行のみであることを `git diff -U0` で機械確認
-
 ## 2026-09-11（#1317 / #1322 / #1323: docs サイトの取り残し 3 ページを実挙動へ合わせた）
 - settings（8 タブ・`--tab` は英語スラッグのみ）/ architecture（存在しない `shelve` → `background`・IPC に Windows の named pipe）/ keyboard-shortcuts（macOS / Windows の 3 列表へ作り直し）
 - 表は `keybindings.rs` から全件起こした（macOS 45 本 / Windows 45 本・差分 0）。番犬 `crates/tako-control/tests/docs_keyboard_shortcuts.rs` が両方向を検査する（注入 3 通りでキーを名指し FAILED）
@@ -68,6 +63,11 @@
 - 現状 main で `screenshots-5b.spec.js` は 9/9 PASS・PWA e2e 全 6 spec も 50/50 PASS。`cf85756`（#1089 / PR #1100）が #632 の「対応案」（モックへ `permission_dialog` / assert を `/respond` + `choice`）を既に実装していた
 - A/B（`cf85756^` の spec を現行実装へ当てる）で `.approval-card` の 10 秒タイムアウト × 3 を再現 = 症状は実在。旧契約（`/input` へ `y`/`n`）の grep は 0 件、境界の選択肢 N=2 / N=1 も一時 spec で PASS
 - コード変更なし（install 不要）。実出力を付けて #632 を close し、真因（PWA e2e が CI で 1 度も走らず、実行手順が package.json / README のどこにも無い）を #1357 として起票した
+
+## 2026-09-11（#1365: 衝突で CI の run が作られない状態を待たずに名指しで案内するようにした）
+- base が進んで衝突すると GitHub は merge コミットを作れず `pull_request` の run を作らないので、期待名が永久に未登録のまま `wait-pr-checks.sh` がタイムアウト（2400 秒）まで待っていた（#775 の PR #1359 で 3 回）。未登録が残るあいだだけ `gh pr view --json mergeable` を引き、**2 回連続**で衝突を観測したら終了コード 4 + 取り込み手順を出す形へ
+- 判定・案内文・終了コードは `scripts/lib/pr-conflict.sh` の 1 実装で、`merge-pr.sh` の門（待つ前 / merge 直前）も同じ言い方になる（CONFLICTING の拒否は 1 → 4 へ変更）。`UNKNOWN` = 計算中・空文字・`gh pr view` が引けないときは待ちを続ける
+- 実測（既定間隔 20 秒）: 21 秒・ポーリング 2 回で 4。A/B `TAKO_1365_LEGACY=1` は同じ入力で待ち続ける（上限 60 秒で打ち切り = 2）。モック 106 PASS / 0 FAIL（従来 72。Test 20〜23 を追加）
 
 ## 2026-09-11（#372: 器を持たないペインも sleep guard の busy に数えた）
 - 走査対象が器のセッションだけで、tmux 未導入 / persist OFF（cask の既定）では常に空 = `busy_agents` が無条件に 0。全ペイン対象 + 器なしは PTY 直下の子から辿る二段構え（判定 `has_running_descendants` / 数え方 `busy_count()`）へ。CLI の `status` も IPC でアプリの値を採る（保持フラグと busy はプロセスローカル static）
