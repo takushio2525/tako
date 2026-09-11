@@ -555,21 +555,59 @@ pub fn legacy_execution_refused() -> bool {
         .unwrap_or(false)
 }
 
+/// 画面 1 行が「**いまログインし直す必要がある**」と言っているか（#757 の正本）。
+///
+/// 稼働中の worker のログイン失効（OAuth リフレッシュトークンの無効化）と、
+/// 起動時の未ログインは**同じ文言で現れる**ので、語句はここ 1 か所だけに置く。
+/// 使う側は 2 つあり、**どちらの種別になるかは呼び出し側のゲートで決まる**:
+///
+/// - [`detect_launch_failure`]（送達の証拠がまだ無い worker に限る）
+///   → `AgentCliProblem::NotAuthenticated` → `WorkerErrorKind::LaunchFailed`（`fix_launch`）
+/// - `orchestrator::wait::detect_worker_error`（停止確定後の画面）
+///   → `WorkerErrorKind::LoginExpired`（`relogin`）
+///
+/// 語句は**実採取のみ**（#757 の観測 3 件 + #983 で採ってあった `OAuth session expired`）。
+/// `/login` / `sign in` のような 1 語は採らない —— 画面には agent の作業出力が流れるので、
+/// コードやドキュメントに `login` と書いてあるだけで反応してしまう
+/// （`agent_models::looks_unauthenticated` はコマンドの stderr を見る用なので 1 語も拾う）
+pub fn login_expired_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    LOGIN_EXPIRED_PHRASES
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+/// 「ログインし直す必要がある」と読める語句（すべて小文字。#757 / #983 の実採取）。
+///
+/// - `oauth refresh token is no longer valid` = #757 の実観測
+///   （`OAuth refresh token is no longer valid; run /login to re-authenticate`）
+/// - `oauth session expired` = #983 で採ってあった同型の文言
+/// - `login expired` = #757 の実観測 `Login expired · Please run /login` の前半。
+///   中黒で 2 文へ割れているので**前半・後半を別の語句として持つ**
+///   （狭いペインでは行が割れる = #1123。折り返しの結合とも両立させる）
+/// - `please run /login` = 同じ行の後半。単独で出る観測もある
+const LOGIN_EXPIRED_PHRASES: [&str; 4] = [
+    "oauth refresh token is no longer valid",
+    "oauth session expired",
+    "login expired",
+    "please run /login",
+];
+
 /// 画面 1 行が「ログインしていない」と言っているか（**実採取の文言だけ**）。
 ///
-/// `agent_models::looks_unauthenticated` はコマンドの stderr を見る用で
-/// `login` / `sign in` のような 1 語も拾う。画面は agent の作業出力が流れるので
-/// そのままでは誤検知する（コードに `login` と書いてあるだけで反応してしまう）
+/// 失効の語句は [`login_expired_line`] が正本（#757）。ここはそれに、起動時にだけ
+/// 現れる形（`not logged in` / `invalid api key` 等）を足したもの
 fn looks_unauthenticated_screen(line: &str) -> bool {
+    if login_expired_line(line) {
+        return true;
+    }
     let lower = line.to_ascii_lowercase();
     [
         "not logged in",
-        "oauth session expired",
         "please sign in",
         "please log in",
         "without arguments to sign in",
         "invalid api key",
-        "please run /login",
     ]
     .iter()
     .any(|needle| lower.contains(needle))

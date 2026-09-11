@@ -782,4 +782,32 @@ try again at Aug 28th, 2026 4:24 AM.
             ))
         ));
     }
+
+    /// #757: ログイン失効も**自動復帰の追跡を作らない**。
+    /// 解除を待つ相手が居ないので、追跡を作ると解除時刻不明のまま待ち続けることになる
+    /// （直せるのはユーザーの再ログインだけ）。worker の異常としては検知される
+    #[test]
+    fn issue757_ログイン失効は自動復帰を作らない() {
+        let src = WRAPPED_SESSION_LIMIT_IDLE.replace(
+            "  ⎿  You've hit your
+     session limit ·
+     resets 5:50am
+     (Asia/Tokyo)
+     /usage-credits to
+     request more usage
+     from your admin.
+",
+            "  ⎿  OAuth refresh token is no longer valid; run /login to re-authenticate
+",
+        );
+        assert!(
+            detect_limit_stop(&screen(&src), OBSERVED, JST).is_none(),
+            "ログイン失効で解除待ちの追跡を作ってはいけない"
+        );
+        let joined: String = screen(&src).join("\n");
+        assert!(matches!(
+            crate::orchestrator::wait::detect_worker_error(&joined),
+            Some((crate::orchestrator::wait::WorkerErrorKind::LoginExpired, _))
+        ));
+    }
 }
