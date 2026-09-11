@@ -69,3 +69,8 @@
 - `backend::psmux::ensure_conf` が `new-session -f` の直前に最終パスへ直書きしていた（#625 の機序③が psmux 側に残存）。`write_conf_in`（pid + 連番の tmp → rename・rename 失敗時は tmp を掃除）へ寄せ、tmux 側（#625）と同じ作法に揃えた。**内容が同じなら書かない**ので、2 回目以降の spawn は最終パスに触らない（Windows の `FILE_SHARE_DELETE` 依存の置換そのものを避ける）
 - A/B `TAKO_1314_LEGACY=1`（修正前の直書き）: 8 スレッド × 200 書き込みの再現テストが旧アーム **60/60 FAILED**（`len=0` / 短い本文が長い本文の先頭を潰した `len=55296`）→ 新アーム 0/60・負荷下（load 8 / 55〜60）0/50 × 2
 - **Windows CI で tako-core のテストが 1 件も走っていなかった**（`cargo test --workspace` は非ブロッキング + #583 で打ち切り）ので、#1282 と同じ形で `backend::psmux` の実行検査を blocking ステップとして追加。実機確認は Windows 機が offline のため Issue に手順を残した
+
+## 2026-09-11（#1318 #1321: README のリモート transport と `tako --help` の説明を実態へ）
+- README の日英を #1038 後の実態（Tailscale `serve` → ループバック TCP `127.0.0.1` のエフェメラルポート・LAN / 外部から到達不可）へ。事実に反する「TCP ポートを一切開きません」を削除し、`tako remote --help` の `Tailscale Serve + UDS` も同じ形へ
+- #982 で `AgentSupport` が `Platform` の doc の上へ挿し込まれ 3 行すべてが agent-support の説明になっていたのを分離。`platform` は `PlatformArgs` の「参照引数」露出をやめて自前の doc を持つ（`--help` 実出力で確認）
+- 挙動は不変（doc コメント / README のみ）。`remote.rs:45` / `:1473` の同じ #1038 前の記述は #1332 へ切り出した
