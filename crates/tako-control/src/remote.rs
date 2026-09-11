@@ -41,11 +41,15 @@
 //!
 //! PWA は daemon 自身が配信する（同一 origin・バージョン一致。公開 Pages 配信は廃止）。
 //!
-//! transport（Issue #282 + #287 P1-2: UDS + Tailscale Serve）:
-//! - daemon は Unix domain socket（0600）のみで listen し、TCP ポートは一切開かない。
-//!   `tailscale serve` が HTTPS:443 → `unix:<socket path>` のプロキシとして tailnet 内へ
-//!   公開する（WireGuard E2E 暗号化・public internet に入口を持たない）。
-//!   別 OS ユーザーは socket パーミッションにより接続自体が不能
+//! transport（Issue #282 + #287 P1-2 → #1038 で既定をループバック TCP へ）:
+//! - daemon の待ち受けは既定が**ループバック TCP**（`127.0.0.1:<エフェメラルポート>`）。
+//!   `tailscale serve` が HTTPS:443 → そのローカルエンドポイントのプロキシとして
+//!   tailnet 内へ公開する（WireGuard E2E 暗号化・public internet に入口を持たない）。
+//!   LAN や外部インタフェースへはバインドしない
+//! - Unix domain socket（0600）は `TAKO_REMOTE_ENDPOINT=unix` を明示したときだけの
+//!   互換経路。**既定の TCP では「別 OS ユーザーは接続自体が不能」という UDS の保証は
+//!   成り立たない**（トレードオフと緩和は `.agent/threat-model-remote.md` / #841）。
+//!   実体とプラットフォーム差は `platform::local_endpoint` が持つ
 //! - 接続リンクは恒久固定の `https://<ホスト名>.<tailnet>.ts.net`（MagicDNS 名。
 //!   serve の off → 再設定でも不変。弾 0 実測 `.agent/investigations/tailscale-serve-poc.md`）
 //! - Tailscale 未セットアップ（未導入・デーモン未起動・未ログイン・HTTPS 未有効）での
@@ -1470,10 +1474,13 @@ fn probe_serve(base_url: &str, timeout: std::time::Duration) -> ServeReachabilit
 /// 独立デーモンとして HTTP サーバーを起動し、SIGTERM まで待機する。
 /// `tako remote serve` から呼ばれる内部用関数。
 ///
-/// transport 方針（#287 P1-2 根治）: TCP ポートを一切 listen せず、Unix domain socket
-/// （0600）のみで待ち受ける。`tailscale serve` が `unix:<socket path>` をバックエンドと
-/// して tailnet 内へ HTTPS プロキシする。別 OS ユーザーは接続自体が不能になり、
-/// XFF/XFH 偽装の攻撃経路が構造的に消滅する。
+/// transport 方針（#287 P1-2 → #1038）: 待ち受けの実体は `platform::local_endpoint` が
+/// 決め、既定はループバック TCP（`127.0.0.1:<エフェメラルポート>`）。`tailscale serve` が
+/// それをバックエンドとして tailnet 内へ HTTPS プロキシする。`TAKO_REMOTE_ENDPOINT=unix`
+/// のときだけ Unix domain socket（0600）で待ち受ける。
+/// TCP では「別 OS ユーザーは接続自体が不能」「XFF/XFH 偽装の経路が構造的に消滅」は
+/// 成り立たないので、緩和（127.0.0.1 限定のバインド・毎回エフェメラルなポート・管理 API は
+/// XFF 付きを常に拒否）で受ける（`.agent/threat-model-remote.md` / #841）。
 /// Tailscale が未セットアップなら不足項目を列挙して起動を拒否する
 pub fn run_daemon() -> io::Result<()> {
     // #1077: daemon は表示言語を初期化していなかったため、応答に載る `Note` 由来の文言
@@ -2745,8 +2752,10 @@ fn kill_stale_daemon(pid: u32) {
 // `.agent/requirements.md`）。devices list / revoke は CLI / MCP にも公開する。
 // 認証はローカル管理トークン（state_dir の token ファイル、0600 = 同一ユーザーのみ）。
 
-/// 稼働中 daemon の admin API を叩く最小 HTTP クライアント（UDS 専用）。
-/// 外部依存を増やさないため std UnixStream + HTTP/1.1 の自前実装
+/// 稼働中 daemon の admin API を叩く最小 HTTP クライアント。
+/// 待ち受けの実体（既定 = ループバック TCP / `TAKO_REMOTE_ENDPOINT=unix` = UDS）は
+/// `platform::local_endpoint` が吸収するので、ここは HTTP/1.1 を自前で組むだけ
+/// （外部依存を増やさないため）
 pub fn admin_request(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
     let status = daemon_status();
     if status["running"].as_bool() != Some(true) {
