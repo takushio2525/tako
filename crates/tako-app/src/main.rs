@@ -38389,29 +38389,35 @@ mod self_test {
             // 新ペインへ移す（後続テストは新ペインからの入力を前提とする）。
             // ペイン数が増えるまでリトライで待つ（項目 17 と同型のフレーキー対策）
             type_text(any, cx, &format!("{cli} split --down --focus"), true);
-            let mut split_state = None;
-            for _ in 0..8 {
-                wait(cx, 1500).await;
-                let state = window
-                    .update(cx, |app, _, _| {
-                        let tree = app.workspace.active_tab().tree();
-                        let focused = tree.focused();
-                        (
-                            tree.len(),
-                            focused,
-                            tree.get(focused).map(|p| p.origin()) == Some(PaneOrigin::Cli),
-                        )
-                    })
-                    .unwrap_or_else(|_| fail("tako split 後の状態取得"));
-                let done = state.0 == 2;
-                split_state = Some(state);
-                if done {
-                    break;
-                }
-            }
-            let (pane_count, pane4, origin_cli) =
-                split_state.unwrap_or_else(|| fail("tako split 後の状態取得"));
-            check(pane_count == 2, "tako split で 2 ペイン");
+            // #1375: 旧実装は 8 × 1500ms = **固定 12 秒窓**。待つ相手は「ペインが 2 枚に
+            //         なって**新しい**ペインへフォーカスが移ること」なので状態で待つ。
+            //         `focused()` だけを見ると分割が届く前に分割元で真になる
+            //         （= #1364 / #1367 73g と同じ偽陽性）ので、打つ前のペインと比べる
+            let split_ok = wait_for_cli_state(
+                window,
+                cx,
+                "18",
+                "18: tako split --down --focus が新ペインへフォーカスを移す",
+                Duration::from_millis(12000),
+                Duration::from_secs(20),
+                move |app| {
+                    let tree = app.workspace.active_tab().tree();
+                    tree.len() == 2 && tree.focused() != pane2
+                },
+            )
+            .await;
+            let (pane_count, pane4, origin_cli) = window
+                .update(cx, |app, _, _| {
+                    let tree = app.workspace.active_tab().tree();
+                    let focused = tree.focused();
+                    (
+                        tree.len(),
+                        focused,
+                        tree.get(focused).map(|p| p.origin()) == Some(PaneOrigin::Cli),
+                    )
+                })
+                .unwrap_or_else(|_| fail("tako split 後の状態取得"));
+            check(split_ok && pane_count == 2, "tako split で 2 ペイン");
             check(pane4 != pane2, "split --focus 後フォーカスは新ペイン");
             check(origin_cli, "新ペインの origin は cli");
 
@@ -38427,21 +38433,23 @@ mod self_test {
                 ),
                 true,
             );
-            let mut sent = false;
-            for _ in 0..8 {
-                wait(cx, 1200).await;
-                sent = window
-                    .update(cx, |app, _, _| {
-                        app.terminals
-                            .get(&pane2)
-                            .map(|s| s.visible_lines().iter().any(|l| l.contains("TAKO-SEND-42")))
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-                if sent {
-                    break;
-                }
-            }
+            // #1375: 旧実装は 8 × 1200ms = 固定 9.6 秒窓。証拠源は**送り先ペイン**の
+            //         画面（フォーカスではない = #1175 / #1364 の「流れない場所から採る」）
+            let sent = wait_for_cli_state(
+                window,
+                cx,
+                "19",
+                "19: tako send の本文が送り先ペインの画面へ出る",
+                Duration::from_millis(9600),
+                Duration::from_secs(20),
+                move |app| {
+                    app.terminals
+                        .get(&pane2)
+                        .map(|s| s.visible_lines().iter().any(|l| l.contains("TAKO-SEND-42")))
+                        .unwrap_or(false)
+                },
+            )
+            .await;
             check(sent, "tako send で別ペインへ送信");
 
             // 20. tako read で別ペインの画面内容を取得する（FR-2.2.5。
@@ -41067,23 +41075,22 @@ mod self_test {
                 .unwrap_or_else(|_| fail("FR-2.12 開始時の状態取得"));
             press(any, cx, sh.clear_line_key());
             type_text(any, cx, &format!("{cli} tab rename 実験タブ"), true);
-            let mut renamed = false;
-            for _ in 0..15 {
-                wait(cx, 200).await;
-                renamed = window
-                    .update(cx, |app, _, _| {
-                        app.workspace
-                            .get_tab(active_tab)
-                            .map(|t| {
-                                t.title() == "実験タブ" && t.title_source() == TitleSource::Manual
-                            })
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-                if renamed {
-                    break;
-                }
-            }
+            // #1375: 旧実装は 15 × 200ms = 固定 3 秒窓
+            let renamed = wait_for_cli_state(
+                window,
+                cx,
+                "50",
+                "50: tako tab rename がタブ名を手動扱いで書き換える",
+                Duration::from_millis(3000),
+                Duration::from_secs(20),
+                move |app| {
+                    app.workspace
+                        .get_tab(active_tab)
+                        .map(|t| t.title() == "実験タブ" && t.title_source() == TitleSource::Manual)
+                        .unwrap_or(false)
+                },
+            )
+            .await;
             check(renamed, "tako tab rename（手動扱い）");
 
             // 51. 自動リネームの適用と手動優先（FR-2.12.3）: 手動のタブ・ペインは
@@ -41149,24 +41156,24 @@ mod self_test {
             // CLI（= MCP と同じ dispatch）から固定解除 → 自動リネームが再開する
             press(any, cx, sh.clear_line_key());
             type_text(any, cx, &format!("{cli} tab pin --off"), true);
-            let mut released = false;
-            for _ in 0..15 {
-                wait(cx, 200).await;
-                released = window
-                    .update(cx, |app, _, _| {
-                        app.workspace
-                            .get_tab(active_tab)
-                            .map(|t| {
-                                t.title() == "自動タブ"
-                                    && t.title_source() == TitleSource::Default
-                            })
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-                if released {
-                    break;
-                }
-            }
+            // #1375: 旧実装は 15 × 200ms = 固定 3 秒窓
+            let released = wait_for_cli_state(
+                window,
+                cx,
+                "51b",
+                "51b: tako tab pin --off が固定を解除する",
+                Duration::from_millis(3000),
+                Duration::from_secs(20),
+                move |app| {
+                    app.workspace
+                        .get_tab(active_tab)
+                        .map(|t| {
+                            t.title() == "自動タブ" && t.title_source() == TitleSource::Default
+                        })
+                        .unwrap_or(false)
+                },
+            )
+            .await;
             check(released, "tako tab pin --off で固定を解除できる");
 
             // 52. tako autorename の ON/OFF と状態取得（FR-2.12.4。CLI / MCP と同じ
@@ -43113,20 +43120,22 @@ mod self_test {
                 )),
                 true,
             );
-            let mut cli_open_ok = false;
-            for _ in 0..10 {
-                wait(cx, 300).await;
-                cli_open_ok = window
-                    .update(cx, |app, _, _| {
-                        app.previews
-                            .values()
-                            .any(|p| p.path.ends_with("note.md") && p.markdown_capable())
-                    })
-                    .unwrap_or(false);
-                if cli_open_ok {
-                    break;
-                }
-            }
+            // #1375: 旧実装は 10 × 300ms = 固定 3 秒窓。ロードのキューを回すのは
+            //         **IPC 受信ループ**（実 CLI 経由なのでここは自分で drain しない）
+            let cli_open_ok = wait_for_cli_state(
+                window,
+                cx,
+                "66b",
+                "66b: tako open CLI が md プレビューを開く",
+                Duration::from_millis(3000),
+                Duration::from_secs(20),
+                |app| {
+                    app.previews
+                        .values()
+                        .any(|p| p.path.ends_with("note.md") && p.markdown_capable())
+                },
+            )
+            .await;
             check(cli_open_ok, "tako open CLI でプレビューが開く");
 
             // 66b-2. プレビュー座標の機械検証（#145）。描画に使った GPUI TextLayout の
@@ -72400,13 +72409,8 @@ mod selftest_wait_watchdog {
     /// リストは**減る方向にしか動かさない**（下のテストが、直したのに残っている
     /// エントリを落とす）。キーは `check` のラベル
     const KNOWN_FIXED_CLI_WAITS: &[&str] = &[
-        "tako split で 2 ペイン",
-        "tako send で別ペインへ送信",
         "ペインの × ボタンで kill（dispatch 経由）",
         "ペインの ー ボタンでバックグラウンド（dispatch 経由）",
-        "tako tab rename（手動扱い）",
-        "tako tab pin --off で固定を解除できる",
-        "tako open CLI でプレビューが開く",
         "確認ダイアログ: cmd+クリックでスキップ",
         "確認ダイアログ: 通常ペインの cmd+W は確認なしで即 close（#566）",
     ];
