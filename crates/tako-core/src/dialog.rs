@@ -242,7 +242,7 @@ fn detect_choice_list_in(lines: &[&str]) -> Option<ChoiceList> {
 
     // 経路 1: 番号つき（カーソルが `N. …` を指している + 画面に 2 つ以上）
     if numbered_choice(content).is_some() {
-        let numbered = numbered_rows(lines, bottom);
+        let numbered = numbered_block(lines, bottom, cursor_row);
         if numbered.len() >= 2 {
             return Some(numbered_list(lines, &numbered, cursor_row));
         }
@@ -307,7 +307,7 @@ fn detect_choice_list_in(lines: &[&str]) -> Option<ChoiceList> {
         options,
         highlighted,
         numbered: false,
-        header: header_block(lines, *rows.first().unwrap_or(&cursor_row)),
+        header: header_block(lines, &rows),
         cursor_row: Some(cursor_row),
     })
 }
@@ -315,7 +315,8 @@ fn detect_choice_list_in(lines: &[&str]) -> Option<ChoiceList> {
 // --- 番号つき経路の共通部と「入力欄の上のダイアログ」（#1263） ---
 
 /// 画面の `to` 行までにある番号つき選択肢の行（選択カーソル行も含む）。
-/// 経路 1 と経路 4（#1263）で共有する
+/// **画面全体が対象**なので、これをそのまま選択肢一覧にしてはいけない（#1293）。
+/// 生きたダイアログの並びを採るのは [`numbered_block`]
 fn numbered_rows(lines: &[&str], to: usize) -> Vec<usize> {
     (0..to)
         .filter(|&i| {
@@ -323,6 +324,119 @@ fn numbered_rows(lines: &[&str], to: usize) -> Vec<usize> {
             numbered_choice(inner).is_some()
         })
         .collect()
+}
+
+/// その行の番号（番号つき選択肢でなければ `None`）
+fn numbered_value(line: &str) -> Option<u32> {
+    let inner = cursor_content(line).unwrap_or_else(|| strip_indent(line));
+    numbered_choice(inner).map(|(n, _)| n)
+}
+
+/// 選択カーソル行 `anchor` と**連続している**番号つき行だけを採る（#1293）。
+///
+/// 会話ログの番号つき箇条書き（claude は日常的に書く）は字面が選択肢と同じなので、
+/// 画面全体から番号つき行を集めると生きたダイアログの一覧へ混ざる。実測（#1293）では
+/// 3 択のダイアログが 6 択・番号重複・タイトルが会話本文、という一覧になり、master は
+/// その一覧で番号を決めるので誤選択・監査ログの嘘・存在しない番号キーの送信が起きる。
+///
+/// カーソルの探索は元から末尾 [`SCAN_ROWS`] 行に絞ってあった（= 起点は生きた画面に限る）
+/// のに、**収集だけが画面全体**という非対称がそのまま穴だった。ここでは起点から上下へ
+/// 次の 2 つを両方満たすあいだだけ伸ばす:
+///
+/// - あいだに挟まる行が**ダイアログの一部だけ**（[`numbered_gap_ok`]。空行 /
+///   説明列の折り返し / 確定キーの案内 / 罫線。実採取の AskUserQuestion は
+///   選択肢のあいだに罫線が入る = 跨げないと 5 択が 4 択になる）
+/// - 番号が**1 ずつ増える**（会話ログの `1. 2.` がダイアログの `1. 2. 3.` の
+///   直上に空行なしで続く形は、あいだが空でも番号の並びで切れる）
+fn numbered_block(lines: &[&str], to: usize, anchor: usize) -> Vec<usize> {
+    let all = numbered_rows(lines, to);
+    if legacy_numbered_block() {
+        return all;
+    }
+    let Some(pos) = all.iter().position(|&i| i == anchor) else {
+        return Vec::new();
+    };
+    let follows = |upper: usize, lower: usize| {
+        numbered_gap_ok(lines, upper, lower)
+            && matches!(
+                (numbered_value(lines[upper]), numbered_value(lines[lower])),
+                (Some(a), Some(b)) if a + 1 == b
+            )
+    };
+    let mut above: Vec<usize> = Vec::new();
+    let mut cur = anchor;
+    for &i in all[..pos].iter().rev() {
+        if !follows(i, cur) {
+            break;
+        }
+        above.push(i);
+        cur = i;
+    }
+    above.reverse();
+    let mut block = above;
+    block.push(anchor);
+    let mut cur = anchor;
+    for &i in &all[pos + 1..] {
+        if !follows(cur, i) {
+            break;
+        }
+        block.push(i);
+        cur = i;
+    }
+    block
+}
+
+/// ダイアログの行のあいだに挟まってよい行の種類（#1263 / #1293 の共通判定）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GapLine {
+    /// 空行
+    Blank,
+    /// 説明列 / ラベルの折り返し（中身の桁以上へ字下げされた行）
+    Continuation,
+    /// 確定キーの案内（`Enter to confirm · Esc to cancel` 等）
+    KeyHint,
+    /// 罫線（箱の境界。実採取の AskUserQuestion は選択肢のあいだにも引かれる）
+    Rule,
+    /// ダイアログの一部でない行（会話ログの本文・生成中インジケータ）
+    Foreign,
+}
+
+/// ダイアログの行のあいだに挟まった 1 行を分類する（#1293 で 1 実装へ寄せた）。
+///
+/// `content_col` は**上側の行の中身が始まる桁**（[`content_start_column`]）。
+/// 折り返しの続きは必ずそこ以上へ字下げされるので、それより浅い非空行は
+/// 案内でも罫線でもなければダイアログの外（= 会話ログ）とみなす
+fn gap_line_kind(line: &str, content_col: usize) -> GapLine {
+    if line.trim().is_empty() {
+        return GapLine::Blank;
+    }
+    if line.chars().take_while(|c| *c == ' ').count() >= content_col {
+        return GapLine::Continuation;
+    }
+    if is_key_hint(line) {
+        return GapLine::KeyHint;
+    }
+    if is_rule_line(line) {
+        return GapLine::Rule;
+    }
+    GapLine::Foreign
+}
+
+/// `upper` 行と `lower` 行のあいだが、ダイアログの一部だけでできているか（#1293）
+fn numbered_gap_ok(lines: &[&str], upper: usize, lower: usize) -> bool {
+    let content_col = content_start_column(lines[upper]).unwrap_or(0);
+    lines
+        .get(upper + 1..lower)
+        .unwrap_or_default()
+        .iter()
+        .all(|l| gap_line_kind(l, content_col) != GapLine::Foreign)
+}
+
+/// `TAKO_1293_LEGACY=1` で #1293 前（番号つき行を画面全体から拾う・本文の境界は
+/// 罫線だけ）へ戻す（A/B 用）
+fn legacy_numbered_block() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_1293_LEGACY").is_some())
 }
 
 /// 番号つきの行から `ChoiceList` を組む（経路 1 と経路 4 の共通部）
@@ -333,7 +447,7 @@ fn numbered_list(lines: &[&str], numbered: &[usize], cursor_row: usize) -> Choic
         options,
         highlighted,
         numbered: true,
-        header: header_block(lines, numbered.first().copied().unwrap_or(cursor_row)),
+        header: header_block(lines, numbered),
         cursor_row: Some(cursor_row),
     }
 }
@@ -370,7 +484,7 @@ fn numbered_above_empty_input(
     let cursor_row = (scan_from..input_row)
         .rev()
         .find(|&i| cursor_content(lines[i]).is_some_and(|c| numbered_choice(c).is_some()))?;
-    let numbered = numbered_rows(lines, input_row);
+    let numbered = numbered_block(lines, input_row, cursor_row);
     if numbered.len() < 2 {
         return None;
     }
@@ -396,13 +510,11 @@ fn dialog_reaches_input_box(lines: &[&str], last_row: usize, input_row: usize) -
     let content_col = content_start_column(lines[last_row]).unwrap_or(0);
     let mut hint = false;
     for line in lines.get(last_row + 1..input_row).unwrap_or_default() {
-        if line.trim().is_empty() || line.chars().take_while(|c| *c == ' ').count() >= content_col {
-            continue; // 空行 / 説明列の折り返し
-        }
-        if is_key_hint(line) {
-            hint = true;
-        } else if !is_rule_line(line) {
-            return false; // ダイアログの一部でない行が挟まっている（= 会話ログの残骸）
+        match gap_line_kind(line, content_col) {
+            // ダイアログの一部でない行が挟まっている（= 会話ログの残骸）
+            GapLine::Foreign => return false,
+            GapLine::KeyHint => hint = true,
+            GapLine::Blank | GapLine::Continuation | GapLine::Rule => {}
         }
     }
     hint
@@ -565,6 +677,7 @@ fn detect_cursorless_numbered(lines: &[&str], bottom: usize) -> Option<ChoiceLis
     let indent = indent_of(last);
     let mut rows = vec![last];
     let mut want = numbered_at(last)?;
+    let mut prev = last;
     for i in (0..last).rev() {
         let Some(n) = numbered_at(i) else {
             continue;
@@ -572,8 +685,14 @@ fn detect_cursorless_numbered(lines: &[&str], bottom: usize) -> Option<ChoiceLis
         if indent_of(i) != indent || n + 1 != want {
             break;
         }
+        // 経路 1 / 4 と同じ限定（#1293）。あいだに会話ログの本文が挟まる並びは
+        // 「同じ一覧」ではない
+        if !legacy_numbered_block() && !numbered_gap_ok(lines, i, prev) {
+            break;
+        }
         rows.push(i);
         want = n;
+        prev = i;
     }
     rows.reverse();
     if rows.len() < 2 {
@@ -613,7 +732,7 @@ fn detect_cursorless_numbered(lines: &[&str], bottom: usize) -> Option<ChoiceLis
         options,
         highlighted: None,
         numbered: true,
-        header: header_block(lines, first),
+        header: header_block(lines, &rows),
         cursor_row: None,
     })
 }
@@ -983,16 +1102,46 @@ fn framed_as_input_box(
     }
 }
 
-/// 選択肢の直前にあるダイアログ本文を集める。
+/// 選択肢の直前にあるダイアログ本文を集める（= `ChoiceDialog.title` の材料）。
 ///
 /// 画面全体を採ると上端のバナー・cwd・ユーザー発話まで入るため、**罫線に当たったら
 /// それまでのブロックを捨てる**（ダイアログの箱の内側だけを残す。#425 の実採取由来）。
-/// 空行は境界にしない（claude の実ダイアログは本体に空行を挟む）
-fn header_block(lines: &[&str], first_option_row: usize) -> Vec<String> {
+/// 空行は境界にしない（claude の実ダイアログは本体に空行を挟む）。
+///
+/// #1293 で境界を 2 つ足した。罫線を 1 本も引かない画面（auto mode の環境学習の確認）
+/// では会話ログがそのまま本文へ入り、master が「（会話本文）を選んだ」という嘘の
+/// 監査行を書くところまで繋がっていた:
+///
+/// - **並びが字下げして描かれているなら、0 桁から始まる非空行は箱の中ではありえない**。
+///   実採取の会話ログ（claude の応答・発話・生成中インジケータ）は必ず 0 桁で、
+///   ダイアログの箱は 1 桁以上（実採取 1〜5 桁）へ字下げされる。箱ごと 0 桁で描く TUI
+///   （agy の信頼ダイアログ）ではこの規則は自動的に無効 = 従来どおり罫線だけが境界
+/// - **選択肢に採らなかった番号つき行**（[`numbered_block`] が切った側）も境界にする。
+///   別の一覧がそこで終わっている証拠なので、それより上は本文ではない
+fn header_block(lines: &[&str], option_rows: &[usize]) -> Vec<String> {
+    let first_option_row = option_rows.first().copied().unwrap_or(0);
+    // 箱の左端（並びの最も浅い行）。0 = 箱ごと 0 桁で描く TUI なので会話ログと区別できない
+    let box_indent = if legacy_numbered_block() {
+        0
+    } else {
+        option_rows
+            .iter()
+            .filter_map(|&i| lines.get(i))
+            .map(|l| l.chars().take_while(|c| *c == ' ').count())
+            .min()
+            .unwrap_or(0)
+    };
     let mut block: Vec<String> = Vec::new();
     for line in lines.iter().take(first_option_row) {
         let t = line.trim();
         if t.is_empty() || is_key_hint(line) {
+            continue;
+        }
+        if !legacy_numbered_block()
+            && ((box_indent > 0 && line.chars().take_while(|c| *c == ' ').count() == 0)
+                || numbered_value(line).is_some())
+        {
+            block.clear(); // 会話ログの境界（#1293）
             continue;
         }
         let desc = t
@@ -2279,6 +2428,236 @@ Antigravity CLI requires permission to read, edit, and execute files here.
             detect_choice_list(&rows(&without_hint)).is_none(),
             "案内が無ければ入力欄の上は見ない（誤検知より非検知を採る）"
         );
+    }
+
+    // --- #1293: 会話ログの番号つき箇条書きがダイアログの選択肢へ混ざる ---
+
+    /// Issue #1293 の再現画面。claude は番号つきリストを日常的に書くので、
+    /// **会話の途中で出るダイアログ**の上には番号つき箇条書きが残っている。
+    /// 経路 4（#1263。空の入力欄の上を見る）はまさにこの形の画面を対象にしたので
+    /// 露出が大きい。origin/main = 9ab6c26 の実測は options=6・番号重複・
+    /// header が会話本文（`⏺ 直し方の候補は 3 つあります。`）
+    const LOG_LIST_ABOVE_DIALOG: &str = r#"⏺ 直し方の候補は 3 つあります。
+
+  1. 待ちを状態待ちへ寄せる
+  2. 番犬テストを足す
+  3. 何もしない
+
+⏺ 1 を採ります。
+
+  Teach auto mode about your environment?
+
+  Auto mode works better when it knows your environment. Takes about a minute.
+
+  ❯ 1. Yes
+    2. Not now
+    3. Don't show again
+
+  Enter to confirm · Esc to cancel
+────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  [model placeholder] · ctx 12%"#;
+
+    /// 同じ形の**経路 1**（入力欄が描かれない全画面ダイアログ）。
+    /// 起点が変わっても同じ限定が効くことを固定する
+    const LOG_LIST_ABOVE_DIALOG_NO_INPUT: &str = r#"⏺ 直し方の候補は 3 つあります。
+
+  1. 待ちを状態待ちへ寄せる
+  2. 番犬テストを足す
+  3. 何もしない
+
+⏺ 1 を採ります。
+
+  Teach auto mode about your environment?
+
+  Auto mode works better when it knows your environment. Takes about a minute.
+
+  ❯ 1. Yes
+    2. Not now
+    3. Don't show again
+
+  Enter to confirm · Esc to cancel"#;
+
+    /// 期待する 3 択（両経路で同じ）
+    fn expect_teach_three(list: &ChoiceList, name: &str) {
+        assert!(list.numbered, "{name}: 番号キーで確定できる一覧として組む");
+        assert_eq!(
+            list.options
+                .iter()
+                .map(|o| (o.number, o.label.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(1), "Yes".to_string()),
+                (Some(2), "Not now".to_string()),
+                (Some(3), "Don't show again".to_string()),
+            ],
+            "{name}: 会話ログの箇条書きが混ざっている"
+        );
+        assert_eq!(list.highlighted, Some(0), "{name}: 既定は 1. Yes");
+        let header = list.header.join(" ");
+        assert!(
+            header.contains("Teach auto mode about your environment?"),
+            "{name}: ダイアログの説明文が本文に入っていない: {header:?}"
+        );
+        for log in ["直し方の候補", "待ちを状態待ちへ寄せる", "1 を採ります"]
+        {
+            assert!(
+                !header.contains(log),
+                "{name}: 会話本文が title に混ざっている（{log}）: {header:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue1293_会話ログの箇条書きは選択肢にもtitleにも混ざらない() {
+        let list = detect_choice_list(&rows(LOG_LIST_ABOVE_DIALOG)).expect("経路 4 で検知される");
+        expect_teach_three(&list, "経路 4");
+        assert!(list.cursor_row.is_some(), "選択カーソルは画面に在る");
+    }
+
+    #[test]
+    fn issue1293_入力欄が無い経路1でも同じ三択になる() {
+        let list =
+            detect_choice_list(&rows(LOG_LIST_ABOVE_DIALOG_NO_INPUT)).expect("経路 1 で検知される");
+        expect_teach_three(&list, "経路 1");
+        // 入力欄の有無で結果が変わらない
+        let with_input = detect_choice_list(&rows(LOG_LIST_ABOVE_DIALOG)).expect("検知される");
+        assert_eq!(options_of(&list), options_of(&with_input));
+        assert_eq!(list.header, with_input.header);
+    }
+
+    #[test]
+    fn issue1293_箇条書きがダイアログの直上に空行なしで続いても切れる() {
+        // あいだに何も挟まらない = 「連続していない」根拠が番号の並びだけになる形
+        let text = concat!(
+            "⏺ 手順です。\n",
+            "  1. まず A をやって\n",
+            "  2. 次に B をやって\n",
+            "  ❯ 1. Yes\n",
+            "    2. Not now\n",
+            "    3. Don't show again\n",
+            "\n",
+            "  Enter to confirm · Esc to cancel"
+        );
+        let list = detect_choice_list(&rows(text)).expect("検知される");
+        assert_eq!(
+            list.options.len(),
+            3,
+            "番号が 1 へ戻るところで切れていない: {:?}",
+            list.options
+        );
+        assert_eq!(list.options[0].label, "Yes");
+        assert_eq!(list.highlighted, Some(0));
+    }
+
+    #[test]
+    fn issue1293_丸括弧の箇条書きは番号つき行として拾わない() {
+        // `1)` 形式（`numbered_choice` は `N. ` だけを番号とみなす）は選択肢に
+        // ならないのはもちろん、**並びをそこで切る側**（`GapLine::Foreign`）にも効く。
+        // 実採取どおり claude の応答ブロックは 0 桁の marker で始まる形にする
+        let text = concat!(
+            "⏺ 直し方の候補は 2 つあります。\n",
+            "  1) 待ちを状態待ちへ寄せる\n",
+            "  2) 番犬テストを足す\n",
+            "\n",
+            "⏺ 1 を採ります。\n",
+            "\n",
+            "  Teach auto mode about your environment?\n",
+            "\n",
+            "  ❯ 1. Yes\n",
+            "    2. Not now\n",
+            "\n",
+            "  Enter to confirm · Esc to cancel"
+        );
+        let list = detect_choice_list(&rows(text)).expect("検知される");
+        assert_eq!(list.options.len(), 2, "{:?}", list.options);
+        assert_eq!(list.options[0].label, "Yes");
+        assert_eq!(list.options[1].label, "Not now");
+        let header = list.header.join(" ");
+        assert!(header.contains("Teach auto mode"), "{header:?}");
+        assert!(!header.contains("待ちを状態待ちへ寄せる"), "{header:?}");
+    }
+
+    #[test]
+    fn issue1293_箱と同じ桁の会話ログは本文に残る_限界の固定() {
+        // **境界は 0 桁の marker と番号つき行だけ**。claude の応答ブロックは必ず
+        // 0 桁の marker で始まるので実画面では効くが、その marker が画面の上へ
+        // 流れ切った形では箱と同じ桁の残骸が本文に残る。選択肢は汚れない
+        // （= master が選ぶ番号は正しい）ことだけを保証する範囲だと明示しておく
+        let text = concat!(
+            "  1) 会話ログの残骸\n",
+            "\n",
+            "  Teach auto mode about your environment?\n",
+            "\n",
+            "  ❯ 1. Yes\n",
+            "    2. Not now\n",
+            "\n",
+            "  Enter to confirm · Esc to cancel"
+        );
+        let list = detect_choice_list(&rows(text)).expect("検知される");
+        assert_eq!(
+            list.options.len(),
+            2,
+            "選択肢は汚れない: {:?}",
+            list.options
+        );
+        assert!(
+            list.header.join(" ").contains("会話ログの残骸"),
+            "この限界が消えたら（別の境界を足したら）ここを更新する: {:?}",
+            list.header
+        );
+    }
+
+    #[test]
+    fn issue1293_二桁番号の一覧は会話ログの上でも全件取れる() {
+        // 10 個以上の選択肢（2 桁）+ その上に会話ログの箇条書き。
+        // 「連続の打ち切り」が多桁の一覧を途中で切らないこと
+        let mut screen = vec![
+            "⏺ 候補を挙げます。".to_string(),
+            String::new(),
+            "  1. 会話ログの一項目".into(),
+            "  2. 会話ログの二項目".into(),
+            String::new(),
+            "⏺ ではモデルを選んでください。".into(),
+            String::new(),
+            "  どれにしますか?".into(),
+        ];
+        for n in 1..=12 {
+            screen.push(if n == 11 {
+                format!("  ❯ {n}. 選択肢 {n}")
+            } else {
+                format!("    {n}. 選択肢 {n}")
+            });
+        }
+        screen.push("  Press enter to confirm".into());
+        let refs: Vec<&str> = screen.iter().map(String::as_str).collect();
+        let list = detect_choice_list(&refs).expect("検知される");
+        assert_eq!(list.options.len(), 12, "{:?}", list.options);
+        assert_eq!(list.options[0].number, Some(1));
+        assert_eq!(list.options[11].number, Some(12));
+        assert_eq!(list.highlighted, Some(10));
+        assert_eq!(list.highlighted_label(), Some("選択肢 11"));
+        let header = list.header.join(" ");
+        assert!(header.contains("どれにしますか?"), "{header:?}");
+        assert!(!header.contains("会話ログの一項目"), "{header:?}");
+        assert!(!header.contains("候補を挙げます"), "{header:?}");
+    }
+
+    #[test]
+    fn issue1293_番号ブロックの限定は既存の実採取ダイアログを変えない() {
+        // 選択肢のあいだに罫線が入る AskUserQuestion（5 択）・説明列つきの /model（6 択）・
+        // 説明行つきの plan 確認（3 択）は「連続」の側に残る
+        for (name, text, want) in [
+            ("permission", PERMISSION, 3),
+            ("model select", MODEL_SELECT, 6),
+            ("plan confirm", PLAN_CONFIRM, 3),
+            ("AskUserQuestion", ASK_USER_QUESTION, 5),
+            ("auto mode", TEACH_AUTO_MODE, 3),
+        ] {
+            let list = detect_choice_list(&rows(text)).unwrap_or_else(|| panic!("{name} 未検知"));
+            assert_eq!(list.options.len(), want, "{name}: {:?}", list.options);
+        }
     }
 
     #[test]
