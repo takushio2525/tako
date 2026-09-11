@@ -68,3 +68,8 @@
 ## 2026-09-11（#1317 / #1322 / #1323: docs サイトの取り残し 3 ページを実挙動へ合わせた）
 - settings（8 タブ・`--tab` は英語スラッグのみ）/ architecture（存在しない `shelve` → `background`・IPC に Windows の named pipe）/ keyboard-shortcuts（macOS / Windows の 3 列表へ作り直し）
 - 表は `keybindings.rs` から全件起こした（macOS 45 本 / Windows 45 本・差分 0）。番犬 `crates/tako-control/tests/docs_keyboard_shortcuts.rs` が両方向を検査する（注入 3 通りでキーを名指し FAILED）
+
+## 2026-09-11（#1316: docs の MCP / CLI の件数と掲載漏れを直し、番犬で拘束した）
+- 実測（`mcp::tools()` = 149 / `tako --help` = 84）に対し docs は 147 / 128 / 69 / 68 を名乗り、MCP 11 ツール・CLI 10 コマンドが一覧に 1 度も出てこなかった。件数 11 か所を直し欠落を既存カテゴリへ追加（`mcp-tools.md` の「機械的に抽出」note も手書き + 番犬の事実へ）
+- 番犬 `crates/tako-control/tests/docs_tool_inventory.rs` 6 本が件数と名前集合の両方を拘束。CLI 集合は `main.rs` の `enum Command` のソース走査（実バイナリの `--help` と差分 0 を実測）で、**記述が見つからないことも FAILED** にして黙って通らない形
+- A/B（修正前 docs へ戻す）: 4/6 FAILED = 件数 11 か所を file:line で・欠落 21 件を名前で名指し → 修正後 6/6 緑。案 (a)（ページの生成物化）は構成変更なので未実施・ユーザー相談へ回す
