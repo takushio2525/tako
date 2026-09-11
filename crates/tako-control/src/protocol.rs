@@ -1869,6 +1869,200 @@ impl Request {
     }
 }
 
+/// **この Request の dispatch がペインの配置・寸法・表示対象を変えうるか**（#1370）。
+///
+/// 真にしたものは、IPC 受信ループ（`tako-app` の `main.rs`）が dispatch の直後に
+/// **1 フレームを強制描画**する。ペインの cols / rows を PTY へ渡す唯一の書き手は
+/// 描画の中（`render_pane` / `sync_offscreen_pane_sizes`）にあるのに、macOS の gpui では
+/// `cx.notify()` は dirty を立てるだけで、フレームを作る `on_request_frame` は
+/// CVDisplayLink / `displayLayer:` / `windowDidBecomeKey` からしか呼ばれず、
+/// display link は窓が `NSWindowOcclusionStateVisible` でないと起動しない。
+/// = **隠れた窓・最小化した窓・仮想ディスプレイ上の窓ではフレームが 1 枚も来ず**、
+/// `tako resize` / `split` / `equalize` のあともペインの中のシェルは古い winsize の
+/// まま残る（#1370 の実測は `stty size` = `21 21`・30 秒 × 5 回で不変）。
+///
+/// **読み取り・問い合わせ系では必ず偽にする**。`List` / `Read` /
+/// `OrchestratorWorkerStatus` は master のポーリングが秒単位で撃つので、
+/// ここを真にすると #786 の描画固定費（実測 5.1M instr/frame）が毎回乗る。
+///
+/// 迷ったときの倒し方は**真**（払うのは 1 フレームぶんの費用だけで、
+/// 偽にすると #1370 がその操作で残る）。ただし上の読み取り・問い合わせ系と、
+/// ペインの**中身**だけを触るもの（`Send` / `Scroll` / プレビューの編集系）は
+/// 例外なく偽にする。中身の再描画は端末・プレビュー自身の経路が行う。
+///
+/// ワイルドカードを置かない（= バリアントを増やしたらビルドが落ちる）ので、
+/// 新しい Request は必ずどちらかへ分類されて入る。
+pub fn changes_layout(request: &Request) -> bool {
+    match request {
+        // --- ペインの木・寸法そのもの ---
+        Request::Split { .. }
+        | Request::Close { .. }
+        | Request::Resize { .. }
+        | Request::Equalize { .. }
+        | Request::MovePane { .. }
+        | Request::Background { .. }
+        | Request::Foreground { .. }
+        // --- タブの構成・表示対象 ---
+        | Request::TabNew { .. }
+        | Request::TabSelect { .. }
+        | Request::TabReorder { .. }
+        | Request::CollapseTab { .. }
+        // --- ウィンドウの構成（#339 のビューポート） ---
+        | Request::WindowNew { .. }
+        | Request::WindowClose { .. }
+        | Request::WindowMoveTab { .. }
+        | Request::WindowFocus { .. }
+        | Request::WindowMinimize { .. }
+        | Request::WindowMaximize { .. }
+        | Request::WindowRestore { .. }
+        // --- ペインの面積を食うクローム ---
+        | Request::Panel { .. }
+        | Request::TreeFolder { .. }
+        | Request::Welcome { .. }
+        | Request::ShowCommand { .. }
+        | Request::MenuOpen { .. }
+        | Request::MenuClose
+        | Request::MenuInvoke { .. }
+        // --- セル寸法・描画モードが変わる（全ペインの grid が変わる） ---
+        | Request::Theme { .. }
+        | Request::UiMode { .. }
+        | Request::Lang { .. }
+        // --- ペインを新しく作る / 中身を差し替える ---
+        | Request::OpenFile { .. }
+        | Request::OpenDir { .. }
+        | Request::OpenRemote { .. }
+        | Request::RemoteFolder { .. }
+        | Request::Web { .. }
+        | Request::Run { .. }
+        | Request::RunInteractive { .. }
+        | Request::PreviewView { .. }
+        | Request::SessionRestart { .. }
+        | Request::Sessions { .. }
+        | Request::TmuxOpen { .. }
+        | Request::TmuxSelectWindow { .. }
+        | Request::OrchestratorSpawn { .. }
+        | Request::OrchestratorHandoff { .. }
+        | Request::GitResolveAgent { .. }
+        // --- 別ウィンドウを開く ---
+        | Request::Settings { .. }
+        | Request::Update { .. } => true,
+
+        // --- 読み取り・問い合わせ（ポーリングで撃たれる。描いてはならない） ---
+        Request::List
+        | Request::Read { .. }
+        | Request::Links { .. }
+        | Request::ResolvePane { .. }
+        | Request::CheckHealth
+        | Request::WindowList
+        | Request::MenuList
+        | Request::BackgroundList
+        | Request::TmuxList { .. }
+        | Request::SshHosts
+        | Request::Logs { .. }
+        | Request::Platform { .. }
+        | Request::AgentSupport { .. }
+        | Request::ContextBudget { .. }
+        | Request::TestResidue { .. }
+        | Request::StaleBinary { .. }
+        | Request::Telemetry { .. }
+        | Request::LimitService { .. }
+        | Request::TaskCheckpoint { .. }
+        | Request::TaskGate { .. }
+        | Request::RunResolve { .. }
+        | Request::RunInteractiveStatus { .. }
+        | Request::RecentItems { .. }
+        | Request::Fda { .. }
+        | Request::SetupChanges
+        | Request::OrchestratorSelf { .. }
+        | Request::OrchestratorWorkerStatus { .. }
+        | Request::OrchestratorWorkers { .. }
+        | Request::OrchestratorReport { .. }
+        | Request::OrchestratorRunStatus { .. }
+        | Request::OrchestratorRunResult { .. }
+        | Request::OrchestratorLedger { .. }
+        | Request::OrchestratorGuide { .. }
+        | Request::RemoteStatus
+        | Request::RemoteAgents
+        | Request::RemoteMessages { .. }
+        | Request::RemoteScrollback { .. }
+        | Request::RemoteDevices { .. }
+        // --- ペインの中身だけを触る（再描画は端末・プレビュー自身の経路が行う） ---
+        | Request::Send { .. }
+        | Request::Scroll { .. }
+        | Request::Focus { .. }
+        | Request::Title { .. }
+        | Request::TabRename { .. }
+        | Request::TabPinTitle { .. }
+        | Request::Pin { .. }
+        | Request::ChatCopy { .. }
+        | Request::BackgroundKill { .. }
+        | Request::PreviewOutline { .. }
+        | Request::PreviewLinkList { .. }
+        | Request::PreviewFollowLink { .. }
+        | Request::PreviewCopyCode { .. }
+        | Request::PreviewEdit { .. }
+        | Request::PreviewApply { .. }
+        | Request::PreviewSave { .. }
+        | Request::PreviewUndo { .. }
+        | Request::PreviewRedo { .. }
+        | Request::PreviewSearch { .. }
+        | Request::PreviewReplace { .. }
+        | Request::PreviewChangelog { .. }
+        | Request::VideoPlayback { .. }
+        | Request::VideoSeek { .. }
+        | Request::VideoVolume { .. }
+        | Request::FileOp { .. }
+        // --- 設定・外部プロセス・バックエンド操作（幾何に触らない） ---
+        | Request::AutoRename { .. }
+        | Request::PortDetect { .. }
+        | Request::Autosuggest { .. }
+        | Request::Persist { .. }
+        | Request::ConfirmClose { .. }
+        | Request::LimitResume { .. }
+        | Request::PreviewReload { .. }
+        | Request::PreviewCache { .. }
+        | Request::PreviewAutosave { .. }
+        | Request::Scrollback { .. }
+        | Request::SleepGuard { .. }
+        | Request::ShellIntegration { .. }
+        | Request::RunnerDefaults { .. }
+        | Request::Migrate { .. }
+        | Request::ConfigShare { .. }
+        | Request::AgentsSyncRules { .. }
+        | Request::SetupMcp { .. }
+        | Request::SetupBootstrap { .. }
+        | Request::SetupDeps { .. }
+        | Request::SetupModels { .. }
+        | Request::SetupRun { .. }
+        | Request::RemoteStart {}
+        | Request::RemoteStop { .. }
+        | Request::RemoteSetup { .. }
+        | Request::TmuxKill { .. }
+        | Request::TmuxResize { .. }
+        | Request::TmuxCleanup { .. }
+        | Request::OrchestratorProjects { .. }
+        | Request::OrchestratorProfiles { .. }
+        | Request::OrchestratorAccounts { .. }
+        | Request::OrchestratorLayout { .. }
+        | Request::OrchestratorRespond { .. }
+        | Request::OrchestratorSupervisor { .. }
+        | Request::OrchestratorHandoffFiles { .. }
+        | Request::GitLog { .. }
+        | Request::GitDiff { .. }
+        | Request::GitShow { .. }
+        | Request::GitCommit { .. }
+        | Request::GitPull { .. }
+        | Request::GitPush { .. }
+        | Request::GitStage { .. }
+        | Request::GitUnstage { .. }
+        | Request::GitCheckout { .. }
+        | Request::GitBranchCreate { .. }
+        | Request::GitMerge { .. }
+        | Request::GitMergeAbort { .. }
+        | Request::GitConflicts { .. } => false,
+    }
+}
+
 /// リクエストエンベロープ。`token` はセッション毎のランダム値（FR-2.3.4）。
 /// `origin` は生成主体の自己申告（`"mcp"` = MCP 経由。省略時は CLI）。
 /// トークンを持つプロセスは信頼済みのため、これは UI 表示・ポリシー用のラベルであって
@@ -2107,5 +2301,119 @@ mod tests {
     fn panel_viewの案内文は表示名と旧称の対応を含む() {
         let hint = PanelViewWire::values_hint();
         assert_eq!(hint, "fleet | orch | git。tmux は fleet の旧称");
+    }
+
+    // === #1370: changes_layout ===
+
+    /// #1370 の実測で「dispatch 後に cols / rows が古いまま残った」操作は全部真。
+    /// ここが偽に倒れると、隠れた窓・仮想ディスプレイ上でその操作だけ再発する
+    #[test]
+    fn changes_layoutはレイアウトを変える操作で真() {
+        for req in [
+            Request::Split {
+                pane: None,
+                tab: None,
+                direction: None,
+                ratio: None,
+                command: None,
+                cwd: None,
+                focus: None,
+            },
+            Request::Resize {
+                pane: None,
+                axis: Axis::X,
+                delta: None,
+                share: Some(0.3),
+            },
+            Request::Equalize {
+                pane: None,
+                tab: None,
+            },
+            Request::Close {
+                pane: None,
+                force: false,
+                caller_role: None,
+            },
+            Request::TabSelect { tab: 1 },
+            Request::WindowMaximize { window: None },
+            Request::Theme {
+                action: None,
+                mode: Some("light".into()),
+                target: None,
+                key: None,
+                value: None,
+                name: None,
+                font_family: None,
+                font_size: None,
+            },
+            Request::UiMode {
+                action: None,
+                mode: Some("gui".into()),
+                pane: None,
+            },
+        ] {
+            assert!(
+                changes_layout(&req),
+                "{} は描画を通さないと cols / rows が古いまま残る",
+                req.kind_name()
+            );
+        }
+    }
+
+    /// **ポーリングで撃たれるものは必ず偽**。ここが真に倒れると #786 の描画固定費
+    /// （実測 5.1M instr/frame）が master の 2 秒ポーリングごとに乗る
+    #[test]
+    fn changes_layoutは読み取り系で偽() {
+        for req in [
+            Request::List,
+            Request::Read {
+                pane: None,
+                lines: None,
+                tmux_session: None,
+            },
+            Request::CheckHealth,
+            Request::WindowList,
+            Request::BackgroundList,
+            Request::ResolvePane {
+                pane: None,
+                caller_pid: None,
+            },
+        ] {
+            assert!(
+                !changes_layout(&req),
+                "{} は読み取りなのに 1 フレーム描いてしまう",
+                req.kind_name()
+            );
+        }
+    }
+
+    /// ペインの**中身**だけを触るものも偽（再描画は端末・プレビュー自身の経路が行う）。
+    /// `Send` は master が worker へ指示を送るたびに通るので、ここは費用に直結する
+    #[test]
+    fn changes_layoutは中身だけの操作で偽() {
+        for req in [
+            Request::Send {
+                pane: None,
+                text: "x".into(),
+                newline: true,
+                tmux_session: None,
+                await_prompt: false,
+            },
+            Request::Scroll {
+                pane: None,
+                to: None,
+                delta: None,
+            },
+            Request::Focus {
+                pane: None,
+                direction: None,
+            },
+        ] {
+            assert!(
+                !changes_layout(&req),
+                "{} はペインの中身だけなので描かない",
+                req.kind_name()
+            );
+        }
     }
 }
