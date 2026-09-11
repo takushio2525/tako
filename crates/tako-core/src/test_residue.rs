@@ -62,6 +62,21 @@ pub const KINDS: &[Kind] = &[
         note: "検証プロセスの外部エージェント設定・シェル履歴（#1253 の隔離先）",
         auto: false,
     },
+    Kind {
+        prefix: "tako-test-scratch-",
+        note: "テスト本体が作る使い捨ての作業ディレクトリの親（#1312 の ScratchDir）",
+        auto: true,
+    },
+    Kind {
+        prefix: "tako-test-orchestrator-",
+        note: "cargo test のオーケストレーター設定（tako_control::orchestrator の隔離先）",
+        auto: true,
+    },
+    Kind {
+        prefix: "tako-test-supervisor-",
+        note: "cargo test の supervisor 監査ログ（tako_control::orchestrator の隔離先）",
+        auto: true,
+    },
 ];
 
 /// 起動時の自動掃除で 1 プロセスが消す上限（残りは次のプロセスが引き継ぐ）。
@@ -566,6 +581,153 @@ pub fn sweep_stale_on_start() {
     });
 }
 
+// ------------------------------------- テスト本体が作る使い捨て dir（Issue #1312）
+
+/// A/B 用の逃げ道（`TAKO_1312_LEGACY=1`）。[`ScratchDir`] を**修正前の形**
+/// （`<TMPDIR>/tako-<タグ>-<pid>` を作りっぱなしにする）へ戻す。
+/// 番犬がこれを立てて「残骸が積もること」= 検査に検出力があることを実測する
+pub fn legacy_1312() -> bool {
+    matches!(
+        std::env::var("TAKO_1312_LEGACY").ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
+/// テスト本体が作る使い捨ての作業ディレクトリを**まとめて置く親**（プロセスごとに 1 つ）。
+///
+/// #1296 が掃けるようにしたのは「置き場を決める側」（`paths.rs` の `test_data_dir` 等）
+/// だけで、テストが個別に `temp_dir().join(…)` で作る使い捨ては射程の外だった
+/// （実測 2026-09-11: `cargo test -p tako-core --lib` 1 回で 14 件が残る = #1312）。
+///
+/// 親を 1 つに畳んで `<prefix><pid>` の形にすると **#1296 の 2 段構えがそのまま効く**
+/// （終了時の `atexit` + 次回起動時の pid 回収 + `tako test-residue` から見える）。
+/// 個々の dir は [`ScratchDir`] がスコープを抜けた時点で消すので、
+/// 親が効くのは `Drop` が走らなかった回（SIGKILL / abort）だけ
+pub fn scratch_root() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("tako-test-scratch-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        if !legacy_1312() {
+            // 呼び出しを絶対パスで書くのは、番犬が「作る経路が武装しているか」を
+            // この綴りで検査するため（`crates/tako-control/tests/test_residue_watchdog.rs`）
+            crate::test_residue::arm_self_cleanup(&dir);
+            crate::test_residue::sweep_stale_on_start();
+        }
+        dir
+    })
+    .clone()
+}
+
+/// テストが使う使い捨ての作業ディレクトリ。**スコープを抜けた時点で消える**
+/// （panic による巻き戻しでも `Drop` は走る）。
+///
+/// 原則は「作る側が消す」で、`std::process::exit` / SIGKILL のように `Drop` が
+/// 走らなかった回だけ親（[`scratch_root`]）ごと #1296 の 2 段構えが回収する。
+///
+/// 同じ `tag` で何度作っても**別の dir** になる（並行するテストが同じ名前を
+/// 取り合わない = #1313 / #1300 と同じ作法）。
+pub struct ScratchDir {
+    path: PathBuf,
+}
+
+impl ScratchDir {
+    /// `tag` はディレクトリ名に出る目印（残骸が出たときに作り手を辿れるようにする）
+    pub fn new(tag: &str) -> Self {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self {
+            path: make_scratch(&format!("{tag}-{seq}"), tag),
+        }
+    }
+
+    /// 作られた dir のパス
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// **プロセスの最後まで生きる**使い捨ての置き場（同じ `tag` なら同じ dir を返す）。
+///
+/// `OnceLock` に持つ器や、テストの外の子プロセスが使うキャッシュのように
+/// 「スコープ」が無いものだけがここを使う。個別の `Drop` は無いが、
+/// 親（[`scratch_root`]）ごと終了時の `atexit` が消すので残骸にはならない
+pub fn process_scratch(tag: &str) -> PathBuf {
+    make_scratch(tag, tag)
+}
+
+/// 使い捨て dir を作る 1 実装。`leaf` は親の下での名前、`legacy_tag` は
+/// A/B（`TAKO_1312_LEGACY=1`）で再現する修正前の名前
+fn make_scratch(leaf: &str, legacy_tag: &str) -> PathBuf {
+    let path = if legacy_1312() {
+        // A/B: 修正前の形（TMPDIR 直下・タグごとに 1 つ・消さない）
+        let name = format!("tako-{}-{}", sanitize_tag(legacy_tag), std::process::id());
+        std::env::temp_dir().join(name)
+    } else {
+        scratch_root().join(sanitize_tag(leaf))
+    };
+    std::fs::create_dir_all(&path)
+        .unwrap_or_else(|e| panic!("使い捨て dir を作れない: {} ({e})", path.display()));
+    path
+}
+
+impl std::fmt::Debug for ScratchDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ScratchDir").field(&self.path).finish()
+    }
+}
+
+impl AsRef<Path> for ScratchDir {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl std::ops::Deref for ScratchDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        remove_scratch(&self.path);
+    }
+}
+
+/// 使い捨て dir を消す**唯一の経路**。一時ディレクトリ配下であることを確かめてから消す
+/// （名前を間違えて実環境を消す事故の防止。#1296 の `remove_if_still_stale` と同じ立場）
+fn remove_scratch(dir: &Path) {
+    if legacy_1312() {
+        return; // A/B: 修正前は作りっぱなしだった
+    }
+    if !dir.starts_with(std::env::temp_dir()) {
+        debug_assert!(false, "使い捨て dir が一時ディレクトリの外にある: {dir:?}");
+        return;
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// ディレクトリ名に使える形へ落とす（Windows のパス区切り・禁止文字対策）
+fn sanitize_tag(tag: &str) -> String {
+    let cleaned: String = tag
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.trim_matches(['-', '_', '.']).is_empty() {
+        "scratch".to_string()
+    } else {
+        cleaned
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -774,6 +936,210 @@ mod tests {
         assert!(
             matches!(probe.owner(std::process::id()), Owner::Alive { .. }),
             "自分自身が Dead に見える = 生死判定が壊れている"
+        );
+    }
+
+    // ------------------------------------------------- ScratchDir（Issue #1312）
+
+    #[test]
+    fn 使い捨てdirはスコープを抜けると消える() {
+        let path = {
+            let dir = ScratchDir::new("unit-drop");
+            std::fs::write(dir.join("a.txt"), b"x").expect("中へ書ける");
+            assert!(dir.path().is_dir());
+            dir.path().to_path_buf()
+        };
+        assert!(!path.exists(), "スコープを抜けても残っている: {path:?}");
+    }
+
+    #[test]
+    fn 使い捨てdirはpanicでも消える() {
+        let path = std::sync::Arc::new(std::sync::Mutex::new(PathBuf::new()));
+        let sink = std::sync::Arc::clone(&path);
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // 期待した panic の出力を抑える
+        let res = std::panic::catch_unwind(move || {
+            let dir = ScratchDir::new("unit-panic");
+            *sink.lock().unwrap() = dir.path().to_path_buf();
+            panic!("テスト本体が落ちた");
+        });
+        std::panic::set_hook(hook);
+        assert!(res.is_err(), "panic していない = 検査になっていない");
+        let path = path.lock().unwrap().clone();
+        assert!(
+            !path.as_os_str().is_empty() && !path.exists(),
+            "panic の巻き戻しで消えていない: {path:?}"
+        );
+    }
+
+    #[test]
+    fn 同じタグでも別のdirになる() {
+        let a = ScratchDir::new("unit-same");
+        let b = ScratchDir::new("unit-same");
+        assert_ne!(a.path(), b.path(), "同じ tag が同じ dir を指している");
+        assert!(a.path().is_dir() && b.path().is_dir());
+    }
+
+    #[test]
+    fn 使い捨てdirは親の下に出来る() {
+        let dir = ScratchDir::new("unit-root");
+        let root = scratch_root();
+        assert!(
+            dir.path().starts_with(&root),
+            "{:?} が親 {:?} の下に無い",
+            dir.path(),
+            root
+        );
+        assert_eq!(
+            root.file_name().map(|n| n.to_string_lossy().to_string()),
+            Some(format!("tako-test-scratch-{}", std::process::id())),
+            "親の名前が KINDS の <prefix><pid> の形になっていない"
+        );
+    }
+
+    #[test]
+    fn タグはディレクトリ名に使える形へ落ちる() {
+        assert_eq!(sanitize_tag("osc-sink_a.1"), "osc-sink_a.1");
+        assert_eq!(sanitize_tag("a/b\\c:d"), "a_b_c_d");
+        assert_eq!(sanitize_tag("__"), "scratch", "空に潰れる tag の落とし先");
+        let dir = ScratchDir::new("a/b");
+        assert!(
+            dir.path().parent() == Some(scratch_root().as_path()),
+            "区切り文字が入って階層が増えた: {:?}",
+            dir.path()
+        );
+    }
+
+    #[test]
+    fn 一時ディレクトリの外は消さない() {
+        // 名前を間違えても実環境を消さない（削除の唯一の経路に安全弁があること）
+        let outside = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        assert!(outside.is_dir(), "検査の前提（src が在る）");
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        // debug ビルドでは debug_assert! が落ちる = 気付ける。どちらでも消さないことを見る
+        let _ = std::panic::catch_unwind(|| remove_scratch(&outside));
+        std::panic::set_hook(hook);
+        assert!(outside.is_dir(), "一時ディレクトリの外を消した");
+    }
+    // --------------------------- 一巡して残骸が残らないことの実測（Issue #1312）
+
+    /// 子として起こされた印（無ければ番犬本体が動く）。
+    /// これが無いと子の中の番犬がまた子を起こして止まらない
+    const RESIDUE_CHILD: &str = "TAKO_1312_CHILD";
+
+    /// 子（このテストバイナリの再実行）の待ちの上限
+    const RESIDUE_DEADLINE: Duration = Duration::from_secs(600);
+
+    /// このテストバイナリを**使い捨ての TMPDIR** で回し、残った `tako-*` の名前を返す。
+    /// 標準出力はファイルへ落とす（パイプに溜めると全件の出力で詰まる）
+    fn run_suite_in(scratch: &Path, filter: Option<&str>, legacy: bool) -> (Vec<String>, String) {
+        let log = scratch.join("child.log");
+        let tmp = scratch.join("tmp");
+        std::fs::create_dir_all(&tmp).expect("子の TMPDIR を作れる");
+        let exe = std::env::current_exe().expect("テストバイナリのパス");
+        let mut cmd = std::process::Command::new(exe);
+        if let Some(f) = filter {
+            cmd.arg(f);
+        }
+        // この 1 本だけは**使い捨ての TMPDIR では成立しない**: ssh の ControlPath は
+        // unix domain socket のパス長上限（`MAX_SOCKET_PATH` = 92）に収まる必要があり、
+        // 親の置き場の下へ潜らせた TMPDIR ではその予算を使い切る。
+        // 残骸を数えるという番犬の本題とは関係が無いので外す
+        cmd.args(["--skip", "ホストごとに_controlpath_が分かれる"]);
+        cmd.env(RESIDUE_CHILD, "1")
+            // 一時ディレクトリの解決元は OS ごとに違う（unix = TMPDIR /
+            // Windows = TMP・TEMP）。両方を使い捨てへ向ける
+            .env("TMPDIR", &tmp)
+            .env("TMP", &tmp)
+            .env("TEMP", &tmp)
+            .env_remove("TAKO_DATA_DIR")
+            .env_remove("TAKO_1296_LEGACY")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::fs::File::create(&log).expect("子のログを作れる"))
+            .stderr(
+                std::fs::File::options()
+                    .append(true)
+                    .open(&log)
+                    .expect("子のログを開ける"),
+            );
+        if legacy {
+            cmd.env("TAKO_1312_LEGACY", "1");
+        } else {
+            cmd.env_remove("TAKO_1312_LEGACY");
+        }
+        let mut child = cmd.spawn().expect("子を起こせる");
+        let deadline = std::time::Instant::now() + RESIDUE_DEADLINE;
+        loop {
+            match child.try_wait().expect("子の状態を読める") {
+                Some(_) => break,
+                None if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("子のテスト一巡が {RESIDUE_DEADLINE:?} で終わらない");
+                }
+                None => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+        let out = std::fs::read_to_string(&log).unwrap_or_default();
+        let mut residues: Vec<String> = std::fs::read_dir(&tmp)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .filter(|n| n.starts_with("tako-"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        residues.sort();
+        (residues, out)
+    }
+
+    /// `test result: …; N passed;` の合計（ok / FAILED のどちらの行からも採る）
+    fn passed_count(out: &str) -> usize {
+        out.lines()
+            .filter(|l| l.starts_with("test result:"))
+            .filter_map(|l| {
+                let head = l.split(" passed").next()?;
+                head.rsplit(' ').next()?.parse::<usize>().ok()
+            })
+            .sum()
+    }
+
+    /// #1312 の受け入れ: **テストを一巡しても TMPDIR に `tako-*` が残らない**。
+    ///
+    /// 「器を使った」ではなく、このバイナリをもう一度回して**実際に数える**
+    /// （#1296 の `test_data_residue` と同じ作法）。検出力は
+    /// `TAKO_1312_LEGACY=1`（修正前 = 作りっぱなし）の腕が受け持つ
+    #[test]
+    fn テストを一巡してもtmpdirに残骸が残らない() {
+        if std::env::var_os(RESIDUE_CHILD).is_some() || legacy_1312() {
+            return; // 子（再帰の停止条件）と A/B の腕では回さない
+        }
+        let scratch = ScratchDir::new("residue-watchdog");
+
+        let (residues, out) = run_suite_in(scratch.path(), None, false);
+        // **個々のテストの成否では落とさない**（ここの本題は残骸の数で、
+        // 他のテストの失敗まで二重に報告すると原因が埋もれる）。
+        // 代わりに「一巡したこと」を件数で確かめる
+        let passed = passed_count(&out);
+        assert!(
+            passed >= 500,
+            "子が一巡していない（passed={passed}）= 検査になっていない。末尾:\n{}",
+            out.lines().rev().take(20).collect::<Vec<_>>().join("\n")
+        );
+        assert!(
+            residues.is_empty(),
+            "テストを一巡したら TMPDIR に {} 件残った（作り手は名前で辿れる）: {residues:?}\n\
+             直し方: その dir を tako_core::test_residue::ScratchDir / process_scratch で作る",
+            residues.len()
+        );
+
+        // A/B: 器を修正前（作りっぱなし）へ戻すと同じ手順で残る = 検出力がある
+        let (legacy, _) = run_suite_in(scratch.path(), Some("osc_sink::tests::"), true);
+        assert!(
+            !legacy.is_empty(),
+            "TAKO_1312_LEGACY=1 でも残らない = A/B が効いていない"
         );
     }
 }

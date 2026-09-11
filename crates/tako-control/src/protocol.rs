@@ -1375,11 +1375,14 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller_role: Option<String>,
     },
-    /// テスト・検証プロセスが一時ディレクトリへ残した使い捨て dir の掃除（Issue #1296）。
+    /// テスト・検証プロセスが一時ディレクトリへ残した使い捨て dir の掃除（Issue #1296 / #1312）。
     ///
-    /// 対象は `<TMPDIR>/tako-test-data-<pid>`（cargo test の data dir）と
-    /// `<TMPDIR>/tako-agent-config-<pid>`（検証プロセスのエージェント設定）で、
-    /// **所有プロセスが生きていないものだけ**。既定は dry-run（`apply` で実削除）
+    /// 対象は `<TMPDIR>` 直下の `tako-test-data-<pid>`（cargo test の data dir）/
+    /// `tako-agent-config-<pid>`（検証プロセスのエージェント設定）/
+    /// `tako-test-scratch-<pid>`（テスト本体の使い捨て作業ディレクトリ）/
+    /// `tako-test-orchestrator-<pid>` / `tako-test-supervisor-<pid>`（オーケストレーターの
+    /// テスト隔離先）で、**所有プロセスが生きていないものだけ**。
+    /// 既定は dry-run（`apply` で実削除）
     TestResidue {
         /// 判定どおりに実際に削除する（既定 false = 1 つも消さない）
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
