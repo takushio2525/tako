@@ -6,7 +6,7 @@
 //! | 層 | 中身 |
 //! |---|---|
 //! | `tako_core::ssh_detect` | コマンド行 → 宛先（純関数） |
-//! | ここ | 「どのペインの配下に ssh が居るか」の判定・**再走査の間引き**・見送りログの重複抑止（#1258） |
+//! | ここ | 「どのペインの配下に ssh が居るか」の判定・**再走査の間引き**・見送りログの重複抑止（#1258）・**検知の材料（`~/.ssh/config`）の採取**（#1411） |
 //! | `tako-app` | 自動追加の実行（background で接続 → ルートを足す）と切断の表示 |
 //!
 //! # 毎 tick 走らせない（#772 / #779 / #782 の教訓）
@@ -24,11 +24,19 @@
 //! シェル統合が効いていないペイン（状態が `Unknown` のまま）だけは変化が現れないので
 //! 保険の間隔に頼る。全ペインが `Idle` で追跡中のホストも無ければ、保険も走らせない
 //! （アイドルの tako が `ps` を起動しない = #976 受け入れ条件の「アイドル時の増加なし」）。
+//!
+//! # 材料を読むのも走る tick だけ（#1411）
+//!
+//! 非既定ポートの `-p` を「宛先の名前そのものが持つポート」と突き合わせるために
+//! `~/.ssh/config` を読む（[`tako_core::ssh_detect::ConfiguredPorts`]）。読むのは
+//! [`scan`] が**実際に走査する tick** だけで、間引かれた tick は 1 行も触らない。
+//! 材料を引数で受ける [`scan_in`] が本体なので、テストは実ユーザーの config に
+//! 左右されない。
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-use tako_core::ssh_detect::{parse_ssh_command, SkipReason};
+use tako_core::ssh_detect::{parse_ssh_command_with, DetectContext, SkipReason};
 use tako_core::CommandState;
 
 use crate::agents::ProcessSnapshot;
@@ -204,14 +212,45 @@ pub fn scan(
     snapshot: Option<&ProcessSnapshot>,
     now: Instant,
 ) -> SshScanState {
+    // #1411: 材料（`~/.ssh/config`）を読むのは**走査が実際に起きる tick だけ**。
+    // 間引かれた tick はここで戻るので、2 秒ごとにファイルを触らない
+    // （走る tick でも読むのは 1 ファイル分 = 同じ tick の
+    // `ProcessSnapshot::capture()` が起こす `ps` より軽い）
     let Some(snapshot) = snapshot else {
-        return SshScanState {
-            targets,
-            sessions: prev.sessions.clone(),
-            skipped: prev.skipped.clone(),
-            scanned_at: prev.scanned_at,
-            argv_unavailable: prev.argv_unavailable,
-        };
+        return carried_over(prev, targets);
+    };
+    scan_in(
+        prev,
+        targets,
+        Some(snapshot),
+        now,
+        &DetectContext::current(),
+    )
+}
+
+/// 走査を間引いた tick の戻り（**前回の結果をそのまま持ち越す**。
+/// 「ssh が消えた」と誤解しないため）
+fn carried_over(prev: &SshScanState, targets: Vec<SshScanTarget>) -> SshScanState {
+    SshScanState {
+        targets,
+        sessions: prev.sessions.clone(),
+        skipped: prev.skipped.clone(),
+        scanned_at: prev.scanned_at,
+        argv_unavailable: prev.argv_unavailable,
+    }
+}
+
+/// [`scan`] の中身（**検知の材料を引数で受ける**ので `~/.ssh/config` も env も読まない）。
+/// テストと A/B はこちらを呼ぶ（実ユーザーの config に結果が左右されない）
+pub fn scan_in(
+    prev: &SshScanState,
+    targets: Vec<SshScanTarget>,
+    snapshot: Option<&ProcessSnapshot>,
+    now: Instant,
+    ctx: &DetectContext,
+) -> SshScanState {
+    let Some(snapshot) = snapshot else {
+        return carried_over(prev, targets);
     };
     let mut sessions: Vec<DetectedSsh> = Vec::new();
     let mut skipped: Vec<SkippedSsh> = Vec::new();
@@ -243,7 +282,7 @@ pub fn scan(
             if !argv_looks_like_ssh(argv) {
                 continue;
             }
-            match parse_ssh_command(argv) {
+            match parse_ssh_command_with(argv, ctx) {
                 Ok(cmd) if !found => {
                     found = true;
                     sessions.push(DetectedSsh {
@@ -284,6 +323,17 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    /// テストの走査（**実ユーザーの `~/.ssh/config` を読まない**。
+    /// 材料なし = #1411 以前と同じ「非既定ポートは全部見送る」物差し）
+    fn scan_t(
+        prev: &SshScanState,
+        targets: Vec<SshScanTarget>,
+        snapshot: Option<&ProcessSnapshot>,
+        now: Instant,
+    ) -> SshScanState {
+        scan_in(prev, targets, snapshot, now, &DetectContext::strict())
+    }
+
     fn target(pane: u64, child_pid: u32, state: CommandState) -> SshScanTarget {
         SshScanTarget {
             pane,
@@ -316,7 +366,7 @@ mod tests {
             &[(200, 100), (100, 10)],
             &[(100, "-zsh"), (200, "ssh win")],
         );
-        let state = scan(
+        let state = scan_t(
             &SshScanState::default(),
             vec![target(1, 100, CommandState::Running)],
             Some(&snap),
@@ -337,7 +387,7 @@ mod tests {
             &[(600, 500), (901, 900)],
             &[(600, "ssh box"), (901, "ssh should-not-match")],
         );
-        let state = scan(
+        let state = scan_t(
             &SshScanState::default(),
             vec![SshScanTarget {
                 pane: 7,
@@ -362,7 +412,7 @@ mod tests {
             &[(200, 100), (400, 300)],
             &[(200, "vim"), (400, "ssh elsewhere")],
         );
-        let state = scan(
+        let state = scan_t(
             &SshScanState::default(),
             vec![target(1, 100, CommandState::Running)],
             Some(&snap),
@@ -371,10 +421,61 @@ mod tests {
         assert!(state.sessions.is_empty(), "{:?}", state.sessions);
     }
 
+    /// tako 自身が開いた SSH ペインの実コマンド行（#1411 の実測と同じ形）。
+    /// ControlPath は macOS の既定 data_dir（**空白を含む**）で組む
+    fn self_opened_argv(host: &str, port: u16) -> String {
+        let dir = std::path::Path::new("/Users/testuser/Library/Application Support/tako");
+        let cp = tako_core::remote_fs::control_path_option(&tako_core::remote_fs::control_path_in(
+            Some(dir),
+            host,
+        ));
+        format!(
+            "/usr/bin/ssh -o {cp} -o ControlMaster=auto -o ControlPersist=600 \
+             -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
+             -p {port} {host}"
+        )
+    }
+
+    #[test]
+    fn tako自身が開いたsshペインは材料があればsessionsに載る() {
+        let argv = self_opened_argv("win", 2222);
+        let snap = snapshot(vec![], &[(200, 100)], &[(200, argv.as_str())]);
+        let targets = vec![target(1, 100, CommandState::Running)];
+        let ctx =
+            DetectContext::with_configured(tako_core::ssh_detect::ConfiguredPorts::from_pairs(&[
+                ("win", 2222),
+            ]));
+        let state = scan_in(
+            &SshScanState::default(),
+            targets.clone(),
+            Some(&snap),
+            Instant::now(),
+            &ctx,
+        );
+        assert_eq!(state.skipped, Vec::new(), "見送りが残っている");
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.sessions[0].destination, "win");
+        assert!(state.is_live("win"));
+
+        // 材料が無ければ従来どおり見送る（#1411 以前 = Issue の実測）
+        let legacy = scan_in(
+            &SshScanState::default(),
+            targets,
+            Some(&snap),
+            Instant::now(),
+            &DetectContext::legacy(),
+        );
+        assert!(legacy.sessions.is_empty());
+        assert_eq!(legacy.skipped.len(), 1);
+        // 空白で割れた ControlPath の続きを宛先と読むので理由は `RemoteCommand`
+        // （ポートを 22 にしても起きる = #1411 の 2 つ目の原因）
+        assert_eq!(legacy.skipped[0].reason, SkipReason::RemoteCommand);
+    }
+
     #[test]
     fn 見送った形は理由つきで持ち帰る() {
         let snap = snapshot(vec![], &[(200, 100)], &[(200, "ssh -p 2222 win")]);
-        let state = scan(
+        let state = scan_t(
             &SshScanState::default(),
             vec![target(1, 100, CommandState::Running)],
             Some(&snap),
@@ -395,7 +496,7 @@ mod tests {
             &[(200, 100), (300, 200)],
             &[(200, "ssh outer"), (300, "ssh inner")],
         );
-        let state = scan(
+        let state = scan_t(
             &SshScanState::default(),
             vec![target(1, 100, CommandState::Running)],
             Some(&snap),
@@ -409,7 +510,7 @@ mod tests {
     fn argvを採れない環境は旗が立つ() {
         // 境界が実行ファイル名しか返せない環境（Windows）= argv が空
         let snap = snapshot(vec![], &[(200, 100)], &[]);
-        let state = scan(
+        let state = scan_t(
             &SshScanState::default(),
             vec![target(1, 100, CommandState::Running)],
             Some(&snap),
@@ -513,7 +614,7 @@ mod tests {
         for tick in 0..60u64 {
             let now = t0 + Duration::from_secs(2 * tick);
             let rescan = should_rescan(&state, &targets, false, now);
-            state = scan(&state, targets.clone(), rescan.then_some(&snap), now);
+            state = scan_t(&state, targets.clone(), rescan.then_some(&snap), now);
             carried += state.skipped.len();
             lines += log.take_new(&state.skipped, false).len();
         }
@@ -563,7 +664,7 @@ mod tests {
             scanned_at: Some(Instant::now()),
             argv_unavailable: false,
         };
-        let state = scan(
+        let state = scan_t(
             &prev,
             vec![target(1, 100, CommandState::Running)],
             None,

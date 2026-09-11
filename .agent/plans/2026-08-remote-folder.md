@@ -263,6 +263,17 @@ clamshell 閉 + 画面 OFF なので `screencapture` は**全面黒しか撮れ�
   `-o Hostname=` / `ssh host <コマンド>` / `-N` / `-s` は全部見送り、
   理由（`SkipReason` 7 種別・日英）を `auto` の応答と `persist.log` に残す。
   `-l user` / `-o User=` だけは `user@host` へ**畳み込む**（見送るより忠実）
+- **物差しは「ポートが 22 か」ではなく「宛先の名前だけでそのポートへ行けるか」**（#1411）:
+  `~/.ssh/config` がその Host に `Port 2222` と書いていれば `ssh <host>` でも同じ相手へ
+  届くので見送らない。tako 自身が開くペインの `-p` は config の `Port` の書き写し
+  （`SshHost::ssh_command`）なので、これで**自分が書いた `-p` を自分で疑う**状態が消える。
+  手打ちの `ssh -p 2222 host`（config に `Port` が無い）と `-F <別の config>` は従来どおり見送る。
+  材料は `ConfiguredPorts`（`scan` が走る tick だけ読む）・A/B は `TAKO_1411_LEGACY=1`
+- **引用つきオプション値の平坦化を戻す**（#1411 の 2 つ目の原因）: tako は空白を含む値を
+  `-o ControlPath="…"` と引用して渡すので、macOS の既定 data_dir
+  （`~/Library/Application Support/tako`）では `ps` の 1 行が空白で割れ、**続きの語が宛先に
+  見えて** `RemoteCommand` で見送られていた（ポートが 22 でも起きる）。開いたままの引用が
+  閉じるまで語を足して戻す
 - **`-N` を弾くのが効く場面**: tako 自身の ControlMaster（`ssh -M -N -f`）はペイン配下に
   居ないが、ユーザーの `ssh -N -L 8080:…` はペイン配下に居る。転送だけの接続で
   フォルダを開かない
