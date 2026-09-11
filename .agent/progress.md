@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-11（#1353 / #1364: セルフテスト 3 項目の固定予算を状態待ちへ、番犬を状態読みへ広げた）
-- 項目 22（固定 800ms）/ 44（固定 1 秒）/ 63（固定 6 秒窓 + 40 秒）を `wait_for_app_state` + `cli_state_budget` へ。**項目 63 の真因は待ち不足ではなく証拠源の取り違え + 再描画の不発**（旧は描画を `focused_pane()` で見て分割元で真になる偽陽性 = legacy 実測 `pane=Some(2)`。新ペインは誰も汚さないと `AnyView::cached` のまま一度も描かれず、シェルが 1 行も出さない）→ 作った ID のペイン + `wait_for_drawn_state`（毎周期 notify + draw）
-- 番犬 `打ち込んだcliの結果を固定予算で待っていない` を追加（アンカー = 手前の `type_text` + `{cli}`）。修正前ソースで 3 項目を file:line 名指し（`38244` / `39998` / `41809`）。同型 16 件は `KNOWN_FIXED_CLI_WAITS` で段階導入 = #1375 で空にする
-- 実測: 高負荷 4 回（load 73〜142）で 3 項目 0 FAILED・うち 2 回は完走。**人工負荷では旧も落ちない**（`yes` 68 本 load 134 で `waited=0.1s budget=0.8s`）ので注入で確定: `late` で旧 3/3 FAILED・新は待って通る / `never:44` は新でも FAILED
-
 ## 2026-09-11（#633: 承認カードの command を「承認を求めている操作」から始める）
 - 実測で真因を絞った: 本文の境界は「当たったら捨てる」3 つ（罫線 / 0 桁の非空行 = #1293 / 番号つき行）しか無く、**罫線を引かず箱ごと 0 桁で描く**許可ダイアログ（agy / claude の箱なし 2 形）では捨てる材料が無い。Issue 実測値の `⏺` 行そのものは #1293 が既に切っていた
 - `dialog::BODY_START_MARKERS` + `body_start_row` で**本体の開始マーカーを起点**にし、無ければ従来のブロック抽出へフォールバック（起点を下げるだけ = 結果は必ず従来の接尾辞）。FR-2.25.12 / conventions #1293 節に追記
@@ -64,6 +59,7 @@
 - 隔離 GUI（tako-vd・`CGEventPostToPid`）で確定: ターミナルの cmd+A は選択を作らず PTY にも届かない（`abc` に cmd+A → `x` で `abcx` 3/3。本物の Ctrl+A は `xabc` 3/3 = 検出力あり）。cmd+A → cmd+C も sentinel のまま 3/3
 - 同じ経路でプレビュー本文 3/3・編集中バッファ 3/3 は全文が入るので「端末には実装が無い」が確定。表の行へ効く先を書き注記を 1 つ追加（コード変更なし = install 不要。案 (b) = ターミナルの全選択は別 Issue 候補として Issue へ残した）
 - 番犬 2 本（説明文 ↔ `select_all_text` の両方向 / 効く先の列挙）。注入 5 通りで file:line 名指しの FAILED → 復帰後 7/7 緑
+
 ## 2026-09-11（#1383: clippy が単体形と workspace 形で違う lint を見る理由を確定し CI へ 1 本足した）
 - 真因は feature unification。`--workspace` は必ず gpui を含むので `serde_json/preserve_order` が有効 = `Map` が IndexMap 実装 → `Value` が**有意な Drop** を持ち `unnecessary_lazy_evaluations` が黙る。gpui 抜きの `-p` 宇宙は BTreeMap 実装（insignificant）なので同じ行で落ちる
 - `wait.rs:1099` を `then_some` へ（挙動不変）。CI の macOS ジョブへ `-p tako-core -p tako-control -p tako-cli` の clippy を追加（温まっていれば実測 10.5 秒）
