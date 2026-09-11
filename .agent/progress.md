@@ -20,26 +20,6 @@
 
 ---
 
-## 2026-09-11（#1293: 会話ログの番号つき箇条書きがダイアログの選択肢に混ざらないようにした）
-- 真因は非対称。選択カーソルの探索は末尾 40 行に絞ってあるのに**収集（`numbered_rows`）だけが画面全体**だった。`numbered_block` で起点から上下へ「あいだがダイアログの一部だけ（`gap_line_kind`）」かつ「番号が 1 ずつ増える」あいだに限定し、経路 1〜4 すべてへ effect。`title` も同じ塊に限る（境界 = 罫線 + 0 桁の非空行 + 採らなかった番号つき行）
-- A/B `TAKO_1293_LEGACY=1`: 単体 5 本が Issue と同じ `options=6`・`highlighted=Some(3)`・`header=["⏺ 直し方の候補は 3 つあります。"]` で FAILED → 修正後 3 択・header はダイアログの説明文のみ
-- 実 tmux の模擬 TUI e2e（新規 2 本）: 下見が 3 択・`--choice 1` が `choice_text="Yes"` / `keys_sent=["1"]` / `resolved=true`。legacy は `choice_text="待ちを状態待ちへ寄せる"` = Issue の「監査ログが嘘になる」を再現
-
-## 2026-09-11（#1282: `tako tmux cleanup --servers` を psmux の器でも使えるようにした）
-- 器の列挙を 2 実装へ（unix = ソケットファイル走査 / Windows = 器のプロセスのコマンドライン `-L <名前>`。psmux は名前付きパイプで走査できるファイルが無く、実機に 24 個残っていても 0 件と答えていた）。コマンドラインは `NtQueryInformationProcess(ProcessCommandLineInformation)`・起動時刻は `GetProcessTimes` で、依存クレートは足していない
-- 所有者は 2 段（ソケット名の pid = unix と同じ強さ / コマンドラインの隔離マーカー = 自分以外の生きた tako-app が居れば `peer_may_reattach` で見送る）。材料が無ければ従来どおり `owner_unknown`。回収は `taskkill /PID /T /F` の **pid 指定のみ**
-- macOS: fmt / clippy / `test --workspace` 4074 件緑・クロスチェック エラー 0（警告は既存箇所のみ）。番犬 5 本（修正前ソースで 4 本 FAILED）+ 単体 11 本（応答の形は dispatch で固定）。FFI は CI の Windows ランナーで実行検査（既存の `cargo test --workspace` は #583 の失敗で tako-core まで届かないので blocking の別ステップを追加）。**Windows 実機実測は未取得**（機が offline。手順は plan の「#1282」節）
-
-## 2026-09-11（#1294: peer 送達の「送ったかもしれない」を未達扱いにせず二重投函を止めた）
-- `Stall::PeerSendStalled`（再送禁止の宣言）と registry の記録が逆を向いていた。送達の記録を 3 値（`tako_core::prompt_delivery::Confidence`）にし、`peer_send_stalled` / `peer_unconfirmed` は `Unverified`（#983 の `verify_then_resend`）へ。3 値目の宣言は `outcome_confidence` の表 1 本で、記録側と判定側が同じ表を引く（**既定は未達側**）
-- A/B（`TAKO_1294_LEGACY=1`）: 旧アーム = `prompt_delivery=undelivered` / events `prompt_undelivered` / **自動再送 1 回**、新アーム = `unverified` / `prompt_delivery_unverified` / **0 回**。本当に未達（`paste_not_reflected`）は両アームとも 1 回で回帰なし
-- 番犬 3 本（記録が bool を渡す形 / 判定が無条件 `OverdueSuspect` / 自動再送の引き金の一本化）が修正前ソースで file:line 名指し FAILED。単体 8 本・dispatch e2e 1 本
-
-## 2026-09-11（#1292: send_input の queued 応答が前回の決着済み送達の顛末を名乗らないようにした）
-- 真因は「積む前の状態」を未決着かどうかで分けていなかったこと。`prompt_delivery_states` はペインを閉じるまで消えないので、素通しすると 1 時間前の `gave_up` や 10 秒前の `delivered` を新しい送達が名乗る（後者は master が届いたと判断して**監視をやめる**）
-- 判定は `tako_core::prompt_delivery::pending_predecessor`（`State::is_pending` = Queued / Waiting だけ）の 1 実装へ。絞り込みは `queued_json` の 1 箇所なので send フロー / Enter 単独 / tmux フォールバックが全部通る。MCP の説明文も一致させた
-- 隔離 GUI + 模擬 TUI の実測: 1 通目を flow_timeout（120s）させた後の 2 通目が legacy `gave_up … elapsed=120s` → 修正後 `queued elapsed=0s`。番犬 3 本が修正前ソースを file:line 名指し FAILED
-
 ## 2026-09-11（#638: 状態ファイルの tmp 名を書き込み 1 回ごとに分けた）
 - 真因は #625 と同型。tmp 名が pid 止まりなので A の rename 後に B が**本番ファイルになった同じ inode** へ書き込む（実測の途中状態 `len=8194 head="S\ns\nLLLLLLLL" tail=…lll` = 短い本文が長い本文の先頭を潰した形）+ B の rename は ENOENT で失敗
 - `shell_integration::write_state_file` を `tmux_backend::write_conf_in` と同じ作法へ（pid + `AtomicU64` の seq・rename 失敗時は tmp を掃除）。tmp 名は純粋関数 `state_tmp_name` に出して両アームを単体で固定
@@ -79,10 +59,12 @@
 - `AGENTS.md` の「状況」行（Phase 5 中断中のまま = 3 か月前）と push 運用（「公開まで main 直 push 可」）を実態へ。フェーズ詳細は `.agent/roadmap.md` 参照に寄せ、Phase 7 見出しも「✅ 公開済み・残は README 図版と CONTRIBUTING.md」へ棚卸し（#1320）
 - `.agent/commands.md` に `tako file open-in-tako`（#1182）の行を追加。コマンド名で正規化した `comm` の差分は設計上の畳み込み `tako setup bootstrap` 1 件のみ（#1324）
 - `.agent/requirements.md` の重複 FR を解消（#1319）。コードが 12 か所参照する **FR-3.18 = Code Runner は不動**、#496 の 2 行を FR-3.25 / 3.26 へ、参照ゼロの #1067 セクションを FR-2.38 へ（`:1653` の相互参照も追従）
+
 ## 2026-09-11（#1313: config_io の tmp 名を書き込み 1 回ごとに分けた）
 - #638 の同型を `config_io::atomic_write` へ。ロック無しで呼ぶ経路は 11 か所（`with_backup` 経由込み。Issue にコメントで列挙）で、legacy 実測は 3 形 = `len=0`（空 = #169 の全消失の入口）/ 短い本文が長い本文の先頭を潰した `len=5610` / rename の ENOENT
 - tmp suffix を `.tmp.{pid}.{seq}` へ（`AtomicU64`）。`.tmp.` を含む形は保つ（共有カタログが `contains(".tmp.")` で派生を外すため。catalog のテストへ新形を追加）
 - A/B `TAKO_1313_LEGACY=1`: 8 スレッド × 100 書き込みの再現は旧 **50/50 FAILED** → 新 **0/100**（負荷 81〜99 下でも 0/50）。並行テストは**統合テスト側**へ置く（同一プロセスの `ipc::tests::連続接続でfdが漏れない` の fd 計測を押し上げるため）
+
 ## 2026-09-11（#1314: psmux の conf を tmp → rename で差し替えるようにした）
 - `backend::psmux::ensure_conf` が `new-session -f` の直前に最終パスへ直書きしていた（#625 の機序③が psmux 側に残存）。`write_conf_in`（pid + 連番の tmp → rename・rename 失敗時は tmp を掃除）へ寄せ、tmux 側（#625）と同じ作法に揃えた。**内容が同じなら書かない**ので、2 回目以降の spawn は最終パスに触らない（Windows の `FILE_SHARE_DELETE` 依存の置換そのものを避ける）
 - A/B `TAKO_1314_LEGACY=1`（修正前の直書き）: 8 スレッド × 200 書き込みの再現テストが旧アーム **60/60 FAILED**（`len=0` / 短い本文が長い本文の先頭を潰した `len=55296`）→ 新アーム 0/60・負荷下（load 8 / 55〜60）0/50 × 2
