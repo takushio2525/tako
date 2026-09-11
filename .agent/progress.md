@@ -20,16 +20,6 @@
 
 ---
 
-## 2026-09-11（#1296: テストの pid ごとの data dir が消えずに溜まるのを直した）
-- #944 の隔離は「本番の外へ倒す」までで消す仕掛けが無く、再起動でも消えない macOS の `TMPDIR` に積もっていた（実測 2,188 件 + `tako-agent-config-*` 784 件 = `du` で 115 MB）。`tako_core::test_residue` に後始末を 1 実装し、作る経路（`paths::test_data_dir`）が `arm_self_cleanup`（`libc::atexit`）+ `sweep_stale_on_start`（SIGKILL 分を次回起動で回収）を持つ形へ
-- 消すのは**自分の pid か pid が生きていないもの**だけ。pid 再利用は「dir の作成時刻より後に始まったプロセス」として見分けて見送る（実測 19 件）。消す直前に生死と作成時刻を取り直して、列挙後に作り直された置き場を巻き込まない
-- 既存残骸の口は `tako test-residue`（既定 dry-run・`--apply` で実削除・MCP `tako_test_residue`）。番犬 2 本（修正前ソースで 2 件 FAILED）+ 子プロセス実測 2 本 + 単体 12 本。A/B は `TAKO_1296_LEGACY=1`
-
-## 2026-09-11（#1295: 実行拒否ゲートが claude では常に真だったのを締めた）
-- 真因は `None`（観測ゼロ）を無条件に作業ゼロと数えていたこと。claude の腕（`query_agent_status`）は `agent_work_started` を一度も代入しないので `!= Some(true)` が常に真で、`execution_refused_patterns(Claude)` に文言を 1 つ足した瞬間に正常完了した worker が `error` / `retry_spawn` へ落ちる形だった。判定を `dispatch::refusal_gate_open` の 1 実装へ閉じ、`None` を通せる系統は `agent_support::MATRIX` の新マス `worker_refusal_work_proof`（agy だけ対象外 = 代理の証拠を使う）が宣言する
-- A/B（`TAKO_1295_LEGACY=1`）: 旧アーム = 正常完了の claude worker が `status=error` / `kind=execution_refused` / `retry_spawn`、新アーム = `error` なし。#1034 の agy 経路は両アームとも分類されたまま（既存テスト緑）
-- 番犬は 4 → 7 本で doc と assert を機械で結んだ（doc の「ゲートの形」1 行を assert の入力にする）。ゲートを旧形へ戻す A/B で 4 本が `dispatch.rs:9343` 等を名指し FAILED
-
 ## 2026-09-11（#1320 / #1324 / #1319: AI 向け規約ファイルの取り残し 3 件）
 - `AGENTS.md` の「状況」行（Phase 5 中断中のまま = 3 か月前）と push 運用（「公開まで main 直 push 可」）を実態へ。フェーズ詳細は `.agent/roadmap.md` 参照に寄せ、Phase 7 見出しも「✅ 公開済み・残は README 図版と CONTRIBUTING.md」へ棚卸し（#1320）
 - `.agent/commands.md` に `tako file open-in-tako`（#1182）の行を追加。コマンド名で正規化した `comm` の差分は設計上の畳み込み `tako setup bootstrap` 1 件のみ（#1324）
@@ -69,6 +59,7 @@
 - 真因は gh の順序（ローカル切り替え → ローカル削除 → リモート削除）。worktree から実行すると 1 手目が `fatal: 'main' is already used by worktree` で落ち**リモートまで到達しない**（`git switch main` 単体で逐語再現・PR #1337 で実発生・棚卸しで merge 済み PR の head が origin に 5 本残存）
 - `delete_remote_head_branch` を MERGED 確認の後に置いた（`gh api` で存在確認 → DELETE。冪等・**その PR の head 1 本だけ**・head == base と fork の PR は触らない）。A/B `TAKO_1347_LEGACY=1` が gh 任せの腕
 - モック 4 ケース追加（worktree 事故で消し切る / legacy では残る = 検出力 / 既に消えていれば DELETE を呼ばない / head == base と fork で触らない）。72 assert 緑。この PR 自身を修正版で merge してドッグフーディング
+
 ## 2026-09-11（#1317 / #1322 / #1323: docs サイトの取り残し 3 ページを実挙動へ合わせた）
 - settings（8 タブ・`--tab` は英語スラッグのみ）/ architecture（存在しない `shelve` → `background`・IPC に Windows の named pipe）/ keyboard-shortcuts（macOS / Windows の 3 列表へ作り直し）
 - 表は `keybindings.rs` から全件起こした（macOS 45 本 / Windows 45 本・差分 0）。番犬 `crates/tako-control/tests/docs_keyboard_shortcuts.rs` が両方向を検査する（注入 3 通りでキーを名指し FAILED）
