@@ -11,6 +11,7 @@
 ## 追記フォーマット
 
 ```markdown
+
 ## YYYY-MM-DD（#Issue 一言）
 - {何を / どこを / 結果}
 - 関連コミット: `{shortsha}` `[種別] 概要`
@@ -58,6 +59,7 @@
 - 真因は「積む前の状態」を未決着かどうかで分けていなかったこと。`prompt_delivery_states` はペインを閉じるまで消えないので、素通しすると 1 時間前の `gave_up` や 10 秒前の `delivered` を新しい送達が名乗る（後者は master が届いたと判断して**監視をやめる**）
 - 判定は `tako_core::prompt_delivery::pending_predecessor`（`State::is_pending` = Queued / Waiting だけ）の 1 実装へ。絞り込みは `queued_json` の 1 箇所なので send フロー / Enter 単独 / tmux フォールバックが全部通る。MCP の説明文も一致させた
 - 隔離 GUI + 模擬 TUI の実測: 1 通目を flow_timeout（120s）させた後の 2 通目が legacy `gave_up … elapsed=120s` → 修正後 `queued elapsed=0s`。番犬 3 本が修正前ソースを file:line 名指し FAILED
+
 ## 2026-09-11（#1208: remote_link_live の実時間比較は #1220 で修正済みと確認し、再現の作法を規約へ）
 - Issue は #1220（`3a0ea26`）の重複で、現行 main のテストは既に `scan_counters` の量比較。番犬 `test_timing_watchdog` は `crates/*/tests` 全体を見ており（`tako-core` への注入も名指し）、旧版を戻すと `remote_link_live.rs:247: assert(… warm <= cold …)` で FAILED
 - 症状解消を実測: 新実装は負荷下 330 回 + 同時 16 本 × 10 ラウンドで **0 FAILED**。旧実装は `yes` 負荷では 0/170 だが**バイナリ多重同時起動**で 3/160 反転（1 件は Issue と同じ `初回 24.5ms / 2 回目 38.8ms`）
