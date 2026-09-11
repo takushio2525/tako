@@ -10,6 +10,10 @@
 //! `eprintln!` は誰も読めないので『押しても無言』になる（#1283 と同じ穴）」と
 //! 明記しているのに、そこから逸脱していたのが本体。#1283 / #1376 が同型の前例。
 //!
+//! #1417 で、この走査が見つけた**別画面の 3 件**（右パネルの tmux window 切替 /
+//! プレビューの目次ジャンプ・ページジャンプ）も同じ 1 実装へ寄せた。
+//! `KNOWN_DISCARDED` は空になり、番犬は全 UI モジュールを素で縛っている。
+//!
 //! 走査対象は tako-app の UI モジュール（`main.rs` を除く）。`main.rs` を外すのは
 //! `ui_dispatch_attach_watchdog` と同じ理由で、production と隔離セルフテスト /
 //! visual-test が同居しており**ソース走査では両者を区別できない**ため
@@ -25,21 +29,18 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// まだ通知欄へ寄せていない「dispatch の結果を捨てる」既知の 3 件（#1399）。
+/// まだ通知欄へ寄せていない「dispatch の結果を捨てる」既知の箇所。
 ///
-/// #1399 が直したのは**ファイルツリー**（`sidebar.rs`）の 13 か所。同じ形が
-/// **別の画面**に 3 つ残っている（右パネルの tmux window 切替 / プレビューの
-/// 目次ジャンプ・ページジャンプ）。1 つの PR で他の画面まで動かすと前後比較が
-/// 画面ごとに取れず、出し先（どの通知欄へ出すか）もその画面ごとに決める話なので、
-/// 番犬を先に入れて**新規の混入を止める**形にした。
+/// #1399 が直したのは**ファイルツリー**（`sidebar.rs`）の 13 か所で、別の画面に
+/// 残っていた 3 件（右パネルの tmux window 切替 / プレビューの目次ジャンプ・
+/// ページジャンプ）は段階導入のためここに宣言していた。**#1417 で 3 件とも
+/// 通知欄へ寄せたので空**。
 ///
 /// リストは**減る方向にしか動かさない**（下のテストが、直したのに残っている
-/// エントリを落とす）。キーは `ファイル名:Request 名`
-const KNOWN_DISCARDED: &[&str] = &[
-    "right_panel.rs:TmuxSelectWindow",
-    "preview_render.rs:PreviewOutline",
-    "preview_render.rs:PreviewView",
-];
+/// エントリを落とす）。空のまま保つこと = 新しい画面で `Err` を捨てたら、
+/// ここへ足して素通りさせるのではなく [`TakoApp::notify_ui_dispatch_failed`]
+/// を通す。キーは `ファイル名:Request 名`
+const KNOWN_DISCARDED: &[&str] = &[];
 
 /// `Err` を扱ったと認めるしるし。`match` のアーム / `if let Err(` / `map_err` の
 /// どれかが**その呼び出しの窓の中**に居ること
@@ -144,6 +145,25 @@ fn scan_discarded(file: &str, src: &str) -> (Vec<Offender>, usize) {
     (offenders, call_lines.len())
 }
 
+/// 関数の中身だけを切り出す（次の `fn` の手前まで。上限 1400 文字）。
+///
+/// 「見出しから下へ N 文字」で切ると**隣の関数の `notify_…` を自分のものと数える**
+/// （実測: 目次のハンドラから通知を外しても、その下のページのハンドラの
+/// `notify_ui_dispatch_failed` を拾って素通りした）。`scan_discarded` の窓の
+/// 上限と同じ理由で、隣へ食い込ませない
+fn fn_body(rest: &str) -> String {
+    let capped: String = rest.chars().take(1400).collect();
+    match capped
+        .find("\n    fn ")
+        .into_iter()
+        .chain(capped.find("\n    pub(crate) fn "))
+        .min()
+    {
+        Some(end) => capped[..end].to_string(),
+        None => capped,
+    }
+}
+
 fn ui_modules(root: &Path) -> Vec<PathBuf> {
     let dir = root.join("crates/tako-app/src");
     let mut out = Vec::new();
@@ -195,8 +215,8 @@ fn ツリーのローカル操作はdispatchの結果を捨てていない() {
          データを消す操作（ごみ箱移動）や名前を打つ操作（リネーム）の失敗が無言になり、\
          ユーザーには「押せていないのか / 消えたのに表示が古いのか」が区別できない。\
          `.agent/conventions.md`（境界 B8）の「弾いたら黙って捨てない」に従い、\
-         `notify_tree_dispatch_failed` で共有の通知欄（`remote_notice`）へ \
-         `tr!` を通した 1 行を出すこと:\n  {}",
+         `notify_ui_dispatch_failed`（画面は `NoticeArea`）で共有の通知欄\
+         （`remote_notice`）へ `tr!` を通した 1 行を出すこと:\n  {}",
         unknown.join("\n  ")
     );
     let stale: Vec<&str> = KNOWN_DISCARDED
@@ -237,40 +257,109 @@ fn ローカル操作の失敗は1実装から出ている() {
     let src = sidebar_src(&root);
     // 出し口の本体（persist.log + 共有の通知欄 + A/B の逃げ道）
     let body = src
-        .split_once("fn notify_tree_failure(")
+        .split_once("fn notify_ui_failure(")
         .map(|(_, rest)| rest.chars().take(1200).collect::<String>())
-        .expect("`notify_tree_failure` が sidebar.rs に無い（#1399 の出し口）");
+        .expect("`notify_ui_failure` が sidebar.rs に無い（#1399 / #1417 の出し口）");
     for mark in [
         "diag::persist_log",
         "self.set_remote_notice(",
-        "legacy_1399()",
+        "legacy_suppressed()",
     ] {
         assert!(
             body.contains(mark),
-            "`notify_tree_failure` が {mark} を通っていない（#1399）。\
+            "`notify_ui_failure` が {mark} を通っていない（#1399 / #1417）。\
              通知欄と persist.log と A/B の逃げ道は 1 実装が担うこと"
         );
     }
-    // 薄い包み 3 本はすべてこの出し口を呼ぶ（画面へ出す経路を 2 本にしない）
+    // 薄い包み 4 本はすべてこの出し口を呼ぶ（画面へ出す経路を 2 本にしない）
     for wrapper in [
-        "fn notify_tree_dispatch_failed(",
+        "fn notify_ui_dispatch_failed(",
         "fn notify_tree_op_failed(",
         "fn notify_tree_open_failed(",
     ] {
         let after = src
             .split_once(wrapper)
             .map(|(_, rest)| rest.chars().take(700).collect::<String>())
-            .unwrap_or_else(|| panic!("{wrapper} が sidebar.rs に無い（#1399）"));
+            .unwrap_or_else(|| panic!("{wrapper} が sidebar.rs に無い（#1399 / #1417）"));
         assert!(
-            after.contains("self.notify_tree_failure("),
-            "{wrapper} が `notify_tree_failure` を通っていない（#1399）"
+            after.contains("self.notify_ui_failure("),
+            "{wrapper} が `notify_ui_failure` を通っていない（#1399 / #1417）"
         );
     }
+    let tree = src
+        .split_once("fn notify_tree_dispatch_failed(")
+        .map(|(_, rest)| rest.chars().take(700).collect::<String>())
+        .expect("`notify_tree_dispatch_failed` が sidebar.rs に無い（#1399）");
+    assert!(
+        tree.contains("self.notify_ui_dispatch_failed("),
+        "`notify_tree_dispatch_failed` が画面横断の出し口を通っていない（#1417）"
+    );
     // 文言は ui_text のカタログ経由（render へ直書きしない = i18n の規約）
     for key in ["notice_op_failed(", "notice_open_failed("] {
         assert!(
             src.contains(&format!("crate::ui_text::sidebar::{key}")),
             "通知文言 {key} が ui_text のカタログを通っていない（#1399 / #435）"
+        );
+    }
+}
+
+/// ツリー以外の画面（右パネル・プレビュー）も**同じ 1 実装**から出していること（#1417）。
+///
+/// 画面ごとに `set_remote_notice` を直に呼ぶと、出し方（persist.log を残すか /
+/// A/B の逃げ道があるか）が画面ごとにずれて「片方だけ無言」がまた生まれる。
+/// #1399 の 1 実装を**再利用**して 3 実装目を作らないことを機械で縛る
+#[test]
+fn 別画面の失敗も同じ出し口から出ている() {
+    let root = workspace_root();
+    for (file, handlers) in [
+        (
+            "crates/tako-app/src/right_panel.rs",
+            &["fn tmux_window_row_clicked("][..],
+        ),
+        (
+            "crates/tako-app/src/preview_render.rs",
+            &[
+                "fn preview_outline_item_clicked(",
+                "fn preview_page_item_clicked(",
+            ][..],
+        ),
+    ] {
+        let src = std::fs::read_to_string(root.join(file)).expect("UI モジュールが読める");
+        let name = file.rsplit('/').next().unwrap_or(file);
+        for handler in handlers {
+            let body = src
+                .split_once(handler)
+                .map(|(_, rest)| fn_body(rest))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name} に `{handler}` が無い（#1417）。\
+                         クリックの中身は `render` のクロージャから切り出しておくこと\
+                         （合成マウスイベントは GPUI へ届かないので、セルフテストが\
+                         呼べる名前が無いと前後比較が取れない）"
+                    )
+                });
+            assert!(
+                body.contains("self.notify_ui_dispatch_failed("),
+                "{name} の `{handler}` が `notify_ui_dispatch_failed` を通っていない（#1417）"
+            );
+            assert!(
+                body.contains("NoticeArea::"),
+                "{name} の `{handler}` が画面（`NoticeArea`）を渡していない（#1417）。\
+                 persist.log の `area=` がどの画面か分からなくなる"
+            );
+        }
+        let raw: Vec<&str> = src.lines().collect();
+        let direct: Vec<String> = strip_comment_lines(&raw)
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains("set_remote_notice("))
+            .map(|(i, _)| format!("{name}:{}", i + 1))
+            .collect();
+        assert!(
+            direct.is_empty(),
+            "{direct:?} が共有の通知欄を直に呼んでいる（#1417）。\
+             出し口は `notify_ui_dispatch_failed` の 1 つに保つこと\
+             （直呼びは persist.log と A/B の逃げ道を素通りする）"
         );
     }
 }

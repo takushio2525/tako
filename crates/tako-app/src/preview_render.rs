@@ -431,6 +431,72 @@ mod pdf_hit_test_tests {
 }
 
 impl TakoApp {
+    /// プレビューの目次の行を押したときの処理（#680 / #1417）。
+    ///
+    /// `render` のクロージャから切り出してあるのは、**クリックが通る経路そのもの**を
+    /// セルフテストから呼ぶため。以前は `if dispatch(..).is_ok()` で `Err` を落として
+    /// いたので、その項目へ飛べない（見出しがもう無い / プレビューが別の種類へ
+    /// 変わった）ときに**押しても何も起きない**だけだった。成功したときだけ
+    /// パネルを閉じる挙動は据え置き、失敗はツリー（#1399）と同じ通知欄へ出す
+    pub(crate) fn preview_outline_item_clicked(
+        &mut self,
+        pane_id: PaneId,
+        item_number: usize,
+        item_title: &str,
+        cx: &mut Context<Self>,
+    ) {
+        match tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::PreviewOutline {
+                pane: Some(pane_id.as_u64()),
+                item: Some(item_number),
+            },
+            PaneOrigin::User,
+        ) {
+            Ok(_) => self.preview_navigation_panel = None,
+            Err(e) => self.notify_ui_dispatch_failed(
+                crate::sidebar::NoticeArea::Preview,
+                crate::ui_text::preview::op_outline_jump(),
+                Some(item_title),
+                &e,
+            ),
+        }
+        cx.notify();
+    }
+
+    /// プレビューのページ一覧の行を押したときの処理（#271 / #1417）。
+    /// 目次と同じ理由でクロージャから切り出してある
+    pub(crate) fn preview_page_item_clicked(
+        &mut self,
+        pane_id: PaneId,
+        page: usize,
+        cx: &mut Context<Self>,
+    ) {
+        match tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::PreviewView {
+                pane: Some(pane_id.as_u64()),
+                zoom: None,
+                zoom_in: false,
+                zoom_out: false,
+                reset: false,
+                page: Some(page),
+                pan_x: None,
+                pan_y: None,
+            },
+            PaneOrigin::User,
+        ) {
+            Ok(_) => self.preview_navigation_panel = None,
+            Err(e) => self.notify_ui_dispatch_failed(
+                crate::sidebar::NoticeArea::Preview,
+                crate::ui_text::preview::op_goto_page(),
+                Some(&crate::ui_text::preview::page_n(page)),
+                &e,
+            ),
+        }
+        cx.notify();
+    }
+
     /// 表示幅・device scale に合う PDF 画像を background で用意する。
     /// 64px / 1% 量子化キーが変わった時だけ要求し、連続リサイズは 120ms debounce 後の
     /// 最新要求だけを実行する。結果待ち中は旧画像を拡縮表示して UI を止めない。
@@ -2812,6 +2878,9 @@ impl TakoApp {
                             .enumerate()
                             .map(|(index, item)| {
                                 let item_number = index + 1;
+                                // 失敗の通知に出す対象名（#1417）。押した見出しの文言を
+                                // そのまま出すので「どれが飛べなかったか」が分かる
+                                let item_title = item.title.clone();
                                 let indent = f32::from(item.level.saturating_sub(1)) * 12.0;
                                 div()
                                     .id((
@@ -2843,19 +2912,12 @@ impl TakoApp {
                                     )
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         cx.stop_propagation();
-                                        if tako_control::dispatch(
-                                            this,
-                                            tako_control::protocol::Request::PreviewOutline {
-                                                pane: Some(pane_id.as_u64()),
-                                                item: Some(item_number),
-                                            },
-                                            PaneOrigin::User,
-                                        )
-                                        .is_ok()
-                                        {
-                                            this.preview_navigation_panel = None;
-                                        }
-                                        cx.notify();
+                                        this.preview_outline_item_clicked(
+                                            pane_id,
+                                            item_number,
+                                            &item_title,
+                                            cx,
+                                        );
                                     }))
                                     .child(
                                         svg()
@@ -2914,25 +2976,7 @@ impl TakoApp {
                                     )
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         cx.stop_propagation();
-                                        if tako_control::dispatch(
-                                            this,
-                                            tako_control::protocol::Request::PreviewView {
-                                                pane: Some(pane_id.as_u64()),
-                                                zoom: None,
-                                                zoom_in: false,
-                                                zoom_out: false,
-                                                reset: false,
-                                                page: Some(page),
-                                                pan_x: None,
-                                                pan_y: None,
-                                            },
-                                            PaneOrigin::User,
-                                        )
-                                        .is_ok()
-                                        {
-                                            this.preview_navigation_panel = None;
-                                        }
-                                        cx.notify();
+                                        this.preview_page_item_clicked(pane_id, page, cx);
                                     }))
                                     .child(SharedString::from(crate::ui_text::preview::page_n(page)))
                                     .into_any_element()

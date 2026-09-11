@@ -392,13 +392,20 @@ Windows の `ShellExecuteW`）で、これは「URL を開く API」ではなく
   実在しないので、通すとローカルの実行ファイルが「URL」になる
 - **弾いたら黙って捨てない**。GUI の `eprintln!` は誰も読めないので「押しても無言」に
   なる（#1283 と同じ穴）。共有の通知欄（`remote_notice`）へ `tr!` を通した 1 行を出す
-- **ファイルツリーのローカル操作も同じ通知欄**（#1399）。`let _ = dispatch(..)` /
+- **UI から dispatch を呼ぶ画面はすべて同じ通知欄**（#1399 / #1417）。`let _ = dispatch(..)` /
   `if result.is_ok()` で `Err` を捨てると、**ごみ箱移動やリネームの失敗が無言**になる
   （ラベルは削除を約束しているのに消えず理由も出ない / 打った名前ごと消える）。
-  出し口は `sidebar::notify_tree_failure` の 1 実装で、リモート行（#919）と同じ
-  `set_remote_notice` へ寄せる。番犬は `issue1399_tree_notice_watchdog`
+  出し口は `sidebar::notify_ui_failure` の 1 実装で、リモート行（#919）と同じ
+  `set_remote_notice` へ寄せる。**画面は増えても口は増やさない**: 画面の区別は
+  `sidebar::NoticeArea`（persist.log の `area=` と A/B の逃げ道の選択に使う）だけで持ち、
+  呼ぶのは `notify_ui_dispatch_failed` 1 本にする（#1417 で右パネルの tmux window 切替と
+  プレビューの目次 / ページ移動を同じ口へ寄せた）。番犬は `issue1399_tree_notice_watchdog`
   （UI モジュールの dispatch 呼び出しを走査し、捨てている箇所を file:line で名指す。
-  別画面の残りは `KNOWN_DISCARDED` で段階導入）
+  `KNOWN_DISCARDED` は #1417 で**空**になった = 新しい画面で捨てたら必ず落ちる）
+- **クリックの中身は `render` のクロージャから切り出す**（#1417）。合成マウスイベントは
+  GPUI へ届かないことがあるので、`on_click` の中に直接書くと**押した経路をセルフテストから
+  叩けない**（前後比較が取れない = #1399 で「その間の 1 行」が未検証として残った形）。
+  名前を付けて `on_click` はそれを呼ぶだけにし、セルフテストは同じ名前を叩く
 - **診断へリンク文字列そのものを出さない**。PDF / 画面の中身はペイン内容に相当するので、
   `persist.log` へ載せてよいのは理由の分類（`UrlBlocked`）だけ。dispatch 由来の失敗は
   `DispatchError::class()`（#1399）が分類を返すので、本文（パス・OS のエラー文）は

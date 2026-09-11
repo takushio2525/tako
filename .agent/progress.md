@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-12（#1401: remote stop の stale 経路にも PID の正体確認を通した）
-- #329 の fail-safe が stale 経路（PID ファイル無し → `/api/health` の pid を撃つ）に無かった。確認を `kill_stale_daemon` の**内側**へ移して結果型にし（呼び出し側で忘れられない形）、`ps` 出力が**空**のときも「確認できない = 撃たない」へ倒した（判定は `ps_args_is_tako_remote_serve` の 1 実装）。中止時は state を残し理由 + 手順を返す
-- 修正前の実測（隔離 state・偽 health + 使い捨て `/bin/sleep`）: 実 CLI が sleep を殺して `{"stopped":true}` を返す / health が停止操作プロセス自身の pid を返す形ではテストバイナリが `signal: 15` で落ちた。修正後は sleep 生存・exit=1・state 残存
-- 番犬 `issue1401_stale_stop_identity_watchdog` 7 本（注入 6 通りで `remote.rs:2185` / `2223` / `2364` / `2788` を file:line 名指し）。workspace 4430 passed 0 failed・check-windows error 0。**install 要**
-
 ## 2026-09-12（#1400: ssh config の Match の設定が直前の Host へ混入して宛先が化けるのを直した）
 - 状態を `Section` の 2 値へ（`Match` / `Include` のあとは「どの Host にも属さない位置」）。キーワードは行頭の最初のトークンで切る（`Match exec "test -f a=b"` で検知が抜けていた）。複数パターンは全部エントリ・`Include` は `~/.ssh/` 起点 + glob + 深さ 16 + 循環検出つきで解決し、読めない理由は `warnings` へ返す
 - 隔離 GUI（tako-vd・fixture HOME）で `tako ssh-hosts` の A/B: 修正前は `web1` と `prod(user=root port=2222)` の 2 件、修正後は `edge` / `inner`（Include 配下）/ `web1` / `web2` / `prod(user=null port=null)` の 5 件
@@ -59,3 +54,8 @@
 - 原因は 3 つ重なっていた: ①列挙が `backend_sessions` 起点 ②live 解決のキーが器のセッション名だけ ③**判定表が alt screen をチャットより先に見る**（器なしでは claude の TUI 自身が alt screen = Issue に無かった 3 つ目）。キーを `agents::LiveSessionKey`（器あり = セッション名 / 器なし = (ペイン ID, PTY 直下の子 pid)）へ広げ、列挙を `terminals` 起点に、表を「チャット確定 → alt screen」へ
 - 隔離 GUI（tako-vd・tmux サーバー無し・persist OFF）の A/B: 新 = `pane_display=chat`（`alt_screen:true` / `claude_chat:true`）で実会話も読める。legacy（`TAKO_1397_LEGACY=1`）は実 claude TUI が生きたまま 21 サンプル（約 105 秒）すべて `terminal`。器あり（persist ON）と混在は前後どちらも `chat` で不変
 - 番犬 9 本 + 単体 8 本（注入 7 通りで file:line 名指し）。波及で **#853 の fixture 保護が器の有無を問わず必須**になり、旧順序を固定していた項目 94 の alt screen 節（#702）を新規則へ寄せた（`main.rs` は 9 行）。隔離セルフテスト完走・legacy では項目 94 が落ちる
+
+## 2026-09-12（#1417: 右パネル・プレビューの失敗も同じ通知欄へ出した）
+- #1399 の番犬が `KNOWN_DISCARDED` に残していた同型 3 件（`right_panel.rs:TmuxSelectWindow` / `preview_render.rs:PreviewOutline` / `PreviewView`）を同じ 1 実装へ寄せた。出し口は `notify_tree_failure` → **`notify_ui_failure(area, ..)`** へ改名し、画面は `sidebar::NoticeArea`（persist.log の `area=` と A/B の逃げ道の選択）だけで区別する（3 実装目を作らない）。クリックの中身は `render` のクロージャから名前付きハンドラ 3 本へ切り出した（合成マウスが届かないのでセルフテストが叩ける名前が要る）
+- 隔離 GUI（tako-vd）セルフテスト項目 84c の A/B: 新 = `win="window 切替 に失敗しました（9999:gone）: ペイン 3 に tmux セッションがない…"` / `outline="目次へ移動 に失敗しました（存在しない見出し）: …"` / `page="ページ移動 に失敗しました（ページ 999）: …"` / 上書き・閉じた直後の再失敗・成功時無言すべて取得 → 完走（`TAKO_APP_SELF_TEST_OK`）。legacy（`TAKO_1417_LEGACY=1`）は 3 つとも `None` で **FAILED**。persist.log は `area=right_panel op=window 切替 分類=operation` の形（本文は載せない）
+- 番犬 9 本（`KNOWN_DISCARDED` は空・新規 1 本が別画面の 1 実装と直呼び増殖を縛る）。注入 7 通りで file:line 名指し FAILED（`right_panel.rs:231` / `preview_render.rs:448` / `:475` / `right_panel.rs:245`）。走査窓が隣の関数へ食い込む穴を `fn_body` で塞いだ（#1399 が踏んだのと同型）

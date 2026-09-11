@@ -49093,6 +49093,176 @@ mod self_test {
                 }
             }
 
+            // 84c. #1417: ツリー**以外**の画面（右パネルの tmux window 行・プレビューの
+            // 目次 / ページ移動）の失敗も、ツリーと同じ共有の通知欄へ 1 行出る。
+            // この 3 か所は `let _ = dispatch(..)` / `if ....is_ok()` で `Err` を
+            // 落としていたので、**行を押しても何も起きない**だけだった（#1399 の番犬が
+            // `KNOWN_DISCARDED` に既知として残していた同型 3 件）。
+            // **A/B は `TAKO_1417_LEGACY=1`**（legacy アームはここが FAILED になる）。
+            //
+            // 合成マウスイベントは GPUI へ届かないことがあるので、クリックではなく
+            // `on_click` が呼ぶ関数そのものを叩く（#1399 の 84b と同じ作法）。
+            // 失敗させるのは **dispatch が外部プロセスへ行く前に返す形**
+            // （ターミナルペインは tmux セッションでもプレビューでもない）
+            {
+                let term_pane = window
+                    .update(cx, |app, _, _| app.focused_pane())
+                    .unwrap_or(PaneId::from_raw(1));
+                let (win_notice, outline_notice, page_notice, overwritten, after_dismiss) = window
+                    .update(cx, |app, _, cx| {
+                        app.remote_notice = None;
+                        // ① 右パネルの tmux window 行
+                        app.tmux_window_row_clicked(term_pane, 9_999, "9999:gone", cx);
+                        let win_notice = app
+                            .remote_notice
+                            .as_ref()
+                            .filter(|n| n.is_error)
+                            .map(|n| n.text.clone());
+                        // ② プレビューの目次（エッジ: 直前の失敗を表示中でも上書きされる）
+                        app.preview_outline_item_clicked(term_pane, 999, "存在しない見出し", cx);
+                        let outline_notice = app
+                            .remote_notice
+                            .as_ref()
+                            .filter(|n| n.is_error)
+                            .map(|n| n.text.clone());
+                        let overwritten = outline_notice != win_notice;
+                        // ③ プレビューのページ移動
+                        app.preview_page_item_clicked(term_pane, 999, cx);
+                        let page_notice = app
+                            .remote_notice
+                            .as_ref()
+                            .filter(|n| n.is_error)
+                            .map(|n| n.text.clone());
+                        // ④ エッジ: 通知を閉じた直後に同じ失敗をしてもまた出る
+                        app.remote_notice = None;
+                        app.preview_page_item_clicked(term_pane, 999, cx);
+                        let after_dismiss = app
+                            .remote_notice
+                            .as_ref()
+                            .filter(|n| n.is_error)
+                            .map(|n| n.text.clone());
+                        app.remote_notice = None;
+                        cx.notify();
+                        (
+                            win_notice,
+                            outline_notice,
+                            page_notice,
+                            overwritten,
+                            after_dismiss,
+                        )
+                    })
+                    .unwrap_or((None, None, None, false, None));
+
+                // ⑤ 裏取り: **成功する操作では通知を出さない**（誤検知していない）。
+                // 目次が実在する Markdown プレビューを専用タブに開いて 1 項目目へ飛ぶ
+                let md1417 = std::env::temp_dir().join(format!(
+                    "tako-st1417-{}-note.md",
+                    std::process::id()
+                ));
+                let _ = std::fs::write(&md1417, "# 見出し A\n\n本文\n\n## 見出し B\n\n本文\n");
+                let preview_pane = window
+                    .update(cx, |app, _, cx| {
+                        let pane = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::OpenFile {
+                                pane: None,
+                                path: md1417.display().to_string(),
+                                mode: Some(tako_control::protocol::PreviewModeWire::Markdown),
+                                direction: None,
+                                focus: Some(false),
+                                new_tab: true,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                        .and_then(|v| v.get("pane").and_then(serde_json::Value::as_u64))
+                        .map(PaneId::from_raw);
+                        // Markdown は background 読み込み。直接 dispatch では IPC ループの
+                        // drain を通らないので手動で流す（#680 の項目と同じ理由）
+                        app.drain_pending_preview_loads(cx);
+                        cx.notify();
+                        pane
+                    })
+                    .ok()
+                    .flatten();
+                let outline_ready = match preview_pane {
+                    Some(pane) => {
+                        wait_for_app_state(
+                            window,
+                            cx,
+                            "84c の前提: Markdown プレビューの目次が読める",
+                            state_wait_budget(Duration::from_secs(10), machine_busy()),
+                            move |app| {
+                                app.preview_outline(pane)
+                                    .is_some_and(|o| !o.items.is_empty())
+                            },
+                        )
+                        .await
+                    }
+                    None => false,
+                };
+                let ok_silent = match preview_pane {
+                    Some(pane) => window
+                        .update(cx, |app, _, cx| {
+                            app.remote_notice = None;
+                            app.preview_navigation_panel =
+                                Some((pane, PreviewNavigationPanel::Outline));
+                            app.preview_outline_item_clicked(pane, 1, "見出し A", cx);
+                            // 成功 = 通知は出ず、開いていたパネルが閉じる
+                            let silent = app.remote_notice.is_none()
+                                && app.preview_navigation_panel.is_none();
+                            let _ = tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::Close {
+                                    pane: Some(pane.as_u64()),
+                                    force: true,
+                                    caller_role: None,
+                                },
+                                PaneOrigin::Cli,
+                            );
+                            cx.notify();
+                            silent
+                        })
+                        .unwrap_or(false),
+                    None => false,
+                };
+                let _ = std::fs::remove_file(&md1417);
+
+                println!(
+                    "TAKO_SELF_TEST_1417: legacy={} win={win_notice:?} outline={outline_notice:?} \
+                     page={page_notice:?} overwritten={overwritten} \
+                     after_dismiss={after_dismiss:?} outline_ready={outline_ready} \
+                     ok_silent={ok_silent}",
+                    TakoApp::legacy_1417(),
+                );
+                let win_ok = win_notice
+                    .as_deref()
+                    .is_some_and(|t| {
+                        t.starts_with(crate::ui_text::panel::op_select_window())
+                            && t.contains("9999:gone")
+                    });
+                let outline_ok = outline_notice.as_deref().is_some_and(|t| {
+                    t.starts_with(crate::ui_text::preview::op_outline_jump())
+                        && t.contains("存在しない見出し")
+                });
+                let page_ok = page_notice.as_deref().is_some_and(|t| {
+                    t.starts_with(crate::ui_text::preview::op_goto_page())
+                        && t.contains(&crate::ui_text::preview::page_n(999))
+                });
+                check(
+                    win_ok,
+                    "右パネル: tmux window 切替の失敗が通知欄へ出る（#1417）",
+                );
+                check(
+                    outline_ok && page_ok && overwritten,
+                    "プレビュー: 目次 / ページ移動の失敗が通知欄へ出て最後の 1 件が残る（#1417）",
+                );
+                check(
+                    after_dismiss.is_some() && outline_ready && ok_silent,
+                    "別画面: 通知を閉じた直後も出る・成功時は無言（#1417）",
+                );
+            }
+
             // 85. git タブのセクション表示順（#551 案 2）。
             // 「変更 → コミット → ブランチ → リモート → diff」の順に積まれることを
             // render が実際に記録した並び（`git_body_sections`）で固定する。

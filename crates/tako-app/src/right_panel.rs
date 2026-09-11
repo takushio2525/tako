@@ -214,6 +214,38 @@ struct OrchCard {
 }
 
 impl TakoApp {
+    /// 右パネルの tmux window 行を押したときの処理（#1185 / #1417）。
+    ///
+    /// `render` のクロージャから切り出してあるのは、**クリックが通る経路そのもの**を
+    /// セルフテストから呼ぶため（合成マウスイベントは GPUI へ届かないことがある）。
+    /// 以前は `let _ = dispatch(..)` で結果を捨てていたので、window が既に消えている /
+    /// そのペインに tmux セッションがないときに**押しても何も起きない**だけだった。
+    /// 失敗はツリー（#1399）と同じ共有の通知欄 + persist.log へ出す
+    pub(crate) fn tmux_window_row_clicked(
+        &mut self,
+        pane: PaneId,
+        window: u32,
+        target_label: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(e) = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::TmuxSelectWindow {
+                pane: Some(pane.as_u64()),
+                window,
+            },
+            PaneOrigin::User,
+        ) {
+            self.notify_ui_dispatch_failed(
+                crate::sidebar::NoticeArea::RightPanel,
+                crate::ui_text::panel::op_select_window(),
+                Some(target_label),
+                &e,
+            );
+        }
+        cx.notify();
+    }
+
     /// 縦積みにし、文言が長くてもボタンがパネル右端へ見切れないようにする
     /// （flex_row 一列だと長文時にボタンごと overflow_hidden で切られる。2026-06-13 実機）。
     /// `confirm_pane` = Some ならペイン kill（dispatch Close）、None なら tmux kill
@@ -1669,6 +1701,9 @@ impl TakoApp {
                         }
                         let win_index = w.index;
                         let win_label = format!("  ↳ {}:{}", w.index, truncate(&w.name, 16));
+                        // 通知欄に出す対象名（#1417）。行ラベルは表示用の矢印と
+                        // インデントを含むので、失敗の文には素の `index:name` を出す
+                        let win_target = format!("{}:{}", w.index, w.name);
                         let win_pane_count = w.panes;
                         let win_pinned = self
                             .pinned_previews
@@ -1691,15 +1726,7 @@ impl TakoApp {
                                 .text_color(hsla(theme.tab_inactive_foreground))
                                 .hover(|d| d.bg(rgba_alpha(theme.tab_bar_background, 0.8)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    let _ = tako_control::dispatch(
-                                        this,
-                                        tako_control::protocol::Request::TmuxSelectWindow {
-                                            pane: Some(pane.as_u64()),
-                                            window: win_index,
-                                        },
-                                        PaneOrigin::User,
-                                    );
-                                    cx.notify();
+                                    this.tmux_window_row_clicked(pane, win_index, &win_target, cx);
                                 }))
                                 .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
                                     if *hovered {
