@@ -19,11 +19,6 @@
 
 ---
 
-## 2026-09-09（#1283: ~ 始まりのパスを地の文の中でも cmd+クリックで開けるようにした）
-- 真因は見立て（`~` 展開 / `.mp4` のプレビュー非対応 / soft wrap）と別で、**トークンの区切りが ASCII の空白と `()[]{}<>,;` だけ**だったこと。日本語の文にパスが埋まると**文ごと 1 トークン**になり実在チェックで落ちる（実測トークン: `` 動画は`~/…mp4`、確認して。`` / `~/…mp4このリンクが` = **素の形だけが飛べていた**）
-- 区切り集合は増やさず（`資料（最新）.pdf` のような実在名を落とす）**トークン全体 → 文字種の切り替わりで削った候補**を長い順に試す形へ（`links::path_candidates`。全 ASCII は候補を増やさない / `/` 終わりは採らない）。囲みの前に地の文がくっつく形（空白入りパス）は**途中のバッククォートで切る**ことで回収。`open_plan` を「拡張子 → 開き方」の正本にし（`.mp4` = 動画プレビュー）、開けなかったときの `eprintln!` を通知 + persist.log へ。CLI `tako links` / MCP `tako_links` を新設
-- A/B `TAKO_1283_LEGACY=1` で 2 形が `[]` に戻る（素の形は残る）。隔離 GUI（tako-vd）の実画面で 3 形すべて検出 + `open=video`・セルフテスト項目 147 に 2 形を追加して `TAKO_APP_SELF_TEST_OK`
-
 ## 2026-09-11（#1261: 単体テストが実 agy / codex を起こして本番ホームへ書かないようにした）
 - 起動元は空 HOME + 偽 CLI の shim で 2 本に特定（`setup_bootstrap::tests::状態は3系統ぶんまとめて返せる` = `agy models` / `codex login status` / `claude auth status --json`、`stale_binary::tests::test_check_stale_different_binary` = `claude --version`）。**tako が書かなくても実 CLI は起動しただけで自分のホームを作る**
 - 問い合わせ起動を `tako_control::agent_probe::run` の 1 か所へ寄せた。判定は実行時（`paths::is_test_process`。#1253 の brew と同型）で、#586 のコンソール窓抑止もここが当てる
@@ -63,6 +58,7 @@
 - Issue は #1220（`3a0ea26`）の重複で、現行 main のテストは既に `scan_counters` の量比較。番犬 `test_timing_watchdog` は `crates/*/tests` 全体を見ており（`tako-core` への注入も名指し）、旧版を戻すと `remote_link_live.rs:247: assert(… warm <= cold …)` で FAILED
 - 症状解消を実測: 新実装は負荷下 330 回 + 同時 16 本 × 10 ラウンドで **0 FAILED**。旧実装は `yes` 負荷では 0/170 だが**バイナリ多重同時起動**で 3/160 反転（1 件は Issue と同じ `初回 24.5ms / 2 回目 38.8ms`）
 - 検出力の差が決定的: リンク memo を殺すと旧は 2/10 しか落ちない（8 回見逃し）・所在 memo は 0/10。新は両方 10/10。コード修正は不要で #1208 は close、再現の作法だけ `.agent/conventions.md` へ残した
+
 ## 2026-09-11（#1300: trust_auto_accept_e2e の tmux 起動失敗を診断で割れる形にして真因を直した）
 - 真因は見立て（#1265 と同じ PTY 枯渇）と別で**固定名の取り合い**。器のソケットもセッション名も定数なので、同じ機で `cargo test --workspace` が 2 本並ぶと片方が 0.03 秒で `duplicate session: tako1236new` に当たり、後始末の `kill-session -t <固定名>` は相手のセッションまで消す（失敗時の実測は PTY 103/511・ソケット 206 = 枯渇していない）
 - 器の名前・起動・後始末・診断を `tests/common/tmux_e2e.rs` の 1 実装へ（pid つきソケット + 期限つき + 失敗時に stderr / そのソケットのセッション / PTY / ソケット / サーバー数 / load、**このプロセスの最後の 1 本**でだけ器を畳む）。tako-control の実 tmux e2e 7 本を寄せ、番犬 2 本が修正前ソースの 28 か所を名指し FAILED
