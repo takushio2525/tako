@@ -18,7 +18,7 @@
   2 系統同時なので `warnings` が 1 行出るのは既知（#1038）
 - **検証用 GUI は常設の仮想ディスプレイ `tako-vd` へ出す**（#1141 / #1150 / #1160。ユーザーの
   メイン画面に窓を出さない）。起動前に `scripts/lib/virtual-display.sh ensure`、
-  レシピは `.agent/conventions.md`（`-u TERM -u COLORTERM` まで揃える）
+  レシピは `.agent/conventions.md`（`-u TERM -u COLORTERM` は不要になった = #946）
 - **検収の status 読みは `/Applications/tako.app/Contents/MacOS/tako` で叩く**（PATH 先頭の
   `~/dev/tako/target` が stale だと新フィールドがキーごと無い = #432 と同じ罠）
 - 作業は**専用 worktree**・main 直 push はしない（docs も PR 経由）
