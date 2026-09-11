@@ -26694,6 +26694,68 @@ mod self_test {
         }
     }
 
+    /// **打ち込んだ CLI コマンドの結果を待つ予算**（純粋関数。#1353 / #1364）。
+    ///
+    /// ペインへ打った `tako …` が判定できる形になるまでには**シェル起動 → CLI
+    /// プロセス起動 → IPC → dispatch → アプリの状態更新**の 4 段が乗るので、
+    /// 固定時間では混み具合に追従できない（項目 44 = 固定 1 秒 / 項目 22 = 固定 800ms /
+    /// 項目 63 = 固定 6 秒窓 が load 90 前後の機で落ちていた。#1353 / #1364 の実測）。
+    ///
+    /// 新経路は `base` を [`state_wait_budget`] で伸ばす（**伸ばすだけ・4 倍で打ち切り**）。
+    /// 旧の固定予算を**コードに残す**のは、`TAKO_1353_LEGACY` / `TAKO_1364_LEGACY` で
+    /// 同一バイナリの A/B が取れるようにするため（#1165 の `text_wait_budget` と同じ役目）
+    pub(crate) fn cli_state_budget(
+        legacy_window: Duration,
+        base: Duration,
+        busy: Option<f64>,
+        legacy: bool,
+    ) -> Duration {
+        if legacy {
+            legacy_window
+        } else {
+            state_wait_budget(base, busy)
+        }
+    }
+
+    /// **#1353 / #1364 の A/B の口**: 打ち込んだ CLI の結果を待つ予算を旧実装の
+    /// 固定値へ戻す。`TAKO_1353_LEGACY`（項目 44）/ `TAKO_1364_LEGACY`（項目 22 / 63）を
+    /// `1` / `all` / **項目番号のカンマ区切り**で指定する。
+    ///
+    /// 項目ごとに戻せるようにしてあるのは、`check` が 1 つ目の失敗でプロセスごと
+    /// 止まるため（全部戻すといちばん早い項目 22 しか観測できない。#1173 と同じ理由）
+    fn legacy_cli_wait(item: &str) -> bool {
+        ["TAKO_1353_LEGACY", "TAKO_1364_LEGACY"].iter().any(|key| {
+            std::env::var(key).is_ok_and(|value| {
+                value == "1" || value == "all" || value.split(',').any(|p| p.trim() == item)
+            })
+        })
+    }
+
+    /// **#1353 / #1364 の注入口**（#1180 の `TAKO_1180_INJECT` と同じ役目）。
+    ///
+    /// **混み具合は人工負荷では再現できない**（`yes` で load 134 まで上げても、
+    /// 短命な CLI の起動そのものは遅れない = 実測で `waited=0.1s budget=0.8s` の
+    /// まま通った）。そこで Issue が観測した**遅れる材料そのもの**を注入する。
+    ///
+    /// - `late` = 旧の予算 + 5 秒だけ**観測を遅らせる**（旧の腕だけが落ちる）
+    /// - `never` = ずっと観測しない（**新経路でも落ちるのが正しい** = 予算を伸ばしても
+    ///   本物の回帰は隠れないことの確認）
+    ///
+    /// 書式は `<種別>[:<項目,項目…>]` で、解くのは `inject_1180_mode` の 1 実装
+    /// （項目を絞れるのは `check` が 1 つ目の失敗でプロセスごと止まるため）
+    fn inject_cli_wait(item: &str, legacy_window: Duration) -> Option<Duration> {
+        let spec = ["TAKO_1353_INJECT", "TAKO_1364_INJECT"]
+            .iter()
+            .filter_map(|key| std::env::var(key).ok())
+            .find(|value| !inject_1180_mode(value, item).is_empty())
+            .unwrap_or_default();
+        match inject_1180_mode(&spec, item) {
+            "late" => Some(inject_1180_delay(legacy_window)),
+            "never" => Some(INJECT_1180_FOREVER),
+            _ => None,
+        }
+    }
+
     /// **#1133 の A/B の口**: 設定すると起動直後のスタック予約チェックを飛ばし、
     /// 予約が足りないまま項目 80 まで走る「修正前」の挙動へ戻る。
     ///
@@ -27254,6 +27316,54 @@ mod self_test {
             if started.elapsed() >= timeout {
                 println!(
                     "TAKO_SELF_TEST_STATE_TIMEOUT: label={label:?} waited={:.1}s {}",
+                    started.elapsed().as_secs_f32(),
+                    env_line()
+                );
+                return false;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(100))
+                .await;
+        }
+    }
+
+    /// [`wait_for_app_state`] の**毎周期 1 フレーム描く**版（#1364）。
+    ///
+    /// レイアウト・描画由来の状態（`pane_text_areas` = 1 度でも描かれたペイン）は
+    /// **dirty でないフレームでは更新されない**（#786 でペイン本体とクロームは
+    /// `AnyView::cached`）。`tako split` のような IPC / dispatch 由来のレイアウト変更は
+    /// 製品経路では受信ループが `cx.notify()` してから次フレームを描くが、セルフテストの
+    /// 待ちの中では誰も汚さないので**待っても永久に届かない**。
+    ///
+    /// 実測（#1364）: 項目 63 の新ペイン 25 は `born=true` のあと 24.4 秒待っても
+    /// `pane_text_areas` に載らず、描かれないペインのシェルは 1 行も出さないので
+    /// マーカーも出なかった（旧実装はここを**分割元のペイン**で見ていたため
+    /// `painted=true` の偽陽性になり、原因が「マーカーが出ない」に見えていた）。
+    /// 観測だけを予算で待ち、**駆動（notify + draw）は毎周期**行う
+    /// （#771 / #1180 と同じ約束）。関連 = #1370（製品側の再描画不発）
+    async fn wait_for_drawn_state<F>(
+        window: WindowHandle<TakoApp>,
+        any: AnyWindowHandle,
+        cx: &mut AsyncApp,
+        label: &str,
+        timeout: Duration,
+        predicate: F,
+    ) -> bool
+    where
+        F: Fn(&TakoApp) -> bool,
+    {
+        let started = std::time::Instant::now();
+        loop {
+            notify_and_draw(any, window, cx);
+            if window
+                .update(cx, |app, _, _| predicate(app))
+                .unwrap_or(false)
+            {
+                return true;
+            }
+            if started.elapsed() >= timeout {
+                println!(
+                    "TAKO_SELF_TEST_STATE_TIMEOUT: label={label:?} waited={:.1}s drawn=true {}",
                     started.elapsed().as_secs_f32(),
                     env_line()
                 );
@@ -38234,27 +38344,60 @@ mod self_test {
                 .unwrap_or(false);
             check(titled, "tako title / role 設定");
 
-            // 22. tako resize --share-y（FR-2.5.6。pane2 の縦取り分を 0.7 へ）
+            // 22. tako resize --share-y（FR-2.5.6。pane2 の縦取り分を 0.7 へ）。
+            //     #1364: 旧実装は固定 800ms の直後に取り分を 1 度だけ読んでいた。
+            //     打った CLI は「シェル起動 → CLI 起動 → IPC → dispatch」を通るので、
+            //     load 96 の機では 800ms に届かず落ちていた（#775 の検証で観測）。
+            //     待つ相手は**ツリーの取り分が 0.7 になること**なので状態で待ち、
+            //     上限は `state_wait_budget` で混み具合に応じて伸ばす
             type_text(
                 any,
                 cx,
                 &format!("{cli} resize --pane {pane2} --share-y 0.7"),
                 true,
             );
-            wait(cx, 800).await;
+            let share_of_pane2 = |app: &TakoApp| {
+                app.workspace
+                    .active_tab()
+                    .tree()
+                    .layout(Rect::UNIT)
+                    .into_iter()
+                    .find(|(id, _)| *id == pane2)
+                    .map(|(_, r)| r.height)
+                    .unwrap_or(0.0)
+            };
+            let legacy22 = legacy_cli_wait("22");
+            let budget22 = cli_state_budget(
+                Duration::from_millis(800),
+                Duration::from_secs(20),
+                machine_busy(),
+                legacy22,
+            );
+            let hold22 = inject_cli_wait("22", Duration::from_millis(800));
+            let started22 = std::time::Instant::now();
+            let resized = wait_for_app_state(
+                window,
+                cx,
+                "22: tako resize --share-y 0.7 がツリーの取り分へ届く",
+                budget22,
+                |app| {
+                    (share_of_pane2(app) - 0.7).abs() < 0.01
+                        && hold22.is_none_or(|hold| started22.elapsed() >= hold)
+                },
+            )
+            .await;
             let share = window
-                .update(cx, |app, _, _| {
-                    app.workspace
-                        .active_tab()
-                        .tree()
-                        .layout(Rect::UNIT)
-                        .into_iter()
-                        .find(|(id, _)| *id == pane2)
-                        .map(|(_, r)| r.height)
-                        .unwrap_or(0.0)
-                })
+                .update(cx, |app, _, _| share_of_pane2(app))
                 .unwrap_or(0.0);
-            check((share - 0.7).abs() < 0.01, "tako resize");
+            println!(
+                "TAKO_SELF_TEST_1364: item=22 ok={resized} share={share:.3} waited={:.1}s \
+                 budget={:.1}s legacy={legacy22} inject={:?} {}",
+                started22.elapsed().as_secs_f32(),
+                budget22.as_secs_f32(),
+                hold22.map(|h| h.as_secs_f32()),
+                env_line()
+            );
+            check(resized, "tako resize");
 
             // 23. tako equalize（FR-2.5.7。呼び出し元ペインのタブを均等化）
             type_text(any, cx, &format!("{cli} equalize"), true);
@@ -39995,15 +40138,48 @@ mod self_test {
                 &sh.discard_output(&format!("{cli} scroll --to 5")),
                 true,
             );
-            wait(cx, 1000).await;
-            let cli_scrolled = window
-                .update(cx, |app, _, _| {
-                    app.terminals
-                        .get(&app.focused_pane())
-                        .map(|s| s.display_offset() >= 5)
-                        == Some(true)
-                })
-                .unwrap_or(false);
+            // #1353: 旧実装は固定 1 秒の直後に offset を 1 度だけ読んでいた。打った CLI は
+            // 「シェル起動 → CLI プロセス起動 → IPC → dispatch → session.scroll_to(5)」
+            // まで進む必要があり、load 90 超の機では 1 秒で届かず **origin/main でも**
+            // 落ちていた（#1301 の切り分けで 3 アーム中 2 アームが項目 44 で FAILED）。
+            // offset が 5 行以上遡るのを状態で待ち、上限は混み具合に応じて伸ばす
+            let scrolled_offset = |app: &TakoApp| {
+                app.terminals
+                    .get(&app.focused_pane())
+                    .map(|s| s.display_offset())
+                    .unwrap_or(0)
+            };
+            let legacy44 = legacy_cli_wait("44");
+            let budget44 = cli_state_budget(
+                Duration::from_millis(1000),
+                Duration::from_secs(20),
+                machine_busy(),
+                legacy44,
+            );
+            let hold44 = inject_cli_wait("44", Duration::from_millis(1000));
+            let started44 = std::time::Instant::now();
+            let cli_scrolled = wait_for_app_state(
+                window,
+                cx,
+                "44: tako scroll --to 5 が display_offset へ届く",
+                budget44,
+                |app| {
+                    scrolled_offset(app) >= 5
+                        && hold44.is_none_or(|hold| started44.elapsed() >= hold)
+                },
+            )
+            .await;
+            let offset44 = window
+                .update(cx, |app, _, _| scrolled_offset(app))
+                .unwrap_or(0);
+            println!(
+                "TAKO_SELF_TEST_1353: item=44 ok={cli_scrolled} offset={offset44} \
+                 waited={:.1}s budget={:.1}s legacy={legacy44} inject={:?} {}",
+                started44.elapsed().as_secs_f32(),
+                budget44.as_secs_f32(),
+                hold44.map(|h| h.as_secs_f32()),
+                env_line()
+            );
             check(cli_scrolled, "tako scroll --to が表示位置に反映");
             let (drag_top_ok, drag_bottom_ok, drag_cleared) = window
                 .update(cx, |app, _, cx| {
@@ -41785,6 +41961,18 @@ mod self_test {
             //     コマンドはログインシェル経由で実行される（最小 PATH の .app でも
             //     `tmux attach` 等が解決できる）。出力マーカーで実行を機械検証する
             press(any, cx, sh.clear_line_key());
+            // 押す前のペイン集合を採る（#1153。増えた数ではなく**生まれた ID**で見る）
+            let panes_before63: Vec<PaneId> = window
+                .update(cx, |app, _, _| {
+                    app.workspace
+                        .active_tab()
+                        .tree()
+                        .panes()
+                        .iter()
+                        .map(|p| p.id())
+                        .collect()
+                })
+                .unwrap_or_default();
             type_text(
                 any,
                 cx,
@@ -41792,44 +41980,191 @@ mod self_test {
                     "{cli} split --down --focus -- {}",
                     sh.shell_snippet_argv(&sh.sequence(&[
                         sh.echo(&sh.marker("TAKO-CMD-", 60, 3)),
-                        sh.sleep(15),
+                        // **証拠が生きている時間**（旧 15 秒 → 90 秒。#1364）。マーカーは
+                        // 1 行出るだけなので、コマンドが終わってペインが畳まれると
+                        // 証拠ごと消える。旧の 15 秒は③の上限（40 秒）より短く、
+                        // 「遅れの注入（旧の予算 + 5 秒 = 45 秒）」が**証拠の寿命を
+                        // 超えてしまって A/B が成立しない**（実測: 新の腕でも
+                        // `marker=false alive=false pane_tail=""`）。cmd+W で
+                        // すぐ閉じるので延ばしても後片付けは増えない
+                        sh.sleep(90),
                     ]))
                 ),
                 true,
             );
-            // #796: 旧実装は上限 9 秒。CLI のコールドスタート + ログインシェル + tmux は
-            // 高負荷で 9 秒を超える。状態到達で待ち、上限で診断を出す。
+            // 待つ相手は 3 段ある。
+            //   ① CLI → IPC → dispatch が新ペインを作ってフォーカスを移す
+            //   ② その新ペインが 1 度でも描かれる
+            //   ③ ログインシェル + 器が起動してマーカーを 1 行出す
+            //
+            // #796: 旧実装は③の上限 9 秒 → 40 秒。CLI のコールドスタート +
+            // ログインシェル + tmux は高負荷で 9 秒を超える。
+            //
+            // #1364: それでも①②が「固定 60 × 100ms = **6 秒**」の窓のままで、しかも
+            // **①を待たずに `focused_pane()` を見ていた**。分割が届く前の 1 周目は
+            // 分割元のペインが既に描かれているので即 break し、以降は③の固定 40 秒を
+            // **分割元の画面**に対して使い切って落ちる（load 96 で観測 = #775 の検証）。
+            // ①は押す前の集合に無い ID で、②③は `state_wait_budget` の上限で待つ。
             //
             // さらに、**ウィンドウが他アプリに完全に隠れていると GPUI が描画を止め、
             // 新ペインのシェルは 1 行も出さない**（項目 76d / 104 と同じ環境要因。
             // 実測: `screen_tail=""` で 40 秒経過）。描かれたかどうかを
             // `pane_text_areas`（= 1 度でも描画されたペインだけが載る）で見て、
             // 未描画ならスキップを明示する
-            let mut cmd_pane_painted = false;
-            for _ in 0..60 {
-                wait(cx, 100).await;
-                cmd_pane_painted = window
-                    .update(cx, |app, _, _| {
-                        let pane = app.focused_pane();
-                        app.pane_text_areas.iter().any(|(id, _)| *id == pane)
-                    })
-                    .unwrap_or(false);
-                if cmd_pane_painted {
-                    break;
-                }
-            }
-            if cmd_pane_painted {
-                check(
-                    // マーカーは打った行に答えが出ない形（`$((60+3))`）で組んである
-                    wait_for_focused_text(window, cx, "TAKO-CMD-63", Duration::from_secs(40)).await,
-                    "明示コマンド付き split（ログインシェル経由）",
-                );
+            // **A/B の口**（`TAKO_1364_LEGACY=63`）。旧経路との差は 4 つあり、
+            // どれも「形」ではなく**分岐**で表すので番犬に旧の形が残らない:
+            //   ・描かれたかを**フォーカス中のペイン**で見る（= 分割元で真になる偽陽性）
+            //   ・マーカーもフォーカス中のペインで待つ（コマンド終了で証拠源が入れ替わる）
+            //   ・毎周期の駆動（notify + draw）をしない
+            //   ・予算は旧の固定値（①② = 60 × 100ms の 6 秒窓 / ③ = 40 秒）
+            let legacy63 = legacy_cli_wait("63");
+            let budget63 = cli_state_budget(
+                Duration::from_millis(6000),
+                Duration::from_secs(20),
+                machine_busy(),
+                legacy63,
+            );
+            let started63 = std::time::Instant::now();
+            let (cmd_pane_born, cmd_pane, cmd_pane_painted) = if legacy63 {
+                // 旧経路: ①を**待たない**。「フォーカス中のペインが描かれているか」を
+                // 6 秒窓で見るので、分割が届く前の 1 周目は**分割元**で真になる
+                let painted = wait_for_app_state(
+                    window,
+                    cx,
+                    "63: 描かれたか（legacy: フォーカス中のペイン・駆動なし）",
+                    budget63,
+                    |app| {
+                        let focused = app.focused_pane();
+                        app.pane_text_areas.iter().any(|(id, _)| *id == focused)
+                    },
+                )
+                .await;
+                let focused = window.update(cx, |app, _, _| app.focused_pane()).ok();
+                (true, focused, painted)
             } else {
-                println!(
-                    "TAKO_SELF_TEST_SKIPPED: 63（新ペインが未描画 = ウィンドウが完全に隠れて \
-                     描画が止まった。前面にして再実行すると検証できる） {}",
-                    env_line()
-                );
+                let born = wait_for_app_state(
+                    window,
+                    cx,
+                    "63: split の新ペインが生まれてフォーカスされる",
+                    budget63,
+                    |app| !panes_before63.contains(&app.focused_pane()),
+                )
+                .await;
+                // 以降の証拠源は**この ID のペイン**。フォーカスで追ってはいけない
+                // （新ペインのコマンドが終わるとフォーカスは分割元へ戻る = 証拠源が
+                // 入れ替わる。#1175 と同じ「証拠は流れない場所から採る」）
+                let pane = born
+                    .then(|| window.update(cx, |app, _, _| app.focused_pane()).ok())
+                    .flatten();
+                // **毎周期 1 フレーム描く**（#1364）。IPC 由来のレイアウト変更のあと
+                // 誰も汚さないと、新ペインは `AnyView::cached` のまま永久に描かれない
+                let painted = match pane {
+                    Some(pane) => {
+                        wait_for_drawn_state(
+                            window,
+                            any,
+                            cx,
+                            "63: split の新ペインが 1 度でも描かれる",
+                            budget63,
+                            |app| app.pane_text_areas.iter().any(|(id, _)| *id == pane),
+                        )
+                        .await
+                    }
+                    None => false,
+                };
+                (born, pane, painted)
+            };
+            // ③の上限は旧の固定窓（40 秒）より**広く**採る = 空いている機でも A/B が
+            // 取れる（#771 の不等式）。legacy の腕では 40 秒へ戻る
+            let marker_budget63 = cli_state_budget(
+                Duration::from_secs(40),
+                Duration::from_secs(60),
+                machine_busy(),
+                legacy63,
+            );
+            println!(
+                "TAKO_SELF_TEST_1364: item=63 born={cmd_pane_born} painted={cmd_pane_painted} \
+                 pane={:?} before={} waited={:.1}s budget={:.1}s marker_budget={:.1}s {}",
+                cmd_pane.map(|p| p.as_u64()),
+                panes_before63.len(),
+                started63.elapsed().as_secs_f32(),
+                budget63.as_secs_f32(),
+                marker_budget63.as_secs_f32(),
+                env_line()
+            );
+            match (cmd_pane, cmd_pane_painted) {
+                (Some(pane), true) => {
+                    // マーカーは打った行に答えが出ない形（`$((60+3))`）で組んである
+                    let hold63 = inject_cli_wait("63", Duration::from_secs(40));
+                    let started_marker63 = std::time::Instant::now();
+                    let marker_seen = if legacy63 {
+                        // 旧経路: 証拠源が**フォーカス中のペイン**（コマンドが終わると
+                        // 分割元へ戻る）・毎周期の駆動なし・上限は固定 40 秒
+                        wait_for_app_state(
+                            window,
+                            cx,
+                            "63: マーカー（legacy: フォーカス中のペイン・駆動なし）",
+                            marker_budget63,
+                            |app| {
+                                app.focused_session().is_some_and(|session| {
+                                    session
+                                        .visible_lines()
+                                        .iter()
+                                        .any(|line| line.contains("TAKO-CMD-63"))
+                                }) && hold63.is_none_or(|hold| started_marker63.elapsed() >= hold)
+                            },
+                        )
+                        .await
+                    } else {
+                        wait_for_drawn_state(
+                            window,
+                            any,
+                            cx,
+                            "63: 新ペインがマーカーを出す（ログインシェル経由）",
+                            marker_budget63,
+                            |app| {
+                                app.terminals.get(&pane).is_some_and(|session| {
+                                    session
+                                        .visible_lines()
+                                        .iter()
+                                        .any(|line| line.contains("TAKO-CMD-63"))
+                                }) && hold63.is_none_or(|hold| started_marker63.elapsed() >= hold)
+                            },
+                        )
+                        .await
+                    };
+                    if !marker_seen {
+                        // 「出なかった」と「ペインごと消えた（fixture の sleep が
+                        // 切れた）」を後から区別できるようにする
+                        let alive = window
+                            .update(cx, |app, _, _| app.terminals.contains_key(&pane))
+                            .unwrap_or(false);
+                        println!(
+                            "TAKO_SELF_TEST_1364: item=63 marker=false alive={alive} \
+                             pane_tail={:?} {}",
+                            pane_screen_tail(window, cx, Some(pane)),
+                            env_line()
+                        );
+                    }
+                    check(marker_seen, "明示コマンド付き split（ログインシェル経由）");
+                }
+                (Some(_), false) => {
+                    // **ウィンドウが他アプリに完全に隠れていると GPUI が描画を止め、
+                    // 新ペインのシェルは 1 行も出さない**（項目 76d / 104 と同じ環境要因）
+                    println!(
+                        "TAKO_SELF_TEST_SKIPPED: 63（新ペインが未描画 = ウィンドウが完全に隠れて \
+                         描画が止まった。前面にして再実行すると検証できる） {}",
+                        env_line()
+                    );
+                }
+                _ => {
+                    // ①が来ないのは環境要因ではなく **split そのものが届いていない**印。
+                    // 旧実装はここを分割元のペインで検査してしまい、原因が③に見えていた
+                    check(
+                        false,
+                        "明示コマンド付き split（ログインシェル経由）: 新ペインが生まれない",
+                    );
+                }
             }
             press(any, cx, "cmd-w");
             wait(cx, 500).await;
@@ -68032,7 +68367,9 @@ mod selftest_pty_enter_watchdog {
 /// 待ち続けてはいけない）
 #[cfg(test)]
 mod self_test_wait_budget_tests {
-    use super::self_test::{resolve_text_wait, state_wait_budget, text_wait_budget};
+    use super::self_test::{
+        cli_state_budget, inject_1180_delay, resolve_text_wait, state_wait_budget, text_wait_budget,
+    };
     use std::time::Duration;
 
     /// `load=unknown` の環境（Windows 実機で 1 か月ぶん出ていた）でも予算は残る
@@ -68075,6 +68412,71 @@ mod self_test_wait_budget_tests {
             Duration::from_secs(80)
         );
     }
+
+    /// #1353 / #1364: 打ち込んだ CLI の結果を待つ予算。旧経路（`TAKO_1353_LEGACY` /
+    /// `TAKO_1364_LEGACY`）は**項目ごとの旧の固定予算そのまま**（項目 22 = 800ms /
+    /// 項目 44 = 1 秒 / 項目 63 = 6 秒窓 + 40 秒）
+    #[test]
+    fn 旧経路は項目ごとの固定予算をそのまま再現する() {
+        for legacy_window in [
+            Duration::from_millis(800),
+            Duration::from_millis(1000),
+            Duration::from_millis(6000),
+            Duration::from_secs(40),
+        ] {
+            assert_eq!(
+                cli_state_budget(legacy_window, Duration::from_secs(20), Some(3.0), true),
+                legacy_window,
+                "旧経路が固定予算を再現していない"
+            );
+        }
+    }
+
+    /// 新経路は**混み具合で伸ばすだけ**。空いている機でも旧の固定予算より広いこと
+    /// （0.8 秒 → 20 秒 / 40 秒 → 60 秒）が #1353 / #1364 の核心
+    #[test]
+    fn 新経路は空いている機でも旧の固定予算より広い() {
+        for (legacy_window, base) in CLI_WAIT_PAIRS {
+            let idle = cli_state_budget(legacy_window, base, Some(0.0), false);
+            assert_eq!(idle, base, "空いている機で基準から動いた");
+            assert!(
+                idle > legacy_window,
+                "新経路が旧の固定予算を超えていない（{legacy_window:?} → {idle:?}）"
+            );
+            let busy = cli_state_budget(legacy_window, base, Some(1.0), false);
+            assert!(busy > idle, "混んだ機で伸びていない");
+        }
+    }
+
+    /// **注入の遅れは「旧の予算 < 遅れ < 新の素の上限」に収まる**（#771 / #1180 と同じ
+    /// 不等式）。等しいと旧の腕も通ってしまい A/B が差を測らない
+    #[test]
+    fn 注入の遅れは旧の予算を超えて新の上限に収まる_1353() {
+        for (legacy_window, base) in CLI_WAIT_PAIRS {
+            let delay = inject_1180_delay(legacy_window);
+            assert!(
+                delay > legacy_window,
+                "注入の遅れが旧の予算を超えていない（{legacy_window:?} / {delay:?}）"
+            );
+            assert!(
+                delay < base,
+                "注入の遅れが新の素の上限に収まっていない（{delay:?} / {base:?}）"
+            );
+        }
+    }
+
+    /// 項目ごとの（旧の固定予算, 新の素の上限）。**main.rs の呼び出しと同じ値**を置く
+    /// （増やしたら上の 2 本が不等式を検査する）
+    const CLI_WAIT_PAIRS: [(Duration, Duration); 4] = [
+        // 項目 22: tako resize
+        (Duration::from_millis(800), Duration::from_secs(20)),
+        // 項目 44: tako scroll --to
+        (Duration::from_millis(1000), Duration::from_secs(20)),
+        // 項目 63: split の新ペインが生まれて描かれるまで
+        (Duration::from_millis(6000), Duration::from_secs(20)),
+        // 項目 63: 新ペインがマーカーを出すまで
+        (Duration::from_secs(40), Duration::from_secs(60)),
+    ];
 
     /// #1165: 画面テキストの待ちも同じ予算に通る。旧経路（`TAKO_1165_LEGACY=1`）は
     /// **項目 1b の固定窓そのまま**（8 × 800ms = 6.4 秒・1 回・送り直しなし）
@@ -70531,6 +70933,27 @@ mod selftest_wait_watchdog {
         found
     }
 
+    /// **固定回数ループの本文をインデントで閉じ括弧まで採る**（#771 / #1180 / #1353 が共有）。
+    ///
+    /// 行数で切ると、本文の長いループの**末尾にある** `wait` を見落とす
+    /// （#771 の項目 101c がこれだった）。`end` は region の終端（無ければ `lines.len()`）
+    fn loop_body_by_indent(lines: &[&str], at: usize, end: usize) -> String {
+        let indent = lines[at].len() - lines[at].trim_start().len();
+        let mut body = String::new();
+        for inner in lines.iter().take(end).skip(at + 1) {
+            let trimmed = inner.trim_start();
+            if !trimmed.is_empty()
+                && inner.len() - trimmed.len() == indent
+                && trimmed.starts_with('}')
+            {
+                break;
+            }
+            body.push_str(inner.trim());
+            body.push(' ');
+        }
+        body
+    }
+
     /// **固定窓のあいだに「増えた数」を測っていない**（#1153）。
     ///
     /// `for _ in 0..8 { wait(cx, 300).await; … tabs().len() > before … }` は
@@ -70672,19 +71095,7 @@ mod selftest_wait_watchdog {
                 }
                 // 本文は**インデントで閉じ括弧まで**採る（#771 と同じ理由: 行数で切ると
                 // 本文の長いループの末尾にある `wait` を見落とす）
-                let loop_indent = candidate.len() - candidate.trim_start().len();
-                let mut body = String::new();
-                for inner in lines.iter().take(end).skip(offset + 1) {
-                    let trimmed = inner.trim_start();
-                    if !trimmed.is_empty()
-                        && inner.len() - trimmed.len() == loop_indent
-                        && trimmed.starts_with('}')
-                    {
-                        break;
-                    }
-                    body.push_str(inner.trim());
-                    body.push(' ');
-                }
+                let body = loop_body_by_indent(&lines, offset, end);
                 if body.contains(wait_call) && body.contains("break") {
                     hits.push(offset + 1);
                 }
@@ -71137,19 +71548,7 @@ mod selftest_wait_watchdog {
                 }
                 // 本文は**インデントで閉じ括弧まで**採る（行数で切ると、本文の長い
                 // ループの末尾にある `wait` を見落とす = #771 の項目 101c がこれ）
-                let loop_indent = candidate.len() - candidate.trim_start().len();
-                let mut body = String::new();
-                for inner in lines.iter().take(end).skip(offset + 1) {
-                    let trimmed = inner.trim_start();
-                    if !trimmed.is_empty()
-                        && inner.len() - trimmed.len() == loop_indent
-                        && trimmed.starts_with('}')
-                    {
-                        break;
-                    }
-                    body.push_str(inner.trim());
-                    body.push(' ');
-                }
+                let body = loop_body_by_indent(&lines, offset, end);
                 if body.contains(wait_call) && body.contains("break") {
                     hits.push(offset + 1);
                 }
@@ -71308,6 +71707,281 @@ mod selftest_wait_watchdog {
             concat!("settle_scroll", "_mirror")
         );
         assert!(container_gated_visual_skips(&good).is_empty());
+    }
+
+    /// **打ち込んだ CLI の結果を固定の予算で待っていない**（#1353 / #1364）。
+    ///
+    /// ペインへ打った `tako …` が判定できる形になるまでには**シェル起動 → CLI
+    /// プロセス起動 → IPC → dispatch → アプリの状態更新**の 4 段が乗る。固定の予算
+    /// （単発の `wait(cx, N)` か「固定回数 × 固定待ち」のループ）では混み具合に
+    /// 追従できず、load 90 前後の機で項目 44（固定 1 秒）/ 項目 22（固定 800ms）/
+    /// 項目 63（固定 6 秒窓）が落ちていた（#1353 / #1364 の実測。項目 44 は
+    /// origin/main のバイナリでも落ちた）。
+    ///
+    /// **なぜ既存の番犬をすり抜けたか**: [`fixed_wait_then_positive_contains`]（#796）は
+    /// 「固定待ちの**直後 3 行**が `check(` で始まる」×「その check に**肯定形の**
+    /// `focused_contains`」の 2 条件を同時に満たす形しか違反にしない。項目 44 は
+    /// 待ちのあとに `let cli_scrolled = …` が挟まり（1 つ目を外す）、判定材料が画面の
+    /// 文字列ではなく `display_offset()` の**状態読み**（2 つ目を外す）だったので
+    /// **二重に対象外**だった。#1153 / #1165 / #1162 / #1180 の needle
+    /// （`.len() > ` / `focused_contains` / `read(app)` / `read_to_string(`）も
+    /// 状態読み一般には当たらない。
+    ///
+    /// **アンカーは打ち込んだ CLI コマンド**（手前に `type_text` + CLI のプレースホルダ）。
+    /// ここを起点にするのは、待つ相手がアプリの中ではなく**別プロセスの往復**だと
+    /// ソースから言えるのがこの形だからで、`window.update` の中で操作まで済ませている
+    /// 形（= 待つ相手が居ない）を巻き込まないための境界でもある。
+    ///
+    /// 正しい形は `wait_for_app_state`（状態到達まで待ち、上限は `state_wait_budget` で
+    /// 混み具合に応じて伸ばす）。**A/B の腕は「旧の形」ではなく「旧の予算の値」で
+    /// 表す**（`cli_state_budget` の `legacy_window`）ので、#1175 のような
+    /// legacy ブロックの除外は要らない。パターンは `concat!` で分割して書く
+    /// （番犬自身のソース行が検査対象に入るため）
+    fn fixed_budget_then_cli_state_read(src: &str) -> Vec<(usize, String)> {
+        let lines: Vec<&str> = src.lines().collect();
+        let wait_call = concat!("wait(cx", ", ");
+        let state_read = concat!(".update(cx", ",");
+        let mut hits = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            let single = trimmed.starts_with(wait_call) && trimmed.ends_with(").await;");
+            let windowed = trimmed.starts_with("for ")
+                && trimmed.contains(" in 0..")
+                && trimmed.ends_with('{')
+                && lines
+                    .get(index + 1)
+                    .is_some_and(|next| next.trim().starts_with(wait_call));
+            if !(single || windowed) {
+                continue;
+            }
+            // 固定窓ループの先頭の待ちは**ループ側で 1 度だけ**名指しする
+            if single {
+                let before = lines[index.saturating_sub(4)..index]
+                    .iter()
+                    .map(|l| l.trim())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if before.contains("for ") || before.contains("loop {") {
+                    continue;
+                }
+            }
+            if !cli_command_typed_before(&lines, index) {
+                continue;
+            }
+            // 待ちの結果を判定に使っている印。単発は直後の `check(`、固定窓は
+            // 早く抜ける `break`（#771 / #1180 と同じ見分け。片付けの叩き込みは持たない）
+            let (body, used) = if windowed {
+                let body = loop_body_by_indent(&lines, index, lines.len());
+                let used = body.contains("break");
+                (body, used)
+            } else {
+                let body = lines
+                    .iter()
+                    .skip(index + 1)
+                    .take(14)
+                    .map(|l| l.trim())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let used = body.contains("check(");
+                (body, used)
+            };
+            if !(used && body.contains(state_read)) {
+                continue;
+            }
+            hits.push((index + 1, first_check_label(&lines, index)));
+        }
+        hits
+    }
+
+    /// 手前に**打ち込んだ tako CLI のコマンド**があるか（#1353 / #1364 のアンカー）。
+    ///
+    /// 遡るのは「直前の `check(`（= 前の項目の終わり）か直前の待ち」までで、そこに
+    /// `type_text` と CLI のプレースホルダが揃っていれば、待つ相手は別プロセスの往復だと
+    /// ソースから言える。パターンは `concat!` で分割して書く
+    fn cli_command_typed_before(lines: &[&str], at: usize) -> bool {
+        let wait_call = concat!("wait(cx", ", ");
+        let cli = concat!("{", "cli}");
+        let typed = concat!("type_", "text(");
+        let mut span = String::new();
+        for candidate in lines[..at].iter().rev().take(26) {
+            let trimmed = candidate.trim();
+            if trimmed.starts_with("check(")
+                || (trimmed.starts_with(wait_call) && trimmed.ends_with(").await;"))
+            {
+                break;
+            }
+            span.push_str(trimmed);
+            span.push(' ');
+        }
+        span.contains(typed) && span.contains(cli)
+    }
+
+    /// 後続の最初の `check(` に渡されている文字列（既知リストのキー）。
+    /// **行番号は編集でずれる**のでキーにはラベルを使う
+    fn first_check_label(lines: &[&str], at: usize) -> String {
+        let joined = lines
+            .iter()
+            .skip(at)
+            .take(60)
+            .map(|l| l.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let Some(from) = joined.find("check(") else {
+            return String::new();
+        };
+        let rest = &joined[from..];
+        let Some(open) = rest.find('"') else {
+            return String::new();
+        };
+        let mut label = String::new();
+        let mut escaped = false;
+        for ch in rest[open + 1..].chars() {
+            if escaped {
+                label.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                break;
+            } else {
+                label.push(ch);
+            }
+        }
+        label
+    }
+
+    /// **まだ状態待ちへ移せていない「固定予算 + CLI の状態読み」の既知リスト**（#1375）。
+    ///
+    /// #1353 / #1364 で直したのは項目 22 / 44 / 63 の 3 つで、同じ形が 16 件残っている。
+    /// 1 つの PR で全部動かすと**高負荷での A/B が項目ごとに取れない**ので、番犬を
+    /// 先に入れて**新規の混入を止め**、リストは #1375 で空にする。
+    ///
+    /// リストは**減る方向にしか動かさない**（下のテストが、直したのに残っている
+    /// エントリを落とす）。キーは `check` のラベル
+    const KNOWN_FIXED_CLI_WAITS: &[&str] = &[
+        "tako split で 2 ペイン",
+        "tako send で別ペインへ送信",
+        "tako title / role 設定",
+        "tako equalize",
+        "tako focus",
+        "tako tab new",
+        "tako tab move-pane",
+        "tako tab select",
+        "tako close",
+        "ペインの × ボタンで kill（dispatch 経由）",
+        "ペインの ー ボタンでバックグラウンド（dispatch 経由）",
+        "tako tab rename（手動扱い）",
+        "tako tab pin --off で固定を解除できる",
+        "tako open CLI でプレビューが開く",
+        "確認ダイアログ: cmd+クリックでスキップ",
+        "確認ダイアログ: 通常ペインの cmd+W は確認なしで即 close（#566）",
+    ];
+
+    #[test]
+    fn 打ち込んだcliの結果を固定予算で待っていない() {
+        let src = include_str!("main.rs");
+        let hits = fixed_budget_then_cli_state_read(src);
+        let unknown: Vec<String> = hits
+            .iter()
+            .filter(|(_, label)| !KNOWN_FIXED_CLI_WAITS.contains(&label.as_str()))
+            .map(|(line, label)| format!("main.rs:{line}（{label}）"))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "{unknown:?} が「打ち込んだ CLI の結果を固定の予算で待つ」形で書かれている。\
+             シェル起動 + CLI 起動 + IPC + dispatch の 4 段は混んだ機で固定予算を\
+             使い切り、**その項目以降が 1 つも走らなくなる**（#1353 の項目 44 は\
+             load 103 で固定 1 秒を・#1364 の項目 22 / 63 は load 96 で固定 800ms /\
+             6 秒窓を使い切った）。`wait_for_app_state` + `cli_state_budget`\
+             （状態待ち + `state_wait_budget` の上限）を使うこと"
+        );
+        let stale: Vec<&str> = KNOWN_FIXED_CLI_WAITS
+            .iter()
+            .copied()
+            .filter(|known| !hits.iter().any(|(_, label)| label == known))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "KNOWN_FIXED_CLI_WAITS の {stale:?} はもう違反していない。\
+             既知リストは減る方向にしか動かさないので、直したらエントリを消すこと（#1375）"
+        );
+    }
+
+    /// 検出力の担保: 番犬自身が空振りしないこと（#1353 / #1364 で直した形そのものを与える）
+    #[test]
+    fn 番犬は固定予算のcli状態読みを見逃さず状態待ちは許す() {
+        let typed = format!(
+            "            {}any, cx, &format!(\"{} scroll --to 5\"), true);",
+            concat!("type_", "text("),
+            concat!("{", "cli}")
+        );
+        // 項目 44 の旧実装そのもの（待ちのあとに `let` が挟まり、判定材料は状態読み）
+        let bad = [
+            typed.as_str(),
+            &format!("            {}", concat!("wait(cx", ", 1000).await;")),
+            "            let cli_scrolled = window",
+            &format!(
+                "                {} |app, _, _| {{ off(app) >= 5 }})",
+                concat!(".update(cx", ",")
+            ),
+            "                .unwrap_or(false);",
+            "            check(cli_scrolled, \"tako scroll --to が表示位置に反映\");",
+        ]
+        .join("\n");
+        assert_eq!(
+            fixed_budget_then_cli_state_read(&bad),
+            vec![(2, "tako scroll --to が表示位置に反映".to_string())]
+        );
+        // 項目 63 の旧実装そのもの（固定回数 × 固定待ちの窓で描画状態を読む）
+        let windowed = [
+            typed.as_str(),
+            "            for _ in 0..60 {",
+            &format!("                {}", concat!("wait(cx", ", 100).await;")),
+            "                cmd_pane_painted = window",
+            &format!(
+                "                    {} |app, _, _| painted(app))",
+                concat!(".update(cx", ",")
+            ),
+            "                    .unwrap_or(false);",
+            "                if cmd_pane_painted {",
+            "                    break;",
+            "                }",
+            "            }",
+            "            check(cmd_pane_painted, \"明示コマンド付き split（ログインシェル経由）\");",
+        ]
+        .join("\n");
+        assert_eq!(
+            fixed_budget_then_cli_state_read(&windowed),
+            vec![(
+                2,
+                "明示コマンド付き split（ログインシェル経由）".to_string()
+            )]
+        );
+        // 状態待ちヘルパーへ寄せた形は許す
+        let good = [
+            typed.as_str(),
+            &format!(
+                "            let ok = {}(window, cx, \"44\", budget44, |app| off(app) >= 5).await;",
+                concat!("wait_for_app", "_state")
+            ),
+            "            check(ok, \"tako scroll --to が表示位置に反映\");",
+        ]
+        .join("\n");
+        assert!(fixed_budget_then_cli_state_read(&good).is_empty());
+        // CLI を打っていない固定待ち（アプリ内で完結する操作）は対象外
+        let no_cli = bad.replace(typed.as_str(), "            press(any, cx, \"cmd-b\");");
+        assert!(fixed_budget_then_cli_state_read(&no_cli).is_empty());
+        // 判定に使わない待ち（`check` も `break` も無い片付け）は対象外
+        let teardown = [
+            typed.as_str(),
+            &format!("            {}", concat!("wait(cx", ", 500).await;")),
+            &format!(
+                "            let _ = window{} |app, _, cx| app.cleanup(cx));",
+                concat!(".update(cx", ",")
+            ),
+        ]
+        .join("\n");
+        assert!(fixed_budget_then_cli_state_read(&teardown).is_empty());
     }
 
     #[test]
