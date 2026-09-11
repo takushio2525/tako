@@ -1251,6 +1251,23 @@ stderr・そのソケットのセッション一覧・PTY / ソケット / サ�
 1 往復要った。実測の答えは PTY 103/511 = **枯渇ではなく名前の取り合い**）。
 番犬は `crates/tako-control/tests/tmux_e2e_watchdog.rs`、A/B は `TAKO_1300_LEGACY=1`。
 
+## 新しい worktree は PWA のビルドから始まる（Issue #1309 / #574）
+
+`git worktree add` 直後のツリーには `web/tako-remote/dist/` が無い（`.gitignore` 対象）。
+rust_embed（`remote.rs` の `PwaAssets`）がそれを**コンパイル時**に要求するので、
+放っておくと `cargo build` が `#[derive(RustEmbed)] folder ... does not exist` →
+`PwaAssets::get` 未定義で落ちる。
+
+**手作業は要らない**: `crates/tako-control/build.rs` が `dist/index.html` の有無を見て、
+無ければ `npm ci && npm run build` を走らせる。**既にある dist は触らない**ので、
+ビルド済みのツリーでは所要も生成物も変わらない（CI は #574 で npm build 済みの状態で
+ここへ来るため二重ビルドにならない）。共有ツリーから `dist/` をコピーする回避はもう不要。
+
+npm が無い / npm が失敗した環境では**1 行目に手順が出て**止まるので、案内どおり
+`scripts/build-pwa.sh` を実行する（PWA ビルドの正本。`build-app.sh` もこれを呼ぶ）。
+手順を変えるときは `build.rs` の `pwa` モジュールと `build-pwa.sh` を**対で**直す
+（build.rs 側が npm を直接起こすのは、Windows の開発機に bash があるとは限らないため）。
+
 ## 設定・データファイルのスキーマ変更（Issue #916）
 
 **永続ファイルの形式や置き場を変えるときは自動移行を同梱する。手動移行を要求しない。**

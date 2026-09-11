@@ -45,11 +45,9 @@ if [ ${#missing[@]} -gt 0 ]; then
   exit 2
 fi
 
-# PWA を rust_embed で埋め込むため、dist が無いと tako-control がコンパイルできない
-if [ ! -d "web/tako-remote/dist" ]; then
-  echo "web/tako-remote/dist がありません。先に PWA をビルドします…"
-  (cd web/tako-remote && npm ci && npm run build)
-fi
+# PWA を rust_embed で埋め込むため、dist が無いと tako-control がコンパイルできない。
+# 手順の正本は scripts/build-pwa.sh（#1309。crates/tako-control/build.rs も同じことをする）
+scripts/build-pwa.sh --if-missing
 
 # gpui の build script は Windows マニフェストを llvm-rc で埋め込む。
 # .rc 内の相対パスが OUT_DIR 基準で解決されるため、そのままでは manifest を見つけられない。
