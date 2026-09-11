@@ -65,6 +65,13 @@ pub const PIN_HINT_TTL: Duration = Duration::from_secs(120);
 /// 見分けの付かない症状を macOS でも起こす。Windows は macOS より遅い側で、
 /// この上限を決めた #722 の実測から取り直せていない（実機 offline）
 const CLAUDE_TIMEOUT: Duration = Duration::from_secs(120);
+/// claude が終わったあと、その stdout が閉じるのを待つ上限（#758）。
+///
+/// 通常は即座に閉じる。閉じないのは claude の**孫プロセス**（MCP サーバー）が
+/// パイプを握ったまま残っているときで、[`STRICT_MCP_FLAG`] が効いていれば起こらない。
+/// ここに上限が無いと命名スレッドがそのまま止まり続けるので、諦めて
+/// ヒューリスティック命名へ落とす
+const READ_GRACE: Duration = Duration::from_secs(10);
 /// 安価・高速なモデルを固定で使う（FR-2.12.2）
 const MODEL: &str = "claude-haiku-4-5-20251001";
 /// プロンプトに含めるペイン末尾の行数と 1 行の最大文字数
@@ -371,7 +378,7 @@ fn run_claude_with(
 ) -> Option<RenamePlan> {
     let prompt = build_prompt(materials, lang);
     let output = run_learning_strict(state, legacy, &mut |strict| {
-        spawn_claude(bin, &prompt, strict)
+        spawn_claude(bin, &prompt, strict, CLAUDE_TIMEOUT)
     })?;
     let plan = parse_plan(&output, materials, lang);
     diag(format_args!(
@@ -428,8 +435,13 @@ fn run_learning_strict(
     }
 }
 
-/// claude -p を 1 回だけ起こして stdout を読む
-fn spawn_claude(bin: &Path, prompt: &str, strict: bool) -> ClaudeRun {
+/// claude -p を 1 回だけ起こして stdout を読む。
+///
+/// `timeout` は本番では [`CLAUDE_TIMEOUT`] 固定で、テストだけが短い値を渡す
+/// （上限に当たったときの結果が [`ClaudeRun::Failed`] = 再試行しない側であることを
+/// 実際に起こして確かめるため。ここを `NonZero` と取り違えると、上限まで待ったあとに
+/// もう一度上限まで待つ = 命名 1 回が最悪 2 倍になる）
+fn spawn_claude(bin: &Path, prompt: &str, strict: bool, timeout: Duration) -> ClaudeRun {
     use std::io::{Read, Write};
     use std::process::{Command, Stdio};
 
@@ -462,12 +474,19 @@ fn spawn_claude(bin: &Path, prompt: &str, strict: bool) -> ClaudeRun {
         let _ = child.wait();
         return ClaudeRun::Failed;
     };
-    let reader = std::thread::spawn(move || {
+    // **`join` で待たない**（#758 の上限テストで見つけた）。`read_to_string` が返るのは
+    // パイプが閉じたときで、閉じるのは**握っている全員**が消えたとき。claude は MCP
+    // サーバーを子プロセスとして抱えるので、親を kill しても孫が stdout を握ったままなら
+    // 待ちは孫が死ぬまで返らない（実測: 孫が 30 秒眠る偽 CLI で、上限 0.6 秒の打ち切りが
+    // 30.3 秒待たされた = 上限が上限として効いていない）。期限付きで受け取り、
+    // 間に合わなければ読み出しは諦める（スレッドはパイプが閉じた時点で自然に終わる）
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut buf = String::new();
         let _ = stdout.read_to_string(&mut buf);
-        buf
+        let _ = tx.send(buf);
     });
-    let deadline = Instant::now() + CLAUDE_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
@@ -478,7 +497,7 @@ fn spawn_claude(bin: &Path, prompt: &str, strict: bool) -> ClaudeRun {
                 diag(format_args!(
                     "claude を打ち切り: {:.1}s（上限 {}s）",
                     started.elapsed().as_secs_f32(),
-                    CLAUDE_TIMEOUT.as_secs()
+                    timeout.as_secs()
                 ));
                 let _ = child.kill();
                 let _ = child.wait();
@@ -486,26 +505,34 @@ fn spawn_claude(bin: &Path, prompt: &str, strict: bool) -> ClaudeRun {
             }
         }
     };
-    let output = reader.join().unwrap_or_default();
     let flag = if strict { STRICT_MCP_FLAG } else { "既定" };
-    match status {
-        Some(status) if status.success() => {
-            diag(format_args!(
-                "claude 応答: {:.1}s / {} バイト / {flag}",
-                started.elapsed().as_secs_f32(),
-                output.len()
-            ));
-            ClaudeRun::Ok(output)
-        }
-        Some(status) => {
-            diag(format_args!(
-                "claude が非ゼロ終了: code={:?}（{:.1}s / {flag}）",
-                status.code(),
-                started.elapsed().as_secs_f32()
-            ));
-            ClaudeRun::NonZero
-        }
-        None => ClaudeRun::Failed,
+    // 打ち切ったときは出力を捨てるので 1 秒も待たない
+    let Some(status) = status else {
+        return ClaudeRun::Failed;
+    };
+    let Ok(output) = rx.recv_timeout(READ_GRACE) else {
+        // claude は終わったのに stdout が閉じない = 孫が握ったまま。従来はここで
+        // 命名スレッドが**永久に**止まっていた。ヒューリスティックへ落として先へ進む
+        diag(format_args!(
+            "claude の出力が {}s 以内に閉じない（孫プロセスが握っている）",
+            READ_GRACE.as_secs()
+        ));
+        return ClaudeRun::Failed;
+    };
+    if status.success() {
+        diag(format_args!(
+            "claude 応答: {:.1}s / {} バイト / {flag}",
+            started.elapsed().as_secs_f32(),
+            output.len()
+        ));
+        ClaudeRun::Ok(output)
+    } else {
+        diag(format_args!(
+            "claude が非ゼロ終了: code={:?}（{:.1}s / {flag}）",
+            status.code(),
+            started.elapsed().as_secs_f32()
+        ));
+        ClaudeRun::NonZero
     }
 }
 
@@ -1051,6 +1078,42 @@ TAIL
             None
         );
         assert_eq!(arg_lines(&log).len(), 2, "起動失敗で再試行している");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// エッジ（#758）: **上限に当たった起動は [`ClaudeRun::Failed`]**（再試行しない側）。
+    /// ここを `NonZero` と取り違えると、上限まで待ったあとにもう一度上限まで待つ。
+    /// 実際に子を起こして上限を当て、打ち切りと後始末まで見る
+    #[test]
+    #[cfg(unix)]
+    fn 上限に当たった起動は再試行しない側になる() {
+        let dir = temp_dir_for("timeout");
+        let bin = dir.join("claude");
+        let log = dir.join("args.log");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> '{}'\ncat >/dev/null\nsleep 30\n",
+                log.display()
+            ),
+        )
+        .expect("眠る偽 claude を書ける");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+                .expect("実行権を付けられる");
+        }
+
+        let started = Instant::now();
+        let run = spawn_claude(&bin, "prompt", true, Duration::from_millis(600));
+        let waited = started.elapsed();
+        assert_eq!(run, ClaudeRun::Failed, "打ち切りが非ゼロ終了に化けている");
+        assert!(
+            waited < Duration::from_secs(10),
+            "上限で打ち切っていない（{waited:?} 待った）"
+        );
+        assert_eq!(arg_lines(&log).len(), 1, "打ち切りなのに起動が 2 回ある");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
