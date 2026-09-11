@@ -27514,6 +27514,42 @@ mod self_test {
         ok
     }
 
+    /// **`tako split` を打って新しいペインへフォーカスが移るのを待つ**（#1375）。
+    ///
+    /// 項目 47 / 47b / 73c / 73f はどれも「CLI で分割して、増えた**新しい**ペインを
+    /// 対象に UI 相当の操作（× / ー ボタン・cmd+クリック・cmd+W）を行う」形で、
+    /// 旧実装は固定 1.5 秒か 60 × 250ms の固定窓で分割の着地を待っていた。
+    ///
+    /// 待つ相手は別プロセスの往復（[`wait_for_cli_state`]）で、成立の条件は
+    /// **打つ前のペインと違うペインへフォーカスが移ること**。`focused_pane()` だけを
+    /// 見ると分割が届く前に分割元で真になり、以降の検査が**別のペイン**を測る
+    /// （#1364 / #1367 の 73g で実測した偽陽性）。
+    ///
+    /// 返すのは**作られたペインの ID**（以降の検査はフォーカスではなくこの ID を見る
+    /// = #1175 / #1364 の「流れない場所から採る」）。上限まで待って移らなければ `None`
+    async fn split_focus_new_pane(
+        window: WindowHandle<TakoApp>,
+        any: AnyWindowHandle,
+        cx: &mut AsyncApp,
+        command: &str,
+        item: &str,
+        legacy_window: Duration,
+        base: Duration,
+    ) -> Option<PaneId> {
+        let split_from = window.update(cx, |app, _, _| app.focused_pane()).ok()?;
+        type_text(any, cx, command, true);
+        let label = format!("{item}: tako split の着地（新ペインへフォーカスが移る）");
+        let moved = wait_for_cli_state(window, cx, item, &label, legacy_window, base, move |app| {
+            let tree = app.workspace.active_tab().tree();
+            tree.len() > 1 && tree.focused() != split_from
+        })
+        .await;
+        if !moved {
+            return None;
+        }
+        window.update(cx, |app, _, _| app.focused_pane()).ok()
+    }
+
     /// **dispatch（CLI / MCP と同じ経路）の応答が期待の形になるまで待つ**（#1162）。
     ///
     /// [`wait_for_app_state`] の `&mut TakoApp` 版。`Request::Read` のような
@@ -40841,17 +40877,23 @@ mod self_test {
             //     残らないこと。タブの × と挙動を統一し、紐づく tmux セッションも
             //     remove_pane が kill するため管理外 / orphan に残らない。
             //     --focus で新ペインを対象にする（3c9d363 追従。分割元の誤 kill 防止）
-            type_text(
+            // #1375: 旧実装は固定 1.5 秒のあと `focused_pane()` を対象にしていた
+            let close_target = split_focus_new_pane(
+                window,
                 any,
                 cx,
                 &sh.discard_output(&format!("{cli} split --right --focus")),
-                true,
-            );
-            wait(cx, 1500).await;
+                "47",
+                Duration::from_millis(1500),
+                Duration::from_secs(20),
+            )
+            .await;
             let close_button_ok = window
                 .update(cx, |app, _, cx| {
+                    let Some(target) = close_target else {
+                        return false;
+                    };
                     let before = app.workspace.active_tab().tree().len();
-                    let target = app.focused_pane();
                     app.close_pane_button(target, CloseOrigin::PaneButton, cx);
                     let tree = app.workspace.active_tab().tree();
                     before == 2
@@ -40866,17 +40908,23 @@ mod self_test {
             // 47b. ペインの ー ボタン = バックグラウンドへバックグラウンド（dispatch 共有経路）。プロセス
             //      （ターミナル）は生かしたまま、ツリーから外れて shelved へ移ること（FR-2.15.1）。
             //      --focus で新ペインを対象にする（3c9d363 追従。分割元の誤退避防止）
-            type_text(
+            // #1375: 旧実装は固定 1.5 秒のあと `focused_pane()` を対象にしていた
+            let shelve_target = split_focus_new_pane(
+                window,
                 any,
                 cx,
                 &sh.discard_output(&format!("{cli} split --right --focus")),
-                true,
-            );
-            wait(cx, 1500).await;
+                "47b",
+                Duration::from_millis(1500),
+                Duration::from_secs(20),
+            )
+            .await;
             let shelve_button_ok = window
                 .update(cx, |app, _, cx| {
+                    let Some(target) = shelve_target else {
+                        return false;
+                    };
                     let before = app.workspace.active_tab().tree().len();
-                    let target = app.focused_pane();
                     app.background_pane_button(target, cx);
                     let tree = app.workspace.active_tab().tree();
                     before == 2
@@ -47281,18 +47329,24 @@ mod self_test {
                     .unwrap_or(false);
                 check(enter_ok, "確認ダイアログ: Enter で閉じる");
 
-                // 73c. cmd+クリック = ダイアログスキップ
-                type_text(
+                // 73c. cmd+クリック = ダイアログスキップ。
+                //      #1375: 旧実装は固定 1.5 秒のあと `focused_pane()` を対象にしていた
+                let skip_target = split_focus_new_pane(
+                    window,
                     any,
                     cx,
                     &sh.discard_output(&format!("{cli} split --right --focus")),
-                    true,
-                );
-                wait(cx, 1500).await;
+                    "73c",
+                    Duration::from_millis(1500),
+                    Duration::from_secs(20),
+                )
+                .await;
                 let cmd_ok = window
                     .update(cx, |app, _, cx| {
+                        let Some(target) = skip_target else {
+                            return false;
+                        };
                         let before = app.workspace.active_tab().tree().len();
-                        let target = app.focused_pane();
                         mark_risky(app, target);
                         app.confirm_close = true;
                         app.close_pane_with_confirm(target, true, CloseOrigin::PaneButton, cx);
@@ -47311,60 +47365,60 @@ mod self_test {
                 // シェルの起動（rc / compinit / シェル統合の precmd）で**まだ子プロセスを
                 // 抱えている**ことがあり、`pane_close_needs_confirm` の「子プロセスあり」で
                 // 真になる。前提（= 素のアイドルなペイン）が整うまで待ってから
-                // 「確認なしで閉じる」を検査する。判定内容そのものは変えていない
-                type_text(
+                // 「確認なしで閉じる」を検査する。判定内容そのものは変えていない。
+                //
+                // #1375: 旧実装は 60 × 250ms = **固定 15 秒窓**で「分割の着地」と
+                // 「アイドル化」を同時に待っていて、隔離セルフテストが高負荷
+                // （load-after 101.64）で実際に落ちた（`TAKO_APP_SELF_TEST_FAILED:
+                // 73f: split で新ペインへフォーカスが移らない` = **以降の項目が 1 つも
+                // 走らない**）。加えて旧実装は**分割コマンドを打ったあとに**
+                // 「分割前のフォーカス」を読んでいたので、分割が先に着地した回は
+                // 比較相手が新ペインそのものになり、窓を使い切るまで真にならなかった。
+                // 前提を 2 段（着地 → アイドル）に割り、どちらも状態で待つ
+                let plain_target = split_focus_new_pane(
+                    window,
                     any,
                     cx,
                     &sh.discard_output(&format!("{cli} split --right --focus")),
-                    true,
-                );
-                let split_pane_before = window
-                    .update(cx, |app, _, _| app.focused_pane())
-                    .unwrap_or_else(|_| fail("73f: 分割前のフォーカス取得"));
-                let mut plain_target = None;
-                let mut plain_idle = false;
-                for _ in 0..60 {
-                    wait(cx, 250).await;
-                    let state = window
-                        .update(cx, |app, _, _| {
-                            let target = app.focused_pane();
-                            (
-                                target,
-                                target != split_pane_before,
-                                !app.pane_close_needs_confirm(target),
-                            )
-                        })
-                        .unwrap_or((split_pane_before, false, false));
-                    if state.1 {
-                        plain_target = Some(state.0);
-                        plain_idle = state.2;
-                        if plain_idle {
-                            break;
-                        }
-                    }
-                }
-                if plain_target.is_none() {
+                    "73f",
+                    Duration::from_millis(15000),
+                    Duration::from_secs(30),
+                )
+                .await;
+                let Some(plain_pane) = plain_target else {
                     fail("73f: split で新ペインへフォーカスが移らない");
-                }
+                };
+                let plain_idle = wait_for_cli_state(
+                    window,
+                    cx,
+                    "73f-idle",
+                    "73f: 分割直後のペインが素のアイドルになる",
+                    Duration::from_millis(15000),
+                    Duration::from_secs(30),
+                    move |app| !app.pane_close_needs_confirm(plain_pane),
+                )
+                .await;
                 // 前提が整わなかったら「なぜ」を残す（黙って落ちるのを避ける。#796）
                 if !plain_idle {
                     println!(
-                        "TAKO_SELF_TEST_732: 分割直後のペインが 15 秒アイドルにならなかった {}",
+                        "TAKO_SELF_TEST_732: 分割直後のペインがアイドルにならなかった {}",
                         env_line()
                     );
                 }
                 let plain_ok = window
                     .update(cx, |app, _, cx| {
                         let before = app.workspace.active_tab().tree().len();
-                        let target = app.focused_pane();
                         app.confirm_close = true;
                         // role 無し + アイドル = 失うものが無い
-                        let needs = app.pane_close_needs_confirm(target);
+                        let needs = app.pane_close_needs_confirm(plain_pane);
+                        // cmd+W はフォーカスを閉じるので、待った相手を見ていること
+                        // まで含めて確かめる（待ちの間に戻っていたら別のペインを測る）
+                        let focused = app.focused_pane() == plain_pane;
                         app.close_focused_pane(cx);
                         let no_dialog = app.pending_close_confirm.is_none();
                         let after = app.workspace.active_tab().tree().len();
                         app.confirm_close = false; // セルフテスト既定へ戻す
-                        !needs && no_dialog && after == before - 1
+                        focused && !needs && no_dialog && after == before - 1
                     })
                     .unwrap_or(false);
                 check(
@@ -68963,19 +69017,15 @@ mod self_test_wait_budget_tests {
         );
     }
 
-    /// #1353 / #1364: 打ち込んだ CLI の結果を待つ予算。旧経路（`TAKO_1353_LEGACY` /
-    /// `TAKO_1364_LEGACY`）は**項目ごとの旧の固定予算そのまま**（項目 22 = 800ms /
-    /// 項目 44 = 1 秒 / 項目 63 = 6 秒窓 + 40 秒）
+    /// #1353 / #1364 / #1375: 打ち込んだ CLI の結果を待つ予算。旧経路
+    /// （`TAKO_1353_LEGACY` / `TAKO_1364_LEGACY` / `TAKO_1375_LEGACY`）は
+    /// **項目ごとの旧の固定予算そのまま**（項目 22 = 800ms / 項目 44 = 1 秒 /
+    /// 項目 63 = 6 秒窓 + 40 秒 / #1375 の 16 項目 = 0.8〜15 秒）
     #[test]
     fn 旧経路は項目ごとの固定予算をそのまま再現する() {
-        for legacy_window in [
-            Duration::from_millis(800),
-            Duration::from_millis(1000),
-            Duration::from_millis(6000),
-            Duration::from_secs(40),
-        ] {
+        for (legacy_window, base) in cli_wait_budgets() {
             assert_eq!(
-                cli_state_budget(legacy_window, Duration::from_secs(20), Some(3.0), true),
+                cli_state_budget(legacy_window, base, Some(3.0), true),
                 legacy_window,
                 "旧経路が固定予算を再現していない"
             );
@@ -68986,7 +69036,7 @@ mod self_test_wait_budget_tests {
     /// （0.8 秒 → 20 秒 / 40 秒 → 60 秒）が #1353 / #1364 の核心
     #[test]
     fn 新経路は空いている機でも旧の固定予算より広い() {
-        for (legacy_window, base) in CLI_WAIT_PAIRS {
+        for (legacy_window, base) in cli_wait_budgets() {
             let idle = cli_state_budget(legacy_window, base, Some(0.0), false);
             assert_eq!(idle, base, "空いている機で基準から動いた");
             assert!(
@@ -69002,7 +69052,7 @@ mod self_test_wait_budget_tests {
     /// 不等式）。等しいと旧の腕も通ってしまい A/B が差を測らない
     #[test]
     fn 注入の遅れは旧の予算を超えて新の上限に収まる_1353() {
-        for (legacy_window, base) in CLI_WAIT_PAIRS {
+        for (legacy_window, base) in cli_wait_budgets() {
             let delay = inject_1180_delay(legacy_window);
             assert!(
                 delay > legacy_window,
@@ -69015,18 +69065,106 @@ mod self_test_wait_budget_tests {
         }
     }
 
-    /// 項目ごとの（旧の固定予算, 新の素の上限）。**main.rs の呼び出しと同じ値**を置く
-    /// （増やしたら上の 2 本が不等式を検査する）
-    const CLI_WAIT_PAIRS: [(Duration, Duration); 4] = [
-        // 項目 22: tako resize
-        (Duration::from_millis(800), Duration::from_secs(20)),
-        // 項目 44: tako scroll --to
-        (Duration::from_millis(1000), Duration::from_secs(20)),
-        // 項目 63: split の新ペインが生まれて描かれるまで
-        (Duration::from_millis(6000), Duration::from_secs(20)),
-        // 項目 63: 新ペインがマーカーを出すまで
-        (Duration::from_secs(40), Duration::from_secs(60)),
-    ];
+    /// 呼び出し側の（旧の固定予算, 新の素の上限）を**ソースから採る**（#1375。
+    /// #771 / #1180 の `claude_wait_budgets` / `backend_wait_budgets` と同じ手）。
+    ///
+    /// 手で並べた表だと移送のたびにズレる（#1375 で 16 件増えた）ので、
+    /// `wait_for_cli_state`（#1375 の寄せ先）・`split_focus_new_pane`（分割の着地を
+    /// 待つ薄い包み）・`cli_state_budget` の直呼び（項目 22 / 44 / 63）を採り、
+    /// 引数に書かれた最初の 2 つの `Duration` リテラルを読む。パターンは
+    /// `concat!` で分割して書く（このテスト自身のソース行が対象に入るため）
+    fn cli_wait_budgets() -> Vec<(Duration, Duration)> {
+        let src = include_str!("main.rs");
+        let mut out = Vec::new();
+        for call in [
+            concat!("wait_for_cli", "_state("),
+            concat!("split_focus_new", "_pane("),
+            concat!("cli_state", "_budget("),
+        ] {
+            for (index, _) in src.match_indices(call) {
+                let mut found = duration_literals(&call_args(&src[index + call.len()..]));
+                if found.len() >= 2 {
+                    out.push((found.remove(0), found.remove(0)));
+                }
+            }
+        }
+        out
+    }
+
+    /// 呼び出しの引数の範囲を**丸括弧の釣り合い**で切り出す。引数にクロージャや
+    /// 入れ子の呼び出しが入るので、最初の `)` では切れない
+    fn call_args(rest: &str) -> String {
+        let mut depth = 0i32;
+        let mut out = String::new();
+        for ch in rest.chars() {
+            match ch {
+                '(' => depth += 1,
+                ')' if depth == 0 => break,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            out.push(ch);
+        }
+        out
+    }
+
+    /// `Duration::from_millis(N)` / `Duration::from_secs(N)` を**書かれた順**に採る
+    /// （桁区切りの `_` は落とす）
+    fn duration_literals(args: &str) -> Vec<Duration> {
+        let head = "Duration::from_";
+        let mut out = Vec::new();
+        let mut rest = args;
+        while let Some(at) = rest.find(head) {
+            let tail = &rest[at + head.len()..];
+            let (Some(open), Some(close)) = (tail.find('('), tail.find(')')) else {
+                break;
+            };
+            if open > close {
+                break;
+            }
+            let digits: String = tail[open + 1..close]
+                .chars()
+                .filter(|c| c.is_ascii_digit())
+                .collect();
+            match (&tail[..open], digits.parse::<u64>()) {
+                ("millis", Ok(value)) => out.push(Duration::from_millis(value)),
+                ("secs", Ok(value)) => out.push(Duration::from_secs(value)),
+                _ => {}
+            }
+            rest = &tail[close..];
+        }
+        out
+    }
+
+    /// 採り漏らしの番犬: 移送済みの項目の予算がソースから採れていること
+    /// （`concat!` の分割ミスや書き方の変更で**全部 0 件**になっても
+    /// 上の 3 本は空ループで緑になってしまう）
+    #[test]
+    fn 打ち込んだcliの待ちの予算がソースから採れている() {
+        let sites = cli_wait_budgets();
+        assert!(
+            sites.len() >= 21,
+            "CLI の待ちの呼び出しが採れていない（採れたのは {} 件: {sites:?}）",
+            sites.len()
+        );
+        for known in [
+            // 項目 22: tako resize（#1364)
+            (Duration::from_millis(800), Duration::from_secs(20)),
+            // 項目 44: tako scroll --to（#1353）
+            (Duration::from_millis(1000), Duration::from_secs(20)),
+            // 項目 63: 新ペインがマーカーを出すまで（#1364）
+            (Duration::from_secs(40), Duration::from_secs(60)),
+            // 項目 18: tako split の固定窓 8 × 1500ms（#1375）
+            (Duration::from_millis(12000), Duration::from_secs(20)),
+            // 項目 73f: 確認なしで即 close の固定窓 60 × 250ms（#1375）
+            (Duration::from_millis(15000), Duration::from_secs(30)),
+        ] {
+            assert!(
+                sites.contains(&known),
+                "移送済みの予算 {known:?} が採れていない: {sites:?}"
+            );
+        }
+    }
 
     /// #1165: 画面テキストの待ちも同じ予算に通る。旧経路（`TAKO_1165_LEGACY=1`）は
     /// **項目 1b の固定窓そのまま**（8 × 800ms = 6.4 秒・1 回・送り直しなし）
@@ -72400,20 +72538,18 @@ mod selftest_wait_watchdog {
         label
     }
 
-    /// **まだ状態待ちへ移せていない「固定予算 + CLI の状態読み」の既知リスト**（#1375）。
+    /// **「固定予算 + CLI の状態読み」の既知リスト**（#1375 で**空にした**）。
     ///
-    /// #1353 / #1364 で直したのは項目 22 / 44 / 63 の 3 つで、同じ形が 16 件残っている。
-    /// 1 つの PR で全部動かすと**高負荷での A/B が項目ごとに取れない**ので、番犬を
-    /// 先に入れて**新規の混入を止め**、リストは #1375 で空にする。
+    /// #1353 / #1364 で直したのは項目 22 / 44 / 63 の 3 つで、番犬を入れた時点で
+    /// 同じ形が 16 件残っていた。1 つの PR で全部動かすと**高負荷での A/B が項目ごとに
+    /// 取れない**ので、番犬を先に入れて**新規の混入を止め**、既知のぶんはここで
+    /// 段階導入にしていた。#1375 で 16 件すべてを [`wait_for_cli_state`]
+    /// （状態待ち + [`cli_state_budget`]）へ移したので**空**。
     ///
     /// リストは**減る方向にしか動かさない**（下のテストが、直したのに残っている
-    /// エントリを落とす）。キーは `check` のラベル
-    const KNOWN_FIXED_CLI_WAITS: &[&str] = &[
-        "ペインの × ボタンで kill（dispatch 経由）",
-        "ペインの ー ボタンでバックグラウンド（dispatch 経由）",
-        "確認ダイアログ: cmd+クリックでスキップ",
-        "確認ダイアログ: 通常ペインの cmd+W は確認なしで即 close（#566）",
-    ];
+    /// エントリを落とす）。**空のまま維持する**のが正しい状態で、新しく混入した形は
+    /// ここへ足さずに移送すること。キーは `check` のラベル
+    const KNOWN_FIXED_CLI_WAITS: &[&str] = &[];
 
     #[test]
     fn 打ち込んだcliの結果を固定予算で待っていない() {
