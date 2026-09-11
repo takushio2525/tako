@@ -64,3 +64,7 @@
 - `ScreenLine` の旗は #787 以降 production の読み手が 0（grep で確定）なのに毎行 `windows(2)` を走らせ、doc だけが「描画で使う」と言っていた。フィールドと書き手 4 か所（`screen.rs` / `links.rs` ×2 / `terminal_grid.rs`）を落とし、assert 3 件は「全角のぶん `cell_cols` が 2 列飛ぶ」へ置き換え
 - 修正前ソースの実測: 右端だけが全角の行は旗が **false**（`windows(2)` 版の構造的な見落とし）/ 途中に全角なら true。`text` / `cell_cols` は前後で完全一致（右端全角・空行・全角のみ・途中全角の 4 ケースを `screen_from_lines` で固定）
 - 番犬 `issue1388_has_wide_watchdog` 6 本（識別子の再登場 / 旗を組む形 / フィールド指紋 + 注入 3）。修正前ソースで 3 本が file:line 名指し FAILED（`screen.rs:55` / `476` / `481`・`links.rs:122` / `127`・`terminal_grid.rs:627`）
+## 2026-09-12（#1389: visible_lines_filled の「行末が全角」の取りこぼしを限界として固定した）
+- `line_length()` は末尾から `cell.c != ' '` を探すので全角の後続セル（`WIDE_CHAR_SPACER`）を空きと数える = 行末が全角の行は右端まで埋まっていても `filled=false`。挙動は変えず、doc の「既知の限界」+ `.agent/conventions.md` #1283 節（兄弟実装 `combined_screen_text` と**同じ穴**であること）+ 10 桁の実 PTY で 6 形を採る単体テストで固定した
+- 実測（10 桁）: A 行末が全角・以降の出力なし = `line_length=9 filled=false WIDE_CHAR_SPACER` / E `CUP` で描き直し = 同じ / B 続きあり = `WRAPLINE` が立って 10・true / C・D・F は従来どおり。現行の消費者 `find_exit_marker` は全 ASCII のマーカー断片しか見ないので実害は無い（(b) 判定の修正は別 Issue 候補）
+- 番犬 `issue1389_filled_wide_limit_watchdog` 5 本が doc / 規約 / 固定テストの欠落を file:line で名指し（注入 4 通りで確認）。製品コードの差分は doc コメントのみ・削除 0 行 = **install 不要**

@@ -1366,6 +1366,16 @@ alacritty は 0 幅の結合文字（NFD の濁点 `U+3099`・アクセント `U
   `combined_screen_text` の「右端まで埋まったか」は `last_visible_col + 1 >= cols` なので
   右端 1 列前の全角文字を「埋まっていない」と読み、行末の空白は空白詰めと区別できない
   （実画面でも同じ情報しか無い）。#1283 の 3 形はどれもここに当たらない
+- **同じ穴は `TerminalSession::visible_lines_filled`（#651 の物差し）にも在る**（#1389）。
+  あちらは alacritty の `line_length()` で列を測るが、`line_length()` は末尾から
+  `cell.c != ' '` を探すので**全角の後続セル（`WIDE_CHAR_SPACER`）を空きと数える** =
+  行末が全角の行は 1 列足りず `filled=false`（実測・10 桁: `abcdefghあ` で
+  `line_length=9`。端末自身が折り返した行だけ `WRAPLINE` で全幅になるので、
+  **器が `CUP` で描き直した行は救えない**）。**2 つの物差しは同じ穴を持つ**ので、
+  折り返しの結合を新しく書くときはどちらを使っても右端の全角を自分で検査する。
+  現行の消費者（`dispatch::find_exit_marker`）は全 ASCII のマーカーの断片しか見ないので
+  実害は無い。限界は `terminal::tests::visible_lines_filled_は行末の全角を取りこぼす` と
+  番犬 `crates/tako-control/tests/issue1389_filled_wide_limit_watchdog.rs` が固定する
 - 検証は `tako links --text <画面の写し>`（GUI と同じ判定を人手のクリック無しで引ける）
 
 ## ダイアログの検知は「起点と連続する塊」だけを採る（Issue #1293）
