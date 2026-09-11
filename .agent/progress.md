@@ -64,3 +64,7 @@
 - 隔離 GUI（tako-vd・`CGEventPostToPid`）で確定: ターミナルの cmd+A は選択を作らず PTY にも届かない（`abc` に cmd+A → `x` で `abcx` 3/3。本物の Ctrl+A は `xabc` 3/3 = 検出力あり）。cmd+A → cmd+C も sentinel のまま 3/3
 - 同じ経路でプレビュー本文 3/3・編集中バッファ 3/3 は全文が入るので「端末には実装が無い」が確定。表の行へ効く先を書き注記を 1 つ追加（コード変更なし = install 不要。案 (b) = ターミナルの全選択は別 Issue 候補として Issue へ残した）
 - 番犬 2 本（説明文 ↔ `select_all_text` の両方向 / 効く先の列挙）。注入 5 通りで file:line 名指しの FAILED → 復帰後 7/7 緑
+## 2026-09-11（#1383: clippy が単体形と workspace 形で違う lint を見る理由を確定し CI へ 1 本足した）
+- 真因は feature unification。`--workspace` は必ず gpui を含むので `serde_json/preserve_order` が有効 = `Map` が IndexMap 実装 → `Value` が**有意な Drop** を持ち `unnecessary_lazy_evaluations` が黙る。gpui 抜きの `-p` 宇宙は BTreeMap 実装（insignificant）なので同じ行で落ちる
+- `wait.rs:1099` を `then_some` へ（挙動不変）。CI の macOS ジョブへ `-p tako-core -p tako-control -p tako-cli` の clippy を追加（温まっていれば実測 10.5 秒）
+- 番犬: 修正前の行を戻すと新ステップが EXIT=101・既存の workspace ステップは EXIT=0 で見逃す（実出力で確認）

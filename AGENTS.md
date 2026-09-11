@@ -131,7 +131,7 @@ tako/
 | **PWA を単独でビルドする（新規 worktree で dist が無いとき。#1309）** | `scripts/build-pwa.sh` |
 | **PWA の e2e（Playwright 6 spec / 50 項目。#1357）** | `cd web/tako-remote && npm run e2e` |
 | build | `cargo build --workspace` |
-| lint | `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` |
+| lint（**2 つの feature 宇宙**を見る。#1383） | `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo clippy -p tako-core -p tako-control -p tako-cli --all-targets -- -D warnings` |
 | test | `cargo test --workspace` |
 | **PR の CI 完了を待つ（判定はこの 1 実装。#1333）** | `scripts/wait-pr-checks.sh <PR>` |
 | **CI が緑で揃ってから PR を merge する（#1333）** | `scripts/merge-pr.sh <PR>` |
