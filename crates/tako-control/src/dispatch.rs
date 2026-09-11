@@ -771,9 +771,12 @@ fn dispatch_inner(
             // #390: worker レジストリの該当エントリを closed へ（worker でなければ no-op。
             // PTY 死亡（Exited）はここを通らないため「pane が消えても worker は生存」の
             // 追跡は維持される）
-            if let Err(e) = crate::orchestrator::registry::mark_closed_by_pane(
+            // #775: `close_reason` には発生源（CLI / MCP + 呼び出し元 role）を載せる。
+            // ペインログのクローズマーカーと同じ語彙なので、両者を突き合わせられる
+            if let Err(e) = crate::orchestrator::registry::mark_closed_by_origin(
                 target.as_u64(),
-                "explicit_close",
+                close_origin_of(origin),
+                caller_role.as_deref(),
             ) {
                 eprintln!("warning: worker レジストリの close 記録に失敗: {e}");
             }
@@ -2948,6 +2951,15 @@ fn dispatch_inner(
                 return Err(DispatchError::PaneNotFound(pane));
             }
             host.detach_session(pane_id, close_origin_of(origin), None);
+            // #775: たまり場の kill も明示 close なのでレジストリへ記録する
+            // （GUI のたまり場カードと対の経路。UI でできることは AI からも同じに見える）
+            if let Err(e) = crate::orchestrator::registry::mark_closed_by_origin(
+                pane_id.as_u64(),
+                close_origin_of(origin),
+                None,
+            ) {
+                eprintln!("warning: worker レジストリの close 記録に失敗: {e}");
+            }
             Ok(json!({ "killed": pane }))
         }
 
@@ -14566,6 +14578,65 @@ mod tests {
         );
     }
 
+    /// #775: たまり場からの kill も worker レジストリへ closed を記録する。
+    ///
+    /// たまり場のペインはどのタブにも居ないので `Request::Close` を通れず、
+    /// この経路だけが記録していなかった（GUI のたまり場カードと対の穴）
+    #[test]
+    fn background_killもworkerレジストリへclosedを記録する() {
+        use crate::orchestrator::registry::{registry_path, RegisterSpawn, WorkerRegistry};
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let pane = split(&mut host, root);
+        let worker_id = crate::orchestrator::registry::record_spawn(RegisterSpawn {
+            label: Some("bg-kill".into()),
+            project: "st775".into(),
+            agent: "claude".into(),
+            model: None,
+            effort: None,
+            pane,
+            tab: None,
+            tmux_session: None,
+            issues: vec![],
+            ledger_id: None,
+            cwd: None,
+            prompt_head: None,
+        })
+        .expect("レジストリへ登録できる");
+
+        dispatch(
+            &mut host,
+            Request::Background {
+                pane: Some(pane),
+                tab: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        // 退避しただけでは倒さない（まだ生きている worker）
+        let reg = WorkerRegistry::load().unwrap();
+        assert!(
+            reg.resolve(&worker_id).unwrap().1.is_active(),
+            "たまり場への退避で worker を closed にしてはいけない"
+        );
+
+        dispatch(&mut host, Request::BackgroundKill { pane }, PaneOrigin::Mcp).unwrap();
+        let reg = WorkerRegistry::load().unwrap();
+        let (_, entry) = reg.resolve(&worker_id).unwrap();
+        assert_eq!(entry.status, "closed");
+        assert_eq!(
+            entry.close_reason.as_deref(),
+            Some("close:dispatch(mcp)"),
+            "たまり場 kill の発生源が残る"
+        );
+        assert!(reg.find_active_by_pane(pane).is_none());
+        // 後始末（プロセス共有の一時レジストリなので、この worker だけ消す）
+        let path = registry_path().unwrap();
+        let _ = WorkerRegistry::mutate_at(&path, |reg| {
+            reg.workers.remove(&worker_id);
+        });
+    }
+
     #[test]
     fn タブ最後のペインのcloseはタブごと閉じる() {
         let mut host = MockHost::new();
@@ -23409,7 +23480,13 @@ mod tests {
             let reg = WorkerRegistry::load().unwrap();
             let (_, entry) = reg.resolve(&worker_id).unwrap();
             assert_eq!(entry.status, "closed");
-            assert_eq!(entry.close_reason.as_deref(), Some("explicit_close"));
+            // #775: 発生源が載る（旧値の固定文字列 "explicit_close" ではない）。
+            // ペインログのクローズマーカーと同じ語彙なので突き合わせられる
+            assert_eq!(
+                entry.close_reason.as_deref(),
+                Some("close:dispatch(cli)"),
+                "CLI 経路の close は発生源つきで記録される"
+            );
             assert!(reg.find_active_by_pane(worker_pane).is_none());
         });
     }
