@@ -468,7 +468,12 @@ pub fn append_audit(path: &Path, event: &str, extra: Value) {
         .append(true)
         .open(path)
     {
-        let _ = writeln!(f, "{entry}");
+        // **1 行を 1 回の write で出す**（#1403）。`writeln!` は本文と改行を
+        // 別々に書くので、O_APPEND でも**行が混ざる**。#1403 で HTTP の受信が
+        // 4 ワーカーになり、ここへ同時に書く者（受信 / serve 自己検査 / セッション
+        // スイープ / WS 中継）が増えたため、組んでから 1 回で書く形へ寄せた
+        let line = format!("{entry}\n");
+        let _ = f.write_all(line.as_bytes());
     }
 }
 

@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-12（#1388: 読み手のいない「行に全角が在るか」の旗を落とした）
-- `ScreenLine` の旗は #787 以降 production の読み手が 0（grep で確定）なのに毎行 `windows(2)` を走らせ、doc だけが「描画で使う」と言っていた。フィールドと書き手 4 か所（`screen.rs` / `links.rs` ×2 / `terminal_grid.rs`）を落とし、assert 3 件は「全角のぶん `cell_cols` が 2 列飛ぶ」へ置き換え
-- 修正前ソースの実測: 右端だけが全角の行は旗が **false**（`windows(2)` 版の構造的な見落とし）/ 途中に全角なら true。`text` / `cell_cols` は前後で完全一致（右端全角・空行・全角のみ・途中全角の 4 ケースを `screen_from_lines` で固定）
-- 番犬 `issue1388_has_wide_watchdog` 6 本（識別子の再登場 / 旗を組む形 / フィールド指紋 + 注入 3）。修正前ソースで 3 本が file:line 名指し FAILED（`screen.rs:55` / `476` / `481`・`links.rs:122` / `127`・`terminal_grid.rs:627`）
-
 ## 2026-09-12（#1389: visible_lines_filled の「行末が全角」の取りこぼしを限界として固定した）
 - `line_length()` は末尾から `cell.c != ' '` を探すので全角の後続セル（`WIDE_CHAR_SPACER`）を空きと数える = 行末が全角の行は右端まで埋まっていても `filled=false`。挙動は変えず、doc の「既知の限界」+ `.agent/conventions.md` #1283 節（兄弟実装 `combined_screen_text` と**同じ穴**であること）+ 10 桁の実 PTY で 6 形を採る単体テストで固定した
 - 実測（10 桁）: A 行末が全角・以降の出力なし = `line_length=9 filled=false WIDE_CHAR_SPACER` / E `CUP` で描き直し = 同じ / B 続きあり = `WRAPLINE` が立って 10・true / C・D・F は従来どおり。現行の消費者 `find_exit_marker` は全 ASCII のマーカー断片しか見ないので実害は無い（(b) 判定の修正は別 Issue 候補）
@@ -64,3 +59,8 @@
 - 物差しを「ポートが 22 か」から「**宛先の名前だけでそのポートへ行けるか**」へ（`ConfiguredPorts` = `~/.ssh/config` の `Port`・判断は `port_reachable_by_name` の 1 箇所・材料は `scan` が走る tick だけ読む）。tako の `-p` は config の書き写しなので全部この側に入り、手打ちの `-p`（config に無い）と `-F <別 config>` は従来どおり見送る
 - 同じ症状の 2 つ目の原因を同時に直した: tako の `-o ControlPath="…"` は macOS 既定 data_dir に空白があるので `ps` の 1 行が割れ、**続きの語が宛先に見えて** `RemoteCommand` で見送られていた（ポートが 22 でも起きる）。隔離 GUI + 使い捨て sshd の A/B（`TAKO_1411_LEGACY=1`）で legacy = `sessions:[]`（空白あり data dir は `RemoteCommand`・空白なしは Issue と同じ `PortOverride`）→ 新 = pane が `sessions` に `live` で載り、手打ちの `-p` だけが `PortOverride` で残る
 - 番犬 `issue1411_self_opened_ssh_watchdog` 8 本（注入 6 通りで `ssh_detect.rs:378` / `:421` / `:423` / `remote.md:107` を file:line 名指し）。単体 16 本・workspace 4442 passed 0 failed・check-windows error 0。**install 要**
+
+## 2026-09-12（#1403: remote daemon の HTTP 受信を少数ワーカーへ並列化した）
+- 受信ループを `serve_http_requests` へ切り出し、`Arc<tiny_http::Server>` を既定 4 本（`TAKO_REMOTE_HTTP_WORKERS` で 1..=32）のワーカーが recv する形へ。合流は `thread::scope`（忘れられない）・1 本の panic は `catch_unwind` で監査ログへ・recv 破損は全員で降りる。daemon → app の IPC は `with_app_ipc` の 1 実装が往復の間ロックを握る（呼び出し 4 か所を集約）。波及で `append_audit` を 1 行 1 write へ（書く者が増えたので `writeln!` だと行が混ざる）
+- 隔離 daemon（偽 tailscale の whois 3 秒・本番 pid 64092 は不可侵）の A/B: 修正前 B = **2.71 秒** → 新 **0.0004 秒**（A は 3.03 秒のまま）。`TAKO_1403_LEGACY=1` / `TAKO_REMOTE_HTTP_WORKERS=1` はどちらも 2.72 秒で旧挙動を再現。飽和の限界も実測（4 本同時で health 2.51 秒・6 本で溢れた 2 本が 6.04 秒）
+- 番犬 `issue1403_http_workers_watchdog` 7 本 + 単体 6 本。注入 9 通りで file:line 名指し FAILED（IPC は `left: 4 / right: 1`）。**mid-file の `#[cfg(test)]` は禁止**（#1401 番犬の走査範囲が切れる）・`LEGACY_ARM` マーカーは実時間アサート用なので付けない。workspace 4487 passed 0 failed × 5・check-windows error 0
