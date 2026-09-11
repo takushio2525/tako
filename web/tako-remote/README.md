@@ -91,4 +91,5 @@ spec はカンプ比較用に PNG を撮る（PASS / FAIL には影響しない�
 
 `.github/workflows/ci.yml` の macOS ジョブ末尾で `npm run e2e:install` →
 `npm run e2e` が **blocking** で走る（#1357）。PWA の実装契約が変わって spec が
-取り残されたら、そこで落ちる。
+取り残されたら、そこで落ちる。追加の所要は実測 46〜87 秒（`50 passed` が 33 秒〜1.2 分。
+Playwright の既定 worker 数がランナーの CPU 数に従うので run ごとに幅が出る）。
