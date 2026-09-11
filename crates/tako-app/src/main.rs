@@ -2187,10 +2187,6 @@ struct TakoApp {
     confirm_close: bool,
     /// 確認ダイアログ表示中の対象（None = ダイアログ非表示）
     pending_close_confirm: Option<CloseConfirmTarget>,
-    /// 子プロセスが動いているバックエンドセッション名（Issue #566）。
-    /// sleep guard の定期スキャン（2 秒 tick の background 実行）結果を再利用し、
-    /// close 確認の判定で UI スレッドから tmux / ps を起こさないためのキャッシュ
-    busy_backend_sessions: std::collections::HashSet<String>,
     /// 子プロセス走査の対象指紋・前回結果・最終走査時刻（#779）。変化のない tick は
     /// tmux / ps を起動せず、この状態を sleep guard / GUI モード / close 確認で共有する。
     running_children_scan: tako_control::agents::RunningChildrenScanState,
@@ -3889,7 +3885,6 @@ impl TakoApp {
             hovered_link: None,
             confirm_close: tako_control::setup::confirm_close_enabled(),
             pending_close_confirm: None,
-            busy_backend_sessions: std::collections::HashSet::new(),
             running_children_scan: tako_control::agents::RunningChildrenScanState::default(),
             osc_sinks: HashMap::new(),
             sleep_guard_state: None,
@@ -5157,7 +5152,7 @@ impl TakoApp {
                 }
                 // ② background: GUI モードのチャット読み取り（#702）。sleep_guard の
                 // 直後に置くのは、チャット判定が「子プロセスが動いているか」
-                // （= いま適用したばかりの busy_backend_sessions）を根拠にするため。
+                // （= いま適用したばかりの running_children_scan）を根拠にするため。
                 // terminal モードでは collect が即空を返すので実質ゼロコスト
                 {
                     let targets = this.update(cx, |app: &mut TakoApp, _| {
@@ -8251,9 +8246,20 @@ impl TakoApp {
         {
             return true;
         }
-        self.backend_sessions
-            .get(&pane_id)
-            .is_some_and(|session| self.busy_backend_sessions.contains(session))
+        self.pane_has_busy_children(pane_id)
+    }
+
+    /// このペインで実行中の子プロセスがあるか（#1367）。
+    ///
+    /// **器の有無で分岐しない**: 判定は `RunningChildrenScanState::is_pane_busy` の
+    /// 1 実装を通す。器のセッション名（`busy_sessions`）を呼び出し側で引くと、
+    /// 器を持たないペイン（tmux 未導入 / persist OFF = Homebrew cask の既定構成）が
+    /// 必ず false になり、close 確認（#566）・GUI モードの判定（#694）・チャットの
+    /// `agent_running` がまとめて反応しなくなる（= #1367）。
+    /// 材料は sleep guard の定期スキャン結果の使い回しなので、ここで tmux / ps は
+    /// 起こさない（UI スレッドからサブプロセスを起こさない。#340 / #779）
+    fn pane_has_busy_children(&self, pane_id: PaneId) -> bool {
+        self.running_children_scan.is_pane_busy(pane_id.as_u64())
     }
 
     /// 会話を引き継いだ再起動の出し分け（#1067）。**右クリックの瞬間に 1 度だけ**呼ぶ。
@@ -9545,10 +9551,7 @@ impl TakoApp {
                 .map(|s| s.command_state())
                 .unwrap_or(tako_core::CommandState::Unknown),
             has_role,
-            busy_children: self
-                .backend_sessions
-                .get(&pane_id)
-                .is_some_and(|s| self.busy_backend_sessions.contains(s)),
+            busy_children: self.pane_has_busy_children(pane_id),
             // #720: 生成直後 / エージェント起動直後の猶予。ここに載っている間は
             // 「不明 → ターミナル」ではなく準備中プレースホルダで覆う
             settle: self
@@ -13693,7 +13696,6 @@ impl TakoApp {
             settings.lid_sleep_mode,
             scan.busy_count(),
         );
-        self.busy_backend_sessions = scan.busy_sessions.iter().cloned().collect();
         self.running_children_scan = scan;
         self.sleep_guard_state = Some(state);
     }
@@ -47248,6 +47250,170 @@ mod self_test {
                     "確認ダイアログ: 通常ペインの cmd+W は確認なしで即 close（#566）",
                 );
 
+                // 73g. #1367: **器を持たないペイン**（tmux 未導入 / persist OFF =
+                //      Homebrew cask の既定構成）でも「子プロセスが動いている」を理由に
+                //      確認が入る。#372 で走査（`RunningChildrenScanState`）は器なし
+                //      ペインを数えるようになったが、引く側は器のセッション名を見たまま
+                //      だったので、この構成では稼働中のエージェントが cmd+W 一撃で消えた
+                //      （2026-09-12 の隔離 GUI の実測: `busy_agents=1` なのに確認なしで
+                //      即 close = #566 の事故がそのまま再現していた）。
+                //
+                //      実 claude は起こさず、**背景ジョブ**で「OSC 133 では拾えない
+                //      ペインの子プロセス」を作る（前景はすぐ戻るのでシェルは Idle のまま
+                //      = `CommandState::Running` の枝では真にならない形にして、
+                //      busy_children の枝だけを検証する）。前提の器なしは**見て飛ばさず
+                //      この項目のあいだだけ製品の経路で作る**（persist OFF → 分割 → 戻す）
+                {
+                    let set_persist = |app: &mut TakoApp, enabled: Option<bool>| {
+                        tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Persist { enabled },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                        .and_then(|v| v["enabled"].as_bool())
+                    };
+                    let restore_persist = window
+                        .update(cx, |app, _, _| set_persist(app, None))
+                        .ok()
+                        .flatten();
+                    let _ = window.update(cx, |app, _, _| set_persist(app, Some(false)));
+                    // 分割**前**のフォーカスを控える。`focused_pane()` だけを見ると
+                    // split が届く前に「アイドルな分割元」で前提が真になり、以降の
+                    // 検査が**別のペイン**を測る（#1364 と同じ偽陽性。実測で 36.4 秒の
+                    // 待ちを使い切って落ちた）
+                    let split_from = window
+                        .update(cx, |app, _, _| app.focused_pane())
+                        .unwrap_or_else(|_| fail("#1367: 分割前のフォーカス取得"));
+                    type_text(
+                        any,
+                        cx,
+                        &sh.discard_output(&format!("{cli} split --right --focus")),
+                        true,
+                    );
+                    // 予算は **60 秒の保険再走査**（#779。指紋が動かなくても必ず採り直す）を
+                    // 必ず跨げる値にする。前景の `sleep` で指紋を動かすので通常は数秒で
+                    // 届くが、そこが外れた回に「待てば届くもの」で落とさないため
+                    let budget1367 = state_wait_budget(Duration::from_secs(75), machine_busy());
+                    // 前提①: **新しい**ペインへフォーカスが移り、素のアイドル
+                    // （子プロセス無し）になる
+                    let born = wait_for_app_state(
+                        window,
+                        cx,
+                        "#1367: 器なしペインが素のアイドルになる",
+                        budget1367,
+                        move |app| {
+                            let target = app.focused_pane();
+                            target != split_from
+                                && !app.backend_sessions.contains_key(&target)
+                                && !app.pane_close_needs_confirm(target)
+                        },
+                    )
+                    .await;
+                    let direct = window
+                        .update(cx, |app, _, _| app.focused_pane())
+                        .unwrap_or_else(|_| fail("#1367: 器なしペインのフォーカス取得"));
+                    // 前提②: 本当に器を持っていない（持っていたら #1367 の枝を通らない）
+                    let no_backend = window
+                        .update(cx, |app, _, _| !app.backend_sessions.contains_key(&direct))
+                        .unwrap_or(false);
+                    // 落ちたときに「どのペインの何を測っていたか」が残るようにする
+                    let note1367 = move |app: &TakoApp, phase: &str| {
+                        println!(
+                            "TAKO_SELF_TEST_1367: phase={phase} split_from={} direct={} \
+                             backend={:?} state={:?} busy={} {}",
+                            split_from.as_u64(),
+                            direct.as_u64(),
+                            app.backend_sessions.get(&direct).cloned(),
+                            app.terminals.get(&direct).map(|s| s.command_state()),
+                            app.pane_has_busy_children(direct),
+                            env_line()
+                        );
+                    };
+                    let _ = window.update(cx, |app, _, _| note1367(app, "born"));
+                    check(
+                        born && no_backend,
+                        "#1367: 器を持たないアイドルペインを用意できた",
+                    );
+
+                    // 背景の子プロセスを起こす。**前景の `sleep` を後ろに足す**のは
+                    // 走査の指紋（`command_state`）を動かして再走査を即座に起こすため
+                    // （変化が無い tick は tmux / ps を起こさない = #779。放っておくと
+                    // 60 秒の保険まで反映されない。実測で 90 秒待っても届かなかった）
+                    let bg = sh.sequence(&[
+                        sh.spawn_background_sleep(300, "tako1367"),
+                        sh.sleep(3),
+                    ]);
+                    type_text(any, cx, &bg, true);
+                    let busy_seen = wait_for_app_state(
+                        window,
+                        cx,
+                        "#1367: 器なしペインの子プロセスが busy として届く",
+                        budget1367,
+                        move |app| {
+                            app.pane_has_busy_children(direct)
+                                && app.terminals.get(&direct).map(|s| s.command_state())
+                                    == Some(CommandState::Idle)
+                        },
+                    )
+                    .await;
+                    let _ = window.update(cx, |app, _, _| note1367(app, "busy"));
+                    let confirm_ok = window
+                        .update(cx, |app, _, cx| {
+                            let before = app.workspace.active_tab().tree().len();
+                            app.confirm_close = true;
+                            // シェル自身は Idle（= OSC 133 の枝では真にならない）
+                            let idle_shell = app.terminals.get(&direct).map(|s| s.command_state())
+                                == Some(CommandState::Idle);
+                            let needs = app.pane_close_needs_confirm(direct);
+                            app.close_focused_pane(cx);
+                            let dialog_shown = app.pending_close_confirm
+                                == Some(CloseConfirmTarget::Pane(direct, CloseOrigin::Keyboard));
+                            let not_closed = app.workspace.active_tab().tree().len() == before;
+                            app.close_confirm_cancelled(cx);
+                            app.confirm_close = false;
+                            idle_shell && needs && dialog_shown && not_closed
+                        })
+                        .unwrap_or(false);
+                    check(
+                        busy_seen && confirm_ok,
+                        "確認ダイアログ: 器なしペインでも子プロセス稼働中は確認が入る（#1367）",
+                    );
+
+                    // 止めたら確認は消える（= 全ペインに確認を出す形へ倒れていない）
+                    let stop = sh.sequence(&[
+                        sh.discard_output(&sh.stop_background_sleep("tako1367")),
+                        sh.sleep(3),
+                    ]);
+                    type_text(any, cx, &stop, true);
+                    let idle_again = wait_for_app_state(
+                        window,
+                        cx,
+                        "#1367: 子プロセスを止めたら busy が下りる",
+                        budget1367,
+                        move |app| !app.pane_has_busy_children(direct),
+                    )
+                    .await;
+                    let _ = window.update(cx, |app, _, _| note1367(app, "stopped"));
+                    let closed_ok = window
+                        .update(cx, |app, _, cx| {
+                            let before = app.workspace.active_tab().tree().len();
+                            app.confirm_close = true;
+                            let needs = app.pane_close_needs_confirm(direct);
+                            app.close_focused_pane(cx);
+                            let no_dialog = app.pending_close_confirm.is_none();
+                            let after = app.workspace.active_tab().tree().len();
+                            app.confirm_close = false;
+                            !needs && no_dialog && after == before - 1
+                        })
+                        .unwrap_or(false);
+                    check(
+                        idle_again && closed_ok,
+                        "確認ダイアログ: 器なしペインも子プロセスが止まれば確認なし（#1367）",
+                    );
+                    let _ = window.update(cx, |app, _, _| set_persist(app, restore_persist));
+                }
+
                 // 75. ⌘K コマンドパレット（#217）: 開く → 絞り込み → Enter で実行 →
                 //     テーマが反転し settings は汚さない（TAKO_SELF_TEST ガード）
                 let palette_ok = window
@@ -50653,9 +50819,7 @@ mod self_test {
                                     .find(|p| p.id() == base)
                                     .and_then(|p| p.role().map(str::to_string)),
                                 app.backend_sessions.get(&base).cloned(),
-                                app.backend_sessions
-                                    .get(&base)
-                                    .map(|s| app.busy_backend_sessions.contains(s)),
+                                app.pane_has_busy_children(base),
                             )
                         })
                         .unwrap_or_default();

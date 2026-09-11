@@ -922,7 +922,11 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
   会話の定期読み取り（`collect_chat_targets`）は **`backend_sessions` = 器つきペイン
   だけ**を対象にするので、persist OFF では誰も読みに来ず fixture が生き残り、
   persist ON では「実 claude ではない」と正しく判定されて消える。
-  **器の有無で通ったり落ちたりする検査**はこれを疑う
+  **器の有無で通ったり落ちたりする検査**はこれを疑う。
+  #1367 で `agent_running` の**判定**は器なしペインでも真になるようになったが、
+  **列挙**（この `backend_sessions` 起点）は器つきのままなので、器なし構成では
+  チャットビューそのものが立ち上がらない状態は続いている（live 解決が器の
+  セッション名をキーにしているため。器なしへ広げるのは別 Issue）
 
 - **器（tmux）と外のプロセスの往復を固定窓で待たない**（#1180）。相手が別プロセス
   （tmux サーバー / attach クライアント / CLI + IPC / webview の ipc）の往復である

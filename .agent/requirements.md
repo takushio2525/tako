@@ -1761,10 +1761,21 @@ master 1 セッション分の工数がかかった。事故の内訳は「確�
   次のいずれかなら確認ダイアログを挟む。⌘ を押しながらの × クリックは従来どおりスキップ
   - role 付きペイン（`orchestrator-master` / `orchestrator-worker` / `solo` 等 = エージェント）
   - シェルがコマンド実行中（OSC 133 の Running）
-  - バックエンドセッション配下で子プロセスが動いている（TUI エージェントは OSC 133 を
+  - **ペインで子プロセスが動いている**（TUI エージェントは OSC 133 を
     出さないため。判定は sleep guard（FR-5 系）の 2 秒ごとの評価結果を再利用する。実際の
     tmux / ps 走査は backend・role・OSC 状態の変化時 + 60 秒保険に限定し（#779）、
-    UI スレッドから tmux / ps を起こさない）
+    UI スレッドから tmux / ps を起こさない）。
+    **器の有無で分岐しない**（#1367）: 判定は `RunningChildrenScanState::is_pane_busy` の
+    1 実装を通し、器あり = 器のセッション名 / 器なし = tako のペイン ID という
+    「数え方の違い」は答える側で吸収する。ここで `busy_sessions`（器のセッション名）を
+    呼び出し側から引くと、**器を持たないペイン**（tmux 未導入 / persist OFF =
+    Homebrew cask の既定構成）は必ず false になり、稼働中のエージェントが cmd+W 一撃で
+    消える = #566 の事故がそのまま再現する（2026-09-12 の隔離 GUI で実測。走査側は
+    `busy_agents=1` と知っていた）。同じ材料を引く GUI モードの判定（#694 の
+    `busy_children`）とチャットの `agent_running` も同じ 1 実装を通す。
+    A/B は `TAKO_1367_LEGACY=1`、番犬は
+    `crates/tako-control/tests/issue1367_direct_pane_busy_watchdog.rs`、
+    run ごとの機械検証はセルフテスト項目 73g
   - タブの × は、タブ内に上記のペインが 1 つでもあれば確認する
   - 上記に当たらない**空のシェルペインは確認なしで即 close**（日常操作の邪魔をしない）
 - **CLI / MCP の close は確認を挟まない**（設計原則 5「AI フルコントロール」を維持）。

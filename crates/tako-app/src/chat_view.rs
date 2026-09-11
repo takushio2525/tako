@@ -3865,7 +3865,9 @@ impl TakoApp {
                 Some(ChatRefreshTarget {
                     pane: *pane,
                     backend: backend.clone(),
-                    agent_running: self.busy_backend_sessions.contains(backend),
+                    // #1367: 判定は `RunningChildrenScanState::is_pane_busy` の 1 実装。
+                    // `busy_sessions` を直に引くと器なしペインが必ず false になる
+                    agent_running: self.pane_has_busy_children(*pane),
                     read_only: role
                         .as_deref()
                         .is_some_and(tako_core::ui_mode::is_read_only_role),

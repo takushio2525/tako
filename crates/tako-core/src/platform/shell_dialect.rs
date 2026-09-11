@@ -252,6 +252,47 @@ impl ShellDialect {
         }
     }
 
+    /// **背景で動き続ける子プロセスを 1 つ起こす**（前景はすぐ戻る。#1367）。
+    ///
+    /// 用途は「シェルは OSC 133 で Idle のまま、ペインの子プロセスだけが在る」状態を
+    /// 作ること。TUI エージェント（claude 等）が動いているペインと同じ形で、
+    /// close 確認（#566）・GUI モードの判定（#694）の材料になる
+    /// `busy_children` を実プロセスで検証するための最小手。
+    ///
+    /// `label` は**シェルの識別子**として使う（POSIX は `<label>_pid` 変数、
+    /// PowerShell はジョブ名）ので、英数と `_` だけにすること
+    pub fn spawn_background_sleep(self, secs: u32, label: &str) -> String {
+        match self {
+            // 形が 3 つとも意味を持つ（どれも実測 2026-09-12）:
+            // - **ブレースグループで包む**: `sequence` は `;` で並べるので、素の
+            //   `sleep N &` だと `sleep N &; …` になり **zsh でしか通らない**
+            //   （bash / sh は構文エラー）
+            // - **`( … & )` のサブシェルにしない**: 抜けた瞬間に init へ里子に出て
+            //   「ペインの子孫」ではなくなる。`{ … & }` は現在のシェルで走るので
+            //   背景ジョブはペインのシェルの**直接の子**のまま
+            // - **pid を変数へ控える**: 止めるときの `%1` は当てにならない
+            //   （zsh ではブレースグループ自身が `%1` を取り、背景ジョブは `%2`。
+            //   `kill %1` が空振りして止まらなかった）
+            Self::Posix => format!("{{ sleep {secs} & }}; {label}_pid=$!"),
+            // PowerShell のバックグラウンドジョブはワーカーの pwsh プロセスを
+            // 子として起こすので、プロセス表では同じく「ペインの子孫」になる
+            Self::PowerShell => {
+                format!("Start-Job -Name {label} -ScriptBlock {{ Start-Sleep {secs} }} | Out-Null")
+            }
+        }
+    }
+
+    /// [`Self::spawn_background_sleep`] で起こした子を止める（#1367）
+    pub fn stop_background_sleep(self, label: &str) -> String {
+        match self {
+            // `%1` ではなく控えた pid で止める（理由は spawn 側のコメント）
+            Self::Posix => format!("kill ${label}_pid 2>/dev/null"),
+            Self::PowerShell => {
+                format!("Stop-Job -Name {label} -ErrorAction SilentlyContinue; Remove-Job -Name {label} -ErrorAction SilentlyContinue")
+            }
+        }
+    }
+
     /// 指定の終了コードで終わるコマンド（`true` / `false` 相当）。
     /// シェル統合が出す OSC 133 の exit code 検証に使う
     pub fn exit_status(self, code: u8) -> String {
@@ -1208,6 +1249,53 @@ mod tests {
         // `.` とパスは**別の語**（1 語にすると 5.1 が引用符を落として落ちる。実測）
         assert_eq!(ps[ps.len() - 2], ".");
         assert_eq!(ps[ps.len() - 1], script.display().to_string());
+    }
+
+    /// 背景ジョブ（#1367）は `sequence` で `;` 連結しても**どの POSIX シェルでも**
+    /// 構文が通る。素の `sleep N &` は zsh でしか通らない（bash / sh は構文エラー）ので、
+    /// 検出力つきで固定する
+    #[test]
+    #[cfg(unix)]
+    fn 背景ジョブは並べてもposixシェルの構文を壊さない() {
+        let line = POSIX.sequence(&[
+            POSIX.spawn_background_sleep(300, "tako1367"),
+            POSIX.sleep(3),
+        ]);
+        assert!(
+            line.contains("{ sleep 300 & }; tako1367_pid=$!"),
+            "実際の行: {line}"
+        );
+        let syntax_ok = |shell: &str, script: &str| {
+            std::process::Command::new(shell)
+                .args(["-n", "-c", script])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(true)
+        };
+        for shell in ["/bin/sh", "/bin/bash", "/bin/zsh"] {
+            assert!(syntax_ok(shell, &line), "{shell} で構文が通らない: {line}");
+        }
+        // 検出力: 素の `&` 形は bash / sh で落ちる（= この検査は空振りしていない）
+        let naive = POSIX.sequence(&["sleep 300 &".to_string(), POSIX.sleep(3)]);
+        assert!(
+            !syntax_ok("/bin/bash", &naive),
+            "`&;` の形が bash で通ってしまっている（検査の前提が崩れている）: {naive}"
+        );
+    }
+
+    /// 背景ジョブの停止はジョブ名 / ジョブ番号で行う（方言ごとの形を固定する）
+    #[test]
+    fn 背景ジョブの停止は方言ごとの形になる() {
+        assert_eq!(
+            POSIX.stop_background_sleep("tako1367"),
+            "kill $tako1367_pid 2>/dev/null"
+        );
+        let ps = PS.stop_background_sleep("tako1367");
+        assert!(ps.starts_with("Stop-Job -Name tako1367"), "実際: {ps}");
+        assert!(ps.contains("Remove-Job -Name tako1367"), "実際: {ps}");
+        let spawn = PS.spawn_background_sleep(300, "tako1367");
+        assert!(spawn.contains("Start-Job -Name tako1367"), "実際: {spawn}");
+        assert!(spawn.contains("Start-Sleep 300"), "実際: {spawn}");
     }
 
     /// 実環境の既定シェルから方言が引けること（両プラットフォームの経路が動く証明）

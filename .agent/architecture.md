@@ -1091,6 +1091,17 @@ lid-guard.json が使う）:
   **`busy_sessions.len()` を直に使うと器なしペインが落ちる**（= tmux 未導入 / persist OFF の
   構成で `while-agents-running` が無効になる #372 の再発）。旧挙動の A/B は `TAKO_372_LEGACY=1`、
   番犬は `crates/tako-control/tests/issue372_sleep_guard_direct_panes_watchdog.rs`
+- **引く側も 1 実装を通す**（#1367。#372 の続き）: 1 ペインの busy を問う口は
+  `RunningChildrenScanState::is_pane_busy(pane)` だけで、close 確認（#566）・GUI モードの
+  判定材料（#694 の `busy_children`）・チャットの `agent_running` はすべてここを通る
+  （tako-app 側の入口は `TakoApp::pane_has_busy_children`）。**走査が器なしペインを
+  数えられても、引く側が `busy_sessions`（器のセッション名）を見ていれば器なし構成では
+  必ず false** で、実際 #372 の着地後も close 確認と `agent_running` がこの形で残っていた
+  （実測 2026-09-12: 隔離 GUI・persist OFF で `busy_agents=1` / `busy_children=false` /
+  cmd+W が確認なしで即 close / 動いているペインへスターターが被る）。旧挙動の A/B は
+  `TAKO_1367_LEGACY=1`、番犬は
+  `crates/tako-control/tests/issue1367_direct_pane_busy_watchdog.rs`（消費側が
+  `busy_sessions` / `busy_backend_sessions` を引く形を大域走査で禁じる）
 - **実行時の状態はアプリのプロセスが持つ**（#372）: アサーションの保持フラグと `busy_agents` は
   どちらもプロセスローカルな static なので、`tako sleep-guard status` を CLI 自身で計算すると
   **アプリが保持していても常に「未保持 / busy 0」**になる。CLI は IPC（= MCP `tako_sleep_guard` と

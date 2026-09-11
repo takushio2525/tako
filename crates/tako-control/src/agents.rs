@@ -311,7 +311,11 @@ pub struct RunningChildrenScanTarget {
 #[derive(Debug, Clone, Default)]
 pub struct RunningChildrenScanState {
     pub targets: Vec<RunningChildrenScanTarget>,
-    /// 実行中の子プロセスを持つ**器のセッション名**（close 確認 / チャット表示が引く）
+    /// 実行中の子プロセスを持つ**器のセッション名**。
+    ///
+    /// **これを呼び出し側から直に引かない**（#1367）。器なしペインは器のセッション名を
+    /// 持たないので、`busy_sessions` を引く形は器なし構成で必ず false になる。
+    /// 1 ペインの busy を問うときは [`RunningChildrenScanState::is_pane_busy`] を通す
     pub busy_sessions: Vec<String>,
     /// 実行中の子プロセスを持つ**器なしペイン**の tako ペイン ID（#372）
     pub busy_panes: Vec<u64>,
@@ -328,6 +332,40 @@ impl RunningChildrenScanState {
     pub fn busy_count(&self) -> usize {
         self.busy_sessions.len() + self.busy_panes.len()
     }
+
+    /// このペインで実行中の子プロセスがあるか（#1367）。
+    ///
+    /// **器の有無で呼び分けない 1 実装**。走査は器あり = 器のセッション名・
+    /// 器なし = tako のペイン ID と別の単位で数えるが、問いは «このペインで何か
+    /// 動いているか» の 1 つなので、答える側で吸収する。
+    /// 呼び出し側で `busy_sessions` を引くと器なしペインが必ず false になり、
+    /// close 確認（#566）・GUI モードの判定（#694）・チャットの `agent_running` が
+    /// tmux 未導入 / persist OFF（= Homebrew cask の既定）でまとめて死ぬ（= #1367）
+    pub fn is_pane_busy(&self, pane: u64) -> bool {
+        self.is_pane_busy_in(pane, legacy_1367())
+    }
+
+    /// 判定の本体（A/B のため旧挙動を引数で受ける。#1367）。
+    ///
+    /// `legacy_backend_only` が真なら器のセッションしか見ない = #1367 前の挙動
+    pub fn is_pane_busy_in(&self, pane: u64, legacy_backend_only: bool) -> bool {
+        if !legacy_backend_only && self.busy_panes.contains(&pane) {
+            return true;
+        }
+        self.targets
+            .iter()
+            .find(|target| target.pane == pane)
+            .and_then(|target| target.backend_session.as_deref())
+            .is_some_and(|session| self.busy_sessions.iter().any(|busy| busy == session))
+    }
+}
+
+/// #1367 の A/B。`TAKO_1367_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
+/// （器のセッション名でしか busy を見ない = 器なしペインの close 確認 /
+/// `busy_children` / `agent_running` が常に false）
+pub fn legacy_1367() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_1367_LEGACY").map(|v| v == "1") == Ok(true))
 }
 
 /// #372 の A/B。`TAKO_372_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
@@ -1313,6 +1351,83 @@ mod tests {
         let closed = scan_running_children_in(Vec::new(), true, now, Some(&snapshot), false);
         assert_eq!(closed.busy_count(), 0);
         assert!(closed.busy_panes.is_empty());
+    }
+
+    // --- #1367: 1 ペインの busy を問う口（close 確認 / GUI モード / チャット） ---
+
+    /// 器なし 1 枚 + 器あり 1 枚が同居する走査結果。器なし（pane 7）だけが busy
+    fn state_1367() -> RunningChildrenScanState {
+        let now = Instant::now();
+        // 器なし: シェル(100) の下にコマンド(200) / 器あり: tako-s1 の pane_pid=500 の下に 600
+        let snapshot = ProcessSnapshot::from_parts(
+            vec![("tako-s1:0.0".to_string(), 500u32)],
+            [(10, 1), (100, 10), (200, 100), (500, 1), (600, 500)].into(),
+        );
+        scan_running_children_in(
+            vec![
+                direct_target(7, 100, tako_core::CommandState::Idle, false),
+                running_target("tako-s1", tako_core::CommandState::Idle, true),
+            ],
+            true,
+            now,
+            Some(&snapshot),
+            false,
+        )
+    }
+
+    #[test]
+    fn is_pane_busyは器なしペインでも真になる() {
+        let state = state_1367();
+        assert_eq!(state.busy_panes, vec![7]);
+        assert!(
+            state.is_pane_busy_in(7, false),
+            "器なしペインの busy が消費側へ届いていない（#1367）"
+        );
+    }
+
+    #[test]
+    fn is_pane_busyは器ありペインでも従来どおり真になる() {
+        let state = state_1367();
+        let backend_pane = running_target("tako-s1", tako_core::CommandState::Idle, true).pane;
+        assert_eq!(state.busy_sessions, vec!["tako-s1".to_string()]);
+        assert!(
+            state.is_pane_busy_in(backend_pane, false),
+            "器ありペインの判定が壊れている（#1367 の回帰）"
+        );
+        // legacy でも器ありは真のまま（#1367 で変わるのは器なしだけ）
+        assert!(state.is_pane_busy_in(backend_pane, true));
+    }
+
+    #[test]
+    fn legacyでは器なしペインのbusyが消費側へ届かない() {
+        let state = state_1367();
+        assert!(
+            !state.is_pane_busy_in(7, true),
+            "#1367 前の挙動（器のセッション名でしか見ない）が再現していない"
+        );
+    }
+
+    #[test]
+    fn is_pane_busyは走査対象に無いペインを真にしない() {
+        let state = state_1367();
+        assert!(
+            !state.is_pane_busy_in(9999, false),
+            "材料の無いペインを busy と言ってはいけない（#372 の規則）"
+        );
+        assert!(!RunningChildrenScanState::default().is_pane_busy_in(7, false));
+    }
+
+    #[test]
+    fn 器なしペインがシェルだけならis_pane_busyも偽() {
+        let now = Instant::now();
+        let state = scan_running_children_in(
+            vec![direct_target(7, 100, tako_core::CommandState::Idle, false)],
+            true,
+            now,
+            Some(&snapshot_372(false)),
+            false,
+        );
+        assert!(!state.is_pane_busy_in(7, false));
     }
 
     #[test]
