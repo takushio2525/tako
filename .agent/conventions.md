@@ -1348,6 +1348,44 @@ npm が無い / npm が失敗した環境では**1 行目に手順が出て**止
 手順を変えるときは `build.rs` の `pwa` モジュールと `build-pwa.sh` を**対で**直す
 （build.rs 側が npm を直接起こすのは、Windows の開発機に bash があるとは限らないため）。
 
+## CI 完了の判定は待ちスクリプトを通す（Issue #1333 / #1313）
+
+**PR の CI が終わったかどうかを自分で判定しない。`scripts/wait-pr-checks.sh <PR>` を使う。**
+「`gh pr checks` に出ているチェックが全部 pending でなければ完了」という判定は、
+**push 直後に Cloudflare Pages しか登録されていない瞬間**（macOS / Windows の job は
+run 開始前なので checks にまだ現れない）に通ってしまう。実際に #1313 = PR #1328 が
+CI 完了前に merge され（merge 04:24:10 / Windows 完了 04:48:24）、過去にも #1253 / #1282 で
+同じ手順違反が起きている。**存在するチェックだけを見る判定は構造的に早すぎる**。
+
+- 判定は「**期待する名前が全部そろって**、報告されているチェックが全部 completed」。
+  さらに**同じ結論を 2 回連続で観測**するまで確定しない（GitHub API は replica 差で
+  in_progress / completed が両方向に揺れて返る）。揺れたら 1 行出して観測をやり直す
+- 期待する名前は `.github/workflows/*.yml` のうち **pull_request で起動するものの job 名**
+  から導く（ハードコードしない。`name:` が無い job は job id）。外部連携の
+  `Cloudflare Pages` だけは導出できないので `wait-pr-checks.sh` の `EXTERNAL_CHECKS` が正。
+  job を増やす・改名する・matrix を入れるときはここが追従するかを見る
+- merge は `scripts/merge-pr.sh <PR>`（待ち → 揃わなければ merge しない → squash +
+  `--delete-branch`）。CONFLICTING / BEHIND / BLOCKED は待たずに理由を出して止まる。
+  **worker も master もこの 1 実装を呼ぶ**（手順の記憶ではなく構造で守る）
+- 終了コードは共通で **0 = 全部緑 / 1 = 失敗・拒否 / 2 = タイムアウト / 3 = 引数・gh のエラー**
+- 検証は `bash scripts/test-wait-pr-checks.sh`（偽 gh + 偽リポジトリ。**CI の macOS ジョブで
+  毎 PR 走る**）。A/B は `TAKO_1333_LEGACY=1` = 修正前の判定をそのまま再現する腕で、
+  Test 13 / 14 が「1 本だけで完了と返る」「揺れの 1 回目で確定する」を固定している
+- **緑を見た後に main が進んだら、取り込んで回し直す**。PR の CI が検査しているのは
+  ブランチ head ではなく **merge 結果**（`actions/checkout` の既定が `refs/pull/<PR>/merge`。
+  実測: PR #1337 の run が読んだ `progress.md` は 12442 bytes = ブランチ head の 11196 でも
+  main 単独でもない union マージ後の値）だが、**その merge base は run が始まった時点で凍る**。
+  別々に緑だった 2 本が組み合わさって壊れる事故はここを通り抜ける（#1343 = #1295 のテストに
+  #1297 が足した `input_style` が無く、main が `cargo check --all-targets` で落ちた）。
+  手順は `git fetch origin && git merge origin/main && git push` → CI を待ち直し。
+  `merge-pr.sh` は「緑を出した run の後に main の先頭が進んだ」ことを検出して**警告する**
+  （材料が取れなければ黙って通す = **助言であって門ではない**。門にすると並走する PR が
+  互いに待ち直しを繰り返して収束しない。構造的に締めるならリポ設定側
+  「require branches to be up to date」の話になる）
+- **警告が出たら、merge 前に main を取り込んで CI を回し直すのが原則**。ただし変更が
+  独立していると判断できるなら警告のまま merge してよい（#1343 のような意味的
+  コンフリクトのリスクは残る、と分かったうえで通す）
+
 ## 設定・データファイルのスキーマ変更（Issue #916）
 
 **永続ファイルの形式や置き場を変えるときは自動移行を同梱する。手動移行を要求しない。**
