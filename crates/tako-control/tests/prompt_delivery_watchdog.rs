@@ -32,6 +32,8 @@
 //!
 //! ①〜④ は違反行を**行番号で名指し**する。ブロックの切り出しはインデントで行う
 //! （`rustfmt` が通っている前提。CI は `cargo fmt --all --check` を回している）
+//!
+//! ⑥〜⑧ は #1294（送達の記録は 3 値）、⑨〜⑪ は #1292（積む応答が前任を名乗らない）。
 
 use std::path::{Path, PathBuf};
 
@@ -425,4 +427,92 @@ fn 自動再送の引き金は一箇所で決まる() {
         joined.contains("wants_prompt_resend"),
         "{SUPERVISOR} の supervisor_loop が wants_prompt_resend を通っていない"
     );
+}
+
+const DISPATCH: &str = "crates/tako-control/src/dispatch.rs";
+const CATALOG: &str = "crates/tako-control/src/mcp/catalog.rs";
+
+/// ⑨ 積む応答は積む**前**の状態を素通ししない（Issue #1292）
+///
+/// `host.prompt_delivery_state` が返すのは `still_visible` で残っている状態で、
+/// `prompt_delivery_states` は**ペインを閉じたときにしか消えない**。素通しすると
+/// 新しい送達の応答が前回の `delivered` / `gave_up` を名乗る（`delivered` を見た
+/// master は届いたと判断して監視をやめる = これから 120 秒の送達フローが始まるのに）
+#[test]
+fn 積む応答は未決着の前任だけを名乗る() {
+    let src = read(DISPATCH);
+    let body = function_lines(&src, "fn queued_json(");
+    let at = body
+        .iter()
+        .position(|(_, l)| l.contains("\"delivery\":"))
+        .expect("queued_json が delivery を組んでいない（関数が変わった？）");
+    let joined = body
+        .iter()
+        .map(|(_, l)| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("pending_predecessor("),
+        "{DISPATCH}:{} 積む前の状態を絞り込まずに delivery へ載せている\
+         （#1292: 後ろに並ぶのは未決着（queued / waiting）だけ。判定は \
+         `tako_core::prompt_delivery::pending_predecessor` の 1 実装を通す）",
+        body[at].0
+    );
+}
+
+/// ⑩ 「積んだ」応答を組む口は `queued_json` の 1 箇所（Issue #1292 / #1259）
+///
+/// send フロー・Enter 単独・tmux フォールバックが別々に組み立て始めると、
+/// ⑨ の絞り込みも #1259 の `pane` / `delivery` も片方だけ直る形で崩れる
+#[test]
+fn 積んだ応答を組む口は一箇所() {
+    let src = read(DISPATCH);
+    let span = function_lines(&src, "fn queued_json(");
+    let (first, last) = (span[0].0, span[span.len() - 1].0);
+    let offenders: Vec<String> = src
+        .lines()
+        .enumerate()
+        .map(|(i, l)| (i + 1, l))
+        .filter(|(lineno, line)| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with("//")
+                && trimmed.contains("\"queued\": true")
+                && !(first..=last).contains(lineno)
+        })
+        .map(|(lineno, line)| format!("{DISPATCH}:{lineno}: {}", line.trim()))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "積んだ応答を `queued_json` の外で組んでいる（#1292: 絞り込みが 1 箇所で\
+         効かなくなる）:\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// ⑪ MCP の説明文がコードの絞り込みと一致している（Issue #1292）
+///
+/// `tako_send_input` の description は AI がこの応答をどう読むかを決める。
+/// 「未決着のフローがあればその状態が出る」とだけ書いてあると、
+/// 実装が決着済みも出す形へ戻ったときに**説明文のほうが嘘**になる
+#[test]
+fn send_inputの説明文が絞り込みを明言している() {
+    let src = read(CATALOG);
+    let at = src
+        .find("\"name\": \"tako_send_input\"")
+        .expect("tako_send_input がカタログに無い");
+    let desc_end = src[at..]
+        .find("\"inputSchema\"")
+        .expect("inputSchema が見つからない");
+    let desc: String = src[at..at + desc_end]
+        .lines()
+        .map(|l| l.trim().trim_end_matches('\\'))
+        .collect::<Vec<_>>()
+        .join("");
+    for phrase in ["未決着", "queued / waiting", "決着済み"] {
+        assert!(
+            desc.contains(phrase),
+            "{CATALOG} の tako_send_input の説明文に「{phrase}」が無い\
+             （#1292: 積む応答へ載るのは未決着の前任だけで、決着済みは出ない）:\n{desc}"
+        );
+    }
 }

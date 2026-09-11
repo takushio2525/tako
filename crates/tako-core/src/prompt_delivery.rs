@@ -46,6 +46,31 @@ impl State {
             State::GaveUp => "gave_up",
         }
     }
+
+    /// `as_str` の逆（応答 JSON の `delivery.state` から語彙へ戻す）。
+    /// 綴りは [`State::as_str`] から引くので両者が食い違わない。未知の綴りは `None`
+    pub fn parse(s: &str) -> Option<Self> {
+        [
+            State::Queued,
+            State::Waiting,
+            State::Delivered,
+            State::GaveUp,
+        ]
+        .into_iter()
+        .find(|state| state.as_str() == s)
+    }
+
+    /// **未決着**か（= これから積む送達がこの状態の後ろに並ぶ）。
+    ///
+    /// [`still_visible`]（決着した顛末をまだ応答へ出すか）とは別の問い。
+    /// 決着した顛末は「その後を問う」ために残すが、**新しい送達の応答に
+    /// 名乗らせてはいけない**（#1292）
+    pub fn is_pending(self) -> bool {
+        match self {
+            State::Queued | State::Waiting => true,
+            State::Delivered | State::GaveUp => false,
+        }
+    }
 }
 
 /// 送達フローが進めない理由。**安定コード**（応答・ログ・テストが名前で参照する）。
@@ -573,13 +598,42 @@ pub fn peer_wait_now(state: &PeerAttemptState, elapsed_secs: u32) -> PeerWait {
 /// 打ち切りは次の送達まで残す = master が後から「なぜ届かなかったか」を問える
 pub const DELIVERED_VISIBLE_SECS: u32 = 300;
 
-/// この顛末をまだ応答へ出すか（`age_secs` = 決着してからの経過）
+/// この顛末をまだ応答へ出すか（`age_secs` = 決着してからの経過）。
+///
+/// 「まだ出すか」であって「まだ回っているか」ではない。後者は [`State::is_pending`]
 pub fn still_visible(status: &Status, age_secs: u32) -> bool {
     match status.state {
         State::Delivered => age_secs < DELIVERED_VISIBLE_SECS,
         // 待ち・打ち切りは消さない（無音に戻したら #1259 の再来）
         State::Queued | State::Waiting | State::GaveUp => true,
     }
+}
+
+/// 積む**前**のそのペインの送達状態のうち、「この送達が後ろに並ぶ」対象だけを通す（#1292）。
+///
+/// `tako_send_input(await_prompt=true)` は `queued` を即返すが、先行フローがまだ
+/// 回っているならその状態を載せる（#1259: いま何を待っているかを応答から読める）。
+/// ところが `prompt_delivery_states` は**ペインを閉じたときにしか消えない**ので、
+/// 素通しすると新しい送達の応答が**前回の決着済みの顛末**（`delivered` / `gave_up`）を
+/// 名乗る。1 時間前の `gave_up` は「積んだ瞬間に失敗した」と読め、10 秒前の
+/// `delivered` に至っては master が届いたと判断して監視をやめる —— そこから
+/// [`FLOW_TIMEOUT_SECS`] 秒の送達フローが始まるところなのに。
+///
+/// 判定は `state` の語彙だけを見る（`Status` へ戻さない = 応答 JSON をそのまま運ぶ）。
+/// 読めない綴りは通さない: 新しい送達は実際に `queued` なので、そう答えるほうが嘘にならない
+pub fn pending_predecessor(status: Option<serde_json::Value>) -> Option<serde_json::Value> {
+    let status = status?;
+    if legacy_passthrough() {
+        return Some(status);
+    }
+    let state = State::parse(status.get("state")?.as_str()?)?;
+    state.is_pending().then_some(status)
+}
+
+/// `TAKO_1292_LEGACY=1` で **#1292 前**の挙動（決着済みの顛末も素通し）へ戻す。
+/// 同一バイナリで A/B を取る入口
+pub fn legacy_passthrough() -> bool {
+    std::env::var_os("TAKO_1292_LEGACY").is_some()
 }
 
 /// `TAKO_1259_LEGACY=1` で **#1259 前**の挙動へ戻す。
@@ -883,5 +937,67 @@ mod tests {
             outcome_confidence(Stall::NoInputBox.code()),
             Confidence::Undelivered
         );
+    }
+
+    /// #1292: 「まだ出すか」（`still_visible`）と「まだ回っているか」（`is_pending`）は別の問い。
+    /// 決着した顛末は `tako_read_pane` へ出し続けるが、後ろに並ぶ相手にはならない
+    #[test]
+    fn 未決着と表示寿命は別の問い() {
+        assert!(State::Queued.is_pending());
+        assert!(State::Waiting.is_pending());
+        assert!(!State::Delivered.is_pending());
+        assert!(!State::GaveUp.is_pending());
+        // 打ち切りは無期限に「出す」が、後ろに並ぶ相手ではない
+        let gave_up = Status::gave_up("flow_timeout", Some(Stall::NoInputBox), 120);
+        assert!(still_visible(&gave_up, DELIVERED_VISIBLE_SECS * 10));
+        assert!(!gave_up.state.is_pending());
+    }
+
+    /// 綴りは `as_str` の 1 実装から来る（応答 JSON と語彙が食い違わない）
+    #[test]
+    fn 状態の綴りは往復する() {
+        for state in [
+            State::Queued,
+            State::Waiting,
+            State::Delivered,
+            State::GaveUp,
+        ] {
+            assert_eq!(State::parse(state.as_str()), Some(state), "{state:?}");
+        }
+        assert_eq!(State::parse("unknown_state"), None);
+        assert_eq!(State::parse(""), None);
+    }
+
+    /// #1292: 積む前の状態のうち後ろに並ぶ対象だけを通す。
+    /// 決着済み・読めない綴り・状態なしはどれも `None`（呼び出し側が `queued` を出す）
+    #[test]
+    fn 後ろに並ぶ対象は未決着だけ() {
+        let waiting = Status::waiting(Stall::PeerPending, 42).to_json();
+        assert_eq!(
+            pending_predecessor(Some(waiting.clone())),
+            Some(waiting),
+            "未決着はそのまま通す（#1259 の挙動は据え置き）"
+        );
+        assert_eq!(
+            pending_predecessor(Some(Status::queued().to_json())),
+            Some(Status::queued().to_json())
+        );
+        for settled in [
+            Status::delivered("peer", "delivered", 3).to_json(),
+            Status::gave_up("flow_timeout", Some(Stall::NoInputBox), 120).to_json(),
+        ] {
+            assert_eq!(
+                pending_predecessor(Some(settled.clone())),
+                None,
+                "決着済みを後ろに並ぶ相手として通している: {settled}"
+            );
+        }
+        assert_eq!(pending_predecessor(None), None);
+        assert_eq!(
+            pending_predecessor(Some(serde_json::json!({ "state": "unknown_state" }))),
+            None,
+            "読めない綴りは通さない（新しい送達は実際に queued なので嘘にならない）"
+        );
+        assert_eq!(pending_predecessor(Some(serde_json::json!({}))), None);
     }
 }
