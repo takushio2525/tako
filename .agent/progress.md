@@ -63,3 +63,8 @@
 - 真因は見立て（#1265 と同じ PTY 枯渇）と別で**固定名の取り合い**。器のソケットもセッション名も定数なので、同じ機で `cargo test --workspace` が 2 本並ぶと片方が 0.03 秒で `duplicate session: tako1236new` に当たり、後始末の `kill-session -t <固定名>` は相手のセッションまで消す（失敗時の実測は PTY 103/511・ソケット 206 = 枯渇していない）
 - 器の名前・起動・後始末・診断を `tests/common/tmux_e2e.rs` の 1 実装へ（pid つきソケット + 期限つき + 失敗時に stderr / そのソケットのセッション / PTY / ソケット / サーバー数 / load、**このプロセスの最後の 1 本**でだけ器を畳む）。tako-control の実 tmux e2e 7 本を寄せ、番犬 2 本が修正前ソースの 28 か所を名指し FAILED
 - A/B: 2 本同時 × 110 ラウンドで旧（origin/main バイナリ）= 110/110 ラウンド FAILED（115 プロセス・全て duplicate）→ 新 = 0/110。診断の有無は `TAKO_1300_INJECT=duplicate` で同一バイナリ対比。「負荷で待ちが足りない」説は**否定**（固定の待ちのまま load 12.15 で 30 回 0 失敗。当初の 11/12 は自分の A/B ハーネスの `rm -rf` が走行中の作業 dir を消していた artifact で、並走 sweeper で同じ署名を再現）
+
+## 2026-09-11（#946: ペインの TERM 注入を「最後に無条件上書き」へ寄せ、1b の失敗理由を名指しできるようにした）
+- Issue の見立て（親の TERM がペインへ素通し）は**実測で否定**。修正前バイナリ（`f1af0cc`）を tako のペインの中（親 `TERM=tmux-256color`）から起こしても項目 1b は **3/3 通過**（`ok=true waited=0.1s`）。alacritty は `Options.env` を親 env の上に当てる（`tty/unix.rs:235`）ので注入は元から勝っていた。報告時点（`e703e40`）の 3/3 失敗は**同じ項目を落とす #1165 の固定 6.4 秒窓**で、9/8（`4d84695`）に解消済み
+- 残っていた穴は「注入が既定でしかない」こと（`env.extend(options.env)` が後 = 呼び出し側の env 1 つで無言で消える）。`finalize_pane_env` で TERM / COLORTERM を**最後に上書き**へ寄せ、番犬 `端末申告の注入はoptions_envより後にある` が修正前ソースで FAILED。項目 1b の失敗時だけ `TAKO_SELF_TEST_946: cause=injected|inherited|unexpected|no-echo` を出す（SKIP にはしない）
+- 実測: 修正後 × 継承あり / `-u TERM` とも `TAKO_APP_SELF_TEST_OK`（316s / 294s）。注入口 `TAKO_946_INJECT=inherit` では 1b が `cause=inherited`（観測 `tmux-256color,truecolor`）で FAILED。`cargo test -p tako-core --test pane_term_env` が親 TERM 6 系統 + `options.env` の `TERM=dumb` でも `xterm-256color` を実シェルで固定

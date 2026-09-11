@@ -93,6 +93,160 @@ fn default_locale_env(
         .then(|| ("LC_CTYPE".to_string(), "UTF-8".to_string()))
 }
 
+/// ペインの端末申告（#946）。**親プロセスにも `options.env` にも依らない固定値**。
+///
+/// alacritty terminfo は未導入環境が多いので安全側の `xterm-256color` を名乗り、
+/// 24bit カラーは `COLORTERM=truecolor` で広告する。
+pub const PANE_TERMINAL_ENV: &[(&str, &str)] =
+    &[("TERM", "xterm-256color"), ("COLORTERM", "truecolor")];
+
+/// PTY へ渡す env を仕上げる（#946）。
+///
+/// TERM / COLORTERM を**最後に上書き**するのが要点。既定として先に敷く形だと
+/// 「注入する」という設計意図が呼び出し側の env 1 つで消えるうえ、消えたことは
+/// どのログにも出ない。ここで上書きしておけば、`SpawnOptions::env` に何が入っていても、
+/// tako-app を起こした親の端末が何であっても、ペインの申告は 1 つに決まる。
+///
+/// `inherit` は **#946 の注入口**（[`inherit_terminal_env`]）で、注入そのものを外して
+/// 「親の TERM がペインへ素通しになる」壊れ方を同じバイナリで再現するためだけにある。
+pub(crate) fn finalize_pane_env(
+    mut env: std::collections::HashMap<String, String>,
+    inherit: bool,
+) -> std::collections::HashMap<String, String> {
+    if inherit {
+        // 注入を外す = 親プロセスの値がそのまま子へ継承される（alacritty は
+        // `Command` の既定どおり親 env を引き継ぎ、指定ぶんだけ上書きするため）
+        for (key, _) in PANE_TERMINAL_ENV {
+            env.remove(*key);
+        }
+        return env;
+    }
+    for (key, value) in PANE_TERMINAL_ENV {
+        env.insert((*key).to_string(), (*value).to_string());
+    }
+    env
+}
+
+/// **#946 の注入口**: `TAKO_946_INJECT=inherit` でペインへの TERM / COLORTERM 注入を外す。
+///
+/// 旧挙動の再現（`*_LEGACY`）ではない。旧実装も値は同じで、違いは「`options.env` で
+/// 上書きできたか」だけなので、上書きする呼び出し側が居ない現状では観測できない。
+/// 注入を外すアームにしてあるのは、**注入が効いているからこそ項目 1b が通る**ことと、
+/// 継承が起きたときに診断が理由を名指しできることを、同じバイナリで示すため
+fn inherit_terminal_env() -> bool {
+    std::env::var("TAKO_946_INJECT").is_ok_and(|v| v == "inherit")
+}
+
+/// `TERMCHK=<TERM>,<COLORTERM>` の観測結果（#946 の診断）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TermCheck {
+    /// 期待どおり注入されている
+    Injected,
+    /// tako-app を起こした親プロセスの TERM がそのままペインへ出ている
+    Inherited { observed: String },
+    /// 注入も継承も説明にならない値
+    Unexpected { observed: String },
+    /// 画面に `TERMCHK=` 行が無い（エコーが返っていない = 待ちや入力経路の問題）
+    NoEcho,
+}
+
+impl TermCheck {
+    /// 診断行の機械可読キー（grep 用）
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Injected => "injected",
+            Self::Inherited { .. } => "inherited",
+            Self::Unexpected { .. } => "unexpected",
+            Self::NoEcho => "no-echo",
+        }
+    }
+
+    /// 診断行に出す短い理由（日本語 1 行。**値そのものは端末名だけ**なので個人情報は乗らない）
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Injected => "ペインの TERM / COLORTERM は注入どおり".to_string(),
+            Self::Inherited { observed } => format!(
+                "親プロセスの TERM がペインへ継承されている（観測 {observed} / 期待 {}）。\
+                 TERM 注入が効いていない = finalize_pane_env を通っていない疑い",
+                expected_termchk()
+            ),
+            Self::Unexpected { observed } => format!(
+                "ペインの TERM / COLORTERM が期待と違う（観測 {observed} / 期待 {}）",
+                expected_termchk()
+            ),
+            Self::NoEcho => {
+                "画面に TERMCHK= 行が無い（エコーが返っていない。待ち・入力経路の問題）".to_string()
+            }
+        }
+    }
+}
+
+/// 項目 1b が期待する `TERMCHK=` の値
+pub fn expected_termchk() -> String {
+    PANE_TERMINAL_ENV
+        .iter()
+        .map(|(_, v)| *v)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// 画面から拾った `TERMCHK=` 行を、親プロセスの申告と突き合わせて分類する（#946）。
+///
+/// **純関数**。画面テキストと親の TERM / COLORTERM だけを見るので、GUI を立てずに
+/// 全分岐を単体テストできる。`screen` には画面末尾をそのまま渡してよい
+/// （打ち込んだコマンド行そのものは `${TERM}` のままなので、展開後の行だけが拾われる）
+pub fn diagnose_termchk(
+    screen: &str,
+    parent_term: Option<&str>,
+    parent_colorterm: Option<&str>,
+) -> TermCheck {
+    let expected = expected_termchk();
+    let Some(observed) = observed_termchk(screen) else {
+        return TermCheck::NoEcho;
+    };
+    if observed == expected {
+        return TermCheck::Injected;
+    }
+    // 親の申告（COLORTERM は無いことがあるので空文字で突き合わせる）と一致したら継承
+    let parent = format!(
+        "{},{}",
+        parent_term.unwrap_or_default(),
+        parent_colorterm.unwrap_or_default()
+    );
+    if observed == parent {
+        return TermCheck::Inherited { observed };
+    }
+    // TERM だけが親と一致する形（COLORTERM は注入が効いた等）も継承として扱う。
+    // 直したい相手は「TERM が親から来ている」ことで、COLORTERM の一致は必須ではない
+    let observed_term = observed.split(',').next().unwrap_or_default();
+    if !observed_term.is_empty() && Some(observed_term) == parent_term {
+        return TermCheck::Inherited { observed };
+    }
+    TermCheck::Unexpected { observed }
+}
+
+/// 画面テキストから `TERMCHK=` の**展開後の値**を拾う（最後に出たものを採る）。
+///
+/// 入力はセルフテストの画面末尾（`pane_screen_tail`）をそのまま渡してよい。
+/// あれは**行を ` | ` で連結した 1 行**なので、行区切りではなく
+/// 「空白・`|`・引用符のどれかが来たら値の終わり」で切る（端末名にそれらは入らない）。
+/// 打ち込んだコマンド行（`echo "TERMCHK=${TERM},${COLORTERM}"`）は展開前なので、
+/// `$` や `{` を含む値は捨てる
+pub fn observed_termchk(screen: &str) -> Option<String> {
+    let mut found = None;
+    for (idx, _) in screen.match_indices("TERMCHK=") {
+        let rest = &screen[idx + "TERMCHK=".len()..];
+        let end = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, '|' | '"' | '\''))
+            .unwrap_or(rest.len());
+        let value = &rest[..end];
+        if !value.is_empty() && !value.contains(['$', '{', '}']) {
+            found = Some(value.to_string());
+        }
+    }
+    found
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     #[error("PTY の生成に失敗した")]
@@ -323,15 +477,11 @@ impl TerminalSession {
             cell_width: 8,
             cell_height: 16,
         };
-        // TERM / COLORTERM はまずデフォルトを敷き、呼び出し側の env で上書きできるようにする。
+        // TERM / COLORTERM は**この関数の最後で無条件に上書きする**（#946。`finalize_pane_env`）。
         // alacritty_terminal の `setup_env` はホストプロセスの env を書き換える方式で tako は
-        // 呼んでおらず、未設定だと親（.app は Finder 由来で TERM 不定）を継承して tmux 等が
-        // 「missing or unsuitable terminal」で落ちる。alacritty terminfo は未導入環境が多いので
-        // 安全側の xterm-256color を既定にし、24bit カラーは COLORTERM=truecolor で広告する。
-        let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::from([
-            ("TERM".to_string(), "xterm-256color".to_string()),
-            ("COLORTERM".to_string(), "truecolor".to_string()),
-        ]);
+        // 呼んでおらず、注入しないと親（.app は Finder 由来で TERM 不定 / 外部ターミナル起動なら
+        // その端末の値）を継承して tmux 等が「missing or unsuitable terminal」で落ちる。
+        let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         // ロケール未設定（Finder 起動の .app はプロセス環境に LANG が無い）だと、
         // ペイン内で起動した tmux クライアントが非 UTF-8 扱いになり CJK を `_` に
         // 置換する（2026-06-12 P0: 日本語全滅）。Terminal.app と同じく LC_CTYPE だけ
@@ -353,6 +503,9 @@ impl TerminalSession {
         // シェル統合（OSC 7/133 発行）の自動注入。options.env が常に優先
         env.extend(crate::shell_integration::env().iter().cloned());
         env.extend(options.env);
+        // **TERM / COLORTERM だけは最後**（#946）。呼び出し側の env にも親プロセスにも
+        // 依らせない = 「注入する」という設計意図が環境で消えない
+        let env = finalize_pane_env(env, inherit_terminal_env());
 
         // 明示コマンド（Claude 等）はシェル統合の OSC 7 を発行しないことがある。
         // PTY へ渡す起動 cwd をセッションにも保持し、相対パス解決やファイルツリーが
@@ -1733,6 +1886,169 @@ impl PaneAccess {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn map(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    /// #946: ペインの端末申告は**呼び出し側の env に依らない**。
+    /// 旧実装は既定を先に敷くだけだったので、`options.env` に TERM が 1 つ入れば
+    /// 注入の意図が消え、消えたことはどのログにも出なかった
+    #[test]
+    fn ペインのtermはoptions_envで上書きされない() {
+        for parent in [
+            "tmux-256color",
+            "screen-256color",
+            "xterm-256color",
+            "vt100",
+            "",
+        ] {
+            let env = finalize_pane_env(
+                map(&[
+                    ("TERM", parent),
+                    ("COLORTERM", "8bit"),
+                    ("TAKO_PANE_ID", "1"),
+                ]),
+                false,
+            );
+            assert_eq!(
+                env.get("TERM").map(String::as_str),
+                Some("xterm-256color"),
+                "options.env の TERM={parent:?} が残っている"
+            );
+            assert_eq!(env.get("COLORTERM").map(String::as_str), Some("truecolor"));
+            // 端末申告以外は素通し（この関数は TERM / COLORTERM 以外を触らない）
+            assert_eq!(env.get("TAKO_PANE_ID").map(String::as_str), Some("1"));
+        }
+    }
+
+    /// #946: 何も入っていない env にも必ず注入される（親からの継承に落ちない）
+    #[test]
+    fn ペインのtermは空のenvにも注入される() {
+        let env = finalize_pane_env(std::collections::HashMap::new(), false);
+        assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color"));
+        assert_eq!(env.get("COLORTERM").map(String::as_str), Some("truecolor"));
+    }
+
+    /// #946 の注入口: `inherit` を立てると注入を外す = 親の値が子へ素通しになる
+    #[test]
+    fn 注入口inheritは端末申告を落とす() {
+        let env = finalize_pane_env(
+            map(&[("TERM", "tmux-256color"), ("TAKO_PANE_ID", "1")]),
+            true,
+        );
+        assert_eq!(env.get("TERM"), None);
+        assert_eq!(env.get("COLORTERM"), None);
+        assert_eq!(env.get("TAKO_PANE_ID").map(String::as_str), Some("1"));
+    }
+
+    /// #946 の診断: 画面の TERMCHK 行を親の申告と突き合わせて理由を名指しする
+    #[test]
+    fn termchkの診断は継承と別の失敗を区別する() {
+        let parent = Some("tmux-256color");
+        // 注入どおり
+        assert_eq!(
+            diagnose_termchk(
+                "TERMCHK=xterm-256color,truecolor",
+                parent,
+                Some("truecolor")
+            ),
+            TermCheck::Injected
+        );
+        // 親からの継承（TERM / COLORTERM とも一致）
+        assert_eq!(
+            diagnose_termchk("TERMCHK=tmux-256color,truecolor", parent, Some("truecolor")),
+            TermCheck::Inherited {
+                observed: "tmux-256color,truecolor".to_string()
+            }
+        );
+        // TERM だけが親と一致（COLORTERM は注入が効いた形）も継承として扱う
+        assert!(matches!(
+            diagnose_termchk("TERMCHK=tmux-256color,", parent, None),
+            TermCheck::Inherited { .. }
+        ));
+        // 継承では説明できない値
+        assert!(matches!(
+            diagnose_termchk("TERMCHK=dumb,", parent, Some("truecolor")),
+            TermCheck::Unexpected { .. }
+        ));
+        // エコーが返っていない（打ったコマンド行だけが画面にある）
+        assert_eq!(
+            diagnose_termchk("$ echo \"TERMCHK=${TERM},${COLORTERM}\"", parent, None),
+            TermCheck::NoEcho
+        );
+        assert_eq!(diagnose_termchk("", parent, None), TermCheck::NoEcho);
+    }
+
+    /// 画面末尾をそのまま渡しても、**最後に出た展開後の値**を拾う
+    #[test]
+    fn termchkの観測は展開後の最後の値を採る() {
+        let screen = "$ echo \"TERMCHK=${TERM},${COLORTERM}\"\nTERMCHK=tmux-256color,truecolor\n$ echo \"TERMCHK=${TERM},${COLORTERM}\"\nTERMCHK=xterm-256color,truecolor\n$ ";
+        assert_eq!(
+            observed_termchk(screen).as_deref(),
+            Some("xterm-256color,truecolor")
+        );
+        // セルフテストが渡すのは `pane_screen_tail` の ` | ` 連結 1 行（#946）。
+        // 行区切りで切ると、次のペイン行まで値に混ざる
+        let joined =
+            "$ echo \"TERMCHK=${TERM},${COLORTERM}\" | TERMCHK=xterm-256color,truecolor | $ ";
+        assert_eq!(
+            observed_termchk(joined).as_deref(),
+            Some("xterm-256color,truecolor")
+        );
+        // 値が末尾で終わる形（後ろに何も無い）
+        assert_eq!(observed_termchk("TERMCHK=dumb,").as_deref(), Some("dumb,"));
+    }
+
+    /// 診断キーは grep できる形で固定する（ログの読み手が引く）
+    #[test]
+    fn termchkの診断キーは固定() {
+        assert_eq!(TermCheck::Injected.label(), "injected");
+        assert_eq!(
+            TermCheck::Inherited {
+                observed: "x".into()
+            }
+            .label(),
+            "inherited"
+        );
+        assert_eq!(TermCheck::NoEcho.label(), "no-echo");
+        assert_eq!(
+            TermCheck::Unexpected {
+                observed: "x".into()
+            }
+            .label(),
+            "unexpected"
+        );
+    }
+
+    /// 番犬（#946）: 端末申告の注入が **`options.env` の後**にあること。
+    /// 既定として先に敷く形へ戻ると、呼び出し側の env 1 つで注入が無言で消える
+    #[test]
+    fn 端末申告の注入はoptions_envより後にある() {
+        let src = include_str!("terminal.rs");
+        let body = src
+            .split("    pub fn spawn(")
+            .nth(1)
+            .expect("TerminalSession::spawn の定義");
+        let body = &body[..body.find("\n    pub fn ").unwrap_or(body.len())];
+        let options_env = body
+            .find("env.extend(options.env)")
+            .expect("spawn が options.env を取り込んでいない");
+        let finalize = body
+            .find("finalize_pane_env(")
+            .expect("spawn が finalize_pane_env を通っていない（#946 の注入が消えている）");
+        assert!(
+            finalize > options_env,
+            "端末申告の注入が options.env より前にある（呼び出し側の env で消える。#946）"
+        );
+        assert!(
+            !body.contains("(\"TERM\".to_string()"),
+            "spawn が TERM を直書きで敷いている（正本は PANE_TERMINAL_ENV。#946）"
+        );
+    }
 
     /// #816 の `Wakeup` ゲート: 未処理の `Wakeup` が残っている間は PTY 側が次を送らず、
     /// 受け手が倒すと再び送られる。これが崩れると「1 read ごとに配送タスクを起こす」
