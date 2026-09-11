@@ -12,19 +12,34 @@ mod build_script;
 use build_script::pwa::{self, Plan};
 use std::path::{Path, PathBuf};
 
-/// テストごとに使い捨てる一時ディレクトリ（pid つき = 同じ機で 2 本走っても取り合わない）
-fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("tako-1309-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れる");
-    dir
+/// 使い捨ての一時ツリー。名前は pid つき（同じ機で 2 本走っても取り合わない）で、
+/// **落ちても Drop で消える**（テスト本体が作る作業 dir は自分で片付ける。#1296）
+struct TempTree(PathBuf);
+
+impl TempTree {
+    fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("tako-1309-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れる");
+        Self(dir)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    /// PWA の置き場を模した空のツリー（`<root>/web/tako-remote`）
+    fn pwa_dir(&self) -> PathBuf {
+        let dir = self.0.join("web/tako-remote");
+        std::fs::create_dir_all(&dir).expect("PWA ディレクトリを作れる");
+        dir
+    }
 }
 
-/// PWA の置き場を模した空のツリー
-fn pwa_tree(name: &str) -> PathBuf {
-    let dir = temp_dir(name).join("web/tako-remote");
-    std::fs::create_dir_all(&dir).expect("PWA ディレクトリを作れる");
-    dir
+impl Drop for TempTree {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 fn write_dist_index(pwa_dir: &Path) {
@@ -86,21 +101,23 @@ fn npm_in(bin: &Path) -> Option<PathBuf> {
 
 #[test]
 fn dist_があれば何もしない() {
-    let pwa_dir = pwa_tree("uptodate");
+    let tree = TempTree::new("uptodate");
+    let pwa_dir = tree.pwa_dir();
     write_dist_index(&pwa_dir);
-    let bin = fake_npm(pwa_dir.parent().unwrap(), 0);
+    let bin = fake_npm(tree.path(), 0);
 
     assert_eq!(pwa::plan(&pwa_dir, npm_in(&bin)), Plan::UpToDate);
     // dist があるなら npm が無い環境（配布物のビルド機）でも落ちない
     assert_eq!(pwa::plan(&pwa_dir, None), Plan::UpToDate);
     // 判定だけで npm は 1 度も起きない
-    assert!(shim_calls(pwa_dir.parent().unwrap()).is_empty());
+    assert!(shim_calls(tree.path()).is_empty());
 }
 
 #[test]
 fn dist_が無ければ_npm_でビルドする() {
-    let pwa_dir = pwa_tree("build");
-    let bin = fake_npm(pwa_dir.parent().unwrap(), 0);
+    let tree = TempTree::new("build");
+    let pwa_dir = tree.pwa_dir();
+    let bin = fake_npm(tree.path(), 0);
 
     // node_modules が無い = lockfile どおりに入れてからビルドする
     match pwa::plan(&pwa_dir, npm_in(&bin)) {
@@ -123,10 +140,11 @@ fn dist_が無ければ_npm_でビルドする() {
 
 #[test]
 fn dist_はあるが_index_htmlが無ければビルドする() {
-    let pwa_dir = pwa_tree("empty-dist");
+    let tree = TempTree::new("empty-dist");
+    let pwa_dir = tree.pwa_dir();
     // npm が途中で落ちた跡（ディレクトリだけある）を「ビルド済み」と誤判定しない
     std::fs::create_dir_all(pwa_dir.join("dist/assets")).expect("dist/assets を作れる");
-    let bin = fake_npm(pwa_dir.parent().unwrap(), 0);
+    let bin = fake_npm(tree.path(), 0);
 
     assert!(matches!(
         pwa::plan(&pwa_dir, npm_in(&bin)),
@@ -136,10 +154,14 @@ fn dist_はあるが_index_htmlが無ければビルドする() {
 
 #[test]
 fn npm_が無ければ手順を案内して止める() {
-    let pwa_dir = pwa_tree("no-npm");
-    let empty = temp_dir("no-npm-path");
+    let tree = TempTree::new("no-npm");
+    let pwa_dir = tree.pwa_dir();
+    let empty_path = TempTree::new("no-npm-path");
 
-    assert_eq!(pwa::plan(&pwa_dir, npm_in(&empty)), Plan::MissingNpm);
+    assert_eq!(
+        pwa::plan(&pwa_dir, npm_in(empty_path.path())),
+        Plan::MissingNpm
+    );
     assert_eq!(pwa::find_npm(None), None, "PATH 自体が無くても落ちない");
 
     let message = pwa::missing_npm_message(&pwa_dir);
@@ -153,9 +175,9 @@ fn npm_が無ければ手順を案内して止める() {
 
 #[test]
 fn find_npm_は_path_の並び順で最初の実行可能ファイルを採る() {
-    let base = temp_dir("find-npm");
-    let first = base.join("first");
-    let second = base.join("second");
+    let tree = TempTree::new("find-npm");
+    let first = tree.path().join("first");
+    let second = tree.path().join("second");
     std::fs::create_dir_all(&first).expect("dir を作れる");
     let bin = fake_npm(&second, 0);
     // 1 つ目には「名前は同じだが実行できないもの」を置く（unix のみ実行ビットで判別できる）
@@ -174,8 +196,9 @@ fn find_npm_は_path_の並び順で最初の実行可能ファイルを採る()
 
 #[test]
 fn run_はnode_modulesの有無で_npm_ciを呼び分ける() {
-    let pwa_dir = pwa_tree("run");
-    let base = pwa_dir.parent().unwrap().to_path_buf();
+    let tree = TempTree::new("run");
+    let pwa_dir = tree.pwa_dir();
+    let base = tree.path().to_path_buf();
     let bin = fake_npm(&base, 0);
     let npm = npm_in(&bin).expect("shim が見つかる");
 
@@ -200,8 +223,9 @@ fn run_はnode_modulesの有無で_npm_ciを呼び分ける() {
 
 #[test]
 fn npm_が非ゼロ終了なら手順つきのエラーで止まる() {
-    let pwa_dir = pwa_tree("npm-fails");
-    let base = pwa_dir.parent().unwrap().to_path_buf();
+    let tree = TempTree::new("npm-fails");
+    let pwa_dir = tree.pwa_dir();
+    let base = tree.path().to_path_buf();
     let bin = fake_npm(&base, 3);
     let npm = npm_in(&bin).expect("shim が見つかる");
 
@@ -220,7 +244,8 @@ fn npm_が非ゼロ終了なら手順つきのエラーで止まる() {
 
 #[test]
 fn ビルド後に埋め込み元が揃っていなければ止める() {
-    let pwa_dir = pwa_tree("verify");
+    let tree = TempTree::new("verify");
+    let pwa_dir = tree.pwa_dir();
 
     let err = pwa::verify_built(&pwa_dir).expect_err("index.html が無ければ失敗");
     let first_line = err.lines().next().unwrap_or_default();
