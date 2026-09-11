@@ -20,16 +20,6 @@
 
 ---
 
-## 2026-09-11（#1293: 会話ログの番号つき箇条書きがダイアログの選択肢に混ざらないようにした）
-- 真因は非対称。選択カーソルの探索は末尾 40 行に絞ってあるのに**収集（`numbered_rows`）だけが画面全体**だった。`numbered_block` で起点から上下へ「あいだがダイアログの一部だけ（`gap_line_kind`）」かつ「番号が 1 ずつ増える」あいだに限定し、経路 1〜4 すべてへ effect。`title` も同じ塊に限る（境界 = 罫線 + 0 桁の非空行 + 採らなかった番号つき行）
-- A/B `TAKO_1293_LEGACY=1`: 単体 5 本が Issue と同じ `options=6`・`highlighted=Some(3)`・`header=["⏺ 直し方の候補は 3 つあります。"]` で FAILED → 修正後 3 択・header はダイアログの説明文のみ
-- 実 tmux の模擬 TUI e2e（新規 2 本）: 下見が 3 択・`--choice 1` が `choice_text="Yes"` / `keys_sent=["1"]` / `resolved=true`。legacy は `choice_text="待ちを状態待ちへ寄せる"` = Issue の「監査ログが嘘になる」を再現
-
-## 2026-09-11（#1282: `tako tmux cleanup --servers` を psmux の器でも使えるようにした）
-- 器の列挙を 2 実装へ（unix = ソケットファイル走査 / Windows = 器のプロセスのコマンドライン `-L <名前>`。psmux は名前付きパイプで走査できるファイルが無く、実機に 24 個残っていても 0 件と答えていた）。コマンドラインは `NtQueryInformationProcess(ProcessCommandLineInformation)`・起動時刻は `GetProcessTimes` で、依存クレートは足していない
-- 所有者は 2 段（ソケット名の pid = unix と同じ強さ / コマンドラインの隔離マーカー = 自分以外の生きた tako-app が居れば `peer_may_reattach` で見送る）。材料が無ければ従来どおり `owner_unknown`。回収は `taskkill /PID /T /F` の **pid 指定のみ**
-- macOS: fmt / clippy / `test --workspace` 4074 件緑・クロスチェック エラー 0（警告は既存箇所のみ）。番犬 5 本（修正前ソースで 4 本 FAILED）+ 単体 11 本（応答の形は dispatch で固定）。FFI は CI の Windows ランナーで実行検査（既存の `cargo test --workspace` は #583 の失敗で tako-core まで届かないので blocking の別ステップを追加）。**Windows 実機実測は未取得**（機が offline。手順は plan の「#1282」節）
-
 ## 2026-09-11（#1294: peer 送達の「送ったかもしれない」を未達扱いにせず二重投函を止めた）
 - `Stall::PeerSendStalled`（再送禁止の宣言）と registry の記録が逆を向いていた。送達の記録を 3 値（`tako_core::prompt_delivery::Confidence`）にし、`peer_send_stalled` / `peer_unconfirmed` は `Unverified`（#983 の `verify_then_resend`）へ。3 値目の宣言は `outcome_confidence` の表 1 本で、記録側と判定側が同じ表を引く（**既定は未達側**）
 - A/B（`TAKO_1294_LEGACY=1`）: 旧アーム = `prompt_delivery=undelivered` / events `prompt_undelivered` / **自動再送 1 回**、新アーム = `unverified` / `prompt_delivery_unverified` / **0 回**。本当に未達（`paste_not_reflected`）は両アームとも 1 回で回帰なし
@@ -59,6 +49,7 @@
 - `autorename` の起動を `spawn_claude` 1 本へ寄せ `--strict-mcp-config` を付ける。**再試行の引き金は非ゼロ終了だけ**で、フラグ無しの再試行が通ったときにだけ「使えない」と学習する（打ち切り・起動失敗では再試行しない）。A/B は `TAKO_758_LEGACY=1`
 - macOS 実測（順序交互 10 ラウンド。順序固定の初回 15 ラウンドは 2 番目の腕が系統的に遅く測り直した）: 命名プロンプト p50 18.4→16.9s（対応差の中央値 -3.8s・9/10）/ 最小プロンプト 5.8→3.7s / **子孫プロセス 17→2**。隔離 GUI の 1 対 1 は 32.8s→16.6s。`CLAUDE_TIMEOUT` は縮めない（最大 43.6s）
 - 単体 6 本（フォールバックを外すと 3 本 FAILED = 検出力）。上限テストが**上限が効いていない**のを発見（kill しても stdout の `join` は孫 = MCP サーバーが握る限り返らない。実測 上限 0.6s が 30.3s）→ 読み出しを `mpsc` の期限付き受信へ
+
 ## 2026-09-11（#946: ペインの TERM 注入を「最後に無条件上書き」へ寄せ、1b の失敗理由を名指しできるようにした）
 - Issue の見立て（親の TERM がペインへ素通し）は**実測で否定**。修正前バイナリ（`f1af0cc`）を tako のペインの中（親 `TERM=tmux-256color`）から起こしても項目 1b は **3/3 通過**（`ok=true waited=0.1s`）。alacritty は `Options.env` を親 env の上に当てる（`tty/unix.rs:235`）ので注入は元から勝っていた。報告時点（`e703e40`）の 3/3 失敗は**同じ項目を落とす #1165 の固定 6.4 秒窓**で、9/8（`4d84695`）に解消済み
 - 残っていた穴は「注入が既定でしかない」こと（`env.extend(options.env)` が後 = 呼び出し側の env 1 つで無言で消える）。`finalize_pane_env` で TERM / COLORTERM を**最後に上書き**へ寄せ、番犬 `端末申告の注入はoptions_envより後にある` が修正前ソースで FAILED。項目 1b の失敗時だけ `TAKO_SELF_TEST_946: cause=injected|inherited|unexpected|no-echo` を出す（SKIP にはしない）
