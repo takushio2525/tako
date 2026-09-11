@@ -238,7 +238,12 @@ mod tests {
         let raw = vec!["あiう"];
         let lines = parse_ansi_lines(&raw, 10, &theme());
         assert!(lines[0].text.starts_with("あiう"));
-        assert!(lines[0].has_wide);
+        // 全角のぶん列が 2 つ飛ぶ（半角に差し替えると差 1 になって落ちる）
+        assert!(
+            lines[0].cell_cols.windows(2).any(|w| w[1] - w[0] == 2),
+            "全角のぶん cell_cols が 2 列飛んでいない: {:?}",
+            lines[0].cell_cols
+        );
         // あ=col0(幅2), i=col2, う=col3(幅2)
         assert_eq!(&lines[0].cell_cols[..3], &[0, 2, 3]);
     }
@@ -279,7 +284,6 @@ mod tests {
                 text: String::new(),
                 runs: Vec::new(),
                 cell_cols: Vec::new(),
-                has_wide: false,
             }],
             total_history: 100,
             position: 0.0,

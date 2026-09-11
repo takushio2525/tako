@@ -119,12 +119,10 @@ pub fn screen_from_lines(lines: &[String], cols: usize) -> Screen {
             text.push(' ');
             col += 1;
         }
-        let has_wide = cell_cols.windows(2).any(|w| w[1] - w[0] > 1);
         rows.push(ScreenLine {
             text,
             runs: Vec::new(),
             cell_cols,
-            has_wide,
         });
     };
     for line in lines {
@@ -749,7 +747,6 @@ mod tests {
                         text,
                         runs: Vec::new(),
                         cell_cols,
-                        has_wide: false,
                     }
                 })
                 .collect(),
@@ -1035,6 +1032,43 @@ mod tests {
         cleanup_test_dir(&dir);
     }
 
+    /// #1388: 「行に全角が在るか」の旗を落としても、`screen_from_lines` が組む
+    /// `text` / `cell_cols` は 1 文字も変わらない。
+    ///
+    /// 旗の書き手は `cell_cols.windows(2)` を畳んでいただけなので `text` /
+    /// `cell_cols` に影響しないが、**右端だけが全角の行**（旧の物差しが構造的に
+    /// 見落としていた形）・空行・全角だけの行を列まで固定して、描画と
+    /// `tako links` の材料がここで変わらないことを見る
+    #[test]
+    fn screen_from_linesの列は全角のぶん飛ぶ_1388() {
+        let dump = |line: &str, cols: usize| -> (String, Vec<usize>) {
+            let s = screen_from_lines(&[line.to_string()], cols);
+            let l = &s.lines[0];
+            eprintln!(
+                "i1388 cols={cols} in={line:?} text={:?} cell_cols={:?}",
+                l.text, l.cell_cols
+            );
+            (l.text.clone(), l.cell_cols.clone())
+        };
+
+        // 右端だけが全角（次の可視文字が無いので、旧 `windows(2)` 版は旗を false にしていた）
+        let (text, cols_of) = dump("abcdefghあ", 10);
+        assert_eq!(text, "abcdefghあ");
+        assert_eq!(cols_of, vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        // 空行は全列ぶんの空白詰め（#1182）
+        let (text, cols_of) = dump("", 4);
+        assert_eq!(text, "    ");
+        assert_eq!(cols_of, vec![0, 1, 2, 3]);
+        // 全角だけの行は 2 列ずつ飛び、余りは空白で埋まる
+        let (text, cols_of) = dump("ああああ", 10);
+        assert_eq!(text, "ああああ  ");
+        assert_eq!(cols_of, vec![0, 2, 4, 6, 8, 9]);
+        // 途中に全角（旧の物差しでも拾えていた形）
+        let (text, cols_of) = dump("あbc", 5);
+        assert_eq!(text, "あbc ");
+        assert_eq!(cols_of, vec![0, 2, 3, 4]);
+    }
+
     /// **実画面と同じ形**（行末まで空白で埋まった `text` + 全列ぶんの `cell_cols`）の
     /// スクリーンを作る。`screen::compose_line` は未使用セルも押し込むので、
     /// 実機の `ScreenLine` はこの形になる（#1182）
@@ -1060,12 +1094,10 @@ mod tests {
                         padded.push(' ');
                         col += 1;
                     }
-                    let has_wide = cell_cols.windows(2).any(|w| w[1] - w[0] > 1);
                     ScreenLine {
                         text: padded,
                         runs: Vec::new(),
                         cell_cols,
-                        has_wide,
                     }
                 })
                 .collect(),

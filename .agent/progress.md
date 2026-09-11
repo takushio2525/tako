@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-11（#1373: 蓋閉じ継続の記録に所有者を持たせ、原子書き込み + fail-loud にした）
-- `lid-guard.json` は data_dir に 1 つで複数の tako-app が共有するのに「書き換えるのはこのプロセスだけ」が前提だった。記録へ所有者（pid + 起動時刻）を足し、戻すのは「自分の / 所有者が死んだ / 所有者を持たない旧形式」だけへ（**生きた他プロセスの記録は倒す側も解除側も触らない**）。判定は `claim_for` → `decide` の純粋関数 2 本で、probe を引数に取るので macOS の CI で 4 通り全部を固定できる
-- 書き込みを `config_io::atomic_write` + `<path>.lock` の flock（**書くと決まってから**取り、その下で読み直す）へ。読めない記録は「記録なし」へ丸めず `<name>.unreadable.bak` へ写して Err（元ファイルは触らない）。旧形式は `serde(default)` でそのまま読めるので移行は不要（指紋へ `SavedLidState` / `RecordOwner` を登録）
-- A/B: 修正前ソースで番犬 6 本が file:line 名指し FAILED。注入 5 種それぞれで対応する番犬 / 単体が落ちる。**Windows 実機（2 プロセス構成）は未検証**（電源待ち）。`main.rs` の `apply_sleep_guard` がセカンダリで止まらない件は所有権で無害化したので別 Issue は立てない
-
 ## 2026-09-11（#1308: 実 PTY の fixture を待つテストを状態待ちへ寄せた）
 - 真因は「固定窓の待ち + 尽きても結果を検査せず素通り」。混んだ機で素のシェルの起動が固定 10 秒窓を超えると、起動前の PTY へ打ち込んだ行はエコーされるだけで実行されず、それでも `dispatch` するので panic が**「器越しへ倒れている（#1200）」という無関係な原因**を名指ししていた（実測 `prompt_ok=false waited=10.03s dialog_seen=false waited=20.04s load=3.89`）
 - 待ちを `i1308_wait_for_state`（状態待ち + `state_wait_budget`・**上限に達したらドライバ自身が panic**・届かないあいだは予算に比例した間隔で打ち直す）へ寄せ、呼び出し側が素通りできない構造にした。番犬 `issue1308_pty_wait_watchdog` 4 本が注入 5 通りを file:line で名指し
@@ -64,3 +59,8 @@
 - 項目 1/3 はテスト追加（スクロール中の `visible_lines_filled` / `set_scrollback_limit` の副作用）、項目 2 は `history_plain_lines` の末尾トリムを `compose_grid_row` の 1 実装へ寄せて履歴行をスクロールで可視化して突き合わせ、項目 4 は罫線剥がしを `strip_box_border` 1 実装へ（`screen.rs` / `terminal.rs` / #1387 の番犬）
 - 項目 4 は「2 行目以降だけ剥がす」最小修正だと**枠線つきでプロンプト行にだけ本文がある箱が false** になるので、プロンプト行も同じ作法で見る形にした（1 行の箱の誤答は修正前から在った）
 - 注入 6 通り（起点 1 ずらし / トリム規則 / ループ 2 実装化 / `kitty_keyboard` 落とし / `set_options` 直渡し / 罫線剥がし戻し）で file:line 名指しの FAILED。workspace 4381 passed 0 failed・check-windows error 0
+
+## 2026-09-12（#1388: 読み手のいない「行に全角が在るか」の旗を落とした）
+- `ScreenLine` の旗は #787 以降 production の読み手が 0（grep で確定）なのに毎行 `windows(2)` を走らせ、doc だけが「描画で使う」と言っていた。フィールドと書き手 4 か所（`screen.rs` / `links.rs` ×2 / `terminal_grid.rs`）を落とし、assert 3 件は「全角のぶん `cell_cols` が 2 列飛ぶ」へ置き換え
+- 修正前ソースの実測: 右端だけが全角の行は旗が **false**（`windows(2)` 版の構造的な見落とし）/ 途中に全角なら true。`text` / `cell_cols` は前後で完全一致（右端全角・空行・全角のみ・途中全角の 4 ケースを `screen_from_lines` で固定）
+- 番犬 `issue1388_has_wide_watchdog` 6 本（識別子の再登場 / 旗を組む形 / フィールド指紋 + 注入 3）。修正前ソースで 3 本が file:line 名指し FAILED（`screen.rs:55` / `476` / `481`・`links.rs:122` / `127`・`terminal_grid.rs:627`）

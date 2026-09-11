@@ -50,9 +50,6 @@ pub struct ScreenLine {
     /// テキストから除いているため、次の文字との col 差が 2 になる。
     /// 描画（プロポーショナルな実フォント幅）とグリッド座標の写像に使う
     pub cell_cols: Vec<usize>,
-    /// 行に全角（2 セル幅）文字が含まれるか。描画時にセル幅固定レイアウトへ
-    /// 切り替える判定に使う
-    pub has_wide: bool,
 }
 
 /// 表示中グリッドのスナップショット
@@ -473,12 +470,10 @@ fn compose_line(
             }),
         }
     }
-    let has_wide = cell_cols.windows(2).any(|w| w[1] - w[0] > 1);
     ScreenLine {
         text,
         runs,
         cell_cols,
-        has_wide,
     }
 }
 
@@ -1163,7 +1158,12 @@ mod tests {
         // 「あ」は 2 セル占有 = 次の文字の列が 2
         assert_eq!(s.lines[0].cell_cols.first().copied(), Some(0));
         assert_eq!(s.lines[0].cell_cols.get(1).copied(), Some(2));
-        assert!(s.lines[0].has_wide);
+        // 全角のぶん列が 2 つ飛ぶ（半角に差し替えると差 1 になって落ちる）
+        assert!(
+            s.lines[0].cell_cols.windows(2).any(|w| w[1] - w[0] == 2),
+            "全角のぶん cell_cols が 2 列飛んでいない: {:?}",
+            s.lines[0].cell_cols
+        );
     }
 
     #[test]
@@ -1387,7 +1387,6 @@ mod tests {
                     text: (*t).to_string(),
                     runs: Vec::new(),
                     cell_cols: Vec::new(),
-                    has_wide: false,
                 })
                 .collect(),
             cursor: None,
@@ -1798,7 +1797,12 @@ mod tests {
         );
         // `a`=0 / `か`=1（濁点も 1）/ `e`=3（アクセントも 3）/ `b`=4
         assert_eq!(&line.cell_cols[..6], &[0, 1, 1, 3, 3, 4]);
-        assert!(line.has_wide, "全角の判定は結合文字で変わらない");
+        assert_eq!(
+            line.cell_cols[3] - line.cell_cols[1],
+            2,
+            "結合文字が載っても全角は 2 列進む: {:?}",
+            line.cell_cols
+        );
         assert_runs_cover(line);
     }
 

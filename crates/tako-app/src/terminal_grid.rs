@@ -624,7 +624,6 @@ mod tests {
                 strikeout: false,
                 dim: false,
             }],
-            has_wide: text.chars().any(is_wide),
             text: text.to_string(),
             cell_cols,
         }
@@ -670,7 +669,6 @@ mod tests {
             }],
             // `か` は全角（列 0、スペーサーが列 1）/ 濁点も列 0 / `a` = 列 2 / `b` = 列 3
             cell_cols: vec![0, 0, 2, 3],
-            has_wide: true,
         };
         let plan = plan_row(&l, fg(), None, link_style());
         assert_eq!(plan.segments.len(), 1);
