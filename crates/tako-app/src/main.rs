@@ -69148,7 +69148,7 @@ mod self_test_wait_budget_tests {
             sites.len()
         );
         for known in [
-            // 項目 22: tako resize（#1364)
+            // 項目 22: tako resize（#1364）
             (Duration::from_millis(800), Duration::from_secs(20)),
             // 項目 44: tako scroll --to（#1353）
             (Duration::from_millis(1000), Duration::from_secs(20)),
