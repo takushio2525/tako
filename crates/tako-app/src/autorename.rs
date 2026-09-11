@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -54,7 +55,15 @@ pub const PIN_HINT_TTL: Duration = Duration::from_secs(120);
 ///
 /// 呼び出しはバックグラウンドスレッドで、同じタブへは [`RENAME_MIN_INTERVAL`] /
 /// [`FIRST_NAME_COOLDOWN`] 以内に再発火しない。伸ばして困るのは「claude が本当に
-/// ハングしたとき、そのスレッドが待ち続ける時間」だけなので、取りこぼしを無くす側へ倒す
+/// ハングしたとき、そのスレッドが待ち続ける時間」だけなので、取りこぼしを無くす側へ倒す。
+///
+/// #758 で [`STRICT_MCP_FLAG`] を入れたあとに**縮められるか再検討したが、縮めない**。
+/// macOS の実測（同一プロンプト・順序を交互にした 10 ラウンド）はフラグ付きでも
+/// **中央値 16.9 秒 / 最大 43.6 秒**、隔離 GUI の実命名でも 38.7 秒かかった回がある。
+/// 遅い側の裾はフラグでは短くならない（MCP の起動ぶんが消えるだけで、応答待ちは残る）ので、
+/// 上限を裾の近くまで下げると「AI 命名が黙ってヒューリスティックへ落ちる」= #722 と
+/// 見分けの付かない症状を macOS でも起こす。Windows は macOS より遅い側で、
+/// この上限を決めた #722 の実測から取り直せていない（実機 offline）
 const CLAUDE_TIMEOUT: Duration = Duration::from_secs(120);
 /// 安価・高速なモデルを固定で使う（FR-2.12.2）
 const MODEL: &str = "claude-haiku-4-5-20251001";
@@ -274,17 +283,164 @@ fn resolve_claude(
     is_file(&path).then_some(path)
 }
 
-/// claude -p を 1 回叩いて応答をパースする。失敗（起動不可・タイムアウト・パース不能）は
+/// `claude -p` へ渡す「MCP サーバーを一切使わない」フラグ（#758）。
+///
+/// `--mcp-config` を伴わずに渡すと、ユーザーの MCP 設定（tako 自身の MCP サーバーを含む）を
+/// **1 つも起動しない**。タブ名を 1 個作るだけの使い捨て呼び出しには、全サーバーの起動と
+/// 接続は過剰で、遅いうえに命名ヘルパーへペイン操作ツール一式を持たせてしまう。
+///
+/// macOS の実測（claude 2.1.258・MCP サーバー 9 本・順序を交互にした 10 ラウンド）:
+///
+/// | 測り方 | 既定 | このフラグ付き |
+/// |---|---|---|
+/// | 命名プロンプト（本番と同じ文面）の所要 p50 | 18.4s | **16.9s**（対応差の中央値 **-3.8s**・10 回中 9 回速い） |
+/// | 最小プロンプト（応答 1 文字）の所要 p50 = ほぼ固定費 | 5.8s | **3.7s**（同 **-2.1s**・分布がほぼ重ならない） |
+/// | 起動する子孫プロセスのピーク | **17**（node / uv / python / tako 等） | **2** |
+///
+/// 所要のばらつきは応答待ちが支配するので、**速さより「17 → 2」のほうが本題**（#758）:
+/// 命名は純粋なテキスト変換なのに、既定では tako の MCP サーバーごと起きていて、
+/// 命名ヘルパーにペイン操作ツール一式が生えていた
+const STRICT_MCP_FLAG: &str = "--strict-mcp-config";
+
+/// [`STRICT_MCP_FLAG`] を付けてよいかの学習状態（#758）。
+///
+/// 未知のフラグを足すと**古い claude CLI では使い方エラーで即座に非ゼロ終了**し、
+/// 自動命名が黙ってヒューリスティックへ落ちる（#722 と見分けの付かない症状になる）。
+/// バージョン番号で分岐するより、1 回だけ実際に渡して確かめるほうが確実
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StrictMcp {
+    /// まだ 1 回も渡していない
+    Unknown = 0,
+    /// フラグ付きで通った（以後フラグ付きで固定。再試行しない）
+    Supported = 1,
+    /// フラグ付きが非ゼロ終了し、フラグ無しなら通った（古い CLI。以後フラグを付けない）
+    Unsupported = 2,
+}
+
+impl StrictMcp {
+    fn load(cell: &AtomicU8) -> Self {
+        match cell.load(Ordering::Relaxed) {
+            1 => Self::Supported,
+            2 => Self::Unsupported,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn store(self, cell: &AtomicU8) {
+        cell.store(self as u8, Ordering::Relaxed);
+    }
+}
+
+/// 学習状態の置き場（プロセス内で 1 つ。`claude_bin()` と同じ方針）
+fn strict_state() -> &'static AtomicU8 {
+    static STATE: AtomicU8 = AtomicU8::new(StrictMcp::Unknown as u8);
+    &STATE
+}
+
+/// A/B の逃げ道（#758）: `TAKO_758_LEGACY=1` で [`STRICT_MCP_FLAG`] を一切付けない旧経路へ戻す
+fn issue758_legacy() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TAKO_758_LEGACY").is_some())
+}
+
+/// claude を 1 回起こした結果。**非ゼロ終了だけ**を他の失敗と区別するのは、
+/// 未知のフラグを拒否した古い CLI がそこへ来るから（#758）
+#[derive(Debug, PartialEq, Eq)]
+enum ClaudeRun {
+    /// 正常終了（中身は stdout）
+    Ok(String),
+    /// 非ゼロ終了
+    NonZero,
+    /// 起動できない / 上限まで応答が来ない。**引数の綴りとは無関係**なので再試行しない
+    Failed,
+}
+
+/// claude -p を叩いて応答をパースする。失敗（起動不可・タイムアウト・パース不能）は
 /// None（呼び出し側がヒューリスティックへ落とす）
 fn run_claude(bin: &Path, materials: &TabMaterials, lang: Lang) -> Option<RenamePlan> {
+    run_claude_with(strict_state(), issue758_legacy(), bin, materials, lang)
+}
+
+/// [`run_claude`] の本体（学習状態と A/B を注入して**偽 CLI でテストできる**ようにしてある）
+fn run_claude_with(
+    state: &AtomicU8,
+    legacy: bool,
+    bin: &Path,
+    materials: &TabMaterials,
+    lang: Lang,
+) -> Option<RenamePlan> {
+    let prompt = build_prompt(materials, lang);
+    let output = run_learning_strict(state, legacy, &mut |strict| {
+        spawn_claude(bin, &prompt, strict)
+    })?;
+    let plan = parse_plan(&output, materials, lang);
+    diag(format_args!(
+        "claude 応答のパース{}",
+        if plan.is_some() { "成功" } else { "失敗" }
+    ));
+    plan
+}
+
+/// [`STRICT_MCP_FLAG`] を学習しながら起こす（#758）。`run(strict)` が 1 回の起動。
+///
+/// - 未学習: フラグ付きで起こす。**非ゼロ終了のときだけ**フラグ無しで 1 回再試行し、
+///   その再試行が通ったときにだけ「このフラグは使えない」と決める。
+///   リミット・認証切れのような一時的な非ゼロ終了で速い経路を捨てないための条件で、
+///   古い CLI なら使い方エラーが即座に返るので再試行の代償もほぼ無い
+/// - 学習済み: 覚えた側だけを 1 回起こす（= 余計な再試行は初回だけ）
+/// - タイムアウト・起動失敗では再試行しない。プロセスが立った時点でフラグは通っており、
+///   もう一度待つと上限のぶんだけ二重に待たせるだけ
+fn run_learning_strict(
+    state: &AtomicU8,
+    legacy: bool,
+    run: &mut dyn FnMut(bool) -> ClaudeRun,
+) -> Option<String> {
+    if legacy {
+        return match run(false) {
+            ClaudeRun::Ok(output) => Some(output),
+            _ => None,
+        };
+    }
+    let learned = StrictMcp::load(state);
+    let strict = learned != StrictMcp::Unsupported;
+    match run(strict) {
+        ClaudeRun::Ok(output) => {
+            if strict && learned == StrictMcp::Unknown {
+                StrictMcp::Supported.store(state);
+                diag(format_args!("{STRICT_MCP_FLAG} は使える（以後付けたまま）"));
+            }
+            Some(output)
+        }
+        ClaudeRun::NonZero if strict && learned == StrictMcp::Unknown => {
+            match run(false) {
+                ClaudeRun::Ok(output) => {
+                    StrictMcp::Unsupported.store(state);
+                    diag(format_args!(
+                        "{STRICT_MCP_FLAG} を拒否された → 以後付けない（古い claude CLI）"
+                    ));
+                    Some(output)
+                }
+                // フラグ無しでも駄目 = フラグのせいだと決められない。学習せず次回また試す
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// claude -p を 1 回だけ起こして stdout を読む
+fn spawn_claude(bin: &Path, prompt: &str, strict: bool) -> ClaudeRun {
     use std::io::{Read, Write};
     use std::process::{Command, Stdio};
 
-    let prompt = build_prompt(materials, lang);
     let started = Instant::now();
+    let mut command = Command::new(bin);
+    command.args(["-p", "--model", MODEL]);
+    if strict {
+        command.arg(STRICT_MCP_FLAG);
+    }
     // #586: GUI プロセスからの起動なので Windows でコンソールウィンドウを出させない
-    let mut child = match tako_core::platform::process::no_console_window(&mut Command::new(bin))
-        .args(["-p", "--model", MODEL])
+    let mut child = match tako_core::platform::process::no_console_window(&mut command)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -293,7 +449,7 @@ fn run_claude(bin: &Path, materials: &TabMaterials, lang: Lang) -> Option<Rename
         Ok(child) => child,
         Err(e) => {
             diag(format_args!("claude の起動に失敗: {e}"));
-            return None;
+            return ClaudeRun::Failed;
         }
     };
     if let Some(mut stdin) = child.stdin.take() {
@@ -301,25 +457,20 @@ fn run_claude(bin: &Path, materials: &TabMaterials, lang: Lang) -> Option<Rename
         // drop で stdin が閉じ、-p は EOF までをプロンプトとして読む
     }
     // stdout はパイプ詰まり防止のため別スレッドで吸い出しつつ、タイムアウト付きで待つ
-    let mut stdout = child.stdout.take()?;
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return ClaudeRun::Failed;
+    };
     let reader = std::thread::spawn(move || {
         let mut buf = String::new();
         let _ = stdout.read_to_string(&mut buf);
         buf
     });
     let deadline = Instant::now() + CLAUDE_TIMEOUT;
-    let finished = loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    diag(format_args!(
-                        "claude が非ゼロ終了: code={:?}（{:.1}s）",
-                        status.code(),
-                        started.elapsed().as_secs_f32()
-                    ));
-                }
-                break status.success();
-            }
+            Ok(Some(status)) => break Some(status),
             Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(200));
             }
@@ -331,22 +482,31 @@ fn run_claude(bin: &Path, materials: &TabMaterials, lang: Lang) -> Option<Rename
                 ));
                 let _ = child.kill();
                 let _ = child.wait();
-                break false;
+                break None;
             }
         }
     };
     let output = reader.join().unwrap_or_default();
-    if !finished {
-        return None;
+    let flag = if strict { STRICT_MCP_FLAG } else { "既定" };
+    match status {
+        Some(status) if status.success() => {
+            diag(format_args!(
+                "claude 応答: {:.1}s / {} バイト / {flag}",
+                started.elapsed().as_secs_f32(),
+                output.len()
+            ));
+            ClaudeRun::Ok(output)
+        }
+        Some(status) => {
+            diag(format_args!(
+                "claude が非ゼロ終了: code={:?}（{:.1}s / {flag}）",
+                status.code(),
+                started.elapsed().as_secs_f32()
+            ));
+            ClaudeRun::NonZero
+        }
+        None => ClaudeRun::Failed,
     }
-    let plan = parse_plan(&output, materials, lang);
-    diag(format_args!(
-        "claude 応答: {:.1}s / {} バイト / パース{}",
-        started.elapsed().as_secs_f32(),
-        output.len(),
-        if plan.is_some() { "成功" } else { "失敗" }
-    ));
-    plan
 }
 
 /// プロンプト 1 本（FR-2.12.2。判断・調整はすべてこの文面に閉じる）。
@@ -701,6 +861,282 @@ mod tests {
             &|_| false,
         );
         assert_eq!(missing, None);
+    }
+
+    /// 偽 claude を書く（#758）。実 CLI は起こさない（`.agent/conventions.md`
+    /// 「テストの書き先は本番の外」）。`mode`:
+    ///
+    /// - `"reject-strict"`: **古い CLI 相当**。`--strict-mcp-config` を渡されたら
+    ///   使い方エラー（非ゼロ終了）。渡されなければ命名 JSON を返す
+    /// - `"accept"`: どちらでも命名 JSON を返す
+    /// - `"always-fail"`: 何を渡しても非ゼロ終了（リミット・認証切れ相当）
+    ///
+    /// 返すのは (偽 claude のパス, 渡された引数のログ)。呼ばれるたびに 1 行増える。
+    /// Windows は**バッチ経由の起動を実機で確かめられない**ので、この形のテストは
+    /// unix だけに置く（学習の規則そのものは下の `run_learning_strict` の
+    /// テストが両プラットフォームで拘束する）
+    #[cfg(unix)]
+    fn write_fake_claude(dir: &Path, mode: &str) -> (PathBuf, PathBuf) {
+        let bin = dir.join("claude");
+        let log = dir.join("args.log");
+        let script = r#"#!/bin/sh
+echo "$@" >> 'ARGS_LOG'
+cat >/dev/null
+for a in "$@"; do
+  if [ "$a" = "--strict-mcp-config" ]; then
+    STRICT_BRANCH
+  fi
+done
+TAIL
+"#
+        .replace("ARGS_LOG", &log.display().to_string())
+        .replace(
+            "STRICT_BRANCH",
+            if mode == "reject-strict" {
+                "exit 2"
+            } else {
+                ":"
+            },
+        )
+        .replace(
+            "TAIL",
+            if mode == "always-fail" {
+                "exit 3"
+            } else {
+                r#"printf '%s\n' '{"tab":"偽命名","panes":{"3":"偽ペイン"}}'"#
+            },
+        );
+        std::fs::write(&bin, script).expect("偽 claude を書ける");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("偽 claude に実行権を付けられる");
+        (bin, log)
+    }
+
+    /// テスト用の一時ディレクトリ（本番の data dir・ホームには触らない）
+    #[cfg(unix)]
+    fn temp_dir_for(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tako-758-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れる");
+        dir
+    }
+
+    #[cfg(unix)]
+    fn arg_lines(log: &Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// 受け入れ 2（#758）: **フラグを拒否する古い CLI でも自動命名が黙って無効化されない**。
+    /// フラグ無しで 1 回だけ再試行して成功し、2 回目以降は再試行が走らない
+    #[test]
+    #[cfg(unix)]
+    fn 古いclaudeがフラグを拒否してもフォールバックで命名できる() {
+        let dir = temp_dir_for("reject");
+        let (bin, log) = write_fake_claude(&dir, "reject-strict");
+        let state = AtomicU8::new(StrictMcp::Unknown as u8);
+
+        let plan = run_claude_with(&state, false, &bin, &materials(), Lang::Ja)
+            .expect("フォールバックで命名できる（黙って無効化されない）");
+        assert_eq!(plan.tab.as_deref(), Some("偽命名"));
+        assert_eq!(plan.panes, vec![(3, "偽ペイン".to_string())]);
+        let calls = arg_lines(&log);
+        assert_eq!(
+            calls.len(),
+            2,
+            "フラグ付き → フラグ無しの 2 回のはず: {calls:?}"
+        );
+        assert!(
+            calls[0].contains(STRICT_MCP_FLAG),
+            "1 回目は付ける: {calls:?}"
+        );
+        assert!(
+            !calls[1].contains(STRICT_MCP_FLAG),
+            "再試行は外す: {calls:?}"
+        );
+        assert_eq!(StrictMcp::load(&state), StrictMcp::Unsupported);
+
+        // 2 回目以降はフラグ無しの 1 回だけ（余計な再試行は初回だけ）
+        let plan = run_claude_with(&state, false, &bin, &materials(), Lang::Ja);
+        assert!(plan.is_some());
+        let calls = arg_lines(&log);
+        assert_eq!(calls.len(), 3, "2 回目に再試行が走っている: {calls:?}");
+        assert!(
+            !calls[2].contains(STRICT_MCP_FLAG),
+            "学習後に付け直さない: {calls:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 受け入れ 2（#758）: フラグを受け付ける CLI では 2 回目以降もフラグ付きのままで、
+    /// 再試行は 1 度も走らない
+    #[test]
+    #[cfg(unix)]
+    fn フラグが通るclaudeでは再試行せず付けたままになる() {
+        let dir = temp_dir_for("accept");
+        let (bin, log) = write_fake_claude(&dir, "accept");
+        let state = AtomicU8::new(StrictMcp::Unknown as u8);
+
+        for _ in 0..3 {
+            assert!(run_claude_with(&state, false, &bin, &materials(), Lang::Ja).is_some());
+        }
+        let calls = arg_lines(&log);
+        assert_eq!(calls.len(), 3, "1 回の命名につき 1 回の起動: {calls:?}");
+        assert!(
+            calls.iter().all(|c| c.contains(STRICT_MCP_FLAG)),
+            "全てフラグ付きのはず: {calls:?}"
+        );
+        assert_eq!(StrictMcp::load(&state), StrictMcp::Supported);
+
+        // A/B（`TAKO_758_LEGACY=1` 相当）: 旧経路はフラグを一切付けない
+        let (legacy_bin, legacy_log) = write_fake_claude(&dir, "accept");
+        assert!(run_claude_with(&state, true, &legacy_bin, &materials(), Lang::Ja).is_some());
+        let legacy_calls = arg_lines(&legacy_log);
+        assert_eq!(
+            legacy_calls.len(),
+            4,
+            "同じログへ 4 行目が付く: {legacy_calls:?}"
+        );
+        assert!(
+            !legacy_calls[3].contains(STRICT_MCP_FLAG),
+            "legacy でフラグを付けている: {legacy_calls:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// エッジ（#758）: claude が何をしても失敗する（リミット・認証切れ相当）なら
+    /// 従来どおり `None` = ヒューリスティックへ落ちる。学習もしないので次回また速い側から試す
+    #[test]
+    #[cfg(unix)]
+    fn どちらでも失敗するなら従来どおりヒューリスティックへ落ちる() {
+        let dir = temp_dir_for("fail");
+        let (bin, log) = write_fake_claude(&dir, "always-fail");
+        let state = AtomicU8::new(StrictMcp::Unknown as u8);
+
+        assert_eq!(
+            run_claude_with(&state, false, &bin, &materials(), Lang::Ja),
+            None
+        );
+        assert_eq!(
+            StrictMcp::load(&state),
+            StrictMcp::Unknown,
+            "失敗で学習しない"
+        );
+        let calls = arg_lines(&log);
+        assert_eq!(
+            calls,
+            vec![
+                format!("-p --model {MODEL} {STRICT_MCP_FLAG}"),
+                format!("-p --model {MODEL}"),
+            ]
+        );
+
+        // claude が PATH に無い（実在しないパス）= 起動失敗も従来どおり None。
+        // 引数の綴りとは無関係なので再試行もしない
+        let missing = dir.join("does-not-exist");
+        assert_eq!(
+            run_claude_with(&state, false, &missing, &materials(), Lang::Ja),
+            None
+        );
+        assert_eq!(arg_lines(&log).len(), 2, "起動失敗で再試行している");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `run_learning_strict` を偽の起動結果で回し、(結果, 渡した strict の並び) を返す
+    fn drive(
+        state: &AtomicU8,
+        legacy: bool,
+        replies: Vec<ClaudeRun>,
+    ) -> (Option<String>, Vec<bool>) {
+        let replies = std::cell::RefCell::new(std::collections::VecDeque::from(replies));
+        let calls = std::cell::RefCell::new(Vec::new());
+        let out = run_learning_strict(state, legacy, &mut |strict| {
+            calls.borrow_mut().push(strict);
+            replies
+                .borrow_mut()
+                .pop_front()
+                .expect("起動回数が想定より多い")
+        });
+        (out, calls.into_inner())
+    }
+
+    /// 学習の規則（#758）を両プラットフォームで拘束する。
+    /// **非ゼロ終了だけ**が再試行の引き金で、再試行が通ったときにだけ学習する
+    #[test]
+    fn フラグの学習は非ゼロ終了のときだけ再試行する() {
+        let unknown = || AtomicU8::new(StrictMcp::Unknown as u8);
+
+        // 古い CLI: フラグ付き → 非ゼロ、フラグ無し → 通る。以後フラグを付けない
+        let state = unknown();
+        let (out, calls) = drive(
+            &state,
+            false,
+            vec![ClaudeRun::NonZero, ClaudeRun::Ok("plain".into())],
+        );
+        assert_eq!(out.as_deref(), Some("plain"));
+        assert_eq!(calls, vec![true, false]);
+        assert_eq!(StrictMcp::load(&state), StrictMcp::Unsupported);
+        let (_, calls) = drive(&state, false, vec![ClaudeRun::Ok("plain".into())]);
+        assert_eq!(calls, vec![false], "学習後に再試行が走っている");
+
+        // 通る CLI: 1 回で決まり、以後も付けたまま。学習後の非ゼロ終了では再試行しない
+        let state = unknown();
+        let (out, calls) = drive(&state, false, vec![ClaudeRun::Ok("strict".into())]);
+        assert_eq!(out.as_deref(), Some("strict"));
+        assert_eq!(calls, vec![true]);
+        assert_eq!(StrictMcp::load(&state), StrictMcp::Supported);
+        let (out, calls) = drive(&state, false, vec![ClaudeRun::NonZero]);
+        assert_eq!(out, None);
+        assert_eq!(calls, vec![true], "学習済みなのに再試行した");
+        assert_eq!(StrictMcp::load(&state), StrictMcp::Supported);
+
+        // 打ち切り・起動失敗はフラグと無関係なので再試行しない（上限のぶん二重に待たせない）
+        let state = unknown();
+        let (out, calls) = drive(&state, false, vec![ClaudeRun::Failed]);
+        assert_eq!(out, None);
+        assert_eq!(calls, vec![true]);
+        assert_eq!(
+            StrictMcp::load(&state),
+            StrictMcp::Unknown,
+            "打ち切りで速い経路を諦めている"
+        );
+
+        // フラグ無しでも失敗 = フラグのせいだと決められない。学習せず次回もフラグから試す
+        let state = unknown();
+        let (out, calls) = drive(&state, false, vec![ClaudeRun::NonZero, ClaudeRun::NonZero]);
+        assert_eq!(out, None);
+        assert_eq!(calls, vec![true, false]);
+        assert_eq!(StrictMcp::load(&state), StrictMcp::Unknown);
+        let (_, calls) = drive(
+            &state,
+            false,
+            vec![ClaudeRun::NonZero, ClaudeRun::Ok("plain".into())],
+        );
+        assert_eq!(
+            calls,
+            vec![true, false],
+            "一時的な失敗で速い経路を捨てている"
+        );
+
+        // A/B: legacy はフラグを一切付けず、学習もしない
+        let state = unknown();
+        let (out, calls) = drive(&state, true, vec![ClaudeRun::Ok("legacy".into())]);
+        assert_eq!(out.as_deref(), Some("legacy"));
+        assert_eq!(calls, vec![false]);
+        assert_eq!(StrictMcp::load(&state), StrictMcp::Unknown);
     }
 
     /// #722 の受け入れ 2: **実 claude を呼ぶ** e2e。AI 経路が実際に走り、
