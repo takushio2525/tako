@@ -63,8 +63,17 @@
 - `WorkerErrorKind::LoginExpired`（`login_expired` / `relogin`）を新設。文言の正本は `agent_cli::login_expired_line` の 1 か所（#983 の起動時未認証検知もそこへ委譲。種別は呼び出し側のゲートで決まる）。判定順序は「ライブのダイアログ > 失効 > 上限メッセージ」で、上限行のほうが新しければ見送る
 - 対象アカウント（`error.config_dir` / `error.account`）は会話の transcript の所在から逆引きし、失効を検知したときだけ走らせる。watch / MCP は `wait::error_json` の 1 実装で同形。仕様は FR-2.39
 - 隔離 GUI + fixture 実測: 失効 3 文言 → `login_expired` / `relogin` / `account=alt`・上限ダイアログ中は `usage_limit` → 解除後に失効へ遷移・`ENOTFOUND` だけは `api_error` / `resume`・窓の外の残骸は `idle`。legacy アーム（`TAKO_757_LEGACY=1`）は誤分類（`api_error`）と無検知（`idle`）を再現
+## 2026-09-11（#1349: コピー行の「選択なしなら Ctrl+C 送信」を実態へ）
+- 隔離 GUI（tako-vd・pid 指定の CGEventPostToPid）で実測: 選択なし cmd+C は `sleep` を殺さず `^C` も出ず クリップボードも不変。同じ経路で撃った本物の Ctrl+C は殺した（= 観測に検出力あり）。選択あり cmd+C はコピーになる（回帰なし）
+- docs の行を「選択が無いときは何も起きない」へ直し、注記で「中断の Ctrl+C は tako が横取りしない」を明示。実装を docs へ寄せる案 (b) は挙動変更なので Issue へ比較を残して master 判断へ
+- 番犬 2 本（コピー行の説明文と `copy_selection` の両方向 / 素の ctrl-c 未バインド）を `docs_keyboard_shortcuts.rs` へ。注入 5 通りで file:line 名指し FAILED
 
 ## 2026-09-11（#1347: merge 後のリモートブランチ削除を merge-pr.sh 自身で閉じた）
 - 真因は gh の順序（ローカル切り替え → ローカル削除 → リモート削除）。専用 worktree から実行すると 1 手目が `fatal: 'main' is already used by worktree` で落ち**リモートまで到達しない**（`git switch main` 単体で逐語再現・PR #1337 で実発生・棚卸しで merge 済み PR の head が origin に 5 本残存）
 - `delete_remote_head_branch` を MERGED 確認の後に置いた（`gh api` で存在確認 → DELETE・冪等・**その PR の head 1 本だけ**・head == base と fork は触らない）。A/B `TAKO_1347_LEGACY=1` が gh 任せの腕で、モック 4 ケース（消し切る / legacy では残る / 冪等 / 門）を追加して 72 assert 緑
 - ドッグフーディングで PR #1348 を修正版の `merge-pr.sh` から merge: gh は同じ worktree 事故で 1 を返したが `リモートブランチ … を削除した` が出て `git ls-remote` は空。**GitHub は `.gitattributes` の `merge=union` を適用しない**（実測）ので progress 系を触る PR は CI 中の他 PR 追記だけで CONFLICTING になると分かった（#1246 の前提が GitHub 側では成立しない）
+
+## 2026-09-11（#632: 承認カード e2e 3 本は #1089 で修正済みと実測確定）
+- 現状 main で `screenshots-5b.spec.js` は 9/9 PASS・PWA e2e 全 6 spec も 50/50 PASS。`cf85756`（#1089 / PR #1100）が #632 の「対応案」（モックへ `permission_dialog` / assert を `/respond` + `choice`）を既に実装していた
+- A/B（`cf85756^` の spec を現行実装へ当てる）で `.approval-card` の 10 秒タイムアウト × 3 を再現 = 症状は実在。旧契約（`/input` へ `y`/`n`）の grep は 0 件、境界の選択肢 N=2 / N=1 も一時 spec で PASS
+- コード変更なし（install 不要）。実出力を付けて #632 を close し、真因（PWA e2e が CI で 1 度も走らず、実行手順が package.json / README のどこにも無い）を #1357 として起票した
