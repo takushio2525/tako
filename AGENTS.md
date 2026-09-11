@@ -132,6 +132,8 @@ tako/
 | build | `cargo build --workspace` |
 | lint | `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` |
 | test | `cargo test --workspace` |
+| **PR の CI 完了を待つ（判定はこの 1 実装。#1333）** | `scripts/wait-pr-checks.sh <PR>` |
+| **CI が緑で揃ってから PR を merge する（#1333）** | `scripts/merge-pr.sh <PR>` |
 | リリース経路のモックテスト（#256 / #965） | `bash scripts/test-release-retry.sh` |
 | **スマホからの master 起動の実経路テスト（#1078）** | `bash scripts/test-remote-master-launch.sh` |
 | リモート serve 自己検査のモックテスト（#1049） | `bash scripts/test-serve-watch.sh` |

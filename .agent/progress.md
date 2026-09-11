@@ -59,6 +59,10 @@
 - #1296 の射程は**置き場を決める側**だけで、テストが個別に `temp_dir().join(…)` で作る使い捨ては残っていた（実測: `cargo test -p tako-core --lib` で 14 件 / `-p tako-cli -p tako-control --lib` で 31 件）。`tako_core::test_residue` に `ScratchDir`（スコープで消える）と `process_scratch`（プロセス寿命）を 1 実装し、親を `<TMPDIR>/tako-test-scratch-<pid>` 1 つへ畳んで #1296 の 2 段構え（atexit + 次回起動の pid 回収 + `tako test-residue`）にそのまま乗せた
 - 実測（空 TMPDIR の前後）: tako-core `--lib` **14 → 0**・全 target **16 → 0**・tako-cli + tako-control `--lib` **31 → 7**（残 7 は `dispatch.rs` の `tako-mcp-test-*` = 別 worker が編集中で射程外・#1312 にコメント）。libtest が `process::exit` する失敗回でも 0、SIGKILL 相当の残骸は次回起動で掃かれ、生きている pid の置き場は残る
 - 番犬は動的 1 本（このテストバイナリを使い捨て TMPDIR で回して**実際に数える**。修正前の作り手で 15 件を名指し FAILED）+ 静的 8 本（修正前ソースで 4 本 FAILED）。A/B は `TAKO_1312_LEGACY=1`（器を作りっぱなしへ戻す = 19 件残る）
+## 2026-09-11（#1333: PR の「CI 3 本緑を待って merge」を共通の待ちスクリプトへ寄せた）
+- 「出ているチェックが全部非 pending = 完了」は push 直後に Cloudflare Pages しか登録されていない瞬間に通る（#1313 = PR #1328 が CI 完了前 merge・過去に #1253 / #1282）。判定を `scripts/wait-pr-checks.sh` の 1 実装へ寄せ、**期待名が全部そろって全部 completed** を **2 回連続**観測してから確定する形にした（期待名は `.github/workflows/*.yml` の pull_request job から導出・外部連携の Cloudflare Pages だけ定数）
+- merge は `scripts/merge-pr.sh`（揃わなければ merge しない / CONFLICTING・BEHIND は待たずに拒否）。モックテスト 14 ケース（偽 gh + 偽リポジトリ）は CI の macOS ジョブで走り、A/B `TAKO_1333_LEGACY=1` の腕が「1 本だけで完了」「揺れの 1 回目で確定」を再現して Test 13 / 14 が固定する
+- この PR 自身をこの経路で merge する（初回の実運用で CI 赤を 2 回検出して拒否 = #1313 の予算超過と #1343 のコンパイル破損）。**merge 直前に「緑を出した run の後に main が進んだか」を警告する**（PR の CI は merge 結果を検査するが merge base は run 開始時点で凍る = #1343 の事故クラス）
 
 ## 2026-09-11（#1318 #1321: README のリモート transport と `tako --help` の説明を実態へ）
 - README の日英を #1038 後の実態（Tailscale `serve` → ループバック TCP `127.0.0.1` のエフェメラルポート・LAN / 外部から到達不可）へ。事実に反する「TCP ポートを一切開きません」を削除し、`tako remote --help` の `Tailscale Serve + UDS` も同じ形へ
