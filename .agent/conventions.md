@@ -1371,6 +1371,16 @@ CI 完了前に merge され（merge 04:24:10 / Windows 完了 04:48:24）、過
 - 検証は `bash scripts/test-wait-pr-checks.sh`（偽 gh + 偽リポジトリ。**CI の macOS ジョブで
   毎 PR 走る**）。A/B は `TAKO_1333_LEGACY=1` = 修正前の判定をそのまま再現する腕で、
   Test 13 / 14 が「1 本だけで完了と返る」「揺れの 1 回目で確定する」を固定している
+- **緑を見た後に main が進んだら、取り込んで回し直す**。PR の CI が検査しているのは
+  ブランチ head ではなく **merge 結果**（`actions/checkout` の既定が `refs/pull/<PR>/merge`。
+  実測: PR #1337 の run が読んだ `progress.md` は 12442 bytes = ブランチ head の 11196 でも
+  main 単独でもない union マージ後の値）だが、**その merge base は run が始まった時点で凍る**。
+  別々に緑だった 2 本が組み合わさって壊れる事故はここを通り抜ける（#1343 = #1295 のテストに
+  #1297 が足した `input_style` が無く、main が `cargo check --all-targets` で落ちた）。
+  手順は `git fetch origin && git merge origin/main && git push` → CI を待ち直し。
+  `merge-pr.sh` は「緑を出した run の後に main の先頭が進んだ」ことを検出して**警告する**
+  （材料が取れなければ黙って通す = 助言であって門ではない。門にすると CI 18 分 <
+  main の更新間隔 20〜40 分で待ち直しが常態化するため、止めるかどうかは運用側で決める）
 
 ## 設定・データファイルのスキーマ変更（Issue #916）
 

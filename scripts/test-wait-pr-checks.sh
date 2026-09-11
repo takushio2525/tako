@@ -46,6 +46,36 @@ cat > "${TMP}/bin/gh" <<'GH_EOF'
 set -uo pipefail
 M="${TAKO_GH_MOCK_DIR}"
 echo "$*" >> "${M}/calls.log"
+
+# -q / --jq が付いていればその式を適用して返す（本物と同じ見え方にする）
+emit() {
+  local file="$1" q="" prev="" a
+  shift
+  for a in "$@"; do
+    if [[ "${prev}" == "-q" || "${prev}" == "--jq" ]]; then q="${a}"; fi
+    prev="${a}"
+  done
+  if [[ -n "${q}" ]]; then jq -r "${q}" "${file}"; else cat "${file}"; fi
+}
+
+# 鮮度チェック（merge 直前に main が進んでいないか）が使う口。
+# 応答ファイルを置かないテストでは失敗して返る = 助言を諦めて merge へ進む経路になる
+if [[ "$1" == "api" ]]; then
+  case "$2" in
+    */commits/*) f="${M}/api-commit.json" ;;
+    */compare/*) f="${M}/api-compare.json" ;;
+    *) f="" ;;
+  esac
+  [[ -n "${f}" && -f "${f}" ]] || { echo "mock: api の応答が無い: $2" >&2; exit 1; }
+  emit "${f}" "$@"
+  exit 0
+fi
+if [[ "$1 ${2:-}" == "run list" ]]; then
+  [[ -f "${M}/runlist.json" ]] || { echo "mock: run list の応答が無い" >&2; exit 1; }
+  emit "${M}/runlist.json" "$@"
+  exit 0
+fi
+
 case "$1 ${2:-}" in
   "pr checks")
     n=$(( $(cat "${M}/checks.count" 2>/dev/null || echo 0) + 1 ))
@@ -291,6 +321,7 @@ rc=$?
 assert_eq "緑で揃えば 0" "${rc}" "0"
 assert_eq "squash + ブランチ削除で merge する" "$(cat "${TAKO_GH_MOCK_DIR}/merged" 2>/dev/null)" "pr merge 1334 --squash --delete-branch"
 assert_has "merge 後に PR の状態を見て成否を決める" "PR #1334 は MERGED" "${out}"
+assert_hasnt "鮮度の情報が取れないときは黙って通す" "警告: CI が緑になった後に" "${out}"
 
 echo "== Test 9: CONFLICTING なら CI を待たずに merge しない =="
 new_case t9
@@ -363,6 +394,39 @@ out="$(TAKO_1333_LEGACY=1 run_wait 1328 --timeout 20 --interval 1)"
 rc=$?
 assert_eq "旧判定は揺れを見ずに 0 を返す" "${rc}" "0"
 assert_eq "旧判定は 1 回の観測で確定する" "$(calls_of 'pr checks')" "1"
+
+echo "== Test 15: 緑になった後に main が進んでいたら警告する（#1343 の事故クラス）=="
+new_case t15
+checks_json "${CF}|pass|2026-09-11T04:24:00Z" "${MAC}|pass|2026-09-11T04:36:50Z" "${WIN}|pass|2026-09-11T04:39:33Z" \
+  > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+cat > "${TAKO_GH_MOCK_DIR}/view.json" <<'JSON'
+{"number":1334,"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN",
+ "headRefName":"improve/1333-wait-pr-checks","headRefOid":"deadbeef","baseRefName":"main",
+ "title":"[改善] テスト用","url":"https://example.invalid/pr/1334"}
+JSON
+echo '[{"headSha":"deadbeef","createdAt":"2026-09-11T04:20:00Z"}]' > "${TAKO_GH_MOCK_DIR}/runlist.json"
+echo '{"commit":{"committer":{"date":"2026-09-11T05:00:00Z"}}}' > "${TAKO_GH_MOCK_DIR}/api-commit.json"
+echo '{"behind_by":2}' > "${TAKO_GH_MOCK_DIR}/api-compare.json"
+out="$(run_merge 1334 --timeout 20 --interval 1)"
+rc=$?
+assert_eq "警告は出しても merge は止めない" "${rc}" "0"
+assert_has "run の後に main が進んだことを名指しする" "警告: CI が緑になった後に main が進んでいる（未取り込み 2 本" "${out}"
+assert_has "取り込み方を案内する" "git merge origin/main" "${out}"
+
+new_case t15b
+checks_json "${CF}|pass|2026-09-11T04:24:00Z" "${MAC}|pass|2026-09-11T04:36:50Z" "${WIN}|pass|2026-09-11T04:39:33Z" \
+  > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+cat > "${TAKO_GH_MOCK_DIR}/view.json" <<'JSON'
+{"number":1334,"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN",
+ "headRefName":"improve/1333-wait-pr-checks","headRefOid":"deadbeef","baseRefName":"main",
+ "title":"[改善] テスト用","url":"https://example.invalid/pr/1334"}
+JSON
+echo '[{"headSha":"deadbeef","createdAt":"2026-09-11T06:00:00Z"}]' > "${TAKO_GH_MOCK_DIR}/runlist.json"
+echo '{"commit":{"committer":{"date":"2026-09-11T05:00:00Z"}}}' > "${TAKO_GH_MOCK_DIR}/api-commit.json"
+echo '{"behind_by":2}' > "${TAKO_GH_MOCK_DIR}/api-compare.json"
+out="$(run_merge 1334 --timeout 20 --interval 1)"
+assert_eq "run より古い main の先頭では警告しない（run の merge 結果に入っている）" "$?" "0"
+assert_hasnt "余計な警告を出さない" "警告: CI が緑になった後に" "${out}"
 
 echo
 echo "=== 結果: PASS=${PASS} FAIL=${FAIL} ==="

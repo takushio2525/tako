@@ -6,6 +6,11 @@
 # 判定は scripts/wait-pr-checks.sh の 1 実装（期待するチェックが全部そろって全部完了 +
 # 同じ結論を 2 回連続で観測）に任せ、ここは merge してよい状態かだけを見る。
 #
+# PR の CI は **merge 結果**（`refs/pull/<PR>/merge`）を検査するが、その **merge base は
+# run が始まった時点で凍る**。別々に緑だった 2 本が組み合わさって壊れる事故（#1343 =
+# #1295 のテストに #1297 が足したフィールドが無い）はここを通り抜けるので、
+# merge の直前に「緑を出した run の後に main が進んでいないか」を見て警告する。
+#
 # 使い方: bash scripts/merge-pr.sh <PR番号> [--timeout <秒>] [--interval <秒>]
 # 終了コード: 0 = merge した / 1 = merge しなかった（CI 失敗・コンフリクト等）/
 #             2 = CI が揃わずタイムアウト / 3 = 引数・gh のエラー
@@ -61,7 +66,7 @@ fetch_pr() {
   local err rc
   err="$(mktemp)"
   set +e
-  PR_JSON="$(gh pr view "${PR}" --json number,state,isDraft,mergeable,mergeStateStatus,headRefName,title,url 2>"${err}")"
+  PR_JSON="$(gh pr view "${PR}" --json number,state,isDraft,mergeable,mergeStateStatus,headRefName,headRefOid,baseRefName,title,url 2>"${err}")"
   rc=$?
   set -e
   if [[ ${rc} -ne 0 || -z "${PR_JSON}" ]]; then
@@ -120,6 +125,31 @@ gate_state() {
   esac
 }
 
+# 緑を出した CI run の**後に** main が進んでいたら警告する。
+# PR の CI は merge 結果を検査するが merge base は run 実行時点で凍るので、
+# その後に main へ入った変更との組み合わせは**誰も検査していない**（#1343）。
+# これは助言であり merge は止めない（判定に使う情報が取れなくても黙って通す）。
+warn_if_base_moved() {
+  local base head run_created base_tip_date behind
+  base="$(pr_field baseRefName)"
+  head="$(pr_field headRefOid)"
+  [[ -n "${base}" && -n "${head}" ]] || return 0
+  # 緑を出した run（= PR head に対する最新の run）の開始時刻
+  run_created="$(gh run list --branch "$(pr_field headRefName)" --limit 20 \
+    --json headSha,createdAt -q "[.[] | select(.headSha == \"${head}\")] | max_by(.createdAt) | .createdAt" 2>/dev/null || true)"
+  base_tip_date="$(gh api "repos/{owner}/{repo}/commits/${base}" -q .commit.committer.date 2>/dev/null || true)"
+  behind="$(gh api "repos/{owner}/{repo}/compare/${base}...${head}" -q .behind_by 2>/dev/null || true)"
+  [[ -n "${run_created}" && "${run_created}" != "null" ]] || return 0
+  [[ -n "${base_tip_date}" && "${base_tip_date}" != "null" ]] || return 0
+  [[ "${behind}" =~ ^[0-9]+$ ]] || return 0
+  [[ ${behind} -gt 0 ]] || return 0
+  # ISO 8601 の UTC 同士なので文字列比較でよい
+  [[ "${base_tip_date}" > "${run_created}" ]] || return 0
+  echo "警告: CI が緑になった後に ${base} が進んでいる（未取り込み ${behind} 本 / run ${run_created} < ${base} の先頭 ${base_tip_date}）" >&2
+  echo "  その組み合わせは誰も検査していない（#1343 の事故クラス）。取り込んで回し直すなら:" >&2
+  echo "    git fetch origin && git merge origin/${base} && git push" >&2
+}
+
 fetch_pr
 echo "PR #${PR}: $(pr_field title)"
 echo "  ブランチ $(pr_field headRefName) / $(pr_field url)"
@@ -138,6 +168,7 @@ echo
 # 待っている間に main が進む・衝突が生まれることがあるので、merge の直前にもう一度見る
 fetch_pr
 gate_state "merge 直前"
+warn_if_base_moved
 
 echo "squash merge する（--delete-branch）"
 set +e
