@@ -60,10 +60,6 @@
 - #982 で `AgentSupport` が `Platform` の doc の上へ挿し込まれ 3 行すべてが agent-support の説明になっていたのを分離。`platform` は `PlatformArgs` の「参照引数」露出をやめて自前の doc を持つ（`--help` 実出力で確認）
 - 挙動は不変（doc コメント / README のみ）。`remote.rs:45` / `:1473` の同じ #1038 前の記述は #1332 へ切り出した
 
-## 2026-09-11（#1347: merge 後のリモートブランチ削除を merge-pr.sh 自身で閉じた）
-- 真因は gh の順序（ローカル切り替え → ローカル削除 → リモート削除）。worktree から実行すると 1 手目が `fatal: 'main' is already used by worktree` で落ち**リモートまで到達しない**（`git switch main` 単体で逐語再現・PR #1337 で実発生・棚卸しで merge 済み PR の head が origin に 5 本残存）
-- `delete_remote_head_branch` を MERGED 確認の後に置いた（`gh api` で存在確認 → DELETE。冪等・**その PR の head 1 本だけ**・head == base と fork の PR は触らない）。A/B `TAKO_1347_LEGACY=1` が gh 任せの腕
-- モック 4 ケース追加（worktree 事故で消し切る / legacy では残る = 検出力 / 既に消えていれば DELETE を呼ばない / head == base と fork で触らない）。72 assert 緑。この PR 自身を修正版で merge してドッグフーディング
 ## 2026-09-11（#1332: remote.rs の doc が #1038 前の保証を語っていたのを実態へ）
 - モジュール doc（`remote.rs:44`）と `run_daemon` doc が「UDS のみで listen・TCP ポートを一切開かない・別 OS ユーザーは接続自体が不能」のままで、同ファイルの実装（`:135-147`）と `threat-model-remote.md` と逆を向いていた。既定 = ループバック TCP / UDS は `TAKO_REMOTE_ENDPOINT=unix` の opt-in / 失われた保証と緩和は threat-model へ誘導、の形へ
 - 横断 grep（`TCP ポートを一切` / `接続自体が不能` / `UDS + Tailscale` / `UDS 専用`）で同じ誤りが 3 か所残っていた: `protocol.rs:1137` の `RemoteStart` doc・MCP カタログ `tako_remote_start` の説明文（+ スナップショット）・`admin_request` の「UDS 専用」（実装は `local_endpoint` 経由で両対応）
