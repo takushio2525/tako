@@ -1142,8 +1142,7 @@ impl TerminalSession {
     /// （`n >= rows` なら全体。テスト `tail_lines_は_visible_lines_の末尾と一致する`）。
     /// 色・選択・カーソルはテキストを変えないので、装飾を解決せずに済む
     pub fn tail_lines(&self, n: usize) -> Vec<String> {
-        use alacritty_terminal::index::{Column, Line};
-        use alacritty_terminal::term::cell::Flags;
+        use alacritty_terminal::index::Line;
 
         let term = self.term.lock();
         let rows = term.screen_lines();
@@ -1158,36 +1157,95 @@ impl TerminalSession {
         let first = rows as i32 - grid.display_offset() as i32 - take as i32;
         let mut out = Vec::with_capacity(take);
         for i in 0..take as i32 {
-            let row = &grid[Line(first + i)];
-            // #816 と同じ作法: 行の大半は末尾の未使用セル（空白）で `trim_end` で必ず落ちる。
-            // 先に後ろから境界を探し、そこまでしか組み立てない
-            // 全角の後続セル（スペーサー）と `\0` は `compose_line` が落とすので同じく落とす
-            let dropped = |cell: &alacritty_terminal::term::cell::Cell| {
-                cell.flags
-                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-                    || cell.c == '\0'
-            };
-            let mut end = cols;
-            while end > 0 {
-                let cell = &row[Column(end - 1)];
-                if !dropped(cell) && cell.c != ' ' {
-                    break;
-                }
-                end -= 1;
-            }
-            let mut text = String::with_capacity(end);
-            for col in 0..end {
-                let cell = &row[Column(col)];
-                if dropped(cell) {
-                    continue;
-                }
-                text.push(cell.c);
-            }
-            // 空白以外の末尾空白類（全角空白等）は `visible_lines` と同じく `trim_end` に任せる
-            text.truncate(text.trim_end().len());
-            out.push(text);
+            out.push(Self::compose_grid_row(&grid[Line(first + i)], cols));
         }
         out
+    }
+
+    /// グリッドの 1 行を平文へ組む（[`Self::tail_lines`] と
+    /// [`Self::visible_lines_filled`] の共有部分）。
+    ///
+    /// 返す文字列は [`Self::visible_lines`]（= `screen::compose_line` + `trim_end`）と
+    /// **1 バイトも変わらない**（テスト `tail_lines_は_visible_lines_の末尾と一致する` /
+    /// `visible_lines_filled_は折り返しを右端で見分ける`）
+    fn compose_grid_row(
+        row: &alacritty_terminal::grid::Row<alacritty_terminal::term::cell::Cell>,
+        cols: usize,
+    ) -> String {
+        use alacritty_terminal::index::Column;
+        use alacritty_terminal::term::cell::Flags;
+
+        // #816 と同じ作法: 行の大半は末尾の未使用セル（空白）で `trim_end` で必ず落ちる。
+        // 先に後ろから境界を探し、そこまでしか組み立てない
+        // 全角の後続セル（スペーサー）と `\0` は `compose_line` が落とすので同じく落とす
+        let dropped = |cell: &alacritty_terminal::term::cell::Cell| {
+            cell.flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                || cell.c == '\0'
+        };
+        let mut end = cols;
+        while end > 0 {
+            let cell = &row[Column(end - 1)];
+            if !dropped(cell) && cell.c != ' ' {
+                break;
+            }
+            end -= 1;
+        }
+        let mut text = String::with_capacity(end);
+        for col in 0..end {
+            let cell = &row[Column(col)];
+            if dropped(cell) {
+                continue;
+            }
+            text.push(cell.c);
+        }
+        // 空白以外の末尾空白類（全角空白等）は `visible_lines` と同じく `trim_end` に任せる
+        text.truncate(text.trim_end().len());
+        text
+    }
+
+    /// 表示行と「その行が**右端まで埋まっているか**」を返す（#651）。
+    ///
+    /// 本文は [`Self::visible_lines`] と 1 バイトも変わらない。増えるのは 2 つ目の値で、
+    /// **真なら次の行がこの行の折り返しの続きでありうる**ことを意味する
+    /// （読む側は `tako_control::dispatch::find_exit_marker`）。
+    ///
+    /// # なぜ「埋まっているか」をグリッドから採るのか
+    ///
+    /// 画面テキストの**文字数**で代用すると、行に全角文字が 1 つあるだけで
+    /// 「埋まっていない」と読む（`chars().count() < cols`）。終了マーカーの手前に全角の
+    /// プロンプトが載る形（#325 の `続行しますか? (y/n): __TAKO_EXIT=1`）は実在するので、
+    /// 判定は文字数ではなく**列**で持つ必要がある。alacritty の
+    /// [`LineLength`](alacritty_terminal::term::cell::LineLength) は `WRAPLINE`
+    /// （端末自身が折り返した印）が立っていれば全幅を返し、立っていなければ占有列数を返すので、
+    ///
+    /// - 直接 PTY のペイン: 折り返すのは alacritty 自身なので `WRAPLINE` が立つ
+    /// - 器（tmux / psmux）のペイン: 折り返しは**器の中**で起きて、外側へは再描画として
+    ///   届くので `WRAPLINE` が立つ保証が無い。占有列数が幅と一致することで拾う
+    ///   （実測: 10 桁の tmux バックエンドのペインで割れたマーカーを拾えている）
+    ///
+    /// の両方を 1 つの物差しで見られる。**空白詰めの行を soft wrap 扱いにしてはいけない**
+    /// （#1182 の実害: `Screen` の `cell_cols.last()` は空白詰めのせいで常に最終列を指すので、
+    /// 画面全体が 1 本に連結された）ので、`Screen` 経由では判定しない
+    pub fn visible_lines_filled(&self) -> Vec<(String, bool)> {
+        use alacritty_terminal::index::Line;
+        use alacritty_terminal::term::cell::LineLength;
+
+        let term = self.term.lock();
+        let rows = term.screen_lines();
+        let grid = term.grid();
+        let cols = grid.columns();
+        // display_offset d のビューポートは grid の Line(-d ..= rows-d-1)（`screen.rs` と同じ）
+        let first = -(grid.display_offset() as i32);
+        (0..rows as i32)
+            .map(|i| {
+                let row = &grid[Line(first + i)];
+                (
+                    Self::compose_grid_row(row, cols),
+                    row.line_length().0 >= cols,
+                )
+            })
+            .collect()
     }
 
     /// Claude TUI のフッターからエージェントメトリクスを抽出する。
@@ -2459,6 +2517,91 @@ mod tests {
             empty.visible_lines(),
             "空ペインで末尾窓が全画面と一致しない"
         );
+    }
+
+    /// `visible_lines_filled()` が「折り返しの続きがありうる行」を**列**で見分けること（#651）。
+    ///
+    /// 実 PTY を狭い幅（10 桁）で張って、終了マーカー `__TAKO_EXIT=0`（13 文字）が
+    /// 実際に割れる形を採る。ここで得た対が `tako_control::dispatch` 側の fixture
+    /// （`exit_markerは折り返して割れていても拾える`）の実在の根拠になる
+    #[cfg(unix)]
+    #[test]
+    fn visible_lines_filled_は折り返しを右端で見分ける() {
+        use std::time::{Duration, Instant};
+
+        // 10 桁。`__TAKO_EXIT=0` は 13 文字なので必ず 2 行に割れる
+        let script = "printf '__TAKO_EXIT=0\\n'; sleep 30";
+        let (session, _rx) = TerminalSession::spawn(
+            10,
+            6,
+            SpawnOptions {
+                command: Some(SpawnCommand {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), script.to_string()],
+                }),
+                ..SpawnOptions::default()
+            },
+        )
+        .expect("PTY を張れる");
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !session.visible_lines().iter().any(|l| l == "T=0") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let got = session.visible_lines_filled();
+        // 本文は `visible_lines()` と 1 バイトも変わらない
+        assert_eq!(
+            got.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>(),
+            session.visible_lines(),
+            "本文が visible_lines と一致しない: {got:?}"
+        );
+        let at = got
+            .iter()
+            .position(|(t, _)| t == "__TAKO_EXI")
+            .unwrap_or_else(|| panic!("割れたマーカーが出ていない: {got:?}"));
+        assert!(
+            got[at].1,
+            "右端まで埋まった行を「埋まっていない」と読んだ: {got:?}"
+        );
+        assert_eq!(got[at + 1].0, "T=0", "続きの行が違う: {got:?}");
+        assert!(
+            !got[at + 1].1,
+            "10 桁に届かない行を「埋まっている」と読んだ: {got:?}"
+        );
+
+        // 全角で右端まで埋まった行（`あいうえお` = 5 文字 / 10 列）。**文字数で測ると
+        // 「埋まっていない」と読む**ので、#325 の形（全角プロンプト + マーカー）が
+        // 折り返したときに拾えなくなる
+        let wide = "printf 'あいうえお__TAKO_EXIT=1\\n'; sleep 30";
+        let (session2, _rx2) = TerminalSession::spawn(
+            10,
+            6,
+            SpawnOptions {
+                command: Some(SpawnCommand {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), wide.to_string()],
+                }),
+                ..SpawnOptions::default()
+            },
+        )
+        .expect("PTY を張れる");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !session2.visible_lines().iter().any(|l| l == "T=1") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let got2 = session2.visible_lines_filled();
+        let at = got2
+            .iter()
+            .position(|(t, _)| t == "あいうえお")
+            .unwrap_or_else(|| panic!("全角行が出ていない: {got2:?}"));
+        assert_eq!(got2[at].0.chars().count(), 5, "全角行の文字数");
+        assert!(
+            got2[at].1,
+            "全角で埋まった行を文字数で測って「埋まっていない」と読んだ: {got2:?}"
+        );
+        assert_eq!(got2[at + 1].0, "__TAKO_EXI", "続きの行が違う: {got2:?}");
+        assert!(got2[at + 1].1, "続きの行も右端まで埋まっている: {got2:?}");
+        assert_eq!(got2[at + 2].0, "T=1", "続きの行が違う: {got2:?}");
     }
 
     /// スクロール中（`display_offset > 0`）でも `tail_lines` は**いま見えている**

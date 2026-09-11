@@ -4946,13 +4946,14 @@ fn dispatch_inner(
         Request::RunInteractiveStatus { pane, no_wait: _ } => {
             let (tab_id, target) = resolve_pane(host.workspace(), Some(pane))?;
 
-            // ペインの画面からマーカーを探す
-            let lines = host
+            // ペインの画面からマーカーを探す。行が**右端まで埋まっているか**まで採るのは、
+            // 幅が 13 桁（`__TAKO_EXIT=0`）未満のペインでは端末がマーカーを割るため（#651）
+            let rows = host
                 .session(target)
-                .map(|s| s.visible_lines())
+                .map(|s| s.visible_lines_filled())
                 .unwrap_or_default();
 
-            let exit_code = find_exit_marker(&lines);
+            let exit_code = find_exit_marker(&rows);
 
             let meta = host
                 .workspace()
@@ -6524,15 +6525,163 @@ fn send_is_enter_only(text: &str, newline: bool) -> bool {
 /// `Write-Host ('<prefix>' + $__tako_code)` と書き方が違うが、**出る行は同じ形**（#875）
 const EXIT_MARKER_PREFIX: &str = "__TAKO_EXIT=";
 
-/// `__TAKO_EXIT=<code>` マーカーを画面行から検索する。
-/// 行頭以外の位置（read プロンプトと同一行等）にも対応する（#325）
-fn find_exit_marker(lines: &[String]) -> Option<i32> {
-    lines.iter().rev().find_map(|line| {
-        line.find(EXIT_MARKER_PREFIX).and_then(|pos| {
-            let after = &line[pos + EXIT_MARKER_PREFIX.len()..];
-            after.trim().parse::<i32>().ok()
-        })
+/// #651 の A/B（`TAKO_651_LEGACY=1`）。**同一バイナリのまま**「物理行 1 本の中だけを探す」
+/// #651 前の判定へ戻す = 幅が 13 桁未満のペインで `--wait` が永久待機する
+pub fn legacy_651() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_651_LEGACY").is_some())
+}
+
+/// `__TAKO_EXIT=<code>` マーカーを画面行から検索する。**読む側はこの 1 実装だけ**で、
+/// `tako run --wait` / `tako run-interactive --wait`（CLI）と `tako_run_interactive_status`
+/// （MCP）が同じものを見る。
+///
+/// 入力は画面行と「その行が右端まで埋まっているか」の対
+/// （[`TerminalSession::visible_lines_filled`](tako_core::TerminalSession::visible_lines_filled)）。
+///
+/// - 行頭以外の位置（read プロンプトと同一行等）にも対応する（#325）
+/// - **折り返して物理行が割れていても拾う**（#651）。マーカーは最短でも 13 文字
+///   （`__TAKO_EXIT=0`）あるので、それより狭いペインでは端末が必ず割る
+pub fn find_exit_marker(rows: &[(String, bool)]) -> Option<i32> {
+    find_exit_marker_in(rows, legacy_651())
+}
+
+/// [`find_exit_marker`] の本体（`legacy` を引数で受ける版。A/B とテスト用）
+pub fn find_exit_marker_in(rows: &[(String, bool)], legacy: bool) -> Option<i32> {
+    let allow_wrap = !legacy;
+    (0..rows.len()).rev().find_map(|li| {
+        exit_marker_starts(&rows[li].0, allow_wrap)
+            .into_iter()
+            .find_map(|off| read_exit_marker(rows, li, off, allow_wrap))
     })
+}
+
+/// 行の中で「マーカーの先頭が始まりうる」位置を左から並べる。
+///
+/// 折り返しを許すときは「**行末が接頭辞の途中で切れている**」位置も候補にする
+/// （幅 10 桁の実採取: `__TAKO_EXI` / `T=0`）。許さないとき（legacy）は #651 前と同じ
+/// 「最初に見つかった 1 か所」だけを返す
+fn exit_marker_starts(line: &str, allow_wrap: bool) -> Vec<usize> {
+    let Some(first) = line.find(EXIT_MARKER_PREFIX) else {
+        if !allow_wrap {
+            return Vec::new();
+        }
+        return exit_marker_partial_tail(line).into_iter().collect();
+    };
+    if !allow_wrap {
+        return vec![first];
+    }
+    // 同じ行にマーカーが 2 つ以上あるとき、#651 前は最初の 1 つで諦めていた
+    // （`__TAKO_EXIT=1 x __TAKO_EXIT=2` は後ろが読めるのに None）。左から順に試す
+    let mut out = Vec::new();
+    let mut search = first;
+    while let Some(rel) = line[search..].find(EXIT_MARKER_PREFIX) {
+        out.push(search + rel);
+        search += rel + 1;
+    }
+    out.extend(exit_marker_partial_tail(line));
+    out
+}
+
+/// 行末が接頭辞の**真の途中**で切れている位置（`...__TAKO_EXI` の `_` の位置）。
+/// 接頭辞が丸ごと入っている行は [`exit_marker_starts`] の前半が拾うので対象外
+fn exit_marker_partial_tail(line: &str) -> Option<usize> {
+    // 長い一致から見る（`_` 1 文字より `__TAKO_EXI` を優先する）
+    (1..EXIT_MARKER_PREFIX.len())
+        .rev()
+        .find(|take| line.ends_with(&EXIT_MARKER_PREFIX[..*take]))
+        .map(|take| line.len() - take)
+}
+
+/// 行 `li` の行末から次の行の行頭へまたげるか（#651）。
+///
+/// またげるのは「`li` が**右端まで埋まっている**」「次の行が在る」「次の行が**空でない**」
+/// の 3 つが揃うときだけ。空行を飛ばさないのは、折り返しの続きが空行になることは
+/// 定義上あり得ないため（飛ばすと無関係な行を繋いでしまう）
+fn wrap_to_next(rows: &[(String, bool)], li: usize) -> Option<usize> {
+    if !rows[li].1 {
+        return None;
+    }
+    let next = li + 1;
+    if rows.get(next)?.0.is_empty() {
+        return None;
+    }
+    Some(next)
+}
+
+/// `rows[li]` の `off` から `__TAKO_EXIT=<code>` を読む。接頭辞の途中でも行境界をまたぐ
+/// （幅 6 桁の実採取: `__TAKO` / `_EXIT=` / `0` の 3 行割れ）
+fn read_exit_marker(
+    rows: &[(String, bool)],
+    li: usize,
+    off: usize,
+    allow_wrap: bool,
+) -> Option<i32> {
+    let want = EXIT_MARKER_PREFIX.as_bytes();
+    let mut li = li;
+    let mut off = off;
+    let mut eaten = 0usize;
+    while eaten < want.len() {
+        let line = rows[li].0.as_bytes();
+        // マーカーは ASCII なのでバイトで突き合わせられる（`off` は常に文字境界）
+        let take = (want.len() - eaten).min(line.len().saturating_sub(off));
+        if take == 0 || line[off..off + take] != want[eaten..eaten + take] {
+            return None;
+        }
+        eaten += take;
+        off += take;
+        if eaten < want.len() {
+            if !allow_wrap {
+                return None;
+            }
+            li = wrap_to_next(rows, li)?;
+            off = 0;
+        }
+    }
+    read_exit_code(rows, li, off, String::new(), allow_wrap)
+}
+
+/// 終了コードの数字を読む。
+///
+/// 数字が行末まで続いていてその行が折り返しているなら、**次の行へ続けて読んだ解釈を
+/// 優先する**（`__TAKO_EXIT=1` + `27` = 127）。続けた側が数として成立しないなら
+/// またがない解釈へ落ちる（幅 13 桁でちょうど埋まった `__TAKO_EXIT=0` の次行に
+/// `5 files changed` が来ても 0 を返す）。
+///
+/// 数字のあとは**行の残りが空白だけ**であることを要求する（#651 前と同じ契約。
+/// ConPTY が行を幅まで空白で埋めて返す形 = #875 を通すため `trim` で見る）
+fn read_exit_code(
+    rows: &[(String, bool)],
+    li: usize,
+    off: usize,
+    acc: String,
+    allow_wrap: bool,
+) -> Option<i32> {
+    let line = rows[li].0.as_str();
+    let rest = line.get(off..)?;
+    let mut digits = String::new();
+    for ch in rest.chars() {
+        // 符号は先頭の 1 文字だけ（PowerShell のネイティブ exe は負値を返しうる = #875）
+        let sign = ch == '-' && acc.is_empty() && digits.is_empty();
+        if ch.is_ascii_digit() || sign {
+            digits.push(ch);
+        } else {
+            break;
+        }
+    }
+    let end = off + digits.len();
+    let acc = format!("{acc}{digits}");
+    if allow_wrap && end == line.len() {
+        if let Some(next) = wrap_to_next(rows, li) {
+            if let Some(code) = read_exit_code(rows, next, 0, acc.clone(), allow_wrap) {
+                return Some(code);
+            }
+        }
+    }
+    if acc.is_empty() || !line[end..].trim().is_empty() {
+        return None;
+    }
+    acc.parse::<i32>().ok()
 }
 
 /// キーボード入力の意味論での改行正規化（Issue #95）: 端末の Enter キーは CR であり、
@@ -22712,21 +22861,37 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// 折り返しの無い画面（どの行も右端まで届いていない）
+    fn rows(lines: &[&str]) -> Vec<(String, bool)> {
+        lines.iter().map(|l| ((*l).to_string(), false)).collect()
+    }
+
+    /// **幅 `cols` 桁の画面**として組む（#651）。`cols` 桁ちょうどまで埋まった行は
+    /// 「右端まで埋まっている」= 次の行が折り返しの続きでありうる、という
+    /// 実画面（`visible_lines_filled`）と同じ形になる。
+    /// fixture は ASCII なので、桁数 = 文字数
+    fn rows_at(cols: usize, lines: &[&str]) -> Vec<(String, bool)> {
+        lines
+            .iter()
+            .map(|l| ((*l).to_string(), l.chars().count() >= cols))
+            .collect()
+    }
+
     #[test]
     fn exit_markerは行頭でも途中でも検知できる() {
-        assert_eq!(find_exit_marker(&["__TAKO_EXIT=0".into()]), Some(0));
+        assert_eq!(find_exit_marker(&rows(&["__TAKO_EXIT=0"])), Some(0));
         assert_eq!(
-            find_exit_marker(&["続行しますか? (y/n): __TAKO_EXIT=1".into()]),
+            find_exit_marker(&rows(&["続行しますか? (y/n): __TAKO_EXIT=1"])),
             Some(1)
         );
-        assert_eq!(find_exit_marker(&["  __TAKO_EXIT=42  ".into()]), Some(42));
-        assert_eq!(find_exit_marker(&["just some output".into()]), None);
+        assert_eq!(find_exit_marker(&rows(&["  __TAKO_EXIT=42  "])), Some(42));
+        assert_eq!(find_exit_marker(&rows(&["just some output"])), None);
         assert_eq!(
-            find_exit_marker(&[
-                "__TAKO_EXIT=0".into(),
-                "some output".into(),
-                "prompt: __TAKO_EXIT=2".into(),
-            ]),
+            find_exit_marker(&rows(&[
+                "__TAKO_EXIT=0",
+                "some output",
+                "prompt: __TAKO_EXIT=2",
+            ])),
             Some(2),
         );
     }
@@ -22737,18 +22902,119 @@ mod tests {
         // **画面に出る行は同じ**であることを、両方言の実出力の形で固定する（#875）。
         //
         // POSIX: `echo "__TAKO_EXIT=$?"` → 行末に余分な空白は無い
-        assert_eq!(find_exit_marker(&["__TAKO_EXIT=7".into()]), Some(7));
+        assert_eq!(find_exit_marker(&rows(&["__TAKO_EXIT=7"])), Some(7));
         // PowerShell: `Write-Host ('__TAKO_EXIT=' + $__tako_code)`。
         // ConPTY は行を端末幅まで空白で埋めて返すことがあるので、右の空白を許す
         assert_eq!(
-            find_exit_marker(&["__TAKO_EXIT=7                    ".into()]),
+            find_exit_marker(&rows(&["__TAKO_EXIT=7                    "])),
             Some(7)
         );
         // PowerShell の `$LASTEXITCODE` は cmdlet 失敗時に 1 を返す設計（負値は来ない）が、
         // ネイティブ exe は負値を返しうる（`exit -1` → 4294967295 ではなく -1 で表示される）
-        assert_eq!(find_exit_marker(&["__TAKO_EXIT=-1".into()]), Some(-1));
+        assert_eq!(find_exit_marker(&rows(&["__TAKO_EXIT=-1"])), Some(-1));
         // どちらの方言でも「マーカーの後ろに数字以外」は採らない
-        assert_eq!(find_exit_marker(&["__TAKO_EXIT=$__tako_code".into()]), None);
+        assert_eq!(find_exit_marker(&rows(&["__TAKO_EXIT=$__tako_code"])), None);
+    }
+
+    #[test]
+    fn exit_markerは折り返して割れていても拾える() {
+        // 実採取（隔離 GUI・幅は `tako list` の cols 実測値。#651 の再現）
+        //
+        // 幅 10 桁: `__TAKO_EXI` / `T=0`（接頭辞の途中で割れる）
+        assert_eq!(
+            find_exit_marker(&rows_at(10, &["hello-651-", "wait", "__TAKO_EXI", "T=0"])),
+            Some(0)
+        );
+        // 幅 7 桁
+        assert_eq!(
+            find_exit_marker(&rows_at(7, &["hello-6", "51-w10", "__TAKO_", "EXIT=0"])),
+            Some(0)
+        );
+        // 幅 6 桁（Issue 本文の Windows 実測）= 3 行に割れる
+        assert_eq!(
+            find_exit_marker(&rows_at(6, &["hello-", "937", "__TAKO", "_EXIT=", "0"])),
+            Some(0)
+        );
+        // 接頭辞は入りきって**数字だけ**が割れる形（幅 13 桁 + 3 桁コード）
+        assert_eq!(
+            find_exit_marker(&rows_at(13, &["__TAKO_EXIT=1", "27"])),
+            Some(127)
+        );
+        // 符号の直後で割れても読む
+        assert_eq!(
+            find_exit_marker(&rows_at(13, &["__TAKO_EXIT=-", "1"])),
+            Some(-1)
+        );
+        // 幅がマーカーちょうど（13 桁）なら割れない = 従来どおり
+        assert_eq!(find_exit_marker(&rows_at(13, &["__TAKO_EXIT=0"])), Some(0));
+    }
+
+    #[test]
+    fn 折り返しの連結は無関係な行を繋がない() {
+        // 右端までちょうど埋まったマーカー行の次に別の出力が来る形。繋いだ側は
+        // 数として成立しない（`05 files changed`）ので**繋がない解釈**を採る
+        assert_eq!(
+            find_exit_marker(&rows_at(13, &["__TAKO_EXIT=0", "5 files changed"])),
+            Some(0)
+        );
+        // 右端まで埋まっていない行は繋がない（画面にソースが写っている形）
+        assert_eq!(
+            find_exit_marker(&rows_at(40, &["echo \"__TAKO_EXIT=", "0\""])),
+            None
+        );
+        // 空行は折り返しの続きになりえない（飛ばして繋がない）
+        assert_eq!(
+            find_exit_marker(&rows_at(10, &["__TAKO_EXI", "", "T=0"])),
+            None
+        );
+        // 画面の末尾で切れている（続きが無い）
+        assert_eq!(find_exit_marker(&rows_at(10, &["__TAKO_EXI"])), None);
+        // 接頭辞の途中までしか一致しない行の続き（`T=` の後ろが数字でない）
+        assert_eq!(find_exit_marker(&rows_at(10, &["__TAKO_EXI", "T=x"])), None);
+    }
+
+    #[test]
+    fn exit_markerは画面のいちばん新しいものを採る() {
+        // 分割で幅が変わると「古い完全なマーカー + 新しい割れたマーカー」が同じ画面に並ぶ。
+        // 物理行を先に走査して打ち切ると**古い方**（0）を返してしまう
+        let screen = rows_at(13, &["__TAKO_EXIT=0", "", "__TAKO_EXIT=1", "27"]);
+        assert_eq!(find_exit_marker(&screen), Some(127));
+        // 同じ行に 2 つあるときは後ろ（#651 前は最初の 1 つで諦めて None だった）
+        assert_eq!(
+            find_exit_marker(&rows(&["__TAKO_EXIT=1 x __TAKO_EXIT=2"])),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn i651_注入_物理行だけを見る実装は折り返した画面で外れる() {
+        // #651 前の判定（行 1 本の中だけを探す）を legacy 引数で再現し、**それが外れる**ことを
+        // 同じ fixture で示す（env 版の A/B は `tests/issue651_legacy_ab.rs`）
+        let wrapped = rows_at(10, &["hello-651-", "wait", "__TAKO_EXI", "T=0"]);
+        assert_eq!(
+            find_exit_marker_in(&wrapped, true),
+            None,
+            "legacy が折り返した画面を拾えてしまうなら A/B が成立していない"
+        );
+        assert_eq!(find_exit_marker_in(&wrapped, false), Some(0));
+
+        // 折り返しの無い画面では legacy と既定が **1 ビットも変わらない**
+        for lines in [
+            vec!["__TAKO_EXIT=0"],
+            vec!["続行しますか? (y/n): __TAKO_EXIT=1"],
+            vec!["__TAKO_EXIT=7                    "],
+            vec!["__TAKO_EXIT=-1"],
+            vec!["__TAKO_EXIT=$__tako_code"],
+            vec!["just some output"],
+            vec!["__TAKO_EXIT=0", "some output", "prompt: __TAKO_EXIT=2"],
+        ] {
+            let screen = rows(&lines);
+            assert_eq!(
+                find_exit_marker_in(&screen, true),
+                find_exit_marker_in(&screen, false),
+                "折り返しの無い画面で判定が変わった: {lines:?}"
+            );
+        }
     }
 
     #[test]
