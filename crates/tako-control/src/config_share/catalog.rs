@@ -968,6 +968,8 @@ mod tests {
             "orchestrator/projects.yaml.bak.1",
             "orchestrator/projects.yaml.lock",
             "orchestrator/projects.yaml.tmp.1234",
+            // #1313 で tmp 名に連番が付いた形。`.tmp.` を含むので同じく共有されない
+            "orchestrator/projects.yaml.tmp.1234.5",
             "orchestrator/accounts.yaml.bak-511-512",
             "settings.json.bak",
             "orchestrator/projects.yaml.wiped-141102.bak",
