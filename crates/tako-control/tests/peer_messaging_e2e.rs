@@ -13,13 +13,19 @@
 //! claude の会話は実ユーザーの config dir に残る（transcript を読む検証のため必須）。
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use tako_control::{claude_tui, delivery, peer_messaging};
 
-/// 専用ソケットで本番バックエンド（tako-backend）や他の実験用 tmux と隔離する
-const SOCKET: &str = "tako-e2e-790";
+#[path = "common/tmux_e2e.rs"]
+mod tmux_e2e;
+
+/// 本番のバックエンドや**他プロセスのテスト**と混ざらない専用の器（#1300）。
+/// 固定名だと `cargo test --workspace` が 2 本走った瞬間に同名セッションを
+/// 取り合って `duplicate session` で落ちる（実測は `tmux_e2e` のモジュール doc）
+fn socket() -> &'static str {
+    tmux_e2e::socket_for("790")
+}
 
 /// 応答マーカー（数字はステータスライン `5h 45% (→4h42m)` と誤マッチするため英単語）
 const SPELL_SUFFIX: &str = "Reply with only the answer spelled out in English words, lowercase.";
@@ -40,9 +46,9 @@ struct SessionGuard {
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        let _ = Command::new("tmux")
-            .args(["-L", SOCKET, "kill-session", "-t", &self.session])
-            .output();
+        // 器はこのプロセス専用。セッションを畳み、**このプロセスの最後の 1 本**なら
+        // サーバーごと退役させてソケットファイルまで消す（tmux は残す）
+        tmux_e2e::release_session(socket(), &self.session);
         assert!(
             self.dir.starts_with("/private/tmp/"),
             "一時ディレクトリ以外を削除しようとしている: {}",
@@ -81,7 +87,7 @@ fn isolate(name: &str) -> PathBuf {
     let data = work_dir(&format!("{name}-data"));
     std::fs::create_dir_all(&data).expect("data dir を作れる");
     std::env::set_var("TAKO_DATA_DIR", &data);
-    std::env::set_var("TAKO_TMUX_SOCKET", SOCKET);
+    std::env::set_var("TAKO_TMUX_SOCKET", socket());
     data
 }
 
@@ -90,11 +96,14 @@ fn isolate(name: &str) -> PathBuf {
 fn launch_claude(session: &str, dir: &Path) -> SessionGuard {
     std::fs::create_dir_all(dir).expect("作業ディレクトリを作れる");
     claude_tui::ensure_trusted_in(None, &dir.display().to_string()).expect("事前信頼を書ける");
-    let status = Command::new("tmux")
-        .args([
-            "-L",
-            SOCKET,
-            "new-session",
+    // 起動より**先に**ガードを作る。起動が落ちたときも作業ディレクトリと器が残らない
+    let guard = SessionGuard {
+        session: session.to_string(),
+        dir: dir.to_path_buf(),
+    };
+    if let Err(diag) = tmux_e2e::new_session(
+        socket(),
+        &[
             "-d",
             "-s",
             session,
@@ -105,18 +114,15 @@ fn launch_claude(session: &str, dir: &Path) -> SessionGuard {
             "-c",
             dir.to_str().expect("テストパスは UTF-8"),
             "claude --model haiku",
-        ])
-        .status()
-        .expect("tmux を実行できる");
-    assert!(status.success(), "tmux new-session が失敗した");
-    SessionGuard {
-        session: session.to_string(),
-        dir: dir.to_path_buf(),
+        ],
+    ) {
+        panic!("{diag}");
     }
+    guard
 }
 
 fn capture(session: &str) -> Option<Vec<String>> {
-    tako_core::tmux::capture_session(Some(SOCKET), session).ok()
+    tako_core::tmux::capture_session(Some(socket()), session).ok()
 }
 
 fn dump_screen(session: &str) -> String {
@@ -380,7 +386,7 @@ fn peer_が使えないときはキー経路で届く() {
 
     // ② 従来経路で実際に送達が成立する（画面で応答を確認）
     let report = claude_tui::deliver_via_tmux(
-        Some(SOCKET),
+        Some(socket()),
         &guard.session,
         &format!("What is 6 * 7? {SPELL_SUFFIX}"),
         true,

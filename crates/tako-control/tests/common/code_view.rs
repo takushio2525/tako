@@ -2,8 +2,12 @@
 //!
 //! 走査型の番犬は、**自分の説明文や他のテストの期待値文字列**を拾わないために
 //! コメントと文字列を先に潰す必要がある。この 1 実装を
-//! `test_timing_watchdog`（#1220）と `psmux_cleanup_timeout_watchdog`（#1271）が
+//! `test_timing_watchdog`（#1220）・`psmux_cleanup_timeout_watchdog`（#1271）・
+//! `tmux_e2e_watchdog`（#1300）が
 //! 共有する（走査の前処理を番犬ごとに書き直すと、片方だけ生文字列を取りこぼす）。
+
+// 取り込む番犬ごとに使う関数が違う（片方しか使わないファイルがある）
+#![allow(dead_code)]
 
 /// コメントと文字列 / 文字リテラルを空白へ潰した「コードだけの眺め」。
 ///
@@ -141,4 +145,19 @@ pub fn code_view(src: &str) -> String {
         i += 1;
     }
     String::from_utf8(out).expect("空白で潰しても UTF-8 は壊れない")
+}
+
+/// 行まるごとのコメントだけ落とした眺め（**文字列リテラルは残す**）。
+///
+/// [`code_view`] は文字列も潰すので、「どんな文字列を書いたか」を見張る番犬
+/// （#1271 の `taskkill /PID` / #1300 の固定ソケット名）はこちらを使う。
+/// 説明文の中の同じ語を実装と読み違えないよう、コメント行だけは落とす
+pub fn without_comment_lines(src: &str) -> String {
+    src.lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !t.starts_with("//")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
