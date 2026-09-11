@@ -24167,6 +24167,9 @@ mod tests {
                     backend_session: None,
                     live_tail: Some(screen.clone()),
                     full_screen: None,
+                    // #1297: 画面テキストだけを与える形なので属性は取れない扱い
+                    // （判定は従来の文字列ベースへ落ちる = このテストが書かれた前提のまま）
+                    input_style: None,
                     has_running_children: false,
                     limit_resume: Value::Null,
                 },
