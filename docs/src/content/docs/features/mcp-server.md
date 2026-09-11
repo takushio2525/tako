@@ -25,7 +25,7 @@ MCP は、AI エージェントが外部ツールを操作するための共通�
 | codex | `~/.codex/config.toml` の `[mcp_servers.tako]` | `codex mcp add` + `env_vars` の追記 | 転送する変数名を書いたものだけ |
 | agy | `~/.gemini/config/mcp_config.json` | `agy mcp add` | そのまま継承する |
 
-tako の MCP サーバーは、**tako の中から起動されたこと**を環境変数（`TAKO_SOCKET` / `TAKO_TOKEN`）で確認してから 128 個のツールを公開します。tako の外で立ち上がったエージェントに画面操作をさせないための線引きです（後述の[アクセス制御](#アクセス制御)）。
+tako の MCP サーバーは、**tako の中から起動されたこと**を環境変数（`TAKO_SOCKET` / `TAKO_TOKEN`）で確認してから 149 個のツールを公開します。tako の外で立ち上がったエージェントに画面操作をさせないための線引きです（後述の[アクセス制御](#アクセス制御)）。
 
 そのため codex の登録には、転送する変数名の一覧（`TAKO_SOCKET` / `TAKO_TOKEN` / `TAKO_PANE_ID` / `TAKO_ORCHESTRATOR_ROLE`）も一緒に書き込みます。**書くのは変数名だけで、トークンは設定ファイルに残りません。**ペインごとに違う値がそのまま届くので、「どのペインから呼ばれたか」もこれまでどおり解決されます。
 
@@ -34,9 +34,9 @@ tako の MCP サーバーは、**tako の中から起動されたこと**を環�
 <figcaption>MCP 経由で AI がペインを分割し、担当エージェントを並べたところ。人がキーボードでできることは AI も同じ経路でできる</figcaption>
 </figure>
 
-## 128 個の MCP ツール
+## 149 個の MCP ツール
 
-tako は **128 個**の MCP ツールを公開しています。全リストは [MCP ツール一覧](/guides/mcp-tools/)にあります。主なカテゴリ:
+tako は **149 個**の MCP ツールを公開しています。全リストは [MCP ツール一覧](/guides/mcp-tools/)にあります。主なカテゴリ:
 
 ### レイアウト操作
 - `tako_split_pane` — ペイン分割（方向・比率・コマンド指定）

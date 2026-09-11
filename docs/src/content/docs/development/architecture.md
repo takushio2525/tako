@@ -34,6 +34,7 @@ GPUI に依存しない純粋なドメインモデル。
 - **Workspace**: タブの管理・たまり場・レイアウト永続化
 - **TerminalSession**: PTY 管理・tmux セッションとの対応
 - **tmux**: tmux CLI ラッパー（セッション・window の列挙・操作）
+- **backend**: セッション永続化の「器」の抽象。macOS は tmux、Windows は psmux（tmux 互換 CLI）を使い、器が無い環境は NullBackend へ縮退する。選択は OS ではなく利用できる器で決まる
 - **git**: git CLI ラッパー（log・diff・status パーサ）
 - **ports**: listen ポート検知（libproc + tty 突き合わせ）
 - **osc_tap**: OSC 7/133 パーサ（cwd 通知・プロンプトマーク）
@@ -45,7 +46,7 @@ IPC サーバーと操作ディスパッチ。
 - **dispatch**: 全操作の一元化ハブ。CLI・MCP・UI の全経路がここを通る
 - **protocol**: リクエスト/レスポンスの型定義
 - **mcp**: MCP エンジン（トランスポート非依存。Streamable HTTP + stdio ブリッジ）
-- **ipc**: Unix domain socket + JSON-RPC + トークン認証
+- **ipc**: JSON-RPC + トークン認証。トランスポートは OS で分かれ、unix は Unix domain socket（パーミッション 0600）、Windows は named pipe（`\\.\pipe\tako-<ユーザー>`。既定 DACL + トークンの二段防御）
 
 ### tako-app
 
@@ -60,7 +61,7 @@ GPUI バイナリ。GPUI への依存はここに閉じる。
 
 `tako` コマンドの実装。
 
-- サブコマンド群（`split`, `send`, `list`, `open`, `shelve`, `tmux` 等）
+- サブコマンド群（`split`, `send`, `list`, `open`, `background`, `foreground`, `tmux` 等）
 - `tako mcp serve`: MCP stdio ブリッジ（Claude Code への登録経路）
 - `tako setup-mcp`: Claude Code への MCP 登録ヘルパー
 - `tako master`: オーケストレーターのマスター起動

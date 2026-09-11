@@ -7,12 +7,14 @@ tako の設定は、**設定画面・CLI・MCP の 3 経路すべてから同じ
 
 ## 設定画面を開く
 
-<kbd>Cmd</kbd>+<kbd>,</kbd>、<kbd>Cmd</kbd>+<kbd>K</kbd> のコマンドパレット、または次のコマンドで開きます。独立したウィンドウで、一般 / 外観 / Code Runner / セットアップ / スリープ防止 / リモート / 高度 の 7 タブに分かれています。
+<kbd>Cmd</kbd>+<kbd>,</kbd>、<kbd>Cmd</kbd>+<kbd>K</kbd> のコマンドパレット、または次のコマンドで開きます。独立したウィンドウで、一般 / 外観 / Code Runner / プロファイル / セットアップ / スリープ防止 / リモート / 高度 の 8 タブに分かれています。
 
 ```bash
 tako settings
-tako settings --tab 外観
+tako settings --tab appearance
 ```
+
+`--tab` が受け付けるのは英語スラッグの `general` / `appearance` / `runner` / `profiles` / `setup` / `sleep` / `remote` / `advanced` の 8 つです。日本語のタブ名は受け付けず、一般タブが開きます。
 
 <figure class="tako-shot">
 <img src="/img/settings-general.webp" alt="tako の設定画面。一般タブに表示言語・AI 自動リネーム・ポート検知などのトグルが並んでいる" />

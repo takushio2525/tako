@@ -50,6 +50,11 @@
 - A/B `TAKO_1314_LEGACY=1`（修正前の直書き）: 8 スレッド × 200 書き込みの再現テストが旧アーム **60/60 FAILED**（`len=0` / 短い本文が長い本文の先頭を潰した `len=55296`）→ 新アーム 0/60・負荷下（load 8 / 55〜60）0/50 × 2
 - **Windows CI で tako-core のテストが 1 件も走っていなかった**（`cargo test --workspace` は非ブロッキング + #583 で打ち切り）ので、#1282 と同じ形で `backend::psmux` の実行検査を blocking ステップとして追加。実機確認は Windows 機が offline のため Issue に手順を残した
 
+## 2026-09-11（#1336: 要件番号の一意性と参照の実在を番犬で固定した）
+- `crates/tako-control/tests/fr_number_watchdog.rs` 1 本。定義の形は 3 つ（章 `## FR-5` / 節 `### FR-2.34` / 表 ID `| FR-2.34.1 |`）で **1 段も拾う**（`NFR-1`〜`8` が 1 段なので 2 段以上だけ見ると見逃す。1 段を定義に持つと章番号への言及も偽の参照切れにならない）。定義 482 件 / コード参照 613 件を実測
+- A/B は fixture を置かず**現行テキストへの逆置換**（#1319 の変更は番号 14 行だけなので `84c16c7^` と同値。置換が空振りしたら落ちるガード付き）。実データ検証も実施: `84c16c7^` を置くと `要件番号は一意` が **FAILED で 3 系統 11 番号を行番号つきで名指し**（FR-2.34 + 配下 8 / FR-3.17 / FR-3.18）
+- 自分自身も走査対象なので**架空の番号を書くと自分で拾う**（実装中に 2 度拾われた）。例外リストは作らず例を実在番号へ寄せ、参照切れの検出力は「定義側を 1 つ削る」形で証明。参照切れは現行 0 件
+
 ## 2026-09-11（#1333: PR の「CI 3 本緑を待って merge」を共通の待ちスクリプトへ寄せた）
 - 「出ているチェックが全部非 pending = 完了」は push 直後に Cloudflare Pages しか登録されていない瞬間に通る（#1313 = PR #1328 が CI 完了前 merge・過去に #1253 / #1282）。判定を `scripts/wait-pr-checks.sh` の 1 実装へ寄せ、**期待名が全部そろって全部 completed** を **2 回連続**観測してから確定する形にした（期待名は `.github/workflows/*.yml` の pull_request job から導出・外部連携の Cloudflare Pages だけ定数）
 - merge は `scripts/merge-pr.sh`（揃わなければ merge しない / CONFLICTING・BEHIND は待たずに拒否）。モックテスト 14 ケース（偽 gh + 偽リポジトリ）は CI の macOS ジョブで走り、A/B `TAKO_1333_LEGACY=1` の腕が「1 本だけで完了」「揺れの 1 回目で確定」を再現して Test 13 / 14 が固定する
@@ -64,3 +69,6 @@
 - 真因は gh の順序（ローカル切り替え → ローカル削除 → リモート削除）。worktree から実行すると 1 手目が `fatal: 'main' is already used by worktree` で落ち**リモートまで到達しない**（`git switch main` 単体で逐語再現・PR #1337 で実発生・棚卸しで merge 済み PR の head が origin に 5 本残存）
 - `delete_remote_head_branch` を MERGED 確認の後に置いた（`gh api` で存在確認 → DELETE。冪等・**その PR の head 1 本だけ**・head == base と fork の PR は触らない）。A/B `TAKO_1347_LEGACY=1` が gh 任せの腕
 - モック 4 ケース追加（worktree 事故で消し切る / legacy では残る = 検出力 / 既に消えていれば DELETE を呼ばない / head == base と fork で触らない）。72 assert 緑。この PR 自身を修正版で merge してドッグフーディング
+## 2026-09-11（#1317 / #1322 / #1323: docs サイトの取り残し 3 ページを実挙動へ合わせた）
+- settings（8 タブ・`--tab` は英語スラッグのみ）/ architecture（存在しない `shelve` → `background`・IPC に Windows の named pipe）/ keyboard-shortcuts（macOS / Windows の 3 列表へ作り直し）
+- 表は `keybindings.rs` から全件起こした（macOS 45 本 / Windows 45 本・差分 0）。番犬 `crates/tako-control/tests/docs_keyboard_shortcuts.rs` が両方向を検査する（注入 3 通りでキーを名指し FAILED）
