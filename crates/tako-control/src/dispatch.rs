@@ -1565,6 +1565,19 @@ fn dispatch_inner(
                         "live_owner_pids": entry.live_owner_pids,
                         "bytes": entry.bytes,
                         "modified_secs_ago": entry.modified_secs_ago,
+                        // #1282: 名前で列挙した器（Windows / psmux）は
+                        // ソケットファイルが無いので、器そのものの pid と
+                        // 所有者の出どころを出す（回収は pid を名指しして行う）
+                        "kind": match entry.kind {
+                            tako_core::tmux_cleanup::ServerKind::SocketFile => "socket_file",
+                            tako_core::tmux_cleanup::ServerKind::Named => "named",
+                        },
+                        "server_pids": entry.server_pids,
+                        "owner_source": match entry.owner_source {
+                            tako_core::tmux_cleanup::OwnerSource::Unknown => "unknown",
+                            tako_core::tmux_cleanup::OwnerSource::SocketName => "socket_name",
+                            tako_core::tmux_cleanup::OwnerSource::CommandLine => "command_line",
+                        },
                     })
                 })
                 .collect();
@@ -13071,6 +13084,8 @@ mod tests {
         /// 返させる結果
         cleanup_socket: std::cell::RefCell<Vec<Option<String>>>,
         cleanup_report: Option<tako_core::tmux_cleanup::CleanupReport>,
+        /// #1282: サーバー単位の回収の応答（実際のソケット置き場を触らせない）
+        server_outcome: Option<tako_core::tmux_cleanup::ServerCleanupOutcome>,
         /// #1191: 器の**実態**（`refresh_backend_windows` を呼ばないと見えない）。
         /// UI のポーリングでしか更新されなかった旧実装を模す
         tmux_windows: std::collections::HashMap<u64, Vec<tako_core::TmuxWindow>>,
@@ -13122,6 +13137,7 @@ mod tests {
                 tab_cols: None,
                 cleanup_socket: std::cell::RefCell::new(Vec::new()),
                 cleanup_report: None,
+                server_outcome: None,
                 welcome_banner: false,
                 autosuggest: true,
                 autosuggest_hint: true,
@@ -13256,6 +13272,19 @@ mod tests {
             self.cleanup_report.clone().unwrap_or_else(|| {
                 tako_core::tmux_cleanup::CleanupReport::killed(socket.unwrap_or("tako"), Vec::new())
             })
+        }
+        fn cleanup_tmux_servers(
+            &self,
+            apply: bool,
+        ) -> tako_core::tmux_cleanup::ServerCleanupOutcome {
+            self.server_outcome
+                .clone()
+                .unwrap_or(tako_core::tmux_cleanup::ServerCleanupOutcome {
+                    applied: apply,
+                    entries: Vec::new(),
+                    killed: Vec::new(),
+                    removed_sockets: Vec::new(),
+                })
         }
         fn tmux_tab_collapsed(&self, tab: TabId) -> bool {
             self.collapsed.contains(&tab.as_u64())
@@ -13722,6 +13751,84 @@ mod tests {
             detail.contains("71082") && detail.contains("tako"),
             "理由に pid / ソケットが入っていない: {detail}"
         );
+    }
+
+    /// #1282: 名前で列挙した器（Windows / psmux）が **unix と同じ形**で返り、
+    /// 器の pid と所有者の出どころが載ること。ソケットファイルの器と混ざっても
+    /// 1 件ごとに `kind` で見分けられる（CLI / MCP はこの JSON をそのまま出す）
+    #[test]
+    fn issue1282_名前で列挙した器も同じ形で返る() {
+        use tako_core::tmux_cleanup::{OwnerSource, ServerEntry, ServerKind, ServerVerdict};
+
+        let named = ServerEntry {
+            socket: "tako-iso-4242".into(),
+            path: std::path::PathBuf::new(),
+            running: true,
+            clients: 0,
+            sessions: 2,
+            bytes: 0,
+            modified_secs_ago: Some(3600),
+            owner_pids: vec![4242],
+            live_owner_pids: Vec::new(),
+            kind: ServerKind::Named,
+            server_pids: vec![11, 12],
+            owner_source: OwnerSource::SocketName,
+            live_app_pids: Vec::new(),
+        };
+        let manual = ServerEntry {
+            socket: "tako-w1133".into(),
+            owner_pids: Vec::new(),
+            owner_source: OwnerSource::Unknown,
+            server_pids: vec![21],
+            sessions: 1,
+            ..named.clone()
+        };
+        let mut host = MockHost::new();
+        host.server_outcome = Some(tako_core::tmux_cleanup::ServerCleanupOutcome {
+            applied: true,
+            entries: vec![
+                (named, ServerVerdict::Reclaimable { pids: vec![4242] }),
+                (manual, ServerVerdict::OwnerUnknown),
+            ],
+            killed: vec!["tako-iso-4242".into()],
+            removed_sockets: Vec::new(),
+        });
+
+        let out = dispatch(
+            &mut host,
+            Request::TmuxCleanup {
+                socket: None,
+                servers: true,
+                apply: true,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+
+        // unix と同じ骨格
+        assert_eq!(out["mode"], "servers");
+        assert_eq!(out["applied"], true);
+        assert_eq!(out["summary"]["total"], 2);
+        assert_eq!(out["summary"]["reclaimable"], 1);
+        assert_eq!(out["summary"]["protected"], 1);
+        assert_eq!(out["killed"][0], "tako-iso-4242");
+
+        // 名前で列挙した器の追加材料（**pid を名指しできることが回収の前提**）
+        let first = &out["servers"][0];
+        assert_eq!(first["socket"], "tako-iso-4242");
+        assert_eq!(first["kind"], "named");
+        assert_eq!(first["verdict"], "reclaimable");
+        assert_eq!(first["owner_source"], "socket_name");
+        assert_eq!(first["server_pids"], serde_json::json!([11, 12]));
+
+        // 材料が取れない器は見送りとして理由つきで残る
+        let second = &out["servers"][1];
+        assert_eq!(second["socket"], "tako-w1133");
+        assert_eq!(second["verdict"], "owner_unknown");
+        assert_eq!(second["owner_source"], "unknown");
+        assert!(second["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("特定できない")));
     }
 
     /// #1002: モデル一覧は dispatch を通るので CLI・MCP・GUI が同じペイロードを見る。

@@ -16,6 +16,19 @@
 //! 手当ては「テストの**コンパイル**だけを blocking にする」1 ステップ
 //! （`cargo test --workspace --no-run`）。テスト結果の扱い（#583）は変えない。
 //! そのステップが消える / 非ブロッキングへ倒されると同じ穴が開くので、ここで拘束する。
+//!
+//! ## 狭く絞った blocking なテストは許す（#1282）
+//!
+//! 据え置くのは「**ワークスペース全体**の結果を blocking にしない」であって、
+//! 「blocking なテストを 1 本も置かない」ではない。macOS では 1 行も実行できない
+//! コード（Windows の Win32 FFI 等）は、名指しの小さなステップで実際に走らせないと
+//! 誰も検査できない。しかも `cargo test --workspace` は **tako-app の既知失敗で
+//! そこで打ち切られ、以降のクレートは 1 件も走らない**（実測 2026-09-11:
+//! `622 passed / 1 failed` で終了）ので、ぶら下げても走らない。
+//!
+//! そこで規則を精密化する: `--workspace` のテスト実行は 1 本だけ・非ブロッキングのまま、
+//! **それ以外の `cargo test` 実行ステップは `--workspace` を付けてはいけない**
+//! （付けられると #583 の方針が裏口から blocking へ倒れる）。
 
 use std::path::{Path, PathBuf};
 
@@ -110,15 +123,54 @@ fn テスト結果の非ブロッキング_583_は据え置かれている() {
         .into_iter()
         .filter(|s| s.contains("cargo test") && !s.contains("--no-run"))
         .collect();
+    let (workspace, scoped): (Vec<&String>, Vec<&String>) =
+        run.iter().partition(|s| s.contains("--workspace"));
     assert_eq!(
-        run.len(),
+        workspace.len(),
         1,
-        "Windows ジョブのテスト実行ステップが 1 本でない（#583 の扱いが変わった？）\n{job}"
+        "Windows ジョブの `cargo test --workspace` 実行ステップが 1 本でない\
+         （#583 の扱いが変わった？）\n{job}"
     );
     assert!(
-        run[0].contains("continue-on-error: true"),
+        workspace[0].contains("continue-on-error: true"),
         "#1264 のコンパイル検査を足すついでにテスト結果まで blocking へ倒してはいけない\
          （POSIX 前提の既存失敗が残っているあいだは #583 の方針を据え置く）\n{}",
-        run[0]
+        workspace[0]
+    );
+    // #1282: 名指しの小さな検査は blocking で置いてよいが、**ワークスペース全体を
+    // 巻き込んではいけない**（上で 1 本に絞ってあるので、ここは念のための二重化）
+    for step in scoped {
+        assert!(
+            !step.contains("--workspace"),
+            "狭く絞ったはずのテスト実行が --workspace を持っている\n{step}"
+        );
+    }
+}
+
+/// #1282: macOS で 1 行も実行できない Windows 固有コードが、CI で**実際に走る**こと。
+///
+/// `cargo test --workspace` は tako-app の既知失敗（#583）でそこで打ち切られ
+/// tako-core まで届かないので、名指しのステップが無いと Win32 FFI
+/// （`NtQueryInformationProcess` でのコマンドライン / `GetProcessTimes` での起動時刻）は
+/// **コンパイルされるだけで一度も呼ばれない**。構造体レイアウトの転記ミス・
+/// 情報クラス番号・`FILETIME` の起点はそこでしか捕まらない
+#[test]
+fn windows固有ffiの実行検査がblockingで置かれている() {
+    let ci = ci_yaml();
+    let job = without_comments(&windows_job(&ci));
+    let ffi: Vec<String> = steps(&job)
+        .into_iter()
+        .filter(|s| s.contains("cargo test") && s.contains("platform::procinfo"))
+        .collect();
+    assert_eq!(
+        ffi.len(),
+        1,
+        "Windows の FFI を実際に叩く検査ステップが無い（#1282）。\
+         `cargo test -p tako-core --lib platform::procinfo` を windows ジョブへ置くこと\n{job}"
+    );
+    assert!(
+        !ffi[0].contains("continue-on-error"),
+        "FFI の実行検査が非ブロッキングになっている（#1282。壊れても緑のまま通る）\n{}",
+        ffi[0]
     );
 }

@@ -82,6 +82,62 @@ pub fn image_path(pid: u32) -> Option<std::path::PathBuf> {
     imp::image_path(pid)
 }
 
+/// プロセス 1 件の**コマンドラインつき**スナップショット（#1282）。
+///
+/// [`ProcEntry`] は名前と親子だけを持つ。器（tmux / psmux）を名前付きパイプ越しに
+/// 見分けるには **`-L <ソケット名>` が載っているコマンドライン**が要るので、
+/// 必要になる場面だけこちらを使う（全プロセスぶん引くと重い）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcDetail {
+    pub pid: u32,
+    /// 実行ファイル名（`tmux.exe`）
+    pub name: String,
+    /// 起動時のコマンドライン全体。読めなければ `None`
+    /// （権限が無い / 既に居ない / 取得手段が無いプラットフォーム）
+    pub command_line: Option<String>,
+    /// 起動時刻（UNIX 秒）。読めなければ `None`
+    pub started_unix: Option<u64>,
+}
+
+/// 実行中プロセスのコマンドライン全体。取れなければ `None`。
+///
+/// Windows は `NtQueryInformationProcess(ProcessCommandLineInformation)`。
+/// **`PROCESS_QUERY_LIMITED_INFORMATION` だけで読める**ので、PEB を
+/// `ReadProcessMemory` で辿る古い手口（bit 幅を跨ぐと壊れる）は使わない。
+/// Windows 8.1 以降で使える（tako の下限は 10.0.17763 = #965 の動作要件）。
+///
+/// unix には「他プロセスのコマンドラインを引く」用途がまだ無いので `None`
+/// （器の列挙はソケットファイル走査で足りる = [`crate::tmux_cleanup`]）
+pub fn command_line(pid: u32) -> Option<String> {
+    imp::command_line(pid)
+}
+
+/// 実行中プロセスの起動時刻（UNIX 秒）。取れなければ `None`。
+///
+/// **pid の再利用を見分ける材料**（#1282: 所有者が死んだ後に別プロセスが
+/// 同じ pid を取っていないかを、器の起動時刻と突き合わせて確かめる）
+pub fn start_time_unix(pid: u32) -> Option<u64> {
+    imp::start_time_unix(pid)
+}
+
+/// 名前（拡張子と大文字小文字を無視）が `names` のいずれかに一致するプロセスの詳細。
+///
+/// 取得手段が無いプラットフォームでは空を返す
+/// （呼び出し側は「見つからない」= 何もしない側へ倒すこと）
+pub fn details_by_name(names: &[&str]) -> Vec<ProcDetail> {
+    let wanted: HashSet<String> = names.iter().map(|n| stem_of(n)).collect();
+    snapshot()
+        .into_iter()
+        .filter(|p| wanted.contains(&stem_of(&p.name)))
+        .map(|p| ProcDetail {
+            command_line: command_line(p.pid),
+            started_unix: start_time_unix(p.pid),
+            pid: p.pid,
+            name: p.name,
+        })
+        .collect()
+}
+
 /// `root` とその子孫の pid 集合（`root` 自身を含む）。
 ///
 /// 純粋関数なので **macOS 上でもテストできる**。Windows の ppid は
@@ -190,6 +246,25 @@ pub fn agent_children_of_tako_under(procs: &[ProcEntry], roots: &[u32]) -> Vec<(
         .collect()
 }
 
+/// **GUI（`tako-app`）として動いているプロセス**の pid（`self_pid` は除く）。
+///
+/// 除外が要るのは、この数えを使う `tako tmux cleanup --servers` が
+/// **GUI プロセスの中で実行される**（CLI は IPC で GUI へ投げる）ため。
+/// 自分を数えると「生きた tako-app が居る」が常に真になり、回収が永久に見送られる。
+///
+/// CLI（`tako`）も含めない: コマンドを投げた CLI 自身が数えられてしまう（#1282）
+pub fn live_tako_app_pids(procs: &[ProcEntry], self_pid: u32) -> Vec<u32> {
+    let mut out: Vec<u32> = procs
+        .iter()
+        .filter(|p| stem_of(&p.name) == "tako-app")
+        .map(|p| p.pid)
+        .filter(|&pid| pid != self_pid)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// エージェント CLI として動いているプロセスの件数（診断用。親子は問わない）
 pub fn agent_process_count(procs: &[ProcEntry]) -> usize {
     procs
@@ -241,6 +316,143 @@ mod imp {
             exe_name: *mut u16,
             size: *mut u32,
         ) -> i32;
+    }
+
+    /// `FILETIME`（100ns 単位・1601-01-01 起点）。`GetProcessTimes` の出力
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    /// `UNICODE_STRING`（ntdef.h）。`Buffer` は**呼び出し側が渡したバッファの内側**を
+    /// 指す（`ProcessCommandLineInformation` は 1 つのバッファに構造体と文字列を詰める）
+    #[repr(C)]
+    struct UnicodeString {
+        /// **バイト数**（文字数ではない）
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+
+    // 転記ミスを型検査で捕まえる（x64: 2 + 2 + パディング 4 + ポインタ 8）
+    const _: () = assert!(std::mem::size_of::<UnicodeString>() == 2 * size_of::<usize>());
+    const _: () = assert!(std::mem::size_of::<FileTime>() == 8);
+
+    /// `ProcessCommandLineInformation`（PROCESSINFOCLASS = 60）。Windows 8.1 以降
+    const PROCESS_COMMAND_LINE_INFORMATION: u32 = 60;
+    /// `STATUS_INFO_LENGTH_MISMATCH`（バッファが足りない）
+    const STATUS_INFO_LENGTH_MISMATCH: i32 = -1_073_741_820; // 0xC0000004
+    /// 1601-01-01 から 1970-01-01 までの 100ns 単位
+    const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetProcessTimes(
+            process: Handle,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+    }
+
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtQueryInformationProcess(
+            process: Handle,
+            info_class: u32,
+            info: *mut std::ffi::c_void,
+            info_len: u32,
+            return_len: *mut u32,
+        ) -> i32;
+    }
+
+    pub(super) fn command_line(pid: u32) -> Option<String> {
+        if pid == 0 {
+            return None;
+        }
+        // SAFETY: OpenProcess の戻りは null を検査し、復帰経路すべてで CloseHandle する。
+        // バッファは **u64 の器**で確保して `UNICODE_STRING` のポインタ整列を満たす
+        // （`Vec<u8>` の先頭は 1 バイト整列しか保証されない）。
+        // NtQueryInformationProcess にはバッファの実長だけを渡し、書き戻された
+        // `Buffer` / `Length` がそのバッファの内側に収まることを読み出し前に検査する
+        // （API の返す値を信用しない）
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return None;
+            }
+            // 構造体 + 文字列を 1 つのバッファに詰めて返す API。足りなければ
+            // 必要長を教えてくれるので 1 度だけ取り直す
+            let mut buf: Vec<u64> = vec![0; 4096 / 8];
+            let mut need: u32 = 0;
+            let mut status = NtQueryInformationProcess(
+                handle,
+                PROCESS_COMMAND_LINE_INFORMATION,
+                buf.as_mut_ptr().cast(),
+                (buf.len() * 8) as u32,
+                &mut need,
+            );
+            if status == STATUS_INFO_LENGTH_MISMATCH && need as usize > buf.len() * 8 {
+                buf = vec![0; (need as usize).div_ceil(8)];
+                status = NtQueryInformationProcess(
+                    handle,
+                    PROCESS_COMMAND_LINE_INFORMATION,
+                    buf.as_mut_ptr().cast(),
+                    (buf.len() * 8) as u32,
+                    &mut need,
+                );
+            }
+            CloseHandle(handle);
+            let bytes = buf.len() * 8;
+            if status < 0 || bytes < std::mem::size_of::<UnicodeString>() {
+                return None;
+            }
+            let us = &*buf.as_ptr().cast::<UnicodeString>();
+            let len = us.length as usize;
+            if us.buffer.is_null() || len == 0 || len % 2 != 0 {
+                return None;
+            }
+            // `Buffer` はこのバッファの内側を指しているはず。外を指していたら読まない
+            let start = buf.as_ptr() as usize;
+            let at = us.buffer as usize;
+            if at < start || at.checked_add(len).is_none_or(|end| end > start + bytes) {
+                return None;
+            }
+            let units = std::slice::from_raw_parts(us.buffer, len / 2);
+            Some(String::from_utf16_lossy(units))
+        }
+    }
+
+    pub(super) fn start_time_unix(pid: u32) -> Option<u64> {
+        if pid == 0 {
+            return None;
+        }
+        // SAFETY: OpenProcess の戻りは null を検査し、復帰経路すべてで CloseHandle する。
+        // 4 つの出力はすべてローカル変数で、API はそれ以上書き込まない
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return None;
+            }
+            let (mut created, mut exited, mut kernel, mut user) = (
+                FileTime::default(),
+                FileTime::default(),
+                FileTime::default(),
+                FileTime::default(),
+            );
+            let ok = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user);
+            CloseHandle(handle);
+            if ok == 0 {
+                return None;
+            }
+            let ticks = ((created.high as u64) << 32) | created.low as u64;
+            ticks
+                .checked_sub(FILETIME_UNIX_EPOCH)
+                .map(|since_epoch| since_epoch / 10_000_000)
+        }
     }
 
     pub(super) fn image_path(pid: u32) -> Option<std::path::PathBuf> {
@@ -466,6 +678,16 @@ mod imp {
         Vec::new()
     }
 
+    /// 他プロセスのコマンドラインを引く用途が unix にはまだ無い（#1282 の器の列挙は
+    /// ソケットファイル走査で足りる）。読めない = 呼び出し側は見送る
+    pub(super) fn command_line(_pid: u32) -> Option<String> {
+        None
+    }
+
+    pub(super) fn start_time_unix(_pid: u32) -> Option<u64> {
+        None
+    }
+
     pub(super) fn tcp_listeners() -> Vec<TcpListenEntry> {
         Vec::new()
     }
@@ -495,6 +717,91 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
+    /// #1282: コマンドライン / 起動時刻の FFI が**実際に読めるか**。
+    ///
+    /// 自分自身を対象にするので権限の問題が起きず、CI の Windows ランナーでも走る。
+    /// 転記ミス（`UNICODE_STRING` のレイアウト・`FILETIME` の起点・情報クラス番号）は
+    /// ここでしか捕まらない（純粋関数のテストは全部 macOS で通ってしまう）
+    #[cfg(windows)]
+    #[test]
+    fn 自分のコマンドラインと起動時刻をffiで読める() {
+        let pid = std::process::id();
+        let cmd = super::command_line(pid).expect("自分のコマンドラインは読めるはず");
+        assert!(!cmd.trim().is_empty(), "空のコマンドライン");
+        assert!(
+            !crate::tmux_cleanup::split_command_line(&cmd).is_empty(),
+            "語に割れない: {cmd:?}"
+        );
+        let started = super::start_time_unix(pid).expect("自分の起動時刻は読めるはず");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        assert!(
+            (1_600_000_000..=now + 60).contains(&started),
+            "UNIX 秒に見えない（FILETIME の起点がずれている）: {started} / now={now}"
+        );
+    }
+
+    /// #1282: 名前で引く経路（Toolhelp の列挙 → コマンドライン → 起動時刻）が
+    /// 一続きで動くこと。器の列挙はこの形で `tmux.exe` / `psmux.exe` / `pmux.exe` を引く
+    #[cfg(windows)]
+    #[test]
+    fn 自分のプロセスを名前で引ける() {
+        let exe = std::env::current_exe().expect("自分の exe パス");
+        let name = exe
+            .file_name()
+            .expect("ファイル名がある")
+            .to_string_lossy()
+            .to_string();
+        let details = super::details_by_name(&[name.as_str()]);
+        let me = details
+            .iter()
+            .find(|d| d.pid == std::process::id())
+            .unwrap_or_else(|| panic!("自分（{name}）が名前で引けない: {details:?}"));
+        assert!(me.command_line.as_deref().is_some_and(|c| !c.is_empty()));
+        assert!(me.started_unix.is_some());
+    }
+
+    /// 取得手段が無いプラットフォームは `None` を返す（呼び出し側は見送る）
+    #[cfg(not(windows))]
+    #[test]
+    fn コマンドラインを引けない環境では見送りへ倒れる() {
+        assert_eq!(super::command_line(std::process::id()), None);
+        assert_eq!(super::start_time_unix(std::process::id()), None);
+        assert!(super::details_by_name(&["tmux"]).is_empty());
+    }
+
+    /// #1282: 回収の最終ゲートに使う「生きた GUI」の数え方。
+    /// **CLI（`tako`）を数えると `tako tmux cleanup` 自身が引っかかる**ので入れない
+    #[test]
+    fn live_tako_app_pidsはguiだけを自分を除いて返す() {
+        let procs = vec![
+            super::ProcEntry {
+                pid: 10,
+                ppid: 1,
+                name: "tako-app.exe".into(),
+            },
+            super::ProcEntry {
+                pid: 11,
+                ppid: 1,
+                name: "TAKO-APP".into(),
+            },
+            super::ProcEntry {
+                pid: 12,
+                ppid: 1,
+                name: "tako.exe".into(),
+            },
+            super::ProcEntry {
+                pid: 13,
+                ppid: 1,
+                name: "pwsh.exe".into(),
+            },
+        ];
+        assert_eq!(super::live_tako_app_pids(&procs, 11), vec![10]);
+        assert_eq!(super::live_tako_app_pids(&procs, 0), vec![10, 11]);
+    }
+
     use super::*;
 
     fn p(pid: u32, ppid: u32, name: &str) -> ProcEntry {

@@ -150,3 +150,12 @@ jobs:
       - name: テスト（#583 が片付くまで非ブロッキング）
         continue-on-error: true
         run: cargo test --workspace
+      # #1282: 器の列挙が使う Win32 FFI（`NtQueryInformationProcess` でのコマンドライン /
+      # `GetProcessTimes` での起動時刻）は **macOS では 1 行も実行できない**。
+      # 上の `cargo test --workspace` は tako-app の既知失敗（#583）でそこで打ち切られ、
+      # tako-core まで届かない（実測 2026-09-11: 622 passed / 1 failed で終了 = 以降のクレートは未実行）。
+      # そこで FFI を実際に叩く検査だけ名指しで走らせ、**ここは blocking にする**
+      # （構造体レイアウトの転記ミス・情報クラス番号・FILETIME の起点は他で捕まらない）。
+      # テストバイナリは上のステップで作ってあるので追加の所要は数秒
+      - name: Windows FFI の実行検査（#1282。プロセスのコマンドライン / 起動時刻）
+        run: cargo test -p tako-core --lib platform::procinfo
