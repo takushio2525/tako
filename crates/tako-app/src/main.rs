@@ -3253,6 +3253,14 @@ enum DropZone {
     Center,
 }
 
+/// #1301 の C3 を入れる前（判定の**前に**全ペインをフルスナップショット）へ戻す逃げ道
+/// （`TAKO_1001_C3_LEGACY=1`）。同じバイナリで A/B するために使う。
+/// C2 側の入口は `tako_core::terminal::c2_legacy()`
+fn queued_recovery_legacy() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_1001_C3_LEGACY").is_some())
+}
+
 /// #1043 の修正を入れる前（外部ドラッグではオーバーレイを作らない）へ戻す逃げ道
 /// （`TAKO_1043_LEGACY=1`）。同じバイナリで A/B するために使う
 fn external_drop_legacy() -> bool {
@@ -7304,6 +7312,7 @@ impl TakoApp {
     /// `QUEUE_RECOVERY_MAX` 回で打ち切り、状態が解消したらカウンタを戻す
     fn drive_queued_message_recovery(&mut self) {
         use tako_control::claude_tui;
+        let legacy_c3 = queued_recovery_legacy();
         let panes: Vec<PaneId> = self
             .workspace
             .tabs()
@@ -7321,8 +7330,17 @@ impl TakoApp {
                 self.queued_recovery.remove(&pane);
                 continue;
             }
-            let lines = session.visible_lines();
-            if !claude_tui::queued_messages_pending(&lines) {
+            // #1301: 判定に要るのは最下部のプロンプト行だけ（`bottom_prompt_content`）。
+            // ヒントが出ているペインに限って全画面を採る（フルが本当に要るのは
+            // `state.observe` の before / after 比較だけ）。`AGENT_TUI_TAIL_LINES`
+            // より上にある入力欄は claude の TUI では起こらない（フッターが最下部）ので、
+            // ヒントの有無の判定はこの窓で全画面と一致する
+            let hint_lines = if legacy_c3 {
+                session.visible_lines()
+            } else {
+                session.tail_lines(tako_core::terminal::AGENT_TUI_TAIL_LINES)
+            };
+            if !claude_tui::queued_messages_pending(&hint_lines) {
                 self.queued_recovery.remove(&pane);
                 continue;
             }
@@ -7331,6 +7349,13 @@ impl TakoApp {
             if self.prompt_flows.iter().any(|f| f.pane == pane) {
                 continue;
             }
+            // ここまで来たペイン（= ヒントが出ている）だけフル画面を採る。
+            // `screen_settled` は画面全体の前後比較なので窓では代用できない
+            let lines = if legacy_c3 {
+                hint_lines
+            } else {
+                session.visible_lines()
+            };
             let state = self.queued_recovery.entry(pane).or_default();
             match state.observe(lines) {
                 QueuedRecoveryAction::Wait => continue,
@@ -13179,8 +13204,16 @@ impl TakoApp {
                     .filter(|id| *id != focused),
             )
             .collect();
+        // #1301: 素のシェルにエージェントメトリクスは無いので画面を読まない。
+        // 器（tmux / psmux）つきのペインでは器のクライアント自身が alt screen へ
+        // 入るので**中身が素のシェルでも true**（`remote_open_watchdog` が固定している
+        // 性質）= ここで落ちるのは器なしの素のシェルだけで、取りこぼしは増えない
+        let gate_alt_screen = !tako_core::terminal::c2_legacy();
         for pid in pane_ids {
             if let Some(session) = self.terminals.get(&pid) {
+                if gate_alt_screen && !session.is_alt_screen() {
+                    continue;
+                }
                 if let Some(m) = session.agent_metrics() {
                     let has_data =
                         m.ctx_percent.is_some() || m.usage_text.is_some() || m.limit_5h.is_some();

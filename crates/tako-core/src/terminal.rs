@@ -1129,13 +1129,81 @@ impl TerminalSession {
             .collect()
     }
 
+    /// 表示行の**末尾 `n` 行だけ**を平文で返す（#1301）。
+    ///
+    /// [`Self::visible_lines`] は [`Self::screen`]（= `snapshot_opts`）を通るので、
+    /// 1 回ごとに `cols * rows` のセル配列を確保し、行ごとに `ScreenLine`
+    /// （`String` + `Vec<StyleRun>` + `Vec<usize>` の 3 確保）を組んでから
+    /// **その場で捨てて**文字列だけを取り出している。2 秒 tick の定期判定は
+    /// どれも画面末尾しか見ないので、全ペインぶんの `Screen` を毎 tick
+    /// 作り直す理由が無い（#1001 の H2 / H3）。
+    ///
+    /// 返す文字列は `visible_lines()` の末尾 `n` 行と**1 バイトも変わらない**
+    /// （`n >= rows` なら全体。テスト `tail_lines_は_visible_lines_の末尾と一致する`）。
+    /// 色・選択・カーソルはテキストを変えないので、装飾を解決せずに済む
+    pub fn tail_lines(&self, n: usize) -> Vec<String> {
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Flags;
+
+        let term = self.term.lock();
+        let rows = term.screen_lines();
+        let take = n.min(rows);
+        if take == 0 {
+            return Vec::new();
+        }
+        let grid = term.grid();
+        let cols = grid.columns();
+        // display_offset d のビューポートは grid の Line(-d ..= rows-d-1)（`screen.rs` と同じ）。
+        // その末尾 take 行を上から順に組む
+        let first = rows as i32 - grid.display_offset() as i32 - take as i32;
+        let mut out = Vec::with_capacity(take);
+        for i in 0..take as i32 {
+            let row = &grid[Line(first + i)];
+            // #816 と同じ作法: 行の大半は末尾の未使用セル（空白）で `trim_end` で必ず落ちる。
+            // 先に後ろから境界を探し、そこまでしか組み立てない
+            // 全角の後続セル（スペーサー）と `\0` は `compose_line` が落とすので同じく落とす
+            let dropped = |cell: &alacritty_terminal::term::cell::Cell| {
+                cell.flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                    || cell.c == '\0'
+            };
+            let mut end = cols;
+            while end > 0 {
+                let cell = &row[Column(end - 1)];
+                if !dropped(cell) && cell.c != ' ' {
+                    break;
+                }
+                end -= 1;
+            }
+            let mut text = String::with_capacity(end);
+            for col in 0..end {
+                let cell = &row[Column(col)];
+                if dropped(cell) {
+                    continue;
+                }
+                text.push(cell.c);
+            }
+            // 空白以外の末尾空白類（全角空白等）は `visible_lines` と同じく `trim_end` に任せる
+            text.truncate(text.trim_end().len());
+            out.push(text);
+        }
+        out
+    }
+
     /// Claude TUI のフッターからエージェントメトリクスを抽出する。
     /// alt screen（TUI モード）のペインの末尾数行を走査し、
     /// `ctx NN%` や usage 情報をパースする。
     /// tmux バックエンド経由では alt screen フラグがホスト側に伝播しない
-    /// ことがあるため、alt screen でなくても末尾行にパターンがあれば抽出する
+    /// ことがあるため、alt screen でなくても末尾行にパターンがあれば抽出する。
+    ///
+    /// 採るのは画面末尾 [`AGENT_TUI_TAIL_LINES`] 行だけ（#1301）。
+    /// `TAKO_1001_C2_LEGACY=1` で全画面スナップショットへ戻せる（A/B 用）
     pub fn agent_metrics(&self) -> Option<AgentMetrics> {
-        let lines = self.visible_lines();
+        let lines = if c2_legacy() {
+            self.visible_lines()
+        } else {
+            self.tail_lines(AGENT_TUI_TAIL_LINES)
+        };
         parse_agent_metrics(&lines)
     }
 
@@ -1213,6 +1281,48 @@ pub enum MetricsSource {
     Codex,
 }
 
+/// 2 秒 tick の定期判定が画面から採る**末尾の行数**（#1301）。
+///
+/// この窓の**正本はここ 1 箇所**で、採る側（`TerminalSession::agent_metrics` /
+/// `main.rs` の `drive_queued_message_recovery`）と読む側（[`parse_agent_metrics`] /
+/// `claude_tui::queued_messages_pending`）が同じ値を引く。片方だけ広げると
+/// 「画面には出ているのに読めない」状態になる。
+///
+/// 値の根拠（読む側が要る窓の広いほう + 余裕）:
+///
+/// - フッター（[`FOOTER_SCAN_LINES`] = 8 物理行）: `ctx NN%` / `5h NN%` / `7d NN%` / モデル名
+/// - 上限の見出し（[`EXHAUSTED_SCAN_LINES`] = 24 物理行、外したら **24 論理行**で再走査）:
+///   実採取（25 桁の狭いペイン・#1123）で見出しは画面末尾から **16 物理行**目に居た。
+///   48 はそれに 3 倍、物理 24 行の窓には 2 倍の余裕がある
+/// - 入力欄（`claude_tui::bottom_prompt_content` は最下部のプロンプト行）:
+///   実測でフッター 6 行 + 空行 1 + 枠 3 行 = 末尾から 9〜10 行目（#1093）
+///
+/// **rows がこの値以下のペインでは全画面と一致する**（= 大半のペインで判定は 1 ビットも動かない）。
+/// 節約の主体は行数ではなく `Screen`（`ScreenLine` の 3 確保 / 行）を組まないこと
+pub const AGENT_TUI_TAIL_LINES: usize = 48;
+
+/// 窓の正本が、読む側が要る窓を両方とも覆っていることを**コンパイル時**に固定する（#1301）。
+/// 片方の窓を広げたらここでビルドが落ちる = 採る側も一緒に直る
+/// （テストではなくビルドで止めるので、`--lib` を走らせない経路でも取りこぼさない）
+const _: () = assert!(
+    AGENT_TUI_TAIL_LINES >= FOOTER_SCAN_LINES,
+    "フッターの走査窓が AGENT_TUI_TAIL_LINES を超えている（採る窓を広げること。#1301）"
+);
+const _: () = assert!(
+    AGENT_TUI_TAIL_LINES >= EXHAUSTED_SCAN_LINES,
+    "上限見出しの走査窓が AGENT_TUI_TAIL_LINES を超えている（採る窓を広げること。#1093 / #1123 / #1301）"
+);
+
+/// `TAKO_1001_C2_LEGACY=1` で #1301 前（全ペインのフルスナップショット + alt screen ゲート無し）
+/// へ戻す。同一バイナリで A/B を取る入口（`main.rs` の `refresh_agent_metrics` も同じ関数を引く）
+pub fn c2_legacy() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_1001_C2_LEGACY").is_some())
+}
+
+/// TUI フッター（ステータスバー + ヒント行）を走査する画面末尾の行数
+const FOOTER_SCAN_LINES: usize = 8;
+
 /// 画面行リストからメトリクスを抽出する（#1021）。
 ///
 /// `TerminalSession::agent_metrics` は**生きたセッション**を要るので GUI 層しか呼べない。
@@ -1231,7 +1341,7 @@ pub fn agent_metrics_from_text(text: &str) -> Option<AgentMetrics> {
 /// 画面行リストから Claude / Codex TUI フッターのメトリクスをパースする（#357 拡張）
 fn parse_agent_metrics(lines: &[String]) -> Option<AgentMetrics> {
     // TUI のフッターは画面末尾 8 行以内にある（ステータスバー + ヒント行）
-    let scan_lines: Vec<_> = lines.iter().rev().take(8).collect();
+    let scan_lines: Vec<_> = lines.iter().rev().take(FOOTER_SCAN_LINES).collect();
     let mut ctx_percent = None;
     let mut ctx_detail = None;
     let mut usage_text = None;
@@ -2196,6 +2306,194 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         done(session.history_size())
+    }
+
+    // --- #1301: 2 秒 tick が採る末尾 N 行 ---
+
+    /// 実採取の画面（#1093 の 72 桁 / #1123 の 25 桁）で、全画面を渡したときと
+    /// 末尾 `AGENT_TUI_TAIL_LINES` 行だけを渡したときのパース結果が一致すること。
+    /// 窓を狭めた瞬間に「画面には出ているのに読めない」が起きないことの機械検査
+    #[test]
+    fn 末尾窓だけでも実採取画面のパース結果は変わらない() {
+        let screens: Vec<Vec<String>> = vec![
+            limit_stopped_screen("You've hit your session limit · resets 7:50pm (Asia/Tokyo)"),
+            limit_stopped_screen("You've hit your weekly limit · resets 7:50pm (Asia/Tokyo)"),
+            narrow_limit_stopped_screen(&[
+                "  ⎿  You've hit your",
+                "     session limit ·",
+                "     resets 5:50am",
+                "     (Asia/Tokyo)",
+                "     /usage-credits to",
+                "     request more usage",
+                "     from your admin.",
+            ]),
+        ];
+        for (i, full) in screens.iter().enumerate() {
+            let tail: Vec<String> = full
+                .iter()
+                .rev()
+                .take(AGENT_TUI_TAIL_LINES)
+                .rev()
+                .cloned()
+                .collect();
+            let a = parse_agent_metrics(full);
+            let b = parse_agent_metrics(&tail);
+            assert_eq!(
+                (
+                    a.as_ref().and_then(|m| m.limit_5h),
+                    a.as_ref().and_then(|m| m.limit_week),
+                    a.as_ref().and_then(|m| m.ctx_percent)
+                ),
+                (
+                    b.as_ref().and_then(|m| m.limit_5h),
+                    b.as_ref().and_then(|m| m.limit_week),
+                    b.as_ref().and_then(|m| m.ctx_percent)
+                ),
+                "画面 {i}: 末尾 {AGENT_TUI_TAIL_LINES} 行だけだと結果が変わる（窓が足りない）"
+            );
+        }
+    }
+
+    /// `tail_lines(n)` が `visible_lines()` の末尾 n 行と**1 バイトも変わらない**こと。
+    /// 全角・末尾空白・空行・n が行数より大きい場合・スクロール中（display_offset > 0）を
+    /// 実 PTY で通す（#1301 の入れ替えが「同じ文字列を返す」ことが前提になっている）
+    #[cfg(unix)]
+    #[test]
+    fn tail_lines_は_visible_lines_の末尾と一致する() {
+        use std::time::{Duration, Instant};
+
+        // 20 桁 10 行。全角・末尾空白・行内空白・空行を混ぜる
+        let script = "printf 'ab   \\nあいうえお\\na b\\n\\nTAIL_MARK\\n'; sleep 30";
+        let (session, _rx) = TerminalSession::spawn(
+            20,
+            10,
+            SpawnOptions {
+                command: Some(SpawnCommand {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), script.to_string()],
+                }),
+                ..SpawnOptions::default()
+            },
+        )
+        .expect("PTY を張れる");
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !session.visible_lines().iter().any(|l| l == "TAIL_MARK") && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let full = session.visible_lines();
+        assert!(
+            full.iter().any(|l| l == "TAIL_MARK"),
+            "画面が整わない: {full:?}"
+        );
+        assert!(
+            full.iter().any(|l| l == "あいうえお"),
+            "全角行が出ていない: {full:?}"
+        );
+
+        for n in [0usize, 1, 2, 8, 10, 24, 48, 100] {
+            let want: Vec<String> = full
+                .iter()
+                .rev()
+                .take(n.min(full.len()))
+                .rev()
+                .cloned()
+                .collect();
+            assert_eq!(session.tail_lines(n), want, "n={n} で末尾が一致しない");
+        }
+        // alt screen（全画面 TUI）のペインでも同じ関係が成り立つ。
+        // 副グリッドは履歴を持たないので `display_offset` は常に 0 = 起点の計算が変わる
+        let alt_script = "printf '\\033[?1049h'; printf 'ALT_A\\nALT_B\\nALT_TAIL\\n'; sleep 30";
+        let (alt, _rx3) = TerminalSession::spawn(
+            20,
+            6,
+            SpawnOptions {
+                command: Some(SpawnCommand {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), alt_script.to_string()],
+                }),
+                ..SpawnOptions::default()
+            },
+        )
+        .expect("PTY を張れる");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !alt.is_alt_screen() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(alt.is_alt_screen(), "alt screen へ入らない");
+        while !alt.visible_lines().iter().any(|l| l == "ALT_TAIL") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let alt_full = alt.visible_lines();
+        assert!(
+            alt_full.iter().any(|l| l == "ALT_TAIL"),
+            "alt screen の画面が整わない: {alt_full:?}"
+        );
+        for n in [1usize, 3, 6, 48] {
+            let want: Vec<String> = alt_full
+                .iter()
+                .rev()
+                .take(n.min(alt_full.len()))
+                .rev()
+                .cloned()
+                .collect();
+            assert_eq!(alt.tail_lines(n), want, "alt screen の n={n} で一致しない");
+        }
+
+        // 空ペイン（1 行も書かれていない）でも同じ関係が成り立つ
+        let (empty, _rx2) = TerminalSession::spawn(
+            20,
+            4,
+            SpawnOptions {
+                command: Some(SpawnCommand {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), "sleep 30".to_string()],
+                }),
+                ..SpawnOptions::default()
+            },
+        )
+        .expect("PTY を張れる");
+        assert_eq!(
+            empty.tail_lines(48),
+            empty.visible_lines(),
+            "空ペインで末尾窓が全画面と一致しない"
+        );
+    }
+
+    /// スクロール中（`display_offset > 0`）でも `tail_lines` は**いま見えている**
+    /// 末尾を返すこと。ビューポートの起点を取り違えると履歴の行が混ざる
+    #[cfg(unix)]
+    #[test]
+    fn スクロール中でも末尾窓はビューポートを指す() {
+        use std::time::{Duration, Instant};
+
+        let session = spawn_lines(60, None);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while session.history_size() < 40 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        session.scroll_to(20);
+        assert!(
+            session.visible_lines() != session.tail_lines(0),
+            "前提: 画面に中身がある"
+        );
+        for n in [1usize, 2, 4, 48] {
+            let full = session.visible_lines();
+            let want: Vec<String> = full
+                .iter()
+                .rev()
+                .take(n.min(full.len()))
+                .rev()
+                .cloned()
+                .collect();
+            assert_eq!(
+                session.tail_lines(n),
+                want,
+                "scroll_to(20) の n={n} で末尾が一致しない"
+            );
+        }
+        session.scroll_to_bottom();
     }
 
     /// #816 で `history_plain_lines` は「後ろから境界を探して 1 本だけ組み立てる」形に

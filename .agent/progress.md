@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-11（#1295: 実行拒否ゲートが claude では常に真だったのを締めた）
-- 真因は `None`（観測ゼロ）を無条件に作業ゼロと数えていたこと。claude の腕（`query_agent_status`）は `agent_work_started` を一度も代入しないので `!= Some(true)` が常に真で、`execution_refused_patterns(Claude)` に文言を 1 つ足した瞬間に正常完了した worker が `error` / `retry_spawn` へ落ちる形だった。判定を `dispatch::refusal_gate_open` の 1 実装へ閉じ、`None` を通せる系統は `agent_support::MATRIX` の新マス `worker_refusal_work_proof`（agy だけ対象外 = 代理の証拠を使う）が宣言する
-- A/B（`TAKO_1295_LEGACY=1`）: 旧アーム = 正常完了の claude worker が `status=error` / `kind=execution_refused` / `retry_spawn`、新アーム = `error` なし。#1034 の agy 経路は両アームとも分類されたまま（既存テスト緑）
-- 番犬は 4 → 7 本で doc と assert を機械で結んだ（doc の「ゲートの形」1 行を assert の入力にする）。ゲートを旧形へ戻す A/B で 4 本が `dispatch.rs:9343` 等を名指し FAILED
-
 ## 2026-09-11（#1320 / #1324 / #1319: AI 向け規約ファイルの取り残し 3 件）
 - `AGENTS.md` の「状況」行（Phase 5 中断中のまま = 3 か月前）と push 運用（「公開まで main 直 push 可」）を実態へ。フェーズ詳細は `.agent/roadmap.md` 参照に寄せ、Phase 7 見出しも「✅ 公開済み・残は README 図版と CONTRIBUTING.md」へ棚卸し（#1320）
 - `.agent/commands.md` に `tako file open-in-tako`（#1182）の行を追加。コマンド名で正規化した `comm` の差分は設計上の畳み込み `tako setup bootstrap` 1 件のみ（#1324）
@@ -73,3 +68,8 @@
 - 実測（`mcp::tools()` = 149 / `tako --help` = 84）に対し docs は 147 / 128 / 69 / 68 を名乗り、MCP 11 ツール・CLI 10 コマンドが一覧に 1 度も出てこなかった。件数 11 か所を直し欠落を既存カテゴリへ追加（`mcp-tools.md` の「機械的に抽出」note も手書き + 番犬の事実へ）
 - 番犬 `crates/tako-control/tests/docs_tool_inventory.rs` 6 本が件数と名前集合の両方を拘束。CLI 集合は `main.rs` の `enum Command` のソース走査（実バイナリの `--help` と差分 0 を実測）で、**記述が見つからないことも FAILED** にして黙って通らない形
 - A/B（修正前 docs へ戻す）: 4/6 FAILED = 件数 11 か所を file:line で・欠落 21 件を名前で名指し → 修正後 6/6 緑。案 (a)（ページの生成物化）は構成変更なので未実施・ユーザー相談へ回す
+
+## 2026-09-11（#1301: 2 秒 tick の全ペイン フルスナップショット 2 本を末尾窓へ）
+- `refresh_agent_metrics` / `drive_queued_message_recovery` が毎 tick 全ペインの `Screen`（行ごとに `String` + `Vec<StyleRun>` + `Vec<usize>` の 3 確保）を組んで文字列だけ取って捨てていた（#1001 の H2 / H3）。`TerminalSession::tail_lines(n)`（`Screen` を通さずグリッドから末尾 n 行）+ alt screen ゲート + C3 の判定順入れ替えへ。窓の正本は `AGENT_TUI_TAIL_LINES`=48（Issue 記載の 8 では #1093 / #1123 の上限見出し窓 24 を割る）
+- 実測（隔離 GUI・`tako-vd`・1/4/12/22 ペイン・各 20 秒 × 3 窓）: 傾き **0.271 → 0.068 M 命令/秒/ペイン**（全 12 窓の最小二乗）= 2 秒 tick 1 回あたり 0.543 → 0.135 M 命令/ペイン。22 ペインの footprint 46.4 → 39.9 MB
+- A/B は `TAKO_1001_C2_LEGACY=1` / `TAKO_1001_C3_LEGACY=1`。番犬 4 本が修正前ソースで file:line 名指し FAILED、`tail_lines` は故障注入 3 種で単体テストが落ちる
