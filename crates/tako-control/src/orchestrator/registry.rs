@@ -55,8 +55,10 @@ pub fn registry_path() -> Option<PathBuf> {
         Some(
             test_registry_path()
                 .get_or_init(|| {
-                    std::env::temp_dir()
-                        .join(format!("tako-test-workers-{}.yaml", std::process::id()))
+                    // `.bak.N` / `.lock` も脇に出来るので、TMPDIR 直下ではなく
+                    // プロセスごとの使い捨ての親の下へ置く（終了時に親ごと消える = #1312）
+                    tako_core::test_residue::process_scratch("workers-registry")
+                        .join("workers.yaml")
                 })
                 .clone(),
         )
@@ -922,9 +924,11 @@ pub fn list_payload(
 mod tests {
     use super::*;
 
+    /// テスト 1 本ぶんの workers.yaml。置き場はプロセスごとの使い捨ての親の下で、
+    /// 終了時に親ごと消える（#1312。以前は pid の付かない固定名
+    /// `tako-registry-tests` を並行する別プロセスと共有していた）
     fn temp_registry_file(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("tako-registry-tests");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tako_core::test_residue::process_scratch("registry-tests");
         let path = dir.join(format!("{name}-{}.yaml", std::process::id()));
         let _ = std::fs::remove_file(&path);
         path

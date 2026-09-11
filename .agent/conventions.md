@@ -1316,6 +1316,28 @@ Dock のピン留めは `.app` への **file URL ブックマーク**（`com.app
   `crates/tako-core/tests/test_data_residue.rs`（子プロセスを起こして**実際に
   dir が消えること / 生きている子の dir が残ること**を見る）の 2 段。A/B は `TAKO_1296_LEGACY=1`
 
+### テスト本体の使い捨てはスコープで消える器で作る（Issue #1312）
+
+#1296 が掃けるようにしたのは**置き場を決める側**（`paths.rs` / `orchestrator` の隔離先）だけで、
+テストが個別に `temp_dir().join(…)` で作る使い捨ては射程の外だった
+（実測 2026-09-11: `cargo test -p tako-core --lib` 1 回で 14 件残る）。
+
+- **`tako_core::test_residue::ScratchDir::new("<タグ>")`** を使う。スコープを抜けた時点で
+  消える（panic の巻き戻しでも `Drop` は走る）。同じタグで何度作っても別の dir になるので、
+  並行するテストが同じ名前を取り合わない（#1313 / #1300 と同じ作法）
+- **スコープが無いもの**（`OnceLock` に持つ器・子プロセスが使うキャッシュ）は
+  `test_residue::process_scratch("<タグ>")`。同じタグなら同じ dir を返し、
+  プロセス終了時に親ごと消える
+- 置き場の親は `<TMPDIR>/tako-test-scratch-<pid>` の 1 つだけで、**#1296 の 2 段構えが
+  そのまま効く**（`atexit` + 次回起動時の pid 回収 + `tako test-residue` から見える）。
+  `KINDS` へ種別を足したら CLI / MCP の案内も足す（番犬 `種別はcliとmcpの案内に載っている`）
+- 消す経路は `remove_scratch` の 1 本で、**一時ディレクトリ配下であることを確かめてから**消す
+- 番犬は 2 段: `tako_core::test_residue` の
+  `テストを一巡してもtmpdirに残骸が残らない`（**このテストバイナリをもう一度回して実際に数える**。
+  個々のテストの成否では落とさず、残骸の件数だけを見る）と、
+  `crates/tako-control/tests/test_residue_watchdog.rs` の静的検査。A/B は `TAKO_1312_LEGACY=1`
+  （器を修正前 = 作りっぱなしへ戻す。実測 19 件が残る）
+
 ## 実 tmux の e2e は器をプロセスごとに分ける（Issue #1300）
 
 **`-L` に渡す器の名前に固定名を使わない**（`tmux_e2e::socket_for("<Issue 番号>")` が

@@ -157,10 +157,13 @@ enum Command {
     /// `fix` で作業ログの archive 移送だけを自動で直す
     #[command(name = "context-budget")]
     ContextBudget(ContextBudgetArgs),
-    /// テスト・検証プロセスが一時ディレクトリへ残した使い捨て dir を掃除する（Issue #1296）。
-    /// 対象は `<TMPDIR>/tako-test-data-<pid>`（cargo test の data dir）と
-    /// `<TMPDIR>/tako-agent-config-<pid>`（検証プロセスのエージェント設定）で、
-    /// **所有プロセスが生きていないものだけ**。**既定は dry-run**（1 つも消さない）
+    /// テスト・検証プロセスが一時ディレクトリへ残した使い捨て dir を掃除する（Issue #1296 / #1312）。
+    /// 対象は `<TMPDIR>` 直下の `tako-test-data-<pid>`（cargo test の data dir）/
+    /// `tako-agent-config-<pid>`（検証プロセスのエージェント設定）/
+    /// `tako-test-scratch-<pid>`（テスト本体の使い捨て作業ディレクトリ）/
+    /// `tako-test-orchestrator-<pid>` / `tako-test-supervisor-<pid>`（オーケストレーターの
+    /// テスト隔離先）で、**所有プロセスが生きていないものだけ**。
+    /// **既定は dry-run**（1 つも消さない）
     #[command(name = "test-residue")]
     TestResidue(TestResidueArgs),
     /// シェル統合（OSC 7 / 133 = ペインの cwd 追従とコマンド実行状態）の
@@ -5151,8 +5154,15 @@ fn test_residue_local(args: &TestResidueArgs) -> Result<(), String> {
         }
         let bytes: u64 = mine.iter().map(|r| r.bytes).sum();
         let removable = mine.iter().filter(|r| r.verdict.removable()).count();
+        // 桁は種別名の実長に合わせる（#1312 で `tako-test-orchestrator-` が増え、
+        // 固定 20 桁では列がずれた）
+        let width = residue::KINDS
+            .iter()
+            .map(|k| k.prefix.len())
+            .max()
+            .unwrap_or(20);
         println!(
-            "  {:<20} {:>5} 件 / {:>9}（消せる {removable}）  {}",
+            "  {:<width$} {:>5} 件 / {:>9}（消せる {removable}）  {}",
             kind.prefix,
             mine.len(),
             human_bytes(bytes),
