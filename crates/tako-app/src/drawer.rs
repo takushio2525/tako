@@ -90,26 +90,13 @@ impl TakoApp {
                         .child(crate::ui_text::common::yes())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.bg_pending_kill = None;
-                            if this.workspace.remove_shelved(pane_id).is_some() {
-                                this.terminals.remove(&pane_id);
-                                this.previews.remove(&pane_id);
-                                this.preview_edits.remove(&pane_id);
-                                this.remove_preview_image_cache(pane_id);
-                                this.preview_views.remove(&pane_id);
-                                this.preview_scroll_handles.remove(&pane_id);
-                                this.video_players.remove(&pane_id);
-                                this.remove_video_frame_cache(pane_id);
-                                this.sync_preview_watches();
-                                this.scroll_accum.remove(&pane_id);
-                                this.scroll_ctls.remove(&pane_id);
-                                this.drop_tmux_view_session(pane_id);
-                                // たまり場カードの kill も GUI のボタン操作（#770 の監査記録）
-                                this.drop_backend_session(
-                                    pane_id,
-                                    tako_core::pane_log::CloseOrigin::PaneButton,
-                                    None,
-                                );
-                            }
+                            // 後始末の一式は `kill_shelved_pane` に集約してある（#775）。
+                            // ここに並べ直すとレジストリ記録のような後付けが
+                            // この経路だけ抜ける（それが #775 の症状）
+                            this.kill_shelved_pane(
+                                pane_id,
+                                tako_core::pane_log::CloseOrigin::PaneButton,
+                            );
                             if this.workspace.shelved_panes().is_empty() {
                                 this.drawer_visible = false;
                             }

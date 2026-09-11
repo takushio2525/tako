@@ -8555,17 +8555,57 @@ impl TakoApp {
     /// active のまま残り続けていた**（#658 の残骸の主因）。
     /// `CloseReason::Exited`（PTY 死亡）は #390 の方針どおり倒さない
     /// ——「ペインが消えても worker は生きている」追跡を維持するため。
-    /// セカンダリモードはプライマリのレジストリを触らない
+    /// セカンダリモードはプライマリのレジストリを触らない。
+    ///
+    /// #775: `close_reason` には発生源（`close:gui` / `close:gui-tab` / `close:kbd`）を
+    /// 載せる。綴りは `registry::close_reason_for` の 1 実装が持つので、GUI と
+    /// CLI / MCP で語彙がずれない
     fn mark_worker_closed(&self, pane_id: PaneId, reason: CloseReason) {
         if !reason.is_explicit() || self.secondary {
             return;
         }
-        if let Err(e) = tako_control::orchestrator::registry::mark_closed_by_pane(
+        if let Err(e) = tako_control::orchestrator::registry::mark_closed_by_origin(
             pane_id.as_u64(),
-            "explicit_close",
+            reason.origin(),
+            None,
         ) {
             eprintln!("warning: worker レジストリの close 記録に失敗: {e}");
         }
+    }
+
+    /// たまり場（退避中ペイン）のカードから kill する（#775）。
+    ///
+    /// たまり場のペインは**どのタブにも居ない**ので `remove_pane_with` を通らず、
+    /// 後始末を drawer の on_click が独自に並べていた = 明示 close なのに
+    /// **worker レジストリの記録だけが抜けていた**（#658 が配線したのは
+    /// ペイン × / タブ × / cmd+W の 3 経路で、この 4 番目が残っていた）。
+    /// 記録フックは 1 か所（[`Self::mark_worker_closed`]）に寄せてあるので、
+    /// ここもそれを通す。UI 側に残すのは確認状態とドロワーの開閉だけ。
+    /// 返り値は「実際に kill したか」（既に居ないペインは false）
+    fn kill_shelved_pane(&mut self, pane_id: PaneId, origin: CloseOrigin) -> bool {
+        if self.workspace.remove_shelved(pane_id).is_none() {
+            return false;
+        }
+        self.terminals.remove(&pane_id);
+        self.previews.remove(&pane_id);
+        self.preview_edits.remove(&pane_id);
+        self.remove_preview_image_cache(pane_id);
+        self.preview_views.remove(&pane_id);
+        self.preview_scroll_handles.remove(&pane_id);
+        self.video_players.remove(&pane_id);
+        self.remove_video_frame_cache(pane_id);
+        self.sync_preview_watches();
+        self.scroll_accum.remove(&pane_id);
+        self.scroll_ctls.remove(&pane_id);
+        self.drop_tmux_view_session(pane_id);
+        // たまり場カードの kill も GUI のボタン操作（#770 の監査記録）
+        self.drop_backend_session(pane_id, origin, None);
+        // #775: 明示 close なので worker レジストリへも記録する。
+        // A/B（`TAKO_775_LEGACY=1`）は記録しない旧挙動へ戻す
+        if std::env::var("TAKO_775_LEGACY").as_deref() != Ok("1") {
+            self.mark_worker_closed(pane_id, CloseReason::Explicit(origin));
+        }
+        true
     }
 
     fn remove_pane_with(&mut self, pane_id: PaneId, reason: CloseReason, cx: &mut Context<Self>) {
@@ -46859,6 +46899,50 @@ mod self_test {
                     reason == origin.marker()
                         || reason == origin.marker_with_caller(caller_role.as_deref())
                 };
+                // #775: 同じ 3 経路が **worker レジストリ**へも発生源つきで記録すること。
+                // ペインログの発生源と `workers.yaml` の `close_reason` が同じ語彙
+                // であることが #770 の調査手順（両者の照合）の前提になっている。
+                // 置き場は `TAKO_WORKERS_FILE`（#658 でセルフテストの既定隔離に入って
+                // いる）なので、本番の workers.yaml には触れない
+                let register775 = |pane: u64, label: &str| {
+                    use tako_control::orchestrator::registry::{record_spawn, RegisterSpawn};
+                    if let Err(e) = record_spawn(RegisterSpawn {
+                        label: Some(label.to_string()),
+                        project: "st775".into(),
+                        agent: "claude".into(),
+                        model: None,
+                        effort: None,
+                        pane,
+                        tab: None,
+                        tmux_session: None,
+                        issues: vec![],
+                        ledger_id: None,
+                        cwd: None,
+                        prompt_head: None,
+                    }) {
+                        fail(&format!("87: worker を登録できない (#775。{e})"));
+                    }
+                };
+                // 「status/close_reason」の組を読む（エントリが無ければ空文字）
+                let registry775 = |pane: u64| -> String {
+                    use tako_control::orchestrator::registry::WorkerRegistry;
+                    WorkerRegistry::load()
+                        .ok()
+                        .and_then(|reg| {
+                            reg.workers
+                                .values()
+                                .find(|e| e.pane == pane)
+                                .map(|e| {
+                                    format!(
+                                        "{}/{}",
+                                        e.status,
+                                        e.close_reason.clone().unwrap_or_default()
+                                    )
+                                })
+                        })
+                        .unwrap_or_default()
+                };
+
                 // 対象ペインを作り、ログ素材になる出力を残してから閉じる
                 let split_cmd = sh.discard_output(&format!("{cli} split --right --focus"));
                 type_text(any, cx, &split_cmd, true);
@@ -46872,6 +46956,7 @@ mod self_test {
                         // 73 が見ているので切っておく（開いたダイアログが残ると
                         // 以降の項目の escape を食う）
                         app.confirm_close = false;
+                        register775(target.as_u64(), "st775-kbd");
                         app.close_focused_pane(cx);
                         target.as_u64()
                     })
@@ -46885,6 +46970,7 @@ mod self_test {
                 let gui_pane = window
                     .update(cx, |app, _, cx| {
                         let target = app.focused_pane();
+                        register775(target.as_u64(), "st775-gui");
                         app.close_pane_button(target, CloseOrigin::PaneButton, cx);
                         target.as_u64()
                     })
@@ -46896,6 +46982,7 @@ mod self_test {
                 type_text(any, cx, "echo TAKO-566-CLI", true);
                 wait(cx, 800).await;
                 let cli_pane = window.update(cx, |app, _, _| app.focused_pane().as_u64()).unwrap_or(0);
+                register775(cli_pane, "st775-cli");
                 // 実 CLI（dispatch 経路）で閉じる。フォーカスを分割元へ戻してから叩く
                 let _ = window.update(cx, |app, _, cx| {
                     app.focus_direction(SplitDirection::Left, cx);
@@ -46906,6 +46993,12 @@ mod self_test {
                 // ログの書き出しは環境で数秒かかる（Windows 実機で 1200ms 固定では
                 // `cli=""` になった）
                 let mut markers_ok = false;
+                let mut registry_ok = false;
+                // #775: レジストリ側の期待値。**`CloseOrigin::marker` から採る**
+                // （`close_reason_for` から採ると A/B の legacy 腕で期待値も旧値へ
+                // 動いてしまい、検出力が消える）。GUI 経路は caller を載せない
+                let want775 =
+                    |origin: CloseOrigin| -> String { format!("closed/{}", origin.marker()) };
                 for _ in 0..24 {
                     wait(cx, 500).await;
                     markers_ok = log_dir
@@ -46916,7 +47009,16 @@ mod self_test {
                                 && reason_is(&close_reason(dir, cli_pane), CloseOrigin::Cli)
                         })
                         .unwrap_or(false);
-                    if markers_ok {
+                    // dispatch 経路は呼び出し元 role が載る（ペインログと同じ扱い）
+                    registry_ok = registry775(kbd_pane) == want775(CloseOrigin::Keyboard)
+                        && registry775(gui_pane) == want775(CloseOrigin::PaneButton)
+                        && (registry775(cli_pane) == want775(CloseOrigin::Cli)
+                            || registry775(cli_pane)
+                                == format!(
+                                    "closed/{}",
+                                    CloseOrigin::Cli.marker_with_caller(caller_role.as_deref())
+                                ));
+                    if markers_ok && registry_ok {
                         break;
                     }
                 }
@@ -46932,9 +47034,20 @@ mod self_test {
                         );
                     }
                 }
+                println!(
+                    "TAKO_SELF_TEST_775: kbd={} gui={} cli={} legacy={}",
+                    registry775(kbd_pane),
+                    registry775(gui_pane),
+                    registry775(cli_pane),
+                    std::env::var_os("TAKO_775_LEGACY").is_some()
+                );
                 check(
                     markers_ok,
                     "ペインログ: クローズマーカーに発生源（kbd / gui / dispatch）が残る（#566）",
+                );
+                check(
+                    registry_ok,
+                    "workers.yaml: cmd+W / ペイン × / CLI の close が発生源つきで closed になる（#775）",
                 );
                 // 後始末: 確認ダイアログを残さない（残ると以降の項目のキー入力を食う）
                 let _ = window.update(cx, |app, _, cx| app.close_confirm_cancelled(cx));
@@ -66520,6 +66633,275 @@ mod self_test {
                 );
             }
 
+            // --- 項目 148: タブ × / たまり場 kill も worker レジストリへ記録する（#775） ---
+            //
+            // 項目 87 が見ているのは cmd+W / ペイン × / CLI の 3 経路。残る 2 つは
+            // **ここでしか踏めない**:
+            //   - タブ × = `remove_tab_from(TabButton)`（ペイン単位の close を通らない）
+            //   - たまり場カードの kill = `kill_shelved_pane`。退避中ペインはどのタブにも
+            //     居ないので `remove_pane_with` を通らず、#658 の配線から漏れていた
+            // 併せて「閉じた直後から `tako orchestrator workers`（--all 無し）に出ない」
+            // ことと、worker でないペインの close で余計な記録が増えないことを見る
+            {
+                use tako_control::orchestrator::registry::{
+                    record_spawn, RegisterSpawn, WorkerRegistry,
+                };
+                let reg148 = |pane: u64| -> String {
+                    WorkerRegistry::load()
+                        .ok()
+                        .and_then(|reg| {
+                            reg.workers.values().find(|e| e.pane == pane).map(|e| {
+                                format!("{}/{}", e.status, e.close_reason.clone().unwrap_or_default())
+                            })
+                        })
+                        .unwrap_or_default()
+                };
+                let entries148 = || -> usize {
+                    WorkerRegistry::load().map(|r| r.workers.len()).unwrap_or(0)
+                };
+                let register148 = |pane: u64, label: &str| {
+                    if let Err(e) = record_spawn(RegisterSpawn {
+                        label: Some(label.to_string()),
+                        project: "st775".into(),
+                        agent: "claude".into(),
+                        model: None,
+                        effort: None,
+                        pane,
+                        tab: None,
+                        tmux_session: None,
+                        issues: vec![],
+                        ledger_id: None,
+                        cwd: None,
+                        prompt_head: None,
+                    }) {
+                        fail(&format!("148: worker を登録できない (#775。{e})"));
+                    }
+                };
+                // 検証用タブを 1 枚起こす（項目 146 と同じ手。最後のタブを閉じると
+                // アプリが終了してしまうので、必ず別タブを作ってからタブ × を踏む）
+                let new_tab148 = |cx: &mut AsyncApp, title: &str| -> (u64, u64) {
+                    let made = window
+                        .update(cx, |app: &mut TakoApp, _, cx| {
+                            let made = tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::TabNew {
+                                    title: Some(title.to_string()),
+                                    focus: Some(true),
+                                    cwd: None,
+                                },
+                                PaneOrigin::Cli,
+                            );
+                            for (p, options) in std::mem::take(&mut app.pending_attach) {
+                                if app.spawn_session(p, options, cx).is_err() {
+                                    app.remove_pane(p, cx);
+                                }
+                            }
+                            cx.notify();
+                            made.ok()
+                                .and_then(|v| Some((v["pane"].as_u64()?, v["tab"].as_u64()?)))
+                        })
+                        .ok()
+                        .flatten();
+                    made.unwrap_or_else(|| fail("148: 検証用タブを作れない (#775)"))
+                };
+
+                // (1) タブ × — タブごと閉じた worker が closed になる
+                let (tab_pane148, tab_id148) = new_tab148(cx, "st775-tab");
+                register148(tab_pane148, "st775-tab");
+                let before148 = reg148(tab_pane148);
+                window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        app.confirm_close = false;
+                        // GUI のタブ × と同じ入口（既定の発生源 = TabButton）
+                        app.remove_tab(tako_core::TabId::from_raw(tab_id148), cx);
+                        cx.notify();
+                    })
+                    .unwrap_or_else(|e| fail(&format!("148: タブを閉じられない (#775。{e})")));
+
+                // (2) たまり場カードの kill — 退避してから GUI と同じ入口で殺す
+                let (shelf_pane148, shelf_tab148) = new_tab148(cx, "st775-shelf");
+                register148(shelf_pane148, "st775-shelf");
+                let shelved148 = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        let r = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Background {
+                                pane: Some(shelf_pane148),
+                                tab: None,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                        cx.notify();
+                        r.is_ok() && app.workspace.shelved(PaneId::from_raw(shelf_pane148)).is_some()
+                    })
+                    .unwrap_or(false);
+                check(shelved148, "148: 検証用ペインをたまり場へ退避できる (#775)");
+                // 退避だけでは倒さない（まだ生きている worker）
+                check(
+                    reg148(shelf_pane148).starts_with("active/"),
+                    "148: たまり場への退避で worker を closed にしない (#775)",
+                );
+                let killed148 = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        let killed = app.kill_shelved_pane(
+                            PaneId::from_raw(shelf_pane148),
+                            CloseOrigin::PaneButton,
+                        );
+                        cx.notify();
+                        killed
+                    })
+                    .unwrap_or(false);
+                check(killed148, "148: たまり場カードの kill が実行できる (#775)");
+
+                // (3) worker でない普通のペインを閉じても記録は増えない
+                let (_plain_pane148, plain_tab148) = new_tab148(cx, "st775-plain");
+                let count_before148 = entries148();
+                window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        app.confirm_close = false;
+                        app.remove_tab(tako_core::TabId::from_raw(plain_tab148), cx);
+                        cx.notify();
+                    })
+                    .unwrap_or_else(|e| fail(&format!("148: 検証用タブを閉じられない (#775。{e})")));
+
+                // 状態の到達を待つ（記録はファイル IO を挟む）。上限は機の混み具合で伸ばす
+                let budget148 = crate::self_test::state_wait_budget(
+                    std::time::Duration::from_secs(12),
+                    tako_core::wait_budget::machine_busy(),
+                );
+                // 期待値は `CloseOrigin::marker`（A/B で動かない側）から採る
+                let want_tab148 = format!("closed/{}", CloseOrigin::TabButton.marker());
+                let want_shelf148 = format!("closed/{}", CloseOrigin::PaneButton.marker());
+                let deadline148 = std::time::Instant::now() + budget148;
+                loop {
+                    if reg148(tab_pane148) == want_tab148
+                        && reg148(shelf_pane148) == want_shelf148
+                    {
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline148 {
+                        println!(
+                            "TAKO_SELF_TEST_WAIT_TIMEOUT: 148 の記録が {:?} 以内に\
+                             揃わなかった（tab={} shelf={} 期待 tab={want_tab148} \
+                             shelf={want_shelf148}）",
+                            budget148,
+                            reg148(tab_pane148),
+                            reg148(shelf_pane148)
+                        );
+                        break;
+                    }
+                    wait(cx, 250).await;
+                }
+                println!(
+                    "TAKO_SELF_TEST_775B: tab={} shelf={} before_tab={} plain_entries={}->{} \
+                     legacy={}",
+                    reg148(tab_pane148),
+                    reg148(shelf_pane148),
+                    before148,
+                    count_before148,
+                    entries148(),
+                    std::env::var_os("TAKO_775_LEGACY").is_some()
+                );
+                check(
+                    reg148(tab_pane148) == want_tab148,
+                    "148: タブ × で閉じた worker が発生源つきで closed になる (#775)",
+                );
+                check(
+                    reg148(shelf_pane148) == want_shelf148,
+                    "148: たまり場カードの kill が発生源つきで closed になる (#775)",
+                );
+                check(
+                    entries148() == count_before148,
+                    "148: worker でないペインの close は workers.yaml を増やさない (#775)",
+                );
+
+                // (4) 閉じた直後から `tako orchestrator workers`（--all 無し）に出ない
+                let listed148 = |cx: &mut AsyncApp, all: bool| -> Vec<u64> {
+                    window
+                        .update(cx, |app: &mut TakoApp, _, _| {
+                            tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::OrchestratorWorkers {
+                                    all: Some(all),
+                                },
+                                PaneOrigin::Cli,
+                            )
+                            .ok()
+                            .and_then(|v| {
+                                Some(
+                                    v["workers"]
+                                        .as_array()?
+                                        .iter()
+                                        .filter_map(|w| w["pane"].as_u64())
+                                        .collect::<Vec<_>>(),
+                                )
+                            })
+                        })
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default()
+                };
+                let active148 = listed148(cx, false);
+                let all148 = listed148(cx, true);
+                println!(
+                    "TAKO_SELF_TEST_775C: active={active148:?} all_has_tab={} all_has_shelf={}",
+                    all148.contains(&tab_pane148),
+                    all148.contains(&shelf_pane148)
+                );
+                check(
+                    !active148.contains(&tab_pane148) && !active148.contains(&shelf_pane148),
+                    "148: 閉じた worker が orchestrator workers（--all 無し）に出ない (#775)",
+                );
+                check(
+                    all148.contains(&tab_pane148) && all148.contains(&shelf_pane148),
+                    "148: --all では closed の追跡材料が残る (#775)",
+                );
+
+                // (5) エッジ: レジストリに無いペイン / 既に closed のエントリを再度閉じる
+                let untouched148 = entries148();
+                let snapshot148 = std::env::var_os("TAKO_WORKERS_FILE")
+                    .map(std::path::PathBuf::from)
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .unwrap_or_default();
+                window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        // レジストリに無いペイン（実在しない ID）
+                        app.mark_worker_closed(
+                            PaneId::from_raw(9_999_999),
+                            CloseReason::Explicit(CloseOrigin::PaneButton),
+                        );
+                        // 既に closed のエントリを別の発生源で再度閉じる
+                        app.mark_worker_closed(
+                            PaneId::from_raw(tab_pane148),
+                            CloseReason::Explicit(CloseOrigin::Keyboard),
+                        );
+                        // PTY 死亡は倒さない（#390 の不変条件）
+                        app.mark_worker_closed(PaneId::from_raw(shelf_pane148), CloseReason::Exited);
+                    })
+                    .ok();
+                let after148 = std::env::var_os("TAKO_WORKERS_FILE")
+                    .map(std::path::PathBuf::from)
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .unwrap_or_default();
+                check(
+                    entries148() == untouched148 && after148 == snapshot148,
+                    "148: 不在ペイン / closed 済みの再 close は workers.yaml を書き換えない (#775)",
+                );
+
+                // 後片付け: 残っているのは (2) の器だけ（ペインは kill 済みでタブは空）
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                    if app
+                        .workspace
+                        .tabs()
+                        .iter()
+                        .any(|t| t.id() == tako_core::TabId::from_raw(shelf_tab148))
+                    {
+                        app.remove_tab(tako_core::TabId::from_raw(shelf_tab148), cx);
+                    }
+                    cx.notify();
+                });
+            }
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);
@@ -69628,6 +70010,12 @@ mod session_kill_boundary_tests {
             "detach_session",
             "ControlHost = CLI / MCP の明示 close（発生源つき）",
         ),
+        (
+            "kill_shelved_pane",
+            "たまり場カードの kill = GUI の明示操作。退避中ペインはどのタブにも \
+             居ないので drop_backend_session_with（ツリーの close 経路）を通れない。\
+             #775 でここへ集約したので、drawer.rs の一括免除は不要になった",
+        ),
     ];
 
     /// 走査対象のソース。この番犬モジュール自身（パターン文字列を含む）は除外する
@@ -69646,7 +70034,9 @@ mod session_kill_boundary_tests {
     /// 判定は「直前に現れた `fn 名前(`」で行う（関数境界の近似で十分な粒度）
     #[test]
     fn セッションkillの呼び出しが明示close経路の外に無い() {
-        // drawer.rs（たまり場カードの kill 確認）は GUI の明示操作なので別枠で許可する
+        // #775 以降、たまり場カードの kill も名前のある関数（`kill_shelved_pane`）に
+        // 収まっているので、drawer.rs のファイル単位の免除は撤去した
+        // （UI のクロージャから kill を直接撃てる穴を残さない）
         let files = ["src/main.rs", "src/drawer.rs"];
         let mut offenders = Vec::new();
         for rel in files {
@@ -69660,10 +70050,7 @@ mod session_kill_boundary_tests {
                 if !line.contains(".drop_backend_session(") {
                     continue;
                 }
-                let allowed = ALLOWED_CALLERS.iter().any(|(f, _)| *f == current_fn)
-                    // たまり場ドロワーの kill 確認（GUI の明示操作）はクロージャの中なので
-                    // 関数名で切れない。ファイル単位で許可する
-                    || rel == "src/drawer.rs";
+                let allowed = ALLOWED_CALLERS.iter().any(|(f, _)| *f == current_fn);
                 if !allowed {
                     offenders.push(format!("{rel}:{} （{current_fn} の中）", i + 1));
                 }

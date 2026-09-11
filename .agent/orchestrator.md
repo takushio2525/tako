@@ -461,9 +461,25 @@ watch / status / report を続けられる。既定は active のみ、`--all` �
 
 | 遷移 | きっかけ |
 |---|---|
-| active → closed（`explicit_close`） | ペイン / タブを明示的に閉じた（CLI・MCP・GUI のどの経路でも） |
+| active → closed（`close:…`） | ペイン / タブを明示的に閉じた。**`close_reason` に発生源が載る**（#775。下表） |
 | active → closed（`superseded`） | 同じペイン番号へ新しい worker を spawn した |
 | active → closed（`gone`） | ペインも器（tmux / psmux）も **5 分以上続けて**観測できない（GC。#658） |
+
+明示 close の `close_reason` は**どの経路で閉じたか**を残す（#775）。綴りはペインログの
+クローズマーカー（`--- [クローズ: … ] ---`）と**同じ語彙**なので、`workers.yaml` と
+persist.log / ペインログを文字列一致で突き合わせられる（正本は
+`tako_control::orchestrator::registry::close_reason_for`）。
+
+| `close_reason` | 閉じた操作 |
+|---|---|
+| `close:kbd` | cmd+W |
+| `close:gui` | ペインタイトルバーの × / たまり場カードの kill |
+| `close:gui-tab` | タブの × |
+| `close:dispatch(cli)` / `close:dispatch(mcp)` | `tako close` / `tako_close_pane`（`, caller=<role>` が付くこともある） |
+
+`v0.8.10` より前に閉じたエントリは旧値 `explicit_close`（発生源なし）のまま残る。
+値で分岐する消費側は無いので移行は行わない。**PTY 死亡（`exit`）ではここを倒さない**
+——「ペインが消えても worker は生きている」追跡を維持するため（#390）。
 
 GC は `workers` の列挙のついでに走る（別コマンドは要らない）。**1 回の観測では倒さない**
 ——器の列挙が一時的に失敗した・アプリ再起動直後でペインがまだ揃っていない、といった
