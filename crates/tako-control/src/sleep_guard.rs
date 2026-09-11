@@ -139,6 +139,17 @@ impl ThermalState {
     pub fn is_warning(self) -> bool {
         matches!(self, Self::Serious | Self::Critical)
     }
+
+    /// `as_str` の逆（#372。`to_json` を読み戻すために使う）
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s {
+            "nominal" => Some(Self::Nominal),
+            "fair" => Some(Self::Fair),
+            "serious" => Some(Self::Serious),
+            "critical" => Some(Self::Critical),
+            _ => None,
+        }
+    }
 }
 
 /// アサーションの現在の状態
@@ -194,6 +205,33 @@ impl SleepGuardState {
             "thermal_state": self.thermal_state.as_str(),
             "display_sleep_forced": self.display_sleep_forced,
             "description": self.description(),
+        })
+    }
+
+    /// [`Self::to_json`] の逆（#372）。
+    ///
+    /// **実行時の状態（`assertion_held` / `busy_agents`）はアプリのプロセスが持つ**
+    /// （どちらもプロセスローカルな static）。CLI から `tako sleep-guard status` を
+    /// 叩いたときに MCP の同ツールと同じ値を返すため、IPC で受け取った JSON を
+    /// ここで型へ戻して**同じ 1 つのレンダラ**へ通す。
+    ///
+    /// 1 つでも欠ける / 読めないフィールドがあれば `None`（黙って既定値 0 / false を
+    /// 返すと「アプリは動いているのに busy 0」という #372 と同じ嘘になる）
+    pub fn from_json(v: &Value) -> Option<Self> {
+        Some(Self {
+            assertion_held: v["assertion_held"].as_bool()?,
+            mode: SleepGuardMode::from_str_opt(v["mode"].as_str()?)?,
+            power_condition: PowerCondition::from_str_opt(v["power_condition"].as_str()?)?,
+            on_ac_power: v["on_ac_power"].as_bool()?,
+            busy_agents: usize::try_from(v["busy_agents"].as_u64()?).ok()?,
+            platform_supported: v["platform_supported"].as_bool()?,
+            lid_closed: v["lid_closed"].as_bool()?,
+            lid_sleep_disabled: v["lid_sleep_disabled"].as_bool()?,
+            lid_sleep_mode: LidSleepMode::from_str_opt(v["lid_sleep_mode"].as_str()?)?,
+            sudoers_installed: v["sudoers_installed"].as_bool()?,
+            lid_setup_required: v["lid_setup_required"].as_bool()?,
+            thermal_state: ThermalState::from_str_opt(v["thermal_state"].as_str()?)?,
+            display_sleep_forced: v["display_sleep_forced"].as_bool()?,
         })
     }
 
@@ -1247,6 +1285,48 @@ mod tests {
         assert!(json.get("thermal_state").is_some());
         assert!(json.get("display_sleep_forced").is_some());
         assert!(json.get("description").is_some());
+    }
+
+    /// #372: CLI は IPC で受け取った JSON を型へ戻して**同じレンダラ**へ通す。
+    /// `to_json` へフィールドを足して `from_json` を忘れると、CLI が
+    /// 「アプリは動いているのに未起動扱い」へ落ちる（= busy 0 の嘘が戻る）ので、
+    /// 全フィールドの往復をここで拘束する
+    #[test]
+    fn status_jsonは型へ往復できる() {
+        let state = SleepGuardState {
+            assertion_held: true,
+            mode: SleepGuardMode::WhileAgentsRunning,
+            power_condition: PowerCondition::Always,
+            on_ac_power: true,
+            busy_agents: 3,
+            platform_supported: true,
+            lid_closed: true,
+            lid_sleep_disabled: true,
+            lid_sleep_mode: LidSleepMode::WhileAgentsRunning,
+            sudoers_installed: true,
+            lid_setup_required: false,
+            thermal_state: ThermalState::Serious,
+            display_sleep_forced: true,
+        };
+        let back = SleepGuardState::from_json(&state.to_json()).expect("往復できるはず");
+        assert_eq!(back.assertion_held, state.assertion_held);
+        assert_eq!(back.mode, state.mode);
+        assert_eq!(back.power_condition, state.power_condition);
+        assert_eq!(back.on_ac_power, state.on_ac_power);
+        assert_eq!(back.busy_agents, state.busy_agents);
+        assert_eq!(back.platform_supported, state.platform_supported);
+        assert_eq!(back.lid_closed, state.lid_closed);
+        assert_eq!(back.lid_sleep_disabled, state.lid_sleep_disabled);
+        assert_eq!(back.lid_sleep_mode, state.lid_sleep_mode);
+        assert_eq!(back.sudoers_installed, state.sudoers_installed);
+        assert_eq!(back.lid_setup_required, state.lid_setup_required);
+        assert_eq!(back.thermal_state, state.thermal_state);
+        assert_eq!(back.display_sleep_forced, state.display_sleep_forced);
+        // 欠けたフィールドは None（既定値で埋めて嘘をつかない）
+        let mut broken = state.to_json();
+        broken["busy_agents"] = Value::Null;
+        assert!(SleepGuardState::from_json(&broken).is_none());
+        assert!(SleepGuardState::from_json(&json!({})).is_none());
     }
 
     #[test]

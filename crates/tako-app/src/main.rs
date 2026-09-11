@@ -3958,9 +3958,12 @@ impl TakoApp {
         if !secondary {
             tako_control::sleep_guard::check_disablesleep_residual();
         }
-        // 起動直後は Unknown バックエンドの子プロセス判定（tmux + ps）を待たず 0 で仮適用し、
+        // 起動直後は子プロセス判定（tmux + ps）を待たず 0 で仮適用し、
         // 初回の 2 秒 tick が background 判定で正確な値に補正する（#340）
-        app.apply_sleep_guard(&tako_control::settings::load(), Vec::new());
+        app.apply_sleep_guard(
+            &tako_control::settings::load(),
+            tako_control::agents::RunningChildrenScanState::default(),
+        );
 
         // 終了処理（layout 保存 + 接続情報の後片付け）はアプリ終了フックで一元化する
         // （#103）。Cmd-Q（グローバル Quit アクション）・メニュー・Dock 右クリック終了・
@@ -5049,9 +5052,9 @@ impl TakoApp {
                             app.transcript_ctx = ctx;
                             app.transcript_ctx_scan.mark(std::time::Instant::now());
                         }
-                        let busy_sessions = running_children_scan.busy_sessions.clone();
-                        app.running_children_scan = running_children_scan;
-                        app.apply_sleep_guard(&settings, busy_sessions);
+                        // #372: 走査結果をそのまま渡す（busy の数え方を呼び出し側へ
+                        // 散らさない。保存も apply_sleep_guard の中で行う）
+                        app.apply_sleep_guard(&settings, running_children_scan);
                         if stale_outcome.is_some_and(|outcome| app.apply_stale_binary_scan(outcome))
                         {
                             cx.notify();
@@ -13549,13 +13552,17 @@ impl TakoApp {
         changed
     }
 
-    /// sleep guard の UI 収集部: 全バックエンドのセッション名・role・OSC 133 状態を
-    /// 変化検出用の指紋として集める（メモリ走査のみ）。
+    /// sleep guard の UI 収集部: **全ペイン**のセッション名 / PTY 直下の子 pid・role・
+    /// OSC 133 状態を変化検出用の指紋として集める（メモリ走査のみ）。
     /// 子プロセス有無の実判定（tmux + ps）は background で、初回 / 指紋変化 /
     /// 60 秒保険のときだけ行う（#340 / #779）。
     /// #372: 旧実装は Unknown ペインのみ対象だったが、OSC 133 の遷移に依存すると
     /// Idle のまま子プロセスが走るペイン（TUI エージェント）を見落とす。全バックエンドを
-    /// 対象にし、子プロセス判定のみで busy を決定する
+    /// 対象にし、子プロセス判定のみで busy を決定する。
+    /// #372（2 段目）: **器を持たないペインも対象に入れる**。`backend_sessions` だけを
+    /// 列挙していたので、tmux 不在 / persist OFF（= Homebrew cask の既定）では対象が
+    /// 常に空 = `busy_agents` が無条件に 0 だった。器なしは PTY 直下の子 pid を渡す
+    /// （#728 / #976 と同じ二段構え）
     fn running_children_scan_targets(
         &self,
     ) -> Vec<tako_control::agents::RunningChildrenScanTarget> {
@@ -13573,40 +13580,47 @@ impl TakoApp {
                 .map(|pane| (pane.id(), pane.role().is_some())),
         );
         let mut targets: Vec<_> = self
-            .backend_sessions
+            .terminals
             .iter()
-            .map(
-                |(pane_id, backend_session)| tako_control::agents::RunningChildrenScanTarget {
-                    backend_session: backend_session.clone(),
-                    command_state: self
-                        .terminals
-                        .get(pane_id)
-                        .map(|session| session.command_state())
-                        .unwrap_or(tako_core::CommandState::Unknown),
+            .map(|(pane_id, session)| {
+                let backend_session = self.backend_sessions.get(pane_id).cloned();
+                tako_control::agents::RunningChildrenScanTarget {
+                    pane: pane_id.as_u64(),
+                    // 器ありは器のセッションから辿るので pid は渡さない（世代の
+                    // 取り違えに強い方を優先する = #728 と同じ判断）
+                    child_pid: match backend_session {
+                        Some(_) => None,
+                        None => session.child_pid(),
+                    },
+                    backend_session,
+                    command_state: session.command_state(),
                     has_agent_role: roles.get(pane_id).copied().unwrap_or(false),
-                },
-            )
+                }
+            })
             .collect();
         // HashMap の列挙順で指紋が揺れて毎 tick 再走査にならないよう固定する。
-        targets.sort_by(|a, b| a.backend_session.cmp(&b.backend_session));
+        targets.sort_by_key(|target| target.pane);
         targets
     }
 
-    /// sleep guard の適用部。busy_sessions（バックエンドセッションのうち実行中子プロセスを
-    /// 持つもの）は background で取得済みのものを受け取る。
-    /// #566: 同じ結果を close 確認の判定でも使うため、セッション名の集合を保持する
+    /// sleep guard の適用部。走査結果（器あり = セッション名 / 器なし = ペイン ID の
+    /// それぞれで実行中子プロセスを持つもの）は background で取得済みのものを受け取る。
+    /// #566: 同じ結果を close 確認の判定でも使うため、セッション名の集合を保持する。
+    /// #372: `busy_agents` は `busy_count()`（器あり + 器なしの合算）を通す。
+    /// `busy_sessions.len()` を直に渡すと器なしペインが落ちる = #372 の再発
     fn apply_sleep_guard(
         &mut self,
         settings: &tako_control::settings::Settings,
-        busy_sessions: Vec<String>,
+        scan: tako_control::agents::RunningChildrenScanState,
     ) {
         let state = tako_control::sleep_guard::update(
             settings.sleep_guard_mode,
             settings.sleep_guard_power,
             settings.lid_sleep_mode,
-            busy_sessions.len(),
+            scan.busy_count(),
         );
-        self.busy_backend_sessions = busy_sessions.into_iter().collect();
+        self.busy_backend_sessions = scan.busy_sessions.iter().cloned().collect();
+        self.running_children_scan = scan;
         self.sleep_guard_state = Some(state);
     }
 

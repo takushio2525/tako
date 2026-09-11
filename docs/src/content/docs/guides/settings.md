@@ -154,6 +154,10 @@ tako sleep-guard set --mode while-agents-running --power-condition ac-only
 
 `--power-condition` は `ac-only`（電源接続時のみ）と `always` から選べます。
 
+`while-agents-running` の「動いている」は、ペインの中で実際にプロセスが走っているかで
+判断します。セッション永続化（tmux）を使っているかどうかには関係しません。何も走っていない
+素のシェルのペインだけなら防止は働きません。
+
 ## プライバシー
 
 ### エラーレポートの自動送信（テレメトリ）

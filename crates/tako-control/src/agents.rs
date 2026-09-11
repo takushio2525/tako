@@ -250,6 +250,15 @@ impl ProcessSnapshot {
         sessions_with_children_inner(sessions, &self.panes, &self.parents)
     }
 
+    /// `roots`（ペインのシェル）**自身を除き**、その子孫のプロセスが 1 つでも居るか。
+    ///
+    /// 器あり（[`Self::pane_pids_of`] の結果）/ 器なし（PTY 直下の子 pid）を
+    /// **同じ規則**で判定するための 1 実装（#372）。`roots` が空なら false
+    /// （= 判定材料が無いものを busy と言わない）
+    pub fn has_running_descendants(&self, roots: &[u32]) -> bool {
+        has_running_descendants_inner(roots, &self.parents)
+    }
+
     /// テストと**セルフテスト**で実プロセスを使わずに組み立てる（#976 の検知の
     /// 判定部分をネットワーク・実 ssh 無しで検証するため）
     pub fn from_parts_for_test(
@@ -277,9 +286,23 @@ impl ProcessSnapshot {
 
 /// sleep guard の子プロセス走査対象。backend 集合だけでなく、エージェント role と
 /// OSC 133 状態を指紋へ含め、開始・終了を次の tick で再走査できるようにする。
+///
+/// **器あり / 器なしの両方**を覆う（#372）。器（tmux / psmux）のセッションだけを
+/// 対象にしていた旧実装では、tmux 不在 / persist OFF の構成（= Homebrew cask の既定）で
+/// 対象が常に空になり、エージェントが動いていても `busy_agents` が無条件に 0 だった。
+/// 辿り方は #728 / #976 と同じ二段構えで、器ありは器のセッション名から、
+/// 器なしは PTY 直下の子 pid から辿る
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunningChildrenScanTarget {
-    pub backend_session: String,
+    /// tako のペイン ID。**器なしペインの busy を数える単位**（#372。
+    /// 器ありはセッション名が単位なので、そちらは `backend_session` で数える）
+    pub pane: u64,
+    /// 器（tmux / psmux）のセッション名。器を持たないペインは None（#372）
+    pub backend_session: Option<String>,
+    /// PTY 直下の子 pid（器を持たないペイン用。#372）。
+    /// **生存は保証されない**（`TerminalSession::child_pid` の規約）ので、
+    /// 死んだシェルの pid はプロセス表に子孫が居ない = busy に数えられない形で落ちる
+    pub child_pid: Option<u32>,
     pub command_state: tako_core::CommandState,
     pub has_agent_role: bool,
 }
@@ -288,10 +311,30 @@ pub struct RunningChildrenScanTarget {
 #[derive(Debug, Clone, Default)]
 pub struct RunningChildrenScanState {
     pub targets: Vec<RunningChildrenScanTarget>,
+    /// 実行中の子プロセスを持つ**器のセッション名**（close 確認 / チャット表示が引く）
     pub busy_sessions: Vec<String>,
+    /// 実行中の子プロセスを持つ**器なしペイン**の tako ペイン ID（#372）
+    pub busy_panes: Vec<u64>,
     pub scanned_at: Option<Instant>,
     /// 前回の走査時に while-agents-running が有効だったか。
     pub sleep_guard_active: bool,
+}
+
+impl RunningChildrenScanState {
+    /// busy なエージェントの数（器あり + 器なしの合算）。
+    ///
+    /// sleep guard の `busy_agents` はこの**1 実装**を通す（#372）。
+    /// `busy_sessions.len()` を直に使うと器なしペインが落ちる = #372 の再発
+    pub fn busy_count(&self) -> usize {
+        self.busy_sessions.len() + self.busy_panes.len()
+    }
+}
+
+/// #372 の A/B。`TAKO_372_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
+/// （器のセッションしか数えない = tmux 不在 / persist OFF で `busy_agents` が常に 0）
+pub fn legacy_372() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_372_LEGACY").map(|v| v == "1") == Ok(true))
 }
 
 /// 変化に現れない終了等を回収する低頻度の保険。
@@ -326,16 +369,47 @@ pub fn scan_running_children(
     now: Instant,
     snapshot: Option<&ProcessSnapshot>,
 ) -> RunningChildrenScanState {
-    let refs: Vec<&str> = targets
-        .iter()
-        .map(|target| target.backend_session.as_str())
-        .collect();
-    let busy_sessions = snapshot
-        .map(|snapshot| snapshot.sessions_with_running_children(&refs))
-        .unwrap_or_default();
+    scan_running_children_in(targets, sleep_guard_active, now, snapshot, legacy_372())
+}
+
+/// 走査の本体（A/B のため旧挙動を引数で受ける。#372）。
+///
+/// `legacy_backend_only` が真なら器のセッションしか数えない = #372 前の挙動。
+/// 公開関数は [`legacy_372`] を渡すだけなので、env が唯一の差になる
+pub fn scan_running_children_in(
+    targets: Vec<RunningChildrenScanTarget>,
+    sleep_guard_active: bool,
+    now: Instant,
+    snapshot: Option<&ProcessSnapshot>,
+    legacy_backend_only: bool,
+) -> RunningChildrenScanState {
+    let mut busy_sessions = Vec::new();
+    let mut busy_panes = Vec::new();
+    if let Some(snapshot) = snapshot {
+        for target in &targets {
+            match &target.backend_session {
+                // 器あり: 器のペインのシェル（`#{pane_pid}`）を起点に辿る
+                Some(session)
+                    if snapshot.has_running_descendants(&snapshot.pane_pids_of(session)) =>
+                {
+                    busy_sessions.push(session.clone());
+                }
+                // 器なし: PTY 直下の子（= ペインのシェル）を起点に辿る。
+                // #372 の旧挙動はこの枝が存在せず、器が無い構成で busy が常に 0 だった
+                None if !legacy_backend_only => {
+                    let roots: Vec<u32> = target.child_pid.into_iter().collect();
+                    if snapshot.has_running_descendants(&roots) {
+                        busy_panes.push(target.pane);
+                    }
+                }
+                Some(_) | None => {}
+            }
+        }
+    }
     RunningChildrenScanState {
         targets,
         busy_sessions,
+        busy_panes,
         scanned_at: Some(now),
         sleep_guard_active,
     }
@@ -662,16 +736,22 @@ fn sessions_with_children_inner(
                 .filter(|(id, _)| id.starts_with(&format!("{session}:")))
                 .map(|(_, pid)| *pid)
                 .collect();
-            if target_pids.is_empty() {
-                return false;
-            }
-            let pane_set: std::collections::HashSet<u32> = target_pids.into_iter().collect();
-            parents.iter().any(|(&pid, &ppid)| {
-                !pane_set.contains(&pid) && is_descendant_of(ppid, &pane_set, parents)
-            })
+            has_running_descendants_inner(&target_pids, parents)
         })
         .map(|s| s.to_string())
         .collect()
+}
+
+/// 「roots 自身を除いた子孫が 1 つでも居るか」の 1 実装（#372）。
+/// 器あり（ペインのシェル群）・器なし（PTY 直下の子）で同じ規則を使う
+fn has_running_descendants_inner(roots: &[u32], parents: &HashMap<u32, u32>) -> bool {
+    if roots.is_empty() {
+        return false;
+    }
+    let root_set: std::collections::HashSet<u32> = roots.iter().copied().collect();
+    parents
+        .iter()
+        .any(|(&pid, &ppid)| !root_set.contains(&pid) && is_descendant_of(ppid, &root_set, parents))
 }
 
 /// pid が target_pids のいずれかの子孫（自身を含む）かどうか
@@ -784,11 +864,8 @@ pub fn any_target_has_running_children(sessions: &[&str], pane_pids: &[u32]) -> 
         return true;
     }
     // 器が無いペインは PTY 直下の子 pid が起点。その子孫が 1 つでも居れば稼働中
-    let targets: std::collections::HashSet<u32> = pane_pids.iter().copied().collect();
-    !targets.is_empty()
-        && parents.iter().any(|(&pid, &ppid)| {
-            !targets.contains(&pid) && is_descendant_of(ppid, &targets, &parents)
-        })
+    // （判定は sleep guard と同じ 1 実装を通す。#372）
+    has_running_descendants_inner(pane_pids, &parents)
 }
 
 #[cfg(test)]
@@ -1001,13 +1078,32 @@ mod tests {
         assert!(!descendants.contains(&100), "pane PID 自体は子孫へ含めない");
     }
 
+    /// 器ありペインの走査対象（ペイン ID は見分けがつくよう連番で振る）
     fn running_target(
         session: &str,
         command_state: tako_core::CommandState,
         has_agent_role: bool,
     ) -> RunningChildrenScanTarget {
         RunningChildrenScanTarget {
-            backend_session: session.to_string(),
+            pane: session.bytes().map(u64::from).sum(),
+            backend_session: Some(session.to_string()),
+            child_pid: None,
+            command_state,
+            has_agent_role,
+        }
+    }
+
+    /// 器なし（直接 spawn）ペインの走査対象（#372）
+    fn direct_target(
+        pane: u64,
+        child_pid: u32,
+        command_state: tako_core::CommandState,
+        has_agent_role: bool,
+    ) -> RunningChildrenScanTarget {
+        RunningChildrenScanTarget {
+            pane,
+            backend_session: None,
+            child_pid: Some(child_pid),
             command_state,
             has_agent_role,
         }
@@ -1024,6 +1120,7 @@ mod tests {
         let prev = RunningChildrenScanState {
             targets: targets.clone(),
             busy_sessions: vec!["tako-s1".into()],
+            busy_panes: Vec::new(),
             scanned_at: Some(now),
             sleep_guard_active: true,
         };
@@ -1037,6 +1134,7 @@ mod tests {
         let prev = RunningChildrenScanState {
             targets: vec![idle.clone()],
             busy_sessions: Vec::new(),
+            busy_panes: Vec::new(),
             scanned_at: Some(now),
             sleep_guard_active: true,
         };
@@ -1082,6 +1180,7 @@ mod tests {
         let prev = RunningChildrenScanState {
             targets: targets.clone(),
             busy_sessions: Vec::new(),
+            busy_panes: Vec::new(),
             scanned_at: Some(scanned_at),
             sleep_guard_active: false,
         };
@@ -1104,6 +1203,168 @@ mod tests {
             true,
             scanned_at + RUNNING_CHILDREN_RESCAN_INTERVAL
         ));
+    }
+
+    // --- #372: 器を持たないペイン（直接 spawn）も busy に数える ---
+
+    /// 器なし 1 ペイン: tako-app(10) → シェル(100) → 実行中コマンド(200)。
+    /// 器ありの対照として tako-s1（pane_pid=500）も置く
+    fn snapshot_372(with_command: bool) -> ProcessSnapshot {
+        let mut parents: HashMap<u32, u32> = [(100, 10), (500, 1), (10, 1)].into();
+        if with_command {
+            parents.insert(200, 100);
+        }
+        ProcessSnapshot::from_parts(vec![("tako-s1:0.0".to_string(), 500u32)], parents)
+    }
+
+    #[test]
+    fn 器なしペインの実行中コマンドがbusyに数えられる() {
+        let now = Instant::now();
+        let targets = vec![direct_target(
+            7,
+            100,
+            tako_core::CommandState::Running,
+            true,
+        )];
+        let state = scan_running_children_in(
+            targets,
+            true,
+            now,
+            Some(&snapshot_372(true)),
+            /* legacy */ false,
+        );
+        assert_eq!(state.busy_panes, vec![7], "器なしペインが数えられていない");
+        assert!(state.busy_sessions.is_empty(), "器のセッションは無い構成");
+        assert_eq!(state.busy_count(), 1);
+    }
+
+    #[test]
+    fn 器なしペインがシェルだけならbusyに数えない() {
+        let now = Instant::now();
+        let targets = vec![direct_target(7, 100, tako_core::CommandState::Idle, true)];
+        let state = scan_running_children_in(targets, true, now, Some(&snapshot_372(false)), false);
+        assert!(
+            state.busy_panes.is_empty(),
+            "素のシェルだけのペインを busy に数えてはいけない"
+        );
+        assert_eq!(state.busy_count(), 0);
+    }
+
+    #[test]
+    fn 器ありペインは従来どおり数える() {
+        let now = Instant::now();
+        // tako-s1 の pane_pid=500 の下に子（600）を置く
+        let snapshot = ProcessSnapshot::from_parts(
+            vec![("tako-s1:0.0".to_string(), 500u32)],
+            [(500, 1), (600, 500)].into(),
+        );
+        let targets = vec![running_target(
+            "tako-s1",
+            tako_core::CommandState::Unknown,
+            true,
+        )];
+        let state = scan_running_children_in(targets, true, now, Some(&snapshot), false);
+        assert_eq!(state.busy_sessions, vec!["tako-s1".to_string()]);
+        assert!(state.busy_panes.is_empty(), "器ありはペイン側で数えない");
+        assert_eq!(state.busy_count(), 1);
+    }
+
+    #[test]
+    fn legacyでは器なしペインが数えられない() {
+        let now = Instant::now();
+        let targets = vec![direct_target(
+            7,
+            100,
+            tako_core::CommandState::Running,
+            true,
+        )];
+        let state = scan_running_children_in(
+            targets,
+            true,
+            now,
+            Some(&snapshot_372(true)),
+            /* legacy */ true,
+        );
+        assert_eq!(
+            state.busy_count(),
+            0,
+            "#372 前の挙動（器のセッションしか数えない）が再現していない"
+        );
+    }
+
+    #[test]
+    fn ペインが消えたらbusyも消える() {
+        let now = Instant::now();
+        let snapshot = snapshot_372(true);
+        let busy = scan_running_children_in(
+            vec![direct_target(
+                7,
+                100,
+                tako_core::CommandState::Running,
+                true,
+            )],
+            true,
+            now,
+            Some(&snapshot),
+            false,
+        );
+        assert_eq!(busy.busy_count(), 1);
+        // 対象から外れた（= ペインを閉じた）ら、同じプロセス表でも 0 に戻る
+        let closed = scan_running_children_in(Vec::new(), true, now, Some(&snapshot), false);
+        assert_eq!(closed.busy_count(), 0);
+        assert!(closed.busy_panes.is_empty());
+    }
+
+    #[test]
+    fn 器なしペインは指紋の変化で再走査される() {
+        let now = Instant::now();
+        let idle = direct_target(7, 100, tako_core::CommandState::Idle, false);
+        let prev = RunningChildrenScanState {
+            targets: vec![idle.clone()],
+            busy_sessions: Vec::new(),
+            busy_panes: Vec::new(),
+            scanned_at: Some(now),
+            sleep_guard_active: true,
+        };
+        assert!(!should_rescan_running_children(
+            &prev,
+            std::slice::from_ref(&idle),
+            true,
+            now
+        ));
+        // OSC 133 の遷移（コマンド開始）で再走査
+        assert!(should_rescan_running_children(
+            &prev,
+            &[direct_target(
+                7,
+                100,
+                tako_core::CommandState::Running,
+                false
+            )],
+            true,
+            now
+        ));
+        // シェルの pid が替わった（ペインの張り直し）でも再走査
+        assert!(should_rescan_running_children(
+            &prev,
+            &[direct_target(7, 101, tako_core::CommandState::Idle, false)],
+            true,
+            now
+        ));
+    }
+
+    #[test]
+    fn has_running_descendantsは起点自身を数えない() {
+        let snapshot = snapshot_372(false);
+        assert!(
+            !snapshot.has_running_descendants(&[100]),
+            "起点（シェル）自身を子孫に数えてはいけない"
+        );
+        assert!(
+            !snapshot.has_running_descendants(&[]),
+            "起点が無いものを busy と言ってはいけない"
+        );
+        assert!(snapshot_372(true).has_running_descendants(&[100]));
     }
 
     // --- #439: live claude セッションの一括解決 ---

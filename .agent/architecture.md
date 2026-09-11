@@ -1022,9 +1022,26 @@ trait で抽象化し、core/ と control/ は platform/ の trait のみに依�
 - **プロセス走査の共有と変化検出**（#772 / #779）: `agents::ProcessSnapshot` が tmux pane PID と
   `ps` の親子関係を 1 回ずつ採取し、stale binary と sleep guard が同一 tick で共有する。
   sleep guard の 2 秒 tick は assertion の評価頻度であって、tmux / ps の採取頻度ではない。
-  backend 集合・role・OSC 133 状態が変わったときと初回、取りこぼし回収の 60 秒ごとだけ再採取し、
-  それ以外は前回の `busy_backend_sessions` を sleep guard / GUI モード / close 確認で共有する。
+  走査対象（ペイン集合・器のセッション名 / PTY 直下の子 pid・role・OSC 133 状態）が変わったときと
+  初回、取りこぼし回収の 60 秒ごとだけ再採取し、それ以外は前回の走査結果を
+  sleep guard / GUI モード / close 確認で共有する。
   `while-agents-running` へ切り替えた tick は、古いキャッシュで assertion を決めず即再採取する
+- **busy の数え上げは器あり / 器なしの二段構え**（#372。#728 / #976 と同じ形）:
+  走査対象は**全ペイン**（`terminals`）で、器（tmux / psmux）があるペインは器のセッション名から
+  `pane_pids_of` で起点を引き、器が無いペインは **PTY 直下の子 pid**（`TerminalSession::child_pid`）を
+  起点にする。判定規則は 1 実装（`ProcessSnapshot::has_running_descendants` = 起点自身を除いた
+  子孫が 1 つでも居るか）で、素のシェルだけのペインは busy に数えない。明示コマンドのペインも
+  `/bin/sh -c` のラッパ（FR-2.5.14）が必ず 1 段入るので同じ規則で拾える（実測 2026-09-11）。
+  `busy_agents` は `RunningChildrenScanState::busy_count()`（器あり + 器なしの合算）が正本で、
+  **`busy_sessions.len()` を直に使うと器なしペインが落ちる**（= tmux 未導入 / persist OFF の
+  構成で `while-agents-running` が無効になる #372 の再発）。旧挙動の A/B は `TAKO_372_LEGACY=1`、
+  番犬は `crates/tako-control/tests/issue372_sleep_guard_direct_panes_watchdog.rs`
+- **実行時の状態はアプリのプロセスが持つ**（#372）: アサーションの保持フラグと `busy_agents` は
+  どちらもプロセスローカルな static なので、`tako sleep-guard status` を CLI 自身で計算すると
+  **アプリが保持していても常に「未保持 / busy 0」**になる。CLI は IPC（= MCP `tako_sleep_guard` と
+  同じ dispatch）で採り、アプリ未起動のときだけ自前計算へ落ちる（GUI 無しでも引けることは維持）。
+  表示は 1 つのレンダラを通すので、`to_json` へフィールドを足したら `from_json` も足す
+  （往復テストが拘束する）
 
 ## ビュー単位の描画キャッシュ（#782 / #786。2026-08-07）
 

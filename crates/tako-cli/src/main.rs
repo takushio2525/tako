@@ -5549,15 +5549,41 @@ fn recover_apply(path: &std::path::Path, generation: &str, force: bool) -> Resul
     Ok(())
 }
 
+/// `sleep-guard status` の状態を採る（#372）。
+///
+/// **実行時の状態はアプリのプロセスが持つ**（アサーション ID と `busy_agents` は
+/// どちらもプロセスローカルな static）ので、この CLI プロセスで計算すると
+/// アプリが保持していても常に「未保持 / busy 0」になる。アプリが起動していれば
+/// IPC（= MCP の `tako_sleep_guard` と同じ dispatch）で取りに行き、
+/// 未起動ならこのプロセスで計算する。返り値の第 2 要素は取得元の表示用ラベル
+fn sleep_guard_status_state() -> (tako_control::sleep_guard::SleepGuardState, &'static str) {
+    let from_app = send_request(Request::SleepGuard {
+        action: Some("status".to_string()),
+        mode: None,
+        power_condition: None,
+        lid_sleep_mode: None,
+    })
+    .ok()
+    .and_then(|value| tako_control::sleep_guard::SleepGuardState::from_json(&value));
+    if let Some(state) = from_app {
+        return (state, "tako アプリ（IPC）");
+    }
+    let settings = tako_control::settings::load();
+    (
+        tako_control::sleep_guard::status(
+            settings.sleep_guard_mode,
+            settings.sleep_guard_power,
+            settings.lid_sleep_mode,
+        ),
+        "この CLI プロセス（tako アプリは未起動）",
+    )
+}
+
 fn sleep_guard_local(sub: &SleepGuardCommand) -> Result<(), String> {
     match sub {
         SleepGuardCommand::Status => {
-            let settings = tako_control::settings::load();
-            let state = tako_control::sleep_guard::status(
-                settings.sleep_guard_mode,
-                settings.sleep_guard_power,
-                settings.lid_sleep_mode,
-            );
+            let (state, source) = sleep_guard_status_state();
+            eprintln!("  取得元: {source}");
             if state.assertion_held {
                 eprintln!("  idle-sleep: アサーション保持中");
             } else {
