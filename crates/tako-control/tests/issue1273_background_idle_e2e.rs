@@ -23,8 +23,15 @@ use std::time::{Duration, Instant};
 use tako_control::orchestrator::wait;
 use tako_core::agent_support::Agent;
 
-/// 本番のバックエンドや他の実験と混ざらない専用ソケット
-const SOCKET: &str = "tako-e2e-1273";
+#[path = "common/tmux_e2e.rs"]
+mod tmux_e2e;
+
+/// 本番のバックエンドや**他プロセスのテスト**と混ざらない専用の器（#1300）。
+/// 固定名だと `cargo test --workspace` が 2 本走った瞬間に同名セッションを
+/// 取り合って `duplicate session` で落ちる（実測は `tmux_e2e` のモジュール doc）
+fn socket() -> &'static str {
+    tmux_e2e::socket_for("1273")
+}
 
 fn real_tmux() -> bool {
     Command::new("tmux")
@@ -43,9 +50,9 @@ struct EmuGuard {
 
 impl Drop for EmuGuard {
     fn drop(&mut self) {
-        let _ = Command::new("tmux")
-            .args(["-L", SOCKET, "kill-session", "-t", &self.session])
-            .output();
+        // 器はこのプロセス専用。セッションを畳み、**このプロセスの最後の 1 本**なら
+        // サーバーごと退役させてソケットファイルまで消す（tmux は残す）
+        tmux_e2e::release_session(socket(), &self.session);
         // 背景の子（sleep 3600）はセッションごと落ちるが、取りこぼしても
         // **自分が記録した pid だけ**を確実に片付ける
         if let Ok(pid) = std::fs::read_to_string(self.dir.join("child.pid")) {
@@ -125,11 +132,14 @@ fn launch_emulator(tag: &str) -> EmuGuard {
         std::fs::set_permissions(&script, perm).expect("実行権を付けられる");
     }
     let session = format!("tako1273{tag}");
-    let status = Command::new("tmux")
-        .args([
-            "-L",
-            SOCKET,
-            "new-session",
+    // 起動より**先に**ガードを作る。起動が落ちたときも作業ディレクトリと器が残らない
+    let guard = EmuGuard {
+        session: session.clone(),
+        dir: dir.clone(),
+    };
+    if let Err(diag) = tmux_e2e::new_session(
+        socket(),
+        &[
             "-d",
             "-s",
             &session,
@@ -144,14 +154,10 @@ fn launch_emulator(tag: &str) -> EmuGuard {
                 script.to_str().expect("UTF-8"),
                 dir.join("child.pid").to_str().expect("UTF-8"),
             ),
-        ])
-        .status()
-        .expect("tmux を実行できる");
-    assert!(status.success(), "tmux new-session が失敗した");
-    let guard = EmuGuard {
-        session: session.clone(),
-        dir,
-    };
+        ],
+    ) {
+        panic!("{diag}");
+    }
     let drawn = wait_until(Duration::from_secs(15), || {
         capture(&session).contains("still running")
     });
@@ -171,7 +177,7 @@ fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
 }
 
 fn capture(session: &str) -> String {
-    tako_core::tmux::capture_session(Some(SOCKET), session)
+    tako_core::tmux::capture_session(Some(socket()), session)
         .map(|l| l.join("\n"))
         .unwrap_or_else(|e| format!("<capture 失敗: {e}>"))
 }
@@ -189,12 +195,9 @@ fn child_alive(dir: &std::path::Path) -> bool {
 }
 
 fn send(session: &str, key: &str) {
-    let ok = Command::new("tmux")
-        .args(["-L", SOCKET, "send-keys", "-t", session, key])
-        .status()
-        .expect("tmux send-keys を実行できる")
-        .success();
-    assert!(ok, "send-keys が失敗した");
+    if let Err(diag) = tmux_e2e::send_keys(socket(), &["-t", session, key]) {
+        panic!("{diag}");
+    }
 }
 
 /// 受け入れ条件 1 + 3: 実端末の画面で「ターン終了 = 入力待ち」「生成中 = 判定しない」
