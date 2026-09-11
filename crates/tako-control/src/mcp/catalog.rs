@@ -1690,8 +1690,11 @@ pub fn tools() -> Vec<Value> {
                 （undelivered なら tako_send_input でプロンプトを再送する）。\
                 #530: 送達フローがプロンプトの到達を確認できなかった場合は、claude が起動して \
                 session が観測できていても undelivered になる（起動 ≠ プロンプト到達）。\
-                #983: unverified は「猶予を過ぎたが、この系統には送達を裏づける一次シグナルが無い」\
-                （agy 等）という意味で、未達とは断定していない。events には prompt_undelivered ではなく \
+                #983 / #1294: unverified は「未達と断定できない」の意味で、入口が 2 つある: \
+                ①この系統には送達を裏づける一次シグナルが無い（agy 等）\
+                ②peer 送達（#790）の書き込みが始まった後に確認が取れなかった \
+                （prompt_delivery_failure が peer_send_stalled / peer_unconfirmed。届いた可能性がある）。\
+                どちらも events には prompt_undelivered ではなく \
                 prompt_delivery_unverified（recommended_action=verify_then_resend）が載るので、\
                 画面を見て届いているか確かめてから再送すること（そのまま再送すると二重指示になる）。\
                 #983: エージェント CLI の起動そのものが失敗している（CLI 不在で command not found / \
@@ -1734,9 +1737,10 @@ pub fn tools() -> Vec<Value> {
                 watch / status / report を継続できる。各エントリに worker_id / pane / tmux_session / \
                 session_id / pane_alive（GUI にペインが現存するか）/ tmux_alive（tmux session が生存中か）/ \
                 prompt_delivery（delivered = プロンプト到達済み / pending = 確認中 / undelivered = 未達の疑い）/ \
-                prompt_delivery_failure（未達の理由コード。#530: choice_dialog = 初回のテーマ選択・\
+                prompt_delivery_failure（送達を確認できなかった理由コード。#530: choice_dialog = 初回のテーマ選択・\
                 ログイン方法選択ダイアログが出て送れなかった / paste_not_reflected / residual_after_retries / \
-                flow_timeout）/ resend_command（未達 worker にだけ入る再送コマンド。同じ依頼文を \
+                flow_timeout。#1294: peer_send_stalled / peer_unconfirmed は**送ったかもしれない**ので \
+                prompt_delivery は undelivered ではなく unverified になり、自動再送は撃たれない）/ resend_command（未達 worker にだけ入る再送コマンド。同じ依頼文を \
                 tako_send_input で送り直す）/ resume_command（session ID 検出済み claude worker の復旧コマンド。\
                 突然死時に使う）が入る。既定は active のみ。all = true で closed（明示 close 済み）も含める。\
                 列挙のついでに、ペインも tmux session も 5 分以上続けて観測できない active エントリを \

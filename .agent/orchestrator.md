@@ -222,7 +222,10 @@ worker_agents:               # エージェント別の worker 設定（任意�
   **一次シグナルを実際に読めて、それでもターンが 1 件も無いとき**だけ出す。裏取りは
   codex = rollout の `task_started` / agy = 実況 JSONL の `USER_INPUT` でしかできないので、
   器が無い / 会話が解決できない状況では `prompt_delivery_unverified`（`verify_then_resend`）へ
-  降格する。「読めなかった」を未達と断定すると、働いている worker へ同じ依頼が二度渡る
+  降格する。「読めなかった」を未達と断定すると、働いている worker へ同じ依頼が二度渡る。
+  **#1294**: peer 送達（#790）が「書き込みが始まった後に確認が取れない」で決着した顛末
+  （`peer_send_stalled` / `peer_unconfirmed`）も同じ扱いで、レジストリは `unverified` を返す
+  （届いた可能性があるので自動再送しない。救済は master が画面と `delivery` を見て手で送り直す）
 - **MCP 接続（#986）**: worker からも tako の MCP ツール（`tako_*`）が呼べる。経路は系統で違う:
   - **codex** = spawn の起動コマンドへ `-c mcp_servers.tako.command/args/env_vars` を
     **一時注入**する（master と同じ `orchestrator::agent::codex_mcp_args` の 1 実装）。

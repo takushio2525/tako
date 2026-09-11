@@ -6790,10 +6790,14 @@ impl TakoApp {
                                         "warning: peer 送達の受信を確認できない（pane={}）",
                                         flow.pane.as_u64()
                                     );
-                                    Self::report_prompt_delivery(&flow, "peer_unconfirmed");
+                                    // #1294: 顛末コードの綴りは正本（tako-core）から引く。
+                                    // 「書き切ったが受信を確認できない」= 届いた可能性が
+                                    // あるので、レジストリでも未達と断定させない
+                                    let reason = tako_core::prompt_delivery::PEER_UNCONFIRMED;
+                                    Self::report_prompt_delivery(&flow, reason);
                                     Self::finish_flow(
                                         &mut flow,
-                                        Status::delivered("peer", "peer_unconfirmed", elapsed),
+                                        Status::delivered("peer", reason, elapsed),
                                         &mut states,
                                     );
                                 }
@@ -7160,17 +7164,24 @@ impl TakoApp {
         }
     }
 
+    /// 送達を確認できなかった場合の記録（Issue #530 / #1294）。
+    ///
+    /// **`false`（未達確定）を直に渡さない**: 顛末には「送ったかもしれない」
+    /// （peer の書き込みが始まった後に確認が取れない）があり、それを未達として
+    /// 記録すると supervisor の自動再送が二重投函する（#1294）。3 値は
+    /// 顛末コードから引く（正本は `tako_core::prompt_delivery::outcome_confidence`）
     fn report_prompt_delivery(flow: &PromptFlow, reason: &'static str) {
         if flow.enter_only {
             return;
         }
         let pane = flow.pane.as_u64();
         let delivery_flow = flow.delivery_flow;
+        let confidence = tako_core::prompt_delivery::outcome_confidence(reason);
         std::thread::spawn(move || {
             if let Err(e) = tako_control::orchestrator::registry::record_prompt_delivery(
                 pane,
                 delivery_flow,
-                false,
+                confidence,
                 reason,
             ) {
                 eprintln!("warning: worker レジストリへの送達結果記録に失敗: {e}");
@@ -7185,12 +7196,13 @@ impl TakoApp {
         }
         let pane = flow.pane.as_u64();
         let delivery_flow = flow.delivery_flow;
+        let reason = tako_core::prompt_delivery::VERIFIED;
         std::thread::spawn(move || {
             if let Err(e) = tako_control::orchestrator::registry::record_prompt_delivery(
                 pane,
                 delivery_flow,
-                true,
-                "verified",
+                tako_core::prompt_delivery::outcome_confidence(reason),
+                reason,
             ) {
                 eprintln!("warning: worker レジストリへの送達結果記録に失敗: {e}");
             }

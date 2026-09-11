@@ -23039,6 +23039,133 @@ mod tests {
         assert!(entry.prompt_delivered_at.is_some());
     }
 
+    /// #1294: peer 送達の「送ったかもしれない」顛末（書き込みが始まった後に確認が
+    /// 取れない）を、レジストリ → worker_status → supervisor の順に追いかける。
+    ///
+    /// 旧実装は `prompt_delivery_failed_at` を見た時点で `undelivered` へ倒し、
+    /// `prompt_undelivered`（`resend_prompt`）を積んで supervisor が同じ依頼を
+    /// 自動再送していた（= 二重投函。#790 / #1015 が構造で潰してきた事故）
+    #[test]
+    fn issue1294_送ったかもしれない顛末では自動再送を撃たない() {
+        use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
+        use crate::orchestrator::supervisor::{
+            recover_prompt_undelivered, wants_prompt_resend, SupervisorContext, SupervisorMode,
+            SupervisorState,
+        };
+        let legacy = tako_core::prompt_delivery::legacy_undelivered();
+        let path = registry_path().unwrap();
+
+        // 「送ったかもしれない」で決着した claude worker（pane 12941）と、
+        // 本当に未達だった worker（pane 12942）を並べて A/B する
+        let cases: [(u64, &str, &str, &str); 2] = [
+            (
+                12941,
+                "q12941",
+                tako_core::prompt_delivery::Stall::PeerSendStalled.code(),
+                "unverified",
+            ),
+            (12942, "q12942", "paste_not_reflected", "undelivered"),
+        ];
+        WorkerRegistry::mutate_at(&path, |reg| {
+            for (pane, id, reason, _) in cases {
+                reg.workers.insert(
+                    id.into(),
+                    WorkerEntry {
+                        pane,
+                        agent: "claude".into(),
+                        status: "active".into(),
+                        spawned_at: "2026-01-01T00:00:00Z".into(),
+                        prompt_head: Some("依頼文の先頭".into()),
+                        prompt_delivery_failed_at: Some("2026-01-01T00:05:00Z".into()),
+                        prompt_delivery_failure: Some(reason.into()),
+                        ..Default::default()
+                    },
+                );
+            }
+        })
+        .unwrap();
+
+        for (pane, _, reason, expected) in cases {
+            // 入力待ちの画面（welcome のまま）= 画面では裏が取れない状態
+            let v = finish_worker_status(
+                WorkerStatusCtx {
+                    pane_id: pane,
+                    pane_exists: true,
+                    backend_session: None,
+                    live_tail: Some("Welcome to Claude Code\n❯ ".into()),
+                    full_screen: None,
+                    has_running_children: false,
+                    limit_resume: Value::Null,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+            let kinds: Vec<&str> = v["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|e| e["kind"].as_str())
+                .collect();
+
+            // supervisor が撃つかどうかを、実際に復旧関数を呼んで数える
+            // （送信は Err を返させるので `verify_recovery` の待ちには入らない）
+            let mut sends = 0_u32;
+            let mut exec = |req: Request| -> Result<Value, String> {
+                if matches!(req, Request::Send { .. }) {
+                    sends += 1;
+                }
+                Err("mock".to_string())
+            };
+            let mut ctx = SupervisorContext {
+                exec: &mut exec,
+                pane_id: pane,
+                worker_id: format!("w{pane}"),
+                mode: SupervisorMode::Auto,
+                auto_resume_dead: false,
+                max_retries: 3,
+            };
+            let mut state = SupervisorState::default();
+            if wants_prompt_resend(&v) {
+                recover_prompt_undelivered(&mut ctx, &mut state);
+            }
+            println!(
+                "TAKO_1294: legacy={legacy} pane={pane} 顛末={reason} \
+                 prompt_delivery={} events={kinds:?} 自動再送={sends}回",
+                v["prompt_delivery"].as_str().unwrap_or("(none)")
+            );
+
+            if legacy || expected == "undelivered" {
+                // #1294 前の挙動 / 本当に未達のとき: 未達 + 自動再送（回帰なし）
+                assert_eq!(v["prompt_delivery"], "undelivered", "{reason}");
+                assert!(kinds.contains(&"prompt_undelivered"), "{kinds:?}");
+                assert_eq!(sends, 1, "{reason}: 未達確定なら自動再送が撃たれる");
+            } else {
+                assert_eq!(
+                    v["prompt_delivery"], "unverified",
+                    "{reason} は未達と断定しない"
+                );
+                assert!(
+                    kinds.contains(&"prompt_delivery_unverified"),
+                    "未確認イベントを出す（黙らない）: {kinds:?}"
+                );
+                assert!(
+                    !kinds.contains(&"prompt_undelivered"),
+                    "未達イベントは出さない（撃つと二重投函）: {kinds:?}"
+                );
+                let ev = v["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["kind"] == "prompt_delivery_unverified")
+                    .unwrap()
+                    .clone();
+                assert_eq!(ev["recommended_action"], "verify_then_resend");
+                assert_eq!(sends, 0, "{reason}: 自動再送を撃ってはならない");
+            }
+        }
+    }
+
     #[test]
     fn issue983_観測手段の無い系統でも送達判定が黙らない() {
         use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};

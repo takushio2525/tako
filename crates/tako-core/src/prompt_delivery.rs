@@ -174,6 +174,83 @@ impl Stall {
     }
 }
 
+/// peer 送達が「書き切ったが受信を確認できなかった」ときの顛末コード（#790）。
+/// [`Stall::PeerSendStalled`] と同じく**再送してはいけない**側なので、綴りを
+/// 送達フロー側に持たせず正本をここに置く（#1294）
+pub const PEER_UNCONFIRMED: &str = "peer_unconfirmed";
+
+/// 送達を確認できたときの顛末コード。keys 経路（貼り付け反映 + 残留消失）と
+/// peer 経路（transcript で受信確認）でコードが違うので両方を正本に持つ
+pub const VERIFIED: &str = "verified";
+/// peer 送達で受信まで確認できたときの顛末コード
+pub const DELIVERED: &str = "delivered";
+
+/// 送達の記録に載せる**確からしさ**（Issue #1294）。
+///
+/// 旧実装は bool（届いた / 届かなかった）の 2 値だった。ところが peer 送達には
+/// 「**書き込みが始まった後に確認が取れない**」= 届いた可能性がある、という
+/// 第 3 の顛末がある（[`Stall::PeerSendStalled`] / [`PEER_UNCONFIRMED`]）。
+/// これを「未達」として記録すると worker レジストリが `undelivered` を返し、
+/// supervisor の自動再送（`recover_prompt_undelivered`）が同じ依頼を撃つ ——
+/// #790 / #1015 が構造で潰してきた二重投函が、別の口から起きる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confidence {
+    /// 届いたと言える（貼り付けが入力欄へ反映され残留も消えた / peer が受信を確認した）
+    Delivered,
+    /// **未達と断定できる**（1 バイトも送っていない / 貼り付けが画面に出なかった）。
+    /// 自動再送を撃ってよいのはこれだけ
+    Undelivered,
+    /// **送ったかもしれない**（書き込みが始まった後に確認が取れない）。
+    /// 未達と断定できないので自動再送は撃たない = 画面を見て確かめてから人が送り直す
+    Unverified,
+}
+
+impl Confidence {
+    /// 応答・ログ・テストが参照する安定コード
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Confidence::Delivered => "delivered",
+            Confidence::Undelivered => "undelivered",
+            Confidence::Unverified => "unverified",
+        }
+    }
+
+    /// 自動再送（supervisor の `recover_prompt_undelivered`）を撃ってよいか。
+    /// **`Undelivered` だけが true**（「かもしれない」で撃つと二重投函）
+    pub fn may_auto_resend(self) -> bool {
+        matches!(self, Confidence::Undelivered)
+    }
+}
+
+/// 顛末コードごとの確からしさ（[`Stall::transient`] と同型の宣言表。Issue #1294）。
+///
+/// **既定は未達側**（`Undelivered`）にしてある: 判断のつかない新しい顛末を
+/// 「届いたかも」へ倒すと、本当に届いていない worker が救済されなくなる。
+/// 再送禁止側（`Unverified`）へ入れてよいのは「**1 バイト以上書いた後**に
+/// 確認が取れない」と言える顛末だけ。
+///
+/// この表が「送達フローの宣言」と「レジストリの記録」の唯一の接点で、
+/// 記録側（`record_prompt_delivery`）と読み出し側
+/// （`prompt_delivery_assessment_with`）が同じ関数を引くので食い違わない
+pub fn outcome_confidence(outcome: &str) -> Confidence {
+    if outcome == VERIFIED || outcome == DELIVERED {
+        return Confidence::Delivered;
+    }
+    // 書き込みが始まった後に確認が取れなかった 2 系統。届いた可能性がある
+    if outcome == Stall::PeerSendStalled.code() || outcome == PEER_UNCONFIRMED {
+        return Confidence::Unverified;
+    }
+    Confidence::Undelivered
+}
+
+/// `TAKO_1294_LEGACY=1` で **#1294 前**の挙動へ戻す（A/B の入口）。
+///
+/// 戻るのは 1 点: 「送ったかもしれない」もレジストリでは未達（`undelivered`）と
+/// 断定し、supervisor の自動再送が撃たれる（= 二重投函）
+pub fn legacy_undelivered() -> bool {
+    std::env::var_os("TAKO_1294_LEGACY").is_some()
+}
+
 /// 送達フローの顛末。`tako_send_input` の応答 / `tako_read_pane` の `delivery` /
 /// `persist.log` の 1 行がすべてここから作られる（同じ語彙が 3 経路へ出る）
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -734,5 +811,77 @@ mod tests {
             &Status::waiting(Stall::PeerPending, 9),
             99_999
         ));
+    }
+
+    /// #1294: 「送ったかもしれない」は未達と別の値になる。
+    /// 送達フロー側の宣言（`PeerSendStalled` = 再送してはいけない）と
+    /// レジストリの記録が食い違わないための表
+    #[test]
+    fn 書き込み後に確認が取れない顛末は未達と断定しない() {
+        for code in [Stall::PeerSendStalled.code(), PEER_UNCONFIRMED] {
+            assert_eq!(
+                outcome_confidence(code),
+                Confidence::Unverified,
+                "{code} は送った可能性があるので未達と断定できない"
+            );
+            assert!(
+                !outcome_confidence(code).may_auto_resend(),
+                "{code} で自動再送を撃つと二重投函になる"
+            );
+        }
+    }
+
+    /// 未達と断定できる顛末は従来どおり（回帰なし）。
+    /// **既定が未達側**であること（知らないコードは救済側へ倒さない）も固定する
+    #[test]
+    fn 未達と断定できる顛末は自動再送の対象のまま() {
+        for code in [
+            "paste_not_reflected",
+            "residual_after_retries",
+            "choice_dialog",
+            "trust_dialog_blocked",
+            "flow_timeout",
+            "hold_timeout",
+            "peer_refused",
+            "未知の顛末コード",
+        ] {
+            assert_eq!(
+                outcome_confidence(code),
+                Confidence::Undelivered,
+                "{code} は未達確定のまま"
+            );
+            assert!(outcome_confidence(code).may_auto_resend(), "{code}");
+        }
+    }
+
+    #[test]
+    fn 送達できた顛末は届いた側() {
+        for code in [VERIFIED, DELIVERED] {
+            assert_eq!(outcome_confidence(code), Confidence::Delivered, "{code}");
+            assert!(
+                !outcome_confidence(code).may_auto_resend(),
+                "{code} は再送そのものが要らない"
+            );
+        }
+    }
+
+    /// `Stall` の宣言（再送してはいけない）と表が対応している。
+    /// 停滞理由に「書いた後」の系統を足したのに表を直し忘れたら落とす
+    #[test]
+    fn 再送禁止の停滞理由は表でも未確認側にある() {
+        // `PeerSendStalled` の note は「再送しない」と明言している（宣言の正本）
+        assert!(
+            Stall::PeerSendStalled.note().ja().contains("再送しない"),
+            "宣言が変わったら表も見直すこと"
+        );
+        assert_eq!(
+            outcome_confidence(Stall::PeerSendStalled.code()),
+            Confidence::Unverified
+        );
+        // 「まだ 1 バイトも送っていない」段階の理由は未達側でよい
+        assert_eq!(
+            outcome_confidence(Stall::NoInputBox.code()),
+            Confidence::Undelivered
+        );
     }
 }
