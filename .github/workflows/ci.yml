@@ -159,3 +159,11 @@ jobs:
       # テストバイナリは上のステップで作ってあるので追加の所要は数秒
       - name: Windows FFI の実行検査（#1282。プロセスのコマンドライン / 起動時刻）
         run: cargo test -p tako-core --lib platform::procinfo
+      # #1314: psmux は **Windows でしか動かない器**なのに、上の `cargo test --workspace` は
+      # 非ブロッキングかつ tako-app の既知失敗（#583）でそこで打ち切られるため、
+      # tako-core のテストは Windows で 1 件も走っていない（#1282 と同じ状況）。
+      # conf の差し替えは NTFS の rename 意味論（開かれている置換先・`FILE_SHARE_DELETE`）に
+      # 依存するので、**この器のテストだけは Windows でも実際に走らせて blocking にする**。
+      # テストバイナリは上のステップで作ってあるので追加の所要は数秒
+      - name: psmux バックエンドの実行検査（#1314。conf の原子的な差し替えを含む）
+        run: cargo test -p tako-core --lib backend::psmux
