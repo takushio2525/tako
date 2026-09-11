@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-11（#1318 #1321: README のリモート transport と `tako --help` の説明を実態へ）
-- README の日英を #1038 後の実態（Tailscale `serve` → ループバック TCP `127.0.0.1` のエフェメラルポート・LAN / 外部から到達不可）へ。事実に反する「TCP ポートを一切開きません」を削除し、`tako remote --help` の `Tailscale Serve + UDS` も同じ形へ
-- #982 で `AgentSupport` が `Platform` の doc の上へ挿し込まれ 3 行すべてが agent-support の説明になっていたのを分離。`platform` は `PlatformArgs` の「参照引数」露出をやめて自前の doc を持つ（`--help` 実出力で確認）
-- 挙動は不変（doc コメント / README のみ）。`remote.rs:45` / `:1473` の同じ #1038 前の記述は #1332 へ切り出した
-
 ## 2026-09-11（#1332: remote.rs の doc が #1038 前の保証を語っていたのを実態へ）
 - モジュール doc（`remote.rs:44`）と `run_daemon` doc が「UDS のみで listen・TCP ポートを一切開かない・別 OS ユーザーは接続自体が不能」のままで、同ファイルの実装（`:135-147`）と `threat-model-remote.md` と逆を向いていた。既定 = ループバック TCP / UDS は `TAKO_REMOTE_ENDPOINT=unix` の opt-in / 失われた保証と緩和は threat-model へ誘導、の形へ
 - 横断 grep（`TCP ポートを一切` / `接続自体が不能` / `UDS + Tailscale` / `UDS 専用`）で同じ誤りが 3 か所残っていた: `protocol.rs:1137` の `RemoteStart` doc・MCP カタログ `tako_remote_start` の説明文（+ スナップショット）・`admin_request` の「UDS 専用」（実装は `local_endpoint` 経由で両対応）
@@ -73,3 +68,7 @@
 - 現状 main で `screenshots-5b.spec.js` は 9/9 PASS・PWA e2e 全 6 spec も 50/50 PASS。`cf85756`（#1089 / PR #1100）が #632 の「対応案」（モックへ `permission_dialog` / assert を `/respond` + `choice`）を既に実装していた
 - A/B（`cf85756^` の spec を現行実装へ当てる）で `.approval-card` の 10 秒タイムアウト × 3 を再現 = 症状は実在。旧契約（`/input` へ `y`/`n`）の grep は 0 件、境界の選択肢 N=2 / N=1 も一時 spec で PASS
 - コード変更なし（install 不要）。実出力を付けて #632 を close し、真因（PWA e2e が CI で 1 度も走らず、実行手順が package.json / README のどこにも無い）を #1357 として起票した
+
+## 2026-09-11（#372: 器を持たないペインも sleep guard の busy に数えた）
+- 走査対象が器のセッションだけで、tmux 未導入 / persist OFF（cask の既定）では常に空 = `busy_agents` が無条件に 0。全ペイン対象 + 器なしは PTY 直下の子から辿る二段構え（判定 `has_running_descendants` / 数え方 `busy_count()`）へ。CLI の `status` も IPC でアプリの値を採る（保持フラグと busy はプロセスローカル static）
+- 隔離 GUI（persist OFF・tako-vd）: 修正前は `sleep 300` 稼働 75 秒で 0 のまま → 修正後 1 + pmset に assertion、停止で 2 秒で解放。器あり構成も回帰なし。A/B `TAKO_372_LEGACY=1`・番犬 4 本が修正前ソースで file:line 名指し FAILED
