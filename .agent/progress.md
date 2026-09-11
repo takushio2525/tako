@@ -20,16 +20,6 @@
 
 ---
 
-## 2026-09-11（#1295: 実行拒否ゲートが claude では常に真だったのを締めた）
-- 真因は `None`（観測ゼロ）を無条件に作業ゼロと数えていたこと。claude の腕（`query_agent_status`）は `agent_work_started` を一度も代入しないので `!= Some(true)` が常に真で、`execution_refused_patterns(Claude)` に文言を 1 つ足した瞬間に正常完了した worker が `error` / `retry_spawn` へ落ちる形だった。判定を `dispatch::refusal_gate_open` の 1 実装へ閉じ、`None` を通せる系統は `agent_support::MATRIX` の新マス `worker_refusal_work_proof`（agy だけ対象外 = 代理の証拠を使う）が宣言する
-- A/B（`TAKO_1295_LEGACY=1`）: 旧アーム = 正常完了の claude worker が `status=error` / `kind=execution_refused` / `retry_spawn`、新アーム = `error` なし。#1034 の agy 経路は両アームとも分類されたまま（既存テスト緑）
-- 番犬は 4 → 7 本で doc と assert を機械で結んだ（doc の「ゲートの形」1 行を assert の入力にする）。ゲートを旧形へ戻す A/B で 4 本が `dispatch.rs:9343` 等を名指し FAILED
-
-## 2026-09-11（#1320 / #1324 / #1319: AI 向け規約ファイルの取り残し 3 件）
-- `AGENTS.md` の「状況」行（Phase 5 中断中のまま = 3 か月前）と push 運用（「公開まで main 直 push 可」）を実態へ。フェーズ詳細は `.agent/roadmap.md` 参照に寄せ、Phase 7 見出しも「✅ 公開済み・残は README 図版と CONTRIBUTING.md」へ棚卸し（#1320）
-- `.agent/commands.md` に `tako file open-in-tako`（#1182）の行を追加。コマンド名で正規化した `comm` の差分は設計上の畳み込み `tako setup bootstrap` 1 件のみ（#1324）
-- `.agent/requirements.md` の重複 FR を解消（#1319）。コードが 12 か所参照する **FR-3.18 = Code Runner は不動**、#496 の 2 行を FR-3.25 / 3.26 へ、参照ゼロの #1067 セクションを FR-2.38 へ（`:1653` の相互参照も追従）
-
 ## 2026-09-11（#1313: config_io の tmp 名を書き込み 1 回ごとに分けた）
 - #638 の同型を `config_io::atomic_write` へ。ロック無しで呼ぶ経路は 11 か所（`with_backup` 経由込み。Issue にコメントで列挙）で、legacy 実測は 3 形 = `len=0`（空 = #169 の全消失の入口）/ 短い本文が長い本文の先頭を潰した `len=5610` / rename の ENOENT
 - tmp suffix を `.tmp.{pid}.{seq}` へ（`AtomicU64`）。`.tmp.` を含む形は保つ（共有カタログが `contains(".tmp.")` で派生を外すため。catalog のテストへ新形を追加）
@@ -49,6 +39,7 @@
 - #1296 の射程は**置き場を決める側**だけで、テストが個別に `temp_dir().join(…)` で作る使い捨ては残っていた（実測: `cargo test -p tako-core --lib` で 14 件 / `-p tako-cli -p tako-control --lib` で 31 件）。`tako_core::test_residue` に `ScratchDir`（スコープで消える）と `process_scratch`（プロセス寿命）を 1 実装し、親を `<TMPDIR>/tako-test-scratch-<pid>` 1 つへ畳んで #1296 の 2 段構え（atexit + 次回起動の pid 回収 + `tako test-residue`）にそのまま乗せた
 - 実測（空 TMPDIR の前後）: tako-core `--lib` **14 → 0**・全 target **16 → 0**・tako-cli + tako-control `--lib` **31 → 7**（残 7 は `dispatch.rs` の `tako-mcp-test-*` = 別 worker が編集中で射程外・#1312 にコメント）。libtest が `process::exit` する失敗回でも 0、SIGKILL 相当の残骸は次回起動で掃かれ、生きている pid の置き場は残る
 - 番犬は動的 1 本（このテストバイナリを使い捨て TMPDIR で回して**実際に数える**。修正前の作り手で 15 件を名指し FAILED）+ 静的 8 本（修正前ソースで 4 本 FAILED）。A/B は `TAKO_1312_LEGACY=1`（器を作りっぱなしへ戻す = 19 件残る）
+
 ## 2026-09-11（#1336: 要件番号の一意性と参照の実在を番犬で固定した）
 - `crates/tako-control/tests/fr_number_watchdog.rs` 1 本。定義の形は 3 つ（章 `## FR-5` / 節 `### FR-2.34` / 表 ID `| FR-2.34.1 |`）で **1 段も拾う**（`NFR-1`〜`8` が 1 段なので 2 段以上だけ見ると見逃す。1 段を定義に持つと章番号への言及も偽の参照切れにならない）。定義 482 件 / コード参照 613 件を実測
 - A/B は fixture を置かず**現行テキストへの逆置換**（#1319 の変更は番号 14 行だけなので `84c16c7^` と同値。置換が空振りしたら落ちるガード付き）。実データ検証も実施: `84c16c7^` を置くと `要件番号は一意` が **FAILED で 3 系統 11 番号を行番号つきで名指し**（FR-2.34 + 配下 8 / FR-3.17 / FR-3.18）
