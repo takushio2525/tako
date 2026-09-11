@@ -217,7 +217,14 @@ worker_agents:               # エージェント別の worker 設定（任意�
   - **supervisor は自動復旧しない**（`launch_failed` と同じ扱い）。ただし
     `detail` の次の一手が「少し待って spawn し直す」を伝える。`entitlement_blocked`
     とは逆に**時間で解ける**ので、待つ / ナッジするのではなく**やり直す**のが正解
-  - A/B は `TAKO_1034_LEGACY=1`（同一バイナリのまま分類をやめる）
+  - **「作業ゼロ」の確かめ方は系統ごと（#1295）**: 一次シグナルの観測が
+    `Some(false)`（作業ゼロを観測）なら分類し、`Some(true)` なら分類しない。
+    `None`（= 観測ゼロ）を作業ゼロと数えてよいのは**マトリクスが宣言した系統だけ**
+    （`worker_refusal_work_proof` が対象外 = agy。拒否が会話の作成前に起こるので
+    直接の証拠を採る対象が無い）。claude の腕は `agent_work_started` を一度も
+    代入しないので、`None` を無条件に通すとゲートが claude で常に開く
+  - A/B は `TAKO_1034_LEGACY=1`（同一バイナリのまま分類をやめる）/
+    `TAKO_1295_LEGACY=1`（ゲートを修正前の `None` 無条件通過へ戻す）
 - **未達の断定（#1015 / #1033）**: `prompt_undelivered`（= supervisor の自動再送のトリガ）は
   **一次シグナルを実際に読めて、それでもターンが 1 件も無いとき**だけ出す。裏取りは
   codex = rollout の `task_started` / agy = 実況 JSONL の `USER_INPUT` でしかできないので、

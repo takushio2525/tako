@@ -335,6 +335,9 @@ pub mod keys {
     pub const WORKER_PROMPT_UNDELIVERED: &str = "worker_prompt_undelivered";
     /// 実行を断られて止まったことの検知（#1034）
     pub const WORKER_REFUSAL_DETECT: &str = "worker_refusal_detect";
+    /// 実行拒否と判定する前に「作業を 1 歩も始めていない」ことの
+    /// **直接の証拠**（一次シグナルの実観測）を要求できるか（#1295）
+    pub const WORKER_REFUSAL_WORK_PROOF: &str = "worker_refusal_work_proof";
     /// 報告の第 1 層（scrollback）
     pub const WORKER_REPORT_SCROLLBACK: &str = "worker_report_scrollback";
     /// 報告の第 2 層（transcript）
@@ -497,6 +500,12 @@ pub mod notes {
         "The model runs on your own machine, so there is no notion of a usage limit",
     );
 
+    /// #1295: 拒否が会話の作成前に起こるので、作業ゼロの直接の証拠がそもそも採れない
+    pub const REFUSAL_BEFORE_CONVERSATION: Note = Note::new(
+        "実行の拒否が会話の作成前に起こるので、作業を 1 歩も始めていないことを実況ログで直接は確かめられない（#1034 の実物では拒否の時点で会話がまだ無い）。代わりに「会話が 1 件も解決できない」ことを作業ゼロの代理の証拠として使う",
+        "The refusal happens before any conversation is created, so there is no live log in which to confirm directly that no work was started (in the real case behind #1034 no conversation existed yet at the moment of refusal). tako falls back to \"no conversation can be resolved at all\" as a proxy for zero work",
+    );
+
     /// #1034: ローカルで動かすモデルには「実行を断る」主体が居ない
     pub const NO_LOCAL_REFUSAL: Note = Note::new(
         "自分のマシンで動かすモデルなので、アカウントや座席の確認で実行を断られるという事象が起こらない（断る主体がそもそも存在しない）",
@@ -548,6 +557,34 @@ pub fn delivery_observation(agent: Agent) -> DeliveryObservation {
         DeliveryObservation::Structured
     } else {
         DeliveryObservation::ScreenOnly
+    }
+}
+
+/// 実行拒否（#1034）を分類する前に、「作業を 1 歩も始めていない」を**何で確かめるか**（#1295）。
+///
+/// 言い換えると **`agent_work_started` の `None`（観測ゼロ）を作業ゼロと数えてよいか**。
+/// 判断は[`keys::WORKER_REFUSAL_WORK_PROOF`]のマスから引く（#982 の規約: 系統差は 1 マス）ので、
+/// 系統が増えてもこの関数ではなくマトリクスを直せば追従する
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalWorkProof {
+    /// **直接の証拠だけ**を根拠にする。一次シグナルで作業ゼロを観測した
+    /// （`Some(false)`）ときだけ分類し、観測が無い（`None`）ときは何も言わない
+    Direct,
+    /// 拒否が**会話の成立前**に起こるので直接の証拠が存在しない系統。
+    /// 「会話が 1 件も解決できない」（解決は sticky）を代理の証拠として使う
+    NoConversation,
+}
+
+/// 指定 agent の「作業ゼロ」の確かめ方。判断は
+/// [`keys::WORKER_REFUSAL_WORK_PROOF`]のマスから引く。
+///
+/// **一次シグナルを持たない系統**（`Local`）はゲートの手前
+/// （[`keys::WORKER_STATUS_STRUCTURED`]）で落ちるので、この値は使われない
+pub fn refusal_work_proof(agent: Agent) -> RefusalWorkProof {
+    if supports(agent, keys::WORKER_REFUSAL_WORK_PROOF) {
+        RefusalWorkProof::Direct
+    } else {
+        RefusalWorkProof::NoConversation
     }
 }
 
@@ -1498,6 +1535,39 @@ pub const MATRIX: &[AgentFeature] = &[
         ),
     },
     AgentFeature {
+        key: keys::WORKER_REFUSAL_WORK_PROOF,
+        summary: Note::new(
+            "実行拒否と判定する前に「作業を 1 歩も始めていない」ことの直接の証拠（一次シグナルの実観測）を要求できる（#1295）",
+            "Before reporting an execution refusal, tako can demand direct proof that no work was started, i.e. an actual observation from the primary signal (#1295)",
+        ),
+        // **要求してよい = 会話が成立する前に拒否される形が観測されていない**。
+        // claude / codex で観測されている拒否（未認証 #983 / 利用阻害 #1106）は
+        // どちらも別の分類が先に error にするので、この経路が会話の成立前に
+        // 発火する必要が無い = 直接の証拠だけを根拠にできる
+        claude: S::Supported,
+        codex: S::Supported,
+        agy: unsupported(notes::REFUSAL_BEFORE_CONVERSATION),
+        local: unsupported(notes::NO_LOCAL_REFUSAL),
+        evidence: AgentEvidence::Measured(
+            "#1034: agy の実物では拒否が **CLI の起動直後**（会話が作られる前）に出るので、\
+             実況 JSONL がまだ無く「作業ゼロ」を直接は観測できない。代わりに会話が 1 件も \
+             解決できないことを代理の証拠にしている（`agy_session::\
+             resolve_conversation_id_for_backend` の解決は sticky なので、\
+             一度でも会話を開いたペインは以後ずっと `Some(..)` を返す = \
+             「解決できない」が durable に言える）。\
+             #1295: claude / codex にはこの代理が要らない。両系統で観測されている拒否は \
+             未認証（#983 の `detect_launch_failure`）と時間で解けない利用阻害（#1106）で、\
+             どちらも別の分類が先に error にする。むしろ代理を許すと害がある: \
+             **claude の腕（`dispatch.rs` の `query_agent_status`）は \
+             `agent_work_started` を一度も代入しない**ので、`None` を作業ゼロと数えると \
+             正常に働いた worker（`status=idle` / `prompt_delivery=delivered`）の画面に \
+             同じ文字列が流れただけで完了を `error` / `retry_spawn` へ落とす \
+             （#983 が `command not found` で避けた誤検知と同型）。\
+             再現は `dispatch::tests::issue1295_claudeの正常完了を実行拒否へ落とさない`。\
+             local は断る主体がそもそも居ない（`worker_refusal_detect` と同じ理由）",
+        ),
+    },
+    AgentFeature {
         key: keys::WORKER_REPORT_SCROLLBACK,
         summary: Note::new(
             "画面の履歴から報告を取れる（#364 の第 1 層）",
@@ -1897,6 +1967,22 @@ mod tests {
         assert!(supports(Agent::Claude, keys::WORKER_STATUS_STRUCTURED));
         assert!(supports(Agent::Codex, keys::WORKER_STATUS_STRUCTURED));
         assert!(supports(Agent::Agy, keys::WORKER_STATUS_STRUCTURED));
+        assert!(!supports(Agent::Local, keys::WORKER_STATUS_STRUCTURED));
+    }
+
+    /// #1295: 「作業ゼロ」の確かめ方は系統ごとにマトリクスから引く。
+    ///
+    /// **agy だけが代理の証拠（会話の非成立）を使う**。claude / codex で `None`
+    /// （= 観測ゼロ）を作業ゼロと数えると、正常に働いた worker を実行拒否へ落とす
+    #[test]
+    fn 作業ゼロの確かめ方はagyだけ代理の証拠() {
+        use RefusalWorkProof as P;
+        assert_eq!(refusal_work_proof(Agent::Claude), P::Direct);
+        assert_eq!(refusal_work_proof(Agent::Codex), P::Direct);
+        assert_eq!(refusal_work_proof(Agent::Agy), P::NoConversation);
+        // 断る主体が居ない系統。値は使われない（一次シグナルのゲートで先に落ちる）が、
+        // 宣言としては「直接の証拠を要求できない」側に居る
+        assert_eq!(refusal_work_proof(Agent::Local), P::NoConversation);
         assert!(!supports(Agent::Local, keys::WORKER_STATUS_STRUCTURED));
     }
 
