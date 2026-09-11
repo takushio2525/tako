@@ -1236,6 +1236,21 @@ Dock のピン留めは `.app` への **file URL ブックマーク**（`com.app
   （モックテスト `scripts/test-clean-trust-residue.sh` が偽の HOME で実プロジェクトの
   巻き添えを落とす。CI の macOS ジョブで毎 PR 走る）
 
+## 実 tmux の e2e は器をプロセスごとに分ける（Issue #1300）
+
+**`-L` に渡す器の名前に固定名を使わない**（`tmux_e2e::socket_for("<Issue 番号>")` が
+pid を足す）。同じ機で `cargo test --workspace` が 2 本走ると、固定名は同じサーバーの
+同じセッション名を取り合って `duplicate session` で即死し、後始末の
+`kill-session -t <固定名>` は**相手のセッションを横から消す**（worktree を分けた worker が
+並ぶこの機では日常的に起こる）。
+
+**器を叩いた失敗を素の `assert!(status.success(), "…が失敗した")` で落とさない**。
+`crates/tako-control/tests/common/tmux_e2e.rs` の `new_session` / `send_keys` を通せば、
+stderr・そのソケットのセッション一覧・PTY / ソケット / サーバー数・load が付いた 1 枚の
+診断になる（#1300 の観測は理由が 1 ビットも残らず、枯渇か否かの切り分けに測り直しが
+1 往復要った。実測の答えは PTY 103/511 = **枯渇ではなく名前の取り合い**）。
+番犬は `crates/tako-control/tests/tmux_e2e_watchdog.rs`、A/B は `TAKO_1300_LEGACY=1`。
+
 ## 設定・データファイルのスキーマ変更（Issue #916）
 
 **永続ファイルの形式や置き場を変えるときは自動移行を同梱する。手動移行を要求しない。**

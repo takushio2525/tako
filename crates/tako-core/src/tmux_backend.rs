@@ -575,7 +575,7 @@ pub fn kill_server(socket: &str) {
 /// tmux は TMUX_TMPDIR → /tmp の順でソケットディレクトリを決定する（TMPDIR は使わない）。
 /// macOS では /tmp → /private/tmp のシンボリックリンク解決でソケット名末尾に `=` が付くため
 /// 両方試す
-pub(crate) fn remove_socket_file(socket: &str) {
+pub fn remove_socket_file(socket: &str) {
     let Some(base) = socket_dir() else { return };
     let _ = std::fs::remove_file(base.join(socket));
     let _ = std::fs::remove_file(base.join(format!("{socket}=")));
@@ -584,14 +584,14 @@ pub(crate) fn remove_socket_file(socket: &str) {
 /// tmux がソケットを置くディレクトリ（`$TMUX_TMPDIR|/tmp` の `tmux-<uid>`）。
 /// Windows には tmux もこのレイアウトも存在しないため `None`
 #[cfg(unix)]
-pub(crate) fn socket_dir() -> Option<std::path::PathBuf> {
+pub fn socket_dir() -> Option<std::path::PathBuf> {
     let uid = unsafe { libc::getuid() };
     let tmpdir = std::env::var("TMUX_TMPDIR").unwrap_or_else(|_| "/tmp".into());
     Some(std::path::Path::new(&tmpdir).join(format!("tmux-{uid}")))
 }
 
 #[cfg(windows)]
-pub(crate) fn socket_dir() -> Option<std::path::PathBuf> {
+pub fn socket_dir() -> Option<std::path::PathBuf> {
     None
 }
 

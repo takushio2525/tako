@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 
 #[path = "common/code_view.rs"]
 mod code_view_mod;
-use code_view_mod::code_view;
+use code_view_mod::{code_view, without_comment_lines};
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -130,16 +130,6 @@ fn legacy_lines(lines: &[&str]) -> Vec<usize> {
         out.extend(i..=end);
     }
     out
-}
-
-/// 行まるごとのコメントだけ落とした眺め（文字列リテラルは残す）。
-/// 走査対象の 3 ファイルには行コメントしか無い（`code_view` の潰しが効く形は
-/// そちらで見る）ので、これで説明文と実装を分けられる
-fn without_comment_lines(src: &str) -> String {
-    src.lines()
-        .filter(|l| !l.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn indent_of(line: &str) -> usize {
