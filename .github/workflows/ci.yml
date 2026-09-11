@@ -99,6 +99,20 @@ jobs:
       # scripts/wait-pr-checks.sh の 1 実装で、master / worker もこれを呼ぶ = #1333）
       - name: CI 完了待ちのモックテスト
         run: bash scripts/test-wait-pr-checks.sh
+      # PWA の Playwright e2e（6 spec / 50 項目）。**この e2e は CI で 1 度も走っておらず、
+      # 走らせ方もどこにも書かれていなかった**ので、#425 の契約変更（承認カードを
+      # transcript 推定 → permission_dialog 実在へ / 送信先を /input → /respond へ）で
+      # spec が取り残されたまま 6 週間誰も気づかず、同じ症状が #1089 として独立に
+      # 再起票された（#632 / #1357）。**PWA の実装契約が spec とズレたらここで落ちる**。
+      # node_modules は上の「PWA をビルド」の npm ci をそのまま使い、ブラウザは
+      # chromium だけ（config の projects も chromium 1 本・headless 固定）。
+      # 手順とローカルでの回し方は web/tako-remote/README.md
+      - name: PWA e2e のブラウザを取得（#1357）
+        working-directory: web/tako-remote
+        run: npm run e2e:install
+      - name: PWA e2e（Playwright 6 spec / 50 項目。#1357）
+        working-directory: web/tako-remote
+        run: npm run e2e
 
   windows:
     name: Windows（build + test スモーク）

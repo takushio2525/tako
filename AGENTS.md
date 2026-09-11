@@ -129,6 +129,7 @@ tako/
 | オーケストレーター アカウント管理（#504/#548） | `tako orchestrator accounts list/show/add/remove` |
 | worker spawn のレイアウト設定 | `tako orchestrator layout [--policy master-reserved|legacy] [--master-ratio 0.5] [--algorithm grid|spiral]` |
 | **PWA を単独でビルドする（新規 worktree で dist が無いとき。#1309）** | `scripts/build-pwa.sh` |
+| **PWA の e2e（Playwright 6 spec / 50 項目。#1357）** | `cd web/tako-remote && npm run e2e` |
 | build | `cargo build --workspace` |
 | lint | `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` |
 | test | `cargo test --workspace` |
