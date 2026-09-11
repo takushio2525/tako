@@ -884,7 +884,7 @@ impl TerminalSession {
     /// 平文（装飾なし・古い→新しい順）で返す。ペインログ（Issue #112）の増分取り込み用。
     /// 履歴が足りない分は取れた範囲だけ返す
     pub fn history_plain_lines(&self, skip_newest: usize, count: usize) -> Vec<String> {
-        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::index::Line;
 
         let term = self.term.lock();
         let grid = term.grid();
@@ -896,28 +896,14 @@ impl TerminalSession {
         }
         let cols = grid.columns();
         let mut out = Vec::with_capacity(take);
-        // 履歴行は負の Line 番号（-1 = 最新の履歴行）。古い側から順に読む
+        // 履歴行は負の Line 番号（-1 = 最新の履歴行）。古い側から順に読む。
+        // **行を平文へ組むのは [`Self::compose_grid_row`] の 1 実装**（#1390）:
+        // 行の由来が「可視グリッド」か「履歴」かの違いしかないのに末尾トリムを
+        // 2 つ持つと、#1387（結合文字の欠落）のような「セルから文字を取り出す
+        // 規則」の修正が片方だけに入って、ペインログ（#112）だけ黙って別の
+        // 文字列になる。一致は `履歴の平文行は可視行と1バイトも変わらない` が見る
         for offset in (skip_newest + 1..=skip_newest + take).rev() {
-            let line = Line(-(offset as i32));
-            let row = &grid[line];
-            // #816: 行の大半は末尾の未使用セル（空白）で、`trim_end` で必ず落ちる。
-            // 先に後ろから境界を探し、そこまでしか組み立てない（`String` の確保も
-            // 1 本で済ませる）。境界探しは切るだけなので取り出す文字列を変えない。
-            // 境界の判定とテキストの組み立ては `screen` の 1 実装を通す（#1387）:
-            // 0 幅の結合文字（NFD の濁点・アクセント）は `Cell::c` ではなく
-            // `zerowidth` に在るので、ここで読まないとペインログだけが
-            // 「端末が実際に受け取ったバイト列と違う文字列」を記録する
-            let mut end = cols;
-            while end > 0 && crate::screen::cell_is_trailing_blank(&row[Column(end - 1)]) {
-                end -= 1;
-            }
-            let mut text = String::with_capacity(end);
-            for col in 0..end {
-                crate::screen::push_cell_text(&row[Column(col)], &mut text);
-            }
-            // 空白以外の末尾空白類（タブ等）は従来どおり `trim_end` に任せる
-            text.truncate(text.trim_end().len());
-            out.push(text);
+            out.push(Self::compose_grid_row(&grid[Line(-(offset as i32))], cols));
         }
         out
     }
@@ -1151,12 +1137,16 @@ impl TerminalSession {
         out
     }
 
-    /// グリッドの 1 行を平文へ組む（[`Self::tail_lines`] と
-    /// [`Self::visible_lines_filled`] の共有部分）。
+    /// グリッドの 1 行を平文へ組む（[`Self::tail_lines`] /
+    /// [`Self::visible_lines_filled`] / [`Self::history_plain_lines`] の共有部分）。
     ///
     /// 返す文字列は [`Self::visible_lines`]（= `screen::compose_line` + `trim_end`）と
     /// **1 バイトも変わらない**（テスト `tail_lines_は_visible_lines_の末尾と一致する` /
-    /// `visible_lines_filled_は折り返しを右端で見分ける`）
+    /// `visible_lines_filled_は折り返しを右端で見分ける` /
+    /// `履歴の平文行は可視行と1バイトも変わらない`）。
+    ///
+    /// **可視行と履歴行で実装を分けない**（#1390）: 行の由来が違うだけで
+    /// 取り出す規則は同じなので、2 実装を持つと片方だけ直る
     fn compose_grid_row(
         row: &alacritty_terminal::grid::Row<alacritty_terminal::term::cell::Cell>,
         cols: usize,
@@ -2329,11 +2319,18 @@ mod tests {
         session
     }
 
-    /// 履歴が条件を満たすまで待つ（満たしたら true。予算内に満たさなければ false）
+    /// 履歴が条件を満たすまで待つ（満たしたら true。予算内に満たさなければ false）。
+    ///
+    /// 上限は [`crate::wait_budget::state_wait_budget`]（混み具合で**伸ばすだけ**・
+    /// 4 倍で打ち切り）。固定窓だと混んだ機で「窓が短いのか / 出力が来ていないのか」が
+    /// 出力から消える（#1308 と同じ理由）
     #[cfg(unix)]
     fn wait_history(session: &TerminalSession, done: impl Fn(usize) -> bool) -> bool {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while std::time::Instant::now() < deadline {
+        let busy = crate::wait_budget::machine_busy();
+        let budget =
+            crate::wait_budget::state_wait_budget(std::time::Duration::from_secs(30), busy);
+        let start = std::time::Instant::now();
+        while start.elapsed() < budget {
             if done(session.history_size()) {
                 return true;
             }
@@ -2681,22 +2678,40 @@ mod tests {
         assert_eq!(got2[at + 2].0, "T=1", "続きの行が違う: {got2:?}");
     }
 
-    /// スクロール中（`display_offset > 0`）でも `tail_lines` は**いま見えている**
-    /// 末尾を返すこと。ビューポートの起点を取り違えると履歴の行が混ざる
+    /// スクロール中（`display_offset > 0`）でも `tail_lines` と
+    /// `visible_lines_filled` は**いま見えている**ビューポートを指すこと。
+    ///
+    /// 2 つはビューポートの起点を `display_offset` から**別々の式**で出す
+    /// （`tail_lines` = `rows - d - take` / `visible_lines_filled` = `-d`）ので、
+    /// 片方だけ拘束すると式を触ったときに気づけない（#1390）。
+    /// 起点を取り違えると履歴の行が混ざる
     #[cfg(unix)]
     #[test]
     fn スクロール中でも末尾窓はビューポートを指す() {
-        use std::time::{Duration, Instant};
-
         let session = spawn_lines(60, None);
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while session.history_size() < 40 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        session.scroll_to(20);
         assert!(
-            session.visible_lines() != session.tail_lines(0),
-            "前提: 画面に中身がある"
+            wait_history(&session, |h| h >= 40),
+            "履歴が伸びない: {}",
+            session.history_size()
+        );
+        session.scroll_to(20);
+        assert_eq!(
+            session.display_offset(),
+            20,
+            "前提: スクロール位置が届いている（届かないと最下部の検査になる）"
+        );
+        // `visible_lines_filled` の本文はビューポート（= `visible_lines`）と
+        // 1 バイトも変わらない。**最下部でしか走らない**検査だと `-d` の項が死ぬ
+        let filled = session.visible_lines_filled();
+        assert_eq!(
+            filled.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>(),
+            session.visible_lines(),
+            "scroll_to(20) で visible_lines_filled の本文がビューポートと食い違う: {filled:?}"
+        );
+        assert_eq!(
+            filled.len(),
+            session.visible_lines().len(),
+            "行数がビューポートと違う: {filled:?}"
         );
         for n in [1usize, 2, 4, 48] {
             let full = session.visible_lines();
@@ -2714,6 +2729,177 @@ mod tests {
             );
         }
         session.scroll_to_bottom();
+    }
+
+    /// 届いているイベントを全部処理して、上がった通知を返す（#1390）。
+    ///
+    /// `title()` は `process_event` を通さないと更新されない（OSC は IO スレッドから
+    /// チャネルで来る）ので、タイトルを読む検査はここを通す
+    #[cfg(unix)]
+    fn drain_notices(
+        session: &mut TerminalSession,
+        rx: &mut UnboundedReceiver<SessionEvent>,
+    ) -> Vec<SessionNotice> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let Some(notice) = session.process_event(ev) {
+                out.push(notice);
+            }
+        }
+        out
+    }
+
+    /// **#1390**: ペインログ（`history_plain_lines`）と画面テキスト（`visible_lines`）が
+    /// **同じ行**に対して 1 バイトも変わらないこと。
+    ///
+    /// 2 つは「セルから文字を取り出す規則」を共有する（#1387 で `screen` の 1 実装へ
+    /// 寄せ、#1390 で末尾トリムのループも `compose_grid_row` 1 本へ寄せた）。
+    /// 片方だけ直る形へ戻ると**ペインログだけ**黙って別の文字列になる。
+    ///
+    /// 検査は「履歴行をスクロールで可視化する」形にしてある: `display_offset = d`
+    /// のビューポートは `Line(-d ..= rows-d-1)` なので、`d >= rows` なら
+    /// **ビューポートの全行が履歴行**で、`history_plain_lines(d-rows, rows)` と
+    /// 1:1 で対応する（`out[j]` = 履歴 offset `d-j`）= 同じ行を 2 経路で読める
+    #[cfg(unix)]
+    #[test]
+    fn 履歴の平文行は可視行と1バイトも変わらない() {
+        const COLS: usize = 20;
+        const ROWS: usize = 6;
+
+        // 全角 / 末尾空白 / 空行 / 行内の空白を混ぜ、そのあと詰め物で履歴へ送る
+        let script = "printf 'H_ab   \\nH_あいうえ\\n\\nH_a b\\nH_TAIL\\n'; \
+                      i=0; while [ $i -lt 10 ]; do printf 'PAD%d\\n' $i; i=$((i+1)); done; \
+                      printf 'READY\\n'; sleep 30";
+        let (session, _rx) = TerminalSession::spawn(
+            COLS,
+            ROWS,
+            SpawnOptions {
+                command: Some(SpawnCommand {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), script.to_string()],
+                }),
+                ..SpawnOptions::default()
+            },
+        )
+        .expect("PTY を張れる");
+
+        i1387_wait_visible(&session, "READY", "履歴と可視行の一致");
+        let history = session.history_size();
+        assert!(
+            history >= ROWS + 4,
+            "検査対象が履歴へ出ていない: history={history}"
+        );
+
+        // 履歴のすべての行が、どこかの窓に 1 度は入る（offset 1..=history を網羅）
+        let mut seen: Vec<String> = Vec::new();
+        for skip in 0..=(history - ROWS) {
+            let d = skip + ROWS;
+            session.scroll_to(d);
+            assert_eq!(
+                session.display_offset(),
+                d,
+                "スクロール位置が届かない（skip={skip}）"
+            );
+            let visible = session.visible_lines();
+            let hist = session.history_plain_lines(skip, ROWS);
+            assert_eq!(
+                hist, visible,
+                "skip={skip} でペインログと画面テキストが食い違う\n\
+                 （履歴 {hist:?} / 可視 {visible:?}）"
+            );
+            seen.extend(visible);
+        }
+        session.scroll_to_bottom();
+
+        // 比べた窓に「全角 / 末尾空白が落ちた行 / 行内の空白 / 空行」が実際に入っていた
+        for needle in ["H_あいうえ", "H_ab", "H_a b", "H_TAIL"] {
+            assert!(
+                seen.iter().any(|l| l == needle),
+                "検査対象 {needle:?} が比べた窓に入っていない: {seen:?}"
+            );
+        }
+        assert!(
+            seen.iter().any(|l| l.is_empty()),
+            "空行が比べた窓に入っていない: {seen:?}"
+        );
+    }
+
+    /// **#1390**: `set_scrollback_limit` が他の設定を巻き添えにしないこと。
+    ///
+    /// `Term::set_options` は `Config` を**丸ごと差し替える**ので、上限だけを渡すと
+    /// `kitty_keyboard` が既定（false）へ戻り、`mode.remove(KITTY_KEYBOARD_PROTOCOL)`
+    /// で Shift+Enter の区別（#28）が死ぬ。`term_config` の doc
+    /// 「上限の動的変更で他の設定が巻き添えで既定へ戻ることはない」を守る検査。
+    ///
+    /// タイトルも見る: alacritty 0.26.0 の `set_options` は履歴を縮める前に
+    /// **必ず `Event::Title` か `Event::ResetTitle` を送る**（実測: 上限を変えるたびに
+    /// `TitleChanged` が 1 回上がる）。`Some(title)` なら同じ値の `Title` なので
+    /// 値は変わらない = 余計な再描画 1 回で済む、という前提をここで固定する
+    #[cfg(unix)]
+    #[test]
+    fn 上限の変更は他の設定を巻き添えにしない() {
+        // OSC 2 でタイトルを設定し、CSI > 1 u で kitty keyboard の disambiguate を立てる
+        let script = "printf '\\033]2;TAKO1390\\007'; printf '\\033[>1u'; \
+                      printf 'READY\\n'; sleep 30";
+        let (mut session, mut rx) = TerminalSession::spawn(
+            20,
+            6,
+            SpawnOptions {
+                command: Some(SpawnCommand {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), script.to_string()],
+                }),
+                scrollback_lines: Some(2_000),
+                ..SpawnOptions::default()
+            },
+        )
+        .expect("PTY を張れる");
+
+        i1387_wait_visible(&session, "READY", "上限変更の副作用");
+        // タイトルは `process_event` を通してはじめて入る（READY より前に送られた
+        // OSC なので、READY が見えている時点でイベントは届いている）
+        let before_notices = drain_notices(&mut session, &mut rx);
+        assert_eq!(
+            session.title(),
+            Some("TAKO1390"),
+            "前提: OSC 2 のタイトルが入っている（通知 {before_notices:?}）"
+        );
+        assert!(
+            session.disambiguate_keys(),
+            "前提: CSI > 1 u が効いている（= `term_config` の `kitty_keyboard`）"
+        );
+        assert_eq!(session.scrollback_limit(), 2_000, "前提: 上限の初期値");
+
+        // 上限を実際に変える（同値なら `set_options` を呼ばないので検査が空振りする）
+        session.set_scrollback_limit(1_000);
+        assert_eq!(session.scrollback_limit(), 1_000, "上限が変わっていない");
+
+        assert!(
+            session.disambiguate_keys(),
+            "上限を変えたら kitty keyboard の disambiguate が落ちた\n\
+             （`set_options` に `term_config` を渡していない = Shift+Enter の区別が死ぬ）"
+        );
+        assert_eq!(
+            session.title(),
+            Some("TAKO1390"),
+            "上限を変えたらタイトルが変わった"
+        );
+        // `set_options` が送った通知を処理してもタイトルは変わらない
+        // （`ResetTitle` が来ると None へ落ちる = 巻き添え）
+        let after = drain_notices(&mut session, &mut rx);
+        let titles = after
+            .iter()
+            .filter(|n| matches!(n, SessionNotice::TitleChanged))
+            .count();
+        assert_eq!(
+            session.title(),
+            Some("TAKO1390"),
+            "上限変更の通知を処理したらタイトルが消えた（TitleChanged {titles} 件）"
+        );
+        assert!(
+            session.disambiguate_keys(),
+            "上限変更の通知を処理したら disambiguate が落ちた"
+        );
     }
 
     /// #816 で `history_plain_lines` は「後ろから境界を探して 1 本だけ組み立てる」形に

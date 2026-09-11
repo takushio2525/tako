@@ -23,6 +23,8 @@
 //!    落とす形へ戻る（#651 / #875 でマーカーの読み手を 1 本へ寄せたのと同じ理由）
 //! 2. [`画面テキストを組む3経路は1実装を通す`] — 3 経路が `cell_text` /
 //!    `push_cell_text` を通し、`cell.c` を直接積む形（修正前そのもの）へ戻っていないこと
+//!    （`history_plain_lines` は #1390 で `compose_grid_row` の 1 実装へ寄せたので、
+//!    そこを呼んでいることを見る = 連鎖で `push_cell_text` に届く）
 //! 3. [`compose_lineは結合文字ぶんもcell_colsへ積む`] — `text` へ足した結合文字は
 //!    `cell_cols` へ**同じ列**を積む。積まないと描画のセル写像と links のスパンが
 //!    1 文字ずつずれる
@@ -231,11 +233,27 @@ fn at(body: &Body, offset: usize, why: &str) -> String {
     )
 }
 
-/// 画面テキストを組む 3 経路（file, 関数名）
-const TEXT_PATHS: &[(&str, &str)] = &[
-    ("crates/tako-core/src/screen.rs", "resolve_cell"),
-    ("crates/tako-core/src/terminal.rs", "compose_grid_row"),
-    ("crates/tako-core/src/terminal.rs", "history_plain_lines"),
+/// 画面テキストを組む 3 経路（file, 関数名, **1 実装への入口として許す呼び出し**）。
+///
+/// `history_plain_lines` は #1390 で自前のループを捨てて `compose_grid_row` を
+/// 呼ぶ形になった（末尾トリムの 2 実装を 1 本へ寄せた）。`compose_grid_row` 自身が
+/// この表で `push_cell_text` を要求されるので、**連鎖でこの経路も 1 実装を通る**
+const TEXT_PATHS: &[(&str, &str, &[&str])] = &[
+    (
+        "crates/tako-core/src/screen.rs",
+        "resolve_cell",
+        &["cell_text(", "push_cell_text("],
+    ),
+    (
+        "crates/tako-core/src/terminal.rs",
+        "compose_grid_row",
+        &["cell_text(", "push_cell_text("],
+    ),
+    (
+        "crates/tako-core/src/terminal.rs",
+        "history_plain_lines",
+        &["Self::compose_grid_row("],
+    ),
 ];
 
 /// 修正前そのものの形（セルの本体文字を自分で積む）
@@ -243,7 +261,7 @@ const RAW_PUSH: [&str; 2] = ["push(cell.c)", "text.push(cell.c)"];
 
 fn offending_paths() -> Vec<String> {
     let mut offenders = Vec::new();
-    for (rel, name) in TEXT_PATHS {
+    for (rel, name, entries) in TEXT_PATHS {
         let body = body_of(rel, &read(rel), name);
         let code: Vec<(usize, &str)> = body
             .text
@@ -252,12 +270,14 @@ fn offending_paths() -> Vec<String> {
             .filter(|(_, l)| !is_comment(l))
             .collect();
         let joined = code.iter().map(|(_, l)| *l).collect::<Vec<_>>().join("\n");
-        if !joined.contains("cell_text(") && !joined.contains("push_cell_text(") {
+        if !entries.iter().any(|e| joined.contains(e)) {
             offenders.push(at(
                 &body,
                 0,
-                "結合文字を読む 1 実装（`screen::cell_text` / `screen::push_cell_text`）を\
-                 通していない",
+                &format!(
+                    "結合文字を読む 1 実装への入口（{}）を通していない",
+                    entries.join(" / ")
+                ),
             ));
         }
         for (n, line) in &code {
