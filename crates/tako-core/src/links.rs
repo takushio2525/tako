@@ -1436,6 +1436,85 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// #1387: NFD（結合文字）のファイル名が**実ペインの画面**から
+    /// 実在チェックまで通ってリンクになること。
+    ///
+    /// macOS のファイル名には NFD が混ざる（HFS+ 由来・アーカイブ展開物）。
+    /// 画面テキストから結合文字が落ちると、`links` は**実在しないパス**を見るので
+    /// Cmd+クリックが無反応になる（#153 / #1283 で通した経路がここで死ぬ）。
+    /// 画面は合成せず `Term` → `screen::snapshot` の実経路から組む
+    #[cfg(unix)]
+    #[test]
+    fn nfdのファイル名が画面からリンクになる_1387() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{test::TermSize, Config};
+        use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+        use alacritty_terminal::Term;
+
+        let dir = crate::test_residue::ScratchDir::new("i1387-links");
+        // `画像か` + U+3099（濁点）+ `ある.txt` = macOS の NFD ファイル名
+        let name = "画像か\u{3099}ある.txt";
+        let file = dir.path().join(name);
+        std::fs::write(&file, "x").expect("NFD 名のファイルを作れる");
+        assert!(file.exists(), "作ったファイルが実在しない: {file:?}");
+
+        let line = format!("open {} please", file.display());
+        let mut term = Term::new(Config::default(), &TermSize::new(220, 3), VoidListener);
+        let mut parser: Processor<StdSyncHandler> = Processor::new();
+        parser.advance(&mut term, line.as_bytes());
+        let screen = crate::screen::snapshot(&term, &crate::theme::Theme::default_dark());
+        assert!(
+            screen.lines[0].text.contains('\u{3099}'),
+            "画面テキストから濁点が落ちている: {:?}",
+            screen.lines[0].text
+        );
+
+        let links = detect_links_with_home(&screen, Some(dir.path()), None);
+        let path_links: Vec<_> = links.iter().filter(|l| l.kind == LinkKind::Path).collect();
+        assert_eq!(
+            path_links.len(),
+            1,
+            "NFD のファイル名がリンクにならない: {links:?}"
+        );
+        assert_eq!(path_links[0].target, file.to_string_lossy());
+        assert!(
+            std::path::Path::new(&path_links[0].target).exists(),
+            "リンク先が実在しない（結合文字が落ちた形を掴んでいる）: {:?}",
+            path_links[0].target
+        );
+        // 検出力の確認: 濁点を落とした形は実在しない = 落ちれば必ずリンクにならない
+        let dropped: String = path_links[0]
+            .target
+            .chars()
+            .filter(|c| *c != '\u{3099}')
+            .collect();
+        assert!(
+            !std::path::Path::new(&dropped).exists(),
+            "濁点を落としたパスが実在してしまい、このテストに検出力が無い: {dropped:?}"
+        );
+    }
+
+    /// #1387: `tako links --text` の経路（画面テキストの行を受け取る
+    /// [`detect_in_lines`]）でも同じ NFD のパスが引けること。
+    /// GUI の cmd+クリックと CLI / MCP の答えを食い違わせない
+    #[cfg(unix)]
+    #[test]
+    fn nfdのファイル名はtext経路でもリンクになる_1387() {
+        let dir = crate::test_residue::ScratchDir::new("i1387-links-text");
+        let file = dir.path().join("画像か\u{3099}ある.txt");
+        std::fs::write(&file, "x").expect("NFD 名のファイルを作れる");
+
+        let line = format!("open {} please", file.display());
+        let links = detect_in_lines(&[line], 220, Some(dir.path()), None);
+        let path_links: Vec<_> = links.iter().filter(|l| l.kind == LinkKind::Path).collect();
+        assert_eq!(
+            path_links.len(),
+            1,
+            "text 経路で NFD のファイル名がリンクにならない: {links:?}"
+        );
+        assert_eq!(path_links[0].target, file.to_string_lossy());
+    }
+
     /// 候補の切り出し規則そのもの（実在チェック抜き）。
     /// **トークン全体が必ず先頭**で、削った候補は長い順に並ぶ
     #[test]

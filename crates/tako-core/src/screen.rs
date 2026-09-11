@@ -138,6 +138,10 @@ pub(crate) fn snapshot_opts<T: EventListener>(
     };
     // フラット配列（rows 個の内側 Vec 割り当てを回避）
     let mut grid: Vec<(char, CellStyle)> = vec![(' ', default_style); cols * rows];
+    // #1387: 0 幅の結合文字を持つセルは稀なので、**在るセルだけ**を横に持つ
+    // （フラット配列を太らせない = 空なら 1 バイトも確保しない）。値は `Term` から
+    // 借りたスライスなので文字の複製もしない
+    let mut combining: Vec<(usize, &[char])> = Vec::new();
     // #801: 1 セルも書かれなかった行は、どの行でも合成結果が同じになる。
     // 1 本だけ組んで複製すれば、行ごとの `compose_line`（119 セルの走査 +
     // スタイル比較 + String / Vec の積み上げ）が丸ごと省ける
@@ -188,19 +192,30 @@ pub(crate) fn snapshot_opts<T: EventListener>(
         if plain_blank_matches_default && !selected && !is_cursor && is_plain_blank(indexed.cell) {
             continue;
         }
-        grid[row * cols + col] = resolve_cell(indexed.cell, selected, is_cursor, colors, theme);
+        let idx = row * cols + col;
+        let (c, zero_width, style) = resolve_cell(indexed.cell, selected, is_cursor, colors, theme);
+        grid[idx] = (c, style);
+        if !zero_width.is_empty() {
+            combining.push((idx, zero_width));
+        }
         row_touched[row] = true;
     }
 
-    // 素のままの行は 1 本組んで使い回す（#801。中身は行位置に依らず同じ）
+    // display_iter は行優先で走るので `combining` は既に昇順だが、順序に依存しない形にする
+    combining.sort_unstable_by_key(|&(idx, _)| idx);
+    // 素のままの行は 1 本組んで使い回す（#801。中身は行位置に依らず同じ）。
+    // 結合文字を持つセルは `is_plain_blank` が近道から外すので、
+    // 使い回す行には結合文字が無い（#1387）
     let mut blank_line: Option<ScreenLine> = None;
     let lines = (0..rows)
         .map(|row| {
+            let base = row * cols;
             if row_touched[row] {
-                return compose_line(&grid[row * cols..(row + 1) * cols]);
+                let zw = row_combining(&combining, base, cols);
+                return compose_line(&grid[base..base + cols], zw, base);
             }
             blank_line
-                .get_or_insert_with(|| compose_line(&grid[row * cols..(row + 1) * cols]))
+                .get_or_insert_with(|| compose_line(&grid[base..base + cols], &[], base))
                 .clone()
         })
         .collect();
@@ -213,15 +228,20 @@ pub(crate) fn snapshot_opts<T: EventListener>(
         let line = Line(rows as i32 - display_offset as i32);
         let grid_ref = term.grid();
         let mut cells: Vec<(char, CellStyle)> = Vec::with_capacity(cols);
+        let mut extra_combining: Vec<(usize, &[char])> = Vec::new();
         for col in 0..cols {
             let point = Point::new(line, Column(col));
             let cell = &grid_ref[line][Column(col)];
             let selected = selection.is_some_and(|range| range.contains(point));
             // カーソルが追加行（viewport の 1 行下）にある場合も焼き込む
             let is_cursor = cursor_visible_at == Some(point);
-            cells.push(resolve_cell(cell, selected, is_cursor, colors, theme));
+            let (c, zero_width, style) = resolve_cell(cell, selected, is_cursor, colors, theme);
+            cells.push((c, style));
+            if !zero_width.is_empty() {
+                extra_combining.push((col, zero_width));
+            }
         }
-        compose_line(&cells)
+        compose_line(&cells, &extra_combining, 0)
     });
 
     Screen {
@@ -236,6 +256,80 @@ pub(crate) fn snapshot_opts<T: EventListener>(
     }
 }
 
+/// セル 1 つが**画面テキストへ寄与する文字**（#1387 の 1 実装）。
+///
+/// alacritty は 0 幅の結合文字（NFD の濁点 `U+3099`・アクセント `U+0301` 等）を
+/// `Cell::c` ではなく `Cell::extra.zerowidth` に持つ。`c` だけを読むと結合文字が
+/// 画面テキストから**黙って落ちる**ので、テキストを組む経路は必ずここを通す。
+///
+/// 落ちていたのは 3 経路（`resolve_cell` = 描画 / GUI モード / links の材料・
+/// `TerminalSession::compose_grid_row` = `tail_lines` / `visible_lines_filled`・
+/// `TerminalSession::history_plain_lines` = ペインログ）で、**選択コピーだけ**
+/// alacritty 自身の `selection_to_string` を通るため、同じセルの内容が
+/// 「見た目 / `read_pane` / ペインログ」と「Cmd+C」で食い違っていた（#1387）。
+/// 実害は NFD のファイル名が画面に出たときの Cmd+クリック不動作
+/// （`links` の実在チェックが落ちる = #153 / #1283 の経路が死ぬ）。
+pub(crate) struct CellText<'a> {
+    /// 本体の文字。`None` = テキストへ出さないセル（全角の後続スペーサー・空セル）
+    pub(crate) base: Option<char>,
+    /// 0 幅の結合文字（本体の直後に**この順で**続く）。`base` が `None` なら常に空
+    pub(crate) combining: &'a [char],
+}
+
+/// セルの [`CellText`] を取り出す（**`zerowidth` を読む唯一の場所**）。
+///
+/// 積む順序は alacritty の `selection_to_string`（`line_to_string` の
+/// 「本体 → zerowidth」）と同じにしてあるので、Cmd+C と 1 バイトも変わらない。
+/// 番犬 `crates/tako-control/tests/issue1387_combining_watchdog.rs` が
+/// 他所での直読みと、3 経路がここを通っていないことを名指しで落とす
+pub(crate) fn cell_text(cell: &alacritty_terminal::term::cell::Cell) -> CellText<'_> {
+    // 全角の後続セル（スペーサー）と空セルはテキストへ出さない。alacritty は
+    // 結合文字を**全角の先頭セル**へ寄せる（`Term::input` の `width == 0` 経路が
+    // `WIDE_CHAR_SPACER` を 1 つ左へ辿る）ので、スペーサー側を読む必要は無い
+    if cell
+        .flags
+        .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        || cell.c == '\0'
+    {
+        return CellText {
+            base: None,
+            combining: &[],
+        };
+    }
+    CellText {
+        base: Some(cell.c),
+        combining: cell.zerowidth().unwrap_or(&[]),
+    }
+}
+
+/// 画面テキストへセル 1 つぶんを積む（積んだ char 数を返す。0 = 出さないセル）。
+///
+/// `Cell` から直接テキストを組む経路（`terminal.rs` の `compose_grid_row` /
+/// `history_plain_lines`）の入口。`Screen` 側は `resolve_cell` が色解決と一緒に
+/// [`cell_text`] を通すので、3 経路の答えは定義上同じになる（#1387）
+pub(crate) fn push_cell_text(
+    cell: &alacritty_terminal::term::cell::Cell,
+    out: &mut String,
+) -> usize {
+    let text = cell_text(cell);
+    let Some(base) = text.base else {
+        return 0;
+    };
+    out.push(base);
+    out.extend(text.combining.iter().copied());
+    1 + text.combining.len()
+}
+
+/// 行末の「詰め物」に見えるセルか（テキストを組む手前で右端の境界を探すのに使う）。
+///
+/// 空セル・全角スペーサー・素の半角スペースが該当する。**結合文字を持つセルは
+/// 該当しない**（行頭に単独の結合文字が来ると本体が `' '` のセルへ載るので、
+/// 空白扱いで切ると落ちる = #1387）
+pub(crate) fn cell_is_trailing_blank(cell: &alacritty_terminal::term::cell::Cell) -> bool {
+    let text = cell_text(cell);
+    text.combining.is_empty() && matches!(text.base, None | Some(' '))
+}
+
 /// 「素の空白セル」か（#801）。
 ///
 /// 文字が半角スペースで、属性フラグが 1 つも立っておらず、前景・背景が既定色のセル。
@@ -246,25 +340,28 @@ pub(crate) fn snapshot_opts<T: EventListener>(
 fn is_plain_blank(cell: &alacritty_terminal::term::cell::Cell) -> bool {
     cell.c == ' '
         && cell.flags.is_empty()
+        // 0 幅の結合文字を載せた空白セル（行頭の単独アクセント等）は素ではない。
+        // 近道で飛ばすと結合文字が落ちる（#1387）
+        && cell_text(cell).combining.is_empty()
         && matches!(cell.fg, Color::Named(NamedColor::Foreground))
         && matches!(cell.bg, Color::Named(NamedColor::Background))
 }
 
-/// セル 1 つを色解決済みの (文字, スタイル) へ変換する。
-/// display_iter のセルと grid 直接アクセスのセル（追加行）で共用する
-fn resolve_cell(
-    cell: &alacritty_terminal::term::cell::Cell,
+/// セル 1 つを色解決済みの (文字, 0 幅の結合文字, スタイル) へ変換する。
+/// display_iter のセルと grid 直接アクセスのセル（追加行）で共用する。
+///
+/// 文字の取り出しは [`cell_text`] の 1 実装を通す（#1387）。テキストへ出さない
+/// セルは `'\0'` として持ち回り、`compose_line` が落とす
+fn resolve_cell<'a>(
+    cell: &'a alacritty_terminal::term::cell::Cell,
     selected: bool,
     is_cursor: bool,
     colors: &Colors,
     theme: &Theme,
-) -> (char, CellStyle) {
+) -> (char, &'a [char], CellStyle) {
     let flags = cell.flags;
-    let c = if flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
-        '\0'
-    } else {
-        cell.c
-    };
+    let text = cell_text(cell);
+    let c = text.base.unwrap_or('\0');
 
     let mut fg = resolve_color(&cell.fg, colors, theme);
     let mut bg = resolve_color(&cell.bg, colors, theme);
@@ -289,6 +386,7 @@ fn resolve_cell(
 
     (
         c,
+        text.combining,
         CellStyle {
             fg,
             bg,
@@ -301,19 +399,55 @@ fn resolve_cell(
     )
 }
 
-/// 1 行分のセル列を ScreenLine（text + StyleRun + cell_cols）へ合成する
-fn compose_line(cells: &[(char, CellStyle)]) -> ScreenLine {
+/// `combining`（`(グリッド添字, 0 幅の結合文字)` の昇順リスト）から
+/// 1 行ぶん（`base..base + cols`）を切り出す。**結合文字が無い画面では
+/// 探索そのものを行わない**（#1387 / #801 の hot path を太らせない）
+fn row_combining<'a, 'c>(
+    combining: &'c [(usize, &'a [char])],
+    base: usize,
+    cols: usize,
+) -> &'c [(usize, &'a [char])] {
+    if combining.is_empty() {
+        return &[];
+    }
+    let lo = combining.partition_point(|&(idx, _)| idx < base);
+    let hi = combining.partition_point(|&(idx, _)| idx < base + cols);
+    &combining[lo..hi]
+}
+
+/// 1 行分のセル列を ScreenLine（text + StyleRun + cell_cols）へ合成する。
+///
+/// `combining` は `(グリッド添字, 0 幅の結合文字)` の昇順リストで、`base` は
+/// この行の先頭セルの添字。結合文字は `text` へ本体の直後に積み、`cell_cols` へは
+/// **同じ列**を積む（そうしないと描画のセル写像と links のスパンが 1 文字ずつずれる = #1387）
+fn compose_line(
+    cells: &[(char, CellStyle)],
+    combining: &[(usize, &[char])],
+    base: usize,
+) -> ScreenLine {
     let cols = cells.len();
     let mut text = String::with_capacity(cols);
     let mut runs: Vec<StyleRun> = Vec::new();
     let mut cell_cols = Vec::with_capacity(cols);
+    let mut next = 0usize;
     for (col, (c, style)) in cells.iter().enumerate() {
+        while next < combining.len() && combining[next].0 < base + col {
+            next += 1;
+        }
+        let zero_width = match combining.get(next) {
+            Some(&(idx, chars)) if idx == base + col => chars,
+            _ => &[][..],
+        };
         if *c == '\0' {
             continue;
         }
         cell_cols.push(col);
         let start = text.len();
         text.push(*c);
+        for z in zero_width {
+            cell_cols.push(col);
+            text.push(*z);
+        }
         let end = text.len();
         match runs.last_mut() {
             Some(last)
@@ -1435,4 +1569,92 @@ mod tests {
     /// 描画側の上限（`chat_view::CHAT_INPUT_MAX_ROWS`）と同値。
     /// core は GPUI に依存しないのでテスト用に持つ
     const CHAT_INPUT_MAX_ROWS_FOR_TEST: usize = 8;
+
+    /// 桁数・行数を指定して `Term` を組む（#1387 の「ちょうど 1 文字ぶんの行」用）
+    fn term_sized(cols: usize, rows: usize, bytes: &[u8]) -> Term<VoidListener> {
+        let mut term = Term::new(Config::default(), &TermSize::new(cols, rows), VoidListener);
+        let mut parser: Processor<StdSyncHandler> = Processor::new();
+        parser.advance(&mut term, bytes);
+        term
+    }
+
+    /// ランがテキスト全体を隙間なく覆っていること（結合文字がランの外へ落ちない）
+    fn assert_runs_cover(line: &ScreenLine) {
+        let mut end = 0usize;
+        for run in &line.runs {
+            assert_eq!(run.range.start, end, "ランに隙間がある: {:?}", line.runs);
+            end = run.range.end;
+        }
+        assert_eq!(end, line.text.len(), "ランがテキストの末尾まで届かない");
+    }
+
+    /// #1387: NFD の濁点（`か` + `U+3099`）が `text` に残り、
+    /// `cell_cols` には**同じ列**が積まれる（全角 2 桁ちょうどの行で厳密に見る）
+    #[test]
+    fn nfdの結合文字はtextに残りcell_colsへ同じ列を積む() {
+        let term = term_sized(2, 1, "\u{304B}\u{3099}".as_bytes());
+        let s = snapshot(&term, &theme());
+        let line = &s.lines[0];
+        assert_eq!(line.text, "か\u{3099}", "濁点が落ちている: {:?}", line.text);
+        assert_eq!(line.cell_cols, vec![0, 0], "結合文字は本体と同じ列");
+        assert_runs_cover(line);
+    }
+
+    /// #1387: 全角・半角・結合文字が混ざっても `cell_cols` は `text` と同じ長さで単調。
+    /// ずれると描画のセル写像と links のスパンが 1 文字ずつ狂う
+    #[test]
+    fn 結合文字を混ぜてもcell_colsはtextと同じ長さで単調() {
+        let term = term_with("aか\u{3099}e\u{301}b".as_bytes());
+        let s = snapshot(&term, &theme());
+        let line = &s.lines[0];
+        assert_eq!(
+            line.text.trim_end(),
+            "aか\u{3099}e\u{301}b",
+            "結合文字が落ちている: {:?}",
+            line.text
+        );
+        assert_eq!(
+            line.cell_cols.len(),
+            line.text.chars().count(),
+            "cell_cols と text の長さがずれている"
+        );
+        assert!(
+            line.cell_cols.windows(2).all(|w| w[0] <= w[1]),
+            "cell_cols が単調でない: {:?}",
+            line.cell_cols
+        );
+        // `a`=0 / `か`=1（濁点も 1）/ `e`=3（アクセントも 3）/ `b`=4
+        assert_eq!(&line.cell_cols[..6], &[0, 1, 1, 3, 3, 4]);
+        assert!(line.has_wide, "全角の判定は結合文字で変わらない");
+        assert_runs_cover(line);
+    }
+
+    /// #1387: 行頭の単独の結合文字は**素の空白セル**へ載る（alacritty の
+    /// `width == 0` 経路は 1 つ左のセルへ寄せ、列 0 ではその場に載る）。
+    /// #801 の空白セルの近道で飛ばしてはいけない
+    #[test]
+    fn 空白セルへ載った結合文字も落ちない() {
+        let term = term_with("\u{301}".as_bytes());
+        let s = snapshot(&term, &theme());
+        let line = &s.lines[0];
+        assert_eq!(
+            line.text.trim_end(),
+            " \u{301}",
+            "空白セルの結合文字が落ちている: {:?}",
+            line.text
+        );
+        assert_eq!(&line.cell_cols[..2], &[0, 0]);
+        assert_runs_cover(line);
+    }
+
+    /// #1387: 複数の結合文字（濁点 + アクセント相当を 2 つ積む）も順序どおり残る。
+    /// 積む順序は alacritty の `selection_to_string` と同じ（本体 → zerowidth の順）
+    #[test]
+    fn 複数の結合文字も順序どおり残る() {
+        let term = term_sized(4, 1, "e\u{301}\u{302}".as_bytes());
+        let s = snapshot(&term, &theme());
+        let line = &s.lines[0];
+        assert_eq!(line.text.trim_end(), "e\u{301}\u{302}");
+        assert_eq!(&line.cell_cols[..3], &[0, 0, 0]);
+    }
 }
