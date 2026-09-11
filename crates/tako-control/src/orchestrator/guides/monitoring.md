@@ -114,6 +114,23 @@ Recover by `kind` (also in `tako_orchestrator_worker_status` as
   and tell them what has to change (admin action, plan/seat change, buying
   credits, or `/model` to a model their plan covers). Then park the worker —
   re-arm the watch only after the user says the account side is fixed.
+- `login_expired` (action: relogin) — the login for that account has expired
+  mid-session (its OAuth refresh token was invalidated, typically because the
+  same account was used from another machine). **`relogin` is never solved by
+  `resume`**: it surfaces as `API Error: Unable to connect to API (ENOTFOUND /
+  ECONNRESET)`, so a continue nudge looks like the right move and tako used to
+  classify it as `api_error` — but not one request gets through until a human
+  re-authenticates (measured three times in 2026-08; every time the master spun
+  in circles). So do NOT nudge, do NOT wait for a reset, and do NOT close →
+  respawn. **Ask the user to run `/login` in that worker's pane** — tako never
+  runs it for them, it needs a browser — and **name the account**:
+  `error.account` (the name in accounts.yaml) and `error.config_dir` (the
+  `CLAUDE_CONFIG_DIR` that worker runs under) come back in the status response,
+  and watch prints them on the `account=… config_dir=…` line. With several
+  accounts in play the user cannot tell which one to fix without that. The
+  worker keeps its context, so once the user is back in, a single continue nudge
+  resumes the same conversation. It can also hide *behind* a usage-limit dialog:
+  after you answer the dialog, re-arm the watch and expect this kind next.
 - `launch_failed` (action: fix_launch) — the agent CLI never started (missing
   CLI, not logged in, immediate exit, local runtime down). The `detail` already
   carries the reason and the next step; do that first (install / log in / start

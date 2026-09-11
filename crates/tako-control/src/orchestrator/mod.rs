@@ -544,6 +544,61 @@ impl AccountsConfig {
     }
 }
 
+/// config ディレクトリからアカウント名を逆引きする（#757）。
+///
+/// ログイン失効を検知したとき「**どのアカウントを再ログインすればいいか**」を
+/// master へ渡すために使う。複数アカウント運用では config_dir だけでは
+/// ユーザーがどれを指されているか分からない（`~/.claude-<用途>` のようなパスは
+/// 人が付けた名前とは別物）。
+///
+/// `config_dir = None` は「`CLAUDE_CONFIG_DIR` 未設定 = 既定の資格情報」の意味で、
+/// `inherit: true` のアカウントに当たる（Issue #512 のとおり、既定パスの明示指定とは別物）。
+/// 壊れたエントリは黙って飛ばす（逆引きは診断の付随情報なので、ここで失敗させない）
+pub fn account_name_for_config_dir(
+    cfg: &AccountsConfig,
+    config_dir: Option<&str>,
+) -> Option<String> {
+    let want = config_dir.map(|d| {
+        Path::new(&expand_tilde(d))
+            .components()
+            .collect::<PathBuf>()
+    });
+    cfg.list_resolved()
+        .into_iter()
+        .filter_map(|(name, resolved)| resolved.ok().map(|r| (name, r)))
+        .find(|(_, r)| match (&want, r.config_dir.path()) {
+            (Some(want), Some(got)) => Path::new(got).components().collect::<PathBuf>() == *want,
+            (None, None) => true,
+            _ => false,
+        })
+        .map(|(name, _)| name)
+}
+
+/// ログイン失効（#757）で「**どのアカウントを再ログインすべきか**」を解決する。
+///
+/// worker の会話（session_id）が保存されている config ディレクトリは、その worker が
+/// 使っているアカウントの実体（`CLAUDE_CONFIG_DIR`）そのものなので、transcript の
+/// 所在から引く（`registry::resume_command` が resume の env を組むのと同じ根拠 = #652）。
+///
+/// 解決できないとき（session_id 未取得・claude 以外の系統・transcript が消えている）は
+/// `None` を返す。**推測は返さない** —— 間違ったアカウントを名指しすると、ユーザーは
+/// 正しい方を再ログインしないまま「直らない」と思うことになる
+pub fn login_expired_account(session_id: Option<&str>) -> Option<serde_json::Value> {
+    let location = crate::transcript::locate_transcript(session_id?)?;
+    let config_dir = location.config_dir.display().to_string();
+    // 既定（`~/.claude`）は `CLAUDE_CONFIG_DIR` 未設定で使うものなので、
+    // 逆引きのキーは None（= `inherit: true` のアカウント）になる
+    let key = (!location.is_default).then_some(config_dir.as_str());
+    let account = AccountsConfig::load()
+        .ok()
+        .and_then(|cfg| account_name_for_config_dir(&cfg, key));
+    Some(serde_json::json!({
+        "config_dir": config_dir,
+        "is_default": location.is_default,
+        "account": account,
+    }))
+}
+
 /// アカウントエントリ 1 件を解決する（Issue #512 で config_dir / inherit の排他を検証）
 fn resolve_entry(name: &str, entry: &AccountEntry) -> Result<ResolvedAccount, String> {
     let config_dir = match (entry.inherit, entry.config_dir.as_deref()) {
