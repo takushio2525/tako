@@ -9,6 +9,9 @@
 //! という同じ前処理をする。切り出しを番犬ごとに書き直すと、片方だけ
 //! アームの除去に失敗して**旧経路を本体扱いで誤検知する**ので 1 実装にする。
 
+// 取り込む番犬ごとに使う関数が違う（片方しか使わないファイルがある）
+#![allow(dead_code)]
+
 /// `fn <name>(` から、インデント 4 の閉じ括弧までを関数本体として切り出す。
 /// テストモジュールの中の関数は必ずこの形（`rustfmt` が保証する）
 pub fn body_of(src: &str, name: &str) -> Option<String> {
@@ -41,6 +44,35 @@ pub fn strip_arms(body: &str, begin: &str, end: &str) -> (String, usize) {
             out.push_str(line);
             out.push('\n');
         }
+    }
+    (out, dropped)
+}
+
+/// A/B の旧経路アーム（`begin` 〜 `end` のマーカーで囲んだ範囲）を**空行へ潰す**。
+///
+/// [`strip_arms`] は行そのものを落とすので**行番号がずれる**。ファイル全体を走査して
+/// `file:line` で名指しする番犬（#962 の `test_timing_watchdog`）はこちらを使う
+/// （行数が保たれるので `code_view` と合成できる）。
+///
+/// 落とした件数も返す（マーカーの綴り違いで**何も見ていない番犬**になるのを防ぐ）
+pub fn blank_arms(src: &str, begin: &str, end: &str) -> (String, usize) {
+    let mut out = String::new();
+    let mut dropped = 0usize;
+    let mut inside = false;
+    for line in src.lines() {
+        let is_begin = line.contains(begin);
+        let is_end = line.contains(end);
+        if is_begin {
+            inside = true;
+            dropped += 1;
+        }
+        if !inside && !is_end {
+            out.push_str(line);
+        }
+        if is_end {
+            inside = false;
+        }
+        out.push('\n');
     }
     (out, dropped)
 }
