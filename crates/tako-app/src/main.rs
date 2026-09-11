@@ -37569,18 +37569,38 @@ mod self_test {
                 "noecho" => sh.echo("TERMCHK=absent"),
                 _ => sh.echo("TERMCHK=${TERM},${COLORTERM}"),
             };
-            check(
-                type_until_focused_text(
-                    window,
-                    cx,
-                    "1b",
-                    "TERMCHK=xterm-256color,truecolor",
-                    text_wait_budget(8, 800, 20),
-                    |cx| type_text(any, cx, &term_cmd, true),
-                )
-                .await,
-                "TERM / COLORTERM 注入",
-            );
+            let term_needle = format!("TERMCHK={}", tako_core::terminal::expected_termchk());
+            let term_ok = type_until_focused_text(
+                window,
+                cx,
+                "1b",
+                &term_needle,
+                text_wait_budget(8, 800, 20),
+                |cx| type_text(any, cx, &term_cmd, true),
+            )
+            .await;
+            if !term_ok {
+                // #946: 落ちた理由を名指しする。この項目は最初なので、ここで止まると
+                // 以降が 1 つも走らない = 切り分けの材料をログに残す価値が最も高い。
+                // **SKIP にはしない**（`conventions.md`: SKIP は本物の回帰も隠す）
+                let parent_term = std::env::var("TERM").ok();
+                let parent_colorterm = std::env::var("COLORTERM").ok();
+                let diag = tako_core::terminal::diagnose_termchk(
+                    &focused_screen_tail(window, cx),
+                    parent_term.as_deref(),
+                    parent_colorterm.as_deref(),
+                );
+                println!(
+                    "TAKO_SELF_TEST_946: item=1b cause={} parent_term={:?} \
+                     parent_colorterm={:?} 理由={} {}",
+                    diag.label(),
+                    parent_term.unwrap_or_default(),
+                    parent_colorterm.unwrap_or_default(),
+                    diag.reason(),
+                    env_line()
+                );
+            }
+            check(term_ok, "TERM / COLORTERM 注入");
 
             // 1c. 初期 cwd はホーム（.app 起動時に `/` へ落ちない）
             type_text(
