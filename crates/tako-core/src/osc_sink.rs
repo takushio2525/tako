@@ -314,11 +314,9 @@ impl SinkReader {
 mod tests {
     use super::*;
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("tako-osc-sink-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// テスト 1 本ぶんの使い捨ての置き場（**スコープを抜けると消える** = #1312）
+    fn temp_dir(tag: &str) -> crate::test_residue::ScratchDir {
+        crate::test_residue::ScratchDir::new(&format!("osc-sink-{tag}"))
     }
 
     #[test]

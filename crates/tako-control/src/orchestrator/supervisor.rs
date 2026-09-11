@@ -80,6 +80,9 @@ fn test_audit_dir() -> PathBuf {
     DIR.get_or_init(|| {
         let dir = std::env::temp_dir().join(format!("tako-test-supervisor-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
+        // 作る経路が消す経路を持つ（#1296 の 2 段構え。#1312 でここにも配線）
+        tako_core::test_residue::arm_self_cleanup(&dir);
+        tako_core::test_residue::sweep_stale_on_start();
         dir
     })
     .clone()

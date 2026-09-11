@@ -354,7 +354,9 @@ mod tests {
         let backend = format!("tako-coretest-scrn-{}", std::process::id());
         let nested = format!("tako-coretest-scrn-in-{}", std::process::id());
         let _cleanup = TmuxTestGuard::new(vec![backend.clone(), nested.clone()]);
-        let conf_path = std::env::temp_dir().join(format!("tako-scrn-conf-{nested}"));
+        // conf の置き場はスコープを抜けると消える（#1312）
+        let conf_dir = crate::test_residue::ScratchDir::new("scrn-conf");
+        let conf_path = conf_dir.join(format!("{nested}.conf"));
         std::fs::write(&conf_path, crate::tmux_backend::NESTED_TMUX_SNIPPET)
             .expect("ネスト conf を書ける");
         let options = SpawnOptions {

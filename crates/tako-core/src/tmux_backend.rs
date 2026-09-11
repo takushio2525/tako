@@ -2520,14 +2520,18 @@ set -gq copy-mode-position-format ''
     }
 
     /// ネスト tmux（バックエンド → ユーザー自前 tmux → アプリ）のチェーン e2e 用ヘルパ。
-    /// ユーザーサーバー側は NESTED_TMUX_SNIPPET（FR-2.17 の推奨設定）で起動する
+    /// ユーザーサーバー側は NESTED_TMUX_SNIPPET（FR-2.17 の推奨設定）で起動する。
+    ///
+    /// 返り値の [`ScratchDir`](crate::test_residue::ScratchDir) は**ネスト conf の置き場**で、
+    /// 呼び出し側がセッションと同じスコープで持つ（落とすと conf が消える = #1312）
     #[cfg(unix)]
     fn spawn_nested(
         backend_socket: &str,
         nested_socket: &str,
         inner_cmd: &str,
-    ) -> crate::TerminalSession {
-        let conf_path = std::env::temp_dir().join(format!("tako-nest-conf-{nested_socket}"));
+    ) -> (crate::TerminalSession, crate::test_residue::ScratchDir) {
+        let conf_dir = crate::test_residue::ScratchDir::new("nest-conf");
+        let conf_path = conf_dir.join(format!("{nested_socket}.conf"));
         std::fs::write(&conf_path, NESTED_TMUX_SNIPPET).expect("ネスト conf を書ける");
         // バックエンドペインの中でユーザー tmux サーバーへ new-session する
         // （実機の「自前 tmux セッションを tako 内で attach」構成の再現）
@@ -2557,7 +2561,7 @@ set -gq copy-mode-position-format ''
             wrap_options(options, backend_socket, "tako-e2e-nest"),
         )
         .expect("ネスト構成を spawn できる");
-        session
+        (session, conf_dir)
     }
 
     /// ネスト tmux 越しのホイールがユーザーサーバーの copy-mode スクロールに乗る e2e
@@ -2574,7 +2578,7 @@ set -gq copy-mode-position-format ''
         let backend = format!("tako-coretest-nestw-{}", std::process::id());
         let nested = format!("tako-coretest-nestw-in-{}", std::process::id());
         let _cleanup = TmuxTestGuard::new(vec![backend.clone(), nested.clone()]);
-        let session = spawn_nested(
+        let (session, _nest_conf) = spawn_nested(
             &backend,
             &nested,
             "i=0; while [ $i -lt 100 ]; do echo LINE-$i; i=$((i+1)); done; exec sleep 60",
@@ -2639,7 +2643,7 @@ set -gq copy-mode-position-format ''
         let backend = format!("tako-coretest-nestk-{}", std::process::id());
         let nested = format!("tako-coretest-nestk-in-{}", std::process::id());
         let _cleanup = TmuxTestGuard::new(vec![backend.clone(), nested.clone()]);
-        let session = spawn_nested(
+        let (session, _nest_conf) = spawn_nested(
             &backend,
             &nested,
             r"printf '\033[>1u'; echo TAKO-NEST-'READY'; exec cat -v",

@@ -2724,9 +2724,11 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_test_residue",
-            "description": "テスト・検証プロセスが一時ディレクトリへ残した使い捨て dir を掃除する（Issue #1296）。\
-                対象は `<TMPDIR>/tako-test-data-<pid>`（cargo test の data dir = #944 の隔離先）と \
-                `<TMPDIR>/tako-agent-config-<pid>`（検証プロセスのエージェント設定 = #1253 の隔離先）。\
+            "description": "テスト・検証プロセスが一時ディレクトリへ残した使い捨て dir を掃除する（Issue #1296 / #1312）。\
+                対象は `<TMPDIR>` 直下の `tako-test-data-<pid>`（cargo test の data dir = #944 の隔離先）/ \
+                `tako-agent-config-<pid>`（検証プロセスのエージェント設定 = #1253 の隔離先）/ \
+                `tako-test-scratch-<pid>`（テスト本体が作る使い捨ての作業ディレクトリの親 = #1312）/ \
+                `tako-test-orchestrator-<pid>` / `tako-test-supervisor-<pid>`（オーケストレーターのテスト隔離先）。\
                 macOS の TMPDIR は再起動でも消えないので、放っておくと数千件積もる。\
                 **既定は dry-run**（1 つも消さず、件数・バイト数・判定理由だけを返す）。\
                 apply=true で実削除。消すのは**所有プロセスが生きていないもの**だけで、\
