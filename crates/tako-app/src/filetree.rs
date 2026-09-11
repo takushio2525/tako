@@ -14,7 +14,12 @@ use tako_core::remote_fs::{RemoteEntry, RemoteFolder, RemoteOrigin, RemoteRef};
 
 /// 1 ディレクトリの最大表示エントリ数（巨大ディレクトリの暴走防止）
 const MAX_ENTRIES: usize = 500;
-/// 展開を辿る最大深さ（シンボリックリンクループ等の暴走防止）
+/// 展開を辿る最大深さ（暴走防止の最後の砦）。
+///
+/// #1398 でリンクを辿るようになるまで、この上限に**到達し得る経路は無かった**
+/// （リンクを辿らない = 実ディレクトリの深さしか増えない）。循環そのものは
+/// `collect_rows` が canonical パスの照合で打ち切るので、ここは
+/// 「照合が空振りした場合」に効く二重の歯止め
 const MAX_DEPTH: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -251,7 +256,9 @@ impl FileTree {
                 note: None,
             });
             if expanded {
-                self.collect_rows(root, 1, &mut rows);
+                // #1398: 祖先の実体（canonical パス）を積みながら降りる
+                let mut chain = vec![tako_core::platform::path::canonicalize_or_self(root)];
+                self.collect_rows(root, 1, &mut chain, &mut rows);
             }
         }
         // #976: 自動検知で増えたリモートルートは**ローカルの後ろに普通に並ぶ**。
@@ -265,7 +272,19 @@ impl FileTree {
         rows
     }
 
-    fn collect_rows(&self, dir: &Path, depth: usize, rows: &mut Vec<Row>) {
+    /// 展開中ディレクトリの中身を深さ優先で積む。
+    ///
+    /// `chain` は**ここまでに入ったディレクトリの実体**（canonical パス。起点は
+    /// ルート）。#1398 でリンクを辿るようになったので、`a/link -> a` や
+    /// `da/to_b -> ../db` + `db/to_a -> ../da` のように**同じ実体へ戻る展開**が
+    /// 起こり得る。戻ってきたら打ち切り行（[`loop_cut_row`]）で止める
+    fn collect_rows(
+        &self,
+        dir: &Path,
+        depth: usize,
+        chain: &mut Vec<PathBuf>,
+        rows: &mut Vec<Row>,
+    ) {
         if depth >= MAX_DEPTH {
             return;
         }
@@ -290,9 +309,21 @@ impl FileTree {
                 remote: None,
                 note: None,
             });
-            if expanded {
-                self.collect_rows(&entry.path, depth + 1, rows);
+            if !expanded {
+                continue;
             }
+            // canonicalize は**展開中のディレクトリの数だけ**（= 数十）なので、
+            // read_dir と同じ費用の桁に収まる。解決できないときは入力をそのまま
+            // 返る（`canonicalize_or_self`）ので、偽の循環判定にはならない
+            // （そのぶんは MAX_DEPTH が受け止める）
+            let real = tako_core::platform::path::canonicalize_or_self(&entry.path);
+            if chain.contains(&real) {
+                rows.push(loop_cut_row(&entry.path, depth + 1, &real));
+                continue;
+            }
+            chain.push(real);
+            self.collect_rows(&entry.path, depth + 1, chain, rows);
+            chain.pop();
         }
     }
 
@@ -602,6 +633,58 @@ pub fn is_hidden_name(name: &str) -> bool {
     name.starts_with('.')
 }
 
+/// 展開の打ち切りを**行として見せる**情報行（#1398）。
+///
+/// リンクを辿るようになった結果、同じ実体へ戻る展開が起こり得る。黙って空にすると
+/// 「押しても何も出ない」= #1398 で直した症状そのものに戻るので、理由と戻り先の実体を
+/// 行に出す（`.agent/conventions.md`「弾いたら黙って捨てない」・#919 の静かな失敗禁止）。
+/// 描画はリモート行の状態行と同じ 1 実装（`sidebar::render_note_row`）を通る
+fn loop_cut_row(path: &Path, depth: usize, real: &Path) -> Row {
+    Row {
+        entry: Entry {
+            // 行の同定にだけ使う（押せない行なので FS へは渡らない）
+            path: path.to_path_buf(),
+            // 表示は note が持つ。名前を入れると同じ名前の行が 2 つ出て
+            // 「2 周目が出ている」ように見えてしまう
+            name: String::new(),
+            is_dir: false,
+        },
+        depth,
+        expanded: false,
+        root: false,
+        git_status: None,
+        remote: None,
+        note: Some(RowNote::Error(crate::ui_text::sidebar::note_symlink_loop(
+            &real.display().to_string(),
+        ))),
+    }
+}
+
+/// エントリがディレクトリかを「**リンクを辿った先**」で決める（#1398）。
+///
+/// `DirEntry::file_type()` はリンクを辿らないので、ディレクトリへのシンボリック
+/// リンクは `is_dir = false`（= ファイル行）になっていた。一方で**開く側**は辿る
+/// （`dispatch::OpenFile` の `Path::is_file()` / `tako file open-in-tako` /
+/// ⌘+クリックの `open_plan::route`）ので、ツリーだけが逆の判断をしていた =
+/// 「フォルダなのに chevron が出ず、押すと『ファイルではない』で弾かれる」。
+///
+/// 追加の `stat` はリンクのエントリの数だけ（通常のファイル / ディレクトリは
+/// `file_type()` で決まる）なので、固定費は増えない。
+///
+/// **辿れないリンク（切れたリンク・`ELOOP`）はファイル行のまま**にする: 中身を
+/// 出せないものをディレクトリとして見せると「展開しても空」= 理由の出ない静かな
+/// 失敗（#919 / #1399）に戻る。ファイル行なら押したときに `OpenFile` が理由を返し、
+/// #1399 の通知欄に出る。
+///
+/// Windows のジャンクション / シンボリックリンクも `std::fs::metadata` が辿るので
+/// cfg の分岐は要らない（実機での確認は別途 = #467）
+fn entry_is_dir(path: &Path, file_type: &std::fs::FileType) -> bool {
+    if file_type.is_symlink() {
+        return std::fs::metadata(path).is_ok_and(|m| m.is_dir());
+    }
+    file_type.is_dir()
+}
+
 /// ディレクトリを読んで「ディレクトリ先・名前（大文字小文字無視）順」に並べる。
 /// 読めない場合は空（権限・消滅は正常系として無害に劣化）
 fn read_dir_sorted(path: &Path) -> Vec<Entry> {
@@ -612,12 +695,9 @@ fn read_dir_sorted(path: &Path) -> Vec<Entry> {
         .flatten()
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
-            let is_dir = e.file_type().ok()?.is_dir();
-            Some(Entry {
-                path: e.path(),
-                name,
-                is_dir,
-            })
+            let path = e.path();
+            let is_dir = entry_is_dir(&path, &e.file_type().ok()?);
+            Some(Entry { path, name, is_dir })
         })
         .collect();
     entries.sort_by(|a, b| {
@@ -931,6 +1011,336 @@ mod tests {
         // scan は git 管理外のルートを黙って飛ばす = 空の表になる
         assert!(tako_core::git_tree::scan(std::slice::from_ref(&dir)).is_empty());
         assert!(tree.rows().iter().all(|r| r.git_status.is_none()));
+        remove_temp_dir(&dir);
+    }
+
+    // --- シンボリックリンク（#1398） ---------------------------------------
+    //
+    // unix 限定。Windows のジャンクション / シンボリックリンクは**作成に権限が要る**
+    // ので実機での確認が別途必要（判定側の `entry_is_dir` は cfg で分岐しない =
+    // `std::fs::metadata` が両 OS で reparse point を辿る）
+
+    /// リンクを 1 本張る。張れない環境では**飛ばさずに落とす**
+    /// （静かに skip すると穴が残る）
+    #[cfg(unix)]
+    fn symlink(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).unwrap_or_else(|e| {
+            panic!(
+                "シンボリックリンクを作れない {} -> {}: {e}",
+                link.display(),
+                target.display()
+            )
+        });
+    }
+
+    /// 名前で 1 行引く
+    #[cfg(unix)]
+    fn row_of(tree: &mut FileTree, name: &str) -> Option<Row> {
+        tree.rows().iter().find(|r| r.entry.name == name).cloned()
+    }
+
+    /// (name, depth, is_dir, note の有無) に写す（打ち切りの検査用）
+    #[cfg(unix)]
+    fn shape(tree: &mut FileTree) -> Vec<(String, usize, bool, bool)> {
+        tree.rows()
+            .iter()
+            .map(|r| {
+                (
+                    r.entry.name.clone(),
+                    r.depth,
+                    r.entry.is_dir,
+                    r.note.is_some(),
+                )
+            })
+            .collect()
+    }
+
+    /// #1398 の本体: ディレクトリへのリンクは**展開できるディレクトリ行**になる
+    #[cfg(unix)]
+    #[test]
+    fn ディレクトリへのシンボリックリンクは展開できる() {
+        let dir = fixture("sym-dir");
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::fs::write(dir.join("real/inner.txt"), "x").unwrap();
+        symlink(&dir.join("real"), &dir.join("link"));
+
+        let mut tree = FileTree::default();
+        tree.set_roots(vec![dir.clone()]);
+        let link = row_of(&mut tree, "link").expect("link 行がある");
+        assert!(
+            link.entry.is_dir,
+            "ディレクトリへのシンボリックリンクがファイル扱いになっている（#1398）: {:?}",
+            shape(&mut tree)
+        );
+
+        let before = tree.rows().len();
+        tree.toggle_dir(&dir.join("link"));
+        let after = tree.rows();
+        assert!(
+            after.len() > before,
+            "link を展開しても行が増えない（before={before} after={}）: {:?}",
+            after.len(),
+            shape(&mut tree)
+        );
+        assert!(
+            after
+                .iter()
+                .any(|r| r.entry.name == "inner.txt" && r.depth == 2),
+            "リンク先の中身が出ていない: {:?}",
+            shape(&mut tree)
+        );
+        remove_temp_dir(&dir);
+    }
+
+    /// ファイルへのリンクは**ファイル行のまま**（`OpenFile` で開ける側）
+    #[cfg(unix)]
+    #[test]
+    fn ファイルへのシンボリックリンクはファイル行のまま() {
+        let dir = fixture("sym-file");
+        symlink(&dir.join("README.md"), &dir.join("alias.md"));
+
+        let mut tree = FileTree::default();
+        tree.set_roots(vec![dir.clone()]);
+        let row = row_of(&mut tree, "alias.md").expect("alias.md 行がある");
+        assert!(!row.entry.is_dir, "ファイルへのリンクがディレクトリ扱い");
+        // 開く側（dispatch::OpenFile の `Path::is_file()`）と判断が一致している
+        assert!(dir.join("alias.md").is_file());
+        remove_temp_dir(&dir);
+    }
+
+    /// 切れたリンクはファイル行として残す（中身を出せないものをディレクトリに
+    /// 見せると「展開しても空」= 理由の出ない静かな失敗になる）
+    #[cfg(unix)]
+    #[test]
+    fn 切れたシンボリックリンクはファイル行として残る() {
+        let dir = fixture("sym-broken");
+        symlink(&dir.join("no-such-target"), &dir.join("broken"));
+
+        let mut tree = FileTree::default();
+        tree.set_roots(vec![dir.clone()]);
+        let row = row_of(&mut tree, "broken").expect("broken 行がある");
+        assert!(!row.entry.is_dir, "辿れないリンクがディレクトリ扱い");
+        remove_temp_dir(&dir);
+    }
+
+    /// 相対パスのリンクも辿る（`link -> real` を相対で張る形）
+    #[cfg(unix)]
+    #[test]
+    fn 相対パスのシンボリックリンクも辿る() {
+        let dir = fixture("sym-rel");
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::fs::write(dir.join("real/inner.txt"), "x").unwrap();
+        symlink(Path::new("real"), &dir.join("rel"));
+
+        let mut tree = FileTree::default();
+        tree.set_roots(vec![dir.clone()]);
+        assert!(
+            row_of(&mut tree, "rel").expect("rel 行がある").entry.is_dir,
+            "相対パスのリンクを辿れていない: {:?}",
+            shape(&mut tree)
+        );
+        remove_temp_dir(&dir);
+    }
+
+    /// 相互に指し合うリンク（`a -> b` / `b -> a`）は辿れない（ELOOP）ので
+    /// ファイル行になり、展開もされない
+    #[cfg(unix)]
+    #[test]
+    fn 相互に指し合うシンボリックリンクは展開されない() {
+        let dir = fixture("sym-eloop");
+        symlink(&dir.join("b"), &dir.join("a"));
+        symlink(&dir.join("a"), &dir.join("b"));
+
+        let mut tree = FileTree::default();
+        tree.set_roots(vec![dir.clone()]);
+        for name in ["a", "b"] {
+            assert!(
+                !row_of(&mut tree, name).expect("行がある").entry.is_dir,
+                "循環リンク {name} がディレクトリ扱い（辿れないのに展開できる形）"
+            );
+        }
+        // 展開を指示しても増えない（有限時間で返る）
+        tree.toggle_dir(&dir.join("a"));
+        tree.toggle_dir(&dir.join("b"));
+        assert!(
+            tree.rows().iter().all(|r| r.depth <= 1),
+            "循環リンクの配下が出ている: {:?}",
+            shape(&mut tree)
+        );
+        remove_temp_dir(&dir);
+    }
+
+    /// 自分の祖先を指すリンク（`real/up -> ..`）は、展開しても**打ち切り行**で止まる
+    #[cfg(unix)]
+    #[test]
+    fn 祖先を指すシンボリックリンクは打ち切り行で止まる() {
+        let dir = fixture("sym-ancestor");
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        symlink(Path::new(".."), &dir.join("real/up"));
+
+        let mut tree = FileTree::default();
+        tree.set_roots(vec![dir.clone()]);
+        tree.expand_dir(&dir.join("real"));
+        let up = row_of(&mut tree, "up").expect("up 行がある");
+        assert!(up.entry.is_dir, "`..` へのリンクがファイル扱い");
+
+        tree.expand_dir(&dir.join("real/up"));
+        let rows = tree.rows();
+        let dump: Vec<(String, usize, bool, bool)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.entry.name.clone(),
+                    r.depth,
+                    r.entry.is_dir,
+                    r.note.is_some(),
+                )
+            })
+            .collect();
+        let note = rows
+            .iter()
+            .find(|r| matches!(r.note, Some(RowNote::Error(_))))
+            .unwrap_or_else(|| panic!("循環の打ち切りが行として出ていない: {dump:?}"));
+        assert_eq!(note.depth, 3, "打ち切り行の深さ");
+        // 打ち切ったので祖先の中身（README.md 等）が 2 周目で出てこない
+        let readme_depths: Vec<usize> = rows
+            .iter()
+            .filter(|r| r.entry.name == "README.md")
+            .map(|r| r.depth)
+            .collect();
+        assert_eq!(readme_depths, vec![1], "祖先の中身が 2 周目に出ている");
+        remove_temp_dir(&dir);
+    }
+
+    /// 2 つの実ディレクトリを相互に指すリンク（`da/to_b -> ../db` /
+    /// `db/to_a -> ../da`）で、往復の 2 周目が打ち切られる
+    #[cfg(unix)]
+    #[test]
+    fn 実ディレクトリ間を往復するリンクは打ち切られる() {
+        let dir = fixture("sym-mutual");
+        std::fs::create_dir_all(dir.join("da")).unwrap();
+        std::fs::create_dir_all(dir.join("db")).unwrap();
+        symlink(Path::new("../db"), &dir.join("da/to_b"));
+        symlink(Path::new("../da"), &dir.join("db/to_a"));
+
+        let mut tree = FileTree::default();
+        tree.set_roots(vec![dir.clone()]);
+        tree.expand_dir(&dir.join("da"));
+        tree.expand_dir(&dir.join("da/to_b"));
+        tree.expand_dir(&dir.join("da/to_b/to_a"));
+        let rows = tree.rows();
+        assert!(
+            rows.iter()
+                .any(|r| matches!(r.note, Some(RowNote::Error(_)))),
+            "往復の 2 周目が打ち切られていない"
+        );
+        // da は 1 回だけ（2 周目は打ち切り行に置き換わる）
+        assert_eq!(
+            rows.iter().filter(|r| r.entry.name == "to_a").count(),
+            1,
+            "to_a が 2 回以上出ている: {:?}",
+            rows.iter()
+                .map(|r| (r.entry.name.clone(), r.depth))
+                .collect::<Vec<_>>()
+        );
+        remove_temp_dir(&dir);
+    }
+
+    /// git のしるし（#1009）はリンク行で壊れない。
+    ///
+    /// **既知の限界**: リンク経由のパス（`link/inner.txt`）にはしるしが付かない。
+    /// `git status` は実体側のパス（`real/inner.txt`）で報告するので表に無く、
+    /// git 自身の見え方（`git status` の出力）と揃っている。実体側の行・
+    /// ディレクトリ伝播・ルート行は従来どおり
+    #[cfg(unix)]
+    #[test]
+    fn git状態はリンク行で壊れない() {
+        let dir = fixture("sym-git");
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::fs::write(dir.join("real/inner.txt"), "x").unwrap();
+        symlink(&dir.join("real"), &dir.join("link"));
+
+        let mut tree = FileTree::default();
+        tree.set_roots(vec![dir.clone()]);
+        assert!(tree.apply_git_status(git_map(&dir, &[("real/inner.txt", '.', 'M')])));
+        tree.expand_dir(&dir.join("real"));
+        tree.expand_dir(&dir.join("link"));
+
+        let rows = tree.rows();
+        let badge = |path: PathBuf| {
+            rows.iter()
+                .find(|r| r.entry.path == path)
+                .unwrap_or_else(|| panic!("{} の行が無い", path.display()))
+                .git_status
+                .map(|s| s.badge())
+        };
+        // 実体側は従来どおり（ファイル = M / ディレクトリ = 配下 1 件）
+        assert_eq!(badge(dir.join("real/inner.txt")).as_deref(), Some("M"));
+        assert_eq!(badge(dir.join("real")).as_deref(), Some("1"));
+        assert_eq!(badge(dir.clone()).as_deref(), Some("1"));
+        // リンク経由の行は付かない（git が報告しないパスなので伝播もしない）
+        assert_eq!(badge(dir.join("link")), None);
+        assert_eq!(badge(dir.join("link/inner.txt")), None);
+        remove_temp_dir(&dir);
+    }
+
+    /// 段 3 との整合: ディレクトリへのリンクは**開く経路へ行かない**。
+    ///
+    /// サイドバーのクリック分岐は `is_dir` を見て toggle / open を分けるので、
+    /// `is_dir = true` になった行は `OpenFile`（`Path::is_file()` で弾かれる側）へ
+    /// 到達しない。⌘+クリック / `tako file open-in-tako` が引く振り分け表
+    /// （`open_plan::route`）も同じ答えを返す = GUI / CLI / MCP で意味が揃う
+    #[cfg(unix)]
+    #[test]
+    fn ディレクトリへのリンクは開く経路へ行かない() {
+        use tako_core::open_plan::{route, OpenRoute, PreviewRoute};
+
+        let dir = fixture("sym-route");
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        symlink(&dir.join("real"), &dir.join("link"));
+        symlink(&dir.join("README.md"), &dir.join("alias.md"));
+
+        let entries = read_dir_sorted(&dir);
+        let pick = |name: &str| {
+            entries
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("{name} が無い"))
+        };
+        let link = pick("link");
+        assert!(link.is_dir);
+        assert_eq!(
+            route(&link.path, link.is_dir),
+            OpenRoute::Terminal,
+            "ディレクトリへのリンクがプレビュー（= OpenFile）側へ振られている"
+        );
+        // ファイルへのリンクは従来どおりプレビューへ（`OpenFile` が開ける）
+        let alias = pick("alias.md");
+        assert!(!alias.is_dir);
+        assert_eq!(
+            route(&alias.path, alias.is_dir),
+            OpenRoute::Preview(PreviewRoute::Markdown)
+        );
+        assert!(alias.path.is_file(), "開く側の `is_file()` と判断が一致");
+        remove_temp_dir(&dir);
+    }
+
+    /// 500 件超（`MAX_ENTRIES`）にリンクが混ざっても切り詰めの挙動は変わらない
+    /// （切り詰めそのものは #1402 の範囲なので触らない）
+    #[cfg(unix)]
+    #[test]
+    fn 大量のリンクが混ざっても切り詰めは変わらない() {
+        let dir = fixture("sym-many");
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        for i in 0..600 {
+            symlink(&dir.join("real"), &dir.join(format!("l{i:04}")));
+        }
+        let entries = read_dir_sorted(&dir);
+        assert_eq!(entries.len(), MAX_ENTRIES, "切り詰めの上限が変わっている");
+        assert!(
+            entries.iter().all(|e| e.is_dir),
+            "ディレクトリ先の並びにファイル行が混ざっている"
+        );
         remove_temp_dir(&dir);
     }
 }

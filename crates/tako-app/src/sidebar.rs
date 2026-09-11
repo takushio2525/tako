@@ -541,6 +541,12 @@ impl TakoApp {
                             if row.remote.is_some() {
                                 return self.render_remote_row(index, &row, &theme, cx);
                             }
+                            // #1398: ローカルの情報行（シンボリックリンクの循環で
+                            // 展開を打ち切った説明）。押せない行なので、インライン編集・
+                            // 右クリック・D&D のどれにも入る前に分岐する
+                            if row.note.is_some() {
+                                return Self::render_note_row(index, &row, &theme);
+                            }
                             // インライン編集中の行を検出
                             let is_inline = match &inline_edit_snapshot {
                                 Some(edit) if edit.kind == InlineEditKind::Rename => {
@@ -939,6 +945,75 @@ impl TakoApp {
         )
     }
 
+    /// 情報行（読み込み中 / 失敗 / 空）の 1 行。**押せない行**。
+    ///
+    /// リモート行（#919 / #1010）とローカル行（#1398 の展開打ち切り）で同じ形を出す
+    /// ための 1 実装。どちらも「黙って空にしない」ための行なので、見え方が
+    /// 2 通りに割れると「同じ理由が画面によって違う形で出る」ことになる
+    fn render_note_row(
+        index: usize,
+        row: &filetree::Row,
+        theme: &tako_core::theme::Theme,
+    ) -> gpui::Stateful<gpui::Div> {
+        let base = div()
+            .id(("filetree-row", index as u64))
+            .flex()
+            .flex_row()
+            .items_center()
+            .py(px(1.0))
+            .when(row.depth >= 1, |d| {
+                d.ml(px(INDENT_STEP * row.depth as f32))
+                    .pl(px(14.0))
+                    .children(indent_guides(
+                        row.depth,
+                        hsla(theme.border_subtle),
+                        hsla(theme.border_subtle),
+                    ))
+            })
+            .when(row.depth == 0, |d| d.pl(px(12.0)));
+        let Some(note) = &row.note else {
+            // 呼び出し側が `row.note.is_some()` で分岐しているので来ないが、
+            // **render の中で panic するとアプリごと落ちる**ので空行へ倒す（#828）
+            return base;
+        };
+        let (text, color) = match note {
+            filetree::RowNote::Loading => (
+                crate::ui_text::remote_folder::row_loading().to_string(),
+                theme.text_muted,
+            ),
+            filetree::RowNote::Empty => (
+                crate::ui_text::remote_folder::row_empty().to_string(),
+                theme.text_muted,
+            ),
+            filetree::RowNote::Error(report) => (report.clone(), theme.red),
+        };
+        // #1010: 読み込み中は回る弧を添える（「止まっている」と区別が付く）
+        let loading = matches!(note, filetree::RowNote::Loading);
+        // #919: 失敗の理由は 3 行（要約 / 次の一手 / 生の詳細）。サイドバーは狭いので
+        // **折り返す**（`whitespace_nowrap` + `text_ellipsis` だと理由が読めない =
+        // 静かな失敗に戻ってしまう）。`min_w(0)` は flex の自動最小サイズを外して
+        // 折り返し幅を親に合わせるため（#745 と同じ理由で縦積みには効かないので
+        // 行方向のここだけに置く）
+        base.py(px(2.0))
+            .gap(px(4.0))
+            .when(loading, |d| {
+                d.child(crate::spinner::spinner(
+                    ("remote-dir-spin", index as u64),
+                    px(11.0),
+                    hsla(color),
+                ))
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .pr(px(8.0))
+                    .text_size(px(11.0))
+                    .text_color(hsla(color))
+                    .child(SharedString::from(text)),
+            )
+    }
+
     /// リモート（SSH 先）ツリーの 1 行（#919）。
     ///
     /// ローカル行と**別の関数**に分けているのは、ローカル行の経路にある
@@ -975,45 +1050,10 @@ impl TakoApp {
             .when(row.depth == 0, |d| d.pl(px(12.0)));
 
         // 状態行（読み込み中 / 失敗 / 空）は押せない情報行。
-        // #919 の要点: **失敗を必ず行として見せる**（黙って空にしない）
-        if let Some(note) = &row.note {
-            let (text, color) = match note {
-                filetree::RowNote::Loading => (
-                    crate::ui_text::remote_folder::row_loading().to_string(),
-                    theme.text_muted,
-                ),
-                filetree::RowNote::Empty => (
-                    crate::ui_text::remote_folder::row_empty().to_string(),
-                    theme.text_muted,
-                ),
-                filetree::RowNote::Error(report) => (report.clone(), theme.red),
-            };
-            // #1010: 読み込み中は回る弧を添える（「止まっている」と区別が付く）
-            let loading = matches!(note, filetree::RowNote::Loading);
-            // #919: 失敗の理由は 3 行（要約 / 次の一手 / 生の詳細）。サイドバーは狭いので
-            // **折り返す**（`whitespace_nowrap` + `text_ellipsis` だと理由が読めない =
-            // 静かな失敗に戻ってしまう）。`min_w(0)` は flex の自動最小サイズを外して
-            // 折り返し幅を親に合わせるため（#745 と同じ理由で縦積みには効かないので
-            // 行方向のここだけに置く）
-            return base
-                .py(px(2.0))
-                .gap(px(4.0))
-                .when(loading, |d| {
-                    d.child(crate::spinner::spinner(
-                        ("remote-dir-spin", index as u64),
-                        px(11.0),
-                        hsla(color),
-                    ))
-                })
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .pr(px(8.0))
-                        .text_size(px(11.0))
-                        .text_color(hsla(color))
-                        .child(SharedString::from(text)),
-                );
+        // #919 の要点: **失敗を必ず行として見せる**（黙って空にしない）。
+        // #1398 でローカル行（展開の打ち切り）も同じ行を出すので 1 実装を共有する
+        if row.note.is_some() {
+            return Self::render_note_row(index, row, theme);
         }
 
         let is_dir = row.entry.is_dir;
