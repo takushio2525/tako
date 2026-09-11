@@ -641,6 +641,13 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
   「直後」しか見ないので、リトライループに包むと見逃す**——アンカーは #1153 の
   「`for _ in 0..N {` の次行が `wait(cx,`」を共有し、肯定形かどうかの判定
   （`has_positive_focused_contains`）も 1 実装を共有する
+- **最初の項目が落ちたら「なぜ」までログに出す**（#946）。項目 1b（TERM / COLORTERM 注入）は
+  **最初なので落ちると 1c 以降が 1 つも走らない**。失敗時は `TAKO_SELF_TEST_946` の 1 行に
+  `cause=`（`injected` / `inherited` / `unexpected` / `no-echo`）と親プロセスの TERM /
+  COLORTERM を出し、「注入が効いていない（親から継承した）」と「エコーが返っていない
+  （待ち・入力経路）」を**ログだけで切り分けられる**ようにする。判定は
+  `tako_core::terminal::diagnose_termchk`（純関数）で、GUI 無しで全分岐を単体テストできる。
+  **SKIP にはしない**（上の #771 と同じ理由: SKIP は本物の回帰も隠す）
 - **実 claude の応答を固定窓で待たない**（#771）。`TAKO_SELF_TEST_CLAUDE` 系
   （45c=#28 / 95c=#716 / 97c=#720 / 101c=#749）が待っている相手は**実 LLM** なので、
   応答までの時間は機の混み具合で桁が動く。項目 101c は 600 × 500ms = **固定 300 秒**の窓で
@@ -1272,6 +1279,24 @@ stderr・そのソケットのセッション一覧・PTY / ソケット / サ�
 診断になる（#1300 の観測は理由が 1 ビットも残らず、枯渇か否かの切り分けに測り直しが
 1 往復要った。実測の答えは PTY 103/511 = **枯渇ではなく名前の取り合い**）。
 番犬は `crates/tako-control/tests/tmux_e2e_watchdog.rs`、A/B は `TAKO_1300_LEGACY=1`。
+
+## 新しい worktree は PWA のビルドから始まる（Issue #1309 / #574）
+
+`git worktree add` 直後のツリーには `web/tako-remote/dist/` が無い（`.gitignore` 対象）。
+rust_embed（`remote.rs` の `PwaAssets`）がそれを**コンパイル時**に要求するので、
+放っておくと `cargo build` が `#[derive(RustEmbed)] folder ... does not exist` →
+`PwaAssets::get` 未定義で落ちる。
+
+**手作業は要らない**: `crates/tako-control/build.rs` が `dist/index.html` の有無を見て、
+無ければ `npm ci && npm run build` を走らせる。**既にある dist は触らない**ので、
+ビルド済みのツリーでは所要も生成物も変わらない（CI は #574 で npm build 済みの状態で
+ここへ来るため二重ビルドにならない）。共有ツリーから `dist/` をコピーする回避はもう不要。
+
+npm が無い / npm が失敗した環境では**1 行目に手順が出て**止まるので、案内どおり
+`scripts/build-pwa.sh` を実行する（PWA ビルドの正本。`build-app.sh` もこれを呼ぶ）。
+手順を変えるときは `build.rs` の `pwa` モジュールと `build-pwa.sh` を**対で**直す
+（build.rs 側が npm を直接起こすのは、Windows の開発機に bash があるとは限らないため）。
+
 ## 設定・データファイルのスキーマ変更（Issue #916）
 
 **永続ファイルの形式や置き場を変えるときは自動移行を同梱する。手動移行を要求しない。**
@@ -1607,9 +1632,17 @@ CI で特定の語も見張りたいときは `TAKO_PII_TERMS`（`,` 区切り�
 ```sh
 scripts/lib/virtual-display.sh ensure   # 無ければ作る（冪等・消す機能は無い）
 # 以降、検証用の起動は何もしなくても tako-vd へ出る
-env -u TAKO_SOCKET -u TAKO_TOKEN -u TAKO_PANE_ID -u TERM -u COLORTERM \
+env -u TAKO_SOCKET -u TAKO_TOKEN -u TAKO_PANE_ID \
   TAKO_SELF_TEST=1 TAKO_ISOLATED=1 cargo run -p tako-app
 ```
+
+- **`-u TERM -u COLORTERM` は要らない**（#946）。ペインの端末申告は
+  `TerminalSession::spawn` が**最後に無条件で上書き**するので、tako のペインの中から
+  起こしても（親 `TERM=tmux-256color`）GUI から起こしても（親に TERM 無し）
+  ペインの中は同じ `xterm-256color` / `truecolor` になる。実測は
+  `cargo test -p tako-core --test pane_term_env`（親 TERM 6 系統 + 注入口のアーム）。
+  **旧レシピが揃えていたのは #1165 の取り違え**で、項目 1b が落ちていた真因は
+  固定 6.4 秒窓の使い切りだった（`-u TERM` の有無と相関して見えたのは偶然）
 
 - **隔離するのは data dir だけではない**（#1253）。`TAKO_ISOLATED` / `TAKO_SELF_TEST` /
   `TAKO_VISUAL_TEST` のどれかが立っていれば、外部エージェントの設定
