@@ -34,10 +34,13 @@ fn legacyで永久busyが再現する() {
         IDLE_WITH_BACKGROUND,
         false,
         Some(Agent::Claude),
+        // 属性が取れない経路でも、入力欄が素で空なら従来どおり倒せる（#1297）
+        None,
+        false,
         false,
     );
     assert_eq!(
-        fixed.as_deref(),
+        fixed.overriding(),
         Some("1 shell, 1 monitor"),
         "既定で入力待ちを判定できていない"
     );
@@ -46,10 +49,15 @@ fn legacyで永久busyが再現する() {
     // --- legacy: 画面で覆さない = 一次シグナルの busy がそのまま残る ---
     std::env::set_var("TAKO_1273_LEGACY", "1");
     assert!(wait::legacy_1273(), "env が読まれていない");
-    let legacy =
-        wait::input_waiting_with_background_work(IDLE_WITH_BACKGROUND, false, Some(Agent::Claude));
+    let legacy = wait::input_waiting_with_background_work(
+        IDLE_WITH_BACKGROUND,
+        false,
+        Some(Agent::Claude),
+        None,
+    );
     assert_eq!(
-        legacy, None,
+        legacy,
+        wait::BackgroundIdle::No,
         "legacy なのに画面で覆している（A/B が成立していない）"
     );
     eprintln!("[1273-ab] legacy: {legacy:?}（= watch は永久に WORKER_IDLE を出せない）");

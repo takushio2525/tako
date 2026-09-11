@@ -1717,7 +1717,14 @@ pub fn tools() -> Vec<Value> {
                 events には choice_dialog（dialog_kind つき）が積まれ、\
                 このとき question は出さない（ダイアログ待ちは本文への返信では解けない）。\
                 kind が trust / bypass のものは tako 自身が承諾するので触らないこと（auto_accepted: true）。\
-                応答は tako_orchestrator_respond（choice 省略で下見できる）。",
+                応答は tako_orchestrator_respond（choice 省略で下見できる）。\
+                #1273: 背景シェル / Monitor が生きているあいだ claude の一次シグナルは busy を返し続けるので、\
+                画面が「ターン終了 + 入力待ち」と決定的に言っていれば idle へ倒す \
+                （background_work に残っている背景作業の内訳・idle_despite_primary_busy に倒したかが入る）。\
+                #1297: 倒せたはずなのに倒さなかったときは idle_override_blocked に理由が入る \
+                （input_draft_unreadable = 入力欄に文字はあるが属性が取れず、人の下書きと \
+                claude の AI ゴースト提案を見分けられないので安全側に置いた。\
+                画面を見て人の下書きが無いなら、そのまま指示を送ってよい）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {

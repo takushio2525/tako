@@ -9202,6 +9202,9 @@ pub struct WorkerStatusCtx {
     live_tail: Option<String>,
     /// ライブ画面全体のテキスト（折りたたみ検出用。ペインが GUI に無ければ None）
     full_screen: Option<String>,
+    /// 入力欄のテキスト属性（#1297。`tako_read_pane` の `input_status.style` と同じ 1 実装）。
+    /// **None = 属性が取れない**（ペインが GUI に無く素の tmux capture へ落ちた等）
+    input_style: Option<tako_core::InputStyle>,
     /// tmux セッション配下に実行中の子プロセスがあるか（#224）
     has_running_children: bool,
     /// 利用上限後の自動復帰の状態（#813。UI スレッドで写し取る）
@@ -9228,8 +9231,18 @@ fn collect_worker_status_ctx(host: &dyn ControlHost, pane_id: u64) -> WorkerStat
             .iter()
             .any(|p| p.id().as_u64() == pane_id)
     });
-    let lines = host.session(target).map(|session| session.visible_lines());
+    // 画面と入力欄の属性は**同じセッション・同じ呼び出し**から採る
+    // （別々に引き直すと、別フレームの画面と属性を突き合わせることになる）
+    let session = host.session(target);
+    let lines = session.map(|session| session.visible_lines());
     let full_screen = lines.as_ref().map(|l| l.join("\n"));
+    // #1297: 入力欄の「文字があるか」ではなく「**人が打った**文字があるか」を
+    // 決めるための属性。claude は空欄へ AI のゴースト提案を dim で描くので、
+    // 文字列だけだと下書きと見分けられず #1273 の腕が死ぬ。
+    // 取り口は `read_pane` の `input_status` と同じ 1 実装（`analyze_input`）
+    let input_style = session
+        .and_then(|session| session.analyze_input())
+        .map(|status| status.style);
     let backend_session = host.backend_session(target);
     let has_running_children = backend_session
         .as_ref()
@@ -9241,6 +9254,7 @@ fn collect_worker_status_ctx(host: &dyn ControlHost, pane_id: u64) -> WorkerStat
         has_running_children,
         live_tail: lines.map(tail_join),
         full_screen,
+        input_style,
         limit_resume: limit_resume_entry(host, target),
     }
 }
@@ -9298,6 +9312,73 @@ fn rate_limits_json(rl: &crate::codex_session::RateLimits) -> serde_json::Value 
     })
 }
 
+/// #1034 / #1295: 実行拒否（`execution_refused`）を分類してよいか
+/// = **一次シグナルで agent の作業を 1 歩も観測していない**か。
+///
+/// ゲートを分けてあるのは #983 の誤検知を戻さないため。仕事を始めた worker の
+/// scrollback には、agent 自身が読んだファイルやコマンド出力として同じ文字列が
+/// 普通に流れる（#983 が `command not found` で踏んだ形）。**画面推定の busy は
+/// 根拠にならない**（TUI の起動描画だけで busy に見える。#1034 の実測では
+/// `first_busy` が 0.67s に出ていたが 1 文字も進んでいなかった）。
+///
+/// ## `None`（観測ゼロ）の扱いが #1295
+///
+/// 旧実装は `agent_work_started != Some(true)` で `None` を**無条件に**作業ゼロと
+/// 数えていた。ところが **claude の腕（`query_agent_status`）は `agent_work_started`
+/// を一度も代入しない**ので、claude では worker の実状態と無関係に常に真になる。
+/// `execution_refused_patterns(Claude)` に文言を 1 つ足した瞬間、正常に働いた worker
+/// （`status=idle` / `prompt_delivery=delivered`）が `error` / `retry_spawn` へ落ちる。
+///
+/// `None` を作業ゼロと読めるのは「拒否が**会話の成立前**に起こるので直接の証拠を
+/// 採る対象がそもそも無い」系統（= agy）だけで、その宣言は**能力マトリクスの 1 マス**
+/// [`tako_core::agent_support::keys::WORKER_REFUSAL_WORK_PROOF`] が持つ（#982 の規約）。
+fn refusal_gate_open(
+    agent: tako_core::agent_support::Agent,
+    agent_work_started: Option<bool>,
+) -> bool {
+    refusal_gate_open_in(agent, agent_work_started, legacy_refusal_gate())
+}
+
+/// [`refusal_gate_open`] の A/B を引数で受ける版（env を触らずに両アームを検査できる）
+fn refusal_gate_open_in(
+    agent: tako_core::agent_support::Agent,
+    agent_work_started: Option<bool>,
+    legacy: bool,
+) -> bool {
+    use tako_core::agent_support::{self, keys, RefusalWorkProof};
+    // 一次シグナルを持たない系統では「作業ゼロ」と「見えないだけ」が区別できない
+    if !agent_support::supports(agent, keys::WORKER_STATUS_STRUCTURED) {
+        return false;
+    }
+    if legacy {
+        return legacy_work_unobserved(agent_work_started);
+    }
+    match agent_work_started {
+        // 観測できた側は素直に読む（作業を 1 歩でも観測したら分類しない）
+        Some(started) => !started,
+        // 観測ゼロ。代理の証拠（会話が 1 件も解決できない）を使える系統だけ通す
+        None => matches!(
+            agent_support::refusal_work_proof(agent),
+            RefusalWorkProof::NoConversation
+        ),
+    }
+}
+
+/// #1295 の A/B（`TAKO_1295_LEGACY=1`）でだけ通る**修正前**のゲート。
+/// `None`（= 観測ゼロ）を無条件に作業ゼロと数えるので、`agent_work_started` を
+/// 代入しない claude では常に真になる
+fn legacy_work_unobserved(agent_work_started: Option<bool>) -> bool {
+    agent_work_started != Some(true)
+}
+
+/// #1295 の A/B 用の env。`TAKO_1295_LEGACY=1` で**同一バイナリのまま**
+/// 修正前のゲート（`None` を無条件に作業ゼロと数える）へ戻す
+fn legacy_refusal_gate() -> bool {
+    std::env::var("TAKO_1295_LEGACY")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 fn finish_worker_status(
     ctx: WorkerStatusCtx,
     session_id: Option<&str>,
@@ -9311,6 +9392,7 @@ fn finish_worker_status(
         backend_session,
         live_tail,
         full_screen,
+        input_style,
         has_running_children: has_children,
         limit_resume,
     } = ctx;
@@ -9385,7 +9467,10 @@ fn finish_worker_status(
     let mut agy_transcript_read = false;
     // #1034: 一次シグナルで「agent が作業を 1 歩でも始めた」ことを観測できたか。
     // **None = 何も言えない**（読めない系統・まだ会話が無い）ので、
-    // 実行拒否の分類はここが `Some(false)` のときだけに限る
+    // 実行拒否の分類はここが `Some(false)` のときだけに限る。
+    // #1295: 例外は「拒否が会話の成立前に起こる」とマトリクスが宣言した系統だけで、
+    // その判断は [`refusal_gate_open`] が持つ（claude の腕はここを代入しないので、
+    // `None` を無条件に作業ゼロと数えるとゲートが claude で常に開く）
     let mut agent_work_started: Option<bool> = None;
     let (status, mut ctx_percent) = if let Some(ref sid) = resolved_sid {
         let agent = orchestrator::query_agent_status(sid);
@@ -9535,6 +9620,7 @@ fn finish_worker_status(
         has_children,
         recent_output,
         full_screen,
+        input_style,
         tmux_session: tmux_session.map(String::from),
         registry_agent: registry_worker.as_ref().map(|(_, e)| e.agent.clone()),
         registry_worker_id: registry_worker.map(|(id, _)| id),
@@ -9561,6 +9647,9 @@ struct ResolvedWorkerStatus {
     has_children: bool,
     recent_output: Option<String>,
     full_screen: Option<String>,
+    /// #1297: 入力欄のテキスト属性（`read_pane` の `input_status.style` と同じ 1 実装）。
+    /// **None = 属性が取れない**ので、入力欄の中身は文字列だけで判定する（旧挙動）
+    input_style: Option<tako_core::InputStyle>,
     tmux_session: Option<String>,
     /// #390: レジストリ上の worker ID（登録済み worker のみ）
     registry_worker_id: Option<String>,
@@ -9607,6 +9696,7 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         has_children,
         recent_output,
         full_screen,
+        input_style,
         tmux_session,
         registry_worker_id,
         registry_agent,
@@ -9730,14 +9820,30 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     //
     // `has_children` も要求する: 子が 1 つも無い busy は #224 の `stalled`
     // （もっと具体的な停止種別）が拾うべきもので、そこを先取りしない
+    //
+    // #1297: 「入力欄が空か」は**文字列だけでは決まらない**。claude は空欄へ
+    // AI のゴースト提案（薄字）を描き、文面は任意の自然文なのでプレースホルダの
+    // リストには載らない。ここへ属性つきの読み取り（`input_style`）を渡さないと、
+    // 提案が出ているあいだ倒せず本番 pane 1636 / 1761 / 1775 / 1784 のように
+    // 永久 busy になる。属性が取れない経路（素の tmux capture）では従来どおり
+    // 文字列判定へ落ち、倒せなかった理由を `idle_override_blocked` に残す
     let mut idle_despite_primary_busy = false;
+    let mut idle_override_blocked: Option<&'static str> = None;
     if status == "busy" && agents_authoritative && has_children {
-        let waiting = recent_output.as_deref().and_then(|out| {
-            crate::orchestrator::wait::input_waiting_with_background_work(out, collapsed, agent)
+        let verdict = recent_output.as_deref().map(|out| {
+            crate::orchestrator::wait::input_waiting_with_background_work(
+                out,
+                collapsed,
+                agent,
+                input_style,
+            )
         });
-        if waiting.is_some() {
-            status = "idle".to_string();
-            idle_despite_primary_busy = true;
+        if let Some(verdict) = verdict {
+            if verdict.overriding().is_some() {
+                status = "idle".to_string();
+                idle_despite_primary_busy = true;
+            }
+            idle_override_blocked = verdict.blocked_reason();
         }
     }
 
@@ -9835,27 +9941,14 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     // **一次シグナルで agent の作業を 1 歩も観測していない**ときだけ見る。これで
     // 「仕事を始めた worker の scrollback に同じ文字列が流れる」型の誤検知
     // （#983 が `command not found` で避けたもの）を構造的に避けられる。
-    // **画面推定の busy は根拠にならない**（TUI の起動描画だけで busy に見える。
-    // #1034 の実測では `first_busy` が 0.67s に出ていたが 1 文字も進んでいなかった）。
     //
-    // **`None`（会話そのものが無い）も「作業ゼロ」に数える**のが実挙動に要る:
-    // 拒否は会話が作られる前に起こるので（#1034 の実画面は CLI の起動直後）、
-    // `Some(false)` だけに限ると本来の事象で発火しない。`None` を数えても危なくないのは
-    // **ペイン → 会話の解決が sticky** だから ——  一度でも解決できたペインは以後
-    // ずっと `Some(..)` を返す（`agy_session::resolve_conversation_id_for_backend`）ので、
-    // ここで `None` = そのペインが生きているあいだ一度も会話を開いていない、が durable に言える。
-    // ただし**一次シグナルを持つ系統に限る**（持たない系統では `None` が
-    // 「見えないだけ」と区別できない）
-    let work_unobserved = agent_work_started != Some(true)
-        && registry_agent
-            .as_deref()
-            .and_then(tako_core::agent_support::Agent::parse)
-            .is_some_and(|a| {
-                tako_core::agent_support::supports(
-                    a,
-                    tako_core::agent_support::keys::WORKER_STATUS_STRUCTURED,
-                )
-            });
+    // 判定の中身は [`refusal_gate_open`] に閉じてある（#1295）。**ここで条件を
+    // 書き足さない**: `None` を作業ゼロと数えてよい系統かどうかは能力マトリクスの
+    // 1 マスが宣言していて、呼び出し側が系統を直書きすると宣言が 2 箇所になる
+    let work_unobserved = registry_agent
+        .as_deref()
+        .and_then(tako_core::agent_support::Agent::parse)
+        .is_some_and(|a| refusal_gate_open(a, agent_work_started));
     if error_info.is_none() && work_unobserved && (status == "idle" || status == "unknown") {
         if let (Some(agent_name), Some(out)) = (registry_agent.as_deref(), recent_output.as_deref())
         {
@@ -10044,6 +10137,10 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         // #1273: 一次シグナルは busy だったが、画面が「ターン終了 + 入力待ち」と
         // 決定的に言っていたので idle へ倒したか
         "idle_despite_primary_busy": idle_despite_primary_busy,
+        // #1297: 倒せたはずなのに倒さなかった理由（null = 該当なし）。
+        // input_draft_unreadable = 入力欄に文字はあるが属性が取れず、人の下書きと
+        // claude の AI ゴースト提案を見分けられないので安全側（busy）に置いた
+        "idle_override_blocked": idle_override_blocked,
         "collapsed": collapsed,
         "events": events,
         // #572: true = 人間が busy 中に打った指示がキューに未送信で残っている
@@ -12630,13 +12727,7 @@ pub fn session_restart_menu_facts(
         agent_busy: crate::claude_tui::interrupt_hint_visible(&lines),
         queued_messages: crate::claude_tui::queued_messages_pending(&lines),
         // ダイアログの選択カーソルは入力欄と同じ字面なので、ダイアログ中は下書きと読まない（#748）
-        user_draft: !dialog
-            && input.is_some_and(|s| {
-                matches!(
-                    s.style,
-                    tako_core::InputStyle::User | tako_core::InputStyle::Mixed
-                )
-            }),
+        user_draft: !dialog && input.is_some_and(|s| s.style.is_user_draft()),
         dialog,
     }
 }
@@ -17604,6 +17695,7 @@ mod tests {
             backend_session: None,
             live_tail: None,
             full_screen: None,
+            input_style: None,
             has_running_children: false,
             limit_resume: Value::Null,
         };
@@ -17623,6 +17715,7 @@ mod tests {
                 backend_session: None,
                 live_tail: Some("done\n❯ ".into()),
                 full_screen: None,
+                input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
             },
@@ -17640,6 +17733,7 @@ mod tests {
                 backend_session: None,
                 live_tail: Some("Thinking…\nesc to interrupt".into()),
                 full_screen: None,
+                input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
             },
@@ -17656,6 +17750,7 @@ mod tests {
                 backend_session: None,
                 live_tail: None,
                 full_screen: None,
+                input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
             },
@@ -17678,6 +17773,7 @@ mod tests {
                     "  ⎿  API Error: Connection closed mid-response. The response above may be incomplete.\n\n❯ ".into(),
                 ),
                 full_screen: None,
+                input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
             },
@@ -17703,6 +17799,7 @@ mod tests {
                     "■ You've hit your usage limit. Upgrade to Pro or try again at 4:24 AM.\n\n› 1. Switch to gpt-5.4-mini".into(),
                 ),
                 full_screen: None,
+                input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
             },
@@ -17722,6 +17819,7 @@ mod tests {
                 backend_session: None,
                 live_tail: Some("done\n❯ ".into()),
                 full_screen: None,
+                input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
             },
@@ -17742,6 +17840,7 @@ mod tests {
                     "  ⎿  API Error (Connection error.) · Retrying in 4 seconds… (attempt 3/10)\nesc to interrupt".into(),
                 ),
                 full_screen: None,
+                input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
             },
@@ -17765,6 +17864,7 @@ mod tests {
                     "テストを追加しますか？\n❯ 1. はい\n  2. いいえ\n❯ \n──────".into(),
                 ),
                 full_screen: None,
+                input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
             },
@@ -17790,6 +17890,7 @@ mod tests {
                         .into(),
                 ),
                 full_screen: None,
+                input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
             },
@@ -17813,6 +17914,7 @@ mod tests {
                 backend_session: None,
                 live_tail: Some("done\n❯ ".into()),
                 full_screen: None,
+                input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
             },
@@ -17981,9 +18083,11 @@ mod tests {
             I1273_IDLE_WITH_BACKGROUND,
             false,
             Some(tako_core::agent_support::Agent::Claude),
+            None,
             true,
+            false,
         );
-        assert!(waiting.is_none(), "legacy では画面で覆さない");
+        assert!(waiting.overriding().is_none(), "legacy では画面で覆さない");
     }
 
     /// 受け入れ条件 3: 生成中（スピナーあり）は busy のまま
@@ -18061,6 +18165,257 @@ mod tests {
             assert_eq!(v["status"], "busy", "{agent}: 画面で覆っている");
             assert_eq!(v["idle_despite_primary_busy"], false);
         }
+    }
+
+    // --- #1297: 入力欄の AI ゴースト提案を「人の下書き」と読まない ---
+
+    /// #1297 の本番 pane 1636（2026-09-09 16:06 観測）と同じ形。
+    /// ターンは終わり（`done … · 1 shell still running`）、人は何も打っていないのに、
+    /// claude が入力欄へ **AI のゴースト提案**（薄字）を描いている。
+    /// **画面テキストだけ見ると人の下書きと区別が付かない**のが Issue の核心
+    const I1297_GHOST_SUGGESTION: &str = "\
+⏺ PR を出しました。CI の結果を待ちます。
+
+✻ Worked for 2m 04s · done 12:43 PM · 1 shell still running
+
+─────────────────────────────────────────────
+❯ merge the PR once CI is green
+─────────────────────────────────────────────
+  [model placeholder]  worker: placeholder task
+  ctx  38% ███░░░░░░░
+  ⏵⏵ auto mode on · 1 shell · ← for agents";
+
+    /// #1297 の画面 + 入力欄の属性で `worker_status` を組む
+    fn i1297_resolved(style: Option<tako_core::InputStyle>) -> ResolvedWorkerStatus {
+        ResolvedWorkerStatus {
+            input_style: style,
+            ..i1273_resolved(I1297_GHOST_SUGGESTION)
+        }
+    }
+
+    /// 受け入れ条件 1: 再現 —— ゴースト提案（`style=ghost`）は「空」と同じ扱い
+    #[test]
+    fn issue1297_ゴースト提案があっても背景作業つき入力待ちはidleになる() {
+        let v = apply_worker_status_corrections(i1297_resolved(Some(tako_core::InputStyle::Ghost)))
+            .unwrap();
+        assert_eq!(v["status"], "idle", "watch が WORKER_IDLE を出せる状態");
+        assert_eq!(v["idle_despite_primary_busy"], true);
+        assert_eq!(v["background_work"], "1 shell");
+        assert_eq!(
+            v["idle_override_blocked"],
+            Value::Null,
+            "倒せているのに理由が出ている"
+        );
+    }
+
+    /// A/B: 同一バイナリのまま旧挙動（属性を見ない）へ戻すと busy のまま。
+    /// env 版（`TAKO_1297_LEGACY=1`）は `tests/issue1297_legacy_ab.rs`
+    #[test]
+    fn issue1297_legacyでは同じ画面がbusyのまま() {
+        let legacy = crate::orchestrator::wait::input_waiting_with_background_work_in(
+            I1297_GHOST_SUGGESTION,
+            false,
+            Some(tako_core::agent_support::Agent::Claude),
+            Some(tako_core::InputStyle::Ghost),
+            false,
+            true,
+        );
+        assert_eq!(
+            legacy,
+            crate::orchestrator::wait::BackgroundIdle::No,
+            "legacy なのに属性を見ている（A/B が成立していない）"
+        );
+        // 既定は覆せる（同じ入力・同じバイナリで差が出ることの対照）
+        let fixed = crate::orchestrator::wait::input_waiting_with_background_work_in(
+            I1297_GHOST_SUGGESTION,
+            false,
+            Some(tako_core::agent_support::Agent::Claude),
+            Some(tako_core::InputStyle::Ghost),
+            false,
+            false,
+        );
+        assert_eq!(fixed.overriding(), Some("1 shell"));
+    }
+
+    /// 受け入れ条件 2: 人の下書き（`user` / `mixed`）は引き続き覆さない。
+    /// **#1273 の安全側を崩さない**のがこの修正の前提条件
+    #[test]
+    fn issue1297_人の下書きがあれば覆さない() {
+        for style in [tako_core::InputStyle::User, tako_core::InputStyle::Mixed] {
+            let v = apply_worker_status_corrections(i1297_resolved(Some(style))).unwrap();
+            assert_eq!(v["status"], "busy", "{style:?}: 人の下書きを踏み潰している");
+            assert_eq!(v["idle_despite_primary_busy"], false);
+            assert_eq!(
+                v["idle_override_blocked"],
+                Value::Null,
+                "{style:?}: 下書きと分かっているのに「読めない」と報告している"
+            );
+        }
+    }
+
+    /// エッジ: 属性が取れない経路（素の tmux capture）は従来どおり文字列判定へ落ち、
+    /// **倒せなかった理由**を応答に残す（master が watch のタイムアウトを待たずに済む）
+    #[test]
+    fn issue1297_属性が取れなければ従来判定へ落ちて理由を残す() {
+        let v = apply_worker_status_corrections(i1297_resolved(None)).unwrap();
+        assert_eq!(v["status"], "busy", "属性なしで覆すのは安全側が崩れている");
+        assert_eq!(v["idle_despite_primary_busy"], false);
+        assert_eq!(
+            v["idle_override_blocked"], "input_draft_unreadable",
+            "覆せなかった理由が応答から読めない"
+        );
+        assert_eq!(v["background_work"], "1 shell", "内訳は従来どおり読める");
+    }
+
+    /// エッジ: 入力欄が素で空なら属性が無くても従来どおり倒せる（#1273 の回帰防止）
+    #[test]
+    fn issue1297_空の入力欄は属性が無くても倒せる() {
+        let v = apply_worker_status_corrections(ResolvedWorkerStatus {
+            input_style: None,
+            ..i1273_resolved(I1273_IDLE_WITH_BACKGROUND)
+        })
+        .unwrap();
+        assert_eq!(v["status"], "idle");
+        assert_eq!(v["idle_override_blocked"], Value::Null);
+        // 属性が「空」と言っている場合も同じ
+        let v = apply_worker_status_corrections(ResolvedWorkerStatus {
+            input_style: Some(tako_core::InputStyle::None),
+            ..i1273_resolved(I1273_IDLE_WITH_BACKGROUND)
+        })
+        .unwrap();
+        assert_eq!(v["status"], "idle");
+    }
+
+    /// エッジ: ゴースト提案が**複数行に折り返している**画面。
+    /// 入力欄の判定は最下部のプロンプト行を見るので、続き行があっても結論は変わらない
+    #[test]
+    fn issue1297_折り返したゴースト提案でも倒せる() {
+        let wrapped = I1297_GHOST_SUGGESTION.replace(
+            "❯ merge the PR once CI is green",
+            "❯ merge the PR once CI is green, then close the issue with the\n  \
+             measurement log attached so the reviewer can check it later",
+        );
+        let v = apply_worker_status_corrections(ResolvedWorkerStatus {
+            input_style: Some(tako_core::InputStyle::Ghost),
+            ..i1273_resolved(&wrapped)
+        })
+        .unwrap();
+        assert_eq!(v["status"], "idle", "折り返しで判定が変わっている");
+        assert_eq!(v["idle_despite_primary_busy"], true);
+    }
+
+    /// エッジ: ゴースト提案が出ていても**生成中**なら倒さない（優先順位 1 は不変）
+    #[test]
+    fn issue1297_生成中はゴースト提案があってもbusy() {
+        let generating = I1297_GHOST_SUGGESTION.replace(
+            "✻ Worked for 2m 04s · done 12:43 PM · 1 shell still running",
+            "✻ Cooking… (12s · ↓ 1.2k tokens · esc to interrupt)",
+        );
+        let v = apply_worker_status_corrections(ResolvedWorkerStatus {
+            input_style: Some(tako_core::InputStyle::Ghost),
+            ..i1273_resolved(&generating)
+        })
+        .unwrap();
+        assert_eq!(v["status"], "busy");
+        assert_eq!(v["idle_despite_primary_busy"], false);
+        assert_eq!(
+            v["idle_override_blocked"],
+            Value::Null,
+            "生成中は「読めない」ではなく単に覆さない"
+        );
+    }
+
+    /// 受け入れ条件 3（e2e）: **実 PTY** に dim のゴースト提案を描かせ、
+    /// GUI と同じ 1 実装（`TerminalSession::analyze_input`）で属性を採り、
+    /// `worker_status` が idle を返すところまでを実測で通す。
+    ///
+    /// 実 claude にゴースト提案を「出させる」ことは制御できない（出るかどうかは
+    /// 上流の判断）ので、**同じ描き方**（`ESC[2m` の薄字を入力欄へ）をする
+    /// 模擬 TUI を実端末で走らせる。検査するのは
+    /// 「ANSI → グリッド → スタイルラン → `InputStyle` → 覆す判定」の実経路
+    #[cfg(unix)]
+    #[test]
+    fn issue1297_実ptyのゴースト提案でworker_statusがidleになる() {
+        use std::time::{Duration, Instant};
+
+        // #1297 の本番と同じ形を実端末へ描く。入力欄の本文だけ dim（= ゴースト提案）
+        let screen = concat!(
+            "⏺ PR を出しました。CI の結果を待ちます。\r\n",
+            "\r\n",
+            "✻ Worked for 2m 04s · done 12:43 PM · 1 shell still running\r\n",
+            "\r\n",
+            "─────────────────────────────────────────────\r\n",
+            "❯ \x1b[2mmerge the PR once CI is green\x1b[0m\r\n",
+            "─────────────────────────────────────────────\r\n",
+            "  [model placeholder]  worker: placeholder task\r\n",
+            "  ⏵⏵ auto mode on · 1 shell · ← for agents",
+        );
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let (session, _rx) = TerminalSession::spawn(
+            100,
+            24,
+            SpawnOptions {
+                command: Some(tako_core::SpawnCommand {
+                    program: "/bin/sh".to_string(),
+                    // 描いたまま生かしておく（画面を読む側が採り終わるまで）
+                    args: vec![
+                        "-c".to_string(),
+                        format!("printf '%s' '{screen}'; sleep 60"),
+                    ],
+                }),
+                ..SpawnOptions::default()
+            },
+        )
+        .expect("PTY を張れる");
+        host.sessions.insert(pane, session);
+
+        // **状態で待つ**（固定時間で待たない）。上限は機の混み具合で伸ばすだけ
+        let budget = tako_core::wait_budget::state_wait_budget(
+            Duration::from_secs(20),
+            tako_core::wait_budget::machine_busy(),
+        );
+        let deadline = Instant::now() + budget;
+        let mut ctx = collect_worker_status_ctx(&host, pane);
+        while Instant::now() < deadline && ctx.input_style.is_none() {
+            std::thread::sleep(Duration::from_millis(20));
+            ctx = collect_worker_status_ctx(&host, pane);
+        }
+        let dump = ctx.full_screen.clone().unwrap_or_default();
+
+        // ① 実端末のグリッドから属性が採れている（GUI の `input_status.style` と同じ経路）
+        assert_eq!(
+            ctx.input_style,
+            Some(tako_core::InputStyle::Ghost),
+            "実 PTY の dim な提案を ghost と読めていない（budget={budget:?}）:\n{dump}"
+        );
+
+        // ② 素のキャプチャだけでは「下書きがある」と読めてしまう（Issue の再現）
+        let recent = ctx.live_tail.clone().expect("ライブ画面が採れる");
+        let lines: Vec<String> = recent.lines().map(str::to_string).collect();
+        let input = crate::claude_tui::input_line(&lines).expect("入力欄が読める");
+        assert!(
+            !crate::claude_tui::input_content_is_empty(input),
+            "文字列判定では空に見えてしまい、再現になっていない: {input:?}"
+        );
+
+        // ③ 属性を渡せば覆せる / 渡さなければ覆せない（同じ画面での対比）
+        let v = apply_worker_status_corrections(ResolvedWorkerStatus {
+            input_style: ctx.input_style,
+            ..i1273_resolved(&recent)
+        })
+        .unwrap();
+        assert_eq!(v["status"], "idle", "実 PTY の画面で覆せていない:\n{dump}");
+        assert_eq!(v["idle_despite_primary_busy"], true);
+        assert_eq!(v["background_work"], "1 shell");
+
+        let without = apply_worker_status_corrections(ResolvedWorkerStatus {
+            input_style: None,
+            ..i1273_resolved(&recent)
+        })
+        .unwrap();
+        assert_eq!(without["status"], "busy", "属性なしで倒れている");
+        assert_eq!(without["idle_override_blocked"], "input_draft_unreadable");
     }
 
     // --- #1277: codex / agy は一次シグナルが idle へ落ちる（覆す必要が無い） ---
@@ -23129,6 +23484,7 @@ mod tests {
                 backend_session: None,
                 live_tail: Some("Welcome to Claude Code\n❯ ".into()),
                 full_screen: None,
+                input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
             },
@@ -23157,6 +23513,7 @@ mod tests {
                 backend_session: None,
                 live_tail: Some("Thinking…\nesc to interrupt".into()),
                 full_screen: None,
+                input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
             },
@@ -23191,6 +23548,7 @@ mod tests {
                 backend_session: None,
                 live_tail: Some("done\n❯ ".into()),
                 full_screen: None,
+                input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
             },
@@ -23264,6 +23622,7 @@ mod tests {
                     backend_session: None,
                     live_tail: Some("Welcome to Claude Code\n❯ ".into()),
                     full_screen: None,
+                    input_style: None,
                     has_running_children: false,
                     limit_resume: Value::Null,
                 },
@@ -23363,6 +23722,7 @@ mod tests {
                 backend_session: None,
                 live_tail: Some("agy\n> ".into()),
                 full_screen: None,
+                input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
             },
@@ -23407,6 +23767,7 @@ mod tests {
                 backend_session: None,
                 live_tail: Some("Thinking…\nesc to interrupt".into()),
                 full_screen: None,
+                input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
             },
@@ -23457,6 +23818,7 @@ mod tests {
                 backend_session: None,
                 live_tail: Some(CODEX_BG_WAIT_NARROW_1015.into()),
                 full_screen: Some(CODEX_BG_WAIT_NARROW_1015.into()),
+                input_style: None,
                 // 実発生の観測（背景で cargo test / 隔離セルフテストが走っていた）
                 has_running_children: true,
                 limit_resume: Value::Null,
@@ -23511,6 +23873,7 @@ mod tests {
                 backend_session: None,
                 live_tail: Some("• You have 1 usage limit reset available.\n\n› Ask Codex to do anything\n\n  gpt-5.6-sol high · /private/tmp/probe".into()),
                 full_screen: None,
+                input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
             },
@@ -23577,6 +23940,7 @@ mod tests {
                         .into(),
                 ),
                 full_screen: None,
+                input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
             },
@@ -23603,6 +23967,7 @@ mod tests {
                 backend_session: None,
                 live_tail: Some("Not logged in\n".into()),
                 full_screen: None,
+                input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
             },
@@ -23631,6 +23996,7 @@ mod tests {
                 backend_session: None,
                 live_tail: Some("zsh: command not found: codex\n".into()),
                 full_screen: None,
+                input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
             },
@@ -23671,6 +24037,7 @@ mod tests {
                     backend_session: None,
                     live_tail: Some(screen.into()),
                     full_screen: None,
+                    input_style: None,
                     has_running_children: false,
                     limit_resume: Value::Null,
                 },
@@ -23726,6 +24093,130 @@ mod tests {
         );
     }
 
+    /// #1295: ゲートの真理値表（env を触らない純粋関数の A/B）。
+    ///
+    /// **`None` の扱いだけが系統で割れる**。claude / codex の `None` は
+    /// 「観測していない」なので通さず、agy の `None` は「会話がまだ無い」
+    /// （= 拒否は会話の成立前に起こる）ので通す
+    #[test]
+    fn issue1295_ゲートはnoneをマトリクスの宣言でだけ通す() {
+        use tako_core::agent_support::Agent;
+        let open = |a, w| refusal_gate_open_in(a, w, false);
+        let legacy = |a, w| refusal_gate_open_in(a, w, true);
+
+        for a in [Agent::Claude, Agent::Codex] {
+            assert!(!open(a, Some(true)), "{a:?}: 作業を観測したら分類しない");
+            assert!(open(a, Some(false)), "{a:?}: 作業ゼロを観測したら分類する");
+            assert!(
+                !open(a, None),
+                "{a:?}: 観測ゼロ（= 何も言えない）を作業ゼロと数えない"
+            );
+            // 修正前は `None` を無条件に通していた（= claude では常に開く）
+            assert!(legacy(a, None), "{a:?}: 修正前のゲートの再現が消えている");
+        }
+
+        // agy は会話が作られる前に拒否されるので、代理の証拠で通す（#1034 の本来の事象）
+        assert!(open(Agent::Agy, None), "#1034 の分類が発火しなくなっている");
+        assert!(!open(Agent::Agy, Some(true)));
+        assert!(open(Agent::Agy, Some(false)));
+
+        // 一次シグナルを持たない系統はどのアームでも落ちる
+        for w in [Some(true), Some(false), None] {
+            assert!(!open(Agent::Local, w));
+            assert!(!legacy(Agent::Local, w));
+        }
+    }
+
+    /// #1295: **claude の正常完了を実行拒否へ落とさない**（end-to-end の再現）。
+    ///
+    /// claude の腕（`query_agent_status`）は `agent_work_started` を一度も代入しないので、
+    /// 修正前のゲート（`agent_work_started != Some(true)`）は **claude では worker の
+    /// 実状態と無関係に常に真**だった。`execution_refused_patterns(Claude)` が空な
+    /// あいだは画面から発火しないので、判定パターンだけを注入口
+    /// （`TAKO_1295_INJECT_PATTERN`）から足して**将来文言を 1 つ足した状態**を作る。
+    #[test]
+    fn issue1295_claudeの正常完了を実行拒否へ落とさない() {
+        use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
+        let path = registry_path().unwrap();
+        // **送達済みで正常に働いた** claude worker
+        WorkerRegistry::mutate_at(&path, |reg| {
+            reg.workers.insert(
+                "q12951".into(),
+                WorkerEntry {
+                    pane: 12951,
+                    agent: "claude".into(),
+                    status: "active".into(),
+                    spawned_at: "2026-01-01T00:00:00Z".into(),
+                    prompt_delivered_at: Some(crate::sessions::now_iso()),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+
+        // 「agent 自身が読んだファイルの中身」として拒否文言が画面末尾に流れている形
+        // （#983 が `command not found` で踏んだのと同じ = 仕事はちゃんと終わっている）
+        const PHRASE: &str = "tako-1295-injected-refusal";
+        let screen =
+            format!("  仕様を確認しました。\n  grep で {PHRASE} を数えました。\n  RESULT: 3\n");
+        let status_of = || {
+            finish_worker_status(
+                WorkerStatusCtx {
+                    pane_id: 12951,
+                    pane_exists: true,
+                    backend_session: None,
+                    live_tail: Some(screen.clone()),
+                    full_screen: None,
+                    has_running_children: false,
+                    limit_resume: Value::Null,
+                },
+                None,
+                None,
+            )
+            .unwrap()
+        };
+
+        std::env::set_var("TAKO_1295_INJECT_PATTERN", PHRASE);
+        // 修正後: claude の `None` は「観測していない」なので作業ゼロと数えない
+        let v = status_of();
+        assert_ne!(
+            v["status"], "error",
+            "正常に働いた claude worker を error に落としている: {v}"
+        );
+        assert!(
+            v["error"].is_null(),
+            "実行拒否として分類してはいけない: {v}"
+        );
+
+        // 修正前のゲート（`None` を無条件に作業ゼロと数える）へ戻すと再現する
+        std::env::set_var("TAKO_1295_LEGACY", "1");
+        let v = status_of();
+        std::env::remove_var("TAKO_1295_LEGACY");
+        std::env::remove_var("TAKO_1295_INJECT_PATTERN");
+        assert_eq!(
+            v["status"], "error",
+            "修正前のゲートは claude で常に開いていた（再現が消えている）: {v}"
+        );
+        assert_eq!(v["error"]["kind"], "execution_refused");
+        assert_eq!(v["error"]["recommended_action"], "retry_spawn");
+
+        // **系統が解決できない worker** は修正前のゲートでも分類しない
+        // （マトリクスを引けないので「見えないだけ」と区別できない）
+        WorkerRegistry::mutate_at(&path, |reg| {
+            if let Some(e) = reg.workers.get_mut("q12951") {
+                e.agent = "gemini".into();
+            }
+        })
+        .unwrap();
+        std::env::set_var("TAKO_1295_INJECT_PATTERN", PHRASE);
+        let v = status_of();
+        std::env::remove_var("TAKO_1295_INJECT_PATTERN");
+        assert_ne!(
+            v["status"], "error",
+            "系統が解決できない worker を実行拒否へ落としている: {v}"
+        );
+    }
+
     #[test]
     fn issue390_agent突然死をagent_deadイベントで検知しresumeを提示する() {
         use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
@@ -23754,6 +24245,7 @@ mod tests {
             // SIGSEGV 後のシェルプロンプト画面（claude TUI の ❯ ではない）
             live_tail: Some("zsh: segmentation fault  claude\n% ".into()),
             full_screen: None,
+            input_style: None,
             has_running_children: has_children,
             limit_resume: Value::Null,
         };

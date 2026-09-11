@@ -145,7 +145,7 @@ claude mcp add --scope user --transport stdio tako -- /Applications/tako.app/Con
 
 `tako remote start` は、外出先のスマホのブラウザから tako のペインを見て操作するための API サーバーを起動します。**既定で無効**で、明示的に起動したときだけ動きます。セットアップは `tako remote setup` の対話ウィザードが案内します。
 
-通信は [Tailscale](https://tailscale.com/) の `serve` が HTTPS → Unix domain socket をプロキシする構成で、daemon は TCP ポートを一切開きません。URL は tailnet 内にのみ存在し、WireGuard でエンドツーエンド暗号化されます。認証は二層で、層①が `tailscale whois` による tailnet ノードの検証、層②が機器ペアリング（初回接続時に Mac 画面の承認ダイアログを通すまで画面データを受け取れない）です。仕組みの詳細は[リモートアクセスのドキュメント](https://tako-docs.pages.dev/features/remote/)にあります。
+通信は [Tailscale](https://tailscale.com/) の `serve` が HTTPS → ループバック TCP（`127.0.0.1` のエフェメラルポート）をプロキシする構成です。daemon の待ち受けはループバックだけにバインドされるので、LAN や外部ネットワークからは到達できません。URL は tailnet 内にのみ存在し、WireGuard でエンドツーエンド暗号化されます。認証は二層で、層①が `tailscale whois` による tailnet ノードの検証、層②が機器ペアリング（初回接続時に Mac 画面の承認ダイアログを通すまで画面データを受け取れない）です。仕組みの詳細は[リモートアクセスのドキュメント](https://tako-docs.pages.dev/features/remote/)にあります。
 
 **使う前に必ず読んでください / Read before use:**
 
@@ -153,7 +153,7 @@ claude mcp add --scope user --transport stdio tako -- /Applications/tako.app/Con
 - **接続 URL を共有しないでください。** URL 自体にトークンは含まれませんが、tailnet 内の端末からはアクセス可能です。SNS やスクリーンショットで公開しないでください。
 - **到達できるのは同じ tailnet の端末だけです。** それでも tailnet 内の全端末を信頼できない場合（共有 tailnet 等）は、この機能を使わないでください。Tailscale アカウント自体の保護（2 要素認証・tailnet lock）も重要です。
 
-`tako remote start` launches an API server that lets you drive tako's panes from a phone browser. **It is disabled by default.** Treat it as a legitimate remote-control tool: once connected, the remote browser can send arbitrary keystrokes and commands to your terminal — effectively full shell access. Use it only to control your own machine, never share the connection URL, and do not enable it if you cannot trust every device on your tailnet.
+`tako remote start` launches an API server that lets you drive tako's panes from a phone browser. **It is disabled by default.** Tailscale `serve` proxies HTTPS to a loopback TCP listener (`127.0.0.1`, ephemeral port), so the daemon is not reachable from your LAN or the internet; see the [remote access docs](https://tako-docs.pages.dev/features/remote/) for how it works. Treat it as a legitimate remote-control tool: once connected, the remote browser can send arbitrary keystrokes and commands to your terminal — effectively full shell access. Use it only to control your own machine, never share the connection URL, and do not enable it if you cannot trust every device on your tailnet.
 
 ## ソースからビルド / Build from source
 

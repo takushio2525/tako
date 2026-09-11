@@ -1527,8 +1527,11 @@ fn declaration_implies_turn_end(agent: Agent) -> bool {
 ///    claude は生成中も入力欄を描くので、空の `❯` があるだけでは入力待ちと言えない
 ///    （既存テストが `screen_looks_idle(CLAUDE_BUSY_SCREEN_V2)` = true を固定している）
 /// 2. **折りたたみ画面は根拠にしない**（本文が欠けているので busy 側へ倒す）
-/// 3. **入力欄が空で実在する**こと（Issue の決定的兆候。`read_pane` の `input_status` と
-///    同じ `claude_tui` の 1 実装を通す）
+/// 3. **入力欄が実在し、人の下書きが無い**こと（Issue の決定的兆候）。
+///    「空か」は**文字列だけでは決まらない**: claude は空欄へ AI のゴースト提案を
+///    dim で描くので、文面リストでは網羅できない（#1297 の本番 4 ペインがこれで
+///    永久 busy になっていた）。属性つきの `input_status.style` を
+///    [`classify_input_draft`] へ渡して決める
 /// 4. **背景作業の残存が画面から読める**こと。ここまで揃って初めて
 ///    「一次シグナルの busy は背景作業のせいだ」と説明がつく。説明がつかない busy は
 ///    そのままにする
@@ -1536,51 +1539,180 @@ pub fn input_waiting_with_background_work(
     output: &str,
     collapsed: bool,
     agent: Option<Agent>,
-) -> Option<String> {
-    input_waiting_with_background_work_in(output, collapsed, agent, legacy_1273())
+    input_style: Option<tako_core::InputStyle>,
+) -> BackgroundIdle {
+    input_waiting_with_background_work_in(
+        output,
+        collapsed,
+        agent,
+        input_style,
+        legacy_1273(),
+        legacy_1297(),
+    )
 }
 
-/// 旧挙動かどうかを明示して判定する（#1273 の A/B）。
+/// 旧挙動かどうかを明示して判定する（#1273 / #1297 の A/B）。
 /// **判断を引数に置く**ので env グローバルを触らずに新旧どちらも検査できる
-/// （公開関数はこれに [`legacy_1273`] を渡すだけ = env が唯一の差になる）
+/// （公開関数はこれに [`legacy_1273`] / [`legacy_1297`] を渡すだけ = env が唯一の差になる）
 pub fn input_waiting_with_background_work_in(
     output: &str,
     collapsed: bool,
     agent: Option<Agent>,
+    input_style: Option<tako_core::InputStyle>,
     legacy: bool,
-) -> Option<String> {
+    legacy_ghost: bool,
+) -> BackgroundIdle {
     if legacy {
-        return None;
+        return BackgroundIdle::No;
     }
     // 系統の宣言（#982）。まず能力そのもの、次に**その系統の申告の意味**を見る
-    let agent = agent?;
+    let Some(agent) = agent else {
+        return BackgroundIdle::No;
+    };
     if !tako_core::agent_support::supports(
         agent,
         tako_core::agent_support::keys::WORKER_IDLE_WITH_BACKGROUND,
     ) {
-        return None;
+        return BackgroundIdle::No;
     }
     // 画面の申告が「ターンが終わった」まで言っている系統だけが覆せる（#1277）。
     // codex / agy は申告が状態しか言わない代わりに一次シグナルが idle へ落ちるので、
     // ここを通さなくても能力は満たされている
     if !declaration_implies_turn_end(agent) {
-        return None;
+        return BackgroundIdle::No;
     }
     if collapsed {
-        return None;
+        return BackgroundIdle::No;
     }
     // **判定器はパイプライン全体で同じものを使う**: ここだけ agent 指定版を使うと、
     // dispatch が idle と言った画面を watch の再検査（`screen_looks_busy`）が busy と読み、
     // idle_streak が永久に積まれない形になる
     if screen_looks_busy(output) {
-        return None;
+        return BackgroundIdle::No;
     }
     let lines: Vec<String> = output.lines().map(str::to_string).collect();
-    let input = crate::claude_tui::input_line(&lines)?;
-    if !crate::claude_tui::input_content_is_empty(input) {
-        return None;
+    // 入力欄が実在すること + 選択肢ダイアログではないこと（`input_line` のガード）。
+    // 中身が「人の下書き」かどうかは**属性込み**で決める（#1297）
+    let Some(input) = crate::claude_tui::input_line(&lines) else {
+        return BackgroundIdle::No;
+    };
+    let draft = classify_input_draft_in(input, input_style, legacy_ghost);
+    if draft == InputDraft::Present {
+        return BackgroundIdle::No;
     }
-    background_work_summary_for(output, Some(agent))
+    let Some(work) = background_work_summary_for(output, Some(agent)) else {
+        return BackgroundIdle::No;
+    };
+    match draft {
+        InputDraft::Absent => BackgroundIdle::Waiting(work),
+        // 素の tmux capture 経路（属性が取れない）。従来どおり覆さないが、
+        // 「ゴースト提案かもしれない」ことを応答から読めるようにする（#1297）
+        InputDraft::Indistinguishable => BackgroundIdle::DraftIndistinguishable(work),
+        InputDraft::Present => BackgroundIdle::No,
+    }
+}
+
+/// 一次シグナルの busy を画面で覆せるかの判定結果（#1273。#1297 で理由つきへ）。
+///
+/// 旧実装は `Option<String>` で「覆せる / 覆せない」しか返せず、**覆せなかった理由**が
+/// 応答から消えていた。#1297 の本番 4 ペインはどれも「覆せない」側だったのに、
+/// master にはその理由（入力欄の文字がゴースト提案かもしれない）が見えず、
+/// watch のタイムアウトでしか気づけなかった
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackgroundIdle {
+    /// 覆してよい（値は背景作業の内訳）
+    Waiting(String),
+    /// 覆さない（系統が違う / 生成中 / 折りたたみ / 申告なし / 人の下書きあり）
+    No,
+    /// 入力欄に文字はあるが**属性が取れず**、人の下書きと claude の AI ゴースト提案を
+    /// 見分けられないので覆さない（#1297。値は背景作業の内訳 = 報告用）
+    DraftIndistinguishable(String),
+}
+
+impl BackgroundIdle {
+    /// 覆すなら背景作業の内訳
+    pub fn overriding(&self) -> Option<&str> {
+        match self {
+            Self::Waiting(w) => Some(w.as_str()),
+            _ => None,
+        }
+    }
+
+    /// 覆せなかった理由コード（`worker_status` の `idle_override_blocked`）。
+    /// 覆したとき・理由を名指しできないときは None
+    pub fn blocked_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::DraftIndistinguishable(_) => Some(INPUT_DRAFT_UNREADABLE),
+            _ => None,
+        }
+    }
+}
+
+/// `idle_despite_primary_busy` を倒せなかった理由コード（#1297）。
+///
+/// 意味は「入力欄に文字はあるが、それが人の下書きか claude の AI ゴースト提案かを
+/// **属性が取れないので決められない**」。安全側（= 覆さない）に倒しているだけで、
+/// 本当に人が打っているとは限らない
+pub const INPUT_DRAFT_UNREADABLE: &str = "input_draft_unreadable";
+
+/// 入力欄の中身が「人の下書き」かどうかの分類（#1297）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputDraft {
+    /// 下書きなし（空 / プレースホルダ / AI のゴースト提案だけ）
+    Absent,
+    /// 人が打った下書きがある
+    Present,
+    /// 文字はあるが属性が取れず、下書きとゴースト提案を見分けられない
+    Indistinguishable,
+}
+
+/// 入力欄の中身を属性込みで分類する（#1297）。
+///
+/// ## なぜ文字列だけでは足りないか
+///
+/// claude は入力欄が空のとき **AI のゴースト提案**（薄字）を描く。文面は
+/// 「CI が緑になったら merge して…」のような任意の自然文なので、
+/// `INPUT_PLACEHOLDERS` のような文言リストでは原理的に網羅できない。
+/// 文字列だけで見ると「人の下書きがある」と読めてしまい、#1273 の
+/// 「背景作業つき入力待ちを idle と読む」腕がまるごと死ぬ（本番 pane 1636 /
+/// 1761 / 1775 / 1784 で実際に死んでいた）。
+///
+/// ## 属性の読み方
+///
+/// `style` は `tako_read_pane` の `input_status.style` と**同じ 1 実装**
+/// （`tako_core::screen::analyze_input_line`）が出す。`Ghost`（全部 dim）と
+/// `None`（空）は下書きなし、`User` / `Mixed`（通常輝度が 1 文字でもある）は
+/// 下書きあり = 覆さない（#1273 の安全側を維持）。
+///
+/// `style` が `None`（属性の取れない素の tmux capture 経路）のときだけ
+/// 従来の文字列判定へ落ち、空でなければ [`InputDraft::Indistinguishable`]。
+/// **「読めない = 覆さない」**なので劣化はしても誤報は増えない（#1015 と同じ作法）
+pub fn classify_input_draft(content: &str, style: Option<tako_core::InputStyle>) -> InputDraft {
+    classify_input_draft_in(content, style, legacy_1297())
+}
+
+/// 旧挙動かどうかを明示して分類する（#1297 の A/B）。
+/// `legacy_ghost = true` で属性を**一切見ない** = 文字列だけの旧判定に戻る
+pub fn classify_input_draft_in(
+    content: &str,
+    style: Option<tako_core::InputStyle>,
+    legacy_ghost: bool,
+) -> InputDraft {
+    if let Some(style) = style.filter(|_| !legacy_ghost) {
+        return if style.is_user_draft() {
+            InputDraft::Present
+        } else {
+            InputDraft::Absent
+        };
+    }
+    if crate::claude_tui::input_content_is_empty(content) {
+        InputDraft::Absent
+    } else if legacy_ghost {
+        // 旧挙動は「空でない = 下書きあり」で打ち切っていた（理由も残さない）
+        InputDraft::Present
+    } else {
+        InputDraft::Indistinguishable
+    }
 }
 
 /// #1273 の A/B。`TAKO_1273_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
@@ -1588,6 +1720,13 @@ pub fn input_waiting_with_background_work_in(
 pub fn legacy_1273() -> bool {
     static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *LEGACY.get_or_init(|| std::env::var("TAKO_1273_LEGACY").map(|v| v == "1") == Ok(true))
+}
+
+/// #1297 の A/B。`TAKO_1297_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
+/// （入力欄の属性を見ず文字列だけで判定する = ゴースト提案があると覆せない）
+pub fn legacy_1297() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_1297_LEGACY").map(|v| v == "1") == Ok(true))
 }
 
 /// #1277 の A/B。`TAKO_1277_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
@@ -4322,16 +4461,31 @@ esc to cancel                      Claude Opus 4.6 (Thinking)";
             ("agy", AGY_IDLE_WITH_BG, Agent::Agy),
         ] {
             assert_eq!(
-                input_waiting_with_background_work_in(screen, false, Some(agent), false),
-                None,
+                input_waiting_with_background_work_in(
+                    screen,
+                    false,
+                    Some(agent),
+                    None,
+                    false,
+                    false
+                ),
+                BackgroundIdle::No,
                 "{label}: 申告を覆す根拠に使っている"
             );
         }
         // claude は従来どおり覆せる（回帰していないこと）
         let claude = "✻ Worked for 1m 11s · done 2:54 PM · 1 shell, 1 monitor still running\n❯ \n";
         assert_eq!(
-            input_waiting_with_background_work_in(claude, false, Some(Agent::Claude), false),
-            Some("1 shell, 1 monitor".to_string())
+            input_waiting_with_background_work_in(
+                claude,
+                false,
+                Some(Agent::Claude),
+                None,
+                false,
+                false
+            )
+            .overriding(),
+            Some("1 shell, 1 monitor")
         );
     }
 
@@ -4366,8 +4520,15 @@ esc to cancel                      Claude Opus 4.6 (Thinking)";
             ("agy", AGY_IDLE_WITH_BG, Agent::Agy),
         ] {
             assert_eq!(
-                input_waiting_with_background_work_in(screen, true, Some(agent), false),
-                None,
+                input_waiting_with_background_work_in(
+                    screen,
+                    true,
+                    Some(agent),
+                    None,
+                    false,
+                    false
+                ),
+                BackgroundIdle::No,
                 "{label}: 折りたたみで判定が変わった"
             );
         }
