@@ -685,9 +685,26 @@ pub fn input_box_has_content(screen: &Screen, region: &InputRegion) -> bool {
     if analyze_input_line_at(screen, region.prompt_row).is_some_and(|s| !s.text.trim().is_empty()) {
         return true;
     }
-    // 箱が複数行なら 2 行目以降の本文も見る（プロンプト行は上で判定済み）
+    // 枠線つきで描くバージョン（`│ ❯ hello │`）のプロンプト行は
+    // `analyze_input_line_at` が受けない（行頭が `│` なので `starts_with('❯')` が偽）。
+    // 罫線を剥がしてから記号の右を見る。**ここを見ないと本文があるのに「空」**と読む
+    // （1 行の箱には継続行も無いので、下の走査でも拾えない。#1390）
+    if screen
+        .lines
+        .get(region.prompt_row)
+        .and_then(|l| content_after_prompt(&l.text))
+        .is_some_and(|rest| !rest.trim().is_empty())
+    {
+        return true;
+    }
+    // 箱が複数行なら 2 行目以降の本文も見る（プロンプト行は上で判定済み）。
+    // **行頭・行末の縦罫線は剥がす**（`starts_with_prompt` と同じ作法）: 剥がさないと
+    // 空の継続行 `│          │` が trim 後も空にならず、枠線つきの箱が常に
+    // 「中身あり」になって tako 自前のプレースホルダが出なくなる（#1390）
     let end = region.end.min(screen.lines.len());
-    (region.start..end).any(|i| i != region.prompt_row && !screen.lines[i].text.trim().is_empty())
+    (region.start..end).any(|i| {
+        i != region.prompt_row && !strip_box_border(&screen.lines[i].text).trim().is_empty()
+    })
 }
 
 /// 入力ボックスの中でのキャレット位置 `(列, 映した行の先頭から数えた行)`（Issue #737）。
@@ -733,19 +750,48 @@ fn is_frame_line(line: &str) -> bool {
     horizontal >= 3
 }
 
-/// エージェント TUI のプロンプト記号で始まる行か。
+/// 箱の行から**行頭・行末の縦罫線を 1 つずつ**剥がす（`│ ❯ hello │` → `❯ hello`）。
 ///
-/// 枠線つきで描かれるバージョン（`│ ❯ hello │`）でも拾えるよう、行頭の縦罫線は
-/// 1 つだけ剥がしてから見る。記号は claude `❯` / codex `›` / agy `>` の和集合（#120）
-fn starts_with_prompt(line: &str) -> bool {
-    let t = line.trim_start();
+/// 枠線つきで描くバージョンでは、プロンプト行だけでなく**中身の有無を見る行**にも
+/// 罫線が載る。剥がす作法をここ 1 箇所に置くのは、片方だけ剥がすと
+/// 「プロンプト行は見つかるのに中身の判定が罫線に引っかかる」形で答えが割れるため
+/// （#1390 の実害: 空の継続行 `│          │` が trim 後も空にならず、
+/// [`input_box_has_content`] が常に真 = tako 自前のプレースホルダが出なくなる）
+fn strip_box_border(line: &str) -> &str {
+    let t = line.trim();
     let t = t
         .strip_prefix('│')
         .or_else(|| t.strip_prefix('┃'))
+        .unwrap_or(t);
+    t.strip_suffix('│')
+        .or_else(|| t.strip_suffix('┃'))
         .unwrap_or(t)
-        .trim_start();
-    // ASCII の `>` はシェルの PS2 と衝突するので「`>` 単独 or `> `＋内容」だけ
-    t.starts_with('❯') || t.starts_with('›') || t.starts_with("> ") || t.trim_end() == ">"
+        .trim()
+}
+
+/// プロンプト記号の**右側**（罫線と記号を剥がした残り）。記号で始まらない行は None。
+///
+/// 記号は claude `❯` / codex `›` / agy `>` の和集合（#120）。ASCII の `>` は
+/// シェルの PS2 と衝突するので「`>` 単独 or `> `＋内容」だけを受ける
+fn content_after_prompt(line: &str) -> Option<&str> {
+    let t = strip_box_border(line);
+    for marker in ['❯', '›'] {
+        if let Some(rest) = t.strip_prefix(marker) {
+            return Some(rest);
+        }
+    }
+    if let Some(rest) = t.strip_prefix("> ") {
+        return Some(rest);
+    }
+    (t == ">").then_some("")
+}
+
+/// エージェント TUI のプロンプト記号で始まる行か。
+///
+/// 枠線つきで描かれるバージョン（`│ ❯ hello │`）でも拾えるよう、縦罫線は
+/// [`strip_box_border`] で剥がしてから見る
+fn starts_with_prompt(line: &str) -> bool {
+    content_after_prompt(line).is_some()
 }
 
 /// 画面から入力ボックスの行範囲を求める（#719 のミラー描画の基準）。
@@ -1508,6 +1554,133 @@ mod tests {
         let r = input_region(&s).expect("入力ボックスがある");
         assert!(r.rows() >= 2, "2 行の箱として取れている: {r:?}");
         assert!(input_box_has_content(&s, &r));
+    }
+
+    /// 枠線つきで描く TUI の下端を組む（`lines` をそのまま流す）。
+    /// 実 claude v2.1 系は水平罫線だけだが、枠線つきのバージョンでも
+    /// 判定が成り立つことを見るための fixture（#1390）
+    fn framed_screen(lines: &[&str]) -> Screen {
+        let bytes = lines.join("\r\n");
+        let term = wide_term(bytes.as_bytes());
+        snapshot_opts(&term, &theme(), true, 0.0)
+    }
+
+    /// 縦罫線つきの箱で**本文が無い**とき（`│ ❯      │` / `│        │`）は「中身なし」。
+    ///
+    /// 罫線を剥がさずに `trim` すると空の継続行が空にならないので、枠線つきの箱は
+    /// **常に「中身あり」**になり、tako 自前のプレースホルダが一切出なくなる
+    /// （#1390。#737 の逆側の壊れ方）
+    #[test]
+    fn 縦罫線つきの空の箱は中身なしと判定する() {
+        let s = framed_screen(&[
+            "text above",
+            "╭──────────────────────╮",
+            "│ ❯                    │",
+            "│                      │",
+            "╰──────────────────────╯",
+            "  footer",
+        ]);
+        let r = input_region(&s).expect("入力ボックスがある");
+        assert_eq!(r.rows(), 2, "2 行の箱として取れている: {r:?}");
+        assert!(
+            !input_box_has_content(&s, &r),
+            "空の継続行を罫線のせいで「中身あり」と読んだ: {:?}",
+            (region_lines(&s, &r), s.lines[r.prompt_row].text.clone())
+        );
+    }
+
+    /// 縦罫線つきでも**プロンプト行の本文**は拾う。
+    ///
+    /// 「2 行目以降だけ罫線を剥がす」直し方だと、`analyze_input_line_at` が
+    /// 行頭 `│` の行を受けないせいでここが false になる（本文があるのに
+    /// プレースホルダを重ねる = #737 そのもの）
+    #[test]
+    fn 縦罫線つきでもプロンプト行の本文を拾う() {
+        let s = framed_screen(&[
+            "text above",
+            "╭──────────────────────╮",
+            "│ ❯ hello              │",
+            "│                      │",
+            "╰──────────────────────╯",
+            "  footer",
+        ]);
+        let r = input_region(&s).expect("入力ボックスがある");
+        assert!(
+            input_box_has_content(&s, &r),
+            "プロンプト行の本文を取りこぼした: {:?}",
+            region_lines(&s, &r)
+        );
+    }
+
+    /// 縦罫線つきの 2 行目以降の本文も拾う（罫線の剥がしで本文まで消していないこと）
+    #[test]
+    fn 縦罫線つきでも2行目の本文を拾う() {
+        let s = framed_screen(&[
+            "text above",
+            "╭──────────────────────╮",
+            "│ ❯                    │",
+            "│ world                │",
+            "╰──────────────────────╯",
+            "  footer",
+        ]);
+        let r = input_region(&s).expect("入力ボックスがある");
+        assert!(
+            input_box_has_content(&s, &r),
+            "2 行目の本文を取りこぼした: {:?}",
+            region_lines(&s, &r)
+        );
+    }
+
+    /// 1 行の枠線つき箱（継続行が無い形）でも本文の有無が正しく出る。
+    /// 継続行の走査に頼った判定だと、本文があっても「中身なし」になる
+    #[test]
+    fn 縦罫線つきの1行の箱でも中身の有無が出る() {
+        let full = framed_screen(&[
+            "╭──────────────────────╮",
+            "│ ❯ hello              │",
+            "╰──────────────────────╯",
+            "  footer",
+        ]);
+        let r = input_region(&full).expect("入力ボックスがある");
+        assert_eq!(r.rows(), 1, "1 行の箱: {r:?}");
+        assert!(
+            input_box_has_content(&full, &r),
+            "1 行の箱の本文を取りこぼした: {:?}",
+            region_lines(&full, &r)
+        );
+        let empty = framed_screen(&[
+            "╭──────────────────────╮",
+            "│ ❯                    │",
+            "╰──────────────────────╯",
+            "  footer",
+        ]);
+        let r = input_region(&empty).expect("入力ボックスがある");
+        assert!(
+            !input_box_has_content(&empty, &r),
+            "1 行の空の箱を「中身あり」と読んだ: {:?}",
+            region_lines(&empty, &r)
+        );
+    }
+
+    /// 罫線を剥がす 1 実装（`strip_box_border`）の単体。
+    /// 剥がすのは**行頭・行末の 1 つずつ**で、中身の縦棒は残す
+    #[test]
+    fn 罫線の剥がしは行頭行末の1つずつ() {
+        assert_eq!(strip_box_border("│ ❯ hello              │"), "❯ hello");
+        assert_eq!(strip_box_border("┃ ❯ hello              ┃"), "❯ hello");
+        assert_eq!(strip_box_border("│                      │"), "");
+        assert_eq!(strip_box_border("  ❯ hello"), "❯ hello");
+        assert_eq!(strip_box_border("│"), "");
+        // 中身として並ぶ縦棒は残す（表の行が箱の中に来ても中身と読む）
+        assert_eq!(strip_box_border("│ a │ b │"), "a │ b");
+        assert_eq!(strip_box_border(""), "");
+    }
+
+    /// 入力ボックスの行を診断へ出す（どの行を見て判定したかが失敗出力に残る）
+    fn region_lines(screen: &Screen, region: &InputRegion) -> Vec<String> {
+        (region.start..region.end.min(screen.lines.len()))
+            .map(|i| screen.lines[i].text.clone())
+            .collect()
     }
 
     /// キャレットは「箱の中の (列, 行)」へ写る。

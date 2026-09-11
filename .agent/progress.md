@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-11（#1371: Windows の URL 起動から cmd.exe を外した）
-- 真因は `cmd /C start "" <url>`。`std::process::Command` の Windows 実装は空白を含まない引数を引用符で囲まない（`Quote::Auto`）ので、cmd.exe が引用符の外の `&` をコマンド区切りとして解釈する。tako が拾う URL は構造的に空白を含まず `&` は正規の文字なので、クエリ文字列つきリンクは常にそこで切れ、残りが別コマンドとして走っていた（画面 / PDF / Markdown が第三者由来ならクリック 1 回で任意コマンド実行）
-- `open_url` / `open_url_wait` を既存の `shell_execute`（`ShellExecuteW`）へ寄せ、引数の正本を境界の外の純粋関数 `windows_url_launch` に置いた（macOS からも Windows の形を検査できる）。待つ版は戻り値判定（> 32）で足りる = `SEE_MASK_NOCLOSEPROCESS` はハンドラ本体のハンドルを返すのでブラウザを閉じるまで返らない
-- 番犬 5 本（シェル起動のソース走査 / ShellExecuteW への配線 / メタ文字 URL が 1 つの値のまま / `&` 以降が落ちない / 名指しの行番号がずれない）。注入 3 種（旧 cmd 経路・`&` で切る・lpParameters へ載せる）が file:line 名指しで FAILED。**Windows 実機は未検証**。到達経路側（PDF / 提案チップのスキーム検査なし）は #1376 へ分離
-
 ## 2026-09-11（#1373: 蓋閉じ継続の記録に所有者を持たせ、原子書き込み + fail-loud にした）
 - `lid-guard.json` は data_dir に 1 つで複数の tako-app が共有するのに「書き換えるのはこのプロセスだけ」が前提だった。記録へ所有者（pid + 起動時刻）を足し、戻すのは「自分の / 所有者が死んだ / 所有者を持たない旧形式」だけへ（**生きた他プロセスの記録は倒す側も解除側も触らない**）。判定は `claim_for` → `decide` の純粋関数 2 本で、probe を引数に取るので macOS の CI で 4 通り全部を固定できる
 - 書き込みを `config_io::atomic_write` + `<path>.lock` の flock（**書くと決まってから**取り、その下で読み直す）へ。読めない記録は「記録なし」へ丸めず `<name>.unreadable.bak` へ写して Err（元ファイルは触らない）。旧形式は `serde(default)` でそのまま読めるので移行は不要（指紋へ `SavedLidState` / `RecordOwner` を登録）
@@ -64,3 +59,8 @@
 - 真因は「cols / rows の書き手が描画の中だけ」+「macOS の gpui では notify でフレームが作られない」（display link は窓が可視でないと起動しない）。IPC ループ（全 dispatch が通る 1 箇所）で**レイアウトを変える Request のときだけ**応答を返す前に全ビューポートを 1 フレーム描く形へ。判定は `protocol::changes_layout` の純粋関数 1 実装（ワイルドカード無し = 155 バリアント全網羅・読み取り系は偽）
 - 隔離 GUI（tako-vd・入力イベント無し）の A/B（`TAKO_1370_LEGACY=1`）: resize は legacy **0/5**（20 秒待っても cols/rows 不変・rect だけ動く）→ 新 **5/5**（応答直後に反映）。equalize / split（新ペインが 80x24 のまま 2 枚 → 0 枚）/ theme toggle（`ipc_frame` +0 → +1）も同様。**`list` × 30 で `ipc_frame` +0**（読み取りは描かない = #786 の固定費が乗らない）
 - 隔離セルフテスト項目 22b（意図的に `notify_and_draw` を呼ばない）は新で ok（rows 13 → 5）・legacy で FAILED（25.1s 待って届かず）。番犬 `issue1370_ipc_redraw_watchdog` 8 本が注入 5 通りを file:line で名指し。全体は `TAKO_APP_SELF_TEST_OK` で完走
+
+## 2026-09-12（#1390: terminal-core のテストの穴 4 件を埋めた）
+- 項目 1/3 はテスト追加（スクロール中の `visible_lines_filled` / `set_scrollback_limit` の副作用）、項目 2 は `history_plain_lines` の末尾トリムを `compose_grid_row` の 1 実装へ寄せて履歴行をスクロールで可視化して突き合わせ、項目 4 は罫線剥がしを `strip_box_border` 1 実装へ（`screen.rs` / `terminal.rs` / #1387 の番犬）
+- 項目 4 は「2 行目以降だけ剥がす」最小修正だと**枠線つきでプロンプト行にだけ本文がある箱が false** になるので、プロンプト行も同じ作法で見る形にした（1 行の箱の誤答は修正前から在った）
+- 注入 6 通り（起点 1 ずらし / トリム規則 / ループ 2 実装化 / `kitty_keyboard` 落とし / `set_options` 直渡し / 罫線剥がし戻し）で file:line 名指しの FAILED。workspace 4381 passed 0 failed・check-windows error 0
