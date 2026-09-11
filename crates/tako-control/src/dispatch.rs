@@ -9660,10 +9660,23 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         .as_ref()
         .is_some_and(|s| crate::orchestrator::wait::screen_is_collapsed(s));
 
-    // 画面の状態行が申告している「まだ生きている背景作業」（#1273。申告なしは null）
+    // どの系統の画面を見ているか。**申告の形が系統ごとに違う**ので先に決める（#1277）。
+    // レジストリの宣言を優先し、無ければ画面から見分ける（#984 の `detect_screen_agent`）
+    let agent = registry_agent
+        .as_deref()
+        .and_then(tako_core::agent_support::Agent::parse)
+        .or_else(|| {
+            recent_output
+                .as_deref()
+                .and_then(crate::orchestrator::wait::detect_screen_agent)
+        });
+
+    // 画面が申告している「まだ生きている背景作業」（#1273。申告なしは null）。
+    // 読み方は系統別（claude = 状態行の `· <内訳> still running` /
+    // codex = `1 background terminal running` / agy = フッターの `1 task(s)`。#1277）
     let background_work = recent_output
         .as_deref()
-        .and_then(crate::orchestrator::wait::background_work_summary);
+        .and_then(|out| crate::orchestrator::wait::background_work_summary_for(out, agent));
 
     // #1273（#289 の再発）: **一次シグナルの busy を画面で覆す唯一の経路**。
     //
@@ -9684,14 +9697,6 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     // （もっと具体的な停止種別）が拾うべきもので、そこを先取りしない
     let mut idle_despite_primary_busy = false;
     if status == "busy" && agents_authoritative && has_children {
-        let agent = registry_agent
-            .as_deref()
-            .and_then(tako_core::agent_support::Agent::parse)
-            .or_else(|| {
-                recent_output
-                    .as_deref()
-                    .and_then(crate::orchestrator::wait::detect_screen_agent)
-            });
         let waiting = recent_output.as_deref().and_then(|out| {
             crate::orchestrator::wait::input_waiting_with_background_work(out, collapsed, agent)
         });
@@ -17764,15 +17769,178 @@ mod tests {
         assert_eq!(v["idle_despite_primary_busy"], false);
     }
 
-    /// 宣言の無い系統（codex / agy）では覆さない（#982 のマトリクスが唯一の判断）
+    /// codex / agy では画面で覆さない（#1277）。
+    ///
+    /// 能力そのものは 3 系統とも `Supported` になったが、**経路が違う**:
+    /// 両系統は一次シグナルがターン終了で idle へ落ちるので覆す必要が無く、
+    /// 逆に覆すと状態しか言わない申告で偽 idle を出す（`declaration_implies_turn_end`）
     #[test]
-    fn issue1273_宣言の無い系統では覆さない() {
-        for agent in ["codex", "agy"] {
+    fn issue1277_codexとagyでは画面で覆さない() {
+        for (agent, source) in [("codex", "codex-session"), ("agy", "agy-session")] {
             let mut r = i1273_resolved(I1273_IDLE_WITH_BACKGROUND);
             r.registry_agent = Some(agent.into());
-            r.status_source = "codex-session".into();
+            r.status_source = source.into();
             let v = apply_worker_status_corrections(r).unwrap();
-            assert_eq!(v["status"], "busy", "{agent} は宣言していない");
+            assert_eq!(v["status"], "busy", "{agent}: 画面で覆っている");
+            assert_eq!(v["idle_despite_primary_busy"], false);
+        }
+    }
+
+    // --- #1277: codex / agy は一次シグナルが idle へ落ちる（覆す必要が無い） ---
+
+    /// codex の実採取画面（2026-09-11 / codex-cli 0.154.0。隔離 tmux 上で
+    /// 背景ターミナル `sleep 600` を残したままターンを終わらせたもの）
+    const I1277_CODEX_IDLE_WITH_BACKGROUND: &str = "\
+• done
+
+  1 background terminal running · /ps to view · /stop to close
+
+› Ask Codex to do anything
+
+  gpt-5.6-sol high · Context 96% left · weekly 5% left";
+
+    /// agy の実採取画面（2026-09-11 / Antigravity CLI 1.2.0。同じ手順）
+    const I1277_AGY_IDLE_WITH_BACKGROUND: &str = "\
+○ Bash(sleep 600) (ctrl+o to expand)
+
+  done
+
+────────────────────────────────
+>
+────────────────────────────────
+  ● [07:15:49] sleep 600 running
+────────────────────────────────
+? for shortcuts                    Claude Opus 4.6 (Thinking) · 1 task(s) · /tasks";
+
+    fn i1277_resolved(agent: &str, source: &str, recent: &str) -> ResolvedWorkerStatus {
+        ResolvedWorkerStatus {
+            // 一次シグナルはターン終了で idle を返す（**実測**。rollout の
+            // `task_complete` / 実況 JSONL の終端 `PLANNER_RESPONSE`）
+            status: "idle".into(),
+            status_source: source.into(),
+            resolved_sid: Some("test-session".into()),
+            pane_exists: true,
+            // 背景作業 + TUI 自身が居るので必ず true
+            has_children: true,
+            recent_output: Some(recent.into()),
+            registry_agent: Some(agent.into()),
+            ..Default::default()
+        }
+    }
+
+    /// 受け入れ条件: 背景作業が残っていても idle のまま返り、内訳が読める
+    #[test]
+    fn issue1277_codexは背景ターミナルが残ってもidleで内訳を返す() {
+        let v = apply_worker_status_corrections(i1277_resolved(
+            "codex",
+            "codex-session",
+            I1277_CODEX_IDLE_WITH_BACKGROUND,
+        ))
+        .unwrap();
+        assert_eq!(v["status"], "idle", "画面の申告で busy へ覆されていない");
+        assert_eq!(v["background_work"], "1 background terminal");
+        // 覆していない = claude の腕を通っていない
+        assert_eq!(v["idle_despite_primary_busy"], false);
+        assert_eq!(v["status_source"], "codex-session");
+    }
+
+    #[test]
+    fn issue1277_agyは背景タスクが残ってもidleで内訳を返す() {
+        let v = apply_worker_status_corrections(i1277_resolved(
+            "agy",
+            "agy-session",
+            I1277_AGY_IDLE_WITH_BACKGROUND,
+        ))
+        .unwrap();
+        assert_eq!(v["status"], "idle");
+        assert_eq!(v["background_work"], "1 task(s)");
+        assert_eq!(v["idle_despite_primary_busy"], false);
+        assert_eq!(v["status_source"], "agy-session");
+    }
+
+    /// エッジ: 背景作業が 0 に戻った直後（申告行が消える）。
+    /// **判定は変わらない**（idle のまま・内訳が null になるだけ）
+    #[test]
+    fn issue1277_背景作業が0に戻っても判定は変わらない() {
+        let codex = I1277_CODEX_IDLE_WITH_BACKGROUND.replace(
+            "  1 background terminal running · /ps to view · /stop to close\n",
+            "",
+        );
+        let v = apply_worker_status_corrections(i1277_resolved("codex", "codex-session", &codex))
+            .unwrap();
+        assert_eq!(v["status"], "idle");
+        assert_eq!(v["background_work"], Value::Null);
+
+        let agy = I1277_AGY_IDLE_WITH_BACKGROUND
+            .replace(" · 1 task(s) · /tasks", "")
+            .replace("  ● [07:15:49] sleep 600 running\n", "");
+        let v =
+            apply_worker_status_corrections(i1277_resolved("agy", "agy-session", &agy)).unwrap();
+        assert_eq!(v["status"], "idle");
+        assert_eq!(v["background_work"], Value::Null);
+    }
+
+    /// エッジ: **生成中**。一次シグナルが busy を返すので busy のまま。
+    /// 内訳は読める（申告は生成中も同じ形で出るため = これが claude との違いの実体）
+    #[test]
+    fn issue1277_生成中は内訳を読めてもbusyのまま() {
+        // codex の生成中フッター（#120 の実採取。申告つき）
+        let codex = "\
+• Working (3s • esc to interrupt) · 1 background terminal running
+› Ask Codex to do anything
+  gpt-5.6-sol high · Context 96% left";
+        let mut r = i1277_resolved("codex", "codex-session", codex);
+        r.status = "busy".into();
+        let v = apply_worker_status_corrections(r).unwrap();
+        assert_eq!(v["status"], "busy", "生成中に idle へ倒れている");
+        assert_eq!(v["background_work"], "1 background terminal");
+        assert_eq!(v["idle_despite_primary_busy"], false);
+
+        // 一次シグナルが idle でも画面が生成中なら busy（#289 の腕。取り違え防止）
+        let v = apply_worker_status_corrections(i1277_resolved("codex", "codex-session", codex))
+            .unwrap();
+        assert_eq!(v["status"], "busy", "画面の生成中を無視している");
+    }
+
+    /// エッジ: **折りたたみ表示**。両系統は画面で覆わないので判定は変わらない
+    /// （一次シグナルの idle がそのまま返る = 折りたたみで劣化しない）
+    #[test]
+    fn issue1277_折りたたみでも判定は変わらない() {
+        for (agent, source, screen) in [
+            ("codex", "codex-session", I1277_CODEX_IDLE_WITH_BACKGROUND),
+            ("agy", "agy-session", I1277_AGY_IDLE_WITH_BACKGROUND),
+        ] {
+            let mut r = i1277_resolved(agent, source, screen);
+            r.full_screen = Some(format!("95 new messages (click) ↓\n{screen}"));
+            let v = apply_worker_status_corrections(r).unwrap();
+            assert_eq!(
+                v["collapsed"], true,
+                "{agent}: 折りたたみを検知できていない"
+            );
+            assert_eq!(v["status"], "idle", "{agent}: 折りたたみで判定が変わった");
+        }
+    }
+
+    /// A/B: 同一バイナリのまま旧挙動（`TAKO_1277_LEGACY=1`）へ戻すと内訳を読まない。
+    /// **status は旧挙動でも idle**（一次シグナルが張り付かないので実害が無い）のが
+    /// claude（#1273）との違い
+    #[test]
+    fn issue1277_legacyでは両系統の内訳を読まない() {
+        for (agent, screen) in [
+            (
+                tako_core::agent_support::Agent::Codex,
+                I1277_CODEX_IDLE_WITH_BACKGROUND,
+            ),
+            (
+                tako_core::agent_support::Agent::Agy,
+                I1277_AGY_IDLE_WITH_BACKGROUND,
+            ),
+        ] {
+            assert!(
+                crate::orchestrator::wait::background_work_summary_in(screen, Some(agent), true)
+                    .is_none(),
+                "{agent:?}: legacy で内訳を読んでいる"
+            );
         }
     }
 

@@ -503,12 +503,6 @@ pub mod notes {
         "The model runs on your own machine, so it cannot be refused execution over an account or seat check: there is no party to refuse it",
     );
 
-    /// #1273: 背景作業が残る入力待ちの画面を、この系統では実物で採っていない
-    pub const BACKGROUND_IDLE_NOT_MEASURED: Note = Note::new(
-        "背景作業が残ったまま入力待ちになった画面をこの系統では採取していない（claude の状態行と同じ形を出すか未確認）",
-        "A screen where this agent waits for input while background work is still alive has not been captured yet (whether it renders the same status line as claude is unknown)",
-    );
-
     /// #1013: モデル名はベンダー固有の語彙なので、claude の既定を他系統へ渡せない
     pub const MODEL_NAME_NOT_PORTABLE: Note = Note::new(
         "モデル名はベンダー固有の語彙なので claude 用の既定を渡せない（渡すと存在しないモデル名で起動する）。この系統のモデルは `worker_agents.<agent>.model` か spawn の明示指定で決め、無ければ CLI の既定に委ねる",
@@ -1285,22 +1279,31 @@ pub const MATRIX: &[AgentFeature] = &[
             "Detects that a turn has ended and the agent is waiting for input even while background work (background shells, monitors) is still alive (#1273)",
         ),
         claude: S::Supported,
-        codex: pending(notes::BACKGROUND_IDLE_NOT_MEASURED, 1277),
-        agy: pending(notes::BACKGROUND_IDLE_NOT_MEASURED, 1277),
+        codex: S::Supported,
+        agy: S::Supported,
         local: local_pending_first_class(),
         evidence: AgentEvidence::Measured(
-            "#1273（2026-09-09 実測）: claude 2.1.258 の `agents --json` は \
-             `isLoading || delegatedActive ? \"busy\" : \"idle\"` で状態を決め、\
-             **背景シェル / Monitor が生きているあいだ busy を返し続ける**。\
-             同時刻の本番 4 ペインで相関を確認: フッターに背景作業の申告がある 3 本 \
-             （`1 shell` / `2 shells` / `1 shell, 1 monitor`）はすべて busy、\
-             申告の無い 1 本だけが idle で、どれも入力欄は空・スピナー無し。\
-             よって tako 側は画面の状態行 `· <内訳> still running` を根拠に idle へ倒す。\
-             この行は claude 自身が **ターンが終わっているときだけ**継ぎ足す \
-             （背景作業の完了を待って止まっているあいだは `Waiting for … to finish` になり \
-             suffix が付かない = 実物の描画コードで確認）ので、\
-             「終わった」と「待っている」を取り違えない。codex / agy は同じ申告を出すか \
-             実物で採っていないので宣言しない（#1277）",
+            "**3 系統とも検知できるが経路が違う**。claude（#1273・2026-09-09 実測）: \
+             2.1.258 の `agents --json` は `isLoading || delegatedActive ? \"busy\" : \"idle\"` で \
+             状態を決め、**背景シェル / Monitor が生きているあいだ busy を返し続ける**ので、\
+             tako は画面の状態行 `· <内訳> still running` を根拠に idle へ倒す \
+             （この行は claude 自身が**ターンが終わっているときだけ**継ぎ足し、\
+             完了を待って止まっているあいだは `Waiting for … to finish` になる = \
+             「終わった」と「待っている」を取り違えない）。\
+             codex / agy（#1277・2026-09-11 実測）: **一次シグナルが張り付かないので覆す必要が無い**。\
+             隔離 tmux 上の実 CLI に背景作業を残したままターンを終わらせたところ、\
+             codex-cli 0.154.0 は背景ターミナル（`sleep 600`）が生きたまま rollout へ \
+             `task_complete` を書き（`read_turn_state` → `idle`）、\
+             Antigravity CLI 1.2.0 も背景タスクが生きたまま実況 JSONL の終端へ \
+             `MODEL/PLANNER_RESPONSE`（`status=DONE`・`tool_calls` なし）を書いた \
+             （`read_turn_state` → `idle`）。どちらの画面も `screen_looks_busy=false` / \
+             `screen_looks_idle=true` なので idle が覆されない。\
+             両系統は背景作業を画面へ申告もする（codex = \
+             `1 background terminal running · /ps to view · /stop to close` / \
+             agy = フッターの `· 1 task(s) · /tasks`）ので `worker_status` の \
+             `background_work` はその内訳を返すが、**この申告は生成中も同じ形で出る** \
+             （#120 / #1015 の採取）ため claude と違ってターン終了の根拠には使わない \
+             （`wait::declaration_implies_turn_end`）",
         ),
     },
     AgentFeature {
