@@ -1134,7 +1134,8 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<usize>,
     },
-    /// リモートアクセス API サーバーの起動（UDS + Tailscale Serve。#287 P1-2）。
+    /// リモートアクセス API サーバーの起動（ループバック TCP + Tailscale Serve。
+    /// #287 P1-2 → #1038）。
     /// Tailscale が未セットアップ（未導入・未ログイン・HTTPS 未有効等）なら
     /// 不足項目を列挙して起動を拒否し、`tako remote setup` へ誘導する
     RemoteStart {},
