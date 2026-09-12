@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-12（#1375: セルフテストの「固定予算 + CLI の状態読み」16 件を状態待ちへ移し既知リストを空にした）
-- 項目 18 / 19 / 21 / 23〜28 / 47 / 47b / 50 / 51b / 66b / 73c / 73f を `wait_for_cli_state`（`wait_for_app_state` + `cli_state_budget` の 1 実装。A/B の口・注入・診断行 `TAKO_SELF_TEST_1375` をここへ集約）へ寄せ、`KNOWN_FIXED_CLI_WAITS` を空にした。分割して新ペインを操作する 4 件は `split_focus_new_pane` で「着地 → アイドル」の 2 段に割り、以降は**返ったペイン ID** を見る（旧 73f は**打ったあとに**分割前のフォーカスを読んでいたので、着地が先だと窓を使い切るまで真にならない = 待ちを伸ばしても直らない形）
-- 実測（隔離 GUI・tako-vd）: `INJECT=late` 全項目で 17 か所とも `ok=true`（`waited` = 旧予算 + 5 秒）で完走 / `LEGACY=all` は旧の固定予算（0.8〜15.0s）を再現して完走 / 項目ごとの `LEGACY+late` は **17/17 FAILED**（73f は Issue が観測した `73f: split で新ペインへフォーカスが移らない` そのまま）/ `never` は新経路でも **16/16 FAILED**。高負荷 3 回（load 6.5〜8.4）と load 10〜37 は完走、load 65〜80 の人工負荷では 73c が 4 倍上限（80 秒）を使い切って FAILED = 上限の政策どおり
-- 予算の不等式は手書きの表をやめ**ソースから採った 21 か所**を検査（`cli_wait_budgets`）。番犬は空リストで緑
-
 ## 2026-09-12（#1397: 器なし（tmux 無し / persist OFF）でもチャットビューが立つようにした）
 - 原因は 3 つ重なっていた: ①列挙が `backend_sessions` 起点 ②live 解決のキーが器のセッション名だけ ③**判定表が alt screen をチャットより先に見る**（器なしでは claude の TUI 自身が alt screen = Issue に無かった 3 つ目）。キーを `agents::LiveSessionKey`（器あり = セッション名 / 器なし = (ペイン ID, PTY 直下の子 pid)）へ広げ、列挙を `terminals` 起点に、表を「チャット確定 → alt screen」へ
 - 隔離 GUI（tako-vd・tmux サーバー無し・persist OFF）の A/B: 新 = `pane_display=chat`（`alt_screen:true` / `claude_chat:true`）で実会話も読める。legacy（`TAKO_1397_LEGACY=1`）は実 claude TUI が生きたまま 21 サンプル（約 105 秒）すべて `terminal`。器あり（persist ON）と混在は前後どちらも `chat` で不変
@@ -59,3 +54,8 @@
 - #1417 の番犬は窓の中に `Err(` が**在るだけ**で「扱った」と数えるので、`right_panel.rs:2022` は結果を `if opened.is_ok()` でしか見ていないのに**無関係な** `if let Err(e) = attach_pending_sessions(..)` で緑だった（実測で確認）。判定を**結果の束縛名の追跡**へ寄せ、`eprintln!` の検査を `sidebar.rs` 限定から全 UI モジュール（テストモジュールは除外・スコープ外は `KNOWN_EPRINTLN` の件数で段階導入）へ広げた
 - 6 か所を振り分け: ユーザー操作 5 件（tmux 復元 / 復元ペインの PTY 起動 / バックグラウンド復帰 / コードのコピー / Code Runner）は共有の通知欄 + persist.log、背景処理 1 件（PDF 再ラスタライズ）は `log_ui_failure` で診断だけ。A/B の軸を画面（`NoticeArea`）から Issue（`NoticeArm`）へ分離（同じ画面に #1417 と #1422 の通知が同居し、画面で env を選ぶと互いの回帰を隠すため）
 - 隔離 GUI（tako-vd）項目 84d の A/B: 新 = `restore=Some("セッションの復元 に失敗しました…")` / `unshelve=Some(…)` / `copy=Some(…)` / `bg_silent=true bg_lines=3` / `ok_silent=true` で完走（FAILED 0）、legacy（`TAKO_1422_LEGACY=1`）は全部 `None` で FAILED かつ #1417 の診断行は `legacy=false` のまま（A/B が互いを隠さない）。注入 10 通りが file:line 名指し FAILED・workspace 4538 passed 0 failed
+
+## 2026-09-12（#1430: merge-pr.sh の終了コードを実測で言い切り、ローカル head も自分で消した）
+- 実測で Issue の推測を否定: 現行スクリプトは worktree 事故でも**既に exit 0**（#1347 で解消済み）。実在した誤読の元は「`failed to run git: fatal:` + `警告: merge は済んだが gh が 1 で終わった`」の 2 行と、**すでに MERGED の PR への再実行が 1** を返すこと（使い捨て private リポ + 実 gh 2.88.1 で PR 7 本を実 merge して確定）
+- gh の非ゼロを「merge の失敗ではない」注記へ、最終行を `merge 成立: PR #N は MERGED（url）/ 終了コード 0` へ、MERGED の再実行を冪等 0 へ（CLOSED は 1）。ローカル head は `git branch -D`、作業ツリーが握るときだけ外し方を名指しして残す（`worktree_holding_branch` / `delete_local_head_branch` の 1 実装）
+- モック Test 24〜29（ローカルブランチと作業ツリーだけ実 git。25b = 本体の作業ツリーには「畳め」と言わない）で 137 PASS 0 FAIL。注入 4 通り（後始末を外す / 再実行を refuse へ戻す / 旧警告文へ戻す / 作業ツリー検出を殺す）すべて FAILED。A/B = `TAKO_1430_LEGACY=1`。**install 不要**（scripts + docs のみ）

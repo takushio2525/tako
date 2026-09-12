@@ -11,13 +11,20 @@
 # #1295 のテストに #1297 が足したフィールドが無い）はここを通り抜けるので、
 # merge の直前に「緑を出した run の後に main が進んでいないか」を見て警告する。
 #
-# merge の後始末（リモート head ブランチの削除）も自分で閉じる。`gh pr merge --delete-branch` は
-# 「ローカルへ切り替えてから消す」順で処理するので、**専用 worktree から実行すると**
-# `fatal: '<既定ブランチ>' is already used by worktree` で打ち切られ、**リモートも消え残る**
-# （#1347 = PR #1337 の実測。この機序はこのリポの標準手順が毎回踏む）。
+# merge の後始末（リモート / ローカルの head ブランチの削除）も自分で閉じる。
+# `gh pr merge --delete-branch` は「ローカルへ切り替え → ローカル削除 → リモート削除」の順で
+# 処理するので、**専用 worktree から実行すると**最初の切り替えが
+# `fatal: '<既定ブランチ>' is already used by worktree` で落ち、**ローカルもリモートも消え残る**
+# （#1347 = PR #1337 / #1430 の実測。この機序はこのリポの標準手順が毎回踏む）。
+#
+# **gh の終了コードは merge の成否ではない**（#1430）。上の後始末はすべて merge の**後**に
+# 行われるので、gh が 1 で終わっても PR は MERGED になっている。成否は `gh pr view` の
+# 実測で決め、最後の 1 行で終了コードの意味を言い切る（「gh が 1 で終わった」という
+# 警告だけを見た worker 3 本が merge 失敗と誤読したのが #1430 の発端）。
 #
 # 使い方: bash scripts/merge-pr.sh <PR番号> [--timeout <秒>] [--interval <秒>]
-# 終了コード: 0 = merge した / 1 = merge しなかった（CI 失敗・BEHIND・BLOCKED・draft 等）/
+# 終了コード: 0 = merge が成立している（**すでに MERGED だった再実行も 0** = #1430）/
+#             1 = merge しなかった（CI 失敗・BEHIND・BLOCKED・draft・merge されずに CLOSED 等）/
 #             2 = CI が揃わずタイムアウト / 3 = 引数・gh のエラー /
 #             4 = base と衝突している（#1365。待ち側と同じ値 = 判定も案内も 1 実装）
 set -euo pipefail
@@ -31,6 +38,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 腕。worktree から実行するとリモート head ブランチが消え残る（#1347）。
 # scripts/test-wait-pr-checks.sh の Test 16 がこの腕で残ることを固定している
 LEGACY_1347="${TAKO_1347_LEGACY:-0}"
+
+# A/B（検出力の確認・計測専用）。1 = **修正前**（#1430）の腕。2 つを同時に戻す:
+#   - merge 後のローカル head ブランチを後始末しない（gh の --delete-branch 任せ = 必ず残る）
+#   - すでに MERGED の PR への再実行を「OPEN ではない」として 1 で拒む
+# scripts/test-wait-pr-checks.sh の Test 24 / 26 / 29 がこの腕との差を固定している
+LEGACY_1430="${TAKO_1430_LEGACY:-0}"
 
 die() {
   echo "エラー: $*" >&2
@@ -58,7 +71,8 @@ while [[ $# -gt 0 ]]; do
   CI が「期待するチェックが全部そろって全部緑」になるまで待ってから squash merge する
   （待ちの判定は scripts/wait-pr-checks.sh）。揃わなければ merge しない。
 
-終了コード: 0 = merge した / 1 = merge しなかった / 2 = タイムアウト / 3 = 引数・gh のエラー /
+終了コード: 0 = merge が成立している（すでに MERGED だった再実行も 0）/
+            1 = merge しなかった / 2 = タイムアウト / 3 = 引数・gh のエラー /
             4 = base と衝突している（取り込んで push し直す）
 USAGE
       exit 0
@@ -100,6 +114,14 @@ gate_state() {
   local phase="$1" state draft mergeable status verdict tries
   state="$(pr_field state)"
   draft="$(pr_field isDraft)"
+  # すでに merge 済み = **望んだ終わり方に到達している**ので、後始末だけ確かめて 0 で終わる（#1430）。
+  # 自動化は終了コードで成否を見るので、再実行・重複実行を「失敗」に化けさせない
+  # （待っている間に別経路で merge されたときも同じ扱いになる）。
+  # merge されずに閉じられた CLOSED は望んだ状態ではないので、下の門で従来どおり 1
+  if [[ "${state}" == "MERGED" && "${LEGACY_1430}" != "1" ]]; then
+    echo "PR #${PR} はすでに merge 済み（${phase}）。後始末だけ確かめる"
+    finish_merged
+  fi
   [[ "${state}" == "OPEN" ]] || refuse "PR #${PR} は OPEN ではない（${state}）"
   [[ "${draft}" != "true" ]] || refuse "PR #${PR} は draft のまま"
 
@@ -169,6 +191,84 @@ delete_remote_head_branch() {
   fi
 }
 
+# この作業ツリー構成で <ブランチ> を握っている作業ツリーのパスを返す（誰も握っていなければ空）。
+# `git worktree list --porcelain` は「worktree <パス>」と「branch refs/heads/<名前>」が対で並ぶ
+worktree_holding_branch() {
+  local want="refs/heads/$1" line path=""
+  while IFS= read -r line; do
+    case "${line}" in
+      "worktree "*) path="${line#worktree }" ;;
+      "branch "*)
+        if [[ "${line#branch }" == "${want}" ]]; then
+          printf '%s' "${path}"
+          return 0
+        fi
+        ;;
+    esac
+  done < <(git worktree list --porcelain 2>/dev/null || true)
+  return 0
+}
+
+# merge 成立後にローカルの head ブランチも自分で消す（#1430）。
+# gh の --delete-branch は「base へ切り替え → ローカル削除 → リモート削除」の順なので、
+# 専用 worktree（共有ツリーが base を握っている）では**最初の切り替えで落ちて**
+# ローカルもリモートも残る。#1347 がリモートを閉じ、ここがローカルを閉じる。
+# squash merge では head は base の祖先にならないので、gh と同じく -D（強制）で消す。
+# 消せない**唯一の正当な理由**は「その作業ツリーがそのブランチを握っている」ことなので、
+# そのときは**どこが握っているか**と外し方を名指しして残す（受け入れ条件の例外）。
+delete_local_head_branch() {
+  local head base cross holder
+  # A/B: 修正前はローカルの後始末をしない（gh 任せ = worktree では必ず残る）
+  [[ "${LEGACY_1430}" != "1" ]] || return 0
+  head="$(pr_field headRefName)"
+  base="$(pr_field baseRefName)"
+  cross="$(pr_field isCrossRepository)"
+  [[ -n "${head}" ]] || return 0
+  git rev-parse --git-dir >/dev/null 2>&1 || return 0
+  # 取り込み先（= この PR の base）には絶対に触らない。リモート側と同じ門
+  if [[ "${head}" == "${base}" ]]; then
+    echo "警告: head と base が同じ（${head}）のでローカルブランチにも触らない" >&2
+    return 0
+  fi
+  # fork の PR の head 名は**手元の無関係な同名ブランチ**と衝突しうるので触らない
+  if [[ "${cross}" == "true" ]]; then
+    echo "fork からの PR なのでローカルブランチにも触らない（${head}）"
+    return 0
+  fi
+  if ! git show-ref --verify --quiet "refs/heads/${head}"; then
+    echo "ローカルブランチ ${head} は無い"
+    return 0
+  fi
+  holder="$(worktree_holding_branch "${head}")"
+  if [[ -n "${holder}" ]]; then
+    echo "ローカルブランチ ${head} は残す（作業ツリー ${holder} が握っているので消せない）"
+    # 連結された作業ツリーは `.git` が**ファイル**（本体は**ディレクトリ**）。
+    # 本体は畳めないので、同じ案内を出すと実行できないコマンドを渡すことになる
+    if [[ -f "${holder}/.git" ]]; then
+      echo "  この作業ツリーを畳むときに一緒に消える: git worktree remove ${holder} && git branch -D ${head}"
+    else
+      echo "  別のブランチへ移れば消せる: git -C ${holder} switch ${base} && git branch -D ${head}"
+    fi
+    return 0
+  fi
+  if git branch -D "${head}" >/dev/null 2>&1; then
+    echo "ローカルブランチ ${head} を削除した"
+  else
+    echo "警告: ローカルブランチ ${head} を削除できなかった（手で: git branch -D ${head}）" >&2
+  fi
+}
+
+# merge が成立したときの**唯一の終わり方**（#1430）。後始末（リモート / ローカルの head
+# ブランチ）を閉じてから、終了コードの意味を 1 行で言い切って 0 で終わる。
+# 「gh が 1 で終わった」という警告だけを読んだ自動化が merge 失敗と誤読したのが #1430 の
+# 発端なので、最後の 1 行は必ず「merge 成立 / 終了コード 0」と読める形にする
+finish_merged() {
+  delete_remote_head_branch
+  delete_local_head_branch
+  echo "merge 成立: PR #${PR} は MERGED（$(pr_field url)）/ 終了コード 0"
+  exit 0
+}
+
 # 緑を出した CI run の**後に** main が進んでいたら警告する。
 # PR の CI は merge 結果を検査するが merge base は run 実行時点で凍るので、
 # その後に main へ入った変更との組み合わせは**誰も検査していない**（#1343）。
@@ -226,18 +326,18 @@ MERGE_RC=$?
 set -e
 if [[ -n "${MERGE_OUT}" ]]; then echo "${MERGE_OUT}"; fi
 
-# gh は「merge は済んだがローカルブランチを消せなかった」でも非ゼロで返る
-# （worktree でそのブランチを開いていると checkout に失敗する）。
-# 終了コードだけで失敗と決めず、PR の状態を見て決める
+# **gh の終了コードは merge の成否ではない**（#1430）。--delete-branch の後始末は
+# すべて merge の**後**に走るので、worktree から実行して checkout に失敗した場合でも
+# PR は MERGED になっている。成否は PR の状態の実測だけで決める
 fetch_pr
 STATE="$(pr_field state)"
 if [[ "${STATE}" != "MERGED" ]]; then
-  echo "merge に失敗した（gh の終了コード ${MERGE_RC} / PR の状態 ${STATE}）" >&2
+  echo "merge に失敗した（PR の状態 ${STATE} / gh の終了コード ${MERGE_RC}）" >&2
   exit 1
 fi
 if [[ ${MERGE_RC} -ne 0 ]]; then
-  echo "警告: merge は済んだが gh が ${MERGE_RC} で終わった（ローカルブランチの後始末は環境依存なので手で確認する）" >&2
+  echo "注記: gh は ${MERGE_RC} で終わったが merge は成立している（PR の状態は MERGED）。"
+  echo "  落ちたのは --delete-branch のローカル後始末（base への切り替え）で、専用 worktree から"
+  echo "  実行すると必ずここで落ちる。ブランチの後始末はこの後で自分で閉じる"
 fi
-delete_remote_head_branch
-echo "PR #${PR} は ${STATE}（$(pr_field url)）"
-exit 0
+finish_merged
