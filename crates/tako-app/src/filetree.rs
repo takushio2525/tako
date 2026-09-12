@@ -174,12 +174,27 @@ impl FileTree {
         if self.roots == ordered {
             return false;
         }
-        // 消えたルートの状態は畳む（配下の展開・キャッシュは refresh が掃除する）
-        for old in &self.roots {
-            if !ordered.contains(old) {
+        // 消えたルートの状態は**配下ごと**畳む（#1404）。
+        //
+        // 以前はルート自身しか落とさず「配下は refresh が掃除する」と注釈していたが、
+        // それは事実と違った: 掃除役の `apply_refresh` が落とすのは
+        // `scan_dirs` が `None` を返したとき = **ディレクトリが実在しなくなったとき**だけ。
+        // 実在する子孫は永久に `expanded` へ残り、画面に出ていないディレクトリを
+        // 2 秒ごとに read_dir し続けていた（タブの cwd が動くたびに固定費が積み上がる）。
+        // リモート側（`remove_remote_root`）は元から配下ごと落としている
+        let dropped: Vec<PathBuf> = self
+            .roots
+            .iter()
+            .filter(|r| !ordered.contains(r))
+            .cloned()
+            .collect();
+        if legacy_1404() {
+            for old in &dropped {
                 self.expanded.remove(old);
                 self.cache.remove(old);
             }
+        } else {
+            self.forget_under(&dropped, &ordered);
         }
         for root in &ordered {
             if !self.roots.contains(root) {
@@ -192,6 +207,23 @@ impl FileTree {
         self.roots = ordered;
         self.rows_cache = None;
         true
+    }
+
+    /// 外れたルート配下の展開状態・キャッシュを忘れる（#1404。`set_roots` の 1 部品）。
+    ///
+    /// 落とすのは「外れたルートの下にあり、**かつ生きているルートの下に無い**」ものだけ。
+    /// ルートは入れ子にできる（`<base>` と `<base>/inner` が同時にルートになる）ので、
+    /// 素朴な `starts_with` 走査だと外側が外れたときに内側の展開まで巻き込む
+    fn forget_under(&mut self, dropped: &[PathBuf], alive: &[PathBuf]) {
+        if dropped.is_empty() {
+            return;
+        }
+        let orphaned = |p: &Path| {
+            dropped.iter().any(|old| p.starts_with(old))
+                && !alive.iter().any(|root| p.starts_with(root))
+        };
+        self.expanded.retain(|p| !orphaned(p));
+        self.cache.retain(|p, _| !orphaned(p));
     }
 
     /// ディレクトリを展開する（既に展開中なら何もしない）
@@ -377,8 +409,38 @@ impl FileTree {
         self.apply_refresh(results)
     }
 
-    /// background executor 向け: スキャン対象のディレクトリ一覧を返す
+    /// background executor 向け: スキャン対象のディレクトリ一覧を返す。
+    ///
+    /// **同じディレクトリを 2 回入れない**（#1404）。ルートは `roots` と `expanded` の
+    /// 両方に入る（`set_roots` / `toggle_dir` が自動展開で入れる）ので、素朴に連結すると
+    /// 全ルートが 2 回ずつ載る。`Vec::dedup` は**隣り合う重複しか落とさない**うえ
+    /// `expanded` は `HashSet` = 順序が任意なので、並べ替えなしの `dedup()` は
+    /// 落とせるかどうかが偶然で決まっていた（実測: 2 ルート + 展開 1 で len=4 uniq=3）。
+    /// 並びは「`roots` の順 → `expanded` のうち未出のものを名前順」= 表示に近い側から読む
     pub fn refresh_targets(&self) -> Vec<PathBuf> {
+        if legacy_1404() {
+            return self.legacy_refresh_targets();
+        }
+        let mut rest: Vec<&PathBuf> = self
+            .expanded
+            .iter()
+            .filter(|p| !self.roots.contains(p))
+            .collect();
+        // `HashSet` の走査順は実行ごとに変わる。並べておくと診断の出力・
+        // セルフテストの表示が回ごとに暴れない（対象は数十件なので費用は無視できる）
+        rest.sort();
+        let mut targets: Vec<PathBuf> = Vec::with_capacity(self.roots.len() + rest.len());
+        let mut seen: HashSet<&Path> = HashSet::with_capacity(targets.capacity());
+        for dir in self.roots.iter().chain(rest) {
+            if seen.insert(dir.as_path()) {
+                targets.push(dir.clone());
+            }
+        }
+        targets
+    }
+
+    /// #1404 の修正前をそのまま再現する腕（A/B 専用。`TAKO_1404_LEGACY=1`）
+    fn legacy_refresh_targets(&self) -> Vec<PathBuf> {
         let mut targets: Vec<PathBuf> = self.roots.clone();
         targets.extend(self.expanded.iter().cloned());
         targets.dedup();
@@ -713,6 +775,14 @@ fn local_note_row(path: &Path, depth: usize, note: RowNote) -> Row {
 fn legacy_1402() -> bool {
     static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *LEGACY.get_or_init(|| std::env::var("TAKO_1402_LEGACY").map(|v| v == "1") == Ok(true))
+}
+
+/// A/B（#1404）: スキャン対象の組み立てを修正前へ戻す腕。
+/// `refresh_targets` の `dedup()` と、外れたルート自身だけを畳む `set_roots` の
+/// **両方**が同時に戻る（片方だけでは症状が再現しない）
+fn legacy_1404() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_1404_LEGACY").map(|v| v == "1") == Ok(true))
 }
 
 /// 展開の打ち切りを**行として見せる**情報行（#1398。行の形は
@@ -1649,5 +1719,190 @@ mod tests {
         assert!(listing.truncation.truncated());
         assert_eq!(listing.truncation.total, on_disk, "総数が実数と一致しない");
         remove_temp_dir(&dir);
+    }
+
+    // --- スキャン対象の組み立て（#1404） --------------------------------------
+    //
+    // ここは表示（`rows`）ではなく、**背景の 2 秒ポーリングが何を read_dir するか**の
+    // 検査。A/B は `TAKO_1404_LEGACY=1`（修正前の `dedup()` と「外れたルート自身だけ
+    // 畳む」をそのまま再現する腕）
+
+    /// #1404 (a): ルートは `roots` と `expanded` の**両方**に入る（`set_roots` が
+    /// 自動展開するため）。素朴な連結 + `Vec::dedup()` は隣り合う重複しか落とさず、
+    /// `expanded` は `HashSet` = 順序が任意なので、全ルートが 2 回ずつ対象に入っていた
+    #[test]
+    fn スキャン対象に同じディレクトリが二度入らない() {
+        let a = empty_scratch("1404-dup-a");
+        let b = empty_scratch("1404-dup-b");
+        let src = a.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let mut tree = FileTree::default();
+        tree.set_roots(vec![a.path().to_path_buf(), b.path().to_path_buf()]);
+        tree.expand_dir(&src);
+
+        let targets = tree.refresh_targets();
+        let mut uniq = targets.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(
+            targets.len(),
+            uniq.len(),
+            "同じディレクトリを 1 回のポーリングで 2 回 read_dir する（#1404。\
+             len={} uniq={} targets={targets:?}）",
+            targets.len(),
+            uniq.len()
+        );
+        assert_eq!(
+            uniq.len(),
+            3,
+            "ルート 2 本 + 展開 1 つ = 3 件のはず: {targets:?}"
+        );
+        // 重複を落とすついでに必要なものまで消していない
+        for want in [a.path(), b.path(), src.as_path()] {
+            assert!(
+                targets.iter().any(|t| t == want),
+                "{} がスキャン対象から消えた: {targets:?}",
+                want.display()
+            );
+        }
+
+        // 端: `expanded` が空（ルート見出しまで畳んだ状態）でもルートは残る
+        tree.toggle_dir(&src);
+        tree.toggle_dir(a.path());
+        tree.toggle_dir(b.path());
+        assert_eq!(
+            tree.refresh_targets(),
+            vec![a.path().to_path_buf(), b.path().to_path_buf()],
+            "全部畳んだらスキャン対象はルートだけ"
+        );
+    }
+
+    /// #1404 (b): ルートが外れたら**配下ごと**忘れる。掃除役の `apply_refresh` が
+    /// 落とすのは「ディレクトリが実在しなくなったとき」だけなので、実在する子孫は
+    /// 永久に `expanded` へ残り、画面に出ていないディレクトリを読み続けていた
+    #[test]
+    fn 外れたルートの配下はスキャン対象から消える() {
+        let stale = empty_scratch("1404-stale");
+        let other = empty_scratch("1404-other");
+        let deep = stale.path().join("deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        let mut tree = FileTree::default();
+        tree.set_roots(vec![stale.path().to_path_buf()]);
+        tree.expand_dir(&deep);
+        assert!(
+            tree.refresh_targets().contains(&deep),
+            "前提: 展開したディレクトリはスキャン対象に入る"
+        );
+
+        // タブの cwd が動いてルートが差し替わる（`cd` / ペインの開閉で毎回起こる）
+        tree.set_roots(vec![other.path().to_path_buf()]);
+        let targets = tree.refresh_targets();
+        let rows = tree.rows().len();
+        let left: Vec<&PathBuf> = targets
+            .iter()
+            .filter(|t| t.starts_with(stale.path()))
+            .collect();
+        assert!(
+            left.is_empty(),
+            "表示されないディレクトリをスキャンし続けている（#1404。\
+             表示行 {rows} / スキャン対象 {} / 残り {left:?}）",
+            targets.len()
+        );
+        assert_eq!(
+            targets,
+            vec![other.path().to_path_buf()],
+            "残るのは新しいルートだけ"
+        );
+    }
+
+    /// 入れ子のルート（`<base>` と `<base>/inner` が両方ルート）で外側だけ外れたとき、
+    /// 生きている内側のルート配下まで巻き込まない（`starts_with` の素朴な走査だと消える）
+    #[test]
+    fn 入れ子のルートは生きている側の展開を巻き込まない() {
+        let base = empty_scratch("1404-nested");
+        let inner = base.path().join("inner");
+        let inner_deep = inner.join("deep");
+        let gone = base.path().join("gone");
+        std::fs::create_dir_all(&inner_deep).unwrap();
+        std::fs::create_dir_all(&gone).unwrap();
+        let mut tree = FileTree::default();
+        tree.set_roots(vec![base.path().to_path_buf(), inner.clone()]);
+        tree.expand_dir(&inner_deep);
+        tree.expand_dir(&gone);
+
+        // 外側のルートだけ外れる
+        tree.set_roots(vec![inner.clone()]);
+        let targets = tree.refresh_targets();
+        assert!(
+            targets.contains(&inner) && targets.contains(&inner_deep),
+            "生きているルートの配下まで落とした: {targets:?}"
+        );
+        assert!(
+            !targets.contains(&gone),
+            "外れたルートの配下が残っている: {targets:?}"
+        );
+    }
+
+    /// 外れたルートが戻ってきたら**畳まれた状態から**始まる（#1404 が選んだ側の
+    /// 明示）。展開状態を覚え続けることは「表示されないディレクトリを読み続ける」
+    /// のと同義なので、忘れる側を採る。ルート自身は `set_roots` が自動展開する
+    #[test]
+    fn 外れて戻ったルートは畳まれた状態から始まる() {
+        let a = empty_scratch("1404-readd-a");
+        let b = empty_scratch("1404-readd-b");
+        let sub = a.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("inner.txt"), "x").unwrap();
+        let mut tree = FileTree::default();
+        tree.set_roots(vec![a.path().to_path_buf()]);
+        tree.expand_dir(&sub);
+        assert!(names(&mut tree).iter().any(|(n, ..)| n == "inner.txt"));
+
+        tree.set_roots(vec![b.path().to_path_buf()]);
+        tree.set_roots(vec![a.path().to_path_buf()]);
+        let rows = names(&mut tree);
+        assert!(
+            rows.iter().any(|(n, ..)| n == "sub"),
+            "戻ってきたルートの中身が出ていない: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|(n, ..)| n == "inner.txt"),
+            "外れているあいだの展開状態を持ち越している（読み続けていた証拠）: {rows:?}"
+        );
+    }
+
+    /// 受け入れ 5: スキャン対象の組み立てを変えても**表示行は変わらない**。
+    /// この 1 本は A/B の**両方の腕で緑**（`TAKO_1404_LEGACY=1` でも同じ並びになる）
+    #[test]
+    fn スキャン対象の整理は表示行を変えない() {
+        let a = empty_scratch("1404-rows-a");
+        let b = empty_scratch("1404-rows-b");
+        let src = a.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("main.rs"), "x").unwrap();
+        std::fs::write(b.path().join("README.md"), "x").unwrap();
+        let name_of = |p: &Path| p.file_name().unwrap().to_string_lossy().into_owned();
+        let mut tree = FileTree::default();
+        tree.set_roots(vec![a.path().to_path_buf(), b.path().to_path_buf()]);
+        tree.expand_dir(&src);
+        assert_eq!(
+            names(&mut tree),
+            vec![
+                (name_of(a.path()), 0, true),
+                ("src".to_string(), 1, false),
+                ("main.rs".to_string(), 2, false),
+                (name_of(b.path()), 0, true),
+                ("README.md".to_string(), 1, false),
+            ]
+        );
+        // ルートが外れた直後の表示も同じ（消えた側は元から描かれていない）
+        tree.set_roots(vec![b.path().to_path_buf()]);
+        assert_eq!(
+            names(&mut tree),
+            vec![
+                (name_of(b.path()), 0, true),
+                ("README.md".to_string(), 1, false),
+            ]
+        );
     }
 }

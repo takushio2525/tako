@@ -64652,18 +64652,39 @@ mod self_test {
                 );
 
                 // (e) git へ渡す起点はルートだけ（展開ディレクトリを混ぜない）。
-                // 混ぜると `git rev-parse --show-toplevel` が 2 秒ごとにその数だけ起動する
+                // 混ぜると `git rev-parse --show-toplevel` が 2 秒ごとにその数だけ起動する。
+                //
+                // #1404: ファイル走査側（`refresh_targets`）は逆に**展開ディレクトリを
+                // 含み、同じディレクトリを 2 回は返さない**。以前この行は
+                // `targets.len() > git_roots.len()` だけを見ていたが、それは修正前の
+                // 重複（ルートが `roots` と `expanded` の両方に入り 2 回ずつ載る）で
+                // **常に真**になり、展開ディレクトリが載っているかを何も検査できていなかった。
+                // ルートではないディレクトリを 1 つ展開してから読む
+                let expanded1009 = repo1009.join("src");
                 let (targets1009, git_roots1009) = window
                     .update(cx, |app: &mut TakoApp, _, _| {
+                        app.filetree.expand_dir(&expanded1009);
                         (app.filetree.refresh_targets(), app.filetree.roots().to_vec())
                     })
                     .unwrap_or_default();
+                let mut uniq1009 = targets1009.clone();
+                uniq1009.sort();
+                uniq1009.dedup();
+                let extra1009: Vec<_> = targets1009
+                    .iter()
+                    .filter(|t| !git_roots1009.contains(*t))
+                    .collect();
                 check(
-                    git_roots1009 == roots1009 && targets1009.len() > git_roots1009.len(),
+                    git_roots1009 == roots1009
+                        && uniq1009.len() == targets1009.len()
+                        && git_roots1009.iter().all(|r| targets1009.contains(r))
+                        && extra1009.contains(&&expanded1009),
                     &format!(
-                        "135: git の走査起点はワークスペースルートだけ \
-                         (#1009。targets={} git_roots={})",
+                        "135: git の走査起点はワークスペースルートだけ・ファイル走査は \
+                         展開ディレクトリを重複なしで持つ (#1009 / #1404。targets={} \
+                         uniq={} git_roots={} extra={extra1009:?})",
                         targets1009.len(),
+                        uniq1009.len(),
                         git_roots1009.len()
                     ),
                 );
