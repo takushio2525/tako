@@ -59,3 +59,8 @@
 - `sync_offscreen_pane_sizes` は render から毎フレーム通るのに、当て直す中身（`offscreen_areas`）が既に「key + 2 秒」で回っていたので**材料が同じあいだは同じ答えを出し直していた**。当て直す側も同じ単位へ寄せ、キーは `OffscreenAreaKey`（1 実装 `offscreen_area_key` に集約）+ 既定セル寸法（#647 の再発防止）+ 表示中ペイン数 + ペイン単位ズームの指紋。間隔は `OFFSCREEN_REFRESH_INTERVAL` の 1 定数を両者が見る
 - 実測（隔離 GUI の grid-bench・22 ペイン / 表示 4・3000 フレーム）: 596〜776 ns/frame（`render` の 5.88〜6.28%・走査 82 比較 + 18 ペイン当て直し）→ **36〜38 ns/frame**（0.38〜0.41%・走査 0 / 当て直し 0）。同一バイナリの `TAKO_1426_LEGACY=1` は 645〜690 ns で旧挙動を再現。#932 の flicker ラウンドは `late_resize=false` で緑、既存 A/B（`TAKO_932_NO_OFFSCREEN_GEOMETRY=1`）では `late_resize=true` で落ちる = 検出力あり
 - 単体 7 本 + 番犬 `issue1426_offscreen_sync_watchdog` 8 本（注入 8 通りで `main.rs:16126` / `:16158` / `:16238` / `:16245` / `:1330` / `:1344` を file:line 名指し）。範囲取りは #1420 の `production_range` の 1 実装を通す。workspace 4551 passed 0 failed・clippy 両宇宙 0・check-windows error 0・隔離セルフテスト完走。**install 要**
+
+## 2026-09-12（#1432: UI に残る `eprintln!` 10 件を通知欄 / 診断へ振り分けた）
+- `KNOWN_EPRINTLN` の 10 件を 1 実装（`notify_ui_op_failed` / `log_ui_failure`）へ。ユーザー操作 7 件は通知欄 + persist.log（ドロワーの D&D / 復元・カードの操作と実行ペイン起動・チャットのコピー・Finder の実在しないパス・ノートのリンク）、画面へ出せない 2 件は診断だけ、`autorename` の env つき診断は persist.log へ。画面は `NoticeArea` を 5 つ足して区別（`drawer` / `command_card` / `chat` / `open_file` / `update_window`）
+- 隔離 GUI（tako-vd）項目 84e + 90 の A/B: 新 = 6 経路とも通知が出て `bg_lines=3`・成功時は無言で完走（`TAKO_APP_SELF_TEST_OK`）/ legacy（`TAKO_1432_LEGACY=1`）は 5 つとも `None`・`bg_lines=0` で FAILED。`TAKO_1432_LEGACY=1` でも #1399 / #1417 / #1422 は `legacy=false` のまま出る（軸が独立）
+- `KNOWN_EPRINTLN` は空・番犬 12 本緑（A/B の env が Issue ごとに 1 対 1 であることの検査を 1 本追加）。workspace 4573 passed 0 failed・clippy 両宇宙 0・check-windows error 0。**install 要**

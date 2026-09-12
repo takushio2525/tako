@@ -120,26 +120,35 @@ pub(crate) enum OpenTarget {
     ShellInNewTab(PathBuf),
 }
 
+/// 振り分けの結果（#1432）。**落としたパスも返す**のがこの型の理由で、
+/// 以前は `eprintln!` へ書いて捨てていたため「消えたファイルを Finder から開くと
+/// tako が前面に出ることすら無い」= 押しても無言だった
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct OpenPlan {
+    /// 開くもの（入力順 = Finder で選んだ順にタブが並ぶ）
+    pub(crate) targets: Vec<OpenTarget>,
+    /// ファイルでもフォルダでもなかったもの（他を巻き添えにせず落とす）
+    pub(crate) missing: Vec<PathBuf>,
+}
+
 /// 渡されたパス群を開き方へ振り分ける。存在しないものは落とす（他を巻き添えにしない）。
 /// 順序は入力どおり = Finder で選んだ順にタブが並ぶ
-pub(crate) fn plan_open(paths: &[PathBuf]) -> Vec<OpenTarget> {
-    paths
-        .iter()
-        .filter_map(|p| {
-            if p.is_dir() {
-                // ターミナルアプリにフォルダを渡す = 「そこで作業を始めたい」と読む。
-                // プレビューはファイル専用なので、フォルダはシェルで受ける
-                Some(OpenTarget::ShellInNewTab(p.clone()))
-            } else if p.is_file() {
-                // 宣言外の形式もここへ来る。表示モードの決定と巨大ファイルの
-                // 切り詰めは dispatch / プレビュー側が持っているので判定しない
-                Some(OpenTarget::PreviewInNewTab(p.clone()))
-            } else {
-                eprintln!("warning: 開けるものが見つからない: {}", p.display());
-                None
-            }
-        })
-        .collect()
+pub(crate) fn plan_open(paths: &[PathBuf]) -> OpenPlan {
+    let mut plan = OpenPlan::default();
+    for p in paths {
+        if p.is_dir() {
+            // ターミナルアプリにフォルダを渡す = 「そこで作業を始めたい」と読む。
+            // プレビューはファイル専用なので、フォルダはシェルで受ける
+            plan.targets.push(OpenTarget::ShellInNewTab(p.clone()));
+        } else if p.is_file() {
+            // 宣言外の形式もここへ来る。表示モードの決定と巨大ファイルの
+            // 切り詰めは dispatch / プレビュー側が持っているので判定しない
+            plan.targets.push(OpenTarget::PreviewInNewTab(p.clone()));
+        } else {
+            plan.missing.push(p.clone());
+        }
+    }
+    plan
 }
 
 /// メインループ側の受け口。Finder から渡されたものを新しいタブで開き、tako を前面に出す。
@@ -147,8 +156,10 @@ pub(crate) fn plan_open(paths: &[PathBuf]) -> Vec<OpenTarget> {
 /// ウィンドウが 1 枚も無い（赤ボタン close 後にプロセスだけ生存）場合は
 /// Dock 復帰と同じ [`crate::reopen_or_restore`] でウィンドウを開き直してから開く。
 pub(crate) fn open_paths(paths: Vec<PathBuf>, cx: &mut gpui::App) {
-    let targets = plan_open(&paths);
-    if targets.is_empty() {
+    let plan = plan_open(&paths);
+    // #1432: 開けないものしか無くても**黙って帰らない**。理由を出すには窓が要るので、
+    // 以降のウィンドウ解決へそのまま進む
+    if plan.targets.is_empty() && plan.missing.is_empty() {
         return;
     }
     if cx.windows().is_empty() {
@@ -157,8 +168,11 @@ pub(crate) fn open_paths(paths: Vec<PathBuf>, cx: &mut gpui::App) {
     cx.activate(true);
 
     let open = move |app: &mut crate::TakoApp, cx: &mut gpui::Context<crate::TakoApp>| {
-        for target in &targets {
+        for target in &plan.targets {
             app.open_from_finder(target, cx);
+        }
+        for path in &plan.missing {
+            app.notify_open_path_missing(path);
         }
     };
 
@@ -175,11 +189,43 @@ pub(crate) fn open_paths(paths: Vec<PathBuf>, cx: &mut gpui::App) {
         .into_iter()
         .find_map(|w| w.downcast::<crate::TakoApp>())
     {
-        if let Err(e) = handle.update(cx, |app, _window, cx| open(app, cx)) {
-            eprintln!("warning: 開いたファイルを表示できない: {e}");
+        if handle.update(cx, |app, _window, cx| open(app, cx)).is_err() {
+            // #1432: ここまで来ると出せる画面そのものが無い（窓が閉じた直後）。
+            // 通知欄は出せないので、捨てずに診断へ 1 行だけ残す
+            log_open_failure("finder-open-window-gone");
         }
     } else {
-        eprintln!("warning: 表示先のウィンドウが無いためファイルを開けない");
+        log_open_failure("finder-open-no-window");
+    }
+}
+
+/// 画面へ出せない失敗を診断へ落とす（#1432）。
+///
+/// 出し口は #1422 の 1 実装（`TakoApp::log_ui_failure`）で、`eprintln!` と違い
+/// `.app` 起動でも `<data_dir>/persist.log` から読める。**載せるのは操作の識別子と
+/// 分類だけ**（渡されたパスは載せない = #1376 と同じ作法）
+fn log_open_failure(diag_op: &str) {
+    crate::TakoApp::log_ui_failure(
+        crate::sidebar::NoticeArea::OpenFile,
+        crate::sidebar::NoticeArm::Issue1432,
+        diag_op,
+        "operation",
+    );
+}
+
+impl crate::TakoApp {
+    /// Finder / `tako open` から渡されたパスが実在しなかったときの通知（#1432）。
+    ///
+    /// 名前付きにしてあるのは #1417 / #1422 と同じ理由（Finder の実イベントは
+    /// セルフテストから起こせないので、通知の経路そのものを叩ける名前が要る）
+    pub(crate) fn notify_open_path_missing(&mut self, path: &std::path::Path) {
+        self.notify_ui_op_failed(
+            crate::sidebar::NoticeArea::OpenFile,
+            crate::sidebar::NoticeArm::Issue1432,
+            crate::ui_text::sidebar::op_open_path(),
+            Some(&path.display().to_string()),
+            crate::ui_text::sidebar::reason_path_missing(),
+        );
     }
 }
 
@@ -341,7 +387,7 @@ mod tests {
             dir.join("no-such"),
         ]);
         assert_eq!(
-            plan,
+            plan.targets,
             vec![
                 // ファイルは 1 枚 = 1 タブ。宣言外の形式も同じ扱い（表示モードの
                 // 決定と巨大ファイルの切り詰めはプレビュー側が持つ）
@@ -353,8 +399,16 @@ mod tests {
             ],
             "選んだ順にタブが並び、開けないものだけが落ちる"
         );
-        assert!(plan_open(&[]).is_empty());
-        assert!(plan_open(&[dir.join("no-such")]).is_empty());
+        // #1432: 落としたものは**捨てずに**返る（呼び出し側が通知欄へ出す）
+        assert_eq!(
+            plan.missing,
+            vec![dir.join("no-such")],
+            "開けなかったパスが結果から消えている（#1432）"
+        );
+        assert_eq!(plan_open(&[]), OpenPlan::default());
+        let only_missing = plan_open(&[dir.join("no-such")]);
+        assert!(only_missing.targets.is_empty());
+        assert_eq!(only_missing.missing.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

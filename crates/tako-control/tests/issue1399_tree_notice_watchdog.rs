@@ -144,18 +144,13 @@ fn discard_shape(line: &str) -> Option<&'static str> {
 /// スコープ外の箇所は**件数**で宣言して段階導入する（行番号だと無関係な編集で
 /// 壊れる。`KNOWN_DISCARDED` と同じく**減る方向にしか動かさない** = 直したら数を減らす）。
 ///
-/// ここに残っているものは別 Issue で振り分ける:
-/// `drawer.rs` はバックグラウンド復帰（`right_panel.rs` と同型）、
-/// `open_files.rs` / `command_card_ui.rs` / `chat_view.rs` / `update_window.rs` は
-/// それぞれユーザー操作の失敗。`autorename.rs` は env で明示的に有効化する診断出力
-const KNOWN_EPRINTLN: &[(&str, usize)] = &[
-    ("autorename.rs", 1),
-    ("chat_view.rs", 1),
-    ("command_card_ui.rs", 2),
-    ("drawer.rs", 2),
-    ("open_files.rs", 3),
-    ("update_window.rs", 1),
-];
+/// **#1432 で 10 件とも振り分けたので空**。ユーザー操作の失敗 7 件は通知欄
+/// （ドロワーの D&D / 復元ボタン・コマンドカードの操作と実行ペインの起動・
+/// チャットのコピー・Finder から開く・リリースノートのリンク）、画面へ出せない
+/// 2 件（窓が無い / 窓が消えた）は `log_ui_failure`、`autorename.rs` の env つき
+/// 診断は `diag::persist_log` へ。空のまま保つこと = 新しい `eprintln!` を
+/// 足したら、ここへ宣言して素通りさせるのではなく出し口を通す
+const KNOWN_EPRINTLN: &[(&str, usize)] = &[];
 
 /// 行コメントを**行数を保ったまま**落とす（近くの説明文を「扱った証拠」と
 /// 誤認しないため。`ui_dispatch_attach_watchdog` が実際にこの空振りを踏んだ）
@@ -536,6 +531,27 @@ fn 別画面の失敗も同じ出し口から出ている() {
                 "fn preview_code_copy_clicked(",
             ][..],
         ),
+        // #1432: 同じ形が残っていた 5 画面
+        (
+            "crates/tako-app/src/drawer.rs",
+            &["fn drop_background_pane(", "fn shelf_restore_clicked("][..],
+        ),
+        (
+            "crates/tako-app/src/command_card_ui.rs",
+            &["fn report_command_card_error("][..],
+        ),
+        (
+            "crates/tako-app/src/chat_view.rs",
+            &["fn chat_copy_clicked("][..],
+        ),
+        (
+            "crates/tako-app/src/open_files.rs",
+            &["fn notify_open_path_missing("][..],
+        ),
+        (
+            "crates/tako-app/src/update_window.rs",
+            &["fn open_note_link("][..],
+        ),
     ] {
         let src = std::fs::read_to_string(root.join(file)).expect("UI モジュールが読める");
         let name = file.rsplit('/').next().unwrap_or(file);
@@ -551,14 +567,19 @@ fn 別画面の失敗も同じ出し口から出ている() {
                          呼べる名前が無いと前後比較が取れない）"
                     )
                 });
+            // 受け手は `self.` とは限らない（#1432 の `update_window.rs` は
+            // `with_app` で辿ったメインウィンドウの `app.` を呼ぶ）。説明文を
+            // 「通した証拠」と誤認しないよう、コメント行は落としてから見る
+            let lines: Vec<&str> = body.lines().collect();
+            let code = strip_comment_lines(&lines).join("\n");
             assert!(
-                body.contains("self.notify_ui_dispatch_failed(")
-                    || body.contains("self.notify_ui_op_failed("),
+                code.contains("notify_ui_dispatch_failed(")
+                    || code.contains("notify_ui_op_failed("),
                 "{name} の `{handler}` が共有の出し口（`notify_ui_dispatch_failed` /\
                  `notify_ui_op_failed`）を通っていない（#1417 / #1422）"
             );
             assert!(
-                body.contains("NoticeArea::"),
+                code.contains("NoticeArea::"),
                 "{name} の `{handler}` が画面（`NoticeArea`）を渡していない（#1417）。\
                  persist.log の `area=` がどの画面か分からなくなる"
             );
@@ -601,6 +622,83 @@ fn 別画面の失敗も同じ出し口から出ている() {
         "sidebar.rs が診断へ {} 箇所から書いている（#1422）。`log_ui_failure` の 1 実装に\
          保つこと（実測: {writes:?}）",
         writes.len()
+    );
+}
+
+/// A/B の逃げ道は **Issue ごとに別の env** を読むこと（#1422 / #1432）。
+///
+/// #1417 までは画面（`NoticeArea`）から env を選んでいたが、同じ画面に別の Issue で
+/// 足した通知が同居するので、画面で選ぶと**片方のアームがもう片方の回帰を隠す**。
+/// 抑止の単位を Issue にした以上、2 つのアームが同じ env を読んだら同じ穴が開く
+#[test]
+fn abの逃げ道はissueごとに別のenvを読む() {
+    let root = workspace_root();
+    let src = sidebar_src(&root);
+    let body = src
+        .split_once("fn suppressed(self) -> bool {")
+        .map(|(_, rest)| fn_body(rest))
+        .expect("`NoticeArm::suppressed` が sidebar.rs に無い（#1422 の A/B の軸）");
+    // `NoticeArm::IssueNNNN => TakoApp::legacy_NNNN(),` の対応を拾う
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for line in body.lines() {
+        let Some((left, right)) = line.split_once("=>") else {
+            continue;
+        };
+        let Some(arm) = left.trim().strip_prefix("NoticeArm::") else {
+            continue;
+        };
+        let Some(func) = right.trim().strip_prefix("TakoApp::") else {
+            continue;
+        };
+        pairs.push((
+            arm.trim().to_string(),
+            func.trim_end_matches(&[',', ' '][..])
+                .trim_end_matches("()")
+                .to_string(),
+        ));
+    }
+    assert!(
+        pairs.len() >= 4,
+        "`suppressed` のアームが {} 本しか読めていない（#1422 / #1432。走査が壊れている）",
+        pairs.len()
+    );
+    let mut funcs: Vec<&str> = pairs.iter().map(|(_, f)| f.as_str()).collect();
+    let total = funcs.len();
+    funcs.sort_unstable();
+    funcs.dedup();
+    assert_eq!(
+        funcs.len(),
+        total,
+        "2 つ以上のアームが同じ `legacy_*` を読んでいる（#1422）。\
+         A/B が互いの回帰を隠すので、アームごとに別の逃げ道を持つこと（実測: {pairs:?}）"
+    );
+    // それぞれの `legacy_*` が読む env も 1 対 1（`TAKO_<番号>_LEGACY`）
+    let mut envs: Vec<String> = Vec::new();
+    for (arm, func) in &pairs {
+        let decl = src
+            .split_once(&format!("fn {func}() -> bool {{"))
+            .map(|(_, rest)| fn_body(rest))
+            .unwrap_or_else(|| panic!("{arm} の逃げ道 `{func}` が sidebar.rs に無い（#1422）"));
+        let env = decl
+            .split_once("std::env::var(\"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(name, _)| name.to_string())
+            .unwrap_or_else(|| panic!("`{func}` が env を読んでいない（#1422）"));
+        let number = arm.trim_start_matches("Issue");
+        assert_eq!(
+            env,
+            format!("TAKO_{number}_LEGACY"),
+            "{arm} の逃げ道が別 Issue の env を読んでいる（#1422 / #1432）"
+        );
+        envs.push(env);
+    }
+    let total = envs.len();
+    envs.sort();
+    envs.dedup();
+    assert_eq!(
+        envs.len(),
+        total,
+        "A/B の env が重複している（#1422 / #1432）"
     );
 }
 

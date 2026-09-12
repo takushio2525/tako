@@ -30,6 +30,20 @@ pub fn run_failed() -> &'static str {
     tr!("実行できませんでした", "Could not run")
 }
 
+/// カード操作が失敗したときに通知欄へ出す**操作名**（#1432）。
+///
+/// **押したボタンの文言をそのまま返す**（#1399 の物差し。押したものと失敗したものの
+/// 名前が必ず一致する）。以前はここが `eprintln!` 止まりで、カードには
+/// [`run_failed`] の一言だけが 2 秒出て**理由がどこにも残らなかった**
+pub fn op_action(action: &str) -> &'static str {
+    match action {
+        "copy" => copy(),
+        "dismiss" => super::common::close(),
+        // `command_card_dispatch` が受ける残りは run（実行ペインの起動失敗も含む）
+        _ => run(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests_support;
@@ -45,6 +59,9 @@ mod tests {
                 run().to_string(),
                 index_label(2, 3),
                 run_failed().to_string(),
+                op_action("copy").to_string(),
+                op_action("run").to_string(),
+                op_action("dismiss").to_string(),
             ]
         });
     }

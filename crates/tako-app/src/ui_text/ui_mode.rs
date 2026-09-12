@@ -327,6 +327,14 @@ pub fn chat_copied() -> &'static str {
     tr!("コピーしました", "Copied")
 }
 
+/// チャットのコピーが失敗したときに通知欄へ出す**操作名**（#1432）。
+///
+/// このボタンは以前 `eprintln!` 止まりで、発話が流れて消えた後に押すと
+/// **押しても無言**だった（GUI の stderr は誰も読めない = 境界 B8）
+pub fn op_copy_chat() -> &'static str {
+    tr!("チャットのコピー", "Copy chat message")
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests_support;
@@ -389,6 +397,7 @@ mod tests {
                 chat_expand_long(9000),
                 chat_collapse_long().to_string(),
                 chat_copied().to_string(),
+                op_copy_chat().to_string(),
             ]
         });
     }

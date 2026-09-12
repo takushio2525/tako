@@ -200,7 +200,7 @@ pub fn fingerprint<T: Hash>(value: &T) -> u64 {
     hasher.finish()
 }
 
-/// 診断出力（`TAKO_AUTORENAME_DIAG=1` のときだけ stderr へ）。
+/// 診断出力（`TAKO_AUTORENAME_DIAG=1` のときだけ `<data_dir>/persist.log` へ）。
 ///
 /// この機能の失敗は全部「黙ってヒューリスティックへ落ちる」形で出る。#722 は claude が
 /// 解決できていないせいだったが、解決不能・非ゼロ終了・タイムアウト・パース失敗が
@@ -208,11 +208,15 @@ pub fn fingerprint<T: Hash>(value: &T) -> u64 {
 ///
 /// **中身は絶対に出さない**（プロンプト・claude の出力・画面末尾はペイン内容そのもの。
 /// 診断ログへ出さないのは AGENTS.md の絶対ルール）。出すのは解決したパス・終了コード・
-/// 所要時間・出力バイト数といったメタ情報だけ
+/// 所要時間・出力バイト数といったメタ情報だけ。
+///
+/// #1432: 出し先は stderr ではなく診断ログ。`.app` 起動（Dock / Finder）の stderr は
+/// 捨てられるので、**この env を立てられる場面でこそ読めない**という逆立ちをしていた
+/// （`diag::flow_log` が #640 で採ったのと同じ形）。env が無ければ 1 行も書かない
 fn diag(args: std::fmt::Arguments<'_>) {
     static ON: OnceLock<bool> = OnceLock::new();
     if *ON.get_or_init(|| std::env::var_os("TAKO_AUTORENAME_DIAG").is_some()) {
-        eprintln!("[autorename] {args}");
+        tako_control::diag::persist_log(&format!("[autorename] {args}"));
     }
 }
 

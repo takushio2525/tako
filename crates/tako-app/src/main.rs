@@ -49619,6 +49619,173 @@ mod self_test {
                 );
             }
 
+            // 84e. #1432: 84d で走査を全 UI モジュールへ広げたときに残っていた 10 か所
+            // （ドロワーの D&D 復帰 / 復元ボタン・コマンドカードの操作と実行ペインの
+            // 起動・チャットのコピー・Finder から渡された実在しないパス・
+            // リリースノートのリンク・画面へ出せない 2 件・autorename の診断）。
+            // ユーザー操作は共有の通知欄 + persist.log、画面へ出せないものは診断だけ。
+            // **A/B は `TAKO_1432_LEGACY=1`**（#1399 / #1417 / #1422 と env を分けて
+            // あるので、片方のアームがもう片方の回帰を隠さない）。84c / 84d と同じく、
+            // 合成マウスではなく `on_click` が呼ぶ関数そのものを叩く。
+            // リリースノートのリンクは**窓が開く項目 90 の中**で見る。autorename の
+            // 診断は env（`TAKO_AUTORENAME_DIAG`）を立てたときだけ出るので対象外
+            {
+                use tako_control::protocol::Request;
+                let term_pane = window
+                    .update(cx, |app, _, _| app.focused_pane())
+                    .unwrap_or(PaneId::from_raw(1));
+                let log_before = tako_control::diag::persist_log_path()
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .map(|s| s.lines().count())
+                    .unwrap_or(0);
+                let gone1432 = std::env::temp_dir()
+                    .join(format!("tako-st1432-{}-gone.md", std::process::id()));
+                let notice_of = |app: &TakoApp| {
+                    app.remote_notice
+                        .as_ref()
+                        .filter(|n| n.is_error)
+                        .map(|n| n.text.clone())
+                };
+                let probe = window
+                    .update(cx, |app, _, cx| {
+                        app.remote_notice = None;
+                        // (1) ドロワーへの D&D 復帰（居ないペイン）
+                        app.drop_background_pane(
+                            term_pane,
+                            BackgroundPaneDrag {
+                                pane: PaneId::from_raw(999_999),
+                            },
+                            cx,
+                        );
+                        let drop_notice = notice_of(app);
+                        // (2) ドロワーのカードの「復元」ボタン
+                        app.shelf_restore_clicked(PaneId::from_raw(999_999), cx);
+                        let shelf_notice = notice_of(app);
+                        // (3) コマンドカードの操作（実在しないカード = dispatch が Err）
+                        app.run_command_card(u64::MAX, 0, cx);
+                        let card_notice = notice_of(app);
+                        // (4) チャットのコピー（もう表示されていない発話）
+                        app.chat_copy_clicked(
+                            term_pane,
+                            u64::MAX,
+                            chat_view::ChatCopyTarget::Code(0),
+                            cx,
+                        );
+                        let chat_notice = notice_of(app);
+                        // (5) Finder / `tako open` から渡された実在しないパス
+                        app.notify_open_path_missing(&gone1432);
+                        let open_notice = notice_of(app);
+                        // (6) 画面へ出せない失敗（窓が無い / 窓が消えた）は通知欄に出さず、
+                        // 連続しても 1 要求 1 行しか診断へ出ないこともここで見る
+                        app.remote_notice = None;
+                        for _ in 0..3 {
+                            TakoApp::log_ui_failure(
+                                crate::sidebar::NoticeArea::OpenFile,
+                                crate::sidebar::NoticeArm::Issue1432,
+                                "finder-open-no-window",
+                                "operation",
+                            );
+                        }
+                        let bg_silent = app.remote_notice.is_none();
+                        // (7) エッジ: 通知を閉じた直後に同じ失敗をしてもまた出る
+                        app.chat_copy_clicked(
+                            term_pane,
+                            u64::MAX,
+                            chat_view::ChatCopyTarget::Message,
+                            cx,
+                        );
+                        let after_dismiss = notice_of(app);
+                        // (8) 裏取り: **成功する操作では通知を出さない**（誤検知していない）
+                        app.remote_notice = None;
+                        let card = tako_control::dispatch(
+                            app,
+                            Request::ShowCommand {
+                                action: None,
+                                commands: vec!["echo st1432".into()],
+                                label: Some("セルフテスト".into()),
+                                pane: Some(term_pane.as_u64()),
+                                card: None,
+                                index: None,
+                                focus: None,
+                            },
+                            PaneOrigin::Mcp,
+                        )
+                        .ok()
+                        .and_then(|v| v["card"]["id"].as_u64())
+                        .unwrap_or(0);
+                        app.dismiss_command_card(card, cx);
+                        let ok_silent = card > 0 && app.remote_notice.is_none();
+                        // 実在するパスは落ちない（(5) の裏取り）
+                        let plan = open_files::plan_open(&[std::env::temp_dir()]);
+                        let plan_ok = plan.missing.is_empty() && plan.targets.len() == 1;
+                        app.remote_notice = None;
+                        cx.notify();
+                        (
+                            drop_notice,
+                            shelf_notice,
+                            card_notice,
+                            chat_notice,
+                            open_notice,
+                            bg_silent,
+                            after_dismiss,
+                            ok_silent && plan_ok,
+                        )
+                    })
+                    .unwrap_or((None, None, None, None, None, false, None, false));
+                let (
+                    drop_notice,
+                    shelf_notice,
+                    card_notice,
+                    chat_notice,
+                    open_notice,
+                    bg_silent,
+                    after_dismiss,
+                    ok_silent,
+                ) = probe;
+                let bg_lines = tako_control::diag::persist_log_path()
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .map(|s| {
+                        s.lines()
+                            .skip(log_before)
+                            .filter(|l| l.contains("op=finder-open-no-window"))
+                            .count()
+                    })
+                    .unwrap_or(0);
+                println!(
+                    "TAKO_SELF_TEST_1432: legacy={} drop={drop_notice:?} shelf={shelf_notice:?} \
+                     card={card_notice:?} chat={chat_notice:?} open={open_notice:?} \
+                     bg_silent={bg_silent} bg_lines={bg_lines} after_dismiss={after_dismiss:?} \
+                     ok_silent={ok_silent}",
+                    TakoApp::legacy_1432(),
+                );
+                let unshelve = crate::ui_text::panel::op_unshelve_pane();
+                let drawer_ok = drop_notice.as_deref().is_some_and(|t| t.starts_with(unshelve))
+                    && shelf_notice.as_deref().is_some_and(|t| t.starts_with(unshelve));
+                let card_ok = card_notice
+                    .as_deref()
+                    .is_some_and(|t| t.starts_with(crate::ui_text::command_card::op_action("run")));
+                let chat_ok = chat_notice.as_deref().is_some_and(|t| {
+                    t.starts_with(crate::ui_text::ui_mode::op_copy_chat())
+                        && t.contains(&crate::ui_text::preview::code_block_n(0))
+                });
+                let open_ok = open_notice.as_deref().is_some_and(|t| {
+                    t.starts_with(crate::ui_text::sidebar::op_open_path())
+                        && t.contains("tako-st1432-")
+                });
+                check(drawer_ok, "ドロワー: D&D / 復元ボタンの失敗が通知欄へ出る（#1432）");
+                check(card_ok, "コマンドカード: 操作の失敗が通知欄へ出る（#1432）");
+                check(chat_ok, "チャット: コピーの失敗が通知欄へ出る（#1432）");
+                check(open_ok, "Finder から開く: 実在しないパスが通知欄へ出る（#1432）");
+                check(
+                    bg_silent && bg_lines == 3,
+                    "画面へ出せない失敗は通知欄に出ず診断へ 1 要求 1 行（#1432）",
+                );
+                check(
+                    after_dismiss.is_some() && ok_silent,
+                    "閉じた直後も出る・成功時は無言（#1432）",
+                );
+            }
+
             // 85. git タブのセクション表示順（#551 案 2）。
             // 「変更 → コミット → ブランチ → リモート → diff」の順に積まれることを
             // render が実際に記録した並び（`git_body_sections`）で固定する。
@@ -50540,10 +50707,10 @@ mod self_test {
                             let _ = view.render(win, cx);
                             let (blocks, has_table, links, layouts) = view.notes_probe();
                             // ⌘+クリックの経路（描画前・範囲外でも panic しない）
-                            let clicked = view.probe_note_link_click(gpui::point(
-                                gpui::px(-10.0),
-                                gpui::px(-10.0),
-                            ));
+                            let clicked = view.probe_note_link_click(
+                                gpui::point(gpui::px(-10.0), gpui::px(-10.0)),
+                                cx,
+                            );
                             (blocks, has_table, links, layouts, clicked)
                         })
                         .unwrap_or((0, false, 0, 0, None));
@@ -50592,6 +50759,69 @@ mod self_test {
                              blocks={} table={} links={} layouts={} click={:?} edges={edges}",
                             real.0, real.1, real.2, real.3, real.4
                         ),
+                    );
+
+                    // #1432: 開けないリンク（http / https 以外）の ⌘+クリックは
+                    // 以前 `eprintln!` 止まりで**押しても無言**だった。この窓は
+                    // 自前の通知欄を持たないので、出し先はメインウィンドウの共有通知欄。
+                    // ヒットテストは描画前だと当たらないので索引で経路を叩く
+                    let _ = window.update(cx, |app, _, cx| {
+                        let mut i = info("99.0.0", Channel::Stable);
+                        i.notes = Some("## メモ\n\n[手順](./guide.md)\n".into());
+                        app.update_state = UpdateState::Available(ChannelUpdates {
+                            stable: Some(i),
+                            test: None,
+                            rate_limit_note: None,
+                        });
+                        app.remote_notice = None;
+                        cx.notify();
+                    });
+                    let _ = handle.update(cx, |view, win, cx| {
+                        let _ = view.render(win, cx);
+                        view.probe_note_link_open(0, cx);
+                    });
+                    let link_notice = window
+                        .update(cx, |app, _, _| {
+                            app.remote_notice
+                                .as_ref()
+                                .filter(|n| n.is_error)
+                                .map(|n| n.text.clone())
+                        })
+                        .ok()
+                        .flatten();
+                    // 裏取り: 開けるリンクでは通知を出さない（実ブラウザは
+                    // `open_external_url` が `TAKO_SELF_TEST` で抑止する）
+                    let link_ok_silent = {
+                        let _ = window.update(cx, |app, _, cx| {
+                            let mut i = info("99.0.0", Channel::Stable);
+                            i.notes = Some("## メモ\n\n[配布](https://example.com/x)\n".into());
+                            app.update_state = UpdateState::Available(ChannelUpdates {
+                                stable: Some(i),
+                                test: None,
+                                rate_limit_note: None,
+                            });
+                            app.remote_notice = None;
+                            cx.notify();
+                        });
+                        let _ = handle.update(cx, |view, win, cx| {
+                            let _ = view.render(win, cx);
+                            view.probe_note_link_open(0, cx);
+                        });
+                        window
+                            .update(cx, |app, _, _| app.remote_notice.is_none())
+                            .unwrap_or(false)
+                    };
+                    println!(
+                        "TAKO_SELF_TEST_1432_LINK: legacy={} link={link_notice:?} \
+                         ok_silent={link_ok_silent}",
+                        TakoApp::legacy_1432(),
+                    );
+                    check(
+                        link_notice
+                            .as_deref()
+                            .is_some_and(|t| t.starts_with(crate::ui_text::update::op_open_link()))
+                            && link_ok_silent,
+                        "リリースノート: 開けないリンクの失敗が通知欄へ出る（#1432）",
                     );
                 }
 

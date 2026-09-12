@@ -137,6 +137,15 @@ pub fn card_dismiss_hint() -> &'static str {
 pub fn window_title() -> &'static str {
     tr!("tako のアップデート", "tako Update")
 }
+
+/// リリースノート内のリンクを開けなかったときに通知欄へ出す**操作名**（#1432）。
+///
+/// ⌘+クリックは以前 `eprintln!` 止まりで、http / https 以外のリンク
+/// （相対パス・`mailto:`・`javascript:`）を押すと**何も起きない**ように見えた。
+/// 理由そのものは `tako_core::url_guard::UrlBlocked::as_str()` が正本（URL を含まない）
+pub fn op_open_link() -> &'static str {
+    tr!("リンクを開く", "Open link")
+}
 pub fn section_current() -> &'static str {
     tr!("現在のバージョン", "Current version")
 }
@@ -221,6 +230,7 @@ mod tests {
         tests_support::check_ja_en(|| {
             vec![
                 banner_both().to_string(),
+                op_open_link().to_string(),
                 banner_stable("1.0.0"),
                 banner_test("1.0.1"),
                 test_warning("1.0.1"),
