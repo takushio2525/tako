@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-12（#1417: 右パネル・プレビューの失敗も同じ通知欄へ出した）
-- #1399 の番犬が `KNOWN_DISCARDED` に残していた同型 3 件（`right_panel.rs:TmuxSelectWindow` / `preview_render.rs:PreviewOutline` / `PreviewView`）を同じ 1 実装へ寄せた。出し口は `notify_tree_failure` → **`notify_ui_failure(area, ..)`** へ改名し、画面は `sidebar::NoticeArea`（persist.log の `area=` と A/B の逃げ道の選択）だけで区別する（3 実装目を作らない）。クリックの中身は `render` のクロージャから名前付きハンドラ 3 本へ切り出した（合成マウスが届かないのでセルフテストが叩ける名前が要る）
-- 隔離 GUI（tako-vd）セルフテスト項目 84c の A/B: 新 = `win="window 切替 に失敗しました（9999:gone）: ペイン 3 に tmux セッションがない…"` / `outline="目次へ移動 に失敗しました（存在しない見出し）: …"` / `page="ページ移動 に失敗しました（ページ 999）: …"` / 上書き・閉じた直後の再失敗・成功時無言すべて取得 → 完走（`TAKO_APP_SELF_TEST_OK`）。legacy（`TAKO_1417_LEGACY=1`）は 3 つとも `None` で **FAILED**。persist.log は `area=right_panel op=window 切替 分類=operation` の形（本文は載せない）
-- 番犬 9 本（`KNOWN_DISCARDED` は空・新規 1 本が別画面の 1 実装と直呼び増殖を縛る）。注入 7 通りで file:line 名指し FAILED（`right_panel.rs:231` / `preview_render.rs:448` / `:475` / `right_panel.rs:245`）。走査窓が隣の関数へ食い込む穴を `fn_body` で塞いだ（#1399 が踏んだのと同型）
-
 ## 2026-09-12（#1420: 番犬の走査範囲が途中の `#[cfg(test)]` で切れるのを直した）
 - 範囲取りを「最初の `#[cfg(test)]` で切る」から「**テスト領域だけ空白へ潰す**」1 実装（`common/production_range.rs`）へ。バイト長と行番号が保たれるので `file:line` がずれず、途中のテスト用ヘルパでも本番コードが消えない。下限（既定 30%）を割ったら潰した先頭の領域を名指して落ちる
 - 実測 A/B: `remote.rs` の検査対象の**後ろ**へ 4 行のヘルパを注入すると legacy は 5,903 → 3,124 行（70.7% → 37.1%）へ縮んで **7 本とも緑のまま**・**手前**へ注入すると「改名したら番犬も直す」で 6 本 FAILED（誤診）。新は両方 8 本緑・本番 70.7% を維持。縮める注入では `remote.rs:1505 走査範囲が全体の 18.3% まで縮んだ（下限 30.0%）` で FAILED
@@ -59,3 +54,8 @@
 - 組み立てを「`roots` の順 → `expanded` の未出（名前順）」の 1 実装へ（`Vec::dedup` は隣接しか落とさず `expanded` は `HashSet` = 順序が任意なので、全ルートが 2 回ずつ `read_dir` されていた）。外れたルートは `forget_under` で**配下ごと**忘れる（生きているルートの下は巻き込まない = 入れ子のルート）。事実と違う注釈も実態へ
 - 隔離 GUI（tako-vd）の項目 135 を「ユニーク化 + 展開ディレクトリの存在」へ書き換え: 新 = 完走 / `TAKO_1404_LEGACY=1` = `targets=5 uniq=3` で FAILED / 展開 0 件の注入 = `targets=2 uniq=2 extra=[]` で FAILED（旧 assert `targets.len() > git_roots.len()` は重複だけで常に真 = 検出力ゼロだった）
 - 単体 5 本（legacy で 4 本 FAILED・`rows` 不変の 1 本は両腕で緑）+ 番犬 3 本（注入 6 通りで file:line 名指し）。workspace 4579 passed 0 failed・clippy 両宇宙 0・check-windows error 0。**install 要**
+
+## 2026-09-12（#1426: 裏タブの寸法合わせを毎フレームから key + 間引きへ寄せた）
+- `sync_offscreen_pane_sizes` は render から毎フレーム通るのに、当て直す中身（`offscreen_areas`）が既に「key + 2 秒」で回っていたので**材料が同じあいだは同じ答えを出し直していた**。当て直す側も同じ単位へ寄せ、キーは `OffscreenAreaKey`（1 実装 `offscreen_area_key` に集約）+ 既定セル寸法（#647 の再発防止）+ 表示中ペイン数 + ペイン単位ズームの指紋。間隔は `OFFSCREEN_REFRESH_INTERVAL` の 1 定数を両者が見る
+- 実測（隔離 GUI の grid-bench・22 ペイン / 表示 4・3000 フレーム）: 596〜776 ns/frame（`render` の 5.88〜6.28%・走査 82 比較 + 18 ペイン当て直し）→ **36〜38 ns/frame**（0.38〜0.41%・走査 0 / 当て直し 0）。同一バイナリの `TAKO_1426_LEGACY=1` は 645〜690 ns で旧挙動を再現。#932 の flicker ラウンドは `late_resize=false` で緑、既存 A/B（`TAKO_932_NO_OFFSCREEN_GEOMETRY=1`）では `late_resize=true` で落ちる = 検出力あり
+- 単体 7 本 + 番犬 `issue1426_offscreen_sync_watchdog` 8 本（注入 8 通りで `main.rs:16126` / `:16158` / `:16238` / `:16245` / `:1330` / `:1344` を file:line 名指し）。範囲取りは #1420 の `production_range` の 1 実装を通す。workspace 4551 passed 0 failed・clippy 両宇宙 0・check-windows error 0・隔離セルフテスト完走。**install 要**

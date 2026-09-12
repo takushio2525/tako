@@ -1303,6 +1303,63 @@ fn grid_cells(area: Size<Pixels>, cell: Size<Pixels>) -> (usize, usize) {
 /// (コンテンツ矩形, タブ数, 端末数, stale バナー数, カードの有無, 拡大率のビット列)
 type OffscreenAreaKey = (Bounds<Pixels>, usize, usize, usize, bool, u32);
 
+/// 裏タブの寸法合わせをやり直す間隔（#932 / #1426）。
+///
+/// 領域の割り出し（[`TakoApp::refresh_offscreen_pane_areas`]）と、その領域を PTY へ
+/// 当て直す側（[`TakoApp::sync_offscreen_pane_sizes`]）が**同じ間隔**で回る。
+/// 材料に現れない変化（分割比の変更など）はこの保険で拾うので、当て直す側だけを
+/// 短くしても「割り出し済みの古い領域」を撃ち直すだけで意味が無い
+const OFFSCREEN_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// [`TakoApp::sync_offscreen_pane_sizes`] をやり直す条件（#1426）。
+///
+/// [`OffscreenAreaKey`]（= 割り出す領域が変わる材料）に、**当て直す cols/rows** を
+/// 変えうる残りの材料を足したもの:
+/// (領域キー, 既定セル幅のビット列, 既定セル高のビット列, 表示中ペイン数, ペイン単位ズームの指紋)
+///
+/// セル寸法を入れるのが要点。#647 は「フォントサイズを変えると裏タブが取り残される」
+/// 話なので、ここが抜けると間引きがそのまま #647 の再発になる
+type OffscreenSyncKey = (OffscreenAreaKey, u32, u32, usize, u64);
+
+/// ペイン単位ズーム（`pane_font_sizes`）の指紋（#1426）。順序に依らない XOR 畳み込み。
+///
+/// **値まで見る**（同じペインを続けてズームすると要素数は変わらない）。
+/// 1 要素は id と値を**掛けて混ぜてから**畳む: `id ^ 値` のように線形に足すと、
+/// 2 ペインで値を入れ替えたときに同じ指紋になる（実測で単体テストが落ちた）。
+/// オーバーライドは普通 0 件なので、毎フレーム畳んでもほぼ無料
+fn pane_font_fingerprint(sizes: &HashMap<PaneId, f32>) -> u64 {
+    sizes.iter().fold(0u64, |acc, (id, size)| {
+        let mut h = id.as_u64().wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h ^= u64::from(size.to_bits());
+        h = h.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+        acc ^ (h ^ (h >> 29))
+    })
+}
+
+/// 裏タブの寸法合わせ（[`TakoApp::sync_offscreen_pane_sizes`]）を飛ばしてよいか（#1426）。
+///
+/// 材料が 1 つでも変われば必ず回す。変わっていなくても
+/// [`OFFSCREEN_REFRESH_INTERVAL`] を過ぎたら回す（材料に現れない変化の保険）。
+/// `legacy` が真なら**毎フレーム回す**（#1426 前の挙動 = A/B の逃げ道）
+fn offscreen_sync_can_skip(
+    legacy: bool,
+    last: Option<&OffscreenSyncKey>,
+    key: &OffscreenSyncKey,
+    since_last: Duration,
+) -> bool {
+    !legacy && since_last < OFFSCREEN_REFRESH_INTERVAL && last == Some(key)
+}
+
+/// 裏タブの寸法合わせを**毎フレーム**やっていた頃（#1426 の前）へ戻す逃げ道
+/// （`TAKO_1426_LEGACY=1`）。
+///
+/// 間引きが回帰（= 表に出した瞬間のリサイズ = #932 / #647 の症状）を隠していないことを、
+/// 同じバイナリで確かめるために置く
+fn offscreen_sync_legacy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TAKO_1426_LEGACY").is_some())
+}
+
 /// 裏タブのペインを「表に出たときの寸法」へ合わせるのを切って、同じバイナリで
 /// A/B を取る逃げ道（`TAKO_932_NO_OFFSCREEN_GEOMETRY=1`）。
 ///
@@ -1560,6 +1617,11 @@ struct TakoApp {
     pane_area_metrics: Option<PaneWidthMetrics>,
     /// `offscreen_areas` を最後に作り直した時刻（取りこぼしの保険。#932）
     offscreen_areas_at: std::time::Instant,
+    /// `sync_offscreen_pane_sizes` を最後に通したときの材料（#1426）。
+    /// これが同じあいだは走査もリサイズの当て直しも要らない
+    offscreen_sync: Option<OffscreenSyncKey>,
+    /// `sync_offscreen_pane_sizes` を最後に通した時刻（取りこぼしの保険。#1426）
+    offscreen_sync_at: std::time::Instant,
     /// ペインを並べるコンテナ（絶対配置ペインの containing block）の実描画矩形。
     /// ウィンドウ単位（#339 の複数ウィンドウは同一 entity を共有するためキーが要る）。
     /// #684: ここが「正」。詳細は `PaneContentGeometry`
@@ -3630,6 +3692,8 @@ impl TakoApp {
             offscreen_areas: None,
             pane_area_metrics: None,
             offscreen_areas_at: std::time::Instant::now(),
+            offscreen_sync: None,
+            offscreen_sync_at: std::time::Instant::now(),
             pane_content: HashMap::new(),
             flicker_inject_frames: 0,
             pane_text_area_probes: HashMap::new(),
@@ -16075,8 +16139,31 @@ impl TakoApp {
                 cell_width: cell_w,
             })
         };
-        // 表示中でないターミナルペイン。これが空なら（= 単一タブ運用）何もしない。
-        // render は毎フレーム通るので、ここから先の計算は必要なときだけ行う
+        // #1426: ここから下は render から毎フレーム通るのに、**材料が同じあいだは
+        // 毎回まったく同じ答えを出し直している**（22 ペイン / 表示 4 で 1 フレームあたり
+        // Vec 1 確保 + 約 88 比較 + 18 ペイン分の当て直し = 実測 0.6〜0.78µs）。
+        // 当て直せる中身は `offscreen_areas` が持っていて、そちらは既に
+        // 「key + 2 秒」で回っているので、**当て直す側も同じ単位で間引く**
+        let scale_factor = window.scale_factor();
+        let default_cell = self.measure_cell(window);
+        let key: OffscreenSyncKey = (
+            self.offscreen_area_key(content, scale_factor),
+            f32::from(default_cell.width).to_bits(),
+            f32::from(default_cell.height).to_bits(),
+            self.pane_text_areas.len(),
+            pane_font_fingerprint(&self.pane_font_sizes),
+        );
+        if offscreen_sync_can_skip(
+            offscreen_sync_legacy(),
+            self.offscreen_sync.as_ref(),
+            &key,
+            self.offscreen_sync_at.elapsed(),
+        ) {
+            return;
+        }
+        self.offscreen_sync = Some(key);
+        self.offscreen_sync_at = std::time::Instant::now();
+        // 表示中でないターミナルペイン。これが空なら（= 単一タブ運用）何もしない
         let offscreen: Vec<PaneId> = self
             .terminals
             .keys()
@@ -16086,8 +16173,6 @@ impl TakoApp {
         if offscreen.is_empty() {
             return;
         }
-        let scale_factor = window.scale_factor();
-        let default_cell = self.measure_cell(window);
         // #932: 「表に出たときの領域」を**表示中とまったく同じ会計**で割り出しておく
         self.refresh_offscreen_pane_areas(content, scale_factor, default_cell);
         for pane_id in offscreen {
@@ -16126,6 +16211,19 @@ impl TakoApp {
         }
     }
 
+    /// 非表示ペインの領域を割り出す材料（#932）。**当て直す側（#1426）と同じ 1 実装**を
+    /// 通す（片方だけ材料が増えると「割り出したのに当て直さない」frame が生まれる）
+    fn offscreen_area_key(&self, content: Bounds<Pixels>, scale_factor: f32) -> OffscreenAreaKey {
+        (
+            content,
+            self.workspace.tabs().len(),
+            self.terminals.len(),
+            self.stale_binary_banners.len(),
+            !self.command_cards.is_empty(),
+            scale_factor.to_bits(),
+        )
+    }
+
     /// どのウィンドウでも表示されていないタブのペインについて、**表示されたときの**
     /// テキスト領域を割り出す（#647 / #932）。
     ///
@@ -16134,7 +16232,8 @@ impl TakoApp {
     /// ここを簡略化すると割り出した寸法と表示時の寸法が食い違い、
     /// 表に出した瞬間に改めてリサイズが走る（= #932 の症状が戻る）。
     ///
-    /// 毎フレーム作り直す必要は無いので、材料が変わったときと 2 秒に 1 回だけ回す
+    /// 毎フレーム作り直す必要は無いので、材料が変わったときと
+    /// [`OFFSCREEN_REFRESH_INTERVAL`] に 1 回だけ回す
     /// （分割比の変更のように材料に現れない変化を取りこぼさないための保険）
     fn refresh_offscreen_pane_areas(
         &mut self,
@@ -16142,15 +16241,8 @@ impl TakoApp {
         scale_factor: f32,
         default_cell: Size<Pixels>,
     ) {
-        let key: OffscreenAreaKey = (
-            content,
-            self.workspace.tabs().len(),
-            self.terminals.len(),
-            self.stale_binary_banners.len(),
-            !self.command_cards.is_empty(),
-            scale_factor.to_bits(),
-        );
-        let fresh = self.offscreen_areas_at.elapsed() < Duration::from_secs(2);
+        let key: OffscreenAreaKey = self.offscreen_area_key(content, scale_factor);
+        let fresh = self.offscreen_areas_at.elapsed() < OFFSCREEN_REFRESH_INTERVAL;
         if fresh
             && self
                 .offscreen_areas
@@ -68701,6 +68793,169 @@ mod grid_cells_tests {
             cell,
         );
         assert_ne!(with_banner, without);
+    }
+}
+
+/// #1426: 裏タブの寸法合わせを毎フレームやらないための間引き条件。
+///
+/// 実測（隔離 GUI の grid-bench・22 ペイン / 表示 4）では、この関数が無いと
+/// 1 フレームあたり 0.60〜0.78µs（`TakoApp::render` の 5.9〜6.2%）を、
+/// **毎フレームまったく同じ答えを出し直す**ために払っていた。
+///
+/// 間引きが #932 / #647 の回帰（= 表に出した瞬間のリサイズ）を隠さないことを
+/// ここで固定する。実挙動は visual-test の flicker ラウンドが実フレームで見る
+#[cfg(test)]
+mod offscreen_sync_tests {
+    use super::{
+        offscreen_sync_can_skip, pane_font_fingerprint, OffscreenSyncKey,
+        OFFSCREEN_REFRESH_INTERVAL,
+    };
+    use gpui::{point, px, size, Bounds};
+    use std::collections::HashMap;
+    use std::time::Duration;
+    use tako_core::PaneId;
+
+    /// (コンテンツ矩形, タブ数, 端末数, バナー数, カードの有無, 拡大率) + #1426 の追加分
+    fn key() -> OffscreenSyncKey {
+        (
+            (
+                Bounds::new(point(px(240.0), px(76.0)), size(px(1200.0), px(800.0))),
+                7,
+                22,
+                0,
+                false,
+                2.0f32.to_bits(),
+            ),
+            8.0f32.to_bits(),
+            17.0f32.to_bits(),
+            4,
+            0,
+        )
+    }
+
+    #[test]
+    fn 材料が同じで間隔内なら飛ばす() {
+        let k = key();
+        assert!(offscreen_sync_can_skip(
+            false,
+            Some(&k),
+            &k,
+            Duration::from_millis(16)
+        ));
+    }
+
+    #[test]
+    fn 初回は飛ばさない() {
+        let k = key();
+        assert!(!offscreen_sync_can_skip(
+            false,
+            None,
+            &k,
+            Duration::from_millis(16)
+        ));
+    }
+
+    #[test]
+    fn 間隔を過ぎたら材料が同じでも回す() {
+        // 分割比の変更のように材料に現れない変化を取りこぼさないための保険（#932 と同じ）
+        let k = key();
+        assert!(!offscreen_sync_can_skip(
+            false,
+            Some(&k),
+            &k,
+            OFFSCREEN_REFRESH_INTERVAL
+        ));
+    }
+
+    #[test]
+    fn legacyアームは毎フレーム回す() {
+        let k = key();
+        assert!(!offscreen_sync_can_skip(
+            true,
+            Some(&k),
+            &k,
+            Duration::from_millis(1)
+        ));
+    }
+
+    /// #647 の再発防止。セル寸法（= テーマのフォントサイズ）が key から抜けると、
+    /// フォントを変えても裏タブが最大 2 秒間そのまま = #647 そのもの
+    #[test]
+    fn セル寸法が変われば材料が変わる() {
+        let a = key();
+        let mut b = a;
+        b.1 = 12.0f32.to_bits();
+        assert!(!offscreen_sync_can_skip(
+            false,
+            Some(&a),
+            &b,
+            Duration::from_millis(16)
+        ));
+        let mut c = a;
+        c.2 = 28.0f32.to_bits();
+        assert!(!offscreen_sync_can_skip(
+            false,
+            Some(&a),
+            &c,
+            Duration::from_millis(16)
+        ));
+    }
+
+    #[test]
+    fn ウィンドウ寸法や端末数が変われば材料が変わる() {
+        let a = key();
+        // #932: 裏に居るあいだにウィンドウ寸法が変わる → 次のフレームで当て直す
+        let mut resized = a;
+        resized.0 .0 = Bounds::new(point(px(240.0), px(76.0)), size(px(980.0), px(660.0)));
+        assert!(!offscreen_sync_can_skip(
+            false,
+            Some(&a),
+            &resized,
+            Duration::from_millis(16)
+        ));
+        // 裏タブでペインが増えた（split）
+        let mut split = a;
+        split.0 .2 = 23;
+        assert!(!offscreen_sync_can_skip(
+            false,
+            Some(&a),
+            &split,
+            Duration::from_millis(16)
+        ));
+        // 表示中のペイン数が変わった（= 裏に回る集合が変わる）
+        let mut shown = a;
+        shown.3 = 3;
+        assert!(!offscreen_sync_can_skip(
+            false,
+            Some(&a),
+            &shown,
+            Duration::from_millis(16)
+        ));
+    }
+
+    #[test]
+    fn ペイン単位ズームは要素数が同じでも指紋が変わる() {
+        let mut sizes: HashMap<PaneId, f32> = HashMap::new();
+        assert_eq!(pane_font_fingerprint(&sizes), 0);
+        sizes.insert(PaneId::from_raw(3), 13.0);
+        let one = pane_font_fingerprint(&sizes);
+        assert_ne!(one, 0);
+        // 同じペインをもう一段ズーム（要素数は 1 のまま）
+        sizes.insert(PaneId::from_raw(3), 14.0);
+        assert_ne!(pane_font_fingerprint(&sizes), one, "値の変化を取りこぼした");
+        // 順序に依らない（HashMap の走査順は不定）
+        let mut a: HashMap<PaneId, f32> = HashMap::new();
+        a.insert(PaneId::from_raw(1), 11.0);
+        a.insert(PaneId::from_raw(2), 19.0);
+        let mut b: HashMap<PaneId, f32> = HashMap::new();
+        b.insert(PaneId::from_raw(2), 19.0);
+        b.insert(PaneId::from_raw(1), 11.0);
+        assert_eq!(pane_font_fingerprint(&a), pane_font_fingerprint(&b));
+        // ペインが違えば別の指紋（同じ値でも打ち消し合わない）
+        let mut c: HashMap<PaneId, f32> = HashMap::new();
+        c.insert(PaneId::from_raw(1), 19.0);
+        c.insert(PaneId::from_raw(2), 11.0);
+        assert_ne!(pane_font_fingerprint(&a), pane_font_fingerprint(&c));
     }
 }
 
