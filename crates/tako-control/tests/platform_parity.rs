@@ -12,6 +12,11 @@ use std::path::{Path, PathBuf};
 use tako_control::mcp;
 use tako_core::platform::support::{Support, MATRIX};
 
+// 本番コードの範囲取りは 1 実装（#1420）。**切らずにテスト領域だけを潰す**ので、
+// ファイル途中のテスト用ヘルパで走査範囲が消えない
+#[path = "common/production_range.rs"]
+mod production_range;
+
 /// リポジトリルート（`crates/tako-control` から 2 つ上）
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -402,10 +407,9 @@ fn ゴミ箱移動が完全削除へ劣化していない() {
     let src = std::fs::read_to_string(&path).expect("境界 B8 の実装本体を読める");
 
     // 走査対象は実装だけ（テストは後始末で remove_file を使う）。
-    // 目印が無くなったら「走査範囲が空 = いつでも通る」になるので先に落とす
-    let (impl_src, _) = src
-        .split_once("#[cfg(test)]")
-        .expect("os_integration.rs に #[cfg(test)] の目印がある");
+    // 範囲が空・想定より縮んだら `production` 自身が file:line で落とす（#1420）
+    let impl_src =
+        production_range::production(&src, "crates/tako-control/src/platform/os_integration.rs");
 
     // 走査先を間違えていないこと（ファイル移動・改名で空振りするのを防ぐ）
     assert!(
@@ -749,12 +753,17 @@ fn シェル片の子プロセス実行がposixシェルの直起動へ戻って
     }
 }
 
-/// ソースの「テストより前」= production 部分。
+/// ソースの production 部分（`#[cfg(test)]` の付いた item を空白へ潰した眺め）。
 ///
-/// `#[cfg(test)]` より後ろは対象外にする（テストは意図的に POSIX 限定のシェルを
-/// 起こすものがある: シェル関数との一致検査・macOS 専用のモックテスト・tmux の e2e）
-fn production_region(src: &str) -> &str {
-    src.split_once("#[cfg(test)]").map_or(src, |(head, _)| head)
+/// テストは対象外にする（意図的に POSIX 限定のシェルを起こすものがある:
+/// シェル関数との一致検査・macOS 専用のモックテスト・tmux の e2e）。
+///
+/// **切らない**理由は #1420: 「最初の `#[cfg(test)]` まで」で切ると、テスト用ヘルパが
+/// 1 つ途中にあるだけで残り全部が視界から消える。ここは 4 クレートの `src` を丸ごと
+/// 走査するので影響が大きく、実測では `orchestrator/mod.rs` が 1.5%・`mcp/mod.rs` が
+/// 10.5% しか見えていなかった。下限判定は使わない（小さいファイルも走査対象のため）
+fn production_region(src: &str) -> String {
+    production_range::scan(src).text
 }
 
 /// production 部分だけを走査してパターンに当たる行を集める（コメント行は無視）

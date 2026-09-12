@@ -31,6 +31,11 @@
 
 use std::path::{Path, PathBuf};
 
+// 本番コードの範囲取りは 1 実装（#1420）。**切らずにテスト領域だけを潰す**ので、
+// ファイル途中のテスト用ヘルパで走査範囲が消えない
+#[path = "common/production_range.rs"]
+mod production_range;
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -53,17 +58,10 @@ const MD_LINKS: &str = "crates/tako-core/src/md_links.rs";
 /// どちらの綴りも「規則を通した」証拠なので、部分一致で見る
 const CHECK: &str = "browser_url";
 
-/// 本番コード（最初の `#[cfg(test)]` より前）だけを返す。
-/// 目印が消えたら「走査範囲が空 = いつでも通る」になるので先に落とす
+/// 本番コード（`#[cfg(test)]` の付いた item を空白へ潰した眺め）だけを返す。
+/// 切らない理由と「黙って縮んだ」の検出は `common/production_range.rs`（#1420）
 fn production(rel: &str) -> String {
-    let src = read(rel);
-    let cut = src.find("\n#[cfg(test)]").unwrap_or(src.len());
-    let body = src[..cut].to_string();
-    assert!(
-        body.len() > 100,
-        "{rel}: 走査範囲が空（`#[cfg(test)]` の位置が変わった?）"
-    );
-    body
+    production_range::production(&read(rel), rel)
 }
 
 /// 関数 1 本の本文（シグネチャ行から同インデントの `}` まで）。

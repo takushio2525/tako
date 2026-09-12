@@ -17,6 +17,11 @@ use tako_core::agent_resume::restore_support;
 use tako_core::agent_support::{keys, supports, Agent};
 use tako_core::platform::support::Platform;
 
+// 本番コードの範囲取りは 1 実装（#1420）。**切らずにテスト領域だけを潰す**ので、
+// ファイル途中のテスト用ヘルパで走査範囲が消えない
+#[path = "common/production_range.rs"]
+mod production_range;
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -39,12 +44,10 @@ fn code_lines(source: &str) -> Vec<(usize, &str)> {
         .collect()
 }
 
-/// `#[cfg(test)]` 以降（テストは期待値としてコマンド文字列を書くので走査対象外）
+/// テスト領域（期待値としてコマンド文字列を書くので走査対象外）を空白へ潰した眺め。
+/// 切らない理由と「黙って縮んだ」の検出は `common/production_range.rs`（#1420）
 fn without_tests(source: &str) -> String {
-    match source.find("\n#[cfg(test)]\n") {
-        Some(i) => source[..i].to_string(),
-        None => source.to_string(),
-    }
+    production_range::scan(source).text
 }
 
 const MAIN: &str = "crates/tako-app/src/main.rs";

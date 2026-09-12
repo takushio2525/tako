@@ -32,6 +32,11 @@
 
 use std::path::{Path, PathBuf};
 
+// 本番コードの範囲取りは 1 実装（#1420）。**切らずにテスト領域だけを潰す**ので、
+// ファイル途中のテスト用ヘルパで走査範囲が消えない
+#[path = "common/production_range.rs"]
+mod production_range;
+
 const REMOTE: &str = "crates/tako-control/src/remote.rs";
 
 fn repo_root() -> PathBuf {
@@ -41,19 +46,17 @@ fn repo_root() -> PathBuf {
         .expect("リポジトリルート")
 }
 
-/// 本番コード（最初の `#[cfg(test)]` より前）だけを返す。
-/// 走査範囲が空になったら「いつでも通る」ので先に落とす
+/// 本番コード（`#[cfg(test)]` の付いた item を空白へ潰した眺め）を返す。
+///
+/// **切らない**理由は #1420: 旧実装は「最初の `#[cfg(test)]` まで」で切っていたので、
+/// `remote.rs` の途中にテスト用ヘルパを 1 つ置いただけで走査範囲が 3,124 行へ縮み、
+/// 検査対象を見失ったまま**緑のまま通った**（実測）。潰す形なら消えるのはヘルパだけで、
+/// 範囲が想定より縮んだら [`production_range::production`] 自身が `file:line` で落ちる
 fn production(rel: &str) -> String {
     let path = repo_root().join(rel);
     let src = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("{} を読めない: {e}", path.display()));
-    let cut = src.find("\n#[cfg(test)]").unwrap_or(src.len());
-    let body = src[..cut].to_string();
-    assert!(
-        body.len() > 1000,
-        "{rel}: 走査範囲が空（`#[cfg(test)]` の位置が変わった?）"
-    );
-    body
+    production_range::production(&src, rel)
 }
 
 /// 関数 1 本の本文（シグネチャ行から同インデントの `}` まで）。
@@ -205,6 +208,44 @@ fn 中止の文言は1実装から組む() {
     assert!(
         dbody.contains("pid_identity_refusal"),
         "{REMOTE}:{dline} 正規経路の中止文言が共通の前置きを通っていない（#329）"
+    );
+}
+
+/// 走査範囲が本番コード全体を覆っていること（#1420）。
+///
+/// 旧実装は「最初の `#[cfg(test)]` まで」で切っていたので、`remote.rs` の途中に
+/// テスト用ヘルパを 1 つ置くと検査対象を見失った。**しかも落ち方が
+/// 「`fn kill_stale_daemon(` が見つからない（改名したら番犬も直す）」**なので、
+/// 読んだ人は改名を疑ってヘルパの側を避けてしまう（#1403 で実際にそうなった）。
+/// 検査対象の直前へヘルパを注入して、6 本が同じ結論へ届くことを固定する
+#[test]
+fn 途中のテスト用ヘルパで走査範囲が消えない() {
+    let src = std::fs::read_to_string(repo_root().join(REMOTE)).expect("remote.rs を読む");
+    let at = src
+        .find("\nfn kill_stale_daemon(")
+        .expect("注入点（検査対象の直前）が見つからない");
+    let injected = format!(
+        "{}\n#[cfg(test)]\nfn 注入したテスト用ヘルパ() -> u32 {{\n    0\n}}\n{}",
+        &src[..at],
+        &src[at..]
+    );
+
+    // 新実装: ヘルパだけが消え、検査は全部届く
+    let view = production_range::production(&injected, REMOTE);
+    check_kill_stale_daemon(&view, REMOTE);
+    check_call_site(&view, REMOTE);
+    assert!(
+        !view.contains("注入したテスト用ヘルパ"),
+        "テスト用ヘルパが走査範囲に残っている"
+    );
+
+    // 旧アーム: 同じ入力で見失うこと（測れないなら この回帰テストに意味が無い）
+    // 目印は切り出しと**同じ行**に置く（#1420 の番犬は行単位で見る）
+    let cut = injected.find("\n#[cfg(test)]"); // #1420-legacy-arm
+    let legacy_cut = cut.expect("旧実装の切れ目");
+    assert!(
+        !injected[..legacy_cut].contains("\nfn kill_stale_daemon("),
+        "旧実装が見失う形になっていない = A/B が成立していない"
     );
 }
 

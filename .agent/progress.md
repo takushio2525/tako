@@ -20,16 +20,6 @@
 
 ---
 
-## 2026-09-12（#1400: ssh config の Match の設定が直前の Host へ混入して宛先が化けるのを直した）
-- 状態を `Section` の 2 値へ（`Match` / `Include` のあとは「どの Host にも属さない位置」）。キーワードは行頭の最初のトークンで切る（`Match exec "test -f a=b"` で検知が抜けていた）。複数パターンは全部エントリ・`Include` は `~/.ssh/` 起点 + glob + 深さ 16 + 循環検出つきで解決し、読めない理由は `warnings` へ返す
-- 隔離 GUI（tako-vd・fixture HOME）で `tako ssh-hosts` の A/B: 修正前は `web1` と `prod(user=root port=2222)` の 2 件、修正後は `edge` / `inner`（Include 配下）/ `web1` / `web2` / `prod(user=null port=null)` の 5 件
-- 番犬 `issue1400_ssh_config_watchdog` 7 本。注入 2 通りで file:line 名指し FAILED（`ssh_config.rs:175` ×2 / `:190`）。#1004 の `guides/remote.md`「Include は読まない」も同一 PR で実態へ寄せた
-
-## 2026-09-12（#1399: ファイルツリーのローカル操作の失敗を共有の通知欄へ出した）
-- ローカル行の 13 か所が dispatch の結果を `let _ =` / `if result.is_ok()` / `eprintln!` で捨てていて、**ごみ箱移動・リネームが無言で失敗**していた（同じサイドバーのリモート行は #919 から通知欄へ出していた = 1 画面に 2 方針）。出し口を `sidebar::notify_tree_failure` の 1 実装へ寄せ、リモート行と同じ `set_remote_notice` + persist.log（載せるのは操作名と `DispatchError::class()` の分類だけ）へ通した。`commit_inline_edit` の先頭 `take()` をやめ、**失敗時は入力欄と打った名前を残す**
-- 隔離 GUI（tako-vd）セルフテスト項目 84b の A/B: 新 = `trash="削除 に失敗しました（<fixture>/gone.txt）: パスが存在しない…"` / `rename="名前変更 に失敗しました（taken.txt）: 既に存在する…"` / `kept="taken.txt"` / 成功時は無言・連続失敗は最後の 1 件が残る → 完走（`TAKO_APP_SELF_TEST_OK`・FAILED 0）。legacy（`TAKO_1399_LEGACY=1`）は `trash=None rename=None kept=None` で **FAILED**
-- 番犬 `issue1399_tree_notice_watchdog` 8 本（UI モジュールの dispatch 走査 + `eprintln!` + 1 実装 + `take()` + 分類 + 検出力）。修正前ソースで 6/7 が file:line 名指し FAILED（`sidebar.rs:1540/1570/1613/1630/1646/1659/1705/1718/1732/1740/1971/2014/2019`）。別画面の同型 3 件は `KNOWN_DISCARDED` で段階導入
-
 ## 2026-09-12（#1411: tako 自身が開いた SSH ペインを自分の自動検知が見送るのを直した）
 - 物差しを「ポートが 22 か」から「**宛先の名前だけでそのポートへ行けるか**」へ（`ConfiguredPorts` = `~/.ssh/config` の `Port`・判断は `port_reachable_by_name` の 1 箇所・材料は `scan` が走る tick だけ読む）。tako の `-p` は config の書き写しなので全部この側に入り、手打ちの `-p`（config に無い）と `-F <別 config>` は従来どおり見送る
 - 同じ症状の 2 つ目の原因を同時に直した: tako の `-o ControlPath="…"` は macOS 既定 data_dir に空白があるので `ps` の 1 行が割れ、**続きの語が宛先に見えて** `RemoteCommand` で見送られていた（ポートが 22 でも起きる）。隔離 GUI + 使い捨て sshd の A/B（`TAKO_1411_LEGACY=1`）で legacy = `sessions:[]`（空白あり data dir は `RemoteCommand`・空白なしは Issue と同じ `PortOverride`）→ 新 = pane が `sessions` に `live` で載り、手打ちの `-p` だけが `PortOverride` で残る
@@ -59,3 +49,8 @@
 - #1399 の番犬が `KNOWN_DISCARDED` に残していた同型 3 件（`right_panel.rs:TmuxSelectWindow` / `preview_render.rs:PreviewOutline` / `PreviewView`）を同じ 1 実装へ寄せた。出し口は `notify_tree_failure` → **`notify_ui_failure(area, ..)`** へ改名し、画面は `sidebar::NoticeArea`（persist.log の `area=` と A/B の逃げ道の選択）だけで区別する（3 実装目を作らない）。クリックの中身は `render` のクロージャから名前付きハンドラ 3 本へ切り出した（合成マウスが届かないのでセルフテストが叩ける名前が要る）
 - 隔離 GUI（tako-vd）セルフテスト項目 84c の A/B: 新 = `win="window 切替 に失敗しました（9999:gone）: ペイン 3 に tmux セッションがない…"` / `outline="目次へ移動 に失敗しました（存在しない見出し）: …"` / `page="ページ移動 に失敗しました（ページ 999）: …"` / 上書き・閉じた直後の再失敗・成功時無言すべて取得 → 完走（`TAKO_APP_SELF_TEST_OK`）。legacy（`TAKO_1417_LEGACY=1`）は 3 つとも `None` で **FAILED**。persist.log は `area=right_panel op=window 切替 分類=operation` の形（本文は載せない）
 - 番犬 9 本（`KNOWN_DISCARDED` は空・新規 1 本が別画面の 1 実装と直呼び増殖を縛る）。注入 7 通りで file:line 名指し FAILED（`right_panel.rs:231` / `preview_render.rs:448` / `:475` / `right_panel.rs:245`）。走査窓が隣の関数へ食い込む穴を `fn_body` で塞いだ（#1399 が踏んだのと同型）
+
+## 2026-09-12（#1420: 番犬の走査範囲が途中の `#[cfg(test)]` で切れるのを直した）
+- 範囲取りを「最初の `#[cfg(test)]` で切る」から「**テスト領域だけ空白へ潰す**」1 実装（`common/production_range.rs`）へ。バイト長と行番号が保たれるので `file:line` がずれず、途中のテスト用ヘルパでも本番コードが消えない。下限（既定 30%）を割ったら潰した先頭の領域を名指して落ちる
+- 実測 A/B: `remote.rs` の検査対象の**後ろ**へ 4 行のヘルパを注入すると legacy は 5,903 → 3,124 行（70.7% → 37.1%）へ縮んで **7 本とも緑のまま**・**手前**へ注入すると「改名したら番犬も直す」で 6 本 FAILED（誤診）。新は両方 8 本緑・本番 70.7% を維持。縮める注入では `remote.rs:1505 走査範囲が全体の 18.3% まで縮んだ（下限 30.0%）` で FAILED
+- 棚卸しで 8 本を寄せた（`platform_parity` は 4 クレートの src を丸ごと走査していて `orchestrator/mod.rs` を 1.5%・`mcp/mod.rs` を 10.5% しか見ていなかった）。番犬 `issue1420_production_range_watchdog` 12 本 + 実ファイル 254 本の不変条件。寄せられない 4 件（製品コード内の番犬）は `KNOWN_COARSE` へ件数つきで宣言。**テストのみ = install 不要**

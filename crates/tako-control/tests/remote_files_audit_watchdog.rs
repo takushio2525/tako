@@ -14,6 +14,11 @@
 
 use std::path::{Path, PathBuf};
 
+// 本番コードの範囲取りは 1 実装（#1420）。**切らずにテスト領域だけを潰す**ので、
+// ファイル途中のテスト用ヘルパで走査範囲が消えない
+#[path = "common/production_range.rs"]
+mod production_range;
+
 fn remote_files_source() -> String {
     let path: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("src")
@@ -29,12 +34,10 @@ fn without_comments(src: &str) -> String {
         .join("\n")
 }
 
-/// 本文（`#[cfg(test)] mod tests` より前）だけを見る
+/// 本番コード（`#[cfg(test)]` の付いた item を空白へ潰した眺め）だけを返す。
+/// 切らない理由と「黙って縮んだ」の検出は `common/production_range.rs`（#1420）
 fn production_part(src: &str) -> String {
-    match src.find("#[cfg(test)]") {
-        Some(i) => src[..i].to_string(),
-        None => src.to_string(),
-    }
+    production_range::scan(src).text
 }
 
 #[test]
