@@ -860,6 +860,11 @@ pub trait SystemHost {
     fn recovered_sessions_count(&self) -> usize {
         0
     }
+    /// `save_layout` の内訳（#1425）。変化検出キーで capture / 直列化を省けているかを
+    /// AI / CLI から確かめられるようにする（設計原則 5「AI フルコントロール」）
+    fn layout_save_stats(&self) -> crate::layout::SaveStats {
+        crate::layout::SaveStats::default()
+    }
     /// orphan 復元で旧 pane ID から新 pane ID を解決する（#210）。
     /// 既存 claude CLI が旧 TAKO_PANE_ID で MCP を呼んだとき、caller_pane を新 ID に変換する
     fn resolve_stale_pane(&self, _stale: PaneId) -> Option<PaneId> {

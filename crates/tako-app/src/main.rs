@@ -118,6 +118,29 @@ fn legacy_1191() -> bool {
     *LEGACY.get_or_init(|| std::env::var("TAKO_1191_LEGACY").as_deref() == Ok("1"))
 }
 
+/// #1425 の A/B。`TAKO_1425_LEGACY=1` で**同一バイナリのまま**旧挙動
+/// （変化検出を JSON 直列化の**後**の文字列比較で行う = 変化が無い tick でも
+/// 全ペインの `PaneMeta` 構築 + 全体の直列化を払う）へ戻す
+fn legacy_1425() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_1425_LEGACY").as_deref() == Ok("1"))
+}
+
+/// 直近に保存できたレイアウトの状態（#1425）。
+///
+/// 変化検出キーと保存済み JSON を**1 つの状態**にまとめてある。別々のフィールドに
+/// すると「JSON だけリセットしてキーを残す」= 以後キー一致でスキップし続けて
+/// **二度と書かれない**、という壊し方ができてしまう（persist の OFF → ON が実際に
+/// その経路。`last_saved_layout = None` の 1 行で両方消えるのが正しい）
+struct SavedLayout {
+    /// 保存した時点の変化検出キー
+    key: tako_control::layout::ChangeKey,
+    /// 保存した JSON（キーが動いたときの最終確認に使う）
+    json: String,
+    /// キー一致で capture を省いた連続回数（保険の発動判定）
+    skips: u32,
+}
+
 /// 復元時の resume コマンドを PTY（新しいログインシェルの stdin）へ流す形にする。
 ///
 /// **明示コマンド spawn ではなく入力のキュー**なので、claude を終了したあとは
@@ -1722,8 +1745,10 @@ struct TakoApp {
     backend_windows_at: Option<std::time::Instant>,
     /// tmux window のキャプチャテキスト（ホバープレビュー用。ポーリングで非アクティブ window を取得）
     window_captures: HashMap<(PaneId, u32), Vec<String>>,
-    /// 直近に保存したレイアウトの JSON（変化したときだけ書き込むための比較用）
-    last_saved_layout: Option<String>,
+    /// 直近に保存できたレイアウト（変化したときだけ書き込むための比較用）
+    last_saved_layout: Option<SavedLayout>,
+    /// `save_layout` の内訳（#1425。`tako persist` / MCP から読める）
+    save_layout_stats: tako_control::layout::SaveStats,
     /// 起動時のレイアウト復元結果（人間可読 1 行。Issue #30 の診断用。
     /// `tako persist` / MCP `tako_persist` の `last_restore` として公開する）
     restore_report: Option<String>,
@@ -3719,6 +3744,7 @@ impl TakoApp {
             backend_windows_at: None,
             window_captures: HashMap::new(),
             last_saved_layout: None,
+            save_layout_stats: tako_control::layout::SaveStats::default(),
             restore_report,
             window_frame: None,
             drag_kind: None,
@@ -9049,6 +9075,7 @@ impl TakoApp {
         // Issue #168: 2 秒ポーリング + dispatch 毎に呼ばれる。capture + 変化検出 +
         // （変化時のみ）ディスク書き込みのメインスレッド専有を計測
         let _span = tako_control::diag::perf_span("save_layout");
+        self.save_layout_stats.calls += 1;
         let backend_sessions = &self.backend_sessions;
         let claude_resume_sessions = &self.claude_resume_sessions;
         let agent_resume_sessions = &self.agent_resume_sessions;
@@ -9062,77 +9089,121 @@ impl TakoApp {
             .into_iter()
             .map(|(pane, h)| (pane, h as u64))
             .collect();
-        let mut layout = tako_control::layout::capture(
-            &self.workspace,
-            &|pane| tako_control::layout::PaneMeta {
-                session: backend_sessions.get(&pane).cloned(),
-                cwd: terminals
-                    .get(&pane)
-                    .and_then(|s| s.cwd())
-                    .map(|p| p.display().to_string()),
-                claude_session_id: claude_resume_sessions.get(pane).map(str::to_string),
-                // #1238: codex / agy の会話参照。ID がまだ採れていなくても系統は残す
-                agent_resume: agent_resume_sessions.get(pane).map(|(agent, id)| {
-                    tako_control::layout::AgentResumeLayout {
-                        agent: agent.as_str().to_string(),
-                        id: id.map(str::to_string),
-                    }
-                }),
-                logged_history: pane_log_history.get(&pane.as_u64()).copied(),
-                preview: previews
-                    .get(&pane)
-                    .map(|p| tako_control::layout::PreviewLayout {
-                        path: p.path.display().to_string(),
-                        mode: p.mode.to_wire().as_str().to_string(),
-                    }),
-                webview: webviews
-                    .iter()
-                    .find(|e| e.pane == Some(pane))
-                    .map(|e| e.current_url()),
-            },
+        // ペイン付帯情報は**借用のまま**組む（#1425）。保存形（`PaneMeta`）は
+        // ペインあたり String を最大 7 本作るので、「変わっていないことの確認」に
+        // 毎 tick それを払わない。落とすのは実際に変化があったときだけ
+        let meta = |pane: PaneId| tako_control::layout::PaneMetaRef {
+            session: backend_sessions.get(&pane).map(String::as_str),
+            cwd: terminals.get(&pane).and_then(|s| s.cwd()),
+            claude_session_id: claude_resume_sessions.get(pane),
+            // #1238: codex / agy の会話参照。ID がまだ採れていなくても系統は残す
+            agent_resume: agent_resume_sessions
+                .get(pane)
+                .map(|(agent, id)| (agent.as_str(), id)),
+            logged_history: pane_log_history.get(&pane.as_u64()).copied(),
+            preview: previews
+                .get(&pane)
+                .map(|p| (p.path.as_path(), p.mode.to_wire().as_str())),
+            webview: webviews
+                .iter()
+                .find(|e| e.pane == Some(pane))
+                .map(|e| std::borrow::Cow::Owned(e.current_url())),
+        };
+        // capture では埋まらない UI 層の付帯情報（#1425: 変化検出と穴埋めで
+        // **同じ値**を使う。片方だけ更新すると保存漏れになる）
+        let extras = tako_control::layout::LayoutExtras {
             // 旧スキーマ互換の単一フレームはアクティブウィンドウのもの（Issue #339。
             // 起動時のプライマリウィンドウ復元 = open_primary_window が読む値）
-            self.window_frames
+            window: self
+                .window_frames
                 .get(&self.workspace.active_window_id())
                 .cloned()
                 .or_else(|| self.window_frame.clone()),
-        );
-        // 複数ウィンドウの OS フレーム（Issue #339）。render で採取済みの分を埋める
-        for w in &mut layout.windows {
-            w.frame = self
-                .window_frames
-                .get(&tako_core::WindowId::from_raw(w.id))
-                .cloned();
-        }
-        // 折りたたみ状態（FR-2.16.14）を埋める。現存タブのみ（閉じたタブの残骸は除く）
-        layout.collapsed = self
-            .collapsed_tmux_tabs
-            .iter()
-            .filter(|t| self.workspace.get_tab(**t).is_some())
-            .map(|t| t.as_u64())
-            .collect();
-        // Web ビュー dock の退避分（#155）。表示分は PaneMeta.webview で tree に載る。
-        // まだ開き直していない復元待ち（初回 render 前の保存）も失わずに引き継ぐ
-        layout.webview_dock = self
-            .webviews
-            .iter()
-            .filter(|e| e.pane.is_none())
-            .map(|e| e.current_url())
-            .chain(
-                self.pending_webview_restore
+            // 複数ウィンドウの OS フレーム（Issue #339）。render で採取済みの分を埋める
+            window_frames: self
+                .workspace
+                .windows()
+                .iter()
+                .map(|w| (w.id().as_u64(), self.window_frames.get(&w.id()).cloned()))
+                .collect(),
+            // 折りたたみ状態（FR-2.16.14）。現存タブのみ（閉じたタブの残骸は除く）。
+            // 元が HashSet なので**昇順に整える**（#1425: 並びが揺れると中身が同じでも
+            // JSON が変わり、変化検出キーと食い違う = 無駄な書き込みになる）
+            collapsed: {
+                let mut ids: Vec<u64> = self
+                    .collapsed_tmux_tabs
                     .iter()
-                    .filter(|(pane, _)| pane.is_none())
-                    .map(|(_, url)| url.clone()),
-            )
-            .collect();
+                    .filter(|t| self.workspace.get_tab(**t).is_some())
+                    .map(|t| t.as_u64())
+                    .collect();
+                ids.sort_unstable();
+                ids
+            },
+            // Web ビュー dock の退避分（#155）。表示分は PaneMeta.webview で tree に載る。
+            // まだ開き直していない復元待ち（初回 render 前の保存）も失わずに引き継ぐ
+            webview_dock: self
+                .webviews
+                .iter()
+                .filter(|e| e.pane.is_none())
+                .map(|e| e.current_url())
+                .chain(
+                    self.pending_webview_restore
+                        .iter()
+                        .filter(|(pane, _)| pane.is_none())
+                        .map(|(_, url)| url.clone()),
+                )
+                .collect(),
+        };
+        // 変化検出は capture / 直列化の**前**（#1425）。キーが同じなら
+        // 「全ペインの PaneMeta 構築 + 全体の JSON 直列化」を丸ごと省く
+        let key = tako_control::layout::change_key(&self.workspace, &meta, &extras);
+        if !legacy_1425() {
+            if let Some(saved) = &mut self.last_saved_layout {
+                if saved.key == key {
+                    // 保険（#1425）: 連続スキップが上限に達したら必ず実物と
+                    // 突き合わせる。キーの載せ忘れがあっても「永久に保存されない」
+                    // にはしない（「消えた」系 #30 / #177 / #770 の根を作らない）
+                    if saved.skips < tako_control::layout::RECONCILE_AFTER_SKIPS {
+                        saved.skips += 1;
+                        self.save_layout_stats.skipped += 1;
+                        return;
+                    }
+                    self.save_layout_stats.reconciled += 1;
+                }
+            }
+        }
+        self.save_layout_stats.captured += 1;
+        let mut layout = tako_control::layout::capture(
+            &self.workspace,
+            &|pane| meta(pane).to_meta(),
+            extras.window.clone(),
+        );
+        extras.apply(&mut layout);
         let Ok(json) = serde_json::to_string(&layout) else {
+            // 直列化できない（NaN 等）。キーは更新せず次の tick でやり直す
             return;
         };
-        if self.last_saved_layout.as_deref() == Some(json.as_str()) {
+        if self
+            .last_saved_layout
+            .as_ref()
+            .is_some_and(|s| s.json == json)
+        {
+            // 内容は同じでキーだけ動いた。書かずにキーだけ追随させる
+            if let Some(saved) = &mut self.last_saved_layout {
+                saved.key = key;
+                saved.skips = 0;
+            }
             return;
         }
         match tako_control::layout::save(&layout) {
-            Ok(_) => self.last_saved_layout = Some(json),
+            Ok(_) => {
+                self.save_layout_stats.written += 1;
+                self.last_saved_layout = Some(SavedLayout {
+                    key,
+                    json,
+                    skips: 0,
+                });
+            }
             // 保存失敗は復元不能に直結するので診断ログにも残す（Issue #30）
             Err(e) => persist_diag(&format!("保存失敗: {e}")),
         }
@@ -21396,6 +21467,10 @@ impl SystemHost for TakoApp {
 
     fn recovered_sessions_count(&self) -> usize {
         self.recovered_count
+    }
+
+    fn layout_save_stats(&self) -> tako_control::layout::SaveStats {
+        self.save_layout_stats
     }
 
     fn resolve_stale_pane(&self, stale: PaneId) -> Option<PaneId> {

@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-12（#1411: tako 自身が開いた SSH ペインを自分の自動検知が見送るのを直した）
-- 物差しを「ポートが 22 か」から「**宛先の名前だけでそのポートへ行けるか**」へ（`ConfiguredPorts` = `~/.ssh/config` の `Port`・判断は `port_reachable_by_name` の 1 箇所・材料は `scan` が走る tick だけ読む）。tako の `-p` は config の書き写しなので全部この側に入り、手打ちの `-p`（config に無い）と `-F <別 config>` は従来どおり見送る
-- 同じ症状の 2 つ目の原因を同時に直した: tako の `-o ControlPath="…"` は macOS 既定 data_dir に空白があるので `ps` の 1 行が割れ、**続きの語が宛先に見えて** `RemoteCommand` で見送られていた（ポートが 22 でも起きる）。隔離 GUI + 使い捨て sshd の A/B（`TAKO_1411_LEGACY=1`）で legacy = `sessions:[]`（空白あり data dir は `RemoteCommand`・空白なしは Issue と同じ `PortOverride`）→ 新 = pane が `sessions` に `live` で載り、手打ちの `-p` だけが `PortOverride` で残る
-- 番犬 `issue1411_self_opened_ssh_watchdog` 8 本（注入 6 通りで `ssh_detect.rs:378` / `:421` / `:423` / `remote.md:107` を file:line 名指し）。単体 16 本・workspace 4442 passed 0 failed・check-windows error 0。**install 要**
-
 ## 2026-09-12（#1403: remote daemon の HTTP 受信を少数ワーカーへ並列化した）
 - 受信ループを `serve_http_requests` へ切り出し、`Arc<tiny_http::Server>` を既定 4 本（`TAKO_REMOTE_HTTP_WORKERS` で 1..=32）のワーカーが recv する形へ。合流は `thread::scope`（忘れられない）・1 本の panic は `catch_unwind` で監査ログへ・recv 破損は全員で降りる。daemon → app の IPC は `with_app_ipc` の 1 実装が往復の間ロックを握る（呼び出し 4 か所を集約）。波及で `append_audit` を 1 行 1 write へ（書く者が増えたので `writeln!` だと行が混ざる）
 - 隔離 daemon（偽 tailscale の whois 3 秒・本番 pid 64092 は不可侵）の A/B: 修正前 B = **2.71 秒** → 新 **0.0004 秒**（A は 3.03 秒のまま）。`TAKO_1403_LEGACY=1` / `TAKO_REMOTE_HTTP_WORKERS=1` はどちらも 2.72 秒で旧挙動を再現。飽和の限界も実測（4 本同時で health 2.51 秒・6 本で溢れた 2 本が 6.04 秒）
@@ -59,3 +54,8 @@
 - `read_dir_sorted` の戻り値を `DirListing`（entries + 切り詰め + 読み取り失敗）へ広げ、切り詰めと「読めない」を #1398 の器（`RowNote` / `render_note_row`）の行として出した。判断は CLI の `tree git-status` と同じ 1 実装 `tako_core::sidebar::Truncation`（`total > limit` の手書きを両側から排除）
 - A/B（`TAKO_1402_LEGACY=1`）: legacy = 560 件で **行 501 / note 0**（Issue の実測そのもの）・権限なしが空と同じ → 新 = 行 502 で `Truncated{shown:500,total:560}`・読めないは Error 行。番犬 3 本（注入 6 通りで file:line 名指し）+ 単体 8 本
 - 次: 上限そのもの（500）の見直しは別 Issue（暴走防止として妥当なことは perf 実測済み）
+
+## 2026-09-12（#1425: save_layout の変化検出を JSON 直列化の前へ出した）
+- 判定材料を「組んでから比べる」から「組む前の 128bit キー」へ（`layout::change_key` + 借用版 `PaneMetaRef`）。UI 側の付帯情報は `LayoutExtras` に 1 度だけ組んでキーと穴埋めが同じ値を読む。`collapsed` は HashSet 由来なので昇順に整える。載せ忘れは 3 段で止める（網羅的分解でコンパイル / `CHANGE_KEY_FIELDS` × #916 指紋の番犬 / 連続 30 スキップで必ず突き合わせる保険）
+- 実測 A/B（23 ペイン・同一手順の隔離 GUI）: 70 秒アイドルで新 = 37 呼び出し中 **35 スキップ・capture 2 回**、legacy（`TAKO_1425_LEGACY=1`）= **capture 63 回**。`written` は両腕とも 26 で同一（保存結果は不変）。確保は 22 ペインで **319 回 / 29893 バイト → 0 回 / 0 バイト**（0.349ms → 0.065ms）
+- 番犬 6 本 + 確保計測 1 本（注入 6 通りで file:line 名指し FAILED）。操作 13 種で保存を実測・再起動復元 23 ペイン成功。内訳は `tako persist` の `save_layout` で読める。**install 要**

@@ -2045,6 +2045,9 @@ fn dispatch_inner(
                 "last_restore": host.persist_restore_report(),
                 // 起動時に orphan 自動復帰した tmux セッション数（Issue #191）
                 "recovered_count": host.recovered_sessions_count(),
+                // 保存の内訳（#1425）: calls / skipped（変化検出で省いた）/
+                // captured / written / reconciled（保険で突き合わせた）
+                "save_layout": host.layout_save_stats(),
                 "log_path": crate::diag::persist_log_path()
                     .map(|p| p.display().to_string()),
             }))
