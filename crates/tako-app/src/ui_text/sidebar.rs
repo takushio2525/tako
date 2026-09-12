@@ -59,6 +59,18 @@ pub fn notice_op_failed(op: &str, target: Option<&str>, reason: &str) -> String 
         ),
     }
 }
+/// Finder の「このアプリケーションで開く」・`tako open` で渡されたパスを
+/// 開けなかったときの**操作名**（#1432）。
+///
+/// この入口は以前 `eprintln!` 止まりで、消えたファイル・別ボリュームのパスを
+/// 渡すと **tako が前面に出ることすらなく無反応**だった
+pub fn op_open_path() -> &'static str {
+    tr!("パスを開く", "Open path")
+}
+/// 渡されたパスが実在しないときの理由（#1432。ファイルでもフォルダでもない）
+pub fn reason_path_missing() -> &'static str {
+    tr!("見つかりません", "Not found")
+}
 pub fn menu_rename() -> &'static str {
     tr!("名前変更", "Rename")
 }
@@ -304,6 +316,8 @@ mod tests {
         tests_support::check_ja_en(|| {
             vec![
                 menu_copy_rel().to_string(),
+                op_open_path().to_string(),
+                reason_path_missing().to_string(),
                 menu_copy_abs().to_string(),
                 menu_reveal(FileManager::Finder).to_string(),
                 menu_reveal(FileManager::Explorer).to_string(),

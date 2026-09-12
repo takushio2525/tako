@@ -188,10 +188,22 @@ pub(crate) fn inline_insert_position(
 pub(crate) enum NoticeArea {
     /// ファイルツリーのローカル行（#1399）
     Tree,
-    /// 右パネルの tmux ビュー・バックグラウンドのドロワー（#1417 / #1422）
+    /// 右パネルの tmux ビュー・バックグラウンドの復元行（#1417 / #1422）
     RightPanel,
     /// プレビューペインの目次 / ページ移動・コードのコピー・Code Runner（#1417 / #1422）
     Preview,
+    /// 下部ドロワー（バックグラウンドのカード・ペインへの D&D 復帰。#1432）
+    Drawer,
+    /// AI コマンド提案カード（コピー / 新規ペインで実行 / 閉じる。#1432）
+    CommandCard,
+    /// GUI 表示モードのチャットビュー（発話・コードブロックのコピー。#1432）
+    Chat,
+    /// Finder の「このアプリケーションで開く」・`tako open` の受け口（#1432）。
+    /// 画面ではなく**入口**だが、失敗は同じ共有の通知欄へ出る
+    OpenFile,
+    /// アップデート専用ウィンドウのリリースノート（#1432）。
+    /// この窓は自前の通知欄を持たないので、出し先はメインウィンドウの共有通知欄
+    UpdateWindow,
 }
 
 impl NoticeArea {
@@ -201,6 +213,11 @@ impl NoticeArea {
             NoticeArea::Tree => "tree",
             NoticeArea::RightPanel => "right_panel",
             NoticeArea::Preview => "preview",
+            NoticeArea::Drawer => "drawer",
+            NoticeArea::CommandCard => "command_card",
+            NoticeArea::Chat => "chat",
+            NoticeArea::OpenFile => "open_file",
+            NoticeArea::UpdateWindow => "update_window",
         }
     }
 }
@@ -221,6 +238,9 @@ pub(crate) enum NoticeArm {
     /// tmux セッションの復元・バックグラウンド復帰・コードのコピー・Code Runner・
     /// PDF 再ラスタライズ（`TAKO_1422_LEGACY`）
     Issue1422,
+    /// ドロワーの復帰・コマンドカード・チャットのコピー・Finder から開く・
+    /// リリースノートのリンク（`TAKO_1432_LEGACY`）
+    Issue1432,
 }
 
 impl NoticeArm {
@@ -230,6 +250,7 @@ impl NoticeArm {
             NoticeArm::Issue1399 => TakoApp::legacy_1399(),
             NoticeArm::Issue1417 => TakoApp::legacy_1417(),
             NoticeArm::Issue1422 => TakoApp::legacy_1422(),
+            NoticeArm::Issue1432 => TakoApp::legacy_1432(),
         }
     }
 }
@@ -2230,6 +2251,16 @@ impl TakoApp {
         *LEGACY.get_or_init(|| std::env::var("TAKO_1422_LEGACY").map(|v| v == "1") == Ok(true))
     }
 
+    /// #1432 の A/B。`TAKO_1432_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
+    /// （ドロワーの復帰・コマンドカードの操作・チャットのコピー・Finder から開く・
+    /// リリースノートのリンクの失敗を、通知欄にも persist.log にも出さない =
+    /// `eprintln!` しか無かった頃の「押しても無言」の再現）。#1399 / #1417 / #1422 と
+    /// env を分けてあるので、片方のアームがもう片方の回帰を隠さない
+    pub(crate) fn legacy_1432() -> bool {
+        static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *LEGACY.get_or_init(|| std::env::var("TAKO_1432_LEGACY").map(|v| v == "1") == Ok(true))
+    }
+
     /// リモート行の右クリックメニューの実行（#919）
     pub(crate) fn remote_menu_action(
         &mut self,
@@ -2781,6 +2812,33 @@ fn pick_app_and_open(path: &std::path::Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// 画面の識別子は診断（`area=`）で画面を見分けるためのものなので、
+    /// 2 つの画面が同じ札を名乗ったら「どこで起きたか」が消える（#1417 / #1432）
+    #[test]
+    fn 通知の画面札は重複せず識別子の形をしている() {
+        let all = [
+            NoticeArea::Tree,
+            NoticeArea::RightPanel,
+            NoticeArea::Preview,
+            NoticeArea::Drawer,
+            NoticeArea::CommandCard,
+            NoticeArea::Chat,
+            NoticeArea::OpenFile,
+            NoticeArea::UpdateWindow,
+        ];
+        let mut tags: Vec<&str> = all.iter().map(|a| a.tag()).collect();
+        for tag in &tags {
+            assert!(
+                !tag.is_empty() && tag.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "画面札 {tag:?} が識別子の形でない（#1417）"
+            );
+        }
+        let total = tags.len();
+        tags.sort_unstable();
+        tags.dedup();
+        assert_eq!(tags.len(), total, "画面札が重複している（#1417 / #1432）");
+    }
 
     fn row(path: &str, depth: usize, root: bool, is_dir: bool) -> filetree::Row {
         let path = PathBuf::from(path);

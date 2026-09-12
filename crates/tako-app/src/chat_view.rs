@@ -1550,6 +1550,45 @@ impl TakoApp {
         Ok(result)
     }
 
+    /// コピーボタンのクリック（#1432）。
+    ///
+    /// 中身を `render` のクロージャから名前付きにしてあるのは #1417 / #1422 と同じ理由
+    /// （合成マウスイベントは GPUI へ届かないので、セルフテストが押した経路そのものを
+    /// 叩ける名前が要る）。以前は失敗が `eprintln!` 止まりで、流れて消えた発話の
+    /// コピーを押しても**何も起きない**ように見えた（GUI の stderr は誰も読めない）
+    pub(crate) fn chat_copy_clicked(
+        &mut self,
+        pane_id: PaneId,
+        key: u64,
+        target: ChatCopyTarget,
+        cx: &mut Context<Self>,
+    ) {
+        match self.copy_chat_message(pane_id, key, target, false) {
+            Ok(_) => self.flush_pending_clipboard(cx),
+            Err(e) => self.notify_ui_op_failed(
+                crate::sidebar::NoticeArea::Chat,
+                crate::sidebar::NoticeArm::Issue1432,
+                crate::ui_text::ui_mode::op_copy_chat(),
+                match target {
+                    // 対象はユーザーが見て分かる粒度だけ（発話の中身は載せない）
+                    ChatCopyTarget::Code(index) => {
+                        Some(crate::ui_text::preview::code_block_n(index))
+                    }
+                    ChatCopyTarget::Message => None,
+                }
+                .as_deref(),
+                &e,
+            ),
+        }
+        // フィードバックの終わりで元の見た目へ戻す（2 秒ポーリング待ちにしない）
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(CHAT_COPY_FEEDBACK).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
+        cx.notify();
+    }
+
     /// コピーボタン 1 つ（メッセージ全文 / コードブロック共通）。
     ///
     /// 見た目は #680 のコードブロックコピーボタンに合わせる: **常時表示だが淡色**で、
@@ -1630,17 +1669,7 @@ impl TakoApp {
             )
             .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
                 cx.stop_propagation();
-                match this.copy_chat_message(pane_id, key, target, false) {
-                    Ok(_) => this.flush_pending_clipboard(cx),
-                    Err(e) => eprintln!("warning: チャットのコピーに失敗: {e}"),
-                }
-                // フィードバックの終わりで元の見た目へ戻す（2 秒ポーリング待ちにしない）
-                cx.spawn(async move |this, cx| {
-                    cx.background_executor().timer(CHAT_COPY_FEEDBACK).await;
-                    let _ = this.update(cx, |_, cx| cx.notify());
-                })
-                .detach();
-                cx.notify();
+                this.chat_copy_clicked(pane_id, key, target, cx);
             }))
             .into_any_element()
     }

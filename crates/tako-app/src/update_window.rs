@@ -591,7 +591,7 @@ impl UpdateWindow {
                                         .hovered_note_link
                                         .or_else(|| this.note_link_at(ev.position));
                                     if let Some(index) = index {
-                                        this.open_note_link(index);
+                                        this.open_note_link(index, cx);
                                         this.hovered_note_link = None;
                                         cx.notify();
                                     }
@@ -674,12 +674,23 @@ impl UpdateWindow {
 
     /// セルフテスト用（#690）: ⌘+クリックの経路をそのまま叩く。
     /// 実ブラウザは `open_external_url` が `TAKO_SELF_TEST` で抑止する
-    pub(crate) fn probe_note_link_click(&mut self, position: Point<Pixels>) -> Option<usize> {
+    pub(crate) fn probe_note_link_click(
+        &mut self,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
         let index = self.note_link_at(position);
         if let Some(index) = index {
-            self.open_note_link(index);
+            self.open_note_link(index, cx);
         }
         index
+    }
+
+    /// セルフテスト用（#1432）: ヒットテストを通さず**索引で**⌘+クリックの
+    /// 行き先だけを叩く。開けないリンクの通知は描画前でも起こせる必要がある
+    /// （`note_link_at` は `painted` が立つまで当たらないので、経路の検査に使えない）
+    pub(crate) fn probe_note_link_open(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.open_note_link(index, cx);
     }
 
     /// ノート内リンクのヒットテスト（#690）。
@@ -710,17 +721,33 @@ impl UpdateWindow {
     }
 
     /// ノート内リンクを既定ブラウザで開く。開いてよい URL の判定は
-    /// `md_links::browser_url` が正（http / https のみ。#680）
-    fn open_note_link(&self, index: usize) {
+    /// `url_guard::check_browser_url` が正（http / https のみ。#680 / #1376）。
+    ///
+    /// #1432: 開けないリンク（相対パス・`mailto:`・`javascript:`）は以前
+    /// `eprintln!` 止まりで、⌘+クリックしても**何も起きない**ように見えた。
+    /// この窓は自前の通知欄を持たないので、出し先はメインウィンドウの共有通知欄
+    /// （`with_app` で辿る）。理由文は URL を含まない `UrlBlocked::as_str()` が正本
+    fn open_note_link(&self, index: usize, cx: &mut Context<Self>) {
         let Some(notes) = self.notes.as_ref() else {
             return;
         };
         let Some(hit) = notes.links.get(index) else {
             return;
         };
-        match tako_core::md_links::browser_url(&hit.url) {
-            Some(url) => crate::open_external_url(url),
-            None => eprintln!("warning: 開けないリンク（http / https のみ）: {}", hit.url),
+        match tako_core::url_guard::check_browser_url(&hit.url) {
+            Ok(url) => crate::open_external_url(url),
+            Err(why) => {
+                let url = hit.url.clone();
+                self.with_app(cx, move |app, _cx| {
+                    app.notify_ui_op_failed(
+                        crate::sidebar::NoticeArea::UpdateWindow,
+                        crate::sidebar::NoticeArm::Issue1432,
+                        crate::ui_text::update::op_open_link(),
+                        Some(&url),
+                        why.as_str(),
+                    );
+                });
+            }
         }
     }
 

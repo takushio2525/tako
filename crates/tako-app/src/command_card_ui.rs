@@ -578,7 +578,17 @@ impl TakoApp {
         // PTY が起動しない**（#153 で同じ穴を踏んでいる）
         for (pane, options) in std::mem::take(&mut self.pending_attach) {
             if let Err(e) = self.spawn_session(pane, options, cx) {
-                eprintln!("warning: コマンドカードの実行ペインを起動できない: {e}");
+                // #1432: ペインを消してしまうので、消した理由を画面へ残す
+                // （残さないと「新しいペインが一瞬出て消えた」だけになる。
+                // `sidebar::open_from_finder` が #1399 で採ったのと同じ形）
+                let reason = e.to_string();
+                self.notify_ui_op_failed(
+                    crate::sidebar::NoticeArea::CommandCard,
+                    crate::sidebar::NoticeArm::Issue1432,
+                    crate::ui_text::command_card::op_action(action),
+                    None,
+                    &reason,
+                );
                 self.remove_pane(pane, cx);
             }
         }
@@ -592,11 +602,23 @@ impl TakoApp {
         result
     }
 
-    /// 失敗は画面に一言 + 理由は診断ログへ（dispatch のエラー文は日本語固定 =
-    /// UI 文言の i18n 対象外なのでそのまま画面には出さない）
+    /// 失敗はカードの一言 + **共有の通知欄**（#1432）。
+    ///
+    /// 以前は理由が `eprintln!` 止まりで、カードには [`run_failed`] の一言が 2 秒
+    /// 出るだけ = **なぜ駄目だったかがどこにも残らなかった**（GUI の stderr は誰も
+    /// 読めない = 境界 B8）。理由文（dispatch のエラー）は日本語固定だが、#1399 /
+    /// #1422 と同じく「無言より読める方がよい」を採って通知欄へ出す
+    ///
+    /// [`run_failed`]: crate::ui_text::command_card::run_failed
     fn report_command_card_error(&mut self, card: u64, action: &str, reason: &str) {
-        eprintln!("warning: コマンドカードの {action} に失敗: {reason}");
         self.command_card_error = Some((card, std::time::Instant::now()));
+        self.notify_ui_op_failed(
+            crate::sidebar::NoticeArea::CommandCard,
+            crate::sidebar::NoticeArm::Issue1432,
+            crate::ui_text::command_card::op_action(action),
+            None,
+            reason,
+        );
     }
 
     /// クリップボード書き込みの保留分を流す（render から呼ぶ）。

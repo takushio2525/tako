@@ -4,6 +4,51 @@ use tako_core::{CommandState, PaneId, SplitDirection};
 use super::*;
 
 impl TakoApp {
+    /// 通知に出す退避ペインの見出し（ユーザーが見ている「どれを戻そうとしたか」）。
+    /// 右パネルの `shelved_restore_clicked` が採るものと同じ（#1432）
+    fn shelved_label(&self, pane_id: PaneId) -> Option<String> {
+        self.workspace
+            .shelved_panes()
+            .iter()
+            .find(|p| p.id() == pane_id)
+            .and_then(|p| p.title())
+            .map(str::to_string)
+    }
+
+    /// ドロワーのカードの「復元」ボタン（#1432）。
+    ///
+    /// 中身を `render` のクロージャから名前付きにしてあるのは #1417 / #1422 と同じ理由
+    /// （合成マウスイベントは GPUI へ届かないので、セルフテストが押した経路そのものを
+    /// 叩ける名前が要る）。右パネルの同名ボタン（`shelved_restore_clicked`）とは
+    /// **プレビュー監視の再開（`reattach_backgrounded_preview`）の有無**が違うので
+    /// 1 本に畳んでいない（畳むと右パネル側の挙動が変わる = 別 Issue）
+    pub(crate) fn shelf_restore_clicked(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        let origin = self.workspace.shelved_origin_tab(pane_id);
+        let target = origin
+            .and_then(|t| self.workspace.get_tab(t))
+            .map(|t| t.tree().focused())
+            .unwrap_or_else(|| self.workspace.active_tab().tree().focused());
+        let label = self.shelved_label(pane_id);
+        if let Err(e) = self
+            .workspace
+            .unshelve_pane(pane_id, target, SplitDirection::Right)
+        {
+            // #1432: 以前は `eprintln!` 止まりで「押しても無言」だった
+            self.notify_ui_op_failed(
+                crate::sidebar::NoticeArea::Drawer,
+                crate::sidebar::NoticeArm::Issue1432,
+                crate::ui_text::panel::op_unshelve_pane(),
+                label.as_deref(),
+                &e.to_string(),
+            );
+        }
+        self.reattach_backgrounded_preview(pane_id);
+        if self.workspace.shelved_panes().is_empty() {
+            self.drawer_visible = false;
+        }
+        cx.notify();
+    }
+
     pub(crate) fn drop_background_pane(
         &mut self,
         target_pane: PaneId,
@@ -18,11 +63,20 @@ impl TakoApp {
             Some(DropZone::Down) => SplitDirection::Down,
             Some(DropZone::Center) => SplitDirection::Right,
         };
+        let label = self.shelved_label(drag.pane);
         if let Err(e) = self
             .workspace
             .unshelve_pane(drag.pane, target_pane, direction)
         {
-            eprintln!("warning: バックグラウンドから復帰できない: {e}");
+            // #1432: 以前は `eprintln!` 止まりで、**掴んで落としたのに何も起きない**
+            // ように見えた（GUI の stderr は誰も読めない = 境界 B8）
+            self.notify_ui_op_failed(
+                crate::sidebar::NoticeArea::Drawer,
+                crate::sidebar::NoticeArm::Issue1432,
+                crate::ui_text::panel::op_unshelve_pane(),
+                label.as_deref(),
+                &e.to_string(),
+            );
         }
         self.reattach_backgrounded_preview(drag.pane);
         self.drag_kind = None;
@@ -141,22 +195,7 @@ impl TakoApp {
                         .hover(|d| d.bg(rgba_alpha(theme.accent, 0.2)))
                         .child(crate::ui_text::common::restore())
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            let origin = this.workspace.shelved_origin_tab(pane_id);
-                            let target = origin
-                                .and_then(|t| this.workspace.get_tab(t))
-                                .map(|t| t.tree().focused())
-                                .unwrap_or_else(|| this.workspace.active_tab().tree().focused());
-                            if let Err(e) =
-                                this.workspace
-                                    .unshelve_pane(pane_id, target, SplitDirection::Right)
-                            {
-                                eprintln!("warning: バックグラウンドから復帰できない: {e}");
-                            }
-                            this.reattach_backgrounded_preview(pane_id);
-                            if this.workspace.shelved_panes().is_empty() {
-                                this.drawer_visible = false;
-                            }
-                            cx.notify();
+                            this.shelf_restore_clicked(pane_id, cx);
                         })),
                 )
                 .child(
