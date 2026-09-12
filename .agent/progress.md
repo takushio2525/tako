@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-12（#1420: 番犬の走査範囲が途中の `#[cfg(test)]` で切れるのを直した）
-- 範囲取りを「最初の `#[cfg(test)]` で切る」から「**テスト領域だけ空白へ潰す**」1 実装（`common/production_range.rs`）へ。バイト長と行番号が保たれるので `file:line` がずれず、途中のテスト用ヘルパでも本番コードが消えない。下限（既定 30%）を割ったら潰した先頭の領域を名指して落ちる
-- 実測 A/B: `remote.rs` の検査対象の**後ろ**へ 4 行のヘルパを注入すると legacy は 5,903 → 3,124 行（70.7% → 37.1%）へ縮んで **7 本とも緑のまま**・**手前**へ注入すると「改名したら番犬も直す」で 6 本 FAILED（誤診）。新は両方 8 本緑・本番 70.7% を維持。縮める注入では `remote.rs:1505 走査範囲が全体の 18.3% まで縮んだ（下限 30.0%）` で FAILED
-- 棚卸しで 8 本を寄せた（`platform_parity` は 4 クレートの src を丸ごと走査していて `orchestrator/mod.rs` を 1.5%・`mcp/mod.rs` を 10.5% しか見ていなかった）。番犬 `issue1420_production_range_watchdog` 12 本 + 実ファイル 254 本の不変条件。寄せられない 4 件（製品コード内の番犬）は `KNOWN_COARSE` へ件数つきで宣言。**テストのみ = install 不要**
-
 ## 2026-09-12（#1402: ツリーが上限超過ぶんを黙って捨てるのを直した）
 - `read_dir_sorted` の戻り値を `DirListing`（entries + 切り詰め + 読み取り失敗）へ広げ、切り詰めと「読めない」を #1398 の器（`RowNote` / `render_note_row`）の行として出した。判断は CLI の `tree git-status` と同じ 1 実装 `tako_core::sidebar::Truncation`（`total > limit` の手書きを両側から排除）
 - A/B（`TAKO_1402_LEGACY=1`）: legacy = 560 件で **行 501 / note 0**（Issue の実測そのもの）・権限なしが空と同じ → 新 = 行 502 で `Truncated{shown:500,total:560}`・読めないは Error 行。番犬 3 本（注入 6 通りで file:line 名指し）+ 単体 8 本
@@ -64,3 +59,8 @@
 - `KNOWN_EPRINTLN` の 10 件を 1 実装（`notify_ui_op_failed` / `log_ui_failure`）へ。ユーザー操作 7 件は通知欄 + persist.log（ドロワーの D&D / 復元・カードの操作と実行ペイン起動・チャットのコピー・Finder の実在しないパス・ノートのリンク）、画面へ出せない 2 件は診断だけ、`autorename` の env つき診断は persist.log へ。画面は `NoticeArea` を 5 つ足して区別（`drawer` / `command_card` / `chat` / `open_file` / `update_window`）
 - 隔離 GUI（tako-vd）項目 84e + 90 の A/B: 新 = 6 経路とも通知が出て `bg_lines=3`・成功時は無言で完走（`TAKO_APP_SELF_TEST_OK`）/ legacy（`TAKO_1432_LEGACY=1`）は 5 つとも `None`・`bg_lines=0` で FAILED。`TAKO_1432_LEGACY=1` でも #1399 / #1417 / #1422 は `legacy=false` のまま出る（軸が独立）
 - `KNOWN_EPRINTLN` は空・番犬 12 本緑（A/B の env が Issue ごとに 1 対 1 であることの検査を 1 本追加）。workspace 4573 passed 0 failed・clippy 両宇宙 0・check-windows error 0。**install 要**
+
+## 2026-09-12（#841: 偽 XFF でローカルから serve を名乗れるのを接続元プロセスの検証で塞いだ）
+- XFF を読む口を `remote::forwarded_identity` の 1 実装へ寄せ、読む前に `local_endpoint::verify_peer` を通す。所有者ゲート（ソケットの uid が自分か root）+ 実行ファイル名ゲート（設置場所では判定しない）を両方通ったときだけ信じ、材料が欠けたら 403。分岐はエンドポイントの形（UDS は検証しない）
+- 接続元 pid の解決は `procinfo::loopback_tcp_peer`（macOS = `net.inet.tcp.pcblist_n` の sysctl。**libproc の fd 走査では非 root から root の tailscaled が見えない**ことを実測して方式を変えた / Windows = `GetExtendedTcpTable`）。Windows は所有者を引けないので `owner_check=unavailable` と名乗る（残存リスクは脅威モデルへ）
+- 実測 A/B（隔離 daemon + 別プロセス curl）: 新 = 403 `not_tailscale_daemon` + persist.log + `remote status` の `peer_verification` / `TAKO_841_LEGACY=1` = 検証を通らず whois 層まで到達。番犬 9 本・実ソース注入 5 通りで file:line 名指し FAILED。**install 要 / 本番 daemon 再起動要**
