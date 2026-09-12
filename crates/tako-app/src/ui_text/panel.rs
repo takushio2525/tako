@@ -66,6 +66,11 @@ pub fn pane_count(n: impl std::fmt::Display) -> String {
 pub fn external_badge() -> &'static str {
     tr!("外部", "external")
 }
+/// tmux window 行のクリックが失敗したときに通知欄へ出す**操作名**（#1417）。
+/// 「押した行の切り替え」と「失敗の名前」を一致させるためにここで持つ
+pub fn op_select_window() -> &'static str {
+    tr!("window 切替", "Switch window")
+}
 pub fn closed_tab_section() -> &'static str {
     tr!(
         "閉じたタブのターミナル（バックグラウンドで実行中）",
@@ -429,6 +434,7 @@ mod tests {
                 orch_no_workers().to_string(),
                 pane_count(3),
                 external_badge().to_string(),
+                op_select_window().to_string(),
                 closed_tab_section().to_string(),
                 closed_tab_group("dev", 2),
                 git_detecting().to_string(),

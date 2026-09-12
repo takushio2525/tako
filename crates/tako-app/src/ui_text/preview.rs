@@ -70,6 +70,16 @@ pub fn goto_page_section() -> &'static str {
 pub fn page_n(page: usize) -> String {
     tr!(format!("ページ {page}"), format!("Page {page}"))
 }
+/// 目次の行を押したときに通知欄へ出す**操作名**（#1417）。
+/// 節の見出し（[`outline_section`]）とは別に持つ（見出しの文言を変えても
+/// 失敗の文が「何をしようとしたか」を言い続けるため）
+pub fn op_outline_jump() -> &'static str {
+    tr!("目次へ移動", "Jump to outline item")
+}
+/// ページ一覧の行を押したときに通知欄へ出す**操作名**（#1417）
+pub fn op_goto_page() -> &'static str {
+    tr!("ページ移動", "Go to page")
+}
 pub fn item_count(n: usize) -> String {
     tr!(format!("{n} 件"), format!("{n} items"))
 }
@@ -209,6 +219,8 @@ mod tests {
                 outline_section().to_string(),
                 goto_page_section().to_string(),
                 page_n(3),
+                op_outline_jump().to_string(),
+                op_goto_page().to_string(),
                 item_count(12),
                 loading().to_string(),
                 tail_omitted().to_string(),

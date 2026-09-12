@@ -175,6 +175,44 @@ pub(crate) fn inline_insert_position(
     })
 }
 
+/// 失敗の通知を出した**画面**（#1417）。
+///
+/// #1399 の出し口はファイルツリー専用だったが、同じ形（dispatch の `Err` を
+/// 捨てる）は右パネルの tmux window 行とプレビューの目次 / ページ移動にも在った。
+/// 画面ごとに出し口を増やすと「片方だけ無言」が必ず生まれるので、
+/// 口は [`TakoApp::notify_ui_failure`] の 1 つに保ち、**画面はこの値だけで区別**する。
+///
+/// 用途は 2 つ。persist.log の `area=` に出す識別子（どの画面で起きたかを診断から
+/// 辿れる）と、A/B の逃げ道の選択（画面ごとに Issue が違うので env も分ける）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NoticeArea {
+    /// ファイルツリーのローカル行（#1399）
+    Tree,
+    /// 右パネルの tmux ビュー（#1417）
+    RightPanel,
+    /// プレビューペインの目次 / ページ移動（#1417）
+    Preview,
+}
+
+impl NoticeArea {
+    /// persist.log へ出す画面の識別子（本文を含まない ASCII 名。`DispatchError::class()` と同じ作法）
+    pub(crate) fn tag(self) -> &'static str {
+        match self {
+            NoticeArea::Tree => "tree",
+            NoticeArea::RightPanel => "right_panel",
+            NoticeArea::Preview => "preview",
+        }
+    }
+
+    /// その画面の通知を旧挙動（何も出さない）へ戻す A/B が立っているか
+    pub(crate) fn legacy_suppressed(self) -> bool {
+        match self {
+            NoticeArea::Tree => TakoApp::legacy_1399(),
+            NoticeArea::RightPanel | NoticeArea::Preview => TakoApp::legacy_1417(),
+        }
+    }
+}
+
 impl TakoApp {
     pub(crate) fn sync_filetree_roots(&mut self) {
         if !self.filetree.visible {
@@ -2024,49 +2062,65 @@ impl TakoApp {
         });
     }
 
-    /// ファイルツリーの**ローカル行**の操作が失敗したことを画面へ出す唯一の口（#1399）。
+    /// ユーザーの操作が失敗したことを画面へ出す唯一の口（#1399 / #1417）。
     ///
-    /// ローカル行の操作は以前 `let _ = dispatch(..)` / `if result.is_ok()` /
+    /// ファイルツリーのローカル行は以前 `let _ = dispatch(..)` / `if result.is_ok()` /
     /// `eprintln!` で結果を捨てていたので、**ごみ箱移動やリネームが失敗しても
     /// 画面が無反応**だった（同じサイドバーのリモート行は #919 から通知欄へ
-    /// 出していたので、1 つの画面に 2 つのエラー方針が同居していた）。
+    /// 出していたので、1 つの画面に 2 つのエラー方針が同居していた）。#1417 で
+    /// 同じ形が右パネル・プレビューにも在ることが分かったので、口は増やさず
+    /// [`NoticeArea`] で画面だけを区別する。
     ///
     /// 出し先はリモート行と同じ [`Self::set_remote_notice`] = 共有の通知欄で、
-    /// 同じ失敗を persist.log にも 1 行残す。**診断へ載せるのは操作名と
+    /// 同じ失敗を persist.log にも 1 行残す。**診断へ載せるのは画面・操作名と
     /// 理由の分類だけ**（パス・OS のエラー文は載せない = #1376 と同じ作法）。
-    /// 通知本文にはユーザーが見て分かる対象（パス・打った名前）と理由を出す
-    fn notify_tree_failure(&mut self, diag_op: &str, class: &str, text: String) {
-        // #1399 の A/B: 旧挙動（結果を捨てて画面にも診断にも何も出さない）へ戻す
-        if Self::legacy_1399() {
+    /// 通知本文にはユーザーが見て分かる対象（パス・打った名前・window 名）と理由を出す
+    fn notify_ui_failure(&mut self, area: NoticeArea, diag_op: &str, class: &str, text: String) {
+        // A/B: 旧挙動（結果を捨てて画面にも診断にも何も出さない）へ戻す
+        if area.legacy_suppressed() {
             return;
         }
         tako_control::diag::persist_log(&format!(
-            "ツリーのローカル操作に失敗: op={diag_op} 分類={class}"
+            "UI 操作に失敗: area={} op={diag_op} 分類={class}",
+            area.tag()
         ));
         self.set_remote_notice(text, true);
     }
 
-    /// 右クリックメニュー・トグルの dispatch が `Err` を返したときの通知（#1399）。
+    /// dispatch が `Err` を返したときの通知（#1399 / #1417）。
     /// `op` は**ユーザーが押した項目の文言**をそのまま渡す（押したものと失敗した
-    /// ものの名前が必ず一致する）。`target` が `None` なのは対象パスを持たない操作
-    pub(crate) fn notify_tree_dispatch_failed(
+    /// ものの名前が必ず一致する）。`target` が `None` なのは対象を持たない操作
+    pub(crate) fn notify_ui_dispatch_failed(
         &mut self,
+        area: NoticeArea,
         op: &str,
         target: Option<&str>,
         err: &tako_control::DispatchError,
     ) {
         let reason = err.to_string();
-        self.notify_tree_failure(
+        self.notify_ui_failure(
+            area,
             op,
             err.class(),
             crate::ui_text::sidebar::notice_op_failed(op, target, &reason),
         );
     }
 
+    /// ファイルツリーの右クリックメニュー・トグルの dispatch 失敗（#1399）
+    pub(crate) fn notify_tree_dispatch_failed(
+        &mut self,
+        op: &str,
+        target: Option<&str>,
+        err: &tako_control::DispatchError,
+    ) {
+        self.notify_ui_dispatch_failed(NoticeArea::Tree, op, target, err);
+    }
+
     /// dispatch を経由しない経路（OS ダイアログ・PTY 起動）の失敗の通知（#1399）。
     /// 理由は `String` しか無いので分類は `operation` 固定
     pub(crate) fn notify_tree_op_failed(&mut self, op: &str, target: Option<&str>, reason: &str) {
-        self.notify_tree_failure(
+        self.notify_ui_failure(
+            NoticeArea::Tree,
             op,
             "operation",
             crate::ui_text::sidebar::notice_op_failed(op, target, reason),
@@ -2075,7 +2129,8 @@ impl TakoApp {
 
     /// ファイル行を開けなかったときの通知（#1283 の cmd+クリックと同じ文言。#1399）
     pub(crate) fn notify_tree_open_failed(&mut self, diag_op: &str, path: &str, reason: &str) {
-        self.notify_tree_failure(
+        self.notify_ui_failure(
+            NoticeArea::Tree,
             diag_op,
             "operation",
             crate::ui_text::sidebar::notice_open_failed(path, reason),
@@ -2088,6 +2143,15 @@ impl TakoApp {
     pub(crate) fn legacy_1399() -> bool {
         static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *LEGACY.get_or_init(|| std::env::var("TAKO_1399_LEGACY").map(|v| v == "1") == Ok(true))
+    }
+
+    /// #1417 の A/B。`TAKO_1417_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
+    /// （ツリー以外の画面の dispatch 失敗を通知欄にも persist.log にも出さない
+    /// = 「行を押しても無言」の再現）。#1399 と env を分けてあるので、
+    /// 片方のアームがもう片方の画面の回帰を隠さない
+    pub(crate) fn legacy_1417() -> bool {
+        static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *LEGACY.get_or_init(|| std::env::var("TAKO_1417_LEGACY").map(|v| v == "1") == Ok(true))
     }
 
     /// リモート行の右クリックメニューの実行（#919）
