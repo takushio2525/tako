@@ -390,3 +390,89 @@ mod remote_root_order_tests {
         assert_eq!(order.trailing.len(), 1);
     }
 }
+
+// ─────────── 一覧を上限で切り詰めた事実（#1402） ───────────
+//
+// 1 ディレクトリの表示エントリ数（`filetree::MAX_ENTRIES` = 500）と
+// `tree git-status` の応答エントリ数（既定 500）はどちらも上限を持つ。
+// #1402 の実害は「上限そのもの」ではなく **画面だけが黙っていた**こと:
+// CLI / MCP は `truncated: true` を返すのに、ツリーは切り詰めたぶんを
+// 何の表示もなく捨てていた（ユーザーからは「そのファイルが存在しない」に見える）。
+//
+// 判断（何件見せたか / 総数は何件か / 切り詰めたか）をここ 1 本にして、
+// 画面と機械可読の応答が**同じ答え**を返すようにする。
+// 上限の値そのものは関心が別（表示の暴走防止 / 応答サイズの上限）なので
+// 呼び出し側に残し、ここへは `limit` として渡してもらう。
+
+/// 一覧を上限で切り詰めた事実（#1402）。
+///
+/// 「見せた件数」と「切り詰める前の総数」の 2 つだけを持つ。`shown == total` は
+/// 切り詰めていない（**上限ちょうども切り詰めではない**）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Truncation {
+    /// 実際に見せている件数
+    pub shown: usize,
+    /// 切り詰める前の総数
+    pub total: usize,
+}
+
+impl Truncation {
+    /// 総数と上限から判断を作る。`limit == 0` でも panic しない（`shown = 0`）
+    pub fn new(total: usize, limit: usize) -> Self {
+        Self {
+            shown: total.min(limit),
+            total,
+        }
+    }
+
+    /// 切り詰めたか（= 見せていない件数がある）
+    pub fn truncated(&self) -> bool {
+        self.total > self.shown
+    }
+
+    /// 見せていない件数
+    pub fn hidden(&self) -> usize {
+        self.total.saturating_sub(self.shown)
+    }
+}
+
+#[cfg(test)]
+mod truncation_tests {
+    use super::*;
+
+    /// 境界: 上限未満・上限ちょうど・上限超過（#1402 の受け入れ条件 3(c) の正本）
+    #[test]
+    fn 上限ちょうどは切り詰めではない() {
+        let under = Truncation::new(499, 500);
+        assert_eq!((under.shown, under.total), (499, 499));
+        assert!(!under.truncated());
+        assert_eq!(under.hidden(), 0);
+
+        let exact = Truncation::new(500, 500);
+        assert_eq!((exact.shown, exact.total), (500, 500));
+        assert!(!exact.truncated(), "上限ちょうどで申告すると狼少年になる");
+        assert_eq!(exact.hidden(), 0);
+
+        let over = Truncation::new(560, 500);
+        assert_eq!((over.shown, over.total), (500, 560));
+        assert!(over.truncated());
+        assert_eq!(over.hidden(), 60);
+    }
+
+    /// 極端な入力でも panic しない（上限 0 / 総数 0 / usize の端）
+    #[test]
+    fn 極端な入力でも壊れない() {
+        let zero_limit = Truncation::new(3, 0);
+        assert_eq!((zero_limit.shown, zero_limit.hidden()), (0, 3));
+        assert!(zero_limit.truncated());
+
+        let empty = Truncation::new(0, 500);
+        assert!(!empty.truncated());
+        assert_eq!(empty.hidden(), 0);
+        assert_eq!(empty, Truncation::default());
+
+        let huge = Truncation::new(usize::MAX, 1);
+        assert!(huge.truncated());
+        assert_eq!(huge.hidden(), usize::MAX - 1);
+    }
+}

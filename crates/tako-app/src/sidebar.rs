@@ -1024,6 +1024,12 @@ impl TakoApp {
                 theme.text_muted,
             ),
             filetree::RowNote::Error(report) => (report.clone(), theme.red),
+            // #1402: 切り詰めは**失敗ではない**（上限まで正しく出している）ので
+            // red にしない。行があること自体が「続きがある」の合図
+            filetree::RowNote::Truncated { shown, total } => (
+                crate::ui_text::sidebar::note_truncated(*shown, *total),
+                theme.text_muted,
+            ),
         };
         // #1010: 読み込み中は回る弧を添える（「止まっている」と区別が付く）
         let loading = matches!(note, filetree::RowNote::Loading);

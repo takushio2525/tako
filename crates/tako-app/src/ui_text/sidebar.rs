@@ -129,6 +129,31 @@ pub fn note_symlink_loop(real: &str) -> String {
     )
 }
 
+/// 1 ディレクトリの表示を上限で切り詰めたときの説明行（#1402）。
+///
+/// 上限（`filetree::MAX_ENTRIES`）を超えたぶんを黙って捨てると、ユーザーからは
+/// 「そのファイルが存在しない」ように見える（機械可読側の `tree git-status` は
+/// `truncated` を返していたので、画面だけが黙っていた）。**総数まで出す**のが要点:
+/// 「何件隠れているか」が分からないと、ツリーで探すのを諦める判断ができない
+pub fn note_truncated(shown: usize, total: usize) -> String {
+    tr!(
+        format!("{shown} 件まで表示（全 {total} 件）"),
+        format!("Showing {shown} of {total} entries")
+    )
+}
+
+/// ディレクトリを読めなかったときの説明行（#1402）。
+///
+/// `read_dir` の失敗（権限なし・消滅）を空 Vec へ落としていたので、**権限の無い
+/// フォルダと空のフォルダが同じ見え方**だった。`reason` は OS が返した理由をそのまま
+/// 渡す（言語非依存の詳細。リモート行が生の詳細を出すのと同じ作法 = #919）
+pub fn note_read_failed(reason: &str) -> String {
+    tr!(
+        format!("読み込めませんでした: {reason}"),
+        format!("Cannot read this folder: {reason}")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests_support;
@@ -180,6 +205,38 @@ mod tests {
                 notice_op_failed("Op", Some("/tmp/x"), "why"),
                 notice_op_failed("Op", None, "why"),
                 "target の有無が文言に出ていない"
+            );
+        });
+    }
+
+    /// 切り詰めの説明は**見せた件数と総数の両方**を出す（#1402）。
+    ///
+    /// 「一部だけ表示しています」のような件数の無い文言だと、探すのを諦める判断が
+    /// できない（総数が分かって初めて「ターミナルで見る」へ切り替えられる）
+    #[test]
+    fn 切り詰めと読み取り失敗の文言が日英で出る() {
+        tests_support::with_lang(Lang::Ja, || {
+            assert_eq!(note_truncated(500, 560), "500 件まで表示（全 560 件）");
+            assert_eq!(
+                note_read_failed("Permission denied (os error 13)"),
+                "読み込めませんでした: Permission denied (os error 13)"
+            );
+        });
+        tests_support::with_lang(Lang::En, || {
+            assert_eq!(note_truncated(500, 560), "Showing 500 of 560 entries");
+            assert_eq!(
+                note_read_failed("Permission denied (os error 13)"),
+                "Cannot read this folder: Permission denied (os error 13)"
+            );
+        });
+        // 件数が両方とも文言に出ている（片方だけ出す形へ退化していない）
+        tests_support::for_each_lang(|| {
+            let text = note_truncated(500, 560);
+            assert!(text.contains("500") && text.contains("560"), "{text}");
+            assert_ne!(
+                note_truncated(500, 560),
+                note_truncated(500, 999),
+                "総数が文言に出ていない"
             );
         });
     }
@@ -274,6 +331,9 @@ mod tests {
                 note_external_change().to_string(),
                 // #1398: 打ち切りの説明（差し込むパスは言語非依存）
                 note_symlink_loop("/tmp/x"),
+                // #1402: 切り詰め・読み取り失敗の説明（件数と OS の理由は言語非依存）
+                note_truncated(500, 560),
+                note_read_failed("Permission denied (os error 13)"),
             ]
         });
     }
