@@ -268,6 +268,43 @@ fn write_serve_health(health: &crate::remote_serve::ServeHealth) {
     }
 }
 
+/// 接続元検証の状態（#841）。`tako remote status` / MCP `tako_remote_status` が読む。
+///
+/// **理由コードと件数だけ**を持つ（XFF の IP・ヘッダの中身・トークンは持たない）
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PeerGuardState {
+    /// ループバック TCP で検証を効かせているか（UDS / legacy では false）
+    pub enforced: bool,
+    /// 所有者ゲートの種類（unix = `uid` / Windows = `unavailable`）
+    pub owner_check: String,
+    /// 起動してから拒否した件数
+    pub rejected: u64,
+    /// 直近の拒否の理由コード
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_code: Option<String>,
+    /// 直近の拒否の時刻（UNIX 秒）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_at: Option<u64>,
+}
+
+/// 接続元検証の状態ファイル（#841）
+pub fn peer_guard_path() -> std::path::PathBuf {
+    state_dir().join("tako-remote.peer")
+}
+
+/// 接続元検証の状態を読む（無い = この daemon は #841 以前）
+pub fn read_peer_guard() -> Option<PeerGuardState> {
+    let raw = std::fs::read_to_string(peer_guard_path()).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// 接続元検証の状態を書き出す（0600。他の state ファイルと揃える）
+fn write_peer_guard(state: &PeerGuardState) {
+    if let Ok(json) = serde_json::to_string(state) {
+        let _ = write_secret_file(&peer_guard_path(), &json);
+    }
+}
+
 /// serve の増減を audit.log へ残す（#1049: 「何が消したか」を後から追えるように）。
 /// pid と実行ファイルが載るので、世代違いの tako が犯人なら名指しできる
 fn audit_serve(event: &str, extra: serde_json::Value) {
@@ -511,6 +548,7 @@ fn cleanup_state_files() {
     let _ = std::fs::remove_file(url_path());
     let _ = std::fs::remove_file(port_path());
     let _ = std::fs::remove_file(serve_health_path());
+    let _ = std::fs::remove_file(peer_guard_path());
     // QR ファイル（ランダム名）を掃除する
     let dir = state_dir();
     if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -562,6 +600,18 @@ struct DaemonCtx {
     base_url: String,
     /// 自ノードの ts.net ホスト名（XFF 検証用。#287 P1-1）
     expected_host: String,
+    /// 待ち受けているエンドポイント（接続元検証の分岐に使う。#841）。
+    /// **分岐はプラットフォームではなくこの形**で決まる
+    endpoint: local_endpoint::Endpoint,
+    /// 接続元検証の拒否の集計（`tako remote status` に出す。#841）
+    peer_rejects: Mutex<PeerRejectState>,
+}
+
+/// 接続元検証で拒否した件数と直近の理由（#841）
+#[derive(Debug, Default)]
+struct PeerRejectState {
+    total: u64,
+    last: Option<(&'static str, u64)>,
 }
 
 /// デバイスごとの WS 接続状態
@@ -621,6 +671,56 @@ impl DaemonCtx {
             .is_some_and(|s| s.count > 0)
     }
 
+    /// 接続元検証の拒否を記録する（#841）。
+    ///
+    /// 残すのは**理由コードだけ**。ヘッダの中身・`X-Forwarded-For` の IP・
+    /// 管理トークン・ペイン内容は監査ログにも診断ログにも載せない
+    fn record_peer_reject(&self, reject: local_endpoint::PeerReject) {
+        let at = now_epoch_secs();
+        let total = {
+            let mut st = self
+                .peer_rejects
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            st.total += 1;
+            st.last = Some((reject.code(), at));
+            st.total
+        };
+        if let Ok(reg) = self.registry.lock() {
+            reg.audit(
+                "peer_verification_rejected",
+                "",
+                "",
+                json!({ "code": reject.code(), "endpoint_kind": self.endpoint.kind_str() }),
+            );
+        }
+        crate::diag::persist_log(&format!(
+            "remote 接続元検証: 拒否 code={} endpoint_kind={} 累計={total}",
+            reject.code(),
+            self.endpoint.kind_str()
+        ));
+        write_peer_guard(&self.peer_guard_state());
+    }
+
+    /// status へ出す接続元検証の状態（#841）
+    fn peer_guard_state(&self) -> PeerGuardState {
+        let (total, last) = {
+            let st = self
+                .peer_rejects
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (st.total, st.last)
+        };
+        PeerGuardState {
+            enforced: matches!(self.endpoint, local_endpoint::Endpoint::Loopback(_))
+                && !local_endpoint::legacy_mode(),
+            owner_check: local_endpoint::owner_check_kind().to_string(),
+            rejected: total,
+            last_code: last.map(|(c, _)| c.to_string()),
+            last_at: last.map(|(_, at)| at),
+        }
+    }
+
     /// 接続中デバイス → WS 接続数のスナップショット
     fn connections_snapshot(&self) -> HashMap<String, usize> {
         self.ws_connections
@@ -657,6 +757,44 @@ enum AuthDecision {
     Rejected(u16, String),
 }
 
+/// **`X-Forwarded-For` / `X-Forwarded-Host` を identity として読む唯一の入口**（#841）。
+///
+/// この 2 つは `tailscale serve` が付けるヘッダで、層①はこれを根拠に接続元の
+/// tailnet ノードを決める。ループバック TCP は**同一マシンの別プロセスからも繋がる**ので、
+/// 検証が無いと「ペアリング済み端末の tailnet IP を XFF に入れる」だけで interact 以上の
+/// role を騙れる（= 実質シェルアクセス）。そこで**読む前に接続元プロセスを検証**し、
+/// 信頼できないときはヘッダを渡さずに 403 で落とす。
+///
+/// XFF が無いリクエスト（= serve を経由していないローカル直結）は検証もせず素通しする。
+/// 呼び出し側が `Identity::Local` として扱い、管理 API 以外は 401 になる既存の流れを変えない。
+///
+/// **role 認可のあるリクエストではこの関数が 1 リクエストにつき 2 回通る**
+/// （層①の `identify_tailnet` → 層②の `authorize_device`）。judgement は毎回引き直す:
+/// 実測で 1 回あたり約 1.8ms（ソケット約 1800 本の macOS）で、判定を覚えておくより
+/// **そのつど事実を見に行くほうが安全**（pid が別の実行ファイルに置き換わった瞬間から
+/// 結果が変わる = `procinfo::image_path` の #936 の性質）
+fn forwarded_identity(
+    ctx: &DaemonCtx,
+    request: &tiny_http::Request,
+) -> Result<(Option<String>, Option<String>), (u16, String)> {
+    let forwarded = header_value(request, "x-forwarded-for");
+    if forwarded.is_none() {
+        return Ok((None, None));
+    }
+    let trust = local_endpoint::verify_peer(&ctx.endpoint, request.remote_addr().copied());
+    if let Some(reject) = trust.reject() {
+        ctx.record_peer_reject(reject);
+        return Err((
+            403,
+            format!(
+                "serve 経由を名乗る接続の接続元を検証できない: {}",
+                reject.describe()
+            ),
+        ));
+    }
+    Ok((forwarded, header_value(request, "x-forwarded-host")))
+}
+
 /// 層①（identity）+ 層②（デバイス role）を評価する。
 /// `required` 以上の role を持つ登録済みデバイスのみ Allowed
 fn authorize_device(
@@ -664,8 +802,10 @@ fn authorize_device(
     request: &tiny_http::Request,
     required: DeviceRole,
 ) -> AuthDecision {
-    let forwarded = header_value(request, "x-forwarded-for");
-    let forwarded_host = header_value(request, "x-forwarded-host");
+    let (forwarded, forwarded_host) = match forwarded_identity(ctx, request) {
+        Ok(pair) => pair,
+        Err((status, e)) => return AuthDecision::Rejected(status, e),
+    };
     match crate::remote_auth::identify(
         &ctx.registry,
         &ctx.ts_cli,
@@ -710,8 +850,7 @@ fn identify_tailnet(
     ctx: &DaemonCtx,
     request: &tiny_http::Request,
 ) -> Result<crate::tailscale::WhoisInfo, (u16, String)> {
-    let forwarded = header_value(request, "x-forwarded-for");
-    let forwarded_host = header_value(request, "x-forwarded-host");
+    let (forwarded, forwarded_host) = forwarded_identity(ctx, request)?;
     match crate::remote_auth::identify(
         &ctx.registry,
         &ctx.ts_cli,
@@ -1866,7 +2005,12 @@ pub fn run_daemon() -> io::Result<()> {
         ws_connections: Mutex::new(HashMap::new()),
         base_url: base_url.clone(),
         expected_host,
+        endpoint: endpoint.clone(),
+        peer_rejects: Mutex::new(PeerRejectState::default()),
     });
+    // 接続元検証の状態を起動時点で 1 度書く（#841）。
+    // 拒否が 1 件も出ていなくても「効いているか」を status から読めるようにする
+    write_peer_guard(&ctx.peer_guard_state());
 
     // IPC 接続（#281: dispatch 正規経路。app 不在時は read-only fallback）
     let app_conn = Arc::new(RwLock::new(AppConnection::new()));
@@ -2312,6 +2456,12 @@ pub fn daemon_status() -> Value {
     if !warnings.is_empty() {
         status["warnings"] = json!(warnings);
     }
+    // 接続元プロセス検証の状態（#841）。daemon が起動時と拒否のたびに書く。
+    // ファイルが無い = #841 以前の daemon が動いている（状態を名乗れない）
+    status["peer_verification"] = match read_peer_guard() {
+        Some(guard) => serde_json::to_value(&guard).unwrap_or_else(|_| json!({ "known": false })),
+        None => json!({ "known": false }),
+    };
     // 未選択を "gui" と言わない（既定探索は GUI 版が無ければ standalone に当たる）
     status["tailscale_variant"] = json!(crate::tailscale::selection_label());
     // 稼働中 serve の実行バイナリを可視化する（#432: どの世代の serve が
@@ -6102,6 +6252,159 @@ mod tests {
         assert!(tcp.contains("tako remote start"), "{tcp}");
     }
 
+    /// #841: **偽の `X-Forwarded-For` を付けたローカルプロセスは認証を通れない**。
+    ///
+    /// 修正前は、ループバック TCP へ繋げる誰でも「ペアリング済み端末の tailnet IP を
+    /// XFF に入れる」だけで層①を通り、role 次第で実質シェルアクセスになった。
+    /// この 1 本が **A/B を同居**させる:
+    ///
+    /// - 既定（検証あり）= 403 + 理由コード
+    /// - `TAKO_841_LEGACY=1`（検証なし）= 200 / 層②も通過 = **修正前の再現**
+    /// - `TAKO_REMOTE_TRUSTED_PEER_NAMES` で接続元を信頼名にする = 200
+    ///   （正規の tailscaled 経由の代理。実 tailscaled は root で動くのでテストから起こせない）
+    #[test]
+    fn 偽のxffを付けたローカルプロセスは接続元検証で拒否される() {
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "tako-841-peer-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("一時ディレクトリ");
+        std::env::set_var("TAKO_REMOTE_STATE_DIR", dir.as_os_str());
+        std::env::remove_var("TAKO_841_LEGACY");
+        std::env::remove_var("TAKO_REMOTE_TRUSTED_PEER_NAMES");
+
+        // 偽装に使う「ペアリング済み端末」を仕込む。whois はキャッシュに入れて
+        // tailscale CLI を呼ばせない（テストが実環境の tailnet に依存しないため）
+        let who = crate::tailscale::WhoisInfo {
+            stable_id: "nTESTPEER841".to_string(),
+            node_name: "phone.tail0000.ts.net".to_string(),
+            hostname: "phone".to_string(),
+            login: "user@example.com".to_string(),
+        };
+        let mut registry = DeviceRegistry::open(&dir).expect("レジストリ");
+        registry.cache_whois("100.64.0.9", who.clone());
+        registry.request_pairing(&who, "phone", DeviceRole::Admin);
+        registry
+            .approve(&who.stable_id, Some(DeviceRole::Admin))
+            .expect("承認");
+
+        let (server, endpoint) =
+            local_endpoint::bind(&local_endpoint::EndpointSpec::Loopback).expect("bind");
+        let ctx = Arc::new(DaemonCtx {
+            registry: Mutex::new(registry),
+            ts_cli: "tailscale".to_string(),
+            admin_token: "test-admin-token".to_string(),
+            tmux_socket: "tako-test-841".to_string(),
+            ws_connections: Mutex::new(HashMap::new()),
+            base_url: "https://example.tail0000.ts.net".to_string(),
+            expected_host: "example.tail0000.ts.net".to_string(),
+            endpoint: endpoint.clone(),
+            peer_rejects: Mutex::new(PeerRejectState::default()),
+        });
+        let app_conn = Arc::new(RwLock::new(AppConnection::new()));
+        let pane_mapping = Arc::new(RwLock::new(PaneMapping::new()));
+        let broadcasters = new_broadcaster_map();
+
+        // 下で撃つ本数と同じにする（多いと最後の recv_timeout をまるごと待つ）
+        const REQUESTS: usize = 5;
+        let handle = std::thread::spawn(move || {
+            for _ in 0..REQUESTS {
+                match server.recv_timeout(std::time::Duration::from_secs(10)) {
+                    Ok(Some(req)) => {
+                        handle_request_v2(req, &ctx, &app_conn, &pane_mapping, &broadcasters)
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        let call = |raw: &str| -> (u16, String) {
+            let resp = local_endpoint::request_raw(
+                &endpoint,
+                raw,
+                Some(std::time::Duration::from_secs(10)),
+            )
+            .expect("応答");
+            let status = resp
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|s| s.parse().ok())
+                .expect("ステータス行");
+            (status, resp)
+        };
+        // serve を名乗る偽リクエスト（XFF / XFH は本物の serve と同じ形に揃えてある）
+        let forged = |path: &str| {
+            format!(
+                "GET {path} HTTP/1.1\r\nHost: localhost\r\n\
+                 X-Forwarded-For: 100.64.0.9\r\n\
+                 X-Forwarded-Host: example.tail0000.ts.net\r\n\
+                 Connection: close\r\n\r\n"
+            )
+        };
+
+        // ① 修正後: 接続元がこのテストプロセス（= tailscaled ではない）なので 403
+        let (status, body) = call(&forged("/api/me"));
+        assert_eq!(status, 403, "偽の XFF は層①へ届く前に落ちる: {body}");
+        assert!(
+            body.contains("接続元プロセスが tailscale デーモンではない"),
+            "拒否理由が返る: {body}"
+        );
+        // ② 層②（role 認可）が要る経路も同じ入口で落ちる。
+        //    IPC を触らない `/api/devices`（Admin role）を使う = #1403 の
+        //    「IPC の往復は同時に 1 本」テストと並列に走っても互いを壊さない
+        let (status, _) = call(&forged("/api/devices"));
+        assert_eq!(status, 403, "role を持つ端末を騙っても通らない");
+
+        // 拒否は理由コードで残る（本文・トークン・XFF の IP は残さない）
+        let guard = read_peer_guard().expect("接続元検証の状態ファイル");
+        assert!(guard.enforced, "ループバック TCP では検証が効いている");
+        assert_eq!(guard.rejected, 2);
+        assert_eq!(guard.last_code.as_deref(), Some("not_tailscale_daemon"));
+        assert_eq!(guard.owner_check, local_endpoint::owner_check_kind());
+        let log = crate::diag::persist_log_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default();
+        assert!(
+            log.contains("remote 接続元検証: 拒否 code=not_tailscale_daemon"),
+            "persist.log に理由コードが残る"
+        );
+        assert!(
+            !log.contains("100.64.0.9") && !log.contains("test-admin-token"),
+            "XFF の IP や管理トークンは診断ログへ出さない"
+        );
+
+        // ③ 修正前の再現（A/B）: 検証を切ると同じリクエストが通ってしまう
+        std::env::set_var("TAKO_841_LEGACY", "1");
+        let (status, body) = call(&forged("/api/me"));
+        assert_eq!(status, 200, "legacy = 偽の XFF がそのまま identity になる");
+        assert!(body.contains("\"registered\":true"), "{body}");
+        let (status, body) = call(&forged("/api/devices"));
+        assert_eq!(
+            status, 200,
+            "legacy では Admin role の端末制御まで通ってしまう"
+        );
+        assert!(body.contains("\"devices\""), "{body}");
+        std::env::remove_var("TAKO_841_LEGACY");
+
+        // ④ 正規経路の代理: 接続元を信頼名に載せれば 200 のまま（検証が厳しすぎない）
+        let own = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .expect("自分の実行ファイル名");
+        std::env::set_var("TAKO_REMOTE_TRUSTED_PEER_NAMES", &own);
+        let (status, body) = call(&forged("/api/me"));
+        assert_eq!(status, 200, "信頼できる接続元なら従来どおり通る: {body}");
+        std::env::remove_var("TAKO_REMOTE_TRUSTED_PEER_NAMES");
+
+        handle.join().expect("サーバースレッド");
+        std::env::remove_var("TAKO_REMOTE_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #1038: 待ち受けを TCP にしても認証層は同じに効くことを、**実際の HTTP 経路**で固定する。
     /// UDS の「同一ユーザーしか繋げない」がカーネル任せでなくなるぶん、
     /// ヘッダ由来の認証（層① identity / Origin / 管理トークン）が抜けないことが要になる
@@ -6114,6 +6417,8 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("一時ディレクトリ");
         let registry = DeviceRegistry::open(&dir).expect("レジストリ");
+        let (server, endpoint) =
+            local_endpoint::bind(&local_endpoint::EndpointSpec::Loopback).expect("bind");
         let ctx = Arc::new(DaemonCtx {
             registry: Mutex::new(registry),
             ts_cli: "tailscale".to_string(),
@@ -6122,9 +6427,9 @@ mod tests {
             ws_connections: Mutex::new(HashMap::new()),
             base_url: "https://example.tail0000.ts.net".to_string(),
             expected_host: "example.tail0000.ts.net".to_string(),
+            endpoint: endpoint.clone(),
+            peer_rejects: Mutex::new(PeerRejectState::default()),
         });
-        let (server, endpoint) =
-            local_endpoint::bind(&local_endpoint::EndpointSpec::Loopback).expect("bind");
         let app_conn = Arc::new(RwLock::new(AppConnection::new()));
         let pane_mapping = Arc::new(RwLock::new(PaneMapping::new()));
         let broadcasters = new_broadcaster_map();

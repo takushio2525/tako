@@ -73,6 +73,39 @@ pub fn tcp_listeners() -> Vec<TcpListenEntry> {
     imp::tcp_listeners()
 }
 
+/// ループバック TCP 接続を**張った側**（クライアント側）のプロセス（#841）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopbackPeer {
+    /// 接続元プロセスの pid
+    pub pid: u32,
+    /// 接続元ソケットの所有ユーザー。**Windows は `None`**
+    /// （この OS ではソケットの所有者を引く手段が無い = 呼び出し側は
+    /// 「所有者ゲートを強制できない」と扱う）
+    pub uid: Option<u32>,
+}
+
+/// `127.0.0.1:peer_port -> 127.0.0.1:local_port` の接続を張った側のプロセスを引く（#841）。
+///
+/// remote デーモンは `tiny_http` 越しに接続元アドレス（= `peer_port`）しか受け取れない。
+/// そこから**所有プロセス**まで辿れて初めて「この接続は tailscaled が張ったのか」を
+/// 問える。取れなければ `None`（呼び出し側は**拒否側へ倒す**こと）。
+///
+/// **`lsof` / libproc の fd 走査では引けない**（実測 2026-09-12: 非 root から
+/// root 所有 tailscaled の fd は 1 件も見えない）。macOS は `netstat -anv` と同じ
+/// `net.inet.tcp.pcblist_n` sysctl を使う。これは所有者に関係なく全ソケットを返す。
+/// Windows は `GetExtendedTcpTable`（[`tcp_listeners`] と同じ表の非 LISTEN 行）
+pub fn loopback_tcp_peer(peer_port: u16, local_port: u16) -> Option<LoopbackPeer> {
+    if peer_port == 0 || local_port == 0 || peer_port == local_port {
+        return None;
+    }
+    imp::loopback_tcp_peer(peer_port, local_port)
+}
+
+/// 自プロセスの所有ユーザー。**Windows は `None`**（[`LoopbackPeer::uid`] と対）
+pub fn current_uid() -> Option<u32> {
+    imp::current_uid()
+}
+
 /// 実行中プロセスの実行ファイルの絶対パス。取れなければ `None`
 /// （プロセスが既に居ない / 権限が無い / 取得手段が無いプラットフォーム）。
 ///
@@ -280,7 +313,7 @@ pub fn agent_process_count(procs: &[ProcEntry]) -> usize {
 
 #[cfg(windows)]
 mod imp {
-    use super::{ProcEntry, TcpListenEntry};
+    use super::{LoopbackPeer, ProcEntry, TcpListenEntry};
     use std::ffi::c_void;
 
     type Handle = *mut c_void;
@@ -672,11 +705,49 @@ mod imp {
         out.retain(|e| e.port != 0);
         out
     }
+
+    /// 127.0.0.1 の `peer_port -> local_port` を張った側の pid（#841）。
+    ///
+    /// [`tcp_listeners`] と**同じ表**（`TCP_TABLE_OWNER_PID_ALL`）の非 LISTEN 行を見る。
+    /// 4 つ組（両端のアドレスとポート）まで照合するので、たまたま同じポート番号を
+    /// 使っている別ホスト向けの接続を取り違えない。
+    ///
+    /// Windows には**ソケットの所有ユーザーを引く手段が無い**ので `uid` は `None`
+    /// （所有者ゲートは呼び出し側で「強制できない」として扱う）
+    pub(super) fn loopback_tcp_peer(peer_port: u16, local_port: u16) -> Option<LoopbackPeer> {
+        // dwLocalAddr / dwRemoteAddr はネットワークバイトオーダーの 32bit がそのまま入る
+        let loopback = u32::from_ne_bytes(std::net::Ipv4Addr::LOCALHOST.octets());
+        let buf = fetch_table(AF_INET)?;
+        let mut found: Option<u32> = None;
+        for r in rows::<TcpRowOwnerPid>(&buf) {
+            if r.state == TCP_STATE_LISTEN
+                || r.local_addr != loopback
+                || r.remote_addr != loopback
+                || port_of(r.local_port) != peer_port
+                || port_of(r.remote_port) != local_port
+            {
+                continue;
+            }
+            match found {
+                // 同じ 4 つ組が 2 行あり、しかも所有者が食い違う = どちらか分からない。
+                // 曖昧なまま「信頼できる pid」を返さない（呼び出し側は拒否へ倒す）
+                Some(pid) if pid != r.owning_pid => return None,
+                _ => found = Some(r.owning_pid),
+            }
+        }
+        found.map(|pid| LoopbackPeer { pid, uid: None })
+    }
+
+    /// Windows にはソケット / プロセスの所有ユーザーという概念の直接の対応が無い
+    /// （トークンの SID を引くのは別の権限が要る）。`None` = 所有者ゲートは効かせない
+    pub(super) fn current_uid() -> Option<u32> {
+        None
+    }
 }
 
 #[cfg(not(windows))]
 mod imp {
-    use super::{ProcEntry, TcpListenEntry};
+    use super::{LoopbackPeer, ProcEntry, TcpListenEntry};
 
     /// macOS の検査は `ports.rs` の libproc 実装が正（このモジュールは使わない）
     pub(super) fn snapshot() -> Vec<ProcEntry> {
@@ -743,10 +814,228 @@ mod imp {
     pub(super) fn image_path(pid: u32) -> Option<std::path::PathBuf> {
         std::fs::read_link(format!("/proc/{pid}/exe")).ok()
     }
+
+    /// unix はソケットの所有ユーザーを引けるので、自分の uid も返せる
+    pub(super) fn current_uid() -> Option<u32> {
+        // SAFETY: getuid は引数を取らず必ず成功する
+        Some(unsafe { libc::getuid() })
+    }
+
+    /// macOS 以外の unix は TCP テーブルの読み口を持たない（tako の対象 OS ではない）。
+    /// `None` = 呼び出し側は拒否へ倒す
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn loopback_tcp_peer(_peer_port: u16, _local_port: u16) -> Option<LoopbackPeer> {
+        None
+    }
+
+    /// macOS の接続元プロセス解決（#841）。
+    ///
+    /// ## なぜ libproc の fd 走査ではないのか
+    ///
+    /// `ports.rs` が使っている libproc の fd 走査は**自分と同じユーザーのプロセスしか
+    /// 見えない**（実測 2026-09-12: 非 root から root 所有の tailscaled は
+    /// `lsof -p <pid>` も `PROC_PIDLISTFDS` も 0 件）。tailscaled は root で動くので、
+    /// fd 走査では**正規の接続元すら特定できない**。`net.inet.tcp.pcblist_n` は
+    /// 所有者に関係なく全 TCP ソケットを返す（`netstat -anv` の `process:pid` 列と同じ出所）。
+    ///
+    /// ## バイト列の読み方
+    ///
+    /// 先頭は `struct xinpgen`（自身の長さを持つ）。以降は `{u32 len, u32 kind}` で
+    /// 始まる**自己記述レコード**の並びで、ソケット 1 本ぶんが
+    /// XSO_INPCB → XSO_SOCKET → XSO_RCVBUF → XSO_SNDBUF → XSO_STATS → XSO_TCPCB の
+    /// 順に連続する。次のレコードへは **8 バイト境界へ丸めて**進む（`xtcpcb_n` のように
+    /// len が 8 の倍数でない種別があり、len だけで進むと途中でずれて走査が止まる）。
+    ///
+    /// `xinpcb_n` / `xsocket_n` は xnu の PRIVATE ヘッダにあり **SDK に入っていない**。
+    /// しかも **4 バイトパック**（`u_int64_t so_pcb` がオフセット 28 に来る = 自然
+    /// アライメントなら 32）なので、`#[repr(C)]` の転記は取り違えやすい。ここでは
+    /// **必要なフィールドのオフセットだけ**を定数で持ち、レコード長で範囲を守る。
+    /// オフセットの正しさは「自分で張った接続の pid / uid が自分と一致するか」を
+    /// 見るユニットテストが実測で押さえる（ずれたら必ず落ちる）
+    #[cfg(target_os = "macos")]
+    pub(super) fn loopback_tcp_peer(peer_port: u16, local_port: u16) -> Option<LoopbackPeer> {
+        /// `XSO_SOCKET`（socketvar.h）
+        const XSO_SOCKET: u32 = 0x001;
+        /// `XSO_INPCB`（socketvar.h）
+        const XSO_INPCB: u32 = 0x010;
+        /// `xinpcb_n.inp_fport`（u16・ネットワークバイトオーダー）
+        const INP_FPORT: usize = 16;
+        /// `xinpcb_n.inp_lport`
+        const INP_LPORT: usize = 18;
+        /// `xinpcb_n.inp_vflag`（u8）
+        const INP_VFLAG: usize = 44;
+        /// `xinpcb_n.inp_dependfaddr` の IPv4 部（`in_addr_4in6` の末尾 4 バイト）
+        const INP_FADDR4: usize = 60;
+        /// `xinpcb_n.inp_dependladdr` の IPv4 部
+        const INP_LADDR4: usize = 76;
+        /// ここまで読むので、これより短い XSO_INPCB は無視する
+        const INPCB_MIN: usize = INP_LADDR4 + 4;
+        /// `INP_IPV4`（in_pcb.h）
+        const INP_IPV4: u8 = 0x1;
+        /// `xsocket_n.so_uid`（u32）
+        const SO_UID: usize = 64;
+        /// `xsocket_n.so_last_pid`（pid_t）
+        const SO_LAST_PID: usize = 68;
+        /// ここまで読むので、これより短い XSO_SOCKET は無視する
+        const SOCKET_MIN: usize = SO_LAST_PID + 4;
+
+        fn u32_at(rec: &[u8], off: usize) -> u32 {
+            u32::from_ne_bytes([rec[off], rec[off + 1], rec[off + 2], rec[off + 3]])
+        }
+        fn port_at(rec: &[u8], off: usize) -> u16 {
+            u16::from_be_bytes([rec[off], rec[off + 1]])
+        }
+        /// 次のレコードは 8 バイト境界から始まる
+        fn roundup8(n: usize) -> usize {
+            n.div_ceil(8) * 8
+        }
+
+        let buf = pcblist_n()?;
+        if buf.len() < 8 {
+            return None;
+        }
+        // 先頭の xinpgen を読み飛ばす（自身の長さが先頭 u32）
+        let mut pos = roundup8(u32_at(&buf, 0) as usize);
+        let loopback = u32::from_ne_bytes(std::net::Ipv4Addr::LOCALHOST.octets());
+        // 直前に見た XSO_INPCB が探している 4 つ組だったか
+        let mut pending = false;
+        let mut found: Option<LoopbackPeer> = None;
+        while pos + 8 <= buf.len() {
+            let rlen = u32_at(&buf, pos) as usize;
+            let kind = u32_at(&buf, pos + 4);
+            if rlen < 8 || pos + rlen > buf.len() {
+                break;
+            }
+            let rec = &buf[pos..pos + rlen];
+            if kind == XSO_INPCB {
+                pending = rlen >= INPCB_MIN
+                    && rec[INP_VFLAG] & INP_IPV4 != 0
+                    && port_at(rec, INP_LPORT) == peer_port
+                    && port_at(rec, INP_FPORT) == local_port
+                    && u32_at(rec, INP_LADDR4) == loopback
+                    && u32_at(rec, INP_FADDR4) == loopback;
+            } else if kind == XSO_SOCKET && std::mem::take(&mut pending) && rlen >= SOCKET_MIN {
+                let pid = u32_at(rec, SO_LAST_PID);
+                let peer = LoopbackPeer {
+                    pid,
+                    uid: Some(u32_at(rec, SO_UID)),
+                };
+                if pid != 0 {
+                    match found {
+                        // 同じ 4 つ組が 2 本あって所有者が食い違う = どちらか分からない。
+                        // 曖昧なまま「信頼できる pid」を名乗らせない（拒否へ倒す）
+                        Some(prev) if prev != peer => return None,
+                        _ => found = Some(peer),
+                    }
+                }
+            }
+            pos += roundup8(rlen);
+        }
+        found
+    }
+
+    /// `net.inet.tcp.pcblist_n` の生バイト列。
+    /// 問い合わせと取得の間にソケットが増えるので、少し大きめに確保して数回試す
+    #[cfg(target_os = "macos")]
+    fn pcblist_n() -> Option<Vec<u8>> {
+        const NAME: &[u8] = b"net.inet.tcp.pcblist_n\0";
+        for _ in 0..4 {
+            let mut len: libc::size_t = 0;
+            // SAFETY: 1 回目はバッファ null + len 0 で必要量を問い合わせる規定の呼び方
+            let rc = unsafe {
+                libc::sysctlbyname(
+                    NAME.as_ptr().cast(),
+                    std::ptr::null_mut(),
+                    &mut len,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if rc != 0 || len == 0 {
+                return None;
+            }
+            // 問い合わせ後に増えたぶんの余白（足りなければ ENOMEM で取り直す）
+            let cap = len + len / 8 + 4096;
+            let mut buf = vec![0u8; cap];
+            let mut got: libc::size_t = cap;
+            // SAFETY: buf は cap バイト確保済みで、got にその長さを渡している
+            let rc = unsafe {
+                libc::sysctlbyname(
+                    NAME.as_ptr().cast(),
+                    buf.as_mut_ptr().cast(),
+                    &mut got,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if rc == 0 {
+                buf.truncate(got.min(cap));
+                return Some(buf);
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    /// #841: 接続元プロセスの解決が**実際に当たる**か。
+    ///
+    /// macOS 側は SDK に無い PRIVATE 構造体のオフセットを定数で持っているので、
+    /// ここがオフセットの唯一の実測検査になる（ずれたら pid / uid が別の値になって落ちる）。
+    /// Windows 側は `GetExtendedTcpTable` の 4 つ組照合の検査。
+    /// 自分で張った接続を自分で引くので権限の問題が起きず、両ランナーで走る
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn 自分で張ったループバック接続の所有プロセスを引ける() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listen");
+        let local_port = listener.local_addr().expect("listen addr").port();
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", local_port)).expect("connect");
+        let peer_port = client.local_addr().expect("client addr").port();
+        let _accepted = listener.accept().expect("accept");
+        // 接続が確立したことを確かめてから表を引く（未確立だと行がまだ無い）
+        client.write_all(b"x").expect("write");
+
+        let peer = super::loopback_tcp_peer(peer_port, local_port)
+            .expect("自分で張った接続の所有プロセスは引けるはず");
+        assert_eq!(
+            peer.pid,
+            std::process::id(),
+            "接続を張ったのはこのテストプロセス自身"
+        );
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                peer.uid,
+                super::current_uid(),
+                "ソケットの所有ユーザーは自分自身"
+            );
+            assert!(peer.uid.is_some(), "unix は uid を引ける");
+        }
+        #[cfg(windows)]
+        assert_eq!(peer.uid, None, "Windows は所有ユーザーを引かない");
+
+        // 向きを逆にすると別の接続（= 受け側のソケット）を指すので、
+        // 「4 つ組をそのまま照合している」ことも確かめる
+        let reversed = super::loopback_tcp_peer(local_port, peer_port);
+        assert!(
+            reversed.is_some_and(|p| p.pid == std::process::id()),
+            "受け側も同じプロセスなので引けるが、別のソケットとして引ける"
+        );
+    }
+
+    /// 引けないときは `None`（呼び出し側が拒否へ倒せる形）
+    #[test]
+    fn 使われていない組み合わせや不正なポートはnone() {
+        // 0 と自己ループは問い合わせる前に弾く
+        assert_eq!(super::loopback_tcp_peer(0, 1), None);
+        assert_eq!(super::loopback_tcp_peer(1, 0), None);
+        assert_eq!(super::loopback_tcp_peer(9, 9), None);
+        // 特権ポート同士の接続は（非 root では）張れないので必ず見つからない
+        assert_eq!(super::loopback_tcp_peer(1, 2), None);
+    }
+
     /// #1282: コマンドライン / 起動時刻の FFI が**実際に読めるか**。
     ///
     /// 自分自身を対象にするので権限の問題が起きず、CI の Windows ランナーでも走る。
