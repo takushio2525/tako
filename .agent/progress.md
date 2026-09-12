@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-12（#1403: remote daemon の HTTP 受信を少数ワーカーへ並列化した）
-- 受信ループを `serve_http_requests` へ切り出し、`Arc<tiny_http::Server>` を既定 4 本（`TAKO_REMOTE_HTTP_WORKERS` で 1..=32）のワーカーが recv する形へ。合流は `thread::scope`（忘れられない）・1 本の panic は `catch_unwind` で監査ログへ・recv 破損は全員で降りる。daemon → app の IPC は `with_app_ipc` の 1 実装が往復の間ロックを握る（呼び出し 4 か所を集約）。波及で `append_audit` を 1 行 1 write へ（書く者が増えたので `writeln!` だと行が混ざる）
-- 隔離 daemon（偽 tailscale の whois 3 秒・本番 pid 64092 は不可侵）の A/B: 修正前 B = **2.71 秒** → 新 **0.0004 秒**（A は 3.03 秒のまま）。`TAKO_1403_LEGACY=1` / `TAKO_REMOTE_HTTP_WORKERS=1` はどちらも 2.72 秒で旧挙動を再現。飽和の限界も実測（4 本同時で health 2.51 秒・6 本で溢れた 2 本が 6.04 秒）
-- 番犬 `issue1403_http_workers_watchdog` 7 本 + 単体 6 本。注入 9 通りで file:line 名指し FAILED（IPC は `left: 4 / right: 1`）。**mid-file の `#[cfg(test)]` は禁止**（#1401 番犬の走査範囲が切れる）・`LEGACY_ARM` マーカーは実時間アサート用なので付けない。workspace 4487 passed 0 failed × 5・check-windows error 0
-
 ## 2026-09-12（#1398: ディレクトリへのシンボリックリンクがファイル扱いになるのを直した）
 - 種別を「**辿った先**」で決める 1 実装（`filetree::entry_is_dir`。リンクのときだけ追加 `metadata`）へ寄せ、開く側（`OpenFile` の `is_file()` / `open_plan::route`）と向きを揃えた。辿って初めて起こる循環は `collect_rows` が canonical パスの照合で打ち切り、**打ち切りを行として見せる**（`RowNote::Error`・描画はリモート行と同じ `render_note_row` の 1 実装）
 - 修正前ソースの実測: `link` 行が `("link", 1, is_dir=false)` で `toggle_dir` しても増えない → 修正後は展開でき `inner.txt` が depth 2 に出る。実注入の A/B は `file_type()` へ戻すと番犬が `filetree.rs:699` / `:690` を名指し FAILED、照合を落とすと祖先リンクの 2 周目（depth 3 に `README.md`）が出て loop テスト 2 本が FAILED
@@ -59,3 +54,8 @@
 - 判定材料を「組んでから比べる」から「組む前の 128bit キー」へ（`layout::change_key` + 借用版 `PaneMetaRef`）。UI 側の付帯情報は `LayoutExtras` に 1 度だけ組んでキーと穴埋めが同じ値を読む。`collapsed` は HashSet 由来なので昇順に整える。載せ忘れは 3 段で止める（網羅的分解でコンパイル / `CHANGE_KEY_FIELDS` × #916 指紋の番犬 / 連続 30 スキップで必ず突き合わせる保険）
 - 実測 A/B（23 ペイン・同一手順の隔離 GUI）: 70 秒アイドルで新 = 37 呼び出し中 **35 スキップ・capture 2 回**、legacy（`TAKO_1425_LEGACY=1`）= **capture 63 回**。`written` は両腕とも 26 で同一（保存結果は不変）。確保は 22 ペインで **319 回 / 29893 バイト → 0 回 / 0 バイト**（0.349ms → 0.065ms）
 - 番犬 6 本 + 確保計測 1 本（注入 6 通りで file:line 名指し FAILED）。操作 13 種で保存を実測・再起動復元 23 ペイン成功。内訳は `tako persist` の `save_layout` で読める。**install 要**
+
+## 2026-09-12（docs: activeContext を実態へ同期）
+- 「現在の対象」が 9/8 / main `4d84695` で止まり、close 済みの Issue 12 件（#1167 / #995 / #771 / #1122 / #1114 / #1124 / #1013 / #1015 / #1022 / #1030 / #1033 / #1034 / #1035）を open として案内していたのを、gh の state と git log で全行照合して書き直した
+- 直した主な食い違い: install 世代（9/7 19:52 / v0.8.7 → **9/12 09:59 / `1f4eb3f`**）・「#1167 着手中」（close 済み）・Windows のブロッカー（#1133 → #1073 / #1278）・予算の残超過（4 件 → **3 件・全部リポ外**）。無言の失敗系統（#1399 / #1417 → #1422 / #1432）とファイルツリー系の棚卸しを追加し、直列着地の理由（#1228 / #1352）を明記
+- 79 行（予算 80）・`tako context-budget check` で activeContext の違反 0・docs のみなので **install 不要**
