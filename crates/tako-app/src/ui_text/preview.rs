@@ -80,6 +80,21 @@ pub fn op_outline_jump() -> &'static str {
 pub fn op_goto_page() -> &'static str {
     tr!("ページ移動", "Go to page")
 }
+/// コードブロックの「コピー」を押したときに通知欄へ出す**操作名**（#1422）
+pub fn op_copy_code_block() -> &'static str {
+    tr!("コードブロックのコピー", "Copy code block")
+}
+/// 失敗した対象を指すラベル（何番目のコードブロックか。#1422）
+pub fn code_block_n(index: usize) -> String {
+    tr!(
+        format!("コードブロック {}", index + 1),
+        format!("Code block {}", index + 1)
+    )
+}
+/// Code Runner でファイルを実行しようとしたときの**操作名**（#453 / #1422）
+pub fn op_run_file() -> &'static str {
+    tr!("ファイルの実行", "Run file")
+}
 pub fn item_count(n: usize) -> String {
     tr!(format!("{n} 件"), format!("{n} items"))
 }
@@ -221,6 +236,9 @@ mod tests {
                 page_n(3),
                 op_outline_jump().to_string(),
                 op_goto_page().to_string(),
+                op_copy_code_block().to_string(),
+                code_block_n(0),
+                op_run_file().to_string(),
                 item_count(12),
                 loading().to_string(),
                 tail_omitted().to_string(),

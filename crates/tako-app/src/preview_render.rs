@@ -456,6 +456,7 @@ impl TakoApp {
             Ok(_) => self.preview_navigation_panel = None,
             Err(e) => self.notify_ui_dispatch_failed(
                 crate::sidebar::NoticeArea::Preview,
+                crate::sidebar::NoticeArm::Issue1417,
                 crate::ui_text::preview::op_outline_jump(),
                 Some(item_title),
                 &e,
@@ -489,12 +490,37 @@ impl TakoApp {
             Ok(_) => self.preview_navigation_panel = None,
             Err(e) => self.notify_ui_dispatch_failed(
                 crate::sidebar::NoticeArea::Preview,
+                crate::sidebar::NoticeArm::Issue1417,
                 crate::ui_text::preview::op_goto_page(),
                 Some(&crate::ui_text::preview::page_n(page)),
                 &e,
             ),
         }
         cx.notify();
+    }
+
+    /// Markdown のコードブロックの「コピー」ボタン（#680 / #1422）。
+    ///
+    /// 以前は失敗が `eprintln!` 止まりで、**押しても何も起きず成功と見分けが
+    /// つかなかった**（コピー成功のフィードバックは出るのに、失敗だけ無言）。
+    /// 名前付きにしてあるのは #1417 と同じ理由（セルフテストが押した経路そのものを
+    /// 叩ける名前が要る）
+    pub(crate) fn preview_code_copy_clicked(
+        &mut self,
+        pane_id: PaneId,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        match self.copy_preview_code_block(pane_id, Some(index)) {
+            Ok(_) => self.flush_pending_clipboard(cx),
+            Err(e) => self.notify_ui_op_failed(
+                crate::sidebar::NoticeArea::Preview,
+                crate::sidebar::NoticeArm::Issue1422,
+                crate::ui_text::preview::op_copy_code_block(),
+                Some(&crate::ui_text::preview::code_block_n(index)),
+                &e,
+            ),
+        }
     }
 
     /// 表示幅・device scale に合う PDF 画像を background で用意する。
@@ -584,8 +610,17 @@ impl TakoApp {
                                 }
                             }
                         }
-                        Err(error) => {
-                            eprintln!("warning: PDF 再ラスタライズ失敗: {error}");
+                        Err(_) => {
+                            // #1422: ユーザーが押していない背景処理なのでバナーは出さず、
+                            // 捨てもせず診断へ 1 行だけ残す（失敗した request は直前に
+                            // `pending_pdf_rasters` から除いてあるので、同じ要求で
+                            // 何行も溜まらない = 1 要求 1 行）
+                            Self::log_ui_failure(
+                                crate::sidebar::NoticeArea::Preview,
+                                crate::sidebar::NoticeArm::Issue1422,
+                                "pdf-raster",
+                                "operation",
+                            );
                         }
                     }
                     false
@@ -3991,10 +4026,7 @@ impl TakoApp {
                 cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
-                match this.copy_preview_code_block(pane_id, Some(index)) {
-                    Ok(_) => this.flush_pending_clipboard(cx),
-                    Err(e) => eprintln!("warning: コードブロックのコピーに失敗: {e}"),
-                }
+                this.preview_code_copy_clicked(pane_id, index, cx);
                 // フィードバックの終わりで元の見た目へ戻す（2 秒ポーリング待ちにしない）
                 cx.spawn(async move |this, cx| {
                     cx.background_executor().timer(MD_COPY_FEEDBACK).await;
@@ -4134,7 +4166,15 @@ impl TakoApp {
             Ok(_) => {
                 for (pane, options) in std::mem::take(&mut self.pending_attach) {
                     if let Err(e) = self.spawn_session(pane, options, cx) {
-                        eprintln!("warning: Run ペインを開けない: {e}");
+                        // #1422: ペインは下で消える。無言だと「押したのに何も起きない」
+                        // ようにしか見えないので、消す前に理由を通知欄へ出す
+                        self.notify_ui_op_failed(
+                            crate::sidebar::NoticeArea::Preview,
+                            crate::sidebar::NoticeArm::Issue1422,
+                            crate::ui_text::preview::op_run_file(),
+                            Some(&path.to_string_lossy()),
+                            &e.to_string(),
+                        );
                         self.remove_pane(pane, cx);
                     }
                 }
