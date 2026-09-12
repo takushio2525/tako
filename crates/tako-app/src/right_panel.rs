@@ -238,10 +238,99 @@ impl TakoApp {
         ) {
             self.notify_ui_dispatch_failed(
                 crate::sidebar::NoticeArea::RightPanel,
+                crate::sidebar::NoticeArm::Issue1417,
                 crate::ui_text::panel::op_select_window(),
                 Some(target_label),
                 &e,
             );
+        }
+        cx.notify();
+    }
+
+    /// tmux セッションの「復元」ボタン（#183 / #1422）。
+    ///
+    /// 以前は dispatch の結果を `if opened.is_ok()` でしか見ておらず、**復元できない
+    /// とき（セッションが消えた / ソケットが死んだ）は押しても無言**だった。PTY の
+    /// 起動失敗も `eprintln!` 止まりで、**ペインだけ生えてターミナルが立たない**
+    /// （#1023 の形）。どちらも共有の通知欄へ出す。
+    /// 名前付きにしてあるのは #1417 と同じ理由（合成マウスは GPUI へ届かないので、
+    /// セルフテストが押した経路そのものを叩ける名前が要る）
+    pub(crate) fn tmux_restore_clicked(
+        &mut self,
+        socket: Option<String>,
+        session: String,
+        cx: &mut Context<Self>,
+    ) {
+        let opened = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::TmuxOpen {
+                socket,
+                session: session.clone(),
+                window: None,
+                pane: None,
+                direction: None,
+            },
+            PaneOrigin::User,
+        );
+        match opened {
+            Ok(_) => {
+                // #1023: 取り込みペインの PTY をこの場で立てる
+                // （dispatch は `pending_attach` へ積むだけ）
+                if !Self::attach_drain_legacy() {
+                    if let Err(e) = self.attach_pending_sessions(cx) {
+                        self.notify_ui_op_failed(
+                            crate::sidebar::NoticeArea::RightPanel,
+                            crate::sidebar::NoticeArm::Issue1422,
+                            crate::ui_text::panel::op_start_terminal(),
+                            Some(&session),
+                            &e,
+                        );
+                    }
+                }
+            }
+            Err(e) => self.notify_ui_dispatch_failed(
+                crate::sidebar::NoticeArea::RightPanel,
+                crate::sidebar::NoticeArm::Issue1422,
+                crate::ui_text::panel::op_restore_session(),
+                Some(&session),
+                &e,
+            ),
+        }
+        cx.notify();
+    }
+
+    /// バックグラウンド（閉じたタブのターミナル）からの復帰ボタン（#1422）。
+    ///
+    /// 由来タブが生きていればそこへ、無ければアクティブタブへ戻す。以前は
+    /// `unshelve_pane` の `Err` が `eprintln!` 止まりで、**押しても何も起きない**
+    /// ように見えた（GUI の stderr は誰も読めない = 境界 B8）
+    pub(crate) fn shelved_restore_clicked(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        let origin = self.workspace.shelved_origin_tab(pane_id);
+        let target = origin
+            .and_then(|t| self.workspace.get_tab(t))
+            .map(|t| t.tree().focused())
+            .unwrap_or_else(|| self.workspace.active_tab().tree().focused());
+        let label = self
+            .workspace
+            .shelved_panes()
+            .iter()
+            .find(|p| p.id() == pane_id)
+            .and_then(|p| p.title())
+            .map(str::to_string);
+        if let Err(e) = self
+            .workspace
+            .unshelve_pane(pane_id, target, SplitDirection::Right)
+        {
+            self.notify_ui_op_failed(
+                crate::sidebar::NoticeArea::RightPanel,
+                crate::sidebar::NoticeArm::Issue1422,
+                crate::ui_text::panel::op_unshelve_pane(),
+                label.as_deref(),
+                &e.to_string(),
+            );
+        }
+        if self.workspace.shelved_panes().is_empty() {
+            self.drawer_visible = false;
         }
         cx.notify();
     }
@@ -549,22 +638,7 @@ impl TakoApp {
                 .hover(|d| d.bg(rgba_alpha(theme.accent, 0.2)))
                 .child("⬆")
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    // 由来タブが生きていればそこへ、無ければアクティブタブへ戻す
-                    let origin = this.workspace.shelved_origin_tab(pane_id);
-                    let target = origin
-                        .and_then(|t| this.workspace.get_tab(t))
-                        .map(|t| t.tree().focused())
-                        .unwrap_or_else(|| this.workspace.active_tab().tree().focused());
-                    if let Err(e) =
-                        this.workspace
-                            .unshelve_pane(pane_id, target, SplitDirection::Right)
-                    {
-                        eprintln!("warning: バックグラウンドから復帰できない: {e}");
-                    }
-                    if this.workspace.shelved_panes().is_empty() {
-                        this.drawer_visible = false;
-                    }
-                    cx.notify();
+                    this.shelved_restore_clicked(pane_id, cx);
                 })),
         )
     }
@@ -2019,25 +2093,11 @@ impl TakoApp {
                                 .hover(|d| d.bg(rgba_alpha(theme.accent, 0.25)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
-                                    let opened = tako_control::dispatch(
-                                        this,
-                                        tako_control::protocol::Request::TmuxOpen {
-                                            socket: open_socket.clone(),
-                                            session: open_name.clone(),
-                                            window: None,
-                                            pane: None,
-                                            direction: None,
-                                        },
-                                        PaneOrigin::User,
+                                    this.tmux_restore_clicked(
+                                        open_socket.clone(),
+                                        open_name.clone(),
+                                        cx,
                                     );
-                                    // #1023: 取り込みペインの PTY をこの場で立てる
-                                    // （dispatch は `pending_attach` へ積むだけ）
-                                    if opened.is_ok() && !Self::attach_drain_legacy() {
-                                        if let Err(e) = this.attach_pending_sessions(cx) {
-                                            eprintln!("warning: {e}");
-                                        }
-                                    }
-                                    cx.notify();
                                 }))
                                 .child(crate::ui_text::common::restore()),
                         )

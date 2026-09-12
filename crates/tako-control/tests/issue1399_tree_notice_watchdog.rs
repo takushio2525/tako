@@ -43,8 +43,88 @@ fn workspace_root() -> PathBuf {
 const KNOWN_DISCARDED: &[&str] = &[];
 
 /// `Err` を扱ったと認めるしるし。`match` のアーム / `if let Err(` / `map_err` の
-/// どれかが**その呼び出しの窓の中**に居ること
+/// どれかが**その呼び出しの結果と一緒に**現れること（#1422 で「窓の中に在るだけ」から
+/// 「結果の束縛名と同じ行に在る」へ寄せた。理由は [`scan_discarded`] の doc）
 const HANDLED_MARKS: &[&str] = &["Err(", "map_err", "is_err()"];
+
+/// `let <name> = tako_control::dispatch(` の `<name>` を拾う。
+/// `let _ =` と分割代入は束縛名なし（`None`）として扱う
+fn bound_name(line: &str) -> Option<String> {
+    let (head, _) = line.split_once("= tako_control::dispatch(")?;
+    // 型注釈つき（`let r: Result<_, _> = dispatch(..)`）も名前だけ取る
+    let name = head.trim().strip_prefix("let ")?.split(':').next()?.trim();
+    if name == "_" || name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// `line` の `at` から始まる `name` が**識別子として独立**しているか
+/// （`opened` が `opened_at` の一部で当たらないようにする）
+fn is_ident_at(line: &str, at: usize, name: &str) -> bool {
+    let b = line.as_bytes();
+    let before = at == 0 || !(b[at - 1].is_ascii_alphanumeric() || b[at - 1] == b'_');
+    let end = at + name.len();
+    let after = end >= b.len() || !(b[end].is_ascii_alphanumeric() || b[end] == b'_');
+    before && after
+}
+
+/// 束縛式の終端（最初に `;` で終わる行の次）。`.map_err(..)` のように**呼び出し式へ
+/// 続けて**扱う形をここで拾う
+fn stmt_end(window: &[String]) -> usize {
+    window
+        .iter()
+        .position(|l| l.trim_end().ends_with(';'))
+        .map(|i| i + 1)
+        .unwrap_or(window.len())
+}
+
+/// 束縛された結果を**その名前で**扱っているか（#1422）。
+///
+/// 認めるのは 4 つだけ:
+/// 1. 束縛式そのものに `map_err` / `?` が付いている（`let r = dispatch(..).map_err(..)`）
+/// 2. `<name>` と [`HANDLED_MARKS`] が同じ行に在る（`if let Err(e) = r` / `r.is_err()`）
+/// 3. `match <name>` の下に `Err(` アームが在る
+/// 4. `<name>` をそのまま呼び出し元へ返している（`return r;` / `Ok(r)` / 末尾の `r`）
+fn handled_by_name(window: &[String], name: &str) -> bool {
+    let end = stmt_end(window);
+    if window[..end]
+        .iter()
+        .any(|l| l.contains("map_err") || l.contains("?;") || l.trim_end().ends_with('?'))
+    {
+        return true;
+    }
+    for (i, line) in window.iter().enumerate() {
+        let Some(at) = line.find(name) else { continue };
+        if !is_ident_at(line, at, name) {
+            continue;
+        }
+        // 束縛式そのもの（`let r = dispatch(`）は「扱った」の証拠にしない
+        if i < end && line.contains("= tako_control::dispatch(") {
+            continue;
+        }
+        if HANDLED_MARKS.iter().any(|m| line.contains(m)) {
+            return true;
+        }
+        if line.contains(&format!("match {name}")) && window[i..].iter().any(|l| l.contains("Err("))
+        {
+            return true;
+        }
+        let bare = line
+            .trim()
+            .trim_end_matches(',')
+            .trim_end_matches(';')
+            .trim();
+        if bare == name
+            || bare == format!("return {name}")
+            || bare == format!("Ok({name})")
+            || bare == format!("Some({name})")
+        {
+            return true;
+        }
+    }
+    false
+}
 
 /// 呼び出し行そのものが「結果を捨てる形」かどうか
 fn discard_shape(line: &str) -> Option<&'static str> {
@@ -56,6 +136,26 @@ fn discard_shape(line: &str) -> Option<&'static str> {
     }
     None
 }
+
+/// まだ通知欄 / persist.log へ寄せていない `eprintln!` の**件数**（ファイル単位）。
+///
+/// #1399 は `sidebar.rs` だけを見ていたので、他の UI モジュールの `eprintln!` は
+/// 誰も落とさなかった（#1422）。検査を全 UI モジュールへ広げるにあたり、本 Issue の
+/// スコープ外の箇所は**件数**で宣言して段階導入する（行番号だと無関係な編集で
+/// 壊れる。`KNOWN_DISCARDED` と同じく**減る方向にしか動かさない** = 直したら数を減らす）。
+///
+/// ここに残っているものは別 Issue で振り分ける:
+/// `drawer.rs` はバックグラウンド復帰（`right_panel.rs` と同型）、
+/// `open_files.rs` / `command_card_ui.rs` / `chat_view.rs` / `update_window.rs` は
+/// それぞれユーザー操作の失敗。`autorename.rs` は env で明示的に有効化する診断出力
+const KNOWN_EPRINTLN: &[(&str, usize)] = &[
+    ("autorename.rs", 1),
+    ("chat_view.rs", 1),
+    ("command_card_ui.rs", 2),
+    ("drawer.rs", 2),
+    ("open_files.rs", 3),
+    ("update_window.rs", 1),
+];
 
 /// 行コメントを**行数を保ったまま**落とす（近くの説明文を「扱った証拠」と
 /// 誤認しないため。`ui_dispatch_attach_watchdog` が実際にこの空振りを踏んだ）
@@ -100,6 +200,14 @@ impl Offender {
 /// 数えて**しまう（`commit_inline_edit` の `if result.is_ok()` が、その下にある
 /// copy-abs の `Err` アームで素通りする）。
 ///
+/// 窓の中に `Err(` が**在るかどうか**だけを見ると、まだ穴が残る（#1422）。
+/// `right_panel.rs` の `TmuxOpen` は結果を `if opened.is_ok()` でしか見ていないのに、
+/// 窓の中の**無関係な** `if let Err(e) = this.attach_pending_sessions(cx)` を
+/// 「扱った」と数えて素通りしていた。そこで**結果の束縛名を追い**、`Err` がその名前と
+/// 一緒に現れることを要求する（[`handled_by_name`]）。束縛名が無い形
+/// （`match dispatch(..)` / `if let Err(..) = dispatch(..)`）はその場で扱うしかないので
+/// 従来どおり窓の中のしるしで見る
+///
 /// 戻り値の 2 番目は走査した dispatch 呼び出しの数（空振りの検出に使う）
 fn scan_discarded(file: &str, src: &str) -> (Vec<Offender>, usize) {
     let raw: Vec<&str> = src.lines().collect();
@@ -137,9 +245,15 @@ fn scan_discarded(file: &str, src: &str) -> (Vec<Offender>, usize) {
         }
         let next_call = call_lines.get(n + 1).copied().unwrap_or(lines.len());
         let to = next_call.min(i + 45).min(lines.len());
-        let window = lines[i..to].join("\n");
-        if !HANDLED_MARKS.iter().any(|m| window.contains(m)) {
-            offenders.push(make("`Err` を一度も見ていない（通知欄へ出していない）"));
+        let window = &lines[i..to];
+        let handled = match bound_name(&lines[i]) {
+            Some(name) => handled_by_name(window, &name),
+            None => HANDLED_MARKS.iter().any(|m| window.join("\n").contains(m)),
+        };
+        if !handled {
+            offenders.push(make(
+                "結果の `Err` を一度も見ていない（通知欄へ出していない）",
+            ));
         }
     }
     (offenders, call_lines.len())
@@ -183,6 +297,46 @@ fn ui_modules(root: &Path) -> Vec<PathBuf> {
     }
     out.sort();
     out
+}
+
+/// `#[cfg(test)] mod ..` のブロックを**行数を保ったまま**空にする（#1422）。
+///
+/// 番犬が見るのは production の経路だけ。テストの中の `eprintln!`（`[perf]` の計測・
+/// `[skip]` の理由）は誰も読めない出力ではないので違反ではない。
+/// ファイル末尾とは限らない（`preview_render.rs` は中ほどに `mod pdf_hit_test_tests`）ので、
+/// `#[cfg(test)]` と**同じ深さの閉じ括弧**までを切る
+fn strip_test_mods(lines: &[String]) -> Vec<String> {
+    let mut out = lines.to_vec();
+    let mut i = 0;
+    while i < out.len() {
+        if out[i].trim() == "#[cfg(test)]" {
+            let indent = out[i].len() - out[i].trim_start().len();
+            let mut j = i + 1;
+            while j < out.len() && out[j].trim().is_empty() {
+                j += 1;
+            }
+            if j < out.len() && out[j].trim_start().starts_with("mod ") {
+                let close = format!("{}}}", " ".repeat(indent));
+                let mut k = j + 1;
+                while k < out.len() && out[k] != close {
+                    k += 1;
+                }
+                for line in out.iter_mut().take((k + 1).min(lines.len())).skip(i) {
+                    line.clear();
+                }
+                i = k + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// production のソース行（コメントとテストモジュールを行数を保ったまま抜いたもの）
+fn production_lines(src: &str) -> Vec<String> {
+    let raw: Vec<&str> = src.lines().collect();
+    strip_test_mods(&strip_comment_lines(&raw))
 }
 
 fn sidebar_src(root: &Path) -> String {
@@ -231,23 +385,57 @@ fn ツリーのローカル操作はdispatchの結果を捨てていない() {
     );
 }
 
+/// GUI の `eprintln!` は誰も読めない（#1399 → #1422 で全 UI モジュールへ）。
+///
+/// #1399 の検査は `sidebar.rs` 限定だったので、同じ「押しても無言」が
+/// `right_panel.rs`（tmux の復元・バックグラウンド復帰）と `preview_render.rs`
+/// （コードのコピー・Code Runner・PDF 再ラスタライズ）に残っていた。
+/// スコープ外のファイルは [`KNOWN_EPRINTLN`] の件数で段階導入する
 #[test]
-fn sidebarにeprintlnだけで終わる経路が無い() {
+fn uiモジュールにeprintlnだけで終わる経路が無い() {
     let root = workspace_root();
-    let src = sidebar_src(&root);
-    let raw: Vec<&str> = src.lines().collect();
-    let lines = strip_comment_lines(&raw);
-    let hits: Vec<String> = lines
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| l.contains("eprintln!"))
-        .map(|(i, _)| format!("sidebar.rs:{}", i + 1))
-        .collect();
+    let mut hits: Vec<String> = Vec::new();
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for path in ui_modules(&root) {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let src = std::fs::read_to_string(&path).expect("UI モジュールが読める");
+        let found: Vec<String> = production_lines(&src)
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains("eprintln!"))
+            .map(|(i, _)| format!("{name}:{}", i + 1))
+            .collect();
+        let allowed = KNOWN_EPRINTLN
+            .iter()
+            .find(|(f, _)| *f == name)
+            .map(|(_, n)| *n)
+            .unwrap_or(0);
+        counts.insert(name.clone(), found.len());
+        if found.len() > allowed {
+            hits.extend(found.into_iter().skip(allowed));
+        }
+    }
     assert!(
         hits.is_empty(),
-        "{hits:?} が `eprintln!` で失敗を報告している（#1399）。GUI の stderr は\
-         誰も読めないので、ユーザーの操作に対する失敗は通知欄（`notify_tree_*`）へ、\
-         背景処理の失敗は `tako_control::diag::persist_log` へ出すこと"
+        "{hits:?} が `eprintln!` で失敗を報告している（#1399 / #1422）。GUI の stderr は\
+         誰も読めないので、ユーザーの操作に対する失敗は通知欄\
+         （`notify_ui_dispatch_failed` / `notify_ui_op_failed`）へ、背景処理の失敗は\
+         `TakoApp::log_ui_failure` で persist.log へ出すこと"
+    );
+    let stale: Vec<&str> = KNOWN_EPRINTLN
+        .iter()
+        .filter(|(f, n)| counts.get(*f).copied().unwrap_or(0) < *n)
+        .map(|(f, _)| *f)
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "KNOWN_EPRINTLN の {stale:?} は宣言した件数より減っている（#1422）。\
+         既知リストは減る方向にしか動かさないので、直したら数も減らすこと\
+         （実測: {counts:?}）"
     );
 }
 
@@ -261,20 +449,32 @@ fn ローカル操作の失敗は1実装から出ている() {
         .map(|(_, rest)| rest.chars().take(1200).collect::<String>())
         .expect("`notify_ui_failure` が sidebar.rs に無い（#1399 / #1417 の出し口）");
     for mark in [
-        "diag::persist_log",
+        "Self::log_ui_failure(",
         "self.set_remote_notice(",
-        "legacy_suppressed()",
+        "arm.suppressed()",
     ] {
         assert!(
             body.contains(mark),
-            "`notify_ui_failure` が {mark} を通っていない（#1399 / #1417）。\
+            "`notify_ui_failure` が {mark} を通っていない（#1399 / #1417 / #1422）。\
              通知欄と persist.log と A/B の逃げ道は 1 実装が担うこと"
+        );
+    }
+    // 診断の書式は背景処理と共有する（grep が 1 通りで済む）
+    let log = src
+        .split_once("fn log_ui_failure(")
+        .map(|(_, rest)| rest.chars().take(700).collect::<String>())
+        .expect("`log_ui_failure` が sidebar.rs に無い（#1422 の背景処理の出し口）");
+    for mark in ["diag::persist_log", "arm.suppressed()", "area.tag()"] {
+        assert!(
+            log.contains(mark),
+            "`log_ui_failure` が {mark} を通っていない（#1422）。背景処理の失敗も\
+             A/B の逃げ道と `area=` つきの 1 書式で診断へ残すこと"
         );
     }
     // 薄い包み 4 本はすべてこの出し口を呼ぶ（画面へ出す経路を 2 本にしない）
     for wrapper in [
         "fn notify_ui_dispatch_failed(",
-        "fn notify_tree_op_failed(",
+        "fn notify_ui_op_failed(",
         "fn notify_tree_open_failed(",
     ] {
         let after = src
@@ -286,14 +486,22 @@ fn ローカル操作の失敗は1実装から出ている() {
             "{wrapper} が `notify_ui_failure` を通っていない（#1399 / #1417）"
         );
     }
-    let tree = src
-        .split_once("fn notify_tree_dispatch_failed(")
-        .map(|(_, rest)| rest.chars().take(700).collect::<String>())
-        .expect("`notify_tree_dispatch_failed` が sidebar.rs に無い（#1399）");
-    assert!(
-        tree.contains("self.notify_ui_dispatch_failed("),
-        "`notify_tree_dispatch_failed` が画面横断の出し口を通っていない（#1417）"
-    );
+    for (wrapper, inner) in [
+        (
+            "fn notify_tree_dispatch_failed(",
+            "self.notify_ui_dispatch_failed(",
+        ),
+        ("fn notify_tree_op_failed(", "self.notify_ui_op_failed("),
+    ] {
+        let tree = src
+            .split_once(wrapper)
+            .map(|(_, rest)| rest.chars().take(700).collect::<String>())
+            .unwrap_or_else(|| panic!("{wrapper} が sidebar.rs に無い（#1399）"));
+        assert!(
+            tree.contains(inner),
+            "{wrapper} が画面横断の出し口（{inner}）を通っていない（#1417 / #1422）"
+        );
+    }
     // 文言は ui_text のカタログ経由（render へ直書きしない = i18n の規約）
     for key in ["notice_op_failed(", "notice_open_failed("] {
         assert!(
@@ -314,13 +522,18 @@ fn 別画面の失敗も同じ出し口から出ている() {
     for (file, handlers) in [
         (
             "crates/tako-app/src/right_panel.rs",
-            &["fn tmux_window_row_clicked("][..],
+            &[
+                "fn tmux_window_row_clicked(",
+                "fn tmux_restore_clicked(",
+                "fn shelved_restore_clicked(",
+            ][..],
         ),
         (
             "crates/tako-app/src/preview_render.rs",
             &[
                 "fn preview_outline_item_clicked(",
                 "fn preview_page_item_clicked(",
+                "fn preview_code_copy_clicked(",
             ][..],
         ),
     ] {
@@ -339,8 +552,10 @@ fn 別画面の失敗も同じ出し口から出ている() {
                     )
                 });
             assert!(
-                body.contains("self.notify_ui_dispatch_failed("),
-                "{name} の `{handler}` が `notify_ui_dispatch_failed` を通っていない（#1417）"
+                body.contains("self.notify_ui_dispatch_failed(")
+                    || body.contains("self.notify_ui_op_failed("),
+                "{name} の `{handler}` が共有の出し口（`notify_ui_dispatch_failed` /\
+                 `notify_ui_op_failed`）を通っていない（#1417 / #1422）"
             );
             assert!(
                 body.contains("NoticeArea::"),
@@ -348,20 +563,45 @@ fn 別画面の失敗も同じ出し口から出ている() {
                  persist.log の `area=` がどの画面か分からなくなる"
             );
         }
-        let raw: Vec<&str> = src.lines().collect();
-        let direct: Vec<String> = strip_comment_lines(&raw)
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| l.contains("set_remote_notice("))
-            .map(|(i, _)| format!("{name}:{}", i + 1))
-            .collect();
-        assert!(
-            direct.is_empty(),
-            "{direct:?} が共有の通知欄を直に呼んでいる（#1417）。\
-             出し口は `notify_ui_dispatch_failed` の 1 つに保つこと\
-             （直呼びは persist.log と A/B の逃げ道を素通りする）"
-        );
+        // 通知欄も診断も画面モジュールから直に触らない（#1417 / #1422）。
+        // `persist_log` の直呼びは `area=` の書式と A/B の逃げ道を素通りするので、
+        // 背景処理であっても `TakoApp::log_ui_failure` を通す
+        for (mark, why) in [
+            (
+                "set_remote_notice(",
+                "共有の通知欄を直に呼んでいる（#1417）。出し口は `notify_ui_dispatch_failed` /                  `notify_ui_op_failed` の 1 つに保つこと",
+            ),
+            (
+                "diag::persist_log(",
+                "診断へ直に書いている（#1422）。背景処理の失敗も `TakoApp::log_ui_failure`                  を通すこと（直呼びは `area=` の書式と A/B の逃げ道を素通りする）",
+            ),
+        ] {
+            let raw: Vec<&str> = src.lines().collect();
+            let direct: Vec<String> = strip_comment_lines(&raw)
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.contains(mark))
+                .map(|(i, _)| format!("{name}:{}", i + 1))
+                .collect();
+            assert!(direct.is_empty(), "{direct:?} が{why}");
+        }
     }
+    // 出し口の家（`sidebar.rs`）でも、診断へ書くのは 1 実装の中だけ
+    let sidebar = sidebar_src(&root);
+    let raw: Vec<&str> = sidebar.lines().collect();
+    let writes: Vec<String> = strip_comment_lines(&raw)
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.contains("diag::persist_log("))
+        .map(|(i, _)| format!("sidebar.rs:{}", i + 1))
+        .collect();
+    assert_eq!(
+        writes.len(),
+        1,
+        "sidebar.rs が診断へ {} 箇所から書いている（#1422）。`log_ui_failure` の 1 実装に\
+         保つこと（実測: {writes:?}）",
+        writes.len()
+    );
 }
 
 /// dispatch を通らない失敗（OS のアプリ選択ダイアログ）も捨てていないこと（#1399）。
@@ -531,5 +771,87 @@ fn 番犬は3つの捨て方を見逃さず扱った形は許す() {
         found.len(),
         1,
         "コメント中の `Err(` を「扱った証拠」と数えている"
+    );
+}
+
+/// #1422 の本体: 窓の中の**無関係な** `Err(` を「扱った証拠」と数えないこと。
+///
+/// `right_panel.rs:2022` はこの形で素通りしていた（結果は `if opened.is_ok()` でしか
+/// 見ていないのに、その中の `if let Err(e) = this.attach_pending_sessions(cx)` で緑）。
+/// 束縛名を追えば落ちる
+#[test]
+fn 番犬は無関係なエラーに騙されない() {
+    let call = concat!("tako_control::", "dispatch(");
+    let head = format!(
+        "fn f(&mut self) {{\n    let opened = {call}\n        self,\n        Request::TmuxOpen {{ session }},\n        PaneOrigin::User,\n    );\n"
+    );
+    // ① 他人の Err を窓に置いても落ちる（#1422 の実物）
+    let decoy = format!(
+        "{head}    if opened.is_ok() {{\n        if let Err(e) = this.attach_pending_sessions(cx) {{\n            eprintln!(\"{{e}}\");\n        }}\n    }}\n}}\n"
+    );
+    // ② 似た名前（`opened_at`）を証拠と数えない
+    let lookalike = format!(
+        "{head}    if let Err(e) = opened_at.check() {{\n        report(e);\n    }}\n    if opened.is_ok() {{ refresh(); }}\n}}\n"
+    );
+    // ③ 自分の結果を扱っていれば許す（3 つの正しい形）
+    let by_if_let = format!("{head}    if let Err(e) = opened {{\n        self.notify_ui_dispatch_failed(area, arm, op, None, &e);\n    }}\n}}\n");
+    let by_match = format!("{head}    match opened {{\n        Ok(_) => refresh(),\n        Err(e) => self.notify_ui_dispatch_failed(area, arm, op, None, &e),\n    }}\n}}\n");
+    let by_is_err = format!("{head}    if opened.is_err() {{\n        self.notify_ui_op_failed(area, arm, op, None, \"ng\");\n    }}\n}}\n");
+    // ④ 呼び出し式に続けて扱う形（`command_card_ui.rs` の `.map_err(..)` + 呼び出し元へ返す）
+    let by_map_err = format!(
+        "fn f(&mut self) -> Result<Value, String> {{\n    let result = {call}\n        self,\n        Request::ShowCommand {{ action }},\n        PaneOrigin::User,\n    )\n    .map_err(|e| e.to_string());\n    for (pane, options) in take(&mut self.pending_attach) {{\n        if let Err(e) = self.spawn_session(pane, options, cx) {{\n            drop(e);\n        }}\n    }}\n    result\n}}\n"
+    );
+    for (label, src, want) in [
+        ("無関係な Err（#1422 の実物）", &decoy, true),
+        ("似た名前の識別子", &lookalike, true),
+        ("if let Err で自分を見る", &by_if_let, false),
+        ("match の Err アーム", &by_match, false),
+        ("is_err() で自分を見る", &by_is_err, false),
+        ("map_err で呼び出し元へ返す", &by_map_err, false),
+    ] {
+        let (found, calls) = scan_discarded("synthetic.rs", src);
+        assert_eq!(calls, 1, "{label}: 呼び出しを 1 件と数えられていない");
+        assert_eq!(
+            !found.is_empty(),
+            want,
+            "{label}: 判定が想定と違う（found={:?}）",
+            found.iter().map(Offender::report).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// `eprintln!` の走査が**テストモジュールを見ない**こと（#1422）。
+///
+/// `[perf]` の計測や `[skip]` の理由は誰も読めない出力ではないので違反ではない。
+/// 逆に production の 1 行は、同じファイルの下にテストが在っても落とす
+#[test]
+fn eprintlnの走査はテストモジュールを見ない() {
+    let prod = "fn f() {\n    eprintln!(\"warning: 失敗\");\n}\n";
+    let test_mod = "#[cfg(test)]\nmod tests {\n    #[test]\n    fn perf() {\n        eprintln!(\"[perf] 12ms\");\n    }\n}\n";
+    let nested = "impl A {\n    #[cfg(test)]\n    mod inner {\n        fn g() {\n            eprintln!(\"[perf] x\");\n        }\n    }\n}\n";
+    let count = |src: &str| {
+        production_lines(src)
+            .iter()
+            .filter(|l| l.contains("eprintln!"))
+            .count()
+    };
+    assert_eq!(
+        count(test_mod),
+        0,
+        "テストモジュールの `eprintln!` を数えている"
+    );
+    assert_eq!(count(nested), 0, "入れ子のテストモジュールを切れていない");
+    assert_eq!(count(prod), 1, "production の `eprintln!` を見落としている");
+    assert_eq!(
+        count(&format!("{prod}{test_mod}")),
+        1,
+        "テストが同居するファイルで production の 1 行を見落としている"
+    );
+    // `#[cfg(test)]` の関数（`mod` ではない）は切らない
+    let cfg_fn = "impl A {\n    #[cfg(test)]\n    fn probe(&self) -> u8 {\n        1\n    }\n}\nfn f() {\n    eprintln!(\"warning: 失敗\");\n}\n";
+    assert_eq!(
+        count(cfg_fn),
+        1,
+        "`#[cfg(test)] fn` をモジュールと誤認して切っている"
     );
 }

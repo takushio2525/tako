@@ -71,6 +71,18 @@ pub fn external_badge() -> &'static str {
 pub fn op_select_window() -> &'static str {
     tr!("window 切替", "Switch window")
 }
+/// tmux セッションの「復元」ボタンを押したときに通知欄へ出す**操作名**（#1422）
+pub fn op_restore_session() -> &'static str {
+    tr!("セッションの復元", "Restore session")
+}
+/// 復元したペインの PTY を起動できなかったときの**操作名**（#1023 / #1422）
+pub fn op_start_terminal() -> &'static str {
+    tr!("ターミナルの起動", "Start terminal")
+}
+/// バックグラウンドのターミナルを画面へ戻すときの**操作名**（#1422）
+pub fn op_unshelve_pane() -> &'static str {
+    tr!("バックグラウンドから復帰", "Restore from background")
+}
 pub fn closed_tab_section() -> &'static str {
     tr!(
         "閉じたタブのターミナル（バックグラウンドで実行中）",
@@ -435,6 +447,9 @@ mod tests {
                 pane_count(3),
                 external_badge().to_string(),
                 op_select_window().to_string(),
+                op_restore_session().to_string(),
+                op_start_terminal().to_string(),
+                op_unshelve_pane().to_string(),
                 closed_tab_section().to_string(),
                 closed_tab_group("dev", 2),
                 git_detecting().to_string(),

@@ -182,15 +182,15 @@ pub(crate) fn inline_insert_position(
 /// 画面ごとに出し口を増やすと「片方だけ無言」が必ず生まれるので、
 /// 口は [`TakoApp::notify_ui_failure`] の 1 つに保ち、**画面はこの値だけで区別**する。
 ///
-/// 用途は 2 つ。persist.log の `area=` に出す識別子（どの画面で起きたかを診断から
-/// 辿れる）と、A/B の逃げ道の選択（画面ごとに Issue が違うので env も分ける）
+/// 用途は persist.log の `area=` に出す識別子（どの画面で起きたかを診断から辿れる）。
+/// A/B の逃げ道は [`NoticeArm`] が別に持つ（#1422 で軸を分けた。理由はそちらの doc）
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum NoticeArea {
     /// ファイルツリーのローカル行（#1399）
     Tree,
-    /// 右パネルの tmux ビュー（#1417）
+    /// 右パネルの tmux ビュー・バックグラウンドのドロワー（#1417 / #1422）
     RightPanel,
-    /// プレビューペインの目次 / ページ移動（#1417）
+    /// プレビューペインの目次 / ページ移動・コードのコピー・Code Runner（#1417 / #1422）
     Preview,
 }
 
@@ -203,12 +203,33 @@ impl NoticeArea {
             NoticeArea::Preview => "preview",
         }
     }
+}
 
-    /// その画面の通知を旧挙動（何も出さない）へ戻す A/B が立っているか
-    pub(crate) fn legacy_suppressed(self) -> bool {
+/// 同一バイナリのまま旧挙動（失敗を捨てて無言）へ戻す A/B の逃げ道（#1399 / #1417 / #1422）。
+///
+/// **画面（[`NoticeArea`]）とは別の軸**にしてある。#1417 までは画面から env を選んで
+/// いたが、#1422 で**同じ画面に別の Issue で足した通知が同居**した（右パネルは
+/// window 切替 = #1417 と復元ボタン = #1422 がどちらも `right_panel`）。画面で env を
+/// 選ぶと、片方のアームを立てたときにもう片方の通知まで消えて **A/B が互いの回帰を
+/// 隠す**ので、抑止の単位は「どの Issue で足した通知か」にする
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NoticeArm {
+    /// ファイルツリーのローカル操作（`TAKO_1399_LEGACY`）
+    Issue1399,
+    /// 右パネルの window 切替 / プレビューの目次・ページ移動（`TAKO_1417_LEGACY`）
+    Issue1417,
+    /// tmux セッションの復元・バックグラウンド復帰・コードのコピー・Code Runner・
+    /// PDF 再ラスタライズ（`TAKO_1422_LEGACY`）
+    Issue1422,
+}
+
+impl NoticeArm {
+    /// この Issue で足した通知を旧挙動（何も出さない）へ戻す A/B が立っているか
+    pub(crate) fn suppressed(self) -> bool {
         match self {
-            NoticeArea::Tree => TakoApp::legacy_1399(),
-            NoticeArea::RightPanel | NoticeArea::Preview => TakoApp::legacy_1417(),
+            NoticeArm::Issue1399 => TakoApp::legacy_1399(),
+            NoticeArm::Issue1417 => TakoApp::legacy_1417(),
+            NoticeArm::Issue1422 => TakoApp::legacy_1422(),
         }
     }
 }
@@ -2081,16 +2102,37 @@ impl TakoApp {
     /// 同じ失敗を persist.log にも 1 行残す。**診断へ載せるのは画面・操作名と
     /// 理由の分類だけ**（パス・OS のエラー文は載せない = #1376 と同じ作法）。
     /// 通知本文にはユーザーが見て分かる対象（パス・打った名前・window 名）と理由を出す
-    fn notify_ui_failure(&mut self, area: NoticeArea, diag_op: &str, class: &str, text: String) {
+    fn notify_ui_failure(
+        &mut self,
+        area: NoticeArea,
+        arm: NoticeArm,
+        diag_op: &str,
+        class: &str,
+        text: String,
+    ) {
         // A/B: 旧挙動（結果を捨てて画面にも診断にも何も出さない）へ戻す
-        if area.legacy_suppressed() {
+        if arm.suppressed() {
+            return;
+        }
+        Self::log_ui_failure(area, arm, diag_op, class);
+        self.set_remote_notice(text, true);
+    }
+
+    /// **画面には出さず**診断にだけ 1 行残す（#1422）。
+    ///
+    /// ユーザーが押していない背景処理（PDF の再ラスタライズ・監視対象の更新）の
+    /// 失敗までバナーにすると、押していない操作の失敗が画面に居座る（#1399 が
+    /// プレビュー監視で採った物差しと同じ）。それでも `eprintln!` は GUI では
+    /// 誰も読めないので、**捨てずに** persist.log へ落とす。
+    /// 書式は [`Self::notify_ui_failure`] と共有する（診断の grep が 1 通りで済む）
+    pub(crate) fn log_ui_failure(area: NoticeArea, arm: NoticeArm, diag_op: &str, class: &str) {
+        if arm.suppressed() {
             return;
         }
         tako_control::diag::persist_log(&format!(
             "UI 操作に失敗: area={} op={diag_op} 分類={class}",
             area.tag()
         ));
-        self.set_remote_notice(text, true);
     }
 
     /// dispatch が `Err` を返したときの通知（#1399 / #1417）。
@@ -2099,6 +2141,7 @@ impl TakoApp {
     pub(crate) fn notify_ui_dispatch_failed(
         &mut self,
         area: NoticeArea,
+        arm: NoticeArm,
         op: &str,
         target: Option<&str>,
         err: &tako_control::DispatchError,
@@ -2106,9 +2149,30 @@ impl TakoApp {
         let reason = err.to_string();
         self.notify_ui_failure(
             area,
+            arm,
             op,
             err.class(),
             crate::ui_text::sidebar::notice_op_failed(op, target, &reason),
+        );
+    }
+
+    /// dispatch を経由しない経路（PTY 起動・クリップボード・ワークスペース操作）の
+    /// 失敗の通知（#1399 の `notify_tree_op_failed` を画面横断へ広げたもの。#1422）。
+    /// 理由は `String` しか無いので分類は `operation` 固定
+    pub(crate) fn notify_ui_op_failed(
+        &mut self,
+        area: NoticeArea,
+        arm: NoticeArm,
+        op: &str,
+        target: Option<&str>,
+        reason: &str,
+    ) {
+        self.notify_ui_failure(
+            area,
+            arm,
+            op,
+            "operation",
+            crate::ui_text::sidebar::notice_op_failed(op, target, reason),
         );
     }
 
@@ -2119,24 +2183,20 @@ impl TakoApp {
         target: Option<&str>,
         err: &tako_control::DispatchError,
     ) {
-        self.notify_ui_dispatch_failed(NoticeArea::Tree, op, target, err);
+        self.notify_ui_dispatch_failed(NoticeArea::Tree, NoticeArm::Issue1399, op, target, err);
     }
 
     /// dispatch を経由しない経路（OS ダイアログ・PTY 起動）の失敗の通知（#1399）。
     /// 理由は `String` しか無いので分類は `operation` 固定
     pub(crate) fn notify_tree_op_failed(&mut self, op: &str, target: Option<&str>, reason: &str) {
-        self.notify_ui_failure(
-            NoticeArea::Tree,
-            op,
-            "operation",
-            crate::ui_text::sidebar::notice_op_failed(op, target, reason),
-        );
+        self.notify_ui_op_failed(NoticeArea::Tree, NoticeArm::Issue1399, op, target, reason);
     }
 
     /// ファイル行を開けなかったときの通知（#1283 の cmd+クリックと同じ文言。#1399）
     pub(crate) fn notify_tree_open_failed(&mut self, diag_op: &str, path: &str, reason: &str) {
         self.notify_ui_failure(
             NoticeArea::Tree,
+            NoticeArm::Issue1399,
             diag_op,
             "operation",
             crate::ui_text::sidebar::notice_open_failed(path, reason),
@@ -2158,6 +2218,16 @@ impl TakoApp {
     pub(crate) fn legacy_1417() -> bool {
         static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *LEGACY.get_or_init(|| std::env::var("TAKO_1417_LEGACY").map(|v| v == "1") == Ok(true))
+    }
+
+    /// #1422 の A/B。`TAKO_1422_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
+    /// （tmux セッションの復元・復元ペインの PTY 起動・バックグラウンド復帰・
+    /// コードのコピー・Code Runner・PDF 再ラスタライズの失敗を、通知欄にも
+    /// persist.log にも出さない = 「押しても無言」の再現）。#1399 / #1417 と env を
+    /// 分けてあるので、片方のアームがもう片方の回帰を隠さない
+    pub(crate) fn legacy_1422() -> bool {
+        static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *LEGACY.get_or_init(|| std::env::var("TAKO_1422_LEGACY").map(|v| v == "1") == Ok(true))
     }
 
     /// リモート行の右クリックメニューの実行（#919）
@@ -2475,9 +2545,13 @@ impl TakoApp {
             if watcher.sync_paths(paths).is_err() {
                 // #1399: `eprintln!` は GUI では誰も読めないので persist.log へ。
                 // **通知欄には出さない**（ユーザーの操作が無い背景の保守処理で、
-                // バナーを出すと押していない操作の失敗が画面に居座る）
-                tako_control::diag::persist_log(
-                    "プレビューの監視対象を更新できない: 分類=watcher_sync",
+                // バナーを出すと押していない操作の失敗が画面に居座る）。
+                // #1422 で書式ごと 1 実装（`log_ui_failure`）へ寄せた
+                Self::log_ui_failure(
+                    NoticeArea::Tree,
+                    NoticeArm::Issue1399,
+                    "preview-watch-sync",
+                    "watcher_sync",
                 );
             }
         }

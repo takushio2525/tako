@@ -49338,6 +49338,195 @@ mod self_test {
                 );
             }
 
+            // 84d. #1422: 同じ「押しても無言」が 84c の隣に残っていた 6 か所
+            // （右パネルの tmux 復元ボタン・復元ペインの PTY 起動・バックグラウンド復帰・
+            // コードブロックのコピー・Code Runner・PDF 再ラスタライズ）。前 5 つは
+            // **ユーザーの操作**なので共有の通知欄へ、最後の 1 つは背景処理なので
+            // 診断だけへ出す。**A/B は `TAKO_1422_LEGACY=1`**（#1417 と env を分けて
+            // あるので、片方のアームがもう片方の画面の回帰を隠さない）。
+            // 84c と同じく、合成マウスではなく `on_click` が呼ぶ関数そのものを叩く
+            {
+                let term_pane = window
+                    .update(cx, |app, _, _| app.focused_pane())
+                    .unwrap_or(PaneId::from_raw(1));
+                let log_before = tako_control::diag::persist_log_path()
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .map(|s| s.lines().count())
+                    .unwrap_or(0);
+                let gone_socket = std::env::temp_dir()
+                    .join(format!("tako-st1422-{}-gone.sock", std::process::id()));
+                let (restore_notice, unshelve_notice, copy_notice, bg_silent, after_dismiss) =
+                    window
+                        .update(cx, |app, _, cx| {
+                            app.remote_notice = None;
+                            // ① tmux セッションの復元ボタン（死んだソケット = dispatch が Err）
+                            app.tmux_restore_clicked(
+                                Some(gone_socket.display().to_string()),
+                                "tako-st1422-gone".into(),
+                                cx,
+                            );
+                            let restore_notice = app
+                                .remote_notice
+                                .as_ref()
+                                .filter(|n| n.is_error)
+                                .map(|n| n.text.clone());
+                            // ② バックグラウンドからの復帰（居ないペイン）
+                            app.shelved_restore_clicked(PaneId::from_raw(999_999), cx);
+                            let unshelve_notice = app
+                                .remote_notice
+                                .as_ref()
+                                .filter(|n| n.is_error)
+                                .map(|n| n.text.clone());
+                            // ③ コードブロックのコピー（プレビューではないペイン）
+                            app.preview_code_copy_clicked(term_pane, 0, cx);
+                            let copy_notice = app
+                                .remote_notice
+                                .as_ref()
+                                .filter(|n| n.is_error)
+                                .map(|n| n.text.clone());
+                            // ④ 背景処理（PDF 再ラスタライズ）は**通知欄へ出さない**。
+                            // 連続で失敗しても 1 要求 1 行しか診断へ出ないこともここで見る
+                            app.remote_notice = None;
+                            for _ in 0..3 {
+                                TakoApp::log_ui_failure(
+                                    crate::sidebar::NoticeArea::Preview,
+                                    crate::sidebar::NoticeArm::Issue1422,
+                                    "pdf-raster",
+                                    "operation",
+                                );
+                            }
+                            let bg_silent = app.remote_notice.is_none();
+                            // ⑤ エッジ: 通知を閉じた直後に同じ失敗をしてもまた出る
+                            app.preview_code_copy_clicked(term_pane, 0, cx);
+                            let after_dismiss = app
+                                .remote_notice
+                                .as_ref()
+                                .filter(|n| n.is_error)
+                                .map(|n| n.text.clone());
+                            app.remote_notice = None;
+                            cx.notify();
+                            (
+                                restore_notice,
+                                unshelve_notice,
+                                copy_notice,
+                                bg_silent,
+                                after_dismiss,
+                            )
+                        })
+                        .unwrap_or((None, None, None, false, None));
+
+                // ⑥ 裏取り: **成功するコピーでは通知を出さない**（誤検知していない）
+                let md1422 = std::env::temp_dir()
+                    .join(format!("tako-st1422-{}-code.md", std::process::id()));
+                let _ = std::fs::write(&md1422, "# コード\n\n```rust\nfn main() {}\n```\n");
+                let code_pane = window
+                    .update(cx, |app, _, cx| {
+                        let pane = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::OpenFile {
+                                pane: None,
+                                path: md1422.display().to_string(),
+                                mode: Some(tako_control::protocol::PreviewModeWire::Markdown),
+                                direction: None,
+                                focus: Some(false),
+                                new_tab: true,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                        .and_then(|v| v.get("pane").and_then(serde_json::Value::as_u64))
+                        .map(PaneId::from_raw);
+                        app.drain_pending_preview_loads(cx);
+                        cx.notify();
+                        pane
+                    })
+                    .ok()
+                    .flatten();
+                let code_ready = match code_pane {
+                    Some(pane) => {
+                        wait_for_app_state(
+                            window,
+                            cx,
+                            "84d の前提: Markdown プレビューのコードブロックが読める",
+                            state_wait_budget(Duration::from_secs(10), machine_busy()),
+                            move |app| {
+                                app.previews.get(&pane).is_some_and(|p| {
+                                    matches!(&p.content, preview::PreviewContent::Markdown(blocks)
+                                        if blocks.iter().any(|b| matches!(
+                                            b.kind,
+                                            preview::MdBlockKind::CodeBlock { .. }
+                                        )))
+                                })
+                            },
+                        )
+                        .await
+                    }
+                    None => false,
+                };
+                let ok_silent = match code_pane {
+                    Some(pane) => window
+                        .update(cx, |app, _, cx| {
+                            app.remote_notice = None;
+                            app.preview_code_copy_clicked(pane, 0, cx);
+                            let silent = app.remote_notice.is_none();
+                            let _ = tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::Close {
+                                    pane: Some(pane.as_u64()),
+                                    force: true,
+                                    caller_role: None,
+                                },
+                                PaneOrigin::Cli,
+                            );
+                            cx.notify();
+                            silent
+                        })
+                        .unwrap_or(false),
+                    None => false,
+                };
+                let _ = std::fs::remove_file(&md1422);
+                let bg_lines = tako_control::diag::persist_log_path()
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .map(|s| {
+                        s.lines()
+                            .skip(log_before)
+                            .filter(|l| l.contains("op=pdf-raster"))
+                            .count()
+                    })
+                    .unwrap_or(0);
+
+                println!(
+                    "TAKO_SELF_TEST_1422: legacy={} restore={restore_notice:?} \
+                     unshelve={unshelve_notice:?} copy={copy_notice:?} bg_silent={bg_silent} \
+                     bg_lines={bg_lines} after_dismiss={after_dismiss:?} \
+                     code_ready={code_ready} ok_silent={ok_silent}",
+                    TakoApp::legacy_1422(),
+                );
+                let restore_ok = restore_notice.as_deref().is_some_and(|t| {
+                    t.starts_with(crate::ui_text::panel::op_restore_session())
+                        && t.contains("tako-st1422-gone")
+                });
+                let unshelve_ok = unshelve_notice
+                    .as_deref()
+                    .is_some_and(|t| t.starts_with(crate::ui_text::panel::op_unshelve_pane()));
+                let copy_ok = copy_notice.as_deref().is_some_and(|t| {
+                    t.starts_with(crate::ui_text::preview::op_copy_code_block())
+                        && t.contains(&crate::ui_text::preview::code_block_n(0))
+                });
+                check(
+                    restore_ok && unshelve_ok,
+                    "右パネル: tmux 復元 / バックグラウンド復帰の失敗が通知欄へ出る（#1422）",
+                );
+                check(
+                    copy_ok && after_dismiss.is_some(),
+                    "プレビュー: コードブロックのコピー失敗が通知欄へ出る（#1422）",
+                );
+                check(
+                    bg_silent && bg_lines == 3 && code_ready && ok_silent,
+                    "背景処理は通知欄に出ず診断へ 1 要求 1 行・成功時は無言（#1422）",
+                );
+            }
+
             // 85. git タブのセクション表示順（#551 案 2）。
             // 「変更 → コミット → ブランチ → リモート → diff」の順に積まれることを
             // render が実際に記録した並び（`git_body_sections`）で固定する。
