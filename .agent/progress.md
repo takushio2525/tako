@@ -59,3 +59,8 @@
 - #1417 の番犬は窓の中に `Err(` が**在るだけ**で「扱った」と数えるので、`right_panel.rs:2022` は結果を `if opened.is_ok()` でしか見ていないのに**無関係な** `if let Err(e) = attach_pending_sessions(..)` で緑だった（実測で確認）。判定を**結果の束縛名の追跡**へ寄せ、`eprintln!` の検査を `sidebar.rs` 限定から全 UI モジュール（テストモジュールは除外・スコープ外は `KNOWN_EPRINTLN` の件数で段階導入）へ広げた
 - 6 か所を振り分け: ユーザー操作 5 件（tmux 復元 / 復元ペインの PTY 起動 / バックグラウンド復帰 / コードのコピー / Code Runner）は共有の通知欄 + persist.log、背景処理 1 件（PDF 再ラスタライズ）は `log_ui_failure` で診断だけ。A/B の軸を画面（`NoticeArea`）から Issue（`NoticeArm`）へ分離（同じ画面に #1417 と #1422 の通知が同居し、画面で env を選ぶと互いの回帰を隠すため）
 - 隔離 GUI（tako-vd）項目 84d の A/B: 新 = `restore=Some("セッションの復元 に失敗しました…")` / `unshelve=Some(…)` / `copy=Some(…)` / `bg_silent=true bg_lines=3` / `ok_silent=true` で完走（FAILED 0）、legacy（`TAKO_1422_LEGACY=1`）は全部 `None` で FAILED かつ #1417 の診断行は `legacy=false` のまま（A/B が互いを隠さない）。注入 10 通りが file:line 名指し FAILED・workspace 4538 passed 0 failed
+
+## 2026-09-12（#1430: merge-pr.sh の終了コードを実測で言い切り、ローカル head も自分で消した）
+- 実測で Issue の推測を否定: 現行スクリプトは worktree 事故でも**既に exit 0**（#1347 で解消済み）。実在した誤読の元は「`failed to run git: fatal:` + `警告: merge は済んだが gh が 1 で終わった`」の 2 行と、**すでに MERGED の PR への再実行が 1** を返すこと（使い捨て private リポ + 実 gh 2.88.1 で PR 7 本を実 merge して確定）
+- gh の非ゼロを「merge の失敗ではない」注記へ、最終行を `merge 成立: PR #N は MERGED（url）/ 終了コード 0` へ、MERGED の再実行を冪等 0 へ（CLOSED は 1）。ローカル head は `git branch -D`、作業ツリーが握るときだけ外し方を名指しして残す（`worktree_holding_branch` / `delete_local_head_branch` の 1 実装）
+- モック Test 24〜29（ローカルブランチと作業ツリーだけ実 git。25b = 本体の作業ツリーには「畳め」と言わない）で 137 PASS 0 FAIL。注入 4 通り（後始末を外す / 再実行を refuse へ戻す / 旧警告文へ戻す / 作業ツリー検出を殺す）すべて FAILED。A/B = `TAKO_1430_LEGACY=1`。**install 不要**（scripts + docs のみ）

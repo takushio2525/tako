@@ -129,7 +129,9 @@ case "$1 ${2:-}" in
     exit 0
     ;;
   "pr merge")
-    echo "$*" >> "${M}/merged"
+    # merge.not-merged があるときは **merge 自体が成立しなかった**腕（#1430）。
+    # pr view は OPEN のままになるので、merge-pr.sh は 1 で終わらなければならない
+    [[ -f "${M}/merge.not-merged" ]] || echo "$*" >> "${M}/merged"
     rc="$(cat "${M}/merge.rc" 2>/dev/null || echo 0)"
     if [[ "${rc}" != "0" ]]; then
       # worktree 事故: ローカルの切り替えで落ちるので**リモートは消えない**（#1347 の実測）
@@ -234,6 +236,31 @@ new_case() {
 
 run_wait() { (cd "${CASE_DIR}/repo" && bash "${WAIT_SH}" "$@" 2>&1); }
 run_merge() { (cd "${CASE_DIR}/repo" && bash "${MERGE_SH}" "$@" 2>&1); }
+# 専用 worktree から実行する形（#1430）。第 1 引数が作業ディレクトリ
+run_merge_at() {
+  local dir="$1"
+  shift
+  (cd "${dir}" && bash "${MERGE_SH}" "$@" 2>&1)
+}
+# 実 git のコミット・ブランチ・作業ツリーを用意する（#1430 のローカル後始末は本当に git を触るので
+# スタブではなく実物で見る）。$1 = head ブランチ名 / $2 = "worktree" なら別の作業ツリーが握る
+seed_local_branch() {
+  local repo="${CASE_DIR}/repo" br="$1" mode="${2:-}"
+  git -C "${repo}" config user.email "probe@example.invalid"
+  git -C "${repo}" config user.name "probe"
+  git -C "${repo}" add -A >/dev/null 2>&1
+  git -C "${repo}" commit -qm seed >/dev/null 2>&1
+  git -C "${repo}" branch "${br}" >/dev/null 2>&1
+  if [[ "${mode}" == "worktree" ]]; then
+    git -C "${repo}" worktree add -q "${CASE_DIR}/wt" "${br}" >/dev/null 2>&1
+  elif [[ "${mode}" == "current" ]]; then
+    # 本体の作業ツリー（連結ではない）が head を握っている形
+    git -C "${repo}" checkout -q "${br}" >/dev/null 2>&1
+  fi
+}
+local_branch_exists() {
+  git -C "${CASE_DIR}/repo" show-ref --verify --quiet "refs/heads/$1" && echo yes || echo no
+}
 calls_of() {
   local n
   n="$(grep -c "$1" "${TAKO_GH_MOCK_DIR}/calls.log" 2>/dev/null)" || n=0
@@ -479,6 +506,7 @@ JSON
   printf '%s' "${BR}" > "${TAKO_GH_MOCK_DIR}/merge-head"
 }
 remote_has() { grep -qxF "${BR}" "${TAKO_GH_MOCK_DIR}/remote-branches" 2>/dev/null && echo yes || echo no; }
+remote_has_1430() { grep -qxF "${BR30}" "${TAKO_GH_MOCK_DIR}/remote-branches" 2>/dev/null && echo yes || echo no; }
 
 setup_1347 t16
 echo 1 > "${TAKO_GH_MOCK_DIR}/merge.rc"
@@ -648,6 +676,118 @@ out="$(run_merge 1359 --timeout 60 --interval 1)"
 rc=$?
 assert_eq "merge 側は draft の門が先（従来どおり 1）" "${rc}" "1"
 assert_has "draft だと言う" "draft のまま" "${out}"
+
+echo "== Test 24: worktree から merge しても 0 で終わり、ローカル head は理由つきで残る（#1430）=="
+# 実測（使い捨てリポ + 実 gh 2.88.1）: `gh pr merge --squash --delete-branch` を専用 worktree から
+# 叩くと merge は成立（MERGED）するのに gh は 1 で終わり、リモートもローカルも消え残る。
+# その「gh が 1」を merge の失敗と読ませないのが本 Issue
+BR30="fix/1430-merge-pr-exit-code"
+setup_1430() { # $1 = ケース名, $2 = seed_local_branch の第 2 引数（worktree / 空）
+  new_case "$1"
+  checks_json "${CF}|pass|2026-09-11T04:24:00Z" "${MAC}|pass|2026-09-11T04:36:50Z" "${WIN}|pass|2026-09-11T04:39:33Z" \
+    > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+  cat > "${TAKO_GH_MOCK_DIR}/view.json" <<JSON
+{"number":1431,"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN",
+ "headRefName":"${BR30}","headRefOid":"cafebabe","baseRefName":"main","isCrossRepository":false,
+ "title":"[改善] テスト用","url":"https://example.invalid/pr/1431"}
+JSON
+  printf '%s\n' "${BR30}" > "${TAKO_GH_MOCK_DIR}/remote-branches"
+  printf '%s' "${BR30}" > "${TAKO_GH_MOCK_DIR}/merge-head"
+  seed_local_branch "${BR30}" "${2:-}"
+}
+# 実 gh の事故をそのまま再現する（rc=1・リモートもローカルも残す）
+worktree_accident() {
+  echo 1 > "${TAKO_GH_MOCK_DIR}/merge.rc"
+  printf "failed to run git: fatal: 'main' is already used by worktree at '/tmp/shared'\n" \
+    > "${TAKO_GH_MOCK_DIR}/merge.err"
+}
+
+setup_1430 t24 worktree
+worktree_accident
+out="$(run_merge_at "${CASE_DIR}/wt" 1431 --timeout 20 --interval 1)"
+rc=$?
+# git は作業ツリーのパスをシンボリックリンク解決後で持つ（macOS の /var → /private/var）ので、
+# 期待値もスクリプトとは独立に pwd -P で取る
+WT24="$(cd "${CASE_DIR}/wt" && pwd -P)"
+assert_eq "merge が成立していれば worktree から実行しても 0" "${rc}" "0"
+assert_has "gh の非ゼロは merge の失敗ではないと言い切る" "gh は 1 で終わったが merge は成立している" "${out}"
+assert_hasnt "「merge は済んだが gh が」という誤読を招く言い方は残っていない" "merge は済んだが gh が" "${out}"
+assert_has "リモート head は消す" "リモートブランチ ${BR30} を削除した" "${out}"
+assert_has "ローカル head を消せない理由を名指しする" "ローカルブランチ ${BR30} は残す（作業ツリー ${WT24} が握っているので消せない）" "${out}"
+assert_has "外し方まで出す" "git worktree remove ${WT24} && git branch -D ${BR30}" "${out}"
+assert_has "最後の 1 行で終了コードの意味を言い切る" "merge 成立: PR #1431 は MERGED（https://example.invalid/pr/1431）/ 終了コード 0" "${out}"
+assert_eq "握られているローカル head は残る（正当な例外）" "$(local_branch_exists "${BR30}")" "yes"
+
+echo "== Test 25: どこも握っていないローカル head は自分で消す（#1430）=="
+setup_1430 t25
+worktree_accident
+out="$(run_merge 1431 --timeout 20 --interval 1)"
+rc=$?
+assert_eq "0 で終わる" "${rc}" "0"
+assert_has "消したことを 1 行で言う" "ローカルブランチ ${BR30} を削除した" "${out}"
+assert_eq "ローカル head が消えている" "$(local_branch_exists "${BR30}")" "no"
+
+echo "== Test 25b: 本体の作業ツリーが head を握っているときは「畳め」と言わない（#1430）=="
+# 連結された作業ツリーは畳めばブランチが解放されるが、**本体は畳めない**ので
+# `git worktree remove` を案内すると実行できないコマンドを渡すことになる
+setup_1430 t25b current
+worktree_accident
+out="$(run_merge 1431 --timeout 20 --interval 1)"
+rc=$?
+REPO25B="$(cd "${CASE_DIR}/repo" && pwd -P)"
+assert_eq "0 で終わる" "${rc}" "0"
+assert_has "握っているのが本体だと分かる形で残す" "ローカルブランチ ${BR30} は残す（作業ツリー ${REPO25B} が握っているので消せない）" "${out}"
+assert_has "本体には「別のブランチへ移れ」と言う" "別のブランチへ移れば消せる: git -C ${REPO25B} switch main && git branch -D ${BR30}" "${out}"
+assert_hasnt "本体に「畳め」とは言わない" "git worktree remove ${REPO25B}" "${out}"
+assert_eq "ローカル head は残る" "$(local_branch_exists "${BR30}")" "yes"
+
+echo "== Test 26: すでに MERGED の PR への再実行は 0（冪等・#1430 の実在した 1）=="
+# 実測: 修正前は「merge しない: PR #N は OPEN ではない（MERGED）」で 1 を返していた。
+# merge 済みは**望んだ終わり方に到達している**ので、自動化には 0 を返す
+setup_1430 t26 worktree
+printf 'x' > "${TAKO_GH_MOCK_DIR}/merged" # 偽 gh の pr view が MERGED を返す
+out="$(run_merge_at "${CASE_DIR}/wt" 1431 --timeout 20 --interval 1)"
+rc=$?
+assert_eq "再実行は 0" "${rc}" "0"
+assert_has "すでに merge 済みだと言う" "PR #1431 はすでに merge 済み（待つ前）" "${out}"
+assert_eq "merge を呼び直さない" "$(calls_of 'pr merge')" "0"
+assert_has "後始末は再実行でも閉じる" "リモートブランチ ${BR30} を削除した" "${out}"
+assert_has "終了コードの意味を言い切る" "/ 終了コード 0" "${out}"
+
+echo "== Test 27: merge されずに閉じられた PR は従来どおり 1 =="
+setup_1430 t27
+jq '.state = "CLOSED"' "${TAKO_GH_MOCK_DIR}/view.json" > "${TAKO_GH_MOCK_DIR}/view.json.new"
+mv "${TAKO_GH_MOCK_DIR}/view.json.new" "${TAKO_GH_MOCK_DIR}/view.json"
+out="$(run_merge 1431 --timeout 20 --interval 1)"
+rc=$?
+assert_eq "CLOSED は 1（望んだ状態ではない）" "${rc}" "1"
+assert_has "理由を名指しする" "OPEN ではない（CLOSED）" "${out}"
+assert_eq "merge を呼ばない" "$(calls_of 'pr merge')" "0"
+
+echo "== Test 28: merge 自体が成立しなかったら 1 で理由を名指しする =="
+setup_1430 t28
+echo 1 > "${TAKO_GH_MOCK_DIR}/merge.rc"
+printf 'failed to merge: base branch was modified\n' > "${TAKO_GH_MOCK_DIR}/merge.err"
+: > "${TAKO_GH_MOCK_DIR}/merge.not-merged" # 状態は OPEN のまま
+out="$(run_merge 1431 --timeout 20 --interval 1)"
+rc=$?
+assert_eq "merge が成立していなければ 1" "${rc}" "1"
+assert_has "PR の状態と gh の終了コードを両方出す" "merge に失敗した（PR の状態 OPEN / gh の終了コード 1）" "${out}"
+assert_eq "成立していないので後始末はしない" "$(remote_has_1430)" "yes"
+assert_eq "ローカル head にも触らない" "$(local_branch_exists "${BR30}")" "yes"
+
+echo "== Test 29: 修正前（TAKO_1430_LEGACY=1）はローカルが残り、再実行が 1 になる（検出力）=="
+setup_1430 t29 worktree
+worktree_accident
+out="$(TAKO_1430_LEGACY=1 run_merge_at "${CASE_DIR}/wt" 1431 --timeout 20 --interval 1)"
+assert_hasnt "修正前はローカル head に一切触れない" "ローカルブランチ" "${out}"
+
+setup_1430 t29b worktree
+printf 'x' > "${TAKO_GH_MOCK_DIR}/merged"
+out="$(TAKO_1430_LEGACY=1 run_merge_at "${CASE_DIR}/wt" 1431 --timeout 20 --interval 1)"
+rc=$?
+assert_eq "修正前は merge 済みへの再実行が 1" "${rc}" "1"
+assert_has "修正前は「OPEN ではない」で拒む" "OPEN ではない（MERGED）" "${out}"
 
 echo
 echo "=== 結果: PASS=${PASS} FAIL=${FAIL} ==="

@@ -1745,7 +1745,9 @@ CI 完了前に merge され（merge 04:24:10 / Windows 完了 04:48:24）、過
   `--delete-branch`）。CONFLICTING / BEHIND / BLOCKED は待たずに理由を出して止まる。
   **worker も master もこの 1 実装を呼ぶ**（手順の記憶ではなく構造で守る）
 - 終了コードは共通で **0 = 全部緑 / 1 = 失敗・拒否 / 2 = タイムアウト / 3 = 引数・gh のエラー /
-  4 = base と衝突している**
+  4 = base と衝突している**。`merge-pr.sh` の 0 は「**merge が成立している**」で、
+  **すでに MERGED だった PR への再実行も 0**（#1430。望んだ終わり方に到達しているので
+  後始末だけ確かめて終わる。merge されずに CLOSED なのは 1）
 - **衝突しているあいだ CI の run は作られないので、待たずに 4 で終わる**（#1365）。base が進んで
   衝突すると GitHub は merge コミットを作れず **`pull_request` の run を作らない**ので、
   `gh pr checks` には外部連携の `Cloudflare Pages` だけが並び、macOS / Windows は永久に未登録のまま
@@ -1780,6 +1782,23 @@ CI 完了前に merge され（merge 04:24:10 / Windows 完了 04:48:24）、過
   到達しない**（PR #1337 で実発生。棚卸しでは merge 済み PR の head が origin に 5 本残っていた）。
   `merge-pr.sh` は MERGED を確認してから**自分で消す**（冪等・**その PR の head 1 本だけ**・
   head == base と fork の PR は触らない）。A/B は `TAKO_1347_LEGACY=1`（gh 任せの腕）
+- **ローカルブランチも `gh` に任せない。そして `gh` の終了コードを merge の成否として読まない**（#1430）。
+  後始末（ローカル削除・リモート削除）は**すべて merge の後**に走るので、gh が 1 で終わっても
+  PR は MERGED になっている。実測（使い捨てリポ + 実 gh 2.88.1）: 専用 worktree からの
+  `gh pr merge --squash --delete-branch` は **rc=1 / PR は MERGED / リモートもローカルも残る**。
+  それでも `merge-pr.sh` 自身の終了コードは #1347 の時点から 0 だったが、**出力が**
+  `failed to run git: fatal: …` と `警告: merge は済んだが gh が 1 で終わった` の 2 行で
+  失敗に見えたので、worker 3 本（PR #1421 / #1423 / #1424）が merge 失敗と誤読して
+  人手確認に回った。直したのは 3 点:
+  - ローカル head も `merge-pr.sh` が消す。誰も握っていなければ `git branch -D`、
+    **作業ツリーが握っているときだけ**「どこが握っているか」と
+    `git worktree remove <path> && git branch -D <head>` を名指しして残す（正当な例外）
+  - gh の非ゼロは「merge の失敗ではない」と言い切る**注記**（stdout）にし、成否は
+    `gh pr view` の状態の実測だけで決める。最後の 1 行は必ず
+    `merge 成立: PR #N は MERGED（url）/ 終了コード 0`
+  - **すでに MERGED なら後始末だけ確かめて 0**（再実行・重複実行を失敗に化けさせない）
+  A/B は `TAKO_1430_LEGACY=1`（ローカルを後始末せず、MERGED の再実行を 1 で拒む腕）。
+  モックは Test 24〜29 が固定し、**ローカルブランチと作業ツリーだけは実 git** を触る
 
 ## 設定・データファイルのスキーマ変更（Issue #916）
 
