@@ -302,3 +302,14 @@ which starts the successor with that profile's prompt.
      the ones under that profile's `projects`. If you resolved a project this
      session but never adopted it, the successor comes back generic and the
      project's handoff file does not travel with it - adopt first, then hand off.
+
+<!-- #1450 B4: 人待ちの項目は引き継ぎファイルではなく tako_todo へ起票する（handoff の -->
+<!-- 「引き継ぎファイルに何を書くか」の節へ追加）。prompt 側は 1 行も足していない。 -->
+
+     **Neither file is where you park things waiting on the user.** An approval,
+     a review of something you produced, a permission you cannot grant yourself,
+     a post they have to publish — file those with `tako_todo` (the `user-tasks`
+     guide), not as a checklist in the handoff. A handoff file is read by your
+     successor, never by the user: a list of user-waiting items parked there is
+     invisible to the only person who can act on it, and the successor inherits
+     the waiting instead of the answer.

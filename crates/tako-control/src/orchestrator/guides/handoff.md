@@ -35,6 +35,14 @@
        tako warns you, and the fix is to move project content into the project
        files, not to trim the meaning out of it.
 
+     **Neither file is where you park things waiting on the user.** An approval,
+     a review of something you produced, a permission you cannot grant yourself,
+     a post they have to publish — file those with `tako_todo` (the `user-tasks`
+     guide), not as a checklist in the handoff. A handoff file is read by your
+     successor, never by the user: a list of user-waiting items parked there is
+     invisible to the only person who can act on it, and the successor inherits
+     the waiting instead of the answer.
+
    - **The successor is launched with the profile you currently hold**, which is
      the one `tako_orchestrator_self` reports - including a profile you took on
      mid-session with `tako_orchestrator_adopt`. The `successor_command` field
