@@ -2790,6 +2790,40 @@ pub fn is_generic_profile(profile: &Profile) -> bool {
     profile.projects.as_ref().is_none_or(|p| p.is_empty())
 }
 
+/// プロジェクトキーを管轄する master プロファイルを**一意に**引く（#1466）。
+///
+/// worker が起票したユーザータスクの戻り先を、spawn 元のペインが残っていないとき
+/// （GUI 再起動で `spawned_by` が失われた・master のペインを閉じた）に解くための
+/// 最後の手がかり。#1453 以降 `projects add` が `projects: [<key>]` を持つ専用
+/// プロファイルを作るので、たいていは 1 件で決まる。
+///
+/// **0 件と複数件はどちらも `None`**。「候補のどれか 1 つ」を選ぶのは
+/// #1466 の症状（無関係な master の入力欄へ返答が入る）そのものなので、
+/// 曖昧なら宛先不明のまま返す
+pub fn profile_governing_project(key: &str) -> Option<String> {
+    if key.is_empty() {
+        return None;
+    }
+    let mut found: Option<String> = None;
+    for name in list_profiles_of(ProfileKind::Master).ok()? {
+        let Ok(profile) = load_profile_of(ProfileKind::Master, &name) else {
+            continue;
+        };
+        let governs = profile
+            .projects
+            .as_ref()
+            .is_some_and(|list| list.iter().any(|k| k == key));
+        if !governs {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(name);
+    }
+    found
+}
+
 /// prompt の**利用者が書いた部分**の指紋（#1453）。
 /// 管轄（`projects`）は落とす —— 採用で必ず変わる部分なので、比較に入れると
 /// 「毎回違う」としか言えなくなる
@@ -3531,6 +3565,43 @@ mod tests {
             Some("個人ルール"),
             "個人ルールが継承されていない"
         );
+    }
+
+    /// #1466: 管轄プロファイルは**一意なときだけ**引ける。
+    /// 「候補のどれか 1 つ」を選ぶと、返答が無関係な master へ届く症状が戻る
+    #[test]
+    fn issue1466_管轄プロファイルは一意なときだけ引ける() {
+        let key = "_tako_1466_proj_";
+        let _guard = t1453_setup(key, "/tmp/_tako_1466_repo_");
+        let rival = "_tako_1466_rival_";
+        let _ = std::fs::remove_file(ProfileKind::Master.path(rival).expect("パス"));
+
+        // 管轄するプロファイルが 1 つも無い = 引けない
+        assert_eq!(profile_governing_project(key), None, "0 件で引けてしまう");
+
+        // #1453 の自動生成で `projects: [key]` を持つ専用プロファイルができる
+        assert!(ensure_project_profile(key).created());
+        assert_eq!(
+            profile_governing_project(key).as_deref(),
+            Some(key),
+            "一意な管轄が引けない"
+        );
+
+        // 同じキーを管轄する 2 本目ができたら曖昧 = 引かない
+        mutate_profile_of(ProfileKind::Master, rival, |p| {
+            p.projects = Some(vec![key.to_string()]);
+        })
+        .expect("2 本目の準備");
+        assert_eq!(
+            profile_governing_project(key),
+            None,
+            "曖昧なのに 1 つ選んでいる（#1466 の症状が戻る）"
+        );
+        let _ = std::fs::remove_file(ProfileKind::Master.path(rival).expect("パス"));
+
+        // 空キー・未登録キーは引かない
+        assert_eq!(profile_governing_project(""), None);
+        assert_eq!(profile_governing_project("_tako_1466_unknown_"), None);
     }
 
     #[test]

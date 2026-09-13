@@ -12991,8 +12991,10 @@ fn dispatch_user_task(
                 .transpose()
                 .map_err(DispatchError::InvalidParams)?;
             let caller = params.pane.and_then(|p| resolve_pane(host.workspace(), Some(p)).ok());
-            let task_origin = user_task_origin(host, &params, caller.map(|(_, p)| p));
-            let created_by = user_task_created_by(&params, &task_origin);
+            let (task_origin, origin_source) =
+                user_task_origin(host, &params, caller.map(|(_, p)| p));
+            let origin_profile = task_origin.profile.clone();
+            let created_by = user_task_created_by(host, &params, &task_origin);
             let value = crate::user_tasks::add_at(
                 &path,
                 NewTask {
@@ -13018,10 +13020,16 @@ fn dispatch_user_task(
             // 新しく人の手を待つものが増えたことを画面へ 1 行出す（#1399 系の出し口の成功系）。
             // 診断はここ（起きた場所）に置く。GUI 側は画面へ出すだけ
             let new_id = value["id"].as_str().unwrap_or("-").to_string();
+            // 戻り先の解き方まで残す（#1466。「返答が別の master へ行った」を後から追える
+            // 唯一の痕跡。プロファイル名は個人情報ではないが、本文・添付の中身は出さない）
             crate::diag::persist_log(&format!(
-                "ユーザータスクを起票: task={new_id} kind={} 添付={} 通知=通知欄",
+                "ユーザータスクを起票: task={new_id} kind={} 添付={} 戻り先={} 由来={} 通知=通知欄",
                 value["kind"].as_str().unwrap_or("-"),
                 value["attachments"].as_array().map(Vec::len).unwrap_or(0),
+                origin_profile.as_deref().unwrap_or("宛先不明"),
+                origin_source
+                    .map(crate::user_tasks::OriginSource::as_str)
+                    .unwrap_or("なし"),
             ));
             host.notify_user_task_added(&new_id, value["title"].as_str().unwrap_or("-"));
             Ok(value)
@@ -13119,49 +13127,104 @@ fn user_task_id(params: &UserTaskParams) -> Result<String, DispatchError> {
 }
 
 /// 起票元（返答の戻り先）。**呼び出し側は何も指定しなくてよい**のが要件
-/// （master は「起票する」とだけ言えば、返答が自分の入力欄へ返ってくる）
+/// （master は「起票する」とだけ言えば、返答が自分の入力欄へ返ってくる）。
+///
+/// # worker から起票されたとき（#1466）
+///
+/// master を名乗る role が無いので、以前は profile が空のまま `default` へ落ち、
+/// 返答が**たまたま生きている別プロジェクトの master** の入力欄へ入っていた。
+/// 解くのは「spawn 時点の事実」= `spawned_by` の枝（tako 自身が spawn の瞬間に張る）で、
+/// 枝が失われている場合だけ「その project を管轄するプロファイル」を保険に使う。
+/// **どれも当たらなければ profile は `None` のまま**にして、配送時に宛先不明で失敗させる
 fn user_task_origin(
     host: &dyn ControlHost,
     params: &UserTaskParams,
     caller: Option<PaneId>,
-) -> tako_core::user_task::TaskOrigin {
-    // プロファイルは呼び出し元の role（env 由来）→ ペインの role ラベルの順に解く。
-    // どちらの語彙でも読める 1 実装（#761 の取り違えを構造的に避ける）
-    let profile = params
+) -> (
+    tako_core::user_task::TaskOrigin,
+    Option<crate::user_tasks::OriginSource>,
+) {
+    let pane_role = caller.and_then(|pane| pane_role_of(host, pane));
+    // 呼び出し元が名乗った role（env 由来）と、tako が知っているペインの role ラベル。
+    // どちらの語彙でも読める 1 実装を通す（#761 の取り違えを構造的に避ける）
+    let pane_master = pane_role
+        .as_deref()
+        .and_then(tako_core::handoff::master_profile_of_role);
+    // spawn 元の master（`spawned_by` を辿る。worker spawn の既定と同じ 1 実装）
+    let spawn_chain = caller.and_then(|pane| spawn_chain_master_profile(host.workspace(), pane));
+    // 保険: worker の project を管轄するプロファイル（**一意のときだけ**返る）
+    let jurisdiction = params
         .caller_role
         .as_deref()
-        .and_then(tako_core::handoff::master_profile_of_any_role)
-        .map(str::to_string)
+        .and_then(tako_core::handoff::worker_project_of_any_role)
         .or_else(|| {
-            caller.and_then(|pane| {
-                pane_role_of(host, pane)
-                    .as_deref()
-                    .and_then(tako_core::handoff::master_profile_of_role)
-                    .map(str::to_string)
-            })
-        });
+            pane_role
+                .as_deref()
+                .and_then(tako_core::handoff::worker_project_of_any_role)
+        })
+        .and_then(crate::orchestrator::profile_governing_project);
+    let resolved = crate::user_tasks::resolve_origin_profile(
+        params.caller_role.as_deref(),
+        pane_master,
+        spawn_chain.as_deref(),
+        jurisdiction.as_deref(),
+        crate::user_tasks::legacy_origin_resolution(),
+    );
     // 会話の id はセッションカタログ（#284 の逆引き）から引く。
     // ペインが死んだあとに返答が来ても「どの会話の話か」が残る
     let session_id = caller
         .and_then(|pane| crate::sessions::resolve_session_for_pane(&pane.as_u64().to_string()));
-    tako_core::user_task::TaskOrigin {
-        profile,
+    let origin = tako_core::user_task::TaskOrigin {
+        profile: resolved.as_ref().map(|(p, _)| p.clone()),
         session_id,
         pane: caller.map(|p| p.as_u64()),
         project: params.project.clone(),
-    }
+    };
+    (origin, resolved.map(|(_, source)| source))
 }
 
-/// 起票者の名乗り（画面に「誰が頼んだか」を出すため）
+/// 起票したペインから `spawned_by` を辿って着いた master のプロファイル（#1466）。
+///
+/// `find_master_suffix_from` は既定プロファイルの master を**空 suffix**で返すので、
+/// ここで `default` へ綴りを揃える（空のまま渡すと「解けなかった」と区別できない）
+fn spawn_chain_master_profile(workspace: &tako_core::Workspace, pane: PaneId) -> Option<String> {
+    find_master_suffix_from(workspace, pane).map(|suffix| {
+        if suffix.is_empty() {
+            tako_core::handoff::DEFAULT_PROFILE.to_string()
+        } else {
+            suffix
+        }
+    })
+}
+
+/// 起票者の名乗り（画面に「誰が頼んだか」を出すため）。
+///
+/// 見るのは**呼び出し元自身の役割**であって、返答の戻り先（`origin.profile`）ではない
+/// （#1466 で worker の戻り先が master のプロファイルへ解けるようになったので、
+/// `origin.profile` から名乗りを作ると worker の起票が `master:<profile>` を騙る）
 fn user_task_created_by(
+    host: &dyn ControlHost,
     params: &UserTaskParams,
     origin: &tako_core::user_task::TaskOrigin,
 ) -> Option<String> {
-    if let Some(profile) = &origin.profile {
+    let self_role = params
+        .caller_role
+        .clone()
+        .filter(|r| !r.trim().is_empty())
+        .or_else(|| {
+            origin
+                .pane
+                .and_then(|p| pane_role_of(host, PaneId::from_raw(p)))
+        });
+    // master は 2 語彙（表示用 / env 用）あるので `master:<profile>` へ正規化する
+    if let Some(profile) = self_role
+        .as_deref()
+        .and_then(tako_core::handoff::master_profile_of_any_role)
+    {
         return Some(format!("master:{profile}"));
     }
-    if let Some(role) = params.caller_role.as_deref().filter(|r| !r.is_empty()) {
-        return Some(role.to_string());
+    if let Some(role) = self_role {
+        return Some(role);
     }
     origin.pane.map(|p| format!("pane:{p}"))
 }
@@ -13217,7 +13280,12 @@ fn deliver_user_task_response(
     use crate::user_tasks::{delivery_record, DeliveryTarget};
     use tako_core::user_task::DeliveryState;
 
-    let profile = crate::user_tasks::origin_profile(task);
+    // 起票元が解けていなければ**どこへも送らない**（#1466）。`default` へ落とすと
+    // 無関係なプロジェクトの master の入力欄へ返答が入り、双方に何も分からない
+    let Some(profile) = crate::user_tasks::origin_profile(task) else {
+        log_user_task_delivery(&task.id, "origin_unresolved", "operation");
+        return crate::user_tasks::unresolved_delivery(index);
+    };
     let panes = user_task_pane_roles(host.workspace());
     let origin_pane = task.origin.as_ref().and_then(|o| o.pane);
     match crate::user_tasks::choose_target(&panes, &profile, origin_pane) {
@@ -27141,6 +27209,243 @@ mod tests {
             tree.get_mut(id).unwrap().set_spawned_by(Some(master));
         }
         (tab, master)
+    }
+
+    // --- #1466: worker が起票したユーザータスクの戻り先 ---
+
+    /// `master + worker` を組み、それぞれの role ラベルを貼る。
+    /// spawn 経路と同じ手順（`spawn_worker` → `set_spawned_by`）を通す
+    fn t1466_host(master_role: &str, worker_role: &str) -> (MockHost, PaneId, PaneId) {
+        let mut host = MockHost::new();
+        let (tab, master) = layout_with_workers(&mut host, 1);
+        let worker = host
+            .ws
+            .get_tab(tab)
+            .unwrap()
+            .tree()
+            .panes()
+            .iter()
+            .map(|p| p.id())
+            .find(|id| *id != master)
+            .expect("worker ペイン");
+        for (id, role) in [(master, master_role), (worker, worker_role)] {
+            host.ws
+                .get_tab_mut(tab)
+                .unwrap()
+                .tree_mut()
+                .get_mut(id)
+                .unwrap()
+                .set_role(Some(role.to_string()));
+        }
+        (host, master, worker)
+    }
+
+    fn t1466_params(caller_role: Option<&str>, pane: PaneId) -> UserTaskParams {
+        UserTaskParams {
+            action: "add".into(),
+            id: None,
+            title: Some("t".into()),
+            body: None,
+            kind: None,
+            status: None,
+            all: None,
+            project: None,
+            attachments: None,
+            copy_texts: None,
+            links: None,
+            due: None,
+            decision: None,
+            comment: None,
+            via: None,
+            pane: Some(pane.as_u64()),
+            caller_role: caller_role.map(str::to_string),
+        }
+    }
+
+    /// worker の起票は **spawn 元の master のプロファイル**へ戻る（#1466 の本体）
+    #[test]
+    fn issue1466_workerの起票はspawn元のmasterへ戻る() {
+        let (host, _master, worker) = t1466_host(
+            "orchestrator-master:_tako_1466_p_",
+            "orchestrator-worker:_tako_1466_proj_:1466",
+        );
+        let params = t1466_params(Some("worker:_tako_1466_proj_:1466"), worker);
+        let (origin, source) = user_task_origin(&host, &params, Some(worker));
+        assert_eq!(
+            origin.profile.as_deref(),
+            Some("_tako_1466_p_"),
+            "worker の起票が spawn 元の master へ戻らない（#1466）"
+        );
+        assert_eq!(source, Some(crate::user_tasks::OriginSource::SpawnChain));
+        assert_eq!(origin.pane, Some(worker.as_u64()));
+        // 名乗りは worker のまま（master を騙らない）
+        assert_eq!(
+            user_task_created_by(&host, &params, &origin).as_deref(),
+            Some("worker:_tako_1466_proj_:1466")
+        );
+    }
+
+    /// 既定プロファイルの master が spawn 元でも `default` と綴られる
+    /// （`find_master_suffix_from` は空 suffix を返すので、解けなかったのと混ざらない）
+    #[test]
+    fn issue1466_既定プロファイルのspawn元も解ける() {
+        let (host, _master, worker) = t1466_host(
+            "orchestrator-master",
+            "orchestrator-worker:_tako_1466_proj_:1466",
+        );
+        let params = t1466_params(Some("worker:_tako_1466_proj_:1466"), worker);
+        let (origin, source) = user_task_origin(&host, &params, Some(worker));
+        assert_eq!(origin.profile.as_deref(), Some("default"));
+        assert_eq!(source, Some(crate::user_tasks::OriginSource::SpawnChain));
+    }
+
+    /// master 自身の起票は従来どおり（回帰なし）
+    #[test]
+    fn issue1466_masterの起票は従来どおり() {
+        let (host, master, _worker) = t1466_host(
+            "orchestrator-master:_tako_1466_p_",
+            "orchestrator-worker:_tako_1466_proj_:1466",
+        );
+        // env で名乗る場合
+        let params = t1466_params(Some("master:_tako_1466_p_"), master);
+        let (origin, source) = user_task_origin(&host, &params, Some(master));
+        assert_eq!(origin.profile.as_deref(), Some("_tako_1466_p_"));
+        assert_eq!(source, Some(crate::user_tasks::OriginSource::CallerRole));
+        assert_eq!(
+            user_task_created_by(&host, &params, &origin).as_deref(),
+            Some("master:_tako_1466_p_")
+        );
+        // env が失われていてもペインの role ラベルから解ける（#854 と同じ material）
+        let params = t1466_params(None, master);
+        let (origin, source) = user_task_origin(&host, &params, Some(master));
+        assert_eq!(origin.profile.as_deref(), Some("_tako_1466_p_"));
+        assert_eq!(source, Some(crate::user_tasks::OriginSource::PaneRole));
+        assert_eq!(
+            user_task_created_by(&host, &params, &origin).as_deref(),
+            Some("master:_tako_1466_p_"),
+            "ペインの role から解けた master の名乗りが変わっている"
+        );
+    }
+
+    /// spawn 元が解けない起票は **`default` へ落ちない**（宛先不明のまま残る）
+    #[test]
+    fn issue1466_解けない起票は既定へ落ちない() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let pane_id = PaneId::from_raw(pane);
+        for role in [
+            // 復元で spawned_by を失った worker（管轄も引けないキー）
+            Some("orchestrator-worker:_tako_1466_orphan_:1466"),
+            // solo（オーケストレーションの外）
+            Some("solo"),
+            // role なしの素のシェル
+            None,
+        ] {
+            let tab = host.ws.active_tab_id();
+            host.ws
+                .get_tab_mut(tab)
+                .unwrap()
+                .tree_mut()
+                .get_mut(pane_id)
+                .unwrap()
+                .set_role(role.map(str::to_string));
+            let caller_role = match role {
+                Some("orchestrator-worker:_tako_1466_orphan_:1466") => {
+                    Some("worker:_tako_1466_orphan_:1466")
+                }
+                other => other,
+            };
+            let params = t1466_params(caller_role, pane_id);
+            let (origin, source) = user_task_origin(&host, &params, Some(pane_id));
+            assert_eq!(
+                origin.profile, None,
+                "role={role:?} の起票が既定プロファイルへ落ちている（#1466）"
+            );
+            assert_eq!(source, None, "role={role:?}");
+            // 宛先が無いので配送は失敗として残る（無言で誰かへ届けない）
+            let task = tako_core::user_task::UserTask {
+                id: "u-1".into(),
+                title: "t".into(),
+                body: String::new(),
+                kind: tako_core::user_task::TaskKind::Other,
+                status: tako_core::user_task::TaskStatus::Open,
+                created_by: None,
+                project: None,
+                attachments: Vec::new(),
+                copy_texts: Vec::new(),
+                links: Vec::new(),
+                due: None,
+                created_at: 0,
+                updated_at: 0,
+                origin: Some(origin),
+                responses: Vec::new(),
+                delivery: None,
+            };
+            let mut host2 = MockHost::new();
+            let delivery = deliver_user_task_response(&mut host2, &task, 0);
+            assert_eq!(
+                delivery.state,
+                tako_core::user_task::DeliveryState::Failed,
+                "role={role:?} の返答が誰かへ配送されている"
+            );
+            assert_eq!(delivery.profile, None, "role={role:?}");
+            assert!(
+                delivery
+                    .reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("宛先不明")),
+                "role={role:?} の失敗理由が読めない: {:?}",
+                delivery.reason
+            );
+        }
+    }
+
+    /// spawn 元の枝が失われていても、**一意な管轄**があればそこへ戻る
+    #[test]
+    fn issue1466_枝が無くても管轄から解ける() {
+        // config_dir はプロセス共有。プロファイルを作る / 消すので直列化する
+        let _guard = crate::orchestrator::TEST_PROJECT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let project = "_tako_1466_gov_";
+        crate::orchestrator::ensure_defaults().expect("隔離先の初期化");
+        let path = crate::orchestrator::ProfileKind::Master
+            .path(project)
+            .expect("パス");
+        let _ = std::fs::remove_file(&path);
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(path);
+        crate::orchestrator::mutate_profile_of(
+            crate::orchestrator::ProfileKind::Master,
+            project,
+            |p| p.projects = Some(vec![project.to_string()]),
+        )
+        .expect("管轄プロファイルの準備");
+
+        // spawned_by の枝が無い（= GUI 再起動で失われた）worker ペイン
+        let mut host = MockHost::new();
+        let pane = PaneId::from_raw(host.root_pane());
+        let tab = host.ws.active_tab_id();
+        host.ws
+            .get_tab_mut(tab)
+            .unwrap()
+            .tree_mut()
+            .get_mut(pane)
+            .unwrap()
+            .set_role(Some(format!("orchestrator-worker:{project}:1466")));
+        let params = t1466_params(Some(&format!("worker:{project}:1466")), pane);
+        let (origin, source) = user_task_origin(&host, &params, Some(pane));
+        assert_eq!(
+            origin.profile.as_deref(),
+            Some(project),
+            "一意な管轄から戻り先が解けない（#1466）"
+        );
+        assert_eq!(source, Some(crate::user_tasks::OriginSource::Jurisdiction));
     }
 
     #[test]

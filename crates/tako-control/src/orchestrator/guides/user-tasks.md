@@ -33,6 +33,14 @@ Pick `kind` by what you are asking for:
 
 The origin is filled in for you — the profile, the conversation and the pane are
 recorded from the call. You never have to say "reply to me": the reply finds you.
+A worker's task comes back to **the master that spawned it**, not to whichever master
+happens to be running, so workers can file freely.
+
+The one case that has no answer is a caller tako cannot place: no orchestrator role, no
+spawning master left. Those tasks are still filed, but the reply has nowhere to go and
+the delivery is recorded as `failed` with a "宛先不明" reason instead of being handed to
+an unrelated master. If you need to file from such a place — a bare shell, a script —
+call it with `TAKO_ORCHESTRATOR_ROLE=master:<profile>` so the reply has an address.
 
 ### 2. Write the body so it can be answered without you
 
