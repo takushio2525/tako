@@ -1730,6 +1730,17 @@ enum OrchestratorCommand {
     /// プロジェクト管理（一覧 / 追加 / 削除）
     #[command(subcommand)]
     Projects(ProjectsCommand),
+    /// 走っている master を専用プロファイルへその場で寄せる（#1453。立て直さない）。
+    /// 名前はプロファイル名、またはまだプロファイルの無い projects.yaml のキー
+    /// （後者はその場で default から継承して作る）。default を渡すと汎用へ戻る
+    Adopt {
+        /// 採用するプロファイル名 / プロジェクトキー
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// 対象の master ペイン ID（省略時は呼び出し元）
+        #[arg(long)]
+        pane: Option<u64>,
+    },
     /// プロファイル管理（一覧 / 表示 / 設定）
     #[command(subcommand)]
     Profiles(ProfilesCommand),
@@ -3297,6 +3308,18 @@ fn cli_main() -> ExitCode {
         Command::Orchestrator(OrchestratorCommand::Projects(ref sub)) => {
             orchestrator_projects_cli(sub)
         }
+        Command::Orchestrator(OrchestratorCommand::Adopt { ref name, pane }) => {
+            // ペインの role ラベルを書き換える = GUI の状態を触るので IPC 経由
+            let pane = pane.or_else(caller_pane);
+            let caller_role = std::env::var("TAKO_ORCHESTRATOR_ROLE").ok();
+            send_request(Request::OrchestratorAdopt {
+                name: name.clone(),
+                pane,
+                caller_role,
+                caller_pid: Some(std::process::id()),
+            })
+            .map(|result| println!("{}", pretty_json(&result)))
+        }
         Command::Orchestrator(OrchestratorCommand::Profiles(ref sub)) => {
             // #1068: 応答に理由文（`Note`）が載るのでここで表示言語を決める。
             // profiles はローカル処理（dispatch を直呼び）なので、GUI 側の初期化に
@@ -4486,24 +4509,44 @@ fn orchestrator_projects_cli(sub: &ProjectsCommand) -> Result<(), String> {
             }
             Ok(())
         }
+        // add / remove は**書き込み**なので MCP と同じ 1 本（`dispatch_orchestrator_projects`）
+        // を通す。#1453 まで CLI 側に写しがあり、専用プロファイルの自動生成が
+        // MCP からだけ効いて CLI からは効かなかった（実測で踏んだ）
         ProjectsCommand::Add {
             key,
             cwd,
             description,
         } => {
-            orchestrator::ensure_defaults()?;
-            // ロック付き read-modify-write（#169: 並行 add で他エントリを消さない）
-            orchestrator::ProjectsConfig::mutate(|config| {
-                config.add(key.clone(), cwd.clone(), description.clone());
-            })?;
+            let res = tako_control::dispatch::dispatch_orchestrator_projects(
+                "add",
+                Some(key.clone()),
+                Some(cwd.clone()),
+                description.clone(),
+            )
+            .map_err(|e| e.to_string())?;
             eprintln!("追加しました: {key} → {cwd}");
+            // 専用プロファイルの生成結果も見せる（黙って作らない / 黙って作らないでもない）
+            match res["profile_generation"].as_str() {
+                Some("created") => eprintln!(
+                    "専用プロファイルを作りました: {}（default から継承）",
+                    res["profile_path"].as_str().unwrap_or("")
+                ),
+                Some("skipped") => eprintln!(
+                    "専用プロファイルは作りませんでした: {}",
+                    res["profile_note"].as_str().unwrap_or("理由不明")
+                ),
+                _ => {}
+            }
             Ok(())
         }
         ProjectsCommand::Remove { key } => {
-            let removed = orchestrator::ProjectsConfig::mutate(|config| config.remove(key))?;
-            if !removed {
-                return Err(format!("プロジェクト '{key}' が見つかりません"));
-            }
+            tako_control::dispatch::dispatch_orchestrator_projects(
+                "remove",
+                Some(key.clone()),
+                None,
+                None,
+            )
+            .map_err(|e| e.to_string())?;
             eprintln!("削除しました: {key}");
             Ok(())
         }
@@ -6214,11 +6257,8 @@ fn solo_cmd_hint(profile_name: &str) -> String {
 }
 
 fn profile_cmd_hint(base: &str, profile_name: &str) -> String {
-    if profile_name == "default" {
-        base.to_string()
-    } else {
-        format!("{base} -{profile_name}")
-    }
+    // 組み立ては tako-core の 1 実装（#1453 で `adopt` の応答も同じ文字列を返す）
+    tako_core::handoff::profile_launch_command(base, profile_name)
 }
 
 /// master / solo の起動先ペインを決める（Issue #567）。
@@ -7495,6 +7535,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         }
         Command::Orchestrator(OrchestratorCommand::Projects(_)) => {
             unreachable!("orchestrator projects は run() を通らない")
+        }
+        Command::Orchestrator(OrchestratorCommand::Adopt { .. }) => {
+            unreachable!("orchestrator adopt は run() を通らない（run() で send_request 済み）")
         }
         Command::Orchestrator(OrchestratorCommand::Profiles(_)) => {
             unreachable!("orchestrator profiles は run() を通らない")

@@ -845,6 +845,25 @@ pub enum Request {
         cwd: Option<String>,
         description: Option<String>,
     },
+    /// オーケストレーター: 走っている master を専用プロファイルへ**その場で**寄せる（Issue #1453）。
+    ///
+    /// セッションは立て直さない（pid・会話はそのまま）。書き換えるのは**ペインの role
+    /// ラベル 1 つ**で、`self` / `handoff` / spawn 既定 / 自動ハンドオフはそこから追従する。
+    /// `name` は master プロファイル名、またはまだプロファイルの無い
+    /// projects.yaml のキー（その場で `profiles/<key>.yaml` を自動生成して採用する）
+    OrchestratorAdopt {
+        /// 採用するプロファイル名 / プロジェクトキー
+        name: String,
+        /// 対象ペイン ID（省略時は呼び出し元）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        /// 呼び出し元の `TAKO_ORCHESTRATOR_ROLE`（現在のプロファイル解決に使う）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_role: Option<String>,
+        /// 呼び出し元 pid（ペイン解決の第 1 手段）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_pid: Option<u32>,
+    },
     /// オーケストレーター: プロファイル管理（list / show / set / create / copy / delete）。
     /// model 未指定のプロファイルは claude CLI の既定モデルで起動する（Issue #27）。
     /// set は model / worker_model / effort / worker_effort の更新と、
@@ -1432,6 +1451,13 @@ pub enum Request {
         /// 呼び出し元の `TAKO_ORCHESTRATOR_ROLE`（プロファイル解決に使う）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller_role: Option<String>,
+        /// 対象ペイン ID（#1453。採用でペインの role ラベルが変わるので、
+        /// env が既定のままでも採用後のプロファイルでプレースホルダを解ける）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        /// 呼び出し元 pid（#1453。ペイン解決の第 1 手段）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_pid: Option<u32>,
     },
     /// テスト・検証プロセスが一時ディレクトリへ残した使い捨て dir の掃除（Issue #1296 / #1312）。
     ///
@@ -2163,6 +2189,7 @@ pub fn changes_layout(request: &Request) -> bool {
         | Request::TmuxResize { .. }
         | Request::TmuxCleanup { .. }
         | Request::OrchestratorProjects { .. }
+        | Request::OrchestratorAdopt { .. }
         | Request::OrchestratorProfiles { .. }
         | Request::OrchestratorAccounts { .. }
         | Request::OrchestratorLayout { .. }

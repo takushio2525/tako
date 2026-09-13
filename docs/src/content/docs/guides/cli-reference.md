@@ -1101,6 +1101,41 @@ tako orchestrator projects add --key webapp --cwd ~/Documents/webapp --descripti
 tako orchestrator projects remove --key webapp
 ```
 
+`add` はそのプロジェクト専用のプロファイル（`profiles/webapp.yaml`）も同時に作ります。中身は
+`default` を引き継ぎ、管轄（`projects`）と起動フォルダ（`cwd`）だけがそのプロジェクトのものに
+なります。既にあるプロファイルには触りません。登録済みのプロジェクトは `tako setup` や次回の
+アプリ起動でまとめて揃います。
+
+### tako orchestrator adopt
+
+**素の `tako master` で始めた会話を、その場でプロジェクト専用 master に切り替えます。**
+セッションは立て直さないので、会話もコンテキストもそのまま残ります（トークンを使い直しません）。
+
+master は対象プロジェクトを見つけた時点でこれを自分で呼ぶので、通常ユーザーが打つことはありません。
+
+```bash
+tako orchestrator adopt webapp        # プロファイル名 / プロジェクトキーのどちらでもよい
+tako orchestrator adopt default       # 汎用（どのプロジェクトにも属さない状態）へ戻す
+```
+
+切り替わるのは tako 側の状態です。
+
+| 切り替わるもの | 中身 |
+|---|---|
+| ペインの役割ラベル | `orchestrator-master:<key>` になり、画面でも見分けがつく |
+| `tako orchestrator self` | `profile` / 引き継ぎファイルの宛先 / 管轄プロジェクトがそのプロファイルの値になる |
+| worker の既定 | 以後 spawn する worker がそのプロファイルのモデル・思考量・エージェントで立つ |
+| 引き継ぎ | `tako orchestrator handoff` と自動ハンドオフが `tako master -<key>` で後任を立てる |
+
+プロファイルがまだ無いプロジェクトキーを渡すと、その場で `default` から引き継いで作ります
+（`tako orchestrator projects add` の時点でも作られます）。
+
+:::caution[呼べない場合]
+専用プロファイル（`tako master -<名前>`）で起動した master と、master のエージェント種別が
+食い違う相手には使えません。会話の途中で system prompt は差し替えられないため、tako 側だけを
+動かすと表示と実態が食い違うからです。その場合は理由と直し方がエラーに出ます。
+:::
+
 ### tako orchestrator profiles
 
 master・worker が使うモデルや思考量（effort）の設定です。

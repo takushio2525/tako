@@ -578,7 +578,8 @@ mod tests {
         // #1296 の tako_test_residue（テスト・検証プロセスの残骸の掃除）を追加して 149
         // #1450 の tako_todo（ユーザー向けタスク）を追加して 150
         // #1451 の tako_remote_shortcuts（リモート閲覧のショートカット）を追加して 151
-        assert_eq!(tools.len(), 151);
+        // #1453 の tako_orchestrator_adopt（master を専用プロファイルへその場で寄せる）を追加して 152
+        assert_eq!(tools.len(), 152);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
@@ -1382,7 +1383,7 @@ mod tests {
         assert!(
             matches!(
                 &seen[0],
-                Request::OrchestratorGuide { topic, profile, caller_role }
+                Request::OrchestratorGuide { topic, profile, caller_role, .. }
                     if topic.as_deref() == Some("monitoring")
                         && profile.is_none()
                         && caller_role.as_deref() == Some("master:takodev")

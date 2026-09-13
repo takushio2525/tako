@@ -537,6 +537,15 @@ pub(super) fn build_request(
             cwd: str_arg(args, "cwd")?,
             description: str_arg(args, "description")?,
         },
+        // #1453: 走っている master を専用プロファイルへその場で寄せる
+        "tako_orchestrator_adopt" => Request::OrchestratorAdopt {
+            name: str_arg(args, "name")?.ok_or_else(|| {
+                "name を指定する（プロファイル名 / プロジェクトキー）".to_string()
+            })?,
+            pane: u64_arg(args, "pane")?.or(caller),
+            caller_role: caller_role.map(str::to_string),
+            caller_pid: None,
+        },
         "tako_orchestrator_profiles" => Request::OrchestratorProfiles {
             action: str_arg(args, "action")?.unwrap_or_else(|| "list".into()),
             name: str_arg(args, "name")?,
@@ -815,6 +824,9 @@ pub(super) fn build_request(
             topic: str_arg(args, "topic")?.map(|s| s.to_string()),
             profile: str_arg(args, "profile")?.map(|s| s.to_string()),
             caller_role: caller_role.map(str::to_string),
+            // #1453: 採用後のプロファイルでプレースホルダを解くためペインを渡す
+            pane: u64_arg(args, "pane")?.or(caller),
+            caller_pid: None,
         },
         "tako_test_residue" => Request::TestResidue {
             apply: bool_arg(args, "apply")?.unwrap_or(false),

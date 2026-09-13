@@ -1,9 +1,9 @@
 ---
 title: MCP ツール一覧
-description: tako が AI エージェントに公開する 151 個の MCP ツールの全リスト
+description: tako が AI エージェントに公開する 152 個の MCP ツールの全リスト
 ---
 
-tako は **151 個の MCP ツール**を AI エージェント（Claude Code / Codex 等）に公開しています。ほぼすべてが `tako` CLI のコマンドと 1:1 で対応しているため、細かい引数や挙動は [CLI リファレンス](/guides/cli-reference/)の対応コマンドも合わせて参照してください。
+tako は **152 個の MCP ツール**を AI エージェント（Claude Code / Codex 等）に公開しています。ほぼすべてが `tako` CLI のコマンドと 1:1 で対応しているため、細かい引数や挙動は [CLI リファレンス](/guides/cli-reference/)の対応コマンドも合わせて参照してください。
 
 :::tip[登録は一度きり]
 MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度行えば、以降はどのプロジェクトでも自動的に使えます。codex を master にする場合は `tako master` の起動時にだけ設定が注入されるため、グローバル設定の変更すら不要です。
@@ -139,7 +139,8 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_orchestrator_self` | master / solo が自分の pane・tab・コンテキスト残量・引き継ぎ閾値を取得する |
 | `tako_orchestrator_handoff` | master の引き継ぎ（新しい master へバトンを渡す。渡るのは担当プロジェクトの引き継ぎだけ。前任のペインは後任が確認後に閉じる） |
 | `tako_orchestrator_handoffs` | 引き継ぎファイルの管理（一覧 / 読み / 書き / 旧形式の自動移行） |
-| `tako_orchestrator_projects` | 管理対象プロジェクトの一覧 / 追加 / 削除 |
+| `tako_orchestrator_projects` | 管理対象プロジェクトの一覧 / 追加 / 削除（追加時に専用プロファイルを自動生成） |
+| `tako_orchestrator_adopt` | 走っている master をそのプロジェクト専用プロファイルへその場で寄せる（立て直さない） |
 | `tako_orchestrator_profiles` | プロファイル（モデル・思考量・エージェント CLI・自動ハンドオフ）の管理 |
 | `tako_orchestrator_accounts` | アカウントレジストリの管理（worker ごとの使い分け） |
 | `tako_orchestrator_layout` | worker spawn 時のレイアウト方針の設定 |

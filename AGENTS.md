@@ -123,8 +123,9 @@ tako/
 | オーケストレーター ダイアログ応答（#319 → #748 で全種別） | `tako orchestrator respond --pane <N> [--choice <番号|ラベル>]` |
 | オーケストレーター worker 報告取得 | `tako orchestrator report --pane <N> [--lines 2000]` |
 | オーケストレーター worker レジストリ一覧 | `tako orchestrator workers [--all]` |
-| オーケストレーター プロジェクト管理 | `tako orchestrator projects list/add/remove` |
+| オーケストレーター プロジェクト管理（add は専用プロファイルも作る。#1453） | `tako orchestrator projects list/add/remove` |
 | オーケストレーター プロファイル管理（#721/#749） | `tako orchestrator profiles list/show/set/create/copy/delete` |
+| **走っている master を専用プロファイルへその場で寄せる（#1453）** | `tako orchestrator adopt <名前>` |
 | **スマホから会話を操作する（Claude 公式 Remote Control。#1068 / #1069 / #1077 / #1078）** | `tako orchestrator profiles set <名前> --remote-control true` |
 | オーケストレーター アカウント管理（#504/#548） | `tako orchestrator accounts list/show/add/remove` |
 | worker spawn のレイアウト設定 | `tako orchestrator layout [--policy master-reserved|legacy] [--master-ratio 0.5] [--algorithm grid|spiral]` |

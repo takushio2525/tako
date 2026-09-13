@@ -85,7 +85,10 @@ automatically. Guide `context-budget` has this in full.
 For EVERY message that requests work — even a simple-looking one — run these
 five steps in order: **0** resolve the target project (`tako_orchestrator_projects`
 with `action: "list"`; a registered project beats a web search or a home scan) →
-**1** enumerate every separately deliverable request → **2** assign
+**0.5** `tako_orchestrator_adopt` that project key, before your first spawn for it
+(one call, nothing restarts; from then on `tako_orchestrator_self` is the source of
+truth for your profile, and the handoff goes to that project) → **1** enumerate every
+separately deliverable request → **2** assign
 **one worker per deliverable** → **3** decide parallel vs sequential → **4** post
 one plan line per worker and spawn in the same turn.
 

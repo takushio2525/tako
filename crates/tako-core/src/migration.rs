@@ -303,6 +303,13 @@ pub enum FileOutcome {
         /// 適用した手順の説明（日英）
         applied: Vec<Note>,
     },
+    /// 揃えるために**新しく作った**（Issue #1453）。
+    ///
+    /// 移行には「中身の形を直す」（[`Migrated`](Self::Migrated)）のほかに
+    /// 「対になるファイルがまだ無いので作る」がある。前者は旧内容を退避するが、
+    /// 後者に**退避元は無い**（作る前は何も無い）ので `Migrated` では表せない。
+    /// `reason` は何をもとに作ったかの説明（日英）
+    Created { reason: Note },
     /// 解釈できない。退避したなら `quarantine` にその場所が入る
     /// （`None` = 退避しない種別 = 秘匿情報つき / 作り直せる短命なファイル）
     Unreadable {
@@ -316,9 +323,11 @@ pub enum FileOutcome {
 }
 
 impl FileOutcome {
-    /// 実際にファイルを書き換えたか（通知を出すかの判断に使う）
+    /// 実際にファイルを書き換えたか（通知を出すかの判断に使う）。
+    /// #1453 の [`Created`](Self::Created) も「起動のたびに黙って増える」を避けるため
+    /// ここに含める（`tako migrate status` の予告と `run` の報告が一致する）
     pub fn changed(&self) -> bool {
-        matches!(self, Self::Migrated { .. })
+        matches!(self, Self::Migrated { .. } | Self::Created { .. })
     }
 
     /// 人が気にするべき状態か（`tako migrate status` の警告行になる）
@@ -335,6 +344,7 @@ impl FileOutcome {
             Self::Absent => "absent",
             Self::UpToDate { .. } => "up_to_date",
             Self::Migrated { .. } => "migrated",
+            Self::Created { .. } => "created",
             Self::Unreadable { .. } => "unreadable",
             Self::Refused { .. } => "refused",
             Self::Failed { .. } => "failed",
@@ -384,9 +394,17 @@ impl MigrationReport {
     /// [`notice`](Self::notice) の一般形。`applied = false`（見るだけ）のときは
     /// 「これから移行する」の言い回しにする（済んだことのように見せない）
     pub fn notice_for(&self, applied: bool) -> Option<String> {
-        let migrated = self.changed_count();
+        // #1453: 「形を直した」と「足りないものを作った」は別の出来事。
+        // 一緒に数えると、新規作成まで「旧内容は .bak へ退避」と名乗ってしまう
+        // （退避元が無いので事実と違う）
+        let created = self
+            .files
+            .iter()
+            .filter(|f| matches!(f.outcome, FileOutcome::Created { .. }))
+            .count();
+        let migrated = self.changed_count() - created;
         let attention = self.attention().count();
-        if migrated == 0 && attention == 0 {
+        if migrated == 0 && created == 0 && attention == 0 {
             return None;
         }
         let mut parts = Vec::new();
@@ -397,6 +415,14 @@ impl MigrationReport {
                 NOTICE_PENDING
             };
             parts.push(note.text().replace("{n}", &migrated.to_string()));
+        }
+        if created > 0 {
+            let note = if applied {
+                NOTICE_CREATED
+            } else {
+                NOTICE_CREATE_PENDING
+            };
+            parts.push(note.text().replace("{n}", &created.to_string()));
         }
         if attention > 0 {
             parts.push(
@@ -416,6 +442,14 @@ const NOTICE_MIGRATED: Note = Note::new(
 const NOTICE_PENDING: Note = Note::new(
     "設定ファイル {n} 件が旧形式です（tako migrate run で移行します）",
     "{n} config file(s) are in an older format (run `tako migrate run` to migrate)",
+);
+const NOTICE_CREATED: Note = Note::new(
+    "足りない設定ファイル {n} 件を作りました",
+    "Created {n} missing config file(s)",
+);
+const NOTICE_CREATE_PENDING: Note = Note::new(
+    "設定ファイル {n} 件が足りません（tako migrate run で作ります）",
+    "{n} config file(s) are missing (run `tako migrate run` to create them)",
 );
 const NOTICE_ATTENTION: Note = Note::new(
     "設定ファイル {n} 件を読めないので既定値で動いています（tako migrate status で確認できます）",

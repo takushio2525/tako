@@ -20,16 +20,6 @@
 
 ---
 
-## 2026-09-13（#812: ペイン枠線をルート側オーバーレイ 1 枚へ集約した）
-- 枠線のインクを `render` の `pane_borders`（`pane_headers` の直後に出すルート側 1 枚）へ集約。本体とヘッダ外枠は枠**幅**と角丸のクリップだけ持ち色を持たない（`Style::is_border_visible()` が false = quad が出ない / 会計は不変）。副作用でヘッダより低いペインの下端枠線が旧は 0 / 576 画素だったのが全部出るようになった（#803 の症状の残り）
-- 実測 A/B（`pane-border` 節・同じ場面のまま腕を倒す）: 1 ペインで丸め角の差 **32 画素**（#803 の報告値と一致）・角の外 0 / 2 分割・ズーム・light は 60 画素・外 0。注入 4 通り（描かない / 丸めを落とす / 色規則を外す / 二重塗りへ戻す）で症状を名指し FAILED
-- 番犬 `issue812_pane_border_watchdog` 5 本（注入 5 通りで file:line 名指し）。workspace 4623 passed 0 failed・check-windows error 0。**罠**: 手元の lint 2 本では `#[cfg(feature = "visual-test")]` の中が一度も lint されず CI だけ赤（`type_complexity`）→ AGENTS.md / commands.md の lint 行へ 3 本目（`-p tako-app --features visual-test`）を足した。**install 要**
-
-## 2026-09-13（#1439: worker を別タブへ逃がさず、同じタブでフォントを縮めて桁数を確保する）
-- 配置を常に `same_tab` へ（#1132 の `new_tab` / `overflow_tab` は対照 `TAKO_1439_LEGACY=1` へ退避）。足りない桁数は worker 領域**まるごと**の自動縮小で確保する 1 実装 `tako_control::worker_font::refit_worker_area`（段の選び方は純関数 `spawn_layout::fit_worker_font`・「その倍率で何桁入るか」だけ GUI の実測。spawn / close / 復元・リサイズが同じ実装を通る）。CLI / MCP は `tako orchestrator layout --auto-shrink-font / --min-worker-font-scale` で 1:1
-- 実測 3 腕（tako-vd 上の隔離 GUI・worker 8 体）: 新 = **タブ 1 枚**・全部 `same_tab`・最狭 28 桁（床 0.6 + `cols_short=true`）/ `TAKO_1439_LEGACY=1` = タブ 8 枚（#1132 再現）/ `TAKO_1132_LEGACY=1` = タブ 1 枚・17 桁（#1132 前 再現）。エッジ 3 件（close で 42 → 58 桁へ復帰・`min_worker_cols=0`・`auto_shrink_font=false`）も実測
-- 番犬 3 本（注入 8 通りで file:line 名指し）+ 単体 11 本・workspace 4629 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。検証の器から AX の窓移動を外した（#1442）。**install 要**
-
 ## 2026-09-13（#1441: 深い data dir でも IPC が立つようにし、立たないときは黙らせない）
 - ソケットの実体を data dir 直下から外し、`tako_core::ipc_socket` の 1 実装（`<data_dir>/tako.sock` が `sun_path` に収まればそのまま / 収まらなければ `$TMPDIR/tako-<data dir の 16 桁 FNV-1a>.sock` → `/tmp`）へ寄せた。data dir 側には参照 `tako.sock.path` だけ。**symlink では解決しない**（上限は繋ぐ側の `connect()` に掛かる）
 - 実測 A/B（tako-vd 上の隔離 GUI・data dir 150 バイト）: 新 = 受け口 75 バイト・`tako list` exit 0 / `TAKO_1441_LEGACY=1` = `path must be shorter than SUN_LEN` の 1 行のみ・discovery 空・`tako list` exit 1（#782 の症状の再現）。浅い data dir は固定パスのまま不変。深い `$TMPDIR`（110 バイト）は `/tmp/tako-<hash>.sock`（31 バイト）へ
@@ -59,3 +49,8 @@
 - 認可は**案 (a)**（全体閲覧とショートカットは manage 以上・interact 以下は #1079 のまま）。**経路は 1 本も新設せず**、疑似ルート `fs` を一覧へ 1 件足すだけにしたので、プレビュー / 編集 / DL は `resolve_in_root` の 1 実装をそのまま通る。門は `local_roots_for` の 1 か所で、載らなければ `unknown_root` の 403。role は `FILE_ROUTES`（#1449 の作法）が正で、**表に無い `/api/files…` は安全側の Manage** へ落ちる
 - ショートカットの正本は `tako_core::remote_shortcuts`（PWA / `tako remote shortcuts` / MCP の 3 口が同じ実装）。永続は `<data_dir>/remote/shortcuts.json`（番地 `SchemaId::RemoteShortcuts`・**新規なので移行 Step 無し = 指紋の追加のみ**）。既定はファイルに書かず毎回計算する
 - 実測: 実経路 `scripts/test-remote-fs-1451.sh` **73 PASS 0 FAIL**（HOME ごと隔離した偽の木・実 `/` を一覧しない = #927）/ e2e 11 本（全 72 passed）/ 番犬 10 本・**注入 12 通りすべて file:line 名指しで FAILED**。**実バグ 2 件を実測で発見して直した**: ①既定と登録分で正規化基準が違い同じフォルダが 2 行に出る ②飛び先にツリーのルートを選ぶとフォルダを閉じた瞬間 403。一覧は「切ってから metadata」へ（旧は全件 x3 syscall）。**install 要 / 本番 daemon 再起動要**
+
+## 2026-09-14（#1453: 素の master をその場で専用プロファイルへ寄せられるようにした）
+- 新しい永続状態を 1 つも足さず、**ペインの role ラベル 1 つ**の書き換えで実現（`resolve_master_profile` が非既定の pane_role を優先する #854 が土台。role は layout.json に載るので GUI 再起動もまたぐ）。`self` / spawn 既定 / `handoff` の後任と宛先 / 自動ハンドオフ #749 は既存の 1 実装のまま追従。`projects add` は `profiles/<key>.yaml` を default から継承して作り（管轄と cwd だけ差し替え・冪等）、既存プロジェクトは migration の登録簿（`FileOutcome::Created` を新設）で揃う
+- 実測（tako-vd 上の隔離 GUI・A〜G）: 生成 → 採用 → spawn 制限 → 引き継ぎまで通し。採用で `pane_id` 不変のまま `profile` が `default` → `<key>`・`successor_command="tako master -<key>"`・管轄外 spawn は `projects 制限` で拒否。`TAKO_1453_LEGACY=1` は生成も採用も起きず修正前を再現。拒否の 2 種（専用起動 master / `master_agent` の食い違い）は直す 1 コマンド付き
+- **罠**: CLI の `projects add` が dispatch の写しを持っていて**MCP からだけ生成が効いていた**（実測で発覚）→ 1 本へ寄せ、番犬で縛った。system prompt は 19,679 → 19,912 B（予算 24,576 B 内）。番犬 4 本（注入 7 通りで file:line 名指し）+ 単体 14 本・セルフテスト項目 149（legacy 腕は 149a で FAILED）。workspace 4695 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。**install 要**
