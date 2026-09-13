@@ -85,14 +85,10 @@ pub fn root_id_of(path: &str) -> String {
 
 /// FNV-1a 64bit。id（`root_id_of`）と検証子（`content_etag`）が同じ 1 実装を通る。
 ///
-/// 暗号学的強度は**どちらの用途でも要らない**（理由はそれぞれの doc に書いた）
+/// 実体は `tako_core::fnv`（#1441 でソケット名も同じ安定ハッシュを使うため寄せた）。
+/// 暗号学的強度は**どの用途でも要らない**（理由はそれぞれの doc に書いた）
 fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        hash ^= u64::from(*b);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
+    tako_core::fnv::fnv1a64(bytes)
 }
 
 /// tako app の `TreeFolder { action: "roots" }` 応答からルート一覧を組む。

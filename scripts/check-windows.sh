@@ -73,5 +73,20 @@ echo
 
 # 注: エラーのみをゲートする。macOS 専用実装に対する dead_code 警告は、
 # 各抽象境界の Windows 実装が入るにつれて自然に消える性質のもの
+#
+# **`--all-targets` を既定にする**（#1441）。既定（lib / bin のみ）だと `tests/` が
+# 検査対象に入らず、統合テストの `std::os::unix` を `cfg(unix)` で囲い忘れても
+# ここは error 0 のまま緑になる。CI の Windows ジョブは
+# 「テストのコンパイル検査（#1264）」= `cargo test --workspace --no-run` を回すので、
+# **手元が緑なのに CI だけ赤**になる（2026-09-13 に PR #1444 で実測: E0433
+# `cannot find unix in os` が 2 件。旧レシピは error 0 を返していた）。
+# 呼び出し側が明示したときは重ねない
+ALL_TARGETS=(--all-targets)
+for arg in "$@"; do
+  if [ "$arg" = "--all-targets" ]; then
+    ALL_TARGETS=()
+    break
+  fi
+done
 PATH="${LLVM_BIN}:$PATH" INCLUDE="$GPUI_DIR" \
-  cargo xwin check --workspace --target "$TARGET" "$@"
+  cargo xwin check --workspace --target "$TARGET" "${ALL_TARGETS[@]}" "$@"

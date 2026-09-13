@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-12（#1422: 右パネルの tmux 復元と UI の eprintln! 5 か所を通知欄 / 診断へ寄せた）
-- #1417 の番犬は窓の中に `Err(` が**在るだけ**で「扱った」と数えるので、`right_panel.rs:2022` は結果を `if opened.is_ok()` でしか見ていないのに**無関係な** `if let Err(e) = attach_pending_sessions(..)` で緑だった（実測で確認）。判定を**結果の束縛名の追跡**へ寄せ、`eprintln!` の検査を `sidebar.rs` 限定から全 UI モジュール（テストモジュールは除外・スコープ外は `KNOWN_EPRINTLN` の件数で段階導入）へ広げた
-- 6 か所を振り分け: ユーザー操作 5 件（tmux 復元 / 復元ペインの PTY 起動 / バックグラウンド復帰 / コードのコピー / Code Runner）は共有の通知欄 + persist.log、背景処理 1 件（PDF 再ラスタライズ）は `log_ui_failure` で診断だけ。A/B の軸を画面（`NoticeArea`）から Issue（`NoticeArm`）へ分離（同じ画面に #1417 と #1422 の通知が同居し、画面で env を選ぶと互いの回帰を隠すため）
-- 隔離 GUI（tako-vd）項目 84d の A/B: 新 = `restore=Some("セッションの復元 に失敗しました…")` / `unshelve=Some(…)` / `copy=Some(…)` / `bg_silent=true bg_lines=3` / `ok_silent=true` で完走（FAILED 0）、legacy（`TAKO_1422_LEGACY=1`）は全部 `None` で FAILED かつ #1417 の診断行は `legacy=false` のまま（A/B が互いを隠さない）。注入 10 通りが file:line 名指し FAILED・workspace 4538 passed 0 failed
-
 ## 2026-09-12（#1430: merge-pr.sh の終了コードを実測で言い切り、ローカル head も自分で消した）
 - 実測で Issue の推測を否定: 現行スクリプトは worktree 事故でも**既に exit 0**（#1347 で解消済み）。実在した誤読の元は「`failed to run git: fatal:` + `警告: merge は済んだが gh が 1 で終わった`」の 2 行と、**すでに MERGED の PR への再実行が 1** を返すこと（使い捨て private リポ + 実 gh 2.88.1 で PR 7 本を実 merge して確定）
 - gh の非ゼロを「merge の失敗ではない」注記へ、最終行を `merge 成立: PR #N は MERGED（url）/ 終了コード 0` へ、MERGED の再実行を冪等 0 へ（CLOSED は 1）。ローカル head は `git branch -D`、作業ツリーが握るときだけ外し方を名指しして残す（`worktree_holding_branch` / `delete_local_head_branch` の 1 実装）
@@ -59,3 +54,8 @@
 - 配置を常に `same_tab` へ（#1132 の `new_tab` / `overflow_tab` は対照 `TAKO_1439_LEGACY=1` へ退避）。足りない桁数は worker 領域**まるごと**の自動縮小で確保する 1 実装 `tako_control::worker_font::refit_worker_area`（段の選び方は純関数 `spawn_layout::fit_worker_font`・「その倍率で何桁入るか」だけ GUI の実測。spawn / close / 復元・リサイズが同じ実装を通る）。CLI / MCP は `tako orchestrator layout --auto-shrink-font / --min-worker-font-scale` で 1:1
 - 実測 3 腕（tako-vd 上の隔離 GUI・worker 8 体）: 新 = **タブ 1 枚**・全部 `same_tab`・最狭 28 桁（床 0.6 + `cols_short=true`）/ `TAKO_1439_LEGACY=1` = タブ 8 枚（#1132 再現）/ `TAKO_1132_LEGACY=1` = タブ 1 枚・17 桁（#1132 前 再現）。エッジ 3 件（close で 42 → 58 桁へ復帰・`min_worker_cols=0`・`auto_shrink_font=false`）も実測
 - 番犬 3 本（注入 8 通りで file:line 名指し）+ 単体 11 本・workspace 4629 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。検証の器から AX の窓移動を外した（#1442）。**install 要**
+
+## 2026-09-13（#1441: 深い data dir でも IPC が立つようにし、立たないときは黙らせない）
+- ソケットの実体を data dir 直下から外し、`tako_core::ipc_socket` の 1 実装（`<data_dir>/tako.sock` が `sun_path` に収まればそのまま / 収まらなければ `$TMPDIR/tako-<data dir の 16 桁 FNV-1a>.sock` → `/tmp`）へ寄せた。data dir 側には参照 `tako.sock.path` だけ。**symlink では解決しない**（上限は繋ぐ側の `connect()` に掛かる）
+- 実測 A/B（tako-vd 上の隔離 GUI・data dir 150 バイト）: 新 = 受け口 75 バイト・`tako list` exit 0 / `TAKO_1441_LEGACY=1` = `path must be shorter than SUN_LEN` の 1 行のみ・discovery 空・`tako list` exit 1（#782 の症状の再現）。浅い data dir は固定パスのまま不変。深い `$TMPDIR`（110 バイト）は `/tmp/tako-<hash>.sock`（31 バイト）へ
+- bind の成否を記録して `check_health` の `ipc` 節 + 通知欄（`notify_ui_failure` の 1 実装）へ。CLI は `tako check-health`（新設・MCP と 1:1）で、**届かないときはローカルの受け口診断**を返す。番犬 8 本 + 統合 1 本・注入 8 通りで file:line 名指し FAILED。**install 要**。**罠**: `scripts/check-windows.sh` は `tests/` を見ていなかったので統合テストの `cfg(unix)` 漏れを**手元 error 0・CI の Windows だけ赤**で通していた（#1264 の `--no-run` が E0433 を 2 件）→ `--all-targets` を既定にし、同じ注入で旧 = 0 件 / 新 = 名指し検出を実測

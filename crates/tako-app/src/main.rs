@@ -3565,6 +3565,9 @@ impl TakoApp {
             match IpcServer::start_with(control_tx.clone(), token.clone(), secondary) {
                 Ok(server) => Some(server),
                 Err(e) => {
+                    // #1441: `eprintln!` は GUI では誰も読めないので**黙って縮退させない**。
+                    // 通知欄と persist.log へは構築後の `notify_ipc_unavailable` が
+                    // 1 実装（`notify_ui_failure`）を通して出す（A/B もそこが持つ）
                     eprintln!("warning: IPC サーバーを起動できない（tako CLI は使えない）: {e}");
                     None
                 }
@@ -4069,6 +4072,12 @@ impl TakoApp {
             card_bands: HashMap::new(),
             card_band_probes: HashMap::new(),
         };
+        // #1441: 受け口が立たなかったら画面へ出す（見た目は正常なのに CLI / MCP から
+        // 一切操作できない状態を無言で始めない）。立っているときは何も出さない
+        if let Some(status) = tako_core::ipc_socket::status() {
+            app.notify_ipc_unavailable(&status);
+        }
+
         // 複数ウィンドウの復元（Issue #339）: アクティブ以外の論理ウィンドウは
         // 初回 render / dispatch の sync_viewports が保存フレームで開き直す
         // （アクティブウィンドウは open_primary_window が担う）
@@ -50916,6 +50925,96 @@ mod self_test {
                 check(
                     after_dismiss.is_some() && ok_silent,
                     "閉じた直後も出る・成功時は無言（#1432）",
+                );
+            }
+
+            // 84f. #1441: `tako` CLI / MCP の受け口（IPC サーバー）が立たなかったら、
+            // 共有の通知欄 + persist.log へ**理由（バイト長と上限）**が出る。旧実装は
+            // `eprintln!` 1 行だけで GUI を普通に立てていたので、見た目は正常なのに
+            // CLI / MCP から一切操作できない状態が無言で始まっていた。
+            // **A/B は `TAKO_1441_LEGACY=1`**（#1399 / #1417 / #1422 / #1432 と env を
+            // 分けてあるので、片方のアームがもう片方の回帰を隠さない）。
+            //
+            // 記録（`ipc_socket::IpcStatus`）から通知を組み立てる 1 実装を叩く。
+            // **実際に深い data dir で起動し直す必要が無い**形にしてあるのが要点で、
+            // 起動経路そのものの実測は `plan_with` の単体テストと隔離起動が持つ
+            {
+                use tako_core::ipc_socket::{IpcStatus, SocketPathKind};
+                let log_before = tako_control::diag::persist_log_path()
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .map(|s| s.lines().count())
+                    .unwrap_or(0);
+                let notice_of = |app: &TakoApp| {
+                    app.remote_notice
+                        .as_ref()
+                        .filter(|n| n.is_error)
+                        .map(|n| n.text.clone())
+                };
+                let status = |bound: bool, path_bytes: usize, error: Option<&str>| IpcStatus {
+                    endpoint: bound.then(|| "<socket>".to_string()),
+                    kind: if bound {
+                        SocketPathKind::Shortened
+                    } else {
+                        SocketPathKind::WellKnown
+                    },
+                    bound,
+                    path_bytes,
+                    limit: tako_core::ipc_socket::max_path_bytes(),
+                    well_known_bytes: path_bytes,
+                    error: error.map(str::to_string),
+                };
+                let (too_long, other, ok_silent) = window
+                    .update(cx, |app, _, cx| {
+                        // ① 上限超過（#1441 の症状そのもの）
+                        app.remote_notice = None;
+                        app.notify_ipc_unavailable(&status(
+                            false,
+                            160,
+                            Some("path must be shorter than SUN_LEN"),
+                        ));
+                        let too_long = notice_of(app);
+                        // ② 上限以外の理由（権限など）は生の理由をそのまま出す
+                        app.remote_notice = None;
+                        app.notify_ipc_unavailable(&status(
+                            false,
+                            40,
+                            Some("Permission denied (os error 13)"),
+                        ));
+                        let other = notice_of(app);
+                        // ③ 裏取り: 立っているときは何も出さない（誤検知していない）
+                        app.remote_notice = None;
+                        app.notify_ipc_unavailable(&status(true, 75, None));
+                        let ok_silent = app.remote_notice.is_none();
+                        app.remote_notice = None;
+                        cx.notify();
+                        (too_long, other, ok_silent)
+                    })
+                    .unwrap_or((None, None, false));
+                let log_lines = tako_control::diag::persist_log_path()
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .map(|s| {
+                        s.lines()
+                            .skip(log_before)
+                            .filter(|l| l.contains("area=ipc"))
+                            .count()
+                    })
+                    .unwrap_or(0);
+                println!(
+                    "TAKO_SELF_TEST_1441: legacy={} too_long={too_long:?} other={other:?} \
+                     ok_silent={ok_silent} log_lines={log_lines}",
+                    TakoApp::legacy_1441(),
+                );
+                let too_long_ok = too_long
+                    .as_deref()
+                    .is_some_and(|t| t.contains("160") && t.contains("103"));
+                let other_ok = other
+                    .as_deref()
+                    .is_some_and(|t| t.contains("Permission denied (os error 13)"));
+                check(too_long_ok, "IPC: 上限超過の理由が通知欄へ出る（#1441）");
+                check(other_ok, "IPC: 上限以外の理由も通知欄へ出る（#1441）");
+                check(
+                    ok_silent && log_lines == 2,
+                    "IPC: 立っていれば無言・失敗 2 件は診断へ 2 行（#1441）",
                 );
             }
 

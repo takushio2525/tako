@@ -204,6 +204,10 @@ pub(crate) enum NoticeArea {
     /// アップデート専用ウィンドウのリリースノート（#1432）。
     /// この窓は自前の通知欄を持たないので、出し先はメインウィンドウの共有通知欄
     UpdateWindow,
+    /// `tako` CLI / MCP の受け口（IPC サーバー）の起動（#1441）。
+    /// 画面ではなく**起動時の一段**だが、失敗すると「見た目は正常なのに
+    /// AI からは何も操作できない」ので同じ共有の通知欄へ出す
+    Ipc,
 }
 
 impl NoticeArea {
@@ -218,6 +222,7 @@ impl NoticeArea {
             NoticeArea::Chat => "chat",
             NoticeArea::OpenFile => "open_file",
             NoticeArea::UpdateWindow => "update_window",
+            NoticeArea::Ipc => "ipc",
         }
     }
 }
@@ -241,6 +246,8 @@ pub(crate) enum NoticeArm {
     /// ドロワーの復帰・コマンドカード・チャットのコピー・Finder から開く・
     /// リリースノートのリンク（`TAKO_1432_LEGACY`）
     Issue1432,
+    /// IPC の受け口が立たなかったときの申告（`TAKO_1441_LEGACY`）
+    Issue1441,
 }
 
 impl NoticeArm {
@@ -251,6 +258,7 @@ impl NoticeArm {
             NoticeArm::Issue1417 => TakoApp::legacy_1417(),
             NoticeArm::Issue1422 => TakoApp::legacy_1422(),
             NoticeArm::Issue1432 => TakoApp::legacy_1432(),
+            NoticeArm::Issue1441 => TakoApp::legacy_1441(),
         }
     }
 }
@@ -2259,6 +2267,44 @@ impl TakoApp {
     pub(crate) fn legacy_1432() -> bool {
         static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *LEGACY.get_or_init(|| std::env::var("TAKO_1432_LEGACY").map(|v| v == "1") == Ok(true))
+    }
+
+    /// #1441 の A/B。`TAKO_1441_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
+    /// （ソケットの置き場を `<data_dir>/tako.sock` 直置きへ固定し、深い data dir では
+    /// bind が `sun_path` で落ちる。失敗を通知欄にも persist.log にも出さない =
+    /// 「警告 1 行で黙って縮退する」の再現）。#1399 / #1417 / #1422 / #1432 と env を
+    /// 分けてあるので、片方のアームがもう片方の回帰を隠さない。
+    ///
+    /// **置き場を決める側（`tako_core::ipc_socket::legacy_1441`）と同じ env を読む**。
+    /// 宣言がここにも要るのは、番犬（#1422 の `abの逃げ道はissueごとに別のenvを読む`）が
+    /// アームごとの宣言を `sidebar.rs` に求めるため。2 つが同じ env を読んでいることは
+    /// #1441 の番犬が機械で照合する
+    pub(crate) fn legacy_1441() -> bool {
+        static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *LEGACY.get_or_init(|| std::env::var("TAKO_1441_LEGACY").map(|v| v == "1") == Ok(true))
+    }
+
+    /// IPC の受け口が立たなかったことを画面へ出す（#1441）。
+    /// 理由（バイト長と上限）は `tako_core::ipc_socket` の記録から組み立てる
+    pub(crate) fn notify_ipc_unavailable(&mut self, status: &tako_core::ipc_socket::IpcStatus) {
+        if status.bound {
+            return;
+        }
+        let text = if status.too_long() {
+            crate::ui_text::sidebar::notice_ipc_too_long(status.path_bytes, status.limit)
+        } else {
+            crate::ui_text::sidebar::notice_ipc_unavailable(
+                status.error.as_deref().unwrap_or("理由不明"),
+            )
+        };
+        self.notify_ui_failure(
+            NoticeArea::Ipc,
+            NoticeArm::Issue1441,
+            "IPC サーバーの起動",
+            // 診断へ載せるのは分類と長さだけ（パスは載せない）
+            &status.length_note(),
+            text,
+        );
     }
 
     /// リモート行の右クリックメニューの実行（#919）

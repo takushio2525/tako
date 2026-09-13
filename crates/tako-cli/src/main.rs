@@ -55,6 +55,10 @@ enum Command {
     Focus(FocusArgs),
     /// タブ / ペインのツリー構造・ジオメトリ・状態を JSON で出力する
     List,
+    /// 環境の健全性を診断する（MCP `tako_check_health` と 1:1）。
+    /// アプリへ届かないときは IPC の受け口だけをローカルで診断する（Issue #1441）
+    #[command(name = "check-health")]
+    CheckHealth(CheckHealthArgs),
     /// ペインの画面内容をテキストで出力する
     Read(ReadArgs),
     /// ターミナル画面のリンク（cmd+クリックで開けるもの）を列挙する（Issue #1283）
@@ -2616,6 +2620,14 @@ struct AgentSupportArgs {
     json: bool,
 }
 
+/// 環境診断の引数（Issue #1441）
+#[derive(Args)]
+struct CheckHealthArgs {
+    /// 生の JSON で出力する（既定は人が読む要約）
+    #[arg(long)]
+    json: bool,
+}
+
 /// プラットフォーム対応マトリクスの参照引数（Issue #515）
 #[derive(Args)]
 struct PlatformArgs {
@@ -3367,6 +3379,9 @@ fn cli_main() -> ExitCode {
         // GUI が動いていない環境（移植作業中の Windows がまさにそれ）でも引けることが本質
         Command::Platform(ref args) => platform_local(args),
         Command::ContextBudget(ref args) => context_budget_local(args),
+        // #1441: **IPC が立っていないときこそ答えが要る**診断なので、届かなければ
+        // ローカルの受け口診断へ落ちる（run() を通すと「接続情報が無い」で終わる）
+        Command::CheckHealth(ref args) => check_health_cli(args.json),
         // 残骸の掃除もローカル処理（IPC 不要）。**GUI が動いていなくても掃ける**ことが
         // 本質（掃除の対象は一時ディレクトリで、GUI の状態とは無関係）
         Command::TestResidue(ref args) => test_residue_local(args),
@@ -5370,6 +5385,117 @@ fn print_context_budget_fix(out: &serde_json::Value, dry_run: bool) {
     }
     println!("変更したファイル: {}", out["changed"].as_u64().unwrap_or(0));
     print_context_budget_proposals(out);
+}
+
+/// `tako check-health`（MCP `tako_check_health` と 1:1。#1441）。
+///
+/// アプリへ届けば dispatch の結果をそのまま出す（`ipc` 節つき）。**届かないときこそ
+/// 答えが要る**ので、IPC の受け口だけをローカルで診断して出す。#1441 の症状
+/// （深い `TAKO_DATA_DIR` でソケットが `sun_path` の上限を超え、警告 1 行で縮退する）は
+/// アプリ側の記録も discovery も残らないので、ここが唯一の機械的な手がかりになる
+fn check_health_cli(json: bool) -> Result<(), String> {
+    match send_request(Request::CheckHealth) {
+        Ok(result) => {
+            if json {
+                println!("{}", pretty_json(&result));
+            } else {
+                print_check_health(&result);
+            }
+            Ok(())
+        }
+        Err(reason) => {
+            let local = local_ipc_report();
+            if json {
+                println!(
+                    "{}",
+                    pretty_json(&serde_json::json!({
+                        "connected": false,
+                        "reason": reason,
+                        "ipc": local,
+                    }))
+                );
+            } else {
+                println!("接続: 届かない（{reason}）");
+                print_ipc_section(&local);
+            }
+            Err("tako アプリへ届かない（上の ipc 節が受け口の実測）".into())
+        }
+    }
+}
+
+/// 繋ぐ側からの受け口の診断（#1441）。置き場の決め方は
+/// `tako_core::ipc_socket` の 1 実装を通す（bind 側と同じ規則で引く）
+fn local_ipc_report() -> Value {
+    let Some(data_dir) = tako_core::paths::data_dir() else {
+        return serde_json::json!({ "resolved": false });
+    };
+    let temp_dir = std::env::temp_dir();
+    let limit = tako_core::ipc_socket::max_path_bytes();
+    // `kind` は**決め方**（この data dir ならどこへ置くはずか）、`socket` は
+    // **繋ぎ先**（参照ファイルがあればそちらが正）。両者がズレていたら
+    // 「前の世代が別の場所へ置いた」ことが読める
+    let plan = tako_core::ipc_socket::plan_with(&data_dir, &temp_dir, limit);
+    let socket = tako_core::ipc_socket::resolve_with(&data_dir, &temp_dir, limit);
+    let exists = socket.exists();
+    serde_json::json!({
+        "resolved": true,
+        "data_dir": data_dir.display().to_string(),
+        "socket": socket.display().to_string(),
+        "kind": plan.kind.as_str(),
+        "path_bytes": tako_core::ipc_socket::path_bytes(&socket),
+        "limit": limit,
+        "well_known_bytes": plan.well_known_bytes,
+        "socket_exists": exists,
+        "connect_ok": exists && tako_control::discovery::socket_alive(&socket.to_string_lossy()),
+        "pointer": tako_core::ipc_socket::read_pointer(&data_dir)
+            .map(|p| p.display().to_string()),
+    })
+}
+
+/// 人が読む要約（`--json` 無しのとき）
+fn print_check_health(result: &Value) {
+    println!(
+        "健全性: {}",
+        if result["healthy"].as_bool() == Some(true) {
+            "問題なし"
+        } else {
+            "指摘あり"
+        }
+    );
+    println!(
+        "バージョン: app={} cli={}",
+        result["app_version"].as_str().unwrap_or("?"),
+        result["cli_version"].as_str().unwrap_or("不明"),
+    );
+    if let Some(ipc) = result.get("ipc").filter(|v| !v.is_null()) {
+        print_ipc_section(ipc);
+    }
+    for issue in result["issues"].as_array().into_iter().flatten() {
+        println!(
+            "[{}] {}: {}",
+            issue["level"].as_str().unwrap_or("?"),
+            issue["check"].as_str().unwrap_or("?"),
+            issue["message"].as_str().unwrap_or(""),
+        );
+    }
+}
+
+/// IPC の受け口 1 行（アプリ経由・ローカル診断のどちらも同じ形で出す）
+fn print_ipc_section(ipc: &Value) {
+    println!(
+        "IPC: bound={} kind={} path_bytes={} limit={} well_known_bytes={}",
+        ipc["bound"].as_bool().unwrap_or(false) || ipc["connect_ok"].as_bool().unwrap_or(false),
+        ipc["kind"].as_str().unwrap_or("?"),
+        ipc["path_bytes"].as_u64().unwrap_or(0),
+        ipc["limit"].as_u64().unwrap_or(0),
+        ipc["well_known_bytes"].as_u64().unwrap_or(0),
+    );
+    if let Some(endpoint) = ipc["endpoint"].as_str().or(ipc["socket"].as_str()) {
+        println!("  受け口: {endpoint}");
+    }
+    if let Some(error) = ipc["error"].as_str() {
+        println!("  理由: {error}");
+    }
 }
 
 fn platform_local(args: &PlatformArgs) -> Result<(), String> {
@@ -7388,6 +7514,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Agents(_) => unreachable!("agents は run() を通らない"),
         Command::Recover(_) => unreachable!("recover は run() を通らない（ローカル処理）"),
         Command::Platform(_) => unreachable!("platform は run() を通らない（ローカル処理）"),
+        Command::CheckHealth(_) => {
+            unreachable!("check-health は run() を通らない（ローカル処理）")
+        }
         Command::ContextBudget(_) => {
             unreachable!("context-budget は run() を通らない（ローカル処理）")
         }

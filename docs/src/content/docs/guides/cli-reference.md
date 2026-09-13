@@ -1,11 +1,11 @@
 ---
 title: CLI リファレンス
-description: tako コマンド全 84 種の逆引き一覧 — 目的・使い方・実行例・よく使うオプション
+description: tako コマンド全 85 種の逆引き一覧 — 目的・使い方・実行例・よく使うオプション
 ---
 
 `tako` CLI は、ターミナルの画面操作（ペイン分割・テキスト送信・レイアウト変更など）をコマンドとして実行するためのツールです。シェルスクリプトからの自動化にも、AI エージェントからの操作にも使われます。
 
-トップレベルのコマンドは **84 種**で、その多くがさらにサブコマンドを持ちます。ほぼすべてが同名の MCP ツールと 1:1 で対応しており（[MCP ツール一覧](/guides/mcp-tools/)）、人ができる操作は AI も同じ経路で実行できます。
+トップレベルのコマンドは **85 種**で、その多くがさらにサブコマンドを持ちます。ほぼすべてが同名の MCP ツールと 1:1 で対応しており（[MCP ツール一覧](/guides/mcp-tools/)）、人ができる操作は AI も同じ経路で実行できます。
 
 ## 共通の前提
 
@@ -22,7 +22,7 @@ tako orchestrator spawn --help
 
 ## コマンド早見表
 
-やりたいことから引くための全 84 コマンドの一覧です。詳細のあるものはリンクから飛べます。
+やりたいことから引くための全 85 コマンドの一覧です。詳細のあるものはリンクから飛べます。
 
 ### 画面を操作する
 
@@ -143,6 +143,7 @@ tako orchestrator spawn --help
 | [`migrate`](#tako-migrate) | 設定・データファイルの形式確認と自動移行 |
 | [`config`](#tako-config) | AI 系設定のデバイス間共有（git ベース） |
 | [`platform`](#tako-platform) | この環境で使える機能の一覧 |
+| [`check-health`](#その他) | 環境の健全性診断（CLI / MCP の受け口が立っているか） |
 | [`agent-support`](#tako-agent-support) | エージェント系統ごとの能力差 |
 | [`shell-integration`](#その他) | シェル統合（cwd 追従・コマンド状態）の確認・配置 |
 | [`context-budget`](#その他) | 起動時ロードの予算の確認と作業ログの自動移送 |
@@ -1319,6 +1320,9 @@ tako telemetry on
 tako telemetry off
 
 tako stale-binary            # 稼働中セッションの claude バイナリの鮮度確認・張り直し
+
+tako check-health            # 環境の健全性診断（CLI の PATH・tmux・IPC の受け口）
+tako check-health --json     # 生の JSON（アプリへ届かないときは受け口だけをローカル診断）
 
 tako shell-integration           # シェル統合（cwd 追従・コマンド実行状態）が効いているか
 tako shell-integration install   # 配置する（unix は環境変数の注入で完結するので不要）
