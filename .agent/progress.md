@@ -20,16 +20,6 @@
 
 ---
 
-## 2026-09-12（#1402: ツリーが上限超過ぶんを黙って捨てるのを直した）
-- `read_dir_sorted` の戻り値を `DirListing`（entries + 切り詰め + 読み取り失敗）へ広げ、切り詰めと「読めない」を #1398 の器（`RowNote` / `render_note_row`）の行として出した。判断は CLI の `tree git-status` と同じ 1 実装 `tako_core::sidebar::Truncation`（`total > limit` の手書きを両側から排除）
-- A/B（`TAKO_1402_LEGACY=1`）: legacy = 560 件で **行 501 / note 0**（Issue の実測そのもの）・権限なしが空と同じ → 新 = 行 502 で `Truncated{shown:500,total:560}`・読めないは Error 行。番犬 3 本（注入 6 通りで file:line 名指し）+ 単体 8 本
-- 次: 上限そのもの（500）の見直しは別 Issue（暴走防止として妥当なことは perf 実測済み）
-
-## 2026-09-12（#1425: save_layout の変化検出を JSON 直列化の前へ出した）
-- 判定材料を「組んでから比べる」から「組む前の 128bit キー」へ（`layout::change_key` + 借用版 `PaneMetaRef`）。UI 側の付帯情報は `LayoutExtras` に 1 度だけ組んでキーと穴埋めが同じ値を読む。`collapsed` は HashSet 由来なので昇順に整える。載せ忘れは 3 段で止める（網羅的分解でコンパイル / `CHANGE_KEY_FIELDS` × #916 指紋の番犬 / 連続 30 スキップで必ず突き合わせる保険）
-- 実測 A/B（23 ペイン・同一手順の隔離 GUI）: 70 秒アイドルで新 = 37 呼び出し中 **35 スキップ・capture 2 回**、legacy（`TAKO_1425_LEGACY=1`）= **capture 63 回**。`written` は両腕とも 26 で同一（保存結果は不変）。確保は 22 ペインで **319 回 / 29893 バイト → 0 回 / 0 バイト**（0.349ms → 0.065ms）
-- 番犬 6 本 + 確保計測 1 本（注入 6 通りで file:line 名指し FAILED）。操作 13 種で保存を実測・再起動復元 23 ペイン成功。内訳は `tako persist` の `save_layout` で読める。**install 要**
-
 ## 2026-09-12（docs: activeContext を実態へ同期）
 - 「現在の対象」が 9/8 / main `4d84695` で止まり、close 済みの Issue 12 件（#1167 / #995 / #771 / #1122 / #1114 / #1124 / #1013 / #1015 / #1022 / #1030 / #1033 / #1034 / #1035）を open として案内していたのを、gh の state と git log で全行照合して書き直した
 - 直した主な食い違い: install 世代（9/7 19:52 / v0.8.7 → **9/12 09:59 / `1f4eb3f`**）・「#1167 着手中」（close 済み）・Windows のブロッカー（#1133 → #1073 / #1278）・予算の残超過（4 件 → **3 件・全部リポ外**）。無言の失敗系統（#1399 / #1417 → #1422 / #1432）とファイルツリー系の棚卸しを追加し、直列着地の理由（#1228 / #1352）を明記
@@ -64,3 +54,8 @@
 - XFF を読む口を `remote::forwarded_identity` の 1 実装へ寄せ、読む前に `local_endpoint::verify_peer` を通す。所有者ゲート（ソケットの uid が自分か root）+ 実行ファイル名ゲート（設置場所では判定しない）を両方通ったときだけ信じ、材料が欠けたら 403。分岐はエンドポイントの形（UDS は検証しない）
 - 接続元 pid の解決は `procinfo::loopback_tcp_peer`（macOS = `net.inet.tcp.pcblist_n` の sysctl。**libproc の fd 走査では非 root から root の tailscaled が見えない**ことを実測して方式を変えた / Windows = `GetExtendedTcpTable`）。Windows は所有者を引けないので `owner_check=unavailable` と名乗る（残存リスクは脅威モデルへ）
 - 実測 A/B（隔離 daemon + 別プロセス curl）: 新 = 403 `not_tailscale_daemon` + persist.log + `remote status` の `peer_verification` / `TAKO_841_LEGACY=1` = 検証を通らず whois 層まで到達。番犬 9 本・実ソース注入 5 通りで file:line 名指し FAILED。**install 要 / 本番 daemon 再起動要**
+
+## 2026-09-13（#812: ペイン枠線をルート側オーバーレイ 1 枚へ集約した）
+- 枠線のインクを `render` の `pane_borders`（`pane_headers` の直後に出すルート側 1 枚）へ集約。本体とヘッダ外枠は枠**幅**と角丸のクリップだけ持ち色を持たない（`Style::is_border_visible()` が false = quad が出ない / 会計は不変）。副作用でヘッダより低いペインの下端枠線が旧は 0 / 576 画素だったのが全部出るようになった（#803 の症状の残り）
+- 実測 A/B（`pane-border` 節・同じ場面のまま腕を倒す）: 1 ペインで丸め角の差 **32 画素**（#803 の報告値と一致）・角の外 0 / 2 分割・ズーム・light は 60 画素・外 0。注入 4 通り（描かない / 丸めを落とす / 色規則を外す / 二重塗りへ戻す）で症状を名指し FAILED
+- 番犬 `issue812_pane_border_watchdog` 5 本（注入 5 通りで file:line 名指し）。workspace 4623 passed 0 failed・check-windows error 0。**罠**: 手元の lint 2 本では `#[cfg(feature = "visual-test")]` の中が一度も lint されず CI だけ赤（`type_complexity`）→ AGENTS.md / commands.md の lint 行へ 3 本目（`-p tako-app --features visual-test`）を足した。**install 要**

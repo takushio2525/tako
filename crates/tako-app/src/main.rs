@@ -126,6 +126,34 @@ fn legacy_1425() -> bool {
     *LEGACY.get_or_init(|| std::env::var("TAKO_1425_LEGACY").as_deref() == Ok("1"))
 }
 
+/// #812 の A/B。`TAKO_812_LEGACY=1` で**同一バイナリのまま**旧挙動
+/// （ペイン本体とヘッダ外枠の **2 か所**が同じ枠線を塗る = 丸め角の AA 画素が
+/// 二重に合成されて濃くなる）へ戻す。
+///
+/// 他の逃げ道と違って `OnceLock` ではなく差し替えられる原子で持つ。visual-test が
+/// **同じ場面のまま**新旧を撮り比べる（プロセスを分けると PTY の出力・時計・
+/// レイアウトの揺れが混ざり、「角だけが違う」を言い切れない）ため。
+/// 0 = env 未読 / 1 = 新（ルート側 1 枚）/ 2 = 旧（2 か所塗り）
+static LEGACY_812: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn legacy_812() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match LEGACY_812.load(Relaxed) {
+        0 => {
+            let on = std::env::var("TAKO_812_LEGACY").as_deref() == Ok("1");
+            LEGACY_812.store(u8::from(on) + 1, Relaxed);
+            on
+        }
+        v => v == 2,
+    }
+}
+
+/// #812 の A/B を実行中に倒す（visual-test 専用）。倒した直後のフレームから効く
+#[cfg(feature = "visual-test")]
+fn set_legacy_812(on: bool) {
+    LEGACY_812.store(u8::from(on) + 1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// 直近に保存できたレイアウトの状態（#1425）。
 ///
 /// 変化検出キーと保存済み JSON を**1 つの状態**にまとめてある。別々のフィールドに
@@ -188,8 +216,9 @@ fn inject_flicker() -> bool {
 /// ペイン枠線の太さ（px）
 const PANE_BORDER: f32 = 1.0;
 /// ペイン枠の丸め角（px。カンプ準拠）。
-/// #803: ヘッダをルート側へ持ち上げた外枠も同じ角丸で枠線を描き直すので、
-/// **本体とヘッダの 2 か所で同じ値**を使う（直値を散らすと角がずれる）
+/// #812: 枠線のインクを塗るのはルート側のオーバーレイ 1 枚だけだが、角丸は
+/// **本体（背景とクリップ）・ヘッダ外枠（クリップ）・オーバーレイ（インク）**の
+/// 3 か所が同じ形でなければ合わないので、直値を散らさずここから引く
 const PANE_CORNER_RADIUS: f32 = 9.0;
 /// ペイン内側の余白（px。デザインスペック: 12–14px content padding）
 const PANE_PADDING: f32 = 10.0;
@@ -18916,10 +18945,11 @@ impl TakoApp {
         view
     }
 
-    /// ペイン枠線の色（#803）。
+    /// ペイン枠線の色（#803 / #812）。
     ///
-    /// 本体（`render_pane`）とルート側のヘッダ外枠が**同じ枠線を 2 回**塗るので、
-    /// 規則はここ 1 か所に置く（片方だけ直すと枠の上下で色が食い違う）
+    /// インクを塗るのは `render` のルート側オーバーレイ 1 枚だけ（#812）。旧挙動
+    /// （本体 + ヘッダ外枠の 2 か所塗り）は `TAKO_812_LEGACY=1` でだけ戻るので、
+    /// 色の規則はここ 1 か所に置いたまま両方の腕が同じ値を読む
     fn pane_border_color(&self, pane_id: PaneId) -> gpui::Hsla {
         let is_failed = matches!(
             self.terminals.get(&pane_id).map(|s| s.command_state()),
@@ -19179,9 +19209,15 @@ impl TakoApp {
             .relative()
             .size_full()
             .bg(rgba(theme.background))
+            // #812: 枠**幅**は残す（箱の大きさと内容の inset = `pane_text_areas` の
+            // 会計が枠の有無で変わらない）が、**色は持たない**。GPUI の
+            // `Style::is_border_visible()` は `border_color` が無ければ false なので
+            // 枠線の quad は 1 枚も出ない。インクはルート側のオーバーレイが塗る
             .border(px(PANE_BORDER))
             .rounded(px(PANE_CORNER_RADIUS))
-            .border_color(self.pane_border_color(pane_id))
+            .when(legacy_812(), |d| {
+                d.border_color(self.pane_border_color(pane_id))
+            })
             .when(is_failed, |d| {
                 d.shadow(vec![BoxShadow {
                     color: hsla_alpha(theme.red, 0.12),
@@ -23004,12 +23040,15 @@ impl Render for TakoApp {
         // 手計算しないのが要点（枠の内側の上端という関係をレイアウトエンジンに解かせる
         // = 会計のずれが構造的に起きない）。
         //
-        // **枠線だけはこの div にも描かせる**（`border_color`）。GPUI の `Style::paint` は
-        // 「影 → 背景 → 子 → 枠線」の順なので、持ち上げる前はペイン枠の丸め角が
-        // ヘッダの**上**に来ていた。ヘッダを兄弟にすると本体の枠線より後に塗られ、
-        // 上 2 つの丸め角がヘッダの四角い背景で潰れる（実測: フォーカス枠の accent が
-        // 角で 104px 消えた）。同じ矩形・同じ色の枠線を子（ヘッダ）の後に塗り直すことで、
-        // 持ち上げ前とまったく同じ重なり順に戻す
+        // 枠線の**インクはここでは塗らない**（#812）。#803 の当座の直しはこの div にも
+        // 同じ枠線を描かせて重なり順を戻すものだった（GPUI の `Style::paint` は
+        // 「影 → 背景 → 子 → 枠線」の順なので、ヘッダを兄弟にすると本体の枠線より
+        // 後に塗られ、上 2 つの丸め角がヘッダの四角い背景で潰れる = 実測でフォーカス枠の
+        // accent が角で 104px 消えた）。ただし同じ枠線を本体とここの**2 か所**が塗るので、
+        // 丸め角の AA 画素だけが二重に合成されて濃くなっていた。いまはインクを
+        // `pane_borders`（ヘッダより後に描くルート側のオーバーレイ）へ集約してあり、
+        // ここは**枠幅**（ヘッダ内容を枠の内側へ収める inset）と**角丸のクリップ**だけ持つ。
+        // 旧挙動は `TAKO_812_LEGACY=1`
         let lifted: Vec<(PaneId, Rect)> = layout
             .iter()
             .filter(|(id, _)| self.lifted_header_panes.contains(id))
@@ -23030,9 +23069,6 @@ impl Render for TakoApp {
                         .flex_none(),
                     cx,
                 );
-                // 枠線の色は本体（`render_pane`）と同じ 1 か所から取る。状態が変われば
-                // TakoApp が notify され本体も同じフレームで描き直るので食い違わない
-                let border_color = self.pane_border_color(id);
                 div()
                     .absolute()
                     .left(relative(rect.x))
@@ -23044,7 +23080,9 @@ impl Render for TakoApp {
                     .border_t(px(PANE_BORDER))
                     .border_r(px(PANE_BORDER))
                     .rounded_t(px(PANE_CORNER_RADIUS))
-                    .border_color(border_color)
+                    // 旧挙動（#812 の A/B）のときだけ、ここにも同じ色の枠線を塗らせる。
+                    // 色の規則は本体・オーバーレイと同じ 1 か所から取る
+                    .when(legacy_812(), |d| d.border_color(self.pane_border_color(id)))
                     .overflow_hidden()
                     .flex()
                     .flex_col()
@@ -23052,6 +23090,34 @@ impl Render for TakoApp {
                     .into_any_element()
             })
             .collect();
+        // #812: ペイン枠線のインクはここ 1 枚だけが塗る。
+        //
+        // 位置・大きさの指定は `panes`（本体）とまったく同じ（同じ包含ブロックの
+        // 同じ相対矩形）なので、枠線の quad は本体が描いていた場所へ 1 ドットもずれずに
+        // 乗る。**ヘッダより後**に出すので #803 の重なり順（枠の丸め角がヘッダの上）も
+        // そのまま。当たり判定は持たない（リスナ・hover・カーソルのどれも付けない div は
+        // GPUI が hitbox を挿さない = `Interactivity::should_insert_hitbox`）ので、
+        // ペインのクリック・ホイール・ドラッグは下の本体へ素通りする。
+        // 旧挙動（本体 + ヘッダ外枠の 2 か所塗り）は `TAKO_812_LEGACY=1`
+        let pane_borders: Vec<_> = if legacy_812() {
+            Vec::new()
+        } else {
+            layout
+                .iter()
+                .map(|(id, rect)| {
+                    div()
+                        .absolute()
+                        .left(relative(rect.x))
+                        .top(relative(rect.y))
+                        .w(relative(rect.width))
+                        .h(relative(rect.height))
+                        .border(px(PANE_BORDER))
+                        .rounded(px(PANE_CORNER_RADIUS))
+                        .border_color(self.pane_border_color(*id))
+                        .into_any_element()
+                })
+                .collect()
+        };
         let _ = cell;
         // 消えたペインのビューは持ち続けない（タブ・たまり場のどちらにも居ないもの）
         self.prune_pane_body_views();
@@ -23499,6 +23565,8 @@ impl Render for TakoApp {
                             // #803: ヘッダは本体の直後（本体の上・境界ハンドルの下）。
                             // 本体側は同じ高さを空けてあるので重なりは無い
                             .children(pane_headers)
+                            // #812: 枠線はヘッダの後（= #803 と同じ重なり順）に 1 枚だけ
+                            .children(pane_borders)
                             .children(border_handles)
                             .children(drop_overlays)
                             .children(ime_overlay),
@@ -33851,6 +33919,753 @@ mod self_test {
         );
     }
 
+    /// ペイン枠線を塗るのが**ルート側のオーバーレイ 1 枚だけ**であること（#812）を
+    /// 実ピクセルで固定する。
+    ///
+    /// #803 でヘッダをルート側の兄弟へ持ち上げたとき、GPUI の `Style::paint` の順
+    /// （影 → 背景 → 子 → 枠線）のせいでペイン枠の上 2 つの丸め角がヘッダの四角い背景で
+    /// 潰れた。当座の直しは「ヘッダの外枠にも同じ枠線を描かせる」で重なり順は戻ったが、
+    /// **同じ枠線を本体とヘッダ外枠の 2 か所が塗る**状態になった。不透明な直線部分は
+    /// 2 回塗っても同じ色だが、丸め角の AA 画素は `a·c + (1-a)·dst` を 2 回通るぶん
+    /// 濃くなる（#803 の報告で実フレーム全画素比較 32 / 3,115,200）。
+    ///
+    /// ここが固定するのは 3 つ:
+    ///
+    /// 1. **同じ場面のまま**新旧を撮り比べて（`TAKO_812_LEGACY` を実行中に倒す）、
+    ///    差分が**丸め角の箱の中だけ**に収まること。角の外が 1 画素も動かない =
+    ///    フォーカス枠 / 非フォーカス枠 / 分割 / ズーム / テーマの位置と色が不変
+    /// 2. 4 つの角すべてに枠線色の画素が在ること（#803 の「角が潰れる」の再発防止）
+    /// 3. 角のいちばん外側の画素が枠線色でもヘッダ色でもないこと（丸めが落ちていない）
+    ///
+    /// プロセスを分けた A/B にしないのが要点。別プロセスでは PTY の出力・ヘッダの時計・
+    /// レイアウトの揺れが混ざるので「角だけが違う」を言い切れない。
+    ///
+    /// 単独実行は `TAKO_VISUAL_ONLY=pane-border`
+    #[cfg(feature = "visual-test")]
+    async fn pane_border_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        inject_section_failure("pane-border");
+        ensure_fresh_scene(window, cx, "pane-border").await;
+
+        /// 実描画のペイン矩形（論理座標）と、判定に要る地の色
+        struct BorderScene {
+            /// (ペイン, フォーカス中か, ペイン矩形)
+            panes: Vec<(PaneId, bool, Bounds<Pixels>)>,
+            /// フォーカス中ペインの枠線色
+            accent: tako_core::Rgb,
+            /// 非フォーカスペインの枠線色
+            border_default: tako_core::Rgb,
+            /// 失敗ペイン（枠線が半透明 = 直線部分も二重塗りで変わる）が混ざっていないか
+            any_failed: bool,
+        }
+
+        /// 実描画で採ったコンテナ矩形 × 木の単位矩形 = ペイン矩形。
+        /// `render` が `panes` / `pane_borders` を置くのとまったく同じ材料
+        fn border_scene(window: WindowHandle<TakoApp>, cx: &mut AsyncApp) -> Option<BorderScene> {
+            window
+                .update(cx, |app, win, _| -> Option<BorderScene> {
+                    let container = app
+                        .pane_content
+                        .get(&win.window_handle().window_id())
+                        .and_then(|g| g.measured)?;
+                    let tree = app.workspace.active_tab().tree();
+                    let focused = tree.focused();
+                    let panes: Vec<(PaneId, bool, Bounds<Pixels>)> = tree
+                        .layout(Rect::UNIT)
+                        .into_iter()
+                        .map(|(id, r)| {
+                            let cw = f32::from(container.size.width);
+                            let ch = f32::from(container.size.height);
+                            (
+                                id,
+                                id == focused,
+                                Bounds::new(
+                                    point(
+                                        px(f32::from(container.left()) + cw * r.x),
+                                        px(f32::from(container.top()) + ch * r.y),
+                                    ),
+                                    size(px(cw * r.width), px(ch * r.height)),
+                                ),
+                            )
+                        })
+                        .collect();
+                    let any_failed = panes.iter().any(|(id, _, _)| {
+                        matches!(
+                            app.terminals.get(id).map(|s| s.command_state()),
+                            Some(tako_core::CommandState::Failed(_))
+                        )
+                    });
+                    Some(BorderScene {
+                        panes,
+                        accent: app.theme.accent,
+                        border_default: app.theme.border_default,
+                        any_failed,
+                    })
+                })
+                .ok()
+                .flatten()
+        }
+
+        /// ペイン本体（`AnyView::cached`）ごと汚す。#812 の腕を倒しただけでは
+        /// キャッシュが当たって本体の枠線が前フレームのまま再利用される
+        fn dirty_all(window: WindowHandle<TakoApp>, cx: &mut AsyncApp) {
+            let _ = window.update(cx, |app, _, cx| {
+                let bodies: Vec<_> = app.pane_bodies.values().cloned().collect();
+                for view in bodies {
+                    view.update(cx, |_, cx| cx.notify());
+                }
+                let headers: Vec<_> = app.pane_headers.values().cloned().collect();
+                for view in headers {
+                    view.update(cx, |_, cx| cx.notify());
+                }
+                cx.notify();
+            });
+        }
+
+        fn near(p: [u8; 4], c: tako_core::Rgb, tol: i32) -> bool {
+            (i32::from(p[0]) - i32::from(c.r)).abs() <= tol
+                && (i32::from(p[1]) - i32::from(c.g)).abs() <= tol
+                && (i32::from(p[2]) - i32::from(c.b)).abs() <= tol
+        }
+
+        /// 論理矩形 → 画像座標の箱（`flip` は Metal 読み戻しの上下の向き）
+        fn to_image(
+            b: Bounds<Pixels>,
+            scale: f32,
+            flip: bool,
+            height: u32,
+        ) -> (u32, u32, u32, u32) {
+            let x0 = (f32::from(b.left()) * scale).round().max(0.0) as u32;
+            let x1 = (f32::from(b.right()) * scale).round().max(0.0) as u32;
+            let raw_top = (f32::from(b.top()) * scale).round().max(0.0) as u32;
+            let raw_bottom = (f32::from(b.bottom()) * scale).round().max(0.0) as u32;
+            if flip {
+                (
+                    x0,
+                    height.saturating_sub(raw_bottom),
+                    x1,
+                    height.saturating_sub(raw_top),
+                )
+            } else {
+                (x0, raw_top, x1, raw_bottom)
+            }
+        }
+
+        /// A/B の差分を仕分けるときに要るペイン 1 枚の情報。
+        /// タプルのままだと `clippy::type_complexity` に当たる（CI の visual-test 宇宙）
+        struct PaneBox {
+            /// 画像座標の矩形（左, 上, 右, 下）
+            rect: (u32, u32, u32, u32),
+            /// このペインの枠線色（フォーカス = accent / 非 = border_default）
+            want: tako_core::Rgb,
+            /// ヘッダ（+ 枠）がペインの高さを覆いきるか（退化ケース）
+            swallowed: bool,
+        }
+
+        /// 箱の中で色 `c` に近い画素を数える
+        fn box_hits(frame: &image::RgbaImage, r: (u32, u32, u32, u32), c: tako_core::Rgb) -> usize {
+            let (w, h) = frame.dimensions();
+            let mut n = 0;
+            for y in r.1..r.3.min(h) {
+                for x in r.0..r.2.min(w) {
+                    if near(frame.get_pixel(x, y).0, c, 6) {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        }
+
+        // ---- ラウンドを 1 本回す（撮り比べ + 角・辺の検査）----
+        async fn round(
+            any: AnyWindowHandle,
+            window: WindowHandle<TakoApp>,
+            cx: &mut AsyncApp,
+            label: &str,
+            // ヘッダがペインを覆いきる高さのペインが居る場面か（退化ケース）。
+            // `false` なら丸め角の外の差分は 1 画素も認めない
+            degenerate: bool,
+        ) {
+            // 場面が落ち着くまで実フレームを重ねる（初回の全面描画・訂正フレームを測らない）
+            for _ in 0..6 {
+                let _ = capture_frame(any, cx);
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(600))
+                .await;
+            let _ = capture_frame(any, cx);
+
+            let scene = border_scene(window, cx)
+                .unwrap_or_else(|| fail(&format!("visual-test pane-border {label}: ペイン矩形")));
+            // 失敗ペインの枠線は半透明（`hsla_alpha(red, 0.55)`）なので直線部分まで
+            // 二重塗りの影響を受ける。「角だけが違う」の前提が崩れるので先に弾く
+            check(
+                !scene.any_failed,
+                &format!("visual-test pane-border {label}: 失敗ペインが混ざっていない前提"),
+            );
+            // フォーカス枠と非フォーカス枠が同じ色だと、下の「色規則」の検査が
+            // 何も言っていないことになる（閾値の空振り防止）
+            check(
+                !near(
+                    [scene.accent.r, scene.accent.g, scene.accent.b, 255],
+                    scene.border_default,
+                    12,
+                ),
+                &format!(
+                    "visual-test pane-border {label}: フォーカス枠と非フォーカス枠が \
+                     同じ色に見える前提崩れ（色規則の検査が空振りする）"
+                ),
+            );
+
+            // 起動時の腕（= `TAKO_812_LEGACY` の env が決めた側）を先に 1 枚撮る。
+            // 下でこれとどちらかの腕が完全一致することを見る = env が配線されている証拠
+            let env_arm = legacy_812();
+            let pre = if label == "1pane" {
+                let _ = capture_frame(any, cx);
+                capture_frame(any, cx).map(|(f, _)| f)
+            } else {
+                None
+            };
+
+            // --- 新（既定）で 2 枚。静止しているので完全一致するはず ---
+            set_legacy_812(false);
+            dirty_all(window, cx);
+            let Some((new_a, scale)) = capture_frame(any, cx) else {
+                fail(&format!(
+                    "visual-test pane-border {label}: フレーム取得(new_a)"
+                ))
+            };
+            let Some((new_b, _)) = capture_frame(any, cx) else {
+                fail(&format!(
+                    "visual-test pane-border {label}: フレーム取得(new_b)"
+                ))
+            };
+            let still = frame_diff_bbox(&new_a, &new_b).map(|d| d.4).unwrap_or(0);
+
+            // --- 上下の向きを確定させる ---
+            //
+            // Metal の読み戻しは上下の向きがプラットフォームで変わりうる。地の色で
+            // 決めようとすると dark テーマの `surface_2`(32,33,47) と
+            // `background`(30,30,46) が 3 しか離れておらず**どちらの向きでも当たる**
+            // （実測で踏んだ）ので、**枠線が実際に見つかる側**を採る。
+            // どちらでも見つからなければ「向きが分からない」ではなく
+            // **枠線が 1 本も描かれていない**なので、そう名指して落とす
+            let (fw, fh) = new_a.dimensions();
+            let ring_score = |flip: bool| -> (usize, usize) {
+                let (mut hit, mut span_px) = (0usize, 0usize);
+                for (_, focused, rect) in &scene.panes {
+                    let want = if *focused {
+                        scene.accent
+                    } else {
+                        scene.border_default
+                    };
+                    let (x0, y0, x1, y1) = to_image(*rect, scale, flip, fh);
+                    // 数えるのは**上下の辺**だけ（角を避けた中央 60%）。左右の辺は
+                    // 縦線なので上下を反転しても大きく重なり、向きの手がかりにならない
+                    // （実測: 1 ペインで上向き 100% に対し下向きも 41% 当たった）
+                    let (mx0, mx1) = (x0 + (x1 - x0) / 5, x1 - (x1 - x0) / 5);
+                    span_px += (mx1 - mx0) as usize * 2;
+                    for x in mx0..mx1.min(fw) {
+                        for y in [y0, y1.saturating_sub(1)] {
+                            if y < fh && near(new_a.get_pixel(x, y).0, want, 6) {
+                                hit += 1;
+                            }
+                        }
+                    }
+                }
+                (hit, span_px)
+            };
+            let (up, span_px) = ring_score(false);
+            let (down, _) = ring_score(true);
+            let flip = down > up;
+            let (win_ring, lose_ring) = if flip { (down, up) } else { (up, down) };
+            let rects: Vec<String> = scene
+                .panes
+                .iter()
+                .map(|(id, f, r)| {
+                    format!(
+                        "p{}{}={:.0},{:.0}+{:.0}x{:.0}",
+                        id.as_u64(),
+                        if *f { "*" } else { "" },
+                        f32::from(r.left()),
+                        f32::from(r.top()),
+                        f32::from(r.size.width),
+                        f32::from(r.size.height)
+                    )
+                })
+                .collect();
+            println!(
+                "TAKO_VISUAL_PIXEL: pane-border {label} flip={flip} ring={win_ring}/{span_px} \
+                 other={lose_ring} scale={scale} still={still} panes={} size={fw}x{fh} rects={}",
+                scene.panes.len(),
+                rects.join(" ")
+            );
+            check(
+                win_ring as f32 >= span_px as f32 * 0.5,
+                &format!(
+                    "visual-test pane-border {label}: 辺に枠線色が見つからない \
+                     (上向き={up} 下向き={down} / 辺の長さ={span_px}) = 枠線が描かれていない"
+                ),
+            );
+            check(
+                lose_ring * 4 <= win_ring,
+                &format!(
+                    "visual-test pane-border {label}: 上下の向きが決まらない \
+                     (上向き={up} 下向き={down})"
+                ),
+            );
+            check(
+                still == 0,
+                &format!(
+                    "visual-test pane-border {label}: 静止した場面が動いている ({still} 画素)"
+                ),
+            );
+
+            // --- 角の箱（丸めの半径 + 枠幅）。device px はスケールから作る ---
+            let corner = ((PANE_CORNER_RADIUS + PANE_BORDER) * scale).ceil() as u32;
+            // 角の箱は**上下を分けて**持つ。旧挙動でヘッダ外枠が塗り重ねていたのは
+            // 上 2 つだけなので、**下 2 つは旧挙動でも 1 回塗り**。つまり新旧で
+            // 下の角が 1 画素でも違えば「新しい側が 2 回塗っている」ことになる
+            // （この区別が無いと「本体にも枠線を残す」= 二重塗りへ戻す注入が素通りする。
+            // 実測で踏んだ）
+            let mut top_corner_boxes: Vec<(u32, u32, u32, u32)> = Vec::new();
+            let mut min_corner_ink = usize::MAX;
+            let mut worst_corner = String::new();
+            let mut outer_bad: Vec<String> = Vec::new();
+            let mut edge_worst = (1.0f32, String::new());
+            for (id, focused, rect) in &scene.panes {
+                let want = if *focused {
+                    scene.accent
+                } else {
+                    scene.border_default
+                };
+                let (x0, y0, x1, y1) = to_image(*rect, scale, flip, fh);
+                for (cx0, cy0, top) in [
+                    (x0, y0, true),
+                    (x1.saturating_sub(corner), y0, true),
+                    (x0, y1.saturating_sub(corner), false),
+                    (x1.saturating_sub(corner), y1.saturating_sub(corner), false),
+                ] {
+                    let b = (cx0, cy0, cx0 + corner, cy0 + corner);
+                    if top {
+                        top_corner_boxes.push(b);
+                    }
+                    // (2) 角に枠線色が在る = #803 の「角が潰れる」が再発していない
+                    let ink = box_hits(&new_a, b, want);
+                    if ink < min_corner_ink {
+                        min_corner_ink = ink;
+                        worst_corner = format!("pane{} @({cx0},{cy0})", id.as_u64());
+                    }
+                }
+                // (3) 丸めが落ちていないこと。**色ではなく形**で見る: ペインの
+                //     上端・下端の行では、角から `reach` px のあいだに枠線インクが無い
+                //     （丸めが落ちると L 字になって辺の端まで届く）。
+                //
+                //     許容は 2。light テーマの地 + 影は `border_default` と 6 しか
+                //     離れておらず、許容 6 だと丸まっていても当たる（実測で踏んだ）。
+                //     同じ許容で**辺の中央には当たる**ことを併せて見る（空振り防止）。
+                //
+                //     `reach` は半径の 35%（≒ 3.2px）。丸め角の弧は**上端の行でも
+                //     角から遠くない**（半径 r の弧は上端の行ですでに
+                //     `r - sqrt(r² - (r-0.25)²)` ≒ 0.77r まで寄る）ので、箱の幅
+                //     （= r + 枠幅）をそのまま使うと丸まっていても当たってしまう
+                //     （これも実測で踏んだ）。弧の最寄り ≒ 6.9px の半分以下で余裕がある
+                let reach = ((PANE_CORNER_RADIUS * 0.35) * scale).round().max(2.0) as u32;
+                let mid = (x0 + x1) / 2;
+                for (edge, rows) in [
+                    ("上端", [y0, y0 + 1]),
+                    ("下端", [y1.saturating_sub(1), y1.saturating_sub(2)]),
+                ] {
+                    let tight = |x: u32, y: u32| -> bool {
+                        x < fw && y < fh && near(new_a.get_pixel(x, y).0, want, 2)
+                    };
+                    // 枠線が乗っている方の行を選ぶ（device px の丸めで 1 行ずれる）
+                    let row = rows
+                        .into_iter()
+                        .max_by_key(|y| {
+                            (mid.saturating_sub(2)..mid + 2)
+                                .filter(|x| tight(*x, *y))
+                                .count()
+                        })
+                        .unwrap_or(rows[0]);
+                    let mid_ink = (mid.saturating_sub(2)..mid + 2)
+                        .filter(|x| tight(*x, row))
+                        .count();
+                    if mid_ink == 0 {
+                        outer_bad.push(format!(
+                            "pane{} {edge} 辺の中央に枠線が無い(row={row})",
+                            id.as_u64()
+                        ));
+                        continue;
+                    }
+                    let hit = (x0..(x0 + reach).min(fw))
+                        .chain(x1.saturating_sub(reach)..x1.min(fw))
+                        .filter(|x| tight(*x, row))
+                        .count();
+                    if hit > 0 {
+                        outer_bad.push(format!(
+                            "pane{} {edge} 角まで枠線が届いている({hit} 画素 row={row})",
+                            id.as_u64()
+                        ));
+                    }
+                }
+                // (4) 直線部分の色が規則どおり（フォーカス = accent / 非 = border_default）。
+                //     角を避けた中央 40% の帯を、枠幅ぶん左右に広げて舐める
+                let pad = (PANE_BORDER * scale).ceil() as u32 + 1;
+                let ys = y0 + (y1 - y0) * 3 / 10;
+                let ye = y0 + (y1 - y0) * 7 / 10;
+                let rows = (ye.saturating_sub(ys)).max(1);
+                let hit_rows = (ys..ye)
+                    .filter(|y| {
+                        (x0.saturating_sub(1)..(x0 + pad).min(fw))
+                            .any(|x| near(new_a.get_pixel(x, *y).0, want, 6))
+                    })
+                    .count();
+                let ratio = hit_rows as f32 / rows as f32;
+                if ratio < edge_worst.0 {
+                    edge_worst = (
+                        ratio,
+                        format!(
+                            "pane{} 左辺 focused={focused} hit={hit_rows}/{rows}",
+                            id.as_u64()
+                        ),
+                    );
+                }
+            }
+            println!(
+                "TAKO_VISUAL_PIXEL: pane-border {label} corner_ink_min={min_corner_ink} \
+                 ({worst_corner}) outer_bad={} edge_min={:.2} ({}) corner_px={corner}",
+                outer_bad.len(),
+                edge_worst.0,
+                edge_worst.1
+            );
+            check(
+                min_corner_ink as f32 >= 4.0 * scale,
+                &format!(
+                    "visual-test pane-border {label}: 丸め角に枠線色が出ていない \
+                     ({worst_corner} = {min_corner_ink} 画素。#803 の再発)"
+                ),
+            );
+            check(
+                outer_bad.is_empty(),
+                &format!("visual-test pane-border {label}: 丸め角の形が崩れている ({outer_bad:?})"),
+            );
+            check(
+                edge_worst.0 >= 0.9,
+                &format!(
+                    "visual-test pane-border {label}: 枠線の色規則が合わない ({})",
+                    edge_worst.1
+                ),
+            );
+
+            // --- 旧（2 か所塗り）へ倒して同じ場面を撮る ---
+            set_legacy_812(true);
+            dirty_all(window, cx);
+            let _ = capture_frame(any, cx);
+            let Some((legacy, _)) = capture_frame(any, cx) else {
+                fail(&format!(
+                    "visual-test pane-border {label}: フレーム取得(legacy)"
+                ))
+            };
+            set_legacy_812(false);
+            dirty_all(window, cx);
+            let _ = capture_frame(any, cx);
+            let Some((back, _)) = capture_frame(any, cx) else {
+                fail(&format!(
+                    "visual-test pane-border {label}: フレーム取得(back)"
+                ))
+            };
+            let reverted = frame_diff_bbox(&new_b, &back).map(|d| d.4).unwrap_or(0);
+            // 崩れを追うときだけフレームを書き出す（既存の口 `TAKO_VISUAL_DUMP_DIR` を使う）。
+            // 検査そのものはプロセス内の読み戻しで完結するので、既定では何も書かない
+            if let Ok(dir) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                let _ = std::fs::create_dir_all(&dir);
+                let path = std::path::Path::new(&dir);
+                let _ = new_b.save(path.join(format!("pane-border-{label}-new.png")));
+                let _ = legacy.save(path.join(format!("pane-border-{label}-legacy.png")));
+            }
+
+            // --- 差分を 3 つに仕分ける ---
+            //
+            // 1. `ab_corner`: **上 2 つ**の丸め角の箱の中 = 旧挙動が二重に塗って
+            //    濃くしていた AA 画素。ここが #812 で消したかったもの。
+            //    **下 2 つの角は旧挙動でも 1 回塗り**なので差が出てはいけない
+            //    （出たら新しい側が 2 回塗っている = 直っていない）
+            // 2. `ab_recovered`: **ヘッダがペインを覆いきる高さまで縮んだペイン**の中の画素。
+            //    旧挙動はヘッダの四角い背景で枠線を飲み込んでいた（#803 の症状が
+            //    このサイズでは残っていた）ので、新旧で違って当たり前。代わりに
+            //    「新ではその下端に枠線が出ている」を下で別に主張する
+            // 3. `ab_outside`: それ以外 = 枠線の位置か色が変わった疑い。**0 でなければ落とす**
+            let boxes: Vec<PaneBox> = scene
+                .panes
+                .iter()
+                .map(|(_, focused, rect)| PaneBox {
+                    rect: to_image(*rect, scale, flip, fh),
+                    want: if *focused {
+                        scene.accent
+                    } else {
+                        scene.border_default
+                    },
+                    // ヘッダ（+ 枠）がペインの高さを覆いきるか
+                    swallowed: f32::from(rect.size.height)
+                        <= PANE_TITLE_BAR + 2.0 * PANE_BORDER + 2.0,
+                })
+                .collect();
+            let (mut inside, mut outside, mut recovered) = (0u64, 0u64, 0u64);
+            let mut outside_spots: Vec<String> = Vec::new();
+            if new_b.dimensions() != legacy.dimensions() {
+                fail(&format!(
+                    "visual-test pane-border {label}: 新旧のフレームサイズが違う"
+                ));
+            }
+            for y in 0..fh {
+                for x in 0..fw {
+                    if new_b.get_pixel(x, y) == legacy.get_pixel(x, y) {
+                        continue;
+                    }
+                    if top_corner_boxes
+                        .iter()
+                        .any(|(a, b, c, d)| x >= *a && x < *c && y >= *b && y < *d)
+                    {
+                        inside += 1;
+                        continue;
+                    }
+                    // 退化ペインの矩形（`to_image` の丸めぶん 1px 広げる）の中は
+                    // strict 比較から外す
+                    let swallowed_pane = boxes.iter().any(|b| {
+                        let (x0, y0, x1, y1) = b.rect;
+                        b.swallowed && x + 1 >= x0 && x <= x1 && y + 1 >= y0 && y <= y1
+                    });
+                    if swallowed_pane {
+                        recovered += 1;
+                    } else {
+                        outside += 1;
+                        if outside_spots.len() < 8 {
+                            outside_spots.push(format!("({x},{y})"));
+                        }
+                    }
+                }
+            }
+            println!(
+                "TAKO_VISUAL_PIXEL: pane-border {label} ab_corner={inside} \
+                 ab_recovered={recovered} ab_outside={outside} {outside_spots:?} \
+                 reverted={reverted}"
+            );
+            check(
+                reverted == 0,
+                &format!(
+                    "visual-test pane-border {label}: 腕を戻しても絵が戻らない ({reverted} 画素)"
+                ),
+            );
+            check(
+                inside > 0,
+                &format!(
+                    "visual-test pane-border {label}: 旧挙動（2 か所塗り）との差が 0 画素 = \
+                     A/B の逃げ道が効いていない"
+                ),
+            );
+            check(
+                outside == 0,
+                &format!(
+                    "visual-test pane-border {label}: 丸め角の外が動いた ({outside} 画素 \
+                     {outside_spots:?}) = 枠線の位置か色が変わっている"
+                ),
+            );
+            // 退化ペインは「旧は枠線を飲み込む / 新は飲み込まれない」を別に主張する
+            // （矩形の中を strict 比較から外したぶんの穴埋め）
+            for b in &boxes {
+                if !b.swallowed {
+                    continue;
+                }
+                let (x0, y0, x1, y1) = b.rect;
+                let (mx0, mx1) = (x0 + (x1 - x0) / 5, x1 - (x1 - x0) / 5);
+                let row_ink = |img: &image::RgbaImage| -> usize {
+                    (mx0..mx1.min(fw))
+                        .filter(|x| {
+                            (y1.saturating_sub(3)..y1)
+                                .any(|y| y < fh && near(img.get_pixel(*x, y).0, b.want, 6))
+                        })
+                        .count()
+                };
+                let (ink_new, ink_old) = (row_ink(&new_b), row_ink(&legacy));
+                let span = (mx1 - mx0) as usize;
+                println!(
+                    "TAKO_VISUAL_PIXEL: pane-border {label} swallowed rect=({x0},{y0})-({x1},{y1}) \
+                     下端の枠線 new={ink_new} legacy={ink_old} span={span}"
+                );
+                check(
+                    ink_new * 2 >= span,
+                    &format!(
+                        "visual-test pane-border {label}: ヘッダが覆いきる高さのペインで \
+                         下端の枠線が出ていない (new={ink_new}/{span})"
+                    ),
+                );
+            }
+            check(
+                degenerate || recovered == 0,
+                &format!(
+                    "visual-test pane-border {label}: 丸め角の外で枠線が増えている \
+                     ({recovered} 画素)。ヘッダが覆いきる高さのペインが居ない場面では \
+                     新旧の差は角の AA だけのはず"
+                ),
+            );
+
+            if let Some(pre) = pre {
+                let want = if env_arm { &legacy } else { &new_b };
+                let d = frame_diff_bbox(&pre, want).map(|x| x.4).unwrap_or(0);
+                println!("TAKO_VISUAL_PIXEL: pane-border {label} env_arm={env_arm} env_match={d}");
+                check(
+                    d == 0,
+                    &format!(
+                        "visual-test pane-border {label}: TAKO_812_LEGACY の env が腕へ \
+                         配線されていない (env_arm={env_arm} 差={d} 画素)"
+                    ),
+                );
+            }
+        }
+
+        // --- ラウンド 1: 1 枚（分割なし） ---
+        round(any, window, cx, "1pane", false).await;
+
+        // --- ラウンド 2: 2 分割（フォーカス枠 + 非フォーカス枠が同じ絵に並ぶ） ---
+        window
+            .update(cx, |app, _, cx| {
+                let base = app.focused_pane();
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::Split {
+                        pane: Some(base.as_u64()),
+                        tab: None,
+                        direction: Some(tako_control::protocol::Direction::Right),
+                        ratio: None,
+                        command: None,
+                        cwd: None,
+                        focus: Some(false),
+                    },
+                    PaneOrigin::User,
+                );
+                let _ = app.attach_pending_sessions(cx);
+                cx.notify();
+            })
+            .ok();
+        cx.background_executor()
+            .timer(Duration::from_millis(1200))
+            .await;
+        round(any, window, cx, "2pane", false).await;
+
+        // --- ラウンド 3: ペインのフォントズーム（中身だけ変わり枠は動かない） ---
+        let zoomed = window
+            .update(cx, |app, _, cx| {
+                let pane = app.focused_pane();
+                let before = app.pane_font_size(pane);
+                app.zoom_focused_pane(4.0, cx);
+                cx.notify();
+                (before, app.pane_font_size(pane))
+            })
+            .unwrap_or((0.0, 0.0));
+        println!(
+            "TAKO_VISUAL_PIXEL: pane-border zoom font {:.1} -> {:.1}",
+            zoomed.0, zoomed.1
+        );
+        // 効いていないズームで「枠が動かない」を主張しても意味がない（空振り防止）
+        check(
+            (zoomed.1 - zoomed.0).abs() >= 1.0,
+            "visual-test pane-border zoom: フォントサイズが変わっていない（空振り）",
+        );
+        cx.background_executor()
+            .timer(Duration::from_millis(900))
+            .await;
+        round(any, window, cx, "zoom", false).await;
+        window
+            .update(cx, |app, _, cx| {
+                app.reset_zoom_focused_pane(cx);
+                cx.notify();
+            })
+            .ok();
+
+        // --- ラウンド 4: light テーマ（枠線色が総入れ替えになる） ---
+        for mode in ["light", "dark"] {
+            window
+                .update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Theme {
+                            action: Some("set".into()),
+                            mode: Some(mode.into()),
+                            target: None,
+                            key: None,
+                            value: None,
+                            name: None,
+                            font_family: None,
+                            font_size: None,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    cx.notify();
+                })
+                .ok();
+            cx.background_executor()
+                .timer(Duration::from_millis(1000))
+                .await;
+            if mode == "light" {
+                round(any, window, cx, "light", false).await;
+            }
+        }
+
+        // --- ラウンド 5: 4 分割 + 仕切りを寄せて 1 枚をヘッダより低く縮める ---
+        //
+        // **退化ケースなので最後に回す**。ヘッダがペインを覆いきる高さになると、
+        // 旧挙動は枠線をヘッダの四角い背景で飲み込む（#803 の症状が残っていた形）。
+        // 新挙動は枠線をヘッダの後に塗るので飲み込まれない = `ab_recovered` に出る
+        window
+            .update(cx, |app, _, cx| {
+                let base = app.focused_pane();
+                for dir in [
+                    tako_control::protocol::Direction::Down,
+                    tako_control::protocol::Direction::Down,
+                ] {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Split {
+                            pane: Some(base.as_u64()),
+                            tab: None,
+                            direction: Some(dir),
+                            ratio: None,
+                            command: None,
+                            cwd: None,
+                            focus: Some(false),
+                        },
+                        PaneOrigin::User,
+                    );
+                    let _ = app.attach_pending_sessions(cx);
+                }
+                // 仕切りを寄せて 1 枚を最小まで縮める
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::Resize {
+                        pane: Some(base.as_u64()),
+                        axis: tako_control::protocol::Axis::Y,
+                        delta: None,
+                        share: Some(0.05),
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+            })
+            .ok();
+        cx.background_executor()
+            .timer(Duration::from_millis(1500))
+            .await;
+        round(any, window, cx, "4pane-narrow", true).await;
+
+        // 腕は既定（新）へ戻して次の節へ渡す
+        set_legacy_812(false);
+        dirty_all(window, cx);
+    }
+
     /// 静止した画面が 1 ピクセルも動かないことを実フレームで固定する（#932）。
     ///
     /// tako はカーソルを点滅させない（`blink` の実装がワークスペースに 1 つも無い）。
@@ -35341,6 +36156,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #812: ペイン枠線を塗るのがルート側の 1 枚だけか
+                "pane-border" => {
+                    pane_border_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #932: 静止した画面が 1 ピクセルも動かないか（ちらつきの機械検証）
                 "flicker" => {
                     flicker_visual(any, window, cx).await;
@@ -35369,7 +36190,8 @@ mod self_test {
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
                          profiles / chat-table / conflict-card / terminal-grid / \
                          grid-bench / preview-leak / chat-leak / preview-code / \
-                         remote-tree / flicker / ime-preedit / screen-lines）"
+                         remote-tree / flicker / ime-preedit / screen-lines / \
+                         pane-border）"
                     );
                     std::process::exit(1);
                 }
@@ -37699,6 +38521,10 @@ mod self_test {
             // #919 / #976 / #1041: リモートフォルダがツリーへどう並ぶか
             // （ローカルの後ろ / 明示は先頭 / 切断バッジ）を実ピクセルで見る
             remote_tree_visual(any, window, cx).await;
+
+            // #812: ペイン枠線のインクがルート側のオーバーレイ 1 枚からだけ出るか
+            // （丸め角の AA 二重合成の再発防止）
+            pane_border_visual(any, window, cx).await;
 
             // #932: ちらつきの機械検証。**最後に回す**（専用タブを作り、分割・
             // プレビュー・連続出力まで状態を動かすので、他の節の前提を壊さない）
@@ -71640,7 +72466,10 @@ mod pane_text_area_tests {
                     .map(|_| rest)
             })
             .collect();
-        // 期待する 9 個:
+        // 期待する 10 個:
+        //   when(legacy_812) = 旧挙動のときだけ枠線色を付ける（#812。色だけなので
+        //     高さを食わない。枠**幅**は `.border(px(PANE_BORDER))` が常に持つので
+        //     `stacked_top` の会計は腕によらず不変）
         //   when(is_failed) / when(focused) = 影と枠の見た目だけ（高さを食わない）
         //   child(ヘッダの場所を空けるスペーサー #803) = PANE_TITLE_BAR
         //   when_some(stale バナー) = STALE_BANNER_HEIGHT
@@ -71649,7 +72478,7 @@ mod pane_text_area_tests {
         //   children(スクロールバー) / children(提案チップ) / when(workers メニュー) = absolute
         assert_eq!(
             children.len(),
-            9,
+            10,
             "ペインの直接の子が変わっている: {children:#?}\n\
              流れの中（absolute でない）に足したなら `stacked_top` / `band` の会計を\
              見直すこと（#781）"
