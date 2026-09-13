@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-14（#1452: 権限が足りませんに導線を付け、端末ごとの権限編集を PC へ置いた）
-- スマホは #283 からある `POST /api/pair` を押せる場所に出しただけ（**新 API は `POST /api/admin/devices/role` の 1 本**）。`GET /api/me` が登録済み端末にも `pending` / `requested_role` / `denied` を返すようにし、承認待ちの間だけ 2 秒ポーリング → 承認で**再読込なしで**続きができる。導線は `permission-request.jsx` へ切り出し `files.jsx` は 2 行差分（#1451 との衝突回避）
-- 昇格を PC の人へ縛るのは 3 段: 方向（403 `upgrade_requires_gui`）/ 接続元プロセスの名前ゲート（#841 の `procinfo` を流用）/ **dispatch の手前での拒否**（MCP・CLI の IPC は tako-app の中で走るので名前ゲートだけでは AI を止められない = 実装中に見つけた穴）。経路表は `remote_role::ROLE_ROUTES`、依頼は `tako todo`（kind=permission）へ 1 件（**授権の正本は daemon のメモリのまま** = done しても権限は動かない）
-- 実測 `scripts/test-remote-role-1452.sh` **58 PASS 0 FAIL**（CLI / MCP / curl の昇格が全部拒否・GUI を名乗った承認だけ 200・監査に `caller_check`・再起動をまたいで記録だけ残る）・e2e 71 passed（新 10 本）・番犬 9 本。**罠**: 承認にゲートが掛かったので #1449 / #1078 の実経路テストが全 403 になる（`TAKO_REMOTE_TRUSTED_ADMIN_NAMES` を宣言して復旧 = #841 と同じ形）。**install 要 / 本番 daemon 再起動要**
-
 ## 2026-09-14（#1447: preview パネルつき AskUserQuestion（2 カラム配置）を検知できるようにした）
 - 真因は枠の同居**ではなく**折り返しの継続行の字下げ（実採取は中身の桁 5 に対して 4）。`gap_line_kind` が「ダイアログの外」に分類し `numbered_block` が選択肢 1 個で打ち切っていた。注入 A/B で名指し（枠を剥がしただけでは None のまま / 継続行を 5 桁へ揃えると修正前でも採れる）
 - 下限を `dialog::wrap_indent_floor`（マーカー `N.` より右）の 1 実装へ寄せ、歯止めに「選択カーソル行・番号つき行は続きにしない」。副画面は判定前に `side_panel_cuts` → `strip_side_panel` で剥がす（3 条件つき。全幅の箱の右端では発火しない）。エッジで実バグ 2 件を発見して修正（パネルだけの行が下の選択肢ラベルへ結合 / 内側の余白を掴む）
@@ -54,3 +49,8 @@
 - 本番 `tako todo` へ **19 件**（post 2 = #1081 解説動画 v6 / #1284 X ショート・permission 4・review 12・confirm 1）。投稿 2 件は投稿文 / タイトル / タグを `copy_texts` に分け、動画とサムネを添付（`exists: true` を実測）。引き継ぎの「ユーザー確認待ち」18 項目のうち①は投稿 2 件へ畳んだ。登録は冪等（同じ title はスキップ）
 - リポは `guides/handoff.md` に 1 段落（**人待ちは引き継ぎファイルではなく `tako_todo` へ**）。番犬の要求どおり `guides_added_after_1154.md` へ同文を宣言（宣言を外すと 7 行を file:line で名指し FAILED）。`user-tasks` 手順書と `.agent/orchestrator.md:917` は既に同じことを書いているので変更不要
 - 実測で穴 2 件を発見して起票: **#1466**（worker 起票の返答が無関係な `default` master へ届く。B4 は role 明示で回避）/ **#1467**（MCP `tako_panel` の view enum に `tasks` が無い = 設計原則 5）
+
+## 2026-09-14（#1467: MCP カタログの enum を正本から生成するようにした）
+- `tako_panel` の `view` が手書きの写し（`["fleet","orch","git","tmux"]`）で #1450 B2 の `tasks` に追従していなかった。`PanelViewWire` へ `summary()` / `accepted_values()` / `values_summary()` を足し、catalog は `panel_view_schema()` で受理値も説明文も生成する。旧称 `tmux` は**落とさない**（enum から消すと今動いているクライアントが送れなくなる）
+- 棚卸し: catalog の `"enum"` は 102 か所 / 値集合 75 種。正本が実行時に読めるのは 10 種（20 site）だけで、うち「MCP の正本」を名乗っていた 5 つ（Panel / ProfileKind / SessionRestartMode / UiMode / RemoteOpenTarget）を生成へ寄せた。残り 52 種は正本なし（action 動詞）か正本が非公開・列挙 API なし = Issue にコメント
+- 番犬 `issue1467_mcp_enum_watchdog`（5 本・注入 8 通り + 実ファイル注入で `catalog.rs:695` を名指し）。スナップショット `mcp_tools_full_snapshot.json` は `tasks` の追加ぶんだけ差分。tools/list 実出力と隔離 GUI の MCP 呼び出しで実測。workspace 4875 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。**install 要**

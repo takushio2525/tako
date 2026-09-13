@@ -2,9 +2,32 @@
 
 use serde_json::{json, Value};
 
+use crate::protocol::PanelViewWire;
+
 /// ペイン ID 引数のスキーマ（省略時は呼び出し元）
 fn pane_schema(description: &str) -> Value {
     json!({ "type": "integer", "minimum": 0, "description": description })
+}
+
+/// 文字列 enum のスキーマを**正本の定数から**組み立てる（Issue #1467）。
+///
+/// カタログ側に値を直書きすると、正本へ値を足したときに MCP だけ追従せず
+/// 「CLI からは呼べるのに、スキーマを尊重するクライアントからは存在すら見えない」
+/// 申告になる（`tako_panel` の `tasks` が実際にそうなっていた）。
+/// 番犬は `crates/tako-control/tests/issue1467_mcp_enum_watchdog.rs`。
+fn enum_schema(values: &[&str], description: &str) -> Value {
+    json!({ "type": "string", "enum": values, "description": description })
+}
+
+/// 右パネルのビュー引数（正本 = [`PanelViewWire`]。受理値も案内文も生成する）
+fn panel_view_schema() -> Value {
+    enum_schema(
+        &PanelViewWire::accepted_values(),
+        &format!(
+            "表示するビュー（GUI のタブ名と同じ。{}）",
+            PanelViewWire::values_hint()
+        ),
+    )
 }
 
 /// 公開ツールカタログ（FR-2.5 と 1:1。CLI のサブコマンドと同じ操作セット）
@@ -656,18 +679,20 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_panel",
-            "description": "右サイドバー情報パネルの表示・非表示・幅・ビュー切替と、\
-                左サイドバーのファイルツリーの表示・非表示を操作する（全省略で現在状態の取得）。\
-                view の値は GUI のタブ表示名と同じ。view=fleet はタブごとの全ペイン一覧 + \
-                管理外 / kill 漏れ tmux セッションの統合ビュー、view=orch はオーケストレーター俯瞰、\
-                view=git は git。ユーザーにセッションやエージェントの状況を見せたいとき表示し、\
-                邪魔なら隠す。",
+            "description": format!(
+                "右サイドバー情報パネルの表示・非表示・幅・ビュー切替と、\
+                 左サイドバーのファイルツリーの表示・非表示を操作する（全省略で現在状態の取得）。\
+                 view の値は GUI のタブ表示名と同じ（{}）。{}。\
+                 ユーザーにセッションやエージェントの状況を見せたいとき表示し、邪魔なら隠す。",
+                PanelViewWire::VALUES.join(" / "),
+                PanelViewWire::values_summary()
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "visible": { "type": "boolean", "description": "true = 表示、false = 非表示" },
                     "width": { "type": "number", "exclusiveMinimum": 0, "description": "パネル幅（px）" },
-                    "view": { "type": "string", "enum": ["fleet", "orch", "git", "tmux"], "description": "表示するビュー（GUI のタブ名と同じ。fleet = ペイン / セッション俯瞰、orch = オーケストレーター俯瞰、git = git。tmux は fleet の旧称で後方互換のみ）" },
+                    "view": panel_view_schema(),
                     "filetree": { "type": "boolean", "description": "左サイドバーのファイルツリーの表示・非表示" },
                     "sidebar_width": { "type": "number", "exclusiveMinimum": 0, "description": "左サイドバーの幅（px。GUI のドラッグと同じ規則で下限 120 / 上限はウィンドウ幅の 50% にクランプされる。応答の sidebar_width が実際に適用された幅、sidebar_width_max がその時点の上限。Issue #307 / #789）" },
                     "show_hidden": { "type": "boolean", "description": "ファイルツリーでドット始まり（.git / .env 等）の項目を表示するか。既定 false = 非表示（Issue #550）" },
@@ -1482,11 +1507,10 @@ pub fn tools() -> Vec<Value> {
                         "description": "操作種別（省略時は list）",
                     },
                     "name": { "type": "string", "description": "プロファイル名（set / create / copy / delete 時に必須。show 省略時は default）" },
-                    "kind": {
-                        "type": "string",
-                        "enum": ["master", "solo"],
-                        "description": "プロファイル種別（master = tako master の profiles/ 既定 / solo = tako solo の solo-profiles/）",
-                    },
+                    "kind": enum_schema(
+                        crate::orchestrator::ProfileKind::VALUES,
+                        "プロファイル種別（master = tako master の profiles/ 既定 / solo = tako solo の solo-profiles/）",
+                    ),
                     "from": { "type": "string", "description": "複製元プロファイル名（copy 時に必須）" },
                     "projects": {
                         "type": "array", "items": { "type": "string" },
@@ -2532,11 +2556,10 @@ pub fn tools() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "pane": pane_schema("対象ペイン（**省略すると呼び出し元 = 自分のペイン**。他人を建て直すときは必ず指定する）"),
-                    "mode": {
-                        "type": "string",
-                        "enum": ["harness", "handoff"],
-                        "description": "harness = 会話を保ったまま CLI プロセスを建て直す / handoff = 引き継ぎを書かせてセッション交代（master のみ）。省略すると下見だけを返す",
-                    },
+                    "mode": enum_schema(
+                        &tako_core::session_restart::SessionRestartMode::VALUES,
+                        "harness = 会話を保ったまま CLI プロセスを建て直す / handoff = 引き継ぎを書かせてセッション交代（master のみ）。省略すると下見だけを返す",
+                    ),
                 },
                 "additionalProperties": false,
             },
@@ -2902,11 +2925,10 @@ pub fn tools() -> Vec<Value> {
                         "enum": ["status", "set", "toggle", "release", "restore"],
                         "description": "操作種別（省略時は status）",
                     },
-                    "mode": {
-                        "type": "string",
-                        "enum": ["terminal", "gui"],
-                        "description": "表示モード（set 時に必須）",
-                    },
+                    "mode": enum_schema(
+                        &tako_core::ui_mode::UiMode::VALUES,
+                        "表示モード（set 時に必須）",
+                    ),
                     "pane": {
                         "type": "integer",
                         "description": "release / restore の対象ペイン ID（省略時は呼び出し元ペイン）",
@@ -3395,12 +3417,11 @@ pub fn tools() -> Vec<Value> {
                         "type": "string",
                         "description": "接続後に cd するリモートのパス（省略時はログイン時の cwd）",
                     },
-                    "target": {
-                        "type": "string",
-                        "enum": ["split", "tab", "pane"],
-                        "description": "開き先（#1006。省略時 split = いまのタブへ新ペイン / \
-                            tab = 新しいタブ / pane = 既存ペインをそのまま SSH 化）",
-                    },
+                    "target": enum_schema(
+                        &tako_core::remote_open::RemoteOpenTarget::VALUES,
+                        "開き先（#1006。省略時 split = いまのタブへ新ペイン / \
+                         tab = 新しいタブ / pane = 既存ペインをそのまま SSH 化）",
+                    ),
                     "pane": {
                         "type": "integer",
                         "description": "対象ペイン ID（target=pane は SSH 化するペイン / \

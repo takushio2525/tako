@@ -2209,6 +2209,34 @@ GPUI の `cmd` は platform 修飾で、Windows では **Win キー**へ解決�
   実装の意図を書くコメントは対象外（画面に出ない診断文）。
   claude の TUI から採った fixture も同じ（tako の文言ではない）
 
+## MCP カタログの enum は正本から生成する（Issue #1467）
+
+`crates/tako-control/src/mcp/catalog.rs` の `"enum": [..]` は **MCP クライアントへの申告**で、
+実際に受け取れる値（dispatch の `parse`）とは別の実装になっている。ここへ値を直書きすると、
+**正本へ値を足した側は写しの存在を知らない**まま古くなる。壊れるのは動作ではなく申告なので、
+CLI でも dispatch でも単体テストでも緑のままになる。
+
+#1450 B2 が `PanelViewWire` へ `tasks` を足したときが実例。CLI の possible values は
+`VALUES` から組み立てるので `tako panel --view tasks` は通り、`parse` も通るので寛容な
+クライアントからは動いた。一方で `tako_panel` の `inputSchema` は
+`["fleet","orch","git","tmux"]` のままで、**enum を尊重するクライアントは `tasks` を送れず、
+enum を読んで選ぶエージェントはビューの存在自体を知れない**（設計原則 5 に反する）。
+
+- 値の一覧を持つ型（`VALUES` / `ALL` / `all()`）が在るなら、カタログは
+  **`enum_schema(正本, 説明)` で生成する**。`tako_panel` の `view` は
+  `panel_view_schema()`（受理値 = `VALUES` + `LEGACY_VALUES`、案内文 = `values_hint()`）
+- **説明文も正本に持たせる**。`PanelViewWire::summary()` は `match` なので、
+  変種を足すとコンパイルが通らない = 値だけ増えて説明が古い状態にならない
+- **旧称（後方互換だけで受理する値）は enum から落とさない**。落とすと、いま動いている
+  クライアントが送れなくなる。案内文では「旧称」と明記して勧めない（#553 と同じ扱い）
+- 正本が非公開・列挙 API が無いなどで生成へ寄せられない語彙は、番犬
+  `crates/tako-control/tests/issue1467_mcp_enum_watchdog.rs` の `registry()` へ
+  **`Bound`** として登録し、値が正本と一致することだけでも縛る。登録簿にある語彙と同じ
+  値集合を登録簿の外が手書きで持ったら落ちるので、**写しは増やせない**
+- カタログを変えたら `TAKO_UPDATE_MCP_SNAPSHOT=1 cargo test -p tako-control
+  --test mcp_catalog_snapshot` でスナップショットを更新し、**差分が意図どおりか**を diff で
+  確認する（公開契約の変更なので、通りすがりの更新をしない）
+
 ## 個人情報を現行コードへ書かない（Issue #927）
 
 tako は public リポなので、**実ユーザー名・実ホームパス・実ホスト名・実メールアドレス・

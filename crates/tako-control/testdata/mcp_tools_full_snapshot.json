@@ -814,7 +814,7 @@
     "name": "tako_auto_rename"
   },
   {
-    "description": "右サイドバー情報パネルの表示・非表示・幅・ビュー切替と、左サイドバーのファイルツリーの表示・非表示を操作する（全省略で現在状態の取得）。view の値は GUI のタブ表示名と同じ。view=fleet はタブごとの全ペイン一覧 + 管理外 / kill 漏れ tmux セッションの統合ビュー、view=orch はオーケストレーター俯瞰、view=git は git。ユーザーにセッションやエージェントの状況を見せたいとき表示し、邪魔なら隠す。",
+    "description": "右サイドバー情報パネルの表示・非表示・幅・ビュー切替と、左サイドバーのファイルツリーの表示・非表示を操作する（全省略で現在状態の取得）。view の値は GUI のタブ表示名と同じ（fleet / orch / git / tasks）。view=fleet はタブごとの全ペイン一覧 + 管理外 / kill 漏れ tmux セッションの統合ビュー、view=orch はオーケストレーター俯瞰（master + worker のツリー）、view=git は git（差分・ステージ・コミット・ブランチ）、view=tasks は人がやること（承認待ち・レビュー・投稿）の一覧と返答。ユーザーにセッションやエージェントの状況を見せたいとき表示し、邪魔なら隠す。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -832,11 +832,12 @@
           "type": "number"
         },
         "view": {
-          "description": "表示するビュー（GUI のタブ名と同じ。fleet = ペイン / セッション俯瞰、orch = オーケストレーター俯瞰、git = git。tmux は fleet の旧称で後方互換のみ）",
+          "description": "表示するビュー（GUI のタブ名と同じ。fleet | orch | git | tasks。tmux は fleet の旧称）",
           "enum": [
             "fleet",
             "orch",
             "git",
+            "tasks",
             "tmux"
           ],
           "type": "string"
