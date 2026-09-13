@@ -4655,10 +4655,18 @@ fn required_role(method: &tiny_http::Method, path: &str) -> DeviceRole {
     if path.starts_with("/api/devices") {
         return DeviceRole::Admin;
     }
-    // SSH 系（#1080）は読み書きとも Manage。一覧が GET なのに Observe でないのは、
-    // ①`~/.ssh/config` の Host 名・user・port は画面に映らない**別の在庫情報**で、
-    // 画面を見るだけの端末へ配る理由が無い ②一覧の用途は接続（= Manage）だけなので、
-    // 押せない端末に見せても操作できない選択肢が並ぶだけ
+    // #1449: リモートから**新しいタブ / ペインを立てる**経路は宣言表が正。
+    // role・監査イベント・PWA の呼び口を `remote_launch` の 1 か所で持ち、
+    // 番犬が「PWA が呼ぶ API がすべて表に在るか」をソース走査で照合する
+    // （#1405 の懸念 = 未知の経路が Observe へこぼれる、を構造で塞ぐ）。
+    // #1078 のタブ / master 起動も #1080 の SSH もここに集約した
+    if let Some(role) = crate::remote_launch::role_for(method.as_str(), path) {
+        return role;
+    }
+    // 表に無い形の SSH 系（#1080）も読み書きとも Manage。一覧が GET なのに
+    // Observe でないのは、①`~/.ssh/config` の Host 名・user・port は画面に映らない
+    // **別の在庫情報**で、画面を見るだけの端末へ配る理由が無い ②一覧の用途は
+    // 接続（= Manage）だけなので、押せない端末に見せても操作できない選択肢が並ぶだけ
     if path == "/api/ssh-hosts" || path == "/api/ssh" || path.ends_with("/ssh") {
         return DeviceRole::Manage;
     }
@@ -4667,12 +4675,6 @@ fn required_role(method: &tiny_http::Method, path: &str) -> DeviceRole {
             return DeviceRole::Interact;
         }
         if path.ends_with("/close") || path.ends_with("/resize") {
-            return DeviceRole::Manage;
-        }
-        // #1078: タブとプロセスを作る = close / resize より強い操作なので Manage。
-        // 未知の POST も安全側で Manage に落ちるが、**意図であることを明示**しておく
-        // （後から Interact へ緩めるときに、うっかりではなく判断として行われるように）
-        if path == "/api/tabs" || (path.starts_with("/api/tabs/") && path.ends_with("/master")) {
             return DeviceRole::Manage;
         }
         // #1084 / #1085: ファイル API の書き込み（保存 / 送り直し）は `/api/upload` と

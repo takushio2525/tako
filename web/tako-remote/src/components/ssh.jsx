@@ -62,20 +62,18 @@ export function SshConnectBar({ state }) {
 }
 
 /**
- * ホストを選んで接続するシート。
+ * `~/.ssh/config` の Host 一覧（読み込み・空・失敗も含めた 1 実装）。
  *
- * `canSsh` = `/api/v2/panes` の `can_ssh`（`{ ok, reason, note }`）。
- * ok が false なら「このペイン」は**選択肢に出さない**（#1080 受け入れ条件 ③）。
- * ただし理由は 1 行だけ添える: 出さないだけだと、スマホには右クリックのような
- * 別の入口が無いので「なぜ出来ないのか」を確かめる手段が消える
+ * **一覧は PC 側の答えをそのまま出す**（`GET /api/ssh-hosts` → `Request::SshHosts`）。
+ * ここで `~/.ssh/config` を解釈し直すと、PC の右クリックメニュー（#1006）と
+ * スマホで並びや別名が食い違う。
+ *
+ * `error` は呼び出し側の失敗（接続を始められなかった理由）。一覧の取得失敗と
+ * **同じ場所に出す**: スマホには他の入口が無いので、理由の置き場を増やさない
  */
-export function SshSheet({ client, paneId, canSsh, onClose, onOpened }) {
+export function SshHostList({ client, onPick, busyHost, error }) {
   const [hosts, setHosts] = useState(null);
-  const [error, setError] = useState(null);
-  const paneAllowed = !!(canSsh && canSsh.ok);
-  const targets = TARGETS.filter(t => t.id !== 'pane' || paneAllowed);
-  const [target, setTarget] = useState(paneAllowed ? 'pane' : 'split');
-  const [busy, setBusy] = useState(null);
+  const [loadError, setLoadError] = useState(null);
 
   useEffect(() => {
     let alive = true;
@@ -85,12 +83,61 @@ export function SshSheet({ client, paneId, canSsh, onClose, onOpened }) {
         if (alive) setHosts(r.hosts || []);
       })
       .catch(e => {
-        if (alive) setError(e.message);
+        if (alive) setLoadError(e.message);
       });
     return () => {
       alive = false;
     };
   }, [client]);
+
+  const shown = error || loadError;
+  return (
+    <>
+      {shown && <div class="ssh-sheet-error" data-testid="ssh-sheet-error">{shown}</div>}
+      {hosts === null && !loadError && (
+        <div class="ssh-sheet-empty"><div class="spinner" /></div>
+      )}
+      {hosts !== null && hosts.length === 0 && (
+        <div class="ssh-sheet-empty" data-testid="ssh-hosts-empty">
+          ~/.ssh/config に Host がありません
+        </div>
+      )}
+      {hosts !== null && hosts.length > 0 && (
+        <div class="sheet-model-list ssh-host-list">
+          {hosts.map(h => (
+            <div
+              key={h.name}
+              class="sheet-model-item"
+              data-testid={`ssh-host-${h.name}`}
+              onClick={() => onPick(h)}
+            >
+              <div class="sheet-model-info">
+                <span class="sheet-model-name">{h.name}</span>
+                <span class="sheet-model-desc">{hostLine(h)}</span>
+              </div>
+              {busyHost === h.name && <span class="ssh-bar-spinner" style="margin-left:auto" />}
+            </div>
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
+/**
+ * ホストを選んで接続するシート。
+ *
+ * `canSsh` = `/api/v2/panes` の `can_ssh`（`{ ok, reason, note }`）。
+ * ok が false なら「このペイン」は**選択肢に出さない**（#1080 受け入れ条件 ③）。
+ * ただし理由は 1 行だけ添える: 出さないだけだと、スマホには右クリックのような
+ * 別の入口が無いので「なぜ出来ないのか」を確かめる手段が消える
+ */
+export function SshSheet({ client, paneId, canSsh, onClose, onOpened }) {
+  const [error, setError] = useState(null);
+  const paneAllowed = !!(canSsh && canSsh.ok);
+  const targets = TARGETS.filter(t => t.id !== 'pane' || paneAllowed);
+  const [target, setTarget] = useState(paneAllowed ? 'pane' : 'split');
+  const [busy, setBusy] = useState(null);
 
   async function connect(host) {
     if (busy) return;
@@ -136,33 +183,7 @@ export function SshSheet({ client, paneId, canSsh, onClose, onOpened }) {
         )}
 
         <div class="sheet-section-label" style="margin-top:16px">SSH HOST</div>
-        {error && <div class="ssh-sheet-error" data-testid="ssh-sheet-error">{error}</div>}
-        {hosts === null && !error && (
-          <div class="ssh-sheet-empty"><div class="spinner" /></div>
-        )}
-        {hosts !== null && hosts.length === 0 && (
-          <div class="ssh-sheet-empty" data-testid="ssh-hosts-empty">
-            ~/.ssh/config に Host がありません
-          </div>
-        )}
-        {hosts !== null && hosts.length > 0 && (
-          <div class="sheet-model-list ssh-host-list">
-            {hosts.map(h => (
-              <div
-                key={h.name}
-                class="sheet-model-item"
-                data-testid={`ssh-host-${h.name}`}
-                onClick={() => connect(h)}
-              >
-                <div class="sheet-model-info">
-                  <span class="sheet-model-name">{h.name}</span>
-                  <span class="sheet-model-desc">{hostLine(h)}</span>
-                </div>
-                {busy === h.name && <span class="ssh-bar-spinner" style="margin-left:auto" />}
-              </div>
-            ))}
-          </div>
-        )}
+        <SshHostList client={client} onPick={connect} busyHost={busy} error={error} />
         <div class="sheet-footer-note">
           接続に失敗してもペインは残ります（理由がその場に出ます）
         </div>

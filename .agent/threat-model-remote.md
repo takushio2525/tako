@@ -143,11 +143,26 @@ v0.6.0〜v0.8.1 は UDS（socket 0600 + 親ディレクトリ 0700）のみで�
 - 監査ログにファイル名を含めない（バイト数のみ。ペイン内容と同基準。#287 P2-2）
 - シンボリックリンクの follow を拒否（リンク先への意図しない書き込み防止。#287 P2-4）
 
-### タブ作成 / master 起動 API（#1078）
+### タブ作成 / master 起動 API（#1078） / 「+」の 3 択（#1449）
 
 スマホから**新しいタブとエージェントプロセスを作れる**ようになったので、
 `POST /api/tabs` と `POST /api/tabs/:id/master` は close / resize と同じ **Manage role** を要求する
 （observe / interact は 403。判定は `required_role` の 1 か所で、未知の POST も安全側 Manage へ落ちる）。
+
+#1449 で「+」が 3 択（master / ターミナル / SSH ターミナル）になったが、
+**通る経路は 1 本も増えていない**（ターミナル = `POST /api/tabs` だけ / SSH = #1080 の
+`POST /api/ssh`）。role も **3 種とも Manage 据え置き**にした:
+
+- 「新規起動は Interact 以上」へ緩める案は採らない。**既にペアリング済みの Interact 端末の
+  権限が、UI の都合で黙って広がる**（利用者は role を見直す機会を持たない）。
+  「新しいタブとプロセスを作れる」は実質シェルアクセスで、close / resize より弱くはない
+- 代わりに **observe には選択肢を出さない**（押してから 403 で断られる画面を作らない）。
+  出すのは理由だけで、入口そのものは隠さない（隠すと「機能が無い」と誤解させる）
+- 経路の宣言は `tako_control::remote_launch::LAUNCH_ROUTES` の 1 表が正本。
+  `required_role` がこの表を最初に引き、番犬
+  （`crates/tako-control/tests/issue1449_launch_routes_watchdog.rs`）が
+  「PWA が呼ぶ API がすべて表に在るか」をソース走査で照合する。
+  **表に無い呼び口が生えたら CI が落ちる** = 未知の経路が Observe へこぼれない（#1405）
 
 - 起動できるのは **PC 側に既に在る master プロファイル**だけ（プロファイル名以外の
   起動パラメータを HTTP から受けない）。コマンド・モデル・system prompt・env は

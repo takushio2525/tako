@@ -1,5 +1,8 @@
 // スマホから「新しいタブ + master 起動」（#1078 / エピック #1059 柱 1-D）
 //
+// #1449 でシートの外枠は `launch-sheet.jsx`（「+」の 3 択）へ移った。
+// ここに残るのは **master の経路だけ**（プロファイル選択 → 起動 → 繋がるまで待つ）。
+//
 // 1 操作で ①タブを作り ②そのタブで master を起動し ③公式の Remote Control へ
 // 繋がるまで待って ④Claude アプリへ送り出す。
 //
@@ -26,8 +29,12 @@ import { ClaudeOpenLink, RemoteLinkReason } from './remote-link';
 const POLL_MS = 2000;
 const MAX_WAIT_MS = 90000;
 
-/// master を立てられる role か（daemon の `required_role` = Manage と対）
-export function canLaunchMaster(me) {
+/// 新しいタブとプロセスを立てられる role か（daemon の `required_role` = Manage と対）。
+///
+/// **3 種（master / ターミナル / SSH）で同じ判定**にしてある（#1449）。
+/// 経路表では `POST /api/tabs`（#1078）も `/api/ssh*`（#1080）も Manage なので、
+/// どれか 1 つだけ出しても押した先で 403 になるだけ
+export function canLaunch(me) {
   return me?.role === 'manage' || me?.role === 'admin';
 }
 
@@ -159,8 +166,8 @@ function WaitPanel({ result, onClose, onOpenPane }) {
   );
 }
 
-/// master ランチャー本体（一覧画面から開くボトムシート）
-export function MasterLauncher({ me, onClose, onLaunched }) {
+/// master の起動パネル（シートの中身。外枠は `LaunchSheet` が持つ）
+export function MasterPanel({ onClose, onLaunched }) {
   const [profiles, setProfiles] = useState(null);
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -194,47 +201,35 @@ export function MasterLauncher({ me, onClose, onLaunched }) {
     }
   }
 
-  const allowed = canLaunchMaster(me);
-
+  if (result) {
+    return (
+      <WaitPanel
+        result={result}
+        onClose={onClose}
+        onOpenPane={() => { window.location.hash = `#/panes/${result.pane}`; }}
+      />
+    );
+  }
+  if (error) return <p class="error-text">{error}</p>;
+  if (profiles === null) {
+    return <div class="launch-waiting"><div class="spinner" /><span>プロファイルを読み込み中…</span></div>;
+  }
+  if (profiles.length === 0) {
+    return (
+      <p class="launch-note">master プロファイルがありません。Mac 側で `tako setup` を実行してください。</p>
+    );
+  }
   return (
-    <div class="sheet-backdrop" onClick={onClose}>
-      <div class="sheet" onClick={e => e.stopPropagation()}>
-        <div class="sheet-head">
-          <span class="sheet-title">master を起動</span>
-          <button class="sheet-close" onClick={onClose} aria-label="閉じる">×</button>
-        </div>
-
-        {result ? (
-          <WaitPanel
-            result={result}
-            onClose={onClose}
-            onOpenPane={() => { window.location.hash = `#/panes/${result.pane}`; }}
-          />
-        ) : !allowed ? (
-          <p class="launch-note">
-            この端末の権限（{me?.role || '不明'}）では新しいタブとプロセスを作れません。
-            Mac 側で Manage 以上に昇格させてください。
-          </p>
-        ) : error ? (
-          <p class="error-text">{error}</p>
-        ) : profiles === null ? (
-          <div class="launch-waiting"><div class="spinner" /><span>プロファイルを読み込み中…</span></div>
-        ) : profiles.length === 0 ? (
-          <p class="launch-note">master プロファイルがありません。Mac 側で `tako setup` を実行してください。</p>
-        ) : (
-          <>
-            <p class="launch-note">
-              新しいタブを作って master を起動します。Remote Control が ON のプロファイルなら、
-              起動後に Claude アプリから指示できます。
-            </p>
-            <div class="launch-profile-list">
-              {profiles.map(p => (
-                <ProfileRow key={p.name} profile={p} onPick={pick} disabled={busy} />
-              ))}
-            </div>
-          </>
-        )}
+    <>
+      <p class="launch-note">
+        新しいタブを作って master を起動します。Remote Control が ON のプロファイルなら、
+        起動後に Claude アプリから指示できます。
+      </p>
+      <div class="launch-profile-list">
+        {profiles.map(p => (
+          <ProfileRow key={p.name} profile={p} onPick={pick} disabled={busy} />
+        ))}
       </div>
-    </div>
+    </>
   );
 }

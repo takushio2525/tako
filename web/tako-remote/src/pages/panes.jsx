@@ -12,7 +12,7 @@ import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
 import { createClient } from '../api';
 import { AgentIcon } from '../components/agent-icon';
 import { RemoteLinkRow, AccountChip } from '../components/remote-link';
-import { MasterLauncher } from '../components/master-launcher';
+import { LaunchSheet, legacy1449 } from '../components/launch-sheet';
 
 const PREVIEW_LINES = 8;
 const PULL_THRESHOLD = 80;
@@ -261,7 +261,7 @@ export function PanesPage({ me }) {
   const [pulling, setPulling] = useState(false);
   const [pullY, setPullY] = useState(0);
   const [filter, setFilter] = useState('all');
-  // #1078: master ランチャー（新しいタブ + master 起動）のボトムシート
+  // #1078 → #1449: 「+」のボトムシート（master / ターミナル / SSH の 3 択）
   const [launcher, setLauncher] = useState(false);
   const timerRef = useRef(null);
   const touchStartRef = useRef({ y: 0, scrollTop: 0 });
@@ -353,15 +353,16 @@ export function PanesPage({ me }) {
             <span class="chip-name">{(me && me.host) || 'tako'}</span>
           </div>
           <div class="panes-header-actions">
-            {/* #1078: スマホから master を立てる。role が足りない端末でも入口は出し、
-                シートを開いた時点で理由を出す（隠すと「機能が無い」と誤解させる） */}
+            {/* #1078 → #1449: スマホから新しいタブを立てる（master / ターミナル / SSH）。
+                role が足りない端末でも入口は出し、シートを開いた時点で理由を出す
+                （隠すと「機能が無い」と誤解させる） */}
             <button
               class="launch-btn"
-              aria-label="master を起動"
+              aria-label="新しく起動"
               onClick={() => setLauncher(true)}
             >
               <PlusIcon />
-              <span>master</span>
+              <span>{legacy1449() ? 'master' : '新規'}</span>
             </button>
             {/* #1079: ファイルビューへの導線 */}
             <button
@@ -456,7 +457,7 @@ export function PanesPage({ me }) {
       )}
 
       {launcher && (
-        <MasterLauncher
+        <LaunchSheet
           me={me}
           onClose={() => setLauncher(false)}
           onLaunched={() => refresh()}

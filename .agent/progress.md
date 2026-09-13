@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-12（#1404: ツリーのスキャン対象の重複と、消えたルート配下の読み続けを直した）
-- 組み立てを「`roots` の順 → `expanded` の未出（名前順）」の 1 実装へ（`Vec::dedup` は隣接しか落とさず `expanded` は `HashSet` = 順序が任意なので、全ルートが 2 回ずつ `read_dir` されていた）。外れたルートは `forget_under` で**配下ごと**忘れる（生きているルートの下は巻き込まない = 入れ子のルート）。事実と違う注釈も実態へ
-- 隔離 GUI（tako-vd）の項目 135 を「ユニーク化 + 展開ディレクトリの存在」へ書き換え: 新 = 完走 / `TAKO_1404_LEGACY=1` = `targets=5 uniq=3` で FAILED / 展開 0 件の注入 = `targets=2 uniq=2 extra=[]` で FAILED（旧 assert `targets.len() > git_roots.len()` は重複だけで常に真 = 検出力ゼロだった）
-- 単体 5 本（legacy で 4 本 FAILED・`rows` 不変の 1 本は両腕で緑）+ 番犬 3 本（注入 6 通りで file:line 名指し）。workspace 4579 passed 0 failed・clippy 両宇宙 0・check-windows error 0。**install 要**
-
 ## 2026-09-12（#1426: 裏タブの寸法合わせを毎フレームから key + 間引きへ寄せた）
 - `sync_offscreen_pane_sizes` は render から毎フレーム通るのに、当て直す中身（`offscreen_areas`）が既に「key + 2 秒」で回っていたので**材料が同じあいだは同じ答えを出し直していた**。当て直す側も同じ単位へ寄せ、キーは `OffscreenAreaKey`（1 実装 `offscreen_area_key` に集約）+ 既定セル寸法（#647 の再発防止）+ 表示中ペイン数 + ペイン単位ズームの指紋。間隔は `OFFSCREEN_REFRESH_INTERVAL` の 1 定数を両者が見る
 - 実測（隔離 GUI の grid-bench・22 ペイン / 表示 4・3000 フレーム）: 596〜776 ns/frame（`render` の 5.88〜6.28%・走査 82 比較 + 18 ペイン当て直し）→ **36〜38 ns/frame**（0.38〜0.41%・走査 0 / 当て直し 0）。同一バイナリの `TAKO_1426_LEGACY=1` は 645〜690 ns で旧挙動を再現。#932 の flicker ラウンドは `late_resize=false` で緑、既存 A/B（`TAKO_932_NO_OFFSCREEN_GEOMETRY=1`）では `late_resize=true` で落ちる = 検出力あり
@@ -59,3 +54,8 @@
 - `TAKO_DISPLAY` つきの隔離起動は保存フレームを無視して必ず中央 960x600 で開き、AX で動かすと本番 tako の窓に当たっていた。起動時 `TAKO_WINDOW_BOUNDS=x,y,w,h`（`w,h` だけなら中央）と `tako window move` / `resize`（MCP 1:1）を足し、解釈・検査は `tako_core::platform::window_bounds::resolve` の 1 実装へ。`window list` に `bounds` / `display` を載せて AX 無しで読めるようにした
 - 実測（tako-vd = 1512,0 の 2560x1440・CGWindowList）: 修正前は保存フレーム 200,100,1400,900 があっても `2312,420,960,600` / 新 `100,50,1400,900` → `1612,50,1400,900` / `TAKO_1442_LEGACY=1` は `2312,420,960,600`。はみ出し・最小未満・読めない形は既定へ落ちて persist.log に理由（CLI / MCP はエラー）。**罠**: `move` 直後の `resize` が render 待ちの古い位置を土台にして移動を打ち消す（セルフテスト項目 77b が実際に落ちた）ので、依頼した矩形はその場で `window_frames` へ記録する
 - 番犬 9 本（注入 10 通りで file:line 名指し）+ 単体 14 本・セルフテスト項目 77b（legacy 腕は FAILED）。workspace 4657 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。**install 要**
+
+## 2026-09-13（#1449: スマホの「+」を 3 択にして、ターミナル / SSH も新規に立てられるようにした）
+- 「+」を `LaunchSheet`（master / ターミナル / SSH）へ。**操作は 1 つも新設していない**（ターミナル = `POST /api/tabs` だけ / SSH = #1080 の `POST /api/ssh {target:"tab"}`）。role は 3 種とも **Manage 据え置き**（「interact 以上」案は既存 Interact 端末の権限が黙って広がるので不採用 = 脅威モデルへ明記）
+- 経路の宣言を `remote_launch::LAUNCH_ROUTES`（role / 監査 / PWA の呼び口）へ集約し `required_role` が引く形に。番犬 6 本 + e2e 11 本（61 passed）+ 実経路 `scripts/test-remote-launch-1449.sh` 38 PASS（**HOME ごと隔離**して実 `~/.ssh/config` を読まない = #927）。注入 7 通りすべて名指し FAILED
+- **既存テストの罠 2 つを直した**: #841 以降 `test-remote-master-launch.sh` が全 403 で落ちていた（`TAKO_REMOTE_TRUSTED_PEER_NAMES="curl"`）→ 34 PASS へ復旧 / tako ペインからの実行は `TAKO_SOCKET` 継承で **CLI が本番 GUI を触る**（実測でタブ + QR が本番へ出た）→ `unset` + 起動ガード。**install 不要 / daemon 再起動要**

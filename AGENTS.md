@@ -129,7 +129,7 @@ tako/
 | オーケストレーター アカウント管理（#504/#548） | `tako orchestrator accounts list/show/add/remove` |
 | worker spawn のレイアウト設定 | `tako orchestrator layout [--policy master-reserved|legacy] [--master-ratio 0.5] [--algorithm grid|spiral]` |
 | **PWA を単独でビルドする（新規 worktree で dist が無いとき。#1309）** | `scripts/build-pwa.sh` |
-| **PWA の e2e（Playwright 6 spec / 50 項目。#1357）** | `cd web/tako-remote && npm run e2e` |
+| **PWA の e2e（Playwright 7 spec / 61 項目。#1357 / #1449）** | `cd web/tako-remote && npm run e2e` |
 | build | `cargo build --workspace` |
 | lint（**3 つの feature 宇宙**を見る。#1383 / #1072） | `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo clippy -p tako-app --features visual-test --all-targets -- -D warnings && cargo clippy -p tako-core -p tako-control -p tako-cli --all-targets -- -D warnings` |
 | test | `cargo test --workspace` |
@@ -137,6 +137,7 @@ tako/
 | **CI が緑で揃ってから PR を merge する（#1333）** | `scripts/merge-pr.sh <PR>` |
 | リリース経路のモックテスト（#256 / #965） | `bash scripts/test-release-retry.sh` |
 | **スマホからの master 起動の実経路テスト（#1078）** | `bash scripts/test-remote-master-launch.sh` |
+| **スマホの「+」から立てる 3 種の実経路テスト（#1449）** | `bash scripts/test-remote-launch-1449.sh` |
 | リモート serve 自己検査のモックテスト（#1049） | `bash scripts/test-serve-watch.sh` |
 | ファイルツリーフォルダ操作 | `tako tree add <path>` |
 | **Finder の「このアプリケーションで開く」（#708 / #835）** | `tako open <file> --new-tab` |
