@@ -5459,6 +5459,8 @@ impl TakoApp {
         }
         let theme = self.theme.clone();
         let view = self.panel_view;
+        // #1450 B2: tasks タブのバッジ（未完了件数）。画面で数えず B1 の値をそのまま出す
+        let open_tasks = self.user_tasks.snapshot.open_count;
         // カンプ準拠のタブ（アイコン + ラベル、active は下線 inset）
         let tab_button =
             |label: &'static str, icon: &'static str, target: PanelView, active: bool| {
@@ -5564,6 +5566,34 @@ impl TakoApp {
                                 cx.notify();
                             })),
                         )
+                        .child(
+                            // #1450 B2: 人がやること。未完了件数のバッジ付き
+                            // （件数の正本は B1 の `list` が返す `open_count`）
+                            tab_button(
+                                "tasks",
+                                crate::file_icons::ui_icon::TASKS,
+                                PanelView::Tasks,
+                                view == PanelView::Tasks,
+                            )
+                            .when(open_tasks > 0, |d| {
+                                d.child(
+                                    div()
+                                        .flex_none()
+                                        .px(px(4.0))
+                                        .rounded(px(7.0))
+                                        .bg(rgba(theme.accent_muted))
+                                        .text_size(px(9.5))
+                                        .text_color(hsla(theme.foreground))
+                                        .child(gpui::SharedString::from(open_tasks.to_string())),
+                                )
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.panel_view = PanelView::Tasks;
+                                // 開いた瞬間に出す（2 秒ループを待たない）
+                                this.refresh_user_tasks();
+                                cx.notify();
+                            })),
+                        )
                         .child(div().flex_grow(1.0))
                         .child(
                             div()
@@ -5589,6 +5619,7 @@ impl TakoApp {
                     PanelView::Fleet => self.render_tmux_view(cx).into_any_element(),
                     PanelView::Orch => self.render_orch_view(cx).into_any_element(),
                     PanelView::Git => self.render_git_view(cx).into_any_element(),
+                    PanelView::Tasks => self.render_tasks_view(cx).into_any_element(),
                 })
                 .child(
                     // 左端のリサイズハンドル（ドラッグで幅調整）

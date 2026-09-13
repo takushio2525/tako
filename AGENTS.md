@@ -158,6 +158,7 @@ tako/
 | プレビュー画像キャッシュ | `tako preview-cache [max_mb]` |
 | 設定の自動マイグレーション（#916） | `tako migrate [status|run] [--schema <種別>]` |
 | **ユーザー向けタスク（人がやること。承認待ち・レビュー・投稿。#1450）** | `tako todo list` |
+| **人がやることを画面で見る・返答する（右パネル。#1450 B2）** | `tako panel --show --view tasks` |
 | 受け入れゲート（#244 / #935） | `tako task gate set <task_id> --command "cmd" [--pr-merged N] [--custom "desc"]` |
 | git ブランチ操作（#496） | `tako git checkout <branch>` |
 | コンフリクト解消エージェント（#496） | `tako git resolve [--agent claude|codex|agy] [--tab N]` |
@@ -187,7 +188,7 @@ tako/
 | **agent 能力マトリクス（#982）** | `tako agent-support [--agent claude|codex|agy|local] [--status supported|degraded|pending|unsupported] [--json]` |
 | Windows 対応状況ページの生成（#591） | `cargo build -p tako-cli && node scripts/gen-windows-support-docs.mjs` |
 | **Windows のウインドウを実測する（#1063）** | `pwsh -File scripts/windows/measure-window.ps1 -TakoPid <pid> [-Png out.png] [-Maximize] [-ClickX N -ClickY N]` |
-| 右パネルのビュー切替 | `tako panel --show --view <fleet|orch|git>` |
+| 右パネルのビュー切替 | `tako panel --show --view <fleet|orch|git|tasks>` |
 | Code Runner でファイル実行（#453） | `tako run <file> [--profile <name>]` |
 | 拡張子既定コマンド設定 | `tako run-default [ext] [command]` |
 | AI コマンド提案カード（#666/#703） | `tako show-command <コマンド>...` |

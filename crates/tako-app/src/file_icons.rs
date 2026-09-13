@@ -156,6 +156,7 @@ static EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
     ui_asset!("split"),
     ui_asset!("stop"),
     ui_asset!("sun"),
+    ui_asset!("tasks"),
     ui_asset!("trend"),
     ui_asset!("unshelve"),
     ui_asset!("warning"),
@@ -219,6 +220,8 @@ pub mod ui_icon {
     /// 起動 ⇔ 停止トグルの停止側（#615。PLAY と対になる ■）
     pub const STOP: &str = "icons/ui/stop.svg";
     pub const SUN: &str = "icons/ui/sun.svg";
+    /// 右パネル tasks タブ（#1450 B2。チェックリストのパス。絵文字は使わない）
+    pub const TASKS: &str = "icons/ui/tasks.svg";
     pub const TREND: &str = "icons/ui/trend.svg";
     pub const UNSHELVE: &str = "icons/ui/unshelve.svg";
     pub const WARNING: &str = "icons/ui/warning.svg";

@@ -425,6 +425,156 @@ pub fn git_resolve_agent_started(agent: &str, pane: u64) -> String {
     )
 }
 
+// --- ユーザー向けタスク（tasks ビュー。#1450 の分割 B2。キー: panel.tasks_*） ---
+
+/// 一覧が空（**未完了が 0 件**）のときの 1 行
+pub fn tasks_empty() -> &'static str {
+    tr!("人がやることはありません", "Nothing is waiting for you")
+}
+/// 絞り込みの結果だけが 0 件（未完了はある）ときの 1 行。
+/// 「タスクが無い」と「絞り込みで消えた」を言い分ける（押しても無言にしない）
+pub fn tasks_empty_filtered() -> &'static str {
+    tr!(
+        "この絞り込みに当てはまるものはありません",
+        "No tasks match this filter"
+    )
+}
+pub fn tasks_open_count(n: usize) -> String {
+    tr!(format!("{n} 件待ち"), format!("{n} waiting"))
+}
+pub fn tasks_filter_all() -> &'static str {
+    tr!("すべて", "All")
+}
+/// 完了・却下も一覧に出すトグル（既定は未完了のみ）
+pub fn tasks_show_done() -> &'static str {
+    tr!("完了も見る", "Show completed")
+}
+pub fn tasks_kind(kind: &str) -> String {
+    match kind {
+        "review" => tr!("レビュー", "Review"),
+        "confirm" => tr!("確認", "Confirm"),
+        "permission" => tr!("許可", "Permission"),
+        "post" => tr!("投稿", "Post"),
+        "other" => tr!("その他", "Other"),
+        other => other,
+    }
+    .to_string()
+}
+pub fn tasks_body_empty() -> &'static str {
+    tr!("（説明はありません）", "(no description)")
+}
+pub fn tasks_attachments() -> &'static str {
+    tr!("添付", "Attachments")
+}
+/// 起票時には在ったが**今は無い**添付（起票時に実在を問わない設計の裏返し）
+pub fn tasks_attachment_missing() -> &'static str {
+    tr!("見つかりません", "Missing")
+}
+pub fn tasks_open_preview() -> &'static str {
+    tr!("プレビューで開く", "Open preview")
+}
+pub fn tasks_copy_texts() -> &'static str {
+    tr!("コピー用のテキスト", "Text to copy")
+}
+pub fn tasks_copy_button() -> &'static str {
+    tr!("コピー", "Copy")
+}
+pub fn tasks_copied(label: &str) -> String {
+    if label.is_empty() {
+        tr!("コピーしました".to_string(), "Copied".to_string())
+    } else {
+        tr!(
+            format!("「{label}」をコピーしました"),
+            format!("Copied: {label}")
+        )
+    }
+}
+pub fn tasks_links() -> &'static str {
+    tr!("リンク", "Links")
+}
+pub fn tasks_due(due: &str) -> String {
+    tr!(format!("期限 {due}"), format!("Due {due}"))
+}
+pub fn tasks_respond_heading() -> &'static str {
+    tr!("返答", "Respond")
+}
+pub fn tasks_decision(decision: &str) -> String {
+    match decision {
+        "approve" => tr!("承認", "Approve"),
+        "reject" => tr!("却下", "Reject"),
+        "needs_change" => tr!("直してほしい", "Needs change"),
+        "answered" => tr!("回答", "Answered"),
+        other => other,
+    }
+    .to_string()
+}
+pub fn tasks_comment_placeholder() -> &'static str {
+    tr!("コメント（任意）", "Comment (optional)")
+}
+pub fn tasks_send() -> &'static str {
+    tr!("返す", "Send")
+}
+/// 判断を選ぶまで「返す」を押せない理由（誤爆防止をユーザーに言う）
+pub fn tasks_pick_decision() -> &'static str {
+    tr!("判断を選ぶと返せます", "Pick a decision to send")
+}
+pub fn tasks_comment_limit(max: usize) -> String {
+    tr!(
+        format!("コメントはここまでです（上限 {max} 文字）"),
+        format!("Comment is at its limit ({max} characters)")
+    )
+}
+pub fn tasks_thread() -> &'static str {
+    tr!("やりとり", "Thread")
+}
+pub fn tasks_done() -> &'static str {
+    tr!("完了", "Done")
+}
+pub fn tasks_dismiss() -> &'static str {
+    tr!("却下", "Dismiss")
+}
+/// 配送の状態。**`sent` を「届いた」と書かない**（B1 と同じ物差し。
+/// 分からないものを分かったことにしない）
+pub fn tasks_delivery(state: &str) -> String {
+    match state {
+        "sent" => tr!("送信済み（確認待ち）", "Sent (awaiting confirmation)"),
+        "launched" => tr!("master を起動しました", "Launched master"),
+        "delivered" => tr!("master に届きました", "Delivered to master"),
+        "failed" => tr!("届きませんでした", "Delivery failed"),
+        other => other,
+    }
+    .to_string()
+}
+pub fn tasks_delivery_label() -> &'static str {
+    tr!("配送", "Delivery")
+}
+/// やりとりの時刻（**相対**で出す）。絶対時刻はタイムゾーンの解釈が要るうえ、
+/// スレッドで知りたいのは「さっきか、ずっと前か」なので相対に倒す
+pub fn tasks_ago(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs < 60 {
+        return tr!("たった今".to_string(), "just now".to_string());
+    }
+    if secs < 3600 {
+        let n = secs / 60;
+        return tr!(format!("{n} 分前"), format!("{n} min ago"));
+    }
+    if secs < 86_400 {
+        let n = secs / 3600;
+        return tr!(format!("{n} 時間前"), format!("{n} h ago"));
+    }
+    let n = secs / 86_400;
+    tr!(format!("{n} 日前"), format!("{n} d ago"))
+}
+
+/// 一覧そのものが引けなかったとき（**画面を空にして黙らない**）
+pub fn tasks_load_failed(reason: &str) -> String {
+    tr!(
+        format!("タスクを読めませんでした: {reason}"),
+        format!("Could not load tasks: {reason}")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests_support;
@@ -512,6 +662,49 @@ mod tests {
                 git_conflict_resolve_agent().to_string(),
                 git_agent_pick().to_string(),
                 git_resolve_agent_started("claude", 7),
+                // #1450 B2: ユーザー向けタスク
+                tasks_empty().to_string(),
+                tasks_empty_filtered().to_string(),
+                tasks_open_count(3),
+                tasks_filter_all().to_string(),
+                tasks_show_done().to_string(),
+                tasks_kind("review"),
+                tasks_kind("confirm"),
+                tasks_kind("permission"),
+                tasks_kind("post"),
+                tasks_kind("other"),
+                tasks_body_empty().to_string(),
+                tasks_attachments().to_string(),
+                tasks_attachment_missing().to_string(),
+                tasks_open_preview().to_string(),
+                tasks_copy_texts().to_string(),
+                tasks_copy_button().to_string(),
+                tasks_copied("tags"),
+                tasks_copied(""),
+                tasks_links().to_string(),
+                tasks_due("2026-09-20"),
+                tasks_respond_heading().to_string(),
+                tasks_decision("approve"),
+                tasks_decision("reject"),
+                tasks_decision("needs_change"),
+                tasks_decision("answered"),
+                tasks_comment_placeholder().to_string(),
+                tasks_send().to_string(),
+                tasks_pick_decision().to_string(),
+                tasks_comment_limit(4000),
+                tasks_thread().to_string(),
+                tasks_done().to_string(),
+                tasks_dismiss().to_string(),
+                tasks_delivery("sent"),
+                tasks_delivery("launched"),
+                tasks_delivery("delivered"),
+                tasks_delivery("failed"),
+                tasks_delivery_label().to_string(),
+                tasks_ago(5),
+                tasks_ago(120),
+                tasks_ago(7200),
+                tasks_ago(200_000),
+                tasks_load_failed("no data dir"),
             ]
         });
     }

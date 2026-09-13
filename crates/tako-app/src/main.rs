@@ -55,7 +55,9 @@ mod ssh_folders;
 mod starter;
 mod status_bar;
 mod tab_bar;
+mod tasks_panel;
 mod terminal_grid;
+mod text_field;
 mod ui_text;
 mod update_checker;
 mod update_window;
@@ -404,6 +406,8 @@ enum PanelView {
     /// ワーカーツリー・メトリクスを俯瞰する）
     Orch,
     Git,
+    /// ユーザー向けタスク（#1450 の分割 B2。人がやることの一覧 + 詳細 + 返答）
+    Tasks,
 }
 
 /// プレビューヘッダから開くナビゲーションドロップダウン（Issue #232）。
@@ -1193,6 +1197,8 @@ enum AppTextInput {
     GitCommit,
     /// git タブの新規ブランチ名欄
     GitBranch,
+    /// tasks タブの返答コメント欄（#1450 B2）
+    TaskComment,
 }
 
 /// IME 変換中（未確定文字列 = marked text）の状態（FR-1.9）。
@@ -1978,6 +1984,8 @@ struct TakoApp {
     text_input_caret_bounds: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
     /// git コミットメッセージ入力欄にフォーカスがあるか（#472）
     git_commit_input_focused: bool,
+    /// 右パネル tasks ビューの画面状態（#1450 B2。**正本ではない** = 読んだ結果のキャッシュ）
+    user_tasks: crate::tasks_panel::TasksPanel,
     /// ブランチ操作の事前提示カード（#496。承諾するまで実行しない）
     git_branch_confirm: Option<GitBranchConfirm>,
     /// 新規ブランチ名の入力欄（#496。`Some` の間はキー入力をここへ吸う）
@@ -3912,6 +3920,7 @@ impl TakoApp {
             ime_preedit_font_size: std::cell::Cell::new(None),
             text_input_caret_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             git_commit_input_focused: false,
+            user_tasks: crate::tasks_panel::TasksPanel::default(),
             git_branch_confirm: None,
             git_branch_input: None,
             git_agent_menu_open: false,
@@ -5103,6 +5112,16 @@ impl TakoApp {
                     } else {
                         None
                     };
+                    // #1450 B2: ユーザー向けタスクの一覧。**新しいタイマーを作らない**。
+                    // 撃つかどうかの判断は `tick_user_tasks` が持つ（右パネルを閉じれば
+                    // この tick から空振りになる = 「止める処理」がどこにも無い）。
+                    // background へ逃がさないのは、B1 が配送（sent → delivered / failed）を
+                    // **`UserTask` の dispatch が走るたびに** host から畳み込んで確定させる
+                    // ため（host に触れない background では永久に `sent` のまま残る）
+                    {
+                        let _s = tako_control::diag::perf_span("periodic_prep:user_tasks");
+                        app.tick_user_tasks();
+                    }
                     let git_selected = app.git_selected_commit.clone();
                     // サイドバー表示中はブランチ + 変更サマリの軽量 git 取得（#217）
                     let sidebar_git_cwd = if app.filetree.visible {
@@ -8194,6 +8213,8 @@ impl TakoApp {
         self.git_commit_input_focused = false;
         // #496: 新規ブランチ名の入力もキーを奪うので同じ経路で落とす（#503 の不変条件）
         self.git_branch_input = None;
+        // #1450 B2: 返答コメント欄も同じ経路で落とす（IME の宛先を 1 つに保つ）
+        self.user_tasks.comment_focused = false;
         self.git_agent_menu_open = false;
         self.webview_dock_url_focused = false;
         if let Some(pane_id) = self.webview_address_bar_active.take() {
@@ -10226,6 +10247,8 @@ impl TakoApp {
             "panel-fleet",
             "panel-orch",
             "panel-git",
+            // #1450 B2: 人がやること（ユーザー向けタスク）
+            "panel-tasks",
             "split-right",
             "split-down",
             "pin-tab-title",
@@ -10319,6 +10342,7 @@ impl TakoApp {
                 "panel-fleet" => self.toggle_panel_view(PanelView::Fleet, cx),
                 "panel-orch" => self.toggle_panel_view(PanelView::Orch, cx),
                 "panel-git" => self.toggle_panel_view(PanelView::Git, cx),
+                "panel-tasks" => self.toggle_panel_view(PanelView::Tasks, cx),
                 "split-right" => self.split(SplitDirection::Right, cx),
                 "split-down" => self.split(SplitDirection::Down, cx),
                 // #552 案 4: いまのタブ名を固定する（ピン印と同じ操作）
@@ -13028,6 +13052,11 @@ impl TakoApp {
             self.git_commit_insert(&text, cx);
             return;
         }
+        // #1450 B2: 返答コメント欄（⌘V はここへ来る）
+        if self.user_tasks.comment_focused {
+            self.task_comment_insert(&text, cx);
+            return;
+        }
         let pane_id = self.focused_pane();
         if self
             .preview_edits
@@ -13095,6 +13124,10 @@ impl TakoApp {
             || (self.git_commit_input_focused
                 && self.panel_visible
                 && self.panel_view == PanelView::Git)
+            // #1450 B2: 返答コメント欄も全キーを消費する（⌘V はここから paste へ渡る）
+            || (self.user_tasks.comment_focused
+                && self.panel_visible
+                && self.panel_view == PanelView::Tasks)
     }
 
     fn handle_key(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) {
@@ -13149,6 +13182,14 @@ impl TakoApp {
             return;
         }
         if self.git_commit_input_focused && self.handle_git_commit_key(keystroke, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        // #1450 B2: 返答コメント欄。**見えないのにフラグが残る**経路を git と同じ形で塞ぐ
+        if !self.panel_visible || self.panel_view != PanelView::Tasks {
+            self.user_tasks.comment_focused = false;
+        }
+        if self.user_tasks.comment_focused && self.handle_task_comment_key(keystroke, cx) {
             cx.stop_propagation();
             return;
         }
@@ -13365,6 +13406,13 @@ impl TakoApp {
         {
             return Some(AppTextInput::GitCommit);
         }
+        // #1450 B2: 返答コメント欄も「見えているときだけ」（stale フラグで拾わない）
+        if self.user_tasks.comment_focused
+            && self.panel_visible
+            && self.panel_view == PanelView::Tasks
+        {
+            return Some(AppTextInput::TaskComment);
+        }
         None
     }
 
@@ -13377,6 +13425,7 @@ impl TakoApp {
         match target {
             AppTextInput::GitCommit => self.git_commit_insert(text, cx),
             AppTextInput::GitBranch => self.git_branch_input_insert(text, cx),
+            AppTextInput::TaskComment => self.task_comment_insert(text, cx),
         }
     }
 
@@ -20823,6 +20872,7 @@ impl UiStateHost for TakoApp {
             PanelView::Fleet => tako_control::protocol::PanelViewWire::Fleet,
             PanelView::Orch => tako_control::protocol::PanelViewWire::Orch,
             PanelView::Git => tako_control::protocol::PanelViewWire::Git,
+            PanelView::Tasks => tako_control::protocol::PanelViewWire::Tasks,
         };
         (self.panel_visible, self.panel_width, view)
     }
@@ -20844,6 +20894,7 @@ impl UiStateHost for TakoApp {
                 tako_control::protocol::PanelViewWire::Fleet => PanelView::Fleet,
                 tako_control::protocol::PanelViewWire::Orch => PanelView::Orch,
                 tako_control::protocol::PanelViewWire::Git => PanelView::Git,
+                tako_control::protocol::PanelViewWire::Tasks => PanelView::Tasks,
             };
         }
         // #503: パネルが非表示になったらテキスト入力フラグをクリア
@@ -22420,6 +22471,15 @@ impl EntityInputHandler for TakoApp {
             cx.notify();
             return;
         }
+        // #1450 B2: 返答コメント欄（同じ理由でここを通す）
+        if self.user_tasks.comment_focused {
+            if !text.is_empty() {
+                self.task_comment_insert(text, cx);
+            }
+            self.ime = None;
+            cx.notify();
+            return;
+        }
         let pane = self.ime_target();
         // 検索バー表示中は入力文字を検索/置換フィールドへ
         if self
@@ -23814,6 +23874,7 @@ impl Render for TakoApp {
                 cx.listener(|this, _: &MouseDownEvent, _, cx| {
                     // #503: テキスト入力フラグの一括クリア
                     let had = this.git_commit_input_focused
+                        || this.user_tasks.comment_focused
                         || this.git_branch_input.is_some()
                         || this.git_agent_menu_open
                         || this.webview_dock_url_focused
@@ -36897,13 +36958,19 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1450 B2: 右パネル tasks ビューの実ピクセル（画面収録権限に依らない）
+                "tasks-panel" => {
+                    tasks_panel_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
                          profiles / chat-table / conflict-card / terminal-grid / \
                          grid-bench / preview-leak / chat-leak / preview-code / \
                          remote-tree / flicker / ime-preedit / screen-lines / \
-                         pane-border）"
+                         pane-border / tasks-panel）"
                     );
                     std::process::exit(1);
                 }
@@ -36934,6 +37001,10 @@ mod self_test {
             // 変換していないフレームと変換中フレームの差分の外形を測るので、
             // 日本語入力ソースが無い機でも実描画で確かめられる
             ime_preedit_visual(any, window, cx).await;
+
+            // #1450 B2: 右パネル tasks ビュー。中身（markdown 本文・消えた添付・
+            // コピー用テキスト・リンク・やりとり・配送）が載った状態を実ピクセルで撮る
+            tasks_panel_visual(any, window, cx).await;
 
             // #589: ファイルツリーのインデントガイド線が連続しているか。
             // 4 階層のフィクスチャを開き、ダーク / ライト / スクロール後の 3 状態で
@@ -39249,6 +39320,202 @@ mod self_test {
             std::process::exit(0);
         })
         .detach();
+    }
+
+    /// #1450 B2: 右パネル tasks ビューの実ピクセル検証。
+    ///
+    /// `screencapture` は**画面収録権限**（TCC）と窓の前面化が要るので、検証機や CI では
+    /// 撮れない（撮れても全黒になる）。ここは Metal の最終 scene を直接読み戻す
+    /// [`capture_frame`] を使うので、**権限も前面化も要らずに実ピクセルが採れる**。
+    ///
+    /// 撮る場面は 3 つ:
+    ///   (1) 0 件（人がやることが無い）
+    ///   (2) 一覧 + 詳細（markdown 本文・消えた添付・コピー用テキスト・リンク）
+    ///   (3) 返答のあと（やりとりのスレッド + 配送の行）
+    ///
+    /// 検査は「画面が実際に変わったか」（フレームの指紋が 3 場面で全部違う）。
+    /// 同じ絵が撮れ続ける = 描画が止まっている（#470 の罠）を見逃さない。
+    /// PNG は `TAKO_VISUAL_DUMP_DIR` を渡したときだけ落とす
+    #[cfg(feature = "visual-test")]
+    async fn tasks_panel_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        use tako_control::protocol::{PanelViewWire, Request};
+        let wait =
+            |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+        let dump = std::env::var("TAKO_VISUAL_DUMP_DIR").ok();
+        let shot = |cx: &mut AsyncApp, name: &str| -> Option<u64> {
+            let (frame, _scale) = capture_frame(any, cx)?;
+            if let Some(dir) = dump.as_ref() {
+                let _ = std::fs::create_dir_all(dir);
+                let _ = frame.save(std::path::Path::new(dir).join(format!("tasks-{name}.png")));
+            }
+            Some(frame_fingerprint(&frame))
+        };
+
+        // 添付は「在るもの」と「消えたもの」の 2 件（起票時に実在を問わない設計の裏返し）
+        let live1450 =
+            std::env::temp_dir().join(format!("tako-visual-1450-{}.txt", std::process::id()));
+        let gone1450 = std::env::temp_dir().join(format!(
+            "tako-visual-1450-missing-{}.png",
+            std::process::id()
+        ));
+        let _ = std::fs::write(&live1450, "v6 の書き出し\n");
+        let _ = std::fs::remove_file(&gone1450);
+
+        // (1) 0 件
+        let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+            let _ = tako_control::dispatch(
+                app,
+                Request::Panel {
+                    visible: Some(true),
+                    width: Some(360.0),
+                    view: Some(PanelViewWire::Tasks),
+                    filetree: None,
+                    sidebar_width: None,
+                    show_hidden: None,
+                },
+                PaneOrigin::Cli,
+            );
+            app.tick_user_tasks();
+            cx.notify();
+        });
+        wait(cx, 250).await;
+        let empty1450 = shot(cx, "empty");
+
+        // (2) 一覧 + 詳細
+        let id1450 = window
+            .update(cx, |app: &mut TakoApp, _, cx| {
+                let mut add = |title: &str, kind: &str, body: &str, rich: bool| {
+                    tako_control::dispatch(
+                        app,
+                        Request::UserTask {
+                            action: "add".to_string(),
+                            id: None,
+                            title: Some(title.to_string()),
+                            body: Some(body.to_string()),
+                            kind: Some(kind.to_string()),
+                            status: None,
+                            all: None,
+                            project: Some("tako".to_string()),
+                            attachments: rich.then(|| {
+                                vec![
+                                    live1450.display().to_string(),
+                                    gone1450.display().to_string(),
+                                ]
+                            }),
+                            copy_texts: rich.then(|| {
+                                vec![
+                                    "投稿文=tako v0.8 を出しました".to_string(),
+                                    "タグ=#tako".to_string(),
+                                ]
+                            }),
+                            links: rich.then(|| vec!["https://example.com/tako".to_string()]),
+                            due: None,
+                            decision: None,
+                            comment: None,
+                            via: None,
+                            pane: None,
+                            caller_role: Some("orchestrator-master:visual1450".to_string()),
+                        },
+                        PaneOrigin::Cli,
+                    )
+                    .ok()
+                    .and_then(|v| v["id"].as_str().map(str::to_string))
+                };
+                let id = add(
+                    "解説動画 v6 を YouTube へ投稿",
+                    "post",
+                    "# 確認してほしいこと\n\n- サムネの文字が読めるか\n- 冒頭 10 秒で伝わるか\n",
+                    true,
+                );
+                let _ = add(
+                    "リモート権限の許可",
+                    "permission",
+                    "manage を許可してよいか",
+                    false,
+                );
+                let _ = add("PR #1459 のレビュー", "review", "", false);
+                app.tick_user_tasks();
+                app.user_tasks.selected = id.clone();
+                cx.notify();
+                id
+            })
+            .ok()
+            .flatten();
+        wait(cx, 250).await;
+        let listed1450 = shot(cx, "list");
+
+        // (3) 返答のあと（スレッド + 配送）。配送先は**存在しないプロファイル**なので
+        //     タブも master も立たない（`failed` + 理由が載った絵が撮れる）
+        if let Some(id) = id1450.as_ref() {
+            let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                app.user_tasks.decision = Some("needs_change".to_string());
+                app.task_comment_insert("サムネの文字を大きくしてほしい", cx);
+                app.user_task_respond(id, cx);
+                app.tick_user_tasks();
+                cx.notify();
+            });
+        }
+        wait(cx, 250).await;
+        let responded1450 = shot(cx, "responded");
+
+        let distinct1450 = {
+            let mut v: Vec<u64> = [empty1450, listed1450, responded1450]
+                .into_iter()
+                .flatten()
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v.len()
+        };
+        check(
+            distinct1450 == 3,
+            &format!(
+                "visual-test #1450 B2: 3 場面が別々の絵になる（描画が止まっていない）。\
+                 distinct={distinct1450} empty={empty1450:?} list={listed1450:?} \
+                 responded={responded1450:?}"
+            ),
+        );
+
+        // 後片付け（次の節へ持ち越さない）
+        let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+            for id in ["u-1", "u-2", "u-3"] {
+                let _ = tako_control::dispatch(
+                    app,
+                    Request::UserTask {
+                        action: "dismiss".to_string(),
+                        id: Some(id.to_string()),
+                        title: None,
+                        body: None,
+                        kind: None,
+                        status: None,
+                        all: None,
+                        project: None,
+                        attachments: None,
+                        copy_texts: None,
+                        links: None,
+                        due: None,
+                        decision: None,
+                        comment: None,
+                        via: None,
+                        pane: None,
+                        caller_role: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+            }
+            app.panel_visible = false;
+            app.panel_view = PanelView::Fleet;
+            app.user_tasks.selected = None;
+            app.user_tasks.reset_form();
+            app.tick_user_tasks();
+            cx.notify();
+        });
+        let _ = std::fs::remove_file(&live1450);
+        println!("TAKO_VISUAL_1450B2: distinct={distinct1450}");
     }
 
     /// コンフリクトカードの操作が**実マウスで**発火するか（#496）。
@@ -67958,6 +68225,316 @@ mod self_test {
                     "TAKO_SELF_TEST_1446: save={save_ok} restore={restore_ok} \
                      rebase={rebase_ok} read={read_ok} adopt={adopt_ok} regain={regain_ok} \
                      notice={notice_ok} legacy={legacy1446}"
+                );
+                notify_and_draw(any, window, cx);
+            }
+
+            // 150. 右パネルの tasks ビュー（#1450 の分割 B2）。
+            //
+            // 守るのは **B1 の口だけを通って画面が成り立っていること**:
+            //   (a) `tako panel --view tasks` と同じ dispatch でビューが切り替わる
+            //   (b) 起票が一覧に載り、未完了件数（バッジの正本 = `open_count`）が増える
+            //   (c) 消えた添付が `exists=false` として読める（起票時に実在を問わない設計の裏返し）
+            //   (d) コピーは**押した 1 件だけ**がクリップボードへ入る
+            //   (e) 返答が `responses` に積まれ、配送の顛末（ここでは `failed` + 理由）が読める
+            //   (f) 完了すると一覧から消え、`tako todo list` の結果と一致する
+            //   (g) **ポーリングが止まる**（右パネルを閉じているあいだは撃たない）
+            //
+            // 配送先は**わざと存在しないプロファイル**にしてある（`st1450b2`）。
+            // 生きた master が無いと B1 は `master_launch::plan` へ進むので、
+            // 実在するプロファイルだとここでタブを立てて `tako master` を起動してしまう。
+            // 存在しない名前なら `plan` が Err で返り、タブを作らずに
+            // 「配送できないときは理由つきで残る」（#1450 の受け入れ条件）を測れる
+            {
+                use tako_control::protocol::{PanelViewWire, Request};
+                let role150 = "orchestrator-master:st1450b2";
+                let gone150 = std::env::temp_dir()
+                    .join(format!("tako-st1450b2-missing-{}.png", std::process::id()));
+                let _ = std::fs::remove_file(&gone150);
+                let task150 = |app: &mut TakoApp, title: &str, attach: Option<String>| {
+                    tako_control::dispatch(
+                        app,
+                        Request::UserTask {
+                            action: "add".to_string(),
+                            id: None,
+                            title: Some(title.to_string()),
+                            // 長い markdown 本文（見出し・箇条書き・コード）でも描ける
+                            body: Some(
+                                "# 見出し\n\n- 1 つ目\n- 2 つ目\n\n```sh\ntako todo list\n```\n"
+                                    .to_string(),
+                            ),
+                            kind: Some("review".to_string()),
+                            status: None,
+                            all: None,
+                            project: Some("st1450b2".to_string()),
+                            attachments: attach.map(|p| vec![p]),
+                            copy_texts: Some(vec![
+                                "投稿文=本番へ貼る文面".to_string(),
+                                "タグ=#tako".to_string(),
+                            ]),
+                            links: Some(vec!["https://example.com/st1450b2".to_string()]),
+                            due: None,
+                            decision: None,
+                            comment: None,
+                            via: None,
+                            pane: None,
+                            caller_role: Some(role150.to_string()),
+                        },
+                        PaneOrigin::Cli,
+                    )
+                    .ok()
+                    .and_then(|v| v["id"].as_str().map(str::to_string))
+                };
+
+                // (a) ビュー切替は CLI / MCP と同じ dispatch を通る
+                let view150 = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        let r = tako_control::dispatch(
+                            app,
+                            Request::Panel {
+                                visible: Some(true),
+                                width: None,
+                                view: Some(PanelViewWire::Tasks),
+                                filetree: None,
+                                sidebar_width: None,
+                                show_hidden: None,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                        cx.notify();
+                        (r.is_ok(), app.panel_state().2, app.panel_visible)
+                    })
+                    .unwrap_or((false, PanelViewWire::Fleet, false));
+                check(
+                    view150.0 && view150.1 == PanelViewWire::Tasks && view150.2,
+                    &format!("150: tako panel --view tasks で tasks ビューが出る (#1450 B2。{view150:?})"),
+                );
+
+                // (b)(c) 起票 → ポーリングが一覧へ載せる。未完了件数も増える
+                let (id150, listed150, count150, missing150, body150) = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        let before = app.user_tasks.snapshot.open_count;
+                        let id = task150(app, "st1450b2 のレビュー", Some(gone150.display().to_string()));
+                        app.tick_user_tasks();
+                        let row = id.as_ref().and_then(|id| {
+                            app.user_tasks.snapshot.tasks.iter().find(|t| &t.id == id).cloned()
+                        });
+                        (
+                            id,
+                            row.is_some(),
+                            app.user_tasks.snapshot.open_count > before,
+                            row.as_ref().is_some_and(|t| {
+                                t.attachments.len() == 1 && !t.attachments[0].exists
+                            }),
+                            row.as_ref().is_some_and(|t| t.body.contains("```sh")),
+                        )
+                    })
+                    .unwrap_or((None, false, false, false, false));
+                check(
+                    listed150 && count150,
+                    &format!("150: 起票が一覧に載り未完了件数が増える (#1450 B2。{id150:?} listed={listed150} count={count150})"),
+                );
+                check(
+                    missing150 && body150,
+                    &format!("150: 消えた添付と長い markdown 本文が読める (#1450 B2。missing={missing150} body={body150})"),
+                );
+                let Some(id150) = id150 else {
+                    fail("150: 起票の id を採れない (#1450 B2)");
+                };
+
+                // (d) コピーは押した 1 件だけ（2 件目を押したら 2 件目が入る）
+                let copied150 = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        app.user_tasks.selected = Some(id150.clone());
+                        let first = app.user_task_copy(0, cx);
+                        let a = cx.read_from_clipboard().and_then(|c| c.text());
+                        let second = app.user_task_copy(1, cx);
+                        let b = cx.read_from_clipboard().and_then(|c| c.text());
+                        // 範囲外は黙って成功と言わない
+                        let out_of_range = app.user_task_copy(9, cx);
+                        (first && second && !out_of_range, a, b)
+                    })
+                    .unwrap_or((false, None, None));
+                let copy_ok150 = copied150.0
+                    && copied150.1.as_deref() == Some("本番へ貼る文面")
+                    && copied150.2.as_deref() == Some("#tako");
+                check(
+                    copy_ok150,
+                    &format!("150: コピーは押した 1 件だけが入る (#1450 B2。{copied150:?})"),
+                );
+                // **中身が載った状態で実描画を 1 枚通す**。スクリーンショットが撮れない
+                // 環境（Screen Recording 権限が無い機・CI）でも、markdown 本文 +
+                // 消えた添付 + コピー用テキスト + リンクを載せた詳細の描画経路が
+                // 走ったことはここで押さえられる（描けなければ panic して落ちる）
+                notify_and_draw(any, window, cx);
+
+                // (e) 返答 → responses に積まれ、配送の顛末が読める
+                let responded150 = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        app.user_tasks.selected = Some(id150.clone());
+                        app.user_tasks.decision = Some("needs_change".to_string());
+                        app.task_comment_insert("サムネの字を大きく", cx);
+                        app.user_task_respond(&id150, cx);
+                        app.tick_user_tasks();
+                        app.user_tasks
+                            .snapshot
+                            .tasks
+                            .iter()
+                            .find(|t| t.id == id150)
+                            .map(|t| {
+                                (
+                                    t.responses.len(),
+                                    t.responses.first().map(|r| (r.decision.clone(), r.via.clone(), r.comment.clone())),
+                                    t.delivery.as_ref().map(|d| (d.state.clone(), d.reason.clone())),
+                                )
+                            })
+                    })
+                    .unwrap_or(None);
+                let respond_ok150 = responded150.as_ref().is_some_and(|(n, r, d)| {
+                    *n == 1
+                        && r.as_ref().is_some_and(|(dec, via, c)| {
+                            dec == "needs_change" && via == "pc" && c.contains("サムネ")
+                        })
+                        // 配送先が居ないので `failed` + 理由（無言にならない）
+                        && d.as_ref().is_some_and(|(state, reason)| {
+                            state == "failed" && reason.as_ref().is_some_and(|r| !r.is_empty())
+                        })
+                });
+                check(
+                    respond_ok150,
+                    &format!("150: 返答が積まれ配送の顛末が読める (#1450 B2。{responded150:?})"),
+                );
+                // 返した直後はフォームが空に戻る（次のタスクへ前の判断を持ち越さない）
+                let form150 = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        (
+                            app.user_tasks.decision.clone(),
+                            app.user_tasks.comment.text().to_string(),
+                        )
+                    })
+                    .unwrap_or((Some("x".into()), "x".into()));
+                check(
+                    form150.0.is_none() && form150.1.is_empty(),
+                    &format!("150: 返したら返答フォームが空に戻る (#1450 B2。{form150:?})"),
+                );
+                // やりとり（スレッド）と配送の行が載った状態でもう 1 枚描く
+                notify_and_draw(any, window, cx);
+
+                // エッジ: やりとりが 10 件を超えても積み上がり、描画も通る
+                let long150 = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        for i in 0..11 {
+                            app.user_tasks.selected = Some(id150.clone());
+                            app.user_tasks.decision = Some("answered".to_string());
+                            app.task_comment_insert(&format!("{i} 件目の返答"), cx);
+                            app.user_task_respond(&id150, cx);
+                        }
+                        app.user_tasks.selected = Some(id150.clone());
+                        app.tick_user_tasks();
+                        app.user_tasks
+                            .snapshot
+                            .tasks
+                            .iter()
+                            .find(|t| t.id == id150)
+                            .map(|t| t.responses.len())
+                    })
+                    .unwrap_or(None);
+                check(
+                    long150 == Some(12),
+                    &format!("150: やりとりが 10 件を超えても積み上がる (#1450 B2。{long150:?})"),
+                );
+                // 長いスレッドを載せたまま実描画（詰まる / 落ちるならここで出る）
+                notify_and_draw(any, window, cx);
+
+                // (g) ポーリングが止まる: 右パネルを閉じているあいだは一覧が動かない
+                let (stopped150, resumed150) = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.panel_visible = false;
+                        let before = app.user_tasks.snapshot.tasks.len();
+                        let id2 = task150(app, "閉じている間に増えたぶん", None);
+                        app.tick_user_tasks();
+                        let stopped = app.user_tasks.snapshot.tasks.len() == before;
+                        app.panel_visible = true;
+                        app.tick_user_tasks();
+                        let resumed = id2.as_ref().is_some_and(|id| {
+                            app.user_tasks.snapshot.tasks.iter().any(|t| &t.id == id)
+                        });
+                        (stopped, resumed)
+                    })
+                    .unwrap_or((false, false));
+                check(
+                    stopped150 && resumed150,
+                    &format!("150: 右パネルを閉じている間はポーリングが止まる (#1450 B2。stopped={stopped150} resumed={resumed150})"),
+                );
+
+                // (f) 完了すると一覧から消え、`tako todo list` と一致する
+                let done150 = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        app.user_task_set_status(&id150, "done", cx);
+                        let gone_from_panel = !app
+                            .user_tasks
+                            .snapshot
+                            .tasks
+                            .iter()
+                            .any(|t| t.id == id150);
+                        // CLI / MCP が見るものと同じか（同じ dispatch を素で叩く）
+                        let cli = tako_control::dispatch(
+                            app,
+                            Request::UserTask {
+                                action: "list".to_string(),
+                                id: None,
+                                title: None,
+                                body: None,
+                                kind: None,
+                                status: None,
+                                all: None,
+                                project: None,
+                                attachments: None,
+                                copy_texts: None,
+                                links: None,
+                                due: None,
+                                decision: None,
+                                comment: None,
+                                via: None,
+                                pane: None,
+                                caller_role: None,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok();
+                        let gone_from_cli = cli.as_ref().is_some_and(|v| {
+                            !v["tasks"]
+                                .as_array()
+                                .unwrap_or(&Vec::new())
+                                .iter()
+                                .any(|t| t["id"].as_str() == Some(id150.as_str()))
+                        });
+                        let same_count = cli
+                            .as_ref()
+                            .and_then(|v| v["open_count"].as_u64())
+                            .map(|n| n as usize)
+                            == Some(app.user_tasks.snapshot.open_count);
+                        cx.notify();
+                        (gone_from_panel, gone_from_cli, same_count)
+                    })
+                    .unwrap_or((false, false, false));
+                check(
+                    done150.0 && done150.1 && done150.2,
+                    &format!("150: 完了で一覧から消え tako todo list と一致する (#1450 B2。{done150:?})"),
+                );
+
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                    app.panel_visible = false;
+                    app.panel_view = PanelView::Fleet;
+                    app.user_tasks.selected = None;
+                    app.user_tasks.reset_form();
+                    cx.notify();
+                });
+                println!(
+                    "TAKO_SELF_TEST_1450B2: view={} listed={listed150} count={count150} \
+                     missing={missing150} body={body150} copy={copy_ok150} \
+                     respond={respond_ok150} thread={long150:?} stop={stopped150} done={}",
+                    view150.0, done150.0
                 );
                 notify_and_draw(any, window, cx);
             }
