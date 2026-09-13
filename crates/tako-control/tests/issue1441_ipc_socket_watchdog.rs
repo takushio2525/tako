@@ -40,39 +40,14 @@ fn read(root: &Path, rel: &str) -> String {
     std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel} を読めない: {e}"))
 }
 
-/// 本番コードだけの眺め（テスト領域は空白へ潰す。行番号は保たれる = #1420）
+/// 本番コードだけの眺め（テスト領域は空白へ潰す。行番号は保たれる = #1420 / #1445）。
+///
+/// `discovery.rs` / `ipc.rs` のテストモジュールは `#[cfg(all(test, unix))]` なので、
+/// 初版はここで長さを保ったまま `#[cfg(test)]` へ正規化していた。**#1445 で
+/// 共有部品が cfg 述語を読むようになった**ので、自前の写しは持たない
 fn production(root: &Path, rel: &str) -> (String, String) {
     let src = read(root, rel);
-    (
-        production_range::scan(&normalize_test_attrs(&src)).text,
-        src,
-    )
-}
-
-/// `#[cfg(all(test, unix))]` の形も #1420 の 1 実装へ食わせられるようにする。
-///
-/// `common/production_range.rs` が探すのは**リテラルの `#[cfg(test)]` だけ**なので、
-/// `#[cfg(all(test, unix))]` が付いたテストモジュール（`discovery.rs` がそれ）は
-/// 潰されず、番犬の走査に**テストコードが混ざる**。ここでは**長さを保ったまま**
-/// `#[cfg(test)]` へ揃える（行番号もバイト長も動かないので `file:line` はそのまま）。
-/// 共有部品側を触るのは他の番犬の走査範囲を動かすので、寄せるのは別 Issue にする
-fn normalize_test_attrs(src: &str) -> String {
-    const NEEDLE: &str = "#[cfg(all(test";
-    const CANON: &str = "#[cfg(test)]";
-    let mut out = String::with_capacity(src.len());
-    let mut rest = src;
-    while let Some(at) = rest.find(NEEDLE) {
-        let Some(end) = rest[at..].find(")]").map(|i| at + i + 2) else {
-            break;
-        };
-        out.push_str(&rest[..at]);
-        out.push_str(CANON);
-        out.push_str(&" ".repeat(end - at - CANON.len()));
-        rest = &rest[end..];
-    }
-    out.push_str(rest);
-    debug_assert_eq!(out.len(), src.len(), "長さが変わると file:line がずれる");
-    out
+    (production_range::scan(&src).text, src)
 }
 
 /// `needle` を含む行を `file:line` で名指す
