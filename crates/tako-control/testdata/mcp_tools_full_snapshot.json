@@ -1894,6 +1894,28 @@
     "name": "tako_orchestrator_projects"
   },
   {
+    "description": "走っている master を、そのプロジェクト専用プロファイルへ**その場で**寄せる（セッションは立て直さない = 会話・コンテキストはそのまま）。Task Intake の Step 0 で対象プロジェクトを解決したら呼ぶ。name にはプロファイル名か、まだプロファイルの無い projects.yaml のキーを渡す（後者はその場で profiles/<key>.yaml を default から継承して作る）。切り替わるのは tako 側の状態: ペインの role ラベル・tako_orchestrator_self の profile / handoff_path / project_handoffs・worker spawn の既定・引き継ぎ（tako_orchestrator_handoff と自動ハンドオフ）の宛先。以後の引き継ぎは successor_command のコマンドで後任を立てる。汎用プロファイル（projects 未指定。default / codex）で立った master だけが呼べる。専用プロファイルで立っている master や、master の系統（master_agent）が食い違う相手は拒否して直し方を返す（会話の途中で system prompt は差し替えられないため）。同じプロファイルへの 2 回目は changed=false（冪等）。default を渡すと汎用へ戻る。",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "description": "採用するプロファイル名、またはプロジェクトキー（必須）",
+          "type": "string"
+        },
+        "pane": {
+          "description": "対象の master ペイン ID（省略時は呼び出し元）",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "tako_orchestrator_adopt"
+  },
+  {
     "description": "オーケストレーターのプロファイル（tako master / tako solo の起動設定）を管理する。action=list で一覧、show で単一表示、set で作成・更新、create で新規作成、copy で複製（from に複製元）、delete で削除（default は削除不可）。kind=master（既定。tako master が読む profiles/）と kind=solo（tako solo が読む solo-profiles/）を切り替える。スキーマは両者共通。list / show / set は参照整合性の警告（未登録 project / 未登録アカウント / [1m] モデル）を warnings フィールドで返す。プロファイルは profiles/<name>.yaml に保存され、master のエージェント種別・モデル・effort と子 worker のモデル決定に使われる。model が null / 未指定のプロファイルはその CLI の既定モデルで起動する（プラン非依存・推奨）。1M コンテキスト版（[1m] サフィックス）は Max / API プラン限定のため、set で明示指定した場合のみ使われる（Pro プランでは起動不能になる点に注意）。master のエージェント種別は master_agent（claude / codex。agy は master 非対応）で指定し、model / effort はその CLI のネイティブ表記で書く（codex 例: model=gpt-5.6-sol / effort=xhigh）。master_agent が claude 以外のときmaster の model / effort は claude worker へ継承されない。worker のエージェント種別（claude / codex / agy）は worker_agent（既定種別）とagent_* 系（worker_agents.<agent> のエージェント別 worker 設定: モデル・effort・許可スキップ・追加引数）で指定する。自動ハンドオフ（#749）は ctx_threshold（50〜60%）と auto_handoff で調整する。応答の resolved_ctx_threshold / ctx_threshold_source / resolved_auto_handoff が実効値（プロファイル → config.yaml → 既定 60 の解決結果）。",
     "inputSchema": {
       "additionalProperties": false,
@@ -2164,8 +2186,13 @@
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "pane": {
+          "description": "プロファイル解決に使うペイン ID（省略時は呼び出し元。#1453 の adopt 後はこのペインの採用先で解決される）",
+          "minimum": 0,
+          "type": "integer"
+        },
         "profile": {
-          "description": "プレースホルダを解決するプロファイル（省略時は呼び出し元の role から解決）",
+          "description": "プレースホルダを解決するプロファイル（省略時は呼び出し元の role とペインの役割ラベルから解決）",
           "type": "string"
         },
         "topic": {

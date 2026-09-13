@@ -99,6 +99,14 @@ pub(crate) fn test_config_dir_override() -> &'static std::sync::OnceLock<PathBuf
     &OVERRIDE
 }
 
+/// 隔離先の `projects.yaml` / `profiles/` を触るテストの直列化ロック（#120 / #1453）。
+///
+/// `config_dir` は**プロセス共有**なので、複数のテストが同時に read-modify-write すると
+/// バックアップの繰り下げが競合して落ちる（#1453 の作業中に実際に踏んだ）。
+/// **dispatch 側のテストと同じ 1 つ**を使う（別々に持つとお互いを直列化できない）
+#[cfg(test)]
+pub(crate) static TEST_PROJECT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// テストの隔離先（プロセスごとに 1 つ）。[`config_dir`] が必ずここへ倒す
 #[cfg(test)]
 fn test_config_dir() -> PathBuf {
@@ -2461,7 +2469,9 @@ impl ProfileKind {
         }
     }
 
-    fn path(&self, name: &str) -> Result<PathBuf, String> {
+    /// このプロファイル種別の `<name>.yaml`（名前の検証つき）。
+    /// #1453 の自動生成も同じ解決を通すので公開する
+    pub fn path(&self, name: &str) -> Result<PathBuf, String> {
         validate_profile_name(name)?;
         self.dir()
             .map(|d| d.join(format!("{name}.yaml")))
@@ -2616,6 +2626,279 @@ pub fn delete_profile_at(path: &Path) -> Result<(), Option<String>> {
     // 削除も他プロセスの RMW と直列化する（#169 の config_io と同じロックを使う）
     let _lock = crate::config_io::lock_exclusive(path).map_err(Some)?;
     std::fs::remove_file(path).map_err(|e| Some(format!("プロファイルの削除に失敗: {e}")))
+}
+
+// --- プロジェクト専用プロファイルの自動生成と採用（Issue #1453）--------------
+//
+// 「素の `tako master` で始めた会話が、対象プロジェクトを解決した時点でそのプロジェクト
+// 専用 master と同じ振る舞いになる」を、**セッションを立て直さずに**実現する部分。
+//
+// # なぜ role ラベル 1 つで足りるのか
+//
+// master のプロファイルは [`tako_core::handoff::resolve_master_profile`]（#854）が
+// **呼び出し元の env とペインの role ラベルの両方**から決めており、しかも
+// **非既定の pane_role を既定の caller_role より優先する**。素の master の env は
+// `TAKO_ORCHESTRATOR_ROLE=master`（= default）なので、ペインの role ラベルを
+// `orchestrator-master:<key>` へ書き換えるだけで
+//
+// - `self` の `profile` / `handoff_path` / `project_handoffs` / `ctx_threshold`
+// - worker spawn の既定（`resolve_caller_profile_with_role` → `find_master_suffix_from`）
+// - `handoff` の後任（`tako master -<key>` と同一経路）と引き継ぎファイルの宛先
+// - 自動ハンドオフ #749 の nudge 対象
+//
+// が**すべて既存の 1 実装のまま**追従する。role ラベルは `layout.json` に保存される
+// （`PaneLayout.role`）ので、GUI を再起動しても採用は生き残る = 新しい永続構造は要らない。
+//
+// # A/B（`TAKO_1453_LEGACY=1`）
+//
+// 立てると同一バイナリのまま「プロジェクト追加で profile を作らない / 一括生成しない /
+// adopt が role ラベルを書き換えない」旧挙動へ戻る。逃げ道はこの 1 つだけ。
+
+/// #1453 の A/B。`TAKO_1453_LEGACY=1` で自動生成と採用を丸ごと無効化する
+pub fn legacy_auto_profile() -> bool {
+    std::env::var_os("TAKO_1453_LEGACY").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// プロジェクト専用プロファイルの自動生成の結果
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileGen {
+    /// 新しく作った
+    Created(PathBuf),
+    /// 既にあったので**触っていない**（冪等の正常系）
+    Exists(PathBuf),
+    /// 作らなかった（理由つき。プロジェクト追加そのものは失敗させない）
+    Skipped { reason: String },
+}
+
+impl ProfileGen {
+    pub fn created(&self) -> bool {
+        matches!(self, Self::Created(_))
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Self::Created(p) | Self::Exists(p) => Some(p),
+            Self::Skipped { .. } => None,
+        }
+    }
+
+    /// 機械可読な状態名（CLI / MCP の応答で使う）
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Created(_) => "created",
+            Self::Exists(_) => "exists",
+            Self::Skipped { .. } => "skipped",
+        }
+    }
+}
+
+/// 自動生成の**継承元**（`profiles/default.yaml`。読めなければ組み込み既定）。
+///
+/// default から継ぐのは、ユーザーが default へ書いた個人ルール（`prompt_blocks` の
+/// prepend / append）・アカウント・モデル・worker 既定をそのまま持ち込むため。
+/// これが「素の master と同じ振る舞いのまま、管轄だけが決まる」の中身になる
+pub fn project_profile_base() -> Profile {
+    load_profile_of(ProfileKind::Master, tako_core::handoff::DEFAULT_PROFILE).unwrap_or_default()
+}
+
+/// projects.yaml に登録されている cwd（生値。`~` は展開しない）
+fn project_entry_cwd(key: &str) -> Option<String> {
+    ProjectsConfig::load()
+        .ok()?
+        .projects
+        .get(key)
+        .map(|e| e.cwd.clone())
+}
+
+/// プロジェクトキーに対応する master プロファイルを用意する（**冪等・既存は触らない**）。
+///
+/// 上書きするのは 2 項目だけ:
+/// - `projects: [<key>]` — このプロファイルの管轄
+/// - `cwd` — projects.yaml のそのプロジェクトの cwd。default の cwd（汎用の置き場）を
+///   そのまま継ぐと「別プロジェクト専用の master が無関係なフォルダで立つ」になり、
+///   後任を同じ環境で立てるという #1055 の約束と逆になる
+///
+/// 残りは [`project_profile_base`] の値をそのまま使う。
+/// 生成できない理由（プロファイル名に使えないキー・書き込み失敗）は
+/// `Skipped` に載せて返し、**呼び出し元の操作そのものは失敗させない**
+pub fn ensure_project_profile(key: &str) -> ProfileGen {
+    if legacy_auto_profile() {
+        return ProfileGen::Skipped {
+            reason: "TAKO_1453_LEGACY=1 のため自動生成しない".into(),
+        };
+    }
+    if let Err(e) = validate_profile_name(key) {
+        return ProfileGen::Skipped {
+            reason: format!("プロジェクトキーをプロファイル名にできない: {e}"),
+        };
+    }
+    let path = match ProfileKind::Master.path(key) {
+        Ok(p) => p,
+        Err(e) => return ProfileGen::Skipped { reason: e },
+    };
+    if path.is_file() {
+        return ProfileGen::Exists(path);
+    }
+    if let Err(e) = ProfileKind::Master.ensure_defaults() {
+        return ProfileGen::Skipped { reason: e };
+    }
+    let mut profile = project_profile_base();
+    profile.projects = Some(vec![key.to_string()]);
+    if let Some(cwd) = project_entry_cwd(key) {
+        profile.cwd = Some(cwd);
+    }
+    match create_profile_at(&path, &profile) {
+        Ok(()) => ProfileGen::Created(path),
+        // 並行生成で先を越された = 望みの状態になっている（冪等）
+        Err(CreateError::Exists) => ProfileGen::Exists(path),
+        Err(CreateError::Failed(reason)) => ProfileGen::Skipped { reason },
+    }
+}
+
+/// projects.yaml の全キーぶんを揃える（`tako setup` / 起動時の差分検出から呼ぶ）。
+/// 既にあるものには触らないので、何度走っても同じ結果になる
+pub fn ensure_project_profiles() -> Vec<(String, ProfileGen)> {
+    if legacy_auto_profile() {
+        return Vec::new();
+    }
+    let Ok(config) = ProjectsConfig::load() else {
+        return Vec::new();
+    };
+    config
+        .projects
+        .keys()
+        .map(|key| (key.clone(), ensure_project_profile(key)))
+        .collect()
+}
+
+/// 採用（adopt）の判定結果。**拒否の理由をここ 1 箇所に閉じる**
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdoptDecision {
+    /// 採用してよい（`warnings` は採用を妨げないが黙らせないもの）
+    Adopt { warnings: Vec<String> },
+    /// 既に同じプロファイル（冪等。role ラベルは貼り直す）
+    Unchanged,
+    /// 採用できない（理由 + 直し方）
+    Refused { reason: String },
+}
+
+/// このプロファイルが**汎用の入口**か（管轄プロジェクトを持たない）。
+///
+/// `default` 決め打ちにしないのは、`codex` も「`projects` 未指定の汎用の入口」として
+/// 同じ役割を負っているから（2026-09-10 の運用メモ）。名前ではなく中身で判定する
+pub fn is_generic_profile(profile: &Profile) -> bool {
+    profile.projects.as_ref().is_none_or(|p| p.is_empty())
+}
+
+/// prompt の**利用者が書いた部分**の指紋（#1453）。
+/// 管轄（`projects`）は落とす —— 採用で必ず変わる部分なので、比較に入れると
+/// 「毎回違う」としか言えなくなる
+fn prompt_fingerprint(profile: &Profile, name: &str) -> String {
+    let mut neutral = profile.clone();
+    neutral.projects = None;
+    neutral.build_system_prompt(name)
+}
+
+/// 走っている master の素性（#1453 の判定材料）。
+///
+/// **「今どのプロファイルか」と「どのプロファイルで起動したか」は別物**で、
+/// 採用したあとの master は前者だけが動く。会話の途中で変えられないもの
+/// （system prompt・master の系統）は**起動時のプロファイル**の性質なので、
+/// 拒否の判断はそちらを見る
+#[derive(Debug, Clone, Copy)]
+pub struct RunningMaster<'a> {
+    /// 今のプロファイル名（ペインの role ラベル由来を含む = 採用後の値）
+    pub current_name: &'a str,
+    /// 起動時に指定されたプロファイル名（`TAKO_ORCHESTRATOR_ROLE` 由来）。
+    /// 素の `tako master` なら `default`
+    pub launched_as: &'a str,
+    /// 起動時のプロファイルの中身
+    pub launched: &'a Profile,
+}
+
+/// 採用してよいかを決める（**純関数**。ファイルも GUI も触らない）。
+///
+/// 拒否は 2 つだけで、どちらも**起動時のプロファイル**を見る:
+///
+/// 1. **専用プロファイルで起動した master**（`tako master -<名前>`）— その master の
+///    system prompt は既にそのプロファイルのもの（`prompt_blocks` / 個人ルール）で、
+///    会話の途中で差し替えられない。tako 側だけ動かすと prompt と状態が食い違うので、
+///    移るなら `handoff` で立て直す。
+///    **採用で専用になった master はここに当たらない**（起動は汎用のまま）ので、
+///    対象を取り違えたら採用し直せるし、`adopt default` で汎用へも戻せる
+/// 2. **master の系統（`master_agent`）が食い違う** — 採用だけ通すと、後任が
+///    `handoff` で**別系統として立ち上がる**（codex master の後任が claude になる）。
+///    黙って系統を入れ替えないため拒否し、揃える 1 コマンドを返す
+pub fn decide_adopt(
+    running: RunningMaster<'_>,
+    target_name: &str,
+    target: &Profile,
+) -> AdoptDecision {
+    let RunningMaster {
+        current_name,
+        launched_as,
+        launched,
+    } = running;
+    if current_name == target_name {
+        return AdoptDecision::Unchanged;
+    }
+    if !is_generic_profile(launched) {
+        return AdoptDecision::Refused {
+            reason: format!(
+                "この master は専用プロファイル '{launched_as}'（管轄: {}）で起動している。\n\
+                 会話の途中で system prompt は差し替えられないので、tako 側だけ \
+                 '{target_name}' へ移すと prompt と状態が食い違う。\n\
+                 移るには: tako orchestrator handoff（'{target_name}' で後任を立て直す）",
+                launched
+                    .projects
+                    .as_ref()
+                    .map(|p| p.join(", "))
+                    .unwrap_or_default()
+            ),
+        };
+    }
+    let launched_agent = launched.resolve_master_agent();
+    let target_agent = target.resolve_master_agent();
+    if let (Ok(cur), Ok(tgt)) = (launched_agent, target_agent) {
+        if cur != tgt {
+            return AdoptDecision::Refused {
+                reason: format!(
+                    "master の系統が食い違う（この master は {} / '{target_name}' は {}）。\n\
+                     採用だけ通すと引き継ぎの後任が {} で立ち上がる。\n\
+                     揃えるには: tako orchestrator profiles set {target_name} --master-agent {}",
+                    cur.as_str(),
+                    tgt.as_str(),
+                    tgt.as_str(),
+                    cur.as_str()
+                ),
+            };
+        }
+    }
+    let mut warnings = Vec::new();
+    if is_generic_profile(target) && target_name != tako_core::handoff::DEFAULT_PROFILE {
+        warnings.push(format!(
+            "'{target_name}' は管轄プロジェクトを持たない汎用プロファイル（projects 未指定）。\
+             引き継ぎの宛先は変わるが管轄は決まらない"
+        ));
+    }
+    // 会話の途中で system prompt は差し替えられない（#1453 の前提）。ユーザーが対象
+    // プロファイルの prompt を作り込んでいたときだけ鳴らす。
+    //
+    // 比べ方に 2 つ仕掛けがある。**同じ名前で組み立てる**のは、prompt にプロファイル名
+    // （identity ブロックの起動コマンド）が載るため。**`projects` を落として比べる**のは、
+    // 管轄つきプロファイルの prompt には「Assigned Projects（専用 master）」ブロックが
+    // 必ず増えるため —— これは採用そのものの結果なので、残すと毎回鳴って
+    // 「誰も読まない警告」になる。見たいのは `system_prompt` / `prompt_blocks` /
+    // 閾値・命名規約といった**利用者が書いた違い**だけ
+    if prompt_fingerprint(launched, launched_as) != prompt_fingerprint(target, launched_as) {
+        warnings.push(format!(
+            "'{target_name}' は起動時の '{launched_as}' と違う system prompt を持っている\
+             （個別の prompt_blocks / system_prompt）。走っている会話の prompt は\
+             差し替えられないので、prompt ごと '{target_name}' にしたいときは \
+             tako orchestrator handoff で立て直す"
+        ));
+    }
+    AdoptDecision::Adopt { warnings }
 }
 
 /// プロファイルの参照整合性を検査して警告を返す（GUI / CLI / MCP 共用の単一ソース）。
@@ -3194,6 +3477,289 @@ mod tests {
     const POSIX: crate::launch_cmd::ShellDialect = crate::launch_cmd::ShellDialect::Posix;
 
     use super::*;
+
+    // --- #1453: プロジェクト専用プロファイルの自動生成と採用 -----------------
+    //
+    // `config_dir` はテストビルドで必ず隔離先へ倒れる（`test_config_dir`）ので、
+    // ここから本番の profiles/ は触れない。キーは `_tako_1453_` 接頭辞で名前空間を切る
+
+    /// 生成の下ごしらえ。projects.yaml へ 1 件登録し、前回の残骸を消す
+    fn t1453_setup(key: &str, cwd: &str) -> std::sync::MutexGuard<'static, ()> {
+        // config_dir はプロセス共有。projects.yaml を書くので直列化する
+        let guard = TEST_PROJECT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ensure_defaults().expect("隔離先の初期化");
+        let _ = std::fs::remove_file(ProfileKind::Master.path(key).expect("パス"));
+        ProjectsConfig::mutate(|c| c.add(key.into(), cwd.into(), None)).expect("プロジェクト登録");
+        guard
+    }
+
+    #[test]
+    fn issue1453_自動生成はdefaultから継承しprojectsとcwdだけを差し替える() {
+        let key = "_tako_1453_gen_";
+        let _guard = t1453_setup(key, "/tmp/_tako_1453_repo_");
+        // default 側に「継承されるべき個人設定」を置く
+        mutate_profile_of(ProfileKind::Master, "default", |p| {
+            p.worker_effort = Some("high".into());
+            p.cwd = Some("/tmp/_tako_1453_generic_".into());
+            p.prompt_blocks = Some(PromptBlocks {
+                append: Some("個人ルール".into()),
+                ..Default::default()
+            });
+        })
+        .expect("default の準備");
+
+        let gen = ensure_project_profile(key);
+        assert!(gen.created(), "生成されていない: {gen:?}");
+
+        let made = load_profile_of(ProfileKind::Master, key).expect("生成物が読める");
+        assert_eq!(
+            made.projects.as_deref(),
+            Some(&["_tako_1453_gen_".to_string()][..]),
+            "管轄が自分のキーになっていない"
+        );
+        assert_eq!(
+            made.cwd.as_deref(),
+            Some("/tmp/_tako_1453_repo_"),
+            "cwd が projects.yaml の値になっていない（default の汎用 cwd を継いでいる）"
+        );
+        // 残りは default から継承する（= 素の master と同じ振る舞いのまま）
+        assert_eq!(made.worker_effort.as_deref(), Some("high"));
+        assert_eq!(
+            made.prompt_blocks.and_then(|b| b.append).as_deref(),
+            Some("個人ルール"),
+            "個人ルールが継承されていない"
+        );
+    }
+
+    #[test]
+    fn issue1453_自動生成は冪等で既存を書き換えない() {
+        let key = "_tako_1453_idem_";
+        let _guard = t1453_setup(key, "/tmp/_tako_1453_repo_");
+        assert!(ensure_project_profile(key).created());
+
+        // 利用者が後から中身を変えた状態を作る
+        mutate_profile_of(ProfileKind::Master, key, |p| {
+            p.worker_effort = Some("low".into());
+            p.cwd = Some("/tmp/_tako_1453_moved_".into());
+        })
+        .expect("利用者の編集");
+
+        let again = ensure_project_profile(key);
+        assert!(
+            matches!(again, ProfileGen::Exists(_)),
+            "2 回目が Created になっている（非冪等）: {again:?}"
+        );
+        let after = load_profile_of(ProfileKind::Master, key).expect("読める");
+        assert_eq!(
+            after.worker_effort.as_deref(),
+            Some("low"),
+            "既存プロファイルを上書きしている"
+        );
+        assert_eq!(after.cwd.as_deref(), Some("/tmp/_tako_1453_moved_"));
+    }
+
+    #[test]
+    fn issue1453_プロファイル名にできないキーは理由つきで作らない() {
+        let _guard = TEST_PROJECT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ensure_defaults().expect("隔離先の初期化");
+        let gen = ensure_project_profile("a/b");
+        match gen {
+            ProfileGen::Skipped { reason } => assert!(
+                reason.contains("プロファイル名"),
+                "理由が説明になっていない: {reason}"
+            ),
+            other => panic!("不正なキーで生成した: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn issue1453_legacyは生成しない() {
+        let key = "_tako_1453_legacy_";
+        let _guard = t1453_setup(key, "/tmp/_tako_1453_repo_");
+        let restore = std::env::var("TAKO_1453_LEGACY").ok();
+        std::env::set_var("TAKO_1453_LEGACY", "1");
+        let gen = ensure_project_profile(key);
+        let bulk = ensure_project_profiles();
+        match restore {
+            Some(v) => std::env::set_var("TAKO_1453_LEGACY", v),
+            None => std::env::remove_var("TAKO_1453_LEGACY"),
+        }
+        assert!(
+            matches!(gen, ProfileGen::Skipped { .. }),
+            "legacy で生成した: {gen:?}"
+        );
+        assert!(bulk.is_empty(), "legacy で一括生成が走った: {bulk:?}");
+        assert!(
+            !ProfileKind::Master.path(key).expect("パス").is_file(),
+            "legacy なのにファイルができている"
+        );
+    }
+
+    /// 汎用の判定は**名前ではなく中身**（`codex` も汎用の入口なので名前決め打ちにしない）
+    #[test]
+    fn issue1453_汎用判定はprojectsの有無で決まる() {
+        let generic = Profile::default();
+        assert!(is_generic_profile(&generic), "projects 未指定は汎用");
+        let empty = Profile {
+            projects: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(is_generic_profile(&empty), "空の projects も汎用");
+        let dedicated = Profile {
+            projects: Some(vec!["tako".into()]),
+            ..Default::default()
+        };
+        assert!(!is_generic_profile(&dedicated), "projects 付きは専用");
+    }
+
+    /// 起動時プロファイルを `launched_as` に、今のプロファイルを `current_name` に持つ
+    fn running<'a>(
+        current: &'a str,
+        launched_as: &'a str,
+        launched: &'a Profile,
+    ) -> RunningMaster<'a> {
+        RunningMaster {
+            current_name: current,
+            launched_as,
+            launched,
+        }
+    }
+
+    #[test]
+    fn issue1453_採用の可否() {
+        let generic = Profile::default();
+        let target = Profile {
+            projects: Some(vec!["tako".into()]),
+            ..Default::default()
+        };
+
+        // 素の master（汎用で起動）→ 専用は通る
+        assert!(matches!(
+            decide_adopt(running("default", "default", &generic), "tako", &target),
+            AdoptDecision::Adopt { .. }
+        ));
+
+        // 同じ名前は冪等（何もしない）
+        assert_eq!(
+            decide_adopt(running("tako", "default", &generic), "tako", &target),
+            AdoptDecision::Unchanged
+        );
+
+        // **採用で専用になった master は動ける**（起動は汎用のまま）
+        let other = Profile {
+            projects: Some(vec!["campus".into()]),
+            ..Default::default()
+        };
+        assert!(
+            matches!(
+                decide_adopt(running("tako", "default", &generic), "campus", &other),
+                AdoptDecision::Adopt { .. }
+            ),
+            "採用し直せない（対象を取り違えたら詰む）"
+        );
+        // 汎用へも戻せる
+        assert!(matches!(
+            decide_adopt(running("tako", "default", &generic), "default", &generic),
+            AdoptDecision::Adopt { .. }
+        ));
+
+        // **専用プロファイルで起動した** master は拒否し、立て直す手を案内する
+        match decide_adopt(running("takodev", "takodev", &target), "campus", &other) {
+            AdoptDecision::Refused { reason } => {
+                assert!(reason.contains("handoff"), "直し方が無い: {reason}");
+                assert!(
+                    reason.contains("takodev"),
+                    "起動時のプロファイル名が無い: {reason}"
+                );
+            }
+            other => panic!("専用起動の master の乗り換えを通した: {other:?}"),
+        }
+
+        // 系統違いは拒否し、揃える 1 コマンドを返す（後任が別系統で立つのを防ぐ）
+        let codex_master = Profile {
+            master_agent: Some("codex".into()),
+            ..Default::default()
+        };
+        match decide_adopt(running("codex", "codex", &codex_master), "tako", &target) {
+            AdoptDecision::Refused { reason } => assert!(
+                reason.contains("--master-agent codex"),
+                "揃えるコマンドが無い: {reason}"
+            ),
+            other => panic!("系統違いを通した: {other:?}"),
+        }
+
+        // 系統が揃っていれば通る
+        let codex_target = Profile {
+            master_agent: Some("codex".into()),
+            projects: Some(vec!["tako".into()]),
+            ..Default::default()
+        };
+        assert!(matches!(
+            decide_adopt(
+                running("codex", "codex", &codex_master),
+                "tako",
+                &codex_target
+            ),
+            AdoptDecision::Adopt { .. }
+        ));
+    }
+
+    /// 会話の途中で system prompt は差し替えられない。
+    /// 対象プロファイルの prompt が違うときは**採用は通すが黙らない**
+    #[test]
+    fn issue1453_prompt違いは警告になる() {
+        let generic = Profile::default();
+        let same = Profile {
+            projects: Some(vec!["tako".into()]),
+            ..Default::default()
+        };
+        // default から継承したてなら prompt は一致する（余計な警告を出さない）
+        let AdoptDecision::Adopt { warnings } =
+            decide_adopt(running("default", "default", &generic), "tako", &same)
+        else {
+            panic!("採用が通らない");
+        };
+        assert!(
+            !warnings.iter().any(|w| w.contains("system prompt")),
+            "同じ prompt なのに警告が出ている: {warnings:?}"
+        );
+
+        let customized = Profile {
+            projects: Some(vec!["tako".into()]),
+            prompt_blocks: Some(PromptBlocks {
+                append: Some("このプロジェクト固有の掟".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let AdoptDecision::Adopt { warnings } =
+            decide_adopt(running("default", "default", &generic), "tako", &customized)
+        else {
+            panic!("採用が通らない");
+        };
+        assert!(
+            warnings.iter().any(|w| w.contains("system prompt")),
+            "prompt が違うのに黙っている: {warnings:?}"
+        );
+    }
+
+    /// 起動コマンドの語彙は 1 実装（#322 の最簡形）。
+    /// ここがずれると「片方だけ `-default` が付く」案内が生まれる
+    #[test]
+    fn issue1453_後任の起動コマンドは最簡形() {
+        assert_eq!(
+            tako_core::handoff::master_launch_command("default"),
+            "tako master"
+        );
+        assert_eq!(
+            tako_core::handoff::master_launch_command("tako"),
+            "tako master -tako"
+        );
+    }
 
     #[test]
     fn tilde_expansion() {

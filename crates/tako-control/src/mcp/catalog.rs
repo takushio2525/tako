@@ -1420,6 +1420,36 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_orchestrator_adopt",
+            "description": "走っている master を、そのプロジェクト専用プロファイルへ\
+                **その場で**寄せる（セッションは立て直さない = 会話・コンテキストはそのまま）。\
+                Task Intake の Step 0 で対象プロジェクトを解決したら呼ぶ。\
+                name にはプロファイル名か、まだプロファイルの無い projects.yaml の\
+                キーを渡す（後者はその場で profiles/<key>.yaml を default から継承して作る）。\
+                切り替わるのは tako 側の状態: ペインの role ラベル・tako_orchestrator_self の \
+                profile / handoff_path / project_handoffs・worker spawn の既定・\
+                引き継ぎ（tako_orchestrator_handoff と自動ハンドオフ）の宛先。\
+                以後の引き継ぎは successor_command のコマンドで後任を立てる。\
+                汎用プロファイル（projects 未指定。default / codex）で立った master だけが\
+                呼べる。専用プロファイルで立っている master や、master の系統\
+                （master_agent）が食い違う相手は拒否して直し方を返す\
+                （会話の途中で system prompt は差し替えられないため）。\
+                同じプロファイルへの 2 回目は changed=false（冪等）。\
+                default を渡すと汎用へ戻る。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "採用するプロファイル名、またはプロジェクトキー（必須）",
+                    },
+                    "pane": pane_schema("対象の master ペイン ID（省略時は呼び出し元）"),
+                },
+                "required": ["name"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_orchestrator_profiles",
             "description": "オーケストレーターのプロファイル（tako master / tako solo の起動設定）を管理する。\
                 action=list で一覧、show で単一表示、set で作成・更新、create で新規作成、\
@@ -1561,7 +1591,8 @@ pub fn tools() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "topic": { "type": "string", "description": "引く topic（省略時は一覧。context-budget / task-intake / worker-prompt / spawning / monitoring / acceptance / lifecycle / handoff / remote / user-tasks / tools / quality-ops / behavior）" },
-                    "profile": { "type": "string", "description": "プレースホルダを解決するプロファイル（省略時は呼び出し元の role から解決）" },
+                    "profile": { "type": "string", "description": "プレースホルダを解決するプロファイル（省略時は呼び出し元の role とペインの役割ラベルから解決）" },
+                    "pane": pane_schema("プロファイル解決に使うペイン ID（省略時は呼び出し元。#1453 の adopt 後はこのペインの採用先で解決される）"),
                 },
                 "additionalProperties": false,
             },

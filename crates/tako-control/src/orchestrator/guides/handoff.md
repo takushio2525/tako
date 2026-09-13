@@ -35,6 +35,15 @@
        tako warns you, and the fix is to move project content into the project
        files, not to trim the meaning out of it.
 
+   - **The successor is launched with the profile you currently hold**, which is
+     the one `tako_orchestrator_self` reports - including a profile you took on
+     mid-session with `tako_orchestrator_adopt`. The `successor_command` field
+     of the adopt response names the exact command that will be used
+     (`tako master -<key>`), and the project files the successor receives are
+     the ones under that profile's `projects`. If you resolved a project this
+     session but never adopted it, the successor comes back generic and the
+     project's handoff file does not travel with it - adopt first, then hand off.
+
      Which projects you own is resolved from the profile's assigned projects
      plus the projects of your live workers (`jurisdiction_source` tells you
      which). If neither exists, the successor gets a list of paths instead of

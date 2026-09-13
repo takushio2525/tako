@@ -262,3 +262,43 @@ say so in the body and let the user dismiss it.
 - Anything you can settle yourself by reading the repository, running a command or
   asking a worker. Filing those trains the user to ignore the list.
 - Secrets. The body and the comments are stored on disk and shown on a phone.
+<!-- #1453: 走っている master を専用プロファイルへその場で寄せる（adopt）。 -->
+<!-- task-intake の Step 0.5 と handoff の後任の節へ追加。prompt 側は 1 行の案内だけ。 -->
+
+### Step 0.5 - Adopt the project's own profile
+
+Once Step 0 resolved a registered project, call
+`tako_orchestrator_adopt(name=<project key>)`. This is one call and it does not
+restart anything: your session, conversation and context stay exactly as they
+are. What changes is tako's own state for your pane - the role label, the
+profile behind `tako_orchestrator_self`, the handoff destination, and the
+defaults every worker you spawn from now on will start with.
+
+- **Run it before the first spawn of that project.** Workers inherit the profile
+  that is current at spawn time; adopting afterwards does not re-parent them.
+- **The profile is created for you** if the project has none yet, inherited from
+  `default` with the project's own `projects` and `cwd`.
+- **From then on, `tako_orchestrator_self` is the source of truth** for which
+  profile you are. Its `profile` field, not the name you were launched with.
+- **Idempotent.** Calling it again with the same name answers `changed: false`.
+  Passing `default` puts you back on the generic profile.
+- **It can refuse**, and the refusal is information, not an obstacle: a master
+  launched with its own dedicated profile (`tako master -<name>`) is already
+  specialised, and a profile whose `master_agent` differs from yours would make
+  your successor come back as a different agent. The error names the one command
+  that resolves it. Do not work around a refusal by editing the profile files
+  directly.
+
+Your system prompt was fixed when your session started and cannot be swapped
+mid-conversation. Adopting changes tako's state, not your prompt - so if the
+adopted profile carries prompt text you need, the way to get it is a handoff,
+which starts the successor with that profile's prompt.
+
+   - **The successor is launched with the profile you currently hold**, which is
+     the one `tako_orchestrator_self` reports - including a profile you took on
+     mid-session with `tako_orchestrator_adopt`. The `successor_command` field
+     of the adopt response names the exact command that will be used
+     (`tako master -<key>`), and the project files the successor receives are
+     the ones under that profile's `projects`. If you resolved a project this
+     session but never adopted it, the successor comes back generic and the
+     project's handoff file does not travel with it - adopt first, then hand off.

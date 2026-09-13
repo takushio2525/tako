@@ -82,6 +82,24 @@ pub fn master_role_env(profile: &str) -> String {
     }
 }
 
+/// プロファイル名から**起動コマンド**を組み立てる（`tako master` / `tako master -<name>`）。
+///
+/// 既定は最簡形（#322「既定値で済む引数を付けない」）。role の語彙と同じ理由でここに
+/// 置く: 案内文・引き継ぎの説明・採用の応答が同じ 1 実装から文字列を得ることで、
+/// 「片方だけ `-default` を付ける」ようなずれが構造的に起きない
+pub fn profile_launch_command(base: &str, profile: &str) -> String {
+    if profile.is_empty() || profile == DEFAULT_PROFILE {
+        base.to_string()
+    } else {
+        format!("{base} -{profile}")
+    }
+}
+
+/// master の起動コマンド（`tako master` / `tako master -<name>`）
+pub fn master_launch_command(profile: &str) -> String {
+    profile_launch_command("tako master", profile)
+}
+
 /// 表示用 role（`orchestrator-master[:<name>]`）と env 用 role（`master[:<name>]`）の
 /// **どちらからでも** master のプロファイル名を取り出す。
 /// master 以外（solo / worker / role なし）は None。

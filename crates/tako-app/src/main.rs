@@ -71002,6 +71002,377 @@ mod self_test {
                 });
             }
 
+            // --- 項目 149: 素の master を専用プロファイルへその場で寄せる（#1453） ---
+            //
+            // 期待は「セッションを立て直さずに振る舞いだけが専用 master になる」。
+            // 立て直していないことは **pane ID とバックエンドセッションが同じまま**で見る
+            // （claude は起こさないので、判定が起動タイミングに揺らされない）。
+            //
+            // 通しで見るのは 4 段:
+            //   (a) `projects add` が `profiles/<key>.yaml` を default から継承して作る
+            //   (b) `adopt` で role ラベル・`self` の profile / handoff_path /
+            //       project_handoffs が切り替わる（**同じペイン**）
+            //   (c) 採用後に spawn した worker が採用先の既定で立つ
+            //   (d) 採用後の `handoff` が `tako master -<key>` で後任を立て、
+            //       引き継ぎが `<key>` 側のファイルから渡る
+            //
+            // 判定は**新しい挙動を無条件に主張する**。`TAKO_1453_LEGACY=1` を立てると
+            // 生成も採用も起きないのでこの項目は FAILED になり、それが A/B の実測になる
+            // （env に合わせて期待を変える書き方だと、両腕で緑になって何も測れない）。
+            //
+            // 隔離: プロファイル・projects.yaml・handoff の置き場は
+            // `TAKO_ORCHESTRATOR_DIR`（#658 でセルフテストの既定隔離に入っている）なので、
+            // 本番の profiles/ には触れない
+            {
+                use tako_control::orchestrator as orch;
+                use tako_control::protocol::Request as Req;
+                let fire = |r: Req, cx: &mut AsyncApp| {
+                    window
+                        .update(cx, |app, _, _| {
+                            tako_control::dispatch(app, r, PaneOrigin::Cli).ok()
+                        })
+                        .ok()
+                        .flatten()
+                };
+                let legacy149 = std::env::var("TAKO_1453_LEGACY")
+                    .map(|v| v == "1")
+                    .unwrap_or(false);
+                let key149 = "st1453";
+                let repo149 = std::env::temp_dir().join(format!("tako-st1453-{}", std::process::id()));
+                let _ = std::fs::create_dir_all(&repo149);
+
+                // 前回の残骸を消す（項目は何度も走りうる）
+                if let Ok(path) = orch::ProfileKind::Master.path(key149) {
+                    let _ = std::fs::remove_file(&path);
+                }
+
+                // (a) プロジェクト登録 = 専用プロファイルの自動生成
+                let add149 = fire(
+                    Req::OrchestratorProjects {
+                        action: "add".into(),
+                        key: Some(key149.into()),
+                        cwd: Some(repo149.display().to_string()),
+                        description: None,
+                    },
+                    cx,
+                );
+                let generated149 = add149
+                    .as_ref()
+                    .and_then(|v| v["profile_generation"].as_str())
+                    .unwrap_or("なし")
+                    .to_string();
+                let profile_exists149 = orch::ProfileKind::Master
+                    .path(key149)
+                    .map(|p| p.is_file())
+                    .unwrap_or(false);
+                // 継承元（default）の値が入っているか = 「素の master と同じ振る舞い」の中身
+                let inherited149 = orch::load_profile_of(orch::ProfileKind::Master, key149)
+                    .ok()
+                    .map(|p| {
+                        (
+                            p.projects.clone().unwrap_or_default(),
+                            p.cwd.clone().unwrap_or_default(),
+                            p.effort.clone(),
+                        )
+                    });
+                println!(
+                    "TAKO_SELF_TEST_1453_GEN: legacy={legacy149} generation={generated149} \
+                     exists={profile_exists149} inherited={inherited149:?}"
+                );
+                check(
+                    profile_exists149,
+                    &format!(
+                        "149a: projects add が専用プロファイルを作る (#1453。\
+                         legacy={legacy149} exists={profile_exists149} gen={generated149})"
+                    ),
+                );
+                check(
+                    inherited149.as_ref().is_some_and(|(projects, cwd, _)| {
+                        projects == &[key149.to_string()] && cwd == &repo149.display().to_string()
+                    }),
+                    &format!(
+                        "149a: 生成物は管轄と cwd だけが自分のものになる (#1453。{inherited149:?})"
+                    ),
+                );
+
+                // (b) 素の master ペインを作って採用する
+                let anchor149 = window.update(cx, |app, _, _| app.focused_pane()).ok();
+                let master149 = anchor149.and_then(|anchor| {
+                    fire(
+                        Req::Split {
+                            pane: Some(anchor.as_u64()),
+                            tab: None,
+                            direction: Some(tako_control::protocol::Direction::Down),
+                            ratio: None,
+                            command: None,
+                            cwd: None,
+                            focus: Some(false),
+                        },
+                        cx,
+                    )
+                    .and_then(|v| v["pane"].as_u64())
+                });
+                let Some(master149) = master149 else {
+                    fail("#1453: 検証用 master ペインの作成")
+                };
+                // 素の `tako master` と同じ role ラベル（= default）を貼る
+                let _ = fire(
+                    Req::Title {
+                        pane: Some(master149),
+                        title: None,
+                        role: Some("orchestrator-master".into()),
+                    },
+                    cx,
+                );
+                let self_of149 = |cx: &mut AsyncApp| {
+                    fire(
+                        Req::OrchestratorSelf {
+                            pane: Some(master149),
+                            caller_role: Some("master".into()),
+                            caller_pid: None,
+                        },
+                        cx,
+                    )
+                };
+                let before149 = self_of149(cx);
+                let before_profile149 = before149
+                    .as_ref()
+                    .and_then(|v| v["profile"].as_str())
+                    .unwrap_or("?")
+                    .to_string();
+
+                let adopt149 = fire(
+                    Req::OrchestratorAdopt {
+                        name: key149.into(),
+                        pane: Some(master149),
+                        caller_role: Some("master".into()),
+                        caller_pid: None,
+                    },
+                    cx,
+                );
+                let after149 = self_of149(cx);
+                let after_profile149 = after149
+                    .as_ref()
+                    .and_then(|v| v["profile"].as_str())
+                    .unwrap_or("?")
+                    .to_string();
+                let after_pane149 = after149.as_ref().and_then(|v| v["pane_id"].as_u64());
+                let after_handoff149 = after149
+                    .as_ref()
+                    .and_then(|v| v["handoff_path"].as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let after_jurisdiction149: Vec<String> = after149
+                    .as_ref()
+                    .and_then(|v| v["project_handoffs"].as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x["project"].as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let successor_cmd149 = adopt149
+                    .as_ref()
+                    .and_then(|v| v["successor_command"].as_str())
+                    .unwrap_or("")
+                    .to_string();
+                println!(
+                    "TAKO_SELF_TEST_1453_ADOPT: legacy={legacy149} before={before_profile149} \
+                     after={after_profile149} pane={master149}->{after_pane149:?} \
+                     handoff={after_handoff149} jurisdiction={after_jurisdiction149:?} \
+                     successor={successor_cmd149:?} adopted={}",
+                    adopt149.is_some()
+                );
+                check(
+                    before_profile149 == "default",
+                    &format!("149b: 採用前は default (#1453。{before_profile149})"),
+                );
+                check(
+                    after_profile149 == key149,
+                    &format!(
+                        "149b: 採用で self の profile が切り替わる (#1453。\
+                         legacy={legacy149} want={key149} got={after_profile149})"
+                    ),
+                );
+                // **立て直していない**= 同じペイン ID のまま
+                check(
+                    after_pane149 == Some(master149),
+                    &format!(
+                        "149b: 採用でペインが変わらない (#1453 = セッションを立て直さない。\
+                         {master149} -> {after_pane149:?})"
+                    ),
+                );
+                {
+                    check(
+                        after_handoff149.ends_with(&format!("{key149}.md"))
+                            && after_jurisdiction149 == vec![key149.to_string()],
+                        &format!(
+                            "149b: 引き継ぎ先と管轄が採用先になる (#1453。\
+                             handoff={after_handoff149} jurisdiction={after_jurisdiction149:?})"
+                        ),
+                    );
+                    check(
+                        successor_cmd149 == format!("tako master -{key149}"),
+                        &format!("149b: 後任の起動コマンドが採用先 (#1453。{successor_cmd149})"),
+                    );
+                }
+
+                // (c) 採用後に spawn した worker が採用先の既定（projects 制限）で立つ。
+                //     採用先の管轄は `st1453` だけなので、範囲外への spawn は断られる。
+                //     **比較対象も登録しておく**のが要点: 未登録のままだと
+                //     「projects.yaml に無い」で断られてしまい、採用の有無に関係なく
+                //     緑になる（= 検出力ゼロ。実測で踏んだ）
+                let outside149 = "st1453out";
+                {
+                    let _ = fire(
+                        Req::OrchestratorProjects {
+                            action: "add".into(),
+                            key: Some(outside149.into()),
+                            cwd: Some(repo149.display().to_string()),
+                            description: None,
+                        },
+                        cx,
+                    );
+                    let refused149 = window
+                        .update(cx, |app, _, _| {
+                            tako_control::dispatch(
+                                app,
+                                Req::OrchestratorSpawn {
+                                    project: outside149.into(),
+                                    prompt: "検証".into(),
+                                    label: None,
+                                    model: None,
+                                    effort: None,
+                                    pane: Some(master149),
+                                    tab: None,
+                                    caller_role: Some("master".into()),
+                                    agent: None,
+                                    caller_pid: None,
+                                    task_type: None,
+                                    account: None,
+                                    limit_resume: None,
+                                },
+                                PaneOrigin::Cli,
+                            )
+                            .err()
+                            .map(|e| format!("{e:?}"))
+                        })
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    println!("TAKO_SELF_TEST_1453_SPAWN: refused={refused149:?}");
+                    // 断る理由まで見る。**プロファイルの projects 制限**で
+                    // 断られていなければ、採用が spawn の既定へ効いていない
+                    check(
+                        refused149.contains("projects 制限"),
+                        &format!(
+                            "149c: 採用先の管轄が spawn の既定に効く (#1453。projects 制限で断られていない: {refused149:?})"
+                        ),
+                    );
+                }
+
+                // (d) 採用後の handoff が採用先で後任を立てる
+                {
+                    let _ = orch::handoff_store::write_project_handoff(
+                        key149,
+                        "## 知識\n- 採用後の引き継ぎ（セルフテスト）\n\n## 実行状態\n- worker なし\n",
+                    );
+                    let handoff149 = window
+                        .update(cx, |app, _, _| {
+                            let res = tako_control::dispatch(
+                                app,
+                                Req::OrchestratorHandoff {
+                                    pane: Some(master149),
+                                    caller_role: Some("master".into()),
+                                    tab: None,
+                                    caller_pid: None,
+                                    projects: None,
+                                },
+                                PaneOrigin::Cli,
+                            )
+                            .ok()?;
+                            // claude は起こさない（起動コマンドと attach を捨てる）
+                            let _ = std::mem::take(&mut app.pending_attach);
+                            let _ = std::mem::take(&mut app.pending_writes);
+                            let _ = std::mem::take(&mut app.command_flows);
+                            if let Some(p) = res["new_master_pane_id"].as_u64() {
+                                app.prompt_flows.retain(|f| f.pane != PaneId::from_raw(p));
+                            }
+                            Some(res)
+                        })
+                        .ok()
+                        .flatten();
+                    let ho_profile149 = handoff149
+                        .as_ref()
+                        .and_then(|v| v["profile"].as_str())
+                        .unwrap_or("?")
+                        .to_string();
+                    let ho_files149: Vec<String> = handoff149
+                        .as_ref()
+                        .and_then(|v| v["project_files"].as_array())
+                        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
+                    let ho_file149 = handoff149
+                        .as_ref()
+                        .and_then(|v| v["handoff_file"].as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    println!(
+                        "TAKO_SELF_TEST_1453_HANDOFF: profile={ho_profile149} \
+                         files={ho_files149:?} memo={ho_file149}"
+                    );
+                    check(
+                        ho_profile149 == key149
+                            && ho_files149 == vec![key149.to_string()]
+                            && ho_file149.ends_with(&format!("{key149}.md")),
+                        &format!(
+                            "149d: 採用後の引き継ぎが採用先で立つ (#1453。\
+                             profile={ho_profile149} files={ho_files149:?} memo={ho_file149})"
+                        ),
+                    );
+                    // 後任ペインは片付ける（以降の項目へ持ち越さない）
+                    if let Some(p) = handoff149.as_ref().and_then(|v| v["new_master_pane_id"].as_u64())
+                    {
+                        let _ = fire(
+                            Req::Close {
+                                pane: Some(p),
+                                force: true,
+                                caller_role: None,
+                            },
+                            cx,
+                        );
+                    }
+                }
+
+                // 片付け: 検証用ペイン・プロジェクト・プロファイル・引き継ぎを消す
+                let _ = fire(
+                    Req::Close {
+                        pane: Some(master149),
+                        force: true,
+                        caller_role: None,
+                    },
+                    cx,
+                );
+                for k in [key149, outside149] {
+                    let _ = fire(
+                        Req::OrchestratorProjects {
+                            action: "remove".into(),
+                            key: Some(k.into()),
+                            cwd: None,
+                            description: None,
+                        },
+                        cx,
+                    );
+                    if let Ok(path) = orch::ProfileKind::Master.path(k) {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    if let Some(path) = orch::handoff_store::project_handoff_path(k) {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&repo149);
+            }
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);

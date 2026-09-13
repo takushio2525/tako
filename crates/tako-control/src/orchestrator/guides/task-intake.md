@@ -24,6 +24,35 @@ Do NOT skip this step even when the name looks like a generic word or a
 web service — registered projects take priority over web searches and
 home-directory scans.
 
+### Step 0.5 - Adopt the project's own profile
+
+Once Step 0 resolved a registered project, call
+`tako_orchestrator_adopt(name=<project key>)`. This is one call and it does not
+restart anything: your session, conversation and context stay exactly as they
+are. What changes is tako's own state for your pane - the role label, the
+profile behind `tako_orchestrator_self`, the handoff destination, and the
+defaults every worker you spawn from now on will start with.
+
+- **Run it before the first spawn of that project.** Workers inherit the profile
+  that is current at spawn time; adopting afterwards does not re-parent them.
+- **The profile is created for you** if the project has none yet, inherited from
+  `default` with the project's own `projects` and `cwd`.
+- **From then on, `tako_orchestrator_self` is the source of truth** for which
+  profile you are. Its `profile` field, not the name you were launched with.
+- **Idempotent.** Calling it again with the same name answers `changed: false`.
+  Passing `default` puts you back on the generic profile.
+- **It can refuse**, and the refusal is information, not an obstacle: a master
+  launched with its own dedicated profile (`tako master -<name>`) is already
+  specialised, and a profile whose `master_agent` differs from yours would make
+  your successor come back as a different agent. The error names the one command
+  that resolves it. Do not work around a refusal by editing the profile files
+  directly.
+
+Your system prompt was fixed when your session started and cannot be swapped
+mid-conversation. Adopting changes tako's state, not your prompt - so if the
+adopted profile carries prompt text you need, the way to get it is a handoff,
+which starts the successor with that profile's prompt.
+
 ### Step 1 — Enumerate the requests
 
 Write out every request contained in the message as a numbered list. A "request"

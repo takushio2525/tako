@@ -569,9 +569,75 @@ pub fn run(mode: Mode, only: Option<SchemaId>) -> MigrationReport {
         for path in targets(spec.id) {
             report.push(migrate_one(spec, &path, mode));
         }
+        // #1453: 既存プロファイルの形を直したあと、**まだ無いプロジェクト専用
+        // プロファイル**を作る。登録済みプロジェクトを後から自動化の対象にするのに
+        // ユーザーの手作業を要求しないための段（#916 の作法）
+        if spec.id == SchemaId::Profiles {
+            for file in project_profile_reports(mode) {
+                report.push(file);
+            }
+        }
     }
     report
 }
+
+/// プロジェクト専用プロファイルの自動生成（#1453）を共通の記録へ載せる。
+///
+/// 手順は `orchestrator::ensure_project_profile` が持つ（既存ファイルの形を直すのではなく
+/// **対になるファイルを作る**ので `Step` では表せない）。ここがやるのは
+/// **同じ発火点から呼ぶこと**と、結果を [`MigrationReport`] の語彙へ翻訳することだけ。
+/// これで `tako setup` / GUI 起動 / `tako migrate` のどれからでも揃う
+fn project_profile_reports(mode: Mode) -> Vec<FileReport> {
+    use crate::orchestrator;
+    if orchestrator::legacy_auto_profile() {
+        return Vec::new();
+    }
+    if mode == Mode::Check {
+        // 書かずに「まだ無いプロジェクト」だけを数える。判定は生成側と同じ材料
+        // （プロファイル名として使えるキー かつ `profiles/<key>.yaml` が無い）
+        let Ok(config) = orchestrator::ProjectsConfig::load() else {
+            return Vec::new();
+        };
+        return config
+            .projects
+            .keys()
+            .filter_map(|key| {
+                let path = orchestrator::ProfileKind::Master.path(key).ok()?;
+                (!path.is_file()).then_some(FileReport {
+                    id: SchemaId::Profiles,
+                    path,
+                    outcome: FileOutcome::Created {
+                        reason: PROFILE_AUTO_CREATED,
+                    },
+                })
+            })
+            .collect();
+    }
+    orchestrator::ensure_project_profiles()
+        .into_iter()
+        .filter_map(|(key, gen)| match gen {
+            orchestrator::ProfileGen::Created(path) => Some(FileReport {
+                id: SchemaId::Profiles,
+                path,
+                outcome: FileOutcome::Created {
+                    reason: PROFILE_AUTO_CREATED,
+                },
+            }),
+            // 既にある = 揃っている（記録に出さない。毎回 N 行増えるのを避ける）
+            orchestrator::ProfileGen::Exists(_) => None,
+            orchestrator::ProfileGen::Skipped { reason } => Some(FileReport {
+                id: SchemaId::Profiles,
+                path: PathBuf::from(format!("{key}.yaml")),
+                outcome: FileOutcome::Failed { reason },
+            }),
+        })
+        .collect()
+}
+
+const PROFILE_AUTO_CREATED: Note = Note::new(
+    "登録済みプロジェクト用の master プロファイルを default から継承して作成",
+    "Created a master profile for a registered project, inheriting from default",
+);
 
 /// 引き継ぎの移行（#915）を共通の記録へ載せる。
 ///
@@ -846,6 +912,11 @@ pub fn setup_lines() -> Vec<String> {
                     file.path.display()
                 ),
             }),
+            FileOutcome::Created { reason } => lines.push(format!(
+                "{}: {}（新規作成）",
+                file.path.display(),
+                reason.text()
+            )),
             FileOutcome::Refused { reason } | FileOutcome::Failed { reason } => {
                 lines.push(format!("{}: {reason}", file.path.display()))
             }
@@ -906,6 +977,12 @@ fn file_json(file: &FileReport, did_apply: bool) -> serde_json::Value {
     match &file.outcome {
         FileOutcome::UpToDate { version } => {
             map.insert("version".into(), (*version).into());
+        }
+        // #1453: 作った（作る予定の）ファイル。退避元が無いので backup は載らない
+        FileOutcome::Created { reason } => {
+            map.insert("reason".into(), reason.text().into());
+            map.insert("reason_ja".into(), reason.ja().into());
+            map.insert("reason_en".into(), reason.en().into());
         }
         FileOutcome::Migrated {
             from,
@@ -968,6 +1045,12 @@ fn record(report: &MigrationReport, origin: &str) {
                 file.id.as_str(),
                 file.path.display(),
                 backup.display()
+            )),
+            FileOutcome::Created { reason } => crate::diag::persist_log(&format!(
+                "作成: {} {}: {}（発生源 {origin}）",
+                file.id.as_str(),
+                file.path.display(),
+                reason.text()
             )),
             FileOutcome::Unreadable { quarantine, reason } => {
                 let where_to = match quarantine {

@@ -396,6 +396,14 @@ master は結果を確認してユーザーに報告する。
 | `--cwd` | ○ | 作業ディレクトリ |
 | `--description` | | 説明 |
 
+**登録と同時に専用プロファイル（`profiles/<key>.yaml`）も作る**（#1453）。中身は
+`profiles/default.yaml` を引き継ぎ、**管轄（`projects: [<key>]`）と起動フォルダ（`cwd`）だけ**
+がそのプロジェクトのものになる。既存のプロファイルには触らない（冪等）。
+応答の `profile_generation` が `created` / `exists` / `skipped`（作れなかった理由は
+`profile_note`。プロジェクトキーがプロファイル名に使えない場合など）。
+**登録済みのプロジェクトは `tako setup` / GUI 起動 / `tako migrate run` の差分検出で揃う**
+ので、手で作り直す必要はない。
+
 ### `tako orchestrator projects remove`
 
 プロジェクトを削除する。
@@ -403,6 +411,46 @@ master は結果を確認してユーザーに報告する。
 | オプション | 必須 | 説明 |
 |---|---|---|
 | `--key` | ○ | プロジェクトキー |
+
+### `tako orchestrator adopt`
+
+**素の `tako master` で始めた会話を、その場でプロジェクト専用 master にする**（#1453）。
+
+```bash
+tako orchestrator adopt <名前> [--pane N]
+```
+
+`<名前>` はプロファイル名か projects.yaml のキー（後者はその場で生成して採用する）。
+`adopt default` で汎用へ戻る。同じ名前の 2 回目は `changed: false`（冪等）。
+
+**セッションは立て直さない。** pid も会話もコンテキストもそのまま残る
+（ユーザー要望の「シームレス・トークン節約」がこの機能の主目的）。書き換えるのは
+**ペインの role ラベル 1 つ**で、そこから下流が全部追従する:
+
+| 追従するもの | 経路 |
+|---|---|
+| `self` の `profile` / `handoff_path` / `project_handoffs` / `ctx_threshold` | `resolve_master_profile` が**非既定の pane_role を優先**する（#854） |
+| worker spawn の既定（model / effort / agent / account / limit_resume / projects 制限） | `resolve_caller_profile_with_role` → `find_master_suffix_from` が role ラベルを辿る |
+| `handoff` の後任と引き継ぎファイルの宛先 | 同じ `resolve_master_profile` → `build_master_cmd`（`tako master -<key>` と同一経路） |
+| 自動ハンドオフ（#749）の nudge 対象プロファイル | `drive_handoff_nudge` が `pane.role()` を読む |
+| GUI 再起動をまたいだ保持 | role は `layout.json` に保存される（`PaneLayout.role`） |
+
+新しい永続状態は 1 つも足していない。応答の `successor_command` が引き継ぎで実際に使われる
+コマンドで、`launched_as` が起動時のプロファイル（現在値と違えば「この会話ですでに採用済み」）。
+
+**呼べるのは汎用プロファイル（`projects` 未指定 = `default` / `codex`）で起動した master だけ。**
+判定は名前ではなく中身（`is_generic_profile`）で行う。次の 2 つは拒否して直す 1 コマンドを返す:
+
+- **専用プロファイルで起動した master**（`tako master -takodev`）が別へ移ろうとした
+  → その master の system prompt は既にそのプロファイルのもので、会話の途中では差し替えられない。
+  移るなら `tako orchestrator handoff` で立て直す
+- **master の系統（`master_agent`）が食い違う**（codex master が claude 継承のプロファイルを採用）
+  → 採用だけ通すと後任が別系統で立ち上がる。`tako orchestrator profiles set <key> --master-agent codex`
+  で揃えてから採用する
+
+採用で専用になった master は**起動が汎用のまま**なので、対象を取り違えても採用し直せる。
+
+A/B は `TAKO_1453_LEGACY=1`（同一バイナリで「生成も採用もしない」旧挙動へ戻る）。
 
 ### `tako orchestrator spawn`
 
@@ -557,7 +605,8 @@ master（または任意の claude エージェント）から使える MCP ツ�
 
 | ツール | 説明 |
 |---|---|
-| `tako_orchestrator_projects` | プロジェクト管理（list / add / remove） |
+| `tako_orchestrator_projects` | プロジェクト管理（list / add / remove。**add は専用プロファイルも作る** = #1453） |
+| `tako_orchestrator_adopt` | 走っている master を専用プロファイルへその場で寄せる（立て直さない。#1453） |
 | `tako_orchestrator_profiles` | プロファイル管理（list / show / set。モデル・effort・worker_agent / agent_* の設定と解除、ctx_threshold / auto_handoff（#749）） |
 | `tako_orchestrator_self` | 自分の pane / tab / ctx% / 引き継ぎ閾値の取得（`ctx_over_threshold` が true なら引き継ぎ時） |
 | `tako_orchestrator_handoff` | 後任 master への引き継ぎ（管轄プロジェクトの引き継ぎを読んで spawn。前任ペインは後任が閉じる） |

@@ -844,6 +844,17 @@ pub const MATRIX: &[Feature] = &[
         ),
     },
     Feature {
+        // #1453: 走っている master を専用プロファイルへその場で寄せる。
+        // 触るのは tako 側の状態（ペインの role ラベル・プロファイルの yaml）だけで、
+        // OS 固有の経路（プロセス・ウインドウ・端末）を通らないので両 OS で同じ
+        key: "tako_orchestrator_adopt",
+        macos: Support::Supported,
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 146（自動生成 → 採用 → spawn 既定 → 引き継ぎ先の一連）",
+        ),
+    },
+    Feature {
         // #1154: master の手順書を引く。バイナリ埋め込みの本文 + プロファイル読みだけの
         // ローカル処理で、パスは `PathBuf::join` のみ・プラットフォーム分岐が無い
         key: "tako_orchestrator_guide",

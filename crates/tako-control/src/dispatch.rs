@@ -3069,6 +3069,14 @@ fn dispatch_inner(
             description,
         } => dispatch_orchestrator_projects(&action, key, cwd, description),
 
+        // #1453: 走っている master を専用プロファイルへその場で寄せる
+        Request::OrchestratorAdopt {
+            name,
+            pane,
+            caller_role,
+            caller_pid,
+        } => dispatch_orchestrator_adopt(host, &name, pane, caller_role.as_deref(), caller_pid),
+
         Request::OrchestratorProfiles {
             action,
             name,
@@ -4156,13 +4164,29 @@ fn dispatch_inner(
             topic,
             profile,
             caller_role,
+            pane,
+            caller_pid,
         } => {
+            // #1453: 採用（adopt）でペインの role ラベルが変わるので、env が既定のまま
+            // でも採用後のプロファイルでプレースホルダを解く。解決規則は `self` /
+            // `handoff` と同じ `resolve_master_profile`（非既定の pane_role を優先）。
+            // ペインが解決できない呼び出し（GUI 不在・CLI のローカル処理）は従来どおり
+            // 呼び出し元の role → default へ落ちる
             let profile_name = profile.unwrap_or_else(|| {
-                caller_role
-                    .as_deref()
-                    .and_then(tako_core::handoff::master_profile_of_any_role)
-                    .unwrap_or(tako_core::handoff::DEFAULT_PROFILE)
-                    .to_string()
+                let pane_role = resolve_caller_pane(host, pane, caller_role.as_deref(), caller_pid)
+                    .ok()
+                    .and_then(|(tab_id, pane_id)| {
+                        host.workspace()
+                            .get_tab(tab_id)
+                            .and_then(|t| t.tree().get(pane_id))
+                            .and_then(|p| p.role())
+                            .map(str::to_string)
+                    });
+                tako_core::handoff::resolve_master_profile(
+                    caller_role.as_deref(),
+                    pane_role.as_deref(),
+                )
+                .0
             });
             crate::orchestrator::guide::json(topic.as_deref(), &profile_name)
                 .map_err(DispatchError::InvalidParams)
@@ -5976,7 +6000,13 @@ fn dispatch_sessions_resume(
 
 // --- オーケストレーター dispatch ---
 
-fn dispatch_orchestrator_projects(
+/// プロジェクト管理（list / add / remove）。**CLI も MCP もここ 1 本を通る**
+/// （`handoffs` / `layout` / `accounts` と同じ形）。GUI も IPC も要らない
+/// ローカルのファイル操作なので CLI は IPC を張らずに直接呼ぶ。
+///
+/// #1453 まで CLI 側に同じ処理の写しがあり、`add` の専用プロファイル自動生成が
+/// **MCP からは効くのに CLI からは効かない**状態になっていた（実測で踏んだ）
+pub fn dispatch_orchestrator_projects(
     action: &str,
     key: Option<String>,
     cwd: Option<String>,
@@ -6002,7 +6032,22 @@ fn dispatch_orchestrator_projects(
                 config.add(key.clone(), cwd.clone(), description);
             })
             .map_err(DispatchError::Operation)?;
-            Ok(json!({ "added": key, "cwd": cwd }))
+            // #1453: 登録と同時に専用プロファイルを用意する（default から継承・
+            // 既存は触らない・冪等）。**projects.yaml への登録より後**に呼ぶのは、
+            // 生成が cwd を projects.yaml から読むから。作れなかった理由は
+            // `profile_note` に載せるが、プロジェクト登録そのものは成功させる
+            let gen = orchestrator::ensure_project_profile(&key);
+            let mut result = json!({
+                "added": key,
+                "cwd": cwd,
+                "profile": key,
+                "profile_generation": gen.kind(),
+                "profile_path": gen.path().map(|p| p.display().to_string()),
+            });
+            if let orchestrator::ProfileGen::Skipped { ref reason } = gen {
+                result["profile_note"] = json!(reason);
+            }
+            Ok(result)
         }
         "remove" => {
             let key = key.ok_or(DispatchError::InvalidParams("key を指定する".into()))?;
@@ -6018,6 +6063,201 @@ fn dispatch_orchestrator_projects(
         _ => Err(DispatchError::InvalidParams(format!(
             "action が不正: {action}（list / add / remove）"
         ))),
+    }
+}
+
+/// OrchestratorAdopt — 走っている master を専用プロファイルへ**その場で**寄せる（#1453）。
+///
+/// # 何を書き換えるか
+///
+/// **ペインの role ラベル 1 つだけ**（+ 表示用のタイトルと #1140 の自動復帰の既定）。
+/// セッション（pid・バックエンド・会話）には触らない。`TAKO_ORCHESTRATOR_ROLE` も
+/// 書き換えない —— 走っているプロセスの env は外から変えられないし、
+/// `resolve_master_profile`（#854）が**非既定の pane_role を既定の caller_role より
+/// 優先する**ので、書き換える必要そのものが無い。
+///
+/// この 1 つから下流が全部追従する: `self` の profile / handoff_path / project_handoffs、
+/// worker spawn の既定（`find_master_suffix_from` が role ラベルを辿る）、`handoff` の
+/// 後任（`tako master -<key>`）と引き継ぎファイルの宛先、自動ハンドオフ #749 の nudge。
+/// role は `layout.json` に保存されるので GUI 再起動もまたぐ。
+fn dispatch_orchestrator_adopt(
+    host: &mut dyn ControlHost,
+    name: &str,
+    pane: Option<u64>,
+    caller_role: Option<&str>,
+    caller_pid: Option<u32>,
+) -> Result<Value, DispatchError> {
+    use crate::orchestrator;
+
+    let (tab_id, pane_id) = resolve_caller_pane(host, pane, caller_role, caller_pid)?;
+    let pane_role = host
+        .workspace()
+        .get_tab(tab_id)
+        .and_then(|t| t.tree().get(pane_id))
+        .and_then(|p| p.role())
+        .map(str::to_string);
+
+    // master のペインでなければ採用しない（worker / ユーザーペインの role を
+    // master のものへ書き換えると、以後そのペインが master として扱われてしまう）
+    let is_master = pane_role
+        .as_deref()
+        .is_some_and(|r| tako_core::handoff::master_profile_of_role(r).is_some())
+        || caller_role.is_some_and(|r| tako_core::handoff::master_profile_of_any_role(r).is_some());
+    if !is_master {
+        return Err(DispatchError::Operation(format!(
+            "ペイン {} は master ではない（role={}）。adopt は master のペインにだけ効く",
+            pane_id.as_u64(),
+            pane_role.as_deref().unwrap_or("なし")
+        )));
+    }
+
+    let (current_name, profile_source) =
+        tako_core::handoff::resolve_master_profile(caller_role, pane_role.as_deref());
+    // **拒否の判断は「起動時のプロファイル」で行う**（#1453）。会話の途中で変えられない
+    // もの（system prompt・master の系統）は起動時に決まったきりなので、採用で動いた
+    // 現在値ではなく env（`TAKO_ORCHESTRATOR_ROLE`）由来のほうを見る。
+    //
+    // **役割を名乗らない呼び出しは既定（汎用）として扱う**。master 自身は起動時に
+    // `TAKO_ORCHESTRATOR_ROLE` を注入されているので、役割が無いのは**外から**
+    // （人・スクリプトが `--pane` を明示して）叩いた場合だけ。そこを現在値へ落とすと、
+    // 一度採用したペインが `adopt default` でも戻せなくなる（採用先が専用なので
+    // 「専用で起動した master」と誤判定される = 実測で踏んだ）。
+    // 明示の操作を推測で拒まず、prompt の食い違いは警告で知らせる
+    let launched_as = caller_role
+        .and_then(tako_core::handoff::master_profile_of_any_role)
+        .unwrap_or(tako_core::handoff::DEFAULT_PROFILE)
+        .to_string();
+    let launched = orchestrator::Profile::load(&launched_as).unwrap_or_default();
+
+    // 対象の解決: ① 既存プロファイル → ② projects.yaml のキー（その場で生成）→ ③ エラー
+    let target_path = orchestrator::ProfileKind::Master
+        .path(name)
+        .map_err(DispatchError::InvalidParams)?;
+    let mut generated = ProfileGenReport::none();
+    if !target_path.is_file() {
+        let known_project = orchestrator::ProjectsConfig::load()
+            .map(|c| c.projects.contains_key(name))
+            .unwrap_or(false);
+        if !known_project {
+            let profiles = orchestrator::list_profiles().unwrap_or_default();
+            let projects = orchestrator::ProjectsConfig::load()
+                .map(|c| c.projects.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            return Err(DispatchError::Operation(format!(
+                "'{name}' はプロファイルでもプロジェクトでもない。\n\
+                 プロファイル: {}\n\
+                 プロジェクト: {}\n\
+                 プロジェクトを先に登録するには: tako orchestrator projects add --key {name} --cwd <path>",
+                if profiles.is_empty() { "（なし）".into() } else { profiles.join(" / ") },
+                if projects.is_empty() { "（なし）".into() } else { projects.join(" / ") },
+            )));
+        }
+        generated = ProfileGenReport::of(&orchestrator::ensure_project_profile(name));
+    }
+    let target = orchestrator::Profile::load(name).map_err(DispatchError::Operation)?;
+
+    let decision = orchestrator::decide_adopt(
+        orchestrator::RunningMaster {
+            current_name: &current_name,
+            launched_as: &launched_as,
+            launched: &launched,
+        },
+        name,
+        &target,
+    );
+    let warnings = match decision {
+        orchestrator::AdoptDecision::Refused { reason } => {
+            return Err(DispatchError::Operation(reason))
+        }
+        orchestrator::AdoptDecision::Unchanged => Vec::new(),
+        orchestrator::AdoptDecision::Adopt { warnings } => warnings,
+    };
+
+    let new_role = tako_core::handoff::master_pane_role(name);
+    let legacy = orchestrator::legacy_auto_profile();
+    let changed = !legacy && pane_role.as_deref() != Some(new_role.as_str());
+    let mut limit_resume = false;
+    if !legacy {
+        // role ラベルの貼り替え。**ここが adopt の唯一の書き換え**（#1453 の番犬が
+        // 「adopt を経由しない master の role 書き換え」が増えていないかを見張る）
+        let pane_obj = tree_mut(host.workspace_mut(), tab_id)
+            .get_mut(pane_id)
+            .ok_or_else(|| op_err("ペインが見つからない"))?;
+        pane_obj.set_role(Some(new_role.clone()));
+        // タブ名 / 表示名の形は `tako master -<名前>` と同じ 1 実装から採る（#761 の語彙）
+        pane_obj.set_title(Some(orchestrator::master_launch::tab_title_for(name)));
+        // #1140 の 1 実装。採用先のプロファイル既定を本人のペインへ配る
+        apply_master_pane_profile_defaults(pane_obj, Some(new_role.as_str()));
+        limit_resume = pane_obj.limit_autoresume();
+    }
+    if changed {
+        crate::diag::persist_log(&format!(
+            "[adopt] pane={} profile:{current_name} -> profile:{name} generated={} source={}",
+            pane_id.as_u64(),
+            generated.created,
+            profile_source.as_str()
+        ));
+    }
+
+    let jurisdiction = target.projects.clone().unwrap_or_default();
+    let project_handoffs: Vec<Value> = jurisdiction
+        .iter()
+        .map(|key| {
+            json!({
+                "project": key,
+                "path": orchestrator::handoff_store::project_handoff_path(key)
+                    .map(|p| p.display().to_string()),
+                "exists": orchestrator::handoff_store::read_project_handoff(key).is_some(),
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "pane_id": pane_id.as_u64(),
+        "tab_id": tab_id.as_u64(),
+        "profile": if legacy { current_name.clone() } else { name.to_string() },
+        "previous_profile": current_name,
+        "profile_source": profile_source.as_str(),
+        // 起動時のプロファイル（拒否の判断はこちらを見る）。current と違えば
+        // 「この会話ですでに採用している」ということ
+        "launched_as": launched_as,
+        "role": if legacy { pane_role.unwrap_or_default() } else { new_role },
+        // 実際に貼り替えたか（同じプロファイルへの 2 回目は false = 冪等）
+        "changed": changed,
+        "profile_generated": generated.created,
+        "profile_generation": generated.kind,
+        "profile_path": target_path.display().to_string(),
+        "projects": jurisdiction,
+        "handoff_path": orchestrator::handoff_path(name).map(|p| p.display().to_string()),
+        "project_handoffs": project_handoffs,
+        // 採用の効きが一目で分かるよう、引き継ぎの後任がどう立つかを返す
+        "successor_command": tako_core::handoff::master_launch_command(name),
+        "limit_resume": limit_resume,
+        "warnings": warnings,
+        // #1453 の A/B。true なら TAKO_1453_LEGACY=1 で何も書き換えていない
+        "legacy": legacy,
+    }))
+}
+
+/// 自動生成の結果を応答へ載せるための小さな写し（#1453）
+struct ProfileGenReport {
+    created: bool,
+    kind: &'static str,
+}
+
+impl ProfileGenReport {
+    fn none() -> Self {
+        Self {
+            created: false,
+            kind: "exists",
+        }
+    }
+
+    fn of(gen: &crate::orchestrator::ProfileGen) -> Self {
+        Self {
+            created: gen.created(),
+            kind: gen.kind(),
+        }
     }
 }
 
@@ -15164,6 +15404,8 @@ mod tests {
                 topic: None,
                 profile: Some("default".into()),
                 caller_role: None,
+                pane: None,
+                caller_pid: None,
             },
             PaneOrigin::Mcp,
         )
@@ -15179,6 +15421,8 @@ mod tests {
                     topic: Some(g.topic.into()),
                     profile: Some("default".into()),
                     caller_role: None,
+                    pane: None,
+                    caller_pid: None,
                 },
                 PaneOrigin::Mcp,
             )
@@ -15205,6 +15449,8 @@ mod tests {
                 topic: Some("acceptance".into()),
                 profile: None,
                 caller_role: Some("master:takodev".into()),
+                pane: None,
+                caller_pid: None,
             },
             PaneOrigin::Mcp,
         )
@@ -15218,6 +15464,8 @@ mod tests {
                 topic: Some("nope".into()),
                 profile: None,
                 caller_role: None,
+                pane: None,
+                caller_pid: None,
             },
             PaneOrigin::Mcp,
         )
@@ -18090,8 +18338,10 @@ mod tests {
     // --- #109: 複数 master 並行時の caller_role による正しい master 特定 ---
 
     /// with_test_project の直列化ロック。共有キーを並列テストが同時に
-    /// 追加・削除すると解決失敗のレースが起きるため（#120 でテストが増えて顕在化）
-    static TEST_PROJECT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// 追加・削除すると解決失敗のレースが起きるため（#120 でテストが増えて顕在化）。
+    /// **正本は `orchestrator` 側の 1 つ**（#1453。別々に持つと orchestrator の
+    /// 単体テストと直列化できず、バックアップの繰り下げが競合する）
+    use crate::orchestrator::TEST_PROJECT_LOCK;
 
     /// テスト用に一時プロジェクトを projects.yaml に追加し、テスト後に削除する。
     /// config_dir を隔離ディレクトリへ差し替え、実運用の projects.yaml と
@@ -20809,6 +21059,382 @@ mod tests {
     }
 
     // --- #123 / #193: OrchestratorSelf + OrchestratorHandoff ---
+
+    // --- #1453: 採用（adopt）が実 dispatch でどう効くか ------------------------
+
+    /// 採用の検証用に「素の master ペイン」と登録済みプロジェクトを用意する。
+    /// `config_dir` はテストビルドで隔離先へ倒れるので本番の profiles/ は触らない
+    fn t1453_master_host(project: &str) -> (MockHost, u64) {
+        crate::orchestrator::ensure_defaults().expect("隔離先の初期化");
+        // 前回の残骸を消す（同じ隔離先を全テストで共有するので、引き継ぎファイルが
+        // 残っていると「材料が無い」を見る既存テストを汚す）
+        t1453_cleanup(project);
+        let _ = std::fs::remove_file(
+            crate::orchestrator::ProfileKind::Master
+                .path(project)
+                .expect("パス"),
+        );
+        // 生成したプロファイルは projects.yaml の cwd をそのまま継ぐ（#1453）ので、
+        // 引き継ぎまで通す検証では実在するフォルダを登録する
+        let repo = std::env::temp_dir().join(format!("tako-test-scratch-{}", std::process::id()));
+        std::fs::create_dir_all(&repo).expect("検証用フォルダ");
+        crate::orchestrator::ProjectsConfig::mutate(|c| {
+            c.add(project.into(), repo.display().to_string(), None)
+        })
+        .expect("プロジェクト登録");
+
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(pane),
+                title: None,
+                // 素の `tako master` が貼る role ラベル（= default）
+                role: Some("orchestrator-master".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        (host, pane)
+    }
+
+    /// この Issue の検証が隔離先へ作ったものを消す（**共有の config_dir を汚さない**）
+    fn t1453_cleanup(project: &str) {
+        if let Ok(path) = crate::orchestrator::ProfileKind::Master.path(project) {
+            let _ = std::fs::remove_file(&path);
+        }
+        if let Some(path) = crate::orchestrator::handoff_store::project_handoff_path(project) {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Some(path) = crate::orchestrator::handoff_path(project) {
+            let _ = std::fs::remove_file(path);
+        }
+        let _ = crate::orchestrator::ProjectsConfig::mutate(|c| c.remove(project));
+    }
+
+    fn t1453_adopt(host: &mut MockHost, pane: u64, name: &str) -> Result<Value, DispatchError> {
+        dispatch(
+            host,
+            Request::OrchestratorAdopt {
+                name: name.into(),
+                pane: Some(pane),
+                // 素の master の env（default）。pane_role が勝つことがこの機能の土台
+                caller_role: Some("master".into()),
+                caller_pid: None,
+            },
+            PaneOrigin::Mcp,
+        )
+    }
+
+    fn t1453_self(host: &mut MockHost, pane: u64) -> Value {
+        dispatch(
+            host,
+            Request::OrchestratorSelf {
+                pane: Some(pane),
+                caller_role: Some("master".into()),
+                caller_pid: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap()
+    }
+
+    /// 受け入れ条件 3: **同じペインのまま** role ラベル・self の profile /
+    /// handoff_path / project_handoffs が切り替わる
+    #[test]
+    fn issue1453_adoptは同じペインのままprofileを切り替える() {
+        // config_dir はプロセス共有。引き継ぎファイルを作る / 消すので直列化する
+        let _guard = TEST_PROJECT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let project = "_tako_1453_d1_";
+        let (mut host, pane) = t1453_master_host(project);
+        // 途中で panic しても隔離先へ残さない
+        struct Cleanup(&'static str);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                t1453_cleanup(self.0);
+            }
+        }
+        let _cleanup = Cleanup(project);
+
+        let before = t1453_self(&mut host, pane);
+        assert_eq!(before["profile"].as_str(), Some("default"));
+        assert!(
+            before["handoff_path"]
+                .as_str()
+                .expect("パス")
+                .ends_with("default.md"),
+            "採用前の引き継ぎ先が default でない: {before}"
+        );
+        assert_eq!(
+            before["project_handoffs"].as_array().map(Vec::len),
+            Some(0),
+            "採用前から管轄がある: {before}"
+        );
+
+        let res = t1453_adopt(&mut host, pane, project).expect("採用が通る");
+        assert_eq!(res["pane_id"].as_u64(), Some(pane), "ペインが変わっている");
+        assert_eq!(res["changed"].as_bool(), Some(true));
+        assert_eq!(res["profile"].as_str(), Some(project));
+        assert_eq!(res["previous_profile"].as_str(), Some("default"));
+        // まだプロファイルが無かったので、その場で作られている
+        assert_eq!(res["profile_generated"].as_bool(), Some(true));
+        assert_eq!(
+            res["successor_command"].as_str(),
+            Some(format!("tako master -{project}").as_str()),
+            "後任の起動コマンドが採用先になっていない: {res}"
+        );
+
+        // ペインの role ラベルが正本。**これ 1 つ**が書き換わっている
+        let role = host.workspace().tabs().iter().find_map(|t| {
+            t.tree()
+                .panes()
+                .iter()
+                .find(|p| p.id().as_u64() == pane)
+                .and_then(|p| p.role().map(str::to_string))
+        });
+        assert_eq!(
+            role.as_deref(),
+            Some(&format!("orchestrator-master:{project}")[..])
+        );
+
+        // self が追従する（同じペイン ID のまま）
+        let after = t1453_self(&mut host, pane);
+        assert_eq!(after["pane_id"].as_u64(), Some(pane));
+        assert_eq!(after["profile"].as_str(), Some(project));
+        assert_eq!(after["profile_source"].as_str(), Some("pane_role"));
+        assert!(
+            after["handoff_path"]
+                .as_str()
+                .expect("パス")
+                .ends_with(&format!("{project}.md")),
+            "引き継ぎ先が採用先になっていない: {after}"
+        );
+        let jurisdiction: Vec<&str> = after["project_handoffs"]
+            .as_array()
+            .expect("配列")
+            .iter()
+            .filter_map(|v| v["project"].as_str())
+            .collect();
+        assert_eq!(jurisdiction, vec![project], "管轄が決まっていない: {after}");
+    }
+
+    /// 受け入れ条件 4: 採用後の handoff が採用先で後任を立て、
+    /// 引き継ぎファイルもそちら側になる
+    #[test]
+    fn issue1453_採用後のhandoffは採用先で後任を立てる() {
+        // config_dir はプロセス共有。引き継ぎファイルを作る / 消すので直列化する
+        let _guard = TEST_PROJECT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let project = "_tako_1453_d2_";
+        let (mut host, pane) = t1453_master_host(project);
+        // 途中で panic しても隔離先へ残さない
+        struct Cleanup(&'static str);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                t1453_cleanup(self.0);
+            }
+        }
+        let _cleanup = Cleanup(project);
+        t1453_adopt(&mut host, pane, project).expect("採用が通る");
+
+        // 引き継ぎの材料（プロジェクト単位のファイル）を用意する
+        crate::orchestrator::handoff_store::write_project_handoff(
+            project,
+            "## 知識\n- 採用後の引き継ぎ\n\n## 実行状態\n- worker なし\n",
+        )
+        .expect("引き継ぎファイルの作成");
+
+        let res = dispatch(
+            &mut host,
+            Request::OrchestratorHandoff {
+                pane: Some(pane),
+                caller_role: Some("master".into()),
+                tab: None,
+                caller_pid: None,
+                projects: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .expect("引き継ぎが通る");
+
+        assert_eq!(
+            res["profile"].as_str(),
+            Some(project),
+            "後任が default で立った: {res}"
+        );
+        assert_eq!(
+            res["role"].as_str(),
+            Some(format!("orchestrator-master:{project}").as_str())
+        );
+        assert!(
+            res["handoff_file"]
+                .as_str()
+                .expect("パス")
+                .ends_with(&format!("{project}.md")),
+            "運用メモの宛先が採用先でない: {res}"
+        );
+        let files: Vec<&str> = res["project_files"]
+            .as_array()
+            .expect("配列")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            files,
+            vec![project],
+            "プロジェクトの引き継ぎが渡っていない: {res}"
+        );
+    }
+
+    /// 冪等（2 回目は何もしない）と、汎用へ戻せること
+    #[test]
+    fn issue1453_同じ採用の2回目は変化なしでdefaultへ戻せる() {
+        // config_dir はプロセス共有。引き継ぎファイルを作る / 消すので直列化する
+        let _guard = TEST_PROJECT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let project = "_tako_1453_d3_";
+        let (mut host, pane) = t1453_master_host(project);
+        // 途中で panic しても隔離先へ残さない
+        struct Cleanup(&'static str);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                t1453_cleanup(self.0);
+            }
+        }
+        let _cleanup = Cleanup(project);
+        assert_eq!(
+            t1453_adopt(&mut host, pane, project).unwrap()["changed"].as_bool(),
+            Some(true)
+        );
+        let second = t1453_adopt(&mut host, pane, project).expect("2 回目も通る");
+        assert_eq!(
+            second["changed"].as_bool(),
+            Some(false),
+            "2 回目で書き換えた"
+        );
+        assert_eq!(second["profile"].as_str(), Some(project));
+        // 2 回目は生成もしない（冪等）
+        assert_eq!(second["profile_generated"].as_bool(), Some(false));
+
+        // default を渡すと汎用へ戻る
+        let back = t1453_adopt(&mut host, pane, "default").expect("戻せる");
+        assert_eq!(back["profile"].as_str(), Some("default"));
+        assert_eq!(
+            t1453_self(&mut host, pane)["profile"].as_str(),
+            Some("default")
+        );
+    }
+
+    /// 知らない名前は**候補つきで**断る（黙って作らない）
+    #[test]
+    fn issue1453_未知の名前は候補つきで断る() {
+        // config_dir はプロセス共有。引き継ぎファイルを作る / 消すので直列化する
+        let _guard = TEST_PROJECT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let project = "_tako_1453_d4_";
+        let (mut host, pane) = t1453_master_host(project);
+        // 途中で panic しても隔離先へ残さない
+        struct Cleanup(&'static str);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                t1453_cleanup(self.0);
+            }
+        }
+        let _cleanup = Cleanup(project);
+        let err = t1453_adopt(&mut host, pane, "_tako_1453_unknown_").unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("プロファイルでもプロジェクトでもない"),
+            "{msg}"
+        );
+        assert!(msg.contains("projects add"), "登録の手を案内しない: {msg}");
+    }
+
+    /// master でないペインには効かない（worker の role を master へ書き換えない）
+    #[test]
+    fn issue1453_masterでないペインは断る() {
+        // config_dir はプロセス共有。引き継ぎファイルを作る / 消すので直列化する
+        let _guard = TEST_PROJECT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let project = "_tako_1453_d5_";
+        let (mut host, pane) = t1453_master_host(project);
+        // 途中で panic しても隔離先へ残さない
+        struct Cleanup(&'static str);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                t1453_cleanup(self.0);
+            }
+        }
+        let _cleanup = Cleanup(project);
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(pane),
+                title: None,
+                role: Some("orchestrator-worker:1".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let err = dispatch(
+            &mut host,
+            Request::OrchestratorAdopt {
+                name: project.into(),
+                pane: Some(pane),
+                caller_role: None,
+                caller_pid: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("master ではない"), "{err:?}");
+    }
+
+    /// A/B: `TAKO_1453_LEGACY=1` は同一バイナリのまま「採用しない」旧挙動を再現する
+    #[test]
+    fn issue1453_legacyは何も書き換えない() {
+        // config_dir はプロセス共有。引き継ぎファイルを作る / 消すので直列化する
+        let _guard = TEST_PROJECT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let project = "_tako_1453_d6_";
+        let (mut host, pane) = t1453_master_host(project);
+        // 途中で panic しても隔離先へ残さない
+        struct Cleanup(&'static str);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                t1453_cleanup(self.0);
+            }
+        }
+        let _cleanup = Cleanup(project);
+        let restore = std::env::var("TAKO_1453_LEGACY").ok();
+        std::env::set_var("TAKO_1453_LEGACY", "1");
+        let res = t1453_adopt(&mut host, pane, project);
+        let after = t1453_self(&mut host, pane);
+        match restore {
+            Some(v) => std::env::set_var("TAKO_1453_LEGACY", v),
+            None => std::env::remove_var("TAKO_1453_LEGACY"),
+        }
+        // legacy ではプロファイルが無いまま = 採用の対象を解決できない
+        let err = res.expect_err("legacy で採用が通った");
+        assert!(
+            format!("{err:?}").contains("プロファイルでもプロジェクトでもない")
+                || format!("{err:?}").contains("見つからない"),
+            "{err:?}"
+        );
+        assert_eq!(
+            after["profile"].as_str(),
+            Some("default"),
+            "legacy なのに profile が動いた: {after}"
+        );
+    }
 
     #[test]
     fn orchestrator_selfがmaster_paneを返す() {

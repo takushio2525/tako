@@ -16,7 +16,7 @@ tako platform --status pending      # まだ使えないものだけ
 
 | 状態 | 件数 | 意味 |
 | --- | --- | --- |
-| 対応 | 117 / 151（77%） | macOS と同じように使えます |
+| 対応 | 118 / 152（78%） | macOS と同じように使えます |
 | 一部対応 | 15 | 使えますが機能が落ちます。落ち方は各表の「差分」列 |
 | 未実測 | 4 | 実装はあり macOS と同じ経路を通るが、Windows 実機でまだ動かしていないもの |
 | 未対応 | 13 | Windows 側の実装が無い、または動かないことが分かっているもの |
@@ -121,7 +121,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 
 ## AI 連携（オーケストレーション）
 
-対応 26・一部対応 2・未対応 / 未実測 1
+対応 27・一部対応 2・未対応 / 未実測 1
 
 | 機能 | 状態 | 差分 | 根拠 |
 | --- | --- | --- | --- |
@@ -132,6 +132,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 | `tako_orchestrator_profiles` | 対応 | — | 実機セルフテスト: 項目 96 / 99 / 117（設定画面のフォーム・スターターの ▾・limit_resume の既定） |
 | `tako_orchestrator_guide` | 対応 | — | 実機テスト: guide の単体 6 本と番犬 prompt_guides.rs（本文は include_str! の静的データで、プレースホルダ解決は platform::facts が OS 差を吸収する） |
 | `tako_orchestrator_projects` | 対応 | — | 実機セルフテスト: 項目 117（一時プロジェクトの登録と解除） |
+| `tako_orchestrator_adopt` | 対応 | — | 実機セルフテスト: 項目 146（自動生成 → 採用 → spawn 既定 → 引き継ぎ先の一連） |
 | `tako_orchestrator_accounts` | 対応 | — | 実機実測: #937 の Windows 11 実測: `accounts list`（空）→ `add --inherit` → `show` → `list`（1 件）→ `remove` → `list`（空）の往復 |
 | `tako_orchestrator_layout` | 対応 | — | 実機セルフテスト: 項目 72（master-reserved の配置と close 後のリフロー） |
 | `tako_orchestrator_workers` | 対応 | — | 実機セルフテスト: 項目 105（レジストリの登録・再読込・再解決） |
