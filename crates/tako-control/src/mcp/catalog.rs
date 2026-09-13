@@ -548,13 +548,20 @@ pub fn tools() -> Vec<Value> {
                 new = 新しいウィンドウを開く（tab 指定でそのタブを分離、省略で新規タブ付き）、\
                 close = ウィンドウを閉じる（タブは残存ウィンドウへ合流しプロセスは殺さない）、\
                 move-tab = タブを別ウィンドウへ移動、focus = ウィンドウをアクティブにして前面化、\
-                minimize = 最小化、maximize = 最大化、restore = 最大化を解除して元のサイズへ戻す。",
+                minimize = 最小化、maximize = 最大化、restore = 最大化を解除して元のサイズへ戻す、\
+                move = 窓を動かす（x / y は置き先ディスプレイの左上を原点とする座標）、\
+                resize = 窓の寸法を変える（位置は動かさない）。\
+                list の各ウィンドウには現在の矩形（bounds）が載る。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["list", "new", "close", "move-tab", "focus", "minimize", "maximize", "restore"], "description": "省略時は list" },
+                    "action": { "type": "string", "enum": ["list", "new", "close", "move-tab", "focus", "minimize", "maximize", "restore", "move", "resize"], "description": "省略時は list" },
                     "tab": { "type": "integer", "minimum": 0, "description": "new: 分離するタブ ID（省略で新規タブ）/ move-tab: 移動するタブ ID" },
-                    "window": { "type": "integer", "minimum": 0, "description": "close / move-tab / focus の対象ウィンドウ ID。minimize / maximize / restore は省略でアクティブウィンドウ" },
+                    "window": { "type": "integer", "minimum": 0, "description": "close / move-tab / focus の対象ウィンドウ ID。minimize / maximize / restore / move / resize は省略でアクティブウィンドウ" },
+                    "x": { "type": "number", "description": "move: 左端（置き先ディスプレイ内の座標）" },
+                    "y": { "type": "number", "description": "move: 上端（置き先ディスプレイ内の座標）" },
+                    "width": { "type": "number", "description": "resize: 幅" },
+                    "height": { "type": "number", "description": "resize: 高さ" },
                 },
                 "additionalProperties": false,
             },

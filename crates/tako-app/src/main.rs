@@ -89,6 +89,8 @@ use tako_control::{
 };
 use tako_core::claude_resume::legacy_1076;
 use tako_core::pane_log::CloseOrigin;
+// 窓の位置・寸法の正本（#1442）。env / CLI / MCP がすべてここを通る
+use tako_core::platform::window_bounds as wb;
 use tako_core::{
     ratio_for_position, AgentMetrics, CommandState, Pane, PaneId, PaneOrigin, Rect, SelectionKind,
     SessionNotice, SpawnOptions, SplitAxis, SplitDirection, TabId, TerminalSession, Theme,
@@ -124,6 +126,18 @@ fn legacy_1191() -> bool {
 fn legacy_1425() -> bool {
     static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *LEGACY.get_or_init(|| std::env::var("TAKO_1425_LEGACY").as_deref() == Ok("1"))
+}
+
+/// #1442 の A/B。`TAKO_1442_LEGACY=1` で**同一バイナリのまま**旧挙動
+/// （窓の位置・寸法を外から決められない = `TAKO_WINDOW_BOUNDS` を読まず、
+/// `window move` / `resize` も実適用しない）へ戻す。
+///
+/// 隔離検証で窓を並べたいときに AX（System Events）へ逃げると、AX は複数の
+/// tako-app を unix id にかかわらず同一プロセスとして返し**本番 tako の窓が動く**
+/// （#1442 の症状 2）。逃げ道はこの 1 つに閉じる
+fn legacy_1442() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_1442_LEGACY").as_deref() == Ok("1"))
 }
 
 /// #812 の A/B。`TAKO_812_LEGACY=1` で**同一バイナリのまま**旧挙動
@@ -2363,6 +2377,9 @@ struct TakoApp {
     /// CLI / MCP から依頼された OS ウィンドウの表示状態操作（Issue #584）。
     /// GPUI の Context が要るため `sync_viewports` で消費する
     pending_window_states: Vec<(tako_core::WindowId, tako_control::protocol::WindowStateOp)>,
+    /// CLI / MCP から依頼された窓の位置・寸法（#1442）。`pending_window_states` と
+    /// 同じく GPUI の Context が要るので `sync_viewports` が消費する
+    pending_window_geometry: Vec<(tako_core::WindowId, tako_control::protocol::WindowGeometry)>,
     /// in-window メニューバーの開閉状態（Issue #657。Windows のみ描画される）
     menu_bar: menu_bar::MenuBarState,
     /// メニュー定義のキャッシュ（Issue #657）。`app_menus()` は毎回 `Box<dyn Action>` を
@@ -4055,6 +4072,7 @@ impl TakoApp {
                 .collect(),
             pending_viewport_opens: Vec::new(),
             pending_window_states: Vec::new(),
+            pending_window_geometry: Vec::new(),
             menu_bar: menu_bar::MenuBarState::default(),
             menu_defs: Vec::new(),
             menu_trigger_layout: Vec::new(),
@@ -11365,6 +11383,17 @@ impl TakoApp {
             };
             cx.defer(move |cx| {
                 let _ = handle.update(cx, |_, window, _| apply_window_state(window, op));
+            });
+        }
+        // CLI / MCP からの位置・寸法の指定（#1442）。最小化 / 最大化と同じ経路
+        for (lid, geometry) in std::mem::take(&mut self.pending_window_geometry) {
+            let Some((_, handle)) = self.viewports.iter().find(|(l, _)| *l == lid).copied() else {
+                continue;
+            };
+            cx.defer(move |cx| {
+                let _ = handle.update(cx, |_, window, cx| {
+                    apply_window_geometry(window, geometry, cx)
+                });
             });
         }
         self.drain_menu_ops(cx);
@@ -20248,6 +20277,43 @@ impl UiStateHost for TakoApp {
         self.pending_window_states.push((window, op));
     }
 
+    fn request_window_geometry(
+        &mut self,
+        window: tako_core::WindowId,
+        geometry: tako_control::protocol::WindowGeometry,
+    ) {
+        // 位置・寸法（#1442）も同じ経路で消費する
+        self.pending_window_geometry.push((window, geometry));
+        // **依頼した矩形をその場で記録する**（#1442）。`window_frames` は render でしか
+        // 更新されないので、これが無いと `window move` の直後の `window resize` が
+        // **古い位置**を土台にして移動を打ち消す（実測: セルフテスト項目 77b が
+        // `指定 40,40,1000,700 → 実測 800,420,1000,700` で落ちた）。依頼は
+        // 「これから置く矩形」なので続く操作もそれを土台にし、実測値は次の render が
+        // 上書きする（OS が丸めたぶんはそこで直る）
+        let state = self
+            .window_frames
+            .get(&window)
+            .map(|f| f.state.clone())
+            .unwrap_or_else(|| "windowed".into());
+        self.window_frames.insert(
+            window,
+            tako_control::layout::WindowFrame {
+                x: geometry.x,
+                y: geometry.y,
+                width: geometry.width,
+                height: geometry.height,
+                state,
+            },
+        );
+    }
+
+    fn window_frame(
+        &self,
+        window: tako_core::WindowId,
+    ) -> Option<tako_control::layout::WindowFrame> {
+        self.window_frames.get(&window).cloned()
+    }
+
     fn menu_bar_snapshot(&self) -> tako_control::protocol::MenuBarSnapshot {
         self.build_menu_bar_snapshot()
     }
@@ -24334,6 +24400,177 @@ fn apply_window_state(window: &mut Window, op: tako_control::protocol::WindowSta
     }
 }
 
+/// CLI / MCP からのウィンドウの位置・寸法の適用（Issue #1442）。
+///
+/// 矩形は **GPUI がウィンドウ矩形として読み書きする空間**（`window.bounds()` と同じ）。
+/// 座標の解釈・検査は `tako_core::platform::window_bounds` が済ませてあるので、
+/// ここは「その矩形へ置く」だけを行う。
+///
+/// GPUI が公開しているのは `Window::resize`（寸法のみ）だけで**移動の口が無い**ので、
+/// 位置は OS へ直接頼む（`restore_window` が user32 を直に呼ぶのと同じ作法）。
+/// 寸法も同じ 1 回の呼び出しで渡す: `Window::resize` は macOS では
+/// `setContentSize:` を**別スレッドへ投げる**ので、直後に位置を当てると
+/// どちらが先に効くかで最終位置が揺れる
+fn apply_window_geometry(
+    window: &mut Window,
+    geometry: tako_control::protocol::WindowGeometry,
+    cx: &mut App,
+) {
+    if legacy_1442() {
+        return;
+    }
+    let display_id = window.display(cx).map(|d| u64::from(d.id()));
+    set_window_frame(window, geometry, display_id);
+}
+
+/// 窓の矩形を OS へ当てる（macOS）。
+///
+/// GPUI の窓矩形は「**そのディスプレイの左上が原点**・y は下向き」（`MacDisplay::bounds`
+/// の原点が常に `(0,0)` で、窓の生成・読み戻しの両方が画面の原点を足し引きしている）。
+/// NSWindow の frame は「**主ディスプレイの左下が原点**・y は上向き」なので、
+/// CoreGraphics のグローバル矩形（左上原点）を挟んで変換する。
+#[cfg(target_os = "macos")]
+fn set_window_frame(
+    window: &Window,
+    geometry: tako_control::protocol::WindowGeometry,
+    display_id: Option<u64>,
+) {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CgPoint {
+        x: f64,
+        y: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CgSize {
+        width: f64,
+        height: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CgRect {
+        origin: CgPoint,
+        size: CgSize,
+    }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGMainDisplayID() -> u32;
+        fn CGDisplayBounds(display: u32) -> CgRect;
+    }
+    // 宣言はクレート内の既存（`platform/pdf/macos.rs`）と**同じ形**にする。
+    // 別の型で宣言し直すと `clashing_extern_declarations` で落ちる
+    #[link(name = "objc", kind = "dylib")]
+    unsafe extern "C" {
+        fn sel_registerName(name: *const u8) -> *const c_void;
+        fn objc_msgSend(receiver: *const c_void, sel: *const c_void, ...) -> *const c_void;
+    }
+
+    /// `setFrame:display:` を呼ぶための型。**可変長で呼んではいけない**:
+    /// Apple ARM64 の可変長引数はスタックへ積まれるので、NSRect をそのまま渡すと
+    /// 引数が壊れる。同じシンボルを非可変長の型で呼び直す
+    type SetFrame = unsafe extern "C" fn(*const c_void, *const c_void, CgRect, bool);
+
+    let Ok(handle) = raw_window_handle::HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let raw_window_handle::RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return;
+    };
+    // SAFETY: NSView は GPUI が窓を持っているあいだ有効。ここはメインスレッド
+    // （`cx.defer` の中）なので AppKit を直接叩いてよい
+    unsafe {
+        let ns_view = appkit.ns_view.as_ptr() as *const c_void;
+        let ns_window = objc_msgSend(ns_view, sel_registerName(c"window".as_ptr() as *const u8));
+        if ns_window.is_null() {
+            return;
+        }
+        let display = display_id
+            .map(|id| id as u32)
+            .unwrap_or_else(|| CGMainDisplayID());
+        let db = CGDisplayBounds(display);
+        let main_height = CGDisplayBounds(CGMainDisplayID()).size.height;
+        // 置き先ディスプレイ内の座標 → グローバル（左上原点）→ Cocoa（左下原点）
+        let global_x = db.origin.x + f64::from(geometry.x);
+        let global_top = db.origin.y + f64::from(geometry.y);
+        let frame = CgRect {
+            origin: CgPoint {
+                x: global_x,
+                y: main_height - (global_top + f64::from(geometry.height)),
+            },
+            size: CgSize {
+                width: f64::from(geometry.width),
+                height: f64::from(geometry.height),
+            },
+        };
+        let set_frame: SetFrame = std::mem::transmute(objc_msgSend as *const ());
+        set_frame(
+            ns_window,
+            sel_registerName(c"setFrame:display:".as_ptr() as *const u8),
+            frame,
+            true,
+        );
+    }
+}
+
+/// 窓の矩形を OS へ当てる（Windows。Issue #1442）。
+///
+/// GPUI Windows の窓矩形は仮想デスクトップのグローバル座標を DPI 倍率で割った
+/// **論理ピクセル**（`logical_point(x, y, scale_factor)`）なので、`SetWindowPos` へ
+/// 渡すときは倍率を掛けて物理ピクセルへ戻す。
+#[cfg(target_os = "windows")]
+fn set_window_frame(
+    window: &Window,
+    geometry: tako_control::protocol::WindowGeometry,
+    _display_id: Option<u64>,
+) {
+    /// `SWP_NOZORDER | SWP_NOACTIVATE`（winuser.h）。前後関係と入力焦点は動かさない
+    const SWP_FLAGS: u32 = 0x0004 | 0x0010;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn SetWindowPos(
+            hwnd: isize,
+            insert_after: isize,
+            x: i32,
+            y: i32,
+            cx: i32,
+            cy: i32,
+            flags: u32,
+        ) -> i32;
+    }
+
+    let Some(hwnd) = native_window_handle(window) else {
+        return;
+    };
+    let scale = window.scale_factor();
+    // SAFETY: HWND は GPUI が生きているあいだ有効。SetWindowPos は対象ウィンドウの
+    // スレッドへ送るだけで、この場でブロックしない
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            0,
+            (geometry.x * scale) as i32,
+            (geometry.y * scale) as i32,
+            (geometry.width * scale) as i32,
+            (geometry.height * scale) as i32,
+            SWP_FLAGS,
+        );
+    }
+}
+
+/// 窓の矩形を OS へ当てる（macOS / Windows 以外）。移動の口が無いので寸法だけ当てる
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn set_window_frame(
+    _window: &Window,
+    _geometry: tako_control::protocol::WindowGeometry,
+    _display_id: Option<u64>,
+) {
+}
+
 /// メニューの「拡大 / 縮小」（`ZoomWindow`）の実体（macOS。Issue #657）。
 ///
 /// NSWindow の zoom はトグルなので**現状のまま**素直に呼ぶ（挙動不変）
@@ -24825,8 +25062,68 @@ fn centered_on_target(size: Size<Pixels>, cx: &App) -> Bounds<Pixels> {
     Bounds::centered(target_display_id(), size, cx)
 }
 
+/// 置き先のディスプレイの矩形（#1141 の `Placement` 由来。未解決なら `None`）。
+/// `TAKO_WINDOW_BOUNDS` の座標を「そのディスプレイ内の座標」として読むのに要る
+fn target_display_rect() -> Option<tako_core::platform::display::DisplayRect> {
+    tako_core::platform::display::placement()
+        .and_then(|p| p.resolved)
+        .and_then(|d| d.rect)
+}
+
+/// 既定の窓の大きさ（[`wb::DEFAULT_WIDTH`] x [`wb::DEFAULT_HEIGHT`]）。
+/// **1 実装**にしておかないと、既定を変えたつもりで片方だけ残る
+fn default_window_size() -> Size<Pixels> {
+    size(px(wb::DEFAULT_WIDTH), px(wb::DEFAULT_HEIGHT))
+}
+
+/// `TAKO_WINDOW_BOUNDS`（#1442）から初期の窓矩形を決める。
+///
+/// 撥ねた指定（読めない形・最小寸法未満・置き先からはみ出す）は**黙って落とさず**
+/// persist.log へ理由を残してから既定へ落ちる。起動を止めるほどの話ではないが、
+/// 「指定したのに効かない」を persist.log を読まずに気づけないのは #1160 と同じ失敗
+fn requested_window_bounds() -> Option<Bounds<Pixels>> {
+    if legacy_1442() {
+        return None;
+    }
+    let spec = wb::env_spec()?;
+    let display = target_display_rect();
+    let resolved = wb::parse(&spec).and_then(|s| {
+        wb::resolve(
+            &s,
+            wb::default_rect(display),
+            display,
+            // 大きさだけ指定したら中央に出るのが素直（窓の大きさを揃える用途）
+            wb::OriginDefault::Center,
+        )
+    });
+    match resolved {
+        Ok(r) => {
+            tako_control::diag::persist_log(&format!(
+                "{}={spec} を適用: {}x{} @ {},{}",
+                wb::ENV_WINDOW_BOUNDS,
+                r.width,
+                r.height,
+                r.x,
+                r.y
+            ));
+            Some(Bounds::new(
+                point(px(r.x), px(r.y)),
+                size(px(r.width), px(r.height)),
+            ))
+        }
+        Err(reason) => {
+            tako_control::diag::persist_log(&format!(
+                "{}={spec} を無視して既定へ落ちた: {reason}",
+                wb::ENV_WINDOW_BOUNDS
+            ));
+            None
+        }
+    }
+}
+
 /// 保存済みフレーム（FR-5）から初期の窓矩形を決める。
 ///
+/// **明示の指定（`TAKO_WINDOW_BOUNDS`）が最優先**（#1442）。次に
 /// **置き先のディスプレイが決まっていれば保存位置より置き先が勝つ**（#1141）。
 /// 保存された座標はメイン画面のものなので、そのまま使うと隔離起動の窓が
 /// ユーザーの画面へ戻ってしまう。ユーザーの保存値は書き換えないので、
@@ -24835,12 +25132,16 @@ fn initial_window_bounds(
     saved_frame: Option<tako_control::layout::WindowFrame>,
     cx: &App,
 ) -> WindowBounds {
+    if let Some(bounds) = requested_window_bounds() {
+        return WindowBounds::Windowed(bounds);
+    }
     if target_display_id().is_some() {
-        return WindowBounds::Windowed(centered_on_target(size(px(960.), px(600.)), cx));
+        return WindowBounds::Windowed(centered_on_target(default_window_size(), cx));
     }
     match saved_frame {
-        // 壊れた保存値（極端に小さい等）は既定へフォールバック
-        Some(f) if f.width >= 200.0 && f.height >= 150.0 => {
+        // 壊れた保存値（極端に小さい等）は既定へフォールバック。下限は
+        // `window move` / `resize` が撥ねる下限と**同じ 1 実装**（#1442）
+        Some(f) if f.width >= wb::MIN_WIDTH && f.height >= wb::MIN_HEIGHT => {
             let bounds = Bounds::new(point(px(f.x), px(f.y)), size(px(f.width), px(f.height)));
             match f.state.as_str() {
                 "fullscreen" => WindowBounds::Fullscreen(bounds),
@@ -24848,7 +25149,7 @@ fn initial_window_bounds(
                 _ => WindowBounds::Windowed(bounds),
             }
         }
-        _ => WindowBounds::Windowed(centered_on_target(size(px(960.), px(600.)), cx)),
+        _ => WindowBounds::Windowed(centered_on_target(default_window_size(), cx)),
     }
 }
 
@@ -24894,9 +25195,8 @@ fn open_viewport_window(
     bounds: Option<WindowBounds>,
     cx: &mut App,
 ) {
-    let bounds = bounds.unwrap_or_else(|| {
-        WindowBounds::Windowed(centered_on_target(size(px(960.), px(600.)), cx))
-    });
+    let bounds = bounds
+        .unwrap_or_else(|| WindowBounds::Windowed(centered_on_target(default_window_size(), cx)));
     let opened = cx.open_window(
         WindowOptions {
             window_bounds: Some(bounds),
@@ -49785,6 +50085,180 @@ mod self_test {
                     }
                 });
                 wait(cx, 800).await;
+
+                // 77b. 窓の位置・寸法を外から決める（#1442）: CLI / MCP と同じ dispatch で
+                //      move / resize が効き、撥ねる指定はエラーで返って窓が動かない。
+                //      **AX（System Events）を使わない**のがこの項目の要点で、AX は複数の
+                //      tako-app を同一プロセスとして返すため本番 tako の窓に当たる
+                {
+                    let list = window
+                        .update(cx, |app, _, _| {
+                            tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::WindowList,
+                                tako_core::PaneOrigin::Cli,
+                            )
+                            .ok()
+                        })
+                        .ok()
+                        .flatten();
+                    let dw = list
+                        .as_ref()
+                        .and_then(|v| v["display"]["width"].as_f64())
+                        .unwrap_or(0.0) as f32;
+                    let dh = list
+                        .as_ref()
+                        .and_then(|v| v["display"]["height"].as_f64())
+                        .unwrap_or(0.0) as f32;
+                    let read_bounds = |handle: &gpui::WindowHandle<TakoApp>, cx: &mut gpui::AsyncApp| {
+                        handle
+                            .update(cx, |_, w, _| match w.window_bounds() {
+                                WindowBounds::Windowed(b)
+                                | WindowBounds::Maximized(b)
+                                | WindowBounds::Fullscreen(b) => b,
+                            })
+                            .ok()
+                    };
+                    let before = read_bounds(&window, cx);
+                    // 置き先の大きさが読めないと「収まる指定」を作れない。
+                    // **黙って飛ばさず**、読めなかったことを 1 行残して測れる形にする
+                    println!(
+                        "TAKO_SELF_TEST_77B: 開始 display={dw}x{dh} before={:?}",
+                        before.map(|b| (
+                            f32::from(b.origin.x),
+                            f32::from(b.origin.y),
+                            f32::from(b.size.width),
+                            f32::from(b.size.height)
+                        ))
+                    );
+                    check(
+                        dw >= 400.0 && dh >= 300.0 && before.is_some(),
+                        "window move / resize: 置き先の大きさと現在の矩形が読める (#1442)",
+                    );
+                    if let Some(before) = before.filter(|_| dw >= 400.0 && dh >= 300.0) {
+                        // 置き先に確実に収まる矩形（指定は**ディスプレイ内の座標**）
+                        let (tx, ty) = (40.0_f32, 40.0_f32);
+                        let tw = (dw - 120.0).clamp(320.0, 1000.0);
+                        let th = (dh - 120.0).clamp(240.0, 700.0);
+                        let apply = |handle: &gpui::WindowHandle<TakoApp>,
+                                     cx: &mut gpui::AsyncApp,
+                                     req: tako_control::protocol::Request| {
+                            handle
+                                .update(cx, |app, _, cx| {
+                                    let r = tako_control::dispatch(
+                                        app,
+                                        req,
+                                        tako_core::PaneOrigin::Cli,
+                                    );
+                                    app.sync_viewports("selftest", cx);
+                                    r.is_ok()
+                                })
+                                .unwrap_or(false)
+                        };
+                        let move_ok = apply(
+                            &window,
+                            cx,
+                            tako_control::protocol::Request::WindowMove {
+                                window: None,
+                                x: tx,
+                                y: ty,
+                            },
+                        );
+                        let resize_ok = apply(
+                            &window,
+                            cx,
+                            tako_control::protocol::Request::WindowResize {
+                                window: None,
+                                width: tw,
+                                height: th,
+                            },
+                        );
+                        check(
+                            move_ok && resize_ok,
+                            "window move / resize の dispatch が成功する (#1442)",
+                        );
+                        wait(cx, 1200).await;
+                        let after = read_bounds(&window, cx);
+                        let hit = after
+                            .map(|b| {
+                                let d = |a: Pixels, b: f32| (f32::from(a) - b).abs() <= 2.0;
+                                d(b.origin.x, tx)
+                                    && d(b.origin.y, ty)
+                                    && d(b.size.width, tw)
+                                    && d(b.size.height, th)
+                            })
+                            .unwrap_or(false);
+                        println!(
+                            "TAKO_SELF_TEST_77B: 指定 {tx},{ty},{tw},{th} → 実測 {:?} hit={hit} \
+                             legacy={}",
+                            after.map(|b| (
+                                f32::from(b.origin.x),
+                                f32::from(b.origin.y),
+                                f32::from(b.size.width),
+                                f32::from(b.size.height)
+                            )),
+                            legacy_1442(),
+                        );
+                        // **`TAKO_1442_LEGACY=1` ではここが FAILED になるのが正しい**
+                        // （同じバイナリで回帰を隠していないことを示す対照）。
+                        // Windows は SetWindowPos の DPI 換算が実機未検証なので、
+                        // 数値は上の 1 行に残しつつ判定は macOS だけに掛ける
+                        if cfg!(target_os = "macos") {
+                            check(
+                                hit,
+                                "window move / resize: 指定した矩形へ実際に置かれる (#1442)",
+                            );
+                        }
+
+                        // 撥ねる指定はエラーで返り、窓は動かない
+                        let refused = window
+                            .update(cx, |app, _, _| {
+                                [
+                                    tako_control::protocol::Request::WindowResize {
+                                        window: None,
+                                        width: 10.0,
+                                        height: 10.0,
+                                    },
+                                    tako_control::protocol::Request::WindowMove {
+                                        window: None,
+                                        x: dw + 10.0,
+                                        y: 0.0,
+                                    },
+                                ]
+                                .into_iter()
+                                .all(|r| {
+                                    tako_control::dispatch(app, r, tako_core::PaneOrigin::Cli)
+                                        .is_err()
+                                })
+                            })
+                            .unwrap_or(false);
+                        check(
+                            refused,
+                            "window move / resize: 最小未満とはみ出しは理由つきで断る (#1442)",
+                        );
+
+                        // 後始末: 元の矩形へ戻す（以降の項目へ寸法を残さない）
+                        let _ = apply(
+                            &window,
+                            cx,
+                            tako_control::protocol::Request::WindowResize {
+                                window: None,
+                                width: f32::from(before.size.width),
+                                height: f32::from(before.size.height),
+                            },
+                        );
+                        let _ = apply(
+                            &window,
+                            cx,
+                            tako_control::protocol::Request::WindowMove {
+                                window: None,
+                                x: f32::from(before.origin.x),
+                                y: f32::from(before.origin.y),
+                            },
+                        );
+                        wait(cx, 1200).await;
+                    }
+                }
 
                 // 79. 赤ボタン close → Dock 復帰（#381）は **macOS 固有の概念**
                 //     （窓 0 枚でアプリだけ生きて Dock から戻る）。Windows には戻す

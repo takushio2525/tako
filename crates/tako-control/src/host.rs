@@ -235,6 +235,27 @@ pub trait UiStateHost {
         _op: crate::protocol::WindowStateOp,
     ) {
     }
+    /// OS ウィンドウの位置・寸法を指定する（Issue #1442）。
+    /// `request_window_state` と同じく GPUI の Context が要るため UI 層が消費する
+    fn request_window_geometry(
+        &mut self,
+        _window: tako_core::WindowId,
+        _geometry: crate::protocol::WindowGeometry,
+    ) {
+    }
+    /// 論理ウィンドウの現在の OS フレーム（Issue #339 で採取済みのもの）。
+    /// `window list` の座標と、`window move` / `resize` で**指定されなかった側**
+    /// （位置だけ / 寸法だけ変えるとき）の供給元。まだ採取していなければ `None`
+    fn window_frame(&self, _window: tako_core::WindowId) -> Option<crate::layout::WindowFrame> {
+        None
+    }
+    /// 窓の置き先として解決したディスプレイの矩形（#1141 の `Placement` 由来）。
+    /// `window move` の座標を「ディスプレイ内の座標」として読むのに要る
+    fn target_display_rect(&self) -> Option<tako_core::platform::display::DisplayRect> {
+        tako_core::platform::display::placement()
+            .and_then(|p| p.resolved)
+            .and_then(|d| d.rect)
+    }
     /// in-window メニューバー（Issue #657）の構成と開閉状態。
     /// メニュー定義は UI 層が持つのでここから貰う。既定は「メニューを持たない環境」
     fn menu_bar_snapshot(&self) -> crate::protocol::MenuBarSnapshot {

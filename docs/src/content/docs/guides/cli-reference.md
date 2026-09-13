@@ -460,6 +460,17 @@ tako window new --tab 3                   # 既存タブ 3 を分離して新ウ
 tako window move-tab --tab 3 --window 2   # タブを別ウィンドウへ移動
 tako window focus 2                       # ウィンドウを前面化
 tako window close 2                       # 閉じる（タブは残存ウィンドウへ合流）
+tako window move 300 200                  # 窓を動かす（ディスプレイ内の座標）
+tako window resize 1600 1000              # 窓の寸法を変える（位置は動かない）
+```
+
+`move` / `resize` の座標は**そのディスプレイの左上を原点**とする位置です（`--window W` を省略するとアクティブウィンドウが対象）。現在の矩形は `tako window list` の `bounds`、置き先のディスプレイは同じ応答の `display` で読めます。最小寸法（200x150）未満や画面からはみ出す指定は理由つきで断ります。
+
+起動時から位置を決めたいときは環境変数 `TAKO_WINDOW_BOUNDS` を使います。
+
+```bash
+TAKO_WINDOW_BOUNDS=100,50,1400,900 tako   # 位置と寸法
+TAKO_WINDOW_BOUNDS=1400,900 tako          # 寸法だけ（画面の中央へ）
 ```
 
 ### tako menu

@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-12（#1430: merge-pr.sh の終了コードを実測で言い切り、ローカル head も自分で消した）
-- 実測で Issue の推測を否定: 現行スクリプトは worktree 事故でも**既に exit 0**（#1347 で解消済み）。実在した誤読の元は「`failed to run git: fatal:` + `警告: merge は済んだが gh が 1 で終わった`」の 2 行と、**すでに MERGED の PR への再実行が 1** を返すこと（使い捨て private リポ + 実 gh 2.88.1 で PR 7 本を実 merge して確定）
-- gh の非ゼロを「merge の失敗ではない」注記へ、最終行を `merge 成立: PR #N は MERGED（url）/ 終了コード 0` へ、MERGED の再実行を冪等 0 へ（CLOSED は 1）。ローカル head は `git branch -D`、作業ツリーが握るときだけ外し方を名指しして残す（`worktree_holding_branch` / `delete_local_head_branch` の 1 実装）
-- モック Test 24〜29（ローカルブランチと作業ツリーだけ実 git。25b = 本体の作業ツリーには「畳め」と言わない）で 137 PASS 0 FAIL。注入 4 通り（後始末を外す / 再実行を refuse へ戻す / 旧警告文へ戻す / 作業ツリー検出を殺す）すべて FAILED。A/B = `TAKO_1430_LEGACY=1`。**install 不要**（scripts + docs のみ）
-
 ## 2026-09-12（#1404: ツリーのスキャン対象の重複と、消えたルート配下の読み続けを直した）
 - 組み立てを「`roots` の順 → `expanded` の未出（名前順）」の 1 実装へ（`Vec::dedup` は隣接しか落とさず `expanded` は `HashSet` = 順序が任意なので、全ルートが 2 回ずつ `read_dir` されていた）。外れたルートは `forget_under` で**配下ごと**忘れる（生きているルートの下は巻き込まない = 入れ子のルート）。事実と違う注釈も実態へ
 - 隔離 GUI（tako-vd）の項目 135 を「ユニーク化 + 展開ディレクトリの存在」へ書き換え: 新 = 完走 / `TAKO_1404_LEGACY=1` = `targets=5 uniq=3` で FAILED / 展開 0 件の注入 = `targets=2 uniq=2 extra=[]` で FAILED（旧 assert `targets.len() > git_roots.len()` は重複だけで常に真 = 検出力ゼロだった）
@@ -59,3 +54,8 @@
 - ソケットの実体を data dir 直下から外し、`tako_core::ipc_socket` の 1 実装（`<data_dir>/tako.sock` が `sun_path` に収まればそのまま / 収まらなければ `$TMPDIR/tako-<data dir の 16 桁 FNV-1a>.sock` → `/tmp`）へ寄せた。data dir 側には参照 `tako.sock.path` だけ。**symlink では解決しない**（上限は繋ぐ側の `connect()` に掛かる）
 - 実測 A/B（tako-vd 上の隔離 GUI・data dir 150 バイト）: 新 = 受け口 75 バイト・`tako list` exit 0 / `TAKO_1441_LEGACY=1` = `path must be shorter than SUN_LEN` の 1 行のみ・discovery 空・`tako list` exit 1（#782 の症状の再現）。浅い data dir は固定パスのまま不変。深い `$TMPDIR`（110 バイト）は `/tmp/tako-<hash>.sock`（31 バイト）へ
 - bind の成否を記録して `check_health` の `ipc` 節 + 通知欄（`notify_ui_failure` の 1 実装）へ。CLI は `tako check-health`（新設・MCP と 1:1）で、**届かないときはローカルの受け口診断**を返す。番犬 8 本 + 統合 1 本・注入 8 通りで file:line 名指し FAILED。**install 要**。**罠**: `scripts/check-windows.sh` は `tests/` を見ていなかったので統合テストの `cfg(unix)` 漏れを**手元 error 0・CI の Windows だけ赤**で通していた（#1264 の `--no-run` が E0433 を 2 件）→ `--all-targets` を既定にし、同じ注入で旧 = 0 件 / 新 = 名指し検出を実測
+
+## 2026-09-13（#1442: 窓の位置・寸法を tako 自身の口で決められるようにした）
+- `TAKO_DISPLAY` つきの隔離起動は保存フレームを無視して必ず中央 960x600 で開き、AX で動かすと本番 tako の窓に当たっていた。起動時 `TAKO_WINDOW_BOUNDS=x,y,w,h`（`w,h` だけなら中央）と `tako window move` / `resize`（MCP 1:1）を足し、解釈・検査は `tako_core::platform::window_bounds::resolve` の 1 実装へ。`window list` に `bounds` / `display` を載せて AX 無しで読めるようにした
+- 実測（tako-vd = 1512,0 の 2560x1440・CGWindowList）: 修正前は保存フレーム 200,100,1400,900 があっても `2312,420,960,600` / 新 `100,50,1400,900` → `1612,50,1400,900` / `TAKO_1442_LEGACY=1` は `2312,420,960,600`。はみ出し・最小未満・読めない形は既定へ落ちて persist.log に理由（CLI / MCP はエラー）。**罠**: `move` 直後の `resize` が render 待ちの古い位置を土台にして移動を打ち消す（セルフテスト項目 77b が実際に落ちた）ので、依頼した矩形はその場で `window_frames` へ記録する
+- 番犬 9 本（注入 10 通りで file:line 名指し）+ 単体 14 本・セルフテスト項目 77b（legacy 腕は FAILED）。workspace 4657 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。**install 要**

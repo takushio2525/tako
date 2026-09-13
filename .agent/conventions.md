@@ -2263,6 +2263,26 @@ env -u TAKO_SOCKET -u TAKO_TOKEN -u TAKO_PANE_ID \
   置き場の決め方は `tako_core::ipc_socket` の 1 実装（A/B は `TAKO_1441_LEGACY=1`）
 - **面を指定するのは `TAKO_DISPLAY=<名前 | UUID | index>`**。`TAKO_ISOLATED` /
   `TAKO_SELF_TEST` / `TAKO_VISUAL_TEST` のどれかが立っていれば**未指定でも** `tako-vd` を狙う
+- **窓の位置・寸法は tako 側の口で決める。AX（System Events）は使わない**（#1442）。
+  AX は複数の tako-app を **unix id にかかわらず同一プロセスとして返す**ので、
+  `first application process whose unix id is <隔離 pid>` を掴んで `set position` すると
+  **本番 `/Applications/tako.app` の窓が動く**（ユーザーの窓を動かす事故が実際に起きた）。
+  使う口は 3 つで、座標はどれも**そのディスプレイ内**（左上が原点）:
+
+  ```sh
+  # 起動時に置く（x,y,w,h。`w,h` だけなら置き先の中央へ）
+  env "$(scripts/lib/virtual-display.sh window-env 1400 900)" \
+    TAKO_ISOLATED=1 TAKO_DISPLAY=tako-vd cargo run -p tako-app
+  # 起動後に動かす（MCP `tako_window` の move / resize と 1:1）
+  tako window move 300 200 && tako window resize 1600 1000
+  # 結果を読む（bounds = 窓の矩形 / display = 置き先の面）
+  tako window list
+  ```
+
+  最小寸法（200x150）未満と置き先からのはみ出しは撥ねる。起動時は既定へ落ちて
+  理由が persist.log に残り、CLI / MCP からはエラーとして返る（窓は動かない）。
+  `scripts/lib/virtual-display.sh move-window` は**当座しのぎの AX 経路**で、
+  tako の pid を渡すと拒否して上の口を案内する
 - **通常起動は 1 ビットも変わらない**（未指定 かつ 非検証なら置き先は未解決のまま）
 - **通常起動**で指定が外れても**起動は止まらない**。既定の面へ落ちて persist.log に
   理由 + 候補が 1 行残る。どこへ置いたかは `tako_check_health` の `display_placement` で読める

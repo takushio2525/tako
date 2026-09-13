@@ -32,4 +32,5 @@ pub mod ssh_client;
 pub mod stack;
 pub mod support;
 pub mod user_path;
+pub mod window_bounds;
 pub mod window_lifecycle;

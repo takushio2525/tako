@@ -1761,7 +1761,7 @@ fn dispatch_inner(
             Ok(Value::Null)
         }
 
-        Request::WindowList => Ok(windows_json(host.workspace())),
+        Request::WindowList => Ok(windows_json(host)),
 
         Request::WindowNew { tab } => match tab {
             // 既存タブを新しいウィンドウへ分離
@@ -1833,6 +1833,30 @@ fn dispatch_inner(
         Request::WindowRestore { window } => {
             window_state_op(host, window, crate::protocol::WindowStateOp::Restore)
         }
+
+        Request::WindowMove { window, x, y } => window_geometry_op(
+            host,
+            window,
+            tako_core::platform::window_bounds::Spec {
+                origin: Some((x, y)),
+                size: None,
+            },
+            tako_core::platform::window_bounds::OriginDefault::Keep,
+        ),
+        Request::WindowResize {
+            window,
+            width,
+            height,
+        } => window_geometry_op(
+            host,
+            window,
+            tako_core::platform::window_bounds::Spec {
+                origin: None,
+                size: Some((width, height)),
+            },
+            // 寸法だけ変える操作なので位置は動かさない（中央へ寄せない）
+            tako_core::platform::window_bounds::OriginDefault::Keep,
+        ),
 
         Request::MenuList => Ok(menu_bar_json(&host.menu_bar_snapshot())),
 
@@ -11857,17 +11881,76 @@ fn window_state_op(
     Ok(json!({ "window": wid.as_u64(), "state": op.as_str() }))
 }
 
-/// ウィンドウ一覧（Issue #339）。`WindowList` 応答と `list` の windows フィールドで共用
-fn windows_json(ws: &Workspace) -> Value {
+/// ウィンドウ一覧（Issue #339）。`WindowList` 応答と `list` の windows フィールドで共用。
+///
+/// **矩形（`bounds`）も載せる**（#1442）。窓の位置・寸法を外から指定できるようにした
+/// 以上、指定した結果を読む口が無いと検証できない（従来は AX で読むしかなく、
+/// AX は複数の tako-app を同一プロセスとして返して本番の窓に当たる = #1442 の症状 2）。
+/// まだフレームを採取していないウィンドウ（初回 render 前）は `null`
+fn windows_json(host: &dyn ControlHost) -> Value {
+    let ws = host.workspace();
     json!({
         "active_window": ws.active_window_id().as_u64(),
+        // 置き先のディスプレイ（#1141）。`bounds` を「そのディスプレイ内の座標」として
+        // 読み直せるよう、原点と大きさを添える（未解決なら null = 既定の面）
+        "display": host.target_display_rect().map(|d| json!({
+            "x": d.x, "y": d.y, "width": d.width, "height": d.height,
+        })),
         "windows": ws.windows().iter().map(|w| json!({
             "id": w.id().as_u64(),
             "active": w.id() == ws.active_window_id(),
             "active_tab": w.active_tab().as_u64(),
             "tabs": ws.window_tab_ids(w.id()).iter().map(|t| t.as_u64()).collect::<Vec<_>>(),
+            "bounds": host.window_frame(w.id()).map(|f| json!({
+                "x": f.x, "y": f.y, "width": f.width, "height": f.height, "state": f.state,
+            })),
         })).collect::<Vec<_>>(),
     })
+}
+
+/// `window move` / `window resize` の実体（Issue #1442）。
+///
+/// 座標の解釈・最小寸法・置き先からのはみ出しの判定は
+/// `tako_core::platform::window_bounds` の 1 実装が持つ（起動時の
+/// `TAKO_WINDOW_BOUNDS` と**同じ関数**を通るので、env と CLI / MCP で解釈がズレない）。
+/// 実適用は GPUI の Context を持つ UI 層（`request_window_geometry`）に委ねる
+fn window_geometry_op(
+    host: &mut dyn ControlHost,
+    window: Option<u64>,
+    spec: tako_core::platform::window_bounds::Spec,
+    origin_default: tako_core::platform::window_bounds::OriginDefault,
+) -> Result<Value, DispatchError> {
+    use tako_core::platform::window_bounds as wb;
+    let wid = match window {
+        Some(w) => find_window(host.workspace(), w)?,
+        None => host.workspace().active_window_id(),
+    };
+    let display = host.target_display_rect();
+    // まだ採取していないウィンドウ（初回 render 前）は既定の矩形を土台にする。
+    // 「読めないから何もしない」にすると、起動直後の移動だけ黙って効かない
+    let current = host
+        .window_frame(wid)
+        .map(|f| wb::Rect::new(f.x, f.y, f.width, f.height))
+        .unwrap_or_else(|| wb::default_rect(display));
+    let rect = wb::resolve(&spec, current, display, origin_default).map_err(|e| {
+        DispatchError::Operation(format!("ウィンドウの位置・寸法を指定できない: {e}"))
+    })?;
+    host.request_window_geometry(
+        wid,
+        crate::protocol::WindowGeometry {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+        },
+    );
+    Ok(json!({
+        "window": wid.as_u64(),
+        "x": rect.x,
+        "y": rect.y,
+        "width": rect.width,
+        "height": rect.height,
+    }))
 }
 
 // --- メニューバー（Issue #657）------------------------------------------------
@@ -12323,7 +12406,7 @@ fn list_json(host: &dyn ControlHost) -> Value {
         "active_tab": ws.active_tab_id().as_u64(),
         // 複数ウィンドウ（Issue #339）。後方互換: 既存フィールドは維持し追加のみ
         "active_window": ws.active_window_id().as_u64(),
-        "windows": windows_json(ws)["windows"].clone(),
+        "windows": windows_json(host)["windows"].clone(),
         "tabs": tabs,
         "shelved_panes": shelved,
         // ピン留め中のプレビューウィンドウ（FR-2.16.15。AI が現在のピンを把握できる）
@@ -13559,6 +13642,12 @@ mod tests {
         scrollback: tako_core::scrollback::ScrollbackStatus,
         /// #584: UI 層へ依頼したウィンドウ表示状態の操作（window ID, 操作）
         window_state_ops: Vec<(u64, crate::protocol::WindowStateOp)>,
+        /// #1442: UI 層へ依頼した窓の位置・寸法（window ID, 矩形）
+        window_geometry_ops: Vec<(u64, crate::protocol::WindowGeometry)>,
+        /// #1442: 採取済みの窓フレーム（GUI の `window_frames` の代役）
+        window_frames: std::collections::HashMap<u64, crate::layout::WindowFrame>,
+        /// #1442: 置き先のディスプレイ（GUI の `Placement` の代役）
+        display_rect: Option<tako_core::platform::display::DisplayRect>,
         /// #657: メニューバーの構成（UI 層が持つものの代役）
         menu_bar: crate::protocol::MenuBarSnapshot,
         /// #657: UI 層へ依頼したメニュー操作
@@ -13643,6 +13732,9 @@ mod tests {
                     max_cols: 119,
                 },
                 window_state_ops: Vec::new(),
+                window_geometry_ops: Vec::new(),
+                window_frames: std::collections::HashMap::new(),
+                display_rect: None,
                 menu_bar: sample_menu_bar(),
                 menu_ops: Vec::new(),
                 backend_sessions: std::collections::HashMap::new(),
@@ -13844,6 +13936,24 @@ mod tests {
             op: crate::protocol::WindowStateOp,
         ) {
             self.window_state_ops.push((window.as_u64(), op));
+        }
+
+        fn request_window_geometry(
+            &mut self,
+            window: tako_core::WindowId,
+            geometry: crate::protocol::WindowGeometry,
+        ) {
+            self.window_geometry_ops.push((window.as_u64(), geometry));
+        }
+
+        fn window_frame(&self, window: tako_core::WindowId) -> Option<crate::layout::WindowFrame> {
+            self.window_frames.get(&window.as_u64()).cloned()
+        }
+
+        fn target_display_rect(&self) -> Option<tako_core::platform::display::DisplayRect> {
+            // **本物のグローバル（`disp::placement()`）を読まない**。テストから読むと
+            // 実機の配置に結果が左右され、CI と手元で答えが変わる
+            self.display_rect
         }
 
         fn menu_bar_snapshot(&self) -> crate::protocol::MenuBarSnapshot {
@@ -23897,6 +24007,141 @@ mod tests {
         )
         .is_err());
         assert_eq!(host.window_state_ops.len(), before);
+    }
+
+    /// #1442: `window move` / `resize` は解決済みの矩形を UI 層へ渡す。
+    ///
+    /// 座標は**置き先ディスプレイ内**なので、置き先の原点が足された値が渡る
+    /// （env の `TAKO_WINDOW_BOUNDS` と同じ `window_bounds::resolve` を通る）
+    #[test]
+    fn windowの位置寸法はディスプレイ内の座標で解決される() {
+        use tako_core::platform::display::DisplayRect;
+        let mut host = MockHost::new();
+        // Windows 相当（グローバル座標の面）で「原点が足される」ことまで見る
+        host.display_rect = Some(DisplayRect {
+            x: 1920.0,
+            y: 0.0,
+            width: 2560.0,
+            height: 1440.0,
+        });
+        let w1 = host.workspace().active_window_id().as_u64();
+        host.window_frames.insert(
+            w1,
+            crate::layout::WindowFrame {
+                x: 2720.0,
+                y: 420.0,
+                width: 960.0,
+                height: 600.0,
+                state: "windowed".into(),
+            },
+        );
+
+        // move: 位置だけ変わり、寸法は今のまま
+        let r = dispatch(
+            &mut host,
+            Request::WindowMove {
+                window: None,
+                x: 100.0,
+                y: 50.0,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(r["x"].as_f64(), Some(2020.0), "面の原点 1920 が足される");
+        assert_eq!(r["y"].as_f64(), Some(50.0));
+        assert_eq!(r["width"].as_f64(), Some(960.0), "寸法は今のまま");
+
+        // resize: 寸法だけ変わり、位置は動かない
+        let r = dispatch(
+            &mut host,
+            Request::WindowResize {
+                window: Some(w1),
+                width: 1400.0,
+                height: 900.0,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(r["x"].as_f64(), Some(2720.0), "位置は動かない");
+        assert_eq!(r["width"].as_f64(), Some(1400.0));
+
+        assert_eq!(
+            host.window_geometry_ops
+                .iter()
+                .map(|(w, g)| (*w, g.x, g.y, g.width, g.height))
+                .collect::<Vec<_>>(),
+            vec![
+                (w1, 2020.0, 50.0, 960.0, 600.0),
+                (w1, 2720.0, 420.0, 1400.0, 900.0),
+            ]
+        );
+
+        // 撥ねる指定は依頼が積まれない（はみ出す / 小さすぎる）
+        let before = host.window_geometry_ops.len();
+        for req in [
+            Request::WindowMove {
+                window: None,
+                x: 2000.0,
+                y: 10.0,
+            },
+            Request::WindowResize {
+                window: None,
+                width: 100.0,
+                height: 100.0,
+            },
+            // 存在しないウィンドウ ID
+            Request::WindowMove {
+                window: Some(9_999),
+                x: 0.0,
+                y: 0.0,
+            },
+        ] {
+            assert!(dispatch(&mut host, req, PaneOrigin::Cli).is_err());
+        }
+        assert_eq!(host.window_geometry_ops.len(), before);
+    }
+
+    /// #1442: `window list` は矩形と置き先のディスプレイを返す（AX を使わずに読む口）
+    #[test]
+    fn window_listは矩形を返す() {
+        use tako_core::platform::display::DisplayRect;
+        let mut host = MockHost::new();
+        host.display_rect = Some(DisplayRect {
+            x: 0.0,
+            y: 0.0,
+            width: 2560.0,
+            height: 1440.0,
+        });
+        let w1 = host.workspace().active_window_id().as_u64();
+        host.window_frames.insert(
+            w1,
+            crate::layout::WindowFrame {
+                x: 300.0,
+                y: 200.0,
+                width: 1600.0,
+                height: 1000.0,
+                state: "windowed".into(),
+            },
+        );
+        let r = dispatch(&mut host, Request::WindowList, PaneOrigin::Cli).unwrap();
+        assert_eq!(r["display"]["width"].as_f64(), Some(2560.0));
+        let b = &r["windows"][0]["bounds"];
+        assert_eq!(b["x"].as_f64(), Some(300.0));
+        assert_eq!(b["y"].as_f64(), Some(200.0));
+        assert_eq!(b["width"].as_f64(), Some(1600.0));
+        assert_eq!(b["state"].as_str(), Some("windowed"));
+
+        // まだ採取していないウィンドウは null（「読めない」を 0 と偽らない）
+        let r2 = dispatch(&mut host, Request::WindowNew { tab: None }, PaneOrigin::Cli).unwrap();
+        let w2 = r2["window"].as_u64().unwrap();
+        let r = dispatch(&mut host, Request::WindowList, PaneOrigin::Cli).unwrap();
+        let w2_row = r["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["id"].as_u64() == Some(w2))
+            .unwrap();
+        assert!(w2_row["bounds"].is_null());
     }
 
     /// #657 のテスト用メニュー構成（Windows 版の並びを模したもの）
