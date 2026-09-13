@@ -3029,6 +3029,26 @@ enum WindowCommand {
         /// 対象ウィンドウ ID（省略時はアクティブウィンドウ）
         window: Option<u64>,
     },
+    /// ウィンドウを動かす（#1442。座標は置き先ディスプレイの左上が原点）
+    Move {
+        /// 左端（ディスプレイ内の座標）
+        x: f32,
+        /// 上端（ディスプレイ内の座標）
+        y: f32,
+        /// 対象ウィンドウ ID（省略時はアクティブウィンドウ）
+        #[arg(long)]
+        window: Option<u64>,
+    },
+    /// ウィンドウの寸法を変える（#1442。位置は動かさない）
+    Resize {
+        /// 幅
+        width: f32,
+        /// 高さ
+        height: f32,
+        /// 対象ウィンドウ ID（省略時はアクティブウィンドウ）
+        #[arg(long)]
+        window: Option<u64>,
+    },
 }
 
 /// メニューバーの操作（Issue #657）
@@ -6491,6 +6511,20 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Window(WindowCommand::Maximize { window }) => {
             Request::WindowMaximize { window: *window }
         }
+        Command::Window(WindowCommand::Move { x, y, window }) => Request::WindowMove {
+            window: *window,
+            x: *x,
+            y: *y,
+        },
+        Command::Window(WindowCommand::Resize {
+            width,
+            height,
+            window,
+        }) => Request::WindowResize {
+            window: *window,
+            width: *width,
+            height: *height,
+        },
         Command::Window(WindowCommand::Restore { window }) => {
             Request::WindowRestore { window: *window }
         }
@@ -8367,7 +8401,9 @@ fn print_result(command: &Command, result: &Value) {
             | WindowCommand::MoveTab { .. }
             | WindowCommand::Minimize { .. }
             | WindowCommand::Maximize { .. }
-            | WindowCommand::Restore { .. },
+            | WindowCommand::Restore { .. }
+            | WindowCommand::Move { .. }
+            | WindowCommand::Resize { .. },
         ) => println!("{result}"),
         Command::Open(_) | Command::Preview(_) | Command::PreviewOutline(_) | Command::Edit(_) => {
             println!("{result}")

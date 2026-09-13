@@ -641,7 +641,7 @@
     "name": "tako_reorder_tab"
   },
   {
-    "description": "複数ウィンドウの操作（ビューポート方式: タブ・ペインの実体は全ウィンドウで共有され、各ウィンドウは表示タブだけを持つ）。action: list = ウィンドウ一覧、new = 新しいウィンドウを開く（tab 指定でそのタブを分離、省略で新規タブ付き）、close = ウィンドウを閉じる（タブは残存ウィンドウへ合流しプロセスは殺さない）、move-tab = タブを別ウィンドウへ移動、focus = ウィンドウをアクティブにして前面化、minimize = 最小化、maximize = 最大化、restore = 最大化を解除して元のサイズへ戻す。",
+    "description": "複数ウィンドウの操作（ビューポート方式: タブ・ペインの実体は全ウィンドウで共有され、各ウィンドウは表示タブだけを持つ）。action: list = ウィンドウ一覧、new = 新しいウィンドウを開く（tab 指定でそのタブを分離、省略で新規タブ付き）、close = ウィンドウを閉じる（タブは残存ウィンドウへ合流しプロセスは殺さない）、move-tab = タブを別ウィンドウへ移動、focus = ウィンドウをアクティブにして前面化、minimize = 最小化、maximize = 最大化、restore = 最大化を解除して元のサイズへ戻す、move = 窓を動かす（x / y は置き先ディスプレイの左上を原点とする座標）、resize = 窓の寸法を変える（位置は動かさない）。list の各ウィンドウには現在の矩形（bounds）が載る。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -655,19 +655,37 @@
             "focus",
             "minimize",
             "maximize",
-            "restore"
+            "restore",
+            "move",
+            "resize"
           ],
           "type": "string"
+        },
+        "height": {
+          "description": "resize: 高さ",
+          "type": "number"
         },
         "tab": {
           "description": "new: 分離するタブ ID（省略で新規タブ）/ move-tab: 移動するタブ ID",
           "minimum": 0,
           "type": "integer"
         },
+        "width": {
+          "description": "resize: 幅",
+          "type": "number"
+        },
         "window": {
-          "description": "close / move-tab / focus の対象ウィンドウ ID。minimize / maximize / restore は省略でアクティブウィンドウ",
+          "description": "close / move-tab / focus の対象ウィンドウ ID。minimize / maximize / restore / move / resize は省略でアクティブウィンドウ",
           "minimum": 0,
           "type": "integer"
+        },
+        "x": {
+          "description": "move: 左端（置き先ディスプレイ内の座標）",
+          "type": "number"
+        },
+        "y": {
+          "description": "move: 上端（置き先ディスプレイ内の座標）",
+          "type": "number"
         }
       },
       "type": "object"

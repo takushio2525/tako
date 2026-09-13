@@ -191,10 +191,21 @@ pub(super) fn build_request(
                 "restore" => Request::WindowRestore {
                     window: u64_arg(args, "window")?,
                 },
+                // #1442: CLI の `tako window move` / `resize` と 1:1
+                "move" => Request::WindowMove {
+                    window: u64_arg(args, "window")?,
+                    x: required_f32(args, "x")?,
+                    y: required_f32(args, "y")?,
+                },
+                "resize" => Request::WindowResize {
+                    window: u64_arg(args, "window")?,
+                    width: required_f32(args, "width")?,
+                    height: required_f32(args, "height")?,
+                },
                 other => {
                     return Err(format!(
                         "action が不正: {other}（list | new | close | move-tab | focus | \
-                         minimize | maximize | restore）"
+                         minimize | maximize | restore | move | resize）"
                     ))
                 }
             }
@@ -1154,6 +1165,11 @@ pub(super) fn validate_known_params(tool_name: &str, args: &Value) -> Result<(),
 
 fn required_u64(args: &Value, key: &str) -> Result<u64, String> {
     u64_arg(args, key)?.ok_or_else(|| format!("{key} を指定する"))
+}
+
+/// 必須の数値引数（#1442 の `window move` / `resize`）
+fn required_f32(args: &Value, key: &str) -> Result<f32, String> {
+    f32_arg(args, key)?.ok_or_else(|| format!("{key} を指定する"))
 }
 
 pub(super) fn u64_arg(args: &Value, key: &str) -> Result<Option<u64>, String> {

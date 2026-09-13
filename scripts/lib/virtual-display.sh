@@ -632,11 +632,35 @@ vd_cleanup_orphans() {
     return 0
 }
 
+# tako の窓の位置・寸法は **tako 自身の口**で指定する（#1442）。
+# 起動時に渡す env を組み立てる。座標は**そのディスプレイ内**（左上が原点）。
+#   env "$(scripts/lib/virtual-display.sh window-env 1400 900)" TAKO_ISOLATED=1 … tako-app
+# 起動後は `tako window move <x> <y>` / `tako window resize <w> <h>`（MCP も 1:1）。
+vd_tako_window_env() {
+    local w=$1 h=$2 x=${3:-$VD_PAD_X} y=${4:-$VD_PAD_Y}
+    printf 'TAKO_WINDOW_BOUNDS=%s,%s,%s,%s\n' "$x" "$y" "$w" "$h"
+}
+
+# その pid が tako の窓を持つプロセスか（AX で触らせないための判定。#1442）
+vd_is_tako_process() {
+    ps -p "$1" -o comm= 2>/dev/null | grep -qi 'tako'
+}
+
 # 窓を仮想ディスプレイへ移す（System Events の AX 経由。GPUI の窓にも効く = 実測）。
 # tako 本体は TAKO_DISPLAY で最初からそこへ開くので、これは **TAKO_DISPLAY に対応しない
-# 旧バイナリや tako 以外の窓**向けの当座しのぎ
+# 旧バイナリや tako 以外の窓**向けの当座しのぎ。
+#
+# **tako には使わせない**（#1442）: AX は複数の tako-app を unix id にかかわらず
+# 同一プロセスとして返すので、隔離 tako を狙った移動が**本番 tako の窓へ当たる**
+# （ユーザーの窓を動かす事故が実際に起きた）
 vd_move_window() {
     local pid=$1 r x y
+    if vd_is_tako_process "$pid"; then
+        vd_err "tako の窓を AX で動かさない（#1442: AX は複数の tako-app を同一プロセスとして返し、本番 tako の窓に当たる）"
+        vd_err "  起動時: $(vd_tako_window_env '<w>' '<h>') を env で渡す（window-env が作る）"
+        vd_err "  起動後: tako window move <x> <y> / tako window resize <w> <h>"
+        return 1
+    fi
     r=$(vd_row) || { vd_err "仮想ディスプレイ ${VD_NAME} が見つからない"; return 1; }
     x=$(( $(echo "$r" | awk '{print $1}') + VD_PAD_X ))
     y=$(( $(echo "$r" | awk '{print $2}') + VD_PAD_Y ))
@@ -663,12 +687,17 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
             [ $# -ge 2 ] || { vd_err "move-window には pid が要る"; exit 1; }
             vd_move_window "$2"
             ;;
+        window-env)
+            [ $# -ge 3 ] || { vd_err "window-env には <w> <h> が要る"; exit 1; }
+            vd_tako_window_env "$2" "$3" "${4:-}" "${5:-}"
+            ;;
         *)
-            echo "使い方: ${0} {ensure|bounds|status [--snapshot]|move-window <pid>|cleanup-orphans [--apply]}" >&2
+            echo "使い方: ${0} {ensure|bounds|status [--snapshot]|move-window <pid>|window-env <w> <h> [x] [y]|cleanup-orphans [--apply]}" >&2
             echo "  ensure           仮想ディスプレイ ${VD_NAME} を用意し、眠っていれば起こす（冪等・消す機能は無い）" >&2
             echo "  bounds           \"x y w h\"（Quartz グローバル・ポイント）" >&2
             echo "  status           状態を 1 行（眠っている面も出る。--snapshot は前後比較用の機械可読な現況）" >&2
-            echo "  move-window      その pid の窓を仮想ディスプレイへ移す" >&2
+            echo "  move-window      その pid の窓を仮想ディスプレイへ移す（**tako には使えない** = #1442）" >&2
+            echo "  window-env       tako の窓を置く env を作る: window-env <w> <h> [x] [y]（#1442）" >&2
             echo "  cleanup-orphans  孤児の下見（--apply は実行条件を満たすときだけ掃除）" >&2
             exit 1
             ;;

@@ -92,6 +92,24 @@ impl WindowStateOp {
     }
 }
 
+/// OS ウィンドウの位置・寸法（Issue #1442）。`WindowStateOp` と同じく、dispatch は
+/// 解決済みの矩形だけを UI 層へ渡し、実適用は UI 層に委ねる。
+///
+/// 値は **GPUI がウィンドウ矩形として読み書きする空間**（`layout.json` の `window`
+/// と同じ）。「ディスプレイ内の座標」からの変換は `tako_core::platform::window_bounds`
+/// の 1 実装が済ませてあるので、ここへ来る時点で置き先を含んだ絶対座標になっている
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowGeometry {
+    /// 左端
+    pub x: f32,
+    /// 上端
+    pub y: f32,
+    /// 幅
+    pub width: f32,
+    /// 高さ
+    pub height: f32,
+}
+
 /// in-window メニューバー（Issue #657）への操作。`WindowStateOp` と同じく、
 /// dispatch は「何をするか」だけを UI 層へ渡し、実適用は UI 層が行う
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -450,6 +468,22 @@ pub enum Request {
     WindowRestore {
         #[serde(default)]
         window: Option<u64>,
+    },
+    /// ウィンドウを動かす（Issue #1442）。`x` / `y` は**置き先のディスプレイ内の
+    /// 座標**（左上が原点）。`window` 省略でアクティブウィンドウ
+    WindowMove {
+        #[serde(default)]
+        window: Option<u64>,
+        x: f32,
+        y: f32,
+    },
+    /// ウィンドウの寸法を変える（Issue #1442）。位置は動かさない。
+    /// `window` 省略でアクティブウィンドウ
+    WindowResize {
+        #[serde(default)]
+        window: Option<u64>,
+        width: f32,
+        height: f32,
     },
     /// メニューバーの構成と開閉状態を返す（Issue #657）
     MenuList,
@@ -1924,6 +1958,9 @@ pub fn changes_layout(request: &Request) -> bool {
         | Request::WindowMinimize { .. }
         | Request::WindowMaximize { .. }
         | Request::WindowRestore { .. }
+        // 窓の寸法が変わればペインの cols / rows も変わる（#1442 は #1370 の対象）
+        | Request::WindowMove { .. }
+        | Request::WindowResize { .. }
         // --- ペインの面積を食うクローム ---
         | Request::Panel { .. }
         | Request::TreeFolder { .. }

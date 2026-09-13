@@ -157,6 +157,7 @@ tako/
 | コンフリクト解消エージェント（#496） | `tako git resolve [--agent claude|codex|agy] [--tab N]` |
 | Web ビューペイン操作 | `tako web open <url>` |
 | 複数ウィンドウ操作（ビューポート方式 + 共有タブバー。#339/#380） | `tako window list` |
+| **窓の位置・寸法を外から決める（検証で窓を並べる。AX は使わない。#1442）** | `TAKO_WINDOW_BOUNDS=x,y,w,h` / `tako window move` / `resize` |
 | **シェル統合（cwd 追従・コマンド状態。#525）** | `tako shell-integration [status|install|uninstall]` |
 | エージェント共通ルール同期 | `tako agents sync-rules` |
 | AI 系設定のデバイス間共有（#513） | `tako config` |

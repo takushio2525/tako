@@ -26,7 +26,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_scroll_pane` | スクロールバック表示を動かす |
 | `tako_scrollback` | スクロールバック保持行数（直接ペインのメモリ）の確認・変更 |
 | `tako_move_pane_to_tab` | ペインを別のタブへ移動する |
-| `tako_window` | 複数ウィンドウの操作（一覧 / 新規 / 閉じる / タブ移動 / フォーカス） |
+| `tako_window` | 複数ウィンドウの操作（一覧 / 新規 / 閉じる / タブ移動 / フォーカス / 移動 / 寸法変更） |
 | `tako_menu` | メニューバーの構成取得・開閉・項目の実行（開閉は Windows の in-window メニューバー限定） |
 
 ## テキストの読み書き
