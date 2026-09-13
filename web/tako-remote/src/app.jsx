@@ -3,6 +3,7 @@ import { PairingPage } from './pages/pairing';
 import { PanesPage } from './pages/panes';
 import { TerminalPage } from './pages/terminal';
 import { FilesPage } from './pages/files';
+import { TasksPage } from './pages/tasks';
 import { createClient } from './api';
 import { cleanupLegacyStore } from './store';
 
@@ -127,6 +128,15 @@ export function App() {
   let page;
   if (segments[0] === 'panes' && segments[1]) {
     page = <TerminalPage paneId={segments[1]} me={me} />;
+  } else if (segments[0] === 'tasks') {
+    // #1450 B3: 人がやること（id はクエリで持つので端末の戻るが効く）
+    page = (
+      <TasksPage
+        me={me}
+        id={route.params.get('id') || ''}
+        onMeRefresh={refreshMe}
+      />
+    );
   } else if (segments[0] === 'files') {
     // #1079: ファイルビュー（root / path はクエリで持つ）
     page = (

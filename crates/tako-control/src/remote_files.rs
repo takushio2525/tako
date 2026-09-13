@@ -1331,6 +1331,24 @@ fn current_roots(deps: &FilesDeps) -> Result<Vec<TreeRoot>, String> {
     ))
 }
 
+/// 添付の解決（#1450 B3）に使うルート一覧。**門（[`local_roots_for`]）を通った結果**を返す。
+///
+/// `remote_tasks` はファイル API の受け口を持たない（= `FilesDeps` を組む理由が無い）ので、
+/// 必要な 2 つだけを受ける薄い入口をここに置く。**認可の判断はこの下の
+/// [`current_roots`] 1 本のまま**で、タスク側に写しを作らない
+pub fn roots_for(
+    send: &dyn Fn(crate::protocol::Request) -> Result<Value, String>,
+    role: DeviceRole,
+) -> Result<Vec<TreeRoot>, String> {
+    current_roots(&FilesDeps {
+        send,
+        // ルートを引くだけなので監査には残らない（読み出しの監査は各受け口が出す）
+        audit: &|_, _| {},
+        cors: Vec::new(),
+        role,
+    })
+}
+
 /// 現在ツリーに出ている SSH 先フォルダを app から取り直す（#1085）。
 ///
 /// ローカルと同じ理由で**毎リクエスト**引く: Mac 側でフォルダを閉じれば
@@ -2496,8 +2514,9 @@ fn app_unreachable(detail: &str) -> (u16, Value) {
 /// リクエストボディを JSON として読む（上限つき）。
 ///
 /// `remote.rs` にも同名の関数があるが、このモジュールを**単体でテストできる**形に
-/// 保つため写しを持つ（`query_value` / `percent_decode` と同じ方針）
-fn read_json_body(request: &mut tiny_http::Request) -> Result<Value, String> {
+/// 保つため写しを持つ（`query_value` / `percent_decode` と同じ方針）。
+/// #1450 B3（`remote_tasks`）も**この 1 実装を使う**（3 本目の写しを増やさない）
+pub(crate) fn read_json_body(request: &mut tiny_http::Request) -> Result<Value, String> {
     use std::io::Read as _;
     let mut body = String::new();
     request
@@ -2519,8 +2538,10 @@ fn read_json_body(request: &mut tiny_http::Request) -> Result<Value, String> {
 pub const MAX_BODY_BYTES: u64 = 4 * MAX_TEXT_BYTES;
 
 /// クエリ 1 個を取り出す（`remote.rs` の `query_param` と同じ意味論。
-/// このモジュールを単体でテストできるよう写しを持つ）
-fn query_value(url: &str, key: &str) -> Option<String> {
+/// このモジュールを単体でテストできるよう写しを持つ）。
+///
+/// #1450 B3（`remote_tasks`）も**この 1 実装を使う**（3 本目の写しを増やさない）
+pub(crate) fn query_value(url: &str, key: &str) -> Option<String> {
     let qs = url.split_once('?')?.1;
     for pair in qs.split('&') {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));

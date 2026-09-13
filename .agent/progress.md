@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-14（#1446: SSH 追跡をプロセスの寿命を越えて残し、繋ぎ直さない理由を出す）
-- 真因は判断ではなく**記憶**: `ssh_connect` はメモリだけで作る口も dispatch の 1 つだけ → GUI 再起動をまたいだペイン（32 秒無反応・診断 0 行・報告と同一画面）と手打ち `ssh` のペイン（24 秒無反応）が実測で再現。slave 説と版が古い説は否定（8 桁幅での誤測は 88 桁で取り直し）
-- 追跡を `track_ssh_connect` の 1 実装へ寄せ、入口を 3 つに（dispatch / `layout.json` からの復元 = `PaneLayout.ssh`・器が生きたときだけ / #976 の検知からの引き取り）。復元・引き取りは見張りから始めて起点を取り直す。`gave_up` を手で繋ぎ直したら見張りを再開（エッジで見つけた穴）。撃たないときは通知欄 + persist.log、`ssh_connect.reconnect` を `list` / `read` へ
-- 実測: 再起動後の切断 **1 秒**検知 → 復帰 **2 秒**（ゼロタッチ）/ 手打ちも `source=detected` で復帰 / slave 落ち 0 秒検知 4 秒復帰 / 上限後は撃たずペインも残る。A/B `TAKO_1446_LEGACY=1` は追跡ゼロ・診断も無言（報告の再現）。番犬 4 本・注入 8 通り。workspace 4730 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。**install 要**
-
 ## 2026-09-14（#1451: スマホのファイル閲覧を Finder 風の全体閲覧へ広げ、ショートカットを足せるようにした）
 - 認可は**案 (a)**（全体閲覧とショートカットは manage 以上・interact 以下は #1079 のまま）。**経路は 1 本も新設せず**、疑似ルート `fs` を一覧へ 1 件足すだけにしたので、プレビュー / 編集 / DL は `resolve_in_root` の 1 実装をそのまま通る。門は `local_roots_for` の 1 か所で、載らなければ `unknown_root` の 403。role は `FILE_ROUTES`（#1449 の作法）が正で、**表に無い `/api/files…` は安全側の Manage** へ落ちる
 - ショートカットの正本は `tako_core::remote_shortcuts`（PWA / `tako remote shortcuts` / MCP の 3 口が同じ実装）。永続は `<data_dir>/remote/shortcuts.json`（番地 `SchemaId::RemoteShortcuts`・**新規なので移行 Step 無し = 指紋の追加のみ**）。既定はファイルに書かず毎回計算する
@@ -54,3 +49,8 @@
 - 右パネルに 4 本目のビュー `tasks`。`PanelViewWire` へ 1 枝足すだけで CLI の possible values・`--help`・不正値の案内・MCP の説明が追従する（`tako panel --show --view tasks` / パレット `panel-tasks`）。一覧（既定 open・`updated_at` 降順・種類 / プロジェクト絞り込み・バッジは `open_count` をそのまま）+ 詳細（本文は `md_view::render_document` の共有描画・`exists` を見て「消えた添付」・`copy_texts` は 1 件ずつ・リンク）+ 返答フォーム（4 択 + コメント・判断未選択では送れない）+ スレッド + 配送状態。**B1 の API 以外は叩かない**
 - **ポーリングは新タイマー無し**: 既存 2 秒ループが `tick_user_tasks` を呼ぶだけで、撃つ判断（`panel_visible` + A/B）はその 1 か所 = 止める処理を書かずに止まる。`list` を background へ逃がさないのは B1 が配送の決着を host から畳み込むため。3 本目の手書き入力を増やさないよう純ロジックを `text_field::TextField` へ切り出した（既存 git 2 本の移行は #1459）
 - 実測: 隔離セルフテスト**項目 150**（view / 起票 / バッジ / 消えた添付 / 長い md / コピー 1 件 / 返答 + `failed` + 理由 / スレッド 12 件 / **閉じている間は撃たない** / 完了が `tako todo list` と一致）+ `TAKO_VISUAL_ONLY=tasks-panel`（**Metal の scene を読み戻すので画面収録権限が不要**・3 場面の指紋が全部別）+ 隔離 GUI で `sent → delivered` を実測（疑似 master へ実送達）。A/B `TAKO_1450B2_LEGACY=1` は項目 150 が「起票が一覧に載らない」で FAILED。番犬 5 本・注入 8 通り。workspace 4845 passed 0 failed・clippy 3 宇宙 0・check-windows error 0・docs build 32 ページ。**install 要**
+
+## 2026-09-14（#1450 B3: 人がやることをスマホから片付けられるようにした）
+- PWA `#/tasks`（一覧 + 詳細 + 添付の「端末に保存」+ copy_texts のワンタップコピー + 共有シート + 返答 / 完了 / 却下・ナビにバッジ）。daemon の受け口は `remote_tasks::TASK_ROUTES` の 4 本だけで、中身は B1 の `Request::UserTask` を**素通し**（一覧 Observe / 操作 Interact・**表に無い `/api/tasks…` は Manage の床**）。語彙と状態表示は B2 と同一（`sent` を「届いた」と書かない）
+- **添付の配信経路は 1 本も足していない**: daemon が絶対パスを `shortcut_target` で `{root, path_rel}` へ解決し、PWA は既存の `/api/files/download` を叩く = 認可は `resolve_in_root` の 1 実装のまま（manage は `fs`・interact はツリー配下だけ・落とせない添付は理由 + #1452 の導線）。ポーリングは `usePolling` の 1 実装（cleanup + visibility。画面とバッジで共有）
+- **実測で実バグ 2 件**: ①`value["tasks"]` の読みが serde_json の IndexMut で `null` を書き込み、単体応答に一覧のキーが生えていた ②ルートは canonicalize 済みなのに添付は素の綴りなので `/tmp/…` が解決できなかった（`resolve_target` で実体の綴りを引き直す）。実経路 `scripts/test-remote-tasks-1450b3.sh` **68 PASS 0 FAIL**（300 MB の添付を実転送・chunked を実測）・e2e 93 passed（新 11 本）・番犬 10 本（注入 8 通りで file:line 名指し）・workspace 4864 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。**install 不要 / 本番 daemon 再起動要**

@@ -1513,3 +1513,140 @@ body {
   display: inline-flex; align-items: center; gap: 7px;
   width: 100%; margin-bottom: 10px; min-height: 44px;
 }
+
+/* ============================================================
+   ユーザー向けタスク（#1450 B3）
+   ============================================================
+   主役は「コピー」と「端末に保存」。指で押せる大きさ（44px 前後）を優先し、
+   本文は md-content（チャットと同じ描画）に載せる。**絵文字は使わない**
+   （アイコンは SVG・状態は色と字で出す）。 */
+
+.tasks-entry-btn {
+  position: relative;
+  width: 40px; height: 40px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: none; border: 1px solid var(--line); border-radius: var(--radius-xs);
+  color: var(--fg2); cursor: pointer; transition: background .12s;
+}
+.tasks-entry-btn:active { background: var(--panel3); }
+/* 未完了件数。0 件のときは出さない（「何も待っていない」を静かに伝える） */
+.tasks-badge {
+  position: absolute; top: -6px; right: -6px;
+  min-width: 18px; height: 18px; padding: 0 5px;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--amber); color: #1A1205;
+  border-radius: 9px; font-size: 11px; font-weight: 700; line-height: 1;
+}
+
+.tasks-page { padding-bottom: 40px; }
+.tasks-count { margin-left: auto; color: var(--fg2); font-size: 13px; }
+
+.task-list { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; }
+
+.task-row {
+  display: flex; flex-direction: column; gap: 6px; width: 100%;
+  padding: 12px; text-align: left; cursor: pointer;
+  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  color: var(--fg);
+}
+.task-row:active { background: var(--card-hover); }
+.task-row-head { display: flex; align-items: center; gap: 8px; }
+.task-row-title { font-size: 14px; font-weight: 600; line-height: 1.4; }
+.task-row-meta {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  color: var(--fg2); font-size: 12px;
+}
+.task-id { font-family: var(--mono); color: var(--fg3); }
+.task-due { color: var(--amber); }
+.task-status-done { color: var(--fg3); }
+
+/* 種別のチップ。色は種別ごとに変えるが、**字で読める**ようにラベルを必ず出す */
+.task-kind {
+  flex-shrink: 0; padding: 2px 7px; border-radius: 999px;
+  font-size: 11px; font-weight: 600;
+  background: var(--panel3); color: var(--fg2); border: 1px solid var(--line2);
+}
+.task-kind.kind-review { color: var(--blue); border-color: var(--blue); }
+.task-kind.kind-permission { color: var(--amber); border-color: var(--amber); }
+.task-kind.kind-post { color: var(--green); border-color: var(--green); }
+
+/* 配送の状態。**sent は色を付けない**（届いたと騙らない = B1 / B2 と同じ物差し） */
+.task-delivery.ok, .task-delivery-line.ok { color: var(--green); }
+.task-delivery.error, .task-delivery-line.error { color: var(--red); }
+
+.task-detail { padding: 12px; display: flex; flex-direction: column; gap: 14px; }
+.task-detail-head { display: flex; align-items: center; gap: 10px; }
+.task-back { gap: 4px; }
+.task-title { font-size: 18px; font-weight: 700; line-height: 1.4; }
+.task-body { font-size: 14px; line-height: 1.7; }
+.task-body-empty { color: var(--fg3); font-size: 13px; }
+
+.task-section { display: flex; flex-direction: column; gap: 8px; }
+.task-section h2 {
+  font-size: 12px; font-weight: 600; color: var(--fg2);
+  text-transform: uppercase; letter-spacing: .04em;
+}
+
+.task-attachment {
+  display: flex; flex-direction: column; gap: 8px; padding: 10px;
+  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-xs);
+}
+.task-attachment-info { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.task-attachment-name { font-size: 13px; font-family: var(--mono); word-break: break-all; }
+.task-attachment-meta { color: var(--fg3); font-size: 12px; }
+.task-attachment-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+/* 「端末に保存」はリンクなので、押しボタンと同じ見た目へ揃える（下線を出さない） */
+.task-attachment-actions .btn,
+.task-copy-actions .btn {
+  display: inline-flex; align-items: center; gap: 7px;
+  text-decoration: none; padding: 11px 16px; min-height: 44px;
+}
+/* 開けない理由は必ず出す（押せないボタンを黙って並べない） */
+.task-attachment-why { color: var(--fg3); font-size: 12px; line-height: 1.5; }
+
+.task-copy {
+  display: flex; flex-direction: column; gap: 6px; padding: 10px;
+  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-xs);
+}
+.task-copy-head { display: flex; align-items: center; gap: 8px; }
+.task-copy-label { font-size: 13px; font-weight: 600; }
+.task-copy-actions { display: flex; gap: 6px; margin-left: auto; }
+.task-copy-text {
+  max-height: 140px; overflow: auto; padding: 8px;
+  background: var(--bg); border-radius: var(--radius-xs);
+  font-family: var(--mono); font-size: 12px; line-height: 1.5;
+  white-space: pre-wrap; word-break: break-word;
+}
+.task-copy-state { color: var(--green); font-size: 12px; }
+
+.task-link { color: var(--blue); font-size: 13px; word-break: break-all; }
+
+.task-respond { display: flex; flex-direction: column; gap: 8px; }
+.task-decisions { display: flex; gap: 6px; flex-wrap: wrap; }
+.task-comment {
+  width: 100%; min-height: 84px; padding: 10px; resize: vertical;
+  background: var(--bg); color: var(--fg);
+  border: 1px solid var(--border); border-radius: var(--radius-xs);
+  font-size: 14px; line-height: 1.5;
+}
+.task-respond-actions { display: flex; align-items: center; gap: 10px; }
+.task-hint { color: var(--fg3); font-size: 12px; }
+.task-respond-actions .btn-primary { margin-left: auto; }
+
+.task-delivery-line {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  color: var(--fg2); font-size: 12px;
+}
+.task-delivery-reason { color: var(--fg3); }
+
+.task-response {
+  display: flex; flex-direction: column; gap: 4px; padding: 8px 10px;
+  background: var(--card); border-left: 2px solid var(--line2); border-radius: var(--radius-xs);
+}
+.task-response-head { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.task-response-decision { font-weight: 600; }
+.task-response-via, .task-response-at { color: var(--fg3); }
+.task-response-comment { font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
+
+.task-footer-actions { display: flex; gap: 10px; }
+.task-footer-actions .btn { flex: 1; justify-content: center; }

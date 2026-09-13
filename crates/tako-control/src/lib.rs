@@ -70,6 +70,7 @@ pub mod remote_role;
 pub mod remote_serve;
 pub mod remote_setup;
 pub mod remote_ssh;
+pub mod remote_tasks;
 pub mod sessions;
 pub mod settings;
 pub mod setup;
