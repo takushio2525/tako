@@ -905,13 +905,21 @@ tako todo done u-1              # 片付いた / dismiss なら「やらない�
 
 - **起票するのは master / worker**（MCP `tako_todo` の `action=add`）。
   起票元（プロファイル・会話・ペイン）は自動で入るので、返答の戻り先は指定しない
+- **worker の起票は spawn 元の master へ戻る**（#1466）。戻り先は
+  「呼び出し元が名乗った master → ペインの role ラベル → **spawn 元**（`spawned_by` の枝）
+  → その project を管轄するプロファイル（**一意のときだけ**）」の順に解く
+- **解けなければ `default` へ落とさない**（#1466）。配送は `failed` +
+  `宛先不明: …` の理由で残る（無関係なプロファイルの master へ黙って届くより良い）。
+  role も spawn 元も無いところ（素のシェル・solo）から起票したいときは
+  `TAKO_ORCHESTRATOR_ROLE=master:<profile>` を名乗って呼ぶ
 - **返答は起票した master の入力欄へ届く**（`【ユーザー返答】todo u-N …`）。
   その master が閉じていれば、同じプロファイルの master を**新しいタブで起動**して
   初回メッセージにタスク本文 + 返答を載せる。顛末は `tako todo show` の `配送:` 行
   （`sent` / `launched` / `delivered` / `failed` + 理由）
 - **判断は 4 つ**。`approve` / `reject` は閉じ、`needs_change` / `answered` は
   **open のまま**残る（AI 側の作業がこれから続くので、閉じると直した物を見てもらう先が消える）
-- 新しく起票されると共有の通知欄に 1 行出る（`TAKO_1450_LEGACY=1` で旧挙動 = 無言）
+- 新しく起票されると共有の通知欄に 1 行出る（`TAKO_1450_LEGACY=1` で旧挙動 = 無言）。
+  戻り先の解き方の A/B は `TAKO_1466_LEGACY=1`（worker の起票が `default` へ落ちる旧挙動）
 - 置き場は `<data_dir>/orchestrator/user-tasks.yaml`（`tako migrate` の番地に載っている）
 - master 側の作法は `tako orchestrator guide user-tasks`。
   **引き継ぎファイルの「ユーザー確認待ち」はこの機能へ移す**（会話や md に溜めない）

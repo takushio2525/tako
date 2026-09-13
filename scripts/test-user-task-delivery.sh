@@ -162,6 +162,9 @@ for k in sys.argv[1].split("."):
 print("null" if cur is None else (str(cur).lower() if isinstance(cur,bool) else cur))' "$1"; }
 
 start_app() {
+  # 仮想ディスプレイは検証の合間に眠る（眠ると列挙から落ちて起動が中止される。#1160）。
+  # ②「落として起動し直す」の 2 回目で実際に踏むので、起こす手を毎回通す
+  bash "$REPO_ROOT/scripts/lib/virtual-display.sh" ensure >/dev/null 2>&1 || true
   "$APP_BIN" >> "$TMP/app.log" 2>&1 &
   APP_PID=$!
   for _ in $(seq 1 300); do

@@ -313,3 +313,14 @@ which starts the successor with that profile's prompt.
      successor, never by the user: a list of user-waiting items parked there is
      invisible to the only person who can act on it, and the successor inherits
      the waiting instead of the answer.
+
+<!-- #1466: worker の起票の戻り先（spawn 元の master）と、解けないときの扱い。 -->
+<!-- user-tasks の「起票元は自動で入る」段落へ追記した本文をそのまま貼る。 -->
+A worker's task comes back to **the master that spawned it**, not to whichever master
+happens to be running, so workers can file freely.
+
+The one case that has no answer is a caller tako cannot place: no orchestrator role, no
+spawning master left. Those tasks are still filed, but the reply has nowhere to go and
+the delivery is recorded as `failed` with a "宛先不明" reason instead of being handed to
+an unrelated master. If you need to file from such a place — a bare shell, a script —
+call it with `TAKO_ORCHESTRATOR_ROLE=master:<profile>` so the reply has an address.

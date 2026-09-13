@@ -295,13 +295,94 @@ pub enum DeliveryTarget {
     Launch,
 }
 
-/// 起票元のプロファイル（無ければ既定）
-pub fn origin_profile(task: &UserTask) -> String {
+/// 起票元プロファイルを**どこから**決めたか（#1466 の診断用）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginSource {
+    /// 呼び出し元が master を名乗った（`TAKO_ORCHESTRATOR_ROLE=master[:<profile>]`）
+    CallerRole,
+    /// 起票したペイン自身の role ラベルが master だった
+    PaneRole,
+    /// 起票したペインから `spawned_by` を辿って master に着いた（= **spawn 時点の事実**）
+    SpawnChain,
+    /// worker のプロジェクトを管轄する master プロファイルが一意に決まった
+    Jurisdiction,
+}
+
+impl OriginSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CallerRole => "caller_role",
+            Self::PaneRole => "pane_role",
+            Self::SpawnChain => "spawn_chain",
+            Self::Jurisdiction => "jurisdiction",
+        }
+    }
+}
+
+/// 起票元が解けなかったときに配送へ残す理由（`tako todo show` の `配送:` 行に出る）。
+///
+/// **`default` へ落とさない**のが要点（#1466）。落とすと「たまたま生きている
+/// default プロファイルの master」= 別プロジェクトの会話へ返答が入り、
+/// 受け取った側にも起票した側にも何が起きたか分からない
+pub const UNRESOLVED_ORIGIN_REASON: &str =
+    "宛先不明: 起票元の master プロファイルを解決できない（呼び出し元の role も spawn 元の master も残っていない）";
+
+/// #1466 の A/B。`TAKO_1466_LEGACY=1` で「master を名乗る呼び出しだけ解けて、
+/// 残りは `default` へ落ちる」修正前の挙動を同一バイナリのまま再現する
+pub fn legacy_origin_resolution() -> bool {
+    std::env::var_os("TAKO_1466_LEGACY").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// 起票元のプロファイルを解く（**純粋**。#1466）。
+///
+/// 見る順は「**呼び出し元が名乗ったもの → tako が知っている spawn 時点の事実 →
+/// 管轄の登録**」。前ほど確かで、どれも当たらなければ `None`（= 宛先不明）にする。
+///
+/// worker から起票されたときに **spawn 元の master** へ返るのがこの関数の目的で、
+/// `spawn_chain` がその本命（`spawned_by` は spawn の瞬間に tako 自身が張った枝）。
+/// `jurisdiction` は GUI 再起動で枝が失われた・master のペインを閉じた場合の保険で、
+/// **一意に決まるときしか渡ってこない**（曖昧なら呼び出し側が `None` を渡す）。
+///
+/// 引数はすべて呼び出し側（dispatch）が workspace とプロファイル一覧から集めた
+/// 材料で、この関数自身は env もファイルも見ない = 注入だけで全経路を検査できる
+pub fn resolve_origin_profile(
+    caller_role: Option<&str>,
+    pane_master_profile: Option<&str>,
+    spawn_chain_profile: Option<&str>,
+    jurisdiction_profile: Option<&str>,
+    legacy: bool,
+) -> Option<(String, OriginSource)> {
+    fn pick(p: Option<&str>) -> Option<&str> {
+        p.map(str::trim).filter(|p| !p.is_empty())
+    }
+    if let Some(profile) = caller_role.and_then(tako_core::handoff::master_profile_of_any_role) {
+        return Some((profile.to_string(), OriginSource::CallerRole));
+    }
+    if let Some(profile) = pick(pane_master_profile) {
+        return Some((profile.to_string(), OriginSource::PaneRole));
+    }
+    if legacy {
+        // #1466-legacy-arm: 修正前はここまでしか解かず、残りは `default` へ落ちていた
+        return None;
+    }
+    if let Some(profile) = pick(spawn_chain_profile) {
+        return Some((profile.to_string(), OriginSource::SpawnChain));
+    }
+    pick(jurisdiction_profile).map(|p| (p.to_string(), OriginSource::Jurisdiction))
+}
+
+/// 起票元のプロファイル。**解けていなければ `None`**（#1466）。
+///
+/// 旧挙動（`default` へ落ちる）は `TAKO_1466_LEGACY=1` のときだけ残す
+pub fn origin_profile(task: &UserTask) -> Option<String> {
     task.origin
         .as_ref()
         .and_then(|o| o.profile.clone())
         .filter(|p| !p.is_empty())
-        .unwrap_or_else(|| tako_core::handoff::DEFAULT_PROFILE.to_string())
+        // #1466-legacy-arm
+        .or_else(|| {
+            legacy_origin_resolution().then(|| tako_core::handoff::DEFAULT_PROFILE.to_string())
+        })
 }
 
 /// 配送先を決める（**純粋**）。
@@ -423,6 +504,20 @@ pub fn reconcile_at(path: &Path, observed: &[(String, Option<Value>)]) -> Result
         }
         n
     })
+}
+
+/// 起票元が解けないときの配送記録（#1466）。**宛先を選ばない**ので pane も profile も持たない。
+/// 理由は `tako todo show` の `配送:` 行と右パネル / PWA の配送状態にそのまま出る
+pub fn unresolved_delivery(response_index: usize) -> Delivery {
+    Delivery {
+        state: DeliveryState::Failed,
+        profile: None,
+        pane: None,
+        tab: None,
+        reason: Some(UNRESOLVED_ORIGIN_REASON.to_string()),
+        at: unix_now(),
+        response_index: Some(response_index),
+    }
 }
 
 /// 配送の記録を作る（`at` を 1 か所で入れる）
@@ -737,15 +832,102 @@ mod tests {
         assert!(parse_via("sms").is_err());
     }
 
+    /// #1466: 起票元が解けていないタスクは **`default` へ落ちない**
+    /// （落ちると無関係なプロファイルの master へ返答が届く）
     #[test]
-    fn 起票元のプロファイルは既定へ落ちる() {
+    fn 起票元が解けていなければ宛先は空のまま() {
         let mut store = TaskStore::default();
         store.add(sample("t")).unwrap();
-        assert_eq!(origin_profile(store.find("u-1").unwrap()), "default");
+        assert_eq!(
+            origin_profile(store.find("u-1").unwrap()),
+            None,
+            "解けていない起票元が既定プロファイルへ落ちている（#1466）"
+        );
         store.tasks[0].origin = Some(TaskOrigin {
             profile: Some("takodev".into()),
             ..TaskOrigin::default()
         });
-        assert_eq!(origin_profile(&store.tasks[0]), "takodev");
+        assert_eq!(origin_profile(&store.tasks[0]).as_deref(), Some("takodev"));
+        // 空文字も「解けていない」（YAML を手で書き換えた場合の保険）
+        store.tasks[0].origin = Some(TaskOrigin {
+            profile: Some(String::new()),
+            ..TaskOrigin::default()
+        });
+        assert_eq!(origin_profile(&store.tasks[0]), None);
+    }
+
+    /// #1466: 宛先不明の配送は「失敗 + 理由」で残る（無言で誰かへ届けない）
+    #[test]
+    fn 宛先不明の配送は理由を残して失敗する() {
+        let d = unresolved_delivery(2);
+        assert_eq!(d.state, DeliveryState::Failed);
+        assert_eq!(d.profile, None, "宛先不明なのにプロファイルを名乗っている");
+        assert_eq!(d.pane, None, "宛先不明なのにペインを選んでいる");
+        assert_eq!(d.response_index, Some(2));
+        let reason = d.reason.expect("理由が無い");
+        assert!(reason.contains("宛先不明"), "{reason}");
+    }
+
+    /// #1466: 解決順は「呼び出し元の名乗り → ペインの role → spawn 元 → 管轄」
+    #[test]
+    fn 起票元は確かな順に解ける() {
+        use OriginSource::*;
+        // master を名乗る呼び出しが最優先（従来どおり）
+        assert_eq!(
+            resolve_origin_profile(Some("master:takodev"), None, None, None, false),
+            Some(("takodev".into(), CallerRole))
+        );
+        // 表示用の語彙でも解ける
+        assert_eq!(
+            resolve_origin_profile(Some("orchestrator-master"), None, None, None, false),
+            Some(("default".into(), CallerRole))
+        );
+        // worker の名乗りは master にならない → ペインの role ラベルを見る
+        assert_eq!(
+            resolve_origin_profile(Some("worker:tako:1466"), Some("sol"), None, None, false),
+            Some(("sol".into(), PaneRole))
+        );
+        // ペインが master でなければ spawn 元（**#1466 の本命**）
+        assert_eq!(
+            resolve_origin_profile(Some("worker:tako:1466"), None, Some("takodev"), None, false),
+            Some(("takodev".into(), SpawnChain))
+        );
+        // spawn 元の枝が失われていたら管轄の登録（一意のときだけ渡ってくる）
+        assert_eq!(
+            resolve_origin_profile(Some("worker:tako:1466"), None, None, Some("tako"), false),
+            Some(("tako".into(), Jurisdiction))
+        );
+        // どれも当たらなければ宛先不明（**既定へ落とさない**）
+        assert_eq!(
+            resolve_origin_profile(Some("worker:tako:1466"), None, None, None, false),
+            None
+        );
+        assert_eq!(resolve_origin_profile(None, None, None, None, false), None);
+        // 空文字は「解けた」にしない
+        assert_eq!(
+            resolve_origin_profile(None, Some(""), Some("  "), Some(""), false),
+            None
+        );
+    }
+
+    /// #1466 の A/B: legacy アームは spawn 元も管轄も見ず、`default` へ落ちる旧挙動
+    #[test]
+    fn legacyアームは修正前の宛先を再現する() {
+        assert_eq!(
+            resolve_origin_profile(
+                Some("worker:tako:1466"),
+                None,
+                Some("takodev"),
+                Some("tako"),
+                true
+            ),
+            None,
+            "legacy アームが spawn 元を解いている（A/B にならない）"
+        );
+        // master を名乗る呼び出しは legacy でも解ける（修正前もここは動いていた）
+        assert_eq!(
+            resolve_origin_profile(Some("master:takodev"), None, None, None, true),
+            Some(("takodev".into(), OriginSource::CallerRole))
+        );
     }
 }

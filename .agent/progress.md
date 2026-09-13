@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-14（#1447: preview パネルつき AskUserQuestion（2 カラム配置）を検知できるようにした）
-- 真因は枠の同居**ではなく**折り返しの継続行の字下げ（実採取は中身の桁 5 に対して 4）。`gap_line_kind` が「ダイアログの外」に分類し `numbered_block` が選択肢 1 個で打ち切っていた。注入 A/B で名指し（枠を剥がしただけでは None のまま / 継続行を 5 桁へ揃えると修正前でも採れる）
-- 下限を `dialog::wrap_indent_floor`（マーカー `N.` より右）の 1 実装へ寄せ、歯止めに「選択カーソル行・番号つき行は続きにしない」。副画面は判定前に `side_panel_cuts` → `strip_side_panel` で剥がす（3 条件つき。全幅の箱の右端では発火しない）。エッジで実バグ 2 件を発見して修正（パネルだけの行が下の選択肢ラベルへ結合 / 内側の余白を掴む）
-- 実測（隔離 GUI・tako-vd）: `status` の `choice_dialog` が 3 択・`watch` が `WORKER_DIALOG: tako:1 (select)`・`respond --choice 2` が `resolved:true` / `keys_sent:["2"]`（模擬 TUI 側も `KEY=2 / CHOSE=自分で流す`）。`TAKO_1447_LEGACY=1` は `choice_dialog: null` / `WORKER_TIMEOUT` / 「画面に存在しない」で症状を再現。番犬 3 本・注入 8 通りで file:line 名指し。workspace 4805 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。**install 要**
-
 ## 2026-09-14（#1445: 番犬の共有部品が合成 cfg のテストモジュールを本番として走査していた）
 - `production_range.rs` のテスト領域検出をリテラル `#[cfg(test)]` から**cfg 述語の解釈**へ（`mentions_test`: `test` を正の位置に含むものだけ潰す）。`not(test)` は本番として残し、`cfg_attr` は入口の綴りごと対象外。#1441 の番犬が持っていた自前正規化は削除して 1 実装へ戻した
 - 走査範囲は src 263 本中 **8 本**が変化（合計 74.34% → 74.04% / 新たに潰れたのは合成 cfg の 11 item ちょうど）。**下限 30% を跨いだファイルは 0 件**（表は Issue #1445）。A/B `TAKO_1445_LEGACY=1` では #1441 の番犬が `discovery.rs:343` をテスト内の直書きなのに本番違反として名指しで落ちる = 誤検出の再現
@@ -54,3 +49,8 @@
 - `tako_panel` の `view` が手書きの写し（`["fleet","orch","git","tmux"]`）で #1450 B2 の `tasks` に追従していなかった。`PanelViewWire` へ `summary()` / `accepted_values()` / `values_summary()` を足し、catalog は `panel_view_schema()` で受理値も説明文も生成する。旧称 `tmux` は**落とさない**（enum から消すと今動いているクライアントが送れなくなる）
 - 棚卸し: catalog の `"enum"` は 102 か所 / 値集合 75 種。正本が実行時に読めるのは 10 種（20 site）だけで、うち「MCP の正本」を名乗っていた 5 つ（Panel / ProfileKind / SessionRestartMode / UiMode / RemoteOpenTarget）を生成へ寄せた。残り 52 種は正本なし（action 動詞）か正本が非公開・列挙 API なし = Issue にコメント
 - 番犬 `issue1467_mcp_enum_watchdog`（5 本・注入 8 通り + 実ファイル注入で `catalog.rs:695` を名指し）。スナップショット `mcp_tools_full_snapshot.json` は `tasks` の追加ぶんだけ差分。tools/list 実出力と隔離 GUI の MCP 呼び出しで実測。workspace 4875 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。**install 要**
+
+## 2026-09-14（#1466: worker が起票したユーザータスクの返答を spawn 元の master へ返した）
+- 戻り先の解決順を「名乗った master → ペインの role → **spawn 元**（`spawned_by` を辿る `find_master_suffix_from` = worker spawn の既定と同じ 1 実装）→ 管轄プロファイル（**一意のときだけ**）」へ。判断は `user_tasks::resolve_origin_profile` の純粋関数 1 本で、dispatch は材料を集めるだけ。**新しい永続フィールドは 0**（`spawned_by` と role ラベルは既にある）
+- **解けなければ `default` へ落とさない**（`origin_profile` を `Option` 化。配送は `failed` + `宛先不明: …` で残り `tako todo show` に出る）。名乗り（`created_by`）は戻り先ではなく**呼び出し元自身の役割**から作る（worker が `master:<profile>` を騙らないため）
+- 実測 `scripts/test-user-task-origin-1466.sh` **28 PASS 0 FAIL**（実 spawn の worker → CLI / MCP とも `origin.profile` が spawn 元・返答が master のペインへ・role なし / solo / 管轄なしは `failed`・master を閉じても管轄から同じプロファイルを起こす）。A/B `TAKO_1466_LEGACY=1` で症状再現（無関係な default の master のペインへ届く）。#1450 B1 の e2e 45 PASS 0 FAIL（回帰なし）・番犬 4 本（注入 8 通り）・workspace 4889 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。**install 要**

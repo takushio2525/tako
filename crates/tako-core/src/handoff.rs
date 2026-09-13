@@ -118,6 +118,22 @@ pub fn master_profile_of_any_role(role: &str) -> Option<&str> {
     }
 }
 
+/// 表示用 role（`orchestrator-worker:<project>[:<label>]`）と env 用 role
+/// （`worker:<project>[:<label>]`）の**どちらからでも** worker のプロジェクトキーを取り出す。
+/// master / solo / role なしは None。
+///
+/// master 側（[`master_profile_of_any_role`]）と対にしてここへ置く。worker の役割から
+/// 「どのプロジェクトの worker か」を読む場所が増えるたびに `strip_prefix` を書き直すと、
+/// 片方の語彙だけ解ける実装が生えて #761 と同じ取り違えが起きる（#1466）
+pub fn worker_project_of_any_role(role: &str) -> Option<&str> {
+    let rest = role
+        .strip_prefix("orchestrator-worker")
+        .or_else(|| role.strip_prefix("worker"))?;
+    rest.strip_prefix(':')
+        .map(|r| r.split(':').next().unwrap_or(""))
+        .filter(|s| !s.is_empty())
+}
+
 /// master のプロファイルを**どこから**決めたか（#854 の診断用）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProfileSource {
@@ -2089,6 +2105,31 @@ mod tests {
         assert_eq!(master_profile_of_any_role("worker:tako"), None);
         assert_eq!(master_profile_of_any_role("master-old"), None);
         assert_eq!(master_profile_of_any_role(""), None);
+    }
+
+    /// worker の role からも**どちらの語彙でも**プロジェクトキーが読める（#1466）
+    #[test]
+    fn どちらの語彙のroleからもworkerのプロジェクトが読める() {
+        for role in [
+            "orchestrator-worker:tako",
+            "orchestrator-worker:tako:1466",
+            "worker:tako",
+            "worker:tako:1466-の担当",
+        ] {
+            assert_eq!(
+                worker_project_of_any_role(role),
+                Some("tako"),
+                "worker の role からプロジェクトが読めない: {role}"
+            );
+        }
+        // master / solo / 空 suffix / 似た接頭辞 / role なし
+        assert_eq!(worker_project_of_any_role("master:takodev"), None);
+        assert_eq!(worker_project_of_any_role("orchestrator-master"), None);
+        assert_eq!(worker_project_of_any_role("solo:docs"), None);
+        assert_eq!(worker_project_of_any_role("worker"), None);
+        assert_eq!(worker_project_of_any_role("worker:"), None);
+        assert_eq!(worker_project_of_any_role("worker-old:tako"), None);
+        assert_eq!(worker_project_of_any_role(""), None);
     }
 
     // --- #915: プロジェクト単位の引き継ぎ ---
