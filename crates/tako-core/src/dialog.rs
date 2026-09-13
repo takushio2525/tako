@@ -212,8 +212,26 @@ pub fn is_choice_dialog(lines: &[&str]) -> bool {
 /// しまう形（番号なしの並び）では物理行の結果がそのまま残る。
 /// 折り返しが 1 つも無い画面では入力が**同一の文字列**なので 1 ビットも変わらない
 pub fn detect_choice_list(lines: &[&str]) -> Option<ChoiceList> {
+    // #1447: 選択肢の右へ並ぶ副画面（AskUserQuestion の `preview`）を先に剥がす。
+    // 剥がさないと選択肢の行末に枠線が混ざり、ラベルにも枠が丸ごと入る
+    match side_panel_cuts(lines) {
+        Some(cuts) => {
+            let stripped = strip_side_panel(lines, &cuts);
+            let refs: Vec<&str> = stripped.iter().map(String::as_str).collect();
+            let at_edge: Vec<bool> = cuts.iter().map(Option::is_some).collect();
+            detect_choice_list_wrapped(&refs, &at_edge)
+        }
+        None => detect_choice_list_wrapped(lines, &[]),
+    }
+}
+
+/// 物理行と「折り返しを結合した行」の**良いほう**を採る（#1131）。
+///
+/// `at_wrap_edge` は「その行が折り返しの縁で切られている」ことの印（#1447。
+/// 空スライス = 印なし）。`detect_choice_list` が副画面を剥がしたときだけ立つ
+fn detect_choice_list_wrapped(lines: &[&str], at_wrap_edge: &[bool]) -> Option<ChoiceList> {
     let raw = detect_choice_list_in(lines);
-    let unwrapped = unwrap_dialog_lines(lines);
+    let unwrapped = unwrap_dialog_lines_at(lines, at_wrap_edge);
     if unwrapped.iter().zip(lines).all(|(a, b)| a == b) {
         return raw; // 結合が起きていない = 判定材料が同一
     }
@@ -225,6 +243,149 @@ pub fn detect_choice_list(lines: &[&str]) -> Option<ChoiceList> {
         (Some(joined), None) => Some(joined),
         (_, raw) => raw,
     }
+}
+
+// --- 選択肢の右へ並ぶ副画面の剥がし（#1447） ---
+
+/// 副画面の枠に使われる縦・角の罫線
+const PANEL_EDGE: &[char] = &['┌', '╭', '├', '└', '╰', '│', '┃', '┐', '╮', '┤', '┘', '╯'];
+
+/// 副画面の**左上角**（= 箱がそこから右へ始まる証拠）
+const PANEL_TOP_LEFT: &[char] = &['┌', '╭'];
+
+/// 副画面の左に要る余白（実採取の gutter は 4 桁以上。2 桁を下限にする）
+const PANEL_GUTTER: usize = 2;
+
+/// その行が「本文 → [`PANEL_GUTTER`] 桁以上の空白 → 枠線」と並んでいれば、
+/// **空白が始まるバイト位置**を返す（#1447）。
+///
+/// AskUserQuestion の `preview` つき（side-by-side layout）は選択肢の**右**へ
+/// 枠つきの副画面を描くので、`capture-pane` の 1 行に選択肢と枠が同居する。
+/// 本文を囲む枠（行頭の `│`）は左に本文が無いので当たらない。
+/// 桁は**表示幅ではなく空白の並びで**見つけるので、全角のラベルでもずれない
+fn panel_cut(line: &str) -> Option<usize> {
+    // **行まるごとが副画面**なら、掴むべきは箱の左端であって内側の余白ではない
+    // （実測: `　…　│ src/a.rs      │` の右端の `│` の手前で切ってしまい、
+    // 残った `│ src/a.rs` が直前の選択肢のラベルへ結合された）。
+    // その行は [`extend_panel_cuts`] が地続きのときだけ切る = 存在判定には使わない
+    if panel_only_cut(line).is_some() {
+        return None;
+    }
+    let mut seen_content = false;
+    let mut run: Option<(usize, usize)> = None; // (開始バイト, 空白の数)
+    for (idx, c) in line.char_indices() {
+        if c == ' ' {
+            run = Some(match run {
+                Some((start, n)) => (start, n + 1),
+                None => (idx, 1),
+            });
+            continue;
+        }
+        if let Some((start, n)) = run {
+            if seen_content && n >= PANEL_GUTTER && PANEL_EDGE.contains(&c) {
+                return Some(start);
+            }
+        }
+        run = None;
+        seen_content = true;
+    }
+    None
+}
+
+/// その行が**副画面だけ**でできているか（行頭の余白 → 枠線）。
+///
+/// 箱が選択肢より高いと、下端の数行は左に本文を持たない（実測: 選択肢 2 個 +
+/// パネル 6 行）。[`panel_cut`] は「本文の右」しか見ないのでこれを切り残し、
+/// 残った枠線が**直前の選択肢の折り返しの続き**として結合されてラベルへ入る
+/// （実測: `あとで反映する│ src/a.rs │ src/b.rs │ src/c.rs`）。
+///
+/// **副画面が在ると確定したあとの切り足しにだけ使う**（[`side_panel_cuts`]）。
+/// 存在判定に使うと、字下げして罫線で囲んだ本文を副画面と誤認しうる
+fn panel_only_cut(line: &str) -> Option<usize> {
+    let leading = line.chars().take_while(|c| *c == ' ').count();
+    if leading < PANEL_GUTTER {
+        return None;
+    }
+    let rest = line.trim_start();
+    rest.starts_with(PANEL_EDGE)
+        .then_some(line.len() - rest.len())
+}
+
+/// 画面に「選択肢の右へ並ぶ副画面」が在れば、行ごとの切り出し位置を返す（#1447）。
+///
+/// 誤爆を避けるため次を**すべて**要求する:
+///
+/// - 枠の**左上角**（`┌` / `╭`）が本文の右に在る（= 箱がそこから右へ始まる）。
+///   全幅の箱の**右端**（`┐` / `│`）だけが並ぶ画面（codex の入力ボックス・
+///   罫線で囲んだ本文）はここで落ちる
+/// - 同じ形の行が 2 行以上（箱は上端と下端で最低 2 行）
+/// - **番号つき選択肢の行**が 1 つ以上その形で、左側に中身が残る
+///   （= 選択肢と副画面が同居している。これが「2 カラム配置」の定義）
+fn side_panel_cuts(lines: &[&str]) -> Option<Vec<Option<usize>>> {
+    if legacy_side_panel() {
+        return None;
+    }
+    let cuts: Vec<Option<usize>> = lines.iter().map(|l| panel_cut(l)).collect();
+    let mut top_left = false;
+    let mut rows = 0usize;
+    let mut with_option = false;
+    for (line, cut) in lines.iter().zip(&cuts) {
+        let Some(cut) = *cut else { continue };
+        rows += 1;
+        if line[cut..].trim_start().starts_with(PANEL_TOP_LEFT) {
+            top_left = true;
+        }
+        let left = &line[..cut];
+        if numbered_choice(cursor_content(left).unwrap_or_else(|| strip_indent(left))).is_some() {
+            with_option = true;
+        }
+    }
+    if !(top_left && rows >= 2 && with_option) {
+        return None;
+    }
+    Some(extend_panel_cuts(lines, cuts))
+}
+
+/// 本文を持たない「副画面だけの行」へ切り出し位置を広げる（#1447）。
+///
+/// 広げるのは**既に切れている行と地続き**のところだけ（上下へ 1 行ずつ伸ばす）。
+/// 画面のどこにあるか分からない罫線まで巻き込まないための限定
+fn extend_panel_cuts(lines: &[&str], mut cuts: Vec<Option<usize>>) -> Vec<Option<usize>> {
+    let grow = |cuts: &mut Vec<Option<usize>>, order: Vec<usize>| {
+        let mut inside = false;
+        for i in order {
+            if cuts[i].is_some() {
+                inside = true;
+                continue;
+            }
+            match inside.then(|| panel_only_cut(lines[i])).flatten() {
+                Some(cut) => cuts[i] = Some(cut),
+                None => inside = false,
+            }
+        }
+    };
+    grow(&mut cuts, (0..lines.len()).collect());
+    grow(&mut cuts, (0..lines.len()).rev().collect());
+    cuts
+}
+
+/// 副画面を落とした行を返す（`cuts` は [`side_panel_cuts`] の戻り。**行数は保つ**）
+fn strip_side_panel(lines: &[&str], cuts: &[Option<usize>]) -> Vec<String> {
+    lines
+        .iter()
+        .zip(cuts)
+        .map(|(line, cut)| match cut {
+            Some(c) => line[..*c].trim_end().to_string(),
+            None => (*line).to_string(),
+        })
+        .collect()
+}
+
+/// `TAKO_1447_LEGACY=1` で #1447 前（副画面を剥がさない・折り返しの下限を
+/// 中身の桁のままにする）へ戻す（A/B 用）
+fn legacy_side_panel() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_1447_LEGACY").is_some())
 }
 
 /// [`detect_choice_list`] の本体（渡された行をそのまま材料にする）
@@ -403,14 +564,19 @@ enum GapLine {
 
 /// ダイアログの行のあいだに挟まった 1 行を分類する（#1293 で 1 実装へ寄せた）。
 ///
-/// `content_col` は**上側の行の中身が始まる桁**（[`content_start_column`]）。
-/// 折り返しの続きは必ずそこ以上へ字下げされるので、それより浅い非空行は
-/// 案内でも罫線でもなければダイアログの外（= 会話ログ）とみなす
-fn gap_line_kind(line: &str, content_col: usize) -> GapLine {
+/// `floor` は**折り返しの続きが字下げされる下限の桁**（[`wrap_indent_floor`]）。
+/// それより浅い非空行は、案内でも罫線でもなければダイアログの外（= 会話ログ）とみなす。
+///
+/// **選択カーソル行と番号つき選択肢の行は続きにしない**（#1447）。下限を中身の桁より
+/// 浅くしたぶんの歯止めで、別の一覧をまたいで「あいだはダイアログの一部だった」と
+/// 言わせないための条件（#1263 / #1293 の安全側をそのまま保つ）
+fn gap_line_kind(line: &str, floor: usize) -> GapLine {
     if line.trim().is_empty() {
         return GapLine::Blank;
     }
-    if line.chars().take_while(|c| *c == ' ').count() >= content_col {
+    let is_element = !legacy_side_panel()
+        && (cursor_content(line).is_some() || numbered_choice(strip_indent(line)).is_some());
+    if !is_element && line.chars().take_while(|c| *c == ' ').count() >= floor {
         return GapLine::Continuation;
     }
     if is_key_hint(line) {
@@ -424,7 +590,7 @@ fn gap_line_kind(line: &str, content_col: usize) -> GapLine {
 
 /// `upper` 行と `lower` 行のあいだが、ダイアログの一部だけでできているか（#1293）
 fn numbered_gap_ok(lines: &[&str], upper: usize, lower: usize) -> bool {
-    let content_col = content_start_column(lines[upper]).unwrap_or(0);
+    let content_col = wrap_indent_floor(lines[upper]).unwrap_or(0);
     lines
         .get(upper + 1..lower)
         .unwrap_or_default()
@@ -507,7 +673,7 @@ fn numbered_above_empty_input(
 /// 旧実装は「最下部の選択カーソル行」を起点にすることで偶然この区別をしていたので、
 /// 入力欄を跨いで上を見るならこの条件を明示的に置く必要がある
 fn dialog_reaches_input_box(lines: &[&str], last_row: usize, input_row: usize) -> bool {
-    let content_col = content_start_column(lines[last_row]).unwrap_or(0);
+    let content_col = wrap_indent_floor(lines[last_row]).unwrap_or(0);
     let mut hint = false;
     for line in lines.get(last_row + 1..input_row).unwrap_or_default() {
         match gap_line_kind(line, content_col) {
@@ -756,34 +922,57 @@ const MAX_WRAP_JOIN_CHARS: usize = 600;
 /// 25 桁のペインで本文の列 3 / 選択肢の列 8 の両方がこの値で一致する）
 const DIALOG_RIGHT_PAD: usize = 3;
 
+/// 続きを受け付けている論理行（[`unwrap_dialog_lines_at`] の状態）
+#[derive(Debug, Clone, Copy)]
+struct OpenLine {
+    /// 出力側の行番号（入力の行番号と 1:1）
+    row: usize,
+    /// 中身が始まる桁（番号なしの並びの下限）
+    indent: usize,
+    /// 続きとみなす字下げの下限（[`wrap_indent_floor`]）
+    floor: usize,
+    /// 番号つき選択肢の行か
+    numbered: bool,
+    /// この行が**折り返しの縁で切られている**か（#1447 の副画面の左端）。
+    /// 縁に達しているのは構造から分かっているので、幅の見積もりは使わない
+    at_wrap_edge: bool,
+}
+
 /// その行が**新しい要素**を始めるか（= 直前の行の折り返しの続きではないか）。
 ///
-/// `indent` は直前の論理行の中身が始まる桁。続きは**必ずそれより深く**字下げされる
-/// （実採取: 25 桁の確認ダイアログで `   ❯ 1. Yes, switch to` の続きが
-/// `        Haiku 4.5` = 番号の後ろの列）。同じ桁の行は**次の選択肢**なので結合しない。
+/// 続きは直前の論理行の[`下限`](wrap_indent_floor)より深く字下げされる（実採取:
+/// 25 桁の確認ダイアログで `   ❯ 1. Yes, switch to` の続きが `        Haiku 4.5`）。
+/// 兄弟の選択肢はそれより左の**番号の列**に並ぶので結合されない。
 ///
 /// 加えて、深く字下げされていても次のものは続きにしない:
 /// 選択カーソル行 / 番号つき選択肢 / 操作キーの案内 / 罫線
-fn starts_new_dialog_block(
-    line: &str,
-    prev: &str,
-    indent: usize,
-    numbered: bool,
-    usable: usize,
-) -> bool {
+fn starts_new_dialog_block(line: &str, prev: &str, open: &OpenLine, usable: usize) -> bool {
     let stripped = line.trim_start();
     if stripped.is_empty() {
         return true;
     }
+    // **構造で「別の要素」と分かるものが先**（幅の見積もりより確実。#1447 で
+    // 下限を緩めたので、順序を後ろに置いたままだと兄弟の選択肢を飲みうる）
+    if !legacy_side_panel()
+        && (cursor_content(line).is_some()
+            || is_key_hint(line)
+            || is_rule_line(stripped)
+            || numbered_choice(strip_indent(line)).is_some())
+    {
+        return true;
+    }
     let leading = line.chars().take_while(|c| *c == ' ').count();
-    // 番号つきの選択肢は**ラベルの列**（`1. ` の後ろ）へ折り返し、兄弟の選択肢は
-    // それより左の**番号の列**に並ぶ（実採取）。だから同じ桁は続きでよい。
     // 番号なしの並びは兄弟も続きも同じ桁に来て区別できないので、**深い行だけ**を
     // 続きとみなす（`/mcp` のサーバー一覧を 1 個へ畳まないための安全側）
-    let deep_enough = if numbered {
-        leading >= indent
+    let deep_enough = if open.numbered {
+        leading
+            >= if legacy_side_panel() {
+                open.indent
+            } else {
+                open.floor
+            }
     } else {
-        leading > indent
+        leading > open.indent
     };
     if !deep_enough {
         return true;
@@ -792,22 +981,49 @@ fn starts_new_dialog_block(
     // 前の行に最初の語がまだ入る余地があるなら、それは折り返しではなく
     // 別の要素（実採取: 80 桁の AskUserQuestion は選択肢の下に説明行が
     // ラベルと同じ桁で並ぶ）。桁は表示幅ではなく char 数で数えるので、
-    // 全角の行では**控えめ**に見積もる = 結合しない側へ倒れる（安全側）
-    let first_word = stripped
-        .split(' ')
-        .next()
-        .unwrap_or(stripped)
-        .chars()
-        .count();
-    // 前の行の長さは**行末の余白を落として**測る（実画面は幅ぶん空白で埋まることがあり、
-    // 埋めたままだと「もう入らない」と誤判定して結合しすぎる側へ倒れる）
-    if prev.trim_end().chars().count() + 1 + first_word <= usable {
+    // 全角の行では**控えめ**に見積もる = 結合しない側へ倒れる（安全側）。
+    // **副画面の縁で切られた行は見積もりを使わない**（#1447）: 折り返し位置は
+    // 画面幅ではなく副画面の左端で決まっており、char 数では測れない
+    if !open.at_wrap_edge {
+        let first_word = stripped
+            .split(' ')
+            .next()
+            .unwrap_or(stripped)
+            .chars()
+            .count();
+        // 前の行の長さは**行末の余白を落として**測る（実画面は幅ぶん空白で埋まることがあり、
+        // 埋めたままだと「もう入らない」と誤判定して結合しすぎる側へ倒れる）
+        if prev.trim_end().chars().count() + 1 + first_word <= usable {
+            return true;
+        }
+    }
+    if legacy_side_panel() {
+        return cursor_content(line).is_some()
+            || is_key_hint(line)
+            || is_rule_line(stripped)
+            || numbered_choice(strip_indent(line)).is_some();
+    }
+    false
+}
+
+/// 折り返しを繋ぐときに空白を挟むか（#1447）。
+///
+/// 英語のラベルは語の切れ目で折り返すので空白が要る（`Yes, switch to` +
+/// `Haiku 4.5`）。**副画面の縁で切られた行**（`at_wrap_edge`）は画面幅ではなく
+/// 副画面の左端で割れており、日本語では語の途中で割れる。そこへ空白を挟むと
+/// `権限を許可して私が流す（ 推奨）` という壊れた語になる（#1447 の実採取）ので、
+/// 境界の両側が非 ASCII なら挟まない。
+///
+/// **副画面が無い画面の結合は従来どおり**（#1131 の実装を変えない）。狭いペインの
+/// 全角ラベルにも同じ理屈は当たるが、そちらを変えると #1131 が固定した期待値
+/// （`はい、ぜんぶ進めますよ つづき`）が変わるので、この Issue の範囲では触らない
+fn needs_join_space(head: &str, tail: &str, at_wrap_edge: bool) -> bool {
+    if !at_wrap_edge || legacy_side_panel() {
         return true;
     }
-    if cursor_content(line).is_some() || is_key_hint(line) || is_rule_line(stripped) {
-        return true;
-    }
-    numbered_choice(strip_indent(line)).is_some()
+    let last = head.chars().next_back();
+    let first = tail.chars().next();
+    !matches!((last, first), (Some(a), Some(b)) if !a.is_ascii() && !b.is_ascii())
 }
 
 /// 選択肢のラベルが折り返された画面を、1 論理行へ戻す（#1131）。
@@ -838,6 +1054,12 @@ fn starts_new_dialog_block(
 /// 空白で継ぐと `1M co ntext` という壊れた語がラベルに入る。
 /// 列の判定は [`description_column`]
 pub fn unwrap_dialog_lines(lines: &[&str]) -> Vec<String> {
+    unwrap_dialog_lines_at(lines, &[])
+}
+
+/// [`unwrap_dialog_lines`] の本体。`at_wrap_edge` は行ごとの
+/// 「副画面の縁で切られている」印（#1447。空スライス = 印なし）
+fn unwrap_dialog_lines_at(lines: &[&str], at_wrap_edge: &[bool]) -> Vec<String> {
     if legacy_wrapped_dialog() {
         return lines.iter().map(|l| (*l).to_string()).collect();
     }
@@ -858,22 +1080,24 @@ pub fn unwrap_dialog_lines(lines: &[&str]) -> Vec<String> {
         .collect();
     let desc_col = description_column(lines, &numbered_rows);
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
-    // 続きを受け付けている論理行（`out` の添字と中身の桁）。None = 受け付けない
-    let mut open: Option<(usize, usize, bool)> = None;
+    // 続きを受け付けている論理行。None = 受け付けない
+    let mut open: Option<OpenLine> = None;
     let mut joined = 0usize;
     for line in lines {
-        if let Some((row, indent, numbered)) = open {
+        if let Some(state) = open {
             if joined < MAX_WRAP_JOIN_LINES
-                && !starts_new_dialog_block(line, &out[row], indent, numbered, usable)
+                && !starts_new_dialog_block(line, &out[state.row], &state, usable)
             {
                 let tail = line.trim();
-                let last = &mut out[row];
+                let last = &mut out[state.row];
                 if last.chars().count() + tail.chars().count() < MAX_WRAP_JOIN_CHARS {
                     // 行末の余白は情報を持たないので落としてから継ぐ。実画面はペイン幅ぶん
                     // 空白で埋まることがあり、そのまま繋ぐとラベルの途中に空白の塊が残って
                     // `respond` のラベル一致検証が外れる（#1131 が直したかったものと同じ形）
                     last.truncate(last.trim_end().len());
-                    last.push(' ');
+                    if needs_join_space(last, tail, state.at_wrap_edge) {
+                        last.push(' ');
+                    }
                     last.push_str(tail);
                     joined += 1;
                     // **行数は保つ**（画面の行番号と 1:1 のまま扱う）。結合した行は
@@ -889,19 +1113,26 @@ pub fn unwrap_dialog_lines(lines: &[&str]) -> Vec<String> {
             numbered_choice(cursor_content(line).unwrap_or_else(|| strip_indent(line))).is_some();
         // 2 列レイアウトの選択肢は続きを受け付けない（下に来るのは説明列の折り返し）
         let two_column = is_numbered && desc_col.is_some() && column_gap(line) == desc_col;
+        let row = out.len();
         open = if two_column {
             None
         } else {
-            content_start_column(line).map(|c| (out.len(), c, is_numbered))
+            content_start_column(line).map(|indent| OpenLine {
+                row,
+                indent,
+                floor: wrap_indent_floor(line).unwrap_or(indent),
+                numbered: is_numbered,
+                at_wrap_edge: at_wrap_edge.get(row).copied().unwrap_or(false),
+            })
         };
         out.push((*line).to_string());
     }
     out
 }
 
-/// その行の「中身が始まる桁」（行頭空白 + 縦罫線 + 選択カーソル + 番号を除いた位置）。
-/// 折り返しの続きはこの桁へ字下げされる（実採取）
-fn content_start_column(line: &str) -> Option<usize> {
+/// その行の「マーカーが始まる桁」（行頭空白 + 縦罫線 + 選択カーソルを除いた位置）。
+/// 番号つき選択肢ならここに `N.` が来る。本文を持たない行（罫線・キー案内・空行）は `None`
+fn marker_start_column(line: &str) -> Option<usize> {
     let stripped = line.trim_start();
     if stripped.is_empty() {
         return None;
@@ -912,12 +1143,15 @@ fn content_start_column(line: &str) -> Option<usize> {
     if is_rule_line(stripped) || is_key_hint(line) {
         return None;
     }
-    let after_cursor =
-        cursor_content(line).map(|inner| line[..subslice_offset(line, inner)].chars().count());
-    let base = match after_cursor {
-        Some(c) => c,
+    Some(match cursor_content(line) {
+        Some(inner) => line[..subslice_offset(line, inner)].chars().count(),
         None => line.chars().take_while(|c| *c == ' ').count(),
-    };
+    })
+}
+
+/// その行の「中身が始まる桁」（行頭空白 + 縦罫線 + 選択カーソル + 番号を除いた位置）
+fn content_start_column(line: &str) -> Option<usize> {
+    let base = marker_start_column(line)?;
     // 番号つきなら番号とドットの後ろがラベルの列
     let inner = cursor_content(line).unwrap_or_else(|| strip_indent(line));
     match numbered_choice(inner) {
@@ -926,6 +1160,36 @@ fn content_start_column(line: &str) -> Option<usize> {
             Some(base + consumed)
         }
         None => Some(base),
+    }
+}
+
+/// 折り返しの続きが字下げされる**下限**の桁（#1447）。
+///
+/// 番号つき選択肢の続きが**どの桁へ揃うかは描画側の都合で変わる**。実採取:
+///
+/// ```text
+/// 通常のダイアログ（ラベル列へ揃う。中身の桁 = 5）
+///   ❯ 1. Yes, switch to
+///        Haiku 4.5
+///
+/// 副画面つき（side-by-side。中身の桁 = 5 なのに続きは 4）
+///   ❯ 1. 権限を許可して私が流す（
+///       推奨）
+/// ```
+///
+/// 中身の桁を下限にすると後者が「ダイアログの外」に落ちて、選択肢の並びが
+/// 1 行で切れる（#1447 の不検知の真因）。そこで**マーカー（`N.`）より右**という
+/// 下限だけを条件にする。番号なしの行は従来どおり中身の桁が下限
+fn wrap_indent_floor(line: &str) -> Option<usize> {
+    let content = content_start_column(line)?;
+    if legacy_side_panel() {
+        return Some(content);
+    }
+    let numbered =
+        numbered_choice(cursor_content(line).unwrap_or_else(|| strip_indent(line))).is_some();
+    match numbered {
+        true => Some(marker_start_column(line)? + 1),
+        false => Some(content),
     }
 }
 
