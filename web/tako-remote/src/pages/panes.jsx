@@ -13,6 +13,7 @@ import { createClient } from '../api';
 import { AgentIcon } from '../components/agent-icon';
 import { RemoteLinkRow, AccountChip } from '../components/remote-link';
 import { LaunchSheet, legacy1449 } from '../components/launch-sheet';
+import { useOpenTaskCount, legacy1450b3 } from './tasks';
 
 const PREVIEW_LINES = 8;
 const PULL_THRESHOLD = 80;
@@ -263,6 +264,8 @@ export function PanesPage({ me }) {
   const [filter, setFilter] = useState('all');
   // #1078 → #1449: 「+」のボトムシート（master / ターミナル / SSH の 3 択）
   const [launcher, setLauncher] = useState(false);
+  // #1450 B3: 未完了のユーザータスク件数（ポーリングの止め方は tasks.jsx の 1 実装）
+  const openTasks = useOpenTaskCount(!legacy1450b3());
   const timerRef = useRef(null);
   const touchStartRef = useRef({ y: 0, scrollTop: 0 });
   const listRef = useRef(null);
@@ -364,6 +367,20 @@ export function PanesPage({ me }) {
               <PlusIcon />
               <span>{legacy1449() ? 'master' : '新規'}</span>
             </button>
+            {/* #1450 B3: 人がやること（未完了件数をバッジで出す。件数の正本は daemon の open_count） */}
+            {!legacy1450b3() && (
+              <button
+                class="tasks-entry-btn"
+                data-testid="tasks-entry"
+                aria-label="タスク"
+                onClick={() => { window.location.hash = '#/tasks'; }}
+              >
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                  <path d="M9 5h10M9 12h10M9 19h10M4 5l1.5 1.5L8 4M4 12l1.5 1.5L8 11M4 19l1.5 1.5L8 18" />
+                </svg>
+                {openTasks > 0 && <span class="tasks-badge" data-testid="tasks-badge">{openTasks}</span>}
+              </button>
+            )}
             {/* #1079: ファイルビューへの導線 */}
             <button
               class="files-entry-btn"

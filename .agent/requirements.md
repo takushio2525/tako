@@ -1476,11 +1476,12 @@ A/B は `TAKO_757_LEGACY=1`（#757 前の分類へ戻る = 接続エラー行が
 | FR-2.40.7 | **起票は画面に 1 行出る**。共有の通知欄（#1399 / #1417 / #1422 / #1432 と**同じ出し口**の成功系 = `notify_ui_info`）へ「新しいユーザータスク u-N: タイトル」を出す。**本文・添付・コメントは出さない**（通知は消える前提で、続きは右パネルと `tako todo list` で読む）。診断（persist.log）は**起きた場所**（dispatch）に置く = sidebar.rs から診断へ書く口は `log_ui_failure` の 1 つのまま。A/B は `TAKO_1450_LEGACY=1` | M | ✅ |
 | FR-2.40.8 | **master の運用へ組み込む**。`tako orchestrator guide user-tasks` に「ユーザーに聞くこと・見てもらうこと・許可をもらうことは会話や引き継ぎに溜めずここへ起票する」「返答は入力欄に届くので、それを起点に作業を続ける」「投稿系は `copy_texts` を貼り先ごとに分ける」を置き、system prompt の topic 表から引けるようにする。`respond` の状態遷移は approve / reject = 閉じる、needs_change / answered = **open のまま**（AI 側の作業がこれから続くので、閉じると直した物を見てもらう先が消える） | M | ✅ |
 
+
 A/B は `TAKO_1450_LEGACY=1`（起票しても通知欄に何も出ない = 「起票されたことに気づけない」の再現）。
 番犬は `issue1450_user_tasks_watchdog.rs`（CLI が store を直接触らない / CLI と MCP の action 語彙が一致 /
 永続の番地が 4 か所に揃う / 通知の出し口が増殖しない / 配送が既存経路を呼ぶ。**注入 7 通りで `file:line` 名指し**）。
 実測は `scripts/test-user-task-delivery.sh`（隔離した実 tako-app + 実 CLI + claude スタブで
-①〜⑦ を通す）。**B3（PWA `#/tasks`）は別 Issue**。
+①〜⑦ を通す）。スマホ（PWA）側は下の **B3** 節。
 
 #### B2: PC の画面（右パネルの `tasks` ビュー。✅ 2026-09-14）
 
@@ -1504,6 +1505,26 @@ B2 の A/B は **`TAKO_1450B2_LEGACY=1`**（B1 の `TAKO_1450_LEGACY` とは別�
 返答コメント欄の編集ロジックは `tako-app::text_field::TextField`（GPUI 非依存の純ロジック）。
 右パネルに既にある手書き入力 2 本（git のコミットメッセージ / 新規ブランチ名）の移行は **#1459** で追う
 （番犬が「**新しい**手書きカーソル操作を足せない」を縛り、既存 2 本は名指しの猶予にしてある）。
+
+#### B3: スマホの画面（PWA の `#/tasks`。✅ 2026-09-14）
+
+| ID | 要件 | 優先度 | 状態 |
+|---|---|---|---|
+| FR-2.40.16 | **スマホ（PWA）から片付けられる**（#1450 の分割 B3）。`#/tasks` に一覧（既定 = 未完了・種類で絞り込み・並びは `updated_at` 降順）と詳細（markdown 本文 / 添付 / コピー用テキスト / リンク / 返答フォーム / やりとり / 配送の状態 / 完了・却下）を出し、ペイン一覧のナビに**未完了件数のバッジ**を出す。件数の正本は `list` の `open_count`（画面で数え直さない）。**語彙と状態表示は PC 版（B2）と同一**で、`sent` を「届いた」と書かない | M | ✅ |
+| FR-2.40.17 | **daemon の受け口は宣言表**（`tako_control::remote_tasks::TASK_ROUTES`）。`GET /api/tasks` = Observe、`POST /api/tasks/<id>/{respond,done,dismiss}` = Interact で、**表に無い `/api/tasks…` は Manage へ落とす床**を置く（#1405 の「未知の経路が弱い role へこぼれる」を塞ぐ）。中身は B1 の `Request::UserTask` を**素通し**するだけで、データモデル・永続・配送はこの分割で 1 行も変えない。返答の `via` は `pwa` | M | ✅ |
+| FR-2.40.18 | **添付のダウンロードは新しい配信経路を作らない**。daemon が添付の絶対パスを `remote_files::shortcut_target`（#1451 の 1 実装）で `{root, path_rel}` へ解決して返し、PWA は既存の `GET /api/files/download?root=…&path=…`（#1079。Interact）を叩く。したがって**認可は `resolve_in_root` の 1 実装のまま**で、解決できる範囲は role で決まる（manage = `fs` ルートでどこでも / interact = tako のツリーに出ているフォルダ配下だけ）。**タスク専用の root は作らない**: 添付のパスは AI が書く欄なので、それを根拠に配ると AI が弱い端末の読める範囲を広げられる（#1451 の判断と食い違う）。解決できない添付・消えた添付は**理由を出し**、権限が足りないだけなら #1452 の権限リクエストへ繋ぐ | M | ✅ |
+| FR-2.40.19 | **ワンタップのコピーと共有**。`copy_texts` は 1 件ずつ「コピー」でき（`navigator.clipboard` → 使えなければ `textarea` + `execCommand` のフォールバック。**成否を画面に出す**）、`navigator.share` がある端末では投稿文・リンクを共有シートへ渡せる。添付の共有シート（`navigator.canShare({files})`）は **64 MB 以下に限る**（`remote_tasks::SHARE_MAX_BYTES` と PWA の定数が一致していることを番犬が見る）: Blob を丸ごとメモリへ載せるので、数百 MB の動画はタブごと落ちる。大きい添付は「端末に保存 → ファイル / 写真アプリ → 投稿アプリで選ぶ」に倒す | M | ✅ |
+| FR-2.40.20 | **ポーリングは画面を離れると止まる**。周期は 5 秒の 1 定数で、`useEffect` の cleanup で `clearInterval`・裏へ回っているあいだ（`visibilityState === 'hidden'`）は撃たない。**画面とナビのバッジが同じ 1 実装**（`usePolling`）を使う（止め方が 2 か所に割れない）。ポーリングには意味があり、B1 が `list` のたびに配送を畳み込むので**見ているあいだに `sent` が `delivered` へ確定する**。A/B は `TAKO_1450B3_LEGACY=1`（daemon は `/api/tasks…` が 404）と `?tako_1450b3_legacy=1`（PWA は画面もバッジも出ない） | M | ✅ |
+
+B3 の A/B は **`TAKO_1450B3_LEGACY=1`**（daemon が `/api/tasks…` を 404 にする）と
+**`?tako_1450b3_legacy=1`**（PWA が画面もバッジも出さない）。どちらも「スマホからは
+タスクが見えない・片付けられない」= B3 以前を同一バイナリで再現する。
+番犬は `issue1450b3_tasks_pwa_watchdog.rs`（PWA が表外の API を呼ばない / observe に操作を出さない /
+添付の配信が認可 1 実装を通る / ポーリングが止まる / 語彙が PC 版とずれない / 絵文字 0。
+**注入 6 通りで `file:line` 名指し**）。実測は `scripts/test-remote-tasks-1450b3.sh`
+（隔離した実 daemon + 実 tako-app で role ごとの 200 / 403・添付の解決範囲・
+**数百 MB の添付の実転送**・返答と配送・完了までを通す）と
+e2e `web/tako-remote/e2e/tasks-1450b3.spec.js`（iPhone viewport の実 DOM・偽の木だけを見る）。
 
 
 ## FR-3 コンセプト②: 軽量 IDE 的ワークスペース

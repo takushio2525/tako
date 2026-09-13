@@ -113,7 +113,8 @@ function ChoiceButtons({ choices, onSelect }) {
   );
 }
 
-function MarkdownContent({ text, className }) {
+// #1450 B3（`pages/tasks.jsx`）もこの 1 実装で markdown を描く（marked + DOMPurify の写しを作らない）
+export function MarkdownContent({ text, className }) {
   const html = useMemo(() => renderMarkdownHtml(text), [text]);
   return <div class={className} dangerouslySetInnerHTML={{ __html: html }} />;
 }

@@ -107,6 +107,27 @@ export function createClient() {
     sshOpen(host, opts = {}) {
       return request('POST', '/api/ssh', { host, ...opts });
     },
+    // --- ユーザー向けタスク（#1450 B3。経路は `remote_tasks::TASK_ROUTES` が正）---
+    // 一覧は詳細まで丸ごと返る（`show` を撃たない = 往復を増やさない）。
+    // 既定は未完了のみ・`open_count` がバッジの正本
+    tasks(opts = {}) {
+      const params = [];
+      if (opts.status) params.push(`status=${encodeURIComponent(opts.status)}`);
+      if (opts.kind) params.push(`kind=${encodeURIComponent(opts.kind)}`);
+      if (opts.all) params.push('all=1');
+      const qs = params.length ? `?${params.join('&')}` : '';
+      return request('GET', `/api/tasks${qs}`);
+    },
+    // 返答（decision + comment）。起票した master の入力欄へ daemon が配送する
+    respondTask(id, decision, comment = '') {
+      return request('POST', `/api/tasks/${encodeURIComponent(id)}/respond`, { decision, comment });
+    },
+    doneTask(id) {
+      return request('POST', `/api/tasks/${encodeURIComponent(id)}/done`);
+    },
+    dismissTask(id) {
+      return request('POST', `/api/tasks/${encodeURIComponent(id)}/dismiss`);
+    },
     // リサイズ要求は存在しない: リモート表示は PC 側のペインサイズに一切影響しない（#63）
     wsUrl(paneId) {
       const proto = base.startsWith('https') ? 'wss' : 'ws';

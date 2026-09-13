@@ -4789,6 +4789,12 @@ fn required_role(method: &tiny_http::Method, path: &str) -> DeviceRole {
     if let Some(role) = crate::remote_launch::role_for(method.as_str(), path) {
         return role;
     }
+    // #1450 B3: スマホからユーザー向けタスク（人がやること）を片付ける経路も宣言表が正
+    // （`remote_tasks::TASK_ROUTES`）。一覧は Observe・返答 / 完了 / 却下は Interact で、
+    // **表に無い `/api/tasks…` は表側が Manage へ落とす**（未知の受け口が弱い role へこぼれない）
+    if let Some(role) = crate::remote_tasks::role_for(method.as_str(), path) {
+        return role;
+    }
     // 表に無い形の SSH 系（#1080）も読み書きとも Manage。一覧が GET なのに
     // Observe でないのは、①`~/.ssh/config` の Host 名・user・port は画面に映らない
     // **別の在庫情報**で、画面を見るだけの端末へ配る理由が無い ②一覧の用途は
@@ -5569,6 +5575,25 @@ fn handle_api_v2_routes(
         // そのタブで master を起動（Manage）
         (tiny_http::Method::Post, p) if p.starts_with("/api/tabs/") && p.ends_with("/master") => {
             handle_tab_master(request, ctx, device, app_conn, p)
+        }
+        // #1450 B3: ユーザー向けタスクの一覧 / 返答 / 完了 / 却下。実装は `remote_tasks` に
+        // 閉じてあり、中身は B1 の `Request::UserTask` を素通しするだけ（操作を新設しない）
+        (_, p) if crate::remote_tasks::owns_path(p) => {
+            let deps = crate::remote_tasks::TasksDeps {
+                // **status つきで受ける**（`app_dispatch` が「app の拒否 = 400」と
+                // 「届かない = 503」を分ける 1 実装。タスク側で分類し直さない）
+                send: &|req| app_dispatch(app_conn, req, "タスクの操作"),
+                audit: &|event, extra| {
+                    ctx.registry
+                        .lock()
+                        .unwrap()
+                        .audit(event, &device.id, &device.name, extra)
+                },
+                cors: cors_headers(),
+                // 添付をどこまで解決できるかはこの値だけで決まる（再判定しない）
+                role: device.role,
+            };
+            crate::remote_tasks::handle_tasks_request(request, p, url_full, &deps)
         }
         // #1079: ファイル API（一覧 / プレビュー / ダウンロード）と
         // #1084 / #1085 の書き込み（保存 / 送り直し）。実装は `remote_files` に
