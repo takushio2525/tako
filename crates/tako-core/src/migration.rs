@@ -82,6 +82,8 @@ pub enum SchemaId {
     DiscoveryInstance,
     /// `<data_dir>/remote/devices.json`（リモートのペアリング。#283）
     RemoteDevices,
+    /// `<data_dir>/remote/shortcuts.json`（リモート閲覧のショートカット。#1451）
+    RemoteShortcuts,
 }
 
 impl SchemaId {
@@ -108,6 +110,7 @@ impl SchemaId {
             Self::Setup => "setup",
             Self::DiscoveryInstance => "discovery_instance",
             Self::RemoteDevices => "remote_devices",
+            Self::RemoteShortcuts => "remote_shortcuts",
         }
     }
 
@@ -138,6 +141,7 @@ impl SchemaId {
             Self::Setup,
             Self::DiscoveryInstance,
             Self::RemoteDevices,
+            Self::RemoteShortcuts,
         ]
     }
 }

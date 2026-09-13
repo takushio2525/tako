@@ -1,9 +1,9 @@
 ---
 title: MCP ツール一覧
-description: tako が AI エージェントに公開する 150 個の MCP ツールの全リスト
+description: tako が AI エージェントに公開する 151 個の MCP ツールの全リスト
 ---
 
-tako は **150 個の MCP ツール**を AI エージェント（Claude Code / Codex 等）に公開しています。ほぼすべてが `tako` CLI のコマンドと 1:1 で対応しているため、細かい引数や挙動は [CLI リファレンス](/guides/cli-reference/)の対応コマンドも合わせて参照してください。
+tako は **151 個の MCP ツール**を AI エージェント（Claude Code / Codex 等）に公開しています。ほぼすべてが `tako` CLI のコマンドと 1:1 で対応しているため、細かい引数や挙動は [CLI リファレンス](/guides/cli-reference/)の対応コマンドも合わせて参照してください。
 
 :::tip[登録は一度きり]
 MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度行えば、以降はどのプロジェクトでも自動的に使えます。codex を master にする場合は `tako master` の起動時にだけ設定が注入されるため、グローバル設定の変更すら不要です。
@@ -176,6 +176,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_remote_start` / `tako_remote_stop` | リモートアクセスサーバーの起動 / 停止 |
 | `tako_remote_status` | 状態確認（固定 URL・登録端末数。secret は含まない） |
 | `tako_remote_devices` | ペアリング済み端末の一覧 / 失効 |
+| `tako_remote_shortcuts` | スマホのファイル閲覧で使うショートカット（お気に入り）の一覧 / 追加 / 削除 |
 | `tako_remote_agents` | 動作中のエージェント一覧 |
 | `tako_remote_messages` | エージェントの会話ログ取得 |
 | `tako_remote_scrollback` | ペインのスクロールバック履歴取得 |

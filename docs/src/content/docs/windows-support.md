@@ -16,9 +16,9 @@ tako platform --status pending      # まだ使えないものだけ
 
 | 状態 | 件数 | 意味 |
 | --- | --- | --- |
-| 対応 | 117 / 150（78%） | macOS と同じように使えます |
+| 対応 | 117 / 151（77%） | macOS と同じように使えます |
 | 一部対応 | 15 | 使えますが機能が落ちます。落ち方は各表の「差分」列 |
-| 未実測 | 3 | 実装はあり macOS と同じ経路を通るが、Windows 実機でまだ動かしていないもの |
+| 未実測 | 4 | 実装はあり macOS と同じ経路を通るが、Windows 実機でまだ動かしていないもの |
 | 未対応 | 13 | Windows 側の実装が無い、または動かないことが分かっているもの |
 | 対象外 | 2 | Windows にその概念が無い、または OS が同等機能を標準で持つ |
 
@@ -229,7 +229,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 
 ## リモートアクセス
 
-対応 2・一部対応 2・未対応 / 未実測 7
+対応 2・一部対応 2・未対応 / 未実測 8
 
 | 機能 | 状態 | 差分 | 根拠 |
 | --- | --- | --- | --- |
@@ -244,6 +244,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 | `tako_open_remote` | 一部対応 | Windows の OpenSSH は接続多重化（ControlMaster）に対応しないため、操作ごとに独立した SSH 接続になる。鍵・ssh-agent で入れる相手は変わらないが、パスワード認証しか無い相手はツリーの展開やファイルの取得のたびに認証が要る。接続が生きているかもソケットで判定できないので、切断後の自動再接続（#1040）も armed にならない（#1090） | 実機実測: #1090 の Windows 11 実測（OpenSSH_for_Windows_10.0p2）: ControlMaster 系を渡すと接続の前に `getsockname failed: Not a socket` / exit -1 で死に、渡さないと同じ相手へ exit 255（`Could not resolve hostname` / `Host key verification failed`）まで進む。渡さない形にしたうえで到達不能ホストの 3 経路（split / tab / pane）が理由 + 次の一手を出してローカルのシェルへ戻ることを実測 |
 | `tako_remote_folder` | 一部対応 | 同梱の OpenSSH クライアントで開けるが、接続多重化（ControlMaster）が無いので操作ごとに認証が起きる（パスワード認証しか無い相手は展開のたびに聞かれる。接続が生きているかも判定できない。#1090）。ペインの ssh を検知した自動追加（#976）は、プロセスのコマンド行を採れないので働かない（明示的に開く経路だけが使える） | 実機実測: #1090 の Windows 11 実測: ControlMaster 系を渡した sftp は `getsockname failed: Not a socket` で握手にすら進まないが、渡さないと同じ相手へ SSH の握手が進む（`Host key verification failed` まで到達）。渡さない形で `tako remote-folder open` / `ls` が実 SSH 先の一覧を返すことを実測 |
 | `tako_ssh_hosts` | 対応 | — | 実機テスト: ~/.ssh/config の解析は純粋関数で、remote_fs / ssh_hosts の単体が実機で緑（ホーム解決は #870 で一本化） |
+| `tako_remote_shortcuts` | 未対応 / 未実測 | #1038 で serve の中継先をループバック TCP へ変えたので、`unix socket serve target is not supported on Windows` で止まる原因は無くなった。ただし Windows 実機での通し（setup の 4 段目 → デーモン起動 → スマホからの接続）は未実測（#971） | 未実測 |
 
 ## アップデート
 

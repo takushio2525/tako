@@ -1443,3 +1443,38 @@ body {
   border-top: 1px solid var(--line); background: var(--panel);
 }
 .file-edit-actions .btn { flex: 1; min-height: 46px; }
+
+/* --- Finder 風の全体閲覧とショートカット（#1451） --- */
+
+/* ルート一覧の節見出し（ショートカット / tako のツリー / このマシン）。
+   節が 1 つしか無いときは出ないので、#1079 の見え方のままの端末では増えない */
+.file-section {
+  margin: 14px 2px 7px; font-size: 11px; letter-spacing: .04em;
+  color: var(--fg3); text-transform: none;
+}
+.file-section:first-child { margin-top: 0; }
+
+/* ショートカット 1 件（行 + 削除 + その行に紐づく失敗メッセージ） */
+.file-row-wrap { display: contents; }
+
+/* 行と削除は**兄弟**（ボタンの入れ子にしない = タップが親に吸われない）。
+   行だけが伸び、削除は固定幅で右端に残る */
+.file-row-pair { display: flex; align-items: stretch; gap: 6px; }
+.file-row-pair > .file-row { flex: 1; min-width: 0; }
+
+/* 削除。**押せる大きさ（44px）を確保**する（指で押す前提） */
+.file-row-remove {
+  display: flex; align-items: center; justify-content: center;
+  width: 44px; flex-shrink: 0; margin-bottom: 6px;
+  background: var(--panel2); border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--fg3); cursor: pointer; transition: background .12s;
+}
+.file-row-remove:active { background: var(--panel3); color: var(--red); }
+.file-row-remove:disabled { opacity: .4; }
+
+/* 「このフォルダをショートカットに追加」 */
+.file-shortcut-add {
+  display: inline-flex; align-items: center; gap: 7px;
+  width: 100%; margin-bottom: 10px; min-height: 44px;
+}

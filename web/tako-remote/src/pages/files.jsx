@@ -1,11 +1,19 @@
 // ファイルビュー（#1079。リモート刷新 柱 3-E / 編集は #1084 = 柱 3-F /
-// SSH 先は #1085 = 柱 3-G）。
+// SSH 先は #1085 = 柱 3-G / Finder 風の全体閲覧とショートカットは #1451）。
 //
 // スマホから PC のファイルを「見る → 中身を確かめる → 直す → 保存する」までを 1 画面で。
-// 出せるのは **Mac のファイルツリーに現に出ているルートの配下だけ**で、
 // 認可は daemon 側の純粋関数（`remote_files::resolve_in_root`）が正。
 // ここは見せ方だけを持ち、パスの妥当性を画面側で判断しない
 // （画面で弾いたつもりの形が API では通る、という食い違いを作らないため）。
+//
+// #1451 で見えるものが 3 節になった:
+//   ① ショートカット（お気に入り。manage 以上）
+//   ② ツリーのルート（#1079 の見え方。**そのまま残す**）
+//   ③ このマシン（`/` から全部辿る。manage 以上）
+// ②と③の出し分けは **daemon が返す一覧が正**（`kind` が `tree` か `fs` か）。
+// 画面側で role を見て節を作らないのは、押せる範囲と見える範囲を
+// 2 か所で判断すると必ずズレるため。role を見るのは
+// 「ショートカット API を呼ぶか」（呼ぶと 403 になる端末で無駄な赤を出さない）だけ。
 //
 // API は自前 fetch で叩く: 並行して `api.js` を改修している作業（#1077 / #1078）と
 // 衝突させないため、このビューが使う分はこのファイルに閉じてある。
@@ -13,6 +21,22 @@ import { useState, useEffect, useCallback } from 'preact/hooks';
 import { createClient } from '../api';
 
 const TIMEOUT_MS = 15000;
+
+// #1451 の A/B。PWA はブラウザで動くので env が届かない（逃げ道はこの 1 つだけ）。
+// legacy 腕では全体閲覧の節もショートカットも出さず、#1079 の見え方に戻る
+function legacy1451() {
+  try {
+    return new URLSearchParams(window.location.search).get('tako_1451_legacy') === '1';
+  } catch {
+    return false;
+  }
+}
+
+// ショートカットを編集できる role（daemon の `FILE_ROUTES` と揃える。
+// **認可の正はサーバー側**で、ここは「呼んでも 403 になる端末に赤を出さない」ためだけ）
+function canManage(me) {
+  return me && (me.role === 'manage' || me.role === 'admin');
+}
 
 // 本文プレビューを出す上限（daemon 側 MAX_TEXT_BYTES と揃える）
 const PREVIEW_MAX_BYTES = 512 * 1024;
@@ -50,6 +74,22 @@ async function sendJson(method, path, body) {
     e.status = resp.status;
     e.kind = out.kind;
     e.pending = out.pending === true;
+    throw e;
+  }
+  return out;
+}
+
+// ショートカットの削除（宛先は query。DELETE のボディは中継で落ちうる）
+async function deleteJson(path) {
+  const resp = await fetch(`${base()}${path}`, {
+    method: 'DELETE',
+    signal: AbortSignal.timeout(TIMEOUT_MS),
+  });
+  const out = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    const e = new Error(out.error || `HTTP ${resp.status}`);
+    e.status = resp.status;
+    e.kind = out.kind;
     throw e;
   }
   return out;
@@ -125,17 +165,61 @@ const DownloadIcon = () => (
   </svg>
 );
 
+const StarIcon = ({ filled }) => (
+  <svg width="16" height="16" viewBox="0 0 24 24"
+    fill={filled ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="1.8">
+    <path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8-4.2-4.1 5.8-.8z" />
+  </svg>
+);
+
+const MachineIcon = () => (
+  <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+    <rect x="3" y="4" width="18" height="12" rx="2" /><path d="M8 20h8" /><path d="M12 16v4" />
+  </svg>
+);
+
+const TrashIcon = () => (
+  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+    <path d="M4 7h16" /><path d="M9 7V5h6v2" /><path d="M6 7l1 13h10l1-13" />
+  </svg>
+);
+
 // --- 画面 ---
 
 export function FilesPage({ me, root, path, hint }) {
   const [state, setState] = useState({ loading: true });
+  // ショートカットを扱えるか。**派生した真偽値**を依存に使う:
+  // `me` そのものを依存にすると、role が同じでも `refreshMe` のたびに
+  // オブジェクトの同一性が変わって開いているフォルダを読み直してしまう。
+  // 逆に依存から外すと、role が上がっても `load` が作り直されず
+  // ショートカットが出ないままになる（どちらの取りこぼしも避ける）
+  const canShortcuts = canManage(me) && !legacy1451();
 
   const load = useCallback(async () => {
     setState({ loading: true });
     try {
       if (!root) {
         const body = await getJson('/api/files');
-        setState({ loading: false, kind: 'roots', roots: body.roots || [] });
+        // ショートカットは **manage 以上**（daemon の `FILE_ROUTES`）。
+        // 権限が無い端末では**呼ばない**（押してもいない操作で赤を出さない）。
+        // 呼んで失敗したときも一覧そのものは出す = ショートカットの不調で
+        // ファイルビューごと開けなくならない
+        let shortcuts = [];
+        let shortcutsError = null;
+        if (canShortcuts) {
+          try {
+            shortcuts = (await getJson('/api/files/shortcuts')).shortcuts || [];
+          } catch (e) {
+            shortcutsError = e;
+          }
+        }
+        setState({
+          loading: false,
+          kind: 'roots',
+          roots: body.roots || [],
+          shortcuts,
+          shortcutsError,
+        });
         return;
       }
       const asDir = async () => ({
@@ -159,9 +243,19 @@ export function FilesPage({ me, root, path, hint }) {
     } catch (e) {
       setState({ loading: false, error: e });
     }
-  }, [root, path, hint]);
+  }, [root, path, hint, canShortcuts]);
 
   useEffect(() => { load(); }, [load]);
+
+  // ショートカットの追加 / 削除。**結果は必ず読み直す**（画面側で一覧を
+  // 組み直すと、daemon が冪等に畳んだ結果とズレる）
+  const addShortcut = useCallback(async (abs, name) => {
+    await sendJson('POST', '/api/files/shortcuts', { path: abs, name });
+  }, []);
+  const removeShortcut = useCallback(async (id) => {
+    await deleteJson(`/api/files/shortcuts?id=${encodeURIComponent(id)}`);
+    load();
+  }, [load]);
 
   const roleTooLow = state.error && state.error.status === 403 && !state.error.kind;
 
@@ -188,15 +282,40 @@ export function FilesPage({ me, root, path, hint }) {
             Mac の tako で、この端末の権限を上げてください。
           </p>
         </div>
+      ) : state.error && state.error.kind === 'unreadable' ? (
+        /* #1451: 全体閲覧では `/private/var/db` のような読めないフォルダへ
+           普通に入れてしまう。「エラー」の 1 行で終わらせず、**理由と戻り道**を出す */
+        <div class="empty-state" data-testid="dir-unreadable">
+          <h2>このフォルダは開けません</h2>
+          <p>{state.error.message}</p>
+          <p>
+            macOS が守っているフォルダ（システム領域・他のユーザーの領域）は、
+            tako からも読めません。
+          </p>
+          <button class="btn" onClick={() => navigate(root, parentOf(path || '') ?? '')}>
+            上のフォルダへ戻る
+          </button>
+        </div>
       ) : state.error ? (
         <div class="center-fill">
           <p class="error-text">{state.error.message}</p>
           <button class="btn btn-primary" onClick={load}>再試行</button>
         </div>
       ) : state.kind === 'roots' ? (
-        <RootList roots={state.roots} />
+        <RootList
+          roots={state.roots}
+          shortcuts={state.shortcuts || []}
+          shortcutsError={state.shortcutsError}
+          onRemoveShortcut={removeShortcut}
+        />
       ) : state.kind === 'dir' ? (
-        <DirList dir={state.dir} root={root} path={path} />
+        <DirList
+          dir={state.dir}
+          root={root}
+          path={path}
+          canShortcut={canShortcuts}
+          onAddShortcut={addShortcut}
+        />
       ) : (
         <FileView file={state.file} root={root} path={path} onReload={load} />
       )}
@@ -234,7 +353,12 @@ function FilesHeader({ me, root, path, rootName, sshHost, onRefresh }) {
       {root ? (
         <div class="file-crumb">
           {sshHost && <span class="file-badge">SSH {sshHost}</span>}
-          {[rootName, path].filter(Boolean).join('/')}
+          {/* #1451: 全体閲覧のルートは名前が区切り（`/` や `C:\`）そのものなので、
+              ツリー由来と同じ規則で継ぐと `//Users/...` になる。
+              **区切りで終わるルート名は継ぎ足さない** */}
+          {rootName.endsWith('/') || rootName.endsWith('\\')
+            ? `${rootName}${path}`
+            : [rootName, path].filter(Boolean).join('/')}
         </div>
       ) : (
         <div class="file-crumb">{(me && me.host) || 'tako'} のファイルツリー</div>
@@ -243,8 +367,14 @@ function FilesHeader({ me, root, path, rootName, sshHost, onRefresh }) {
   );
 }
 
-function RootList({ roots }) {
-  if (!roots.length) {
+// ルート一覧は 3 節（#1451）。**節の作り方は daemon の答えが正**:
+// `kind === 'fs'` なら「このマシン」、それ以外は従来どおり「ツリーのルート」。
+// ショートカットだけは別 API（manage 以上）なので、取れたときだけ先頭へ出る
+function RootList({ roots, shortcuts, shortcutsError, onRemoveShortcut }) {
+  const treeRoots = roots.filter(r => r.kind !== 'fs');
+  const fsRoots = roots.filter(r => r.kind === 'fs');
+
+  if (!roots.length && !shortcuts.length) {
     return (
       <div class="empty-state">
         <h2>フォルダがありません</h2>
@@ -258,25 +388,162 @@ function RootList({ roots }) {
   }
   return (
     <div class="card-list" style="padding-top: 12px;">
-      {roots.map(r => (
-        <button key={r.id} class="file-row" onClick={() => navigate(r.id, '', 'dir')}>
-          <span class="file-row-icon dir"><FolderIcon /></span>
-          <span class="file-row-main">
-            <span class="file-row-name">{r.name}</span>
-            <span class="file-row-meta">
-              {r.tab_title || `タブ ${r.tab}`}
-              {/* SSH 先は行末バッジで示す（Mac のツリーと同じ言い方。#976） */}
-              {r.ssh && <SshBadge host={r.host} connected={r.connected} />}
-            </span>
-          </span>
-          <span class="file-row-chevron">{'›'}</span>
-        </button>
-      ))}
+      {shortcutsError && (
+        <div class="file-notice warn">
+          ショートカットを読めませんでした（{shortcutsError.message}）
+        </div>
+      )}
+
+      {shortcuts.length > 0 && (
+        <>
+          <div class="file-section" data-testid="files-section-shortcuts">ショートカット</div>
+          {shortcuts.map(s => (
+            <ShortcutRow key={s.id} shortcut={s} onRemove={onRemoveShortcut} />
+          ))}
+        </>
+      )}
+
+      {treeRoots.length > 0 && (
+        <>
+          <div class="file-section" data-testid="files-section-tree">tako のツリー</div>
+          {treeRoots.map(r => (
+            <button
+              key={r.id}
+              class="file-row"
+              data-testid={`tree-root-${r.id}`}
+              onClick={() => navigate(r.id, '', 'dir')}
+            >
+              <span class="file-row-icon dir"><FolderIcon /></span>
+              <span class="file-row-main">
+                <span class="file-row-name">{r.name}</span>
+                <span class="file-row-meta">
+                  {r.tab_title || `タブ ${r.tab}`}
+                  {/* SSH 先は行末バッジで示す（Mac のツリーと同じ言い方。#976） */}
+                  {r.ssh && <SshBadge host={r.host} connected={r.connected} />}
+                </span>
+              </span>
+              <span class="file-row-chevron">{'›'}</span>
+            </button>
+          ))}
+        </>
+      )}
+
+      {fsRoots.length > 0 && (
+        <>
+          <div class="file-section" data-testid="files-section-fs">このマシン</div>
+          {fsRoots.map(r => (
+            <button
+              key={r.id}
+              class="file-row"
+              data-testid={`fs-root-${r.id}`}
+              onClick={() => navigate(r.id, '', 'dir')}
+            >
+              <span class="file-row-icon dir"><MachineIcon /></span>
+              <span class="file-row-main">
+                <span class="file-row-name">{r.name}</span>
+                <span class="file-row-meta">ルートから全部たどる</span>
+              </span>
+              <span class="file-row-chevron">{'›'}</span>
+            </button>
+          ))}
+        </>
+      )}
     </div>
   );
 }
 
-function DirList({ dir, root, path }) {
+// ショートカット 1 行。既定（`builtin`）は削除できない = ボタンを出さない。
+// `available: false` は「今このマシンでは開けない」（daemon が飛び先を解決できなかった）
+function ShortcutRow({ shortcut, onRemove }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+
+  async function remove() {
+    setBusy(true);
+    setError(null);
+    try {
+      await onRemove(shortcut.id);
+    } catch (err) {
+      setError(err.message);
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div class="file-row-wrap">
+      {/* 削除は**行の中に入れない**（`<button>` の入れ子はタップが親に吸われて
+          「削除のつもりが遷移」になる端末がある）。兄弟として並べ、
+          行と削除で押した先が別物であることを DOM の構造で保証する */}
+      <div class="file-row-pair">
+        <button
+          data-testid={`shortcut-${shortcut.id}`}
+          class={`file-row${shortcut.available === false ? ' disabled' : ''}`}
+          disabled={shortcut.available === false}
+          onClick={() => navigate(shortcut.root, shortcut.path || '', 'dir')}
+        >
+          <span class="file-row-icon dir"><StarIcon filled /></span>
+          <span class="file-row-main">
+            <span class="file-row-name">{shortcut.name}</span>
+            <span class="file-row-meta">
+              {shortcut.available === false
+                ? 'このマシンでは開けません'
+                : shortcut.display_path}
+            </span>
+          </span>
+          {shortcut.available !== false && <span class="file-row-chevron">{'›'}</span>}
+        </button>
+        {!shortcut.builtin && (
+          <button
+            class="file-row-remove"
+            data-testid={`shortcut-remove-${shortcut.id}`}
+            aria-label={`${shortcut.name} をショートカットから外す`}
+            disabled={busy}
+            onClick={remove}
+          >
+            <TrashIcon />
+          </button>
+        )}
+      </div>
+      {error && <div class="file-notice error">{error}</div>}
+    </div>
+  );
+}
+
+// 「このフォルダをショートカットに追加」。**冪等**（daemon が同じパスを畳む）なので
+// 二重に押しても増えない。押した結果は言葉で返す（無言で終わらせない）
+function AddShortcutRow({ abs, name, onAdd }) {
+  const [state, setState] = useState(null); // null | 'busy' | 'done' | { error }
+
+  async function add() {
+    setState('busy');
+    try {
+      await onAdd(abs, name);
+      setState('done');
+    } catch (e) {
+      setState({ error: e.message });
+    }
+  }
+
+  if (state === 'done') {
+    return <div class="file-notice ok">ショートカットに追加しました</div>;
+  }
+  return (
+    <>
+      <button
+        class="btn file-shortcut-add"
+        data-testid="shortcut-add"
+        disabled={state === 'busy'}
+        onClick={add}
+      >
+        <StarIcon />
+        {state === 'busy' ? '追加中...' : 'ショートカットに追加'}
+      </button>
+      {state && state.error && <div class="file-notice error">{state.error}</div>}
+    </>
+  );
+}
+
+function DirList({ dir, root, path, canShortcut, onAddShortcut }) {
   const [showHidden, setShowHidden] = useState(false);
   const all = dir.entries || [];
   const entries = showHidden ? all : all.filter(e => !e.hidden);
@@ -286,6 +553,12 @@ function DirList({ dir, root, path }) {
 
   return (
     <div class="card-list" style="padding-top: 12px;">
+      {/* #1451: ショートカットに足せるのは**絶対パスが分かるとき**だけ。
+          daemon は全体閲覧（`kind: fs`）のときにしか `abs` を返さないので、
+          ツリー由来のルートでは出ない（#1079 の「絶対パスを配らない」を保つ） */}
+      {canShortcut && dir.abs && (
+        <AddShortcutRow abs={dir.abs} name={path ? path.split('/').pop() : dir.root_name} onAdd={onAddShortcut} />
+      )}
       {dir.ssh && dir.connected === false && (
         <div class="file-notice warn">
           このホストとの接続が切れています。Mac 側でつながると読み直せます。
@@ -304,6 +577,7 @@ function DirList({ dir, root, path }) {
       ) : entries.map(e => (
         <button
           key={e.name}
+          data-testid={`entry-${e.name}`}
           class={`file-row${e.escapes_root ? ' disabled' : ''}`}
           disabled={e.escapes_root}
           onClick={() =>
@@ -318,11 +592,15 @@ function DirList({ dir, root, path }) {
             <span class="file-row-meta">
               {e.escapes_root
                 ? 'ツリーの外を指すリンク'
-                : [
-                    e.dir ? '' : formatSize(e.size),
-                    formatTime(e.modified),
-                    e.symlink ? 'リンク' : '',
-                  ].filter(Boolean).join(' · ')}
+                : e.unreadable
+                  /* #1451: metadata が引けない = 権限が無い / リンクが切れている。
+                     0 バイトの行として黙って混ぜない（無言禁止。#1399 系） */
+                  ? (e.symlink ? 'リンク先を読めません' : '読み取り権限がありません')
+                  : [
+                      e.dir ? '' : formatSize(e.size),
+                      formatTime(e.modified),
+                      e.symlink ? 'リンク' : '',
+                    ].filter(Boolean).join(' · ')}
             </span>
           </span>
           {!e.escapes_root && <span class="file-row-chevron">{'›'}</span>}

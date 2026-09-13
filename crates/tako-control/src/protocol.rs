@@ -1210,6 +1210,20 @@ pub enum Request {
         action: String,
         device_id: Option<String>,
     },
+    /// リモート閲覧のショートカット（お気に入り）の管理（#1451）。`action`:
+    /// - "list": 既定（`~` / Desktop / Downloads）+ 登録分を一覧
+    /// - "add": `path`（絶対パス）を足す。`name` で表示名を明示できる（**冪等**）
+    /// - "remove": `path`（id でもパスでもよい）を消す
+    ///
+    /// 正本は `tako_core::remote_shortcuts`。PWA（`/api/files/shortcuts`）・CLI
+    /// （`tako remote shortcuts`）・MCP がこの 1 実装を通る
+    RemoteShortcuts {
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
     /// リモートアクセスの対話セットアップ（Issue #286 弾6）。
     /// Tailscale の導入状態を検証し、serve 設定と QR PNG 生成まで行う。
     /// `action`:
@@ -2093,6 +2107,7 @@ pub fn changes_layout(request: &Request) -> bool {
         | Request::RemoteMessages { .. }
         | Request::RemoteScrollback { .. }
         | Request::RemoteDevices { .. }
+        | Request::RemoteShortcuts { .. }
         // --- ペインの中身だけを触る（再描画は端末・プレビュー自身の経路が行う） ---
         | Request::Send { .. }
         | Request::Scroll { .. }

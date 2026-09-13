@@ -1260,6 +1260,20 @@ pub const MATRIX: &[Feature] = &[
         ),
     },
     Feature {
+        key: "tako_remote_shortcuts",
+        // #1451: 読み書きは `<data_dir>/remote/shortcuts.json` の 1 ファイルだけで、
+        // ホーム解決も `paths::home_dir`（`%USERPROFILE%` を含む 1 実装）を通る。
+        // それでも Windows を `Supported` と名乗らないのは、**ショートカットの用途が
+        // スマホからの閲覧**で、そこへ届くには daemon が要る（#971 で立たない）ため。
+        // ドライブごとの全体閲覧ルート（`fs_roots`）も Windows 実機で未実測
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_REMOTE_SERVE_UNIX,
+            issue: 971,
+        },
+        windows_evidence: Evidence::Unverified,
+    },
+    Feature {
         key: "tako_remote_start",
         macos: Support::Supported,
         windows: Support::Pending {

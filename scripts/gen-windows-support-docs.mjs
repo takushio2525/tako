@@ -87,7 +87,7 @@ const CATEGORIES = [
     'tako_remote_start', 'tako_remote_stop', 'tako_remote_status',
     'tako_remote_setup', 'tako_remote_devices', 'tako_remote_agents',
     'tako_remote_messages', 'tako_remote_scrollback', 'tako_open_remote',
-    'tako_remote_folder', 'tako_ssh_hosts',
+    'tako_remote_folder', 'tako_ssh_hosts', 'tako_remote_shortcuts',
   ]],
   ['アップデート', ['tako_update']],
 ];

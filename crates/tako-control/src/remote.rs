@@ -3623,9 +3623,12 @@ fn cors_headers() -> Vec<tiny_http::Header> {
     vec![
         tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], origin.as_bytes())
             .expect("固定ヘッダ"),
+        // #1084 の `PUT`（保存）と #1451 の `DELETE`（ショートカットの削除）を含める。
+        // PWA は daemon 自身から配信される = 同一オリジンなので実際には効かないが、
+        // **実装しているメソッドと名乗るメソッドを食い違わせない**
         tiny_http::Header::from_bytes(
             &b"Access-Control-Allow-Methods"[..],
-            &b"GET, POST, OPTIONS"[..],
+            &b"GET, POST, PUT, DELETE, OPTIONS"[..],
         )
         .expect("固定ヘッダ"),
         tiny_http::Header::from_bytes(
@@ -4677,18 +4680,20 @@ fn required_role(method: &tiny_http::Method, path: &str) -> DeviceRole {
         if path.ends_with("/close") || path.ends_with("/resize") {
             return DeviceRole::Manage;
         }
-        // #1084 / #1085: ファイル API の書き込み（保存 / 送り直し）は `/api/upload` と
-        // 同じ Interact。**パスを明示列挙**しているので、未知の `/api/files/*` の
-        // POST は下の Manage のまま安全側に残る（判定の正は remote_files 側）
-        if crate::remote_files::is_write_path(path) {
-            return DeviceRole::Interact;
+        // #1084 / #1085 / #1451: ファイル API の書き込みは**経路表が正**
+        // （`remote_files::FILE_ROUTES`）。メソッドごとに宣言してあるので、
+        // 保存 / 送り直しは Interact・ショートカットの編集は Manage と撃ち分く。
+        // **表に無い `/api/files/*` の POST は下の Manage のまま安全側に残る**
+        if let Some(role) = crate::remote_files::required_role_for_method("POST", path) {
+            return role;
         }
         // 未知の POST は安全側（Manage）
         return DeviceRole::Manage;
     }
-    // #1079: ファイル API は**読み出しでも** Interact 以上（判定の正は remote_files 側）。
-    // POST の分岐より後に置くのは意図的: 未知の POST は Manage のまま安全側に倒す
-    if let Some(role) = crate::remote_files::required_role_for(path) {
+    // #1079 / #1451: ファイル API は**読み出しでも** Interact 以上（判定の正は
+    // remote_files の経路表）。POST の分岐より後に置くのは意図的:
+    // 未知の POST は Manage のまま安全側に倒す
+    if let Some(role) = crate::remote_files::required_role_for_method(method.as_str(), path) {
         return role;
     }
     DeviceRole::Observe
@@ -5261,9 +5266,9 @@ fn handle_api_v2_routes(
         // #1079: ファイル API（一覧 / プレビュー / ダウンロード）と
         // #1084 / #1085 の書き込み（保存 / 送り直し）。実装は `remote_files` に
         // 閉じてあり、ここは受け渡しだけ（メソッドの振り分けも向こう側）
-        (tiny_http::Method::Get | tiny_http::Method::Put | tiny_http::Method::Post, p)
-            if crate::remote_files::required_role_for(p).is_some() =>
-        {
+        // #1451: `DELETE`（ショートカットの削除）が加わったので、メソッドの列挙ではなく
+        // **経路表が受け持つパスか**で渡す（表に載せた瞬間に配線される = 表が飾りにならない）
+        (_, p) if crate::remote_files::owns_path(p) => {
             let deps = crate::remote_files::FilesDeps {
                 send: &|req| app_request(app_conn, req),
                 audit: &|event, extra| {
@@ -5273,6 +5278,10 @@ fn handle_api_v2_routes(
                         .audit(event, &device.id, &device.name, extra)
                 },
                 cors: cors_headers(),
+                // 全体閲覧の門（#1451）はこの値だけで決まる。
+                // 認可はこの行より前の `required_role` + `authorize_device` が済ませており、
+                // ここでは**確定した role をそのまま渡す**（再判定して食い違わせない）
+                role: device.role,
             };
             crate::remote_files::handle_files_request(request, p, url_full, &deps)
         }

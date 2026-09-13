@@ -581,6 +581,9 @@ impl Harness {
                         audit_ref.lock().unwrap().push((event.to_string(), extra));
                     },
                     cors: Vec::new(),
+                    // #1451: この器は #1079 の見え方（ツリー配下だけ）を固定するので
+                    // **Interact** で回す。全体閲覧は Manage 以上でしか出ない
+                    role: tako_control::remote_auth::DeviceRole::Interact,
                 };
                 remote_files::handle_files_request(request, &path, &url, &deps);
             }

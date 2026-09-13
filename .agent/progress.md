@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-12（#841: 偽 XFF でローカルから serve を名乗れるのを接続元プロセスの検証で塞いだ）
-- XFF を読む口を `remote::forwarded_identity` の 1 実装へ寄せ、読む前に `local_endpoint::verify_peer` を通す。所有者ゲート（ソケットの uid が自分か root）+ 実行ファイル名ゲート（設置場所では判定しない）を両方通ったときだけ信じ、材料が欠けたら 403。分岐はエンドポイントの形（UDS は検証しない）
-- 接続元 pid の解決は `procinfo::loopback_tcp_peer`（macOS = `net.inet.tcp.pcblist_n` の sysctl。**libproc の fd 走査では非 root から root の tailscaled が見えない**ことを実測して方式を変えた / Windows = `GetExtendedTcpTable`）。Windows は所有者を引けないので `owner_check=unavailable` と名乗る（残存リスクは脅威モデルへ）
-- 実測 A/B（隔離 daemon + 別プロセス curl）: 新 = 403 `not_tailscale_daemon` + persist.log + `remote status` の `peer_verification` / `TAKO_841_LEGACY=1` = 検証を通らず whois 層まで到達。番犬 9 本・実ソース注入 5 通りで file:line 名指し FAILED。**install 要 / 本番 daemon 再起動要**
-
 ## 2026-09-13（#812: ペイン枠線をルート側オーバーレイ 1 枚へ集約した）
 - 枠線のインクを `render` の `pane_borders`（`pane_headers` の直後に出すルート側 1 枚）へ集約。本体とヘッダ外枠は枠**幅**と角丸のクリップだけ持ち色を持たない（`Style::is_border_visible()` が false = quad が出ない / 会計は不変）。副作用でヘッダより低いペインの下端枠線が旧は 0 / 576 画素だったのが全部出るようになった（#803 の症状の残り）
 - 実測 A/B（`pane-border` 節・同じ場面のまま腕を倒す）: 1 ペインで丸め角の差 **32 画素**（#803 の報告値と一致）・角の外 0 / 2 分割・ズーム・light は 60 画素・外 0。注入 4 通り（描かない / 丸めを落とす / 色規則を外す / 二重塗りへ戻す）で症状を名指し FAILED
@@ -59,3 +54,8 @@
 - 真因は判断ではなく**記憶**: `ssh_connect` はメモリだけで作る口も dispatch の 1 つだけ → GUI 再起動をまたいだペイン（32 秒無反応・診断 0 行・報告と同一画面）と手打ち `ssh` のペイン（24 秒無反応）が実測で再現。slave 説と版が古い説は否定（8 桁幅での誤測は 88 桁で取り直し）
 - 追跡を `track_ssh_connect` の 1 実装へ寄せ、入口を 3 つに（dispatch / `layout.json` からの復元 = `PaneLayout.ssh`・器が生きたときだけ / #976 の検知からの引き取り）。復元・引き取りは見張りから始めて起点を取り直す。`gave_up` を手で繋ぎ直したら見張りを再開（エッジで見つけた穴）。撃たないときは通知欄 + persist.log、`ssh_connect.reconnect` を `list` / `read` へ
 - 実測: 再起動後の切断 **1 秒**検知 → 復帰 **2 秒**（ゼロタッチ）/ 手打ちも `source=detected` で復帰 / slave 落ち 0 秒検知 4 秒復帰 / 上限後は撃たずペインも残る。A/B `TAKO_1446_LEGACY=1` は追跡ゼロ・診断も無言（報告の再現）。番犬 4 本・注入 8 通り。workspace 4730 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。**install 要**
+
+## 2026-09-14（#1451: スマホのファイル閲覧を Finder 風の全体閲覧へ広げ、ショートカットを足せるようにした）
+- 認可は**案 (a)**（全体閲覧とショートカットは manage 以上・interact 以下は #1079 のまま）。**経路は 1 本も新設せず**、疑似ルート `fs` を一覧へ 1 件足すだけにしたので、プレビュー / 編集 / DL は `resolve_in_root` の 1 実装をそのまま通る。門は `local_roots_for` の 1 か所で、載らなければ `unknown_root` の 403。role は `FILE_ROUTES`（#1449 の作法）が正で、**表に無い `/api/files…` は安全側の Manage** へ落ちる
+- ショートカットの正本は `tako_core::remote_shortcuts`（PWA / `tako remote shortcuts` / MCP の 3 口が同じ実装）。永続は `<data_dir>/remote/shortcuts.json`（番地 `SchemaId::RemoteShortcuts`・**新規なので移行 Step 無し = 指紋の追加のみ**）。既定はファイルに書かず毎回計算する
+- 実測: 実経路 `scripts/test-remote-fs-1451.sh` **73 PASS 0 FAIL**（HOME ごと隔離した偽の木・実 `/` を一覧しない = #927）/ e2e 11 本（全 72 passed）/ 番犬 10 本・**注入 12 通りすべて file:line 名指しで FAILED**。**実バグ 2 件を実測で発見して直した**: ①既定と登録分で正規化基準が違い同じフォルダが 2 行に出る ②飛び先にツリーのルートを選ぶとフォルダを閉じた瞬間 403。一覧は「切ってから metadata」へ（旧は全件 x3 syscall）。**install 要 / 本番 daemon 再起動要**

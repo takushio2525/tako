@@ -59,6 +59,29 @@ pub struct TreeRoot {
     pub name: String,
     pub tab: u64,
     pub tab_title: String,
+    /// ツリー由来か、全体閲覧の入口か（#1451）
+    pub kind: RootKind,
+}
+
+/// ローカルのルートの出どころ（#1451）。
+///
+/// **配下判定の実装は同じ**（`resolve_in_root`）で、違うのは「一覧に載るか」の条件だけ。
+/// ここを型で分けておくと、認可の門（`fs` を載せてよい role か）を 1 か所に名指しできる
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootKind {
+    /// tako のファイルツリーに現に出ているフォルダ（#1079。全 role 共通）
+    Tree,
+    /// ファイルシステム全体の入口（`/`。Windows はドライブごと）。**Manage 以上だけ**
+    Fs,
+}
+
+impl RootKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tree => "tree",
+            Self::Fs => "fs",
+        }
+    }
 }
 
 impl TreeRoot {
@@ -70,6 +93,8 @@ impl TreeRoot {
             "tab_title": self.tab_title,
             // SSH 先ルート（#1085）と 1 本の一覧に並ぶので、どちら側かを明示する
             "ssh": false,
+            // #1451: ツリー由来か全体閲覧の入口か（PWA が節を分けて出す）
+            "kind": self.kind.as_str(),
         })
     }
 }
@@ -130,6 +155,7 @@ pub fn roots_from_payload(payload: &Value) -> Vec<TreeRoot> {
                 name,
                 tab: tab_id,
                 tab_title: tab_title.clone(),
+                kind: RootKind::Tree,
             });
         }
     }
@@ -295,6 +321,8 @@ pub struct Resolved {
     /// （相対パスの深さから逆算すると、深さの数え方を間違えた瞬間に
     /// 「ルートの外を配下と見なす」壊れ方をする）
     pub root_canon: PathBuf,
+    /// ツリー由来か全体閲覧か（#1451。応答と一覧の見せ方が変わる）
+    pub root_kind: RootKind,
 }
 
 /// ルート一覧から `root_id` を引き、`rel` を配下のパスとして解決する。
@@ -348,14 +376,19 @@ pub fn resolve_in_root(roots: &[TreeRoot], root_id: &str, rel: &str) -> Result<R
         root_id: root.id.clone(),
         root_name: root.name.clone(),
         root_canon,
+        root_kind: root.kind,
     })
 }
 
 // --- ディレクトリ一覧 ---
 
 /// 1 エントリの JSON を組む。`symlink` は symlink_metadata で判定する
-/// （リンク自身の種別を出す。開いたときの認可は `resolve_in_root` が別途行う）
-fn entry_json(name: &str, dir_path: &Path, root_canon: &Path) -> Value {
+/// （リンク自身の種別を出す。開いたときの認可は `resolve_in_root` が別途行う）。
+///
+/// `check_escape` が false のときは「ルートの外を指す symlink」の判定を**省く**。
+/// 全体閲覧（`fs` ルート = `/`）では配下判定が常に真なので、省いても答えは変わらず、
+/// エントリ 1 件あたりの `canonicalize`（1 回）が丸ごと消える（#1451）
+fn entry_json(name: &str, dir_path: &Path, root_canon: &Path, check_escape: bool) -> Value {
     let full = dir_path.join(name);
     let link_meta = full.symlink_metadata().ok();
     let is_symlink = link_meta
@@ -363,13 +396,23 @@ fn entry_json(name: &str, dir_path: &Path, root_canon: &Path) -> Value {
         .is_some_and(|m| m.file_type().is_symlink());
     // ルートの外を指す symlink は開けない（`resolve_in_root` が 403 にする）。
     // 一覧の時点で印を付けておくと、PWA が「押しても 403」の行を避けられる
-    let escapes = is_symlink
+    let escapes = check_escape
+        && is_symlink
         && !full
             .canonicalize()
             .is_ok_and(|target| is_within(root_canon, &target));
     // symlink はリンク先の種別で「開けるか」が決まるので metadata（follow）で見る
     let meta = full.metadata().ok();
-    let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
+    // #1451: metadata が引けないのは「権限が無い / リンクが切れている」で、
+    // **全体閲覧では普通に起きる**（`/private/var/db` 配下など）。
+    // 黙って 0 バイト・更新日時なしの行として混ぜず、読めなかったことを印にする。
+    // リンク自身の情報（symlink_metadata）は取れているなら「壊れたリンク」と分かる
+    let unreadable = meta.is_none();
+    let is_dir = meta
+        .as_ref()
+        .map(|m| m.is_dir())
+        // リンク先を辿れないときはリンク自身の種別へ落とす（辿れる形で出さない）
+        .unwrap_or_else(|| link_meta.as_ref().is_some_and(|m| m.is_dir()));
     let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
     let modified = meta
         .as_ref()
@@ -379,20 +422,37 @@ fn entry_json(name: &str, dir_path: &Path, root_canon: &Path) -> Value {
     json!({
         "name": name,
         "dir": is_dir,
-        "size": if is_dir { Value::Null } else { json!(size) },
+        "size": if is_dir || unreadable { Value::Null } else { json!(size) },
         "modified": modified,
         "symlink": is_symlink,
         "escapes_root": escapes,
         "hidden": name.starts_with('.'),
+        "unreadable": unreadable,
     })
 }
 
-/// ディレクトリの中身を返す。並びは**フォルダ先 → 名前順**（サイドバーと同じ感覚）
+/// ディレクトリの中身を返す。並びは**フォルダ先 → 名前順**（サイドバーと同じ感覚）。
+///
+/// # 実体を問う回数を件数で抑える（#1451）
+///
+/// 旧実装は**全件**に `symlink_metadata` + `canonicalize` + `metadata`（1 件 3 回）を
+/// 掛けてから [`MAX_ENTRIES`] 件へ切っていた。ツリー配下では滅多に当たらなかったが、
+/// 全体閲覧では `/usr/share/man/man3` のような**万単位のディレクトリ**を普通に開く。
+/// **切ってから実体を問う**ので、問い合わせ回数は件数に関わらず上限で頭打ちになる。
+///
+/// 並べ替えの順序は変わらない: 名前順は名前だけで決まり、フォルダ先送りは
+/// 「切ったあとの 1000 件」の中での並べ替えなので、旧実装の「全件をフォルダ先送りしてから
+/// 1000 件」とは**切り取られる集合が変わる**。名前順で先頭 1000 件を見せる方が
+/// 「どこまで見えているか」が利用者に分かる（フォルダだけが先に全部来ると、
+/// 名前で探している人には途中が消えたように見える）
 pub fn list_directory(resolved: &Resolved) -> Result<Value, Denial> {
     let meta = resolved.path.metadata().map_err(|_| Denial::Unreadable)?;
     if !meta.is_dir() {
         return Err(Denial::NotADirectory);
     }
+    // 失敗（権限が無い / 途中で消えた）は**必ず理由へ変換する**。
+    // ここを `let Ok(..) else { 空の一覧 }` にすると、読めないフォルダが
+    // **空のフォルダに見える**（#1451 の番犬が実測で見逃した形。#1399 系の無言禁止）
     let read = std::fs::read_dir(&resolved.path).map_err(|_| Denial::Unreadable)?;
     let mut names: Vec<String> = read
         .filter_map(|e| e.ok())
@@ -401,21 +461,32 @@ pub fn list_directory(resolved: &Resolved) -> Result<Value, Denial> {
     // キーの生成は 1 要素 1 回にする（比較ごとに String を作らない）
     names.sort_by_cached_key(|a| a.to_lowercase());
 
+    let truncated = names.len() > MAX_ENTRIES;
+    names.truncate(MAX_ENTRIES);
+
+    // 全体閲覧のルートは配下判定が常に真なので、外を指す symlink の検査を省く
+    let check_escape = resolved.root_kind != RootKind::Fs;
     let mut entries: Vec<Value> = names
         .iter()
-        .map(|n| entry_json(n, &resolved.path, &resolved.root_canon))
+        .map(|n| entry_json(n, &resolved.path, &resolved.root_canon, check_escape))
         .collect();
     entries.sort_by_key(|e| !e["dir"].as_bool().unwrap_or(false));
-
-    let truncated = entries.len() > MAX_ENTRIES;
-    entries.truncate(MAX_ENTRIES);
 
     Ok(json!({
         "root": resolved.root_id,
         "root_name": resolved.root_name,
+        "root_kind": resolved.root_kind.as_str(),
         "path": resolved.rel,
         "entries": entries,
         "truncated": truncated,
+        // #1451: 全体閲覧のときだけ絶対パスを載せる（ショートカット登録の宛先）。
+        // ツリー由来のルートでは**載せない**: #1079 は「ルート名 + 相対パス」しか
+        // 見せない設計で、絶対パスを配ると全体閲覧を許していない端末にも
+        // ディスク上の位置が漏れる。OS ごとの区切りを JS で組ませないための値でもある
+        "abs": match resolved.root_kind {
+            RootKind::Fs => json!(resolved.path.to_string_lossy()),
+            RootKind::Tree => Value::Null,
+        },
     }))
 }
 
@@ -479,6 +550,7 @@ pub fn content_payload(resolved: &Resolved, content: &FileContent) -> Value {
     json!({
         "root": resolved.root_id,
         "root_name": resolved.root_name,
+        "root_kind": resolved.root_kind.as_str(),
         "path": resolved.rel,
         "size": content.size,
         "binary": content.binary,
@@ -565,6 +637,114 @@ pub fn content_disposition(file_name: &str) -> String {
 /// **偶然の一致が起きないこと**だけなので、長さと 64bit の内容ハッシュを併記する
 pub fn content_etag(bytes: &[u8]) -> String {
     format!("{}-{:016x}", bytes.len(), fnv1a64(bytes))
+}
+
+// ============================================================================
+// 全体閲覧のルート（#1451）
+// ============================================================================
+//
+// # 設計: 新しい読み出し経路を作らず、**ルートを 1 件足すだけ**にした
+//
+// 既存の読み出し・編集・ダウンロードはすべて `?root=<id>&path=<相対>` の形で、
+// 認可は [`resolve_in_root`] の 1 実装が正。ここへ「`/` を指すルート」を足すと、
+// プレビュー（#1079）/ 編集（#1084）/ pending・push（#1085）が**分岐を 1 つも
+// 増やさずにそのまま効く**。`/api/fs?path=<絶対パス>` を新設する案は、
+// content / download / PUT / pending / push を全部二重化することになり、
+// 「認可は #1079 の 1 実装をそのまま通す」（脅威モデルの明文）を壊すので採らない。
+//
+// # 認可の門はここ 1 か所
+//
+// 門は [`allows_full_browse`]（role + A/B）だけで、**`fs` ルートを一覧に載せるか**を
+// 決める。載っていなければ `resolve_in_root` が `UnknownRoot` で 403 にするので、
+// id を推測して直接叩いても通らない（id は秘密ではなく、認可は一覧との照合で行う）。
+
+/// 全体閲覧のルート id（unix の `/`）。
+///
+/// ローカルのツリールート id は 12 桁の 16 進、SSH は `s-` 接頭辞なので、
+/// **`fs` はどちらとも構造的に衝突しない**（`s` も `fs` の 2 文字目も 16 進に無い）。
+/// Windows はドライブごとに `fs-c` / `fs-d` と枝番を付ける
+pub const FS_ROOT_ID: &str = "fs";
+
+/// 全体閲覧を許す最低 role（**この定数が認可の正**）。
+///
+/// 画面の閲覧（Observe）や「ツリーに出ているものを読む」（Interact）と違い、
+/// 全体閲覧は**そのユーザーが読めるものすべて**を tailnet 越しに配れる。
+/// 危険度は close / resize（= 実質シェルアクセス）と同じ強さなので Manage に置く。
+/// role 昇格は Mac 画面の GUI でしか行えない（FR-6.5）ので、
+/// 「全体を読める端末 = Mac 所有者がその場で manage を押した端末」が構造で保たれる
+pub const FULL_BROWSE_ROLE: DeviceRole = DeviceRole::Manage;
+
+/// #1451 の A/B。`TAKO_1451_LEGACY=1` で**同一バイナリのまま** #1079 の挙動へ戻す
+/// （全体閲覧の入口もショートカットも一覧に出ない = ツリー配下だけが見える）
+pub fn legacy_1451() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_1451_LEGACY").map(|v| v == "1") == Ok(true))
+}
+
+/// 全体閲覧を許すか（**純粋関数**。env を読まないので両アームを 1 プロセスで検査できる）
+pub fn allows_full_browse(role: DeviceRole, legacy: bool) -> bool {
+    !legacy && role >= FULL_BROWSE_ROLE
+}
+
+/// `id` が全体閲覧のルートか
+pub fn is_fs_root_id(root_id: &str) -> bool {
+    root_id == FS_ROOT_ID || root_id.starts_with(&format!("{FS_ROOT_ID}-"))
+}
+
+/// 全体閲覧のルート 1 件を組む（**純粋関数**。存在確認は呼び出し側）
+fn fs_root_entry(id: String, path: PathBuf, name: String) -> TreeRoot {
+    TreeRoot {
+        id,
+        path,
+        name,
+        // ツリーのタブに属さない（画面のどのタブでもない）ことを 0 で表す
+        tab: 0,
+        tab_title: String::new(),
+        kind: RootKind::Fs,
+    }
+}
+
+/// 全体閲覧の入口。unix は `/` の 1 件、Windows は**実在するドライブ**ごと。
+///
+/// Windows でドライブを列挙するのは、`C:\` だけに固定すると外付け・ネットワーク
+/// ドライブが見えないため（`\\?\` の UNC は対象外 = `check_relative_shape` が落とす）
+pub fn fs_roots() -> Vec<TreeRoot> {
+    #[cfg(windows)]
+    {
+        let mut out = Vec::new();
+        for letter in b'a'..=b'z' {
+            let ch = letter as char;
+            let path = PathBuf::from(format!("{}:\\", ch.to_ascii_uppercase()));
+            if path.is_dir() {
+                out.push(fs_root_entry(
+                    format!("{FS_ROOT_ID}-{ch}"),
+                    path.clone(),
+                    path.to_string_lossy().to_string(),
+                ));
+            }
+        }
+        out
+    }
+    #[cfg(not(windows))]
+    {
+        vec![fs_root_entry(
+            FS_ROOT_ID.to_string(),
+            PathBuf::from("/"),
+            "/".to_string(),
+        )]
+    }
+}
+
+/// ツリーのルートに全体閲覧の入口を**足すかどうか**を決める 1 か所（= 認可の門）。
+///
+/// 足す側に倒す条件は [`allows_full_browse`] だけ。ここを通さずに `fs` ルートを
+/// 組む経路が生えたら番犬（`issue1451_full_fs_watchdog`）が落とす
+pub fn local_roots_for(role: DeviceRole, legacy: bool, tree: Vec<TreeRoot>) -> Vec<TreeRoot> {
+    let mut out = tree;
+    if allows_full_browse(role, legacy) {
+        out.extend(fs_roots());
+    }
+    out
 }
 
 // ============================================================================
@@ -736,7 +916,106 @@ pub fn is_ssh_root_id(root_id: &str) -> bool {
     root_id.starts_with(SSH_ID_PREFIX)
 }
 
-// --- role ---
+// --- role（経路の宣言表。#1451 で #1449 の作法へ揃えた） ---
+//
+// # なぜ表にするのか
+//
+// #1079 は接頭辞一致（`/api/files/` で始まれば Interact）で role を決めていた。
+// これは「読み出しだけ」のあいだは十分だったが、#1451 でショートカットの
+// **編集**（Manage）が同じ接頭辞の下に生えるので、接頭辞のままだと
+// **新しい経路が黙って Interact へ緩む**。#1449 が `LAUNCH_ROUTES` で塞いだのと
+// 同じ壊れ方（#1405: 未知の経路が弱い role へこぼれる）なので、同じ形にする。
+//
+// - [`required_role_for`] はこの表から引く（= 表が実際の認可を決める）
+// - 番犬 `tests/issue1451_full_fs_watchdog.rs` が「PWA（`files.jsx`）が呼ぶ
+//   `/api/files…` がすべてこの表に在るか」をソース走査で照合する
+//
+// **表に無い呼び口が生えたら CI が落ちる。**
+
+/// ファイル API の経路 1 本の宣言
+#[derive(Debug, Clone, Copy)]
+pub struct FileRoute {
+    /// HTTP メソッド
+    pub method: &'static str,
+    /// 具体形のパス（docs・番犬・テストが使う）
+    pub path: &'static str,
+    /// 必要な role
+    pub role: DeviceRole,
+    /// 監査ログへ残す種別（`audit_payload` の `kind`）。読み出しは複数種別を
+    /// 出し分けるので代表値
+    pub audit_kind: &'static str,
+}
+
+/// 経路表（**正本**）。
+///
+/// 読み出し（#1079 / #1084 / #1085）は Interact 据え置きで、
+/// **全体閲覧の可否は role ではなく「`fs` ルートを一覧に載せるか」**（[`allows_full_browse`]）が決める。
+/// 2 段にしてあるのは、interact 端末が #1079 と同じ範囲を今までどおり読めることを保つため。
+///
+/// ショートカットは読み書きとも **Manage**: 絶対パスは画面に映らない在庫情報で、
+/// 全体閲覧ができない端末へ配る理由が無い（#1080 で `~/.ssh/config` の Host 一覧を
+/// GET でも Manage にしたのと同じ判断）
+pub const FILE_ROUTES: &[FileRoute] = &[
+    FileRoute {
+        method: "GET",
+        path: "/api/files",
+        role: DeviceRole::Interact,
+        audit_kind: "list",
+    },
+    FileRoute {
+        method: "GET",
+        path: "/api/files/content",
+        role: DeviceRole::Interact,
+        audit_kind: "content",
+    },
+    FileRoute {
+        method: "PUT",
+        path: "/api/files/content",
+        role: DeviceRole::Interact,
+        audit_kind: "write",
+    },
+    FileRoute {
+        method: "GET",
+        path: "/api/files/download",
+        role: DeviceRole::Interact,
+        audit_kind: "download",
+    },
+    FileRoute {
+        method: "GET",
+        path: "/api/files/pending",
+        role: DeviceRole::Interact,
+        audit_kind: "pending",
+    },
+    FileRoute {
+        method: "POST",
+        path: "/api/files/push",
+        role: DeviceRole::Interact,
+        audit_kind: "push",
+    },
+    FileRoute {
+        method: "GET",
+        path: "/api/files/shortcuts",
+        role: DeviceRole::Manage,
+        audit_kind: "shortcuts",
+    },
+    FileRoute {
+        method: "POST",
+        path: "/api/files/shortcuts",
+        role: DeviceRole::Manage,
+        audit_kind: "shortcut_add",
+    },
+    FileRoute {
+        method: "DELETE",
+        path: "/api/files/shortcuts",
+        role: DeviceRole::Manage,
+        audit_kind: "shortcut_remove",
+    },
+];
+
+/// このモジュールが受け持つパスか（メソッドを問わない）
+pub fn owns_path(path: &str) -> bool {
+    FILE_ROUTES.iter().any(|r| r.path == path)
+}
 
 /// このモジュールが受け持つパスの必要 role を返す（担当外なら None）。
 ///
@@ -744,27 +1023,57 @@ pub fn is_ssh_root_id(root_id: &str) -> bool {
 /// ファイルの中身を丸ごと持ち出せることは危険度が別物なので、
 /// Mac 側で明示的に昇格した端末にだけ許す。
 ///
-/// メソッドは見ない（= 下限だけを言う）。`remote.rs` の `required_role` は
-/// **POST の分岐より後**でこれを引くので、未知の POST は従来どおり Manage のまま
-pub fn required_role_for(path: &str) -> Option<DeviceRole> {
-    if path == "/api/files" || path.starts_with("/api/files/") {
-        return Some(DeviceRole::Interact);
+/// メソッドを見るのは #1451 から: 同じパスでも読み（Interact）と
+/// ショートカットの編集（Manage）で必要な強さが違う。
+/// **表に無いメソッドはこのモジュールの担当外**として `None` を返すので、
+/// `remote.rs` 側の「未知の POST は Manage」が従来どおり最後の網になる
+pub fn required_role_for_method(method: &str, path: &str) -> Option<DeviceRole> {
+    if let Some(role) = FILE_ROUTES
+        .iter()
+        .find(|r| r.method.eq_ignore_ascii_case(method) && r.path == path)
+        .map(|r| r.role)
+    {
+        return Some(role);
+    }
+    // **表に無い `/api/files…` は安全側（Manage）へ落とす**。
+    // #1079 は接頭辞一致で Interact を返していたので、表へ移した拍子に
+    // 「未知の GET が Observe へこぼれる」（#1405）を作らないための床。
+    // 受け口が無いので実際には 404 になるが、認可を先に通すことで
+    // **将来ここへハンドラを足した人が role を宣言し忘れても弱くならない**
+    if path == FILES_PREFIX || path.starts_with(&format!("{FILES_PREFIX}/")) {
+        return Some(DeviceRole::Manage);
     }
     None
 }
 
-/// このモジュールが受け持つ**書き込み系**のパス（`PUT` / `POST`）。
+/// ファイル API の接頭辞（床の判定と番犬が使う）
+pub const FILES_PREFIX: &str = "/api/files";
+
+/// パスだけで引く下限（`remote.rs` のルータが「このモジュールへ渡すか」を決めるのに使う）。
+///
+/// **表にあるメソッドのうち最も弱い role** を返す。強い方を返すと、
+/// 読み出ししかしない端末が一覧すら引けなくなる
+pub fn required_role_for(path: &str) -> Option<DeviceRole> {
+    let from_table = FILE_ROUTES
+        .iter()
+        .filter(|r| r.path == path)
+        .map(|r| r.role)
+        .min();
+    from_table.or_else(|| {
+        (path == FILES_PREFIX || path.starts_with(&format!("{FILES_PREFIX}/")))
+            .then_some(DeviceRole::Manage)
+    })
+}
+
+/// このモジュールが受け持つ**書き込み系**のパス（`PUT` / `POST` / `DELETE`）。
 ///
 /// `remote.rs` の `required_role` は「未知の POST は Manage」で安全側に倒しており、
-/// その規則を崩さないために**パスを明示列挙**する（`required_role_for` のような
-/// 接頭辞一致にすると、将来足した `/api/files/*` の POST が意図せず
-/// Interact へ緩む）。役割は保存も再送も同じ Interact = `/api/upload` と同じ基準:
-/// 「ファイルを書き換えられる端末」は Mac 側で明示的に昇格したものだけ
-pub const WRITE_PATHS: &[&str] = &["/api/files/content", "/api/files/push"];
-
-/// [`WRITE_PATHS`] に載っているか
+/// その規則を崩さないために**表から導く**（接頭辞一致にすると、将来足した
+/// `/api/files/*` の POST が意図せず Interact へ緩む）
 pub fn is_write_path(path: &str) -> bool {
-    WRITE_PATHS.contains(&path)
+    FILE_ROUTES
+        .iter()
+        .any(|r| r.path == path && !r.method.eq_ignore_ascii_case("GET"))
 }
 
 // ============================================================================
@@ -963,6 +1272,9 @@ pub struct FilesDeps<'a> {
     pub audit: &'a dyn Fn(&str, Value),
     /// 応答に付ける CORS ヘッダ（`remote.rs` の 1 実装をそのまま使う）
     pub cors: Vec<tiny_http::Header>,
+    /// この要求を出した端末の role（#1451）。**全体閲覧の門はこの値だけで決まる**
+    /// （`remote.rs` の認可が確定させた値をそのまま受け取り、ここで再判定しない）
+    pub role: DeviceRole,
 }
 
 fn header(name: &[u8], value: &[u8]) -> tiny_http::Header {
@@ -994,8 +1306,16 @@ fn respond_denial(request: tiny_http::Request, deps: &FilesDeps, denial: Denial)
     respond_json(request, deps, denial.status(), &denial.to_json());
 }
 
-/// 現在ツリーに出ているルートを app から取り直す。**毎リクエスト取り直す**のが要点:
-/// daemon 側に許可リストを溜めると、Mac 側で閉じたフォルダが読めたままになる
+/// 現在ツリーに出ているルート + （許されていれば）全体閲覧の入口を組む。
+///
+/// ツリーのルートは**毎リクエスト取り直す**のが要点: daemon 側に許可リストを
+/// 溜めると、Mac 側で閉じたフォルダが読めたままになる。
+///
+/// **#1451 の認可の門はここ 1 か所**。`fs` ルートを足すかどうかを
+/// [`local_roots_for`]（= role と A/B だけを見る純粋関数）に委ね、
+/// 読み出し・プレビュー・ダウンロード・書き込みのすべてがこの 1 本を通る。
+/// 一覧に載らなければ [`resolve_in_root`] が `UnknownRoot` で 403 にするので、
+/// id を直接叩いても通らない
 fn current_roots(deps: &FilesDeps) -> Result<Vec<TreeRoot>, String> {
     let payload = (deps.send)(crate::protocol::Request::TreeFolder {
         action: "roots".to_string(),
@@ -1004,7 +1324,11 @@ fn current_roots(deps: &FilesDeps) -> Result<Vec<TreeRoot>, String> {
         pane: None,
         limit: None,
     })?;
-    Ok(roots_from_payload(&payload))
+    Ok(local_roots_for(
+        deps.role,
+        legacy_1451(),
+        roots_from_payload(&payload),
+    ))
 }
 
 /// 現在ツリーに出ている SSH 先フォルダを app から取り直す（#1085）。
@@ -1535,6 +1859,29 @@ pub fn handle_files_request(
             respond_json(request, deps, status, &body)
         }
 
+        // --- ショートカット（#1451。role は Manage = `FILE_ROUTES`） ---
+        (tiny_http::Method::Get, "/api/files/shortcuts") => {
+            let (status, body) = read_shortcuts(deps);
+            respond_json(request, deps, status, &body)
+        }
+        (tiny_http::Method::Post, "/api/files/shortcuts") => {
+            let body = match read_json_body(&mut request) {
+                Ok(v) => v,
+                Err(e) => {
+                    let f = WriteFailure::bad_body(&e);
+                    return respond_json(request, deps, f.status, &f.to_json());
+                }
+            };
+            let (status, out) = add_shortcut(deps, &body);
+            respond_json(request, deps, status, &out)
+        }
+        (tiny_http::Method::Delete, "/api/files/shortcuts") => {
+            // 宛先は query（`?id=…`）で受ける。DELETE のボディは中継で落ちうる
+            let id = query_value(url_full, "id").or_else(|| query_value(url_full, "path"));
+            let (status, out) = remove_shortcut(deps, id.as_deref());
+            respond_json(request, deps, status, &out)
+        }
+
         // --- 書き込み（#1084 / SSH 先は #1085） ---
         (tiny_http::Method::Put, "/api/files/content") => {
             let body = match read_json_body(&mut request) {
@@ -1560,7 +1907,7 @@ pub fn handle_files_request(
         }
 
         // 受け持つパスだがメソッドが違う（405）と、そもそも無いパス（404）を分ける
-        (_, p) if is_write_path(p) || required_role_for(p).is_some() => respond_json(
+        (_, p) if owns_path(p) => respond_json(
             request,
             deps,
             405,
@@ -1577,6 +1924,162 @@ pub fn handle_files_request(
             &json!({ "error": "API エンドポイントが見つからない" }),
         ),
     }
+}
+
+// ============================================================================
+// ショートカット（#1451）
+// ============================================================================
+//
+// 正本は [`tako_core::remote_shortcuts`]（CLI / MCP と同じ 1 実装）。ここは
+// **HTTP の受け口と「どこへ飛ぶか」の解決**だけを持つ。
+//
+// 認可: 読み書きとも Manage（[`FILE_ROUTES`]）。ショートカットは行き先の宣言で
+// あって読める範囲を広げないが、**絶対パスは画面に映らない在庫情報**なので、
+// 全体閲覧ができない端末へ配らない。
+
+use tako_core::remote_shortcuts::{Shortcut, ShortcutError, ShortcutsFile};
+
+/// ショートカットの絶対パスを「どのルートの・どの相対パスか」へ解決する。
+///
+/// **純粋関数**（`roots` を引数で受ける）なので、Windows のドライブ形も
+/// macOS から検査できる。当たるルートが無ければ `None` =
+/// PWA は「今は開けない」と出す（黙って押せない行にしない）
+pub fn shortcut_target(roots: &[TreeRoot], path: &str) -> Option<(String, String)> {
+    let target = Path::new(path);
+    let pick = |kind: RootKind| -> Option<(String, String)> {
+        let mut best: Option<(&TreeRoot, String)> = None;
+        for root in roots.iter().filter(|r| r.kind == kind) {
+            let Ok(rel) = target.strip_prefix(&root.path) else {
+                continue;
+            };
+            let rel = rel
+                .components()
+                .filter_map(|c| match c {
+                    Component::Normal(s) => Some(s.to_string_lossy().to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+            // 同じ種別で複数当たるなら**より深いルート**（= 相対が短い方）を採る。
+            // Windows でドライブが複数あるときに正しい方を選ぶための規則
+            if best.as_ref().is_none_or(|(_, cur)| rel.len() < cur.len()) {
+                best = Some((root, rel));
+            }
+        }
+        best.map(|(root, rel)| (root.id.clone(), rel))
+    };
+    // **全体閲覧のルートを優先する**。ツリーのルートの方が相対パスは短くなるが、
+    // そちらを選ぶと**飛び先が「今ツリーに何を開いているか」に左右される**
+    // （Mac 側でそのフォルダを閉じた瞬間にショートカットが 403 になる = 実測）。
+    // ショートカットは manage 端末の道具で、その端末には必ず `fs` ルートが出るので、
+    // 常に `fs` を宛先にすれば**ツリーの開閉に関わらず同じ場所へ飛ぶ**。
+    // `fs` が無いとき（A/B の legacy 腕など）だけツリー側へ落とす
+    pick(RootKind::Fs).or_else(|| pick(RootKind::Tree))
+}
+
+/// ショートカット 1 件の応答。`root` / `path` は**飛び先**（PWA はこれをそのまま使う）
+fn shortcut_json(s: &Shortcut, roots: &[TreeRoot]) -> Value {
+    let mut out = s.to_json();
+    match shortcut_target(roots, &s.path) {
+        Some((root, rel)) => {
+            out["root"] = json!(root);
+            out["path"] = json!(rel);
+            out["available"] = json!(true);
+        }
+        None => {
+            out["available"] = json!(false);
+        }
+    }
+    out
+}
+
+/// 現在の時刻（UNIX 秒）。正本側は引数で受け取るので、env を読むのはここだけ
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// ショートカットの一覧（既定 + 登録分）。
+///
+/// 飛び先の解決に使うルートは**そのリクエストの role で組んだもの**なので、
+/// 全体閲覧を許されていない端末では `available: false` になる（門は 1 か所のまま）
+fn read_shortcuts(deps: &FilesDeps) -> (u16, Value) {
+    let roots = match current_roots(deps) {
+        Ok(r) => r,
+        Err(e) => return app_unreachable(&e),
+    };
+    let file = ShortcutsFile::load();
+    let list = file.listing(tako_core::paths::home_dir().as_deref());
+    let items: Vec<Value> = list.iter().map(|s| shortcut_json(s, &roots)).collect();
+    (deps.audit)("files", audit_payload("shortcuts", 0, items.len()));
+    (200, json!({ "shortcuts": items }))
+}
+
+/// 失敗の応答（読み出しの [`Denial`] とキー名を揃えるので PWA の分岐は 1 本のまま）
+fn shortcut_failure(e: ShortcutError) -> (u16, Value) {
+    (
+        e.status(),
+        json!({
+            "error": e.message_ja(),
+            "error_en": e.message_en(),
+            "kind": e.kind(),
+        }),
+    )
+}
+
+/// ショートカットを足す（冪等）。`path` は絶対パス
+fn add_shortcut(deps: &FilesDeps, body: &Value) -> (u16, Value) {
+    let Some(path) = body["path"].as_str().filter(|s| !s.is_empty()) else {
+        return shortcut_failure(ShortcutError::NotAbsolute);
+    };
+    let name = body["name"].as_str();
+    let roots = match current_roots(deps) {
+        Ok(r) => r,
+        Err(e) => return app_unreachable(&e),
+    };
+    let mut file = ShortcutsFile::load();
+    let added = match file.add(Path::new(path), name, now_secs()) {
+        Ok(s) => s,
+        Err(e) => return shortcut_failure(e),
+    };
+    if let Err(e) = file.save() {
+        return (
+            500,
+            json!({
+                "error": format!("ショートカットを保存できなかった: {e}"),
+                "error_en": "Could not save the shortcut",
+                "kind": "save_failed",
+            }),
+        );
+    }
+    (deps.audit)("files", audit_payload("shortcut_add", 0, 1));
+    (200, json!({ "shortcut": shortcut_json(&added, &roots) }))
+}
+
+/// ショートカットを消す。`id` でも `path` でも指せる
+fn remove_shortcut(deps: &FilesDeps, id: Option<&str>) -> (u16, Value) {
+    let Some(key) = id.filter(|s| !s.is_empty()) else {
+        return shortcut_failure(ShortcutError::UnknownShortcut);
+    };
+    let mut file = ShortcutsFile::load();
+    let removed = match file.remove(key, tako_core::paths::home_dir().as_deref()) {
+        Ok(s) => s,
+        Err(e) => return shortcut_failure(e),
+    };
+    if let Err(e) = file.save() {
+        return (
+            500,
+            json!({
+                "error": format!("ショートカットを保存できなかった: {e}"),
+                "error_en": "Could not save the shortcut",
+                "kind": "save_failed",
+            }),
+        );
+    }
+    (deps.audit)("files", audit_payload("shortcut_remove", 0, 1));
+    (200, json!({ "removed": removed.id }))
 }
 
 /// ルート一覧（`root` 省略）またはディレクトリ一覧
@@ -2380,14 +2883,21 @@ mod tests {
 
     #[test]
     fn ファイルapiはinteract以上を要求する() {
-        for p in [
-            "/api/files",
-            "/api/files/content",
-            "/api/files/download",
-            "/api/files/anything",
-        ] {
+        for p in ["/api/files", "/api/files/content", "/api/files/download"] {
             assert_eq!(required_role_for(p), Some(DeviceRole::Interact), "path={p}");
         }
+        // #1451: 表に無い `/api/files…` は**安全側（Manage）**。
+        // 接頭辞で Interact を返していた #1079 の形より強い = 未知の経路が緩まない
+        assert_eq!(
+            required_role_for("/api/files/anything"),
+            Some(DeviceRole::Manage),
+            "表に無いパスは安全側へ落ちる"
+        );
+        assert_eq!(
+            required_role_for_method("GET", "/api/files/anything"),
+            Some(DeviceRole::Manage),
+            "未知の GET が Observe へこぼれない（#1405）"
+        );
         // Observe では足りない = 403 になる
         assert!(
             DeviceRole::Observe < DeviceRole::Interact,
@@ -2716,6 +3226,61 @@ mod tests {
 
     // --- 書き込みの role と失敗の形（#1084 / #1085） ---
 
+    // --- ショートカットの飛び先（#1451） ---
+
+    fn root_for(id: &str, path: &str, kind: RootKind) -> TreeRoot {
+        TreeRoot {
+            id: id.to_string(),
+            path: PathBuf::from(path),
+            name: path.to_string(),
+            tab: 0,
+            tab_title: String::new(),
+            kind,
+        }
+    }
+
+    /// 実測で見つけた回帰（#1451）: ツリーのルートの方が相対パスは短いので、
+    /// 「深い方を採る」だけだと**飛び先がツリーの開閉に左右される**
+    /// （Mac 側でそのフォルダを閉じた瞬間にショートカットが 403 になる）
+    #[test]
+    fn ショートカットの飛び先は全体閲覧のルートを選ぶ() {
+        let roots = vec![
+            root_for("aaaaaaaaaaaa", "/home/testuser", RootKind::Tree),
+            root_for(FS_ROOT_ID, "/", RootKind::Fs),
+        ];
+        let (root, rel) = shortcut_target(&roots, "/home/testuser/dev/proj").expect("解決できる");
+        assert_eq!(
+            root, FS_ROOT_ID,
+            "ツリーのルートを選んでいる（開閉に左右される）"
+        );
+        assert_eq!(rel, "home/testuser/dev/proj");
+
+        // `fs` が無いとき（legacy 腕）だけツリー側へ落ちる
+        let only_tree = vec![root_for("aaaaaaaaaaaa", "/home/testuser", RootKind::Tree)];
+        let (root, rel) = shortcut_target(&only_tree, "/home/testuser/dev").expect("解決できる");
+        assert_eq!(root, "aaaaaaaaaaaa");
+        assert_eq!(rel, "dev");
+
+        // どこにも当たらなければ None（PWA は「今は開けない」と出す）
+        assert!(shortcut_target(&only_tree, "/elsewhere/x").is_none());
+    }
+
+    /// 全体閲覧のルートが複数（Windows のドライブ）なら、深い方 = 相対が短い方を選ぶ。
+    ///
+    /// **Windows でしか回せない**: 配下判定は `Path::strip_prefix`（= コンポーネント単位）で、
+    /// `\\` が区切りかどうかはホスト OS が決める。macOS では `D:\work\proj` が
+    /// 1 コンポーネントになるので、この形は Windows のランナーでだけ意味を持つ
+    #[cfg(windows)]
+    #[test]
+    fn 複数のドライブからは深い方を選ぶ() {
+        let roots = vec![
+            root_for("fs-c", "C:\\", RootKind::Fs),
+            root_for("fs-d", "D:\\", RootKind::Fs),
+        ];
+        let (root, _) = shortcut_target(&roots, "D:\\work\\proj").expect("解決できる");
+        assert_eq!(root, "fs-d");
+    }
+
     #[test]
     fn 書き込みパスは明示列挙されている() {
         assert!(is_write_path("/api/files/content"));
@@ -2730,9 +3295,22 @@ mod tests {
         ] {
             assert!(!is_write_path(p), "{p} が書き込み扱いになっている");
         }
-        // 受け持ちは読み出しと同じ Interact 以上
-        for p in WRITE_PATHS {
-            assert_eq!(required_role_for(p), Some(DeviceRole::Interact), "{p}");
+        // 本文を書き換える経路は読み出しと同じ Interact 以上（#1084 / #1085）
+        for (m, p) in [("PUT", "/api/files/content"), ("POST", "/api/files/push")] {
+            assert_eq!(
+                required_role_for_method(m, p),
+                Some(DeviceRole::Interact),
+                "{m} {p}"
+            );
+        }
+        // #1451: ショートカットの編集は Manage（読み出しより強い）
+        assert!(is_write_path("/api/files/shortcuts"));
+        for m in ["POST", "DELETE"] {
+            assert_eq!(
+                required_role_for_method(m, "/api/files/shortcuts"),
+                Some(DeviceRole::Manage),
+                "{m} /api/files/shortcuts"
+            );
         }
     }
 

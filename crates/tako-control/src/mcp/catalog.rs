@@ -2219,6 +2219,37 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_remote_shortcuts",
+            "description": "リモート（スマホ）のファイル閲覧で使うショートカット（お気に入り）を\
+                管理する（#1451）。action=list で既定（ホーム / デスクトップ / ダウンロード）と\
+                登録分の一覧、action=add で path（絶対パス）を追加（同じパスの二重登録は\
+                起きない = 冪等）、action=remove で削除（path は id でもパスでもよい）。\
+                既定のショートカットは削除できない。永続は <data_dir>/remote/shortcuts.json で、\
+                PWA・CLI（tako remote shortcuts）とこのツールが同じ 1 実装を通るので\
+                どこから足しても同じ一覧になる。\
+                **ショートカットは行き先の宣言であって、読める範囲は広げない**\
+                （スマホから実際に読めるかは端末の role と認可が毎リクエスト決める）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string", "enum": ["list", "add", "remove"],
+                        "default": "list",
+                        "description": "list = 一覧（既定） / add = 追加 / remove = 削除",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "add = 追加するフォルダの絶対パス / remove = 消す対象（id でもパスでもよい）",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "add のときの表示名（省略時は末尾のフォルダ名）",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_remote_setup",
             "description": "リモートアクセスの Tailscale セットアップ状態を確認・実行する（#286）。\
                 action=check で Tailscale の導入・ログイン・HTTPS・serve の各項目を確認、\

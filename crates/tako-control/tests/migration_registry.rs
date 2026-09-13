@@ -75,6 +75,10 @@ fn 共有対象の設定ファイルは移行の番地にも載っている() {
         ("setup/", SchemaId::Setup),
         ("instances/", SchemaId::DiscoveryInstance),
         ("remote/", SchemaId::RemoteDevices),
+        // #1451: ショートカットも `remote/` 配下の 1 ファイル。カタログは
+        // ディレクトリ単位（`remote/` = Secret）なので、番地が 2 つでも
+        // 共有分類の宣言は 1 つのまま = ここだけが 1:多 になる
+        ("remote/", SchemaId::RemoteShortcuts),
     ];
     use tako_control::config_share::catalog;
     for (path, id) in MAPPING {
@@ -249,6 +253,10 @@ fn fingerprint() -> BTreeMap<String, Vec<String>> {
         (
             "crates/tako-control/src/platform/lid.rs",
             &["SavedLidState", "RecordOwner"],
+        ),
+        (
+            "crates/tako-core/src/remote_shortcuts.rs",
+            &["ShortcutsFile", "Shortcut"],
         ),
     ];
     let mut out = BTreeMap::new();

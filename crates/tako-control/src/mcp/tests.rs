@@ -577,7 +577,8 @@ mod tests {
         // #1283 の tako_links（画面のリンク検出）を追加して 148
         // #1296 の tako_test_residue（テスト・検証プロセスの残骸の掃除）を追加して 149
         // #1450 の tako_todo（ユーザー向けタスク）を追加して 150
-        assert_eq!(tools.len(), 150);
+        // #1451 の tako_remote_shortcuts（リモート閲覧のショートカット）を追加して 151
+        assert_eq!(tools.len(), 151);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
