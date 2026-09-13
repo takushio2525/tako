@@ -76,6 +76,12 @@ fn validate_remote_devices(text: &str) -> Result<(), String> {
     json_ok::<crate::remote_auth::DevicesFile>(text)
 }
 
+/// リモート閲覧のショートカット（#1451）。**秘匿情報ではない**（行き先の宣言だけで、
+/// 読める範囲は role と認可が毎リクエスト決める）ので、読めない内容は退避して残す
+fn validate_remote_shortcuts(text: &str) -> Result<(), String> {
+    json_ok::<tako_core::remote_shortcuts::ShortcutsFile>(text)
+}
+
 /// 蓋閉じ継続の残留記録（#697 / #1373）。中身は Windows 専用だが、
 /// **読めない記録を「記録なし」へ丸めない**のは両 OS 共通の要件なので検査も共通
 fn validate_lid_guard(text: &str) -> Result<(), String> {
@@ -395,6 +401,10 @@ pub const SPECS: &[SchemaSpec] = &[
     ),
     // 共有分類は Secret（`remote/`）。ペアリング情報の写しを残さない
     ephemeral(SchemaId::RemoteDevices, Some(validate_remote_devices)),
+    // ショートカット（#1451）は利用者が手で育てた一覧なので、**読めなくても捨てない**
+    // （`ephemeral` の RemoteDevices と分けているのはそのため）。版数フィールドを
+    // 持つので、形を変えるときは target_version を上げて Step を足す
+    versioned(SchemaId::RemoteShortcuts, Some(validate_remote_shortcuts)),
 ];
 
 /// 種別から登録を引く
@@ -443,6 +453,9 @@ pub fn targets(id: SchemaId) -> Vec<PathBuf> {
             dir_entries(data.as_ref().map(|d| d.join("instances")), ".json")
         }
         SchemaId::RemoteDevices => single("remote/devices.json"),
+        SchemaId::RemoteShortcuts => {
+            single(&format!("remote/{}", tako_core::remote_shortcuts::FILENAME))
+        }
     }
 }
 

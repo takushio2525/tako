@@ -708,6 +708,11 @@ pub(super) fn build_request(
             action: str_arg(args, "action")?.ok_or("action を指定する（list / revoke）")?,
             device_id: str_arg(args, "device_id")?,
         },
+        "tako_remote_shortcuts" => Request::RemoteShortcuts {
+            action: str_arg(args, "action")?.unwrap_or_else(|| "list".to_string()),
+            path: str_arg(args, "path")?,
+            name: str_arg(args, "name")?,
+        },
         "tako_remote_setup" => Request::RemoteSetup {
             action: str_arg(args, "action")?.ok_or("action を指定する（check / run）")?,
             answers: args.get("answers").cloned(),

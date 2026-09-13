@@ -1265,8 +1265,33 @@ enum RemoteCommand {
         #[arg(long, value_name = "auto|gui|standalone")]
         tailscale: Option<String>,
     },
+    /// スマホのファイル閲覧で使うショートカット（お気に入り）を管理する（#1451）。
+    /// 引数なしで一覧、`add <path>` で追加、`remove <path|id>` で削除
+    Shortcuts {
+        #[command(subcommand)]
+        command: Option<RemoteShortcutsCommand>,
+    },
     /// [内部用] HTTP サーバーをフォアグラウンドで起動する（start から自動呼び出し）
     Serve,
+}
+
+#[derive(Subcommand)]
+enum RemoteShortcutsCommand {
+    /// 既定（ホーム / デスクトップ / ダウンロード）+ 登録分を一覧する
+    List,
+    /// ショートカットを追加する（同じパスを 2 回足しても 1 件のまま）
+    Add {
+        /// 追加するフォルダの絶対パス
+        path: String,
+        /// 表示名（省略時は末尾のフォルダ名）
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// ショートカットを削除する（既定のショートカットは消せない）
+    Remove {
+        /// 消す対象（`tako remote shortcuts` の id でも、登録したパスでもよい）
+        path: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3501,6 +3526,7 @@ fn cli_main() -> ExitCode {
             remote_scrollback(&pane_id, lines)
         }
         Command::Remote(RemoteCommand::Devices { command }) => remote_devices(command),
+        Command::Remote(RemoteCommand::Shortcuts { command }) => remote_shortcuts(command),
         Command::Remote(RemoteCommand::Setup {
             yes,
             answers,
@@ -4693,6 +4719,24 @@ fn remote_devices(command: RemoteDevicesCommand) -> Result<(), String> {
             tako_control::remote::devices_revoke(&device_id)?
         }
     };
+    println!("{}", pretty_json(&result));
+    Ok(())
+}
+
+/// `tako remote shortcuts` — スマホのファイル閲覧のショートカット（#1451）。
+///
+/// **サブコマンド省略で一覧**（`tako remote shortcuts list` と打たせない = #322 の最簡形）。
+/// 正本は `tako_core::remote_shortcuts` で、PWA・MCP と同じ 1 実装を通る
+fn remote_shortcuts(command: Option<RemoteShortcutsCommand>) -> Result<(), String> {
+    let (action, path, name) = match command {
+        None | Some(RemoteShortcutsCommand::List) => ("list", None, None),
+        Some(RemoteShortcutsCommand::Add { path, name }) => ("add", Some(path), name),
+        Some(RemoteShortcutsCommand::Remove { path }) => ("remove", Some(path), None),
+    };
+    // dispatch と**同一関数**を共用する（IPC 不要 = GUI が動いていなくても効く）
+    let result =
+        tako_control::dispatch::dispatch_remote_shortcuts(action, path.as_deref(), name.as_deref())
+            .map_err(|e| e.to_string())?;
     println!("{}", pretty_json(&result));
     Ok(())
 }

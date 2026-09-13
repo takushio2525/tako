@@ -3437,6 +3437,12 @@ fn dispatch_inner(
             ))),
         },
 
+        // ショートカット（#1451）。ControlHost 不要（正本はファイル）なので
+        // GUI が動いていない CLI からも同じ結果になる
+        Request::RemoteShortcuts { action, path, name } => {
+            dispatch_remote_shortcuts(&action, path.as_deref(), name.as_deref())
+        }
+
         Request::RemoteScrollback { pane_id, lines } => {
             // 数値の PaneId は **app 自身の workspace** で器のセッションへ解決する（#972）。
             // remote 側にも IPC 経由の解決があるが、それは CLI（別プロセス）用で、
@@ -11753,6 +11759,68 @@ fn limit_resume_panes(host: &dyn ControlHost) -> Vec<Value> {
         .into_iter()
         .map(|id| limit_resume_entry(host, id))
         .collect()
+}
+
+/// リモート閲覧のショートカット（#1451）。CLI / MCP / dispatch の 1 実装。
+///
+/// 正本は [`tako_core::remote_shortcuts`] で、ここは**引数の受け取りと応答の形**だけ。
+/// PWA（`/api/files/shortcuts`）も同じ正本を通るので、3 口の答えが揃う（開発不変条件）
+pub fn dispatch_remote_shortcuts(
+    action: &str,
+    path: Option<&str>,
+    name: Option<&str>,
+) -> Result<Value, DispatchError> {
+    use tako_core::remote_shortcuts::ShortcutsFile;
+
+    let home = tako_core::paths::home_dir();
+    let listing = |file: &ShortcutsFile| -> Value {
+        json!({
+            "shortcuts": file
+                .listing(home.as_deref())
+                .iter()
+                .map(|s| s.to_json())
+                .collect::<Vec<_>>(),
+        })
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    match action {
+        "list" => Ok(listing(&ShortcutsFile::load())),
+        "add" => {
+            let target = path.ok_or_else(|| {
+                DispatchError::InvalidParams("add には path が必要（絶対パス）".to_string())
+            })?;
+            let mut file = ShortcutsFile::load();
+            let added = file
+                .add(std::path::Path::new(target), name, now)
+                .map_err(|e| DispatchError::Operation(e.message_ja()))?;
+            file.save()
+                .map_err(|e| DispatchError::Operation(format!("保存に失敗: {e}")))?;
+            let mut out = listing(&file);
+            out["added"] = added.to_json();
+            Ok(out)
+        }
+        "remove" => {
+            let key = path.ok_or_else(|| {
+                DispatchError::InvalidParams("remove には path が必要（id でも可）".to_string())
+            })?;
+            let mut file = ShortcutsFile::load();
+            let removed = file
+                .remove(key, home.as_deref())
+                .map_err(|e| DispatchError::Operation(e.message_ja()))?;
+            file.save()
+                .map_err(|e| DispatchError::Operation(format!("保存に失敗: {e}")))?;
+            let mut out = listing(&file);
+            out["removed"] = json!(removed.id);
+            Ok(out)
+        }
+        other => Err(DispatchError::InvalidParams(format!(
+            "不明な action: {other}（list / add / remove）"
+        ))),
+    }
 }
 
 /// `tako_remote_scrollback` の対象指定を器のセッション名へ解決する（#972）。

@@ -45,6 +45,7 @@ pub mod pty_loop;
 pub mod recent;
 pub mod remote_fs;
 pub mod remote_open;
+pub mod remote_shortcuts;
 pub mod runner;
 pub mod screen;
 pub mod scroll;
