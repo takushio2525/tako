@@ -24,14 +24,16 @@
 //!    居て `parse` が受け、GUI のタブは同じ `PanelView::Tasks` を代入する
 //! 4. **ポーリングが止まる** — 撃つ判断は `tick_user_tasks` の 1 か所にあり、
 //!    `panel_visible` と A/B を見る。2 秒ループはそれを呼ぶだけ
-//! 5. **手書きのテキスト入力を増やさない** — `tasks_panel.rs` はカーソル操作を
-//!    自前で書かず `TextField` を通す（既存 2 本 = git のコミット / ブランチ名は
-//!    #1459 で移すまでの**名指しの猶予**）
+//! 5. **手書きのテキスト入力を増やさない** — `tasks_panel.rs` と `right_panel.rs` は
+//!    カーソル操作を自前で書かず `TextField` を通す。#1459 で既存 2 本
+//!    （git のコミット / ブランチ名）も移し終えたので**猶予は無い**（走査は全面適用）。
+//!    丸めの `floor_char_boundary` は `text_field.rs` の非公開関数なので、
+//!    他ファイルが同じことをするには自前で書き直すしかない = このマークに掛かる
 //!
 //! # 見逃す側へ倒れないための作り
 //!
 //! 走査が空振りすれば 1〜5 はすべて無意味に緑になるので、[`走査が空振りしていない`]
-//! で窓が採れていることを固定し、[`逆戻りを名指しできる`] で**注入 8 通り**が
+//! で窓が採れていることを固定し、[`逆戻りを名指しできる`] で**注入 10 通り**が
 //! `file:line` で名指しされることを確かめる。範囲取りは #1420 の 1 実装
 //! （`production_range`）を通す（`main.rs` は本番コードと隔離セルフテストが
 //! 交互に並ぶので、雑に切ると走査範囲が黙って縮む）。
@@ -349,29 +351,92 @@ fn scan_polling(sources: &Sources) -> Vec<Offender> {
     out
 }
 
-/// 5: 手書きのテキスト入力を 3 本目として増やさない（#1459 で既存 2 本を移す）
-fn scan_no_handrolled_input(src: &str) -> Vec<Offender> {
+/// 右パネルの手書き入力は **#1459 で全部 `TextField` へ移した**ので猶予は無い。
+/// 編集操作を委ねているべき打鍵ハンドラ（ファイル / 関数 / 通すべき API）
+const INPUT_DELEGATORS: &[(&str, &str, &str)] = &[
+    (
+        TASKS_PANEL,
+        "fn handle_task_comment_key(",
+        "handle_edit_key",
+    ),
+    (RIGHT_PANEL, "fn handle_git_commit_key(", "handle_edit_key"),
+    (
+        RIGHT_PANEL,
+        "fn handle_git_branch_input_key(",
+        "handle_edit_key",
+    ),
+];
+
+/// 5: 手書きのテキスト入力を増やさない（#1459 で既存 2 本も `TextField` へ移し、猶予は空）
+fn scan_no_handrolled_input(sources: &Sources) -> Vec<Offender> {
     let mut out = Vec::new();
-    let code = code_only(src);
-    for mark in HANDROLLED_INPUT_MARKS {
-        if let Some(i) = code_line_with(&code, mark) {
-            out.push(Offender {
-                file: TASKS_PANEL,
-                line: i + 1,
-                why: format!(
-                    "手書きのカーソル操作（`{mark}`）が居る。編集は `TextField` を通す\
-                     （右パネルには既に 2 本の手書き入力があり、3 本目を増やすと\
-                     境界バグの直し漏れが増える。#1459）"
-                ),
-            });
+    // **猶予表は無い**。入力を持つ 2 ファイルへ同じ走査を掛ける
+    for (file, src) in [
+        (TASKS_PANEL, &sources.tasks_panel),
+        (RIGHT_PANEL, &sources.right_panel),
+    ] {
+        let code = code_only(src);
+        for mark in HANDROLLED_INPUT_MARKS {
+            if let Some(i) = code_line_with(&code, mark) {
+                out.push(Offender {
+                    file,
+                    line: i + 1,
+                    why: format!(
+                        "手書きのカーソル操作（`{mark}`）が居る。編集は `TextField` を通す\
+                         （同じ境界処理が 2 本に割れると、片方だけ直したバグが\
+                         もう片方に残る。#1459）"
+                    ),
+                });
+            }
         }
     }
-    if !code.contains("TextField") {
-        out.push(Offender {
-            file: TASKS_PANEL,
+    // 打鍵ハンドラが編集操作を `TextField` へ委ねている（走査の空振り / 自前復活の検出）
+    for (file, needle, api) in INPUT_DELEGATORS {
+        let src = match *file {
+            TASKS_PANEL => &sources.tasks_panel,
+            _ => &sources.right_panel,
+        };
+        match fn_window(src, needle) {
+            None => out.push(Offender {
+                file,
+                line: 0,
+                why: format!("`{needle}` が見つからない（走査が空振り）"),
+            }),
+            Some((at, window)) => {
+                if !code_only(&window).contains(api) {
+                    out.push(Offender {
+                        file,
+                        line: at,
+                        why: format!(
+                            "`{needle}` が `TextField::{api}` を通していない\
+                             （編集操作が画面ごとに散ると境界バグの直し漏れが増える。#1459）"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    // 丸めの実装は `text_field.rs` の中だけ（`pub` にすると手書きが再び生える）
+    let text_field = code_only(&sources.text_field);
+    match code_line_with(&text_field, "fn floor_char_boundary(") {
+        None => out.push(Offender {
+            file: TEXT_FIELD,
             line: 0,
-            why: "`TextField` を使っていない（走査が空振り、または自前実装へ戻った）".into(),
-        });
+            why: "`floor_char_boundary` が居ない（丸めの 1 実装が消えた = 走査が空振り）".into(),
+        }),
+        Some(i) => {
+            let line = text_field.lines().nth(i).unwrap_or_default();
+            if line.contains("pub") {
+                out.push(Offender {
+                    file: TEXT_FIELD,
+                    line: i + 1,
+                    why: "`floor_char_boundary` がモジュール外へ公開されている\
+                          （呼べる場所が増えると「丸めてから自前で drain する」実装が\
+                          再び生える。#1459）"
+                        .into(),
+                });
+            }
+        }
     }
     out
 }
@@ -382,7 +447,7 @@ fn scan_all(sources: &Sources) -> Vec<Offender> {
     out.extend(scan_no_emoji(sources));
     out.extend(scan_view_vocabulary(sources));
     out.extend(scan_polling(sources));
-    out.extend(scan_no_handrolled_input(&sources.tasks_panel));
+    out.extend(scan_no_handrolled_input(sources));
     out
 }
 
@@ -415,6 +480,27 @@ fn 走査が空振りしていない() {
         ("返答", &sources.tasks_panel, "fn user_task_respond("),
         ("ポーリング", &sources.tasks_panel, "fn tick_user_tasks("),
         ("ビューの語彙", &sources.protocol, "pub fn parse(s: &str)"),
+        // #1459 で移した右パネルの入力 2 本（窓が採れないと 5 が無意味に緑になる）
+        (
+            "コミット欄の打鍵",
+            &sources.right_panel,
+            "fn handle_git_commit_key(",
+        ),
+        (
+            "コミット欄の挿入",
+            &sources.right_panel,
+            "fn git_commit_insert(",
+        ),
+        (
+            "ブランチ名欄の打鍵",
+            &sources.right_panel,
+            "fn handle_git_branch_input_key(",
+        ),
+        (
+            "ブランチ名欄の挿入",
+            &sources.right_panel,
+            "fn git_branch_input_insert(",
+        ),
     ] {
         let (at, window) = fn_window(src, needle)
             .unwrap_or_else(|| panic!("{label}（{needle}）の窓が採れない = 走査が壊れている"));
@@ -436,21 +522,39 @@ fn 走査が空振りしていない() {
     assert!(!is_emoji('あ') && !is_emoji('A') && !is_emoji('・'));
 }
 
-/// **既存の手書き入力 2 本は #1459 で移すまでの猶予**。
-/// 猶予をここに名指しで置いておくことで、「移し終わったのに表が残っている」も
-/// 「増えたのに気づかない」も検知できる（表と実態がズレたら落ちる）
+/// **手書き入力の猶予は空**（#1459 で既存 2 本を `TextField` へ移し終えた）。
+///
+/// B2 の時点では git のコミット欄 / ブランチ名欄を名指しで猶予していた。移送が
+/// 済んだので、ここでは「猶予表が残っていないか」ではなく**移送の結果**を直接固定する
+/// —— 2 本が居て、手書きのマークが 1 つも無く、挿入も `TextField` を通っていること。
 #[test]
-fn 手書き入力の猶予は既存2本だけ() {
+fn 手書き入力の猶予が空になっている() {
     let root = workspace_root();
     let src = code_only(&prod(&root, RIGHT_PANEL));
+    // 猶予していた 2 本は今も在り（消えたら走査が空振りになる）、手書きを持たない
     for (label, needle) in [
         ("git のコミットメッセージ欄", "fn handle_git_commit_key("),
         ("git の新規ブランチ名欄", "fn handle_git_branch_input_key("),
     ] {
         assert!(
             src.contains(needle),
-            "{RIGHT_PANEL}: {label}（{needle}）が無い。#1459 で `TextField` へ移したのなら、\
-             この猶予表からも外すこと（表と実態がズレたままになる）"
+            "{RIGHT_PANEL}: {label}（{needle}）が無い（走査が空振り）"
+        );
+    }
+    for mark in HANDROLLED_INPUT_MARKS {
+        assert!(
+            !src.contains(mark),
+            "{RIGHT_PANEL}: 手書きのカーソル操作（`{mark}`）が残っている。\
+             #1459 の移送後は右パネルに 1 つも要らない"
+        );
+    }
+    // 挿入も `TextField` の 1 実装を通る（上限・境界・制御文字の扱いが 2 本に割れない）
+    for needle in ["fn git_commit_insert(", "fn git_branch_input_insert("] {
+        let (_, window) = fn_window(&src, needle)
+            .unwrap_or_else(|| panic!("{RIGHT_PANEL}: `{needle}` の窓が採れない"));
+        assert!(
+            window.contains(".insert("),
+            "{RIGHT_PANEL}: `{needle}` が `TextField::insert` を通していない（#1459）"
         );
     }
     // 3 本目が right_panel.rs に生えていないこと（tasks の入力はここに置かない）
@@ -565,9 +669,42 @@ fn 逆戻りを名指しできる() {
     let mut s = Sources::load(&root);
     s.tasks_panel = s.tasks_panel.replace(
         "    pub(crate) fn tick_user_tasks(&mut self) {",
-        "    pub(crate) fn tick_user_tasks(&mut self) {\n        let _ = crate::right_panel::floor_char_boundary(\"\", 0);",
+        "    pub(crate) fn tick_user_tasks(&mut self) {\n        let mut buf = String::new();\n        buf.drain(0..0);",
     );
     expect_hit(&s, TASKS_PANEL, "手書きのカーソル操作");
+
+    // (9) 右パネルの入力が手書きのカーソル操作へ戻る（#1459 で移した 2 本の逆戻り）
+    let mut s = Sources::load(&root);
+    let (_, window) = fn_window(&s.right_panel, "fn handle_git_branch_input_key(").expect("窓");
+    s.right_panel = s.right_panel.replace(
+        &window,
+        &window.replace(
+            "            key => {",
+            "            key => {\n                let prev = \"\".char_indices().next_back();",
+        ),
+    );
+    expect_hit(&s, RIGHT_PANEL, "手書きのカーソル操作");
+
+    // (10) 右パネルの打鍵ハンドラが `TextField` を通さなくなる
+    let mut s = Sources::load(&root);
+    let (_, window) = fn_window(&s.right_panel, "fn handle_git_commit_key(").expect("窓");
+    s.right_panel = s.right_panel.replace(
+        &window,
+        &window.replace("handle_edit_key", "handle_git_commit_edit_key"),
+    );
+    expect_hit(
+        &s,
+        RIGHT_PANEL,
+        "`TextField::handle_edit_key` を通していない",
+    );
+
+    // (11) 丸めがモジュール外へ公開される（呼べる場所が増えると手書きが再び生える）
+    let mut s = Sources::load(&root);
+    s.text_field = s.text_field.replace(
+        "fn floor_char_boundary(",
+        "pub(crate) fn floor_char_boundary(",
+    );
+    expect_hit(&s, TEXT_FIELD, "モジュール外へ公開");
 }
 
 /// 注入した材料で走査し、**その file:line と理由**が名指しされることを確かめる
