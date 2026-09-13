@@ -916,8 +916,9 @@ tako todo done u-1              # 片付いた / dismiss なら「やらない�
 - master 側の作法は `tako orchestrator guide user-tasks`。
   **引き継ぎファイルの「ユーザー確認待ち」はこの機能へ移す**（会話や md に溜めない）
 
-PC の画面（右パネル）とスマホ（PWA の `#/tasks`）は別 Issue（#1450 の B2 / B3）で、
-どちらもこの CLI / MCP と同じ 1 実装を叩く。
+同じものを **PC の右パネル**（`tako panel --show --view tasks` = #1450 B2）と
+**スマホ**（PWA の `#/tasks` = #1450 B3）からも読める。どちらもこの CLI / MCP と
+同じ 1 実装（`Request::UserTask`）を叩くので、どこから片付けても結果は同じ。
 
 ## 手順書（`tako orchestrator guide <topic>`。Issue #1154）
 
