@@ -45,6 +45,27 @@ pub fn device_node(node: &str) -> String {
 pub fn choose_role() -> &'static str {
     tr!("許可する権限を選択:", "Choose the permission to grant:")
 }
+/// 「observe から interact へ」（#1452。押す前に何が変わるか分かる）
+pub fn role_change_line(current: &str, requested: &str) -> String {
+    tr!(
+        format!("権限: {current} から {requested} へ"),
+        format!("Permission: {current} to {requested}")
+    )
+}
+
+/// 端末が書いた理由（#1452。**監査ログには残らない**値なのでここでだけ読める）
+pub fn request_reason(reason: &str) -> String {
+    tr!(
+        format!("端末が書いた理由: {reason}"),
+        format!("Reason given by the device: {reason}")
+    )
+}
+
+/// 端末一覧カードから設定 → リモートへの導線（#1452）
+pub fn edit_roles() -> &'static str {
+    tr!("端末の権限を編集…", "Edit device permissions…")
+}
+
 pub fn deny() -> &'static str {
     tr!("拒否", "Deny")
 }
@@ -274,6 +295,10 @@ mod tests {
                 stop_confirm_yes().to_string(),
                 stop_failed().to_string(),
                 indicator_stopping().to_string(),
+                // #1452 の権限リクエスト
+                role_change_line("observe", "interact"),
+                request_reason("need logs"),
+                edit_roles().to_string(),
             ]
         });
     }

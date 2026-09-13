@@ -150,6 +150,7 @@ tako/
 | **リモート閲覧のショートカット（お気に入り。#1451）** | `tako remote shortcuts [add <path>\|remove <path\|id>]` |
 | **リモートファイルの編集・保存（#966 / #65）** | `put` |
 | **リモート公開の自己検査と自動復旧（#1049）** | `tako remote status` |
+| **リモート端末の権限（一覧・降格・削除。上げるのは画面だけ。#1452）** | `tako remote devices list` / `role <id> <role>` / `revoke <id>` |
 | プレビュー目次操作 | `tako preview-outline [--pane N] [--item N]` |
 | プレビュー内リンク（#680 / #271） | `tako preview-link-list` |
 | Markdown コードブロックのコピー（#680） | `tako preview-copy-code [index]` |

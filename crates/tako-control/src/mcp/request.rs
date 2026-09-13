@@ -714,8 +714,9 @@ pub(super) fn build_request(
             tail: u64_arg(args, "tail")?.map(|n| n as usize),
         },
         "tako_remote_devices" => Request::RemoteDevices {
-            action: str_arg(args, "action")?.ok_or("action を指定する（list / revoke）")?,
+            action: str_arg(args, "action")?.ok_or("action を指定する（list / revoke / role）")?,
             device_id: str_arg(args, "device_id")?,
+            role: str_arg(args, "role")?,
         },
         "tako_remote_shortcuts" => Request::RemoteShortcuts {
             action: str_arg(args, "action")?.unwrap_or_else(|| "list".to_string()),

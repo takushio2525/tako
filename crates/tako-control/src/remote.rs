@@ -3245,6 +3245,73 @@ pub fn admin_request(method: &str, path: &str, body: Option<&Value>) -> Result<V
     Ok(value)
 }
 
+/// #1452 の A/B。`TAKO_1452_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
+/// （登録済み端末に承認待ちを返さず・依頼の起票もしない = 「送ったことに気づけない」の再現）。
+///
+/// **安全側のゲート（昇格の方向判定と呼び出し元の検証）はこのアームでも外れない**。
+/// A/B は導線と通知のためだけのもので、権限の境界を緩める逃げ道にはしない
+pub fn legacy_1452() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_1452_LEGACY").map(|v| v == "1") == Ok(true))
+}
+
+/// デバイスの role を**弱める**（CLI `tako remote devices role` / MCP / dispatch から使う）。
+///
+/// # ここが「AI からは上げられない」の 1 段目（#1452）
+///
+/// **この関数は自分で昇格を断る**。daemon 側の呼び出し元ゲート
+/// （[`crate::remote_role::verify_admin_caller`]）だけに任せてはいけない:
+/// MCP と CLI の IPC は **tako-app の中の dispatch** で実行されるので、そこから
+/// `admin_request` を撃つと daemon には「tako-app からの接続」に見える = GUI と
+/// 区別が付かない。だから**方向の判断は daemon へ行く前に済ませ**、ここには
+/// `CallerCheck::NotGui` で問うた答えだけを通す。
+///
+/// 2 段目（daemon 側のゲート）は、この関数を通らない呼び出し —— 管理トークンを
+/// 読んで直接 HTTP を撃つプロセス —— を止める。**どちらか片方では穴が残る**。
+///
+/// 上げる操作は tako の画面（承認ダイアログ / 設定 → リモート）が `admin_request` を
+/// 直接叩く経路だけが持つ。dispatch から届くのがこの関数だけであることは
+/// 番犬 `issue1452_role_grant_watchdog` がソース走査で縛る。
+///
+/// daemon 稼働中は admin API（接続中 WS の切断込み）、停止中はレジストリ直接編集
+pub fn devices_set_role(device_id: &str, role_str: &str) -> Result<Value, String> {
+    let next = crate::remote_auth::DeviceRole::parse(role_str)
+        .ok_or_else(|| format!("不正な role: {role_str}（observe / interact / manage / admin）"))?;
+    let running = daemon_status()["running"].as_bool() == Some(true);
+    // 現 role は daemon 稼働中でも**同じ答え**（稼働中は admin state、停止中は
+    // devices.json。どちらも `devices_list` の 1 実装が吸収する）
+    let current = devices_list()?["devices"]
+        .as_array()
+        .and_then(|list| {
+            list.iter()
+                .find(|d| d["id"].as_str() == Some(device_id))
+                .and_then(|d| d["role"].as_str())
+                .and_then(crate::remote_auth::DeviceRole::parse)
+        })
+        .ok_or_else(|| format!("登録されていないデバイス: {device_id}"))?;
+    let change = crate::remote_role::classify(Some(current), next);
+    if let crate::remote_role::GrantDecision::Deny { message, .. } =
+        crate::remote_role::decide(change, crate::remote_role::CallerCheck::NotGui)
+    {
+        return Err(message);
+    }
+    if running {
+        // 弱める側だけが HTTP へ行く（接続中 WS の切断と監査は daemon 側で起こる）
+        return admin_request(
+            "POST",
+            "/api/admin/devices/role",
+            Some(&json!({ "device_id": device_id, "role": next.as_str() })),
+        );
+    }
+    let mut reg = DeviceRegistry::open(&state_dir())?;
+    let (device, _) = reg.set_role(device_id, next)?;
+    Ok(json!({
+        "changed": true,
+        "change": change.as_str(),
+        "device": device_json(&device),
+    }))
+}
+
 /// 登録済みデバイスの一覧（CLI `tako remote devices list` / MCP / GUI から使う）。
 /// daemon 稼働中は admin API（接続状態込み）、停止中は devices.json を直接読む
 pub fn devices_list() -> Result<Value, String> {
@@ -4461,7 +4528,7 @@ fn handle_request_v2(
                 Some(json!({ "error": "管理 API はローカルの管理トークンが必要" }).to_string()),
             );
         }
-        return handle_admin_api(request, &method, &path, ctx, broadcasters);
+        return handle_admin_api(request, &method, &path, ctx, app_conn, broadcasters);
     }
 
     // --- 層①: tailnet identity 検証（serve 経由の実在ノードのみ通す）---
@@ -4500,20 +4567,40 @@ fn handle_request_v2(
     if path == "/api/me" && method == tiny_http::Method::Get {
         let mut reg = ctx.registry.lock().unwrap();
         let body = match reg.device(&who.stable_id).cloned() {
-            Some(device) => json!({
-                "registered": true,
-                "device_id": device.id,
-                "name": device.name,
-                "role": device.role.as_str(),
-                "login": device.login,
-                "host": hostname(),
-                "version": env!("CARGO_PKG_VERSION"),
-                "app_connected": app_conn
-                    .read()
-                    .ok()
-                    .and_then(|c| c.client.as_ref().map(|_| true))
-                    .unwrap_or(false),
-            }),
+            Some(device) => {
+                // #1452: **登録済みでも**承認待ちを返す。これが無いと、権限の更新を
+                // リクエストしたスマホが「送れたのか」を知る手段が無い（以前は
+                // 未登録端末の枝にしか pending / denied が入っていなかった）
+                let pending = reg.pending_of(&device.id).cloned();
+                let denied = pending.is_none() && reg.recently_denied(&device.id);
+                let mut body = json!({
+                    "registered": true,
+                    "device_id": device.id,
+                    "name": device.name,
+                    "role": device.role.as_str(),
+                    "login": device.login,
+                    "host": hostname(),
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "app_connected": app_conn
+                        .read()
+                        .ok()
+                        .and_then(|c| c.client.as_ref().map(|_| true))
+                        .unwrap_or(false),
+                });
+                // A/B: 旧挙動（登録済みには何も返さない = 送ったことに気づけない）へ
+                // 同一バイナリのまま戻す。**安全側のゲートはこのアームでも外れない**
+                if !legacy_1452() {
+                    if let Some(obj) = body.as_object_mut() {
+                        obj.insert("pending".into(), json!(pending.is_some()));
+                        obj.insert("denied".into(), json!(denied));
+                        if let Some(p) = &pending {
+                            obj.insert("requested_role".into(), json!(p.requested_role.as_str()));
+                            obj.insert("requested_at".into(), json!(p.requested_at));
+                        }
+                    }
+                }
+                body
+            }
             None => {
                 let pending = reg.pending().iter().any(|p| p.device_id == who.stable_id);
                 json!({
@@ -4537,6 +4624,9 @@ fn handle_request_v2(
             }
         };
         let name = parsed["name"].as_str().unwrap_or("").to_string();
+        // #1452: 端末が書いた理由。整形は `remote_role::sanitize_reason` の 1 実装で、
+        // **監査ログには載せない**（FR-6.8）。出すのは承認ダイアログとタスクの本文だけ
+        let reason = parsed["reason"].as_str().unwrap_or("").to_string();
         let role_str = parsed["role"].as_str().unwrap_or("observe");
         let Some(role) = DeviceRole::parse(role_str) else {
             return respond(
@@ -4548,11 +4638,38 @@ fn handle_request_v2(
                 ),
             );
         };
-        let result = ctx
-            .registry
-            .lock()
-            .unwrap()
-            .request_pairing(&who, &name, role);
+        // レジストリのロックは**要求を作るところまで**で外す。起票は daemon → app の
+        // IPC 往復なので、ロックを抱えたまま行くと他のリクエストが全部待たされる
+        let (result, upgrade) = {
+            let mut reg = ctx.registry.lock().unwrap();
+            let current = reg.device(&who.stable_id).map(|d| d.role);
+            let result = reg.request_pairing(&who, &name, role, &reason);
+            let upgrade = reg
+                .pending_of(&who.stable_id)
+                .filter(|p| p.kind == crate::remote_auth::RequestKind::Upgrade)
+                .map(|p| (p.name.clone(), p.requested_role, p.reason.clone()));
+            (result, upgrade.map(|(n, r, why)| (n, current, r, why)))
+        };
+        // 昇格の依頼だけをユーザータスク（#1450 kind=permission）へ起票する。
+        // 新規ペアリング（kind=Pair）は #283 の承認ダイアログのままにする（挙動を変えない）
+        if let Some((dev_name, current, requested, why)) = upgrade {
+            if !legacy_1452() {
+                let outcome = crate::remote_role::file_upgrade_task(
+                    app_conn,
+                    &who.stable_id,
+                    &dev_name,
+                    current,
+                    requested,
+                    &why,
+                );
+                // 無言で落とさない（#1399 系の物差し）。**理由の本文は診断に出さない**
+                crate::diag::persist_log(&format!(
+                    "リモート権限の依頼: 要求={} 起票={}",
+                    requested.as_str(),
+                    outcome.code()
+                ));
+            }
+        }
         return respond_sensitive(request, 200, Some(result.to_string()));
     }
 
@@ -4655,6 +4772,12 @@ fn handle_request_v2(
 
 /// パス・メソッドから必要 role を決める（強い role は弱い role の操作を包含する）
 fn required_role(method: &tiny_http::Method, path: &str) -> DeviceRole {
+    // #1452: role を動かす / 端末を管理する経路は宣言表が正（`remote_role::ROLE_ROUTES`）。
+    // 表が実際の認可を決めるので、番犬が「昇格経路が増えていないか」を同じ表で見られる
+    if let Some(role) = crate::remote_role::device_role_for(method.as_str(), path) {
+        return role;
+    }
+    // 表に無い形の `/api/devices*` も Admin のまま（未知の枝が下の Observe へ落ちない）
     if path.starts_with("/api/devices") {
         return DeviceRole::Admin;
     }
@@ -4712,14 +4835,21 @@ fn authorize_device_checked(
 }
 
 /// 管理 API のルーティング（check_admin 通過後に呼ばれる）。
-/// ペアリング承認・拒否はここだけ = Mac 側 GUI（+ 同一ユーザーのローカルプロセス）限定
+///
+/// 管理トークンは 0600 = **同一ユーザーなら誰でも読める**ので、ここへ来られること自体は
+/// 「PC の人が押した」ことを意味しない。**role を上げる操作だけ**は接続元プロセスを
+/// 引いて tako-app からの呼び出しかを確かめる（#1452。判断は `remote_role::decide`）
+#[allow(clippy::too_many_arguments)]
 fn handle_admin_api(
     mut request: tiny_http::Request,
     method: &tiny_http::Method,
     path: &str,
     ctx: &Arc<DaemonCtx>,
+    app_conn: &Arc<RwLock<AppConnection>>,
     broadcasters: &BroadcasterMap,
 ) {
+    // read_json_body が request を消費する前に接続元を採っておく
+    let peer = request.remote_addr().copied();
     match (method.clone(), path) {
         // 状態スナップショット（GUI の 2 秒ポーリング先）
         (tiny_http::Method::Get, "/api/admin/state") => {
@@ -4737,6 +4867,10 @@ fn handle_admin_api(
                         "requested_role": p.requested_role.as_str(),
                         "kind": p.kind,
                         "requested_at": p.requested_at,
+                        // #1452: 承認ダイアログが「なぜ要るのか」を出せるようにする
+                        "reason": p.reason,
+                        // 今の role（承認ダイアログが「observe → interact」と書ける）
+                        "current_role": reg.device(&p.device_id).map(|d| d.role.as_str()),
                     })
                 })
                 .collect();
@@ -4767,9 +4901,41 @@ fn handle_admin_api(
                 );
             };
             let role = parsed["role"].as_str().and_then(DeviceRole::parse);
+            // #1452: 承認は role を**上げうる**経路なので、上げる向きのときだけ
+            // 接続元が tako-app かを確かめる（管理トークンだけでは GUI と CLI を
+            // 区別できない）。据え置き・降格の承認は誰でも通る
+            let decision = {
+                let reg = ctx.registry.lock().unwrap();
+                let current = reg.device(device_id).map(|d| d.role);
+                let next = role.or_else(|| reg.pending_of(device_id).map(|p| p.requested_role));
+                next.map(|next| {
+                    let change = crate::remote_role::classify(current, next);
+                    let caller = crate::remote_role::verify_admin_caller(&ctx.endpoint, peer);
+                    (change, caller, crate::remote_role::decide(change, caller))
+                })
+            };
+            if let Some((
+                change,
+                caller,
+                crate::remote_role::GrantDecision::Deny { code, message },
+            )) = &decision
+            {
+                audit_role_denied(ctx, device_id, "approve", change, *caller, code);
+                return respond(
+                    request,
+                    403,
+                    Some(json!({ "error": message, "kind": code }).to_string()),
+                );
+            }
             let result = ctx.registry.lock().unwrap().approve(device_id, role);
             match result {
                 Ok(device) => {
+                    if let Some((change, caller, _)) = &decision {
+                        audit_role_allowed(ctx, &device, "approve", change, *caller);
+                    }
+                    // 決着した依頼のユーザータスクを閉じる（#1450 kind=permission）。
+                    // **閉じても権限は動かない**（逆向きの経路はどこにも無い）
+                    let _ = crate::remote_role::resolve_upgrade_task(app_conn, device_id, true);
                     notify_desktop(&format!(
                         "{} を {} として登録しました",
                         device.name,
@@ -4803,7 +4969,93 @@ fn handle_admin_api(
             };
             let result = ctx.registry.lock().unwrap().deny(device_id);
             match result {
-                Ok(()) => respond(request, 200, Some(json!({ "denied": true }).to_string())),
+                Ok(()) => {
+                    let _ = crate::remote_role::resolve_upgrade_task(app_conn, device_id, false);
+                    respond(request, 200, Some(json!({ "denied": true }).to_string()))
+                }
+                Err(e) => respond(request, 404, Some(json!({ "error": e }).to_string())),
+            }
+        }
+        // role の直接変更（#1452）。**降格は誰でも / 昇格は tako-app からだけ**。
+        // 保留を介さないので、承認ダイアログが消えたあとでも設定画面から与えられる
+        (tiny_http::Method::Post, "/api/admin/devices/role") => {
+            let parsed = match read_json_body(&mut request) {
+                Ok(v) => v,
+                Err(e) => {
+                    return respond(request, 400, Some(json!({ "error": e }).to_string()));
+                }
+            };
+            let Some(device_id) = parsed["device_id"].as_str() else {
+                return respond(
+                    request,
+                    400,
+                    Some(json!({ "error": "device_id が必要" }).to_string()),
+                );
+            };
+            let role_str = parsed["role"].as_str().unwrap_or("");
+            let Some(next) = DeviceRole::parse(role_str) else {
+                return respond(
+                    request,
+                    400,
+                    Some(
+                        json!({ "error": format!("不正な role: {role_str}（observe / interact / manage / admin）") })
+                            .to_string(),
+                    ),
+                );
+            };
+            let (change, caller, verdict) = {
+                let reg = ctx.registry.lock().unwrap();
+                let Some(current) = reg.device(device_id).map(|d| d.role) else {
+                    drop(reg);
+                    return respond(
+                        request,
+                        404,
+                        Some(
+                            json!({ "error": format!("登録されていないデバイス: {device_id}") })
+                                .to_string(),
+                        ),
+                    );
+                };
+                let change = crate::remote_role::classify(Some(current), next);
+                let caller = crate::remote_role::verify_admin_caller(&ctx.endpoint, peer);
+                (change, caller, crate::remote_role::decide(change, caller))
+            };
+            if let crate::remote_role::GrantDecision::Deny { code, message } = &verdict {
+                audit_role_denied(ctx, device_id, "set_role", &change, caller, code);
+                return respond(
+                    request,
+                    403,
+                    Some(json!({ "error": message, "kind": code }).to_string()),
+                );
+            }
+            let result = ctx.registry.lock().unwrap().set_role(device_id, next);
+            match result {
+                Ok((device, resolved)) => {
+                    audit_role_allowed(ctx, &device, "set_role", &change, caller);
+                    // 弱めたなら、その role では通らなくなった WS を切る（#283 の revoke と
+                    // 同じ扱い。**繋ぎっぱなしの端末に古い権限が残らない**）
+                    if change == crate::remote_role::RoleChange::Downgrade {
+                        disconnect_device_ws(broadcasters, device_id);
+                    }
+                    // 人が明示的に決めたので、残っていた依頼は畳む
+                    if resolved.is_some() {
+                        let approved = change != crate::remote_role::RoleChange::Downgrade;
+                        let _ =
+                            crate::remote_role::resolve_upgrade_task(app_conn, device_id, approved);
+                    }
+                    respond(
+                        request,
+                        200,
+                        Some(
+                            json!({
+                                "changed": true,
+                                "change": change.as_str(),
+                                "device": device_json(&device),
+                            })
+                            .to_string(),
+                        ),
+                    )
+                }
                 Err(e) => respond(request, 404, Some(json!({ "error": e }).to_string())),
             }
         }
@@ -4842,6 +5094,61 @@ fn handle_admin_api(
             404,
             Some(json!({ "error": "管理 API エンドポイントが見つからない" }).to_string()),
         ),
+    }
+}
+
+/// role を動かす操作を断ったことを監査へ残す（#1452）。
+///
+/// **残すのは種別だけ**（端末 id / 名前 / 方向 / 呼び出し元の分類 / 理由コード）。
+/// 理由の本文・トークン・ヘッダの中身は載せない（FR-6.8 の維持）
+fn audit_role_denied(
+    ctx: &DaemonCtx,
+    device_id: &str,
+    op: &str,
+    change: &crate::remote_role::RoleChange,
+    caller: crate::remote_role::CallerCheck,
+    code: &str,
+) {
+    if let Ok(reg) = ctx.registry.lock() {
+        let name = reg
+            .device(device_id)
+            .map(|d| d.name.clone())
+            .unwrap_or_default();
+        reg.audit(
+            "role_change_denied",
+            device_id,
+            &name,
+            json!({ "op": op, "change": change.as_str(), "caller_check": caller.code(), "reason": code }),
+        );
+    }
+    crate::diag::persist_log(&format!(
+        "リモート権限の変更を拒否: op={op} 方向={} 呼び出し元={} 理由={code}",
+        change.as_str(),
+        caller.code()
+    ));
+}
+
+/// role を動かした（許した）ことを監査へ残す。`caller_check` を必ず載せるのは、
+/// ゲートを**引けなかった**（`unavailable`）通過を後から数えられるようにするため
+fn audit_role_allowed(
+    ctx: &DaemonCtx,
+    device: &crate::remote_auth::Device,
+    op: &str,
+    change: &crate::remote_role::RoleChange,
+    caller: crate::remote_role::CallerCheck,
+) {
+    if let Ok(reg) = ctx.registry.lock() {
+        reg.audit(
+            "role_change_allowed",
+            &device.id,
+            &device.name,
+            json!({
+                "op": op,
+                "change": change.as_str(),
+                "caller_check": caller.code(),
+                "role": device.role.as_str(),
+            }),
+        );
     }
 }
 
@@ -6297,7 +6604,7 @@ mod tests {
         };
         let mut registry = DeviceRegistry::open(&dir).expect("レジストリ");
         registry.cache_whois("100.64.0.9", who.clone());
-        registry.request_pairing(&who, "phone", DeviceRole::Admin);
+        registry.request_pairing(&who, "phone", DeviceRole::Admin, "");
         registry
             .approve(&who.stable_id, Some(DeviceRole::Admin))
             .expect("承認");

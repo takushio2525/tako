@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-13（#1441: 深い data dir でも IPC が立つようにし、立たないときは黙らせない）
-- ソケットの実体を data dir 直下から外し、`tako_core::ipc_socket` の 1 実装（`<data_dir>/tako.sock` が `sun_path` に収まればそのまま / 収まらなければ `$TMPDIR/tako-<data dir の 16 桁 FNV-1a>.sock` → `/tmp`）へ寄せた。data dir 側には参照 `tako.sock.path` だけ。**symlink では解決しない**（上限は繋ぐ側の `connect()` に掛かる）
-- 実測 A/B（tako-vd 上の隔離 GUI・data dir 150 バイト）: 新 = 受け口 75 バイト・`tako list` exit 0 / `TAKO_1441_LEGACY=1` = `path must be shorter than SUN_LEN` の 1 行のみ・discovery 空・`tako list` exit 1（#782 の症状の再現）。浅い data dir は固定パスのまま不変。深い `$TMPDIR`（110 バイト）は `/tmp/tako-<hash>.sock`（31 バイト）へ
-- bind の成否を記録して `check_health` の `ipc` 節 + 通知欄（`notify_ui_failure` の 1 実装）へ。CLI は `tako check-health`（新設・MCP と 1:1）で、**届かないときはローカルの受け口診断**を返す。番犬 8 本 + 統合 1 本・注入 8 通りで file:line 名指し FAILED。**install 要**。**罠**: `scripts/check-windows.sh` は `tests/` を見ていなかったので統合テストの `cfg(unix)` 漏れを**手元 error 0・CI の Windows だけ赤**で通していた（#1264 の `--no-run` が E0433 を 2 件）→ `--all-targets` を既定にし、同じ注入で旧 = 0 件 / 新 = 名指し検出を実測
-
 ## 2026-09-13（#1442: 窓の位置・寸法を tako 自身の口で決められるようにした）
 - `TAKO_DISPLAY` つきの隔離起動は保存フレームを無視して必ず中央 960x600 で開き、AX で動かすと本番 tako の窓に当たっていた。起動時 `TAKO_WINDOW_BOUNDS=x,y,w,h`（`w,h` だけなら中央）と `tako window move` / `resize`（MCP 1:1）を足し、解釈・検査は `tako_core::platform::window_bounds::resolve` の 1 実装へ。`window list` に `bounds` / `display` を載せて AX 無しで読めるようにした
 - 実測（tako-vd = 1512,0 の 2560x1440・CGWindowList）: 修正前は保存フレーム 200,100,1400,900 があっても `2312,420,960,600` / 新 `100,50,1400,900` → `1612,50,1400,900` / `TAKO_1442_LEGACY=1` は `2312,420,960,600`。はみ出し・最小未満・読めない形は既定へ落ちて persist.log に理由（CLI / MCP はエラー）。**罠**: `move` 直後の `resize` が render 待ちの古い位置を土台にして移動を打ち消す（セルフテスト項目 77b が実際に落ちた）ので、依頼した矩形はその場で `window_frames` へ記録する
@@ -54,3 +49,8 @@
 - 新しい永続状態を 1 つも足さず、**ペインの role ラベル 1 つ**の書き換えで実現（`resolve_master_profile` が非既定の pane_role を優先する #854 が土台。role は layout.json に載るので GUI 再起動もまたぐ）。`self` / spawn 既定 / `handoff` の後任と宛先 / 自動ハンドオフ #749 は既存の 1 実装のまま追従。`projects add` は `profiles/<key>.yaml` を default から継承して作り（管轄と cwd だけ差し替え・冪等）、既存プロジェクトは migration の登録簿（`FileOutcome::Created` を新設）で揃う
 - 実測（tako-vd 上の隔離 GUI・A〜G）: 生成 → 採用 → spawn 制限 → 引き継ぎまで通し。採用で `pane_id` 不変のまま `profile` が `default` → `<key>`・`successor_command="tako master -<key>"`・管轄外 spawn は `projects 制限` で拒否。`TAKO_1453_LEGACY=1` は生成も採用も起きず修正前を再現。拒否の 2 種（専用起動 master / `master_agent` の食い違い）は直す 1 コマンド付き
 - **罠**: CLI の `projects add` が dispatch の写しを持っていて**MCP からだけ生成が効いていた**（実測で発覚）→ 1 本へ寄せ、番犬で縛った。system prompt は 19,679 → 19,912 B（予算 24,576 B 内）。番犬 4 本（注入 7 通りで file:line 名指し）+ 単体 14 本・セルフテスト項目 149（legacy 腕は 149a で FAILED）。workspace 4695 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。**install 要**
+
+## 2026-09-14（#1452: 権限が足りませんに導線を付け、端末ごとの権限編集を PC へ置いた）
+- スマホは #283 からある `POST /api/pair` を押せる場所に出しただけ（**新 API は `POST /api/admin/devices/role` の 1 本**）。`GET /api/me` が登録済み端末にも `pending` / `requested_role` / `denied` を返すようにし、承認待ちの間だけ 2 秒ポーリング → 承認で**再読込なしで**続きができる。導線は `permission-request.jsx` へ切り出し `files.jsx` は 2 行差分（#1451 との衝突回避）
+- 昇格を PC の人へ縛るのは 3 段: 方向（403 `upgrade_requires_gui`）/ 接続元プロセスの名前ゲート（#841 の `procinfo` を流用）/ **dispatch の手前での拒否**（MCP・CLI の IPC は tako-app の中で走るので名前ゲートだけでは AI を止められない = 実装中に見つけた穴）。経路表は `remote_role::ROLE_ROUTES`、依頼は `tako todo`（kind=permission）へ 1 件（**授権の正本は daemon のメモリのまま** = done しても権限は動かない）
+- 実測 `scripts/test-remote-role-1452.sh` **58 PASS 0 FAIL**（CLI / MCP / curl の昇格が全部拒否・GUI を名乗った承認だけ 200・監査に `caller_check`・再起動をまたいで記録だけ残る）・e2e 71 passed（新 10 本）・番犬 9 本。**罠**: 承認にゲートが掛かったので #1449 / #1078 の実経路テストが全 403 になる（`TAKO_REMOTE_TRUSTED_ADMIN_NAMES` を宣言して復旧 = #841 と同じ形）。**install 要 / 本番 daemon 再起動要**

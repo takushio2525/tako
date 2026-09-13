@@ -989,6 +989,41 @@ body {
 .empty-state p { color: var(--fg2); font-size: 14px; max-width: 280px; line-height: 1.6; }
 
 /* ============================================================
+   Permission request (#1452)
+   「権限が足りません」からその場でリクエストするための最小の組み。
+   .empty-state の中に置くので、幅だけ広げて中身を左寄せにする
+   ============================================================ */
+
+.permission-label {
+  display: block; width: 100%; max-width: 320px; text-align: left;
+  font-family: var(--mono); font-size: 10px; color: var(--fg3);
+  letter-spacing: .05em; text-transform: uppercase;
+  margin: 16px 0 6px;
+}
+.permission-roles {
+  display: flex; flex-direction: column; gap: 7px;
+  width: 100%; max-width: 320px;
+}
+.permission-role {
+  display: flex; flex-direction: column; gap: 1px;
+  border: 1px solid var(--line); border-radius: 13px;
+  padding: 11px 14px; background: none; color: var(--fg);
+  text-align: left; cursor: pointer;
+}
+.permission-role.is-selected { border-color: var(--claude); background: var(--panel3); }
+.permission-role-name { font-family: var(--mono); font-size: 13px; font-weight: 600; }
+.permission-role-desc { font-size: 11px; color: var(--fg2); }
+.permission-reason {
+  width: 100%; max-width: 320px; padding: 10px 14px;
+  border-radius: 13px; border: 1px solid var(--line);
+  background: var(--panel); color: var(--fg);
+  font-family: var(--mono); font-size: 13px; outline: none;
+}
+.empty-state .permission-reason + .btn,
+.empty-state .error-text + .btn { margin-top: 16px; }
+.empty-state .btn { margin-top: 16px; }
+
+/* ============================================================
    Approval card (1b)
    ============================================================ */
 

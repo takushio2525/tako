@@ -135,6 +135,7 @@ export function App() {
         root={route.params.get('root') || ''}
         path={route.params.get('path') || ''}
         hint={route.params.get('kind') || ''}
+        onMeRefresh={refreshMe}
       />
     );
   } else {

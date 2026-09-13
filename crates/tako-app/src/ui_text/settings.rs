@@ -889,9 +889,79 @@ pub fn remote_devices_header() -> &'static str {
 
 pub fn desc_remote_devices() -> &'static str {
     tr!(
-        "登録済みの端末数を確認する",
-        "Check how many devices are paired"
+        "端末ごとに権限を選び直す・登録を消す。権限を上げられるのはこの画面と承認ダイアログだけで、CLI / MCP からは下げることしかできない",
+        "Change each device's permission or remove it. Raising a permission is only possible here and in the approval dialog — the CLI and MCP can only lower it"
     )
+}
+
+// --- 端末ごとの権限編集（#1452）---
+
+pub fn remote_pending_header() -> &'static str {
+    tr!("承認待ちの要求", "Requests waiting for you")
+}
+
+/// 「phone-a: observe → interact」。`current` が空なら新規ペアリング
+pub fn remote_pending_line(name: &str, current: &str, requested: &str) -> String {
+    let name = if name.trim().is_empty() {
+        crate::ui_text::remote::unnamed_device()
+    } else {
+        name
+    };
+    if current.is_empty() {
+        tr!(
+            format!("{name}: 新規ペアリング（{requested} を要求）"),
+            format!("{name}: new device (requesting {requested})")
+        )
+    } else {
+        tr!(
+            format!("{name}: {current} から {requested} へ"),
+            format!("{name}: {current} to {requested}")
+        )
+    }
+}
+
+pub fn remote_pending_reason(reason: &str) -> String {
+    tr!(
+        format!("端末が書いた理由: {reason}"),
+        format!("Reason given by the device: {reason}")
+    )
+}
+
+/// 承認の口は承認ダイアログ 1 つに保つので、ここでは次の一手だけを案内する
+pub fn remote_pending_hint() -> &'static str {
+    tr!(
+        "承認ダイアログで許可するか、下の一覧でこの端末の権限を選び直してください",
+        "Allow it in the approval dialog, or pick a new permission for the device below"
+    )
+}
+
+pub fn remote_forget() -> &'static str {
+    tr!("登録を消す", "Remove")
+}
+
+pub fn remote_no_devices() -> &'static str {
+    tr!(
+        "ペアリング済みの端末はまだありません",
+        "No devices are paired yet"
+    )
+}
+
+/// 「phone-a（user@example.com）」
+pub fn remote_device_label(name: &str, login: &str) -> String {
+    let name = if name.trim().is_empty() {
+        crate::ui_text::remote::unnamed_device()
+    } else {
+        name
+    };
+    if login.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name}（{login}）")
+    }
+}
+
+pub fn remote_device_desc(device_id: &str) -> String {
+    tr!(format!("ID: {device_id}"), format!("ID: {device_id}"))
 }
 
 // --- 高度タブ ---
@@ -1543,6 +1613,15 @@ mod tests {
                 remote_setup_not_ready().into(),
                 remote_devices_header().into(),
                 desc_remote_devices().into(),
+                // #1452: 端末ごとの権限編集
+                remote_pending_header().into(),
+                remote_pending_line("phone-a", "", "interact"),
+                remote_pending_line("phone-a", "observe", "interact"),
+                remote_pending_reason("need logs"),
+                remote_pending_hint().into(),
+                remote_forget().into(),
+                remote_no_devices().into(),
+                remote_device_desc("nDEVICE"),
                 advanced_editor_header().into(),
                 advanced_edit_help(crate::ui_text::tests_support::mac_modifier()),
                 advanced_edit_help(None),
