@@ -207,6 +207,54 @@ impl PanelViewWire {
         }
     }
 
+    /// 各ビューの説明（**MCP のツール説明の正本**。#1467）。
+    ///
+    /// `match` なので変種を足すと**コンパイルが通らない** = 説明の追従漏れが起きない。
+    /// 手書きの写しを catalog 側に作らないための土台（写しは `tasks` の追加に
+    /// 追従せず、MCP からだけ存在を知れないビューになっていた）
+    pub fn summary(self) -> &'static str {
+        match self {
+            PanelViewWire::Fleet => {
+                "タブごとの全ペイン一覧 + 管理外 / kill 漏れ tmux セッションの統合ビュー"
+            }
+            PanelViewWire::Orch => "オーケストレーター俯瞰（master + worker のツリー）",
+            PanelViewWire::Git => "git（差分・ステージ・コミット・ブランチ）",
+            PanelViewWire::Tasks => "人がやること（承認待ち・レビュー・投稿）の一覧と返答",
+        }
+    }
+
+    /// CLI の possible values / MCP の inputSchema の enum が共有する受理値の全件
+    /// （正式値 + 後方互換の旧称。#1467）
+    pub fn accepted_values() -> Vec<&'static str> {
+        Self::VALUES
+            .iter()
+            .copied()
+            .chain(Self::LEGACY_VALUES.iter().map(|(old, _)| *old))
+            .collect()
+    }
+
+    /// 「値 = 説明」を [`VALUES`] の並びで連ねた 1 行（MCP のツール説明に埋める。#1467）
+    ///
+    /// [`VALUES`]: PanelViewWire::VALUES
+    pub fn values_summary() -> String {
+        Self::VALUES
+            .iter()
+            .map(|v| {
+                // VALUES は必ず parse を通る（`valuesは全件parseを通る` が固定する）
+                let view = Self::parse(v).expect("VALUES の値は parse を通る");
+                let summary = view.summary();
+                // 日本語の直後に英字が来るときだけ空白を入れる（「はgit」を避ける）
+                let sep = if summary.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+                    " "
+                } else {
+                    ""
+                };
+                format!("view={v} は{sep}{summary}")
+            })
+            .collect::<Vec<_>>()
+            .join("、")
+    }
+
     /// 不正値を弾くときに添える案内（GUI 表示名を先に出し、旧称は括弧で補足。#553 案 2）
     pub fn values_hint() -> String {
         let legacy = Self::LEGACY_VALUES
@@ -2465,6 +2513,40 @@ mod tests {
     fn panel_viewの案内文は表示名と旧称の対応を含む() {
         let hint = PanelViewWire::values_hint();
         assert_eq!(hint, "fleet | orch | git | tasks。tmux は fleet の旧称");
+    }
+
+    /// `values_summary` の `expect` が論理的に到達不能であることを固定する（#1467）
+    #[test]
+    fn valuesは全件parseを通る() {
+        for v in PanelViewWire::VALUES {
+            assert!(
+                PanelViewWire::parse(v).is_some(),
+                "VALUES の {v} が parse を通らない（values_summary が panic する）"
+            );
+        }
+    }
+
+    /// MCP の enum が読む受理値は「正式値 + 旧称」（CLI の possible values と同じ並び。#1467）
+    #[test]
+    fn accepted_valuesは正式値のあとに旧称を並べる() {
+        assert_eq!(
+            PanelViewWire::accepted_values(),
+            vec!["fleet", "orch", "git", "tasks", "tmux"]
+        );
+    }
+
+    /// ツール説明に埋める 1 行が VALUES の全件を説明つきで載せる（#1467）
+    #[test]
+    fn values_summaryはvaluesの全件を説明つきで載せる() {
+        let summary = PanelViewWire::values_summary();
+        for v in PanelViewWire::VALUES {
+            assert!(
+                summary.contains(&format!("view={v} は")),
+                "values_summary に {v} の説明が無い: {summary}"
+            );
+        }
+        // 旧称は勧めないので、値の説明としては出さない
+        assert!(!summary.contains("view=tmux"));
     }
 
     // === #1370: changes_layout ===
