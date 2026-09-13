@@ -2251,6 +2251,16 @@ env -u TAKO_SOCKET -u TAKO_TOKEN -u TAKO_PANE_ID \
   まで書く。SIGKILL や落ちた検証の残骸は `tako tmux cleanup --servers`
   （既定 dry-run。実削除は `--apply`）で回収する。判定は所有 pid の生死なので、
   **他 worker の生きているサーバーは対象にならない**
+- **`TAKO_DATA_DIR` が深くても CLI / MCP は届く**（#1441）。IPC の Unix ソケットの
+  実体は data dir 直下ではなく **`$TMPDIR/tako-<data dir の 16 桁ハッシュ>.sock`**
+  （上限に収まるときだけ従来どおり `<data_dir>/tako.sock`）で、data dir 側には
+  参照ファイル `tako.sock.path` だけが残る。worker の scratchpad のような深いパスを
+  そのまま `TAKO_DATA_DIR` に渡してよい。**旧挙動は `warning: IPC サーバーを起動できない`
+  の 1 行だけ出して GUI は普通に立つ**ので、隔離起動の「見た目は動くのに CLI が無反応」を
+  見たらまずここを疑う。受け口が立ったかは `tako check-health`（`ipc` 節の `bound` /
+  `kind` / `path_bytes` / `limit`）で読める。**アプリへ届かないときもローカル診断が出る**
+  ので、`tako list` が「接続情報が無い」と言ったら `tako check-health` を打つ。
+  置き場の決め方は `tako_core::ipc_socket` の 1 実装（A/B は `TAKO_1441_LEGACY=1`）
 - **面を指定するのは `TAKO_DISPLAY=<名前 | UUID | index>`**。`TAKO_ISOLATED` /
   `TAKO_SELF_TEST` / `TAKO_VISUAL_TEST` のどれかが立っていれば**未指定でも** `tako-vd` を狙う
 - **通常起動は 1 ビットも変わらない**（未指定 かつ 非検証なら置き先は未解決のまま）

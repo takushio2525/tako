@@ -389,10 +389,26 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
   `<data_dir>/control.json`（0600 / 親ディレクトリ 0700。tmp + rename で原子的に更新）へ
   socket / token / mcp_url を書き出す（`tako-control::discovery`）。CLI は
   環境変数 → 発見ファイルの順で解決し、env があっても**接続不可・認証失敗のときだけ**
-  フォールバックする（操作エラーはそのまま返す）。ソケットパスは PID 入りのまま
-  （安定パスは複数インスタンスで取り合いになるため不採用）。複数インスタンスは
+  フォールバックする（操作エラーはそのまま返す）。複数インスタンスは
   最新起動がファイルを上書き = 最新優先。終了時の削除はしない（GPUI の終了経路で
   Drop が保証されない。残骸は接続失敗として顕在化し、誤接続はトークンで防がれる）
+- **IPC ソケットの置き場（`tako-core::ipc_socket`。#1441）**: 決め方はこの 1 実装が正で、
+  bind 側（`ipc.rs`）も繋ぐ側の診断（`tako check-health` のオフライン経路）も通る。
+  1. `<data_dir>/tako.sock` が `sun_path` の上限（macOS 103 / Linux 107 バイト）に
+     収まるならそこ（2026-06-23 に PID 入りから固定パスへ変えた性質 = **再起動をまたいで
+     既存クライアントがそのまま繋ぎ直せる**を保つ）
+  2. 収まらないなら `<$TMPDIR>/tako-<data dir の 16 桁 FNV-1a>.sock` へ逃がし、
+     data dir 側には参照ファイル `tako.sock.path` だけを残す。**pid ではなくハッシュ**
+     なのは 1 の性質を短縮パスでも保つため。`$TMPDIR` 自体が深い機のために `/tmp` も候補
+  3. **symlink では解決しない**（`sun_path` の上限は繋ぐ側が `connect()` へ渡すパスに
+     掛かるので、長いパスの symlink を置いてもクライアントが同じ上限で弾かれる）
+  4. 生きた先客が居るパスは奪わない（`exists() && connect().is_ok()` なら pid 入り
+     一時パスへ逃げる）。短縮パスは data dir ごとに安定 = 取り合いが起きうるので、
+     固定パスと同じ判定を掛ける
+  5. bind の成否は `ipc_socket::record` で 1 回記録し、`check_health` の `ipc` 節と
+     GUI の通知欄（`notify_ipc_unavailable`）が読む。**立たなかったら黙らない**
+     （旧実装は `eprintln!` 1 行だけで GUI を普通に立て、CLI / MCP から一切操作できない
+     状態が無言で始まっていた = #1441 の症状）
 - **TODO(Phase 6): Windows named pipe**。`IpcServer::start` と CLI の transport は
   `#[cfg(windows)]` でスタブ化済み（サーバー起動失敗でもアプリは IPC なしで継続する）。
   実装時の検討事項:

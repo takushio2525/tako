@@ -39,6 +39,35 @@ pub fn notice_open_failed(path: &str, reason: &str) -> String {
         format!("Cannot open path ({path}): {reason}")
     )
 }
+/// IPC の受け口（`tako` CLI / MCP の入口）が立たなかったときの通知（#1441）。
+///
+/// 深い `TAKO_DATA_DIR` でソケットパスが `sun_path` の上限を超えると bind に失敗し、
+/// 旧実装は `eprintln!` 1 行だけで GUI を普通に立てていた。**見た目は正常なのに
+/// CLI / MCP から一切操作できない**ので、原因に気づくまで時間を失う。
+/// 出すのは長さと上限（数値）と次の一手だけで、生のパスは載せない
+pub fn notice_ipc_too_long(path_bytes: usize, limit: usize) -> String {
+    tr!(
+        format!(
+            "tako CLI / MCP の受け口を開けません: データディレクトリが深く、\
+             ソケットパスが {path_bytes} バイトで上限 {limit} バイトを超えています。\
+             もっと浅い TAKO_DATA_DIR で起動し直してください"
+        ),
+        format!(
+            "Cannot open the tako CLI / MCP endpoint: the data directory is too deep \
+             ({path_bytes} bytes of socket path, limit {limit}). \
+             Relaunch with a shorter TAKO_DATA_DIR."
+        )
+    )
+}
+
+/// IPC の受け口が上限以外の理由で立たなかったときの通知（#1441）
+pub fn notice_ipc_unavailable(reason: &str) -> String {
+    tr!(
+        format!("tako CLI / MCP の受け口を開けません: {reason}"),
+        format!("Cannot open the tako CLI / MCP endpoint: {reason}")
+    )
+}
+
 /// ファイルツリーの**ローカル行**の操作が失敗したときの理由（#1399）。
 ///
 /// この経路は以前 `let _ = dispatch(..)` / `if result.is_ok()` / `eprintln!` で
@@ -348,6 +377,9 @@ mod tests {
                 // #1402: 切り詰め・読み取り失敗の説明（件数と OS の理由は言語非依存）
                 note_truncated(500, 560),
                 note_read_failed("Permission denied (os error 13)"),
+                // #1441: IPC の受け口が立たなかったときの案内（数値と OS の理由は言語非依存）
+                notice_ipc_too_long(160, 103),
+                notice_ipc_unavailable("Permission denied (os error 13)"),
             ]
         });
     }

@@ -29,10 +29,13 @@ pub struct IncomingRequest {
     pub reply: std::sync::mpsc::SyncSender<Result<serde_json::Value, DispatchError>>,
 }
 
-/// IPC サーバーのハンドル。drop でソケットファイルを片付ける。
+/// IPC サーバーのハンドル。drop でソケットファイル（と #1441 の参照ファイル）を片付ける。
 /// `endpoint` はペインのシェルへ `TAKO_SOCKET` として注入する
 pub struct IpcServer {
     endpoint: String,
+    /// data dir 側に置いた実体への参照（#1441。短縮したときだけ `Some`）
+    #[cfg_attr(windows, allow(dead_code))]
+    pointer: Option<std::path::PathBuf>,
 }
 
 impl IpcServer {
@@ -70,7 +73,13 @@ impl IpcServer {
 impl Drop for IpcServer {
     fn drop(&mut self) {
         #[cfg(unix)]
-        let _ = std::fs::remove_file(&self.endpoint);
+        {
+            let _ = std::fs::remove_file(&self.endpoint);
+            // 死んだ実体を指す参照を残さない（#1441）
+            if let Some(pointer) = &self.pointer {
+                let _ = std::fs::remove_file(pointer);
+            }
+        }
     }
 }
 
@@ -190,6 +199,20 @@ mod windows_imp {
             .collect()
     }
 
+    /// 立たなかった理由を記録して、そのまま呼び出し元へ返す（#1441）
+    fn record_failure(e: std::io::Error) -> std::io::Error {
+        tako_core::ipc_socket::record(tako_core::ipc_socket::IpcStatus {
+            endpoint: None,
+            kind: tako_core::ipc_socket::SocketPathKind::NamedPipe,
+            bound: false,
+            path_bytes: 0,
+            limit: 0,
+            well_known_bytes: 0,
+            error: Some(e.to_string()),
+        });
+        e
+    }
+
     /// 再起動をまたいで安定するパイプ名（unix の固定ソケットパスに相当）
     fn preferred_pipe_name(prefer_temp: bool) -> String {
         if prefer_temp || cfg!(test) || std::env::var_os("TAKO_SELF_TEST").is_some() {
@@ -210,10 +233,24 @@ mod windows_imp {
             Ok(instance) => instance,
             Err(_) if !prefer_temp_socket => {
                 name = temp_pipe_name();
-                named_pipe::create_server_instance(&name, true)?
+                match named_pipe::create_server_instance(&name, true) {
+                    Ok(instance) => instance,
+                    Err(e) => return Err(record_failure(e)),
+                }
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(record_failure(e)),
         };
+        // #1441: 立った受け口を記録する（`check_health` が読む。名前付きパイプに
+        // `sun_path` の上限は無いので長さは 0 で申告する）
+        tako_core::ipc_socket::record(tako_core::ipc_socket::IpcStatus {
+            endpoint: Some(name.clone()),
+            kind: tako_core::ipc_socket::SocketPathKind::NamedPipe,
+            bound: true,
+            path_bytes: 0,
+            limit: 0,
+            well_known_bytes: 0,
+            error: None,
+        });
 
         let accept_name = name.clone();
         let accept_token = token;
@@ -253,7 +290,10 @@ mod windows_imp {
                 }
             })?;
 
-        Ok(IpcServer { endpoint: name })
+        Ok(IpcServer {
+            endpoint: name,
+            pointer: None,
+        })
     }
 }
 
@@ -263,32 +303,46 @@ mod unix_imp {
     use std::os::unix::net::{UnixListener, UnixStream};
 
     use futures::channel::mpsc::UnboundedSender;
+    use tako_core::ipc_socket::{IpcStatus, SocketPathKind, SocketPlan};
 
     use super::{conn, IncomingRequest, IpcServer};
 
     /// PID ベースの一時ソケットパス（テスト・セルフテスト・多重起動フォールバック用）
-    fn temp_socket_path() -> std::path::PathBuf {
+    fn temp_socket_path() -> SocketPlan {
         static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        std::env::temp_dir().join(format!("tako-{}-{seq}.sock", std::process::id()))
+        let path = std::env::temp_dir().join(format!("tako-{}-{seq}.sock", std::process::id()));
+        SocketPlan {
+            path,
+            kind: SocketPathKind::Temp,
+            pointer: None,
+            limit: tako_core::ipc_socket::max_path_bytes(),
+            well_known_bytes: 0,
+        }
     }
 
     /// 再起動をまたいで安定するソケットパスを決定する。
     /// - 単体テスト / セルフテスト / セカンダリモード（`prefer_temp`）: 一時パス
     ///   （他インスタンスと衝突回避・プライマリの固定ソケットを乗っ取らない）
-    /// - 通常起動: `<data_dir>/tako.sock`（固定。既存クライアントがそのまま再接続可能）
+    /// - 通常起動: [`tako_core::ipc_socket::plan`] の決め方（浅い data dir なら
+    ///   `<data_dir>/tako.sock` のまま。深ければ短いパスへ逃がす = #1441）
     /// - 別インスタンスが生きている: フォールバックで一時パス
-    fn preferred_socket_path(prefer_temp: bool) -> std::path::PathBuf {
+    ///
+    /// **置き場の決め方をここへ書かない**（#1441）。同じ規則は繋ぐ側の診断
+    /// （`tako check-health` のオフライン経路）も引くので、1 実装に保つ
+    fn preferred_socket_path(prefer_temp: bool) -> SocketPlan {
         if prefer_temp || cfg!(test) || std::env::var_os("TAKO_SELF_TEST").is_some() {
             return temp_socket_path();
         }
-        if let Some(well_known) = tako_core::paths::data_dir().map(|d| d.join("tako.sock")) {
-            if well_known.exists() && UnixStream::connect(&well_known).is_ok() {
-                return temp_socket_path();
-            }
-            return well_known;
+        let Some(plan) = tako_core::ipc_socket::plan() else {
+            return temp_socket_path();
+        };
+        // 生きた先客が居るパスは奪わない。**短縮パスにも同じ判定を掛ける**
+        // （短縮パスは data dir ごとに安定 = 別インスタンスと同じ値になりうる）
+        if plan.path.exists() && UnixStream::connect(&plan.path).is_ok() {
+            return temp_socket_path();
         }
-        temp_socket_path()
+        plan
     }
 
     pub(super) fn start(
@@ -296,16 +350,66 @@ mod unix_imp {
         token: String,
         prefer_temp_socket: bool,
     ) -> std::io::Result<IpcServer> {
-        let path = preferred_socket_path(prefer_temp_socket);
+        let plan = preferred_socket_path(prefer_temp_socket);
+        match bind(&plan) {
+            Ok(listener) => {
+                // #1441: 立った受け口を記録する（`check_health` / 通知欄が読む）
+                tako_core::ipc_socket::record(IpcStatus {
+                    endpoint: Some(plan.path.display().to_string()),
+                    kind: plan.kind,
+                    bound: true,
+                    path_bytes: plan.path_bytes(),
+                    limit: plan.limit,
+                    well_known_bytes: plan.well_known_bytes,
+                    error: None,
+                });
+                // data dir 側には実体への参照だけ残す（診断の手がかり）。
+                // 書けなかったら drop で消す対象にも入れない（他所が書いた物を消さない）
+                let pointer = match tako_core::ipc_socket::write_pointer(&plan) {
+                    Ok(()) => plan.pointer,
+                    Err(_) => None,
+                };
+                serve(listener, tx, token, plan.path, pointer)
+            }
+            Err(e) => {
+                // #1441: 立たなかった理由も記録する。**黙って縮退させない**
+                tako_core::ipc_socket::record(IpcStatus {
+                    endpoint: None,
+                    kind: plan.kind,
+                    bound: false,
+                    path_bytes: plan.path_bytes(),
+                    limit: plan.limit,
+                    well_known_bytes: plan.well_known_bytes,
+                    error: Some(e.to_string()),
+                });
+                Err(e)
+            }
+        }
+    }
+
+    /// ソケットを張る（親ディレクトリ作成 → 残骸除去 → bind → 0600）
+    fn bind(plan: &SocketPlan) -> std::io::Result<UnixListener> {
+        let path = &plan.path;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        // 前回残骸（クラッシュ等で remove されなかったもの）を除去
-        let _ = std::fs::remove_file(&path);
-        let listener = UnixListener::bind(&path)?;
+        // 前回残骸（クラッシュ等で remove されなかったもの）を除去。
+        // 生きた先客は `preferred_socket_path` が先に避けているのでここには来ない
+        let _ = std::fs::remove_file(path);
+        let listener = UnixListener::bind(path)?;
         // 自ユーザーのプロセスのみ接続可能にする（トークンと二段の防御線）
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(listener)
+    }
 
+    /// accept スレッドを立てる
+    fn serve(
+        listener: UnixListener,
+        tx: UnboundedSender<IncomingRequest>,
+        token: String,
+        path: std::path::PathBuf,
+        pointer: Option<std::path::PathBuf>,
+    ) -> std::io::Result<IpcServer> {
         let accept_token = token;
         std::thread::Builder::new()
             .name("tako-ipc-accept".into())
@@ -334,6 +438,7 @@ mod unix_imp {
 
         Ok(IpcServer {
             endpoint: path.display().to_string(),
+            pointer,
         })
     }
 }

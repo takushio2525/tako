@@ -370,6 +370,16 @@ pub const CATALOG: &[Entry] = &[
         local_fields: &[],
         needs_local_unless: &[],
     },
+    // #1441: 深い data dir ではソケットの実体が短いパスへ逃げるので、
+    // data dir 側には実体への参照だけが残る。これも機ごとのランタイム値
+    Entry {
+        root: Root::TakoData,
+        path: "tako.sock.path",
+        class: Class::Local,
+        note: notes::RUNTIME,
+        local_fields: &[],
+        needs_local_unless: &[],
+    },
     Entry {
         root: Root::TakoData,
         path: "layout.json",

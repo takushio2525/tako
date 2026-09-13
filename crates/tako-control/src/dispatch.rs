@@ -11519,6 +11519,14 @@ fn check_health(host: &dyn ControlHost) -> Value {
         issues.push(issue);
     }
 
+    // IPC の受け口が立ったか（#1441）。立たないと CLI / MCP から一切操作できないのに
+    // 見た目は普通に動くので、**機械で読める形**で申告する。記録は
+    // `IpcServer::start_with` が起動時に 1 回置く（GUI 以外のホストでは None）
+    let ipc = tako_core::ipc_socket::status();
+    if let Some(issue) = ipc.as_ref().and_then(ipc_health_issue) {
+        issues.push(issue);
+    }
+
     // ワークスペースの状態サマリ
     let ws = host.workspace();
     let tab_count = ws.tabs().len();
@@ -11551,6 +11559,9 @@ fn check_health(host: &dyn ControlHost) -> Value {
         "display_placement": display_placement.as_ref().map(
             tako_core::platform::display::Placement::describe,
         ),
+        // #1441: IPC の受け口の実測。`bound=false` なら CLI / MCP は届かない
+        // （`kind=shortened` は深い data dir を短いパスへ逃がした正常な状態）
+        "ipc": ipc.as_ref().map(ipc_describe),
         "workspace": {
             "tabs": tab_count,
             "panes": pane_count,
@@ -11558,6 +11569,44 @@ fn check_health(host: &dyn ControlHost) -> Value {
         },
         "issues": issues,
     })
+}
+
+/// `check_health` の `ipc` 節（#1441）。GUI を立てずに検査できるよう
+/// **記録から組み立てるだけ**にしてある（#1160 の `Placement::describe` と同じ作法）
+fn ipc_describe(status: &tako_core::ipc_socket::IpcStatus) -> Value {
+    json!({
+        "bound": status.bound,
+        "endpoint": status.endpoint,
+        "kind": status.kind.as_str(),
+        "path_bytes": status.path_bytes,
+        "limit": status.limit,
+        "well_known_bytes": status.well_known_bytes,
+        "error": status.error,
+    })
+}
+
+/// 受け口が立たなかったときだけ申告する（立っているときは黙る = 通常起動と同じ）。
+/// 上限超過（#1441 の症状）は原因と次の一手が違うので文言を分ける
+fn ipc_health_issue(status: &tako_core::ipc_socket::IpcStatus) -> Option<Value> {
+    if status.bound {
+        return None;
+    }
+    let message = if status.too_long() {
+        format!(
+            "IPC の受け口が立っていない（tako CLI / MCP は届かない）: データディレクトリが深く、             ソケットパスが {} バイトで上限 {} バイトを超えている。             もっと浅い TAKO_DATA_DIR で起動し直すこと",
+            status.path_bytes, status.limit,
+        )
+    } else {
+        format!(
+            "IPC の受け口が立っていない（tako CLI / MCP は届かない）: {}",
+            status.error.as_deref().unwrap_or("理由不明"),
+        )
+    };
+    Some(json!({
+        "level": "error",
+        "check": "ipc",
+        "message": message,
+    }))
 }
 
 fn home_dir() -> Option<std::path::PathBuf> {
