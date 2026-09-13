@@ -4066,6 +4066,42 @@ Running 1 shell command...\n\
     }
 
     #[test]
+    fn issue1447_previewパネルつきの三択でwatchがdialog_waitingを返す() {
+        // 実採取（2026-09-13 / claude 2.1.258 / 60 桁）。AskUserQuestion の
+        // `preview` つきは選択肢の**右**へ枠つきの副画面を描く。修正前は
+        // choice_dialog を組めず、watch が WORKER_DIALOG も WORKER_IDLE も
+        // 出さないまま 30 分でタイムアウトしていた（#1447）
+        let preview = "  Made 1 scratchpad edit +149, pushed to feat/62-link-share,\n  created PR #66, ran 33 shell commands\n\n────────────────────────────────────────────────────────────\n ☐ AWS 適用\n\n│ #62 のコード・テスト・ドキュメントは完了して PR #66\n│ を出しました。残るのは AWS への適用（DynamoDB\n│ テーブル・IAM・Lambda 更新・CloudFront\n│ のビヘイビア）ですが、このセッションでは AWS\n│ の書き込み系コマンドがすべて自動モードの分類器にブロックさ\n│ れています。どう進めますか？\n\n❯ 1. 権限を許可して私が流す（    ┌────────────────────────┐\n    推奨）                       │ 許可が要る aws         │\n  2. 自分で流す                  ├─── ✂ ─── 17 lines hidden\n  3. AWS は後回し、PR            ┤\n    だけ進める                   └────────────────────────┘\n\n                                 Notes: press n to add notes\n\n────────────────────────────────────────────────────────────\n  Chat about this\n\nEnter to select · ↑/↓ to navigate · n to add notes · Esc to\ncancel";
+        let mut script = ExecScript::new(vec![
+            status("idle", preview, "agents"),
+            status("idle", preview, "agents"),
+            status("idle", preview, "agents"),
+        ]);
+        let outcome = run_wait(&mut script, &watch_opts(7, None));
+        let WatchOutcome::ChoiceWaiting { choice_dialog } = outcome else {
+            panic!("ChoiceWaiting を返す（修正前は Idle も出ない）: {outcome:?}");
+        };
+        assert_eq!(choice_dialog["kind"], "select");
+        assert_eq!(choice_dialog["numbered"], true);
+        assert_eq!(choice_dialog["highlighted"], 0);
+        assert_eq!(choice_dialog["cursor_visible"], true);
+        assert_eq!(choice_dialog["recommended_action"], "respond");
+        let options = choice_dialog["options"].as_array().expect("options");
+        assert_eq!(options.len(), 3, "{options:?}");
+        assert_eq!(options[1]["number"], 2);
+        assert_eq!(options[1]["label"], "自分で流す");
+        // 副画面の枠がラベルへ混ざっていない（master がここを読んで respond する）
+        assert_eq!(options[0]["label"], "権限を許可して私が流す（推奨）");
+        assert_eq!(choice_dialog["labels_truncated"], false);
+        // 本文の質問（question）としては通知しない（#748 と同じ扱い）
+        let events = collect_worker_events("idle", Some(preview), None);
+        assert!(
+            !events.iter().any(|e| e.kind == WorkerEventKind::Question),
+            "ダイアログ実在時に question は出さない: {events:?}"
+        );
+    }
+
+    #[test]
     fn issue1143_狭いモデルセレクタでもwatchがdialog_waitingを返す() {
         // 実採取（claude 2.1.258 / 25 桁 × 40 行）。ダイアログがペインより高いので
         // 選択カーソルもキー案内も画面に無く、ラベルは `…` で切り詰められている。

@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-13（#1442: 窓の位置・寸法を tako 自身の口で決められるようにした）
-- `TAKO_DISPLAY` つきの隔離起動は保存フレームを無視して必ず中央 960x600 で開き、AX で動かすと本番 tako の窓に当たっていた。起動時 `TAKO_WINDOW_BOUNDS=x,y,w,h`（`w,h` だけなら中央）と `tako window move` / `resize`（MCP 1:1）を足し、解釈・検査は `tako_core::platform::window_bounds::resolve` の 1 実装へ。`window list` に `bounds` / `display` を載せて AX 無しで読めるようにした
-- 実測（tako-vd = 1512,0 の 2560x1440・CGWindowList）: 修正前は保存フレーム 200,100,1400,900 があっても `2312,420,960,600` / 新 `100,50,1400,900` → `1612,50,1400,900` / `TAKO_1442_LEGACY=1` は `2312,420,960,600`。はみ出し・最小未満・読めない形は既定へ落ちて persist.log に理由（CLI / MCP はエラー）。**罠**: `move` 直後の `resize` が render 待ちの古い位置を土台にして移動を打ち消す（セルフテスト項目 77b が実際に落ちた）ので、依頼した矩形はその場で `window_frames` へ記録する
-- 番犬 9 本（注入 10 通りで file:line 名指し）+ 単体 14 本・セルフテスト項目 77b（legacy 腕は FAILED）。workspace 4657 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。**install 要**
-
 ## 2026-09-13（#1449: スマホの「+」を 3 択にして、ターミナル / SSH も新規に立てられるようにした）
 - 「+」を `LaunchSheet`（master / ターミナル / SSH）へ。**操作は 1 つも新設していない**（ターミナル = `POST /api/tabs` だけ / SSH = #1080 の `POST /api/ssh {target:"tab"}`）。role は 3 種とも **Manage 据え置き**（「interact 以上」案は既存 Interact 端末の権限が黙って広がるので不採用 = 脅威モデルへ明記）
 - 経路の宣言を `remote_launch::LAUNCH_ROUTES`（role / 監査 / PWA の呼び口）へ集約し `required_role` が引く形に。番犬 6 本 + e2e 11 本（61 passed）+ 実経路 `scripts/test-remote-launch-1449.sh` 38 PASS（**HOME ごと隔離**して実 `~/.ssh/config` を読まない = #927）。注入 7 通りすべて名指し FAILED
@@ -54,3 +49,8 @@
 - スマホは #283 からある `POST /api/pair` を押せる場所に出しただけ（**新 API は `POST /api/admin/devices/role` の 1 本**）。`GET /api/me` が登録済み端末にも `pending` / `requested_role` / `denied` を返すようにし、承認待ちの間だけ 2 秒ポーリング → 承認で**再読込なしで**続きができる。導線は `permission-request.jsx` へ切り出し `files.jsx` は 2 行差分（#1451 との衝突回避）
 - 昇格を PC の人へ縛るのは 3 段: 方向（403 `upgrade_requires_gui`）/ 接続元プロセスの名前ゲート（#841 の `procinfo` を流用）/ **dispatch の手前での拒否**（MCP・CLI の IPC は tako-app の中で走るので名前ゲートだけでは AI を止められない = 実装中に見つけた穴）。経路表は `remote_role::ROLE_ROUTES`、依頼は `tako todo`（kind=permission）へ 1 件（**授権の正本は daemon のメモリのまま** = done しても権限は動かない）
 - 実測 `scripts/test-remote-role-1452.sh` **58 PASS 0 FAIL**（CLI / MCP / curl の昇格が全部拒否・GUI を名乗った承認だけ 200・監査に `caller_check`・再起動をまたいで記録だけ残る）・e2e 71 passed（新 10 本）・番犬 9 本。**罠**: 承認にゲートが掛かったので #1449 / #1078 の実経路テストが全 403 になる（`TAKO_REMOTE_TRUSTED_ADMIN_NAMES` を宣言して復旧 = #841 と同じ形）。**install 要 / 本番 daemon 再起動要**
+
+## 2026-09-14（#1447: preview パネルつき AskUserQuestion（2 カラム配置）を検知できるようにした）
+- 真因は枠の同居**ではなく**折り返しの継続行の字下げ（実採取は中身の桁 5 に対して 4）。`gap_line_kind` が「ダイアログの外」に分類し `numbered_block` が選択肢 1 個で打ち切っていた。注入 A/B で名指し（枠を剥がしただけでは None のまま / 継続行を 5 桁へ揃えると修正前でも採れる）
+- 下限を `dialog::wrap_indent_floor`（マーカー `N.` より右）の 1 実装へ寄せ、歯止めに「選択カーソル行・番号つき行は続きにしない」。副画面は判定前に `side_panel_cuts` → `strip_side_panel` で剥がす（3 条件つき。全幅の箱の右端では発火しない）。エッジで実バグ 2 件を発見して修正（パネルだけの行が下の選択肢ラベルへ結合 / 内側の余白を掴む）
+- 実測（隔離 GUI・tako-vd）: `status` の `choice_dialog` が 3 択・`watch` が `WORKER_DIALOG: tako:1 (select)`・`respond --choice 2` が `resolved:true` / `keys_sent:["2"]`（模擬 TUI 側も `KEY=2 / CHOSE=自分で流す`）。`TAKO_1447_LEGACY=1` は `choice_dialog: null` / `WORKER_TIMEOUT` / 「画面に存在しない」で症状を再現。番犬 3 本・注入 8 通りで file:line 名指し。workspace 4805 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。**install 要**
