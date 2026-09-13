@@ -53,21 +53,6 @@ pub(crate) fn git_feedback_text(message: &str) -> String {
     out
 }
 
-/// バイトオフセットを直近の文字境界へ切り下げる（#494）。
-///
-/// `String::split_at` / `insert_str` は文字の途中のオフセットを渡すと panic し、
-/// GPUI の描画中に落ちるとアプリ全体が巻き添えで死ぬ。キャレット位置は
-/// マルチバイト文字・IME・貼り付けで境界を外し得るので、使う直前に必ず丸める。
-pub(crate) fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
-    if idx >= s.len() {
-        return s.len();
-    }
-    while idx > 0 && !s.is_char_boundary(idx) {
-        idx -= 1;
-    }
-    idx
-}
-
 /// 末尾 `n` 文字だけを返す（#494。長いメッセージでキャレットを画面内に留めるため）
 pub(crate) fn tail_chars(s: &str, n: usize) -> String {
     let count = s.chars().count();
@@ -2670,9 +2655,9 @@ impl TakoApp {
             .or_else(|| self.git_data.as_ref().map(|d| d.branch.clone()))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "HEAD".to_string());
-        // キャレット位置は必ず文字境界へ丸めてから split する（#494 と同じ理由）
-        let cursor = floor_char_boundary(&input.text, input.cursor.min(input.text.len()));
-        let (before, after) = input.text.split_at(cursor);
+        // キャレット位置は必ず文字境界へ丸めてから split する（#494 と同じ理由。
+        // 丸めは `TextField` が閉じているので呼び出し側では書かない = #1459）
+        let (before, after) = input.field.split_at_caret();
         let visible = ((self.panel_width - 60.0) / 6.5).max(6.0) as usize;
         let repo_for_create = repo_root.to_string();
 
@@ -2705,7 +2690,7 @@ impl TakoApp {
                         MouseButton::Left,
                         cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
                     )
-                    .when(input.text.is_empty(), |d| {
+                    .when(input.field.text().is_empty(), |d| {
                         d.child(
                             div()
                                 .overflow_hidden()
@@ -2714,7 +2699,7 @@ impl TakoApp {
                                 .child(crate::ui_text::panel::git_branch_new_placeholder()),
                         )
                     })
-                    .when(!input.text.is_empty(), |d| {
+                    .when(!input.field.text().is_empty(), |d| {
                         d.child(
                             div()
                                 .flex_none()
@@ -2724,7 +2709,7 @@ impl TakoApp {
                     // #561: コミット欄と同じく未確定文字列は入力欄の中へ出す
                     .children(self.text_input_marked(AppTextInput::GitBranch, theme))
                     .child(self.text_input_caret(AppTextInput::GitBranch, theme))
-                    .when(!input.text.is_empty(), |d| {
+                    .when(!input.field.text().is_empty(), |d| {
                         d.child(
                             div()
                                 .overflow_hidden()
@@ -3438,8 +3423,8 @@ impl TakoApp {
         }
 
         // ──── コミットメッセージ入力 + 操作ボタン（#472 / #487）────
-        let commit_msg = self.git_commit_message.clone();
-        let commit_cursor = self.git_commit_cursor.min(commit_msg.len());
+        let commit_field = self.git_commit.clone();
+        let commit_msg = commit_field.text().to_string();
         let commit_focused = self.git_commit_input_focused;
         let branch_name = data.branch.clone();
         let has_changes = !data.status.is_empty();
@@ -3503,9 +3488,8 @@ impl TakoApp {
         // コミットメッセージ入力欄（#487: キャレット表示 + フォーカス可視化。
         // 実際の文字入力は replace_text_in_range / handle_git_commit_key が担う）
         // #494: split_at はバイト境界でしか切れず、文字の途中で切ると panic して
-        // アプリ全体が落ちる。キャレットは必ず文字境界へ丸めてから使う
-        let commit_cursor = floor_char_boundary(&commit_msg, commit_cursor);
-        let (msg_before, msg_after) = commit_msg.split_at(commit_cursor);
+        // アプリ全体が落ちる。丸めは `TextField` の中に閉じている（#1459）
+        let (msg_before, msg_after) = commit_field.split_at_caret();
         // 長いメッセージでもキャレット位置が見えるように、前後を表示可能な文字数で
         // 切り詰める（#494。切らないとキャレットが入力欄の外へ押し出されて見えなくなる）
         let visible_chars = ((self.panel_width - 40.0) / 6.5).max(8.0) as usize;
@@ -3541,7 +3525,7 @@ impl TakoApp {
                             // 両方フォーカス扱いだと IME の宛先が優先順位で決まってしまう
                             this.clear_text_input_focus();
                             this.git_commit_input_focused = true;
-                            this.git_commit_cursor = this.git_commit_message.len();
+                            this.git_commit.move_end();
                             cx.stop_propagation();
                             cx.notify();
                         }),
@@ -3591,7 +3575,7 @@ impl TakoApp {
         // コミット + プル / プッシュ ボタン行
         // #494: 実行中は連打・二重押しを防ぐため全ボタンを無効化する
         let busy = self.git_busy;
-        let commit_block = tako_core::git::commit_block(&self.git_commit_message, has_changes);
+        let commit_block = tako_core::git::commit_block(self.git_commit.text(), has_changes);
         let commit_enabled = commit_block.is_none() && busy.is_none();
         let btn_base = |id: &'static str, th: &tako_core::Theme, enabled: bool| {
             div()
@@ -4088,8 +4072,7 @@ impl TakoApp {
                 this.clear_text_input_focus();
                 // 基点は現在の HEAD（= 今いるブランチ）。入力欄に明示表示する
                 this.git_branch_input = Some(GitBranchInput {
-                    text: String::new(),
-                    cursor: 0,
+                    field: crate::text_field::TextField::default(),
                     start_point: None,
                 });
                 this.git_branch_confirm = None;
@@ -4625,101 +4608,52 @@ impl TakoApp {
         keystroke: &gpui::Keystroke,
         cx: &mut Context<Self>,
     ) -> bool {
-        // #494: 文字境界を割ったまま split/drain すると panic するので必ず丸める
-        let cursor = floor_char_boundary(
-            &self.git_commit_message,
-            self.git_commit_cursor.min(self.git_commit_message.len()),
-        );
-        self.git_commit_cursor = cursor;
+        // この画面だけの割り当てを先に見る（⌘Enter = 確定 / Esc = フォーカスを外す）。
+        // 編集操作は下の `TextField` へ渡すので、ここには置かない（#1459）
         match keystroke.key.as_str() {
             "enter" if keystroke.modifiers.platform => {
                 if let Some(data) = &self.git_data {
                     let repo = data.repo_root.clone();
                     self.git_do_commit(repo, cx);
                 }
-                true
+                return true;
             }
             "escape" => {
                 self.git_commit_input_focused = false;
                 cx.notify();
-                true
+                return true;
             }
-            "backspace" => {
-                if cursor > 0 {
-                    let prev = self.git_commit_message[..cursor]
-                        .char_indices()
-                        .next_back()
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                    self.git_commit_message.drain(prev..cursor);
-                    self.git_commit_cursor = prev;
-                }
-                cx.notify();
-                true
-            }
-            "delete" => {
-                if cursor < self.git_commit_message.len() {
-                    let next = cursor
-                        + self.git_commit_message[cursor..]
-                            .chars()
-                            .next()
-                            .map(|c| c.len_utf8())
-                            .unwrap_or(0);
-                    self.git_commit_message.drain(cursor..next);
-                }
-                cx.notify();
-                true
-            }
-            "left" => {
-                self.git_commit_cursor = self.git_commit_message[..cursor]
-                    .char_indices()
-                    .next_back()
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                cx.notify();
-                true
-            }
-            "right" => {
-                if cursor < self.git_commit_message.len() {
-                    self.git_commit_cursor = cursor
-                        + self.git_commit_message[cursor..]
-                            .chars()
-                            .next()
-                            .map(|c| c.len_utf8())
-                            .unwrap_or(0);
-                }
-                cx.notify();
-                true
-            }
-            "home" | "up" => {
-                self.git_commit_cursor = 0;
-                cx.notify();
-                true
-            }
-            "end" | "down" => {
-                self.git_commit_cursor = self.git_commit_message.len();
-                cx.notify();
-                true
-            }
-            // cmd / ctrl 付きはアプリのキーバインド（⌘V 等）へ通す
-            _ if keystroke.modifiers.platform || keystroke.modifiers.control => false,
-            _ => {
-                if let Some(ch) = keystroke.key_char.as_deref() {
-                    if !ch.is_empty() && !ch.chars().any(|c| c.is_control()) {
-                        self.git_commit_insert(ch, cx);
-                        return true;
-                    }
-                }
-                // 空白は key_char が来ないことがある（実機で「Fix-487 staged」の
-                // 空白以降が入らないのを観測。#487）ので論理キー名で拾い直す
-                if keystroke.key == "space" {
-                    self.git_commit_insert(" ", cx);
-                    return true;
-                }
-                // 修飾なしキーは入力欄が握る（ターミナルへ漏らさない）
-                true
+            _ => {}
+        }
+        // #494（文字境界を割ったまま drain して panic する）の防止は `TextField` の中。
+        // 1 行入力なので上下もキャレットの端へ寄せる（#487 からの挙動）
+        let edit_key = match keystroke.key.as_str() {
+            "up" => "home",
+            "down" => "end",
+            k => k,
+        };
+        if self.git_commit.handle_edit_key(edit_key) {
+            cx.notify();
+            return true;
+        }
+        // cmd / ctrl 付きはアプリのキーバインド（⌘V 等）へ通す
+        if keystroke.modifiers.platform || keystroke.modifiers.control {
+            return false;
+        }
+        if let Some(ch) = keystroke.key_char.as_deref() {
+            if !ch.is_empty() && !ch.chars().any(|c| c.is_control()) {
+                self.git_commit_insert(ch, cx);
+                return true;
             }
         }
+        // 空白は key_char が来ないことがある（実機で「Fix-487 staged」の
+        // 空白以降が入らないのを観測。#487）ので論理キー名で拾い直す
+        if keystroke.key == "space" {
+            self.git_commit_insert(" ", cx);
+            return true;
+        }
+        // 修飾なしキーは入力欄が握る（ターミナルへ漏らさない）
+        true
     }
 
     /// アプリ内テキスト入力のキャレット（#487 / #496 の入力欄で共用）。
@@ -4866,31 +4800,21 @@ impl TakoApp {
     /// キー入力・IME 確定・貼り付けの全経路をここに集約し、
     /// ①制御文字の混入 ②上限超過 ③文字境界を割った挿入（panic）を一箇所で防ぐ。
     pub(crate) fn git_commit_insert(&mut self, text: &str, cx: &mut Context<Self>) {
+        // 制御文字を半角空白へ潰すのは 1 行入力欄だけの事情なので、ここで先に通す
         let insert = tako_core::git::sanitize_commit_message(text);
         if insert.is_empty() {
             return;
         }
-        let cursor = crate::right_panel::floor_char_boundary(
-            &self.git_commit_message,
-            self.git_commit_cursor.min(self.git_commit_message.len()),
-        );
-        // 上限に収まる分だけ入れる（超過分は捨て、理由をカードで知らせる）
-        let room = tako_core::COMMIT_MESSAGE_MAX.saturating_sub(self.git_commit_message.len());
-        let insert = if insert.len() > room {
-            let cut = crate::right_panel::floor_char_boundary(&insert, room);
+        // 上限に収まる分だけ入れる（超過分は捨て、理由をカードで知らせる）。
+        // 文字境界の丸めと切り詰めは `TextField` の 1 実装が担う（#1459）
+        if !self
+            .git_commit
+            .insert(&insert, tako_core::COMMIT_MESSAGE_MAX, false)
+        {
             let msg =
                 crate::ui_text::panel::git_commit_message_too_long(tako_core::COMMIT_MESSAGE_MAX);
             self.git_set_feedback(msg, true, cx);
-            insert[..cut].to_string()
-        } else {
-            insert
-        };
-        if insert.is_empty() {
-            cx.notify();
-            return;
         }
-        self.git_commit_message.insert_str(cursor, &insert);
-        self.git_commit_cursor = cursor + insert.len();
         cx.notify();
     }
 
@@ -4914,7 +4838,7 @@ impl TakoApp {
             return;
         }
         let has_changes = self.git_data.as_ref().is_some_and(|d| !d.status.is_empty());
-        let msg = match tako_core::git::commit_block(&self.git_commit_message, has_changes) {
+        let msg = match tako_core::git::commit_block(self.git_commit.text(), has_changes) {
             Some(tako_core::CommitBlock::EmptyMessage) => {
                 crate::ui_text::panel::git_commit_blocked_empty()
             }
@@ -4932,14 +4856,14 @@ impl TakoApp {
     fn git_do_commit(&mut self, repo_root: String, cx: &mut Context<Self>) {
         // #494: ボタン・Cmd+Enter のどちらの経路でも同じ判定で弾き、理由を必ず出す
         let has_changes = self.git_data.as_ref().is_some_and(|d| !d.status.is_empty());
-        if tako_core::git::commit_block(&self.git_commit_message, has_changes).is_some() {
+        if tako_core::git::commit_block(self.git_commit.text(), has_changes).is_some() {
             self.git_report_commit_block(cx);
             return;
         }
         if !self.git_begin_op("commit", cx) {
             return;
         }
-        let message = self.git_commit_message.clone();
+        let message = self.git_commit.text().to_string();
         // 失敗時に入力欄へ戻すため、送るコピーとは別に保持しておく
         let restore = message.clone();
         let has_staged = self
@@ -4947,8 +4871,7 @@ impl TakoApp {
             .as_ref()
             .is_some_and(|d| d.status.iter().any(|e| e.is_staged()));
         let all = !has_staged;
-        self.git_commit_message.clear();
-        self.git_commit_cursor = 0;
+        self.git_commit.clear();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -4965,9 +4888,8 @@ impl TakoApp {
                     }
                     Err(e) => {
                         // 失敗したメッセージは打ち直させない（入力欄へ戻す）
-                        if app.git_commit_message.trim().is_empty() {
-                            app.git_commit_message = restore;
-                            app.git_commit_cursor = app.git_commit_message.len();
+                        if app.git_commit.text().trim().is_empty() {
+                            app.git_commit.set_text(restore);
                         }
                         app.git_set_feedback(e, true, cx);
                     }
@@ -5131,7 +5053,7 @@ impl TakoApp {
         let Some(input) = self.git_branch_input.clone() else {
             return;
         };
-        let name = input.text.trim().to_string();
+        let name = input.field.text().trim().to_string();
         if name.is_empty() {
             return;
         }
@@ -5235,31 +5157,27 @@ impl TakoApp {
 
     /// 新規ブランチ名入力欄へ文字列を挿入する（#496。キー入力・IME 確定・貼り付け共通）
     pub(crate) fn git_branch_input_insert(&mut self, text: &str, cx: &mut Context<Self>) {
-        // ブランチ名に改行・タブは入れられない。空白も git が拒否するのでここで落とす
-        let insert: String = text
-            .chars()
-            .filter(|c| !c.is_control() && *c != ' ')
-            .collect();
+        // 空白は git がブランチ名として拒否するのでここで落とす
+        // （改行・タブなどの制御文字は `TextField` 側が落とす）
+        let insert: String = text.chars().filter(|c| *c != ' ').collect();
         if insert.is_empty() {
             return;
         }
         if let Some(input) = self.git_branch_input.as_mut() {
-            // 上限はブランチ名として現実的な長さに留める（描画も入力欄に収まる）
+            // 上限はブランチ名として現実的な長さに留める（描画も入力欄に収まる）。
+            // 文字境界の丸めと切り詰めは `TextField` の 1 実装が担う（#1459）。
+            // 255 バイトに当たるのは事実上あり得ないので、入り切らない旨は
+            // 従来どおり画面へ出さない（出すなら文言の i18n から要る = 別件）
             const MAX: usize = 255;
-            let room = MAX.saturating_sub(input.text.len());
-            let cut = floor_char_boundary(&insert, room.min(insert.len()));
-            if cut == 0 {
-                return;
-            }
-            let cursor = floor_char_boundary(&input.text, input.cursor.min(input.text.len()));
-            input.text.insert_str(cursor, &insert[..cut]);
-            input.cursor = cursor + cut;
+            let _fits = input.field.insert(&insert, MAX, false);
         }
         cx.notify();
     }
 
     /// 新規ブランチ名入力欄のキー処理（#496。サイドバーの InlineEdit と同じ操作体系）
     pub(crate) fn handle_git_branch_input_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) {
+        // この画面だけの割り当て（Enter = 作成 / Esc = 閉じる / ⌘V = 貼り付け）を先に見る。
+        // 編集操作は下の `TextField` へ渡すので、ここには置かない（#1459）
         match ks.key.as_str() {
             "enter" => {
                 if let Some(repo) = self.git_data.as_ref().map(|d| d.repo_root.clone()) {
@@ -5270,74 +5188,18 @@ impl TakoApp {
                 self.git_branch_input = None;
                 cx.notify();
             }
-            "backspace" => {
-                if let Some(input) = self.git_branch_input.as_mut() {
-                    let cursor = floor_char_boundary(&input.text, input.cursor);
-                    if cursor > 0 {
-                        let prev = input.text[..cursor]
-                            .char_indices()
-                            .next_back()
-                            .map(|(i, _)| i)
-                            .unwrap_or(0);
-                        input.text.drain(prev..cursor);
-                        input.cursor = prev;
-                    }
-                }
-                cx.notify();
-            }
-            "delete" => {
-                if let Some(input) = self.git_branch_input.as_mut() {
-                    let cursor = floor_char_boundary(&input.text, input.cursor);
-                    if cursor < input.text.len() {
-                        let next = input.text[cursor..]
-                            .char_indices()
-                            .nth(1)
-                            .map(|(i, _)| cursor + i)
-                            .unwrap_or(input.text.len());
-                        input.text.drain(cursor..next);
-                    }
-                }
-                cx.notify();
-            }
-            "left" => {
-                if let Some(input) = self.git_branch_input.as_mut() {
-                    let cursor = floor_char_boundary(&input.text, input.cursor);
-                    input.cursor = input.text[..cursor]
-                        .char_indices()
-                        .next_back()
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                }
-                cx.notify();
-            }
-            "right" => {
-                if let Some(input) = self.git_branch_input.as_mut() {
-                    let cursor = floor_char_boundary(&input.text, input.cursor);
-                    input.cursor = input.text[cursor..]
-                        .char_indices()
-                        .nth(1)
-                        .map(|(i, _)| cursor + i)
-                        .unwrap_or(input.text.len());
-                }
-                cx.notify();
-            }
-            "home" => {
-                if let Some(input) = self.git_branch_input.as_mut() {
-                    input.cursor = 0;
-                }
-                cx.notify();
-            }
-            "end" => {
-                if let Some(input) = self.git_branch_input.as_mut() {
-                    input.cursor = input.text.len();
-                }
-                cx.notify();
-            }
             "v" if ks.modifiers.platform => {
                 // ⌘V は paste() 経由（クリップボード読み出しは共通経路に任せる）
                 self.paste(cx);
             }
-            _ => {
+            key => {
+                // #494（文字境界を割ったまま drain して panic する）の防止は `TextField` の中
+                if let Some(input) = self.git_branch_input.as_mut() {
+                    if input.field.handle_edit_key(key) {
+                        cx.notify();
+                        return;
+                    }
+                }
                 if let Some(ch) = ks.key_char.as_deref() {
                     if !ch.is_empty() && !ch.chars().any(|c| c.is_control()) {
                         self.git_branch_input_insert(ch, cx);
@@ -5699,25 +5561,6 @@ mod tests {
             Some(0.0),
             "スクロール領域の行に flex_shrink_0 が付いていない"
         );
-    }
-
-    /// #494: バイトオフセットを文字境界へ丸める（丸めないと split_at / insert_str が panic する）
-    #[test]
-    fn 文字境界への丸め() {
-        let s = "あa\u{1F600}";
-        // 「あ」= 0..3、「a」= 3..4、「\u{1F600}」= 4..8
-        assert_eq!(floor_char_boundary(s, 0), 0);
-        assert_eq!(floor_char_boundary(s, 1), 0);
-        assert_eq!(floor_char_boundary(s, 2), 0);
-        assert_eq!(floor_char_boundary(s, 3), 3);
-        assert_eq!(floor_char_boundary(s, 5), 4);
-        assert_eq!(floor_char_boundary(s, 7), 4);
-        // 範囲外は末尾へクランプ
-        assert_eq!(floor_char_boundary(s, 99), s.len());
-        // 丸めた位置で split しても panic しない
-        for i in 0..=s.len() + 5 {
-            let _ = s.split_at(floor_char_boundary(s, i));
-        }
     }
 
     /// #494: 長いメッセージでもキャレットを画面内に残すための切り詰め

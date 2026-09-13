@@ -294,6 +294,28 @@ Win32 のパス正規化と `MAX_PATH` 制限を無効にする**入口指定**�
   `PlatformInput`（MouseMove → MouseDown → MouseUp）を流すので、GPUI のヒットテストと
   リスナー配線まで通る。ハンドラを直呼びするテストではこの型のバグを検出できない
 
+## アプリ内テキスト入力は `TextField` を通す（Issue #1450 / #1459）
+
+ターミナルの外（右パネル・サイドバー）にある手書きのテキスト入力は、**本文の `String` +
+バイトオフセットのキャレット**という同じ状態を持ち、`floor_char_boundary` で境界へ丸めてから
+backspace / delete / 左右 / Home / End / 挿入をする同じコードになる。放っておくと画面が増える
+たびにコピーで増え、**片方だけ直した境界バグがもう片方に残る**（#494 の panic が典型で、
+右パネルには移送前まで同型の実装が 2 本あった）。
+
+- 状態は `tako-app` の `text_field::TextField`（GPUI 非依存）に持たせ、編集は
+  `handle_edit_key` / `insert` / `backspace` / `move_*` を通す。画面側でキャレットを動かさない
+- **キーの割り当てはここに置かない**。`enter` が改行か送信か、`escape` が何を閉じるか、
+  `⌘V` をどう捌くかは画面ごとに違う。各画面は自分の割り当てを先に見て、**残りを渡す**
+  （`handle_edit_key` の戻り値は「編集操作だったか」であって「打鍵を消費したか」ではない）
+- 描画で本文を前後に割るときは `split_at_caret()`（丸めが中に閉じている）。生のカーソルを
+  `split_at` へ渡すと文字の途中で切って panic し、GPUI の描画中なのでアプリごと落ちる
+- 丸めの `floor_char_boundary` は `text_field.rs` の**非公開関数**（#1459）。外へ公開すると
+  「呼び出し側で丸めてから自前で drain する」実装が再び生える
+- 上限に当たったら `insert` が `false` を返す。**黙って捨てずに理由を画面へ出す**（#1399 系）
+- 番犬は `crates/tako-control/tests/issue1450b2_tasks_panel_watchdog.rs`。
+  `tasks_panel.rs` / `right_panel.rs` に `floor_char_boundary` / `.drain(` / `char_indices()`
+  が現れたら `file:line` で名指しする（**猶予表は空** = 走査は全面適用）
+
 ## UI アニメーションは「いつ終わるか」を決めてから足す（Issue #945）
 
 GPUI の `AnimationElement` は、**アニメーションが終わっていないフレームで毎回**

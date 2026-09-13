@@ -1961,10 +1961,9 @@ struct TakoApp {
     /// 直近の render で git スクロール領域へ積んだセクションの並び（#551 の回帰検出用）。
     /// 表示順そのものなので、セルフテスト 83 がこの中身で案 2 の並びを固定する
     git_body_sections: Vec<&'static str>,
-    /// git コミットメッセージ入力欄の内容（#472）
-    git_commit_message: String,
-    /// git コミットメッセージ入力欄のキャレット位置（バイトオフセット。#487）
-    git_commit_cursor: usize,
+    /// git コミットメッセージ入力欄の本文とキャレット（#472 / #487。
+    /// 編集操作は `TextField` の 1 実装を通す = #1459）
+    git_commit: crate::text_field::TextField,
     /// git 操作の結果フィードバック（#472。成功は数秒で消え、失敗は閉じるまで残る）
     git_feedback: Option<GitFeedback>,
     /// 実行中の git 操作名（#494。連打・二重押しを防ぐためボタンを無効化する）
@@ -2671,9 +2670,8 @@ struct GitBranchConfirm {
 /// 新規ブランチ名の入力状態（#496。サイドバーの InlineEdit と同じ形）
 #[derive(Debug, Clone)]
 struct GitBranchInput {
-    text: String,
-    /// キャレット位置（バイトオフセット）
-    cursor: usize,
+    /// 入力中のブランチ名とキャレット（編集操作は `TextField` の 1 実装。#1459）
+    field: crate::text_field::TextField,
     /// 基点（None なら現在の HEAD）
     start_point: Option<String>,
 }
@@ -3912,8 +3910,7 @@ impl TakoApp {
             git_collapsed: GitCollapsed::default(),
             git_collapsed_repo: None,
             git_body_sections: Vec::new(),
-            git_commit_message: String::new(),
-            git_commit_cursor: 0,
+            git_commit: crate::text_field::TextField::default(),
             git_feedback: None,
             git_busy: None,
             ime_overlay_anchored: false,
@@ -39778,9 +39775,10 @@ mod self_test {
                     let _ = window496.update(cx, |app, _, cx| {
                         app.git_feedback = None;
                         app.git_collapsed.branches = false;
+                        let mut field = crate::text_field::TextField::default();
+                        field.set_text("st496");
                         app.git_branch_input = Some(GitBranchInput {
-                            text: "st496".into(),
-                            cursor: 5,
+                            field,
                             start_point: None,
                         });
                         cx.notify();
@@ -46987,8 +46985,7 @@ mod self_test {
                 let git_input_ok = window
                     .update(cx, |app, _, cx| {
                         app.git_commit_input_focused = true;
-                        app.git_commit_message.clear();
-                        app.git_commit_cursor = 0;
+                        app.git_commit.clear();
                         // shift+A: key は論理キー名 "a"、key_char が実文字 "A"
                         let upper = Keystroke {
                             modifiers: Modifiers {
@@ -47016,16 +47013,15 @@ mod self_test {
                         );
                         app.handle_git_commit_key(&ch("1", "1"), cx);
                         app.handle_git_commit_key(&ch("minus", "-"), cx);
-                        let typed = app.git_commit_message == "Ab 1-";
+                        let typed = app.git_commit.text() == "Ab 1-";
                         // キャレット移動 + 中間挿入
                         app.handle_git_commit_key(&Keystroke::parse("left").unwrap(), cx);
                         app.handle_git_commit_key(&ch("z", "z"), cx);
-                        let caret_ok = app.git_commit_message == "Ab 1z-";
+                        let caret_ok = app.git_commit.text() == "Ab 1z-";
                         app.handle_git_commit_key(&Keystroke::parse("backspace").unwrap(), cx);
-                        let bs_ok = app.git_commit_message == "Ab 1-";
+                        let bs_ok = app.git_commit.text() == "Ab 1-";
                         // IME / 通常文字経路（replace_text_in_range）でも入る
-                        app.git_commit_message.clear();
-                        app.git_commit_cursor = 0;
+                        app.git_commit.clear();
                         // 修飾なしの未知キーはターミナルへ漏らさず消費する
                         let consumed = app.handle_git_commit_key(&ch("f5", ""), cx);
                         // ⌘ 付きはアプリのキーバインドへ通す（false）
@@ -47041,11 +47037,10 @@ mod self_test {
                         // ⌘V ペーストは欄に入る
                         cx.write_to_clipboard(ClipboardItem::new_string("Fix: 修正".into()));
                         app.paste(cx);
-                        let pasted = app.git_commit_message == "Fix: 修正";
+                        let pasted = app.git_commit.text() == "Fix: 修正";
                         app.handle_git_commit_key(&Keystroke::parse("escape").unwrap(), cx);
                         let esc_ok = !app.git_commit_input_focused;
-                        app.git_commit_message.clear();
-                        app.git_commit_cursor = 0;
+                        app.git_commit.clear();
                         cx.notify();
                         typed && caret_ok && bs_ok && consumed && passed_through && pasted && esc_ok
                     })
@@ -51003,8 +50998,7 @@ mod self_test {
                 let branch_input_ok = window
                     .update(cx, |app, _, cx| {
                         app.git_branch_input = Some(GitBranchInput {
-                            text: String::new(),
-                            cursor: 0,
+                            field: crate::text_field::TextField::default(),
                             start_point: None,
                         });
                         let ch = |k: &str, c: &str| Keystroke {
@@ -51015,7 +51009,7 @@ mod self_test {
                         let text = |app: &TakoApp| {
                             app.git_branch_input
                                 .as_ref()
-                                .map(|i| i.text.clone())
+                                .map(|i| i.field.text().to_string())
                                 .unwrap_or_default()
                         };
                         // shift+F: key は論理キー名、key_char が実文字
@@ -51061,16 +51055,14 @@ mod self_test {
                         let space_dropped = text(app) == "Fix/496";
                         // ⌘V ペースト（paste 経由）も欄に入る
                         if let Some(i) = app.git_branch_input.as_mut() {
-                            i.text.clear();
-                            i.cursor = 0;
+                            i.field.clear();
                         }
                         cx.write_to_clipboard(ClipboardItem::new_string("feat/x-1".into()));
                         app.paste(cx);
                         let pasted = text(app) == "feat/x-1";
                         // 不正なブランチ名は git を呼ぶ前に弾き、入力欄を閉じない
                         if let Some(i) = app.git_branch_input.as_mut() {
-                            i.text = "-d".into();
-                            i.cursor = 2;
+                            i.field.set_text("-d");
                         }
                         app.git_feedback = None;
                         app.git_do_create_branch("/nonexistent-repo-496".into(), cx);
@@ -52211,8 +52203,7 @@ mod self_test {
                         app.panel_view = PanelView::Git;
                         app.git_branch_input = None;
                         app.git_commit_input_focused = true;
-                        app.git_commit_message.clear();
-                        app.git_commit_cursor = 0;
+                        app.git_commit.clear();
                         let pane = app.focused_pane();
                         // 変換開始（setMarkedText 相当）
                         app.replace_and_mark_text_in_range(None, "にほんご", None, window, cx);
@@ -52242,16 +52233,15 @@ mod self_test {
                         };
                         // 確定（insertText 相当）は入力欄へ入る
                         app.replace_text_in_range(None, "日本語", window, cx);
-                        let committed = app.git_commit_message == "日本語" && app.ime.is_none();
+                        let committed = app.git_commit.text() == "日本語" && app.ime.is_none();
                         // unmark（未確定のまま確定扱い）も入力欄へ入る。
                         // 修正前はここでターミナルへ流れ、入力欄は空のままだった
                         app.replace_and_mark_text_in_range(None, "ですね", None, window, cx);
                         app.unmark_text(window, cx);
                         let unmark_ok =
-                            app.git_commit_message == "日本語ですね" && app.ime.is_none();
+                            app.git_commit.text() == "日本語ですね" && app.ime.is_none();
                         // 後始末（後続項目へフォーカス・本文を残さない。#503）
-                        app.git_commit_message.clear();
-                        app.git_commit_cursor = 0;
+                        app.git_commit.clear();
                         app.clear_text_input_focus();
                         app.panel_visible = false;
                         cx.notify();
