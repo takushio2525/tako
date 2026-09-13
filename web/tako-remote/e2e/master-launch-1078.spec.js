@@ -171,11 +171,15 @@ async function setupMocks(page, opts = {}) {
   return calls;
 }
 
+/// 「+」→（#1449 で 3 択になったので）master の経路を開く。
+/// role が足りない端末では種別ボタンそのものが出ないので、そのときは開いたままにする
 async function openLauncher(page) {
   await page.goto(`${BASE}/#/`);
   await page.waitForSelector('.pane-card', { timeout: 10000 });
   await page.locator('.launch-btn').click();
   await page.waitForSelector('.sheet', { timeout: 5000 });
+  const master = page.locator('[data-testid="launch-kind-master"]');
+  if (await master.count()) await master.click();
 }
 
 test.describe('#1078 スマホから master を起動 — モバイル', () => {
@@ -290,6 +294,7 @@ test.describe('#1078 スマホから master を起動 — モバイル', () => {
       setTimeout(() => { shifted = true; }, 1500);
     });
     await page.locator('.launch-btn').click();
+    await page.locator('[data-testid="launch-kind-master"]').click();
     await page.locator('.launch-profile', { hasText: 'dev' }).click();
     await expect(page.locator('.launch-note', { hasText: '時間内に Claude 公式へ繋がりません' }))
       .toBeVisible({ timeout: 20000 });

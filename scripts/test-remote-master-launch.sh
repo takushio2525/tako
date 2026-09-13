@@ -16,6 +16,11 @@
 # 使い方: bash scripts/test-remote-master-launch.sh
 set -euo pipefail
 
+# **本番 GUI を指す env を最初に落とす**（#1449 で実測）。tako のペインの中から
+# 走らせると `TAKO_SOCKET` / `TAKO_TOKEN` / `TAKO_PANE_ID` が継承され、
+# CLI（`tako list`）が隔離インスタンスではなく**ユーザーの本番 GUI** を触る
+unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PASS=0
 FAIL=0
@@ -119,6 +124,11 @@ export TAKO_WORKERS_FILE="$TMP/workers.yaml"
 export TAKO_TMUX_SOCKET="tako-1078-$$"
 export TAKO_PERSIST=0
 export TAKO_TAILSCALE_BIN="$FAKE_TS"
+# #841: ループバック TCP では XFF を読む前に**接続元プロセス**を検証する。
+# 検証を切る（`TAKO_841_LEGACY`）のではなく、「この隔離環境で serve の代わりに
+# 繋いでくるのは curl」だと名前で宣言して**本番と同じ経路**を通す。
+# これが無いと全リクエストが 403（接続元プロセスが tailscale デーモンではない）
+export TAKO_REMOTE_TRUSTED_PEER_NAMES="curl"
 mkdir -p "$TAKO_DATA_DIR" "$TAKO_DISCOVERY_DIR" "$TAKO_REMOTE_STATE_DIR" "$TAKO_ORCHESTRATOR_DIR/profiles"
 # 本番へ書かない不変条件（env が効いていなければここで落とす）
 for d in "$TAKO_DATA_DIR" "$TAKO_REMOTE_STATE_DIR" "$TAKO_ORCHESTRATOR_DIR"; do
@@ -145,7 +155,13 @@ for _ in $(seq 1 200); do
   sleep 0.1
 done
 "$TAKO_BIN" list >/dev/null 2>&1 || { echo "tako-app へ接続できない:"; tail -20 "$TMP/app.log"; exit 1; }
-pass "隔離 tako-app が起動して CLI から見える（pid ${APP_PID}）"
+# 繋がった先が隔離インスタンスであることを確かめる（本番 GUI にタブを作らない）
+BOOT_TABS="$("$TAKO_BIN" list | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["tabs"]))')"
+if [ "$BOOT_TABS" != "1" ]; then
+  echo "繋がった先が隔離インスタンスではない（タブ ${BOOT_TABS} 枚）。中止する。"
+  exit 1
+fi
+pass "隔離 tako-app が起動して CLI から見える（pid ${APP_PID}・タブ 1 枚）"
 
 if ! "$TAKO_BIN" remote start > "$TMP/daemon.log" 2>&1; then
   echo "daemon を起動できなかった:"; cat "$TMP/daemon.log"; exit 1
