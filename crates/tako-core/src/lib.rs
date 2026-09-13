@@ -111,7 +111,9 @@ pub use runner::{
 };
 pub use screen::{InputStatus, InputStyle, Screen, ScreenLine, StyleRun};
 pub use shell::{quote_for_shell, quote_paths_for_shell};
-pub use spawn_layout::{SpawnLayoutConfig, SpawnLayoutPolicy, WorkerLayoutAlgorithm};
+pub use spawn_layout::{
+    SpawnLayoutConfig, SpawnLayoutPolicy, WorkerFontFit, WorkerLayoutAlgorithm,
+};
 pub use tab::{Tab, TabId};
 pub use task_checkpoint::{TaskCheckpoint, TaskPhase};
 pub use terminal::{

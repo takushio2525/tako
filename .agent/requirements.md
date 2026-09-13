@@ -820,7 +820,7 @@ tty 突き合わせ）。現状はペイン配下のみ検知のため、**tako 
 | FR-2.20.4 | **worker 領域の判定は origin / spawned_by による**: 領域 = spawn 由来ペイン（`spawned_by` チェーンが spawn 元に到達）だけのサブツリー。ユーザーが手動で開いたペインが混在するサブツリーは領域と見なさず再構築しない（**master とユーザー由来ペインの矩形を勝手に潰さない**） | M |
 | FR-2.20.5 | worker close 時（dispatch `Close` / UI ×・exit）に空いた場所を残り worker で再配分する。リフローは worker 領域内に限定し、master・ユーザー由来ペインの矩形は不変 | M |
 | FR-2.20.6 | master / solo のデフォルト system prompt に「レイアウト操作時は master とユーザー由来ペインの可読性を最優先する」行動規範を持つ | S |
-| FR-2.20.7 | **worker ペイン 1 枚に最小幅（桁数）を保証する**（#1132）。同じタブへ置くと `min_worker_cols`（既定 60 / 0 = 保証しない / 20〜400）を割る spawn は同じタブへ割らず、①すでにその master 由来の worker だけが居るタブで余裕のあるもの → ②新しいタブ（worker を全幅で置く）の順に出す。配置先と理由は spawn 応答（`tab` / `placement` / `placement_reason` / `pane_cols` / `min_worker_cols`）に載る。設定は config.yaml の `spawn_layout.min_worker_cols` で、CLI `tako orchestrator layout --min-worker-cols` + MCP `tako_orchestrator_layout` の `min_worker_cols` で 1:1 公開する | M |
+| FR-2.20.7 | **worker ペイン 1 枚に最小幅（桁数）を保証する**（#1132 → #1439 で確保の仕方を変更）。worker は**必ず spawn 元と同じタブへ置く**（別タブへ逃がす配置は廃止）。同じタブで `min_worker_cols`（既定 60 / 0 = 保証しない / 20〜400）を割るなら、**その worker 領域のペインのフォントを自動で縮めて**桁数を確保する。床（`min_worker_font_scale`。既定 0.6 = 既定サイズの 60% / 0.4〜1.0）まで縮めても届かなければ床のサイズで置き、spawn 応答に `cols_short=true` と実桁数を載せる。結果は spawn 応答（`tab` / `placement`（常に `same_tab`）/ `placement_reason` / `pane_cols` / `min_worker_cols` / `font_scale` / `font_size` / `cols_short` / `font_refit`）に載る。設定は config.yaml の `spawn_layout.min_worker_cols` / `auto_shrink_font` / `min_worker_font_scale` で、CLI `tako orchestrator layout --min-worker-cols / --auto-shrink-font / --min-worker-font-scale` + MCP `tako_orchestrator_layout` の同名パラメータで 1:1 公開する | M |
 
 実装メモ（2026-07-13）: レイアウト計算は `tako-core::spawn_layout`（ポリシー型 +
 領域構築の純関数）と `PaneTree::spawn_worker` / `reflow_workers`（領域判定 + 再構築）。
@@ -852,6 +852,33 @@ tako-app `remove_pane_with` の両方から `reflow_workers` を呼ぶ。設定�
   同タブに置けなくなる）
 - `spawn_worker`（tako-core）は下限を見ない。配置の決定は dispatch の
   `plan_worker_placement` に閉じているので、#165 の rect テストは 1 ビットも変わらない
+
+実装メモ（2026-09-13。FR-2.20.7 の**確保の仕方の変更** = #1439）: #1132 の
+「別タブへ逃がす」は下限幅を守れていたが、**1 グループ = 1 タブで集約監視する**
+という tako のコンセプトを壊した（実測: 8 体 spawn でタブが 8 枚に散り、master の
+タブから worker が 1 枚も見えない）。ユーザー指示（2026-09-13）は
+「見切れそうなら子ペインの文字サイズを小さくする。タブ分けはマジでしない」。
+
+- 配置は**常に `same_tab`**。別タブ配置（`new_tab` / `overflow_tab`）のコードは
+  A/B の対照として `TAKO_1439_LEGACY=1` のときだけ通る（腕は `PlacementArm` の型で
+  表し、env の読み取りと判断を分けてある = 3 腕を単体テストから決定的に回せる）
+- 桁数の確保は `tako-control::worker_font::refit_worker_area` の 1 実装。
+  **worker 領域まるごと**を当て直す（grid は 1 体足すと既存の列も細くなるので、
+  新しいペインだけ縮めても残りが下限を割ったまま残る）。呼び口は spawn 直後・
+  close 後のリフロー・復元 / リサイズ（tako-app の render から取りこぼしぶんだけ）
+- 段の選び方（5% 刻み・床で止める・届かなければ床 + `cols_short`）は
+  `tako_core::spawn_layout::fit_worker_font`（**純関数**）。「その倍率で何桁入るか」は
+  `ControlHost::pane_cols_for_width_fraction(tab, fraction, font_scale)` として
+  GUI が答える。GUI は**段ごとのセル幅を実測**して控える（`refresh_font_scale_cells`。
+  倍率を線形に割ると実フォントの丸めと 8pt クランプでずれる）
+- 床 0.6 の根拠: 既定 13pt に対して 7.8pt = ペイン単位ズームの下限（8pt）とほぼ同じ。
+  これより小さい倍率を許しても実セル幅は 8pt で頭打ちになり**桁数は増えない**
+- 戻し方は自動。worker が閉じて幅が戻れば当て直しで倍率 1.0 が選ばれ、縮小が外れる。
+  **ユーザーが cmd +/- で手で決めたペインは触らない**（`auto_font_panes` で出自を分ける）
+- 限界: 同じタブに 8 体入れると 119 桁のタブでは worker が約 17 桁 → 床まで縮めても
+  約 28 桁で下限 60 桁に届かない。**これは方針上避けられない**ので、spawn 応答の
+  `cols_short=true` と理由文（ウィンドウを広げる / worker を減らす /
+  `--min-worker-cols` を下げる）で master へ伝える
 
 ### FR-2.21 アプリ内更新の通知と専用画面（✅ 2026-07-28、#616。基盤は #36 / #403 / #50 / #595）
 

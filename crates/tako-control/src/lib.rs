@@ -88,6 +88,8 @@ mod test_home;
 mod test_write_isolation;
 pub mod transcript;
 pub mod welcome;
+/// worker ペインのフォント自動縮小（#1439）
+pub mod worker_font;
 
 pub use dispatch::{
     dispatch, dispatch_orchestrator_accounts, dispatch_orchestrator_layout, fetch_tmux_sessions,

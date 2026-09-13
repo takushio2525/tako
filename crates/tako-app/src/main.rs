@@ -1621,6 +1621,20 @@ struct TakoApp {
     cell_size: Option<Size<Pixels>>,
     /// ペインごとのフォントサイズオーバーライド（未設定ならテーマ既定）
     pane_font_sizes: HashMap<PaneId, f32>,
+    /// #1439: `pane_font_sizes` のうち**自動縮小が当てた**ペイン。
+    /// ユーザーが cmd +/- で手で決めたぶんはここに入らないので、当て直しで
+    /// 上書きされない（手の指定が勝つ）
+    auto_font_panes: std::collections::HashSet<PaneId>,
+    /// #1439: フォント倍率の段ごとに実測したセル幅（(倍率, セル幅 px)）。
+    /// テーマのフォント（ファミリー / サイズ）が変わったときだけ測り直す
+    font_scale_cells: Option<(u64, Vec<(f32, f32)>)>,
+    /// #1439: worker ペインのフォントを当て直す必要がある（復元直後・ウィンドウ幅の変化）。
+    /// 実測（`pane_area_metrics`）が載ってから 1 回だけ回す
+    worker_font_refit_pending: bool,
+    /// #1439: 最後に当て直したときのタブ内容領域の幅（px）と時刻。
+    /// 幅が動いたときだけ、かつ連続ドラッグでは間引いて当て直す
+    worker_font_refit_width: f32,
+    worker_font_refit_at: std::time::Instant,
     /// ペインごとのセル寸法キャッシュ（フォントサイズ変更時に無効化）
     pane_cell_sizes: HashMap<PaneId, Size<Pixels>>,
     /// マウス選択中のペイン
@@ -3713,6 +3727,12 @@ impl TakoApp {
             focus_handle: cx.focus_handle(),
             cell_size: None,
             pane_font_sizes: HashMap::new(),
+            auto_font_panes: std::collections::HashSet::new(),
+            font_scale_cells: None,
+            // 復元されたペインは一度も当て直していない（#1439）
+            worker_font_refit_pending: true,
+            worker_font_refit_width: 0.0,
+            worker_font_refit_at: std::time::Instant::now(),
             pane_cell_sizes: HashMap::new(),
             selecting: None,
             drag_scroll: None,
@@ -8249,6 +8269,8 @@ impl TakoApp {
         }
         self.pane_font_sizes.insert(pane_id, new_size);
         self.pane_cell_sizes.remove(&pane_id);
+        // #1439: 手で決めたぶんは自動縮小の当て直しで上書きしない
+        self.auto_font_panes.remove(&pane_id);
         cx.notify();
     }
 
@@ -8272,6 +8294,8 @@ impl TakoApp {
         }
         self.pane_font_sizes.remove(&pane_id);
         self.pane_cell_sizes.remove(&pane_id);
+        // #1439: 手の指定を捨てる = 自動縮小へ返す（次の当て直しでまた縮みうる）
+        self.auto_font_panes.remove(&pane_id);
         cx.notify();
     }
 
@@ -8800,6 +8824,8 @@ impl TakoApp {
             .expect("直前に存在を確認したタブ");
         // Issue #165: worker close 後のリフロー用に spawn 元を close 前に記録する
         // （明示 close も worker プロセスの exit 由来も対象）
+        // #1439: リフローの後にフォントの当て直しを予約する（`tab` の借用を抜けてから）
+        let mut reflow_refit = false;
         let reflow_anchor = tab
             .tree()
             .get(pane_id)
@@ -8817,6 +8843,9 @@ impl TakoApp {
                     if layout.policy != tako_core::SpawnLayoutPolicy::Legacy {
                         let _ = tab.tree_mut().reflow_workers(anchor, layout.algorithm);
                     }
+                    // #1439: 幅が戻ったぶんフォントも戻す。ここは `tab` を可変で
+                    // 借りているので予約だけ置き、次の render で当て直す
+                    reflow_refit = true;
                 }
                 // ペインログの最終フラッシュ（Issue #112 B。セッション破棄前に書き残す）
                 if let Some(data) = log_close {
@@ -8834,7 +8863,9 @@ impl TakoApp {
                 self.known_failed.remove(&pane_id);
                 self.scroll_accum.remove(&pane_id);
                 self.scroll_ctls.remove(&pane_id);
+                self.worker_font_refit_pending |= reflow_refit;
                 self.pane_font_sizes.remove(&pane_id);
+                self.auto_font_panes.remove(&pane_id);
                 self.pane_cell_sizes.remove(&pane_id);
                 self.pane_last_text_areas.remove(&pane_id);
                 self.pane_text_area_probes.remove(&pane_id);
@@ -16121,20 +16152,30 @@ impl TakoApp {
         if let Some(cell) = self.cell_size {
             return cell;
         }
+        let width = self.measure_cell_width(self.theme.font_size, window);
+        let cell = size(width, px(self.theme.line_height));
+        self.cell_size = Some(cell);
+        cell
+    }
+
+    /// フォントサイズ `font_size` のときのセル幅（#1439 で 1 実装へ寄せた）。
+    ///
+    /// `measure_cell`（テーマ既定）・`measure_pane_cell`（ペイン単位のズーム）・
+    /// 倍率の段ごとの実測（[`Self::refresh_font_scale_cells`]）が**同じ式**を通る。
+    /// ずれると「見積もった倍率のセル幅」と「実際に描くセル幅」が食い違い、
+    /// 縮めたのに桁数が足りない = #1439 の保証が嘘になる
+    fn measure_cell_width(&self, font_size: f32, window: &mut Window) -> Pixels {
         let font = Font {
             family: SharedString::from(self.theme.font_family.clone()),
             ..gpui::font(self.theme.font_family.clone())
         };
         let font_id = window.text_system().resolve_font(&font);
-        let width = window
+        window
             .text_system()
-            .advance(font_id, px(self.theme.font_size), 'M')
+            .advance(font_id, px(font_size), 'M')
             .map(|advance| advance.width)
             // 計測に失敗してもセル幅ゼロで詰まないよう概算へフォールバック
-            .unwrap_or(px(self.theme.font_size * 0.6));
-        let cell = size(width, px(self.theme.line_height));
-        self.cell_size = Some(cell);
-        cell
+            .unwrap_or(px(font_size * 0.6))
     }
 
     /// 表示中タブに居ないペインへも新しいセル寸法を反映する（#647）。
@@ -16168,6 +16209,10 @@ impl TakoApp {
                 cell_width: cell_w,
             })
         };
+        // #1439: 倍率の段ごとのセル幅も**描いたときに**測っておく（dispatch には
+        // `Window` が無いので、その場では測れない）。テーマのフォントが変わった
+        // ときだけ測り直すので、毎フレームの費用は指紋 1 個ぶん
+        self.refresh_font_scale_cells(window);
         // #1426: ここから下は render から毎フレーム通るのに、**材料が同じあいだは
         // 毎回まったく同じ答えを出し直している**（22 ペイン / 表示 4 で 1 フレームあたり
         // Vec 1 確保 + 約 88 比較 + 18 ペイン分の当て直し = 実測 0.6〜0.78µs）。
@@ -16350,6 +16395,105 @@ impl TakoApp {
             .unwrap_or(self.theme.font_size)
     }
 
+    /// 倍率 `scale`（テーマ既定に対する比率）を**実際に適用できる**絶対サイズへ（#1439）。
+    ///
+    /// ズーム操作（cmd +/-）と同じ下限・上限へクランプする。既定 13pt なら
+    /// 床 0.6 = 7.8pt がクランプされて 8.0pt になる = それ以上縮めても桁数は増えない。
+    /// 見積もり（[`Self::pane_cols_for_width_fraction`]）も同じ値を通すので、
+    /// 「縮めたつもりで桁数が増えていない」を応答が取り違えない
+    fn pane_font_size_for_scale(&self, scale: f32) -> f32 {
+        (self.theme.font_size * scale).clamp(Self::FONT_SIZE_MIN, Self::FONT_SIZE_MAX)
+    }
+
+    /// worker ペインのフォントを当て直す（#1439。復元直後とウィンドウ幅の変化）。
+    ///
+    /// spawn / close は dispatch が同期で当てるので、ここが拾うのは
+    /// **dispatch を通らない変化**だけ:
+    ///
+    /// - 復元直後（`pane_font_sizes` は永続しないので、再起動すると縮小が消える）
+    /// - ウィンドウのリサイズ・サイドバーの開閉（桁数が変わる）
+    ///
+    /// 毎フレームの費用は `bool` 1 個 + 幅の比較 1 回。実際に当て直すのは
+    /// 幅が動いたときだけ、かつドラッグ中に暴れないよう 1 秒に 1 回までに間引く
+    /// （config.yaml の読み込みを伴うので毎フレームは回せない）
+    fn refit_worker_fonts_if_needed(&mut self) {
+        const REFIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+        let Some(metrics) = self.pane_area_metrics else {
+            return; // まだ一度も描いていない = 桁数を測れない
+        };
+        let width_changed = (metrics.content_width - self.worker_font_refit_width).abs() > 0.5;
+        if !self.worker_font_refit_pending && !width_changed {
+            return;
+        }
+        if width_changed && self.worker_font_refit_at.elapsed() < REFIT_INTERVAL {
+            return;
+        }
+        self.worker_font_refit_pending = false;
+        self.worker_font_refit_width = metrics.content_width;
+        self.worker_font_refit_at = std::time::Instant::now();
+        let layout = tako_control::setup::spawn_layout_config();
+        let tabs: Vec<TabId> = self.workspace.tabs().iter().map(|t| t.id()).collect();
+        for tab in tabs {
+            tako_control::worker_font::refit_tab(self, tab, &layout);
+        }
+    }
+
+    /// テーマのフォント（ファミリー + サイズ）の指紋（#1439。段の測り直しの契機）
+    fn font_ladder_key(&self) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::{Hash, Hasher};
+        self.theme.font_family.hash(&mut h);
+        self.theme.font_size.to_bits().hash(&mut h);
+        h.finish()
+    }
+
+    /// 倍率の段ごとのセル幅を実測して控える（#1439）。
+    ///
+    /// 段は tako-core の 1 実装（[`tako_core::spawn_layout::worker_font_scale_steps`]）を
+    /// 使う。**床いっぱい**（`WORKER_FONT_SCALE_MIN`）まで測っておくので、
+    /// 設定でどの床にしても当てはめが空振りしない
+    fn refresh_font_scale_cells(&mut self, window: &mut Window) {
+        let key = self.font_ladder_key();
+        if self
+            .font_scale_cells
+            .as_ref()
+            .is_some_and(|(k, _)| *k == key)
+        {
+            return;
+        }
+        let steps = tako_core::spawn_layout::worker_font_scale_steps(
+            tako_core::spawn_layout::WORKER_FONT_SCALE_MIN,
+        );
+        let cells: Vec<(f32, f32)> = steps
+            .into_iter()
+            .map(|scale| {
+                let fs = self.pane_font_size_for_scale(scale);
+                (scale, f32::from(self.measure_cell_width(fs, window)))
+            })
+            .collect();
+        self.font_scale_cells = Some((key, cells));
+    }
+
+    /// 倍率 `scale` のときのセル幅（px。#1439）。実測した段があればそれを使う
+    fn cell_width_for_scale(&self, scale: f32, fallback: f32) -> f32 {
+        self.font_scale_cells
+            .as_ref()
+            .and_then(|(_, cells)| {
+                cells
+                    .iter()
+                    .min_by(|a, b| {
+                        (a.0 - scale)
+                            .abs()
+                            .partial_cmp(&(b.0 - scale).abs())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    // 段から離れた倍率（段を作り替えたのに片方が古い）は使わない
+                    .filter(|(s, _)| (s - scale).abs() < 1e-3)
+                    .map(|(_, w)| *w)
+            })
+            .unwrap_or(fallback * scale)
+    }
+
     /// ペイン単位のline_height（font_size と同じ比率でスケール）
     fn pane_line_height(&self, pane_id: PaneId) -> f32 {
         let fs = self.pane_font_size(pane_id);
@@ -16363,16 +16507,7 @@ impl TakoApp {
         }
         let fs = self.pane_font_size(pane_id);
         let lh = self.pane_line_height(pane_id);
-        let font = Font {
-            family: SharedString::from(self.theme.font_family.clone()),
-            ..gpui::font(self.theme.font_family.clone())
-        };
-        let font_id = window.text_system().resolve_font(&font);
-        let width = window
-            .text_system()
-            .advance(font_id, px(fs), 'M')
-            .map(|advance| advance.width)
-            .unwrap_or(px(fs * 0.6));
+        let width = self.measure_cell_width(fs, window);
         let cell = size(width, px(lh));
         self.pane_cell_sizes.insert(pane_id, cell);
         cell
@@ -20467,8 +20602,54 @@ impl UiStateHost for TakoApp {
     /// ウィンドウの性質なので、作られた直後のタブ（= あふれ先を選ぶまさにその瞬間）でも
     /// 答えられる。複数ウィンドウでは最後に描いたウィンドウの幅を使う近似。
     /// まだ一度も描かれていないなら `None` を返し、呼び出し側は下限の保証をしない
-    fn pane_cols_for_width_fraction(&self, _tab: TabId, fraction: f32) -> Option<u16> {
-        Some(self.pane_area_metrics?.cols_for_fraction(fraction))
+    fn pane_cols_for_width_fraction(
+        &self,
+        _tab: TabId,
+        fraction: f32,
+        font_scale: f32,
+    ) -> Option<u16> {
+        let metrics = self.pane_area_metrics?;
+        // #1439: 縮めたときの桁数は**その倍率で実測したセル幅**で出す
+        // （線形に割ると実フォントの丸め・8pt クランプとずれる）
+        Some(
+            PaneWidthMetrics {
+                content_width: metrics.content_width,
+                cell_width: self.cell_width_for_scale(font_scale, metrics.cell_width),
+            }
+            .cols_for_fraction(fraction),
+        )
+    }
+
+    /// #1439: worker ペインのフォント倍率を当てる / 外す。
+    ///
+    /// 手でズームしたペイン（`auto_font_panes` に無いのにオーバーライドがある）は
+    /// 触らない。戻り値は**その後に効いている絶対サイズ**
+    fn set_worker_font_scale(&mut self, pane: PaneId, scale: Option<f32>) -> Option<f32> {
+        let manual =
+            self.pane_font_sizes.contains_key(&pane) && !self.auto_font_panes.contains(&pane);
+        if manual {
+            return Some(self.pane_font_size(pane));
+        }
+        match scale {
+            Some(s) => {
+                let size = self.pane_font_size_for_scale(s);
+                if (self.pane_font_size(pane) - size).abs() > 0.01 {
+                    self.pane_font_sizes.insert(pane, size);
+                    // セル寸法を捨てると、次の render が新しいサイズで grid を測り直す
+                    // （= PTY も新しい cols/rows へリサイズされる）
+                    self.pane_cell_sizes.remove(&pane);
+                }
+                self.auto_font_panes.insert(pane);
+                Some(size)
+            }
+            None => {
+                if self.auto_font_panes.remove(&pane) {
+                    self.pane_font_sizes.remove(&pane);
+                    self.pane_cell_sizes.remove(&pane);
+                }
+                Some(self.pane_font_size(pane))
+            }
+        }
     }
 
     fn set_filetree(&mut self, visible: bool) {
@@ -23009,6 +23190,9 @@ impl Render for TakoApp {
         // 表示中タブ以外のペインへもセル寸法の変更を届ける（#647）。
         // pane_text_areas を確定させた直後（= 誰が表示中かが分かった時点）に呼ぶ
         self.sync_offscreen_pane_sizes(content_rect, window);
+        // #1439: worker ペインのフォントを当て直す（復元直後・ウィンドウ幅の変化）。
+        // spawn / close の経路は dispatch が同期で当てるので、ここは**取りこぼし専用**
+        self.refit_worker_fonts_if_needed();
 
         let drop_layout = layout.clone();
         // #786: ペイン本体は 1 枚ずつ独立した子ビュー（`PaneBody`）にして
@@ -47960,18 +48144,32 @@ mod self_test {
                 // 復元は config.yaml へ**解決済みの値**を書き戻す（未設定だった場合は
                 // 既定値が明示されるだけで、resolve() の結果は変わらない）
                 let layout_min_before = tako_control::dispatch_orchestrator_layout(
-                    None, None, None, None,
+                    None, None, None, None, None, None,
                 )
                 .ok()
                 .and_then(|v| v["min_worker_cols"].as_u64())
                 .map(|v| v as u16)
                 .unwrap_or(tako_core::spawn_layout::DEFAULT_MIN_WORKER_COLS);
                 let restore_layout_min = |v: u16| {
-                    let _ = tako_control::dispatch_orchestrator_layout(None, None, None, Some(v));
+                    let _ = tako_control::dispatch_orchestrator_layout(
+                        None,
+                        None,
+                        None,
+                        Some(v),
+                        None,
+                        None,
+                    );
                 };
-                let min_off = tako_control::dispatch_orchestrator_layout(None, None, None, Some(0))
-                    .ok()
-                    .and_then(|v| v["min_worker_cols"].as_u64())
+                let min_off = tako_control::dispatch_orchestrator_layout(
+                    None,
+                    None,
+                    None,
+                    Some(0),
+                    None,
+                    None,
+                )
+                .ok()
+                .and_then(|v| v["min_worker_cols"].as_u64())
                     == Some(0);
                 check(min_off, "spawn レイアウト: 下限幅を切って rect を測る (#1132)");
 
@@ -48111,12 +48309,12 @@ mod self_test {
                     "spawn レイアウト: close 後も master とユーザーペインは不変",
                 );
 
-                // 72b. #1132: worker ペイン 1 枚の下限幅の保証。
-                //      同じタブへ置くと下限を割る spawn は、同じタブへ割らず**別のタブ**へ
-                //      出て、応答に配置先と理由が載ること。
-                //      下限は「そのタブの全幅」に取る（= 同タブの見積もり（半分以下）は
-                //      必ず割り、新しいタブ（全幅）は必ず満たす）ので、画面の大きさに
-                //      依らず判定が決まる
+                // 72b. #1439: worker ペイン 1 枚の下限桁数を**同じタブのまま**確保する。
+                //      #1132 は下限を割る spawn を別タブへ逃がしていたが、それは
+                //      「1 グループ = 1 タブ」を壊す。いまは必ず同じタブへ置き、
+                //      足りないぶんは worker ペインのフォントを縮めて確保する。
+                //      下限は「そのタブの全幅」に取る（= 同タブの worker 領域（半分以下）は
+                //      必ず割る）ので、画面の大きさに依らず「縮める」側の判定が決まる
                 {
                     // 幅の実測はフレームが描かれてから載る（このタブは表示していないので
                     // #932 の裏タブ用の割り出しを待つ）。**出るまで待つのではなく
@@ -48136,6 +48334,7 @@ mod self_test {
                                         app,
                                         TabId::from_raw(lt_tab),
                                         1.0,
+                                        1.0,
                                     )
                                 })
                                 .ok()
@@ -48153,24 +48352,64 @@ mod self_test {
                     match floor {
                         None => println!(
                             "SKIP: ペインが一度も描かれておらず幅を実測できないため \
-                             worker ペインの下限幅の検証を飛ばす (#1132)"
+                             worker ペインの下限幅の検証を飛ばす (#1439)"
                         ),
                         Some(floor) => {
-                            let applied = tako_control::dispatch_orchestrator_layout(
+                            let layout_resp = tako_control::dispatch_orchestrator_layout(
                                 None,
                                 None,
                                 None,
                                 Some(floor),
+                                None,
+                                None,
                             )
-                            .ok()
-                            .and_then(|v| v["min_worker_cols"].as_u64())
+                            .ok();
+                            let applied = layout_resp
+                                .as_ref()
+                                .and_then(|v| v["min_worker_cols"].as_u64())
                                 == Some(u64::from(floor));
                             check(applied, "spawn レイアウト: 下限幅の設定 (#1132)");
+                            // 有効な方針が応答に出る（CLI / MCP と同じ 1 実装。#1439）
+                            let policy_ok = layout_resp.as_ref().is_some_and(|v| {
+                                v["placement"].as_str() == Some("same_tab")
+                                    && v["auto_shrink_font"].as_bool() == Some(true)
+                                    && v["min_worker_font_scale"].as_f64().is_some()
+                                    && v["effective_policy"]
+                                        .as_str()
+                                        .is_some_and(|s| s.contains("タブ分けなし"))
+                            });
+                            check(
+                                policy_ok,
+                                &format!(
+                                    "spawn レイアウト: layout 応答に有効な方針が出る \
+                                     (#1439。placement={} auto={} floor={})",
+                                    layout_resp
+                                        .as_ref()
+                                        .and_then(|v| v["placement"].as_str())
+                                        .unwrap_or("-"),
+                                    layout_resp
+                                        .as_ref()
+                                        .and_then(|v| v["auto_shrink_font"].as_bool())
+                                        .unwrap_or(false),
+                                    layout_resp
+                                        .as_ref()
+                                        .and_then(|v| v["min_worker_font_scale"].as_f64())
+                                        .unwrap_or(0.0)
+                                ),
+                            );
+                            let font_floor = layout_resp
+                                .as_ref()
+                                .and_then(|v| v["min_worker_font_scale"].as_f64())
+                                .unwrap_or(0.6);
+                            // タブが増えていないことを見るので spawn の**前**に数える
+                            let tabs_before_1439 = window
+                                .update(cx, |app, _, _cx| app.workspace.tabs().len())
+                                .unwrap_or(0);
                             let spawned = window
                                 .update(cx, |app, _, _cx| {
                                     tako_control::dispatch(
                                         app,
-                                        spawn_req(lt_master, "w1132"),
+                                        spawn_req(lt_master, "w1439"),
                                         PaneOrigin::Mcp,
                                     )
                                     .ok()
@@ -48179,44 +48418,112 @@ mod self_test {
                                 .flatten();
                             let Some(resp) = spawned else {
                                 restore_layout_min(layout_min_before);
-                                fail("spawn レイアウト: 下限幅つき spawn (#1132)");
+                                fail("spawn レイアウト: 下限幅つき spawn (#1439)");
                             };
                             let placement = resp["placement"].as_str().unwrap_or("");
                             let out_tab = resp["tab"].as_u64().unwrap_or(0);
                             let out_pane = resp["pane_id"].as_u64().unwrap_or(0);
                             let reason = resp["placement_reason"].as_str().unwrap_or("");
                             let cols = resp["pane_cols"].as_u64().unwrap_or(0);
+                            let scale = resp["font_scale"].as_f64().unwrap_or(1.0);
+                            let font_size = resp["font_size"].as_f64().unwrap_or(0.0);
+                            let short = resp["cols_short"].as_bool().unwrap_or(false);
                             check(
-                                placement == "new_tab" && out_tab != lt_tab,
+                                placement == "same_tab" && out_tab == lt_tab,
                                 &format!(
-                                    "spawn レイアウト: 下限を割る spawn は別タブへ出る \
-                                     (#1132。placement={placement} tab={out_tab} 元={lt_tab})"
+                                    "spawn レイアウト: 下限を割っても同じタブへ置く \
+                                     (#1439。placement={placement} tab={out_tab} 元={lt_tab})"
+                                ),
+                            );
+                            // タブ全幅を下限にしたので、worker 領域（半分以下）は
+                            // 床まで縮めても届かない = 床の倍率 + cols_short
+                            check(
+                                (scale - font_floor).abs() < 1e-3 && short && font_size > 0.0,
+                                &format!(
+                                    "spawn レイアウト: 床まで縮めて cols_short を立てる \
+                                     (#1439。font_scale={scale} 床={font_floor} \
+                                     font_size={font_size} cols_short={short})"
                                 ),
                             );
                             check(
-                                !reason.is_empty() && cols >= u64::from(floor),
+                                reason.contains("同じタブ") && cols > 0,
                                 &format!(
-                                    "spawn レイアウト: 応答に配置先の理由と桁数が載る \
-                                     (#1132。cols={cols} 下限={floor} 理由={reason})"
+                                    "spawn レイアウト: 応答に理由と実桁数が載る \
+                                     (#1439。cols={cols} 下限={floor} 理由={reason})"
                                 ),
                             );
-                            // あふれ先タブのルートが worker 本体（= 全幅）
-                            let root_is_worker = window
+                            // 実際にペインへ当たっている（テーマ既定より小さい）
+                            let (theme_size, applied) = window
                                 .update(cx, |app, _, _cx| {
-                                    let tab = app.workspace.get_tab(TabId::from_raw(out_tab))?;
-                                    let panes = tab.tree().panes();
-                                    Some(panes.len() == 1 && panes[0].id().as_u64() == out_pane)
+                                    (
+                                        app.theme.font_size,
+                                        app.pane_font_sizes
+                                            .get(&PaneId::from_raw(out_pane))
+                                            .copied(),
+                                    )
+                                })
+                                .unwrap_or((0.0, None));
+                            check(
+                                applied.is_some_and(|s| s < theme_size),
+                                &format!(
+                                    "spawn レイアウト: ペインに縮小が当たっている \
+                                     (#1439。適用={applied:?} テーマ既定={theme_size})"
+                                ),
+                            );
+                            // 新しいタブは**作られていない**（#1439 の肝）
+                            let tabs_after = window
+                                .update(cx, |app, _, _cx| app.workspace.tabs().len())
+                                .unwrap_or(0);
+                            check(
+                                tabs_after == tabs_before_1439,
+                                &format!(
+                                    "spawn レイアウト: タブは増えない \
+                                     (#1439。前={tabs_before_1439} 後={tabs_after})"
+                                ),
+                            );
+                            // 下限を切ると当て直しでフォントが既定へ戻る
+                            let _ = tako_control::dispatch_orchestrator_layout(
+                                None,
+                                None,
+                                None,
+                                Some(0),
+                                None,
+                                None,
+                            );
+                            let restored = window
+                                .update(cx, |app, _, _cx| {
+                                    let layout =
+                                        tako_control::setup::spawn_layout_config();
+                                    tako_control::worker_font::refit_worker_area(
+                                        app,
+                                        TabId::from_raw(lt_tab),
+                                        PaneId::from_raw(lt_master),
+                                        &layout,
+                                    );
+                                    app.pane_font_sizes
+                                        .get(&PaneId::from_raw(out_pane))
+                                        .copied()
                                 })
                                 .ok()
-                                .flatten()
-                                .unwrap_or(false);
+                                .flatten();
                             check(
-                                root_is_worker,
-                                "spawn レイアウト: あふれ先タブは worker が全幅で 1 枚 (#1132)",
+                                restored.is_none(),
+                                &format!(
+                                    "spawn レイアウト: 保証を切ると縮小が外れる \
+                                     (#1439。残った上書き={restored:?})"
+                                ),
                             );
-                            // 後始末: あふれ先タブを閉じる
-                            let _ = window.update(cx, |app, _, cx| {
-                                app.remove_tab(TabId::from_raw(out_tab), cx);
+                            // 後始末: 足した worker を閉じる（タブは 72 の後始末で閉じる）
+                            let _ = window.update(cx, |app, _, _cx| {
+                                tako_control::dispatch(
+                                    app,
+                                    tako_control::protocol::Request::Close {
+                                        pane: Some(out_pane),
+                                        force: true,
+                                        caller_role: None,
+                                    },
+                                    PaneOrigin::Mcp,
+                                )
                             });
                         }
                     }

@@ -1572,10 +1572,15 @@ pub fn tools() -> Vec<Value> {
                 worker close 時は領域内だけがリフローされ、master とユーザーが自分で開いた\
                 ペインの矩形は変わらない。\
                 min_worker_cols は worker ペイン 1 枚に保証する最小の桁数（既定 60。0 = 保証しない）。\
-                これを割る spawn は同じタブへ割らず、この master の worker が居る別のタブか\
-                新しいタブへ出る（spawn 応答の placement / placement_reason / pane_cols に載る）。\
+                **worker は必ず spawn 元と同じタブへ置く**（#1439。別タブへ逃がす配置は廃止した）。\
+                下限を割るときは worker ペインのフォントを自動で縮めて桁数を確保し、\
+                床（min_worker_font_scale。既定 0.6 = 既定サイズの 60%）まで縮めても届かなければ\
+                床のサイズで置いて spawn 応答に cols_short=true と実桁数を載せる\
+                （spawn 応答の placement / placement_reason / pane_cols / font_scale / font_size / \
+                cols_short / font_refit に載る）。auto_shrink_font=false で自動縮小を切れる\
+                （狭いまま置く。タブは分けない）。\
                 狭いペインでは claude TUI がメッセージをハード折り返しするので、\
-                上限・ダイアログ・報告の読み取りが同時に壊れる（#1132）。",
+                上限・ダイアログ・報告の読み取りが同時に壊れる（#1132 / #1123）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1596,6 +1601,14 @@ pub fn tools() -> Vec<Value> {
                         "type": "string",
                         "enum": ["grid", "spiral"],
                         "description": "worker 領域内の配置アルゴリズム（省略で現状維持）",
+                    },
+                    "auto_shrink_font": {
+                        "type": "boolean",
+                        "description": "下限桁数を割るとき worker ペインのフォントを自動で縮めるか（既定 true。false でも別タブへは出さない。省略で現状維持）",
+                    },
+                    "min_worker_font_scale": {
+                        "type": "number",
+                        "description": "自動縮小の床（既定フォントサイズに対する比率。0.4〜1.0。既定 0.6。省略で現状維持）",
                     },
                 },
                 "additionalProperties": false,

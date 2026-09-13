@@ -319,8 +319,9 @@ pub trait UiStateHost {
     /// ファイルツリーの root 同期をトリガーする（#134: pinned_folders 変更後に呼ぶ）
     fn sync_filetree(&mut self) {}
 
-    /// タブ `tab` のペインが**タブ内容領域の幅の `fraction` を占める**ときに収まる桁数
-    /// （#1132。worker ペインの最小幅を保証するための見積もり）。
+    /// タブ `tab` のペインが**タブ内容領域の幅の `fraction` を占める**ときに、
+    /// フォント倍率 `font_scale`（既定サイズに対する比率）で収まる桁数
+    /// （#1132 / #1439。worker ペインの最小幅を保証するための見積もり）。
     ///
     /// 桁数への変換はセル幅・ペインの枠と余白という**実測**に依るので、
     /// 画面を持つホスト（GUI）だけが答えられる。実測が無いホスト・まだ一度も
@@ -328,8 +329,27 @@ pub trait UiStateHost {
     /// （見積もれないことを理由に spawn を止めない）。
     ///
     /// 実装は表示中ペインの寸法計算（`grid_cells`）と同じ式を通すこと。
-    /// ずれると「見積もりでは足りるのに実際は狭い」= #1132 の症状が戻る
-    fn pane_cols_for_width_fraction(&self, _tab: TabId, _fraction: f32) -> Option<u16> {
+    /// ずれると「見積もりでは足りるのに実際は狭い」= #1132 の症状が戻る。
+    /// `font_scale` は [`tako_core::spawn_layout::worker_font_scale_steps`] の段で
+    /// 渡ってくるので、ホスト側のセル幅の実測も**同じ段**で行う
+    fn pane_cols_for_width_fraction(
+        &self,
+        _tab: TabId,
+        _fraction: f32,
+        _font_scale: f32,
+    ) -> Option<u16> {
+        None
+    }
+
+    /// worker ペインのフォント倍率を当てる / 外す（#1439）。
+    ///
+    /// `Some(scale)` = 既定フォントサイズの `scale` 倍で描く（自動縮小）。
+    /// `None` = 自動縮小を外して既定へ戻す（worker が閉じて幅が戻ったとき）。
+    /// 戻り値は**実際に効いている絶対フォントサイズ**（pt。フォントの概念を持たない
+    /// ホストは `None`）。
+    ///
+    /// ユーザーが cmd +/- で手で決めたペインは**上書きしない**（手の指定が勝つ）
+    fn set_worker_font_scale(&mut self, _pane: PaneId, _scale: Option<f32>) -> Option<f32> {
         None
     }
 

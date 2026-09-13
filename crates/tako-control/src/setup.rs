@@ -329,6 +329,14 @@ pub struct SpawnLayoutSection {
     /// 移行の手順は不要（#916 の指紋テストが型の変更を検知する）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_worker_cols: Option<u16>,
+    /// 下限桁数を割るとき worker ペインのフォントを自動で縮めるか（#1439。既定 true）。
+    /// **旧ファイルにこのキーは無い**ので serde default（= None → 既定値へ解決）で読める
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_shrink_font: Option<bool>,
+    /// 自動縮小の床（既定フォントサイズに対する比率。#1439。既定 0.6）。
+    /// 旧ファイルに無いキーなので serde default で読める
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_worker_font_scale: Option<f32>,
 }
 
 impl SpawnLayoutSection {
@@ -358,6 +366,11 @@ impl SpawnLayoutSection {
                 .min_worker_cols
                 .map(tako_core::spawn_layout::clamp_min_worker_cols)
                 .unwrap_or(defaults.min_worker_cols),
+            auto_shrink_font: self.auto_shrink_font.unwrap_or(defaults.auto_shrink_font),
+            min_worker_font_scale: self
+                .min_worker_font_scale
+                .map(tako_core::spawn_layout::clamp_worker_font_scale)
+                .unwrap_or(defaults.min_worker_font_scale),
         }
     }
 }

@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-12（docs: activeContext を実態へ同期）
-- 「現在の対象」が 9/8 / main `4d84695` で止まり、close 済みの Issue 12 件（#1167 / #995 / #771 / #1122 / #1114 / #1124 / #1013 / #1015 / #1022 / #1030 / #1033 / #1034 / #1035）を open として案内していたのを、gh の state と git log で全行照合して書き直した
-- 直した主な食い違い: install 世代（9/7 19:52 / v0.8.7 → **9/12 09:59 / `1f4eb3f`**）・「#1167 着手中」（close 済み）・Windows のブロッカー（#1133 → #1073 / #1278）・予算の残超過（4 件 → **3 件・全部リポ外**）。無言の失敗系統（#1399 / #1417 → #1422 / #1432）とファイルツリー系の棚卸しを追加し、直列着地の理由（#1228 / #1352）を明記
-- 79 行（予算 80）・`tako context-budget check` で activeContext の違反 0・docs のみなので **install 不要**
-
 ## 2026-09-12（#1422: 右パネルの tmux 復元と UI の eprintln! 5 か所を通知欄 / 診断へ寄せた）
 - #1417 の番犬は窓の中に `Err(` が**在るだけ**で「扱った」と数えるので、`right_panel.rs:2022` は結果を `if opened.is_ok()` でしか見ていないのに**無関係な** `if let Err(e) = attach_pending_sessions(..)` で緑だった（実測で確認）。判定を**結果の束縛名の追跡**へ寄せ、`eprintln!` の検査を `sidebar.rs` 限定から全 UI モジュール（テストモジュールは除外・スコープ外は `KNOWN_EPRINTLN` の件数で段階導入）へ広げた
 - 6 か所を振り分け: ユーザー操作 5 件（tmux 復元 / 復元ペインの PTY 起動 / バックグラウンド復帰 / コードのコピー / Code Runner）は共有の通知欄 + persist.log、背景処理 1 件（PDF 再ラスタライズ）は `log_ui_failure` で診断だけ。A/B の軸を画面（`NoticeArea`）から Issue（`NoticeArm`）へ分離（同じ画面に #1417 と #1422 の通知が同居し、画面で env を選ぶと互いの回帰を隠すため）
@@ -59,3 +54,8 @@
 - 枠線のインクを `render` の `pane_borders`（`pane_headers` の直後に出すルート側 1 枚）へ集約。本体とヘッダ外枠は枠**幅**と角丸のクリップだけ持ち色を持たない（`Style::is_border_visible()` が false = quad が出ない / 会計は不変）。副作用でヘッダより低いペインの下端枠線が旧は 0 / 576 画素だったのが全部出るようになった（#803 の症状の残り）
 - 実測 A/B（`pane-border` 節・同じ場面のまま腕を倒す）: 1 ペインで丸め角の差 **32 画素**（#803 の報告値と一致）・角の外 0 / 2 分割・ズーム・light は 60 画素・外 0。注入 4 通り（描かない / 丸めを落とす / 色規則を外す / 二重塗りへ戻す）で症状を名指し FAILED
 - 番犬 `issue812_pane_border_watchdog` 5 本（注入 5 通りで file:line 名指し）。workspace 4623 passed 0 failed・check-windows error 0。**罠**: 手元の lint 2 本では `#[cfg(feature = "visual-test")]` の中が一度も lint されず CI だけ赤（`type_complexity`）→ AGENTS.md / commands.md の lint 行へ 3 本目（`-p tako-app --features visual-test`）を足した。**install 要**
+
+## 2026-09-13（#1439: worker を別タブへ逃がさず、同じタブでフォントを縮めて桁数を確保する）
+- 配置を常に `same_tab` へ（#1132 の `new_tab` / `overflow_tab` は対照 `TAKO_1439_LEGACY=1` へ退避）。足りない桁数は worker 領域**まるごと**の自動縮小で確保する 1 実装 `tako_control::worker_font::refit_worker_area`（段の選び方は純関数 `spawn_layout::fit_worker_font`・「その倍率で何桁入るか」だけ GUI の実測。spawn / close / 復元・リサイズが同じ実装を通る）。CLI / MCP は `tako orchestrator layout --auto-shrink-font / --min-worker-font-scale` で 1:1
+- 実測 3 腕（tako-vd 上の隔離 GUI・worker 8 体）: 新 = **タブ 1 枚**・全部 `same_tab`・最狭 28 桁（床 0.6 + `cols_short=true`）/ `TAKO_1439_LEGACY=1` = タブ 8 枚（#1132 再現）/ `TAKO_1132_LEGACY=1` = タブ 1 枚・17 桁（#1132 前 再現）。エッジ 3 件（close で 42 → 58 桁へ復帰・`min_worker_cols=0`・`auto_shrink_font=false`）も実測
+- 番犬 3 本（注入 8 通りで file:line 名指し）+ 単体 11 本・workspace 4629 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。検証の器から AX の窓移動を外した（#1442）。**install 要**

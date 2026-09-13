@@ -418,6 +418,40 @@ master は結果を確認してユーザーに報告する。
 | `--effort` | | thinking / reasoning effort（claude・codex のみ。省略時はプロファイル設定） |
 | `--account` | | アカウント名（accounts.yaml のキー。この worker だけ別アカウントで起動する。#504 / #511） |
 
+#### worker は必ず同じタブに置かれる（#1439）
+
+1 グループ = 1 タブで集約監視するのが tako のコンセプトなので、**spawn した worker は
+必ず呼び出し元（master）と同じタブ**に入る（応答の `placement` は常に `same_tab`）。
+worker が増えて 1 枚あたりの桁数が下限（`min_worker_cols`。既定 60 桁）を割るときは、
+**その worker 領域のペインのフォントを自動で縮めて**桁数を確保する。
+
+- 縮めたときは spawn 応答に `font_scale`（倍率）・`font_size`（pt）・`pane_cols`（実桁数）・
+  `placement_reason`（人が読む 1 行）が載る。`font_refit` には**同時に縮んだ既存 worker**
+  が並ぶ（grid は 1 体足すと既存の列も細くなるため）
+- 床（`min_worker_font_scale`。既定 0.6 = 既定サイズの 60%）まで縮めても届かないときは
+  床のサイズで置き、`cols_short: true` と実桁数を返す。**spawn は止めない**。
+  そうなったら「ウィンドウを広げる / worker を減らす / `--min-worker-cols` を下げる」の
+  どれかを選ぶ（理由文にも同じ順で載る）
+- worker を閉じて幅が戻ると、残った worker のフォントは**自動で元に戻る**。
+  ユーザーが cmd +/- で手で決めたペインは自動縮小の対象外（手の指定が勝つ）
+- 別タブへ逃がす旧挙動（#1132）は既定では使わない（A/B の対照 `TAKO_1439_LEGACY=1` のみ）
+
+### `tako orchestrator layout`
+
+worker spawn のレイアウト設定（config.yaml の `spawn_layout`）。全オプション省略で現在値。
+
+| オプション | 説明 |
+|---|---|
+| `--policy` | `master-reserved`（既定。master の取り分を維持し worker は右側の領域へ）/ `legacy`（従来の右等分割） |
+| `--master-ratio` | master 側へ残す取り分（0.1〜0.9。既定 0.5） |
+| `--algorithm` | worker 領域内の配置（`grid` = 十字四分割系（既定）/ `spiral` = 縦横交互の半分割） |
+| `--min-worker-cols` | worker ペイン 1 枚に保証する桁数（既定 60。`0` = 保証しない / 20〜400） |
+| `--auto-shrink-font` | 下限を割るときフォントを自動で縮めるか（既定 `true`。`false` でも別タブへは出さず狭いまま置く。#1439） |
+| `--min-worker-font-scale` | 自動縮小の床（既定サイズに対する比率。0.4〜1.0。既定 0.6。#1439） |
+
+応答の `effective_policy` に有効な方針が 1 行で出る（`placement` は常に `same_tab`）。
+MCP は `tako_orchestrator_layout` が同名パラメータで 1:1。
+
 プロンプト送達は 2 層構成（Issue #790）。claude worker には**まず受信箱へ直送**する
 （claude の Cross-Session Messaging。socket 直送なので画面解析もキー操作も伴わず、
 生成中でもキューに入って取りこぼさない。長文もそのまま届く）。使えない環境

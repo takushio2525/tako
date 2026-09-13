@@ -584,6 +584,8 @@ pub(super) fn build_request(
             algorithm: str_arg(args, "algorithm")?,
             min_worker_cols: u64_arg(args, "min_worker_cols")?
                 .map(|v| v.min(u64::from(u16::MAX)) as u16),
+            auto_shrink_font: bool_arg(args, "auto_shrink_font")?,
+            min_worker_font_scale: f64_arg(args, "min_worker_font_scale")?.map(|v| v as f32),
         },
         "tako_orchestrator_self" => Request::OrchestratorSelf {
             pane: u64_arg(args, "pane")?.or(caller),
