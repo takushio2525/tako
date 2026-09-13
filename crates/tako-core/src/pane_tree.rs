@@ -1317,9 +1317,10 @@ mod tests {
                 policy: SpawnLayoutPolicy::MasterReserved,
                 master_ratio: 0.5,
                 algorithm: WorkerLayoutAlgorithm::Grid,
-                // #1132 の下限幅は dispatch 側の配置決定で使う。ここは木の組み立てだけを
-                // 見るテストなので既定値をそのまま使う（spawn_worker は下限を見ない）
-                min_worker_cols: crate::spawn_layout::DEFAULT_MIN_WORKER_COLS,
+                // #1132 の下限幅と #1439 のフォント自動縮小は dispatch 側の配置決定で使う。
+                // ここは木の組み立てだけを見るテストなので既定値をそのまま使う
+                // （spawn_worker は下限もフォントも見ない）
+                ..SpawnLayoutConfig::default()
             }
         }
 

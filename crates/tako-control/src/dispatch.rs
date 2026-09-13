@@ -772,6 +772,10 @@ fn dispatch_inner(
                             let _ = tree_mut(host.workspace_mut(), tab)
                                 .reflow_workers(anchor, layout.algorithm);
                         }
+                        // #1439: 幅が戻ったぶんフォントも戻す（1.0 が選ばれれば
+                        // 自動縮小が外れる）。残りが下限を割るなら縮めたまま保つ。
+                        // A/B の対照で縮めないことは `worker_font::enabled` が見る
+                        crate::worker_font::refit_worker_area(host, tab, anchor, &layout);
                     }
                 }
                 Err(PaneTreeError::LastPane) => {
@@ -3189,11 +3193,15 @@ fn dispatch_inner(
             master_ratio,
             algorithm,
             min_worker_cols,
+            auto_shrink_font,
+            min_worker_font_scale,
         } => dispatch_orchestrator_layout(
             policy.as_deref(),
             master_ratio,
             algorithm.as_deref(),
             min_worker_cols,
+            auto_shrink_font,
+            min_worker_font_scale,
         ),
 
         Request::OrchestratorSelf {
@@ -7581,6 +7589,24 @@ pub fn dispatch_orchestrator_accounts(
     }
 }
 
+/// 有効なレイアウト方針を人が読む 1 行にする（#1439。CLI / MCP で同じ文）
+fn effective_policy_text(cfg: &tako_core::SpawnLayoutConfig) -> String {
+    if cfg.min_worker_cols == 0 {
+        return "worker は常に spawn 元と同じタブへ置く（タブ分けなし）。桁数の保証なし（min_worker_cols=0）".to_string();
+    }
+    if !cfg.auto_shrink_font {
+        return format!(
+            "worker は常に spawn 元と同じタブへ置く（タブ分けなし）。下限 {} 桁を割っても自動縮小はしない（auto_shrink_font=false）",
+            cfg.min_worker_cols
+        );
+    }
+    format!(
+        "worker は常に spawn 元と同じタブへ置く（タブ分けなし）。下限 {} 桁を割るときは worker ペインのフォントを自動で縮め、床は既定サイズの {}%（届かなければ床で置き cols_short を立てる）",
+        cfg.min_worker_cols,
+        (cfg.min_worker_font_scale * 100.0).round() as i32
+    )
+}
+
 /// （二重実装を作らない。#83 の教訓）。
 /// 全パラメータ None = 取得、いずれか Some = 検証して更新。更新はロック付き
 /// read-modify-write（#169。並行する他プロセスの設定更新を巻き戻さない）。
@@ -7590,8 +7616,12 @@ pub fn dispatch_orchestrator_layout(
     master_ratio: Option<f32>,
     algorithm: Option<&str>,
     min_worker_cols: Option<u16>,
+    auto_shrink_font: Option<bool>,
+    min_worker_font_scale: Option<f32>,
 ) -> Result<Value, DispatchError> {
-    use tako_core::spawn_layout::{MIN_WORKER_COLS_FLOOR, MIN_WORKER_COLS_MAX};
+    use tako_core::spawn_layout::{
+        MIN_WORKER_COLS_FLOOR, MIN_WORKER_COLS_MAX, WORKER_FONT_SCALE_MAX, WORKER_FONT_SCALE_MIN,
+    };
     // 検証は書き込み前に完了させる（不正値ではロックを取らない）
     let policy = policy
         .map(tako_core::SpawnLayoutPolicy::parse)
@@ -7611,6 +7641,13 @@ pub fn dispatch_orchestrator_layout(
             )));
         }
     }
+    if let Some(s) = min_worker_font_scale {
+        if !s.is_finite() || !(WORKER_FONT_SCALE_MIN..=WORKER_FONT_SCALE_MAX).contains(&s) {
+            return Err(DispatchError::InvalidParams(format!(
+                "min_worker_font_scale は {WORKER_FONT_SCALE_MIN}〜{WORKER_FONT_SCALE_MAX} で指定してください（指定値: {s}）"
+            )));
+        }
+    }
     let algorithm = algorithm
         .map(tako_core::WorkerLayoutAlgorithm::parse)
         .transpose()
@@ -7619,7 +7656,9 @@ pub fn dispatch_orchestrator_layout(
     let changed = policy.is_some()
         || master_ratio.is_some()
         || algorithm.is_some()
-        || min_worker_cols.is_some();
+        || min_worker_cols.is_some()
+        || auto_shrink_font.is_some()
+        || min_worker_font_scale.is_some();
     let resolved = if changed {
         crate::setup::mutate_config(|config| {
             if let Some(p) = policy {
@@ -7633,6 +7672,12 @@ pub fn dispatch_orchestrator_layout(
             }
             if let Some(c) = min_worker_cols {
                 config.spawn_layout.min_worker_cols = Some(c);
+            }
+            if let Some(b) = auto_shrink_font {
+                config.spawn_layout.auto_shrink_font = Some(b);
+            }
+            if let Some(s) = min_worker_font_scale {
+                config.spawn_layout.min_worker_font_scale = Some(s);
             }
             config.spawn_layout.resolve()
         })
@@ -7650,10 +7695,20 @@ pub fn dispatch_orchestrator_layout(
         "master_ratio": ratio,
         "algorithm": resolved.algorithm.as_str(),
         // #1132: worker ペイン 1 枚に保証する最小の桁数（0 = 保証しない）。
-        // これを割る spawn は同じタブへ割らず別のタブへ出る
+        // #1439: これを割っても**タブは分けず**、worker ペインのフォントを縮めて確保する
         "min_worker_cols": resolved.min_worker_cols,
         "min_worker_cols_default": tako_core::spawn_layout::DEFAULT_MIN_WORKER_COLS,
         "min_worker_cols_range": [MIN_WORKER_COLS_FLOOR, MIN_WORKER_COLS_MAX],
+        // #1439: 有効な方針。worker は必ず spawn 元と同じタブへ置く
+        "placement": "same_tab",
+        "auto_shrink_font": resolved.auto_shrink_font,
+        "min_worker_font_scale": (f64::from(resolved.min_worker_font_scale) * 1000.0).round()
+            / 1000.0,
+        "min_worker_font_scale_default":
+            tako_core::spawn_layout::DEFAULT_MIN_WORKER_FONT_SCALE,
+        "min_worker_font_scale_range": [WORKER_FONT_SCALE_MIN, WORKER_FONT_SCALE_MAX],
+        // 人が読む 1 行（CLI / MCP で同じ文）
+        "effective_policy": effective_policy_text(&resolved),
         "updated": changed,
         "config_path": crate::setup::config_yaml_path().ok(),
     }))
@@ -8743,12 +8798,9 @@ struct SpawnParams<'a> {
     limit_resume: Option<bool>,
 }
 
-/// #1132 の A/B。`TAKO_1132_LEGACY=1` で下限幅の保証をせず、どんなに狭くなっても
-/// 同じタブへ割る（= #1132 前の挙動）
-fn legacy_worker_min_width() -> bool {
-    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *LEGACY.get_or_init(|| std::env::var_os("TAKO_1132_LEGACY").is_some())
-}
+// #1132 / #1439 の A/B の腕は `crate::worker_font::PlacementArm`（配置とフォントは
+// 同じ方針の両輪なので 1 か所に置く）。ここではその判断を使うだけ
+use crate::worker_font::PlacementArm;
 
 /// worker を置く先（#1132）。`tab` が None なら新しいタブを作って root ペインにする
 struct WorkerPlacement {
@@ -8798,20 +8850,53 @@ fn predicted_worker_cols(
         anchor_rect.width,
         area,
     );
-    host.pane_cols_for_width_fraction(tab, share)
+    // 既定フォント（倍率 1.0）での桁数。足りないぶんをどれだけ縮めて補うかは
+    // spawn 後の当て直し（`worker_font::refit_worker_area`）が決める（#1439）
+    host.pane_cols_for_width_fraction(tab, share, 1.0)
 }
 
-/// worker の置き先を決める（#1132）。
+/// 当てはめた結果を人が読める理由文にする（#1439。縮めていなければ `None`）。
 ///
-/// 同じタブの worker 領域が下限幅を割るなら、①この master 由来の worker だけが居る
-/// 既存タブ（= 前にあふれた先）で余裕のあるもの → ②新しいタブ の順に落とす。
-/// 見積もれない・下限を切っていない・そもそも新しいタブでも足りないときは同じタブへ置く
-/// （見積もれないことや、そもそも達成できない下限を理由に spawn を止めない）
+/// 「無言で小さくなった」に見えないよう、**縮めたこと**と**届かなかったこと**を
+/// spawn 応答へ必ず載せる。届かないときは次の一手（最も簡単な順）も添える
+fn describe_font_fit(fit: Option<crate::worker_font::AppliedFit>, min_cols: u16) -> Option<String> {
+    let fit = fit?;
+    if fit.fit.scale >= 1.0 {
+        return None;
+    }
+    let pct = (fit.fit.scale * 100.0).round() as i32;
+    let size = fit
+        .font_size
+        .map(|s| format!("{s:.1}pt"))
+        .unwrap_or_else(|| "-".to_string());
+    if fit.fit.cols_short {
+        Some(format!(
+            "同じタブに置いた。フォントを床の {pct}%（{size}）まで縮めたが {} 桁で下限 {min_cols} 桁に届かない。\n  直すには: ウィンドウを広げる / worker を減らす / tako orchestrator layout --min-worker-cols <桁>",
+            fit.fit.cols
+        ))
+    } else {
+        Some(format!(
+            "同じタブに置き、worker ペインのフォントを {pct}%（{size}）へ縮めて {} 桁を確保した（下限 {min_cols} 桁）",
+            fit.fit.cols
+        ))
+    }
+}
+
+/// worker の置き先を決める（#1132 → #1439 で方針を変更）。
+///
+/// **既定は常に同じタブ**（`same_tab`）。1 グループ = 1 タブで集約監視するのが
+/// tako のコンセプトなので、下限桁数を割るからといって master のタブから
+/// worker を追い出さない。足りない桁数は spawn 後の
+/// [`crate::worker_font::refit_worker_area`] がフォントを縮めて確保する。
+///
+/// `TAKO_1439_LEGACY=1` のときだけ #1132 の挙動（①この master 由来の worker だけが
+/// 居る既存タブ → ②新しいタブ の順に逃がす）へ戻る
 fn plan_worker_placement(
     host: &dyn ControlHost,
     tab_id: TabId,
     target: PaneId,
     layout: &tako_core::SpawnLayoutConfig,
+    arm: PlacementArm,
 ) -> WorkerPlacement {
     let min_cols = layout.min_worker_cols;
     let same_tab = |predicted: Option<u16>| WorkerPlacement {
@@ -8822,10 +8907,16 @@ fn plan_worker_placement(
         predicted_cols: predicted,
         min_cols,
     };
-    if min_cols == 0 || legacy_worker_min_width() {
+    if min_cols == 0 || arm == PlacementArm::NoGuarantee {
         return same_tab(None);
     }
-    let Some(predicted) = predicted_worker_cols(host, tab_id, target, layout) else {
+    let predicted = predicted_worker_cols(host, tab_id, target, layout);
+    if arm == PlacementArm::SameTab {
+        // #1439: タブは分けない。見積もりは応答の材料として載せるだけで、
+        // 足りるかどうかの判断はフォントの当て直し側が持つ
+        return same_tab(predicted);
+    }
+    let Some(predicted) = predicted else {
         // 画面の実測が無い（GUI 外・まだ一度も描かれていない）= 見積もれない
         return same_tab(None);
     };
@@ -8834,7 +8925,7 @@ fn plan_worker_placement(
     }
     // 新しいタブ（= 全幅）でも下限に届かないなら、下限そのものが達成できない。
     // タブを増やしても解決しないので同じタブへ置く（理由は応答に載せる）
-    let full_tab_cols = host.pane_cols_for_width_fraction(tab_id, 1.0);
+    let full_tab_cols = host.pane_cols_for_width_fraction(tab_id, 1.0, 1.0);
     if full_tab_cols.is_some_and(|c| c < min_cols) {
         return WorkerPlacement {
             tab: Some(tab_id),
@@ -9062,9 +9153,11 @@ fn dispatch_orchestrator_spawn(
     // 既定 = master-reserved（spawn 元の取り分を維持し、worker は右側の worker 領域内へ
     // grid 配置）。領域判定は既存 worker の spawned_by チェーンによる
     let layout = crate::setup::spawn_layout_config();
-    // #1132: worker ペイン 1 枚の下限幅を割るなら同じタブへ割らず別のタブへ出す
-    // （21〜25 桁まで狭まると claude TUI がハード折り返しして検知全般が壊れる）
-    let placement = plan_worker_placement(host, tab_id, target, &layout);
+    // #1132 / #1439: worker ペイン 1 枚の下限幅。既定は**同じタブのまま**フォントを
+    // 縮めて確保する（21〜25 桁まで狭まると claude TUI がハード折り返しして
+    // 検知全般が壊れる）。別タブへ逃がす #1132 の挙動は `TAKO_1439_LEGACY=1` のみ
+    let arm = PlacementArm::from_env();
+    let placement = plan_worker_placement(host, tab_id, target, &layout, arm);
     let placement_kind = placement.kind;
     let placement_reason = placement.reason.clone();
     let placement_predicted = placement.predicted_cols;
@@ -9194,6 +9287,19 @@ fn dispatch_orchestrator_spawn(
         ));
     }
 
+    // #1439: worker 領域のフォントを当て直す（**新しいペインだけでなく領域まるごと**。
+    // grid は 1 体足すと既存の列も細くなるので、新しいペインだけ縮めても
+    // 残りが下限を割ったままになる）。`spawned_by` を立てた後でないと領域が引けない。
+    // A/B の対照（別タブへ逃がす / 保証しない）で縮めないことは
+    // `worker_font::enabled` が見るので、ここでは腕を判断しない。
+    // 別タブへ出した腕では `tab_id` と `target` が別のタブなので領域が引けず空になる
+    let font_fits = crate::worker_font::refit_worker_area(host, tab_id, target, &layout);
+    let new_fit = font_fits.iter().find(|f| f.pane == new_id).copied();
+    // 応答に載せる桁数は、**当て直した後の実測**があればそれを優先する
+    // （見積もりは既定フォントでの値なので、縮めた後の桁数と食い違う）
+    let placement_cols = new_fit.map(|f| f.fit.cols).or(placement_predicted);
+    let placement_reason = placement_reason.or_else(|| describe_font_fit(new_fit, placement_min));
+
     // attach は非同期のため backend セッション名をここで事前予約する（Issue #112。
     // 従来の `backend_session(new_id)` は spawn 時点で常に None = 応答の tmux_session が
     // 空で、pane 消失時の tmux フォールバック用の値を master へ渡せていなかった）
@@ -9311,9 +9417,31 @@ fn dispatch_orchestrator_spawn(
         "tab": tab_id.as_u64(),
         "placement": placement_kind,
         "placement_reason": placement_reason,
-        // 見積もった worker ペインの桁数と、保証した下限（0 = 保証しない）
-        "pane_cols": placement_predicted,
+        // worker ペインの桁数（#1439 の当て直し後の実測。測れなければ既定フォントでの
+        // 見積もり）と、保証した下限（0 = 保証しない）
+        "pane_cols": placement_cols,
         "min_worker_cols": placement_min,
+        // #1439: 適用したフォント倍率と絶対サイズ（null = 既定のまま = 縮めていない）
+        "font_scale": new_fit
+            .filter(|f| f.fit.scale < 1.0)
+            .map(|f| (f64::from(f.fit.scale) * 1000.0).round() / 1000.0),
+        "font_size": new_fit
+            .filter(|f| f.fit.scale < 1.0)
+            .and_then(|f| f.font_size)
+            .map(|s| (f64::from(s) * 100.0).round() / 100.0),
+        // 床まで縮めても下限に届かなかった（ウィンドウが狭い / worker が多すぎる）
+        "cols_short": new_fit.map(|f| f.fit.cols_short),
+        // 同じ当て直しで**既存の** worker も動く（grid は 1 体足すと列が細くなる）
+        "font_refit": font_fits
+            .iter()
+            .filter(|f| f.pane != new_id)
+            .map(|f| json!({
+                "pane": f.pane.as_u64(),
+                "font_scale": (f64::from(f.fit.scale) * 1000.0).round() / 1000.0,
+                "cols": f.fit.cols,
+                "cols_short": f.fit.cols_short,
+            }))
+            .collect::<Vec<_>>(),
         "title": window_title,
         "cwd": cwd,
         "agent": worker_agent.as_str(),
@@ -13415,6 +13543,8 @@ mod tests {
         sessions: std::collections::HashMap<u64, TerminalSession>,
         /// #1132: タブ内容領域の幅（桁。実測の代役）。None = 実測が無い
         tab_cols: Option<f32>,
+        /// #1439: ペインへ当てたフォント倍率（None のキー = 当て直しで外された）
+        font_scales: std::collections::HashMap<PaneId, Option<f32>>,
         /// #1187: cleanup が受け取ったソケット（`--socket` が届いているかの検証用）と、
         /// 返させる結果
         cleanup_socket: std::cell::RefCell<Vec<Option<String>>>,
@@ -13470,6 +13600,7 @@ mod tests {
                 tmux_views: std::collections::HashMap::new(),
                 sessions: std::collections::HashMap::new(),
                 tab_cols: None,
+                font_scales: std::collections::HashMap::new(),
                 cleanup_socket: std::cell::RefCell::new(Vec::new()),
                 cleanup_report: None,
                 server_outcome: None,
@@ -13635,11 +13766,27 @@ mod tests {
     }
 
     impl UiStateHost for MockHost {
-        /// #1132: 幅比 → 桁数。GUI の実測（`PaneWidthMetrics`）の代役として
-        /// 「タブ幅 × 幅比」を返す（枠と余白は桁数に対して小さいので省く）
-        fn pane_cols_for_width_fraction(&self, _tab: TabId, fraction: f32) -> Option<u16> {
-            self.tab_cols
-                .map(|cols| (cols * fraction).floor().clamp(0.0, f32::from(u16::MAX)) as u16)
+        /// #1132 / #1439: 幅比 + フォント倍率 → 桁数。GUI の実測（`PaneWidthMetrics`）の
+        /// 代役として「タブ幅 × 幅比 ÷ 倍率」を返す（枠と余白は桁数に対して小さいので省く。
+        /// フォントを縮めるとセル幅が比例して細くなる = 桁数は倍率の逆数倍）
+        fn pane_cols_for_width_fraction(
+            &self,
+            _tab: TabId,
+            fraction: f32,
+            font_scale: f32,
+        ) -> Option<u16> {
+            self.tab_cols.map(|cols| {
+                (cols * fraction / font_scale.max(0.01))
+                    .floor()
+                    .clamp(0.0, f32::from(u16::MAX)) as u16
+            })
+        }
+
+        /// #1439: 当てた倍率を記録する（GUI の `pane_font_sizes` の代役）。
+        /// 絶対サイズは既定 13pt に対する比率で返す
+        fn set_worker_font_scale(&mut self, pane: PaneId, scale: Option<f32>) -> Option<f32> {
+            self.font_scales.insert(pane, scale);
+            Some(13.0 * scale.unwrap_or(1.0))
         }
 
         fn request_window_state(
@@ -25535,7 +25682,7 @@ mod tests {
         host.tab_cols = Some(400.0);
         let (tab, master) = layout_with_workers(&mut host, 2);
         let layout = tako_core::SpawnLayoutConfig::default();
-        let plan = plan_worker_placement(&host, tab, master, &layout);
+        let plan = plan_worker_placement(&host, tab, master, &layout, PlacementArm::SameTab);
         assert_eq!(plan.kind, "same_tab");
         assert_eq!(plan.tab, Some(tab));
         assert_eq!(plan.anchor, master);
@@ -25548,6 +25695,25 @@ mod tests {
         );
     }
 
+    /// #1439 の既定: 下限を割っても**同じタブ**へ置く（桁数はフォントで確保する）
+    #[test]
+    fn issue1439_下限を割っても同じタブへ置く() {
+        let mut host = MockHost::new();
+        // 実測（#1132）と同じ約 124 桁のタブ
+        host.tab_cols = Some(124.0);
+        let (tab, master) = layout_with_workers(&mut host, 2);
+        let layout = tako_core::SpawnLayoutConfig::default();
+        let plan = plan_worker_placement(&host, tab, master, &layout, PlacementArm::SameTab);
+        assert_eq!(plan.kind, "same_tab", "{:?}", plan.reason);
+        assert_eq!(plan.tab, Some(tab), "新しいタブを作らない");
+        assert_eq!(plan.anchor, master);
+        assert!(plan.reason.is_none(), "理由はフォント当て直しの後に決まる");
+        // grid(3) は 2 列 = 領域 62 桁 → 31 桁（下限 60 桁を割るが、逃がさない）
+        assert_eq!(plan.predicted_cols, Some(31));
+        assert_eq!(host.ws.tabs().len(), 1, "タブは増えない（#1439）");
+    }
+
+    /// 対照（`TAKO_1439_LEGACY=1`）: #1132 の別タブ配置が再現する
     #[test]
     fn issue1132_下限を割るなら新しいタブへ出す() {
         let mut host = MockHost::new();
@@ -25555,7 +25721,7 @@ mod tests {
         host.tab_cols = Some(124.0);
         let (tab, master) = layout_with_workers(&mut host, 2);
         let layout = tako_core::SpawnLayoutConfig::default();
-        let plan = plan_worker_placement(&host, tab, master, &layout);
+        let plan = plan_worker_placement(&host, tab, master, &layout, PlacementArm::SplitTabs);
         assert_eq!(plan.kind, "new_tab", "{:?}", plan.reason);
         assert_eq!(plan.tab, None, "新しいタブを作る");
         assert_eq!(plan.anchor, master, "spawned_by は master のまま");
@@ -25589,7 +25755,7 @@ mod tests {
             .set_spawned_by(Some(master));
 
         let layout = tako_core::SpawnLayoutConfig::default();
-        let plan = plan_worker_placement(&host, tab, master, &layout);
+        let plan = plan_worker_placement(&host, tab, master, &layout, PlacementArm::SplitTabs);
         assert_eq!(plan.kind, "overflow_tab", "{:?}", plan.reason);
         assert_eq!(plan.tab, Some(overflow_tab));
         assert_eq!(
@@ -25603,7 +25769,7 @@ mod tests {
         let user_pane = Pane::new(PaneOrigin::User);
         let user_id = user_pane.id();
         let mixed = host.ws.create_tab("mixed".to_string(), user_pane);
-        let plan = plan_worker_placement(&host, tab, master, &layout);
+        let plan = plan_worker_placement(&host, tab, master, &layout, PlacementArm::SplitTabs);
         assert_eq!(plan.tab, Some(overflow_tab), "混在タブは選ばない");
         // あふれ先を混在させると候補から外れて新しいタブへ落ちる
         let extra = Pane::new(PaneOrigin::User);
@@ -25611,7 +25777,7 @@ mod tests {
         let tree = host.ws.get_tab_mut(overflow_tab).unwrap().tree_mut();
         tree.split(overflow_id, tako_core::SplitDirection::Down, extra)
             .unwrap();
-        let plan = plan_worker_placement(&host, tab, master, &layout);
+        let plan = plan_worker_placement(&host, tab, master, &layout, PlacementArm::SplitTabs);
         assert_eq!(plan.kind, "new_tab", "{:?}", plan.reason);
         let _ = (mixed, user_id, extra_id);
     }
@@ -25624,11 +25790,13 @@ mod tests {
         let mut host = MockHost::new();
         host.tab_cols = None;
         let (tab, master) = layout_with_workers(&mut host, 4);
-        let plan = plan_worker_placement(&host, tab, master, &layout);
-        assert_eq!(plan.kind, "same_tab");
-        assert_eq!(plan.predicted_cols, None);
+        for arm in [PlacementArm::SameTab, PlacementArm::SplitTabs] {
+            let plan = plan_worker_placement(&host, tab, master, &layout, arm);
+            assert_eq!(plan.kind, "same_tab", "{arm:?}");
+            assert_eq!(plan.predicted_cols, None, "{arm:?}");
+        }
 
-        // 下限 0 = 保証しない
+        // 下限 0 = 保証しない（腕に依らず同じタブ）
         let mut host = MockHost::new();
         host.tab_cols = Some(40.0);
         let (tab, master) = layout_with_workers(&mut host, 4);
@@ -25636,16 +25804,120 @@ mod tests {
             min_worker_cols: 0,
             ..layout
         };
-        let plan = plan_worker_placement(&host, tab, master, &off);
-        assert_eq!(plan.kind, "same_tab");
-        assert_eq!(plan.min_cols, 0);
+        for arm in [
+            PlacementArm::SameTab,
+            PlacementArm::SplitTabs,
+            PlacementArm::NoGuarantee,
+        ] {
+            let plan = plan_worker_placement(&host, tab, master, &off, arm);
+            assert_eq!(plan.kind, "same_tab", "{arm:?}");
+            assert_eq!(plan.min_cols, 0, "{arm:?}");
+        }
 
-        // タブ全幅でも下限に届かない = タブを増やしても解決しないので同じタブへ
-        let plan = plan_worker_placement(&host, tab, master, &layout);
+        // #1132 前の腕: 下限を保証しないので見積もりも載せない
+        let plan = plan_worker_placement(&host, tab, master, &layout, PlacementArm::NoGuarantee);
+        assert_eq!(plan.kind, "same_tab");
+        assert_eq!(plan.predicted_cols, None);
+
+        // 別タブ腕でも、タブ全幅が下限に届かないならタブを増やしても解決しない
+        let plan = plan_worker_placement(&host, tab, master, &layout, PlacementArm::SplitTabs);
         assert_eq!(plan.kind, "same_tab");
         let reason = plan.reason.expect("理由が載る");
         assert!(reason.contains("ウィンドウ"), "{reason}");
         assert_eq!(host.ws.tabs().len(), 1, "無駄なタブを作らない");
+    }
+
+    /// #1439: worker 領域**まるごと**フォントを当て直す。
+    ///
+    /// grid は 1 体足すと既存の列も細くなるので、新しいペインだけ縮めても
+    /// 残りが下限を割ったままになる。逆に worker が減って幅が戻ったら縮小を外す
+    #[test]
+    fn issue1439_worker領域のフォントをまるごと当て直す() {
+        let mut host = MockHost::new();
+        // 124 桁のタブ: master 半分 = 62 桁、worker 領域 62 桁
+        host.tab_cols = Some(124.0);
+        let (tab, master) = layout_with_workers(&mut host, 3);
+        let layout = tako_core::SpawnLayoutConfig::default();
+        let applied = crate::worker_font::refit_worker_area(&mut host, tab, master, &layout);
+        assert_eq!(applied.len(), 3, "領域の 3 枚すべてを当て直す");
+        // grid(3) は 2 列 = 31 桁。60 桁へ届かせるには 0.52 倍が要るので床（0.6）で止まる
+        for a in &applied {
+            assert!(
+                (a.fit.scale - tako_core::spawn_layout::DEFAULT_MIN_WORKER_FONT_SCALE).abs() < 1e-5,
+                "床で置いていない: {a:?}"
+            );
+            assert!(
+                a.fit.cols_short,
+                "届かないのに cols_short が立たない: {a:?}"
+            );
+            assert!(a.fit.cols > 31, "縮めたのに桁数が増えていない: {a:?}");
+        }
+        assert_eq!(
+            host.font_scales.values().filter(|v| v.is_some()).count(),
+            3,
+            "3 枚とも縮小が当たっている"
+        );
+
+        // 広い画面なら縮めない（当てていたぶんは外れる）
+        host.tab_cols = Some(600.0);
+        let applied = crate::worker_font::refit_worker_area(&mut host, tab, master, &layout);
+        assert!(
+            applied
+                .iter()
+                .all(|a| a.fit.scale >= 1.0 && !a.fit.cols_short),
+            "広いのに縮めた: {applied:?}"
+        );
+        assert!(
+            host.font_scales.values().all(|v| v.is_none()),
+            "幅が戻ったのに縮小が外れていない: {:?}",
+            host.font_scales
+        );
+
+        // 自動縮小を切ると当てずに外す
+        host.tab_cols = Some(124.0);
+        let off = tako_core::SpawnLayoutConfig {
+            auto_shrink_font: false,
+            ..layout
+        };
+        let applied = crate::worker_font::refit_worker_area(&mut host, tab, master, &off);
+        assert!(applied.is_empty(), "切っているのに当てた: {applied:?}");
+        assert!(host.font_scales.values().all(|v| v.is_none()));
+
+        // 下限 0（保証しない）も同じ（縮めない）
+        let zero = tako_core::SpawnLayoutConfig {
+            min_worker_cols: 0,
+            ..layout
+        };
+        assert!(crate::worker_font::refit_worker_area(&mut host, tab, master, &zero).is_empty());
+    }
+
+    /// 幅が実測できないホスト（GUI 外）では当て直さない（#1439）
+    #[test]
+    fn issue1439_実測が無ければ当て直さない() {
+        let mut host = MockHost::new();
+        host.tab_cols = None;
+        let (tab, master) = layout_with_workers(&mut host, 2);
+        let layout = tako_core::SpawnLayoutConfig::default();
+        assert!(crate::worker_font::refit_worker_area(&mut host, tab, master, &layout).is_empty());
+        assert!(host.font_scales.is_empty(), "触っていない");
+        // worker 領域がまだ無い（master だけ）タブも同じ
+        let mut host = MockHost::new();
+        host.tab_cols = Some(124.0);
+        let tab = host.ws.active_tab_id();
+        let master = host.ws.get_tab(tab).unwrap().tree().focused();
+        assert!(crate::worker_font::refit_worker_area(&mut host, tab, master, &layout).is_empty());
+    }
+
+    /// タブ内の worker 領域を全部当て直す（#1439。復元・リサイズ経路）
+    #[test]
+    fn issue1439_タブ内の全領域を当て直す() {
+        let mut host = MockHost::new();
+        host.tab_cols = Some(124.0);
+        let (tab, master) = layout_with_workers(&mut host, 3);
+        let layout = tako_core::SpawnLayoutConfig::default();
+        assert_eq!(crate::worker_font::refit_tab(&mut host, tab, &layout), 3);
+        assert_eq!(host.font_scales.values().filter(|v| v.is_some()).count(), 3);
+        let _ = master;
     }
 
     #[test]
@@ -25657,10 +25929,29 @@ mod tests {
             tako_core::spawn_layout::DEFAULT_MIN_WORKER_COLS
         );
         // 範囲外の指定は書き込む前に弾く
-        let err = dispatch_orchestrator_layout(None, None, None, Some(5)).unwrap_err();
+        let err = dispatch_orchestrator_layout(None, None, None, Some(5), None, None).unwrap_err();
         assert!(format!("{err}").contains("min_worker_cols"), "{err}");
-        let err = dispatch_orchestrator_layout(None, None, None, Some(9999)).unwrap_err();
+        let err =
+            dispatch_orchestrator_layout(None, None, None, Some(9999), None, None).unwrap_err();
         assert!(format!("{err}").contains("min_worker_cols"), "{err}");
+        // #1439: 自動縮小の床も書き込む前に弾く
+        let err =
+            dispatch_orchestrator_layout(None, None, None, None, None, Some(0.1)).unwrap_err();
+        assert!(format!("{err}").contains("min_worker_font_scale"), "{err}");
+        let err =
+            dispatch_orchestrator_layout(None, None, None, None, None, Some(1.5)).unwrap_err();
+        assert!(format!("{err}").contains("min_worker_font_scale"), "{err}");
+        // 既定は「同じタブ + 自動縮小 + 床 60%」
+        assert!(resolved.auto_shrink_font);
+        assert_eq!(
+            resolved.min_worker_font_scale,
+            tako_core::spawn_layout::DEFAULT_MIN_WORKER_FONT_SCALE
+        );
+        assert!(
+            effective_policy_text(&resolved).contains("タブ分けなし"),
+            "有効な方針の 1 行がタブ分けなしを言っていない: {}",
+            effective_policy_text(&resolved)
+        );
     }
 
     /// #1191: `tako list` の `backend_windows` は**要求時点の実態**を返す。

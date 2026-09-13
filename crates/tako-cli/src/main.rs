@@ -1607,9 +1607,17 @@ enum OrchestratorCommand {
         #[arg(long)]
         algorithm: Option<String>,
         /// worker ペイン 1 枚に保証する最小の桁数（既定 60。0 = 保証しない / 20〜400）。
-        /// 割る spawn は同じタブへ割らず別のタブへ出る（#1132）
+        /// 割っても別タブへは出さず、worker ペインのフォントを縮めて確保する（#1132 / #1439）
         #[arg(long)]
         min_worker_cols: Option<u16>,
+        /// 下限桁数を割るとき worker ペインのフォントを自動で縮めるか（既定 true。
+        /// false でも別タブへは出さず、狭いまま置く）（#1439）
+        #[arg(long)]
+        auto_shrink_font: Option<bool>,
+        /// 自動縮小の床（既定フォントサイズに対する比率。0.4〜1.0。既定 0.6）。
+        /// 床まで縮めても下限に届かなければ床で置き、応答に cols_short が立つ（#1439）
+        #[arg(long)]
+        min_worker_font_scale: Option<f32>,
     },
     /// 子 worker を spawn する（split + エージェント CLI 起動 + プロンプト送信）
     Spawn {
@@ -3185,6 +3193,8 @@ fn cli_main() -> ExitCode {
             master_ratio,
             ref algorithm,
             min_worker_cols,
+            auto_shrink_font,
+            min_worker_font_scale,
         }) => {
             // config.yaml のみの操作のため IPC 不要。dispatch と同一関数を共用する
             // （MCP `tako_orchestrator_layout` と 1:1。二重実装を作らない）
@@ -3193,6 +3203,8 @@ fn cli_main() -> ExitCode {
                 master_ratio,
                 algorithm.as_deref(),
                 min_worker_cols,
+                auto_shrink_font,
+                min_worker_font_scale,
             )
             .map_err(|e| e.to_string())
             .map(|result| println!("{}", pretty_json(&result)))

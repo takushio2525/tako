@@ -431,6 +431,8 @@ mod tests {
                 master_ratio: None,
                 algorithm: None,
                 min_worker_cols: None,
+                auto_shrink_font: None,
+                min_worker_font_scale: None,
             }]
         );
         assert_eq!(response.unwrap()["result"]["isError"], false);
@@ -439,7 +441,7 @@ mod tests {
         let (_, requests) = run(
             call(
                 "tako_orchestrator_layout",
-                json!({ "policy": "legacy", "master_ratio": 0.6, "algorithm": "spiral", "min_worker_cols": 80 }),
+                json!({ "policy": "legacy", "master_ratio": 0.6, "algorithm": "spiral", "min_worker_cols": 80, "auto_shrink_font": false, "min_worker_font_scale": 0.7 }),
             ),
             None,
             true,
@@ -452,6 +454,9 @@ mod tests {
                 algorithm: Some("spiral".into()),
                 // #1132: worker ペインの下限幅も 1:1 で届く
                 min_worker_cols: Some(80),
+                // #1439: 自動縮小の可否と床も 1:1 で届く
+                auto_shrink_font: Some(false),
+                min_worker_font_scale: Some(0.7),
             }]
         );
     }

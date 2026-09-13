@@ -86,10 +86,11 @@ pub const LEGACY_WORKER_SHARE: f32 = 0.45;
 ///    worker 列が 1 本立つ（= master の隣に worker が見える）が、これより大きくすると
 ///    ノート PC では **どの worker も同タブに置けなくなる**
 ///
-/// 大きくすれば読みやすくなるが、同タブに置ける worker は減る（残りは別タブへ出る）
+/// 大きくすれば読みやすくなるが、同じタブに置いた worker のフォントはそのぶん縮む
+/// （#1439 で「別タブへ逃がす」をやめ、**フォントを縮めて桁数を確保する**方針に変えた）
 pub const DEFAULT_MIN_WORKER_COLS: u16 = 60;
 
-/// `min_worker_cols` に指定できる上限。これ以上は実質どのタブにも置けなくなる
+/// `min_worker_cols` に指定できる上限。これ以上は床まで縮めても届かなくなる
 pub const MIN_WORKER_COLS_MAX: u16 = 400;
 
 /// `min_worker_cols` に指定できる下限（0 = 保証しない、を除く）。
@@ -104,6 +105,104 @@ pub fn clamp_min_worker_cols(cols: u16) -> u16 {
     cols.clamp(MIN_WORKER_COLS_FLOOR, MIN_WORKER_COLS_MAX)
 }
 
+// --- worker ペインのフォント自動縮小（#1439） ---
+//
+// #1132 は下限桁数を割る spawn を**別のタブ**へ逃がしていたが、それは
+// 「1 グループ = 1 タブで集約監視する」という tako のコンセプトを壊す
+// （master のタブから worker が見えなくなる）。#1439 では**必ず同じタブに置き**、
+// 足りない桁数は worker ペインのフォントを縮めて確保する。
+//
+// 倍率は段（5% 刻み）で決める。「この倍率だと何桁入るか」はセル幅の実測に依るので
+// ホスト（GUI）が答え、**どの段を選ぶか**の判断だけがここに居る。
+
+/// 自動縮小の段の刻み（5%）
+pub const WORKER_FONT_SCALE_STEP: f32 = 0.05;
+
+/// 縮小なし（既定フォントサイズそのまま）
+pub const WORKER_FONT_SCALE_MAX: f32 = 1.0;
+
+/// 床として指定できる下限。これ以下は実機のフォント下限（8pt）に当たって
+/// 桁数が増えなくなるうえ、人が読めない
+pub const WORKER_FONT_SCALE_MIN: f32 = 0.4;
+
+/// 自動縮小の床の既定値（既定フォントサイズの 60%）。
+///
+/// # なぜ 0.6 か
+///
+/// 既定のフォントサイズ 13pt に対して 7.8pt = GUI のペイン単位ズームの下限（8pt）と
+/// ほぼ同じ。これより小さい倍率を許しても実際のセル幅は 8pt で頭打ちになるので
+/// **桁数は増えず、読みにくさだけが増える**。床まで縮めても下限に届かないときは
+/// 床のサイズで置き、応答に `cols_short` を立てて呼び出し元（master）へ伝える
+pub const DEFAULT_MIN_WORKER_FONT_SCALE: f32 = 0.6;
+
+/// 自動縮小の床を妥当域へ寄せる（非有限値は既定へ）
+pub fn clamp_worker_font_scale(scale: f32) -> f32 {
+    if !scale.is_finite() {
+        return DEFAULT_MIN_WORKER_FONT_SCALE;
+    }
+    scale.clamp(WORKER_FONT_SCALE_MIN, WORKER_FONT_SCALE_MAX)
+}
+
+/// 試す倍率の段を**大きい順**に返す（1.0 → 床）。
+///
+/// ホスト側のセル幅の実測もこの段で行うので、段の作り方は 1 実装に閉じる
+/// （別々に作ると「見積もった倍率のセル幅が無い」= 当てはめが空振りする）
+pub fn worker_font_scale_steps(floor: f32) -> Vec<f32> {
+    let floor = clamp_worker_font_scale(floor);
+    let n = ((WORKER_FONT_SCALE_MAX - floor) / WORKER_FONT_SCALE_STEP).round() as i32;
+    (0..=n.max(0))
+        .map(|k| (WORKER_FONT_SCALE_MAX - k as f32 * WORKER_FONT_SCALE_STEP).max(floor))
+        .collect()
+}
+
+/// worker ペイン 1 枚へのフォント倍率の当てはめ結果（#1439）
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WorkerFontFit {
+    /// 適用する倍率（既定フォントサイズに対する比率。1.0 = 縮小なし）
+    pub scale: f32,
+    /// その倍率で実際に収まる桁数
+    pub cols: u16,
+    /// 床まで縮めても下限に届かなかった（床の倍率で置いた）
+    pub cols_short: bool,
+}
+
+/// `min_cols` を満たす**いちばん大きい**倍率を段から選ぶ（#1439）。
+///
+/// - `measure(scale)` は「その倍率のときに収まる桁数」。画面が無い・まだ一度も
+///   描かれていないホストは `None` を返す。最初の段が `None` なら当てはめ自体をしない
+///   （見積もれないことを理由に spawn を止めない = #1132 と同じ作法）
+/// - 床まで下げても届かないときは**床で置き** `cols_short = true` を立てる
+///   （縮めないより広い桁数が入るので、届かなくても縮める）
+/// - `min_cols == 0`（保証しない）や自動縮小を切っているときの判断は呼び出し側
+pub fn fit_worker_font(
+    min_cols: u16,
+    floor: f32,
+    mut measure: impl FnMut(f32) -> Option<u16>,
+) -> Option<WorkerFontFit> {
+    let steps = worker_font_scale_steps(floor);
+    let mut last: Option<(f32, u16)> = None;
+    for scale in steps {
+        let Some(cols) = measure(scale) else {
+            // 途中で測れなくなったら、そこまでで分かっている最良の段を使う
+            break;
+        };
+        if cols >= min_cols {
+            return Some(WorkerFontFit {
+                scale,
+                cols,
+                cols_short: false,
+            });
+        }
+        last = Some((scale, cols));
+    }
+    let (scale, cols) = last?;
+    Some(WorkerFontFit {
+        scale,
+        cols,
+        cols_short: true,
+    })
+}
+
 /// spawn レイアウト設定（config.yaml の `spawn_layout` セクションに対応）
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpawnLayoutConfig {
@@ -112,8 +211,14 @@ pub struct SpawnLayoutConfig {
     pub master_ratio: f32,
     pub algorithm: WorkerLayoutAlgorithm,
     /// worker ペイン 1 枚に保証する最小の桁数（#1132。0 = 保証しない）。
-    /// 割ってしまう spawn は同じタブへ割らず別のタブへ出す
+    /// 割ってしまう spawn は**同じタブのまま** worker ペインのフォントを縮めて確保する（#1439）
     pub min_worker_cols: u16,
+    /// 下限桁数を割るとき、worker ペインのフォントを自動で縮めて桁数を確保する（#1439。既定 true）。
+    /// false にすると狭いまま置く（別タブへは出さない）
+    pub auto_shrink_font: bool,
+    /// 自動縮小の床（既定フォントサイズに対する比率。#1439。既定 0.6）。
+    /// 床まで縮めても下限に届かないときは床のサイズで置き、応答に `cols_short` を立てる
+    pub min_worker_font_scale: f32,
 }
 
 impl Default for SpawnLayoutConfig {
@@ -123,6 +228,8 @@ impl Default for SpawnLayoutConfig {
             master_ratio: DEFAULT_MASTER_RATIO,
             algorithm: WorkerLayoutAlgorithm::default(),
             min_worker_cols: DEFAULT_MIN_WORKER_COLS,
+            auto_shrink_font: true,
+            min_worker_font_scale: DEFAULT_MIN_WORKER_FONT_SCALE,
         }
     }
 }
@@ -436,6 +543,86 @@ mod tests {
         assert_eq!(
             SpawnLayoutConfig::default().min_worker_cols,
             DEFAULT_MIN_WORKER_COLS
+        );
+    }
+
+    #[test]
+    fn issue1439_フォント倍率の段は大きい順で床で止まる() {
+        let steps = worker_font_scale_steps(DEFAULT_MIN_WORKER_FONT_SCALE);
+        assert_eq!(steps.first().copied(), Some(WORKER_FONT_SCALE_MAX));
+        assert!(
+            (steps.last().copied().expect("段がある") - DEFAULT_MIN_WORKER_FONT_SCALE).abs() < 1e-6,
+            "最後の段が床ぴったりでない: {steps:?}"
+        );
+        for w in steps.windows(2) {
+            assert!(w[0] > w[1], "段が大きい順でない: {steps:?}");
+            assert!(
+                (w[0] - w[1] - WORKER_FONT_SCALE_STEP).abs() < 1e-5,
+                "刻みが {WORKER_FONT_SCALE_STEP} でない: {steps:?}"
+            );
+        }
+        // 床の指定は妥当域へ寄る（0 や NaN でも段が空にならない）
+        assert_eq!(
+            worker_font_scale_steps(0.0).last().copied(),
+            Some(WORKER_FONT_SCALE_MIN)
+        );
+        assert_eq!(worker_font_scale_steps(f32::NAN).len(), steps.len());
+        // 床 = 1.0 は「縮めない」= 段が 1 つだけ
+        assert_eq!(worker_font_scale_steps(1.0), vec![WORKER_FONT_SCALE_MAX]);
+    }
+
+    #[test]
+    fn issue1439_下限を満たすいちばん大きい倍率を選ぶ() {
+        // 幅比 0.5 のペインに、倍率 1.0 で 30 桁入る画面（桁数は 1/倍率 に比例）
+        let measure = |scale: f32| Some((30.0 / scale).round() as u16);
+        // 30 桁で足りるなら縮めない
+        let fit = fit_worker_font(30, DEFAULT_MIN_WORKER_FONT_SCALE, measure).expect("当てはまる");
+        assert_eq!(fit.scale, WORKER_FONT_SCALE_MAX);
+        assert_eq!(fit.cols, 30);
+        assert!(!fit.cols_short);
+        // 40 桁なら 0.75（30/0.75 = 40）で足りる。0.8 では 37 桁で足りない
+        let fit = fit_worker_font(40, DEFAULT_MIN_WORKER_FONT_SCALE, measure).expect("当てはまる");
+        assert!((fit.scale - 0.75).abs() < 1e-5, "選んだ倍率: {}", fit.scale);
+        assert_eq!(fit.cols, 40);
+        assert!(!fit.cols_short);
+        // 床（0.6 = 50 桁）でも届かない 60 桁は、床で置いて cols_short
+        let fit = fit_worker_font(60, DEFAULT_MIN_WORKER_FONT_SCALE, measure).expect("当てはまる");
+        assert!(
+            (fit.scale - DEFAULT_MIN_WORKER_FONT_SCALE).abs() < 1e-5,
+            "床で置いていない: {}",
+            fit.scale
+        );
+        assert_eq!(fit.cols, 50);
+        assert!(fit.cols_short, "届かないのに cols_short が立っていない");
+    }
+
+    #[test]
+    fn issue1439_測れないときは当てはめない() {
+        // 一度も描かれていない画面（最初の段から測れない）= 当てはめ自体をしない
+        assert_eq!(fit_worker_font(60, 0.6, |_| None), None);
+        // 途中で測れなくなったら、そこまでの最良で置く（spawn を止めない）
+        let fit = fit_worker_font(60, 0.6, |scale| {
+            (scale > 0.8).then_some((30.0 / scale).round() as u16)
+        })
+        .expect("そこまでの最良で置く");
+        assert!((fit.scale - 0.85).abs() < 1e-5, "選んだ倍率: {}", fit.scale);
+        assert!(fit.cols_short);
+    }
+
+    #[test]
+    fn issue1439_既定は自動縮小が有効で床は60パーセント() {
+        let c = SpawnLayoutConfig::default();
+        assert!(
+            c.auto_shrink_font,
+            "既定でタブ分けせず自動縮小する（#1439）"
+        );
+        assert_eq!(c.min_worker_font_scale, DEFAULT_MIN_WORKER_FONT_SCALE);
+        assert_eq!(clamp_worker_font_scale(0.6), 0.6);
+        assert_eq!(clamp_worker_font_scale(0.01), WORKER_FONT_SCALE_MIN);
+        assert_eq!(clamp_worker_font_scale(9.0), WORKER_FONT_SCALE_MAX);
+        assert_eq!(
+            clamp_worker_font_scale(f32::NAN),
+            DEFAULT_MIN_WORKER_FONT_SCALE
         );
     }
 
