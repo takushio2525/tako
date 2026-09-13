@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-13（#1450 B1: 人がやることの正本と、返答を起票 master へ返す配送）
-- `tako todo` / MCP `tako_todo`（add / list / show / update / done / dismiss / respond）を `Request::UserTask` の 1 経路へ。モデルと純粋操作は `tako_core::user_task`、永続は `<data_dir>/orchestrator/user-tasks.yaml`（#916 の番地 `SchemaId::UserTasks` + 共有分類 Local。**新規ファイルなので移行 Step は無し** = 指紋のみ更新）。起票は共有通知欄の**成功系** `notify_ui_info`（A/B `TAKO_1450_LEGACY=1`）、診断は起きた場所（dispatch）へ
-- 返答の配送は**既存経路のみ**: 生きている master へ `Request::Send` / 居なければ `master_launch::plan` + `TabNew` + `queue_command_flow`（#640）+ `queue_prompt_flow`。**罠**: 作りたてのペインへ `Request::Send` を撃つと取り付けが次 tick なので落ちる（実測で launched が failed になった）
-- 実測 `scripts/test-user-task-delivery.sh`（隔離 tako-app + claude スタブ・tako-vd）45 PASS 0 FAIL（`delivered` / `launched` / `failed` + 理由）・セルフテスト完走・workspace 4686 passed 0 failed。番犬 4 本・注入 7 通りで file:line 名指し。**事故**: 初版はスクリプトが `TAKO_SOCKET` を unset せず本番 GUI にペイン 2 枚を作った（即 close・関門を追加 = #1454 と同じ罠）。**install 要**
-
 ## 2026-09-14（#1446: SSH 追跡をプロセスの寿命を越えて残し、繋ぎ直さない理由を出す）
 - 真因は判断ではなく**記憶**: `ssh_connect` はメモリだけで作る口も dispatch の 1 つだけ → GUI 再起動をまたいだペイン（32 秒無反応・診断 0 行・報告と同一画面）と手打ち `ssh` のペイン（24 秒無反応）が実測で再現。slave 説と版が古い説は否定（8 桁幅での誤測は 88 桁で取り直し）
 - 追跡を `track_ssh_connect` の 1 実装へ寄せ、入口を 3 つに（dispatch / `layout.json` からの復元 = `PaneLayout.ssh`・器が生きたときだけ / #976 の検知からの引き取り）。復元・引き取りは見張りから始めて起点を取り直す。`gave_up` を手で繋ぎ直したら見張りを再開（エッジで見つけた穴）。撃たないときは通知欄 + persist.log、`ssh_connect.reconnect` を `list` / `read` へ
@@ -54,3 +49,8 @@
 - `production_range.rs` のテスト領域検出をリテラル `#[cfg(test)]` から**cfg 述語の解釈**へ（`mentions_test`: `test` を正の位置に含むものだけ潰す）。`not(test)` は本番として残し、`cfg_attr` は入口の綴りごと対象外。#1441 の番犬が持っていた自前正規化は削除して 1 実装へ戻した
 - 走査範囲は src 263 本中 **8 本**が変化（合計 74.34% → 74.04% / 新たに潰れたのは合成 cfg の 11 item ちょうど）。**下限 30% を跨いだファイルは 0 件**（表は Issue #1445）。A/B `TAKO_1445_LEGACY=1` では #1441 の番犬が `discovery.rs:343` をテスト内の直書きなのに本番違反として名指しで落ちる = 誤検出の再現
 - 新設 `issue1445_cfg_predicate_watchdog`（14 本・注入 8 通りすべて file:line 名指し）。workspace 4819 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。**テストのみ = install 不要**
+
+## 2026-09-14（#1450 B2: 人がやることを右パネルで見て、その場で返す）
+- 右パネルに 4 本目のビュー `tasks`。`PanelViewWire` へ 1 枝足すだけで CLI の possible values・`--help`・不正値の案内・MCP の説明が追従する（`tako panel --show --view tasks` / パレット `panel-tasks`）。一覧（既定 open・`updated_at` 降順・種類 / プロジェクト絞り込み・バッジは `open_count` をそのまま）+ 詳細（本文は `md_view::render_document` の共有描画・`exists` を見て「消えた添付」・`copy_texts` は 1 件ずつ・リンク）+ 返答フォーム（4 択 + コメント・判断未選択では送れない）+ スレッド + 配送状態。**B1 の API 以外は叩かない**
+- **ポーリングは新タイマー無し**: 既存 2 秒ループが `tick_user_tasks` を呼ぶだけで、撃つ判断（`panel_visible` + A/B）はその 1 か所 = 止める処理を書かずに止まる。`list` を background へ逃がさないのは B1 が配送の決着を host から畳み込むため。3 本目の手書き入力を増やさないよう純ロジックを `text_field::TextField` へ切り出した（既存 git 2 本の移行は #1459）
+- 実測: 隔離セルフテスト**項目 150**（view / 起票 / バッジ / 消えた添付 / 長い md / コピー 1 件 / 返答 + `failed` + 理由 / スレッド 12 件 / **閉じている間は撃たない** / 完了が `tako todo list` と一致）+ `TAKO_VISUAL_ONLY=tasks-panel`（**Metal の scene を読み戻すので画面収録権限が不要**・3 場面の指紋が全部別）+ 隔離 GUI で `sent → delivered` を実測（疑似 master へ実送達）。A/B `TAKO_1450B2_LEGACY=1` は項目 150 が「起票が一覧に載らない」で FAILED。番犬 5 本・注入 8 通り。workspace 4845 passed 0 failed・clippy 3 宇宙 0・check-windows error 0・docs build 32 ページ。**install 要**

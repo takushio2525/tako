@@ -795,6 +795,7 @@ tako sessions resume <session-id>       # 記録された cwd で復元（claude
 tako panel --show --view fleet   # fleet = 全ペイン + tmux セッション
 tako panel --view orch           # orch  = master + ワーカーツリー
 tako panel --view git            # git   = ブランチ・変更・履歴・diff
+tako panel --view tasks          # tasks = 人がやること（承認・レビュー・投稿）
 tako panel --hide
 tako panel --filetree on         # 左のファイルツリー
 tako panel --width 360
@@ -1286,6 +1287,8 @@ tako task gate show <task_id>
 ユーザー（人）がやることの一覧です。AI の承認待ち・生成物のレビュー・権限の確認・宣伝投稿のように**あなたの手が要る**ものを tako が溜めて促します。`tako task`（AI 自身のタスク）とは別物です。
 
 返答（`respond`）は起票した master の入力欄へ届きます。master が閉じていれば、同じプロファイルの master を新しいタブで起動して初回メッセージとして渡します。配送の結果は `tako todo show` の `配送:` 行で読めます。
+
+同じことは PC の画面からもできます（右パネルの tasks ビュー = `tako panel --show --view tasks`）。一覧・詳細・返答フォーム・配送状態が 1 枚に並びます。詳しくは [人がやること（ユーザータスク）](/features/user-tasks/)を参照してください。
 
 ```bash
 tako todo                            # （サブコマンド一覧）

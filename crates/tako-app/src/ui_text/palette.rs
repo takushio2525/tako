@@ -30,6 +30,8 @@ pub fn cmd_label(id: &str) -> &'static str {
         "panel-fleet" => tr!("fleet パネルを開く", "Open fleet panel"),
         "panel-orch" => tr!("orch パネルを開く", "Open orch panel"),
         "panel-git" => tr!("git パネルを開く", "Open git panel"),
+        // #1450 B2: 人がやること（ユーザー向けタスク）の一覧
+        "panel-tasks" => tr!("tasks パネルを開く", "Open tasks panel"),
         "split-right" => tr!("ペインを右に分割", "Split pane right"),
         "split-down" => tr!("ペインを下に分割", "Split pane down"),
         // #552: いまのタブ名を固定して自動リネームの上書きを止める
@@ -68,6 +70,7 @@ mod tests {
                 cmd_label("panel-fleet").to_string(),
                 cmd_label("panel-orch").to_string(),
                 cmd_label("panel-git").to_string(),
+                cmd_label("panel-tasks").to_string(),
                 cmd_label("split-right").to_string(),
                 cmd_label("split-down").to_string(),
                 cmd_label("pin-tab-title").to_string(),

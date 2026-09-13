@@ -177,11 +177,13 @@ pub enum PanelViewWire {
     /// オーケストレーター中心ビュー（#217。master + ワーカーツリーの俯瞰）
     Orch,
     Git,
+    /// ユーザー向けタスク（#1450 の分割 B2。人がやることの一覧 + 詳細 + 返答）
+    Tasks,
 }
 
 impl PanelViewWire {
     /// CLI / MCP が案内する正式値（GUI のタブ表示名と 1:1。#553）
-    pub const VALUES: [&'static str; 3] = ["fleet", "orch", "git"];
+    pub const VALUES: [&'static str; 4] = ["fleet", "orch", "git", "tasks"];
     /// 後方互換のみで受理する旧称と現行値の対応（#553）
     pub const LEGACY_VALUES: [(&'static str, &'static str); 1] = [("tmux", "fleet")];
 
@@ -190,6 +192,7 @@ impl PanelViewWire {
             PanelViewWire::Fleet => "fleet",
             PanelViewWire::Orch => "orch",
             PanelViewWire::Git => "git",
+            PanelViewWire::Tasks => "tasks",
         }
     }
 
@@ -199,6 +202,7 @@ impl PanelViewWire {
             "fleet" | "tmux" => Some(PanelViewWire::Fleet),
             "orch" => Some(PanelViewWire::Orch),
             "git" => Some(PanelViewWire::Git),
+            "tasks" => Some(PanelViewWire::Tasks),
             _ => None,
         }
     }
@@ -2422,8 +2426,9 @@ mod tests {
         assert_eq!(PanelViewWire::Fleet.as_str(), "fleet");
         assert_eq!(PanelViewWire::Orch.as_str(), "orch");
         assert_eq!(PanelViewWire::Git.as_str(), "git");
+        assert_eq!(PanelViewWire::Tasks.as_str(), "tasks");
         // 案内する正式値に旧称は混ざらない（GUI に出ない語を勧めない）
-        assert_eq!(PanelViewWire::VALUES, ["fleet", "orch", "git"]);
+        assert_eq!(PanelViewWire::VALUES, ["fleet", "orch", "git", "tasks"]);
         assert!(!PanelViewWire::VALUES.contains(&"tmux"));
     }
 
@@ -2433,6 +2438,9 @@ mod tests {
         assert_eq!(PanelViewWire::parse("tmux"), Some(PanelViewWire::Fleet));
         assert_eq!(PanelViewWire::parse("orch"), Some(PanelViewWire::Orch));
         assert_eq!(PanelViewWire::parse("git"), Some(PanelViewWire::Git));
+        // #1450 B2: ユーザー向けタスクのビュー
+        assert_eq!(PanelViewWire::parse("tasks"), Some(PanelViewWire::Tasks));
+        assert_eq!(PanelViewWire::parse("task"), None);
         assert_eq!(PanelViewWire::parse("fleets"), None);
         assert_eq!(PanelViewWire::parse(""), None);
         // 旧称で入れても応答の表記は正式値に正規化される
@@ -2456,7 +2464,7 @@ mod tests {
     #[test]
     fn panel_viewの案内文は表示名と旧称の対応を含む() {
         let hint = PanelViewWire::values_hint();
-        assert_eq!(hint, "fleet | orch | git。tmux は fleet の旧称");
+        assert_eq!(hint, "fleet | orch | git | tasks。tmux は fleet の旧称");
     }
 
     // === #1370: changes_layout ===

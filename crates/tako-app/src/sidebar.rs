@@ -261,6 +261,10 @@ pub(crate) enum NoticeArm {
     Issue1450,
     /// SSH ペインの追跡の永続・引き取りと「繋ぎ直さない理由」（`TAKO_1446_LEGACY`）
     Issue1446,
+    /// 右パネル tasks ビューの操作の失敗（`TAKO_1450B2_LEGACY`）。
+    /// B1 の [`NoticeArm::Issue1450`]（起票通知）とは**別の軸**にしてある
+    /// （同じ画面に別の Issue で足した通知が同居するときの作法 = #1422）
+    Issue1450B2,
 }
 
 impl NoticeArm {
@@ -274,6 +278,7 @@ impl NoticeArm {
             NoticeArm::Issue1441 => TakoApp::legacy_1441(),
             NoticeArm::Issue1450 => TakoApp::legacy_1450(),
             NoticeArm::Issue1446 => TakoApp::legacy_1446(),
+            NoticeArm::Issue1450B2 => crate::tasks_panel::legacy_1450_b2(),
         }
     }
 }
