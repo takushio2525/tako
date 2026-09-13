@@ -208,6 +208,10 @@ pub(crate) enum NoticeArea {
     /// 画面ではなく**起動時の一段**だが、失敗すると「見た目は正常なのに
     /// AI からは何も操作できない」ので同じ共有の通知欄へ出す
     Ipc,
+    /// ユーザー向けタスク（#1450）。**ここだけは成功系**
+    /// （`notify_ui_info` = 新しく人の手を待つものが増えたことの通知）で、
+    /// 出し先と抑止の作法は失敗通知と同じ 1 実装を共有する
+    UserTasks,
 }
 
 impl NoticeArea {
@@ -223,6 +227,7 @@ impl NoticeArea {
             NoticeArea::OpenFile => "open_file",
             NoticeArea::UpdateWindow => "update_window",
             NoticeArea::Ipc => "ipc",
+            NoticeArea::UserTasks => "user_tasks",
         }
     }
 }
@@ -248,6 +253,8 @@ pub(crate) enum NoticeArm {
     Issue1432,
     /// IPC の受け口が立たなかったときの申告（`TAKO_1441_LEGACY`）
     Issue1441,
+    /// ユーザー向けタスクの起票通知（`TAKO_1450_LEGACY`）
+    Issue1450,
 }
 
 impl NoticeArm {
@@ -259,6 +266,7 @@ impl NoticeArm {
             NoticeArm::Issue1422 => TakoApp::legacy_1422(),
             NoticeArm::Issue1432 => TakoApp::legacy_1432(),
             NoticeArm::Issue1441 => TakoApp::legacy_1441(),
+            NoticeArm::Issue1450 => TakoApp::legacy_1450(),
         }
     }
 }
@@ -2145,6 +2153,45 @@ impl TakoApp {
         }
         Self::log_ui_failure(area, arm, diag_op, class);
         self.set_remote_notice(text, true);
+    }
+
+    /// ユーザーの操作**ではない**が知らせるべき出来事を画面へ出す唯一の口（#1450）。
+    ///
+    /// [`Self::notify_ui_failure`] の成功系。出し先（共有の通知欄）も抑止の軸
+    /// （[`NoticeArm`]）も失敗側と同じで、違うのは **`is_error` が偽**
+    /// （サイドバーを勝手に開かない）ことだけ。口を分けずに 1 つに保つのは
+    /// #1417 と同じ理由で、画面ごとに増やすと「片方だけ無言」が必ず生まれるため。
+    ///
+    /// **診断（persist.log）はここでは書かない**。起票は GUI の中の出来事ではなく
+    /// dispatch の操作なので、記録は起きた場所（`tako_control::dispatch`）に置く
+    /// = sidebar.rs から診断へ書く口は `log_ui_failure` の 1 つのままに保たれる
+    fn notify_ui_info(&mut self, area: NoticeArea, arm: NoticeArm, text: String) {
+        debug_assert!(matches!(area, NoticeArea::UserTasks), "成功系の画面は 1 つ");
+        if arm.suppressed() {
+            return;
+        }
+        self.set_remote_notice(text, false);
+    }
+
+    /// 新しいユーザータスクが起票されたことを通知欄へ 1 行出す（#1450）。
+    ///
+    /// **本文・添付・コメントは出さない**（画面に出すのは id とタイトルだけ）。
+    /// 通知は消える前提なので、続きは右パネル（B2）と `tako todo list` で読む
+    pub(crate) fn notify_user_task_added(&mut self, id: &str, title: &str) {
+        self.notify_ui_info(
+            NoticeArea::UserTasks,
+            NoticeArm::Issue1450,
+            crate::ui_text::sidebar::notice_user_task_added(id, title),
+        );
+    }
+
+    /// #1450 の A/B。`TAKO_1450_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
+    /// （起票しても画面に何も出ない = 「起票されたことに気づけない」の再現）。
+    /// 診断（persist.log）は dispatch 側で書くのでこのアームでも残る —— 抑えるのは
+    /// **画面の通知だけ**なので、A/B を立てた検証でも起票そのものは追える
+    pub(crate) fn legacy_1450() -> bool {
+        static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *LEGACY.get_or_init(|| std::env::var("TAKO_1450_LEGACY").map(|v| v == "1") == Ok(true))
     }
 
     /// **画面には出さず**診断にだけ 1 行残す（#1422）。

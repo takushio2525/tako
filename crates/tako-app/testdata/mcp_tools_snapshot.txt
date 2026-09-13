@@ -138,6 +138,7 @@ tako_tmux_list
 tako_tmux_open
 tako_tmux_resize
 tako_tmux_select_window
+tako_todo
 tako_tree_folder
 tako_ui_mode
 tako_update

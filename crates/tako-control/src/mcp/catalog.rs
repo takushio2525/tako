@@ -1560,7 +1560,7 @@ pub fn tools() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "topic": { "type": "string", "description": "引く topic（省略時は一覧。context-budget / task-intake / worker-prompt / spawning / monitoring / acceptance / lifecycle / handoff / remote / tools / quality-ops / behavior）" },
+                    "topic": { "type": "string", "description": "引く topic（省略時は一覧。context-budget / task-intake / worker-prompt / spawning / monitoring / acceptance / lifecycle / handoff / remote / user-tasks / tools / quality-ops / behavior）" },
                     "profile": { "type": "string", "description": "プレースホルダを解決するプロファイル（省略時は呼び出し元の role から解決）" },
                 },
                 "additionalProperties": false,
@@ -3447,6 +3447,57 @@ pub fn tools() -> Vec<Value> {
                     },
                 },
                 "required": ["action"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_todo",
+            "description": "ユーザー向けタスク（**人がやること**）の起票・一覧・返答（Issue #1450）。\
+                承認待ち・生成物のレビュー・権限の確認・宣伝投稿のように\
+                **ユーザーの手が要る**ものはここへ起票する（会話や引き継ぎファイルに溜めない）。\
+                AI 自身のタスクは tako_task_checkpoint / tako_task_gate で、これとは別物。\
+                起票すると PC の画面とスマホから同じものが見え、ユーザーの返答は\
+                起票した master の入力欄へ届く（master が閉じていれば起動して初回メッセージで渡す）。\
+                起票元（プロファイル・会話・ペイン）は自動で入るので指定は要らない。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["add", "list", "show", "update", "done", "dismiss", "respond"],
+                        "description": "操作種別（省略時 list）",
+                    },
+                    "id": { "type": "string", "description": "対象のタスク id（u-N。show / update / done / dismiss / respond で必須）" },
+                    "title": { "type": "string", "description": "一覧に出る 1 行（add で必須）" },
+                    "body": { "type": "string", "description": "本文（markdown）。手順・確認してほしい点を書く" },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["review", "confirm", "permission", "post", "other"],
+                        "description": "種類。review=生成物のレビュー / confirm=確認 / permission=権限の確認 / post=投稿（省略時 other）",
+                    },
+                    "status": { "type": "string", "enum": ["open", "done", "dismissed"], "description": "list の絞り込み（省略時は未完了のみ）" },
+                    "all": { "type": "boolean", "description": "list で状態の絞り込みを外す" },
+                    "project": { "type": "string", "description": "プロジェクトキー（projects.yaml）" },
+                    "attachments": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "添付の絶対パス（動画・画像・差分ファイル）。update では置き換え",
+                    },
+                    "copy_texts": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "コピー用テキスト（`ラベル=本文`）。投稿文 / タイトル / タグを分けて入れるとスマホからワンタップでコピーできる",
+                    },
+                    "links": { "type": "array", "items": { "type": "string" }, "description": "関連 URL。update では置き換え" },
+                    "due": { "type": "string", "description": "期限（YYYY-MM-DD）" },
+                    "decision": {
+                        "type": "string",
+                        "enum": ["approve", "reject", "needs_change", "answered"],
+                        "description": "respond の判断。approve / reject はタスクを閉じ、needs_change / answered は開いたまま残す",
+                    },
+                    "comment": { "type": "string", "description": "respond の自由記述（スレッドとして積まれる）" },
+                    "via": { "type": "string", "enum": ["pc", "pwa", "cli", "mcp"], "description": "respond がどこから来たか（省略時 mcp）" },
+                },
                 "additionalProperties": false,
             },
         }),

@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-12（#1426: 裏タブの寸法合わせを毎フレームから key + 間引きへ寄せた）
-- `sync_offscreen_pane_sizes` は render から毎フレーム通るのに、当て直す中身（`offscreen_areas`）が既に「key + 2 秒」で回っていたので**材料が同じあいだは同じ答えを出し直していた**。当て直す側も同じ単位へ寄せ、キーは `OffscreenAreaKey`（1 実装 `offscreen_area_key` に集約）+ 既定セル寸法（#647 の再発防止）+ 表示中ペイン数 + ペイン単位ズームの指紋。間隔は `OFFSCREEN_REFRESH_INTERVAL` の 1 定数を両者が見る
-- 実測（隔離 GUI の grid-bench・22 ペイン / 表示 4・3000 フレーム）: 596〜776 ns/frame（`render` の 5.88〜6.28%・走査 82 比較 + 18 ペイン当て直し）→ **36〜38 ns/frame**（0.38〜0.41%・走査 0 / 当て直し 0）。同一バイナリの `TAKO_1426_LEGACY=1` は 645〜690 ns で旧挙動を再現。#932 の flicker ラウンドは `late_resize=false` で緑、既存 A/B（`TAKO_932_NO_OFFSCREEN_GEOMETRY=1`）では `late_resize=true` で落ちる = 検出力あり
-- 単体 7 本 + 番犬 `issue1426_offscreen_sync_watchdog` 8 本（注入 8 通りで `main.rs:16126` / `:16158` / `:16238` / `:16245` / `:1330` / `:1344` を file:line 名指し）。範囲取りは #1420 の `production_range` の 1 実装を通す。workspace 4551 passed 0 failed・clippy 両宇宙 0・check-windows error 0・隔離セルフテスト完走。**install 要**
-
 ## 2026-09-12（#1432: UI に残る `eprintln!` 10 件を通知欄 / 診断へ振り分けた）
 - `KNOWN_EPRINTLN` の 10 件を 1 実装（`notify_ui_op_failed` / `log_ui_failure`）へ。ユーザー操作 7 件は通知欄 + persist.log（ドロワーの D&D / 復元・カードの操作と実行ペイン起動・チャットのコピー・Finder の実在しないパス・ノートのリンク）、画面へ出せない 2 件は診断だけ、`autorename` の env つき診断は persist.log へ。画面は `NoticeArea` を 5 つ足して区別（`drawer` / `command_card` / `chat` / `open_file` / `update_window`）
 - 隔離 GUI（tako-vd）項目 84e + 90 の A/B: 新 = 6 経路とも通知が出て `bg_lines=3`・成功時は無言で完走（`TAKO_APP_SELF_TEST_OK`）/ legacy（`TAKO_1432_LEGACY=1`）は 5 つとも `None`・`bg_lines=0` で FAILED。`TAKO_1432_LEGACY=1` でも #1399 / #1417 / #1422 は `legacy=false` のまま出る（軸が独立）
@@ -59,3 +54,8 @@
 - 「+」を `LaunchSheet`（master / ターミナル / SSH）へ。**操作は 1 つも新設していない**（ターミナル = `POST /api/tabs` だけ / SSH = #1080 の `POST /api/ssh {target:"tab"}`）。role は 3 種とも **Manage 据え置き**（「interact 以上」案は既存 Interact 端末の権限が黙って広がるので不採用 = 脅威モデルへ明記）
 - 経路の宣言を `remote_launch::LAUNCH_ROUTES`（role / 監査 / PWA の呼び口）へ集約し `required_role` が引く形に。番犬 6 本 + e2e 11 本（61 passed）+ 実経路 `scripts/test-remote-launch-1449.sh` 38 PASS（**HOME ごと隔離**して実 `~/.ssh/config` を読まない = #927）。注入 7 通りすべて名指し FAILED
 - **既存テストの罠 2 つを直した**: #841 以降 `test-remote-master-launch.sh` が全 403 で落ちていた（`TAKO_REMOTE_TRUSTED_PEER_NAMES="curl"`）→ 34 PASS へ復旧 / tako ペインからの実行は `TAKO_SOCKET` 継承で **CLI が本番 GUI を触る**（実測でタブ + QR が本番へ出た）→ `unset` + 起動ガード。**install 不要 / daemon 再起動要**
+
+## 2026-09-13（#1450 B1: 人がやることの正本と、返答を起票 master へ返す配送）
+- `tako todo` / MCP `tako_todo`（add / list / show / update / done / dismiss / respond）を `Request::UserTask` の 1 経路へ。モデルと純粋操作は `tako_core::user_task`、永続は `<data_dir>/orchestrator/user-tasks.yaml`（#916 の番地 `SchemaId::UserTasks` + 共有分類 Local。**新規ファイルなので移行 Step は無し** = 指紋のみ更新）。起票は共有通知欄の**成功系** `notify_ui_info`（A/B `TAKO_1450_LEGACY=1`）、診断は起きた場所（dispatch）へ
+- 返答の配送は**既存経路のみ**: 生きている master へ `Request::Send` / 居なければ `master_launch::plan` + `TabNew` + `queue_command_flow`（#640）+ `queue_prompt_flow`。**罠**: 作りたてのペインへ `Request::Send` を撃つと取り付けが次 tick なので落ちる（実測で launched が failed になった）
+- 実測 `scripts/test-user-task-delivery.sh`（隔離 tako-app + claude スタブ・tako-vd）45 PASS 0 FAIL（`delivered` / `launched` / `failed` + 理由）・セルフテスト完走・workspace 4686 passed 0 failed。番犬 4 本・注入 7 通りで file:line 名指し。**事故**: 初版はスクリプトが `TAKO_SOCKET` を unset せず本番 GUI にペイン 2 枚を作った（即 close・関門を追加 = #1454 と同じ罠）。**install 要**

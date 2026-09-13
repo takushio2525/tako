@@ -1440,6 +1440,33 @@ A/B は `TAKO_757_LEGACY=1`（#757 前の分類へ戻る = 接続エラー行が
 任意のタイミングでは作れない）ので、検証は実観測の文言を描いた fixture と
 隔離 tmux のペインで行った。
 
+### FR-2.40 ユーザー向けタスク（人がやること）の正本と返答の配送（✅ 2026-09-13、#1450 の分割 B1）
+
+> master は「ユーザー確認待ち」を引き継ぎファイル（`handoff/projects/*.md`）と会話に
+> 溜めていて、**ユーザーが一覧で見る場所が無かった**。宣伝系（#1081 の動画 / #1284 の
+> X ショート）も「完成したがユーザー投稿待ち」が可視化されない。会話の中の 1 行は待ち行列に
+> ならない —— スマホからは見えず、次の master は引き継がず、答えたかどうかも分からない。
+> worker の task 系（`tako task checkpoint` / `gate` = #242 / #244）は **AI のタスク**なので
+> 名前空間を分ける（id の綴りも `task-N` / `u-N` で目で区別できる形にした）。
+> B1 はその**正本と操作**で、PC の画面（B2）・PWA（B3）・初期データ（B4）はこの API だけを叩く。
+
+| ID | 要件 | 優先度 | 状態 |
+|---|---|---|---|
+| FR-2.40.1 | **データモデルは tako-core**（`user_task`。GPUI 非依存）。`id`（`u-N`）/ `title` / `body`（markdown）/ `kind`（review / confirm / permission / post / other）/ `status`（open / done / dismissed）/ `created_by` / `project` / `attachments[]` / `copy_texts[{label,text}]` / `links[]` / `due` / `created_at` / `updated_at` / `origin` / `responses[]` / `delivery`。**空タイトルは拒否**（一覧で選べないものを作らせない）。**添付の実在は起票時に問わない**（動画を書き出す前に起票する運用が普通にある）代わりに、一覧・詳細の応答が `attachments[].exists` を返して「消えた添付」を画面に出せるようにする。`copy_texts` をラベルつきの配列にしてあるのは、投稿文・タイトル・説明・タグが**別々の入力欄へ貼られる**ため（1 本の本文に混ぜるとスマホ側で編集作業が発生する） | M | ✅ |
+| FR-2.40.2 | **永続は `<data_dir>/orchestrator/user-tasks.yaml`**。書き込みは `config_io` の排他 flock + アトミック書き込み（`task_checkpoints` / `ledger` と同じ read-modify-write）なので、**2 プロセスが同時に起票しても取りこぼさない**。読めないファイルは 0 件へ丸めず Err にして退避へ回す（#169）。#916 の番地 `SchemaId::UserTasks` に載せ、共有分類は `Class::Local`（ペイン ID と master のプロファイル = **この機械の状態**を持つのでデバイス間共有しない） | M | ✅ |
+| FR-2.40.3 | **操作は 1 実装**（設計原則 5）。`add` / `list` / `show` / `update` / `done` / `dismiss` / `respond` を `Request::UserTask` の 1 経路へ集約し、CLI（`tako todo <action>`）と MCP（`tako_todo` の `action`）が 1:1 で載る。CLI をローカル処理にしない（= store を直接触らない）のは、**起票の通知と返答の配送が GUI の中でしか起こせない**ため。MCP を 1 ツールへ畳んだのは、ツール一覧が master の起動時ロード（#1139）に毎回乗るから。`list` は既定で未完了のみを返し、**`open_count` と種類別の内訳**（B2 / B3 のバッジの正本）を同じ応答に載せる | M | ✅ |
+| FR-2.40.4 | **起票元は自動で入る**。`origin`（profile / session_id / pane / project）を呼び出し元の role（env 由来と ペインの role ラベルの**両方の語彙**を `handoff::master_profile_of_any_role` の 1 実装で解く = #761 の取り違えを構造的に避ける）と、セッションカタログの逆引き（#284）から埋める。master は「起票する」とだけ言えばよく、返答の戻り先を指定しない | M | ✅ |
+| FR-2.40.5 | **返答は起票 master の入力欄へ届く**。`respond`（`decision` = approve / reject / needs_change / answered、`comment`、`via` = pc / pwa / cli / mcp）は `responses[]` にスレッドとして積み、**新しい送達経路を作らず**既存を呼んで配る: ①同じプロファイルの master ペインが生きていれば `Request::Send`（= `tako_send_input` と同じ腕。#1259 の送達フローに乗る）で「【ユーザー返答】…」を送る ②居なければ `master_launch::plan`（= `tako master` / PWA の「+ master」= #1078 と同じ組み立て）で**新しいタブに起動**し、`queue_prompt_flow` で起動を待ってからタスク本文 + 返答を初回メッセージとして渡す。**本文にペインの内容・添付の中身は載せない**（絶対ルール）。①では本文を送らず②でだけ載せるのは、生きている master は文脈を持っているため | M | ✅ |
+| FR-2.40.6 | **配送の顛末が残り、無言にならない**。`delivery`（`sent` / `launched` / `delivered` / `failed` + profile / pane / tab / reason / 何番目の返答か）をタスクに持ち、決着は `host.prompt_delivery_state`（#1259 の 1 実装）を**読むたびに畳み込んで**確定する。**分からないものを「届いた」とも「失敗した」とも言わない**（未決着は `sent` のまま）。配送できないとき（プロファイル不明・起動失敗・タブ作成失敗）は `failed` + 理由をタスクへ残し、persist.log にも 1 行出す。既知の限界: `prompt_delivery_state` は 300 秒で消える（`still_visible`）ので、5 分以上誰も一覧を引かないと `sent` のまま残る（画面は数秒周期で `list` を叩くので実運用では埋まる） | M | ✅ |
+| FR-2.40.7 | **起票は画面に 1 行出る**。共有の通知欄（#1399 / #1417 / #1422 / #1432 と**同じ出し口**の成功系 = `notify_ui_info`）へ「新しいユーザータスク u-N: タイトル」を出す。**本文・添付・コメントは出さない**（通知は消える前提で、続きは右パネルと `tako todo list` で読む）。診断（persist.log）は**起きた場所**（dispatch）に置く = sidebar.rs から診断へ書く口は `log_ui_failure` の 1 つのまま。A/B は `TAKO_1450_LEGACY=1` | M | ✅ |
+| FR-2.40.8 | **master の運用へ組み込む**。`tako orchestrator guide user-tasks` に「ユーザーに聞くこと・見てもらうこと・許可をもらうことは会話や引き継ぎに溜めずここへ起票する」「返答は入力欄に届くので、それを起点に作業を続ける」「投稿系は `copy_texts` を貼り先ごとに分ける」を置き、system prompt の topic 表から引けるようにする。`respond` の状態遷移は approve / reject = 閉じる、needs_change / answered = **open のまま**（AI 側の作業がこれから続くので、閉じると直した物を見てもらう先が消える） | M | ✅ |
+
+A/B は `TAKO_1450_LEGACY=1`（起票しても通知欄に何も出ない = 「起票されたことに気づけない」の再現）。
+番犬は `issue1450_user_tasks_watchdog.rs`（CLI が store を直接触らない / CLI と MCP の action 語彙が一致 /
+永続の番地が 4 か所に揃う / 通知の出し口が増殖しない / 配送が既存経路を呼ぶ。**注入 7 通りで `file:line` 名指し**）。
+実測は `scripts/test-user-task-delivery.sh`（隔離した実 tako-app + 実 CLI + claude スタブで
+①〜⑦ を通す）。**B2 / B3 は別 Issue**（この分割は画面が無くても CLI / MCP で全部できる状態で完結する）。
+
 
 ## FR-3 コンセプト②: 軽量 IDE 的ワークスペース
 

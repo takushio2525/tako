@@ -575,6 +575,16 @@ pub const CATALOG: &[Entry] = &[
         local_fields: &[],
         needs_local_unless: &[],
     },
+    // ユーザー向けタスク（#1450）。ペイン ID・master のプロファイルという
+    // **この機械の状態**を持つので共有しない（ledger / task_checkpoints と同じ扱い）
+    Entry {
+        root: Root::TakoData,
+        path: "orchestrator/user-tasks.yaml",
+        class: Class::Local,
+        note: notes::RUNTIME,
+        local_fields: &[],
+        needs_local_unless: &[],
+    },
     Entry {
         root: Root::TakoData,
         path: "orchestrator/review-ledger.yaml",

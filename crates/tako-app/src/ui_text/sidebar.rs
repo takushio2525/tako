@@ -60,6 +60,17 @@ pub fn notice_ipc_too_long(path_bytes: usize, limit: usize) -> String {
     )
 }
 
+/// 新しいユーザータスクが起票されたときの通知（#1450）。
+///
+/// **人の手を待つものが増えた**ことを画面に 1 行だけ出す。本文・添付・コメントは
+/// 載せない（通知は消える前提で、続きは右パネルと `tako todo list` で読む）
+pub fn notice_user_task_added(id: &str, title: &str) -> String {
+    tr!(
+        format!("新しいユーザータスク {id}: {title}"),
+        format!("New user task {id}: {title}")
+    )
+}
+
 /// IPC の受け口が上限以外の理由で立たなかったときの通知（#1441）
 pub fn notice_ipc_unavailable(reason: &str) -> String {
     tr!(

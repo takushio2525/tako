@@ -2169,7 +2169,7 @@
           "type": "string"
         },
         "topic": {
-          "description": "引く topic（省略時は一覧。context-budget / task-intake / worker-prompt / spawning / monitoring / acceptance / lifecycle / handoff / remote / tools / quality-ops / behavior）",
+          "description": "引く topic（省略時は一覧。context-budget / task-intake / worker-prompt / spawning / monitoring / acceptance / lifecycle / handoff / remote / user-tasks / tools / quality-ops / behavior）",
           "type": "string"
         }
       },
@@ -4034,6 +4034,118 @@
       "type": "object"
     },
     "name": "tako_recent"
+  },
+  {
+    "description": "ユーザー向けタスク（**人がやること**）の起票・一覧・返答（Issue #1450）。承認待ち・生成物のレビュー・権限の確認・宣伝投稿のように**ユーザーの手が要る**ものはここへ起票する（会話や引き継ぎファイルに溜めない）。AI 自身のタスクは tako_task_checkpoint / tako_task_gate で、これとは別物。起票すると PC の画面とスマホから同じものが見え、ユーザーの返答は起票した master の入力欄へ届く（master が閉じていれば起動して初回メッセージで渡す）。起票元（プロファイル・会話・ペイン）は自動で入るので指定は要らない。",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "description": "操作種別（省略時 list）",
+          "enum": [
+            "add",
+            "list",
+            "show",
+            "update",
+            "done",
+            "dismiss",
+            "respond"
+          ],
+          "type": "string"
+        },
+        "all": {
+          "description": "list で状態の絞り込みを外す",
+          "type": "boolean"
+        },
+        "attachments": {
+          "description": "添付の絶対パス（動画・画像・差分ファイル）。update では置き換え",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "body": {
+          "description": "本文（markdown）。手順・確認してほしい点を書く",
+          "type": "string"
+        },
+        "comment": {
+          "description": "respond の自由記述（スレッドとして積まれる）",
+          "type": "string"
+        },
+        "copy_texts": {
+          "description": "コピー用テキスト（`ラベル=本文`）。投稿文 / タイトル / タグを分けて入れるとスマホからワンタップでコピーできる",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "decision": {
+          "description": "respond の判断。approve / reject はタスクを閉じ、needs_change / answered は開いたまま残す",
+          "enum": [
+            "approve",
+            "reject",
+            "needs_change",
+            "answered"
+          ],
+          "type": "string"
+        },
+        "due": {
+          "description": "期限（YYYY-MM-DD）",
+          "type": "string"
+        },
+        "id": {
+          "description": "対象のタスク id（u-N。show / update / done / dismiss / respond で必須）",
+          "type": "string"
+        },
+        "kind": {
+          "description": "種類。review=生成物のレビュー / confirm=確認 / permission=権限の確認 / post=投稿（省略時 other）",
+          "enum": [
+            "review",
+            "confirm",
+            "permission",
+            "post",
+            "other"
+          ],
+          "type": "string"
+        },
+        "links": {
+          "description": "関連 URL。update では置き換え",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "project": {
+          "description": "プロジェクトキー（projects.yaml）",
+          "type": "string"
+        },
+        "status": {
+          "description": "list の絞り込み（省略時は未完了のみ）",
+          "enum": [
+            "open",
+            "done",
+            "dismissed"
+          ],
+          "type": "string"
+        },
+        "title": {
+          "description": "一覧に出る 1 行（add で必須）",
+          "type": "string"
+        },
+        "via": {
+          "description": "respond がどこから来たか（省略時 mcp）",
+          "enum": [
+            "pc",
+            "pwa",
+            "cli",
+            "mcp"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "tako_todo"
   },
   {
     "description": "タスクチェックポイントの記録・更新（Issue #242）。worker タスクの進行状態（Issue 番号・ブランチ・フェーズ・直近コミット等）を 永続化し、クラッシュ・利用上限・API 切断からの resume を可能にする。task_id を省略すると自動採番される。既存の task_id を指定すると上書き更新する。",

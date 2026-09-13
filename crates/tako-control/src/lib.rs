@@ -88,6 +88,7 @@ mod test_home;
 #[cfg(test)]
 mod test_write_isolation;
 pub mod transcript;
+pub mod user_tasks;
 pub mod welcome;
 /// worker ペインのフォント自動縮小（#1439）
 pub mod worker_font;

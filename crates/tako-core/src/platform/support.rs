@@ -1678,6 +1678,18 @@ pub const MATRIX: &[Feature] = &[
         ),
     },
     Feature {
+        key: "tako_todo",
+        macos: Support::Supported,
+        // 中身は YAML の読み書きと dispatch の既存腕（`Send` / `TabNew`）だけで、
+        // OS 固有の API は使わない。ただし Windows 実機での往復は**未実測**なので、
+        // #591 の規約どおり Pending + 追跡 #937 で置く（実測できたら根拠と同時に外す）
+        windows: Support::Pending {
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
+        },
+        windows_evidence: Evidence::Unverified,
+    },
+    Feature {
         key: "tako_tree_folder",
         macos: Support::Supported,
         windows: Support::Supported,

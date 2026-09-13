@@ -16,9 +16,9 @@ tako platform --status pending      # まだ使えないものだけ
 
 | 状態 | 件数 | 意味 |
 | --- | --- | --- |
-| 対応 | 117 / 149（79%） | macOS と同じように使えます |
+| 対応 | 117 / 150（78%） | macOS と同じように使えます |
 | 一部対応 | 15 | 使えますが機能が落ちます。落ち方は各表の「差分」列 |
-| 未実測 | 2 | 実装はあり macOS と同じ経路を通るが、Windows 実機でまだ動かしていないもの |
+| 未実測 | 3 | 実装はあり macOS と同じ経路を通るが、Windows 実機でまだ動かしていないもの |
 | 未対応 | 13 | Windows 側の実装が無い、または動かないことが分かっているもの |
 | 対象外 | 2 | Windows にその概念が無い、または OS が同等機能を標準で持つ |
 
@@ -121,7 +121,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 
 ## AI 連携（オーケストレーション）
 
-対応 26・一部対応 2
+対応 26・一部対応 2・未対応 / 未実測 1
 
 | 機能 | 状態 | 差分 | 根拠 |
 | --- | --- | --- | --- |
@@ -153,6 +153,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 | `tako_task_checkpoint` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako task checkpoint --task-id … --phase running` が保存され、`tako task update --phase verifying` が反映される |
 | `tako_task_list` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako task list --json` が保存したチェックポイントを issue / branch / project / prompt_head / phase つきで返す |
 | `tako_task_resume` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako task resume <id> --tab <t>` が PowerShell 方言の env 前置き（`$env:TAKO_ORCHESTRATOR_ROLE=…; claude …`）でペインを立てる |
+| `tako_todo` | 未対応 / 未実測 | 実装はプラットフォーム共通で macOS と同じ経路を通るが、Windows 実機での実測がまだ無い（動く見込み。失敗したらまずここを疑う） | 未実測 |
 
 ## git 連携
 

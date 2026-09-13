@@ -20540,6 +20540,11 @@ impl UiStateHost for TakoApp {
     }
 
     // #549: ウェルカムバナー。永続化（welcome_dismissed）は dispatch 側の責務
+    fn notify_user_task_added(&mut self, id: &str, title: &str) {
+        // 出し口は sidebar の 1 実装（#1399 系の通知欄）。ここは配線だけ
+        TakoApp::notify_user_task_added(self, id, title);
+    }
+
     fn welcome_banner_visible(&self) -> bool {
         self.welcome_banner
     }
@@ -51489,6 +51494,125 @@ mod self_test {
                 check(
                     ok_silent && log_lines == 2,
                     "IPC: 立っていれば無言・失敗 2 件は診断へ 2 行（#1441）",
+                );
+            }
+
+            // 84g. #1450: ユーザー向けタスクの起票が**共有の通知欄へ 1 行**出る。
+            // 84c〜84f が「失敗の無言」を潰したのに対し、ここは同じ出し口の**成功系**
+            // （`notify_ui_info`）。人の手を待つものが増えたことが画面のどこにも
+            // 出ないと、起票しても気づかれない = 機能が無いのと同じになる。
+            // **A/B は `TAKO_1450_LEGACY=1`**（他の Issue と env を分けてあるので、
+            // 片方のアームがもう片方の回帰を隠さない）。
+            //
+            // 起票は CLI / MCP と同じ dispatch の 1 実装を通す（画面用の近道を作らない）。
+            // 置き場はこのセルフテストの隔離 data dir の下なので本番へは書かない
+            {
+                use tako_control::protocol::Request;
+                let add = |title: &str, kind: &str| Request::UserTask {
+                    action: "add".into(),
+                    id: None,
+                    title: Some(title.to_string()),
+                    body: Some("本文は通知に載せない".into()),
+                    kind: Some(kind.to_string()),
+                    status: None,
+                    all: None,
+                    project: None,
+                    attachments: None,
+                    copy_texts: None,
+                    links: None,
+                    due: None,
+                    decision: None,
+                    comment: None,
+                    via: None,
+                    pane: None,
+                    caller_role: None,
+                };
+                let list = || Request::UserTask {
+                    action: "list".into(),
+                    id: None,
+                    title: None,
+                    body: None,
+                    kind: None,
+                    status: None,
+                    all: None,
+                    project: None,
+                    attachments: None,
+                    copy_texts: None,
+                    links: None,
+                    due: None,
+                    decision: None,
+                    comment: None,
+                    via: None,
+                    pane: None,
+                    caller_role: None,
+                };
+                let (before, added, notice, is_error, body_leaked, unknown_err, after) = window
+                    .update(cx, |app, _, cx| {
+                        let before = tako_control::dispatch(app, list(), PaneOrigin::Cli)
+                            .ok()
+                            .and_then(|v| v["open_count"].as_u64())
+                            .unwrap_or(0);
+                        app.remote_notice = None;
+                        let added = tako_control::dispatch(
+                            app,
+                            add("サムネを確認してほしい（#1450 セルフテスト）", "review"),
+                            PaneOrigin::Cli,
+                        )
+                        .ok();
+                        let notice = app.remote_notice.as_ref().map(|n| n.text.clone());
+                        let is_error = app.remote_notice.as_ref().map(|n| n.is_error);
+                        // 通知に本文は載せない（載せると通知欄が長文で埋まる）
+                        let body_leaked = notice
+                            .as_deref()
+                            .is_some_and(|t| t.contains("本文は通知に載せない"));
+                        // 綴りの違う action は**黙って無視せず**エラーにする
+                        let mut bad = add("x", "review");
+                        if let Request::UserTask { action, .. } = &mut bad {
+                            *action = "とじる".into();
+                        }
+                        let unknown_err =
+                            tako_control::dispatch(app, bad, PaneOrigin::Cli).is_err();
+                        let after = tako_control::dispatch(app, list(), PaneOrigin::Cli)
+                            .ok()
+                            .and_then(|v| v["open_count"].as_u64())
+                            .unwrap_or(0);
+                        cx.notify();
+                        (
+                            before,
+                            added,
+                            notice,
+                            is_error,
+                            body_leaked,
+                            unknown_err,
+                            after,
+                        )
+                    })
+                    .unwrap_or((0, None, None, None, false, false, 0));
+                let id = added
+                    .as_ref()
+                    .and_then(|v| v["id"].as_str())
+                    .unwrap_or("-")
+                    .to_string();
+                println!(
+                    "TAKO_SELF_TEST_1450: legacy={} id={id} notice={notice:?} \
+                     is_error={is_error:?} body_leaked={body_leaked} \
+                     unknown_err={unknown_err} open_count={before}->{after}",
+                    TakoApp::legacy_1450(),
+                );
+                let notice_ok = notice
+                    .as_deref()
+                    .is_some_and(|t| t.contains(&id) && t.contains("サムネを確認してほしい"));
+                check(
+                    notice_ok && is_error == Some(false) && !body_leaked,
+                    "ユーザータスク: 起票が通知欄へ 1 行出る（エラー扱いにしない・本文は出さない。#1450）",
+                );
+                check(
+                    after == before + 1,
+                    "ユーザータスク: 未完了件数が増える（画面のバッジの正本。#1450）",
+                );
+                check(
+                    unknown_err,
+                    "ユーザータスク: 知らない action は黙って無視せずエラーにする（#1450）",
                 );
             }
 

@@ -840,6 +840,36 @@ CLAUDE.md セクションテンプレート `06-completion-verification` が対�
 
 にファイルを配置する。このファイルが存在すれば、デフォルトより優先して使われる。
 
+## ユーザー向けタスク（`tako todo`。Issue #1450）
+
+**人がやること**の一覧。AI の承認待ち・生成物のレビュー・権限の確認・宣伝投稿のように
+**ユーザーの手が要る**ものを master / worker が起票し、ユーザーが PC でもスマホでも片付ける。
+AI 自身のタスク（`tako task checkpoint` / `gate` = #242 / #244）とは名前空間が別
+（id も `task-N` / `u-N` で目で区別できる）。
+
+```bash
+tako todo list                  # 未完了の一覧 + 件数
+tako todo show u-1              # 本文・添付・返答・配送状態
+tako todo respond u-1 --decision needs_change --comment "サムネの文字を大きく"
+tako todo done u-1              # 片付いた / dismiss なら「やらない」
+```
+
+- **起票するのは master / worker**（MCP `tako_todo` の `action=add`）。
+  起票元（プロファイル・会話・ペイン）は自動で入るので、返答の戻り先は指定しない
+- **返答は起票した master の入力欄へ届く**（`【ユーザー返答】todo u-N …`）。
+  その master が閉じていれば、同じプロファイルの master を**新しいタブで起動**して
+  初回メッセージにタスク本文 + 返答を載せる。顛末は `tako todo show` の `配送:` 行
+  （`sent` / `launched` / `delivered` / `failed` + 理由）
+- **判断は 4 つ**。`approve` / `reject` は閉じ、`needs_change` / `answered` は
+  **open のまま**残る（AI 側の作業がこれから続くので、閉じると直した物を見てもらう先が消える）
+- 新しく起票されると共有の通知欄に 1 行出る（`TAKO_1450_LEGACY=1` で旧挙動 = 無言）
+- 置き場は `<data_dir>/orchestrator/user-tasks.yaml`（`tako migrate` の番地に載っている）
+- master 側の作法は `tako orchestrator guide user-tasks`。
+  **引き継ぎファイルの「ユーザー確認待ち」はこの機能へ移す**（会話や md に溜めない）
+
+PC の画面（右パネル）とスマホ（PWA の `#/tasks`）は別 Issue（#1450 の B2 / B3）で、
+どちらもこの CLI / MCP と同じ 1 実装を叩く。
+
 ## 手順書（`tako orchestrator guide <topic>`。Issue #1154）
 
 system prompt は**長寿命セッションが起動した瞬間に払う固定費**なので、

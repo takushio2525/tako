@@ -1,11 +1,11 @@
 ---
 title: CLI リファレンス
-description: tako コマンド全 85 種の逆引き一覧 — 目的・使い方・実行例・よく使うオプション
+description: tako コマンド全 86 種の逆引き一覧 — 目的・使い方・実行例・よく使うオプション
 ---
 
 `tako` CLI は、ターミナルの画面操作（ペイン分割・テキスト送信・レイアウト変更など）をコマンドとして実行するためのツールです。シェルスクリプトからの自動化にも、AI エージェントからの操作にも使われます。
 
-トップレベルのコマンドは **85 種**で、その多くがさらにサブコマンドを持ちます。ほぼすべてが同名の MCP ツールと 1:1 で対応しており（[MCP ツール一覧](/guides/mcp-tools/)）、人ができる操作は AI も同じ経路で実行できます。
+トップレベルのコマンドは **86 種**で、その多くがさらにサブコマンドを持ちます。ほぼすべてが同名の MCP ツールと 1:1 で対応しており（[MCP ツール一覧](/guides/mcp-tools/)）、人ができる操作は AI も同じ経路で実行できます。
 
 ## 共通の前提
 
@@ -22,7 +22,7 @@ tako orchestrator spawn --help
 
 ## コマンド早見表
 
-やりたいことから引くための全 85 コマンドの一覧です。詳細のあるものはリンクから飛べます。
+やりたいことから引くための全 86 コマンドの一覧です。詳細のあるものはリンクから飛べます。
 
 ### 画面を操作する
 
@@ -100,6 +100,7 @@ tako orchestrator spawn --help
 | [`solo`](#tako-solo) | 1 対 1 の AI を起動する |
 | [`orchestrator`](#オーケストレーター) | worker の起動・監視・回収など |
 | [`task`](#tako-task) | タスクチェックポイントと受け入れゲート |
+| [`todo`](#tako-todo) | ユーザー向けタスク（人がやること）の起票・一覧・返答 |
 | [`mcp serve`](#tako-mcp-serve) | MCP stdio ブリッジ |
 | [`agents`](#tako-agents) | エージェント共通ルールの同期 |
 | [`show-command`](#tako-show-command) | コピー / 実行ボタンつきのコマンド提案カードを出す |
@@ -1244,6 +1245,42 @@ tako task gate set <task_id> --command "cargo test" --pr-merged 620
 tako task gate check <task_id>
 tako task gate show <task_id>
 ```
+
+### tako todo
+
+ユーザー（人）がやることの一覧です。AI の承認待ち・生成物のレビュー・権限の確認・宣伝投稿のように**あなたの手が要る**ものを tako が溜めて促します。`tako task`（AI 自身のタスク）とは別物です。
+
+返答（`respond`）は起票した master の入力欄へ届きます。master が閉じていれば、同じプロファイルの master を新しいタブで起動して初回メッセージとして渡します。配送の結果は `tako todo show` の `配送:` 行で読めます。
+
+```bash
+tako todo                            # （サブコマンド一覧）
+tako todo list                       # 未完了の一覧 + 件数
+tako todo list --all --json          # 完了・却下も含めて機械可読で
+tako todo show u-1                   # 本文・添付・返答・配送状態
+
+# 起票（ふつうは master / worker が MCP から行う）
+tako todo add "解説動画 v6 を YouTube へ投稿" \
+  --kind post \
+  --body "サムネは docs/thumb.png。タイトルと説明は copy-text から貼れます" \
+  --attach out/v6.mp4 \
+  --copy-text "タイトル=tako v0.9 の解説" \
+  --copy-text "説明=AI エージェントを 1 画面で監視する OSS ターミナル" \
+  --link https://github.com/takushio2525/tako
+
+# 返答する（起票した master へ届く）
+tako todo respond u-1 --decision needs_change --comment "サムネの文字を大きく"
+tako todo respond u-1 --decision approve
+
+tako todo done u-1                   # 片付いた
+tako todo dismiss u-1                # やらない
+```
+
+| 判断 | 意味 | タスクの状態 |
+|---|---|---|
+| `approve` | 承認した | `done`（閉じる） |
+| `reject` | 却下した | `dismissed`（閉じる） |
+| `needs_change` | 直してほしい | `open` のまま（AI の作業が続く） |
+| `answered` | 質問に答えた | `open` のまま |
 
 ### tako agents
 

@@ -570,6 +570,13 @@ pub trait UiStateHost {
     fn settings_window_open(&self) -> bool {
         false
     }
+    /// 新しいユーザータスクが起票されたことを画面へ 1 行出す（Issue #1450）。
+    ///
+    /// 出し先は #1399 / #1417 / #1422 / #1432 の失敗通知と**同じ共有の通知欄**で、
+    /// これはその**成功系**（`is_error = false`）。人の手を待つものが増えたことが
+    /// 画面のどこにも出ないと、起票しても気づかれない = 機能が無いのと同じになる。
+    /// 既定は何もしない（GUI が居ないホストでは画面が無い）
+    fn notify_user_task_added(&mut self, _id: &str, _title: &str) {}
     /// 初回起動のウェルカムバナーが表示中か（Issue #549）
     fn welcome_banner_visible(&self) -> bool {
         false

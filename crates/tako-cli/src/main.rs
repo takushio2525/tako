@@ -334,6 +334,11 @@ enum Command {
     /// worker タスクの進行状態を永続化し、クラッシュや利用上限からの resume を可能にする
     #[command(subcommand)]
     Task(TaskCommand),
+    /// ユーザー向けタスク（人がやること）の操作（Issue #1450）。
+    /// 承認待ち・レビュー・権限の確認・宣伝投稿など、AI ではなくユーザーの手が要るものを
+    /// 一覧で溜めて片付ける。AI 自身のタスクは `tako task`（別物）
+    #[command(subcommand)]
+    Todo(TodoCommand),
     /// ユーザー入力が必要なコマンドを可視ペインに委譲する（Issue #305）。
     /// split → タイトル設定 → コマンド投入をアトミックに実行し、pane_id を返す。
     /// --wait で完了まで待って exit code を返す
@@ -946,6 +951,125 @@ enum LogsCommand {
         /// ログ全体の上限（MB）
         #[arg(long = "total-max-mb")]
         total_max_mb: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum TodoCommand {
+    /// タスクを起票する
+    Add {
+        /// 一覧に出る 1 行
+        title: String,
+        /// 本文（markdown）
+        #[arg(long)]
+        body: Option<String>,
+        /// 種類: review / confirm / permission / post / other
+        #[arg(long)]
+        kind: Option<String>,
+        /// プロジェクトキー
+        #[arg(long)]
+        project: Option<String>,
+        /// 添付の絶対パス（複数指定可）
+        #[arg(long = "attach", value_name = "PATH")]
+        attachments: Vec<String>,
+        /// コピー用テキスト（`ラベル=本文`。複数指定可）
+        #[arg(long = "copy-text", value_name = "LABEL=TEXT")]
+        copy_texts: Vec<String>,
+        /// 関連 URL（複数指定可）
+        #[arg(long = "link", value_name = "URL")]
+        links: Vec<String>,
+        /// 期限（YYYY-MM-DD）
+        #[arg(long)]
+        due: Option<String>,
+        /// JSON で出力する
+        #[arg(long)]
+        json: bool,
+    },
+    /// 一覧（既定は未完了のみ）
+    List {
+        /// 状態で絞り込む: open / done / dismissed
+        #[arg(long)]
+        status: Option<String>,
+        /// 種類で絞り込む
+        #[arg(long)]
+        kind: Option<String>,
+        /// プロジェクトで絞り込む
+        #[arg(long)]
+        project: Option<String>,
+        /// 状態の絞り込みを外す（完了・却下も出す）
+        #[arg(long)]
+        all: bool,
+        /// JSON で出力する
+        #[arg(long)]
+        json: bool,
+    },
+    /// 1 件の詳細（本文・添付・返答・配送状態）
+    Show {
+        /// 対象のタスク id（u-N）
+        id: String,
+        /// JSON で出力する
+        #[arg(long)]
+        json: bool,
+    },
+    /// 内容を更新する（指定した項目だけ置き換える）
+    Update {
+        /// 対象のタスク id
+        id: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+        /// 添付を置き換える（複数指定可）
+        #[arg(long = "attach", value_name = "PATH")]
+        attachments: Vec<String>,
+        /// コピー用テキストを置き換える（複数指定可）
+        #[arg(long = "copy-text", value_name = "LABEL=TEXT")]
+        copy_texts: Vec<String>,
+        /// 関連 URL を置き換える（複数指定可）
+        #[arg(long = "link", value_name = "URL")]
+        links: Vec<String>,
+        #[arg(long)]
+        due: Option<String>,
+        /// JSON で出力する
+        #[arg(long)]
+        json: bool,
+    },
+    /// 片付いたことにする
+    Done {
+        /// 対象のタスク id
+        id: String,
+        /// JSON で出力する
+        #[arg(long)]
+        json: bool,
+    },
+    /// やらないことにする
+    Dismiss {
+        /// 対象のタスク id
+        id: String,
+        /// JSON で出力する
+        #[arg(long)]
+        json: bool,
+    },
+    /// 返答する（起票した master へ届く）
+    Respond {
+        /// 対象のタスク id
+        id: String,
+        /// 判断: approve / reject / needs_change / answered
+        #[arg(long)]
+        decision: String,
+        /// 自由記述（スレッドとして積まれる）
+        #[arg(long)]
+        comment: Option<String>,
+        /// どこから返したか: pc / pwa / cli / mcp（省略時 cli）
+        #[arg(long)]
+        via: Option<String>,
+        /// JSON で出力する
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -6226,6 +6350,170 @@ fn target_pane(explicit: Option<u64>) -> Result<Option<u64>, String> {
     })
 }
 
+/// `tako todo` の各サブコマンドを [`Request::UserTask`] へ畳む（#1450）。
+///
+/// **CLI 側で store を直接触らない**（`tako task gate` のようなローカル処理にしない）のは、
+/// 起票の通知を画面へ出すこと・返答を master のペインへ配ることが GUI の中でしか
+/// できないため。操作の実体は dispatch の 1 実装を通る（設計原則 5）
+fn todo_request(sub: &TodoCommand) -> Request {
+    let caller_role = std::env::var("TAKO_ORCHESTRATOR_ROLE").ok();
+    let base = |action: &str| Request::UserTask {
+        action: action.to_string(),
+        id: None,
+        title: None,
+        body: None,
+        kind: None,
+        status: None,
+        all: None,
+        project: None,
+        attachments: None,
+        copy_texts: None,
+        links: None,
+        due: None,
+        decision: None,
+        comment: None,
+        via: None,
+        pane: caller_pane(),
+        caller_role: caller_role.clone(),
+    };
+    /// 空の `Vec` は「指定なし」（update で既存を消さない）
+    fn some_if_any(list: &[String]) -> Option<Vec<String>> {
+        (!list.is_empty()).then(|| list.to_vec())
+    }
+    match sub {
+        TodoCommand::Add {
+            title,
+            body,
+            kind,
+            project,
+            attachments,
+            copy_texts,
+            links,
+            due,
+            ..
+        } => {
+            let mut req = base("add");
+            if let Request::UserTask {
+                title: t,
+                body: b,
+                kind: k,
+                project: p,
+                attachments: a,
+                copy_texts: c,
+                links: l,
+                due: d,
+                ..
+            } = &mut req
+            {
+                *t = Some(title.clone());
+                *b = body.clone();
+                *k = kind.clone();
+                *p = project.clone();
+                // 添付は相対パスで打たれることが多い。**呼び出し元の cwd で絶対化**する
+                // （dispatch は GUI のプロセスで走るので、相対のままでは別の場所を指す）
+                *a = some_if_any(attachments)
+                    .map(|list| list.iter().map(|p| resolve_cli_path(p)).collect());
+                *c = some_if_any(copy_texts);
+                *l = some_if_any(links);
+                *d = due.clone();
+            }
+            req
+        }
+        TodoCommand::List {
+            status,
+            kind,
+            project,
+            all,
+            ..
+        } => {
+            let mut req = base("list");
+            if let Request::UserTask {
+                status: s,
+                kind: k,
+                project: p,
+                all: a,
+                ..
+            } = &mut req
+            {
+                *s = status.clone();
+                *k = kind.clone();
+                *p = project.clone();
+                *a = all.then_some(true);
+            }
+            req
+        }
+        TodoCommand::Show { id, .. } => with_id(base("show"), id),
+        TodoCommand::Update {
+            id,
+            title,
+            body,
+            kind,
+            project,
+            attachments,
+            copy_texts,
+            links,
+            due,
+            ..
+        } => {
+            let mut req = with_id(base("update"), id);
+            if let Request::UserTask {
+                title: t,
+                body: b,
+                kind: k,
+                project: p,
+                attachments: a,
+                copy_texts: c,
+                links: l,
+                due: d,
+                ..
+            } = &mut req
+            {
+                *t = title.clone();
+                *b = body.clone();
+                *k = kind.clone();
+                *p = project.clone();
+                *a = some_if_any(attachments)
+                    .map(|list| list.iter().map(|p| resolve_cli_path(p)).collect());
+                *c = some_if_any(copy_texts);
+                *l = some_if_any(links);
+                *d = due.clone();
+            }
+            req
+        }
+        TodoCommand::Done { id, .. } => with_id(base("done"), id),
+        TodoCommand::Dismiss { id, .. } => with_id(base("dismiss"), id),
+        TodoCommand::Respond {
+            id,
+            decision,
+            comment,
+            via,
+            ..
+        } => {
+            let mut req = with_id(base("respond"), id);
+            if let Request::UserTask {
+                decision: d,
+                comment: c,
+                via: v,
+                ..
+            } = &mut req
+            {
+                *d = Some(decision.clone());
+                *c = comment.clone();
+                *v = Some(via.clone().unwrap_or_else(|| "cli".to_string()));
+            }
+            req
+        }
+    }
+}
+
+/// `Request::UserTask` へ対象 id を入れる
+fn with_id(mut req: Request, value: &str) -> Request {
+    if let Request::UserTask { id, .. } = &mut req {
+        *id = Some(value.to_string());
+    }
+    req
+}
+
 fn build_request(command: &Command) -> Result<Request, String> {
     Ok(match command {
         Command::Split(args) => {
@@ -7735,6 +8023,11 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 terminal: None,
             },
         },
+        Command::Todo(sub) => {
+            // 引数の並べ替えは 1 箇所（`todo_request`）に閉じる。CLI と MCP が
+            // **同じ `Request::UserTask`** を組むので、経路ごとの差が生まれない
+            todo_request(sub)
+        }
         Command::Task(sub) => match sub {
             TaskCommand::Checkpoint {
                 task_id,
@@ -8247,6 +8540,90 @@ fn print_sessions_list(result: &Value) {
     eprintln!("(resume: tako sessions resume <id> / 詳細: tako sessions show <id>)");
 }
 
+/// `tako todo list` の既定出力（#1450）。**未完了の件数を最後に出す**
+/// （画面のバッジと同じ数字を CLI でも見られるようにする）
+fn print_todo_list(result: &Value) {
+    let tasks = result["tasks"].as_array().cloned().unwrap_or_default();
+    if tasks.is_empty() {
+        println!("ユーザータスクが無い");
+    }
+    for task in &tasks {
+        let responses = task["responses"].as_array().map(Vec::len).unwrap_or(0);
+        let reply = if responses == 0 {
+            String::new()
+        } else {
+            format!("  返答:{responses}")
+        };
+        let due = task["due"]
+            .as_str()
+            .map(|d| format!("  期限:{d}"))
+            .unwrap_or_default();
+        println!(
+            "{:<6}  {:10}  {:9}  {}{}{}",
+            task["id"].as_str().unwrap_or("-"),
+            task["kind"].as_str().unwrap_or("-"),
+            task["status"].as_str().unwrap_or("-"),
+            task["title"].as_str().unwrap_or("-"),
+            due,
+            reply,
+        );
+    }
+    println!("未完了 {} 件", result["open_count"].as_u64().unwrap_or(0));
+}
+
+/// 1 件の詳細（`show` / `add` / `respond` の既定出力）
+fn print_todo_detail(result: &Value) {
+    println!(
+        "{} [{}/{}] {}",
+        result["id"].as_str().unwrap_or("-"),
+        result["kind"].as_str().unwrap_or("-"),
+        result["status"].as_str().unwrap_or("-"),
+        result["title"].as_str().unwrap_or("-"),
+    );
+    if let Some(body) = result["body"].as_str().filter(|b| !b.trim().is_empty()) {
+        println!("{body}");
+    }
+    for a in result["attachments"].as_array().unwrap_or(&Vec::new()) {
+        let mark = if a["exists"].as_bool() == Some(true) {
+            ""
+        } else {
+            "（見つからない）"
+        };
+        println!("  添付: {}{mark}", a["path"].as_str().unwrap_or("-"));
+    }
+    for c in result["copy_texts"].as_array().unwrap_or(&Vec::new()) {
+        let label = c["label"].as_str().unwrap_or("");
+        let head: String = c["text"].as_str().unwrap_or("").chars().take(40).collect();
+        println!("  コピー用[{label}]: {head}");
+    }
+    for l in result["links"].as_array().unwrap_or(&Vec::new()) {
+        println!("  リンク: {}", l.as_str().unwrap_or("-"));
+    }
+    for r in result["responses"].as_array().unwrap_or(&Vec::new()) {
+        println!(
+            "  返答[{}] {}: {}",
+            r["via"].as_str().unwrap_or("-"),
+            r["decision"].as_str().unwrap_or("-"),
+            r["comment"].as_str().unwrap_or(""),
+        );
+    }
+    if let Some(d) = result["delivery"].as_object() {
+        let reason = d
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(|r| format!("（{r}）"))
+            .unwrap_or_default();
+        println!(
+            "  配送: {}{reason} pane:{}",
+            d.get("state").and_then(Value::as_str).unwrap_or("-"),
+            d.get("pane")
+                .and_then(Value::as_u64)
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "-".into()),
+        );
+    }
+}
+
 fn print_task_list(result: &Value) {
     let checkpoints = result["checkpoints"]
         .as_array()
@@ -8553,6 +8930,27 @@ fn print_result(command: &Command, result: &Value) {
         Command::Recent(_) => println!("{}", pretty_json(result)),
         Command::SshHosts => println!("{}", pretty_json(result)),
         Command::RemoteFolder(_) => println!("{}", pretty_json(result)),
+        Command::Todo(TodoCommand::List { json, .. }) => {
+            if *json {
+                println!("{}", pretty_json(result));
+            } else {
+                print_todo_list(result);
+            }
+        }
+        Command::Todo(
+            TodoCommand::Add { json, .. }
+            | TodoCommand::Show { json, .. }
+            | TodoCommand::Update { json, .. }
+            | TodoCommand::Done { json, .. }
+            | TodoCommand::Dismiss { json, .. }
+            | TodoCommand::Respond { json, .. },
+        ) => {
+            if *json {
+                println!("{}", pretty_json(result));
+            } else {
+                print_todo_detail(result);
+            }
+        }
         Command::Task(TaskCommand::List { json, .. }) => {
             if *json {
                 println!("{}", pretty_json(result));

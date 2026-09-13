@@ -72,6 +72,8 @@ pub enum SchemaId {
     SoloProfiles,
     /// `<data_dir>/orchestrator/ledger.yaml`
     Ledger,
+    /// `<data_dir>/orchestrator/user-tasks.yaml`（ユーザー向けタスク。#1450）
+    UserTasks,
     /// `<data_dir>/orchestrator/handoff/`（引き継ぎ。プロジェクト単位化は #915）
     Handoff,
     /// `<data_dir>/setup/`（`tako setup` の生成物。置き場の是正は #1019）
@@ -101,6 +103,7 @@ impl SchemaId {
             Self::Profiles => "profiles",
             Self::SoloProfiles => "solo_profiles",
             Self::Ledger => "ledger",
+            Self::UserTasks => "user_tasks",
             Self::Handoff => "handoff",
             Self::Setup => "setup",
             Self::DiscoveryInstance => "discovery_instance",
@@ -130,6 +133,7 @@ impl SchemaId {
             Self::Profiles,
             Self::SoloProfiles,
             Self::Ledger,
+            Self::UserTasks,
             Self::Handoff,
             Self::Setup,
             Self::DiscoveryInstance,
