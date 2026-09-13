@@ -212,6 +212,9 @@ pub(crate) enum NoticeArea {
     /// （`notify_ui_info` = 新しく人の手を待つものが増えたことの通知）で、
     /// 出し先と抑止の作法は失敗通知と同じ 1 実装を共有する
     UserTasks,
+    /// SSH ペインの自動再接続（#1446）。**押した操作ではなく回線の事故**だが、
+    /// 「切れたのに繋ぎ直さない」は黙って起きてはいけないので同じ通知欄へ出す
+    SshPane,
 }
 
 impl NoticeArea {
@@ -224,6 +227,7 @@ impl NoticeArea {
             NoticeArea::Drawer => "drawer",
             NoticeArea::CommandCard => "command_card",
             NoticeArea::Chat => "chat",
+            NoticeArea::SshPane => "ssh_pane",
             NoticeArea::OpenFile => "open_file",
             NoticeArea::UpdateWindow => "update_window",
             NoticeArea::Ipc => "ipc",
@@ -255,6 +259,8 @@ pub(crate) enum NoticeArm {
     Issue1441,
     /// ユーザー向けタスクの起票通知（`TAKO_1450_LEGACY`）
     Issue1450,
+    /// SSH ペインの追跡の永続・引き取りと「繋ぎ直さない理由」（`TAKO_1446_LEGACY`）
+    Issue1446,
 }
 
 impl NoticeArm {
@@ -267,6 +273,7 @@ impl NoticeArm {
             NoticeArm::Issue1432 => TakoApp::legacy_1432(),
             NoticeArm::Issue1441 => TakoApp::legacy_1441(),
             NoticeArm::Issue1450 => TakoApp::legacy_1450(),
+            NoticeArm::Issue1446 => TakoApp::legacy_1446(),
         }
     }
 }
@@ -2139,7 +2146,7 @@ impl TakoApp {
     /// 同じ失敗を persist.log にも 1 行残す。**診断へ載せるのは画面・操作名と
     /// 理由の分類だけ**（パス・OS のエラー文は載せない = #1376 と同じ作法）。
     /// 通知本文にはユーザーが見て分かる対象（パス・打った名前・window 名）と理由を出す
-    fn notify_ui_failure(
+    pub(crate) fn notify_ui_failure(
         &mut self,
         area: NoticeArea,
         arm: NoticeArm,
@@ -2352,6 +2359,18 @@ impl TakoApp {
             &status.length_note(),
             text,
         );
+    }
+
+    /// #1446 の A/B。`TAKO_1446_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す。
+    ///
+    /// 戻すのは 4 つすべて（**この env 1 つに閉じる**）:
+    /// SSH 追跡の `layout.json` への永続 / 復元時の引き継ぎ / #976 の検知が
+    /// 見つけた手打ちペインの引き取り / 「繋ぎ直さない理由」の通知。
+    /// **#1040 の `TAKO_1040_LEGACY`（自動再接続そのもの）とは独立**に効くので、
+    /// 「記憶が残るか」と「残った記憶で撃つか」を別々に倒して確かめられる
+    pub(crate) fn legacy_1446() -> bool {
+        static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *LEGACY.get_or_init(|| std::env::var("TAKO_1446_LEGACY").map(|v| v == "1") == Ok(true))
     }
 
     /// リモート行の右クリックメニューの実行（#919）

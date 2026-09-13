@@ -168,6 +168,13 @@ impl TakoApp {
                 session.destination = known;
             }
         }
+        // #1446: 追跡していない SSH ペインをここで引き取る。**検知の材料は既に在る**
+        // （#976 がこの走査で `remote-folder auto` を動かしている）ので、新しい走査は
+        // 増えない。これが無いと、ユーザーが手で `ssh <host>` と打ったペインは
+        // dispatch を通らないので切断しても誰も見ておらず、無言でローカルへ落ちる
+        for session in &state.sessions {
+            self.adopt_ssh_connect(PaneId::from_raw(session.pane), &session.destination);
+        }
         let mut jobs: Vec<SshAutoOpenJob> = Vec::new();
         for session in &state.sessions {
             let entry = self

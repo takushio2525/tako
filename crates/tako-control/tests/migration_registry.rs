@@ -156,6 +156,9 @@ fn fingerprint() -> BTreeMap<String, Vec<String>> {
                 // いた（`origin` を足しても指紋が動かず素通りする）。#728 で
                 // `PendingSpawn` を足したのと同じ穴なので閉じる
                 "RemoteFolderLayout",
+                // #1446: `SshPaneLayout` は `PaneLayout.ssh` として layout.json へ
+                // 直に serde される永続構造体
+                "SshPaneLayout",
             ],
         ),
         (

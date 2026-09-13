@@ -31,8 +31,8 @@ use std::path::{Path, PathBuf};
 
 use tako_control::layout::{
     self, AgentResumeLayout, ChangeKey, LayoutExtras, LayoutFile, NodeLayout, PaneLayout,
-    PaneMetaRef, PreviewLayout, RemoteFolderLayout, TabLayout, WindowFrame, WindowLayout,
-    CHANGE_KEY_FIELDS,
+    PaneMetaRef, PreviewLayout, RemoteFolderLayout, SshPaneLayout, TabLayout, WindowFrame,
+    WindowLayout, CHANGE_KEY_FIELDS,
 };
 use tako_core::PaneId;
 
@@ -55,6 +55,7 @@ const LAYOUT_STRUCTS: &[&str] = &[
     "AgentResumeLayout",
     "PreviewLayout",
     "RemoteFolderLayout",
+    "SshPaneLayout",
 ];
 
 /// #916 の指紋スナップショットから layout 側の `(構造体, フィールド)` を読む。
@@ -394,6 +395,21 @@ fn cases() -> Vec<((&'static str, &'static str), Cover)> {
             ("PaneLayout", "limit_autoresume"),
             Cover::Mutate(|f| leaf(f, 101).limit_autoresume = true),
         ),
+        (
+            ("PaneLayout", "ssh"),
+            Cover::Mutate(|f| leaf(f, 102).ssh = None),
+        ),
+        // ---- SshPaneLayout（#1446）----
+        (
+            ("SshPaneLayout", "host"),
+            Cover::Mutate(|f| leaf(f, 101).ssh.as_mut().unwrap().host = "other-host".into()),
+        ),
+        (
+            ("SshPaneLayout", "reconnect_line"),
+            Cover::Mutate(|f| {
+                leaf(f, 101).ssh.as_mut().unwrap().reconnect_line = "ssh other-host".into()
+            }),
+        ),
         // ---- AgentResumeLayout ----
         (
             ("AgentResumeLayout", "agent"),
@@ -608,6 +624,10 @@ fn pane(id: u64, title: &str) -> PaneLayout {
         origin_tab: None,
         origin_tab_title: None,
         limit_autoresume: false,
+        ssh: Some(SshPaneLayout {
+            host: "work-host".into(),
+            reconnect_line: "ssh -o ConnectTimeout=10 work-host".into(),
+        }),
     }
 }
 
@@ -715,6 +735,10 @@ fn meta_of(p: &PaneLayout) -> PaneMetaRef<'_> {
             .as_ref()
             .map(|pv| (Path::new(pv.path.as_str()), pv.mode.as_str())),
         webview: p.webview.as_deref().map(Cow::Borrowed),
+        ssh: p
+            .ssh
+            .as_ref()
+            .map(|s| (s.host.as_str(), s.reconnect_line.as_str())),
     }
 }
 

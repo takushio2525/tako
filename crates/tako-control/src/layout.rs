@@ -243,6 +243,28 @@ pub struct PaneLayout {
     /// 旧ファイルは serde default で false になる（後方互換）
     #[serde(default, skip_serializing_if = "is_false")]
     pub limit_autoresume: bool,
+    /// SSH で繋がっているペインの再接続材料（#1446）。
+    /// **旧ファイルには無いので serde default で後方互換**（移行 Step は不要）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshPaneLayout>,
+}
+
+/// SSH ペインの再接続材料（#1446）。
+///
+/// #1040 の自動再接続は「このペインは host へ繋がっている」の記憶を**メモリだけ**に
+/// 持っていたため、GUI を再起動したペインは切断しても無言でローカルのシェルに残った
+/// （#1446 の実測: 再起動後の切断で 32 秒 `ssh_connect=null`・診断に検知行 0）。
+/// ここへ落として復元時に引き継ぐ。
+///
+/// **保存されるのは接続が成立した実績のあるペインだけ**（`ssh_reconnect::should_arm`
+/// の前提）。到達できない相手で開いただけのペインを再起動後に叩き始めない
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SshPaneLayout {
+    /// 接続先（`~/.ssh/config` の Host 名、または `user@host`）
+    pub host: String,
+    /// 切れたときに打ち直す 1 行。**そのペインを開いたときと同じ形**を保つ
+    /// （手打ちのペインを引き取った場合は、そのとき走っていた argv から組んだ行）
+    pub reconnect_line: String,
 }
 
 /// `skip_serializing_if` 用（既定値 false の項目を JSON に出さない）
@@ -284,6 +306,8 @@ pub struct PaneMeta {
     pub preview: Option<PreviewLayout>,
     /// Web ビューペインなら表示中の URL（FR-3.8 / #155）
     pub webview: Option<String>,
+    /// SSH ペインの再接続材料（#1446）
+    pub ssh: Option<SshPaneLayout>,
 }
 
 /// 復元されたペインの spawn 指示（Workspace へ挿入済み。セッション起動は呼び出し側）
@@ -302,6 +326,9 @@ pub struct RestoredPane {
     pub preview: Option<PreviewLayout>,
     /// Some なら Web ビューペインとして復元する（spawn しない。URL を開き直す）
     pub webview: Option<String>,
+    /// SSH ペインの再接続材料（#1446）。**器が生きていた**ときだけ引き継ぐ
+    /// （器ごと消えていたら新しいシェルが開くので、見張る相手が居ない）
+    pub ssh: Option<SshPaneLayout>,
 }
 
 /// 現在の Workspace 構造をレイアウト表現へ写す。`meta` でペインごとの
@@ -364,6 +391,7 @@ pub fn capture(
                     origin_tab: Some(shelved.origin_tab().as_u64()),
                     origin_tab_title: Some(shelved.origin_tab_title().to_string()),
                     limit_autoresume: pane.limit_autoresume(),
+                    ssh: m.ssh,
                 }
             })
             .collect(),
@@ -415,6 +443,7 @@ fn capture_node(node: &PaneNode, meta: &dyn Fn(PaneId) -> PaneMeta) -> NodeLayou
                 origin_tab: None,
                 origin_tab_title: None,
                 limit_autoresume: pane.limit_autoresume(),
+                ssh: m.ssh,
             }))
         }
         PaneNode::Split {
@@ -524,6 +553,8 @@ pub struct PaneMetaRef<'a> {
     pub preview: Option<(&'a Path, &'a str)>,
     /// Web ビューの URL。採取が `String` を返す経路（ロック越し）なので `Cow`
     pub webview: Option<Cow<'a, str>>,
+    /// SSH ペインの再接続材料（#1446）。(接続先, 打ち直す 1 行) の借用版
+    pub ssh: Option<(&'a str, &'a str)>,
 }
 
 impl PaneMetaRef<'_> {
@@ -537,6 +568,7 @@ impl PaneMetaRef<'_> {
             logged_history,
             preview,
             webview,
+            ssh,
         } = self;
         PaneMeta {
             session: session.map(str::to_string),
@@ -552,6 +584,10 @@ impl PaneMetaRef<'_> {
                 mode: mode.to_string(),
             }),
             webview: webview.as_ref().map(|u| u.to_string()),
+            ssh: ssh.map(|(host, line)| SshPaneLayout {
+                host: host.to_string(),
+                reconnect_line: line.to_string(),
+            }),
         }
     }
 
@@ -565,6 +601,7 @@ impl PaneMetaRef<'_> {
             logged_history,
             preview,
             webview,
+            ssh,
         } = self;
         session.hash(h);
         cwd.map(Path::as_os_str).hash(h);
@@ -573,6 +610,7 @@ impl PaneMetaRef<'_> {
         logged_history.hash(h);
         preview.map(|(p, m)| (p.as_os_str(), m)).hash(h);
         webview.as_deref().hash(h);
+        ssh.hash(h);
     }
 }
 
@@ -653,6 +691,10 @@ pub const CHANGE_KEY_FIELDS: &[(&str, &str)] = &[
     ("PaneLayout", "origin_tab"),
     ("PaneLayout", "origin_tab_title"),
     ("PaneLayout", "limit_autoresume"),
+    ("PaneLayout", "ssh"),
+    // SshPaneLayout（#1446）
+    ("SshPaneLayout", "host"),
+    ("SshPaneLayout", "reconnect_line"),
     // AgentResumeLayout
     ("AgentResumeLayout", "agent"),
     ("AgentResumeLayout", "id"),
@@ -953,6 +995,7 @@ pub fn restore(file: &LayoutFile) -> Result<(Workspace, Vec<RestoredPane>), Layo
             logged_history: p.logged_history,
             preview: p.preview.clone(),
             webview: p.webview.clone(),
+            ssh: p.ssh.clone(),
         });
         let origin_tab = p.origin_tab.map(TabId::from_raw).unwrap_or(fallback_tab);
         let origin_title = p
@@ -1014,6 +1057,7 @@ fn restore_node(
                 logged_history: p.logged_history,
                 preview: p.preview.clone(),
                 webview: p.webview.clone(),
+                ssh: p.ssh.clone(),
             });
             Some((PaneNode::Leaf(pane), id))
         }
@@ -1345,6 +1389,63 @@ mod tests {
         assert_ne!(markdown, code, "プレビューのモード変更が載らない");
     }
 
+    /// #1446: SSH ペインの再接続材料が再起動をまたいで残る。
+    /// 持たないペインは JSON に出さず、旧ファイル（フィールド無し）もそのまま読める
+    #[test]
+    fn issue1446_ssh追跡が保存復元され旧ファイルと後方互換() {
+        let root = Pane::new(PaneOrigin::User);
+        let root_id = root.id();
+        let mut ws = Workspace::new("1", root);
+        let ssh_pane = Pane::new(PaneOrigin::Cli);
+        let ssh_id = ssh_pane.id();
+        ws.active_tab_mut()
+            .tree_mut()
+            .split(root_id, SplitDirection::Right, ssh_pane)
+            .unwrap();
+
+        // SSH のペインだけが材料を持つ（普通のシェルのペインには付かない）
+        let meta = |pane: PaneId| {
+            if pane == ssh_id {
+                PaneMeta {
+                    ssh: Some(SshPaneLayout {
+                        host: "work-host".into(),
+                        reconnect_line: "ssh -o ConnectTimeout=10 work-host".into(),
+                    }),
+                    ..PaneMeta::default()
+                }
+            } else {
+                PaneMeta::default()
+            }
+        };
+        let layout = capture(&ws, &meta, None);
+        let json = serde_json::to_string(&layout).unwrap();
+        assert_eq!(
+            json.matches("reconnect_line").count(),
+            1,
+            "SSH のペインぶんだけ出力される: {json}"
+        );
+
+        let back: LayoutFile = serde_json::from_str(&json).unwrap();
+        let (_, restored) = restore(&back).expect("復元できる");
+        let tracked: Vec<&SshPaneLayout> = restored.iter().filter_map(|r| r.ssh.as_ref()).collect();
+        assert_eq!(tracked.len(), 1, "復元で引き継がれるのは 1 枚だけ");
+        assert_eq!(tracked[0].host, "work-host");
+        assert_eq!(
+            tracked[0].reconnect_line, "ssh -o ConnectTimeout=10 work-host",
+            "打ち直す 1 行が欠けると、復元したペインは繋ぎ直せない"
+        );
+
+        // 旧ファイル（`ssh` を知らない世代）は**移行なしで**そのまま読める
+        let old = json.replace("\"ssh\":", "\"_ssh_unknown\":");
+        assert_ne!(old, json, "置換の対象が無い（テストが何も見ていない）");
+        let back: LayoutFile = serde_json::from_str(&old).expect("旧ファイルが読める");
+        let (_, restored) = restore(&back).expect("復元できる");
+        assert!(
+            restored.iter().all(|r| r.ssh.is_none()),
+            "旧ファイルは追跡なしとして読む（serde default）"
+        );
+    }
+
     /// #813: 自動復帰のオプトインが再起動をまたいで残る。
     /// 既定 OFF は JSON に出さず、旧ファイル（フィールド無し）も OFF として読める
     #[test]
@@ -1541,6 +1642,7 @@ mod tests {
                     mode: "markdown".into(),
                 }),
                 webview: Some(format!("http://localhost:300{}", pane.as_u64())),
+                ssh: None,
             },
             Some(frame.clone()),
         );
@@ -1823,6 +1925,7 @@ mod tests {
                 origin_tab: None,
                 origin_tab_title: None,
                 limit_autoresume: false,
+                ssh: None,
             }))
         }
         let mut tree = pane(1);
@@ -1883,6 +1986,7 @@ mod tests {
             origin_tab: Some(1),
             origin_tab_title: None,
             limit_autoresume: false,
+            ssh: None,
         });
         assert_eq!(layout.pane_count(), 4);
         assert_eq!(layout.sessions(), vec!["tako-s1", "tako-s2", "tako-bg"]);
@@ -1979,6 +2083,7 @@ mod tests {
                 origin_tab: None,
                 origin_tab_title: None,
                 limit_autoresume: false,
+                ssh: None,
             }))
         }
         let mut id = 1u64;
@@ -2075,6 +2180,7 @@ mod tests {
             origin_tab: Some(1),
             origin_tab_title: None,
             limit_autoresume: false,
+            ssh: None,
         });
         assert!(
             !loses_backend_session(&base, &shelved),
