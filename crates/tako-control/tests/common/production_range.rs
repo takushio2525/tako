@@ -19,15 +19,50 @@
 //! 「黙って縮んだ」の検出は [`production`] / [`production_with_floor`] が持つ
 //! （本番コードが下限を割ったら、潰した先頭の領域を `file:line` で名指して落ちる）。
 //! テスト側を見張る番犬のために裏返し（[`tests_only`]）も同じ 1 実装から出す。
+//!
+//! ## テスト領域の見つけ方（#1445）
+//!
+//! 初版はリテラルの `#[cfg(test)]` しか探していなかったので、
+//! `#[cfg(all(test, unix))]` のように**属性が合成された**テストモジュール
+//! （`tako-control/src/discovery.rs` など 8 ファイル 11 か所）が潰れず、**本番コードとして
+//! 走査に混ざって**いた。番犬はテスト内の直書きを本番の違反として誤検出するか、
+//! 逆にテスト内の文字列を「扱った証拠」として拾って緑になる（#1417 が踏んだ型）。
+//!
+//! いまは cfg 述語を読んで、`test` を**正の位置**に含むものをテスト領域とする
+//! （[`mentions_test`]）。`#[cfg(not(test))]` は「テストでないとき」に載る
+//! **本番コード**なので潰さない。A/B は `TAKO_1445_LEGACY=1`（[`cfg_mode`]）。
 
 // 取り込む番犬ごとに使う関数が違う（片方しか使わないファイルがある）
 #![allow(dead_code)]
 
-// 位置決めだけに使う（コメント・文字列の中の `#[cfg(test)]` や `}` を数えないため）
+// 位置決めだけに使う（コメント・文字列の中の `#[cfg(test)]` や `}` を数えないため）。
+// 取り込む側から**二重に宣言させない**ため公開する（`clippy::duplicate_mod`）
 #[path = "code_view.rs"]
-mod code_view;
+pub mod code_view;
 
-const ATTR: &str = "#[cfg(test)]";
+/// item 属性の入口（`#[cfg_attr(` は**別物**なのでここには当たらない）
+const ATTR_HEAD: &str = "#[cfg(";
+
+/// #1445 以前が探していた綴り（A/B の旧アームでだけ使う）
+const LITERAL_ATTR: &str = "#[cfg(test)]";
+
+/// cfg 述語の読み方（A/B の軸 = #1445）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CfgMode {
+    /// `test` を**正の位置**に含む cfg 述語をテスト領域として潰す（現行）
+    TestPredicate,
+    /// リテラルの `#[cfg(test)]` だけを潰す（#1445 以前の再現）
+    LiteralOnly,
+}
+
+/// 既定の読み方。`TAKO_1445_LEGACY=1` のときだけ #1445 以前へ戻す
+pub fn cfg_mode() -> CfgMode {
+    if std::env::var("TAKO_1445_LEGACY").is_ok_and(|v| v == "1") {
+        CfgMode::LiteralOnly
+    } else {
+        CfgMode::TestPredicate
+    }
+}
 
 /// 本番コードだけの眺めと、潰したテスト領域の内訳
 pub struct Production {
@@ -84,8 +119,13 @@ pub const MIN_COVERAGE: f64 = 0.30;
 /// `#[cfg(test)] mod tests` も `#[cfg(test)] fn helper()` も
 /// `#[cfg(test)] stmt();` も同じ扱いで、**どれが先に来ても残りの本番コードは消えない**
 pub fn scan(src: &str) -> Production {
+    scan_with_mode(src, cfg_mode())
+}
+
+/// [`scan`] の読み方を指定する版（A/B の 2 アームを 1 回の実行で並べるため）
+pub fn scan_with_mode(src: &str, mode: CfgMode) -> Production {
     let view = code_view::code_view(src);
-    let ranges = test_ranges(&view);
+    let ranges = test_ranges(&view, mode);
     let mut out = src.as_bytes().to_vec();
     let mut removed = 0usize;
     for &(start, end) in &ranges {
@@ -107,10 +147,15 @@ pub fn scan(src: &str) -> Production {
 /// テスト側を見張る番犬（「テストが `Instant` を使っていない」等）が使う。
 /// 行番号が保たれるので、こちらも `file:line` でそのまま名指しできる
 pub fn tests_only(src: &str) -> String {
+    tests_only_with_mode(src, cfg_mode())
+}
+
+/// [`tests_only`] の読み方を指定する版（A/B 用。境界は [`scan_with_mode`] と同じ 1 実装）
+pub fn tests_only_with_mode(src: &str, mode: CfgMode) -> String {
     let view = code_view::code_view(src);
     let mut out = src.as_bytes().to_vec();
     let mut cursor = 0usize;
-    for (start, end) in test_ranges(&view) {
+    for (start, end) in test_ranges(&view, mode) {
         blank(&mut out, cursor, start);
         cursor = end;
     }
@@ -150,23 +195,122 @@ pub fn production_with_floor(src: &str, rel: &str, floor: f64) -> String {
     scanned.text
 }
 
-/// `#[cfg(test)]` が付いた item のバイト範囲（`code_view` 上で数える）
-fn test_ranges(view: &str) -> Vec<(usize, usize)> {
+/// テスト専用の item のバイト範囲（`code_view` 上で数える）。
+///
+/// `#[cfg(` から対応する `)]` までを述語として読み、[`mentions_test`] が真なら
+/// その item 全体を範囲にする。`#[cfg_attr(test, …)]` は**入口の綴りが違う**ので
+/// ここには当たらない（`cfg_attr` は item 自体は本番ビルドにも載り、付ける属性だけを
+/// 切り替えるものなので、潰すと本番コードが消える = 対象外にするのが正しい）
+fn test_ranges(view: &str, mode: CfgMode) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut cursor = 0usize;
-    while let Some(hit) = view[cursor..].find(ATTR) {
+    while let Some(hit) = view[cursor..].find(ATTR_HEAD) {
         let at = cursor + hit;
+        let after_head = at + ATTR_HEAD.len();
         // 行頭に置かれた item 属性だけを見る（`#![cfg(test)]` や式中の綴りは対象外）
         let line_start = view[..at].rfind('\n').map(|n| n + 1).unwrap_or(0);
         if !view[line_start..at].trim().is_empty() {
-            cursor = at + ATTR.len();
+            cursor = after_head;
             continue;
         }
-        let end = item_end(view, at + ATTR.len());
+        // `)]` で閉じるところまでが属性（複数行に跨る `#[cfg(all(\n test,\n …))]` も拾う）
+        let Some(close) = matching_paren(view, after_head - 1) else {
+            cursor = after_head;
+            continue;
+        };
+        if view.as_bytes().get(close + 1) != Some(&b']') {
+            cursor = after_head;
+            continue;
+        }
+        let attr_end = close + 2;
+        let is_test = match mode {
+            CfgMode::TestPredicate => mentions_test(&view[after_head..close]),
+            // #1445 以前: リテラルの綴りだけ（合成 cfg は本番コードとして残っていた）
+            CfgMode::LiteralOnly => &view[at..attr_end] == LITERAL_ATTR,
+        };
+        if !is_test {
+            cursor = attr_end;
+            continue;
+        }
+        let end = item_end(view, attr_end);
         ranges.push((line_start, end));
         cursor = end;
     }
     ranges
+}
+
+/// cfg 述語が `test` を**正の位置**に含むか。
+///
+/// - `test` → 真
+/// - `all(…)` / `any(…)` → 子のどれかが真なら真
+///   （`any(test, feature = "visual-test")` は本番ビルドに載らないテスト用の足場なので潰す）
+/// - `not(…)` → **偽**。`#[cfg(not(test))]` は「テストでないとき」に載る**本番コード**で、
+///   潰すと本番が番犬の視界から消える（`orchestrator/mod.rs` などに実在する）
+/// - それ以外の原子（`unix` / `windows` / `feature = "…"`）→ 偽。
+///   `code_view` が文字列を空白へ潰しているので `feature = "test-util"` は当たらない
+fn mentions_test(pred: &str) -> bool {
+    let pred = pred.trim();
+    if pred == "test" {
+        return true;
+    }
+    for name in ["all", "any"] {
+        if let Some(inner) = strip_call(pred, name) {
+            return split_top(inner).into_iter().any(mentions_test);
+        }
+    }
+    false
+}
+
+/// `name(…)` の中身（`all(test, unix)` → `test, unix`）
+fn strip_call<'a>(pred: &'a str, name: &str) -> Option<&'a str> {
+    let rest = pred.strip_prefix(name)?.trim_start();
+    rest.strip_prefix('(')?.strip_suffix(')')
+}
+
+/// 深さ 0 のカンマで割る（`all(a, any(b, c)), d` を壊さない）
+fn split_top(inner: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, ch) in inner.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&inner[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&inner[start..]);
+    parts
+        .into_iter()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// `open` の `(` に対応する `)` の位置（`code_view` 上なので文字列の中の括弧は数えない）
+fn matching_paren(view: &str, open: usize) -> Option<usize> {
+    let bytes = view.as_bytes();
+    if bytes.get(open) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (i, &b) in bytes.iter().enumerate().skip(open) {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// 属性の直後から item の終わりまで。対応する `}` か、宣言なら深さ 0 の `;`

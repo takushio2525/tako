@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-13（#1449: スマホの「+」を 3 択にして、ターミナル / SSH も新規に立てられるようにした）
-- 「+」を `LaunchSheet`（master / ターミナル / SSH）へ。**操作は 1 つも新設していない**（ターミナル = `POST /api/tabs` だけ / SSH = #1080 の `POST /api/ssh {target:"tab"}`）。role は 3 種とも **Manage 据え置き**（「interact 以上」案は既存 Interact 端末の権限が黙って広がるので不採用 = 脅威モデルへ明記）
-- 経路の宣言を `remote_launch::LAUNCH_ROUTES`（role / 監査 / PWA の呼び口）へ集約し `required_role` が引く形に。番犬 6 本 + e2e 11 本（61 passed）+ 実経路 `scripts/test-remote-launch-1449.sh` 38 PASS（**HOME ごと隔離**して実 `~/.ssh/config` を読まない = #927）。注入 7 通りすべて名指し FAILED
-- **既存テストの罠 2 つを直した**: #841 以降 `test-remote-master-launch.sh` が全 403 で落ちていた（`TAKO_REMOTE_TRUSTED_PEER_NAMES="curl"`）→ 34 PASS へ復旧 / tako ペインからの実行は `TAKO_SOCKET` 継承で **CLI が本番 GUI を触る**（実測でタブ + QR が本番へ出た）→ `unset` + 起動ガード。**install 不要 / daemon 再起動要**
-
 ## 2026-09-13（#1450 B1: 人がやることの正本と、返答を起票 master へ返す配送）
 - `tako todo` / MCP `tako_todo`（add / list / show / update / done / dismiss / respond）を `Request::UserTask` の 1 経路へ。モデルと純粋操作は `tako_core::user_task`、永続は `<data_dir>/orchestrator/user-tasks.yaml`（#916 の番地 `SchemaId::UserTasks` + 共有分類 Local。**新規ファイルなので移行 Step は無し** = 指紋のみ更新）。起票は共有通知欄の**成功系** `notify_ui_info`（A/B `TAKO_1450_LEGACY=1`）、診断は起きた場所（dispatch）へ
 - 返答の配送は**既存経路のみ**: 生きている master へ `Request::Send` / 居なければ `master_launch::plan` + `TabNew` + `queue_command_flow`（#640）+ `queue_prompt_flow`。**罠**: 作りたてのペインへ `Request::Send` を撃つと取り付けが次 tick なので落ちる（実測で launched が failed になった）
@@ -54,3 +49,8 @@
 - 真因は枠の同居**ではなく**折り返しの継続行の字下げ（実採取は中身の桁 5 に対して 4）。`gap_line_kind` が「ダイアログの外」に分類し `numbered_block` が選択肢 1 個で打ち切っていた。注入 A/B で名指し（枠を剥がしただけでは None のまま / 継続行を 5 桁へ揃えると修正前でも採れる）
 - 下限を `dialog::wrap_indent_floor`（マーカー `N.` より右）の 1 実装へ寄せ、歯止めに「選択カーソル行・番号つき行は続きにしない」。副画面は判定前に `side_panel_cuts` → `strip_side_panel` で剥がす（3 条件つき。全幅の箱の右端では発火しない）。エッジで実バグ 2 件を発見して修正（パネルだけの行が下の選択肢ラベルへ結合 / 内側の余白を掴む）
 - 実測（隔離 GUI・tako-vd）: `status` の `choice_dialog` が 3 択・`watch` が `WORKER_DIALOG: tako:1 (select)`・`respond --choice 2` が `resolved:true` / `keys_sent:["2"]`（模擬 TUI 側も `KEY=2 / CHOSE=自分で流す`）。`TAKO_1447_LEGACY=1` は `choice_dialog: null` / `WORKER_TIMEOUT` / 「画面に存在しない」で症状を再現。番犬 3 本・注入 8 通りで file:line 名指し。workspace 4805 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。**install 要**
+
+## 2026-09-14（#1445: 番犬の共有部品が合成 cfg のテストモジュールを本番として走査していた）
+- `production_range.rs` のテスト領域検出をリテラル `#[cfg(test)]` から**cfg 述語の解釈**へ（`mentions_test`: `test` を正の位置に含むものだけ潰す）。`not(test)` は本番として残し、`cfg_attr` は入口の綴りごと対象外。#1441 の番犬が持っていた自前正規化は削除して 1 実装へ戻した
+- 走査範囲は src 263 本中 **8 本**が変化（合計 74.34% → 74.04% / 新たに潰れたのは合成 cfg の 11 item ちょうど）。**下限 30% を跨いだファイルは 0 件**（表は Issue #1445）。A/B `TAKO_1445_LEGACY=1` では #1441 の番犬が `discovery.rs:343` をテスト内の直書きなのに本番違反として名指しで落ちる = 誤検出の再現
+- 新設 `issue1445_cfg_predicate_watchdog`（14 本・注入 8 通りすべて file:line 名指し）。workspace 4819 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。**テストのみ = install 不要**
