@@ -59,6 +59,7 @@ const CATEGORIES = [
     'tako_session_restart',
     'tako_task_gate', 'tako_task_gate_check', 'tako_task_gate_show',
     'tako_task_checkpoint', 'tako_task_list', 'tako_task_resume',
+    'tako_todo',
   ]],
   ['git 連携', [
     'tako_git_log', 'tako_git_diff', 'tako_git_show', 'tako_git_stage',

@@ -74,6 +74,7 @@ pub mod tmux_backend;
 pub mod tmux_cleanup;
 pub mod ui_mode;
 pub mod url_guard;
+pub mod user_task;
 pub mod wait_budget;
 pub mod workspace;
 
@@ -127,6 +128,7 @@ pub use text_edit::{CursorMovement, SearchHit, TextBuffer, TextEditError};
 pub use theme::{Rgb, Theme};
 pub use tmux::{TmuxSession, TmuxView, TmuxWindow};
 pub use ui_mode::{pane_display, PaneDisplay, PaneDisplayInput, StarterAction, UiMode};
+pub use user_task::{TaskKind, TaskStatus, UserTask};
 pub use workspace::{BackgroundPane, WindowId, Workspace, WorkspaceError, WorkspaceWindow};
 
 /// 外部バイナリの解決（環境変数 → PATH 直 → 既知パス → ログインシェル）。

@@ -70,6 +70,7 @@ fn 共有対象の設定ファイルは移行の番地にも載っている() {
         ("orchestrator/profiles/", SchemaId::Profiles),
         ("orchestrator/solo-profiles/", SchemaId::SoloProfiles),
         ("orchestrator/ledger.yaml", SchemaId::Ledger),
+        ("orchestrator/user-tasks.yaml", SchemaId::UserTasks),
         ("orchestrator/handoff/", SchemaId::Handoff),
         ("setup/", SchemaId::Setup),
         ("instances/", SchemaId::DiscoveryInstance),
@@ -171,6 +172,24 @@ fn fingerprint() -> BTreeMap<String, Vec<String>> {
         (
             "crates/tako-control/src/orchestrator/ledger.rs",
             &["Ledger", "LedgerEntry"],
+        ),
+        (
+            // #1450: ユーザー向けタスク。ストアも中身も tako-core 側に在る
+            // （`task_checkpoint` と違い、純粋な操作 API まで core に置いたため）
+            "crates/tako-core/src/user_task.rs",
+            &[
+                "TaskStore",
+                "UserTask",
+                "TaskOrigin",
+                "TaskResponse",
+                "Delivery",
+                "CopyText",
+                "TaskKind",
+                "TaskStatus",
+                "Decision",
+                "Via",
+                "DeliveryState",
+            ],
         ),
         (
             "crates/tako-control/src/task_checkpoints.rs",

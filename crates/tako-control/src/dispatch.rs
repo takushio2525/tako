@@ -4887,6 +4887,48 @@ fn dispatch_inner(
             ))),
         },
 
+        Request::UserTask {
+            action,
+            id,
+            title,
+            body,
+            kind,
+            status,
+            all,
+            project,
+            attachments,
+            copy_texts,
+            links,
+            due,
+            decision,
+            comment,
+            via,
+            pane,
+            caller_role,
+        } => dispatch_user_task(
+            host,
+            origin,
+            UserTaskParams {
+                action,
+                id,
+                title,
+                body,
+                kind,
+                status,
+                all,
+                project,
+                attachments,
+                copy_texts,
+                links,
+                due,
+                decision,
+                comment,
+                via,
+                pane,
+                caller_role,
+            },
+        ),
+
         Request::TaskGate {
             action,
             task_id,
@@ -12565,6 +12607,425 @@ pub fn fetch_tmux_sessions(ctx: &TmuxContext) -> Vec<Value> {
             .map(|s| session_json(s, true, &backend_socket.clone().into())),
     );
     sessions
+}
+
+/// [`Request::UserTask`] の引数（フィールドが 17 個あるので構造体で渡す。
+/// `ProfilesParams` と同じ作法）
+pub struct UserTaskParams {
+    pub action: String,
+    pub id: Option<String>,
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub kind: Option<String>,
+    pub status: Option<String>,
+    pub all: Option<bool>,
+    pub project: Option<String>,
+    pub attachments: Option<Vec<String>>,
+    pub copy_texts: Option<Vec<String>>,
+    pub links: Option<Vec<String>>,
+    pub due: Option<String>,
+    pub decision: Option<String>,
+    pub comment: Option<String>,
+    pub via: Option<String>,
+    pub pane: Option<u64>,
+    pub caller_role: Option<String>,
+}
+
+// --- ユーザー向けタスク（#1450） -------------------------------------------
+
+/// [`Request::UserTask`] の受け口。**CLI も MCP も画面もこの 1 実装を通る**
+/// （設計原則 5）。永続と純粋な判断は `crate::user_tasks` / `tako_core::user_task` にあり、
+/// ここが持つのは「host に触る部分」だけ = 呼び出し元の解決と、返答の配送
+fn dispatch_user_task(
+    host: &mut dyn ControlHost,
+    origin: PaneOrigin,
+    params: UserTaskParams,
+) -> Result<Value, DispatchError> {
+    use tako_core::user_task::{NewTask, TaskFilter, TaskPatch, TaskStatus};
+
+    let path = crate::user_tasks::store_path()
+        .ok_or_else(|| DispatchError::Operation("データディレクトリを解決できない".into()))?;
+    let op_err = DispatchError::Operation;
+
+    // 決着していない配送を畳み込む（読み書きのどの入口からでも 1 回。#1259 の
+    // `prompt_delivery_state` は 300 秒で消えるので、読まれた機会に確定させる）
+    reconcile_user_task_deliveries(host, &path);
+
+    match params.action.as_str() {
+        "add" => {
+            let title = params
+                .title
+                .clone()
+                .ok_or_else(|| DispatchError::InvalidParams("add には title が必要".into()))?;
+            let kind = params
+                .kind
+                .as_deref()
+                .map(crate::user_tasks::parse_kind)
+                .transpose()
+                .map_err(DispatchError::InvalidParams)?;
+            let caller = params.pane.and_then(|p| resolve_pane(host.workspace(), Some(p)).ok());
+            let task_origin = user_task_origin(host, &params, caller.map(|(_, p)| p));
+            let created_by = user_task_created_by(&params, &task_origin);
+            let value = crate::user_tasks::add_at(
+                &path,
+                NewTask {
+                    title,
+                    body: params.body.clone().unwrap_or_default(),
+                    kind,
+                    created_by,
+                    project: params.project.clone(),
+                    attachments: params.attachments.clone().unwrap_or_default(),
+                    copy_texts: params
+                        .copy_texts
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|s| crate::user_tasks::parse_copy_text(s))
+                        .collect(),
+                    links: params.links.clone().unwrap_or_default(),
+                    due: params.due.clone(),
+                    origin: Some(task_origin),
+                },
+            )
+            .map_err(op_err)?;
+            // 新しく人の手を待つものが増えたことを画面へ 1 行出す（#1399 系の出し口の成功系）。
+            // 診断はここ（起きた場所）に置く。GUI 側は画面へ出すだけ
+            let new_id = value["id"].as_str().unwrap_or("-").to_string();
+            crate::diag::persist_log(&format!(
+                "ユーザータスクを起票: task={new_id} kind={} 添付={} 通知=通知欄",
+                value["kind"].as_str().unwrap_or("-"),
+                value["attachments"].as_array().map(Vec::len).unwrap_or(0),
+            ));
+            host.notify_user_task_added(&new_id, value["title"].as_str().unwrap_or("-"));
+            Ok(value)
+        }
+        "list" => {
+            let filter = TaskFilter {
+                status: params
+                    .status
+                    .as_deref()
+                    .map(crate::user_tasks::parse_status)
+                    .transpose()
+                    .map_err(DispatchError::InvalidParams)?,
+                kind: params
+                    .kind
+                    .as_deref()
+                    .map(crate::user_tasks::parse_kind)
+                    .transpose()
+                    .map_err(DispatchError::InvalidParams)?,
+                project: params.project.clone(),
+                any_status: params.all.unwrap_or(false),
+            };
+            crate::user_tasks::list_at(&path, &filter).map_err(op_err)
+        }
+        "show" => {
+            let id = user_task_id(&params)?;
+            crate::user_tasks::show_at(&path, &id).map_err(op_err)
+        }
+        "update" => {
+            let id = user_task_id(&params)?;
+            let patch = TaskPatch {
+                title: params.title.clone(),
+                body: params.body.clone(),
+                kind: params
+                    .kind
+                    .as_deref()
+                    .map(crate::user_tasks::parse_kind)
+                    .transpose()
+                    .map_err(DispatchError::InvalidParams)?,
+                project: params.project.clone(),
+                attachments: params.attachments.clone(),
+                copy_texts: params.copy_texts.as_ref().map(|list| {
+                    list.iter()
+                        .map(|s| crate::user_tasks::parse_copy_text(s))
+                        .collect()
+                }),
+                links: params.links.clone(),
+                due: params.due.clone(),
+            };
+            crate::user_tasks::update_at(&path, &id, patch).map_err(op_err)
+        }
+        "done" | "dismiss" => {
+            let id = user_task_id(&params)?;
+            let status = if params.action == "done" {
+                TaskStatus::Done
+            } else {
+                TaskStatus::Dismissed
+            };
+            crate::user_tasks::set_status_at(&path, &id, status).map_err(op_err)
+        }
+        "respond" => {
+            let id = user_task_id(&params)?;
+            let decision = crate::user_tasks::parse_decision(
+                params
+                    .decision
+                    .as_deref()
+                    .ok_or_else(|| DispatchError::InvalidParams("respond には decision が必要".into()))?,
+            )
+            .map_err(DispatchError::InvalidParams)?;
+            let via = match params.via.as_deref() {
+                Some(v) => crate::user_tasks::parse_via(v).map_err(DispatchError::InvalidParams)?,
+                None => match origin {
+                    PaneOrigin::Mcp => tako_core::user_task::Via::Mcp,
+                    _ => tako_core::user_task::Via::Cli,
+                },
+            };
+            let comment = params.comment.clone().unwrap_or_default();
+            let (task, index) =
+                crate::user_tasks::respond_at(&path, &id, decision, &comment, via).map_err(op_err)?;
+            let delivery = deliver_user_task_response(host, &task, index);
+            crate::user_tasks::record_delivery_at(&path, &id, delivery).map_err(op_err)?;
+            crate::user_tasks::show_at(&path, &id).map_err(op_err)
+        }
+        other => Err(DispatchError::InvalidParams(format!(
+            "不明な action: {other:?}（add / list / show / update / done / dismiss / respond のいずれか）"
+        ))),
+    }
+}
+
+fn user_task_id(params: &UserTaskParams) -> Result<String, DispatchError> {
+    params
+        .id
+        .clone()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| DispatchError::InvalidParams(format!("{} には id が必要", params.action)))
+}
+
+/// 起票元（返答の戻り先）。**呼び出し側は何も指定しなくてよい**のが要件
+/// （master は「起票する」とだけ言えば、返答が自分の入力欄へ返ってくる）
+fn user_task_origin(
+    host: &dyn ControlHost,
+    params: &UserTaskParams,
+    caller: Option<PaneId>,
+) -> tako_core::user_task::TaskOrigin {
+    // プロファイルは呼び出し元の role（env 由来）→ ペインの role ラベルの順に解く。
+    // どちらの語彙でも読める 1 実装（#761 の取り違えを構造的に避ける）
+    let profile = params
+        .caller_role
+        .as_deref()
+        .and_then(tako_core::handoff::master_profile_of_any_role)
+        .map(str::to_string)
+        .or_else(|| {
+            caller.and_then(|pane| {
+                pane_role_of(host, pane)
+                    .as_deref()
+                    .and_then(tako_core::handoff::master_profile_of_role)
+                    .map(str::to_string)
+            })
+        });
+    // 会話の id はセッションカタログ（#284 の逆引き）から引く。
+    // ペインが死んだあとに返答が来ても「どの会話の話か」が残る
+    let session_id = caller
+        .and_then(|pane| crate::sessions::resolve_session_for_pane(&pane.as_u64().to_string()));
+    tako_core::user_task::TaskOrigin {
+        profile,
+        session_id,
+        pane: caller.map(|p| p.as_u64()),
+        project: params.project.clone(),
+    }
+}
+
+/// 起票者の名乗り（画面に「誰が頼んだか」を出すため）
+fn user_task_created_by(
+    params: &UserTaskParams,
+    origin: &tako_core::user_task::TaskOrigin,
+) -> Option<String> {
+    if let Some(profile) = &origin.profile {
+        return Some(format!("master:{profile}"));
+    }
+    if let Some(role) = params.caller_role.as_deref().filter(|r| !r.is_empty()) {
+        return Some(role.to_string());
+    }
+    origin.pane.map(|p| format!("pane:{p}"))
+}
+
+/// 生きているペインと role の一覧（配送先を選ぶ材料）
+fn user_task_pane_roles(workspace: &tako_core::Workspace) -> Vec<crate::user_tasks::PaneRole> {
+    workspace
+        .tabs()
+        .iter()
+        .flat_map(|t| t.tree().panes())
+        .map(|p| crate::user_tasks::PaneRole {
+            pane: p.id().as_u64(),
+            role: p.role().map(str::to_string),
+        })
+        .collect()
+}
+
+/// 決着していない配送を `prompt_delivery_state`（#1259）で確定させる。
+/// 失敗しても呼び出し元の操作は続ける（畳み込みは副次的な仕事）
+fn reconcile_user_task_deliveries(host: &dyn ControlHost, path: &std::path::Path) {
+    let Ok(store) = crate::user_tasks::load_from(path) else {
+        return;
+    };
+    let pending = store.pending_deliveries();
+    if pending.is_empty() {
+        return;
+    }
+    let observed: Vec<(String, Option<Value>)> = pending
+        .iter()
+        .map(|id| {
+            let flow = store
+                .find(id)
+                .and_then(|t| t.delivery.as_ref())
+                .and_then(|d| d.pane)
+                .and_then(|pane| host.prompt_delivery_state(PaneId::from_raw(pane)));
+            (id.clone(), flow)
+        })
+        .collect();
+    let _ = crate::user_tasks::reconcile_at(path, &observed);
+}
+
+/// 返答を起票 master へ運ぶ（#1450 の要件追加 ③）。
+///
+/// **新しい送達経路は作らない**。生きている master へは `Request::Send`
+/// （= `tako_send_input` と同じ腕）、居ないときは
+/// `orchestrator::master_launch::plan`（= `tako master` / PWA の「+ master」と
+/// 同じ組み立て）で起動してから `queue_prompt_flow` で初回メッセージを流す
+fn deliver_user_task_response(
+    host: &mut dyn ControlHost,
+    task: &tako_core::user_task::UserTask,
+    index: usize,
+) -> tako_core::user_task::Delivery {
+    use crate::user_tasks::{delivery_record, DeliveryTarget};
+    use tako_core::user_task::DeliveryState;
+
+    let profile = crate::user_tasks::origin_profile(task);
+    let panes = user_task_pane_roles(host.workspace());
+    let origin_pane = task.origin.as_ref().and_then(|o| o.pane);
+    match crate::user_tasks::choose_target(&panes, &profile, origin_pane) {
+        DeliveryTarget::Pane(pane) => {
+            let text = crate::user_tasks::response_message(task, index);
+            match dispatch(
+                host,
+                Request::Send {
+                    pane: Some(pane),
+                    text,
+                    newline: true,
+                    tmux_session: None,
+                    await_prompt: true,
+                },
+                PaneOrigin::User,
+            ) {
+                Ok(_) => {
+                    delivery_record(DeliveryState::Sent, &profile, Some(pane), None, None, index)
+                }
+                Err(e) => {
+                    log_user_task_delivery(&task.id, "send_failed", e.class());
+                    delivery_record(
+                        DeliveryState::Failed,
+                        &profile,
+                        Some(pane),
+                        None,
+                        Some(e.class().to_string()),
+                        index,
+                    )
+                }
+            }
+        }
+        DeliveryTarget::Launch => launch_master_for_response(host, task, index, &profile),
+    }
+}
+
+/// 起票 master が居ないので同じプロファイルで起動し、初回メッセージへ返答を載せる
+fn launch_master_for_response(
+    host: &mut dyn ControlHost,
+    task: &tako_core::user_task::UserTask,
+    index: usize,
+    profile: &str,
+) -> tako_core::user_task::Delivery {
+    use crate::user_tasks::delivery_record;
+    use tako_core::user_task::DeliveryState;
+
+    // 組み立て（プロファイル検証・CLI の実在検査）はペインを作る前に済ませる。
+    // ここで落ちたら空のタブを残さない（#983 と同じ順序）
+    let plan = match crate::orchestrator::master_launch::plan(profile) {
+        Ok(p) => p,
+        Err(e) => {
+            log_user_task_delivery(&task.id, "launch_plan_failed", "operation");
+            return delivery_record(
+                DeliveryState::Failed,
+                profile,
+                None,
+                None,
+                Some(format!("master を起動できない: {e}")),
+                index,
+            );
+        }
+    };
+    let created = match dispatch(
+        host,
+        Request::TabNew {
+            title: Some(plan.tab_title.clone()),
+            focus: Some(false),
+            cwd: plan.cwd.as_ref().map(|p| p.display().to_string()),
+        },
+        PaneOrigin::User,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            log_user_task_delivery(&task.id, "launch_tab_failed", e.class());
+            return delivery_record(
+                DeliveryState::Failed,
+                profile,
+                None,
+                None,
+                Some(e.class().to_string()),
+                index,
+            );
+        }
+    };
+    let tab = created["tab"].as_u64();
+    let Some(pane) = created["pane"].as_u64() else {
+        log_user_task_delivery(&task.id, "launch_pane_missing", "operation");
+        return delivery_record(
+            DeliveryState::Failed,
+            profile,
+            None,
+            tab,
+            Some("起動したタブのペインを解決できない".into()),
+            index,
+        );
+    };
+    // role を先に貼る（コマンドが走り出した時点で master として見える。#1078 と同じ順）
+    let _ = dispatch(
+        host,
+        Request::Title {
+            pane: Some(pane),
+            title: None,
+            role: Some(plan.pane_role.clone()),
+        },
+        PaneOrigin::User,
+    );
+    // 起動コマンドは **#640 の送達確認つきフロー**へ積む。作ったばかりのペインは
+    // セッションの取り付けが次の tick なので、ここで `Request::Send` を撃つと
+    // 「セッションが無い」で落ちる（実測: タブと role だけできて起動しない）。
+    // `queue_command_flow` は「シェルの準備待ち → 本文 → エコー確認 → 分離 Enter」を
+    // 回すので、器が入力を読み始める前に書いたバイトが落ちる事故（#640）も塞がる
+    host.queue_command_flow(PaneId::from_raw(pane), plan.command.clone());
+    // 初回メッセージは **claude TUI の起動（❯ 表示）を待ってから**送る。
+    // 起動コマンドの直後に書くと素のシェルへ流れ込む（#694 / #1006 と同じ事故）
+    host.queue_prompt_flow(
+        PaneId::from_raw(pane),
+        crate::user_tasks::launch_message(task, index),
+    );
+    log_user_task_delivery(&task.id, "launched", "ok");
+    delivery_record(
+        DeliveryState::Launched,
+        profile,
+        Some(pane),
+        tab,
+        None,
+        index,
+    )
+}
+
+/// 配送の顛末を persist.log へ 1 行（**本文・コメントは出さない**）。
+/// 「返答したのに master が動かない」を後から追うための唯一の痕跡
+fn log_user_task_delivery(id: &str, outcome: &str, class: &str) {
+    crate::diag::persist_log(&format!(
+        "ユーザータスクの返答配送: task={id} 結果={outcome} 分類={class}"
+    ));
 }
 
 /// 呼び出し元ペインに紐づく master プロファイルを解決する。

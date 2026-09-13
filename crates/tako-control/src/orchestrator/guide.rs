@@ -115,6 +115,15 @@ pub const GUIDES: &[Guide] = &[
         body: include_str!("guides/remote.md"),
     },
     Guide {
+        topic: "user-tasks",
+        // #1450 で新しく足した topic（移送ではないので差し戻しには参加しない）。
+        // prompt 側には「ユーザーの手が要るものはここへ起票する」という条件だけを置き、
+        // 種類の選び方・返答の扱い・本文の書き方はここへ置く
+        title: "Asking the User: Filing Tasks a Human Must Do",
+        restores: &[],
+        body: include_str!("guides/user-tasks.md"),
+    },
+    Guide {
         topic: "tools",
         title: "Available Tools, Worker Status and Projects",
         restores: &["tools", "worker-status", "projects"],

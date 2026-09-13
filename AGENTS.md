@@ -153,6 +153,7 @@ tako/
 | プレビューライブリロード | `tako preview-reload [on|off]` |
 | プレビュー画像キャッシュ | `tako preview-cache [max_mb]` |
 | 設定の自動マイグレーション（#916） | `tako migrate [status|run] [--schema <種別>]` |
+| **ユーザー向けタスク（人がやること。承認待ち・レビュー・投稿。#1450）** | `tako todo list` |
 | 受け入れゲート（#244 / #935） | `tako task gate set <task_id> --command "cmd" [--pr-merged N] [--custom "desc"]` |
 | git ブランチ操作（#496） | `tako git checkout <branch>` |
 | コンフリクト解消エージェント（#496） | `tako git resolve [--agent claude|codex|agy] [--tab N]` |

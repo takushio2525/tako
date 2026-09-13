@@ -1713,6 +1713,62 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller_role: Option<String>,
     },
+    /// ユーザー向けタスクの操作（Issue #1450）。**人がやること**の正本。
+    /// AI のタスク（[`Request::TaskCheckpoint`] / [`Request::TaskGate`]）とは別物で、
+    /// `action` は CLI（`tako todo <action>`）・MCP（`tako_todo`）と 1:1。
+    ///
+    /// `action`:
+    /// - "add": 起票（`title` 必須）
+    /// - "list": 一覧（既定は未完了のみ。`open_count` がバッジの正本）
+    /// - "show": 1 件
+    /// - "update": 部分更新（指定した項目だけ置き換える）
+    /// - "done" / "dismiss": 状態遷移
+    /// - "respond": ユーザーの返答（`decision` + `comment`）を積み、起票 master へ配送する
+    UserTask {
+        action: String,
+        /// 対象のタスク id（`u-N`）。add / list では使わない
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body: Option<String>,
+        /// review / confirm / permission / post / other
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        /// list の絞り込み（open / done / dismissed）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        /// list で status の絞り込みを外す
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        all: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+        /// 添付（絶対パス）。update では**置き換え**
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attachments: Option<Vec<String>>,
+        /// コピー用テキスト（`ラベル=本文`）。update では**置き換え**
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        copy_texts: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        links: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        due: Option<String>,
+        /// respond の判断（approve / reject / needs_change / answered）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decision: Option<String>,
+        /// respond の自由記述
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        comment: Option<String>,
+        /// respond がどこから来たか（pc / pwa / cli / mcp）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        via: Option<String>,
+        /// 起票元の名乗り・ペイン解決（呼び出し元が埋める）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_role: Option<String>,
+    },
     /// 受け入れゲートの操作（Issue #244）。
     /// `action`:
     /// - "set": ゲートの定義（criteria の一括設定）
@@ -1937,6 +1993,11 @@ impl Request {
 /// 新しい Request は必ずどちらかへ分類されて入る。
 pub fn changes_layout(request: &Request) -> bool {
     match request {
+        // ユーザー向けタスク（#1450）。`list` / `show` は画面（右パネル・PWA）が
+        // 秒単位でポーリングするので偽、`respond` だけは **master が居ないときに
+        // タブとペインを作る**ので真。ここを一律で偽にすると、起動した master の
+        // ペインへ winsize が渡らない（#1370 がこの操作で再発する）
+        Request::UserTask { action, .. } => action == "respond",
         // --- ペインの木・寸法そのもの ---
         Request::Split { .. }
         | Request::Close { .. }

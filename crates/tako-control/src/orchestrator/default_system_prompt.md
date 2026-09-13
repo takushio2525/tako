@@ -53,6 +53,7 @@ tako_orchestrator_guide({ topic: "monitoring" })   // CLI: tako orchestrator gui
 | `lifecycle` | you are deciding whether to reuse, replace or close a worker |
 | `handoff` | you cross the context threshold, or `【tako 自動通知】` arrives |
 | `remote` | a remote / SSH host must be set up, opened, or a remote open failed |
+| `user-tasks` | something needs the user's hands — approval, review, permission, a post |
 | `tools` | you need the tool inventory, worker-status fields, or the project registry |
 | `quality-ops` | related PRs are landing, or two workers could touch the same files |
 | `behavior` | early in the session, and whenever you are unsure how to act |

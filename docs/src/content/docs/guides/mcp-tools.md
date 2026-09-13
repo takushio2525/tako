@@ -1,9 +1,9 @@
 ---
 title: MCP ツール一覧
-description: tako が AI エージェントに公開する 149 個の MCP ツールの全リスト
+description: tako が AI エージェントに公開する 150 個の MCP ツールの全リスト
 ---
 
-tako は **149 個の MCP ツール**を AI エージェント（Claude Code / Codex 等）に公開しています。ほぼすべてが `tako` CLI のコマンドと 1:1 で対応しているため、細かい引数や挙動は [CLI リファレンス](/guides/cli-reference/)の対応コマンドも合わせて参照してください。
+tako は **150 個の MCP ツール**を AI エージェント（Claude Code / Codex 等）に公開しています。ほぼすべてが `tako` CLI のコマンドと 1:1 で対応しているため、細かい引数や挙動は [CLI リファレンス](/guides/cli-reference/)の対応コマンドも合わせて参照してください。
 
 :::tip[登録は一度きり]
 MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度行えば、以降はどのプロジェクトでも自動的に使えます。codex を master にする場合は `tako master` の起動時にだけ設定が注入されるため、グローバル設定の変更すら不要です。
@@ -156,6 +156,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_task_gate` | 受け入れゲート（完了条件）の定義 |
 | `tako_task_gate_check` | 受け入れゲートを実行して結果を記録する |
 | `tako_task_gate_show` | 受け入れゲートの状態を表示する |
+| `tako_todo` | ユーザー向けタスク（人がやること）の起票・一覧・返答。承認待ち・レビュー・権限の確認・宣伝投稿を溜め、返答は起票した master へ届く |
 
 ## コマンド実行（Code Runner）
 

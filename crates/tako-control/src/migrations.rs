@@ -122,6 +122,12 @@ fn validate_ledger(text: &str) -> Result<(), String> {
     yaml_ok::<crate::orchestrator::ledger::Ledger>(text)
 }
 
+/// ユーザー向けタスク（#1450）。**読めない = 承認待ちが画面から消える**ので、
+/// 黙って既定値（0 件）へ落とさずここで Err にして退避へ回す
+fn validate_user_tasks(text: &str) -> Result<(), String> {
+    yaml_ok::<tako_core::user_task::TaskStore>(text)
+}
+
 // --- 版数の判定 --------------------------------------------------------------
 
 /// 版数フィールドを持たない形式（構造で世代を分けていない）。常に v1
@@ -366,6 +372,8 @@ pub const SPECS: &[SchemaSpec] = &[
     // （`tako solo` は build_master_cmd を通る）。#981 の移行は solo にも要る
     profile_spec(SchemaId::SoloProfiles),
     pristine(SchemaId::Ledger, Some(validate_ledger)),
+    // ユーザー向けタスク（#1450）。版数フィールドを持つので `versioned`
+    versioned(SchemaId::UserTasks, Some(validate_user_tasks)),
     // 引き継ぎ（#915）は「プロファイル単位の 1 ファイル」から
     // 「プロジェクト単位の複数ファイル」への**分割**移行なので、テキスト置換の
     // Step では表せない。手順そのものは `orchestrator::handoff_store` が持ち、
@@ -425,6 +433,7 @@ pub fn targets(id: SchemaId) -> Vec<PathBuf> {
         SchemaId::Ledger => crate::orchestrator::ledger::ledger_path()
             .into_iter()
             .collect(),
+        SchemaId::UserTasks => crate::user_tasks::store_path().into_iter().collect(),
         // 引き継ぎは**1 ファイル → 複数ファイル**の分割移行（#915）なので、
         // テキスト置換の Step では表せない。専用実装へ委譲する（[`handoff_reports`]）
         SchemaId::Handoff => Vec::new(),

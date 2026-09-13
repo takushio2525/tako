@@ -5,6 +5,10 @@ AccountEntry: config_dir, inherit, description, default_model, default_effort
 AccountsConfig: accounts
 AgentResumeLayout: agent, id
 ControlInfo: version, pid, socket, token, mcp_url
+CopyText: label, text
+Decision: Approve, Reject, NeedsChange, Answered
+Delivery: state, profile, pane, tab, reason, at, response_index
+DeliveryState: Sent, Launched, Delivered, Failed
 Device: id, name, login, node_name, role, created_at, last_seen
 DevicesFile: devices
 LayoutFile: version, active_tab, tabs, window, backgrounded, collapsed, webview_dock, windows
@@ -33,7 +37,14 @@ SpawnLayoutSection: policy, master_ratio, algorithm, min_worker_cols, auto_shrin
 TabLayout: id, title, title_source, focused, tree, pinned_folders, remote_folders
 TaskCheckpoint: task_id, pane_id, issue, branch, phase, last_commit, agent, model, prompt_head, suspended_reason, project, cwd, updated_at
 TaskCheckpointStore: version, checkpoints
+TaskKind: Review, Confirm, Permission, Post, Other
+TaskOrigin: profile, session_id, pane, project
+TaskResponse: decision, comment, at, via
+TaskStatus: Open, Done, Dismissed
+TaskStore: version, tasks
 ThemePreset: base, colors
+UserTask: id, title, body, kind, status, created_by, project, attachments, copy_texts, links, due, created_at, updated_at, origin, responses, delivery
+Via: Pc, Pwa, Cli, Mcp
 WindowFrame: x, y, width, height, state
 WindowLayout: id, tabs, active_tab, frame
 WorkerEntry: label, project, agent, model, effort, pane, tab, tmux_session, session_id, issues, ledger_id, cwd, prompt_head, spawned_at, status, closed_at, close_reason, prompt_delivered_at, dead_since, prompt_delivery_failed_at, prompt_delivery_failure
@@ -54,6 +65,7 @@ version accounts: v1 steps=0
 version profiles: v3 steps=2
 version solo_profiles: v3 steps=2
 version ledger: v1 steps=0
+version user_tasks: v1 steps=0
 version handoff: v1 steps=0
 version setup: v1 steps=0
 version discovery_instance: v1 steps=0
