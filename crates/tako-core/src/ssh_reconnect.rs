@@ -129,7 +129,116 @@ pub fn is_recoverable_reason(reason: Option<&str>) -> bool {
 /// 多重化を持たないプラットフォームでは証拠が無いので armed にならない
 /// （宣言済みの縮退。[`crate::platform::ssh_client::NO_MULTIPLEXING`]）
 pub fn should_arm(enabled: bool, ever_connected: bool) -> bool {
-    enabled && ever_connected
+    arm_state(enabled, ever_connected).armed()
+}
+
+/// 自動再接続の対象か、対象でないなら**なぜか**（#1446）。
+///
+/// #1040 は `bool` だけを持っていたので、**繋ぎ直さなかった理由が誰にも見えなかった**
+/// （画面にも `tako list` にも何も出ず、ペインは黙ってローカルのシェルに残る）。
+/// 理由を型で持つと、切断を拾ったのに撃たない場面で**必ず 1 行出せる**ようになり、
+/// `ssh_connect.reconnect` としてそのまま CLI / MCP からも読める
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArmState {
+    /// 対象（切れたら打ち直す）
+    Armed,
+    /// 対象外: このペインで接続が成立した証拠がまだ無い。
+    /// 初回の接続失敗（#919）と、多重化を持たないプラットフォーム
+    /// （[`crate::platform::ssh_client::NO_MULTIPLEXING`]）がここへ来る
+    NoConnectionEvidence,
+    /// 対象外: 自動再接続そのものが切られている（`TAKO_1040_LEGACY`）
+    Disabled,
+}
+
+impl ArmState {
+    /// 対象か（[`should_arm`] の実体）
+    pub fn armed(self) -> bool {
+        matches!(self, ArmState::Armed)
+    }
+
+    /// ワイヤ表記（`tako list` / `read` の `ssh_connect.reconnect.state`）
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ArmState::Armed => "armed",
+            ArmState::NoConnectionEvidence => "no_connection_evidence",
+            ArmState::Disabled => "disabled",
+        }
+    }
+
+    /// 対象外の理由（対象なら `None`）。**画面にも応答にも同じ文面を出す**
+    pub fn reason(self, lang: Lang) -> Option<&'static str> {
+        match (self, lang) {
+            (ArmState::Armed, _) => None,
+            (ArmState::NoConnectionEvidence, Lang::Ja) => {
+                Some("このペインでは接続が成立した記録がありません")
+            }
+            (ArmState::NoConnectionEvidence, Lang::En) => {
+                Some("this pane has no record of a successful connection")
+            }
+            (ArmState::Disabled, Lang::Ja) => Some("自動再接続が無効です"),
+            (ArmState::Disabled, Lang::En) => Some("auto-reconnect is disabled"),
+        }
+    }
+}
+
+/// 対象かどうかと、対象でない理由（[`should_arm`] と同じ材料・1 実装）
+pub fn arm_state(enabled: bool, ever_connected: bool) -> ArmState {
+    if !enabled {
+        // **無効が先**: 切られているなら証拠の有無を論じる意味がない
+        ArmState::Disabled
+    } else if ever_connected {
+        ArmState::Armed
+    } else {
+        ArmState::NoConnectionEvidence
+    }
+}
+
+/// 「このペインは SSH だ」をどこから知ったか（#1446）。
+///
+/// #1446 の根因は**この記憶がプロセスの寿命しか持たなかった**こと。出どころを型で
+/// 持つと、`tako list` から「復元で引き継いだのか / 手打ちを引き取ったのか」が読め、
+/// 発火しない報告が来たときに**どの入口が抜けたか**を実測せずに切り分けられる
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackSource {
+    /// `tako open-in remote` / GUI のメニュー・右クリック / MCP（= dispatch 経由）
+    Opened,
+    /// `layout.json` から復元して引き継いだ（GUI 再起動をまたいだペイン）
+    Restored,
+    /// #976 の ssh 検知が見つけたので引き取った（ユーザーが手で打ったペイン）
+    Detected,
+}
+
+impl TrackSource {
+    /// ワイヤ表記（`tako list` / `read` の `ssh_connect.reconnect.source`）
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TrackSource::Opened => "opened",
+            TrackSource::Restored => "restored",
+            TrackSource::Detected => "detected",
+        }
+    }
+}
+
+/// 切断を拾ったのに繋ぎ直さないときに画面へ出す 1 行（#1446）。
+///
+/// **無言で終わらせない**のが趣旨。#1040 はここで `Failed` にするだけだったので、
+/// ユーザーには「ローカルのシェルに戻ります」しか見えず、再接続を待てばいいのか
+/// 自分で打つのかが判断できなかった（本 Issue の報告そのもの）
+pub fn not_armed_notice(lang: Lang, host: &str, state: ArmState) -> String {
+    let why = state.reason(lang).unwrap_or(match lang {
+        Lang::Ja => "理由は不明です",
+        Lang::En => "reason unknown",
+    });
+    match lang {
+        Lang::Ja => format!(
+            "{host} との接続が切れました。自動再接続はしません（{why}）。\
+             このペインで ssh {host} を実行すると繋ぎ直せます"
+        ),
+        Lang::En => format!(
+            "Disconnected from {host}. Not reconnecting automatically ({why}). \
+             Run ssh {host} in this pane to reconnect"
+        ),
+    }
 }
 
 /// **成立していた接続が壊れたときにしか出ない**行（ssh が印字する英語のまま）。
@@ -229,6 +338,25 @@ pub fn detect_disconnect(
         }
     }
     None
+}
+
+/// 繰り返しても同じ理由（鍵・ホスト鍵・設定）で繋ぎ直さないときの 1 行（#1446）。
+///
+/// [`is_recoverable_reason`] が false を返す場面。理由そのものは ssh が画面へ
+/// 生で出しているので、ここが言うのは**繰り返さないという判断**のほう
+pub fn permanent_notice(lang: Lang, host: &str, reason: Option<&str>) -> String {
+    let detail = reason.unwrap_or(match lang {
+        Lang::Ja => "理由は上の行です",
+        Lang::En => "the reason is printed above",
+    });
+    match lang {
+        Lang::Ja => format!(
+            "{host} との接続が切れました。何度試しても同じ理由なので自動再接続はしません（{detail}）"
+        ),
+        Lang::En => format!(
+            "Disconnected from {host}. Not retrying: the same error would repeat ({detail})"
+        ),
+    }
 }
 
 /// 再接続を始めるときにペインへ出す一言（`tako list` の `reason` ではなくチップの文言）
@@ -621,5 +749,118 @@ mod tests {
             !folder_should_probe(FOLDER_MAX_PROBES, 9999),
             "上限を越えて試している"
         );
+    }
+
+    // --- #1446: 対象かどうかと、対象でない理由 ---------------------------------
+
+    #[test]
+    fn 対象かの答えはshould_armとarm_stateで食い違わない() {
+        // `should_arm` は `arm_state` の薄い包み（1 実装）。真理値表の全点で一致させる
+        for enabled in [true, false] {
+            for ever in [true, false] {
+                assert_eq!(
+                    should_arm(enabled, ever),
+                    arm_state(enabled, ever).armed(),
+                    "enabled={enabled} ever_connected={ever} で食い違った"
+                );
+            }
+        }
+        assert_eq!(arm_state(true, true), ArmState::Armed);
+        assert_eq!(arm_state(true, false), ArmState::NoConnectionEvidence);
+        // **無効が先**: 切られているなら証拠の有無を論じない（画面の文面もそうなる）
+        assert_eq!(arm_state(false, true), ArmState::Disabled);
+        assert_eq!(arm_state(false, false), ArmState::Disabled);
+    }
+
+    #[test]
+    fn 対象でない理由は必ず言葉になる() {
+        // #1446 の本体: 「繋ぎ直さない」を**無言にしない**ので、
+        // 対象外の状態はどちらの言語でも必ず理由を持つ
+        for state in [ArmState::NoConnectionEvidence, ArmState::Disabled] {
+            for lang in [Lang::Ja, Lang::En] {
+                let why = state.reason(lang);
+                assert!(why.is_some(), "{state:?} / {lang:?} の理由が無い");
+                assert!(!why.unwrap().trim().is_empty());
+            }
+            assert_ne!(state.as_str(), "armed");
+        }
+        // 対象なら理由は無い（「繋ぎ直します」に理由は要らない）
+        assert!(ArmState::Armed.reason(Lang::Ja).is_none());
+        assert!(ArmState::Armed.reason(Lang::En).is_none());
+    }
+
+    #[test]
+    fn 状態と出どころのワイヤ表記は重複しない() {
+        let arms = [
+            ArmState::Armed,
+            ArmState::NoConnectionEvidence,
+            ArmState::Disabled,
+        ];
+        let mut wire: Vec<&str> = arms.iter().map(|a| a.as_str()).collect();
+        wire.sort_unstable();
+        wire.dedup();
+        assert_eq!(
+            wire.len(),
+            arms.len(),
+            "ArmState のワイヤ表記が衝突している"
+        );
+
+        let sources = [
+            TrackSource::Opened,
+            TrackSource::Restored,
+            TrackSource::Detected,
+        ];
+        let mut wire: Vec<&str> = sources.iter().map(|s| s.as_str()).collect();
+        wire.sort_unstable();
+        wire.dedup();
+        assert_eq!(
+            wire.len(),
+            sources.len(),
+            "TrackSource のワイヤ表記が衝突している"
+        );
+    }
+
+    #[test]
+    fn 繋ぎ直さないときの案内は次の一手を必ず含む() {
+        // 画面に出るのはこの 1 行だけなので、**何が起きたか**と
+        // **次に何をすればいいか**の両方が入っていること（#1446 / #919 と同じ物差し）
+        for lang in [Lang::Ja, Lang::En] {
+            for state in [ArmState::NoConnectionEvidence, ArmState::Disabled] {
+                let text = not_armed_notice(lang, "example-host", state);
+                assert!(text.contains("example-host"), "相手の名前が無い: {text}");
+                assert!(
+                    text.contains("ssh example-host"),
+                    "次の一手（打ち直す 1 行）が無い: {text}"
+                );
+                assert!(
+                    text.contains(state.reason(lang).expect("対象外には理由がある")),
+                    "理由が入っていない: {text}"
+                );
+            }
+            // 待っても変わらない理由のほうは、**繰り返さない判断**を言う
+            let text = permanent_notice(lang, "example-host", Some("Permission denied"));
+            assert!(text.contains("example-host"));
+            assert!(
+                text.contains("Permission denied"),
+                "拾った理由が消えた: {text}"
+            );
+            // 理由が読めなくても無言にはしない
+            let blind = permanent_notice(lang, "example-host", None);
+            assert!(!blind.trim().is_empty());
+            assert!(blind.contains("example-host"));
+        }
+    }
+
+    #[test]
+    fn 繋ぎ直す価値のある理由と無い理由を取り違えない() {
+        // #1446 で通知の文面を 2 種類に分けた根拠。ここが入れ替わると
+        // 鍵の失敗に「回線が戻ったら」と案内してしまう
+        assert!(!is_recoverable_reason(Some(
+            "testuser@example-host: Permission denied (publickey)."
+        )));
+        assert!(is_recoverable_reason(Some(
+            "client_loop: send disconnect: Broken pipe"
+        )));
+        assert!(is_recoverable_reason(None));
     }
 }

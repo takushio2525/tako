@@ -85,6 +85,9 @@ struct Owned {
     conv: String,
     preview: PathBuf,
     webview: String,
+    /// SSH ペインの追跡（#1446）。保存に載る値なので**コストの計測にも載せる**
+    ssh_host: String,
+    ssh_line: String,
 }
 
 fn scene() -> (Workspace, Vec<PaneId>, HashMap<u64, Owned>) {
@@ -127,6 +130,8 @@ fn scene() -> (Workspace, Vec<PaneId>, HashMap<u64, Owned>) {
                     conv: format!("conv-{n}"),
                     preview: PathBuf::from(format!("/srv/work/project-{n}/README.md")),
                     webview: format!("https://example.invalid/{n}"),
+                    ssh_host: format!("remote-{n}"),
+                    ssh_line: format!("ssh -o ConnectTimeout=10 remote-{n}"),
                 },
             )
         })
@@ -163,6 +168,7 @@ fn 変化が無いtickは確保も直列化もほぼ払わない() {
             logged_history: Some(1234),
             preview: Some((o.preview.as_path(), "markdown")),
             webview: Some(Cow::Borrowed(o.webview.as_str())),
+            ssh: Some((o.ssh_host.as_str(), o.ssh_line.as_str())),
         },
         None => PaneMetaRef::default(),
     };

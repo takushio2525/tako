@@ -3283,6 +3283,16 @@ struct SshConnect {
     attempt_pending: bool,
     /// 切断の理由（画面から拾った 1 行）
     reason: Option<String>,
+    /// このペインが SSH だと**どこから知ったか**（#1446）。
+    /// `tako list` / `read` に出して、発火しない報告の切り分けを実測抜きで行えるようにする
+    source: tako_core::ssh_reconnect::TrackSource,
+    /// 見張りの起点をまだ取り直していない（#1446）。
+    ///
+    /// 復元・引き取りで作ったエントリは**画面に過去の出力が残っている**ところから
+    /// 始まる（再起動前の切断マーカー・手打ちの `ssh` の行）。起点を取らずに見張ると
+    /// 古い行をもう一度「いま切れた」と読む（#1040 が実装中に踏んだ罠と同型）ので、
+    /// 最初の tick で必ず現在の画面末尾へ起点を移す
+    needs_rebase: bool,
 }
 
 impl SshConnect {
@@ -4314,6 +4324,12 @@ impl TakoApp {
                 });
                 if let Some(name) = &r.session {
                     app.backend_sessions.insert(pane, name.clone());
+                }
+                // #1446: SSH の追跡を引き継ぐ。**器が生きていたときだけ**
+                // （器ごと消えていたら新しいシェルが開く = 繋がっている相手が居ない）。
+                // これが無いと、再起動をまたいだペインは切断しても誰も見ていない
+                if let (Some(ssh), true) = (&r.ssh, backend_alive) {
+                    app.restore_ssh_connect(pane, ssh);
                 }
                 // ペインログ（Issue #112 B）: 前回の取り込み位置を復元し、tako 停止中に
                 // tmux 側へ積もった出力を次回 tick の差分として取り込む
@@ -9233,6 +9249,8 @@ impl TakoApp {
         let terminals = &self.terminals;
         let previews = &self.previews;
         let webviews = &self.webviews;
+        // #1446: SSH の追跡。借用のまま渡す（`PaneMetaRef` の作法と同じ）
+        let ssh_tracked = &self.ssh_connect;
         // ペインログの取り込み位置（Issue #112 B。再起動後の差分取り込み基準として保存）
         let pane_log_history: HashMap<u64, u64> = self
             .pane_logs_lock()
@@ -9259,6 +9277,8 @@ impl TakoApp {
                 .iter()
                 .find(|e| e.pane == Some(pane))
                 .map(|e| std::borrow::Cow::Owned(e.current_url())),
+            // #1446: 接続が成立した実績のある SSH ペインだけ保存する
+            ssh: Self::ssh_layout_in(ssh_tracked, pane),
         };
         // capture では埋まらない UI 層の付帯情報（#1425: 変化検出と穴埋めで
         // **同じ値**を使う。片方だけ更新すると保存漏れになる）
@@ -10527,6 +10547,20 @@ impl TakoApp {
                 Some(tako_core::terminal::CommandState::Failed(code)) => Some(code),
                 _ => None,
             };
+            // #1446: 復元・引き取りで作ったエントリは**画面に過去の出力が残っている**
+            // ところから始まる（再起動前の切断マーカー・手打ちの `ssh` の行）。
+            // 起点を取らずに見張ると古い行をもう一度「いま切れた」と読むので、
+            // 最初の tick で必ず現在の画面末尾へ移す
+            if self
+                .ssh_connect
+                .get(&pane)
+                .is_some_and(|st| st.needs_rebase)
+            {
+                if let Some(st) = self.ssh_connect.get_mut(&pane) {
+                    st.rebase(&lines);
+                    st.needs_rebase = false;
+                }
+            }
             let Some(st) = self.ssh_connect.get(&pane) else {
                 continue;
             };
@@ -10626,17 +10660,49 @@ impl TakoApp {
                         continue;
                     };
                     let host = st.host.clone();
-                    // `ever_connected` をここで読むのが要点: `Connected` は接続が成立した
-                    // ペインしか通らないが、**判断の根拠をリテラルで埋めない**
-                    // （読む人にもテストにも「何が条件か」が見える形にしておく）
-                    let armed =
-                        reconnect::should_arm(Self::ssh_reconnect_enabled(), st.ever_connected)
-                            && reconnect::is_recoverable_reason(reason.as_deref());
+                    // `ever_connected` をここで読むのが要点: **判断の根拠をリテラルで
+                    // 埋めない**（読む人にもテストにも「何が条件か」が見える形にしておく）。
+                    // #1446 で戻り値を `bool` から理由つきの型へ変えた: `bool` だけだと、
+                    // ユーザーにも `tako list` にも**なぜ繋ぎ直さないか**が出せない
+                    let arm =
+                        reconnect::arm_state(Self::ssh_reconnect_enabled(), st.ever_connected);
+                    let recoverable = reconnect::is_recoverable_reason(reason.as_deref());
+                    let armed = arm.armed() && recoverable;
                     tako_control::diag::persist_log(&format!(
-                        "ssh 切断を検知: pane={} host={host} 自動再接続={}",
+                        "ssh 切断を検知: pane={} host={host} 自動再接続={}（{}）",
                         pane.as_u64(),
-                        if armed { "する" } else { "しない" }
+                        if armed { "する" } else { "しない" },
+                        arm.as_str()
                     ));
+                    if !armed {
+                        // **無言で終わらせない**（#1446）。文面は 2 通り:
+                        // 待てば戻る理由なら**追跡の側の事情**（証拠が無い / 無効）と
+                        // 次の一手を、待っても変わらない理由（鍵・ホスト鍵・設定）なら
+                        // **繰り返さないという判断**と拾った理由を言う
+                        let lang = tako_core::i18n::lang();
+                        let (class, text) = if recoverable {
+                            (
+                                arm.as_str(),
+                                tako_core::ssh_reconnect::not_armed_notice(lang, &host, arm),
+                            )
+                        } else {
+                            (
+                                "permanent_reason",
+                                tako_core::ssh_reconnect::permanent_notice(
+                                    lang,
+                                    &host,
+                                    reason.as_deref(),
+                                ),
+                            )
+                        };
+                        self.notify_ui_failure(
+                            crate::sidebar::NoticeArea::SshPane,
+                            crate::sidebar::NoticeArm::Issue1446,
+                            "ssh 自動再接続",
+                            class,
+                            text,
+                        );
+                    }
                     if let Some(st) = self.ssh_connect.get_mut(&pane) {
                         st.reason = reason.clone();
                         st.rebase(&lines);
@@ -10778,6 +10844,150 @@ impl TakoApp {
         }
         touched.retain(|p| self.pane_exists(*p));
         touched
+    }
+
+    /// SSH ペインの追跡を始める（#1010 / #1446）。**入口 3 つの 1 実装**。
+    ///
+    /// 覚え始めた時点の画面を控える。`pane` 経路（既存シェル）は**打った行が
+    /// プロンプトの続きに載る**ので、起点はプロンプト行（= 最後の非空行）。
+    /// 行数で切り出せない理由は `ssh_progress::baseline_index`
+    fn track_ssh_connect(
+        &mut self,
+        pane: PaneId,
+        host: &str,
+        fresh_pane: bool,
+        reconnect_line: &str,
+        source: tako_core::ssh_reconnect::TrackSource,
+    ) {
+        use tako_core::ssh_reconnect::TrackSource;
+        let lines = self
+            .terminals
+            .get(&pane)
+            .map(|s| s.visible_lines())
+            .unwrap_or_default();
+        // 復元・引き取りは**既に繋がっている**ところから始まるので、接続待ちではなく
+        // 見張り（`Connected`）へ直接入り、証拠（`ever_connected`）も引き継ぐ。
+        // `Connecting` から始めると、相手が黙っている限り `give_up`（120 秒）で
+        // 畳まれて**また追跡が消える** = #1446 を作り直すことになる
+        let restored_or_adopted = !matches!(source, TrackSource::Opened);
+        self.ssh_connect.insert(
+            pane,
+            SshConnect {
+                host: host.to_string(),
+                started: std::time::Instant::now(),
+                fresh_pane,
+                baseline_index: tako_core::ssh_progress::baseline_index(&lines),
+                baseline_fingerprint: tako_control::limit_stop::screen_fingerprint(&lines),
+                phase: if restored_or_adopted {
+                    tako_core::ssh_progress::ConnectPhase::Connected
+                } else {
+                    tako_core::ssh_progress::ConnectPhase::Connecting
+                },
+                reconnect_line: reconnect_line.to_string(),
+                ever_connected: restored_or_adopted,
+                disconnected_at: None,
+                attempts: 0,
+                last_attempt_at: None,
+                attempt_pending: false,
+                reason: None,
+                source,
+                needs_rebase: restored_or_adopted,
+            },
+        );
+    }
+
+    /// `layout.json` から引き継いだ SSH ペインの追跡を再開する（#1446）。
+    ///
+    /// **器が生きていたペインだけ**を呼び出し側が渡す（器ごと消えていたら新しい
+    /// シェルが開くので、繋がっている相手が居ない）。これが無いと、GUI 再起動を
+    /// またいだペインは切断しても誰も見ておらず、無言でローカルのシェルに残る
+    pub(crate) fn restore_ssh_connect(
+        &mut self,
+        pane: PaneId,
+        ssh: &tako_control::layout::SshPaneLayout,
+    ) {
+        if Self::legacy_1446() {
+            return;
+        }
+        self.track_ssh_connect(
+            pane,
+            &ssh.host,
+            false,
+            &ssh.reconnect_line,
+            tako_core::ssh_reconnect::TrackSource::Restored,
+        );
+        tako_control::diag::persist_log(&format!(
+            "ssh 追跡を復元: pane={} host={}",
+            pane.as_u64(),
+            ssh.host
+        ));
+    }
+
+    /// #976 の検知が見つけた**未追跡の** SSH ペインを引き取る（#1446）。
+    ///
+    /// ユーザーが自分で `ssh <host>` と打ったペインは dispatch を通らないので
+    /// `begin_ssh_connect` が呼ばれず、切断しても無言でローカルへ落ちていた（実測）。
+    /// 検知は既にそのペインを見つけている（`remote-folder auto` が使っている材料）
+    /// ので、**同じ材料をここでも使う**（新しい走査は増やさない）
+    fn adopt_ssh_connect(&mut self, pane: PaneId, destination: &str) {
+        use tako_core::ssh_progress::ConnectPhase;
+        if Self::legacy_1446() {
+            return;
+        }
+        // 既に追跡しているペインは触らない。**ただし諦めた / 失敗の表示で止まっている
+        // ペインは引き取り直す**: 検知が ssh を見つけたということは、ユーザーが案内
+        // どおり自分で繋ぎ直したということなので、そのまま放っておくと「もう一度
+        // 切れても撃たない」ペインが残る（実測: 上限まで撃って `gave_up` になった
+        // ペインを手で繋ぎ直しても、表示は `gave_up` のままで見張りが再開しない）。
+        // 古い失敗表示を**生きている事実**で置き換えるので、#1040 の
+        // 「失敗は自動で消さない」とは別（消すのではなく、終わった事実を反映する）
+        let stale = match self.ssh_connect.get(&pane) {
+            None => false,
+            Some(st) => {
+                if !matches!(st.phase, ConnectPhase::Failed { .. } | ConnectPhase::GaveUp) {
+                    return;
+                }
+                true
+            }
+        };
+        // 打ち直す 1 行は **dispatch が組むのとまったく同じ形**（`remote_ssh_argv` +
+        // `launch_cmd` の 1 実装）。プロセス表のコマンド行をそのまま打ち返さないのは、
+        // `ps` の行が引用を失っている（空白で連結されている）うえ、外から来た文字列を
+        // シェルへ流し込むことになるため。`~/.ssh/config` の Host 設定は
+        // `remote_ssh_argv` が反映するので、`ssh <host>` と打った普通の使い方は同じ形に
+        // 戻る（手で足した引数は引き継がれない = 打ち直した行がペインに見える）
+        let argv = tako_control::dispatch::remote_ssh_argv(destination);
+        let line = tako_control::launch_cmd::command_line(
+            tako_control::launch_cmd::launch_dialect(),
+            &argv,
+        );
+        self.track_ssh_connect(
+            pane,
+            destination,
+            false,
+            &line,
+            tako_core::ssh_reconnect::TrackSource::Detected,
+        );
+        tako_control::diag::persist_log(&format!(
+            "ssh 追跡を引き取り: pane={} host={destination}（{}）",
+            pane.as_u64(),
+            if stale {
+                "繋ぎ直されたので見張りを再開"
+            } else {
+                "手打ちの ssh を検知"
+            }
+        ));
+    }
+
+    /// 保存する SSH 追跡（#1446）。**接続が成立した実績のあるペインだけ**を残す
+    /// （到達できない相手で開いただけのペインを再起動後に叩き始めない）
+    fn ssh_layout_in(tracked: &HashMap<PaneId, SshConnect>, pane: PaneId) -> Option<(&str, &str)> {
+        if Self::legacy_1446() {
+            return None;
+        }
+        let st = tracked.get(&pane)?;
+        st.ever_connected
+            .then_some((st.host.as_str(), st.reconnect_line.as_str()))
     }
 
     /// 自動再接続が有効か（#1040）。`TAKO_1040_LEGACY=1` で #1040 前の挙動へ戻す
@@ -20796,41 +21006,42 @@ impl UiStateHost for TakoApp {
         fresh_pane: bool,
         reconnect_line: &str,
     ) {
-        // 覚え始めた時点の画面を控える。`pane` 経路（既存シェル）は
-        // **打った行がプロンプトの続きに載る**ので、起点はプロンプト行
-        // （= 最後の非空行）。行数で切り出せない理由は `ssh_progress::baseline_index`
-        let lines = self
-            .terminals
-            .get(&pane)
-            .map(|s| s.visible_lines())
-            .unwrap_or_default();
-        self.ssh_connect.insert(
+        self.track_ssh_connect(
             pane,
-            SshConnect {
-                host: host.to_string(),
-                started: std::time::Instant::now(),
-                fresh_pane,
-                baseline_index: tako_core::ssh_progress::baseline_index(&lines),
-                baseline_fingerprint: tako_control::limit_stop::screen_fingerprint(&lines),
-                phase: tako_core::ssh_progress::ConnectPhase::Connecting,
-                reconnect_line: reconnect_line.to_string(),
-                ever_connected: false,
-                disconnected_at: None,
-                attempts: 0,
-                last_attempt_at: None,
-                attempt_pending: false,
-                reason: None,
-            },
+            host,
+            fresh_pane,
+            reconnect_line,
+            tako_core::ssh_reconnect::TrackSource::Opened,
         );
     }
 
     fn ssh_connect_state(&self, pane: PaneId) -> Option<serde_json::Value> {
         use tako_core::ssh_progress::ConnectPhase;
         let st = self.ssh_connect.get(&pane)?;
-        // 接続が成立して普通に使えているだけのペインは「状態」を出さない
-        // （出すと `list` が SSH ペインの数だけ賑やかになり、異常が埋もれる）
+        // #1446: 自動再接続の対象か（対象でないならなぜか）。**繋がっている間こそ
+        // 知りたい値**なので、後述のとおり `Connected` のペインでもこれだけは出す
+        let arm =
+            tako_core::ssh_reconnect::arm_state(Self::ssh_reconnect_enabled(), st.ever_connected);
+        let reconnect = serde_json::json!({
+            "state": arm.as_str(),
+            "armed": arm.armed(),
+            "reason": arm.reason(tako_core::i18n::lang()),
+            "source": st.source.as_str(),
+        });
+        // 接続が成立して普通に使えているだけのペインは**進行状況**を出さない
+        // （出すと `list` が SSH ペインの数だけ賑やかになり、異常が埋もれる = #1040）。
+        // ただし #1446 以降は「切れたら繋ぎ直してもらえるのか」だけを最小形で返す:
+        // それが読めなかったことが本 Issue で報告が遅れた原因で、人も AI も
+        // **切れる前に**知りたい値だから
         if matches!(st.phase, ConnectPhase::Connected) {
-            return None;
+            if Self::legacy_1446() {
+                return None;
+            }
+            return Some(serde_json::json!({
+                "host": st.host,
+                "phase": st.phase.as_str(),
+                "reconnect": reconnect,
+            }));
         }
         let reason = match &st.phase {
             ConnectPhase::Failed { reason } => reason.clone(),
@@ -20846,6 +21057,9 @@ impl UiStateHost for TakoApp {
             // 判定材料が経路で違うので、どちらで見ているかを出す（#1006 の 3 経路）
             "fresh_pane": st.fresh_pane,
         });
+        if !Self::legacy_1446() {
+            v["reconnect"] = reconnect;
+        }
         // #1040: 自動再接続の進み具合。AI が「待てばいいのか / 手を出すのか」を
         // 応答だけで判断できるようにする
         if let ConnectPhase::Reconnecting {
@@ -67251,7 +67465,9 @@ mod self_test {
                     "137: バックオフが明けたら打ち直しが送達確認つき経路へ積まれる (#1040 / #640)",
                 );
 
-                // (c) 繋がり直したら状態が消える（`Connected` は表に出さない）
+                // (c) 繋がり直したら見張りへ戻る。#1446 以降、`Connected` の応答は
+                //     **進行状況を出さず「再接続の対象か」だけ**を返す（切れる前に
+                //     守られているかを読めないことが #1446 の報告が遅れた原因だった）
                 make_socket(true);
                 let _ = window.update(cx, |app: &mut TakoApp, _, _| {
                     if let Some(s) = app.terminals.get_mut(&pid1040) {
@@ -67264,7 +67480,19 @@ mod self_test {
                     back1040 = window
                         .update(cx, |app: &mut TakoApp, _, _| {
                             app.drive_ssh_connect();
-                            <TakoApp as UiStateHost>::ssh_connect_state(app, pid1040).is_none()
+                            let state =
+                                <TakoApp as UiStateHost>::ssh_connect_state(app, pid1040);
+                            let quiet = match &state {
+                                // #1446 前（`TAKO_1446_LEGACY=1`）は何も出さない
+                                None => TakoApp::legacy_1446(),
+                                Some(v) => {
+                                    v["phase"] == "connected"
+                                        && v["attempt"].is_null()
+                                        && v["retry_in_secs"].is_null()
+                                        && v["reconnect"]["armed"] == true
+                                }
+                            };
+                            quiet
                                 && matches!(
                                     app.ssh_connect.get(&pid1040).map(|st| st.phase.clone()),
                                     Some(ConnectPhase::Connected)
@@ -67277,7 +67505,7 @@ mod self_test {
                 }
                 check(
                     back1040,
-                    "137: 繋がり直したら見張りへ戻り状態を出さない (#1040)",
+                    "137: 繋がり直したら見張りへ戻り進行状況を出さない (#1040 / #1446)",
                 );
 
                 // (d) 認証系の理由では繰り返さない（相手のログを埋めない）
@@ -67425,6 +67653,313 @@ mod self_test {
                 );
                 notify_and_draw(any, window, cx);
                 let _ = std::fs::remove_file(&fixture1040);
+            }
+
+            // 149. SSH 追跡がプロセスの寿命を越えて残る（#1446）。
+            //
+            // #1040 の判断は正しかったのに、**判断の入口に立てるペインが限られていた**
+            // のが実機報告の真因。ここで守るのは追跡の器のほう:
+            //   (a) 接続実績のあるペインだけが `layout.json` へ落ちる
+            //   (b) 復元で追跡が戻り、**見張り + 対象**の状態から始まる
+            //   (c) #976 の検知が見つけた手打ちペインを引き取る
+            //   (d) 復元・引き取りは見張りの起点を取り直す（画面に残った古いマーカーで
+            //       いきなり繋ぎ直しへ入らない）
+            //   (e) 切断を拾って撃たないときに**無言で終わらない**
+            //   (f) `list` / `read` から「再接続の対象か」が読める（繋がっている間も）
+            //
+            // A/B: `TAKO_1446_LEGACY=1` では (a)〜(f) が**すべて FAILED** になる
+            // （追跡が保存されず・復元されず・引き取られず・撃たない理由も出ない =
+            // 実機報告の再現）。#1040 の腕（`TAKO_1040_LEGACY`）とは独立に効く
+            {
+                use tako_core::ssh_progress::ConnectPhase;
+                use tako_core::ssh_reconnect::TrackSource;
+                let host1446 = "selftest-nonexistent-1446";
+                let line1446 = "echo TAKO_1446_RETRY";
+                let legacy1446 = TakoApp::legacy_1446();
+                let pane1446 = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        let base = app
+                            .workspace
+                            .get_tab(app.workspace.active_tab_id())
+                            .map(|t| t.tree().focused().as_u64());
+                        let pane = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Split {
+                                pane: base,
+                                tab: None,
+                                direction: None,
+                                ratio: None,
+                                command: None,
+                                cwd: None,
+                                focus: Some(true),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                        .and_then(|v| v["pane"].as_u64())
+                        .unwrap_or(0);
+                        for (p, options) in std::mem::take(&mut app.pending_attach) {
+                            if app.spawn_session(p, options, cx).is_err() {
+                                app.remove_pane(p, cx);
+                            }
+                        }
+                        pane
+                    })
+                    .unwrap_or(0);
+                let pid1446 = PaneId::from_raw(pane1446);
+                wait_for_pane_ready(window, cx, pid1446, Duration::from_secs(20)).await;
+
+                // (a) 保存の材料。**接続実績が無いうちは保存しない**
+                let (save_before, save_after) = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        <TakoApp as UiStateHost>::begin_ssh_connect(
+                            app, pid1446, host1446, false, line1446,
+                        );
+                        let before = TakoApp::ssh_layout_in(&app.ssh_connect, pid1446)
+                            .map(|(h, l)| (h.to_string(), l.to_string()));
+                        if let Some(st) = app.ssh_connect.get_mut(&pid1446) {
+                            st.ever_connected = true;
+                        }
+                        let after = TakoApp::ssh_layout_in(&app.ssh_connect, pid1446)
+                            .map(|(h, l)| (h.to_string(), l.to_string()));
+                        (before, after)
+                    })
+                    .unwrap_or((None, None));
+                let save_ok = save_before.is_none()
+                    && save_after
+                        .as_ref()
+                        .is_some_and(|(h, l)| h == host1446 && l == line1446);
+                check(
+                    save_ok,
+                    &format!(
+                        "149: 接続実績のあるペインだけが layout へ落ちる \
+                         (#1446。before={save_before:?} after={save_after:?} legacy={legacy1446})"
+                    ),
+                );
+
+                // (b) 復元で追跡が戻る。**見張り + 対象**から始まらないと切断を拾えない
+                let restored1446 = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.ssh_connect.remove(&pid1446);
+                        app.restore_ssh_connect(
+                            pid1446,
+                            &tako_control::layout::SshPaneLayout {
+                                host: host1446.to_string(),
+                                reconnect_line: line1446.to_string(),
+                            },
+                        );
+                        app.ssh_connect.get(&pid1446).map(|st| {
+                            (
+                                st.phase.as_str().to_string(),
+                                st.ever_connected,
+                                st.source == TrackSource::Restored,
+                                st.needs_rebase,
+                            )
+                        })
+                    })
+                    .unwrap_or(None);
+                let restore_ok = restored1446
+                    .as_ref()
+                    .is_some_and(|(p, ever, src, rebase)| {
+                        p == "connected" && *ever && *src && *rebase
+                    });
+                check(
+                    restore_ok,
+                    &format!("149: 復元で追跡が戻る (#1446。{restored1446:?} legacy={legacy1446})"),
+                );
+
+                // (d) 起点を取り直す。画面に**古い切断マーカー**が残っている状態で
+                //     見張りへ入っても、それを「いま切れた」と読まない
+                let stale1446 = format!(
+                    "tako: {host1446} への接続に失敗しました（{}）。理由は上の行です",
+                    tako_core::ssh_progress::SCRIPT_FAILURE_MARK
+                );
+                // 画面へ出すのは #1127 と同じ**ファイル経由**（`print_lines` だと
+                // シェルのエコー行にも本文が載り、マーカーの最初の出現がそちらになる）
+                let fixture1446 = std::env::temp_dir()
+                    .join(format!("tako-selftest-1446-{}.txt", std::process::id()));
+                let _ = std::fs::write(&fixture1446, format!("{stale1446}\n"));
+                let emit1446 = sh.print_file(&fixture1446);
+                let _ = window.update(cx, |app: &mut TakoApp, _, _| {
+                    if let Some(s) = app.terminals.get_mut(&pid1446) {
+                        s.write(pty_line(&emit1446));
+                    }
+                });
+                wait(cx, 1200).await;
+                let rebase1446 = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.ssh_connect.remove(&pid1446);
+                        app.restore_ssh_connect(
+                            pid1446,
+                            &tako_control::layout::SshPaneLayout {
+                                host: host1446.to_string(),
+                                reconnect_line: line1446.to_string(),
+                            },
+                        );
+                        app.drive_ssh_connect();
+                        app.drive_ssh_connect();
+                        app.ssh_connect
+                            .get(&pid1446)
+                            .map(|st| (st.phase.as_str().to_string(), st.needs_rebase))
+                    })
+                    .unwrap_or(None);
+                let rebase_ok = rebase1446
+                    .as_ref()
+                    .is_some_and(|(p, rebase)| p == "connected" && !*rebase);
+                check(
+                    rebase_ok,
+                    &format!(
+                        "149: 復元直後に画面の古いマーカーを拾わない \
+                         (#1446。{rebase1446:?} legacy={legacy1446})"
+                    ),
+                );
+
+                // (f) `list` / `read` から対象かどうかが読める（**繋がっている間も**）
+                let read1446 = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        <TakoApp as UiStateHost>::ssh_connect_state(app, pid1446)
+                    })
+                    .unwrap_or(None);
+                let read_ok = read1446
+                    .as_ref()
+                    .map(|v| {
+                        v["reconnect"]["armed"] == true
+                            && v["reconnect"]["state"] == "armed"
+                            && v["reconnect"]["source"] == "restored"
+                    })
+                    .unwrap_or(false);
+                check(
+                    read_ok,
+                    &format!("149: 繋がっている間も対象かどうかが読める (#1446。{read1446:?})"),
+                );
+
+                // (c) 手打ちの ssh を #976 の検知経路から引き取る
+                let adopt1446 = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.ssh_connect.remove(&pid1446);
+                        let state = tako_control::ssh_detect::SshScanState {
+                            sessions: vec![tako_control::ssh_detect::DetectedSsh {
+                                pane: pane1446,
+                                tab: app.workspace.active_tab_id().as_u64(),
+                                destination: host1446.to_string(),
+                                pid: std::process::id(),
+                            }],
+                            ..Default::default()
+                        };
+                        let _ = app.apply_ssh_scan(state);
+                        app.ssh_connect.get(&pid1446).map(|st| {
+                            (
+                                st.host.clone(),
+                                st.source == TrackSource::Detected,
+                                st.ever_connected,
+                                st.reconnect_line.contains(host1446),
+                            )
+                        })
+                    })
+                    .unwrap_or(None);
+                let adopt_ok = adopt1446
+                    .as_ref()
+                    .is_some_and(|(h, src, ever, line)| h == host1446 && *src && *ever && *line);
+                check(
+                    adopt_ok,
+                    &format!(
+                        "149: 手打ちの ssh を検知から引き取る (#1446。{adopt1446:?} \
+                         legacy={legacy1446})"
+                    ),
+                );
+
+                // (c2) 諦めたペインを手で繋ぎ直したら見張りが再開する。
+                //      実測で見つけた穴: `gave_up` のまま案内どおり `ssh <host>` を
+                //      打っても表示が `gave_up` のままで、**もう一度切れても撃たない**
+                //      ペインが残っていた（引き取りが「既に追跡している」で降りるため）
+                let regain1446 = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        if let Some(st) = app.ssh_connect.get_mut(&pid1446) {
+                            st.phase = ConnectPhase::GaveUp;
+                            st.attempts = tako_core::ssh_reconnect::MAX_ATTEMPTS;
+                        }
+                        let state = tako_control::ssh_detect::SshScanState {
+                            sessions: vec![tako_control::ssh_detect::DetectedSsh {
+                                pane: pane1446,
+                                tab: app.workspace.active_tab_id().as_u64(),
+                                destination: host1446.to_string(),
+                                pid: std::process::id(),
+                            }],
+                            ..Default::default()
+                        };
+                        let _ = app.apply_ssh_scan(state);
+                        app.ssh_connect
+                            .get(&pid1446)
+                            .map(|st| (st.phase.as_str().to_string(), st.attempts))
+                    })
+                    .unwrap_or(None);
+                let regain_ok = regain1446
+                    .as_ref()
+                    .is_some_and(|(p, attempts)| p == "connected" && *attempts == 0);
+                check(
+                    regain_ok,
+                    &format!(
+                        "149: 諦めたペインを繋ぎ直したら見張りが再開する \
+                         (#1446。{regain1446:?} legacy={legacy1446})"
+                    ),
+                );
+
+                // (e) 撃たないときに無言で終わらない。証拠を落として切断を拾わせる
+                let _: Option<()> = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.remote_notice = None;
+                        if let Some(st) = app.ssh_connect.get_mut(&pid1446) {
+                            // **証拠が無い**ペイン = 撃たない側（`NoConnectionEvidence`）
+                            st.ever_connected = false;
+                            st.phase = ConnectPhase::Connected;
+                            st.needs_rebase = false;
+                            st.baseline_index = 0;
+                        }
+                        app.drive_ssh_connect();
+                        if let Some(s) = app.terminals.get_mut(&pid1446) {
+                            s.write(pty_line(&emit1446));
+                        }
+                        None::<()>
+                    })
+                    .unwrap_or(None);
+                wait(cx, 1200).await;
+                let notice1446 = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        (0..4).for_each(|_| {
+                            app.drive_ssh_connect();
+                        });
+                        (
+                            app.remote_notice.as_ref().map(|n| n.text.clone()),
+                            app.ssh_connect
+                                .get(&pid1446)
+                                .map(|st| st.phase.as_str().to_string()),
+                        )
+                    })
+                    .unwrap_or((None, None));
+                let notice_ok = notice1446
+                    .0
+                    .as_ref()
+                    .is_some_and(|t| t.contains(host1446) && t.contains("ssh "));
+                check(
+                    notice_ok,
+                    &format!(
+                        "149: 撃たないときは理由と次の一手を画面へ出す \
+                         (#1446。{notice1446:?} legacy={legacy1446})"
+                    ),
+                );
+
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                    app.dismiss_ssh_connect(pid1446);
+                    app.remote_notice = None;
+                    app.close_pane_button(pid1446, CloseOrigin::Internal, cx);
+                });
+                let _ = std::fs::remove_file(&fixture1446);
+                println!(
+                    "TAKO_SELF_TEST_1446: save={save_ok} restore={restore_ok} \
+                     rebase={rebase_ok} read={read_ok} adopt={adopt_ok} regain={regain_ok} \
+                     notice={notice_ok} legacy={legacy1446}"
+                );
+                notify_and_draw(any, window, cx);
             }
 
             // 138. 「リモートからフォルダを開く」の VSCode Remote 化（#1041）。

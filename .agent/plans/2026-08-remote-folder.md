@@ -808,6 +808,68 @@ Mac からのログインは `%ProgramData%\ssh\administrators_authorized_keys` 
 
 **検証が終わったら追記した 1 行と鍵・config・known_hosts を消す**。
 
+## 20. #1446: 自動再接続が発火しないケースがあった（2026-09-14）
+
+### 20.1 真因 — 判断ではなく**記憶**のほう
+
+§17 の判断（`should_arm` / `detect_disconnect`）は正しかった。欠けていたのは
+**「このペインは SSH だ」の記憶がプロセスの寿命しか持たなかった**こと。
+追跡の器 `ssh_connect: HashMap<PaneId, SshConnect>` はメモリだけに在り、
+作る口は `begin_ssh_connect` 1 つ、その唯一の呼び出し元は dispatch の
+`Request::OpenRemote` だった。
+
+仮説を 1 つずつ隔離ハーネス（§17.2 を組み直したもの）で測った結果:
+
+| 仮説 | 結果 | 実測 |
+|---|---|---|
+| **GUI 再起動をまたぐと失われる** | **真因** | 再起動後の硬切断で `ssh_connect` が **32 秒 `null`**・persist.log に検知行 0 行・画面は報告と同一の 3 行 → `${SSH_CONNECTION:-LOCAL}` が `LOCAL` |
+| **手打ちの `ssh <host>`** | **真因 2** | dispatch を通らないので最初から追跡外。硬切断で **24 秒 `null`**・無言でローカルへ |
+| ControlMaster の slave | **否定** | master 有りのブラックホール断で master / slave とも **15 秒**で `reconnecting`、復帰 **24 秒** |
+| 版が古い | **否定** | #1050（`374ecbe`）は **v0.8.2** から入っており実機は v0.8.12 |
+
+**計測でいちど誤った**: 仮説 3 を 8 桁幅のペインで測って「発火しない」に見えたが、
+スクリプトの失敗行が折り返して**マーカー `ssh exit ` が行をまたいだ**ためだった
+（88 桁で取り直して否定）。折り返しでマーカーを失う件は #1127 と同型の別問題。
+
+### 20.2 直し方（入口 3 つを 1 実装へ）
+
+追跡を作る口を `track_ssh_connect` の 1 本にし、そこへ入口を 3 つ生やした:
+
+1. `begin_ssh_connect`（dispatch = `open-in remote` / メニュー / 右クリック / MCP）
+2. **復元** — `PaneLayout.ssh`（`host` / `reconnect_line`）を `layout.json` へ落とし、
+   **器が生きていたペインだけ**引き継ぐ。保存するのは**接続実績のあるペインだけ**
+3. **引き取り** — #976 の ssh 検知が見つけた未追跡ペインを拾う（走査は増えない）
+
+復元・引き取りは**見張り（`Connected`）から始め、証拠も引き継ぐ**。`Connecting` から
+入れると相手が黙っている限り 120 秒（`SILENT_CAP_SECS`）で畳まれて追跡がまた消える。
+画面には過去の出力が残っているので、最初の tick で必ず起点を取り直す（`needs_rebase`）。
+
+**エッジで見つけた穴**: 上限まで撃って `gave_up` になったペインを案内どおり手で
+繋ぎ直しても、引き取りが「既に追跡している」で降りるため表示が `gave_up` のままで、
+**もう一度切れても撃たない**。検知が ssh を見つけたら失敗表示を生きている事実で
+置き換える（`Failed` / `GaveUp` のときだけ引き取り直す）。
+
+### 20.3 after の実測
+
+| 測ったもの | before | after |
+|---|---|---|
+| GUI 再起動をまたいだペインの切断 | **32 秒観測して無反応**・診断 0 行 | **1 秒**で `reconnecting`（`ssh 切断を検知 … 自動再接続=する（armed）`）|
+| 同・回線復帰 → リモートのプロンプト | 戻らない | **2 秒**（ゼロタッチ・`WHERE=REMOTE`）|
+| 手打ち `ssh` のペイン | **24 秒観測して無反応**・無言 | 検知で `source=detected` として引き取り、切断 **0 秒**検知 → 復帰（配下に生きた ssh を確認）|
+| 繋がっている間に「対象か」が読めるか | `ssh_connect` が `null` | `{"phase":"connected","reconnect":{"armed":true,"state":"armed","source":"opened"}}` |
+| 撃たないときの案内 | 無し（`Failed` にするだけ） | 通知欄 1 行 + `UI 操作に失敗: area=ssh_pane op=ssh 自動再接続 分類=disabled` |
+| 上限到達後に回線が戻った | — | `gave_up` のまま撃たず・ペインは残る・手で打てば戻る（**繋ぎ直すと見張りが再開**）|
+| master を落として slave だけ落ちた | — | **0 秒**検知 → **4 秒**で復帰 |
+
+**A/B**（`TAKO_1446_LEGACY=1`。`TAKO_1040_LEGACY` とは独立）: 追跡は復元されず
+（`ssh_connect` が全部 `null`）、切断しても**診断行が 1 行も増えない** = 報告の再現。
+セルフテスト項目 149 は `TAKO_APP_SELF_TEST_FAILED: 149: 接続実績のあるペインだけが
+layout へ落ちる (#1446。before=None after=None legacy=true)` で落ちる。
+
+**罠**: `tako send`（CLI）は打鍵ではないので自動再接続を中止しない。中止は
+`keystroke_to_bytes` の直後だけ（`cancel_ssh_reconnect_on_input`）= 人の操作を
+邪魔しないための設計。CLI から中止の検証はできないので項目 137 (f) が受け持つ。
+
 ## A/B の env（同一バイナリで旧挙動へ戻す）
 
 `.agent/activeContext.md` から移した一覧（#1139 の起動時ロード予算に収めるため）。
@@ -818,6 +880,6 @@ SSH / リモート系のうち、他の `.agent/*.md` に記録が無いもの�
 - `TAKO_1023_LEGACY=1` — ファイルメニュー経路の SSH ペインの**後始末をしない**旧挙動へ戻す
   （#1023。`main.rs`）
 
-`TAKO_1040_LEGACY`（本ファイル §17）/ `TAKO_1049_LEGACY` + `TAKO_1049_WATCH_SECS`
+`TAKO_1040_LEGACY`（本ファイル §17）/ `TAKO_1446_LEGACY`（同 §20）/ `TAKO_1049_LEGACY` + `TAKO_1049_WATCH_SECS`
 （`.agent/commands.md`）/ `TAKO_1038_LEGACY` + `TAKO_1038_INJECT_UNREACHABLE`
 （`.agent/architecture.md`）は別の場所に記録がある。

@@ -6935,7 +6935,7 @@ pub fn dispatch_config_share(
 /// `~/.ssh/config` の Host 設定を反映しつつ、**ツリー側と同じ ControlPath** を通す
 /// （`remote_fs::ssh_pane_argv`）。ここで対話ログインした接続がそのまま共有されるので、
 /// パスワード認証しか無い相手でも一度入れば以後ツリーが追加認証なしで開く（#65）
-fn remote_ssh_argv(ssh_host: &str) -> Vec<String> {
+pub fn remote_ssh_argv(ssh_host: &str) -> Vec<String> {
     let hosts = match tako_core::ssh_config::default_ssh_config_path() {
         Some(p) => tako_core::ssh_config::parse_ssh_config(&p),
         None => Vec::new(),

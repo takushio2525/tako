@@ -16,7 +16,7 @@ Ledger: entries
 LedgerEntry: id, ts, project, label, issue, task_type, model, effort, agent, duration_seconds, ctx_percent, had_error, outcome, rounds, note, post_issue, amend_note
 NodeLayout: Pane, Split, axis, ratio, first, second
 OrchestratorConfig: auto_close, auto_push
-PaneLayout: id, session, title, title_source, role, origin, cwd, claude_session_id, agent_resume, logged_history, preview, webview, origin_tab, origin_tab_title, limit_autoresume
+PaneLayout: id, session, title, title_source, role, origin, cwd, claude_session_id, agent_resume, logged_history, preview, webview, origin_tab, origin_tab_title, limit_autoresume, ssh
 PendingSpawn: tmux_session, kind, label, project, agent, model, effort, issues, prompt_head, cwd, tab, pane, recorded_at
 PreviewLayout: path, mode
 Profile: master_agent, model, effort, worker_model_policy, worker_model, worker_effort, delegate_guidance, worker_agent, worker_agents, system_prompt, prompt_blocks, projects, tab_naming_convention, supervisor_mode, auto_resume_dead, supervisor_max_retries, cwd, env, master_account, worker_account, ctx_threshold, auto_handoff, limit_resume, bypass_sandbox, remote_control
@@ -34,6 +34,7 @@ SetupConfig: orchestrator, setup, agents_sync, spawn_layout, confirm_close, ctx_
 SetupState: completed, completed_at, applied_revision, applied_version, selected_agent, provider_plans
 ShareState: repo, linked_at
 SpawnLayoutSection: policy, master_ratio, algorithm, min_worker_cols, auto_shrink_font, min_worker_font_scale
+SshPaneLayout: host, reconnect_line
 TabLayout: id, title, title_source, focused, tree, pinned_folders, remote_folders
 TaskCheckpoint: task_id, pane_id, issue, branch, phase, last_commit, agent, model, prompt_head, suspended_reason, project, cwd, updated_at
 TaskCheckpointStore: version, checkpoints
