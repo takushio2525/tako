@@ -129,6 +129,11 @@ export TAKO_TAILSCALE_BIN="$FAKE_TS"
 # 繋いでくるのは curl」だと名前で宣言して**本番と同じ経路**を通す。
 # これが無いと全リクエストが 403（接続元プロセスが tailscale デーモンではない）
 export TAKO_REMOTE_TRUSTED_PEER_NAMES="curl"
+# #1452: ペアリングの**承認**は「呼び出し元が tako-app か」も見るようになった
+# （管理トークンは 0600 = 同一ユーザーなら誰でも読めるので、トークンだけでは
+# GUI と CLI / AI を区別できない）。このテストは curl で承認を撃つので、
+# **この隔離環境では curl を GUI 側として名乗る**（#841 の PEER_NAMES と同じ作法）
+export TAKO_REMOTE_TRUSTED_ADMIN_NAMES="curl"
 mkdir -p "$TAKO_DATA_DIR" "$TAKO_DISCOVERY_DIR" "$TAKO_REMOTE_STATE_DIR" "$TAKO_ORCHESTRATOR_DIR/profiles"
 # 本番へ書かない不変条件（env が効いていなければここで落とす）
 for d in "$TAKO_DATA_DIR" "$TAKO_REMOTE_STATE_DIR" "$TAKO_ORCHESTRATOR_DIR"; do

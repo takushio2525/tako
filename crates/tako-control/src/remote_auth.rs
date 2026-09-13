@@ -109,6 +109,11 @@ pub struct PendingRequest {
     /// 新規ペアリングか、登録済みデバイスの role 変更要求か
     pub kind: RequestKind,
     pub requested_at: u64,
+    /// 端末が書いた理由（#1452。整形は `remote_role::sanitize_reason`）。
+    /// **監査ログには載せない**（FR-6.8: 監査に内容を残さない）。出すのは
+    /// 承認ダイアログとユーザータスクの本文だけ
+    #[serde(default)]
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -247,6 +252,7 @@ impl DeviceRegistry {
         who: &WhoisInfo,
         name: &str,
         requested_role: DeviceRole,
+        reason: &str,
     ) -> Value {
         let name = if name.trim().is_empty() {
             who.hostname.clone()
@@ -255,6 +261,15 @@ impl DeviceRegistry {
         };
         let kind = match self.devices.get(&who.stable_id) {
             Some(existing) if existing.role == requested_role => {
+                return json!({
+                    "status": "already_registered",
+                    "role": existing.role.as_str(),
+                });
+            }
+            // 現より弱い role の要求は「承認待ち」にしない。放っておくと
+            // 承認ダイアログが**降格の伺い**を出すことになり、押し忘れた保留が
+            // 端末ごとに 1 件しか持てない枠を塞ぐ（#1452）
+            Some(existing) if requested_role < existing.role => {
                 return json!({
                     "status": "already_registered",
                     "role": existing.role.as_str(),
@@ -272,6 +287,7 @@ impl DeviceRegistry {
             requested_role,
             kind,
             requested_at: now_epoch(),
+            reason: crate::remote_role::sanitize_reason(reason),
         };
         self.pending.insert(who.stable_id.clone(), req);
         self.audit(
@@ -361,6 +377,49 @@ impl DeviceRegistry {
             json!({ "login": device.login }),
         );
         Ok(device)
+    }
+
+    /// 保留リクエストを 1 件引く（`/api/me` が「PC で承認待ち」を返すのに使う。#1452）
+    pub fn pending_of(&self, device_id: &str) -> Option<&PendingRequest> {
+        self.pending.get(device_id)
+    }
+
+    /// 保留を介さず role を直接置く（#1452: 設定画面の権限編集 / CLI・MCP の降格）。
+    ///
+    /// **上げてよいかの判断はここではしない**。方向と呼び出し元の判断は
+    /// [`crate::remote_role::decide`] の 1 実装が持ち、ここは言われたとおりに置くだけ
+    /// （判断を 2 か所に置くと片方だけ緩む）。
+    ///
+    /// 同じ端末の保留は落とす: 人が role を明示したのに承認ダイアログが残ると、
+    /// 同じ端末について 2 つの伺いが同時に立つ。落とした保留は戻り値の 2 番目に返すので、
+    /// 呼び出し側がユーザータスクを閉じられる
+    pub fn set_role(
+        &mut self,
+        device_id: &str,
+        role: DeviceRole,
+    ) -> Result<(Device, Option<PendingRequest>), String> {
+        let device = self
+            .devices
+            .get_mut(device_id)
+            .ok_or_else(|| format!("登録されていないデバイス: {device_id}"))?;
+        let before = device.role;
+        device.role = role;
+        device.last_seen = now_epoch();
+        let device = device.clone();
+        let resolved = self.pending.remove(device_id);
+        self.denied.remove(device_id);
+        self.save()?;
+        self.audit(
+            "role_changed",
+            device_id,
+            &device.name,
+            json!({
+                "login": device.login,
+                "from": before.as_str(),
+                "to": role.as_str(),
+            }),
+        );
+        Ok((device, resolved))
     }
 
     /// アクセスを記録する（last_seen 更新。永続化は revoke / approve 時に乗る）
@@ -612,7 +671,7 @@ mod tests {
     fn ペアリングの要求から承認までの流れ() {
         let (_dir, mut reg) = temp_registry("pair-flow");
         let w = who("nDEV1");
-        let resp = reg.request_pairing(&w, "My iPhone", DeviceRole::Observe);
+        let resp = reg.request_pairing(&w, "My iPhone", DeviceRole::Observe, "");
         assert_eq!(resp["status"], "pending");
         assert_eq!(reg.pending().len(), 1);
         assert!(reg.device("nDEV1").is_none(), "承認前は未登録のまま");
@@ -627,7 +686,7 @@ mod tests {
     #[test]
     fn 承認時にroleを差し替えられる() {
         let (_dir, mut reg) = temp_registry("approve-role");
-        reg.request_pairing(&who("nDEV1"), "pad", DeviceRole::Admin);
+        reg.request_pairing(&who("nDEV1"), "pad", DeviceRole::Admin, "");
         let device = reg
             .approve("nDEV1", Some(DeviceRole::Observe))
             .expect("承認");
@@ -641,7 +700,7 @@ mod tests {
     #[test]
     fn 拒否は登録されずdenied記録が残る() {
         let (_dir, mut reg) = temp_registry("deny");
-        reg.request_pairing(&who("nDEV1"), "x", DeviceRole::Observe);
+        reg.request_pairing(&who("nDEV1"), "x", DeviceRole::Observe, "");
         reg.deny("nDEV1").expect("拒否");
         assert!(reg.device("nDEV1").is_none());
         assert!(reg.pending().is_empty());
@@ -651,10 +710,10 @@ mod tests {
     #[test]
     fn 昇格要求はupgrade種別になり承認でroleが変わる() {
         let (_dir, mut reg) = temp_registry("upgrade");
-        reg.request_pairing(&who("nDEV1"), "x", DeviceRole::Observe);
+        reg.request_pairing(&who("nDEV1"), "x", DeviceRole::Observe, "");
         reg.approve("nDEV1", None).expect("承認");
 
-        let resp = reg.request_pairing(&who("nDEV1"), "x", DeviceRole::Interact);
+        let resp = reg.request_pairing(&who("nDEV1"), "x", DeviceRole::Interact, "");
         assert_eq!(resp["status"], "pending");
         assert_eq!(reg.pending()[0].kind, RequestKind::Upgrade);
         // 昇格の保留中も既存 role のまま
@@ -667,17 +726,73 @@ mod tests {
     #[test]
     fn 同一roleの再要求はalready_registered() {
         let (_dir, mut reg) = temp_registry("same-role");
-        reg.request_pairing(&who("nDEV1"), "x", DeviceRole::Observe);
+        reg.request_pairing(&who("nDEV1"), "x", DeviceRole::Observe, "");
         reg.approve("nDEV1", None).expect("承認");
-        let resp = reg.request_pairing(&who("nDEV1"), "x", DeviceRole::Observe);
+        let resp = reg.request_pairing(&who("nDEV1"), "x", DeviceRole::Observe, "");
         assert_eq!(resp["status"], "already_registered");
         assert!(reg.pending().is_empty());
     }
 
     #[test]
+    fn 現より弱いroleの要求は承認待ちにしない() {
+        // #1452: PWA は今より強いものしか出さないが、古い端末・手打ちの要求で
+        // 降格の伺いがダイアログに出ると、1 端末 1 件の保留の枠を無駄に塞ぐ
+        let (_dir, mut reg) = temp_registry("weaker-role");
+        reg.request_pairing(&who("nDEV1"), "x", DeviceRole::Manage, "");
+        reg.approve("nDEV1", None).expect("承認");
+        let resp = reg.request_pairing(&who("nDEV1"), "x", DeviceRole::Observe, "");
+        assert_eq!(resp["status"], "already_registered");
+        assert_eq!(resp["role"], "manage", "今持っている role を返す");
+        assert!(reg.pending().is_empty(), "降格の保留は作らない");
+    }
+
+    #[test]
+    fn 理由は保留に載り整形される() {
+        let (_dir, mut reg) = temp_registry("reason");
+        reg.request_pairing(&who("nDEV1"), "x", DeviceRole::Observe, "");
+        reg.approve("nDEV1", None).expect("承認");
+        reg.request_pairing(
+            &who("nDEV1"),
+            "x",
+            DeviceRole::Interact,
+            "  ログを\n見たい  ",
+        );
+        assert_eq!(reg.pending()[0].reason, "ログを 見たい");
+        assert_eq!(
+            reg.pending_of("nDEV1").map(|p| p.requested_role),
+            Some(DeviceRole::Interact),
+            "pending_of が同じ 1 件を引ける（/api/me が使う）"
+        );
+    }
+
+    #[test]
+    fn set_roleは保留を畳んで監査へ残す() {
+        let (dir, mut reg) = temp_registry("set-role");
+        reg.request_pairing(&who("nDEV1"), "x", DeviceRole::Observe, "");
+        reg.approve("nDEV1", None).expect("承認");
+        reg.request_pairing(&who("nDEV1"), "x", DeviceRole::Manage, "why");
+        let (device, resolved) = reg.set_role("nDEV1", DeviceRole::Interact).expect("変更");
+        assert_eq!(device.role, DeviceRole::Interact);
+        assert_eq!(
+            resolved.map(|p| p.requested_role),
+            Some(DeviceRole::Manage),
+            "畳んだ保留を返す（呼び出し側がタスクを閉じられる）"
+        );
+        assert!(reg.pending().is_empty());
+        let audit = std::fs::read_to_string(dir.path().join("audit.log")).expect("監査");
+        assert!(audit.contains("role_changed"));
+        assert!(
+            !audit.contains("why"),
+            "理由の本文は監査へ載せない（FR-6.8）"
+        );
+        // 未登録は失敗する
+        assert!(reg.set_role("nNOPE", DeviceRole::Observe).is_err());
+    }
+
+    #[test]
     fn revokeで登録が消えて永続化される() {
         let (dir, mut reg) = temp_registry("revoke");
-        reg.request_pairing(&who("nDEV1"), "x", DeviceRole::Manage);
+        reg.request_pairing(&who("nDEV1"), "x", DeviceRole::Manage, "");
         reg.approve("nDEV1", None).expect("承認");
         reg.revoke("nDEV1").expect("revoke");
         assert!(reg.device("nDEV1").is_none());
@@ -690,7 +805,7 @@ mod tests {
     #[test]
     fn 永続化と再読み込みでデバイスが保持される() {
         let (dir, mut reg) = temp_registry("persist");
-        reg.request_pairing(&who("nDEV1"), "iPhone", DeviceRole::Interact);
+        reg.request_pairing(&who("nDEV1"), "iPhone", DeviceRole::Interact, "");
         reg.approve("nDEV1", None).expect("承認");
 
         let reg2 = DeviceRegistry::open(dir.path()).expect("再オープン");

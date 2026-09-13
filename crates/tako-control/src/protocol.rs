@@ -1219,15 +1219,22 @@ pub enum Request {
     },
     /// ペインのスクロールバック履歴をプレーンテキストで取得（Issue #42 履歴レイヤー用）
     RemoteScrollback { pane_id: String, lines: Option<u32> },
-    /// ペアリング済み端末の管理（#283）。`action`:
-    /// - "list": 登録済み端末と保留中のペアリング要求を一覧
+    /// ペアリング済み端末の管理（#283 / #1452）。`action`:
+    /// - "list": 登録済み端末と保留中の要求（ペアリング・権限の更新）を一覧
     /// - "revoke": `device_id` の登録を失効（接続中なら即時切断）
+    /// - "role": `device_id` の role を `role` へ**弱める**（#1452）
     ///
-    /// ペアリングの承認・role 変更はここに**存在しない**: Mac 画面の GUI ダイアログ
-    /// でのみ行う（AI フルコントロール不変条件の例外。`.agent/requirements.md`）
+    /// **role を上げる操作はここに存在しない**: ペアリングの承認も権限の昇格も
+    /// Mac 画面（承認ダイアログ / 設定 → リモート）でのみ行う
+    /// （AI フルコントロール不変条件の例外。`.agent/requirements.md` FR-6.5 / FR-6.21）。
+    /// `action="role"` に現より強い role を渡すと 403 相当のエラーで断る —— 経路自体は
+    /// 1:1 で在るので「上げられない」ことを CLI / MCP から**実測できる**
     RemoteDevices {
         action: String,
         device_id: Option<String>,
+        /// `action="role"` の行き先（observe / interact / manage / admin）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
     },
     /// リモート閲覧のショートカット（お気に入り）の管理（#1451）。`action`:
     /// - "list": 既定（`~` / Desktop / Downloads）+ 登録分を一覧

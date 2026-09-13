@@ -1027,6 +1027,10 @@ impl TakoApp {
             .unwrap_or("observe")
             .to_string();
         let is_upgrade = req["kind"].as_str() == Some("upgrade");
+        // #1452: 端末が書いた理由と今の role。**理由は監査ログには載っていない**
+        // （FR-6.8）ので、出せるのは daemon が保留に持っているこの値だけ
+        let reason = req["reason"].as_str().unwrap_or("").to_string();
+        let current_role = req["current_role"].as_str().unwrap_or("").to_string();
         // 選択中 role（未選択なら要求 role を既定に）
         let selected = self
             .remote
@@ -1131,8 +1135,28 @@ impl TakoApp {
                                 d.child(SharedString::from(crate::ui_text::remote::device_node(
                                     &node_name,
                                 )))
+                            })
+                            // #1452: 何から何へ上げるのか（押す前に分かる）
+                            .when(is_upgrade && !current_role.is_empty(), |d| {
+                                d.child(SharedString::from(
+                                    crate::ui_text::remote::role_change_line(
+                                        &current_role,
+                                        &requested_role,
+                                    ),
+                                ))
                             }),
                     )
+                    // #1452: 端末が書いた理由。空なら行ごと出さない
+                    .when(!reason.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(hsla(theme.text_tertiary))
+                                .child(SharedString::from(crate::ui_text::remote::request_reason(
+                                    &reason,
+                                ))),
+                        )
+                    })
                     .child(
                         div()
                             .text_size(px(11.5))
@@ -1314,6 +1338,28 @@ impl TakoApp {
                     .child(self.remote_copy_row("remote-copy-url", url, cx))
             }))
             .child(list)
+            // #1452: 権限の編集はここでは持たない（カード幅に 4 択 × 台数は入らない）。
+            // 設定 → リモートへ 1 行で渡す = 「役割を変えたい」が行き止まりにならない
+            .child(
+                div()
+                    .id("remote-edit-roles")
+                    .px_2()
+                    .py_1()
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .text_size(px(11.5))
+                    .text_color(hsla(theme.accent))
+                    .hover(|d| d.bg(rgba_alpha(theme.accent, 0.15)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.remote.panel_open = false;
+                        this.open_settings_window_impl(
+                            Some(crate::settings_window::SettingsTab::Remote),
+                            cx,
+                        );
+                        cx.notify();
+                    }))
+                    .child(crate::ui_text::remote::edit_roles()),
+            )
             // 停止トグル = kill switch（全遮断）。確認を挟んでから実行する（#615）
             .children(match action {
                 // 確認待ち: 何が起きるかを件数つきで示し、実行 / キャンセルを選ばせる

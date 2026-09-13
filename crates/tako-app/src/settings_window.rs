@@ -142,6 +142,10 @@ struct ImeState {
     selected_utf16: Option<Range<usize>>,
 }
 
+/// 権限の選択肢（弱い順）。綴りは `remote_auth::DeviceRole::as_str` と 1:1 で、
+/// PWA のペアリング画面・`tako remote devices role` とも同じ語を使う（#1452）
+const ROLE_CHOICES: &[&str] = &["observe", "interact", "manage", "admin"];
+
 /// タブ表示に必要な read-only 状態のキャッシュ。
 /// render 毎に子プロセス・dispatch を叩かないよう、タブ切替と更新ボタンでのみ取得する
 #[derive(Default)]
@@ -151,6 +155,8 @@ struct StatusCache {
     rules: Option<serde_json::Value>,
     changes: Option<serde_json::Value>,
     remote: Option<serde_json::Value>,
+    /// 登録済み端末と保留中の要求（#1452。`tako remote devices list` と同じ dispatch）
+    remote_devices: Option<serde_json::Value>,
     /// スリープ防止の現在値（#727。`tako sleep-guard status` と同じ dispatch を通す）
     sleep: Option<serde_json::Value>,
     /// エージェント CLI の検出結果（名前, 導入済み）。background で取得する
@@ -353,6 +359,14 @@ impl SettingsWindow {
             }
             SettingsTab::Remote => {
                 self.status.remote = self.query(Request::RemoteStatus, cx);
+                self.status.remote_devices = self.query(
+                    Request::RemoteDevices {
+                        action: "list".into(),
+                        device_id: None,
+                        role: None,
+                    },
+                    cx,
+                );
             }
             // タブ表示のたびに読み直すので CLI / MCP / 手編集の変更に追随する（#721）
             SettingsTab::Profiles => self.refresh_profiles(cx),
@@ -2858,28 +2872,186 @@ impl SettingsWindow {
                     }),
                 ),
             ))
-            .child(self.row(
-                txt::remote_devices_header(),
-                txt::desc_remote_devices(),
-                self.button(
-                    "remote-devices",
-                    txt::button_show(),
-                    BtnKind::Normal,
-                    cx.listener(|this, _, _, cx| {
-                        let result = this.dispatch(
-                            Request::RemoteDevices {
-                                action: "list".into(),
-                                device_id: None,
-                            },
-                            cx,
-                        );
-                        this.message = Some(match result {
-                            Ok(v) => (summarize_devices(&v), false),
-                            Err(e) => (e, true),
-                        });
-                    }),
-                ),
-            ))
+            // #1452: 端末ごとの権限編集。以前はここが「表示」ボタン 1 個で、
+            // 件数を 1 行出すだけ = **登録後に role を動かす画面がどこにも無かった**
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(self.section(txt::remote_devices_header()))
+                    .child(self.button(
+                        "remote-devices-refresh",
+                        txt::button_refresh(),
+                        BtnKind::Normal,
+                        cx.listener(|this, _, _, cx| this.refresh_tab_status(cx)),
+                    )),
+            )
+            .child(
+                div()
+                    .text_color(to_hsla(theme.text_muted))
+                    .text_size(px(11.))
+                    .child(txt::desc_remote_devices().to_string()),
+            )
+            .children(self.render_remote_pending())
+            .children(self.render_remote_devices(cx))
+    }
+
+    /// 承認待ちの要求（新規ペアリング / 権限の更新）を**読むだけ**の節。#1452。
+    ///
+    /// ここに「許可 / 拒否」を置かない理由: 承認の口は `remote_panel` の承認ダイアログ
+    /// **1 つだけ**に保つ（同じ判断を 2 か所に置くと、片方だけ仕様が古くなる）。
+    /// この画面で与えたいときは下の一覧で権限を選び直す = `/api/admin/devices/role` の
+    /// 1 経路を通り、保留も一緒に畳まれる
+    fn render_remote_pending(&self) -> Vec<Div> {
+        let theme = self.theme();
+        let pending: Vec<serde_json::Value> = self
+            .status
+            .remote_devices
+            .as_ref()
+            .and_then(|v| v.get("pending"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if pending.is_empty() {
+            return Vec::new();
+        }
+        let mut rows = vec![self.section(txt::remote_pending_header())];
+        for p in pending {
+            let name = p["name"].as_str().unwrap_or("").to_string();
+            let requested = p["requested_role"].as_str().unwrap_or("").to_string();
+            let current = p["current_role"].as_str().unwrap_or("").to_string();
+            let reason = p["reason"].as_str().unwrap_or("").to_string();
+            rows.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .flex_shrink_0()
+                    .py(px(6.))
+                    .child(
+                        div()
+                            .text_color(to_hsla(theme.foreground))
+                            .text_size(px(13.))
+                            .child(txt::remote_pending_line(&name, &current, &requested)),
+                    )
+                    .when(!reason.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .text_color(to_hsla(theme.text_muted))
+                                .text_size(px(11.))
+                                .child(txt::remote_pending_reason(&reason)),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_color(to_hsla(theme.text_muted))
+                            .text_size(px(11.))
+                            .child(txt::remote_pending_hint().to_string()),
+                    ),
+            );
+        }
+        rows
+    }
+
+    /// 登録済み端末 1 台 1 行（権限の 4 択 + 削除）。#1452
+    fn render_remote_devices(&self, cx: &mut Context<Self>) -> Vec<Div> {
+        let theme = self.theme();
+        let devices: Vec<serde_json::Value> = self
+            .status
+            .remote_devices
+            .as_ref()
+            .and_then(|v| v.get("devices"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if devices.is_empty() {
+            return vec![div()
+                .py(px(6.))
+                .text_color(to_hsla(theme.text_muted))
+                .text_size(px(12.))
+                .child(txt::remote_no_devices().to_string())];
+        }
+        devices
+            .into_iter()
+            .map(|d| {
+                let id = d["id"].as_str().unwrap_or("").to_string();
+                let name = d["name"].as_str().unwrap_or("").to_string();
+                let role = d["role"].as_str().unwrap_or("").to_string();
+                let login = d["login"].as_str().unwrap_or("").to_string();
+                let mut chips = div().flex().flex_wrap().gap_1().justify_end();
+                for candidate in ROLE_CHOICES {
+                    let selected = role == *candidate;
+                    let (target, device) = (candidate.to_string(), id.clone());
+                    chips = chips.child(self.button(
+                        &format!("remote-role-{id}-{candidate}"),
+                        crate::ui_text::remote::role_label(candidate),
+                        if selected {
+                            BtnKind::Primary
+                        } else {
+                            BtnKind::Normal
+                        },
+                        cx.listener(move |this, _, _, cx| {
+                            if selected {
+                                return;
+                            }
+                            // 上げる / 下げるを**同じ 1 経路**で撃つ。判断は daemon 側
+                            // （`remote_role::decide`）で、GUI は結果を出すだけ
+                            this.remote_admin(
+                                "/api/admin/devices/role",
+                                serde_json::json!({ "device_id": device, "role": target }),
+                                cx,
+                            );
+                        }),
+                    ));
+                }
+                let revoke_id = id.clone();
+                self.row_wrapping(
+                    &txt::remote_device_label(&name, &login),
+                    &txt::remote_device_desc(&id),
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(chips)
+                        .child(self.button(
+                            &format!("remote-revoke-{id}"),
+                            txt::remote_forget(),
+                            BtnKind::Danger,
+                            cx.listener(move |this, _, _, cx| {
+                                this.remote_admin(
+                                    "/api/admin/devices/revoke",
+                                    serde_json::json!({ "device_id": revoke_id }),
+                                    cx,
+                                );
+                            }),
+                        )),
+                )
+            })
+            .collect()
+    }
+
+    /// 管理 API を叩いて一覧を取り直す（#1452）。
+    ///
+    /// **dispatch を通さない**のは、承認と昇格が GUI 限定の操作だから
+    /// （`remote_panel` の承認・拒否・revoke と同じ作法）。dispatch に置くと
+    /// CLI / MCP からも同じ操作が生えてしまい、FR-6.5 の例外が崩れる。
+    /// 降格・削除は `tako remote devices role / revoke` が同じ HTTP 経路を叩く = 1:1
+    fn remote_admin(
+        &mut self,
+        path: &'static str,
+        body: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        match tako_control::remote::admin_request("POST", path, Some(&body)) {
+            Ok(_) => {
+                self.message = None;
+                self.refresh_tab_status(cx);
+            }
+            // 昇格を断られた（呼び出し元が GUI でない）ときもここに出る = 黙って落ちない
+            Err(e) => self.message = Some((e, true)),
+        }
+        cx.notify();
     }
 
     // --- 高度タブ ---
@@ -3161,15 +3333,6 @@ fn summarize_remote_setup(v: &serde_json::Value) -> String {
     } else {
         format!("{head}（{}）", pending.join(", "))
     }
-}
-
-fn summarize_devices(v: &serde_json::Value) -> String {
-    let count = v
-        .get("devices")
-        .and_then(|x| x.as_array())
-        .map(|a| a.len())
-        .unwrap_or(0);
-    format!("{}: {count}", txt::remote_devices_header())
 }
 
 fn to_hsla(c: Rgb) -> Hsla {

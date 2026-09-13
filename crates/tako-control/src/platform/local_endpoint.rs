@@ -333,8 +333,12 @@ pub fn legacy_mode() -> bool {
     std::env::var(LEGACY_ENV).is_ok_and(|v| v == "1")
 }
 
-/// 実行ファイル名から拡張子と大文字小文字を落とした比較用の語
-fn peer_name_stem(name: &str) -> String {
+/// 実行ファイル名から拡張子と大文字小文字を落とした比較用の語。
+///
+/// `pub` なのは #1452 の管理 API ゲートが**同じ畳み方**で呼び出し元の名前を
+/// 比べるため（`tako-app` / `tako-app.exe` / 大文字混じりを 1 通りに寄せる）。
+/// 名前の畳み方が 2 実装に割れると、片方だけ通る形（`Tako-App.exe`）が生まれる
+pub fn peer_name_stem(name: &str) -> String {
     let name = name.trim();
     let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
     let lower = base.trim().to_ascii_lowercase();

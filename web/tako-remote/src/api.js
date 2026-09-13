@@ -41,9 +41,10 @@ export function createClient() {
     me() {
       return request('GET', '/api/me');
     },
-    // ペアリング / role 変更を要求する（Mac 画面に承認ダイアログが出る）
-    pair(name, role = 'observe') {
-      return request('POST', '/api/pair', { name, role });
+    // ペアリング / 権限の更新を要求する（Mac 画面に承認ダイアログが出る）。
+    // #1452 の「権限の更新をリクエスト」も**この 1 本**を使う（新しい API を足さない）
+    pair(name, role = 'observe', reason = '') {
+      return request('POST', '/api/pair', { name, role, reason });
     },
     panes() {
       return request('GET', '/api/v2/panes');

@@ -19,6 +19,7 @@
 // 衝突させないため、このビューが使う分はこのファイルに閉じてある。
 import { useState, useEffect, useCallback } from 'preact/hooks';
 import { createClient } from '../api';
+import { PermissionRequest } from '../components/permission-request';
 
 const TIMEOUT_MS = 15000;
 
@@ -186,7 +187,7 @@ const TrashIcon = () => (
 
 // --- 画面 ---
 
-export function FilesPage({ me, root, path, hint }) {
+export function FilesPage({ me, root, path, hint, onMeRefresh }) {
   const [state, setState] = useState({ loading: true });
   // ショートカットを扱えるか。**派生した真偽値**を依存に使う:
   // `me` そのものを依存にすると、role が同じでも `refreshMe` のたびに
@@ -259,6 +260,12 @@ export function FilesPage({ me, root, path, hint }) {
 
   const roleTooLow = state.error && state.error.status === 403 && !state.error.kind;
 
+  // #1452: 権限が付いた瞬間に続きができる（画面遷移もリロードもしない）
+  const onGranted = useCallback(() => {
+    if (onMeRefresh) onMeRefresh();
+    load();
+  }, [onMeRefresh, load]);
+
   return (
     <div class="page">
       <FilesHeader
@@ -275,13 +282,8 @@ export function FilesPage({ me, root, path, hint }) {
       {state.loading ? (
         <div class="center-fill"><div class="spinner" /></div>
       ) : roleTooLow ? (
-        <div class="empty-state">
-          <h2>権限が足りません</h2>
-          <p>
-            ファイルの参照には interact 以上の権限が要ります。
-            Mac の tako で、この端末の権限を上げてください。
-          </p>
-        </div>
+        // #1452: 「足りません」で終わらせない（中身は permission-request.jsx が持つ）
+        <PermissionRequest me={me} need="interact" what="ファイルの参照" onGranted={onGranted} />
       ) : state.error && state.error.kind === 'unreadable' ? (
         /* #1451: 全体閲覧では `/private/var/db` のような読めないフォルダへ
            普通に入れてしまう。「エラー」の 1 行で終わらせず、**理由と戻り道**を出す */

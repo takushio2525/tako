@@ -3430,9 +3430,17 @@ fn dispatch_inner(
                 .map_err(DispatchError::Operation)
         }
 
-        // ペアリング済み端末の管理（#283）。承認・role 変更はここに存在しない
-        // （Mac 画面の GUI ダイアログ限定 = AI フルコントロール不変条件の例外）
-        Request::RemoteDevices { action, device_id } => match action.as_str() {
+        // ペアリング済み端末の管理（#283 / #1452）。
+        //
+        // **role を上げる経路はここに 1 本も無い**（AI フルコントロール不変条件の例外）。
+        // 承認は Mac 画面の承認ダイアログ、昇格は設定 → リモートだけが持ち、どちらも
+        // GUI が `admin_request` で直接叩く。ここから呼べるのは弱める側の
+        // `devices_set_role` だけで、強い role を渡すと同じ判断関数が断る
+        Request::RemoteDevices {
+            action,
+            device_id,
+            role,
+        } => match action.as_str() {
             "list" => crate::remote::devices_list().map_err(DispatchError::Operation),
             "revoke" => {
                 let id = device_id.ok_or_else(|| {
@@ -3440,8 +3448,19 @@ fn dispatch_inner(
                 })?;
                 crate::remote::devices_revoke(&id).map_err(DispatchError::Operation)
             }
+            "role" => {
+                let id = device_id.ok_or_else(|| {
+                    DispatchError::Operation("role には device_id が必要".to_string())
+                })?;
+                let role = role.ok_or_else(|| {
+                    DispatchError::Operation(
+                        "role には role が必要（observe / interact / manage / admin）".to_string(),
+                    )
+                })?;
+                crate::remote::devices_set_role(&id, &role).map_err(DispatchError::Operation)
+            }
             other => Err(DispatchError::Operation(format!(
-                "不明な action: {other}（list / revoke）"
+                "不明な action: {other}（list / revoke / role）"
             ))),
         },
 

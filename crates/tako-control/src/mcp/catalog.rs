@@ -2226,23 +2226,29 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_remote_devices",
-            "description": "リモート接続のペアリング済み端末を管理する（#283 機器ペアリング認証）。\
-                action=list で登録済み端末（id・名前・role・最終アクセス）と保留中の\
-                ペアリング要求を一覧、action=revoke で device_id の登録を失効させる\
-                （接続中の端末は即時切断される）。\
-                ペアリングの承認・role 変更はこのツールでは行えない: Mac 画面に表示される\
-                承認ダイアログでユーザー本人だけが操作できる（セキュリティ境界のため AI には\
-                承認 API を提供しない）。",
+            "description": "リモート接続のペアリング済み端末を管理する（#283 機器ペアリング認証 / #1452）。\
+                action=list で登録済み端末（id・名前・role・最終アクセス）と保留中の要求\
+                （新規ペアリング・権限の更新リクエスト）を一覧、action=revoke で device_id の\
+                登録を失効させる（接続中の端末は即時切断される）、action=role で device_id の\
+                権限を**弱める**（role に現在より弱いものを渡す）。\
+                **権限を上げる操作はこのツールでは行えない**: 承認も昇格も Mac 画面\
+                （承認ダイアログ / 設定 → リモート）でユーザー本人だけが操作できる\
+                （セキュリティ境界のため AI には昇格経路を提供しない）。強い role を渡すと\
+                その旨のエラーを返すので、ユーザーには画面での操作を案内すること。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
-                        "type": "string", "enum": ["list", "revoke"],
-                        "description": "list = 端末一覧 / revoke = 登録失効",
+                        "type": "string", "enum": ["list", "revoke", "role"],
+                        "description": "list = 端末一覧 / revoke = 登録失効 / role = 権限を弱める",
                     },
                     "device_id": {
                         "type": "string",
-                        "description": "revoke の対象デバイス ID（list で確認できる）",
+                        "description": "revoke / role の対象デバイス ID（list で確認できる）",
+                    },
+                    "role": {
+                        "type": "string", "enum": ["observe", "interact", "manage", "admin"],
+                        "description": "action=role の行き先。現在より弱いものだけ通る（強い role は断られる）",
                     },
                 },
                 "required": ["action"],

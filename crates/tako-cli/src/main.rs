@@ -1246,7 +1246,8 @@ enum RemoteCommand {
         #[arg(long, default_value_t = 1000)]
         lines: u32,
     },
-    /// ペアリング済み端末の管理（一覧・失効。承認は Mac 画面のダイアログでのみ行う）
+    /// ペアリング済み端末の管理（一覧・権限を弱める・失効。
+    /// 権限を上げるのは Mac 画面 = 承認ダイアログ / 設定 → リモートだけ）
     Devices {
         #[command(subcommand)]
         command: RemoteDevicesCommand,
@@ -1296,8 +1297,16 @@ enum RemoteShortcutsCommand {
 
 #[derive(Subcommand)]
 enum RemoteDevicesCommand {
-    /// 登録済み端末と保留中のペアリング要求を一覧する
+    /// 登録済み端末と保留中の要求（ペアリング・権限の更新）を一覧する
     List,
+    /// 端末の権限を**弱める**（上げるのは Mac 画面からだけ = #1452）
+    Role {
+        /// 対象デバイス ID（`tako remote devices list` で確認できる）
+        device_id: String,
+        /// 行き先の権限（observe / interact / manage / admin）。
+        /// 現在より強いものを渡すと、画面での操作を案内して断る
+        role: String,
+    },
     /// 端末の登録を失効させる（接続中なら即時切断される）
     Revoke {
         /// 対象デバイス ID（`tako remote devices list` で確認できる）
@@ -4752,12 +4761,18 @@ fn remote_status() -> Result<(), String> {
     Ok(())
 }
 
-/// `tako remote devices` — ペアリング済み端末の一覧・失効。
-/// ペアリングの承認・role 変更は Mac 画面の GUI ダイアログでのみ行う
-/// （AI フルコントロール不変条件の例外。`.agent/requirements.md`）
+/// `tako remote devices` — ペアリング済み端末の一覧・降格・失効。
+///
+/// **権限を上げる経路はここに無い**（#1452）。承認は Mac 画面の承認ダイアログ、
+/// 昇格は設定 → リモートだけが持つ（AI フルコントロール不変条件の例外。
+/// `.agent/requirements.md` FR-6.5 / FR-6.21）。`role` に強いものを渡すと断られるので、
+/// 「上げられない」ことを CLI からそのまま観測できる
 fn remote_devices(command: RemoteDevicesCommand) -> Result<(), String> {
     let result = match command {
         RemoteDevicesCommand::List => tako_control::remote::devices_list()?,
+        RemoteDevicesCommand::Role { device_id, role } => {
+            tako_control::remote::devices_set_role(&device_id, &role)?
+        }
         RemoteDevicesCommand::Revoke { device_id } => {
             tako_control::remote::devices_revoke(&device_id)?
         }
