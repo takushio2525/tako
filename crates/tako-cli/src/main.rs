@@ -801,6 +801,12 @@ enum SleepGuardCommand {
         /// 蓋閉じ防止モード: off / while-agents-running（要 sudoers 登録）
         #[arg(long)]
         lid_sleep_mode: Option<String>,
+        /// 蓋閉じ継続の電源条件: ac-only（既定）/ always（バッテリーでも継続。#1473）
+        #[arg(long)]
+        lid_power_condition: Option<String>,
+        /// 蓋閉じ継続をバッテリーで続けるときの残量下限（%。既定 20。#1473）
+        #[arg(long)]
+        lid_battery_floor: Option<i64>,
     },
     /// 蓋閉じ防止の sudoers 登録（管理者パスワード必要、初回のみ）
     InstallLidSleep,
@@ -5946,6 +5952,8 @@ fn sleep_guard_status_state() -> (tako_control::sleep_guard::SleepGuardState, &'
         mode: None,
         power_condition: None,
         lid_sleep_mode: None,
+        lid_power_condition: None,
+        lid_battery_floor: None,
     })
     .ok()
     .and_then(|value| tako_control::sleep_guard::SleepGuardState::from_json(&value));
@@ -5954,11 +5962,7 @@ fn sleep_guard_status_state() -> (tako_control::sleep_guard::SleepGuardState, &'
     }
     let settings = tako_control::settings::load();
     (
-        tako_control::sleep_guard::status(
-            settings.sleep_guard_mode,
-            settings.sleep_guard_power,
-            settings.lid_sleep_mode,
-        ),
+        tako_control::sleep_guard::status(settings.sleep_guard_config()),
         "この CLI プロセス（tako アプリは未起動）",
     )
 }
@@ -6014,6 +6018,25 @@ fn sleep_guard_local(sub: &SleepGuardCommand) -> Result<(), String> {
                     "無効"
                 }
             );
+            // #1473: 蓋閉じ継続の電源条件と、効いていないなら**その理由**
+            if tako_control::sleep_guard::lid_control_supported() {
+                eprintln!(
+                    "  蓋閉じ継続の電源条件: {}",
+                    state.lid_power_condition.as_str()
+                );
+                match state.battery_percent {
+                    Some(percent) => eprintln!(
+                        "  バッテリー残量: {percent}%（下限 {}%）",
+                        state.lid_battery_floor
+                    ),
+                    None => eprintln!("  バッテリー残量: 不明（この機械では取得できません）"),
+                }
+                if !state.lid_sleep_disabled {
+                    if let Some(reason) = state.lid_skip_reason {
+                        eprintln!("  蓋閉じ継続が効かない理由: {}", reason.describe());
+                    }
+                }
+            }
             // thermal は macOS でしか取れない。取れない OS で常に nominal と出しても情報がない
             if tako_control::sleep_guard::lid_requires_privileged_setup()
                 || state.thermal_state != tako_control::sleep_guard::ThermalState::Nominal
@@ -6033,6 +6056,8 @@ fn sleep_guard_local(sub: &SleepGuardCommand) -> Result<(), String> {
             mode,
             power_condition,
             lid_sleep_mode,
+            lid_power_condition,
+            lid_battery_floor,
         } => {
             let mut settings = tako_control::settings::load();
             if let Some(m) = mode {
@@ -6061,19 +6086,33 @@ fn sleep_guard_local(sub: &SleepGuardCommand) -> Result<(), String> {
                     )
                 })?;
             }
+            // #1473: 蓋閉じ継続の電源条件と残量下限（アイドルスリープ側とは別の軸）
+            if let Some(pc) = lid_power_condition {
+                settings.lid_sleep_power = tako_control::sleep_guard::PowerCondition::from_str_opt(
+                    pc,
+                )
+                .ok_or_else(|| {
+                    format!(
+                        "不明な lid-power-condition: {pc:?}（{}）",
+                        tako_control::sleep_guard::PowerCondition::values_hint()
+                    )
+                })?;
+            }
+            if let Some(floor) = lid_battery_floor {
+                settings.lid_battery_floor =
+                    tako_control::sleep_guard::parse_battery_floor(*floor)?;
+            }
             tako_control::settings::save(&settings)
                 .map_err(|e| format!("設定の保存に失敗: {e}"))?;
             eprintln!(
-                "  設定を変更しました: mode={}, power={}, lid-sleep={}",
+                "  設定を変更しました: mode={}, power={}, lid-sleep={}, lid-power={}, lid-battery-floor={}%",
                 settings.sleep_guard_mode.as_str(),
                 settings.sleep_guard_power.as_str(),
                 settings.lid_sleep_mode.as_str(),
+                settings.lid_sleep_power.as_str(),
+                settings.lid_battery_floor,
             );
-            let state = tako_control::sleep_guard::status(
-                settings.sleep_guard_mode,
-                settings.sleep_guard_power,
-                settings.lid_sleep_mode,
-            );
+            let state = tako_control::sleep_guard::status(settings.sleep_guard_config());
             println!(
                 "{}",
                 serde_json::to_string_pretty(&state.to_json()).unwrap()
@@ -7756,28 +7795,38 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 mode: None,
                 power_condition: None,
                 lid_sleep_mode: None,
+                lid_power_condition: None,
+                lid_battery_floor: None,
             },
             SleepGuardCommand::Set {
                 mode,
                 power_condition,
                 lid_sleep_mode,
+                lid_power_condition,
+                lid_battery_floor,
             } => Request::SleepGuard {
                 action: Some("set".to_string()),
                 mode: mode.clone(),
                 power_condition: power_condition.clone(),
                 lid_sleep_mode: lid_sleep_mode.clone(),
+                lid_power_condition: lid_power_condition.clone(),
+                lid_battery_floor: *lid_battery_floor,
             },
             SleepGuardCommand::InstallLidSleep => Request::SleepGuard {
                 action: Some("install-lid-sleep".to_string()),
                 mode: None,
                 power_condition: None,
                 lid_sleep_mode: None,
+                lid_power_condition: None,
+                lid_battery_floor: None,
             },
             SleepGuardCommand::RemoveLidSleep => Request::SleepGuard {
                 action: Some("remove-lid-sleep".to_string()),
                 mode: None,
                 power_condition: None,
                 lid_sleep_mode: None,
+                lid_power_condition: None,
+                lid_battery_floor: None,
             },
         },
         Command::Chat(sub) => match sub {

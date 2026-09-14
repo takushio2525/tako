@@ -3034,7 +3034,7 @@
     "name": "tako_fda"
   },
   {
-    "description": "スリープ防止機能の状態確認・設定変更（Issue #173 + #218 蓋閉じ対応）。macOS のアイドルスリープを IOKit 電源アサーションで防止する。蓋閉じ防止は pmset disablesleep で制御（sudoers 登録が必要）。action=status（既定）: モード・電源条件・アサーション状態・蓋の開閉・thermal 状態を返す。action=set: mode / power_condition / lid_sleep_mode を設定する。action=install-lid-sleep: sudoers.d に pmset NOPASSWD を登録（管理者パスワード必要、初回のみ）。action=remove-lid-sleep: sudoers.d から削除 + disablesleep 解除。action=open-battery-settings: System Settings の Battery を開く（フォールバック）。ユーザーが「PC がスリープして作業が止まった」「蓋を閉じても続けたい」と言った場合は、まず status で確認し、蓋閉じ防止なら install-lid-sleep で登録を案内すること。",
+    "description": "スリープ防止機能の状態確認・設定変更（Issue #173 + #218 蓋閉じ対応）。macOS のアイドルスリープを IOKit 電源アサーションで防止する。蓋閉じ防止は pmset disablesleep で制御（sudoers 登録が必要）。action=status（既定）: モード・電源条件・アサーション状態・蓋の開閉・thermal 状態を返す。action=set: mode / power_condition / lid_sleep_mode を設定する。action=install-lid-sleep: sudoers.d に pmset NOPASSWD を登録（管理者パスワード必要、初回のみ）。action=remove-lid-sleep: sudoers.d から削除 + disablesleep 解除。action=open-battery-settings: System Settings の Battery を開く（フォールバック）。蓋閉じ継続は既定では AC 接続時のみ効く。バッテリー駆動（テザリング中など）でも続けたい場合は lid_power_condition=always を設定する（#1473）。そのときは安全弁（エージェント稼働中のみ / 残量が lid_battery_floor 以下で自動解除 / 本体が高温なら解除）が必ず働き、解除の理由は status の lid_skip_reason に出る。ユーザーが「PC がスリープして作業が止まった」「蓋を閉じても続けたい」と言った場合は、まず status で確認し、蓋閉じ防止なら install-lid-sleep で登録を案内すること。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -3046,6 +3046,20 @@
             "install-lid-sleep",
             "remove-lid-sleep",
             "open-battery-settings"
+          ],
+          "type": "string"
+        },
+        "lid_battery_floor": {
+          "description": "蓋閉じ継続をバッテリーで続けるときの残量下限（%。既定 20。この値以下になると自動で解除して通常のスリープへ戻す）",
+          "maximum": 90,
+          "minimum": 5,
+          "type": "integer"
+        },
+        "lid_power_condition": {
+          "description": "蓋閉じ継続の電源条件（アイドルスリープ側とは別の軸。既定 ac-only）（set 時のみ有効。ac-only = AC 電源に接続しているときだけ / always = バッテリー駆動でも）",
+          "enum": [
+            "ac-only",
+            "always"
           ],
           "type": "string"
         },
@@ -3067,7 +3081,7 @@
           "type": "string"
         },
         "power_condition": {
-          "description": "電源条件（set 時のみ有効）",
+          "description": "アイドルスリープ防止の電源条件（set 時のみ有効。ac-only = AC 電源に接続しているときだけ / always = バッテリー駆動でも）",
           "enum": [
             "ac-only",
             "always"

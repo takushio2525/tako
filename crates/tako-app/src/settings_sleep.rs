@@ -9,7 +9,9 @@
 //! 「sudoers を登録」という macOS 専用の案内が Windows にも出てしまうので、
 //! UI は `sleep_guard` が公開する能力（初回セットアップが要るか等）だけを見る。
 
-use tako_control::sleep_guard::{self, LidSleepMode, PowerCondition, SleepGuardMode};
+use tako_control::sleep_guard::{
+    self, LidGuardInput, LidSkipReason, LidSleepMode, PowerCondition, SleepGuardMode, ThermalState,
+};
 
 use crate::ui_text::settings as txt;
 
@@ -81,6 +83,8 @@ pub enum LidStatus {
     PausedNoAc,
     /// 本体が高温のため見送り中（macOS のみ観測できる）
     PausedThermal,
+    /// バッテリー残量が下限以下・または残量が読めないため見送り中（#1473）
+    PausedBatteryFloor,
     /// 効かせるべき条件は揃っているが、まだ倒せていない（[`IdleStatus::Applying`] と同じ隙間）
     Applying,
 }
@@ -92,7 +96,7 @@ pub enum LidStatus {
 ///
 /// 既定値は「まだ何も分かっていない」= 使えない側へ倒す（モード等の既定は
 /// `tako_control` の定義に従う）
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SleepSnapshot {
     /// アイドルスリープ防止がこの OS で使えるか
     pub idle_supported: bool,
@@ -112,10 +116,47 @@ pub struct SleepSnapshot {
     /// この OS の蓋閉じ継続が、管理者権限を伴う初回登録を要する仕組みか。
     /// **OS 固定の性質**なので JSON には無く、`sleep_guard` の判定関数から入れる
     pub lid_needs_privileged_setup: bool,
-    /// 本体が高温か（macOS のみ観測できる。Windows は常に false）
-    pub thermal_warning: bool,
+    /// 本体の温度（macOS のみ観測できる。Windows は常に `Nominal`）。
+    ///
+    /// **真偽値ではなく状態そのもの**を持つ（#1473）。バッテリーで蓋を閉じ続けるときは
+    /// `fair` でも降りるので、「警告かどうか」に潰すと判定が表せない
+    pub thermal_state: ThermalState,
+    /// 蓋閉じ継続の電源条件（#1473）
+    pub lid_power_condition: PowerCondition,
+    /// バッテリーで続けるときの残量下限（%。#1473）
+    pub lid_battery_floor: u8,
+    /// バッテリー残量（%。読めない環境は None。#1473）
+    pub battery_percent: Option<u8>,
+    /// 蓋閉じ継続が効いていない理由（#1473）。**判断したプロセス（アプリ）が
+    /// 載せたものをそのまま読む**ので、画面が自分で計算し直すことはない
+    pub lid_skip_reason: Option<LidSkipReason>,
     /// 文言がこの機械を何と呼ぶか
     pub device: Device,
+}
+
+impl Default for SleepSnapshot {
+    fn default() -> Self {
+        Self {
+            idle_supported: false,
+            mode: SleepGuardMode::default(),
+            power_condition: PowerCondition::default(),
+            assertion_held: false,
+            busy_agents: 0,
+            on_ac_power: false,
+            lid_supported: false,
+            lid_mode: LidSleepMode::default(),
+            lid_active: false,
+            lid_setup_required: false,
+            lid_needs_privileged_setup: false,
+            thermal_state: ThermalState::default(),
+            lid_power_condition: PowerCondition::default(),
+            // 0 にすると「下限なし」という別の意味になるので、既定は正本から引く
+            lid_battery_floor: sleep_guard::DEFAULT_LID_BATTERY_FLOOR,
+            battery_percent: None,
+            lid_skip_reason: None,
+            device: Device::detect(),
+        }
+    }
 }
 
 impl SleepSnapshot {
@@ -146,8 +187,38 @@ impl SleepSnapshot {
             lid_active: b("lid_sleep_disabled"),
             lid_setup_required: b("lid_setup_required"),
             lid_needs_privileged_setup: needs_setup_step,
-            thermal_warning: matches!(s("thermal_state"), "serious" | "critical"),
+            thermal_state: ThermalState::from_str_opt(s("thermal_state")).unwrap_or_default(),
+            lid_power_condition: PowerCondition::from_str_opt(s("lid_power_condition"))
+                .unwrap_or_default(),
+            lid_battery_floor: v
+                .get("lid_battery_floor")
+                .and_then(|x| x.as_u64())
+                .and_then(|x| u8::try_from(x).ok())
+                .unwrap_or(sleep_guard::DEFAULT_LID_BATTERY_FLOOR),
+            battery_percent: v
+                .get("battery_percent")
+                .and_then(|x| x.as_u64())
+                .and_then(|x| u8::try_from(x).ok()),
+            lid_skip_reason: v.get("lid_skip_reason").and_then(LidSkipReason::from_json),
             device: Device::detect(),
+        }
+    }
+
+    /// 蓋閉じ継続の判定材料（#1473）。
+    ///
+    /// **画面は自前で条件を書かない**。`sleep_guard::lid_decision` へ渡して
+    /// 返ってきた理由を表示へ写すだけにしておくと、安全弁を足しても
+    /// 「実際は残量で降りているのに画面は AC 未接続と言う」がそもそも作れない
+    fn lid_input(&self) -> LidGuardInput {
+        LidGuardInput {
+            lid_sleep_mode: self.lid_mode,
+            setup_done: !self.lid_setup_required,
+            busy_agents: self.busy_agents,
+            on_ac: self.on_ac_power,
+            thermal: self.thermal_state,
+            lid_power_condition: self.lid_power_condition,
+            battery_percent: self.battery_percent,
+            battery_floor: self.lid_battery_floor,
         }
     }
 
@@ -204,22 +275,25 @@ impl SleepSnapshot {
         if self.lid_active {
             return LidStatus::Active;
         }
-        if self.lid_mode == LidSleepMode::Off {
-            return LidStatus::Off;
+        // 効いていない理由は**アプリが判断したもの**を読む（#1473）。ここで条件を
+        // 書き直すと、安全弁を足したときに画面だけ古い理由を出す。
+        // 理由が入っていない応答（取得前・古いアプリ）だけ材料から計算へ落ちる
+        let decision = match self.lid_skip_reason {
+            Some(reason) => Err(reason),
+            None => sleep_guard::lid_decision(&self.lid_input()),
+        };
+        match decision {
+            Err(LidSkipReason::ModeOff) => LidStatus::Off,
+            Err(LidSkipReason::SetupRequired) => LidStatus::SetupRequired,
+            Err(LidSkipReason::Thermal(_)) => LidStatus::PausedThermal,
+            Err(LidSkipReason::NoAgents) => LidStatus::WaitingAgents,
+            Err(LidSkipReason::NoAcPower) => LidStatus::PausedNoAc,
+            Err(LidSkipReason::BatteryFloor { .. } | LidSkipReason::BatteryUnknown) => {
+                LidStatus::PausedBatteryFloor
+            }
+            // 倒すべき条件は揃っているのにまだ倒れていない = 反映待ち
+            Ok(()) => LidStatus::Applying,
         }
-        if self.lid_setup_required {
-            return LidStatus::SetupRequired;
-        }
-        if self.thermal_warning {
-            return LidStatus::PausedThermal;
-        }
-        if self.busy_agents == 0 {
-            return LidStatus::WaitingAgents;
-        }
-        if !self.on_ac_power {
-            return LidStatus::PausedNoAc;
-        }
-        LidStatus::Applying
     }
 
     /// このタブの表示構成
@@ -245,29 +319,53 @@ impl SleepSnapshot {
                     } else {
                         String::new()
                     },
-                    value: txt::sleep_idle_status(idle),
+                    value: txt::sleep_idle_status(idle).to_string(),
                     tone: tone(idle == IdleStatus::Active, idle != IdleStatus::Unsupported),
                 },
                 StatusRow {
                     label: txt::sleep_lid_header(),
                     note: String::new(),
-                    value: txt::sleep_lid_status(lid),
+                    value: txt::sleep_lid_status(lid).to_string(),
                     tone: tone(lid == LidStatus::Active, lid != LidStatus::Unsupported),
                 },
                 StatusRow {
                     label: txt::sleep_status_power_label(),
                     note: String::new(),
                     value: if self.on_ac_power {
-                        txt::sleep_status_on_ac()
+                        txt::sleep_status_on_ac().to_string()
                     } else {
-                        txt::sleep_status_on_battery()
+                        txt::sleep_status_on_battery().to_string()
                     },
                     tone: StatusTone::Known,
                 },
-            ],
+            ]
+            .into_iter()
+            // 残量は読める機械でだけ出す（#1473）。読めない環境で「不明」の行を
+            // 足しても情報がなく、デスクトップ機には意味のない行が増える
+            .chain(self.battery_percent.map(|percent| StatusRow {
+                label: txt::sleep_status_battery_label(),
+                note: String::new(),
+                value: txt::sleep_status_battery_value(percent, self.lid_battery_floor),
+                // 下限以下は「いつ落ちるか」ではなく「もう効かない」の合図なので薄く出さない
+                tone: if percent <= self.lid_battery_floor {
+                    StatusTone::Unknown
+                } else {
+                    StatusTone::Known
+                },
+            }))
+            .collect(),
         }
     }
 }
+
+/// 設定画面が並べる残量下限の候補（%。#1473）。
+///
+/// CLI / MCP は [`sleep_guard::parse_battery_floor`] の範囲（5〜90）を自由に受けるが、
+/// 画面はよく使う値だけを並べる（数値入力を増やさない）。候補に無い値が設定されている
+/// ときはどれも選択されない代わりに、状態セクションの残量行へ現在の下限が出る
+/// 組の 2 つ目は**セグメントが送る値の綴り**（`Request` の `lid_battery_floor` は
+/// 整数なので、画面側は文字列と数値の両方を要る）
+pub const BATTERY_FLOOR_CHOICES: &[(u8, &str)] = &[(10, "10"), (20, "20"), (30, "30"), (50, "50")];
 
 /// 状態の値をどの濃さで出すか（実際の色は描画側が Theme から引く）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,7 +384,8 @@ pub struct StatusRow {
     pub label: &'static str,
     /// 補足（無ければ空文字）
     pub note: String,
-    pub value: &'static str,
+    /// 表示値。**固定文言とは限らない**（バッテリー残量のような実測値も出る。#1473）
+    pub value: String,
     pub tone: StatusTone,
 }
 
@@ -323,7 +422,7 @@ impl SleepTabPlan {
         ];
         for row in &self.status_rows {
             out.push(row.label.into());
-            out.push(row.value.into());
+            out.push(row.value.clone());
             if !row.note.is_empty() {
                 out.push(row.note.clone());
             }
@@ -331,6 +430,16 @@ impl SleepTabPlan {
         if self.show_lid_row {
             out.push(txt::sleep_lid_header().into());
             out.push(txt::desc_sleep_lid(self.needs_privileged_setup).into());
+            // #1473: 蓋閉じ継続の電源条件と残量下限（バッテリーで続けるかどうか）
+            out.push(txt::sleep_lid_power_header().into());
+            out.push(txt::desc_sleep_lid_power().into());
+            out.push(txt::sleep_power_ac().into());
+            out.push(txt::sleep_lid_power_always().into());
+            out.push(txt::sleep_lid_floor_header().into());
+            out.push(txt::desc_sleep_lid_floor().into());
+            for (percent, _) in BATTERY_FLOOR_CHOICES {
+                out.push(txt::sleep_lid_floor_choice(*percent));
+            }
         }
         if self.show_setup_buttons {
             out.push(txt::sleep_lid_install().into());
@@ -577,7 +686,7 @@ mod tests {
         let s = SleepSnapshot {
             lid_mode: LidSleepMode::WhileAgentsRunning,
             busy_agents: 1,
-            thermal_warning: true,
+            thermal_state: ThermalState::Serious,
             lid_setup_required: false,
             ..mac()
         };
@@ -624,38 +733,162 @@ mod tests {
 
     #[test]
     fn lidの反映中はsleep_guardの判定と一致する() {
+        // #1473 で電源条件と残量も判定に入ったので、総当たりの軸もそれに合わせる
         for lid_mode in [LidSleepMode::Off, LidSleepMode::WhileAgentsRunning] {
             for setup_required in [false, true] {
                 for busy in [0usize, 2] {
                     for on_ac in [false, true] {
-                        for thermal in [false, true] {
-                            let s = SleepSnapshot {
-                                lid_mode,
-                                lid_setup_required: setup_required,
-                                busy_agents: busy,
-                                on_ac_power: on_ac,
-                                thermal_warning: thermal,
-                                lid_active: false,
-                                ..mac()
-                            };
-                            let should = sleep_guard::should_disable_lid_sleep(
-                                lid_mode,
-                                !setup_required,
-                                busy,
-                                on_ac,
-                                thermal,
-                            );
-                            assert_eq!(
-                                s.lid_status() == LidStatus::Applying,
-                                should,
-                                "倒すべきかの判定と表示が食い違う: {lid_mode:?} setup_required={setup_required} busy={busy} ac={on_ac} thermal={thermal} -> {:?}",
-                                s.lid_status()
-                            );
+                        for thermal in [
+                            ThermalState::Nominal,
+                            ThermalState::Fair,
+                            ThermalState::Serious,
+                        ] {
+                            for lid_power in [PowerCondition::AcOnly, PowerCondition::Always] {
+                                for battery in [None, Some(5u8), Some(20), Some(80)] {
+                                    let s = SleepSnapshot {
+                                        lid_mode,
+                                        lid_setup_required: setup_required,
+                                        busy_agents: busy,
+                                        on_ac_power: on_ac,
+                                        thermal_state: thermal,
+                                        lid_power_condition: lid_power,
+                                        battery_percent: battery,
+                                        lid_active: false,
+                                        ..mac()
+                                    };
+                                    let should =
+                                        sleep_guard::should_disable_lid_sleep(&s.lid_input());
+                                    assert_eq!(
+                                        s.lid_status() == LidStatus::Applying,
+                                        should,
+                                        "倒すべきかの判定と表示が食い違う: {lid_mode:?} setup_required={setup_required} busy={busy} ac={on_ac} thermal={thermal:?} lid_power={lid_power:?} battery={battery:?} -> {:?}",
+                                        s.lid_status()
+                                    );
+                                }
+                            }
                         }
                     }
                 }
             }
         }
+    }
+
+    // --- #1473: バッテリー駆動の蓋閉じ継続 ---
+
+    /// 既定（`ac-only`）はバッテリーで降りる。表示も従来どおり「AC 未接続」
+    #[test]
+    fn 既定ではバッテリーで蓋閉じ継続に入らない() {
+        let s = SleepSnapshot {
+            lid_mode: LidSleepMode::WhileAgentsRunning,
+            busy_agents: 1,
+            on_ac_power: false,
+            battery_percent: Some(90),
+            ..win()
+        };
+        assert_eq!(
+            s.lid_power_condition,
+            PowerCondition::AcOnly,
+            "既定は AC のみ"
+        );
+        assert_eq!(s.lid_status(), LidStatus::PausedNoAc);
+    }
+
+    #[test]
+    fn alwaysならバッテリーでも反映中まで進む() {
+        let s = SleepSnapshot {
+            lid_mode: LidSleepMode::WhileAgentsRunning,
+            lid_power_condition: PowerCondition::Always,
+            busy_agents: 1,
+            on_ac_power: false,
+            battery_percent: Some(90),
+            ..win()
+        };
+        assert_eq!(s.lid_status(), LidStatus::Applying);
+    }
+
+    #[test]
+    fn 残量が下限以下なら残量の理由で止まる() {
+        let base = SleepSnapshot {
+            lid_mode: LidSleepMode::WhileAgentsRunning,
+            lid_power_condition: PowerCondition::Always,
+            busy_agents: 1,
+            on_ac_power: false,
+            lid_battery_floor: 20,
+            ..win()
+        };
+        // ちょうど下限は「割った」側（下限に達したら降りる）
+        for percent in [0u8, 19, 20] {
+            let s = SleepSnapshot {
+                battery_percent: Some(percent),
+                ..base
+            };
+            assert_eq!(
+                s.lid_status(),
+                LidStatus::PausedBatteryFloor,
+                "残量 {percent}% で止まらない"
+            );
+        }
+        assert_eq!(
+            SleepSnapshot {
+                battery_percent: Some(21),
+                ..base
+            }
+            .lid_status(),
+            LidStatus::Applying,
+            "下限より上なら続ける"
+        );
+        // 読めない環境も同じ枝（続けられないことに変わりはない）
+        assert_eq!(
+            SleepSnapshot {
+                battery_percent: None,
+                ..base
+            }
+            .lid_status(),
+            LidStatus::PausedBatteryFloor
+        );
+    }
+
+    #[test]
+    fn バッテリー継続中はfairでも温度で降りる() {
+        let battery = SleepSnapshot {
+            lid_mode: LidSleepMode::WhileAgentsRunning,
+            lid_power_condition: PowerCondition::Always,
+            busy_agents: 1,
+            on_ac_power: false,
+            battery_percent: Some(90),
+            thermal_state: ThermalState::Fair,
+            ..win()
+        };
+        assert_eq!(battery.lid_status(), LidStatus::PausedThermal);
+        // AC 接続中は従来どおり fair では降りない
+        let on_ac = SleepSnapshot {
+            on_ac_power: true,
+            ..battery
+        };
+        assert_eq!(on_ac.lid_status(), LidStatus::Applying);
+    }
+
+    #[test]
+    fn 残量の行は読める機械にだけ出る() {
+        let with_battery = SleepSnapshot {
+            battery_percent: Some(42),
+            lid_battery_floor: 20,
+            ..win()
+        };
+        let rows = with_battery.plan().status_rows;
+        assert!(
+            rows.iter().any(|r| r.value.contains("42")),
+            "残量の行が無い: {rows:?}"
+        );
+        let without = SleepSnapshot {
+            battery_percent: None,
+            ..win()
+        };
+        assert_eq!(
+            without.plan().status_rows.len(),
+            rows.len() - 1,
+            "読めない機械に残量の行を足してはいけない"
+        );
     }
 
     // --- 画面に出る文字列（#727 の受け入れ条件 1 を GUI 無しで固定する） ---
@@ -719,7 +952,7 @@ mod tests {
         assert_eq!(s.lid_mode, LidSleepMode::WhileAgentsRunning);
         assert!(s.lid_active);
         assert!(!s.lid_setup_required);
-        assert!(s.thermal_warning);
+        assert_eq!(s.thermal_state, ThermalState::Serious);
         assert_eq!(s.idle_status(), IdleStatus::Active);
         assert_eq!(s.lid_status(), LidStatus::Active);
     }
@@ -739,7 +972,10 @@ mod tests {
         let s = SleepSnapshot::from_status_json(Some(&v));
         assert_eq!(s.mode, SleepGuardMode::On);
         assert!(!s.lid_supported);
-        assert!(!s.thermal_warning);
+        assert_eq!(s.thermal_state, ThermalState::Nominal);
+        // #1473: 欠けていても下限は 0（= 安全弁なし）へ落とさない
+        assert_eq!(s.lid_battery_floor, sleep_guard::DEFAULT_LID_BATTERY_FLOOR);
+        assert_eq!(s.lid_power_condition, PowerCondition::AcOnly);
     }
 
     #[test]

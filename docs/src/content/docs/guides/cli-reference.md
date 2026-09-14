@@ -1401,6 +1401,10 @@ tako fda open                # システム設定を開く
 tako sleep-guard status
 tako sleep-guard set --mode while-agents-running --power-condition ac-only
 
+tako sleep-guard install-lid-sleep                     # 蓋を閉じても動かし続ける（初回登録）
+tako sleep-guard set --lid-power-condition always      # バッテリー駆動でも継続する（既定は AC のみ）
+tako sleep-guard set --lid-battery-floor 30            # 残量の下限（既定 20%。ここまで下がると自動解除）
+
 tako telemetry status        # エラーレポート自動送信（既定 OFF）
 tako telemetry on
 tako telemetry off

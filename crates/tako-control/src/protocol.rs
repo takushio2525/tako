@@ -1446,6 +1446,13 @@ pub enum Request {
         /// 蓋閉じ防止モード: "off" / "while-agents-running"（#218）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         lid_sleep_mode: Option<String>,
+        /// 蓋閉じ継続の電源条件: "ac-only"（既定）/ "always"（#1473）。
+        /// アイドルスリープ側の `power_condition` とは別の軸
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lid_power_condition: Option<String>,
+        /// 蓋閉じ継続をバッテリーで続けるときの残量下限（%。#1473。既定 20）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lid_battery_floor: Option<i64>,
     },
     /// UI テーマの状態確認・切替（Issue #217。ライト/ダーク）。
     /// `action` = "status"（既定）/ "set"（`mode` へ変更）/ "toggle"（反転）。

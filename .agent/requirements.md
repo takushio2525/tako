@@ -1820,6 +1820,26 @@ FR-2.7.6 は画像ペインを並べて実現する）。
 | FR-4.9.4 | CLI `tako scrollback [lines]` / MCP `tako_scrollback` / 設定画面（一般タブ「ターミナル」節）の 3 経路が**同じ dispatch** を通る（設計原則 5）。最簡形（#322）は引数なしで現在値・既定・下限・上限・適用中のペイン数・飽和時の見積りが読めること | M |
 | FR-4.9.5 | ペインログ（FR-5.13 / #112）の飽和判定は `TerminalSession::scrollback_limit()` = 設定値を見る（定数を別に持たない）。スクロール（FR-2.5.13）の可視範囲は `history_size()` 由来なので上限に自動追従する | M |
 
+### FR-4.10 蓋閉じ継続をバッテリー駆動でも続ける（Issue #1473。✅ 2026-09-14）
+
+> 蓋閉じ継続（#218 / #697。macOS = sudoers + `pmset disablesleep` / Windows = 電源プランの
+> `GUID_LIDCLOSE_ACTION`）は **AC 接続時にしか適用されなかった**。実発の症状は
+> 「iPhone でテザリングしながら蓋を閉じると、回線も master も worker も止まる」。
+> スマホから操作する運用（#1059）はまさにバッテリー + テザリングで使う。
+>
+> **既定は変えない**（設定を触っていない人の Mac を鞄の中で走らせない）。明示的に
+> 切り替えた人だけバッテリーでも継続し、そのときは安全弁を必ず通す。
+
+| ID | 要件 | 優先度 |
+|---|---|---|
+| FR-4.10.1 | 蓋閉じ継続の電源条件を**アイドルスリープ側とは別の軸**として持つ（`settings.json` の `lid_sleep_power`。既定 `ac-only` = 従来どおり）。まとめて切り替えないのは、蓋を閉じて持ち歩くリスクとアイドルスリープ防止のリスクが釣り合わないため。キーが無い旧ファイルはそのまま読める（`#[serde(default)]` なので移行 Step は不要 = #916） | M |
+| FR-4.10.2 | バッテリーで継続するあいだは**安全弁を必ず通す**: ①エージェント稼働中のみ（`while-agents-running` の意味は不変）②残量が下限（`lid_battery_floor`。既定 20%・5〜90% で設定可）**まで下がったら**解除 ③本体が高温なら解除（**物差しは電源で変える**: バッテリーは `fair` 以上 / AC は従来どおり `serious` 以上）④残量を読めない機械では継続しない（止める条件を持てないまま走らない）。条件が戻れば再適用する | M |
+| FR-4.10.3 | 判定は `sleep_guard::lid_decision`（`Result<(), LidSkipReason>`）の **1 実装**で、真偽値ではなく**理由**を返す。`status` の description・CLI・設定画面の状態行・通知欄・`persist.log` はすべてこの理由を引く（画面側が条件を書き直さない）。倒した / 戻したは `persist.log` に `lid-sleep: … reason=<tag>` として 1 行ずつ残る | M |
+| FR-4.10.4 | **通知欄へ出すのは安全弁による解除と、その回復だけ**（`lid_notice`）。エージェントが一段落した・AC を抜いたは設定どおりの動きなので出さない（作業のたびにバナーが出る）。`ac-only`（既定）の利用者には何も出さない | S |
+| FR-4.10.5 | CLI `tako sleep-guard set --lid-power-condition <ac-only\|always> --lid-battery-floor <percent>` / MCP `tako_sleep_guard`（同名の引数）/ 設定画面「スリープ防止」タブの 3 口が**同じ dispatch** を通る（設計原則 5）。MCP の enum は正本 `PowerCondition::VALUES` から生成する（#1467）。残量下限 0（= 安全弁なし）は 3 口とも理由つきで弾く | M |
+| FR-4.10.6 | 検証用の注入（`TAKO_1473_INJECT_BATTERY` / `TAKO_1473_INJECT_THERMAL`）は**隔離起動・セルフテストでのみ効く**（`inject_allowed`）。本番の GUI が env で `pmset` の判断を左右できてはいけない。旧挙動の A/B は `TAKO_1473_LEGACY=1`（材料を `ac-only` へ丸めるので判定の本体は 1 本のまま）。番犬は `crates/tako-control/tests/issue1473_lid_battery_watchdog.rs` | M |
+| FR-4.10.7 | Windows も同じ判定を通り、`always` のときだけ電源プランの**バッテリーレールも倒す**（`set_stay_awake(_, include_battery)`）。ただし残量の取得は未実装なので、実質はバッテリーでは安全弁（`battery-unknown`）で降りる。**実機未検証**（#467 の一部） | S |
+
 ## FR-5 セッション永続性（tmux バックエンド。Phase 5.5 で再設計・実装済み）
 
 > **長寿命のエージェントセッションをアプリの生死から切り離す**。全ペインの PTY を

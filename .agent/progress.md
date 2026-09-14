@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-14（#1450 B3: 人がやることをスマホから片付けられるようにした）
-- PWA `#/tasks`（一覧 + 詳細 + 添付の「端末に保存」+ copy_texts のワンタップコピー + 共有シート + 返答 / 完了 / 却下・ナビにバッジ）。daemon の受け口は `remote_tasks::TASK_ROUTES` の 4 本だけで、中身は B1 の `Request::UserTask` を**素通し**（一覧 Observe / 操作 Interact・**表に無い `/api/tasks…` は Manage の床**）。語彙と状態表示は B2 と同一（`sent` を「届いた」と書かない）
-- **添付の配信経路は 1 本も足していない**: daemon が絶対パスを `shortcut_target` で `{root, path_rel}` へ解決し、PWA は既存の `/api/files/download` を叩く = 認可は `resolve_in_root` の 1 実装のまま（manage は `fs`・interact はツリー配下だけ・落とせない添付は理由 + #1452 の導線）。ポーリングは `usePolling` の 1 実装（cleanup + visibility。画面とバッジで共有）
-- **実測で実バグ 2 件**: ①`value["tasks"]` の読みが serde_json の IndexMut で `null` を書き込み、単体応答に一覧のキーが生えていた ②ルートは canonicalize 済みなのに添付は素の綴りなので `/tmp/…` が解決できなかった（`resolve_target` で実体の綴りを引き直す）。実経路 `scripts/test-remote-tasks-1450b3.sh` **68 PASS 0 FAIL**（300 MB の添付を実転送・chunked を実測）・e2e 93 passed（新 11 本）・番犬 10 本（注入 8 通りで file:line 名指し）・workspace 4864 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。**install 不要 / 本番 daemon 再起動要**
-
 ## 2026-09-14（#1459: 右パネルの手書きテキスト入力 2 本を TextField へ寄せた）
 - git のコミット欄とブランチ名欄が持っていた同型の編集実装（`floor_char_boundary` で丸めてから backspace / delete / 左右 / Home / End / 挿入）を `TextField` の 1 実装へ。状態も `String` + カーソルから `TextField` 1 つへ畳んだ（`GitBranchInput.start_point` は不変）。割り当て（`⌘Enter` / `Esc` / `⌘V` / 1 行欄の上下→端）は各画面に残す
 - **丸めは `text_field.rs` の非公開関数へ移した**ので、他ファイルが同じことをするには自前で書き直すしかない（= 番犬のマークに必ず掛かる）。B2 番犬の猶予表は空になり、走査は `tasks_panel.rs` + `right_panel.rs` の全面適用 + 「打鍵ハンドラが `handle_edit_key` を通す」の正検査つき
@@ -54,3 +49,8 @@
 - #1450 B2 の「プレビューで開く」は**300px の帯の 10px ボタン**で、ユーザーには「押しても中身が見られない」に見えていた（Issue の前提「PC はパスの表示だけ」は不正確で、実測では `Request::OpenFile` 自体は png→image / mp4→video / md→markdown で正常動作）。**行そのもの**を押せるようにし、左に「画像 / 動画 / PDF …」の種別・ホバーで「プレビューで開く」を出す。**新しいビューアも拡張子の表も作らない**（`open_plan::preview_route` + `Request::OpenFile` = `tako open` / `tako_open_file` と同じ 1 経路）
 - 画像添付にサムネイル。**縮小後だけを持ち**（320x180 枠）、上限はファイル 32 MB とヘッダの画素 64M の 2 段で**画素は decode の前**に見る（解凍爆弾）。読むのは背景スレッド・持つのは開いている 1 件ぶんだけ（`retain` で溜まらない）。動画のサムネは作らない（ffmpeg 依存を一覧の描画に混ぜない）
 - 実測: visual-test 項目 151 新設（`TAKO_VISUAL_ONLY=task-attachment`）で**合成マウス**が実フレームの hitbox を押し、image / video が開く・2 回押してもペインが増えない・消えた添付は押せないを確認（ハンドラ直呼びの項目 150 では #496 型を検出できない）。注入 A/B は行の `on_click` を切ると項目 151 が `[]` で FAILED。番犬 `issue1472a_attachment_open_watchdog`（3 本・注入 9 通り）。**install 要**
+
+## 2026-09-14（#1473: 蓋閉じ継続をバッテリー駆動でも opt-in で続けられるようにした）
+- 蓋閉じ継続の電源条件を**アイドルスリープ側とは別の軸**（`lid_sleep_power`・既定 `ac-only` = 現状維持）にし、`always` のときだけバッテリーでも続ける。安全弁は 4 つ（エージェント稼働中のみ / 残量が下限（既定 20%・5〜90%）に**達したら**解除 / 温度は**バッテリーなら fair 以上・AC なら serious 以上**で解除 / 残量を読めない機械では継続しない）。Windows は同じ判定を通り `always` のときだけ電源プランのバッテリーレールも倒す（残量取得は未実装 = 実質 AC のみ・実機未検証）
+- 判定は `lid_decision(&LidGuardInput) -> Result<(), LidSkipReason>` の 1 本で、真偽値ではなく**理由**を返す。理由は状態が運ぶ（`update` / `status` が `with_decision()` で埋める）ので、CLI・設定画面・通知欄・persist.log は**読むだけ**（読む側が再計算すると A/B や stale binary で判断が割れる = #372 と同じ理屈）。通知欄へ出すのは安全弁の解除と回復だけ
+- 実測（隔離 GUI / tako-vd。実機はバッテリー 52% 駆動）: `always` + 下限 10% + エージェント 1 体で実機の `SleepDisabled=Yes` を 8 サンプル観測（persist.log に `lid-sleep: … reason=applied battery=15%`）・注入 15% では倒さず理由 `battery-floor`・MCP で書いた値を CLI が読む・範囲外（0 / 95）は両口とも拒否・A/B `TAKO_1473_LEGACY=1` は `always` でも「AC 未接続」で降りる。**検証後に `SleepDisabled=No`（検証前と同値）へ戻したことを確認**。workspace 4937 passed 0 failed・clippy 3 宇宙 0・check-windows error 0・docs 32 ページ・番犬 3 本（注入 9 通り + 実注入で `sleep_guard.rs:1162` を名指し）。**install 要 / 実機の蓋閉じは未検証**
