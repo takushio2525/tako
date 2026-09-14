@@ -473,6 +473,23 @@ pub fn tasks_attachment_missing() -> &'static str {
 pub fn tasks_open_preview() -> &'static str {
     tr!("プレビューで開く", "Open preview")
 }
+/// 添付が tako の中で**どのプレビューで開くか**（#1472）。
+/// 綴りの正本は `tako_core::open_plan::PreviewRoute::as_str`（画面は拡張子表を持たない）
+pub fn tasks_attachment_route(route: &str) -> String {
+    match route {
+        "image" => tr!("画像", "Image"),
+        "video" => tr!("動画", "Video"),
+        "pdf" => tr!("PDF", "PDF"),
+        "markdown" => tr!("Markdown", "Markdown"),
+        "code" => tr!("テキスト", "Text"),
+        other => other,
+    }
+    .to_string()
+}
+/// サムネイルを出さなかった理由（#1472）。**行は押せるまま**なので行き止まりにしない
+pub fn tasks_thumb_skipped() -> &'static str {
+    tr!("サムネイルなし", "No thumbnail")
+}
 pub fn tasks_copy_texts() -> &'static str {
     tr!("コピー用のテキスト", "Text to copy")
 }
@@ -677,6 +694,13 @@ mod tests {
                 tasks_attachments().to_string(),
                 tasks_attachment_missing().to_string(),
                 tasks_open_preview().to_string(),
+                // #1472: 添付の種別ラベルとサムネイルの但し書き
+                tasks_attachment_route("image"),
+                tasks_attachment_route("video"),
+                tasks_attachment_route("pdf"),
+                tasks_attachment_route("markdown"),
+                tasks_attachment_route("code"),
+                tasks_thumb_skipped().to_string(),
                 tasks_copy_texts().to_string(),
                 tasks_copy_button().to_string(),
                 tasks_copied("tags"),

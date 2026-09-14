@@ -2720,11 +2720,11 @@ impl TakoApp {
                     // セルフテスト（visual-test）が実マウスで押すための実矩形。
                     // 記録は上書きのみ（render 冒頭でクリアすると空を読む窓ができる。#315）
                     .child({
-                        let slot = self.git_click_probe_bounds.clone();
+                        let slot = self.panel_click_probe_bounds.clone();
                         gpui::canvas(
                             |_, _, _| (),
                             move |bounds, _, _, _| {
-                                slot.borrow_mut().insert("branch-input", bounds);
+                                slot.borrow_mut().insert("branch-input".to_string(), bounds);
                             },
                         )
                         // `absolute` だけでは CSS 同様「本来置かれる位置」= 直前の子の
@@ -3109,11 +3109,11 @@ impl TakoApp {
                             ),
                     )
                     .child({
-                        let slot = self.git_click_probe_bounds.clone();
+                        let slot = self.panel_click_probe_bounds.clone();
                         gpui::canvas(
                             |_, _, _| (),
                             move |bounds, _, _, _| {
-                                slot.borrow_mut().insert("toggle", bounds);
+                                slot.borrow_mut().insert("toggle".to_string(), bounds);
                             },
                         )
                         // `absolute` だけでは CSS 同様「本来置かれる位置」= 直前の子の
@@ -3163,7 +3163,7 @@ impl TakoApp {
                 .gap_1();
             // 既存のエージェント基盤と同じ 3 種（新しい系統は作らない）
             for (i, agent) in ["claude", "codex", "agy"].into_iter().enumerate() {
-                let slot = self.git_click_probe_bounds.clone();
+                let slot = self.panel_click_probe_bounds.clone();
                 row = row.child(
                     div()
                         .id(("git-conflict-agent", i))
@@ -3195,7 +3195,7 @@ impl TakoApp {
                             gpui::canvas(
                                 |_, _, _| (),
                                 move |bounds, _, _, _| {
-                                    slot.borrow_mut().insert(agent, bounds);
+                                    slot.borrow_mut().insert(agent.to_string(), bounds);
                                 },
                             )
                             // `absolute` だけでは直前の子の下へずれる（原点を明示する）
