@@ -87,6 +87,45 @@ pub fn preview_route(path: &Path) -> PreviewRoute {
     preview_route_for_extension(path.extension().and_then(|e| e.to_str()))
 }
 
+/// 拡張子から HTTP の `Content-Type` を決める（純粋関数。I/O をしない）。
+///
+/// **[`preview_route_for_extension`] と同じ表**（下のテストが「Image の拡張子は
+/// `image/` で始まる」等を機械で拘束する）。分けてあるのは粒度だけで、
+/// プレビューの振り分けは 5 種別・HTTP は `image/png` と `image/jpeg` を
+/// 区別する必要があるため。
+///
+/// 使い道は **daemon が添付をその場で見せるとき**（#1472）。`<img>` / `<video>` は
+/// `application/octet-stream` では鳴らない（とくに Safari は `<video>` の
+/// MIME を見る）ので、インライン配信ではここが返す型を載せる。
+/// 分からない拡張子は `None` = 呼び出し側が `application/octet-stream` へ倒す
+pub fn media_type_for_extension(ext: Option<&str>) -> Option<&'static str> {
+    let ext = ext?;
+    Some(match ext.to_ascii_lowercase().as_str() {
+        // 画像（`PreviewRoute::Image` と同じ集合）
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        // 動画（`PreviewRoute::Video` と同じ集合）
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        // QuickTime は `video/quicktime`。iOS / macOS の Safari はこれで鳴る
+        "mov" => "video/quicktime",
+        "avi" => "video/x-msvideo",
+        "mkv" => "video/x-matroska",
+        // 文書（`PreviewRoute::Pdf` / `Markdown`）
+        "pdf" => "application/pdf",
+        "md" | "markdown" => "text/markdown; charset=utf-8",
+        _ => return None,
+    })
+}
+
+/// パスの拡張子から HTTP の `Content-Type` を決める
+pub fn media_type(path: &Path) -> Option<&'static str> {
+    media_type_for_extension(path.extension().and_then(|e| e.to_str()))
+}
+
 /// パスを tako の中で開いたときの行き先。`is_dir` は呼び出し側が調べた実体の種別
 pub fn route(path: &Path, is_dir: bool) -> OpenRoute {
     if is_dir {
@@ -128,5 +167,51 @@ mod tests {
         );
         assert_eq!(OpenRoute::Terminal.as_str(), "terminal");
         assert_eq!(OpenRoute::Preview(PreviewRoute::Video).as_str(), "video");
+    }
+
+    /// 拡張子の一覧（2 つの表が同じ集合を見ていることを確かめる材料）
+    const KNOWN_EXTENSIONS: &[&str] = &[
+        "png", "jpg", "jpeg", "gif", "webp", "svg", "mp4", "webm", "mov", "avi", "mkv", "pdf",
+        "md", "markdown", "rs", "toml", "zip", "",
+    ];
+
+    /// #1472: **プレビューの振り分けと MIME の表がずれない**。
+    /// 片方だけ拡張子を足すと（例: `.heic` を Image に足して MIME を忘れる）ここで落ちる
+    #[test]
+    fn mimeとプレビュー種別が同じ表を見ている() {
+        for ext in KNOWN_EXTENSIONS {
+            let ext = if ext.is_empty() { None } else { Some(*ext) };
+            let route = preview_route_for_extension(ext);
+            let mime = media_type_for_extension(ext);
+            match route {
+                PreviewRoute::Image => {
+                    let m = mime.unwrap_or_else(|| panic!("{ext:?}: 画像なのに MIME が無い"));
+                    assert!(m.starts_with("image/"), "{ext:?}: 画像なのに {m}");
+                }
+                PreviewRoute::Video => {
+                    let m = mime.unwrap_or_else(|| panic!("{ext:?}: 動画なのに MIME が無い"));
+                    assert!(m.starts_with("video/"), "{ext:?}: 動画なのに {m}");
+                }
+                PreviewRoute::Pdf => assert_eq!(mime, Some("application/pdf"), "{ext:?}"),
+                PreviewRoute::Markdown => {
+                    let m = mime.unwrap_or_else(|| panic!("{ext:?}: md なのに MIME が無い"));
+                    assert!(m.starts_with("text/markdown"), "{ext:?}: md なのに {m}");
+                }
+                // 未知・コードは MIME を名乗らない（呼び出し側が octet-stream へ倒す）
+                PreviewRoute::Code => assert_eq!(mime, None, "{ext:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn mimeは大文字小文字と拡張子なしを吸収する() {
+        assert_eq!(media_type(Path::new("/a/x.PNG")), Some("image/png"));
+        assert_eq!(media_type(Path::new("/a/clip.MP4")), Some("video/mp4"));
+        assert_eq!(
+            media_type(Path::new("/a/clip.mov")),
+            Some("video/quicktime")
+        );
+        assert_eq!(media_type(Path::new("/a/Makefile")), None);
+        assert_eq!(media_type(Path::new("/a/main.rs")), None);
     }
 }

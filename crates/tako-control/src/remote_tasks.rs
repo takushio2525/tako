@@ -236,8 +236,12 @@ pub fn legacy_1450b3() -> bool {
 
 /// 添付 1 件に「どう開くか」を書き足す（**純粋関数**。ルートは引数で受ける）。
 ///
-/// 足すのは `name` / `size` / `root` / `path_rel` / `available` だけで、
-/// B1 が返した `path` / `exists` は 1 バイトも書き換えない
+/// 足すのは `name` / `size` / `preview` / `root` / `path_rel` / `available` だけで、
+/// B1 が返した `path` / `exists` は 1 バイトも書き換えない。
+///
+/// `preview`（#1472）は「画面が `<img>` で見せるか `<video>` で鳴らすか」で、
+/// 判定は **`tako_core::open_plan` の 1 実装**（cmd+クリック・`tako open` と同じ表）。
+/// PWA 側に拡張子の対応表を写さないため、ここで解いて渡す
 fn decorate_attachment(entry: &mut Value, roots: &[TreeRoot]) {
     let Some(path) = entry
         .get("path")
@@ -247,6 +251,7 @@ fn decorate_attachment(entry: &mut Value, roots: &[TreeRoot]) {
         return;
     };
     entry["name"] = json!(base_name(&path));
+    entry["preview"] = json!(preview_kind(&path));
     let exists = entry
         .get("exists")
         .and_then(Value::as_bool)
@@ -264,6 +269,19 @@ fn decorate_attachment(entry: &mut Value, roots: &[TreeRoot]) {
             entry["available"] = json!(true);
         }
         _ => entry["available"] = json!(false),
+    }
+}
+
+/// 添付をその場で見せる種別（#1472）。**画像と動画だけ**を名乗る。
+///
+/// 表は [`tako_core::open_plan::preview_route`]（cmd+クリック・`tako open` ・
+/// 右パネルの「プレビューで開く」と同じ 1 本）。PDF / markdown / コードは
+/// PWA 側にビューアが無いので `null` を返し、画面は従来どおり保存と共有だけを出す
+fn preview_kind(path: &str) -> Option<&'static str> {
+    match tako_core::open_plan::preview_route(std::path::Path::new(path)) {
+        tako_core::open_plan::PreviewRoute::Image => Some("image"),
+        tako_core::open_plan::PreviewRoute::Video => Some("video"),
+        _ => None,
     }
 }
 
@@ -611,6 +629,19 @@ mod tests {
         assert_eq!(task_id_of("/api/tasks/done", "done"), None);
     }
 
+    /// #1472: 種別は `open_plan` の表を通る（PWA に写しを作らない）
+    #[test]
+    fn 添付のプレビュー種別は画像と動画だけ() {
+        assert_eq!(preview_kind("/Users/testuser/out/v6.mp4"), Some("video"));
+        assert_eq!(preview_kind("/Users/testuser/out/CLIP.MOV"), Some("video"));
+        assert_eq!(preview_kind("/Users/testuser/out/thumb.PNG"), Some("image"));
+        assert_eq!(preview_kind("/Users/testuser/out/a.jpeg"), Some("image"));
+        // PWA にビューアが無いものは名乗らない（保存と共有だけを出す）
+        assert_eq!(preview_kind("/Users/testuser/out/report.pdf"), None);
+        assert_eq!(preview_kind("/Users/testuser/out/notes.md"), None);
+        assert_eq!(preview_kind("/Users/testuser/out/Makefile"), None);
+    }
+
     #[test]
     fn 添付は実在してルートに当たるときだけ開ける() {
         let dir = std::env::temp_dir().join(format!("tako-1450b3-{}", std::process::id()));
@@ -642,6 +673,8 @@ mod tests {
         assert_eq!(a[0]["path_rel"], "out/v6.mp4");
         assert_eq!(a[0]["name"], "v6.mp4");
         assert_eq!(a[0]["size"], 10);
+        // #1472: その場で見せる種別（表は `open_plan` の 1 本）
+        assert_eq!(a[0]["preview"], "video");
         assert_eq!(a[1]["available"], false, "消えた添付は開けると言わない");
         assert_eq!(
             a[1]["name"], "gone.mp4",

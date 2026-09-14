@@ -415,11 +415,22 @@ fn 添付の配信は認可1実装を通る() {
         );
     }
 
-    // (d) PWA が叩くダウンロードは**既存のファイル API**（新しい配信経路が生えていない）
+    // (d) PWA が叩くダウンロードは**既存のファイル API**（新しい配信経路が生えていない）。
+    // **コメントではなく本文**で見る（#1472 で URL の組み立てを `attachmentUrl` の
+    // 1 実装へ寄せたとき、解説コメントの綴りに当たって緑のままになりかけた）
     let pwa = read(PWA_REL);
-    assert!(
-        pwa.contains("/api/files/download?root="),
-        "{PWA_REL}: 添付のダウンロードが #1079 のファイル API を使っていない"
+    let built: Vec<String> = pwa
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.contains("/api/files/download") && !is_comment(l))
+        .map(|(i, l)| format!("{PWA_REL}:{}: {}", i + 1, l.trim()))
+        .collect();
+    assert_eq!(
+        built.len(),
+        1,
+        "{PWA_REL}: 添付のダウンロードを組む場所が {} か所（#1079 のファイル API 1 本のはず）:\n{}",
+        built.len(),
+        built.join("\n")
     );
     assert!(
         tako_control::remote_files::required_role_for_method("GET", "/api/files/download")

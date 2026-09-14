@@ -1515,6 +1515,7 @@ B2 の A/B は **`TAKO_1450B2_LEGACY=1`**（B1 の `TAKO_1450_LEGACY` とは別�
 | FR-2.40.18 | **添付のダウンロードは新しい配信経路を作らない**。daemon が添付の絶対パスを `remote_files::shortcut_target`（#1451 の 1 実装）で `{root, path_rel}` へ解決して返し、PWA は既存の `GET /api/files/download?root=…&path=…`（#1079。Interact）を叩く。したがって**認可は `resolve_in_root` の 1 実装のまま**で、解決できる範囲は role で決まる（manage = `fs` ルートでどこでも / interact = tako のツリーに出ているフォルダ配下だけ）。**タスク専用の root は作らない**: 添付のパスは AI が書く欄なので、それを根拠に配ると AI が弱い端末の読める範囲を広げられる（#1451 の判断と食い違う）。解決できない添付・消えた添付は**理由を出し**、権限が足りないだけなら #1452 の権限リクエストへ繋ぐ | M | ✅ |
 | FR-2.40.19 | **ワンタップのコピーと共有**。`copy_texts` は 1 件ずつ「コピー」でき（`navigator.clipboard` → 使えなければ `textarea` + `execCommand` のフォールバック。**成否を画面に出す**）、`navigator.share` がある端末では投稿文・リンクを共有シートへ渡せる。添付の共有シート（`navigator.canShare({files})`）は **64 MB 以下に限る**（`remote_tasks::SHARE_MAX_BYTES` と PWA の定数が一致していることを番犬が見る）: Blob を丸ごとメモリへ載せるので、数百 MB の動画はタブごと落ちる。大きい添付は「端末に保存 → ファイル / 写真アプリ → 投稿アプリで選ぶ」に倒す | M | ✅ |
 | FR-2.40.20 | **ポーリングは画面を離れると止まる**。周期は 5 秒の 1 定数で、`useEffect` の cleanup で `clearInterval`・裏へ回っているあいだ（`visibilityState === 'hidden'`）は撃たない。**画面とナビのバッジが同じ 1 実装**（`usePolling`）を使う（止め方が 2 か所に割れない）。ポーリングには意味があり、B1 が `list` のたびに配送を畳み込むので**見ているあいだに `sent` が `delivered` へ確定する**。A/B は `TAKO_1450B3_LEGACY=1`（daemon は `/api/tasks…` が 404）と `?tako_1450b3_legacy=1`（PWA は画面もバッジも出ない） | M | ✅ |
+| FR-2.40.21 | **添付をその場で見せるのに経路を増やさない**（#1472 B）。PWA の `#/tasks` の詳細で、画像は `<img>`・動画は `<video controls preload="metadata">` としてその場に出す（画像はタップで全画面）。`src` は **`GET /api/files/download` に `disposition=inline` を足しただけ**で、受け口も認可も FR-2.40.18 のまま（したがって**落とせない添付は見られない** = observe は 403・interact はツリー配下だけ）。daemon 側は同じ経路が ①`?disposition=inline` のとき `Content-Type` を実体の型にして `Content-Disposition: inline` を返す ②`Range: bytes=…` に **206 + `Content-Range`** で答える（`Accept-Ranges: bytes` は常時）の 2 つを増やしただけで、応答を組むのは `respond_file` の 1 実装のまま。**Range が要るのは飾りではない**: Safari の `<video>` は部分取得に 206 が返らないと再生に進まない。**画像 / 動画の判定と MIME の表は `tako_core::open_plan` の 1 本**（cmd+クリック・`tako open` と同じ表）で、daemon が `attachments[].preview` に載せて渡す = PWA に拡張子の表を作らない。**一覧では 1 バイトも取りに行かない**（描くのは詳細だけ・動画は `preload="metadata"`）ので、300 MB の添付が並んでいても一覧は軽い。PDF / Markdown など PWA にビューアが無い種別は `preview` を名乗らず従来どおり保存と共有だけ | M | ✅ |
 
 B3 の A/B は **`TAKO_1450B3_LEGACY=1`**（daemon が `/api/tasks…` を 404 にする）と
 **`?tako_1450b3_legacy=1`**（PWA が画面もバッジも出さない）。どちらも「スマホからは
@@ -1525,6 +1526,15 @@ B3 の A/B は **`TAKO_1450B3_LEGACY=1`**（daemon が `/api/tasks…` を 404 �
 （隔離した実 daemon + 実 tako-app で role ごとの 200 / 403・添付の解決範囲・
 **数百 MB の添付の実転送**・返答と配送・完了までを通す）と
 e2e `web/tako-remote/e2e/tasks-1450b3.spec.js`（iPhone viewport の実 DOM・偽の木だけを見る）。
+
+#1472 B（その場プレビュー）の番犬は `issue1472_attachment_preview_watchdog.rs`
+（添付の URL を組む場所が 1 か所 / `FILE_ROUTES` の外に配信の受け口が生えない /
+`Range` を読むのが 1 実装 / MIME の表が `open_plan` の外へ写らない /
+画像・動画の判定を PWA がやり直さない / 一覧が添付に触らない。**注入 8 通りで `file:line` 名指し**）。
+実測は `scripts/test-remote-attachment-preview-1472.sh`（隔離した実 daemon で
+206 + `Content-Range`・末尾チャンクの中身・416・150 MB の部分取得での常駐量・
+role ごとの 200 / 403 を通す）と e2e `web/tako-remote/e2e/tasks-preview-1472.spec.js`
+（実 PNG / webm を配って `naturalWidth` と `readyState` まで見る）。
 
 
 ## FR-3 コンセプト②: 軽量 IDE 的ワークスペース

@@ -1604,6 +1604,31 @@ body {
 /* 開けない理由は必ず出す（押せないボタンを黙って並べない） */
 .task-attachment-why { color: var(--fg3); font-size: 12px; line-height: 1.5; }
 
+/* --- その場プレビュー（#1472）。詳細でだけ描かれる --- */
+/* 画像は「押せる」ので button で包む（見た目はボタンにしない） */
+.task-attachment-thumb {
+  display: block; padding: 0; border: 0; background: none; cursor: zoom-in;
+  border-radius: var(--radius-xs); overflow: hidden; line-height: 0;
+}
+/* 縦長の画像でも詳細が縦に伸びきらないよう頭を止める */
+.task-attachment-image,
+.task-attachment-video {
+  display: block; width: 100%; max-height: 46vh; object-fit: contain;
+  background: var(--bg); border-radius: var(--radius-xs);
+}
+.task-attachment-video { max-height: 52vh; }
+
+.task-image-zoom {
+  position: fixed; inset: 0; z-index: 60; display: flex;
+  align-items: center; justify-content: center; padding: 12px;
+  background: rgba(0, 0, 0, .92); cursor: zoom-out;
+}
+.task-image-zoom-img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.task-image-zoom-close {
+  position: absolute; top: calc(env(safe-area-inset-top, 0px) + 12px); right: 12px;
+  min-height: 44px;
+}
+
 .task-copy {
   display: flex; flex-direction: column; gap: 6px; padding: 10px;
   background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-xs);
