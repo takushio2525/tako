@@ -80,19 +80,23 @@ fn remoteのtopicが引ける() {
             guide::topics().join(" / ")
         )
     });
-    assert!(!g.body.trim().is_empty(), "`{TOPIC}` の本文が空");
+    let body = g.static_body().expect("remote は静的な手順書");
+    assert!(!body.trim().is_empty(), "`{TOPIC}` の本文が空");
     // 表記ゆれ（大文字・アンダースコア）でも同じ topic へ届く
     assert_eq!(guide::find("Remote").map(|g| g.topic), Some(TOPIC));
     // CLI（tako orchestrator guide）と MCP（tako_orchestrator_guide）は
     // dispatch でこの 1 本を共有するので、ここが本文の正
     let out = guide::json(Some(TOPIC), "default").expect("remote の全文");
     assert_eq!(out["topic"], TOPIC);
-    assert_eq!(out["text"].as_str().unwrap_or_default(), g.body);
+    assert_eq!(out["text"].as_str().unwrap_or_default(), body);
 }
 
 #[test]
 fn remoteの本文がissue1004の4項目に答えている() {
-    let body = guide::find(TOPIC).expect("remote の手順書").body;
+    let body = guide::find(TOPIC)
+        .expect("remote の手順書")
+        .static_body()
+        .expect("静的な手順書");
     // Issue #1004「明文化する内容」の 4 項目 + #1006 の開き先。
     // 実装が変わって語が変わったら**本文を実装へ合わせる**（ここを緩めない）
     let required: &[(&str, &[&str])] = &[
@@ -191,7 +195,10 @@ fn トリガーは手順を抱えず予算に収まっている() {
     // 2) 手順の本文が prompt へインラインで戻っていない
     //    （`restores` が空の topic は tests/prompt_guides.rs の同型検査の対象外なので、
     //     ここで見る。「prompt に無いから足す」で量が戻るのを止める）
-    let body = guide::find(TOPIC).expect("remote の手順書").body;
+    let body = guide::find(TOPIC)
+        .expect("remote の手順書")
+        .static_body()
+        .expect("静的な手順書");
     let prompts = [
         ("master", built(DEFAULT_SYSTEM_PROMPT, PromptMode::Master)),
         ("solo", built(SOLO_SYSTEM_PROMPT, PromptMode::Solo)),
@@ -244,7 +251,10 @@ fn 本文から要件が落ちたら名指しする() {
         "要件の欠落を検出できていない: {missing:?}"
     );
     // 実物は 1 件も落ちない（= 常に落ちる番犬ではない）
-    let real = guide::find(TOPIC).expect("remote の手順書").body;
+    let real = guide::find(TOPIC)
+        .expect("remote の手順書")
+        .static_body()
+        .expect("静的な手順書");
     assert!(
         ["tako_run_interactive", "ControlMaster", "action: \"auto\""]
             .into_iter()

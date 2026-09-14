@@ -19,6 +19,21 @@ fn enum_schema(values: &[&str], description: &str) -> Value {
     json!({ "type": "string", "enum": values, "description": description })
 }
 
+/// master の手順書の topic 引数（正本 = [`crate::orchestrator::guide::GUIDES`]。#1467 / #1477）。
+///
+/// **`enum` にはしない**: 引く側は `quality_ops` のような表記ゆれも通る
+/// （`guide::find` が正規化する）ので、`enum` で縛ると受理できる値より狭い申告になる。
+/// 代わりに**案内文を正本から生成**して、topic を足したときの取り残しを無くす
+fn guide_topic_schema() -> Value {
+    json!({
+        "type": "string",
+        "description": format!(
+            "引く topic（省略時は一覧。{}）",
+            crate::orchestrator::guide::topics().join(" / ")
+        ),
+    })
+}
+
 /// スリープ防止の電源条件（正本 = [`crate::sleep_guard::PowerCondition`]。#1467 / #1473）
 fn power_condition_schema(what: &str) -> Value {
     enum_schema(
@@ -1616,16 +1631,18 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_orchestrator_guide",
-            "description": "master の手順書を引く（#1154）。system prompt には「いつ引くか」だけを置き、\
+            "description": "master の手順書を引く（#1154 / #1477）。system prompt には「いつ引くか」だけを置き、\
                 手順の全文（monitoring のイベント別対処表・acceptance の手順・worker prompt テンプレート・\
                 引き継ぎの書き方など）はここから取得する。長寿命セッションの起動時固定費を\
                 減らすための仕組みで、返る本文は prompt から移した原文そのまま。\
                 topic を省略すると引ける topic をサイズ付きで一覧する。\
-                `{CTX_THRESHOLD}` などのプレースホルダは prompt と同じ解決を通してから返る",
+                `{CTX_THRESHOLD}` などのプレースホルダは prompt と同じ解決を通してから返る。\
+                delegation（委任の判断材料）と local-rules（この環境の追記の on-demand 部）は\
+                プロファイルと利用者のファイルから組み立てるので、profile によって中身が変わる",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "topic": { "type": "string", "description": "引く topic（省略時は一覧。context-budget / task-intake / worker-prompt / spawning / monitoring / acceptance / lifecycle / handoff / remote / user-tasks / tools / quality-ops / behavior）" },
+                    "topic": guide_topic_schema(),
                     "profile": { "type": "string", "description": "プレースホルダを解決するプロファイル（省略時は呼び出し元の role とペインの役割ラベルから解決）" },
                     "pane": pane_schema("プロファイル解決に使うペイン ID（省略時は呼び出し元。#1453 の adopt 後はこのペインの採用先で解決される）"),
                 },

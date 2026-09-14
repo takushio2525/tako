@@ -879,6 +879,29 @@ default system prompt の「品質パイプライン」として手順・型に�
 prompt_blocks への移行を案内する）。worker 側の品質ゲートは setup が配る
 CLAUDE.md セクションテンプレート `06-completion-verification` が対になる。
 
+## 個人環境のルール（prompt_blocks.append）と自動分割（#1477）
+
+プロファイルの `prompt_blocks.append` は「この環境固有のルール」を system prompt の末尾へ足す口で、
+値が `~/` で始まればファイルとして読まれる（既定の置き場は
+`<data_dir>/orchestrator/local-rules.md`）。
+
+system prompt の予算 24 KB のうち **tako が作る部分は 18.5 KB 以内**に抑えてあり、
+残り **5.5 KB** がこの追記の取り分。これを超える追記は `tako migrate run`
+（= `tako setup` と GUI / master / CLI の起動時に自動で当たる）が**見出し境界へ
+`<!-- tako:on-demand -->` を 1 行入れて**常時部と on-demand 部に分ける。
+
+- **常時部**（区切りの手前）= 毎ターン prompt に載る
+- **on-demand 部**（区切りの後ろ）= `tako orchestrator guide local-rules` /
+  MCP `tako_orchestrator_guide({ topic: "local-rules" })` で引く。prompt には
+  見出しを並べた**索引 1 行だけ**が自動生成で載る（索引はファイルへ書かない）
+- **内容は 1 文字も消えない**（増えるのはマーカー行 1 本だけ・旧ファイルは `.pre-v1.bak`）。
+  自分で区切りを置けばそこが優先され、移行は二度と触らない
+- 分割しても常時部が予算を超えるときは `tako context-budget check` が
+  「区切りを何行上へ動かすか」を具体値で返す
+
+委任の判断材料（プロファイルの `delegate_guidance` と ledger 由来の既定）も同じ理由で
+prompt から外れ、`tako orchestrator guide delegation` で引く形になっている。
+
 ## system prompt のカスタマイズ
 
 デフォルトの system prompt はバイナリに埋め込まれている。カスタマイズしたい場合は:

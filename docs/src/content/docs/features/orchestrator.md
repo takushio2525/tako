@@ -138,10 +138,33 @@ master が裏でやっていることを少しだけ紹介します。すべて�
 | `accounts.yaml` | worker ごとに使い分けるアカウントの登録（`tako orchestrator accounts`） |
 | `workers.yaml` | spawn 済み worker のレジストリ（ペインが消えても追跡できる） |
 | `config.yaml` | セットアップ状態と挙動フラグ（auto_close / auto_push） |
+| `local-rules.md` | （置いた場合のみ）この環境固有のルール。プロファイルの `prompt_blocks.append` から読まれ、master の指示書の末尾に足されます |
 | `master-system.md` | （置いた場合のみ）master の system prompt を差し替えるカスタムファイル |
 | `conflict-resolver.md` | （置いた場合のみ）git コンフリクト解消エージェントへ渡す文面 |
 
 worker のモデルはプロファイルの `worker_model_policy` で決まります: `inherit`（master と同じ・既定）/ `fixed`（別の固定モデル）/ `delegate`（master がタスク内容を見て判断）。master / worker のエージェント CLI は `master_agent`（claude / codex）・`worker_agent`（claude / codex / agy）で選べます。master が claude 以外のときは、プロファイルの `model` / `effort` は claude worker へ継承されません。worker は spawn のたびに `--agent` で上書きできるので、プロファイルの指定は「既定」であって「固定」ではありません。系統ごとの入れ方・つなぎ方と Claude Code との差分は [エージェントの選び方](/agents/) にまとめています。
+
+### この環境だけのルールを足す
+
+「このマシンではこう動いてほしい」というルールは、プロファイルに 2 行足すだけで master の指示書へ
+反映されます。
+
+```yaml
+prompt_blocks:
+  append: ~/Library/Application Support/tako/orchestrator/local-rules.md
+```
+
+**長くなっても気にしなくて構いません。** 指示書には「毎ターン読み込める量」の上限があり、
+書いたルールがそれを超えると、tako が自動で**いつも要る部分**と**必要なときだけ読む部分**に
+分けます（`## 見出し` の切れ目で分け、`<!-- tako:on-demand -->` という 1 行を挟むだけ）。
+
+- 分けたあとも**内容は 1 文字も消えません**。元のファイルは `local-rules.md.pre-v1.bak` に残ります
+- 後半は master が必要になったときだけ読みます（前半には「こういう見出しが後ろにあります」という
+  1 行が自動で入ります）
+- 自分で区切りたい位置がある場合は、その場所に `<!-- tako:on-demand -->` を書いておけば、
+  tako はそれを尊重してもう触りません
+- 分け方は `tako setup` や tako の起動時に自動で当たります。今すぐ反映したいときは
+  `tako migrate run`
 
 CLI から手動で操作したい場合は [CLI リファレンス](/guides/cli-reference/#オーケストレーター)を参照してください。master が内部で使っているのと同じ操作を、スクリプトからも実行できます。
 

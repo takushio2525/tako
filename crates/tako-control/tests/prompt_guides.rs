@@ -24,7 +24,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use tako_control::orchestrator::guide::{self, GUIDES};
+use tako_control::orchestrator::guide::{self, Guide, GUIDES};
 use tako_control::orchestrator::DEFAULT_SYSTEM_PROMPT;
 
 fn repo_root() -> PathBuf {
@@ -92,8 +92,8 @@ fn merge(into: &mut BTreeMap<String, usize>, from: &BTreeMap<String, usize>) {
 /// テンプレート + 全 topic の本文（master が到達できる本文の全体）
 fn corpus_bag() -> BTreeMap<String, usize> {
     let mut all = bag(DEFAULT_SYSTEM_PROMPT);
-    for g in GUIDES {
-        merge(&mut all, &bag(g.body));
+    for body in GUIDES.iter().filter_map(Guide::static_body) {
+        merge(&mut all, &bag(body));
     }
     all
 }
@@ -169,7 +169,12 @@ fn 移した本文は1文字も失われていない() {
 fn 手順書は原文以外の行を含まない() {
     // 手順書は「移した原文そのまま」でなければならない（要約すると意味が変わる）。
     // 新しく書いてよいのはテンプレート側の案内文だけ
-    let bodies: Vec<(&str, &str)> = GUIDES.iter().map(|g| (g.topic, g.body)).collect();
+    // #1477 の動的 guide（delegation / local-rules）は**利用者の設定から組み立てる**
+    // ので、移送前の原文と突き合わせる対象ではない（本文が tako のリポジトリに無い）
+    let bodies: Vec<(&str, &str)> = GUIDES
+        .iter()
+        .filter_map(|g| g.static_body().map(|b| (g.topic, b)))
+        .collect();
     let invented = invented_lines(&bodies, &bag(&before()));
     assert!(
         invented.is_empty(),
@@ -194,7 +199,9 @@ fn ブロックの本文は申告した行き先にしか無い() {
             .iter()
             .filter(|g| g.restores.contains(&name.as_str()))
         {
-            merge(&mut dest, &bag(g.body));
+            if let Some(body) = g.static_body() {
+                merge(&mut dest, &bag(body));
+            }
         }
         for (line, want) in bag(&body) {
             if dest.get(&line).copied().unwrap_or(0) < want {
@@ -315,7 +322,8 @@ fn 行を1本落としたら欠落として名指しする() {
     let before = before();
     let victim = guide::find("monitoring")
         .expect("monitoring の手順書")
-        .body
+        .static_body()
+        .expect("静的な手順書")
         .lines()
         .map(str::trim)
         .find(|l| l.starts_with("- `api_error`"))
@@ -346,7 +354,7 @@ fn 手順書に要約を混ぜたら創作として名指しする() {
     );
     assert_eq!(invented.len(), 1, "創作した行を名指しする: {invented:?}");
     // 原文そのままの行は創作扱いしない
-    let real = guide::find("acceptance").unwrap().body;
+    let real = guide::find("acceptance").unwrap().static_body().unwrap();
     assert!(invented_lines(&[("acceptance", real)], &before_bag).is_empty());
 }
 
@@ -384,7 +392,10 @@ fn 既定のpromptに手順の全文が載っていない() {
     let mut inlined: Vec<String> = Vec::new();
     for g in GUIDES.iter().filter(|g| !g.restores.is_empty()) {
         // その topic の本文のうち、案内文に出てこない実体行を代表として選ぶ
-        let sample = lines_of(g.body)
+        let Some(body) = g.static_body() else {
+            continue;
+        };
+        let sample = lines_of(body)
             .into_iter()
             .filter(|l| l.len() > 60 && !l.starts_with('#') && !l.starts_with('|'))
             .max_by_key(|l| l.len())

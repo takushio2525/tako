@@ -27,6 +27,9 @@ pub struct Item {
     /// 内訳（system prompt のときだけ入る。#1154）。
     /// **生成と同じ 1 実装**（`Profile::build_prompt_pieces`）から採るので数え直さない
     pub pieces: Vec<(String, usize)>,
+    /// 追記（`prompt_blocks.append`）の**常時部**と、区切りが既に在るか（#1477）。
+    /// 超過したときに「区切りを何行ぶん上げれば収まるか」を実測から答えるために持つ
+    pub append_always: Option<(String, bool)>,
 }
 
 /// ホームを `~` へ畳んだ表示用パス（個人情報を応答へ出さない。#927）。
@@ -156,6 +159,7 @@ fn walk_imports(start: &Path, out: &mut Vec<Item>, visited: &mut BTreeSet<PathBu
                 imported: true,
                 imported_by: Some(from.clone()),
                 pieces: Vec::new(),
+                append_always: None,
             });
             walk_imports(&p, out, visited);
         }
@@ -188,6 +192,7 @@ pub fn inventory(cwd: &Path, profile: Option<&str>) -> Vec<Item> {
                 imported: false,
                 imported_by: None,
                 pieces: Vec::new(),
+                append_always: None,
             });
             walk_imports(&g, &mut items, &mut visited);
         }
@@ -211,6 +216,7 @@ pub fn inventory(cwd: &Path, profile: Option<&str>) -> Vec<Item> {
             imported: false,
             imported_by: None,
             pieces: Vec::new(),
+            append_always: None,
         });
         walk_imports(&p, &mut items, &mut visited);
     }
@@ -226,6 +232,7 @@ pub fn inventory(cwd: &Path, profile: Option<&str>) -> Vec<Item> {
                 imported: false,
                 imported_by: None,
                 pieces: Vec::new(),
+                append_always: None,
             });
         }
     }
@@ -256,6 +263,14 @@ pub fn inventory(cwd: &Path, profile: Option<&str>) -> Vec<Item> {
                 .iter()
                 .map(|piece| (piece.name.clone(), piece.bytes()))
                 .collect(),
+            // #1477: 区切りより手前（= 実際に prompt へ載っている追記）
+            append_always: p
+                .prompt_append_text()
+                .map(|raw| {
+                    let part = tako_core::prompt_append::split(&raw);
+                    (part.always.to_string(), part.marked)
+                })
+                .filter(|(a, _)| !a.trim().is_empty()),
         });
     }
 
@@ -270,6 +285,7 @@ pub fn inventory(cwd: &Path, profile: Option<&str>) -> Vec<Item> {
                 imported: false,
                 imported_by: None,
                 pieces: Vec::new(),
+                append_always: None,
             });
         }
     }
@@ -303,7 +319,7 @@ fn item_json(it: &Item) -> Value {
         o["over_long_entries"] = json!(m.over_long_entries.unwrap_or(0));
     }
     if !vs.is_empty() {
-        o["violations"] = json!(vs.iter().map(violation_json).collect::<Vec<_>>());
+        o["violations"] = json!(vs.iter().map(|v| violation_json(it, v)).collect::<Vec<_>>());
     }
     o
 }
@@ -319,8 +335,8 @@ fn pieces_json(pieces: &[(String, usize)]) -> Vec<Value> {
         .collect()
 }
 
-fn violation_json(v: &budget::Violation) -> Value {
-    json!({
+fn violation_json(it: &Item, v: &budget::Violation) -> Value {
+    let mut o = json!({
         "metric": v.metric.as_str(),
         "actual": v.actual,
         "limit": v.limit,
@@ -330,7 +346,39 @@ fn violation_json(v: &budget::Violation) -> Value {
         "note": v.note.text(),
         "note_ja": v.note.ja(),
         "note_en": v.note.en(),
-    })
+    });
+    if let Some(a) = split_advice_for(it, v) {
+        // #1477: 「大きい」だけでなく**何行動かせば収まるか**を実測から返す
+        o["advice"] = json!(if tako_core::i18n::lang() == tako_core::i18n::Lang::Ja {
+            &a.ja
+        } else {
+            &a.en
+        });
+        o["advice_ja"] = json!(a.ja);
+        o["advice_en"] = json!(a.en);
+        o["move_lines"] = json!(a.move_lines);
+        o["marker"] = json!(tako_core::prompt_append::MARKER);
+    }
+    o
+}
+
+/// 分割しても常時部が予算を超えるときの具体値（#1477）。
+///
+/// 追記を持たない（= 超過が tako 自身の生成物だけで起きている）プロファイルでは
+/// `None`。そちらは利用者が直せるものではないので、既定の理由文だけを返す
+fn split_advice_for(
+    it: &Item,
+    v: &budget::Violation,
+) -> Option<tako_core::prompt_append::SplitAdvice> {
+    if it.kind != ItemKind::SystemPrompt || v.metric != budget::Metric::Bytes {
+        return None;
+    }
+    let (always, marked) = it.append_always.as_ref()?;
+    Some(tako_core::prompt_append::split_advice(
+        v.actual.saturating_sub(v.limit),
+        always,
+        *marked,
+    ))
 }
 
 /// 状態の棚卸し（何も書き換えない）
@@ -370,6 +418,13 @@ pub fn report(cwd: &Path, profile: Option<&str>) -> Result<Value, String> {
                     // （「大きい」だけ言われても何を分ければいいか分からない）
                     if !it.pieces.is_empty() {
                         prop["pieces"] = json!(pieces_json(&it.pieces));
+                    }
+                    // #1477: 追記があるなら「区切りを何行上げれば収まるか」まで出す
+                    if let Some(a) = split_advice_for(it, &v) {
+                        prop["advice"] = json!(a.ja);
+                        prop["advice_ja"] = json!(a.ja);
+                        prop["advice_en"] = json!(a.en);
+                        prop["move_lines"] = json!(a.move_lines);
                     }
                     proposals.push(prop);
                 }
@@ -424,7 +479,13 @@ pub fn budget_json() -> Value {
         "active_context": { "max_lines": budget::ACTIVE_CONTEXT_MAX_LINES },
         "handoff_memo": { "max_lines": budget::HANDOFF_MEMO_MAX_LINES },
         "global_guide": { "max_bytes": budget::GLOBAL_GUIDE_MAX_BYTES },
-        "system_prompt": { "max_bytes": budget::SYSTEM_PROMPT_MAX_BYTES },
+        "system_prompt": {
+            "max_bytes": budget::SYSTEM_PROMPT_MAX_BYTES,
+            // #1477: tako 自身の取り分と、利用者の追記へ明け渡した残り
+            "base_max_bytes": budget::SYSTEM_PROMPT_BASE_MAX_BYTES,
+            "append_max_bytes": budget::PROMPT_APPEND_MAX_BYTES,
+            "append_marker": tako_core::prompt_append::MARKER,
+        },
     })
 }
 

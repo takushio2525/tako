@@ -39,6 +39,10 @@
 - 引き継ぎの運用メモは 80 行以内 / グローバル指示ファイルは 24 KB 以内
 - master / solo の **system prompt は 24 KB 以内**。手順の詳細は
   `tako orchestrator guide <topic>` で必要なときだけ引く形にし、prompt には「いつ引くか」を残す
+- そのうち **tako が作る部分は 18.5 KB 以内**で、残り **5.5 KB** は
+  プロファイルの `prompt_blocks.append`（個人環境のルール）の取り分。追記がこれを超えると
+  `tako migrate` が見出し境界へ `<!-- tako:on-demand -->` を入れ、その行より後ろは
+  `tako orchestrator guide local-rules` で引く形になる（**内容は 1 文字も消さない**）
 
 ### 機械強制
 

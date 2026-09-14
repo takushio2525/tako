@@ -51,3 +51,11 @@ agent when the profile's Available Worker Agents section (below) lists it or the
 user asks for it. `model` / `effort` are interpreted in that agent's native
 vocabulary. codex / agy workers are monitored by screen heuristics (no
 `claude agents` signal), so allow extra time before judging them idle.
+
+## Scout Workers: Reconnaissance Before a Real Task
+
+- If you need reconnaissance before a real task, spawn a **scout worker**:
+  1. Spawn a child with instructions to investigate only (no code changes) and
+     output a summary
+  2. Read the summary from the pane output, then kill the scout
+  3. Use the summary to write a focused prompt for the implementation worker

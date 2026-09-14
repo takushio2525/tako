@@ -31,6 +31,18 @@ pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("default_system_prompt.md")
 /// バイナリ埋め込みの solo system prompt
 pub const SOLO_SYSTEM_PROMPT: &str = include_str!("solo_system_prompt.md");
 
+/// 委任の判断材料を引く条件（Issue #1477）。
+///
+/// 移送前はここに `ledger::build_judgment_section()` の全文（組み込み既定 +
+/// 利用者の `judgment-local.md` + 調査頻度の制御 = 実測 2.5 KB）と、Delegate
+/// プロファイルの `delegate_guidance`（実測 1.8〜2.0 KB）が inline で載っていた。
+/// **prompt に残すのは「いつ引くか」だけ**（#1154 の作法）
+const DELEGATION_TRIGGER: &str = "\n\n### Delegation Judgment Criteria\n\n\
+     Guide `delegation` carries this profile's delegation guidance and the model / effort\n\
+     defaults per task type, distilled from real delivery outcomes. **Fetch it before the\n\
+     first spawn of the session**, and again before you override `model` / `effort` — these\n\
+     are calibrated from what actually shipped, so guessing them costs rework.\n";
+
 /// solo のデフォルト effort。master の "max" より低くしてエコ運用を既定にする
 pub const SOLO_DEFAULT_EFFORT: &str = "high";
 
@@ -1676,7 +1688,11 @@ impl Profile {
             // #1154 の A/B: 立てると手順書の本文を prompt へ差し戻す（変更前の量へ戻る）
             if mode == PromptMode::Master && guide::legacy_restore() {
                 for g in guide::restored_at_block(name) {
-                    push(format!("guide:{}", g.topic), format!("\n{}\n", g.body));
+                    // 差し戻しに参加するのは静的な本文だけ（動的 guide は
+                    // 生成と同じ 1 実装の側で戻す。#1477）
+                    if let Some(body) = g.static_body() {
+                        push(format!("guide:{}", g.topic), format!("\n{body}\n"));
+                    }
                 }
             }
         }
@@ -1692,11 +1708,28 @@ impl Profile {
             );
         }
 
+        // #1477: 追記（個人環境のルール）は区切り `<!-- tako:on-demand -->` の
+        // **手前だけ**を載せ、後ろは索引 1 行に畳んで guide `local-rules` で引く。
+        // 予算に収まらない追記へ区切りを入れるのは `migrations` の自動移行
         if let Some(text) = pb.and_then(|b| b.append.as_ref()) {
-            push(
-                piece_name("append", text),
-                format!("{}\n", resolve_text_or_file(text)),
-            );
+            let resolved = resolve_text_or_file(text);
+            let part = if guide::legacy_1477() {
+                // A/B: 分割前 = 全文を prompt へ載せる
+                tako_core::prompt_append::Split {
+                    always: resolved.as_str(),
+                    on_demand: "",
+                    marked: false,
+                }
+            } else {
+                tako_core::prompt_append::split(&resolved)
+            };
+            if !part.always.trim().is_empty() {
+                push(piece_name("append", text), format!("{}\n", part.always));
+            }
+            let index = tako_core::prompt_append::index_text(part.on_demand);
+            if !index.is_empty() {
+                push(piece_name("append index", text), index);
+            }
         }
 
         out
@@ -1788,8 +1821,40 @@ impl Profile {
     fn generate_model_policy_section(&self) -> String {
         let base = self.generate_model_policy_base();
         let agents = self.generate_worker_agents_section();
-        let judgment = ledger::build_judgment_section();
+        // #1477: 委任の判断材料（プロファイルの delegate_guidance + ledger 由来の
+        // 既定 = 合わせて 2.5〜4.4 KB）は起動時の固定費から外し、guide `delegation`
+        // で引く。**差し戻しは組み立てと同じこの 1 実装で行う**（guide 側の
+        // `restores` から戻すと順序が変わり「移送前の prompt」にならない）
+        let judgment = if guide::legacy_1477() {
+            ledger::build_judgment_section()
+        } else {
+            DELEGATION_TRIGGER.to_string()
+        };
         format!("{base}{agents}{judgment}")
+    }
+
+    /// `TAKO_1477_LEGACY=1` の差し戻し: Delegate の委任方針を model-policy へ戻す
+    fn legacy_delegate_guidance_inline(&self) -> String {
+        let guidance = self
+            .delegate_guidance_text()
+            .unwrap_or_else(|| "タスクの複雑さに応じて判断してください。".to_string());
+        format!("\n\n### Delegation Guidance\n\n{guidance}")
+    }
+
+    /// `delegate_guidance` の本文（`~/` で始まるならファイルとして読む）
+    pub(crate) fn delegate_guidance_text(&self) -> Option<String> {
+        self.delegate_guidance
+            .as_ref()
+            .map(|g| resolve_text_or_file(g))
+    }
+
+    /// `prompt_blocks.append` の本文（`~/` で始まるならファイルとして読む）。#1477
+    pub fn prompt_append_text(&self) -> Option<String> {
+        self.prompt_blocks
+            .as_ref()?
+            .append
+            .as_ref()
+            .map(|t| resolve_text_or_file(t))
     }
 
     fn generate_model_policy_base(&self) -> String {
@@ -1819,12 +1884,14 @@ impl Profile {
                     self.resolve_worker_effort()
                 )
             }
+            // #1477: プロファイルの `delegate_guidance`（実測で 1.8〜2.0 KB）は
+            // ここへ inline しない。判断材料は guide `delegation` が 1 本で返す
             WorkerModelPolicy::Delegate => {
-                let guidance = self
-                    .delegate_guidance
-                    .as_ref()
-                    .map(|g| resolve_text_or_file(g))
-                    .unwrap_or_else(|| "タスクの複雑さに応じて判断してください。".to_string());
+                let legacy = if guide::legacy_1477() {
+                    self.legacy_delegate_guidance_inline()
+                } else {
+                    String::new()
+                };
                 format!(
                     "## Worker Model Policy\n\n\
                      You decide the model and effort for each worker based on the task content.\n\
@@ -1832,9 +1899,7 @@ impl Profile {
                      and `tako_orchestrator_run` calls.\n\n\
                      If you cannot determine the appropriate model, use the default:\n\
                      - **Default Model**: {}\n\
-                     - **Default Effort**: {}\n\n\
-                     ### Delegation Guidance\n\n\
-                     {guidance}",
+                     - **Default Effort**: {}{legacy}",
                     self.model_label(),
                     self.effort
                 )
@@ -1930,9 +1995,10 @@ impl Profile {
                 String::new()
             } else {
                 let details = self.resolve_project_details();
+                // #1477: 案内文は 1 文ずつに絞る（この節はプロジェクト数に比例して
+                // 伸びるので、散文のぶんも profile ごとに掛かる）
                 let mut section = String::from(
                     "\n\n## Assigned Projects (Dedicated Master)\n\n\
-                     This master is dedicated to the following project(s). \
                      You already know the target — skip project resolution (Step 0).\n\n",
                 );
                 for p in &details {
@@ -1944,9 +2010,8 @@ impl Profile {
                     ));
                 }
                 section.push_str(
-                    "\nFor requests outside these projects, explain that this master is dedicated \
-                     to the listed project(s) and suggest using a general-purpose master \
-                     (`tako master`) or a different profile instead.",
+                    "\nFor anything outside these, say this master is dedicated to them and \
+                     point at a general-purpose master (`tako master`) or another profile.",
                 );
                 section
             }
@@ -4315,15 +4380,23 @@ prompt_blocks:
         // 既定はモデル無指定 = claude CLI の既定（[1m] を含まない）
         assert!(prompt.contains(CLAUDE_DEFAULT_LABEL));
         assert!(!prompt.contains("[1m]"));
-        // #292: judgment 二層が model-policy の後に注入されていること
+        // #292: judgment 二層が model-policy の後に案内されていること。
+        // #1477 で**本文は guide `delegation` へ移した**ので、prompt に載るのは
+        // 引く条件だけ。全文が在ることは master が到達できる本文の側で確かめる
         let policy_pos = prompt.find("Worker Model Policy").unwrap();
         let judgment_pos = prompt
             .find("Delegation Judgment Criteria")
-            .expect("judgment セクションが存在する");
+            .expect("judgment の案内が存在する");
         assert!(judgment_pos > policy_pos, "judgment は model-policy の後");
-        assert!(prompt.contains("Built-in Defaults"));
-        assert!(prompt.contains("Survey Frequency Control"));
-        assert!(prompt.contains("bugfix-rooted"));
+        assert!(prompt.contains("`delegation`"), "引く条件が無い");
+        assert!(
+            !prompt.contains("bugfix-rooted"),
+            "判断材料の全文が prompt に残っている（#1477）"
+        );
+        let reachable = master_reachable_text(&p, "test");
+        assert!(reachable.contains("Built-in Defaults"));
+        assert!(reachable.contains("Survey Frequency Control"));
+        assert!(reachable.contains("bugfix-rooted"));
     }
 
     /// master が到達できる本文の全体（system prompt + 手順書。#1154）。
@@ -4334,7 +4407,8 @@ prompt_blocks:
         let mut s = p.build_system_prompt(profile_name);
         for g in guide::GUIDES {
             s.push('\n');
-            s.push_str(&p.render_prompt_placeholders(g.body));
+            // #1477: 動的 guide（delegation / local-rules）もここで組み立てる
+            s.push_str(&p.render_prompt_placeholders(&g.body_raw(p)));
         }
         s
     }
@@ -4415,8 +4489,15 @@ prompt_blocks:
             ..Default::default()
         };
         let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "test");
-        assert!(prompt.contains("Delegation Guidance"));
-        assert!(prompt.contains("複雑なタスクは Opus"));
+        // #1477: 委任方針は prompt ではなく guide `delegation` 側にある
+        assert!(
+            !prompt.contains("複雑なタスクは Opus"),
+            "inline に戻っている"
+        );
+        assert!(prompt.contains("`delegation`"), "引く条件が無い");
+        let reachable = master_reachable_text(&p, "test");
+        assert!(reachable.contains("Delegation Guidance"));
+        assert!(reachable.contains("複雑なタスクは Opus"));
     }
 
     #[test]

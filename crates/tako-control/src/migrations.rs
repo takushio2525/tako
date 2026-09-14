@@ -277,6 +277,59 @@ fn pin_sandbox_bypass(text: &str) -> Result<Option<String>, String> {
     Ok(Some(out))
 }
 
+// --- 追記（prompt_blocks.append）の分割（#1477）-------------------------------
+
+/// 追記の現在の世代。v1 = 区切りが無く予算を超えている / v2 = 現在
+const PROMPT_APPEND_VERSION: u32 = 2;
+
+/// 追記の世代は**内容だけ**で決まる（冪等性の根拠）。
+///
+/// - 区切りがある → v2（分け終わっている。**二度と触らない**）
+/// - 予算に収まっている → v2（**小さいファイルは触らない**。あとで育てば v1 へ戻り、
+///   そのとき初めて区切りが入る）
+/// - それ以外 → v1
+fn detect_prompt_append(text: &str) -> u32 {
+    if tako_core::prompt_append::split(text).marked {
+        return PROMPT_APPEND_VERSION;
+    }
+    if text.len() <= tako_core::context_budget::PROMPT_APPEND_MAX_BYTES {
+        return PROMPT_APPEND_VERSION;
+    }
+    1
+}
+
+const PROMPT_APPEND_V1_TO_V2: Note = Note::new(
+    "予算を超えた追記の見出し境界へ `<!-- tako:on-demand -->` を 1 行入れ、その行より後ろを常時読み込みから外す（内容は 1 文字も消さない。全文は `tako orchestrator guide local-rules` で引ける。#1477）",
+    "Insert one `<!-- tako:on-demand -->` line at a heading boundary of an over-budget append so everything after it stops being loaded every turn (nothing is deleted; the full text stays available via `tako orchestrator guide local-rules`; #1477)",
+);
+
+/// #1477: 追記へ区切りを入れる。
+///
+/// **挿入するのはマーカー行 1 本だけ**（[`tako_core::prompt_append::insert_marker`]）。
+/// 見出しが無い / 先頭の節だけで予算を超えるものは切らずに `Ok(None)` を返す
+/// （機械的に切ると規則の意味が壊れるので、`tako context-budget` の提案へ回す）
+fn split_oversized_append(text: &str) -> Result<Option<String>, String> {
+    // **手順そのものが世代を見る**（`detect` を通さずに呼ばれても小さいファイルや
+    // 区切り済みのファイルを触らない = `Step::apply` の「Ok(None) = 既に新形式」契約）
+    if detect_prompt_append(text) == PROMPT_APPEND_VERSION {
+        return Ok(None);
+    }
+    Ok(tako_core::prompt_append::insert_marker(
+        text,
+        tako_core::context_budget::PROMPT_APPEND_MAX_BYTES,
+    ))
+}
+
+const PROMPT_APPEND_STEPS: &[Step] = &[Step {
+    from: 1,
+    to: PROMPT_APPEND_VERSION,
+    describe: PROMPT_APPEND_V1_TO_V2,
+    // once にしない。利用者が区切りを消して追記を育てたら、また分ける必要がある
+    // （detect が内容だけを見るので、分け終わっているファイルには当たらない）
+    once: false,
+    apply: split_oversized_append,
+}];
+
 const PROFILE_STEPS: &[Step] = &[
     Step {
         from: 1,
@@ -380,6 +433,17 @@ pub const SPECS: &[SchemaSpec] = &[
     pristine(SchemaId::Ledger, Some(validate_ledger)),
     // ユーザー向けタスク（#1450）。版数フィールドを持つので `versioned`
     versioned(SchemaId::UserTasks, Some(validate_user_tasks)),
+    // 追記（#1477）。**利用者が書いた md** なので validate は持たない（形式が決まって
+    // いない）が、読めない内容を退避する側には回す（`preserve_unreadable: true`）
+    SchemaSpec {
+        id: SchemaId::PromptAppend,
+        target_version: PROMPT_APPEND_VERSION,
+        detect: detect_prompt_append,
+        steps: PROMPT_APPEND_STEPS,
+        once_markers: &[],
+        validate: None,
+        preserve_unreadable: true,
+    },
     // 引き継ぎ（#915）は「プロファイル単位の 1 ファイル」から
     // 「プロジェクト単位の複数ファイル」への**分割**移行なので、テキスト置換の
     // Step では表せない。手順そのものは `orchestrator::handoff_store` が持ち、
@@ -444,6 +508,9 @@ pub fn targets(id: SchemaId) -> Vec<PathBuf> {
             .into_iter()
             .collect(),
         SchemaId::UserTasks => crate::user_tasks::store_path().into_iter().collect(),
+        // #1477: 置き場が固定でない唯一の種別。**プロファイルが指している追記ファイル**を
+        // master / solo 両方から集める（同じファイルを何本ものプロファイルが指すので重複排除）
+        SchemaId::PromptAppend => prompt_append_targets(),
         // 引き継ぎは**1 ファイル → 複数ファイル**の分割移行（#915）なので、
         // テキスト置換の Step では表せない。専用実装へ委譲する（[`handoff_reports`]）
         SchemaId::Handoff => Vec::new(),
@@ -457,6 +524,45 @@ pub fn targets(id: SchemaId) -> Vec<PathBuf> {
             single(&format!("remote/{}", tako_core::remote_shortcuts::FILENAME))
         }
     }
+}
+
+/// プロファイルが `prompt_blocks.append` で指している追記ファイル（#1477）。
+///
+/// **インラインのテキスト指定は対象外**（ファイルではないので書き換えようがない。
+/// 分割は prompt 生成側が区切りを見て行うので、インラインでも区切りは効く）
+fn prompt_append_targets() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for dir in [
+        crate::orchestrator::profiles_dir(),
+        crate::orchestrator::solo_profiles_dir(),
+    ] {
+        for profile_path in dir_entries(dir, ".yaml") {
+            let Ok(text) = std::fs::read_to_string(&profile_path) else {
+                continue;
+            };
+            let Ok(profile) = serde_yaml::from_str::<crate::orchestrator::Profile>(&text) else {
+                // 読めないプロファイルは Profiles 側の validate が申告する
+                continue;
+            };
+            let Some(append) = profile
+                .prompt_blocks
+                .as_ref()
+                .and_then(|b| b.append.as_ref())
+            else {
+                continue;
+            };
+            // `~/` で始まるものだけがファイル指定（`resolve_text_or_file` と同じ規則）
+            if !append.starts_with("~/") {
+                continue;
+            }
+            let path = PathBuf::from(crate::orchestrator::expand_tilde(append));
+            if path.is_file() && !out.contains(&path) {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 /// ディレクトリ配下の対象ファイル。**退避・ロック・作業ファイルは対象にしない**

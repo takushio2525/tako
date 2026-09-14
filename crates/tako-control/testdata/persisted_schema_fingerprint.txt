@@ -69,6 +69,7 @@ version profiles: v3 steps=2
 version solo_profiles: v3 steps=2
 version ledger: v1 steps=0
 version user_tasks: v1 steps=0
+version prompt_append: v2 steps=1
 version handoff: v1 steps=0
 version setup: v1 steps=0
 version discovery_instance: v1 steps=0

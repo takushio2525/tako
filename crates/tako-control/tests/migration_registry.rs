@@ -71,6 +71,11 @@ fn 共有対象の設定ファイルは移行の番地にも載っている() {
         ("orchestrator/solo-profiles/", SchemaId::SoloProfiles),
         ("orchestrator/ledger.yaml", SchemaId::Ledger),
         ("orchestrator/user-tasks.yaml", SchemaId::UserTasks),
+        // #1477: 追記そのものは自由文の md だが、**予算超過のときに区切りを入れる**
+        // 移行を持つので番地が要る（形式の検査 = validate は無いまま）。
+        // カタログの既定の置き場 1 本を代表に載せる（実際の対象は
+        // プロファイルの `prompt_blocks.append` が指すファイル）
+        ("orchestrator/local-rules.md", SchemaId::PromptAppend),
         ("orchestrator/handoff/", SchemaId::Handoff),
         ("setup/", SchemaId::Setup),
         ("instances/", SchemaId::DiscoveryInstance),
@@ -106,8 +111,9 @@ fn 共有対象の設定ファイルは移行の番地にも載っている() {
     // Local / Secret を対象にしないのは、ソケット・キャッシュ・ログのように
     // そもそもスキーマを持たないものが正当に含まれるため
     const SHARED_WITHOUT_SCHEMA: &[&str] = &[
-        // どれも AI へ渡す自由文の Markdown（形式の決まりが無い）
-        "orchestrator/local-rules.md",
+        // どれも AI へ渡す自由文の Markdown（形式の決まりが無い）。
+        // `local-rules.md` は #1477 で**版数の番地を持った**ので対応表の側へ移った
+        // （中身は自由文のままで、移行が見るのは区切りの有無と大きさだけ）
         "orchestrator/master-system.md",
         "orchestrator/conflict-resolver.md",
         "orchestrator/judgment-local.md",
