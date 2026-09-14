@@ -314,6 +314,30 @@ pub(crate) struct TasksPanel {
     pub notice: Option<String>,
     /// 一度でも `list` が返ってきたか（読み込み前と 0 件を言い分ける）
     pub loaded: bool,
+    /// 画像添付のサムネイル（#1472）。**いま開いている 1 件のぶんだけ**持ち、
+    /// 別のタスクを選んだら捨てる（`ensure_task_thumbs` が毎フレーム揃える）
+    pub thumbs: std::collections::HashMap<String, ThumbState>,
+}
+
+/// サムネイル 1 枚の状態（#1472）
+#[derive(Clone)]
+pub(crate) enum ThumbState {
+    /// 背景で読んでいる最中
+    Loading,
+    /// 縮小済み（**元の大きさは持たない**）
+    Ready(std::sync::Arc<gpui::RenderImage>),
+    /// 出さないと決めた（大きすぎる・読めない）。**行は押せるまま**
+    Skipped,
+}
+
+impl std::fmt::Debug for ThumbState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Loading => f.write_str("Loading"),
+            Self::Ready(_) => f.write_str("Ready"),
+            Self::Skipped => f.write_str("Skipped"),
+        }
+    }
 }
 
 impl TasksPanel {
@@ -331,6 +355,94 @@ impl TasksPanel {
         self.comment.clear();
         self.comment_focused = false;
     }
+}
+
+// --- 画像添付のサムネイル（Issue #1472）--------------------------------------
+//
+// 「重くしない」を**構造で**守る。ここは 300px 前後の帯なので原寸を持つ意味が無く、
+// 読んだその場で縮小して**縮小後だけ**を持つ（原寸はプレビューペインが見せる）。
+// 上限を 2 段（ファイルのバイト数 → ヘッダの画素数）にしてあるのは、PNG は
+// **小さいファイルでも展開すると巨大**になりうるため（解凍爆弾）。どちらかに当たったら
+// サムネイルは出さないが、**行は押せるまま**なので行き止まりにはならない。
+//
+// 動画のサムネイルは作らない: 既存の動画プレビューは ffmpeg で 1 フレーム抜く
+// （`preview::video_thumbnail`）ので、**任意依存が要る処理を一覧の描画に混ぜない**。
+// 動画は行を押せばそのまま再生できる。
+
+/// サムネイルの上限寸法（`thumbnail` は縦横比を保ったままこの枠へ収める）
+pub(crate) const THUMB_W: u32 = 320;
+pub(crate) const THUMB_H: u32 = 180;
+/// これより大きいファイルは読まない
+pub(crate) const THUMB_MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
+/// これより画素が多い画像は展開しない（**ヘッダだけで判る** = decode の前に落とせる）
+pub(crate) const THUMB_MAX_PIXELS: u64 = 64_000_000;
+
+/// 縮小済みの画素（GPUI の `RenderImage` が読む形 = BGRA）
+pub(crate) struct ThumbPixels {
+    pub width: u32,
+    pub height: u32,
+    pub bgra: Vec<u8>,
+}
+
+/// サムネイルを作らなかった理由
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThumbSkip {
+    /// 上限（バイト数 / 画素数）に当たった
+    TooLarge,
+    /// 読めない・画像として解釈できない
+    Unreadable,
+}
+
+/// 画像ファイルを**縮小済み BGRA** へ起こす（背景スレッドで走る純関数）。
+///
+/// 呼ぶ前に `open_plan::preview_route` が `Image` と判じていること（拡張子の表は
+/// 画面が持たない）。ここでは中身を見るので、拡張子が png でも壊れていれば
+/// `Unreadable` になる
+pub(crate) fn decode_thumb(path: &std::path::Path) -> Result<ThumbPixels, ThumbSkip> {
+    let len = std::fs::metadata(path)
+        .map_err(|_| ThumbSkip::Unreadable)?
+        .len();
+    if len > THUMB_MAX_FILE_BYTES {
+        return Err(ThumbSkip::TooLarge);
+    }
+    let open = || {
+        image::ImageReader::open(path)
+            .map_err(|_| ThumbSkip::Unreadable)?
+            .with_guessed_format()
+            .map_err(|_| ThumbSkip::Unreadable)
+    };
+    // ヘッダだけで画素数を見る（**展開する前に**落とす）
+    let (w, h) = open()?
+        .into_dimensions()
+        .map_err(|_| ThumbSkip::Unreadable)?;
+    if u64::from(w) * u64::from(h) > THUMB_MAX_PIXELS {
+        return Err(ThumbSkip::TooLarge);
+    }
+    let decoded = open()?.decode().map_err(|_| ThumbSkip::Unreadable)?;
+    // **縮めるだけ**（枠より小さい画像を引き伸ばしても粗が出るだけで情報は増えない）
+    let fitted = if decoded.width() > THUMB_W || decoded.height() > THUMB_H {
+        decoded.thumbnail(THUMB_W, THUMB_H)
+    } else {
+        decoded
+    };
+    let mut rgba = fitted.to_rgba8();
+    let (width, height) = (rgba.width(), rgba.height());
+    // GPUI は BGRA を読む（動画プレビューの現在フレームと同じ作法）
+    for px in rgba.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+    Ok(ThumbPixels {
+        width,
+        height,
+        bgra: rgba.into_raw(),
+    })
+}
+
+/// 添付がサムネイルを出す対象か（**画像だけ**。判定は `open_plan` の 1 実装を通す）
+pub(crate) fn thumbable(att: &Attachment) -> bool {
+    att.exists
+        && tako_core::open_plan::preview_route(std::path::Path::new(&att.path))
+            == tako_core::open_plan::PreviewRoute::Image
 }
 
 impl TakoApp {
@@ -507,6 +619,58 @@ impl TakoApp {
         self.user_tasks.notice = Some(crate::ui_text::panel::tasks_copied(&copy.label));
         cx.notify();
         true
+    }
+
+    /// いま開いているタスクのぶんだけサムネイルを揃える（#1472）。
+    ///
+    /// **持つのは「今の 1 件」だけ**。欲しい集合を毎回作って `retain` するので、
+    /// 別のタスクを選んだ時点で前のぶんは落ちる = 「捨てる処理」をどこにも書かずに
+    /// 溜まらない（ポーリングの止め方と同じ考え方）。読み込みは背景スレッドで、
+    /// 詰まっても描画は止まらない（**未完のあいだは枠だけ出す**）
+    pub(crate) fn ensure_task_thumbs(&mut self, task: &TaskRow, cx: &mut Context<Self>) {
+        let wanted: Vec<String> = task
+            .attachments
+            .iter()
+            .filter(|a| thumbable(a))
+            .map(|a| a.path.clone())
+            .collect();
+        self.user_tasks.thumbs.retain(|k, _| wanted.contains(k));
+        for path in wanted {
+            if self.user_tasks.thumbs.contains_key(&path) {
+                continue;
+            }
+            self.user_tasks
+                .thumbs
+                .insert(path.clone(), ThumbState::Loading);
+            let target = std::path::PathBuf::from(&path);
+            cx.spawn(async move |this, cx| {
+                let decoded = cx
+                    .background_executor()
+                    .spawn(async move { decode_thumb(&target) })
+                    .await;
+                let state = match decoded {
+                    Ok(px) => image::RgbaImage::from_raw(px.width, px.height, px.bgra)
+                        .map(|img| {
+                            ThumbState::Ready(std::sync::Arc::new(gpui::RenderImage::new(vec![
+                                image::Frame::new(img),
+                            ])))
+                        })
+                        .unwrap_or(ThumbState::Skipped),
+                    Err(_) => ThumbState::Skipped,
+                };
+                let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                    // 読んでいるあいだに別のタスクへ移っていたら捨てる（増やさない）。
+                    // `Occupied` のときだけ書くので、外れた添付が読み終わりで復活しない
+                    if let std::collections::hash_map::Entry::Occupied(mut slot) =
+                        app.user_tasks.thumbs.entry(path)
+                    {
+                        slot.insert(state);
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
     }
 
     /// 添付をファイルマネージャで表示する（`tako_file_op` と同じ dispatch）
@@ -1119,6 +1283,9 @@ impl TakoApp {
         }
 
         // --- 添付（消えたものは「見つかりません」を出す） ---
+        // #1472: サムネイルは**開いている 1 件のぶんだけ**持つ。添付が 0 件のタスクを
+        // 選んだときにも前のぶんを落とすので、この呼び出しは `if` の外に置く
+        self.ensure_task_thumbs(task, cx);
         if !task.attachments.is_empty() {
             detail = detail.child(section(
                 crate::ui_text::panel::tasks_attachments().to_string(),
@@ -1127,61 +1294,73 @@ impl TakoApp {
                 let path_reveal = att.path.clone();
                 let path_open = att.path.clone();
                 let shown = short_path(&att.path);
-                let mut row = div()
+                // どのプレビューで開くかは `open_plan` の 1 実装が決める
+                // （画面は拡張子の表を持たない）
+                let route =
+                    tako_core::open_plan::preview_route(std::path::Path::new(&att.path)).as_str();
+                let mut label = div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap(px(5.0))
                     .flex_none()
-                    .py(px(2.0))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .overflow_hidden()
-                            // 狭いパネルで長いパスが折り返して行が膨らむのを止める
-                            // （末尾 2 要素にしても /var/folders/… の一時パスは長い）
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_size(px(10.5))
-                            .text_color(hsla(if att.exists {
-                                theme.text_secondary
-                            } else {
-                                theme.text_faint
-                            }))
-                            .child(SharedString::from(shown)),
-                    );
+                    .py(px(2.0));
                 if att.exists {
-                    row = row
-                        .child(
-                            small_button(
-                                &theme,
-                                ("tasks-att-reveal", i),
-                                crate::ui_text::pane_menu::reveal(
-                                    tako_control::platform::os_integration::file_manager(),
-                                )
-                                .to_string(),
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.user_task_reveal(&path_reveal, cx);
-                                },
+                    label = label.child(
+                        // 何の添付で、押すと何が開くかを先に言う（動画 / 画像 / PDF …）。
+                        // **左端**に置くのは、右へ積むとファイル名の桁を食うため
+                        div()
+                            .flex_none()
+                            .px(px(4.0))
+                            .rounded(px(4.0))
+                            .bg(rgba(theme.chip_surface))
+                            .text_size(px(9.0))
+                            .text_color(hsla(theme.text_faint))
+                            .child(SharedString::from(
+                                crate::ui_text::panel::tasks_attachment_route(route),
                             )),
+                    );
+                }
+                label = label.child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        // 狭いパネルで長いパスが折り返して行が膨らむのを止める
+                        // （末尾 2 要素にしても /var/folders/… の一時パスは長い）
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_size(px(10.5))
+                        .text_color(hsla(if att.exists {
+                            theme.text_secondary
+                        } else {
+                            theme.text_faint
+                        }))
+                        .child(SharedString::from(shown)),
+                );
+                if att.exists {
+                    label = label.child(
+                        small_button(
+                            &theme,
+                            ("tasks-att-reveal", i),
+                            crate::ui_text::pane_menu::reveal(
+                                tako_control::platform::os_integration::file_manager(),
+                            )
+                            .to_string(),
                         )
-                        .child(
-                            small_button(
-                                &theme,
-                                ("tasks-att-open", i),
-                                crate::ui_text::panel::tasks_open_preview().to_string(),
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.user_task_open_preview(&path_open, cx);
-                                },
-                            )),
-                        );
+                        // #496: 行のクリック（= プレビューで開く）へ落ちないよう
+                        // ここで止める。守らないと「Finder で表示」がプレビューも開く
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.user_task_reveal(&path_reveal, cx);
+                        })),
+                    );
                 } else {
-                    row = row.child(
+                    label = label.child(
                         div()
                             .flex_none()
                             .text_size(px(9.5))
@@ -1189,7 +1368,107 @@ impl TakoApp {
                             .child(crate::ui_text::panel::tasks_attachment_missing()),
                     );
                 }
-                detail = detail.child(row);
+
+                // #1472: **行そのもの**が「プレビューで開く」。小さなボタンを狙わせない
+                // （押す先は `Request::OpenFile` の 1 経路 = `tako open` / `tako_open_file`
+                // と同じ。画像 / 動画 / PDF / md / コードの振り分けは dispatch 側の表）。
+                // 消えた添付は押せない = `exists` を見て配線ごと付けない
+                let mut row = div()
+                    .id(("tasks-att-row", i))
+                    .flex()
+                    .flex_col()
+                    .flex_none()
+                    .px(px(3.0))
+                    .rounded(px(5.0));
+                if att.exists {
+                    let probe = self.panel_click_probe_bounds.clone();
+                    let probe_key = format!("tasks-att-{i}");
+                    let tip_theme = theme.clone();
+                    row = row
+                        .cursor_pointer()
+                        .hover(|d| d.bg(rgba(theme.chip_surface)))
+                        // 行がボタンだと**言葉で**分かるようにする（図形だけにしない）
+                        .tooltip(move |_, cx| {
+                            cx.new(|_| {
+                                crate::tab_bar::HintTooltip::new(
+                                    crate::ui_text::panel::tasks_open_preview().to_string(),
+                                    tip_theme.clone(),
+                                )
+                            })
+                            .into()
+                        })
+                        // #496: ルート div の一括 dismiss（#503）より先に自分を確定させる
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.user_task_open_preview(&path_open, cx);
+                        }))
+                        // セルフテスト（visual-test）が**実マウスで**押すための実矩形
+                        .child(
+                            gpui::canvas(
+                                |_, _, _| (),
+                                move |bounds, _, _, _| {
+                                    probe.borrow_mut().insert(probe_key.clone(), bounds);
+                                },
+                            )
+                            // `absolute` だけでは直前の子の下へずれる（原点を明示する）
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full(),
+                        );
+                }
+                // 画像はその場で見える（縮小済み。押せば原寸がプレビューペインで開く）
+                if let Some(thumb) = self.user_tasks.thumbs.get(&att.path) {
+                    match thumb {
+                        ThumbState::Ready(image) => {
+                            row = row.child(
+                                div()
+                                    .flex_none()
+                                    .my(px(3.0))
+                                    .h(px(112.0))
+                                    .w_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .overflow_hidden()
+                                    .rounded(px(5.0))
+                                    .bg(rgba(theme.surface_0))
+                                    .child(
+                                        gpui::img(image.clone())
+                                            .object_fit(gpui::ObjectFit::Contain)
+                                            .max_w_full()
+                                            .max_h(px(112.0)),
+                                    ),
+                            );
+                        }
+                        // 読んでいる最中は枠だけ出す（行が飛び跳ねない）
+                        ThumbState::Loading => {
+                            row = row.child(
+                                div()
+                                    .flex_none()
+                                    .my(px(3.0))
+                                    .h(px(112.0))
+                                    .w_full()
+                                    .rounded(px(5.0))
+                                    .bg(rgba(theme.surface_0)),
+                            );
+                        }
+                        ThumbState::Skipped => {
+                            row = row.child(
+                                div()
+                                    .flex_none()
+                                    .pb(px(1.0))
+                                    .text_size(px(9.0))
+                                    .text_color(hsla(theme.text_faint))
+                                    .child(crate::ui_text::panel::tasks_thumb_skipped()),
+                            );
+                        }
+                    }
+                }
+                detail = detail.child(row.child(label));
             }
         }
 
@@ -1803,5 +2082,169 @@ mod tests {
         );
         assert_eq!(short_path("c.mp4"), "c.mp4");
         assert_eq!(short_path(""), "");
+    }
+
+    // --- サムネイル（#1472）------------------------------------------------
+
+    fn att(path: &str, exists: bool) -> Attachment {
+        Attachment {
+            path: path.to_string(),
+            exists,
+        }
+    }
+
+    /// PNG を 1 枚書く（`w` x `h`。中身は位置で変わる色 = 縮小しても単色にならない）
+    fn write_png(path: &std::path::Path, w: u32, h: u32) {
+        let img = image::RgbaImage::from_fn(w, h, |x, y| {
+            image::Rgba([(x % 256) as u8, (y % 256) as u8, 10, 255])
+        });
+        img.save(path).expect("PNG を書けない");
+    }
+
+    #[test]
+    fn サムネイルは枠に収まり縦横比を保つ() {
+        let dir = tako_core::test_residue::ScratchDir::new("tasks-thumb");
+        let png = dir.path().join("wide.png");
+        // 枠（320x180）より大きい 2:1 の画像
+        write_png(&png, 800, 400);
+        let thumb = decode_thumb(&png).expect("縮小できるはず");
+        assert!(
+            thumb.width <= THUMB_W && thumb.height <= THUMB_H,
+            "枠を超えている: {}x{}",
+            thumb.width,
+            thumb.height
+        );
+        // 2:1 のまま（枠の縦横比 320:180 とは違うので、潰れていれば気付ける）
+        assert_eq!(thumb.width, 320);
+        assert_eq!(thumb.height, 160);
+        assert_eq!(thumb.bgra.len() as u32, thumb.width * thumb.height * 4);
+    }
+
+    #[test]
+    fn 枠より小さい画像は拡大しない() {
+        let dir = tako_core::test_residue::ScratchDir::new("tasks-thumb");
+        let png = dir.path().join("small.png");
+        write_png(&png, 40, 30);
+        let thumb = decode_thumb(&png).expect("そのまま通るはず");
+        assert_eq!((thumb.width, thumb.height), (40, 30));
+        // 縮小が挟まらないので画素が厳密に読める。元は (x=0,y=0) が R=0 / G=0 / B=10 で、
+        // GPUI が読む BGRA へ入れ替わっていれば**先頭が B**になる
+        assert_eq!(
+            thumb.bgra[0], 10,
+            "B が先頭に来ていない（入れ替えていない）"
+        );
+        assert_eq!(
+            thumb.bgra[2], 0,
+            "R が 3 番目に来ていない（入れ替えていない）"
+        );
+        assert_eq!(thumb.bgra[3], 255);
+        // x=1 の画素は R=1（入れ替え後は 3 番目）
+        assert_eq!(thumb.bgra[6], 1);
+    }
+
+    /// **中身が 1 バイトしか無い PNG**（ファイルは 100 バイト未満なのに、
+    /// ヘッダ上の大きさは巨大）。`into_dimensions` は IDAT の**存在**までは見るが
+    /// 展開はしないので、画素上限が decode の前に効くことをこれで確かめられる
+    pub(super) fn write_png_header(path: &std::path::Path, w: u32, h: u32) {
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = 0xffff_ffffu32;
+            for b in bytes {
+                crc ^= u32::from(*b);
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 {
+                        (crc >> 1) ^ 0xedb8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        }
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&w.to_be_bytes());
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        // 8bit / RGBA / deflate / adam7 なし
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        // zlib（無圧縮 1 バイト）: ヘッダ 0x78 0x01 + stored ブロック + adler32
+        let idat: Vec<u8> = vec![
+            0x78, 0x01, 0x01, 0x01, 0x00, 0xfe, 0xff, 0x00, 0x00, 0x01, 0x00, 0x01,
+        ];
+        let mut out: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        for (kind, data) in [
+            (b"IHDR", ihdr.as_slice()),
+            (b"IDAT", idat.as_slice()),
+            (b"IEND", &[][..]),
+        ] {
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            out.extend_from_slice(kind);
+            out.extend_from_slice(data);
+            let mut crc_src = kind.to_vec();
+            crc_src.extend_from_slice(data);
+            out.extend_from_slice(&crc32(&crc_src).to_be_bytes());
+        }
+        std::fs::write(path, out).expect("PNG を書けない");
+    }
+
+    #[test]
+    fn 画素が多すぎる画像はヘッダだけで落とす() {
+        let dir = tako_core::test_residue::ScratchDir::new("tasks-thumb");
+        let png = dir.path().join("bomb.png");
+        // 解凍爆弾（ファイルは小さいのに展開すると巨大）
+        let w = 9000u32;
+        let h = (THUMB_MAX_PIXELS / u64::from(w)) as u32 + 10;
+        write_png_header(&png, w, h);
+        let len = std::fs::metadata(&png).expect("metadata").len();
+        assert!(
+            len < THUMB_MAX_FILE_BYTES,
+            "ファイル上限で落ちてしまうと画素上限の検査にならない: {len}"
+        );
+        assert!(matches!(decode_thumb(&png), Err(ThumbSkip::TooLarge)));
+        // 同じ作りで**枠内**の大きさなら画素上限では落ちず、展開まで進んでから
+        // 中身が足りずに Unreadable になる（= TooLarge が寸法由来だと言い切れる）
+        let ok = dir.path().join("small-header.png");
+        write_png_header(&ok, 100, 100);
+        assert!(matches!(decode_thumb(&ok), Err(ThumbSkip::Unreadable)));
+    }
+
+    #[test]
+    fn 画像でないファイルと消えたファイルは読めないと言う() {
+        let dir = tako_core::test_residue::ScratchDir::new("tasks-thumb");
+        let text = dir.path().join("not-an-image.png");
+        std::fs::write(&text, "これは画像ではない").expect("書けない");
+        assert!(matches!(decode_thumb(&text), Err(ThumbSkip::Unreadable)));
+        assert!(matches!(
+            decode_thumb(&dir.path().join("居ない.png")),
+            Err(ThumbSkip::Unreadable)
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn シンボリックリンクの添付も実体を読む() {
+        let dir = tako_core::test_residue::ScratchDir::new("tasks-thumb");
+        let real = dir.path().join("real.png");
+        let link = dir.path().join("リンク.png");
+        write_png(&real, 60, 40);
+        std::os::unix::fs::symlink(&real, &link).expect("symlink を張れない");
+        // `exists` も `metadata` も**辿った先**を見る（壊れたリンクは読めないと言う）
+        assert!(link.exists());
+        let thumb = decode_thumb(&link).expect("実体を読めるはず");
+        assert_eq!((thumb.width, thumb.height), (60, 40));
+        let broken = dir.path().join("壊れたリンク.png");
+        std::os::unix::fs::symlink(dir.path().join("居ない.png"), &broken).expect("symlink");
+        assert!(matches!(decode_thumb(&broken), Err(ThumbSkip::Unreadable)));
+    }
+
+    #[test]
+    fn サムネイルを出すのは実在する画像だけ() {
+        assert!(thumbable(&att("/tmp/a.png", true)));
+        assert!(thumbable(&att("/tmp/a.JPG", true)));
+        // 動画・文書・コードは出さない（原寸はプレビューペインが見せる）
+        assert!(!thumbable(&att("/tmp/a.mp4", true)));
+        assert!(!thumbable(&att("/tmp/a.md", true)));
+        assert!(!thumbable(&att("/tmp/a.pdf", true)));
+        assert!(!thumbable(&att("/tmp/a.rs", true)));
+        // 消えた添付は読みに行かない
+        assert!(!thumbable(&att("/tmp/a.png", false)));
     }
 }

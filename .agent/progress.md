@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-14（#1450 B2: 人がやることを右パネルで見て、その場で返す）
-- 右パネルに 4 本目のビュー `tasks`。`PanelViewWire` へ 1 枝足すだけで CLI の possible values・`--help`・不正値の案内・MCP の説明が追従する（`tako panel --show --view tasks` / パレット `panel-tasks`）。一覧（既定 open・`updated_at` 降順・種類 / プロジェクト絞り込み・バッジは `open_count` をそのまま）+ 詳細（本文は `md_view::render_document` の共有描画・`exists` を見て「消えた添付」・`copy_texts` は 1 件ずつ・リンク）+ 返答フォーム（4 択 + コメント・判断未選択では送れない）+ スレッド + 配送状態。**B1 の API 以外は叩かない**
-- **ポーリングは新タイマー無し**: 既存 2 秒ループが `tick_user_tasks` を呼ぶだけで、撃つ判断（`panel_visible` + A/B）はその 1 か所 = 止める処理を書かずに止まる。`list` を background へ逃がさないのは B1 が配送の決着を host から畳み込むため。3 本目の手書き入力を増やさないよう純ロジックを `text_field::TextField` へ切り出した（既存 git 2 本の移行は #1459）
-- 実測: 隔離セルフテスト**項目 150**（view / 起票 / バッジ / 消えた添付 / 長い md / コピー 1 件 / 返答 + `failed` + 理由 / スレッド 12 件 / **閉じている間は撃たない** / 完了が `tako todo list` と一致）+ `TAKO_VISUAL_ONLY=tasks-panel`（**Metal の scene を読み戻すので画面収録権限が不要**・3 場面の指紋が全部別）+ 隔離 GUI で `sent → delivered` を実測（疑似 master へ実送達）。A/B `TAKO_1450B2_LEGACY=1` は項目 150 が「起票が一覧に載らない」で FAILED。番犬 5 本・注入 8 通り。workspace 4845 passed 0 failed・clippy 3 宇宙 0・check-windows error 0・docs build 32 ページ。**install 要**
-
 ## 2026-09-14（#1450 B3: 人がやることをスマホから片付けられるようにした）
 - PWA `#/tasks`（一覧 + 詳細 + 添付の「端末に保存」+ copy_texts のワンタップコピー + 共有シート + 返答 / 完了 / 却下・ナビにバッジ）。daemon の受け口は `remote_tasks::TASK_ROUTES` の 4 本だけで、中身は B1 の `Request::UserTask` を**素通し**（一覧 Observe / 操作 Interact・**表に無い `/api/tasks…` は Manage の床**）。語彙と状態表示は B2 と同一（`sent` を「届いた」と書かない）
 - **添付の配信経路は 1 本も足していない**: daemon が絶対パスを `shortcut_target` で `{root, path_rel}` へ解決し、PWA は既存の `/api/files/download` を叩く = 認可は `resolve_in_root` の 1 実装のまま（manage は `fs`・interact はツリー配下だけ・落とせない添付は理由 + #1452 の導線）。ポーリングは `usePolling` の 1 実装（cleanup + visibility。画面とバッジで共有）
@@ -54,3 +49,8 @@
 - PWA `#/tasks` の詳細で画像を `<img>`（タップで全画面）・動画を `<video controls preload="metadata">` に。**経路は 1 本も増やしていない**: src は既存 `/api/files/download` に `disposition=inline` を足しただけで、認可は `resolve_in_root` のまま（observe は 403・interact はツリー配下だけ）。daemon 側は同じ経路に `Range`（206 + `Content-Range`・416・`Accept-Ranges` 常時）と inline の `Content-Type` を足し、**応答の送出は `respond_file` の 1 か所へ畳んだ**（枝ごとに書くと `no-store` の付け忘れが生えるため）。画像 / 動画の判定と MIME は `tako_core::open_plan` の 1 本（`preview_route` と `media_type` の一致を単体テストが拘束）で、daemon が `attachments[].preview` に載せる = PWA に拡張子の表を作らない
 - 実測: 実経路 `scripts/test-remote-attachment-preview-1472.sh` **59 PASS 0 FAIL**（先頭 / 途中 / 末尾チャンクの**中身が実体と一致**・416・150 MB の部分取得で daemon RSS 23 MB・observe / interact の 403）+ e2e 新 8 本（実 PNG の `naturalWidth` と実 webm の `readyState` / `duration` を実測・**一覧では GET 0 本**）。A/B は daemon 24 件 FAILED / PWA e2e 6 本 FAILED。番犬 6 本・注入 8 通り file:line 名指し
 - workspace 4901 passed 0 failed・clippy 3 宇宙 0・check-windows error 0・e2e 101 passed・docs 32 ページ。**install 不要 / 本番 remote daemon の再起動が要る**
+
+## 2026-09-14（#1472 A: 人がやることの添付を、行を押すだけで既存プレビューで開けるようにした）
+- #1450 B2 の「プレビューで開く」は**300px の帯の 10px ボタン**で、ユーザーには「押しても中身が見られない」に見えていた（Issue の前提「PC はパスの表示だけ」は不正確で、実測では `Request::OpenFile` 自体は png→image / mp4→video / md→markdown で正常動作）。**行そのもの**を押せるようにし、左に「画像 / 動画 / PDF …」の種別・ホバーで「プレビューで開く」を出す。**新しいビューアも拡張子の表も作らない**（`open_plan::preview_route` + `Request::OpenFile` = `tako open` / `tako_open_file` と同じ 1 経路）
+- 画像添付にサムネイル。**縮小後だけを持ち**（320x180 枠）、上限はファイル 32 MB とヘッダの画素 64M の 2 段で**画素は decode の前**に見る（解凍爆弾）。読むのは背景スレッド・持つのは開いている 1 件ぶんだけ（`retain` で溜まらない）。動画のサムネは作らない（ffmpeg 依存を一覧の描画に混ぜない）
+- 実測: visual-test 項目 151 新設（`TAKO_VISUAL_ONLY=task-attachment`）で**合成マウス**が実フレームの hitbox を押し、image / video が開く・2 回押してもペインが増えない・消えた添付は押せないを確認（ハンドラ直呼びの項目 150 では #496 型を検出できない）。注入 A/B は行の `on_click` を切ると項目 151 が `[]` で FAILED。番犬 `issue1472a_attachment_open_watchdog`（3 本・注入 9 通り）。**install 要**

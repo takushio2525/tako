@@ -1991,10 +1991,11 @@ struct TakoApp {
     git_branch_input: Option<GitBranchInput>,
     /// コンフリクト解消エージェントの選択ドロップダウンを開いているか（#496）
     git_agent_menu_open: bool,
-    /// git パネルの「一括 dismiss に食われうる」クリック要素の実描画矩形（#496。
-    /// キーは agent 名 / `"toggle"` / `"branch-input"`）。
+    /// 右パネルの「一括 dismiss に食われうる」クリック要素の実描画矩形（#496 / #1472。
+    /// キーは git = agent 名 / `"toggle"` / `"branch-input"`、tasks = `"tasks-att-N"`）。
     /// セルフテストが実マウスで押すためだけに使う観測値で、描画の正には使わない
-    git_click_probe_bounds: std::rc::Rc<std::cell::RefCell<HashMap<&'static str, Bounds<Pixels>>>>,
+    /// （**ハンドラ直呼びのテストでは「押した瞬間に消えて発火しない」型を検出できない**）
+    panel_click_probe_bounds: std::rc::Rc<std::cell::RefCell<HashMap<String, Bounds<Pixels>>>>,
     /// バックグラウンドドロワーの表示状態（FR-2.15。下部ステータスバーのボタンでトグル）
     drawer_visible: bool,
     /// バックグラウンドドロワーの高さ（px）
@@ -3921,7 +3922,7 @@ impl TakoApp {
             git_branch_confirm: None,
             git_branch_input: None,
             git_agent_menu_open: false,
-            git_click_probe_bounds: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
+            panel_click_probe_bounds: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
             drawer_visible: false,
             drawer_height: DRAWER_DEFAULT_HEIGHT,
             bg_pending_kill: None,
@@ -36961,13 +36962,19 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1472: 添付の行を**実マウスで**押すとプレビューが開くか
+                "task-attachment" => {
+                    task_attachment_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
                          profiles / chat-table / conflict-card / terminal-grid / \
                          grid-bench / preview-leak / chat-leak / preview-code / \
                          remote-tree / flicker / ime-preedit / screen-lines / \
-                         pane-border / tasks-panel）"
+                         pane-border / tasks-panel / task-attachment）"
                     );
                     std::process::exit(1);
                 }
@@ -37002,6 +37009,10 @@ mod self_test {
             // #1450 B2: 右パネル tasks ビュー。中身（markdown 本文・消えた添付・
             // コピー用テキスト・リンク・やりとり・配送）が載った状態を実ピクセルで撮る
             tasks_panel_visual(any, window, cx).await;
+
+            // #1472: 添付の行を**実マウスで**押すとプレビューが開くか
+            // （ハンドラ直呼びでは「押した瞬間に消えて発火しない」型を検出できない）
+            task_attachment_visual(any, window, cx).await;
 
             // #589: ファイルツリーのインデントガイド線が連続しているか。
             // 4 階層のフィクスチャを開き、ダーク / ライト / スクロール後の 3 状態で
@@ -39515,6 +39526,286 @@ mod self_test {
         println!("TAKO_VISUAL_1450B2: distinct={distinct1450}");
     }
 
+    /// 添付の行を**実マウスで**押すと既存のプレビューで開くか（#1472）。
+    ///
+    /// #1450 B2 は添付に「プレビューで開く」の小さなボタンを置いたが、300px の帯では
+    /// 狙いにくく、ユーザーからは「押しても中身が見られない」に見えていた。行そのものを
+    /// 押せるようにしたので、**その配線**をここで押さえる。ハンドラ直呼び（項目 150）は
+    /// #496 型（押下の mouse_down で自分が消えて `on_click` が発火しない）を
+    /// 検出できないので、`click_at` の合成マウスで実フレームの hitbox へ当てる。
+    ///
+    /// 単独実行は `TAKO_VISUAL_ONLY=task-attachment`
+    #[cfg(feature = "visual-test")]
+    async fn task_attachment_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        use tako_control::protocol::{PanelViewWire, Request};
+        let wait =
+            |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+
+        // --- 素材（使い捨て。実ユーザー名・実ホームパスを置かない）---
+        let dir1472 = tako_core::test_residue::process_scratch("visual-1472");
+        let png1472 = dir1472.join("ショット a.png");
+        let mp41472 = dir1472.join("clip.mp4");
+        let md1472 = dir1472.join("note.md");
+        let gone1472 = dir1472.join("消えた.png");
+        // 枠（320x180）より大きい画像 = 縮小が実際に走る
+        let made1472 = image::RgbaImage::from_fn(640, 360, |x, y| {
+            image::Rgba([(x % 256) as u8, (y % 256) as u8, 90, 255])
+        })
+        .save(&png1472)
+        .is_ok()
+            // 中身は見ない（振り分けは拡張子 = `open_plan` の 1 実装）。
+            // 実動画は ffmpeg 依存なのでここでは要求しない
+            && std::fs::write(&mp41472, b"\x00\x00\x00\x18ftypmp42").is_ok()
+            && std::fs::write(&md1472, "# 見出し\n\n本文\n").is_ok();
+        let _ = std::fs::remove_file(&gone1472);
+        if !made1472 {
+            println!("TAKO_VISUAL_SKIPPED: 1472（素材を作れない）");
+            return;
+        }
+        // 添付は**master が書いた綴りのまま**（`/var/…`）入れ、突き合わせは実体の綴り
+        // （`/private/var/…`）で行う: `OpenFile` は境界で canonicalize する（#970）ので、
+        // 素の綴りで比べると「開いているのに開いていない」に見える
+        // 突き合わせも**dispatch と同じ 1 実装**で正規化する（#970 の B26）。
+        // `std::fs::canonicalize` を直に呼ぶと、Windows の `\\?\` 前置の扱いが
+        // dispatch 側とズレて「開いているのに開いていない」に見える
+        let real = |p: &std::path::Path| {
+            tako_core::platform::path::canonicalize_or_self(p)
+                .display()
+                .to_string()
+        };
+        let png_real1472 = real(&png1472);
+        let mp4_real1472 = real(&mp41472);
+
+        // --- tasks ビューを開き、添付 4 件のタスクを選んだ状態にする ---
+        let id1472 = window
+            .update(cx, |app: &mut TakoApp, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    Request::Panel {
+                        visible: Some(true),
+                        width: Some(360.0),
+                        view: Some(PanelViewWire::Tasks),
+                        filetree: None,
+                        sidebar_width: None,
+                        show_hidden: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+                let id = tako_control::dispatch(
+                    app,
+                    Request::UserTask {
+                        action: "add".to_string(),
+                        id: None,
+                        title: Some("添付の試聴（#1472）".to_string()),
+                        body: Some("添付の行を押すと開く".to_string()),
+                        kind: Some("post".to_string()),
+                        status: None,
+                        all: None,
+                        project: Some("tako".to_string()),
+                        attachments: Some(vec![
+                            png1472.display().to_string(),
+                            mp41472.display().to_string(),
+                            md1472.display().to_string(),
+                            gone1472.display().to_string(),
+                        ]),
+                        copy_texts: None,
+                        links: None,
+                        due: None,
+                        decision: None,
+                        comment: None,
+                        via: None,
+                        pane: None,
+                        caller_role: Some("orchestrator-master:visual1472".to_string()),
+                    },
+                    PaneOrigin::Cli,
+                )
+                .ok()
+                .and_then(|v| v["id"].as_str().map(str::to_string));
+                app.tick_user_tasks();
+                app.user_tasks.selected = id.clone();
+                app.panel_click_probe_bounds.borrow_mut().clear();
+                cx.notify();
+                id
+            })
+            .ok()
+            .flatten();
+        let Some(id1472) = id1472 else {
+            check(false, "151: 添付つきタスクを起票できない (#1472)");
+            return;
+        };
+
+        // サムネイルは背景で読む。**描画を止めない**代わりに、載るまで少し待つ
+        let mut thumb_ready = false;
+        for _ in 0..40 {
+            notify_and_draw(any, window, cx);
+            wait(cx, 100).await;
+            thumb_ready = window
+                .update(cx, |app: &mut TakoApp, _, _| {
+                    matches!(
+                        app.user_tasks.thumbs.get(&png1472.display().to_string()),
+                        Some(crate::tasks_panel::ThumbState::Ready(_))
+                    )
+                })
+                .unwrap_or(false);
+            if thumb_ready {
+                break;
+            }
+        }
+        check(thumb_ready, "151: 画像の添付にサムネイルが載る (#1472)");
+        // **画像だけ**（動画は ffmpeg が要るので一覧の描画に混ぜない・消えたものは読まない）
+        let only_images1472 = window
+            .update(cx, |app: &mut TakoApp, _, _| {
+                let keys: Vec<String> = app.user_tasks.thumbs.keys().cloned().collect();
+                keys == vec![png1472.display().to_string()]
+            })
+            .unwrap_or(false);
+        check(
+            only_images1472,
+            "151: サムネイルを持つのは実在する画像だけ (#1472)",
+        );
+
+        let probe1472 = |cx: &mut AsyncApp, key: &str| {
+            window
+                .update(cx, |app: &mut TakoApp, _, _| {
+                    app.panel_click_probe_bounds.borrow().get(key).copied()
+                })
+                .ok()
+                .flatten()
+        };
+        let panes1472 = |cx: &mut AsyncApp| {
+            window
+                .update(cx, |app: &mut TakoApp, _, _| {
+                    app.workspace.active_tab().tree().panes().len()
+                })
+                .unwrap_or(0)
+        };
+        // いま開いているプレビューの (パス, モード)
+        let preview1472 = |cx: &mut AsyncApp| {
+            window
+                .update(cx, |app: &mut TakoApp, _, _| {
+                    app.previews
+                        .values()
+                        .map(|s| (s.path.display().to_string(), format!("{:?}", s.mode)))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+
+        notify_and_draw(any, window, cx);
+        wait(cx, 150).await;
+
+        // ① 画像の行を実マウスで押す → image モードのプレビューが開く
+        let before1472 = panes1472(cx);
+        match probe1472(cx, "tasks-att-0") {
+            None => check(false, "151: 添付の行が描かれない (#1472)"),
+            Some(row) => {
+                click_at(any, cx, row.center());
+                let mut opened = Vec::new();
+                for _ in 0..20 {
+                    wait(cx, 150).await;
+                    opened = preview1472(cx);
+                    if !opened.is_empty() {
+                        break;
+                    }
+                }
+                let png_open = opened
+                    .iter()
+                    .any(|(p, m)| p == &png_real1472 && m == "Image");
+                check(
+                    png_open,
+                    &format!("151: 画像の添付行の実クリックで image プレビューが開く (#1472。{opened:?})"),
+                );
+            }
+        }
+
+        // ② 同じ行をもう一度押してもペインが増えない（プレビューは差し替え）
+        let after_first1472 = panes1472(cx);
+        if let Some(row) = probe1472(cx, "tasks-att-0") {
+            click_at(any, cx, row.center());
+            wait(cx, 400).await;
+        }
+        let after_second1472 = panes1472(cx);
+        check(
+            after_second1472 == after_first1472 && after_first1472 > before1472,
+            &format!(
+                "151: 同じ添付を 2 回押してもペインが増えない (#1472。\
+                 before={before1472} first={after_first1472} second={after_second1472})"
+            ),
+        );
+
+        // ③ 動画の行 → video モードへ差し替わる（同じ 1 経路 = `tako open` の振り分け）
+        if let Some(row) = probe1472(cx, "tasks-att-1") {
+            click_at(any, cx, row.center());
+            let mut opened = Vec::new();
+            for _ in 0..20 {
+                wait(cx, 150).await;
+                opened = preview1472(cx);
+                if opened.iter().any(|(p, _)| p == &mp4_real1472) {
+                    break;
+                }
+            }
+            let video_open = opened
+                .iter()
+                .any(|(p, m)| p == &mp4_real1472 && m == "Video");
+            check(
+                video_open,
+                &format!(
+                    "151: 動画の添付行の実クリックで video プレビューが開く (#1472。{opened:?})"
+                ),
+            );
+            check(
+                panes1472(cx) == after_first1472,
+                "151: 別の添付を押してもペインは増えない (#1472)",
+            );
+        } else {
+            check(false, "151: 動画の添付行が描かれない (#1472)");
+        }
+
+        // ④ 消えた添付は押す先が無い（配線ごと付けていない = 実矩形も登録されない）
+        check(
+            probe1472(cx, "tasks-att-3").is_none(),
+            "151: 消えた添付は押せない (#1472)",
+        );
+
+        // --- 後片付け（次の節へ持ち越さない）---
+        let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+            let _ = tako_control::dispatch(
+                app,
+                Request::UserTask {
+                    action: "dismiss".to_string(),
+                    id: Some(id1472.clone()),
+                    title: None,
+                    body: None,
+                    kind: None,
+                    status: None,
+                    all: None,
+                    project: None,
+                    attachments: None,
+                    copy_texts: None,
+                    links: None,
+                    due: None,
+                    decision: None,
+                    comment: None,
+                    via: None,
+                    pane: None,
+                    caller_role: None,
+                },
+                PaneOrigin::Cli,
+            );
+            app.panel_visible = false;
+            app.panel_view = PanelView::Fleet;
+            app.user_tasks.selected = None;
+            app.user_tasks.thumbs.clear();
+            app.tick_user_tasks();
+            cx.notify();
+        });
+        println!("TAKO_VISUAL_1472: thumb={thumb_ready}");
+    }
+
     /// コンフリクトカードの操作が**実マウスで**発火するか（#496）。
     ///
     /// ルート div の `on_mouse_down` が呼ぶ一括 dismiss（#503）が `git_agent_menu_open` を
@@ -39607,7 +39898,7 @@ mod self_test {
                         app.panel_view = PanelView::Git;
                         app.git_feedback = None;
                         app.git_agent_menu_open = false;
-                        app.git_click_probe_bounds.borrow_mut().clear();
+                        app.panel_click_probe_bounds.borrow_mut().clear();
                         app.refresh_git(cx);
                     });
                     // コンフリクトカードが出るまで待つ（実 git 由来。注入はしない）
@@ -39657,7 +39948,7 @@ mod self_test {
                     let probe = |cx: &mut gpui::AsyncApp, key: &'static str| {
                         window496
                             .update(cx, |app, _, _| {
-                                app.git_click_probe_bounds.borrow().get(key).copied()
+                                app.panel_click_probe_bounds.borrow().get(key).copied()
                             })
                             .ok()
                             .flatten()
