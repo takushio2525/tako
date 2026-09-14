@@ -10,7 +10,13 @@
 //   （経路は `tako_control::remote_tasks::TASK_ROUTES` が正本）
 // - **添付のダウンロードは #1079 / #1085 のファイル API そのもの**。daemon が
 //   添付の絶対パスを `{root, path_rel}` へ解決して返すので、ここは
-//   `/api/files/download?root=…&path=…` を組むだけ（新しい配信経路は無い）
+//   そのファイル API を組むだけ（新しい配信経路は無い）
+// - **その場で見せる（#1472）のも同じ 1 本**。`<img>` / `<video>` の `src` は
+//   ダウンロードと**同じ URL に `disposition=inline` を足しただけ**で、
+//   認可は `resolve_in_root` の 1 実装のまま。daemon 側は `Range`（206）に
+//   応えるようになっただけで、受け口は増えていない。
+//   画像 / 動画の判定も自分でやらない（daemon が `attachments[].preview` に載せる。
+//   表は `tako_core::open_plan` = cmd+クリックや `tako open` と同じ 1 本）
 // - 権限が足りないときの導線は #1452 の `PermissionRequest` をそのまま使う
 //
 // ## 語彙は PC 版（B2 = 右パネルの tasks ビュー）と同一
@@ -208,6 +214,25 @@ function canShareFile(att) {
   }
 }
 
+// --- 添付の URL（**この 1 本だけが配信経路を知っている**）---
+
+/**
+ * 添付を取りに行く URL。**保存もその場再生も同じ経路**（#1079 のファイル API）で、
+ * 違うのは `disposition` だけ:
+ *
+ * - 既定（保存）は daemon が `Content-Disposition: attachment` を付ける
+ * - `inline: true` は `Content-Type` が実体の型（`video/mp4` 等）になり
+ *   `inline` で返る。`<img>` / `<video>` の src はこちら（#1472）
+ *
+ * **新しい経路をここ以外で組まない**（番犬が配信経路の綴りを 1 か所に縛る）
+ */
+export function attachmentUrl(base, att, inline = false) {
+  if (!att || !att.available) return null;
+  const qs = new URLSearchParams({ root: att.root, path: att.path_rel });
+  if (inline) qs.set('disposition', 'inline');
+  return `${base}/api/files/download?${qs.toString()}`;
+}
+
 // --- アイコン（絵文字は使わない。SVG で描く）---
 
 function DownloadIcon() {
@@ -275,12 +300,77 @@ function TaskRow({ task, onOpen }) {
 
 // --- 詳細 ---
 
+/**
+ * 添付をその場で見せる（#1472）。
+ *
+ * - 画像は `<img>`（タップで全画面へ）・動画は `<video controls preload="metadata">`
+ * - **詳細を開いたときだけ**描く（一覧には出さないので、開くまで 1 バイトも取りに行かない）
+ * - `preload="metadata"` なので動画は尺と最初のフレームぶんしか読まない。
+ *   本体はシーク（`Range`）で必要なところだけ流れてくる
+ *
+ * 種別（`att.preview`）は daemon が決める。ここに拡張子の表を持たない
+ */
+function AttachmentPreview({ att, base, onZoom }) {
+  const src = attachmentUrl(base, att, true);
+  if (!src) return null;
+  if (att.preview === 'image') {
+    return (
+      <button class="task-attachment-thumb" data-testid="task-preview-image-open" onClick={onZoom}>
+        <img
+          class="task-attachment-image"
+          data-testid="task-preview-image"
+          src={src}
+          alt={att.name || ''}
+          loading="lazy"
+          decoding="async"
+        />
+      </button>
+    );
+  }
+  if (att.preview === 'video') {
+    return (
+      <video
+        class="task-attachment-video"
+        data-testid="task-preview-video"
+        src={src}
+        controls
+        preload="metadata"
+        playsinline
+        webkit-playsinline="true"
+      />
+    );
+  }
+  return null;
+}
+
+/** 拡大表示（タップで閉じる。スマホには Esc が無いので閉じるボタンも出す） */
+function ImageZoom({ att, base, onClose }) {
+  const src = attachmentUrl(base, att, true);
+  useEffect(() => {
+    const onKey = e => {
+      if (e.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+  if (!src) return null;
+  return (
+    <div class="task-image-zoom" data-testid="task-image-zoom" onClick={onClose}>
+      <button class="btn task-image-zoom-close" data-testid="task-image-zoom-close" onClick={onClose}>
+        閉じる
+      </button>
+      <img class="task-image-zoom-img" src={src} alt={att.name || ''} />
+    </div>
+  );
+}
+
 function Attachment({ task, att, canDownload, base }) {
   const [notice, setNotice] = useState(null);
   const [sharing, setSharing] = useState(false);
-  const href = att.available
-    ? `${base}/api/files/download?root=${encodeURIComponent(att.root)}&path=${encodeURIComponent(att.path_rel)}`
-    : null;
+  const [zoomed, setZoomed] = useState(false);
+  const href = attachmentUrl(base, att);
+  // 見せられるのは「実体があって・この端末で取りに行けて・種別が分かる」ときだけ
+  const showPreview = Boolean(href) && canDownload && (att.preview === 'image' || att.preview === 'video');
 
   async function share() {
     setSharing(true);
@@ -303,6 +393,8 @@ function Attachment({ task, att, canDownload, base }) {
 
   return (
     <div class="task-attachment" data-testid="task-attachment">
+      {showPreview && <AttachmentPreview att={att} base={base} onZoom={() => setZoomed(true)} />}
+      {zoomed && <ImageZoom att={att} base={base} onClose={() => setZoomed(false)} />}
       <div class="task-attachment-info">
         <span class="task-attachment-name">{att.name || att.path}</span>
         <span class="task-attachment-meta">

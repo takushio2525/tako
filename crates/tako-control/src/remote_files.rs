@@ -585,6 +585,19 @@ pub fn open_for_download(resolved: &Resolved) -> Result<(std::fs::File, u64), De
 /// 非 ASCII が入りうるので、ASCII 側は安全な文字だけに落とし、
 /// 本来の名前は RFC 5987 の `filename*`（UTF-8 パーセント符号化）で渡す
 pub fn content_disposition(file_name: &str) -> String {
+    disposition_header("attachment", file_name)
+}
+
+/// その場で見せるときの `Content-Disposition`（#1472）。
+///
+/// `attachment` のままだと `<img>` / `<video>` の src に使えない端末がある。
+/// **綴りの組み立ては [`content_disposition`] と同じ 1 実装**（名前の逃がし方を
+/// 2 通り持たない）で、変わるのは先頭の語だけ
+pub fn content_disposition_inline(file_name: &str) -> String {
+    disposition_header("inline", file_name)
+}
+
+fn disposition_header(kind: &str, file_name: &str) -> String {
     let ascii: String = file_name
         .chars()
         .map(|c| {
@@ -611,7 +624,92 @@ pub fn content_disposition(file_name: &str) -> String {
             }
         })
         .collect();
-    format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{encoded}")
+    format!("{kind}; filename=\"{ascii}\"; filename*=UTF-8''{encoded}")
+}
+
+// ============================================================================
+// 部分取得（Range。#1472）
+// ============================================================================
+
+/// `Range` ヘッダの解釈結果（**純粋関数の戻り**。I/O をしない）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeSpec {
+    /// ヘッダが無い / 解釈できない / 複数範囲 → 全体を 200 で返す
+    Whole,
+    /// `bytes=start-end`（両端を含む・0 起点）→ 206
+    Part { start: u64, end: u64 },
+    /// 範囲が実体の外 → 416
+    Unsatisfiable,
+}
+
+/// `Range: bytes=…` を解く（**この 1 実装だけが Range を読む**）。
+///
+/// 足した理由は #1472: スマホの `<video>` は**まずシークのために部分取得を投げる**
+/// （Safari は `bytes=0-1` を撃って `206` が返らないと再生に進まない）。
+/// 配信経路は増やさず、既存の `/api/files/download` が同じ認可のまま部分でも返せるようにする。
+///
+/// 決め事（RFC 7233）:
+/// - 単位が `bytes` でない・複数範囲（`,`）・綴りが壊れている → **`Whole`**
+///   （Range は「無視してよい」ヘッダなので、断るより全体を返すほうが安全）
+/// - `a-b` は両端を含む。`b` が実体を超えたら末尾へ丸める
+/// - `a-` は末尾まで。`-n` は**末尾 n バイト**
+/// - 始点が実体の外・`-0`・長さ 0 の実体 → `Unsatisfiable`（416）
+pub fn parse_range(header: Option<&str>, total: u64) -> RangeSpec {
+    let Some(raw) = header else {
+        return RangeSpec::Whole;
+    };
+    let raw = raw.trim();
+    let Some(rest) = raw
+        .get(..6)
+        .filter(|p| p.eq_ignore_ascii_case("bytes="))
+        .map(|_| &raw[6..])
+    else {
+        return RangeSpec::Whole;
+    };
+    // 複数範囲は multipart/byteranges が要るので受けない（無視して全体を返す）
+    if rest.contains(',') {
+        return RangeSpec::Whole;
+    }
+    let spec = rest.trim();
+    let Some((first, last)) = spec.split_once('-') else {
+        return RangeSpec::Whole;
+    };
+    let (first, last) = (first.trim(), last.trim());
+    if total == 0 {
+        // 長さ 0 の実体はどんな範囲も満たせない
+        return RangeSpec::Unsatisfiable;
+    }
+    if first.is_empty() {
+        // 末尾 n バイト
+        let Ok(n) = last.parse::<u64>() else {
+            return RangeSpec::Whole;
+        };
+        if n == 0 {
+            return RangeSpec::Unsatisfiable;
+        }
+        return RangeSpec::Part {
+            start: total.saturating_sub(n),
+            end: total - 1,
+        };
+    }
+    let Ok(start) = first.parse::<u64>() else {
+        return RangeSpec::Whole;
+    };
+    if start >= total {
+        return RangeSpec::Unsatisfiable;
+    }
+    let end = if last.is_empty() {
+        total - 1
+    } else {
+        match last.parse::<u64>() {
+            Ok(e) => e.min(total - 1),
+            Err(_) => return RangeSpec::Whole,
+        }
+    };
+    if end < start {
+        return RangeSpec::Unsatisfiable;
+    }
+    RangeSpec::Part { start, end }
 }
 
 // ============================================================================
@@ -1869,7 +1967,10 @@ pub fn handle_files_request(
             respond_json(request, deps, status, &body)
         }
         (tiny_http::Method::Get, "/api/files/download") => {
-            respond_download(request, deps, root_param.as_deref(), &rel)
+            // `?disposition=inline` は**同じ経路の見せ方の指定**（新しい受け口ではない）。
+            // 認可も解決も上の 3 本とまったく同じ 1 実装を通る（#1472）
+            let inline = query_value(url_full, "disposition").as_deref() == Some("inline");
+            respond_download(request, deps, root_param.as_deref(), &rel, inline)
         }
         // --- 押し出せていない保存（#1085 / #966） ---
         (tiny_http::Method::Get, "/api/files/pending") => {
@@ -2424,8 +2525,24 @@ fn ssh_content_payload(deps: &FilesDeps, target: &SshResolved) -> Result<Value, 
     }))
 }
 
-/// ダウンロード（ローカル / SSH 先の両方。ストリーミング）
-fn respond_download(request: tiny_http::Request, deps: &FilesDeps, root: Option<&str>, rel: &str) {
+/// ダウンロード（ローカル / SSH 先の両方。ストリーミング）。
+///
+/// #1472 で 2 つだけ増えた。**経路も認可も 1 バイトも変えていない**:
+/// - `Range: bytes=…` があれば部分（206）で返す（`<video>` のシーク）
+/// - `?disposition=inline` なら `Content-Type` を実体の型にして `inline` で返す
+///   （`<img>` / `<video>` の src に使えるようにする）
+fn respond_download(
+    request: tiny_http::Request,
+    deps: &FilesDeps,
+    root: Option<&str>,
+    rel: &str,
+    inline: bool,
+) {
+    let range = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Range"))
+        .map(|h| h.value.as_str().to_string());
     let Some(root) = root else {
         return respond_denial(request, deps, Denial::UnknownRoot);
     };
@@ -2444,7 +2561,7 @@ fn respond_download(request: tiny_http::Request, deps: &FilesDeps, root: Option<
         match prepare_ssh_download(deps, &target) {
             Ok((file, name, size)) => {
                 (deps.audit)("files", audit_payload("ssh_download", size, 0));
-                respond_file(request, deps, file, &name)
+                respond_file(request, deps, file, &name, size, range.as_deref(), inline)
             }
             Err(f) => respond_json(request, deps, f.status, &f.to_json()),
         }
@@ -2465,7 +2582,7 @@ fn respond_download(request: tiny_http::Request, deps: &FilesDeps, root: Option<
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| "download".to_string());
             (deps.audit)("files", audit_payload("download", size, 0));
-            respond_file(request, deps, file, &name)
+            respond_file(request, deps, file, &name, size, range.as_deref(), inline)
         }
         Err(d) => respond_denial(request, deps, d),
     }
@@ -2489,19 +2606,87 @@ fn prepare_ssh_download(
     Ok((file, tako_core::remote_fs::base_name(&target.path), size))
 }
 
-/// ファイルを添付としてストリーミングする（ローカルと SSH 先で 1 実装）
-fn respond_file(request: tiny_http::Request, deps: &FilesDeps, file: std::fs::File, name: &str) {
-    let mut resp = tiny_http::Response::from_file(file)
-        .with_header(header(b"Content-Type", b"application/octet-stream"))
-        .with_header(header_or(
-            b"Content-Disposition",
-            &content_disposition(name),
-            b"attachment",
-        ));
-    for h in deps.cors.clone() {
-        resp = resp.with_header(h);
+/// ファイルをストリーミングする（ローカルと SSH 先・全体と部分で **1 実装**）。
+///
+/// 全体でも部分でも `Response` を組み立てるのはここだけ。
+/// **`Read` を丸ごとメモリへ載せない**（全体は `from_file`・部分は `Take` で、
+/// どちらも tiny_http が読みながら書き出す = 300 MB でも常駐量は増えない）
+fn respond_file(
+    request: tiny_http::Request,
+    deps: &FilesDeps,
+    file: std::fs::File,
+    name: &str,
+    size: u64,
+    range: Option<&str>,
+    inline: bool,
+) {
+    use std::io::{Read as _, Seek as _};
+
+    // インライン表示のときだけ実体の型を名乗る（表は `tako_core::open_plan` の 1 本）
+    let ctype = if inline {
+        tako_core::open_plan::media_type(std::path::Path::new(name))
+            .unwrap_or("application/octet-stream")
+    } else {
+        "application/octet-stream"
+    };
+    let disposition = if inline {
+        content_disposition_inline(name)
+    } else {
+        content_disposition(name)
+    };
+    let fallback: &[u8] = if inline { b"inline" } else { b"attachment" };
+    // 共通ヘッダ。`Accept-Ranges` は**常に**出す（出さないと `<video>` がシークを諦める）
+    let mut common = vec![
+        header(b"Content-Type", ctype.as_bytes()),
+        header_or(b"Content-Disposition", &disposition, fallback),
+        header(b"Accept-Ranges", b"bytes"),
+        header(b"Cache-Control", b"no-store, private"),
+    ];
+    common.extend(deps.cors.clone());
+
+    // 実体（全体 / 部分 / 満たせない）を選ぶ。**組み立てと送出は下の 1 か所だけ**
+    // （応答経路を枝ごとに書くと、`no-store` のような共通ヘッダを付け忘れる枝ができる）
+    let mut file = file;
+    let spec = parse_range(range, size);
+    // シークできない実体（あり得ないが）は全体へ倒す = 無言で切らない
+    let seeked = match spec {
+        RangeSpec::Part { start, .. } => file.seek(std::io::SeekFrom::Start(start)).is_ok(),
+        _ => true,
+    };
+    let (status, reader, len, content_range): (
+        u16,
+        Box<dyn std::io::Read + Send>,
+        u64,
+        Option<String>,
+    ) = match spec {
+        RangeSpec::Part { start, end } if seeked => {
+            let len = end - start + 1;
+            (
+                206,
+                Box::new(file.take(len)),
+                len,
+                Some(format!("bytes {start}-{end}/{size}")),
+            )
+        }
+        RangeSpec::Unsatisfiable => (
+            416,
+            Box::new(std::io::empty()),
+            0,
+            Some(format!("bytes */{size}")),
+        ),
+        _ => (200, Box::new(file), size, None),
+    };
+
+    let mut resp = tiny_http::Response::new(
+        tiny_http::StatusCode(status),
+        common,
+        reader,
+        Some(len as usize),
+        None,
+    );
+    if let Some(range) = content_range {
+        resp = resp.with_header(header_or(b"Content-Range", &range, b"bytes */0"));
     }
-    resp = resp.with_header(header(b"Cache-Control", b"no-store, private"));
     let _ = request.respond(resp);
 }
 
@@ -3034,6 +3219,111 @@ mod tests {
         assert!(jp.contains("%E5%A0%B1"), "jp={jp}");
         // 安全文字が 1 つも無い名前でも空にならない
         assert!(content_disposition("///").contains("\"download\""));
+    }
+
+    /// #1472: インライン版は**同じ組み立て**で先頭の語だけが違う
+    #[test]
+    fn inlineのdispositionは組み立てを共有する() {
+        let att = content_disposition("報告書.pdf");
+        let inl = content_disposition_inline("報告書.pdf");
+        assert!(att.starts_with("attachment; "), "att={att}");
+        assert!(inl.starts_with("inline; "), "inl={inl}");
+        assert_eq!(
+            att.trim_start_matches("attachment; "),
+            inl.trim_start_matches("inline; "),
+            "名前の逃がし方が 2 通りに割れている"
+        );
+        // ヘッダを壊せないのも同じ（1 実装なので当然だが、外れたら落とす）
+        let evil = content_disposition_inline("a\"; drop\r\nX-Evil: 1\r\n\r\n.txt");
+        assert!(!evil.contains('\r') && !evil.contains('\n'), "evil={evil}");
+    }
+
+    /// #1472: `Range` の解釈（**この 1 実装だけが Range を読む**）
+    #[test]
+    fn rangeの解釈() {
+        use RangeSpec::*;
+        const TOTAL: u64 = 1000;
+        // ヘッダが無い / 単位が違う / 複数範囲 / 壊れている → 全体
+        assert_eq!(parse_range(None, TOTAL), Whole);
+        assert_eq!(parse_range(Some("items=0-9"), TOTAL), Whole);
+        assert_eq!(parse_range(Some("bytes=0-9,20-29"), TOTAL), Whole);
+        assert_eq!(parse_range(Some("bytes=abc"), TOTAL), Whole);
+        assert_eq!(parse_range(Some("bytes=x-9"), TOTAL), Whole);
+        assert_eq!(parse_range(Some("bytes=0-x"), TOTAL), Whole);
+        // 通常の範囲（両端を含む）
+        assert_eq!(
+            parse_range(Some("bytes=0-1"), TOTAL),
+            Part { start: 0, end: 1 }
+        );
+        assert_eq!(
+            parse_range(Some("BYTES=100-199"), TOTAL),
+            Part {
+                start: 100,
+                end: 199
+            },
+            "単位の綴りは大文字小文字を問わない"
+        );
+        // 終端が実体を超えたら末尾へ丸める
+        assert_eq!(
+            parse_range(Some("bytes=990-99999"), TOTAL),
+            Part {
+                start: 990,
+                end: 999
+            }
+        );
+        // 開いた範囲は末尾まで
+        assert_eq!(
+            parse_range(Some("bytes=999-"), TOTAL),
+            Part {
+                start: 999,
+                end: 999
+            }
+        );
+        // 末尾 n バイト
+        assert_eq!(
+            parse_range(Some("bytes=-10"), TOTAL),
+            Part {
+                start: 990,
+                end: 999
+            }
+        );
+        assert_eq!(
+            parse_range(Some("bytes=-99999"), TOTAL),
+            Part { start: 0, end: 999 },
+            "実体より長い suffix は先頭で止める"
+        );
+        // 満たせない
+        assert_eq!(parse_range(Some("bytes=1000-"), TOTAL), Unsatisfiable);
+        assert_eq!(parse_range(Some("bytes=1000-1009"), TOTAL), Unsatisfiable);
+        assert_eq!(parse_range(Some("bytes=-0"), TOTAL), Unsatisfiable);
+        assert_eq!(
+            parse_range(Some("bytes=0-0"), 0),
+            Unsatisfiable,
+            "長さ 0 の実体"
+        );
+        assert_eq!(
+            parse_range(None, 0),
+            Whole,
+            "Range が無ければ 0 バイトでも 200"
+        );
+    }
+
+    /// #1472: 部分の長さが「両端を含む」勘定になっている（オフバイワン検出）
+    #[test]
+    fn 部分の長さは両端を含む() {
+        for (spec, want_len) in [
+            ("bytes=0-0", 1u64),
+            ("bytes=0-1", 2),
+            ("bytes=0-999", 1000),
+            ("bytes=-1", 1),
+            ("bytes=500-", 500),
+        ] {
+            let RangeSpec::Part { start, end } = parse_range(Some(spec), 1000) else {
+                panic!("{spec}: 部分にならない");
+            };
+            assert_eq!(end - start + 1, want_len, "{spec}");
+            assert!(end < 1000, "{spec}: 終端が実体の外");
+        }
     }
 
     #[test]
