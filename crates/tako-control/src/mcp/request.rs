@@ -765,6 +765,8 @@ pub(super) fn build_request(
             mode: str_arg(args, "mode")?.map(|s| s.to_string()),
             power_condition: str_arg(args, "power_condition")?.map(|s| s.to_string()),
             lid_sleep_mode: str_arg(args, "lid_sleep_mode")?.map(|s| s.to_string()),
+            lid_power_condition: str_arg(args, "lid_power_condition")?.map(|s| s.to_string()),
+            lid_battery_floor: i64_arg(args, "lid_battery_floor")?,
         },
         "tako_theme" => Request::Theme {
             action: str_arg(args, "action")?.map(|s| s.to_string()),

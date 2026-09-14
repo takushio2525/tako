@@ -3832,17 +3832,14 @@ fn dispatch_inner(
             mode,
             power_condition,
             lid_sleep_mode,
+            lid_power_condition,
+            lid_battery_floor,
         } => {
             let action = action.as_deref().unwrap_or("status");
             match action {
                 "status" => {
                     let settings = crate::settings::load();
-                    Ok(crate::sleep_guard::status(
-                        settings.sleep_guard_mode,
-                        settings.sleep_guard_power,
-                        settings.lid_sleep_mode,
-                    )
-                    .to_json())
+                    Ok(crate::sleep_guard::status(settings.sleep_guard_config()).to_json())
                 }
                 "set" => {
                     let mut settings = crate::settings::load();
@@ -3876,14 +3873,26 @@ fn dispatch_inner(
                                 },
                             )?;
                     }
+                    // #1473: 蓋閉じ継続の電源条件と残量下限（アイドルスリープ側とは別の軸）
+                    if let Some(pc) = lid_power_condition.as_deref() {
+                        settings.lid_sleep_power =
+                            crate::sleep_guard::PowerCondition::from_str_opt(pc).ok_or_else(
+                                || {
+                                    DispatchError::InvalidParams(format!(
+                                        "不明な lid_power_condition: {pc:?}（{}）",
+                                        crate::sleep_guard::PowerCondition::values_hint()
+                                    ))
+                                },
+                            )?;
+                    }
+                    if let Some(floor) = lid_battery_floor {
+                        settings.lid_battery_floor =
+                            crate::sleep_guard::parse_battery_floor(floor)
+                                .map_err(DispatchError::InvalidParams)?;
+                    }
                     crate::settings::save(&settings)
                         .map_err(|e| DispatchError::Operation(format!("設定の保存に失敗: {e}")))?;
-                    Ok(crate::sleep_guard::status(
-                        settings.sleep_guard_mode,
-                        settings.sleep_guard_power,
-                        settings.lid_sleep_mode,
-                    )
-                    .to_json())
+                    Ok(crate::sleep_guard::status(settings.sleep_guard_config()).to_json())
                 }
                 // 手段（macOS = sudoers 登録 / Windows = 権限不要）は `sleep_guard` 側に
                 // 閉じているので、ここは OS を意識しない単一経路にする（#697）。

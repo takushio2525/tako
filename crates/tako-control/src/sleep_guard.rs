@@ -99,6 +99,9 @@ pub enum PowerCondition {
 }
 
 impl PowerCondition {
+    /// 受理・申告する値の正本（#1467。MCP カタログの enum はここから生成する）
+    pub const VALUES: &'static [&'static str] = &["ac-only", "always"];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::AcOnly => "ac-only",
@@ -112,6 +115,50 @@ impl PowerCondition {
             "always" => Some(Self::Always),
             _ => None,
         }
+    }
+
+    /// 各値の意味（`match` なので変種を足すとコンパイルが通らない = 値だけ増えて
+    /// 説明が古くなることがない。#1467）
+    pub fn summary(self) -> &'static str {
+        match self {
+            Self::AcOnly => "ac-only = AC 電源に接続しているときだけ",
+            Self::Always => "always = バッテリー駆動でも",
+        }
+    }
+
+    /// MCP / CLI の案内文（受理値と意味を 1 行で）
+    pub fn values_hint() -> String {
+        Self::VALUES
+            .iter()
+            .filter_map(|v| Self::from_str_opt(v))
+            .map(|v| v.summary().to_string())
+            .collect::<Vec<_>>()
+            .join(" / ")
+    }
+}
+
+/// 蓋閉じ継続をバッテリーで続けるときの残量下限の既定値（%。#1473）
+pub const DEFAULT_LID_BATTERY_FLOOR: u8 = 20;
+/// 残量下限として受け付ける下端（%。#1473）。
+///
+/// **0 を許さない**のは安全弁そのものを外せてしまうため（鞄の中で空になる）
+pub const LID_BATTERY_FLOOR_MIN: u8 = 5;
+/// 残量下限として受け付ける上端（%。#1473）。
+///
+/// これより上を許すと、常に下限を割った状態になって蓋閉じ継続が
+/// 「設定したのに一度も効かない」ように見える
+pub const LID_BATTERY_FLOOR_MAX: u8 = 90;
+
+/// 残量下限の入力を検証する（CLI / MCP / 設定画面が同じ 1 実装を通る。#1473）
+pub fn parse_battery_floor(percent: i64) -> Result<u8, String> {
+    let min = i64::from(LID_BATTERY_FLOOR_MIN);
+    let max = i64::from(LID_BATTERY_FLOOR_MAX);
+    if (min..=max).contains(&percent) {
+        Ok(percent as u8)
+    } else {
+        Err(format!(
+            "残量下限は {LID_BATTERY_FLOOR_MIN}〜{LID_BATTERY_FLOOR_MAX} の範囲で指定してください（指定値: {percent}）"
+        ))
     }
 }
 
@@ -150,6 +197,175 @@ impl ThermalState {
             _ => None,
         }
     }
+
+    /// バッテリー駆動で蓋を閉じ続けるには温度が高すぎるか（#1473）。
+    ///
+    /// AC 接続時の [`Self::is_warning`] より**厳しい**（`fair` でも解除する）。
+    /// 蓋を閉じたバッテリー駆動は鞄の中である可能性が高く、放熱が閉じた状態から
+    /// さらに悪化しても誰も気づけないため、悪化の兆し（fair）で降りる
+    pub fn blocks_battery_lid(self) -> bool {
+        self != Self::Nominal
+    }
+}
+
+/// 蓋閉じ継続が効いていない理由（#1473）。
+///
+/// 判定 [`lid_decision`] の戻り値であり、**「なぜ無効か」を出すすべての面
+/// （`status` の description / CLI / 設定画面 / 通知欄 / persist.log）がこの 1 つを引く**。
+/// 真偽値だけを返していた頃は、画面ごとに理由を書き直していたので
+/// 片方だけ直すと表示が嘘になった（#727 で総当たりテストを足した理由）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LidSkipReason {
+    /// 蓋閉じ継続そのものが設定されていない
+    ModeOff,
+    /// 初回セットアップが済んでいない（macOS の sudoers 登録）
+    SetupRequired,
+    /// エージェントが 1 体も動いていない
+    NoAgents,
+    /// `ac-only` の設定で AC 未接続
+    NoAcPower,
+    /// バッテリー残量が下限以下（安全弁）
+    BatteryFloor { percent: u8, floor: u8 },
+    /// バッテリー駆動なのに残量を読めない（安全弁。読めない = 止められないので降りる）
+    BatteryUnknown,
+    /// 本体が高温（安全弁）
+    Thermal(ThermalState),
+}
+
+impl LidSkipReason {
+    /// 診断・JSON 用の識別子（ASCII 固定。本文は含めない）
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::ModeOff => "mode-off",
+            Self::SetupRequired => "setup-required",
+            Self::NoAgents => "no-agents",
+            Self::NoAcPower => "no-ac-power",
+            Self::BatteryFloor { .. } => "battery-floor",
+            Self::BatteryUnknown => "battery-unknown",
+            Self::Thermal(_) => "thermal",
+        }
+    }
+
+    /// 安全弁による解除か（#1473）。
+    ///
+    /// **通知欄へ出すのはこれが真のものだけ**。`NoAgents` / `NoAcPower` /
+    /// `ModeOff` は設定どおりの正常な動きなので、バナーにすると
+    /// エージェントが一段落するたびに画面へ出る
+    pub fn is_safety_valve(self) -> bool {
+        matches!(
+            self,
+            Self::BatteryFloor { .. } | Self::BatteryUnknown | Self::Thermal(_)
+        )
+    }
+
+    /// 人が読む理由（`status` の description と CLI が使う。UI の日英は
+    /// `tako-app::ui_text::sleep_guard` が同じ分類から作る）
+    pub fn describe(self) -> String {
+        match self {
+            Self::ModeOff => "未設定".to_string(),
+            Self::SetupRequired => {
+                "sudoers 未登録（tako setup --lid-sleep で登録）".to_string()
+            }
+            Self::NoAgents => "エージェント待機中のため無効".to_string(),
+            Self::NoAcPower => {
+                "AC 未接続のため無効（tako sleep-guard set --lid-power-condition always でバッテリーでも継続）"
+                    .to_string()
+            }
+            Self::BatteryFloor { percent, floor } => {
+                format!("バッテリー残量 {percent}% が下限 {floor}% 以下のため解除")
+            }
+            Self::BatteryUnknown => {
+                "バッテリー残量を取得できないため解除（安全弁）".to_string()
+            }
+            Self::Thermal(state) => {
+                format!("本体が高温（{}）のため解除", state.as_str())
+            }
+        }
+    }
+
+    pub fn to_json(self) -> Value {
+        let mut v = json!({ "reason": self.tag(), "text": self.describe() });
+        match self {
+            Self::BatteryFloor { percent, floor } => {
+                v["battery_percent"] = json!(percent);
+                v["battery_floor"] = json!(floor);
+            }
+            Self::Thermal(state) => v["thermal_state"] = json!(state.as_str()),
+            _ => {}
+        }
+        v
+    }
+
+    /// [`Self::to_json`] の逆（#372 と同じ理由: CLI は IPC の JSON を型へ戻して
+    /// **同じレンダラ**へ通すので、往復できないと理由が CLI からだけ消える）
+    pub fn from_json(v: &Value) -> Option<Self> {
+        match v["reason"].as_str()? {
+            "mode-off" => Some(Self::ModeOff),
+            "setup-required" => Some(Self::SetupRequired),
+            "no-agents" => Some(Self::NoAgents),
+            "no-ac-power" => Some(Self::NoAcPower),
+            "battery-floor" => Some(Self::BatteryFloor {
+                percent: u8::try_from(v["battery_percent"].as_u64()?).ok()?,
+                floor: u8::try_from(v["battery_floor"].as_u64()?).ok()?,
+            }),
+            "battery-unknown" => Some(Self::BatteryUnknown),
+            "thermal" => Some(Self::Thermal(ThermalState::from_str_opt(
+                v["thermal_state"].as_str()?,
+            )?)),
+            _ => None,
+        }
+    }
+}
+
+/// 蓋閉じ継続を倒すかどうかの判定材料（#1473）。
+///
+/// 引数を並べるのではなく型にするのは、**安全弁を足したときに
+/// 渡し忘れた呼び出し側がコンパイルで落ちる**ようにするため
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LidGuardInput {
+    pub lid_sleep_mode: LidSleepMode,
+    /// 初回セットアップが済んでいるか。macOS は sudoers 登録、
+    /// Windows は権限が要らないので常に `true`
+    pub setup_done: bool,
+    pub busy_agents: usize,
+    pub on_ac: bool,
+    /// 本体の温度。macOS のみ観測でき、Windows は常に `Nominal`
+    pub thermal: ThermalState,
+    /// 蓋閉じ継続の電源条件（#1473。アイドルスリープ側とは**別の軸**）
+    pub lid_power_condition: PowerCondition,
+    /// バッテリー残量（%）。読めない環境は `None`
+    pub battery_percent: Option<u8>,
+    /// 残量の下限（%）
+    pub battery_floor: u8,
+}
+
+/// スリープ防止の設定一式（#1473）。
+///
+/// `update` / `status` の引数を設定ごとに増やすと、呼び出し側（GUI の 2 秒 tick /
+/// dispatch / CLI）のどれかが更新漏れになる。1 つの型にして
+/// [`crate::settings::Settings::sleep_guard_config`] から作る 1 経路に寄せる
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SleepGuardConfig {
+    pub mode: SleepGuardMode,
+    /// アイドルスリープ防止の電源条件
+    pub power_condition: PowerCondition,
+    pub lid_sleep_mode: LidSleepMode,
+    /// 蓋閉じ継続の電源条件（#1473）
+    pub lid_power_condition: PowerCondition,
+    /// 蓋閉じ継続をバッテリーで続けるときの残量下限（%。#1473）
+    pub lid_battery_floor: u8,
+}
+
+impl Default for SleepGuardConfig {
+    fn default() -> Self {
+        Self {
+            mode: SleepGuardMode::default(),
+            power_condition: PowerCondition::default(),
+            lid_sleep_mode: LidSleepMode::default(),
+            lid_power_condition: PowerCondition::default(),
+            lid_battery_floor: DEFAULT_LID_BATTERY_FLOOR,
+        }
+    }
 }
 
 /// アサーションの現在の状態
@@ -185,6 +401,19 @@ pub struct SleepGuardState {
     pub thermal_state: ThermalState,
     /// ディスプレイ消灯を強制送信済みか（#311）
     pub display_sleep_forced: bool,
+    /// 蓋閉じ継続の電源条件（#1473。アイドルスリープ側の `power_condition` とは別軸）
+    pub lid_power_condition: PowerCondition,
+    /// 蓋閉じ継続をバッテリーで続けるときの残量下限（%。#1473）
+    pub lid_battery_floor: u8,
+    /// バッテリー残量（%）。読めない環境（デスクトップ機・Windows）は `None`（#1473）
+    pub battery_percent: Option<u8>,
+    /// 蓋閉じ継続が効いていない理由（#1473）。効くべき状態なら `None`。
+    ///
+    /// **判断したプロセスが載せる**（#372 と同じ理屈）。読む側が材料から計算し直すと、
+    /// CLI とアプリでバイナリや A/B のアームが違うときに「画面と実際の判断が別物」に
+    /// なる。作るのは [`update`] / [`status`] と [`SleepGuardState::from_json`] だけで、
+    /// どれも [`lid_decision`] の結果をそのまま入れる
+    pub lid_skip_reason: Option<LidSkipReason>,
 }
 
 impl SleepGuardState {
@@ -204,6 +433,11 @@ impl SleepGuardState {
             "lid_setup_required": self.lid_setup_required,
             "thermal_state": self.thermal_state.as_str(),
             "display_sleep_forced": self.display_sleep_forced,
+            "lid_power_condition": self.lid_power_condition.as_str(),
+            "lid_battery_floor": self.lid_battery_floor,
+            // 読めない環境は null（0% と区別する）
+            "battery_percent": self.battery_percent,
+            "lid_skip_reason": self.lid_skip_reason.map(|r| r.to_json()),
             "description": self.description(),
         })
     }
@@ -232,7 +466,42 @@ impl SleepGuardState {
             lid_setup_required: v["lid_setup_required"].as_bool()?,
             thermal_state: ThermalState::from_str_opt(v["thermal_state"].as_str()?)?,
             display_sleep_forced: v["display_sleep_forced"].as_bool()?,
+            lid_power_condition: PowerCondition::from_str_opt(v["lid_power_condition"].as_str()?)?,
+            lid_battery_floor: u8::try_from(v["lid_battery_floor"].as_u64()?).ok()?,
+            // `null`（読めない）と「キーが無い」（古い応答 = 嘘になる）を区別する
+            battery_percent: match v.get("battery_percent")? {
+                Value::Null => None,
+                other => Some(u8::try_from(other.as_u64()?).ok()?),
+            },
+            // `null`（倒すべき状態）と「キーが無い」（古い応答）を区別する
+            lid_skip_reason: match v.get("lid_skip_reason")? {
+                Value::Null => None,
+                other => Some(LidSkipReason::from_json(other)?),
+            },
         })
+    }
+
+    /// 蓋閉じ継続の判定材料（#1473）。
+    ///
+    /// 状態は判定に要るものをすべて持っているので、理由を**フィールドで運ばずに
+    /// ここから計算する**。CLI / 設定画面 / 通知が同じ 1 実装（[`lid_decision`]）を通る
+    pub fn lid_input(&self) -> LidGuardInput {
+        LidGuardInput {
+            lid_sleep_mode: self.lid_sleep_mode,
+            setup_done: !self.lid_setup_required,
+            busy_agents: self.busy_agents,
+            on_ac: self.on_ac_power,
+            thermal: self.thermal_state,
+            lid_power_condition: self.lid_power_condition,
+            battery_percent: self.battery_percent,
+            battery_floor: self.lid_battery_floor,
+        }
+    }
+
+    /// 材料から理由を計算して埋める（#1473）。[`update`] / [`status`] の締めで通す
+    fn with_decision(mut self) -> Self {
+        self.lid_skip_reason = lid_decision(&self.lid_input()).err();
+        self
     }
 
     fn description(&self) -> String {
@@ -263,28 +532,30 @@ impl SleepGuardState {
 
         let lid_desc = if self.lid_sleep_disabled {
             if self.thermal_state.is_warning() {
-                "蓋閉じ継続: 有効（高温警告中）"
+                "蓋閉じ継続: 有効（高温警告中）".to_string()
             } else if self.display_sleep_forced {
-                "蓋閉じ継続: 有効（ディスプレイ消灯済み）"
+                "蓋閉じ継続: 有効（ディスプレイ消灯済み）".to_string()
+            } else if !self.on_ac_power {
+                // #1473: バッテリーで継続しているあいだは残量が減り続けるので、
+                // 「効いている」だけでなく**いま何 % か・どこで降りるか**まで出す
+                match self.battery_percent {
+                    Some(p) => format!(
+                        "蓋閉じ継続: 有効（バッテリー {p}%・下限 {}%）",
+                        self.lid_battery_floor
+                    ),
+                    None => "蓋閉じ継続: 有効（バッテリー駆動）".to_string(),
+                }
             } else {
-                "蓋閉じ継続: 有効"
+                "蓋閉じ継続: 有効".to_string()
             }
         } else {
-            match self.lid_sleep_mode {
-                LidSleepMode::Off => "蓋閉じ継続: 未設定",
-                LidSleepMode::WhileAgentsRunning => {
-                    // 手段（sudoers）ではなく「未完了か」で分岐する。
-                    // Windows は権限が要らないのでこの枝に入らない（#697）
-                    if self.lid_setup_required {
-                        "蓋閉じ継続: sudoers 未登録（tako setup --lid-sleep で登録）"
-                    } else if self.busy_agents == 0 {
-                        "蓋閉じ継続: エージェント待機中のため無効"
-                    } else if !self.on_ac_power {
-                        "蓋閉じ継続: AC 未接続のため無効"
-                    } else {
-                        "蓋閉じ継続: 無効"
-                    }
-                }
+            // #1473: 「なぜ無効か」は判定の 1 実装が返した理由をそのまま出す。
+            // 手段（sudoers）ではなく「未完了か」で分岐するのは #697 のまま
+            match self.lid_skip_reason {
+                Some(LidSkipReason::ModeOff) => "蓋閉じ継続: 未設定".to_string(),
+                Some(reason) => format!("蓋閉じ継続: {}", reason.describe()),
+                // 倒すべき状態なのに倒れていない = 反映待ち（2 秒 tick の隙間）
+                None => "蓋閉じ継続: 無効".to_string(),
             }
         };
 
@@ -307,6 +578,9 @@ mod iokit {
     const K_CFSTRING_ENCODING_UTF8: CFStringEncoding = 0x08000100;
     const K_IOPM_ASSERTION_LEVEL_ON: u32 = 255;
 
+    /// `CFNumberGetValue` の型指定（kCFNumberSInt32Type）
+    const K_CFNUMBER_SINT32_TYPE: i32 = 3;
+
     #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
         fn CFStringCreateWithCString(
@@ -316,6 +590,11 @@ mod iokit {
         ) -> CFStringRef;
         fn CFRelease(cf: *const c_void);
         fn CFBooleanGetValue(boolean: CFBooleanRef) -> bool;
+        // バッテリー残量の読み取り（#1473）
+        fn CFArrayGetCount(array: *const c_void) -> isize;
+        fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
+        fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
+        fn CFNumberGetValue(number: *const c_void, the_type: i32, value: *mut c_void) -> bool;
     }
 
     /// AC 接続時の IOPSGetTimeRemainingEstimate 戻り値（kIOPSTimeRemainingUnlimited）
@@ -334,6 +613,10 @@ mod iokit {
         ) -> IOReturn;
         fn IOPMAssertionRelease(assertion_id: IOPMAssertionID) -> IOReturn;
         fn IOPSGetTimeRemainingEstimate() -> f64;
+        // バッテリー残量の読み取り（#1473）。Copy で返るものは CFRelease が要る
+        fn IOPSCopyPowerSourcesInfo() -> *const c_void;
+        fn IOPSCopyPowerSourcesList(blob: *const c_void) -> *const c_void;
+        fn IOPSGetPowerSourceDescription(blob: *const c_void, ps: *const c_void) -> *const c_void;
 
         fn IOServiceGetMatchingService(main_port: MachPort, matching: *const c_void) -> u32;
         fn IOServiceMatching(name: *const u8) -> *mut c_void;
@@ -414,6 +697,69 @@ mod iokit {
     /// （fork+exec は 1 回 20〜30ms、CPU 飽和時は秒級までブロックする。#212）
     pub fn on_ac_power() -> bool {
         unsafe { IOPSGetTimeRemainingEstimate() == K_IOPS_TIME_REMAINING_UNLIMITED }
+    }
+
+    /// CFNumber を i32 として読む（#1473）
+    fn cf_number_i32(value: *const c_void) -> Option<i32> {
+        if value.is_null() {
+            return None;
+        }
+        let mut out: i32 = 0;
+        let ok = unsafe {
+            CFNumberGetValue(
+                value,
+                K_CFNUMBER_SINT32_TYPE,
+                std::ptr::addr_of_mut!(out) as *mut c_void,
+            )
+        };
+        ok.then_some(out)
+    }
+
+    /// バッテリー残量（%。IOPowerSources。root 不要、#1473）。
+    ///
+    /// デスクトップ機・電源が 1 つも列挙されない環境は `None`。
+    /// `on_ac_power` と同じく **UI スレッドから 2 秒毎に呼ばれる**ので
+    /// サブプロセス（`pmset -g batt`）は使わない（#212）
+    pub fn battery_percent() -> Option<u8> {
+        unsafe {
+            let blob = IOPSCopyPowerSourcesInfo();
+            if blob.is_null() {
+                return None;
+            }
+            let list = IOPSCopyPowerSourcesList(blob);
+            if list.is_null() {
+                CFRelease(blob);
+                return None;
+            }
+            let mut result = None;
+            for i in 0..CFArrayGetCount(list) {
+                let source = CFArrayGetValueAtIndex(list, i);
+                if source.is_null() {
+                    continue;
+                }
+                // Get = 所有権は blob 側（CFRelease しない）
+                let desc = IOPSGetPowerSourceDescription(blob, source);
+                if desc.is_null() {
+                    continue;
+                }
+                let current_key = cf_string("Current Capacity");
+                let max_key = cf_string("Max Capacity");
+                let current = cf_number_i32(CFDictionaryGetValue(desc, current_key));
+                let max = cf_number_i32(CFDictionaryGetValue(desc, max_key));
+                CFRelease(current_key);
+                CFRelease(max_key);
+                if let (Some(current), Some(max)) = (current, max) {
+                    if max > 0 {
+                        let ratio = f64::from(current) / f64::from(max) * 100.0;
+                        result = Some(ratio.round().clamp(0.0, 100.0) as u8);
+                        break;
+                    }
+                }
+            }
+            CFRelease(list);
+            CFRelease(blob);
+            result
+        }
     }
 
     /// 蓋が閉じているか（IORegistry AppleClamshellState。root 不要、#218）。
@@ -796,22 +1142,204 @@ pub fn should_hold_assertion(
 ///   Windows は権限が要らないので常に `true`
 /// - `thermal_warning`: 本体が高温か。macOS のみ取得でき、Windows は常に `false`
 ///
-/// **AC 接続を条件にするのは意図的**。蓋を閉じて持ち歩くのはたいていバッテリー駆動なので、
-/// バッテリー時まで蓋閉じ継続を効かせると鞄の中で電池が尽きる
+/// **AC 接続を既定の条件にするのは意図的**。蓋を閉じて持ち歩くのはたいていバッテリー
+/// 駆動なので、何も設定していない人にまで効かせると鞄の中で電池が尽きる。#1473 で
+/// `lid_power_condition = always` を**明示した人だけ**バッテリーでも継続できるようにし、
+/// そのときは安全弁（残量下限・thermal・エージェント稼働中のみ）を必ず通す。
 ///
 /// `should_hold_assertion` と同じ理由で `pub`（#727）
-pub fn should_disable_lid_sleep(
-    lid_sleep_mode: LidSleepMode,
-    setup_done: bool,
-    busy_agents: usize,
-    on_ac: bool,
-    thermal_warning: bool,
-) -> bool {
-    lid_sleep_mode == LidSleepMode::WhileAgentsRunning
-        && setup_done
-        && busy_agents > 0
-        && on_ac
-        && !thermal_warning
+pub fn should_disable_lid_sleep(input: &LidGuardInput) -> bool {
+    lid_decision(input).is_ok()
+}
+
+/// 蓋閉じ継続を倒すか、倒さないならなぜかを返す（#1473）。
+///
+/// **理由を返す 1 実装**。`status` の description・CLI・設定画面の状態・通知欄・
+/// persist.log がすべてここを通るので、表示と実際の判定がずれない。
+///
+/// 安全弁の順序は「人が読んで納得する順」= 設定 → セットアップ → 稼働 → 電源 →
+/// 温度 → 残量。どれか 1 つでも欠けたら倒さない
+pub fn lid_decision(input: &LidGuardInput) -> Result<(), LidSkipReason> {
+    // A/B: #1473 より前の挙動（AC 接続時のみ・残量下限なし・thermal は serious 以上）
+    let input = &legacy_lid_input(input);
+
+    if input.lid_sleep_mode != LidSleepMode::WhileAgentsRunning {
+        return Err(LidSkipReason::ModeOff);
+    }
+    if !input.setup_done {
+        return Err(LidSkipReason::SetupRequired);
+    }
+    if input.busy_agents == 0 {
+        return Err(LidSkipReason::NoAgents);
+    }
+    if !input.on_ac && input.lid_power_condition == PowerCondition::AcOnly {
+        return Err(LidSkipReason::NoAcPower);
+    }
+    // 温度の物差しは電源で変える。AC なら従来どおり serious 以上、バッテリーで
+    // 蓋を閉じているなら悪化の兆し（fair）で降りる（放熱が塞がった鞄の中を想定）
+    let too_hot = if input.on_ac {
+        input.thermal.is_warning()
+    } else {
+        input.thermal.blocks_battery_lid()
+    };
+    if too_hot {
+        return Err(LidSkipReason::Thermal(input.thermal));
+    }
+    // 残量の安全弁はバッテリー駆動のときだけ意味がある（AC 中は減らない）。
+    // **読めないときは倒さない**（止める条件を持てないまま走り続けるのが最悪）
+    if !input.on_ac {
+        match input.battery_percent {
+            Some(percent) if percent <= input.battery_floor => {
+                return Err(LidSkipReason::BatteryFloor {
+                    percent,
+                    floor: input.battery_floor,
+                })
+            }
+            None => return Err(LidSkipReason::BatteryUnknown),
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// #1473 の A/B。`TAKO_1473_LEGACY=1` で**同一バイナリのまま**旧挙動
+/// （蓋閉じ継続は AC 接続時のみ）へ戻す
+pub fn legacy_1473() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_1473_LEGACY").map(|v| v == "1") == Ok(true))
+}
+
+/// A/B のアームで入力を旧相当へ丸める（#1473）。
+///
+/// 判定の本体を 2 本に割らないため、**入口で材料のほうを旧世界に戻す**
+/// （`ac-only` 固定 = バッテリーでは `NoAcPower` で必ず降りるので、
+/// 残量下限も温度の新しい物差しも到達しない）
+fn legacy_lid_input(input: &LidGuardInput) -> LidGuardInput {
+    if !legacy_1473() {
+        return *input;
+    }
+    LidGuardInput {
+        lid_power_condition: PowerCondition::AcOnly,
+        ..*input
+    }
+}
+
+/// 蓋閉じ継続の状態が変わったときに画面へ出すもの（#1473）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LidNotice {
+    /// 安全弁が働いて蓋閉じ継続を解除した
+    Released(LidSkipReason),
+    /// 解除していたものを再適用した
+    Reapplied,
+}
+
+/// 前回と今回の状態から、通知欄へ出すべき変化を求める（#1473。純粋関数）。
+///
+/// **出すのは安全弁による解除と、その回復だけ**。エージェントが一段落した
+/// （`NoAgents`）・AC を抜いた（`NoAcPower`）は設定どおりの正常な動きなので、
+/// バナーにすると作業のたびに画面へ出る（診断には persist.log の 1 行が残る）。
+///
+/// `ac-only`（既定）の人には何も出さない。バッテリー継続を選んだ人にとってだけ
+/// 「止まったのか・続いているのか」が読めないと困る情報だから
+pub fn lid_notice(prev: Option<&SleepGuardState>, next: &SleepGuardState) -> Option<LidNotice> {
+    if next.lid_power_condition != PowerCondition::Always
+        || next.lid_sleep_mode != LidSleepMode::WhileAgentsRunning
+    {
+        return None;
+    }
+    let prev = prev?;
+    match (prev.lid_sleep_disabled, next.lid_sleep_disabled) {
+        // 効いていたものが落ちた: 落ちた理由が安全弁のときだけ出す
+        (true, false) => next
+            .lid_skip_reason
+            .filter(|r| r.is_safety_valve())
+            .map(LidNotice::Released),
+        // 落ちていたものが戻った: 直前が安全弁で落ちていたときだけ出す
+        // （エージェントが動き出しただけの再開は通知しない）
+        (false, true) => prev
+            .lid_skip_reason
+            .filter(|r| r.is_safety_valve())
+            .map(|_| LidNotice::Reapplied),
+        _ => None,
+    }
+}
+
+/// 検証用の注入（`TAKO_1473_INJECT_*`）が効く環境か（#1473）。
+///
+/// **本番の GUI では常に false**。バッテリー残量と thermal は
+/// `pmset disablesleep` を実際に倒す材料なので、env で本番の判断を
+/// 左右できるようにしてはいけない。隔離起動（`TAKO_ISOLATED`）と
+/// セルフテスト（`TAKO_SELF_TEST`）のときだけ読む
+fn inject_allowed() -> bool {
+    inject_allowed_from(
+        std::env::var("TAKO_ISOLATED").ok().as_deref(),
+        std::env::var_os("TAKO_SELF_TEST").is_some(),
+    )
+}
+
+/// [`inject_allowed`] の純粋部分（env を触らずに検査できる形にしておく）
+fn inject_allowed_from(isolated: Option<&str>, self_test: bool) -> bool {
+    tako_core::tmux_cleanup::is_isolated_value(isolated) || self_test
+}
+
+/// バッテリー残量の注入（`TAKO_1473_INJECT_BATTERY=15`）。範囲外は無視する
+fn injected_battery_percent() -> Option<u8> {
+    if !inject_allowed() {
+        return None;
+    }
+    parse_injected_battery(std::env::var("TAKO_1473_INJECT_BATTERY").ok().as_deref())
+}
+
+fn parse_injected_battery(value: Option<&str>) -> Option<u8> {
+    value
+        .and_then(|v| v.parse::<u8>().ok())
+        .filter(|p| *p <= 100)
+}
+
+/// thermal 状態の注入（`TAKO_1473_INJECT_THERMAL=serious`）
+fn injected_thermal() -> Option<ThermalState> {
+    if !inject_allowed() {
+        return None;
+    }
+    std::env::var("TAKO_1473_INJECT_THERMAL")
+        .ok()
+        .and_then(|v| ThermalState::from_str_opt(&v))
+}
+
+/// いまのバッテリー残量（%。#1473）。
+///
+/// デスクトップ機・バッテリーを持たない環境・読めない OS は `None`。
+/// 注入（隔離・セルフテストのみ）が在ればそれを優先する
+pub fn battery_percent() -> Option<u8> {
+    if let Some(p) = injected_battery_percent() {
+        return Some(p);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        iokit::battery_percent()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Windows の残量取得は #1473 の対象外。読めない = バッテリー駆動では
+        // 安全弁が働いて蓋閉じ継続に入らない（理由は status に出る）
+        None
+    }
+}
+
+/// いまの thermal 状態（#1473。注入を通す 1 実装）
+fn current_thermal() -> ThermalState {
+    if let Some(t) = injected_thermal() {
+        return t;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        iokit::thermal_state()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Windows は NSProcessInfo 相当を持たない（#218 からの既知の制約）
+        ThermalState::Nominal
+    }
 }
 
 /// 電源要求に添える理由文字列（#524）。
@@ -859,10 +1387,8 @@ fn should_clear_residual(
 /// `update()` は 2 秒ごとに呼ばれるので、書き込みが恒久的に失敗する環境
 /// （グループポリシーで電源プランが固定されている等）だと同じ行が延々と出る。
 /// **文言が変わったときだけ**出す
-#[cfg(not(target_os = "macos"))]
 static LAST_LID_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
-#[cfg(not(target_os = "macos"))]
 fn report_lid_error(msg: &str) {
     let mut last = match LAST_LID_ERROR.lock() {
         Ok(v) => v,
@@ -877,11 +1403,31 @@ fn report_lid_error(msg: &str) {
 }
 
 /// 成功したらエラーの記憶を捨てる（次に失敗したらまた 1 回出る）
-#[cfg(not(target_os = "macos"))]
 fn clear_lid_error() {
     if let Ok(mut last) = LAST_LID_ERROR.lock() {
         *last = None;
     }
+}
+
+/// 蓋閉じ継続を倒した / 戻したことを診断へ 1 行残す（#1473。**両 OS 経路の 1 実装**）。
+///
+/// 書式を 1 つにしておくと、`persist.log` を `lid-sleep:` で grep したときに
+/// macOS と Windows の記録が同じ形で並ぶ。載せるのは**理由の分類（ASCII のタグ）**と
+/// 残量だけで、本文や環境の値は載せない（#1376 と同じ作法）
+fn log_lid_change(enabled: bool, reason: Option<LidSkipReason>, battery: Option<u8>) {
+    let head = if enabled {
+        "蓋閉じ継続を有効化"
+    } else {
+        "蓋閉じ継続を解除"
+    };
+    let reason = match reason {
+        Some(r) => r.tag(),
+        None => "applied",
+    };
+    let battery = battery
+        .map(|p| format!(" battery={p}%"))
+        .unwrap_or_default();
+    crate::diag::persist_log(&format!("lid-sleep: {head} reason={reason}{battery}"));
 }
 
 /// 起動時の残留チェック: 蓋閉じ継続の上書きが残っていれば元へ戻す。
@@ -950,16 +1496,21 @@ pub fn open_battery_settings() -> Result<(), String> {
 
 /// スリープ防止の状態を更新する。busy_agents は現在 busy なエージェントの数。
 /// 設定に基づいてアサーションの取得・解放を行い、現在の状態を返す
-pub fn update(
-    mode: SleepGuardMode,
-    power_condition: PowerCondition,
-    lid_sleep_mode: LidSleepMode,
-    busy_agents: usize,
-) -> SleepGuardState {
+pub fn update(config: SleepGuardConfig, busy_agents: usize) -> SleepGuardState {
     BUSY_AGENTS.store(busy_agents, Ordering::Relaxed);
+    let SleepGuardConfig {
+        mode,
+        power_condition,
+        lid_sleep_mode,
+        lid_power_condition,
+        lid_battery_floor,
+    } = config;
+    // 材料の取得は OS ごとの実装に閉じつつ、**判定は 1 実装**（#1473）
+    let battery = battery_percent();
+    let thermal = current_thermal();
     #[cfg(not(target_os = "macos"))]
     {
-        // thermal 監視と蓋の開閉検知は macOS 固有のまま
+        // 蓋の開閉検知は macOS 固有のまま
         // （Windows の蓋の開閉は `RegisterPowerSettingNotification` にウィンドウハンドルが
         // 要り、ここからは取れない）。蓋閉じ継続そのものは電源プランの lid action で行う（#697）
         let on_ac = crate::platform::power::on_ac_power();
@@ -969,19 +1520,26 @@ pub fn update(
         // --- 蓋閉じ継続（#697: 電源プランの lid action を倒す） ---
         let lid_supported = lid_control_supported();
         if lid_supported {
-            // Windows は初回セットアップが要らないので setup_done = true、
-            // thermal は取得できないので警告なし扱い（判定関数は macOS と同一）
-            let should_disable =
-                should_disable_lid_sleep(lid_sleep_mode, true, busy_agents, on_ac, false);
-            // 倒すのは AC レールだけ。macOS 側も蓋閉じ継続は AC 接続時のみなので挙動が揃うし、
-            // バッテリー側を触らないことが残留時の安全弁にもなる
-            match crate::platform::lid::set_stay_awake(should_disable, false) {
+            // Windows は初回セットアップが要らないので setup_done = true。
+            // 判定関数と安全弁は macOS と同一（#1473）
+            let decision = lid_decision(&LidGuardInput {
+                lid_sleep_mode,
+                setup_done: true,
+                busy_agents,
+                on_ac,
+                thermal,
+                lid_power_condition,
+                battery_percent: battery,
+                battery_floor: lid_battery_floor,
+            });
+            let should_disable = decision.is_ok();
+            // 倒すレールは電源条件に合わせる（#1473）。`ac-only`（既定）では
+            // AC レールだけ = 従来どおりで、バッテリー側を触らないことが残留時の
+            // 安全弁にもなる。`always` を選んだときだけバッテリーレールも倒す
+            let include_battery = lid_power_condition == PowerCondition::Always;
+            match crate::platform::lid::set_stay_awake(should_disable, include_battery) {
                 Ok(true) => {
-                    crate::diag::persist_log(if should_disable {
-                        "lid-sleep: 蓋閉じ継続を有効化（電源プランの lid action を倒した）"
-                    } else {
-                        "lid-sleep: 蓋閉じ継続を解除（lid action を元へ戻した）"
-                    });
+                    log_lid_change(should_disable, decision.err(), battery);
                     clear_lid_error();
                 }
                 Ok(false) => {}
@@ -1007,15 +1565,19 @@ pub fn update(
             },
             sudoers_installed: false,
             lid_setup_required: false,
-            thermal_state: ThermalState::Nominal,
+            thermal_state: thermal,
             display_sleep_forced: false,
-        };
+            lid_power_condition,
+            lid_battery_floor,
+            battery_percent: battery,
+            lid_skip_reason: None,
+        }
+        .with_decision();
     }
     #[cfg(target_os = "macos")]
     {
         let on_ac = iokit::on_ac_power();
         let lid_closed = iokit::clamshell_closed();
-        let thermal = iokit::thermal_state();
         let sudoers = is_sudoers_installed();
 
         // --- アイドルスリープ防止（既存ロジック。判定は #524 で共通化） ---
@@ -1035,20 +1597,38 @@ pub fn update(
         }
 
         // --- 蓋閉じ防止（#218: pmset disablesleep） ---
-        // 判定は #697 で Windows と共通化した（真理値は従来と同じ）
+        // 判定は #697 で Windows と共通化し、#1473 で安全弁つきの 1 実装になった
         let current_disabled = iokit::sleep_disabled();
         if lid_sleep_mode == LidSleepMode::WhileAgentsRunning && sudoers {
-            let should_disable = should_disable_lid_sleep(
+            let decision = lid_decision(&LidGuardInput {
                 lid_sleep_mode,
-                sudoers,
+                setup_done: sudoers,
                 busy_agents,
                 on_ac,
-                thermal.is_warning(),
-            );
+                thermal,
+                lid_power_condition,
+                battery_percent: battery,
+                battery_floor: lid_battery_floor,
+            });
+            let should_disable = decision.is_ok();
+            // 倒した・戻したは診断へ残す（#1473。旧実装は結果を捨てていたので、
+            // 安全弁が働いて解除されても記録が何も残らなかった）
             if should_disable && !current_disabled {
-                let _ = set_disablesleep(true);
+                match set_disablesleep(true) {
+                    Ok(()) => {
+                        log_lid_change(true, None, battery);
+                        clear_lid_error();
+                    }
+                    Err(e) => report_lid_error(&e),
+                }
             } else if !should_disable && current_disabled {
-                let _ = set_disablesleep(false);
+                match set_disablesleep(false) {
+                    Ok(()) => {
+                        log_lid_change(false, decision.err(), battery);
+                        clear_lid_error();
+                    }
+                    Err(e) => report_lid_error(&e),
+                }
             }
         }
 
@@ -1079,17 +1659,27 @@ pub fn update(
             lid_setup_required: !sudoers,
             thermal_state: thermal,
             display_sleep_forced: iokit::display_sleep_sent(),
+            lid_power_condition,
+            lid_battery_floor,
+            battery_percent: battery,
+            lid_skip_reason: None,
         }
+        .with_decision()
     }
 }
 
 /// 現在の状態を取得する（副作用なし）
-pub fn status(
-    mode: SleepGuardMode,
-    power_condition: PowerCondition,
-    lid_sleep_mode: LidSleepMode,
-) -> SleepGuardState {
+pub fn status(config: SleepGuardConfig) -> SleepGuardState {
     let busy_agents = BUSY_AGENTS.load(Ordering::Relaxed);
+    let SleepGuardConfig {
+        mode,
+        power_condition,
+        lid_sleep_mode,
+        lid_power_condition,
+        lid_battery_floor,
+    } = config;
+    let battery = battery_percent();
+    let thermal = current_thermal();
     #[cfg(not(target_os = "macos"))]
     {
         // 副作用なし: 取得・解放は行わず、いまの保持状態と電源だけを読む
@@ -1110,9 +1700,14 @@ pub fn status(
             },
             sudoers_installed: false,
             lid_setup_required: false,
-            thermal_state: ThermalState::Nominal,
+            thermal_state: thermal,
             display_sleep_forced: false,
-        };
+            lid_power_condition,
+            lid_battery_floor,
+            battery_percent: battery,
+            lid_skip_reason: None,
+        }
+        .with_decision();
     }
     #[cfg(target_os = "macos")]
     {
@@ -1128,9 +1723,14 @@ pub fn status(
             lid_sleep_mode,
             sudoers_installed: is_sudoers_installed(),
             lid_setup_required: !is_sudoers_installed(),
-            thermal_state: iokit::thermal_state(),
+            thermal_state: thermal,
             display_sleep_forced: iokit::display_sleep_sent(),
+            lid_power_condition,
+            lid_battery_floor,
+            battery_percent: battery,
+            lid_skip_reason: None,
         }
+        .with_decision()
     }
 }
 
@@ -1187,6 +1787,45 @@ pub fn cleanup_on_exit() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1473 より前の 5 引数版と同じ意味の判定材料（既存テストの意図を保つ）。
+    /// 電源条件は `ac-only`・残量は満充電なので、新しい安全弁には触れない
+    fn lid_in(
+        lid_sleep_mode: LidSleepMode,
+        setup_done: bool,
+        busy_agents: usize,
+        on_ac: bool,
+        thermal_warning: bool,
+    ) -> LidGuardInput {
+        LidGuardInput {
+            lid_sleep_mode,
+            setup_done,
+            busy_agents,
+            on_ac,
+            thermal: if thermal_warning {
+                ThermalState::Serious
+            } else {
+                ThermalState::Nominal
+            },
+            lid_power_condition: PowerCondition::AcOnly,
+            battery_percent: Some(100),
+            battery_floor: DEFAULT_LID_BATTERY_FLOOR,
+        }
+    }
+
+    /// #1473: バッテリー駆動で蓋閉じ継続を続ける設定の判定材料
+    fn battery_in(busy_agents: usize, percent: Option<u8>, thermal: ThermalState) -> LidGuardInput {
+        LidGuardInput {
+            lid_sleep_mode: LidSleepMode::WhileAgentsRunning,
+            setup_done: true,
+            busy_agents,
+            on_ac: false,
+            thermal,
+            lid_power_condition: PowerCondition::Always,
+            battery_percent: percent,
+            battery_floor: DEFAULT_LID_BATTERY_FLOOR,
+        }
+    }
 
     #[test]
     fn mode_roundtrip() {
@@ -1270,6 +1909,10 @@ mod tests {
             lid_setup_required: true,
             thermal_state: ThermalState::Nominal,
             display_sleep_forced: false,
+            lid_power_condition: PowerCondition::AcOnly,
+            lid_battery_floor: DEFAULT_LID_BATTERY_FLOOR,
+            battery_percent: Some(100),
+            lid_skip_reason: None,
         };
         let json = state.to_json();
         assert!(json.get("assertion_held").is_some());
@@ -1307,6 +1950,12 @@ mod tests {
             lid_setup_required: false,
             thermal_state: ThermalState::Serious,
             display_sleep_forced: true,
+            // 新フィールドも**既定と違う値**で往復させる（既定のままだと
+            // 読み落としに気づけない）
+            lid_power_condition: PowerCondition::Always,
+            lid_battery_floor: 35,
+            battery_percent: Some(42),
+            lid_skip_reason: None,
         };
         let back = SleepGuardState::from_json(&state.to_json()).expect("往復できるはず");
         assert_eq!(back.assertion_held, state.assertion_held);
@@ -1322,6 +1971,19 @@ mod tests {
         assert_eq!(back.lid_setup_required, state.lid_setup_required);
         assert_eq!(back.thermal_state, state.thermal_state);
         assert_eq!(back.display_sleep_forced, state.display_sleep_forced);
+        assert_eq!(back.lid_power_condition, state.lid_power_condition);
+        assert_eq!(back.lid_battery_floor, state.lid_battery_floor);
+        assert_eq!(back.battery_percent, state.battery_percent);
+        // #1473: 残量の `null`（読めない）と 0% は別物。null を 0 と読むと
+        // 「常に下限割れ」になって蓋閉じ継続が永久に効かない
+        let mut unknown = state.to_json();
+        unknown["battery_percent"] = Value::Null;
+        let back = SleepGuardState::from_json(&unknown).expect("null も往復できる");
+        assert_eq!(back.battery_percent, None);
+        // キーごと無い（古い応答）は「読めない」ではなく**欠損**として弾く
+        let mut missing = state.to_json();
+        missing.as_object_mut().unwrap().remove("battery_percent");
+        assert!(SleepGuardState::from_json(&missing).is_none());
         // 欠けたフィールドは None（既定値で埋めて嘘をつかない）
         let mut broken = state.to_json();
         broken["busy_agents"] = Value::Null;
@@ -1377,6 +2039,10 @@ mod tests {
             lid_setup_required: true,
             thermal_state: ThermalState::Nominal,
             display_sleep_forced: false,
+            lid_power_condition: PowerCondition::AcOnly,
+            lid_battery_floor: DEFAULT_LID_BATTERY_FLOOR,
+            battery_percent: Some(100),
+            lid_skip_reason: None,
         };
         assert!(state.description().contains("無効"));
     }
@@ -1397,6 +2063,10 @@ mod tests {
             lid_setup_required: false,
             thermal_state: ThermalState::Nominal,
             display_sleep_forced: false,
+            lid_power_condition: PowerCondition::AcOnly,
+            lid_battery_floor: DEFAULT_LID_BATTERY_FLOOR,
+            battery_percent: Some(100),
+            lid_skip_reason: None,
         };
         assert!(state.description().contains("蓋閉じ継続: 有効"));
     }
@@ -1417,6 +2087,10 @@ mod tests {
             lid_setup_required: false,
             thermal_state: ThermalState::Serious,
             display_sleep_forced: false,
+            lid_power_condition: PowerCondition::AcOnly,
+            lid_battery_floor: DEFAULT_LID_BATTERY_FLOOR,
+            battery_percent: Some(100),
+            lid_skip_reason: None,
         };
         assert!(state.description().contains("高温警告中"));
     }
@@ -1437,7 +2111,13 @@ mod tests {
             lid_setup_required: true,
             thermal_state: ThermalState::Nominal,
             display_sleep_forced: false,
-        };
+            lid_power_condition: PowerCondition::AcOnly,
+            lid_battery_floor: DEFAULT_LID_BATTERY_FLOOR,
+            battery_percent: Some(100),
+            lid_skip_reason: None,
+        }
+        // 理由は材料から埋める（`update` / `status` と同じ締め）
+        .with_decision();
         assert!(state.description().contains("sudoers 未登録"));
     }
 
@@ -1457,6 +2137,10 @@ mod tests {
             lid_setup_required: true,
             thermal_state: ThermalState::Nominal,
             display_sleep_forced: false,
+            lid_power_condition: PowerCondition::AcOnly,
+            lid_battery_floor: DEFAULT_LID_BATTERY_FLOOR,
+            battery_percent: Some(100),
+            lid_skip_reason: None,
         };
         assert!(state.description().contains("AC 未接続"));
     }
@@ -1477,6 +2161,10 @@ mod tests {
             lid_setup_required: true,
             thermal_state: ThermalState::Nominal,
             display_sleep_forced: false,
+            lid_power_condition: PowerCondition::AcOnly,
+            lid_battery_floor: DEFAULT_LID_BATTERY_FLOOR,
+            battery_percent: Some(100),
+            lid_skip_reason: None,
         };
         assert!(state.description().contains("この OS では"));
     }
@@ -1533,13 +2221,13 @@ mod tests {
     #[test]
     fn 蓋閉じ継続はエージェント稼働中かつac接続のときだけ有効() {
         let m = LidSleepMode::WhileAgentsRunning;
-        assert!(should_disable_lid_sleep(m, true, 1, true, false));
+        assert!(should_disable_lid_sleep(&lid_in(m, true, 1, true, false)));
         assert!(
-            !should_disable_lid_sleep(m, true, 0, true, false),
+            !should_disable_lid_sleep(&lid_in(m, true, 0, true, false)),
             "エージェントが居なければ倒さない"
         );
         assert!(
-            !should_disable_lid_sleep(m, true, 1, false, false),
+            !should_disable_lid_sleep(&lid_in(m, true, 1, false, false)),
             "AC 未接続なら倒さない（鞄の中で電池が尽きるため）"
         );
     }
@@ -1548,13 +2236,13 @@ mod tests {
     fn 蓋閉じ継続はoffモードなら常に無効() {
         for busy in [0, 5] {
             for on_ac in [true, false] {
-                assert!(!should_disable_lid_sleep(
+                assert!(!should_disable_lid_sleep(&lid_in(
                     LidSleepMode::Off,
                     true,
                     busy,
                     on_ac,
                     false
-                ));
+                )));
             }
         }
     }
@@ -1562,25 +2250,25 @@ mod tests {
     #[test]
     fn 初回セットアップが済むまでは倒さない() {
         // macOS の sudoers 未登録に相当。Windows は setup_done = true で呼ぶ
-        assert!(!should_disable_lid_sleep(
+        assert!(!should_disable_lid_sleep(&lid_in(
             LidSleepMode::WhileAgentsRunning,
             false,
             3,
             true,
             false
-        ));
+        )));
     }
 
     #[test]
     fn 高温警告中は蓋閉じ継続を倒さない() {
         // macOS のみ観測できる。Windows は常に false で呼ぶので影響しない
-        assert!(!should_disable_lid_sleep(
+        assert!(!should_disable_lid_sleep(&lid_in(
             LidSleepMode::WhileAgentsRunning,
             true,
             3,
             true,
             true
-        ));
+        )));
     }
 
     /// 蓋閉じ継続の案内は「手段」ではなく「未完了か」で出し分ける（#697）。
@@ -1601,10 +2289,16 @@ mod tests {
             lid_setup_required: true,
             thermal_state: ThermalState::Nominal,
             display_sleep_forced: false,
-        };
+            lid_power_condition: PowerCondition::AcOnly,
+            lid_battery_floor: DEFAULT_LID_BATTERY_FLOOR,
+            battery_percent: Some(100),
+            lid_skip_reason: None,
+        }
+        .with_decision();
         assert!(state.description().contains("sudoers 未登録"));
         // Windows のように初回セットアップが要らない OS では出さない
         state.lid_setup_required = false;
+        state = state.with_decision();
         assert!(
             !state.description().contains("sudoers"),
             "セットアップ不要の OS へ macOS 専用の案内を出してはいけない: {}",
@@ -1678,40 +2372,33 @@ mod tests {
     #[test]
     fn updateで保持と解除ができる() {
         let _serial = crate::platform::testing::machine_state_lock();
-        // On + always なら電源条件（AC / バッテリー）によらず保持する状態
-        let held = update(
-            SleepGuardMode::On,
-            PowerCondition::Always,
-            LidSleepMode::Off,
-            0,
-        );
+        // On + always なら電源条件（AC / バッテリー）によらず保持する状態。
+        // 蓋閉じ継続は off のまま（電源プランを書かない = テストの副作用にしない）
+        let on = SleepGuardConfig {
+            mode: SleepGuardMode::On,
+            power_condition: PowerCondition::Always,
+            ..SleepGuardConfig::default()
+        };
+        let held = update(on, 0);
         assert!(held.platform_supported, "Windows は対応済みのはず");
         assert!(held.assertion_held, "保持できていない: {held:?}");
         // 副作用なしの status も同じ状態を返す
-        let s = status(
-            SleepGuardMode::On,
-            PowerCondition::Always,
-            LidSleepMode::Off,
-        );
+        let s = status(on);
         assert!(s.assertion_held);
         assert_eq!(s.lid_sleep_mode, LidSleepMode::Off, "蓋閉じ制御は持たない");
         assert!(!s.sudoers_installed);
+        // #1473: 蓋閉じ継続の設定も状態へ出る（既定は従来どおり AC のみ）
+        assert_eq!(s.lid_power_condition, PowerCondition::AcOnly);
+        assert_eq!(s.lid_battery_floor, DEFAULT_LID_BATTERY_FLOOR);
 
-        let released = update(
-            SleepGuardMode::Off,
-            PowerCondition::Always,
-            LidSleepMode::Off,
-            0,
-        );
+        let off = SleepGuardConfig {
+            mode: SleepGuardMode::Off,
+            power_condition: PowerCondition::Always,
+            ..SleepGuardConfig::default()
+        };
+        let released = update(off, 0);
         assert!(!released.assertion_held, "解除できていない: {released:?}");
-        assert!(
-            !status(
-                SleepGuardMode::Off,
-                PowerCondition::Always,
-                LidSleepMode::Off
-            )
-            .assertion_held
-        );
+        assert!(!status(off).assertion_held);
     }
 
     #[test]
@@ -1730,6 +2417,10 @@ mod tests {
             lid_setup_required: false,
             thermal_state: ThermalState::Nominal,
             display_sleep_forced: true,
+            lid_power_condition: PowerCondition::AcOnly,
+            lid_battery_floor: DEFAULT_LID_BATTERY_FLOOR,
+            battery_percent: Some(100),
+            lid_skip_reason: None,
         };
         assert!(state.description().contains("蓋閉じ継続: 有効"));
         assert!(state.description().contains("ディスプレイ消灯済み"));
@@ -1824,5 +2515,377 @@ mod tests {
         let r = should_clear_residual(true, true, true, true);
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("隔離モード"));
+    }
+
+    // --- #1473: バッテリー駆動でも蓋閉じ継続を続ける（opt-in + 安全弁） ---
+
+    /// 既定（`ac-only`）の挙動は #1473 前と 1 ビットも変わらない。
+    /// ここが崩れると「設定を触っていない人の Mac が鞄の中で熱くなる」
+    #[test]
+    fn 既定ではバッテリー駆動で蓋閉じ継続に入らない() {
+        let input = LidGuardInput {
+            lid_power_condition: PowerCondition::AcOnly,
+            ..battery_in(2, Some(100), ThermalState::Nominal)
+        };
+        assert_eq!(lid_decision(&input), Err(LidSkipReason::NoAcPower));
+    }
+
+    #[test]
+    fn alwaysならバッテリーでも倒す() {
+        assert_eq!(
+            lid_decision(&battery_in(1, Some(80), ThermalState::Nominal)),
+            Ok(())
+        );
+    }
+
+    /// 安全弁①: 残量。**ちょうど下限は降りる側**（「下限 20%」と設定した人の
+    /// 期待は「20% になったら止まる」）
+    #[test]
+    fn 残量が下限に達したら解除する() {
+        for percent in [0u8, 1, 19, DEFAULT_LID_BATTERY_FLOOR] {
+            assert_eq!(
+                lid_decision(&battery_in(1, Some(percent), ThermalState::Nominal)),
+                Err(LidSkipReason::BatteryFloor {
+                    percent,
+                    floor: DEFAULT_LID_BATTERY_FLOOR
+                }),
+                "残量 {percent}% で解除されない"
+            );
+        }
+        assert_eq!(
+            lid_decision(&battery_in(
+                1,
+                Some(DEFAULT_LID_BATTERY_FLOOR + 1),
+                ThermalState::Nominal
+            )),
+            Ok(()),
+            "下限より上なら続ける"
+        );
+    }
+
+    /// 残量が読めない環境は**続けない**（止める条件を持てないまま走るのが最悪）
+    #[test]
+    fn 残量が読めなければ解除する() {
+        assert_eq!(
+            lid_decision(&battery_in(1, None, ThermalState::Nominal)),
+            Err(LidSkipReason::BatteryUnknown)
+        );
+        // AC 接続中は残量が読めなくても関係ない（減らないので安全弁が要らない）
+        let on_ac = LidGuardInput {
+            on_ac: true,
+            battery_percent: None,
+            ..battery_in(1, None, ThermalState::Nominal)
+        };
+        assert_eq!(lid_decision(&on_ac), Ok(()));
+    }
+
+    /// 安全弁②: 温度。バッテリーで蓋を閉じているときは `fair` でも降りる。
+    /// AC 接続時の物差し（`serious` 以上）は #218 のまま変えない
+    #[test]
+    fn 温度の物差しは電源で変わる() {
+        assert_eq!(
+            lid_decision(&battery_in(1, Some(80), ThermalState::Fair)),
+            Err(LidSkipReason::Thermal(ThermalState::Fair))
+        );
+        let on_ac_fair = LidGuardInput {
+            on_ac: true,
+            ..battery_in(1, Some(80), ThermalState::Fair)
+        };
+        assert_eq!(lid_decision(&on_ac_fair), Ok(()), "AC 中は fair で降りない");
+        let on_ac_serious = LidGuardInput {
+            on_ac: true,
+            ..battery_in(1, Some(80), ThermalState::Serious)
+        };
+        assert_eq!(
+            lid_decision(&on_ac_serious),
+            Err(LidSkipReason::Thermal(ThermalState::Serious))
+        );
+    }
+
+    /// 安全弁③: エージェントが全部止まったら解除する（`while-agents-running` の意味は不変）
+    #[test]
+    fn エージェントが居なくなったら解除する() {
+        assert_eq!(
+            lid_decision(&battery_in(0, Some(80), ThermalState::Nominal)),
+            Err(LidSkipReason::NoAgents)
+        );
+    }
+
+    /// A/B は**材料を旧世界へ丸める**ので、バッテリーでは必ず AC 未接続で降りる
+    #[test]
+    fn legacyアームの入力はac_onlyへ丸まる() {
+        let rolled = legacy_lid_input(&battery_in(1, Some(80), ThermalState::Nominal));
+        if legacy_1473() {
+            assert_eq!(rolled.lid_power_condition, PowerCondition::AcOnly);
+        } else {
+            assert_eq!(rolled.lid_power_condition, PowerCondition::Always);
+        }
+    }
+
+    #[test]
+    fn 理由はjsonを往復する() {
+        for reason in [
+            LidSkipReason::ModeOff,
+            LidSkipReason::SetupRequired,
+            LidSkipReason::NoAgents,
+            LidSkipReason::NoAcPower,
+            LidSkipReason::BatteryFloor {
+                percent: 12,
+                floor: 20,
+            },
+            LidSkipReason::BatteryUnknown,
+            LidSkipReason::Thermal(ThermalState::Fair),
+        ] {
+            let back = LidSkipReason::from_json(&reason.to_json());
+            assert_eq!(back, Some(reason), "{} が往復しない", reason.tag());
+            assert!(!reason.describe().is_empty());
+        }
+        assert_eq!(LidSkipReason::from_json(&json!({})), None);
+    }
+
+    #[test]
+    fn 安全弁かどうかの分類() {
+        assert!(LidSkipReason::BatteryFloor {
+            percent: 5,
+            floor: 20
+        }
+        .is_safety_valve());
+        assert!(LidSkipReason::BatteryUnknown.is_safety_valve());
+        assert!(LidSkipReason::Thermal(ThermalState::Fair).is_safety_valve());
+        // 設定どおりの動きは通知しない（バナーが作業のたびに出る）
+        assert!(!LidSkipReason::NoAgents.is_safety_valve());
+        assert!(!LidSkipReason::NoAcPower.is_safety_valve());
+        assert!(!LidSkipReason::ModeOff.is_safety_valve());
+        assert!(!LidSkipReason::SetupRequired.is_safety_valve());
+    }
+
+    /// 状態は材料をすべて持っているので、`with_decision` で理由まで埋まる
+    /// （読む側は再計算しない = CLI とアプリで判断が割れない。#372 / #1473）
+    #[test]
+    fn 状態から理由が導ける() {
+        let mut state = SleepGuardState {
+            assertion_held: true,
+            mode: SleepGuardMode::WhileAgentsRunning,
+            power_condition: PowerCondition::AcOnly,
+            on_ac_power: false,
+            busy_agents: 1,
+            platform_supported: true,
+            lid_closed: true,
+            lid_sleep_disabled: false,
+            lid_sleep_mode: LidSleepMode::WhileAgentsRunning,
+            sudoers_installed: true,
+            lid_setup_required: false,
+            thermal_state: ThermalState::Nominal,
+            display_sleep_forced: false,
+            lid_power_condition: PowerCondition::Always,
+            lid_battery_floor: 20,
+            battery_percent: Some(10),
+            lid_skip_reason: None,
+        };
+        state = state.with_decision();
+        assert_eq!(
+            state.lid_skip_reason,
+            Some(LidSkipReason::BatteryFloor {
+                percent: 10,
+                floor: 20
+            })
+        );
+        assert!(
+            state.description().contains("残量"),
+            "{}",
+            state.description()
+        );
+        state.battery_percent = Some(60);
+        state = state.with_decision();
+        assert_eq!(state.lid_skip_reason, None);
+        // 効いているときはバッテリー残量と下限まで出す（あとどれだけ続くかが読める）
+        state.lid_sleep_disabled = true;
+        let desc = state.description();
+        assert!(desc.contains("60%") && desc.contains("20%"), "{desc}");
+        // JSON も同じ理由を運ぶ（読む側は再計算しない）
+        let json = state.with_decision().to_json();
+        assert_eq!(json["lid_skip_reason"], Value::Null);
+    }
+
+    // --- 通知欄へ出す変化（#1473） ---
+
+    fn battery_state(disabled: bool, percent: Option<u8>) -> SleepGuardState {
+        SleepGuardState {
+            assertion_held: true,
+            mode: SleepGuardMode::WhileAgentsRunning,
+            power_condition: PowerCondition::AcOnly,
+            on_ac_power: false,
+            busy_agents: 1,
+            platform_supported: true,
+            lid_closed: false,
+            lid_sleep_disabled: disabled,
+            lid_sleep_mode: LidSleepMode::WhileAgentsRunning,
+            sudoers_installed: true,
+            lid_setup_required: false,
+            thermal_state: ThermalState::Nominal,
+            display_sleep_forced: false,
+            lid_power_condition: PowerCondition::Always,
+            lid_battery_floor: 20,
+            battery_percent: percent,
+            lid_skip_reason: None,
+        }
+        .with_decision()
+    }
+
+    #[test]
+    fn 安全弁の解除と再適用だけ通知する() {
+        let held = battery_state(true, Some(80));
+        let dropped = battery_state(false, Some(10));
+        assert_eq!(
+            lid_notice(Some(&held), &dropped),
+            Some(LidNotice::Released(LidSkipReason::BatteryFloor {
+                percent: 10,
+                floor: 20
+            }))
+        );
+        assert_eq!(
+            lid_notice(Some(&dropped), &held),
+            Some(LidNotice::Reapplied)
+        );
+        // 前回が無い（起動直後）は出さない
+        assert_eq!(lid_notice(None, &dropped), None);
+        // 変化していなければ出さない
+        assert_eq!(lid_notice(Some(&held), &held), None);
+    }
+
+    #[test]
+    fn 設定どおりの解除は通知しない() {
+        let held = battery_state(true, Some(80));
+        // エージェントが終わって落ちただけ
+        let idle = SleepGuardState {
+            busy_agents: 0,
+            ..battery_state(false, Some(80))
+        }
+        .with_decision();
+        assert_eq!(lid_notice(Some(&held), &idle), None);
+        // 既定（ac-only）の人には何も出さない
+        let ac_only_held = SleepGuardState {
+            lid_power_condition: PowerCondition::AcOnly,
+            ..held
+        }
+        .with_decision();
+        let ac_only_dropped = SleepGuardState {
+            lid_power_condition: PowerCondition::AcOnly,
+            ..battery_state(false, Some(10))
+        }
+        .with_decision();
+        assert_eq!(lid_notice(Some(&ac_only_held), &ac_only_dropped), None);
+    }
+
+    // --- 設定値の検証と注入（#1473） ---
+
+    #[test]
+    fn 残量下限は範囲の中だけ受ける() {
+        assert_eq!(parse_battery_floor(20), Ok(20));
+        assert_eq!(
+            parse_battery_floor(i64::from(LID_BATTERY_FLOOR_MIN)),
+            Ok(LID_BATTERY_FLOOR_MIN)
+        );
+        assert_eq!(
+            parse_battery_floor(i64::from(LID_BATTERY_FLOOR_MAX)),
+            Ok(LID_BATTERY_FLOOR_MAX)
+        );
+        // 0 は「安全弁なし」になるので受けない
+        assert!(parse_battery_floor(0).is_err());
+        assert!(parse_battery_floor(4).is_err());
+        assert!(parse_battery_floor(91).is_err());
+        assert!(parse_battery_floor(-1).is_err());
+        assert!(parse_battery_floor(1_000_000).is_err());
+    }
+
+    /// 注入（残量・温度）が効くのは隔離・セルフテストだけ。
+    /// **本番の GUI で env に左右されたら、それは `pmset` を env で倒せるということ**
+    #[test]
+    fn 注入は隔離とセルフテストでだけ効く() {
+        assert!(!inject_allowed_from(None, false), "本番では効かない");
+        assert!(!inject_allowed_from(Some("0"), false));
+        assert!(inject_allowed_from(Some("1"), false));
+        assert!(inject_allowed_from(Some("true"), false));
+        assert!(inject_allowed_from(None, true));
+    }
+
+    #[test]
+    fn 注入の残量は0から100だけ受ける() {
+        assert_eq!(parse_injected_battery(Some("15")), Some(15));
+        assert_eq!(parse_injected_battery(Some("0")), Some(0));
+        assert_eq!(parse_injected_battery(Some("100")), Some(100));
+        assert_eq!(parse_injected_battery(Some("101")), None);
+        assert_eq!(parse_injected_battery(Some("abc")), None);
+        assert_eq!(parse_injected_battery(None), None);
+    }
+
+    /// MCP カタログの enum は正本から生成する（#1467）。
+    /// 値を足して `from_str_opt` を忘れると、申告した値を受け取れない
+    #[test]
+    fn 電源条件の一覧は受理値と一致する() {
+        for v in PowerCondition::VALUES {
+            let parsed = PowerCondition::from_str_opt(v).expect("申告した値は受け取れる");
+            assert_eq!(parsed.as_str(), *v);
+        }
+        let hint = PowerCondition::values_hint();
+        for v in PowerCondition::VALUES {
+            assert!(hint.contains(v), "案内文に {v} が無い: {hint}");
+        }
+    }
+
+    /// 設定一式は `Settings` の既定と同じ（片方だけ変えると
+    /// 「設定画面は 20% と出るのに実際は 0%」になる）
+    #[test]
+    fn 設定一式の既定は従来どおり() {
+        let c = SleepGuardConfig::default();
+        assert_eq!(c.lid_power_condition, PowerCondition::AcOnly);
+        assert_eq!(c.lid_battery_floor, DEFAULT_LID_BATTERY_FLOOR);
+        assert_eq!(c.lid_sleep_mode, LidSleepMode::Off);
+        let s = crate::settings::Settings::default();
+        assert_eq!(s.sleep_guard_config(), c);
+    }
+
+    /// 解除と再適用は**診断に残る**（画面の通知は消えるので、あとから
+    /// 「いつ・なぜ止まったか」を追えるのは persist.log だけ）。
+    /// 書式は両 OS 経路で共有するので、ここが変わると `lid-sleep:` の grep が割れる
+    #[test]
+    fn 解除と再適用の記録がpersistログへ残る() {
+        let Some(path) = tako_core::paths::data_dir().map(|d| d.join("persist.log")) else {
+            return; // data dir を解決できない環境（CI のサンドボックス）では検査しない
+        };
+        log_lid_change(
+            false,
+            Some(LidSkipReason::BatteryFloor {
+                percent: 15,
+                floor: 20,
+            }),
+            Some(15),
+        );
+        log_lid_change(true, None, Some(80));
+        let body = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            body.contains("lid-sleep: 蓋閉じ継続を解除 reason=battery-floor battery=15%"),
+            "解除の 1 行が残っていない: {}",
+            path.display()
+        );
+        assert!(
+            body.contains("lid-sleep: 蓋閉じ継続を有効化 reason=applied battery=80%"),
+            "再適用の 1 行が残っていない: {}",
+            path.display()
+        );
+        // 本文（残量以外の環境の値）は載せない = #1376 と同じ作法
+        assert!(
+            !body.contains("TAKO_1473_INJECT"),
+            "診断に env の名前を載せない"
+        );
+    }
+
+    /// 実機でも残量取得は落ちない（値そのものは機械依存なので範囲だけ見る）
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn battery_percentは0から100か不明を返す() {
+        if let Some(p) = battery_percent() {
+            assert!(p <= 100, "残量が範囲外: {p}");
+        }
     }
 }

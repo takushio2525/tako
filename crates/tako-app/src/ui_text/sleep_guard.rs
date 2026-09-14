@@ -274,6 +274,10 @@ mod tests {
             lid_setup_required: false,
             thermal_state,
             display_sleep_forced: false,
+            lid_power_condition: PowerCondition::AcOnly,
+            lid_battery_floor: tako_control::sleep_guard::DEFAULT_LID_BATTERY_FLOOR,
+            battery_percent: Some(100),
+            lid_skip_reason: None,
         }
     }
 

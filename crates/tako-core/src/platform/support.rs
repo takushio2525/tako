@@ -1541,7 +1541,7 @@ pub const MATRIX: &[Feature] = &[
         macos: Support::Supported,
         windows: Support::Supported,
         windows_evidence: Evidence::Measured(
-            "powercfg /requests の SYSTEM に tako のアサーションが出て mode=off で消える。蓋閉じは lid-guard.json の生成まで確認 + セルフテスト項目 120 / 121",
+            "powercfg /requests の SYSTEM に tako のアサーションが出て mode=off で消える。蓋閉じは lid-guard.json の生成まで確認 + セルフテスト項目 120 / 121。バッテリー継続（#1473）は判定も lid action のバッテリーレールも実装済みだが、残量の取得が未実装なので実機では安全弁（battery-unknown）で降りる = 実質 AC のみ・実機未検証",
         ),
     },
     Feature {

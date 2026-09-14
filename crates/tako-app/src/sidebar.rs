@@ -215,6 +215,10 @@ pub(crate) enum NoticeArea {
     /// SSH ペインの自動再接続（#1446）。**押した操作ではなく回線の事故**だが、
     /// 「切れたのに繋ぎ直さない」は黙って起きてはいけないので同じ通知欄へ出す
     SshPane,
+    /// 蓋閉じ継続の安全弁（#1473）。**ここも成功系**（バッテリー残量・温度で
+    /// 自動解除したことの申告）。黙って解除すると「蓋を閉じたら止まっていた」に
+    /// なるので、バッテリー継続を選んだ人にだけ理由つきで出す
+    SleepGuard,
 }
 
 impl NoticeArea {
@@ -232,6 +236,7 @@ impl NoticeArea {
             NoticeArea::UpdateWindow => "update_window",
             NoticeArea::Ipc => "ipc",
             NoticeArea::UserTasks => "user_tasks",
+            NoticeArea::SleepGuard => "sleep_guard",
         }
     }
 }
@@ -265,6 +270,10 @@ pub(crate) enum NoticeArm {
     /// B1 の [`NoticeArm::Issue1450`]（起票通知）とは**別の軸**にしてある
     /// （同じ画面に別の Issue で足した通知が同居するときの作法 = #1422）
     Issue1450B2,
+    /// 蓋閉じ継続の安全弁による解除・再適用（`TAKO_1473_LEGACY`）。
+    /// 判定そのものの A/B と同じ env を使う（旧挙動ではバッテリー継続に
+    /// 入らないので、通知だけ残っても意味がない）
+    Issue1473,
 }
 
 impl NoticeArm {
@@ -279,6 +288,7 @@ impl NoticeArm {
             NoticeArm::Issue1450 => TakoApp::legacy_1450(),
             NoticeArm::Issue1446 => TakoApp::legacy_1446(),
             NoticeArm::Issue1450B2 => crate::tasks_panel::legacy_1450_b2(),
+            NoticeArm::Issue1473 => tako_control::sleep_guard::legacy_1473(),
         }
     }
 }
@@ -2178,7 +2188,10 @@ impl TakoApp {
     /// dispatch の操作なので、記録は起きた場所（`tako_control::dispatch`）に置く
     /// = sidebar.rs から診断へ書く口は `log_ui_failure` の 1 つのままに保たれる
     fn notify_ui_info(&mut self, area: NoticeArea, arm: NoticeArm, text: String) {
-        debug_assert!(matches!(area, NoticeArea::UserTasks), "成功系の画面は 1 つ");
+        debug_assert!(
+            matches!(area, NoticeArea::UserTasks | NoticeArea::SleepGuard),
+            "成功系は「人の手を待つものが増えた」（#1450）と「安全弁が働いた」（#1473）だけ"
+        );
         if arm.suppressed() {
             return;
         }
@@ -2195,6 +2208,19 @@ impl TakoApp {
             NoticeArm::Issue1450,
             crate::ui_text::sidebar::notice_user_task_added(id, title),
         );
+    }
+
+    /// 蓋閉じ継続が安全弁で解除された・戻ったことを通知欄へ 1 行出す（#1473）。
+    ///
+    /// **出すかどうかの判断はここではしない**（`sleep_guard::lid_notice` の
+    /// 純粋関数が決める）。ここは文言を選んで共有の通知欄へ渡すだけ
+    pub(crate) fn notify_lid_guard(&mut self, notice: tako_control::sleep_guard::LidNotice) {
+        use tako_control::sleep_guard::LidNotice;
+        let text = match notice {
+            LidNotice::Released(reason) => crate::ui_text::sidebar::notice_lid_released(reason),
+            LidNotice::Reapplied => crate::ui_text::sidebar::notice_lid_reapplied().to_string(),
+        };
+        self.notify_ui_info(NoticeArea::SleepGuard, NoticeArm::Issue1473, text);
     }
 
     /// #1450 の A/B。`TAKO_1450_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す

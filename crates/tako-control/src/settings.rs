@@ -53,6 +53,18 @@ pub struct Settings {
     /// 蓋閉じ防止モード（Issue #218。既定 off）
     #[serde(default)]
     pub lid_sleep_mode: crate::sleep_guard::LidSleepMode,
+    /// 蓋閉じ継続の電源条件（Issue #1473。既定 ac-only = 従来どおり AC 接続時のみ）。
+    ///
+    /// アイドルスリープ側の `sleep_guard_power` とは**別の軸**（蓋を閉じて持ち歩く
+    /// リスクはアイドルスリープの防止とは釣り合わないので、まとめて切り替えない）。
+    /// **旧ファイルはキーが無くても `PowerCondition::default()` = ac-only で読める**
+    /// ので移行 Step は要らない（`Settings` の指紋は動くが、読み書きは後方互換）
+    #[serde(default)]
+    pub lid_sleep_power: crate::sleep_guard::PowerCondition,
+    /// 蓋閉じ継続をバッテリーで続けるときの残量下限（%。Issue #1473。既定 20）。
+    /// 旧ファイルにキーが無ければ既定 20 が立つ（同上）
+    #[serde(default = "default_lid_battery_floor")]
+    pub lid_battery_floor: u8,
     /// ペインの平文ログ保存（Issue #112 B。既定 ON）
     #[serde(default = "default_true")]
     pub pane_logs: bool,
@@ -154,6 +166,10 @@ fn default_scrollback_lines() -> usize {
     tako_core::scrollback::DEFAULT_LINES
 }
 
+fn default_lid_battery_floor() -> u8 {
+    crate::sleep_guard::DEFAULT_LID_BATTERY_FLOOR
+}
+
 fn default_preview_cache_max_mb() -> u64 {
     tako_core::PREVIEW_CACHE_DEFAULT_MB
 }
@@ -181,6 +197,8 @@ impl Default for Settings {
             sleep_guard_mode: crate::sleep_guard::SleepGuardMode::default(),
             sleep_guard_power: crate::sleep_guard::PowerCondition::default(),
             lid_sleep_mode: crate::sleep_guard::LidSleepMode::default(),
+            lid_sleep_power: crate::sleep_guard::PowerCondition::default(),
+            lid_battery_floor: default_lid_battery_floor(),
             pane_logs: true,
             pane_log_max_mb: default_pane_log_max_mb(),
             pane_log_total_max_mb: default_pane_log_total_max_mb(),
@@ -204,6 +222,20 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// スリープ防止の設定一式（#1473）。
+    ///
+    /// `update` / `status` の呼び出し側（GUI の 2 秒 tick / dispatch / CLI）が
+    /// **ここ 1 か所から作る**ので、設定を足しても渡し忘れる経路が生まれない
+    pub fn sleep_guard_config(&self) -> crate::sleep_guard::SleepGuardConfig {
+        crate::sleep_guard::SleepGuardConfig {
+            mode: self.sleep_guard_mode,
+            power_condition: self.sleep_guard_power,
+            lid_sleep_mode: self.lid_sleep_mode,
+            lid_power_condition: self.lid_sleep_power,
+            lid_battery_floor: self.lid_battery_floor,
+        }
+    }
+
     /// theme 値からテーマ実体を解決する（Issue #459）。
     /// 優先順: プリセット名 → ビルトイン名 + theme_colors 上書き → ダークフォールバック
     pub fn resolve_theme(&self) -> (tako_core::theme::Theme, Vec<String>) {
@@ -396,6 +428,8 @@ mod tests {
             sleep_guard_mode: crate::sleep_guard::SleepGuardMode::On,
             sleep_guard_power: crate::sleep_guard::PowerCondition::Always,
             lid_sleep_mode: crate::sleep_guard::LidSleepMode::WhileAgentsRunning,
+            lid_sleep_power: crate::sleep_guard::PowerCondition::Always,
+            lid_battery_floor: 35,
             pane_logs: false,
             pane_log_max_mb: 10,
             pane_log_total_max_mb: 300,
@@ -459,6 +493,16 @@ mod tests {
         assert_eq!(
             parsed.sleep_guard_power,
             crate::sleep_guard::PowerCondition::AcOnly
+        );
+        // #1473: 蓋閉じ継続の電源条件と残量下限は、旧ファイル（キー無し）でも
+        // 既定（ac-only / 20%）が立つ = 移行 Step 不要。指紋テストの更新理由がこれ
+        assert_eq!(
+            parsed.lid_sleep_power,
+            crate::sleep_guard::PowerCondition::AcOnly
+        );
+        assert_eq!(
+            parsed.lid_battery_floor,
+            crate::sleep_guard::DEFAULT_LID_BATTERY_FLOOR
         );
         // ペインログ設定の既定（Issue #112。旧ファイル後方互換）
         assert!(parsed.pane_logs);

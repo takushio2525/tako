@@ -19,6 +19,17 @@ fn enum_schema(values: &[&str], description: &str) -> Value {
     json!({ "type": "string", "enum": values, "description": description })
 }
 
+/// スリープ防止の電源条件（正本 = [`crate::sleep_guard::PowerCondition`]。#1467 / #1473）
+fn power_condition_schema(what: &str) -> Value {
+    enum_schema(
+        crate::sleep_guard::PowerCondition::VALUES,
+        &format!(
+            "{what}（set 時のみ有効。{}）",
+            crate::sleep_guard::PowerCondition::values_hint()
+        ),
+    )
+}
+
 /// 右パネルのビュー引数（正本 = [`PanelViewWire`]。受理値も案内文も生成する）
 fn panel_view_schema() -> Value {
     enum_schema(
@@ -2454,6 +2465,10 @@ pub fn tools() -> Vec<Value> {
                 action=install-lid-sleep: sudoers.d に pmset NOPASSWD を登録（管理者パスワード必要、初回のみ）。\
                 action=remove-lid-sleep: sudoers.d から削除 + disablesleep 解除。\
                 action=open-battery-settings: System Settings の Battery を開く（フォールバック）。\
+                蓋閉じ継続は既定では AC 接続時のみ効く。バッテリー駆動（テザリング中など）でも\
+                続けたい場合は lid_power_condition=always を設定する（#1473）。そのときは\
+                安全弁（エージェント稼働中のみ / 残量が lid_battery_floor 以下で自動解除 / \
+                本体が高温なら解除）が必ず働き、解除の理由は status の lid_skip_reason に出る。\
                 ユーザーが「PC がスリープして作業が止まった」「蓋を閉じても続けたい」と言った場合は、\
                 まず status で確認し、蓋閉じ防止なら install-lid-sleep で登録を案内すること。",
             "inputSchema": {
@@ -2469,15 +2484,21 @@ pub fn tools() -> Vec<Value> {
                         "enum": ["off", "on", "while-agents-running"],
                         "description": "アイドルスリープ防止モード（set 時のみ有効）",
                     },
-                    "power_condition": {
-                        "type": "string",
-                        "enum": ["ac-only", "always"],
-                        "description": "電源条件（set 時のみ有効）",
-                    },
+                    "power_condition": power_condition_schema("アイドルスリープ防止の電源条件"),
                     "lid_sleep_mode": {
                         "type": "string",
                         "enum": ["off", "while-agents-running"],
                         "description": "蓋閉じ防止モード（set 時のみ有効。要 sudoers 登録）",
+                    },
+                    "lid_power_condition": power_condition_schema(
+                        "蓋閉じ継続の電源条件（アイドルスリープ側とは別の軸。既定 ac-only）",
+                    ),
+                    "lid_battery_floor": {
+                        "type": "integer",
+                        "minimum": crate::sleep_guard::LID_BATTERY_FLOOR_MIN,
+                        "maximum": crate::sleep_guard::LID_BATTERY_FLOOR_MAX,
+                        "description": "蓋閉じ継続をバッテリーで続けるときの残量下限（%。既定 20。\
+                            この値以下になると自動で解除して通常のスリープへ戻す）",
                     },
                 },
                 "additionalProperties": false,

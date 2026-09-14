@@ -670,10 +670,47 @@ pub fn desc_sleep_lid(needs_privileged_setup: bool) -> &'static str {
         // 権限が要らないことは自分から言う。macOS 向けの案内（sudoers 登録）を見た人が
         // 「Windows でも何か登録が要るはず」と探しにいかないように
         tr!(
-            "蓋を閉じても動かし続ける（管理者権限は不要。AC 接続時・エージェント稼働中のみ）",
-            "Keep running with the lid closed (no admin rights needed; only on AC power, while agents are running)"
+            "蓋を閉じても動かし続ける（管理者権限は不要。エージェント稼働中のみ）",
+            "Keep running with the lid closed (no admin rights needed; only while agents are running)"
         )
     }
+}
+
+// --- 蓋閉じ継続の電源条件と残量下限（#1473） ---
+
+pub fn sleep_lid_power_header() -> &'static str {
+    tr!("蓋閉じ継続の電源条件", "Lid-close power condition")
+}
+
+pub fn desc_sleep_lid_power() -> &'static str {
+    tr!(
+        "バッテリー駆動でも蓋を閉じたまま動かし続けるかどうか（テザリング中に蓋を閉じても回線を保ちたいとき）",
+        "Whether to keep running with the lid closed on battery too (useful to keep tethering alive)"
+    )
+}
+
+/// 蓋閉じ継続の「常時」（アイドル側の `sleep_power_always` とは注意書きが違う）
+pub fn sleep_lid_power_always() -> &'static str {
+    tr!(
+        "バッテリーでも（残量下限まで）",
+        "On battery too (down to the floor)"
+    )
+}
+
+pub fn sleep_lid_floor_header() -> &'static str {
+    tr!("バッテリー残量の下限", "Battery floor")
+}
+
+pub fn desc_sleep_lid_floor() -> &'static str {
+    tr!(
+        "この残量まで下がったら蓋閉じ継続を自動で解除して通常のスリープへ戻す",
+        "Release lid-close prevention and sleep normally once the battery falls to this level"
+    )
+}
+
+/// 残量下限の選択肢（`10%` のような表示。言語によらず数字 + %）
+pub fn sleep_lid_floor_choice(percent: u8) -> String {
+    format!("{percent}%")
 }
 
 pub fn sleep_lid_install() -> &'static str {
@@ -747,6 +784,26 @@ pub fn sleep_status_paused_thermal() -> &'static str {
     tr!("停止中（本体が高温）", "Paused (device is running hot)")
 }
 
+/// 残量の安全弁で停止中（#1473。残量が読めないときも同じ枝 = どちらも「続けられない」）
+pub fn sleep_status_paused_battery() -> &'static str {
+    tr!(
+        "停止中（バッテリー残量が下限以下）",
+        "Paused (battery at or below the floor)"
+    )
+}
+
+pub fn sleep_status_battery_label() -> &'static str {
+    tr!("バッテリー残量", "Battery level")
+}
+
+/// 残量の値（`85%（下限 20%）`）。#1473
+pub fn sleep_status_battery_value(percent: u8, floor: u8) -> String {
+    tr!(
+        format!("{percent}%（下限 {floor}%）"),
+        format!("{percent}% (floor {floor}%)")
+    )
+}
+
 pub fn sleep_status_idle_active() -> &'static str {
     tr!(
         "有効（自動スリープを止めています）",
@@ -790,6 +847,7 @@ pub fn sleep_lid_status(status: LidStatus) -> &'static str {
         LidStatus::WaitingAgents => sleep_status_waiting_agents(),
         LidStatus::PausedNoAc => sleep_status_paused_no_ac(),
         LidStatus::PausedThermal => sleep_status_paused_thermal(),
+        LidStatus::PausedBatteryFloor => sleep_status_paused_battery(),
         LidStatus::Applying => sleep_status_applying(),
     }
 }

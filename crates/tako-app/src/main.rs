@@ -14180,13 +14180,17 @@ impl TakoApp {
         settings: &tako_control::settings::Settings,
         scan: tako_control::agents::RunningChildrenScanState,
     ) {
-        let state = tako_control::sleep_guard::update(
-            settings.sleep_guard_mode,
-            settings.sleep_guard_power,
-            settings.lid_sleep_mode,
-            scan.busy_count(),
-        );
+        let state =
+            tako_control::sleep_guard::update(settings.sleep_guard_config(), scan.busy_count());
         self.running_children_scan = scan;
+        // #1473: 安全弁で蓋閉じ継続が落ちた・戻ったことを通知欄へ 1 行出す。
+        // 「出すかどうか」の判断は `sleep_guard::lid_notice` の純粋関数 1 本で、
+        // ここは前後の状態を渡すだけ（画面側に条件を書かない）
+        if let Some(notice) =
+            tako_control::sleep_guard::lid_notice(self.sleep_guard_state.as_ref(), &state)
+        {
+            self.notify_lid_guard(notice);
+        }
         self.sleep_guard_state = Some(state);
     }
 
@@ -64380,7 +64384,7 @@ mod self_test {
                     plan.needs_privileged_setup,
                     plan.status_rows
                         .iter()
-                        .map(|r| (r.label, r.value, r.tone))
+                        .map(|r| (r.label, r.value.as_str(), r.tone))
                         .collect::<Vec<_>>(),
                     plan.visible_texts().len()
                 );
@@ -64414,19 +64418,20 @@ mod self_test {
 
                 // (c) 「いまの状態」が dispatch の実値と一致する
                 let json = Some(json);
-                let idle_row = plan.status_rows.first().map(|r| r.value);
-                let lid_row = plan.status_rows.get(1).map(|r| r.value);
-                let power_row = plan.status_rows.get(2).map(|r| r.value);
+                let idle_row = plan.status_rows.first().map(|r| r.value.clone());
+                let lid_row = plan.status_rows.get(1).map(|r| r.value.clone());
+                let power_row = plan.status_rows.get(2).map(|r| r.value.clone());
                 let agrees = json
                     .as_ref()
                     .map(|v| {
                         let snap = crate::settings_sleep::SleepSnapshot::from_status_json(Some(v));
                         let on_ac = v["on_ac_power"].as_bool().unwrap_or(false);
                         // 実値から作り直した状態と、画面が出している行が一致する
-                        idle_row == Some(crate::ui_text::settings::sleep_idle_status(snap.idle_status()))
-                            && lid_row
+                        idle_row.as_deref()
+                            == Some(crate::ui_text::settings::sleep_idle_status(snap.idle_status()))
+                            && lid_row.as_deref()
                                 == Some(crate::ui_text::settings::sleep_lid_status(snap.lid_status()))
-                            && power_row
+                            && power_row.as_deref()
                                 == Some(if on_ac {
                                     crate::ui_text::settings::sleep_status_on_ac()
                                 } else {
@@ -64480,6 +64485,10 @@ mod self_test {
                     lid_setup_required: false,
                     thermal_state: ThermalState::Serious,
                     display_sleep_forced: false,
+                    lid_power_condition: PowerCondition::AcOnly,
+                    lid_battery_floor: tako_control::sleep_guard::DEFAULT_LID_BATTERY_FLOOR,
+                    battery_percent: Some(80),
+                    lid_skip_reason: None,
                 };
                 let device = Device::detect();
                 // チップのクリックハンドラが立てるのと同じ 2 つの状態を立てて開く
@@ -68816,6 +68825,250 @@ mod self_test {
                      missing={missing150} body={body150} copy={copy_ok150} \
                      respond={respond_ok150} thread={long150:?} stop={stopped150} done={}",
                     view150.0, done150.0
+                );
+                notify_and_draw(any, window, cx);
+            }
+
+            // 151. 蓋閉じ継続をバッテリー駆動でも続ける（#1473）。
+            //
+            // 症状は「テザリング中に蓋を閉じると回線ごと止まる」。蓋閉じ継続は
+            // AC 接続時にしか適用されなかったので、opt-in でバッテリーへ広げた。
+            // ここで測るのは
+            //   (a) dispatch（= CLI / MCP と同じ経路）の set で電源条件と残量下限が
+            //       書け、status が同じ値を返す（3 口の 1:1）
+            //   (b) 設定画面の状態行が status の実値と一致する（画面が判定の写しを持たない）
+            //   (c) 注入した残量が下限以下なら理由が `battery-floor` になり、**倒さない**
+            //   (d) 温度の物差しはバッテリーのとき厳しい（`fair` で降りる）
+            //   (e) 範囲外の下限は撥ねる（安全弁を 0 にできない）
+            //
+            // **本番の `pmset` を触らないための仕掛け**: 注入（`TAKO_1473_INJECT_BATTERY`）が
+            // 効くのはセルフテスト・隔離だけなので、ここで残量を下限以下に固定すれば
+            // 実機が満充電でも安全弁の側だけを通る = `disablesleep 1` へ入らない。
+            // 測り終えたら設定を元の値へ戻す
+            {
+                use tako_control::protocol::Request;
+                use tako_control::sleep_guard::LidSkipReason;
+
+                let before151 = tako_control::settings::load();
+                let fire151 = |r: Request, cx: &mut AsyncApp| {
+                    window
+                        .update(cx, |app, _, _| {
+                            tako_control::dispatch(app, r, PaneOrigin::Cli).ok()
+                        })
+                        .ok()
+                        .flatten()
+                };
+                let set151 = |power: Option<&str>, floor: Option<i64>, cx: &mut AsyncApp| {
+                    fire151(
+                        Request::SleepGuard {
+                            action: Some("set".into()),
+                            mode: None,
+                            power_condition: None,
+                            lid_sleep_mode: None,
+                            lid_power_condition: power.map(|s| s.to_string()),
+                            lid_battery_floor: floor,
+                        },
+                        cx,
+                    )
+                };
+
+                // (a) set が書けて status が同じ値を返す
+                let written151 = set151(Some("always"), Some(30), cx);
+                let status151 = fire151(
+                    Request::SleepGuard {
+                        action: Some("status".into()),
+                        mode: None,
+                        power_condition: None,
+                        lid_sleep_mode: None,
+                        lid_power_condition: None,
+                        lid_battery_floor: None,
+                    },
+                    cx,
+                );
+                let agree151 = |v: &serde_json::Value| {
+                    v["lid_power_condition"] == "always" && v["lid_battery_floor"] == 30
+                };
+                let ok_a151 = written151.as_ref().is_some_and(agree151)
+                    && status151.as_ref().is_some_and(agree151);
+                check(
+                    ok_a151,
+                    &format!(
+                        "151: 蓋閉じ継続の電源条件と残量下限が set / status で往復する \
+                         (#1473。set={written151:?} status={status151:?})"
+                    ),
+                );
+
+                // (b) 設定画面の状態行が status の実値と一致する
+                let plan151 = window.update(cx, |_app: &mut TakoApp, _, cx| cx.notify()).ok();
+                let row_agrees151 = status151.as_ref().map(|v| {
+                    let snap = crate::settings_sleep::SleepSnapshot::from_status_json(Some(v));
+                    let rows = snap.plan().status_rows;
+                    let lid_row = rows.get(1).map(|r| r.value.clone());
+                    lid_row.as_deref()
+                        == Some(crate::ui_text::settings::sleep_lid_status(snap.lid_status()))
+                });
+                check(
+                    row_agrees151 == Some(true) && plan151.is_some(),
+                    &format!(
+                        "151: 設定画面の蓋閉じ継続の行が status の実値と一致する (#1473。{row_agrees151:?})"
+                    ),
+                );
+
+                // (c) 注入した残量が下限以下なら理由が `battery-floor`（倒さない）
+                let injected151 = tako_control::sleep_guard::battery_percent();
+                let floor151 = tako_control::settings::load().lid_battery_floor;
+                let reason151 = tako_control::sleep_guard::lid_decision(
+                    &tako_control::sleep_guard::LidGuardInput {
+                        lid_sleep_mode: tako_control::sleep_guard::LidSleepMode::WhileAgentsRunning,
+                        setup_done: true,
+                        busy_agents: 1,
+                        on_ac: false,
+                        thermal: tako_control::sleep_guard::ThermalState::Nominal,
+                        lid_power_condition: tako_control::sleep_guard::PowerCondition::Always,
+                        battery_percent: Some(floor151.saturating_sub(5)),
+                        battery_floor: floor151,
+                    },
+                )
+                .err();
+                check(
+                    matches!(reason151, Some(LidSkipReason::BatteryFloor { .. })),
+                    &format!(
+                        "151: 残量が下限以下なら蓋閉じ継続を倒さない (#1473。{reason151:?} \
+                         injected={injected151:?} floor={floor151})"
+                    ),
+                );
+
+                // (d) バッテリー中は `fair` でも降りる（AC 中の物差しは #218 のまま）
+                let thermal151 = |on_ac: bool| {
+                    tako_control::sleep_guard::lid_decision(
+                        &tako_control::sleep_guard::LidGuardInput {
+                            lid_sleep_mode:
+                                tako_control::sleep_guard::LidSleepMode::WhileAgentsRunning,
+                            setup_done: true,
+                            busy_agents: 1,
+                            on_ac,
+                            thermal: tako_control::sleep_guard::ThermalState::Fair,
+                            lid_power_condition: tako_control::sleep_guard::PowerCondition::Always,
+                            battery_percent: Some(90),
+                            battery_floor: floor151,
+                        },
+                    )
+                };
+                let ok_d151 = matches!(thermal151(false), Err(LidSkipReason::Thermal(_)))
+                    && thermal151(true).is_ok();
+                check(
+                    ok_d151,
+                    &format!(
+                        "151: 温度の物差しが電源で変わる (#1473。battery={:?} ac={:?})",
+                        thermal151(false),
+                        thermal151(true)
+                    ),
+                );
+
+                // (e) 範囲外の下限は撥ねる（安全弁を 0 にできない）
+                let rejected151 = window
+                    .update(cx, |app, _, _| {
+                        tako_control::dispatch(
+                            app,
+                            Request::SleepGuard {
+                                action: Some("set".into()),
+                                mode: None,
+                                power_condition: None,
+                                lid_sleep_mode: None,
+                                lid_power_condition: None,
+                                lid_battery_floor: Some(0),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .is_err()
+                    })
+                    .unwrap_or(false);
+                check(
+                    rejected151,
+                    "151: 残量下限 0（安全弁なし）は撥ねる (#1473)",
+                );
+
+                // (f) 安全弁で落ちたことが通知欄へ出る（設定どおりの解除では出さない）
+                let notice151 = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        use tako_control::sleep_guard as sg;
+                        let base = sg::SleepGuardState {
+                            assertion_held: true,
+                            mode: sg::SleepGuardMode::WhileAgentsRunning,
+                            power_condition: sg::PowerCondition::AcOnly,
+                            on_ac_power: false,
+                            busy_agents: 1,
+                            platform_supported: true,
+                            lid_closed: false,
+                            lid_sleep_disabled: true,
+                            lid_sleep_mode: sg::LidSleepMode::WhileAgentsRunning,
+                            sudoers_installed: true,
+                            lid_setup_required: false,
+                            thermal_state: sg::ThermalState::Nominal,
+                            display_sleep_forced: false,
+                            lid_power_condition: sg::PowerCondition::Always,
+                            lid_battery_floor: 20,
+                            battery_percent: Some(80),
+                            lid_skip_reason: None,
+                        };
+                        // 落ちた側は**判断した理由まで**持つ（読む側は再計算しない）
+                        let dropped = sg::SleepGuardState {
+                            lid_sleep_disabled: false,
+                            battery_percent: Some(10),
+                            lid_skip_reason: Some(sg::LidSkipReason::BatteryFloor {
+                                percent: 10,
+                                floor: 20,
+                            }),
+                            ..base
+                        };
+                        // 安全弁で落ちた → 出す
+                        let released = sg::lid_notice(Some(&base), &dropped);
+                        if let Some(n) = released {
+                            app.notify_lid_guard(n);
+                        }
+                        let shown = app.remote_notice.as_ref().map(|n| n.text.clone());
+                        // エージェントが終わっただけ → 出さない（同じ通知が残ったまま）
+                        let idle = sg::SleepGuardState {
+                            lid_sleep_disabled: false,
+                            busy_agents: 0,
+                            ..base
+                        };
+                        let quiet = sg::lid_notice(Some(&base), &idle).is_none();
+                        app.remote_notice = None;
+                        cx.notify();
+                        (shown, quiet)
+                    })
+                    .unwrap_or((None, false));
+                check(
+                    notice151
+                        .0
+                        .as_deref()
+                        .is_some_and(|t| t.contains("10") && t.contains("20"))
+                        && notice151.1,
+                    &format!(
+                        "151: 安全弁の解除だけが通知欄へ理由つきで出る (#1473。{:?} quiet={})",
+                        notice151.0, notice151.1
+                    ),
+                );
+
+                // 測り終えたら元の設定へ戻す（本番の settings.json を残さない）
+                let restored151 = set151(
+                    Some(before151.lid_sleep_power.as_str()),
+                    Some(i64::from(before151.lid_battery_floor)),
+                    cx,
+                )
+                .is_some();
+                check(
+                    restored151
+                        && tako_control::settings::load().lid_sleep_power
+                            == before151.lid_sleep_power,
+                    "151: 検証で書いた設定を元へ戻す (#1473)",
+                );
+                println!(
+                    "TAKO_SELF_TEST_1473: set={ok_a151} row={row_agrees151:?} \
+                     reason={reason151:?} thermal={ok_d151} rejected={rejected151} \
+                     notice={:?} restored={restored151} injected={injected151:?}",
+                    notice151
                 );
                 notify_and_draw(any, window, cx);
             }

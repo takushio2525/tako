@@ -71,6 +71,52 @@ pub fn notice_user_task_added(id: &str, title: &str) -> String {
     )
 }
 
+/// 蓋閉じ継続が安全弁で解除されたことの通知（#1473）。
+///
+/// 理由の分類は `tako_control` が持つ 1 実装（[`tako_control::sleep_guard::LidSkipReason`]）で、
+/// ここは**同じ分類を日英の文にするだけ**（分類を画面側で作り直さない）
+pub fn notice_lid_released(reason: tako_control::sleep_guard::LidSkipReason) -> String {
+    use tako_control::sleep_guard::LidSkipReason;
+    match reason {
+        LidSkipReason::BatteryFloor { percent, floor } => tr!(
+            format!(
+                "バッテリー残量 {percent}%（下限 {floor}%）のため、蓋閉じ継続を解除しました。蓋を閉じると通常どおりスリープします"
+            ),
+            format!(
+                "Battery at {percent}% (floor {floor}%) — lid-close prevention released; closing the lid will sleep as usual"
+            )
+        ),
+        LidSkipReason::BatteryUnknown => tr!(
+            "バッテリー残量を取得できないため、蓋閉じ継続を解除しました".to_string(),
+            "Battery level is unavailable — lid-close prevention released".to_string()
+        ),
+        LidSkipReason::Thermal(state) => tr!(
+            format!(
+                "本体が高温（{}）のため、蓋閉じ継続を解除しました",
+                state.as_str()
+            ),
+            format!(
+                "The device is running hot ({}) — lid-close prevention released",
+                state.as_str()
+            )
+        ),
+        // 安全弁以外の理由では通知しない（`lid_notice` が絞る）。
+        // 万一届いても無言にはしない
+        other => tr!(
+            format!("蓋閉じ継続を解除しました（{}）", other.describe()),
+            format!("Lid-close prevention released ({})", other.tag())
+        ),
+    }
+}
+
+/// 解除していた蓋閉じ継続を再び効かせたことの通知（#1473）
+pub fn notice_lid_reapplied() -> &'static str {
+    tr!(
+        "蓋閉じ継続を再び有効にしました（蓋を閉じても動き続けます）",
+        "Lid-close prevention is back on (it keeps running with the lid closed)"
+    )
+}
+
 /// IPC の受け口が上限以外の理由で立たなかったときの通知（#1441）
 pub fn notice_ipc_unavailable(reason: &str) -> String {
     tr!(

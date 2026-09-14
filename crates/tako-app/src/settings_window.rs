@@ -353,6 +353,8 @@ impl SettingsWindow {
                         mode: None,
                         power_condition: None,
                         lid_sleep_mode: None,
+                        lid_power_condition: None,
+                        lid_battery_floor: None,
                     },
                     cx,
                 );
@@ -680,6 +682,8 @@ impl SettingsWindow {
                 mode: Some(s.sleep_guard_mode.as_str().to_string()),
                 power_condition: Some(s.sleep_guard_power.as_str().to_string()),
                 lid_sleep_mode: Some(s.lid_sleep_mode.as_str().to_string()),
+                lid_power_condition: Some(s.lid_sleep_power.as_str().to_string()),
+                lid_battery_floor: Some(i64::from(s.lid_battery_floor)),
             },
             Request::Logs {
                 action: "set".into(),
@@ -2506,6 +2510,15 @@ impl SettingsWindow {
         let mode = s.sleep_guard_mode.as_str().to_string();
         let power = s.sleep_guard_power.as_str().to_string();
         let lid = s.lid_sleep_mode.as_str().to_string();
+        // #1473: 蓋閉じ継続の電源条件と残量下限。候補（10/20/30/50%）の正本は
+        // `settings_sleep::BATTERY_FLOOR_CHOICES` で、CLI / MCP はもっと広い範囲を受ける
+        let lid_power = s.lid_sleep_power.as_str().to_string();
+        let floor = s.lid_battery_floor.to_string();
+        let floor_choices: Vec<(&'static str, String)> =
+            crate::settings_sleep::BATTERY_FLOOR_CHOICES
+                .iter()
+                .map(|(percent, value)| (*value, txt::sleep_lid_floor_choice(*percent)))
+                .collect();
         // 何を描くかは OS 名ではなくこの OS の能力から決める（#727）。
         // Windows は蓋閉じ継続に初回セットアップが要らないので、その手のボタンは生えない。
         // ここで描く文字列の一覧は `SleepTabPlan::visible_texts` と同じ集合にする
@@ -2534,6 +2547,8 @@ impl SettingsWindow {
                         mode: Some(value.to_string()),
                         power_condition: None,
                         lid_sleep_mode: None,
+                        lid_power_condition: None,
+                        lid_battery_floor: None,
                     },
                 ),
             ))
@@ -2553,6 +2568,8 @@ impl SettingsWindow {
                         mode: None,
                         power_condition: Some(value.to_string()),
                         lid_sleep_mode: None,
+                        lid_power_condition: None,
+                        lid_battery_floor: None,
                     },
                 ),
             ))
@@ -2574,9 +2591,57 @@ impl SettingsWindow {
                             mode: None,
                             power_condition: None,
                             lid_sleep_mode: Some(value.to_string()),
+                            lid_power_condition: None,
+                            lid_battery_floor: None,
                         },
                     ),
                 ))
+                // #1473: 蓋を閉じたままバッテリーで走らせるか（既定は AC のみ）
+                .child(self.row(
+                    txt::sleep_lid_power_header(),
+                    txt::desc_sleep_lid_power(),
+                    self.segmented(
+                        "sleep-lid-power",
+                        &[
+                            ("ac-only", txt::sleep_power_ac().to_string()),
+                            ("always", txt::sleep_lid_power_always().to_string()),
+                        ],
+                        &lid_power,
+                        cx,
+                        |value| Request::SleepGuard {
+                            action: Some("set".into()),
+                            mode: None,
+                            power_condition: None,
+                            lid_sleep_mode: None,
+                            lid_power_condition: Some(value.to_string()),
+                            lid_battery_floor: None,
+                        },
+                    ),
+                ))
+                // 残量下限は「バッテリーでも継続する」を選んだ人にだけ意味がある
+                .when(
+                    s.lid_sleep_power == tako_control::sleep_guard::PowerCondition::Always,
+                    |d| {
+                        d.child(self.row(
+                            txt::sleep_lid_floor_header(),
+                            txt::desc_sleep_lid_floor(),
+                            self.segmented(
+                                "sleep-lid-floor",
+                                &floor_choices,
+                                &floor,
+                                cx,
+                                |value| Request::SleepGuard {
+                                    action: Some("set".into()),
+                                    mode: None,
+                                    power_condition: None,
+                                    lid_sleep_mode: None,
+                                    lid_power_condition: None,
+                                    lid_battery_floor: value.parse::<i64>().ok(),
+                                },
+                            ),
+                        ))
+                    },
+                )
             })
             // 初回セットアップ（macOS の sudoers 登録）が要る OS でだけボタンを出す。
             // Windows は電源プランを非管理者で書けるので登録も解除も無い（#697）
@@ -2598,6 +2663,8 @@ impl SettingsWindow {
                                         mode: None,
                                         power_condition: None,
                                         lid_sleep_mode: None,
+                                        lid_power_condition: None,
+                                        lid_battery_floor: None,
                                     },
                                     txt::msg_lid_installed().to_string(),
                                     cx,
@@ -2616,6 +2683,8 @@ impl SettingsWindow {
                                         mode: None,
                                         power_condition: None,
                                         lid_sleep_mode: None,
+                                        lid_power_condition: None,
+                                        lid_battery_floor: None,
                                     },
                                     txt::msg_lid_removed().to_string(),
                                     cx,
