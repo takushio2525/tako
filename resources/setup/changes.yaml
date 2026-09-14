@@ -390,3 +390,46 @@ changes:
         （templates/sections/07-context-budget.md）が増えたので、
         既存の指示ファイルへ取り込むかはユーザーへ確認してから決める
       - AI からは MCP `tako_context_budget`（action = check / fix）で同じ操作ができる
+
+  - revision: 19
+    version: "0.8.14"
+    date: "2026-09-14"
+    kind: auto
+    title: この環境固有のルール（prompt_blocks.append）が長くても予算に収まるようになった
+    description: |
+      master / solo の指示書（system prompt）の 24 KB の予算を、**tako が作る部分
+      18.5 KB** と **あなたが書いた追記 5.5 KB** に分けた（Issue #1477）。
+
+      変更前は tako 側だけで 21.8 KB あり、プロファイルの `prompt_blocks.append`
+      （この環境固有のルール = 既定では orchestrator/local-rules.md）には 2.7 KB しか
+      残らなかった。ルールを書くほど予算を超え、**利用者が自分のルールを削って
+      合わせる**しかない状態だった。
+
+      tako 側でやったこと:
+
+        - 委任の判断材料（プロファイルの delegate_guidance と ledger 由来の既定）を
+          指示書から外し、`tako orchestrator guide delegation` で必要なときだけ
+          引く形にした
+        - monitoring / behavior / guides / context-budget の案内文を締めた
+          （**ルールは 1 つも消していない**。全文は `tako orchestrator guide <topic>`）
+
+      あなたの追記についてやること（**自動・手作業は不要**）:
+
+        - 追記が 5.5 KB を超えていたら、`tako setup` / tako の起動 /
+          `tako migrate run` のいずれかで、見出し（`## …`）の切れ目へ
+          `<!-- tako:on-demand -->` の 1 行が入る
+        - その行より**手前**が毎ターン読まれ、**後ろ**は master が
+          `tako orchestrator guide local-rules` で必要なときだけ読む
+          （手前には「後ろにこういう見出しがある」という索引 1 行が自動で載る）
+        - **内容は 1 文字も消えない**。増えるのはマーカー行 1 本だけで、
+          元のファイルは `<名前>.pre-v1.bak` に残る
+        - 自分で区切りたい位置があれば、そこへ `<!-- tako:on-demand -->` を
+          書いておけば tako は尊重してもう触らない
+        - 予算内の小さい追記・既に区切りのある追記・見出しが無い追記は触らない
+
+      確認事項:
+      - 状態は `tako context-budget check --profile <名前>` で見られる。
+        分割しても常時部が超えるときは「区切りを何行上へ動かすか」が
+        具体的な行数つきで返る
+      - AI からは MCP `tako_orchestrator_guide({ topic: "local-rules" })` /
+        `tako_migrate` で同じ操作ができる

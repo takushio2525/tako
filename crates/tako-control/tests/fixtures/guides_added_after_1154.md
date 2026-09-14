@@ -324,3 +324,8 @@ spawning master left. Those tasks are still filed, but the reply has nowhere to 
 the delivery is recorded as `failed` with a "宛先不明" reason instead of being handed to
 an unrelated master. If you need to file from such a place — a bare shell, a script —
 call it with `TAKO_ORCHESTRATOR_ROLE=master:<profile>` so the reply has an address.
+
+<!-- #1477: no-investigate の偵察 3 手順を guide `spawning` へ移した。本文は原文そのままで、 -->
+<!-- 節を分けるための見出し 1 行だけが新規なのでここへ宣言する。 -->
+
+## Scout Workers: Reconnaissance Before a Real Task

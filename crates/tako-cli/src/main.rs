@@ -5595,6 +5595,10 @@ fn print_context_budget_proposals(out: &serde_json::Value) {
                 piece["bytes"].as_u64().unwrap_or(0)
             );
         }
+        // #1477: 追記を持つプロファイルには「区切りを何行上げるか」まで出す
+        if let Some(advice) = p["advice"].as_str() {
+            println!("        → {advice}");
+        }
     }
 }
 

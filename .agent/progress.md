@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-14（#1459: 右パネルの手書きテキスト入力 2 本を TextField へ寄せた）
-- git のコミット欄とブランチ名欄が持っていた同型の編集実装（`floor_char_boundary` で丸めてから backspace / delete / 左右 / Home / End / 挿入）を `TextField` の 1 実装へ。状態も `String` + カーソルから `TextField` 1 つへ畳んだ（`GitBranchInput.start_point` は不変）。割り当て（`⌘Enter` / `Esc` / `⌘V` / 1 行欄の上下→端）は各画面に残す
-- **丸めは `text_field.rs` の非公開関数へ移した**ので、他ファイルが同じことをするには自前で書き直すしかない（= 番犬のマークに必ず掛かる）。B2 番犬の猶予表は空になり、走査は `tasks_panel.rs` + `right_panel.rs` の全面適用 + 「打鍵ハンドラが `handle_edit_key` を通す」の正検査つき
-- 実測: 隔離セルフテスト（tako-vd）`TAKO_APP_SELF_TEST_OK`。A/B は委譲を切る注入で項目 79 / 82 が名指し FAILED（項目 81 まで通過を確認）。番犬は注入 11 通り + 実注入で `right_panel.rs:4643/4647` を file:line 名指し。workspace 4848 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。**リファクタなので install 不要**
-
 ## 2026-09-14（#1450 B4: 人がやることの最初の中身を本番へ入れ、引き継ぎ手順書に「人待ちはここへ」を足した）
 - 本番 `tako todo` へ **19 件**（post 2 = #1081 解説動画 v6 / #1284 X ショート・permission 4・review 12・confirm 1）。投稿 2 件は投稿文 / タイトル / タグを `copy_texts` に分け、動画とサムネを添付（`exists: true` を実測）。引き継ぎの「ユーザー確認待ち」18 項目のうち①は投稿 2 件へ畳んだ。登録は冪等（同じ title はスキップ）
 - リポは `guides/handoff.md` に 1 段落（**人待ちは引き継ぎファイルではなく `tako_todo` へ**）。番犬の要求どおり `guides_added_after_1154.md` へ同文を宣言（宣言を外すと 7 行を file:line で名指し FAILED）。`user-tasks` 手順書と `.agent/orchestrator.md:917` は既に同じことを書いているので変更不要
@@ -54,3 +49,8 @@
 - 蓋閉じ継続の電源条件を**アイドルスリープ側とは別の軸**（`lid_sleep_power`・既定 `ac-only` = 現状維持）にし、`always` のときだけバッテリーでも続ける。安全弁は 4 つ（エージェント稼働中のみ / 残量が下限（既定 20%・5〜90%）に**達したら**解除 / 温度は**バッテリーなら fair 以上・AC なら serious 以上**で解除 / 残量を読めない機械では継続しない）。Windows は同じ判定を通り `always` のときだけ電源プランのバッテリーレールも倒す（残量取得は未実装 = 実質 AC のみ・実機未検証）
 - 判定は `lid_decision(&LidGuardInput) -> Result<(), LidSkipReason>` の 1 本で、真偽値ではなく**理由**を返す。理由は状態が運ぶ（`update` / `status` が `with_decision()` で埋める）ので、CLI・設定画面・通知欄・persist.log は**読むだけ**（読む側が再計算すると A/B や stale binary で判断が割れる = #372 と同じ理屈）。通知欄へ出すのは安全弁の解除と回復だけ
 - 実測（隔離 GUI / tako-vd。実機はバッテリー 52% 駆動）: `always` + 下限 10% + エージェント 1 体で実機の `SleepDisabled=Yes` を 8 サンプル観測（persist.log に `lid-sleep: … reason=applied battery=15%`）・注入 15% では倒さず理由 `battery-floor`・MCP で書いた値を CLI が読む・範囲外（0 / 95）は両口とも拒否・A/B `TAKO_1473_LEGACY=1` は `always` でも「AC 未接続」で降りる。**検証後に `SleepDisabled=No`（検証前と同値）へ戻したことを確認**。workspace 4937 passed 0 failed・clippy 3 宇宙 0・check-windows error 0・docs 32 ページ・番犬 3 本（注入 9 通り + 実注入で `sleep_guard.rs:1162` を名指し）。**install 要 / 実機の蓋閉じは未検証**
+
+## 2026-09-14（#1477: master system prompt の取り分を tako と利用者で分け、追記を自動分割）
+- system prompt 24 KB を **tako の base 18.5 KB + 追記 5.5 KB** に分割。委任の判断材料（`delegate_guidance` + judgment）を新 topic `delegation`（動的 guide）へ出し、behavior / monitoring / guides / context-budget の案内文を締めた。実測 base: default 20,732→17,480 / codex 22,695→17,507 / fable 22,507→17,493 / takodev 21,808→18,450（**ルールは 1 つも消していない**）
+- 予算を超えた `prompt_blocks.append` は自動移行（`SchemaId::PromptAppend`）が見出し境界へ `<!-- tako:on-demand -->` を**1 行入れるだけ**。後ろは `tako orchestrator guide local-rules` で引き、prompt には生成した索引 1 行（`append index` piece）。`strip_marker(新) == 旧` が不変条件
+- 実測: `scripts/test-prompt-append-split-1477.sh` **31 PASS 0 FAIL**（隔離 HOME + `TAKO_DATA_DIR`）。番犬 11 本（注入つき）・A/B `TAKO_1477_LEGACY=1` で base 18,772 / 追記 12,318 の分割前へ戻る

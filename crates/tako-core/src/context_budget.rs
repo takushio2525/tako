@@ -123,6 +123,21 @@ pub const GLOBAL_GUIDE_MAX_BYTES: usize = 24 * 1024;
 /// `proposals` に添えて分離先を案内する
 pub const SYSTEM_PROMPT_MAX_BYTES: usize = 24 * 1024;
 
+/// master / solo の system prompt のうち **tako 自身が作る部分**（Issue #1477）。
+///
+/// #1154 で手順を `tako orchestrator guide` へ出したあとも base だけで 21.8 KB あり、
+/// 利用者の追記（`prompt_blocks.append` = 個人環境固有のルール）に 2.7 KB しか
+/// 残らなかった。**自分のルールを削って予算に合わせるのは利用者の仕事ではない**ので、
+/// tako 側の取り分に上限を置いて残りを追記へ明け渡す。番犬は
+/// `crates/tako-control/tests/prompt_budget_1477.rs`
+pub const SYSTEM_PROMPT_BASE_MAX_BYTES: usize = 18 * 1024 + 512;
+
+/// 追記（`prompt_blocks.append`）に使える量 = 全体の予算から tako の取り分を引いた残り。
+///
+/// **引き算で導出する**（数値を二重管理しない）。これを超える追記は
+/// [`crate::prompt_append`] の区切りで常時部と on-demand 部に分かれる
+pub const PROMPT_APPEND_MAX_BYTES: usize = SYSTEM_PROMPT_MAX_BYTES - SYSTEM_PROMPT_BASE_MAX_BYTES;
+
 /// 種別ごとの上限を引く（**判定・規約文・番犬がすべてこの 1 本を通る**）
 pub fn limits(kind: ItemKind) -> Limits {
     match kind {
@@ -196,6 +211,10 @@ pub fn rule_markdown() -> String {
 - 引き継ぎの運用メモは {handoff_lines} 行以内 / グローバル指示ファイルは {global_kb} KB 以内
 - master / solo の **system prompt は {prompt_kb} KB 以内**。手順の詳細は
   `tako orchestrator guide <topic>` で必要なときだけ引く形にし、prompt には「いつ引くか」を残す
+- そのうち **tako が作る部分は {prompt_base_kb} KB 以内**で、残り **{prompt_append_kb} KB** は
+  プロファイルの `prompt_blocks.append`（個人環境のルール）の取り分。追記がこれを超えると
+  `tako migrate` が見出し境界へ `<!-- tako:on-demand -->` を入れ、その行より後ろは
+  `tako orchestrator guide local-rules` で引く形になる（**内容は 1 文字も消さない**）
 
 ### 機械強制
 
@@ -214,7 +233,23 @@ pub fn rule_markdown() -> String {
         handoff_lines = HANDOFF_MEMO_MAX_LINES,
         global_kb = GLOBAL_GUIDE_MAX_BYTES / 1024,
         prompt_kb = SYSTEM_PROMPT_MAX_BYTES / 1024,
+        prompt_base_kb = format_kb(SYSTEM_PROMPT_BASE_MAX_BYTES),
+        prompt_append_kb = format_kb(PROMPT_APPEND_MAX_BYTES),
     )
+}
+
+/// 予算を KB 表記にする（`18944` → `18.5`）。
+///
+/// 端数を持つ予算（#1477 の 18.5 KB / 5.5 KB）を規約文へ出すのに要る。
+/// **規約文は必ずここを通す**（手で「18.5」と書くと定数を変えたときに嘘になる）
+pub fn format_kb(bytes: usize) -> String {
+    let whole = bytes / 1024;
+    let frac = (bytes % 1024) * 10 / 1024;
+    if frac == 0 {
+        whole.to_string()
+    } else {
+        format!("{whole}.{frac}")
+    }
 }
 
 /// マーカーに挟まれた規約文を取り出す（規約の一致を検査する側が使う）
@@ -1196,6 +1231,19 @@ mod tests {
         }
         assert!(date_to_days("2026-13-01").is_none());
         assert!(date_to_days("not-a-date").is_none());
+    }
+
+    #[test]
+    fn 予算のkb表記は端数を落とさない() {
+        assert_eq!(format_kb(SYSTEM_PROMPT_BASE_MAX_BYTES), "18.5");
+        assert_eq!(format_kb(PROMPT_APPEND_MAX_BYTES), "5.5");
+        assert_eq!(format_kb(24 * 1024), "24");
+        assert_eq!(format_kb(0), "0");
+        // 取り分の合計は全体の予算（引き算で導出していることの確認。#1477）
+        assert_eq!(
+            SYSTEM_PROMPT_BASE_MAX_BYTES + PROMPT_APPEND_MAX_BYTES,
+            SYSTEM_PROMPT_MAX_BYTES
+        );
     }
 
     #[test]

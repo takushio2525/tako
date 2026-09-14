@@ -74,6 +74,12 @@ pub enum SchemaId {
     Ledger,
     /// `<data_dir>/orchestrator/user-tasks.yaml`（ユーザー向けタスク。#1450）
     UserTasks,
+    /// プロファイルの `prompt_blocks.append` が指す追記ファイル（個人環境のルール。#1477）。
+    ///
+    /// **置き場が固定でない**唯一の種別（どのファイルを指すかはプロファイルが決める）。
+    /// 形式は md なので `validate` は持たず、移行は「予算を超えた追記へ
+    /// `<!-- tako:on-demand -->` を 1 行入れる」だけ
+    PromptAppend,
     /// `<data_dir>/orchestrator/handoff/`（引き継ぎ。プロジェクト単位化は #915）
     Handoff,
     /// `<data_dir>/setup/`（`tako setup` の生成物。置き場の是正は #1019）
@@ -106,6 +112,7 @@ impl SchemaId {
             Self::SoloProfiles => "solo_profiles",
             Self::Ledger => "ledger",
             Self::UserTasks => "user_tasks",
+            Self::PromptAppend => "prompt_append",
             Self::Handoff => "handoff",
             Self::Setup => "setup",
             Self::DiscoveryInstance => "discovery_instance",
@@ -137,6 +144,7 @@ impl SchemaId {
             Self::SoloProfiles,
             Self::Ledger,
             Self::UserTasks,
+            Self::PromptAppend,
             Self::Handoff,
             Self::Setup,
             Self::DiscoveryInstance,
