@@ -8,6 +8,13 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.8.15] - 2026-09-17
+
+Nightly patch release (automated). Changes since v0.8.14:
+夜間パッチリリース（自動）。v0.8.14 以降の変更:
+
+- [改善] tasks ビューを押した行の直下で開き、タブのバッジを幅で欠けさせない (#1479) (#1480)
+
 ## [0.8.14] - 2026-09-15
 
 Nightly patch release (automated). Changes since v0.8.13:
