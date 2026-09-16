@@ -1060,6 +1060,21 @@ enum TodoCommand {
         #[arg(long)]
         json: bool,
     },
+    /// 右パネルの tasks ビューでその 1 件をその場に展開して見せる（#1479）。
+    /// パネルが閉じていれば開いて tasks ビューへ切り替える
+    Expand {
+        /// 対象のタスク id
+        id: String,
+        /// JSON で出力する
+        #[arg(long)]
+        json: bool,
+    },
+    /// 展開を畳む（#1479）
+    Collapse {
+        /// JSON で出力する
+        #[arg(long)]
+        json: bool,
+    },
     /// 返答する（起票した master へ届く）
     Respond {
         /// 対象のタスク id
@@ -6624,6 +6639,8 @@ fn todo_request(sub: &TodoCommand) -> Request {
         }
         TodoCommand::Done { id, .. } => with_id(base("done"), id),
         TodoCommand::Dismiss { id, .. } => with_id(base("dismiss"), id),
+        TodoCommand::Expand { id, .. } => with_id(base("expand"), id),
+        TodoCommand::Collapse { .. } => base("collapse"),
         TodoCommand::Respond {
             id,
             decision,
@@ -8727,6 +8744,27 @@ fn print_todo_list(result: &Value) {
 }
 
 /// 1 件の詳細（`show` / `add` / `respond` の既定出力）
+/// `tako todo expand` / `collapse` の既定出力（#1479）。
+/// **画面が無い（GUI が動いていない）ときに「開いた」と言わない**
+fn print_todo_expanded(result: &Value) {
+    match result.get("expanded").and_then(Value::as_str) {
+        Some(id) => println!("expanded: {id}"),
+        None => println!("expanded: (なし)"),
+    }
+    let visible = result
+        .get("panel_visible")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let view = result
+        .get("panel_view")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    println!(
+        "panel: {} / view: {view}",
+        if visible { "表示" } else { "非表示" }
+    );
+}
+
 fn print_todo_detail(result: &Value) {
     println!(
         "{} [{}/{}] {}",
@@ -9104,6 +9142,14 @@ fn print_result(command: &Command, result: &Value) {
                 println!("{}", pretty_json(result));
             } else {
                 print_todo_detail(result);
+            }
+        }
+        // #1479: 画面の状態だけを返す（タスクの中身は出さない）
+        Command::Todo(TodoCommand::Expand { json, .. } | TodoCommand::Collapse { json, .. }) => {
+            if *json {
+                println!("{}", pretty_json(result));
+            } else {
+                print_todo_expanded(result);
             }
         }
         Command::Task(TaskCommand::List { json, .. }) => {

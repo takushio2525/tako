@@ -159,6 +159,7 @@ tako/
 | プレビュー画像キャッシュ | `tako preview-cache [max_mb]` |
 | 設定の自動マイグレーション（#916） | `tako migrate [status|run] [--schema <種別>]` |
 | **ユーザー向けタスク（人がやること。承認待ち・レビュー・投稿。#1450）** | `tako todo list` |
+| **その 1 件を右パネルで開いて見せる（#1479）** | `tako todo expand <id>` |
 | **人がやることを画面で見る・返答する（右パネル。#1450 B2）** | `tako panel --show --view tasks` |
 | **人がやることをスマホから片付ける（PWA。#1450 B3）** | `#/tasks` |
 | 受け入れゲート（#244 / #935） | `tako task gate set <task_id> --command "cmd" [--pr-merged N] [--custom "desc"]` |

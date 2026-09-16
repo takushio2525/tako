@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-14（#1450 B4: 人がやることの最初の中身を本番へ入れ、引き継ぎ手順書に「人待ちはここへ」を足した）
-- 本番 `tako todo` へ **19 件**（post 2 = #1081 解説動画 v6 / #1284 X ショート・permission 4・review 12・confirm 1）。投稿 2 件は投稿文 / タイトル / タグを `copy_texts` に分け、動画とサムネを添付（`exists: true` を実測）。引き継ぎの「ユーザー確認待ち」18 項目のうち①は投稿 2 件へ畳んだ。登録は冪等（同じ title はスキップ）
-- リポは `guides/handoff.md` に 1 段落（**人待ちは引き継ぎファイルではなく `tako_todo` へ**）。番犬の要求どおり `guides_added_after_1154.md` へ同文を宣言（宣言を外すと 7 行を file:line で名指し FAILED）。`user-tasks` 手順書と `.agent/orchestrator.md:917` は既に同じことを書いているので変更不要
-- 実測で穴 2 件を発見して起票: **#1466**（worker 起票の返答が無関係な `default` master へ届く。B4 は role 明示で回避）/ **#1467**（MCP `tako_panel` の view enum に `tasks` が無い = 設計原則 5）
-
 ## 2026-09-14（#1467: MCP カタログの enum を正本から生成するようにした）
 - `tako_panel` の `view` が手書きの写し（`["fleet","orch","git","tmux"]`）で #1450 B2 の `tasks` に追従していなかった。`PanelViewWire` へ `summary()` / `accepted_values()` / `values_summary()` を足し、catalog は `panel_view_schema()` で受理値も説明文も生成する。旧称 `tmux` は**落とさない**（enum から消すと今動いているクライアントが送れなくなる）
 - 棚卸し: catalog の `"enum"` は 102 か所 / 値集合 75 種。正本が実行時に読めるのは 10 種（20 site）だけで、うち「MCP の正本」を名乗っていた 5 つ（Panel / ProfileKind / SessionRestartMode / UiMode / RemoteOpenTarget）を生成へ寄せた。残り 52 種は正本なし（action 動詞）か正本が非公開・列挙 API なし = Issue にコメント
@@ -54,3 +49,8 @@
 - system prompt 24 KB を **tako の base 18.5 KB + 追記 5.5 KB** に分割。委任の判断材料（`delegate_guidance` + judgment）を新 topic `delegation`（動的 guide）へ出し、behavior / monitoring / guides / context-budget の案内文を締めた。実測 base: default 20,732→17,480 / codex 22,695→17,507 / fable 22,507→17,493 / takodev 21,808→18,450（**ルールは 1 つも消していない**）
 - 予算を超えた `prompt_blocks.append` は自動移行（`SchemaId::PromptAppend`）が見出し境界へ `<!-- tako:on-demand -->` を**1 行入れるだけ**。後ろは `tako orchestrator guide local-rules` で引き、prompt には生成した索引 1 行（`append index` piece）。`strip_marker(新) == 旧` が不変条件
 - 実測: `scripts/test-prompt-append-split-1477.sh` **31 PASS 0 FAIL**（隔離 HOME + `TAKO_DATA_DIR`）。番犬 11 本（注入つき）・A/B `TAKO_1477_LEGACY=1` で base 18,772 / 追記 12,318 の分割前へ戻る
+
+## 2026-09-16（#1479: tasks ビューを押した行の直下で開き、タブのバッジを幅で欠けさせない）
+- A: 詳細を**行の器の子**へ移し（旧実装は列の末尾に 1 枚 + 「選択が無ければ先頭」で畳めなかった）、`toggle` / `collapse` の 1 実装で「再押下で閉じる・別項目で乗り換える・絞り込みで畳む・ポーリングでは畳まない・`done` で畳む（dispatch 側 1 か所）」に。展開した行は `scroll_to_item` で見える位置へ。矢印は `CHEVRON_*`
+- B: タブ列を `panel_tab_density` の 3 段（Full / Compact / IconsOnly）+ belt（バッジ `flex_none` / ラベル `min_w(0)`）で詰め、件数は `panel_tab_badge`（0 件は出さない・100 以上は `99+`）。220〜900px × 0/9/22/150/4000 件を単体テストが 1px 刻みで固定、visual-test 項目 152 が**バッジの実矩形がタブ列の内側**かを 4 幅 × 4 件数で読む（A/B `TAKO_1479_LEGACY=1` は 10/16 で FAILED = 320px で 9px 溢れる）
+- MCP / CLI 1:1: `tako todo expand <id>` / `collapse` + `list` の `expanded`。番犬 `issue1479_tasks_accordion_watchdog`（注入 11 通り）・実経路 `scripts/test-todo-expand-1479.sh`

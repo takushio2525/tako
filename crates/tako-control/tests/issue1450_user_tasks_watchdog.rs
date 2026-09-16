@@ -48,9 +48,11 @@ const MIGRATIONS: &str = "crates/tako-control/src/migrations.rs";
 const CATALOG: &str = "crates/tako-control/src/config_share/catalog.rs";
 const SCHEMA: &str = "crates/tako-core/src/migration.rs";
 
-/// CLI / MCP / dispatch がすべて名乗る操作の語彙（**ここが正**）
+/// CLI / MCP / dispatch がすべて名乗る操作の語彙（**ここが正**）。
+/// `expand` / `collapse` は画面（右パネル tasks ビュー）の操作（#1479）で、
+/// **UI でできることは MCP / CLI からもできる**という開発不変条件のぶん
 const ACTIONS: &[&str] = &[
-    "add", "list", "show", "update", "done", "dismiss", "respond",
+    "add", "list", "show", "update", "done", "dismiss", "respond", "expand", "collapse",
 ];
 
 fn workspace_root() -> PathBuf {
