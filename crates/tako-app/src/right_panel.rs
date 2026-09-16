@@ -5323,17 +5323,30 @@ impl TakoApp {
         let view = self.panel_view;
         // #1450 B2: tasks タブのバッジ（未完了件数）。画面で数えず B1 の値をそのまま出す
         let open_tasks = self.user_tasks.snapshot.open_count;
+        // #1479 B: 出す文字（3 文字で止める）と、それが収まる詰め方を先に決める。
+        // **バッジの幅を含めて**段を選ぶので、件数が増えた日に数字が切れない
+        let badge_text = panel_tab_badge(open_tasks);
+        let legacy_tabs = legacy_1479();
+        let density = if legacy_tabs {
+            // A/B: 幅を見ない（= 直す前）
+            PanelTabDensity::Full
+        } else {
+            panel_tab_density(self.panel_width, badge_text.as_deref())
+        };
         // カンプ準拠のタブ（アイコン + ラベル、active は下線 inset）
         let tab_button =
             |label: &'static str, icon: &'static str, target: PanelView, active: bool| {
+                let tip_theme = theme.clone();
                 div()
                     .id(("panel-tab", target as u64))
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(7.0))
-                    .px(px(12.0))
+                    .gap(px(panel_tab_metrics::GAP))
+                    .px(px(density.pad_x()))
                     .h_full()
+                    // 段の見積りが甘くても**溢れるのではなく縮む**（belt。#1479 B）
+                    .when(!legacy_tabs, |d| d.min_w(px(0.0)).overflow_hidden())
                     .cursor_pointer()
                     .text_size(px(12.0))
                     .when(active, |d| {
@@ -5354,18 +5367,43 @@ impl TakoApp {
                     } else {
                         hsla(theme.text_muted)
                     })
+                    // ラベルを落とした段では**言葉が消える**ので、ホバーで名前を出す
+                    // （添付の行と同じ `HintTooltip` の 1 実装）
+                    .when(!density.labels(), |d| {
+                        let label = label.to_string();
+                        d.tooltip(move |_, cx| {
+                            cx.new(|_| {
+                                crate::tab_bar::HintTooltip::new(label.clone(), tip_theme.clone())
+                            })
+                            .into()
+                        })
+                    })
                     .child(
                         svg()
                             .path(icon)
-                            .w(px(14.0))
-                            .h(px(14.0))
+                            .flex_none()
+                            .w(px(panel_tab_metrics::ICON))
+                            .h(px(panel_tab_metrics::ICON))
                             .text_color(if active {
                                 hsla(theme.accent)
                             } else {
                                 hsla(theme.text_muted)
                             }),
                     )
-                    .child(label)
+                    .when(density.labels(), |d| {
+                        d.child(
+                            // 縮むのはここ（`min_w(0)` が無いと taffy が縮められず、
+                            // 溢れたぶんがバッジを切る = #1479 の症状）
+                            div()
+                                .when(!legacy_tabs, |d| {
+                                    d.min_w(px(0.0))
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                })
+                                .child(label),
+                        )
+                    })
             };
         Some(
             div()
@@ -5385,12 +5423,30 @@ impl TakoApp {
                         .px_2()
                         .h(px(38.0))
                         .flex_none()
+                        .relative()
                         .border_b_1()
                         .border_color(hsla(theme.border_inner))
                         .bg(rgba(theme.mantle))
+                        // タブ列の実描画矩形（#1479 B。バッジがこの中に収まっているかを
+                        // visual-test が実フレームの幾何で読む）
+                        .child({
+                            let probe = self.panel_click_probe_bounds.clone();
+                            canvas(
+                                |_, _, _| (),
+                                move |bounds, _, _, _| {
+                                    probe
+                                        .borrow_mut()
+                                        .insert("panel-tabs-row".to_string(), bounds);
+                                },
+                            )
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full()
+                        })
                         .child(
                             tab_button(
-                                "fleet",
+                                PANEL_TAB_LABELS[0],
                                 crate::file_icons::ui_icon::FLEET,
                                 PanelView::Fleet,
                                 view == PanelView::Fleet,
@@ -5402,7 +5458,7 @@ impl TakoApp {
                         )
                         .child(
                             tab_button(
-                                "orch",
+                                PANEL_TAB_LABELS[1],
                                 if view == PanelView::Orch {
                                     crate::file_icons::ui_icon::ORCH_ACTIVE
                                 } else {
@@ -5418,7 +5474,7 @@ impl TakoApp {
                         )
                         .child(
                             tab_button(
-                                "git",
+                                PANEL_TAB_LABELS[2],
                                 crate::file_icons::ui_icon::GIT_BRANCH,
                                 PanelView::Git,
                                 view == PanelView::Git,
@@ -5432,21 +5488,41 @@ impl TakoApp {
                             // #1450 B2: 人がやること。未完了件数のバッジ付き
                             // （件数の正本は B1 の `list` が返す `open_count`）
                             tab_button(
-                                "tasks",
+                                PANEL_TAB_LABELS[PANEL_TAB_BADGE_ON],
                                 crate::file_icons::ui_icon::TASKS,
                                 PanelView::Tasks,
                                 view == PanelView::Tasks,
                             )
-                            .when(open_tasks > 0, |d| {
+                            .when_some(badge_text.clone(), |d, badge| {
+                                let probe = self.panel_click_probe_bounds.clone();
                                 d.child(
                                     div()
+                                        // **絶対に縮まない**（縮めば数字が欠ける = #1479）
                                         .flex_none()
-                                        .px(px(4.0))
+                                        .relative()
+                                        .px(px(panel_tab_metrics::BADGE_PAD_X))
                                         .rounded(px(7.0))
                                         .bg(rgba(theme.accent_muted))
                                         .text_size(px(9.5))
                                         .text_color(hsla(theme.foreground))
-                                        .child(gpui::SharedString::from(open_tasks.to_string())),
+                                        .child(gpui::SharedString::from(badge))
+                                        // 実描画矩形（visual-test が「欠けていない」を
+                                        // 実フレームの幾何で読む。#1479 の受け入れ条件 B）
+                                        .child(
+                                            canvas(
+                                                |_, _, _| (),
+                                                move |bounds, _, _, _| {
+                                                    probe.borrow_mut().insert(
+                                                        "panel-tab-badge".to_string(),
+                                                        bounds,
+                                                    );
+                                                },
+                                            )
+                                            .absolute()
+                                            .top_0()
+                                            .left_0()
+                                            .size_full(),
+                                        ),
                                 )
                             })
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -5456,11 +5532,12 @@ impl TakoApp {
                                 cx.notify();
                             })),
                         )
-                        .child(div().flex_grow(1.0))
+                        .child(div().flex_grow(1.0).min_w(px(0.0)))
                         .child(
                             div()
                                 .id("panel-close")
                                 .flex()
+                                .when(!legacy_tabs, |d| d.flex_none())
                                 .items_center()
                                 .px_1()
                                 .cursor_pointer()
@@ -5506,9 +5583,275 @@ impl TakoApp {
     }
 }
 
+// --- 右パネルのタブ列の詰め方（Issue #1479 B）--------------------------------
+//
+// タブ列（fleet / orch / git / tasks + 閉じる）は**パネル幅の中に必ず収める**。
+// 収まらないと最後に積んである tasks のバッジが右端で切れ、**22 が 2 に見える**
+// （#1479 のユーザー原文「通知の個数がみきれてる」）。数字が部分的に見えるのは
+// 「出ない」より悪い: 読み手は残った桁を件数だと信じる。
+//
+// 直し方は 2 段構え。
+//
+// 1. **段（density）で詰める**。幅から `Full`（既定の padding + ラベル）→
+//    `Compact`（padding を詰めてラベルは残す）→ `IconsOnly`（ラベルを落として
+//    アイコン + バッジ）の順に、**収まる最初の段**を選ぶ。判定は
+//    [`panel_tab_density`] の純関数 1 本で、描画と単体テストが同じ 1 実装を読む
+// 2. **構造の belt**。バッジは `flex_none`・ラベルは `min_w(0)` + `text_ellipsis`・
+//    閉じるは `flex_none` にしてあるので、下の定数表が実フォントより狭く見積もって
+//    いても**縮むのはラベル側**で、数字は常に全部出る（元の実装はラベル div に
+//    `min_w(0)` が無く、taffy が縮められないぶんがそのまま右へ溢れていた）
+//
+// 件数の桁で幅が伸び続けないよう、表示は 3 文字で止める（[`panel_tab_badge`]）。
+// **正確な件数はビューのヘッダ（`未完了 N 件`）に出たままなので情報は落ちない**。
+
+/// #1479 B の A/B。`TAKO_1479_LEGACY=1` で**同一バイナリのまま**
+/// 「幅を見ずに既定 padding で並べ、ラベルも縮まない」= 直す前の溢れた形へ戻す
+/// （320px でバッジが右端に切れて `22` が `2` に見える状態が再現する）
+pub(crate) fn legacy_1479() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_1479_LEGACY").map(|v| v == "1") == Ok(true))
+}
+
+/// タブ列に並ぶラベル（**並び順そのもの**。描画も幅の見積りもここを読む）
+pub(crate) const PANEL_TAB_LABELS: [&str; 4] = ["fleet", "orch", "git", "tasks"];
+/// バッジが付くタブの位置（[`PANEL_TAB_LABELS`] の添字）
+pub(crate) const PANEL_TAB_BADGE_ON: usize = 3;
+
+/// タブ列の寸法（実測の定数表。**描画とテストが同じ値を読む**）
+pub(crate) mod panel_tab_metrics {
+    /// タブ列の左右 padding（`px_2` = 8px を両側）
+    pub const ROW_PAD_X: f32 = 8.0;
+    /// 右端の閉じるボタン（`px_1` = 4px 両側 + svg 12px）
+    pub const CLOSE_W: f32 = 20.0;
+    /// タブのアイコン（svg 14px 角）
+    pub const ICON: f32 = 14.0;
+    /// アイコンとラベル / バッジのあいだ（`gap(7.0)`）
+    pub const GAP: f32 = 7.0;
+    /// バッジの左右 padding（`px(4.0)` を両側）
+    pub const BADGE_PAD_X: f32 = 4.0;
+    /// バッジの数字 1 文字（9.5px）の見積り。**上限側へ寄せる**
+    pub const BADGE_CHAR_W: f32 = 6.5;
+    /// ラベル 1 文字（12px）の見積り。タブバー（`tab_bar::CHAR_WIDTH_PX`）と
+    /// **同じ 1 つの数**を読む（字の幅の見積りを 2 か所に持たない）
+    pub const LABEL_CHAR_W: f32 = crate::tab_bar::CHAR_WIDTH_PX;
+}
+
+/// タブ列の詰め方。**収まる最初のものを選ぶ**（[`PanelTabDensity::LADDER`] の順）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PanelTabDensity {
+    /// 既定。ラベルつき・padding 12px
+    Full,
+    /// ラベルつき・padding 6px（320px 前後の既定幅がここに来る）
+    Compact,
+    /// ラベルを落としてアイコン + バッジだけ（ラベルはツールチップで出す）
+    IconsOnly,
+}
+
+impl PanelTabDensity {
+    /// 広い順。[`panel_tab_density`] はこの順に見て**最初に収まる段**を返す
+    pub(crate) const LADDER: [PanelTabDensity; 3] = [Self::Full, Self::Compact, Self::IconsOnly];
+
+    /// 1 タブの左右 padding
+    pub(crate) fn pad_x(self) -> f32 {
+        match self {
+            Self::Full => 12.0,
+            Self::Compact => 6.0,
+            Self::IconsOnly => 8.0,
+        }
+    }
+
+    /// ラベルの文字を出すか（`false` ならツールチップへ回す）
+    pub(crate) fn labels(self) -> bool {
+        !matches!(self, Self::IconsOnly)
+    }
+}
+
+/// バッジに出す文字（`None` なら描かない）。
+///
+/// 3 文字で止めるのは、桁が増えるたびにタブ列が伸びて他のタブを押し出すため。
+/// **正確な件数はヘッダの「未完了 N 件」に出たまま**
+pub(crate) fn panel_tab_badge(open_count: usize) -> Option<String> {
+    match open_count {
+        0 => None,
+        n if n > 99 => Some("99+".to_string()),
+        n => Some(n.to_string()),
+    }
+}
+
+/// バッジ 1 つの幅（前の gap を含む）
+fn panel_tab_badge_width(badge: Option<&str>) -> f32 {
+    use panel_tab_metrics::*;
+    match badge {
+        None => 0.0,
+        Some(text) => GAP + BADGE_PAD_X * 2.0 + BADGE_CHAR_W * text.chars().count() as f32,
+    }
+}
+
+/// タブ列がその段で要する幅（px）。**溢れ判定の正本**
+pub(crate) fn panel_tab_row_width(density: PanelTabDensity, badge: Option<&str>) -> f32 {
+    use panel_tab_metrics::*;
+    let mut sum = CLOSE_W;
+    for (i, label) in PANEL_TAB_LABELS.iter().enumerate() {
+        sum += density.pad_x() * 2.0 + ICON;
+        if density.labels() {
+            sum += GAP + LABEL_CHAR_W * label.chars().count() as f32;
+        }
+        if i == PANEL_TAB_BADGE_ON {
+            sum += panel_tab_badge_width(badge);
+        }
+    }
+    sum
+}
+
+/// タブ列が使える幅（px）
+pub(crate) fn panel_tab_row_available(panel_width: f32) -> f32 {
+    panel_width - panel_tab_metrics::ROW_PAD_X * 2.0
+}
+
+/// 幅と件数から詰め方を決める（純関数）。
+///
+/// **最後の段は必ず返る**（どれも収まらない幅でも `IconsOnly` を返す）。
+/// `PANEL_MIN_WIDTH` 以上では `IconsOnly` が必ず収まることを単体テストが固定する
+pub(crate) fn panel_tab_density(panel_width: f32, badge: Option<&str>) -> PanelTabDensity {
+    let available = panel_tab_row_available(panel_width);
+    PanelTabDensity::LADDER
+        .into_iter()
+        .find(|d| panel_tab_row_width(*d, badge) <= available)
+        .unwrap_or(PanelTabDensity::IconsOnly)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- タブ列のバッジ（#1479 B）------------------------------------------
+
+    /// バッジの文字。0 件は出さず、3 桁を超えたら `99+` で止める
+    /// （**桁が増えるたびにタブ列が伸びない**。正確な件数はヘッダに出たまま）
+    #[test]
+    fn バッジは0件で消え3文字で止まる() {
+        assert_eq!(panel_tab_badge(0), None);
+        assert_eq!(panel_tab_badge(1).as_deref(), Some("1"));
+        assert_eq!(panel_tab_badge(22).as_deref(), Some("22"));
+        assert_eq!(panel_tab_badge(99).as_deref(), Some("99"));
+        assert_eq!(panel_tab_badge(100).as_deref(), Some("99+"));
+        assert_eq!(panel_tab_badge(4000).as_deref(), Some("99+"));
+        // どの件数でも 3 文字以内（幅の見積りが発散しない）
+        for n in [0, 1, 9, 22, 99, 100, 150, 4000, usize::MAX] {
+            let len = panel_tab_badge(n).map(|b| b.chars().count()).unwrap_or(0);
+            assert!(len <= 3, "{n} 件のバッジが {len} 文字");
+        }
+    }
+
+    /// **選んだ段は必ず収まる**（= バッジが欠けない）。
+    ///
+    /// `PANEL_MIN_WIDTH`（220px）から 900px まで 1px 刻み × 代表的な件数で、
+    /// [`panel_tab_density`] が返した段の要求幅が使える幅を超えないことを見る。
+    /// #1479 の受け入れ条件（240 / 320 / 480 / 600 px × 0 / 9 / 22 / 150 件）を
+    /// **全域で**含む
+    #[test]
+    fn 選んだ段はどの幅でも収まる() {
+        for w in 220..=900 {
+            let panel_width = w as f32;
+            for n in [0usize, 1, 9, 22, 99, 150, 4000] {
+                let badge = panel_tab_badge(n);
+                let density = panel_tab_density(panel_width, badge.as_deref());
+                let need = panel_tab_row_width(density, badge.as_deref());
+                let have = panel_tab_row_available(panel_width);
+                assert!(
+                    need <= have,
+                    "幅 {panel_width}px / {n} 件で {density:?} が溢れる（要 {need}px > 使える {have}px）"
+                );
+            }
+        }
+    }
+
+    /// 受け入れ条件の 4 幅 × 4 件数で、**どれもラベルかアイコンのどちらかを出し**、
+    /// バッジは常に全桁ぶんの幅を確保している（段の選び方が退行していないことの記録）
+    #[test]
+    fn 受け入れ条件の幅と件数での段() {
+        let case = |w: f32, n: usize| {
+            let badge = panel_tab_badge(n);
+            panel_tab_density(w, badge.as_deref())
+        };
+        // 240px: ラベルは入らないのでアイコン + バッジへ落ちる
+        assert_eq!(case(240.0, 22), PanelTabDensity::IconsOnly);
+        // 320px（既定幅）: padding を詰めればラベルは残る = ユーザーの画面が壊れない
+        assert_eq!(case(320.0, 0), PanelTabDensity::Compact);
+        assert_eq!(case(320.0, 9), PanelTabDensity::Compact);
+        assert_eq!(case(320.0, 22), PanelTabDensity::Compact);
+        // 3 桁ぶんのバッジは 320px では入らない（**数字を欠かす代わりにラベルを落とす**）
+        assert_eq!(case(320.0, 150), PanelTabDensity::IconsOnly);
+        // 480 / 600px: 既定の padding のまま全部入る
+        for w in [480.0, 600.0] {
+            for n in [0, 9, 22, 150] {
+                assert_eq!(case(w, n), PanelTabDensity::Full, "{w}px / {n} 件");
+            }
+        }
+    }
+
+    /// 幅を広げて段が狭くなることはない（ladder の順が崩れていない）
+    #[test]
+    fn 幅を広げると段は緩む方向にしか動かない() {
+        let rank = |d: PanelTabDensity| {
+            PanelTabDensity::LADDER
+                .iter()
+                .position(|x| *x == d)
+                .expect("ladder に居る")
+        };
+        for n in [0usize, 9, 22, 150] {
+            let badge = panel_tab_badge(n);
+            let mut prev = rank(panel_tab_density(220.0, badge.as_deref()));
+            for w in 221..=900 {
+                let now = rank(panel_tab_density(w as f32, badge.as_deref()));
+                assert!(now <= prev, "幅 {w}px / {n} 件で段が逆行した");
+                prev = now;
+            }
+        }
+    }
+
+    /// 件数が増えて段が緩むことはない（バッジぶんの幅を数えている証拠）
+    #[test]
+    fn 件数が増えると段は詰まる方向にしか動かない() {
+        let rank = |d: PanelTabDensity| {
+            PanelTabDensity::LADDER
+                .iter()
+                .position(|x| *x == d)
+                .expect("ladder に居る")
+        };
+        for w in [220.0f32, 260.0, 320.0, 400.0, 480.0, 600.0] {
+            let mut prev = 0usize;
+            for n in [0usize, 9, 22, 150] {
+                let now = rank(panel_tab_density(w, panel_tab_badge(n).as_deref()));
+                assert!(now >= prev, "幅 {w}px で {n} 件のときに段が緩んだ");
+                prev = now;
+            }
+        }
+    }
+
+    /// バッジぶんの幅が要求に入っている（入っていないと 320px で
+    /// 「ラベルつきなのにバッジが溢れる」へ戻る）
+    #[test]
+    fn バッジは幅の見積りに入っている() {
+        for d in PanelTabDensity::LADDER {
+            let none = panel_tab_row_width(d, None);
+            let two = panel_tab_row_width(d, Some("22"));
+            let three = panel_tab_row_width(d, Some("99+"));
+            assert!(two > none, "{d:?} でバッジぶんが数えられていない");
+            assert!(three > two, "{d:?} で桁数が数えられていない");
+        }
+    }
+
+    /// ラベルを落とす段でもアイコンぶんは数える（アイコンが溢れたら押せない）
+    #[test]
+    fn アイコンだけの段でも最小幅で収まる() {
+        let need = panel_tab_row_width(PanelTabDensity::IconsOnly, Some("99+"));
+        let have = panel_tab_row_available(220.0);
+        assert!(
+            need <= have,
+            "最小幅 220px でアイコン + 3 桁バッジが収まらない（要 {need}px / 使える {have}px）"
+        );
+    }
 
     /// #551 案 1: git タブを開いた直後に見えるのは「変更」と「コミット」であること。
     /// ブランチ / リモートを既定で開いていた頃は、リモート 163 件の展開だけで

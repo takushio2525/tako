@@ -298,8 +298,16 @@ pub(crate) fn project_choices(tasks: &[TaskRow]) -> Vec<String> {
 #[derive(Debug, Default)]
 pub(crate) struct TasksPanel {
     pub snapshot: TasksSnapshot,
-    /// 選択中の id（`None` なら一覧の先頭）
-    pub selected: Option<String>,
+    /// **その場で展開している 1 件**の id（`None` = どれも開いていない。#1479）。
+    ///
+    /// 先頭へ落とさないのが要点。旧実装は「選択が無ければ一覧の先頭」へ落として
+    /// いたので、**畳んだ状態を持てず**（常にどれか 1 件が開いている）、
+    /// 「もう一度押して閉じる」が構造的に作れなかった
+    pub expanded: Option<String>,
+    /// 一覧のスクロール（#1479。展開した行を見える位置へ運ぶ）。
+    /// `scroll_to_item` は**直接の子の添字**で動くので、積む順（= 行の並び）と
+    /// 添字が一致していることが前提になる
+    pub scroll: gpui::ScrollHandle,
     pub kind_filter: Option<String>,
     pub project_filter: Option<String>,
     /// 完了・却下も一覧に出す（`list` の `all` に載る = 絞り込みではなく取得条件）
@@ -341,12 +349,36 @@ impl std::fmt::Debug for ThumbState {
 }
 
 impl TasksPanel {
-    /// 選択中のタスク（選択が消えていたら一覧の先頭へ落ちる）
-    pub(crate) fn selected_task<'a>(&self, visible: &[&'a TaskRow]) -> Option<&'a TaskRow> {
-        self.selected
+    /// 展開中のタスク（**一覧から消えていれば `None`**。#1479）。
+    ///
+    /// ポーリングで一覧が入れ替わっても id で追従するので**開いたままになる**が、
+    /// 絞り込みで外れた・完了して消えたものは畳まれる（無い行の下に詳細だけが
+    /// 残る絵を作らない）
+    pub(crate) fn expanded_task<'a>(&self, visible: &[&'a TaskRow]) -> Option<&'a TaskRow> {
+        self.expanded
             .as_ref()
             .and_then(|id| visible.iter().find(|t| &t.id == id).copied())
-            .or_else(|| visible.first().copied())
+    }
+
+    /// 展開を畳む（#1479。絞り込みを変えた・完了した・もう一度押した）。
+    /// **返答フォームも一緒に初期化する**（開いていない詳細の入力を持ち越さない）
+    pub(crate) fn collapse(&mut self) {
+        self.expanded = None;
+        self.reset_form();
+        self.notice = None;
+    }
+
+    /// 押した行を展開する / 同じ行なら畳む（#1479。**同時に開くのは 1 件**）。
+    /// 戻り値は「これで開いたか」（呼び出し側がスクロールを決めるのに使う）
+    pub(crate) fn toggle(&mut self, id: &str) -> bool {
+        if self.expanded.as_deref() == Some(id) {
+            self.collapse();
+            false
+        } else {
+            self.collapse();
+            self.expanded = Some(id.to_string());
+            true
+        }
     }
 
     /// 返答フォームを初期状態へ（タスクを選び直した / 返し終えた）
@@ -533,8 +565,10 @@ impl TakoApp {
         };
         match tako_control::dispatch(self, request, PaneOrigin::User) {
             Ok(_) => {
-                self.user_tasks.selected = None;
+                // 畳むのは dispatch 側（#1479。CLI / MCP から閉じたときも同じ 1 実装が
+                // 通る）。ここでは返答フォームだけを初期化する
                 self.user_tasks.reset_form();
+                self.user_tasks.notice = None;
                 self.refresh_user_tasks();
             }
             Err(e) => self.notify_ui_dispatch_failed(
@@ -609,7 +643,7 @@ impl TakoApp {
         );
         let Some(copy) = self
             .user_tasks
-            .selected_task(&visible)
+            .expanded_task(&visible)
             .and_then(|t| t.copy_texts.get(index))
             .cloned()
         else {
@@ -776,7 +810,7 @@ impl TakoApp {
         match keystroke.key.as_str() {
             // ⌘Enter で送る（git のコミット欄と同じ割り当て）
             "enter" if keystroke.modifiers.platform => {
-                if let Some(id) = self.selected_user_task_id() {
+                if let Some(id) = self.expanded_user_task_id() {
                     self.user_task_respond(&id, cx);
                 }
                 true
@@ -815,15 +849,16 @@ impl TakoApp {
         }
     }
 
-    /// いま詳細に出ているタスクの id（返答・完了の宛先）
-    pub(crate) fn selected_user_task_id(&self) -> Option<String> {
+    /// いま詳細を開いているタスクの id（返答・完了の宛先）。
+    /// **展開していなければ `None`**（#1479。詳細が出ていないのに返答を送らない）
+    pub(crate) fn expanded_user_task_id(&self) -> Option<String> {
         let visible = visible_tasks(
             &self.user_tasks.snapshot.tasks,
             self.user_tasks.kind_filter.as_deref(),
             self.user_tasks.project_filter.as_deref(),
         );
         self.user_tasks
-            .selected_task(&visible)
+            .expanded_task(&visible)
             .map(|t| t.id.clone())
     }
 
@@ -842,7 +877,7 @@ impl TakoApp {
                 .cloned()
                 .collect();
         let visible_refs: Vec<&TaskRow> = visible.iter().collect();
-        let selected = self.user_tasks.selected_task(&visible_refs).cloned();
+        let expanded = self.user_tasks.expanded_task(&visible_refs).cloned();
         let kinds = kind_choices(&tasks);
         let projects = project_choices(&tasks);
         let open_count = self.user_tasks.snapshot.open_count;
@@ -851,9 +886,13 @@ impl TakoApp {
         let notice = self.user_tasks.notice.clone();
         let loaded = self.user_tasks.loaded;
 
+        let probe_bounds = self.panel_click_probe_bounds.clone();
         let chip = |label: String, id: (&'static str, usize), active: bool| {
+            let probe = probe_bounds.clone();
+            let probe_key = format!("{}-{}", id.0, id.1);
             div()
                 .id(id)
+                .relative()
                 .flex_none()
                 .px(px(7.0))
                 .py(px(2.0))
@@ -877,6 +916,20 @@ impl TakoApp {
                     theme.text_muted
                 }))
                 .child(SharedString::from(label))
+                // セルフテスト（visual-test）が**実マウスで**押すための実矩形。
+                // 絞り込みは押した結果（展開が畳まれる）まで含めて機械検証する（#1479）
+                .child(
+                    gpui::canvas(
+                        |_, _, _| (),
+                        move |bounds, _, _, _| {
+                            probe.borrow_mut().insert(probe_key.clone(), bounds);
+                        },
+                    )
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+                )
         };
 
         let mut root = div()
@@ -933,6 +986,8 @@ impl TakoApp {
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.user_tasks.kind_filter = None;
+                        // 見えている集合が変わるので畳む（#1479）
+                        this.user_tasks.collapse();
                         cx.notify();
                     })),
                 );
@@ -946,6 +1001,7 @@ impl TakoApp {
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.user_tasks.kind_filter = Some(k.clone());
+                        this.user_tasks.collapse();
                         cx.notify();
                     })),
                 );
@@ -971,6 +1027,7 @@ impl TakoApp {
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.user_tasks.project_filter = None;
+                        this.user_tasks.collapse();
                         cx.notify();
                     })),
                 );
@@ -984,6 +1041,7 @@ impl TakoApp {
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.user_tasks.project_filter = Some(p.clone());
+                        this.user_tasks.collapse();
                         cx.notify();
                     })),
                 );
@@ -1007,6 +1065,7 @@ impl TakoApp {
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.user_tasks.show_done = !this.user_tasks.show_done;
+                        this.user_tasks.collapse();
                         this.refresh_user_tasks();
                         cx.notify();
                     })),
@@ -1047,6 +1106,9 @@ impl TakoApp {
             .flex()
             .flex_col()
             .overflow_y_scroll()
+            // #1479: 展開した行を見える位置へ運ぶための取っ手。
+            // 付けないと `scroll_to_item` が黙って空振りする
+            .track_scroll(&self.user_tasks.scroll)
             .px(px(8.0))
             .pb(px(8.0));
 
@@ -1066,85 +1128,142 @@ impl TakoApp {
             );
         }
 
+        // --- 行とその直下の詳細（#1479 のアコーディオン）---
+        //
+        // **詳細は「押した行の子」として積む**。旧実装は一覧を全部描き切ってから
+        // 末尾に 1 枚だけ詳細を置いていたので、22 件あると押した行から詳細まで
+        // パネル 1 枚ぶん以上離れ、ユーザーには「押しても何も起きない」に見えていた
+        // （#1479 のユーザー原文）。開くのは 1 件だけなので `render_task_detail` は
+        // 1 回しか呼ばれず、`id("tasks-detail")` も重複しない
         for (i, task) in visible.iter().enumerate() {
-            let is_selected = selected.as_ref().is_some_and(|s| s.id == task.id);
+            let is_expanded = expanded.as_ref().is_some_and(|t| t.id == task.id);
             let id = task.id.clone();
             let done = task.status != "open";
-            scroll = scroll.child(
-                div()
-                    .id(("tasks-row", i))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(6.0))
-                    .flex_none()
-                    .px(px(6.0))
-                    .py(px(5.0))
-                    .mb(px(2.0))
-                    .rounded(px(6.0))
-                    .cursor_pointer()
-                    .bg(rgba(if is_selected {
-                        theme.surface_2
-                    } else {
-                        theme.surface_0
-                    }))
-                    .hover(|d| d.bg(rgba(theme.surface_hover)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if this.user_tasks.selected.as_deref() != Some(id.as_str()) {
-                            this.user_tasks.selected = Some(id.clone());
-                            this.user_tasks.reset_form();
-                            this.user_tasks.notice = None;
-                        }
-                        cx.notify();
-                    }))
-                    // 状態の丸（図形。絵文字は使わない）
-                    .child(
+            let probe = self.panel_click_probe_bounds.clone();
+            let probe_key = format!("tasks-row-{i}");
+            let header = div()
+                .id(("tasks-row", i))
+                .relative()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .flex_none()
+                .px(px(6.0))
+                .py(px(5.0))
+                .rounded(px(6.0))
+                .cursor_pointer()
+                .bg(rgba(if is_expanded {
+                    theme.surface_2
+                } else {
+                    theme.surface_0
+                }))
+                .hover(|d| d.bg(rgba(theme.surface_hover)))
+                // #496 / #503: ルート div の一括 dismiss より先に自分を確定させる。
+                // **トグルは特にここが要る**（押下で畳まれた直後に `on_click` が
+                // 開き直すと、開いた状態から閉じられなくなる）
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if this.user_tasks.toggle(&id) {
+                        // 開いた行が画面外なら見える位置へ運ぶ（背の高い詳細は
+                        // 行の上端がビューポートの上端へ来る = 押した行が残る）
+                        this.user_tasks.scroll.scroll_to_item(i);
+                    }
+                    cx.notify();
+                }))
+                // 開閉の矢印（svg。**絵文字は使わない** = FR-2.40.14）
+                .child(
+                    gpui::svg()
+                        .path(if is_expanded {
+                            crate::file_icons::ui_icon::CHEVRON_DOWN
+                        } else {
+                            crate::file_icons::ui_icon::CHEVRON_RIGHT
+                        })
+                        .flex_none()
+                        .w(px(10.0))
+                        .h(px(10.0))
+                        .text_color(hsla(if is_expanded {
+                            theme.foreground
+                        } else {
+                            theme.text_faint
+                        })),
+                )
+                // 状態の丸（図形。絵文字は使わない）
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(6.0))
+                        .h(px(6.0))
+                        .rounded_full()
+                        .bg(rgba(kind_color(&theme, &task.kind, done))),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(9.5))
+                        .text_color(hsla(theme.text_faint))
+                        .child(SharedString::from(task.id.clone())),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        // 畳んでいるあいだは 1 行に収め、**展開したら折り返して全文**を出す
+                        // （詳細はタイトルを繰り返さないので、ここが唯一の出し場になる）
+                        .when(!is_expanded, |d| d.whitespace_nowrap().text_ellipsis())
+                        .text_size(px(11.5))
+                        .text_color(hsla(if done {
+                            theme.text_muted
+                        } else {
+                            theme.foreground
+                        }))
+                        .child(SharedString::from(task.title.clone())),
+                )
+                .when(task.delivery.is_some(), |d| {
+                    let state = task
+                        .delivery
+                        .as_ref()
+                        .map(|x| x.state.clone())
+                        .unwrap_or_default();
+                    d.child(
                         div()
                             .flex_none()
                             .w(px(6.0))
                             .h(px(6.0))
                             .rounded_full()
-                            .bg(rgba(kind_color(&theme, &task.kind, done))),
+                            .bg(rgba(delivery_color(&theme, &state))),
                     )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(9.5))
-                            .text_color(hsla(theme.text_faint))
-                            .child(SharedString::from(task.id.clone())),
+                })
+                // セルフテスト（visual-test）が**実マウスで**押すための実矩形
+                .child(
+                    gpui::canvas(
+                        |_, _, _| (),
+                        move |bounds, _, _, _| {
+                            probe.borrow_mut().insert(probe_key.clone(), bounds);
+                        },
                     )
-                    .child(
-                        div()
-                            .flex_1()
-                            .overflow_hidden()
-                            .text_size(px(11.5))
-                            .text_color(hsla(if done {
-                                theme.text_muted
-                            } else {
-                                theme.foreground
-                            }))
-                            .child(SharedString::from(task.title.clone())),
-                    )
-                    .when(task.delivery.is_some(), |d| {
-                        let state = task
-                            .delivery
-                            .as_ref()
-                            .map(|x| x.state.clone())
-                            .unwrap_or_default();
-                        d.child(
-                            div()
-                                .flex_none()
-                                .w(px(6.0))
-                                .h(px(6.0))
-                                .rounded_full()
-                                .bg(rgba(delivery_color(&theme, &state))),
-                        )
-                    }),
-            );
-        }
-
-        if let Some(task) = selected {
-            scroll = scroll.child(self.render_task_detail(&task, cx));
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+                );
+            // 行 1 つぶんの器（`scroll_to_item` は**直接の子**の添字で動くので、
+            // 行と詳細を 1 つの器へ入れて添字と行番号を一致させる）
+            let mut item = div()
+                .id(("tasks-item", i))
+                .flex()
+                .flex_col()
+                .flex_none()
+                .mb(px(2.0))
+                .child(header);
+            if is_expanded {
+                item = item.child(self.render_task_detail(task, cx));
+            }
+            scroll = scroll.child(item);
         }
 
         root.child(scroll)
@@ -1205,14 +1324,37 @@ impl TakoApp {
             .flex_none()
             .flex()
             .flex_col()
+            .relative()
             .mt(px(6.0))
             .p(px(8.0))
             .rounded(px(8.0))
             .border_1()
             .border_color(hsla(theme.border_strong))
             .bg(rgba(theme.surface_1));
+        // セルフテスト（visual-test）が**押した行との上下関係**を実フレームの幾何で
+        // 読むための矩形（#1479。「その場で展開している」の機械検証）
+        detail = detail.child({
+            let probe = self.panel_click_probe_bounds.clone();
+            gpui::canvas(
+                |_, _, _| (),
+                move |bounds, _, _, _| {
+                    probe
+                        .borrow_mut()
+                        .insert("tasks-detail".to_string(), bounds);
+                },
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+        });
 
-        // --- 見出し（種類・id・期限） ---
+        // --- 見出し（種類・期限）---
+        //
+        // #1479: id とタイトルは**押した行に出ている**ので繰り返さない
+        // （アコーディオンでは行がそのまま見出しになる。行はこのとき
+        // 折り返して全文を出す = 長いタイトルも欠けない）。
+        // 種類は行では色の丸だけなので、**言葉はここに残す**
         detail = detail.child(
             div()
                 .flex()
@@ -1232,13 +1374,6 @@ impl TakoApp {
                             &task.kind,
                         ))),
                 )
-                .child(
-                    div()
-                        .flex_none()
-                        .text_size(px(9.5))
-                        .text_color(hsla(theme.text_faint))
-                        .child(SharedString::from(task.id.clone())),
-                )
                 .when_some(task.due.clone(), |d, due| {
                     d.child(
                         div()
@@ -1248,14 +1383,6 @@ impl TakoApp {
                             .child(SharedString::from(crate::ui_text::panel::tasks_due(&due))),
                     )
                 }),
-        );
-        detail = detail.child(
-            div()
-                .flex_none()
-                .pt(px(3.0))
-                .text_size(px(12.5))
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(SharedString::from(task.title.clone())),
         );
 
         // --- 本文（markdown。プレビュー / アップデート画面と同じ 1 実装で描く） ---
@@ -2015,9 +2142,25 @@ mod tests {
         assert_eq!(project_choices(&tasks), ["alpha", "zeta"]);
     }
 
-    /// 選択が消えた（完了して一覧から落ちた）ら先頭へ落ちる
+    // --- アコーディオン（#1479 A）----------------------------------------
+
+    /// **既定は全部畳んである**（#1479）。旧実装は「選択が無ければ一覧の先頭」へ
+    /// 落としていたので、畳んだ状態を表せず「もう一度押して閉じる」が作れなかった
     #[test]
-    fn 選択が消えたら先頭へ落ちる() {
+    fn 既定では何も展開していない() {
+        let tasks = parse_list(&json!({ "tasks": [
+            task_json("u-1", "review", 3),
+            task_json("u-2", "review", 2),
+        ]}))
+        .tasks;
+        let visible: Vec<&TaskRow> = tasks.iter().collect();
+        let panel = TasksPanel::default();
+        assert_eq!(panel.expanded_task(&visible).map(|t| t.id.as_str()), None);
+    }
+
+    /// 押す → 開く / 同じ行を押す → 閉じる / 別の行を押す → そちらだけ開く
+    #[test]
+    fn 押下で開き再押下で閉じ別項目は乗り換える() {
         let tasks = parse_list(&json!({ "tasks": [
             task_json("u-1", "review", 3),
             task_json("u-2", "review", 2),
@@ -2025,21 +2168,81 @@ mod tests {
         .tasks;
         let visible: Vec<&TaskRow> = tasks.iter().collect();
         let mut panel = TasksPanel::default();
+
+        assert!(panel.toggle("u-1"), "押したら開く");
         assert_eq!(
-            panel.selected_task(&visible).map(|t| t.id.as_str()),
+            panel.expanded_task(&visible).map(|t| t.id.as_str()),
             Some("u-1")
         );
-        panel.selected = Some("u-2".into());
+        assert!(!panel.toggle("u-1"), "同じ行を押したら閉じる");
+        assert_eq!(panel.expanded_task(&visible).map(|t| t.id.as_str()), None);
+
+        assert!(panel.toggle("u-1"));
+        assert!(panel.toggle("u-2"), "別の行を押したら乗り換える");
+        // **同時に開くのは 1 件**
         assert_eq!(
-            panel.selected_task(&visible).map(|t| t.id.as_str()),
+            panel.expanded_task(&visible).map(|t| t.id.as_str()),
             Some("u-2")
         );
-        panel.selected = Some("u-99".into());
+    }
+
+    /// 乗り換え・畳みで返答フォームを持ち越さない（前の判断で誤爆させない）
+    #[test]
+    fn 乗り換えると返答フォームは初期化される() {
+        let mut panel = TasksPanel::default();
+        panel.toggle("u-1");
+        panel.decision = Some("approve".into());
+        panel
+            .comment
+            .insert("途中まで書いた", COMMENT_MAX_BYTES, true);
+        panel.notice = Some("コピーしました".into());
+
+        panel.toggle("u-2");
+        assert_eq!(panel.decision, None);
+        assert!(panel.comment.text().is_empty());
+        assert_eq!(panel.notice, None);
+    }
+
+    /// **ポーリングで一覧が入れ替わっても閉じない**（id で追従する）。
+    /// 逆に、絞り込みで外れた / 完了して消えた行は畳まれる
+    #[test]
+    fn 展開はidで追従し消えた行では畳まれる() {
+        let mut panel = TasksPanel::default();
+        panel.toggle("u-2");
+
+        // 2 秒ポーリングの 1 回ぶん（並びが変わり、内容も更新された）
+        let refreshed = parse_list(&json!({ "tasks": [
+            task_json("u-2", "review", 9),
+            task_json("u-1", "review", 3),
+            task_json("u-3", "post", 1),
+        ]}))
+        .tasks;
+        let visible: Vec<&TaskRow> = refreshed.iter().collect();
         assert_eq!(
-            panel.selected_task(&visible).map(|t| t.id.as_str()),
-            Some("u-1")
+            panel.expanded_task(&visible).map(|t| t.id.as_str()),
+            Some("u-2"),
+            "ポーリング更新で展開が閉じてはいけない"
         );
-        assert_eq!(panel.selected_task(&[]).map(|t| t.id.as_str()), None);
+
+        // 完了して一覧から落ちた（= 行が無い）。詳細だけが残る絵を作らない
+        let gone = parse_list(&json!({ "tasks": [task_json("u-1", "review", 3)]})).tasks;
+        let visible: Vec<&TaskRow> = gone.iter().collect();
+        assert_eq!(panel.expanded_task(&visible).map(|t| t.id.as_str()), None);
+
+        // 絞り込みで外れたときも同じ（種類が違う行だけを見せている）
+        let filtered = visible_tasks(&refreshed, Some("post"), None);
+        assert_eq!(panel.expanded_task(&filtered).map(|t| t.id.as_str()), None);
+    }
+
+    /// 畳む操作は**展開とフォームの両方**を落とす（`collapse` の 1 実装）
+    #[test]
+    fn 畳むと展開もフォームも落ちる() {
+        let mut panel = TasksPanel::default();
+        panel.toggle("u-5");
+        panel.decision = Some("reject".into());
+        panel.collapse();
+        assert_eq!(panel.expanded, None);
+        assert_eq!(panel.decision, None);
     }
 
     /// 配送の色は **`sent` を緑にしない**（「届いた」と騙らない物差しを色でも守る）

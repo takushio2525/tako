@@ -1311,7 +1311,13 @@ tako todo respond u-1 --decision approve
 
 tako todo done u-1                   # 片付いた
 tako todo dismiss u-1                # やらない
+
+# 画面を動かす（AI が「これを見てください」と言うとき）
+tako todo expand u-1                 # 右パネルの tasks ビューでその 1 件を開く
+tako todo collapse                   # 開いているものを閉じる
 ```
+
+`expand` は右パネルが閉じていれば開いて tasks ビューへ切り替え、その行の中身をその場に展開します（開くのは常に 1 件）。無い id を渡すとエラーになり、画面は動きません。いまどれが開いているかは `tako todo list --json` の `expanded`（画面が無ければ `null`）で読めます。
 
 | 判断 | 意味 | タスクの状態 |
 |---|---|---|

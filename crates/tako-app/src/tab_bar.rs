@@ -67,7 +67,10 @@ const TRAFFIC_LIGHTS_SPACER: f32 = 0.0;
 /// 実測: dot(7) + gap(8) + pl(10) + label + pr(11) + gap(3)。
 /// ラベル 1 文字あたり約 7px（12.5px フォントの平均グリフ幅）
 const TAB_CHROME_PX: f32 = 42.0;
-const CHAR_WIDTH_PX: f32 = 7.0;
+/// **字の幅の見積りはこの 1 つだけ**（#1479 で右パネルのタブ列も同じ数を読む）。
+/// 2 か所に持つと、片方だけ直したときに「片方の画面では収まるのに、もう片方では
+/// 数字が切れる」が生える
+pub(crate) const CHAR_WIDTH_PX: f32 = 7.0;
 /// タブラベルの最大文字数（通常時）
 const LABEL_MAX_CHARS: usize = 24;
 /// タブラベルの最小文字数（縮小限界）

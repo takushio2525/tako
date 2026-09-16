@@ -3591,10 +3591,13 @@ pub fn tools() -> Vec<Value> {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["add", "list", "show", "update", "done", "dismiss", "respond"],
-                        "description": "操作種別（省略時 list）",
+                        "enum": ["add", "list", "show", "update", "done", "dismiss", "respond", "expand", "collapse"],
+                        "description": "操作種別（省略時 list）。\
+                            expand / collapse は**画面の操作**（#1479）: expand はその 1 件を \
+                            PC の右パネル tasks ビューでその場に展開し（パネルが閉じていれば開く）、\
+                            collapse は畳む。ユーザーに「これを見てほしい」と言うときに使う",
                     },
-                    "id": { "type": "string", "description": "対象のタスク id（u-N。show / update / done / dismiss / respond で必須）" },
+                    "id": { "type": "string", "description": "対象のタスク id（u-N。show / update / done / dismiss / respond / expand で必須）" },
                     "title": { "type": "string", "description": "一覧に出る 1 行（add で必須）" },
                     "body": { "type": "string", "description": "本文（markdown）。手順・確認してほしい点を書く" },
                     "kind": {

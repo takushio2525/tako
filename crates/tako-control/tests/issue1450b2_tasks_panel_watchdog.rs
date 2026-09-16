@@ -278,7 +278,12 @@ fn scan_view_vocabulary(sources: &Sources) -> Vec<Offender> {
     if !right.contains("this.panel_view = PanelView::Tasks") {
         out.push(Offender {
             file: RIGHT_PANEL,
-            line: code_line_with(&right, "\"tasks\",").map_or(0, |i| i + 1),
+            // 行番号の足がかりは**必ず在るもの**にする（タブのラベルは
+            // #1479 で `PANEL_TAB_LABELS` の添字引きへ移ったので、綴りの
+            // リテラルを足がかりにすると名指しが 0 行へ落ちる）
+            line: code_line_with(&right, "PanelView::Tasks")
+                .or_else(|| code_line_with(&right, "fn render_panel("))
+                .map_or(0, |i| i + 1),
             why: "tasks タブが `PanelView::Tasks` を代入していない（GUI と CLI で\
                   切替の実装が割れている。#1450 B2）"
                 .into(),

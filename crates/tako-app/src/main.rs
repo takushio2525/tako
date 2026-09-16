@@ -20879,6 +20879,38 @@ impl UiStateHost for TakoApp {
         (self.panel_visible, self.panel_width, view)
     }
 
+    /// #1479: tasks ビューで展開中のタスク id（`tako todo list` の応答に載る）
+    fn user_task_expanded(&self) -> Option<String> {
+        self.user_tasks.expanded.clone()
+    }
+
+    /// #1479: 展開 / 折りたたみ。**GUI のクリックと同じ 1 実装**（`toggle` / `collapse`）を
+    /// 通すので、AI から開いた状態と手で開いた状態が食い違わない
+    fn set_user_task_expanded(&mut self, id: Option<String>) {
+        match id {
+            Some(id) => {
+                if self.user_tasks.expanded.as_deref() != Some(id.as_str()) {
+                    self.user_tasks.toggle(&id);
+                }
+                // 右パネルを畳んでいたあいだはポーリングが空振りしているので一覧が古い。
+                // **その 1 件が並びに居ないときだけ**引き直す（居るなら 2 秒ループに任せる）
+                if !self.user_tasks.snapshot.tasks.iter().any(|t| t.id == id) {
+                    self.refresh_user_tasks();
+                }
+                // 開いた行を見える位置へ（一覧の並びは画面と同じ 1 実装で解く）
+                let visible = crate::tasks_panel::visible_tasks(
+                    &self.user_tasks.snapshot.tasks,
+                    self.user_tasks.kind_filter.as_deref(),
+                    self.user_tasks.project_filter.as_deref(),
+                );
+                if let Some(index) = visible.iter().position(|t| t.id == id) {
+                    self.user_tasks.scroll.scroll_to_item(index);
+                }
+            }
+            None => self.user_tasks.collapse(),
+        }
+    }
+
     fn set_panel(
         &mut self,
         visible: Option<bool>,
@@ -36966,6 +36998,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1479: 項目押下でその場に展開されるか + バッジが欠けないか
+                "tasks-accordion" => {
+                    tasks_accordion_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1472: 添付の行を**実マウスで**押すとプレビューが開くか
                 "task-attachment" => {
                     task_attachment_visual(any, window, cx).await;
@@ -36978,7 +37016,8 @@ mod self_test {
                          profiles / chat-table / conflict-card / terminal-grid / \
                          grid-bench / preview-leak / chat-leak / preview-code / \
                          remote-tree / flicker / ime-preedit / screen-lines / \
-                         pane-border / tasks-panel / task-attachment）"
+                         pane-border / tasks-panel / task-attachment / \
+                         tasks-accordion）"
                     );
                     std::process::exit(1);
                 }
@@ -37017,6 +37056,10 @@ mod self_test {
             // #1472: 添付の行を**実マウスで**押すとプレビューが開くか
             // （ハンドラ直呼びでは「押した瞬間に消えて発火しない」型を検出できない）
             task_attachment_visual(any, window, cx).await;
+
+            // #1479: 一覧の項目を押すとその場に展開されるか（押した行と詳細の上下関係を
+            // 実矩形で読む）+ tasks のバッジがパネル幅で欠けないか
+            tasks_accordion_visual(any, window, cx).await;
 
             // #589: ファイルツリーのインデントガイド線が連続しているか。
             // 4 階層のフィクスチャを開き、ダーク / ライト / スクロール後の 3 状態で
@@ -39451,7 +39494,7 @@ mod self_test {
                 );
                 let _ = add("PR #1459 のレビュー", "review", "", false);
                 app.tick_user_tasks();
-                app.user_tasks.selected = id.clone();
+                app.user_tasks.expanded = id.clone();
                 cx.notify();
                 id
             })
@@ -39521,13 +39564,509 @@ mod self_test {
             }
             app.panel_visible = false;
             app.panel_view = PanelView::Fleet;
-            app.user_tasks.selected = None;
+            app.user_tasks.expanded = None;
             app.user_tasks.reset_form();
             app.tick_user_tasks();
             cx.notify();
         });
         let _ = std::fs::remove_file(&live1450);
         println!("TAKO_VISUAL_1450B2: distinct={distinct1450}");
+    }
+
+    /// 一覧の項目を**実マウスで**押すとその場に展開されるか（#1479 A）+
+    /// タブのバッジがパネル幅で欠けないか（#1479 B）。
+    ///
+    /// #1450 B2 は一覧を全部描き切ってから**末尾に 1 枚だけ**詳細を積んでいた
+    /// （さらに「選択が無ければ先頭」へ落ちるので畳めなかった）。22 件あると
+    /// 押した行から詳細までパネル 1 枚ぶん以上離れ、ユーザーには「押しても何も
+    /// 起きない」に見えていた。**押した行と詳細の上下関係**は状態を読むだけでは
+    /// 分からないので、実フレームの矩形（`panel_click_probe_bounds`）で読む。
+    ///
+    /// B のバッジは「欠けていない」を**幾何で**読む: タブ列の矩形の内側に
+    /// バッジの矩形が丸ごと収まっているか。指紋（ハッシュ）では「切れている絵」と
+    /// 「切れていない絵」を区別できない。
+    ///
+    /// 単独実行は `TAKO_VISUAL_ONLY=tasks-accordion`
+    #[cfg(feature = "visual-test")]
+    async fn tasks_accordion_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        use tako_control::protocol::{PanelViewWire, Request};
+        let wait =
+            |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+        let dump = std::env::var("TAKO_VISUAL_DUMP_DIR").ok();
+        let shot = |cx: &mut AsyncApp, name: &str| -> Option<u64> {
+            let (frame, _scale) = capture_frame(any, cx)?;
+            if let Some(dir) = dump.as_ref() {
+                let _ = std::fs::create_dir_all(dir);
+                let _ = frame.save(std::path::Path::new(dir).join(format!("accordion-{name}.png")));
+            }
+            Some(frame_fingerprint(&frame))
+        };
+
+        let panel = |cx: &mut AsyncApp, width: f32| {
+            let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    Request::Panel {
+                        visible: Some(true),
+                        width: Some(width),
+                        view: Some(PanelViewWire::Tasks),
+                        filetree: None,
+                        sidebar_width: None,
+                        show_hidden: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+                app.tick_user_tasks();
+                cx.notify();
+            });
+        };
+        let todo = |cx: &mut AsyncApp,
+                    action: &str,
+                    id: Option<String>,
+                    title: Option<String>,
+                    kind: Option<String>,
+                    body: Option<String>|
+         -> Option<String> {
+            window
+                .update(cx, |app: &mut TakoApp, _, cx| {
+                    let out = tako_control::dispatch(
+                        app,
+                        Request::UserTask {
+                            action: action.to_string(),
+                            id,
+                            title,
+                            body,
+                            kind,
+                            status: None,
+                            all: None,
+                            project: Some("tako".to_string()),
+                            attachments: None,
+                            copy_texts: None,
+                            links: None,
+                            due: None,
+                            decision: None,
+                            comment: None,
+                            via: None,
+                            pane: None,
+                            caller_role: Some("orchestrator-master:visual1479".to_string()),
+                        },
+                        PaneOrigin::Cli,
+                    )
+                    .ok()
+                    .and_then(|v| v["id"].as_str().map(str::to_string));
+                    app.tick_user_tasks();
+                    cx.notify();
+                    out
+                })
+                .ok()
+                .flatten()
+        };
+        // 矩形を読む前に**probe を空にしてから 1 フレーム描く**（前のフレームの
+        // 残りを読むと「消えたはずのものが在る」に見える）
+        let redraw = |cx: &mut AsyncApp| {
+            let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                app.panel_click_probe_bounds.borrow_mut().clear();
+                cx.notify();
+            });
+            notify_and_draw(any, window, cx);
+        };
+        let probe = |cx: &mut AsyncApp, key: &str| -> Option<Bounds<Pixels>> {
+            window
+                .update(cx, |app: &mut TakoApp, _, _| {
+                    app.panel_click_probe_bounds.borrow().get(key).copied()
+                })
+                .ok()
+                .flatten()
+        };
+        let expanded = |cx: &mut AsyncApp| -> Option<String> {
+            window
+                .update(cx, |app: &mut TakoApp, _, _| {
+                    app.user_tasks.expanded.clone()
+                })
+                .ok()
+                .flatten()
+        };
+        // 一覧の i 番目の行を**実マウスで**押す。
+        //
+        // 押す点は「行の矩形 ∩ スクロールの見える範囲」の中心にする。展開すると
+        // `scroll_to_item` がその項目を収めるために content をずらすので、行の矩形の
+        // 中心が**上端の外**へ出ていることがある（そこは content mask で切られていて、
+        // 実マウスでも当たらない）。ここを素の `row.center()` で押すと「押したのに
+        // 何も起きない」= 検証が製品の欠陥ではなく検証の座標ミスで落ちる
+        let click_row = |cx: &mut AsyncApp, i: usize| -> bool {
+            let key = format!("tasks-row-{i}");
+            let Some(row) = probe(cx, &key) else {
+                println!("TAKO_VISUAL_1479: {key} の矩形が採れない");
+                return false;
+            };
+            let Ok(view) =
+                window.update(cx, |app: &mut TakoApp, _, _| app.user_tasks.scroll.bounds())
+            else {
+                return false;
+            };
+            let top = row.top().max(view.top());
+            let bottom = row.bottom().min(view.bottom());
+            if bottom - top < px(3.0) {
+                println!(
+                    "TAKO_VISUAL_1479: {key} が見えていない row={:?}..{:?} view={:?}..{:?}",
+                    row.top(),
+                    row.bottom(),
+                    view.top(),
+                    view.bottom()
+                );
+                return false;
+            }
+            click_at(any, cx, gpui::point(row.center().x, (top + bottom) / 2.0));
+            true
+        };
+        // 詳細が **i 番目の行の直下**（次の行より上）に出ているか（実フレームの幾何）
+        let detail_after_row = |cx: &mut AsyncApp, i: usize| -> bool {
+            let row = probe(cx, &format!("tasks-row-{i}"));
+            let detail = probe(cx, "tasks-detail");
+            let next = probe(cx, &format!("tasks-row-{}", i + 1));
+            match (row, detail) {
+                (Some(row), Some(detail)) => {
+                    let under = row.bottom() <= detail.top() + px(1.0);
+                    // 次の行が在るなら、その**上**に収まっていること（= 末尾ではない）
+                    let above_next =
+                        next.is_none_or(|next| detail.bottom() <= next.top() + px(1.0));
+                    if !(under && above_next) {
+                        println!(
+                            "TAKO_VISUAL_1479: row{i}_bottom={:?} detail={:?}..{:?} next_top={:?}",
+                            row.bottom(),
+                            detail.top(),
+                            detail.bottom(),
+                            next.map(|n| n.top())
+                        );
+                    }
+                    under && above_next
+                }
+                (row, detail) => {
+                    println!(
+                        "TAKO_VISUAL_1479: 矩形が採れない row={} detail={}",
+                        row.is_some(),
+                        detail.is_some()
+                    );
+                    false
+                }
+            }
+        };
+
+        // --- 素材（3 件。種類を分けて絞り込みのチップを出す）---
+        panel(cx, 320.0);
+        let long_body = (1..=200)
+            .map(|i| format!("- 確認する項目 {i}\n"))
+            .collect::<String>();
+        let id_a = todo(
+            cx,
+            "add",
+            None,
+            Some("解説動画 v6 を投稿".to_string()),
+            Some("post".to_string()),
+            // 長い本文（md 200 行）: 展開してもレイアウトが壊れない
+            Some(format!("# 確認してほしいこと\n\n{long_body}")),
+        );
+        let id_b = todo(
+            cx,
+            "add",
+            None,
+            Some("PR のレビュー".to_string()),
+            Some("review".to_string()),
+            Some("差分を見てほしい".to_string()),
+        );
+        let id_c = todo(
+            cx,
+            "add",
+            None,
+            Some("権限の確認".to_string()),
+            Some("permission".to_string()),
+            None,
+        );
+        let (Some(id_a), Some(id_b), Some(id_c)) = (id_a, id_b, id_c) else {
+            check(false, "152: 検証用のタスクを起票できない (#1479)");
+            return;
+        };
+        // 並びは `updated_at` 降順 = 起票の新しい順（c, b, a）
+        let order = [id_c.clone(), id_b.clone(), id_a.clone()];
+
+        redraw(cx);
+        wait(cx, 150).await;
+        let folded = shot(cx, "folded");
+
+        // 1. 既定では**どれも開いていない**（旧実装は先頭が常に開いていた）
+        check(
+            expanded(cx).is_none() && probe(cx, "tasks-detail").is_none(),
+            &format!(
+                "152: 既定では詳細が畳まれている (#1479。expanded={:?})",
+                expanded(cx)
+            ),
+        );
+
+        // 2. 2 番目の行を実マウスで押す -> **その行の直下**に詳細が出る
+        if !click_row(cx, 1) {
+            check(false, "152: 一覧の行を押せない (#1479)");
+            return;
+        }
+        redraw(cx);
+        wait(cx, 150).await;
+        let opened = shot(cx, "expanded");
+        check(
+            expanded(cx).as_deref() == Some(order[1].as_str()),
+            &format!(
+                "152: 押した行が展開される (#1479。expanded={:?} / 期待 {})",
+                expanded(cx),
+                order[1]
+            ),
+        );
+        check(
+            detail_after_row(cx, 1),
+            "152: 詳細が**押した行の直下**（次の行の上）に出る (#1479。末尾ではない)",
+        );
+
+        // 3. 同じ行をもう一度押す -> 畳まれる
+        click_row(cx, 1);
+        redraw(cx);
+        wait(cx, 150).await;
+        check(
+            expanded(cx).is_none() && probe(cx, "tasks-detail").is_none(),
+            &format!(
+                "152: 同じ行の再押下で畳まれる (#1479。expanded={:?})",
+                expanded(cx)
+            ),
+        );
+
+        // 4. 別の行を押す -> そちらだけが開く（同時に開くのは 1 件）
+        click_row(cx, 1);
+        redraw(cx);
+        wait(cx, 100).await;
+        click_row(cx, 0);
+        redraw(cx);
+        wait(cx, 150).await;
+        let switched = expanded(cx);
+        let one_only = detail_after_row(cx, 0);
+        check(
+            switched.as_deref() == Some(order[0].as_str()) && one_only,
+            &format!(
+                "152: 別の行を押すと乗り換える（開くのは 1 件だけ）(#1479。\
+                 expanded={switched:?} inline={one_only}）"
+            ),
+        );
+
+        // 5. **ポーリングで一覧が更新されても閉じない**（id で追従する）。
+        //    内容が実際に変わる更新（title）を挟んでから tick を何周か回す
+        let _ = todo(
+            cx,
+            "update",
+            Some(order[1].clone()),
+            Some("PR のレビュー（更新後）".to_string()),
+            None,
+            None,
+        );
+        for _ in 0..3 {
+            let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                app.tick_user_tasks();
+                cx.notify();
+            });
+            wait(cx, 60).await;
+        }
+        redraw(cx);
+        wait(cx, 120).await;
+        check(
+            expanded(cx).as_deref() == Some(order[0].as_str())
+                && probe(cx, "tasks-detail").is_some(),
+            &format!(
+                "152: ポーリング更新で展開が閉じない (#1479。expanded={:?})",
+                expanded(cx)
+            ),
+        );
+
+        // 6. 絞り込みを変えたら畳む（**実マウスで**チップを押す）
+        match probe(cx, "tasks-kind-chip-0") {
+            None => check(false, "152: 種類の絞り込みチップが描かれない (#1479)"),
+            Some(rect) => {
+                click_at(any, cx, rect.center());
+                redraw(cx);
+                wait(cx, 150).await;
+                let filtered = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.user_tasks.kind_filter.clone()
+                    })
+                    .ok()
+                    .flatten();
+                check(
+                    filtered.is_some() && expanded(cx).is_none(),
+                    &format!(
+                        "152: 絞り込みを変えると畳まれる (#1479。kind={filtered:?} expanded={:?})",
+                        expanded(cx)
+                    ),
+                );
+                // 絞り込みを戻す（次の検査へ持ち越さない）
+                let all_key = format!("tasks-kind-chip-{}", usize::MAX);
+                if let Some(all) = probe(cx, &all_key) {
+                    click_at(any, cx, all.center());
+                    redraw(cx);
+                    wait(cx, 100).await;
+                }
+            }
+        }
+
+        // 7. 長い本文（md 200 行）の項目も展開できる。**押した行は見えたまま**
+        //    （背の高い詳細は行の上端がビューポートの上端へ来る = 行が消えない）
+        if click_row(cx, 2) {
+            redraw(cx);
+            wait(cx, 200).await;
+            let long_visible = window
+                .update(cx, |app: &mut TakoApp, _, _| app.user_tasks.scroll.bounds())
+                .ok()
+                .zip(probe(cx, "tasks-row-2"))
+                .map(|(view, row)| {
+                    let seen = row.bottom().min(view.bottom()) - row.top().max(view.top());
+                    if seen < px(8.0) {
+                        println!(
+                            "TAKO_VISUAL_1479: 展開した行が見えていない row={:?}..{:?} \
+                             view={:?}..{:?}",
+                            row.top(),
+                            row.bottom(),
+                            view.top(),
+                            view.bottom()
+                        );
+                    }
+                    seen >= px(8.0)
+                })
+                .unwrap_or(false);
+            check(
+                expanded(cx).as_deref() == Some(order[2].as_str()) && long_visible,
+                &format!(
+                    "152: 長い本文の項目も展開でき、押した行が見えたまま残る (#1479。\
+                     expanded={:?} visible={long_visible}）",
+                    expanded(cx)
+                ),
+            );
+            let _ = shot(cx, "long-body");
+            click_row(cx, 2);
+            redraw(cx);
+            wait(cx, 100).await;
+        } else {
+            check(false, "152: 長い本文の行を押せない (#1479)");
+        }
+
+        // 8. 開いている行を**完了にすると畳む**（CLI / MCP から閉じても同じ）。
+        //    畳むのは dispatch の 1 実装で、画面側は `set_user_task_expanded` を実装する
+        //    だけ = ここはその配線（host 実装）が生きていることの検査
+        click_row(cx, 0);
+        redraw(cx);
+        wait(cx, 120).await;
+        let target = expanded(cx);
+        let _ = todo(cx, "done", target.clone(), None, None, None);
+        redraw(cx);
+        wait(cx, 120).await;
+        check(
+            target.is_some() && expanded(cx).is_none() && probe(cx, "tasks-detail").is_none(),
+            &format!(
+                "152: 開いている行を完了にすると畳まれる (#1479。target={target:?} \
+                 expanded={:?})",
+                expanded(cx)
+            ),
+        );
+
+        // --- B: バッジがどのパネル幅でも欠けない（幾何で読む）---
+        let mut badge_cases = 0usize;
+        let mut badge_ok = 0usize;
+        for width in [240.0f32, 320.0, 480.0, 600.0] {
+            for count in [0usize, 9, 22, 150] {
+                panel(cx, width);
+                // 件数は B1 の `open_count` がそのまま出る（画面で数えない）ので、
+                // ここでは**その値だけ**を置いて描かせる（150 件の起票は要らない）
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                    app.user_tasks.snapshot.open_count = count;
+                    cx.notify();
+                });
+                redraw(cx);
+                wait(cx, 80).await;
+                let row = probe(cx, "panel-tabs-row");
+                let badge = probe(cx, "panel-tab-badge");
+                badge_cases += 1;
+                let ok = match (row, badge, count) {
+                    // 0 件はバッジを描かない
+                    (Some(_), None, 0) => true,
+                    (Some(_), Some(_), 0) => {
+                        println!("TAKO_VISUAL_1479: 0 件でバッジが出ている");
+                        false
+                    }
+                    (Some(row), Some(badge), _) => {
+                        let inside = badge.left() >= row.left() - px(0.5)
+                            && badge.right() <= row.right() + px(0.5)
+                            && badge.size.width > px(6.0);
+                        if !inside {
+                            println!(
+                                "TAKO_VISUAL_1479: 幅 {width} / {count} 件でバッジが欠ける \
+                                 badge={:?}..{:?} w={:?} row={:?}..{:?}",
+                                badge.left(),
+                                badge.right(),
+                                badge.size.width,
+                                row.left(),
+                                row.right()
+                            );
+                        }
+                        inside
+                    }
+                    (_, _, _) => {
+                        println!("TAKO_VISUAL_1479: 幅 {width} / {count} 件で矩形が採れない");
+                        false
+                    }
+                };
+                if ok {
+                    badge_ok += 1;
+                }
+                if count == 22 && (width - 320.0).abs() < 0.5 {
+                    let _ = shot(cx, "badge-320-22");
+                }
+                if count == 150 && (width - 240.0).abs() < 0.5 {
+                    let _ = shot(cx, "badge-240-150");
+                }
+            }
+        }
+        check(
+            badge_ok == badge_cases,
+            &format!(
+                "152: tasks のバッジが 4 幅 x 4 件数で 1 度も欠けない (#1479 B。\
+                 {badge_ok}/{badge_cases})"
+            ),
+        );
+
+        // 畳んだ絵と開いた絵が別物（描画が止まっていない）
+        let distinct1479 = {
+            let mut v: Vec<u64> = [folded, opened].into_iter().flatten().collect();
+            v.sort_unstable();
+            v.dedup();
+            v.len()
+        };
+        check(
+            distinct1479 == 2,
+            &format!(
+                "152: 畳んだ絵と展開した絵が別々になる (#1479。distinct={distinct1479} \
+                 folded={folded:?} expanded={opened:?})"
+            ),
+        );
+
+        // --- 後片付け（次の節へ持ち越さない）---
+        for id in [id_a, id_b, id_c] {
+            let _ = todo(cx, "dismiss", Some(id), None, None, None);
+        }
+        let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+            app.user_tasks.collapse();
+            app.user_tasks.kind_filter = None;
+            app.user_tasks.snapshot.open_count = 0;
+            app.panel_visible = false;
+            app.panel_view = PanelView::Fleet;
+            app.tick_user_tasks();
+            cx.notify();
+        });
+        println!("TAKO_VISUAL_1479: badge={badge_ok}/{badge_cases} distinct={distinct1479}");
     }
 
     /// 添付の行を**実マウスで**押すと既存のプレビューで開くか（#1472）。
@@ -39630,7 +40169,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["id"].as_str().map(str::to_string));
                 app.tick_user_tasks();
-                app.user_tasks.selected = id.clone();
+                app.user_tasks.expanded = id.clone();
                 app.panel_click_probe_bounds.borrow_mut().clear();
                 cx.notify();
                 id
@@ -39802,7 +40341,7 @@ mod self_test {
             );
             app.panel_visible = false;
             app.panel_view = PanelView::Fleet;
-            app.user_tasks.selected = None;
+            app.user_tasks.expanded = None;
             app.user_tasks.thumbs.clear();
             app.tick_user_tasks();
             cx.notify();
@@ -68635,7 +69174,7 @@ mod self_test {
                 // (d) コピーは押した 1 件だけ（2 件目を押したら 2 件目が入る）
                 let copied150 = window
                     .update(cx, |app: &mut TakoApp, _, cx| {
-                        app.user_tasks.selected = Some(id150.clone());
+                        app.user_tasks.expanded = Some(id150.clone());
                         let first = app.user_task_copy(0, cx);
                         let a = cx.read_from_clipboard().and_then(|c| c.text());
                         let second = app.user_task_copy(1, cx);
@@ -68661,7 +69200,7 @@ mod self_test {
                 // (e) 返答 → responses に積まれ、配送の顛末が読める
                 let responded150 = window
                     .update(cx, |app: &mut TakoApp, _, cx| {
-                        app.user_tasks.selected = Some(id150.clone());
+                        app.user_tasks.expanded = Some(id150.clone());
                         app.user_tasks.decision = Some("needs_change".to_string());
                         app.task_comment_insert("サムネの字を大きく", cx);
                         app.user_task_respond(&id150, cx);
@@ -68714,12 +69253,12 @@ mod self_test {
                 let long150 = window
                     .update(cx, |app: &mut TakoApp, _, cx| {
                         for i in 0..11 {
-                            app.user_tasks.selected = Some(id150.clone());
+                            app.user_tasks.expanded = Some(id150.clone());
                             app.user_tasks.decision = Some("answered".to_string());
                             app.task_comment_insert(&format!("{i} 件目の返答"), cx);
                             app.user_task_respond(&id150, cx);
                         }
-                        app.user_tasks.selected = Some(id150.clone());
+                        app.user_tasks.expanded = Some(id150.clone());
                         app.tick_user_tasks();
                         app.user_tasks
                             .snapshot
@@ -68816,7 +69355,7 @@ mod self_test {
                 let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
                     app.panel_visible = false;
                     app.panel_view = PanelView::Fleet;
-                    app.user_tasks.selected = None;
+                    app.user_tasks.expanded = None;
                     app.user_tasks.reset_form();
                     cx.notify();
                 });

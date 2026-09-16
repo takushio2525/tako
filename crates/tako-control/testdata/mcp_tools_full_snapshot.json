@@ -4122,7 +4122,7 @@
       "additionalProperties": false,
       "properties": {
         "action": {
-          "description": "操作種別（省略時 list）",
+          "description": "操作種別（省略時 list）。expand / collapse は**画面の操作**（#1479）: expand はその 1 件を PC の右パネル tasks ビューでその場に展開し（パネルが閉じていれば開く）、collapse は畳む。ユーザーに「これを見てほしい」と言うときに使う",
           "enum": [
             "add",
             "list",
@@ -4130,7 +4130,9 @@
             "update",
             "done",
             "dismiss",
-            "respond"
+            "respond",
+            "expand",
+            "collapse"
           ],
           "type": "string"
         },
@@ -4175,7 +4177,7 @@
           "type": "string"
         },
         "id": {
-          "description": "対象のタスク id（u-N。show / update / done / dismiss / respond で必須）",
+          "description": "対象のタスク id（u-N。show / update / done / dismiss / respond / expand で必須）",
           "type": "string"
         },
         "kind": {

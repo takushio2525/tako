@@ -312,6 +312,13 @@ pub trait UiStateHost {
         _view: Option<crate::protocol::PanelViewWire>,
     ) {
     }
+    /// tasks ビューでその場に展開しているタスク id（Issue #1479。画面が無い host は `None`）
+    fn user_task_expanded(&self) -> Option<String> {
+        None
+    }
+    /// tasks ビューの展開 / 折りたたみ（`Some(id)` = その 1 件だけ開く / `None` = 畳む。
+    /// Issue #1479）。**同時に開くのは 1 件**という約束は画面側が持つ
+    fn set_user_task_expanded(&mut self, _id: Option<String>) {}
     /// 左サイドバーのファイルツリー（FR-3.1）の表示状態（FR-2.16.5）
     fn filetree_visible(&self) -> bool {
         false

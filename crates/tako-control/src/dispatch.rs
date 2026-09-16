@@ -12999,7 +12999,9 @@ fn dispatch_user_task(
                 .map(crate::user_tasks::parse_kind)
                 .transpose()
                 .map_err(DispatchError::InvalidParams)?;
-            let caller = params.pane.and_then(|p| resolve_pane(host.workspace(), Some(p)).ok());
+            let caller = params
+                .pane
+                .and_then(|p| resolve_pane(host.workspace(), Some(p)).ok());
             let (task_origin, origin_source) =
                 user_task_origin(host, &params, caller.map(|(_, p)| p));
             let origin_profile = task_origin.profile.clone();
@@ -13060,7 +13062,14 @@ fn dispatch_user_task(
                 project: params.project.clone(),
                 any_status: params.all.unwrap_or(false),
             };
-            crate::user_tasks::list_at(&path, &filter).map_err(op_err)
+            let mut value = crate::user_tasks::list_at(&path, &filter).map_err(op_err)?;
+            // #1479: 画面が**いまどれを開いているか**を同じ応答で読ませる
+            // （AI から「見えている状態」を問える = 設計原則 5）。
+            // 画面が無い host では `null` = 嘘をつかない
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("expanded".to_string(), json!(host.user_task_expanded()));
+            }
+            Ok(value)
         }
         "show" => {
             let id = user_task_id(&params)?;
@@ -13096,17 +13105,22 @@ fn dispatch_user_task(
             } else {
                 TaskStatus::Dismissed
             };
-            crate::user_tasks::set_status_at(&path, &id, status).map_err(op_err)
+            let value = crate::user_tasks::set_status_at(&path, &id, status).map_err(op_err)?;
+            // #1479: 画面でその行を開いていたなら畳む。**GUI のボタンも同じことをする**
+            // ので、CLI / MCP から閉じたときだけ「開いていることになっているのに
+            // 一覧に無い」が残る、を作らない
+            if host.user_task_expanded().as_deref() == Some(id.as_str()) {
+                host.set_user_task_expanded(None);
+            }
+            Ok(value)
         }
         "respond" => {
             let id = user_task_id(&params)?;
-            let decision = crate::user_tasks::parse_decision(
-                params
-                    .decision
-                    .as_deref()
-                    .ok_or_else(|| DispatchError::InvalidParams("respond には decision が必要".into()))?,
-            )
-            .map_err(DispatchError::InvalidParams)?;
+            let decision =
+                crate::user_tasks::parse_decision(params.decision.as_deref().ok_or_else(|| {
+                    DispatchError::InvalidParams("respond には decision が必要".into())
+                })?)
+                .map_err(DispatchError::InvalidParams)?;
             let via = match params.via.as_deref() {
                 Some(v) => crate::user_tasks::parse_via(v).map_err(DispatchError::InvalidParams)?,
                 None => match origin {
@@ -13115,14 +13129,46 @@ fn dispatch_user_task(
                 },
             };
             let comment = params.comment.clone().unwrap_or_default();
-            let (task, index) =
-                crate::user_tasks::respond_at(&path, &id, decision, &comment, via).map_err(op_err)?;
+            let (task, index) = crate::user_tasks::respond_at(&path, &id, decision, &comment, via)
+                .map_err(op_err)?;
             let delivery = deliver_user_task_response(host, &task, index);
             crate::user_tasks::record_delivery_at(&path, &id, delivery).map_err(op_err)?;
             crate::user_tasks::show_at(&path, &id).map_err(op_err)
         }
+        // #1479: 右パネル tasks ビューの「その場で展開」を AI からも操作する
+        // （UI でできることは MCP / CLI からもできる = 開発不変条件）。
+        // **状態は画面の一時状態**なので永続へは書かない（`user-tasks.yaml` は無変更）
+        "expand" | "collapse" => {
+            let target = if params.action == "expand" {
+                let id = user_task_id(&params)?;
+                // 在る id だけを開く。無い id を「開いた」と言わない
+                // （存在の判定は `show` の 1 実装を通す）
+                crate::user_tasks::show_at(&path, &id).map_err(op_err)?;
+                Some(id)
+            } else {
+                None
+            };
+            host.set_user_task_expanded(target);
+            // 開くなら**見える場所へ出す**。右パネルが閉じていたり別のビューを
+            // 出していたら、展開しても画面には何も起きない（`tako panel` と
+            // 同じ `set_panel` の 1 実装を呼ぶ = 経路を増やさない）
+            if params.action == "expand" {
+                host.set_panel(
+                    Some(true),
+                    None,
+                    Some(crate::protocol::PanelViewWire::Tasks),
+                );
+            }
+            let (visible, _width, view) = host.panel_state();
+            Ok(json!({
+                "expanded": host.user_task_expanded(),
+                "panel_visible": visible,
+                "panel_view": view.as_str(),
+            }))
+        }
         other => Err(DispatchError::InvalidParams(format!(
-            "不明な action: {other:?}（add / list / show / update / done / dismiss / respond のいずれか）"
+            "不明な action: {other:?}（add / list / show / update / done / dismiss / \
+             respond / expand / collapse のいずれか）"
         ))),
     }
 }
@@ -14522,6 +14568,10 @@ mod tests {
         /// #1185: ペイン → 取り込みビュー（`tako tmux open` の登録先）。
         /// `track_tmux_view` が入れるので、製品と同じ経路で埋まる
         tmux_views: std::collections::HashMap<u64, tako_core::TmuxView>,
+        /// #1479: 右パネルの状態（既定は trait の既定と同じ「閉じている / fleet」）と
+        /// tasks ビューで展開中のタスク id
+        panel: (bool, f32, crate::protocol::PanelViewWire),
+        user_task_expanded: Option<String>,
         /// #549: ウェルカムバナーの表示状態
         welcome_banner: bool,
         /// #600: 入力予測（既定 ON）
@@ -14571,6 +14621,8 @@ mod tests {
                 attached_options: std::collections::HashMap::new(),
                 detached: Vec::new(),
                 detached_markers: Vec::new(),
+                panel: (false, 0.0, crate::protocol::PanelViewWire::Fleet),
+                user_task_expanded: None,
                 previews: std::collections::HashMap::new(),
                 preview_views: std::collections::HashMap::new(),
                 preview_outlines: std::collections::HashMap::new(),
@@ -14772,6 +14824,37 @@ mod tests {
     }
 
     impl UiStateHost for MockHost {
+        /// #1479: 右パネルの状態（`expand` が開くことを実測するために持つ）
+        fn panel_state(&self) -> (bool, f32, crate::protocol::PanelViewWire) {
+            self.panel
+        }
+
+        fn set_panel(
+            &mut self,
+            visible: Option<bool>,
+            width: Option<f32>,
+            view: Option<crate::protocol::PanelViewWire>,
+        ) {
+            if let Some(v) = visible {
+                self.panel.0 = v;
+            }
+            if let Some(w) = width {
+                self.panel.1 = w;
+            }
+            if let Some(v) = view {
+                self.panel.2 = v;
+            }
+        }
+
+        /// #1479: tasks ビューの展開（GUI の `user_tasks.expanded` の代役）
+        fn user_task_expanded(&self) -> Option<String> {
+            self.user_task_expanded.clone()
+        }
+
+        fn set_user_task_expanded(&mut self, id: Option<String>) {
+            self.user_task_expanded = id;
+        }
+
         /// #1132 / #1439: 幅比 + フォント倍率 → 桁数。GUI の実測（`PaneWidthMetrics`）の
         /// 代役として「タブ幅 × 幅比 ÷ 倍率」を返す（枠と余白は桁数に対して小さいので省く。
         /// フォントを縮めるとセル幅が比例して細くなる = 桁数は倍率の逆数倍）
@@ -27218,6 +27301,180 @@ mod tests {
             tree.get_mut(id).unwrap().set_spawned_by(Some(master));
         }
         (tab, master)
+    }
+
+    // --- #1479: tasks ビューの展開を CLI / MCP から操作する ---
+
+    /// 隔離した置き場で `Request::UserTask` を通す（本番の `user-tasks.yaml` を触らない）。
+    ///
+    /// 置き場は `TAKO_USER_TASKS_FILE`（`store_path` の 1 実装が読む env）で差し替える。
+    /// env は**プロセス共通**なので、`#[test]` の並走で互いの置き場を上書きし合う
+    /// （実測: 2 本が並ぶと `add` が相手の store へ落ち、id が食い違って
+    /// 「別の行を閉じたのに展開が畳まれた」ように見えた）。排他を取り、
+    /// **元の値へ戻してからロックを解放する**（i18n の `LangGuard` と同じ形）
+    fn t1479_env(tag: &str) -> (tako_core::test_residue::ScratchDir, impl Drop) {
+        use std::sync::{Mutex, MutexGuard, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        struct Guard {
+            _lock: MutexGuard<'static, ()>,
+            original: Option<std::ffi::OsString>,
+        }
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                match self.original.take() {
+                    Some(v) => std::env::set_var("TAKO_USER_TASKS_FILE", v),
+                    None => std::env::remove_var("TAKO_USER_TASKS_FILE"),
+                }
+            }
+        }
+        let lock = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tako_core::test_residue::ScratchDir::new(&format!("user-tasks-{tag}"));
+        let guard = Guard {
+            _lock: lock,
+            original: std::env::var_os("TAKO_USER_TASKS_FILE"),
+        };
+        std::env::set_var("TAKO_USER_TASKS_FILE", dir.path().join("user-tasks.yaml"));
+        (dir, guard)
+    }
+
+    fn t1479_params(action: &str, id: Option<&str>) -> UserTaskParams {
+        t1479_params_titled(action, id, "展開の検証")
+    }
+
+    fn t1479_params_titled(action: &str, id: Option<&str>, title: &str) -> UserTaskParams {
+        UserTaskParams {
+            action: action.into(),
+            id: id.map(str::to_string),
+            title: Some(title.to_string()),
+            body: None,
+            kind: None,
+            status: None,
+            all: None,
+            project: None,
+            attachments: None,
+            copy_texts: None,
+            links: None,
+            due: None,
+            decision: None,
+            comment: None,
+            via: None,
+            pane: None,
+            caller_role: None,
+        }
+    }
+
+    /// `expand` はその 1 件を開き、**右パネルを tasks ビューで開く**。
+    /// `list` の応答に `expanded` が載る（画面の状態を AI から読める = 設計原則 5）
+    #[test]
+    fn issue1479_expandは1件を開きパネルをtasksで開く() {
+        let (_dir, _guard) = t1479_env("t1479-expand");
+        let mut host = MockHost::new();
+        let mut add = |title: &str| {
+            dispatch_user_task(
+                &mut host,
+                PaneOrigin::Cli,
+                t1479_params_titled("add", None, title),
+            )
+            .unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let a = add("展開の検証 A");
+        let b = add("展開の検証 B");
+        assert_ne!(
+            a, b,
+            "起票が 2 件に分かれていない（置き場が共有されている）"
+        );
+        // 既定は「どれも開いていない」
+        assert_eq!(
+            dispatch_user_task(&mut host, PaneOrigin::Cli, t1479_params("list", None)).unwrap()
+                ["expanded"],
+            serde_json::Value::Null
+        );
+
+        let out = dispatch_user_task(&mut host, PaneOrigin::Cli, t1479_params("expand", Some(&a)))
+            .unwrap();
+        assert_eq!(out["expanded"].as_str(), Some(a.as_str()));
+        assert_eq!(out["panel_visible"].as_bool(), Some(true));
+        assert_eq!(out["panel_view"].as_str(), Some("tasks"));
+        assert_eq!(host.user_task_expanded.as_deref(), Some(a.as_str()));
+        assert_eq!(
+            dispatch_user_task(&mut host, PaneOrigin::Cli, t1479_params("list", None)).unwrap()
+                ["expanded"]
+                .as_str(),
+            Some(a.as_str())
+        );
+
+        // **同時に開くのは 1 件**（別の id を開くと乗り換える）
+        dispatch_user_task(&mut host, PaneOrigin::Cli, t1479_params("expand", Some(&b))).unwrap();
+        assert_eq!(host.user_task_expanded.as_deref(), Some(b.as_str()));
+
+        // 畳んでもパネルは閉じない（見ている場所を勝手に消さない）
+        let out =
+            dispatch_user_task(&mut host, PaneOrigin::Cli, t1479_params("collapse", None)).unwrap();
+        assert_eq!(out["expanded"], serde_json::Value::Null);
+        assert_eq!(out["panel_visible"].as_bool(), Some(true));
+        assert_eq!(host.panel_state().2.as_str(), "tasks");
+    }
+
+    /// 無い id は**開いたと言わない**（存在の判定は `show` の 1 実装を通す）
+    #[test]
+    fn issue1479_無いidは開けない() {
+        let (_dir, _guard) = t1479_env("t1479-missing");
+        let mut host = MockHost::new();
+        let err = dispatch_user_task(
+            &mut host,
+            PaneOrigin::Cli,
+            t1479_params("expand", Some("u-999")),
+        )
+        .unwrap_err();
+        assert!(matches!(err, DispatchError::Operation(_)), "{err:?}");
+        assert_eq!(host.user_task_expanded, None);
+        // パネルも勝手に開かない（失敗したのだから画面も動かさない）
+        assert!(!host.panel_state().0);
+    }
+
+    /// `done` / `dismiss` で**その行が一覧から消える**なら畳む。
+    /// GUI のボタンも同じ 1 実装（dispatch）を通るので、CLI / MCP から閉じたときだけ
+    /// 「開いていることになっているのに一覧に無い」が残る、を作らない
+    #[test]
+    fn issue1479_完了させると展開は畳まれる() {
+        let (_dir, _guard) = t1479_env("t1479-done");
+        let mut host = MockHost::new();
+        let mut add = |title: &str| {
+            dispatch_user_task(
+                &mut host,
+                PaneOrigin::Cli,
+                t1479_params_titled("add", None, title),
+            )
+            .unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let a = add("展開の検証 A");
+        let b = add("展開の検証 B");
+        assert_ne!(
+            a, b,
+            "起票が 2 件に分かれていない（置き場が共有されている）"
+        );
+
+        dispatch_user_task(&mut host, PaneOrigin::Cli, t1479_params("expand", Some(&a))).unwrap();
+        // **別の行**を閉じても、開いている行の展開は残る
+        dispatch_user_task(
+            &mut host,
+            PaneOrigin::Cli,
+            t1479_params("dismiss", Some(&b)),
+        )
+        .unwrap();
+        assert_eq!(host.user_task_expanded.as_deref(), Some(a.as_str()));
+        // 開いている行を閉じたら畳む
+        dispatch_user_task(&mut host, PaneOrigin::Cli, t1479_params("done", Some(&a))).unwrap();
+        assert_eq!(host.user_task_expanded, None);
     }
 
     // --- #1466: worker が起票したユーザータスクの戻り先 ---
