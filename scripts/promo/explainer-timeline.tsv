@@ -72,5 +72,5 @@ c7_rc	clip	remote	profile	0	18	Claude 公式 Remote Control への委譲（opt-i
 c8_card	card	8 / 8	0	0	4	8. Windows と OSS	導入方法とリンク	最後に、対応環境と入手先です。
 c8_win	clip	windows	winsupport	0	18	Windows 版も同じリリースに同梱	対応状況は、実機で確かめたものだけを「対応」と書く	タコはマックオーエス先行で開発し、ウィンドウズ版はインストーラーとポータブル版を、同じリリースに同梱しています。どの機能が使えるかは、実機で確かめたものだけを対応と書く方針で、ドキュメントに自動生成の表があります。
 c8_oss	clip	windows	license	0	10	GPL-3.0-or-later のオープンソース	github.com/takushio2525/tako	タコは、ジーピーエル バージョン 3 のオープンソースです。ソースコードはギットハブで公開しています。
-c8_get	clip	windows	brew	0	14	^brew install --cask takushio2525/tako/tako	ドキュメント: tako-docs.pages.dev	導入はホームブリューで 1 行。ドキュメントサイトには、セットアップからオーケストレーションの実践ガイドまで揃っています。
+c8_get	clip	windows	brew	0	14	^brew install --cask takushio2525/tako/tako	ドキュメント: tako.takushio2525.com	導入はホームブリューで 1 行。ドキュメントサイトには、セットアップからオーケストレーションの実践ガイドまで揃っています。
 outro_card	card		0	0	10	tako	github.com/takushio2525/tako	エーアイに任せる開発を、ひとつの画面で。タコを、ぜひ試してみてください。

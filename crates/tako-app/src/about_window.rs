@@ -13,7 +13,7 @@ use crate::TakoApp;
 
 /// リンク先（言語非依存）
 pub const REPOSITORY_URL: &str = "https://github.com/takushio2525/tako";
-pub const DOCUMENTATION_URL: &str = "https://tako-docs.pages.dev/";
+pub const DOCUMENTATION_URL: &str = "https://tako.takushio2525.com/";
 pub const RELEASES_URL: &str = "https://github.com/takushio2525/tako/releases";
 pub const ISSUES_URL: &str = "https://github.com/takushio2525/tako/issues";
 

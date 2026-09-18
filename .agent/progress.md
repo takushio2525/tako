@@ -54,3 +54,8 @@
 - A: 詳細を**行の器の子**へ移し（旧実装は列の末尾に 1 枚 + 「選択が無ければ先頭」で畳めなかった）、`toggle` / `collapse` の 1 実装で「再押下で閉じる・別項目で乗り換える・絞り込みで畳む・ポーリングでは畳まない・`done` で畳む（dispatch 側 1 か所）」に。展開した行は `scroll_to_item` で見える位置へ。矢印は `CHEVRON_*`
 - B: タブ列を `panel_tab_density` の 3 段（Full / Compact / IconsOnly）+ belt（バッジ `flex_none` / ラベル `min_w(0)`）で詰め、件数は `panel_tab_badge`（0 件は出さない・100 以上は `99+`）。220〜900px × 0/9/22/150/4000 件を単体テストが 1px 刻みで固定、visual-test 項目 152 が**バッジの実矩形がタブ列の内側**かを 4 幅 × 4 件数で読む（A/B `TAKO_1479_LEGACY=1` は 10/16 で FAILED = 320px で 9px 溢れる）
 - MCP / CLI 1:1: `tako todo expand <id>` / `collapse` + `list` の `expanded`。番犬 `issue1479_tasks_accordion_watchdog`（注入 11 通り）・実経路 `scripts/test-todo-expand-1479.sh`
+
+## 2026-09-18（#1482: ドキュメントサイトを tako.takushio2525.com へ移行）
+- `docs/astro.config.mjs` の `site` を新ドメインへ（canonical / og:url / og:image / sitemap はここ 1 か所が基点なのでまとめて追従）。About の `DOCUMENTATION_URL` は「`site` と同じ URL」という設定コメントの約束があるので同一コミットで動かす
+- 旧ドメインの転送は `docs/functions/_middleware.js` の 301。`*.pages.dev` はゾーン外で Redirect Rules / Bulk Redirects を書けず `_redirects` はホスト名を条件にできないため、Pages Functions が唯一の経路。プレビュー配備を潰さないようホスト名は完全一致で見る
+- OG 画像 31 枚を再生成（フッター文言。未生成だった features/user-tasks もここで揃った）。ビルド 32 ページ緑 / og:verify 緑。カスタムドメインの追加は master が実施

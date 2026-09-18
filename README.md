@@ -3,15 +3,15 @@
 **AI エージェント時代の、集約監視に特化した高速 GUI ターミナル**
 **A fast GUI terminal built for the AI-agent era — monitor your whole agent fleet in one tab.**
 
-開発中です。macOS で動作し、Windows は移植を進めています（[対応状況](https://tako-docs.pages.dev/windows-support/)）。
+開発中です。macOS で動作し、Windows は移植を進めています（[対応状況](https://tako.takushio2525.com/windows-support/)）。
 In development. Runs on macOS; the Windows port is in progress.
 
-**ドキュメント / Documentation — [tako-docs.pages.dev](https://tako-docs.pages.dev/)**
-[セットアップ](https://tako-docs.pages.dev/getting-started/) ・
-[クイックスタート](https://tako-docs.pages.dev/getting-started/quickstart/) ・
-[CLI リファレンス](https://tako-docs.pages.dev/guides/cli-reference/) ・
-[MCP ツール一覧](https://tako-docs.pages.dev/guides/mcp-tools/) ・
-[オーケストレーション](https://tako-docs.pages.dev/features/orchestration/)
+**ドキュメント / Documentation — [tako.takushio2525.com](https://tako.takushio2525.com/)**
+[セットアップ](https://tako.takushio2525.com/getting-started/) ・
+[クイックスタート](https://tako.takushio2525.com/getting-started/quickstart/) ・
+[CLI リファレンス](https://tako.takushio2525.com/guides/cli-reference/) ・
+[MCP ツール一覧](https://tako.takushio2525.com/guides/mcp-tools/) ・
+[オーケストレーション](https://tako.takushio2525.com/features/orchestration/)
 
 ## なぜ tako？ / Why tako?
 
@@ -72,8 +72,8 @@ Install psmux for persistent sessions; it plays the same role as tmux on Windows
 winget install marlocarlo.psmux
 ```
 
-移植は途中です。手順の詳細は [セットアップ](https://tako-docs.pages.dev/getting-started/)、どの機能が使えるかは [Windows 対応状況](https://tako-docs.pages.dev/windows-support/) にまとめてあります。
-The port is still in progress: see [Setup](https://tako-docs.pages.dev/getting-started/) for the full walkthrough and [Windows support status](https://tako-docs.pages.dev/windows-support/) for what works today.
+移植は途中です。手順の詳細は [セットアップ](https://tako.takushio2525.com/getting-started/)、どの機能が使えるかは [Windows 対応状況](https://tako.takushio2525.com/windows-support/) にまとめてあります。
+The port is still in progress: see [Setup](https://tako.takushio2525.com/getting-started/) for the full walkthrough and [Windows support status](https://tako.takushio2525.com/windows-support/) for what works today.
 
 ## 使い始める / Getting started
 
@@ -94,7 +94,7 @@ tako master    # 司令塔の AI（マスター）を今いるペインで起動
 
 オーケストレーションを使わず 1 対 1 で相談したいときは `tako solo`。専用タブで動かしたいときは `tako master --tab` です。
 初回起動時はタブバー下のバナー（および Cmd+K のコマンドパレット）から同じ操作ができます。
-詳しい流れは[クイックスタート](https://tako-docs.pages.dev/getting-started/quickstart/)、設定項目は[セットアップガイド](https://tako-docs.pages.dev/getting-started/)にあります。
+詳しい流れは[クイックスタート](https://tako.takushio2525.com/getting-started/quickstart/)、設定項目は[セットアップガイド](https://tako.takushio2525.com/getting-started/)にあります。
 
 `tako setup` detects your installed and authenticated agent CLIs (claude / codex / agy) and fills in the rest with previous or safe default values — with a single authenticated CLI it asks nothing. `tako master` then starts the orchestrator in the current pane, and you talk to it in plain language; it spawns workers next to itself and reports back. Use `tako solo` for one-on-one work without orchestration, and `tako master --tab` for a dedicated tab.
 
@@ -145,7 +145,7 @@ claude mcp add --scope user --transport stdio tako -- /Applications/tako.app/Con
 
 `tako remote start` は、外出先のスマホのブラウザから tako のペインを見て操作するための API サーバーを起動します。**既定で無効**で、明示的に起動したときだけ動きます。セットアップは `tako remote setup` の対話ウィザードが案内します。
 
-通信は [Tailscale](https://tailscale.com/) の `serve` が HTTPS → ループバック TCP（`127.0.0.1` のエフェメラルポート）をプロキシする構成です。daemon の待ち受けはループバックだけにバインドされるので、LAN や外部ネットワークからは到達できません。URL は tailnet 内にのみ存在し、WireGuard でエンドツーエンド暗号化されます。認証は二層で、層①が `tailscale whois` による tailnet ノードの検証、層②が機器ペアリング（初回接続時に Mac 画面の承認ダイアログを通すまで画面データを受け取れない）です。仕組みの詳細は[リモートアクセスのドキュメント](https://tako-docs.pages.dev/features/remote/)にあります。
+通信は [Tailscale](https://tailscale.com/) の `serve` が HTTPS → ループバック TCP（`127.0.0.1` のエフェメラルポート）をプロキシする構成です。daemon の待ち受けはループバックだけにバインドされるので、LAN や外部ネットワークからは到達できません。URL は tailnet 内にのみ存在し、WireGuard でエンドツーエンド暗号化されます。認証は二層で、層①が `tailscale whois` による tailnet ノードの検証、層②が機器ペアリング（初回接続時に Mac 画面の承認ダイアログを通すまで画面データを受け取れない）です。仕組みの詳細は[リモートアクセスのドキュメント](https://tako.takushio2525.com/features/remote/)にあります。
 
 **使う前に必ず読んでください / Read before use:**
 
@@ -153,7 +153,7 @@ claude mcp add --scope user --transport stdio tako -- /Applications/tako.app/Con
 - **接続 URL を共有しないでください。** URL 自体にトークンは含まれませんが、tailnet 内の端末からはアクセス可能です。SNS やスクリーンショットで公開しないでください。
 - **到達できるのは同じ tailnet の端末だけです。** それでも tailnet 内の全端末を信頼できない場合（共有 tailnet 等）は、この機能を使わないでください。Tailscale アカウント自体の保護（2 要素認証・tailnet lock）も重要です。
 
-`tako remote start` launches an API server that lets you drive tako's panes from a phone browser. **It is disabled by default.** Tailscale `serve` proxies HTTPS to a loopback TCP listener (`127.0.0.1`, ephemeral port), so the daemon is not reachable from your LAN or the internet; see the [remote access docs](https://tako-docs.pages.dev/features/remote/) for how it works. Treat it as a legitimate remote-control tool: once connected, the remote browser can send arbitrary keystrokes and commands to your terminal — effectively full shell access. Use it only to control your own machine, never share the connection URL, and do not enable it if you cannot trust every device on your tailnet.
+`tako remote start` launches an API server that lets you drive tako's panes from a phone browser. **It is disabled by default.** Tailscale `serve` proxies HTTPS to a loopback TCP listener (`127.0.0.1`, ephemeral port), so the daemon is not reachable from your LAN or the internet; see the [remote access docs](https://tako.takushio2525.com/features/remote/) for how it works. Treat it as a legitimate remote-control tool: once connected, the remote browser can send arbitrary keystrokes and commands to your terminal — effectively full shell access. Use it only to control your own machine, never share the connection URL, and do not enable it if you cannot trust every device on your tailnet.
 
 ## ソースからビルド / Build from source
 

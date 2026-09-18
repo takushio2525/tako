@@ -5,11 +5,23 @@ import starlight from '@astrojs/starlight';
 export default defineConfig({
 	// 公開 URL。canonical / og:url / sitemap / OG 画像の絶対 URL の基点になる
 	// （crates/tako-app/src/about_window.rs の DOCUMENTATION_URL と同じ URL）
-	site: 'https://tako-docs.pages.dev',
+	site: 'https://tako.takushio2525.com',
 	integrations: [
 		starlight({
 			title: 'tako',
 			description: 'AI エージェントのための次世代ターミナル',
+			// Pages Functions のミドルウェア（docs/functions/_middleware.js）が届かない配備でも
+			// 旧ドメインの閲覧者を新ドメインへ送るための保険。転送の本体は 301 を返す
+			// ミドルウェア側で、こちらは静的 HTML だけが配られたときにだけ効く。
+			head: [
+				{
+					tag: 'script',
+					content:
+						"if (location.hostname === 'tako-docs.pages.dev') {" +
+						"location.replace('https://tako.takushio2525.com' + location.pathname + location.search + location.hash);" +
+						"}",
+				},
+			],
 			// ページごとの OG 画像を head に足す（画像は docs/scripts/generate-og.mjs が生成）
 			routeMiddleware: './src/starlightRouteData.ts',
 			defaultLocale: 'root',

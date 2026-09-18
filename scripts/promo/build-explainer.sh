@@ -121,7 +121,7 @@ while IFS=$'\t' read -r id kind source anchor offset min_dur caption subtitle sp
         # 末尾カードだけは脚注に音声素材のクレジットを載せる。VOICEVOX の利用規約は
         # 生成音声の公開に話者クレジットの表示を求めるので、ここと説明文の 2 か所に置く
         # （表記はエンジンから引いた値。narrate.sh / voicevox-synth.py と同じ 1 実装）。
-        card_footer="github.com/takushio2525/tako  /  tako-docs.pages.dev"
+        card_footer="github.com/takushio2525/tako  /  tako.takushio2525.com"
         if [ "$id" = "outro_card" ] && [ -n "$VOICE_CREDIT" ]; then
             card_footer="${card_footer}    音声: ${VOICE_CREDIT}"
         fi

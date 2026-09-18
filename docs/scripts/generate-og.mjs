@@ -170,7 +170,7 @@ function heroHtml() {
       <div class="sub">${esc(HERO_SUB)}</div>
     </div>
     <div class="right"><img class="mascot" id="logo" src="${mascotDataUri}" width="300" alt=""></div>
-    <div class="foot site mono">tako-docs.pages.dev</div>
+    <div class="foot site mono">tako.takushio2525.com</div>
   </div>${FIT_SCRIPT}</body></html>`;
 }
 
@@ -203,7 +203,7 @@ function pageHtml({ title, description, section }) {
       <div id="title">${esc(title)}</div>
       ${description ? `<div class="desc">${esc(description)}</div>` : ''}
     </div>
-    <div class="foot"><div class="site mono">tako-docs.pages.dev</div><div class="site">ドキュメント</div></div>
+    <div class="foot"><div class="site mono">tako.takushio2525.com</div><div class="site">ドキュメント</div></div>
   </div>${FIT_SCRIPT}</body></html>`;
 }
 
