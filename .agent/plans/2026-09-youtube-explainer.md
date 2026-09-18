@@ -163,7 +163,7 @@ v6 のタイムラインは事故を避けるため、guimode の 2 区間だけ
 | `c8_card` | card | 3.8 | 8. Windows と OSS / 導入方法とリンク | 最後に、対応環境と入手先です。 |
 | `c8_win` | clip | 18.3 | Windows 版も同じリリースに同梱 / 対応状況は、実機で確かめたものだけを「対応」と書く | タコはマックオーエス先行で開発し、ウィンドウズ版はインストーラーとポータブル版を、同じリリースに同梱しています。どの機能が使えるかは、実機で確かめたものだけを対応と書く方針で、ドキュメントに自動生成の表があります。 |
 | `c8_oss` | clip | 9.3 | GPL-3.0-or-later のオープンソース / github.com/takushio2525/tako | タコは、ジーピーエル バージョン 3 のオープンソースです。ソースコードはギットハブで公開しています。 |
-| `c8_get` | clip | 9.9 | brew install --cask takushio2525/tako/tako / ドキュメント: tako-docs.pages.dev | 導入はホームブリューで 1 行。ドキュメントサイトには、セットアップからオーケストレーションの実践ガイドまで揃っています。 |
+| `c8_get` | clip | 9.9 | brew install --cask takushio2525/tako/tako / ドキュメント: tako.takushio2525.com | 導入はホームブリューで 1 行。ドキュメントサイトには、セットアップからオーケストレーションの実践ガイドまで揃っています。 |
 | `outro_card` | card | 6.8 | tako / github.com/takushio2525/tako | エーアイに任せる開発を、ひとつの画面で。タコを、ぜひ試してみてください。 |
 <!-- narration:end -->
 
@@ -202,7 +202,7 @@ v6 のタイムラインは事故を避けるため、guimode の 2 区間だけ
 | 8 | Windows 版はインストーラー + ポータブル zip を同じリリースに同梱（v0.7.9 以降） | `docs/.../getting-started/index.md`「方法 C: Windows」/ `AGENTS.md`「両 OS 同時リリース（#965）」 |
 | 8 | 対応状況は実機で確かめたものだけを「対応」と書く。docs の表は自動生成 | `docs/.../windows-support.md`（生成物）/ `AGENTS.md`「プラットフォーム対応マトリクス（#515 / #591）」 |
 | 8 | GPL-3.0-or-later のオープンソース。GitHub で公開 | `LICENSE` / `Cargo.toml` の `license` / `README.md` |
-| 8 | ドキュメントサイト tako-docs.pages.dev | `README.md` 冒頭のリンク |
+| 8 | ドキュメントサイト tako.takushio2525.com | `README.md` 冒頭のリンク |
 
 ### 言わなかったこと（裏が取れない・実装中・過大になる）
 
@@ -695,13 +695,13 @@ https://github.com/takushio2525/tako/releases
 
 ■ リンク
 GitHub: https://github.com/takushio2525/tako
-ドキュメント: https://tako-docs.pages.dev/
-セットアップ: https://tako-docs.pages.dev/getting-started/
-クイックスタート: https://tako-docs.pages.dev/getting-started/quickstart/
-オーケストレーションとは: https://tako-docs.pages.dev/features/orchestration/
-tako master 実践ガイド: https://tako-docs.pages.dev/features/orchestrator/
-リモートアクセス: https://tako-docs.pages.dev/features/remote/
-Windows 対応状況: https://tako-docs.pages.dev/windows-support/
+ドキュメント: https://tako.takushio2525.com/
+セットアップ: https://tako.takushio2525.com/getting-started/
+クイックスタート: https://tako.takushio2525.com/getting-started/quickstart/
+オーケストレーションとは: https://tako.takushio2525.com/features/orchestration/
+tako master 実践ガイド: https://tako.takushio2525.com/features/orchestrator/
+リモートアクセス: https://tako.takushio2525.com/features/remote/
+Windows 対応状況: https://tako.takushio2525.com/windows-support/
 
 ■ 章
 00:00 オープニング
