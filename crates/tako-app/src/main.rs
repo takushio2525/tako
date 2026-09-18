@@ -2212,6 +2212,8 @@ struct TakoApp {
     webview_address_bar_active: Option<PaneId>,
     /// wry の親にする GPUI ウィンドウの生ハンドル（初回 render で採取）
     window_raw_handle: Option<webview::WindowHandleBox>,
+    /// キー入力の宛先を Web ビューから GPUI へ戻した回数（#1481 の計器。診断専用）
+    webview_key_focus_returns: u64,
     /// 起動復元で開き直す Web ビュー（ペイン対応, URL）。ウィンドウハンドルが
     /// 要るため初回 render で消費する
     pending_webview_restore: Vec<(Option<u64>, String)>,
@@ -4013,6 +4015,7 @@ impl TakoApp {
             webview_address_bar: HashMap::new(),
             webview_address_bar_active: None,
             window_raw_handle: None,
+            webview_key_focus_returns: 0,
             pending_webview_restore: Vec::new(),
             stale_binary_banners: HashMap::new(),
             stale_binary_scan: tako_control::stale_binary::ScanState::default(),
@@ -8218,6 +8221,75 @@ impl TakoApp {
         if let Some(pane_id) = self.webview_address_bar_active.take() {
             self.webview_address_bar.remove(&pane_id.as_u64());
         }
+        // #1481: GPUI のフラグだけでは足りない。Web ビューはネイティブビュー
+        // （macOS = WKWebView）なので、ページをクリックすると **AppKit の**
+        // キー入力の宛先（NSWindow の first responder）がそちらへ移る。
+        // 入力対象が変わったこの場で宛先も GPUI へ戻す（詳細は関数の doc）
+        self.return_webview_key_focus(false);
+    }
+
+    /// キー入力の宛先（macOS では NSWindow の first responder）を GPUI の描画ビューへ
+    /// 戻す（#1481）。
+    ///
+    /// Web ビューは GPUI の合成レイヤの上に乗る**ネイティブビュー**なので、ページを
+    /// クリックすると打鍵は OS から直接 WKWebView へ配送されるようになる。tako 側で
+    /// ペインのフォーカスを動かしても（クリック・⌘数字・`tako focus`）AppKit の宛先は
+    /// 動かないため、**ターミナルへ戻っても打鍵がページに吸われ続ける**のが #1481。
+    ///
+    /// 呼ぶのは `clear_text_input_focus`（= 入力対象が変わる全経路。#503 と同じ集合）と
+    /// Web ビューの破棄。**毎フレームの判定にはできない**: 「宛先が Web ビューで、
+    /// フォーカスペインはそれ以外」という状態は「たったいまページをクリックした」と
+    /// 「ターミナルへ戻ったのに宛先が残っている」の**両方で同じ**なので、実体だけからは
+    /// 区別できない。操作（= どちらが後に起きたか）を持っているこの経路で決める
+    ///
+    /// `force` は破棄前の呼び出し用。通常（`false`）は**フォーカスペインが可視の
+    /// Web ビューのものなら戻さず**（ページを見ているユーザーの打鍵を奪わない）、
+    /// **別の** Web ビューが宛先を持っていたらフォーカス側のページへ寄せ直す
+    /// （2 枚開いているときの取り違え）
+    fn return_webview_key_focus(&mut self, force: bool) {
+        if self.webviews.is_empty() || Self::webview_key_focus_legacy() {
+            return;
+        }
+        // 宛先が既に tako（GPUI）なら何もしない。**ここで実体を見る**ので、
+        // ページを触っていないユーザーの打鍵を取り上げる経路が構造的に無い
+        let held_by_webview = match self.window_raw_handle.as_ref() {
+            Some(h) => webview::webview_holds_key_focus(h),
+            None => return,
+        };
+        if !held_by_webview {
+            return;
+        }
+        if !force {
+            let focused = self.focused_pane();
+            if let Some(idx) = self
+                .webviews
+                .iter()
+                .position(|e| e.visible_now && e.pane == Some(focused))
+            {
+                // フォーカスペインが可視の Web ビュー = ユーザーはページを見ているので
+                // 打鍵は奪わない。ただし **別の** Web ビューが宛先を持っている状態
+                // （2 枚開いていて、片方のページを触ったあともう片方のペインへ
+                // フォーカスを移した）は取り違えなので、フォーカス側のページへ寄せ直す。
+                // 宛先が tako のときはここへ来ない（上で抜けている）ので、
+                // 「ペインを選んだだけでページに打鍵を渡す」ことにはならない
+                let _ = self.webviews[idx].view.focus();
+                return;
+            }
+        }
+        let restored = match self.window_raw_handle.as_ref() {
+            Some(h) => webview::return_key_focus_to_app(h),
+            None => false,
+        };
+        if restored {
+            self.webview_key_focus_returns = self.webview_key_focus_returns.saturating_add(1);
+        }
+    }
+
+    /// #1481 の修正を切る A/B の口（`TAKO_1481_LEGACY=1`）。
+    /// 1 の間は修正前と同じで、Web ビューを見たあとターミナルへ戻っても
+    /// キー入力の宛先が WKWebView に残る
+    fn webview_key_focus_legacy() -> bool {
+        std::env::var_os("TAKO_1481_LEGACY").is_some()
     }
 
     // --- ペイン操作（ドメイン API の薄い呼び出し。FR-2.5 と同じセマンティクス） ---
@@ -9672,12 +9744,14 @@ impl TakoApp {
     }
 
     fn focus_direction(&mut self, direction: SplitDirection, cx: &mut Context<Self>) {
-        // #503: ペインフォーカス移動でテキスト入力フラグをクリア
-        self.clear_text_input_focus();
         self.workspace
             .active_tab_mut()
             .tree_mut()
             .focus_direction(direction);
+        // #503: ペインフォーカス移動でテキスト入力フラグをクリア。
+        // #1481: **移動のあとに**呼ぶ（移動先が Web ビューかどうかで宛先の扱いが
+        // 変わるので、古いフォーカスで判定させない。他の経路も移動 → クリアの順）
+        self.clear_text_input_focus();
         cx.notify();
     }
 
@@ -14853,6 +14927,11 @@ impl TakoApp {
         cx: &mut Context<Self>,
     ) {
         let _ = self.workspace.active_tab_mut().tree_mut().focus(pane_id);
+        // #503 / #1481: ペインを触ったら入力対象の切り替えをここで通す。
+        // ルート div の一括 dismiss（伝播）にも同じ呼び出しが在るが、**明示に呼ぶ**。
+        // 伝播に頼ると、将来ここへ `cx.stop_propagation()` が入った瞬間に
+        // 「クリックしても打鍵が Web ビューから戻らない」が静かに再発する
+        self.clear_text_input_focus();
         if let Some((col, row, _right)) = self.cell_at(pane_id, event.position, window) {
             let mirror_scrolling = self
                 .scroll_ctls
@@ -17661,6 +17740,9 @@ impl TakoApp {
     /// 先に webviews から外す（remove_pane 側の dock 退避を発火させない）
     fn webview_close_button(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
         if let Some(idx) = self.webviews.iter().position(|e| e.pane == Some(pane_id)) {
+            // #1481: 壊す前に宛先を GPUI へ戻す。宛先のまま消えると
+            // ウィンドウの first responder が宙に浮き、どこへも打鍵が届かない
+            self.return_webview_key_focus(true);
             self.webviews.remove(idx);
             if self.webviews.is_empty() {
                 webview::set_has_webview(false);
@@ -22078,6 +22160,8 @@ impl WebViewHost for TakoApp {
 
     fn web_destroy(&mut self, id: u64) -> Option<PaneId> {
         let idx = self.webviews.iter().position(|e| e.id.as_u64() == id)?;
+        // #1481: 壊す前に宛先を GPUI へ戻す（× ボタンと同じ 1 実装）
+        self.return_webview_key_focus(true);
         let entry = self.webviews.remove(idx);
         if self.webviews.is_empty() {
             webview::set_has_webview(false);
@@ -49686,6 +49770,406 @@ mod self_test {
                         "Web ビュー: notify 無しフレームでも可視状態が変わらない（#838）",
                     );
                 }
+                // #1481: Web ビューを見たあと、ターミナルへ戻れば打鍵が届く。
+                //
+                //   **「届く」を決めているのは AppKit の実体 1 つ**（NSWindow の
+                //   first responder）。他項目の打鍵（`dispatch_keystroke`）は GPUI へ
+                //   直に流すので AppKit の責任連鎖を通らず、この症状は原理的に見えない。
+                //   ここでは宛先そのものを読む（`key_focus_owner` = `クラス名@アドレス`。
+                //   gpui の描画ビュー = tako に届く / `WKWebView` 系 = ページに吸われる。
+                //   アドレスまで見るのは 2 枚のどちらが持っているかを言い分けるため）。
+                //
+                //   ユーザーの「ページをクリックした」は `WebView::focus()`
+                //   （= `makeFirstResponder:webview`）で作る。**クリックが AppKit 層で
+                //   起こすことと同じ**もので、GPUI のマウス経路は通らない
+                //   （ネイティブビューへのクリックは GPUI に見えないため、合成マウスでは
+                //   この前提を作れない）。**実マウスでのクリックは未検証**。
+                //
+                //   宛先の復帰を実時間では測らない（#796）。`clear_text_input_focus` は
+                //   操作と同じターンで走るので、操作 → 1 フレーム描く → 読むで確定する。
+                //
+                //   A/B: `TAKO_1481_LEGACY=1` で「宛先を戻さない」修正前へ戻ると、
+                //   最初の経路（ターミナルをクリック）が `owner=WryWebView` で FAILED に
+                //   なる（セルフテストは最初の失敗で打ち切るので後続はそこまで届かない）
+                #[cfg(target_os = "macos")]
+                {
+                    /// 宛先を読む: (Web ビューが持っているか, 素性, 戻した回数)
+                    fn owner(
+                        window: WindowHandle<TakoApp>,
+                        cx: &mut AsyncApp,
+                    ) -> Option<(bool, String, u64)> {
+                        window
+                            .update(cx, |app, _, _| {
+                                let h = app.window_raw_handle.as_ref()?;
+                                Some((
+                                    webview::webview_holds_key_focus(h),
+                                    webview::key_focus_owner(h),
+                                    app.webview_key_focus_returns,
+                                ))
+                            })
+                            .ok()
+                            .flatten()
+                    }
+                    /// ページのクリック相当（AppKit の宛先を Web ビューへ移す）。
+                    /// **移したことをその場で確かめる**ので、前提が立たない回を
+                    /// 「直った」と読み違えない（#796 / #872 の素通り禁止）
+                    fn grab(
+                        window: WindowHandle<TakoApp>,
+                        cx: &mut AsyncApp,
+                        id: u64,
+                    ) -> bool {
+                        let focused = window
+                            .update(cx, |app, _, _| {
+                                app.webviews
+                                    .iter()
+                                    .find(|e| e.id.as_u64() == id)
+                                    .map(|e| e.view.focus().is_ok())
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                        focused && matches!(owner(window, cx), Some((true, _, _)))
+                    }
+                    let panes = window
+                        .update(cx, |app, _, _| {
+                            let wv_pane = app
+                                .webviews
+                                .iter()
+                                .find(|e| e.id.as_u64() == web_id)
+                                .and_then(|e| e.pane)?;
+                            let term = app.focused_pane();
+                            (term != wv_pane && app.terminals.contains_key(&term))
+                                .then_some((wv_pane, term))
+                        })
+                        .ok()
+                        .flatten();
+                    let Some((wv_pane, term_pane)) = panes else {
+                        fail("項目 71 #1481 の前提（Web ビューとターミナルが同じタブに在る）");
+                    };
+                    // 前提: ページのクリック相当で宛先が Web ビューへ移る。
+                    // ここではまだ描かない（描くと操作扱いの復帰が走る前の素の状態を見たい）
+                    let grabbed = grab(window, cx, web_id);
+                    if !grabbed {
+                        println!("TAKO_WV_KEYFOCUS: grab 失敗 owner={:?}", owner(window, cx));
+                    }
+                    check(
+                        grabbed,
+                        "項目 71 #1481 の前提（ページのクリック相当で宛先が Web ビューへ移る）",
+                    );
+
+                    // 経路 1: ターミナルペインをクリックする（製品と同じハンドラ）
+                    let click_ok = {
+                        let _ = window.update(cx, |app, win, cx| {
+                            let position = app
+                                .pane_text_areas
+                                .iter()
+                                .find(|(p, _)| *p == term_pane)
+                                .map(|(_, area)| area.center())
+                                .unwrap_or_default();
+                            app.hovered_link = None;
+                            app.on_pane_mouse_down(
+                                term_pane,
+                                &MouseDownEvent {
+                                    button: MouseButton::Left,
+                                    position,
+                                    modifiers: Modifiers::default(),
+                                    click_count: 1,
+                                    first_mouse: false,
+                                },
+                                win,
+                                cx,
+                            );
+                        });
+                        notify_and_draw(any, window, cx);
+                        let o = owner(window, cx);
+                        if !matches!(&o, Some((false, _, _))) {
+                            println!("TAKO_WV_KEYFOCUS: click 後 owner={o:?}");
+                        }
+                        matches!(o, Some((false, _, _)))
+                    };
+                    check(
+                        click_ok,
+                        "Web ビューの後にターミナルをクリックすると打鍵の宛先が tako へ戻る (#1481)",
+                    );
+
+                    // 経路 2: `tako focus`（CLI / MCP と同一 dispatch + 後処理）
+                    let focus_ok = grab(window, cx, web_id)
+                        && {
+                            let _ = window.update(cx, |app, _, _| {
+                                let _ = tako_control::dispatch(
+                                    app,
+                                    tako_control::protocol::Request::Focus {
+                                        pane: Some(term_pane.as_u64()),
+                                        direction: None,
+                                    },
+                                    PaneOrigin::Cli,
+                                );
+                                // IPC ループが Focus / TabSelect / Panel の後に行う後処理
+                                app.clear_text_input_focus();
+                            });
+                            notify_and_draw(any, window, cx);
+                            let o = owner(window, cx);
+                            if !matches!(&o, Some((false, _, _))) {
+                                println!("TAKO_WV_KEYFOCUS: tako focus 後 owner={o:?}");
+                            }
+                            matches!(o, Some((false, _, _)))
+                        };
+                    check(
+                        focus_ok,
+                        "`tako focus` で打鍵の宛先が tako へ戻る (#1481)",
+                    );
+
+                    // 経路 3: ⌘数字 = タブ切替（`ActivateTab1` の実体）。
+                    // 別タブへ移ると Web ビューはそのフレームで隠れるので、
+                    // 隠す側（`sync_frame(None)`）でも宛先が戻ることを見る
+                    let tab_ok = {
+                        let other_tab = window
+                            .update(cx, |app, _, _| {
+                                let active = app.workspace.active_tab_id();
+                                app.workspace
+                                    .tabs()
+                                    .iter()
+                                    .map(|t| t.id())
+                                    .find(|id| *id != active)
+                            })
+                            .ok()
+                            .flatten();
+                        match other_tab {
+                            None => {
+                                println!(
+                                    "TAKO_SELF_TEST_SKIPPED: #1481 タブ切替（タブが 1 枚だけ）"
+                                );
+                                true
+                            }
+                            Some(other) => {
+                                let back = window
+                                    .update(cx, |app, _, _| app.workspace.active_tab_id())
+                                    .ok();
+                                let moved = grab(window, cx, web_id)
+                                    && {
+                                        let _ = window.update(cx, |app, _, _| {
+                                            let _ = tako_control::dispatch(
+                                                app,
+                                                tako_control::protocol::Request::TabSelect {
+                                                    tab: other.as_u64(),
+                                                },
+                                                PaneOrigin::Cli,
+                                            );
+                                            app.clear_text_input_focus();
+                                        });
+                                        notify_and_draw(any, window, cx);
+                                        let o = owner(window, cx);
+                                        if !matches!(&o, Some((false, _, _))) {
+                                            println!(
+                                                "TAKO_WV_KEYFOCUS: タブ切替後 owner={o:?}"
+                                            );
+                                        }
+                                        matches!(o, Some((false, _, _)))
+                                    };
+                                // 元のタブへ戻して後続の検査の前提を壊さない
+                                if let Some(back) = back {
+                                    let _ = window.update(cx, |app, _, _| {
+                                        let _ = tako_control::dispatch(
+                                            app,
+                                            tako_control::protocol::Request::TabSelect {
+                                                tab: back.as_u64(),
+                                            },
+                                            PaneOrigin::Cli,
+                                        );
+                                    });
+                                    notify_and_draw(any, window, cx);
+                                }
+                                moved
+                            }
+                        }
+                    };
+                    check(
+                        tab_ok,
+                        "タブ切替（⌘数字）で打鍵の宛先が tako へ戻る (#1481)",
+                    );
+
+                    // URL 入力欄にフォーカスしたあと: アドレスバー編集中は Web ビューを
+                    // 隠して GPUI に画面とキーを渡す（`webview_desired_bounds`）。
+                    // 抜けるのは `clear_text_input_focus`（#503 と同じ集合）
+                    let addr_ok = grab(window, cx, web_id)
+                        && {
+                            let _ = window.update(cx, |app, _, cx| {
+                                app.webview_address_bar
+                                    .insert(wv_pane.as_u64(), (String::new(), 0));
+                                app.webview_address_bar_active = Some(wv_pane);
+                                cx.notify();
+                            });
+                            notify_and_draw(any, window, cx);
+                            let o = owner(window, cx);
+                            if !matches!(&o, Some((false, _, _))) {
+                                println!("TAKO_WV_KEYFOCUS: アドレスバー後 owner={o:?}");
+                            }
+                            // 編集状態から抜けて Web ビューを戻す（close 検査の前提）
+                            let _ = window.update(cx, |app, _, cx| {
+                                app.clear_text_input_focus();
+                                cx.notify();
+                            });
+                            notify_and_draw(any, window, cx);
+                            matches!(o, Some((false, _, _)))
+                        };
+                    check(
+                        addr_ok,
+                        "URL 入力欄にフォーカスしても打鍵の宛先が tako へ戻る (#1481)",
+                    );
+                    // エッジ 1: Web ビューを 2 枚開く。片方のページを触ったあと
+                    // **もう片方の Web ビューのペイン**へフォーカスを移しても、
+                    // 打鍵を tako へ取り上げない（ページを見ているユーザーの入力を
+                    // 奪わない）。宛先はフォーカス側のページへ寄る。
+                    //
+                    // 「寄った」は**宛先オブジェクトの同一性**で見る（`owner` の
+                    // `クラス名@アドレス`）。`document.hasFocus()` では見られない:
+                    // ページの focus は**ウィンドウが key であること**も要求するので、
+                    // 検証用ウィンドウが前面でない環境（#332）では常に false になり、
+                    // 同じソースでも結果が変わる（#796 の禁止事項）
+                    let two_ok = {
+                        let opened2 = window
+                            .update(cx, |app, _, _cx| {
+                                tako_control::dispatch(
+                                    app,
+                                    web_req(
+                                        "open",
+                                        Some("data:text/html,<title>tako-wv-2nd</title>2nd"),
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                    ),
+                                    PaneOrigin::Cli,
+                                )
+                                .ok()
+                                .and_then(|v| Some((v["id"].as_u64()?, v["pane"].as_u64()?)))
+                            })
+                            .ok()
+                            .flatten();
+                        match opened2 {
+                            None => {
+                                println!("TAKO_WV_KEYFOCUS: 2 枚目を開けない");
+                                false
+                            }
+                            Some((web2_id, web2_pane)) => {
+                                notify_and_draw(any, window, cx);
+                                let ok = grab(window, cx, web_id) && {
+                                    // いまは 1 枚目のページが宛先
+                                    let held1 = owner(window, cx);
+                                    let _ = window.update(cx, |app, _, _| {
+                                        let _ = tako_control::dispatch(
+                                            app,
+                                            tako_control::protocol::Request::Focus {
+                                                pane: Some(web2_pane),
+                                                direction: None,
+                                            },
+                                            PaneOrigin::Cli,
+                                        );
+                                        app.clear_text_input_focus();
+                                    });
+                                    notify_and_draw(any, window, cx);
+                                    let held2 = owner(window, cx);
+                                    // ①打鍵は Web ビュー側に残る（tako へ取り上げない）
+                                    // ②戻した回数は増えない ③宛先は別のオブジェクトへ
+                                    //   移った = フォーカス側のページへ寄った
+                                    let ok = match (&held1, &held2) {
+                                        (Some((true, o1, r1)), Some((true, o2, r2))) => {
+                                            r1 == r2 && o1 != o2
+                                        }
+                                        _ => false,
+                                    };
+                                    if !ok {
+                                        println!(
+                                            "TAKO_WV_KEYFOCUS: 2 枚 held1={held1:?} held2={held2:?}"
+                                        );
+                                    }
+                                    ok
+                                };
+                                // 2 枚目を片付ける（以降の検査の前提を戻す）
+                                let _ = window.update(cx, |app, _, _cx| {
+                                    let _ = tako_control::dispatch(
+                                        app,
+                                        web_req("close", None, Some(web2_id), None, None, None),
+                                        PaneOrigin::Cli,
+                                    );
+                                });
+                                notify_and_draw(any, window, cx);
+                                ok
+                            }
+                        }
+                    };
+                    check(
+                        two_ok,
+                        "Web ビューが 2 枚でも打鍵はフォーカス側のページに寄る (#1481)",
+                    );
+
+                    // エッジ 2: Web ビューのペインを別タブへ移す。移った先が非表示タブなら
+                    // そのフレームで隠れる（`sync_frame(None)`）ので宛先は tako へ戻る
+                    let moved_ok = {
+                        let tabs = window
+                            .update(cx, |app, _, _| {
+                                let active = app.workspace.active_tab_id();
+                                let other = app
+                                    .workspace
+                                    .tabs()
+                                    .iter()
+                                    .map(|t| t.id())
+                                    .find(|id| *id != active);
+                                other.map(|o| (active, o))
+                            })
+                            .ok()
+                            .flatten();
+                        match tabs {
+                            None => {
+                                println!(
+                                    "TAKO_SELF_TEST_SKIPPED: #1481 別タブへ移す（タブが 1 枚だけ）"
+                                );
+                                true
+                            }
+                            Some((home, other)) => {
+                                let move_to = |cx: &mut AsyncApp, tab: tako_core::TabId| {
+                                    let _ = window.update(cx, |app, _, _| {
+                                        let _ = tako_control::dispatch(
+                                            app,
+                                            tako_control::protocol::Request::MovePane {
+                                                pane: Some(wv_pane.as_u64()),
+                                                tab: Some(tab.as_u64()),
+                                                target: None,
+                                                direction: None,
+                                                focus: None,
+                                            },
+                                            PaneOrigin::Cli,
+                                        );
+                                        app.clear_text_input_focus();
+                                    });
+                                    notify_and_draw(any, window, cx);
+                                };
+                                let ok = grab(window, cx, web_id) && {
+                                    move_to(cx, other);
+                                    let o = owner(window, cx);
+                                    if !matches!(&o, Some((false, _, _))) {
+                                        println!("TAKO_WV_KEYFOCUS: 別タブへ移した後 owner={o:?}");
+                                    }
+                                    matches!(o, Some((false, _, _)))
+                                };
+                                // 元のタブへ戻す（close 検査はこのタブのペイン数を見る）
+                                move_to(cx, home);
+                                ok
+                            }
+                        }
+                    };
+                    check(
+                        moved_ok,
+                        "Web ビューを別タブへ移すと打鍵の宛先が tako へ戻る (#1481)",
+                    );
+
+                    // close 後の検査（下）のために、宛先を Web ビューへ戻しておく
+                    let grabbed_for_close = grab(window, cx, web_id);
+                    check(
+                        grabbed_for_close,
+                        "項目 71 #1481 の前提（close 前に宛先が Web ビューに在る）",
+                    );
+                }
+
                 // close: 完全破棄 + ペイン数が元に戻る
                 let closed = window
                     .update(cx, |app, _, _cx| {
@@ -49710,6 +50194,28 @@ mod self_test {
                     .flatten()
                     .unwrap_or(false);
                 check(closed, "Web ビュー close（完全破棄 + ペイン後始末）");
+                // #1481: ページごと破棄したあとも打鍵が届く。宛先のまま消えると
+                // ウィンドウの first responder が宙に浮き、どこへも届かなくなる
+                #[cfg(target_os = "macos")]
+                {
+                    let o = window
+                        .update(cx, |app, _, _| {
+                            let h = app.window_raw_handle.as_ref()?;
+                            Some((
+                                webview::webview_holds_key_focus(h),
+                                webview::key_focus_owner(h),
+                            ))
+                        })
+                        .ok()
+                        .flatten();
+                    if !matches!(&o, Some((false, _))) {
+                        println!("TAKO_WV_KEYFOCUS: close 後 owner={o:?}");
+                    }
+                    check(
+                        matches!(o, Some((false, _))),
+                        "Web ビューを閉じたあとも打鍵の宛先が tako に在る (#1481)",
+                    );
+                }
             }
 
             // 72. worker spawn レイアウトエンジン（#165）: OrchestratorSpawn の配置が
