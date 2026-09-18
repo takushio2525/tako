@@ -35,6 +35,18 @@ impl WindowHandleBox {
             .ok()
             .map(|h| Self(h.as_raw()))
     }
+
+    /// wry の親ビュー（macOS では gpui の描画ビュー `GPUIView` の NSView）。
+    /// キー入力の宛先を戻す先の正本（#1481）。macOS 以外では null
+    fn ns_view_ptr(&self) -> *const std::ffi::c_void {
+        #[cfg(target_os = "macos")]
+        {
+            if let raw_window_handle::RawWindowHandle::AppKit(h) = &self.0 {
+                return h.ns_view.as_ptr() as *const std::ffi::c_void;
+            }
+        }
+        std::ptr::null()
+    }
 }
 
 impl raw_window_handle::HasWindowHandle for WindowHandleBox {
@@ -498,6 +510,7 @@ mod key_monitor {
         fn objc_getClass(name: *const u8) -> *const c_void;
         fn sel_registerName(name: *const u8) -> *const c_void;
         fn objc_msgSend(receiver: *const c_void, selector: *const c_void, ...) -> *const c_void;
+        fn object_getClassName(obj: *const c_void) -> *const std::ffi::c_char;
         static _NSConcreteGlobalBlock: c_void;
     }
 
@@ -564,9 +577,126 @@ mod key_monitor {
         WEBVIEW_PASSTHROUGH_KEYS.contains(&key_code)
     }
 
+    // ── キー入力の宛先（first responder）を読む・戻す 1 実装（#326 / #1481） ──
+    //
+    // 「Web ビューがキー入力を持っているか」は**状態ではなく AppKit の実体**で答える
+    // （#503 の教訓 = フラグは必ずどこかで降ろし忘れる）。
+    //
+    // 戻す先は `contentView` では**ない**（#326 の取り違え）。gpui は自前の描画ビューを
+    // ウィンドウの `contentView` の**サブビュー**として足し、そこへ
+    // `makeFirstResponder:` する（gpui_macos/src/window.rs の
+    // `content_view.addSubview_(native_view)` → `makeFirstResponder_(native_view)`）。
+    // つまり `keyDown:` を実装しているのはサブビューの方で、`contentView` は別物
+    // （実測 = `AccessKitSubclassOfNSView`）。`makeFirstResponder:contentView` は
+    // **成功する**（true が返る）のに打鍵は tako へ来ない = 直っていないのに直ったように
+    // 見える形。#326 で ⌘K が効いていたのは `performKeyEquivalent:`（first responder に
+    // 関係なくビュー木を降りる）経路のため。
+    // wry は `build_as_child` で渡した親ビュー（= その描画ビュー）の子として WKWebView を
+    // 足すので、**宛先を持っている WKWebView の superview** が常に正しい宛先になる
+
+    /// NSView の所属 NSWindow（無ければ null）
+    unsafe fn window_of_view(view: *const c_void) -> *const c_void {
+        if view.is_null() {
+            return std::ptr::null();
+        }
+        let f_id: unsafe extern "C" fn(*const c_void, *const c_void) -> *const c_void =
+            std::mem::transmute(objc_msgSend as *const c_void);
+        f_id(view, sel("window"))
+    }
+
+    /// オブジェクトのクラス名（診断用。読めなければ空文字）
+    unsafe fn class_name(obj: *const c_void) -> String {
+        if obj.is_null() {
+            return String::new();
+        }
+        let p = object_getClassName(obj);
+        if p.is_null() {
+            return String::new();
+        }
+        std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+    }
+
+    /// window のキー入力の宛先が Web ビュー側なら、その WKWebView を返す。
+    /// first responder は WKWebView 本体でも内側のサブビュー（WKContentView 等）でも
+    /// ありうるので 2 段で見る
+    unsafe fn webview_holding_focus(window: *const c_void) -> Option<*const c_void> {
+        if window.is_null() {
+            return None;
+        }
+        let f_id: unsafe extern "C" fn(*const c_void, *const c_void) -> *const c_void =
+            std::mem::transmute(objc_msgSend as *const c_void);
+        let f_bool: unsafe extern "C" fn(*const c_void, *const c_void, *const c_void) -> bool =
+            std::mem::transmute(objc_msgSend as *const c_void);
+        let first_resp = f_id(window, sel("firstResponder"));
+        if first_resp.is_null() {
+            return None;
+        }
+        let wk_cls = cls("WKWebView");
+        if wk_cls.is_null() {
+            return None;
+        }
+        let ik_sel = sel("isKindOfClass:");
+        if f_bool(first_resp, ik_sel, wk_cls) {
+            return Some(first_resp);
+        }
+        let parent = f_id(first_resp, sel("superview"));
+        if !parent.is_null() && f_bool(parent, ik_sel, wk_cls) {
+            return Some(parent);
+        }
+        None
+    }
+
+    /// キー入力の宛先が Web ビュー側なら、GPUI の描画ビューへ戻す。戻したら true。
+    /// `preferred` が非 null ならそれを宛先にする（フレーム同期は自ウィンドウの
+    /// 描画ビューを知っている）。null なら実体から引く（monitor は window だけ持つ）
+    unsafe fn restore_from_window(window: *const c_void, preferred: *const c_void) -> bool {
+        let Some(wk) = webview_holding_focus(window) else {
+            return false;
+        };
+        let f_id: unsafe extern "C" fn(*const c_void, *const c_void) -> *const c_void =
+            std::mem::transmute(objc_msgSend as *const c_void);
+        let f_mk: unsafe extern "C" fn(*const c_void, *const c_void, *const c_void) -> bool =
+            std::mem::transmute(objc_msgSend as *const c_void);
+        let target = if preferred.is_null() {
+            f_id(wk, sel("superview"))
+        } else {
+            preferred
+        };
+        if target.is_null() {
+            return false;
+        }
+        f_mk(window, sel("makeFirstResponder:"), target)
+    }
+
+    /// キー入力の宛先が Web ビュー側か（`view` = gpui の描画ビュー）
+    pub(super) fn holds_key_focus(view: *const c_void) -> bool {
+        unsafe { webview_holding_focus(window_of_view(view)).is_some() }
+    }
+
+    /// キー入力の宛先の素性（診断用）。`クラス名@アドレス` の形で、
+    /// **アドレスまで出すのは「宛先が別のオブジェクトへ移ったか」を言い分けるため**
+    /// （Web ビューが 2 枚あるとき、クラス名はどちらも `WryWebView` で区別できない）
+    pub(super) fn owner_class(view: *const c_void) -> String {
+        unsafe {
+            let window = window_of_view(view);
+            if window.is_null() {
+                return String::new();
+            }
+            let f_id: unsafe extern "C" fn(*const c_void, *const c_void) -> *const c_void =
+                std::mem::transmute(objc_msgSend as *const c_void);
+            let first_resp = f_id(window, sel("firstResponder"));
+            format!("{}@{:p}", class_name(first_resp), first_resp)
+        }
+    }
+
+    /// キー入力の宛先を `view`（gpui の描画ビュー）へ戻す。戻したら true
+    pub(super) fn return_to_app(view: *const c_void) -> bool {
+        unsafe { restore_from_window(window_of_view(view), view) }
+    }
+
     /// NSEvent local monitor のコールバック。
-    /// first responder が WKWebView で、tako が処理すべき ⌘ キーなら
-    /// first responder を content view へ戻す。イベント自体は常にそのまま返す
+    /// キー入力の宛先が Web ビューで、tako が処理すべき ⌘ キーなら、宛先を
+    /// GPUI の描画ビューへ戻す（#1481 の 1 実装）。イベント自体は常にそのまま返す
     unsafe extern "C" fn monitor_invoke(
         _block: *const GlobalBlock,
         event: *const c_void,
@@ -603,35 +733,8 @@ mod key_monitor {
         if window.is_null() {
             return event;
         }
-        let first_resp = f_id(window, sel("firstResponder"));
-        if first_resp.is_null() {
-            return event;
-        }
-        // first responder が WKWebView（またはそのサブクラス）かチェック
-        let wk_cls = cls("WKWebView");
-        if wk_cls.is_null() {
-            return event;
-        }
-        let ik_sel = sel("isKindOfClass:");
-        let f_bool: unsafe extern "C" fn(*const c_void, *const c_void, *const c_void) -> bool =
-            std::mem::transmute(objc_msgSend as *const c_void);
-        let is_wk = f_bool(first_resp, ik_sel, wk_cls);
-        if !is_wk {
-            // WKWebView のサブビュー（WKContentView 等）が first responder の場合もある
-            let sv_sel = sel("superview");
-            let parent = f_id(first_resp, sv_sel);
-            if parent.is_null() || !f_bool(parent, ik_sel, wk_cls) {
-                return event;
-            }
-        }
-        // first responder を content view（GPUI のカスタム NSView）へ戻す
-        let content_view = f_id(window, sel("contentView"));
-        if !content_view.is_null() {
-            let mk_sel = sel("makeFirstResponder:");
-            let f_mk: unsafe extern "C" fn(*const c_void, *const c_void, *const c_void) -> bool =
-                std::mem::transmute(objc_msgSend as *const c_void);
-            f_mk(window, mk_sel, content_view);
-        }
+        // キー入力の宛先を GPUI の描画ビューへ戻す（判定・復帰は #1481 の 1 実装）
+        restore_from_window(window, std::ptr::null());
         event
     }
 
@@ -673,8 +776,21 @@ mod key_monitor {
 
 #[cfg(not(target_os = "macos"))]
 mod key_monitor {
+    use std::ffi::c_void;
+
     pub(super) fn install() {}
     pub(super) fn set_has_webview(_: bool) {}
+    /// Windows（WebView2）のキー入力の宛先は #521 で扱う。ここでは「Web ビューが
+    /// 奪っていない」ことにして何もしない（誤って毎フレーム触らないため）
+    pub(super) fn holds_key_focus(_view: *const c_void) -> bool {
+        false
+    }
+    pub(super) fn owner_class(_view: *const c_void) -> String {
+        String::new()
+    }
+    pub(super) fn return_to_app(_view: *const c_void) -> bool {
+        false
+    }
 }
 
 /// NSEvent local monitor を設置する（macOS のみ。#326）。
@@ -686,6 +802,25 @@ pub fn install_key_monitor() {
 /// webview の存在状態を更新する。webview 作成/全破棄のたびに呼ぶ
 pub fn set_has_webview(v: bool) {
     key_monitor::set_has_webview(v);
+}
+
+/// キー入力の宛先（macOS では NSWindow の first responder）が Web ビュー側か（#1481）。
+///
+/// **状態ではなく AppKit の実体を読む**。「さっき Web ビューを触ったか」という印を
+/// 持つと必ずどこかで降ろし忘れる（#503）ので、問うたその場で実体へ聞く
+pub fn webview_holds_key_focus(handle: &WindowHandleBox) -> bool {
+    key_monitor::holds_key_focus(handle.ns_view_ptr())
+}
+
+/// キー入力の宛先の素性（診断用。`クラス名@アドレス`。gpui の描画ビュー = tako に届く /
+/// `WKWebView` 系 = ページに奪われている。アドレスは 2 枚のどちらかを言い分けるため）
+pub fn key_focus_owner(handle: &WindowHandleBox) -> String {
+    key_monitor::owner_class(handle.ns_view_ptr())
+}
+
+/// キー入力の宛先を GPUI の描画ビューへ戻す。実際に戻したら true（#1481）
+pub fn return_key_focus_to_app(handle: &WindowHandleBox) -> bool {
+    key_monitor::return_to_app(handle.ns_view_ptr())
 }
 
 /// ナビゲーションのタイムアウト秒数。

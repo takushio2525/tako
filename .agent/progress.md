@@ -20,16 +20,6 @@
 
 ---
 
-## 2026-09-14（#1467: MCP カタログの enum を正本から生成するようにした）
-- `tako_panel` の `view` が手書きの写し（`["fleet","orch","git","tmux"]`）で #1450 B2 の `tasks` に追従していなかった。`PanelViewWire` へ `summary()` / `accepted_values()` / `values_summary()` を足し、catalog は `panel_view_schema()` で受理値も説明文も生成する。旧称 `tmux` は**落とさない**（enum から消すと今動いているクライアントが送れなくなる）
-- 棚卸し: catalog の `"enum"` は 102 か所 / 値集合 75 種。正本が実行時に読めるのは 10 種（20 site）だけで、うち「MCP の正本」を名乗っていた 5 つ（Panel / ProfileKind / SessionRestartMode / UiMode / RemoteOpenTarget）を生成へ寄せた。残り 52 種は正本なし（action 動詞）か正本が非公開・列挙 API なし = Issue にコメント
-- 番犬 `issue1467_mcp_enum_watchdog`（5 本・注入 8 通り + 実ファイル注入で `catalog.rs:695` を名指し）。スナップショット `mcp_tools_full_snapshot.json` は `tasks` の追加ぶんだけ差分。tools/list 実出力と隔離 GUI の MCP 呼び出しで実測。workspace 4875 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。**install 要**
-
-## 2026-09-14（#1466: worker が起票したユーザータスクの返答を spawn 元の master へ返した）
-- 戻り先の解決順を「名乗った master → ペインの role → **spawn 元**（`spawned_by` を辿る `find_master_suffix_from` = worker spawn の既定と同じ 1 実装）→ 管轄プロファイル（**一意のときだけ**）」へ。判断は `user_tasks::resolve_origin_profile` の純粋関数 1 本で、dispatch は材料を集めるだけ。**新しい永続フィールドは 0**（`spawned_by` と role ラベルは既にある）
-- **解けなければ `default` へ落とさない**（`origin_profile` を `Option` 化。配送は `failed` + `宛先不明: …` で残り `tako todo show` に出る）。名乗り（`created_by`）は戻り先ではなく**呼び出し元自身の役割**から作る（worker が `master:<profile>` を騙らないため）
-- 実測 `scripts/test-user-task-origin-1466.sh` **28 PASS 0 FAIL**（実 spawn の worker → CLI / MCP とも `origin.profile` が spawn 元・返答が master のペインへ・role なし / solo / 管轄なしは `failed`・master を閉じても管轄から同じプロファイルを起こす）。A/B `TAKO_1466_LEGACY=1` で症状再現（無関係な default の master のペインへ届く）。#1450 B1 の e2e 45 PASS 0 FAIL（回帰なし）・番犬 4 本（注入 8 通り）・workspace 4889 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。**install 要**
-
 ## 2026-09-14（#1472 B: スマホのタスク画面で添付をその場で見る・鳴らす）
 - PWA `#/tasks` の詳細で画像を `<img>`（タップで全画面）・動画を `<video controls preload="metadata">` に。**経路は 1 本も増やしていない**: src は既存 `/api/files/download` に `disposition=inline` を足しただけで、認可は `resolve_in_root` のまま（observe は 403・interact はツリー配下だけ）。daemon 側は同じ経路に `Range`（206 + `Content-Range`・416・`Accept-Ranges` 常時）と inline の `Content-Type` を足し、**応答の送出は `respond_file` の 1 か所へ畳んだ**（枝ごとに書くと `no-store` の付け忘れが生えるため）。画像 / 動画の判定と MIME は `tako_core::open_plan` の 1 本（`preview_route` と `media_type` の一致を単体テストが拘束）で、daemon が `attachments[].preview` に載せる = PWA に拡張子の表を作らない
 - 実測: 実経路 `scripts/test-remote-attachment-preview-1472.sh` **59 PASS 0 FAIL**（先頭 / 途中 / 末尾チャンクの**中身が実体と一致**・416・150 MB の部分取得で daemon RSS 23 MB・observe / interact の 403）+ e2e 新 8 本（実 PNG の `naturalWidth` と実 webm の `readyState` / `duration` を実測・**一覧では GET 0 本**）。A/B は daemon 24 件 FAILED / PWA e2e 6 本 FAILED。番犬 6 本・注入 8 通り file:line 名指し
@@ -59,3 +49,8 @@
 - `docs/astro.config.mjs` の `site` を新ドメインへ（canonical / og:url / og:image / sitemap はここ 1 か所が基点なのでまとめて追従）。About の `DOCUMENTATION_URL` は「`site` と同じ URL」という設定コメントの約束があるので同一コミットで動かす
 - 旧ドメインの転送は `docs/functions/_middleware.js` の 301。`*.pages.dev` はゾーン外で Redirect Rules / Bulk Redirects を書けず `_redirects` はホスト名を条件にできないため、Pages Functions が唯一の経路。プレビュー配備を潰さないようホスト名は完全一致で見る
 - OG 画像 31 枚を再生成（フッター文言。未生成だった features/user-tasks もここで揃った）。ビルド 32 ページ緑 / og:verify 緑。カスタムドメインの追加は master が実施
+
+## 2026-09-18（#1481: Web ビューを見たあとターミナルへ戻ったとき打鍵が届かないのを直した）
+- 真因は AppKit 側だった: 宛先を親へ返す `focus_parent()` が `sync_frame` の **hide 分岐にしか無く**（`webview.rs:268`）、Web ビューが見えたままフォーカスが別ペインへ移る経路（`on_pane_mouse_down` / dispatch `Focus`）は `PaneTree` のフォーカスしか動かさない。#326 の NSEvent monitor は **⌘ 修飾つきのキーだけ**（`webview.rs:582`）なので素の打鍵は救われない。破棄（× / `web close`）も宛先を持ったまま壊していた
+- 宛先の読み・戻しを `webview.rs` の 1 実装へ（#326 の monitor も同じ関数を通る）。**戻す先は `contentView` ではなく「宛先を持っている WKWebView の superview」**（実測: contentView = `AccessKitSubclassOfNSView` で `makeFirstResponder:` は成功するのに打鍵は来ない）。呼ぶのは `clear_text_input_focus`（= #503 と同じ全経路）と破棄の直前で、**毎フレームの level 判定にはしない**（「宛先が webview でフォーカスは別ペイン」は「いまページをクリックした」と同じ状態なのでページへ打てなくなる）
+- 実測: 項目 71 に #1481 群 8 件（宛先のクラス名を読む）。legacy `TAKO_1481_LEGACY=1` は `owner=WryWebView returns=0` で FAILED = Issue の症状そのまま / 修正アームは `TAKO_APP_SELF_TEST_OK` 完走。番犬 `issue1481_webview_key_focus_watchdog` 3 本（注入 8 通り）・workspace 4982 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。**実マウスでのクリックと GUI 再起動後の復元は未検証**

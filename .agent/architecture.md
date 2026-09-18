@@ -907,6 +907,45 @@ Windows = WebView2）で実装した。CDP ミラー方式 PoC（ヘッドレス
   UI スレッドで走り、wry のコールバックも UI スレッド配送のため同期待ちは
   デッドロックする（`webview.rs` の設計コメント参照）
 
+### キー入力の宛先は「操作」で戻す（#1481 / #326）
+
+Web ビューはネイティブ子ビューなので、**ページをクリックすると AppKit のキー入力の宛先
+（NSWindow の first responder）が WKWebView へ移る**。tako 側のフォーカス操作は
+`PaneTree` のフォーカスしか動かさないため、放っておくと**ターミナルへ戻っても打鍵が
+ページに吸われ続ける**（#1481 のユーザー報告「ウェブビュー見た後，ターミナルに対する
+プロンプトの入力ができなくなってる」）。
+
+- **読む・戻すは `webview.rs` の 1 実装**（`webview_holding_focus` / `restore_from_window`。
+  公開口は `webview_holds_key_focus` / `key_focus_owner` / `return_key_focus_to_app`）。
+  #326 の NSEvent monitor も同じ関数を通る。`main.rs` から AppKit を直に触らない
+- **戻す先は `contentView` ではなく「宛先を持っている WKWebView の `superview`」**
+  = wry へ渡した親ビュー = gpui の描画ビュー。gpui は描画ビューを contentView の
+  **サブビュー**として足してそこへ `makeFirstResponder:` する（`gpui_macos/src/window.rs`）
+  ので、contentView（実測では `AccessKitSubclassOfNSView`）は `keyDown:` を持たない別物。
+  `makeFirstResponder:contentView` は成功する（true）が打鍵は tako へ来ない。#326 で
+  ⌘K が効いていたのは `performKeyEquivalent:`（first responder に関係なくビュー木を降りる）
+  経路のため
+- **呼ぶのは操作の経路**: `clear_text_input_focus`（= 入力対象が変わる全経路。#503 と
+  同じ集合なのでクリック・⌘数字・`tako focus`・タブ切替・パネル操作が 1 か所で効く）と
+  **Web ビューの破棄の直前**（宛先のまま WKWebView を壊すと宛先が宙に浮く）。
+  隠すときは従来どおり `sync_frame(None)` の `focus_parent()`
+- **2 枚開いているときは寄せ直す**: フォーカスペインが可視の webview なら打鍵は奪わないが、
+  **別の** webview が宛先を持っていたらフォーカス側のページへ `focus()` で寄せる
+  （宛先が GPUI のときはこの経路に来ないので、「ペインを選んだだけでページへ打鍵を渡す」
+  ことにはならない）
+- **毎フレームの level 判定にはできない**: 「宛先が webview で、フォーカスペインはそれ以外」
+  という状態は「たったいまページをクリックした」と「ターミナルへ戻ったのに宛先が残って
+  いる」の**両方で同一**。実体だけからは区別できないので、level で戻すと**ページに文字が
+  打てなくなる**（FR-3.8 を壊す）。どちらが後に起きたかを知っているのは操作の経路だけ
+- 回帰検査はセルフテスト項目 71 の #1481 群（宛先の素性 = `クラス名@アドレス` を読む。
+  打鍵そのものでは見られない = 他項目の `dispatch_keystroke` は GPUI へ直に流れて AppKit の
+  責任連鎖を通らない）と番犬 `issue1481_webview_key_focus_watchdog`。
+  A/B は `TAKO_1481_LEGACY=1`。
+  **ページ側の `document.hasFocus()` は判定に使えない**: ページの focus は
+  「ウィンドウが key であること」も要求するので、検証用ウィンドウが前面でない環境（#332）では
+  常に false になり、同じソースでも結果が変わる（#796）。宛先が**どのオブジェクトか**は
+  first responder のアドレスで言い分ける
+
 ### フレーム同期を「印」でやってはいけない（#838）
 
 2026-08-18 まで、可視性は**印（mark）方式**だった: ペイン本体の render が
