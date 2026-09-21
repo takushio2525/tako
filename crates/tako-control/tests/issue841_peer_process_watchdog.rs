@@ -86,17 +86,10 @@ fn check_single_xff_entry(source: &str, rel: &str) {
         if trimmed.starts_with("//") {
             continue;
         }
-        if let Some(rest) = trimmed
-            .strip_prefix("fn ")
-            .or_else(|| trimmed.strip_prefix("pub fn "))
-            .or_else(|| trimmed.strip_prefix("pub(crate) fn "))
-            .or_else(|| trimmed.strip_prefix("pub(super) fn "))
-        {
-            current = rest
-                .split(['(', '<', ' '])
-                .next()
-                .unwrap_or_default()
-                .to_string();
+        // 関数の頭の判定は 1 実装（旧実装は `async fn` / `const fn` /
+        // `extern "C" fn` を取りこぼし、中の違反を手前の関数名で名指しした = #1496）
+        if let Some(name) = tako_core::source_scan::fn_head_name(trimmed) {
+            current = name.to_string();
         }
         if !line.contains("\"x-forwarded-for\"") {
             continue;

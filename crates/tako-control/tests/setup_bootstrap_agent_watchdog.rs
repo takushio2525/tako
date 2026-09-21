@@ -87,10 +87,18 @@ fn claude既定の引数なし入口が生えていない() {
     let mut offenders = Vec::new();
     for line in src.lines() {
         let trimmed = line.trim_start();
-        let Some(rest) = trimmed.strip_prefix("pub fn ") else {
+        // 入口 = 外から呼べる関数。頭の判定は 1 実装を通す（旧実装の
+        // `strip_prefix("pub fn ")` は `pub async fn` / `pub(crate) fn` を
+        // 取りこぼしていた = #1496 と同型の癖）
+        let Some(name) = tako_core::source_scan::fn_head_name(trimmed) else {
             continue;
         };
-        let Some((name, args)) = rest.split_once('(') else {
+        if !trimmed.starts_with("pub") {
+            continue;
+        }
+        // 引数リストは**関数名の直後**から見る（`pub(crate)` の括弧を引数の
+        // `(` と間違えない）
+        let Some((_, args)) = line.split_once(name).and_then(|(_, a)| a.split_once('(')) else {
             continue;
         };
         if !AGENT_SCOPED.contains(&name) {

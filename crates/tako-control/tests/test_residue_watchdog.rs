@@ -117,43 +117,26 @@ fn collect_sites(src: &str, file: &str, out: &mut Vec<Site>) {
     }
 }
 
-/// `at` を含む**トップレベル関数**の名前と本体（先頭が `fn ` / `pub fn ` の行から、
-/// 桁 0 の `}` まで。`rustfmt` がこの形を保証する）
+/// `at` を含む**トップレベル関数**の名前と本体（桁 0 の関数の頭から、
+/// 桁 0 の `}` まで。`rustfmt` がこの形を保証する）。
+///
+/// 頭の判定と名前の抽出は `tako_core::source_scan` の 1 実装を通す。
+/// `extern "C" fn` / `pub(crate) fn` / `pub async fn` を取りこぼすと
+/// **中の削除が別の関数のものに見える**（#1496 と同じ誤報の原因）
 fn enclosing_fn(src: &str, at: usize) -> (String, String) {
     let head = src[..at]
         .rmatch_indices('\n')
         .map(|(i, _)| i + 1)
-        .find(|&i| is_fn_head(&src[i..]))
+        .find(|&i| tako_core::source_scan::is_top_level_fn_head(&src[i..]))
         .unwrap_or(0);
-    let name = src[head..]
-        .split_once("fn ")
-        .and_then(|(_, rest)| rest.split(['(', '<']).next())
+    let name = tako_core::source_scan::fn_head_name(&src[head..])
         .unwrap_or("?")
-        .trim()
         .to_string();
     let end = src[head..]
         .find("\n}\n")
         .map(|i| head + i)
         .unwrap_or(src.len());
     (name, src[head..end].to_string())
-}
-
-/// 桁 0 から始まる関数定義の頭か。`extern "C" fn` / `pub(crate) fn` を
-/// 取りこぼすと**中の削除が別の関数のものに見える**（誤検知の原因）
-fn is_fn_head(line: &str) -> bool {
-    const HEADS: &[&str] = &[
-        "fn ",
-        "pub fn ",
-        "pub(crate) fn ",
-        "pub(super) fn ",
-        "const fn ",
-        "unsafe fn ",
-        "async fn ",
-        "extern ",
-        "pub extern ",
-        "unsafe extern ",
-    ];
-    HEADS.iter().any(|h| line.starts_with(h)) && line.contains("fn ")
 }
 
 /// 1: 作る経路は消す経路を持つ

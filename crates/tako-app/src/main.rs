@@ -77514,6 +77514,27 @@ mod pane_content_geometry_tests {
 /// 新しい kill 経路が生えたらここで落ちるようにする。
 #[cfg(test)]
 mod session_kill_boundary_tests {
+    /// 違反行を「囲んでいる関数名」つきで集める（`(行番号, 関数名)`）。
+    ///
+    /// **実ファイルにも注入した文字列にも同じ物差しを当てられるよう**、走査だけを
+    /// 切り出してある（実ファイルの違反は 0 件なので、名指しが嘘でも緑のまま気づけない）。
+    /// 関数の頭の判定は `tako_core::source_scan::fn_head_name` の 1 実装を通す
+    /// （`pub(crate) fn` / `async fn` を頭と見なさないと、中の違反が**手前の関数名**で
+    /// 報告される = #1496 の実例）
+    fn sites_with_enclosing_fn(text: &str, hit: impl Fn(&str) -> bool) -> Vec<(usize, String)> {
+        let mut current_fn = String::from("(ファイル先頭)");
+        let mut out = Vec::new();
+        for (i, line) in text.lines().enumerate() {
+            if let Some(name) = tako_core::source_scan::fn_head_name(line) {
+                current_fn = name.to_string();
+            }
+            if hit(line) {
+                out.push((i + 1, current_fn.clone()));
+            }
+        }
+        out
+    }
+
     /// `drop_backend_session`（= 実際に kill を撃つ唯一の入口）を呼んでよい場所。
     /// 追加するときは必ず理由を書く（黙って穴を開けない）
     const ALLOWED_CALLERS: &[(&str, &str)] = &[
@@ -77556,18 +77577,12 @@ mod session_kill_boundary_tests {
         let mut offenders = Vec::new();
         for rel in files {
             let text = source(rel);
-            let mut current_fn = String::from("(ファイル先頭)");
-            for (i, line) in text.lines().enumerate() {
-                if let Some(rest) = line.trim_start().strip_prefix("fn ") {
-                    current_fn = rest.split('(').next().unwrap_or("").to_string();
-                }
-                // 呼び出し形（レシーバつき）だけを見る。定義・ドキュメント中の言及は無視
-                if !line.contains(".drop_backend_session(") {
-                    continue;
-                }
+            // 呼び出し形（レシーバつき）だけを見る。定義・ドキュメント中の言及は無視
+            let sites = sites_with_enclosing_fn(&text, |l| l.contains(".drop_backend_session("));
+            for (line, current_fn) in sites {
                 let allowed = ALLOWED_CALLERS.iter().any(|(f, _)| *f == current_fn);
                 if !allowed {
-                    offenders.push(format!("{rel}:{} （{current_fn} の中）", i + 1));
+                    offenders.push(format!("{rel}:{line} （{current_fn} の中）"));
                 }
             }
         }
@@ -77594,27 +77609,99 @@ mod session_kill_boundary_tests {
             "remove_tab",             // 既定の発生源を GUI タブ × とするヘルパ
         ];
         let text = source("src/main.rs");
-        let mut current_fn = String::from("(ファイル先頭)");
-        let mut offenders = Vec::new();
-        for (i, line) in text.lines().enumerate() {
-            if let Some(rest) = line.trim_start().strip_prefix("fn ") {
-                current_fn = rest.split('(').next().unwrap_or("").to_string();
-            }
-            // 発生源として**渡している**行だけを見る。`.marker()` は
-            // 期待値を引くだけの読み取り（セルフテストの検査など）なので対象外
-            if !line.contains("CloseOrigin::TabButton") || line.contains(".marker()") {
-                continue;
-            }
-            if !ALLOWED_FNS.contains(&current_fn.as_str()) {
-                offenders.push(format!("src/main.rs:{} （{current_fn} の中）", i + 1));
-            }
-        }
+        // 発生源として**渡している**行だけを見る。`.marker()` は
+        // 期待値を引くだけの読み取り（セルフテストの検査など）なので対象外
+        let offenders: Vec<String> = sites_with_enclosing_fn(&text, |l| {
+            l.contains("CloseOrigin::TabButton") && !l.contains(".marker()")
+        })
+        .into_iter()
+        .filter(|(_, current_fn)| !ALLOWED_FNS.contains(&current_fn.as_str()))
+        .map(|(line, current_fn)| format!("src/main.rs:{line} （{current_fn} の中）"))
+        .collect();
         assert!(
             offenders.is_empty(),
             "close:gui-tab を GUI のタブ × 以外が名乗っている:\n  {}\n\
              → 発生源が混ざると「再起動で消えた / 明示 close で消えた」の\
              事後切り分けができなくなる（#566 / #770）",
             offenders.join("\n  ")
+        );
+    }
+
+    /// **#1496 の材料**: 違反の名指しが、可視性修飾子つきの関数でも正しいこと。
+    ///
+    /// 実ファイルではなく**注入した材料**で固定する（実ファイルの違反は 0 件なので、
+    /// 名指しが嘘でも緑のまま気づけない）。旧規則を同じテストの中に並べて、
+    /// **直す前は手前の関数名になる**ことも同じ実行の中で見せる。
+    #[test]
+    fn 違反の名指しは可視性修飾子つきの関数でも正しい() {
+        /// 旧規則（#1496 で直した形 = `fn ` で始まる行だけを頭と見なす）。
+        /// 番犬の関数名追跡の直書きはこの 1 箇所だけ許してある
+        /// （`issue1496_fn_head_watchdog` の許可リストに理由つきで載せた）
+        fn legacy(text: &str, needle: &str) -> Vec<(usize, String)> {
+            let mut current_fn = String::from("(ファイル先頭)");
+            let mut out = Vec::new();
+            for (i, line) in text.lines().enumerate() {
+                if let Some(rest) = line.trim_start().strip_prefix("fn ") {
+                    current_fn = rest.split('(').next().unwrap_or("").to_string();
+                }
+                if line.contains(needle) {
+                    out.push((i + 1, current_fn.clone()));
+                }
+            }
+            out
+        }
+
+        // #1491 の worker が踏んだ形そのもの（#1496 の症状の再現）
+        let material = "\
+impl Workspace {
+    fn shelved_tab_groups(&self) -> Vec<ShelvedTabGroup> {
+        Vec::new()
+    }
+
+    pub(crate) fn kill_shelved_tab_clicked(&mut self) {
+        self.remove_tab(idx, CloseOrigin::TabButton);
+    }
+
+    pub fn close_from_menu(&mut self) {
+        self.remove_tab(idx, CloseOrigin::TabButton);
+    }
+
+    async fn close_later(&mut self) {
+        self.remove_tab(idx, CloseOrigin::TabButton);
+    }
+}
+";
+        let hit = |l: &str| l.contains("CloseOrigin::TabButton");
+        let fixed: Vec<String> = sites_with_enclosing_fn(material, hit)
+            .into_iter()
+            .map(|(_, f)| f)
+            .collect();
+        assert_eq!(
+            fixed,
+            vec![
+                "kill_shelved_tab_clicked".to_string(),
+                "close_from_menu".to_string(),
+                "close_later".to_string(),
+            ],
+            "可視性修飾子・async つきの関数の中の違反が、その関数名で名指しされていない（#1496）"
+        );
+
+        // 旧規則は 3 件とも**手前の `fn shelved_tab_groups`** を名乗る（= Issue の症状）
+        let before: Vec<String> = legacy(material, "CloseOrigin::TabButton")
+            .into_iter()
+            .map(|(_, f)| f)
+            .collect();
+        assert_eq!(
+            before,
+            vec!["shelved_tab_groups".to_string(); 3],
+            "旧規則の再現が壊れている（この材料は #1496 の症状を再現するためのもの）"
+        );
+
+        // 検出力そのもの（何件見つけるか）は旧規則と変わらない = 名指しだけを直した
+        assert_eq!(
+            sites_with_enclosing_fn(material, hit).len(),
+            legacy(material, "CloseOrigin::TabButton").len(),
+            "見つける件数が変わっている（#1496 で直したのは名指しだけ）"
         );
     }
 

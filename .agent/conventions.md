@@ -1407,6 +1407,24 @@ claude は空欄へ **AI のゴースト提案**を dim で描き、文面は
   実時間の値 **1 つ**と `Duration::from_*` の比較（絶対予算）は、
   `ABSOLUTE_BUDGET_ALLOWLIST` に**根拠つきで宣言したものだけ**許す（#962）
 
+### 番犬の関数名追跡は共有ヘルパを使う（Issue #1496）
+
+違反行を**囲んでいる関数名**で名指しする番犬は、関数の頭の判定を
+`tako_core::source_scan::fn_head_name`（トップレベル限定は `is_top_level_fn_head`）へ
+通す。`line.trim_start().strip_prefix("fn ")` で書くと **`pub(crate) fn` / `async fn` が
+関数の頭に見えない**ので、中の違反が**手前の関数名**で報告される。
+
+- 壊れ方が「落ちない」ではなく**「落ちるが嘘をつく」**なので、テストは緑のまま残る。
+  実例は `pub(crate) fn kill_shelved_tab_clicked` の中の違反が
+  `fn shelved_tab_groups` の中として報告されたもの（#1491 の worker が観測）
+- 置き場が tako-core なのは、同じ追跡をする番犬が **tako-app の
+  `#[cfg(test)] mod`（`src/main.rs`）と tako-control の `tests/`** の両方にあるため。
+  クレートを跨いだ `#[path]` は tako-app のビルドを別クレートのテスト配置に縛る
+- 番犬 `issue1496_fn_head_watchdog` が ①直書きの再発（許可は理由つき 1 件）
+  ②寄せ先が実際にヘルパを呼んでいること を止める。棚卸しの全文は同ファイルの冒頭
+- `fn ` を**語として**探す位置ベースの走査（`test_timing_watchdog` の `enclosing_fn` /
+  `ui_text/lang_watchdog` の `fn_defs`）は修飾子に依らないので対象外
+
 ### 絶対予算は「桁が開いている」ことを宣言して置く（Issue #962）
 
 単一の絶対予算（`assert!(elapsed < Duration::from_secs(N), …)`）そのものは悪ではないが、
