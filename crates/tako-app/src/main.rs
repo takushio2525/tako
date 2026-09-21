@@ -55,6 +55,7 @@ mod ssh_folders;
 mod starter;
 mod status_bar;
 mod tab_bar;
+mod tab_shape;
 mod tasks_panel;
 mod terminal_grid;
 mod text_field;
@@ -2002,6 +2003,10 @@ struct TakoApp {
     drawer_height: f32,
     /// バックグラウンド内のペインの kill 確認待ち
     bg_pending_kill: Option<PaneId>,
+    /// 退避タブの kill 確認待ち（#1491。タブ形カードの × = タブごと kill の 1 段目）
+    bg_pending_kill_tab: Option<TabId>,
+    /// 右パネルで配下ペイン行を開いている退避タブ（#1491。既定は畳んだ状態）
+    shelved_tab_expanded: std::collections::HashSet<TabId>,
     /// サイドバー tmux ビューでホバー中のプレビュー（FR-2.16.13。バックグラウンド行 /
     /// 閉じたタブグループの中身をマウス位置のポップアップで覗く）
     hover_preview: Option<HoverPreview>,
@@ -3938,6 +3943,8 @@ impl TakoApp {
             drawer_visible: false,
             drawer_height: DRAWER_DEFAULT_HEIGHT,
             bg_pending_kill: None,
+            bg_pending_kill_tab: None,
+            shelved_tab_expanded: std::collections::HashSet::new(),
             hover_preview: None,
             workers_menu_open: None,
             known_failed: std::collections::HashSet::new(),
@@ -6223,11 +6230,49 @@ impl TakoApp {
         for pane in panes {
             self.reattach_backgrounded_preview(pane);
         }
+        // 戻したタブの確認待ち・展開状態を持ち越さない（#1491。次に退避したとき
+        // いきなり「完全に破棄?」が出ていると、押した覚えのない確認に見える）
+        self.forget_shelved_tab_ui_state(tab_id);
         if self.workspace.shelved_panes().is_empty() && self.workspace.shelved_tabs().is_empty() {
             self.drawer_visible = false;
         }
         self.sync_preview_watches();
         cx.notify();
+    }
+
+    /// 退避タブを**タブごと kill** する（#1491。タブ形カードの × → 「はい」）。
+    ///
+    /// タブバーのタブの × と同じ意味で、配下の全ペイン（退避タブの分割ツリー +
+    /// 同じ由来の平坦な退避 = カードが数えている `entries` そのもの）を落とす。
+    /// 1 本ずつの後始末は [`Self::kill_shelved_pane`] の 1 実装を通す（#775 で
+    /// worker レジストリの記録がこの経路だけ抜けた前例がある）。
+    /// 空になった退避タブは tako-core 側（`shelved_tab_fate`）が畳む
+    pub(crate) fn kill_shelved_tab_clicked(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
+        let panes: Vec<PaneId> = self
+            .background_entries_of_tab(tab_id)
+            .into_iter()
+            .map(|e| e.pane)
+            .collect();
+        for pane in panes {
+            // 発生源は**たまり場カードの ×** と同じ `PaneButton`（#770 の境界）。
+            // `TabButton` = `close:gui-tab` は「タブバーの × が押された」ことの
+            // 事後証拠として意味を固定してある（番犬 `タブcloseの発生源はgui経路だけが名乗る`）
+            // ので、たまり場から破棄した分をそこへ混ぜない
+            self.kill_shelved_pane(pane, tako_core::pane_log::CloseOrigin::PaneButton);
+        }
+        self.forget_shelved_tab_ui_state(tab_id);
+        if self.workspace.shelved_panes().is_empty() && self.workspace.shelved_tabs().is_empty() {
+            self.drawer_visible = false;
+        }
+        cx.notify();
+    }
+
+    /// 退避タブに紐づく UI 側の一時状態（確認待ち・展開）を捨てる（#1491）
+    fn forget_shelved_tab_ui_state(&mut self, tab_id: TabId) {
+        if self.bg_pending_kill_tab == Some(tab_id) {
+            self.bg_pending_kill_tab = None;
+        }
+        self.shelved_tab_expanded.remove(&tab_id);
     }
 
     /// 由来タブが既に閉じているバックグラウンドペインを、由来タブごとにまとめて返す（FR-2.15.6）。
@@ -40527,7 +40572,7 @@ mod self_test {
     }
 
     /// タブバーの「ー」を**実マウスで**押すとタブが 1 単位で退避し、たまり場の
-    /// 「タブごと復帰」で**分割ツリーのまま**元の位置へ戻るか（#1487）。
+    /// 退避タブの**タブ形カード本体**を押して分割ツリーのまま元の位置へ戻るか（#1487 / #1491）。
     ///
     /// ハンドラ直呼び（`background_tab` を直接叩く形）は #496 型
     /// （押下の mouse_down で自分が消えて `on_click` が発火しない）を検出できないので、
@@ -40660,7 +40705,7 @@ mod self_test {
             }
         }
 
-        // ② たまり場の「タブごと復帰」を実マウスで押す → 元の位置・ツリーで戻る
+        // ② たまり場のタブ形カード**本体の中央**を実マウスで押す → 元の位置・ツリーで戻る（#1491）
         window
             .update(cx, |app: &mut TakoApp, _, cx| {
                 app.drawer_visible = true;
@@ -40671,8 +40716,31 @@ mod self_test {
         notify_and_draw(any, window, cx);
         wait(cx, 250).await;
         notify_and_draw(any, window, cx);
-        match probe1487(cx, format!("drawer-restore-tab-{}", tab1487.as_u64())) {
-            None => check(false, "153: たまり場に「タブごと復帰」が出ない (#1487)"),
+        // 退避タブは**タブ形カード 1 枚**（「タブごと復帰」ボタン 0・ペインカード 0）。#1491
+        let card_key1491 = format!("drawer-shelved-tab-{}", tab1487.as_u64());
+        let shape = window
+            .update(cx, |app: &mut TakoApp, _, _| {
+                let probes = app.panel_click_probe_bounds.borrow();
+                let count = |prefix: &str| probes.keys().filter(|k| k.starts_with(prefix)).count();
+                (
+                    usize::from(probes.contains_key(&card_key1491)),
+                    count("drawer-restore-tab-"),
+                    count("drawer-shelf-card-"),
+                )
+            })
+            .unwrap_or((0, 9, 9));
+        check(
+            shape == (1, 0, 0),
+            "153: たまり場は「タブ形カード 1 枚」で復帰ボタンもペインカードも無い (#1491)",
+        );
+        // 見た目そのものが変更点なので、実フレームを残せるようにしておく（#1491）
+        if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+            if let Some((frame, _)) = capture_frame(any, cx) {
+                let _ = frame.save(std::path::Path::new(&dump).join("shelve-tab-drawer-card.png"));
+            }
+        }
+        match probe1487(cx, format!("drawer-shelved-tab-{}", tab1487.as_u64())) {
+            None => check(false, "153: たまり場にタブ形カードが出ない (#1491)"),
             Some(rect) => {
                 click_at(any, cx, rect.center());
                 wait(cx, 250).await;
@@ -40688,7 +40756,7 @@ mod self_test {
                     .unwrap_or((9, false, false));
                 check(
                     restored == (0, true, true),
-                    "153: 「タブごと復帰」で元の並び位置へ戻る (#1487)",
+                    "153: カード本体のクリックで元の並び位置へ戻る (#1491)",
                 );
             }
         }
@@ -40698,6 +40766,112 @@ mod self_test {
             "153: 分割ツリー・比率・タイトルが退避前と一致する (#1487)",
         );
 
+        // --- ③ 右パネルも同じタブ形カード（本体クリックで復帰・▸ でペイン行）。#1491 ---
+        if let Some(rect) = probe1487(cx, format!("tab-bg-{}", tab1487.as_u64())) {
+            click_at(any, cx, rect.center());
+            wait(cx, 200).await;
+        }
+        window
+            .update(cx, |app: &mut TakoApp, _, cx| {
+                app.drawer_visible = false;
+                app.panel_visible = true;
+                app.panel_view = PanelView::Fleet;
+                app.panel_click_probe_bounds.borrow_mut().clear();
+                cx.notify();
+            })
+            .ok();
+        notify_and_draw(any, window, cx);
+        wait(cx, 250).await;
+        notify_and_draw(any, window, cx);
+        let panel_card_key = format!("panel-shelved-tab-{}", tab1487.as_u64());
+        let panel_shape = window
+            .update(cx, |app: &mut TakoApp, _, _| {
+                let probes = app.panel_click_probe_bounds.borrow();
+                (
+                    usize::from(probes.contains_key(&panel_card_key)),
+                    probes
+                        .keys()
+                        .filter(|k| k.starts_with("panel-bg-row-"))
+                        .count(),
+                    probes
+                        .keys()
+                        .filter(|k| k.starts_with("panel-restore-tab-"))
+                        .count(),
+                )
+            })
+            .unwrap_or((0, 9, 9));
+        check(
+            panel_shape == (1, 0, 0),
+            "153: 右パネルもタブ形カード 1 枚で、ペイン行は畳まれている (#1491)",
+        );
+        if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+            if let Some((frame, _)) = capture_frame(any, cx) {
+                let _ = frame.save(std::path::Path::new(&dump).join("shelve-tab-panel-card.png"));
+            }
+        }
+        // ▸ を開くと配下ペインの行が出る（個別復帰はこの行から）
+        match probe1487(cx, format!("panel-shelved-tab-toggle-{}", tab1487.as_u64())) {
+            None => check(false, "153: 右パネルのカードに ▸ が無い (#1491)"),
+            Some(rect) => {
+                click_at(any, cx, rect.center());
+                wait(cx, 250).await;
+                notify_and_draw(any, window, cx);
+                wait(cx, 200).await;
+                notify_and_draw(any, window, cx);
+                let rows = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        let probes = app.panel_click_probe_bounds.borrow();
+                        (
+                            probes
+                                .keys()
+                                .filter(|k| k.starts_with("panel-bg-row-"))
+                                .count(),
+                            probes
+                                .keys()
+                                .filter(|k| k.starts_with("panel-bg-restore-"))
+                                .count(),
+                        )
+                    })
+                    .unwrap_or((0, 0));
+                check(
+                    rows == (3, 3),
+                    "153: ▸ を開くと配下 3 ペインの行（個別復帰つき）が出る (#1491)",
+                );
+            }
+        }
+        // 右パネルのカード本体クリックでもタブごと戻る
+        match probe1487(cx, panel_card_key.clone()) {
+            None => check(false, "153: 右パネルにタブ形カードが出ない (#1491)"),
+            Some(rect) => {
+                click_at(any, cx, rect.center());
+                wait(cx, 250).await;
+                let restored = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        (
+                            app.workspace.shelved_tabs().len(),
+                            app.workspace.get_tab(tab1487).is_some(),
+                        )
+                    })
+                    .unwrap_or((9, false));
+                check(
+                    restored == (0, true),
+                    "153: 右パネルのカード本体クリックで復帰する (#1491)",
+                );
+            }
+        }
+        let after1491 = snapshot(cx, tab1487);
+        check(
+            after1491.is_some() && before1487 == after1491,
+            "153: 右パネル経由でも分割ツリー・比率・タイトルが一致する (#1491)",
+        );
+        window
+            .update(cx, |app: &mut TakoApp, _, cx| {
+                app.panel_visible = false;
+                let _ = app.workspace.activate_tab(tab1487);
+                cx.notify();
+            })
+            .ok();
+
         // --- 後片付け: 作ったペイン / タブを畳む（後続の節へ持ち込まない）---
         window
             .update(cx, |app: &mut TakoApp, _, cx| {
@@ -40706,6 +40880,120 @@ mod self_test {
                     let _ = app.workspace.active_tab_mut().tree_mut().close(*pane);
                     app.terminals.remove(pane);
                 }
+                cx.notify();
+            })
+            .ok();
+        // --- ④ カード右端の × は 2 段確認を通り、確定でタブ配下の全ペインを kill する（#1491）---
+        // 本番タブ（tab1487 = 起動時のタブ）を壊さないよう、使い捨ての 3 ペインタブで試す
+        let kill_target = window
+            .update(cx, |app: &mut TakoApp, _, cx| {
+                let tab = app
+                    .workspace
+                    .create_tab("破棄検証", Pane::new(PaneOrigin::User));
+                app.workspace.activate_tab(tab).ok()?;
+                let root = app.workspace.active_tab().tree().focused();
+                let p2 = Pane::new(PaneOrigin::User);
+                let p2_id = p2.id();
+                let ok2 = app
+                    .workspace
+                    .active_tab_mut()
+                    .tree_mut()
+                    .split_with_ratio(root, SplitDirection::Right, 0.5, p2)
+                    .is_ok();
+                let ok3 = app
+                    .workspace
+                    .active_tab_mut()
+                    .tree_mut()
+                    .split_with_ratio(
+                        p2_id,
+                        SplitDirection::Down,
+                        0.5,
+                        Pane::new(PaneOrigin::User),
+                    )
+                    .is_ok();
+                app.drawer_visible = false;
+                app.panel_click_probe_bounds.borrow_mut().clear();
+                cx.notify();
+                (ok2 && ok3).then_some(tab)
+            })
+            .ok()
+            .flatten();
+        if let Some(target) = kill_target {
+            notify_and_draw(any, window, cx);
+            wait(cx, 200).await;
+            notify_and_draw(any, window, cx);
+            // タブバーの「ー」で 3 ペインのまま退避 → たまり場を開く
+            if let Some(rect) = probe1487(cx, format!("tab-bg-{}", target.as_u64())) {
+                click_at(any, cx, rect.center());
+                wait(cx, 200).await;
+            }
+            window
+                .update(cx, |app: &mut TakoApp, _, cx| {
+                    app.drawer_visible = true;
+                    app.panel_click_probe_bounds.borrow_mut().clear();
+                    cx.notify();
+                })
+                .ok();
+            notify_and_draw(any, window, cx);
+            wait(cx, 250).await;
+            notify_and_draw(any, window, cx);
+
+            // 1 段目: × を押しても消えない（確認が出るだけ）
+            match probe1487(cx, format!("drawer-shelved-tab-kill-{}", target.as_u64())) {
+                None => check(false, "153: タブ形カードに × が出ない (#1491)"),
+                Some(rect) => {
+                    click_at(any, cx, rect.center());
+                    wait(cx, 200).await;
+                    let after_first = window
+                        .update(cx, |app: &mut TakoApp, _, _| {
+                            (
+                                app.workspace.shelved_tabs().len(),
+                                app.workspace.all_background_panes().len(),
+                                app.bg_pending_kill_tab == Some(target),
+                            )
+                        })
+                        .unwrap_or((0, 0, false));
+                    check(
+                        after_first == (1, 3, true),
+                        "153: × の 1 回目は確認が出るだけで消えない (#1491)",
+                    );
+                }
+            }
+            notify_and_draw(any, window, cx);
+            wait(cx, 200).await;
+            notify_and_draw(any, window, cx);
+
+            // 2 段目: 「はい」で配下 3 ペインごと退避タブが消える
+            match probe1487(cx, format!("drawer-shelved-tab-yes-{}", target.as_u64())) {
+                None => check(false, "153: × の確認（はい）が出ない (#1491)"),
+                Some(rect) => {
+                    click_at(any, cx, rect.center());
+                    wait(cx, 250).await;
+                    let after_yes = window
+                        .update(cx, |app: &mut TakoApp, _, _| {
+                            (
+                                app.workspace.shelved_tabs().len(),
+                                app.workspace.all_background_panes().len(),
+                                app.workspace.get_tab(target).is_some(),
+                            )
+                        })
+                        .unwrap_or((9, 9, true));
+                    check(
+                        after_yes == (0, 0, false),
+                        "153: 確定で配下 3 ペインごと退避タブが消える (#1491)",
+                    );
+                }
+            }
+        } else {
+            check(false, "153: × 検証用のタブを組めない (#1491)");
+        }
+
+        // --- 後片付け: 元のタブへ戻す（後続の節は「アクティブタブ = 起動時のタブ」を前提にする）---
+        window
+            .update(cx, |app: &mut TakoApp, _, cx| {
+                app.drawer_visible = false;
+                app.bg_pending_kill_tab = None;
+                let _ = app.workspace.activate_tab(tab1487);
                 cx.notify();
             })
             .ok();

@@ -565,6 +565,7 @@ impl TakoApp {
         };
         let mut row = div()
             .id(("tmux-bg-row", pane_id.as_u64()))
+            .relative()
             .flex()
             .flex_row()
             .items_center()
@@ -613,6 +614,7 @@ impl TakoApp {
         .child(
             div()
                 .id(("tmux-bg-restore", pane_id.as_u64()))
+                .relative()
                 .px_1()
                 .rounded_sm()
                 .cursor_pointer()
@@ -622,8 +624,18 @@ impl TakoApp {
                 .child("⬆")
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.shelved_restore_clicked(pane_id, cx);
-                })),
+                }))
+                // #1491: ▸ を開いたペイン行から個別復帰できることを合成マウスで読む
+                .child(crate::tab_shape::probe_canvas(
+                    self.panel_click_probe_bounds.clone(),
+                    format!("panel-bg-restore-{}", pane_id.as_u64()),
+                )),
         )
+        // #1491: 「畳んだ状態では行が出ない」を数えるための実矩形
+        .child(crate::tab_shape::probe_canvas(
+            self.panel_click_probe_bounds.clone(),
+            format!("panel-bg-row-{}", pane_id.as_u64()),
+        ))
     }
 
     /// 統合 tmux ビュー（FR-2.16.6〜2.16.9。旧 tmuxview FR-2.13 + 集約センター FR-2.10 の
@@ -2195,9 +2207,13 @@ impl TakoApp {
             root = root.child(card);
         }
 
-        // #1487: タブ単位で退避したタブは 1 枚のカード（タブ名 + ペイン数 + タブごと復帰）。
-        // 一括プレビュー（FR-2.16.16）とピン留めは `PreviewTarget::ClosedGroup` を流用する
-        // （退避タブ ID も `background_entries_of_tab` が解決できるようにしてある）
+        // #1487 / #1491: タブ単位で退避したタブは**タブバーのタブと同じ形のカード 1 枚**
+        // （状態ドット + タブ名 + ペイン数 + ×）。本体クリックで復帰し、配下ペインの行は
+        // カードの下へ畳んで ▸ で開く。一括プレビュー（FR-2.16.16）とピン留めは
+        // `PreviewTarget::ClosedGroup` を流用する（退避タブ ID も
+        // `background_entries_of_tab` が解決できるようにしてある）。
+        // A/B（#1489 の形）の env を読むのは `tab_shape` の 1 か所
+        let legacy1491 = crate::tab_shape::shelved_tab_card_legacy();
         let shelved_tabs = self.shelved_tab_groups();
         if !shelved_tabs.is_empty() {
             root = root.child(
@@ -2214,8 +2230,8 @@ impl TakoApp {
                 .pinned_previews
                 .iter()
                 .any(|p| p.target == PreviewTarget::ClosedGroup(tab_id));
-            let probe = self.panel_click_probe_bounds.clone();
-            let probe_key = format!("panel-restore-tab-{}", tab_id.as_u64());
+            // #1491: 配下のペイン行（個別復帰・kill）はカードの下へ畳み、▸ で開く
+            let expanded = self.shelved_tab_expanded.contains(&tab_id);
             let mut card = div()
                 .id(("panel-shelved-tab", tab_id.as_u64()))
                 .group("panel-shelved-tab")
@@ -2240,91 +2256,133 @@ impl TakoApp {
                         this.hover_preview = None;
                     }
                     cx.notify();
-                }))
-                .child(
+                }));
+
+            let mut head = div().flex().flex_row().items_center().gap_1();
+            if legacy1491 {
+                // TAKO_1491_LEGACY_ARM 開始（#1489 の「見出し + タブごと復帰ボタン」。
+                // 本番の描画はタブ形カードへ移ったので、ここは `TAKO_1491_LEGACY=1`
+                // のときだけ通る。番犬は対象外にする）
+                let probe = self.panel_click_probe_bounds.clone();
+                let probe_key = format!("panel-restore-tab-{}", tab_id.as_u64());
+                head = head
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(hsla(theme.tab_inactive_foreground))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(SharedString::from(
+                                crate::ui_text::panel::shelved_tab_group(
+                                    &truncate(&group.title, 16),
+                                    group.entries.len(),
+                                ),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id(("panel-restore-tab", tab_id.as_u64()))
+                            .relative()
+                            .px_1()
+                            .flex_none()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_size(px(10.0))
+                            .text_color(hsla(theme.accent))
+                            .hover(|d| d.bg(rgba_alpha(theme.accent, 0.2)))
+                            .child(SharedString::from(crate::ui_text::panel::op_unshelve_tab()))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.unshelve_tab_clicked(tab_id, cx);
+                            }))
+                            // セルフテスト（visual-test）が**実マウスで**押すための実矩形
+                            .child(crate::tab_shape::probe_canvas(probe, probe_key)),
+                    );
+                // TAKO_1491_LEGACY_ARM 終了
+            } else {
+                head = head
+                    .child(
+                        div()
+                            .id(("panel-shelved-tab-toggle", tab_id.as_u64()))
+                            .relative()
+                            .w(px(14.0))
+                            .h(px(14.0))
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .hover(|d| d.bg(rgba_alpha(theme.accent, 0.2)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                if !this.shelved_tab_expanded.remove(&tab_id) {
+                                    this.shelved_tab_expanded.insert(tab_id);
+                                }
+                                cx.notify();
+                            }))
+                            .child(
+                                svg()
+                                    .path(if expanded {
+                                        ui_icon::CHEVRON_DOWN
+                                    } else {
+                                        ui_icon::CHEVRON_RIGHT
+                                    })
+                                    .w(px(10.0))
+                                    .h(px(10.0))
+                                    .text_color(hsla(theme.text_tertiary)),
+                            )
+                            .child(crate::tab_shape::probe_canvas(
+                                self.panel_click_probe_bounds.clone(),
+                                format!("panel-shelved-tab-toggle-{}", tab_id.as_u64()),
+                            )),
+                    )
+                    // タブ形のカード（本体クリックで復帰。ドロワーと同じ 1 実装）
+                    .child(self.render_shelved_tab_card(
+                        group,
+                        crate::tab_shape::TabCardPlace::Panel,
+                        cx,
+                    ))
+                    .child(div().flex_1());
+            }
+            // カード全体をピン留め（FR-2.16.15 / FR-2.16.16）
+            card = card.child(
+                head.child(
                     div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
+                        .id(("shelved-tab-pin", tab_id.as_u64()))
+                        .px_1()
+                        .flex_none()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_size(px(11.0))
+                        .when(group_pinned, |d| d.text_color(hsla(theme.accent)))
+                        .when(!group_pinned, |d| {
+                            d.opacity(0.0)
+                                .group_hover("panel-shelved-tab", |d| d.opacity(1.0))
+                        })
+                        .hover(|d| d.bg(rgba_alpha(theme.accent, 0.2)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.set_pin(PreviewTarget::ClosedGroup(tab_id), None);
+                            cx.notify();
+                        }))
                         .child(
-                            div()
-                                .flex_1()
-                                .text_size(px(11.0))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(hsla(theme.tab_inactive_foreground))
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .child(SharedString::from(
-                                    crate::ui_text::panel::shelved_tab_group(
-                                        &truncate(&group.title, 16),
-                                        group.entries.len(),
-                                    ),
-                                )),
-                        )
-                        .child(
-                            div()
-                                .id(("panel-restore-tab", tab_id.as_u64()))
-                                .relative()
-                                .px_1()
-                                .flex_none()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .text_size(px(10.0))
-                                .text_color(hsla(theme.accent))
-                                .hover(|d| d.bg(rgba_alpha(theme.accent, 0.2)))
-                                .child(SharedString::from(crate::ui_text::panel::op_unshelve_tab()))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.unshelve_tab_clicked(tab_id, cx);
-                                }))
-                                // セルフテスト（visual-test）が**実マウスで**押すための実矩形
-                                .child(
-                                    gpui::canvas(
-                                        |_, _, _| (),
-                                        move |bounds, _, _, _| {
-                                            probe.borrow_mut().insert(probe_key.clone(), bounds);
-                                        },
-                                    )
-                                    .absolute()
-                                    .top_0()
-                                    .left_0()
-                                    .size_full(),
-                                ),
-                        )
-                        // カード全体をピン留め（FR-2.16.15 / FR-2.16.16）
-                        .child(
-                            div()
-                                .id(("shelved-tab-pin", tab_id.as_u64()))
-                                .px_1()
-                                .flex_none()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .text_size(px(11.0))
-                                .when(group_pinned, |d| d.text_color(hsla(theme.accent)))
-                                .when(!group_pinned, |d| {
-                                    d.opacity(0.0)
-                                        .group_hover("panel-shelved-tab", |d| d.opacity(1.0))
-                                })
-                                .hover(|d| d.bg(rgba_alpha(theme.accent, 0.2)))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.set_pin(PreviewTarget::ClosedGroup(tab_id), None);
-                                    cx.notify();
-                                }))
-                                .child(
-                                    svg()
-                                        .path(ui_icon::PIN)
-                                        .w(px(12.0))
-                                        .h(px(12.0))
-                                        .text_color(hsla(theme.text_tertiary)),
-                                ),
+                            svg()
+                                .path(ui_icon::PIN)
+                                .w(px(12.0))
+                                .h(px(12.0))
+                                .text_color(hsla(theme.text_tertiary)),
                         ),
-                );
-            // カードを開くと中のペイン行（個別復帰・kill）が出る
-            for entry in &group.entries {
-                card = card.child(self.render_background_row(entry, cx));
+                ),
+            );
+            // ▸ を開くと中のペイン行（個別復帰・kill）が出る（legacy は常に開いた形）
+            if expanded || legacy1491 {
+                for entry in &group.entries {
+                    card = card.child(self.render_background_row(entry, cx));
+                }
             }
             root = root.child(card);
         }
