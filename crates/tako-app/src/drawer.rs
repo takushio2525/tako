@@ -241,6 +241,7 @@ impl TakoApp {
 
         div()
             .id(("shelf-card", pane_id.as_u64()))
+            .relative()
             .flex_none()
             .w(px(BG_CARD_WIDTH))
             .h_full()
@@ -257,6 +258,12 @@ impl TakoApp {
             .bg(rgba(theme.background))
             .child(titlebar)
             .child(body)
+            // #1491: 「退避タブの配下はペインカードを並べない」を機械検証するための実矩形
+            //（枚数を数えるためだけのもの。押す対象はタイトルバーの各ボタン）
+            .child(crate::tab_shape::probe_canvas(
+                self.panel_click_probe_bounds.clone(),
+                format!("drawer-shelf-card-{}", pane_id.as_u64()),
+            ))
     }
 
     pub(crate) fn render_drawer(
@@ -267,18 +274,26 @@ impl TakoApp {
             return None;
         }
         let theme = self.theme.clone();
+        // #1491: 退避タブは**タブ形のカード 1 枚**で出す（配下ペインのサムネイルは並べない）。
+        // A/B（`TAKO_1491_LEGACY=1`）のときだけ #1489 の形（見出し + 「タブごと復帰」
+        // ボタン + ペインカード列）へ戻る。env を読むのは `tab_shape` の 1 か所
+        let legacy1491 = crate::tab_shape::shelved_tab_card_legacy();
+        let shelved_tabs = self.shelved_tab_groups();
         // (見出し, 「タブごと復帰」の対象, 中身)。退避タブ（#1487）だけが復帰対象を持つ
         let mut bg_groups: Vec<(String, Option<TabId>, Vec<BackgroundEntry>)> = Vec::new();
-        // #1487: タブ単位で退避したタブを先頭に出す（1 枚のカード = 1 タブ）
-        for group in self.shelved_tab_groups() {
-            bg_groups.push((
-                crate::ui_text::drawer::shelved_tab_group(
-                    &truncate(&group.title, 14),
-                    group.entries.len(),
-                ),
-                Some(group.tab),
-                group.entries,
-            ));
+        if legacy1491 {
+            // TAKO_1491_LEGACY_ARM 開始（#1491 前の形。番犬はここを対象外にする）
+            for group in shelved_tabs.iter().cloned() {
+                bg_groups.push((
+                    crate::ui_text::drawer::shelved_tab_group(
+                        &truncate(&group.title, 14),
+                        group.entries.len(),
+                    ),
+                    Some(group.tab),
+                    group.entries,
+                ));
+            }
+            // TAKO_1491_LEGACY_ARM 終了
         }
         for tab in self.workspace.tabs() {
             let entries = self.background_entries_of_tab(tab.id());
@@ -300,7 +315,15 @@ impl TakoApp {
                 closed.entries,
             ));
         }
-        let bg_total: usize = bg_groups.iter().map(|(_, _, e)| e.len()).sum();
+        // ドロワー見出しの件数は「バックグラウンドに居るペイン数」（#1489 ②）。
+        // タブ形カードにはサムネイルが無いが、中のペインは裏で走っている
+        let tab_card_panes: usize = if legacy1491 {
+            0
+        } else {
+            shelved_tabs.iter().map(|g| g.entries.len()).sum()
+        };
+        let bg_total: usize =
+            bg_groups.iter().map(|(_, _, e)| e.len()).sum::<usize>() + tab_card_panes;
 
         let pending_kill = self.bg_pending_kill;
 
@@ -319,9 +342,17 @@ impl TakoApp {
             let rows = (body_h / f32::from(cell.height)).floor() as usize;
             let cw = f32::from(cell.width).round() as u16;
             let ch = f32::from(cell.height).round() as u16;
+            // #1491: タブ形カードにサムネイルは無いが、ホバーの一括プレビュー
+            //（FR-2.16.16）は配下ペインの画面を映すのでサイズ追従は続ける
             let ids: Vec<PaneId> = bg_groups
                 .iter()
                 .flat_map(|(_, _, e)| e.iter().map(|x| x.pane))
+                .chain(
+                    shelved_tabs
+                        .iter()
+                        .filter(|_| !legacy1491)
+                        .flat_map(|g| g.entries.iter().map(|x| x.pane)),
+                )
                 .collect();
             for pane_id in ids {
                 if let Some(session) = self.terminals.get_mut(&pane_id) {
@@ -341,7 +372,31 @@ impl TakoApp {
             .py_1()
             .overflow_x_scroll();
 
-        if bg_groups.is_empty() {
+        // #1491: 退避タブは**タブ形カードを縦に並べた 1 列**として、ペインカードの左に置く。
+        // 「カードのどこを押しても復帰」なので、ここに復帰ボタンは要らない
+        let has_tab_cards = !legacy1491 && !shelved_tabs.is_empty();
+        if has_tab_cards {
+            let mut column = div()
+                .id("drawer-shelved-tabs")
+                .flex()
+                .flex_col()
+                .flex_none()
+                .items_start()
+                .gap_1()
+                .py_1()
+                .h_full()
+                .overflow_y_scroll();
+            for group in &shelved_tabs {
+                column = column.child(self.render_shelved_tab_card(
+                    group,
+                    crate::tab_shape::TabCardPlace::Drawer,
+                    cx,
+                ));
+            }
+            cards = cards.child(column);
+        }
+
+        if bg_groups.is_empty() && !has_tab_cards {
             cards = cards.child(
                 div()
                     .text_size(px(11.0))
@@ -368,7 +423,9 @@ impl TakoApp {
                             .text_ellipsis()
                             .child(SharedString::from(title.clone())),
                     );
-                // #1487: 退避タブは「タブごと復帰」1 回で分割ツリーのまま元の位置へ戻る
+                // TAKO_1491_LEGACY_ARM 開始（#1489 の「タブごと復帰」テキストボタン。
+                // 本番の描画はタブ形カード（`render_shelved_tab_card`）に移ったので、
+                // ここへ入るのは `TAKO_1491_LEGACY=1` のときだけ。番犬は対象外にする）
                 if let Some(tab_id) = *shelved_tab {
                     let probe = self.panel_click_probe_bounds.clone();
                     let probe_key = format!("drawer-restore-tab-{}", tab_id.as_u64());
@@ -401,13 +458,14 @@ impl TakoApp {
                             ),
                     );
                 }
+                // TAKO_1491_LEGACY_ARM 終了
                 let mut group = div()
                     .id(("drawer-group", gi as u64))
                     .flex()
                     .flex_col()
                     .h_full()
                     .gap_1()
-                    .when(gi > 0, |d| {
+                    .when(gi > 0 || has_tab_cards, |d| {
                         d.pl_2()
                             .border_l_1()
                             .border_color(hsla_alpha(theme.pane_border, 0.6))

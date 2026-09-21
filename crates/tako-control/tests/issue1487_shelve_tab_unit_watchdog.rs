@@ -487,11 +487,14 @@ fn scan_entrypoints(s: &Sources) -> Vec<Offender> {
                 .into(),
         });
     }
-    if !s.drawer.contains("drawer-restore-tab-") {
+    // たまり場からタブごと戻す導線（#1491 でテキストボタン → タブ形カードへ変わった）。
+    // 実矩形（probe）そのものは `issue1491_shelved_tab_card_watchdog` が縛るので、
+    // ここは「描画の呼び出しが在る」ことだけを見る
+    if !s.drawer.contains("render_shelved_tab_card(") {
         out.push(Offender {
             file: DRAWER,
             line: 0,
-            why: "たまり場の「タブごと復帰」に実矩形（probe）が無い（#1487）".into(),
+            why: "たまり場に退避タブをタブごと戻す導線が無い（#1487 / #1491）".into(),
         });
     }
     out

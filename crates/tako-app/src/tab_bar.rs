@@ -340,12 +340,9 @@ impl TakoApp {
             })
             .collect();
         let attention: usize = tabs.iter().map(|(_, _, _, _, fails, _, _)| fails).sum();
-        let state_color = |state: &CommandState| match state {
-            CommandState::Failed(_) => theme.red,
-            CommandState::Running => theme.accent,
-            CommandState::Idle => theme.green,
-            CommandState::Unknown => theme.text_overlay,
-        };
+        // 状態ドットの色・タブピルの形は退避タブカード（#1491）と**同じ 1 実装**を通す。
+        // ここで直に書くと、たまり場のタブ形カードと見た目が割れる
+        let state_color = |state: &CommandState| crate::tab_shape::tab_state_color(&theme, state);
 
         let label_max = self.tab_label_max_chars(tabs.len(), window);
         let tab_drop = self.tab_drop_target;
@@ -449,21 +446,7 @@ impl TakoApp {
                             let dot_color = state_color(&agg);
                             let pulsing = matches!(agg, CommandState::Running);
 
-                            let dot = div()
-                                .w(px(7.0))
-                                .h(px(7.0))
-                                .flex_none()
-                                .rounded_full()
-                                .bg(hsla(dot_color))
-                                .when(is_active, |d| {
-                                    d.shadow(vec![BoxShadow {
-                                        color: hsla_alpha(dot_color, 0.7),
-                                        offset: point(px(0.), px(0.)),
-                                        blur_radius: px(6.0),
-                                        spread_radius: px(0.),
-                                        inset: false,
-                                    }])
-                                });
+                            let dot = crate::tab_shape::tab_state_dot(dot_color, is_active);
                             // 脈動は「走り始めた」の合図なので有限回で終わらせる（#945）。
                             //
                             // GPUI の `AnimationElement` は動いているあいだ毎フレーム
@@ -528,259 +511,184 @@ impl TakoApp {
                                     )
                                 })
                                 .child(
-                                    div()
-                                        .id(("tab", id.as_u64()))
-                                        .group("tab-pill")
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap(px(8.0))
-                                        .h(px(30.0))
-                                        .pl(px(10.0))
-                                        .pr(px(11.0))
-                                        .flex_shrink_0()
-                                        .rounded(px(8.0))
-                                        .cursor_pointer()
-                                        // 根 div の Drag ヒットテストに勝たせる（#576）+
-                                        // ホイールをスクロール領域へ中継する（#961）
-                                        .occlude_scrolling(cx)
-                                        .when(is_drag_source, |d| {
-                                            d.opacity(0.4)
-                                                .border_1()
-                                                .border_color(hsla(theme.border_subtle))
-                                                .border_dashed()
-                                        })
-                                        .when(is_active && !is_drag_source, |d| {
-                                            d.bg(rgba(theme.tab_active_background))
-                                                .border_1()
-                                                .border_color(hsla(theme.border_heavy))
-                                                .shadow(vec![BoxShadow {
-                                                    color: hsla_alpha(theme.foreground, 0.05),
-                                                    offset: point(px(0.), px(1.)),
-                                                    blur_radius: px(0.),
-                                                    spread_radius: px(0.),
-                                                    inset: true,
-                                                }])
-                                        })
-                                        .when(!is_active && !is_drag_source, |d| {
-                                            d.hover(|d| d.bg(rgba(theme.surface_hover)))
-                                        })
-                                        .when(is_pane_dragging && tab_drop == Some(Some(id)), |d| {
-                                            d.bg(rgba_alpha(theme.accent, 0.15))
-                                                .border_2()
-                                                .border_color(hsla(theme.accent))
-                                        })
-                                        .text_color(if is_active {
-                                            hsla(theme.tab_active_foreground)
-                                        } else if fails > 0 {
-                                            hsla(theme.text_tertiary)
-                                        } else {
-                                            hsla(theme.tab_inactive_foreground)
-                                        })
-                                        .text_size(px(12.5))
-                                        .on_mouse_down(
-                                            gpui::MouseButton::Left,
-                                            cx.listener(move |this, _, _, _| {
-                                                this.tab_mouse_down = true;
-                                            }),
-                                        )
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            // 共有タブバー（#380）: クリックしたウィンドウへ
-                                            // 表示を移す（他ウィンドウ所属なら奪取）
-                                            this.select_tab_in_viewport(id, window, cx);
-                                        }))
-                                        .on_drag(
-                                            TabDrag { tab: id },
-                                            self.drag_ghost_builder_with_tab(
-                                                DragKind::Tab,
-                                                truncated.clone(),
-                                                Some(id),
-                                                cx,
-                                            ),
-                                        )
-                                        .on_drag_move::<TabDrag>(cx.listener(
-                                            move |this, e: &DragMoveEvent<TabDrag>, _, cx| {
-                                                // GPUI の on_drag_move は capture フェーズで
-                                                // 全登録要素に発火するため、自身の bounds 内か
-                                                // を明示チェックする（#413）
-                                                if !e.bounds.contains(&e.event.position) {
-                                                    return;
-                                                }
-                                                if e.drag(cx).tab == id {
-                                                    return;
-                                                }
-                                                this.set_tab_reorder_indicator(Some(id), cx);
-                                            },
-                                        ))
-                                        .on_drop::<TabDrag>(cx.listener(
-                                            move |this, drag: &TabDrag, _, cx| {
-                                                this.drop_tab_reorder(drag.tab, Some(id), cx);
-                                            },
-                                        ))
-                                        .on_drag_move::<PaneDrag>(cx.listener(
-                                            move |this, _: &DragMoveEvent<PaneDrag>, _, cx| {
-                                                this.set_tab_drop_target(Some(id), cx);
-                                            },
-                                        ))
-                                        .on_drop::<PaneDrag>(cx.listener(
-                                            move |this, drag: &PaneDrag, _, cx| {
-                                                this.drop_pane_on_tab(drag.pane, Some(id), cx);
-                                            },
-                                        ))
-                                        .child(dot)
-                                        .child(
-                                            div()
-                                                .font_weight(if is_active {
-                                                    FontWeight::SEMIBOLD
-                                                } else {
-                                                    FontWeight::MEDIUM
-                                                })
-                                                .child(SharedString::from(truncated)),
-                                        )
-                                        // 自動命名の直後だけ出る「この名前を固定」の印
-                                        // （#552 案 4）。クリックでこの名前が手動名として
-                                        // 固定され、以後 自動リネームに書き換えられなくなる。
-                                        // 時間（PIN_HINT_TTL）が経てば静かに消える
-                                        .when(pin_hint, |d| {
-                                            d.child(
-                                                div()
-                                                    .id(("tab-pin-title", id.as_u64()))
-                                                    .w(px(17.0))
-                                                    .h(px(17.0))
-                                                    .flex()
-                                                    .flex_none()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .rounded(px(5.0))
-                                                    .cursor_pointer()
-                                                    .hover(|d| d.bg(rgba(theme.surface_highlight)))
-                                                    .on_click(cx.listener(
-                                                        move |this, _: &gpui::ClickEvent, _, cx| {
-                                                            cx.stop_propagation();
-                                                            this.pin_auto_tab_title(id, cx);
-                                                        },
-                                                    ))
-                                                    .child(
-                                                        svg()
-                                                            .path(ui_icon::PIN)
-                                                            .w(px(11.0))
-                                                            .h(px(11.0))
-                                                            .text_color(hsla(theme.accent)),
-                                                    ),
-                                            )
-                                        })
-                                        // 他ウィンドウで表示中の区別バッジ（#380。
-                                        // クリックすればこのウィンドウへ表示が移る）
-                                        .when_some(shown_in, |d, win| {
-                                            d.child(
-                                                div()
-                                                    .flex_none()
-                                                    .px(px(4.0))
-                                                    .h(px(15.0))
-                                                    .flex()
-                                                    .items_center()
-                                                    .rounded(px(4.0))
-                                                    .border_1()
-                                                    .border_color(hsla(theme.border_subtle))
-                                                    .text_size(px(9.5))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(hsla(theme.text_muted))
-                                                    .child(SharedString::from(format!("W{win}"))),
-                                            )
-                                        })
-                                        .when(is_active && pane_states.len() > 1, |d| {
-                                            d.child(
-                                                div()
-                                                    .flex()
-                                                    .flex_row()
-                                                    .items_center()
-                                                    .gap(px(2.5))
-                                                    .children(pane_states.iter().map(|s| {
-                                                        div()
-                                                            .w(px(5.0))
-                                                            .h(px(5.0))
-                                                            .flex_none()
-                                                            .rounded(px(1.5))
-                                                            .bg(hsla(state_color(s)))
-                                                    })),
-                                            )
-                                        })
-                                        .when(!is_active && fails > 0, |d| {
-                                            d.child(
-                                                div()
-                                                    .font_family(theme.font_family.clone())
-                                                    .text_size(px(10.5))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(hsla(theme.red))
-                                                    .child(SharedString::from(format!(
-                                                        "{fails} fail"
-                                                    ))),
-                                            )
-                                        })
-                                        .when(is_active, |d| {
-                                            // セルフテスト（visual-test）が**実マウスで**押すための実矩形（#1487）
-                                            let probe = self.panel_click_probe_bounds.clone();
-                                            let probe_key = format!("tab-bg-{}", id.as_u64());
-                                            d.child(
-                                                div()
-                                                    .id(("tab-bg", id.as_u64()))
-                                                    .relative()
-                                                    .w(px(17.0))
-                                                    .h(px(17.0))
-                                                    .flex()
-                                                    .flex_none()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .rounded(px(5.0))
-                                                    .cursor_pointer()
-                                                    // 根 div の Drag ヒットテストに勝たせる（#576）+
-                                                    // ホイールをスクロール領域へ中継する（#961）
-                                                    .occlude_scrolling(cx)
-                                                    .text_color(hsla(theme.text_muted))
-                                                    .hover(|d| {
-                                                        d.bg(rgba(theme.surface_highlight))
-                                                            .text_color(hsla(theme.foreground))
-                                                    })
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                    crate::tab_shape::tab_pill_shell(
+                                        &theme,
+                                        is_active && !is_drag_source,
+                                    )
+                                    .id(("tab", id.as_u64()))
+                                    .group("tab-pill")
+                                    .cursor_pointer()
+                                    // 根 div の Drag ヒットテストに勝たせる（#576）+
+                                    // ホイールをスクロール領域へ中継する（#961）
+                                    .occlude_scrolling(cx)
+                                    .when(is_drag_source, |d| {
+                                        d.opacity(0.4)
+                                            .border_1()
+                                            .border_color(hsla(theme.border_subtle))
+                                            .border_dashed()
+                                    })
+                                    .when(!is_active && !is_drag_source, |d| {
+                                        d.hover(|d| d.bg(rgba(theme.surface_hover)))
+                                    })
+                                    .when(is_pane_dragging && tab_drop == Some(Some(id)), |d| {
+                                        d.bg(rgba_alpha(theme.accent, 0.15))
+                                            .border_2()
+                                            .border_color(hsla(theme.accent))
+                                    })
+                                    .text_color(if is_active {
+                                        hsla(theme.tab_active_foreground)
+                                    } else if fails > 0 {
+                                        hsla(theme.text_tertiary)
+                                    } else {
+                                        hsla(theme.tab_inactive_foreground)
+                                    })
+                                    // 文字サイズはタブピルの器（`tab_pill_shell`）が持つ
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(move |this, _, _, _| {
+                                            this.tab_mouse_down = true;
+                                        }),
+                                    )
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        // 共有タブバー（#380）: クリックしたウィンドウへ
+                                        // 表示を移す（他ウィンドウ所属なら奪取）
+                                        this.select_tab_in_viewport(id, window, cx);
+                                    }))
+                                    .on_drag(
+                                        TabDrag { tab: id },
+                                        self.drag_ghost_builder_with_tab(
+                                            DragKind::Tab,
+                                            truncated.clone(),
+                                            Some(id),
+                                            cx,
+                                        ),
+                                    )
+                                    .on_drag_move::<TabDrag>(cx.listener(
+                                        move |this, e: &DragMoveEvent<TabDrag>, _, cx| {
+                                            // GPUI の on_drag_move は capture フェーズで
+                                            // 全登録要素に発火するため、自身の bounds 内か
+                                            // を明示チェックする（#413）
+                                            if !e.bounds.contains(&e.event.position) {
+                                                return;
+                                            }
+                                            if e.drag(cx).tab == id {
+                                                return;
+                                            }
+                                            this.set_tab_reorder_indicator(Some(id), cx);
+                                        },
+                                    ))
+                                    .on_drop::<TabDrag>(cx.listener(
+                                        move |this, drag: &TabDrag, _, cx| {
+                                            this.drop_tab_reorder(drag.tab, Some(id), cx);
+                                        },
+                                    ))
+                                    .on_drag_move::<PaneDrag>(cx.listener(
+                                        move |this, _: &DragMoveEvent<PaneDrag>, _, cx| {
+                                            this.set_tab_drop_target(Some(id), cx);
+                                        },
+                                    ))
+                                    .on_drop::<PaneDrag>(cx.listener(
+                                        move |this, drag: &PaneDrag, _, cx| {
+                                            this.drop_pane_on_tab(drag.pane, Some(id), cx);
+                                        },
+                                    ))
+                                    .child(dot)
+                                    .child(crate::tab_shape::tab_pill_label(truncated, is_active))
+                                    // 自動命名の直後だけ出る「この名前を固定」の印
+                                    // （#552 案 4）。クリックでこの名前が手動名として
+                                    // 固定され、以後 自動リネームに書き換えられなくなる。
+                                    // 時間（PIN_HINT_TTL）が経てば静かに消える
+                                    .when(pin_hint, |d| {
+                                        d.child(
+                                            crate::tab_shape::tab_pill_slot()
+                                                .id(("tab-pin-title", id.as_u64()))
+                                                .hover(|d| d.bg(rgba(theme.surface_highlight)))
+                                                .on_click(cx.listener(
+                                                    move |this, _: &gpui::ClickEvent, _, cx| {
                                                         cx.stop_propagation();
-                                                        this.background_tab(id, cx);
-                                                    }))
-                                                    .child(
-                                                        svg()
-                                                            .path(ui_icon::MINUS)
-                                                            .w(px(12.0))
-                                                            .h(px(12.0))
-                                                            .text_color(hsla(theme.text_muted)),
-                                                    )
-                                                    .child(
-                                                        gpui::canvas(
-                                                            |_, _, _| (),
-                                                            move |bounds, _, _, _| {
-                                                                probe.borrow_mut().insert(
-                                                                    probe_key.clone(),
-                                                                    bounds,
-                                                                );
-                                                            },
-                                                        )
-                                                        .absolute()
-                                                        .top_0()
-                                                        .left_0()
-                                                        .size_full(),
-                                                    ),
-                                            )
-                                        })
-                                        .when(is_active, |d| {
-                                            d.child(
+                                                        this.pin_auto_tab_title(id, cx);
+                                                    },
+                                                ))
+                                                .child(
+                                                    svg()
+                                                        .path(ui_icon::PIN)
+                                                        .w(px(11.0))
+                                                        .h(px(11.0))
+                                                        .text_color(hsla(theme.accent)),
+                                                ),
+                                        )
+                                    })
+                                    // 他ウィンドウで表示中の区別バッジ（#380。
+                                    // クリックすればこのウィンドウへ表示が移る）
+                                    .when_some(shown_in, |d, win| {
+                                        d.child(crate::tab_shape::tab_pill_badge(
+                                            &theme,
+                                            format!("W{win}"),
+                                        ))
+                                    })
+                                    .when(is_active && pane_states.len() > 1, |d| {
+                                        d.child(
                                             div()
-                                                .id(("tab-close", id.as_u64()))
-                                                .w(px(17.0))
-                                                .h(px(17.0))
                                                 .flex()
-                                                .flex_none()
+                                                .flex_row()
                                                 .items_center()
-                                                .justify_center()
-                                                .rounded(px(5.0))
-                                                .cursor_pointer()
+                                                .gap(px(2.5))
+                                                .children(pane_states.iter().map(|s| {
+                                                    div()
+                                                        .w(px(5.0))
+                                                        .h(px(5.0))
+                                                        .flex_none()
+                                                        .rounded(px(1.5))
+                                                        .bg(hsla(state_color(s)))
+                                                })),
+                                        )
+                                    })
+                                    .when(!is_active && fails > 0, |d| {
+                                        d.child(
+                                            div()
+                                                .font_family(theme.font_family.clone())
+                                                .text_size(px(10.5))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(hsla(theme.red))
+                                                .child(SharedString::from(format!("{fails} fail"))),
+                                        )
+                                    })
+                                    .when(is_active, |d| {
+                                        // セルフテスト（visual-test）が**実マウスで**押すための実矩形（#1487）
+                                        let probe = self.panel_click_probe_bounds.clone();
+                                        let probe_key = format!("tab-bg-{}", id.as_u64());
+                                        d.child(
+                                            crate::tab_shape::tab_pill_slot()
+                                                .id(("tab-bg", id.as_u64()))
+                                                .relative()
+                                                // 根 div の Drag ヒットテストに勝たせる（#576）+
+                                                // ホイールをスクロール領域へ中継する（#961）
+                                                .occlude_scrolling(cx)
+                                                .text_color(hsla(theme.text_muted))
+                                                .hover(|d| {
+                                                    d.bg(rgba(theme.surface_highlight))
+                                                        .text_color(hsla(theme.foreground))
+                                                })
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.background_tab(id, cx);
+                                                }))
+                                                .child(
+                                                    svg()
+                                                        .path(ui_icon::MINUS)
+                                                        .w(px(12.0))
+                                                        .h(px(12.0))
+                                                        .text_color(hsla(theme.text_muted)),
+                                                )
+                                                .child(crate::tab_shape::probe_canvas(
+                                                    probe, probe_key,
+                                                )),
+                                        )
+                                    })
+                                    .when(is_active, |d| {
+                                        d.child(
+                                            crate::tab_shape::tab_pill_slot()
+                                                .id(("tab-close", id.as_u64()))
                                                 // 根 div の Drag ヒットテストに勝たせる（#576）+
                                                 // ホイールをスクロール領域へ中継する（#961）
                                                 .occlude_scrolling(cx)
@@ -803,7 +711,7 @@ impl TakoApp {
                                                         .text_color(hsla(theme.text_muted)),
                                                 ),
                                         )
-                                        }),
+                                    }),
                                 ) // .child(div() inner tab pill)
                         },
                     ))
