@@ -62,7 +62,7 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/tako-1450-XXXXXX")"
 APP_PID=""
 cleanup() {
   # 明示 pid だけを落とす（pkill / killall は本番 GUI にも当たる）
-  if [ -n "$APP_PID" ]; then kill "$APP_PID" 2>/dev/null || true; fi
+  stop_isolated_gui "$APP_PID"
   if [ -n "${TAKO_TMUX_SOCKET:-}" ]; then
     tmux -L "$TAKO_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
   fi
@@ -99,15 +99,9 @@ chmod +x "$STUB_BIN/claude"
 # master 起動コマンドの中身は `tako` CLI 自身も呼ぶ（#983 の実在検査）ので PATH へ通す
 
 # --- 対象バイナリ -------------------------------------------------------------
-TAKO_BIN="${TAKO_BIN:-$REPO_ROOT/target/debug/tako}"
-APP_BIN="${APP_BIN:-$REPO_ROOT/target/debug/tako-app}"
-if [ ! -x "$TAKO_BIN" ] || [ ! -x "$APP_BIN" ]; then
-  echo "バイナリをビルドします…"
-  (cd "$REPO_ROOT" && cargo build -p tako-cli -p tako-app --quiet)
-fi
-for b in "$TAKO_BIN" "$APP_BIN"; do
-  [ -x "$b" ] || { echo "バイナリが見つからない: $b"; exit 1; }
-done
+# shellcheck source=lib/isolated-gui.sh
+. "$REPO_ROOT/scripts/lib/isolated-gui.sh"
+isolated_gui_bins || exit 1
 ln -sf "$TAKO_BIN" "$STUB_BIN/tako"
 
 # --- 隔離した環境 -------------------------------------------------------------
@@ -144,9 +138,6 @@ env:
   PATH: "$STUB_BIN:/usr/bin:/bin"
 YAML
 
-# 窓は仮想ディスプレイへ（ユーザーのメイン画面に出さない。#1141 / #1150）
-bash "$REPO_ROOT/scripts/lib/virtual-display.sh" ensure >/dev/null 2>&1 || true
-
 jqf() { python3 -c 'import json,sys
 try:
     d=json.load(sys.stdin)
@@ -163,16 +154,11 @@ print("null" if cur is None else (str(cur).lower() if isinstance(cur,bool) else 
 
 start_app() {
   # 仮想ディスプレイは検証の合間に眠る（眠ると列挙から落ちて起動が中止される。#1160）。
-  # ②「落として起動し直す」の 2 回目で実際に踏むので、起こす手を毎回通す
-  bash "$REPO_ROOT/scripts/lib/virtual-display.sh" ensure >/dev/null 2>&1 || true
-  "$APP_BIN" >> "$TMP/app.log" 2>&1 &
-  APP_PID=$!
-  for _ in $(seq 1 300); do
-    if "$TAKO_BIN" list >/dev/null 2>&1; then break; fi
-    sleep 0.1
-  done
-  "$TAKO_BIN" list >/dev/null 2>&1 || {
-    echo "tako-app へ接続できない:"; tail -30 "$TMP/app.log"; exit 1; }
+  # ②「落として起動し直す」の 2 回目で実際に踏むので、起こす手は launch_isolated_gui
+  # が起動ごとに通す（#1490）
+  launch_isolated_gui "$TMP/app.log"
+  APP_PID="$ISOLATED_GUI_PID"
+  wait_isolated_gui "$TMP/app.log" 300 || exit 1
   # **関門**: 繋がった先が隔離インスタンスか（socket が $TMP の下か）を必ず確かめる。
   # ここを通さないと、env の取りこぼし 1 つで本番 GUI を触ったまま「緑」になる
   local sock
@@ -244,8 +230,7 @@ check_contains "空タイトルの理由が出る" "$EMPTY_OUT" "タイトルが
 echo
 echo "=== ② 永続（アプリを落として起動し直す） ==="
 "$TAKO_BIN" todo update u-1 --body "サムネの文字が小さいかもしれません" --json >/dev/null 2>&1
-kill "$APP_PID" 2>/dev/null || true
-wait "$APP_PID" 2>/dev/null || true
+stop_isolated_gui "$APP_PID"
 APP_PID=""
 check_contains "YAML が置き場に在る" "$(ls "$TAKO_ORCHESTRATOR_DIR")" "user-tasks.yaml"
 check_contains "版数フィールドを持つ（#916 の番地）" "$(cat "$TASKS_FILE")" "version: 1"

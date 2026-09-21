@@ -35,27 +35,15 @@ TMP="$(mktemp -d /tmp/tako-1487-XXXXXX)"
 APP_PID=""
 TMUX_SOCKET="tako-1487-$$"
 cleanup() {
-  if [ -n "$APP_PID" ]; then
-    kill "$APP_PID" 2>/dev/null || true
-    wait "$APP_PID" 2>/dev/null || true
-  fi
+  stop_isolated_gui "$APP_PID"
   tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
   rm -rf "$TMP"
 }
 trap cleanup EXIT
 
-TAKO_BIN="${TAKO_BIN:-$REPO_ROOT/target/debug/tako}"
-APP_BIN="${APP_BIN:-$REPO_ROOT/target/debug/tako-app}"
-if [ ! -x "$TAKO_BIN" ] || [ ! -x "$APP_BIN" ]; then
-  echo "バイナリをビルドします…"
-  (cd "$REPO_ROOT" && cargo build -p tako-cli -p tako-app --quiet)
-fi
-for b in "$TAKO_BIN" "$APP_BIN"; do
-  [ -x "$b" ] || { echo "バイナリが見つからない: $b"; exit 1; }
-done
-
-bash "$REPO_ROOT/scripts/lib/virtual-display.sh" ensure >/dev/null 2>&1 || \
-  echo "  (注) 仮想ディスプレイを用意できなかった: 既定の面で続行する"
+# shellcheck source=lib/isolated-gui.sh
+. "$REPO_ROOT/scripts/lib/isolated-gui.sh"
+isolated_gui_bins || exit 1
 
 # --- 隔離した環境 -------------------------------------------------------------
 export HOME="$TMP/home"
@@ -94,21 +82,14 @@ for t in d["tabs"]:
 print("__NOT_FOUND__")'
 
 start_app() {
-  # 面は起動のたびに起こす（#1141 / #1160。蓋閉じ運用では tako-vd が Main になり
-  # アイドルで眠るので、1 回目と 2 回目のあいだに列挙から落ちることがある。
-  # `ensure` は冪等で、常設の面を作り直したり消したりはしない）
-  bash "$REPO_ROOT/scripts/lib/virtual-display.sh" ensure >/dev/null 2>&1 || true
-  "$APP_BIN" > "$TMP/app-$1.log" 2>&1 &
-  APP_PID=$!
-  for _ in $(seq 1 200); do
-    if "$TAKO_BIN" list >/dev/null 2>&1; then return 0; fi
-    sleep 0.1
-  done
-  echo "tako-app へ接続できない:"; tail -20 "$TMP/app-$1.log"; exit 1
+  # 面を起こすのは launch_isolated_gui の中（#1490。蓋閉じ運用では tako-vd が Main に
+  # なりアイドルで眠るので、1 回目と 2 回目のあいだに列挙から落ちることがある）
+  launch_isolated_gui "$TMP/app-$1.log"
+  APP_PID="$ISOLATED_GUI_PID"
+  wait_isolated_gui "$TMP/app-$1.log" || exit 1
 }
 stop_app() {
-  kill "$APP_PID" 2>/dev/null || true
-  wait "$APP_PID" 2>/dev/null || true
+  stop_isolated_gui "$APP_PID"
   APP_PID=""
   sleep 1
 }
@@ -242,13 +223,9 @@ stop_app
 
 echo "== ⑥ A/B: TAKO_1487_LEGACY=1 で旧挙動（平坦化）が再現する =="
 rm -rf "$TAKO_DATA_DIR"; mkdir -p "$TAKO_DATA_DIR"
-bash "$REPO_ROOT/scripts/lib/virtual-display.sh" ensure >/dev/null 2>&1 || true
-TAKO_1487_LEGACY=1 "$APP_BIN" > "$TMP/app-legacy.log" 2>&1 &
-APP_PID=$!
-for _ in $(seq 1 200); do
-  if "$TAKO_BIN" list >/dev/null 2>&1; then break; fi
-  sleep 0.1
-done
+launch_isolated_gui "$TMP/app-legacy.log" TAKO_1487_LEGACY=1
+APP_PID="$ISOLATED_GUI_PID"
+wait_isolated_gui "$TMP/app-legacy.log" || exit 1
 LTAB="$("$TAKO_BIN" list | python3 -c 'import json,sys; print(json.load(sys.stdin)["tabs"][0]["id"])')"
 LP1="$("$TAKO_BIN" list | python3 -c 'import json,sys; print(json.load(sys.stdin)["tabs"][0]["panes"][0]["id"])')"
 "$TAKO_BIN" split --pane "$LP1" --right >/dev/null

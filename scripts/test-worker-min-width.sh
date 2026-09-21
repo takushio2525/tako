@@ -18,8 +18,8 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMPDIR_ROOT="$(mktemp -d /tmp/tk1439-shared-XXXXXX)"
 trap 'rm -rf "$TMPDIR_ROOT"' EXIT
-TAKO_BIN="${TAKO_BIN:-$REPO_ROOT/target/debug/tako}"
-APP_BIN="${APP_BIN:-$REPO_ROOT/target/debug/tako-app}"
+# shellcheck source=lib/isolated-gui.sh
+. "$REPO_ROOT/scripts/lib/isolated-gui.sh"
 WORKERS="${WORKERS:-8}"
 
 PASS=0
@@ -28,13 +28,7 @@ pass() { PASS=$((PASS + 1)); echo "  [OK] $1"; }
 bad()  { FAIL=$((FAIL + 1)); echo "  [NG] $1"; }
 check() { if [ "$1" = "1" ]; then pass "$2"; else bad "$2"; fi; }
 
-if [ ! -x "$TAKO_BIN" ] || [ ! -x "$APP_BIN" ]; then
-  echo "バイナリをビルドします…"
-  (cd "$REPO_ROOT" && cargo build -p tako-cli -p tako-app --quiet)
-fi
-for b in "$TAKO_BIN" "$APP_BIN"; do
-  [ -x "$b" ] || { echo "バイナリが見つからない: $b"; exit 1; }
-done
+isolated_gui_bins || exit 1
 
 # ペインの中から走らせても本番へ届かないように、継承した接続情報を落とす
 unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_MCP_URL
@@ -47,18 +41,9 @@ unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_MCP_URL
 # **AX（System Events）で窓を動かしてはいけない（#1442）**: プロセス名がどちらも
 # `tako-app` なので、複数の tako-app が動いていると**本番 /Applications の窓に当たる**
 # （#782 の計測で実測）。ユーザーの窓を動かす事故になるので、この器では一切使わない。
-# 面が無いときは NEED VD を出して先へ進む（幅を実測できないぶんは skip になる）。
-require_vd() {
-  # `set -o pipefail` 下では `... | grep -q` が SIGPIPE で非ゼロになる（早期終了する
-  # grep が上流を殺す）ので、**一度変数へ受けてから**判定する
-  local out
-  out="$(bash "$REPO_ROOT/scripts/lib/virtual-display.sh" status 2>/dev/null || true)"
-  case "$out" in
-    *"tako-vd: 使用可"*) return 0 ;;
-  esac
-  echo "  NEED VD: 仮想ディスプレイ tako-vd が見つからない（scripts/lib/virtual-display.sh ensure）"
-  return 1
-}
+# 面を用意する（眠っていれば起こす）のは launch_isolated_gui の中（#1490）。
+# `tako-vd` が無い環境では既定の面へ落ちて続行し、面が 1 枚も見えないときは
+# tako 側が窓を開かずに終わる（#1160）。どちらも幅を実測できないぶんは skip になる。
 
 # 各ペインの cols と role・所属タブを取り出す
 panes_json() {
@@ -117,13 +102,10 @@ YAML
   "$TAKO_BIN" orchestrator projects add --key t1439 --cwd "$TMP" \
     --description "#1439 の検証（自動削除される）" >/dev/null 2>&1
 
-  require_vd || true
-  "$APP_BIN" > "$TMP/app.log" 2>&1 &
-  APP_PID=$!
-  for _ in $(seq 1 200); do "$TAKO_BIN" list >/dev/null 2>&1 && break; sleep 0.1; done
-  if ! "$TAKO_BIN" list >/dev/null 2>&1; then
-    echo "tako-app へ接続できない:"; tail -20 "$TMP/app.log"
-    kill "$APP_PID" 2>/dev/null; return 1
+  launch_isolated_gui "$TMP/app.log"
+  APP_PID="$ISOLATED_GUI_PID"
+  if ! wait_isolated_gui "$TMP/app.log"; then
+    stop_isolated_gui "$APP_PID"; return 1
   fi
   pass "隔離 tako-app が起動して CLI から見える（pid ${APP_PID}）"
   # tako-vd 上で描かれて PTY のセル数が確定するのを待つ
@@ -229,9 +211,7 @@ print(d.get("placement"), d.get("tab"), d.get("pane_cols"), d.get("font_scale"),
   esac
 
   # 後始末: 明示 pid だけを落とす
-  kill "$APP_PID" 2>/dev/null
-  for _ in $(seq 1 50); do kill -0 "$APP_PID" 2>/dev/null || break; sleep 0.1; done
-  kill -9 "$APP_PID" 2>/dev/null
+  stop_isolated_gui "$APP_PID"
   pkill -f "$TMP/bin/claude" 2>/dev/null
   rm -rf "$TMP"
 }

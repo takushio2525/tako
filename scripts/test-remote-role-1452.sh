@@ -55,7 +55,7 @@ cleanup() {
     "$TAKO_BIN" remote stop >/dev/null 2>&1 || true
   fi
   # 明示 pid だけを落とす（pkill / killall は本番 GUI にも当たる）
-  if [ -n "$APP_PID" ]; then kill "$APP_PID" 2>/dev/null || true; fi
+  stop_isolated_gui "$APP_PID"
   tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
   rm -rf "$TMP"
 }
@@ -99,18 +99,9 @@ FAKE
 chmod +x "$FAKE_TS"
 
 # --- 対象バイナリ -------------------------------------------------------------
-TAKO_BIN="${TAKO_BIN:-$REPO_ROOT/target/debug/tako}"
-APP_BIN="${APP_BIN:-$REPO_ROOT/target/debug/tako-app}"
-if [ ! -x "$TAKO_BIN" ] || [ ! -x "$APP_BIN" ]; then
-  echo "バイナリをビルドします…"
-  (cd "$REPO_ROOT" && cargo build -p tako-cli -p tako-app --quiet)
-fi
-for b in "$TAKO_BIN" "$APP_BIN"; do
-  [ -x "$b" ] || { echo "バイナリが見つからない: $b"; exit 1; }
-done
-
-bash "$REPO_ROOT/scripts/lib/virtual-display.sh" ensure >/dev/null 2>&1 || \
-  echo "  (注) 仮想ディスプレイを用意できなかった: 既定の面で続行する"
+# shellcheck source=lib/isolated-gui.sh
+. "$REPO_ROOT/scripts/lib/isolated-gui.sh"
+isolated_gui_bins || exit 1
 
 # --- 隔離した環境 -------------------------------------------------------------
 export HOME="$TMP/home"
@@ -148,13 +139,9 @@ done
 
 # --- 起動 ---------------------------------------------------------------------
 echo "=== 準備: 隔離 tako-app と daemon を起動 ==="
-"$APP_BIN" > "$TMP/app.log" 2>&1 &
-APP_PID=$!
-for _ in $(seq 1 200); do
-  if "$TAKO_BIN" list >/dev/null 2>&1; then break; fi
-  sleep 0.1
-done
-"$TAKO_BIN" list >/dev/null 2>&1 || { echo "tako-app へ接続できない:"; tail -20 "$TMP/app.log"; exit 1; }
+launch_isolated_gui "$TMP/app.log"
+APP_PID="$ISOLATED_GUI_PID"
+wait_isolated_gui "$TMP/app.log" || exit 1
 BOOT_TABS="$("$TAKO_BIN" list | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["tabs"]))')"
 if [ "$BOOT_TABS" != "1" ]; then
   echo "繋がった先が隔離インスタンスではない（タブ ${BOOT_TABS} 枚）。中止する。"

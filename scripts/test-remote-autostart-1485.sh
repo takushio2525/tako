@@ -45,14 +45,8 @@ TMUX_SOCKET="tako-iso-1485-$$"
 
 # 明示 pid だけを落とす（`pkill -f tako` は本番 GUI にも当たる = memory の事故）
 kill_app() {
-  if [ -n "$APP_PID" ]; then
-    kill "$APP_PID" 2>/dev/null
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-      kill -0 "$APP_PID" 2>/dev/null || break
-      sleep 0.3
-    done
-    APP_PID=""
-  fi
+  stop_isolated_gui "$APP_PID"
+  APP_PID=""
 }
 kill_daemon() {
   local pid
@@ -73,20 +67,19 @@ BIN_DIR="$TMP/bin"
 mkdir -p "$STATE_DIR" "$DATA_DIR" "$BIN_DIR" "$TMP/disc"
 
 echo "== ビルド =="
+# shellcheck source=lib/isolated-gui.sh
+. "$REPO_ROOT/scripts/lib/isolated-gui.sh"
+# **この本は毎回ビルドし直す**（`isolated_gui_bins` は無いときだけ作るので、
+# stale な target を掴んだまま「緑」になるのを防ぐ = #432 の罠）
 cargo build -q -p tako-app -p tako-cli 2>&1 | tail -3
-APP_SRC="$REPO_ROOT/target/debug/tako-app"
-CLI_SRC="$REPO_ROOT/target/debug/tako"
-if [ ! -x "$APP_SRC" ] || [ ! -x "$CLI_SRC" ]; then
-  echo "fatal: tako-app / tako が無い（cargo build に失敗）"
-  exit 1
-fi
+isolated_gui_bins || exit 1
 # **リポジトリの target を書き換えない**（③ の注入で serve バイナリを差し替えるため、
 # 検証用の複製を作ってそちらを差し替える）。隔離モードの `serve_binary()` は
 # tako-app と**同じディレクトリの `tako`** を選ぶので、2 つを並べて置く
-cp "$APP_SRC" "$BIN_DIR/tako-app"
-cp "$CLI_SRC" "$BIN_DIR/tako"
-cp "$CLI_SRC" "$TMP/tako-cli"   # 検査に使う CLI（注入の影響を受けない）
-APP="$BIN_DIR/tako-app"
+cp "$APP_BIN" "$BIN_DIR/tako-app"
+cp "$TAKO_BIN" "$BIN_DIR/tako"
+cp "$TAKO_BIN" "$TMP/tako-cli"   # 検査に使う CLI（注入の影響を受けない）
+APP_BIN="$BIN_DIR/tako-app"   # 起動するのは複製（③ が serve バイナリを差し替える）
 CLI="$TMP/tako-cli"
 
 export TAKO_ISOLATED=1
@@ -95,19 +88,15 @@ export TAKO_REMOTE_STATE_DIR="$STATE_DIR"
 export TAKO_REMOTE_TEST_MODE=1
 export TAKO_TMUX_SOCKET="$TMUX_SOCKET"
 export TAKO_DISCOVERY_DIR="$TMP/disc"
-export TAKO_DISPLAY="${TAKO_DISPLAY:-tako-vd}"
 # 検証用のバックオフ（既定は 2/5/10/20/40 秒 = 合計 77 秒。実測を現実的な時間で回す）
 export TAKO_1485_BACKOFF_SECS=2
 export TAKO_1485_ATTEMPTS=8
 
-# 窓をユーザーの画面に出さない（#1141）。配線が無い環境では素通し
-if [ -x "$REPO_ROOT/scripts/lib/virtual-display.sh" ]; then
-  "$REPO_ROOT/scripts/lib/virtual-display.sh" ensure >/dev/null 2>&1
-fi
-
 start_app() {
-  "$APP" > "$TMP/app.log" 2>&1 &
-  APP_PID=$!
+  # 面を起こすのは launch_isolated_gui の中（#1490。①〜⑤ で何度も起動し直すので、
+  # 蓋閉じで tako-vd が眠ると 2 回目以降が窓を開かずに終わる = #1160）
+  launch_isolated_gui "$TMP/app.log"
+  APP_PID="$ISOLATED_GUI_PID"
   sleep 5
 }
 
