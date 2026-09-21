@@ -145,6 +145,10 @@ export TAKO_TAILSCALE_BIN="$FAKE_TS"
 # 切る（`TAKO_841_LEGACY`）のではなく「この隔離環境で serve の代わりに繋いでくるのは
 # curl」だと名前で宣言する（所有者ゲートは本番と同じ経路を通る）
 export TAKO_REMOTE_TRUSTED_PEER_NAMES="curl"
+# #1452: ペアリングの**承認**は「呼び出し元が tako-app か」も見る（管理トークンは
+# 0600 = 同一ユーザーなら読めるので、トークンだけでは GUI と CLI / AI を区別できない）。
+# このテストは curl で承認を撃つので、**この隔離環境では curl を GUI 側として名乗る**
+export TAKO_REMOTE_TRUSTED_ADMIN_NAMES="curl"
 mkdir -p "$TAKO_DATA_DIR" "$TAKO_DISCOVERY_DIR" "$TAKO_REMOTE_STATE_DIR" "$TAKO_ORCHESTRATOR_DIR"
 # 本番へ書かない不変条件（env が効いていなければここで落とす）
 for d in "$HOME" "$TAKO_DATA_DIR" "$TAKO_REMOTE_STATE_DIR" "$TAKO_ORCHESTRATOR_DIR"; do
@@ -222,11 +226,35 @@ for e in d.get("entries") or []:
         print(json.dumps({k:e.get(k) for k in ("dir","unreadable","symlink","size")},ensure_ascii=False)); raise SystemExit
 print("なし")' "$TMP/body" "$1"; }
 
+# 端末の role を**その値に据える**。
+# `POST /api/pair` + 承認は「上げる」向きにしか効かない（現より弱い role の要求は
+# 保留を作らない = #1452 の `request_pairing`）ので、下げるときは #1452 の管理経路
+# `POST /api/admin/devices/role` で据え直す。どちらも本番と同じゲートを通る
+# （この隔離環境では curl を GUI 側として名乗っている）。
+#
+# **据わったことを確かめてから先へ進む**: ここが外れたまま進むと以降の全項目が
+# 「role が null / 一覧が 403」で落ち、真因が数十件の NG に埋もれる（#1493 で実際に起きた）
 pair_as() {
-  api POST /api/pair "{\"name\":\"iPhone\",\"role\":\"$1\"}" >/dev/null
-  curl -s -o /dev/null -X POST "$BASE/api/admin/pair/approve" \
+  local want="$1" approve_code role_code got
+  api POST /api/pair "{\"name\":\"iPhone\",\"role\":\"$want\"}" >/dev/null
+  approve_code="$(curl -s -o "$TMP/approve" -w '%{http_code}' -X POST \
+    "$BASE/api/admin/pair/approve" \
     -H "X-Tako-Admin: $ADMIN_TOKEN" -H 'Content-Type: application/json' \
-    -d "{\"device_id\":\"nFAKE1451\",\"role\":\"$1\"}"
+    -d "{\"device_id\":\"nFAKE1451\",\"role\":\"$want\"}")"
+  role_code="$(curl -s -o "$TMP/setrole" -w '%{http_code}' -X POST \
+    "$BASE/api/admin/devices/role" \
+    -H "X-Tako-Admin: $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+    -d "{\"device_id\":\"nFAKE1451\",\"role\":\"$want\"}")"
+  api GET /api/me >/dev/null
+  got="$(jqf role)"
+  if [ "$got" != "$want" ]; then
+    echo "端末の role を ${want} に据えられなかった（/api/me の role=${got}）:"
+    echo "  POST /api/admin/pair/approve → HTTP ${approve_code} $(cat "$TMP/approve")"
+    echo "  POST /api/admin/devices/role → HTTP ${role_code} $(cat "$TMP/setrole")"
+    echo "  昇格できるのは tako-app からの呼び出しだけ（#1452）。curl で撃つ隔離テストは"
+    echo "  TAKO_REMOTE_TRUSTED_ADMIN_NAMES で GUI 側を名乗る宣言が要る。"
+    exit 1
+  fi
 }
 
 start_daemon

@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-14（#1473: 蓋閉じ継続をバッテリー駆動でも opt-in で続けられるようにした）
-- 蓋閉じ継続の電源条件を**アイドルスリープ側とは別の軸**（`lid_sleep_power`・既定 `ac-only` = 現状維持）にし、`always` のときだけバッテリーでも続ける。安全弁は 4 つ（エージェント稼働中のみ / 残量が下限（既定 20%・5〜90%）に**達したら**解除 / 温度は**バッテリーなら fair 以上・AC なら serious 以上**で解除 / 残量を読めない機械では継続しない）。Windows は同じ判定を通り `always` のときだけ電源プランのバッテリーレールも倒す（残量取得は未実装 = 実質 AC のみ・実機未検証）
-- 判定は `lid_decision(&LidGuardInput) -> Result<(), LidSkipReason>` の 1 本で、真偽値ではなく**理由**を返す。理由は状態が運ぶ（`update` / `status` が `with_decision()` で埋める）ので、CLI・設定画面・通知欄・persist.log は**読むだけ**（読む側が再計算すると A/B や stale binary で判断が割れる = #372 と同じ理屈）。通知欄へ出すのは安全弁の解除と回復だけ
-- 実測（隔離 GUI / tako-vd。実機はバッテリー 52% 駆動）: `always` + 下限 10% + エージェント 1 体で実機の `SleepDisabled=Yes` を 8 サンプル観測（persist.log に `lid-sleep: … reason=applied battery=15%`）・注入 15% では倒さず理由 `battery-floor`・MCP で書いた値を CLI が読む・範囲外（0 / 95）は両口とも拒否・A/B `TAKO_1473_LEGACY=1` は `always` でも「AC 未接続」で降りる。**検証後に `SleepDisabled=No`（検証前と同値）へ戻したことを確認**。workspace 4937 passed 0 failed・clippy 3 宇宙 0・check-windows error 0・docs 32 ページ・番犬 3 本（注入 9 通り + 実注入で `sleep_guard.rs:1162` を名指し）。**install 要 / 実機の蓋閉じは未検証**
-
 ## 2026-09-14（#1477: master system prompt の取り分を tako と利用者で分け、追記を自動分割）
 - system prompt 24 KB を **tako の base 18.5 KB + 追記 5.5 KB** に分割。委任の判断材料（`delegate_guidance` + judgment）を新 topic `delegation`（動的 guide）へ出し、behavior / monitoring / guides / context-budget の案内文を締めた。実測 base: default 20,732→17,480 / codex 22,695→17,507 / fable 22,507→17,493 / takodev 21,808→18,450（**ルールは 1 つも消していない**）
 - 予算を超えた `prompt_blocks.append` は自動移行（`SchemaId::PromptAppend`）が見出し境界へ `<!-- tako:on-demand -->` を**1 行入れるだけ**。後ろは `tako orchestrator guide local-rules` で引き、prompt には生成した索引 1 行（`append index` piece）。`strip_marker(新) == 旧` が不変条件
@@ -59,3 +54,8 @@
 - `scripts/lib/isolated-gui.sh` を新設（`isolated_gui_bins` / `launch_isolated_gui` / `wait_isolated_gui` / `stop_isolated_gui`）し、`virtual-display.sh ensure` を**起動の直前に毎回**通す形へ。`scripts/test-*.sh` 12 本を差し替え（-151 行）。Issue の grep は `"…virtual-display.sh" ensure` の引用符に当たらず全部 0 に見えていたが、正しく数えると「起動の直前に通していたのは 4 本 / 冒頭 1 回が 6 本 / 呼んでいないのが 2 本」で症状は実在
 - 実測（眠った tako-vd から。`pmset displaysleepnow` で再現）: **master-launch が OK=0 rc=1 → OK=34 rc=0**・**1485 が OK=12 NG=14 → OK=26 NG=0**（14 NG は全部「窓を開かずに終了」= #1160 の中止）・**worker-min-width が OK=6 → OK=12**（3 腕のうち 1 腕しか走れていなかった）。他 9 本は前後一致・回帰 0
 - 番犬 `issue1490_isolated_gui_launch_watchdog` 5 本（直書き 4 形 + 手書きの背景起動 / ensure を file:line で名指し）。注入で 2 本 FAILED → 戻して 5/5 緑。workspace 5021 passed 0 failed・clippy 3 宇宙 0・check-windows error 0
+
+## 2026-09-21（#1493: main で赤かった test-remote-fs-1451.sh を現行契約へ合わせ、番犬で縛った）
+- 真因は製品の回帰ではなく**テストの前提の追従漏れ**。#1452（`fd46c81`）が ①承認の呼び出し元ゲート（`remote_role.rs:432` `decide` を `remote.rs:5014` が引く）②「現より弱い role の要求は保留を作らない」（`remote_auth.rs:272`）の 2 つを入れ、`test-remote-launch-1449.sh` / `test-remote-master-launch.sh` には宣言を足したが、同日着地の `test-remote-fs-1451.sh` だけ漏れた。承認が 403 `upgrade_requires_gui` で端末が 1 台も登録されず **OK=18 NG=55**
+- `TAKO_REMOTE_TRUSTED_ADMIN_NAMES="curl"` を宣言し、`pair_as` を「撃った」ではなく**「据わった」を確かめる**形へ（降格は `/api/admin/devices/role`）。番犬 `issue1493_admin_gate_script_watchdog` 3 本 + `.agent/conventions.md` に規約。**注入 A が素通りする穴（案内文の env 名を宣言と誤認）を実測で見つけて塞いだ**
+- 実測: 1451 **73 PASS 0 FAIL**（#1451 の PR と一致）/ role-1452 58/0 / autostart-1485 26/0 / 注入 6 通りすべて file:line 名指し / workspace 5024 passed 0 failed / clippy 3 宇宙 0 / check-windows error 0
