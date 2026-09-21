@@ -637,12 +637,11 @@ impl TakoApp {
             self.card_band_probes.clear();
             return;
         }
-        let mut alive: std::collections::HashSet<PaneId> = std::collections::HashSet::new();
-        for tab in self.workspace.tabs() {
-            alive.extend(tab.tree().panes().iter().map(|p| p.id()));
-        }
-        // バックグラウンド退避中（FR-2.15）のペインは生きている = カードも残す
-        alive.extend(self.workspace.shelved_panes().iter().map(|s| s.pane().id()));
+        // バックグラウンド退避中（FR-2.15）のペインは生きている = カードも残す。
+        // **退避タブ（#1487）配下も含む 1 実装**を通す: ここを平坦な `shelved_panes()`
+        // だけにすると、タブを「ー」で送った瞬間に配下ペインのカード
+        // （`tako show-command` の論理文字列ごと）が道連れで消える
+        let alive = self.workspace.all_pane_ids();
         self.command_cards.retain_panes(|p| alive.contains(&p));
         self.card_bands.retain(|p, _| alive.contains(p));
         self.card_band_probes.retain(|p, _| alive.contains(p));

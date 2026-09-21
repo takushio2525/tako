@@ -8,10 +8,8 @@ impl TakoApp {
     /// 右パネルの `shelved_restore_clicked` が採るものと同じ（#1432）
     fn shelved_label(&self, pane_id: PaneId) -> Option<String> {
         self.workspace
-            .shelved_panes()
-            .iter()
-            .find(|p| p.id() == pane_id)
-            .and_then(|p| p.title())
+            .background_pane(pane_id)
+            .and_then(|(p, _, _)| p.title())
             .map(str::to_string)
     }
 
@@ -43,7 +41,7 @@ impl TakoApp {
             );
         }
         self.reattach_backgrounded_preview(pane_id);
-        if self.workspace.shelved_panes().is_empty() {
+        if self.workspace.shelved_panes().is_empty() && self.workspace.shelved_tabs().is_empty() {
             self.drawer_visible = false;
         }
         cx.notify();
@@ -80,7 +78,7 @@ impl TakoApp {
         }
         self.reattach_backgrounded_preview(drag.pane);
         self.drag_kind = None;
-        if self.workspace.shelved_panes().is_empty() {
+        if self.workspace.shelved_panes().is_empty() && self.workspace.shelved_tabs().is_empty() {
             self.drawer_visible = false;
         }
         cx.notify();
@@ -151,7 +149,9 @@ impl TakoApp {
                                 pane_id,
                                 tako_core::pane_log::CloseOrigin::PaneButton,
                             );
-                            if this.workspace.shelved_panes().is_empty() {
+                            if this.workspace.shelved_panes().is_empty()
+                                && this.workspace.shelved_tabs().is_empty()
+                            {
                                 this.drawer_visible = false;
                             }
                             cx.notify();
@@ -267,20 +267,40 @@ impl TakoApp {
             return None;
         }
         let theme = self.theme.clone();
-        let mut bg_groups: Vec<(String, Vec<BackgroundEntry>)> = Vec::new();
+        // (見出し, 「タブごと復帰」の対象, 中身)。退避タブ（#1487）だけが復帰対象を持つ
+        let mut bg_groups: Vec<(String, Option<TabId>, Vec<BackgroundEntry>)> = Vec::new();
+        // #1487: タブ単位で退避したタブを先頭に出す（1 枚のカード = 1 タブ）
+        for group in self.shelved_tab_groups() {
+            bg_groups.push((
+                crate::ui_text::drawer::shelved_tab_group(
+                    &truncate(&group.title, 14),
+                    group.entries.len(),
+                ),
+                Some(group.tab),
+                group.entries,
+            ));
+        }
         for tab in self.workspace.tabs() {
             let entries = self.background_entries_of_tab(tab.id());
             if !entries.is_empty() {
-                bg_groups.push((tab.title().to_string(), entries));
+                bg_groups.push((
+                    crate::ui_text::drawer::tab_group(&truncate(tab.title(), 18), entries.len()),
+                    None,
+                    entries,
+                ));
             }
         }
         for closed in self.tmux_view_closed_origin_background() {
             bg_groups.push((
-                crate::ui_text::drawer::closed_tab_group(&closed.title),
+                crate::ui_text::drawer::tab_group(
+                    &truncate(&crate::ui_text::drawer::closed_tab_group(&closed.title), 18),
+                    closed.entries.len(),
+                ),
+                None,
                 closed.entries,
             ));
         }
-        let bg_total: usize = bg_groups.iter().map(|(_, e)| e.len()).sum();
+        let bg_total: usize = bg_groups.iter().map(|(_, _, e)| e.len()).sum();
 
         let pending_kill = self.bg_pending_kill;
 
@@ -301,7 +321,7 @@ impl TakoApp {
             let ch = f32::from(cell.height).round() as u16;
             let ids: Vec<PaneId> = bg_groups
                 .iter()
-                .flat_map(|(_, e)| e.iter().map(|x| x.pane))
+                .flat_map(|(_, _, e)| e.iter().map(|x| x.pane))
                 .collect();
             for pane_id in ids {
                 if let Some(session) = self.terminals.get_mut(&pane_id) {
@@ -330,7 +350,57 @@ impl TakoApp {
                     .child(crate::ui_text::drawer::empty()),
             );
         } else {
-            for (gi, (title, entries)) in bg_groups.iter().enumerate() {
+            for (gi, (title, shelved_tab, entries)) in bg_groups.iter().enumerate() {
+                let mut header = div()
+                    .h(px(DRAWER_GROUP_HEADER))
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .text_size(px(10.0))
+                    .text_color(hsla(theme.tab_inactive_foreground))
+                    .child(
+                        div()
+                            .flex_1()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(SharedString::from(title.clone())),
+                    );
+                // #1487: 退避タブは「タブごと復帰」1 回で分割ツリーのまま元の位置へ戻る
+                if let Some(tab_id) = *shelved_tab {
+                    let probe = self.panel_click_probe_bounds.clone();
+                    let probe_key = format!("drawer-restore-tab-{}", tab_id.as_u64());
+                    header = header.child(
+                        div()
+                            .id(("drawer-restore-tab", tab_id.as_u64()))
+                            .relative()
+                            .flex_none()
+                            .px_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_color(hsla(theme.accent))
+                            .hover(|d| d.bg(rgba_alpha(theme.accent, 0.2)))
+                            .child(crate::ui_text::drawer::restore_tab())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.unshelve_tab_clicked(tab_id, cx);
+                            }))
+                            // セルフテスト（visual-test）が**実マウスで**押すための実矩形
+                            .child(
+                                gpui::canvas(
+                                    |_, _, _| (),
+                                    move |bounds, _, _, _| {
+                                        probe.borrow_mut().insert(probe_key.clone(), bounds);
+                                    },
+                                )
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .size_full(),
+                            ),
+                    );
+                }
                 let mut group = div()
                     .id(("drawer-group", gi as u64))
                     .flex()
@@ -342,22 +412,7 @@ impl TakoApp {
                             .border_l_1()
                             .border_color(hsla_alpha(theme.pane_border, 0.6))
                     })
-                    .child(
-                        div()
-                            .h(px(DRAWER_GROUP_HEADER))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .text_size(px(10.0))
-                            .text_color(hsla(theme.tab_inactive_foreground))
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .child(SharedString::from(crate::ui_text::drawer::tab_group(
-                                &truncate(title, 18),
-                                entries.len(),
-                            ))),
-                    );
+                    .child(header);
                 let mut row = div().flex().flex_row().flex_1().min_h(px(0.0)).gap_2();
                 for entry in entries {
                     row = row.child(self.render_shelf_card(entry, pending_kill, cx));

@@ -167,7 +167,10 @@ impl TakoApp {
                     .child("Files"),
             )
             .child({
-                let bg_count = self.workspace.shelved_panes().len();
+                // バッジの定義は「バックグラウンドに居るペイン数」。退避タブ（#1487）
+                // 配下も数える（数えないと、退避タブしか無いとき 0 と出てドロワーの
+                // 中身と矛盾する）
+                let bg_count = self.workspace.all_background_panes().len();
                 let drawer_open = self.drawer_visible;
                 toggle("statusbar-bg", drawer_open)
                     .on_click(cx.listener(|this, _, _, cx| {

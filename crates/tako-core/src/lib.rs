@@ -131,7 +131,10 @@ pub use theme::{Rgb, Theme};
 pub use tmux::{TmuxSession, TmuxView, TmuxWindow};
 pub use ui_mode::{pane_display, PaneDisplay, PaneDisplayInput, StarterAction, UiMode};
 pub use user_task::{TaskKind, TaskStatus, UserTask};
-pub use workspace::{BackgroundPane, WindowId, Workspace, WorkspaceError, WorkspaceWindow};
+pub use workspace::{
+    shelve_tab_legacy, shelved_tab_fate, unshelve_tab_placement, BackgroundPane, BackgroundTab,
+    ShelvedTabFate, WindowId, Workspace, WorkspaceError, WorkspaceWindow,
+};
 
 /// 外部バイナリの解決（環境変数 → PATH 直 → 既知パス → ログインシェル）。
 /// `tmux_bin()` / `git_bin()` の共通基盤

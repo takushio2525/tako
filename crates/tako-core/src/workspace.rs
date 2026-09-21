@@ -88,6 +88,10 @@ pub struct Workspace {
     /// バックグラウンド（FR-2.15）: タブから外したがプロセスは生きているペイン。
     /// 由来タブごとに分離表示する（FR-2.15.6）ため `BackgroundPane` で由来を保持する
     shelved: Vec<BackgroundPane>,
+    /// タブ単位のバックグラウンド（#1487）: `Tab` を**分解せずに**退避したもの。
+    /// ペイン単位の `shelved` と別に持つのは「状態を 1 か所にする」ため
+    /// （分割ツリーそのものが状態なので、1 ペイン抜いたあとの整合が自明になる）
+    shelved_tabs: Vec<BackgroundTab>,
     /// 論理ウィンドウ（Issue #339）。常に 1 つ以上。空になったウィンドウは即座に除去する
     windows: Vec<WorkspaceWindow>,
     /// タブ → 所属ウィンドウ。不変条件: 全タブがちょうど 1 ウィンドウに属する
@@ -146,22 +150,141 @@ impl BackgroundPane {
     }
 }
 
+/// タブごとバックグラウンドへ退避したタブ（#1487）。
+///
+/// ユーザーがタブバーの「ー」/ タブの D&D で退避したとき、中のペインを 1 本ずつに
+/// **分解しない**でここへ移す。分割ツリー・比率・ペインの属性は `Tab` がそのまま
+/// 持っているので、復帰は「元の並び位置へ挿し直す」だけで済む
+/// （旧実装は `into_panes()` で平坦化していたため、1 本ずつしか戻せなかった）。
+#[derive(Debug)]
+pub struct BackgroundTab {
+    tab: Tab,
+    /// 退避元のウィンドウ（Issue #339）。閉じていればアクティブウィンドウへ戻す
+    origin_window: WindowId,
+    /// 退避時点の `Workspace::tabs` 内の並び位置。超えていれば末尾へ戻す
+    origin_index: usize,
+}
+
+impl BackgroundTab {
+    /// 退避タブを由来情報とともに包む（退避時・レイアウト復元時の両方で使う）
+    pub fn new(tab: Tab, origin_window: WindowId, origin_index: usize) -> Self {
+        Self {
+            tab,
+            origin_window,
+            origin_index,
+        }
+    }
+
+    /// タブ本体（分割ツリー・タイトル・折りたたみ等の参照に使う）
+    pub fn tab(&self) -> &Tab {
+        &self.tab
+    }
+
+    pub fn id(&self) -> TabId {
+        self.tab.id()
+    }
+
+    pub fn title(&self) -> &str {
+        self.tab.title()
+    }
+
+    /// 退避元のウィンドウ（実在を保証しない。復帰先の解決に使う）
+    pub fn origin_window(&self) -> WindowId {
+        self.origin_window
+    }
+
+    /// 退避時点の並び位置（復帰先の解決に使う）
+    pub fn origin_index(&self) -> usize {
+        self.origin_index
+    }
+
+    /// 配下のペイン ID（表示順）
+    pub fn pane_ids(&self) -> Vec<PaneId> {
+        self.tab.tree().panes().iter().map(|p| p.id()).collect()
+    }
+
+    /// 配下のペイン数
+    pub fn pane_count(&self) -> usize {
+        self.tab.tree().panes().len()
+    }
+}
+
+/// 退避タブを戻す先（#1487）。**純粋関数**にしてあるのは、UI / dispatch / 復元の
+/// どこから来ても同じ判断になることを単体テストで固定するため。
+///
+/// - ウィンドウ: 由来ウィンドウが健在ならそこ、閉じていればアクティブウィンドウ
+/// - 位置: 退避時点の並び位置。現在のタブ数を超えていれば末尾
+pub fn unshelve_tab_placement(
+    origin_window: WindowId,
+    origin_index: usize,
+    live_windows: &[WindowId],
+    active_window: WindowId,
+    tabs_len: usize,
+) -> (WindowId, usize) {
+    let window = if live_windows.contains(&origin_window) {
+        origin_window
+    } else {
+        active_window
+    };
+    (window, origin_index.min(tabs_len))
+}
+
+/// 退避タブから 1 ペイン抜いたあとの扱い（#1487）。
+/// 空になった退避タブは残さない（中身の無いカードがたまり場に残らない）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShelvedTabFate {
+    /// まだペインが残っているので退避タブを保つ
+    Keep,
+    /// 空になったので退避タブごと消す
+    Remove,
+}
+
+/// 残りペイン数から退避タブの去就を決める（純粋関数。上記の判断を 1 実装にする）
+pub fn shelved_tab_fate(remaining_panes: usize) -> ShelvedTabFate {
+    if remaining_panes == 0 {
+        ShelvedTabFate::Remove
+    } else {
+        ShelvedTabFate::Keep
+    }
+}
+
+/// #1487 の A/B。`TAKO_1487_LEGACY=1` でタブ退避を**平坦化**する旧挙動へ戻す
+/// （同一バイナリで Issue の症状を再現できるようにしておく）
+pub fn shelve_tab_legacy() -> bool {
+    std::env::var("TAKO_1487_LEGACY").is_ok_and(|v| v == "1")
+}
+
 impl Workspace {
     /// 最初のタブ（とそのルートペイン）込みで生成する
     pub fn new(initial_tab_title: impl Into<String>, root_pane: Pane) -> Self {
         let tab = Tab::new(initial_tab_title, root_pane);
         let active = tab.id();
-        Self::single_window(vec![tab], active, Vec::new())
+        Self::single_window(vec![tab], active, Vec::new(), Vec::new())
     }
 
     /// 全タブを 1 つの論理ウィンドウに載せて構築する（新規作成・後方互換復元の共通経路）
-    fn single_window(tabs: Vec<Tab>, active: TabId, shelved: Vec<BackgroundPane>) -> Self {
+    fn single_window(
+        tabs: Vec<Tab>,
+        active: TabId,
+        shelved: Vec<BackgroundPane>,
+        shelved_tabs: Vec<BackgroundTab>,
+    ) -> Self {
         let wid = WindowId::next();
         let assignments = tabs.iter().map(|t| (t.id(), wid)).collect();
+        // 由来ウィンドウが 1 枚しか無い復元では、退避タブの由来も唯一のウィンドウへ寄せる
+        // （保存値の由来 ID は再起動で採番し直されるので、そのままでは必ず「閉じている」）
+        let shelved_tabs = shelved_tabs
+            .into_iter()
+            .map(|mut t| {
+                t.origin_window = wid;
+                t
+            })
+            .collect();
         Self {
             tabs,
             active,
             shelved,
+            shelved_tabs,
             windows: vec![WorkspaceWindow { id: wid, active }],
             assignments,
             active_window: wid,
@@ -179,7 +302,7 @@ impl Workspace {
         } else {
             tabs[0].id()
         };
-        Some(Self::single_window(tabs, active, Vec::new()))
+        Some(Self::single_window(tabs, active, Vec::new(), Vec::new()))
     }
 
     pub fn tabs(&self) -> &[Tab] {
@@ -449,11 +572,12 @@ impl Workspace {
         Ok(())
     }
 
-    /// レイアウト復元用（FR-2.15.5）。shelved ペインも含めて復元する
+    /// レイアウト復元用（FR-2.15.5 / #1487）。shelved ペイン・退避タブも含めて復元する
     pub fn restore_with_shelved(
         tabs: Vec<Tab>,
         active: TabId,
         shelved: Vec<BackgroundPane>,
+        shelved_tabs: Vec<BackgroundTab>,
     ) -> Option<Self> {
         if tabs.is_empty() {
             return None;
@@ -463,7 +587,7 @@ impl Workspace {
         } else {
             tabs[0].id()
         };
-        Some(Self::single_window(tabs, active, shelved))
+        Some(Self::single_window(tabs, active, shelved, shelved_tabs))
     }
 
     /// レイアウト復元用（Issue #339）。保存済みのウィンドウ割当も復元する。
@@ -474,6 +598,7 @@ impl Workspace {
         tabs: Vec<Tab>,
         active: TabId,
         shelved: Vec<BackgroundPane>,
+        shelved_tabs: Vec<BackgroundTab>,
         windows: Vec<(u64, Vec<TabId>, TabId)>,
     ) -> Option<Self> {
         if tabs.is_empty() {
@@ -509,7 +634,7 @@ impl Workspace {
             });
         }
         if ws_windows.is_empty() {
-            return Some(Self::single_window(tabs, active, shelved));
+            return Some(Self::single_window(tabs, active, shelved, shelved_tabs));
         }
         // 保存値に載っていないタブは先頭ウィンドウへ
         let first = ws_windows[0].id;
@@ -521,10 +646,24 @@ impl Workspace {
         if let Some(w) = ws_windows.iter_mut().find(|w| w.id == active_window) {
             w.active = active;
         }
+        // 退避タブの由来ウィンドウ: 復元されたウィンドウに無ければアクティブへ寄せる
+        // （`unshelve_tab_placement` と同じ判断。ここで正規化しておくと
+        // 「保存値に無いウィンドウ ID を握ったまま」の退避タブが残らない）
+        let live: Vec<WindowId> = ws_windows.iter().map(|w| w.id).collect();
+        let shelved_tabs = shelved_tabs
+            .into_iter()
+            .map(|mut t| {
+                if !live.contains(&t.origin_window) {
+                    t.origin_window = active_window;
+                }
+                t
+            })
+            .collect();
         Some(Self {
             tabs,
             active,
             shelved,
+            shelved_tabs,
             windows: ws_windows,
             assignments,
             active_window,
@@ -540,9 +679,148 @@ impl Workspace {
         self.shelved.iter().find(|p| p.id() == pane_id)
     }
 
-    /// バックグラウンドペインの由来タブ ID（タブ別分離表示・復帰先の解決に使う。FR-2.15.6）
+    /// バックグラウンドペインの由来タブ ID（タブ別分離表示・復帰先の解決に使う。FR-2.15.6）。
+    /// 退避タブ（#1487）配下のペインは、その退避タブ自身を由来として返す
     pub fn shelved_origin_tab(&self, pane_id: PaneId) -> Option<TabId> {
-        self.shelved(pane_id).map(|p| p.origin_tab())
+        if let Some(p) = self.shelved(pane_id) {
+            return Some(p.origin_tab());
+        }
+        self.shelved_tab_of_pane(pane_id)
+    }
+
+    /// バックグラウンドに居る**すべて**のペイン（平坦な退避 + 退避タブ配下。#1487）。
+    ///
+    /// 「画面には無いが器は生きている」の判定はここを通す。#1487 以前は
+    /// `shelved_panes()` がその全部だったので、tmux の掃除・ペインログ・ビューの
+    /// 刈り取りといった**寿命に関わる経路**は 1 か所でも漏らすと器を殺してしまう
+    pub fn all_background_panes(&self) -> Vec<&Pane> {
+        self.shelved
+            .iter()
+            .map(|p| p.pane())
+            .chain(
+                self.shelved_tabs
+                    .iter()
+                    .flat_map(|t| t.tab.tree().panes().into_iter()),
+            )
+            .collect()
+    }
+
+    /// tako が抱えている**すべての**ペイン ID（表示中のタブ + バックグラウンド）。
+    ///
+    /// 「このペインはまだ生きているか」を判定する側（コマンドカードの掃除・
+    /// ペインビューの刈り取り）はここを通す。退避タブ（#1487）配下を落とすと
+    /// **タブを「ー」で送った瞬間に道連れで消える**（#1487 以前は平坦化されていたため
+    /// `shelved_panes()` だけで足りていた = 直し漏れが後退になる箇所）
+    pub fn all_pane_ids(&self) -> std::collections::HashSet<PaneId> {
+        self.tabs
+            .iter()
+            .flat_map(|t| t.tree().panes().into_iter().map(|p| p.id()))
+            .chain(self.all_background_panes().iter().map(|p| p.id()))
+            .collect()
+    }
+
+    /// バックグラウンドのペイン 1 本を由来つきで引く（平坦な退避 + 退避タブ配下）。
+    /// 返すのは (ペイン, 由来タブ ID, 由来タブ名)
+    pub fn background_pane(&self, pane_id: PaneId) -> Option<(&Pane, TabId, &str)> {
+        if let Some(p) = self.shelved.iter().find(|p| p.id() == pane_id) {
+            return Some((p.pane(), p.origin_tab(), p.origin_tab_title()));
+        }
+        self.shelved_tabs.iter().find_map(|t| {
+            t.tab
+                .tree()
+                .panes()
+                .into_iter()
+                .find(|p| p.id() == pane_id)
+                .map(|p| (p, t.id(), t.title()))
+        })
+    }
+
+    // === タブ単位のバックグラウンド（#1487） ===
+
+    /// 退避タブ一覧（退避した順）
+    pub fn shelved_tabs(&self) -> &[BackgroundTab] {
+        &self.shelved_tabs
+    }
+
+    /// 退避タブを 1 枚引く
+    pub fn shelved_tab(&self, tab_id: TabId) -> Option<&BackgroundTab> {
+        self.shelved_tabs.iter().find(|t| t.id() == tab_id)
+    }
+
+    /// タブが退避中か
+    pub fn is_shelved_tab(&self, tab_id: TabId) -> bool {
+        self.shelved_tab(tab_id).is_some()
+    }
+
+    /// ペインを配下に持つ退避タブの ID（無ければ None）
+    pub fn shelved_tab_of_pane(&self, pane_id: PaneId) -> Option<TabId> {
+        self.shelved_tabs
+            .iter()
+            .find(|t| t.tab.tree().panes().iter().any(|p| p.id() == pane_id))
+            .map(|t| t.id())
+    }
+
+    /// 退避タブごと画面へ戻す（#1487）。戻す先は [`unshelve_tab_placement`] が決める。
+    /// 戻したタブはそのウィンドウの表示タブになり、アクティブウィンドウなら
+    /// グローバルのアクティブタブにもなる
+    pub fn unshelve_tab(&mut self, tab_id: TabId) -> Result<TabId, WorkspaceError> {
+        let idx = self
+            .shelved_tabs
+            .iter()
+            .position(|t| t.id() == tab_id)
+            .ok_or(WorkspaceError::TabNotFound(tab_id))?;
+        let live: Vec<WindowId> = self.windows.iter().map(|w| w.id).collect();
+        let entry = &self.shelved_tabs[idx];
+        let (wid, at) = unshelve_tab_placement(
+            entry.origin_window,
+            entry.origin_index,
+            &live,
+            self.active_window,
+            self.tabs.len(),
+        );
+        let entry = self.shelved_tabs.remove(idx);
+        let id = entry.id();
+        self.tabs.insert(at, entry.tab);
+        self.assignments.insert(id, wid);
+        self.window_mut(wid).active = id;
+        self.active_window = wid;
+        self.active = id;
+        Ok(id)
+    }
+
+    /// 退避タブを丸ごと捨てる（kill。中のペインの後始末は UI / dispatch 側の責務）
+    pub fn remove_shelved_tab(&mut self, tab_id: TabId) -> Option<BackgroundTab> {
+        let idx = self.shelved_tabs.iter().position(|t| t.id() == tab_id)?;
+        Some(self.shelved_tabs.remove(idx))
+    }
+
+    /// 退避タブからペインを 1 本抜く（個別復帰・個別 kill の共通経路）。
+    /// 空になった退避タブは [`shelved_tab_fate`] の判断どおり消す
+    fn take_pane_from_shelved_tab(&mut self, pane_id: PaneId) -> Option<(Pane, TabId, String)> {
+        let idx = self
+            .shelved_tabs
+            .iter()
+            .position(|t| t.tab.tree().panes().iter().any(|p| p.id() == pane_id))?;
+        let origin_tab = self.shelved_tabs[idx].id();
+        let origin_title = self.shelved_tabs[idx].title().to_string();
+        let pane = match self.shelved_tabs[idx].tab.tree_mut().close(pane_id) {
+            Ok(pane) => pane,
+            Err(PaneTreeError::LastPane) => {
+                // 最後の 1 本 → 退避タブごと外してペインを取り出す
+                let entry = self.shelved_tabs.remove(idx);
+                let mut panes = entry.tab.into_tree().into_panes();
+                panes.pop().expect("タブは常に 1 ペイン以上を持つ")
+            }
+            Err(e) => unreachable!("退避タブの close で想定外のエラー: {e}"),
+        };
+        if let Some(entry) = self.shelved_tabs.get(idx) {
+            if entry.id() == origin_tab
+                && shelved_tab_fate(entry.pane_count()) == ShelvedTabFate::Remove
+            {
+                self.shelved_tabs.remove(idx);
+            }
+        }
+        Some((pane, origin_tab, origin_title))
     }
 
     /// ペインをバックグラウンドへバックグラウンドする（FR-2.15.1）。ペインをツリーから外してバックグラウンドに移す。
@@ -582,22 +860,31 @@ impl Workspace {
         }
     }
 
-    /// バックグラウンドからペインを復帰させる（FR-2.15.3）。target を direction 側に分割して挿入する
+    /// バックグラウンドからペインを復帰させる（FR-2.15.3）。target を direction 側に分割して挿入する。
+    /// #1487: 退避タブ（`shelved_tabs`）配下のペインも 1 本だけ取り出せる
+    /// （抜いたぶんはツリーから消え、空になった退避タブはたまり場から消える）
     pub fn unshelve_pane(
         &mut self,
         pane_id: PaneId,
         target: PaneId,
         direction: SplitDirection,
     ) -> Result<(), WorkspaceError> {
-        let idx = self
-            .shelved
-            .iter()
-            .position(|p| p.id() == pane_id)
-            .ok_or(WorkspaceError::PaneNotFound(pane_id))?;
+        let flat = self.shelved.iter().position(|p| p.id() == pane_id);
+        if flat.is_none() && self.shelved_tab_of_pane(pane_id).is_none() {
+            return Err(WorkspaceError::PaneNotFound(pane_id));
+        }
         let tab_id = self
             .find_tab_of_pane(target)
             .ok_or(WorkspaceError::PaneNotFound(target))?;
-        let pane = self.shelved.remove(idx).pane;
+        let pane = match flat {
+            Some(idx) => self.shelved.remove(idx).pane,
+            // 退避タブ配下: ツリーから抜く（空になれば退避タブごと消える）
+            None => {
+                self.take_pane_from_shelved_tab(pane_id)
+                    .expect("直前に存在確認済み")
+                    .0
+            }
+        };
         self.get_tab_mut(tab_id)
             .expect("find_tab_of_pane で存在確認済み")
             .tree_mut()
@@ -606,21 +893,40 @@ impl Workspace {
         Ok(())
     }
 
-    /// バックグラウンドからペインを削除する（FR-2.15.2 の kill 時に使う）
+    /// バックグラウンドからペインを削除する（FR-2.15.2 の kill 時に使う）。
+    /// #1487: 退避タブ配下のペインも抜ける（空になった退避タブは消える）
     pub fn remove_shelved(&mut self, pane_id: PaneId) -> Option<BackgroundPane> {
-        let idx = self.shelved.iter().position(|p| p.id() == pane_id)?;
-        Some(self.shelved.remove(idx))
+        if let Some(idx) = self.shelved.iter().position(|p| p.id() == pane_id) {
+            return Some(self.shelved.remove(idx));
+        }
+        let (pane, origin_tab, origin_title) = self.take_pane_from_shelved_tab(pane_id)?;
+        Some(BackgroundPane::from_pane(pane, origin_tab, origin_title))
     }
 
-    /// ペインがバックグラウンドにあるか
+    /// ペインがバックグラウンドにあるか（#1487: 退避タブ配下も「バックグラウンド」）
     pub fn is_shelved(&self, pane_id: PaneId) -> bool {
         self.shelved.iter().any(|p| p.id() == pane_id)
+            || self.shelved_tab_of_pane(pane_id).is_some()
     }
 
-    /// タブ内の全ペインをバックグラウンドへバックグラウンドする（FR-2.15 タブ単位バックグラウンド）。
-    /// タブを閉じて全ペインを shelved に移す。最後の 1 タブの場合は LastTab を返す
-    /// （呼び出し側で新ペインを生やしてからリトライする想定）
+    /// タブをまるごとバックグラウンドへ退避する（FR-2.15.7 / #1487）。
+    ///
+    /// タブを閉じ、`Tab` を**分解せずに** `shelved_tabs` へ移す（分割ツリー・比率・
+    /// ペイン属性・並び位置・所属ウィンドウをそのまま保つ）。最後の 1 タブの場合は
+    /// LastTab を返す（呼び出し側で新タブを生やしてからリトライする想定）。
+    ///
+    /// A/B `TAKO_1487_LEGACY=1` は #1487 **前**の平坦化（`shelved` へ 1 本ずつ）へ戻す
     pub fn shelve_tab(&mut self, tab_id: TabId) -> Result<Vec<PaneId>, WorkspaceError> {
+        self.shelve_tab_in(tab_id, shelve_tab_legacy())
+    }
+
+    /// [`Workspace::shelve_tab`] の実体（判断を引数で受ける形。#1367 と同じ理屈で、
+    /// env はプロセス全体の状態なのでテストからは引数側を使う）
+    pub fn shelve_tab_in(
+        &mut self,
+        tab_id: TabId,
+        legacy: bool,
+    ) -> Result<Vec<PaneId>, WorkspaceError> {
         let origin_title = match self.get_tab(tab_id) {
             Some(t) => t.title().to_string(),
             None => return Err(WorkspaceError::TabNotFound(tab_id)),
@@ -628,14 +934,31 @@ impl Workspace {
         if self.tabs.len() == 1 {
             return Err(WorkspaceError::LastTab);
         }
+        let origin_window = self
+            .assignments
+            .get(&tab_id)
+            .copied()
+            .unwrap_or(self.active_window);
+        let origin_index = self
+            .tabs
+            .iter()
+            .position(|t| t.id() == tab_id)
+            .expect("get_tab で存在確認済み");
         let tab = self.close_tab(tab_id).expect("複数タブ確認済み");
-        let panes = tab.into_tree().into_panes();
-        let ids: Vec<PaneId> = panes.iter().map(|p| p.id()).collect();
-        self.shelved.extend(
-            panes
-                .into_iter()
-                .map(|p| BackgroundPane::from_pane(p, tab_id, origin_title.clone())),
-        );
+        let ids: Vec<PaneId> = tab.tree().panes().iter().map(|p| p.id()).collect();
+        if legacy {
+            // TAKO_1487_LEGACY_ARM 開始（#1487 前の平坦化。番犬はここを対象外にする）
+            self.shelved.extend(
+                tab.into_tree()
+                    .into_panes()
+                    .into_iter()
+                    .map(|p| BackgroundPane::from_pane(p, tab_id, origin_title.clone())),
+            );
+            // TAKO_1487_LEGACY_ARM 終了
+            return Ok(ids);
+        }
+        self.shelved_tabs
+            .push(BackgroundTab::new(tab, origin_window, origin_index));
         Ok(ids)
     }
 
@@ -1121,18 +1444,259 @@ mod tests {
         let t2 = ws.create_tab("t2", pane());
         // t1（p1, p2）をまとめてバックグラウンド
         let t1 = ws.tabs()[0].id();
-        let shelved_ids = ws.shelve_tab(t1).unwrap();
+        let shelved_ids = ws.shelve_tab_in(t1, false).unwrap();
         assert_eq!(shelved_ids.len(), 2);
         assert!(shelved_ids.contains(&p1));
         assert!(shelved_ids.contains(&p2_id));
         assert_eq!(ws.tabs().len(), 1);
         assert_eq!(ws.active_tab_id(), t2);
+        // #1487: タブは分解されず 1 単位で退避される（平坦な shelved は増えない）
+        assert_eq!(ws.shelved_panes().len(), 0);
+        assert_eq!(ws.shelved_tabs().len(), 1);
+        let entry = ws.shelved_tab(t1).unwrap();
+        assert_eq!(entry.title(), "t1");
+        assert_eq!(entry.pane_count(), 2);
+        assert_eq!(entry.origin_index(), 0);
+        // 配下のペインも「バックグラウンドに居る」= 由来はその退避タブ
+        assert!(ws.is_shelved(p1) && ws.is_shelved(p2_id));
+        assert_eq!(ws.shelved_origin_tab(p2_id), Some(t1));
+        assert!(ws.is_shelved_tab(t1));
+    }
+
+    /// #1487 の A/B: legacy=true は #1487 前の平坦化（1 本ずつ `shelved` へ）に戻る
+    #[test]
+    fn レガシーのタブ退避は平坦化する() {
+        let mut ws = Workspace::new("t1", pane());
+        let p1 = ws.active_tab().tree().focused();
+        let p2 = pane();
+        let p2_id = p2.id();
+        ws.active_tab_mut()
+            .tree_mut()
+            .split(p1, SplitDirection::Right, p2)
+            .unwrap();
+        ws.create_tab("t2", pane());
+        let t1 = ws.tabs()[0].id();
+        ws.shelve_tab_in(t1, true).unwrap();
+        assert_eq!(ws.shelved_tabs().len(), 0, "legacy は退避タブを作らない");
         assert_eq!(ws.shelved_panes().len(), 2);
-        // タブ単位バックグラウンドでは全ペインが同じ由来タブ（t1）を共有する（FR-2.15.6）
         assert!(ws
             .shelved_panes()
             .iter()
             .all(|p| p.origin_tab() == t1 && p.origin_tab_title() == "t1"));
+        assert!(ws.is_shelved(p1) && ws.is_shelved(p2_id));
+    }
+
+    /// #1487: 退避 → 復帰で分割ツリー・比率・並び位置・タイトルがそのまま戻る
+    #[test]
+    fn 退避タブは分割ツリーごと元の位置へ戻る() {
+        let mut ws = Workspace::new("t1", pane());
+        let t1 = ws.active_tab_id();
+        let p1 = ws.active_tab().tree().focused();
+        let p2 = pane();
+        let p2_id = p2.id();
+        ws.active_tab_mut()
+            .tree_mut()
+            .split_with_ratio(p1, SplitDirection::Down, 0.3, p2)
+            .unwrap();
+        let t2 = ws.create_tab("t2", pane());
+        let t3 = ws.create_tab("t3", pane());
+        let before = ws.get_tab(t1).unwrap().tree().layout(crate::Rect::UNIT);
+
+        ws.shelve_tab_in(t1, false).unwrap();
+        assert_eq!(
+            ws.tabs().iter().map(|t| t.id()).collect::<Vec<_>>(),
+            vec![t2, t3]
+        );
+
+        let restored = ws.unshelve_tab(t1).unwrap();
+        assert_eq!(restored, t1);
+        // 元の並び位置（先頭）へ戻る
+        assert_eq!(
+            ws.tabs().iter().map(|t| t.id()).collect::<Vec<_>>(),
+            vec![t1, t2, t3]
+        );
+        assert_eq!(ws.active_tab_id(), t1);
+        assert_eq!(ws.shelved_tabs().len(), 0);
+        // 分割ツリーと比率が一致する
+        let after = ws.get_tab(t1).unwrap().tree().layout(crate::Rect::UNIT);
+        assert_eq!(before, after);
+        assert!(!ws.is_shelved(p1) && !ws.is_shelved(p2_id));
+    }
+
+    /// #1487: 退避タブから 1 ペインだけ取り出せる。全部抜くと退避タブは消える
+    #[test]
+    fn 退避タブから1ペインずつ取り出せる() {
+        let mut ws = Workspace::new("t1", pane());
+        let t1 = ws.active_tab_id();
+        let p1 = ws.active_tab().tree().focused();
+        let p2 = pane();
+        let p2_id = p2.id();
+        ws.active_tab_mut()
+            .tree_mut()
+            .split(p1, SplitDirection::Right, p2)
+            .unwrap();
+        let t2 = ws.create_tab("t2", pane());
+        let target = ws.get_tab(t2).unwrap().tree().focused();
+        ws.shelve_tab_in(t1, false).unwrap();
+
+        ws.unshelve_pane(p1, target, SplitDirection::Right).unwrap();
+        assert_eq!(ws.get_tab(t2).unwrap().tree().len(), 2);
+        // 残り 1 本なので退避タブは残る
+        assert_eq!(ws.shelved_tabs().len(), 1);
+        assert_eq!(ws.shelved_tab(t1).unwrap().pane_count(), 1);
+        assert!(!ws.is_shelved(p1) && ws.is_shelved(p2_id));
+
+        ws.unshelve_pane(p2_id, target, SplitDirection::Down)
+            .unwrap();
+        assert_eq!(ws.shelved_tabs().len(), 0, "空になった退避タブは消える");
+        assert_eq!(ws.get_tab(t2).unwrap().tree().len(), 3);
+    }
+
+    /// #1487: 退避タブ配下のペインも kill（`remove_shelved`）で抜ける
+    #[test]
+    fn 退避タブ配下のペインをkillできる() {
+        let mut ws = Workspace::new("t1", pane());
+        let t1 = ws.active_tab_id();
+        let p1 = ws.active_tab().tree().focused();
+        let p2 = pane();
+        let p2_id = p2.id();
+        ws.active_tab_mut()
+            .tree_mut()
+            .split(p1, SplitDirection::Right, p2)
+            .unwrap();
+        ws.create_tab("t2", pane());
+        ws.shelve_tab_in(t1, false).unwrap();
+
+        let killed = ws.remove_shelved(p1).expect("退避タブ配下でも抜ける");
+        assert_eq!(killed.id(), p1);
+        assert_eq!(killed.origin_tab(), t1);
+        assert_eq!(killed.origin_tab_title(), "t1");
+        assert_eq!(ws.shelved_tab(t1).unwrap().pane_count(), 1);
+
+        ws.remove_shelved(p2_id).unwrap();
+        assert_eq!(ws.shelved_tabs().len(), 0);
+        assert!(ws.remove_shelved(p2_id).is_none());
+    }
+
+    /// #1487: 戻す先の決定（純粋関数）。由来ウィンドウの生死と位置の丸め
+    #[test]
+    fn 退避タブの復帰先は純粋関数が決める() {
+        let a = WindowId::from_raw(9001);
+        let b = WindowId::from_raw(9002);
+        let gone = WindowId::from_raw(9003);
+        // 由来ウィンドウが健在 → そこへ。位置はそのまま
+        assert_eq!(unshelve_tab_placement(a, 1, &[a, b], b, 3), (a, 1));
+        // 由来ウィンドウが閉じている → アクティブウィンドウへ
+        assert_eq!(unshelve_tab_placement(gone, 1, &[a, b], b, 3), (b, 1));
+        // 位置が現在のタブ数を超える → 末尾
+        assert_eq!(unshelve_tab_placement(a, 9, &[a], a, 2), (a, 2));
+        // 先頭は先頭のまま
+        assert_eq!(unshelve_tab_placement(a, 0, &[a], a, 5), (a, 0));
+    }
+
+    /// #1487: 「生きているペイン」の集合に退避タブ配下が入る（掃除の道連れを防ぐ）
+    #[test]
+    fn 退避タブ配下も生きているペインに数える() {
+        let mut ws = Workspace::new("t1", pane());
+        let t1 = ws.active_tab_id();
+        let p1 = ws.active_tab().tree().focused();
+        let p2 = pane();
+        let p2_id = p2.id();
+        ws.active_tab_mut()
+            .tree_mut()
+            .split(p1, SplitDirection::Right, p2)
+            .unwrap();
+        let t2 = ws.create_tab("t2", pane());
+        let p3 = ws.get_tab(t2).unwrap().tree().focused();
+        // ペイン単位の退避も 1 本混ぜる（平坦 + 退避タブの両方を数えることを見る）
+        let p4 = pane();
+        let p4_id = p4.id();
+        ws.get_tab_mut(t2)
+            .unwrap()
+            .tree_mut()
+            .split(p3, SplitDirection::Down, p4)
+            .unwrap();
+        ws.shelve_pane(p4_id).unwrap();
+        ws.shelve_tab_in(t1, false).unwrap();
+
+        assert_eq!(ws.all_background_panes().len(), 3, "平坦 1 + 退避タブ 2");
+        let alive = ws.all_pane_ids();
+        for id in [p1, p2_id, p3, p4_id] {
+            assert!(alive.contains(&id), "ペイン {id} が alive から落ちている");
+        }
+        assert_eq!(alive.len(), 4);
+    }
+
+    /// #1487: タブを「ー」で送ってもコマンドカードが道連れで消えない
+    /// （`prune_command_cards` が `all_pane_ids()` で `retain` する経路を、
+    /// カードの実体（`CommandCards`）ごと通して確かめる。GUI を立てずに
+    /// `retain` の前後を見られる形にしてある）
+    #[test]
+    fn タブを退避してもコマンドカードは残る() {
+        let mut ws = Workspace::new("t1", pane());
+        let t1 = ws.active_tab_id();
+        let p1 = ws.active_tab().tree().focused();
+        let p2 = pane();
+        let p2_id = p2.id();
+        ws.active_tab_mut()
+            .tree_mut()
+            .split(p1, SplitDirection::Right, p2)
+            .unwrap();
+        ws.create_tab("t2", pane());
+
+        let mut cards = crate::CommandCards::new();
+        cards
+            .show(p1, &["cargo test --workspace".to_string()], Some("検証"))
+            .unwrap();
+        cards
+            .show(p2_id, &["npm run dev".to_string()], None)
+            .unwrap();
+        assert_eq!(cards.len(), 2);
+
+        ws.shelve_tab_in(t1, false).unwrap();
+        // 退避した瞬間の掃除（`prune_command_cards` と同じ判定）
+        let alive = ws.all_pane_ids();
+        let removed = cards.retain_panes(|p| alive.contains(&p));
+        assert_eq!(removed, 0, "退避しただけでカードを消してはいけない");
+        assert_eq!(cards.len(), 2);
+        assert_eq!(
+            cards.latest_for(p1).map(|c| c.commands().to_vec()),
+            Some(vec!["cargo test --workspace".to_string()]),
+            "論理 1 行のまま残る"
+        );
+
+        // 本当に閉じたペインは従来どおり消える（掃除が効いていることの裏取り）
+        ws.remove_shelved(p2_id).unwrap();
+        let alive = ws.all_pane_ids();
+        assert_eq!(cards.retain_panes(|p| alive.contains(&p)), 1);
+        assert_eq!(cards.len(), 1);
+    }
+
+    /// #1487: 空になった退避タブの去就（純粋関数）
+    #[test]
+    fn 空になった退避タブは消える判断() {
+        assert_eq!(shelved_tab_fate(0), ShelvedTabFate::Remove);
+        assert_eq!(shelved_tab_fate(1), ShelvedTabFate::Keep);
+        assert_eq!(shelved_tab_fate(9), ShelvedTabFate::Keep);
+    }
+
+    /// #1487: 由来ウィンドウが閉じていればアクティブウィンドウへ戻る（#339）
+    #[test]
+    fn 由来ウィンドウが閉じた退避タブはアクティブウィンドウへ戻る() {
+        let mut ws = Workspace::new("t1", pane());
+        let t1 = ws.active_tab_id();
+        let (w2, t2) = ws.create_window("w2", pane());
+        let t3 = ws.create_tab_in_window("t3", pane(), w2).unwrap();
+        // w2 の t3 を退避 → w2 に残るのは t2 だけ
+        ws.shelve_tab_in(t3, false).unwrap();
+        assert_eq!(ws.shelved_tab(t3).unwrap().origin_window(), w2);
+        // w2 を畳む（t2 を w1 へ移すと w2 は空になり除去される）
+        let w1 = ws.window_of_tab(t1).unwrap();
+        ws.move_tab_to_window(t2, w1).unwrap();
+        assert_eq!(ws.windows().len(), 1);
+        // 由来ウィンドウは消えたのでアクティブウィンドウへ戻る
+        ws.unshelve_tab(t3).unwrap();
+        assert_eq!(ws.window_of_tab(t3), Some(w1));
     }
 
     #[test]
@@ -1419,6 +1983,7 @@ mod tests {
             vec![t1, t2, t3],
             i2,
             Vec::new(),
+            Vec::new(),
             vec![(101, vec![i1, i2], i2), (102, vec![i3], i3)],
         )
         .unwrap();
@@ -1444,6 +2009,7 @@ mod tests {
             vec![t1, t2],
             i1,
             Vec::new(),
+            Vec::new(),
             vec![
                 (201, vec![ghost], ghost), // 実在タブなし → ウィンドウごと読み飛ばし
                 (202, vec![i1], ghost),    // 表示タブ不正 → 先頭タブへ
@@ -1464,7 +2030,8 @@ mod tests {
     fn restore_with_windowsの空保存値は単一ウィンドウへフォールバック() {
         let t1 = Tab::new("t1", pane());
         let i1 = t1.id();
-        let ws = Workspace::restore_with_windows(vec![t1], i1, Vec::new(), Vec::new()).unwrap();
+        let ws = Workspace::restore_with_windows(vec![t1], i1, Vec::new(), Vec::new(), Vec::new())
+            .unwrap();
         assert_eq!(ws.windows().len(), 1);
         assert_eq!(ws.window_of_tab(i1), Some(ws.active_window_id()));
     }

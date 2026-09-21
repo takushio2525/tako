@@ -339,8 +339,9 @@ fn collect_live_panes(host: &dyn ControlHost) -> Vec<(u64, Option<String>)> {
             panes.push((p.id().as_u64(), host.backend_session(p.id())));
         }
     }
-    for s in host.workspace().shelved_panes() {
-        panes.push((s.id().as_u64(), host.backend_session(s.id())));
+    // #1487: 退避タブ配下のペインも器は生きている（レジストリの「消えた」誤判定を防ぐ）
+    for p in host.workspace().all_background_panes() {
+        panes.push((p.id().as_u64(), host.backend_session(p.id())));
     }
     panes
 }
@@ -356,10 +357,11 @@ fn collect_limit_resume_panes(host: &dyn ControlHost) -> Vec<u64> {
         .map(|p| p.id().as_u64())
         .chain(
             host.workspace()
-                .shelved_panes()
-                .iter()
-                .filter(|s| s.pane().limit_autoresume())
-                .map(|s| s.id().as_u64()),
+                .all_background_panes()
+                .into_iter()
+                .filter(|p| p.limit_autoresume())
+                .map(|p| p.id().as_u64())
+                .collect::<Vec<_>>(),
         )
         .collect()
 }
@@ -2885,9 +2887,35 @@ fn dispatch_inner(
 
         Request::Foreground {
             pane,
+            tab,
             target,
             direction,
         } => {
+            // #1487: タブ単位の復帰（分割ツリー・比率・並び位置ごと戻す）
+            if let Some(t) = tab {
+                if pane.is_some() {
+                    return Err(DispatchError::InvalidParams(
+                        "pane と tab は同時に指定できない".to_string(),
+                    ));
+                }
+                let tab_id = TabId::from_raw(t);
+                if !host.workspace().is_shelved_tab(tab_id) {
+                    return Err(DispatchError::TabNotFound(t));
+                }
+                let panes: Vec<u64> = host
+                    .workspace()
+                    .shelved_tab(tab_id)
+                    .map(|e| e.pane_ids().iter().map(|p| p.as_u64()).collect())
+                    .unwrap_or_default();
+                host.workspace_mut().unshelve_tab(tab_id).map_err(op_err)?;
+                for p in &panes {
+                    host.reattach_backgrounded(PaneId::from_raw(*p));
+                }
+                return Ok(json!({ "foregrounded_tab": t, "panes": panes }));
+            }
+            let pane = pane.ok_or_else(|| {
+                DispatchError::InvalidParams("pane か tab のどちらかが要る".to_string())
+            })?;
             let pane_id = PaneId::from_raw(pane);
             if !host.workspace().is_shelved(pane_id) {
                 return Err(DispatchError::PaneNotFound(pane));
@@ -2913,43 +2941,54 @@ fn dispatch_inner(
         }
 
         Request::BackgroundList => {
-            let items: Vec<serde_json::Value> = host
+            // 平坦な一覧（従来の契約）。#1487 の退避タブ配下も **`shelved_tab` 付きで**
+            // ここへ出す（今動いているクライアントを壊さない = #1467 と同じ理屈）
+            let mut items: Vec<serde_json::Value> = host
                 .workspace()
                 .shelved_panes()
                 .iter()
                 .map(|p| {
-                    let preview = host.preview_state(p.id());
-                    let state = if preview.is_some() {
-                        CommandState::Idle
-                    } else {
-                        host.session(p.id())
-                            .map(|s| s.command_state())
-                            .unwrap_or(CommandState::Unknown)
-                    };
-                    let cwd = host
-                        .session(p.id())
-                        .and_then(|s| s.cwd())
-                        .map(|p| p.display().to_string());
-                    let mut entry = json!({
-                        "pane": p.id().as_u64(),
-                        "title": p.title(),
-                        "role": p.role(),
-                        "state": format!("{state:?}").to_lowercase(),
-                        "cwd": cwd,
-                        "origin_tab": p.origin_tab().as_u64(),
-                        "origin_tab_title": p.origin_tab_title(),
-                        "surface": "background",
-                    });
-                    if let Some((path, mode)) = preview {
-                        entry["preview"] = json!({
-                            "path": path,
-                            "mode": mode.as_str(),
-                        });
-                    }
-                    entry
+                    background_entry_json(
+                        host,
+                        p.pane(),
+                        p.origin_tab(),
+                        p.origin_tab_title(),
+                        None,
+                    )
                 })
                 .collect();
-            Ok(json!({ "backgrounded": items }))
+            let tabs: Vec<serde_json::Value> = host
+                .workspace()
+                .shelved_tabs()
+                .iter()
+                .map(|entry| {
+                    let panes: Vec<serde_json::Value> = entry
+                        .tab()
+                        .tree()
+                        .panes()
+                        .iter()
+                        .map(|p| {
+                            background_entry_json(
+                                host,
+                                p,
+                                entry.id(),
+                                entry.title(),
+                                Some(entry.id().as_u64()),
+                            )
+                        })
+                        .collect();
+                    items.extend(panes.iter().cloned());
+                    json!({
+                        "tab": entry.id().as_u64(),
+                        "title": entry.title(),
+                        "origin_window": entry.origin_window().as_u64(),
+                        "origin_index": entry.origin_index(),
+                        "panes": panes,
+                        "tree": tree_json(entry.tab().tree().root()),
+                    })
+                })
+                .collect();
+            Ok(json!({ "backgrounded": items, "tabs": tabs }))
         }
 
         Request::CollapseTab {
@@ -2974,14 +3013,18 @@ fn dispatch_inner(
             pinned,
         } => {
             if let Some(t) = group_tab {
-                // 閉じたタブグループ: tab は閉じているので tabs() に無い。バックグラウンドペインの由来で検証
+                // 閉じたタブグループ: tab は閉じているので tabs() に無い。バックグラウンドペインの由来で検証。
+                // #1487: 退避タブ（タブ単位の退避）も同じホバープレビューの対象なので
+                // 両方を通す（GUI の `background_entries_of_tab` は解決するのに
+                // dispatch だけ拒む = 設計原則 5 の 1:1 が崩れる）
                 let tab = TabId::from_raw(t);
-                if !host
-                    .workspace()
-                    .shelved_panes()
-                    .iter()
-                    .any(|p| p.origin_tab() == tab)
-                {
+                let known = host.workspace().is_shelved_tab(tab)
+                    || host
+                        .workspace()
+                        .shelved_panes()
+                        .iter()
+                        .any(|p| p.origin_tab() == tab);
+                if !known {
                     return Err(DispatchError::TabNotFound(t));
                 }
                 host.set_pin_group(tab, pinned);
@@ -11871,7 +11914,7 @@ fn check_health(host: &dyn ControlHost) -> Value {
     let ws = host.workspace();
     let tab_count = ws.tabs().len();
     let pane_count: usize = ws.tabs().iter().map(|t| t.tree().len()).sum();
-    let bg_count = ws.shelved_panes().len();
+    let bg_count = ws.all_background_panes().len();
 
     let healthy = issues.is_empty();
 
@@ -12764,19 +12807,60 @@ fn list_json(host: &dyn ControlHost) -> Value {
             })
         })
         .collect();
-    let shelved: Vec<Value> = ws
+    let shelved_pane_json = |pane: &tako_core::Pane,
+                             origin_tab: TabId,
+                             origin_tab_title: &str,
+                             shelved_tab: Option<u64>| {
+        let mut v = json!({
+            "id": pane.id().as_u64(),
+            "title": pane.title(),
+            "role": pane.role(),
+            "origin": origin_str(pane.origin()),
+            "spawned_by": pane.spawned_by().map(|id| id.as_u64()),
+            "origin_tab": origin_tab.as_u64(),
+            "origin_tab_title": origin_tab_title,
+            "limit_autoresume": pane.limit_autoresume(),
+            "surface": "background",
+        });
+        if let Some(tab) = shelved_tab {
+            v["shelved_tab"] = json!(tab);
+        }
+        v
+    };
+    let mut shelved: Vec<Value> = ws
         .shelved_panes()
         .iter()
-        .map(|bp| {
+        .map(|bp| shelved_pane_json(bp.pane(), bp.origin_tab(), bp.origin_tab_title(), None))
+        .collect();
+    // #1487: 退避タブ配下のペインも「バックグラウンドに居る」ので同じ一覧へ出す
+    for entry in ws.shelved_tabs() {
+        for pane in entry.tab().tree().panes() {
+            shelved.push(shelved_pane_json(
+                pane,
+                entry.id(),
+                entry.title(),
+                Some(entry.id().as_u64()),
+            ));
+        }
+    }
+    let shelved_tabs: Vec<Value> = ws
+        .shelved_tabs()
+        .iter()
+        .map(|entry| {
             json!({
-                "id": bp.id().as_u64(),
-                "title": bp.title(),
-                "role": bp.role(),
-                "origin": origin_str(bp.pane().origin()),
-                "spawned_by": bp.pane().spawned_by().map(|id| id.as_u64()),
-                "origin_tab": bp.origin_tab().as_u64(),
-                "origin_tab_title": bp.origin_tab_title(),
-                "limit_autoresume": bp.pane().limit_autoresume(),
+                "tab": entry.id().as_u64(),
+                "title": entry.title(),
+                "origin_window": entry.origin_window().as_u64(),
+                "origin_index": entry.origin_index(),
+                "focused_pane": entry.tab().tree().focused().as_u64(),
+                "panes": entry
+                    .tab()
+                    .tree()
+                    .panes()
+                    .iter()
+                    .map(|p| p.id().as_u64())
+                    .collect::<Vec<_>>(),
+                "tree": tree_json(entry.tab().tree().root()),
             })
         })
         .collect();
@@ -12787,9 +12871,56 @@ fn list_json(host: &dyn ControlHost) -> Value {
         "windows": windows_json(host)["windows"].clone(),
         "tabs": tabs,
         "shelved_panes": shelved,
+        // タブ単位の退避（#1487）。分割ツリーごと退避されているタブ
+        "shelved_tabs": shelved_tabs,
         // ピン留め中のプレビューウィンドウ（FR-2.16.15。AI が現在のピンを把握できる）
         "pinned": pinned_json(host),
     })
+}
+
+/// バックグラウンド 1 ペインの JSON（`BackgroundList` の平坦な一覧と `tabs` 配下で共用）。
+///
+/// `shelved_tab` は #1487 の退避タブ配下のときだけ載る（平坦側の既存の形は変えないので、
+/// 今動いているクライアントは追加フィールドを無視するだけで済む）
+fn background_entry_json(
+    host: &dyn ControlHost,
+    pane: &tako_core::Pane,
+    origin_tab: TabId,
+    origin_tab_title: &str,
+    shelved_tab: Option<u64>,
+) -> Value {
+    let preview = host.preview_state(pane.id());
+    let state = if preview.is_some() {
+        CommandState::Idle
+    } else {
+        host.session(pane.id())
+            .map(|s| s.command_state())
+            .unwrap_or(CommandState::Unknown)
+    };
+    let cwd = host
+        .session(pane.id())
+        .and_then(|s| s.cwd())
+        .map(|p| p.display().to_string());
+    let mut entry = json!({
+        "pane": pane.id().as_u64(),
+        "title": pane.title(),
+        "role": pane.role(),
+        "state": format!("{state:?}").to_lowercase(),
+        "cwd": cwd,
+        "origin_tab": origin_tab.as_u64(),
+        "origin_tab_title": origin_tab_title,
+        "surface": "background",
+    });
+    if let Some((path, mode)) = preview {
+        entry["preview"] = json!({
+            "path": path,
+            "mode": mode.as_str(),
+        });
+    }
+    if let Some(tab) = shelved_tab {
+        entry["shelved_tab"] = json!(tab);
+    }
+    entry
 }
 
 /// ピン留め中のプレビュー一覧を JSON 配列へ（list / Pin 応答で共用。FR-2.16.15）
@@ -16444,7 +16575,8 @@ mod tests {
         let result = dispatch(
             &mut host,
             Request::Foreground {
-                pane: p2,
+                pane: Some(p2),
+                tab: None,
                 target: None,
                 direction: None,
             },
@@ -16477,6 +16609,106 @@ mod tests {
         assert_eq!(panes.len(), 2);
         assert!(host.ws.is_shelved(PaneId::from_raw(root)));
         assert!(host.ws.is_shelved(PaneId::from_raw(p2)));
+    }
+
+    /// #1487: タブ単位の退避・復帰と一覧の形（平坦な一覧は残しつつ `tabs` が増える）
+    #[test]
+    fn background_tabは1単位で退避し復帰でツリーごと戻る() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let t1 = host.ws.active_tab_id();
+        let p2 = split(&mut host, root);
+        host.ws.create_tab("t2", Pane::new(PaneOrigin::User));
+        dispatch(
+            &mut host,
+            Request::Background {
+                pane: None,
+                tab: Some(t1.as_u64()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        // 平坦化されない（`shelved` は増えず `shelved_tabs` が 1 枚）
+        assert_eq!(host.ws.shelved_panes().len(), 0);
+        assert_eq!(host.ws.shelved_tabs().len(), 1);
+
+        let list = dispatch(&mut host, Request::BackgroundList, PaneOrigin::Cli).unwrap();
+        // 既存の平坦な契約は残り、退避タブ配下は `shelved_tab` 付きで併載される
+        let flat = list["backgrounded"].as_array().unwrap();
+        assert_eq!(flat.len(), 2);
+        assert!(flat
+            .iter()
+            .all(|p| p["shelved_tab"].as_u64() == Some(t1.as_u64())));
+        let tabs = list["tabs"].as_array().unwrap();
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0]["tab"].as_u64(), Some(t1.as_u64()));
+        assert_eq!(tabs[0]["panes"].as_array().unwrap().len(), 2);
+        // list の shelved_tabs にも出る（設計原則 5 の 1:1）
+        let all = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
+        assert_eq!(all["shelved_tabs"].as_array().unwrap().len(), 1);
+        assert_eq!(all["shelved_panes"].as_array().unwrap().len(), 2);
+
+        let back = dispatch(
+            &mut host,
+            Request::Foreground {
+                pane: None,
+                tab: Some(t1.as_u64()),
+                target: None,
+                direction: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(back["foregrounded_tab"].as_u64(), Some(t1.as_u64()));
+        assert_eq!(host.ws.shelved_tabs().len(), 0);
+        // 元の並び位置（先頭）へ、2 ペインのまま戻る
+        assert_eq!(host.ws.tabs()[0].id(), t1);
+        assert_eq!(host.ws.get_tab(t1).unwrap().tree().len(), 2);
+        assert!(!host.ws.is_shelved(PaneId::from_raw(root)));
+        assert!(!host.ws.is_shelved(PaneId::from_raw(p2)));
+    }
+
+    /// #1487: 退避タブもホバープレビューのピン留め対象（GUI が解決するのに dispatch が
+    /// 拒むと設計原則 5 の 1:1 が崩れる）
+    #[test]
+    fn 退避タブをgroup_tabでピン留めできる() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let t1 = host.ws.active_tab_id();
+        split(&mut host, root);
+        host.ws.create_tab("t2", Pane::new(PaneOrigin::User));
+        dispatch(
+            &mut host,
+            Request::Background {
+                pane: None,
+                tab: Some(t1.as_u64()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let pinned = dispatch(
+            &mut host,
+            Request::Pin {
+                pane: None,
+                group_tab: Some(t1.as_u64()),
+                pinned: Some(true),
+            },
+            PaneOrigin::Cli,
+        )
+        .expect("退避タブはピン留めできる");
+        assert_eq!(pinned["group_tab"].as_u64(), Some(t1.as_u64()));
+        // 実在しないタブは従来どおり拒む（検証が素通りになっていない）
+        let err = dispatch(
+            &mut host,
+            Request::Pin {
+                pane: None,
+                group_tab: Some(99999),
+                pinned: Some(true),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(matches!(err, DispatchError::TabNotFound(99999)));
     }
 
     #[test]
@@ -16557,7 +16789,8 @@ mod tests {
         let result = dispatch(
             &mut host,
             Request::Foreground {
-                pane: p2,
+                pane: Some(p2),
+                tab: None,
                 target: None,
                 direction: None,
             },

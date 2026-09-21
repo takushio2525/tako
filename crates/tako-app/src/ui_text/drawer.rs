@@ -26,6 +26,20 @@ pub fn tab_group(title: &str, count: usize) -> String {
     )
 }
 
+/// タブ単位で退避したタブの見出し（キー: drawer.shelved_tab_group。#1487）。
+/// 中のペインは分解されていないので「ペイン数」ではなく「タブ 1 枚」として見せる
+pub fn shelved_tab_group(title: &str, count: usize) -> String {
+    tr!(
+        format!("タブ {title}（退避中・{count} ペイン）"),
+        format!("Tab {title} (shelved, {count} panes)")
+    )
+}
+
+/// 退避タブをまとめて戻すボタン（キー: drawer.restore_tab。#1487）
+pub fn restore_tab() -> &'static str {
+    tr!("タブごと復帰", "Restore tab")
+}
+
 /// ドロワーヘッダー（キー: drawer.header）
 pub fn header(total: usize) -> String {
     tr!(
@@ -47,6 +61,8 @@ mod tests {
                 empty().to_string(),
                 closed_tab_group("build"),
                 tab_group("dev", 3),
+                shelved_tab_group("dev", 3),
+                restore_tab().to_string(),
                 header(5),
             ]
         });

@@ -54,3 +54,8 @@
 - `tako remote start` の成功だけが `<data_dir>/remote/tako-remote.desired`（移行の番地 `SchemaId::RemoteDesired`）を作り、GUI が persist 復元のあと `spawn_daemon` をバックオフ（2/5/10/20/40 秒）で数回試す。**消す条件は「止まっていること」の 1 つ**（`Ok` だけ見ると Mac 再起動後に stop した人の意図を落とす）。判断は理由を返す純関数 `autostart_decision` 1 本で、CLI / チップ / persist.log は読むだけ
 - 無言にしない: 途中の失敗も persist.log へ 1 行ずつ、諦めたら `notify_ui_failure` の 1 実装 + `remote status` の `desired` / `last_autostart`（`running: false` の応答にも必ず載る）。OS ゲートは `platform::support` の `tako_remote_start` を引く（専用キーは足さない = T2 が落ちる）
 - 実測: `scripts/test-remote-autostart-1485.sh` **26 PASS 0 FAIL**（隔離 GUI + 実 daemon）。A/B `TAKO_1485_LEGACY=1` は同スクリプトで 13 FAIL（①が「自動復帰しない」= Issue の症状）。番犬 4 本・注入 10 通り + 実注入で `remote.rs:339` を名指し。workspace 5002 passed 0 failed・clippy 3 宇宙 0・check-windows error 0
+
+## 2026-09-21（#1487: タブを「ー」で送ったらタブ単位で退避・復帰できるようにした）
+- `Workspace::shelved_tabs`（`Tab` 本体 + 由来ウィンドウ + 元の並び位置）を追加し、`shelve_tab` は `into_panes()` の平坦化をやめて**タブを分解せず**移す。判断は純粋関数 2 本（`unshelve_tab_placement` / `shelved_tab_fate`）。永続は `LayoutFile.shelved_tabs`（serde default = 旧ファイルそのまま読める・移行 Step 不要）
+- 「バックグラウンドに居るペイン」を見る側は `all_background_panes()`、「まだ生きているペイン」を見る側は `all_pane_ids()` の 2 本へ寄せた（**受け入れ検査 rework 1 回目**: コマンドカードの `retain` / 退避バッジの件数 / `Pin { group_tab }` の検証 / 見出しタイトル / 「閉じたタブ」群の 5 か所が退避タブを見落としていた）
+- 実測: `scripts/test-shelve-tab-1487.sh` **24 PASS 0 FAIL**（退避→復帰で tree/rect/title/title_source 一致・再起動往復・1 ペイン抜き・旧 layout.json・A/B `TAKO_1487_LEGACY=1`）+ visual-test 項目 153（合成マウス）。番犬 3 本（注入 15 通り・実注入で `workspace.rs` を名指し）

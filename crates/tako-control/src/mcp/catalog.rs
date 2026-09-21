@@ -1352,7 +1352,8 @@ pub fn tools() -> Vec<Value> {
             "description": "ペインまたはタブをバックグラウンドへ送る。プロセスは生きたまま\
                 画面から外す。邪魔なペインやタブを画面外へ送るのに使う。バックグラウンドのペインは\
                 tako_background_list で確認でき、tako_foreground_pane で画面に戻せる。\
-                tab 指定時はタブ内全ペインを一括退避する（pane と tab は排他）。",
+                tab 指定時は**タブ 1 単位**で退避する（分割ツリー・比率・並び位置を保ったまま。\
+                pane と tab は排他）。戻すときは tako_foreground_pane の tab を使う。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1364,17 +1365,19 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_foreground_pane",
-            "description": "バックグラウンドのペインを画面に復帰させる。target ペインの\
-                direction 側を分割して表示する。target 省略時は由来タブへ戻す\
-                （由来タブが閉じていればアクティブタブ）。バックグラウンドで動かしていたペインを取り出すのに使う。",
+            "description": "バックグラウンドのペインまたはタブを画面に復帰させる。\
+                pane 指定: target ペインの direction 側を分割して表示する。target 省略時は\
+                由来タブへ戻す（由来タブが閉じていればアクティブタブ）。\
+                tab 指定: 退避タブを**分割ツリー・比率・ペイン属性ごと**元のウィンドウの\
+                元の並び位置へ戻す（target / direction は使わない）。pane と tab は排他。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "pane": { "type": "integer", "description": "復帰させるペインの ID（background list から取得）" },
-                    "target": { "type": "integer", "description": "挿入先ペインの ID（省略時はフォーカス中ペイン）" },
-                    "direction": { "type": "string", "enum": ["right","down","left","up"], "description": "分割方向（省略時は right）" },
+                    "pane": { "type": "integer", "description": "復帰させるペインの ID（background list から取得。tab と排他）" },
+                    "tab": { "type": "integer", "description": "復帰させる退避タブの ID（background list の tabs[].tab。pane と排他）" },
+                    "target": { "type": "integer", "description": "挿入先ペインの ID（省略時はフォーカス中ペイン。pane 指定時のみ）" },
+                    "direction": { "type": "string", "enum": ["right","down","left","up"], "description": "分割方向（省略時は right。pane 指定時のみ）" },
                 },
-                "required": ["pane"],
                 "additionalProperties": false,
             },
         }),
@@ -1383,7 +1386,10 @@ pub fn tools() -> Vec<Value> {
             "description": "バックグラウンドのペイン一覧を取得する。各ペインの\
                 ID / title / role / state / cwd に加え、由来タブ（origin_tab / origin_tab_title）と\
                 surface（常に background = 裏で実行中）を返す。バックグラウンドペインはこの由来タブで\
-                グループ分けして表示され、tako_foreground_pane で由来タブへ戻せる。",
+                グループ分けして表示され、tako_foreground_pane で由来タブへ戻せる。\
+                tabs には**タブ単位で退避されたタブ**（tab / title / origin_window / panes / tree）が並ぶ。\
+                退避タブ配下のペインは backgrounded にも shelved_tab 付きで出るので、\
+                1 本だけ取り出すことも tako_foreground_pane の tab でまとめて戻すこともできる。",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
