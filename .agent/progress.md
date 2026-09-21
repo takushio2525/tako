@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-16（#1479: tasks ビューを押した行の直下で開き、タブのバッジを幅で欠けさせない）
-- A: 詳細を**行の器の子**へ移し（旧実装は列の末尾に 1 枚 + 「選択が無ければ先頭」で畳めなかった）、`toggle` / `collapse` の 1 実装で「再押下で閉じる・別項目で乗り換える・絞り込みで畳む・ポーリングでは畳まない・`done` で畳む（dispatch 側 1 か所）」に。展開した行は `scroll_to_item` で見える位置へ。矢印は `CHEVRON_*`
-- B: タブ列を `panel_tab_density` の 3 段（Full / Compact / IconsOnly）+ belt（バッジ `flex_none` / ラベル `min_w(0)`）で詰め、件数は `panel_tab_badge`（0 件は出さない・100 以上は `99+`）。220〜900px × 0/9/22/150/4000 件を単体テストが 1px 刻みで固定、visual-test 項目 152 が**バッジの実矩形がタブ列の内側**かを 4 幅 × 4 件数で読む（A/B `TAKO_1479_LEGACY=1` は 10/16 で FAILED = 320px で 9px 溢れる）
-- MCP / CLI 1:1: `tako todo expand <id>` / `collapse` + `list` の `expanded`。番犬 `issue1479_tasks_accordion_watchdog`（注入 11 通り）・実経路 `scripts/test-todo-expand-1479.sh`
-
 ## 2026-09-18（#1482: ドキュメントサイトを tako.takushio2525.com へ移行）
 - `docs/astro.config.mjs` の `site` を新ドメインへ（canonical / og:url / og:image / sitemap はここ 1 か所が基点なのでまとめて追従）。About の `DOCUMENTATION_URL` は「`site` と同じ URL」という設定コメントの約束があるので同一コミットで動かす
 - 旧ドメインの転送は `docs/functions/_middleware.js` の 301。`*.pages.dev` はゾーン外で Redirect Rules / Bulk Redirects を書けず `_redirects` はホスト名を条件にできないため、Pages Functions が唯一の経路。プレビュー配備を潰さないようホスト名は完全一致で見る
@@ -59,3 +54,8 @@
 - タブ形の描画語彙を `tako-app::tab_shape` へ切り出し（寸法 / 状態ドット / 小バッジ / ボタンスロット）、タブバーと退避タブカードが**同じ 1 実装**を通る形に。退避タブは見出し + 「タブごと復帰」ボタン + ペインカード列 → **カード 1 枚**（状態ドット + タブ名 + ペイン数 + ×）になり、本体のどこを押しても既存の `unshelve_tab_clicked` で復帰。× はタブごと kill の 2 段確認（`stop_propagation` で本体と分離・発生源は `PaneButton` = #770 の `close:gui-tab` に混ぜない）
 - 右パネルも同じカードで、配下ペイン行は `▸`（`CHEVRON_*`）で開く。ドロワー / 右パネルとも `render_shelved_tab_card` の 1 実装
 - 実測: visual-test 項目 153（合成マウス）が `TAKO_VISUAL_TEST_OK`。A/B `TAKO_1491_LEGACY=1` は「タブ形カード 1 枚」で FAILED。実注入 2 通り（本体 on_click 削除 / 2 段確認飛ばし）で visual-test と番犬が `tab_shape.rs:203` を名指し。`test-shelve-tab-1487.sh` 24 PASS 0 FAIL・workspace 5024 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。番犬 `issue1491_shelved_tab_card_watchdog` 3 本（注入 11 通り）
+
+## 2026-09-21（#1496: 番犬の関数名追跡を 1 実装へ寄せ、pub(crate) fn の中の違反を正しく名指しする）
+- 追跡が `strip_prefix("fn ")` だと `pub(crate) fn` / `async fn` が頭に見えず、中の違反が**手前の関数名**で報告されていた（検出は効くが名指しが嘘 = 緑のまま残る）。`tako_core::source_scan`（`fn_head_name` / `is_top_level_fn_head`）を新設し、同型 5 か所（#770 の 2 本 / remote_scrollback / issue841 / test_residue / setup_bootstrap）を差し替え。tako-core へ置いたのは tako-app の `#[cfg(test)]` と tako-control の tests の**両方**から引ける唯一の置き場だから
+- 実測（実ファイルへの注入で A/B）: `main.rs:6202` が 旧 `shelved_tab_groups` → 新 `unshelve_tab_clicked`・`main.rs:8901` が 旧 `background_tab` → 新 `reattach_backgrounded_preview`。前者は Issue の症状そのもの
+- 番犬 `issue1496_fn_head_watchdog` 2 本（直書きの再発 / 寄せ先の空振り）。注入 11 通りすべて FAILED + file:line 名指し（A 5 = 番犬が噛む / B 6 = 寄せた 5 か所の検出力が落ちていない）

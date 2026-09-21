@@ -58,6 +58,7 @@ pub mod shell_integration;
 pub mod shell_profile;
 pub mod shell_send;
 pub mod sidebar;
+pub mod source_scan;
 pub mod spawn_layout;
 pub mod ssh_config;
 pub mod ssh_detect;

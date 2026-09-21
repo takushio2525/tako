@@ -21,14 +21,18 @@ fn remote_rs() -> PathBuf {
 }
 
 /// `tmux_command(` を直に呼んでいる行を「囲っている関数名」つきで集める。
-/// コメント行は落とす（説明文の中の `tmux_command(` を拾わない）
+/// コメント行は落とす（説明文の中の `tmux_command(` を拾わない）。
+///
+/// 関数の頭の判定は `tako_core::source_scan::fn_head_name` の 1 実装を通す
+/// （旧実装は `pub(super)` / `const fn` / `extern "C" fn` を取りこぼしていた。
+/// remote.rs には実際に `extern "C" fn signal_handler` が在る = #1496）
 fn direct_tmux_calls(src: &str) -> Vec<(String, usize, String)> {
     let mut out = Vec::new();
     let mut current = String::from("<トップレベル>");
     for (idx, line) in src.lines().enumerate() {
         let code = line.trim_start();
-        if let Some(name) = fn_name(code) {
-            current = name;
+        if let Some(name) = tako_core::source_scan::fn_head_name(code) {
+            current = name.to_string();
         }
         if code.starts_with("//") {
             continue;
@@ -38,21 +42,6 @@ fn direct_tmux_calls(src: &str) -> Vec<(String, usize, String)> {
         }
     }
     out
-}
-
-/// `fn <名前>` の宣言行から関数名を取り出す（`pub` / `pub(crate)` / `async` を許す）
-fn fn_name(code: &str) -> Option<String> {
-    let rest = code
-        .strip_prefix("pub(crate) ")
-        .or_else(|| code.strip_prefix("pub "))
-        .unwrap_or(code);
-    let rest = rest.strip_prefix("async ").unwrap_or(rest);
-    let rest = rest.strip_prefix("fn ")?;
-    let name: String = rest
-        .chars()
-        .take_while(|c| c.is_alphanumeric() || *c == '_')
-        .collect();
-    (!name.is_empty()).then_some(name)
 }
 
 /// **#972 の本体**: scrollback の経路に tmux 直呼びが戻っていないこと。
@@ -189,4 +178,23 @@ fn b() {\n    // tmux_command( はコメントなので拾わない\n    let x =
     let calls = direct_tmux_calls(src);
     assert_eq!(calls.len(), 1, "拾い方がおかしい: {calls:?}");
     assert_eq!(calls[0].0, "a");
+
+    // #1496: 可視性修飾子・`extern "C"` つきの関数の中の直呼びも**その関数名**で
+    // 名乗ること（旧実装は `extern "C" fn` を頭と見なさず、手前の名前で報告した。
+    // remote.rs には実際に `extern "C" fn signal_handler` が在る）
+    let src = "\
+fn 手前() {\n    let x = 1;\n}\n\
+pub(crate) fn 内側(&self) {\n    tako_core::tmux::tmux_command(None);\n}\n\
+extern \"C\" fn signal_handler(_: i32) {\n    tako_core::tmux::tmux_command(None);\n}\n\
+pub(super) const fn 定数() {\n    tako_core::tmux::tmux_command(None);\n}\n";
+    let names: Vec<String> = direct_tmux_calls(src).into_iter().map(|c| c.0).collect();
+    assert_eq!(
+        names,
+        vec![
+            "内側".to_string(),
+            "signal_handler".to_string(),
+            "定数".to_string()
+        ],
+        "修飾子つきの関数の中の直呼びが、その関数名で名乗っていない（#1496）"
+    );
 }
