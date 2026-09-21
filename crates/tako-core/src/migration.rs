@@ -90,6 +90,12 @@ pub enum SchemaId {
     RemoteDevices,
     /// `<data_dir>/remote/shortcuts.json`（リモート閲覧のショートカット。#1451）
     RemoteShortcuts,
+    /// `<data_dir>/remote/tako-remote.desired`（「起動していた」の記録。#1485）。
+    ///
+    /// **短命な稼働状態ではない**（pid / port / serve の自己検査と違い、Mac の
+    /// 再起動をまたいで残ることが存在意義）ので番地を持つ。中身は `since` だけで、
+    /// **ファイルが在ること自体が意図**なので形式の検査は持たない
+    RemoteDesired,
 }
 
 impl SchemaId {
@@ -118,6 +124,7 @@ impl SchemaId {
             Self::DiscoveryInstance => "discovery_instance",
             Self::RemoteDevices => "remote_devices",
             Self::RemoteShortcuts => "remote_shortcuts",
+            Self::RemoteDesired => "remote_desired",
         }
     }
 
@@ -150,6 +157,7 @@ impl SchemaId {
             Self::DiscoveryInstance,
             Self::RemoteDevices,
             Self::RemoteShortcuts,
+            Self::RemoteDesired,
         ]
     }
 }

@@ -305,6 +305,71 @@ fn write_peer_guard(state: &PeerGuardState) {
     }
 }
 
+// --- 自動復帰（#1485） -------------------------------------------------------
+// 「ユーザーが起動していた」という**意図**と、GUI が立て直した**結果**の置き場。
+// 判断と形式は `crate::remote_autostart` の 1 実装が持ち、ここは読み書きだけを持つ
+// （`serve_health` / `peer_guard` と同じ分け方）
+
+/// 「起動していた」の記録（#1485）。**ファイルが在ること自体が意図**で、
+/// `tako remote start` の成功だけが作り `tako remote stop` の成功だけが消す。
+///
+/// daemon が死んでも消えない（[`cleanup_state_files`] の対象外）のが要点:
+/// Mac の再起動で消えるのは daemon であって、ユーザーの意図ではない
+pub fn desired_path() -> std::path::PathBuf {
+    state_dir().join("tako-remote.desired")
+}
+
+/// 自動復帰の直近の結果（#1485）。GUI が書き `tako remote status`（別プロセス）が読む
+pub fn autostart_path() -> std::path::PathBuf {
+    state_dir().join("tako-remote.autostart")
+}
+
+/// 「起動していた」の記録を読む（無い = 意図が無い）。
+///
+/// **ファイルが在れば内容が壊れていても意図は在ったとみなす**（`since` だけ
+/// 分からなくなる）。中身で真偽を二重に持つと「在るのに false」という
+/// 読み手ごとに解釈の割れる状態を作ってしまう
+pub fn read_desired() -> Option<crate::remote_autostart::DesiredState> {
+    let raw = std::fs::read_to_string(desired_path()).ok()?;
+    Some(serde_json::from_str(&raw).unwrap_or(crate::remote_autostart::DesiredState { since: 0 }))
+}
+
+/// 「起動していた」を残す（#1485。`spawn_daemon` の成功時だけが呼ぶ）。
+/// 既に在れば `since` は動かさない（起動し直しても「いつから」が巻き戻らない）
+pub fn set_desired() {
+    if desired_path().exists() {
+        return;
+    }
+    let state = crate::remote_autostart::DesiredState {
+        since: now_epoch_secs(),
+    };
+    if let Ok(json) = serde_json::to_string(&state) {
+        let _ = ensure_state_dir();
+        let _ = write_secret_file(&desired_path(), &json);
+    }
+}
+
+/// 「起動していた」を消す（#1485。`daemon_stop` の成功時だけが呼ぶ）。
+/// 直近の結果も一緒に消す（停止済みの環境に古い自動復帰の記録を残さない）
+pub fn clear_desired() {
+    let _ = std::fs::remove_file(desired_path());
+    let _ = std::fs::remove_file(autostart_path());
+}
+
+/// 自動復帰の直近の結果を読む（無い・壊れている = 記録なし）
+pub fn read_last_autostart() -> Option<crate::remote_autostart::LastAutostart> {
+    let raw = std::fs::read_to_string(autostart_path()).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// 自動復帰の結果を残す（0600。他の state ファイルと揃える）
+pub fn write_last_autostart(last: &crate::remote_autostart::LastAutostart) {
+    if let Ok(json) = serde_json::to_string(last) {
+        let _ = ensure_state_dir();
+        let _ = write_secret_file(&autostart_path(), &json);
+    }
+}
+
 /// serve の増減を audit.log へ残す（#1049: 「何が消したか」を後から追えるように）。
 /// pid と実行ファイルが載るので、世代違いの tako が犯人なら名指しできる
 fn audit_serve(event: &str, extra: serde_json::Value) {
@@ -541,6 +606,13 @@ fn restrict_permissions(path: &std::path::Path) {
     }
 }
 
+/// 稼働中 daemon の痕跡（pid / トークン / 待ち受け / URL / 自己検査）を消す。
+///
+/// **`tako-remote.desired` と `tako-remote.autostart` は消さない**（#1485）:
+/// 前者はユーザーの意図で、daemon の死とは寿命が違う（Mac の再起動で消えるのは
+/// daemon であって意図ではない）。後者は「なぜ戻せなかったか」の記録なので、
+/// daemon が居ないときにこそ読みたい。どちらも `tako remote stop` の成功
+/// （[`clear_desired`]）だけが消す
 fn cleanup_state_files() {
     let _ = std::fs::remove_file(pid_path());
     let _ = std::fs::remove_file(token_path());
@@ -2397,7 +2469,7 @@ fn configure_daemon_child(cmd: &mut Command) {
 pub fn daemon_status() -> Value {
     let pid_info = match parse_pid_file() {
         Ok(info) => info,
-        Err(_) => return json!({ "running": false }),
+        Err(_) => return with_autostart_fields(json!({ "running": false })),
     };
     let pid_num = pid_info.pid;
     if !is_process_alive(pid_num) {
@@ -2405,7 +2477,7 @@ pub fn daemon_status() -> Value {
         if !is_isolated() {
             cleanup_state_files();
         }
-        return json!({ "running": false });
+        return with_autostart_fields(json!({ "running": false }));
     }
     // URL ファイル（起動時に確定した固定 ts.net URL）から接続リンクを再構成する。
     // #283: URL に token は含まれない（QR も固定 URL のみ）
@@ -2471,6 +2543,24 @@ pub fn daemon_status() -> Value {
     }
     if let Some(n) = devices {
         status["devices"] = json!(n);
+    }
+    with_autostart_fields(status)
+}
+
+/// 自動復帰の意図と直近の結果を応答へ載せる（#1485）。
+///
+/// **`running` のどの分岐でも通す**のが要点。止まっているときこそ
+/// 「戻すつもりが在ったのか」「戻そうとして失敗したのか」が要る情報なので、
+/// `running: false` だけを返す経路に付け忘れると #1485 が消したい「黙る」が残る。
+/// 形（キー名・中身）は `remote_autostart::status_fields` の 1 実装が決める
+fn with_autostart_fields(mut status: Value) -> Value {
+    let desired = read_desired();
+    let last = read_last_autostart();
+    let fields = crate::remote_autostart::status_fields(desired.as_ref(), last.as_ref());
+    if let Some(obj) = fields.as_object() {
+        for (k, v) in obj {
+            status[k.clone()] = v.clone();
+        }
     }
     status
 }
@@ -2679,12 +2769,27 @@ fn parse_etime(s: &str) -> Option<u64> {
 /// P0-4: PID + 実行ファイル + 起動時刻を照合し、無関係プロセスを kill しない。
 /// PID ファイルが無い場合はポート占有者を探して stale デーモンなら回収する
 pub fn daemon_stop() -> Result<Value, String> {
-    daemon_stop_impl(false)
+    forget_if_stopped(daemon_stop_impl(false))
 }
 
 /// `--force` 付き停止。SIGTERM を試みた後 SIGKILL を送る
 pub fn daemon_force_stop() -> Result<Value, String> {
-    daemon_stop_impl(true)
+    forget_if_stopped(daemon_stop_impl(true))
+}
+
+/// 停止のあと daemon が居なければ「起動していた」の記録を消す（#1485）。
+///
+/// **判定は結果の文字列ではなく現況**にする。`daemon_stop_impl` は「止めた」だけでなく
+/// 「もともと止まっていた」「pid が別人だったので state だけ掃除した」も `Err` で返す
+/// ので、`Ok` だけを見ると *Mac の再起動で daemon が消えた後に `tako remote stop` した*
+/// 人の意図（もう起動しないでほしい）を取りこぼし、次の GUI 起動で勝手に戻ってしまう。
+/// 逆に「止まらなかった（SIGTERM / SIGKILL のタイムアウト）」のときは daemon が生きた
+/// ままなので記録も残す = **消す条件は「止まっていること」の 1 つ**
+fn forget_if_stopped(result: Result<Value, String>) -> Result<Value, String> {
+    if daemon_status()["running"].as_bool() != Some(true) {
+        clear_desired();
+    }
+    result
 }
 
 /// デーモン停止後に残った serve 設定をベストエフォートで解除する。
@@ -3002,6 +3107,11 @@ pub fn spawn_daemon() -> Result<Value, String> {
     // 起動応答に serve へ使ったバイナリを含める（#432: start 直後に世代を確認できる）
     let mut info = info;
     info["serve_binary"] = json!(tako_bin);
+
+    // #1485: 「ユーザーが起動していた」を残す。**起動が成った後だけ**書くので、
+    // セットアップ不足で拒否された環境に意図だけが溜まることはない。
+    // ここが唯一の書き手（GUI の起動ボタン / CLI / MCP はすべてこの関数を通る）
+    set_desired();
 
     Ok(info)
 }

@@ -33,6 +33,34 @@ tako remote stop      # 停止
 ステータスバーの「リモート」チップは**常に表示されています**（停止中は中空の丸 + 「リモート オフ」、稼働中は塗りつぶしの丸 + 接続端末数）。クリックすると起動・停止をその場で切り替えられ、Tailscale の設定が足りないときは不足項目とセットアップコマンドが同じパネルに出ます。理由が分からないまま止まることはありません。
 :::
 
+### tako を再起動しても、起動していれば自動で戻る
+
+一度 `tako remote start`（またはチップの起動ボタン）で起動すれば、**tako や Mac を再起動しても自動で立ち上がり直します**。タブやペインが戻るのと同じで、こちらから何かする必要はありません。Mac の再起動直後は Tailscale 本体がまだ立ち上がっていないことがあるので、tako は少し待ちながら数回やり直します。
+
+止めたいときは `tako remote stop`（またはチップの停止ボタン）を 1 回。**「起動していた」という記録も一緒に消える**ので、以後は再起動しても勝手に戻りません。
+
+戻せなかったときは黙りません。理由がステータスバーのリモートカードに出て、`tako remote status` にも残ります。
+
+```bash
+tako remote status
+# {
+#   "running": false,
+#   "desired": true,                       # 起動していた（戻すつもりだった）
+#   "last_autostart": {
+#     "result": "failed",                  # started / skipped / failed
+#     "attempts": 5,
+#     "reason": "spawn-failed",
+#     "detail": "Tailscale がセットアップされていません…"
+#   }
+# }
+```
+
+`desired` は `running` が `false` のときも必ず返るので、「止まっている」のか「戻すつもりが無い」のかを取り違えません。
+
+:::note[この版へ更新した直後だけ 1 回]
+自動で戻る目印は `tako remote start` が成功したときに記録されます。更新前から動かしっぱなしの daemon には目印がないので、一度だけ `tako remote stop && tako remote start` を実行してください（以後は不要です）。
+:::
+
 ## 安全性の作り
 
 ### 層① Tailscale identity

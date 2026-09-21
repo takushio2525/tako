@@ -73,6 +73,12 @@ pub struct RemoteUiState {
     pub stopping: bool,
     /// 直近の停止失敗メッセージ（#615。起動と同じく黙って失敗させない）
     pub stop_error: Option<String>,
+    /// 自動復帰（#1485）を既に走らせたか。**1 起動につき 1 回**だけ回す
+    pub autostart_ran: bool,
+    /// 直近の `start_error` が自動復帰の失敗か（#1485）。押していない失敗を
+    /// 「起動に失敗しました」と出すと、ユーザーは自分の操作の失敗だと読むので
+    /// 見出しだけ差し替える（枠・色・場所は起動失敗と同じ = 出し先を増やさない）
+    pub autostart_failed: bool,
     /// ステータスバーインジケータの**実描画位置**（#615。カードのアンカー）。
     /// paint フェーズでしか分からないので canvas の paint フックから書き戻す
     /// （`text_input_caret` と同じ idiom）
@@ -320,6 +326,177 @@ impl TakoApp {
         .detach();
     }
 
+    /// 前回 `tako remote start` していたなら daemon を立て直す（#1485）。
+    ///
+    /// GUI 起動時（persist の復元のあと）に 1 回だけ呼ぶ。タブ・ペイン・SSH の追跡が
+    /// 再起動をまたいで戻るのに remote だけ戻らないと、スマホ側からは「PWA が
+    /// 繋がらない」としか見えず PC 側にも何も出ない。
+    ///
+    /// **判断は毎回 `remote_autostart::probe` を引き直す**（待っている間に人が
+    /// `tako remote start` / `stop` を打っているかもしれない）。実際に起こすのは
+    /// `spawn_daemon` = 起動ボタン / CLI / MCP と同一実体で、**権限は 1 つも増やさない**
+    /// （戻すのは daemon だけ。`devices.json` と role は触らない）。
+    ///
+    /// Mac の再起動直後は tailscaled がまだ上がっていないので、失敗しても
+    /// [`tako_control::remote_autostart::BACKOFF_SECS`] のバックオフで数回試す。
+    /// 諦めたら**黙らない**: 理由を persist.log と起動パネルへ出す（#1399 / #1446 ④）
+    pub(crate) fn spawn_remote_autostart(&mut self, cx: &mut Context<Self>) {
+        use tako_control::remote_autostart as autostart;
+
+        if self.remote.autostart_ran {
+            return;
+        }
+        self.remote.autostart_ran = true;
+
+        cx.spawn(async move |this, cx| {
+            // 早い見送り: 記録が無い環境（= remote を一度も使っていない / stop 済み）
+            // では待たずに降りる。**ここで待つと、関係ない人の起動に毎回 2 秒の
+            // 背景タスクがぶら下がる**
+            let first = cx
+                .background_executor()
+                .spawn(async { autostart::probe() })
+                .await;
+            if let Err(skip) = first {
+                Self::finish_remote_autostart_skip(&this, cx, skip).await;
+                return;
+            }
+
+            // 立て直している間はチップを「起動中」にする（#590 の既存の状態を使う）。
+            // **表示のためだけではない**: `starting` が立っている間は起動ボタンが
+            // 押せないので、人の手動起動と自動復帰が同時に `spawn_daemon` を叩いて
+            // 「既に起動中」を押した人に返す、という押していない失敗を作らない
+            let _ = this.update(cx, |app, cx| {
+                app.remote.starting = true;
+                cx.notify();
+            });
+
+            let max = autostart::attempts_max();
+            let mut attempts: u32 = 0;
+            loop {
+                attempts += 1;
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(autostart::backoff_secs(
+                        attempts,
+                    )))
+                    .await;
+                // 待っている間に人が起動した / 停めたかもしれない
+                let decision = cx
+                    .background_executor()
+                    .spawn(async { autostart::probe() })
+                    .await;
+                if let Err(skip) = decision {
+                    Self::finish_remote_autostart_skip(&this, cx, skip).await;
+                    return;
+                }
+                let result = cx
+                    .background_executor()
+                    .spawn(async { tako_control::remote::spawn_daemon() })
+                    .await;
+                let err = match result {
+                    Ok(_) => {
+                        let n = attempts;
+                        cx.background_executor()
+                            .spawn(async move {
+                                autostart::record_outcome(&autostart::LastAutostart::started(
+                                    autostart::now_epoch_secs(),
+                                    n,
+                                ));
+                            })
+                            .await;
+                        let _ = this.update(cx, |app, cx| {
+                            app.remote.starting = false;
+                            app.remote.autostart_failed = false;
+                            app.remote.start_error = None;
+                            // チップを待たせない（次のポーリングでも入るが、
+                            // 起動直後に running を見せる）
+                            app.refresh_remote_state(cx);
+                        });
+                        return;
+                    }
+                    Err(e) => e,
+                };
+                if attempts >= max {
+                    let n = attempts;
+                    let detail = err.clone();
+                    cx.background_executor()
+                        .spawn(async move {
+                            autostart::record_outcome(&autostart::LastAutostart::failed(
+                                autostart::now_epoch_secs(),
+                                n,
+                                &detail,
+                            ));
+                        })
+                        .await;
+                    let _ = this.update(cx, |app, cx| {
+                        // 諦めたら起動ボタンを返す（ここから先は人が押せる）
+                        app.remote.starting = false;
+                        app.remote.autostart_failed = true;
+                        app.remote.start_error = Some(err.clone());
+                        app.notify_ui_failure(
+                            crate::sidebar::NoticeArea::RemoteAutostart,
+                            crate::sidebar::NoticeArm::Issue1485,
+                            "リモート自動復帰",
+                            autostart::REASON_SPAWN_FAILED,
+                            crate::ui_text::remote::notice_autostart_failed(
+                                n,
+                                &autostart::trim_detail(&err),
+                            ),
+                        );
+                        cx.notify();
+                    });
+                    return;
+                }
+                // まだ諦めない。**画面にはまだ出さない**（20 秒後に消えるバナーは
+                // 邪魔なだけ）が、再試行の間を無音にはしない（#1485 ③）
+                let (n, detail) = (attempts, err.clone());
+                cx.background_executor()
+                    .spawn(async move {
+                        autostart::log_attempt_failure(n, max, &detail);
+                    })
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    /// 自動復帰を見送ったときの後始末（#1485）。記録と、出すべき理由だけを画面へ。
+    ///
+    /// **正常な見送り（記録が無い / 既に動いている）は画面に出さない**
+    /// （[`tako_control::remote_autostart::AutostartSkip::is_noteworthy`] が絞る）。
+    /// GUI を起動するたびに「リモートは起動しません」と出しても邪魔にしかならない
+    async fn finish_remote_autostart_skip(
+        this: &gpui::WeakEntity<Self>,
+        cx: &mut gpui::AsyncApp,
+        skip: tako_control::remote_autostart::AutostartSkip,
+    ) {
+        use tako_control::remote_autostart as autostart;
+        cx.background_executor()
+            .spawn(async move {
+                autostart::record_outcome(&autostart::LastAutostart::skipped(
+                    autostart::now_epoch_secs(),
+                    skip,
+                ));
+            })
+            .await;
+        let _ = this.update(cx, |app, cx| {
+            app.remote.starting = false;
+            cx.notify();
+        });
+        if !skip.is_noteworthy() {
+            return;
+        }
+        let _ = this.update(cx, |app, cx| {
+            app.notify_ui_failure(
+                crate::sidebar::NoticeArea::RemoteAutostart,
+                crate::sidebar::NoticeArm::Issue1485,
+                "リモート自動復帰",
+                skip.tag(),
+                crate::ui_text::remote::notice_autostart_unsupported(&skip.describe()),
+            );
+            cx.notify();
+        });
+    }
+
     /// リモートを起動する（#590。`tako remote start` / MCP `tako_remote_start` と同一実体）。
     ///
     /// `spawn_daemon` は子プロセスの起動情報を最長 30 秒待つので、UI スレッドでは絶対に
@@ -331,6 +508,8 @@ impl TakoApp {
         }
         self.remote.starting = true;
         self.remote.start_error = None;
+        // #1485: 自分で押した以上、この先の失敗は「自動復帰の失敗」ではない
+        self.remote.autostart_failed = false;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -983,7 +1162,11 @@ impl TakoApp {
                             .text_size(px(10.5))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(hsla(theme.red))
-                            .child(text::start_failed()),
+                            .child(if self.remote.autostart_failed {
+                                text::autostart_failed_title()
+                            } else {
+                                text::start_failed()
+                            }),
                     )
                     .child(
                         div()

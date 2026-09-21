@@ -4747,6 +4747,10 @@ fn remote_start() -> Result<(), String> {
         eprintln!("スマホ側にも Tailscale アプリを入れ、同じアカウントでログインしてください。");
         eprintln!("初回アクセス時は Mac の画面にペアリング承認ダイアログが表示されます。");
     }
+    // #1485: 「一度起動すれば動き続ける」と読むのが自然なので、実際にそうなることを言う
+    eprintln!(
+        "tako や Mac を再起動しても、この状態は自動で戻ります（`tako remote stop` で解除）。"
+    );
     Ok(())
 }
 
@@ -4766,6 +4770,20 @@ fn remote_stop(force: bool) -> Result<(), String> {
 /// 応答にトークンは含まれない（#283 で長寿命 bearer token を全廃）
 fn remote_status() -> Result<(), String> {
     let status = tako_control::remote::daemon_status();
+    // 自動復帰の失敗も JSON に埋もれさせない（#1485: 「起動していたのに戻っていない」を
+    // 一目で分かる形に）。**判断は再計算せず状態を読むだけ**（#372 / #1473 と同じ）
+    if let Some(last) = status.get("last_autostart") {
+        if last.get("result").and_then(|v| v.as_str())
+            == Some(tako_control::remote_autostart::RESULT_FAILED)
+        {
+            eprintln!(
+                "前回の起動状態へ自動で戻せませんでした（{} 回試行）: {}",
+                last.get("attempts").and_then(|v| v.as_u64()).unwrap_or(0),
+                last.get("detail").and_then(|v| v.as_str()).unwrap_or(""),
+            );
+            eprintln!("  次の一手: `tako remote start` で手動起動できます");
+        }
+    }
     // 劣化は JSON の中に埋もれさせない（#1049: 「running なのに見れない」を一目で分かる形に）
     if let Some(d) = status.get("degraded") {
         eprintln!(

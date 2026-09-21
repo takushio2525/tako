@@ -9,6 +9,7 @@ CopyText: label, text
 Decision: Approve, Reject, NeedsChange, Answered
 Delivery: state, profile, pane, tab, reason, at, response_index
 DeliveryState: Sent, Launched, Delivered, Failed
+DesiredState: since
 Device: id, name, login, node_name, role, created_at, last_seen
 DevicesFile: devices
 LayoutFile: version, active_tab, tabs, window, backgrounded, collapsed, webview_dock, windows
@@ -75,3 +76,4 @@ version setup: v1 steps=0
 version discovery_instance: v1 steps=0
 version remote_devices: v1 steps=0
 version remote_shortcuts: v1 steps=0
+version remote_desired: v1 steps=0
