@@ -1777,6 +1777,38 @@ Dock のピン留めは `.app` への **file URL ブックマーク**（`com.app
   `crates/tako-control/tests/test_residue_watchdog.rs` の静的検査。A/B は `TAKO_1312_LEGACY=1`
   （器を修正前 = 作りっぱなしへ戻す。実測 19 件が残る）
 
+## ゲートを足す変更は、そのゲートを通る隔離テストも同じコミットで直す（Issue #1452 / #1493）
+
+**認可・所有者・呼び出し元を見るゲートを足したら、そのゲートを通る実経路テストを
+全部洗い出して同じコミットで直す。** #1452 は `POST /api/admin/pair/approve` に
+「呼び出し元が tako-app か」のゲートを足し、隔離テストのための逃し口
+`TAKO_REMOTE_TRUSTED_ADMIN_NAMES` を同時に用意して既存 2 本へ宣言を入れたが、
+**同じ日に着地したばかりの `scripts/test-remote-fs-1451.sh` だけが漏れた**。
+承認が 403 `upgrade_requires_gui` で通らなくなり、端末が登録されないまま
+**OK=18 NG=55** で 1 週間走り続けた（#1493）。
+落ちているのがテストの前提なのか製品の回帰なのかは、後から見ると誰にも分からない。
+
+### 書くときの決まり
+
+- 洗い出しは経路の具体形で引く（`grep -l '/api/admin/pair/approve' scripts/*.sh`）。
+  **同じ PR でゲートと一緒に直す**（後追いの Issue にしない）
+- ゲートが 1 つとは限らない。#1452 は承認の呼び出し元ゲートと同時に
+  `request_pairing` の**降格の扱い**も変えていた（現より弱い role の要求は保留を作らない）。
+  役割を下げるのは `POST /api/admin/devices/role` が現行の契約で、
+  「`POST /api/pair` + 承認」は上げる向きにしか効かない
+- 逃し口（`TAKO_REMOTE_TRUSTED_ADMIN_NAMES` / #841 の `TAKO_REMOTE_TRUSTED_PEER_NAMES`）は
+  **隔離テストの中だけ**。本番の経路（リリース・セットアップ・製品コード）へ置くと、
+  名前を知っている誰にでもゲートが開く
+- 隔離テスト側は「撃ったこと」ではなく**「据わったこと」を確かめてから先へ進む**。
+  role が外れたまま進むと以降の全項目が 403 で落ち、真因が数十件の NG に埋もれる
+
+### 機械強制
+
+`crates/tako-control/tests/issue1493_admin_gate_script_watchdog.rs`。経路表
+（`remote_role::ROLE_ROUTES` の `grants_upgrade`）を叩く `scripts/*.sh` が逃し口を
+宣言しているか・逃し口がテストの外へ出ていないかを **file:line で名指し**する。
+経路表が正本なので、昇格できる経路が増えたら検査対象も自動で増える。
+
 ## 実 tmux の e2e は器をプロセスごとに分ける（Issue #1300）
 
 **`-L` に渡す器の名前に固定名を使わない**（`tmux_e2e::socket_for("<Issue 番号>")` が
