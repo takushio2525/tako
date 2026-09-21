@@ -84,6 +84,8 @@ fn 共有対象の設定ファイルは移行の番地にも載っている() {
         // ディレクトリ単位（`remote/` = Secret）なので、番地が 2 つでも
         // 共有分類の宣言は 1 つのまま = ここだけが 1:多 になる
         ("remote/", SchemaId::RemoteShortcuts),
+        // #1485: 「起動していた」の記録も `remote/` 配下の 1 ファイル
+        ("remote/", SchemaId::RemoteDesired),
     ];
     use tako_control::config_share::catalog;
     for (path, id) in MAPPING {
@@ -263,6 +265,12 @@ fn fingerprint() -> BTreeMap<String, Vec<String>> {
         (
             "crates/tako-core/src/remote_shortcuts.rs",
             &["ShortcutsFile", "Shortcut"],
+        ),
+        (
+            // #1485: 「起動していた」の記録。`LastAutostart` は入れない
+            // （`ServeHealth` / `PeerGuardState` と同じ短命な稼働状態で番地を持たない）
+            "crates/tako-control/src/remote_autostart.rs",
+            &["DesiredState"],
         ),
     ];
     let mut out = BTreeMap::new();

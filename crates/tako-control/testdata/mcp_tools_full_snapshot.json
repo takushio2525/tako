@@ -2727,7 +2727,7 @@
     "name": "tako_orchestrator_report"
   },
   {
-    "description": "リモートアクセス API サーバーを起動する。スマホからブラウザ経由でペインを操作するための HTTP API サーバーがローカルエンドポイントで開始される。transport は Tailscale Serve のみ: daemon の待ち受けは既定でループバック TCP（127.0.0.1 のエフェメラルポート）で、tailnet 内限定の恒久固定 URL（https://<ホスト名>.<tailnet>.ts.net）で公開される（WireGuard E2E 暗号化・LAN や外部インタフェースへはバインドしない）。Tailscale が未セットアップ（未導入・未ログイン・HTTPS 未有効等）の場合は不足項目を列挙して起動を拒否するので、ユーザーに `tako remote setup` を案内する。接続には機器ペアリングが必要: 初回アクセス時に Mac 画面へ承認ダイアログが表示され、ユーザーが許可した端末だけが role（observe / interact / manage / admin）に応じて操作できる。承認・role 変更は Mac の GUI 限定で AI からは行えない。注意: interact 以上を許可した端末はターミナルへ任意コマンドを送信できる（実質シェルアクセス）。",
+    "description": "リモートアクセス API サーバーを起動する。スマホからブラウザ経由でペインを操作するための HTTP API サーバーがローカルエンドポイントで開始される。transport は Tailscale Serve のみ: daemon の待ち受けは既定でループバック TCP（127.0.0.1 のエフェメラルポート）で、tailnet 内限定の恒久固定 URL（https://<ホスト名>.<tailnet>.ts.net）で公開される（WireGuard E2E 暗号化・LAN や外部インタフェースへはバインドしない）。Tailscale が未セットアップ（未導入・未ログイン・HTTPS 未有効等）の場合は不足項目を列挙して起動を拒否するので、ユーザーに `tako remote setup` を案内する。接続には機器ペアリングが必要: 初回アクセス時に Mac 画面へ承認ダイアログが表示され、ユーザーが許可した端末だけが role（observe / interact / manage / admin）に応じて操作できる。承認・role 変更は Mac の GUI 限定で AI からは行えない。注意: interact 以上を許可した端末はターミナルへ任意コマンドを送信できる（実質シェルアクセス）。起動に成功すると「起動していた」ことが記録され、tako や Mac を再起動してもGUI 起動時に自動で立て直される（#1485。解除は tako_remote_stop）。記録と直近の自動復帰の結果は tako_remote_status の desired / last_autostart で読める。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {},
@@ -2736,7 +2736,7 @@
     "name": "tako_remote_start"
   },
   {
-    "description": "リモートアクセス API サーバーを停止する。既定は SIGTERM で停止を試みる。force=true で SIGKILL を使う。",
+    "description": "リモートアクセス API サーバーを停止する。既定は SIGTERM で停止を試みる。force=true で SIGKILL を使う。「起動していた」の記録も消えるので、以後は GUI を起動しても自動復帰しない（#1485）。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -2750,7 +2750,7 @@
     "name": "tako_remote_stop"
   },
   {
-    "description": "リモートアクセス API サーバーの状態を取得する。起動中なら running=true・socket パス・恒久固定 URL・登録済み端末数を返す。URL に secret は含まれない（接続時の認証は機器ペアリングが行う）。",
+    "description": "リモートアクセス API サーバーの状態を取得する。起動中なら running=true・socket パス・恒久固定 URL・登録済み端末数を返す。URL に secret は含まれない（接続時の認証は機器ペアリングが行う）。desired は「ユーザーが起動していた」の記録（#1485。tako_remote_start で立ち、tako_remote_stop で消える）で、running が false でも必ず載る。last_autostart は GUI 起動時の自動復帰の直近の結果（result = started / skipped / failed・attempts・reason・detail）。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {},

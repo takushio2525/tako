@@ -219,6 +219,10 @@ pub(crate) enum NoticeArea {
     /// 自動解除したことの申告）。黙って解除すると「蓋を閉じたら止まっていた」に
     /// なるので、バッテリー継続を選んだ人にだけ理由つきで出す
     SleepGuard,
+    /// リモート daemon の自動復帰（#1485）。**押した操作ではなく起動時の一段**だが、
+    /// 「起動していたのに戻らない」は黙って起きてはいけないので同じ通知欄へ出す
+    /// （成功は出さない = チップが running になるので分かる）
+    RemoteAutostart,
 }
 
 impl NoticeArea {
@@ -237,6 +241,7 @@ impl NoticeArea {
             NoticeArea::Ipc => "ipc",
             NoticeArea::UserTasks => "user_tasks",
             NoticeArea::SleepGuard => "sleep_guard",
+            NoticeArea::RemoteAutostart => "remote_autostart",
         }
     }
 }
@@ -274,6 +279,9 @@ pub(crate) enum NoticeArm {
     /// 判定そのものの A/B と同じ env を使う（旧挙動ではバッテリー継続に
     /// 入らないので、通知だけ残っても意味がない）
     Issue1473,
+    /// リモート daemon の自動復帰（`TAKO_1485_LEGACY`）。判定そのものの A/B と
+    /// 同じ env を使う（旧挙動では自動復帰しないので、通知だけ残っても意味がない）
+    Issue1485,
 }
 
 impl NoticeArm {
@@ -289,6 +297,7 @@ impl NoticeArm {
             NoticeArm::Issue1446 => TakoApp::legacy_1446(),
             NoticeArm::Issue1450B2 => crate::tasks_panel::legacy_1450_b2(),
             NoticeArm::Issue1473 => tako_control::sleep_guard::legacy_1473(),
+            NoticeArm::Issue1485 => tako_control::remote_autostart::legacy_mode(),
         }
     }
 }

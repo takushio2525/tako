@@ -2199,7 +2199,10 @@ pub fn tools() -> Vec<Value> {
                 接続には機器ペアリングが必要: 初回アクセス時に Mac 画面へ承認ダイアログが表示され、\
                 ユーザーが許可した端末だけが role（observe / interact / manage / admin）に応じて\
                 操作できる。承認・role 変更は Mac の GUI 限定で AI からは行えない。\
-                注意: interact 以上を許可した端末はターミナルへ任意コマンドを送信できる（実質シェルアクセス）。",
+                注意: interact 以上を許可した端末はターミナルへ任意コマンドを送信できる（実質シェルアクセス）。\
+                起動に成功すると「起動していた」ことが記録され、tako や Mac を再起動しても\
+                GUI 起動時に自動で立て直される（#1485。解除は tako_remote_stop）。\
+                記録と直近の自動復帰の結果は tako_remote_status の desired / last_autostart で読める。",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -2209,7 +2212,8 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_remote_stop",
             "description": "リモートアクセス API サーバーを停止する。\
-                既定は SIGTERM で停止を試みる。force=true で SIGKILL を使う。",
+                既定は SIGTERM で停止を試みる。force=true で SIGKILL を使う。\
+                「起動していた」の記録も消えるので、以後は GUI を起動しても自動復帰しない（#1485）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2225,7 +2229,11 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_remote_status",
             "description": "リモートアクセス API サーバーの状態を取得する。\
                 起動中なら running=true・socket パス・恒久固定 URL・登録済み端末数を返す。\
-                URL に secret は含まれない（接続時の認証は機器ペアリングが行う）。",
+                URL に secret は含まれない（接続時の認証は機器ペアリングが行う）。\
+                desired は「ユーザーが起動していた」の記録（#1485。tako_remote_start で立ち、\
+                tako_remote_stop で消える）で、running が false でも必ず載る。\
+                last_autostart は GUI 起動時の自動復帰の直近の結果\
+                （result = started / skipped / failed・attempts・reason・detail）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {},

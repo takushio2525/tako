@@ -469,6 +469,11 @@ pub const SPECS: &[SchemaSpec] = &[
     // （`ephemeral` の RemoteDevices と分けているのはそのため）。版数フィールドを
     // 持つので、形を変えるときは target_version を上げて Step を足す
     versioned(SchemaId::RemoteShortcuts, Some(validate_remote_shortcuts)),
+    // #1485: 「起動していた」の記録。**形式の検査を持たない**のは意図的で、
+    // ファイルが在ること自体が意図だから（`remote::read_desired` は中身が壊れて
+    // いても意図は在ったとみなす）。検査を付けると、壊れた `since` を理由に
+    // 移行が `.unreadable.bak` へ退避 = **ユーザーの意図が黙って消える**
+    pristine(SchemaId::RemoteDesired, None),
 ];
 
 /// 種別から登録を引く
@@ -523,6 +528,7 @@ pub fn targets(id: SchemaId) -> Vec<PathBuf> {
         SchemaId::RemoteShortcuts => {
             single(&format!("remote/{}", tako_core::remote_shortcuts::FILENAME))
         }
+        SchemaId::RemoteDesired => single("remote/tako-remote.desired"),
     }
 }
 

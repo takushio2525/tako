@@ -236,6 +236,40 @@ pub fn indicator_stopping() -> &'static str {
     tr!("リモート 停止中", "remote stopping")
 }
 
+// --- 自動復帰（#1485）---
+
+/// 起動パネルへ出す見出し（起動失敗と区別する: 押していないのに失敗が出ている
+/// 理由が分からないと、ユーザーは自分の操作の失敗だと読む）
+pub fn autostart_failed_title() -> &'static str {
+    tr!(
+        "前回の起動状態へ戻せませんでした",
+        "Could not restore the previous remote state"
+    )
+}
+
+/// 通知欄へ出す 1 行（試行回数と daemon が返した理由）。
+///
+/// **理由は daemon の言葉のまま**渡す（`tako remote setup` の不足項目など、
+/// 次の一手がそこに書いてある）。分類は `tako_control::remote_autostart` が持つ
+pub fn notice_autostart_failed(attempts: u32, detail: &str) -> String {
+    tr!(
+        format!(
+            "リモートを自動で起動できませんでした（{attempts} 回試行）: {detail}。             ステータスバーのリモートから手動で起動できます"
+        ),
+        format!(
+            "Could not start remote access automatically ({attempts} attempts): {detail}.              You can start it manually from the remote indicator in the status bar."
+        )
+    )
+}
+
+/// 通知欄へ出す 1 行（この OS では自動復帰できない）
+pub fn notice_autostart_unsupported(reason: &str) -> String {
+    tr!(
+        format!("リモートを自動で起動できません: {reason}"),
+        format!("Remote access cannot start automatically: {reason}")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests_support;

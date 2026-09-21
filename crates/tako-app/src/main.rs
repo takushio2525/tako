@@ -4548,6 +4548,15 @@ impl TakoApp {
             persist_diag(&line);
         }
 
+        // #1485: 前回 `tako remote start` していたなら remote daemon を立て直す。
+        // タブ・ペイン・プレビュー・SSH の追跡（#1446）は persist が戻すのに、
+        // remote daemon だけは Mac の再起動で消えたまま誰も立て直さなかった。
+        // **セカンダリでは走らせない**（復元と同じ理由: プライマリの資源を二重に触る）。
+        // 記録が無い環境では `probe` が即 `not-desired` で降りるので何も起きない
+        if !secondary {
+            app.spawn_remote_autostart(cx);
+        }
+
         // IPC リクエストを UI スレッドで dispatch するループ。
         // 操作セマンティクスは tako-control::dispatch に一元化されている（設計原則 5）
         cx.spawn(async move |this, cx| {

@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-14（#1472 B: スマホのタスク画面で添付をその場で見る・鳴らす）
-- PWA `#/tasks` の詳細で画像を `<img>`（タップで全画面）・動画を `<video controls preload="metadata">` に。**経路は 1 本も増やしていない**: src は既存 `/api/files/download` に `disposition=inline` を足しただけで、認可は `resolve_in_root` のまま（observe は 403・interact はツリー配下だけ）。daemon 側は同じ経路に `Range`（206 + `Content-Range`・416・`Accept-Ranges` 常時）と inline の `Content-Type` を足し、**応答の送出は `respond_file` の 1 か所へ畳んだ**（枝ごとに書くと `no-store` の付け忘れが生えるため）。画像 / 動画の判定と MIME は `tako_core::open_plan` の 1 本（`preview_route` と `media_type` の一致を単体テストが拘束）で、daemon が `attachments[].preview` に載せる = PWA に拡張子の表を作らない
-- 実測: 実経路 `scripts/test-remote-attachment-preview-1472.sh` **59 PASS 0 FAIL**（先頭 / 途中 / 末尾チャンクの**中身が実体と一致**・416・150 MB の部分取得で daemon RSS 23 MB・observe / interact の 403）+ e2e 新 8 本（実 PNG の `naturalWidth` と実 webm の `readyState` / `duration` を実測・**一覧では GET 0 本**）。A/B は daemon 24 件 FAILED / PWA e2e 6 本 FAILED。番犬 6 本・注入 8 通り file:line 名指し
-- workspace 4901 passed 0 failed・clippy 3 宇宙 0・check-windows error 0・e2e 101 passed・docs 32 ページ。**install 不要 / 本番 remote daemon の再起動が要る**
-
 ## 2026-09-14（#1472 A: 人がやることの添付を、行を押すだけで既存プレビューで開けるようにした）
 - #1450 B2 の「プレビューで開く」は**300px の帯の 10px ボタン**で、ユーザーには「押しても中身が見られない」に見えていた（Issue の前提「PC はパスの表示だけ」は不正確で、実測では `Request::OpenFile` 自体は png→image / mp4→video / md→markdown で正常動作）。**行そのもの**を押せるようにし、左に「画像 / 動画 / PDF …」の種別・ホバーで「プレビューで開く」を出す。**新しいビューアも拡張子の表も作らない**（`open_plan::preview_route` + `Request::OpenFile` = `tako open` / `tako_open_file` と同じ 1 経路）
 - 画像添付にサムネイル。**縮小後だけを持ち**（320x180 枠）、上限はファイル 32 MB とヘッダの画素 64M の 2 段で**画素は decode の前**に見る（解凍爆弾）。読むのは背景スレッド・持つのは開いている 1 件ぶんだけ（`retain` で溜まらない）。動画のサムネは作らない（ffmpeg 依存を一覧の描画に混ぜない）
@@ -54,3 +49,8 @@
 - 真因は AppKit 側だった: 宛先を親へ返す `focus_parent()` が `sync_frame` の **hide 分岐にしか無く**（`webview.rs:268`）、Web ビューが見えたままフォーカスが別ペインへ移る経路（`on_pane_mouse_down` / dispatch `Focus`）は `PaneTree` のフォーカスしか動かさない。#326 の NSEvent monitor は **⌘ 修飾つきのキーだけ**（`webview.rs:582`）なので素の打鍵は救われない。破棄（× / `web close`）も宛先を持ったまま壊していた
 - 宛先の読み・戻しを `webview.rs` の 1 実装へ（#326 の monitor も同じ関数を通る）。**戻す先は `contentView` ではなく「宛先を持っている WKWebView の superview」**（実測: contentView = `AccessKitSubclassOfNSView` で `makeFirstResponder:` は成功するのに打鍵は来ない）。呼ぶのは `clear_text_input_focus`（= #503 と同じ全経路）と破棄の直前で、**毎フレームの level 判定にはしない**（「宛先が webview でフォーカスは別ペイン」は「いまページをクリックした」と同じ状態なのでページへ打てなくなる）
 - 実測: 項目 71 に #1481 群 8 件（宛先のクラス名を読む）。legacy `TAKO_1481_LEGACY=1` は `owner=WryWebView returns=0` で FAILED = Issue の症状そのまま / 修正アームは `TAKO_APP_SELF_TEST_OK` 完走。番犬 `issue1481_webview_key_focus_watchdog` 3 本（注入 8 通り）・workspace 4982 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。**実マウスでのクリックと GUI 再起動後の復元は未検証**
+
+## 2026-09-21（#1485: 「起動していた」を覚えて GUI 起動時に remote daemon を立て直す）
+- `tako remote start` の成功だけが `<data_dir>/remote/tako-remote.desired`（移行の番地 `SchemaId::RemoteDesired`）を作り、GUI が persist 復元のあと `spawn_daemon` をバックオフ（2/5/10/20/40 秒）で数回試す。**消す条件は「止まっていること」の 1 つ**（`Ok` だけ見ると Mac 再起動後に stop した人の意図を落とす）。判断は理由を返す純関数 `autostart_decision` 1 本で、CLI / チップ / persist.log は読むだけ
+- 無言にしない: 途中の失敗も persist.log へ 1 行ずつ、諦めたら `notify_ui_failure` の 1 実装 + `remote status` の `desired` / `last_autostart`（`running: false` の応答にも必ず載る）。OS ゲートは `platform::support` の `tako_remote_start` を引く（専用キーは足さない = T2 が落ちる）
+- 実測: `scripts/test-remote-autostart-1485.sh` **26 PASS 0 FAIL**（隔離 GUI + 実 daemon）。A/B `TAKO_1485_LEGACY=1` は同スクリプトで 13 FAIL（①が「自動復帰しない」= Issue の症状）。番犬 4 本・注入 10 通り + 実注入で `remote.rs:339` を名指し。workspace 5002 passed 0 failed・clippy 3 宇宙 0・check-windows error 0
