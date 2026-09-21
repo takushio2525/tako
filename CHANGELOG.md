@@ -8,6 +8,19 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.8.17] - 2026-09-22
+
+Nightly patch release (automated). Changes since v0.8.16:
+夜間パッチリリース（自動）。v0.8.16 以降の変更:
+
+- [修正] 番犬の関数名追跡を1実装へ寄せ、pub(crate) fn の中の違反を正しく名指しする (#1496) (#1497)
+- [改善] たまり場の退避タブをタブ形のカード 1 枚にして、押せば復帰するようにした (#1491) (#1495)
+- [修正] main で赤かった test-remote-fs-1451.sh を現行契約へ合わせ、番犬で縛った (#1493) (#1494)
+- [改善] 隔離 GUI の起動を scripts/lib の 1 実装へ寄せ、起動ごとに tako-vd を起こす (#1490) (#1492)
+- [機能追加] タブを「ー」で送ったらタブ単位で退避・復帰できるようにした (#1487) (#1489)
+- [機能追加] 「起動していた」を覚えて GUI 起動時に remote daemon を立て直す (#1485) (#1488)
+- [ドキュメント] activeContext を 2026-09-21 の状態へ更新（#1481 着地・#1485 起票・Mac 再起動後の実態） (#1486)
+
 ## [0.8.16] - 2026-09-19
 
 Nightly patch release (automated). Changes since v0.8.15:
