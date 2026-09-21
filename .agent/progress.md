@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-14（#1472 A: 人がやることの添付を、行を押すだけで既存プレビューで開けるようにした）
-- #1450 B2 の「プレビューで開く」は**300px の帯の 10px ボタン**で、ユーザーには「押しても中身が見られない」に見えていた（Issue の前提「PC はパスの表示だけ」は不正確で、実測では `Request::OpenFile` 自体は png→image / mp4→video / md→markdown で正常動作）。**行そのもの**を押せるようにし、左に「画像 / 動画 / PDF …」の種別・ホバーで「プレビューで開く」を出す。**新しいビューアも拡張子の表も作らない**（`open_plan::preview_route` + `Request::OpenFile` = `tako open` / `tako_open_file` と同じ 1 経路）
-- 画像添付にサムネイル。**縮小後だけを持ち**（320x180 枠）、上限はファイル 32 MB とヘッダの画素 64M の 2 段で**画素は decode の前**に見る（解凍爆弾）。読むのは背景スレッド・持つのは開いている 1 件ぶんだけ（`retain` で溜まらない）。動画のサムネは作らない（ffmpeg 依存を一覧の描画に混ぜない）
-- 実測: visual-test 項目 151 新設（`TAKO_VISUAL_ONLY=task-attachment`）で**合成マウス**が実フレームの hitbox を押し、image / video が開く・2 回押してもペインが増えない・消えた添付は押せないを確認（ハンドラ直呼びの項目 150 では #496 型を検出できない）。注入 A/B は行の `on_click` を切ると項目 151 が `[]` で FAILED。番犬 `issue1472a_attachment_open_watchdog`（3 本・注入 9 通り）。**install 要**
-
 ## 2026-09-14（#1473: 蓋閉じ継続をバッテリー駆動でも opt-in で続けられるようにした）
 - 蓋閉じ継続の電源条件を**アイドルスリープ側とは別の軸**（`lid_sleep_power`・既定 `ac-only` = 現状維持）にし、`always` のときだけバッテリーでも続ける。安全弁は 4 つ（エージェント稼働中のみ / 残量が下限（既定 20%・5〜90%）に**達したら**解除 / 温度は**バッテリーなら fair 以上・AC なら serious 以上**で解除 / 残量を読めない機械では継続しない）。Windows は同じ判定を通り `always` のときだけ電源プランのバッテリーレールも倒す（残量取得は未実装 = 実質 AC のみ・実機未検証）
 - 判定は `lid_decision(&LidGuardInput) -> Result<(), LidSkipReason>` の 1 本で、真偽値ではなく**理由**を返す。理由は状態が運ぶ（`update` / `status` が `with_decision()` で埋める）ので、CLI・設定画面・通知欄・persist.log は**読むだけ**（読む側が再計算すると A/B や stale binary で判断が割れる = #372 と同じ理屈）。通知欄へ出すのは安全弁の解除と回復だけ
@@ -59,3 +54,8 @@
 - `Workspace::shelved_tabs`（`Tab` 本体 + 由来ウィンドウ + 元の並び位置）を追加し、`shelve_tab` は `into_panes()` の平坦化をやめて**タブを分解せず**移す。判断は純粋関数 2 本（`unshelve_tab_placement` / `shelved_tab_fate`）。永続は `LayoutFile.shelved_tabs`（serde default = 旧ファイルそのまま読める・移行 Step 不要）
 - 「バックグラウンドに居るペイン」を見る側は `all_background_panes()`、「まだ生きているペイン」を見る側は `all_pane_ids()` の 2 本へ寄せた（**受け入れ検査 rework 1 回目**: コマンドカードの `retain` / 退避バッジの件数 / `Pin { group_tab }` の検証 / 見出しタイトル / 「閉じたタブ」群の 5 か所が退避タブを見落としていた）
 - 実測: `scripts/test-shelve-tab-1487.sh` **24 PASS 0 FAIL**（退避→復帰で tree/rect/title/title_source 一致・再起動往復・1 ペイン抜き・旧 layout.json・A/B `TAKO_1487_LEGACY=1`）+ visual-test 項目 153（合成マウス）。番犬 3 本（注入 15 通り・実注入で `workspace.rs` を名指し）
+
+## 2026-09-21（#1490: 隔離 GUI の起動を scripts/lib の 1 実装へ寄せ、起動ごとに tako-vd を起こす）
+- `scripts/lib/isolated-gui.sh` を新設（`isolated_gui_bins` / `launch_isolated_gui` / `wait_isolated_gui` / `stop_isolated_gui`）し、`virtual-display.sh ensure` を**起動の直前に毎回**通す形へ。`scripts/test-*.sh` 12 本を差し替え（-151 行）。Issue の grep は `"…virtual-display.sh" ensure` の引用符に当たらず全部 0 に見えていたが、正しく数えると「起動の直前に通していたのは 4 本 / 冒頭 1 回が 6 本 / 呼んでいないのが 2 本」で症状は実在
+- 実測（眠った tako-vd から。`pmset displaysleepnow` で再現）: **master-launch が OK=0 rc=1 → OK=34 rc=0**・**1485 が OK=12 NG=14 → OK=26 NG=0**（14 NG は全部「窓を開かずに終了」= #1160 の中止）・**worker-min-width が OK=6 → OK=12**（3 腕のうち 1 腕しか走れていなかった）。他 9 本は前後一致・回帰 0
+- 番犬 `issue1490_isolated_gui_launch_watchdog` 5 本（直書き 4 形 + 手書きの背景起動 / ensure を file:line で名指し）。注入で 2 本 FAILED → 戻して 5/5 緑。workspace 5021 passed 0 failed・clippy 3 宇宙 0・check-windows error 0

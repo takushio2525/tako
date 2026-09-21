@@ -44,7 +44,7 @@ cleanup() {
     "$TAKO_BIN" remote stop >/dev/null 2>&1 || true
   fi
   # 明示 pid だけを落とす（pkill / killall は本番 GUI にも当たる。progress.md の事故）
-  if [ -n "$APP_PID" ]; then kill "$APP_PID" 2>/dev/null || true; fi
+  stop_isolated_gui "$APP_PID"
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -102,15 +102,9 @@ STUB
 chmod +x "$STUB_BIN/claude"
 
 # --- 対象バイナリ -------------------------------------------------------------
-TAKO_BIN="${TAKO_BIN:-$REPO_ROOT/target/debug/tako}"
-APP_BIN="${APP_BIN:-$REPO_ROOT/target/debug/tako-app}"
-if [ ! -x "$TAKO_BIN" ] || [ ! -x "$APP_BIN" ]; then
-  echo "バイナリをビルドします…"
-  (cd "$REPO_ROOT" && cargo build -p tako-cli -p tako-app --quiet)
-fi
-for b in "$TAKO_BIN" "$APP_BIN"; do
-  [ -x "$b" ] || { echo "バイナリが見つからない: $b"; exit 1; }
-done
+# shellcheck source=lib/isolated-gui.sh
+. "$REPO_ROOT/scripts/lib/isolated-gui.sh"
+isolated_gui_bins || exit 1
 
 # --- 隔離した環境（daemon と app が同じ discovery / data を見る）--------------
 export TAKO_ISOLATED=1
@@ -153,13 +147,9 @@ YAML
 
 # --- 起動 ---------------------------------------------------------------------
 echo "=== 準備: 隔離 tako-app と daemon を起動 ==="
-"$APP_BIN" > "$TMP/app.log" 2>&1 &
-APP_PID=$!
-for _ in $(seq 1 200); do
-  if "$TAKO_BIN" list >/dev/null 2>&1; then break; fi
-  sleep 0.1
-done
-"$TAKO_BIN" list >/dev/null 2>&1 || { echo "tako-app へ接続できない:"; tail -20 "$TMP/app.log"; exit 1; }
+launch_isolated_gui "$TMP/app.log"
+APP_PID="$ISOLATED_GUI_PID"
+wait_isolated_gui "$TMP/app.log" || exit 1
 # 繋がった先が隔離インスタンスであることを確かめる（本番 GUI にタブを作らない）
 BOOT_TABS="$("$TAKO_BIN" list | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["tabs"]))')"
 if [ "$BOOT_TABS" != "1" ]; then

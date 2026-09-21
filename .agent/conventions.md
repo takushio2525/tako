@@ -2325,6 +2325,39 @@ CI で特定の語も見張りたいときは `TAKO_PII_TERMS`（`,` 区切り�
 何度も立つ。既定のままだと**ユーザーのメイン画面の前面に窓が出て作業を妨げる**ので、
 常設の仮想ディスプレイ（既定名 `tako-vd`）へ逃がす。
 
+**検証スクリプトから隔離 GUI を立てるなら、起動はヘルパの 1 行を呼ぶ**（#1490）:
+
+```sh
+. "$REPO_ROOT/scripts/lib/isolated-gui.sh"
+isolated_gui_bins                     # TAKO_BIN / APP_BIN を決める（無ければビルド）
+launch_isolated_gui "$TMP/app.log"    # ensure → 面と窓の env → 起動（pid は $ISOLATED_GUI_PID）
+wait_isolated_gui "$TMP/app.log"      # `tako list` が通るまで待つ（任意）
+stop_isolated_gui                     # 自分で起こした pid だけを落とす
+```
+
+`launch_isolated_gui` は**起動の直前に毎回 `ensure` を通す**。これが要点で、
+**蓋閉じ運用の `tako-vd` はアイドルで眠り、眠った面は tako から見えなくなる**ので
+（下の #1160 の項）、冒頭で 1 回だけ起こす形では長い検証の途中や 2 回目の起動で
+「GUI が立たない」で止まる（#1487 の worker が同じ検証に 3 回失敗した）。
+`ensure` は冪等（常設の面を作り直さない・消す機能は無い）なので毎回通して困らない。
+起動ごとに env を足すときは `launch_isolated_gui "$TMP/app-legacy.log" TAKO_1487_LEGACY=1`、
+窓の矩形が要るときは `ISOLATED_GUI_BOUNDS=100,50,1400,900`（既定は指定なし =
+置き先の中央 960x600 のまま。窓の実寸を測る検証の実測値を動かさないため）。
+落とすのは `stop_isolated_gui` = **自分で起こした pid だけ**で、
+`pkill -f tako` のような名前一致は本番 GUI と他 worker に当たるので使わない。
+
+番犬は `crates/tako-control/tests/issue1490_isolated_gui_launch_watchdog.rs`。
+`scripts/test-*.sh` に `target/…/tako-app` / `cargo run -p tako-app` /
+`TAKO_DISPLAY=tako-vd` の直書き・手書きの背景起動・手書きの `ensure` が生えたら
+file:line を名指して落ちる（除外はヘルパ自身と `test-virtual-display-guard.sh` だけ）。
+
+**眠った状態を手で再現する**（受け入れ検査用）: `pmset displaysleepnow` を撃つと面が眠り、
+`virtual-display.sh status` が「眠っている」に変わる（蓋閉じで内蔵が居ない機なら
+落ちるのは `tako-vd` だけ）。`virtual-display.sh` に眠らせる口は**作っていない**:
+内蔵や外部モニタが居る機で撃つとユーザーの画面を消すので、ヘルパに置くと事故の口になる。
+
+シェルスクリプト以外（手で 1 回起こす・セルフテスト・収録）は従来どおり:
+
 ```sh
 scripts/lib/virtual-display.sh ensure   # 無ければ作る（冪等・消す機能は無い）
 # 以降、検証用の起動は何もしなくても tako-vd へ出る
