@@ -199,13 +199,14 @@ enum Command {
     /// プレビューをピン留め / 解除する（バックグラウンドペイン / 閉じたタブグループの
     /// 実画面をアプリ内フローティングウィンドウとして常駐・ライブ更新させる）
     Pin(PinArgs),
-    /// ペインをバックグラウンドへ送る（プロセスは生きたまま画面から外す）
+    /// ペインまたはタブをバックグラウンドへ送る（プロセスは生きたまま画面から外す。
+    /// --tab はタブ 1 単位で退避し、分割ツリー・比率・並び位置を保つ）
     #[command(name = "background")]
     Background(BackgroundArgs),
-    /// バックグラウンドのペインを画面に復帰させる
+    /// バックグラウンドのペイン / 退避タブを画面に復帰させる（--tab はタブ単位）
     #[command(name = "foreground")]
     Foreground(ForegroundArgs),
-    /// バックグラウンドのペイン一覧を JSON で出力する
+    /// バックグラウンドのペイン / 退避タブ一覧を JSON で出力する
     #[command(name = "backgrounded")]
     BackgroundList,
     /// ファイル操作（パスコピー / ファイルマネージャ表示 / cd / リネーム / 作成 / ゴミ箱）
@@ -2946,8 +2947,11 @@ struct PinArgs {
 
 #[derive(Args)]
 struct ForegroundArgs {
-    /// 復帰させるペインの ID（tako backgrounded で確認）
-    pane: u64,
+    /// 復帰させるペインの ID（tako backgrounded で確認。--tab と排他）
+    pane: Option<u64>,
+    /// 復帰させる退避タブの ID（分割ツリーごと元の位置へ戻す。--pane と排他）
+    #[arg(long, conflicts_with_all = ["pane", "target", "direction"])]
+    tab: Option<u64>,
     /// 挿入先ペインの ID（省略時は由来タブ。閉じていればアクティブタブ）
     #[arg(long)]
     target: Option<u64>,
@@ -7365,11 +7369,20 @@ fn build_request(command: &Command) -> Result<Request, String> {
             },
             tab: args.tab,
         },
-        Command::Foreground(args) => Request::Foreground {
-            pane: args.pane,
-            target: args.target,
-            direction: args.direction.as_deref().map(parse_direction).transpose()?,
-        },
+        Command::Foreground(args) => {
+            if args.pane.is_none() && args.tab.is_none() {
+                return Err(
+                    "ペイン ID か --tab のどちらかを指定する（tako backgrounded で確認）"
+                        .to_string(),
+                );
+            }
+            Request::Foreground {
+                pane: args.pane,
+                tab: args.tab,
+                target: args.target,
+                direction: args.direction.as_deref().map(parse_direction).transpose()?,
+            }
+        }
         Command::BackgroundList => Request::BackgroundList,
         Command::Tmux(TmuxCommand::List { socket }) => Request::TmuxList {
             socket: socket.clone(),

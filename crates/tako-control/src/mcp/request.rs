@@ -466,11 +466,20 @@ pub(super) fn build_request(
                 tab,
             }
         }
-        "tako_foreground_pane" => Request::Foreground {
-            pane: required_u64(args, "pane")?,
-            target: u64_arg(args, "target")?,
-            direction: direction_arg(args)?,
-        },
+        "tako_foreground_pane" => {
+            // #1487: tab 指定はタブ単位の復帰（pane と排他）
+            let tab = u64_arg(args, "tab")?;
+            Request::Foreground {
+                pane: if tab.is_some() {
+                    u64_arg(args, "pane")?
+                } else {
+                    Some(required_u64(args, "pane")?)
+                },
+                tab,
+                target: u64_arg(args, "target")?,
+                direction: direction_arg(args)?,
+            }
+        }
         "tako_background_list" => Request::BackgroundList,
         "tako_background_kill" => Request::BackgroundKill {
             pane: required_u64(args, "pane")?,

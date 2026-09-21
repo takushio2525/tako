@@ -633,20 +633,28 @@ impl TakoApp {
         .detach();
     }
 
+    /// バックグラウンドのグループ（退避タブ #1487 / 由来タブが閉じた平坦な退避 FR-2.15.6）の
+    /// 見出し。**タイトルの出どころをここ 1 本にする**（呼び手が「どちらを先に見るか」を
+    /// 覚えなくて済む = 片方だけ見て空文字になる事故が構造的に起きない）
+    fn background_group_label(&self, tab: TabId) -> String {
+        let count = self.background_entries_of_tab(tab).len();
+        if let Some(entry) = self.workspace.shelved_tab(tab) {
+            return crate::ui_text::panel::shelved_tab_group(&truncate(entry.title(), 20), count);
+        }
+        let title = self
+            .workspace
+            .shelved_panes()
+            .iter()
+            .find(|p| p.origin_tab() == tab)
+            .map(|p| p.origin_tab_title().to_string())
+            .unwrap_or_default();
+        crate::ui_text::panel::closed_tab_group(&truncate(&title, 20), count)
+    }
+
     fn preview_label(&self, target: PreviewTarget) -> String {
         match target {
             PreviewTarget::Pane(pane_id) => self.pane_preview_label(pane_id),
-            PreviewTarget::ClosedGroup(tab) => {
-                let title = self
-                    .workspace
-                    .shelved_panes()
-                    .iter()
-                    .find(|p| p.origin_tab() == tab)
-                    .map(|p| p.origin_tab_title().to_string())
-                    .unwrap_or_default();
-                let count = self.background_entries_of_tab(tab).len();
-                crate::ui_text::panel::closed_tab_group(&truncate(&title, 20), count)
-            }
+            PreviewTarget::ClosedGroup(tab) => self.background_group_label(tab),
             PreviewTarget::TmuxWindow(pane_id, win) => {
                 let win_name = self
                     .backend_windows
@@ -684,7 +692,8 @@ impl TakoApp {
             .tabs()
             .iter()
             .find_map(|t| t.tree().get(pane_id))
-            .or_else(|| self.workspace.shelved(pane_id).map(|s| s.pane()));
+            // #1487: 退避タブ配下のペインも解決できるようにする
+            .or_else(|| self.workspace.background_pane(pane_id).map(|(p, _, _)| p));
         if let Some(p) = pane {
             match (p.title(), p.role()) {
                 (Some(t), Some(r)) => return format!("{t} · {r}"),

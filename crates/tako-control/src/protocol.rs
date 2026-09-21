@@ -859,11 +859,19 @@ pub enum Request {
     /// ペインまたはタブをバックグラウンドへ送る（FR-2.15.1）。プロセスは生きたまま画面から外す。
     /// pane と tab は排他。tab 指定時はタブ内全ペインを一括退避する
     Background { pane: Option<u64>, tab: Option<u64> },
-    /// バックグラウンドからペインを復帰させる（FR-2.15.3 / FR-2.15.4）。`target` を
-    /// `direction`（省略時は右）へ分割した位置に挿し直す。`target` 省略時は
-    /// アクティブタブのフォーカス中ペインの隣
+    /// バックグラウンドからペインまたはタブを復帰させる（FR-2.15.3 / FR-2.15.4 / FR-2.15.7）。
+    ///
+    /// `pane` 指定: `target` を `direction`（省略時は右）へ分割した位置に挿し直す。
+    /// `target` 省略時はアクティブタブのフォーカス中ペインの隣。
+    /// `tab` 指定（#1487）: 退避タブを**分割ツリーごと**元の並び位置へ戻す
+    /// （`target` / `direction` は使わない）。`pane` と `tab` は排他
     Foreground {
-        pane: u64,
+        /// 復帰させるペイン ID（`tab` と排他。旧クライアント互換のため serde default）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        /// 復帰させる退避タブ ID（#1487。`pane` と排他）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tab: Option<u64>,
         target: Option<u64>,
         direction: Option<Direction>,
     },

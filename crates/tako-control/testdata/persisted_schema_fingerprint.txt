@@ -12,7 +12,7 @@ DeliveryState: Sent, Launched, Delivered, Failed
 DesiredState: since
 Device: id, name, login, node_name, role, created_at, last_seen
 DevicesFile: devices
-LayoutFile: version, active_tab, tabs, window, backgrounded, collapsed, webview_dock, windows
+LayoutFile: version, active_tab, tabs, window, backgrounded, collapsed, webview_dock, windows, shelved_tabs
 Ledger: entries
 LedgerEntry: id, ts, project, label, issue, task_type, model, effort, agent, duration_seconds, ctx_percent, had_error, outcome, rounds, note, post_issue, amend_note
 NodeLayout: Pane, Split, axis, ratio, first, second
@@ -34,6 +34,7 @@ Settings: auto_rename, port_detect, ssh_auto_folders, autosuggest, autosuggest_h
 SetupConfig: orchestrator, setup, agents_sync, spawn_layout, confirm_close, ctx_threshold
 SetupState: completed, completed_at, applied_revision, applied_version, selected_agent, provider_plans
 ShareState: repo, linked_at
+ShelvedTabLayout: tab, origin_window, origin_index
 Shortcut: id, path, name, added_at, builtin
 ShortcutsFile: version, shortcuts
 SpawnLayoutSection: policy, master_ratio, algorithm, min_worker_cols, auto_shrink_font, min_worker_font_scale

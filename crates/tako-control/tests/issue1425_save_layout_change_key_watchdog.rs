@@ -31,8 +31,8 @@ use std::path::{Path, PathBuf};
 
 use tako_control::layout::{
     self, AgentResumeLayout, ChangeKey, LayoutExtras, LayoutFile, NodeLayout, PaneLayout,
-    PaneMetaRef, PreviewLayout, RemoteFolderLayout, SshPaneLayout, TabLayout, WindowFrame,
-    WindowLayout, CHANGE_KEY_FIELDS,
+    PaneMetaRef, PreviewLayout, RemoteFolderLayout, ShelvedTabLayout, SshPaneLayout, TabLayout,
+    WindowFrame, WindowLayout, CHANGE_KEY_FIELDS,
 };
 use tako_core::PaneId;
 
@@ -56,6 +56,7 @@ const LAYOUT_STRUCTS: &[&str] = &[
     "PreviewLayout",
     "RemoteFolderLayout",
     "SshPaneLayout",
+    "ShelvedTabLayout",
 ];
 
 /// #916 の指紋スナップショットから layout 側の `(構造体, フィールド)` を読む。
@@ -186,6 +187,29 @@ fn cases() -> Vec<((&'static str, &'static str), Cover)> {
         (
             ("LayoutFile", "windows"),
             Cover::Mutate(|f| f.windows.clear()),
+        ),
+        (
+            ("LayoutFile", "shelved_tabs"),
+            Cover::Mutate(|f| {
+                let mut extra = f.shelved_tabs[0].clone();
+                extra.tab.id = 9401;
+                extra.tab.tree = NodeLayout::Pane(Box::new(pane(9501, "退避タブ 2")));
+                extra.tab.focused = 9501;
+                f.shelved_tabs.push(extra);
+            }),
+        ),
+        // ---- ShelvedTabLayout（#1487）----
+        (
+            ("ShelvedTabLayout", "tab"),
+            Cover::Mutate(|f| f.shelved_tabs[0].tab.title = "別の退避名".into()),
+        ),
+        (
+            ("ShelvedTabLayout", "origin_window"),
+            Cover::Mutate(|f| f.shelved_tabs[0].origin_window = 2),
+        ),
+        (
+            ("ShelvedTabLayout", "origin_index"),
+            Cover::Mutate(|f| f.shelved_tabs[0].origin_index = 2),
         ),
         // ---- WindowLayout ----
         (
@@ -689,6 +713,25 @@ fn base_file() -> LayoutFile {
             },
         ],
         backgrounded: vec![bg],
+        // #1487: タブ単位の退避（分割つき = ツリーごと往復することを検査表が射る）
+        shelved_tabs: vec![ShelvedTabLayout {
+            tab: TabLayout {
+                id: 4,
+                title: "退避した四枚目".into(),
+                title_source: "manual".into(),
+                focused: 402,
+                tree: NodeLayout::Split {
+                    axis: "y".into(),
+                    ratio: 0.3,
+                    first: Box::new(NodeLayout::Pane(Box::new(pane(401, "退避上")))),
+                    second: Box::new(NodeLayout::Pane(Box::new(pane(402, "退避下")))),
+                },
+                pinned_folders: Vec::new(),
+                remote_folders: Vec::new(),
+            },
+            origin_window: 1,
+            origin_index: 1,
+        }],
         collapsed: vec![2],
         webview_dock: vec!["https://example.invalid/dock".into()],
         windows: vec![
@@ -761,6 +804,10 @@ fn collect_metas(file: &LayoutFile) -> HashMap<u64, PaneMetaRef<'_>> {
     for p in &file.backgrounded {
         out.insert(p.id, meta_of(p));
     }
+    // #1487: 退避タブ配下のペインも同じ付帯情報を持つ
+    for t in &file.shelved_tabs {
+        walk(&t.tab.tree, &mut out);
+    }
     out
 }
 
@@ -817,6 +864,11 @@ fn leaf(file: &mut LayoutFile, id: u64) -> &mut PaneLayout {
         // borrow checker の都合で二度引く（テスト専用の探索なので素直に書く）
         if walk(&mut t.tree, id).is_some() {
             return walk(&mut t.tree, id).unwrap();
+        }
+    }
+    for t in &mut file.shelved_tabs {
+        if walk(&mut t.tab.tree, id).is_some() {
+            return walk(&mut t.tab.tree, id).unwrap();
         }
     }
     panic!("葉 {id} が無い");

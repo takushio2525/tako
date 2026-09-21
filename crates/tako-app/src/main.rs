@@ -3070,6 +3070,16 @@ struct BackgroundEntry {
     state: CommandState,
 }
 
+/// タブ単位で退避したタブ 1 枚（FR-2.15.7 / #1487）。中のペインは**分解されていない**ので、
+/// 表示は「1 枚のカード」+ 開いたときの中身（ペイン行）になる
+#[derive(Debug, Clone)]
+struct ShelvedTabGroup {
+    /// 退避タブ ID（ホバープレビュー / 復帰の対象解決に使う）
+    tab: TabId,
+    title: String,
+    entries: Vec<BackgroundEntry>,
+}
+
 /// 閉じた由来タブのバックグラウンドペイン群（FR-2.15.6）。由来タブが既に存在しないバックグラウンドペインを
 /// 「タブ <名前>（閉じたタブ）」としてまとめて表示する
 #[derive(Debug, Clone)]
@@ -6096,6 +6106,11 @@ impl TakoApp {
     /// バックグラウンドペインの表示ラベル（title > role > cwd ベース名 > 既定）。
     /// タブツリーのバックグラウンド行とドロワーのカードで共用する
     fn background_label(&self, p: &tako_core::BackgroundPane) -> String {
+        self.pane_background_label(p.pane())
+    }
+
+    /// 同上をペイン本体から解決する（#1487。退避タブ配下のペインはこちらを通る）
+    fn pane_background_label(&self, p: &tako_core::Pane) -> String {
         p.title()
             .map(|s| s.to_string())
             .or_else(|| p.role().map(|s| s.to_string()))
@@ -6131,18 +6146,88 @@ impl TakoApp {
             .unwrap_or(CommandState::Unknown)
     }
 
-    /// 指定した由来タブのバックグラウンドペインのエントリ列（FR-2.15.6。タブ別分離表示用）
+    /// 指定した由来タブのバックグラウンドペインのエントリ列（FR-2.15.6。タブ別分離表示用）。
+    /// #1487: `origin` が**退避タブ**なら、その配下のペインを表示順で返す
+    /// （一括プレビュー FR-2.16.16 とピン留めの対象解決をそのまま流用できる）
     fn background_entries_of_tab(&self, origin: TabId) -> Vec<BackgroundEntry> {
+        // 退避タブ配下（分割ツリーの表示順）→ 同じ由来を持つ平坦な退避、の順。
+        // **両方を足す**のが要る: ペイン単位で 1 本退避したあとタブごと退避すると、
+        // 同じタブ名の下に「退避タブ配下」と「平坦な退避」が同居する（この形を
+        // 分けて見せると、ユーザーには同じタブが 2 か所に出る）
+        let mut out: Vec<BackgroundEntry> = Vec::new();
+        if let Some(entry) = self.workspace.shelved_tab(origin) {
+            out.extend(
+                entry
+                    .tab()
+                    .tree()
+                    .panes()
+                    .into_iter()
+                    .map(|p| BackgroundEntry {
+                        pane: p.id(),
+                        label: self.pane_background_label(p),
+                        state: self.background_state(p.id()),
+                    }),
+            );
+        }
+        out.extend(
+            self.workspace
+                .shelved_panes()
+                .iter()
+                .filter(|p| p.origin_tab() == origin)
+                .map(|p| BackgroundEntry {
+                    pane: p.id(),
+                    label: self.background_label(p),
+                    state: self.background_state(p.id()),
+                }),
+        );
+        out
+    }
+
+    /// タブ単位で退避したタブ一覧（#1487。退避した順）
+    fn shelved_tab_groups(&self) -> Vec<ShelvedTabGroup> {
         self.workspace
-            .shelved_panes()
+            .shelved_tabs()
             .iter()
-            .filter(|p| p.origin_tab() == origin)
-            .map(|p| BackgroundEntry {
-                pane: p.id(),
-                label: self.background_label(p),
-                state: self.background_state(p.id()),
+            .map(|entry| ShelvedTabGroup {
+                tab: entry.id(),
+                title: entry.title().to_string(),
+                entries: self.background_entries_of_tab(entry.id()),
             })
             .collect()
+    }
+
+    /// 退避タブごと画面へ戻す（#1487。ドロワー / 右パネル / D&D の共通経路）。
+    /// プレビュー監視の再開まで面倒を見るので、UI 側に後始末を並べない
+    pub(crate) fn unshelve_tab_clicked(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
+        let panes: Vec<PaneId> = self
+            .workspace
+            .shelved_tab(tab_id)
+            .map(|e| e.pane_ids())
+            .unwrap_or_default();
+        let label = self
+            .workspace
+            .shelved_tab(tab_id)
+            .map(|e| e.title().to_string());
+        if let Err(e) = self.workspace.unshelve_tab(tab_id) {
+            // #1432 と同じ作法: 押しても無言にしない
+            self.notify_ui_op_failed(
+                crate::sidebar::NoticeArea::Drawer,
+                crate::sidebar::NoticeArm::Issue1432,
+                crate::ui_text::panel::op_unshelve_tab(),
+                label.as_deref(),
+                &e.to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        for pane in panes {
+            self.reattach_backgrounded_preview(pane);
+        }
+        if self.workspace.shelved_panes().is_empty() && self.workspace.shelved_tabs().is_empty() {
+            self.drawer_visible = false;
+        }
+        self.sync_preview_watches();
+        cx.notify();
     }
 
     /// 由来タブが既に閉じているバックグラウンドペインを、由来タブごとにまとめて返す（FR-2.15.6）。
@@ -6154,8 +6239,11 @@ impl TakoApp {
         let mut index: std::collections::HashMap<TabId, usize> = std::collections::HashMap::new();
         for p in self.workspace.shelved_panes() {
             let origin = p.origin_tab();
-            // 生存タブ由来は各タブ枠で表示済みなので除外する
-            if self.workspace.get_tab(origin).is_some() {
+            // 生存タブ由来は各タブ枠で表示済みなので除外する。
+            // #1487: 由来タブが**退避中**のものも除外する（退避タブのカードが
+            // `background_entries_of_tab` で同じ由来の平坦な退避も拾うので、
+            // ここへ残すと同じペインが 2 か所に出るうえ「閉じたタブ」と誤表示になる）
+            if self.workspace.get_tab(origin).is_some() || self.workspace.is_shelved_tab(origin) {
                 continue;
             }
             let entry = BackgroundEntry {
@@ -6239,9 +6327,10 @@ impl TakoApp {
     /// 残りを「kill 漏れ?（orphan バックエンド）」と「管理外（ユーザー直起動等）」に分類する。
     /// #183: ロール/cwd/プロセス/最終アクティビティを表示、orphan 判定を改良
     fn tmux_unlisted_sessions(&self) -> Vec<UnlistedTmuxSession> {
+        // #1487: 退避タブ配下のペインも器は生きているので「管理外 / kill 漏れ?」から外す
         let bg_sessions: std::collections::HashSet<String> = self
             .workspace
-            .shelved_panes()
+            .all_background_panes()
             .iter()
             .filter_map(|p| self.backend_sessions.get(&p.id()).cloned())
             .collect();
@@ -9303,7 +9392,8 @@ impl TakoApp {
             protected.extend(self.backend_sessions.values().cloned());
             // バックグラウンド中ペインの backend セッションは backend_sessions に残るため上で網羅されるが、
             // 念のため明示的に保護する（生かしたまま隠れている）
-            for pane in self.workspace.shelved_panes() {
+            // #1487: 退避タブ配下も同じく保護する（掃除で器を殺さない）
+            for pane in self.workspace.all_background_panes() {
                 if let Some(name) = self.backend_sessions.get(&pane.id()) {
                     protected.insert(name.clone());
                 }
@@ -9562,15 +9652,10 @@ impl TakoApp {
                 };
             }
         }
-        if let Some(bp) = self
-            .workspace
-            .shelved_panes()
-            .iter()
-            .find(|b| b.pane().id() == pane)
-        {
+        if let Some((p, origin_tab, _)) = self.workspace.background_pane(pane) {
             return tako_core::pane_log::PaneLogMeta {
-                tab: bp.origin_tab().as_u64(),
-                label: bp.pane().role().or(bp.pane().title()).map(str::to_string),
+                tab: origin_tab.as_u64(),
+                label: p.role().or(p.title()).map(str::to_string),
             };
         }
         tako_core::pane_log::PaneLogMeta::default()
@@ -9734,15 +9819,10 @@ impl TakoApp {
                 }
             }
             if snap.tab == 0 {
-                if let Some(bp) = self
-                    .workspace
-                    .shelved_panes()
-                    .iter()
-                    .find(|b| b.pane().id() == *pane)
-                {
-                    snap.tab = bp.origin_tab().as_u64();
-                    snap.role = bp.pane().role().map(str::to_string);
-                    snap.title = bp.pane().title().map(str::to_string);
+                if let Some((p, origin_tab, _)) = self.workspace.background_pane(*pane) {
+                    snap.tab = origin_tab.as_u64();
+                    snap.role = p.role().map(str::to_string);
+                    snap.title = p.title().map(str::to_string);
                 }
             }
             snap.cwd = session.cwd().map(|p| p.display().to_string());
@@ -14225,7 +14305,7 @@ impl TakoApp {
             .collect();
         roles.extend(
             self.workspace
-                .shelved_panes()
+                .all_background_panes()
                 .iter()
                 .map(|pane| (pane.id(), pane.role().is_some())),
         );
@@ -19515,14 +19595,8 @@ impl TakoApp {
         if self.pane_bodies.is_empty() && self.pane_headers.is_empty() {
             return;
         }
-        let live: std::collections::HashSet<PaneId> = self
-            .workspace
-            .tabs()
-            .iter()
-            .flat_map(|t| t.tree().panes())
-            .map(|p| p.id())
-            .chain(self.workspace.shelved_panes().iter().map(|s| s.pane().id()))
-            .collect();
+        // #1487: 退避タブ配下のペインのビューも刈らない（`all_pane_ids` の 1 実装）
+        let live = self.workspace.all_pane_ids();
         self.pane_bodies.retain(|id, _| live.contains(id));
         self.pane_headers.retain(|id, _| live.contains(id));
         self.pane_header_probes.retain(|id, _| live.contains(id));
@@ -37103,6 +37177,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1487: タブバーの ー を**実マウスで**押すとタブが 1 単位で退避するか
+                "shelve-tab" => {
+                    shelve_tab_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
@@ -37110,7 +37190,7 @@ mod self_test {
                          grid-bench / preview-leak / chat-leak / preview-code / \
                          remote-tree / flicker / ime-preedit / screen-lines / \
                          pane-border / tasks-panel / task-attachment / \
-                         tasks-accordion）"
+                         tasks-accordion / shelve-tab）"
                     );
                     std::process::exit(1);
                 }
@@ -37153,6 +37233,10 @@ mod self_test {
             // #1479: 一覧の項目を押すとその場に展開されるか（押した行と詳細の上下関係を
             // 実矩形で読む）+ tasks のバッジがパネル幅で欠けないか
             tasks_accordion_visual(any, window, cx).await;
+
+            // #1487: タブバーの ー を**実マウスで**押すとタブが 1 単位で退避し、
+            // 「タブごと復帰」で分割ツリーのまま元の位置へ戻るか
+            shelve_tab_visual(any, window, cx).await;
 
             // #589: ファイルツリーのインデントガイド線が連続しているか。
             // 4 階層のフィクスチャを開き、ダーク / ライト / スクロール後の 3 状態で
@@ -40440,6 +40524,196 @@ mod self_test {
             cx.notify();
         });
         println!("TAKO_VISUAL_1472: thumb={thumb_ready}");
+    }
+
+    /// タブバーの「ー」を**実マウスで**押すとタブが 1 単位で退避し、たまり場の
+    /// 「タブごと復帰」で**分割ツリーのまま**元の位置へ戻るか（#1487）。
+    ///
+    /// ハンドラ直呼び（`background_tab` を直接叩く形）は #496 型
+    /// （押下の mouse_down で自分が消えて `on_click` が発火しない）を検出できないので、
+    /// `click_at` の合成マウスで実フレームの hitbox へ当てる。
+    /// D&D（`TabDrag` のドロップ）は同じ `background_tab` の 1 経路を通るので、
+    /// 経路の同一性は番犬（`issue1487_shelve_tab_unit_watchdog`）が縛る。
+    ///
+    /// 単独実行は `TAKO_VISUAL_ONLY=shelve-tab`
+    #[cfg(feature = "visual-test")]
+    async fn shelve_tab_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        let wait =
+            |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+
+        // --- 場面: 3 ペイン（縦横混在・比率 0.3）のタブ + 別タブ 1 枚 ---
+        let made1487 = window
+            .update(cx, |app: &mut TakoApp, _, cx| {
+                // 他の節の残骸を畳んでから組む（#1083 / #948）
+                app.drawer_visible = false;
+                app.panel_visible = false;
+                let first = app.workspace.active_tab_id();
+                let root = app.workspace.active_tab().tree().focused();
+                let p2 = Pane::new(PaneOrigin::User);
+                let p2_id = p2.id();
+                let ok2 = app
+                    .workspace
+                    .active_tab_mut()
+                    .tree_mut()
+                    .split_with_ratio(root, SplitDirection::Right, 0.3, p2)
+                    .is_ok();
+                let p3 = Pane::new(PaneOrigin::User);
+                let p3_id = p3.id();
+                let ok3 = app
+                    .workspace
+                    .active_tab_mut()
+                    .tree_mut()
+                    .split_with_ratio(p2_id, SplitDirection::Down, 0.7, p3)
+                    .is_ok();
+                // 手動タイトル（title_source = Manual）を 1 本に付ける
+                if let Some(pane) = app.workspace.active_tab_mut().tree_mut().get_mut(p3_id) {
+                    pane.set_title(Some("検証用ペイン".to_string()));
+                }
+                // 退避しても最後の 1 タブにならないよう、もう 1 枚作ってから戻す
+                let other = app.workspace.create_tab("他", Pane::new(PaneOrigin::User));
+                let _ = app.workspace.activate_tab(first);
+                app.panel_click_probe_bounds.borrow_mut().clear();
+                cx.notify();
+                (ok2 && ok3).then_some((first, other, vec![root, p2_id, p3_id]))
+            })
+            .ok()
+            .flatten();
+        let Some((tab1487, _other1487, panes1487)) = made1487 else {
+            check(false, "153: 検証用のタブを組めない (#1487)");
+            return;
+        };
+
+        // 退避前のツリー（矩形・タイトル・title_source）を採る
+        let snapshot = |cx: &mut AsyncApp, tab: TabId| -> Option<String> {
+            window
+                .update(cx, |app: &mut TakoApp, _, _| {
+                    let t = app
+                        .workspace
+                        .get_tab(tab)
+                        .or_else(|| app.workspace.shelved_tab(tab).map(|e| e.tab()))?;
+                    let mut rows: Vec<String> = t
+                        .tree()
+                        .layout(tako_core::Rect::UNIT)
+                        .into_iter()
+                        .map(|(id, r)| {
+                            let p = t.tree().get(id);
+                            format!(
+                                "{} {:.3},{:.3},{:.3},{:.3} {:?} {:?}",
+                                id.as_u64(),
+                                r.x,
+                                r.y,
+                                r.width,
+                                r.height,
+                                p.and_then(|p| p.title()),
+                                p.map(|p| p.title_source()),
+                            )
+                        })
+                        .collect();
+                    rows.sort();
+                    Some(rows.join(" | "))
+                })
+                .ok()
+                .flatten()
+        };
+        let before1487 = snapshot(cx, tab1487);
+
+        notify_and_draw(any, window, cx);
+        wait(cx, 200).await;
+        notify_and_draw(any, window, cx);
+
+        let probe1487 = |cx: &mut AsyncApp, key: String| {
+            window
+                .update(cx, |app: &mut TakoApp, _, _| {
+                    app.panel_click_probe_bounds.borrow().get(&key).copied()
+                })
+                .ok()
+                .flatten()
+        };
+
+        // ① タブバーの「ー」を実マウスで押す → タブが 1 単位で退避する
+        match probe1487(cx, format!("tab-bg-{}", tab1487.as_u64())) {
+            None => check(false, "153: タブバーの ー ボタンが描かれない (#1487)"),
+            Some(rect) => {
+                click_at(any, cx, rect.center());
+                wait(cx, 200).await;
+                let shelved = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        (
+                            app.workspace.shelved_tabs().len(),
+                            app.workspace
+                                .shelved_tab(tab1487)
+                                .map(|e| e.pane_count())
+                                .unwrap_or(0),
+                            // 平坦化されていない = ペイン単位の退避は増えない
+                            app.workspace.shelved_panes().len(),
+                        )
+                    })
+                    .unwrap_or((0, 0, 99));
+                check(
+                    shelved == (1, 3, 0),
+                    "153: ー ボタンでタブが 3 ペインのまま 1 単位で退避する (#1487)",
+                );
+            }
+        }
+
+        // ② たまり場の「タブごと復帰」を実マウスで押す → 元の位置・ツリーで戻る
+        window
+            .update(cx, |app: &mut TakoApp, _, cx| {
+                app.drawer_visible = true;
+                app.panel_click_probe_bounds.borrow_mut().clear();
+                cx.notify();
+            })
+            .ok();
+        notify_and_draw(any, window, cx);
+        wait(cx, 250).await;
+        notify_and_draw(any, window, cx);
+        match probe1487(cx, format!("drawer-restore-tab-{}", tab1487.as_u64())) {
+            None => check(false, "153: たまり場に「タブごと復帰」が出ない (#1487)"),
+            Some(rect) => {
+                click_at(any, cx, rect.center());
+                wait(cx, 250).await;
+                let restored = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        (
+                            app.workspace.shelved_tabs().len(),
+                            app.workspace.get_tab(tab1487).is_some(),
+                            // 元の並び位置（先頭）へ戻る
+                            app.workspace.tabs().first().map(|t| t.id()) == Some(tab1487),
+                        )
+                    })
+                    .unwrap_or((9, false, false));
+                check(
+                    restored == (0, true, true),
+                    "153: 「タブごと復帰」で元の並び位置へ戻る (#1487)",
+                );
+            }
+        }
+        let after1487 = snapshot(cx, tab1487);
+        check(
+            before1487.is_some() && before1487 == after1487,
+            "153: 分割ツリー・比率・タイトルが退避前と一致する (#1487)",
+        );
+
+        // --- 後片付け: 作ったペイン / タブを畳む（後続の節へ持ち込まない）---
+        window
+            .update(cx, |app: &mut TakoApp, _, cx| {
+                app.drawer_visible = false;
+                for pane in panes1487.iter().skip(1) {
+                    let _ = app.workspace.active_tab_mut().tree_mut().close(*pane);
+                    app.terminals.remove(pane);
+                }
+                cx.notify();
+            })
+            .ok();
+        println!(
+            "TAKO_VISUAL_1487: before={:?} after={:?}",
+            before1487.is_some(),
+            after1487.is_some()
+        );
     }
 
     /// コンフリクトカードの操作が**実マウスで**発火するか（#496）。

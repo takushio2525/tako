@@ -718,9 +718,13 @@ impl TakoApp {
                                             )
                                         })
                                         .when(is_active, |d| {
+                                            // セルフテスト（visual-test）が**実マウスで**押すための実矩形（#1487）
+                                            let probe = self.panel_click_probe_bounds.clone();
+                                            let probe_key = format!("tab-bg-{}", id.as_u64());
                                             d.child(
                                                 div()
                                                     .id(("tab-bg", id.as_u64()))
+                                                    .relative()
                                                     .w(px(17.0))
                                                     .h(px(17.0))
                                                     .flex()
@@ -747,6 +751,21 @@ impl TakoApp {
                                                             .w(px(12.0))
                                                             .h(px(12.0))
                                                             .text_color(hsla(theme.text_muted)),
+                                                    )
+                                                    .child(
+                                                        gpui::canvas(
+                                                            |_, _, _| (),
+                                                            move |bounds, _, _, _| {
+                                                                probe.borrow_mut().insert(
+                                                                    probe_key.clone(),
+                                                                    bounds,
+                                                                );
+                                                            },
+                                                        )
+                                                        .absolute()
+                                                        .top_0()
+                                                        .left_0()
+                                                        .size_full(),
                                                     ),
                                             )
                                         })

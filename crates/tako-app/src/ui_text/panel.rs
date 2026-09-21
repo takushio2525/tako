@@ -96,6 +96,27 @@ pub fn closed_tab_group(title: &str, count: usize) -> String {
     )
 }
 
+/// タブ単位で退避したタブの節見出し（キー: panel.shelved_tab_section。#1487）
+pub fn shelved_tab_section() -> &'static str {
+    tr!(
+        "退避中のタブ（分割のまま裏で実行中）",
+        "Shelved tabs (still running in background)"
+    )
+}
+
+/// 退避タブ 1 枚のラベル（キー: panel.shelved_tab_group。#1487）
+pub fn shelved_tab_group(title: &str, count: usize) -> String {
+    tr!(
+        format!("タブ {title}（退避中・{count} ペイン）"),
+        format!("Tab {title} (shelved, {count} panes)")
+    )
+}
+
+/// 退避タブをまとめて戻す操作名（通知欄の失敗表示にも使う。キー: panel.op_unshelve_tab。#1487）
+pub fn op_unshelve_tab() -> &'static str {
+    tr!("タブごと復帰", "Restore tab")
+}
+
 // --- git ビュー（キー: panel.git_*） ---
 
 pub fn git_detecting() -> &'static str {
@@ -619,6 +640,9 @@ mod tests {
                 op_unshelve_pane().to_string(),
                 closed_tab_section().to_string(),
                 closed_tab_group("dev", 2),
+                shelved_tab_section().to_string(),
+                shelved_tab_group("dev", 2),
+                op_unshelve_tab().to_string(),
                 git_detecting().to_string(),
                 git_branches(2),
                 git_commits(10),

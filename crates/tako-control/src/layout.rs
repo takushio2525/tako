@@ -72,6 +72,26 @@ pub struct LayoutFile {
     /// serde default（空 = 全タブを 1 ウィンドウで復元）、空なら出力省略で後方互換
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub windows: Vec<WindowLayout>,
+    /// タブ単位で退避したタブ（#1487）。分割ツリー・比率・ペイン属性ごと保つ。
+    /// **旧ファイルには無いので serde default で後方互換**（移行 Step は不要）。
+    /// 空なら出力を省略するので、退避タブが無い環境の JSON は 1 バイトも変わらない
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shelved_tabs: Vec<ShelvedTabLayout>,
+}
+
+/// 退避タブ 1 枚の保存形（#1487）。
+///
+/// タブ本体は `TabLayout` をそのまま入れ子にする（表示中のタブと**同じ形**なので、
+/// 「復帰したら属性が落ちていた」が構造的に起きない）。由来ウィンドウと並び位置は
+/// 復帰先を決める材料（`tako_core::unshelve_tab_placement`）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShelvedTabLayout {
+    /// タブ本体（分割ツリー・タイトル・pinned_folders 等）
+    pub tab: TabLayout,
+    /// 退避元の論理ウィンドウ ID（Issue #339）。閉じていればアクティブへ戻す
+    pub origin_window: u64,
+    /// 退避時点の `tabs` 内の並び位置（超えていれば末尾へ戻す）
+    pub origin_index: usize,
 }
 
 /// 論理ウィンドウ 1 枚の保存形（Issue #339）。タブの実体は `tabs` にあり、
@@ -98,7 +118,14 @@ impl LayoutFile {
                 NodeLayout::Split { first, second, .. } => count(first) + count(second),
             }
         }
-        self.tabs.iter().map(|t| count(&t.tree)).sum::<usize>() + self.backgrounded.len()
+        self.tabs.iter().map(|t| count(&t.tree)).sum::<usize>()
+            + self.backgrounded.len()
+            // #1487: 退避タブ配下のペインも「生きている器」なので縮退保存ガードの対象
+            + self
+                .shelved_tabs
+                .iter()
+                .map(|t| count(&t.tab.tree))
+                .sum::<usize>()
     }
 
     /// レイアウト内の全 tmux バックエンドセッション名（全タブの葉 + バックグラウンド）。
@@ -125,6 +152,10 @@ impl LayoutFile {
             if let Some(s) = &p.session {
                 out.push(s);
             }
+        }
+        // #1487: 退避タブ配下も attach 対象（復元強奪ガードが見落とすと二重 attach になる）
+        for t in &self.shelved_tabs {
+            collect(&t.tab.tree, &mut out);
         }
         out
     }
@@ -343,31 +374,7 @@ pub fn capture(
         version: LAYOUT_VERSION,
         active_tab: ws.active_tab_id().as_u64(),
         window,
-        tabs: ws
-            .tabs()
-            .iter()
-            .map(|tab| TabLayout {
-                id: tab.id().as_u64(),
-                title: tab.title().to_string(),
-                title_source: title_source_str(tab.title_source()).to_string(),
-                focused: tab.tree().focused().as_u64(),
-                tree: capture_node(tab.tree().root(), meta),
-                pinned_folders: tab
-                    .pinned_folders()
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect(),
-                remote_folders: tab
-                    .remote_folders()
-                    .iter()
-                    .map(|f| RemoteFolderLayout {
-                        host: f.remote.host.clone(),
-                        path: f.remote.path.clone(),
-                        origin: f.origin.as_str().to_string(),
-                    })
-                    .collect(),
-            })
-            .collect(),
+        tabs: ws.tabs().iter().map(|tab| capture_tab(tab, meta)).collect(),
         backgrounded: ws
             .shelved_panes()
             .iter()
@@ -419,6 +426,42 @@ pub fn capture(
         } else {
             Vec::new()
         },
+        // 退避タブ（#1487）。表示中のタブと同じ `capture_tab` を通すので、
+        // タブに足した属性が退避中だけ落ちる、が起きない
+        shelved_tabs: ws
+            .shelved_tabs()
+            .iter()
+            .map(|entry| ShelvedTabLayout {
+                tab: capture_tab(entry.tab(), meta),
+                origin_window: entry.origin_window().as_u64(),
+                origin_index: entry.origin_index(),
+            })
+            .collect(),
+    }
+}
+
+/// タブ 1 枚を保存形へ写す（表示中のタブと退避タブ #1487 の共通経路）
+fn capture_tab(tab: &tako_core::Tab, meta: &dyn Fn(PaneId) -> PaneMeta) -> TabLayout {
+    TabLayout {
+        id: tab.id().as_u64(),
+        title: tab.title().to_string(),
+        title_source: title_source_str(tab.title_source()).to_string(),
+        focused: tab.tree().focused().as_u64(),
+        tree: capture_node(tab.tree().root(), meta),
+        pinned_folders: tab
+            .pinned_folders()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect(),
+        remote_folders: tab
+            .remote_folders()
+            .iter()
+            .map(|f| RemoteFolderLayout {
+                host: f.remote.host.clone(),
+                path: f.remote.path.clone(),
+                origin: f.origin.as_str().to_string(),
+            })
+            .collect(),
     }
 }
 
@@ -649,6 +692,11 @@ pub const CHANGE_KEY_FIELDS: &[(&str, &str)] = &[
     ("LayoutFile", "collapsed"),
     ("LayoutFile", "webview_dock"),
     ("LayoutFile", "windows"),
+    ("LayoutFile", "shelved_tabs"),
+    // ShelvedTabLayout（#1487）
+    ("ShelvedTabLayout", "tab"),
+    ("ShelvedTabLayout", "origin_window"),
+    ("ShelvedTabLayout", "origin_index"),
     // WindowLayout
     ("WindowLayout", "id"),
     ("WindowLayout", "tabs"),
@@ -757,24 +805,16 @@ pub fn change_key<'a>(
     // LayoutFile.tabs
     ws.tabs().len().hash(&mut h);
     for tab in ws.tabs() {
-        tab.id().as_u64().hash(&mut h);
-        tab.title().hash(&mut h);
-        title_source_str(tab.title_source()).hash(&mut h);
-        tab.tree().focused().as_u64().hash(&mut h);
-        // TabLayout.tree
-        feed_node(tab.tree().root(), meta, &mut h);
-        // TabLayout.pinned_folders
-        tab.pinned_folders().len().hash(&mut h);
-        for p in tab.pinned_folders() {
-            p.as_os_str().hash(&mut h);
-        }
-        // TabLayout.remote_folders
-        tab.remote_folders().len().hash(&mut h);
-        for f in tab.remote_folders() {
-            f.remote.host.hash(&mut h);
-            f.remote.path.hash(&mut h);
-            f.origin.as_str().hash(&mut h);
-        }
+        feed_tab(tab, meta, &mut h);
+    }
+    // LayoutFile.shelved_tabs（#1487）
+    ws.shelved_tabs().len().hash(&mut h);
+    for entry in ws.shelved_tabs() {
+        // ShelvedTabLayout.tab
+        feed_tab(entry.tab(), meta, &mut h);
+        // ShelvedTabLayout.origin_window / origin_index
+        entry.origin_window().as_u64().hash(&mut h);
+        entry.origin_index().hash(&mut h);
     }
     // LayoutFile.backgrounded
     ws.shelved_panes().len().hash(&mut h);
@@ -800,6 +840,28 @@ pub fn change_key<'a>(
     // LayoutFile.window / windows[].frame / collapsed / webview_dock
     extras.feed(&mut h);
     h.key()
+}
+
+/// タブ 1 枚ぶんをダイジェストへ流す（`capture_tab` と 1:1。表示中のタブと退避タブ #1487 で共用）
+fn feed_tab<'a>(tab: &tako_core::Tab, meta: &dyn Fn(PaneId) -> PaneMetaRef<'a>, h: &mut KeyHasher) {
+    tab.id().as_u64().hash(h);
+    tab.title().hash(h);
+    title_source_str(tab.title_source()).hash(h);
+    tab.tree().focused().as_u64().hash(h);
+    // TabLayout.tree
+    feed_node(tab.tree().root(), meta, h);
+    // TabLayout.pinned_folders
+    tab.pinned_folders().len().hash(h);
+    for p in tab.pinned_folders() {
+        p.as_os_str().hash(h);
+    }
+    // TabLayout.remote_folders
+    tab.remote_folders().len().hash(h);
+    for f in tab.remote_folders() {
+        f.remote.host.hash(h);
+        f.remote.path.hash(h);
+        f.origin.as_str().hash(h);
+    }
 }
 
 fn feed_node<'a>(node: &PaneNode, meta: &dyn Fn(PaneId) -> PaneMetaRef<'a>, h: &mut KeyHasher) {
@@ -915,55 +977,38 @@ pub fn restore(file: &LayoutFile) -> Result<(Workspace, Vec<RestoredPane>), Layo
     let mut tabs = Vec::new();
     let mut active = None;
     for tab_layout in &file.tabs {
-        let (root, focused) = restore_node(&tab_layout.tree, tab_layout.focused, &mut restored)
-            .ok_or(LayoutError::InvalidAxis)?;
-        let tree = PaneTree::from_root(root, focused);
-        let pinned: Vec<PathBuf> = {
-            let mut seen = std::collections::HashSet::new();
-            tab_layout
-                .pinned_folders
-                .iter()
-                .map(PathBuf::from)
-                .filter_map(|p| {
-                    // 解決は境界（B26）を通す（復元後もタブへ保存される値。#970）
-                    let canon = tako_core::platform::path::canonicalize_or_self(&p);
-                    if !canon.is_dir() || !seen.insert(canon.clone()) {
-                        return None;
-                    }
-                    Some(canon)
-                })
-                .collect()
-        };
-        // リモートは**ローカル FS の存在検査を通さない**（`is_dir()` に掛けると必ず
-        // 消える）。到達できるかは開いたあとにツリーが取りに行き、失敗は行として出る
-        let remote_folders: Vec<tako_core::remote_fs::RemoteFolder> = {
-            let mut seen = std::collections::HashSet::new();
-            tab_layout
-                .remote_folders
-                .iter()
-                .filter(|r| !r.host.trim().is_empty() && !r.path.trim().is_empty())
-                .map(|r| {
-                    tako_core::remote_fs::RemoteFolder::new(
-                        tako_core::remote_fs::RemoteRef::new(r.host.clone(), r.path.clone()),
-                        // #1041: 経路を持たない旧ファイルは `auto`（従来の並び）
-                        tako_core::remote_fs::RemoteOrigin::parse(&r.origin),
-                    )
-                })
-                .filter(|f| seen.insert(f.remote.clone()))
-                .collect()
-        };
-        let tab = Tab::restore(
-            tab_layout.id,
-            tab_layout.title.clone(),
-            parse_title_source(&tab_layout.title_source),
-            tree,
-            pinned,
-            remote_folders,
-        );
+        let tab = restore_tab(tab_layout, &mut restored).ok_or(LayoutError::InvalidAxis)?;
         if tab_layout.id == file.active_tab {
             active = Some(tab.id());
         }
         tabs.push(tab);
+    }
+    // 退避タブ（#1487）。ID 重複はここでも拒否する（同じ器を二重に作らない）
+    let mut shelved_tabs = Vec::new();
+    for entry in &file.shelved_tabs {
+        if !tab_ids.insert(entry.tab.id) {
+            return Err(LayoutError::DuplicateId);
+        }
+        let mut stack = vec![&entry.tab.tree];
+        while let Some(node) = stack.pop() {
+            match node {
+                NodeLayout::Pane(p) => {
+                    if !pane_ids.insert(p.id) {
+                        return Err(LayoutError::DuplicateId);
+                    }
+                }
+                NodeLayout::Split { first, second, .. } => {
+                    stack.push(first);
+                    stack.push(second);
+                }
+            }
+        }
+        let tab = restore_tab(&entry.tab, &mut restored).ok_or(LayoutError::InvalidAxis)?;
+        shelved_tabs.push(tako_core::BackgroundTab::new(
+            tab,
+            tako_core::WindowId::from_raw(entry.origin_window),
+            entry.origin_index,
+        ));
     }
     // たまり場ペインの復元（FR-2.15.5 / FR-2.15.6）。由来タブ無しの旧ファイルは
     // アクティブ（無ければ先頭）タブを由来とみなしてフォールバックする
@@ -1009,12 +1054,13 @@ pub fn restore(file: &LayoutFile) -> Result<(Workspace, Vec<RestoredPane>), Layo
     // 複数ウィンドウの復元（Issue #339）。保存が無ければ全タブ 1 ウィンドウ。
     // 壊れた割当（存在しないタブ・二重割当）は tako-core 側が安全に読み飛ばす
     let ws = if file.windows.is_empty() {
-        Workspace::restore_with_shelved(tabs, active, bg_panes)
+        Workspace::restore_with_shelved(tabs, active, bg_panes, shelved_tabs)
     } else {
         Workspace::restore_with_windows(
             tabs,
             active,
             bg_panes,
+            shelved_tabs,
             file.windows
                 .iter()
                 .map(|w| {
@@ -1029,6 +1075,55 @@ pub fn restore(file: &LayoutFile) -> Result<(Workspace, Vec<RestoredPane>), Layo
     }
     .ok_or(LayoutError::Workspace)?;
     Ok((ws, restored))
+}
+
+/// タブ 1 枚を保存形から戻す（表示中のタブと退避タブ #1487 の共通経路。
+/// `capture_tab` と 1:1 なので、片方だけ属性が落ちることがない）
+fn restore_tab(tab_layout: &TabLayout, restored: &mut Vec<RestoredPane>) -> Option<Tab> {
+    let (root, focused) = restore_node(&tab_layout.tree, tab_layout.focused, restored)?;
+    let tree = PaneTree::from_root(root, focused);
+    let pinned: Vec<PathBuf> = {
+        let mut seen = std::collections::HashSet::new();
+        tab_layout
+            .pinned_folders
+            .iter()
+            .map(PathBuf::from)
+            .filter_map(|p| {
+                // 解決は境界（B26）を通す（復元後もタブへ保存される値。#970）
+                let canon = tako_core::platform::path::canonicalize_or_self(&p);
+                if !canon.is_dir() || !seen.insert(canon.clone()) {
+                    return None;
+                }
+                Some(canon)
+            })
+            .collect()
+    };
+    // リモートは**ローカル FS の存在検査を通さない**（`is_dir()` に掛けると必ず
+    // 消える）。到達できるかは開いたあとにツリーが取りに行き、失敗は行として出る
+    let remote_folders: Vec<tako_core::remote_fs::RemoteFolder> = {
+        let mut seen = std::collections::HashSet::new();
+        tab_layout
+            .remote_folders
+            .iter()
+            .filter(|r| !r.host.trim().is_empty() && !r.path.trim().is_empty())
+            .map(|r| {
+                tako_core::remote_fs::RemoteFolder::new(
+                    tako_core::remote_fs::RemoteRef::new(r.host.clone(), r.path.clone()),
+                    // #1041: 経路を持たない旧ファイルは `auto`（従来の並び）
+                    tako_core::remote_fs::RemoteOrigin::parse(&r.origin),
+                )
+            })
+            .filter(|f| seen.insert(f.remote.clone()))
+            .collect()
+    };
+    Some(Tab::restore(
+        tab_layout.id,
+        tab_layout.title.clone(),
+        parse_title_source(&tab_layout.title_source),
+        tree,
+        pinned,
+        remote_folders,
+    ))
 }
 
 /// ノードを PaneNode へ写す。戻りの PaneId は「focused 指定に一致した葉」（無ければ先頭葉）
@@ -1837,6 +1932,7 @@ mod tests {
                 collapsed: vec![],
                 webview_dock: vec![],
                 windows: vec![],
+                shelved_tabs: Vec::new(),
             })
             .err(),
             Some(LayoutError::Empty)
@@ -1954,6 +2050,7 @@ mod tests {
             collapsed: Vec::new(),
             webview_dock: Vec::new(),
             windows: Vec::new(),
+            shelved_tabs: Vec::new(),
         }
     }
 
@@ -2017,6 +2114,7 @@ mod tests {
             collapsed: vec![],
             webview_dock: vec![],
             windows: vec![],
+            shelved_tabs: Vec::new(),
         };
         assert!(is_empty_layout(&empty));
         // 正常構成（タブ + ペインあり）は保存対象
@@ -2122,6 +2220,7 @@ mod tests {
             collapsed: vec![],
             webview_dock: vec![],
             windows: vec![],
+            shelved_tabs: Vec::new(),
         }
     }
 

@@ -1748,7 +1748,7 @@
     "name": "tako_git_resolve_agent"
   },
   {
-    "description": "ペインまたはタブをバックグラウンドへ送る。プロセスは生きたまま画面から外す。邪魔なペインやタブを画面外へ送るのに使う。バックグラウンドのペインはtako_background_list で確認でき、tako_foreground_pane で画面に戻せる。tab 指定時はタブ内全ペインを一括退避する（pane と tab は排他）。",
+    "description": "ペインまたはタブをバックグラウンドへ送る。プロセスは生きたまま画面から外す。邪魔なペインやタブを画面外へ送るのに使う。バックグラウンドのペインはtako_background_list で確認でき、tako_foreground_pane で画面に戻せる。tab 指定時は**タブ 1 単位**で退避する（分割ツリー・比率・並び位置を保ったまま。pane と tab は排他）。戻すときは tako_foreground_pane の tab を使う。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -1766,12 +1766,12 @@
     "name": "tako_background_pane"
   },
   {
-    "description": "バックグラウンドのペインを画面に復帰させる。target ペインのdirection 側を分割して表示する。target 省略時は由来タブへ戻す（由来タブが閉じていればアクティブタブ）。バックグラウンドで動かしていたペインを取り出すのに使う。",
+    "description": "バックグラウンドのペインまたはタブを画面に復帰させる。pane 指定: target ペインの direction 側を分割して表示する。target 省略時は由来タブへ戻す（由来タブが閉じていればアクティブタブ）。tab 指定: 退避タブを**分割ツリー・比率・ペイン属性ごと**元のウィンドウの元の並び位置へ戻す（target / direction は使わない）。pane と tab は排他。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "direction": {
-          "description": "分割方向（省略時は right）",
+          "description": "分割方向（省略時は right。pane 指定時のみ）",
           "enum": [
             "right",
             "down",
@@ -1781,23 +1781,24 @@
           "type": "string"
         },
         "pane": {
-          "description": "復帰させるペインの ID（background list から取得）",
+          "description": "復帰させるペインの ID（background list から取得。tab と排他）",
+          "type": "integer"
+        },
+        "tab": {
+          "description": "復帰させる退避タブの ID（background list の tabs[].tab。pane と排他）",
           "type": "integer"
         },
         "target": {
-          "description": "挿入先ペインの ID（省略時はフォーカス中ペイン）",
+          "description": "挿入先ペインの ID（省略時はフォーカス中ペイン。pane 指定時のみ）",
           "type": "integer"
         }
       },
-      "required": [
-        "pane"
-      ],
       "type": "object"
     },
     "name": "tako_foreground_pane"
   },
   {
-    "description": "バックグラウンドのペイン一覧を取得する。各ペインのID / title / role / state / cwd に加え、由来タブ（origin_tab / origin_tab_title）とsurface（常に background = 裏で実行中）を返す。バックグラウンドペインはこの由来タブでグループ分けして表示され、tako_foreground_pane で由来タブへ戻せる。",
+    "description": "バックグラウンドのペイン一覧を取得する。各ペインのID / title / role / state / cwd に加え、由来タブ（origin_tab / origin_tab_title）とsurface（常に background = 裏で実行中）を返す。バックグラウンドペインはこの由来タブでグループ分けして表示され、tako_foreground_pane で由来タブへ戻せる。tabs には**タブ単位で退避されたタブ**（tab / title / origin_window / panes / tree）が並ぶ。退避タブ配下のペインは backgrounded にも shelved_tab 付きで出るので、1 本だけ取り出すことも tako_foreground_pane の tab でまとめて戻すこともできる。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {},
