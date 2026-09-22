@@ -221,13 +221,22 @@ struct DetectedAgent {
     plan: Option<String>,
 }
 
+/// 外部コマンドへ 1 回聞く（**setup の probe は全部ここを通る**）。
+///
+/// `.output()` を直に書かないこと。あれは待ち時間の上限を持たないので、
+/// 無応答の claude で `tako setup` が無言で固まる（#1503。実測 6 分）。
+/// 上限は `tako_core::probe` の 1 実装が持ち、超えたら**打ち切って知らせ**、
+/// 呼び手には「確認できなかった」= `None` を返す。コンソールウィンドウの
+/// 抑止（#586）と stdin の遮断もそちらが面倒を見る。
+/// 番犬 `issue1503_probe_timeout_watchdog` が素の `.output()` を file:line で落とす
 fn command_output(path: &str, args: &[&str]) -> Option<std::process::Output> {
-    // #586: `tako setup` は dispatch（GUI 内）からも呼ばれる。そちらは既に
-    // コンソールを持たないので、ここを素で起動すると子ごとにウィンドウが出る
-    tako_core::platform::process::no_console_window(&mut std::process::Command::new(path))
-        .args(args)
-        .output()
-        .ok()
+    let outcome =
+        tako_core::probe::output_with_timeout(path, args, tako_core::probe::probe_timeout());
+    // **無言にしない**（#1503 の症状は「固まる」より先に「何も出ない」だった）
+    if let Some(notice) = outcome.timeout_notice() {
+        eprintln!("  {notice}");
+    }
+    outcome.into_output()
 }
 
 /// エージェント CLI の実行ファイルを解決する。
@@ -1644,16 +1653,12 @@ fn run_fda_check(interactive: bool) {
 /// MCP 登録の健全性を確認。
 /// 返り値: (登録あり, 登録パスが生きている)
 fn check_claude_mcp_health(claude_path: &str) -> (bool, bool) {
-    // #586: dispatch（GUI 内）から `tako setup` 経由でも走る。親がコンソールを
-    // 持たないと Windows は**子のために新しいコンソールを作る**ので、対話でない
-    // 子はすべて塞ぐ
-    let output = tako_core::platform::process::no_console_window(&mut std::process::Command::new(
-        claude_path,
-    ))
-    .args(["mcp", "list"])
-    .output();
-    match output {
-        Ok(o) if o.status.success() => {
+    // **`command_output` を通す**（#1503）。`claude mcp list` は登録済みの MCP サーバへ
+    // 1 台ずつ繋いで健全性を見るので、サーバが 1 つ無応答だとここで返らなくなる
+    // （#1500 の R4 = setup が無言で 6 分固まった実測の出どころ）。
+    // 上限で打ち切ったときは「未登録」と同じ扱いで先へ進む（登録し直せば済む）
+    match command_output(claude_path, &["mcp", "list"]) {
+        Some(o) if o.status.success() => {
             let stdout = String::from_utf8_lossy(&o.stdout);
             let has_tako = stdout.lines().any(|line| {
                 let lower = line.to_lowercase();
@@ -3895,17 +3900,9 @@ fn fallback_agent(previous: Option<&str>, bootstrap_target: Option<AgentKind>) -
 }
 
 fn find_backup_path(dir: &Path, filename: &str) -> PathBuf {
-    let today = {
-        // #586: 対話でない子なのでコンソールウィンドウを出させない
-        let output = tako_core::platform::process::no_console_window(
-            &mut std::process::Command::new("date"),
-        )
-        .args(["+%Y-%m-%d"])
-        .output();
-        match output {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-            _ => "unknown".into(),
-        }
+    let today = match command_output("date", &["+%Y-%m-%d"]) {
+        Some(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => "unknown".into(),
     };
     let base = dir.join(format!("{filename}.backup-{today}"));
     if !base.exists() {
@@ -3922,13 +3919,8 @@ fn find_backup_path(dir: &Path, filename: &str) -> PathBuf {
 }
 
 fn now_iso8601() -> String {
-    // #586: 対話でない子なのでコンソールウィンドウを出させない
-    let output =
-        tako_core::platform::process::no_console_window(&mut std::process::Command::new("date"))
-            .args(["+%Y-%m-%dT%H:%M:%S%z"])
-            .output();
-    match output {
-        Ok(o) if o.status.success() => {
+    match command_output("date", &["+%Y-%m-%dT%H:%M:%S%z"]) {
+        Some(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
             // +0900 → +09:00
             if s.len() >= 24 && !s.contains('+') {

@@ -40,6 +40,7 @@ pub mod preview_cache;
 pub mod preview_outline;
 pub mod preview_reload;
 pub mod preview_view;
+pub mod probe;
 pub mod prompt_append;
 pub mod prompt_delivery;
 pub mod pty_loop;

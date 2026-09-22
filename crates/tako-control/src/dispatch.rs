@@ -11795,7 +11795,29 @@ fn resolve_tako_binary_with(
 
 /// dispatch / MCP の回答 JSON を CLI の非対話 stdin 経路へ渡す。
 /// 回答本文を argv に含めず、プロセス一覧や診断情報へ露出させない。
+///
+/// **待ちには上限がある**（#1503）。旧実装は `wait_with_output()` で待ちっぱなしで、
+/// 無応答の claude を掴んだ `tako setup` を子に持つと GUI / MCP 側のボタンが
+/// 永久に回った。子の中の probe は `tako_core::probe` が個別に打ち切るが、
+/// それでも終わらない形（導入器が固まる等）へ最後の蓋をする。
+/// 打ち切りは失敗にせず `completed: false` + `timed_out: true` で返す
+/// （何が起きたかを呼び手＝ AI / CLI が読めるようにする）
 fn run_setup_cli(tako_bin: &str, answers_json: &str) -> Result<Value, DispatchError> {
+    run_setup_cli_within(
+        tako_bin,
+        answers_json,
+        tako_core::probe::setup_run_timeout(),
+    )
+}
+
+/// [`run_setup_cli`] の本体。**待ちの予算を引数で受ける**ので、env を触らずに
+/// 「上限で打ち切ったときの応答」を単体テストで固定できる
+/// （`.agent/conventions.md`「量を観る口の作り方」と同じ作り）
+fn run_setup_cli_within(
+    tako_bin: &str,
+    answers_json: &str,
+    budget: std::time::Duration,
+) -> Result<Value, DispatchError> {
     use std::io::Write as _;
 
     // #586: GUI プロセス（dispatch）から到達するのでコンソールウィンドウを出させない
@@ -11813,21 +11835,58 @@ fn run_setup_cli(tako_bin: &str, answers_json: &str) -> Result<Value, DispatchEr
         .ok_or_else(|| DispatchError::Operation("tako setup の標準入力を開けない".into()))?
         .write_all(answers_json.as_bytes())
         .map_err(|e| DispatchError::Operation(format!("setup answers の送信に失敗: {e}")))?;
-    let output = child
-        .wait_with_output()
-        .map_err(|e| DispatchError::Operation(format!("tako setup の完了待ちに失敗: {e}")))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if !output.status.success() {
+    let (status, stdout, stderr, timed_out, waited) =
+        match tako_core::probe::wait_with_timeout(child, "tako setup", budget) {
+            tako_core::probe::Outcome::Done {
+                status,
+                stdout,
+                stderr,
+            } => (Some(status), stdout, stderr, false, None),
+            tako_core::probe::Outcome::TimedOut {
+                waited,
+                stdout,
+                stderr,
+                ..
+            } => (None, stdout, stderr, true, Some(waited.as_secs())),
+            tako_core::probe::Outcome::Failed { reason, .. } => {
+                return Err(DispatchError::Operation(format!(
+                    "tako setup の完了待ちに失敗: {reason}"
+                )))
+            }
+        };
+    let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+    // 子の中で打ち切った probe（「確認できません（N 秒応答なし）」）を拾って
+    // 応答へ載せる。文面と読み取りは `tako_core::probe` の 1 実装が持つ
+    let probe_timeouts: Vec<Value> = tako_core::probe::parse_notices(&stderr)
+        .into_iter()
+        .map(|n| serde_json::json!({ "label": n.label, "waited_secs": n.waited_secs }))
+        .collect();
+    let output = if stderr.is_empty() { stdout } else { stderr };
+    if timed_out {
+        return Ok(serde_json::json!({
+            "completed": false,
+            "timed_out": true,
+            "waited_secs": waited,
+            "probe_timeouts": probe_timeouts,
+            "output": output,
+            "note": "tako setup が上限内に終わらなかったので打ち切った。\
+                     ターミナルで tako setup を実行して続きを確認すること",
+        }));
+    }
+    let status = status.expect("打ち切りでないなら終了コードがある");
+    if !status.success() {
         return Err(DispatchError::Operation(format!(
             "tako setup が失敗しました (exit={}): {}",
-            output.status.code().unwrap_or(-1),
-            if stderr.is_empty() { &stdout } else { &stderr }
+            status.code().unwrap_or(-1),
+            output
         )));
     }
     Ok(serde_json::json!({
         "completed": true,
-        "output": if stderr.is_empty() { stdout } else { stderr },
+        "timed_out": false,
+        "probe_timeouts": probe_timeouts,
+        "output": output,
     }))
 }
 
@@ -14708,6 +14767,94 @@ fn dispatch_stale_binary_dismiss(
         "dismissed": true,
         "pane": pane_id.as_u64(),
     }))
+}
+
+/// #1503: dispatch（GUI / MCP 経路）の setup 待ちが上限で返り、
+/// **打ち切りの事実が応答に載る**こと。
+///
+/// 実 `tako` ではなく「setup のふりをする使い捨てスクリプト」を子にするので、
+/// 本番の設定にも隔離環境にも 1 バイトも書かない
+#[cfg(all(test, unix))]
+mod setup_run_timeout_tests {
+    use std::io::Write as _;
+
+    /// `<dir>/tako setup --yes --answers -` として起動される使い捨ての子。
+    /// 置き場は**スコープを抜けると消える器**（#1312 の `ScratchDir`）
+    struct FakeTako {
+        dir: tako_core::test_residue::ScratchDir,
+    }
+
+    impl FakeTako {
+        fn new(tag: &str, body: &str) -> Self {
+            let dir = tako_core::test_residue::ScratchDir::new(&format!("dispatch-1503-{tag}"));
+            let bin = dir.path().join("tako");
+            let mut f = std::fs::File::create(&bin).expect("スクリプト");
+            write!(f, "#!/bin/sh\n{body}\n").expect("書き出し");
+            drop(f);
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("実行権");
+            Self { dir }
+        }
+
+        fn path(&self) -> String {
+            self.dir.path().join("tako").display().to_string()
+        }
+    }
+
+    #[test]
+    fn 返らないsetupは上限で打ち切られ事実が応答に載る() {
+        // `exec` で置き換えるので、kill が届く相手 = この sleep 自身
+        // `exec` で置き換えた先を kill するので、残るのは応答の形だけ。
+        // **打ち切る前に出ていたぶんを持ち帰る**性質は `tako_core::probe` の
+        // 単体テストが見る（ここで見ると並列実行の混み具合に左右される）
+        let fake = FakeTako::new("hang", "exec sleep 600");
+        let value =
+            super::run_setup_cli_within(&fake.path(), "{}", std::time::Duration::from_millis(1500))
+                .expect("打ち切りは失敗ではなく応答として返る");
+        assert_eq!(value["completed"], serde_json::json!(false), "{value}");
+        assert_eq!(value["timed_out"], serde_json::json!(true), "{value}");
+        assert_eq!(
+            value["waited_secs"],
+            serde_json::json!(1),
+            "何秒待ったかを載せる: {value}"
+        );
+        assert_eq!(value["probe_timeouts"], serde_json::json!([]), "{value}");
+        assert!(
+            value["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("tako setup"),
+            "次に何をすればよいかを添える: {value}"
+        );
+    }
+
+    #[test]
+    fn 子が打ち切ったprobeは応答のprobe_timeoutsに載る() {
+        let notice = tako_core::probe::TimeoutNotice {
+            label: "claude mcp list".to_string(),
+            waited_secs: 15,
+        };
+        let fake = FakeTako::new("notice", &format!("echo '  {notice}' >&2\nexit 0"));
+        let value =
+            super::run_setup_cli_within(&fake.path(), "{}", std::time::Duration::from_secs(30))
+                .expect("正常終了");
+        assert_eq!(value["completed"], serde_json::json!(true), "{value}");
+        assert_eq!(value["timed_out"], serde_json::json!(false), "{value}");
+        assert_eq!(
+            value["probe_timeouts"],
+            serde_json::json!([{ "label": "claude mcp list", "waited_secs": 15 }]),
+            "子が出した「確認できません」を拾って応答へ載せる: {value}"
+        );
+    }
+
+    #[test]
+    fn 打ち切りが無ければprobe_timeoutsは空() {
+        let fake = FakeTako::new("clean", "echo 'セットアップ完了' >&2\nexit 0");
+        let value =
+            super::run_setup_cli_within(&fake.path(), "{}", std::time::Duration::from_secs(30))
+                .expect("正常終了");
+        assert_eq!(value["probe_timeouts"], serde_json::json!([]), "{value}");
+    }
 }
 
 #[cfg(test)]

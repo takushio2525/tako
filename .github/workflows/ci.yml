@@ -116,6 +116,13 @@ jobs:
       # （#1501。#1500 の棚卸しでは新品環境で「setup を走らせても何も整わない」だった）
       - name: setup が詰まっても完走することの実経路テスト
         run: bash scripts/test-setup-continue-1501.sh
+      # 無応答の claude（`claude mcp list` が返らない）を掴んでも `tako setup` が
+      # 上限で打ち切って完走することの実経路テスト。隔離 HOME / TAKO_DATA_DIR / PATH +
+      # claude / brew のスタブで、立てた人工プロセスは自分の pid だけ片付ける。
+      # **probe や dispatch の待ちから上限が消えたらここで落ちる**（#1503。#1500 の
+      # 棚卸し R4 では `tako setup` が無言で 6 分固まり続けた）
+      - name: setup の probe が上限で打ち切ることの実経路テスト
+        run: bash scripts/test-setup-probe-timeout-1503.sh
       # `tako remote setup` の [1/5]（未導入の Tailscale をその場で入れる）の実経路テスト。
       # 隔離 HOME / TAKO_DATA_DIR / PATH + brew スタブで、`TAKO_TAILSCALE_BIN` を
       # 隔離 PATH の中へ向けて「未導入」を作るので実機の Tailscale にも tailnet の
