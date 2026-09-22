@@ -43,7 +43,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | ツール名 | 説明 |
 |---|---|
 | `tako_create_tab` | 新しいタブ（作業グループ）を作る |
-| `tako_select_tab` | 表示するタブを切り替える |
+| `tako_select_tab` | 表示するタブを切り替える（タブ ID は `tako_list_panes` で確認） |
 | `tako_rename_tab` | タブ名を変更する |
 | `tako_reorder_tab` | タブの並び順を変更する |
 | `tako_pin_tab_title` | 今のタブ名を固定する（以後 AI 自動リネームの対象外にする） |
@@ -73,7 +73,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_preview_edit` | コードプレビューの編集モードを開始・終了する |
 | `tako_preview_apply` | 編集バッファの全文を差し替える |
 | `tako_preview_save` | 未保存の編集をファイルへ保存する |
-| `tako_preview_undo` / `tako_preview_redo` | 編集の undo / redo |
+| `tako_preview_undo` / `tako_preview_redo` | 編集バッファの undo / redo（ディスクへ書くのは `tako_preview_save`） |
 | `tako_preview_search` / `tako_preview_replace` | テキストの検索 / 置換 |
 | `tako_preview_autosave` | 編集の自動保存設定 |
 
@@ -94,7 +94,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_git_show` | コミット詳細（メタ情報・変更ファイル一覧）を取得する |
 | `tako_git_stage` / `tako_git_unstage` | ファイルのステージ / アンステージ |
 | `tako_git_commit` | コミットする |
-| `tako_git_push` / `tako_git_pull` | push / pull |
+| `tako_git_push` / `tako_git_pull` | 対象ペインの cwd のリポジトリで引数なしの push / pull |
 | `tako_git_checkout` | ブランチを切り替える（既定は予行演習。実行は明示指定） |
 | `tako_git_branch_create` | 新規ブランチを作成する |
 | `tako_git_merge` | マージする（既定は予行演習。コンフリクトを事前予測） |
@@ -131,7 +131,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_orchestrator_run` | spawn し `run_id` を返す（非同期ワンショット実行） |
 | `tako_orchestrator_run_status` | 非同期 run の進捗を照会する |
 | `tako_orchestrator_run_result` | 完了した非同期 run の結果を回収する |
-| `tako_orchestrator_worker_status` | worker の状態確認（busy / idle / error / gone / 権限待ち） |
+| `tako_orchestrator_worker_status` | worker の状態確認（busy / idle / waiting / error / gone）と次の一手（`recommended_action`） |
 | `tako_orchestrator_workers` | worker レジストリの一覧（ペインが消えても追跡できる） |
 | `tako_orchestrator_report` | worker の報告内容を取得する（scrollback + transcript の 2 層） |
 | `tako_orchestrator_respond` | worker の権限確認ダイアログに応答する |
@@ -175,7 +175,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 |---|---|
 | `tako_remote_setup` | Tailscale セットアップの状態確認・実行 |
 | `tako_remote_start` / `tako_remote_stop` | リモートアクセスサーバーの起動 / 停止 |
-| `tako_remote_status` | 状態確認（固定 URL・登録端末数。secret は含まない） |
+| `tako_remote_status` | 状態確認（固定 URL・登録端末数。secret は含まない。劣化時は `degraded.next_step` に復旧手順） |
 | `tako_remote_devices` | ペアリング済み端末の一覧 / 失効 |
 | `tako_remote_shortcuts` | スマホのファイル閲覧で使うショートカット（お気に入り）の一覧 / 追加 / 削除 |
 | `tako_remote_agents` | 動作中のエージェント一覧 |

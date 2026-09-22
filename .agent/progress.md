@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-23（#1554: 復元の内訳が全ペインを説明するようにした）
-- 「復元成功: N タブ / M ペイン（…）」の内訳合計が M と合わない行が本番 52 行中 8 行あり、個別の spawn 失敗は `eprintln!` 止まり（GUI の stderr はどこにも出ない）で痕跡ゼロだった。AGENTS.md が「再起動後にエージェントが戻らないとき」の正本として案内している診断そのものの穴。無言の `continue` は Issue の 2 経路ではなく 5 経路（たまり場 / 退避タブ配下 / Web ビュー / spawn 失敗 / resume 入力の宛先なし）
-- **実測で差の正体は「たまり場・退避」だった**: 合わない 8 行はすべて #1487 着地（9/21）以降で、そのときの layout.json は 17 ペイン中 1 件がたまり場・1 件が退避タブ配下（Web ビューとプレビューは 0 件）。この 2 種は「表に出すときに起こす」設計なので失敗にせず別カテゴリで数える。件数・1 行目・2 行目の正本を `tako_control::restore_report` へ寄せ、区間（ラベルと件数）の列が合計の出どころ = カテゴリを 1 つ落とすと合計も落ちる形に。個別の失敗は `復元失敗（ペイン N）: <分類>: <エラー>` を 1 行ずつ、それでも合計が合わなければ食い違い自体を 1 行（FR-5.7.1 / A/B は `TAKO_1554_LEGACY=1`）
-- 実測: `scripts/test-restore-breakdown-1554.sh` **39 PASS 0 FAIL**（隔離 GUI で実 tako-app を 4 回起動。CI 未登録 = 実 GUI が要る）・単体 9 + 番犬 8・注入 12 通りすべて file:line 名指しで FAILED → 戻して緑・workspace 5144 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。[提案] = `$VAR` の直後の全角で bash が変数名へ取り込む罠（番犬候補）/ たまり場・退避のペインが復元で器を引き継がず「復帰」タブへ別ペインとして戻る（実測済み・要 Issue）
-
 ## 2026-09-23（#1278 / #583: CI の Windows の cargo test を blocking にした）
 - `continue-on-error: true`（#583 の据え置き）のあいだ**新しい赤が見えなかった**のが本題。全数を `--no-fail-fast` の blocking へ（既定の cargo は最初に落ちたバイナリで打ち切るので、main の CI は tako-app の 1 件で止まり tako-control / tako-core が 0 件実行だった = 1 回で 1 件しか直せない）。名指しの実行検査（#1282 / #1314）は全数より手前へ move
 - 4 往復で収束: **21 → 2 → 0 failed**（1 巡目 failure → 3 巡目 success が「blocking になった」実証。わざと壊す必要は無かった）。21 件のうち **13 件は 9/9 のベースライン 24 件に無い** = その後 main へ増えた未検出ぶん。テスト側を直した 20 件は期待値を製品の正から作る型（`current_recipe` / `cli_file_name` / `Path::join` / `join_paths` / `temp_dir`）+ `display()` 比較を `Path` 比較へ + `-EncodedCommand` の復号 + 自前 symlink。ランナー固有は 8.3 短縮名 / git identity 不在 / `core.autocrlf=true` / pwsh 自身の書き込みの 4 系統
@@ -54,3 +49,8 @@
 - リンク経路 13 サイト（ターミナルのクリック / cmd+右クリック #1182 / ホバー 6 / md・PDF のクリック / リリースノート）が `Modifiers::platform` を直読みし、Windows は Win+クリック要求だった。判定を `tako_core::platform::keys::link_modifier_active(platform, platform_key, control)`（macOS = command のみ / Windows = control のみ。`platform || control` を素で足すと macOS の Ctrl+クリック = 右クリック相当と衝突）へ寄せ、GPUI 側は `keybindings::link_modifier_active` / `link_modifiers` / `non_link_modifiers` の 3 本だけが `Modifiers` を触る形にした。表記も同じ表を見る `keys::link_click` で MCP カタログ・CLI ヘルプ・docs が実行 OS に追従する
 - 実測: 番犬 `issue763_link_modifier_watchdog`（4 規則）へ注入 12 通りすべて file:line 名指しで FAILED → 戻して緑・隔離 GUI（tako-vd）のセルフテストが `TAKO_APP_SELF_TEST_OK` 完走（310 秒 / 240 診断行）で `TAKO_SELF_TEST_763: file_click=true dir_click=true wrong_modifier_opened=false`・workspace 5204 passed 0 failed・clippy 3 宇宙 0・check-windows error 0
 - 次: Windows 実機での Ctrl+クリック実測は #467 の実機レーンで（offline のため未検証）
+
+## 2026-09-23（#1540: MCP ツールカタログの説明文を圧縮し、Issue 番号を落とした）
+- AI が引けない Issue 番号を description / inputSchema から**195 箇所すべて**落とし（根拠は `// 出自: #…` のソースコメントへ 83 ツールぶん移送）、`tako_orchestrator_worker_status` を 3,587 → 1,566 字へ。残り 76% は識別子なので地の文は 368 字（これ以上は応答キー・enum 値を捨てることになる）。ダイアログ構造は `tako_orchestrator_respond`、`prompt_delivery_failure` の値は `tako_orchestrator_workers`、`delivery` の項目は `tako_read_pane` を正本に寄せた
+- `next_step` / `degraded` を返す 9 ツールへ読み方を明記し、`tako_setup` の `orchestrator` / `sleep_guard`（カタログ唯一の description 欠落）を補い、導線の無かった 6 ツール（`select_tab` / `recent` / `git_push` / `git_pull` / `preview_undo` / `redo`）へ前提ツールを足した。規則は `.agent/conventions.md` の新節、上限は #1539 の 210 KB → **200 KB** へ締め直し
+- 実測: カタログ 201,535 → 198,830 バイト・52,028 → 51,076 トークン（tiktoken `o200k_base`）・Issue 番号 195 → 0。番犬 `mcp説明文にissue番号を書かない` へ注入 3 通りすべてツール名指しで FAILED → 戻して緑。識別子は**カタログ全体で消失 0**（機械照合）・workspace 5172 passed 0 failed・clippy 3 宇宙 0・check-windows error 0

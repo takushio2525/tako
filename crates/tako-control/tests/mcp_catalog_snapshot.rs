@@ -97,3 +97,74 @@ fn snapshotのobjectキー順はserde_jsonのfeatureに依存しない() {
     let rendered = serde_json::to_string(&canonicalize(object.into())).unwrap();
     assert_eq!(rendered, r#"{"a":0,"z":{"a":2,"y":1}}"#);
 }
+
+/// 文字列中の `#` + 2〜4 桁の数字（Issue 番号の形）をすべて拾う
+fn issue_refs(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'#' {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut end = start;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        // 5 桁以上は Issue 番号ではない（誤検出を避ける）
+        if (2..=4).contains(&(end - start)) && !bytes.get(end).is_some_and(u8::is_ascii_digit) {
+            out.push(text[i..end].to_string());
+        }
+        i = end.max(i + 1);
+    }
+    out
+}
+
+/// JSON 値の中の**文字列**をすべて辿る（キーも値も、AI が受け取る全文）
+fn collect_strings(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Array(items) => items.iter().for_each(|v| collect_strings(v, out)),
+        serde_json::Value::Object(map) => map.values().for_each(|v| collect_strings(v, out)),
+        _ => {}
+    }
+}
+
+/// AI 向けの説明文（`tools/list` の応答）に Issue 番号を書かない。
+///
+/// MCP を繋いだエージェントは 1 本残らず起動した瞬間にこの全文を受け取るが、
+/// **AI は番号から Issue を引けない**ので `#1234` はトークンを食うだけで情報を運ばない。
+/// 根拠（どの Issue で入った説明か）は `catalog.rs` のソースコメント
+/// `// 出自: #…` に残してあるので、情報は失われない。
+#[test]
+fn mcp説明文にissue番号を書かない() {
+    let mut problems = Vec::new();
+    for tool in mcp::tools() {
+        let name = tool["name"].as_str().unwrap_or("?").to_string();
+        let mut strings = Vec::new();
+        collect_strings(&tool, &mut strings);
+        for s in strings {
+            let refs = issue_refs(&s);
+            if !refs.is_empty() {
+                problems.push(format!("  {name}: {} — {}", refs.join(" / "), s.trim()));
+            }
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "MCP カタログの説明文に Issue 番号が {} 箇所ある。AI は番号を引けないので\
+         説明文からは落とし、根拠は catalog.rs のソースコメント（`// 出自: #…`）へ書くこと\
+         （Issue #1540）:\n{}",
+        problems.len(),
+        problems.join("\n")
+    );
+}
+
+#[test]
+fn issue番号の拾い方が桁でぶれない() {
+    assert_eq!(issue_refs("#1540 と #99 を見る"), vec!["#1540", "#99"]);
+    // 1 桁は拾わない（見出しの `#` や色指定と紛れる）／5 桁以上も拾わない
+    assert!(issue_refs("#5 / #12345 / # 123 / abc#x").is_empty());
+}
