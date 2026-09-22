@@ -43,6 +43,23 @@ const RENAME_MIN_INTERVAL: Duration = Duration::from_secs(300);
 /// まだ名前が付いていないタブの再試行間隔。初回の命名を 5 分待たせないための例外で、
 /// 従来のクールダウン（claude 呼び出しの浪費防止）をそのまま使う
 const FIRST_NAME_COOLDOWN: Duration = Duration::from_secs(30);
+/// **素材が凍ったままのタブ**をやり直す間隔（#760 問題 2）。前回の発火からこれだけ
+/// 経っていれば、指紋が変わっていなくてももう一度だけ名付け直す。
+///
+/// なぜ要るか: 指紋は cwd / OSC タイトル / 実行状態でできているが、シェル統合
+/// （OSC 7 / 133）が無いプラットフォーム（Windows。#525）ではその 3 つが起動時の値のまま
+/// **一度も変わらない**（cwd は `cd` しても追従せず、状態は常に `unknown`、OSC タイトルは
+/// シェルの実行ファイルパスのまま）。指紋の変化だけを発火条件にすると、命名は
+/// **ペインを開いた直後の 1 回**（＝画面がまだ空で素材がほぼ無い時点）で終わり、
+/// そのあとどれだけ作業しても付け直されない。
+///
+/// N 回目のやり直しは N 番目の値を使い、**表を使い切ったら止まる**。素材が動かない限り
+/// 必ず静まるので、#552 案 1（タブ名が目印として機能しなくなる）の趣旨を壊さない
+const STALE_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(300),
+    Duration::from_secs(1200),
+    Duration::from_secs(3600),
+];
 /// 「この名前を固定」の印を出しておく時間（#552 案 4）。自動命名の**直後だけ**出す
 pub const PIN_HINT_TTL: Duration = Duration::from_secs(120);
 /// claude 子プロセスの待ち時間上限（超過は kill してヒューリスティックへ）。
@@ -128,6 +145,9 @@ struct TabWatch {
     /// 発火済みの指紋（同じ状態への再発火を防ぐ）
     done_fingerprint: u64,
     last_run: Option<Instant>,
+    /// **同じ指紋のまま**やり直した回数（#760。[`STALE_RETRY_DELAYS`] の添字。
+    /// 素材が動いたら 0 へ戻す）
+    stale_runs: usize,
 }
 
 /// 検知ループの状態。`enabled` は dispatch の `AutoRename`（FR-2.12.4）から切り替わる
@@ -165,10 +185,13 @@ impl AutoRenamer {
                 since: now,
                 done_fingerprint: 0,
                 last_run: None,
+                stale_runs: 0,
             });
             if watch.fingerprint != signal.fingerprint {
                 watch.fingerprint = signal.fingerprint;
                 watch.since = now;
+                // 素材が動いたのでやり直しの回数は仕切り直し（#760）
+                watch.stale_runs = 0;
                 continue;
             }
             let calm = now.duration_since(watch.since) >= DEBOUNCE;
@@ -181,7 +204,18 @@ impl AutoRenamer {
             let cooled = watch
                 .last_run
                 .is_none_or(|t| now.duration_since(t) >= interval);
-            if calm && fresh && cooled {
+            // 素材が凍ったままのタブのやり直し（#760 問題 2）。指紋が動かない
+            // プラットフォームでも作業が進めば名前が付け直されるようにする。
+            // 表を使い切ったら止まる = 毎 tick 揺れない
+            let stale_due = !fresh
+                && STALE_RETRY_DELAYS
+                    .get(watch.stale_runs)
+                    .zip(watch.last_run)
+                    .is_some_and(|(delay, last)| now.duration_since(last) >= *delay);
+            if calm && cooled && (fresh || stale_due) {
+                if !fresh {
+                    watch.stale_runs += 1;
+                }
                 // 失敗時の連打を防ぐため、結果を待たず発火済みとして記録する
                 watch.done_fingerprint = signal.fingerprint;
                 watch.last_run = Some(now);
@@ -193,7 +227,11 @@ impl AutoRenamer {
 }
 
 /// 素材指紋（変化検知用）。出力末尾は含めない（実行中は毎 tick 変わり静穏にならないため、
-/// cwd / OSC タイトル / 実行状態の「節目」だけで判定する）
+/// cwd / OSC タイトル / 実行状態の「節目」だけで判定する）。
+///
+/// **その 3 つが全部不変になるプラットフォームがある**（シェル統合の無い Windows。
+/// #525 / #760）ので、指紋の変化だけを発火条件にはしない。凍ったままのタブは
+/// [`STALE_RETRY_DELAYS`] でやり直す
 pub fn fingerprint<T: Hash>(value: &T) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
@@ -719,8 +757,91 @@ const JAPANESE: &str =
      講訳変対観歓漢権勧難樹術図団園環現実軍農辺過達運連進遠違遅選応様還錯誤敗検報処執\
      庫類結構編載伝輸備択撃動態優測復帰項務絡単時験題線顕標録視義習専業倉産";
 
+/// シェル・端末多重化ツール・コンソールホストの実行ファイル名（拡張子を除いた小文字）。
+///
+/// これがタブ名になると「いま何をしているか」を 1 文字も表さないうえ、Windows では
+/// **全タブがまったく同じ名前**になる（#760 の実測: コンソールタイトルがシェル自身の
+/// フルパス `C:\Program Files\PowerShell\7\pwsh.exe` / psmux の `...\tmux.exe` で、
+/// [`MAX_TAB_TITLE`] で切ると全部 `C:\Program Files` / `C:\Users\<user>\A` になる）。
+///
+/// 表に足すのは「**それ自身がシェル / 器**であって作業内容ではない」ものだけ。
+/// ユーザーが打ったコマンド（`cargo` / `vim` / `git`）は作業内容そのものなので入れない
+const SHELL_EXE_STEMS: &[&str] = &[
+    // Windows のシェル・コンソールホスト
+    "pwsh",
+    "powershell",
+    "cmd",
+    "conhost",
+    "openconsole",
+    "wt",
+    "windowsterminal",
+    // POSIX 系のシェル
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "dash",
+    "ksh",
+    "csh",
+    "tcsh",
+    "nu",
+    "xonsh",
+    "elvish",
+    // 端末多重化ツール（tako が器として起こす psmux / tmux を含む）
+    "tmux",
+    "psmux",
+    "screen",
+    "zellij",
+];
+
+/// 実行ファイルに使われる拡張子（Windows）。小文字で比較する
+const EXE_SUFFIXES: &[&str] = &[".exe", ".com", ".bat", ".cmd"];
+
+/// この OSC タイトルは「シェル自身 / 器の実行ファイル」か（#760 問題 1）。
+///
+/// 該当すれば [`SHELL_EXE_STEMS`] の**どの語に当たったか**を返す。返すのは tako 側の
+/// 定数であって画面の中身ではないので、診断ログへ出してよい
+/// （ペイン内容を診断へ出さないのは AGENTS.md の絶対ルール）
+fn shell_exe_material(title: &str) -> Option<&'static str> {
+    let name = last_segment(title)?.to_ascii_lowercase();
+    let stem = EXE_SUFFIXES
+        .iter()
+        .find_map(|suffix| name.strip_suffix(suffix))
+        .unwrap_or(name.as_str());
+    SHELL_EXE_STEMS.iter().copied().find(|known| *known == stem)
+}
+
+/// Windows 形のパスに見えるか（`C:\...` / `C:/...` / UNC `\\server\share`）
+fn looks_like_windows_path(path: &str) -> bool {
+    let b = path.as_bytes();
+    (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/'))
+        || path.starts_with("\\\\")
+}
+
+/// パス文字列の末尾要素（ディレクトリ名 / 実行ファイル名）。ルートだけ・空なら `None`。
+///
+/// **区切りは動いている OS ではなく文字列の形で決める**（#760）。`Path::file_name` は
+/// Unix で `\` を区切りとみなさないので、macOS 上で Windows 形の素材
+/// （`C:\Users\<user>\proj`）を渡すと丸ごと 1 要素として返ってくる。素材は実機の
+/// プラットフォームだけでなく SSH 先（#919）や検査からも来るので、両方の形を受ける。
+/// Unix のパスに対しては `/` しか見ない = ディレクトリ名に `\` を含む実在のパスを壊さない
+fn last_segment(path: &str) -> Option<&str> {
+    let windows = looks_like_windows_path(path);
+    let seps: &[char] = if windows { &['/', '\\'] } else { &['/'] };
+    let trimmed = path.trim_end_matches(seps);
+    let name = trimmed.rsplit(seps).next().unwrap_or(trimmed);
+    // 空（`/` だけ）とドライブ名だけ（`C:\`）は名前にならない
+    if name.is_empty() || (windows && name.ends_with(':')) {
+        return None;
+    }
+    Some(name)
+}
+
 /// ヒューリスティック命名（FR-2.12.5）: OSC タイトル > cwd の末尾ディレクトリ名。
-/// どちらも無いペインは触らない。タブ名は最初に命名できたペインの名前を使う
+/// どちらも無いペインは触らない。タブ名は最初に命名できたペインの名前を使う。
+///
+/// OSC タイトルが**シェル自身 / 器の実行ファイル**に見えるときは素材として捨てて
+/// cwd へ落とす（FR-2.12.12・#760 問題 1）
 pub fn heuristic_plan(materials: &TabMaterials) -> RenamePlan {
     let mut panes = Vec::new();
     for pane in &materials.panes {
@@ -729,13 +850,23 @@ pub fn heuristic_plan(materials: &TabMaterials) -> RenamePlan {
             .as_deref()
             .map(str::trim)
             .filter(|t| !t.is_empty())
+            .filter(|t| match shell_exe_material(t) {
+                Some(program) => {
+                    // 中身は出さない。出すのは tako 側の定数（当たった語）だけ
+                    diag(format_args!(
+                        "pane {}: OSC タイトルは {program} 自身の実行ファイルなので\
+                         素材から捨てた → cwd へ落とす",
+                        pane.pane
+                    ));
+                    false
+                }
+                None => true,
+            })
             .map(|t| clamp_chars(t, MAX_PANE_TITLE))
             .or_else(|| {
                 pane.cwd
                     .as_deref()
-                    .map(Path::new)
-                    .and_then(Path::file_name)
-                    .and_then(|n| n.to_str())
+                    .and_then(last_segment)
                     .map(|n| clamp_chars(n, MAX_PANE_TITLE))
             });
         if let Some(title) = title {
@@ -1316,6 +1447,128 @@ TAIL
         assert_eq!(plan.tab.as_deref(), Some("tako — cargo tes")); // タブ上限 16 文字
     }
 
+    /// Windows 形の素材（**#760 問題 1**）。コンソールタイトルはシェル / psmux **自身**の
+    /// フルパスなので、素通しすると `MAX_TAB_TITLE` で切った `C:\Program Files` /
+    /// `C:\Users\<winuser>\A` が**全タブ同じ名前**になる（9/9 の実機レビューでは
+    /// これが初回起動の第一印象そのものになっていた）。cwd 由来の名前へ落とす
+    #[test]
+    fn ヒューリスティックはシェルの実行ファイルパスを素材にしない() {
+        let psmux = [
+            r"C:\Users\winuser\AppData\Local\Microsoft\WinGet\Packages",
+            r"marlocarlo.psmux_Microsoft.Winget.Source_8wekyb3d8bbwe",
+            "tmux.exe",
+        ]
+        .join("\\");
+        let m = TabMaterials {
+            tab: 7,
+            rename_tab: true,
+            panes: vec![
+                PaneMaterials {
+                    pane: 1,
+                    role: None,
+                    osc_title: Some(r"C:\Program Files\PowerShell\7\pwsh.exe".into()),
+                    cwd: Some(r"C:\Users\winuser\proj".into()),
+                    state: "unknown",
+                    tail: Vec::new(),
+                },
+                PaneMaterials {
+                    pane: 2,
+                    role: None,
+                    osc_title: Some(psmux),
+                    cwd: Some(r"C:\Users\winuser\dev\tako".into()),
+                    state: "unknown",
+                    tail: Vec::new(),
+                },
+            ],
+        };
+        let plan = heuristic_plan(&m);
+        assert_eq!(
+            plan.panes,
+            vec![(1, "proj".into()), (2, "tako".into())],
+            "OSC タイトル（シェル / psmux の実行ファイルパス）がそのまま名前になっている"
+        );
+        assert_eq!(plan.tab.as_deref(), Some("proj"));
+        assert_ne!(
+            plan.panes[0].1, plan.panes[1].1,
+            "2 枚のタブが同じ名前 = タブ名が識別に使えない（#760 の症状）"
+        );
+        for (_, name) in &plan.panes {
+            assert!(
+                !name.contains('\\') && !name.contains('/') && !name.ends_with(".exe"),
+                "実行ファイルパスの断片が名前に残っている: {name}"
+            );
+        }
+    }
+
+    /// 関門は**シェル自身**だけを捨て、作業内容を表すタイトルは巻き添えにしない（#760）。
+    /// macOS 形（OSC 7 / 133 が入る）の素材が従来どおりなのは
+    /// `ヒューリスティックはoscタイトル優先でcwdへ落ちる` が固定している
+    #[test]
+    fn 関門はシェル以外のoscタイトルを巻き添えにしない() {
+        for keep in [
+            "tako — cargo test",
+            "cargo test",
+            "vim src/main.rs",
+            "~/dev/tako",
+            r"C:\work\build.bat",
+            "npm run dev",
+        ] {
+            assert_eq!(shell_exe_material(keep), None, "`{keep}` を捨てている");
+        }
+        for (title, want) in [
+            (r"C:\Program Files\PowerShell\7\pwsh.exe", "pwsh"),
+            (r"C:\WINDOWS\system32\cmd.exe", "cmd"),
+            ("PWSH.EXE", "pwsh"),
+            ("/bin/zsh", "zsh"),
+            ("/opt/homebrew/bin/tmux", "tmux"),
+            ("bash", "bash"),
+        ] {
+            assert_eq!(
+                shell_exe_material(title),
+                Some(want),
+                "`{title}` を素通ししている"
+            );
+        }
+    }
+
+    /// エッジ（#760）: ① タイトルが空 ② タイトルを捨てたが cwd も無い
+    /// ③ cwd がルートだけ ④ 手動リネーム済みのタブ名は作らない
+    #[test]
+    fn 関門はエッジで名前を捏造しない() {
+        let tab = |title: Option<&str>, cwd: Option<&str>, rename_tab: bool| TabMaterials {
+            tab: 1,
+            rename_tab,
+            panes: vec![PaneMaterials {
+                pane: 1,
+                role: None,
+                osc_title: title.map(str::to_string),
+                cwd: cwd.map(str::to_string),
+                state: "unknown",
+                tail: Vec::new(),
+            }],
+        };
+        let pwsh = r"C:\Program Files\PowerShell\7\pwsh.exe";
+        // ① 空白だけのタイトルは従来どおり cwd へ落ちる
+        let plan = heuristic_plan(&tab(Some("   "), Some(r"C:\Users\winuser\proj"), true));
+        assert_eq!(plan.tab.as_deref(), Some("proj"));
+        // ② 捨てたあと cwd も無ければ、そのペインには触らない
+        let plan = heuristic_plan(&tab(Some(pwsh), None, true));
+        assert!(plan.panes.is_empty() && plan.tab.is_none());
+        // ③ ルートはディレクトリ名にならない
+        for root in [r"C:\", "/", r"C:/", r"\\"] {
+            assert!(
+                heuristic_plan(&tab(None, Some(root), true))
+                    .panes
+                    .is_empty(),
+                "ルート `{root}` から名前を作った"
+            );
+        }
+        // ④ 手動リネーム済みのタブ名は作らない（ペイン名は作る）
+        let plan = heuristic_plan(&tab(Some(pwsh), Some(r"C:\Users\winuser\proj"), false));
+        assert_eq!(plan.tab, None);
+        assert_eq!(plan.panes, vec![(1, "proj".into())]);
+    }
+
     #[test]
     fn プロンプトは素材と形式指定を含む() {
         let prompt = build_prompt(&materials(), Lang::Ja);
@@ -1532,6 +1785,65 @@ TAIL
         );
     }
 
+    /// **#760 問題 2**: シェル統合（OSC 7 / 133）が無いプラットフォームでは
+    /// cwd / OSC タイトル / 実行状態が起動時の値のまま**一度も変わらない**ので、
+    /// 指紋の変化だけを発火条件にすると命名はペインを開いた直後の 1 回
+    /// （＝画面がまだ空で素材がほぼ無い時点）で終わる。凍ったままでも時間が経てば
+    /// やり直し、ただし**毎 tick 揺れず**、表を使い切ったら静まる
+    #[test]
+    fn 素材が凍ったままでも時間が経てば命名をやり直す() {
+        let mut renamer = AutoRenamer::new(true);
+        let t0 = Instant::now();
+        assert!(renamer.tick(&[signal(1, 100, false)], t0).is_empty());
+        assert_eq!(
+            renamer.tick(&[signal(1, 100, false)], t0 + DEBOUNCE),
+            vec![1],
+            "初回（名無し）の命名"
+        );
+        let first = t0 + DEBOUNCE;
+
+        // 指紋が 1 ビットも変わらないまま 2 秒ごとに tick しても揺れない
+        for i in 1..(STALE_RETRY_DELAYS[0].as_secs() / POLL_INTERVAL.as_secs()) {
+            let at = first + POLL_INTERVAL * i as u32;
+            assert!(
+                renamer.tick(&[signal(1, 100, true)], at).is_empty(),
+                "やり直しの時刻より前に発火した（{i} 回目の tick）"
+            );
+        }
+        let r1 = first + STALE_RETRY_DELAYS[0];
+        assert_eq!(
+            renamer.tick(&[signal(1, 100, true)], r1),
+            vec![1],
+            "素材が凍ったままなので永久にやり直されない（#760 問題 2 の症状）"
+        );
+        let r2 = r1 + STALE_RETRY_DELAYS[1];
+        assert!(renamer
+            .tick(&[signal(1, 100, true)], r2 - Duration::from_secs(1))
+            .is_empty());
+        assert_eq!(renamer.tick(&[signal(1, 100, true)], r2), vec![1], "2 回目");
+        let r3 = r2 + STALE_RETRY_DELAYS[2];
+        assert!(renamer
+            .tick(&[signal(1, 100, true)], r3 - Duration::from_secs(1))
+            .is_empty());
+        assert_eq!(renamer.tick(&[signal(1, 100, true)], r3), vec![1], "3 回目");
+
+        // 表を使い切ったら、素材が動くまで静まる
+        let long_after = r3 + Duration::from_secs(24 * 3600);
+        assert!(
+            renamer.tick(&[signal(1, 100, true)], long_after).is_empty(),
+            "やり直しが止まらない（素材が動かないのに名前が変わり続ける）"
+        );
+        // 素材が動けば仕切り直し（やり直しの回数も戻る）
+        assert!(renamer.tick(&[signal(1, 200, true)], long_after).is_empty());
+        let moved = long_after + DEBOUNCE;
+        assert_eq!(renamer.tick(&[signal(1, 200, true)], moved), vec![1]);
+        assert_eq!(
+            renamer.tick(&[signal(1, 200, true)], moved + STALE_RETRY_DELAYS[0]),
+            vec![1],
+            "素材が動いたのにやり直しの回数が仕切り直されていない"
+        );
+    }
+
     #[test]
     fn 閉じたタブの監視は捨てられる() {
         let mut renamer = AutoRenamer::new(true);
@@ -1610,6 +1922,136 @@ TAIL
         assert_eq!(
             before, after,
             "打ち間違いだけでリネームが発火してはならない"
+        );
+    }
+
+    /// このファイルの本文（番犬はソースを走査する。#760）
+    fn autorename_source() -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/autorename.rs");
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} が読める: {e}", path.display()))
+    }
+
+    /// `needle` を含む最初の行（1 始まり）。無ければ走査が壊れているので落とす
+    fn line_of(src: &str, needle: &str) -> usize {
+        src.lines()
+            .position(|l| l.contains(needle))
+            .map(|i| i + 1)
+            .unwrap_or_else(|| panic!("`{needle}` が無い（番犬の走査が空振りしている）"))
+    }
+
+    /// 関数の定義行（1 始まり）とその本体（列 0 の `}` まで）
+    fn fn_body(src: &str, name: &str) -> (usize, String) {
+        let head = format!("fn {name}(");
+        let pub_head = format!("pub {head}");
+        let idx = src
+            .lines()
+            .position(|l| {
+                let t = l.trim_start();
+                t.starts_with(&head) || t.starts_with(&pub_head)
+            })
+            .unwrap_or_else(|| panic!("{name}() の定義が無い（番犬の走査が空振りしている）"));
+        let body = src
+            .lines()
+            .skip(idx)
+            .take_while(|l| !l.starts_with('}'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (idx + 1, body)
+    }
+
+    /// **番犬**（#760）: ヒューリスティック命名が OSC タイトルを「シェル自身 / 器の
+    /// 実行ファイルか」の関門へ通していること。関門を外す・表から語を落とす・
+    /// 判定を壊す、のどれをやっても **file:line 名指し**で落ちる。
+    ///
+    /// 走査が空振りしたまま緑になる形（本体が取れていない・表が空）も同じ検査で塞ぐ
+    /// （数え違いが「見逃す」側へ倒れる検査は番犬にならない = `.agent/conventions.md`）
+    #[test]
+    fn ヒューリスティックはoscタイトルをシェル実行ファイルの関門へ通している() {
+        const REL: &str = "crates/tako-app/src/autorename.rs";
+        let src = autorename_source();
+        let (line, body) = fn_body(&src, "heuristic_plan");
+
+        // 走査の健全性（空振りで緑にならないこと）
+        assert!(
+            body.contains("osc_title") && body.lines().count() > 5,
+            "{REL}:{line} heuristic_plan() の本体が取れていない（番犬の走査が壊れている）"
+        );
+        assert!(
+            body.contains("shell_exe_material("),
+            "{REL}:{line} heuristic_plan() が OSC タイトルを shell_exe_material() の関門へ\
+             通していない（#760。Windows のコンソールタイトルはシェル / psmux 自身の\
+             実行ファイルのフルパスなので、素通しすると全タブが同じ名前になる）"
+        );
+
+        let table = line_of(&src, "const SHELL_EXE_STEMS");
+        assert!(
+            SHELL_EXE_STEMS.len() >= 10,
+            "{REL}:{table} SHELL_EXE_STEMS が空同然（番犬が何も守っていない）"
+        );
+        for required in ["pwsh", "powershell", "cmd", "tmux", "psmux", "bash", "zsh"] {
+            assert!(
+                SHELL_EXE_STEMS.contains(&required),
+                "{REL}:{table} SHELL_EXE_STEMS から `{required}` が落ちている（#760。\
+                 その実行ファイルパスがそのままタブ名になる）"
+            );
+        }
+
+        // 表に載っている語は 1 つ残らず実際に捨てられる（表と判定がずれたら落とす）
+        for stem in SHELL_EXE_STEMS {
+            let m = TabMaterials {
+                tab: 1,
+                rename_tab: true,
+                panes: vec![PaneMaterials {
+                    pane: 1,
+                    role: None,
+                    osc_title: Some(format!(r"C:\Program Files\{stem}\{stem}.exe")),
+                    cwd: Some(r"C:\Users\winuser\proj".into()),
+                    state: "unknown",
+                    tail: Vec::new(),
+                }],
+            };
+            assert_eq!(
+                heuristic_plan(&m).tab.as_deref(),
+                Some("proj"),
+                "{REL}:{line} `{stem}` の実行ファイルパスがそのままタブ名になっている（#760）"
+            );
+        }
+    }
+
+    /// **番犬**（#760 問題 2）: 素材が凍ったままのタブをやり直す仕掛けが
+    /// `tick()` に残っていること。外すと file:line 名指しで落ちる
+    #[test]
+    fn tickは素材が凍ったタブのやり直しを持っている() {
+        const REL: &str = "crates/tako-app/src/autorename.rs";
+        let src = autorename_source();
+        let line = line_of(&src, "pub fn tick(");
+        // 文字列の有無ではなく**挙動**で見る（`let _ = stale_due;` のような
+        // 参照だけ残す骨抜きをすり抜けさせない）
+        let mut renamer = AutoRenamer::new(true);
+        let t0 = Instant::now();
+        renamer.tick(&[signal(1, 100, false)], t0);
+        assert_eq!(
+            renamer.tick(&[signal(1, 100, false)], t0 + DEBOUNCE),
+            vec![1]
+        );
+        assert_eq!(
+            renamer.tick(
+                &[signal(1, 100, true)],
+                t0 + DEBOUNCE + STALE_RETRY_DELAYS[0]
+            ),
+            vec![1],
+            "{REL}:{line} tick() が素材の凍結（シェル統合の無いプラットフォーム）を\
+             見ていない（#760。指紋の変化だけを発火条件にすると、命名はペインを開いた\
+             直後の 1 回 = 画面がまだ空の時点で終わる）"
+        );
+        assert!(
+            !STALE_RETRY_DELAYS.is_empty()
+                && STALE_RETRY_DELAYS.windows(2).all(|w| w[0] <= w[1])
+                && STALE_RETRY_DELAYS[0] >= RENAME_MIN_INTERVAL,
+            "{}:{} STALE_RETRY_DELAYS が短い / 逆順（#552 の最小間隔 5 分を破る）",
+            REL,
+            line_of(&src, "const STALE_RETRY_DELAYS")
         );
     }
 }
