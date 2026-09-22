@@ -15502,6 +15502,53 @@ mod tests {
     // #1259: send_input が返した queued: true の**その後**を問える口
     // -----------------------------------------------------------------
 
+    /// #1539: MCP 経路（`tako_context_budget`）でも MCP ツールカタログが項目として返る。
+    ///
+    /// CLI（`tako context-budget`）と MCP はどちらも `crate::context_budget::report` を
+    /// 通る 1 実装なので、**両方が同じ項目を返す**ことをここで固定する
+    /// （開発不変条件「UI でできることはすべて AI からもできる」の予算表版）
+    #[test]
+    fn issue1539_mcp経路の予算棚卸しにmcpカタログが載る() {
+        let mut host = MockHost::new();
+        // cwd を明示するのでペインの解決は挟まらない（何も置いていない一時ディレクトリ）
+        let out = dispatch(
+            &mut host,
+            Request::ContextBudget {
+                action: None,
+                cwd: Some(std::env::temp_dir().display().to_string()),
+                profile: None,
+                dry_run: false,
+                pane: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+
+        let items = out["items"].as_array().expect("items");
+        let catalog: Vec<&Value> = items
+            .iter()
+            .filter(|i| i["kind"] == "mcp_catalog")
+            .collect();
+        assert_eq!(catalog.len(), 1, "MCP カタログが 1 件だけ載る: {out}");
+        let it = catalog[0];
+        assert!(
+            it["bytes"].as_u64().unwrap() > 100_000,
+            "実体のバイト数が載る: {it}"
+        );
+        assert!(it["est_tokens"].as_u64().unwrap() > 0, "概算トークンが載る");
+        assert_eq!(it["lines"], 0, "1 本の JSON なので行数は測らない");
+        assert_eq!(
+            out["budget"]["mcp_catalog"]["max_bytes"],
+            tako_core::context_budget::MCP_CATALOG_MAX_BYTES,
+            "上限も同じ応答に載る"
+        );
+        // 内訳（どのツールを削れば効くか）まで返る
+        assert!(
+            it["pieces"].as_array().is_some_and(|p| p.len() > 100),
+            "ツール 1 本ずつの内訳が載る"
+        );
+    }
+
     /// `await_prompt=true` の応答は「積んだ」だけで終わらず、対象ペインと
     /// 送達の顛末を持つ。旧実装は `{"queued": true}` だけで、届かなかったときに
     /// 呼び出し側が問える口が 1 つも無かった（#1259 の症状の中核）

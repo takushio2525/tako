@@ -166,6 +166,29 @@ fn walk_imports(start: &Path, out: &mut Vec<Item>, visited: &mut BTreeSet<PathBu
     }
 }
 
+/// MCP で公開するツールカタログの実体と、ツール 1 本ずつの大きさ（Issue #1539）。
+///
+/// **スナップショットファイルではなく実行時に組み立てたものを測る**
+/// （`testdata/mcp_tools_full_snapshot.json` はカタログが変わっていないことの
+/// 突き合わせ用であって、測る対象そのものではない）。形は `tools/list` が返すのと
+/// 同じ最小化 JSON = クライアントへ実際に流れるバイト列。
+///
+/// 内訳は「どのツールを削れば効くか」を `proposals` へ出すために要る。
+/// **カタログの組み立ては 1 回だけ**（本文と内訳で 2 回作らない）
+pub fn mcp_catalog() -> (String, Vec<(String, usize)>) {
+    let tools = crate::mcp::tools();
+    let pieces = tools
+        .iter()
+        .map(|t| {
+            (
+                t["name"].as_str().unwrap_or("?").to_string(),
+                t.to_string().len(),
+            )
+        })
+        .collect();
+    (Value::Array(tools).to_string(), pieces)
+}
+
 /// claude の永続メモリ（`<config>/projects/<slug>/memory/MEMORY.md`）
 fn memory_path(cwd: &Path) -> Option<PathBuf> {
     let config = tako_core::paths::home_dir()?.join(".claude");
@@ -274,7 +297,26 @@ pub fn inventory(cwd: &Path, profile: Option<&str>) -> Vec<Item> {
         });
     }
 
-    // 5) 引き継ぎの運用メモ
+    // 5) MCP で公開するツールカタログ（#1539）。
+    // cwd にもプロファイルにも依らない**全エージェント共通の固定費**で、
+    // MCP を繋いだ瞬間に `tools/list` の応答として全文が載る。
+    // 予算表に項目が無かったあいだ、この量は誰にも測られていなかった
+    let (catalog, pieces) = mcp_catalog();
+    items.push(Item {
+        kind: ItemKind::McpCatalog,
+        label: match tako_core::i18n::lang() {
+            tako_core::i18n::Lang::Ja => format!("MCP ツールカタログ（{} 本）", pieces.len()),
+            tako_core::i18n::Lang::En => format!("MCP tool catalog ({} tools)", pieces.len()),
+        },
+        path: None,
+        text: catalog,
+        imported: false,
+        imported_by: None,
+        pieces,
+        append_always: None,
+    });
+
+    // 6) 引き継ぎの運用メモ
     if let Some(p) = crate::orchestrator::handoff_path(profile_name) {
         if let Ok(text) = std::fs::read_to_string(&p) {
             items.push(Item {
@@ -479,6 +521,8 @@ pub fn budget_json() -> Value {
         "active_context": { "max_lines": budget::ACTIVE_CONTEXT_MAX_LINES },
         "handoff_memo": { "max_lines": budget::HANDOFF_MEMO_MAX_LINES },
         "global_guide": { "max_bytes": budget::GLOBAL_GUIDE_MAX_BYTES },
+        // #1539: MCP を繋いだエージェント全員が起動時に受け取る最大の固定費
+        "mcp_catalog": { "max_bytes": budget::MCP_CATALOG_MAX_BYTES },
         "system_prompt": {
             "max_bytes": budget::SYSTEM_PROMPT_MAX_BYTES,
             // #1477: tako 自身の取り分と、利用者の追記へ明け渡した残り
@@ -783,6 +827,61 @@ mod tests {
 
         // 提案が無ければ黙る（1 行に余計な句読点を出さない）
         assert_eq!(worst_proposal(&json!({})), "");
+    }
+
+    /// #1539: MCP カタログは cwd にもプロファイルにも依らず必ず 1 件載る。
+    /// **CLI（`tako context-budget`）と MCP（`tako_context_budget`）はどちらも
+    /// `report` → `inventory` を通る 1 実装**なので、ここが両方の申告を決める
+    #[test]
+    fn mcpカタログはcwdに依らず棚卸しへ必ず載る() {
+        // 何も置いていない一時ディレクトリ（規約も作業ログも無い場所）
+        let cwd = std::env::temp_dir();
+        let items = inventory(&cwd, None);
+        let found: Vec<&Item> = items
+            .iter()
+            .filter(|i| i.kind == ItemKind::McpCatalog)
+            .collect();
+        assert_eq!(found.len(), 1, "MCP カタログは 1 件だけ載る");
+        let it = found[0];
+        assert!(it.path.is_none(), "ファイルではないのでパスは持たない");
+        assert!(!it.imported, "`@import` チェーンではない");
+        assert!(
+            it.text.starts_with('[') && it.text.len() > 100_000,
+            "実行時に組み立てたカタログ本体が入る（{} bytes）",
+            it.text.len()
+        );
+        assert_eq!(
+            it.pieces.len(),
+            crate::mcp::tools().len(),
+            "内訳はツール本数ぶん"
+        );
+        // JSON にも同じ種別で出る（表示と `--json` は同じ 1 件を見る）
+        let o = item_json(it);
+        assert_eq!(o["kind"], "mcp_catalog");
+        assert_eq!(o["bytes"].as_u64().unwrap() as usize, it.text.len());
+        assert_eq!(o["lines"], 0, "1 本の JSON なので行数は測らない");
+        assert_eq!(o["auto_fixable"], false);
+    }
+
+    #[test]
+    fn 予算表jsonにmcpカタログの上限が載る() {
+        assert_eq!(
+            budget_json()["mcp_catalog"]["max_bytes"].as_u64().unwrap() as usize,
+            budget::MCP_CATALOG_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn カタログの実体は最小化jsonで内訳の合計とほぼ一致する() {
+        let (text, pieces) = mcp_catalog();
+        assert!(
+            !text.contains('\n'),
+            "`tools/list` と同じ最小化 JSON（改行なし）"
+        );
+        // `[` `]` と区切りの `,` のぶんだけ本文が大きい
+        let sum: usize = pieces.iter().map(|(_, b)| b).sum();
+        assert_eq!(text.len(), sum + 2 + pieces.len().saturating_sub(1));
+        assert!(pieces.iter().all(|(n, b)| n.starts_with("tako_") && *b > 0));
     }
 
     #[test]

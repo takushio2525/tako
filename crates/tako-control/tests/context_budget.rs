@@ -140,6 +140,59 @@ fn 既定のsystem_promptが起動時ロードの予算に収まっている() {
     }
 }
 
+/// #1539: MCP で公開するツールカタログが起動時ロードの予算に収まっていること。
+///
+/// MCP を繋いだエージェントは 1 本残らず `tools/list` の応答として全文を受け取るので、
+/// これは **cwd にもプロファイルにも依らない全エージェント共通の固定費**であり、
+/// 予算表の中で最大の項目（他の全項目の上限の合計 ≒ 130 KB より大きい）。
+///
+/// 測る対象は `testdata/mcp_tools_full_snapshot.json` **ではなく**
+/// 実行時に組み立てた `mcp::tools()`（スナップショットは変化検知の突き合わせ用）。
+/// カタログを測る 1 実装は `tako_control::context_budget::mcp_catalog` で、
+/// `tako context-budget` / MCP `tako_context_budget` の棚卸しも同じものを通る
+#[test]
+fn mcpツールカタログが起動時ロードの予算に収まっている() {
+    let (text, pieces) = tako_control::context_budget::mcp_catalog();
+    let m = budget::measure(ItemKind::McpCatalog, &text);
+    let mut top = pieces.clone();
+    top.sort_by_key(|(name, bytes)| (std::cmp::Reverse(*bytes), name.clone()));
+    let breakdown: Vec<String> = top
+        .iter()
+        .take(5)
+        .map(|(name, bytes)| format!("{name}={bytes} B"))
+        .collect();
+    let over: Vec<String> = budget::violations(ItemKind::McpCatalog, &m)
+        .into_iter()
+        .filter(|v| enforced(v.metric))
+        .map(|v| {
+            format!(
+                "  {} が {} で上限 {} を超えている（{} 本 / 大きい順: {}）",
+                v.metric.as_str(),
+                v.actual,
+                v.limit,
+                pieces.len(),
+                breakdown.join(", ")
+            )
+        })
+        .collect();
+    assert!(
+        over.is_empty(),
+        "MCP ツールカタログが起動時ロードの予算を超えている\n{}\n\
+         直し方: crates/tako-control/src/mcp/catalog.rs で 1 本ずつの description と\n\
+         inputSchema の description を短くする（ツールを隠すのではない）。\n\
+         直したら TAKO_UPDATE_MCP_SNAPSHOT=1 cargo test -p tako-control \
+         --test mcp_catalog_snapshot でスナップショットを取り直す",
+        over.join("\n")
+    );
+    // 走査が空振りしていないこと（`tools()` が空を返しても緑になる事故を防ぐ）
+    assert!(pieces.len() > 100, "ツール本数が異常: {}", pieces.len());
+    assert!(
+        m.bytes > 100_000,
+        "カタログの実体が測れていない: {}",
+        m.bytes
+    );
+}
+
 #[test]
 fn アーカイブは毎ターン読み込まれる側に置かれていない() {
     // アーカイブを `@import` してしまうと、移送した意味がまるごと消える
@@ -208,6 +261,7 @@ fn 予算表の数値が規約文に出ている() {
         &budget::ARCHIVE_RETAIN_DAYS.to_string(),
         &(budget::AGENTS_GUIDE_MAX_BYTES / 1024).to_string(),
         &(budget::SYSTEM_PROMPT_MAX_BYTES / 1024).to_string(),
+        &(budget::MCP_CATALOG_MAX_BYTES / 1024).to_string(),
     ] {
         assert!(rule.contains(needle.as_str()), "規約文に {needle} が無い");
     }
@@ -247,6 +301,40 @@ fn 超過した作業ログを予算超過として名指しする() {
             .all(|v| !enforced(v.metric)),
         "fix の後は CI が見る軸をすべて満たす"
     );
+}
+
+/// #1539: 予算を超えたカタログを名指しで落とせること（この番犬が空振りしていない証拠）
+#[test]
+fn 超過したmcpカタログを予算超過として名指しする() {
+    let (text, _) = tako_control::context_budget::mcp_catalog();
+    // 実物と同じ形のまま説明文だけを膨らませる（上限を 1 バイト超える最小の注入）。
+    // 実物が既に超えているなら上の番犬が落ちているので、ここは前提の確認だけする
+    let pad = (budget::MCP_CATALOG_MAX_BYTES + 1).saturating_sub(text.len());
+    assert!(
+        pad > 0,
+        "実物が既に上限を超えている（{} bytes）",
+        text.len()
+    );
+    let swollen = format!("{}{}", text, "x".repeat(pad));
+    let m = budget::measure(ItemKind::McpCatalog, &swollen);
+    let v = budget::violations(ItemKind::McpCatalog, &m)
+        .into_iter()
+        .find(|v| enforced(v.metric) && v.metric == Metric::Bytes)
+        .expect("バイト超過を名指しする");
+    assert_eq!(v.limit, budget::MCP_CATALOG_MAX_BYTES);
+    assert_eq!(v.actual, budget::MCP_CATALOG_MAX_BYTES + 1);
+    assert!(!v.fixable, "説明文の圧縮は人間の判断なので自動では直さない");
+    assert!(
+        v.note.ja().contains("catalog.rs") && v.note.en().contains("catalog.rs"),
+        "直し方に正本の置き場を日英とも書く"
+    );
+
+    // 1 バイト減らせば（= 上限ちょうどなら）通る。境界で落ちも素通りもしない
+    let just = budget::measure(ItemKind::McpCatalog, &swollen[..swollen.len() - 1]);
+    assert!(budget::violations(ItemKind::McpCatalog, &just).is_empty());
+
+    // 行数では落とさない（1 本の JSON なので行数は測っていない）
+    assert_eq!(m.lines, 0);
 }
 
 #[test]
