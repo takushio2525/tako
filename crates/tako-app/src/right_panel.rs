@@ -584,11 +584,15 @@ impl TakoApp {
                 BackgroundPaneDrag { pane: pane_id },
                 self.drag_ghost_builder(DragKind::BackgroundPane, truncate(&entry.label, 24), cx),
             )
+            // #1536: ドラッグ用グリップ。点字（U+283F）はフォント依存で化けるので
+            // 描画プリミティブ（6 点の SVG）で描く
             .child(
-                div()
-                    .text_size(px(10.0))
-                    .text_color(hsla(theme.text_faint))
-                    .child("⠿"),
+                svg()
+                    .path(ui_icon::GRIP)
+                    .w(px(6.0))
+                    .h(px(11.0))
+                    .flex_none()
+                    .text_color(hsla(theme.text_faint)),
             );
         if let Some(color) = state_color {
             row = row.child(
@@ -621,7 +625,15 @@ impl TakoApp {
                 .text_size(px(10.0))
                 .text_color(hsla(theme.accent))
                 .hover(|d| d.bg(rgba_alpha(theme.accent, 0.2)))
-                .child("⬆")
+                // #1536: 復帰の印。絵文字（U+2B06）ではなく SVG で描く
+                .child(
+                    svg()
+                        .path(ui_icon::UNSHELVE)
+                        .w(px(11.0))
+                        .h(px(11.0))
+                        .flex_none()
+                        .text_color(hsla(theme.accent)),
+                )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.shelved_restore_clicked(pane_id, cx);
                 }))

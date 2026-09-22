@@ -2095,12 +2095,26 @@ impl TakoApp {
                                     div()
                                         .id(("video-play", pane_id.as_u64()))
                                         .cursor_pointer()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_1p5()
                                         .px_4()
                                         .py_1()
                                         .rounded(px(6.0))
                                         .bg(hsla(theme.ansi[4]))
                                         .text_color(hsla(theme.background))
                                         .text_size(px(14.0))
+                                        // #1536: 再生の印。絵文字（U+25B6）を異体字
+                                        // セレクタでテキスト表示へ倒す書き方をやめ、SVG で描く
+                                        .child(
+                                            svg()
+                                                .path(crate::file_icons::ui_icon::PLAY)
+                                                .w(px(12.0))
+                                                .h(px(12.0))
+                                                .flex_none()
+                                                .text_color(hsla(theme.background)),
+                                        )
                                         .child(SharedString::from(
                                             crate::ui_text::preview::video_play(),
                                         ))
@@ -3165,7 +3179,19 @@ impl TakoApp {
                                     .flex_row()
                                     .items_center()
                                     .gap_1()
-                                    .child("↔")
+                                    // #1536: 置換欄の印。絵文字（U+2194）ではなく
+                                    // 左右 2 本の矢印を SVG で描く
+                                    .child(
+                                        svg()
+                                            .path(crate::file_icons::ui_icon::SWAP)
+                                            .w(px(11.0))
+                                            .h(px(11.0))
+                                            .flex_none()
+                                            .text_color(hsla_alpha(
+                                                theme.tab_inactive_foreground,
+                                                0.8,
+                                            )),
+                                    )
                                     .child(
                                         div()
                                             .id(("search-replace-field", pane_id.as_u64()))

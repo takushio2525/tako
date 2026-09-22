@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-22（#1525: AGENTS.md の予算の余地を作り、activeContext を現在状態へ戻した）
-- 予算の主因はコマンド表ではなく**リリース運用の本文**（71 行 6121 バイト）だった。両 OS 同時 / 夜間リリース / 版数の予約を `.agent/release.md`（新設）へ移し、AGENTS.md には不変条件 2 行 + バックティック参照だけを残した（`@import` にはしない）。表からは実測値（45c / 95c）と診断オプション列挙の 2 行ぶんを `commands.md` の同じ行へ寄せた
-- 実測: **30657 → 25309 バイト**（上限 30720 の 99.8% → 82.4%）。消えた実質 65 行のうち 63 行は release.md に全文一致で残り、残る 2 行は commands.md 側にセル単位で全文あり = **消えた情報 0**。`context_budget` 11 passed / `no_personal_data` 6 passed / fmt 差分なし / docs 生成 2 本とも同期
-- `.agent/activeContext.md` は 9/22 の状態（main = `7bfeb6c` / 着地 8 件 / #1500 のレーン A・C / 判断待ち 4 件）へ 77 行で書き直した
-
 ## 2026-09-22（#1503: agent CLI の probe に待ち時間の上限を付けた）
 - 真因は setup の probe が全部 `Command::output()` で上限を持たないこと。とくに `claude mcp list` は登録済み MCP サーバへ 1 台ずつ繋ぐので 1 台無応答だと返らない（#1500 の R4 = 無言で 6 分ハング）。待ちの 1 実装を `tako_core::probe` へ置き、probe（既定 15 秒 = 実測 `mcp list` 4.57〜5.26 秒の約 3 倍）と dispatch `SetupRun`（既定 600 秒）を両方そこへ通した。超過は「確認できません（N 秒応答なし）」を出してその段だけ諦め、setup は完走する（#1501 の契約は維持）。上限を外す指定は作らない（env は値を変えるだけ・0 / 不正は既定へ）。読み切りにも予算を掛け（孫がパイプを持つと `output()` は返らない）、`Command` の組み立ても境界の中へ入れた（`platform_parity` の baseline は不変）
 - 途中で既存の番犬 2 本が自分の変更を捕まえた: `platform_parity`（#628。素の `Command::new` を境界の外に残していた）と `shell_scripts`（#837。`（${LEFTOVERS}）` の波括弧漏れ）。並列負荷下で単体テストが予算 30 秒を丸ごと使う回があったので、読み切りの猶予は 2 秒で頭打ちにした
@@ -54,3 +49,8 @@
 - Issue の「現行 v0.8.17」は実態と違った: `gh release view` で v0.8.0 だけ `isPrerelease=false`（Latest）、v0.8.1〜v0.8.17 は全部 prerelease。夜間リリースは常にテスト版で出て昇格は `release.sh --promote` の手動（`.agent/release.md`）なので、見出しは「v0.8 系（2026-08-28 〜）— 最新の安定版は v0.8.0」とし、2 種類の関係を節冒頭に表 1 枚で置いた。柱は 4 つ（リモート刷新 / ユーザータスク / setup の代行化 / エージェント間の同等化）
 - ブリーフの柱から 2 件を落とした: **#1500 は 9/22 着地だが v0.8.17（9/22 05:00 の夜間版）に載っておらず CHANGELOG にも節が無い = 未リリース**（代わりに v0.8 で実際に出た #1057 / #989 / #1002 で組んだ）。Web ビューは v0.4.0 の機能で v0.8 にあるのは #1481 の修正だけ。本文の記述 60 件はすべて Issue 番号で CHANGELOG の v0.8 範囲と機械照合（不一致 0）
 - 番犬 `docs/scripts/check-releases-page.mjs` を新設し CI の macOS ジョブへ 1 ステップ。現行の版は **Cargo.toml / CHANGELOG / git tag の最大値**（checkout は `fetch-depth: 1` でタグを持たないので Cargo.toml が主）。落ちるのは A 系列の節が無い / B 先頭でない / C ラベルが古い節に残る、の 3 つ。注入 4 通り落ちる + 偽陽性 1 通り通る。docs ビルド 32 ページ成功・警告 0 → 0・初稿の `**…（日付）**です` が right-flanking 条件を満たさず素の `**` で出ていたのを実測で発見して修正
+
+## 2026-09-23（#1536: UI の絵文字を GPUI の描画プリミティブへ置き換えた）
+- Issue が名指しした ☕ / 🌐 / 📌 / ⏏ は #217 で既に SVG 化済みで、残っていたのは 4 箇所 = `right_panel.rs` の `⠿`（U+283F）→ `ui_icon::GRIP` と `⬆`（U+2B06）→ `UNSHELVE`（**どちらも定数とアセットはあるのに参照 0 件 = 未配線**）・`preview_render.rs` の `↔`（U+2194）→ 新設 `SWAP`・`ui_text/preview.rs` の `▶\u{fe0e} 再生` → 語だけにして `PLAY` を render 側で並べる。最後の 1 件は**旧カタログ検査の範囲に U+25B6 が無くてすり抜けていた**形で、異体字セレクタでテキスト表示へ倒す書き方は逃げ道として認めない
+- 判定を `tako_core::emoji::is_emoji`（Unicode の Emoji プロパティ）の 1 実装へ寄せ、`ui_text` のカタログ検査と新番犬の両方が呼ぶ。番犬 `issue1536_no_emoji_ui_watchdog` は `crates/tako-app/src` の**本番コードの文字列リテラルの中身だけ**を見る（テスト領域は `production_range::scan`・コメントは新設した `code_view::literals_only` が落とす・`\u{XXXX}` も復号）。例外はファイル × 文字 × 件数 × 理由で、`main.rs` のセルフテストが流す claude TUI の画面データ 6 種 21 件だけ
+- 実測: 注入 12 通りすべて一致（絵文字を戻す 8 通りは file:line 名指しで FAILED・対照 4 通り = コメント / `#[cfg(test)]` / `×` / FE0E 単独は緑）。visual-test に `no-emoji` 節を足し、隔離 GUI（tako-vd）で復帰ボタンの実矩形が **14 色**。A/B で `ui_asset!("unshelve")` を外すと **1 色**（#562 の登録漏れ = 無言で描かれない）で落ちる。workspace 5118 passed 0 failed・clippy 3 宇宙 0

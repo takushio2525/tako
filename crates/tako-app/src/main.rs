@@ -37255,6 +37255,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1536: 絵文字を置き換えたアイコンが実ピクセルで描かれているか
+                "no-emoji" => {
+                    no_emoji_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1487: タブバーの ー を**実マウスで**押すとタブが 1 単位で退避するか
                 "shelve-tab" => {
                     shelve_tab_visual(any, window, cx).await;
@@ -37268,7 +37274,7 @@ mod self_test {
                          grid-bench / preview-leak / chat-leak / preview-code / \
                          remote-tree / flicker / ime-preedit / screen-lines / \
                          pane-border / tasks-panel / task-attachment / \
-                         tasks-accordion / shelve-tab）"
+                         tasks-accordion / shelve-tab / no-emoji）"
                     );
                     std::process::exit(1);
                 }
@@ -41035,6 +41041,150 @@ mod self_test {
             before1487.is_some(),
             after1487.is_some()
         );
+    }
+
+    /// UI の絵文字を置き換えた 4 箇所が**実ピクセルで描かれている**か（#1536）。
+    ///
+    /// SVG のパス定数を足しても `EMBEDDED_ASSETS` への登録を忘れると GPUI は
+    /// **無言で何も描かない**（#562 で実在した）。「絵文字が消えた」と
+    /// 「アイコンが出ている」はソースからは区別できないので、実フレームで確かめる。
+    /// 判定は「差し替えた領域が背景 1 色でない」= 何かが描かれていること。
+    /// 単独実行は `TAKO_VISUAL_ONLY=no-emoji`
+    #[cfg(feature = "visual-test")]
+    async fn no_emoji_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        let wait =
+            |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+
+        // 場面: 右パネル fleet に BG ペイン行（グリップ + 復帰ボタン）を出し、
+        // 同時にプレビューの検索 / 置換欄（置換の印）を開く
+        let md1536 = std::env::temp_dir().join(format!("tako-st1536-{}.md", std::process::id()));
+        let _ = std::fs::write(&md1536, "# 見出し\n\nalpha beta alpha\n");
+        let ready1536 = window
+            .update(cx, |app: &mut TakoApp, _, cx| {
+                app.drawer_visible = false;
+                // 1 枚を裏へ送ると、右パネル fleet に「BG ペインの行」が出る
+                let bg = Pane::new(PaneOrigin::User);
+                let bg_id = bg.id();
+                let root = app.workspace.active_tab().tree().focused();
+                let split = app
+                    .workspace
+                    .active_tab_mut()
+                    .tree_mut()
+                    .split_with_ratio(root, SplitDirection::Down, 0.6, bg)
+                    .is_ok();
+                app.background_pane_button(bg_id, cx);
+                // プレビューを開いて編集 + 検索（置換欄はこの 2 つが揃うと出る）
+                let opened = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::OpenFile {
+                        pane: Some(root.as_u64()),
+                        path: md1536.display().to_string(),
+                        mode: Some(tako_control::protocol::PreviewModeWire::Code),
+                        direction: Some(tako_control::protocol::Direction::Right),
+                        focus: Some(false),
+                        new_tab: false,
+                    },
+                    PaneOrigin::Cli,
+                )
+                .ok()
+                .and_then(|v| v["pane"].as_u64())
+                .map(PaneId::from_raw);
+                if let Some(pv) = opened {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::PreviewEdit {
+                            pane: Some(pv.as_u64()),
+                            enabled: Some(true),
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::PreviewSearch {
+                            pane: Some(pv.as_u64()),
+                            query: Some("alpha".into()),
+                            direction: None,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    // 検索欄の**開閉**は GUI のキー操作側が持つ状態なので（dispatch の
+                    // `PreviewSearch` はヒットを数えるだけ）、ここで直接立てる。
+                    // 置換欄の印（`ui_icon::SWAP`）は editing + search_visible で出る
+                    if let Some(edit) = app.preview_edits.get_mut(&pv) {
+                        edit.search_visible = true;
+                        edit.search_focus = preview::SearchFieldFocus::Replace;
+                    }
+                }
+                app.panel_visible = true;
+                app.panel_view = PanelView::Fleet;
+                app.panel_click_probe_bounds.borrow_mut().clear();
+                cx.notify();
+                (split && opened.is_some()).then_some(bg_id)
+            })
+            .ok()
+            .flatten();
+        wait(cx, 700).await;
+
+        let Some(bg1536) = ready1536 else {
+            println!("TAKO_VISUAL_1536: SKIPPED（場面を組めない）");
+            let _ = std::fs::remove_file(&md1536);
+            return;
+        };
+
+        // 復帰ボタンは probe_canvas で実矩形を登録しているので、
+        // 「行が描かれた」ことはそのキーの有無で読める（#1491 と同じ読み方）
+        let restore_key = format!("panel-bg-restore-{}", bg1536.as_u64());
+        let (frame, scale) = match capture_frame(any, cx) {
+            Some(v) => v,
+            None => {
+                println!("TAKO_VISUAL_1536: SKIPPED（フレームを読めない）");
+                let _ = std::fs::remove_file(&md1536);
+                return;
+            }
+        };
+        let rect = window
+            .update(cx, |app: &mut TakoApp, _, _| {
+                app.panel_click_probe_bounds
+                    .borrow()
+                    .get(&restore_key)
+                    .copied()
+            })
+            .ok()
+            .flatten();
+
+        // その矩形の実ピクセルが「背景 1 色」でないこと = 何かが描かれている
+        let painted = rect.map(|r| {
+            let x0 = ((f32::from(r.origin.x) * scale) as u32).min(frame.width().saturating_sub(1));
+            let y0 = ((f32::from(r.origin.y) * scale) as u32).min(frame.height().saturating_sub(1));
+            let w = ((f32::from(r.size.width) * scale) as u32)
+                .max(1)
+                .min(frame.width() - x0);
+            let h = ((f32::from(r.size.height) * scale) as u32)
+                .max(1)
+                .min(frame.height() - y0);
+            let mut seen = std::collections::BTreeSet::new();
+            for y in y0..y0 + h {
+                for x in x0..x0 + w {
+                    let p = frame.get_pixel(x, y).0;
+                    seen.insert((p[0], p[1], p[2]));
+                }
+            }
+            (seen.len(), w, h)
+        });
+        if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+            let _ = frame.save(std::path::Path::new(&dump).join("no-emoji-panel-preview.png"));
+        }
+        println!(
+            "TAKO_VISUAL_1536: bg_pane={} restore_rect={:?} painted={:?}",
+            bg1536.as_u64(),
+            rect.is_some(),
+            painted
+        );
+        let _ = std::fs::remove_file(&md1536);
     }
 
     /// コンフリクトカードの操作が**実マウスで**発火するか（#496）。
