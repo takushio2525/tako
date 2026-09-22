@@ -4528,26 +4528,33 @@ fn orchestrator_run(
 
 /// `tako orchestrator projects` — CLI 版プロジェクト管理
 fn orchestrator_projects_cli(sub: &ProjectsCommand) -> Result<(), String> {
-    use tako_control::orchestrator;
-
     match sub {
+        // list も読み取りだが MCP と同じ 1 本を通す。#1544 まで CLI 側だけ
+        // 設定ファイルの直読みが残っていた。出力は一致していたが、**同じ関数に
+        // 「直したもの」と「残したもの」が並ぶ**のが再発の温床で、add / remove は
+        // #1453 でまさにこの写しから壊れた。番犬は issue1544_projects_dispatch_watchdog
         ProjectsCommand::List => {
-            let config = orchestrator::ProjectsConfig::load()?;
-            let projects = config.list_resolved();
+            let res =
+                tako_control::dispatch::dispatch_orchestrator_projects("list", None, None, None)
+                    .map_err(|e| e.to_string())?;
+            let projects = res["projects"].as_array().cloned().unwrap_or_default();
             if projects.is_empty() {
                 eprintln!("登録済みプロジェクトはありません。");
                 eprintln!("追加: tako orchestrator projects add --key <名前> --cwd <パス>");
             } else {
                 for p in &projects {
-                    let desc = p.description.as_deref().unwrap_or("");
-                    println!("{:<16} {}  {}", p.key, p.cwd, desc);
+                    println!(
+                        "{:<16} {}  {}",
+                        p["key"].as_str().unwrap_or(""),
+                        p["cwd"].as_str().unwrap_or(""),
+                        p["description"].as_str().unwrap_or("")
+                    );
                 }
             }
             Ok(())
         }
-        // add / remove は**書き込み**なので MCP と同じ 1 本（`dispatch_orchestrator_projects`）
-        // を通す。#1453 まで CLI 側に写しがあり、専用プロファイルの自動生成が
-        // MCP からだけ効いて CLI からは効かなかった（実測で踏んだ）
+        // add / remove は**書き込み**なので同じ 1 本を通す。#1453 まで CLI 側に写しがあり、
+        // 専用プロファイルの自動生成が MCP からだけ効いて CLI からは効かなかった（実測で踏んだ）
         ProjectsCommand::Add {
             key,
             cwd,
