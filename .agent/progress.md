@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-22（#1502: tako CLI を外部ターミナルからも打てるようにした）
-- `tako setup` の段として `$HOME/.local/bin/tako` へ symlink を張り、**その置き場所だけ**を `~/.zprofile` のマーカーブロック（1 組のまま）へ通す。**実体のディレクトリは PATH へ入れない**（`.app` の `Contents/MacOS` は tako-app ごと / dev の `target/debug` は依存クレートごと PATH へ出るうえ、`.app` を動かすと黙って切れる）。`$HOME/.local/bin` は 3 系統のランチャーと同じ置き場所なので macOS ではブロックの中身は 1 ディレクトリのまま = 既存ユーザーの profile の形が変わらない
-- 途中で踏んだ真因 2 つ: ①claude が ready だとエージェントの PATH 段は走らないので「ついで」に載せると設置されない（= `run_setup` の独立した段にした）②「もう通っているか」を**プロセスの PATH** で測ると #601 の注入で必ず「通っている」に見える。`$SHELL -l -c` も**継承した PATH を `path_helper` が引き継ぐ**ので、launchd の既定 PATH へ戻してから起こす必要があった
-- 実測: `scripts/test-tako-cli-path-1502.sh` **49 PASS 0 FAIL**（隔離 HOME + 隔離 GUI）。A/B `TAKO_1502_LEGACY=1` は 23 FAIL（B7 / B8「新しいログインシェルで tako が見つかる・動く」= Issue の症状）。番犬 `issue1502_tako_cli_path_watchdog` 6 本（注入 8 通りすべて FAILED → 戻して緑）
-
 ## 2026-09-22（#1516: `orchestrator self --pane N` が名指しどおりそのペインを答えるようにした）
 - 真因は**入口が 2 種類の問いを同じ `pane` 欄へ混ぜていた**こと。受け手の解決順は「確かな順」= pid 祖先辿りが最優先で `pane` は stale になりうる env 由来として扱う契約（#288 / #210）なので、`--pane` は毎回黙って負けていた（pane 1954 から `--pane 1964` → `pane_id: 1954`）。MCP は caller_pid を持たないので pane_id は動くが `caller_role` が残り profile だけ呼び出し元のものになる
 - 組み立てを `Request::orchestrator_self`（protocol.rs）の 1 本へ寄せ、**名指しなら呼び出し元の手掛かりを 1 つも載せない**。自分を名指しした場合は「私についての問い」に倒す（solo の profile は env の `solo:<名前>` にしか無い）。受け手は `named_pane` で名指しを見分け、解けなければ role 検索へ落とさず `PaneNotFound`（#1466）。応答の `role` は名乗り → 対象ペインのラベル、master / solo でなければ理由を `warnings` へ。`adopt` / `guide` / `handoff` の `--pane` は同型のまま（寄せるのは入口 1 か所で済む）
@@ -54,3 +49,8 @@
 - 予算の主因はコマンド表ではなく**リリース運用の本文**（71 行 6121 バイト）だった。両 OS 同時 / 夜間リリース / 版数の予約を `.agent/release.md`（新設）へ移し、AGENTS.md には不変条件 2 行 + バックティック参照だけを残した（`@import` にはしない）。表からは実測値（45c / 95c）と診断オプション列挙の 2 行ぶんを `commands.md` の同じ行へ寄せた
 - 実測: **30657 → 25309 バイト**（上限 30720 の 99.8% → 82.4%）。消えた実質 65 行のうち 63 行は release.md に全文一致で残り、残る 2 行は commands.md 側にセル単位で全文あり = **消えた情報 0**。`context_budget` 11 passed / `no_personal_data` 6 passed / fmt 差分なし / docs 生成 2 本とも同期
 - `.agent/activeContext.md` は 9/22 の状態（main = `7bfeb6c` / 着地 8 件 / #1500 のレーン A・C / 判断待ち 4 件）へ 77 行で書き直した
+
+## 2026-09-22（#1503: agent CLI の probe に待ち時間の上限を付けた）
+- 真因は setup の probe が全部 `Command::output()` で上限を持たないこと。とくに `claude mcp list` は登録済み MCP サーバへ 1 台ずつ繋ぐので 1 台無応答だと返らない（#1500 の R4 = 無言で 6 分ハング）。待ちの 1 実装を `tako_core::probe` へ置き、probe（既定 15 秒 = 実測 `mcp list` 4.57〜5.26 秒の約 3 倍）と dispatch `SetupRun`（既定 600 秒）を両方そこへ通した。超過は「確認できません（N 秒応答なし）」を出してその段だけ諦め、setup は完走する（#1501 の契約は維持）。上限を外す指定は作らない（env は値を変えるだけ・0 / 不正は既定へ）。読み切りにも予算を掛け（孫がパイプを持つと `output()` は返らない）、`Command` の組み立ても境界の中へ入れた（`platform_parity` の baseline は不変）
+- 途中で既存の番犬 2 本が自分の変更を捕まえた: `platform_parity`（#628。素の `Command::new` を境界の外に残していた）と `shell_scripts`（#837。`（${LEFTOVERS}）` の波括弧漏れ）。並列負荷下で単体テストが予算 30 秒を丸ごと使う回があったので、読み切りの猶予は 2 秒で頭打ちにした
+- 実測: `scripts/test-setup-probe-timeout-1503.sh` **28 PASS 0 FAIL**（CI 登録。修正後 7 秒で完走 / A/B `TAKO_1503_LEGACY=1` は 40 秒の締め切りまで無言で固まる）。番犬 6 本 + 注入 11 通りすべて file:line 名指しで FAILED → 戻して緑。回帰 5 本（#1499 / #1501 / #1502 / #1509 / multiagent）全緑・workspace 5127 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。[提案] 5 件は #1531〜#1535 へ
