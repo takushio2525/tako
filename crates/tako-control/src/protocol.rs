@@ -1116,7 +1116,13 @@ pub enum Request {
         limit_resume: Option<bool>,
     },
     /// オーケストレーター: master が自身の pane/tab/ctx% を取得する（#123 / #193 / #288）。
-    /// 解決順序: caller_pid pid 祖先辿り → pane env → stale map → role 検索（複数時エラー）
+    /// 解決順序: caller_pid pid 祖先辿り → pane env → stale map → role 検索（複数時エラー）。
+    ///
+    /// **組み立ては [`Request::orchestrator_self`] の 1 本を通す**（#1516）。`pane` には
+    /// 「呼び出し元の手掛かり（env の `TAKO_PANE_ID`）」と「名指しされた対象
+    /// （`--pane` / MCP `pane`）」の両方が入りうるが、**名指しのときは
+    /// `caller_role` / `caller_pid` を載せない**のが契約。混ぜると受け手が
+    /// 上の解決順どおり pid を先に引いて呼び出し元のペインを答える
     OrchestratorSelf {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pane: Option<u64>,
@@ -2080,6 +2086,76 @@ impl Request {
         let dbg = format!("{self:?}");
         dbg.split([' ', '{', '(']).next().unwrap_or("?").to_string()
     }
+
+    /// `OrchestratorSelf` を組む**唯一の入口**（Issue #1516）。
+    ///
+    /// # なぜ組み立てを 1 本に閉じるか
+    ///
+    /// この要求には 2 種類の問いが載る。「**私は誰か**」（`tako orchestrator self`）と
+    /// 「**そのペインは何か**」（`--pane N` / MCP `pane`）で、前者は呼び出し元を
+    /// 自動解決するために呼び出し元の手掛かり（env の `TAKO_PANE_ID` /
+    /// `TAKO_ORCHESTRATOR_ROLE` / 自プロセスの pid）を載せる。
+    ///
+    /// CLI と MCP はこの 2 つを**同じ `pane` 欄へ混ぜて**いたので、受け手は
+    /// 「`pane` は stale になりうる env 由来」という契約どおり pid 祖先辿りを先に引き、
+    /// 名指ししたペインではなく**呼び出し元のペイン**を答えていた（#1516 の症状。
+    /// `caller_role` も呼び出し元のものが残るので profile まで呼び出し元のものになる）。
+    ///
+    /// 名指しは「私は誰か」を聞いていないので、**呼び出し元の手掛かりを 1 つも載せない**。
+    /// 受け手（`dispatch` の `named_pane`）は「pane だけが載っている = 名指し」として扱い、
+    /// 解けなければ既定へ落とさず失敗する（#1466）。判断をこの 1 本へ閉じるので、
+    /// CLI と MCP で順序が割れない。
+    ///
+    /// # 自分を名指しした場合
+    ///
+    /// `named` が呼び出し元自身（env の `TAKO_PANE_ID`）と同じなら**私についての問い**
+    /// として扱う（手掛かりをそのまま載せる）。`tako solo` の profile は env の
+    /// `solo:<名前>` 接頭辞にしか無く、ペインの role ラベル（`orchestrator-solo:<名前>`）
+    /// からは解けないので、ここで手掛かりを落とすと自分に聞いた solo の profile が
+    /// 既定へ落ちる。
+    ///
+    /// A/B は `TAKO_1516_LEGACY=1`（同一バイナリのまま混ぜる旧挙動へ戻す）。
+    pub fn orchestrator_self(
+        named: Option<u64>,
+        caller_pane: Option<u64>,
+        caller_role: Option<String>,
+        caller_pid: Option<u32>,
+    ) -> Request {
+        Self::orchestrator_self_with(named, caller_pane, caller_role, caller_pid, legacy_1516())
+    }
+
+    /// [`Request::orchestrator_self`] の判断本体（env を読まないので単体で検査できる。
+    /// env グローバルを触るテストは並列で競合する = #608 / #807）
+    pub fn orchestrator_self_with(
+        named: Option<u64>,
+        caller_pane: Option<u64>,
+        caller_role: Option<String>,
+        caller_pid: Option<u32>,
+        legacy: bool,
+    ) -> Request {
+        // 名指しが呼び出し元自身なら「私についての問い」（上の注記）
+        let names_other = named.is_some() && named != caller_pane;
+        if names_other && !legacy {
+            return Request::OrchestratorSelf {
+                pane: named,
+                caller_role: None,
+                caller_pid: None,
+            };
+        }
+        Request::OrchestratorSelf {
+            pane: named.or(caller_pane),
+            caller_role,
+            caller_pid,
+        }
+    }
+}
+
+/// #1516 の A/B 用の env。`TAKO_1516_LEGACY=1` で**同一バイナリのまま**
+/// 「明示指定を呼び出し元の手掛かりへ混ぜる」旧挙動へ戻す
+fn legacy_1516() -> bool {
+    std::env::var("TAKO_1516_LEGACY")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 /// **この Request の dispatch がペインの配置・寸法・表示対象を変えうるか**（#1370）。
@@ -2382,6 +2458,87 @@ pub enum FileOpKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1516 の材料を 1 行で読めるようにする（named / caller_pane / role / pid）
+    fn selfreq(
+        named: Option<u64>,
+        caller_pane: Option<u64>,
+        legacy: bool,
+    ) -> (Option<u64>, Option<String>, Option<u32>) {
+        match Request::orchestrator_self_with(
+            named,
+            caller_pane,
+            Some("master:takodev".into()),
+            Some(4242),
+            legacy,
+        ) {
+            Request::OrchestratorSelf {
+                pane,
+                caller_role,
+                caller_pid,
+            } => (pane, caller_role, caller_pid),
+            other => panic!("OrchestratorSelf でない: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 名指しは呼び出し元の手掛かりを載せない() {
+        // `tako orchestrator self --pane 1964` を pane 1954 の master から撃った形
+        let (pane, role, pid) = selfreq(Some(1964), Some(1954), false);
+        assert_eq!(pane, Some(1964), "名指しした pane が載る");
+        assert_eq!(
+            role, None,
+            "呼び出し元の名乗りが載ると profile が呼び出し元のものになる（#1516）"
+        );
+        assert_eq!(
+            pid, None,
+            "pid が載ると受け手が祖先辿りを先に引いて呼び出し元のペインを答える（#1516 の症状）"
+        );
+    }
+
+    #[test]
+    fn 名指しが無ければ従来どおり呼び出し元の手掛かりを載せる() {
+        let (pane, role, pid) = selfreq(None, Some(1954), false);
+        assert_eq!(pane, Some(1954));
+        assert_eq!(role.as_deref(), Some("master:takodev"));
+        assert_eq!(pid, Some(4242));
+    }
+
+    #[test]
+    fn 自分を名指しした場合は私についての問いとして扱う() {
+        // solo の profile は env の `solo:<名前>` にしか無い（ペインのラベルからは
+        // 解けない）ので、自分を名指ししたときに手掛かりを落とすと既定へ落ちる
+        let (pane, role, pid) = selfreq(Some(1954), Some(1954), false);
+        assert_eq!(pane, Some(1954));
+        assert_eq!(role.as_deref(), Some("master:takodev"));
+        assert_eq!(pid, Some(4242));
+    }
+
+    #[test]
+    fn 呼び出し元が分からない名指しも名指しとして扱う() {
+        // tako の外（`TAKO_PANE_ID` が無い）から `--pane N` を撃った形
+        let (pane, role, pid) = selfreq(Some(1964), None, false);
+        assert_eq!(pane, Some(1964));
+        assert_eq!(role, None);
+        assert_eq!(pid, None);
+    }
+
+    #[test]
+    fn legacyへ倒すと名指しが手掛かりへ混ざる() {
+        // A/B（`TAKO_1516_LEGACY=1`）= #1516 の症状そのまま
+        let (pane, role, pid) = selfreq(Some(1964), Some(1954), true);
+        assert_eq!(pane, Some(1964));
+        assert_eq!(
+            role.as_deref(),
+            Some("master:takodev"),
+            "旧挙動は名乗りを載せる"
+        );
+        assert_eq!(
+            pid,
+            Some(4242),
+            "旧挙動は pid を載せる = 名指しが無視される"
+        );
+    }
 
     #[test]
     fn リクエストエンベロープが往復できる() {

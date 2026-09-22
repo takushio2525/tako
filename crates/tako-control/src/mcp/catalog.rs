@@ -1898,11 +1898,21 @@ pub fn tools() -> Vec<Value> {
                 legacy = 節分離前、null = ファイル未作成）、handoff_sections は認識できた節。\
                 legacy なら次に更新するとき 2 節へ書き直す。\
                 pane を省略すると caller の環境変数（TAKO_PANE_ID / TAKO_ORCHESTRATOR_ROLE）\
-                から自動解決する。",
+                から自動解決する。\
+                #1516: pane を**明示すると、そのペインについて**答える（別の master の状態を\
+                横から確認する用途）。呼び出し元の名乗りは使わないので profile / role は\
+                そのペインの role ラベルから解け（profile_source=pane_role）、role には\
+                ペインのラベル（orchestrator-master:<profile> の語彙）が入る。\
+                名指ししたペインが master / solo でなければ pane_id はそのまま返しつつ、\
+                profile が既定へ落ちた理由が warnings に出る。存在しないペインはエラー\
+                （たまたま既定 role で動いている無関係な master へは落とさない）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "pane": pane_schema("自 pane ID（省略時は caller から自動解決）"),
+                    "pane": pane_schema(
+                        "対象 pane ID（省略時は caller から自動解決。明示するとそのペインに\
+                         ついて答える = #1516）",
+                    ),
                 },
                 "additionalProperties": false,
             },

@@ -1236,6 +1236,38 @@ master の入力欄へ入った。この機械には profile=default の master 
 - **`spawned_by` は `layout.json` に載らない**（GUI 再起動で失われる）。
   枝に頼る解決には「枝が無いときの保険」を必ず 1 本用意する
 
+## 「私は誰か」と「そのペインは何か」を同じ欄へ混ぜない（Issue #1516）
+
+呼び出し元を自動解決する要求（`orchestrator self` / `handoff` / `adopt` / `guide`）は、
+**呼び出し元の手掛かり**（env の `TAKO_PANE_ID` / `TAKO_ORCHESTRATOR_ROLE` / 自プロセスの pid）
+を載せて受け手に解かせる。受け手の解決順は「確かな順」= **pid 祖先辿りが最優先**で、
+`pane` 欄は「stale になりうる env 由来の手掛かり」として扱う（#288 / #210）。
+
+そこへ利用者の**明示指定**（`--pane N` / MCP `pane`）を同じ `pane` 欄へ混ぜると、
+明示指定は**毎回黙って負ける**。#1516 の実測は `self --pane 1964` が `pane_id: 1954`
+（呼び出し元）で、応答は**正しい形をしている**（別 master の状態を見たつもりで自分の
+状態を読む）。`env -u` で名乗りを消しても `profile_source` が変わるだけで pane は動かない。
+
+- **明示指定は「私は誰か」を聞いていない**。名指しのときは呼び出し元の手掛かりを
+  **1 つも載せない**（`caller_role` / `caller_pid` を落とす）。組み立てを
+  `Request::orchestrator_self` の **1 本**に閉じるので、CLI と MCP で順序が割れない
+- 受け手は「**手掛かりが 1 つも無いのに `pane` が載っている = 名指し**」として扱い、
+  解けなければ**既定へ落とさず失敗**する（`named_pane` → `PaneNotFound`）。
+  role 検索へ落ちると「たまたま既定 role で動いている無関係な master」を答える（#1466）
+- **自分を名指しした場合は「私についての問い」**に倒す。`tako solo` の profile は
+  env の `solo:<名前>` にしか無く、ペインのラベル（`orchestrator-solo:<名前>`）からは
+  解けないので、手掛かりを落とすと自分に聞いた solo の profile が既定へ落ちる
+- **応答は名指し先のものにする**。`profile` はペインの role ラベルから
+  （`profile_source=pane_role`）、`role` はそのペインのラベルを返す。
+  master / solo でないペインを名指しされたら `pane_id` はそのまま返しつつ、
+  既定へ落ちた理由を `warnings` に出す（黙って default の引き継ぎ先を答えない）
+- 番犬 `issue1516_named_pane_watchdog` が ①入口（CLI / MCP）が正本を通ること
+  ②正本が名指しで手掛かりを落とすこと ③受け手が role 検索より前に名指しを見ること
+  を `file:line` で落とす。A/B は `TAKO_1516_LEGACY=1`（混ぜる旧挙動）
+- **まだ寄せていない同型**: `adopt` / `guide` / `handoff` の `--pane` は今も混ざったまま
+  （`resolve_caller_pane` は名指しを扱えるが、入口が混ぜて渡している）。寄せるときは
+  入口を `Request::orchestrator_self` と同じ形へ替えるだけで、受け手側の変更は要らない
+
 ## 送達は「届いた / 未達 / 送ったかもしれない」の 3 値で記録する（Issue #1294 / #790）
 
 送達フローが「再送してはいけない」と宣言した顛末（peer の書き込みが始まった後に確認が
