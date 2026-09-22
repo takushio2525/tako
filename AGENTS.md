@@ -99,7 +99,7 @@ tako/
 | Claude Code 実機検証（MCP 設定ゼロ接続） | `scripts/verify-claude-mcp.sh` |
 | 自動セットアップ | `tako setup [--yes] [--answers <json|@file|->]` |
 | **エージェント CLI のゼロスタート導入（claude / codex / agy。#868 / #1057 / #989）** | `tako setup bootstrap [status\|status-all\|install\|path\|undo-path\|handoff] [--agent <claude\|codex\|agy>]` |
-| **任意依存のその場導入（#88 / #1057）** | `tako setup deps [install] [--dep <名>] [--dry-run] [--json]` |
+| **任意依存のその場導入（#88 / #1057 / #1499）** | `tako setup deps [install] [--dep <名>] [--dry-run] [--json]` |
 | **モデル一覧の実取得とピッカー（#1002）** | `tako setup models [--agent <claude|codex|agy>] [--json]` |
 | **MCP セットアップ（claude / codex / agy。#979）** | `tako setup-mcp` |
 | `tako` CLI ビルド | `cargo build -p tako-cli` |
