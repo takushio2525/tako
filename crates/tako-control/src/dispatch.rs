@@ -11799,22 +11799,26 @@ fn check_health(host: &dyn ControlHost) -> Value {
     let cli_in_path = cli_path.is_some();
     // #601: tako が開くシェルへ自動注入している CLI ディレクトリ（解決できなければ null）
     let injected_cli_dir = tako_core::shell_integration::cli_dir();
+    // #1502: 外部ターミナル向けの設置（FR-2.14.5）の実測。判定の正本は
+    // `setup_bootstrap::tako_cli_path_json`（`tako setup --check` も同じ材料を読む）
+    let tako_cli_path = crate::setup_bootstrap::tako_cli_path_json();
     if !cli_in_path {
         // 注入が効いていれば tako の中では打てる = 致命ではない。外部ターミナルでも
-        // 使いたい人向けの案内に落とす（level を下げても対処法は示し続ける）
+        // 使いたい人向けの案内に落とす（level を下げても対処法は示し続ける）。
+        // #1502 からは**手順ではなく 1 コマンド**を出す（#322 の最簡形）
         let (level, message) = match injected_cli_dir.as_deref() {
             Some(dir) => (
                 "info",
                 format!(
                     "tako CLI は PATH に無いが、tako が開くシェルには {} を自動で追加するので \
-                     tako の中では `tako` が使える（#601）。外部ターミナルでも使いたい場合は\
-                     このディレクトリを PATH に追加すること",
+                     tako の中では `tako` が使える（#601）。外部ターミナルでも使いたい場合は \
+                     tako setup bootstrap path を実行すること（#1502）",
                     dir.display()
                 ),
             ),
             None => (
                 "error",
-                "tako CLI が PATH に見つからない。.app バンドル内の CLI を PATH に追加するか、\
+                "tako CLI が PATH に見つからない。tako setup bootstrap path で設置するか、\
                  scripts/build-app.sh --install でインストールすること"
                     .to_string(),
             ),
@@ -11823,6 +11827,19 @@ fn check_health(host: &dyn ControlHost) -> Value {
             "level": level,
             "check": "cli_in_path",
             "message": message,
+        }));
+    }
+    // 設置済みなのにリンクの指す先が消えている（`.app` を移動・削除した）。
+    // PATH には在るので `cli_in_path` だけでは拾えない状態を名指しする
+    if tako_cli_path["link_state"].as_str() == Some("dangling") {
+        issues.push(json!({
+            "level": "warning",
+            "check": "tako_cli_link",
+            "message": format!(
+                "tako CLI のリンク（{}）の指す先が消えている。tako.app を移動・削除した場合は \
+                 tako setup bootstrap path で張り直すこと（#1502）",
+                tako_cli_path["link_display"].as_str().unwrap_or("?"),
+            ),
         }));
     }
 
@@ -11925,6 +11942,9 @@ fn check_health(host: &dyn ControlHost) -> Value {
         "cli_in_path": cli_in_path,
         // tako 内のシェルへ自動で PATH 追加している CLI ディレクトリ（#601）
         "injected_cli_dir": injected_cli_dir.map(|d| d.display().to_string()),
+        // #1502: 外部ターミナル向けの設置（symlink の置き場所・指す先・状態・PATH の有無）。
+        // `usable: true` なら外部ターミナルから `tako` が打てる
+        "tako_cli_path": tako_cli_path,
         "version_match": version_match,
         "tmux_available": tmux_available,
         "persist_enabled": persist_enabled,

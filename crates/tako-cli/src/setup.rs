@@ -3056,6 +3056,9 @@ pub fn run_check() -> Result<(), String> {
         }
     }
 
+    // tako CLI の PATH 設置（FR-2.14.5 / #1502）。判定は check-health と同じ 1 実装
+    eprintln!("{}", setup_bootstrap::tako_cli_path_check_line());
+
     // エージェント CLI + 任意依存。--check では表示のみ。
     let (agents, _) = run_dependency_check(DepCheckMode::check_only());
 
@@ -3363,6 +3366,12 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
     // 依存チェックより**前**に置くのは、依存不足で早期 return するときも
     // データの形式だけは最新化しておきたいため。冪等なので毎回呼んでよい
     run_data_migration_stage();
+
+    // tako CLI を外部ターミナルからも打てるようにする（FR-2.14.5 / #1502）。
+    // **ゼロスタート導入より先**に置く: この後の案内が出す
+    // `tako setup bootstrap install` 等は、`tako` が PATH に無いと打てない。
+    // 実装・文面の正本は tako-control 側（ここは段を呼んで 1 行出すだけ）
+    eprintln!("{}", setup_bootstrap::run_tako_cli_path_stage());
 
     // ゼロスタート導入（#868）。導入済みなら何も出さずに素通りする＝従来の検出型と同じ体験。
     // 未導入なら インストール → PATH 通し → 認証 まで案内してから検出型へ進む

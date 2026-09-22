@@ -118,6 +118,36 @@ const BACKEND_WINDOWS_FRESH: Duration = Duration::from_millis(500);
 
 /// #1191 の A/B。`TAKO_1191_LEGACY=1` で**同一バイナリのまま**旧挙動
 /// （`backend_windows` を要求時に採らない = 右パネルの表示状態に依存する）へ戻す
+/// 外部ターミナル向けに張った tako CLI の symlink を、**切れているときだけ**張り直す（#1502）。
+///
+/// `.app` を移動・削除すると `$HOME/.local/bin/tako` が宙に浮く。起動のたびに
+/// 実体を解決し直す `refresh_cli_dir()`（#601）と同じ理由・同じ場所で面倒を見る。
+/// **新規には張らない**（設置していない人の `$HOME` を起動のたびに触らない）ので、
+/// 設置の入口は `tako setup` / `tako setup bootstrap path` のまま
+fn repair_tako_cli_link() {
+    let Some(home) = tako_core::paths::home_dir() else {
+        return;
+    };
+    let Some(plan) = tako_core::tako_cli_path::plan_here(&home) else {
+        return;
+    };
+    let Some(link) = plan.link.as_deref() else {
+        return;
+    };
+    match tako_core::tako_cli_path::repair_dangling(link, &plan.source) {
+        Ok(tako_core::tako_cli_path::LinkChange::Updated) => {
+            tako_control::diag::persist_log(&format!(
+                "tako CLI のリンクを張り直した: {} -> {}",
+                link.display(),
+                plan.source.display()
+            ));
+        }
+        Ok(_) => {}
+        // 黙って飲まない（直せなかった理由が persist.log に残る）
+        Err(e) => tako_control::diag::persist_log(&format!("tako CLI のリンクを張り直せない: {e}")),
+    }
+}
+
 fn legacy_1191() -> bool {
     static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *LEGACY.get_or_init(|| std::env::var("TAKO_1191_LEGACY").as_deref() == Ok("1"))
@@ -4159,6 +4189,9 @@ impl TakoApp {
         // #601: tako CLI の在り処を起動のたびに解決し直す。zip 展開先で起動していた人が
         // /Applications へ移した後でも、次に開くペインのシェルからは正しい実体が引ける
         tako_core::shell_integration::refresh_cli_dir();
+        // #1502: 外側のターミナル向けに張った symlink も同じ理由で追従させる。
+        // **切れているときだけ**張り直す（一度も設置していない人の $HOME は触らない）
+        repair_tako_cli_link();
         // App Nap 無効化 + 初回スリープ防止更新（Issue #173）
         tako_control::sleep_guard::disable_app_nap();
         // 蓋閉じ防止の残留チェック（#218: 前回クラッシュ時の disablesleep=1 を自動復帰）
