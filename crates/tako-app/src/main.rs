@@ -20303,13 +20303,23 @@ impl TakoApp {
                     .child(
                         div()
                             .id(("port-chip-dismiss", pane_id.as_u64()))
+                            .flex()
+                            .items_center()
                             .cursor_pointer()
                             .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.7))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.dismiss_port_suggestion(pane_id, port, cx);
                             }))
-                            .child("×"),
+                            // 印はグリフではなく描画プリミティブで描く（#1579）。色は svg
+                            // 自身に置く（`svg()` は親の `text_color` を継承しない = #1491）
+                            .child(
+                                svg()
+                                    .path(crate::file_icons::ui_icon::CLOSE)
+                                    .w(px(10.0))
+                                    .h(px(10.0))
+                                    .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.7)),
+                            ),
                     )
             }))
             // 子ワーカードロップダウン（カンプ: w282 / radius 9。ヘッダ下に絶対配置）
@@ -37437,6 +37447,13 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1579: 絵文字ではないグリフ（× / ●）を置き換えた印が
+                // 実ピクセルで描かれているか
+                "glyph-icon" => {
+                    glyph_icon_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1487: タブバーの ー を**実マウスで**押すとタブが 1 単位で退避するか
                 "shelve-tab" => {
                     shelve_tab_visual(any, window, cx).await;
@@ -41367,6 +41384,97 @@ mod self_test {
             painted
         );
         let _ = std::fs::remove_file(&md1536);
+    }
+
+    /// グリフから描画プリミティブへ替えた印が**実ピクセルで描かれている**か（#1579）。
+    ///
+    /// `×`（U+00D7）は `ui_icon::CLOSE` のパスへ、`●`（U+25CF）は図形の丸へ替えた。
+    /// どちらもソースからは「グリフが消えた」と「印が出ている」を区別できない
+    /// （`ui_asset!` の登録漏れは GPUI が**無言で何も描かない** = #562）ので、
+    /// **ピン留めプレビューのタイトルバー**（ライブ印と閉じるが並ぶ唯一の場所）を
+    /// 出して実矩形の色数で読む。判定は「その矩形が背景 1 色でない」。
+    ///
+    /// A/B は `ui_asset!("close")` を `EMBEDDED_ASSETS` から外して撮り直す
+    /// （閉じる側だけが 1 色に落ち、図形で描くライブ印は落ちない）。
+    /// 単独実行は `TAKO_VISUAL_ONLY=glyph-icon`
+    #[cfg(feature = "visual-test")]
+    async fn glyph_icon_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        let wait =
+            |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+
+        // 場面: フォーカス中のペインをピン留めする。他の被せ物は畳んでおく
+        let pinned = window
+            .update(cx, |app: &mut TakoApp, _, cx| {
+                app.drawer_visible = false;
+                app.panel_visible = false;
+                let pane = app.workspace.active_tab().tree().focused();
+                app.set_pin(PreviewTarget::Pane(pane), Some(true));
+                app.panel_click_probe_bounds.borrow_mut().clear();
+                cx.notify();
+                app.preview_has_content(PreviewTarget::Pane(pane))
+                    .then(|| pin_key(PreviewTarget::Pane(pane)))
+            })
+            .ok()
+            .flatten();
+        wait(cx, 700).await;
+
+        let Some(key1579) = pinned else {
+            println!("TAKO_VISUAL_1579: SKIPPED（ピン留めを作れない）");
+            return;
+        };
+        let (frame, scale) = match capture_frame(any, cx) {
+            Some(v) => v,
+            None => {
+                println!("TAKO_VISUAL_1579: SKIPPED（フレームを読めない）");
+                return;
+            }
+        };
+        // 実矩形の中に何色あるか（1 色 = 背景だけ = 何も描かれていない）
+        let colors = |rect: Option<Bounds<Pixels>>| -> Option<(usize, u32, u32)> {
+            let r = rect?;
+            let x0 = ((f32::from(r.origin.x) * scale) as u32).min(frame.width().saturating_sub(1));
+            let y0 = ((f32::from(r.origin.y) * scale) as u32).min(frame.height().saturating_sub(1));
+            let w = ((f32::from(r.size.width) * scale) as u32)
+                .max(1)
+                .min(frame.width() - x0);
+            let h = ((f32::from(r.size.height) * scale) as u32)
+                .max(1)
+                .min(frame.height() - y0);
+            let mut seen = std::collections::BTreeSet::new();
+            for y in y0..y0 + h {
+                for x in x0..x0 + w {
+                    let p = frame.get_pixel(x, y).0;
+                    seen.insert((p[0], p[1], p[2]));
+                }
+            }
+            Some((seen.len(), w, h))
+        };
+        let mut rect_of = |name: &str| -> Option<Bounds<Pixels>> {
+            window
+                .update(cx, |app: &mut TakoApp, _, _| {
+                    app.panel_click_probe_bounds.borrow().get(name).copied()
+                })
+                .ok()
+                .flatten()
+        };
+        let live = colors(rect_of(&format!("pin-live-{key1579}")));
+        let close = colors(rect_of(&format!("pin-close-{key1579}")));
+        if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+            let _ = frame.save(std::path::Path::new(&dump).join("glyph-icon-pin-titlebar.png"));
+        }
+        println!(
+            "TAKO_VISUAL_1579: pin={key1579} live_dot={live:?} close_icon={close:?} \
+             （色数が 1 なら描かれていない = `ui_asset!` の登録漏れか印の消失）"
+        );
+        // 後片付け（全節実行のときに次の節へピンを持ち越さない）
+        let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+            app.pinned_previews.clear();
+            cx.notify();
+        });
     }
 
     /// コンフリクトカードの操作が**実マウスで**発火するか（#496）。
