@@ -21,6 +21,9 @@ use tako_core::platform::agent_install::AgentKind;
 // 依存表と導入の実行は `tako_control::setup_deps` が正本（#1057）。
 // CLI・MCP・`--review` が同じ実装を通るので「UI からしか到達できない経路」を作らない
 use tako_control::setup_deps::{self, DepInstallOptions};
+// 詰まった段を「人へ残る作業」として脇に置く判断と文面の正本（#1501）。
+// CLI はここへ積んで、まとめて表示するだけ
+use tako_control::setup_remaining::{self, Remaining, RemainingKind};
 
 // --- バイナリ埋め込みリソース ---
 // 推奨ルールのセクションと既定指示ファイルは tako_control::setup が正
@@ -197,10 +200,9 @@ impl SetupAgent {
         }
     }
 
-    /// `AgentKind` からの逆写し。**写しが 1:1 であることを縛るためだけに在る**
-    /// （製品コードは `install_kind` の向きしか使わない）。`cfg(test)` にしてあるのは
-    /// 使わない関数を製品バイナリへ残さないため
-    #[cfg(test)]
+    /// `AgentKind` からの逆写し。写しが 1:1 であることを縛るほかに、
+    /// **検出ゼロのときの書き先**（bootstrap 段が面倒を見ていた系統）を
+    /// 決めるのに使う（#1501 の `fallback_agent`）
     fn from_install_kind(kind: AgentKind) -> Self {
         match kind {
             AgentKind::Claude => Self::Claude,
@@ -939,26 +941,40 @@ fn install_failure_message(target: AgentKind, reason: &str) -> String {
 ///
 /// 選ぶ順は「途中まで入っているもの（PATH / 認証だけ足りない）を先に仕上げる」→
 /// それも無ければ推奨（claude）。非対話・`--yes` では質問せず推奨で進む
-fn run_bootstrap_stage(assume_yes: bool) -> Result<(), String> {
+fn run_bootstrap_stage(assume_yes: bool) -> BootstrapOutcome {
     let states = setup_bootstrap::status_all();
     if states.is_empty() {
-        return Ok(());
+        return BootstrapOutcome::default();
     }
     // 1 つでも使える状態なら、この段は何もしない
     if states
         .iter()
         .any(|(_, state)| state.as_ref().is_ok_and(|s| s.step == Step::Ready))
     {
-        return Ok(());
+        return BootstrapOutcome::default();
     }
-    // 全滅の理由が「状態を読めない」なら、その理由を返して止まる
+    // 全滅の理由が「状態を読めない」なら、**それを残り作業として置いて先へ進む**（#1501）。
+    // 読めないだけで設定の書き出し（指示ファイル / プロファイル / テンプレ）は通る
     if states.iter().all(|(_, state)| state.is_err()) {
         let (_, first) = states.into_iter().next().expect("空でないことを確認済み");
-        return Err(first.expect_err("全部 Err のはず"));
+        return BootstrapOutcome::stuck(
+            None,
+            RemainingKind::AgentStatusUnknown,
+            vec![first.expect_err("全部 Err のはず")],
+        );
     }
 
     let target = choose_bootstrap_target(&states);
-    let state = setup_bootstrap::status_for(target)?;
+    let state = match setup_bootstrap::status_for(target) {
+        Ok(state) => state,
+        Err(e) => {
+            return BootstrapOutcome::stuck(
+                Some(target),
+                RemainingKind::AgentStatusUnknown,
+                vec![e],
+            )
+        }
+    };
 
     // ここへ来るのは「どの系統も使えない」= 未導入 / PATH に無い / 未ログインのいずれか。
     // 何が起きるのかを先に伝えてから進む
@@ -970,13 +986,41 @@ fn run_bootstrap_stage(assume_yes: bool) -> Result<(), String> {
     );
     eprintln!();
 
-    run_bootstrap_for(target, &state, assume_yes)?;
+    let remaining = run_bootstrap_for(target, &state, assume_yes);
 
     eprintln!();
-    eprintln!("  導入が完了しました。続けて設定を行います");
-    print_additional_agent_hints(target);
+    if remaining.is_empty() {
+        eprintln!("  導入が完了しました。続けて設定を行います");
+        print_additional_agent_hints(target);
+    } else {
+        // **ここで止めない**（#1501）。代行できない 1 件のために、代行できる段
+        // （依存 / MCP / 指示ファイル / プロファイル / テンプレ）を捨てない
+        eprintln!("  この 1 件は人の操作が要るので、残りとして最後にお知らせします");
+        eprintln!("  設定は先に進めます");
+    }
     eprintln!();
-    Ok(())
+    BootstrapOutcome {
+        remaining,
+        target: Some(target),
+    }
+}
+
+/// bootstrap 段の結果。**詰まっても止めない**（#1501）
+#[derive(Debug, Default)]
+struct BootstrapOutcome {
+    /// 人へ残った作業（空 = 全部済んだ）
+    remaining: Vec<Remaining>,
+    /// この段が面倒を見ていた系統。検出ゼロのときの**書き先の既定**に使う
+    target: Option<AgentKind>,
+}
+
+impl BootstrapOutcome {
+    fn stuck(target: Option<AgentKind>, kind: RemainingKind, detail: Vec<String>) -> Self {
+        Self {
+            remaining: vec![Remaining::with_detail(kind, detail)],
+            target,
+        }
+    }
 }
 
 /// どの系統を仕上げるか。**途中まで入っているものを優先する**
@@ -1011,12 +1055,29 @@ fn choose_bootstrap_target(
 }
 
 /// 1 系統ぶんの 3 段（インストール → PATH → 認証誘導）。
-/// **どの段で失敗したかが分かる形でエラーを返す**
+///
+/// **止めない**（#1501）。どの段で詰まったかを**その場で表示**してから、
+/// 人へ残る作業として [`Remaining`] を返す（空 = 全部済んだ）。
+/// 返り値が空でないときは、その段より先は進めないのでそこで打ち切る
 fn run_bootstrap_for(
     target: AgentKind,
     state: &setup_bootstrap::BootstrapState,
     assume_yes: bool,
-) -> Result<(), String> {
+) -> Vec<Remaining> {
+    /// 詰まった理由をその場で出してから 1 件にして返す（**無言で飛ばさない**）。
+    ///
+    /// 最後の一覧へ載せるのは**要点 1 行**（全文はいまその場に出した）
+    fn stuck(kind: RemainingKind, detail: String) -> Vec<Remaining> {
+        for line in detail.lines() {
+            eprintln!("  {line}");
+        }
+        let mut digest = kind.default_detail();
+        if digest.is_empty() {
+            digest.extend(detail.lines().next().map(str::to_string));
+        }
+        vec![Remaining::with_detail(kind, digest)]
+    }
+
     if state.step == Step::Install {
         eprintln!("  [1/3] {}", Step::Install.describe_for(target));
         print_install_plan(&state.plan.to_json());
@@ -1033,15 +1094,21 @@ fn run_bootstrap_for(
                     target.product()
                 );
             } else {
-                return Err(install_failure_message(target, &reason));
+                return stuck(
+                    RemainingKind::AgentInstall(target),
+                    install_failure_message(target, &reason),
+                );
             }
         } else {
             if !confirm("この内容でインストールしますか？", true, assume_yes) {
-                return Err(format!(
-                    "インストールを中止しました。\n\
-                     自分で入れる場合は次のコマンドを実行してから `tako setup` をやり直してください:\n  {}",
-                    state.plan.official_command
-                ));
+                return stuck(
+                    RemainingKind::AgentInstall(target),
+                    format!(
+                        "インストールを中止しました。\n\
+                         自分で入れる場合は次のコマンドを実行してください:\n  {}",
+                        state.plan.official_command
+                    ),
+                );
             }
             eprintln!();
             if let Err(e) = setup_bootstrap::install_for(
@@ -1055,7 +1122,10 @@ fn run_bootstrap_for(
                 // 居れば、その setup エージェントへ導入の代行を引き継ぐ
                 eprintln!("  [失敗] {e}");
                 if !try_agent_handoff(target, &e, assume_yes) {
-                    return Err(install_failure_message(target, &e));
+                    return stuck(
+                        RemainingKind::AgentInstall(target),
+                        install_failure_message(target, &e),
+                    );
                 }
                 eprintln!(
                     "  [OK] 引き継ぎ先のエージェントが {} を導入しました",
@@ -1068,12 +1138,22 @@ fn run_bootstrap_for(
     }
 
     // PATH（インストール直後は必ずここを通る）
-    let state = setup_bootstrap::status_for(target)?;
+    let state = match setup_bootstrap::status_for(target) {
+        Ok(state) => state,
+        Err(e) => return stuck(RemainingKind::AgentStatusUnknown, e),
+    };
     if state.step == Step::Path {
         eprintln!();
         eprintln!("  [2/3] {}", Step::Path.describe_for(target));
-        let result = setup_bootstrap::ensure_path_for(target)
-            .map_err(|e| format!("[2/3] PATH の設定に失敗しました。\n{e}"))?;
+        let result = match setup_bootstrap::ensure_path_for(target) {
+            Ok(result) => result,
+            Err(e) => {
+                return stuck(
+                    RemainingKind::AgentPath(target),
+                    format!("[2/3] PATH の設定に失敗しました。\n{e}"),
+                )
+            }
+        };
         let profile = result["profile_display"].as_str().unwrap_or("(不明)");
         match result["change"].as_str() {
             Some("already_on_path") => eprintln!("  [OK] すでに使える状態です"),
@@ -1096,18 +1176,28 @@ fn run_bootstrap_for(
     // ブラウザ操作待ちのプロセスは自分では終わらないので、実機（Windows）では
     // セルフテストが打ち込む `tako setup` 経由で 1 日 46 本まで積み上がり、
     // インスタンスを閉じても孫が回収されず CPU が 100% に張り付いた（#1129）。
-    let state = setup_bootstrap::status_for(target)?;
+    //
+    // #1501 からは、ここで **setup 全体を止めない**（ログインは残り作業 1 件）
+    let state = match setup_bootstrap::status_for(target) {
+        Ok(state) => state,
+        Err(e) => return stuck(RemainingKind::AgentStatusUnknown, e),
+    };
     if state.step == Step::Auth {
         eprintln!();
         eprintln!("  [3/3] {}", Step::Auth.describe_for(target));
         if setup_bootstrap::legacy_auth_launch() && target == AgentKind::Claude {
             // `TAKO_1129_LEGACY=1` で修正前へ戻す（同一バイナリで A/B を取る逃げ道）
-            legacy_launch_auth_login(&state, assume_yes)?;
+            if let Err(e) = legacy_launch_auth_login(&state, assume_yes) {
+                return stuck(RemainingKind::AgentLogin(target), e);
+            }
         } else {
-            return Err(setup_bootstrap::auth_instructions_for(target).join("\n"));
+            return stuck(
+                RemainingKind::AgentLogin(target),
+                setup_bootstrap::auth_instructions_for(target).join("\n"),
+            );
         }
     }
-    Ok(())
+    Vec::new()
 }
 
 /// 仕上げた系統以外を**足せること**だけ伝える（選ばせない・強制しない。#989 のやること 5）
@@ -1230,8 +1320,9 @@ impl DepCheckMode {
 /// 未導入の CLI 依存は「何を・どの導入器で・どこへ入れるか」を見せて
 /// `[y/N]` を聞く（#1499。`--yes` は同意扱い・非 TTY は案内だけで素通り）。
 ///
-/// 戻り値は検出したエージェントと、チェック後も欠けている必須依存の一覧。
-fn run_dependency_check(mode: DepCheckMode) -> (Vec<DetectedAgent>, Vec<String>) {
+/// 戻り値は検出したエージェントと、チェック後も欠けている必須依存を
+/// **人へ残る作業として並べたもの**（#1501。ここで setup を止めない）。
+fn run_dependency_check(mode: DepCheckMode) -> (Vec<DetectedAgent>, Vec<Remaining>) {
     let agents = detect_agents();
     eprintln!("  エージェント CLI:");
     for agent in &agents {
@@ -1248,12 +1339,12 @@ fn run_dependency_check(mode: DepCheckMode) -> (Vec<DetectedAgent>, Vec<String>)
         );
     }
     let brew = find_command("brew");
-    let mut missing_required = if agents.is_empty() {
+    let mut missing_required: Vec<Remaining> = if agents.is_empty() {
         eprintln!("    [不足] claude / codex / agy のいずれも見つかりません");
         for kind in SetupAgent::ALL {
             eprintln!("      {}: {}", kind.as_str(), kind.install_hint());
         }
-        vec!["エージェント CLI（claude / codex / agy のいずれか）".to_string()]
+        vec![Remaining::new(RemainingKind::AgentMissing)]
     } else {
         Vec::new()
     };
@@ -1285,12 +1376,16 @@ fn run_dependency_check(mode: DepCheckMode) -> (Vec<DetectedAgent>, Vec<String>)
                         dep.bin
                     );
                     if dep.required {
-                        missing_required.push(dep.bin.to_string());
+                        missing_required.push(Remaining::new(RemainingKind::Dep {
+                            bin: dep.bin.to_string(),
+                        }));
                     }
                 }
             }
         } else if dep.required {
-            missing_required.push(dep.bin.to_string());
+            missing_required.push(Remaining::new(RemainingKind::Dep {
+                bin: dep.bin.to_string(),
+            }));
         }
     }
     // FDA チェック（macOS のみ。任意だが強く推奨）
@@ -1721,8 +1816,14 @@ fn run_setup_mcp() -> Result<(), String> {
 /// **選択したエージェントだけに絞らない**: 推奨プロファイルは `worker_agents` に
 /// 複数を並べるので（`recommended_profile`）、worker として使う CLI からも
 /// tako のツールが見えないと設計原則 5「AI フルコントロール」が破れる。
-/// 個別の失敗は setup 全体を止めず理由を出す（未導入の CLI はそもそも列挙されない）
-fn configure_agent_mcp(agents: &[DetectedAgent]) -> Result<(), String> {
+/// 個別の失敗は setup 全体を止めず理由を出し（未導入の CLI はそもそも列挙されない）、
+/// **通らなかったぶんは残り作業として返す**（#1501。claude の登録失敗も
+/// 以前は setup 全体を落としていた）。
+///
+/// 未認証でも `claude mcp add --scope user` は通る（実 claude 2.1.258 / 隔離 HOME /
+/// `loggedIn:false` で実測）ので、ログイン待ちでも MCP 登録はここで済む
+fn configure_agent_mcp(agents: &[DetectedAgent]) -> Vec<Remaining> {
+    let mut remaining = Vec::new();
     // claude は登録の健全性まで見て修復する（従来経路。回帰させない）
     if let Some(claude) = agents.iter().find(|a| a.kind == SetupAgent::Claude) {
         let (registered, healthy) = check_claude_mcp_health(&claude.path);
@@ -1734,7 +1835,15 @@ fn configure_agent_mcp(agents: &[DetectedAgent]) -> Result<(), String> {
             } else {
                 eprintln!("  [設定] Claude MCP を自動登録します");
             }
-            run_setup_mcp()?;
+            if let Err(e) = run_setup_mcp() {
+                eprintln!("  [警告] {e}");
+                remaining.push(Remaining::with_detail(
+                    RemainingKind::Mcp {
+                        agent: "claude".to_string(),
+                    },
+                    vec![e],
+                ));
+            }
         }
     }
 
@@ -1759,13 +1868,21 @@ fn configure_agent_mcp(agents: &[DetectedAgent]) -> Result<(), String> {
                 eprintln!("  [設定] {} MCP に tako を登録しました", kind.as_str());
             }
             // setup 全体は止めない（他の設定は進めたい）が、無言にはしない
-            Err(e) => eprintln!("  [警告] {} MCP: {e}", kind.as_str()),
+            Err(e) => {
+                eprintln!("  [警告] {} MCP: {e}", kind.as_str());
+                remaining.push(Remaining::with_detail(
+                    RemainingKind::Mcp {
+                        agent: kind.as_str().to_string(),
+                    },
+                    vec![e.to_string()],
+                ));
+            }
         }
     }
     if agents.iter().any(|a| a.kind == SetupAgent::Codex) {
         eprintln!("         codex は master 起動時にも一時設定を注入します");
     }
-    Ok(())
+    remaining
 }
 
 // --- リソース書き出し ---
@@ -2602,7 +2719,7 @@ fn print_setup_summary(plan: &SetupPlan) {
 /// setup 完了後の「次の一歩」案内（Issue #322 受け入れ条件 2）。
 /// オーケストレーションの最短導線とプロファイルの説明を default profile の実値つきで示す。
 /// コマンドは最も簡単な形で案内する（既定で済むものに引数を付けない。`.agent/conventions.md`）
-fn print_next_steps(master_ready: bool) {
+fn print_next_steps(master_ready: bool, has_remaining: bool) {
     use tako_control::orchestrator::{Profile, WorkerModelPolicy};
 
     eprintln!();
@@ -2614,6 +2731,10 @@ fn print_next_steps(master_ready: bool) {
         eprintln!("                日本語で話しかけるだけです（worker の起動・監視・完了報告・");
         eprintln!("                プロジェクト登録などの設定変更は、すべて master に頼めます）");
         eprintln!("  tako solo     worker を使わず 1 対 1 で対話します");
+    } else if has_remaining {
+        // 残りの正体（未導入 / 未ログイン）は末尾の一覧が最簡コマンドつきで言う。
+        // **ここで理由を推測して言い直さない**（#1501 前は agy 前提の文面が出ていた）
+        eprintln!("  tako master（オーケストレーション）は、下の残り作業が済むと使えます");
     } else {
         eprintln!("  agy は worker 専用です。tako master（オーケストレーション）を使うには");
         eprintln!("  claude または codex を導入してログインし、tako setup を再実行してください");
@@ -3023,6 +3144,10 @@ pub fn run_check() -> Result<(), String> {
     eprintln!("tako セットアップ 環境チェック");
     eprintln!("─────────────────────────────");
 
+    // 人へ残る作業（#1501）。`tako setup` の末尾と**同じ 1 実装**で出す
+    // （読むだけの経路なので、ここでは何も導入も登録もしない）
+    let mut remaining: Vec<Remaining> = Vec::new();
+
     // ゼロスタート導入の状況（#868 → #989 で 3 系統）。未導入・PATH 未通し・
     // 未ログインのどれで止まっているかを、系統ごとに実行はせずに先に出す。
     // **1 つでも ready なら tako は使える**ので、そこを最初に言う
@@ -3055,12 +3180,32 @@ pub fn run_check() -> Result<(), String> {
             Err(e) => eprintln!("         [警告] {}: 確認できません（{e}）", agent.as_str()),
         }
     }
+    // 1 つも使える系統が無いときだけ、**一番短い道**を残り作業にする
+    // （`tako setup` が選ぶ系統と同じ判断を通す）
+    if ready.is_empty() && !bootstrap_states.is_empty() {
+        let target = choose_bootstrap_target(&bootstrap_states);
+        match bootstrap_states
+            .iter()
+            .find(|(agent, _)| *agent == target)
+            .map(|(_, state)| state)
+        {
+            Some(Ok(state)) => {
+                remaining.extend(RemainingKind::for_step(state.step, target).map(Remaining::new))
+            }
+            Some(Err(e)) => remaining.push(Remaining::with_detail(
+                RemainingKind::AgentStatusUnknown,
+                vec![e.clone()],
+            )),
+            None => {}
+        }
+    }
 
     // tako CLI の PATH 設置（FR-2.14.5 / #1502）。判定は check-health と同じ 1 実装
     eprintln!("{}", setup_bootstrap::tako_cli_path_check_line());
 
     // エージェント CLI + 任意依存。--check では表示のみ。
-    let (agents, _) = run_dependency_check(DepCheckMode::check_only());
+    let (agents, missing) = run_dependency_check(DepCheckMode::check_only());
+    remaining.extend(missing);
 
     // MCP 登録（#979 で claude / codex / agy の 3 系統とも永続登録になった）
     if let Some(claude) = agents.iter().find(|a| a.kind == SetupAgent::Claude) {
@@ -3076,6 +3221,11 @@ pub fn run_check() -> Result<(), String> {
         } else {
             eprintln!("  [不足] Claude MCP: tako が未登録（tako setup-mcp で登録できます）");
         }
+        if !(registered && healthy) {
+            remaining.push(Remaining::new(RemainingKind::Mcp {
+                agent: "claude".to_string(),
+            }));
+        }
     }
     for agent in &agents {
         let kind = match agent.kind {
@@ -3085,7 +3235,13 @@ pub fn run_check() -> Result<(), String> {
         };
         let name = kind.as_str();
         use tako_control::agent_mcp::McpState;
-        match tako_control::agent_mcp::state(kind) {
+        let state = tako_control::agent_mcp::state(kind);
+        if state.describe_gap().is_some() {
+            remaining.push(Remaining::new(RemainingKind::Mcp {
+                agent: name.to_string(),
+            }));
+        }
+        match state {
             McpState::Ready { .. } => eprintln!("  [OK] {name} MCP: tako が登録済み"),
             McpState::Dead { command } => {
                 eprintln!("  [警告] {name} MCP: 登録済みだがパスが消失しています");
@@ -3255,6 +3411,11 @@ pub fn run_check() -> Result<(), String> {
         Err(e) => eprintln!("  [情報] プロファイル: 確認失敗 ({e})"),
     }
 
+    // 残り作業（#1501）。`tako setup` と同じ判断・同じ文面で締める
+    for line in setup_remaining::render(&setup_remaining::summarize(remaining)) {
+        eprintln!("{line}");
+    }
+
     Ok(())
 }
 
@@ -3373,9 +3534,15 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
     // 実装・文面の正本は tako-control 側（ここは段を呼んで 1 行出すだけ）
     eprintln!("{}", setup_bootstrap::run_tako_cli_path_stage());
 
+    // 人へ残る作業（#1501）。**詰まった段で exit 1 しない**: 代行できない 1 件
+    // （ログイン等）を脇に置き、認証不要な段を全部やってから最後にまとめて出す
+    let mut remaining: Vec<Remaining> = Vec::new();
+
     // ゼロスタート導入（#868）。導入済みなら何も出さずに素通りする＝従来の検出型と同じ体験。
     // 未導入なら インストール → PATH 通し → 認証 まで案内してから検出型へ進む
-    run_bootstrap_stage(assume_yes)?;
+    let bootstrap = run_bootstrap_stage(assume_yes);
+    remaining.extend(bootstrap.remaining);
+    setup_remaining::legacy_stop(&remaining)?;
 
     // 設定値の項目別 y/n は標準 setup では出さない（#262 の質問ゼロ）。
     // **未検出の CLI 依存だけは例外**で、`--review` かどうかに関わらず
@@ -3383,18 +3550,22 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
     // 非 TTY は案内だけで素通り）。FDA・スリープ設定の見直しは従来どおり
     // `--review` だけが対話になる
     let (agents, missing) = run_dependency_check(DepCheckMode::for_setup(review_mode, assume_yes));
-    if !missing.is_empty() {
-        return Err(format!(
-            "必須の依存ツールが不足しています: {}。\n\
-             導入後に tako setup を再実行してください",
-            missing.join(", ")
-        ));
-    }
+    remaining.extend(missing);
+    setup_remaining::legacy_stop(&remaining)?;
     let (selected, selected_source) = if let Some(answer) = answers.selected_agent.as_deref() {
         let selected =
             SetupAgent::parse(answer).ok_or_else(|| format!("不正な selected_agent: {answer}"))?;
         eprintln!("  [input] setup agent: {}", selected.as_str());
         (selected, SetupValueSource::Input)
+    } else if agents.is_empty() {
+        // 1 つも検出できなくても**書き先だけは決める**（#1501）。指示ファイル・
+        // プロファイル・テンプレはここで作っておけば、入れた直後から揃っている
+        let fallback = fallback_agent(config.setup.selected_agent.as_deref(), bootstrap.target);
+        eprintln!(
+            "  [default] setup agent: {}（検出ゼロ。設定の書き先として仮に置きます）",
+            fallback.as_str()
+        );
+        (fallback, SetupValueSource::Default)
     } else {
         select_setup_agent(
             &agents,
@@ -3403,17 +3574,30 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
             !review,
         )?
     };
-    let selected_agent = agents
-        .iter()
-        .find(|agent| agent.kind == selected)
-        .ok_or("選択したエージェントの検出情報がありません")?;
-    if !selected_agent.authenticated {
-        return Err(format!(
-            "{} は未認証です。先に {} を単独起動してログインしてから再実行してください",
-            selected.as_str(),
-            selected.as_str()
-        ));
+    // 選んだ系統の検出情報。**無い / 未認証でも止めない**（残り作業 1 件として脇に置く）
+    let selected_agent = agents.iter().find(|agent| agent.kind == selected);
+    match selected_agent {
+        Some(agent) if !agent.authenticated => {
+            eprintln!(
+                "  [残り] {} は未認証です（この後の設定は先に進めます）",
+                selected.as_str()
+            );
+            remaining.push(Remaining::new(RemainingKind::AgentLogin(
+                selected.install_kind(),
+            )));
+        }
+        None => {
+            eprintln!(
+                "  [残り] {} は未導入です（この後の設定は先に進めます）",
+                selected.as_str()
+            );
+            remaining.push(Remaining::new(RemainingKind::AgentInstall(
+                selected.install_kind(),
+            )));
+        }
+        Some(_) => {}
     }
+    setup_remaining::legacy_stop(&remaining)?;
 
     let mut resolved_plans = collect_provider_plans(
         &agents,
@@ -3466,12 +3650,15 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
     let instruction_existed = instruction.is_file();
     let profile_path = default_profile_path()?;
     let profile_existed = profile_path.is_file();
-    let claude_mcp_missing = if selected == SetupAgent::Claude {
-        let (registered, healthy) = check_claude_mcp_health(&selected_agent.path);
-        !registered || !healthy
-    } else {
-        false
-    };
+    // 登録するのは**検出した claude**（選択系統に縛らない。`configure_agent_mcp` と
+    // 同じ見方にする。#1501 前は claude 未選択のとき登録だけして plan に出なかった）
+    let claude_mcp_missing = agents
+        .iter()
+        .find(|agent| agent.kind == SetupAgent::Claude)
+        .is_some_and(|claude| {
+            let (registered, healthy) = check_claude_mcp_health(&claude.path);
+            !registered || !healthy
+        });
 
     // モデル / effort（#1002）。**聞くのは書き込みより前**にまとめる（途中で中断しても
     // 半端な状態を作らない）。**質問を足すのは --review だけ**（#262 の質問ゼロを守る）。
@@ -3649,7 +3836,7 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
     }
 
     // 検出値・既定値だけの標準ケースは確認を挟まず適用する（Issue #262 要件 D）。
-    configure_agent_mcp(&agents)?;
+    remaining.extend(configure_agent_mcp(&agents));
     let instruction_coverage = apply_instruction(selected, answers.instruction_content.as_deref())?;
     apply_sleep_guard_answers(answers.sleep_guard.as_ref())?;
 
@@ -3700,15 +3887,28 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
 
     let revision = mark_setup_complete(selected, &plans, answers.orchestrator.as_ref())?;
     sync_pending_changes_file(&dir, &[], revision)?;
+    // 同じ道を 1 本にまとめる（判断は純粋関数。#1501）
+    let remaining = setup_remaining::summarize(remaining);
     print_setup_summary(&plan);
-    eprintln!("セットアップが完了しました。");
+    if remaining.is_empty() {
+        eprintln!("セットアップが完了しました。");
+    } else {
+        // **「完了」と言い切らない**。できたところまでを言い、残りは末尾で出す
+        eprintln!(
+            "セットアップはここまで完了しました（人の操作が残り {} 件）。",
+            remaining.len()
+        );
+    }
     eprintln!();
     eprintln!("スマホからリモート接続するには: tako remote setup");
 
     // --- 対話エージェント起動（Issue #295 / #322 / #391）---
     // 既定: 検出フロー完了後に setup agent を対話起動し、設定変更・解説・次の一歩を対話で行う。
-    // スキップ条件: --yes / 非 TTY / --answers launch_agent=none
-    let skip_agent = assume_yes
+    // スキップ条件: --yes / 非 TTY / --answers launch_agent=none /
+    // **選んだ系統が使えない**（未導入・未認証。#1501。起こしてもログイン画面で止まる）
+    let usable_agent = selected_agent.filter(|agent| agent.authenticated);
+    let skip_agent = usable_agent.is_none()
+        || assume_yes
         || !std::io::IsTerminal::is_terminal(&std::io::stdin())
         || answers.launch_agent.as_deref().is_some_and(|v| v == "none");
 
@@ -3756,7 +3956,8 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
         } else {
             "最初に setup-instructions.md を読んでください。設定の確認・変更、コマンドの使い方、次に何をすればよいかなど、何でも聞いてください。"
         };
-        let status = launch_setup_agent(selected_agent, &dir, greeting)?;
+        let agent = usable_agent.expect("skip_agent が false = 使える系統が在る");
+        let status = launch_setup_agent(agent, &dir, greeting)?;
         if !status.success() {
             eprintln!(
                 "{} が終了しました（exit code: {}）",
@@ -3768,10 +3969,26 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
         let master_ready = agents
             .iter()
             .any(|agent| agent.authenticated && agent.kind.supports_master());
-        print_next_steps(master_ready);
+        print_next_steps(master_ready, !remaining.is_empty());
+    }
+
+    // 残り作業（#1501）。**一番最後に置く**: これが次に打つ 1 行だから
+    for line in setup_remaining::render(&remaining) {
+        eprintln!("{line}");
     }
 
     Ok(())
+}
+
+/// 1 つも検出できなかったときの**設定の書き先**（#1501）。
+///
+/// 前回選んだ系統 → ゼロスタート導入が面倒を見ていた系統 → claude（推奨）。
+/// 判断だけの純粋関数なので、検出ゼロの経路を並べて検査できる
+fn fallback_agent(previous: Option<&str>, bootstrap_target: Option<AgentKind>) -> SetupAgent {
+    previous
+        .and_then(SetupAgent::parse)
+        .or_else(|| bootstrap_target.map(SetupAgent::from_install_kind))
+        .unwrap_or(SetupAgent::Claude)
 }
 
 fn find_backup_path(dir: &Path, filename: &str) -> PathBuf {
@@ -4016,6 +4233,32 @@ mod tests {
         );
         assert!(resolve_effort_choice(&efforts, "4").is_err());
         assert!(resolve_effort_choice(&efforts, "high").is_err());
+    }
+
+    /// 検出ゼロでも設定の書き先は決まる（#1501）。**優先順位に意味がある**:
+    /// 前回値を踏み越えて別系統のファイルを作らない
+    #[test]
+    fn 検出ゼロの書き先は前回値_bootstrapの対象_claudeの順() {
+        assert_eq!(
+            fallback_agent(Some("codex"), Some(AgentKind::Claude)),
+            SetupAgent::Codex,
+            "前回選んだ系統が最優先（次に入れるのはそれ）"
+        );
+        assert_eq!(
+            fallback_agent(None, Some(AgentKind::Agy)),
+            SetupAgent::Agy,
+            "前回値が無ければゼロスタート導入が面倒を見ていた系統"
+        );
+        assert_eq!(
+            fallback_agent(None, None),
+            SetupAgent::Claude,
+            "どちらも無ければ推奨（claude）"
+        );
+        assert_eq!(
+            fallback_agent(Some("bogus"), None),
+            SetupAgent::Claude,
+            "読めない前回値は推奨へ落とす（黙って別系統にしない）"
+        );
     }
 
     #[test]

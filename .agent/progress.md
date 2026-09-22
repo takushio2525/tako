@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-21（#1493: main で赤かった test-remote-fs-1451.sh を現行契約へ合わせ、番犬で縛った）
-- 真因は製品の回帰ではなく**テストの前提の追従漏れ**。#1452（`fd46c81`）が ①承認の呼び出し元ゲート（`remote_role.rs:432` `decide` を `remote.rs:5014` が引く）②「現より弱い role の要求は保留を作らない」（`remote_auth.rs:272`）の 2 つを入れ、`test-remote-launch-1449.sh` / `test-remote-master-launch.sh` には宣言を足したが、同日着地の `test-remote-fs-1451.sh` だけ漏れた。承認が 403 `upgrade_requires_gui` で端末が 1 台も登録されず **OK=18 NG=55**
-- `TAKO_REMOTE_TRUSTED_ADMIN_NAMES="curl"` を宣言し、`pair_as` を「撃った」ではなく**「据わった」を確かめる**形へ（降格は `/api/admin/devices/role`）。番犬 `issue1493_admin_gate_script_watchdog` 3 本 + `.agent/conventions.md` に規約。**注入 A が素通りする穴（案内文の env 名を宣言と誤認）を実測で見つけて塞いだ**
-- 実測: 1451 **73 PASS 0 FAIL**（#1451 の PR と一致）/ role-1452 58/0 / autostart-1485 26/0 / 注入 6 通りすべて file:line 名指し / workspace 5024 passed 0 failed / clippy 3 宇宙 0 / check-windows error 0
-
 ## 2026-09-21（#1491: たまり場の退避タブを「タブ形のカード 1 枚」にして、押せば復帰するようにした）
 - タブ形の描画語彙を `tako-app::tab_shape` へ切り出し（寸法 / 状態ドット / 小バッジ / ボタンスロット）、タブバーと退避タブカードが**同じ 1 実装**を通る形に。退避タブは見出し + 「タブごと復帰」ボタン + ペインカード列 → **カード 1 枚**（状態ドット + タブ名 + ペイン数 + ×）になり、本体のどこを押しても既存の `unshelve_tab_clicked` で復帰。× はタブごと kill の 2 段確認（`stop_propagation` で本体と分離・発生源は `PaneButton` = #770 の `close:gui-tab` に混ぜない）
 - 右パネルも同じカードで、配下ペイン行は `▸`（`CHEVRON_*`）で開く。ドロワー / 右パネルとも `render_shelved_tab_card` の 1 実装
@@ -54,3 +49,8 @@
 - 走査は `set -u` 宣言だけでは足りなかった: `scripts/lib/*.sh` / `promo/lib.sh` は宣言側から source されて継ぐので 4 箇所が隠れ、逆にクォート付きヒアドキュメント（`promo/lib.sh` が書き出すデモ用スクリプト）の 3 箇所は囲む側が展開しないので対象外。**41 箇所 / 12 ファイル**へ `${arr[@]+"${arr[@]}"}` を適用（挙動は不変）
 - 判定は実測で 1 点に絞った（`/bin/bash` 3.2.57・空配列・`set -u` で落ちるのは**演算子の無い** `${a[@]}` / `${a[*]}` だけ。`${#a[@]}` / `${!a[@]}` / `:-` / `:+` / `:1` / `#pat` / `/pat/rep` は通る）。番犬 `空配列の展開はbash32の慣用句で守られている` はリポジトリ全体の `.sh` を走査し、例外は `# tako:bash32-ok <理由>`（理由なしは無効）。走査を `scripts/` から広げた初回に #837 の実在バグ `distribution/build-pkg.sh:30` が出たので同時に直した
 - 実測: 全 41 箇所を実ファイル本文から抽出して A/B（空 → 旧形は `unbound variable`・新形は通る / 非空 3 要素は 1 バイト同一）= 54/54。触った 13 本を `/bin/bash` 3.2 で副作用の無い経路から実走 27/27（`test-release-retry` 55/0・`test-wait-pr-checks` 137/0・`test-launch-services` 17/0 を含む）。注入 11 通りすべて file:line 名指し。実際に空が渡る経路は 4 系統（`check-windows.sh --all-targets` = 即死・`promo/lib.sh` の `PROMO_ENV_CLEAN` = 即死・`release.sh --promote` の `ASSETS`・`wait-pr-checks.sh:378` は `$( )` の中で死ぬので案内の中身だけ消える）。workspace 5045 passed 0 failed・clippy 3 宇宙 0
+
+## 2026-09-22（#1501: 未認証・未導入でも setup が全段やって完走するようにした）
+- 真因は **3 か所の早期 return**（`run_bootstrap_stage` の `?` / `missing_required` / 選択系統の未認証）で、一番手前が認証段（#1129 で代行を禁じた所）なので新品環境では `profiles/default.yaml`・`~/.claude/CLAUDE.md`・テンプレ・MCP 登録が**全部未作成**のまま exit 1（#1500 の R1 / R2 / R3）。判断を `tako_control::setup_remaining`（`summarize` / `render` / `for_step` / `legacy_stop` = 理由つき純粋関数）へ寄せ、段は `Vec<Remaining>` を返し、CLI は積んで最後に「残り N 件 + 次に打つ 1 行」を出すだけ。`--check` も同じ 1 実装・`setup.completed` は残りがあっても記録（再実行は残りから再開）
+- 要確認だった点を実測で決着: **未認証の実 claude 2.1.258 でも `claude mcp add --scope user` は通る**（隔離 HOME / `loggedIn:false` → rc 0・`mcpServers.tako` が載る）ので MCP は持ち越さず登録する。ついでに判明 = **`scripts/verify-setup-multiagent.sh` は main で既に赤**（未認証の想定が #868 の段順より古く Z2 が先に出る + codex / agy スタブが #979 の `mcp add` を「予期しない起動」と数える）ので #1493 の規約どおり同じコミットで現行契約へ直して全緑
+- 実測: `scripts/test-setup-continue-1501.sh` **81 PASS 0 FAIL**（CI 登録。非 TTY / `--yes` / TTY / dispatch 同条件 / `--check` / 冪等 / 認証済み A/B / エージェントゼロ / 必須依存 / Z3 / #1499・#1502 との同居）。A/B `TAKO_1501_LEGACY=1` は exit 1 で何も整わない = 症状。番犬 7 本・注入 12 通りすべて FAILED → 戻して緑。workspace 5087 passed 0 failed・clippy 3 宇宙 0・check-windows error 0

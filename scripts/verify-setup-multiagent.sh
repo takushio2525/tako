@@ -91,6 +91,8 @@ make_codex() {
     printf '%s\n' \
         '#!/bin/sh' \
         'if [ "${1:-}" = "login" ] && [ "${2:-}" = "status" ]; then exit 0; fi' \
+        '# MCP 登録の照会・追加は #979 で setup の通常経路になった（対話起動ではない）' \
+        'if [ "${1:-}" = "mcp" ]; then exit 0; fi' \
         'printf '\''codex\n'\'' >"$HOME/unexpected-agent-launch"' \
         'exit 0' >"$path"
     chmod +x "$path"
@@ -102,6 +104,8 @@ make_agy() {
     printf '%s\n' \
         '#!/bin/sh' \
         'if [ "${1:-}" = "models" ]; then exit 0; fi' \
+        '# 同上（#979）' \
+        'if [ "${1:-}" = "mcp" ]; then exit 0; fi' \
         'printf '\''agy\n'\'' >"$HOME/unexpected-agent-launch"' \
         'exit 0' >"$path"
     chmod +x "$path"
@@ -214,17 +218,24 @@ assert_contains "$TMP/yes.out" '\[default\] 非対話モード' "--yes の非対
 assert_contains "$TMP/yes.out" 'セットアップが完了しました' "--yes が完走しない"
 printf '[MEASURE] scenario=yes before_keys=unsupported after_keys=0 prompts=0 source=detected+default result=complete\n'
 
-# 4. 未認証: 質問せず、誤った既定を書かず、ログイン案内つきで停止。
+# 4. 未認証: 質問せず、誤った既定（プラン）を書かず、**残り作業として脇に置いて完走**する。
+#    #1501 / FR-2.14.12 で結末が変わった: 以前はここで exit 1 し、以降の段
+#    （MCP 登録 / 指示ファイル / プロファイル / テンプレ）が 1 つも走らなかった。
+#    いまは「ログイン 1 件」を残して exit 0 で完走し、再実行で残りから再開する。
 UNAUTH_HOME="$TMP/unauth-home"
 UNAUTH_BIN="$TMP/unauth-bin"
 prepare_home "$UNAUTH_HOME" "$UNAUTH_BIN" unauth
-if run_setup "$UNAUTH_HOME" "$UNAUTH_BIN" "$TMP/unauth.out"; then
-    fail "未認証ケースが成功扱いになった"
-fi
+run_setup "$UNAUTH_HOME" "$UNAUTH_BIN" "$TMP/unauth.out" || fail "未認証で setup が止まった（#1501）"
 assert_prompt_count "$TMP/unauth.out" 0 "未認証"
-assert_contains "$TMP/unauth.out" 'claude は未認証です。先に claude を単独起動してログイン' "未認証の復旧案内がない"
-[ ! -e "$UNAUTH_HOME/Library/Application Support/tako/orchestrator/config.yaml" ] || fail "未認証で config.yaml を書いた"
-printf '[MEASURE] scenario=unauthenticated before_keys=1 after_keys=0 prompts=0 source=unavailable result=actionable-error\n'
+assert_contains "$TMP/unauth.out" '残り 1 件（ここから先は人の操作が必要です）' "残り作業の一覧がない"
+assert_contains "$TMP/unauth.out" 'claude auth login' "ログインの最簡コマンドがない"
+assert_not_contains "$TMP/unauth.out" 'セットアップが完了しました。' "残りがあるのに完了と言い切った"
+UNAUTH_CONFIG="$UNAUTH_HOME/Library/Application Support/tako/orchestrator/config.yaml"
+[ -e "$UNAUTH_CONFIG" ] || fail "未認証でも書ける設定を書いていない（#1501）"
+# 未認証プロバイダのプランは「検出できないもの」なので既定値を捏造しない（#262 方針 A）
+assert_not_contains "$UNAUTH_CONFIG" '^    claude: ' "未認証プロバイダのプランを既定で書いた"
+[ ! -e "$UNAUTH_HOME/unexpected-agent-launch" ] || fail "未認証の CLI を対話起動した"
+printf '[MEASURE] scenario=unauthenticated before_keys=1 after_keys=0 prompts=0 source=unavailable result=continue-with-remaining\n'
 
 # 検出不能でも安全なプランは unknown を採用し、質問しない。
 UNKNOWN_HOME="$TMP/unknown-home"

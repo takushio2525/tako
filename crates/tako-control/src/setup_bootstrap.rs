@@ -87,7 +87,7 @@ impl Step {
 ///
 /// 実測で確かめた呼び名だけを書く: codex は `codex login status` が
 /// `Logged in using ChatGPT` を返す / agy は公式 docs の sign-in が Google アカウント
-fn account_label(agent: AgentKind) -> &'static str {
+pub fn account_label(agent: AgentKind) -> &'static str {
     match agent {
         AgentKind::Claude => "Claude アカウント",
         AgentKind::Codex => "ChatGPT アカウント",
