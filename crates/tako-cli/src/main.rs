@@ -3927,7 +3927,7 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
 
     // 旧形式の設定ファイルを master 起動のたびに検知して直す（#916）
     if let Some(notice) = tako_control::migrations::ensure_migrated() {
-        eprintln!("ℹ {notice}");
+        eprintln!("[情報] {notice}");
         eprintln!();
     }
 
@@ -4974,9 +4974,9 @@ fn fda_local(sub: &FdaCommand) -> Result<(), String> {
         FdaCommand::Status => {
             let status = tako_control::fda::status_info();
             if status.granted {
-                eprintln!("✓ フルディスクアクセス: 付与済み");
+                eprintln!("[OK] フルディスクアクセス: 付与済み");
             } else {
-                eprintln!("△ フルディスクアクセス: 未付与");
+                eprintln!("[任意] フルディスクアクセス: 未付与");
                 eprintln!(
                     "  フォルダアクセス時に macOS の許可ダイアログが表示されることがあります"
                 );
@@ -6239,10 +6239,9 @@ fn agents_local(sub: &AgentsCommand) -> Result<(), String> {
                         let action = r["action"].as_str().unwrap_or("?");
                         let path = r["path"].as_str().unwrap_or("");
                         let mark = match action {
-                            "updated" | "created" => "✓",
-                            "unchanged" => "─",
-                            "skipped" => "△",
-                            _ => "✗",
+                            "updated" | "created" | "unchanged" => "[OK]",
+                            "skipped" => "[情報]",
+                            _ => "[失敗]",
                         };
                         eprintln!("  {mark} {agent}: {action} ({path})");
                         if let Some(bak) = r["backup"].as_str() {
@@ -6267,18 +6266,18 @@ fn agents_local(sub: &AgentsCommand) -> Result<(), String> {
                 let status = result["status"].as_str().unwrap_or("unknown");
                 match status {
                     "not_configured" => {
-                        eprintln!("△ エージェント共通ルール同期: 未設定");
+                        eprintln!("[情報] エージェント共通ルール同期: 未設定");
                         eprintln!("  tako setup で正本ファイルを設定できます");
                     }
                     "source_missing" => {
                         let path = result["source_path"].as_str().unwrap_or("?");
-                        eprintln!("✗ 正本ファイルが見つかりません: {path}");
+                        eprintln!("[不足] 正本ファイルが見つかりません: {path}");
                     }
                     "up_to_date" => {
-                        eprintln!("✓ エージェント共通ルール同期: 最新");
+                        eprintln!("[OK] エージェント共通ルール同期: 最新");
                     }
                     "outdated" => {
-                        eprintln!("△ エージェント共通ルール同期: ずれあり");
+                        eprintln!("[情報] エージェント共通ルール同期: ずれあり");
                         eprintln!("  tako agents sync-rules で同期できます");
                     }
                     _ => {
@@ -6290,11 +6289,9 @@ fn agents_local(sub: &AgentsCommand) -> Result<(), String> {
                         let name = a["agent"].as_str().unwrap_or("?");
                         let st = a["status"].as_str().unwrap_or("?");
                         let mark = match st {
-                            "up_to_date" => "✓",
-                            "not_installed" => "─",
-                            "outdated" => "△",
-                            "not_synced" => "△",
-                            _ => "✗",
+                            "up_to_date" => "[OK]",
+                            "not_installed" | "outdated" | "not_synced" => "[情報]",
+                            _ => "[失敗]",
                         };
                         eprintln!("    {mark} {name}: {st}");
                     }
@@ -6409,12 +6406,12 @@ fn resolve_launch_target(
             if let Some(old) = requested.filter(|old| *old != pane) {
                 if caller.method.as_deref() == Some("stale") {
                     eprintln!(
-                        "ℹ TAKO_PANE_ID={old} は旧世代のペイン ID です（アプリ再起動をまたいだ値）"
+                        "[情報] TAKO_PANE_ID={old} は旧世代のペイン ID です（アプリ再起動をまたいだ値）"
                     );
                     eprintln!("  現世代のペイン {pane} へ読み替えて起動します");
                 } else {
                     eprintln!(
-                        "ℹ TAKO_PANE_ID={old} は呼び出し元ペインと一致しません（シェルが古い値を持っています）"
+                        "[情報] TAKO_PANE_ID={old} は呼び出し元ペインと一致しません（シェルが古い値を持っています）"
                     );
                     eprintln!("  実際の呼び出し元ペイン {pane} で起動します");
                 }
@@ -6435,10 +6432,10 @@ fn resolve_launch_target(
         None => {
             match requested {
                 Some(old) => eprintln!(
-                    "ℹ 呼び出し元ペインを特定できません（TAKO_PANE_ID={old} は現在の tako に無い古い値）"
+                    "[情報] 呼び出し元ペインを特定できません（TAKO_PANE_ID={old} は現在の tako に無い古い値）"
                 ),
                 None => {
-                    eprintln!("ℹ 呼び出し元ペインを特定できません（TAKO_PANE_ID 未設定）")
+                    eprintln!("[情報] 呼び出し元ペインを特定できません（TAKO_PANE_ID 未設定）")
                 }
             }
             eprintln!("  新しいタブ '{tab_title}' を作ってそこで起動します");

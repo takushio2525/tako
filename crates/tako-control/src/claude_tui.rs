@@ -1069,7 +1069,7 @@ pub fn deliver_via_tmux(
                 );
             }
             if wait_ready {
-                return Err("claude TUI の入力欄（❯）が現れない（タイムアウト）".into());
+                return Err("claude TUI の入力欄が現れない（タイムアウト）".into());
             }
             break; // 汎用送信: claude TUI でなくても貼り付けは通す（シェル等）
         }

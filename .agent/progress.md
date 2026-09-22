@@ -54,3 +54,8 @@
 - AI が引けない Issue 番号を description / inputSchema から**195 箇所すべて**落とし（根拠は `// 出自: #…` のソースコメントへ 83 ツールぶん移送）、`tako_orchestrator_worker_status` を 3,587 → 1,566 字へ。残り 76% は識別子なので地の文は 368 字（これ以上は応答キー・enum 値を捨てることになる）。ダイアログ構造は `tako_orchestrator_respond`、`prompt_delivery_failure` の値は `tako_orchestrator_workers`、`delivery` の項目は `tako_read_pane` を正本に寄せた
 - `next_step` / `degraded` を返す 9 ツールへ読み方を明記し、`tako_setup` の `orchestrator` / `sleep_guard`（カタログ唯一の description 欠落）を補い、導線の無かった 6 ツール（`select_tab` / `recent` / `git_push` / `git_pull` / `preview_undo` / `redo`）へ前提ツールを足した。規則は `.agent/conventions.md` の新節、上限は #1539 の 210 KB → **200 KB** へ締め直し
 - 実測: カタログ 201,535 → 198,830 バイト・52,028 → 51,076 トークン（tiktoken `o200k_base`）・Issue 番号 195 → 0。番犬 `mcp説明文にissue番号を書かない` へ注入 3 通りすべてツール名指しで FAILED → 戻して緑。識別子は**カタログ全体で消失 0**（機械照合）・workspace 5172 passed 0 failed・clippy 3 宇宙 0・check-windows error 0
+
+## 2026-09-23（#1578: CLI 出力から絵文字を消し、is_emoji の番犬を CLI へ広げた）
+- 本番リテラルの実測は 18 件（Issue の `ℹ`5 / `⚠`1 に加え `✓`4 / `✗`3 / `❯`6）。14 件を文字ラベルへ置換し、**語彙は発明せず `setup.rs` から引いた**（同じ文言を setup.rs は既に `[OK] …` で出していて main.rs だけが取り残されていた）。同じ列の `─` / `△` も揃えないと混在列になるのでその 2 つの match だけ寄せた
+- 走査は `tests/common/emoji_scan.rs` の 1 実装へ寄せ #1536 の番犬も載せ替えた。残る 4 件（`mcp/catalog.rs` の `❯`）は AI だけが読むツールカタログなので理由つき ALLOW。規約は `.agent/conventions.md`「絵文字を出さない」節
+- 実測: 隔離 CLI の before/after 4 経路・origin/main の形へ戻す注入で 14 件すべて file:line 名指しで FAILED → 戻して緑（#1536 は注入中も緑）・workspace 5178 passed 0 failed・clippy 3 宇宙 0
