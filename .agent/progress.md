@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-22（#1516: `orchestrator self --pane N` が名指しどおりそのペインを答えるようにした）
-- 真因は**入口が 2 種類の問いを同じ `pane` 欄へ混ぜていた**こと。受け手の解決順は「確かな順」= pid 祖先辿りが最優先で `pane` は stale になりうる env 由来として扱う契約（#288 / #210）なので、`--pane` は毎回黙って負けていた（pane 1954 から `--pane 1964` → `pane_id: 1954`）。MCP は caller_pid を持たないので pane_id は動くが `caller_role` が残り profile だけ呼び出し元のものになる
-- 組み立てを `Request::orchestrator_self`（protocol.rs）の 1 本へ寄せ、**名指しなら呼び出し元の手掛かりを 1 つも載せない**。自分を名指しした場合は「私についての問い」に倒す（solo の profile は env の `solo:<名前>` にしか無い）。受け手は `named_pane` で名指しを見分け、解けなければ role 検索へ落とさず `PaneNotFound`（#1466）。応答の `role` は名乗り → 対象ペインのラベル、master / solo でなければ理由を `warnings` へ。`adopt` / `guide` / `handoff` の `--pane` は同型のまま（寄せるのは入口 1 か所で済む）
-- 実測: 本番 GUI（旧バイナリ）に対して修正 CLI が `pane_id 1964 / profile <名指し先のもの> / profile_source pane_role`（出荷 CLI と `TAKO_1516_LEGACY=1` は 1967 = 症状）。`scripts/test-self-pane-1516.sh` **28 PASS 0 FAIL**（隔離 GUI・CLI / MCP 両経路 / A/B / エッジ 3 種）。実注入 6 通りすべて FAILED + file:line 名指し（CLI へ戻すと e2e が 11 NG）。番犬 `issue1516_named_pane_watchdog` 3 本・workspace 5047 passed 0 failed・clippy 3 宇宙 0・check-windows error 0
-
 ## 2026-09-22（#1518: bash 3.2 で落ちる空配列展開を 41 箇所直し、番犬で縛った）
 - 走査は `set -u` 宣言だけでは足りなかった: `scripts/lib/*.sh` / `promo/lib.sh` は宣言側から source されて継ぐので 4 箇所が隠れ、逆にクォート付きヒアドキュメント（`promo/lib.sh` が書き出すデモ用スクリプト）の 3 箇所は囲む側が展開しないので対象外。**41 箇所 / 12 ファイル**へ `${arr[@]+"${arr[@]}"}` を適用（挙動は不変）
 - 判定は実測で 1 点に絞った（`/bin/bash` 3.2.57・空配列・`set -u` で落ちるのは**演算子の無い** `${a[@]}` / `${a[*]}` だけ。`${#a[@]}` / `${!a[@]}` / `:-` / `:+` / `:1` / `#pat` / `/pat/rep` は通る）。番犬 `空配列の展開はbash32の慣用句で守られている` はリポジトリ全体の `.sh` を走査し、例外は `# tako:bash32-ok <理由>`（理由なしは無効）。走査を `scripts/` から広げた初回に #837 の実在バグ `distribution/build-pkg.sh:30` が出たので同時に直した
@@ -54,3 +49,8 @@
 - 真因は setup の probe が全部 `Command::output()` で上限を持たないこと。とくに `claude mcp list` は登録済み MCP サーバへ 1 台ずつ繋ぐので 1 台無応答だと返らない（#1500 の R4 = 無言で 6 分ハング）。待ちの 1 実装を `tako_core::probe` へ置き、probe（既定 15 秒 = 実測 `mcp list` 4.57〜5.26 秒の約 3 倍）と dispatch `SetupRun`（既定 600 秒）を両方そこへ通した。超過は「確認できません（N 秒応答なし）」を出してその段だけ諦め、setup は完走する（#1501 の契約は維持）。上限を外す指定は作らない（env は値を変えるだけ・0 / 不正は既定へ）。読み切りにも予算を掛け（孫がパイプを持つと `output()` は返らない）、`Command` の組み立ても境界の中へ入れた（`platform_parity` の baseline は不変）
 - 途中で既存の番犬 2 本が自分の変更を捕まえた: `platform_parity`（#628。素の `Command::new` を境界の外に残していた）と `shell_scripts`（#837。`（${LEFTOVERS}）` の波括弧漏れ）。並列負荷下で単体テストが予算 30 秒を丸ごと使う回があったので、読み切りの猶予は 2 秒で頭打ちにした
 - 実測: `scripts/test-setup-probe-timeout-1503.sh` **28 PASS 0 FAIL**（CI 登録。修正後 7 秒で完走 / A/B `TAKO_1503_LEGACY=1` は 40 秒の締め切りまで無言で固まる）。番犬 6 本 + 注入 11 通りすべて file:line 名指しで FAILED → 戻して緑。回帰 5 本（#1499 / #1501 / #1502 / #1509 / multiagent）全緑・workspace 5127 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。[提案] 5 件は #1531〜#1535 へ
+
+## 2026-09-22（#1548: docs 生成が古い tako バイナリを黙って選ばないようにした）
+- `takoBin()` は debug → release の順に**存在する方**を返すだけで版を見ず、2 スクリプトに複製されていた。開発ツリーで debug だけ古いと（報告時の実測: debug v0.8.13 / release v0.8.17）`--check` が「同期していません」の**偽の赤**を出し、`--check` 無しでは docs が 8 日前へ静かに巻き戻る（CI はフレッシュビルドなので緑のまま手元だけが嘘をつく）。選択を `scripts/lib/tako-bin.mjs` の 1 実装へ寄せ、選んだバイナリの `--version` と `Cargo.toml` の `[workspace.package] version` が違えば生成も検査もせずに 1 行の理由で落とす
+- 倒した判断: **debug が古いとき release へ黙って逃げない**（手元の他スクリプトも既定は debug。直すのは 1 コマンドなので最簡形を出す = #322）。明示指定は新オプションではなく既存の env 名 `TAKO_BIN`（相対はリポジトリルート基準）。失敗はスタックトレースではなくメッセージ 1 本（`main()` + try/catch）
+- 実測: `scripts/test-gen-docs-bin-1548.sh` **46 PASS 0 FAIL**（CI 登録。テンポラリの偽リポジトリ + 版を埋め込んだスタブ。古い版には別内容の JSON を返させて巻き戻しを実際に観測）。注入 11 通りすべて FAILED → 戻して緑。生成内容・md・Rust 側は不変（生成物が本物と 1 バイト同じ）
