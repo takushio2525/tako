@@ -938,7 +938,17 @@ mod tests {
         cleanup_test_dir(&dir);
     }
 
+    /// **Windows では skip**（#1278）。fixture が `dir.join(...)` で作る絶対パスは
+    /// Windows では `C:\…` のバックスラッシュ形で、**製品は設計上それを
+    /// リンクにしない**（`is_path_like` が `/` を含む形だけを候補にする = #153 からの
+    /// 判断で、`platform::support` の `tako_links` は `Support::Degraded` +
+    /// `notes::WIN_PATH_LINK_BACKSLASH` として**宣言済み**）。
+    /// `~/` 起点は Windows でも効くので `detect_tilde_path` は両 OS で走る
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows は `C:\\…` のバックスラッシュ絶対パスをリンクにしない（宣言済みの縮退。platform::support の tako_links = Degraded / #153）"
+    )]
     fn detect_absolute_path() {
         let dir = setup_test_dir("absolute");
         let abs = dir.join("README.md");
@@ -967,7 +977,14 @@ mod tests {
         let _ = std::fs::remove_file(&test_file);
     }
 
+    /// **Windows では skip**（`detect_absolute_path` と同じ宣言済みの縮退。#1278）。
+    /// ホーム起点（`~/`）の検出自体は Windows でも効くが、この検査は
+    /// バックスラッシュ絶対パスの検出と同じ 1 本の中で見ている
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows は `C:\\…` のバックスラッシュ絶対パスをリンクにしない（宣言済みの縮退。platform::support の tako_links = Degraded / #153）"
+    )]
     fn cwd不明でも絶対パスとホーム起点は検出する() {
         let dir = setup_test_dir("without_cwd");
         let abs = dir.join("README.md");
@@ -997,7 +1014,14 @@ mod tests {
         cleanup_test_dir(&dir);
     }
 
+    /// **Windows では skip**（`detect_absolute_path` と同じ宣言済みの縮退。#1278）。
+    /// 折り返しの結合そのものは OS 非依存だが、fixture が絶対パスなので
+    /// Windows では候補にならない
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows は `C:\\…` のバックスラッシュ絶対パスをリンクにしない（宣言済みの縮退。platform::support の tako_links = Degraded / #153）"
+    )]
     fn tuiの装飾付きsoft_wrapをまたぐパスを検出する() {
         use crate::screen::StyleRun;
 

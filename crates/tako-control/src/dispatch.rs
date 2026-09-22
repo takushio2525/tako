@@ -18212,6 +18212,10 @@ mod tests {
     /// 差し替えると並列で走る他のテストと混ざる（#1274 の教訓）。`~` 起点の解決は
     /// `links.rs` の単体（ホームを引数で注入）と隔離 GUI の実測が担保する
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows は `C:\\…` のバックスラッシュ絶対パスをリンクにしない（宣言済みの縮退。platform::support の tako_links = Degraded / #153）"
+    )]
     fn links_は画面テキストの3形から地の文に埋まったパスを検出する_1283() {
         let mut host = MockHost::new();
         let dir = std::env::temp_dir().join(format!("tako_dispatch_1283_{}", std::process::id()));
@@ -18264,6 +18268,10 @@ mod tests {
 
     /// #1283: `open` はディレクトリと拡張子で変わる（表の正本は `tako_core::open_plan`）
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows は `C:\\…` のバックスラッシュ絶対パスをリンクにしない（宣言済みの縮退。platform::support の tako_links = Degraded / #153）"
+    )]
     fn links_の_open_はディレクトリと拡張子で変わる_1283() {
         let mut host = MockHost::new();
         let dir =

@@ -283,10 +283,17 @@ fn cwd_tracking(program: &str, dir_name: &str) {
     let _ = std::fs::remove_dir_all(&target);
 }
 
-/// 区切り文字とドライブレターの大小だけが違う場合を許容して比較する
+/// 区切り文字・ドライブレターの大小・**8.3 短縮名**の違いを許容して比較する。
+///
+/// CI ランナーの `%TEMP%` は `C:\Users\<8.3 短縮名>\…` の**短縮形**で、PowerShell は
+/// 長い名前（`C:\Users\<winuser>\…`）を報告する（#1278 で 3 本が落ちた）。
+/// `canonicalize` が両方を長い名前へ寄せるので、実在するあいだはこれで揃う
+/// （返りは verbatim `\\?\C:\…` なので prefix を落としてから比べる）
 fn same_dir(a: &Path, b: &Path) -> bool {
     fn norm(p: &Path) -> String {
-        p.to_string_lossy().replace('/', "\\").to_lowercase()
+        let resolved = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let s = resolved.to_string_lossy().replace('/', "\\").to_lowercase();
+        s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
     }
     norm(a) == norm(b)
 }

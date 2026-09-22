@@ -337,7 +337,13 @@ mod tests {
         let app = Path::new("/Applications/tako.app/Contents/MacOS/tako");
         let plan = plan_for(home, app, false);
         assert_eq!(plan.dir, home.join(".local/bin"));
-        assert_eq!(plan.link, Some(home.join(".local/bin/tako")));
+        // 実行ファイル名の正本は `shell_integration::cli_file_name`（Windows は `tako.exe`）。
+        // `plan_for` の第 3 引数は**置き場の方針**だけを切り替えるので、名前は
+        // 走っているプラットフォームのものになる（#1278。リテラルで書くと Windows で落ちる）
+        assert_eq!(
+            plan.link,
+            Some(home.join(".local/bin").join(cli_file_name()))
+        );
         assert_eq!(plan.source, app);
         // 実体のディレクトリ（同居物ごと）を PATH へ出さない = #1502 の設計の芯
         assert_ne!(plan.dir, app.parent().unwrap());
@@ -367,7 +373,8 @@ mod tests {
     #[test]
     fn 実体がlocalbinに居るならsymlinkを張らない() {
         let home = Path::new("/home/testuser");
-        let cli = home.join(".local/bin/tako");
+        // 実行ファイル名は製品の正本から（#1278。`tako` 直書きは Windows で外れる）
+        let cli = home.join(".local/bin").join(cli_file_name());
         let plan = plan_for(home, &cli, false);
         assert_eq!(plan.link, None);
         assert_eq!(plan.dir, home.join(".local/bin"));

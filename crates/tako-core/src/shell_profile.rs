@@ -646,7 +646,7 @@ mod tests {
         let home = temp_home("partial");
         let a = home.join(".local/bin");
         let b = PathBuf::from("/opt/tako/bin");
-        let current = format!("/usr/bin:{}", a.display());
+        let current = joined_path(&["/usr/bin", &a.to_string_lossy()]);
         let out = ensure_dirs_on_path_in(
             &home,
             ShellKind::Zsh,
@@ -655,7 +655,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.change, PathChange::Installed);
-        let both = format!("{current}:{}", b.display());
+        let both = joined_path(&["/usr/bin", &a.to_string_lossy(), &b.to_string_lossy()]);
         let out2 = ensure_dirs_on_path_in(&home, ShellKind::Zsh, &[a, b], Some(&both)).unwrap();
         assert_eq!(out2.change, PathChange::AlreadyOnPath);
         cleanup(&home);
