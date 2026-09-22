@@ -3849,6 +3849,19 @@ run 35735202680 で、**5064 passed / 21 failed / 40 ignored**。21 件のうち
 **13 件は 9/9 のベースライン（24 件）に無い**= その後 main へ増えた未検出ぶん
 （`tako_cli_path` = #1502 は当日のもの）。
 
+#### 収束（3 往復）
+
+| 巡 | run | Windows の結果 |
+|---|---|---|
+| 1 | 35735202680 | **5064 passed / 21 failed / 40 ignored** |
+| 2 | 35739986689 | **5076 passed / 2 failed / 47 ignored**（`git` の CRLF と `test_residue`） |
+| 3 | （下記） | **0 failed** |
+
+2 巡目の 2 件はどちらも**1 巡目の修正が 1 段進めた先**に出たもの:
+`git` は identity が通った次に `core.autocrlf` の CRLF が出た。
+`test_residue` は 4 → 3 件（`tako-shell-profile-partial-…` は他のテストが
+`cleanup()` へ到達しなかった**連鎖**で、直したら消えた）。
+
 #### CI ランナーと実機は別物（照合に使わない）
 
 ランナーには **psmux / tmux / claude / codex CLI が無く、セッション 1 でもない**。
@@ -3858,13 +3871,14 @@ run 35735202680 で、**5064 passed / 21 failed / 40 ignored**。21 件のうち
 |---|---|
 | `%TEMP%` が **8.3 短縮名**（PowerShell は長い名前を報告） | `shell_integration_powershell` の cwd 追従 3 本 |
 | git の **グローバル identity が無く auto-detect も失敗**（ホスト名が `…(none)`） | `git::マージ成功とコンフリクトと中止` |
+| Git for Windows の system config が **`core.autocrlf=true`**（製品の関数が起こす git が作業ツリーへ CRLF で書く） | 同上（identity を直したら次に出た） |
 | 子が起こす PowerShell が `%LOCALAPPDATA%` へ起動キャッシュを書く | `test_write_isolation` 2 本 |
 
 **ディレクトリの symlink は作れた**（`dispatch` / `tab` / `remote_tasks` の
 symlink テストが CI Windows で緑）。実機（非昇格）では作れないので、
 どちらでも動く形（作れなければ理由を出して skip）にしてある。
 
-#### 理由つき skip の allowlist（**6 件**。増やすときは Issue 番号を書く）
+#### 理由つき skip の allowlist（**7 件**。増やすときは Issue 番号を書く）
 
 | 件数 | テスト | 理由 | 追跡 |
 |---|---|---|---|
@@ -3874,6 +3888,7 @@ symlink テストが CI Windows で緑）。実機（非昇格）では作れな
 | 1 | `config_share::env::リポジトリ配下の実体も外部管理として検出する` | `canonicalize` の verbatim と git の `/` 表記で `strip_prefix` が外れ `repo_rel` が空（#970 の型） | **#1569** |
 | 1 | `prompt_budget_1477::baseは予算内で追記の取り分を残している` | Windows は `platform` 片 4110 B（縮退の自動生成）で base が 18944 B を 1.7〜2.7 KB 超える。**macOS 側は blocking のまま** | **#1571** |
 | 1 | `remote_fs_e2e::解決できないホストは接続前に分類される` | 分類は正しいが接続経路が戻らない（実機 536 秒）。blocking な CI でぶら下がると run を失う | #930 / #1090 |
+| 1 | `test_residue::テストを一巡してもtmpdirに残骸が残らない` | `atexit` からの `remove_dir_all` は Windows では開いたハンドルがあると失敗する（孫プロセスがまだ握っている）。起動時の掃除も `ports::process_alive` が常に `true` なので動かない | **#1581** |
 
 （`platform::bundle_install` 2 本は `#[cfg(target_os = "macos")]` で**存在しない**ので
 allowlist に数えない。`RENAME_SWAP` 相当が無い側では `MoveAside` が正しい答え）
