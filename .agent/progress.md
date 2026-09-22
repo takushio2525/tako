@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-23（#1545: getting-started を 9/22 の setup 着地へ追従させた）
-- 旧ページは **#1502 が明示的に否定した PATH 手順**（`.app` の実行ファイル置き場を `~/.zshrc` の `export PATH` へ）を読者に指示し続け、同じページ内で「CLI は導入しない」（トラブルシューティング）と「導入 → PATH → ログインの 3 段を案内する」（tip）が矛盾していた。FR-2.14.5 の現行仕様（`$HOME/.local/bin/tako` の symlink + `~/.zprofile`）へ差し替え、旧手順を踏んだ読者向けに「その行は消してよい」の移行案内を足した
-- 任意依存が `[y/N]` で導入まで通ること（#1499 / #1509 / #1524）と、詰まった段があっても止まらず「残り N 件」で終わること（FR-2.14.12 = #1501）を追記。`--version` / `--changes` / `--check` の例は現行ビルド（v0.8.17 / rev 19）の実出力へ。「質問ゼロ」3 行を言い直し、次のステップに `/features/remote/` と `/guides/keyboard-shortcuts/` を足した
-- 実測: 貼った `--check` は隔離 HOME の再実行と**マスク以外バイト単位で一致**（49 行）・`Contents/MacOS` は docs 全体で 0 hit・`npm run build` 32 ページ警告 0・`verify-og` 31 ページ OK
-
 ## 2026-09-23（#1546: releases.md に v0.8 系を書き、最新の安定版の位置を移した）
 - Issue の「現行 v0.8.17」は実態と違った: `gh release view` で v0.8.0 だけ `isPrerelease=false`（Latest）、v0.8.1〜v0.8.17 は全部 prerelease。夜間リリースは常にテスト版で出て昇格は `release.sh --promote` の手動（`.agent/release.md`）なので、見出しは「v0.8 系（2026-08-28 〜）— 最新の安定版は v0.8.0」とし、2 種類の関係を節冒頭に表 1 枚で置いた。柱は 4 つ（リモート刷新 / ユーザータスク / setup の代行化 / エージェント間の同等化）
 - ブリーフの柱から 2 件を落とした: **#1500 は 9/22 着地だが v0.8.17（9/22 05:00 の夜間版）に載っておらず CHANGELOG にも節が無い = 未リリース**（代わりに v0.8 で実際に出た #1057 / #989 / #1002 で組んだ）。Web ビューは v0.4.0 の機能で v0.8 にあるのは #1481 の修正だけ。本文の記述 60 件はすべて Issue 番号で CHANGELOG の v0.8 範囲と機械照合（不一致 0）
@@ -54,3 +49,8 @@
 - `add` / `remove` は #1453 で dispatch へ寄せたのに `list` だけ `ProjectsConfig::load()` の直読みが残っていた（同じ関数に「直したもの」と「残したもの」が並ぶ = #1453 で実際に壊れた形）。3 分岐すべてを `dispatch_orchestrator_projects` の 1 本へ
 - 実測: 隔離 `TAKO_ORCHESTRATOR_DIR` での前後 A/B **7 ケースすべて stdout / stderr / exit がバイト一致**（未登録 / 空 / 3 件 / 桁境界 15・16・17 + 日本語キー / 空 desc / 壊れた YAML=exit 1 / 空ファイル）。本番 projects.yaml は sha256 一致で無改変
 - 番犬 `issue1544_projects_dispatch_watchdog` 3 本（注入 4 通り + 空振り検査）。直読みを戻す注入で `main.rs:4537` を名指しして FAILED → 戻して緑
+
+## 2026-09-23（#1504: Windows のシェル統合を tako setup の段として入れた）
+- `shell_integration::install()` の呼び手が CLI と MCP だけで **setup も installer も呼んでいなかった**（棚卸し Z9）ので、Windows は人が `tako shell-integration install` を打つまで OSC 7 / 133・cwd 追従・入力予測・自動命名の素材が死んでいた。段を `tako setup`（bootstrap より前）と `--check` へ 1 実装で通し、**配置が要るかは `cfg!(windows)` ではなく `Delivery` で分岐**させたので、macOS 上でも Profile 経路の表示・冪等・失敗を全部検査できる（実機を持たない CI の穴を作らない）
+- 倒した判断: ユーザーのファイルへ書く前に「何をどこへ」を出して**同意扱いで続行**（`[y/N]` を出さない = `--yes` / 非 TTY / 端末ありで出力が一致。先例は #1502 の PATH 設置）／失敗は `RemainingKind::ShellIntegration` として末尾へ（段は `Result` を返さないので `?` で setup を止められない）／2 回目は予告も出さず差分ゼロ
+- 実測: `scripts/test-setup-shell-integration-1504.sh` **54 PASS 0 FAIL**（CI 登録。隔離 HOME で `$PROFILE` のマーカーが HOME のどこにも書かれないことを毎回確認）・A/B `TAKO_1504_LEGACY=1` は 34 PASS（`<data_dir>/shell-integration` が作られない = #1504 前の症状）・注入 11 通りすべて FAILED → 戻して緑（段を外すと実経路が 21 FAIL）・回帰 5 本（#1499 52 / #1501 81 / #1503 28 / #1509 49 / multiagent）全緑・workspace 5157 passed 0 failed・clippy 3 宇宙 0・check-windows error 0

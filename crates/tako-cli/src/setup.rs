@@ -24,6 +24,9 @@ use tako_control::setup_deps::{self, DepInstallOptions};
 // 詰まった段を「人へ残る作業」として脇に置く判断と文面の正本（#1501）。
 // CLI はここへ積んで、まとめて表示するだけ
 use tako_control::setup_remaining::{self, Remaining, RemainingKind};
+// シェル統合（OSC 7 / 133・cwd 追従・入力予測）を配置する段の正本（#1504）。
+// 配置が要るかの判断・表示・「残り」はすべて向こう側で、ここは呼んで出すだけ
+use tako_control::shell_integration as setup_shell_integration;
 
 // --- バイナリ埋め込みリソース ---
 // 推奨ルールのセクションと既定指示ファイルは tako_control::setup が正
@@ -3111,6 +3114,11 @@ pub fn run_check() -> Result<(), String> {
     // tako CLI の PATH 設置（FR-2.14.5 / #1502）。判定は check-health と同じ 1 実装
     eprintln!("{}", setup_bootstrap::tako_cli_path_check_line());
 
+    // シェル統合（FR-2.14.14 / #1504）。**読み取りだけ**で、判定は `tako setup` の
+    // 段と同じ 1 実装。未配置なら末尾の「残り」にも同じ 1 行で載る
+    eprintln!("{}", setup_shell_integration::check_line());
+    remaining.extend(setup_shell_integration::check_remaining());
+
     // エージェント CLI + 任意依存。--check では表示のみ。
     let (agents, missing) = run_dependency_check(DepCheckMode::check_only());
     remaining.extend(missing);
@@ -3445,6 +3453,16 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
     // 人へ残る作業（#1501）。**詰まった段で exit 1 しない**: 代行できない 1 件
     // （ログイン等）を脇に置き、認証不要な段を全部やってから最後にまとめて出す
     let mut remaining: Vec<Remaining> = Vec::new();
+
+    // シェル統合の配置（FR-2.14.14 / #1504）。**Windows は `$PROFILE` へブロックが
+    // 要る**ので setup の段として通す（macOS / Linux は env 注入で完結するので 1 行だけ）。
+    // エージェントの導入状況に依存しないのでここ（bootstrap より前）に置く。
+    // 実装・文面・「残り」の判断の正本は tako-control 側
+    let shell_integration = setup_shell_integration::run_setup_stage();
+    for line in &shell_integration.lines {
+        eprintln!("{line}");
+    }
+    remaining.extend(shell_integration.remaining);
 
     // ゼロスタート導入（#868）。導入済みなら何も出さずに素通りする＝従来の検出型と同じ体験。
     // 未導入なら インストール → PATH 通し → 認証 まで案内してから検出型へ進む
