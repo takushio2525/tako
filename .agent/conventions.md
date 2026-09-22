@@ -33,6 +33,10 @@
 
 - 仕様書は `.agent/`（日本語）。コードコメントも日本語
 - 仕様変更時は該当する `.agent/*.md` を**同一コミット**で更新する
+- 公開サイト（`docs/`）のアクセス解析タグは `docs/astro.config.mjs` の Starlight `head` に
+  置き、**ID はファイル冒頭の定数 1 か所**（`GA_MEASUREMENT_ID` / `ADSENSE_PUBLISHER_ID`）で持つ。
+  GA4 は `takushio2525.com` 一族で 1 プロパティを共有し、AdSense は所有権確認の meta だけ
+  （広告は出さないので `adsbygoogle.js` は入れない。`ads.txt` はルートドメイン側に 1 つで足りる）
 
 ## UI 文字列の i18n（Issue #435）
 
