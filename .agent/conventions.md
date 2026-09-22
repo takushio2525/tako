@@ -2169,7 +2169,9 @@ Windows ランナーには **psmux / tmux / claude / codex CLI が無く、セ�
 3. **`#[cfg(...)]` / `#[cfg_attr(windows, ignore = "理由")]`**（その OS に仕組みが無い /
    製品側の穴が別 Issue で追われている）。**理由の無い skip は禁止**で、
    番犬 `issue1278_ignore_reason_watchdog` が `#[ignore]` /
-   `#[cfg_attr(…, ignore)]` を `file:line` で落とす。`#[cfg(...)]` で外すときは
+   `#[cfg_attr(…, ignore)]` を `file:line` で落とす。さらに
+   **Windows だけを外す skip は理由に追跡番号（`#1557` 等）を持つ**こと
+   （= allowlist が黙って増えない）。`#[cfg(...)]` で外すときは
    **すぐ上に doc コメントで理由**を書く（属性からは理由が読めないため）
 
 **製品側の穴をテストの skip で隠すときは必ず Issue を立て、`ignore` の理由文に番号を書く**

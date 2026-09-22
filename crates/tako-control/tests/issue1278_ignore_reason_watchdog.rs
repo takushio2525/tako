@@ -104,6 +104,80 @@ fn reasonless_ignores(source: &str) -> Vec<(usize, String)> {
     out
 }
 
+/// `#[cfg_attr(<windows を含む条件>, ignore = "理由")]` の理由文を集める。
+///
+/// **Windows だけを外す skip は allowlist そのもの**なので、理由に追跡番号
+/// （`#1557` 等）を必ず持たせる。番号があれば「直したら ignore を外す」が
+/// Issue 側から辿れる（宣言済みの縮退なら設計判断の Issue 番号でよい）
+fn windows_only_ignore_reasons(source: &str) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        // 理由文（`ignore = "…"`）が在る行を起点にする
+        let Some(reason) = line
+            .split_once("ignore = \"")
+            .and_then(|(_, r)| r.rsplit_once('"'))
+            .map(|(reason, _)| reason.to_string())
+        else {
+            continue;
+        };
+        // その行を含む属性の頭（`#[cfg_attr(` で始まる行）まで遡る。
+        // rustfmt が 1 行形と複数行形のどちらにも割るので、両方を同じ規則で読む
+        let mut head = None;
+        for back in (0..=i).rev() {
+            let t = lines[back].trim_start();
+            if t.starts_with("#[cfg_attr(") {
+                head = Some(back);
+                break;
+            }
+            if t.starts_with("#[") && !t.starts_with("#[cfg_attr(") {
+                break; // 別の属性に当たった = cfg_attr の中ではない
+            }
+            if i - back > 4 {
+                break; // 属性 1 個ぶんより離れた
+            }
+        }
+        let Some(head) = head else { continue };
+        let window = lines[head..=i].join("\n");
+        if window.contains("windows") {
+            out.push((i + 1, reason));
+        }
+    }
+    out
+}
+
+#[test]
+fn windowsだけのskipは追跡番号を持つ() {
+    let mut violations: Vec<String> = Vec::new();
+    let mut found = 0usize;
+    for path in rust_sources() {
+        if path.file_name().is_some_and(|n| n == SELF_FILE) {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).unwrap_or_default();
+        for (line, reason) in windows_only_ignore_reasons(&source) {
+            found += 1;
+            let has_issue = reason.char_indices().any(|(i, c)| {
+                c == '#' && reason[i + 1..].starts_with(|d: char| d.is_ascii_digit())
+            });
+            if !has_issue {
+                violations.push(format!("{}:{line}  {reason}", rel(&path)));
+            }
+        }
+    }
+    assert!(
+        found > 0,
+        "Windows だけを外す skip が 1 件も見つからない（走査が壊れている）"
+    );
+    assert!(
+        violations.is_empty(),
+        "Windows だけを外す skip の理由に追跡番号（`#1557` 等）が無い（#1278）。\n\
+         これは allowlist そのものなので、**直したら ignore を外す**が Issue 側から\n\
+         辿れる状態にすること（宣言済みの縮退なら設計判断の Issue 番号でよい）:\n{}",
+        violations.join("\n")
+    );
+}
+
 #[test]
 fn 理由の無いignoreがリポジトリに無い() {
     let mut violations: Vec<String> = Vec::new();

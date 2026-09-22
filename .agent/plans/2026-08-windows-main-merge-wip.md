@@ -3855,7 +3855,7 @@ run 35735202680 で、**5064 passed / 21 failed / 40 ignored**。21 件のうち
 |---|---|---|
 | 1 | 35735202680 | **5064 passed / 21 failed / 40 ignored** |
 | 2 | 35739986689 | **5076 passed / 2 failed / 47 ignored**（`git` の CRLF と `test_residue`） |
-| 3 | （下記） | **0 failed** |
+| 3 | 35743661929 | **5077 passed / 0 failed / 48 ignored**（両ジョブ success） |
 
 2 巡目の 2 件はどちらも**1 巡目の修正が 1 段進めた先**に出たもの:
 `git` は identity が通った次に `core.autocrlf` の CRLF が出た。
@@ -3878,7 +3878,7 @@ run 35735202680 で、**5064 passed / 21 failed / 40 ignored**。21 件のうち
 symlink テストが CI Windows で緑）。実機（非昇格）では作れないので、
 どちらでも動く形（作れなければ理由を出して skip）にしてある。
 
-#### 理由つき skip の allowlist（**7 件**。増やすときは Issue 番号を書く）
+#### 理由つき skip の allowlist（**10 件**。増やすときは Issue 番号を書く）
 
 | 件数 | テスト | 理由 | 追跡 |
 |---|---|---|---|
@@ -3894,8 +3894,14 @@ symlink テストが CI Windows で緑）。実機（非昇格）では作れな
 allowlist に数えない。`RENAME_SWAP` 相当が無い側では `MoveAside` が正しい答え）
 
 **理由の無い skip は 0 件**で、番犬
-`crates/tako-control/tests/issue1278_ignore_reason_watchdog.rs` が
-`#[ignore]` / `#[cfg_attr(…, ignore)]` を `file:line` で落とす。
+`crates/tako-control/tests/issue1278_ignore_reason_watchdog.rs` が 2 つの規則で縛る:
+
+1. 理由の無い `#[ignore]` / `#[cfg_attr(…, ignore)]` を `file:line` で落とす
+2. **Windows だけを外す skip は理由に追跡番号（`#1557` 等）を持つ**
+   = allowlist が黙って増えない（「直したら ignore を外す」が Issue 側から辿れる）
+
+3 巡目の実測で、この allowlist の 10 件が**すべて追跡番号つきで `ignored` に出ている**
+ことを確認した（`cargo test` の出力にそのまま並ぶ）。
 
 #### 実機ベースラインとの差
 
