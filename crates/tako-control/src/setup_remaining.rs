@@ -55,6 +55,8 @@ pub enum RemainingKind {
     Mcp { agent: String },
     /// 依存ツールの導入
     Dep { bin: String },
+    /// シェル統合の配置（Windows の `$PROFILE`。#1504）
+    ShellIntegration,
 }
 
 impl RemainingKind {
@@ -77,6 +79,9 @@ impl RemainingKind {
             Self::AgentStatusUnknown => "エージェント CLI の導入状況の確認".to_string(),
             Self::Mcp { agent } => format!("{agent} への tako MCP 登録"),
             Self::Dep { bin } => format!("{bin} の導入"),
+            Self::ShellIntegration => {
+                "シェル統合の配置（ペインの cwd 追従とコマンド実行状態）".to_string()
+            }
         }
     }
 
@@ -102,6 +107,7 @@ impl RemainingKind {
             Self::AgentStatusUnknown => Some("tako setup bootstrap status-all".to_string()),
             Self::Mcp { .. } => Some("tako setup-mcp".to_string()),
             Self::Dep { .. } => Some("tako setup deps install".to_string()),
+            Self::ShellIntegration => Some("tako shell-integration install".to_string()),
         }
     }
 
@@ -117,6 +123,10 @@ impl RemainingKind {
             Self::Mcp { .. } => {
                 vec!["登録が無いと AI から tako の画面を操作できません".to_string()]
             }
+            Self::ShellIntegration => vec![
+                "無くても tako は動きますが、ペインの cwd 追従・コマンド実行状態・入力予測が働きません"
+                    .to_string(),
+            ],
             _ => Vec::new(),
         }
     }
@@ -145,6 +155,9 @@ impl RemainingKind {
             Self::AgentLogin(_) => 4,
             Self::Mcp { .. } => 5,
             Self::Dep { .. } => 6,
+            // 一番後ろ（無くても tako は動く上積み。ここが手前に来ると
+            // 「まず tako を使える状態にする」という並びの意図が崩れる）
+            Self::ShellIntegration => 7,
         }
     }
 }
@@ -342,6 +355,30 @@ mod tests {
         }
     }
 
+    /// シェル統合は「無くても tako は動く上積み」なので一番後ろ（[`RemainingKind::order`]）
+    #[test]
+    fn シェル統合は一番後ろに並ぶ() {
+        let items = summarize(vec![
+            Remaining::new(RemainingKind::ShellIntegration),
+            Remaining::new(RemainingKind::AgentLogin(AgentKind::Claude)),
+            Remaining::new(RemainingKind::Dep {
+                bin: "tmux".to_string(),
+            }),
+        ]);
+        let order: Vec<&RemainingKind> = items.iter().map(|item| &item.kind).collect();
+        assert_eq!(
+            order,
+            vec![
+                &RemainingKind::AgentLogin(AgentKind::Claude),
+                &RemainingKind::Dep {
+                    bin: "tmux".to_string()
+                },
+                &RemainingKind::ShellIntegration,
+            ],
+            "ログイン → 依存 → シェル統合 の順に並ぶ"
+        );
+    }
+
     #[test]
     fn 全種別が次に打つ1行を持つ() {
         let kinds = [
@@ -358,6 +395,7 @@ mod tests {
             RemainingKind::Dep {
                 bin: "tmux".to_string(),
             },
+            RemainingKind::ShellIntegration,
         ];
         for kind in kinds {
             assert!(

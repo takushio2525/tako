@@ -146,7 +146,7 @@ tako orchestrator spawn --help
 | [`platform`](#tako-platform) | この環境で使える機能の一覧 |
 | [`check-health`](#その他) | 環境の健全性診断（CLI / MCP の受け口が立っているか） |
 | [`agent-support`](#tako-agent-support) | エージェント系統ごとの能力差 |
-| [`shell-integration`](#その他) | シェル統合（cwd 追従・コマンド状態）の確認・配置 |
+| [`shell-integration`](#その他) | シェル統合（cwd 追従・コマンド状態）の確認・配置（`tako setup` が自動で通る） |
 | [`context-budget`](#その他) | 起動時ロードの予算の確認と作業ログの自動移送 |
 | [`test-residue`](#その他) | テスト・検証が残した一時 dir の掃除 |
 | [`fda`](#その他) | フルディスクアクセスの状態確認 |
@@ -185,6 +185,8 @@ tako setup --changes --json
 # セットアップ状態をリセットして最初からやり直す
 tako setup --reset
 ```
+
+`tako setup` は**シェル統合**（ペインの作業ディレクトリ追従・コマンドの実行状態・入力予測）の配置も自分で行います。macOS / Linux は tako が開くシェルへ環境変数を渡すだけで効くので設定ファイルには何も書かず、状態が 1 行出るだけです。**Windows は PowerShell のプロファイル（`$PROFILE`）への追記が必要**なので、どのファイルへ何を書くか（置くのは tako の管理ブロック 1 個だけで既存の行はそのまま残ること・`tako shell-integration uninstall` で元に戻せること）を表示してから配置します。2 回目以降は差分がなければ何も書きません。配置できなかったときも setup は最後まで走り、`tako shell-integration install` を「残り」として案内します。状態だけ見たいときは `tako shell-integration` または `tako setup --check` です。
 
 `--answers` は `selected_agent`、`provider_plans`、`instruction_content`、`profile`、`projects`、`orchestrator`、`sleep_guard` を受け取ります。同じ JSON は MCP `tako_setup` でも使えるため、AI に日本語で希望を伝えてセットアップを代行させられます。`projects` は指定時に全登録を置き換えます。
 
@@ -1421,7 +1423,8 @@ tako check-health            # 環境の健全性診断（CLI の PATH・tmux・
 tako check-health --json     # 生の JSON（アプリへ届かないときは受け口だけをローカル診断）
 
 tako shell-integration           # シェル統合（cwd 追従・コマンド実行状態）が効いているか
-tako shell-integration install   # 配置する（unix は環境変数の注入で完結するので不要）
+tako shell-integration install   # 配置する（tako setup が自分で通るので普段は不要）
+tako shell-integration uninstall # 配置を取り除く（書き足したブロックだけを消す）
 
 tako context-budget          # 起動時ロードの予算の確認（何も書き換えない）
 tako context-budget fix      # 積もった作業ログを archive へ移送する

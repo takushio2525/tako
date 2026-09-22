@@ -166,6 +166,15 @@ jobs:
       # 棚卸し R4 では `tako setup` が無言で 6 分固まり続けた）
       - name: setup の probe が上限で打ち切ることの実経路テスト
         run: bash scripts/test-setup-probe-timeout-1503.sh
+      # シェル統合（OSC 7 / 133・cwd 追従・入力予測）を `tako setup` の段として配置する
+      # ことの実経路テスト。隔離 HOME / TAKO_DATA_DIR / PATH + claude / tmux / git /
+      # tailscale のスタブなので本番の rc にも `$PROFILE` にも触らない（unix ではそもそも
+      # ユーザーのファイルを 1 バイトも書かないことを毎回確かめる）。Windows 形（`$PROFILE`
+      # へブロックを置く経路）の表示・冪等・残りは `Status` を組んで macOS 上で通す。
+      # **配置が `tako shell-integration install` を人が打つまで走らない形へ戻ったら
+      # ここで落ちる**（#1504。#1500 の棚卸し Z9 = Windows は人が打つまで cwd 追従が死ぬ）
+      - name: setup がシェル統合を配置することの実経路テスト
+        run: bash scripts/test-setup-shell-integration-1504.sh
       # `tako remote setup` の [1/5]（未導入の Tailscale をその場で入れる）の実経路テスト。
       # 隔離 HOME / TAKO_DATA_DIR / PATH + brew スタブで、`TAKO_TAILSCALE_BIN` を
       # 隔離 PATH の中へ向けて「未導入」を作るので実機の Tailscale にも tailnet の
