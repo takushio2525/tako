@@ -1371,6 +1371,26 @@ master の入力欄へ入った。この機械には profile=default の master 
   （`resolve_caller_pane` は名指しを扱えるが、入口が混ぜて渡している）。寄せるときは
   入口を `Request::orchestrator_self` と同じ形へ替えるだけで、受け手側の変更は要らない
 
+## CLI と MCP は「同じ 1 本」を通す（Issue #1453 / #1544）
+
+AGENTS.md の不変条件「tako-core 操作 API + `dispatch` + CLI + MCP の 1:1」は、
+**読み取りにも効く**。CLI 側に「設定ファイルを直接読むだけ」の写しを置くと、
+dispatch へ機能が足された日に**片側だけ取り残される**。
+
+#1453 の実測がその形で、`projects add` の専用プロファイル自動生成が
+**MCP からだけ効いて CLI からは効かなかった**。#1544 はその修正で残っていた
+`projects list` の直読み（出力は一致していたので症状が出ていなかった）を寄せた。
+
+- **「今は出力が同じ」は写しを残す理由にならない**。同じ関数に「直したもの」と
+  「残したもの」が並ぶ状態そのものが再発の温床（次に触る人が片側だけ直す）
+- 読み取りの CLI は dispatch の戻り値（`Value`）から表示を組む。表示の体裁
+  （`{:<16}` の桁・区切り・空のときの案内）は CLI 側に残してよい —— 寄せるのは
+  **どこから読むか**だけ
+- 番犬 `issue1544_projects_dispatch_watchdog` が `orchestrator_projects_cli` の本文に
+  `ProjectsConfig` が現れたら `file:line` で落とす。3 分岐すべてが
+  `dispatch_orchestrator_projects` を通ること・CLI が渡す action の綴りが正本に
+  在ることも同時に見る（綴りがずれると実行時にだけ「action が不正」で落ちる）
+
 ## 送達は「届いた / 未達 / 送ったかもしれない」の 3 値で記録する（Issue #1294 / #790）
 
 送達フローが「再送してはいけない」と宣言した顛末（peer の書き込みが始まった後に確認が
