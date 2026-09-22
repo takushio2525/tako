@@ -9,6 +9,10 @@
 //   node scripts/gen-agent-support-docs.mjs           # 生成（上書き）
 //   node scripts/gen-agent-support-docs.mjs --check    # 同期検査（CI 用）
 //
+// **どの tako を使うか**は `scripts/lib/tako-bin.mjs` が 1 か所で決める（#1548）。
+// 選んだバイナリの版が `Cargo.toml` とずれていたら、生成も検査もせずに落ちる
+// （古い debug ビルドを黙って使うと、偽の赤と docs の静かな巻き戻しが起きる）。
+//
 // カテゴリ未分類の能力があると**失敗する**。マトリクスへ行を足したらここへも
 // 1 行足すこと（分類漏れを検出するための仕掛けで、放置すると表から消える）。
 //
@@ -19,6 +23,8 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import { resolveTakoBin } from './lib/tako-bin.mjs';
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const OUT = join(REPO, 'docs/src/content/docs/agent-support.md');
@@ -82,15 +88,8 @@ const EVIDENCE_LABEL = {
   unverified: '未確認',
 };
 
-function takoBin() {
-  for (const p of ['target/debug/tako', 'target/release/tako']) {
-    if (existsSync(join(REPO, p))) return join(REPO, p);
-  }
-  throw new Error('tako CLI が見つかりません。`cargo build -p tako-cli` を先に実行してください');
-}
-
 function matrix() {
-  const raw = execFileSync(takoBin(), ['agent-support', '--json'], {
+  const raw = execFileSync(resolveTakoBin(REPO).path, ['agent-support', '--json'], {
     encoding: 'utf8',
     maxBuffer: 32 * 1024 * 1024,
   });
@@ -285,18 +284,29 @@ function render() {
   return out.join('\n');
 }
 
-const body = render();
-if (process.argv.includes('--check')) {
-  const current = existsSync(OUT) ? readFileSync(OUT, 'utf8') : '';
-  if (current !== body) {
-    console.error(
-      'docs/src/content/docs/agent-support.md が能力マトリクスと同期していません。\n' +
-        '`node scripts/gen-agent-support-docs.mjs` で再生成してコミットしてください。',
-    );
-    process.exit(1);
+function main() {
+  const body = render();
+  if (process.argv.includes('--check')) {
+    const current = existsSync(OUT) ? readFileSync(OUT, 'utf8') : '';
+    if (current !== body) {
+      console.error(
+        'docs/src/content/docs/agent-support.md が能力マトリクスと同期していません。\n' +
+          '`node scripts/gen-agent-support-docs.mjs` で再生成してコミットしてください。',
+      );
+      process.exit(1);
+    }
+    console.log('agent-support.md は能力マトリクスと同期しています');
+  } else {
+    writeFileSync(OUT, body);
+    console.log(`生成しました: ${OUT}`);
   }
-  console.log('agent-support.md は能力マトリクスと同期しています');
-} else {
-  writeFileSync(OUT, body);
-  console.log(`生成しました: ${OUT}`);
+}
+
+// 失敗の理由（どのバイナリが古いか等）が 1 行目で読めるようにする。
+// スタックトレースを出しても直し方は分からないので出さない
+try {
+  main();
+} catch (e) {
+  console.error(e instanceof Error ? e.message : String(e));
+  process.exit(1);
 }
