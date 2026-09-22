@@ -260,6 +260,9 @@ CI（`.github/workflows/ci.yml`）は macOS / Windows の両ランナーで buil
   プロファイルの `prompt_blocks.append`（個人環境のルール）の取り分。追記がこれを超えると
   `tako migrate` が見出し境界へ `<!-- tako:on-demand -->` を入れ、その行より後ろは
   `tako orchestrator guide local-rules` で引く形になる（**内容は 1 文字も消さない**）
+- **MCP で公開するツールカタログは 210 KB 以内**（`tools/list` の応答）。
+  MCP を繋いだエージェント全員が起動時に名前 + 説明 + inputSchema の全文を受け取る
+  tako 自身の生成物なので、超えたらツールを隠すのではなく 1 本ずつの説明文を短くする
 
 ### 機械強制
 

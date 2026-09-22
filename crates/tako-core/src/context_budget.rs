@@ -46,9 +46,25 @@ pub enum ItemKind {
     SystemPrompt,
     /// claude の永続メモリ（`MEMORY.md`）
     Memory,
+    /// MCP で公開するツールカタログ（`tools/list` の応答。Issue #1539）
+    McpCatalog,
 }
 
 impl ItemKind {
+    /// 全種別。**新しい種別を足したらここへ載せる**。
+    /// 網羅を確かめるテストはこの 1 本を引くので、載せ忘れは落ちる
+    pub const ALL: &'static [ItemKind] = &[
+        ItemKind::GlobalGuide,
+        ItemKind::AgentsGuide,
+        ItemKind::ProgressLog,
+        ItemKind::ActiveContext,
+        ItemKind::Imported,
+        ItemKind::HandoffMemo,
+        ItemKind::SystemPrompt,
+        ItemKind::Memory,
+        ItemKind::McpCatalog,
+    ];
+
     /// JSON / CLI で使う安定した名前
     pub fn as_str(self) -> &'static str {
         match self {
@@ -60,6 +76,7 @@ impl ItemKind {
             ItemKind::HandoffMemo => "handoff_memo",
             ItemKind::SystemPrompt => "system_prompt",
             ItemKind::Memory => "memory",
+            ItemKind::McpCatalog => "mcp_catalog",
         }
     }
 
@@ -74,6 +91,7 @@ impl ItemKind {
             ItemKind::HandoffMemo => Note::new("引き継ぎ運用メモ", "handoff memo"),
             ItemKind::SystemPrompt => Note::new("system prompt", "system prompt"),
             ItemKind::Memory => Note::new("永続メモリ", "memory"),
+            ItemKind::McpCatalog => Note::new("MCP ツールカタログ", "MCP tool catalog"),
         }
     }
 
@@ -138,6 +156,22 @@ pub const SYSTEM_PROMPT_BASE_MAX_BYTES: usize = 18 * 1024 + 512;
 /// [`crate::prompt_append`] の区切りで常時部と on-demand 部に分かれる
 pub const PROMPT_APPEND_MAX_BYTES: usize = SYSTEM_PROMPT_MAX_BYTES - SYSTEM_PROMPT_BASE_MAX_BYTES;
 
+/// MCP で公開するツールカタログ（`tools/list` の応答。Issue #1539）。
+///
+/// **MCP を繋いだエージェントは 1 本残らず起動した瞬間にこれを全文受け取る**ので、
+/// 予算表の中で最大の固定費（他の全項目の上限の合計 ≒ 130 KB より大きい）。
+/// ここに項目が無かったあいだ、この量は**誰にも測られていなかった**。
+///
+/// 実測（2026-09-22 / 152 本）は最小化 JSON で 201,535 バイト・123,415 文字。
+/// 実トークナイザ（tiktoken `o200k_base`）で **52,028 トークン**
+/// （3.87 バイト / トークン）。JSON の構造と ASCII のキーが多いぶん、
+/// 日本語主体の文書へ合わせた [`estimate_tokens`] は 94,934 と約 1.8 倍に出る。
+/// **だから上限はトークンではなくバイトで置く** — バイトはトークナイザに依らない。
+///
+/// 初期値は現状 + 6.7%（ツールを数本足したくらいでは CI が落ちない程度の余地）。
+/// 説明文の圧縮と Issue 番号の除去（#1540）が入ったら、その実測値で締め直す
+pub const MCP_CATALOG_MAX_BYTES: usize = 210 * 1024;
+
 /// 種別ごとの上限を引く（**判定・規約文・番犬がすべてこの 1 本を通る**）
 pub fn limits(kind: ItemKind) -> Limits {
     match kind {
@@ -170,6 +204,12 @@ pub fn limits(kind: ItemKind) -> Limits {
         // 「移送しなければ超過していた」ことの実測になる）
         ItemKind::SystemPrompt => Limits {
             max_bytes: Some(SYSTEM_PROMPT_MAX_BYTES),
+            ..Limits::default()
+        },
+        // #1539: MCP カタログは 1 本の JSON なので**行数は見ない**（意味を持たない）。
+        // バイトだけで縛る
+        ItemKind::McpCatalog => Limits {
+            max_bytes: Some(MCP_CATALOG_MAX_BYTES),
             ..Limits::default()
         },
         // 取り込み先の 1 本ずつには上限を置かない（合計 IMPORT_TOTAL_MAX_BYTES で見る）。
@@ -215,6 +255,9 @@ pub fn rule_markdown() -> String {
   プロファイルの `prompt_blocks.append`（個人環境のルール）の取り分。追記がこれを超えると
   `tako migrate` が見出し境界へ `<!-- tako:on-demand -->` を入れ、その行より後ろは
   `tako orchestrator guide local-rules` で引く形になる（**内容は 1 文字も消さない**）
+- **MCP で公開するツールカタログは {mcp_kb} KB 以内**（`tools/list` の応答）。
+  MCP を繋いだエージェント全員が起動時に名前 + 説明 + inputSchema の全文を受け取る
+  tako 自身の生成物なので、超えたらツールを隠すのではなく 1 本ずつの説明文を短くする
 
 ### 機械強制
 
@@ -235,6 +278,7 @@ pub fn rule_markdown() -> String {
         prompt_kb = SYSTEM_PROMPT_MAX_BYTES / 1024,
         prompt_base_kb = format_kb(SYSTEM_PROMPT_BASE_MAX_BYTES),
         prompt_append_kb = format_kb(PROMPT_APPEND_MAX_BYTES),
+        mcp_kb = format_kb(MCP_CATALOG_MAX_BYTES),
     )
 }
 
@@ -293,6 +337,12 @@ pub fn measure(kind: ItemKind, text: &str) -> Measurement {
         est_tokens: estimate_tokens(text),
         ..Measurement::default()
     };
+    // #1539: MCP カタログは改行を持たない 1 本の JSON なので**行数は意味を持たない**。
+    // `1 行` と申告すると「小さい」と読めてしまうので 0 にし、
+    // バイトと概算トークンだけで見る（上限側も `max_lines` を置いていない）
+    if kind == ItemKind::McpCatalog {
+        m.lines = 0;
+    }
     if kind == ItemKind::ProgressLog {
         let log = parse_log(text);
         let cap = limits(kind).max_entry_lines.unwrap_or(usize::MAX);
@@ -400,6 +450,11 @@ pub mod notes {
         "master / solo の system prompt が予算を超えている。長寿命セッションの起動直後の固定費なので、手順の詳細は `tako orchestrator guide <topic>` で必要なときだけ引く形へ移す。プロファイルの `prompt_blocks.append`（個人環境固有のルール）が大きい場合は、常に要る規則だけを残して残りを別ファイルへ分け、そこは AI が必要なときだけ読む",
         "The master / solo system prompt is over budget. It is a fixed cost paid at the start of every long-lived session, so move procedure detail into `tako orchestrator guide <topic>` and fetch it on demand. If the profile's `prompt_blocks.append` (your machine-specific rules) is the large part, keep only the always-needed rules there and split the rest into a file the agent reads only when needed",
     );
+
+    pub const MCP_CATALOG_TOO_BIG: Note = Note::new(
+        "MCP ツールカタログが予算を超えている。MCP を繋いだエージェント全員が起動時に全文を受け取る tako 自身の生成物なので、ツールを隠すのではなく 1 本ずつの説明文と inputSchema の description を短くする（正本は `crates/tako-control/src/mcp/catalog.rs`。直したら `TAKO_UPDATE_MCP_SNAPSHOT=1` でスナップショットを取り直す）",
+        "The MCP tool catalog is over budget. Every connected agent receives it in full at startup and it is tako's own generated artifact, so shorten each tool's description and its inputSchema descriptions rather than hiding tools (source of truth: `crates/tako-control/src/mcp/catalog.rs`; refresh the snapshot with `TAKO_UPDATE_MCP_SNAPSHOT=1` afterwards)",
+    );
 }
 
 /// 実測値を予算と突き合わせる
@@ -415,6 +470,7 @@ pub fn violations(kind: ItemKind, m: &Measurement) -> Vec<Violation> {
         ItemKind::HandoffMemo => notes::HANDOFF_MEMO_TOO_LONG,
         ItemKind::GlobalGuide => notes::GLOBAL_GUIDE_TOO_BIG,
         ItemKind::SystemPrompt => notes::SYSTEM_PROMPT_TOO_BIG,
+        ItemKind::McpCatalog => notes::MCP_CATALOG_TOO_BIG,
         _ => notes::IMPORT_TOTAL_TOO_BIG,
     };
 
@@ -1173,15 +1229,10 @@ mod tests {
 
     #[test]
     fn 作業ログ以外は自動修正の対象外() {
-        for k in [
-            ItemKind::GlobalGuide,
-            ItemKind::AgentsGuide,
-            ItemKind::ActiveContext,
-            ItemKind::Imported,
-            ItemKind::HandoffMemo,
-            ItemKind::SystemPrompt,
-            ItemKind::Memory,
-        ] {
+        for k in ItemKind::ALL.iter().copied() {
+            if k == ItemKind::ProgressLog {
+                continue;
+            }
             assert!(!k.auto_fixable(), "{} は人間の判断が要る", k.as_str());
         }
         assert!(ItemKind::ProgressLog.auto_fixable());
@@ -1252,18 +1303,65 @@ mod tests {
         for v in violations(ItemKind::ProgressLog, &m) {
             assert!(!v.note.ja().is_empty() && !v.note.en().is_empty());
         }
-        for k in [
-            ItemKind::GlobalGuide,
-            ItemKind::AgentsGuide,
-            ItemKind::ProgressLog,
-            ItemKind::ActiveContext,
-            ItemKind::Imported,
-            ItemKind::HandoffMemo,
-            ItemKind::SystemPrompt,
-            ItemKind::Memory,
-        ] {
+        for k in ItemKind::ALL.iter().copied() {
             assert!(!k.label().ja().is_empty() && !k.label().en().is_empty());
             assert!(!k.as_str().is_empty());
         }
+    }
+
+    /// #1539: MCP カタログは予算対象で、直し方は説明文の圧縮（自動では直せない）
+    #[test]
+    fn mcpカタログは予算対象で自動修正の対象外() {
+        assert_eq!(
+            limits(ItemKind::McpCatalog).max_bytes,
+            Some(MCP_CATALOG_MAX_BYTES)
+        );
+        // 1 本の JSON なので行数は縛らない（`max_lines` を置くと無意味な軸で落ちる）
+        assert_eq!(limits(ItemKind::McpCatalog).max_lines, None);
+
+        let m = measure(ItemKind::McpCatalog, &"x".repeat(MCP_CATALOG_MAX_BYTES + 1));
+        let bytes = violations(ItemKind::McpCatalog, &m)
+            .into_iter()
+            .find(|v| v.metric == Metric::Bytes)
+            .expect("バイト超過を名指しする");
+        assert_eq!(bytes.limit, MCP_CATALOG_MAX_BYTES);
+        assert!(!bytes.fixable, "説明文を機械で削るのは申告の毀損になる");
+        assert!(
+            bytes.note.ja().contains("catalog.rs"),
+            "直し方に正本の置き場を書く: {}",
+            bytes.note.ja()
+        );
+        // 取り込み合計の理由文（`_ =>` の落ち先）を掴んでいないこと
+        assert_ne!(bytes.note.ja(), notes::IMPORT_TOTAL_TOO_BIG.ja());
+
+        // 上限ちょうどは超過でない（境界は `>` で見る）
+        let just = measure(ItemKind::McpCatalog, &"x".repeat(MCP_CATALOG_MAX_BYTES));
+        assert!(violations(ItemKind::McpCatalog, &just).is_empty());
+        // 空のカタログ（`[]`）も当然予算内
+        assert!(violations(ItemKind::McpCatalog, &measure(ItemKind::McpCatalog, "[]")).is_empty());
+    }
+
+    #[test]
+    fn mcpカタログの行数は測らない() {
+        // 改行を持たない 1 本の JSON。`1 行` と出すと「小さい」と読めてしまう
+        let m = measure(ItemKind::McpCatalog, r#"[{"name":"tako_x"}]"#);
+        assert_eq!(m.lines, 0);
+        assert_eq!(m.bytes, 19);
+        assert!(m.est_tokens > 0);
+        // 他の種別の行数の数え方は変えていない
+        assert_eq!(measure(ItemKind::Imported, "a\nb\n").lines, 2);
+    }
+
+    #[test]
+    fn 予算表はmcpカタログの上限を規約文へ出す() {
+        let rule = rule_markdown();
+        assert!(
+            rule.contains(&format!("{} KB 以内", format_kb(MCP_CATALOG_MAX_BYTES))),
+            "規約文に MCP カタログの上限が無い"
+        );
+        assert!(
+            rule.contains("tools/list"),
+            "何を測っているかを規約文に書く"
+        );
     }
 }

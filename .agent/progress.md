@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-22（#1501: 未認証・未導入でも setup が全段やって完走するようにした）
-- 真因は **3 か所の早期 return**（`run_bootstrap_stage` の `?` / `missing_required` / 選択系統の未認証）で、一番手前が認証段（#1129 で代行を禁じた所）なので新品環境では `profiles/default.yaml`・`~/.claude/CLAUDE.md`・テンプレ・MCP 登録が**全部未作成**のまま exit 1（#1500 の R1 / R2 / R3）。判断を `tako_control::setup_remaining`（`summarize` / `render` / `for_step` / `legacy_stop` = 理由つき純粋関数）へ寄せ、段は `Vec<Remaining>` を返し、CLI は積んで最後に「残り N 件 + 次に打つ 1 行」を出すだけ。`--check` も同じ 1 実装・`setup.completed` は残りがあっても記録（再実行は残りから再開）
-- 要確認だった点を実測で決着: **未認証の実 claude 2.1.258 でも `claude mcp add --scope user` は通る**（隔離 HOME / `loggedIn:false` → rc 0・`mcpServers.tako` が載る）ので MCP は持ち越さず登録する。ついでに判明 = **`scripts/verify-setup-multiagent.sh` は main で既に赤**（未認証の想定が #868 の段順より古く Z2 が先に出る + codex / agy スタブが #979 の `mcp add` を「予期しない起動」と数える）ので #1493 の規約どおり同じコミットで現行契約へ直して全緑
-- 実測: `scripts/test-setup-continue-1501.sh` **81 PASS 0 FAIL**（CI 登録。非 TTY / `--yes` / TTY / dispatch 同条件 / `--check` / 冪等 / 認証済み A/B / エージェントゼロ / 必須依存 / Z3 / #1499・#1502 との同居）。A/B `TAKO_1501_LEGACY=1` は exit 1 で何も整わない = 症状。番犬 7 本・注入 12 通りすべて FAILED → 戻して緑。workspace 5087 passed 0 failed・clippy 3 宇宙 0・check-windows error 0
-
 ## 2026-09-22（#1509: remote setup の Tailscale 導入を setup_deps の 1 実装へ寄せた）
 - #1499 は判断（`offer_for`）と実行（`install`）を共有しただけで**表示と確認は呼び手に残していた**ので、`remote setup` の [1/5] は `brew install tailscale` を自前で組み直したままだった。案内 → `[y/N]` → 導入 → 再検出のひと続きを `setup_deps::offer_and_install`（字下げだけ呼び手が渡す）へ移し、1 件だけ引く `status_of` を追加。`remote_setup.rs` から素の `Command::new("brew")` が消えたので **Windows のコンソール窓を出す起動も 1 件減った**（`platform_parity` の表を更新）
 - 割れていた 4 点を出荷版との A/B で実測: brew が無い機は**聞いてから起動に失敗して中断**（新: 聞かずに `要 Homebrew`）／非 TTY は EOF を N と読むだけ（新: 理由つき案内）／「入れたのに引けない」は案内なしで中断／どこへ入るかを出さない。MCP の非対話経路は従来どおり導入しない
@@ -54,3 +49,8 @@
 - Windows のコンソールタイトルはシェル / psmux **自身**のフルパスなので、`heuristic_plan()` が OSC タイトルを最優先すると 16 文字で切った `C:\Program Files` / `C:\Users\<user>\A` が**全タブ同じ名前**になっていた（9/9 実機レビュー = 初回起動の第一印象）。`shell_exe_material()` の関門で捨てて cwd へ落とす。cwd の末尾要素は `Path::file_name` をやめ `last_segment()` へ（Unix は `\` を区切りにしないので Windows 形の素材が丸ごと 1 要素になる。Windows 形と判定したときだけ `\` も見る）
 - 指紋（cwd / OSC タイトル / 実行状態）はシェル統合の無い Windows で 3 つとも不変 = 命名がペインを開いた直後の 1 回で終わる件は、`tick()` に「同じ指紋のままやり直した回数」を持たせ `STALE_RETRY_DELAYS`（5 分 → 20 分 → 60 分）で再発火する形にした（使い切れば静まる）。画面末尾を指紋へ混ぜる本命は `main.rs` 側なので #1568 へ
 - 実測: 実 GUI の A/B（隔離・tako-vd。関門を外すと `C:\Program Files`、入れると cwd 由来 + 診断 1 行）・注入 7 通りすべて file:line 名指しで FAILED → 戻して緑・workspace 5113 passed 0 failed・clippy 3 宇宙 0・check-windows error 0
+
+## 2026-09-23（#1539: MCP ツールカタログを起動時ロードの予算対象にした）
+- 予算表（progress 12 KB / AGENTS 30 KB / import 40 KB / global 24 KB / system prompt 24 KB ≒ 130 KB）に MCP カタログの項目が無く、**それより大きい 201,535 バイト / 152 本が誰にも測られていなかった**。`ItemKind::McpCatalog` と `MCP_CATALOG_MAX_BYTES`（210 KB）を足し、採取を `tako_control::context_budget::mcp_catalog` の 1 実装へ寄せて `inventory` に載せた（CLI 表示 / `--json` / MCP `tako_context_budget` の 3 経路が同じ 1 件を見る）。測るのは snapshot ではなく実行時に組み立てた `mcp::tools()`。1 本の JSON なので行数は測らない（`lines: 0`）
+- 上限をバイトで置いた根拠 = 実トークナイザ tiktoken `o200k_base` で **52,028 トークン**（3.87 B/tok。参考 `cl100k_base` 62,997）に対し、日本語主体で較正した既存 `estimate_tokens` は 94,934 と**約 1.8 倍**に出る。210 KB は現状 +6.7% で、#1540 の圧縮後に締め直す前提をコードのコメントへ明記。`catalog.rs` は 1 行も触らない（#1540 と並走）
+- 実測: 出荷版との A/B（出荷版は `items` にも `budget` にも `mcp_catalog` のキーが無い）・注入 6 通りすべて FAILED → 戻して緑・棚卸しの上乗せは同一 debug ビルドの A/B で 0.01→0.02 秒・AGENTS.md 25309→25638 バイト（上限 30720）・workspace 5136 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。[提案] 3 件は #1567 へ
