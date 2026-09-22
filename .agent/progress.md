@@ -20,16 +20,6 @@
 
 ---
 
-## 2026-09-22（#1503: agent CLI の probe に待ち時間の上限を付けた）
-- 真因は setup の probe が全部 `Command::output()` で上限を持たないこと。とくに `claude mcp list` は登録済み MCP サーバへ 1 台ずつ繋ぐので 1 台無応答だと返らない（#1500 の R4 = 無言で 6 分ハング）。待ちの 1 実装を `tako_core::probe` へ置き、probe（既定 15 秒 = 実測 `mcp list` 4.57〜5.26 秒の約 3 倍）と dispatch `SetupRun`（既定 600 秒）を両方そこへ通した。超過は「確認できません（N 秒応答なし）」を出してその段だけ諦め、setup は完走する（#1501 の契約は維持）。上限を外す指定は作らない（env は値を変えるだけ・0 / 不正は既定へ）。読み切りにも予算を掛け（孫がパイプを持つと `output()` は返らない）、`Command` の組み立ても境界の中へ入れた（`platform_parity` の baseline は不変）
-- 途中で既存の番犬 2 本が自分の変更を捕まえた: `platform_parity`（#628。素の `Command::new` を境界の外に残していた）と `shell_scripts`（#837。`（${LEFTOVERS}）` の波括弧漏れ）。並列負荷下で単体テストが予算 30 秒を丸ごと使う回があったので、読み切りの猶予は 2 秒で頭打ちにした
-- 実測: `scripts/test-setup-probe-timeout-1503.sh` **28 PASS 0 FAIL**（CI 登録。修正後 7 秒で完走 / A/B `TAKO_1503_LEGACY=1` は 40 秒の締め切りまで無言で固まる）。番犬 6 本 + 注入 11 通りすべて file:line 名指しで FAILED → 戻して緑。回帰 5 本（#1499 / #1501 / #1502 / #1509 / multiagent）全緑・workspace 5127 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。[提案] 5 件は #1531〜#1535 へ
-
-## 2026-09-22（#1548: docs 生成が古い tako バイナリを黙って選ばないようにした）
-- `takoBin()` は debug → release の順に**存在する方**を返すだけで版を見ず、2 スクリプトに複製されていた。開発ツリーで debug だけ古いと（報告時の実測: debug v0.8.13 / release v0.8.17）`--check` が「同期していません」の**偽の赤**を出し、`--check` 無しでは docs が 8 日前へ静かに巻き戻る（CI はフレッシュビルドなので緑のまま手元だけが嘘をつく）。選択を `scripts/lib/tako-bin.mjs` の 1 実装へ寄せ、選んだバイナリの `--version` と `Cargo.toml` の `[workspace.package] version` が違えば生成も検査もせずに 1 行の理由で落とす
-- 倒した判断: **debug が古いとき release へ黙って逃げない**（手元の他スクリプトも既定は debug。直すのは 1 コマンドなので最簡形を出す = #322）。明示指定は新オプションではなく既存の env 名 `TAKO_BIN`（相対はリポジトリルート基準）。失敗はスタックトレースではなくメッセージ 1 本（`main()` + try/catch）
-- 実測: `scripts/test-gen-docs-bin-1548.sh` **46 PASS 0 FAIL**（CI 登録。テンポラリの偽リポジトリ + 版を埋め込んだスタブ。古い版には別内容の JSON を返させて巻き戻しを実際に観測）。注入 11 通りすべて FAILED → 戻して緑。生成内容・md・Rust 側は不変（生成物が本物と 1 バイト同じ）
-
 ## 2026-09-22（#760: 自動命名がシェルの実行ファイルパスを掴まないようにした）
 - Windows のコンソールタイトルはシェル / psmux **自身**のフルパスなので、`heuristic_plan()` が OSC タイトルを最優先すると 16 文字で切った `C:\Program Files` / `C:\Users\<user>\A` が**全タブ同じ名前**になっていた（9/9 実機レビュー = 初回起動の第一印象）。`shell_exe_material()` の関門で捨てて cwd へ落とす。cwd の末尾要素は `Path::file_name` をやめ `last_segment()` へ（Unix は `\` を区切りにしないので Windows 形の素材が丸ごと 1 要素になる。Windows 形と判定したときだけ `\` も見る）
 - 指紋（cwd / OSC タイトル / 実行状態）はシェル統合の無い Windows で 3 つとも不変 = 命名がペインを開いた直後の 1 回で終わる件は、`tick()` に「同じ指紋のままやり直した回数」を持たせ `STALE_RETRY_DELAYS`（5 分 → 20 分 → 60 分）で再発火する形にした（使い切れば静まる）。画面末尾を指紋へ混ぜる本命は `main.rs` 側なので #1568 へ
@@ -54,3 +44,8 @@
 - Issue が名指しした ☕ / 🌐 / 📌 / ⏏ は #217 で既に SVG 化済みで、残っていたのは 4 箇所 = `right_panel.rs` の `⠿`（U+283F）→ `ui_icon::GRIP` と `⬆`（U+2B06）→ `UNSHELVE`（**どちらも定数とアセットはあるのに参照 0 件 = 未配線**）・`preview_render.rs` の `↔`（U+2194）→ 新設 `SWAP`・`ui_text/preview.rs` の `▶\u{fe0e} 再生` → 語だけにして `PLAY` を render 側で並べる。最後の 1 件は**旧カタログ検査の範囲に U+25B6 が無くてすり抜けていた**形で、異体字セレクタでテキスト表示へ倒す書き方は逃げ道として認めない
 - 判定を `tako_core::emoji::is_emoji`（Unicode の Emoji プロパティ）の 1 実装へ寄せ、`ui_text` のカタログ検査と新番犬の両方が呼ぶ。番犬 `issue1536_no_emoji_ui_watchdog` は `crates/tako-app/src` の**本番コードの文字列リテラルの中身だけ**を見る（テスト領域は `production_range::scan`・コメントは新設した `code_view::literals_only` が落とす・`\u{XXXX}` も復号）。例外はファイル × 文字 × 件数 × 理由で、`main.rs` のセルフテストが流す claude TUI の画面データ 6 種 21 件だけ
 - 実測: 注入 12 通りすべて一致（絵文字を戻す 8 通りは file:line 名指しで FAILED・対照 4 通り = コメント / `#[cfg(test)]` / `×` / FE0E 単独は緑）。visual-test に `no-emoji` 節を足し、隔離 GUI（tako-vd）で復帰ボタンの実矩形が **14 色**。A/B で `ui_asset!("unshelve")` を外すと **1 色**（#562 の登録漏れ = 無言で描かれない）で落ちる。workspace 5118 passed 0 failed・clippy 3 宇宙 0
+
+## 2026-09-23（#1554: 復元の内訳が全ペインを説明するようにした）
+- 「復元成功: N タブ / M ペイン（…）」の内訳合計が M と合わない行が本番 52 行中 8 行あり、個別の spawn 失敗は `eprintln!` 止まり（GUI の stderr はどこにも出ない）で痕跡ゼロだった。AGENTS.md が「再起動後にエージェントが戻らないとき」の正本として案内している診断そのものの穴。無言の `continue` は Issue の 2 経路ではなく 5 経路（たまり場 / 退避タブ配下 / Web ビュー / spawn 失敗 / resume 入力の宛先なし）
+- **実測で差の正体は「たまり場・退避」だった**: 合わない 8 行はすべて #1487 着地（9/21）以降で、そのときの layout.json は 17 ペイン中 1 件がたまり場・1 件が退避タブ配下（Web ビューとプレビューは 0 件）。この 2 種は「表に出すときに起こす」設計なので失敗にせず別カテゴリで数える。件数・1 行目・2 行目の正本を `tako_control::restore_report` へ寄せ、区間（ラベルと件数）の列が合計の出どころ = カテゴリを 1 つ落とすと合計も落ちる形に。個別の失敗は `復元失敗（ペイン N）: <分類>: <エラー>` を 1 行ずつ、それでも合計が合わなければ食い違い自体を 1 行（FR-5.7.1 / A/B は `TAKO_1554_LEGACY=1`）
+- 実測: `scripts/test-restore-breakdown-1554.sh` **39 PASS 0 FAIL**（隔離 GUI で実 tako-app を 4 回起動。CI 未登録 = 実 GUI が要る）・単体 9 + 番犬 8・注入 12 通りすべて file:line 名指しで FAILED → 戻して緑・workspace 5144 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。[提案] = `$VAR` の直後の全角で bash が変数名へ取り込む罠（番犬候補）/ たまり場・退避のペインが復元で器を引き継がず「復帰」タブへ別ペインとして戻る（実測済み・要 Issue）

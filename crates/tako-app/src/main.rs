@@ -992,6 +992,30 @@ fn persist_diag(msg: &str) {
     tako_control::diag::persist_log(&msg);
 }
 
+/// 個別の復元失敗を**内訳へ数えて persist.log へ 1 行残す**（Issue #1554）。
+///
+/// 数えるだけでは「合計は合うのに、どのペインがなぜ戻らなかったか」が読めない。
+/// 逆に行だけ出して数えないと 1 行目の内訳が全ペインを説明しない。**両方を 1 か所で
+/// 済ませる**ので、復元ループの失敗の枝が片方だけ忘れる形にならない。
+///
+/// 載せるのはペイン ID と理由の分類（と spawn のエラー文）だけで、ペイン内容・
+/// 送信テキスト・トークンは出さない（`.agent/conventions.md` の診断ログ規約）。
+/// A/B（`TAKO_1554_LEGACY=1`）では数えも残しもしない = 修正前の症状を再現する
+fn record_restore_failure(
+    breakdown: &mut tako_control::restore_report::RestoreBreakdown,
+    pane: u64,
+    reason: tako_control::restore_report::FailureReason,
+    detail: Option<&str>,
+) {
+    if breakdown.is_legacy() {
+        return;
+    }
+    breakdown.record(tako_control::restore_report::PaneOutcome::Failed(reason));
+    persist_diag(&tako_control::restore_report::failure_line(
+        pane, reason, detail,
+    ));
+}
+
 /// #777 の検証専用の注入。`TAKO_777_INJECT` が `kind` を指しているときだけ、その場で
 /// **メインスレッドを止める**（戻らない）。
 ///
@@ -4316,21 +4340,56 @@ impl TakoApp {
                 .iter()
                 .flat_map(|t| t.tree().panes().into_iter().map(|p| p.id()))
                 .collect();
-            let mut reattached = 0usize;
-            let mut resumed_claude = 0usize;
-            let mut resumed_with_role = 0usize;
-            let mut fresh_shells = 0usize;
-            let mut restored_previews = 0usize;
-            // claude 以外（codex / agy）の resume 件数（#1238）。系統ごとに分けて数えるのは、
-            // 「戻らなかったのはどの系統か」が内訳ログだけで分かるようにするため
-            let mut resumed_other: HashMap<&'static str, (usize, usize)> = HashMap::new();
-            // 新規シェルへ落ちた理由の内訳（#1076。「なぜエージェントが出なかったか」を残す）
-            let mut fresh_reasons: HashMap<&'static str, usize> = HashMap::new();
+            // 復元の内訳（#1554）。件数・1 行目・2 行目の正本は
+            // `tako_control::restore_report` の 1 実装で、**このループのすべての出口が
+            // ちょうど 1 つ `record` する**（数え忘れた `continue` は内訳の合計を
+            // ペイン数より小さくし、実測で本番 persist.log の 52 行中 8 行が
+            // 全ペインを説明できていなかった）。
+            // 系統ごとの resume 件数（#1238）と新規シェルの理由（#1076）も同じ器が持つ
+            let mut breakdown = tako_control::restore_report::RestoreBreakdown::new();
+            // タブ配下に居ないペイン（たまり場 = FR-2.15.5 / 退避タブ = #1487）。
+            // どちらも**表に出すときに起こす**設計なので `spawn_session` を通らないのが
+            // 正しく、**復元の失敗ではない**（#1554）。実測 2026-09-22: 本番 layout.json は
+            // 17 ペインのうち 1 件がたまり場・1 件が退避タブ配下で、これが persist.log の
+            // 「内訳の合計が 1〜2 足りない」行（52 件中 8 件・すべて #1487 着地以降）の正体
+            let backgrounded: std::collections::HashSet<u64> = app
+                .workspace
+                .shelved_panes()
+                .iter()
+                .map(|p| p.id().as_u64())
+                .collect();
+            let shelved_tab_panes: std::collections::HashSet<u64> = app
+                .workspace
+                .shelved_tabs()
+                .iter()
+                .flat_map(|t| t.tab().tree().panes())
+                .map(|p| p.id().as_u64())
+                .collect();
             // セッションカタログ（#112）は復元ループの外で 1 回だけ読む。
             // 起動条件（役割 / model / effort）の出どころで、読めなければ最小形へ落ちる
             let catalog = tako_control::sessions::SessionCatalog::load().ok();
             for r in &restored {
                 let Some(&pane) = pane_ids.iter().find(|p| p.as_u64() == r.pane) else {
+                    // タブ配下に居ないペイン。たまり場・退避タブ配下なら**起こさないのが
+                    // 正しい**ので失敗と数えず、そのどちらでもなければ復元失敗（#1554。
+                    // 黙って飛ばすと内訳の合計がペイン数より小さい行になる）
+                    let hidden = if backgrounded.contains(&r.pane) {
+                        Some(tako_control::restore_report::HiddenKind::Backgrounded)
+                    } else if shelved_tab_panes.contains(&r.pane) {
+                        Some(tako_control::restore_report::HiddenKind::ShelvedTab)
+                    } else {
+                        None
+                    };
+                    match hidden {
+                        Some(kind) => breakdown
+                            .record(tako_control::restore_report::PaneOutcome::Hidden(kind)),
+                        None => record_restore_failure(
+                            &mut breakdown,
+                            r.pane,
+                            tako_control::restore_report::FailureReason::NotPlaced,
+                            None,
+                        ),
+                    }
                     continue;
                 };
                 // プレビューペイン（FR-3.2）はファイルを開き直すだけ（PTY は起動しない）
@@ -4365,7 +4424,7 @@ impl TakoApp {
                     // Code Runner: 復元経路でも実行プロファイルを検出する（#453）。
                     // 検出しないと再生ボタンが淡色（クリック無効）のまま表示される
                     app.detect_preview_run_profiles(pane, path);
-                    restored_previews += 1;
+                    breakdown.record(tako_control::restore_report::PaneOutcome::Preview);
                     continue;
                 }
                 // Web ビューペイン（FR-3.8 / #155）は URL を開き直すだけ（PTY は起動しない）。
@@ -4373,6 +4432,10 @@ impl TakoApp {
                 if let Some(url) = &r.webview {
                     app.pending_webview_restore
                         .push((Some(r.pane), url.clone()));
+                    // #1554: PTY を起こさないので 4 カテゴリのどれにも入らなかった
+                    // （実測の差はたまり場・退避が主因だが、Web ビューを 1 枚でも
+                    // 使えば同じ穴に落ちる）
+                    breakdown.record(tako_control::restore_report::PaneOutcome::Webview);
                     continue;
                 }
                 let backend_alive = r.session.as_ref().is_some_and(|name| {
@@ -4450,11 +4513,20 @@ impl TakoApp {
                     ..SpawnOptions::default()
                 };
                 if let Err(e) = app.spawn_session(pane, options, cx) {
+                    // #1554: GUI の stderr はどこにも出ないので、ここが唯一の痕跡になる
                     eprintln!("warning: ペイン {pane} を復元できない: {e}");
+                    record_restore_failure(
+                        &mut breakdown,
+                        pane.as_u64(),
+                        tako_control::restore_report::FailureReason::SpawnFailed,
+                        Some(&e.to_string()),
+                    );
                     continue;
                 }
                 match plan {
-                    RestorePlan::Reattach => reattached += 1,
+                    RestorePlan::Reattach => {
+                        breakdown.record(tako_control::restore_report::PaneOutcome::Reattached)
+                    }
                     RestorePlan::Resume {
                         agent,
                         command,
@@ -4466,22 +4538,25 @@ impl TakoApp {
                         // ペインも終了する）。
                         if let Some(session) = app.terminals.get(&pane) {
                             session.write(resume_input(&command));
-                            if agent == tako_core::agent_support::Agent::Claude {
-                                resumed_claude += 1;
-                                if with_role {
-                                    resumed_with_role += 1;
-                                }
-                            } else {
-                                let e = resumed_other.entry(agent.as_str()).or_insert((0, 0));
-                                e.0 += 1;
-                                e.1 += usize::from(with_role);
-                            }
+                            breakdown.record(tako_control::restore_report::PaneOutcome::Resumed {
+                                agent,
+                                with_role,
+                            });
+                        } else {
+                            // 起こせたのに投入先が無い = 会話は戻らない（#1554）。
+                            // 構造上は起きない（`spawn_session` の成功は登録を伴う）が、
+                            // 数えないと「エージェントが戻らない」1 件が無言で消える
+                            record_restore_failure(
+                                &mut breakdown,
+                                pane.as_u64(),
+                                tako_control::restore_report::FailureReason::ResumeNotDelivered,
+                                None,
+                            );
                         }
                     }
-                    RestorePlan::FreshShell(reason) => {
-                        fresh_shells += 1;
-                        *fresh_reasons.entry(reason.label()).or_insert(0usize) += 1;
-                    }
+                    RestorePlan::FreshShell(reason) => breakdown.record(
+                        tako_control::restore_report::PaneOutcome::FreshShell(reason),
+                    ),
                 }
             }
             if app.terminals.is_empty()
@@ -4493,56 +4568,21 @@ impl TakoApp {
                 persist_diag("fatal: 復元したペインを 1 つも起動できない");
                 std::process::exit(1);
             }
-            // claude 以外の resume（#1238）。**0 件なら 1 行目の形は従来のまま**
-            // （codex / agy を使っていない環境の見え方を変えない）
-            let mut other_agents: Vec<&'static str> = resumed_other.keys().copied().collect();
-            other_agents.sort_unstable();
-            let resumed_other_total: usize = resumed_other.values().map(|(n, _)| n).sum();
-            let other_segment: String = other_agents
-                .iter()
-                .map(|agent| format!("{agent} resume {} / ", resumed_other[agent].0))
-                .collect();
-            let report = format!(
-                "復元成功: {} タブ / {} ペイン（tmux 再 attach {} / Claude resume {} / {}新規シェル {} / プレビュー {}）",
-                app.workspace.tabs().len(),
-                restored.len(),
-                reattached,
-                resumed_claude,
-                other_segment,
-                fresh_shells,
-                restored_previews
-            );
+            // 1 行目（#1554 で全ペインを説明する形になった）。claude 以外の resume は
+            // 0 件なら出ないままなので、codex / agy を使っていない環境の見え方は不変
+            let report = breakdown.summary(app.workspace.tabs().len(), restored.len());
             app.restore_report = Some(report.clone());
             persist_diag(&report);
-            // 経路の内訳（#1076 / #1238）。1 行目の件数だけでは、エージェントが
+            // 2 行目 = 経路の内訳（#1076 / #1238）。1 行目の件数だけでは、エージェントが
             // 出なかった理由（ID なし / 形式不正 / 会話が見つからない / resume 非対応）が
-            // 分からず、同じ報告が何度も上がっていた
-            if resumed_claude + resumed_other_total + fresh_shells > 0 {
-                let mut reasons: Vec<String> = fresh_reasons
-                    .iter()
-                    .map(|(label, n)| format!("{label} {n}"))
-                    .collect();
-                reasons.sort();
-                let others: String = other_agents
-                    .iter()
-                    .map(|agent| {
-                        let (n, with_role) = resumed_other[agent];
-                        format!(
-                            " / {agent} resume {n}（役割つき {with_role} / 役割なし {}）",
-                            n - with_role
-                        )
-                    })
-                    .collect();
-                persist_diag(&format!(
-                    "復元の内訳: Claude resume {resumed_claude}（役割つき {resumed_with_role} / 役割なし {}）\
-                     {others} / 新規シェル {fresh_shells}{}",
-                    resumed_claude - resumed_with_role,
-                    if reasons.is_empty() {
-                        String::new()
-                    } else {
-                        format!("（{}）", reasons.join(" / "))
-                    }
-                ));
+            // 分からず、同じ報告が何度も上がっていた。#1554 で復元失敗の理由も載る
+            if let Some(detail) = breakdown.detail() {
+                persist_diag(&detail);
+            }
+            // 内訳が M を説明できていないなら、それ自体を 1 行残す（#1554）。
+            // 結末を記録しない経路が将来また増えても、二度と無言にはならない
+            if let Some(line) = breakdown.mismatch(restored.len()) {
+                persist_diag(&line);
             }
             // 復元時のプレビューも background でハイライト / 読み込みする
             for (pane, path, text) in std::mem::take(&mut app.pending_highlights) {
