@@ -116,6 +116,13 @@ jobs:
       # （#1501。#1500 の棚卸しでは新品環境で「setup を走らせても何も整わない」だった）
       - name: setup が詰まっても完走することの実経路テスト
         run: bash scripts/test-setup-continue-1501.sh
+      # `tako remote setup` の [1/5]（未導入の Tailscale をその場で入れる）の実経路テスト。
+      # 隔離 HOME / TAKO_DATA_DIR / PATH + brew スタブで、`TAKO_TAILSCALE_BIN` を
+      # 隔離 PATH の中へ向けて「未導入」を作るので実機の Tailscale にも tailnet の
+      # serve 設定にも触らない（スタブ tailscale は NeedsLogin を返すので [2/5] で止まる）。
+      # **導入が `setup_deps` を通らない形（brew の直叩き）へ戻ったらここで落ちる**（#1509）
+      - name: remote setup の依存導入の実経路テスト
+        run: bash scripts/test-remote-setup-deps-1509.sh
       # PR の CI 完了待ちのモックテスト。偽 gh を PATH に挿し、一時ディレクトリの偽リポジトリ
       # （.github/workflows つき）だけを相手にするので本番の PR には触らない。
       # **「出ているチェックが全部 pending でなければ完了」へ戻ったらここで落ちる**

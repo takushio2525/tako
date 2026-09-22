@@ -5,7 +5,7 @@
 //!
 //! ウィザードの流れ:
 //! 1. Tailscale 検出（GUI 版 / CLI 版両対応）
-//! 2. 未導入なら brew / App Store 案内 + その場インストール（y/N）
+//! 2. 未導入なら `setup_deps` の 1 実装でその場インストール（案内 → y/N → 再検出。#1509）
 //! 3. ログイン確認（未ログインならブラウザ認証へ誘導して待機）
 //! 4. MagicDNS + HTTPS 証明書の有効化確認
 //! 5. serve 設定
@@ -19,7 +19,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io;
 
+use crate::setup_deps;
 use crate::tailscale::{self, MissingItem, ServeState};
+
+/// `setup_deps` の依存表で Tailscale を指す名前（macOS / Windows で共通）
+const TAILSCALE_DEP: &str = "tailscale";
 
 /// remote setup のステップ結果。各ステップが何をしたかの記録
 #[derive(Debug, Clone, Serialize)]
@@ -47,7 +51,7 @@ pub struct RemoteSetupResult {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RemoteSetupAnswers {
-    /// true = 全質問に yes で回答（brew install 等）
+    /// true = 全質問に yes で回答（依存の導入等。対話版 `run_interactive` のみ）
     pub yes: Option<bool>,
     /// 使う Tailscale 系統（`gui` = GUI 版 / 既定探索、`standalone` = 自前の tailscaled）。
     /// 省略時は検出結果から決める（#1038: 2 系統が同居しうるので決め打ちしない）
@@ -420,51 +424,24 @@ pub fn run_interactive(
     if status.cli_path.is_none() {
         writeln!(writer, "未導入").map_err(|e| e.to_string())?;
         writeln!(writer).map_err(|e| e.to_string())?;
-        writeln!(
-            writer,
-            "Tailscale が必要です。以下のいずれかの方法でインストールしてください:"
-        )
-        .map_err(|e| e.to_string())?;
-        writeln!(
-            writer,
-            "  - App Store で「Tailscale」を検索してインストール"
-        )
-        .map_err(|e| e.to_string())?;
-        writeln!(writer, "  - brew install tailscale").map_err(|e| e.to_string())?;
-        writeln!(writer).map_err(|e| e.to_string())?;
-
-        if auto_yes || ask_yes_no(writer, "brew install tailscale を実行しますか?")? {
-            writeln!(writer, "  brew install tailscale を実行中...").map_err(|e| e.to_string())?;
-            let install_result = std::process::Command::new("brew")
-                .args(["install", "tailscale"])
-                .status();
-            match install_result {
-                Ok(s) if s.success() => {
-                    writeln!(writer, "  インストール完了").map_err(|e| e.to_string())?;
-                }
-                _ => {
-                    writeln!(
-                        writer,
-                        "  インストールに失敗しました。手動でインストールしてください。"
-                    )
-                    .map_err(|e| e.to_string())?;
-                    return Err(
-                        "Tailscale のインストールに失敗。手動でインストールしてください。".into(),
-                    );
-                }
+        match install_tailscale(auto_yes, writer)? {
+            Some(path) => {
+                writeln!(writer, "  導入しました: {path}").map_err(|e| e.to_string())?;
             }
-            // 再検出
-            let status = tailscale::setup_status();
-            if status.cli_path.is_none() {
-                return Err("インストール後も Tailscale を検出できません。".into());
+            None => {
+                writeln!(
+                    writer,
+                    "インストール後に再度 `tako remote setup` を実行してください。"
+                )
+                .map_err(|e| e.to_string())?;
+                return Err("Tailscale が未導入".into());
             }
-        } else {
-            writeln!(
-                writer,
-                "インストール後に再度 `tako remote setup` を実行してください。"
-            )
-            .map_err(|e| e.to_string())?;
-            return Err("Tailscale が未導入".into());
+        }
+        // 導入できたと言えるかは**この先の段が引けるか**で決まる。`setup_deps` の
+        // 再検出（`exe::find`）と remote の解決規則（`find_tailscale`）は
+        // 見る場所が違うので、ここでもう一度 remote 側の規則で確かめる
+        if tailscale::setup_status().cli_path.is_none() {
+            return Err("インストール後も Tailscale を検出できません。".into());
         }
     } else {
         writeln!(writer, "OK ({})", status.cli_path.as_deref().unwrap_or("?"))
@@ -621,15 +598,48 @@ pub fn run_interactive(
     }))
 }
 
-/// stdin から y/N を読む。デフォルトは No
-fn ask_yes_no(writer: &mut dyn io::Write, prompt: &str) -> Result<bool, String> {
-    write!(writer, "{prompt} [y/N] ").map_err(|e| e.to_string())?;
-    let _ = writer.flush();
-    let mut input = String::new();
-    io::stdin()
-        .read_line(&mut input)
-        .map_err(|e| e.to_string())?;
-    Ok(input.trim().eq_ignore_ascii_case("y") || input.trim().eq_ignore_ascii_case("yes"))
+/// 未導入の Tailscale をその場で入れる（#1509）。戻り値は導入できたパス。
+///
+/// 判断（`--yes` / 端末の有無 / 導入器の有無）・実行・再検出は
+/// [`crate::setup_deps`] の 1 実装（`offer_and_install`）を通す。
+/// **ここで導入器（brew）を直に起こさない**: 直叩きだと `tako setup` の依存
+/// チェック段と体験が割れ、「brew が無い」「非 TTY」「入れたのに見つからない」の
+/// 扱いを 2 か所で持つことになる（#1509 で直したのがまさにその形）
+fn install_tailscale(auto_yes: bool, writer: &mut dyn io::Write) -> Result<Option<String>, String> {
+    let Some(state) = setup_deps::status_of(TAILSCALE_DEP) else {
+        // この環境の依存表に Tailscale が無い = 自動導入の手段を持たない
+        writeln!(writer, "{}", MissingItem::CliNotFound.describe()).map_err(|e| e.to_string())?;
+        return Ok(None);
+    };
+    // 代行できるときは**入れ方を並べない**（#322 の最簡形。y を押せば済む場面で
+    // 2 択を見せない）。代行できないときは `manual_hint_line` が
+    // 依存表の hint（App Store 版を含む）を理由つきで出す
+    writeln!(writer, "Tailscale が必要です。").map_err(|e| e.to_string())?;
+    let ctx = setup_deps::DepOfferContext {
+        // `remote setup` は弾 6 から明示対話型（plan §5.5 導線 A）= 導入まで行う段
+        stage_installs: true,
+        review: false,
+        assume_yes: auto_yes,
+        stdin_is_terminal: io::IsTerminal::is_terminal(&io::stdin()),
+        // #1499 の A/B は「標準 setup が聞くか」の軸。`remote setup` は
+        // もともと聞いていた経路なので対象外（legacy で聞かなくなるのは退行）
+        legacy: false,
+    };
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    let outcome = setup_deps::offer_and_install(
+        &state,
+        ctx,
+        &mut setup_deps::DepPromptIo {
+            writer,
+            reader: &mut reader,
+            indent: "  ",
+        },
+    )?;
+    Ok(match outcome {
+        setup_deps::DepOutcome::Installed(path) => Some(path),
+        setup_deps::DepOutcome::NotInstalled => None,
+    })
 }
 
 /// `tako remote setup` の状態チェック（非対話。status 用途）
