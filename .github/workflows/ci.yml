@@ -74,6 +74,12 @@ jobs:
         run: node scripts/gen-windows-support-docs.mjs --check
       - name: エージェント対応状況ページがマトリクスと同期している
         run: node scripts/gen-agent-support-docs.mjs --check
+      # 上の 2 つが「どの tako を使うか」を間違えないことの検査。以前は
+      # target/debug → target/release の順に**存在する方**を返すだけだったので、
+      # debug だけ古い開発ツリーでは偽の赤と docs の静かな巻き戻しが起きた（#1548）。
+      # 版の突き合わせ・TAKO_BIN・実装 1 か所が壊れたらここで落ちる
+      - name: docs 生成が選ぶ tako バイナリのテスト
+        run: bash scripts/test-gen-docs-bin-1548.sh
       # リリース経路（gh release create のリトライ / 両 OS の待ち合わせ / 片肺の検出）の
       # モックテスト。ダミー gh を PATH に挿すので本番の Release には触らない。
       # **片肺リリースの検出が壊れたらここで落ちる**（#256 / #965）
