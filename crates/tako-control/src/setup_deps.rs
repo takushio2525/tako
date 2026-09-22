@@ -35,6 +35,8 @@
 //! 読んで表示するだけ。A/B は `TAKO_1499_LEGACY=1`（標準 setup が聞かない
 //! = #1499 前の挙動）
 
+use std::io::{BufRead, Write};
+
 use serde_json::{json, Value};
 use tako_core::platform::support::Platform;
 
@@ -363,20 +365,30 @@ pub fn resolve(dep: &ExternalDep) -> Option<String> {
 
 /// 依存の検出（読み取りだけ）
 pub fn status() -> Vec<DepStatus> {
-    current_deps()
-        .into_iter()
-        .map(|dep| {
-            let found = resolve(&dep);
-            let installer_found = dep
-                .installer
-                .and_then(|i| tako_core::platform::exe::find(i.program()));
-            DepStatus {
-                dep,
-                found,
-                installer_found,
-            }
-        })
-        .collect()
+    current_deps().into_iter().map(probe).collect()
+}
+
+/// 依存 1 件だけを検出する（#1509）。
+///
+/// `status()` はこの環境の依存すべてを解決するので、unix では
+/// `exe::find`（ログインシェル起動）が件数ぶん走る。**1 件で足りる呼び手**
+/// （`tako remote setup` は tailscale しか見ない）はこちらを通す。
+/// 名前がこの環境の依存表に無ければ `None`（推測で作らない）
+pub fn status_of(bin: &str) -> Option<DepStatus> {
+    current_deps().into_iter().find(|d| d.bin == bin).map(probe)
+}
+
+/// 依存 1 件の検出（`status` / `status_of` が共有する 1 実装）
+fn probe(dep: ExternalDep) -> DepStatus {
+    let found = resolve(&dep);
+    let installer_found = dep
+        .installer
+        .and_then(|i| tako_core::platform::exe::find(i.program()));
+    DepStatus {
+        dep,
+        found,
+        installer_found,
+    }
 }
 
 /// その依存が「永続化の器」か（名前の解決規則が他と違う）
@@ -535,6 +547,186 @@ fn run_installer(program: &str, installer: DepInstaller, interactive: bool) -> R
     ))
 }
 
+// --- 未検出の依存 1 件をその場で入れる（#1499 → #1509 で「体験」ごと 1 実装へ）---
+//
+// #1499 で判断（`offer_for`）と実行（`install`）は 1 実装になったが、
+// `tako remote setup` の [1/5] は「案内を出して y/N を聞いて `brew` を起こす」を
+// **自前で組み直して**いた（導入器の直叩き / 導入器の有無を見ない / 再検出なし /
+// 失敗で即中断）。判断と実行だけを共有して表示と確認を各呼び手に残すと、
+// 同じ体験が 2 か所で組み上がって片方だけ直る退行が戻るので、
+// **案内 → 確認 → 導入 → 再検出のひと続き**をここへ置く（#1509）。
+
+/// 案内・確認の入出力口。**字下げだけ**呼び手の段組みに合わせる
+pub struct DepPromptIo<'a> {
+    /// 案内・確認の書き出し先
+    pub writer: &'a mut dyn Write,
+    /// `[y/N]` の読み取り元
+    pub reader: &'a mut dyn BufRead,
+    /// 行頭の字下げ（`tako setup` は 6 マス / `tako remote setup` は 2 マス）
+    pub indent: &'a str,
+}
+
+/// [`offer_and_install`] の結末。**呼び手はこれを見て次を決める**
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DepOutcome {
+    /// 導入して**引けるようになった**（再検出で得たパス）
+    Installed(String),
+    /// 導入しなかった / できなかった（**理由は表示済み**）
+    NotInstalled,
+}
+
+/// 「何を・どの導入器で・どこへ入れるか」の 1 行（#1499。聞く前に必ず見せる）
+pub fn install_plan_line(state: &DepStatus) -> Option<String> {
+    let installer = state.dep.installer?;
+    let command = installer.command_line();
+    let Some(program) = state.installer_path() else {
+        return Some(format!("導入: {command}"));
+    };
+    let program_display = tako_core::paths::shorten_home(program);
+    Some(match install_dir(installer, program) {
+        Some(dir) => format!(
+            "導入: {command}（導入器 {program_display} → {} へ入ります）",
+            tako_core::paths::shorten_home(&dir)
+        ),
+        None => format!("導入: {command}（導入器 {program_display}）"),
+    })
+}
+
+/// tako が代行できないときに「人が打つべきコマンド」の 1 行
+pub fn manual_hint_line(state: &DepStatus) -> String {
+    let dep = state.dep;
+    let Some(installer) = dep.installer else {
+        return format!("導入方法: {}", dep.hint);
+    };
+    // brew が無いのは macOS で一番多い詰まり方。Homebrew は管理者パスワードを
+    // 求めるため tako は導入を代行しない（#868）
+    let note = if installer.program() == "brew" && state.installer_path().is_none() {
+        "（要 Homebrew: https://brew.sh）"
+    } else {
+        ""
+    };
+    format!(
+        "導入方法: {}{note} / {}",
+        installer.command_line(),
+        dep.hint
+    )
+}
+
+/// 「いま入れる」の最簡形案内（#322）。導入手段が無い依存には出さない
+pub fn deps_install_hint(state: &DepStatus) -> Option<String> {
+    let command = state.dep.installer?.command_line();
+    Some(format!(
+        "いま入れる: tako setup deps install   （{command} 相当）"
+    ))
+}
+
+/// 未検出の依存 1 件を、文脈に従って「案内 →（必要なら）確認 → 導入 → 再検出」する。
+///
+/// 判断は [`offer_for`]（理由を返す純粋関数）・導入は [`install`]・再検出は
+/// [`resolve`] を通る。**導入器をここ以外で起こさない**のが #1509 の不変条件で、
+/// 番犬 `crates/tako-control/tests/issue1509_dep_install_watchdog.rs` が
+/// 直叩きの再登場を `file:line` で落とす
+pub fn offer_and_install(
+    state: &DepStatus,
+    ctx: DepOfferContext,
+    io: &mut DepPromptIo<'_>,
+) -> Result<DepOutcome, String> {
+    let dep = state.dep;
+    match offer_for(state.can_tako_install(), ctx) {
+        DepOffer::Guide(GuideReason::CannotRun) => {
+            say(io, &manual_hint_line(state))?;
+            return Ok(DepOutcome::NotInstalled);
+        }
+        DepOffer::Guide(reason) => {
+            say_plan(io, state)?;
+            if let Some(hint) = deps_install_hint(state) {
+                say(io, &hint)?;
+            }
+            // 「聞けたはずなのに聞かなかった」ときだけ理由を出す
+            if let Some(note) = reason.note() {
+                say(io, note)?;
+            }
+            return Ok(DepOutcome::NotInstalled);
+        }
+        DepOffer::Ask => {
+            say_plan(io, state)?;
+            write!(
+                io.writer,
+                "{}{} をインストールしますか？ [y/N]: ",
+                io.indent, dep.bin
+            )
+            .map_err(|e| e.to_string())?;
+            let _ = io.writer.flush();
+            let mut input = String::new();
+            if io.reader.read_line(&mut input).is_err() {
+                writeln!(io.writer).map_err(|e| e.to_string())?;
+                say(
+                    io,
+                    "入力を読めませんでした（後から `tako setup deps install` で導入できます）",
+                )?;
+                return Ok(DepOutcome::NotInstalled);
+            }
+            let answer = input.trim().to_ascii_lowercase();
+            if answer != "y" && answer != "yes" {
+                say(
+                    io,
+                    "スキップしました（後から `tako setup deps install` で導入できます）",
+                )?;
+                return Ok(DepOutcome::NotInstalled);
+            }
+        }
+        DepOffer::AutoInstall => {
+            say_plan(io, state)?;
+            say(io, "--yes のため確認を省略してインストールします")?;
+        }
+    }
+    match install(
+        Some(dep.bin),
+        DepInstallOptions {
+            dry_run: false,
+            // 端末を持つ経路から呼ばれるので導入器の進捗をそのまま流す
+            interactive: true,
+        },
+    ) {
+        // `install` は「引けるようになった」ものだけ `installed` へ載せる
+        Ok(value) => {
+            Ok(installed_path(&value, dep.bin)
+                .map_or(DepOutcome::NotInstalled, DepOutcome::Installed))
+        }
+        Err(e) => {
+            // 導入に失敗しても**呼び手を止めない**。次の一手へ落とす（#1499）
+            say(io, &format!("[警告] {e}"))?;
+            if let Some(hint) = deps_install_hint(state) {
+                say(io, &hint)?;
+            }
+            Ok(DepOutcome::NotInstalled)
+        }
+    }
+}
+
+/// 導入計画の 1 行を出す（手段が無い依存では何も出ない）
+fn say_plan(io: &mut DepPromptIo<'_>, state: &DepStatus) -> Result<(), String> {
+    match install_plan_line(state) {
+        Some(line) => say(io, &line),
+        None => Ok(()),
+    }
+}
+
+/// 字下げつきで 1 行出す
+fn say(io: &mut DepPromptIo<'_>, line: &str) -> Result<(), String> {
+    writeln!(io.writer, "{}{line}", io.indent).map_err(|e| e.to_string())
+}
+
+/// [`install`] の応答から、その依存が実際に引けるようになったパスを取る
+fn installed_path(value: &Value, bin: &str) -> Option<String> {
+    value["installed"]
+        .as_array()?
+        .iter()
+        .find(|e| e["bin"].as_str() == Some(bin))
+        .and_then(|e| e["path"].as_str())
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -680,6 +872,179 @@ mod tests {
         .expect("計画は作れる");
         assert_eq!(value["performed"], false);
         assert!(value["installed"].as_array().is_some_and(|a| a.is_empty()));
+    }
+
+    // --- 案内 → 確認 → 導入 → 再検出の 1 実装（#1509）------------------------
+    //
+    // **`install` が走る腕はここでは試さない**（実機の brew を起こしてしまう）。
+    // 導入まで通す検査は実経路テスト `scripts/test-remote-setup-deps-1509.sh`
+    // （隔離 HOME + brew スタブ）の担当
+
+    /// 検出結果を組み立てる（導入器の解決結果まで指定できるのはこのモジュールだけ）
+    fn fake_status(installer: Option<DepInstaller>, installer_found: Option<&str>) -> DepStatus {
+        DepStatus {
+            dep: ExternalDep {
+                bin: "tailscale",
+                required: false,
+                purpose: "テスト",
+                installer,
+                hint: "App Store で「Tailscale」を検索",
+            },
+            found: None,
+            installer_found: installer_found.map(str::to_string),
+        }
+    }
+
+    fn run_offer(state: &DepStatus, ctx: DepOfferContext, input: &str) -> (DepOutcome, String) {
+        let mut out: Vec<u8> = Vec::new();
+        let mut reader = input.as_bytes();
+        let outcome = offer_and_install(
+            state,
+            ctx,
+            &mut DepPromptIo {
+                writer: &mut out,
+                reader: &mut reader,
+                indent: "  ",
+            },
+        )
+        .expect("書き出しは失敗しない");
+        (outcome, String::from_utf8(out).expect("UTF-8"))
+    }
+
+    fn ask_ctx() -> DepOfferContext {
+        DepOfferContext {
+            stage_installs: true,
+            review: false,
+            assume_yes: false,
+            stdin_is_terminal: true,
+            legacy: false,
+        }
+    }
+
+    /// 聞く前に「何を・どの導入器で・どこへ」を出す
+    #[test]
+    fn 導入計画は入る場所まで出す() {
+        let brew = DepInstaller::Brew { pkg: "tailscale" };
+        let state = fake_status(Some(brew), Some("/opt/homebrew/bin/brew"));
+        assert_eq!(
+            install_plan_line(&state).as_deref(),
+            Some("導入: brew install tailscale（導入器 /opt/homebrew/bin/brew → /opt/homebrew/bin へ入ります）")
+        );
+        // `<prefix>/bin/brew` の形でない導入器は置き場を**答えない**（推測を見せない）
+        let odd = fake_status(Some(brew), Some("/tmp/stub/brew"));
+        assert_eq!(
+            install_plan_line(&odd).as_deref(),
+            Some("導入: brew install tailscale（導入器 /tmp/stub/brew）")
+        );
+    }
+
+    /// 代行できないときは「人が打つべきコマンド」を理由つきで出す
+    #[test]
+    fn 代行できないときは打つ手を見せる() {
+        let brew = DepInstaller::Brew { pkg: "tailscale" };
+        // 導入器がこの環境に無い = brew から入れられない
+        let state = fake_status(Some(brew), None);
+        let (outcome, out) = run_offer(&state, ask_ctx(), "y\n");
+        assert_eq!(outcome, DepOutcome::NotInstalled, "入れずに終わる");
+        assert!(
+            out.contains("導入方法: brew install tailscale（要 Homebrew: https://brew.sh）"),
+            "{out}"
+        );
+        // 依存表の hint（App Store 版）もここで出る
+        assert!(out.contains("App Store で「Tailscale」を検索"), "{out}");
+        assert!(!out.contains("[y/N]"), "代行できないのに聞いている: {out}");
+    }
+
+    /// 端末があれば `[y/N]` を出し、N は入れずに次の一手へ落とす
+    #[test]
+    fn nは入れずに次の一手へ落とす() {
+        let state = fake_status(
+            Some(DepInstaller::Brew { pkg: "tailscale" }),
+            Some("/opt/homebrew/bin/brew"),
+        );
+        let (outcome, out) = run_offer(&state, ask_ctx(), "n\n");
+        assert_eq!(outcome, DepOutcome::NotInstalled);
+        assert!(
+            out.contains("tailscale をインストールしますか？ [y/N]: "),
+            "{out}"
+        );
+        assert!(
+            out.contains("スキップしました（後から `tako setup deps install` で導入できます）"),
+            "{out}"
+        );
+    }
+
+    /// 答えが読めない（EOF）ときも止まらず案内で終わる
+    #[test]
+    fn 答えが無ければ案内で終わる() {
+        let state = fake_status(
+            Some(DepInstaller::Brew { pkg: "tailscale" }),
+            Some("/opt/homebrew/bin/brew"),
+        );
+        let (outcome, out) = run_offer(&state, ask_ctx(), "");
+        assert_eq!(outcome, DepOutcome::NotInstalled);
+        assert!(out.contains("スキップしました"), "{out}");
+    }
+
+    /// 端末が無ければ聞かずに最簡形の案内 + 理由（黙って飛ばさない）
+    #[test]
+    fn 端末が無ければ理由つきで案内へ落ちる() {
+        let state = fake_status(
+            Some(DepInstaller::Brew { pkg: "tailscale" }),
+            Some("/opt/homebrew/bin/brew"),
+        );
+        let ctx = DepOfferContext {
+            stdin_is_terminal: false,
+            ..ask_ctx()
+        };
+        let (outcome, out) = run_offer(&state, ctx, "y\n");
+        assert_eq!(outcome, DepOutcome::NotInstalled);
+        assert!(!out.contains("[y/N]"), "端末が無いのに聞いている: {out}");
+        assert!(
+            out.contains("いま入れる: tako setup deps install   （brew install tailscale 相当）"),
+            "{out}"
+        );
+        assert!(out.contains("（端末が無いので確認を省きました）"), "{out}");
+    }
+
+    /// 読み取りだけの経路（`tako setup --check`）は何も入れない・何も聞かない
+    #[test]
+    fn 読み取りだけの経路は入れない() {
+        let state = fake_status(
+            Some(DepInstaller::Brew { pkg: "tailscale" }),
+            Some("/opt/homebrew/bin/brew"),
+        );
+        let ctx = DepOfferContext {
+            stage_installs: false,
+            ..ask_ctx()
+        };
+        let (outcome, out) = run_offer(&state, ctx, "y\n");
+        assert_eq!(outcome, DepOutcome::NotInstalled);
+        assert!(!out.contains("[y/N]"), "{out}");
+    }
+
+    /// 字下げは呼び手が決める（`remote setup` は 2 マス / `tako setup` は 6 マス）
+    #[test]
+    fn 字下げは呼び手が決める() {
+        let state = fake_status(
+            Some(DepInstaller::Brew { pkg: "tailscale" }),
+            Some("/opt/homebrew/bin/brew"),
+        );
+        let (_, out) = run_offer(&state, ask_ctx(), "n\n");
+        for line in out.lines().filter(|l| !l.trim().is_empty()) {
+            assert!(line.starts_with("  "), "字下げが付いていない行: {line:?}");
+        }
+    }
+
+    /// 1 件だけ引く口は依存表と同じものを返す（推測で作らない）
+    #[test]
+    fn status_ofは依存表の1件を返す() {
+        for state in status() {
+            let single = status_of(state.dep.bin).expect("依存表にある名前");
+            assert_eq!(single.dep.bin, state.dep.bin);
+            assert_eq!(single.can_tako_install(), state.can_tako_install());
+        }
+        assert!(status_of("nosuchtool").is_none(), "知らない名前は None");
     }
 
     /// 導入済みのものは触らない（冪等）

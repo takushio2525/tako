@@ -855,7 +855,8 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
             1,
             "対話起動 1 箇所（setup アシスタント本体 = 引き継ぎ先エージェントの起動と共用）。\
              対話子は端末を継承させる必要があるので塞がない。\
-             #1057 で `brew install` の起動は `setup_deps`（境界経由）へ移した",
+             #1057 で `brew install` の起動は `setup_deps`（境界経由）へ移し、\
+             #1509 で `remote_setup` の直叩き（素の起動 1 件）も同じ経路へ寄せた",
         ),
         (
             "crates/tako-control/src/agents.rs",
@@ -882,11 +883,6 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
             "crates/tako-control/src/remote.rs",
             6,
             "`/bin/sh` / `/bin/sleep`（`#[cfg(unix)]` とテスト）。ゾンビ判定の `/bin/ps` は              #1067 で境界（`platform::process::is_zombie`）へ移し、抑止を通している",
-        ),
-        (
-            "crates/tako-control/src/remote_setup.rs",
-            1,
-            "`brew install` の対話実行。進捗をユーザーの端末に出す必要があるため素で起動する",
         ),
         (
             "crates/tako-control/src/sleep_guard.rs",
