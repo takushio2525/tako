@@ -6,7 +6,8 @@
 //!
 //! - `cargo build --workspace` が blocking — だが `tests/` のターゲットは作らない
 //! - `cargo test --workspace` は `continue-on-error: true`（#583。POSIX 前提の
-//!   既存テストが落ちているあいだテスト結果を非ブロッキングにしている）
+//!   既存テストが落ちているあいだテスト結果を非ブロッキングにしていた。
+//!   **#1278 で解除した**ので現在は blocking）
 //!
 //! という組み合わせだったので、**Windows のテストが 1 件も走らない壊れ方が
 //! 両ジョブをすり抜けた**（#1264。#1199 の検証ブロックが変数の無い関数へ入り
@@ -17,18 +18,21 @@
 //! （`cargo test --workspace --no-run`）。テスト結果の扱い（#583）は変えない。
 //! そのステップが消える / 非ブロッキングへ倒されると同じ穴が開くので、ここで拘束する。
 //!
-//! ## 狭く絞った blocking なテストは許す（#1282）
+//! ## 現行契約（#1278 で更新）
 //!
-//! 据え置くのは「**ワークスペース全体**の結果を blocking にしない」であって、
-//! 「blocking なテストを 1 本も置かない」ではない。macOS では 1 行も実行できない
-//! コード（Windows の Win32 FFI 等）は、名指しの小さなステップで実際に走らせないと
-//! 誰も検査できない。しかも `cargo test --workspace` は **tako-app の既知失敗で
-//! そこで打ち切られ、以降のクレートは 1 件も走らない**（実測 2026-09-11:
-//! `622 passed / 1 failed` で終了）ので、ぶら下げても走らない。
+//! 1. `cargo test --workspace --no-run` = **コンパイルだけ**を見る blocking ステップ（#1264）
+//! 2. `cargo test --workspace --no-fail-fast` = **結果まで** blocking（#1278）。
+//!    `--no-fail-fast` が要るのは、既定の cargo が最初に落ちたテストバイナリで打ち切り、
+//!    その先のクレートを 1 件も走らせないため（実測 2026-09-22 の main: tako-app の
+//!    1 件で止まり tako-control / tako-core は 0 件）。全数が採れないと
+//!    「直したら次が出る」を 1 PR 1 往復でしか進められない
+//! 3. 名指しの小さな実行ステップ（Win32 FFI = #1282 / psmux = #1314）は blocking のまま
+//!    **`--workspace` を付けてはいけない**。全数ステップを 1 本に保ち、
+//!    「どのステップが何を見たか」をログから読めるようにするため
 //!
-//! そこで規則を精密化する: `--workspace` のテスト実行は 1 本だけ・非ブロッキングのまま、
-//! **それ以外の `cargo test` 実行ステップは `--workspace` を付けてはいけない**
-//! （付けられると #583 の方針が裏口から blocking へ倒れる）。
+//! Windows に存在しない仕組みを見るテストは、**理由つきで名指し skip**
+//! （`#[cfg(...)]` / `#[cfg_attr(windows, ignore = "理由")]`）へ寄せた。
+//! 理由の無い skip が増えないことは `issue1278_ignore_reason_watchdog` が見る。
 
 use std::path::{Path, PathBuf};
 
@@ -115,8 +119,14 @@ fn windowsジョブがテストのコンパイルをblockingで検査する() {
     );
 }
 
+/// #1278: ワークスペース全体のテスト結果が **blocking** で、しかも
+/// **全数が採れる形**（`--no-fail-fast`）で回っていること。
+///
+/// #583 はここを `continue-on-error: true` で据え置いていたが、そのあいだに
+/// Windows の未検出が溜まり、実機のベースラインが 19 → 24 件まで増えた（#1278）。
+/// 倒し戻されると同じことが起きるので、両方をここで拘束する
 #[test]
-fn テスト結果の非ブロッキング_583_は据え置かれている() {
+fn windowsジョブのテスト結果がblockingで全数を採る() {
     let ci = ci_yaml();
     let job = without_comments(&windows_job(&ci));
     let run: Vec<String> = steps(&job)
@@ -129,15 +139,21 @@ fn テスト結果の非ブロッキング_583_は据え置かれている() {
         workspace.len(),
         1,
         "Windows ジョブの `cargo test --workspace` 実行ステップが 1 本でない\
-         （#583 の扱いが変わった？）\n{job}"
+         （#1278 / #583 の扱いが変わった？）\n{job}"
     );
     assert!(
-        workspace[0].contains("continue-on-error: true"),
-        "#1264 のコンパイル検査を足すついでにテスト結果まで blocking へ倒してはいけない\
-         （POSIX 前提の既存失敗が残っているあいだは #583 の方針を据え置く）\n{}",
+        !workspace[0].contains("continue-on-error"),
+        "Windows のテスト結果が非ブロッキングへ戻されている（#1278 で blocking 化した。\
+         非ブロッキングだと壊れても緑のまま通り、実機のベースラインが黙って増える）\n{}",
         workspace[0]
     );
-    // #1282: 名指しの小さな検査は blocking で置いてよいが、**ワークスペース全体を
+    assert!(
+        workspace[0].contains("--no-fail-fast"),
+        "全数が採れない（#1278）。既定の cargo は最初に落ちたテストバイナリで打ち切るので、\
+         その先のクレートが 1 件も走らない = 1 回の CI で 1 件しか直せない\n{}",
+        workspace[0]
+    );
+    // #1282 / #1314: 名指しの小さな検査は blocking で置いてよいが、**ワークスペース全体を
     // 巻き込んではいけない**（上で 1 本に絞ってあるので、ここは念のための二重化）
     for step in scoped {
         assert!(

@@ -500,22 +500,40 @@ mod tests {
         )));
     }
 
+    /// #944 の不変条件: テストプロセスは**製品の置き場**へ書かない。
+    ///
+    /// #1278 まで「ホーム配下でない」で見ていたが、これは macOS 形の言い換えだった。
+    /// Windows の `%TEMP%` は `C:\Users\<winuser>\AppData\Local\Temp` =
+    /// **必ずホーム配下**なので、どう直しても成立しない不変条件を見ていたことになる。
+    /// 守りたいことを直接書くほうが強い（製品の置き場と同じ / その配下は禁止・
+    /// かつ一時ディレクトリの中にいる）
     #[test]
-    fn テストプロセスのdata_dirはホーム配下を指さない() {
+    fn テストプロセスのdata_dirは製品の置き場を指さない() {
         // このテスト自身がテストバイナリなので、判定は必ず真になる
         assert!(is_test_process(), "テストバイナリで is_test_process が偽");
         // `TAKO_DATA_DIR` が明示されている環境（隔離セルフテスト等）はそちらが優先。
-        // 明示が無いときだけ「ホーム配下でない」ことを見る
+        // 明示が無いときだけ隔離先の性質を見る
         if std::env::var_os("TAKO_DATA_DIR").is_none_or(|v| v.is_empty()) {
             let dir = data_dir().expect("テストプロセスでは必ず解決する");
             assert_eq!(dir, test_data_dir());
-            if let Some(home) = home_dir() {
+            if let Some(product) = default_data_dir() {
+                assert_ne!(
+                    dir,
+                    product,
+                    "テストの data_dir が製品の置き場と同じ: {}",
+                    dir.display()
+                );
                 assert!(
-                    !dir.starts_with(&home),
-                    "テストの data_dir がホーム配下を指している: {}",
+                    !dir.starts_with(&product),
+                    "テストの data_dir が製品の置き場の配下: {}",
                     dir.display()
                 );
             }
+            assert!(
+                dir.starts_with(std::env::temp_dir()),
+                "テストの data_dir が一時ディレクトリの外: {}",
+                dir.display()
+            );
         }
     }
 }

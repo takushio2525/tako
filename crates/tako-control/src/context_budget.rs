@@ -791,7 +791,14 @@ mod tests {
             !shown.contains(&user),
             "表示用パスにユーザー名が残っている: {shown}"
         );
-        assert!(shown.starts_with("~/.claude/projects/"));
+        // 区切りは**元の文字をそのまま残す**のが `shorten_home` の契約なので、
+        // Windows では `~\.claude/projects/…` になる（#1278）。
+        // 見たいのは「`~` 起点でスラグの位置まで畳めている」ことなので区切りを正規化する
+        let normalized = shown.replace('\\', "/");
+        assert!(
+            normalized.starts_with("~/.claude/projects/"),
+            "`~` 起点に畳めていない: {shown}"
+        );
     }
 
     /// #1154: `fix` で直せないものだけが超えているときに `fix` を案内しない

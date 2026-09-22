@@ -646,13 +646,16 @@ mod tests {
         // 起点が分かっていない（`merge_repo` 直呼び）なら絞らない
         assert_eq!(map.sorted_entries().len(), 6);
         // 起点が `/link` なら `/link` 配下だけ（`/repo` 側は出さない）
-        map.display_roots = vec![PathBuf::from("/link")];
-        let listed: Vec<String> = map
-            .sorted_entries()
-            .into_iter()
-            .map(|(p, _)| p.display().to_string())
-            .collect();
-        assert_eq!(listed, ["/link", "/link/src", "/link/src/main.rs"]);
+        let link = PathBuf::from("/link");
+        map.display_roots = vec![link.clone()];
+        // **`display()` の文字列では比べない**: 区切りは OS 依存なので Windows では
+        // `/link\src` になり、`/` 直書きの期待値とは一致しない（#1278 / #920）。
+        // `Path` の比較は components 単位なので区切りの綴りに依らない
+        let listed: Vec<PathBuf> = map.sorted_entries().into_iter().map(|(p, _)| p).collect();
+        assert_eq!(
+            listed,
+            vec![link.clone(), link.join("src"), link.join("src/main.rs")]
+        );
     }
 
     #[test]

@@ -776,7 +776,14 @@ mod tests {
         assert!(catalog.models.is_empty());
         let msg = failure.message_in(WorkerAgent::Codex, Lang::Ja);
         assert!(msg.contains("次の一手"), "次の一手が無い: {msg}");
-        assert!(msg.contains("install.sh"), "導入コマンドが無い: {msg}");
+        // 導入コマンドの正本は `agent_install::current_recipe`（macOS = `install.sh` /
+        // Windows = `install.ps1`）。ここへリテラルを書くと Windows だけ落ちる（#1278 / #920）
+        let install = tako_core::platform::agent_install::current_recipe(
+            tako_core::platform::agent_install::AgentKind::Codex,
+        )
+        .source
+        .official_command;
+        assert!(msg.contains(install), "導入コマンドが無い: {msg}");
         // claude は CLI が無くても静的リストだけは出せる（選択肢を見せられる）
         let claude = catalog_with(WorkerAgent::Claude, missing, never_run, None);
         assert_eq!(claude.models.len(), 3);

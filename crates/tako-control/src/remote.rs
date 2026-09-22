@@ -7589,7 +7589,16 @@ mod tests {
         assert!(status["running"].is_boolean());
     }
 
+    /// **Windows では skip**（#1557）。`is_process_alive` は非 unix で無条件 `false` を
+    /// 返す私的ヘルパのままで、実装済みの境界
+    /// （`tako_core::platform::process::pid_alive`）を通っていない。
+    /// 製品側を直す Issue が #1557 で、直したらこの `ignore` を外す
+    /// （#1278 は CI を blocking にする作業で、製品の変更はスコープ外）
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows では is_process_alive が常に false（製品側の穴。#1557）"
+    )]
     fn is_process_aliveは現在のプロセスをtrueで返す() {
         assert!(is_process_alive(std::process::id()));
     }

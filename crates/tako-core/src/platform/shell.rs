@@ -827,13 +827,26 @@ mod tests_1031 {
         );
     }
 
+    /// 配線が返したコマンドから「シェルへ渡した本文」を取り出す（両 OS。#1278）。
+    ///
+    /// Windows の配線は `-EncodedCommand`（base64 / UTF-16LE）なので、
+    /// 引数を**平文として**読むと必ず外れる。符号化されていれば復号してから見る
+    fn wired_script(got: &SpawnCommand) -> String {
+        let last = got.args.last().expect("スクリプトが要る").clone();
+        if got.args.iter().any(|a| a == "-EncodedCommand") {
+            decode_powershell_command(&last)
+        } else {
+            last
+        }
+    }
+
     /// **配線**の検査（`hold_on_failure_command` の既定は「包む」）
     #[test]
     fn 配線された失敗時の保持が既定で有効() {
         assert!(std::env::var_os("TAKO_1031_LEGACY").is_none());
         let got = hold_on_failure_command(cmd(&["npm", "run", "dev"]), "__TAKO_EXIT=");
         assert_ne!(got.program, "npm", "包まれていない: {got:?}");
-        let script = got.args.last().expect("スクリプトが要る");
+        let script = wired_script(&got);
         assert!(script.contains("__TAKO_EXIT="), "script={script}");
     }
 

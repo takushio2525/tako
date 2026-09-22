@@ -331,27 +331,65 @@ mod tests {
 
     // --- #171: pinned_folders の正規パスデデュープ ---
 
+    /// 一時ディレクトリに「実体 + それを指すシンボリックリンク」を作る（#1278）。
+    ///
+    /// 元は macOS の `/tmp` → `/private/tmp` を当てにしていたが、これは **macOS 固有**で
+    /// Windows には `/tmp` すら無い。自分で張れば「別綴りでも正規パスが同じなら 1 件」を
+    /// 両 OS で検査できる。**Windows の symlink 作成には昇格（管理者 / 開発者モード）が
+    /// 要る**ので、作れない環境は `None` を返し、呼び出し側が理由を出して skip する
+    fn symlinked_dir(tag: &str) -> Option<(PathBuf, PathBuf)> {
+        let base = std::env::temp_dir().join(format!("tako-1278-tab-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).ok()?;
+        let link = base.join("link");
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&real, &link);
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_dir(&real, &link);
+        if made.is_err() {
+            let _ = std::fs::remove_dir_all(&base);
+            return None;
+        }
+        Some((real, link))
+    }
+
     #[test]
     fn pinned_folder_symlink経由の重複は畳まれる() {
+        let Some((real, link)) = symlinked_dir("dedup") else {
+            eprintln!(
+                "skip: この環境ではディレクトリの symlink を作れない\
+                 （Windows は管理者 / 開発者モードが要る）"
+            );
+            return;
+        };
         let mut tab = Tab::new("t", Pane::new(PaneOrigin::User));
-        // macOS: /tmp → /private/tmp
-        assert!(tab.add_pinned_folder(PathBuf::from("/tmp")));
+        assert!(tab.add_pinned_folder(link.clone()));
         assert!(
-            !tab.add_pinned_folder(PathBuf::from("/private/tmp")),
+            !tab.add_pinned_folder(real.clone()),
             "同じ正規パスの二重追加は false を返す"
         );
         assert_eq!(tab.pinned_folders().len(), 1);
+        let _ = std::fs::remove_dir_all(real.parent().expect("親がある"));
     }
 
     #[test]
     fn pinned_folder_symlink経由でも削除できる() {
+        let Some((real, link)) = symlinked_dir("remove") else {
+            eprintln!(
+                "skip: この環境ではディレクトリの symlink を作れない\
+                 （Windows は管理者 / 開発者モードが要る）"
+            );
+            return;
+        };
         let mut tab = Tab::new("t", Pane::new(PaneOrigin::User));
-        tab.add_pinned_folder(PathBuf::from("/tmp"));
+        tab.add_pinned_folder(link.clone());
         assert!(
-            tab.remove_pinned_folder(&PathBuf::from("/private/tmp")),
+            tab.remove_pinned_folder(&real),
             "正規パスが同じなら別表記でも削除できる"
         );
         assert!(tab.pinned_folders().is_empty());
+        let _ = std::fs::remove_dir_all(real.parent().expect("親がある"));
     }
 
     #[test]

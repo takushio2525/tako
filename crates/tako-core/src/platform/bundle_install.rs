@@ -468,7 +468,15 @@ mod tests {
         std::fs::metadata(path).expect("メタデータ").ino()
     }
 
+    /// **macOS 限定**（#1278）。この検査は `ReplaceStrategy::ContentsSwap` =
+    /// `renamex_np(2)` の `RENAME_SWAP` を選ぶことを見るが、
+    /// 非 macOS の `imp::swap_paths` は**設計上つねに `unsupported`** を返す
+    /// （「macOS 以外に `RENAME_SWAP` 相当は無いので退避 → 設置へ落とす」）。
+    /// したがって非 macOS では `MoveAside` が正しい答えで、
+    /// `keeps_path_occupied()` も false が正しい = 検査の前提そのものが macOS 形。
+    /// `.app` バンドルと Dock のブックマークも macOS の概念
     #[test]
+    #[cfg(target_os = "macos")]
     fn 既存を差し替えても置き場のパスは空にならない() {
         let _guard = legacy_guard();
         let root = TempRoot::new("replace");
@@ -573,8 +581,13 @@ mod tests {
     }
 
     /// トップレベルに余分なものが在るバンドルは Contents だけ替えると残骸が残るので、
-    /// バンドルごとの入れ替えへ倒す
+    /// バンドルごとの入れ替えへ倒す。
+    ///
+    /// **macOS 限定**（#1278。`既存を差し替えても置き場のパスは空にならない` と同じ理由）。
+    /// `ReplaceStrategy::Swap` は `RENAME_SWAP` を前提にしており、
+    /// 非 macOS では `imp::swap_paths` が設計どおり `unsupported` を返す
     #[test]
+    #[cfg(target_os = "macos")]
     fn 標準的でないバンドルはバンドルごと入れ替える() {
         let _guard = legacy_guard();
         let root = TempRoot::new("nonstandard");

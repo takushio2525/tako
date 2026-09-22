@@ -58,14 +58,16 @@ fn kill_server(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
-/// 確実に生きていない pid（自分の pid から遠い上限側を探す）
-fn dead_pid() -> u32 {
-    for candidate in (900_000..999_999).rev() {
-        if !tako_core::ports::process_alive(candidate) {
-            return candidate;
-        }
-    }
-    panic!("死んだ pid を用意できない");
+/// 確実に生きていない pid（自分の pid から遠い上限側を探す）。
+///
+/// **`None` を返す環境がある**: `ports::process_alive` は非 unix では常に `true`
+/// （Windows に tmux のソケットレイアウトが無いので「何も回収しない」側へ倒す設計）。
+/// そこでは「所有者が死んだサーバー」という材料そのものを作れないので、
+/// 呼び出し側は理由を出して skip する（#1278。以前は `panic!` で落ちていた）
+fn dead_pid() -> Option<u32> {
+    (900_000..999_999)
+        .rev()
+        .find(|&candidate| !tako_core::ports::process_alive(candidate))
 }
 
 /// #1192 の必須検査。生きた所有者のサーバーは `--apply` でも消えない
@@ -75,11 +77,18 @@ fn 所有者が生きているサーバーはapplyでも消えない() {
         eprintln!("skip: tmux が無い環境");
         return;
     }
+    let Some(dead_owner) = dead_pid() else {
+        eprintln!(
+            "skip: この環境の process_alive は死んだ pid を報告しない\
+             （非 unix は常に true = tmux のソケットを 1 つも回収しない側へ倒す設計）"
+        );
+        return;
+    };
     let dir = std::env::temp_dir().join(format!("tako-1192-alive-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れる");
     // 所有 pid = このテストプロセス（確実に生きている）
     let alive = spawn_server(&dir, &format!("tako-1192test-{}", std::process::id()));
-    let dead = spawn_server(&dir, &format!("tako-1192test-{}", dead_pid()));
+    let dead = spawn_server(&dir, &format!("tako-1192test-{dead_owner}"));
 
     let entries = scan_servers_in(&dir, tako_core::ports::process_alive);
     assert_eq!(entries.len(), 2, "ダミー 2 本だけを見ている: {entries:?}");
