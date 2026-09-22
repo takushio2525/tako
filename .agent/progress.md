@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-18（#1481: Web ビューを見たあとターミナルへ戻ったとき打鍵が届かないのを直した）
-- 真因は AppKit 側だった: 宛先を親へ返す `focus_parent()` が `sync_frame` の **hide 分岐にしか無く**（`webview.rs:268`）、Web ビューが見えたままフォーカスが別ペインへ移る経路（`on_pane_mouse_down` / dispatch `Focus`）は `PaneTree` のフォーカスしか動かさない。#326 の NSEvent monitor は **⌘ 修飾つきのキーだけ**（`webview.rs:582`）なので素の打鍵は救われない。破棄（× / `web close`）も宛先を持ったまま壊していた
-- 宛先の読み・戻しを `webview.rs` の 1 実装へ（#326 の monitor も同じ関数を通る）。**戻す先は `contentView` ではなく「宛先を持っている WKWebView の superview」**（実測: contentView = `AccessKitSubclassOfNSView` で `makeFirstResponder:` は成功するのに打鍵は来ない）。呼ぶのは `clear_text_input_focus`（= #503 と同じ全経路）と破棄の直前で、**毎フレームの level 判定にはしない**（「宛先が webview でフォーカスは別ペイン」は「いまページをクリックした」と同じ状態なのでページへ打てなくなる）
-- 実測: 項目 71 に #1481 群 8 件（宛先のクラス名を読む）。legacy `TAKO_1481_LEGACY=1` は `owner=WryWebView returns=0` で FAILED = Issue の症状そのまま / 修正アームは `TAKO_APP_SELF_TEST_OK` 完走。番犬 `issue1481_webview_key_focus_watchdog` 3 本（注入 8 通り）・workspace 4982 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。**実マウスでのクリックと GUI 再起動後の復元は未検証**
-
 ## 2026-09-21（#1485: 「起動していた」を覚えて GUI 起動時に remote daemon を立て直す）
 - `tako remote start` の成功だけが `<data_dir>/remote/tako-remote.desired`（移行の番地 `SchemaId::RemoteDesired`）を作り、GUI が persist 復元のあと `spawn_daemon` をバックオフ（2/5/10/20/40 秒）で数回試す。**消す条件は「止まっていること」の 1 つ**（`Ok` だけ見ると Mac 再起動後に stop した人の意図を落とす）。判断は理由を返す純関数 `autostart_decision` 1 本で、CLI / チップ / persist.log は読むだけ
 - 無言にしない: 途中の失敗も persist.log へ 1 行ずつ、諦めたら `notify_ui_failure` の 1 実装 + `remote status` の `desired` / `last_autostart`（`running: false` の応答にも必ず載る）。OS ゲートは `platform::support` の `tako_remote_start` を引く（専用キーは足さない = T2 が落ちる）
@@ -59,3 +54,8 @@
 - 真因は回帰ではなく**#1057 の復活が `--review` 経路だけ**だったこと（`run_setup` は `run_dependency_check(review_mode && …)` のまま）。隔離環境でパイプ・実 PTY・`--review` の 3 通りを実走させ、前 2 つの出力が 1 文字も変わらないことで TTY 判定説を潰してから着手。当時の `標準setupは依存の質問をしない` が旧呼び出し形を文字列で固定しており、**直そうとすると番犬が止める**状態だった
 - 判断を理由つき純粋関数 `setup_deps::offer_for`（`Ask` / `AutoInstall` / `Guide(cannot_run|check_only|legacy|no_terminal)`）1 本へ。CLI は表示と入力だけ。`interactive` 1 つが担っていた「依存を入れるか」と「設定値を見直すか」を `DepCheckMode` で分離（**#262 が守るのは後者**）。`--yes` は同意扱い・非 TTY は案内へ落として止まらない。再検出は `setup_deps::resolve`（検出と同じ規則）
 - 実測: `scripts/test-setup-deps-prompt-1499.sh` **52 PASS 0 FAIL**（CI の macOS ジョブへ登録）。番犬 5 本・注入 7 通りすべて FAILED → 戻して緑。A/B `TAKO_1499_LEGACY=1` は端末でも聞かない = Issue の症状。workspace 5040 passed 0 failed・clippy 3 宇宙 0。**受け入れ検査 rework 1 回目**: CI の `/bin/bash`（3.2）は `set -u` 下の空配列 `"${arr[@]}"` を未定義扱いにして PASS=43 FAIL=9（手元の bash 5 では出ない）→ `${arr[@]+"${arr[@]}"}` へ直し規約を conventions へ
+
+## 2026-09-22（#1502: tako CLI を外部ターミナルからも打てるようにした）
+- `tako setup` の段として `$HOME/.local/bin/tako` へ symlink を張り、**その置き場所だけ**を `~/.zprofile` のマーカーブロック（1 組のまま）へ通す。**実体のディレクトリは PATH へ入れない**（`.app` の `Contents/MacOS` は tako-app ごと / dev の `target/debug` は依存クレートごと PATH へ出るうえ、`.app` を動かすと黙って切れる）。`$HOME/.local/bin` は 3 系統のランチャーと同じ置き場所なので macOS ではブロックの中身は 1 ディレクトリのまま = 既存ユーザーの profile の形が変わらない
+- 途中で踏んだ真因 2 つ: ①claude が ready だとエージェントの PATH 段は走らないので「ついで」に載せると設置されない（= `run_setup` の独立した段にした）②「もう通っているか」を**プロセスの PATH** で測ると #601 の注入で必ず「通っている」に見える。`$SHELL -l -c` も**継承した PATH を `path_helper` が引き継ぐ**ので、launchd の既定 PATH へ戻してから起こす必要があった
+- 実測: `scripts/test-tako-cli-path-1502.sh` **49 PASS 0 FAIL**（隔離 HOME + 隔離 GUI）。A/B `TAKO_1502_LEGACY=1` は 23 FAIL（B7 / B8「新しいログインシェルで tako が見つかる・動く」= Issue の症状）。番犬 `issue1502_tako_cli_path_watchdog` 6 本（注入 8 通りすべて FAILED → 戻して緑）

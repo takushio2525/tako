@@ -65,6 +65,7 @@ pub mod ssh_detect;
 pub mod ssh_progress;
 pub mod ssh_reconnect;
 pub mod tab;
+pub mod tako_cli_path;
 pub mod task_checkpoint;
 pub mod terminal;
 pub mod test_residue;

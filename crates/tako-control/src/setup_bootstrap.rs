@@ -41,6 +41,7 @@ use tako_core::platform::agent_install::{self, AgentKind, InstallRecipe};
 use tako_core::platform::support::Platform;
 use tako_core::platform::user_path;
 use tako_core::shell_profile::{self, PathChange, ShellKind};
+use tako_core::tako_cli_path;
 
 /// 導入の進み具合。`status()` が「次に何をすべきか」として返す
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -585,25 +586,44 @@ fn launcher_dir_on_path(agent: AgentKind, dir: &Path) -> bool {
 /// 寄せるのではなく**理由つきの許可**にするか、B21 側へ
 /// 「ログインシェルの PATH を読む」専用の口（Windows は `None`）を足すこと（#868 / #877）
 fn login_shell_sees(dir: &Path) -> bool {
+    login_shell_path().is_some_and(|path| shell_profile::path_contains(&path, dir))
+}
+
+/// ログインシェルの PATH そのもの（読めなければ `None`）。
+///
+/// [`login_shell_sees`] と**同じ 1 実装**。「入っているか」だけでなく値そのものが
+/// 要る場面（#1502 の「書くべきか」の判定）があるので、ここから分けてある
+fn login_shell_path() -> Option<String> {
     if cfg!(windows) {
-        return false;
+        return None;
     }
     let shell = std::env::var("SHELL")
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "/bin/sh".into());
     // #586: GUI プロセス（dispatch）から到達するのでコンソールウィンドウを出させない
-    let Ok(output) =
+    let output =
         tako_core::platform::process::no_console_window(&mut std::process::Command::new(shell))
             .args(["-l", "-c", "printf %s \"$PATH\""])
+            // **PATH を launchd の既定へ戻してから起こす**（#1502 の実測）。
+            // 継承したまま起こすと macOS の `/etc/zprofile` が呼ぶ `path_helper` が
+            // 親の PATH を引き継ぐので、答えが「新しいターミナルが見る PATH」ではなく
+            // 「この親の PATH」になる。tako のペインは #601 で CLI ディレクトリを
+            // 注入済みなので、そのまま測ると「もう通っている」と誤答して設置が丸ごと飛ぶ
+            .env("PATH", DEFAULT_LOGIN_PATH)
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .output()
-    else {
-        return false;
-    };
-    shell_profile::path_contains(&String::from_utf8_lossy(&output.stdout), dir)
+            .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
+
+/// 新しいターミナル（launchd → ログインシェル）が profile を読む**前**に持っている PATH。
+/// macOS / Linux の慣習値で、`/etc/zprofile` の `path_helper` はここから組み直す
+const DEFAULT_LOGIN_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
 // --- インストール実行 ---
 
@@ -876,47 +896,287 @@ fn run_installer(agent: AgentKind, script: &Path, interactive: bool) -> Result<S
 
 // --- PATH 通し ---
 
-/// ランチャーの置き場所を「新しく開いたターミナルが見る PATH」へ通す（冪等）
-pub fn ensure_path_for(agent: AgentKind) -> Result<Value, String> {
-    let home = home_dir()?;
-    let r = recipe_for(agent);
-    let dir = r.launcher_dir_in(&home);
+/// この環境で tako が PATH へ通したいディレクトリの**全部**（正本 1 箇所。#1502）。
+///
+/// ブロックは 1 組しか無いので、書くときは**毎回この全部**を渡す
+/// （部分集合を渡すと前回入れた分が消える）。並びは
+/// 「tako 自身の CLI → エージェント CLI のランチャー」で、重複は
+/// [`shell_profile::ensure_dirs_on_path_in`] が落とす。
+/// **macOS は 3 系統とも `~/.local/bin` で tako の symlink 先も同じ**なので、
+/// 実際に並ぶのは 1 個 = ブロックの中身は #1502 前と変わらない
+fn desired_path_dirs(home: &Path, tako: Option<&tako_cli_path::Placement>) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = tako.map(|p| p.dir.clone()).into_iter().collect();
+    for agent in bootstrap_agents() {
+        dirs.push(recipe_for(agent).launcher_dir_in(home));
+    }
+    dirs
+}
+
+/// tako CLI の設置計画（解決できなければ `None` = 従来どおりエージェントぶんだけ通す）
+fn tako_cli_placement(home: &Path) -> Option<tako_cli_path::Placement> {
+    if legacy_no_tako_cli_path() {
+        return None;
+    }
+    tako_cli_path::plan_here(home)
+}
+
+/// `TAKO_1502_LEGACY=1` で #1502 前（tako CLI を PATH へ設置しない）へ戻す。
+/// **同一バイナリで A/B が取れる**（検証は `scripts/test-tako-cli-path-1502.sh`）
+pub fn legacy_no_tako_cli_path() -> bool {
+    std::env::var_os("TAKO_1502_LEGACY").is_some()
+}
+
+/// A/B のときに出す 1 行（**何が無効なのかを名乗る**。黙って落とすと
+/// 「設置されない」が仕様なのか壊れたのか分からない）
+const LEGACY_LINE: &str =
+    "  [legacy] tako CLI の PATH 設置は TAKO_1502_LEGACY=1 で無効（#1502 前の挙動）";
+
+/// tako CLI の symlink を張る（unix のみ。Windows は `link: None` なので何もしない）
+fn ensure_tako_cli_link(
+    plan: &tako_cli_path::Placement,
+) -> Result<tako_cli_path::LinkChange, String> {
+    match plan.link.as_deref() {
+        Some(link) => tako_cli_path::ensure_link(link, &plan.source),
+        None => Ok(tako_cli_path::LinkChange::Unchanged),
+    }
+}
+
+/// tako CLI の設置状況を JSON 節にする（`ensure_path_for` / `check-health` / `--check` が同じ材料を読む）
+pub fn tako_cli_path_json() -> Value {
+    if legacy_no_tako_cli_path() {
+        return json!({ "resolved": false, "reason": "TAKO_1502_LEGACY=1（#1502 前の挙動）" });
+    }
+    let Ok(home) = home_dir() else {
+        return json!({ "resolved": false, "reason": "ホームディレクトリを特定できません" });
+    };
+    let Some(plan) = tako_cli_placement(&home) else {
+        return json!({
+            "resolved": false,
+            "reason": "tako CLI の実体を解決できません（実行中バイナリの隣に tako がありません）",
+        });
+    };
+    let state = plan
+        .link
+        .as_deref()
+        .map(|link| tako_cli_path::link_state(link, &plan.source));
+    let on_path = dir_on_path(&plan.dir);
+    json!({
+        "resolved": true,
+        "dir": plan.dir.display().to_string(),
+        "dir_display": display_path(&plan.dir),
+        "source": plan.source.display().to_string(),
+        "source_display": display_path(&plan.source),
+        "link": plan.link.as_ref().map(|l| l.display().to_string()),
+        "link_display": plan.link.as_deref().map(display_path),
+        // symlink を張らない形（Windows / 実体が置き場所そのものに居る）は null
+        "link_state": state.as_ref().map(tako_cli_path::LinkState::as_str),
+        "dir_on_path": on_path,
+        // 外部ターミナルから `tako` が打てるか（= PATH に在り、その場所の tako が使える）
+        "usable": on_path && state.as_ref().map(|s| s.usable()).unwrap_or(true),
+    })
+}
+
+/// `dir` が「新しく開いたターミナルが見る PATH」に在るか（OS 差は既存の判定を使う）
+fn dir_on_path(dir: &Path) -> bool {
     if user_path::is_supported() {
-        return ensure_user_path(agent, &dir);
+        let path_var = std::env::var("PATH").unwrap_or_default();
+        return user_path::contains_entry(&path_var, dir)
+            || user_path::read()
+                .map(|value| user_path::contains_entry(&value.raw, dir))
+                .unwrap_or(false);
+    }
+    // **ログインシェルが見るか**を優先して答える（外部ターミナルの話をしているので、
+    // いま走っているプロセスの PATH は答えにならない）。読めないときだけ自分の PATH へ戻す
+    match login_shell_path() {
+        Some(path) => shell_profile::path_contains(&path, dir),
+        None => shell_profile::path_contains(&std::env::var("PATH").unwrap_or_default(), dir),
+    }
+}
+
+/// tako CLI を外部ターミナルから打てるようにする（冪等。FR-2.14.5 / #1502）。
+///
+/// `tako setup` の段としても、`tako setup bootstrap path` の一部としても、
+/// ここ 1 本を通る
+pub fn ensure_tako_cli_path() -> Result<Value, String> {
+    if legacy_no_tako_cli_path() {
+        return Err("TAKO_1502_LEGACY=1（#1502 前の挙動）".to_string());
+    }
+    let home = home_dir()?;
+    let Some(plan) = tako_cli_placement(&home) else {
+        return Err(
+            "tako CLI の実体を解決できません（実行中バイナリの隣に tako がありません）".to_string(),
+        );
+    };
+    let link_change = ensure_tako_cli_link(&plan)?;
+    let path = ensure_dirs_on_path(&home, &desired_path_dirs(&home, Some(&plan)))?;
+    Ok(json!({
+        "link_change": link_change.as_str(),
+        "path": path,
+        "tako_cli": tako_cli_path_json(),
+    }))
+}
+
+/// `tako setup` の段として走らせて、人へ出す文面を返す（#1502）。
+///
+/// **文面の正本はここ 1 箇所**。失敗しても setup 全体は止めない
+/// （tako 内側のシェルからは `tako` が打てる = 致命ではない）
+pub fn run_tako_cli_path_stage() -> String {
+    if legacy_no_tako_cli_path() {
+        return LEGACY_LINE.to_string();
+    }
+    let before = tako_cli_path_json();
+    match ensure_tako_cli_path() {
+        Ok(value) => {
+            let after = &value["tako_cli"];
+            let dir = after["dir_display"].as_str().unwrap_or("?");
+            let wrote = value["path"]["wrote"].as_bool().unwrap_or(false)
+                || value["link_change"]
+                    .as_str()
+                    .is_some_and(|c| matches!(c, "created" | "updated"));
+            if !wrote && before["usable"].as_bool().unwrap_or(false) {
+                return format!("  [OK] tako CLI: どのターミナルからも使えます（{dir}）");
+            }
+            let mut line =
+                "  [設置] tako CLI: どのターミナルからも tako を打てるようにしました".to_string();
+            if let Some(link) = after["link_display"].as_str() {
+                line.push_str(&format!(
+                    "\n         {link} → {}",
+                    after["source_display"].as_str().unwrap_or("?")
+                ));
+            }
+            line.push_str(&format!(
+                "\n         PATH: {} （元に戻すには tako setup bootstrap undo-path）",
+                dir
+            ));
+            if !value["path"]["verified"].as_bool().unwrap_or(false) {
+                line.push_str(
+                    "\n         いま開いているターミナルには反映されません（開き直すと有効）",
+                );
+            }
+            line
+        }
+        // 止めない。理由と次の一手だけ出す
+        Err(e) => format!(
+            "  [警告] tako CLI の PATH 設置を見送りました: {e}\n\
+             \x20        tako の中では tako が打てます（#601）。\n\
+             \x20        外部ターミナルでも使うなら tako setup bootstrap path を実行してください"
+        ),
+    }
+}
+
+/// `tako setup --check` の 1 行（#1502）。**判定は [`tako_cli_path_json`] の 1 実装**
+pub fn tako_cli_path_check_line() -> String {
+    if legacy_no_tako_cli_path() {
+        return LEGACY_LINE.to_string();
+    }
+    let state = tako_cli_path_json();
+    if !state["resolved"].as_bool().unwrap_or(false) {
+        return format!(
+            "  [警告] tako CLI の PATH: 確認できません（{}）",
+            state["reason"].as_str().unwrap_or("理由不明")
+        );
+    }
+    let dir = state["dir_display"].as_str().unwrap_or("?");
+    if state["usable"].as_bool().unwrap_or(false) {
+        return format!("  [OK] tako CLI の PATH: 外部ターミナルからも使えます（{dir}）");
+    }
+    // **状態ごとに違う理由を出す**（「使えません」だけだと、まだ設置していないのか
+    // `.app` を動かして切れたのかが分からず、次の一手が選べない）
+    let reason = match state["link_state"].as_str() {
+        Some("dangling") => "リンクの指す先が消えています（tako.app を移動しましたか？）",
+        Some("missing") if state["dir_on_path"].as_bool().unwrap_or(false) => {
+            "まだ設置していません"
+        }
+        _ if !state["dir_on_path"].as_bool().unwrap_or(false) => "設置先が PATH に入っていません",
+        _ => "まだ設置していません",
+    };
+    format!(
+        "  [不足] tako CLI の PATH: 外部ターミナルからは使えません（{reason}）\n\
+         \x20        tako setup bootstrap path で設置できます"
+    )
+}
+
+/// `dirs` をログインシェルの PATH（Windows はユーザー環境変数）へ通す
+fn ensure_dirs_on_path(home: &Path, dirs: &[PathBuf]) -> Result<Value, String> {
+    if user_path::is_supported() {
+        return ensure_user_path_dirs(dirs);
     }
     let (shell, _) = shell_target();
     let Some(shell) = shell else {
         let current = std::env::var("SHELL").unwrap_or_default();
         return Err(format!(
             "使っているシェル（{}）の設定ファイルが分かりません。\n\
-             次の 1 行をご自身のシェルの設定ファイルへ追加してください:\n  \
-             export PATH=\"{}:$PATH\"",
+             次の {} 行をご自身のシェルの設定ファイルへ追加してください:\n{}",
             if current.is_empty() {
                 "不明"
             } else {
                 &current
             },
-            display_path(&dir),
+            dirs.len(),
+            dirs.iter()
+                .map(|d| format!("  export PATH=\"{}:$PATH\"", display_path(d)))
+                .collect::<Vec<_>>()
+                .join("\n"),
         ));
     };
-    let path_var = std::env::var("PATH").unwrap_or_default();
-    let outcome = shell_profile::ensure_dir_on_path_in(&home, shell, &dir, Some(&path_var))?;
+    // 「書かなくてよいか」は**新しく開いたターミナルが見る PATH**で判定する（#1502）。
+    // プロセスの PATH は親から受け継いだだけで、ログインシェルが同じとは限らない
+    // （tako 内のペインは #601 で CLI ディレクトリを注入済み / `.app` は逆に痩せている）。
+    // ログインシェルを起こせない環境（`$SHELL` が壊れている等）はプロセスの PATH へ戻す
+    let path_var = login_shell_path().unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+    let outcome = shell_profile::ensure_dirs_on_path_in(home, shell, dirs, Some(&path_var))?;
     // 実際にログインシェルから引けるようになったかを**確かめてから**返す。
     // 「書いたはず」で終わらせない（.zshrc へ書いて届かなかった類の失敗を検出する）
-    let verified = outcome.change == PathChange::AlreadyOnPath || login_shell_sees(&dir);
+    let verified = outcome.change == PathChange::AlreadyOnPath
+        || outcome.dirs.iter().all(|d| login_shell_sees(d));
     Ok(json!({
-        "agent": agent.as_str(),
         "shell": shell.as_str(),
         "profile": outcome.profile.display().to_string(),
         "profile_display": display_path(&outcome.profile),
-        "dir": dir.display().to_string(),
-        "dir_display": display_path(&dir),
+        "dirs": outcome.dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>(),
+        "dirs_display": outcome.dirs.iter().map(|d| display_path(d)).collect::<Vec<_>>(),
         "change": outcome.change.as_str(),
         "wrote": outcome.change.wrote(),
         "verified": verified,
+    }))
+}
+
+/// ランチャーの置き場所を「新しく開いたターミナルが見る PATH」へ通す（冪等）。
+///
+/// #1502 から **tako 自身の CLI もここで一緒に通す**（マーカーブロックは 1 組のまま）
+pub fn ensure_path_for(agent: AgentKind) -> Result<Value, String> {
+    let home = home_dir()?;
+    let r = recipe_for(agent);
+    let dir = r.launcher_dir_in(&home);
+    let plan = tako_cli_placement(&home);
+    // symlink は PATH より先に張る（PATH だけ通って実体が無い状態を作らない）
+    let link_change = match plan.as_ref() {
+        Some(plan) => ensure_tako_cli_link(plan)?,
+        None => tako_cli_path::LinkChange::Unchanged,
+    };
+    if user_path::is_supported() {
+        return ensure_user_path(agent, &dir, plan.as_ref(), link_change);
+    }
+    let path = ensure_dirs_on_path(&home, &desired_path_dirs(&home, plan.as_ref()))?;
+    let verified = path["verified"].as_bool().unwrap_or(false);
+    Ok(json!({
+        "agent": agent.as_str(),
+        "shell": path["shell"],
+        "profile": path["profile"],
+        "profile_display": path["profile_display"],
+        "dir": dir.display().to_string(),
+        "dir_display": display_path(&dir),
+        // ブロックが通しているディレクトリの全部（#1502）
+        "dirs": path["dirs"],
+        "dirs_display": path["dirs_display"],
+        "change": path["change"],
+        "wrote": path["wrote"],
+        "verified": verified,
+        "tako_cli_link_change": link_change.as_str(),
+        "tako_cli": tako_cli_path_json(),
         "note": if verified {
             format!(
-                "新しく開くターミナルから {} コマンドが使えます",
+                "新しく開くターミナルから {} コマンドと tako コマンドが使えます",
                 agent.as_str()
             )
         } else {
@@ -931,45 +1191,40 @@ pub fn ensure_path_for(agent: AgentKind) -> Result<Value, String> {
 ///
 /// **末尾へ足す**ので、ユーザーが自分で並べた優先順位は動かない。
 /// 書いたあと**読み直して確かめる**（「書いたはず」で終わらせない）
-fn ensure_user_path(agent: AgentKind, dir: &Path) -> Result<Value, String> {
-    let current = user_path::read()?;
-    let process_has = user_path::contains_entry(&std::env::var("PATH").unwrap_or_default(), dir);
-    let change = match user_path::append_entry(&current.raw, dir) {
-        // レジストリに既に在る = 新しいターミナルからは引ける
-        None => PathChange::AlreadyOnPath,
-        Some(next) => {
-            user_path::write(&user_path::UserPathValue {
-                raw: next,
-                kind: current.kind.clone(),
-            })?;
-            let after = user_path::read()?;
-            if !user_path::contains_entry(&after.raw, dir) {
-                return Err(format!(
-                    "ユーザー PATH へ {} を追加できませんでした（書き込み後も反映されていません）。\n\
-                     設定 → システム → バージョン情報 → 環境変数 から手で追加してください",
-                    display_path(dir)
-                ));
-            }
-            PathChange::Installed
+fn ensure_user_path(
+    agent: AgentKind,
+    dir: &Path,
+    tako: Option<&tako_cli_path::Placement>,
+    link_change: tako_cli_path::LinkChange,
+) -> Result<Value, String> {
+    let mut dirs = vec![dir.to_path_buf()];
+    // #1502: tako 自身の CLI のディレクトリも同じ経路で足す（**末尾へ追記**なので
+    // ユーザーが並べた優先順位は動かない）
+    if let Some(plan) = tako {
+        if !dirs.contains(&plan.dir) {
+            dirs.push(plan.dir.clone());
         }
-    };
-    // レジストリへ入っていても**いまのプロセスには反映されない**（Windows は
-    // 再ログイン / 新しいプロセス起動まで伝播しない。#525 実測）
-    let verified = change == PathChange::AlreadyOnPath || process_has;
+    }
+    let path = ensure_user_path_dirs(&dirs)?;
+    let verified = path["verified"].as_bool().unwrap_or(false);
     Ok(json!({
         "agent": agent.as_str(),
-        "shell": "windows-user-path",
+        "shell": path["shell"],
         // 書き先は「ファイル」ではないので、人へはレジストリのキーを見せる
-        "profile": "HKCU\\Environment\\Path",
-        "profile_display": "ユーザー環境変数 Path",
+        "profile": path["profile"],
+        "profile_display": path["profile_display"],
         "dir": dir.display().to_string(),
         "dir_display": display_path(dir),
-        "change": change.as_str(),
-        "wrote": change.wrote(),
+        "dirs": path["dirs"],
+        "dirs_display": path["dirs_display"],
+        "change": path["change"],
+        "wrote": path["wrote"],
         "verified": verified,
+        "tako_cli_link_change": link_change.as_str(),
+        "tako_cli": tako_cli_path_json(),
         "note": if verified {
             format!(
-                "{} コマンドがどのターミナルからも使えます",
+                "{} コマンドと tako コマンドがどのターミナルからも使えます",
                 agent.as_str()
             )
         } else {
@@ -980,11 +1235,65 @@ fn ensure_user_path(agent: AgentKind, dir: &Path) -> Result<Value, String> {
     }))
 }
 
+/// ユーザー環境変数 `Path` へ `dirs` を**1 エントリずつ末尾追記**する（境界 B23）。
+///
+/// unix と違いマーカーが無いので「ブロックごと書き直す」ができず、
+/// エントリ単位の追記になる。既に在るものは触らない（冪等）
+fn ensure_user_path_dirs(dirs: &[PathBuf]) -> Result<Value, String> {
+    let process_path = std::env::var("PATH").unwrap_or_default();
+    let mut change = PathChange::AlreadyOnPath;
+    let mut process_has = true;
+    for entry in dirs {
+        process_has &= user_path::contains_entry(&process_path, entry);
+        let current = user_path::read()?;
+        // レジストリに既に在る = 新しいターミナルからは引ける
+        if let Some(next) = user_path::append_entry(&current.raw, entry) {
+            user_path::write(&user_path::UserPathValue {
+                raw: next,
+                kind: current.kind.clone(),
+            })?;
+            let after = user_path::read()?;
+            if !user_path::contains_entry(&after.raw, entry) {
+                return Err(format!(
+                    "ユーザー PATH へ {} を追加できませんでした（書き込み後も反映されていません）。\n\
+                     設定 → システム → バージョン情報 → 環境変数 から手で追加してください",
+                    display_path(entry)
+                ));
+            }
+            change = PathChange::Installed;
+        }
+    }
+    // レジストリへ入っていても**いまのプロセスには反映されない**（Windows は
+    // 再ログイン / 新しいプロセス起動まで伝播しない。#525 実測）
+    let verified = change == PathChange::AlreadyOnPath || process_has;
+    Ok(json!({
+        "shell": "windows-user-path",
+        "profile": "HKCU\\Environment\\Path",
+        "profile_display": "ユーザー環境変数 Path",
+        "dirs": dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>(),
+        "dirs_display": dirs.iter().map(|d| display_path(d)).collect::<Vec<_>>(),
+        "change": change.as_str(),
+        "wrote": change.wrote(),
+        "verified": verified,
+    }))
+}
+
 /// 置いた PATH ブロックを取り除く（元のバイト列へ戻す）
 pub fn undo_path_for(agent: AgentKind) -> Result<Value, String> {
     let home = home_dir()?;
+    let plan = tako_cli_placement(&home);
+    // #1502: tako が張った symlink も一緒に外す（**symlink 以外は消さない**）
+    let link_change = match plan.as_ref().and_then(|p| p.link.as_deref()) {
+        Some(link) => tako_cli_path::remove_link(link)?,
+        None => tako_cli_path::LinkChange::Absent,
+    };
     if user_path::is_supported() {
-        return undo_user_path(agent, &recipe_for(agent).launcher_dir_in(&home));
+        return undo_user_path(
+            agent,
+            &recipe_for(agent).launcher_dir_in(&home),
+            plan.as_ref(),
+            link_change,
+        );
     }
     let (shell, _) = shell_target();
     let shell = shell.ok_or("使っているシェルの設定ファイルが分かりません")?;
@@ -994,6 +1303,8 @@ pub fn undo_path_for(agent: AgentKind) -> Result<Value, String> {
         "shell": shell.as_str(),
         "profile": outcome.profile.display().to_string(),
         "change": outcome.change.as_str(),
+        "tako_cli_link_change": link_change.as_str(),
+        "tako_cli_link": plan.as_ref().and_then(|p| p.link.as_ref()).map(|l| l.display().to_string()),
     }))
 }
 
@@ -1009,23 +1320,36 @@ pub fn undo_path_for(agent: AgentKind) -> Result<Value, String> {
 /// 明示的に叩くコマンドで、外した結果は `tako setup bootstrap path` で戻せるので
 /// この非対称は受け入れる。目印のための状態ファイルは作らない
 /// （#513 の共有カタログへ分類が要るものを、可逆な 1 操作のために増やさない）
-fn undo_user_path(agent: AgentKind, dir: &Path) -> Result<Value, String> {
-    let current = user_path::read()?;
-    let change = match user_path::remove_entry(&current.raw, dir) {
-        None => PathChange::Absent,
-        Some(next) => {
+fn undo_user_path(
+    agent: AgentKind,
+    dir: &Path,
+    tako: Option<&tako_cli_path::Placement>,
+    link_change: tako_cli_path::LinkChange,
+) -> Result<Value, String> {
+    let mut dirs = vec![dir.to_path_buf()];
+    if let Some(plan) = tako {
+        if !dirs.contains(&plan.dir) {
+            dirs.push(plan.dir.clone());
+        }
+    }
+    let mut change = PathChange::Absent;
+    for entry in &dirs {
+        let current = user_path::read()?;
+        if let Some(next) = user_path::remove_entry(&current.raw, entry) {
             user_path::write(&user_path::UserPathValue {
                 raw: next,
                 kind: current.kind.clone(),
             })?;
-            PathChange::Removed
+            change = PathChange::Removed;
         }
-    };
+    }
     Ok(json!({
         "agent": agent.as_str(),
         "shell": "windows-user-path",
         "profile": "HKCU\\Environment\\Path",
+        "dirs": dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>(),
         "change": change.as_str(),
+        "tako_cli_link_change": link_change.as_str(),
     }))
 }
 

@@ -83,28 +83,27 @@ impl ShellKind {
         }
     }
 
-    /// PATH へ 1 ディレクトリ足すブロック本文（末尾は改行 1 個）。
+    /// ブロックの 1 行目に置く説明。**ディレクトリの数によらず同じ 1 行**
+    /// （tako が入れるのはエージェント CLI のランチャーと tako 自身の CLI。#1502）
+    const NOTE: &'static str =
+        "# Managed by `tako setup`. Adds tako-managed command directories to PATH.";
+
+    /// PATH へ 1 ディレクトリ足す本文（二重追加ガード付き）。
     ///
     /// `dir_expr` は「そのシェルでディレクトリを指す式」（`$HOME/.local/bin` 等）
-    fn block(self, dir_expr: &str) -> String {
+    fn stanza(self, dir_expr: &str) -> String {
         match self {
-            // 二重追加を防ぐガード付き。`case` は sh / bash / zsh 共通
+            // `case` は sh / bash / zsh 共通
             Self::Zsh | Self::Bash => format!(
-                "{BLOCK_BEGIN}\n\
-                 # Managed by `tako setup`. Adds the Claude Code launcher directory to PATH.\n\
-                 case \":$PATH:\" in\n\
+                "case \":$PATH:\" in\n\
                  \x20 *\":{dir_expr}:\"*) ;;\n\
                  \x20 *) export PATH=\"{dir_expr}:$PATH\" ;;\n\
-                 esac\n\
-                 {BLOCK_END}\n"
+                 esac\n"
             ),
             Self::Fish => format!(
-                "{BLOCK_BEGIN}\n\
-                 # Managed by `tako setup`. Adds the Claude Code launcher directory to PATH.\n\
-                 if not contains {dir_expr} $PATH\n\
+                "if not contains {dir_expr} $PATH\n\
                  \x20   set -gx PATH {dir_expr} $PATH\n\
-                 end\n\
-                 {BLOCK_END}\n"
+                 end\n"
             ),
             // `dir_expr` は**そのまま埋めない**。PowerShell 5.1 は BOM 無しの `.ps1` を
             // ANSI コードページ（日本語環境なら CP932）で読むので、非 ASCII が 1 バイトでも
@@ -112,13 +111,20 @@ impl ShellKind {
             // `shell_integration` の同じ注意書きを参照）。home 配下でないディレクトリは
             // 絶対パスが入るため、ユーザー名が非 ASCII だと現実に踏む
             Self::PowerShell => format!(
-                "{BLOCK_BEGIN}\n\
-                 # Managed by `tako setup`. Adds the Claude Code launcher directory to PATH.\n\
-                 $__takoPathDir = {dir_expr}\n\
-                 if ($env:PATH -notlike \"*$__takoPathDir*\") {{ $env:PATH = \"$__takoPathDir;\" + $env:PATH }}\n\
-                 {BLOCK_END}\n"
+                "$__takoPathDir = {dir_expr}\n\
+                 if ($env:PATH -notlike \"*$__takoPathDir*\") {{ $env:PATH = \"$__takoPathDir;\" + $env:PATH }}\n"
             ),
         }
+    }
+
+    /// PATH へ N ディレクトリ足すブロック本文（末尾は改行 1 個）。
+    ///
+    /// **マーカーは 1 組のまま**で、中に [`Self::stanza`] を並べる（#1502）。
+    /// ディレクトリが 1 個のときの出力は説明行を除いて #1502 前と同一なので、
+    /// 既存ユーザーの profile は形が変わらない
+    fn block(self, dir_exprs: &[String]) -> String {
+        let body: String = dir_exprs.iter().map(|e| self.stanza(e)).collect();
+        format!("{BLOCK_BEGIN}\n{}\n{body}{BLOCK_END}\n", Self::NOTE)
     }
 
     /// そのシェルの構文で `dir` を指す式。home 配下なら `$HOME` 相対にして可搬にする
@@ -192,7 +198,8 @@ impl PathChange {
 pub struct EnsureOutcome {
     pub shell: ShellKind,
     pub profile: PathBuf,
-    pub dir: PathBuf,
+    /// ブロックが通しているディレクトリ（**マーカーは 1 組**のまま中に並ぶ。#1502）
+    pub dirs: Vec<PathBuf>,
     pub change: PathChange,
 }
 
@@ -209,16 +216,41 @@ pub fn ensure_dir_on_path_in(
     dir: &Path,
     current_path: Option<&str>,
 ) -> Result<EnsureOutcome, String> {
+    ensure_dirs_on_path_in(
+        home,
+        shell,
+        std::slice::from_ref(&dir.to_path_buf()),
+        current_path,
+    )
+}
+
+/// 複数ディレクトリ版（#1502）。**マーカーブロックは 1 組**のまま、その中に
+/// ディレクトリごとのガード付き追記を並べる。
+///
+/// `dirs` は**この環境で tako が通したいディレクトリの全部**を渡す
+/// （呼び出しごとに部分集合を渡すと、前回入れた分が消える）。順序はそのまま保つ。
+/// すべてが既に PATH にあるときだけ [`PathChange::AlreadyOnPath`] を返す
+pub fn ensure_dirs_on_path_in(
+    home: &Path,
+    shell: ShellKind,
+    dirs: &[PathBuf],
+    current_path: Option<&str>,
+) -> Result<EnsureOutcome, String> {
     let profile = home.join(shell.login_profile_rel());
-    if current_path.is_some_and(|p| path_contains(p, dir)) {
+    let dirs: Vec<PathBuf> = dedup(dirs);
+    if dirs.is_empty() {
+        return Err("PATH へ通すディレクトリが 1 つもありません".to_string());
+    }
+    if current_path.is_some_and(|p| dirs.iter().all(|d| path_contains(p, d))) {
         return Ok(EnsureOutcome {
             shell,
             profile,
-            dir: dir.to_path_buf(),
+            dirs,
             change: PathChange::AlreadyOnPath,
         });
     }
-    let block = shell.block(&shell.dir_expr(dir, home));
+    let exprs: Vec<String> = dirs.iter().map(|d| shell.dir_expr(d, home)).collect();
+    let block = shell.block(&exprs);
     let original = read_bytes(&profile)?;
     let had_block = MARKERS.present(&original);
     let updated = MARKERS.apply(&original, &block);
@@ -226,7 +258,7 @@ pub fn ensure_dir_on_path_in(
         return Ok(EnsureOutcome {
             shell,
             profile,
-            dir: dir.to_path_buf(),
+            dirs,
             change: PathChange::Unchanged,
         });
     }
@@ -234,13 +266,25 @@ pub fn ensure_dir_on_path_in(
     Ok(EnsureOutcome {
         shell,
         profile,
-        dir: dir.to_path_buf(),
+        dirs,
         change: if had_block {
             PathChange::Updated
         } else {
             PathChange::Installed
         },
     })
+}
+
+/// 順序を保ったまま重複を落とす（macOS は 3 系統とも `~/.local/bin` なので
+/// tako CLI の置き場所と合わせても**実際に並ぶのは 1 個**になる）
+fn dedup(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::with_capacity(dirs.len());
+    for dir in dirs {
+        if !out.contains(dir) {
+            out.push(dir.clone());
+        }
+    }
+    out
 }
 
 /// 置いたブロックを取り除く（元のバイト列へ完全に戻す）
@@ -251,7 +295,7 @@ pub fn remove_from_profile_in(home: &Path, shell: ShellKind) -> Result<EnsureOut
         return Ok(EnsureOutcome {
             shell,
             profile,
-            dir: PathBuf::new(),
+            dirs: Vec::new(),
             change: PathChange::Absent,
         });
     }
@@ -260,7 +304,7 @@ pub fn remove_from_profile_in(home: &Path, shell: ShellKind) -> Result<EnsureOut
     Ok(EnsureOutcome {
         shell,
         profile,
-        dir: PathBuf::new(),
+        dirs: Vec::new(),
         change: PathChange::Removed,
     })
 }
@@ -413,7 +457,7 @@ mod tests {
             ShellKind::Fish,
             ShellKind::PowerShell,
         ] {
-            let block = shell.block(&shell.dir_expr(&dir, home));
+            let block = shell.block(&[shell.dir_expr(&dir, home)]);
             assert!(
                 block.is_ascii(),
                 "{}: 非 ASCII が混ざっている",
@@ -448,7 +492,7 @@ mod tests {
             PathBuf::from(r"C:\Users\山田\bin ver2"), // 空白入り
         ] {
             let expr = ShellKind::PowerShell.dir_expr(&dir, home);
-            let block = ShellKind::PowerShell.block(&expr);
+            let block = ShellKind::PowerShell.block(std::slice::from_ref(&expr));
             assert!(
                 block.is_ascii(),
                 "非 ASCII が残った（$PROFILE を壊す）: dir={} block={block}",
@@ -475,7 +519,7 @@ mod tests {
     fn powershellブロックは変数経由でも二重追加ガードを持つ() {
         let home = Path::new("/home/u");
         let expr = ShellKind::PowerShell.dir_expr(&home.join(".local/bin"), home);
-        let block = ShellKind::PowerShell.block(&expr);
+        let block = ShellKind::PowerShell.block(std::slice::from_ref(&expr));
         assert!(block.contains("$__takoPathDir = Join-Path $HOME"));
         assert!(block.contains("-notlike"), "二重追加ガードが消えた");
         assert!(block.contains("$env:PATH = \"$__takoPathDir;\" + $env:PATH"));
@@ -495,6 +539,110 @@ mod tests {
         assert_eq!(out.change, PathChange::Installed);
         assert!(out.profile.ends_with("config.fish"));
         assert!(out.profile.is_file());
+        cleanup(&home);
+    }
+
+    /// #1502: tako CLI の置き場所を足してもマーカーは 1 組のまま。
+    /// 1 ディレクトリのときの本文が 2 ディレクトリの前半と完全に一致することも見る
+    /// （「並べただけ」= 既存ユーザーの profile の形を変えない）
+    #[test]
+    fn 複数ディレクトリでもマーカーブロックは一個() {
+        let home = temp_home("multi");
+        let a = home.join(".local/bin");
+        let b = PathBuf::from("/opt/tako/bin");
+        let out = ensure_dirs_on_path_in(
+            &home,
+            ShellKind::Zsh,
+            &[a.clone(), b.clone()],
+            Some("/usr/bin"),
+        )
+        .unwrap();
+        assert_eq!(out.change, PathChange::Installed);
+        assert_eq!(out.dirs, vec![a.clone(), b.clone()]);
+        let text = std::fs::read_to_string(&out.profile).unwrap();
+        assert_eq!(text.matches(BLOCK_BEGIN).count(), 1, "ブロックが増えている");
+        assert_eq!(text.matches(BLOCK_END).count(), 1);
+        assert!(text.contains("$HOME/.local/bin"));
+        assert!(text.contains("/opt/tako/bin"));
+        assert_eq!(
+            text.matches("esac").count(),
+            2,
+            "ガードがディレクトリ数ぶん無い"
+        );
+
+        // 2 回目は無変更（冪等）
+        let again = ensure_dirs_on_path_in(
+            &home,
+            ShellKind::Zsh,
+            &[a.clone(), b.clone()],
+            Some("/usr/bin"),
+        )
+        .unwrap();
+        assert_eq!(again.change, PathChange::Unchanged);
+        assert_eq!(std::fs::read_to_string(&out.profile).unwrap(), text);
+
+        // 除去は 1 回で全部消える
+        assert_eq!(
+            remove_from_profile_in(&home, ShellKind::Zsh)
+                .unwrap()
+                .change,
+            PathChange::Removed
+        );
+        assert!(!profile_has_block(&out.profile));
+        cleanup(&home);
+    }
+
+    /// macOS は claude / codex / agy も tako CLI も `~/.local/bin` なので、
+    /// 重複が落ちて**ブロックの中身は 1 ディレクトリのまま**になる（#1502）
+    #[test]
+    fn 同じディレクトリを重ねても一本にまとまる() {
+        let home = temp_home("dedup");
+        let dir = home.join(".local/bin");
+        let out = ensure_dirs_on_path_in(
+            &home,
+            ShellKind::Zsh,
+            &[dir.clone(), dir.clone(), dir.clone()],
+            Some("/usr/bin"),
+        )
+        .unwrap();
+        assert_eq!(out.dirs, vec![dir.clone()]);
+        let text = std::fs::read_to_string(&out.profile).unwrap();
+        assert_eq!(text.matches("esac").count(), 1);
+        // 1 ディレクトリ版（従来 API）と本文が完全一致する
+        let home2 = temp_home("dedup-single");
+        let single = ensure_dir_on_path_in(
+            &home2,
+            ShellKind::Zsh,
+            &home2.join(".local/bin"),
+            Some("/usr/bin"),
+        )
+        .unwrap();
+        let text2 = std::fs::read_to_string(&single.profile)
+            .unwrap()
+            .replace(&home2.display().to_string(), &home.display().to_string());
+        assert_eq!(text, text2);
+        cleanup(&home);
+        cleanup(&home2);
+    }
+
+    /// 一部だけ PATH に在るなら書く（全部揃って初めて `AlreadyOnPath`）
+    #[test]
+    fn 一部しかpathに無いなら書く() {
+        let home = temp_home("partial");
+        let a = home.join(".local/bin");
+        let b = PathBuf::from("/opt/tako/bin");
+        let current = format!("/usr/bin:{}", a.display());
+        let out = ensure_dirs_on_path_in(
+            &home,
+            ShellKind::Zsh,
+            &[a.clone(), b.clone()],
+            Some(&current),
+        )
+        .unwrap();
+        assert_eq!(out.change, PathChange::Installed);
+        let both = format!("{current}:{}", b.display());
+        let out2 = ensure_dirs_on_path_in(&home, ShellKind::Zsh, &[a, b], Some(&both)).unwrap();
+        assert_eq!(out2.change, PathChange::AlreadyOnPath);
         cleanup(&home);
     }
 

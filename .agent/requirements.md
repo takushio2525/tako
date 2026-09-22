@@ -357,8 +357,9 @@ FR-2.2.7 の環境変数解決のまま（誤ったペインへ副作用を起�
   ユーザーは、コマンドペイン・エージェントペイン（`$SHELL -l -c`）に注入が届かない。
   bash の非対話フックは `BASH_ENV` しかなく、これは tako と無関係なスクリプト実行まで
   巻き込むので採らない（対話シェルからは従来どおり届く）
-- **外部シェル向けの PATH 設置（symlink 等）は別件**（FR-2.14.5 / #601 案 2）。Windows は
-  インストーラーが PATH を扱う（#587）ため対象外
+- **外部シェル向けの PATH 設置（symlink 等）は FR-2.14.5**（#601 案 2 → **#1502 で実装**）。
+  tako 内側（ここ）は env 注入、外側は `$HOME/.local/bin/tako` の symlink + profile の
+  マーカーブロックで、**置き場所の解決だけ `tako_core::shell_integration::cli_dir()` を共有する**
 
 ### FR-2.5 AI レイアウト操作セット（Layer 1 / Layer 2 共通）
 
@@ -605,7 +606,7 @@ FR-2.12.6〜9 は 2026-07-27 に #552 で追加）:
 | FR-2.14.2 | 登録の有無・接続状態を tako 側で診断・表示できる（未登録・未接続時はその案内を含む） | S |
 | FR-2.14.3 | MCP の instructions / ツール説明文を「AI がアプリの趣旨を理解して能動的に機能を使う」品質に整備する（成果物はプレビューペインで提示・子エージェント起動は同タブ内分割、等の tako 流の振る舞いを誘導。FR-2.7.5 の行動規範の拡張） | M |
 | FR-2.14.4 | 登録・診断は CLI / MCP からも可能にする（開発不変条件） | M |
-| FR-2.14.5 | `tako` CLI バイナリの PATH 設置（`/usr/local/bin` 等へのシムリンク作成・更新）もオンボーディングに含める。tako 内のシェルから `tako` コマンドが素で使えることが Layer 1（CLI）の前提（2026-06-12 追記）。**tako 内側は FR-2.4.6 のシェル統合注入で解決済み**（Issue #601）。ここに残るのは**外部ターミナル**向けの設置 | S |
+| FR-2.14.5 | `tako` CLI バイナリの PATH 設置もオンボーディングに含める。tako 内のシェルから `tako` コマンドが素で使えることが Layer 1（CLI）の前提（2026-06-12 追記）。**tako 内側は FR-2.4.6 のシェル統合注入で解決済み**（Issue #601）。**外部ターミナル向けは #1502 で実装**: `tako setup` の段（および `tako setup bootstrap path` / MCP `tako_setup_bootstrap`）が **`$HOME/.local/bin/tako` へ symlink を張り**、そのディレクトリをログインシェルの profile（`~/.zprofile` のマーカーブロック **1 組**）へ通す。**実体のディレクトリ（`.app` の `Contents/MacOS` / dev の `target/debug`）は PATH へ入れない**（同居物ごと出るうえ `.app` を動かすと黙って切れる）。`$HOME/.local/bin` は claude / codex / agy のランチャーと同じ置き場所なので、macOS ではブロックの中身は 1 ディレクトリのまま。`tako setup bootstrap undo-path` でブロックと symlink の両方を外す（**symlink でない実体は消さない**）。`.app` を移動して切れたリンクは GUI 起動時に張り直す。判定は「**新しいターミナルが見る PATH**」で行う（自分のプロセスの PATH は #601 の注入で必ず「通っている」に見える）。Windows は `HKCU\Environment\Path`（境界 B23）へ**実体のディレクトリ**（インストーラ管理の `%LOCALAPPDATA%\Programs\tako`）を足す = symlink を使わない（権限が要るため）。**Windows 実機未検証**（コード分岐のみ） | S |
 | FR-2.14.6 | **セットアップ画面**: 必要なもの（claude CLI の存在 / MCP 登録 / tako CLI の PATH 設置）を**自動診断してチェックリスト表示**し、不足項目は「**セットアップ実行**」ボタン一発でまとめて自動導入する（FR-2.14.1 / 2.14.2 / 2.14.5 の UI 統合。手動手順をユーザーに踏ませない）。診断・セットアップ実行は CLI / MCP からも可能（FR-2.14.4 の対象に含める。2026-06-12 追記） | S |
 | FR-2.14.7 | `tako setup` は claude / codex / agy を全検出する。取得可能な認証・プランは source を `detected` と表示して即時採用し、未導入・未認証プロバイダは設定対象にしない。検出不能でも安全な既定値を置ける項目は source `default` で自動解決する。CLI 1 つ・認証済みの標準ケースは質問ゼロで完走し、プラン規模から profiles/default.yaml の master / worker、CLI 既定モデル、effort、worker ポリシーを推奨生成する。質問は「検出不能かつ誤ると実害がある」項目だけに限定し、Enter で進める既定値を必ず示す（Issue #226 / #262） | S |
 | FR-2.14.8 | setup 完了済みなら config の agent / provider plan、既存 profile・指示・プロジェクト、設定済み依存・FDA・スリープ設定を確認なしで引き継ぎ、冪等な再実行は質問ゼロ・実変更ゼロで完了する。source は `previous` と表示し、新しい検出値と食い違う場合は `detected` を優先して旧値も通知する。破損 config は既定値で上書きせず中断する。個別対話による見直しは明示的な `--review` だけで起動する（Issue #262） | S |

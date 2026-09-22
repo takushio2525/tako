@@ -47,7 +47,9 @@ pub const AUTOSUGGEST_VERSION: &str = "v0.7.1";
 pub const AUTOSUGGEST_HINT_DEFAULT: u32 = 10;
 
 /// tako CLI の実行ファイル名（Windows は `tako.exe`）
-fn cli_file_name() -> String {
+/// PATH から引かせる tako CLI のファイル名（`tako` / `tako.exe`）。
+/// **正本はここ 1 箇所**（[`crate::tako_cli_path`] も同じ名前で symlink を張る）
+pub fn cli_file_name() -> String {
     format!("tako{}", std::env::consts::EXE_SUFFIX)
 }
 
