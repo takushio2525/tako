@@ -20,6 +20,10 @@
 //! （`common/production_range.rs` でテスト領域を潰してから
 //! `common/code_view.rs` の `literals_only` を掛ける）。
 //!
+//! **走査そのものは `common/emoji_scan.rs` の 1 実装**で、CLI 出力を見張る
+//! `issue1578_no_emoji_cli_watchdog` と共有する（#1578）。この番犬が持つのは
+//! 「どこを見るか」（[`ROOTS`]）と「何を許すか」（[`ALLOW`]）だけ。
+//!
 //! - **コメントは対象外**。UI には出ないし、規約や理由の説明文に禁止文字そのものを
 //!   書けなくなると「何を禁じているか」をソースに残せない
 //! - **`#[cfg(test)]` の中も対象外**。`text_field.rs` / `right_panel.rs` の
@@ -41,31 +45,10 @@
 //! 例外は「ファイル × 文字 × 件数 × 理由」で持つので、
 //! **同じファイルに別の絵文字が増えても、同じ絵文字が 1 個増えても落ちる**。
 
-use std::path::{Path, PathBuf};
+#[path = "common/emoji_scan.rs"]
+mod emoji_scan;
 
-#[path = "common/production_range.rs"]
-mod production_range;
-use production_range::code_view;
-
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("リポジトリルート")
-        .to_path_buf()
-}
-
-/// 絵文字を残してよい場所。**`why` が空の行は無効**（下の検査が落とす）
-struct Allow {
-    /// リポジトリルートからの相対パス
-    rel: &'static str,
-    /// 許す文字
-    ch: char,
-    /// そのファイルにその文字が出る件数（増減したら落とす = 見直しを強制する）
-    count: usize,
-    /// なぜ「tako が描く UI の絵文字」ではないのか
-    why: &'static str,
-}
+use emoji_scan::{production_range, repo_root, Allow, Hit};
 
 /// セルフテスト（`TAKO_SELF_TEST=1`）が画面へ流し込む**ターミナル / claude TUI の
 /// 中身**。`#[cfg(test)]` ではなく env で分岐する本番コードなので範囲取りでは外れない。
@@ -116,166 +99,28 @@ const ALLOW: &[Allow] = &[
 ];
 
 /// 走査対象（`crates/tako-app/src` の全 `.rs`）
+const ROOTS: &[&str] = &["crates/tako-app/src"];
+
 fn app_sources() -> Vec<(String, String)> {
-    let root = repo_root().join("crates/tako-app/src");
-    let mut out = Vec::new();
-    let mut stack = vec![root.clone()];
-    while let Some(dir) = stack.pop() {
-        let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{dir:?} を読めない: {e}"));
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                let rel = path
-                    .strip_prefix(repo_root())
-                    .expect("リポジトリ内")
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                let src = std::fs::read_to_string(&path).expect("UTF-8 のソース");
-                out.push((rel, src));
-            }
-        }
-    }
-    out.sort();
-    out
-}
-
-/// 見つけた 1 件（`file:line` で名指しするための最小の情報）
-#[derive(Debug, Clone)]
-struct Hit {
-    rel: String,
-    line: usize,
-    ch: char,
-    /// `\u{XXXX}` の書き方で見つけたか（報告に出す）
-    escaped: bool,
-}
-
-impl Hit {
-    fn describe(&self) -> String {
-        let how = if self.escaped {
-            r"（\u{} 表記）"
-        } else {
-            ""
-        };
-        format!(
-            "{}:{}: {:?} (U+{:04X}){}",
-            self.rel, self.line, self.ch, self.ch as u32, how
-        )
-    }
-}
-
-/// `\u{XXXX}` を復号して返す（`}` が無い・16 進でない書き方は無視する）
-fn unicode_escapes(line: &str) -> Vec<char> {
-    let b = line.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    while i + 3 < b.len() {
-        if b[i] == b'\\' && b[i + 1] == b'u' && b[i + 2] == b'{' {
-            let start = i + 3;
-            let mut j = start;
-            // 16 進の続きは ASCII なので、多バイト文字の途中で切れることはない
-            while j < b.len() && b[j] != b'}' {
-                j += 1;
-            }
-            if j > start && j < b.len() {
-                if let Ok(cp) = u32::from_str_radix(&line[start..j], 16) {
-                    if let Some(c) = char::from_u32(cp) {
-                        out.push(c);
-                    }
-                }
-            }
-            i = j.max(start);
-            continue;
-        }
-        i += 1;
-    }
-    out
-}
-
-/// 1 ファイルぶんの違反（**本番コードの文字列リテラルの中身だけ**を見る）
-fn hits_in(rel: &str, src: &str) -> Vec<Hit> {
-    // 下限は掛けない: `main.rs` のようにテストの厚いファイルまで舐めるため
-    // （黙って縮んでいないことは `走査範囲が黙って消えていない` が見る）
-    let production = production_range::scan(src).text;
-    let view = code_view::literals_only(&production);
-    let mut out = Vec::new();
-    for (idx, line) in view.lines().enumerate() {
-        let no = idx + 1;
-        for ch in line.chars() {
-            if tako_core::emoji::is_emoji(ch) {
-                out.push(Hit {
-                    rel: rel.to_string(),
-                    line: no,
-                    ch,
-                    escaped: false,
-                });
-            }
-        }
-        for ch in unicode_escapes(line) {
-            if tako_core::emoji::is_emoji(ch) {
-                out.push(Hit {
-                    rel: rel.to_string(),
-                    line: no,
-                    ch,
-                    escaped: true,
-                });
-            }
-        }
-    }
-    out
+    emoji_scan::sources_under(ROOTS)
 }
 
 /// 走査全体の違反（許可リストを引く前の生の一覧）
 fn all_hits() -> Vec<Hit> {
     app_sources()
         .iter()
-        .flat_map(|(rel, src)| hits_in(rel, src))
+        .flat_map(|(rel, src)| emoji_scan::hits_in(rel, src))
         .collect()
 }
 
 #[test]
 fn tako_appの画面文字列に絵文字が無い() {
-    let hits = all_hits();
-    let mut unexpected: Vec<&Hit> = Vec::new();
-    let mut counted: Vec<(&Allow, Vec<&Hit>)> =
-        ALLOW.iter().map(|a| (a, Vec::new())).collect::<Vec<_>>();
-    for hit in &hits {
-        match counted
-            .iter_mut()
-            .find(|(a, _)| a.rel == hit.rel && a.ch == hit.ch)
-        {
-            Some((_, got)) => got.push(hit),
-            None => unexpected.push(hit),
-        }
-    }
-
-    let mut problems: Vec<String> = Vec::new();
-    for hit in &unexpected {
-        problems.push(format!(
-            "{}  ← UI の文字列に絵文字。`gpui::svg()` + `file_icons::ui_icon` で描くか、\
-             ターミナル / claude の画面データなら ALLOW へ理由つきで載せる",
-            hit.describe()
-        ));
-    }
-    for (allow, got) in &counted {
-        if got.len() != allow.count {
-            let where_ = got
-                .iter()
-                .map(|h| h.describe())
-                .collect::<Vec<_>>()
-                .join("\n    ");
-            problems.push(format!(
-                "{} の {:?} が {} 件（許可リストは {} 件）。\
-                 増えたなら UI へ混ざっていないか、減ったなら許可の理由がまだ要るかを見直す\n    {}",
-                allow.rel,
-                allow.ch,
-                got.len(),
-                allow.count,
-                where_
-            ));
-        }
-    }
+    let problems = emoji_scan::problems(
+        &all_hits(),
+        ALLOW,
+        "UI の文字列に絵文字。`gpui::svg()` + `file_icons::ui_icon` で描くか、\
+         ターミナル / claude の画面データなら ALLOW へ理由つきで載せる",
+    );
     assert!(
         problems.is_empty(),
         "UI に絵文字を使わない（#1536 / #217）に反する箇所が {} 件:\n{}",
@@ -286,15 +131,7 @@ fn tako_appの画面文字列に絵文字が無い() {
 
 #[test]
 fn 許可リストは理由を必ず持つ() {
-    for a in ALLOW {
-        assert!(
-            !a.why.trim().is_empty(),
-            "{} の {:?} に理由が無い（理由なしの許可は認めない）",
-            a.rel,
-            a.ch
-        );
-        assert!(a.count > 0, "{} の {:?} の件数が 0", a.rel, a.ch);
-    }
+    emoji_scan::assert_allow_is_justified(ALLOW);
 }
 
 #[test]
@@ -309,7 +146,7 @@ fn 走査範囲が黙って消えていない() {
     let literal_bytes: usize = sources
         .iter()
         .map(|(_, src)| {
-            code_view::literals_only(&production_range::scan(src).text)
+            production_range::code_view::literals_only(&production_range::scan(src).text)
                 .bytes()
                 .filter(|b| !b.is_ascii_whitespace())
                 .count()
@@ -332,7 +169,7 @@ fn render() {
         .child("☕ 休憩");                               // Issue が名指しした形
 }
 "#;
-    let hits = hits_in("crates/tako-app/src/injected.rs", injected);
+    let hits = emoji_scan::hits_in("crates/tako-app/src/injected.rs", injected);
     let found: Vec<char> = hits.iter().map(|h| h.ch).collect();
     for expected in ['\u{2B06}', '\u{2194}', '\u{25B6}', '\u{FE0F}', '\u{2615}'] {
         if expected == '\u{FE0F}' {
@@ -367,7 +204,7 @@ fn コメントの中の絵文字は落とさない() {
 fn f() {}
 "#;
     assert!(
-        hits_in("crates/tako-app/src/c.rs", only_comments).is_empty(),
+        emoji_scan::hits_in("crates/tako-app/src/c.rs", only_comments).is_empty(),
         "コメントを違反として拾っている"
     );
 }
@@ -377,8 +214,8 @@ fn f() {}
 #[test]
 fn 二つの眺めは噛み合っていて長さを変えない() {
     let src = "// コメント ☕\nfn f() {\n    let s = \"本文 ☕\";\n    let c = 'x';\n    let r = r#\"生 ☕\"#;\n}\n";
-    let code = code_view::code_view(src);
-    let lits = code_view::literals_only(src);
+    let code = production_range::code_view::code_view(src);
+    let lits = production_range::code_view::literals_only(src);
     assert_eq!(code.len(), src.len(), "コード側でバイト長が変わっている");
     assert_eq!(lits.len(), src.len(), "リテラル側でバイト長が変わっている");
     assert_eq!(
@@ -415,15 +252,31 @@ fn 判定の写しを持たない() {
     let ui_text = std::fs::read_to_string(repo_root().join("crates/tako-app/src/ui_text/mod.rs"))
         .expect("ui_text/mod.rs");
     assert!(
-        ui_text.contains("tako_core::emoji::is_emoji"),
+        code_view(&ui_text).contains("tako_core::emoji::is_emoji"),
         "ui_text のカタログ検査が共有実装を呼んでいない（範囲がずれる）"
+    );
+    // 走査は `common/emoji_scan.rs` へ寄せた（#1578）ので、判定を呼んでいるのは
+    // そちら。**この番犬自身の説明文で緑になってはいけない**ので実体を見る
+    let shared =
+        std::fs::read_to_string(repo_root().join("crates/tako-control/tests/common/emoji_scan.rs"))
+            .expect("共有の走査");
+    assert!(
+        code_view(&shared).contains("tako_core::emoji::is_emoji"),
+        "共有の走査が判定の 1 実装を呼んでいない（コメントではなくコードで）"
     );
     let me = std::fs::read_to_string(
         repo_root().join("crates/tako-control/tests/issue1536_no_emoji_ui_watchdog.rs"),
     )
     .expect("この番犬自身");
     assert!(
-        me.contains("tako_core::emoji::is_emoji"),
-        "番犬が共有実装を呼んでいない"
+        // `#[path = "…"]` は文字列リテラルなので code_view では消える。
+        // モジュール宣言そのもの（コード）を見る
+        code_view(&me).contains("mod emoji_scan"),
+        "番犬が共有の走査を使っていない（写しを持つと範囲がずれる）"
     );
+}
+
+/// 「コメントではなくコードに書いてあるか」を見るための眺め（説明文で緑にしない）
+fn code_view(src: &str) -> String {
+    production_range::code_view::code_view(src)
 }

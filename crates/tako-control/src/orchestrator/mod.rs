@@ -2353,7 +2353,7 @@ pub fn one_m_model_warning(model: &str, source: &str) -> Option<String> {
         return None;
     }
     Some(format!(
-        "⚠ {source} のモデル '{model}' は 1M コンテキスト版のため、Pro プランでは起動できない可能性があります（Max / API プラン向け）。\n  起動に失敗する場合は `tako orchestrator profiles set <プロファイル名> --clear-model` で解除してください"
+        "[警告] {source} のモデル '{model}' は 1M コンテキスト版のため、Pro プランでは起動できない可能性があります（Max / API プラン向け）。\n  起動に失敗する場合は `tako orchestrator profiles set <プロファイル名> --clear-model` で解除してください"
     ))
 }
 
