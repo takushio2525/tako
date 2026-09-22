@@ -178,7 +178,7 @@ expected_checks() {
       workflow_job_names "${f}"
     done
   fi
-  printf '%s\n' "${EXTERNAL_CHECKS[@]}"
+  printf '%s\n' ${EXTERNAL_CHECKS[@]+"${EXTERNAL_CHECKS[@]}"}
 }
 
 EXPECTED=()
@@ -241,7 +241,7 @@ evaluate() {
   FAILED_N=0
   DONE_N=0
   REPORTED_N=0
-  for name in "${EXPECTED[@]}"; do
+  for name in ${EXPECTED[@]+"${EXPECTED[@]}"}; do
     bucket="$(field_of 1 "${name}")"
     [[ -n "${bucket}" ]] || MISSING+=("${name}")
   done
@@ -307,7 +307,7 @@ elapsed_text() {
 # ---------------------------------------------------------------- 待つ
 
 echo "PR #${PR} の CI を待つ（期待 ${#EXPECTED[@]} 本 / 上限 ${TIMEOUT} 秒 / 間隔 ${INTERVAL} 秒）"
-for _name in "${EXPECTED[@]}"; do echo "  期待: ${_name}"; done
+for _name in ${EXPECTED[@]+"${EXPECTED[@]}"}; do echo "  期待: ${_name}"; done
 
 START="$(date +%s)"
 PREV_STATE=""
@@ -375,7 +375,7 @@ while :; do
         # チェックの結論と同じく、1 回の観測では確定しない（push 直後は古い値が返る）
         if [[ ${CONFLICT_SEEN} -eq 1 ]]; then
           pr_conflict_report wait "${PR}" "${PR_BASE_REF}" "${PR_MERGEABLE}" "${PR_MERGE_STATE}"
-          echo "  未登録のまま: $(join_names "${MISSING[@]}")" >&2
+          echo "  未登録のまま: $(join_names ${MISSING[@]+"${MISSING[@]}"})" >&2
           exit "${PR_CONFLICT_EXIT}"
         fi
         echo "[$(now)] 衝突を観測（mergeable=${PR_MERGEABLE} / ${PR_MERGE_STATE}）。同じ結論をもう 1 回見るまで確定しない"
@@ -395,7 +395,7 @@ while :; do
   NOW_ELAPSED=$(($(date +%s) - START))
   if [[ ${NOW_ELAPSED} -ge ${TIMEOUT} ]]; then
     echo "タイムアウト（${TIMEOUT} 秒 / ${POLLS} 回確認）: CI が揃わなかった"
-    if [[ ${#MISSING[@]} -gt 0 ]]; then echo "  未登録: $(join_names "${MISSING[@]}")"; fi
+    if [[ ${#MISSING[@]} -gt 0 ]]; then echo "  未登録: $(join_names ${MISSING[@]+"${MISSING[@]}"})"; fi
     if [[ ${PENDING_N} -gt 0 ]]; then echo "  実行中: ${PENDING_N} 本"; fi
     echo "  merge してはいけない（CI の結論が出ていない）"
     exit 2

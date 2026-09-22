@@ -62,7 +62,7 @@ mkdir -p "$(dirname "$OUT")"
 parts=()
 missing=()
 idx=0
-for spec in "${SCENES[@]}"; do
+for spec in ${SCENES[@]+"${SCENES[@]}"}; do
     IFS='|' read -r id src start dur cap sub <<< "$spec"
     if [ ! -f "$SCENES_DIR/$src" ]; then
         missing+=("${id}（${src}）")
@@ -101,7 +101,7 @@ done
 
 [ "${#parts[@]}" -gt 0 ] || { echo "ERROR: 使える素材が 1 本もない" >&2; exit 1; }
 if [ "${#missing[@]}" -gt 0 ]; then
-    echo "!! 素材が無いシーン: ${missing[*]}" >&2
+    echo "!! 素材が無いシーン: ${missing[*]+${missing[*]}}" >&2
     echo "!! （そのシーンを飛ばして繋ぎます）" >&2
 fi
 
@@ -121,7 +121,7 @@ else
         prev="$out"
     done
     fc=${fc%;}
-    ffmpeg -v error "${inputs[@]}" -filter_complex "$fc" -map "[vout]" \
+    ffmpeg -v error ${inputs[@]+"${inputs[@]}"} -filter_complex "$fc" -map "[vout]" \
         -c:v libx264 -preset medium -crf 18 -pix_fmt yuv420p -y "$video"
 fi
 

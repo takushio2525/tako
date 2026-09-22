@@ -62,7 +62,7 @@ scan tailnet      '\.ts\.net|tailscale\.com/|ts\.net'
 scan private_ip   '(^|[^0-9])(10|100|172|192)\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}'
 scan token        'sk-ant-|ghp_[A-Za-z0-9]{10,}|Bearer [A-Za-z0-9]|[A-Fa-f0-9]{32,}|session_[0-9A-Za-z]{16,}|claude\.ai/code/'
 scan uuid         '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-for t in "${terms[@]}"; do
+for t in ${terms[@]+"${terms[@]}"}; do
     # 公開ハンドル（GitHub の takushio2525）は URL として意図的に出すので除外しない側に置かない:
     # ここでは環境由来の語をそのまま探す。何が当たったかは hits.tsv で目視する
     scan "term" "$(printf '%s' "$t" | sed 's/[][\.*^$/]/\\&/g')"

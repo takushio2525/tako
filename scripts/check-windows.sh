@@ -39,7 +39,7 @@ fi
 
 if [ ${#missing[@]} -gt 0 ]; then
   echo "Windows クロスチェックの前提ツールが足りません。次を実行してください:" >&2
-  for m in "${missing[@]}"; do echo "  $m" >&2; done
+  for m in ${missing[@]+"${missing[@]}"}; do echo "  $m" >&2; done
   echo >&2
   echo "（CI は使わない方針のため、この検査は各自の macOS 上で行います）" >&2
   exit 2
@@ -89,4 +89,4 @@ for arg in "$@"; do
   fi
 done
 PATH="${LLVM_BIN}:$PATH" INCLUDE="$GPUI_DIR" \
-  cargo xwin check --workspace --target "$TARGET" "${ALL_TARGETS[@]}" "$@"
+  cargo xwin check --workspace --target "$TARGET" ${ALL_TARGETS[@]+"${ALL_TARGETS[@]}"} "$@"

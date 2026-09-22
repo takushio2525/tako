@@ -70,13 +70,13 @@ declare -a SPECS=(
   "icon_512x512.png 512" "icon_512x512@2x.png 1024"
 )
 if command -v rsvg-convert >/dev/null; then
-  for spec in "${SPECS[@]}"; do
+  for spec in ${SPECS[@]+"${SPECS[@]}"}; do
     name=${spec% *}; size=${spec#* }
     rsvg-convert -w "$size" -h "$size" "$SVG" -o "$ICONSET/$name"
   done
 else
   echo "    rsvg-convert なし → preview/icon-a-1024.png から sips で縮小生成"
-  for spec in "${SPECS[@]}"; do
+  for spec in ${SPECS[@]+"${SPECS[@]}"}; do
     name=${spec% *}; size=${spec#* }
     sips -z "$size" "$size" "$PNG1024" --out "$ICONSET/$name" >/dev/null
   done

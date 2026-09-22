@@ -138,7 +138,7 @@ resolve_tako_bin() {
     "$REPO_ROOT/target/debug/tako"
   )
   local c
-  for c in "${candidates[@]}"; do
+  for c in ${candidates[@]+"${candidates[@]}"}; do
     if [[ -x "$c" ]]; then
       printf '%s' "$c"
       return 0
@@ -475,7 +475,7 @@ if [[ -n "$UPDATE_NOTES_TAG" ]]; then
   if [[ ${#UPLOADED_NAMES[@]} -eq 0 ]]; then
     echo "警告: $UPDATE_NOTES_TAG にアセットが 1 つも無い（表は空になる）" >&2
   else
-    printf '    アセット: %s\n' "${UPLOADED_NAMES[@]}"
+    printf '    アセット: %s\n' ${UPLOADED_NAMES[@]+"${UPLOADED_NAMES[@]}"}
   fi
   refresh_release_notes "$UPDATE_NOTES_TAG"
   echo "==> ノートを更新した: $UPDATE_NOTES_TAG"
@@ -568,7 +568,7 @@ $(build_release_notes "$STABLE_TAG" "$STABLE_VERSION" "${ASSET_NAMES[@]+"${ASSET
 
   if gh release view "$STABLE_TAG" >/dev/null 2>&1; then
     echo "  安定版 Release $STABLE_TAG は既に存在。アセットのみアップロード"
-    for a in "${ASSETS[@]}"; do
+    for a in ${ASSETS[@]+"${ASSETS[@]}"}; do
       gh release upload "$STABLE_TAG" "$a" --clobber
     done
   else
@@ -576,7 +576,7 @@ $(build_release_notes "$STABLE_TAG" "$STABLE_VERSION" "${ASSET_NAMES[@]+"${ASSET
       --title "tako $STABLE_TAG" \
       --notes "$PROMOTE_NOTES" \
       --generate-notes \
-      "${ASSETS[@]}"
+      ${ASSETS[@]+"${ASSETS[@]}"}
     echo "  安定版 Release $STABLE_TAG を作成"
   fi
 
@@ -663,19 +663,19 @@ if [[ $PUBLISH -eq 1 ]] || [[ $DRAFT -eq 1 ]]; then
     ASSET_NAMES+=("$n")
   done < <(collect_dist_asset_names "$TAG")
   if [[ ${#ASSET_NAMES[@]} -gt 1 ]]; then
-    printf '  同梱アセット: %s\n' "${ASSET_NAMES[@]}"
+    printf '  同梱アセット: %s\n' ${ASSET_NAMES[@]+"${ASSET_NAMES[@]}"}
   fi
 
   # CHANGELOG + 実アセットからリリースノートを組み立て（ダウンロード表・OS 別手順・
   # Windows 版があれば Known limitations も。組み立ては build_release_notes が正）
-  RELEASE_NOTES=$(build_release_notes "$TAG" "$VERSION" "${ASSET_NAMES[@]}")
+  RELEASE_NOTES=$(build_release_notes "$TAG" "$VERSION" ${ASSET_NAMES[@]+"${ASSET_NAMES[@]}"})
 
   echo "==> GitHub Release 作成: $TAG"
 
   # 冪等性: Release が既に存在する場合はアセット追加のみ（#256）
   if gh release view "$TAG" >/dev/null 2>&1; then
     echo "    Release $TAG は既に存在。アセットのアップロードのみ実行"
-    gh release upload "$TAG" "${UPLOAD_PATHS[@]}" --clobber
+    gh release upload "$TAG" ${UPLOAD_PATHS[@]+"${UPLOAD_PATHS[@]}"} --clobber
   else
     # タグ push 直後は GitHub 側の伝播ラグで gh release create が失敗する
     # ことがあるため、指数バックオフ付きリトライで吸収する（#256）
@@ -696,7 +696,7 @@ if [[ $PUBLISH -eq 1 ]] || [[ $DRAFT -eq 1 ]]; then
           --generate-notes \
           $DRAFT_FLAG \
           $PRERELEASE_FLAG \
-          "${UPLOAD_PATHS[@]}" 2>"$GH_STDERR_FILE" || GH_EXIT=$?
+          ${UPLOAD_PATHS[@]+"${UPLOAD_PATHS[@]}"} 2>"$GH_STDERR_FILE" || GH_EXIT=$?
 
       if [[ $GH_EXIT -eq 0 ]]; then
         rm -f "$GH_STDERR_FILE"
@@ -712,7 +712,7 @@ if [[ $PUBLISH -eq 1 ]] || [[ $DRAFT -eq 1 ]]; then
         # 部分成功（Release は作られたがアセット添付で失敗等）への対処
         if gh release view "$TAG" >/dev/null 2>&1; then
           echo "    Release $TAG が前回の試行で作成された。アセットをアップロード"
-          gh release upload "$TAG" "${UPLOAD_PATHS[@]}" --clobber
+          gh release upload "$TAG" ${UPLOAD_PATHS[@]+"${UPLOAD_PATHS[@]}"} --clobber
           RELEASE_CREATED=1
           break
         fi

@@ -76,7 +76,7 @@ ls_sweep_stale_registrations() {
   ((${#leftovers[@]} > 0)) || return 0
   echo "警告: $LS_CANONICAL_APP 以外にも tako.app がディスク上にあります（#837）。" >&2
   echo "      「このアプリケーションで開く」の候補を宣言しているものは Finder に重複して並びます:" >&2
-  for registered in "${leftovers[@]}"; do
+  for registered in ${leftovers[@]+"${leftovers[@]}"}; do
     # CFBundleDocumentTypes を宣言していない古いバンドルは、登録されても候補には出ない
     if /usr/libexec/PlistBuddy -c 'Print :CFBundleDocumentTypes' \
       "$registered/Contents/Info.plist" >/dev/null 2>&1; then

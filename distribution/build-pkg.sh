@@ -27,7 +27,7 @@ SIGN=0
 for arg in "$@"; do
   case "$arg" in
     --sign) SIGN=1 ;;
-    *) echo "不明な引数: $arg（--sign のみ対応）" >&2; exit 2 ;;
+    *) echo "不明な引数: ${arg}（--sign のみ対応）" >&2; exit 2 ;;
   esac
 done
 

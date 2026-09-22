@@ -221,7 +221,7 @@ dl() {
   local -a args=(-s -o "$TMP/dl" -D "$TMP/headers" -w '%{http_code} %{size_download}'
     -H "X-Forwarded-For: 100.64.0.7" -H "X-Forwarded-Host: $HOST_HDR")
   if [ -n "$range" ]; then args+=(-H "Range: $range"); fi
-  curl "${args[@]}" "$BASE/api/files/download?root=$ROOT_ID&path=$(urlq "$REL")$extra"
+  curl ${args[@]+"${args[@]}"} "$BASE/api/files/download?root=$ROOT_ID&path=$(urlq "$REL")$extra"
 }
 headers() { tr -d '\r' < "$TMP/headers"; }
 hval() { headers | grep -i "^$1:" | head -1 | cut -d' ' -f2- | tr -d ' '; }

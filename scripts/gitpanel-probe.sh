@@ -50,7 +50,7 @@ iso_start() {
         swiftc -O -o "$WINBOUNDS" "$ROOT/scripts/promo/winbounds.swift" || exit 1
     fi
 
-    ( cd "$REPO" && exec "${iso_env[@]}" "$APP" ) >"$ISO/app.log" 2>&1 &
+    ( cd "$REPO" && exec ${iso_env[@]+"${iso_env[@]}"} "$APP" ) >"$ISO/app.log" 2>&1 &
     echo $! > "$ISO/app.pid"
 
     for _ in $(seq 1 80); do
@@ -91,10 +91,10 @@ burst)
     trap iso_stop EXIT
     WID=$(cat "$ISO/wid"); APP_PID=$(cat "$ISO/app.pid")
     sleep 2
-    "${iso_env[@]}" "$CLI" panel --show --view git >/dev/null 2>&1
+    ${iso_env[@]+"${iso_env[@]}"} "$CLI" panel --show --view git >/dev/null 2>&1
     sleep 3
-    for W in "${WIDTHS[@]}"; do
-        "${iso_env[@]}" "$CLI" panel --width "$W" >/dev/null 2>&1
+    for W in ${WIDTHS[@]+"${WIDTHS[@]}"}; do
+        ${iso_env[@]+"${iso_env[@]}"} "$CLI" panel --width "$W" >/dev/null 2>&1
         sleep 1.5
         "$WINBOUNDS" "$APP_PID" --activate >/dev/null 2>&1
         sleep 0.4
@@ -102,7 +102,7 @@ burst)
         echo "   w${W}.png: $(stat -f %z "$OUT/w${W}.png" 2>/dev/null) bytes"
     done
     # 描画停止（同じ絵が撮れ続ける）検出
-    uniq_count=$(for W in "${WIDTHS[@]}"; do stat -f %z "$OUT/w${W}.png" 2>/dev/null; done | sort -u | wc -l | tr -d ' ')
+    uniq_count=$(for W in ${WIDTHS[@]+"${WIDTHS[@]}"}; do stat -f %z "$OUT/w${W}.png" 2>/dev/null; done | sort -u | wc -l | tr -d ' ')
     if [ ${#WIDTHS[@]} -gt 1 ] && [ "$uniq_count" -le 1 ]; then
         echo "ERROR: 全キャプチャが同一サイズ = 描画停止フレームの可能性。撮り直しが必要" >&2
         exit 1
@@ -113,17 +113,17 @@ start)
     iso_stop; sleep 1
     iso_start || exit 1
     sleep 2
-    "${iso_env[@]}" "$CLI" panel --show --view git >/dev/null 2>&1
+    ${iso_env[@]+"${iso_env[@]}"} "$CLI" panel --show --view git >/dev/null 2>&1
     sleep 2
-    "${iso_env[@]}" "$CLI" panel 2>&1 | head -3
+    ${iso_env[@]+"${iso_env[@]}"} "$CLI" panel 2>&1 | head -3
     ;;
 cli)
-    exec "${iso_env[@]}" "$CLI" "$@"
+    exec ${iso_env[@]+"${iso_env[@]}"} "$CLI" "$@"
     ;;
 shot)
     OUT=${1:?出力先 png}; W=${2:-}
     APP_PID=$(cat "$ISO/app.pid"); WID=$(cat "$ISO/wid")
-    if [ -n "$W" ]; then "${iso_env[@]}" "$CLI" panel --width "$W" >/dev/null 2>&1; sleep 1.5; fi
+    if [ -n "$W" ]; then ${iso_env[@]+"${iso_env[@]}"} "$CLI" panel --width "$W" >/dev/null 2>&1; sleep 1.5; fi
     "$WINBOUNDS" "$APP_PID" --activate >/dev/null 2>&1
     sleep 0.5
     mkdir -p "$(dirname "$OUT")"

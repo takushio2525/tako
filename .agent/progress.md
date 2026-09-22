@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-21（#1490: 隔離 GUI の起動を scripts/lib の 1 実装へ寄せ、起動ごとに tako-vd を起こす）
-- `scripts/lib/isolated-gui.sh` を新設（`isolated_gui_bins` / `launch_isolated_gui` / `wait_isolated_gui` / `stop_isolated_gui`）し、`virtual-display.sh ensure` を**起動の直前に毎回**通す形へ。`scripts/test-*.sh` 12 本を差し替え（-151 行）。Issue の grep は `"…virtual-display.sh" ensure` の引用符に当たらず全部 0 に見えていたが、正しく数えると「起動の直前に通していたのは 4 本 / 冒頭 1 回が 6 本 / 呼んでいないのが 2 本」で症状は実在
-- 実測（眠った tako-vd から。`pmset displaysleepnow` で再現）: **master-launch が OK=0 rc=1 → OK=34 rc=0**・**1485 が OK=12 NG=14 → OK=26 NG=0**（14 NG は全部「窓を開かずに終了」= #1160 の中止）・**worker-min-width が OK=6 → OK=12**（3 腕のうち 1 腕しか走れていなかった）。他 9 本は前後一致・回帰 0
-- 番犬 `issue1490_isolated_gui_launch_watchdog` 5 本（直書き 4 形 + 手書きの背景起動 / ensure を file:line で名指し）。注入で 2 本 FAILED → 戻して 5/5 緑。workspace 5021 passed 0 failed・clippy 3 宇宙 0・check-windows error 0
-
 ## 2026-09-21（#1493: main で赤かった test-remote-fs-1451.sh を現行契約へ合わせ、番犬で縛った）
 - 真因は製品の回帰ではなく**テストの前提の追従漏れ**。#1452（`fd46c81`）が ①承認の呼び出し元ゲート（`remote_role.rs:432` `decide` を `remote.rs:5014` が引く）②「現より弱い role の要求は保留を作らない」（`remote_auth.rs:272`）の 2 つを入れ、`test-remote-launch-1449.sh` / `test-remote-master-launch.sh` には宣言を足したが、同日着地の `test-remote-fs-1451.sh` だけ漏れた。承認が 403 `upgrade_requires_gui` で端末が 1 台も登録されず **OK=18 NG=55**
 - `TAKO_REMOTE_TRUSTED_ADMIN_NAMES="curl"` を宣言し、`pair_as` を「撃った」ではなく**「据わった」を確かめる**形へ（降格は `/api/admin/devices/role`）。番犬 `issue1493_admin_gate_script_watchdog` 3 本 + `.agent/conventions.md` に規約。**注入 A が素通りする穴（案内文の env 名を宣言と誤認）を実測で見つけて塞いだ**
@@ -54,3 +49,8 @@
 - 真因は**入口が 2 種類の問いを同じ `pane` 欄へ混ぜていた**こと。受け手の解決順は「確かな順」= pid 祖先辿りが最優先で `pane` は stale になりうる env 由来として扱う契約（#288 / #210）なので、`--pane` は毎回黙って負けていた（pane 1954 から `--pane 1964` → `pane_id: 1954`）。MCP は caller_pid を持たないので pane_id は動くが `caller_role` が残り profile だけ呼び出し元のものになる
 - 組み立てを `Request::orchestrator_self`（protocol.rs）の 1 本へ寄せ、**名指しなら呼び出し元の手掛かりを 1 つも載せない**。自分を名指しした場合は「私についての問い」に倒す（solo の profile は env の `solo:<名前>` にしか無い）。受け手は `named_pane` で名指しを見分け、解けなければ role 検索へ落とさず `PaneNotFound`（#1466）。応答の `role` は名乗り → 対象ペインのラベル、master / solo でなければ理由を `warnings` へ。`adopt` / `guide` / `handoff` の `--pane` は同型のまま（寄せるのは入口 1 か所で済む）
 - 実測: 本番 GUI（旧バイナリ）に対して修正 CLI が `pane_id 1964 / profile <名指し先のもの> / profile_source pane_role`（出荷 CLI と `TAKO_1516_LEGACY=1` は 1967 = 症状）。`scripts/test-self-pane-1516.sh` **28 PASS 0 FAIL**（隔離 GUI・CLI / MCP 両経路 / A/B / エッジ 3 種）。実注入 6 通りすべて FAILED + file:line 名指し（CLI へ戻すと e2e が 11 NG）。番犬 `issue1516_named_pane_watchdog` 3 本・workspace 5047 passed 0 failed・clippy 3 宇宙 0・check-windows error 0
+
+## 2026-09-22（#1518: bash 3.2 で落ちる空配列展開を 41 箇所直し、番犬で縛った）
+- 走査は `set -u` 宣言だけでは足りなかった: `scripts/lib/*.sh` / `promo/lib.sh` は宣言側から source されて継ぐので 4 箇所が隠れ、逆にクォート付きヒアドキュメント（`promo/lib.sh` が書き出すデモ用スクリプト）の 3 箇所は囲む側が展開しないので対象外。**41 箇所 / 12 ファイル**へ `${arr[@]+"${arr[@]}"}` を適用（挙動は不変）
+- 判定は実測で 1 点に絞った（`/bin/bash` 3.2.57・空配列・`set -u` で落ちるのは**演算子の無い** `${a[@]}` / `${a[*]}` だけ。`${#a[@]}` / `${!a[@]}` / `:-` / `:+` / `:1` / `#pat` / `/pat/rep` は通る）。番犬 `空配列の展開はbash32の慣用句で守られている` はリポジトリ全体の `.sh` を走査し、例外は `# tako:bash32-ok <理由>`（理由なしは無効）。走査を `scripts/` から広げた初回に #837 の実在バグ `distribution/build-pkg.sh:30` が出たので同時に直した
+- 実測: 全 41 箇所を実ファイル本文から抽出して A/B（空 → 旧形は `unbound variable`・新形は通る / 非空 3 要素は 1 バイト同一）= 54/54。触った 13 本を `/bin/bash` 3.2 で副作用の無い経路から実走 27/27（`test-release-retry` 55/0・`test-wait-pr-checks` 137/0・`test-launch-services` 17/0 を含む）。注入 11 通りすべて file:line 名指し。実際に空が渡る経路は 4 系統（`check-windows.sh --all-targets` = 即死・`promo/lib.sh` の `PROMO_ENV_CLEAN` = 即死・`release.sh --promote` の `ASSETS`・`wait-pr-checks.sh:378` は `$( )` の中で死ぬので案内の中身だけ消える）。workspace 5045 passed 0 failed・clippy 3 宇宙 0

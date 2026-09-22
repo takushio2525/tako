@@ -114,7 +114,7 @@ launch_isolated_gui() {
     [ -n "$ISOLATED_GUI_BOUNDS" ] && \
         env_args+=("TAKO_WINDOW_BOUNDS=${TAKO_WINDOW_BOUNDS:-$ISOLATED_GUI_BOUNDS}")
     # 呼び出し側が並べた `VAR=VAL` は既定より後ろ = そちらが勝つ
-    env "${env_args[@]}" "$@" "$APP_BIN" > "$log" 2>&1 &
+    env ${env_args[@]+"${env_args[@]}"} "$@" "$APP_BIN" > "$log" 2>&1 &
     ISOLATED_GUI_PID=$!
     return 0
 }
