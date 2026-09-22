@@ -3362,13 +3362,15 @@ fn cli_main() -> ExitCode {
             orchestrator_profiles_cli(sub)
         }
         Command::Orchestrator(OrchestratorCommand::SelfInfo { pane }) => {
-            let pane = pane.or_else(caller_pane);
+            // #1516: `--pane N` は「そのペインは何か」という名指しなので、呼び出し元の
+            // 手掛かり（env pane / role / pid）を混ぜない。判断は正本 1 本に閉じる
             let caller_role = std::env::var("TAKO_ORCHESTRATOR_ROLE").ok();
-            send_request(Request::OrchestratorSelf {
+            send_request(Request::orchestrator_self(
                 pane,
+                caller_pane(),
                 caller_role,
-                caller_pid: Some(std::process::id()),
-            })
+                Some(std::process::id()),
+            ))
             .map(|result| println!("{}", pretty_json(&result)))
         }
         Command::Orchestrator(OrchestratorCommand::Handoff {

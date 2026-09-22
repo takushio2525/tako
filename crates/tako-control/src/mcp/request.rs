@@ -616,11 +616,14 @@ pub(super) fn build_request(
             auto_shrink_font: bool_arg(args, "auto_shrink_font")?,
             min_worker_font_scale: f64_arg(args, "min_worker_font_scale")?.map(|v| v as f32),
         },
-        "tako_orchestrator_self" => Request::OrchestratorSelf {
-            pane: u64_arg(args, "pane")?.or(caller),
-            caller_role: caller_role.map(str::to_string),
-            caller_pid: u64_arg(args, "caller_pid")?.map(|v| v as u32),
-        },
+        // #1516: `pane` の明示指定は「そのペインは何か」という名指し。呼び出し元の
+        // 手掛かり（session の caller_pane / caller_role）を混ぜない（正本 1 本）
+        "tako_orchestrator_self" => Request::orchestrator_self(
+            u64_arg(args, "pane")?,
+            caller,
+            caller_role.map(str::to_string),
+            u64_arg(args, "caller_pid")?.map(|v| v as u32),
+        ),
         "tako_orchestrator_handoff" => Request::OrchestratorHandoff {
             pane: u64_arg(args, "pane")?.or(caller),
             caller_role: caller_role.map(str::to_string),

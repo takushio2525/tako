@@ -2364,12 +2364,12 @@
     "name": "tako_orchestrator_workers"
   },
   {
-    "description": "master / solo が自分自身の pane・tab・ctx%・session_id を取得する。master は MCP 経由では自分のペイン ID を知る手段がなかったが（#123）、このツールで自己特定できる。ctx_percent はコンテキスト使用率（0〜100）、ctx_threshold は引き継ぎ閾値（プロファイルの ctx_threshold → config.yaml → 既定 60 の順で解決。値域 50〜60。出どころは ctx_threshold_source）、ctx_over_threshold は閾値超えフラグ。ctx_over_threshold が true になったら、ユーザーの許可を待たずに handoff_path のファイルを最新化して tako_orchestrator_handoff を呼ぶ（#749）。auto_handoff は tako 側の自動通知が有効かどうか（有効なら閾値超過で 「【tako 自動通知】」で始まる指示が届く。届いたら即座に引き継ぎを始める）。handoff_path / handoff_exists は**プロファイル運用メモ**（handoff/<profile>.md。プロジェクトに紐付かない運用知識の置き場）。#915: プロジェクト固有の引き継ぎは project_handoffs の各 path（handoff/projects/<project-key>.md）に書く。そこへ書いたものは、そのプロジェクトを管轄する master の後任にだけ渡る。旧形式は読むついでに自動移行される（handoff_migration。冪等）。profile_source が pane_role なら呼び出し元のTAKO_ORCHESTRATOR_ROLE が失われている（ペインの role ラベルから復元した。#854）。handoff_format はその書式（#792。sectioned = 知識 / 実行状態の 2 節に分かれている、legacy = 節分離前、null = ファイル未作成）、handoff_sections は認識できた節。legacy なら次に更新するとき 2 節へ書き直す。pane を省略すると caller の環境変数（TAKO_PANE_ID / TAKO_ORCHESTRATOR_ROLE）から自動解決する。",
+    "description": "master / solo が自分自身の pane・tab・ctx%・session_id を取得する。master は MCP 経由では自分のペイン ID を知る手段がなかったが（#123）、このツールで自己特定できる。ctx_percent はコンテキスト使用率（0〜100）、ctx_threshold は引き継ぎ閾値（プロファイルの ctx_threshold → config.yaml → 既定 60 の順で解決。値域 50〜60。出どころは ctx_threshold_source）、ctx_over_threshold は閾値超えフラグ。ctx_over_threshold が true になったら、ユーザーの許可を待たずに handoff_path のファイルを最新化して tako_orchestrator_handoff を呼ぶ（#749）。auto_handoff は tako 側の自動通知が有効かどうか（有効なら閾値超過で 「【tako 自動通知】」で始まる指示が届く。届いたら即座に引き継ぎを始める）。handoff_path / handoff_exists は**プロファイル運用メモ**（handoff/<profile>.md。プロジェクトに紐付かない運用知識の置き場）。#915: プロジェクト固有の引き継ぎは project_handoffs の各 path（handoff/projects/<project-key>.md）に書く。そこへ書いたものは、そのプロジェクトを管轄する master の後任にだけ渡る。旧形式は読むついでに自動移行される（handoff_migration。冪等）。profile_source が pane_role なら呼び出し元のTAKO_ORCHESTRATOR_ROLE が失われている（ペインの role ラベルから復元した。#854）。handoff_format はその書式（#792。sectioned = 知識 / 実行状態の 2 節に分かれている、legacy = 節分離前、null = ファイル未作成）、handoff_sections は認識できた節。legacy なら次に更新するとき 2 節へ書き直す。pane を省略すると caller の環境変数（TAKO_PANE_ID / TAKO_ORCHESTRATOR_ROLE）から自動解決する。#1516: pane を**明示すると、そのペインについて**答える（別の master の状態を横から確認する用途）。呼び出し元の名乗りは使わないので profile / role はそのペインの role ラベルから解け（profile_source=pane_role）、role にはペインのラベル（orchestrator-master:<profile> の語彙）が入る。名指ししたペインが master / solo でなければ pane_id はそのまま返しつつ、profile が既定へ落ちた理由が warnings に出る。存在しないペインはエラー（たまたま既定 role で動いている無関係な master へは落とさない）。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "pane": {
-          "description": "自 pane ID（省略時は caller から自動解決）",
+          "description": "対象 pane ID（省略時は caller から自動解決。明示するとそのペインについて答える = #1516）",
           "minimum": 0,
           "type": "integer"
         }

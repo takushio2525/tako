@@ -8108,6 +8108,9 @@ fn dispatch_orchestrator_self(
 
     // #288: pid 祖先辿り → pane env → stale map → role（複数時エラー）
     let (tab_id, pane_id) = resolve_caller_pane(host, pane, caller_role, caller_pid)?;
+    // #1516: 名指し（`--pane N`）なら、答えるのは**そのペインについて**。呼び出し元が
+    // 名乗った role は載っていないので、profile も role もペインの role ラベルから解く
+    let named = named_pane(pane, caller_role, caller_pid).is_some();
 
     // #854: master のプロファイルは呼び出し元 env と**ペインの role ラベル**の両方から
     // 解決する（env が失われていても tako 自身の記録から取り戻す）。solo は handoff を
@@ -8191,7 +8194,10 @@ fn dispatch_orchestrator_self(
         "profile": profile_name,
         // #854: プロファイルの出どころ。pane_role なら呼び出し元の env が失われている
         "profile_source": profile_source.as_str(),
-        "role": caller_role,
+        // #1516: 名指しでは呼び出し元の名乗りが無いので、対象ペインの role ラベルを返す
+        // （語彙が 2 つあることに注意 = #761。env 用は `master:<profile>`、
+        // ペインのラベルは `orchestrator-master:<profile>`。ここへ出るのは後者）
+        "role": caller_role.or(pane_role.as_deref()),
         "session_id": session_id,
         "status": status,
         "ctx_percent": ctx_percent,
@@ -8228,6 +8234,24 @@ fn dispatch_orchestrator_self(
     );
     // #1021 の自己検証: 画面と transcript がずれていたら窓の宣言が実態と食い違っている
     warnings.extend(crate::claude_ctx::window_warning(&ctx));
+    // #1516: 名指しされたペインが master / solo でなければ、profile が既定へ落ちたことを
+    // 黙らせない（pane_id は名指しどおり返るので、読み手が取り違えないよう理由を出す。#1466）
+    if named && profile_source == tako_core::handoff::ProfileSource::Default {
+        let label = pane_role.as_deref().unwrap_or("null");
+        // solo のペインを名指しされたときに「solo ではない」と言わない（役割ラベルの
+        // 語彙は `orchestrator-solo:<名前>` で、profile は env 側にしか無い）
+        let why = if label.starts_with("orchestrator-solo") {
+            "solo の profile は起動時の env（`solo:<名前>`）にしか無く、ペインの role ラベルからは解けない"
+        } else {
+            "master / solo のペインではない"
+        };
+        warnings.push(format!(
+            "pane {}（role={label}）の profile が {} へ落ちている: {why}。\
+             master を名指しするか、`--pane` を省いて呼び出し元を解決させる",
+            pane_id.as_u64(),
+            profile_name
+        ));
+    }
     // 範囲外の手書き設定は黙って丸めず、丸めたことを応答に出す（#749）
     if threshold.clamped() {
         result["ctx_threshold_raw"] = json!(threshold.raw);
@@ -8243,6 +8267,23 @@ fn dispatch_orchestrator_self(
         result["warnings"] = json!(warnings);
     }
     Ok(result)
+}
+
+/// 名指しされた対象ペイン（Issue #1516）。**名指しでなければ `None`**。
+///
+/// 要求に呼び出し元の手掛かり（`caller_role` / `caller_pid`）が 1 つも載っていないのに
+/// `pane` が載っているものが名指し（`tako orchestrator self --pane N` / MCP の `pane`）。
+/// この形を作るのは [`crate::protocol::Request::orchestrator_self`] の 1 本だけで、
+/// そこが「名指しなら呼び出し元の手掛かりを載せない」を守る（#1516 の正本）。
+///
+/// 名指しは「私は誰か」ではなく「そのペインは何か」を聞いているので、
+/// **呼び出し元解決（pid 祖先辿り・role 検索）より強く、解けなければ失敗させる**。
+fn named_pane(
+    pane: Option<u64>,
+    caller_role: Option<&str>,
+    caller_pid: Option<u32>,
+) -> Option<u64> {
+    pane.filter(|_| caller_role.is_none() && caller_pid.is_none())
 }
 
 /// #288: caller のペインを解決する共通関数
@@ -8269,6 +8310,11 @@ fn resolve_caller_pane(
         .and_then(|new_id| resolve_pane(host.workspace(), Some(new_id.as_u64())).ok())
     {
         return Ok(resolved);
+    }
+    // #1516: 名指しされたペインが解けなかったら**既定へ落とさない**。role 検索へ落ちると
+    // 「たまたま既定 role で動いている無関係な master」を黙って答える（#1466 と同じ事故）
+    if let Some(raw) = named_pane(pane, caller_role, caller_pid) {
+        return Err(DispatchError::PaneNotFound(raw));
     }
     let role_suffix = caller_role
         .and_then(|r| r.strip_prefix("master:"))
@@ -21928,6 +21974,248 @@ mod tests {
         let val = result.unwrap();
         assert_eq!(val["pane_id"].as_u64(), Some(pane));
         assert_eq!(val["profile"].as_str(), Some("default"));
+    }
+
+    /// role ラベル付きの master ペインを新しいタブへ 1 枚作る（#1516 のテスト用）
+    fn master_pane_in_new_tab(host: &mut MockHost, role: &str) -> u64 {
+        let tab = dispatch(
+            host,
+            Request::TabNew {
+                title: None,
+                focus: None,
+                cwd: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let pane = tab["pane"].as_u64().unwrap();
+        dispatch(
+            host,
+            Request::Title {
+                pane: Some(pane),
+                title: None,
+                role: Some(role.to_string()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        pane
+    }
+
+    #[test]
+    fn orchestrator_self_名指しした別ペインの状態を返す() {
+        // #1516: master alpha（呼び出し元）から master bravo を名指しする
+        let mut host = MockHost::new();
+        let caller = host.root_pane();
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(caller),
+                title: None,
+                role: Some("orchestrator-master:alpha".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let other = master_pane_in_new_tab(&mut host, "orchestrator-master:bravo");
+
+        let result = dispatch(
+            &mut host,
+            // 入口（CLI / MCP）が組むのと同じ形を正本から作る
+            Request::orchestrator_self_with(
+                Some(other),
+                Some(caller),
+                Some("master:alpha".into()),
+                Some(std::process::id()),
+                false,
+            ),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result["pane_id"].as_u64(),
+            Some(other),
+            "名指ししたペインではなく呼び出し元を答えている（#1516 の症状）: {result}"
+        );
+        assert_eq!(
+            result["profile"].as_str(),
+            Some("bravo"),
+            "呼び出し元の profile が漏れている: {result}"
+        );
+        assert_eq!(
+            result["profile_source"].as_str(),
+            Some("pane_role"),
+            "名指しの profile はペインの role ラベルから解く: {result}"
+        );
+        assert_eq!(
+            result["role"].as_str(),
+            Some("orchestrator-master:bravo"),
+            "名指しでは対象ペインの role ラベルを返す: {result}"
+        );
+    }
+
+    #[test]
+    fn orchestrator_self_名指しが解けなければ既定のmasterへ落ちない() {
+        // #1516 / #1466: role 検索へ落ちると「たまたま既定 role で動いている master」を
+        // 黙って答える。名指しが解けないことは失敗として返す
+        let mut host = MockHost::new();
+        let lone_default = host.root_pane();
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(lone_default),
+                title: None,
+                role: Some("orchestrator-master".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        let err = dispatch(
+            &mut host,
+            Request::orchestrator_self_with(Some(99_999), None, None, None, false),
+            PaneOrigin::Cli,
+        )
+        .expect_err("名指しが解けないのでエラー");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("99999"),
+            "名指しした ID を名指しで返すこと: {msg}"
+        );
+    }
+
+    #[test]
+    fn orchestrator_self_名指しがmasterでなければ理由を出す() {
+        // worker / プレビューのペインを名指ししたら pane_id はそのまま返し、
+        // profile が既定へ落ちたことを警告に出す（黙って default を答えない = #1466）
+        let mut host = MockHost::new();
+        let caller = host.root_pane();
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(caller),
+                title: None,
+                role: Some("orchestrator-master:alpha".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let worker = master_pane_in_new_tab(&mut host, "orchestrator-worker:tako");
+
+        let result = dispatch(
+            &mut host,
+            Request::orchestrator_self_with(
+                Some(worker),
+                Some(caller),
+                Some("master:alpha".into()),
+                Some(std::process::id()),
+                false,
+            ),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(result["pane_id"].as_u64(), Some(worker));
+        assert_eq!(result["profile"].as_str(), Some("default"));
+        assert_eq!(
+            result["role"].as_str(),
+            Some("orchestrator-worker:tako"),
+            "対象ペインの role をそのまま返す: {result}"
+        );
+        let warnings = result["warnings"]
+            .as_array()
+            .map(|w| {
+                w.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            })
+            .unwrap_or_default();
+        assert!(
+            warnings.contains("master / solo のペインではない"),
+            "既定へ落ちた理由が出ていない: {result}"
+        );
+    }
+
+    #[test]
+    fn orchestrator_self_名指しがsoloなら理由がsolo向けになる() {
+        // solo のペインを名指しされたときに「solo ではない」と言わない（profile は
+        // 起動時の env にしか無いので既定へ落ちるが、理由が違う）
+        let mut host = MockHost::new();
+        let caller = host.root_pane();
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(caller),
+                title: None,
+                role: Some("orchestrator-master:alpha".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let solo = master_pane_in_new_tab(&mut host, "orchestrator-solo:zulu");
+
+        let result = dispatch(
+            &mut host,
+            Request::orchestrator_self_with(
+                Some(solo),
+                Some(caller),
+                Some("master:alpha".into()),
+                Some(std::process::id()),
+                false,
+            ),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(result["pane_id"].as_u64(), Some(solo));
+        let warnings = result["warnings"].to_string();
+        assert!(
+            warnings.contains("solo の profile は起動時の env"),
+            "solo 向けの理由になっていない: {result}"
+        );
+        assert!(
+            !warnings.contains("master / solo のペインではない"),
+            "solo のペインを「solo ではない」と言っている: {result}"
+        );
+    }
+
+    #[test]
+    fn orchestrator_self_legacyでは名指しが無視される() {
+        // A/B（`TAKO_1516_LEGACY=1` 相当）。修正前の挙動 = 呼び出し元の名乗りが勝つ
+        let mut host = MockHost::new();
+        let caller = host.root_pane();
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(caller),
+                title: None,
+                role: Some("orchestrator-master:alpha".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let other = master_pane_in_new_tab(&mut host, "orchestrator-master:bravo");
+
+        let result = dispatch(
+            &mut host,
+            Request::orchestrator_self_with(
+                Some(other),
+                Some(caller),
+                Some("master:alpha".into()),
+                Some(std::process::id()),
+                true,
+            ),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        // pid 祖先辿りはテスト環境では失敗するので pane_id は名指しどおりになるが、
+        // **profile は呼び出し元のもの**が残る（#1516 が報告した取り違えの本体）
+        assert_eq!(
+            result["profile"].as_str(),
+            Some("alpha"),
+            "旧挙動は呼び出し元の名乗りで profile を解く: {result}"
+        );
+        assert_eq!(result["profile_source"].as_str(), Some("caller_role"));
     }
 
     #[test]

@@ -20,16 +20,6 @@
 
 ---
 
-## 2026-09-21（#1485: 「起動していた」を覚えて GUI 起動時に remote daemon を立て直す）
-- `tako remote start` の成功だけが `<data_dir>/remote/tako-remote.desired`（移行の番地 `SchemaId::RemoteDesired`）を作り、GUI が persist 復元のあと `spawn_daemon` をバックオフ（2/5/10/20/40 秒）で数回試す。**消す条件は「止まっていること」の 1 つ**（`Ok` だけ見ると Mac 再起動後に stop した人の意図を落とす）。判断は理由を返す純関数 `autostart_decision` 1 本で、CLI / チップ / persist.log は読むだけ
-- 無言にしない: 途中の失敗も persist.log へ 1 行ずつ、諦めたら `notify_ui_failure` の 1 実装 + `remote status` の `desired` / `last_autostart`（`running: false` の応答にも必ず載る）。OS ゲートは `platform::support` の `tako_remote_start` を引く（専用キーは足さない = T2 が落ちる）
-- 実測: `scripts/test-remote-autostart-1485.sh` **26 PASS 0 FAIL**（隔離 GUI + 実 daemon）。A/B `TAKO_1485_LEGACY=1` は同スクリプトで 13 FAIL（①が「自動復帰しない」= Issue の症状）。番犬 4 本・注入 10 通り + 実注入で `remote.rs:339` を名指し。workspace 5002 passed 0 failed・clippy 3 宇宙 0・check-windows error 0
-
-## 2026-09-21（#1487: タブを「ー」で送ったらタブ単位で退避・復帰できるようにした）
-- `Workspace::shelved_tabs`（`Tab` 本体 + 由来ウィンドウ + 元の並び位置）を追加し、`shelve_tab` は `into_panes()` の平坦化をやめて**タブを分解せず**移す。判断は純粋関数 2 本（`unshelve_tab_placement` / `shelved_tab_fate`）。永続は `LayoutFile.shelved_tabs`（serde default = 旧ファイルそのまま読める・移行 Step 不要）
-- 「バックグラウンドに居るペイン」を見る側は `all_background_panes()`、「まだ生きているペイン」を見る側は `all_pane_ids()` の 2 本へ寄せた（**受け入れ検査 rework 1 回目**: コマンドカードの `retain` / 退避バッジの件数 / `Pin { group_tab }` の検証 / 見出しタイトル / 「閉じたタブ」群の 5 か所が退避タブを見落としていた）
-- 実測: `scripts/test-shelve-tab-1487.sh` **24 PASS 0 FAIL**（退避→復帰で tree/rect/title/title_source 一致・再起動往復・1 ペイン抜き・旧 layout.json・A/B `TAKO_1487_LEGACY=1`）+ visual-test 項目 153（合成マウス）。番犬 3 本（注入 15 通り・実注入で `workspace.rs` を名指し）
-
 ## 2026-09-21（#1490: 隔離 GUI の起動を scripts/lib の 1 実装へ寄せ、起動ごとに tako-vd を起こす）
 - `scripts/lib/isolated-gui.sh` を新設（`isolated_gui_bins` / `launch_isolated_gui` / `wait_isolated_gui` / `stop_isolated_gui`）し、`virtual-display.sh ensure` を**起動の直前に毎回**通す形へ。`scripts/test-*.sh` 12 本を差し替え（-151 行）。Issue の grep は `"…virtual-display.sh" ensure` の引用符に当たらず全部 0 に見えていたが、正しく数えると「起動の直前に通していたのは 4 本 / 冒頭 1 回が 6 本 / 呼んでいないのが 2 本」で症状は実在
 - 実測（眠った tako-vd から。`pmset displaysleepnow` で再現）: **master-launch が OK=0 rc=1 → OK=34 rc=0**・**1485 が OK=12 NG=14 → OK=26 NG=0**（14 NG は全部「窓を開かずに終了」= #1160 の中止）・**worker-min-width が OK=6 → OK=12**（3 腕のうち 1 腕しか走れていなかった）。他 9 本は前後一致・回帰 0
@@ -59,3 +49,8 @@
 - `tako setup` の段として `$HOME/.local/bin/tako` へ symlink を張り、**その置き場所だけ**を `~/.zprofile` のマーカーブロック（1 組のまま）へ通す。**実体のディレクトリは PATH へ入れない**（`.app` の `Contents/MacOS` は tako-app ごと / dev の `target/debug` は依存クレートごと PATH へ出るうえ、`.app` を動かすと黙って切れる）。`$HOME/.local/bin` は 3 系統のランチャーと同じ置き場所なので macOS ではブロックの中身は 1 ディレクトリのまま = 既存ユーザーの profile の形が変わらない
 - 途中で踏んだ真因 2 つ: ①claude が ready だとエージェントの PATH 段は走らないので「ついで」に載せると設置されない（= `run_setup` の独立した段にした）②「もう通っているか」を**プロセスの PATH** で測ると #601 の注入で必ず「通っている」に見える。`$SHELL -l -c` も**継承した PATH を `path_helper` が引き継ぐ**ので、launchd の既定 PATH へ戻してから起こす必要があった
 - 実測: `scripts/test-tako-cli-path-1502.sh` **49 PASS 0 FAIL**（隔離 HOME + 隔離 GUI）。A/B `TAKO_1502_LEGACY=1` は 23 FAIL（B7 / B8「新しいログインシェルで tako が見つかる・動く」= Issue の症状）。番犬 `issue1502_tako_cli_path_watchdog` 6 本（注入 8 通りすべて FAILED → 戻して緑）
+
+## 2026-09-22（#1516: `orchestrator self --pane N` が名指しどおりそのペインを答えるようにした）
+- 真因は**入口が 2 種類の問いを同じ `pane` 欄へ混ぜていた**こと。受け手の解決順は「確かな順」= pid 祖先辿りが最優先で `pane` は stale になりうる env 由来として扱う契約（#288 / #210）なので、`--pane` は毎回黙って負けていた（pane 1954 から `--pane 1964` → `pane_id: 1954`）。MCP は caller_pid を持たないので pane_id は動くが `caller_role` が残り profile だけ呼び出し元のものになる
+- 組み立てを `Request::orchestrator_self`（protocol.rs）の 1 本へ寄せ、**名指しなら呼び出し元の手掛かりを 1 つも載せない**。自分を名指しした場合は「私についての問い」に倒す（solo の profile は env の `solo:<名前>` にしか無い）。受け手は `named_pane` で名指しを見分け、解けなければ role 検索へ落とさず `PaneNotFound`（#1466）。応答の `role` は名乗り → 対象ペインのラベル、master / solo でなければ理由を `warnings` へ。`adopt` / `guide` / `handoff` の `--pane` は同型のまま（寄せるのは入口 1 か所で済む）
+- 実測: 本番 GUI（旧バイナリ）に対して修正 CLI が `pane_id 1964 / profile <名指し先のもの> / profile_source pane_role`（出荷 CLI と `TAKO_1516_LEGACY=1` は 1967 = 症状）。`scripts/test-self-pane-1516.sh` **28 PASS 0 FAIL**（隔離 GUI・CLI / MCP 両経路 / A/B / エッジ 3 種）。実注入 6 通りすべて FAILED + file:line 名指し（CLI へ戻すと e2e が 11 NG）。番犬 `issue1516_named_pane_watchdog` 3 本・workspace 5047 passed 0 failed・clippy 3 宇宙 0・check-windows error 0
