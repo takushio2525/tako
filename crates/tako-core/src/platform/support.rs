@@ -1292,7 +1292,7 @@ pub const MATRIX: &[Feature] = &[
             issue: 528,
         },
         windows_evidence: Evidence::UnitTest(
-            "実機の cargo test で remote::tests の 2 件（daemon_stop_impl / is_process_alive）が失敗",
+            "実機の cargo test で remote::tests の 2 件（daemon_stop_impl / is_process_alive）が失敗。うち is_process_alive は「非 unix では常に false」という製品側の穴で #1557 で解消（実機の再測は未了）",
         ),
     },
     Feature {

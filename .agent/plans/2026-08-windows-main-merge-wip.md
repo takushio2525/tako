@@ -3878,17 +3878,16 @@ run 35735202680 で、**5064 passed / 21 failed / 40 ignored**。21 件のうち
 symlink テストが CI Windows で緑）。実機（非昇格）では作れないので、
 どちらでも動く形（作れなければ理由を出して skip）にしてある。
 
-#### 理由つき skip の allowlist（**10 件**。増やすときは Issue 番号を書く）
+#### 理由つき skip の allowlist（**9 件**。増やすときは Issue 番号を書く）
 
 | 件数 | テスト | 理由 | 追跡 |
 |---|---|---|---|
 | 3 | `links::detect_absolute_path` / `cwd不明でも絶対パスとホーム起点は検出する` / `tuiの装飾付きsoft_wrapをまたぐパスを検出する` | `C:\…` のバックスラッシュ絶対パスはリンクにしない = **宣言済みの縮退**（`platform::support` の `tako_links` = `Degraded`） | #153（設計判断。close 済み） |
 | 2 | `dispatch::links_は画面テキストの3形…_1283` / `links_の_open_は…_1283` | 同上（fixture が絶対パス） | 同上 |
-| 1 | `remote::is_process_aliveは現在のプロセスをtrueで返す` | `remote.rs` の私的ヘルパが非 unix で無条件 `false`。境界 `pid_alive` を通っていない | **#1557** |
 | 1 | `config_share::env::リポジトリ配下の実体も外部管理として検出する` | `canonicalize` の verbatim と git の `/` 表記で `strip_prefix` が外れ `repo_rel` が空（#970 の型） | **#1569** |
 | 1 | `prompt_budget_1477::baseは予算内で追記の取り分を残している` | Windows は `platform` 片 4110 B（縮退の自動生成）で base が 18944 B を 1.7〜2.7 KB 超える。**macOS 側は blocking のまま** | **#1571** |
 | 1 | `remote_fs_e2e::解決できないホストは接続前に分類される` | 分類は正しいが接続経路が戻らない（実機 536 秒）。blocking な CI でぶら下がると run を失う | #930 / #1090 |
-| 1 | `test_residue::テストを一巡してもtmpdirに残骸が残らない` | `atexit` からの `remove_dir_all` は Windows では開いたハンドルがあると失敗する（孫プロセスがまだ握っている）。起動時の掃除も `ports::process_alive` が常に `true` なので動かない | **#1581** |
+| 1 | `test_residue::テストを一巡してもtmpdirに残骸が残らない` | `atexit` からの `remove_dir_all` は Windows では開いたハンドルがあると失敗する（孫プロセスがまだ握っている）。起動時の掃除は**この窓に入らない**（子の終了直後に数えるので、残る 3 件は子自身の pid）。`ports::process_alive` を使っているという当初の見立ては誤りで、この経路は #1296 の初版から境界を通っていた（#1557 の調査で実測） | **#1581** |
 
 （`platform::bundle_install` 2 本は `#[cfg(target_os = "macos")]` で**存在しない**ので
 allowlist に数えない。`RENAME_SWAP` 相当が無い側では `MoveAside` が正しい答え）
@@ -3897,7 +3896,7 @@ allowlist に数えない。`RENAME_SWAP` 相当が無い側では `MoveAside` �
 `crates/tako-control/tests/issue1278_ignore_reason_watchdog.rs` が 2 つの規則で縛る:
 
 1. 理由の無い `#[ignore]` / `#[cfg_attr(…, ignore)]` を `file:line` で落とす
-2. **Windows だけを外す skip は理由に追跡番号（`#1557` 等）を持つ**
+2. **Windows だけを外す skip は理由に追跡番号（`#1581` 等）を持つ**
    = allowlist が黙って増えない（「直したら ignore を外す」が Issue 側から辿れる）
 
 3 巡目の実測で、この allowlist の 10 件が**すべて追跡番号つきで `ignored` に出ている**

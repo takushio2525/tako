@@ -657,6 +657,32 @@ psmux は入力送出を持たないので、**tako-app が保持していない
   見るのは `Outcome` がどれか・応答に `timed_out` が載るか・**打ち切った子が残っていないか**で、
   所要そのものは assert にしない（実経路テストは外側の締め切りで殺し、所要は証拠として出す）
 
+## プロセスの生死は境界の 1 実装で決める（Issue #1557 / #1581）
+
+**「その pid は生きているか」を自前で書かない。`tako_core::platform::process::pid_alive`
+だけが答える**（unix は `kill(pid, 0)`、Windows は `procinfo::snapshot` の在籍）。
+
+自前で書くと `#[cfg(not(unix))]` の腕が要り、そこは決まって**無条件 `false` か
+無条件 `true`** になる。どちらも Windows でだけ全件を静かに誤り、macOS の単体テストは
+緑のまま通る（`remote.rs` の `is_process_alive` は非 unix で常に `false` を返し、
+`is_process_aliveは存在しないpidをfalseで返す` は**何を渡しても通る偽の緑**だった）。
+
+- 境界は unix でも 2 点を引き受ける。**自前実装はどちらも落とす**:
+  `EPERM`（別ユーザーのプロセス）は「居る」・`pid_t` の範囲外は「居ない」
+  （`pid as libc::pid_t` は `u32::MAX` を -1 =「全プロセス」へ潰すので、
+  `kill` が成功して存在しない pid が生きて見える）
+- **`ports::process_alive` は生死の答えではない**。あれは tmux ソケットの回収専用で、
+  非 unix では「何も回収しない側へ倒す」ために常に `true` を返す（#1253）。
+  掃除や停止の判定に流用すると Windows で 1 件も動かない
+- 走査で何千回も引くなら、境界と**同じ材料**（`procinfo::snapshot`）を 1 度取って
+  キャッシュしてよい（`test_residue::OwnerProbe::alive`）。ただし判定を置く場所は
+  関数 1 つに保ち、呼び出し側へ `#[cfg]` を撒かない
+- ゾンビは `pid_alive` では「居る」。**停止の待ち合わせには使わない**
+  （`tako_control::platform::process::has_terminated` がゾンビ込みで担う）
+- 番犬: `crates/tako-control/tests/issue1557_pid_alive_boundary_watchdog.rs`
+  （`libc::kill(…, 0)` の直書きと `ports::process_alive` の流用を `file:line` で名指す。
+  停止の `libc::kill(…, SIGTERM)` には当たらない）
+
 ## 代行できない 1 件で、代行できる 10 件を捨てない（Issue #1501）
 
 **段を並べた処理で「人しかできない 1 件」に当たったら、そこで `Err` を返して
