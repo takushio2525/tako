@@ -2625,13 +2625,16 @@ fn parse_pid_file() -> Result<PidInfo, String> {
     })
 }
 
-/// `ps -p <pid> -o args=` の出力から「この PID は `tako remote serve` か」を決める純関数。
+/// 「このコマンドラインは `tako remote serve` か」を決める純関数。
+///
+/// 受け取るのは**起動時のコマンドライン全体**。出どころは OS で違うが規則は同じなので
+/// **1 実装を共有する**（unix は `ps -p <pid> -o args=` の出力、Windows は
+/// `procinfo::command_line` = `NtQueryInformationProcess`。#1616）。
 ///
 /// **空の出力は「確認できない」= false**（#1401）。#329 で `ps` の**起動失敗**は
 /// false に倒したが、起動できて出力が空のときは `!cmd.is_empty() && !is_tako_remote`
 /// の形のせいで**検証を通していた** = fail-safe の向きと逆だった
-#[cfg(unix)]
-fn ps_args_is_tako_remote_serve(args: &str) -> bool {
+fn command_line_is_tako_remote_serve(args: &str) -> bool {
     let cmd = args.trim();
     !cmd.is_empty() && cmd.contains("tako") && cmd.contains("remote") && cmd.contains("serve")
 }
@@ -2688,15 +2691,16 @@ fn stale_stop_refusal(pid: u32) -> String {
 }
 
 /// P0-4: PID が本当に tako remote serve プロセスか検証する。
-/// 実行ファイルパスまたは ps の args で確認し、起動時刻もチェックする。
-/// ps の起動自体が失敗した場合・**出力が空の場合**は安全側に倒す
-/// （検証不能 = false = kill しない。#329 / #1401）
+/// 実行ファイルパスまたはコマンドラインで確認し、起動時刻もチェックする。
+/// 材料が取れない場合（`ps` の起動失敗・**出力が空**・境界が 1 つも引けない）は
+/// 安全側に倒す（検証不能 = false = kill しない。#329 / #1401 / #1616）
 fn verify_pid_identity(info: &PidInfo) -> bool {
     if !is_process_alive(info.pid) {
         return false;
     }
-    #[cfg(unix)]
-    {
+    // 材料の採り方は OS で違う。**分岐は `cfg!`**（`#[cfg]` ではない）で書き、
+    // 両方の腕をどちらの OS でもコンパイルする = Windows 側の綴りだけが腐らない（#1616）
+    if cfg!(unix) {
         // ps で実行コマンドを取得し、tako remote serve かどうか確認。
         // 絶対パスで呼び出し PATH 制限環境でも動作する
         let ps_result = Command::new("/bin/ps")
@@ -2707,7 +2711,7 @@ fn verify_pid_identity(info: &PidInfo) -> bool {
         match ps_result {
             Ok(output) => {
                 // 判定は 1 実装（#1401）。**空の出力も false**（確認できない = 撃たない）
-                if !ps_args_is_tako_remote_serve(&String::from_utf8_lossy(&output.stdout)) {
+                if !command_line_is_tako_remote_serve(&String::from_utf8_lossy(&output.stdout)) {
                     return false;
                 }
             }
@@ -2746,17 +2750,39 @@ fn verify_pid_identity(info: &PidInfo) -> bool {
                 }
             }
         }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = info;
+    } else if !boundary_identity_confirmed(info) {
+        return false;
     }
     true
 }
 
+/// 境界（`procinfo`）が引ける材料で「この pid は記録した daemon か」を確かめる（#1616）。
+///
+/// unix の `ps` 経路に対応する Windows 側の腕。**材料（コマンドライン / 実行ファイル /
+/// 起動時刻）が 1 つも引けなければ false** で、`ps` を起動できないときと同じ扱いになる
+/// （確認できない相手は撃たない = #329 / #1401 と同じ fail-safe 既定）。
+///
+/// #1616 以前は非 unix に腕が無く `true` へ直行していた = **生きている pid をすべて
+/// 「本物の daemon」と答えて**いた。撃たずに済んでいたのは停止の実体が Windows 未実装
+/// （#1599）だったからにすぎない。
+///
+/// この関数自体は OS 分岐を持たない（材料の可否は境界が答える）ので macOS でも
+/// 単体テストできる
+fn boundary_identity_confirmed(info: &PidInfo) -> bool {
+    use tako_core::platform::procinfo::{judge_identity, observe_identity, ExpectedProcess};
+    judge_identity(
+        &observe_identity(info.pid),
+        ExpectedProcess {
+            exe: info.exe.as_deref(),
+            start_time_unix: info.start_time,
+        },
+        command_line_is_tako_remote_serve,
+    )
+    .confirmed()
+}
+
 /// ps の etime 出力（"[[DD-]HH:]MM:SS"）を秒数に変換する。
 /// 形式: "03:42" / "01:03:42" / "2-01:03:42"
-#[cfg(unix)]
 fn parse_etime(s: &str) -> Option<u64> {
     let (days, rest) = if let Some((d, r)) = s.split_once('-') {
         (d.parse::<u64>().ok()?, r)
@@ -7774,22 +7800,23 @@ mod tests {
         assert!(!verify_pid_identity(&info));
     }
 
-    /// pid 再利用を検知して kill しないこと。**止まる理由は OS で違う**（#1599）。
+    /// pid 再利用を検知して kill しないこと。**両 OS とも正体確認で止まる**（#1616）。
     ///
     /// unix は `verify_pid_identity` が `ps` の args を見て「`tako remote serve`
     /// ではない」と判定し、撃つ前に中止する（#329 / #1401 の fail-safe）。
     ///
-    /// Windows には args を見る腕が無く、`verify_pid_identity` は `#[cfg(unix)]` の
-    /// 外を素通りして **生きている pid をすべて「本物」と答える**。撃たずに済んで
-    /// いるのは、その先の `platform::process::terminate` が Windows 未実装（#1599）で
-    /// `Err` を返すからにすぎない。#1557 以前は `is_process_alive` が非 unix で
-    /// 常に `false` だったので**穴がもう 1 つの穴で塞がれていた**形で、境界へ寄せた
-    /// いま Windows 側の素通りが露出している。
+    /// Windows も #1616 で同じ結論へ揃った: 境界（`procinfo`）が引ける材料
+    /// （コマンドライン / 実行ファイル名 / 起動時刻）を記録と突き合わせ、1 つでも
+    /// 食い違えば撃たない。**#1616 以前は非 unix に腕が無く `true` へ直行していた**
+    /// = 生きている pid をすべて「本物」と答えていて、撃たずに済んでいたのは
+    /// その先の `platform::process::terminate` が Windows 未実装（#1599）で `Err` を
+    /// 返すからにすぎなかった（#1557 以前は `is_process_alive` が非 unix で常に
+    /// `false` だったので**穴がもう 1 つの穴で塞がれていた**）。
     ///
-    /// なので Windows の腕はわざと「停止が未対応であること」を見る = **#1599 で
-    /// 停止を実装した瞬間にこの検査が落ちる**。そのとき必要なのは Windows の正体確認
-    /// （#1616）で、順序を取り違えると `tako remote stop` が pid を再利用した
-    /// 無関係なプロセスを撃つ
+    /// なので**期待する中止理由は両 OS で同じ**（`pid_identity_refusal` の文言）。
+    /// ここが「未対応」= 停止経路まで進んだ証拠へ戻ったら、Windows の正体確認が
+    /// 抜けている（#1599 を #1616 より先に入れると `tako remote stop` が pid を
+    /// 再利用した無関係なプロセスを `TerminateProcess` する）
     #[test]
     fn daemon_stop_implはpid再利用時にkillしない() {
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -7804,21 +7831,81 @@ mod tests {
         std::env::remove_var("TAKO_REMOTE_STATE_DIR");
         assert!(result.is_err(), "PID 再利用を検知してエラーになる");
         let err = result.unwrap_err();
-        // 分岐は `cfg!`（`#[cfg]` ではない）。両方の腕を macOS でもコンパイルして、
-        // Windows 側の綴りだけが腐るのを防ぐ
-        if cfg!(windows) {
-            assert!(
-                err.contains("未対応"),
-                "Windows で止まっているのは停止経路が未実装だから（#1599）。\n\
-                 この assert が落ちたら停止が実装された = **Windows の正体確認（#1616）が先に要る**: {err}"
-            );
-        } else {
-            assert!(
-                err.contains("確認できません"),
-                "エラーメッセージに検証失敗を示す: {err}"
-            );
-        }
+        assert!(
+            err.contains("確認できません"),
+            "撃つ前に正体確認で中止する（#1616）。`未対応` なら停止経路まで進んでいる = \
+             Windows の正体確認が抜けている: {err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1616: Windows 側の腕（境界の材料での照合）を**このランナーで**実測する。
+    ///
+    /// 本番で通るのは `cfg!(unix)` の ps 経路だが、`boundary_identity_confirmed`
+    /// 自体は OS 分岐を持たない（材料の可否は境界が答える）ので、Windows で使われる
+    /// 判定を macOS でも直接動かせる。渡す形は上の
+    /// `daemon_stop_implはpid再利用時にkillしない` と同じ
+    /// 「生きている自分の pid + 別プロセスの記録」
+    #[test]
+    fn boundary_identity_confirmedは記録と食い違うpidを弾く() {
+        let reused = PidInfo {
+            pid: std::process::id(),
+            exe: Some("/bin/zsh".to_string()),
+            start_time: Some(0),
+        };
+        assert!(
+            !boundary_identity_confirmed(&reused),
+            "記録した実行ファイル名・起動時刻と食い違う = pid の再利用"
+        );
+    }
+
+    /// 材料が 1 つも引けなければ false（撃たない）。**ここが true へ倒れると
+    /// #1616 以前の素通りに戻る**
+    #[test]
+    fn boundary_identity_confirmedは材料が無ければ弾く() {
+        let gone = PidInfo {
+            pid: 99_999_999,
+            exe: Some("/usr/local/bin/tako".to_string()),
+            start_time: Some(1_700_000_000),
+        };
+        assert!(
+            !boundary_identity_confirmed(&gone),
+            "居ない pid からは材料が引けない = 確認できない"
+        );
+        let no_record = PidInfo {
+            pid: std::process::id(),
+            exe: None,
+            start_time: None,
+        };
+        assert!(
+            !boundary_identity_confirmed(&no_record),
+            "記録が無ければ照合できる材料も無い（生きている pid でも通さない）"
+        );
+    }
+
+    /// **常に false へ倒れていないこと**（偽の緑の防止。#1557 の教訓）。
+    ///
+    /// 自分自身の実行ファイルと起動時刻を記録として渡せば `Confirmed` になる。
+    /// Windows はコマンドラインの規則（`tako remote serve`）も見るのでテスト
+    /// バイナリでは成立しない = そちらの向きは `judge_identity` と
+    /// `command_line_is_tako_remote_serve` の単体テストが両 OS で持つ
+    #[cfg(not(windows))]
+    #[test]
+    fn boundary_identity_confirmedは記録が一致すれば通す() {
+        let me = PidInfo {
+            pid: std::process::id(),
+            exe: std::env::current_exe()
+                .ok()
+                .map(|p| p.display().to_string()),
+            start_time: tako_core::platform::procinfo::start_time_unix(std::process::id()),
+        };
+        assert!(
+            me.exe.is_some() && me.start_time.is_some(),
+            "材料が引けている前提（引けないなら偽の緑になる）: {:?} / {:?}",
+            me.exe,
+            me.start_time
+        );
+        assert!(boundary_identity_confirmed(&me), "自分自身の記録は一致する");
     }
 
     #[cfg(unix)]
@@ -8046,33 +8133,47 @@ mod tests {
     ///
     /// #329 で `ps` の**起動失敗**は false へ倒したが、起動できて出力が空のときは
     /// `!cmd.is_empty() && !is_tako_remote` の形のせいで**検証を通していた**。
-    /// 生きたプロセスで空出力を作れないので、判定の純関数でこの向きを固定する
-    #[cfg(unix)]
+    /// 生きたプロセスで空出力を作れないので、判定の純関数でこの向きを固定する。
+    ///
+    /// #1616 でこの規則は Windows のコマンドライン（`procinfo::command_line`）とも
+    /// 共有になったので、**両 OS で回す**（入力の形が違うだけで規則は 1 つ）
     #[test]
     fn ps出力が空なら確認できない扱いになる() {
         assert!(
-            !ps_args_is_tako_remote_serve(""),
+            !command_line_is_tako_remote_serve(""),
             "空の出力は確認できない = kill しない"
         );
         assert!(
-            !ps_args_is_tako_remote_serve("   \n"),
+            !command_line_is_tako_remote_serve("   \n"),
             "空白だけの出力も確認できない"
         );
         assert!(
-            !ps_args_is_tako_remote_serve("/bin/sleep 60"),
+            !command_line_is_tako_remote_serve("/bin/sleep 60"),
             "無関係なプロセスは false"
         );
         assert!(
-            !ps_args_is_tako_remote_serve("/usr/local/bin/tako master"),
+            !command_line_is_tako_remote_serve("/usr/local/bin/tako master"),
             "tako でも remote serve でなければ false"
         );
         assert!(
-            ps_args_is_tako_remote_serve("/Applications/tako.app/Contents/MacOS/tako remote serve"),
+            command_line_is_tako_remote_serve(
+                "/Applications/tako.app/Contents/MacOS/tako remote serve"
+            ),
             "配布バイナリの daemon は true"
         );
         assert!(
-            ps_args_is_tako_remote_serve("target/debug/tako remote serve"),
+            command_line_is_tako_remote_serve("target/debug/tako remote serve"),
             "dev ビルドの daemon も true"
+        );
+        // Windows の `NtQueryInformationProcess` はプログラムパスを引用符で括った
+        // 1 本の文字列を返す（#1616）
+        assert!(
+            command_line_is_tako_remote_serve("\"C:\\Program Files\\tako\\tako.exe\" remote serve"),
+            "Windows の daemon のコマンドラインも true"
+        );
+        assert!(
+            !command_line_is_tako_remote_serve("\"C:\\Windows\\System32\\notepad.exe\""),
+            "pid を再利用した無関係なプロセスは false"
         );
     }
 
@@ -8088,7 +8189,6 @@ mod tests {
         assert!(err.contains("確認できません"), "中止理由が返る: {err}");
     }
 
-    #[cfg(unix)]
     #[test]
     fn parse_etimeは経過時間を秒に変換する() {
         assert_eq!(parse_etime("03:42"), Some(222));

@@ -235,8 +235,8 @@ AI エージェント（tako は縮退の件数と引き方を system prompt へ
 
 | 機能 | 状態 | 差分 | 根拠 |
 | --- | --- | --- | --- |
-| `tako_remote_start` | 未対応 / 未実測 | remote デーモンの起動・停止に unix 前提の処理が残っており、Windows 実機での通し確認も未了 | 実機テスト: 実機の cargo test で remote::tests の 2 件（daemon_stop_impl / is_process_alive）が失敗。うち is_process_alive は「非 unix では常に false」という製品側の穴で #1557 で解消（実機の再測は未了） |
-| `tako_remote_stop` | 未対応 / 未実測 | remote デーモンの起動・停止に unix 前提の処理が残っており、Windows 実機での通し確認も未了 | 実機テスト: 同上（daemon_stop_impl はpid再利用時にkillしない が失敗） |
+| `tako_remote_start` | 未対応 / 未実測 | remote デーモンの起動・停止に unix 前提の処理が残っており、Windows 実機での通し確認も未了 | 実機テスト: 実機の cargo test で remote::tests の 2 件（daemon_stop_impl / is_process_alive）が失敗。うち is_process_alive は「非 unix では常に false」という製品側の穴で #1557 で解消し、daemon_stop_impl が見ていた正体確認の素通りは #1616 で解消（どちらも実機の再測は未了） |
+| `tako_remote_stop` | 未対応 / 未実測 | remote デーモンの起動・停止に unix 前提の処理が残っており、Windows 実機での通し確認も未了 | 実機テスト: 同上（daemon_stop_impl はpid再利用時にkillしない が失敗）。#1616 で Windows も正体確認を通るようになり、この検査は両 OS とも「撃たずに中止」を見る形になった（停止そのものは #1599 が未実装。実機の再測は未了） |
 | `tako_remote_status` | 未対応 / 未実測 | #1038 で serve の中継先をループバック TCP へ変えたので、`unix socket serve target is not supported on Windows` で止まる原因は無くなった。ただし Windows 実機での通し（setup の 4 段目 → デーモン起動 → スマホからの接続）は未実測（#971） | 実機実測: #937 の Windows 11 実測: `tako remote status` は running=false を返すが、デーモンを起動できないので常にこの状態（#971） |
 | `tako_remote_setup` | 未対応 / 未実測 | #1038 で serve の中継先をループバック TCP へ変えたので、`unix socket serve target is not supported on Windows` で止まる原因は無くなった。ただし Windows 実機での通し（setup の 4 段目 → デーモン起動 → スマホからの接続）は未実測（#971） | 実機実測: #937 の Windows 11 実測（#1038 の修正**前**）: 1〜3 段（Tailscale 検出 / ログイン / HTTPS 証明書）は OK で、4 段目の serve 設定が `unix socket serve target is not supported on Windows` で失敗した。#1038 でこの原因は取り除いたが、実機での再測はまだ（#971） |
 | `tako_remote_devices` | 未対応 / 未実測 | #1038 で serve の中継先をループバック TCP へ変えたので、`unix socket serve target is not supported on Windows` で止まる原因は無くなった。ただし Windows 実機での通し（setup の 4 段目 → デーモン起動 → スマホからの接続）は未実測（#971） | 実機実測: #937 の Windows 11 実測: `tako remote devices list` は running=false の形を返すが、デーモンを起動できないので端末を登録できない（#971） |

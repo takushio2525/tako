@@ -729,6 +729,33 @@ psmux は入力送出を持たないので、**tako-app が保持していない
   （`libc::kill(…, 0)` の直書きと `ports::process_alive` の流用を `file:line` で名指す。
   停止の `libc::kill(…, SIGTERM)` には当たらない）
 
+### 「生きている」は「その相手だ」ではない（Issue #1616）
+
+pid が生きていることを確かめても、**相手が誰かはまだ分かっていない**。pid は再利用されるので、
+不可逆な操作（kill / state の掃除）へ進むには**正体の照合**が別に要る。
+
+- 材料を引くのは境界の 1 実装（`tako_core::platform::procinfo::observe_identity` =
+  コマンドライン / 実行ファイル / 起動時刻）で、突き合わせは純関数（`judge_identity`）。
+  **呼び出し側に「どの材料がこの OS で引けるか」を知らせない**
+  （コマンドラインは unix では引けず、起動時刻は macOS / Windows のみ）
+- 結論は 3 値（`Confirmed` / `Mismatch` / `Unknown`）で、**`Unknown` を `Confirmed` 側へ
+  倒さない**。材料が 1 つも引けないのは「本物だった」ではないので、進んでよいかは
+  `IdentityVerdict::confirmed()`（`Confirmed` のときだけ true）で読む
+- 実行ファイルは**名前だけ**で比べる（`stem_of`）。symlink 越しの起動・`versions/<版>` の
+  実体・8.3 短縮名で、同じプロセスが別のパスに見える。起動時刻の照合幅は
+  `START_TIME_SLACK_SECS`（記録の書き出しと OS の生成時刻はずれる）
+- **OS ごとの腕は `cfg!` で分ける**（`#[cfg]` ではない）。`#[cfg]` だと片方しか
+  コンパイルされず、macOS で開発しているあいだ Windows 側の綴りが黙って腐る。
+  腕の中身（`remote.rs` の `boundary_identity_confirmed`）を OS 分岐の無い関数に
+  しておけば、**Windows で使われる判定を macOS の単体テストで実測できる**
+- #1616 の実物: `verify_pid_identity` は照合がまるごと `#[cfg(unix)]` の中にあり、
+  Windows は末尾の `true` へ直行 = **「生きている pid はすべて tako の daemon」**だった。
+  事故になっていなかったのは `is_process_alive` が非 unix で無条件 `false`（#1557）
+  だったから = **穴がもう 1 つの穴で塞がれていた**形で、境界へ寄せた #1596 で露出した。
+  停止の Windows 実装（#1599）が先に入れば、pid を再利用した無関係なプロセスを撃つ
+- 番犬: `crates/tako-control/tests/issue1616_windows_pid_identity_watchdog.rs`
+  （素通り・`#[cfg]` の腕・自前判定へ戻した形・`Unknown` の反転を `file:line` で名指す）
+
 ## 代行できない 1 件で、代行できる 10 件を捨てない（Issue #1501）
 
 **段を並べた処理で「人しかできない 1 件」に当たったら、そこで `Err` を返して

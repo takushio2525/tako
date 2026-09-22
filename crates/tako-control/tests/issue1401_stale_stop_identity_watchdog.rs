@@ -39,6 +39,10 @@ mod production_range;
 
 const REMOTE: &str = "crates/tako-control/src/remote.rs";
 
+/// 「このコマンドラインは `tako remote serve` か」の判定関数。綴りはこの 1 か所に持つ。
+/// #1616 で unix / Windows 共通の規則になり `ps_args_is_tako_remote_serve` から改名した
+const IDENTITY_RULE: &str = "command_line_is_tako_remote_serve";
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -170,17 +174,17 @@ fn ps出力の判定は1実装で空を弾く() {
     let src = production(REMOTE);
     let (vline, vbody) = fn_body(&src, REMOTE, "\nfn verify_pid_identity(");
     assert!(
-        vbody.contains("ps_args_is_tako_remote_serve"),
+        vbody.contains(IDENTITY_RULE),
         "{REMOTE}:{vline} `verify_pid_identity` が ps 出力の判定を再実装している（#1401）"
     );
     assert!(
         !vbody.contains("!cmd.is_empty() && !is_tako_remote"),
         "{REMOTE}:{vline} 空の ps 出力を素通りさせる旧判定に戻っている（#1401）"
     );
-    let (pline, pbody) = fn_body(&src, REMOTE, "\nfn ps_args_is_tako_remote_serve(");
+    let (pline, pbody) = fn_body(&src, REMOTE, &format!("\nfn {IDENTITY_RULE}("));
     assert!(
         pbody.contains("!cmd.is_empty()"),
-        "{REMOTE}:{pline} `ps_args_is_tako_remote_serve` が空出力を弾いていない（#1401）"
+        "{REMOTE}:{pline} `{IDENTITY_RULE}` が空出力を弾いていない（#1401）"
     );
     for token in ["\"tako\"", "\"remote\"", "\"serve\""] {
         assert!(
