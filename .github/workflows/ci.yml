@@ -102,6 +102,13 @@ jobs:
       # **実プロジェクトを巻き添えで消す形へ変わったらここで落ちる**（#1030 / #1022）
       - name: 事前信頼の残骸掃除のモックテスト
         run: bash scripts/test-clean-trust-residue.sh
+      # `tako setup` の依存チェック段（未検出の CLI 依存を [y/N] で導入まで通す）の
+      # 実経路テスト。隔離 HOME / TAKO_DATA_DIR / PATH + brew と claude のスタブなので
+      # 本番の設定にも実機の tmux にも触らない。**標準 `tako setup` が「検出はするが
+      # 入れない」へ戻ったらここで落ちる**（#1499。#1057 は `--review` だけの復活で、
+      # 実機の利用者には検出止まりに見えていた）
+      - name: setup の依存導入の実経路テスト
+        run: bash scripts/test-setup-deps-prompt-1499.sh
       # PR の CI 完了待ちのモックテスト。偽 gh を PATH に挿し、一時ディレクトリの偽リポジトリ
       # （.github/workflows つき）だけを相手にするので本番の PR には触らない。
       # **「出ているチェックが全部 pending でなければ完了」へ戻ったらここで落ちる**

@@ -1182,13 +1182,56 @@ fn legacy_launch_auth_login(
 
 // --- 依存ツールチェック ---
 
-/// 依存ツールのチェック段階。検出結果を `[OK]` / `[任意]` / `[不足]` で表示し、
-/// interactive = true なら未導入の依存をその場で導入できる（`--review` 経路）。
+/// 依存チェック段の対話の強さ。**2 つは別物**（#1499）。
 ///
-/// **標準 `tako setup` は質問ゼロ**（#262）なので interactive = false で呼ばれ、
-/// 状態と最も簡単なコマンド 1 本（#322）だけを出す。
+/// #1499 前は 1 つの `interactive` が「依存の導入を聞く」と「FDA / スリープ設定を
+/// 見直す」の両方を決めており、標準 `tako setup` では両方とも off だった。
+/// 前者は「無い物をいま入れるか」・後者は「既にある設定値を変えるか」で、
+/// #262 の質問ゼロが守っているのは後者だけなので、ここで分ける
+#[derive(Debug, Clone, Copy)]
+struct DepCheckMode {
+    /// FDA / スリープ設定の見直しを対話で行うか（`--review` だけ = #262 を壊さない）
+    review_settings: bool,
+    /// 未検出の CLI 依存をその場で導入するかの判断材料（#1499）
+    offer: setup_deps::DepOfferContext,
+}
+
+impl DepCheckMode {
+    /// `tako setup` 本体。**`--review` かどうかに関わらず**未検出の依存は聞く（#1499）
+    fn for_setup(review: bool, assume_yes: bool) -> Self {
+        Self {
+            review_settings: review && !setup_bootstrap::legacy_mode(),
+            offer: setup_deps::DepOfferContext {
+                stage_installs: true,
+                review,
+                assume_yes,
+                stdin_is_terminal: std::io::IsTerminal::is_terminal(&std::io::stdin()),
+                legacy: setup_deps::legacy_mode(),
+            },
+        }
+    }
+
+    /// `tako setup --check`: 読み取りだけ。**何も導入しない・何も聞かない**
+    fn check_only() -> Self {
+        Self {
+            review_settings: false,
+            offer: setup_deps::DepOfferContext {
+                stage_installs: false,
+                review: false,
+                assume_yes: false,
+                stdin_is_terminal: false,
+                legacy: setup_deps::legacy_mode(),
+            },
+        }
+    }
+}
+
+/// 依存ツールのチェック段階。検出結果を `[OK]` / `[任意]` / `[不足]` で表示し、
+/// 未導入の CLI 依存は「何を・どの導入器で・どこへ入れるか」を見せて
+/// `[y/N]` を聞く（#1499。`--yes` は同意扱い・非 TTY は案内だけで素通り）。
+///
 /// 戻り値は検出したエージェントと、チェック後も欠けている必須依存の一覧。
-fn run_dependency_check(interactive: bool) -> (Vec<DetectedAgent>, Vec<String>) {
+fn run_dependency_check(mode: DepCheckMode) -> (Vec<DetectedAgent>, Vec<String>) {
     let agents = detect_agents();
     eprintln!("  エージェント CLI:");
     for agent in &agents {
@@ -1230,9 +1273,11 @@ fn run_dependency_check(interactive: bool) -> (Vec<DetectedAgent>, Vec<String>) 
         if !dep.required {
             eprintln!("      無くても tako 自体は動きますが、上記の機能が使えません");
         }
-        let installed = offer_dep_install(&state, brew.is_some(), interactive);
+        let installed = offer_dep_install(&state, brew.is_some(), mode.offer);
         if installed {
-            match find_command(dep.bin) {
+            // 再検出は検出と**同じ規則**を通す（FR-2.33.8。`exe::find` だけだと
+            // 器の別名・`TAKO_TMUX_BIN` 指定を取りこぼす）
+            match setup_deps::resolve(&dep) {
                 Some(path) => eprintln!("  [OK] {}: {path}（インストール完了）", dep.bin),
                 None => {
                     eprintln!(
@@ -1251,58 +1296,61 @@ fn run_dependency_check(interactive: bool) -> (Vec<DetectedAgent>, Vec<String>) 
     // FDA チェック（macOS のみ。任意だが強く推奨）
     #[cfg(target_os = "macos")]
     {
-        run_fda_check(interactive);
+        run_fda_check(mode.review_settings);
     }
     // スリープ防止の設定案内
-    run_sleep_guard_check(interactive);
+    run_sleep_guard_check(mode.review_settings);
     (agents, missing_required)
 }
 
-/// 未導入の依存に対する案内と、`--review` でのその場導入（#88 → #1057 で復活）。
+/// 未導入の依存に対する案内と、その場導入（#88 → #1057 → #1499 で標準経路へ）。
 ///
-/// - 標準 `tako setup`（interactive = false）: **質問しない**。状態と
-///   最も簡単なコマンド 1 本だけを出す（#262 / #322）
-/// - `--review`（interactive = true）: 1 件ずつ y/N で聞いて導入する
-///
-/// 導入の実行は `setup_deps::install` を通す（CLI・MCP で同じ実装）
-fn offer_dep_install(state: &setup_deps::DepStatus, has_brew: bool, interactive: bool) -> bool {
+/// 何をするかの判断は `setup_deps::offer_for`（理由を返す純粋関数）が決め、
+/// ここは**表示と入力の読み取りだけ**を行う。導入の実行は `setup_deps::install`
+/// を通す（CLI・MCP・`tako setup deps install` で同じ 1 実装）
+fn offer_dep_install(
+    state: &setup_deps::DepStatus,
+    has_brew: bool,
+    ctx: setup_deps::DepOfferContext,
+) -> bool {
     let dep = state.dep;
-    let Some(installer) = dep.installer else {
-        eprintln!("      導入方法: {}", dep.hint);
-        return false;
-    };
-    let command = installer.command_line();
-    let tool_present = find_command(installer.program()).is_some();
-    if !installer.tako_can_run() {
-        // 代行しない手段（Windows の winget）は打つべきコマンドだけを見せる
-        eprintln!("      導入方法: {command} / {}", dep.hint);
-        return false;
-    }
-    if !tool_present {
-        let missing = installer.program();
-        // brew が無いのは macOS で一番多い詰まり方。Homebrew は
-        // 管理者パスワードを求めるため tako は導入を代行しない（#868）
-        let brew_note = if missing == "brew" && !has_brew {
-            "（要 Homebrew: https://brew.sh）"
-        } else {
-            ""
-        };
-        eprintln!("      導入方法: {command}{brew_note} / {}", dep.hint);
-        return false;
-    }
-    if !interactive {
-        eprintln!("      いま入れる: tako setup deps install   （{command} 相当）");
-        return false;
-    }
-    eprint!("      今すぐ {command} を実行しますか？ [y/N]: ");
-    let mut input = String::new();
-    if std::io::stdin().read_line(&mut input).is_err() {
-        return false;
-    }
-    let answer = input.trim().to_ascii_lowercase();
-    if answer != "y" && answer != "yes" {
-        eprintln!("      スキップしました（後から `tako setup deps install` で導入できます）");
-        return false;
+    let command = dep.installer.map(setup_deps::DepInstaller::command_line);
+    match setup_deps::offer_for(state.can_tako_install(), ctx) {
+        setup_deps::DepOffer::Guide(setup_deps::GuideReason::CannotRun) => {
+            print_dep_manual_hint(state, has_brew);
+            return false;
+        }
+        setup_deps::DepOffer::Guide(reason) => {
+            print_dep_install_plan(state);
+            if let Some(command) = &command {
+                eprintln!("      いま入れる: tako setup deps install   （{command} 相当）");
+            }
+            if let Some(note) = reason.note() {
+                eprintln!("      {note}");
+            }
+            return false;
+        }
+        setup_deps::DepOffer::Ask => {
+            print_dep_install_plan(state);
+            eprint!("      {} をインストールしますか？ [y/N]: ", dep.bin);
+            let mut input = String::new();
+            if std::io::stdin().read_line(&mut input).is_err() {
+                eprintln!();
+                eprintln!("      入力を読めませんでした（後から `tako setup deps install` で導入できます）");
+                return false;
+            }
+            let answer = input.trim().to_ascii_lowercase();
+            if answer != "y" && answer != "yes" {
+                eprintln!(
+                    "      スキップしました（後から `tako setup deps install` で導入できます）"
+                );
+                return false;
+            }
+        }
+        setup_deps::DepOffer::AutoInstall => {
+            print_dep_install_plan(state);
+            eprintln!("      --yes のため確認を省略してインストールします");
+        }
     }
     match setup_deps::install(
         Some(dep.bin),
@@ -1313,10 +1361,55 @@ fn offer_dep_install(state: &setup_deps::DepStatus, has_brew: bool, interactive:
     ) {
         Ok(value) => value["installed"].as_array().is_some_and(|a| !a.is_empty()),
         Err(e) => {
+            // 導入に失敗しても setup は止めない。**次の一手**へ落とす（#1499）
             eprintln!("      [警告] {e}");
+            if let Some(command) = &command {
+                eprintln!("      いま入れる: tako setup deps install   （{command} 相当）");
+            }
             false
         }
     }
+}
+
+/// 「何を・どの導入器で・どこへ入れるか」を出す（#1499。聞く前に必ず見せる）
+fn print_dep_install_plan(state: &setup_deps::DepStatus) {
+    let Some(installer) = state.dep.installer else {
+        return;
+    };
+    let command = installer.command_line();
+    let Some(program) = state.installer_path() else {
+        eprintln!("      導入: {command}");
+        return;
+    };
+    match setup_deps::install_dir(installer, program) {
+        Some(dir) => eprintln!(
+            "      導入: {command}（導入器 {} → {} へ入ります）",
+            display_home_relative(Path::new(program)),
+            display_home_relative(Path::new(&dir))
+        ),
+        None => eprintln!(
+            "      導入: {command}（導入器 {}）",
+            display_home_relative(Path::new(program))
+        ),
+    }
+}
+
+/// tako が代行できないときに「人が打つべきコマンド」を出す
+fn print_dep_manual_hint(state: &setup_deps::DepStatus, has_brew: bool) {
+    let dep = state.dep;
+    let Some(installer) = dep.installer else {
+        eprintln!("      導入方法: {}", dep.hint);
+        return;
+    };
+    let command = installer.command_line();
+    // brew が無いのは macOS で一番多い詰まり方。Homebrew は
+    // 管理者パスワードを求めるため tako は導入を代行しない（#868）
+    let brew_note = if installer.program() == "brew" && !has_brew {
+        "（要 Homebrew: https://brew.sh）"
+    } else {
+        ""
+    };
+    eprintln!("      導入方法: {command}{brew_note} / {}", dep.hint);
 }
 
 /// `tako setup deps [install]`。MCP `tako_setup_deps` と 1:1（#88 / #1057）
@@ -2964,7 +3057,7 @@ pub fn run_check() -> Result<(), String> {
     }
 
     // エージェント CLI + 任意依存。--check では表示のみ。
-    let (agents, _) = run_dependency_check(false);
+    let (agents, _) = run_dependency_check(DepCheckMode::check_only());
 
     // MCP 登録（#979 で claude / codex / agy の 3 系統とも永続登録になった）
     if let Some(claude) = agents.iter().find(|a| a.kind == SetupAgent::Claude) {
@@ -3275,11 +3368,12 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
     // 未導入なら インストール → PATH 通し → 認証 まで案内してから検出型へ進む
     run_bootstrap_stage(assume_yes)?;
 
-    // 標準 setup では項目別 y/n を出さない（#262 の質問ゼロ）。未導入依存・FDA・
-    // スリープ設定は状態と専用コマンドだけを表示する。
-    // `--review` は「前回設定を個別に見直す」経路なので、そこでは
-    // その場導入を y/N で聞く（#88 の体験。#1057 で復活）
-    let (agents, missing) = run_dependency_check(review_mode && !setup_bootstrap::legacy_mode());
+    // 設定値の項目別 y/n は標準 setup では出さない（#262 の質問ゼロ）。
+    // **未検出の CLI 依存だけは例外**で、`--review` かどうかに関わらず
+    // 「何を・どこへ入れるか」を見せて [y/N] を聞く（#1499。`--yes` は同意扱い、
+    // 非 TTY は案内だけで素通り）。FDA・スリープ設定の見直しは従来どおり
+    // `--review` だけが対話になる
+    let (agents, missing) = run_dependency_check(DepCheckMode::for_setup(review_mode, assume_yes));
     if !missing.is_empty() {
         return Err(format!(
             "必須の依存ツールが不足しています: {}。\n\
@@ -3804,22 +3898,12 @@ mod tests {
         );
     }
 
-    /// `--review` のときだけ y/N を聞く（#262 の質問ゼロを壊さない）。
-    /// 呼び出しの引数がずれる退行を固定する
-    #[test]
-    fn 標準setupは依存の質問をしない() {
-        let src = include_str!("setup.rs");
-        assert!(
-            src.contains("run_dependency_check(review_mode && !setup_bootstrap::legacy_mode())"),
-            "run_setup は review のときだけ対話にする（legacy env で旧挙動へ戻せる）"
-        );
-        assert!(
-            src.contains("run_dependency_check(false)"),
-            "--check は表示のみ"
-        );
-        // 標準経路で出す案内は最簡形 1 本（#322）
-        assert!(src.contains("いま入れる: tako setup deps install"));
-    }
+    // 依存チェック段の契約（標準 `tako setup` でも [y/N] を聞く / 設定値の質問は
+    // 増やさない / 聞く前に導入計画を見せる）の番犬は
+    // `crates/tako-control/tests/issue1499_setup_deps_prompt_watchdog.rs` にある。
+    // **ここへ書くと自己参照で嘘をつく**（禁止パターンをテスト自身が文字列で
+    // 持つので `include_str!` の走査に当たる = #1499 の実測）。向こうは
+    // `production_range` でテスト領域を潰してから見るので当たらない
 
     fn detected(kind: SetupAgent, authenticated: bool, plan: Option<&str>) -> DetectedAgent {
         DetectedAgent {

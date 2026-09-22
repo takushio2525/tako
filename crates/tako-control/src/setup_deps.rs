@@ -11,12 +11,29 @@
 //! CLI・MCP・`--review` が同じ実装を通るようにする。UI から到達できない
 //! 経路を作らないのが tako の開発不変条件（設計原則 5）。
 //!
-//! ## #262 との両立
+//! ## #262 との両立（#1499 で線を引き直した）
 //!
-//! - 標準 `tako setup`: 質問ゼロ。状態と**最も簡単なコマンド 1 本**だけを出す（#322）
-//! - `tako setup --review`: 未導入の依存を 1 件ずつ y/N で聞く（#88 の体験）
+//! #1057 が復活させたのは **`--review` 経路だけ**だった（標準 `tako setup` は
+//! `run_dependency_check(false)` のまま）。実機の利用者は `--review` を付けないので
+//! **検出止まりのまま**で、#88 の体験は事実上戻っていなかった（#1499 の実測）。
+//!
+//! #262 の「質問ゼロ」が守っているのは**設定値の個別確認**（前回値の再確認・
+//! プロファイルの選び直し）であって、「無い物をいま入れるか」はそれに当たらない。
+//! 無いものは入れない限り機能が欠けたままで、**利用者が次に打つコマンドを
+//! 自分で考える必要がある**（#322 の「最も簡単なコマンド」の逆）。そこで:
+//!
+//! - 標準 `tako setup`: 未検出の任意依存だけは「何を・どの導入器で・どこへ」を
+//!   見せて `[y/N]` を聞く（#1499）。**設定値の質問は増やさない**
+//! - `--yes`: 同意扱いで導入まで進む（`-y` の一般的な意味。bootstrap 段が
+//!   `--yes` で claude を実際に入れる先例と体験を揃える）
+//! - 非 TTY（GUI の初回起動・パイプ経由）: 聞かずに案内 1 本へ落として**止まらない**
+//! - `tako setup --check`: 読み取りだけ。何も導入しない
 //! - `tako setup deps install`: 明示コマンド（非対話。`--dry-run` で計画だけ）
 //! - MCP `tako_setup_deps`: 上と同じ実装を通る
+//!
+//! 判断は [`offer_for`] の 1 本（**理由を返す純粋関数**）に閉じてあり、CLI は
+//! 読んで表示するだけ。A/B は `TAKO_1499_LEGACY=1`（標準 setup が聞かない
+//! = #1499 前の挙動）
 
 use serde_json::{json, Value};
 use tako_core::platform::support::Platform;
@@ -146,6 +163,10 @@ pub struct DepStatus {
     pub dep: ExternalDep,
     /// 解決できた実行ファイル
     pub found: Option<String>,
+    /// 導入器の実行ファイル。**検出のときに 1 回だけ引く**（unix の
+    /// `exe::find` はログインシェルを起こすので、依存ごとに何度も引くと
+    /// `tako setup` が目に見えて遅くなる。表示・判断・実行が同じ値を見る）
+    installer_found: Option<String>,
 }
 
 impl DepStatus {
@@ -158,18 +179,135 @@ impl DepStatus {
             "purpose": self.dep.purpose,
             "install_command": installer.map(DepInstaller::command_line),
             // 手段があっても代行できないことがある（Windows の winget）
-            "can_run": installer.is_some_and(DepInstaller::tako_can_run) && self.available_installer(),
-            "installer_found": installer.and_then(|i| tako_core::platform::exe::find(i.program())),
+            "can_run": self.can_tako_install(),
+            "installer_found": self.installer_path(),
+            "install_dir": self
+                .installer_path()
+                .and_then(|program| installer.and_then(|i| install_dir(i, program))),
             "hint": self.dep.hint,
         })
     }
 
-    /// 導入手段の実行ファイルがこの環境に在るか
-    fn available_installer(&self) -> bool {
-        self.dep
-            .installer
-            .is_some_and(|i| tako_core::platform::exe::find(i.program()).is_some())
+    /// tako がこの依存の導入を代行できるか（**JSON の `can_run` と同じ 1 実装**）。
+    ///
+    /// 手段があること・その手段を代行してよいこと・導入器がこの環境に在ることの
+    /// 3 つが揃って初めて true。`tako setup` の `[y/N]` を出すかもこれを見る（#1499）
+    pub fn can_tako_install(&self) -> bool {
+        self.dep.installer.is_some_and(DepInstaller::tako_can_run) && self.installer_found.is_some()
     }
+
+    /// 導入器の実行ファイル（この環境で解決できたもの）
+    pub fn installer_path(&self) -> Option<&str> {
+        self.installer_found.as_deref()
+    }
+}
+
+/// 導入したコマンドが**どこへ置かれるか**（#1499 の「何をどこに入れるか」の一部）。
+///
+/// Homebrew は `<prefix>/bin/brew` に在り、パッケージの実行ファイルは同じ
+/// `<prefix>/bin` へ symlink される。**導入器のパスから構造的に導ける**ので
+/// `brew --prefix` を別プロセスで起こさない。winget は置き場がパッケージ任せ
+/// なので答えない（**推測を人へ見せない**）
+pub fn install_dir(installer: DepInstaller, program_path: &str) -> Option<String> {
+    match installer {
+        DepInstaller::Brew { .. } => {
+            let parent = std::path::Path::new(program_path).parent()?;
+            // `<prefix>/bin/brew` の形でないもの（スタブ・別配置）は答えない
+            (parent.file_name()? == "bin").then(|| parent.to_string_lossy().into_owned())
+        }
+        DepInstaller::Winget { .. } => None,
+    }
+}
+
+/// `tako setup` の依存チェック段で、未検出の依存 1 件に対して何をするか（#1499）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DepOffer {
+    /// 端末で「インストールしますか？ [y/N]」を聞いてから導入する
+    Ask,
+    /// 質問を省いてそのまま導入する（`--yes`）
+    AutoInstall,
+    /// 導入せず案内だけ出して続行する（**理由つき**。黙って飛ばさない）
+    Guide(GuideReason),
+}
+
+/// 聞かずに案内で終える理由。**すべて人へ出せる文面を持つ**
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuideReason {
+    /// 手段が無い / tako が代行しない / 導入器がこの環境に無い
+    CannotRun,
+    /// 読み取りだけの経路（`tako setup --check`）
+    CheckOnly,
+    /// `TAKO_1499_LEGACY=1`（#1499 前 = 標準 setup は聞かない）
+    Legacy,
+    /// 端末が無いので聞けない（GUI の初回起動・パイプ経由）
+    NoTerminal,
+}
+
+impl GuideReason {
+    /// 機械可読の理由（`skipped[].reason` と同じ語彙を使う）
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::CannotRun => "cannot_run",
+            Self::CheckOnly => "check_only",
+            Self::Legacy => "legacy",
+            Self::NoTerminal => "no_terminal",
+        }
+    }
+
+    /// 「聞けたはずなのに聞かなかった」ときだけ理由を人へ出す
+    /// （`CannotRun` / `CheckOnly` は直前の表示が既に理由を語っている）
+    pub fn note(self) -> Option<&'static str> {
+        match self {
+            Self::CannotRun | Self::CheckOnly => None,
+            Self::Legacy => Some("（TAKO_1499_LEGACY=1 のため確認を省きました）"),
+            Self::NoTerminal => Some("（端末が無いので確認を省きました）"),
+        }
+    }
+}
+
+/// [`offer_for`] が見る文脈。**この構造体の外の条件で判断を分けない**
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DepOfferContext {
+    /// この段が導入まで行う経路か（`tako setup --check` は false）
+    pub stage_installs: bool,
+    /// `--review`（#1057 からある見直し経路。#1499 前はここだけが聞いた）
+    pub review: bool,
+    /// `--yes`（質問を省いて導入まで進む）
+    pub assume_yes: bool,
+    /// stdin が端末か
+    pub stdin_is_terminal: bool,
+    /// `TAKO_1499_LEGACY=1`
+    pub legacy: bool,
+}
+
+/// 未検出の依存 1 件をその場でどう扱うか（**純粋関数**なので文脈を並べて検査できる）。
+///
+/// `can_run` は [`DepStatus::can_tako_install`]。判断の順序に意味がある:
+/// 代行できないものは他の条件を見るまでもなく案内で終わり、読み取り専用の経路は
+/// `--yes` より強い（`--check` が何かを入れたら読み取りではない）
+pub fn offer_for(can_run: bool, ctx: DepOfferContext) -> DepOffer {
+    if !can_run {
+        return DepOffer::Guide(GuideReason::CannotRun);
+    }
+    if !ctx.stage_installs {
+        return DepOffer::Guide(GuideReason::CheckOnly);
+    }
+    // #1499 前へ戻す A/B。`--review` はもともと聞いていたので据え置く
+    if ctx.legacy && !ctx.review {
+        return DepOffer::Guide(GuideReason::Legacy);
+    }
+    if ctx.assume_yes {
+        return DepOffer::AutoInstall;
+    }
+    if !ctx.stdin_is_terminal {
+        return DepOffer::Guide(GuideReason::NoTerminal);
+    }
+    DepOffer::Ask
+}
+
+/// #1499 の A/B（標準 `tako setup` が依存の導入を聞かない = 復活前の挙動）
+pub fn legacy_mode() -> bool {
+    std::env::var_os("TAKO_1499_LEGACY").is_some()
 }
 
 /// 器（tmux / psmux）は PATH の名前だけでは決まらない。
@@ -189,8 +327,11 @@ fn resolve_container() -> Option<String> {
 /// （別々にすると「入れたのに見つかりません」と言い出す側が生まれる）。
 ///
 /// 器は `exe::find` を先に見る: `backend::binary()` はプロセス内で 1 回だけ
-/// 解決してキャッシュするので、導入直後の再確認では答えが変わらない
-fn resolve(dep: &ExternalDep) -> Option<String> {
+/// 解決してキャッシュするので、導入直後の再確認では答えが変わらない。
+///
+/// **`tako setup` の再検出もこれを通す**（#1499）。`exe::find` だけで確かめると
+/// 器の別名・`TAKO_TMUX_BIN` 指定を取りこぼして「入れたのに見つかりません」になる
+pub fn resolve(dep: &ExternalDep) -> Option<String> {
     let found = tako_core::platform::exe::find(dep.bin);
     if found.is_some() || !is_container(dep) {
         return found;
@@ -204,7 +345,14 @@ pub fn status() -> Vec<DepStatus> {
         .into_iter()
         .map(|dep| {
             let found = resolve(&dep);
-            DepStatus { dep, found }
+            let installer_found = dep
+                .installer
+                .and_then(|i| tako_core::platform::exe::find(i.program()));
+            DepStatus {
+                dep,
+                found,
+                installer_found,
+            }
         })
         .collect()
 }
@@ -279,7 +427,7 @@ pub fn install(bin: Option<&str>, opts: DepInstallOptions) -> Result<Value, Stri
             }));
             continue;
         }
-        let Some(program) = tako_core::platform::exe::find(installer.program()) else {
+        let Some(program) = state.installer_path() else {
             skipped.push(json!({
                 "bin": state.dep.bin,
                 "reason": "installer_missing",
@@ -299,7 +447,7 @@ pub fn install(bin: Option<&str>, opts: DepInstallOptions) -> Result<Value, Stri
         if opts.dry_run {
             continue;
         }
-        run_installer(&program, installer, opts.interactive)?;
+        run_installer(program, installer, opts.interactive)?;
         // 「実行した」ではなく「引けるようになった」を確かめてから成功と言う
         match resolve(&state.dep) {
             Some(path) => installed.push(json!({ "bin": state.dep.bin, "path": path })),
@@ -442,6 +590,48 @@ mod tests {
         assert!(winget
             .command_line()
             .starts_with("winget install --id marlocarlo.psmux"));
+    }
+
+    /// 「どこへ入るか」は Homebrew の構造から導く（`brew --prefix` を起こさない）
+    #[test]
+    fn 入る場所は導入器のパスから導く() {
+        let brew = DepInstaller::Brew { pkg: "tmux" };
+        assert_eq!(
+            install_dir(brew, "/opt/homebrew/bin/brew").as_deref(),
+            Some("/opt/homebrew/bin")
+        );
+        assert_eq!(
+            install_dir(brew, "/usr/local/bin/brew").as_deref(),
+            Some("/usr/local/bin")
+        );
+        // `<prefix>/bin/brew` の形でないものは**答えない**（推測を人へ見せない）
+        assert_eq!(install_dir(brew, "/tmp/stub/brew"), None);
+        assert_eq!(install_dir(brew, "brew"), None);
+        // winget は置き場がパッケージ任せなので答えない
+        assert_eq!(
+            install_dir(DepInstaller::Winget { pkg: "Git.Git" }, "C:\\w\\winget.exe"),
+            None
+        );
+    }
+
+    /// `can_run`（JSON）と `[y/N]` を出すかの判断が**同じ 1 実装**を見る（#1499）
+    #[test]
+    fn can_runの判断は1実装() {
+        for state in status() {
+            let json = state.to_json();
+            assert_eq!(
+                json["can_run"].as_bool(),
+                Some(state.can_tako_install()),
+                "{}: JSON の can_run と can_tako_install がずれている",
+                state.dep.bin
+            );
+            assert_eq!(
+                json["installer_found"].as_str(),
+                state.installer_path(),
+                "{}: 導入器のパスがずれている",
+                state.dep.bin
+            );
+        }
     }
 
     #[test]

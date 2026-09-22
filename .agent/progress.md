@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-18（#1482: ドキュメントサイトを tako.takushio2525.com へ移行）
-- `docs/astro.config.mjs` の `site` を新ドメインへ（canonical / og:url / og:image / sitemap はここ 1 か所が基点なのでまとめて追従）。About の `DOCUMENTATION_URL` は「`site` と同じ URL」という設定コメントの約束があるので同一コミットで動かす
-- 旧ドメインの転送は `docs/functions/_middleware.js` の 301。`*.pages.dev` はゾーン外で Redirect Rules / Bulk Redirects を書けず `_redirects` はホスト名を条件にできないため、Pages Functions が唯一の経路。プレビュー配備を潰さないようホスト名は完全一致で見る
-- OG 画像 31 枚を再生成（フッター文言。未生成だった features/user-tasks もここで揃った）。ビルド 32 ページ緑 / og:verify 緑。カスタムドメインの追加は master が実施
-
 ## 2026-09-18（#1481: Web ビューを見たあとターミナルへ戻ったとき打鍵が届かないのを直した）
 - 真因は AppKit 側だった: 宛先を親へ返す `focus_parent()` が `sync_frame` の **hide 分岐にしか無く**（`webview.rs:268`）、Web ビューが見えたままフォーカスが別ペインへ移る経路（`on_pane_mouse_down` / dispatch `Focus`）は `PaneTree` のフォーカスしか動かさない。#326 の NSEvent monitor は **⌘ 修飾つきのキーだけ**（`webview.rs:582`）なので素の打鍵は救われない。破棄（× / `web close`）も宛先を持ったまま壊していた
 - 宛先の読み・戻しを `webview.rs` の 1 実装へ（#326 の monitor も同じ関数を通る）。**戻す先は `contentView` ではなく「宛先を持っている WKWebView の superview」**（実測: contentView = `AccessKitSubclassOfNSView` で `makeFirstResponder:` は成功するのに打鍵は来ない）。呼ぶのは `clear_text_input_focus`（= #503 と同じ全経路）と破棄の直前で、**毎フレームの level 判定にはしない**（「宛先が webview でフォーカスは別ペイン」は「いまページをクリックした」と同じ状態なのでページへ打てなくなる）
@@ -59,3 +54,8 @@
 - 追跡が `strip_prefix("fn ")` だと `pub(crate) fn` / `async fn` が頭に見えず、中の違反が**手前の関数名**で報告されていた（検出は効くが名指しが嘘 = 緑のまま残る）。`tako_core::source_scan`（`fn_head_name` / `is_top_level_fn_head`）を新設し、同型 5 か所（#770 の 2 本 / remote_scrollback / issue841 / test_residue / setup_bootstrap）を差し替え。tako-core へ置いたのは tako-app の `#[cfg(test)]` と tako-control の tests の**両方**から引ける唯一の置き場だから
 - 実測（実ファイルへの注入で A/B）: `main.rs:6202` が 旧 `shelved_tab_groups` → 新 `unshelve_tab_clicked`・`main.rs:8901` が 旧 `background_tab` → 新 `reattach_backgrounded_preview`。前者は Issue の症状そのもの
 - 番犬 `issue1496_fn_head_watchdog` 2 本（直書きの再発 / 寄せ先の空振り）。注入 11 通りすべて FAILED + file:line 名指し（A 5 = 番犬が噛む / B 6 = 寄せた 5 か所の検出力が落ちていない）
+
+## 2026-09-22（#1499: tako setup の依存チェック段で未検出の CLI 依存を [y/N] から入れられるようにした）
+- 真因は回帰ではなく**#1057 の復活が `--review` 経路だけ**だったこと（`run_setup` は `run_dependency_check(review_mode && …)` のまま）。隔離環境でパイプ・実 PTY・`--review` の 3 通りを実走させ、前 2 つの出力が 1 文字も変わらないことで TTY 判定説を潰してから着手。当時の `標準setupは依存の質問をしない` が旧呼び出し形を文字列で固定しており、**直そうとすると番犬が止める**状態だった
+- 判断を理由つき純粋関数 `setup_deps::offer_for`（`Ask` / `AutoInstall` / `Guide(cannot_run|check_only|legacy|no_terminal)`）1 本へ。CLI は表示と入力だけ。`interactive` 1 つが担っていた「依存を入れるか」と「設定値を見直すか」を `DepCheckMode` で分離（**#262 が守るのは後者**）。`--yes` は同意扱い・非 TTY は案内へ落として止まらない。再検出は `setup_deps::resolve`（検出と同じ規則）
+- 実測: `scripts/test-setup-deps-prompt-1499.sh` **52 PASS 0 FAIL**（CI の macOS ジョブへ登録）。番犬 5 本・注入 7 通りすべて FAILED → 戻して緑。A/B `TAKO_1499_LEGACY=1` は端末でも聞かない = Issue の症状。workspace 5040 passed 0 failed・clippy 3 宇宙 0。**受け入れ検査 rework 1 回目**: CI の `/bin/bash`（3.2）は `set -u` 下の空配列 `"${arr[@]}"` を未定義扱いにして PASS=43 FAIL=9（手元の bash 5 では出ない）→ `${arr[@]+"${arr[@]}"}` へ直し規約を conventions へ
