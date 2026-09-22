@@ -62,9 +62,39 @@ pub struct TcpListenEntry {
     pub pid: u32,
 }
 
-/// 全プロセスのスナップショット。取得手段が無いプラットフォームでは空を返す
+/// 全プロセスのスナップショット。**取れなかった回も空**（[`snapshot_checked`] の lossy 版）。
+///
+/// 「居るものを列挙して絞る」用途（[`details_by_name`] / 子孫の探索）はこれでよい。
+/// **「居ないこと」を根拠に消す / 撃つ判断には使わないこと**: 取得に失敗した回が
+/// 「1 件も居ない」と同じ形になり、全 pid が残骸に見える（#1597）
 pub fn snapshot() -> Vec<ProcEntry> {
-    imp::snapshot()
+    snapshot_checked().unwrap_or_default()
+}
+
+/// 全プロセスのスナップショット。**取得できなかったら `None`**（#1597）。
+///
+/// 区別するのは 2 つ:
+///
+/// - `Some(procs)` = 列挙できた。ここに載っていない pid は**居ない**
+/// - `None` = 列挙そのものができなかった（Windows の Toolhelp 失敗 / そもそも
+///   列挙の手段が無い OS）。**どの pid の生死も言えない**
+///
+/// **空の `Vec` では返さない**。呼び出したプロセス自身が必ず載るので
+/// 「成功したが 0 件」という在籍表は在り得ず、0 件は失敗の別の顔でしかない。
+///
+/// 非 Windows は常に `None`（macOS の検査は `ports.rs` の libproc 実装が正）。
+/// OS に列挙の手段があるかは [`snapshot_supported`] で分かる
+pub fn snapshot_checked() -> Option<Vec<ProcEntry>> {
+    imp::snapshot_checked()
+}
+
+/// この OS に在籍の列挙があるか（#1597）。
+///
+/// `false` の OS では [`snapshot_checked`] が常に `None` を返すので、呼び出し側は
+/// 「**列挙に失敗した**」と「**そもそも列挙しない**」を区別できる。前者は見送る側へ倒し、
+/// 後者は pid ごとに [`crate::platform::process::pid_alive`] へ聞けばよい
+pub const fn snapshot_supported() -> bool {
+    cfg!(windows)
 }
 
 /// LISTEN 中の TCP エンドポイント全件（IPv4 + IPv6）。
@@ -631,7 +661,7 @@ mod imp {
         -1isize as Handle
     }
 
-    pub(super) fn snapshot() -> Vec<ProcEntry> {
+    pub(super) fn snapshot_checked() -> Option<Vec<ProcEntry>> {
         let mut out = Vec::new();
         // SAFETY: スナップショットハンドルは取得直後に妥当性を検査し、
         // 復帰経路すべてで CloseHandle する。entry は毎回 dw_size を設定した
@@ -639,7 +669,8 @@ mod imp {
         unsafe {
             let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             if snap.is_null() || snap == invalid_handle() {
-                return out;
+                // 列挙そのものが出来なかった回。**空の在籍表として返さない**（#1597）
+                return None;
             }
             let mut entry: ProcessEntry32W = std::mem::zeroed();
             entry.dw_size = std::mem::size_of::<ProcessEntry32W>() as u32;
@@ -662,7 +693,9 @@ mod imp {
             }
             CloseHandle(snap);
         }
-        out
+        // 自分自身が必ず載るので 0 件は「誰も居ない」ではなく列挙の失敗
+        // （`Process32FirstW` が落ちた回）。失敗の顔を 1 つに畳む（#1597）
+        (!out.is_empty()).then_some(out)
     }
 
     // --- TCP テーブル（iphlpapi） ---
@@ -858,9 +891,10 @@ mod imp {
 mod imp {
     use super::{LoopbackPeer, ProcEntry, TcpListenEntry};
 
-    /// macOS の検査は `ports.rs` の libproc 実装が正（このモジュールは使わない）
-    pub(super) fn snapshot() -> Vec<ProcEntry> {
-        Vec::new()
+    /// macOS の検査は `ports.rs` の libproc 実装が正（このモジュールは使わない）。
+    /// **`None` = 列挙の手段が無い**（「0 件が居る」ではない。#1597）
+    pub(super) fn snapshot_checked() -> Option<Vec<ProcEntry>> {
+        None
     }
 
     /// 他プロセスのコマンドラインを引く用途が unix にはまだ無い（#1282 の器の列挙は
@@ -1473,6 +1507,41 @@ mod tests {
         );
         // 根が空なら何も拾わない（材料が採れなかったときに誤って落とさない）
         assert!(agent_children_of_tako_under(&procs, &[]).is_empty());
+    }
+
+    /// 在籍の列挙は「失敗」と「不在」を別の形で返す（#1597）。
+    ///
+    /// ここが崩れると、列挙できなかった回が「1 件も居ない」と同じ顔になり、
+    /// 生死を聞いた全 pid が「居ない」= 残骸に見える
+    #[test]
+    fn 在籍の列挙は失敗と不在を区別する() {
+        assert_eq!(
+            snapshot_supported(),
+            cfg!(windows),
+            "列挙の手段を持つ OS の宣言が実装とズレている"
+        );
+        match snapshot_checked() {
+            Some(procs) => {
+                assert!(snapshot_supported(), "列挙を持たない OS が在籍表を返した");
+                assert!(
+                    !procs.is_empty(),
+                    "成功したのに 0 件 = 失敗を空の在籍表で返している"
+                );
+                assert!(
+                    procs.iter().any(|p| p.pid == std::process::id()),
+                    "自分自身が載っていない在籍表は壊れている"
+                );
+            }
+            None => assert!(
+                !snapshot_supported(),
+                "在籍の列挙を持つ OS で列挙に失敗した（Windows の Toolhelp）"
+            ),
+        }
+        assert_eq!(
+            snapshot().is_empty(),
+            !snapshot_supported(),
+            "lossy 版（失敗を空へ畳む）の畳み方が変わっている"
+        );
     }
 
     /// 実機の OS へ問い合わせる。**この環境の構成に依存しない検査だけ**を書く

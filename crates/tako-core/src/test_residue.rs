@@ -30,6 +30,11 @@
 //! **dir の作成時刻より後に始まったプロセス**はその dir を作れないので
 //! `ReusedPid` と分類し、**消さずに見送る**（判定の材料が無い側へ倒す）。
 //! 生死が読めないとき（権限・取得手段が無い）も `Unknown` = 触らない。
+//!
+//! **生死を引く材料そのものが採れなかった回も `Unknown`**（#1597）。Windows の
+//! 在籍の列挙（Toolhelp）が失敗すると全 pid が「載っていない」= 不在に見えるので、
+//! そこを `Dead` と読むと 1 回の失敗で**生きている別 worker の置き場を全部消す**。
+//! 材料の状態は [`Roster`] が 3 値で持ち、失敗（`Unavailable`）は誰の生死も答えない。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -111,7 +116,8 @@ pub enum Owner {
     Dead,
     /// 生きている（起動時刻が取れたら `started`）
     Alive { started: Option<SystemTime> },
-    /// 生死を判定できない（pid として不正・取得手段が無い）= 触らない
+    /// 生死を判定できない（pid として不正・取得手段が無い・**在籍の列挙に
+    /// 失敗した**）= 触らない
     Unknown,
 }
 
@@ -200,8 +206,74 @@ pub struct Residue {
 /// 1 度だけ**スナップショットを取る（2,000 件の残骸に対して pid ごとに
 /// 列挙し直すと O(n²) になる）
 pub struct OwnerProbe {
-    #[cfg(windows)]
-    live: std::collections::HashSet<u32>,
+    roster: Roster,
+}
+
+/// 生死を引く材料（[`OwnerProbe`] を作った時点で 1 度だけ決まる）。
+///
+/// **「列挙できなかった」を「誰も居ない」と同じ形へ潰さない**のが #1597 の要点。
+/// 潰すと全 pid が [`Owner::Dead`] に見え、[`sweep_in`] が並行して走っている
+/// 別 worker の置き場まで消しに行く（#625 と同じ事故クラス）
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Roster {
+    /// 在籍を列挙できた。この集合に居ない pid は**居ない**
+    Listed(std::collections::HashSet<u32>),
+    /// 列挙に失敗した = **どの pid の生死も言えない**（Windows の Toolhelp 失敗）
+    Unavailable,
+    /// 列挙は使わず pid ごとに境界へ聞く（列挙の手段が無い OS）
+    PerPid,
+}
+
+impl Roster {
+    /// 在籍のスナップショット（[`crate::platform::procinfo::snapshot_checked`] の結果）から組む。
+    ///
+    /// cfg で割れていないので **macOS からも Windows の腕を単体で検証できる**。
+    /// `None` も**空**も [`Roster::Unavailable`] へ倒す: 呼び出したプロセス自身が
+    /// 必ず載るので、0 件の在籍表は「誰も居ない」ではなく列挙の失敗でしかない
+    fn from_snapshot(procs: Option<Vec<crate::platform::procinfo::ProcEntry>>) -> Self {
+        match procs {
+            Some(procs) if !procs.is_empty() => {
+                Roster::Listed(procs.iter().map(|p| p.pid).collect())
+            }
+            _ => Roster::Unavailable,
+        }
+    }
+}
+
+/// いまの環境で使う材料を決める。
+///
+/// 列挙の手段を持たない OS（macOS）は**失敗ではない**ので [`Roster::PerPid`] へ倒し、
+/// 境界 [`crate::platform::process::pid_alive`] が pid ごとに答える。
+/// 手段を持つ OS で `None` が返ったときだけが「失敗」（#1597）
+fn current_roster() -> Roster {
+    if let Some(injected) = injected_roster() {
+        return injected;
+    }
+    if !crate::platform::procinfo::snapshot_supported() {
+        return Roster::PerPid;
+    }
+    Roster::from_snapshot(crate::platform::procinfo::snapshot_checked())
+}
+
+/// 在籍の材料を差し替える注入口（**テストプロセスでだけ効く**。#1597）。
+///
+/// | `TAKO_1597_ROSTER` | 再現するもの |
+/// |---|---|
+/// | `fail` | 在籍の列挙に失敗した回（Windows の Toolhelp 失敗）|
+/// | `empty` | **#1597 以前の読み方**（空の列挙を「全員不在」と読む）= 事故そのもの |
+///
+/// `empty` は生きている置き場を消す挙動そのものなので、効く範囲を
+/// [`crate::paths::is_test_process`] の中へ閉じる（製品バイナリでは無視する）。
+/// A/B は `crates/tako-core/tests/test_data_residue.rs` が実プロセスで回す
+fn injected_roster() -> Option<Roster> {
+    if !crate::paths::is_test_process() {
+        return None;
+    }
+    match std::env::var("TAKO_1597_ROSTER").ok().as_deref() {
+        Some("fail") => Some(Roster::Unavailable),
+        Some("empty") => Some(Roster::Listed(std::collections::HashSet::new())),
+        _ => None,
+    }
 }
 
 impl Default for OwnerProbe {
@@ -213,11 +285,7 @@ impl Default for OwnerProbe {
 impl OwnerProbe {
     pub fn new() -> Self {
         Self {
-            #[cfg(windows)]
-            live: crate::platform::procinfo::snapshot()
-                .iter()
-                .map(|p| p.pid)
-                .collect(),
+            roster: current_roster(),
         }
     }
 
@@ -227,23 +295,28 @@ impl OwnerProbe {
             // pid として使われない値 = 名前が壊れている。触らない
             return Owner::Unknown;
         }
-        if !self.alive(pid) {
-            return Owner::Dead;
-        }
-        Owner::Alive {
-            // 秒精度でよい（比べる相手は dir の作成時刻で、余裕は REUSE_SLACK が持つ）
-            started: crate::platform::procinfo::start_time_unix(pid)
-                .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs)),
+        match self.alive(pid) {
+            // 生死を答える材料が無い（在籍の列挙に失敗した）= 触らない（#1597）
+            None => Owner::Unknown,
+            Some(false) => Owner::Dead,
+            Some(true) => Owner::Alive {
+                // 秒精度でよい（比べる相手は dir の作成時刻で、余裕は REUSE_SLACK が持つ）
+                started: crate::platform::procinfo::start_time_unix(pid)
+                    .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs)),
+            },
         }
     }
 
-    /// その pid が生きているか。**規則の正は境界
-    /// [`crate::platform::process::pid_alive`] の 1 実装**（#1557 と同じ寄せ先）。
+    /// その pid が生きているか。**`None` = 材料が無くて答えられない**（#1597）。
     ///
-    /// Windows だけ [`OwnerProbe::new`] が取った在籍スナップショットから引くのは、
-    /// あちらが 1 回の呼び出しごとに Toolhelp を回すため（2,000 件の残骸に対して
-    /// pid ごとに聞くと O(n²) になる）。**見る材料も答えも同じ**で、
-    /// ここは境界のキャッシュ版にあたる。
+    /// 規則の正は境界 [`crate::platform::process::pid_alive`] の 1 実装
+    /// （#1557 と同じ寄せ先）。Windows だけ [`OwnerProbe::new`] が取った在籍
+    /// スナップショットから引くのは、あちらが 1 回の呼び出しごとに Toolhelp を
+    /// 回すため（2,000 件の残骸に対して pid ごとに聞くと O(n²) になる）。
+    /// **見る材料も答えも同じ**で、ここは境界のキャッシュ版にあたる。
+    ///
+    /// **`false` と `None` を混ぜないこと**。その列挙が採れなかった回に「居ない」と
+    /// 答えると全 pid が残骸に見え、生きている別 worker の置き場まで消える（#1597）。
     ///
     /// ここで [`crate::ports::process_alive`] を使ってはいけない。あちらは
     /// **tmux ソケットの回収**用で、非 unix では「何も回収しない」側へ倒すために
@@ -251,14 +324,11 @@ impl OwnerProbe {
     /// （#1581 の見立てはこの取り違えで、実際には #1296 の初版から境界を通っている）。
     /// 戻せないように番犬が見張る:
     /// `crates/tako-control/tests/issue1557_pid_alive_boundary_watchdog.rs`
-    fn alive(&self, pid: u32) -> bool {
-        #[cfg(windows)]
-        {
-            self.live.contains(&pid)
-        }
-        #[cfg(not(windows))]
-        {
-            crate::platform::process::pid_alive(pid)
+    fn alive(&self, pid: u32) -> Option<bool> {
+        match &self.roster {
+            Roster::Listed(live) => Some(live.contains(&pid)),
+            Roster::Unavailable => None,
+            Roster::PerPid => Some(crate::platform::process::pid_alive(pid)),
         }
     }
 }
@@ -949,6 +1019,110 @@ mod tests {
         );
         assert!(items.is_empty());
         assert_eq!(outcome.scanned, 0);
+    }
+
+    // ------------------------------------- 在籍の列挙が採れない回（Issue #1597）
+
+    fn proc_entry(pid: u32) -> crate::platform::procinfo::ProcEntry {
+        crate::platform::procinfo::ProcEntry {
+            pid,
+            ppid: 1,
+            name: format!("p{pid}.exe"),
+        }
+    }
+
+    fn probe_with(roster: Roster) -> OwnerProbe {
+        OwnerProbe { roster }
+    }
+
+    /// 在籍の列挙は「失敗」と「不在」を分ける。**空も失敗**
+    /// （呼び出したプロセス自身が必ず載るので 0 件の在籍表は在り得ない）
+    #[test]
+    fn 空の在籍表は列挙の失敗として扱う() {
+        assert_eq!(Roster::from_snapshot(None), Roster::Unavailable);
+        assert_eq!(
+            Roster::from_snapshot(Some(Vec::new())),
+            Roster::Unavailable,
+            "空の在籍表を「全員不在」と読むのが #1597 の事故"
+        );
+        assert_eq!(
+            Roster::from_snapshot(Some(vec![proc_entry(7), proc_entry(9)])),
+            Roster::Listed(std::collections::HashSet::from([7, 9]))
+        );
+    }
+
+    /// 列挙できた回の判定は 1 マスも変わらない（Windows の腕を macOS から見る）
+    #[test]
+    fn 在籍表が引けた回の判定は変わらない() {
+        let probe = probe_with(Roster::Listed(std::collections::HashSet::from([7])));
+        assert_eq!(probe.alive(7), Some(true));
+        assert_eq!(probe.alive(8), Some(false));
+        assert!(matches!(probe.owner(7), Owner::Alive { .. }));
+        assert_eq!(probe.owner(8), Owner::Dead, "載っていない pid は居ない");
+    }
+
+    /// #1597 の受け入れ: 列挙に失敗した回は**どの pid についても答えない**
+    #[test]
+    fn 列挙に失敗した回はどのpidも判定しない() {
+        let probe = probe_with(Roster::Unavailable);
+        assert_eq!(probe.alive(7), None);
+        assert_eq!(probe.owner(7), Owner::Unknown);
+        assert_eq!(
+            probe.owner(std::process::id()),
+            Owner::Unknown,
+            "自分自身すら判定しない（材料が無いので当然）"
+        );
+        let v = judge(7, SELF_PID, Some(t(100)), probe.owner(7));
+        assert_eq!(v, Verdict::Unknown, "{}", v.detail());
+        assert!(!v.removable(), "材料が無いのに消してよいと言っている");
+    }
+
+    /// #1597 の受け入れ: 列挙に失敗した回は**走査 → 判定 → 削除**の一巡で 0 件。
+    /// 対照（旧読み方 = 空の在籍表を「全員不在」と読む）では同じ残骸が消える
+    #[test]
+    fn 列挙に失敗した回は残骸を1件も消さない() {
+        let scratch = ScratchDir::new("1597-unavailable");
+        let root = scratch.path().to_path_buf();
+        // 消す側のテストなので、置き場が一時ディレクトリの下にあることを先に確かめる
+        // （名前を間違えて実環境を消す事故の防止。`remove_scratch` と同じ立場）
+        assert!(
+            root.starts_with(std::env::temp_dir()),
+            "残骸を植える先が一時ディレクトリの外にある: {root:?}"
+        );
+        for pid in [7u32, 9] {
+            let dir = root.join(format!("tako-test-data-{pid}"));
+            std::fs::create_dir_all(&dir).expect("残骸を作れる");
+            std::fs::write(dir.join("persist.log"), b"x").expect("中身を書ける");
+        }
+
+        let unavailable = probe_with(Roster::Unavailable);
+        let items = scan_in(&root, &["tako-test-data-"], SELF_PID, &unavailable, false);
+        assert_eq!(items.len(), 2, "植えた残骸を列挙できていない");
+        assert!(
+            items.iter().all(|r| r.verdict == Verdict::Unknown),
+            "列挙に失敗した回の判定: {:?}",
+            items.iter().map(|r| r.verdict).collect::<Vec<_>>()
+        );
+        assert_eq!(items.iter().filter(|r| r.verdict.removable()).count(), 0);
+        for res in &items {
+            assert!(
+                !remove_if_still_stale(res, SELF_PID, &|pid| unavailable.owner(pid)).expect("io"),
+                "消す直前の再判定でも見送ること"
+            );
+            assert!(res.path.is_dir(), "列挙に失敗した回に置き場を消した");
+        }
+
+        // 対照: 空の在籍表を「列挙できた」と読むと（= #1597 以前）同じ残骸が消える
+        let legacy = probe_with(Roster::Listed(std::collections::HashSet::new()));
+        let items = scan_in(&root, &["tako-test-data-"], SELF_PID, &legacy, false);
+        assert!(
+            items.iter().all(|r| r.verdict == Verdict::Stale),
+            "A/B が効いていない（旧読み方でも消せると言わない）"
+        );
+        for res in &items {
+            assert!(remove_if_still_stale(res, SELF_PID, &|pid| legacy.owner(pid)).expect("io"));
+            assert!(!res.path.exists());
+        }
     }
 
     #[test]

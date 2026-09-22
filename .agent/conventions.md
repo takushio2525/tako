@@ -740,7 +740,7 @@ psmux は入力送出を持たないので、**tako-app が保持していない
 - **`ports::process_alive` は生死の答えではない**。あれは tmux ソケットの回収専用で、
   非 unix では「何も回収しない側へ倒す」ために常に `true` を返す（#1253）。
   掃除や停止の判定に流用すると Windows で 1 件も動かない
-- 走査で何千回も引くなら、境界と**同じ材料**（`procinfo::snapshot`）を 1 度取って
+- 走査で何千回も引くなら、境界と**同じ材料**（`procinfo::snapshot_checked`）を 1 度取って
   キャッシュしてよい（`test_residue::OwnerProbe::alive`）。ただし判定を置く場所は
   関数 1 つに保ち、呼び出し側へ `#[cfg]` を撒かない
 - ゾンビは `pid_alive` では「居る」。**停止の待ち合わせには使わない**
@@ -775,6 +775,32 @@ pid が生きていることを確かめても、**相手が誰かはまだ分�
   停止の Windows 実装（#1599）が先に入れば、pid を再利用した無関係なプロセスを撃つ
 - 番犬: `crates/tako-control/tests/issue1616_windows_pid_identity_watchdog.rs`
   （素通り・`#[cfg]` の腕・自前判定へ戻した形・`Unknown` の反転を `file:line` で名指す）
+
+### 材料が採れなかった回は「不在」ではない（Issue #1597）
+
+**生死を列挙で読む判定は、「列挙に失敗した」と「その列挙に載っていない」を別の値で持つ。**
+Windows の在籍列挙（Toolhelp）は失敗すると**空の `Vec`** を返すので、そのまま読むと
+1 回の失敗で**全 pid が不在**に見える。`test_residue` はそれを `Owner::Dead` と読み、
+`sweep_in` が**並行して走る別 worker の test dir まで消しに行く**（#625 の事故クラス）。
+
+- 境界が 3 値を返す: `procinfo::snapshot_checked()` が `Some(procs)`（列挙できた）と
+  `None`（失敗した / **そもそも手段が無い OS**）。手段の有無は `snapshot_supported()` が
+  答えるので、呼び出し側は「失敗」と「この OS では列挙しない」を取り違えない
+  （後者は pid ごとに `pid_alive` へ聞けばよく、見送る必要は無い）
+- **空の在籍表は失敗として畳む**。呼び出したプロセス自身が必ず載るので「成功したが 0 件」は
+  在り得ず、0 件をそのまま読むと失敗と同じ結果になる（畳むのは `snapshot_checked` と
+  `test_residue::Roster::from_snapshot` の 2 段）
+- 倒す先は**「消せない・撃てない」側**で固定する。`pid_alive` は**「居る」**と答え
+  （この答えは掃除と停止の手前に置かれる）、`OwnerProbe` は `Owner::Unknown` = 見送る
+- lossy な `procinfo::snapshot()` は残してよいが、**「居ないこと」を根拠に消す / 撃つ判断には
+  使わない**（「居るものを列挙して絞る」用途はそのままでよい）
+- 読み方は **cfg で割れない純粋関数**に置く（`platform::process::alive_in_snapshot` /
+  `test_residue::Roster`）。Windows の腕を macOS から単体で回せないと、事故の再現も
+  修正の実測もできない
+- 番犬 `crates/tako-control/tests/issue1597_snapshot_failure_watchdog.rs`（構造 5 本 +
+  規則そのものを呼ぶ 1 本）。実プロセスの A/B は `TAKO_1597_ROSTER`
+  （`fail` = 列挙の失敗 / `empty` = #1597 以前の読み方。**テストプロセスでだけ効く**）で、
+  `crates/tako-core/tests/test_data_residue.rs` が生きている子の置き場を使って測る
 
 ## 代行できない 1 件で、代行できる 10 件を捨てない（Issue #1501）
 
@@ -2161,6 +2187,8 @@ Dock のピン留めは `.app` への **file URL ブックマーク**（`com.app
   消すと**並行して走る別 worker の `cargo test`** を巻き込む（#625 の事故クラス）。
   pid は再利用されるので、生きていても「dir の作成時刻より後に始まったプロセス」は
   `reused_pid` として**見送る**（判定は `test_residue::judge` の 1 実装）
+- **生死を引く材料そのものが採れなかった回は 1 件も消さない**（#1597。上の
+  「材料が採れなかった回は『不在』ではない」）
 - 過去の残骸は自動では消さない口も用意する: `tako test-residue`（既定 dry-run・
   `--apply` で実削除。MCP は `tako_test_residue`）。`clean-trust-residue.sh` と同じ作法
 - 番犬は `crates/tako-control/tests/test_residue_watchdog.rs`（`paths.rs` の

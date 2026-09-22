@@ -470,3 +470,4 @@
 - 2026-09-23 #1578: CLI 出力から絵文字を消し、is_emoji の番犬を CLI へ広げた
 - 2026-09-23 #1627: Instant の巻き戻しをやめ、起動直後の panic を止めた
 - 2026-09-23 #1569: probe_path が Windows で repo_rel を空にしないようにした
+- 2026-09-23 #1571: Windows の master system prompt を予算内へ戻した

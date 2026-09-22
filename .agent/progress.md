@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-23（#1571: Windows の master system prompt を予算内へ戻した）
-- `{{platform_notes}}` が縮退理由を**全文**並べており Windows で `platform` 片 4110 B・tako が作る側が取り分（18944 B）を 1.7〜2.7 KB 超過（CI 実測 20708 / 21420 / 21639 = そのぶん利用者の追記の取り分が削られる）。#1154 / #1477 の作法で prompt には件数と引き方だけを残し、全文は動的 topic `platform` へ。短縮形・手順書・A/B は `PlatformFacts`（`notes_section_in` / `full_section_in`）の 1 実装を共有
-- 番犬が**実機でしか測れない**のが元凶なので `Platform` を prompt 組み立てまで引数で通し（`system_prompt_pieces_on` ほか）、`prompt_budget_1477` は macOS / Windows 両方の形を測る。#1278 の `#[cfg_attr(windows, ignore)]` は外した。行き先が変わった既存番犬 2 件も追従（`platform_parity` の単一ソース検査 / MCP カタログ snapshot）
-- 実測: platform 片 4110 → 412 B・base 20709→17118 / 21421→17830 / 21640→18049（同一バイナリで旧テンプレート + A/B から main を再現）・A/B `TAKO_1571_LEGACY=1` で番犬 4 件 FAILED → 戻して緑・CI の Windows 実機で `prompt_budget_1477` が ok・clippy 3 宇宙 0・check-windows error 0
-
 ## 2026-09-23（#1609: 番犬が自分の doc コメントで緑になる型を棚卸しした）
 - 肯定の存在確認を**全文**へ `contains` する番犬は、実体が消えてもコメントの綴りで緑のまま（#1536 が踏み #1578 が発見した型）。`crates/*/tests/**` 180 本を 2 段の検出器で棚卸しし、該当 **27 本**を `code_view` の 3 つ目の眺め `without_comments_checked`（コメントだけ潰す / 文字列は囲みごと残す / バイト長と行番号を保つ / 空振りはその場で名指して落ちる）へ寄せた。**不在検査は全文のまま**
 - 実バグ 1 件: #1308 の「A/B 入口が在る」はドライバ本体の**アーム目印コメント**だけで満たされていた（実体の `env::var` は兄弟関数 `legacy_1308`）。分岐の呼び出しと env の読みへ分けた
@@ -64,3 +59,8 @@
 - 調査レポート §10 の分割を現状へ更新して 19 件起票（S0-b #1676 / S0-d #1677 / **S1 #1678** / S2〜S13 #1679〜#1690 / SE-3〜SE-6 #1691〜#1694）。S0-a は #1648 で済・S0-c は #1653・SE-1 は #1652・SE-2 は #1654 を参照に載せ、依存グラフと着手順を #1007 へロールアップ
 - `.agent/plans/2026-09-lsp-s1.md`（395 行）: モジュール配置（GPUI 依存は tako-app だけ）/ スレッド + futures channel（tokio も GPUI executor も使わない。`ipc.rs` の前例）/ 検出表 = 行追加だけで言語が増える形 / 版は #1658 のものを使う / UTF-16 変換の置き場 / 偽サーバ 2 段のテスト戦略 / MCP・CLI の口 / 分割不可の理由 / 判断待ち 4 点
 - 前払い: #1648 着地済み・#1651（PR #1671）と #1658 の着地待ちが S1 の前提
+
+## 2026-09-23（#1597: 在籍の列挙に失敗した回を「プロセス不在」と読まないようにした）
+- Windows の生死判定は Toolhelp の在籍で決まるのに、**列挙に失敗した回の空 `Vec`** をそのまま読んでいた（全 pid が不在に見え、1 回の失敗で `sweep_in` が並行して走る別 worker の test dir まで消す = #625 の事故クラス）。境界へ `procinfo::snapshot_checked`（失敗 = `None`・**0 件も失敗として畳む**）+ `snapshot_supported` を足し、`pid_alive` の Windows 腕は「居る」側・`OwnerProbe` は `Roster` の 3 値で `Owner::Unknown` = 見送りへ。macOS は `Roster::PerPid` で 1 マスも変わらない
+- **先に事故を実測してから直した**: 注入 `TAKO_1597_ROSTER=empty`（#1597 以前の読み方）で**生きている子の data dir が実際に消える**（`test_data_residue.rs:422` の A/B assert を反転して実測）。受け入れは 3 本立て（`fail` = 0 件 / 注入なし = 死んだ残骸だけ消える対照 / `empty` = 消える）を実プロセスで常設
+- 番犬 `issue1597_snapshot_failure_watchdog`（構造 5 + 規則 1）。注入 8 通りすべて FAILED（7 通りは file:line 名指し）→ 戻して緑・workspace 5218 passed 0 failed・clippy 3 宇宙 0・check-windows error 0

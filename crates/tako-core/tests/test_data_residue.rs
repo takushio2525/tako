@@ -14,6 +14,7 @@
 //! 2. SIGKILL された子の残骸は、**次の**テストプロセスの起動で掃かれる（案 2）
 //! 3. そのとき**生きているテストプロセスの dir は消えない**（並行して走る
 //!    別 worker の `cargo test` を巻き込まないこと）
+//! 4. **生死の材料（在籍の列挙）が採れなかった回は 1 件も消さない**（#1597）
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -25,6 +26,10 @@ const CHILD_ENV: &str = "TAKO_1296_CHILD";
 
 /// 子が「自分の data dir はここ」と親へ伝えるファイル名
 const REPORT: &str = "child-data-dir.txt";
+
+/// 在籍の材料の注入口（#1597）。`fail` = 列挙に失敗した回 /
+/// `empty` = #1597 以前の読み方（空の列挙を「全員不在」と読む）
+const ROSTER_ENV: &str = "TAKO_1597_ROSTER";
 
 /// 生き続ける子に終わってよいと伝えるファイル名
 const STOP: &str = "stop-live-child";
@@ -327,6 +332,97 @@ fn 死んだプロセスの残骸だけが次の起動で掃かれる() {
         dead2.exists(),
         "TAKO_1296_LEGACY=1 でも掃かれている = A/B が効いていない"
     );
+
+    std::fs::write(scratch.path().join(STOP), b"stop").expect("停止を伝えられる");
+    let _ = live.wait();
+}
+
+/// 掃除する子を 1 本起こして看取る（`roster` は在籍の材料の注入値。#1597）
+fn run_sweeper(scratch: &Scratch, roster: Option<&str>) {
+    let report = scratch
+        .path()
+        .join(format!("sweeper-{}.txt", roster.unwrap_or("none")));
+    let mut cmd = child_command(TOUCH_TEST, scratch.path(), &report, false);
+    match roster {
+        Some(value) => cmd.env(ROSTER_ENV, value),
+        None => cmd.env_remove(ROSTER_ENV),
+    };
+    let mut child = cmd.spawn().expect("掃除する子を起こせる");
+    assert!(
+        wait_with_deadline(&mut child, "掃除する子"),
+        "掃除する子が失敗した（roster={roster:?}）"
+    );
+    // 報告が書けている = 子が data dir を作った = 起動時の掃除の窓が開いた
+    wait_for_report(&report, "掃除する子");
+}
+
+/// 受け入れ 3（#1597）: **在籍の列挙が採れなかった回は 1 件も消さない**。
+///
+/// Windows の `pid_alive` / `OwnerProbe` は Toolhelp の在籍で生死を読む。列挙に
+/// 失敗した回を「全員不在」と読むと、起動時の掃除が**生きている別 worker の
+/// data dir まで消す**（#625 と同じ事故クラス）。macOS の腕は pid ごとに
+/// `kill(pid, 0)` を撃つのでこの形にならないため、在籍の材料を注入して
+/// **Windows の腕をこの機で回す**（`TAKO_1597_ROSTER`）。
+///
+/// 3 本立てで、真ん中が「掃除そのものは効いている」ことの対照になる
+/// （0 件だったのが「掃除が走らなかったから」ではないことを同じ手順で示す）:
+///
+/// 1. `fail`（列挙に失敗した回）= 生きている置き場も死んだ残骸も**残る**
+/// 2. 注入なし = 死んだ残骸だけ消えて生きている置き場は残る（退行していないこと）
+/// 3. `empty`（#1597 以前の読み方）= **生きている置き場まで消える** = 検出力
+#[test]
+fn 在籍の列挙が採れない回は生きている置き場を消さない() {
+    let scratch = Scratch::new("roster");
+
+    // 生きている当事者（自分の data dir を持ったまま待つ）
+    let live_report = scratch.path().join("live.txt");
+    let mut live = child_command(LIVE_TEST, scratch.path(), &live_report, false)
+        .spawn()
+        .expect("生き続ける子を起こせる");
+    let live_pid = live.id();
+    let live_dir = wait_for_report(&live_report, "生き続ける子");
+    assert!(live_dir.exists(), "生きている子の data dir が無い");
+    assert!(tako_core::platform::process::pid_alive(live_pid));
+
+    // 死んでいる pid の残骸（掃除の対象として正しいもの）
+    let dead_pid = reaped_pid(scratch.path());
+    let dead_dir = plant_residue(scratch.path(), dead_pid);
+    assert!(dead_dir.exists());
+
+    // 1. 列挙に失敗した回 = **1 件も消さない**（材料が無いなら判定しない）
+    run_sweeper(&scratch, Some("fail"));
+    assert!(
+        live_dir.exists(),
+        "列挙に失敗した回に生きている pid {live_pid} の置き場を消した（残り {:?}）",
+        scratch.residues()
+    );
+    assert!(
+        dead_dir.exists(),
+        "列挙に失敗した回に残骸を消した = 材料が無いのに「居ない」と判定している"
+    );
+
+    // 2. 注入なし = 掃除は効いている（1 の 0 件が「窓が開かなかった」ではない証拠）
+    run_sweeper(&scratch, None);
+    assert!(
+        !dead_dir.exists(),
+        "注入なしでも掃けていない = 1 の 0 件が偽の緑（残り {:?}）",
+        scratch.residues()
+    );
+    assert!(
+        live_dir.exists(),
+        "生きている pid {live_pid} の置き場を消した（残り {:?}）",
+        scratch.residues()
+    );
+
+    // 3. A/B: #1597 以前の読み方へ戻すと**生きている置き場まで消える**
+    let dead2 = plant_residue(scratch.path(), dead_pid);
+    run_sweeper(&scratch, Some("empty"));
+    assert!(
+        !live_dir.exists(),
+        "TAKO_1597_ROSTER=empty でも残っている = A/B が効いていない（この検査は\n\
+         「空の在籍表を全員不在と読むと生きている置き場が消える」ことを見ている）"
+    );
+    assert!(!dead2.exists());
 
     std::fs::write(scratch.path().join(STOP), b"stop").expect("停止を伝えられる");
     let _ = live.wait();

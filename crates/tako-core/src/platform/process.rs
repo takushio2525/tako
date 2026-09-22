@@ -36,7 +36,11 @@ pub fn no_console_window(cmd: &mut Command) -> &mut Command {
 /// その pid のプロセスが生きているか（**残骸の掃除の判断に使う**。#916）。
 ///
 /// unix は `kill(pid, 0)`（権限が無くて EPERM でも「居る」= true）。
-/// Windows は [`super::procinfo::snapshot`] の在籍で見る（あちらは Windows 実装が正）。
+/// Windows は [`super::procinfo::snapshot_checked`] の在籍で見る（あちらは Windows 実装が正）。
+///
+/// **材料が無い回は「居る」側へ倒す**（#1597）。この答えは「消す / 撃つ」の手前に
+/// 置かれるので、Windows の在籍の列挙（Toolhelp）が失敗した回に false を返すと
+/// **全 pid が残骸に見える**。判定は [`alive_in_snapshot`] の 1 実装が持つ。
 ///
 /// ゾンビ（終了済みで親が未刈り取り）は unix では true になる。掃除の判断としては
 /// それで正しい（親がまだ居る = そのプロセス列は現役の可能性がある）。
@@ -44,6 +48,25 @@ pub fn no_console_window(cmd: &mut Command) -> &mut Command {
 /// ゾンビ判定込みでそれを担う）
 pub fn pid_alive(pid: u32) -> bool {
     imp::pid_alive(pid)
+}
+
+/// 在籍の列挙 1 枚から 1 件の生死を読む（**Windows の腕の純粋部分**。#1597）。
+///
+/// `procs` は [`super::procinfo::snapshot_checked`] の結果:
+///
+/// - `Some(procs)`（1 件以上）= 列挙できた。載っていない pid は**居ない**
+/// - `None` / `Some(&[])` = 列挙できなかった回。**「居る」側へ倒す**
+///
+/// 空の在籍表を「誰も居ない」と読まないのが要点。呼び出したプロセス自身が必ず
+/// 載るので 0 件は失敗の別の顔でしかなく、そこを「全員不在」と読むと
+/// 残骸の掃除が**生きている別プロセスの置き場まで消しに行く**（#1597 / #625）。
+///
+/// cfg で割れていないので **macOS からも Windows の腕を単体で検証できる**
+pub fn alive_in_snapshot(procs: Option<&[super::procinfo::ProcEntry]>, pid: u32) -> bool {
+    match procs {
+        Some(procs) if !procs.is_empty() => procs.iter().any(|p| p.pid == pid),
+        _ => true,
+    }
 }
 
 #[cfg(not(windows))]
@@ -94,10 +117,10 @@ mod imp {
             return false;
         }
         // Windows は在籍の列挙（Toolhelp）が procinfo 側にあるのでそれを使う。
-        // OpenProcess を新たに宣言せずに済み、実装は 1 か所に留まる
-        super::super::procinfo::snapshot()
-            .iter()
-            .any(|p| p.pid == pid)
+        // OpenProcess を新たに宣言せずに済み、実装は 1 か所に留まる。
+        // **失敗と不在を混ぜない**ため `snapshot_checked` を通し、読み方は
+        // 共有の純粋関数へ渡す（列挙できなかった回は「居る」= #1597）
+        super::alive_in_snapshot(super::super::procinfo::snapshot_checked().as_deref(), pid)
     }
 }
 
@@ -119,6 +142,34 @@ mod tests {
         assert!(
             !pid_alive(i32::MAX as u32),
             "pid_t の上限は実在しない（macOS / Linux の pid 上限より大きい）"
+        );
+    }
+
+    fn entry(pid: u32) -> super::super::procinfo::ProcEntry {
+        super::super::procinfo::ProcEntry {
+            pid,
+            ppid: 1,
+            name: format!("p{pid}.exe"),
+        }
+    }
+
+    /// **Windows の腕の規則**（macOS からも回る）。列挙できた回だけが
+    /// 「居ない」と言える。#1597 の事故はここを逆に倒したことで起きる
+    #[test]
+    fn 在籍を列挙できなかった回は居る側へ倒す() {
+        let procs = [entry(7), entry(9)];
+        assert!(alive_in_snapshot(Some(&procs), 7), "載っている pid は居る");
+        assert!(
+            !alive_in_snapshot(Some(&procs), 8),
+            "列挙できた回は載っていない pid を「居ない」と言える"
+        );
+        assert!(
+            alive_in_snapshot(None, 8),
+            "列挙に失敗した回に「居ない」と答えると全 pid が残骸に見える（#1597）"
+        );
+        assert!(
+            alive_in_snapshot(Some(&[]), 8),
+            "空の在籍表は列挙の失敗（自分自身が必ず載るので 0 件は在り得ない）"
         );
     }
 
