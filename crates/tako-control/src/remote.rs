@@ -3151,16 +3151,28 @@ fn reap_daemon_child(mut child: std::process::Child) {
     }
 }
 
+/// その pid のプロセスが生きているか。**判定は境界の 1 実装へ委譲する**（#1557）。
+///
+/// 以前はここに `libc::kill(pid, 0)` を直書きし、**非 unix では無条件 `false`** を
+/// 返していた。Windows では生きている daemon をすべて「居ない」と読むので、
+/// `daemon_status` の `running` も、pid 再利用時の誤 kill 防止
+/// （[`verify_pid_identity`]）も、残骸 daemon の掃除判断も揃って誤る。
+/// 境界（`tako_core::platform::process::pid_alive`）には Windows 実装
+/// （`procinfo::snapshot` の在籍）が既にあるので、判定を 2 実装持たない。
+///
+/// 境界へ寄せると unix でも 2 点変わる。**どちらも安全側**（消さない / 撃たない）:
+///
+/// - `EPERM`（別ユーザーのプロセス）を「居る」と読む。旧実装は `kill` の失敗を
+///   まとめて「居ない」に倒していたので、他ユーザーの pid を掴んだとき
+///   `daemon_status` が state ファイルを消しに行った
+/// - `pid_t` の範囲外（`u32::MAX` 等）を「居ない」と読む。旧実装の
+///   `pid as libc::pid_t` は u32::MAX を -1 =「全プロセス」へ潰すので、
+///   `kill` が成功して**存在しない pid が生きて見えた**
+///
+/// ゾンビは `pid_alive` では「居る」になるが、停止の待ち合わせは
+/// [`has_terminated`] が担うのでここはこの意味論で正しい
 fn is_process_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
-    }
+    tako_core::platform::process::pid_alive(pid)
 }
 
 /// プロセスが**終了済み**か（ゾンビも終了済みとして扱う。#619）。
@@ -7589,24 +7601,29 @@ mod tests {
         assert!(status["running"].is_boolean());
     }
 
-    /// **Windows では skip**（#1557）。`is_process_alive` は非 unix で無条件 `false` を
-    /// 返す私的ヘルパのままで、実装済みの境界
-    /// （`tako_core::platform::process::pid_alive`）を通っていない。
-    /// 製品側を直す Issue が #1557 で、直したらこの `ignore` を外す
-    /// （#1278 は CI を blocking にする作業で、製品の変更はスコープ外）
+    /// **Windows でも回す**（#1557 で `ignore` を外した）。#1278 が付けた skip の理由は
+    /// 「`is_process_alive` が非 unix で無条件 `false` を返す私的ヘルパのまま」だったが、
+    /// いまは境界 `tako_core::platform::process::pid_alive`（Windows は
+    /// `procinfo::snapshot` の在籍）へ委譲しているので、**実 Windows でこれが緑に
+    /// なること自体が #1557 の実行証拠**になる
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows では is_process_alive が常に false（製品側の穴。#1557）"
-    )]
     fn is_process_aliveは現在のプロセスをtrueで返す() {
         assert!(is_process_alive(std::process::id()));
     }
 
+    /// 存在しない pid は false。
+    ///
+    /// **#1557 以前はこれが偽の緑だった**（非 unix は無条件 `false` を返すので、
+    /// 何を渡しても通る）。境界へ寄せた後は「境界の規則をそのまま持つ」ことまで見る:
+    /// `pid_t` の範囲外と 0 は**どの OS でも**居ない扱いになる。
+    /// 私的ヘルパの `pid as libc::pid_t` では u32::MAX が -1 =「全プロセス」の指定に
+    /// なって `kill` が成功し、**存在しない pid が生きて見えていた**
     #[test]
     fn is_process_aliveは存在しないpidをfalseで返す() {
         // 99999999 は通常存在しない PID
         assert!(!is_process_alive(99_999_999));
+        assert!(!is_process_alive(u32::MAX), "pid_t の範囲外");
+        assert!(!is_process_alive(0), "0 はプロセスグループの指定");
     }
 
     #[test]
@@ -7742,6 +7759,22 @@ mod tests {
         assert!(!verify_pid_identity(&info));
     }
 
+    /// pid 再利用を検知して kill しないこと。**止まる理由は OS で違う**（#1599）。
+    ///
+    /// unix は `verify_pid_identity` が `ps` の args を見て「`tako remote serve`
+    /// ではない」と判定し、撃つ前に中止する（#329 / #1401 の fail-safe）。
+    ///
+    /// Windows には args を見る腕が無く、`verify_pid_identity` は `#[cfg(unix)]` の
+    /// 外を素通りして **生きている pid をすべて「本物」と答える**。撃たずに済んで
+    /// いるのは、その先の `platform::process::terminate` が Windows 未実装（#1599）で
+    /// `Err` を返すからにすぎない。#1557 以前は `is_process_alive` が非 unix で
+    /// 常に `false` だったので**穴がもう 1 つの穴で塞がれていた**形で、境界へ寄せた
+    /// いま Windows 側の素通りが露出している。
+    ///
+    /// なので Windows の腕はわざと「停止が未対応であること」を見る = **#1599 で
+    /// 停止を実装した瞬間にこの検査が落ちる**。そのとき必要なのは Windows の正体確認
+    /// （#1616）で、順序を取り違えると `tako remote stop` が pid を再利用した
+    /// 無関係なプロセスを撃つ
     #[test]
     fn daemon_stop_implはpid再利用時にkillしない() {
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -7756,10 +7789,20 @@ mod tests {
         std::env::remove_var("TAKO_REMOTE_STATE_DIR");
         assert!(result.is_err(), "PID 再利用を検知してエラーになる");
         let err = result.unwrap_err();
-        assert!(
-            err.contains("確認できません"),
-            "エラーメッセージに検証失敗を示す: {err}"
-        );
+        // 分岐は `cfg!`（`#[cfg]` ではない）。両方の腕を macOS でもコンパイルして、
+        // Windows 側の綴りだけが腐るのを防ぐ
+        if cfg!(windows) {
+            assert!(
+                err.contains("未対応"),
+                "Windows で止まっているのは停止経路が未実装だから（#1599）。\n\
+                 この assert が落ちたら停止が実装された = **Windows の正体確認（#1616）が先に要る**: {err}"
+            );
+        } else {
+            assert!(
+                err.contains("確認できません"),
+                "エラーメッセージに検証失敗を示す: {err}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

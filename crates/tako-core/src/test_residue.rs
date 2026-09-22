@@ -227,17 +227,38 @@ impl OwnerProbe {
             // pid として使われない値 = 名前が壊れている。触らない
             return Owner::Unknown;
         }
-        #[cfg(windows)]
-        let alive = self.live.contains(&pid);
-        #[cfg(not(windows))]
-        let alive = crate::platform::process::pid_alive(pid);
-        if !alive {
+        if !self.alive(pid) {
             return Owner::Dead;
         }
         Owner::Alive {
             // 秒精度でよい（比べる相手は dir の作成時刻で、余裕は REUSE_SLACK が持つ）
             started: crate::platform::procinfo::start_time_unix(pid)
                 .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs)),
+        }
+    }
+
+    /// その pid が生きているか。**規則の正は境界
+    /// [`crate::platform::process::pid_alive`] の 1 実装**（#1557 と同じ寄せ先）。
+    ///
+    /// Windows だけ [`OwnerProbe::new`] が取った在籍スナップショットから引くのは、
+    /// あちらが 1 回の呼び出しごとに Toolhelp を回すため（2,000 件の残骸に対して
+    /// pid ごとに聞くと O(n²) になる）。**見る材料も答えも同じ**で、
+    /// ここは境界のキャッシュ版にあたる。
+    ///
+    /// ここで [`crate::ports::process_alive`] を使ってはいけない。あちらは
+    /// **tmux ソケットの回収**用で、非 unix では「何も回収しない」側へ倒すために
+    /// 常に `true` を返す（#1253）。掃除の判定に使うと Windows で 1 件も掃けなくなる
+    /// （#1581 の見立てはこの取り違えで、実際には #1296 の初版から境界を通っている）。
+    /// 戻せないように番犬が見張る:
+    /// `crates/tako-control/tests/issue1557_pid_alive_boundary_watchdog.rs`
+    fn alive(&self, pid: u32) -> bool {
+        #[cfg(windows)]
+        {
+            self.live.contains(&pid)
+        }
+        #[cfg(not(windows))]
+        {
+            crate::platform::process::pid_alive(pid)
         }
     }
 }
@@ -1117,10 +1138,17 @@ mod tests {
     /// `remove_dir_all` は、**中のファイルに開いたハンドルが 1 つでもあると
     /// Windows では失敗する**（unix は最後のハンドルが閉じるまで保留されるだけ）。
     /// atexit が走るのは終了処理中なので、テスト中に起こした孫プロセスがまだ
-    /// 握っていると消えない。起動時の掃除（`sweep_stale_on_start`）も
-    /// `ports::process_alive` が非 unix で常に `true` なので 1 件も動かない。
-    /// 機序の確定と手当ては #1581（#1278 は CI を blocking にする作業で、
-    /// 実機なしで判定できないものはそちらへ分離した）
+    /// 握っていると消えない。
+    ///
+    /// **起動時の掃除（`sweep_stale_on_start`）はここには効かない**。#1278 の
+    /// 見立ては「生存判定の `ports::process_alive` が非 unix で常に `true`」だったが、
+    /// この経路は #1296 の初版から境界（`OwnerProbe::alive`）を通っており
+    /// `ports::process_alive` は一度も使っていない（#1557 の調査で実測）。
+    /// そもそもこの検査は**子の終了直後に数える**形で、残る 3 件は子自身の pid =
+    /// 起動時に走る掃除の窓には原理的に入らない（`tako-agent-config-` は
+    /// [`KINDS`] の `auto: false` でそもそも対象外）。
+    /// 機序の確定と手当ては #1581 に残る（案 2 = `remove_own_dirs` の短いリトライ /
+    /// 案 3 = 番犬側の固定待ち。どちらも実機が要る）
     #[test]
     #[cfg_attr(
         windows,
