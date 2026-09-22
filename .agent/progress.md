@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-22（#1518: bash 3.2 で落ちる空配列展開を 41 箇所直し、番犬で縛った）
-- 走査は `set -u` 宣言だけでは足りなかった: `scripts/lib/*.sh` / `promo/lib.sh` は宣言側から source されて継ぐので 4 箇所が隠れ、逆にクォート付きヒアドキュメント（`promo/lib.sh` が書き出すデモ用スクリプト）の 3 箇所は囲む側が展開しないので対象外。**41 箇所 / 12 ファイル**へ `${arr[@]+"${arr[@]}"}` を適用（挙動は不変）
-- 判定は実測で 1 点に絞った（`/bin/bash` 3.2.57・空配列・`set -u` で落ちるのは**演算子の無い** `${a[@]}` / `${a[*]}` だけ。`${#a[@]}` / `${!a[@]}` / `:-` / `:+` / `:1` / `#pat` / `/pat/rep` は通る）。番犬 `空配列の展開はbash32の慣用句で守られている` はリポジトリ全体の `.sh` を走査し、例外は `# tako:bash32-ok <理由>`（理由なしは無効）。走査を `scripts/` から広げた初回に #837 の実在バグ `distribution/build-pkg.sh:30` が出たので同時に直した
-- 実測: 全 41 箇所を実ファイル本文から抽出して A/B（空 → 旧形は `unbound variable`・新形は通る / 非空 3 要素は 1 バイト同一）= 54/54。触った 13 本を `/bin/bash` 3.2 で副作用の無い経路から実走 27/27（`test-release-retry` 55/0・`test-wait-pr-checks` 137/0・`test-launch-services` 17/0 を含む）。注入 11 通りすべて file:line 名指し。実際に空が渡る経路は 4 系統（`check-windows.sh --all-targets` = 即死・`promo/lib.sh` の `PROMO_ENV_CLEAN` = 即死・`release.sh --promote` の `ASSETS`・`wait-pr-checks.sh:378` は `$( )` の中で死ぬので案内の中身だけ消える）。workspace 5045 passed 0 failed・clippy 3 宇宙 0
-
 ## 2026-09-22（#1501: 未認証・未導入でも setup が全段やって完走するようにした）
 - 真因は **3 か所の早期 return**（`run_bootstrap_stage` の `?` / `missing_required` / 選択系統の未認証）で、一番手前が認証段（#1129 で代行を禁じた所）なので新品環境では `profiles/default.yaml`・`~/.claude/CLAUDE.md`・テンプレ・MCP 登録が**全部未作成**のまま exit 1（#1500 の R1 / R2 / R3）。判断を `tako_control::setup_remaining`（`summarize` / `render` / `for_step` / `legacy_stop` = 理由つき純粋関数）へ寄せ、段は `Vec<Remaining>` を返し、CLI は積んで最後に「残り N 件 + 次に打つ 1 行」を出すだけ。`--check` も同じ 1 実装・`setup.completed` は残りがあっても記録（再実行は残りから再開）
 - 要確認だった点を実測で決着: **未認証の実 claude 2.1.258 でも `claude mcp add --scope user` は通る**（隔離 HOME / `loggedIn:false` → rc 0・`mcpServers.tako` が載る）ので MCP は持ち越さず登録する。ついでに判明 = **`scripts/verify-setup-multiagent.sh` は main で既に赤**（未認証の想定が #868 の段順より古く Z2 が先に出る + codex / agy スタブが #979 の `mcp add` を「予期しない起動」と数える）ので #1493 の規約どおり同じコミットで現行契約へ直して全緑
@@ -54,3 +49,8 @@
 - `takoBin()` は debug → release の順に**存在する方**を返すだけで版を見ず、2 スクリプトに複製されていた。開発ツリーで debug だけ古いと（報告時の実測: debug v0.8.13 / release v0.8.17）`--check` が「同期していません」の**偽の赤**を出し、`--check` 無しでは docs が 8 日前へ静かに巻き戻る（CI はフレッシュビルドなので緑のまま手元だけが嘘をつく）。選択を `scripts/lib/tako-bin.mjs` の 1 実装へ寄せ、選んだバイナリの `--version` と `Cargo.toml` の `[workspace.package] version` が違えば生成も検査もせずに 1 行の理由で落とす
 - 倒した判断: **debug が古いとき release へ黙って逃げない**（手元の他スクリプトも既定は debug。直すのは 1 コマンドなので最簡形を出す = #322）。明示指定は新オプションではなく既存の env 名 `TAKO_BIN`（相対はリポジトリルート基準）。失敗はスタックトレースではなくメッセージ 1 本（`main()` + try/catch）
 - 実測: `scripts/test-gen-docs-bin-1548.sh` **46 PASS 0 FAIL**（CI 登録。テンポラリの偽リポジトリ + 版を埋め込んだスタブ。古い版には別内容の JSON を返させて巻き戻しを実際に観測）。注入 11 通りすべて FAILED → 戻して緑。生成内容・md・Rust 側は不変（生成物が本物と 1 バイト同じ）
+
+## 2026-09-22（#760: 自動命名がシェルの実行ファイルパスを掴まないようにした）
+- Windows のコンソールタイトルはシェル / psmux **自身**のフルパスなので、`heuristic_plan()` が OSC タイトルを最優先すると 16 文字で切った `C:\Program Files` / `C:\Users\<user>\A` が**全タブ同じ名前**になっていた（9/9 実機レビュー = 初回起動の第一印象）。`shell_exe_material()` の関門で捨てて cwd へ落とす。cwd の末尾要素は `Path::file_name` をやめ `last_segment()` へ（Unix は `\` を区切りにしないので Windows 形の素材が丸ごと 1 要素になる。Windows 形と判定したときだけ `\` も見る）
+- 指紋（cwd / OSC タイトル / 実行状態）はシェル統合の無い Windows で 3 つとも不変 = 命名がペインを開いた直後の 1 回で終わる件は、`tick()` に「同じ指紋のままやり直した回数」を持たせ `STALE_RETRY_DELAYS`（5 分 → 20 分 → 60 分）で再発火する形にした（使い切れば静まる）。画面末尾を指紋へ混ぜる本命は `main.rs` 側なので #1568 へ
+- 実測: 実 GUI の A/B（隔離・tako-vd。関門を外すと `C:\Program Files`、入れると cwd 由来 + 診断 1 行）・注入 7 通りすべて file:line 名指しで FAILED → 戻して緑・workspace 5113 passed 0 failed・clippy 3 宇宙 0・check-windows error 0
