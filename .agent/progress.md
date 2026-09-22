@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-22（#1509: remote setup の Tailscale 導入を setup_deps の 1 実装へ寄せた）
-- #1499 は判断（`offer_for`）と実行（`install`）を共有しただけで**表示と確認は呼び手に残していた**ので、`remote setup` の [1/5] は `brew install tailscale` を自前で組み直したままだった。案内 → `[y/N]` → 導入 → 再検出のひと続きを `setup_deps::offer_and_install`（字下げだけ呼び手が渡す）へ移し、1 件だけ引く `status_of` を追加。`remote_setup.rs` から素の `Command::new("brew")` が消えたので **Windows のコンソール窓を出す起動も 1 件減った**（`platform_parity` の表を更新）
-- 割れていた 4 点を出荷版との A/B で実測: brew が無い機は**聞いてから起動に失敗して中断**（新: 聞かずに `要 Homebrew`）／非 TTY は EOF を N と読むだけ（新: 理由つき案内）／「入れたのに引けない」は案内なしで中断／どこへ入るかを出さない。MCP の非対話経路は従来どおり導入しない
-- 実測: `scripts/test-remote-setup-deps-1509.sh` **49 PASS 0 FAIL**（CI 登録。隔離 HOME + brew スタブ + `TAKO_TAILSCALE_BIN` で未導入を偽装。[2/5] 未ログインで止まるので serve に触れない）・#1499 回帰 52 PASS・番犬 3 本で注入 5 通りすべて FAILED → 戻して緑・workspace 5081 passed 0 failed・clippy 3 宇宙 0・check-windows error 0
-
 ## 2026-09-22（#1524: 標準 tako setup の依存 [y/N] を setup_deps::offer_and_install の 1 呼び出しへ寄せた）
 - #1499 は判断 / 実行 / 再検出を寄せたが**表示と入力は呼び手に残し**、#1509 が束ねた `offer_and_install` も #1501 と同時進行だったため標準 setup は差分ゼロのままだった（体験を組む層が 2 か所）。`setup.rs` の `offer_dep_install` / `print_dep_install_plan` / `print_dep_manual_hint` を消し、`DepPromptIo`（stderr + stdin + 字下げ 6 マス）を渡す 1 呼び出しへ。再検出も中で済むので `resolve` の 2 度引き（ログインシェル起動）と `find_command("brew")` の先引きが各 1 回消えた
 - 同時に判明 = `[警告] … インストール後も検出できません` は**到達しない分岐**だった（導入器が成功して引けないときは `install` が `Err` を返し `[警告] {e}` 側へ落ちる）。実測でも before / after とも 0 件なので削除した
@@ -54,3 +49,8 @@
 - 予算表（progress 12 KB / AGENTS 30 KB / import 40 KB / global 24 KB / system prompt 24 KB ≒ 130 KB）に MCP カタログの項目が無く、**それより大きい 201,535 バイト / 152 本が誰にも測られていなかった**。`ItemKind::McpCatalog` と `MCP_CATALOG_MAX_BYTES`（210 KB）を足し、採取を `tako_control::context_budget::mcp_catalog` の 1 実装へ寄せて `inventory` に載せた（CLI 表示 / `--json` / MCP `tako_context_budget` の 3 経路が同じ 1 件を見る）。測るのは snapshot ではなく実行時に組み立てた `mcp::tools()`。1 本の JSON なので行数は測らない（`lines: 0`）
 - 上限をバイトで置いた根拠 = 実トークナイザ tiktoken `o200k_base` で **52,028 トークン**（3.87 B/tok。参考 `cl100k_base` 62,997）に対し、日本語主体で較正した既存 `estimate_tokens` は 94,934 と**約 1.8 倍**に出る。210 KB は現状 +6.7% で、#1540 の圧縮後に締め直す前提をコードのコメントへ明記。`catalog.rs` は 1 行も触らない（#1540 と並走）
 - 実測: 出荷版との A/B（出荷版は `items` にも `budget` にも `mcp_catalog` のキーが無い）・注入 6 通りすべて FAILED → 戻して緑・棚卸しの上乗せは同一 debug ビルドの A/B で 0.01→0.02 秒・AGENTS.md 25309→25638 バイト（上限 30720）・workspace 5136 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。[提案] 3 件は #1567 へ
+
+## 2026-09-23（#1545: getting-started を 9/22 の setup 着地へ追従させた）
+- 旧ページは **#1502 が明示的に否定した PATH 手順**（`.app` の実行ファイル置き場を `~/.zshrc` の `export PATH` へ）を読者に指示し続け、同じページ内で「CLI は導入しない」（トラブルシューティング）と「導入 → PATH → ログインの 3 段を案内する」（tip）が矛盾していた。FR-2.14.5 の現行仕様（`$HOME/.local/bin/tako` の symlink + `~/.zprofile`）へ差し替え、旧手順を踏んだ読者向けに「その行は消してよい」の移行案内を足した
+- 任意依存が `[y/N]` で導入まで通ること（#1499 / #1509 / #1524）と、詰まった段があっても止まらず「残り N 件」で終わること（FR-2.14.12 = #1501）を追記。`--version` / `--changes` / `--check` の例は現行ビルド（v0.8.17 / rev 19）の実出力へ。「質問ゼロ」3 行を言い直し、次のステップに `/features/remote/` と `/guides/keyboard-shortcuts/` を足した
+- 実測: 貼った `--check` は隔離 HOME の再実行と**マスク以外バイト単位で一致**（49 行）・`Contents/MacOS` は docs 全体で 0 hit・`npm run build` 32 ページ警告 0・`verify-og` 31 ページ OK
