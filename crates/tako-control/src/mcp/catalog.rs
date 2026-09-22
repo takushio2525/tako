@@ -135,6 +135,7 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #1259 / #1292 / #748
         json!({
             "name": "tako_send_input",
             "description": "指定ペインの端末へテキストを書き込む（既定で末尾に改行を付けて実行する）。\
@@ -146,15 +147,14 @@ pub fn tools() -> Vec<Value> {
                 信頼ダイアログの自動承諾 → bracketed paste 貼り付け → 分離 Enter → \
                 入力欄が空になったことの検証 + Enter 単独再送（マルチラインもそのまま送れる。\
                 応答は queued: true が即座に返り、実際の送達確認はバックグラウンドで行われる）。\
-                #1259: 応答の delivery が**その後を追う口**になる（state = queued / waiting / \
-                delivered / gave_up、reason = 止まっている理由コード、note = 次の一手）。\
+                応答の delivery が**その後を追う口**（項目の読み方は tako_read_pane の説明）。\
                 積む前に**未決着**（queued / waiting）のフローがあればその状態が出る = \
-                この送達はその後ろに並ぶ。#1292: 決着済み（delivered / gave_up）の前回の\
-                顛末は出ない（この送達はまだ 1 tick も回っていないので queued になる）。\
+                この送達はその後ろに並ぶ。決着済みの前回の顛末は出ない\
+                （この送達はまだ 1 tick も回っていないので queued になる）。\
                 続きは tako_read_pane の delivery で読み、persist.log にも同じ理由が 1 行残る。\
                 text を空にして newline: true にすると Enter 単独送信になる: 入力欄に残った\
                 テキストの送信代行に使え、入力欄が空へ戻るまで Enter を自動再送する。\
-                #748: **選択肢ダイアログ表示中は送信を拒否してエラーを返す**（入力欄が奪われており、\
+                **選択肢ダイアログ表示中は送信を拒否してエラーを返す**（入力欄が奪われており、\
                 テキストはダイアログのキー操作として食われ、数字なら選択が確定してしまう）。\
                 エラー本文に選択肢一覧が入るので、tako_orchestrator_respond で応答すること。",
             "inputSchema": {
@@ -182,6 +182,7 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #748 / #1259
         json!({
             "name": "tako_read_pane",
             "description": "指定ペインの画面内容（表示中のテキスト）を返す。\
@@ -195,11 +196,10 @@ pub fn tools() -> Vec<Value> {
                 メッセージキューに未送信で残っている（入力欄自体は空なので Enter を代行しても\
                 発火しない）。tako が idle 継続時に自動で送り出すので待つこと。\
                 このペインを閉じるとキューごと指示が失われる。\
-                choice_dialog が非 null なら**選択肢ダイアログが表示中**で入力欄は存在しない（#748）。\
-                このとき input_status は null になる（ダイアログの選択カーソルは入力欄と同じ字面なので、\
-                かつては選択肢テキストが style=user の残留入力として報告されていた）。\
+                choice_dialog が非 null なら**選択肢ダイアログが表示中**で入力欄は存在しない。\
+                このとき input_status は null になる。\
                 応答は tako_send_input ではなく tako_orchestrator_respond を使う。\
-                delivery が非 null なら**このペインへの送達フローの顛末**（#1259）: \
+                delivery が非 null なら**このペインへの送達フローの顛末**: \
                 state = queued / waiting / delivered / gave_up、reason = 止まっている理由コード\
                 （peer_pending / no_input_box / choice_dialog / hold_for_command_flow 等）、\
                 transient = 待てば解ける見込みか、note = 人が読む説明、elapsed_secs = 経過。\
@@ -219,11 +219,12 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #1283
         json!({
             "name": "tako_links",
             "description": format!("ターミナル画面の**リンク**（{lc}で開けるもの）を列挙する。\
                 GUI の{lc}と同じ判定（tako_core::links）を通すので、\
-                人手のクリック無しに「この画面のこのパスはリンクになるのか」を確かめられる（#1283）。\
+                人手のクリック無しに「この画面のこのパスはリンクになるのか」を確かめられる。\
                 応答の links[] は kind（url / path）・target（解決済みの絶対パス or URL）・\
                 text（画面に見えている文字列 = 下線が付く範囲）・spans（[row, start_col, end_col]）。\
                 kind=path には open（{lc}の行き先: terminal / code / markdown / image / pdf / video）と \
@@ -294,10 +295,11 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #23
         json!({
             "name": "tako_tmux_resize",
             "description": "tmux window を指定サイズ（cols × rows）へリサイズする。\
-                スマホリモート（Issue #23）のビューポート連動用で、tmux の window-size が \
+                スマホリモートのビューポート連動用で、tmux の window-size が \
                 manual に切り替わる。PC 側の表示に合わせ直すときは reset=true で解除する。\
                 socket を省略すると tako_tmux_list と同じく既定サーバーと tako バックエンドの\
                 両方から探すので、list が返した name をそのまま渡せる。",
@@ -577,7 +579,9 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_select_tab",
-            "description": "表示するタブを切り替える。",
+            "description": "表示するタブを切り替える。tab はタブ ID で、出どころは \
+                tako_list_panes（画面の並び順ではない）。存在しない ID はエラー。\
+                ペインのフォーカスは動かさない（動かすのは tako_focus_pane）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -714,6 +718,7 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #307 / #789 / #550
         json!({
             "name": "tako_panel",
             "description": format!(
@@ -731,8 +736,8 @@ pub fn tools() -> Vec<Value> {
                     "width": { "type": "number", "exclusiveMinimum": 0, "description": "パネル幅（px）" },
                     "view": panel_view_schema(),
                     "filetree": { "type": "boolean", "description": "左サイドバーのファイルツリーの表示・非表示" },
-                    "sidebar_width": { "type": "number", "exclusiveMinimum": 0, "description": "左サイドバーの幅（px。GUI のドラッグと同じ規則で下限 120 / 上限はウィンドウ幅の 50% にクランプされる。応答の sidebar_width が実際に適用された幅、sidebar_width_max がその時点の上限。Issue #307 / #789）" },
-                    "show_hidden": { "type": "boolean", "description": "ファイルツリーでドット始まり（.git / .env 等）の項目を表示するか。既定 false = 非表示（Issue #550）" },
+                    "sidebar_width": { "type": "number", "exclusiveMinimum": 0, "description": "左サイドバーの幅（px。GUI のドラッグと同じ規則で下限 120 / 上限はウィンドウ幅の 50% にクランプされる。応答の sidebar_width が実際に適用された幅、sidebar_width_max がその時点の上限）" },
+                    "show_hidden": { "type": "boolean", "description": "ファイルツリーでドット始まり（.git / .env 等）の項目を表示するか。既定 false = 非表示" },
                 },
                 "additionalProperties": false,
             },
@@ -990,7 +995,10 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_preview_undo",
-            "description": "コードプレビュー編集の undo。直前の編集操作を取り消す。",
+            "description": "コードプレビュー編集の undo。tako_preview_edit / tako_preview_replace / \
+                tako_preview_apply で入れた直前の編集を取り消す。対象は tako_open_file で開いた\
+                プレビューペイン（省略時は呼び出し元）。取り消せる履歴が無ければエラー。\
+                取り消すのは編集バッファで、ディスクへ書くのは tako_preview_save。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1001,7 +1009,10 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_preview_redo",
-            "description": "コードプレビュー編集の redo。取り消した操作をやり直す。",
+            "description": "コードプレビュー編集の redo。tako_preview_undo で取り消した編集をやり直す。\
+                対象は tako_open_file で開いたプレビューペイン（省略時は呼び出し元）。\
+                やり直せる履歴が無ければエラー（undo の後に新しい編集を入れると履歴は捨てられる）。\
+                やり直すのは編集バッファで、ディスクへ書くのは tako_preview_save。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1051,9 +1062,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #338
         json!({
             "name": "tako_preview_changelog",
-            "description": "プレビューペインのチェンジログビュー切替（Issue #338）。\
+            "description": "プレビューペインのチェンジログビュー切替。\
                 enabled=true で git 履歴ベースのファイル変更履歴表示に切り替える。\
                 enabled 省略時は状態取得のみ。expand にコミットハッシュを指定すると diff を展開/折りたたみ。\
                 git 管理外ファイルでは「履歴なし」を返す。",
@@ -1116,12 +1128,13 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #763
         json!({
             "name": "tako_confirm_close",
             "description": "タブ / ペインを閉じる際の確認ダイアログの ON/OFF を\
                 切り替える（enabled 省略時は現在状態の取得のみ）。有効時、× クリックとペインを閉じる\
                 キーで「失われるもの」を要約した確認ダイアログを表示する（macOS のみ command キー +\
-                クリックでスキップできる。Windows は Win キーになるため非対応 = #763）。\
+                クリックでスキップできる。Windows は Win キーになるため非対応）。\
                 確認が入るのは role 付き（エージェント）ペインと実行中プロセスを持つペインだけで、\
                 空のシェルペインは従来どおり即クローズする。CLI / MCP からの close は\
                 確認なし（AI フルコントロール）。設定は config.yaml に永続化される。",
@@ -1186,9 +1199,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #495
         json!({
             "name": "tako_git_show",
-            "description": "特定コミットの詳細情報を取得する（#495）。フルハッシュ・author・committer・\
+            "description": "特定コミットの詳細情報を取得する。フルハッシュ・author・committer・\
                 日時・メッセージ全文・親コミット・変更ファイル一覧（パス・変更種別・増減行数）を返す。\
                 file を指定するとそのファイルの diff も含まれる。",
             "inputSchema": {
@@ -1219,7 +1233,10 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_git_pull",
-            "description": "git pull を実行する。対象ペインの cwd のリポジトリで pull する。",
+            "description": "対象ペインの cwd から見つけたリポジトリで引数なしの git pull を実行する\
+                （ブランチ・リモートは git の設定任せ）。ペインの cwd は tako_list_panes で確認する。\
+                リポジトリが無いとき・コンフリクトなどで git が失敗したときはエラーになり、\
+                git の出力がそのまま理由として返る（コンフリクトの確認は tako_git_conflicts）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1230,7 +1247,10 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_git_push",
-            "description": "git push を実行する。対象ペインの cwd のリポジトリで push する。",
+            "description": "対象ペインの cwd から見つけたリポジトリで引数なしの git push を実行する\
+                （ブランチ・リモートは git の設定任せ。切り替えは先に tako_git_checkout）。\
+                ペインの cwd は tako_list_panes で確認する。リポジトリが無いとき・upstream 未設定などで \
+                git が失敗したときはエラーになり、git の出力がそのまま理由として返る。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1263,9 +1283,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #496
         json!({
             "name": "tako_git_checkout",
-            "description": "ブランチを切り替える（#496）。confirm=false（既定）で呼ぶと、\
+            "description": "ブランチを切り替える。confirm=false（既定）で呼ぶと、\
                 未コミット変更があるなど破壊的になり得る場合は**実行せず**に何が起きるかを返す\
                 （preview.carried_files = 切替後も持ち越される変更 / preview.blocking_files = \
                 git が切替を拒否するファル）。内容を確認したうえで confirm=true で実行する。\
@@ -1281,9 +1302,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #496
         json!({
             "name": "tako_git_branch_create",
-            "description": "新規ブランチを作成する（#496）。start_point 省略時は現在の HEAD が基点。\
+            "description": "新規ブランチを作成する。start_point 省略時は現在の HEAD が基点。\
                 checkout=true（既定）で作成後そのまま切り替える。既存名・不正なブランチ名は実行前に拒否する。",
             "inputSchema": {
                 "type": "object",
@@ -1297,9 +1319,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #496
         json!({
             "name": "tako_git_merge",
-            "description": "指定ブランチを現在のブランチへマージする（#496）。confirm=false（既定）では\
+            "description": "指定ブランチを現在のブランチへマージする。confirm=false（既定）では\
                 **作業ツリーに一切触れず**に予測だけを返す: preview.kind（up-to-date / fast-forward / \
                 three-way / unrelated）・incoming_commits・changed_files・predicted_conflicts\
                 （git merge-tree による事前計算）。内容を確認して confirm=true で実行する。\
@@ -1316,10 +1339,11 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #496
         json!({
             "name": "tako_git_merge_abort",
             "description": "進行中の merge / rebase / cherry-pick / revert を中止して\
-                コンフリクト前の状態へ戻す（#496）。進行中の操作が無ければエラーを返す。",
+                コンフリクト前の状態へ戻す。進行中の操作が無ければエラーを返す。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1328,9 +1352,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #496
         json!({
             "name": "tako_git_conflicts",
-            "description": "コンフリクト状態を取得する（#496）。進行中の操作\
+            "description": "コンフリクト状態を取得する。進行中の操作\
                 （merging / rebasing / cherry-picking / reverting）・未解決ファイル一覧・\
                 取り込み先（ours）と取り込み元（theirs）・中止コマンドを返す。",
             "inputSchema": {
@@ -1341,13 +1366,16 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #496
         json!({
             "name": "tako_git_resolve_agent",
-            "description": "コンフリクト解消エージェントを起動する（#496）。同じタブにペインを立て、\
+            "description": "コンフリクト解消エージェントを起動する。同じタブにペインを立て、\
                 エージェント CLI（claude / codex / agy）を起動して解消用プロンプトを自動投入する。\
                 プロンプトにはリポジトリパス・未解決ファイル一覧・マージ元/先ブランチと\
                 「解消したら報告し、勝手に commit / push しない」制約が含まれる。\
-                コンフリクトが発生していないときはエラーを返す。",
+                コンフリクトが発生していないときはエラーを返す。\
+                Remote Control を opt-in しているのに環境が不適格だったときは remote_control=false と \
+                remote_control_blocked（kind / detail / reason / next_step）が返るので next_step に従う。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1517,11 +1545,14 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #749 / #500 / #1056 / #1055 / #504 / #1140 / #822 / #981 / #1068
         json!({
             "name": "tako_orchestrator_profiles",
             "description": "オーケストレーターのプロファイル（tako master / tako solo の起動設定）を管理する。\
                 action=list で一覧、show で単一表示、set で作成・更新、create で新規作成、\
                 copy で複製（from に複製元）、delete で削除（default は削除不可）。\
+                **モデル・effort・cwd 等の書き込み系の引数は action=set のときだけ効く**。\
+                clear_* は対応する指定を解除して既定へ戻す。\
                 kind=master（既定。tako master が読む profiles/）と kind=solo（tako solo が読む \
                 solo-profiles/）を切り替える。スキーマは両者共通。\
                 list / show / set は参照整合性の警告（未登録 project / 未登録アカウント / \
@@ -1538,9 +1569,11 @@ pub fn tools() -> Vec<Value> {
                 worker のエージェント種別（claude / codex / agy）は worker_agent（既定種別）と\
                 agent_* 系（worker_agents.<agent> のエージェント別 worker 設定: モデル・effort・\
                 許可スキップ・追加引数）で指定する。\
-                自動ハンドオフ（#749）は ctx_threshold（50〜60%）と auto_handoff で調整する。\
+                自動ハンドオフは ctx_threshold（50〜60%）と auto_handoff で調整する。\
                 応答の resolved_ctx_threshold / ctx_threshold_source / resolved_auto_handoff が\
-                実効値（プロファイル → config.yaml → 既定 60 の解決結果）。",
+                実効値（プロファイル → config.yaml → 既定 60 の解決結果）。\
+                remote_control: true でも環境が不適格なら remote_control_effective=false になり、\
+                remote_control_blocked（kind / detail / reason / next_step）が入るので next_step に従う。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1549,7 +1582,7 @@ pub fn tools() -> Vec<Value> {
                         "enum": ["list", "show", "set", "create", "copy", "delete"],
                         "description": "操作種別（省略時は list）",
                     },
-                    "name": { "type": "string", "description": "プロファイル名（set / create / copy / delete 時に必須。show 省略時は default）" },
+                    "name": { "type": "string", "description": "プロファイル名（set / create / copy / delete で必須。show 省略時は default）" },
                     "kind": enum_schema(
                         crate::orchestrator::ProfileKind::VALUES,
                         "プロファイル種別（master = tako master の profiles/ 既定 / solo = tako solo の solo-profiles/）",
@@ -1557,72 +1590,73 @@ pub fn tools() -> Vec<Value> {
                     "from": { "type": "string", "description": "複製元プロファイル名（copy 時に必須）" },
                     "projects": {
                         "type": "array", "items": { "type": "string" },
-                        "description": "このプロファイルに割り当てるプロジェクトキー（projects.yaml のキー。丸ごと置き換え。空配列でクリア。set 時）",
+                        "description": "このプロファイルに割り当てるプロジェクトキー（projects.yaml のキー。丸ごと置き換え。空配列でクリア）",
                     },
-                    "clear_projects": { "type": "boolean", "description": "projects の割り当てを解除する（set 時）" },
+                    "clear_projects": { "type": "boolean", "description": "projects の指定を解除して既定へ戻す" },
                     "master_agent": {
                         "type": "string",
                         "enum": ["claude", "codex"],
-                        "description": "master のエージェント種別（set 時。tako master / solo がこの CLI で起動する。agy は master 非対応）",
+                        "description": "master のエージェント種別（tako master / solo がこの CLI で起動する。agy は master 非対応）",
                     },
-                    "clear_master_agent": { "type": "boolean", "description": "master_agent の指定を解除して claude 既定に戻す（set 時）" },
-                    "model": { "type": "string", "description": "master のモデル（master_agent のネイティブ表記。set 時。省略で現状維持）" },
-                    "clear_model": { "type": "boolean", "description": "master のモデル指定を解除して claude 既定に戻す（set 時）" },
-                    "worker_model": { "type": "string", "description": "worker_model_policy=fixed 時の子 worker モデル（set 時）" },
-                    "clear_worker_model": { "type": "boolean", "description": "子 worker のモデル指定を解除する（set 時）" },
-                    "effort": { "type": "string", "description": "master の thinking effort（set 時。省略で現状維持）" },
-                    "worker_effort": { "type": "string", "description": "子 worker の thinking effort（set 時）" },
+                    "clear_master_agent": { "type": "boolean", "description": "master_agent の指定を解除して既定へ戻す" },
+                    "model": { "type": "string", "description": "master のモデル（master_agent のネイティブ表記。省略で現状維持）" },
+                    "clear_model": { "type": "boolean", "description": "model の指定を解除して既定へ戻す" },
+                    "worker_model": { "type": "string", "description": "worker_model_policy=fixed 時の子 worker モデル" },
+                    "clear_worker_model": { "type": "boolean", "description": "worker_model の指定を解除して既定へ戻す" },
+                    "effort": { "type": "string", "description": "master の thinking effort（省略で現状維持）" },
+                    "worker_effort": { "type": "string", "description": "子 worker の thinking effort" },
                     "worker_agent": {
                         "type": "string",
                         "enum": ["claude", "codex", "agy"],
-                        "description": "worker の既定エージェント種別（set 時。省略時の spawn はこの種別で起動する）",
+                        "description": "worker の既定エージェント種別（省略時の spawn はこの種別で起動する）",
                     },
-                    "clear_worker_agent": { "type": "boolean", "description": "worker_agent の指定を解除して claude 既定に戻す（set 時）" },
+                    "clear_worker_agent": { "type": "boolean", "description": "worker_agent の指定を解除して既定へ戻す" },
                     "agent": {
                         "type": "string",
                         "enum": ["claude", "codex", "agy"],
-                        "description": "agent_* 系で編集する対象エージェント名（set 時。agent_* 指定に必須）",
+                        "description": "agent_* 系で編集する対象エージェント名（agent_* 指定に必須）",
                     },
                     "agent_model": { "type": "string", "description": "対象エージェントの worker 既定モデル（CLI ネイティブ表記。codex: gpt-5.6-terra 等 / agy: 'Gemini 3.5 Flash (High)' 等）" },
-                    "clear_agent_model": { "type": "boolean", "description": "対象エージェントのモデル指定を解除する" },
+                    "clear_agent_model": { "type": "boolean", "description": "agent_model の指定を解除して既定へ戻す" },
                     "agent_effort": { "type": "string", "description": "対象エージェントの worker 既定 effort（claude / agy: --effort / codex: model_reasoning_effort）" },
-                    "clear_agent_effort": { "type": "boolean", "description": "対象エージェントの effort 指定を解除する" },
+                    "clear_agent_effort": { "type": "boolean", "description": "agent_effort の指定を解除して既定へ戻す" },
                     "agent_skip_permissions": { "type": "boolean", "description": "対象エージェントの許可プロンプトをスキップして起動する（明示 opt-in。agy は既定でコマンド毎に許可が出るため自律 worker 運用ではほぼ必須）" },
                     "agent_args": {
                         "type": "array", "items": { "type": "string" },
                         "description": "対象エージェントの追加 CLI 引数（丸ごと置き換え。空配列でクリア）",
                     },
                     "worker_model_policy": { "type": "string", "enum": ["inherit", "delegate", "fixed"], "description": "worker のモデル選択ポリシー（inherit: master と同じ / delegate: master が都度選ぶ / fixed: worker_model 固定）" },
-                    "tab_naming_convention": { "type": "string", "description": "タブ名の命名規則（master プロンプトに注入される自由記述。空文字でクリア。set 時）" },
+                    "tab_naming_convention": { "type": "string", "description": "タブ名の命名規則（master プロンプトに注入される自由記述。空文字でクリア）" },
                     "env_set": {
                         "type": "array", "items": { "type": "string" },
-                        "description": "環境変数を設定する（KEY=VALUE 形式の配列。値の ~ は $HOME に展開される。set 時。Issue #500）",
+                        "description": "環境変数を設定する（KEY=VALUE 形式の配列。値の ~ は $HOME に展開される）",
                     },
                     "env_unset": {
                         "type": "array", "items": { "type": "string" },
-                        "description": "環境変数を削除する（キー名の配列。set 時。Issue #500）",
+                        "description": "環境変数を削除する（キー名の配列）",
                     },
-                    "cwd": { "type": "string", "description": "master / solo をこのフォルダで起動する（**絶対パスか `~/` から始まる形**。相対パスは起動時に解決できないので拒否する。存在しないパスもエラー。空文字でクリア。set 時。#500 / #1056）。引き継ぎ（tako_orchestrator_handoff）の後任もここで起動する（未設定なら前任 master と同じフォルダ。#1055）" },
-                    "clear_cwd": { "type": "boolean", "description": "cwd の指定を解除する（set 時。#1056）" },
-                    "master_account": { "type": "string", "description": "master の既定アカウント名（accounts.yaml のキー。空文字でクリア。set 時。#504）" },
-                    "clear_master_account": { "type": "boolean", "description": "master_account を解除する（set 時。#504）" },
-                    "worker_account": { "type": "string", "description": "worker の既定アカウント名（空文字でクリア。set 時。#504）" },
-                    "clear_worker_account": { "type": "boolean", "description": "worker_account を解除する（set 時。#504）" },
-                    "ctx_threshold": { "type": "integer", "minimum": 50, "maximum": 60, "description": "master が引き継ぎを始める ctx 使用率の閾値（%。50〜60。範囲外はエラー。未設定なら config.yaml → 既定 60。set 時。#749）" },
-                    "clear_ctx_threshold": { "type": "boolean", "description": "ctx_threshold の指定を解除する（config.yaml → 既定 60 へ戻る。set 時。#749）" },
-                    "auto_handoff": { "type": "boolean", "description": "閾値超過時に tako が master へ引き継ぎを促す自動通知（既定 true）。false にすると通知は止まるが tako_orchestrator_self / tako_orchestrator_handoff は従来どおり使える（set 時。#749）" },
-                    "clear_auto_handoff": { "type": "boolean", "description": "auto_handoff の指定を解除して既定（有効）へ戻す（set 時。#749）" },
-                    "limit_resume": { "type": "boolean", "description": "このプロファイルで立つペインで利用上限後の自動復帰（5h / 週次上限のリセット後に tako が再開させる）を既定 ON にする（既定 false。set 時）。効く先は tako master / tako solo 本人のペインと引き継ぎの後任 master（#1140）と、このプロファイルから spawn した worker（#822。spawn 側の limit_resume が指定されていればそちらが勝つ）。実効値は応答の resolved_master_limit_resume（本人）と resolved_limit_resume（worker）に返る" },
-                    "clear_limit_resume": { "type": "boolean", "description": "limit_resume の指定を解除して既定（無効）へ戻す（set 時。#822 / #1140）" },
-                    "bypass_sandbox": { "type": "boolean", "description": "codex（master / worker）を --dangerously-bypass-approvals-and-sandbox で起動することを許可する（既定 false = 許可しない。set 時。#981）。true にすると承認プロンプトと codex のサンドボックスが両方無効になり、書き込み先もネットワークも制限されなくなる。false へ戻すと codex の既定（承認プロンプトが出る）に戻る" },
-                    "remote_control": { "type": "boolean", "description": "このプロファイルの claude セッション（master / solo / spawn した worker）を Claude 公式の Remote Control へ繋ぐ（既定 false = 繋がない。set 時。#1068）。true にすると claude 起動コマンドへ --remote-control が付き、claude.ai と Claude モバイルアプリからその会話を操作できるようになる。**委譲の代償**: 会話の transcript が Anthropic のサーバーにも保存され、認証は claude.ai アカウントへ移るので tako の機器ペアリングと role（observe / interact / manage / admin）はその会話には効かない。claude 以外の系統（codex / agy）には相当する仕組みが無いため何も起きない。環境が不適格（DISABLE_TELEMETRY 等・エンドポイント差し替え・API キー認証・組織ポリシー）なときはフラグを付けず、応答の remote_control_blocked に理由と次の一手が入る" },
+                    "cwd": { "type": "string", "description": "master / solo をこのフォルダで起動する（**絶対パスか `~/` から始まる形**。相対パスは起動時に解決できないので拒否する。存在しないパスもエラー。空文字でクリア）。引き継ぎ（tako_orchestrator_handoff）の後任もここで起動する（未設定なら前任 master と同じフォルダ）" },
+                    "clear_cwd": { "type": "boolean", "description": "cwd の指定を解除して既定へ戻す" },
+                    "master_account": { "type": "string", "description": "master の既定アカウント名（accounts.yaml のキー。空文字でクリア）" },
+                    "clear_master_account": { "type": "boolean", "description": "master_account の指定を解除して既定へ戻す" },
+                    "worker_account": { "type": "string", "description": "worker の既定アカウント名（空文字でクリア）" },
+                    "clear_worker_account": { "type": "boolean", "description": "worker_account の指定を解除して既定へ戻す" },
+                    "ctx_threshold": { "type": "integer", "minimum": 50, "maximum": 60, "description": "master が引き継ぎを始める ctx 使用率の閾値（%。50〜60。範囲外はエラー。未設定なら config.yaml → 既定 60）" },
+                    "clear_ctx_threshold": { "type": "boolean", "description": "ctx_threshold の指定を解除して既定へ戻す" },
+                    "auto_handoff": { "type": "boolean", "description": "閾値超過時に tako が master へ引き継ぎを促す自動通知（既定 true）。false にすると通知は止まるが tako_orchestrator_self / tako_orchestrator_handoff は従来どおり使える" },
+                    "clear_auto_handoff": { "type": "boolean", "description": "auto_handoff の指定を解除して既定へ戻す" },
+                    "limit_resume": { "type": "boolean", "description": "このプロファイルで立つペインで利用上限後の自動復帰（5h / 週次上限のリセット後に tako が再開させる）を既定 ON にする（既定 false）。効く先は tako master / tako solo 本人のペインと引き継ぎの後任 master と、このプロファイルから spawn した worker（spawn 側の limit_resume が指定されていればそちらが勝つ）。実効値は応答の resolved_master_limit_resume（本人）と resolved_limit_resume（worker）に返る" },
+                    "clear_limit_resume": { "type": "boolean", "description": "limit_resume の指定を解除して既定へ戻す" },
+                    "bypass_sandbox": { "type": "boolean", "description": "codex（master / worker）を --dangerously-bypass-approvals-and-sandbox で起動することを許可する（既定 false = 許可しない）。true にすると承認プロンプトと codex のサンドボックスが両方無効になり、書き込み先もネットワークも制限されなくなる。false へ戻すと codex の既定（承認プロンプトが出る）に戻る" },
+                    "remote_control": { "type": "boolean", "description": "このプロファイルの claude セッション（master / solo / spawn した worker）を Claude 公式の Remote Control へ繋ぐ（既定 false = 繋がない）。true にすると claude 起動コマンドへ --remote-control が付き、claude.ai と Claude モバイルアプリからその会話を操作できるようになる。**委譲の代償**: 会話の transcript が Anthropic のサーバーにも保存され、認証は claude.ai アカウントへ移るので tako の機器ペアリングと role（observe / interact / manage / admin）はその会話には効かない。claude 以外の系統（codex / agy）には相当する仕組みが無いため何も起きない。環境が不適格（DISABLE_TELEMETRY 等・エンドポイント差し替え・API キー認証・組織ポリシー）なときはフラグを付けず、応答の remote_control_blocked に理由と次の一手が入る" },
                 },
                 "additionalProperties": false,
             },
         }),
+        // 出自: #504 / #512
         json!({
             "name": "tako_orchestrator_accounts",
-            "description": "アカウントレジストリの管理（Issue #504）。名前つきアカウント（accounts.yaml）の CRUD。\
+            "description": "アカウントレジストリの管理。名前つきアカウント（accounts.yaml）の CRUD。\
                 アカウントは config_dir（CLAUDE_CONFIG_DIR の値）または inherit（未設定のまま = 既定の資格情報）と\
                 既定モデル/effort を持ち、\
                 spawn の account パラメータやプロファイルの master_account/worker_account で使う。\
@@ -1630,14 +1664,14 @@ pub fn tools() -> Vec<Value> {
                 add（name + config_dir か inherit のどちらか必須。追加または更新）/ remove（name 必須。削除）。\
                 既定の claude アカウント（~/.claude）を登録するときは config_dir ではなく inherit=true を使う: \
                 CLAUDE_CONFIG_DIR は設定されているだけで Keychain のエントリ名が変わり、\
-                既定パスを明示しても既存ログインが未ログイン扱いになる（Issue #512）",
+                既定パスを明示しても既存ログインが未ログイン扱いになる",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": ["list", "show", "add", "remove"], "description": "操作（list / show / add / remove）" },
                     "name": { "type": "string", "description": "アカウント名（show / add / remove 時に必須）" },
                     "config_dir": { "type": "string", "description": "CLAUDE_CONFIG_DIR の値（add 時。~ は $HOME に展開される。inherit と排他）" },
-                    "inherit": { "type": "boolean", "description": "true = CLAUDE_CONFIG_DIR を設定しない（既定の資格情報をそのまま使う。spawn 時は明示 unset で direnv 等の値も消す。#512）" },
+                    "inherit": { "type": "boolean", "description": "true = CLAUDE_CONFIG_DIR を設定しない（既定の資格情報をそのまま使う。spawn 時は明示 unset で direnv 等の値も消す）" },
                     "description": { "type": "string", "description": "アカウントの説明（add 時。任意）" },
                     "default_model": { "type": "string", "description": "このアカウントの既定モデル（add 時。任意。spawn で model 未指定時のフォールバック）" },
                     "default_effort": { "type": "string", "description": "このアカウントの既定 effort（add 時。任意）" },
@@ -1646,9 +1680,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #1154 / #1477 / #1453
         json!({
             "name": "tako_orchestrator_guide",
-            "description": "master の手順書を引く（#1154 / #1477）。system prompt には「いつ引くか」だけを置き、\
+            "description": "master の手順書を引く。system prompt には「いつ引くか」だけを置き、\
                 手順の全文（monitoring のイベント別対処表・acceptance の手順・worker prompt テンプレート・\
                 引き継ぎの書き方など）はここから取得する。長寿命セッションの起動時固定費を\
                 減らすための仕組みで、返る本文は prompt から移した原文そのまま。\
@@ -1661,11 +1696,12 @@ pub fn tools() -> Vec<Value> {
                 "properties": {
                     "topic": guide_topic_schema(),
                     "profile": { "type": "string", "description": "プレースホルダを解決するプロファイル（省略時は呼び出し元の role とペインの役割ラベルから解決）" },
-                    "pane": pane_schema("プロファイル解決に使うペイン ID（省略時は呼び出し元。#1453 の adopt 後はこのペインの採用先で解決される）"),
+                    "pane": pane_schema("プロファイル解決に使うペイン ID（省略時は呼び出し元。adopt 後はこのペインの採用先で解決される）"),
                 },
                 "additionalProperties": false,
             },
         }),
+        // 出自: #1439 / #1132 / #1123
         json!({
             "name": "tako_orchestrator_layout",
             "description": "worker spawn のレイアウト設定を取得・変更する（config.yaml の spawn_layout）。\
@@ -1679,7 +1715,7 @@ pub fn tools() -> Vec<Value> {
                 worker close 時は領域内だけがリフローされ、master とユーザーが自分で開いた\
                 ペインの矩形は変わらない。\
                 min_worker_cols は worker ペイン 1 枚に保証する最小の桁数（既定 60。0 = 保証しない）。\
-                **worker は必ず spawn 元と同じタブへ置く**（#1439。別タブへ逃がす配置は廃止した）。\
+                **worker は必ず spawn 元と同じタブへ置く**（別タブへ逃がす配置は廃止した）。\
                 下限を割るときは worker ペインのフォントを自動で縮めて桁数を確保し、\
                 床（min_worker_font_scale。既定 0.6 = 既定サイズの 60%）まで縮めても届かなければ\
                 床のサイズで置いて spawn 応答に cols_short=true と実桁数を載せる\
@@ -1687,7 +1723,7 @@ pub fn tools() -> Vec<Value> {
                 cols_short / font_refit に載る）。auto_shrink_font=false で自動縮小を切れる\
                 （狭いまま置く。タブは分けない）。\
                 狭いペインでは claude TUI がメッセージをハード折り返しするので、\
-                上限・ダイアログ・報告の読み取りが同時に壊れる（#1132 / #1123）。",
+                上限・ダイアログ・報告の読み取りが同時に壊れる。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1721,20 +1757,23 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #390 / #1013 / #1002 / #504 / #822
         json!({
             "name": "tako_orchestrator_spawn",
             "description": "プロジェクトの作業ディレクトリで子 worker を spawn する。\
                 worker のエージェント CLI は claude（既定）/ codex / agy から選べる（agent パラメータ）。\
                 呼び出し元ペインを右に分割して新ペインを作り、エージェントを起動してプロンプトを送信する。\
                 worker の pane_id・tmux_session・spawned_by（spawn 元ペイン ID）・agent・\
-                worker_id（レジストリ ID。#390: ペイン消失後の watch / status / report に使える）を返す。\
+                worker_id（レジストリ ID。ペイン消失後の watch / status / report に使える）を返す。\
                 tmux_session は pane ID が解決できない場合\
                 （BG タブ移動・tako 再起動後）のフォールバックとして tako_read_pane / tako_send_input に渡せる。\
                 worker_status / watch は pane_id だけで session を自動解決するため session_id は不要\
                 （codex / agy は画面推定で判定される）。\
                 起動からプロンプト送信まで 15〜20 秒かかる（これは想定内）。\
                 pane または tab のいずれかを必ず指定すること。省略すると呼び出し元タブに出るため、\
-                master が別タブにいる場合に意図しないタブに子が生える。",
+                master が別タブにいる場合に意図しないタブに子が生える。\
+                起動時に手当てが要る事象は launch_warnings[] に kind / message / next_step で載る\
+                （spawn 自体は続行する）ので、**警告があれば next_step を実行してから作業を任せる**。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1748,11 +1787,11 @@ pub fn tools() -> Vec<Value> {
                     },
                     "model": { "type": "string", "description": "worker のモデル（agent のネイティブ表記。省略時はプロファイル設定に従う）。\
                         codex / agy は claude 語彙の既定（アカウントの default_model / プロファイルの worker_model）を\
-                        受け取らないので、worker_agents.<agent>.model が無ければ CLI 既定で起動する（#1013）。\
+                        受け取らないので、worker_agents.<agent>.model が無ければ CLI 既定で起動する。\
                         実際に使う値と出どころは応答の model / model_source に返る" },
                     "effort": { "type": "string", "description": "thinking / reasoning effort（3 系統とも指定できる。\
-                        claude = --effort / codex = -c model_reasoning_effort= / agy = --effort（low|medium|high のみ。#1002）。\
-                        省略時はプロファイル設定に従う（claude 語彙の既定は claude 以外へ渡らない。#1013）" },
+                        claude = --effort / codex = -c model_reasoning_effort= / agy = --effort（low|medium|high のみ）。\
+                        省略時はプロファイル設定に従う（claude 語彙の既定は claude 以外へ渡らない）" },
                     "pane": pane_schema("分割元ペイン ID（省略時は呼び出し元。このペインの右に子が生える）。\
                         pane と tab の両方を指定した場合は pane を優先する"),
                     "tab": { "type": "integer", "minimum": 0, "description": "子を出すタブ ID。\
@@ -1764,10 +1803,10 @@ pub fn tools() -> Vec<Value> {
                         "description": "委任台帳の task_type（省略時は investigation）。\
                             spawn 時に自動記録され、ledger stats で task_type x model の成功率・差し戻し率を集計できる",
                     },
-                    "account": { "type": "string", "description": "アカウント名（accounts.yaml のキー。この worker だけ該当 config dir / モデルで起動する。#504）" },
+                    "account": { "type": "string", "description": "アカウント名（accounts.yaml のキー。この worker だけ該当 config dir / モデルで起動する）" },
                     "limit_resume": {
                         "type": "boolean",
-                        "description": "この worker だけ利用上限後の自動復帰（5h / 週次上限のリセット後に tako が再開させる）を明示指定する（#822）。\
+                        "description": "この worker だけ利用上限後の自動復帰（5h / 週次上限のリセット後に tako が再開させる）を明示指定する。\
                             省略時はプロファイルの limit_resume → 無効。長時間の自律タスクを任せるときに true にする。\
                             適用結果は応答の limit_resume に返る（ペイン単位の切替は tako_limit_resume）",
                     },
@@ -1776,83 +1815,44 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #157 / #983 / #1106 / #757 / #243 / #572 / #390 / #530 / #1294 / #790 / #748
+        //        #1143 / #1273 / #1297
         json!({
             "name": "tako_orchestrator_worker_status",
-            "description": "子 worker の状態を確認する。status は busy（作業中）/ idle（入力待ち・完了）/ \
-                error（API エラー・usage limit 等の異常で停止。#157）/ \
-                gone（ペイン消滅かつ tmux session も消滅）/ unknown（agents 不可）。\
-                error 時は応答の error オブジェクトに kind（api_error = 続行指示で復帰可 / \
-                usage_limit = 解除時刻まで待つ / limit_dialog = モデル切替等のダイアログに応答 / \
-                launch_failed = エージェント CLI の起動そのものが失敗（#983） / \
-                entitlement_blocked = 座席種別・管理者による無効化・グループ枠 $0・クレジット要求など \
-                **時間では解けない**利用阻害（#1106。待つ・ナッジ・respawn では直らないので \
-                detail をユーザーへ見せて管理者 / プラン / クレジットの対処を促す） / \
-                login_expired = アカウントのログインが失効した（#757。**resume では解けない** —— \
-                画面には接続エラーとして出るが 1 リクエストも通らないので、対象アカウント \
-                （error.account / error.config_dir）を名指しして再ログインをユーザーへ依頼する））と \
-                detail（検知した画面上の行）、\
-                recommended_action（resume / wait_reset / respond_dialog / fix_launch / needs_human / relogin）が入る。\
-                events 配列に直近の検知イベントが入る（#243）: \
-                question = worker が質問中（idle 時のみ。画面末尾に ? 終端行・選択肢・Should I 等のパターン）/ \
-                model_switched = 自動モデル切替が発生（from/to つき。limit reached, now using ... の検知）/ \
-                context_high = ctx 使用率が 60% 超（percent つき。handoff やセーフティコミットの判断材料）/ \
-                queued_messages_pending = 人間が busy 中に打った指示が claude のキューに未送信で残っている（#572。\
-                入力欄は空なので Enter 代行では発火しない。tako が自動で送り出すまで待ち、このペインを閉じない）。\
-                session_id を省略しても pane→session の自動解決（pid 祖先辿り）で claude agents --json の \
-                正確な status を取得する（status_source が agents-auto になる）。自動解決失敗時のみ \
-                画面パターン推定にフォールバック（status_source が screen）。\
-                codex / agy worker は agents API が無いため常に画面推定で判定される（claude / codex / agy \
-                すべての入力欄・busy パターンに対応済み）。\
-                tmux_session を渡すとペインが消えても tmux session が生きている限り \
-                recent_output を取得でき、gone にならない。\
-                退避（shelved）されたペインも追跡可能。recent_output はペインの最近 30 行の出力。\
-                resolved_session_id に自動解決された session_id が入る。\
-                #390: spawn 済み worker はレジストリに登録済みのため、pane_id 指定でも \
-                tmux_session / session_id が自動補完され、ペイン消失後も追跡が切れない。\
-                worker（レジストリ ID）指定なら pane_id 省略可。\
-                応答の prompt_delivery（delivered / pending / undelivered / unverified）と \
-                events の prompt_undelivered イベントで spawn プロンプトの未達を検知できる \
-                （undelivered なら tako_send_input でプロンプトを再送する）。\
-                #530: 送達フローがプロンプトの到達を確認できなかった場合は、claude が起動して \
-                session が観測できていても undelivered になる（起動 ≠ プロンプト到達）。\
-                #983 / #1294: unverified は「未達と断定できない」の意味で、入口が 2 つある: \
-                ①この系統には送達を裏づける一次シグナルが無い（agy 等）\
-                ②peer 送達（#790）の書き込みが始まった後に確認が取れなかった \
-                （prompt_delivery_failure が peer_send_stalled / peer_unconfirmed。届いた可能性がある）。\
-                どちらも events には prompt_undelivered ではなく \
-                prompt_delivery_unverified（recommended_action=verify_then_resend）が載るので、\
-                画面を見て届いているか確かめてから再送すること（そのまま再送すると二重指示になる）。\
-                #983: エージェント CLI の起動そのものが失敗している（CLI 不在で command not found / \
-                未認証）ときは status が error になり、error.kind=launch_failed / \
-                error.launch_problem（cli_not_found / not_authenticated / …）/ \
-                error.detail に「理由 + 次の一手」が入る（recommended_action=fix_launch）。\
-                続行指示や再送では直らないので、detail の手順を先に実施する。\
-                events の agent_dead はエージェント CLI プロセスの突然死（SIGSEGV 等）の疑い: \
-                応答の resume_command（レジストリの session ID から組み立てた claude --resume）を \
-                ペインのシェルへ tako_send_input すれば文脈ごと復旧できる（自動 resume はしない）。\
-                #748: 選択肢ダイアログ（permission だけでなく usage limit の対処選択・モデル選択・\
-                plan 確認・AskUserQuestion・一覧選択も）が画面にあるときは status が waiting になり、\
-                応答の choice_dialog に構造（kind / title / options[number,label,highlighted,label_truncated] / \
-                numbered / cursor_visible / labels_truncated / recommended_action）が入る。\
-                #1143: 狭いペインでは cursor_visible=false（ダイアログがペインより高く選択カーソルが画面外）／\
-                labels_truncated=true（ラベルが `…` で打ち切られ元の文字列が画面に残っていない）になる。\
-                この画面では**必ず番号で** respond すること（ラベル指定は拒否される）。\
-                events には choice_dialog（dialog_kind つき）が積まれ、\
-                このとき question は出さない（ダイアログ待ちは本文への返信では解けない）。\
-                kind が trust / bypass のものは tako 自身が承諾するので触らないこと（auto_accepted: true）。\
-                応答は tako_orchestrator_respond（choice 省略で下見できる）。\
-                #1273: 背景シェル / Monitor が生きているあいだ claude の一次シグナルは busy を返し続けるので、\
-                画面が「ターン終了 + 入力待ち」と決定的に言っていれば idle へ倒す \
-                （background_work に残っている背景作業の内訳・idle_despite_primary_busy に倒したかが入る）。\
-                #1297: 倒せたはずなのに倒さなかったときは idle_override_blocked に理由が入る \
-                （input_draft_unreadable = 入力欄に文字はあるが属性が取れず、人の下書きと \
-                claude の AI ゴースト提案を見分けられないので安全側に置いた。\
-                画面を見て人の下書きが無いなら、そのまま指示を送ってよい）。",
+            "description": "子 worker の状態を確認する（進捗・停止・ダイアログ待ちの検知）。\
+                前提: pane_id は tako_list_panes、worker（レジストリ ID）は \
+                tako_orchestrator_spawn の返り値か tako_orchestrator_workers\
+                （どちらか必須。worker は消失後も追える）。\
+                status = busy / idle（入力待ち・完了）/ waiting（選択肢ダイアログ）/ error / \
+                gone（ペインも tmux も消滅）/ unknown。判定は claude agents --json 優先・\
+                不可なら画面推定（status_source = agents-auto / screen。codex / agy は常に screen）。\
+                返るものは recommended_action / recent_output（直近 30 行）/ prompt_delivery / \
+                events / background_work / resume_command / resolved_session_id。\
+                **次の一手は recommended_action に従う**（resume / wait_reset / respond_dialog / \
+                fix_launch / needs_human / relogin / verify_then_resend）。\
+                error は error.kind（api_error / usage_limit / limit_dialog / launch_failed = \
+                内訳は error.launch_problem の cli_not_found / not_authenticated 等 / \
+                entitlement_blocked / login_expired）+ error.detail（該当行 + 次の一手）。\
+                後ろ 2 つは時間でも resume でも解けないので error.account / error.config_dir を\
+                名指ししてユーザーへ回す。\
+                waiting は choice_dialog に構造が入る（項目と番号縛りは \
+                tako_orchestrator_respond の説明）。応答も tako_send_input でなくそちらを使う。\
+                kind=trust / bypass は tako が承諾する（auto_accepted: true）ので触らない。\
+                prompt_delivery=undelivered は spawn プロンプト未達（起動 ≠ 到達）で \
+                tako_send_input から再送、unverified は届いた可能性があるので画面を見てから\
+                （二重指示になる。内訳は prompt_delivery_failure で、値の意味は \
+                tako_orchestrator_workers の説明）。\
+                events: question / model_switched / context_high / \
+                queued_messages_pending（tako が送り出すまで閉じない）/ prompt_undelivered / \
+                prompt_delivery_unverified / choice_dialog（dialog_kind つき）/ \
+                agent_dead（突然死。resume_command をシェルへ送れば復旧）。背景シェルが生きていても\
+                画面が入力待ちなら idle へ倒す（idle_despite_primary_busy。倒さなかった理由は \
+                idle_override_blocked = input_draft_unreadable 等）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "pane_id": { "type": "integer", "minimum": 0, "description": "worker のペイン ID（worker と排他。どちらか必須）" },
-                    "worker": { "type": "string", "description": "worker レジストリの ID（#390。tako_orchestrator_spawn の返り値 worker_id / tako_orchestrator_workers で確認）" },
+                    "worker": { "type": "string", "description": "worker レジストリの ID（tako_orchestrator_spawn の返り値 worker_id / tako_orchestrator_workers で確認）" },
                     "session_id": { "type": "string", "description": "claude の session ID（あれば精度向上）" },
                     "tmux_session": {
                         "type": "string",
@@ -1862,21 +1862,22 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #390 / #530 / #1294 / #658
         json!({
             "name": "tako_orchestrator_workers",
-            "description": "worker レジストリの一覧（#390）。spawn 済み worker をペインの生死と無関係に列挙する。\
+            "description": "worker レジストリの一覧。spawn 済み worker をペインの生死と無関係に列挙する。\
                 tako 再起動でペインが消えても、レジストリに残る worker は tmux_session / session_id 経由で \
                 watch / status / report を継続できる。各エントリに worker_id / pane / tmux_session / \
                 session_id / pane_alive（GUI にペインが現存するか）/ tmux_alive（tmux session が生存中か）/ \
                 prompt_delivery（delivered = プロンプト到達済み / pending = 確認中 / undelivered = 未達の疑い）/ \
-                prompt_delivery_failure（送達を確認できなかった理由コード。#530: choice_dialog = 初回のテーマ選択・\
+                prompt_delivery_failure（送達を確認できなかった理由コード。choice_dialog = 初回のテーマ選択・\
                 ログイン方法選択ダイアログが出て送れなかった / paste_not_reflected / residual_after_retries / \
-                flow_timeout。#1294: peer_send_stalled / peer_unconfirmed は**送ったかもしれない**ので \
+                flow_timeout。peer_send_stalled / peer_unconfirmed は**送ったかもしれない**ので \
                 prompt_delivery は undelivered ではなく unverified になり、自動再送は撃たれない）/ resend_command（未達 worker にだけ入る再送コマンド。同じ依頼文を \
                 tako_send_input で送り直す）/ resume_command（session ID 検出済み claude worker の復旧コマンド。\
                 突然死時に使う）が入る。既定は active のみ。all = true で closed（明示 close 済み）も含める。\
                 列挙のついでに、ペインも tmux session も 5 分以上続けて観測できない active エントリを \
-                closed（close_reason = gone）へ倒す（#658。resume_command / report は closed でも引けるので \
+                closed（close_reason = gone）へ倒す（resume_command / report は closed でも引けるので \
                 突然死からの復旧材料は失われない）。",
             "inputSchema": {
                 "type": "object",
@@ -1886,31 +1887,31 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #123 / #749 / #915 / #854 / #792 / #1516
         json!({
             "name": "tako_orchestrator_self",
             "description": "master / solo が自分自身の pane・tab・ctx%・session_id を取得する。\
-                master は MCP 経由では自分のペイン ID を知る手段がなかったが（#123）、\
-                このツールで自己特定できる。ctx_percent はコンテキスト使用率（0〜100）、\
+                ctx_percent はコンテキスト使用率（0〜100）、\
                 ctx_threshold は引き継ぎ閾値（プロファイルの ctx_threshold → config.yaml → \
                 既定 60 の順で解決。値域 50〜60。出どころは ctx_threshold_source）、\
                 ctx_over_threshold は閾値超えフラグ。\
                 ctx_over_threshold が true になったら、ユーザーの許可を待たずに \
-                handoff_path のファイルを最新化して tako_orchestrator_handoff を呼ぶ（#749）。\
+                handoff_path のファイルを最新化して tako_orchestrator_handoff を呼ぶ。\
                 auto_handoff は tako 側の自動通知が有効かどうか（有効なら閾値超過で \
                 「【tako 自動通知】」で始まる指示が届く。届いたら即座に引き継ぎを始める）。\
                 handoff_path / handoff_exists は**プロファイル運用メモ**（handoff/<profile>.md。\
                 プロジェクトに紐付かない運用知識の置き場）。\
-                #915: プロジェクト固有の引き継ぎは project_handoffs の各 path\
+                プロジェクト固有の引き継ぎは project_handoffs の各 path\
                 （handoff/projects/<project-key>.md）に書く。そこへ書いたものは、そのプロジェクトを\
                 管轄する master の後任にだけ渡る。旧形式は読むついでに自動移行される\
                 （handoff_migration。冪等）。profile_source が pane_role なら呼び出し元の\
-                TAKO_ORCHESTRATOR_ROLE が失われている（ペインの role ラベルから復元した。#854）。\
-                handoff_format はその書式（#792。sectioned = 知識 / 実行状態の 2 節に分かれている、\
+                TAKO_ORCHESTRATOR_ROLE が失われている（ペインの role ラベルから復元した）。\
+                handoff_format はその書式（sectioned = 知識 / 実行状態の 2 節に分かれている、\
                 legacy = 節分離前、null = ファイル未作成）、handoff_sections は認識できた節。\
                 legacy なら次に更新するとき 2 節へ書き直す。\
                 pane を省略すると caller の環境変数（TAKO_PANE_ID / TAKO_ORCHESTRATOR_ROLE）\
                 から自動解決する。\
-                #1516: pane を**明示すると、そのペインについて**答える（別の master の状態を\
+                pane を**明示すると、そのペインについて**答える（別の master の状態を\
                 横から確認する用途）。呼び出し元の名乗りは使わないので profile / role は\
                 そのペインの role ラベルから解け（profile_source=pane_role）、role には\
                 ペインのラベル（orchestrator-master:<profile> の語彙）が入る。\
@@ -1922,12 +1923,13 @@ pub fn tools() -> Vec<Value> {
                 "properties": {
                     "pane": pane_schema(
                         "対象 pane ID（省略時は caller から自動解決。明示するとそのペインに\
-                         ついて答える = #1516）",
+                         ついて答える）",
                     ),
                 },
                 "additionalProperties": false,
             },
         }),
+        // 出自: #915 / #749 / #792
         json!({
             "name": "tako_orchestrator_handoff",
             "description": "master の引き継ぎを実行する。**管轄プロジェクトの引き継ぎだけ**を読み、\
@@ -1935,7 +1937,7 @@ pub fn tools() -> Vec<Value> {
                 role / プロファイル / アカウント / モデル / effort / タブは旧 master と同一を引き継ぐ。\
                 呼ぶ前に引き継ぎファイルを今の状況で最新化すること（このツールはファイルの\
                 内容をそのまま後任へ渡すだけで、中身の鮮度は確認しない）。\
-                #915: 置き場はプロジェクト単位（handoff/projects/<project-key>.md）。\
+                置き場はプロジェクト単位（handoff/projects/<project-key>.md）。\
                 管轄は projects 引数 → プロファイルの担当プロジェクト + 稼働中 worker の\
                 プロジェクト → 稼働中 worker だけ の順で解決し（応答の jurisdiction_source）、\
                 どれも決まらなければ**本文を貼らずに一覧とパスだけ**を後任へ渡す\
@@ -1943,13 +1945,13 @@ pub fn tools() -> Vec<Value> {
                 プロジェクトに紐付かない運用知識は handoff/<profile>.md（プロファイル運用メモ）\
                 に置き、こちらは常に渡る。旧形式（プロファイル単位の混在ファイル）は\
                 この呼び出しの中で自動移行される（応答の handoff_migration。冪等・原本は退避）。\
-                #749: 旧 master のペインは**後任が引き継ぎを確認したあとに後任自身が閉じる**\
+                旧 master のペインは**後任が引き継ぎを確認したあとに後任自身が閉じる**\
                 （初期プロンプトにその手順が入る: 実態突き合わせ → 旧ペインの入力欄に\
                 ユーザーの未送達指示が残っていないか確認 → close）。この呼び出しでは閉じないので、\
                 後任の起動が失敗しても旧 master は失われない。応答の previous_master_pane_id が\
                 退役予定のペイン（null なら後任に close を指示していない）。\
                 引き継ぎの材料が 1 つも無ければエラーを返す（master は事前に書く必要がある）。\
-                #792: 各ファイルは 2 節に分けて書く。\
+                各ファイルは 2 節に分けて書く。\
                 「## 知識（マシン非依存）」= 決定事項・方針・残タスクの意図（pane / tab 番号を書かない）、\
                 「## 実行状態（このマシン限定）」= worker とその pane / tab・実行中のもの。\
                 pane / tab はこのマシンでしか意味を持たないので、知識に混ぜると別デバイスで\
@@ -1964,15 +1966,16 @@ pub fn tools() -> Vec<Value> {
                     "projects": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "後任へ渡すプロジェクトキー（#915）。指定すると推定より優先される。省略時はプロファイルの担当 + 稼働中 worker から推定",
+                        "description": "後任へ渡すプロジェクトキー。指定すると推定より優先される。省略時はプロファイルの担当 + 稼働中 worker から推定",
                     },
                 },
                 "additionalProperties": false,
             },
         }),
+        // 出自: #915
         json!({
             "name": "tako_orchestrator_handoffs",
-            "description": "引き継ぎファイルの管理（Issue #915）。プロジェクト単位の引き継ぎ\
+            "description": "引き継ぎファイルの管理。プロジェクト単位の引き継ぎ\
                 （handoff/projects/<project-key>.md）とプロファイル運用メモ（handoff/<profile>.md）の\
                 一覧・読み・書き、および旧形式からの移行。\
                 action: list（両方の一覧。行数・書式・肥大警告つき）/ \
@@ -1994,9 +1997,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #121 / #504
         json!({
             "name": "tako_orchestrator_run",
-            "description": "子 worker を spawn し、即座に run_id を返す（非同期。#121）。\
+            "description": "子 worker を spawn し、即座に run_id を返す（非同期）。\
                 MCP 呼び出しが中断されても worker は孤児化せず、run_id で追跡できる。\
                 進捗確認は tako_orchestrator_run_status、結果回収は tako_orchestrator_run_result を使う。\
                 worker のエージェント CLI は claude（既定）/ codex / agy から選べる（agent パラメータ）。\
@@ -2040,15 +2044,16 @@ pub fn tools() -> Vec<Value> {
                         "enum": ["bugfix-rooted", "bugfix-unrooted", "investigation", "feature-verifiable", "feature-ui", "docs", "review"],
                         "description": "委任台帳の task_type（省略時は investigation）",
                     },
-                    "account": { "type": "string", "description": "アカウント名（accounts.yaml のキー。この worker だけ該当 config dir / モデルで起動する。#504）" },
+                    "account": { "type": "string", "description": "アカウント名（accounts.yaml のキー。この worker だけ該当 config dir / モデルで起動する）" },
                 },
                 "required": ["project", "prompt"],
                 "additionalProperties": false,
             },
         }),
+        // 出自: #292
         json!({
             "name": "tako_orchestrator_ledger",
-            "description": "委任台帳を操作する（Issue #292）。\
+            "description": "委任台帳を操作する。\
                 action=list で一覧（project / task_type でフィルタ、limit で件数制限）、\
                 stats で task_type x model の集計（成功率・差し戻し率・平均所要時間・未評価数）、\
                 record で検収結果の記録（id + outcome + rounds + note）、\
@@ -2083,9 +2088,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #121
         json!({
             "name": "tako_orchestrator_run_status",
-            "description": "非同期 run の進捗を照会する（#121）。run_id を指定すると \
+            "description": "非同期 run の進捗を照会する。run_id を指定すると \
                 {run_id, pane_id, status, phase, elapsed_seconds} を返す。\
                 phase は 'running'（進行中）または 'finished'（完了済み）。\
                 status は busy / idle / error / gone / starting / completed / worker_error / timeout。\
@@ -2098,9 +2104,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #121
         json!({
             "name": "tako_orchestrator_run_result",
-            "description": "完了した非同期 run の結果を回収する（#121）。\
+            "description": "完了した非同期 run の結果を回収する。\
                 未完了なら phase='running' を返す（エラーにはならない）。\
                 完了済みなら出力取得 + auto_close を行い、レジストリから除去して \
                 {run_id, pane_id, status, output, duration_seconds, closed} を返す。\
@@ -2114,17 +2121,21 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #319 / #748 / #1143
         json!({
             "name": "tako_orchestrator_respond",
-            "description": "worker の**選択肢ダイアログ**に応答する（#319 permission → #748 で全種別）。\
+            "description": "worker の**選択肢ダイアログ**に応答する（permission に限らず全種別）。\
                 対象は permission（ツール承認）のほか usage limit の対処選択・モデル選択（/model）・\
                 plan モードの実行確認・AskUserQuestion の質問・一覧選択（/mcp）など。\
                 watch の WORKER_PERMISSION / WORKER_DIALOG、または worker_status / read_pane の \
                 choice_dialog で検知されたダイアログに対して使う。\
                 **choice を省略すると送信せず構造だけ返す**（下見。選択肢一覧・現在のハイライト・番号キーの可否）。\
+                構造は kind / title / options[number, label, highlighted, label_truncated] / \
+                numbered / cursor_visible / labels_truncated で、worker_status / read_pane の \
+                choice_dialog も同じ形（events の choice_dialog には dialog_kind が付く）。\
                 ダイアログが画面に存在しない場合はエラー（誤爆防止）。\
                 番号つきダイアログは番号キーだけで確定し、番号なしダイアログは矢印移動 + ラベル一致検証 + Enter で応答する。\
-                #1143: 下見の結果に labels_truncated=true が付いていたら、ラベルは TUI 自身に `…` で\
+                下見の結果に labels_truncated=true が付いていたら、ラベルは TUI 自身に `…` で\
                 打ち切られていて元の文字列が画面に残っていない（狭いペインの /model 等）。\
                 この画面では**番号でのみ**確定できる（ラベル指定はエラーになる。誤選択の確定を防ぐため）。\
                 cursor_visible=false はダイアログがペインより高く選択カーソルが画面外にあることを表す\
@@ -2137,16 +2148,17 @@ pub fn tools() -> Vec<Value> {
                     "pane_id": { "type": "integer", "description": "対象の worker ペイン ID" },
                     "choice": {
                         "type": "string",
-                        "description": "選択肢: 番号（画面の番号 or 1 始まりの順番）／ラベルの部分一致（大小無視・複数一致はエラー。#1143: 切り詰められたラベルには使えない）／'yes'/'allow'／'no'/'deny'。省略すると送信せず構造だけ返す",
+                        "description": "選択肢: 番号（画面の番号 or 1 始まりの順番）／ラベルの部分一致（大小無視・複数一致はエラー。切り詰められたラベルには使えない）／'yes'/'allow'／'no'/'deny'。省略すると送信せず構造だけ返す",
                     },
                 },
                 "required": ["pane_id"],
                 "additionalProperties": false,
             },
         }),
+        // 出自: #401
         json!({
             "name": "tako_orchestrator_supervisor",
-            "description": "worker 自動復旧 supervisor の操作（#401）。\
+            "description": "worker 自動復旧 supervisor の操作。\
                 usage_limit / api_error / agent_dead / prompt_undelivered に対する自動リカバリの設定・状態照会・履歴参照。\
                 action=status: 現在の設定（mode / auto_resume_dead / max_retries）と監査ログ末尾。\
                 action=set_mode: supervisor モードを変更する（auto = 自動復旧 / notify_only = 通知のみ / off = 無効）。\
@@ -2183,9 +2195,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #364 / #390
         json!({
             "name": "tako_orchestrator_report",
-            "description": "worker の報告内容を取得する（#364）。\
+            "description": "worker の報告内容を取得する。\
                 第 1 層: tmux scrollback（capture-pane -J で折返し結合。全 agent 共通）。\
                 第 2 層: 構造化ソース（claude の transcript JSONL。ペイン幅非依存の全文品質）。\
                 transcript が利用可能なら source=transcript で全文テキストを返し、scrollback_text に \
@@ -2193,13 +2206,13 @@ pub fn tools() -> Vec<Value> {
                 tako_read_pane（可視画面のみ）と異なり、スクロールバック履歴を遡るため長い出力も取得できる。\
                 報告の読み取りには report を使い、read_pane は配置・生存確認用に限定すること。\
                 messages で直近 n 件の assistant テキストを取得できる（古い順で返す。省略時 1 件）。\
-                #390: worker（レジストリ ID）指定なら pane_id 省略可。ペイン消失後も \
+                worker（レジストリ ID）指定なら pane_id 省略可。ペイン消失後も \
                 レジストリの tmux_session / session_id 経由で報告を取得できる。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "pane_id": { "type": "integer", "minimum": 0, "description": "worker のペイン ID（worker と排他。どちらか必須）" },
-                    "worker": { "type": "string", "description": "worker レジストリの ID（#390。ペイン消失後の取得にも使える）" },
+                    "worker": { "type": "string", "description": "worker レジストリの ID（ペイン消失後の取得にも使える）" },
                     "lines": {
                         "type": "integer", "minimum": 1, "maximum": 100000,
                         "description": "スクロールバック取得行数（既定 2000）",
@@ -2213,6 +2226,7 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         // --- リモートアクセス MCP ツール ---
+        // 出自: #1485
         json!({
             "name": "tako_remote_start",
             "description": "リモートアクセス API サーバーを起動する。スマホからブラウザ経由で\
@@ -2228,7 +2242,7 @@ pub fn tools() -> Vec<Value> {
                 操作できる。承認・role 変更は Mac の GUI 限定で AI からは行えない。\
                 注意: interact 以上を許可した端末はターミナルへ任意コマンドを送信できる（実質シェルアクセス）。\
                 起動に成功すると「起動していた」ことが記録され、tako や Mac を再起動しても\
-                GUI 起動時に自動で立て直される（#1485。解除は tako_remote_stop）。\
+                GUI 起動時に自動で立て直される（解除は tako_remote_stop）。\
                 記録と直近の自動復帰の結果は tako_remote_status の desired / last_autostart で読める。",
             "inputSchema": {
                 "type": "object",
@@ -2236,11 +2250,12 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #1485
         json!({
             "name": "tako_remote_stop",
             "description": "リモートアクセス API サーバーを停止する。\
                 既定は SIGTERM で停止を試みる。force=true で SIGKILL を使う。\
-                「起動していた」の記録も消えるので、以後は GUI を起動しても自動復帰しない（#1485）。",
+                「起動していた」の記録も消えるので、以後は GUI を起動しても自動復帰しない。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2252,15 +2267,19 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #1485
         json!({
             "name": "tako_remote_status",
             "description": "リモートアクセス API サーバーの状態を取得する。\
                 起動中なら running=true・socket パス・恒久固定 URL・登録済み端末数を返す。\
                 URL に secret は含まれない（接続時の認証は機器ペアリングが行う）。\
-                desired は「ユーザーが起動していた」の記録（#1485。tako_remote_start で立ち、\
+                desired は「ユーザーが起動していた」の記録（tako_remote_start で立ち、\
                 tako_remote_stop で消える）で、running が false でも必ず載る。\
                 last_autostart は GUI 起動時の自動復帰の直近の結果\
-                （result = started / skipped / failed・attempts・reason・detail）。",
+                （result = started / skipped / failed・attempts・reason・detail）。\
+                **劣化しているときだけ degraded が載る**（reason = 何が壊れているか / \
+                next_step = そのまま実行できる復旧手順）。running=true でも degraded があれば\
+                実際には配信できていないので、reason を報告する前に next_step を実行する。",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -2311,9 +2330,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #283 / #1452
         json!({
             "name": "tako_remote_devices",
-            "description": "リモート接続のペアリング済み端末を管理する（#283 機器ペアリング認証 / #1452）。\
+            "description": "リモート接続のペアリング済み端末を管理する（機器ペアリング認証）。\
                 action=list で登録済み端末（id・名前・role・最終アクセス）と保留中の要求\
                 （新規ペアリング・権限の更新リクエスト）を一覧、action=revoke で device_id の\
                 登録を失効させる（接続中の端末は即時切断される）、action=role で device_id の\
@@ -2342,10 +2362,11 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #1451
         json!({
             "name": "tako_remote_shortcuts",
             "description": "リモート（スマホ）のファイル閲覧で使うショートカット（お気に入り）を\
-                管理する（#1451）。action=list で既定（ホーム / デスクトップ / ダウンロード）と\
+                管理する。action=list で既定（ホーム / デスクトップ / ダウンロード）と\
                 登録分の一覧、action=add で path（絶対パス）を追加（同じパスの二重登録は\
                 起きない = 冪等）、action=remove で削除（path は id でもパスでもよい）。\
                 既定のショートカットは削除できない。永続は <data_dir>/remote/shortcuts.json で、\
@@ -2373,9 +2394,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #286 / #1038
         json!({
             "name": "tako_remote_setup",
-            "description": "リモートアクセスの Tailscale セットアップ状態を確認・実行する（#286）。\
+            "description": "リモートアクセスの Tailscale セットアップ状態を確認・実行する。\
                 action=check で Tailscale の導入・ログイン・HTTPS・serve の各項目を確認、\
                 action=run で Tailscale 系統の決定 + serve 設定 + QR PNG 生成まで実行する\
                 （既定のループバック TCP では serve は `tako remote start` 時に張るので \
@@ -2393,7 +2415,7 @@ pub fn tools() -> Vec<Value> {
                     "answers": {
                         "type": "object",
                         "description": "run 時のオプション。yes=true で全質問を自動承認。\
-                            tailscale で使う Tailscale 系統を選ぶ（#1038: macOS では \
+                            tailscale で使う Tailscale 系統を選ぶ（macOS では \
                             GUI 版アプリと standalone tailscaled が同居し、\
                             別ノードとして二重登録されることがある。省略時は検出結果から決め、\
                             選んだ理由を tailscale_reason に返す）",
@@ -2449,9 +2471,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #36 / #50 / #403 / #616
         json!({
             "name": "tako_update",
-            "description": "アプリ内更新の診断・チェック・実行（#36 + #50 + #403 チャンネル制）。\
+            "description": "アプリ内更新の診断・チェック・実行（チャンネル制）。\
                 action=status で配布系統（homebrew / zip / broken-brew）・現在バージョン・\
                 現在チャンネル（stable / test）・PATH 上の重複 CLI を返す。\
                 action=check で GitHub Releases から最新版の有無を確認する（更新は行わない）。\
@@ -2461,7 +2484,7 @@ pub fn tools() -> Vec<Value> {
                 action=apply-zip で zip 経由で強制更新する。\
                 action=repair で broken-brew 状態を修復する。\
                 apply 成功後の再起動は UI 側で行う（CLI / MCP からは apply 結果の確認まで）。\
-                action=open で GUI のアップデート専用画面を開く（#616。\
+                action=open で GUI のアップデート専用画面を開く（\
                 現在 / 最新バージョン・チャンネル・配布物・リリースノート・更新ボタンが載る。\
                 開いているかは action=status の window_open で分かる）。\
                 action=card で画面上部の更新通知カードの状態を返す。\
@@ -2487,9 +2510,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #118
         json!({
             "name": "tako_fda",
-            "description": "macOS のフルディスクアクセス (FDA) の状態確認と設定画面の起動（Issue #118）。\
+            "description": "macOS のフルディスクアクセス (FDA) の状態確認と設定画面の起動。\
                 フォルダアクセス許可ダイアログが頻発する場合、FDA を付与すれば一括で消せる。\
                 action=status で FDA の付与状態を返す（granted: true/false）。\
                 action=open でシステム設定のフルディスクアクセスパネルを開く。\
@@ -2507,9 +2531,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #173 / #218 / #1473
         json!({
             "name": "tako_sleep_guard",
-            "description": "スリープ防止機能の状態確認・設定変更（Issue #173 + #218 蓋閉じ対応）。\
+            "description": "スリープ防止機能の状態確認・設定変更（蓋閉じ対応も見る）。\
                 macOS のアイドルスリープを IOKit 電源アサーションで防止する。\
                 蓋閉じ防止は pmset disablesleep で制御（sudoers 登録が必要）。\
                 action=status（既定）: モード・電源条件・アサーション状態・蓋の開閉・thermal 状態を返す。\
@@ -2518,7 +2543,7 @@ pub fn tools() -> Vec<Value> {
                 action=remove-lid-sleep: sudoers.d から削除 + disablesleep 解除。\
                 action=open-battery-settings: System Settings の Battery を開く（フォールバック）。\
                 蓋閉じ継続は既定では AC 接続時のみ効く。バッテリー駆動（テザリング中など）でも\
-                続けたい場合は lid_power_condition=always を設定する（#1473）。そのときは\
+                続けたい場合は lid_power_condition=always を設定する。そのときは\
                 安全弁（エージェント稼働中のみ / 残量が lid_battery_floor 以下で自動解除 / \
                 本体が高温なら解除）が必ず働き、解除の理由は status の lid_skip_reason に出る。\
                 ユーザーが「PC がスリープして作業が止まった」「蓋を閉じても続けたい」と言った場合は、\
@@ -2556,9 +2581,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #217 / #459
         json!({
             "name": "tako_theme",
-            "description": "UI テーマの状態確認・切替・色設定・プリセット・フォント（Issue #217/#459）。\
+            "description": "UI テーマの状態確認・切替・色設定・プリセット・フォント。\
                 action=status（既定）: 現在のテーマ + 利用可能プリセットを返す。\
                 action=set: mode でテーマ（dark/light/プリセット名）を切り替える。\
                 action=toggle: ダーク/ライトを反転する。\
@@ -2588,9 +2614,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #459 / #721
         json!({
             "name": "tako_settings",
-            "description": "設定画面の操作（Issue #459）。\
+            "description": "設定画面の操作。\
                 action=open（既定）: GUI 設定画面を開く（個別設定は tako_lang / tako_theme 等を使う）。\
                 action=status: 設定画面が開いているかを返す。",
             "inputSchema": {
@@ -2604,23 +2631,24 @@ pub fn tools() -> Vec<Value> {
                     "tab": {
                         "type": "string",
                         "enum": ["general", "appearance", "runner", "profiles", "setup", "sleep", "remote", "advanced"],
-                        "description": "開くタブ指定（省略時は現在タブ維持）。profiles = master / solo の起動プロファイル編集（#721）",
+                        "description": "開くタブ指定（省略時は現在タブ維持）。profiles = master / solo の起動プロファイル編集",
                     },
                 },
                 "additionalProperties": false,
             },
         }),
+        // 出自: #1067 / #640 / #498 / #749
         json!({
             "name": "tako_session_restart",
-            "description": "エージェントペインを**会話を引き継いだまま**建て直す（Issue #1067）。\
+            "description": "エージェントペインを**会話を引き継いだまま**建て直す。\
                 mode を省略すると**下見**（何ができるか + できない理由）を返すだけで何も起こさない。\
                 mode=harness: エージェント CLI のプロセスだけを終了させ、落ちたことを確かめてから \
-                `claude --resume <session-id>` を送達確認つき経路（#640）で投入する。\
+                `claude --resume <session-id>` を送達確認つき経路で投入する。\
                 **会話コンテキストは 1 文字も失われない**ので、claude CLI の自動更新後に\
-                プロセスが旧版のまま残っている（#498 の stale 警告）ときの解決手段になる。\
+                プロセスが旧版のまま残っている（stale 警告）ときの解決手段になる。\
                 アカウント（CLAUDE_CONFIG_DIR）・role・モデル・effort も元のまま復元する。\
                 mode=handoff: 引き継ぎの書き直しと tako_orchestrator_handoff の呼び出しを \
-                master 自身へ依頼する（#749 の自動ハンドオフの手動版）。ctx をリセットできるが、\
+                master 自身へ依頼する（自動ハンドオフの手動版）。ctx をリセットできるが、\
                 引き継ぎファイルに書いた分しか残らない。**master ペインのみ**。\
                 生成中・キュー滞留・入力欄に人間の下書き・選択肢ダイアログ表示中は実行せず\
                 理由 + 次の一手を返す。claude 以外の系統は tako 側の resume 未配線のため対象外\
@@ -2637,9 +2665,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #498
         json!({
             "name": "tako_stale_binary",
-            "description": "稼働中 claude セッションのバイナリ鮮度を検知し、新版への張り直しを行う（Issue #498）。\
+            "description": "稼働中 claude セッションのバイナリ鮮度を検知し、新版への張り直しを行う。\
                 claude CLI は symlink 張り替えで更新されるが、長生きセッション（特に master）は起動時の旧バイナリを\
                 握り続ける。action=status（既定）で指定ペインの stale 判定（握っている版 / 最新版 / stale か）を返す。\
                 action=restart で張り直し（中身は tako_session_restart と同一実装。\
@@ -2662,9 +2691,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #916
         json!({
             "name": "tako_migrate",
-            "description": "設定・データファイルのスキーマ自動マイグレーション（Issue #916）。\
+            "description": "設定・データファイルのスキーマ自動マイグレーション。\
                 tako は設定ファイルの形式や置き場を変えたとき**利用者へ手動移行を要求しない**。\
                 旧形式は setup 実行時と実行時の差分検出で自動的に直る。このツールは\
                 その状態を確認・手動発火するためのもの。\
@@ -2697,9 +2727,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #549
         json!({
             "name": "tako_welcome",
-            "description": "初回起動のウェルカムバナー（Issue #549）。tako を初めて起動したユーザーへ\
+            "description": "初回起動のウェルカムバナー。tako を初めて起動したユーザーへ\
                 「tako setup で初期設定 → tako master で AI 司令塔」の導線を画面上部に出す。\
                 action=status（既定）で表示状態（visible / dismissed / first_launch）と\
                 案内すべきコマンド（setup_command / master_command）を返す。\
@@ -2719,10 +2750,11 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #666
         json!({
             "name": "tako_show_command",
             "description": "ユーザーに実行してほしいコマンドを、コピー可能なカードとして画面に出す\
-                （FR-2.22 / Issue #666）。**ユーザーへコマンドを実行してもらうときは必ずこれを使う**。\
+                （FR-2.22）。**ユーザーへコマンドを実行してもらうときは必ずこれを使う**。\
                 会話本文にコマンドを書くだけだと、TUI がペイン幅で物理改行を入れるため\
                 ユーザーが画面からコピーすると壊れる。このツールに渡した文字列はそのまま保管され、\
                 カードは「コピー」（論理文字列を丸ごとクリップボードへ）と「新規ペインで実行」\
@@ -2775,9 +2807,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #513
         json!({
             "name": "tako_config_share",
-            "description": "AI 系設定の git ベース共有（Issue #513）。tako の宣言的設定\
+            "description": "AI 系設定の git ベース共有。tako の宣言的設定\
                 （profiles / projects / accounts / local-rules / settings）と claude の\
                 グローバル指示（CLAUDE.md / snippets / commands / templates）を 1 つの git\
                 リポジトリでデバイス間（mac ⇔ Windows）共有する。\
@@ -2823,9 +2856,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #525 / #467
         json!({
             "name": "tako_shell_integration",
-            "description": "シェル統合（OSC 7 / 133）の配置状態の確認と配置・解除（Issue #525 / #467）。\
+            "description": "シェル統合（OSC 7 / 133）の配置状態の確認と配置・解除。\
                 これが効いていないとペインの cwd 追従（`list` の cwd）とコマンド実行状態\
                 （idle / running / failed）が取れない。\
                 action: status（既定。状態だけ返す）/ install / uninstall。\
@@ -2846,9 +2880,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #982 / #975
         json!({
             "name": "tako_agent_support",
-            "description": "agent 能力マトリクスの参照（Issue #982 / #975）。\
+            "description": "agent 能力マトリクスの参照。\
                 どのエージェント CLI（claude / codex / agy / ローカル LLM）でどの機能が \
                 claude 同等に使えるか・縮退しているか・まだ使えないかを返す。\
                 tako は claude を基準に実装してきたため、系統によって使えない操作がある。\
@@ -2875,9 +2910,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #515 / #467 / #594
         json!({
             "name": "tako_platform",
-            "description": "プラットフォーム対応マトリクスの参照（Issue #515 / #467）。\
+            "description": "プラットフォーム対応マトリクスの参照。\
                 どの機能がこの環境で使えるか・縮退しているか・未実装かを返す。\
                 tako は macOS 先行で開発して Windows へ反映していくため、環境によって使えない操作がある。\
                 Windows で作業していて操作が失敗したときは、まず status=pending で確認すること。\
@@ -2900,18 +2936,19 @@ pub fn tools() -> Vec<Value> {
                     "known_limitations": {
                         "type": "boolean",
                         "description": "リリースノート用の Known limitations 節（日英併記の markdown）を \
-                            known_limitations_markdown に併せて返す（Issue #594）",
+                            known_limitations_markdown に併せて返す",
                     },
                 },
                 "additionalProperties": false,
             },
         }),
+        // 出自: #1296 / #1312 / #944 / #1253
         json!({
             "name": "tako_test_residue",
-            "description": "テスト・検証プロセスが一時ディレクトリへ残した使い捨て dir を掃除する（Issue #1296 / #1312）。\
-                対象は `<TMPDIR>` 直下の `tako-test-data-<pid>`（cargo test の data dir = #944 の隔離先）/ \
-                `tako-agent-config-<pid>`（検証プロセスのエージェント設定 = #1253 の隔離先）/ \
-                `tako-test-scratch-<pid>`（テスト本体が作る使い捨ての作業ディレクトリの親 = #1312）/ \
+            "description": "テスト・検証プロセスが一時ディレクトリへ残した使い捨て dir を掃除する。\
+                対象は `<TMPDIR>` 直下の `tako-test-data-<pid>`（cargo test の data dir）/ \
+                `tako-agent-config-<pid>`（検証プロセスのエージェント設定）/ \
+                `tako-test-scratch-<pid>`（テスト本体が作る使い捨ての作業ディレクトリの親）/ \
                 `tako-test-orchestrator-<pid>` / `tako-test-supervisor-<pid>`（オーケストレーターのテスト隔離先）。\
                 macOS の TMPDIR は再起動でも消えないので、放っておくと数千件積もる。\
                 **既定は dry-run**（1 つも消さず、件数・バイト数・判定理由だけを返す）。\
@@ -2931,15 +2968,17 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #1139
         json!({
             "name": "tako_context_budget",
-            "description": "起動時ロードの予算の確認と自動修正（Issue #1139）。\
+            "description": "起動時ロードの予算の確認と自動修正。\
                 AI が**起動した瞬間に強制ロードされるもの**（グローバル指示ファイル・\
                 リポジトリの AGENTS.md / CLAUDE.md とその @import チェーン・master / solo の \
                 system prompt・引き継ぎ）を棚卸しし、種別ごとの上限と突き合わせる。\
                 積もった作業ログが毎ターン全文読み込まれてコンテキストを食い潰すのを防ぐための機構。\
                 action=check（既定）: 何も書き換えず、項目ごとの bytes / 行 / 概算トークン / 予算 / \
-                超過理由（violations）と、自動では直せないものの直し方（proposals）を返す。\
+                超過理由（violations。1 件ずつの next_step がそのまま実行できる直し方）と、\
+                自動では直せないものの直し方（proposals）を返す。\
                 action=fix: **自動で直せるものだけ**直す = `## YYYY-MM-DD` の見出しが並ぶ作業ログの \
                 古いエントリを progress-archive.md へ 1 行に畳んで移す（本文の要約も改変もしない。\
                 全文は git 履歴に残る）。移送で総エントリ数が合わなければ書き込まない。\
@@ -2975,9 +3014,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #691 / #1058
         json!({
             "name": "tako_ui_mode",
-            "description": "UI 表示モード（GUI ライク表示 ⇔ ターミナル表示）の状態確認・切替（Issue #691）。\
+            "description": "UI 表示モード（GUI ライク表示 ⇔ ターミナル表示）の状態確認・切替。\
                 action=status（既定）: 現在のモードと、ターミナル表示へ戻してあるペインを返す。\
                 action=set: mode（terminal / gui）へ切り替える。action=toggle: 反転する。\
                 gui モードでは、アイドルなシェルのペインが「AI チームに任せる / AI と 1 対 1 で話す / \
@@ -2988,8 +3028,8 @@ pub fn tools() -> Vec<Value> {
                 表示レイヤだけの切替なので PTY・tmux セッション・実行中プロセスには影響しない。\
                 応答の pane_display は各ペインにいま何が出ているか（terminal / starter / chat / \
                 preparing）で、pane_display_reason は**スターター / チャットにならない理由**\
-                （reason / note / next_step / materials）を返す（#1058。gui にしたのに \
-                スターターが出ないときは、まずここで欠けている材料を確かめる）。",
+                （reason / note / next_step / materials）を返す（gui にしたのに \
+                スターターが出ないときは、まずここで欠けている材料を確かめ、next_step を実行する）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3010,9 +3050,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #435
         json!({
             "name": "tako_lang",
-            "description": "UI 表示言語（日本語/英語）の状態確認・切替（Issue #435）。\
+            "description": "UI 表示言語（日本語/英語）の状態確認・切替。\
                 action=status（既定）: 言語設定（system / ja / en）と実際の表示言語を返す。\
                 action=set: value で指定した言語へ切り替える（system = OS ロケール追従）。\
                 変更は settings.json に永続化され、GUI に即時反映される。",
@@ -3033,9 +3074,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #321 / #357
         json!({
             "name": "tako_limit_service",
-            "description": "ステータスバーの利用制限表示サービスの状態確認・切替・再取得（Issue #321 / #357）。\
+            "description": "ステータスバーの利用制限表示サービスの状態確認・切替・再取得。\
                 ステータスバーの 5h / 7d リミットメーターにどのサービス（claude / codex / agy）の値を表示するかを制御する。\
                 action=status（既定）: 現在の選択サービスと利用可能サービス一覧を返す。\
                 action=set: service で指定したサービスへ切り替える。変更は settings.json に永続化され、GUI に即時反映される。\
@@ -3057,9 +3099,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #333
         json!({
             "name": "tako_telemetry",
-            "description": "エラーレポートの自動送信（テレメトリ）の状態確認・切替（Issue #333）。\
+            "description": "エラーレポートの自動送信（テレメトリ）の状態確認・切替。\
                 tako 内で発生した panic / 重大エラーを PII なしで収集エンドポイントへ送信する。\
                 action=status（既定）: 現在の ON/OFF・直近の送信件数・ログパスを返す。\
                 action=on: テレメトリを有効化する。\
@@ -3077,13 +3120,16 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #868 / #989 / #525 / #1057
         json!({
             "name": "tako_setup_bootstrap",
-            "description": "エージェント CLI（claude / codex / agy）のゼロスタート導入を確認・実行する（Issue #868 / #989）。\
+            "description": "エージェント CLI（claude / codex / agy）のゼロスタート導入を確認・実行する。\
                 **その CLI が入っていない環境で `tako setup` を通すための前段**。\
                 agent で対象の系統を選ぶ（省略時は claude）。\
                 action=status（既定・読み取り専用）は「次に何をすべきか」を next_step で返す\
-                （install = 未導入 / path = PATH に無い / auth = 未ログイン / ready = 導入済み）。\
+                （install = 未導入 / path = PATH に無い / auth = 未ログイン / ready = 導入済み。\
+                人へ見せる一文は next_step_description）。**手順は自分で組み立てず next_step の段から\
+                順に実行する**。\
                 action=status-all（読み取り専用）は 3 系統ぶんをまとめて返すので、\
                 「どれが使える状態か」を 1 回で把握できる。\
                 install_plan には「何をどこに入れるか」（製品名・公式コマンド・取得元・置き場所・\
@@ -3092,11 +3138,11 @@ pub fn tools() -> Vec<Value> {
                 （claude = https://claude.ai/install.sh、codex = https://chatgpt.com/codex/install.sh、\
                 agy = https://antigravity.google/cli/install.sh。Windows は各 install.ps1 相当）。\
                 dry_run=true なら実行せず計画だけ返す。\
-                **Windows で代行できるのは claude だけ**（codex / agy は can_run=false = 状態照会と案内まで。#525）。\
+                **Windows で代行できるのは claude だけ**（codex / agy は can_run=false = 状態照会と案内まで）。\
                 action=path でランチャーの置き場所を「新しく開いたターミナルが見る PATH」へ通す（冪等。\
                 unix はログインシェルの profile、Windows はユーザー環境変数 Path）。\
                 action=undo-path で置いた設定を取り除く。\
-                action=handoff（読み取り専用）は**自動導入が通らなかったときの引き継ぎ計画**を返す（#1057）。\
+                action=handoff（読み取り専用）は**自動導入が通らなかったときの引き継ぎ計画**を返す。\
                 対象以外で導入済みの系統が居れば candidates と prompt が入るので、\
                 tako_orchestrator_spawn / tako_run でその CLI へ prompt を渡して代行させる。\
                 available=false なら fallback の案内（公式コマンド）をユーザーへ提示する。\
@@ -3127,9 +3173,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #88 / #1057
         json!({
             "name": "tako_setup_deps",
-            "description": "任意依存ツール（tmux / psmux / git / tailscale）の検出とその場導入（Issue #88 / #1057）。\
+            "description": "任意依存ツール（tmux / psmux / git / tailscale）の検出とその場導入。\
                 どれも**無くても tako 自体は動く**が、欠けるとリモート接続・セッション完全復元・\
                 git パネルが使えない。action=status（既定・読み取り専用）は各依存の found / \
                 install_command / can_run（tako が導入を代行できるか）/ hint を返す。\
@@ -3158,9 +3205,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #1002
         json!({
             "name": "tako_setup_models",
-            "description": "エージェント CLI が使えるモデルの一覧を返す（Issue #1002）。読み取り専用。\
+            "description": "エージェント CLI が使えるモデルの一覧を返す。読み取り専用。\
                 **モデルを勧める前に必ずこれを引くこと**（学習時点の知識で存在しないモデル名を\
                 提案すると起動が失敗する）。一覧は各 CLI の一覧コマンドから実取得する\
                 （codex = `codex debug models` / agy = `agy models`）。claude は該当コマンドが\
@@ -3184,9 +3232,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #262
         json!({
             "name": "tako_setup",
-            "description": "tako setup を非対話で実行する（Issue #262）。ユーザーが日本語で伝えた好みを answers に変換して代行する。省略項目は detected → previous → default の順で自動解決され、標準ケースは質問ゼロで完走する。instructions / profile / projects / orchestrator / sleep_guard は明示指定時だけ既存値を更新する。",
+            "description": "tako setup を非対話で実行する。ユーザーが日本語で伝えた好みを answers に変換して代行する。省略項目は detected → previous → default の順で自動解決され、標準ケースは質問ゼロで完走する。instructions / profile / projects / orchestrator / sleep_guard は明示指定時だけ既存値を更新する。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3224,17 +3273,29 @@ pub fn tools() -> Vec<Value> {
                     },
                     "orchestrator": {
                         "type": "object",
+                        "description": "config.yaml の orchestrator セクション（master / worker の挙動フラグ）。\
+                            明示したキーだけ更新し、省略したキーは既存値のまま",
                         "properties": {
-                            "auto_close": {"type": "boolean"},
-                            "auto_push": {"type": "boolean"},
+                            "auto_close": {"type": "boolean", "description": "完了した worker のペインを自動で閉じる（既定 true）"},
+                            "auto_push": {"type": "boolean", "description": "master の自動 push を許可する（既定 true）"},
                         },
                         "additionalProperties": false,
                     },
                     "sleep_guard": {
                         "type": "object",
+                        "description": "スリープ防止の初期値（設定後の確認・変更は tako_sleep_guard）。\
+                            明示したキーだけ更新し、省略したキーは既存値のまま",
                         "properties": {
-                            "mode": {"type": "string", "enum": ["off", "on", "while-agents-running"]},
-                            "power": {"type": "string", "enum": ["ac-only", "always"]},
+                            "mode": {
+                                "type": "string",
+                                "enum": ["off", "on", "while-agents-running"],
+                                "description": "off = 無効 / on = 常時保持 / while-agents-running = busy なエージェントペインがある間だけ（既定）",
+                            },
+                            "power": {
+                                "type": "string",
+                                "enum": ["ac-only", "always"],
+                                "description": "有効にする電源条件。ac-only = AC 接続時のみ（既定）/ always = バッテリー駆動でも",
+                            },
                         },
                         "additionalProperties": false,
                     },
@@ -3242,9 +3303,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #94
         json!({
             "name": "tako_setup_changes",
-            "description": "tako setup のアップデート追従状況を照会する（Issue #94）。\
+            "description": "tako setup のアップデート追従状況を照会する。\
                 前回 `tako setup` 完了時に適用したリビジョン（applied_revision）と\
                 バイナリ同梱の setup changelog の現在リビジョンを突き合わせ、\
                 未適用の setup 関連変更（セットアップ項目・設定フォーマット・\
@@ -3258,9 +3320,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #136
         json!({
             "name": "tako_agents_sync_rules",
-            "description": "エージェント共通ルールの同期（#136）。\
+            "description": "エージェント共通ルールの同期。\
                 正本ファイルの内容を各エージェント（claude / codex / agy）のグローバル指示ファイルに\
                 マーカーブロックで埋め込む。ブロック外の既存内容は一切変更しない。\
                 action=sync（既定）: 同期を実行し結果を返す。書き換え前にバックアップ(.bak)を生成する。\
@@ -3287,10 +3350,11 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #134 / #1009
         json!({
             "name": "tako_tree_folder",
-            "description": "ファイルツリーへのフォルダの追加・削除・一覧（#134）と \
-                git ステータスの取得（#1009）。\
+            "description": "ファイルツリーへのフォルダの追加・削除・一覧と \
+                git ステータスの取得。\
                 AI が作業対象プロジェクトのフォルダをファイルツリーに明示追加する。\
                 追加されたフォルダは cwd 由来のエントリと並んでツリーに表示される。\
                 プロジェクトの指示を受けたらそのルートフォルダを追加し、\
@@ -3331,9 +3395,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #112 / #159 / #1069
         json!({
             "name": "tako_sessions",
-            "description": "セッションカタログの参照と会話の復元（Issue #112）。\
+            "description": "セッションカタログの参照と会話の復元。\
                 tako が起動した master / worker / solo / 手動 claude の会話セッションを、\
                 ラベル・ロール・プロジェクト・Issue 番号つきで発見できるインデックス。\
                 会話本文は claude の transcript（~/.claude/projects/）への参照のみ持つ。\
@@ -3341,13 +3406,15 @@ pub fn tools() -> Vec<Value> {
                 action=show: id（前方一致可）のメタ情報 + 会話冒頭の抜粋。\
                 action=resume: ペイン / タブ / 永続化の器（tmux / psmux）が全滅していても、記録された cwd で\
                 新しいペインを分割起動し `claude --resume <session_id>` で会話文脈ごと復元する。\
-                「昨日の #159 の子を呼び戻して」のような依頼は list で特定 → resume で復元する。\
+                「昨日の認証まわりの子を呼び戻して」のような依頼は list で特定 → resume で復元する。\
                 action=link: そのペイン（または id）の会話を Claude 公式アプリ / claude.ai で開くための\
-                session URL を返す（#1069）。「スマホから続きを見たい」に答える経路。\
+                session URL を返す。「スマホから続きを見たい」に答える経路。\
                 応答の remote_link.state は connected（url あり）/ not_connected（まだ繋いでいない）/\
                 ineligible: <理由>（この環境では繋げない）/ unknown（会話が特定できない）で、\
-                繋がっていないときは url を返さない（捏造しない）。繋ぐには\
-                tako_orchestrator_profiles で remote_control: true にしてから起動し直す。\
+                繋がっていないときは url を返さない（捏造しない）。開けない理由は \
+                remote_link.reason、そのまま実行できる手当ては remote_link.next_step / \
+                enable_command にある（繋ぐには tako_orchestrator_profiles で remote_control: true \
+                にしてから起動し直す）。\
                 remote_link.account_label はどの tako アカウント配下のセッションかで、\
                 スマホが別アカウントでログインしていると一覧に出ないので切り分けに使う。\
                 制限: resume / link は claude セッションのみ（codex / agy は list に載るが復元・委譲不可）。",
@@ -3394,9 +3461,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #112
         json!({
             "name": "tako_logs",
-            "description": "ペインの平文ターミナルログの参照・設定（Issue #112）。\
+            "description": "ペインの平文ターミナルログの参照・設定。\
                 全ペインのスクロールバック確定行を平文でローテーション保存しており、\
                 ペイン / タブ / アプリが死んだ後でもビルド・テスト出力を遡れる。\
                 TUI（claude 等）の描画は保存されない（「TUI 実行中」マーカーのみ。\
@@ -3443,9 +3511,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #20
         json!({
             "name": "tako_open_dir",
-            "description": "ディレクトリを新タブで開く（#20）。cwd を設定してシェルを起動し、\
+            "description": "ディレクトリを新タブで開く。cwd を設定してシェルを起動し、\
                 ファイルツリーにフォルダを自動追加する。",
             "inputSchema": {
                 "type": "object",
@@ -3463,15 +3532,16 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #20 / #919 / #1006
         json!({
             "name": "tako_open_remote",
-            "description": "SSH ホストに接続するペインを開く（#20 / #919 / #1006）。~/.ssh/config の Host 名を\
+            "description": "SSH ホストに接続するペインを開く。~/.ssh/config の Host 名を\
                 指定すると、HostName / User / Port 等の設定を尊重して ssh コマンドを実行する。\
                 未定義ホストでも ssh <host> として実行できる。\
-                接続に失敗した場合はペインを閉じずに理由と次の一手を表示する（#919）。\
+                接続に失敗した場合はペインを閉じずに理由と次の一手を表示する。\
                 ツリー側（tako_remote_folder）と同じ接続を共有するので、ここで一度ログインすれば\
                 パスワード認証しか無い相手でもリモートツリーが追加認証なしで開く。\
-                開き先は target で選ぶ（既定 split = いま開いているタブへ新ペイン。#1006）。\
+                開き先は target で選ぶ（既定 split = いま開いているタブへ新ペイン）。\
                 target=pane は**すでにあるペインをそのまま SSH にする**（ペイン ID は変わらず、\
                 接続に失敗してもそのペインのシェルへ戻る）。素のシェルでないペイン\
                 （全画面 TUI・実行中・AI エージェント・プレビュー）は理由つきで断る。",
@@ -3492,7 +3562,7 @@ pub fn tools() -> Vec<Value> {
                     },
                     "target": enum_schema(
                         &tako_core::remote_open::RemoteOpenTarget::VALUES,
-                        "開き先（#1006。省略時 split = いまのタブへ新ペイン / \
+                        "開き先（省略時 split = いまのタブへ新ペイン / \
                          tab = 新しいタブ / pane = 既存ペインをそのまま SSH 化）",
                     ),
                     "pane": {
@@ -3514,17 +3584,18 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #919 / #65 / #966 / #1041 / #976
         json!({
             "name": "tako_remote_folder",
             "description": "リモート（SSH 先）のフォルダをワークスペースとして開く・閉じる・覗く\
-                （#919 / #65。Zed / VSCode の Remote SSH 相当）。ファイルツリーに SSH 先の\
+                （Zed / VSCode の Remote SSH 相当）。ファイルツリーに SSH 先の\
                 ディレクトリ構造が並び、ファイルはプレビューで開いて**編集・保存できる**\
-                （#966。保存は SFTP の一時ファイル + rename でアトミック。開いた時点から\
+                （保存は SFTP の一時ファイル + rename でアトミック。開いた時点から\
                 リモートが変わっていたら上書きせず conflict を返す。書けないファイルは\
                 read_only=true で返る）。\
                 認証は ~/.ssh/config・鍵・ControlMaster をそのまま使う（追加設定なし）。\
                 action: open = 接続してフォルダをツリーへ開く（path 省略でリモートのホーム。\
-                接続に失敗したら開かずに理由を返す。#1041: ツリーの**先頭**（ローカルより前）に\
+                接続に失敗したら開かずに理由を返す。ツリーの**先頭**（ローカルより前）に\
                 並び、同じタブへ SSH 済み + そのフォルダへ cd 済みのターミナルペインも用意する\
                 = VSCode Remote 相当。同じホストへ繋がった生きたペインがあれば作らない。\
                 terminal=false で開くだけにできる。応答の terminal.connected / reason / pane と\
@@ -3537,8 +3608,9 @@ pub fn tools() -> Vec<Value> {
                 mode / mtime で書けるかが分かる。保存は tako_preview_save）/ ssh-pane = そのフォルダで\
                 SSH ペインを開く / pending = リモートへ押し出せていない保存の一覧（切断中の保存は\
                 ここに残るので無言で消えない）/ push = 押し出せていない保存の再試行\
-                （force=true で競合を承知のうえ上書き）/ auto = ペインの ssh を検知した自動追加の\
-                状態を返す（enabled=true/false で切替。#976。ユーザーがペインで `ssh <host>` に\
+                （force=true で競合を承知のうえ上書き。押し出せなかったぶんは failed[] に \
+                kind / error / next_step が入るので next_step に従う）/ auto = ペインの ssh を検知した自動追加の\
+                状態を返す（enabled=true/false で切替。ユーザーがペインで `ssh <host>` に\
                 入ると、そのホストのホームがツリーへ自動で並ぶ。検知した接続の生死・見送った\
                 理由もここで読める）。GUI の「リモートからフォルダを開く」と 1:1。",
             "inputSchema": {
@@ -3571,24 +3643,25 @@ pub fn tools() -> Vec<Value> {
                     },
                     "force": {
                         "type": "boolean",
-                        "description": "push で競合（開いた時点からリモートが変わっている）を承知のうえ上書きする（#966）",
+                        "description": "push で競合（開いた時点からリモートが変わっている）を承知のうえ上書きする",
                     },
                     "enabled": {
                         "type": "boolean",
-                        "description": "auto で自動追加の有効・無効を切り替える（省略で現在値の照会だけ。#976）",
+                        "description": "auto で自動追加の有効・無効を切り替える（省略で現在値の照会だけ）",
                     },
                     "terminal": {
                         "type": "boolean",
-                        "description": "open でターミナルも同じホストへ繋ぐか（#1041。省略時 true。false にすると開くだけ = あとから action=ssh-pane で繋げる）",
+                        "description": "open でターミナルも同じホストへ繋ぐか（省略時 true。false にすると開くだけ = あとから action=ssh-pane で繋げる）",
                     },
                 },
                 "required": ["action"],
                 "additionalProperties": false,
             },
         }),
+        // 出自: #20
         json!({
             "name": "tako_ssh_hosts",
-            "description": "~/.ssh/config の Host 一覧を返す（#20）。ワイルドカード（*）を含む\
+            "description": "~/.ssh/config の Host 一覧を返す。ワイルドカード（*）を含む\
                 エントリは除外される。各ホストの name / hostname / user / port を返す。",
             "inputSchema": {
                 "type": "object",
@@ -3596,9 +3669,13 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #20
         json!({
             "name": "tako_recent",
-            "description": "最近開いたディレクトリ/リポジトリ/SSH ホストの一覧・クリア（#20）。",
+            "description": "最近開いたディレクトリ / リポジトリ / SSH ホストの一覧・クリア。\
+                「この前のあれを開いて」に答える経路で、list で得たパスは tako_open_dir、\
+                ホストは tako_open_remote / tako_remote_folder へそのまま渡せる。\
+                clear は履歴を消すだけで、フォルダ・ホスト・開いているペインには触らない。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3612,9 +3689,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #1450 / #1479
         json!({
             "name": "tako_todo",
-            "description": "ユーザー向けタスク（**人がやること**）の起票・一覧・返答（Issue #1450）。\
+            "description": "ユーザー向けタスク（**人がやること**）の起票・一覧・返答。\
                 承認待ち・生成物のレビュー・権限の確認・宣伝投稿のように\
                 **ユーザーの手が要る**ものはここへ起票する（会話や引き継ぎファイルに溜めない）。\
                 AI 自身のタスクは tako_task_checkpoint / tako_task_gate で、これとは別物。\
@@ -3628,7 +3706,7 @@ pub fn tools() -> Vec<Value> {
                         "type": "string",
                         "enum": ["add", "list", "show", "update", "done", "dismiss", "respond", "expand", "collapse"],
                         "description": "操作種別（省略時 list）。\
-                            expand / collapse は**画面の操作**（#1479）: expand はその 1 件を \
+                            expand / collapse は**画面の操作**: expand はその 1 件を \
                             PC の右パネル tasks ビューでその場に展開し（パネルが閉じていれば開く）、\
                             collapse は畳む。ユーザーに「これを見てほしい」と言うときに使う",
                     },
@@ -3666,9 +3744,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #242
         json!({
             "name": "tako_task_checkpoint",
-            "description": "タスクチェックポイントの記録・更新（Issue #242）。\
+            "description": "タスクチェックポイントの記録・更新。\
                 worker タスクの進行状態（Issue 番号・ブランチ・フェーズ・直近コミット等）を \
                 永続化し、クラッシュ・利用上限・API 切断からの resume を可能にする。\
                 task_id を省略すると自動採番される。既存の task_id を指定すると上書き更新する。",
@@ -3691,9 +3770,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #242
         json!({
             "name": "tako_task_list",
-            "description": "タスクチェックポイントの一覧（Issue #242）。\
+            "description": "タスクチェックポイントの一覧。\
                 永続化された全チェックポイントを updated_at の新しい順に返す。\
                 phase で絞り込み可能（例: suspended で中断中のタスクだけ表示）。",
             "inputSchema": {
@@ -3704,9 +3784,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #242
         json!({
             "name": "tako_task_resume",
-            "description": "チェックポイントから worker を再開する（Issue #242）。\
+            "description": "チェックポイントから worker を再開する。\
                 指定した task_id のチェックポイントを読み、元の branch / cwd / issue コンテキストを \
                 resume プロンプトに含めて新しいペインに worker を spawn する。\
                 モデルを変更して再開することも可能（usage_limit 後に別モデルへ切り替え等）。\
@@ -3723,9 +3804,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #244
         json!({
             "name": "tako_task_gate",
-            "description": "受け入れゲートの定義（Issue #244）。\
+            "description": "受け入れゲートの定義。\
                 タスクに機械検証可能な受け入れ条件（述語）を設定する。\
                 Command 述語はシェルコマンドの exit code、PrMerged は PR のマージ状態、\
                 Custom は人間判断で判定する。\
@@ -3755,9 +3837,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #244
         json!({
             "name": "tako_task_gate_check",
-            "description": "受け入れゲートの述語を実行し、結果を記録する（Issue #244）。\
+            "description": "受け入れゲートの述語を実行し、結果を記録する。\
                 Command 述語はシェルコマンドを実行し exit code で判定、\
                 PrMerged 述語は gh pr view で PR のマージ状態を判定する。\
                 Custom 述語はスキップされる（手動で tako_task_gate の record_results で設定）。\
@@ -3772,9 +3855,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #244
         json!({
             "name": "tako_task_gate_show",
-            "description": "受け入れゲートの状態を表示する（Issue #244）。\
+            "description": "受け入れゲートの状態を表示する。\
                 各 criterion の id / kind / status / evidence / checked_at と、\
                 overall（pending / passed / failed）を返す。",
             "inputSchema": {
@@ -3786,9 +3870,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #305
         json!({
             "name": "tako_run_interactive",
-            "description": "ユーザー入力が必要なコマンドを可視ペインに委譲する（Issue #305）。\
+            "description": "ユーザー入力が必要なコマンドを可視ペインに委譲する。\
                 sudo パスワード・ブラウザ認証・対話プロンプト等、AI が直接入力できない操作を \
                 split -> タイトル設定 -> コマンド投入までアトミックに実行し、pane_id を返す。\
                 コマンドは exit code 回収マーカーでラップされるため、完了後に \
@@ -3832,9 +3917,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #305
         json!({
             "name": "tako_run_interactive_status",
-            "description": "run-interactive で起動したペインの完了状態を確認する（Issue #305）。\
+            "description": "run-interactive で起動したペインの完了状態を確認する。\
                 ペイン出力から exit code マーカーを探し、見つかれば exit code と auto_close の \
                 結果を返す。見つからなければ status: running を返す。\
                 完了検知後、auto_close 方針に従いペインを自動 close する（success: exit 0 のみ / \
@@ -3852,9 +3938,10 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         // --- Code Runner (FR-3.18, #453) ---
+        // 出自: #453
         json!({
             "name": "tako_run",
-            "description": "ファイルを実行する（Code Runner: FR-3.18, #453）。\
+            "description": "ファイルを実行する（Code Runner: FR-3.18）。\
                 ファイル内の tako:run 宣言または拡張子既定コマンドで新ペインを分割して実行する。\
                 \n\n## tako:run 宣言の書式\n\
                 ファイル先頭 64 行以内に以下の形式でコメント内に記述する:\n\
@@ -3922,9 +4009,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #453
         json!({
             "name": "tako_run_resolve",
-            "description": "ファイルの実行プロファイル一覧を解決して返す（実行しない。FR-3.18, #453）。\
+            "description": "ファイルの実行プロファイル一覧を解決して返す（実行しない。FR-3.18）。\
                 ファイル内宣言と拡張子既定から検出されたプロファイル一覧・コマンド・cwd・source を返す。\
                 UI のドロップダウンと同じデータ。tako_run 実行前の事前確認に使う。",
             "inputSchema": {
@@ -3940,9 +4028,10 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #453
         json!({
             "name": "tako_run_defaults",
-            "description": "拡張子ごとの実行コマンド既定を一覧/設定/削除する（FR-3.18, #453）。\
+            "description": "拡張子ごとの実行コマンド既定を一覧/設定/削除する（FR-3.18）。\
                 ext を省略すると全一覧。ext のみで単一情報。ext + command で設定。ext + remove で削除。",
             "inputSchema": {
                 "type": "object",

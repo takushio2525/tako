@@ -2479,7 +2479,7 @@ AI が**起動した瞬間に強制ロードされるもの**には上限があ�
   プロファイルの `prompt_blocks.append`（個人環境のルール）の取り分。追記がこれを超えると
   `tako migrate` が見出し境界へ `<!-- tako:on-demand -->` を入れ、その行より後ろは
   `tako orchestrator guide local-rules` で引く形になる（**内容は 1 文字も消さない**）
-- **MCP で公開するツールカタログは 210 KB 以内**（`tools/list` の応答）。
+- **MCP で公開するツールカタログは 200 KB 以内**（`tools/list` の応答）。
   MCP を繋いだエージェント全員が起動時に名前 + 説明 + inputSchema の全文を受け取る
   tako 自身の生成物なので、超えたらツールを隠すのではなく 1 本ずつの説明文を短くする
 
@@ -2602,6 +2602,48 @@ OS のシェルに食われてユーザーはリンクへ到達できない（#7
   `platform: true` を直書きすると**実装だけ Ctrl へ移って Windows のセルフテストが落ちる**
 - 番犬は `crates/tako-control/tests/issue763_link_modifier_watchdog.rs`（4 規則:
   ホバー呼び出しの実引数 / クリック判定の `if` 条件 / マウスハンドラ本体 / 合成イベント）
+
+## MCP カタログの説明文は AI が使える情報だけ載せる（Issue #1540）
+
+`tools/list` の応答は **MCP を繋いだエージェント全員が起動した瞬間に全文を受け取る**
+固定費で、予算表の中で最大（`AGENTS.md`「起動時ロードの予算」節）。
+ここへ書く文は「AI がその場で行動を決められるか」だけで採否を決める。
+
+### 書かないもの
+
+- **Issue 番号（`#1234` / `Issue #1234`）**: AI は番号から Issue を引けないので、
+  トークンだけ食って情報を運ばない。実測で 152 本中 83 本・195 箇所あった。
+  **根拠は `catalog.rs` のソースコメント `// 出自: #…` へ残す**（情報は失わず、
+  ロードされる文だけ軽くする）。番犬は
+  `crates/tako-control/tests/mcp_catalog_snapshot.rs` の
+  `mcp説明文にissue番号を書かない`（description / inputSchema の全文字列を見る）
+- **歴史的経緯**（「かつては〜だった」「〜する手段がなかったが」）: 今の挙動だけ書く
+- **他のツールにある背景説明の再掲**: 正本を 1 本決めて「読み方は tako_xxx の説明」と
+  参照する（送達フロー `delivery` の項目説明は `tako_read_pane` が正本、
+  選択肢ダイアログの番号縛りは `tako_orchestrator_respond` が正本）
+- **引数ごとに繰り返す共通の但し書き**（`（set 時）` を 20 引数に付ける等）:
+  ツールの description へ 1 回だけ書いて引数からは落とす
+
+### 必ず残すもの（圧縮は削除ではない）
+
+1. **いつ使う**（どんな状況で呼ぶツールか）
+2. **何が返る**（応答のキー名と enum の受理値。AI が分岐に使うので略さない）
+3. **前提ツール**（引数の出どころ。`tab` は `tako_list_panes`、`worker` は
+   `tako_orchestrator_spawn` の返り値、といった導線）
+4. **失敗時**（何がエラーになるか、`next_step` / `recommended_action` をどう読むか）
+
+### `next_step` を返すなら説明に読み方を書く
+
+dispatch が `next_step` / `degraded` を返す経路は、**そのまま実行できる手順**を
+文字列で持っている（`#1049` で「劣化を埋もれさせない」と決めた形）。
+主たる利用者は AI なので、返す側のツールの説明に
+「自分で手順を組み立てず next_step に従う」を明記する。現在の該当は
+`tako_remote_status`（`degraded.reason` / `degraded.next_step`）/
+`tako_context_budget`（`violations[].next_step`）/ `tako_setup_bootstrap`（`next_step`）/
+`tako_orchestrator_profiles` / `tako_git_resolve_agent`（`remote_control_blocked.next_step`）/
+`tako_orchestrator_spawn`（`launch_warnings[].next_step`）/
+`tako_sessions`（`remote_link.next_step`）/ `tako_remote_folder`（`failed[].next_step`）/
+`tako_ui_mode`（`pane_display_reason[].next_step`）。
 
 ## MCP カタログの enum は正本から生成する（Issue #1467）
 
