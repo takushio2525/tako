@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-22（#1524: 標準 tako setup の依存 [y/N] を setup_deps::offer_and_install の 1 呼び出しへ寄せた）
-- #1499 は判断 / 実行 / 再検出を寄せたが**表示と入力は呼び手に残し**、#1509 が束ねた `offer_and_install` も #1501 と同時進行だったため標準 setup は差分ゼロのままだった（体験を組む層が 2 か所）。`setup.rs` の `offer_dep_install` / `print_dep_install_plan` / `print_dep_manual_hint` を消し、`DepPromptIo`（stderr + stdin + 字下げ 6 マス）を渡す 1 呼び出しへ。再検出も中で済むので `resolve` の 2 度引き（ログインシェル起動）と `find_command("brew")` の先引きが各 1 回消えた
-- 同時に判明 = `[警告] … インストール後も検出できません` は**到達しない分岐**だった（導入器が成功して引けないときは `install` が `Err` を返し `[警告] {e}` 側へ落ちる）。実測でも before / after とも 0 件なので削除した
-- 実測: 隔離実走 13 本の出力が**バイト単位で一致**（文面の差分 0）。`test-setup-deps-prompt-1499.sh` 52 PASS / `test-remote-setup-deps-1509.sh` 49 PASS / `test-setup-continue-1501.sh` 81 PASS / `test-tako-cli-path-1502.sh` 49 OK。番犬 `issue1524_setup_prompt_single_impl_watchdog` 4 本・注入 10 通りすべて FAILED → 戻して緑。workspace 5107 passed 0 failed・clippy 3 宇宙 0・check-windows error 0
-
 ## 2026-09-22（#1525: AGENTS.md の予算の余地を作り、activeContext を現在状態へ戻した）
 - 予算の主因はコマンド表ではなく**リリース運用の本文**（71 行 6121 バイト）だった。両 OS 同時 / 夜間リリース / 版数の予約を `.agent/release.md`（新設）へ移し、AGENTS.md には不変条件 2 行 + バックティック参照だけを残した（`@import` にはしない）。表からは実測値（45c / 95c）と診断オプション列挙の 2 行ぶんを `commands.md` の同じ行へ寄せた
 - 実測: **30657 → 25309 バイト**（上限 30720 の 99.8% → 82.4%）。消えた実質 65 行のうち 63 行は release.md に全文一致で残り、残る 2 行は commands.md 側にセル単位で全文あり = **消えた情報 0**。`context_budget` 11 passed / `no_personal_data` 6 passed / fmt 差分なし / docs 生成 2 本とも同期
@@ -54,3 +49,8 @@
 - 旧ページは **#1502 が明示的に否定した PATH 手順**（`.app` の実行ファイル置き場を `~/.zshrc` の `export PATH` へ）を読者に指示し続け、同じページ内で「CLI は導入しない」（トラブルシューティング）と「導入 → PATH → ログインの 3 段を案内する」（tip）が矛盾していた。FR-2.14.5 の現行仕様（`$HOME/.local/bin/tako` の symlink + `~/.zprofile`）へ差し替え、旧手順を踏んだ読者向けに「その行は消してよい」の移行案内を足した
 - 任意依存が `[y/N]` で導入まで通ること（#1499 / #1509 / #1524）と、詰まった段があっても止まらず「残り N 件」で終わること（FR-2.14.12 = #1501）を追記。`--version` / `--changes` / `--check` の例は現行ビルド（v0.8.17 / rev 19）の実出力へ。「質問ゼロ」3 行を言い直し、次のステップに `/features/remote/` と `/guides/keyboard-shortcuts/` を足した
 - 実測: 貼った `--check` は隔離 HOME の再実行と**マスク以外バイト単位で一致**（49 行）・`Contents/MacOS` は docs 全体で 0 hit・`npm run build` 32 ページ警告 0・`verify-og` 31 ページ OK
+
+## 2026-09-23（#1546: releases.md に v0.8 系を書き、最新の安定版の位置を移した）
+- Issue の「現行 v0.8.17」は実態と違った: `gh release view` で v0.8.0 だけ `isPrerelease=false`（Latest）、v0.8.1〜v0.8.17 は全部 prerelease。夜間リリースは常にテスト版で出て昇格は `release.sh --promote` の手動（`.agent/release.md`）なので、見出しは「v0.8 系（2026-08-28 〜）— 最新の安定版は v0.8.0」とし、2 種類の関係を節冒頭に表 1 枚で置いた。柱は 4 つ（リモート刷新 / ユーザータスク / setup の代行化 / エージェント間の同等化）
+- ブリーフの柱から 2 件を落とした: **#1500 は 9/22 着地だが v0.8.17（9/22 05:00 の夜間版）に載っておらず CHANGELOG にも節が無い = 未リリース**（代わりに v0.8 で実際に出た #1057 / #989 / #1002 で組んだ）。Web ビューは v0.4.0 の機能で v0.8 にあるのは #1481 の修正だけ。本文の記述 60 件はすべて Issue 番号で CHANGELOG の v0.8 範囲と機械照合（不一致 0）
+- 番犬 `docs/scripts/check-releases-page.mjs` を新設し CI の macOS ジョブへ 1 ステップ。現行の版は **Cargo.toml / CHANGELOG / git tag の最大値**（checkout は `fetch-depth: 1` でタグを持たないので Cargo.toml が主）。落ちるのは A 系列の節が無い / B 先頭でない / C ラベルが古い節に残る、の 3 つ。注入 4 通り落ちる + 偽陽性 1 通り通る。docs ビルド 32 ページ成功・警告 0 → 0・初稿の `**…（日付）**です` が right-flanking 条件を満たさず素の `**` で出ていたのを実測で発見して修正

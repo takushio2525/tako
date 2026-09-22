@@ -80,6 +80,13 @@ jobs:
       # 版の突き合わせ・TAKO_BIN・実装 1 か所が壊れたらここで落ちる
       - name: docs 生成が選ぶ tako バイナリのテスト
         run: bash scripts/test-gen-docs-bin-1548.sh
+      # リリースノートのページが現行の版から取り残されるのを止める。v0.8.0 が出てから
+      # 25 日間、ページの見出しは「v0.7.0（2026-08-15）— 最新の安定版」のままだった
+      # （#1546）。「最新の安定版」= GitHub Releases で Latest が付く版なので、夜間の
+      # テスト版（prerelease）が進んでもラベルは動かさない。現行の版は Cargo.toml /
+      # CHANGELOG / git tag の最大値から採る（checkout はタグを持たないので Cargo.toml が主）
+      - name: リリースノートのページが現行の版に追いついている
+        run: node docs/scripts/check-releases-page.mjs
       # リリース経路（gh release create のリトライ / 両 OS の待ち合わせ / 片肺の検出）の
       # モックテスト。ダミー gh を PATH に挿すので本番の Release には触らない。
       # **片肺リリースの検出が壊れたらここで落ちる**（#256 / #965）
