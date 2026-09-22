@@ -1,0 +1,6 @@
+# tako 公式ドキュメント（Issue #1547）
+# sitemap は Astro が毎ビルド生成しているが、どこにあるかを告知していなかった。
+User-agent: *
+Allow: /
+
+Sitemap: https://tako.takushio2525.com/sitemap-index.xml

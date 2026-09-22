@@ -26,7 +26,9 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: web/tako-remote/package-lock.json
+          cache-dependency-path: |
+            web/tako-remote/package-lock.json
+            docs/package-lock.json
       # rust_embed が web/tako-remote/dist/ をコンパイル時に埋め込むため、
       # cargo の全ステップ（clippy 含む）より前に PWA をビルドする必要がある。
       # dist/ は .gitignore 対象なのでクリーンチェックアウトには存在しない（Issue #574）。
@@ -34,6 +36,34 @@ jobs:
       - name: PWA をビルド（rust_embed が dist/ を要求する）
         working-directory: web/tako-remote
         run: npm ci --no-audit --no-fund && npm run build
+      # docs サイトは **Cloudflare Pages がビルドを代行**していたので、CI では
+      # 1 度も astro build を通していなかった（`og:verify` と内部リンク検査に
+      # 至ってはどこからも走っていない）。npm ci 2 秒 + build 3.5 秒なので
+      # ここで通す。**Rust より前に置く**のは、docs の壊れがビルド 40 分の
+      # 後ろに隠れないようにするため（#1547）
+      - name: docs をビルド（robots.txt の同梱まで見る。#1547）
+        working-directory: docs
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+          test -f dist/robots.txt
+      # OG / Twitter Card（ページごとの固有画像・自ページを指す og:url）。
+      # 焼き忘れると SNS で全ページがトップの画像になる
+      - name: docs の OG 画像を検査（#1547）
+        working-directory: docs
+        run: npm run og:verify
+      # 内部リンクと断片（`/agent-support/#...`）。生成ページは件数で見出しが
+      # 変わるので、手書きページからのアンカーが静かに切れる（#1547）
+      - name: docs の内部リンクを検査（#1547）
+        working-directory: docs
+        run: node scripts/verify-links.mjs
+      # docs と能力マトリクスが「追跡先」として貼る Issue が open か。
+      # 閉じた Issue を指したままだと、読む側が残りの仕事を辿れなくなる
+      # （#1547 の棚卸しでは docs の Issue 参照 17 件のうち 10 件が closed だった）
+      - name: 追跡先の Issue が閉じていない（#1547）
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/check-docs-issue-refs.sh
       # rust-toolchain.toml と同じバージョンをピン（git 版 gpui が新しめの stable を要求）
       - uses: dtolnay/rust-toolchain@master
         with:

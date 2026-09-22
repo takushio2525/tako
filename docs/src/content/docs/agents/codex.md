@@ -63,7 +63,7 @@ tako orchestrator spawn --agent codex --project app --prompt "テストを通し
 worker からも tako の MCP ツールを呼べます。`tako_list_panes` や、ペインを省略した `tako_set_title` が自分のペインに当たります。
 
 :::caution[モデル名は指定するか、指定しないか]
-プロファイルに claude 用のモデル名が入っていても codex には渡しません（渡すと存在しないモデル名で起動してしまうため。[#1013](https://github.com/takushio2525/tako/issues/1013)）。codex のモデルを決めたいときは次のどちらかにしてください。
+プロファイルに claude 用のモデル名が入っていても codex には渡しません（渡すと存在しないモデル名で起動してしまうため。実際に `codex --model claude-opus-5` で起動していたのを [#1013](https://github.com/takushio2525/tako/issues/1013) で直しました）。codex のモデルを決めたいときは次のどちらかにしてください。
 
 ```bash
 tako orchestrator profiles set default --agent codex --agent-model <モデル名>   # 既定にする
@@ -75,7 +75,7 @@ tako orchestrator spawn --agent codex --model <モデル名> --project app --pro
 
 ## Claude Code との差分
 
-現時点で 47 件中 32 件が「対応」です。全件の内訳と理由は [OpenAI Codex CLI を選ぶと落ちるもの](/agent-support/#openai-codex-cli-を選ぶと落ちるもの) にあります。手元で最新を引くなら次を実行してください。
+現時点で 52 件中 36 件が「対応」です（一部対応 4 件・未対応 9 件・対象外 3 件）。全件の内訳と理由は [OpenAI Codex CLI を選ぶと落ちるもの](/agent-support/#openai-codex-cli-を選ぶと落ちるもの) にあります。手元で最新を引くなら次を実行してください。
 
 ```bash
 tako agent-support --agent codex
@@ -83,7 +83,7 @@ tako agent-support --agent codex
 
 とくに効くのは次の 3 点です。
 
-- **会話の復元がまだ配線されていません**。`tako sessions resume` と、PC 再起動後にペインを会話ごと戻す復元は claude 専用です。codex のペインは再起動後に新しいシェルになります（[#984](https://github.com/takushio2525/tako/issues/984) / [#1238](https://github.com/takushio2525/tako/issues/1238)。手段自体は上流にあり、`codex resume` を手で実行すれば戻せます）
+- **PC 再起動後の復元は会話ごと戻りますが、会話の選び直しはまだできません**。再起動をまたぐ復元は [#1238](https://github.com/takushio2525/tako/issues/1238) で codex にも配線され、ペインは `codex resume <id>` で会話を持ったまま戻ります（会話 ID を `lsof` で採るので **Windows は対象外**です）。過去の会話を一覧から選び直す `tako sessions resume` と、会話を保ったまま CLI だけ建て直す `tako session-restart` は claude 専用のままです（追跡: [#975](https://github.com/takushio2525/tako/issues/975)）
 - **tako 側からアカウントを切り替えられません**。設定ファイルの置き場が固定のためです（[#975](https://github.com/takushio2525/tako/issues/975)）
 - **ワークスペースのクレジットが尽きたときは自動で再開しません**。5 時間 / 週の枠は解除を待って自分で再開しますが、クレジット切れには「待つ」出口が無いので tako は何も選ばずに止まります
 

@@ -3,7 +3,7 @@ title: Claude Code
 description: tako の基準となるエージェント CLI。導入からログイン、MCP 接続、worker としての使い方まで
 ---
 
-`claude`（Claude Code）は **tako が基準にしている系統**です。tako のすべての機能はまず Claude Code で実装され、ほかの系統はそこへ追いつく形で作られています。落ちる機能はありません（[対応状況](/agent-support/) の 47 件すべてが「対応」）。
+`claude`（Claude Code）は **tako が基準にしている系統**です。tako のすべての機能はまず Claude Code で実装され、ほかの系統はそこへ追いつく形で作られています。落ちる機能はありません（[対応状況](/agent-support/) の 52 件すべてが「対応」）。
 
 ## 入れる
 
