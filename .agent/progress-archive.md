@@ -458,3 +458,5 @@
 - 2026-09-22 #1509: remote setup の Tailscale 導入を setup_deps の 1 実装へ寄せた
 - 2026-09-22 #1524: 標準 tako setup の依存 [y/N] を setup_deps::offer_and_install の 1 呼び出しへ寄せた
 - 2026-09-22 #1525: AGENTS.md の予算の余地を作り、activeContext を現在状態へ戻した
+- 2026-09-22 #1503: agent CLI の probe に待ち時間の上限を付けた
+- 2026-09-22 #1548: docs 生成が古い tako バイナリを黙って選ばないようにした
