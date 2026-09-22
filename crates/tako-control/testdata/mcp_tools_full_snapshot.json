@@ -2198,7 +2198,7 @@
           "type": "string"
         },
         "topic": {
-          "description": "引く topic（省略時は一覧。context-budget / task-intake / worker-prompt / spawning / monitoring / acceptance / lifecycle / handoff / remote / user-tasks / tools / quality-ops / behavior / delegation / local-rules）",
+          "description": "引く topic（省略時は一覧。context-budget / task-intake / worker-prompt / spawning / monitoring / acceptance / lifecycle / handoff / remote / user-tasks / tools / quality-ops / behavior / delegation / local-rules / platform）",
           "type": "string"
         }
       },

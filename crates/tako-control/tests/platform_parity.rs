@@ -325,24 +325,47 @@ mod prompt_single_source {
         }
     }
 
-    /// 縮退の説明はマトリクス由来なので、Windows 版には理由が列挙される
+    /// 縮退の説明はマトリクス由来（#516 の単一ソース）。**行き先は #1571 で prompt から
+    /// 手順書 `platform` へ移った**ので、拘束も 2 つに分ける:
+    /// 理由の全文は手順書側でマトリクスと 1 行ずつ一致し、prompt 側には
+    /// 件数と引き方だけが入る（縮退を 1 件足すたびに prompt が伸びる構造をやめた）
     #[test]
-    fn windows版には縮退理由がマトリクスから入る() {
+    fn windows版の縮退理由はマトリクスから手順書へ入る() {
         let notes = tako_core::platform::support::degraded_note_items(Platform::Windows);
         assert!(!notes.is_empty());
+        let facts = PlatformFacts::for_platform(Platform::Windows);
+
+        // ① 手順書 `platform` の本文 = マトリクスの理由が順番どおり 1 行ずつ
+        let listed: Vec<String> = facts
+            .full_section_in(Lang::Ja)
+            .lines()
+            .filter_map(|l| l.strip_prefix("- "))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            listed,
+            notes.iter().map(|n| n.ja().to_string()).collect::<Vec<_>>(),
+            "手順書の本文がマトリクスと一致しない（単一ソースが切れている）"
+        );
+
+        // ② prompt 側（master / solo とも）には理由を載せず、件数と引き方だけを置く
         for (name, src) in sources() {
-            let win = render_in(
-                src,
-                &PlatformFacts::for_platform(Platform::Windows),
-                Lang::Ja,
-            );
+            let win = render_in(src, &facts, Lang::Ja);
             for note in &notes {
                 assert!(
-                    win.contains(note.ja()),
-                    "{name}: 縮退理由 {:?} が prompt に入っていない",
+                    !win.contains(note.ja()),
+                    "{name}: 縮退理由 {:?} が prompt に残っている（#1571 で手順書 `platform` へ移した）",
                     note.ja()
                 );
             }
+            assert!(
+                win.contains(&format!("{} 件の理由", notes.len())),
+                "{name}: 縮退の件数が prompt に無い"
+            );
+            assert!(
+                win.contains("tako orchestrator guide platform"),
+                "{name}: 理由の引き方が prompt に無い（載せないなら引けなければならない）"
+            );
         }
     }
 }
