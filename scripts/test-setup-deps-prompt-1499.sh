@@ -70,11 +70,13 @@ EOF
 # 後ろでも聞くので、これが無いと PTY の時間切れに頼る形になる）
 setup_pty(){   # setup_pty <出力先> <answers...> -- <tako の引数...>
   local out="$1"; shift
+  # 答えを 1 つも渡さない呼び出しがあるので、**空配列の展開**を守る形で書く
+  # （macOS 同梱の bash 3.2 は `set -u` 下で空配列の `"${arr[@]}"` を未定義扱いにする）
   local answers=() ; while [ "${1:-}" != "--" ]; do answers+=(--answer "$1"); shift; done; shift
   env -i HOME="$SANDBOX/home" TAKO_DATA_DIR="$SANDBOX/d" TAKO_ISOLATED=1 \
       SHELL="$BIN/isosh" TAKO_TMUX_BIN="$BIN/tmux" ${LEGACY:+TAKO_1499_LEGACY=1} \
       PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TERM=dumb LANG=ja_JP.UTF-8 \
-      python3 "$PTY" "${answers[@]}" ${STOP_AFTER:+--stop-after "$STOP_AFTER"} \
+      python3 "$PTY" ${answers[@]+"${answers[@]}"} ${STOP_AFTER:+--stop-after "$STOP_AFTER"} \
       --timeout 60 -- "$TAKO" "$@" > "$out" 2>&1
   echo $?
 }

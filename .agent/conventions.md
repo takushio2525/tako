@@ -1679,6 +1679,27 @@ echo "        ${registered}（${note}）"  # ○
 grep -nE '\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]' scripts/*.sh scripts/lib/*.sh
 ```
 
+## テストスクリプトは macOS 同梱の bash 3.2 で通す（Issue #1499）
+
+**CI の macOS ランナーが `scripts/test-*.sh` を走らせるのは `/bin/bash`（3.2.57）**で、
+Homebrew の bash 5 が入っている開発機とは**空配列の扱いが違う**。3.2 は `set -u` の下で
+**空配列の `"${arr[@]}"` を「未定義」として落とす**（5.x は空展開して通る）。
+
+```bash
+set -u
+args=()
+cmd "${args[@]}"                 # ✗ bash 3.2: args[@]: unbound variable
+cmd ${args[@]+"${args[@]}"}      # ○ 空なら何も渡さない（3.2 / 5.x 共通）
+```
+
+手元で緑・CI で赤になる典型で、`bash -n` では見つからない（その行が
+**空のまま**実行されるまで潜伏する）。`scripts/release.sh` / `scripts/merge-pr.sh` は
+以前からこの慣用句で書かれている。#1499 の実測は PR の CI で `PASS=43 FAIL=9`、
+`/bin/bash` で同じ結果を再現 → 慣用句へ直して `PASS=52 FAIL=0`。
+
+**新しいテストスクリプトは push 前に `/bin/bash <script>` で 1 回通す**
+（`bash <script>` は開発機では 5.x に解決されるので検査にならない）。
+
 ## `.app` の差し替えは置き場のパスを空けない（Issue #1042）
 
 **`/Applications/tako.app` を差し替えるときに、そのパスが空になる瞬間を作ってはいけない。**
