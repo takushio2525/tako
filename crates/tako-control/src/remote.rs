@@ -1235,7 +1235,10 @@ struct PaneMapping {
     backend_to_pane: HashMap<String, u64>,
     /// tako PaneId → app の List 応答のペイン情報（API v2 用）
     pane_info: HashMap<u64, Value>,
-    updated_at: std::time::Instant,
+    /// 最後に更新した時刻。**一度も更新していなければ `None`**（= 期限切れ扱い）。
+    /// 旧実装は「必ず期限切れ」を `Instant::now() - 999 秒`（過去の時刻を捏造する形）で
+    /// 表していたので、**ブートから 999 秒未満のマシンで panic した**（#1627）
+    updated_at: Option<std::time::Instant>,
 }
 
 #[allow(dead_code)]
@@ -1246,13 +1249,15 @@ impl PaneMapping {
         Self {
             backend_to_pane: HashMap::new(),
             pane_info: HashMap::new(),
-            updated_at: std::time::Instant::now() - std::time::Duration::from_secs(999),
+            updated_at: None,
         }
     }
 
     #[allow(dead_code)]
     fn is_stale(&self) -> bool {
-        self.updated_at.elapsed() > PANE_MAPPING_TTL
+        // 一度も更新していない = 期限切れ（初回は必ず取り直す）
+        self.updated_at
+            .is_none_or(|t| t.elapsed() > PANE_MAPPING_TTL)
     }
 
     /// IPC List の結果からマッピングを更新する
@@ -1276,7 +1281,7 @@ impl PaneMapping {
                 }
             }
         }
-        self.updated_at = std::time::Instant::now();
+        self.updated_at = Some(std::time::Instant::now());
     }
 
     /// tako PaneId（数値）→ 器のセッション名。
@@ -8160,6 +8165,28 @@ mod tests {
         assert_eq!(
             mapping.resolve_tmux_target("sess:0.1").as_deref(),
             Some("sess:0.1")
+        );
+    }
+
+    /// #1627: 初期状態は**期限切れ**（初回は必ず取り直す）。
+    ///
+    /// 旧実装はこれを `Instant::now() - 999 秒` = 過去の時刻を作ることで表していたので、
+    /// **ブートから 999 秒未満のマシンで panic した**（`Instant` の起点はブート）。
+    /// `Option<Instant>` の `None` へ移したので、`is_none_or` が `is_some_and` へ
+    /// 1 語ずれたらここが落ちる
+    #[test]
+    fn pane_mappingの初期状態は期限切れ() {
+        let mut mapping = PaneMapping::new();
+        assert!(
+            mapping.is_stale(),
+            "一度も更新していないマッピングは期限切れ扱い"
+        );
+        mapping.update_from_list(&json!({
+            "tabs": [{ "id": 1, "panes": [{ "id": 42, "tmux_session": "tako-deadbeef" }]}]
+        }));
+        assert!(
+            !mapping.is_stale(),
+            "更新直後は期限内（TTL は {PANE_MAPPING_TTL:?}）"
         );
     }
 
