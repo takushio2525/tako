@@ -14,15 +14,28 @@
 //!
 //! 数字の拾い方（前後の文面に依存する）が壊れて黙って通るのを避けるため、
 //! **期待した記述が見つからないことも FAILED**にする。
+//!
+//! Issue #1547 で 2 つ足した:
+//!
+//! - トップページの**ヒーロー統計**（同じページの本文が 152 を名乗るそばで 128 を
+//!   配信していた。見ていたのは本文だけだった）
+//! - **手書きのエージェント 4 ページ**が名乗る能力件数（正本は
+//!   `tako_core::agent_support::MATRIX`。47 → 52 になったあと 4 ページとも 47 のままだった）
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+
+use tako_core::agent_support::{self, Agent};
 
 const MCP_TOOLS_PAGE: &str = "docs/src/content/docs/guides/mcp-tools.md";
 const CLI_PAGE: &str = "docs/src/content/docs/guides/cli-reference.md";
 const MCP_SERVER_PAGE: &str = "docs/src/content/docs/features/mcp-server.md";
 const INDEX_PAGE: &str = "docs/src/content/docs/index.mdx";
 const CLI_MAIN: &str = "crates/tako-cli/src/main.rs";
+const AGENT_CLAUDE_PAGE: &str = "docs/src/content/docs/agents/claude.md";
+const AGENT_CODEX_PAGE: &str = "docs/src/content/docs/agents/codex.md";
+const AGENT_AGY_PAGE: &str = "docs/src/content/docs/agents/agy.md";
+const AGENT_LOCAL_PAGE: &str = "docs/src/content/docs/agents/local-llm.md";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -224,6 +237,51 @@ fn check_claims(claims: &[Claim], expected: usize, what: &str) {
     );
 }
 
+/// 期待値を claim ごとに持つ版（`check_claims` は 1 つの期待値を全 claim へ配るので、
+/// 「同じページの中で数が違う 5 つ」を見られない）。Issue #1547
+struct CountClaim {
+    file: &'static str,
+    before: &'static str,
+    after: &'static str,
+    expected: usize,
+    what: &'static str,
+}
+
+fn check_count_claims(claims: &[CountClaim], issue: &str) {
+    let mut problems = Vec::new();
+    for claim in claims {
+        let text = read(claim.file);
+        let hits = claimed_numbers(&text, claim.before, claim.after);
+        if hits.is_empty() {
+            problems.push(format!(
+                "  {}: 「{}<数>{}」という記述が見つからない\
+                 （docs の文面が変わったか、番犬の拾い方が古い）",
+                claim.file, claim.before, claim.after
+            ));
+            continue;
+        }
+        for (line, value) in hits {
+            if value != claim.expected {
+                problems.push(format!(
+                    "  {}:{}: {}を「{}」と書いてあるが実装は {} 件",
+                    claim.file, line, claim.what, value, claim.expected
+                ));
+            }
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "docs が名乗っている件数が実装と合っていない（{issue}）\n{}\n\
+         再計測: cargo test -p tako-control --test docs_tool_inventory -- --nocapture",
+        problems.join("\n")
+    );
+}
+
+/// マトリクスでその系統がその状態になっている能力の数
+fn matrix_count(agent: Agent, status: &str) -> usize {
+    agent_support::features(agent, Some(status)).len()
+}
+
 /// `text` に `token` が「識別子として独立して」出てくるか
 /// （`tako_setup` が `tako_setup_mcp` の一部として出ているだけなら false）
 fn contains_token(text: &str, token: &str) -> bool {
@@ -346,6 +404,14 @@ fn docsが名乗るmcpツール数が実装と一致する() {
                 before: "公開している ",
                 after: " ツールの全リスト",
             },
+            // トップページのヒーロー統計（#1547）。**本文の「152 個」だけを見ていて
+            // ここを見ていなかった**ので、同じページの中で 128 と 152 が同時に
+            // 配信されていた（本番サイトも 128 を出していた）
+            Claim {
+                file: INDEX_PAGE,
+                before: "<span class=\"tako-stat-num\">",
+                after: "</span><span class=\"tako-stat-label\">MCP ツール</span>",
+            },
         ],
         expected,
         "MCP ツール",
@@ -377,6 +443,12 @@ fn docsが名乗るcliコマンド数が実装と一致する() {
                 file: INDEX_PAGE,
                 before: "<span>",
                 after: " 個の <code>tako</code> コマンドの逆引き一覧",
+            },
+            // トップページのヒーロー統計（#1547。上の MCP 側と同じ取り残し）
+            Claim {
+                file: INDEX_PAGE,
+                before: "<span class=\"tako-stat-num\">",
+                after: "</span><span class=\"tako-stat-label\">CLI コマンド</span>",
             },
         ],
         expected,
@@ -435,6 +507,133 @@ fn cliリファレンスの早見表に全トップレベルコマンドが載�
         missing.len(),
         missing.join("\n  ")
     );
+}
+
+#[test]
+fn 手書きのエージェントページが名乗る能力件数がマトリクスと一致する() {
+    let total = agent_support::MATRIX.len();
+    println!("マトリクスの能力数 = {total}");
+    for agent in Agent::ALL {
+        println!(
+            "  {}: 対応 {} / 一部対応 {} / 未対応 {} / 対象外 {}",
+            agent.as_str(),
+            matrix_count(agent, "supported"),
+            matrix_count(agent, "degraded"),
+            matrix_count(agent, "pending"),
+            matrix_count(agent, "unsupported"),
+        );
+    }
+
+    // `agent-support.md` は生成物（同期は gen-agent-support-docs.mjs --check が見る）なので
+    // ここで見るのは**手書きの 4 ページ**だけ
+    let claims = [
+        CountClaim {
+            file: AGENT_CLAUDE_PAGE,
+            before: "[対応状況](/agent-support/) の ",
+            after: " 件すべてが「対応」",
+            expected: total,
+            what: "能力の総数",
+        },
+        CountClaim {
+            file: AGENT_CODEX_PAGE,
+            before: "現時点で ",
+            after: " 件中 ",
+            expected: total,
+            what: "能力の総数",
+        },
+        CountClaim {
+            file: AGENT_CODEX_PAGE,
+            before: " 件中 ",
+            after: " 件が「対応」です",
+            expected: matrix_count(Agent::Codex, "supported"),
+            what: "codex の「対応」",
+        },
+        CountClaim {
+            file: AGENT_CODEX_PAGE,
+            before: "（一部対応 ",
+            after: " 件・未対応 ",
+            expected: matrix_count(Agent::Codex, "degraded"),
+            what: "codex の「一部対応」",
+        },
+        CountClaim {
+            file: AGENT_CODEX_PAGE,
+            before: " 件・未対応 ",
+            after: " 件・対象外 ",
+            expected: matrix_count(Agent::Codex, "pending"),
+            what: "codex の「未対応」",
+        },
+        CountClaim {
+            file: AGENT_CODEX_PAGE,
+            before: " 件・対象外 ",
+            after: " 件）",
+            expected: matrix_count(Agent::Codex, "unsupported"),
+            what: "codex の「対象外」",
+        },
+        CountClaim {
+            file: AGENT_AGY_PAGE,
+            before: "現時点で ",
+            after: " 件中 ",
+            expected: total,
+            what: "能力の総数",
+        },
+        CountClaim {
+            file: AGENT_AGY_PAGE,
+            before: " 件中 ",
+            after: " 件が「対応」です",
+            expected: matrix_count(Agent::Agy, "supported"),
+            what: "agy の「対応」",
+        },
+        CountClaim {
+            file: AGENT_AGY_PAGE,
+            before: "（一部対応 ",
+            after: " 件・未対応 ",
+            expected: matrix_count(Agent::Agy, "degraded"),
+            what: "agy の「一部対応」",
+        },
+        CountClaim {
+            file: AGENT_AGY_PAGE,
+            before: " 件・未対応 ",
+            after: " 件・対象外 ",
+            expected: matrix_count(Agent::Agy, "pending"),
+            what: "agy の「未対応」",
+        },
+        CountClaim {
+            file: AGENT_AGY_PAGE,
+            before: " 件・対象外 ",
+            after: " 件）",
+            expected: matrix_count(Agent::Agy, "unsupported"),
+            what: "agy の「対象外」",
+        },
+        CountClaim {
+            file: AGENT_LOCAL_PAGE,
+            before: "[対応状況](/agent-support/) の ",
+            after: " 件のうち、対応しているものは ",
+            expected: total,
+            what: "能力の総数",
+        },
+        CountClaim {
+            file: AGENT_LOCAL_PAGE,
+            before: " 件のうち、対応しているものは ",
+            after: " 件です",
+            expected: matrix_count(Agent::Local, "supported"),
+            what: "ローカル LLM の「対応」",
+        },
+        CountClaim {
+            file: AGENT_LOCAL_PAGE,
+            before: "- **対象外（",
+            after: " 件）**",
+            expected: matrix_count(Agent::Local, "unsupported"),
+            what: "ローカル LLM の「対象外」",
+        },
+        CountClaim {
+            file: AGENT_LOCAL_PAGE,
+            before: "- **未対応（",
+            after: " 件）**",
+            expected: matrix_count(Agent::Local, "pending"),
+            what: "ローカル LLM の「未対応」",
+        },
+    ];
+    check_count_claims(&claims, "Issue #1547");
 }
 
 /// 材料の取り方が壊れたまま「全部載っている」と誤判定しないための足場。
@@ -501,4 +700,30 @@ fn 番犬の材料の取り方が壊れていない() {
     .is_empty());
     assert!(contains_token("| `tako_setup_mcp` |", "tako_setup_mcp"));
     assert!(!contains_token("| `tako_setup_mcp` |", "tako_setup"));
+
+    // 能力マトリクス側の材料（#1547）。ここが 0 に化けると
+    // 「docs の数字と一致しない」ではなく「見つからない」側へ倒れて分かりにくいので、
+    // 形だけ先に固定する
+    let total = agent_support::MATRIX.len();
+    assert!(
+        total >= 40,
+        "マトリクスの能力が {total} 件しか無い。材料の取り方が壊れている"
+    );
+    for agent in Agent::ALL {
+        let sum: usize = ["supported", "degraded", "pending", "unsupported"]
+            .iter()
+            .map(|st| matrix_count(agent, st))
+            .sum();
+        assert_eq!(
+            sum,
+            total,
+            "{} の状態別の合計が総数と合わない（status の文字列が変わった？）",
+            agent.as_str()
+        );
+    }
+    assert_eq!(
+        matrix_count(Agent::Claude, "supported"),
+        total,
+        "claude は基準系なので全件が supported のはず（マトリクスの前提が変わった）"
+    );
 }

@@ -40,7 +40,7 @@ tako setup-mcp --agent agy
 引数なしの `tako setup-mcp` でも、導入済みなら agy は対象に入ります。書き込み先は `~/.gemini/config/mcp_config.json` です。
 
 :::caution[agy はこの登録が必須です]
-codex の master・worker には、tako が起動のたびに MCP 設定をその場で渡す経路もあります。**agy にはその手段が CLI 側にありません**（起動時に MCP を差し込むオプションが無い）。そのため agy の worker から tako を操作できるかどうかは、この恒久登録が済んでいるかどうかだけで決まります（[#986](https://github.com/takushio2525/tako/issues/986)）。
+codex の master・worker には、tako が起動のたびに MCP 設定をその場で渡す経路もあります。**agy にはその手段が CLI 側にありません**（起動時に MCP を差し込むオプションが無い）。そのため agy の worker から tako を操作できるかどうかは、この恒久登録が済んでいるかどうかだけで決まります（[#986](https://github.com/takushio2525/tako/issues/986) で agy 1.1.27 を実測。恒久登録さえあれば実 worker から MCP が通ることも同時に確認しています）。
 
 登録さえ済んでいれば、agy は親プロセスの環境変数をそのまま MCP サーバーへ渡すので、ペインを省略した `tako_set_title` などは claude と同じように自分のペインへ当たります。
 :::
@@ -84,7 +84,7 @@ agy だけが入っている環境でも `tako setup` は完了しますが、`t
 
 ## Claude Code との差分
 
-現時点で 47 件中 21 件が「対応」です。全件の内訳と理由は [Antigravity CLI を選ぶと落ちるもの](/agent-support/#antigravity-cli-を選ぶと落ちるもの) にあります。手元で最新を引くなら次を実行してください。
+現時点で 52 件中 24 件が「対応」です（一部対応 4 件・未対応 14 件・対象外 10 件）。全件の内訳と理由は [Antigravity CLI を選ぶと落ちるもの](/agent-support/#antigravity-cli-を選ぶと落ちるもの) にあります。手元で最新を引くなら次を実行してください。
 
 ```bash
 tako agent-support --agent agy
@@ -92,5 +92,5 @@ tako agent-support --agent agy
 
 master 関連（上記）と利用制限（上記）のほかで効くのは次の 2 点です。
 
-- **会話の復元がまだ配線されていません**。`tako sessions resume` と、PC 再起動後にペインを会話ごと戻す復元は claude 専用です（[#984](https://github.com/takushio2525/tako/issues/984) / [#1238](https://github.com/takushio2525/tako/issues/1238)。手段自体は上流にあり、`agy --conversation` を手で実行すれば戻せます）
+- **PC 再起動後の復元は会話ごと戻りますが、会話の選び直しはまだできません**。再起動をまたぐ復元は [#1238](https://github.com/takushio2525/tako/issues/1238) で agy にも配線され、ペインは `agy --conversation <id>` で会話を持ったまま戻ります（会話 ID を `lsof` で採るので **Windows は対象外**です）。過去の会話を一覧から選び直す `tako sessions resume` と、会話を保ったまま CLI だけ建て直す `tako session-restart` は claude 専用のままです（追跡: [#975](https://github.com/takushio2525/tako/issues/975)）
 - **契約プランを検出できません**。認証済みかどうかは分かりますが、プランの規模が取れないので、`tako setup` の推奨プロファイルは agy 単独では規模を決められません

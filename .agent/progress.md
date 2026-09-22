@@ -49,3 +49,8 @@
 - `continue-on-error: true`（#583 の据え置き）のあいだ**新しい赤が見えなかった**のが本題。全数を `--no-fail-fast` の blocking へ（既定の cargo は最初に落ちたバイナリで打ち切るので、main の CI は tako-app の 1 件で止まり tako-control / tako-core が 0 件実行だった = 1 回で 1 件しか直せない）。名指しの実行検査（#1282 / #1314）は全数より手前へ move
 - 4 往復で収束: **21 → 2 → 0 failed**（1 巡目 failure → 3 巡目 success が「blocking になった」実証。わざと壊す必要は無かった）。21 件のうち **13 件は 9/9 のベースライン 24 件に無い** = その後 main へ増えた未検出ぶん。テスト側を直した 20 件は期待値を製品の正から作る型（`current_recipe` / `cli_file_name` / `Path::join` / `join_paths` / `temp_dir`）+ `display()` 比較を `Path` 比較へ + `-EncodedCommand` の復号 + 自前 symlink。ランナー固有は 8.3 短縮名 / git identity 不在 / `core.autocrlf=true` / pwsh 自身の書き込みの 4 系統
 - 理由つき skip は **10 件すべて追跡番号つき**。製品側の実バグは #1557 / #1569 / #1571 / #1581 へ起票（製品コードは 1 行も触っていない）。番犬は 2 規則（理由なし ignore を落とす / Windows だけの skip に `#<数字>` を要求）で、`ci_windows_test_compile` の「非ブロッキング据え置き」は反転した
+
+## 2026-09-23（#1547: docs の数値・Issue 参照のズレを直し、docs ビルドと og / リンク検査を CI へ）
+- ヒーロー統計 128 / 68 → **152 / 86**（同じページの本文は既に 152 / 86 = 番犬が本文しか見ていなかった）とエージェント 4 ページの 47 → 52 件系。追跡先が closed だった **13 マス**（#757 / #983 / #984 / #1033 / #1067）は open な親エピック #975 へ寄せ、閉じた番号は Note 本文の引用として残した（能力の申告は 1 マスも変えていない）
+- 手書き 2 か所は**事実そのものが古かった**: MATRIX の `restore_after_reboot` は codex / agy とも supported（#1238 で配線済み）なのに「PC 再起動後の復元は claude 専用」と書いていた。残る 4 か所（#127 / #357 / #986 / #1013）は根拠としての引用なので引用と読める形へ整えて残した。規約「追跡先は open / 根拠は closed でよい」を conventions.md へ
+- 実測: 番犬の注入 **11 通り**すべて file:line 名指しで FAILED → 戻して緑（追跡先検査 3 通り・リンク検査 2 通り・robots 削除も exit 1）。docs ビルド 32 ページ / og:verify 31 / verify-links 内部リンク 1573 本・断片 23 本 OK。workspace 5174 passed 0 failed・clippy 3 宇宙 0・check-windows error 0

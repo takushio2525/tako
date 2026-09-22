@@ -683,6 +683,15 @@ const fn degraded(note: Note) -> AgentSupport {
     S::Degraded { note }
 }
 
+/// `issue` は**追跡先**（まだ残っている仕事の在り処）であって、根拠ではない。
+///
+/// **追跡先に閉じた Issue を置かない**（Issue #1547）。閉じた Issue を指したまま
+/// `Pending` を残すと、docs には「追跡: #N」と出るのに N を開いても完了していて、
+/// 読む側（利用者・AI エージェント）は残りの仕事がどこにあるか辿れなくなる。
+/// 実測では #757 / #983 / #984 / #1033 / #1067 が閉じたあとも 13 マスが指し続けていた。
+/// 済んだ調査・実装を引くのは `Note` 本文か `evidence` 側の仕事で、そちらは
+/// 閉じた Issue でよい（むしろ閉じているほうが「確定した事実」として強い）。
+/// 検査は `scripts/check-docs-issue-refs.sh`。
 const fn pending(note: Note, issue: u32) -> AgentSupport {
     S::Pending { note, issue }
 }
@@ -830,7 +839,7 @@ pub const MATRIX: &[AgentFeature] = &[
             "Hands off by itself once the context ratio crosses the threshold (#749)",
         ),
         claude: S::Supported,
-        codex: pending(notes::NOT_INVESTIGATED, 984),
+        codex: pending(notes::NOT_INVESTIGATED, 975),
         agy: pending(notes::AGY_NOT_ORCHESTRATOR, 987),
         local: local_pending_first_class(),
         evidence: AgentEvidence::Source(
@@ -849,7 +858,7 @@ pub const MATRIX: &[AgentFeature] = &[
             "worker の状態照会では構造化ソースから ctx% が取れるが、master の自動ハンドオフは画面のパターンを見るので master 経路では未確認",
             "The context ratio is available from the structured source for worker status queries, but the master auto-handoff reads screen patterns, so the master path is unverified",
         )),
-        agy: pending(notes::AGY_CTX_NOT_IN_TRANSCRIPT, 1033),
+        agy: pending(notes::AGY_CTX_NOT_IN_TRANSCRIPT, 975),
         local: local_pending_first_class(),
         evidence: AgentEvidence::Measured(
             "#984: rollout の token_count に last_token_usage.total_tokens と \
@@ -966,7 +975,7 @@ pub const MATRIX: &[AgentFeature] = &[
             "The session is replaced after the agent writes a handoff (#1067; pane context menu / `tako session-restart --mode handoff`)",
         ),
         claude: S::Supported,
-        codex: pending(notes::NOT_MEASURED_HANDOFF_RESTART, 1067),
+        codex: pending(notes::NOT_MEASURED_HANDOFF_RESTART, 975),
         agy: pending(notes::AGY_NOT_ORCHESTRATOR, 987),
         local: local_pending_first_class(),
         evidence: AgentEvidence::Source(
@@ -980,8 +989,8 @@ pub const MATRIX: &[AgentFeature] = &[
             "The CLI process is rebuilt while the conversation is kept (#1067; how a session catches up with a CLI auto-update)",
         ),
         claude: S::Supported,
-        codex: pending(notes::NOT_WIRED, 984),
-        agy: pending(notes::NOT_WIRED, 984),
+        codex: pending(notes::NOT_WIRED, 975),
+        agy: pending(notes::NOT_WIRED, 975),
         local: local_pending_first_class(),
         evidence: AgentEvidence::Source(
             "resume コマンド自体は #1238 で 3 系統ぶん組めるようになった（agent_resume::resume_spec）。\
@@ -1012,8 +1021,8 @@ pub const MATRIX: &[AgentFeature] = &[
             "A past conversation can be resumed (`tako sessions resume`)",
         ),
         claude: S::Supported,
-        codex: pending(notes::NOT_WIRED, 984),
-        agy: pending(notes::NOT_WIRED, 984),
+        codex: pending(notes::NOT_WIRED, 975),
+        agy: pending(notes::NOT_WIRED, 975),
         local: local_pending_first_class(),
         evidence: AgentEvidence::Source(
             "コマンドの組み立ては #1238 で 3 系統に広がったが、`tako sessions resume` が引くのは\
@@ -1204,8 +1213,8 @@ pub const MATRIX: &[AgentFeature] = &[
             "The bypass confirmation dialog shown at start-up is pre-accepted (#407)",
         ),
         claude: S::Supported,
-        codex: pending(notes::NOT_WIRED, 983),
-        agy: pending(notes::NOT_WIRED, 983),
+        codex: pending(notes::NOT_WIRED, 975),
+        agy: pending(notes::NOT_WIRED, 975),
         local: pending(notes::LOCAL_HARNESS_UNDECIDED, 991),
         evidence: AgentEvidence::Source(
             "dispatch.rs の事前承諾は 2 箇所とも WorkerAgent::Claude を条件にしている。\
@@ -1254,8 +1263,8 @@ pub const MATRIX: &[AgentFeature] = &[
             "Sudden death is detected and a recovery command is offered (#390)",
         ),
         claude: S::Supported,
-        codex: pending(notes::NOT_WIRED, 984),
-        agy: pending(notes::NOT_WIRED, 984),
+        codex: pending(notes::NOT_WIRED, 975),
+        agy: pending(notes::NOT_WIRED, 975),
         local: local_pending_first_class(),
         evidence: AgentEvidence::Source(
             "dispatch.rs のレジストリの resume_command はコメントどおり claude のみ \
@@ -1436,8 +1445,8 @@ pub const MATRIX: &[AgentFeature] = &[
             "Detects that the agent has stopped because the account's login expired (#757)",
         ),
         claude: S::Supported,
-        codex: pending(notes::LOGIN_EXPIRY_NOT_MEASURED, 757),
-        agy: pending(notes::LOGIN_EXPIRY_NOT_MEASURED, 757),
+        codex: pending(notes::LOGIN_EXPIRY_NOT_MEASURED, 975),
+        agy: pending(notes::LOGIN_EXPIRY_NOT_MEASURED, 975),
         local: unsupported(notes::NO_LOCAL_LOGIN),
         evidence: AgentEvidence::Measured(
             "#757（2026-08-01 / 08-03 / 08-05 の実観測を 3 回）: claude の worker が              `OAuth refresh token is no longer valid; run /login to re-authenticate` /              `Login expired · Please run /login` / `Please run /login` を出して止まる。             画面には先に `API Error: Unable to connect to API (ENOTFOUND / ECONNRESET)` が              出るため、#757 前は `api_error`（推奨 `resume`）に分類され、**続行ナッジを              何度撃っても復帰しなかった**（master が 3 回空回りした）。この 3 文言を              `orchestrator::agent_cli::login_expired_line`（#983 の起動時未認証検知と              **同じ正本**）で受け、`WorkerErrorKind::LoginExpired`（`relogin`）として返す。             対象アカウントは会話（session_id）の transcript の所在から逆引きする              （`orchestrator::login_expired_account`。#652 の resume と同じ根拠）ので、             **会話が claude の config ディレクトリに在る系統でしか名指しできない**。             codex / agy は失効時の実画面を採れていないので文言を足していない              （推測を置かないのは #1034 の `execution_refused_patterns` と同じ作法）。             **実機で失効させる再現はしていない**（同一アカウントを別マシンから使った              直後に起きるもので、任意のタイミングでは作れない）ので、検証は実観測の              文言を描いた fixture と隔離 tmux のペインで行った",
@@ -2047,6 +2056,12 @@ mod tests {
         // #986 で WORKER_MCP は codex / agy とも Supported になったので、
         // まだ pending が残るマス（会話の resume）で診断の言語追従を見る
         let key = keys::SESSIONS_RESUME;
+        // 追跡先の番号は付け替わる（#1547 で閉じた Issue から open な親エピックへ寄せた）
+        // ので、**マトリクスから引く**。ここへ数字を直書きすると付け替えのたびに落ちる
+        let issue = support_for(Agent::Codex, key)
+            .expect("キーが在る")
+            .issue()
+            .expect("pending なら追跡先を持つ");
         i18n::set_lang(Lang::En);
         let en = gate(Agent::Codex, key).unwrap_err();
         i18n::set_lang(Lang::Ja);
@@ -2056,7 +2071,8 @@ mod tests {
                 .any(|c| matches!(c as u32, 0x3040..=0x30FF | 0x4E00..=0x9FFF)),
             "英語の診断に日本語が残っている: {en}"
         );
-        assert!(en.contains("#984") && ja.contains("#984"));
+        let tag = format!("#{issue}");
+        assert!(en.contains(&tag) && ja.contains(&tag));
         assert!(en.contains("OpenAI Codex CLI") && ja.contains("OpenAI Codex CLI"));
     }
 
