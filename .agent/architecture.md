@@ -996,6 +996,13 @@ MCP / CLI から受け、UI 層がレイアウト矩形に変換して描画す�
 
 trait で抽象化し、core/ と control/ は platform/ の trait のみに依存する。
 
+**縮退の宣言は system prompt へも流れる**（#516。正本は `tako-core::platform::support`）。
+ただし prompt へ載せるのは「この環境は何か」と「縮退が N 件あること・その引き方」だけで、
+理由の全文は `tako orchestrator guide platform` が返す（#1571。全文を載せると縮退 1 件ごとに
+prompt が伸び、Windows では `platform` 片が 4110 B = 利用者の追記の取り分を 1.7〜2.7 KB
+侵食していた）。文面の 1 実装は `tako-control::platform::facts::PlatformFacts`
+（`notes_section_in` = prompt 用の短縮形 / `full_section_in` = 手順書の本文）。
+
 ## 設定ファイル I/O の安全化（`tako-control::config_io`。#169）
 
 2026-07-13、orchestrator の projects.yaml が並行 `projects add` で 58 件 → 1 件に

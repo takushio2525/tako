@@ -977,6 +977,12 @@ system prompt は**長寿命セッションが起動した瞬間に払う固定�
   `crates/tako-control/tests/remote_guide.rs`（topic の消失 / トリガーの消失 /
   トリガーが手順を抱えていないか・prompt が予算内か）
 
+- **環境から組み立てる動的 topic**（`GuideBody::Dynamic`）は本文が tako のリポジトリに
+  無いので移送の番犬の対象外。`delegation` / `local-rules`（#1477）に加え、#1571 で
+  `platform`（この環境で使えない・機能が落ちる操作の理由の全文。対応マトリクスの生成物）が
+  入った。prompt 側に残るのは**件数と引き方だけ**で、Windows の `platform` 片は
+  4110 B → 412 B になった（縮退を 1 件足すたびに prompt が伸びる構造をやめた）
+
 ### 触るときの不変条件
 
 - **ブロック名は消さない・改名しない**（`prompt_blocks.disable` / `override_blocks` が

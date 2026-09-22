@@ -189,7 +189,8 @@ function render() {
   out.push('tako は **実機で確かめたものだけを「対応」と書きます**。実装がプラットフォーム');
   out.push('共通で動く見込みがあっても、Windows 実機で 1 度も実行していないものは');
   out.push('「未対応 / 未実測」に置いています。過大に申告すると、この宣言を読んで動く');
-  out.push('AI エージェント（tako は対応状況を system prompt へ渡します）が');
+  out.push('AI エージェント（tako は縮退の件数と引き方を system prompt へ渡し、理由の全文は');
+  out.push('`tako orchestrator guide platform` で引けるようにしています）が');
   out.push('「使えるはず」と信じて失敗し続けるためです。');
   out.push('');
   out.push('各表の「根拠」列が判定の裏づけです。');

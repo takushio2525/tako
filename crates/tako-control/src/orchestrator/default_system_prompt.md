@@ -59,6 +59,7 @@ tako_orchestrator_guide({ topic: "monitoring" })   // CLI: tako orchestrator gui
 | `context-budget` | you are acting on a `tako_context_budget` result |
 | `delegation` | before your first spawn, and before overriding `model` / `effort` |
 | `local-rules` | an `<on-demand rules …>` index line above names a section you need |
+| `platform` | an operation fails on this machine, or you need the full reason a feature is degraded here |
 
 With no `topic` it lists them with their sizes. **The guide text is authoritative;
 the summaries below are triggers, not substitutes** — fetching one costs a few

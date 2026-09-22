@@ -15,7 +15,7 @@ pub mod wait;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use tako_core::platform::support::Note;
+use tako_core::platform::support::{Note, Platform};
 
 pub use agent::WorkerAgent;
 
@@ -1573,6 +1573,11 @@ impl Profile {
     /// プロファイルがカスタム prompt を指しているならその本文（ブロック制御はスキップ）。
     /// `system_prompt` フィールド → カスタム `master-system.md` の順に見る
     fn custom_system_prompt_text(&self) -> Option<String> {
+        self.custom_system_prompt_text_on(Platform::current())
+    }
+
+    /// プラットフォームを明示してのカスタム prompt 本文（#1571）
+    fn custom_system_prompt_text_on(&self, platform: Platform) -> Option<String> {
         // system_prompt フィールドが指定されていればファイルを丸ごと返す（既存互換）
         if let Some(ref custom) = self.system_prompt {
             let expanded = expand_tilde(custom);
@@ -1580,14 +1585,14 @@ impl Profile {
             if p.is_file() {
                 if let Ok(content) = std::fs::read_to_string(&p) {
                     // ユーザーのカスタム prompt もプレースホルダを書けば注入される（#516）
-                    return Some(crate::platform::facts::render_current(&content));
+                    return Some(crate::platform::facts::render_on(&content, platform));
                 }
             }
         }
         // カスタム master-system.md があればそれを使う（ブロック制御はスキップ）
         let custom_path = resolve_system_prompt_path()?;
         let content = std::fs::read_to_string(&custom_path).ok()?;
-        Some(crate::platform::facts::render_current(&content))
+        Some(crate::platform::facts::render_on(&content, platform))
     }
 
     /// prompt のプレースホルダを解決する（`{TAB_NAMING_CONVENTION}` / `{CTX_THRESHOLD}` /
@@ -1596,6 +1601,15 @@ impl Profile {
     /// **master prompt / solo prompt / guide（#1154）の 3 経路が同じ 1 実装を通る**。
     /// guide 側で解決を忘れると、master は自分の引き継ぎ閾値を `{CTX_THRESHOLD}%` と読む
     pub fn render_prompt_placeholders(&self, text: &str) -> String {
+        self.render_prompt_placeholders_on(text, Platform::current())
+    }
+
+    /// プラットフォームを明示しての解決（#1571）。
+    ///
+    /// **macOS 上から Windows 形の prompt を組める**ので、実機なしで tako が作る側の
+    /// 取り分（`SYSTEM_PROMPT_BASE_MAX_BYTES`）の充足を測れる。対応マトリクスの
+    /// 「判定は純粋関数 = `Platform` を引数で受ける」作法（設計 §3.1）をここまで伸ばした形
+    pub fn render_prompt_placeholders_on(&self, text: &str, platform: Platform) -> String {
         let naming_convention = self.tab_naming_convention.as_deref().unwrap_or(
             "Naming rule: describe the current activity concisely in the user's language.",
         );
@@ -1607,7 +1621,7 @@ impl Profile {
             &self.resolved_ctx_threshold().value.to_string(),
         );
         // プラットフォーム事実の注入（#516）。正本は 1 本に保ち、差分はここで入れる
-        crate::platform::facts::render_current(&out)
+        crate::platform::facts::render_on(&out, platform)
     }
 
     /// テンプレートテキストからブロック制御・identity / model-policy 注入を行って合成する
@@ -1626,6 +1640,19 @@ impl Profile {
         profile_name: &str,
         mode: PromptMode,
     ) -> Vec<PromptPiece> {
+        self.build_prompt_pieces_on(template, profile_name, mode, Platform::current())
+    }
+
+    /// プラットフォームを明示しての断片列（#1571）。
+    /// 実機なしで Windows 形の内訳を測るための入口で、既定は
+    /// [`Self::build_prompt_pieces`]（実行中のプラットフォーム）
+    pub fn build_prompt_pieces_on(
+        &self,
+        template: &str,
+        profile_name: &str,
+        mode: PromptMode,
+        platform: Platform,
+    ) -> Vec<PromptPiece> {
         let blocks = parse_prompt_blocks(template);
         let pb = self.prompt_blocks.as_ref();
         let mut out: Vec<PromptPiece> = Vec::new();
@@ -1633,7 +1660,7 @@ impl Profile {
         let mut push = |name: String, text: String| {
             out.push(PromptPiece {
                 name,
-                text: self.render_prompt_placeholders(&text),
+                text: self.render_prompt_placeholders_on(&text, platform),
             })
         };
 
@@ -1740,13 +1767,28 @@ impl Profile {
     /// `system_prompt` / カスタム `master-system.md` を指定しているプロファイルは
     /// ファイルを丸ごと使うので、内訳もその 1 本になる
     pub fn system_prompt_pieces(&self, profile_name: &str) -> Vec<PromptPiece> {
-        if let Some(text) = self.custom_system_prompt_text() {
+        self.system_prompt_pieces_on(profile_name, Platform::current())
+    }
+
+    /// プラットフォームを明示しての内訳（#1571）。予算の番犬が
+    /// **macOS 上から Windows 形を測る**のに使う
+    pub fn system_prompt_pieces_on(
+        &self,
+        profile_name: &str,
+        platform: Platform,
+    ) -> Vec<PromptPiece> {
+        if let Some(text) = self.custom_system_prompt_text_on(platform) {
             return vec![PromptPiece {
                 name: "custom system prompt".into(),
                 text,
             }];
         }
-        self.build_prompt_pieces(DEFAULT_SYSTEM_PROMPT, profile_name, PromptMode::Master)
+        self.build_prompt_pieces_on(
+            DEFAULT_SYSTEM_PROMPT,
+            profile_name,
+            PromptMode::Master,
+            platform,
+        )
     }
 
     /// worker_agent / worker_agents 設定に基づいて「利用可能な worker エージェント」の

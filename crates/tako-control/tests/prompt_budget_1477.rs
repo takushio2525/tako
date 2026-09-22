@@ -25,6 +25,7 @@ use tako_control::orchestrator::guide;
 use tako_control::orchestrator::{Profile, PromptBlocks, PromptPiece, WorkerModelPolicy};
 use tako_core::context_budget as budget;
 use tako_core::migration::SchemaId;
+use tako_core::platform::support::Platform;
 use tako_core::prompt_append::{self, MARKER};
 
 /// **本番のデータディレクトリを読ませない**（プロファイルの実体・追記の実体は
@@ -84,7 +85,11 @@ fn over_base_budget(cases: &[(&str, Vec<PromptPiece>)]) -> Vec<String> {
 }
 
 /// 参照プロファイル。**実在のプロファイルは読まない**（機械差で判定が揺れる）。
-/// tako が作る側が最大になる組み合わせ（委任方針 + 3 エージェント + 3 プロジェクト）を採る
+/// tako が作る側が最大になる組み合わせ（委任方針 + 3 エージェント + 3 プロジェクト）を採る。
+///
+/// #1571 以降は **macOS / Windows の両方の形**を組む。`platform` 片は対応マトリクスの
+/// 生成物で環境ごとに中身が変わり、Windows でだけ予算を超えていた
+/// （実機でしか測れないと、片方の OS の利用者だけが黙って不利になる）
 fn reference_profiles() -> Vec<(&'static str, Vec<PromptPiece>)> {
     let _ = isolated_data_dir();
     let with_append = |mut p: Profile| -> Profile {
@@ -117,26 +122,49 @@ fn reference_profiles() -> Vec<(&'static str, Vec<PromptPiece>)> {
         ]),
         ..Default::default()
     });
+    let default = with_append(Profile::default());
     vec![
         (
-            "default",
-            with_append(Profile::default()).system_prompt_pieces("default"),
+            "default/macos",
+            default.system_prompt_pieces_on("default", Platform::MacOs),
         ),
-        ("delegate", delegate.system_prompt_pieces("delegate")),
-        ("dedicated", dedicated.system_prompt_pieces("dedicated")),
+        (
+            "delegate/macos",
+            delegate.system_prompt_pieces_on("delegate", Platform::MacOs),
+        ),
+        (
+            "dedicated/macos",
+            dedicated.system_prompt_pieces_on("dedicated", Platform::MacOs),
+        ),
+        (
+            "default/windows",
+            default.system_prompt_pieces_on("default", Platform::Windows),
+        ),
+        (
+            "delegate/windows",
+            delegate.system_prompt_pieces_on("delegate", Platform::Windows),
+        ),
+        (
+            "dedicated/windows",
+            dedicated.system_prompt_pieces_on("dedicated", Platform::Windows),
+        ),
     ]
 }
 
-/// **Windows では skip**（#1571）。Windows は `platform` 片が 4110 バイト
-/// （縮退の理由文が対応マトリクスから自動生成で載る）で、tako が作る側が
-/// 18944 バイトの取り分を 1.7〜2.7 KB 超える。prompt の中身を削るのは製品の変更で
-/// #1278（CI の blocking 化）のスコープ外なので #1571 へ分離した。
-/// **macOS 側は blocking のまま効いている**ので、予算の番犬としては生きている
+/// 名前で 1 件引く（並び順に依存させない）
+fn case_pieces<'a>(cases: &'a [(&'static str, Vec<PromptPiece>)], name: &str) -> &'a [PromptPiece] {
+    &cases
+        .iter()
+        .find(|(n, _)| *n == name)
+        .unwrap_or_else(|| panic!("参照プロファイル {name} が無い"))
+        .1
+}
+
+/// **どちらの OS で走らせても両方の形を測る**（#1571）。Windows は `platform` 片が
+/// 4110 バイト（縮退の理由文が対応マトリクスから自動生成で載る）あり、tako が作る側が
+/// 18944 バイトの取り分を 1.7〜2.7 KB 超えていた。#1571 で理由の全文を手順書
+/// `platform` へ移し、prompt には件数と引き方だけを残したので 412 バイトへ縮んだ
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "Windows は platform 片（縮退の自動生成）で base が予算を超える（#1571）"
-)]
 fn baseは予算内で追記の取り分を残している() {
     let cases = reference_profiles();
     let over = over_base_budget(&cases);
@@ -156,7 +184,7 @@ fn baseは予算内で追記の取り分を残している() {
         budget::PROMPT_APPEND_MAX_BYTES
     );
     // 委任の判断材料は prompt ではなく guide 側にある
-    let delegate = &cases[1].1;
+    let delegate = case_pieces(&cases, "delegate/macos");
     let text = tako_control::orchestrator::join_prompt_pieces(delegate);
     assert!(
         !text.contains("Delegation Judgment Criteria")
@@ -182,6 +210,98 @@ fn base上限の超過は名指しで落ちる() {
         text: "x".repeat(budget::SYSTEM_PROMPT_BASE_MAX_BYTES + 1),
     }];
     assert!(over_base_budget(&[("injected", append_only)]).is_empty());
+}
+
+/// **#1571**: 縮退の理由の全文は prompt ではなく手順書 `platform` にある。
+/// 「短くしたら情報が消えていた」が最悪なので、**消えた情報ゼロ**を機械で示す
+#[test]
+fn 縮退の全文は手順書platformで引ける() {
+    use tako_control::platform::facts::PlatformFacts;
+    use tako_core::i18n::Lang;
+    let _ = isolated_data_dir();
+
+    // 手順書は全文の 1 実装をそのまま返す（要約や写しを別に持たない）
+    let body = guide::find("platform")
+        .expect("topic `platform` が正本に無い")
+        .body_raw(&Profile::default());
+    assert_eq!(
+        body,
+        PlatformFacts::current().full_section(),
+        "手順書が `full_section` 以外を返している（正本が 2 つになる）"
+    );
+
+    for platform in [Platform::MacOs, Platform::Windows] {
+        let f = PlatformFacts::for_platform(platform);
+        for lang in [Lang::Ja, Lang::En] {
+            // 移送前に `platform` 片へ載っていた本文 = いまの手順書の本文
+            let before = f.full_section_in(lang);
+            let short = f.notes_section_in(lang);
+            let reasons: Vec<&str> = before.lines().filter(|l| l.starts_with("- ")).collect();
+            assert_eq!(
+                reasons.len(),
+                f.degraded.len(),
+                "{platform:?} の理由行がマトリクスの件数と合わない"
+            );
+            // prompt 側には 1 行も残っていない（= 移送した）
+            for line in &reasons {
+                assert!(
+                    !short.contains(line),
+                    "{platform:?} の理由文が prompt に残っている: {line}"
+                );
+            }
+            // 引き方は残っている（= 引けなくなっていない）
+            if !reasons.is_empty() {
+                assert!(
+                    short.contains("platform"),
+                    "引き先が prompt に無い: {short}"
+                );
+                assert!(
+                    short.contains(&format!("{}", f.degraded.len())),
+                    "件数が prompt に無い: {short}"
+                );
+            }
+        }
+    }
+
+    // topic 一覧（引数無し）にも載る = 存在を知れる
+    let list = guide::json(None, "default").expect("一覧");
+    assert!(
+        list["topics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["topic"] == "platform"),
+        "一覧に platform が無い: {list}"
+    );
+}
+
+/// 検出力（#1571）: 手順書へ移した全文を `platform` 片へ書き戻すと、
+/// **同じ 1 実装**（`over_base_budget`）が超過として名指しする
+#[test]
+fn platform片へ全文を戻したら名指しで落ちる() {
+    use tako_control::platform::facts::PlatformFacts;
+    let cases = reference_profiles();
+    // 戻す前は 1 件も超過していない（= 常に落ちる番犬ではない）
+    assert!(over_base_budget(&cases).is_empty());
+
+    let mut pieces = case_pieces(&cases, "dedicated/windows").to_vec();
+    let at = pieces
+        .iter()
+        .position(|p| p.name == "platform")
+        .expect("`platform` 片");
+    let full = PlatformFacts::for_platform(Platform::Windows).full_section();
+    pieces[at].text = format!("## Platform Notes\n\n{}\n", full.trim_end());
+    let over = over_base_budget(&[("injected", pieces)]);
+    assert_eq!(
+        over.len(),
+        1,
+        "縮退の全文を prompt へ戻したのに超過として検出されない: {over:?}"
+    );
+    assert!(
+        over[0].contains("platform="),
+        "超過の内訳が `platform` を名指ししていない: {}",
+        over[0]
+    );
 }
 
 // ─── 2) 常時部だけが prompt に載る ────────────────────────────────────
