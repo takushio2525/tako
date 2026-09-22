@@ -212,6 +212,10 @@ fn 番犬が走査対象と検出力を持っている() {
     let backend =
         std::fs::read_to_string(repo_root().join("crates/tako-core/tests/psmux_backend.rs"))
             .expect("psmux_backend.rs を読める");
+    let backend = code_view_mod::without_comments_checked(
+        &backend,
+        "crates/tako-core/tests/psmux_backend.rs",
+    );
     assert!(
         backend.contains("impl Drop for Fixture"),
         "#1271 の現場（`Fixture::drop`）が走査対象に入っていない"
@@ -219,6 +223,8 @@ fn 番犬が走査対象と検出力を持っている() {
     let ctl =
         std::fs::read_to_string(repo_root().join("crates/tako-core/tests/common/psmux_ctl.rs"))
             .expect("psmux_ctl.rs を読める");
+    let ctl =
+        code_view_mod::without_comments_checked(&ctl, "crates/tako-core/tests/common/psmux_ctl.rs");
     assert!(
         ctl.contains("fn legacy_kill_server"),
         "A/B の旧アームが消えている（除外規則が検証できない）"

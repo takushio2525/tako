@@ -53,6 +53,18 @@ fn repo_root() -> PathBuf {
         .expect("リポジトリルート")
 }
 
+#[path = "common/code_view.rs"]
+mod code_view;
+
+/// **肯定の存在確認**（「この記録 / このラベルが在る」）が見る眺め = コメントを落とした本文。
+///
+/// 全文へ `contains` すると、走査先の doc コメントに書いた同じ綴りで真になり、
+/// 実体が消えても緑のままになる（#1609）。UI のラベルは文字列リテラルなので
+/// 囲みごと残る眺め（`without_comments`）を使う
+fn read_code(rel: &str) -> String {
+    code_view::without_comments_checked(&read(rel), rel)
+}
+
 fn read(rel: &str) -> String {
     let path = repo_root().join(rel);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} を読めない: {e}", path.display()))
@@ -106,7 +118,7 @@ fn unrecorded_continues(source: &str) -> Vec<String> {
 /// 1: 数え忘れた `continue` が無い
 #[test]
 fn 復元ループのすべての出口が結末を記録する() {
-    let source = read(MAIN);
+    let source = read_code(MAIN);
     let region = restore_loop(&source);
     let exits = region
         .iter()
@@ -131,7 +143,7 @@ fn 復元ループのすべての出口が結末を記録する() {
 /// 1': 記録を 1 つ落とすと名指しできる（検出力）
 #[test]
 fn 記録を落とすと名指しできる() {
-    let source = read(MAIN);
+    let source = read_code(MAIN);
     assert!(unrecorded_continues(&source).is_empty(), "現行は緑のはず");
     // 行を空行へ置き換える（行番号を動かさずに記録だけ落とす）
     let broken = source.replace(
@@ -157,12 +169,12 @@ fn 記録を落とすと名指しできる() {
 /// 2: 1 行目のラベルは `restore_report` の 1 実装からだけ出る
 #[test]
 fn 内訳のラベルは一実装から出る() {
-    let report = read(REPORT);
+    let report = read_code(REPORT);
     assert!(
         report.contains("tmux 再 attach") && report.contains("プレビュー"),
         "{REPORT} が内訳のラベルを持っていない（正本が移った？）"
     );
-    let main = read(MAIN);
+    let main = read_code(MAIN);
     assert!(
         !main.contains("tmux 再 attach"),
         "{MAIN} が 1 行目を自前で組み直している（#1554 の再発）。\n\
@@ -187,7 +199,7 @@ fn 内訳のラベルは一実装から出る() {
 /// 3: 個別の失敗は「数える」と「残す」を同時に行う
 #[test]
 fn 個別の失敗は数えると同時にpersistlogへ残す() {
-    let main = read(MAIN);
+    let main = read_code(MAIN);
     let helper = main
         .split("fn record_restore_failure(")
         .nth(1)
@@ -221,7 +233,7 @@ fn 個別の失敗は数えると同時にpersistlogへ残す() {
 /// 4: 合計とペイン数の食い違いを実行時に名指す
 #[test]
 fn 合計とペイン数の食い違いを黙らせない() {
-    let main = read(MAIN);
+    let main = read_code(MAIN);
     assert!(
         main.contains("breakdown.mismatch(restored.len())"),
         "内訳の合計と復元ペイン数を突き合わせていない（#1554）。\n\
@@ -240,7 +252,7 @@ fn 合計とペイン数の食い違いを黙らせない() {
 /// 5: 診断へペイン内容を載せない（conventions の診断ログ規約）
 #[test]
 fn 診断へペイン内容を載せない() {
-    let report = read(REPORT);
+    let report = read_code(REPORT);
     for banned in ["capture_pane", "scrollback", "TAKO_TOKEN", "read_pane"] {
         assert!(
             !report.contains(banned),
@@ -310,7 +322,7 @@ fn たまり場と退避タブは失敗として数えない() {
     );
     assert!(b.summary(1, 2).contains(&format!("{LABEL_HIDDEN} 2")));
     // 呼び出し側: 2 つの集合を引いてから失敗へ落とす形であること
-    let main = read(MAIN);
+    let main = read_code(MAIN);
     let region: String = restore_loop(&main)
         .iter()
         .map(|(_, l)| *l)

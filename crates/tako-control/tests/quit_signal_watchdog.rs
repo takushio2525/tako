@@ -32,6 +32,9 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+#[path = "common/code_view.rs"]
+mod code_view;
+
 fn read(root: &Path, rel: &str) -> String {
     std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel} が読めない: {e}"))
 }
@@ -124,7 +127,7 @@ fn 握るなら猶予後に必ず終わるウォッチドッグを対で持つ()
          quit が撃たれず、起点も来ない = 永久に死なない）:\n{watchdog}"
     );
     assert!(
-        core.contains("pub const DEFAULT_GRACE"),
+        code_view::without_comments(&core).contains("pub const DEFAULT_GRACE"),
         "猶予の既定値が定数として宣言されていない"
     );
 }

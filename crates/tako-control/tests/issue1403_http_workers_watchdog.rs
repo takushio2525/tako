@@ -51,8 +51,20 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+#[path = "common/code_view.rs"]
+mod code_view;
+
 fn read(rel: &str) -> String {
     std::fs::read_to_string(repo_root().join(rel)).unwrap_or_else(|e| panic!("{rel} を読む: {e}"))
+}
+
+/// **肯定の存在確認**（「この呼び出しが在る」）が見る眺め = コメントを落とした本文。
+///
+/// 全文へ `contains` すると、走査先の doc コメントに書いた同じ綴りで真になり、
+/// 実体が消えても緑のままになる（#1609）。この番犬は「理由を書いたコメントに
+/// `writeln!` が出る」のを自前の行フィルタで避けていたが、綴りは共有部品へ寄せた
+fn read_code(rel: &str) -> String {
+    code_view::without_comments_checked(&read(rel), rel)
 }
 
 /// インデント 0 の `fn` 宣言行から、インデント 0 の閉じ括弧までを本体として切り出す
@@ -82,7 +94,7 @@ fn strip_line_comment(line: &str) -> &str {
 /// へ戻す）で、この行を名指しで落とす
 #[test]
 fn 受信ループが直列に戻っていない() {
-    let src = read(REMOTE_RS);
+    let src = read_code(REMOTE_RS);
     let (line, body) = top_fn_block(&src, "pub fn run_daemon() -> io::Result<()> {")
         .unwrap_or_else(|| panic!("{REMOTE_RS}: run_daemon が見つからない"));
 
@@ -115,7 +127,7 @@ fn 受信ループが直列に戻っていない() {
 /// - `catch_unwind`: 1 本の panic で daemon ごと死なない（直列の頃の後退を戻さない）
 #[test]
 fn ワーカーの合流とpanic耐性が消えていない() {
-    let src = read(REMOTE_RS);
+    let src = read_code(REMOTE_RS);
     let (line, body) = top_fn_block(&src, "fn serve_http_requests<D, P>(")
         .unwrap_or_else(|| panic!("{REMOTE_RS}: serve_http_requests が見つからない"));
 
@@ -143,13 +155,16 @@ fn ワーカーの合流とpanic耐性が消えていない() {
 /// 静かに戻る（= 同時に 2 本の IPC が走る）
 #[test]
 fn ipcのロックはwith_app_ipcの中だけで取る() {
-    let remote = read(REMOTE_RS);
+    let remote = read_code(REMOTE_RS);
     let (with_line, with_body) = top_fn_block(&remote, "pub(crate) fn with_app_ipc<T>(")
         .unwrap_or_else(|| panic!("{REMOTE_RS}: with_app_ipc が見つからない"));
     let with_range = with_line..(with_line + with_body.lines().count());
 
     let mut offenders = Vec::new();
-    for (rel, src) in [(REMOTE_RS, &remote), (REMOTE_SSH_RS, &read(REMOTE_SSH_RS))] {
+    for (rel, src) in [
+        (REMOTE_RS, &remote),
+        (REMOTE_SSH_RS, &read_code(REMOTE_SSH_RS)),
+    ] {
         for (i, raw) in src.lines().enumerate() {
             let line = i + 1;
             if rel == REMOTE_RS && with_range.contains(&line) {
@@ -176,7 +191,7 @@ fn ipcのロックはwith_app_ipcの中だけで取る() {
 /// `conn.get()` だけ取り出してガードを落とす形に戻すと、同時に 2 本の IPC が走る
 #[test]
 fn with_app_ipcが往復の間ロックを握る() {
-    let src = read(REMOTE_RS);
+    let src = read_code(REMOTE_RS);
     let (line, body) = top_fn_block(&src, "pub(crate) fn with_app_ipc<T>(")
         .unwrap_or_else(|| panic!("{REMOTE_RS}: with_app_ipc が見つからない"));
 
@@ -200,7 +215,7 @@ fn with_app_ipcが往復の間ロックを握る() {
 /// 回帰を隠していないことを毎回確かめられる形を保つ
 #[test]
 fn abの口が消えていない() {
-    let src = read(REMOTE_RS);
+    let src = read_code(REMOTE_RS);
     // **env を実際に読む形**で縛る。単なる `TAKO_1403_LEGACY` の文字列一致だと、
     // 名前を説明している doc コメントの側に当たって**注入が素通りする**（実測）
     const READS_ENV: &str = r#"env_on("TAKO_1403_LEGACY")"#;
@@ -229,7 +244,7 @@ fn abの口が消えていない() {
 /// #1403 で受信が 4 ワーカーになり、ここへ同時に書く者が増えた
 #[test]
 fn 監査ログの追記が1回のwriteで出る() {
-    let src = read(REMOTE_AUTH_RS);
+    let src = read_code(REMOTE_AUTH_RS);
     let (line, body) = top_fn_block(
         &src,
         "pub fn append_audit(path: &Path, event: &str, extra: Value) {",

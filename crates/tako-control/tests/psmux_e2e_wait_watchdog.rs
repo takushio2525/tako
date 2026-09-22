@@ -44,6 +44,9 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+#[path = "common/code_view.rs"]
+mod code_view;
+
 fn target() -> PathBuf {
     repo_root().join("crates/tako-core/tests/psmux_backend.rs")
 }
@@ -159,7 +162,10 @@ fn 器のe2eは固定回数の窓で待っていない() {
 fn 番犬が走査対象と検出力を持っている() {
     let path = target();
     assert!(path.exists(), "走査対象が無い: {}", path.display());
-    let src = std::fs::read_to_string(&path).expect("psmux_backend.rs を読める");
+    let raw = std::fs::read_to_string(&path).expect("psmux_backend.rs を読める");
+    // 現場と旧アームが**コードとして**在ること。全文だと、この綴りを書いた
+    // 説明コメントで緑になり、対象テストが消えても気づけない（#1609）
+    let src = code_view::without_comments_checked(&raw, "crates/tako-core/tests/psmux_backend.rs");
     assert!(
         src.contains("fn 器はクライアント切断後もattachで内容ごと戻る"),
         "#1114 の現場（対象テスト）が走査対象に入っていない"

@@ -43,6 +43,9 @@ use std::path::{Path, PathBuf};
 /// 切り出しとアーム除去は #1252 の番犬と共有する（前処理を 2 か所に書かない）
 #[path = "common/test_source.rs"]
 mod test_source;
+
+#[path = "common/code_view.rs"]
+mod code_view;
 use test_source::{body_of, strip_arms};
 
 fn repo_root() -> PathBuf {
@@ -129,19 +132,22 @@ fn 番犬が走査対象を見つけている() {
             "{name} のアーム除去が効いていない"
         );
     }
-    // 状態待ちの実装そのものが在ること
+    // 状態待ちの実装そのものが在ること。**コメントを落とした眺め**で見る
+    // （全文だと、この綴りを書いた説明コメントで緑になる = #1609）。
+    // A/B のアーム除去はコメントの目印で測るので、そちらは `src` のまま
+    let code = code_view::without_comments_checked(&src, "crates/tako-core/src/tmux_backend.rs");
     assert!(
-        src.contains("fn wait_osc7_cwd("),
+        code.contains("fn wait_osc7_cwd("),
         "状態待ちの実装（wait_osc7_cwd）が消えている"
     );
     assert!(
-        src.contains("fn probe_osc7("),
+        code.contains("fn probe_osc7("),
         "予算切れの診断（probe_osc7）が消えている"
     );
     // 診断の採取そのものに期限が付いていること。**この診断がいちばん要るのは
     // 器が応答しない場面**なので、期限が無いと FAILED すら出ずに固まる（#1271 と同じ罠）
     assert!(
-        src.contains("fn probe_osc7_bounded(") && src.contains("recv_timeout("),
+        code.contains("fn probe_osc7_bounded(") && code.contains("recv_timeout("),
         "診断の採取から期限（probe_osc7_bounded / recv_timeout）が消えている"
     );
     // 診断が「原因を切り分けられる材料」を持っていること（#1265 の主目的）
@@ -152,7 +158,7 @@ fn 番犬が走査対象を見つけている() {
         "TAKO_1265_WAIT",
     ] {
         assert!(
-            src.contains(needle),
+            code.contains(needle),
             "予算切れの診断から {needle} が消えている（不着の原因を切り分けられなくなる）"
         );
     }

@@ -35,8 +35,19 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+#[path = "common/code_view.rs"]
+mod code_view;
+
 fn read(root: &Path, rel: &str) -> String {
     std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel} が読めない: {e}"))
+}
+
+/// **肯定の存在確認**（「この実装 / この文言が在る」）が見る眺め = コメントを落とした本文。
+///
+/// 全文へ `contains` すると、走査先の doc コメントに書いた同じ綴りで真になり、
+/// 実体が消えても緑のままになる（#1609）。不在検査は全文のままでよい
+fn read_code(root: &Path, rel: &str) -> String {
+    code_view::without_comments_checked(&read(root, rel), rel)
 }
 
 /// `needle` で始まるブロックを、波括弧の対応で切り出す（見つからなければ panic）
@@ -154,9 +165,10 @@ fn 隔離ソケット名の生成はcoreと1実装() {
              tako_core::tmux_cleanup::isolated_socket_name / self_test_socket_name を使うこと"
         );
     }
+    let code = code_view::without_comments_checked(&src, "crates/tako-app/src/main.rs");
     assert!(
-        src.contains("tmux_cleanup::isolated_socket_name")
-            && src.contains("tmux_cleanup::self_test_socket_name"),
+        code.contains("tmux_cleanup::isolated_socket_name")
+            && code.contains("tmux_cleanup::self_test_socket_name"),
         "一括隔離が core のソケット名生成を通っていない"
     );
 }
@@ -179,7 +191,7 @@ fn orphan判定はグループの生死をメンバー数で見る() {
             "{f} が共通の orphan 判定（tmux_cleanup::is_orphan）を通っていない:\n{body}"
         );
     }
-    let core = read(&root, "crates/tako-core/src/tmux_cleanup.rs");
+    let core = read_code(&root, "crates/tako-core/src/tmux_cleanup.rs");
     let body = code_only(&block_after(&core, "pub fn group_has_live_peer("));
     let checked = without_legacy(&body);
     assert!(
@@ -200,7 +212,7 @@ fn orphan判定はグループの生死をメンバー数で見る() {
 #[test]
 fn サーバー回収は所有者の生死で判定し既定はdry_runである() {
     let root = workspace_root();
-    let core = read(&root, "crates/tako-core/src/tmux_cleanup.rs");
+    let core = read_code(&root, "crates/tako-core/src/tmux_cleanup.rs");
     let judge = code_only(&block_after(&core, "pub fn judge_server_with("));
     for needle in [
         "live_owner_pids",
@@ -224,7 +236,7 @@ fn サーバー回収は所有者の生死で判定し既定はdry_runである(
     );
 
     // CLI と MCP の両方から同じ操作ができること（開発不変条件）
-    let cli = read(&root, "crates/tako-cli/src/main.rs");
+    let cli = read_code(&root, "crates/tako-cli/src/main.rs");
     assert!(
         cli.contains("servers: bool") && cli.contains("apply: bool"),
         "CLI に --servers / --apply が無い"
@@ -249,7 +261,7 @@ fn 使い捨てbackendサーバーは終了時に自分で片付ける() {
         quit.contains("owns_disposable_socket") && quit.contains("kill_server"),
         "終了時に使い捨て backend サーバーを片付けていない（#1192 の溜まる側）:\n{quit}"
     );
-    let core = read(&root, "crates/tako-core/src/tmux_cleanup.rs");
+    let core = read_code(&root, "crates/tako-core/src/tmux_cleanup.rs");
     let owns = code_only(&block_after(&core, "pub fn owns_disposable_socket("));
     assert!(
         owns.contains("isolated_socket_name") && owns.contains("self_test_socket_name"),

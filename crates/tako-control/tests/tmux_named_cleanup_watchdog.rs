@@ -28,8 +28,19 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+#[path = "common/code_view.rs"]
+mod code_view;
+
 fn read(root: &Path, rel: &str) -> String {
     std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel} が読めない: {e}"))
+}
+
+/// **肯定の存在確認**（「この実装 / この文言が在る」）が見る眺め = コメントを落とした本文。
+///
+/// 全文へ `contains` すると、走査先の doc コメントに書いた同じ綴りで真になり、
+/// 実体が消えても緑のままになる（#1609）。不在検査は全文のままでよい
+fn read_code(root: &Path, rel: &str) -> String {
+    code_view::without_comments_checked(&read(root, rel), rel)
 }
 
 /// 走査対象の製品コード（テストの器は `psmux_cleanup_timeout_watchdog` が見ている）
@@ -68,7 +79,7 @@ fn 名前一致の一括killが製品コードへ入っていない() {
 #[test]
 fn 器の強制終了はpidを名指ししている() {
     let root = workspace_root();
-    let text = read(&root, "crates/tako-core/src/tmux_cleanup.rs");
+    let text = read_code(&root, "crates/tako-core/src/tmux_cleanup.rs");
     assert!(
         text.contains("\"/PID\""),
         "Windows の強制終了が pid 指定（taskkill /PID）になっていない（#1282）"
@@ -82,7 +93,7 @@ fn 器の強制終了はpidを名指ししている() {
 #[test]
 fn 名前で列挙した器にkill_serverを使っていない() {
     let root = workspace_root();
-    let text = read(&root, "crates/tako-core/src/tmux_cleanup.rs");
+    let text = read_code(&root, "crates/tako-core/src/tmux_cleanup.rs");
     let named = text
         .split("fn reclaim_named")
         .nth(1)
@@ -99,7 +110,7 @@ fn 名前で列挙した器にkill_serverを使っていない() {
 #[test]
 fn ソケットファイルが無い環境でも器を列挙する() {
     let root = workspace_root();
-    let text = read(&root, "crates/tako-core/src/tmux_cleanup.rs");
+    let text = read_code(&root, "crates/tako-core/src/tmux_cleanup.rs");
     assert!(
         text.contains("fn scan_named_servers"),
         "名前で列挙する実装（scan_named_servers）が無い = #1282 の症状そのもの"
@@ -126,7 +137,7 @@ fn ソケットファイルが無い環境でも器を列挙する() {
 #[test]
 fn 材料が取れない器は回収対象にしていない() {
     let root = workspace_root();
-    let text = read(&root, "crates/tako-core/src/tmux_cleanup.rs");
+    let text = read_code(&root, "crates/tako-core/src/tmux_cleanup.rs");
     for needle in [
         "ServerVerdict::OwnerUnknown",
         "ServerVerdict::PeerMayReattach",

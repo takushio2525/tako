@@ -36,6 +36,21 @@ use tako_control::layout::{
 };
 use tako_core::PaneId;
 
+#[path = "common/code_view.rs"]
+mod code_view;
+
+/// **肯定の存在確認**（「この早期 return / この定数が在る」）が見る眺め =
+/// コメントを落とした本文。
+///
+/// 全文へ `contains` すると、走査先の doc コメントに書いた同じ綴りで真になり、
+/// 実体が消えても緑のままになる（#1609）
+fn read_code(rel: &str) -> String {
+    let path = repo_root().join(rel);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} を読めない: {e}", path.display()));
+    code_view::without_comments_checked(&text, rel)
+}
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -560,8 +575,7 @@ fn 何も変えなければキーは同じ() {
 /// 4: 直し方そのもの（#1001 C6）。キーの算出が capture / 直列化より**前**にある
 #[test]
 fn 変化検出はcaptureと直列化の前にある() {
-    let src = std::fs::read_to_string(repo_root().join("crates/tako-app/src/main.rs"))
-        .expect("main.rs を読めない");
+    let src = read_code("crates/tako-app/src/main.rs");
     let body = save_layout_body(&src);
     let key_at = body
         .find("layout::change_key(")
@@ -592,8 +606,7 @@ fn 変化検出はcaptureと直列化の前にある() {
 /// 4b: 借用版と保存形は 1:1（片方にだけフィールドが増えると保存漏れになる）
 #[test]
 fn パネメタの借用版と保存形は1対1() {
-    let src = std::fs::read_to_string(repo_root().join("crates/tako-control/src/layout.rs"))
-        .expect("layout.rs を読めない");
+    let src = read_code("crates/tako-control/src/layout.rs");
     let owned = struct_field_names(&src, "PaneMeta");
     let borrowed = struct_field_names(&src, "PaneMetaRef");
     assert!(!owned.is_empty(), "PaneMeta のフィールドを読めていない");

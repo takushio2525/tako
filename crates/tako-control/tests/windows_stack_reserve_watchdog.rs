@@ -43,10 +43,19 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+#[path = "common/code_view.rs"]
+mod code_view;
+
+/// build.rs の**コメントを落とした**本文（#1609）。
+///
+/// 宣言を消しても、理由を書いたコメントに同じ綴りが残っていれば緑になる形を避ける。
+/// 文字列リテラルは囲みごと残るので `/stack:` の値も `"msvc"` の照合も効く
 fn build_script(krate: &str) -> (PathBuf, String) {
     let path = workspace_root().join("crates").join(krate).join("build.rs");
     let src = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("{} を読めない: {e}", path.display()));
+    let rel = format!("crates/{krate}/build.rs");
+    let src = code_view::without_comments_checked(&src, &rel);
     (path, src)
 }
 
@@ -121,9 +130,11 @@ fn 宣言はmsvcターゲットだけに限っている() {
 fn セルフテストが起動直後に実測する側を持っている() {
     // 二段構えの 2 段目。ここが消えると、宣言が効かないビルドで
     // 「項目 80 で沈黙して死ぬ」状態（#1133 の症状そのもの）へ戻る
-    let path = workspace_root().join("crates/tako-app/src/main.rs");
+    let rel = "crates/tako-app/src/main.rs";
+    let path = workspace_root().join(rel);
     let src = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("{} を読めない: {e}", path.display()));
+    let src = code_view::without_comments_checked(&src, rel);
     assert!(
         src.contains("platform::stack::current_thread_reserve")
             && src.contains("platform::stack::shortfall_note"),

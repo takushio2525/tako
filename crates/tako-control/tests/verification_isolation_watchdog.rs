@@ -41,9 +41,20 @@ fn fn_body<'a>(text: &'a str, name: &str) -> Option<&'a str> {
     None
 }
 
+#[path = "common/code_view.rs"]
+mod code_view;
+
 fn read(rel: &str) -> String {
     let path = repo_root().join(rel);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{rel} を読めない: {e}"))
+}
+
+/// **肯定の存在確認**（「この呼び出しが在る」）が見る眺め = コメントを落とした本文。
+///
+/// 全文へ `contains` すると、走査先の doc コメントに書いた同じ綴りで真になり、
+/// 実体が消えても緑のままになる（#1609）。`.zshenv` などの非 Rust は全文のまま
+fn read_code(rel: &str) -> String {
+    code_view::without_comments_checked(&read(rel), rel)
 }
 
 /// 外部エージェントの設定の書き先は**実行時判定**で倒す。
@@ -58,7 +69,7 @@ fn 設定の書き先は実行時判定で隔離される() {
         ),
         ("crates/tako-control/src/claude_tui.rs", "env_config_dir"),
     ] {
-        let text = read(rel);
+        let text = read_code(rel);
         let body =
             fn_body(&text, func).unwrap_or_else(|| panic!("{rel}: fn {func} が見つからない"));
         assert!(
@@ -80,7 +91,7 @@ fn 設定の書き先は実行時判定で隔離される() {
 #[test]
 fn 配布系統の判別はテストプロセスで外部コマンドを起こさない() {
     let rel = "crates/tako-app/src/update_checker.rs";
-    let text = read(rel);
+    let text = read_code(rel);
     let body = fn_body(&text, "detect_install_method_full").expect("判別関数が見つからない");
     let guard = body.find("is_test_process").unwrap_or_else(|| {
         panic!("{rel}: detect_install_method_full にテストプロセスの門番が無い（#1253）")
@@ -101,6 +112,7 @@ fn 配布系統の判別はテストプロセスで外部コマンドを起こ�
 #[test]
 fn 検証の履歴はrcの後に当て直される() {
     let rel = "crates/tako-core/shell-integration/zshenv.zsh";
+    // zsh は Rust ではないので眺めを通さない（`#` コメントは code_view の対象外）
     let text = read(rel);
     assert!(
         text.contains("TAKO_VERIFY_HISTFILE"),
@@ -143,7 +155,7 @@ fn エージェントcliの問い合わせ起動は正本の門番を通る() {
             "extract_version_via_cli",
         ),
     ] {
-        let text = read(rel);
+        let text = read_code(rel);
         let body =
             fn_body(&text, func).unwrap_or_else(|| panic!("{rel}: fn {func} が見つからない"));
         assert!(
@@ -166,7 +178,7 @@ fn エージェントcliの問い合わせ起動は正本の門番を通る() {
 #[test]
 fn 問い合わせの門番はテストプロセスを実行時に見分ける() {
     let rel = "crates/tako-control/src/agent_probe.rs";
-    let text = read(rel);
+    let text = read_code(rel);
     let gate = fn_body(&text, "blocked").expect("fn blocked が見つからない");
     assert!(
         gate.contains("is_test_process"),

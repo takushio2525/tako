@@ -25,8 +25,19 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+#[path = "common/code_view.rs"]
+mod code_view;
+
 fn read(root: &Path, rel: &str) -> String {
     std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel} が読める: {e}"))
+}
+
+/// **肯定の存在確認**（「この呼び出しが在る」）が見る眺め。
+///
+/// 全文へ `contains` すると、走査先の doc コメントに書いた同じ綴りで真になり、
+/// 実体が消えても緑のままになる（#1609）。不在検査は `read` の全文のままでよい
+fn read_code(root: &Path, rel: &str) -> String {
+    code_view::without_comments_checked(&read(root, rel), rel)
 }
 
 /// `fn <name>(` の本文（次の同じインデントの `fn ` まで）を切り出す
@@ -49,7 +60,8 @@ fn fn_body(src: &str, name: &str) -> String {
 fn respondの入口はin_processを先に見る() {
     let root = workspace_root();
     let src = read(&root, "crates/tako-control/src/dispatch.rs");
-    let body = fn_body(&src, "dispatch_orchestrator_respond");
+    let code = read_code(&root, "crates/tako-control/src/dispatch.rs");
+    let body = fn_body(&code, "dispatch_orchestrator_respond");
 
     assert!(
         body.contains("crate::reach::dialog_access("),
@@ -59,7 +71,7 @@ fn respondの入口はin_processを先に見る() {
     );
     // 旧実装の形（バックエンドセッション名が無ければ即エラー）へ戻っていないこと。
     // A/B の入口（`TAKO_1200_LEGACY`）の中だけは旧経路を残してある
-    let outside_ab = body
+    let outside_ab = fn_body(&src, "dispatch_orchestrator_respond")
         .split("TAKO_1200_LEGACY")
         .next()
         .expect("split は必ず 1 つ以上返す")
@@ -74,7 +86,7 @@ fn respondの入口はin_processを先に見る() {
 #[test]
 fn 到達の解決はin_processを先に試す() {
     let root = workspace_root();
-    let src = read(&root, "crates/tako-control/src/reach.rs");
+    let src = read_code(&root, "crates/tako-control/src/reach.rs");
     let body = fn_body(&src, "dialog_access");
     let live_at = body
         .find("host.session(")
@@ -91,7 +103,7 @@ fn 到達の解決はin_processを先に試す() {
 #[test]
 fn 応答の手順は両経路で1実装を共有する() {
     let root = workspace_root();
-    let src = read(&root, "crates/tako-control/src/dispatch.rs");
+    let src = read_code(&root, "crates/tako-control/src/dispatch.rs");
     assert!(
         src.contains("pub fn respond_via("),
         "応答の手順が口越しの 1 実装になっていない（#1200）"
@@ -119,7 +131,7 @@ fn 応答の手順は両経路で1実装を共有する() {
 #[test]
 fn 自動復帰も保持しているペインへ届く() {
     let root = workspace_root();
-    let src = read(&root, "crates/tako-app/src/limit_autoresume.rs");
+    let src = read_code(&root, "crates/tako-app/src/limit_autoresume.rs");
     assert!(
         src.contains("LiveDialogAccess::new("),
         "#813 の自動復帰が in-process 経路を持っていない（#1200。器が入力送出を\

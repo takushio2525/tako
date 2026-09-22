@@ -23,8 +23,19 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+#[path = "common/code_view.rs"]
+mod code_view;
+
 fn read(root: &Path, rel: &str) -> String {
     std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel} が読める: {e}"))
+}
+
+/// **肯定の存在確認**（「この呼び出しが在る」）が見る眺め = コメントを落とした本文。
+///
+/// 全文へ `contains` すると、走査先の doc コメントに書いた同じ綴りで真になり、
+/// 実体が消えても緑のままになる（#1609）
+fn read_code(root: &Path, rel: &str) -> String {
+    code_view::without_comments_checked(&read(root, rel), rel)
 }
 
 /// `fn <name>(` の本文（**同じインデントの次の `fn ` まで**）を切り出す。
@@ -68,7 +79,7 @@ fn region(src: &str, what: &str, start: &str, end: &str) -> String {
 #[test]
 fn 送達フローの信頼ダイアログ分岐は素のenterを送らない() {
     let root = workspace_root();
-    let src = read(&root, "crates/tako-app/src/main.rs");
+    let src = read_code(&root, "crates/tako-app/src/main.rs");
     let branch = region(
         &src,
         "送達フローの信頼ダイアログ分岐",
@@ -90,7 +101,7 @@ fn 送達フローの信頼ダイアログ分岐は素のenterを送らない() 
 #[test]
 fn 自動承諾はハイライトを確認できないときenterを送らない() {
     let root = workspace_root();
-    let src = read(&root, "crates/tako-app/src/main.rs");
+    let src = read_code(&root, "crates/tako-app/src/main.rs");
     let body = fn_body(&src, "drive_trust_accept");
     assert!(
         body.contains("claude_tui::accept_step("),
@@ -118,7 +129,7 @@ fn 自動承諾はハイライトを確認できないときenterを送らない
 #[test]
 fn 器越しの送達も同じ1実装で承諾する() {
     let root = workspace_root();
-    let src = read(&root, "crates/tako-control/src/claude_tui.rs");
+    let src = read_code(&root, "crates/tako-control/src/claude_tui.rs");
     let body = fn_body(&src, "deliver_via_tmux");
     let branch = region(
         &body,
@@ -145,8 +156,8 @@ fn 器越しの送達も同じ1実装で承諾する() {
 #[test]
 fn 移動と確定の判断は1実装を共有する() {
     let root = workspace_root();
-    let tui = read(&root, "crates/tako-control/src/claude_tui.rs");
-    let dispatch = read(&root, "crates/tako-control/src/dispatch.rs");
+    let tui = read_code(&root, "crates/tako-control/src/claude_tui.rs");
+    let dispatch = read_code(&root, "crates/tako-control/src/dispatch.rs");
     // 自動承諾側
     assert!(
         fn_body(&tui, "accept_step_with").contains("tako_core::dialog::confirm_step("),

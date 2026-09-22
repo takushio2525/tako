@@ -26,6 +26,9 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+#[path = "common/code_view.rs"]
+mod code_view;
+
 fn app_main(root: &Path) -> String {
     std::fs::read_to_string(root.join("crates/tako-app/src/main.rs")).expect("main.rs が読める")
 }
@@ -128,8 +131,10 @@ fn ipcの1ターンが自動保存を消化する() {
 fn 自動保存の対象は編集セッションの状態から導く() {
     let root = workspace_root();
     let src = app_main(&root);
-    let preview = std::fs::read_to_string(root.join("crates/tako-app/src/preview.rs"))
-        .expect("preview.rs が読める");
+    let preview_rel = "crates/tako-app/src/preview.rs";
+    let preview = std::fs::read_to_string(root.join(preview_rel)).expect("preview.rs が読める");
+    // 肯定の存在確認はコメントを落とした眺めで（#1609）
+    let preview = code_view::without_comments_checked(&preview, preview_rel);
 
     // 判定の正本は preview.rs（GPUI 非依存・単体テストできる純粋関数）
     assert!(

@@ -13,6 +13,9 @@
 
 use std::path::{Path, PathBuf};
 
+#[path = "common/code_view.rs"]
+mod code_view;
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -36,10 +39,16 @@ fn advertised_actions(tool: &str) -> Vec<String> {
         .collect()
 }
 
-/// dispatch.rs の本文（アームの文字列リテラルを探す）
+/// dispatch.rs の本文（アームの文字列リテラルを探す）。
+///
+/// **コメントは落とす**（#1609）。アームを消しても「`"install" =>` を受ける」と
+/// 書いた説明コメントが残っていれば緑になる形を避ける。文字列リテラルは
+/// 囲みごと残るので、`"\"{action}\" =>"` の照合はそのまま効く
 fn dispatch_source() -> String {
-    let path = repo_root().join("crates/tako-control/src/dispatch.rs");
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} を読めない: {e}", path.display()))
+    let rel = "crates/tako-control/src/dispatch.rs";
+    let text = std::fs::read_to_string(repo_root().join(rel))
+        .unwrap_or_else(|e| panic!("{rel} を読めない: {e}"));
+    code_view::without_comments_checked(&text, rel)
 }
 
 /// `Request::<variant>` のブロックを切り出す（他の variant のアームを誤って拾わない）

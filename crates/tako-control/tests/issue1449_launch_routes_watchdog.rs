@@ -38,8 +38,21 @@ fn pwa_src() -> PathBuf {
     repo_root().join("web/tako-remote/src")
 }
 
+#[path = "common/code_view.rs"]
+mod code_view;
+
 fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{} を読めない: {e}", path.display()))
+}
+
+/// **肯定の存在確認**（「経路表を引いている」）が見る眺め = コメントを落とした本文。
+///
+/// 全文へ `contains` すると、走査先の doc コメントに書いた同じ綴りで真になり、
+/// 実体が消えても緑のままになる（#1609）。PWA（`.jsx`）は Rust ではないので
+/// この眺めを通さず全文のまま見る
+fn read_code(path: &Path) -> String {
+    let rel = path.display().to_string();
+    code_view::without_comments_checked(&read(path), &rel)
 }
 
 /// 「+」から辿り着けるすべての画面（ここが呼ぶ API は全部 role の判断を通る必要がある）
@@ -223,7 +236,7 @@ fn 新しいタブとプロセスを作る経路はmanage以上のまま() {
         );
     }
     // 認可が本当にこの表を通っているか（表だけ直して実装が別判断をしていたら意味が無い）
-    let text = read(&remote_rs);
+    let text = read_code(&remote_rs);
     assert!(
         text.contains("remote_launch::role_for("),
         "{} が `remote_launch::role_for` を引いていない。\

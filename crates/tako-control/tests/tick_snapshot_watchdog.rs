@@ -45,8 +45,19 @@ fn fn_body(src: &str, name: &str) -> Option<(String, usize)> {
     None
 }
 
+#[path = "common/code_view.rs"]
+mod code_view;
+
 fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{} を読めない: {e}", path.display()))
+}
+
+/// **肯定の存在確認**（「このゲート / この定数が在る」）が見る眺め = コメントを落とした本文。
+///
+/// 全文へ `contains` すると、走査先の doc コメントに書いた同じ綴りで真になり、
+/// 実体が消えても緑のままになる（#1609）
+fn read_code(path: &Path) -> String {
+    code_view::without_comments_checked(&read(path), &path.display().to_string())
 }
 
 /// C2: `refresh_agent_metrics` は「素のシェルを素通りする」ゲートを持ち、
@@ -55,7 +66,7 @@ fn read(path: &Path) -> String {
 fn 定期更新のメトリクス収集は全画面を撮らない() {
     let root = workspace_root();
     let main_rs = root.join("crates/tako-app/src/main.rs");
-    let src = read(&main_rs);
+    let src = read_code(&main_rs);
     let (body, line) =
         fn_body(&src, "refresh_agent_metrics").expect("refresh_agent_metrics の定義");
 
@@ -77,7 +88,7 @@ fn 定期更新のメトリクス収集は全画面を撮らない() {
 fn メトリクス抽出は末尾窓の共有定数で採る() {
     let root = workspace_root();
     let terminal_rs = root.join("crates/tako-core/src/terminal.rs");
-    let src = read(&terminal_rs);
+    let src = read_code(&terminal_rs);
     let (body, line) = fn_body(&src, "agent_metrics").expect("agent_metrics の定義");
 
     assert!(
@@ -98,7 +109,7 @@ fn メトリクス抽出は末尾窓の共有定数で採る() {
 fn キュー救出は判定の前に全画面を撮らない() {
     let root = workspace_root();
     let main_rs = root.join("crates/tako-app/src/main.rs");
-    let src = read(&main_rs);
+    let src = read_code(&main_rs);
     let (body, line) = fn_body(&src, "drive_queued_message_recovery")
         .expect("drive_queued_message_recovery の定義");
 
@@ -127,8 +138,8 @@ fn キュー救出は判定の前に全画面を撮らない() {
 #[test]
 fn 旧経路へ戻すab入口が両方とも在る() {
     let root = workspace_root();
-    let main_rs = read(&root.join("crates/tako-app/src/main.rs"));
-    let terminal_rs = read(&root.join("crates/tako-core/src/terminal.rs"));
+    let main_rs = read_code(&root.join("crates/tako-app/src/main.rs"));
+    let terminal_rs = read_code(&root.join("crates/tako-core/src/terminal.rs"));
     assert!(
         terminal_rs.contains("TAKO_1001_C2_LEGACY"),
         "C2 の A/B 入口（TAKO_1001_C2_LEGACY）が無い"
