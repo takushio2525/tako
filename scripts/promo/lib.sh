@@ -525,7 +525,7 @@ promo_ensure_oauth_fresh() {
     fi
     if [ "$left" -lt "$need" ]; then
         echo "   OAuth トークンの残り ${left}s < ${need}s → 実 HOME の claude に更新させる（デモ HOME からは更新しない）"
-        env "${PROMO_ENV_CLEAN[@]}" ${PROMO_CLAUDE_CONFIG_DIR:+"CLAUDE_CONFIG_DIR=$PROMO_CLAUDE_CONFIG_DIR"} \
+        env ${PROMO_ENV_CLEAN[@]+"${PROMO_ENV_CLEAN[@]}"} ${PROMO_CLAUDE_CONFIG_DIR:+"CLAUDE_CONFIG_DIR=$PROMO_CLAUDE_CONFIG_DIR"} \
             claude -p 'ok' --model haiku --max-turns 1 >/dev/null 2>&1 || true
         left=$(promo_oauth_expires_in)
         if [ "${left:-0}" -lt "$need" ]; then
@@ -941,7 +941,7 @@ promo_start_isolated() {
     [ "$PROMO_STAGE" = virtual ] && front_before=$(promo_frontmost_pid)
     (
         cd "$PROMO_DEMO/awesome-app"
-        env "${PROMO_ENV_CLEAN[@]}" \
+        env ${PROMO_ENV_CLEAN[@]+"${PROMO_ENV_CLEAN[@]}"} \
             ${PROMO_EXTRA_ENV[@]+"${PROMO_EXTRA_ENV[@]}"} \
             ${PROMO_CLAUDE_CONFIG_DIR:+"CLAUDE_CONFIG_DIR=$PROMO_CLAUDE_CONFIG_DIR"} \
             TAKO_ISOLATED=1 \
@@ -1013,7 +1013,7 @@ promo_stop_isolated() {
 # ローカル設定を直接書くサブコマンドは IPC を経由せず自分の data_dir を見るため、
 # 渡さないと **本番の projects.yaml / profiles を書き換えてしまう**（実際に汚染した）
 tko() {
-    env "${PROMO_ENV_CLEAN[@]}" \
+    env ${PROMO_ENV_CLEAN[@]+"${PROMO_ENV_CLEAN[@]}"} \
         TAKO_SOCKET="$PROMO_SOCKET_PATH" \
         TAKO_TOKEN="$PROMO_TOKEN" \
         TAKO_DATA_DIR="$PROMO_WORK/data" \

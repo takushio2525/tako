@@ -97,7 +97,7 @@ while IFS=$'\t' read -r id kind source anchor offset min_dur caption subtitle sp
         || preflight+=("${id}: ビート ${anchor} が ${source}-beats.tsv に無い")
 done < <(promo_timeline_rows "$TSV")
 if [ "${#preflight[@]}" -gt 0 ]; then
-    printf '!! %s\n' "${preflight[@]}" >&2
+    printf '!! %s\n' ${preflight[@]+"${preflight[@]}"} >&2
     if [ "${TAKO_PROMO_ALLOW_MISSING:-0}" != 1 ]; then
         echo "ERROR: ${#preflight[@]} 区間の前提が欠けている。飛ばしたまま完成品は作らない" >&2
         echo "       （制作中に部分ビルドをしたいときは TAKO_PROMO_ALLOW_MISSING=1）" >&2
@@ -180,12 +180,12 @@ done < <(promo_timeline_rows "$TSV")
 
 [ "${#parts[@]}" -gt 0 ] || { echo "ERROR: 区間が 1 つも作れない" >&2; exit 1; }
 if [ "${#missing[@]}" -gt 0 ]; then
-    echo "!! 素材が無い区間（飛ばした）: ${missing[*]}" >&2
+    echo "!! 素材が無い区間（飛ばした）: ${missing[*]+${missing[*]}}" >&2
 fi
 
 # ── 映像の連結（同一パラメータで作った区間なので copy で繋ぐ）───────────
 list="$WORK/concat.txt"; : > "$list"
-for p in "${parts[@]}"; do printf "file '%s'\n" "$p" >> "$list"; done
+for p in ${parts[@]+"${parts[@]}"}; do printf "file '%s'\n" "$p" >> "$list"; done
 video="$WORK/video.mp4"
 ffmpeg -nostdin -v error -y -f concat -safe 0 -i "$list" -c copy "$video"
 VDUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$video")
@@ -219,7 +219,7 @@ if [ "$n" -gt 0 ]; then
 # 振り切れて 0.0dBFS まで潰れた（実測）。測ってから当てれば、どの声でも同じ音量で出る。
 printf '%samix=inputs=%d:normalize=0:dropout_transition=0,apad=whole_dur=%s[narr];\n' "$mix" "$n" "$VDUR" >> "$fc"
 narr_flat="$WORK/narr-flat.wav"
-ffmpeg -nostdin -v error -y "${inputs[@]}" -filter_complex_script "$fc" -map "[narr]" -t "$VDUR" -ar 48000 -ac 2 "$narr_flat"
+ffmpeg -nostdin -v error -y ${inputs[@]+"${inputs[@]}"} -filter_complex_script "$fc" -map "[narr]" -t "$VDUR" -ar 48000 -ac 2 "$narr_flat"
 
 # 目標値は v2（say）の設計値そのまま。BGM を敷いたあと最終段で -14 LUFS へ寄せるので、
 # ここを動かすと BGM とナレーションの相対バランスが変わる
