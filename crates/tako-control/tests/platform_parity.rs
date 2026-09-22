@@ -1171,9 +1171,12 @@ fn canonicalizeの直呼びが境界の外に残っていない() {
         ),
         (
             "crates/tako-control/src/config_share/env.rs",
-            2,
-            "共有対象が外部 git 管理下かの比較（#513）。`git rev-parse` の戻りと \
-             突き合わせるだけで保存しない",
+            1,
+            "`same_dir()`: 除外リポジトリと `repo_root` の戻りを**両辺とも同じ関数で**\
+             解決して突き合わせるだけ（保存しない）。`probe_path` の 1 件は #1569 で \
+             境界 + `platform::path::relative_under` へ寄せた —— あちらは git の戻りと \
+             突き合わせるので「両辺が同じ形」という前提が成り立たず、\
+             「比較キー専用だから素のままでよい」の例外に入らない",
         ),
         (
             "crates/tako-control/src/remote.rs",

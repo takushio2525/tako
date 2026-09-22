@@ -237,6 +237,19 @@ Win32 のパス正規化と `MAX_PATH` 制限を無効にする**入口指定**�
   （`crates/tako-control/tests/platform_parity.rs`）が**ファイルごとの件数**で見張る。
   トラバーサル判定（`remote_files` / `remote` のアップロード）と比較キー専用の解決、
   テスト内の直呼びは表に理由つきで載っている。**増やすときは理由を書く**
+- **「比較キー専用」が免罪符になるのは両辺を同じ関数で解決するときだけ**
+  （Issue #1569）。`config_share::env::probe_path` は `canonicalize` の戻り
+  （`\\?\C:\repo\home\.claude`）を `git rev-parse --show-toplevel` の戻り
+  （`C:/repo`）へ `Path::strip_prefix` していた。`strip_prefix` は**成分単位**で
+  比べるので `Prefix(VerbatimDisk('C'))` と `Prefix(Disk('C'))` は別物になり、
+  同じ場所を指していても必ず `Err` → `unwrap_or_default()` が `repo_rel` を
+  **黙って空文字**にする（`tako config` の外部管理検出が Windows で常に誤答）
+- **出どころが違う 2 つのパスを突き合わせるなら
+  `tako_core::platform::path::relative_under`**（`strip_prefix` を使わない）。
+  verbatim prefix を**無条件で**落とし、`/` と `\` の両方を区切りとして割り、
+  ドライブ文字だけ大小を無視する。剥がす条件を付けないのは、戻り値が相対表記で
+  **Win32 へ渡らない**ため（`strip_verbatim_str` の保留条件は「剥がした結果を
+  Win32 へ渡す」ときの話）。`cfg` を書かないので macOS から Windows 形を検査できる
 - **なぜ macOS では気づけないか**: unix の `canonicalize` は prefix を付けないので、
   テストも含めて全部緑になる。Windows では `tako open-in dir <repo>` したタブの cwd が
   シェル統合の `\` → `/` 置換で **`///?/C:/…`（実在しないパス）**になり、

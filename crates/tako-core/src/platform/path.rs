@@ -136,6 +136,104 @@ pub fn strip_verbatim_str(path: &str) -> Cow<'_, str> {
     Cow::Borrowed(path)
 }
 
+/// `path` が `base` の配下なら、`base` からの相対表記（`/` 区切り）を返す。
+///
+/// **`Path::strip_prefix` の代わり**に使う: 突き合わせる 2 つのパスの
+/// **出どころが違い、同じ場所を別の表記で指す**場面のため（#1569）。
+///
+/// | 出どころ | Windows での表記 |
+/// |---|---|
+/// | `std::fs::canonicalize` | `\\?\C:\repo\home\.claude`（verbatim） |
+/// | `git rev-parse --show-toplevel` | `C:/repo`（git は `/` 区切り。#1102 で native へ寄せるが `TAKO_1102_LEGACY` では `/` のまま） |
+///
+/// `Path::strip_prefix` は**成分単位**で比べるので、`Prefix(VerbatimDisk('C'))` と
+/// `Prefix(Disk('C'))` は**別の成分**になり、同じ場所を指していても必ず `Err` を返す。
+/// 呼び出し側が `unwrap_or_default()` で受けると**空文字が黙って通る**
+/// （#1569 の実害: `tako config` の外部管理検出が Windows で常に誤答していた）。
+///
+/// ## 判定の決め方
+///
+/// - verbatim prefix は**無条件で落とす**。[`strip_verbatim_str`] が
+///   `MAX_PATH` 超えなどで剥がさずに残すのは「剥がした結果を **Win32 へ渡す**」
+///   ときの話で、ここは成分を突き合わせるだけ（戻り値はリポジトリ内の相対表記で、
+///   ファイルシステムへは渡らない）なので保留する理由が無い
+/// - 区切りは `/` と `\` の**両方**（出どころで違うため）。副作用として
+///   unix のファイル名に含まれる `\` は区切りとして割れるが、この関数の戻りは
+///   もともと `\` を `/` へ潰した表記なので、以前から区別できていない
+/// - **ドライブ文字だけ**大小を無視する（`std` の `Prefix::Disk` と同じ）。
+///   他の成分は `Path::strip_prefix` と同じく完全一致
+/// - 配下でなければ `None`。`base == path`（リポジトリルートそのもの）だけが
+///   `Some("")` で、「配下でない」と「ルートそのもの」を混ぜない
+///
+/// `cfg` を書かないので、**macOS 上から Windows 形の入力を通したテストが書ける**
+/// （このモジュールの方針。冒頭の解説を参照）
+pub fn relative_under(base: &Path, path: &Path) -> Option<String> {
+    let (Some(base_str), Some(path_str)) = (base.to_str(), path.to_str()) else {
+        // 非 UTF-8（Windows の不対サロゲート等）は文字列として扱えないので std へ委ねる
+        return path
+            .strip_prefix(base)
+            .ok()
+            .map(|rel| rel.to_string_lossy().replace('\\', "/"));
+    };
+    let base_str = unverbatim_for_compare(base_str);
+    let path_str = unverbatim_for_compare(path_str);
+    if base_str.is_empty() {
+        // 空の base は「何にでも一致する」ので受けない（git の戻りは空にならない）
+        return None;
+    }
+    let base_parts = split_components(&base_str);
+    let path_parts = split_components(&path_str);
+    if path_parts.len() < base_parts.len() {
+        return None;
+    }
+    for (index, (want, got)) in base_parts.iter().zip(path_parts.iter()).enumerate() {
+        let same = if index == 0 && is_drive_spec(want) && is_drive_spec(got) {
+            want.eq_ignore_ascii_case(got)
+        } else {
+            want == got
+        };
+        if !same {
+            return None;
+        }
+    }
+    Some(path_parts[base_parts.len()..].join("/"))
+}
+
+/// 比較のためだけに verbatim prefix を落とす（[`strip_verbatim_str`] の無条件版）。
+///
+/// 戻り値は [`relative_under`] の成分比較にしか使わず Win32 へは渡らないので、
+/// 「剥がすと Win32 の正規化が別の場所を指す」という保留条件は効かない
+fn unverbatim_for_compare(path: &str) -> Cow<'_, str> {
+    if let Some(rest) = strip_prefix_ascii_case(path, VERBATIM_UNC) {
+        return Cow::Owned(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = strip_prefix_ascii_case(path, VERBATIM) {
+        if starts_with_drive(rest) {
+            return Cow::Borrowed(rest);
+        }
+    }
+    Cow::Borrowed(path)
+}
+
+/// パスを成分へ割る。末尾の区切りは無視し（`C:\repo\` と `C:\repo` を同じに扱う）、
+/// 先頭の空成分は**残す**（`/a` と `a`、`\\server\share` と `server\share` は別物）
+fn split_components(path: &str) -> Vec<&str> {
+    let trimmed = path.trim_end_matches(crate::paths::is_path_separator);
+    if trimmed.is_empty() {
+        // unix のルート（`/`）。1 個の空成分として扱えば `/a/b` の先頭と噛み合う
+        return vec![""];
+    }
+    trimmed
+        .split(crate::paths::is_path_separator)
+        .collect::<Vec<_>>()
+}
+
+/// `C:` の形か（ドライブ文字 + コロンの 2 文字ちょうど）
+fn is_drive_spec(component: &str) -> bool {
+    let bytes = component.as_bytes();
+    bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
 /// 大小を無視した `strip_prefix`（`\\?\unc\` も受ける。`UNC` は Win32 が
 /// 大小を区別しないので、`canonicalize` の戻り以外の入力でも取り落とさない）
 fn strip_prefix_ascii_case<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
@@ -191,6 +289,107 @@ fn legacy() -> bool {
 mod tests {
     use super::*;
     use std::sync::{Mutex, MutexGuard};
+
+    /// **#1569 の本体**: `canonicalize`（verbatim）と `git rev-parse --show-toplevel`
+    /// （`/` 区切り）の食い違いを跨いで相対表記が出ること。
+    /// `Path::strip_prefix` だとここが `Err` → 呼び出し側で空文字になる
+    #[test]
+    fn verbatimとgitの表記を跨いで相対表記が出る() {
+        // git が `/` 区切りで返す形（`TAKO_1102_LEGACY` / git の生の戻り）
+        assert_eq!(
+            relative_under(Path::new("C:/repo"), Path::new(r"\\?\C:\repo\home\.claude")),
+            Some("home/.claude".to_string())
+        );
+        // #1102 で native separator へ寄せた形
+        assert_eq!(
+            relative_under(
+                Path::new(r"C:\repo"),
+                Path::new(r"\\?\C:\repo\home\.claude")
+            ),
+            Some("home/.claude".to_string())
+        );
+        // ドライブ文字の大小は無視する（`std` の `Prefix::Disk` と同じ）
+        assert_eq!(
+            relative_under(Path::new("c:/repo"), Path::new(r"\\?\C:\repo\home\.claude")),
+            Some("home/.claude".to_string())
+        );
+        // verbatim UNC と素の UNC
+        assert_eq!(
+            relative_under(
+                Path::new(r"\\server\share\repo"),
+                Path::new(r"\\?\UNC\server\share\repo\home\.claude")
+            ),
+            Some("home/.claude".to_string())
+        );
+    }
+
+    #[test]
+    fn 剥がせない形でも比較は成立する() {
+        // `MAX_PATH` 超えは `strip_verbatim_str` が verbatim のまま残すが、
+        // 比較は Win32 へ渡らないので落として突き合わせてよい
+        let deep = format!(r"\\?\C:\repo\{}", vec!["dir"; 80].join("\\"));
+        assert_eq!(
+            strip_verbatim_str(&deep),
+            deep.as_str(),
+            "前提: この長さでは剥がさない側に倒れる"
+        );
+        assert_eq!(
+            relative_under(Path::new("C:/repo"), Path::new(&deep)),
+            Some(vec!["dir"; 80].join("/"))
+        );
+    }
+
+    #[test]
+    fn 配下でなければnoneでルートそのものは空文字() {
+        // 兄弟ディレクトリ（成分の途中一致を配下と読まない）
+        assert_eq!(
+            relative_under(Path::new("C:/repo"), Path::new(r"\\?\C:\repo-other\x")),
+            None
+        );
+        // 別ドライブ
+        assert_eq!(
+            relative_under(Path::new("D:/repo"), Path::new(r"\\?\C:\repo\x")),
+            None
+        );
+        // 上位（base より短い）
+        assert_eq!(
+            relative_under(Path::new("C:/repo/sub"), Path::new(r"C:\repo")),
+            None
+        );
+        // ルートそのものだけが空文字
+        assert_eq!(
+            relative_under(Path::new("C:/repo"), Path::new(r"\\?\C:\repo")),
+            Some(String::new())
+        );
+        // 空の base は受けない
+        assert_eq!(relative_under(Path::new(""), Path::new("/a/b")), None);
+    }
+
+    #[test]
+    fn unixのパスも同じ関数で扱える() {
+        assert_eq!(
+            relative_under(
+                Path::new("/private/var/t/dotfiles"),
+                Path::new("/private/var/t/dotfiles/home/.claude")
+            ),
+            Some("home/.claude".to_string())
+        );
+        // 末尾の区切りは無視する
+        assert_eq!(
+            relative_under(Path::new("/repo/"), Path::new("/repo/a/b/")),
+            Some("a/b".to_string())
+        );
+        // ドライブ形でない先頭成分は大小を区別する（unix の既定）
+        assert_eq!(
+            relative_under(Path::new("/Repo"), Path::new("/repo/a")),
+            None
+        );
+        // ルート直下
+        assert_eq!(
+            relative_under(Path::new("/"), Path::new("/a/b")),
+            Some("a/b".to_string())
+        );
+    }
 
     #[test]
     fn ドライブ形のverbatimは剥がす() {
