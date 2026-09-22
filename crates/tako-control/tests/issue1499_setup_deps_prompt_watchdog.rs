@@ -23,6 +23,14 @@
 //! 1. 依存チェック段の対話の可否を `review` **だけ**で決めていない（ソース走査）
 //! 2. 標準 `tako setup` 相当の文脈で [`offer_for`] が `Ask` を返す（全文脈の表）
 //! 3. 導入の実行が `setup_deps::install` の 1 実装を通る（呼び手の棚卸し）
+//!
+//! ## #1524 で動いた置き場
+//!
+//! #1499 当時は表示と入力が CLI（`setup.rs` の `offer_dep_install`）にあったので、
+//! ①の入口検査も②の「計画を見せてから進む」も CLI を見ていた。#1524 でそのひと続きを
+//! `setup_deps::offer_and_install` へ寄せたので、**検査先だけ寄せ先へ移してある**
+//! （縛る中身は同じ）。CLI 側に判断や `[y/N]` が生え直したら
+//! `issue1524_setup_prompt_single_impl_watchdog` が落とす
 
 use std::path::{Path, PathBuf};
 use tako_control::setup_deps::{offer_for, DepOffer, DepOfferContext, GuideReason};
@@ -33,6 +41,7 @@ use tako_control::setup_deps::{offer_for, DepOffer, DepOfferContext, GuideReason
 mod production_range;
 
 const CLI_SETUP: &str = "crates/tako-cli/src/setup.rs";
+const SETUP_DEPS: &str = "crates/tako-control/src/setup_deps.rs";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -89,10 +98,14 @@ fn issue1499_依存チェックの対話をreviewだけで決めない() {
             hits.join("\n")
         );
     }
-    // 判断は純粋関数 1 本を通る（CLI へ条件分岐を書き戻していない）
+    // 判断は純粋関数 1 本を通る（CLI へ条件分岐を書き戻していない）。
+    // #1524 で表示と入力ごと `offer_and_install` の中へ移したので、CLI が呼ぶ入口は
+    // そちら 1 本（中で `offer_for` を通る）。`offer_for` の直呼びが CLI へ戻ったら
+    // `issue1524_setup_prompt_single_impl_watchdog` が落とす
     assert!(
-        src.contains("setup_deps::offer_for("),
-        "{CLI_SETUP}: その場導入の判断は `setup_deps::offer_for` を通すこと（#1499）"
+        src.contains("setup_deps::offer_and_install("),
+        "{CLI_SETUP}: その場導入は `setup_deps::offer_and_install`（中で `offer_for`）を\
+         通すこと（#1499 / #1524）"
     );
     // 呼び出しの形（`--review` に依らない本体経路 / 読み取り専用の `--check`）
     for shape in [
@@ -115,28 +128,29 @@ fn issue1499_依存チェックの対話をreviewだけで決めない() {
             "{CLI_SETUP}: 設定値の質問まで標準 setup へ増やしていないか（#262 / #1499）"
         );
     }
-    // 代行できない / 聞けないときの案内は最簡形 1 本（#322）
+    // 代行できない / 聞けないときの案内は最簡形 1 本（#322）。
+    // 文面の置き場は #1524 で `setup_deps`（`deps_install_hint`）へ揃った
     assert!(
-        src.contains("いま入れる: tako setup deps install"),
-        "{CLI_SETUP}: 次の一手は最簡形 1 本で出すこと（#322）"
+        production(SETUP_DEPS).contains("いま入れる: tako setup deps install"),
+        "{SETUP_DEPS}: 次の一手は最簡形 1 本で出すこと（#322 / #1524）"
     );
 }
 
-/// 聞く前・入れる前に必ず「何を・どの導入器で・どこへ入れるか」を見せる（#1499）
+/// 聞く前・入れる前に必ず「何を・どの導入器で・どこへ入れるか」を見せる（#1499）。
+///
+/// 分岐の置き場は #1524 で `setup_deps::offer_and_install` の 1 組だけになった
+/// （それまでは CLI 側にも同じ腕があり、片方だけ直る退行が起こりうる形だった）
 #[test]
 fn issue1499_導入計画を見せてから進む() {
-    let src = production(CLI_SETUP);
-    for arm in [
-        "setup_deps::DepOffer::Ask => {",
-        "setup_deps::DepOffer::AutoInstall => {",
-    ] {
+    let src = production(SETUP_DEPS);
+    for arm in ["DepOffer::Ask => {", "DepOffer::AutoInstall => {"] {
         let body = src.split(arm).nth(1).unwrap_or_else(|| {
-            panic!("{CLI_SETUP}: `{arm}` の腕が無い（#1499 の分岐が消えている）")
+            panic!("{SETUP_DEPS}: `{arm}` の腕が無い（#1499 の分岐が消えている）")
         });
         let head: String = body.lines().take(3).collect::<Vec<_>>().join("\n");
         assert!(
-            head.contains("print_dep_install_plan(state)"),
-            "{CLI_SETUP}: `{arm}` は導入計画を出してから進むこと（#1499）。実際の先頭:\n{head}"
+            head.contains("say_plan(io, state)"),
+            "{SETUP_DEPS}: `{arm}` は導入計画を出してから進むこと（#1499）。実際の先頭:\n{head}"
         );
     }
 }
@@ -313,10 +327,11 @@ fn issue1499_聞かなかった理由を人へ出す() {
 /// 別の場所で `DepInstaller::args()` からコマンドを組み直したら落ちる
 #[test]
 fn issue1499_導入は1実装を通る() {
+    // #1524 以降、`setup.rs` に残る直呼びは `tako setup deps install`（`run_deps`）
+    // だけ。本体フローは `setup_deps::offer_and_install` の中で同じ `install` を通る
     let expected: &[(&str, &str)] = &[
-        (CLI_SETUP, "offer_dep_install"),
         (CLI_SETUP, "run_deps"),
-        ("crates/tako-control/src/dispatch.rs", "dispatch"),
+        ("crates/tako-control/src/dispatch.rs", "dispatch_inner"),
     ];
     for (rel, _) in expected {
         let src = production(rel);

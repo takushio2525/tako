@@ -20,16 +20,6 @@
 
 ---
 
-## 2026-09-21（#1496: 番犬の関数名追跡を 1 実装へ寄せ、pub(crate) fn の中の違反を正しく名指しする）
-- 追跡が `strip_prefix("fn ")` だと `pub(crate) fn` / `async fn` が頭に見えず、中の違反が**手前の関数名**で報告されていた（検出は効くが名指しが嘘 = 緑のまま残る）。`tako_core::source_scan`（`fn_head_name` / `is_top_level_fn_head`）を新設し、同型 5 か所（#770 の 2 本 / remote_scrollback / issue841 / test_residue / setup_bootstrap）を差し替え。tako-core へ置いたのは tako-app の `#[cfg(test)]` と tako-control の tests の**両方**から引ける唯一の置き場だから
-- 実測（実ファイルへの注入で A/B）: `main.rs:6202` が 旧 `shelved_tab_groups` → 新 `unshelve_tab_clicked`・`main.rs:8901` が 旧 `background_tab` → 新 `reattach_backgrounded_preview`。前者は Issue の症状そのもの
-- 番犬 `issue1496_fn_head_watchdog` 2 本（直書きの再発 / 寄せ先の空振り）。注入 11 通りすべて FAILED + file:line 名指し（A 5 = 番犬が噛む / B 6 = 寄せた 5 か所の検出力が落ちていない）
-
-## 2026-09-22（#1499: tako setup の依存チェック段で未検出の CLI 依存を [y/N] から入れられるようにした）
-- 真因は回帰ではなく**#1057 の復活が `--review` 経路だけ**だったこと（`run_setup` は `run_dependency_check(review_mode && …)` のまま）。隔離環境でパイプ・実 PTY・`--review` の 3 通りを実走させ、前 2 つの出力が 1 文字も変わらないことで TTY 判定説を潰してから着手。当時の `標準setupは依存の質問をしない` が旧呼び出し形を文字列で固定しており、**直そうとすると番犬が止める**状態だった
-- 判断を理由つき純粋関数 `setup_deps::offer_for`（`Ask` / `AutoInstall` / `Guide(cannot_run|check_only|legacy|no_terminal)`）1 本へ。CLI は表示と入力だけ。`interactive` 1 つが担っていた「依存を入れるか」と「設定値を見直すか」を `DepCheckMode` で分離（**#262 が守るのは後者**）。`--yes` は同意扱い・非 TTY は案内へ落として止まらない。再検出は `setup_deps::resolve`（検出と同じ規則）
-- 実測: `scripts/test-setup-deps-prompt-1499.sh` **52 PASS 0 FAIL**（CI の macOS ジョブへ登録）。番犬 5 本・注入 7 通りすべて FAILED → 戻して緑。A/B `TAKO_1499_LEGACY=1` は端末でも聞かない = Issue の症状。workspace 5040 passed 0 failed・clippy 3 宇宙 0。**受け入れ検査 rework 1 回目**: CI の `/bin/bash`（3.2）は `set -u` 下の空配列 `"${arr[@]}"` を未定義扱いにして PASS=43 FAIL=9（手元の bash 5 では出ない）→ `${arr[@]+"${arr[@]}"}` へ直し規約を conventions へ
-
 ## 2026-09-22（#1502: tako CLI を外部ターミナルからも打てるようにした）
 - `tako setup` の段として `$HOME/.local/bin/tako` へ symlink を張り、**その置き場所だけ**を `~/.zprofile` のマーカーブロック（1 組のまま）へ通す。**実体のディレクトリは PATH へ入れない**（`.app` の `Contents/MacOS` は tako-app ごと / dev の `target/debug` は依存クレートごと PATH へ出るうえ、`.app` を動かすと黙って切れる）。`$HOME/.local/bin` は 3 系統のランチャーと同じ置き場所なので macOS ではブロックの中身は 1 ディレクトリのまま = 既存ユーザーの profile の形が変わらない
 - 途中で踏んだ真因 2 つ: ①claude が ready だとエージェントの PATH 段は走らないので「ついで」に載せると設置されない（= `run_setup` の独立した段にした）②「もう通っているか」を**プロセスの PATH** で測ると #601 の注入で必ず「通っている」に見える。`$SHELL -l -c` も**継承した PATH を `path_helper` が引き継ぐ**ので、launchd の既定 PATH へ戻してから起こす必要があった
@@ -54,3 +44,8 @@
 - #1499 は判断（`offer_for`）と実行（`install`）を共有しただけで**表示と確認は呼び手に残していた**ので、`remote setup` の [1/5] は `brew install tailscale` を自前で組み直したままだった。案内 → `[y/N]` → 導入 → 再検出のひと続きを `setup_deps::offer_and_install`（字下げだけ呼び手が渡す）へ移し、1 件だけ引く `status_of` を追加。`remote_setup.rs` から素の `Command::new("brew")` が消えたので **Windows のコンソール窓を出す起動も 1 件減った**（`platform_parity` の表を更新）
 - 割れていた 4 点を出荷版との A/B で実測: brew が無い機は**聞いてから起動に失敗して中断**（新: 聞かずに `要 Homebrew`）／非 TTY は EOF を N と読むだけ（新: 理由つき案内）／「入れたのに引けない」は案内なしで中断／どこへ入るかを出さない。MCP の非対話経路は従来どおり導入しない
 - 実測: `scripts/test-remote-setup-deps-1509.sh` **49 PASS 0 FAIL**（CI 登録。隔離 HOME + brew スタブ + `TAKO_TAILSCALE_BIN` で未導入を偽装。[2/5] 未ログインで止まるので serve に触れない）・#1499 回帰 52 PASS・番犬 3 本で注入 5 通りすべて FAILED → 戻して緑・workspace 5081 passed 0 failed・clippy 3 宇宙 0・check-windows error 0
+
+## 2026-09-22（#1524: 標準 tako setup の依存 [y/N] を setup_deps::offer_and_install の 1 呼び出しへ寄せた）
+- #1499 は判断 / 実行 / 再検出を寄せたが**表示と入力は呼び手に残し**、#1509 が束ねた `offer_and_install` も #1501 と同時進行だったため標準 setup は差分ゼロのままだった（体験を組む層が 2 か所）。`setup.rs` の `offer_dep_install` / `print_dep_install_plan` / `print_dep_manual_hint` を消し、`DepPromptIo`（stderr + stdin + 字下げ 6 マス）を渡す 1 呼び出しへ。再検出も中で済むので `resolve` の 2 度引き（ログインシェル起動）と `find_command("brew")` の先引きが各 1 回消えた
+- 同時に判明 = `[警告] … インストール後も検出できません` は**到達しない分岐**だった（導入器が成功して引けないときは `install` が `Err` を返し `[警告] {e}` 側へ落ちる）。実測でも before / after とも 0 件なので削除した
+- 実測: 隔離実走 13 本の出力が**バイト単位で一致**（文面の差分 0）。`test-setup-deps-prompt-1499.sh` 52 PASS / `test-remote-setup-deps-1509.sh` 49 PASS / `test-setup-continue-1501.sh` 81 PASS / `test-tako-cli-path-1502.sh` 49 OK。番犬 `issue1524_setup_prompt_single_impl_watchdog` 4 本・注入 10 通りすべて FAILED → 戻して緑。workspace 5107 passed 0 failed・clippy 3 宇宙 0・check-windows error 0
