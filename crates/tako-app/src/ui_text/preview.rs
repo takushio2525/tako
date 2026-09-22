@@ -110,8 +110,11 @@ pub fn tail_omitted() -> &'static str {
         "… (tail omitted for large file)"
     )
 }
+/// 動画の再生ボタンの**語**（#1536）。
+/// 印（三角）は `file_icons::ui_icon::PLAY` を `svg()` で描くので、ここは文字だけ持つ
+/// （もとは `\u{25b6}\u{fe0e}` = 絵文字を異体字セレクタでテキスト表示へ倒す書き方だった）
 pub fn video_play() -> &'static str {
-    tr!("\u{25b6}\u{fe0e} 再生", "\u{25b6}\u{fe0e} Play")
+    tr!("再生", "Play")
 }
 pub fn video_resolution(w: u32, h: u32) -> String {
     tr!(

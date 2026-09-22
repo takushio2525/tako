@@ -8,7 +8,8 @@
 //! 運用ルール（`.agent/conventions.md`「UI 文字列の i18n」）:
 //! - 新機能の UI 文字列は必ず日英両方を用意する（`tr!(日本語, English)`）
 //! - コマンド文字列・パス・ロゴ等の言語非依存文字列は `pub const` のまま置いてよい
-//! - 絵文字は使わない（#217。`all_texts_have_both_languages_and_no_emoji` が機械検査）
+//! - 絵文字は使わない（#217。`all_texts_have_both_languages_and_no_emoji` が機械検査。
+//!   判定は `tako_core::emoji::is_emoji` の 1 実装 = #1536）
 
 /// 現在の表示言語で日英どちらかの式を返す。match 展開なので選ばれた側だけ評価される
 /// （`tr!(format!(..), format!(..))` でも未選択側の format は走らない）
@@ -177,15 +178,16 @@ pub(crate) mod tests_support {
         tako_core::platform::keys::modifier_enter(tako_core::platform::support::Platform::MacOs)
     }
 
+    /// 判定は `tako_core::emoji::is_emoji` の 1 実装を通す（#1536）。
+    /// ここに写しを置くと、`crates/tako-app/src` を走査する番犬
+    /// （`issue1536_no_emoji_ui_watchdog`）と範囲がずれて
+    /// 「片方は緑・片方は赤」になる
     fn assert_no_emoji(s: &str) {
         for c in s.chars() {
-            let cp = c as u32;
             assert!(
-                !(0x1F000..=0x1FAFF).contains(&cp)
-                    && !(0x2600..=0x27BF).contains(&cp)
-                    // FE0E（テキスト表示強制）は絵文字化を防ぐ側なので許可。FE0F のみ拒否
-                    && cp != 0xFE0F,
-                "絵文字らしき文字 {c:?} (U+{cp:04X}) が文字列 {s:?} に含まれている"
+                !tako_core::emoji::is_emoji(c),
+                "絵文字らしき文字 {c:?} (U+{:04X}) が文字列 {s:?} に含まれている",
+                c as u32
             );
         }
     }

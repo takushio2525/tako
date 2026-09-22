@@ -155,6 +155,8 @@ static EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
     ui_asset!("search"),
     ui_asset!("split"),
     ui_asset!("stop"),
+    // プレビュー検索の置換欄の印（#1536。絵文字は使わない = #217）
+    ui_asset!("swap"),
     ui_asset!("sun"),
     ui_asset!("tasks"),
     ui_asset!("trend"),
@@ -220,6 +222,9 @@ pub mod ui_icon {
     /// 起動 ⇔ 停止トグルの停止側（#615。PLAY と対になる ■）
     pub const STOP: &str = "icons/ui/stop.svg";
     pub const SUN: &str = "icons/ui/sun.svg";
+    /// プレビューの検索置換欄の印（#1536。左右 2 本の矢印 = 置き換え）。
+    /// 絵文字（`↔` U+2194）を置き換えた枠（#217 の「UI に絵文字を使わない」）
+    pub const SWAP: &str = "icons/ui/swap.svg";
     /// 右パネル tasks タブ（#1450 B2。チェックリストのパス。絵文字は使わない）
     pub const TASKS: &str = "icons/ui/tasks.svg";
     pub const TREND: &str = "icons/ui/trend.svg";

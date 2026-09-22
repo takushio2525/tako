@@ -457,3 +457,4 @@
 - 2026-09-22 #1501: 未認証・未導入でも setup が全段やって完走するようにした
 - 2026-09-22 #1509: remote setup の Tailscale 導入を setup_deps の 1 実装へ寄せた
 - 2026-09-22 #1524: 標準 tako setup の依存 [y/N] を setup_deps::offer_and_install の 1 呼び出しへ寄せた
+- 2026-09-22 #1525: AGENTS.md の予算の余地を作り、activeContext を現在状態へ戻した

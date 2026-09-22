@@ -13,6 +13,7 @@ pub mod command_card;
 pub mod context_budget;
 pub mod ctx_usage;
 pub mod dialog;
+pub mod emoji;
 pub mod file_uri;
 pub mod fnv;
 pub mod git;
