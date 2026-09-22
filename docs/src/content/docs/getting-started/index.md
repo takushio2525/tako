@@ -9,7 +9,7 @@ tako を使い始めるまでの手順を、前提知識がない方でも上か
 
 1. **tako 本体をインストールする**（Homebrew または ZIP）
 2. **tako を起動する**
-3. **`tako setup` を実行する** — AI 連携に必要な設定を質問ゼロでまとめて行うコマンド
+3. **`tako setup` を実行する** — AI 連携に必要な設定をまとめて行うコマンド（必要なものが揃っていれば質問は出ません）
 4. **動作確認**
 
 AI 連携を使わず「ただのターミナル」として使う場合は、手順 1〜2 だけで完了です。
@@ -65,7 +65,7 @@ brew install --cask takushio2525/tako/tako
 tako --version
 ```
 
-バージョン番号（例: `tako 0.6.0`）が表示されれば成功です。
+バージョン番号（例: `tako 0.8.17`）が表示されれば成功です。
 
 ### 方法 B: ZIP ダウンロード
 
@@ -87,21 +87,30 @@ mv tako.app /Applications/
 
 **tako を起動して、その中のターミナルで使う分には、これで準備完了です。** tako が開くシェルには `tako` コマンドの置き場所が自動で追加されるので、[クイックスタート](/getting-started/quickstart/)の `tako setup` はそのまま打てます。
 
-#### 外部ターミナルでも使いたい場合（ZIP のみ・任意）
+#### 外部ターミナルからも `tako` と打ちたい場合（ZIP のみ）
 
-Terminal.app や iTerm2 など **tako の外**のターミナルからも `tako` と打ちたいときだけ、PATH に登録します（Homebrew なら自動）。
+Terminal.app や iTerm2 など **tako の外**のターミナルでも `tako` を使いたいときは、**手で PATH を書く必要はありません**。手順 3 の `tako setup` が、その段でまとめて設置します（Homebrew でインストールした場合は cask が済ませているので何も要りません）。
+
+`tako setup` がやることは 2 つです。
+
+- `$HOME/.local/bin/tako` に本体へのシンボリックリンクを 1 本張る（claude / codex / agy のランチャーと同じ置き場所です）
+- そのディレクトリが PATH に無ければ、`~/.zprofile` にマーカー付きのブロックを 1 組だけ追加する
+
+セットアップ全体より先に、この設置だけを済ませることもできます。
 
 ```bash
-# zsh（macOS 標準のシェル）の場合
-echo 'export PATH="/Applications/tako.app/Contents/MacOS:$PATH"' >> ~/.zshrc
-source ~/.zshrc
+tako setup bootstrap path
 ```
 
-登録できたか確認:
+**新しいターミナルを開いてから** `tako --version` が通れば設置済みです（判定は「これから開くターミナルが見る PATH」で行うため、実行中のターミナルには反映されません）。元に戻すときは `tako setup bootstrap undo-path` で、`~/.zprofile` のブロックとシンボリックリンクの両方が外れます。
 
-```bash
-tako --version
-```
+:::note[`tako.app` の中を直接 PATH に入れない理由]
+アプリの中にある実行ファイルの置き場所そのものを PATH に足す方法は使いません。そこには `tako`（CLI）だけでなく本体の実行ファイルも同居しているので丸ごと PATH に出てしまい、さらに `tako.app` を別の場所へ移動した時点で黙って切れるためです。シンボリックリンク方式なら、`.app` を移動しても次に tako を起動したときに張り直されます。
+
+**以前の版のこのページでは、`~/.zshrc` に `tako.app` のパスを含む `export PATH=...` の行を足す手順を案内していました。** その行が残っている場合は削除してかまいません（`tako setup bootstrap path` で設置し直せます）。
+:::
+
+Windows のインストーラー版は、インストール先（`%LOCALAPPDATA%\Programs\tako`）を `HKCU\Environment\Path` に登録します（シンボリックリンクは権限が要るため使いません）。
 
 ### 方法 C: Windows（インストーラー / ポータブル zip）
 
@@ -169,14 +178,20 @@ tako setup
 
 実行すると、次の処理が自動で順に行われます。
 
-1. **エージェント CLI と依存ツールのチェック** — claude / codex / agy をすべて検出します。認証済み CLI が1つなら自動選択し、複数なら前回値または安全な既定を採用します。**1 つも使える系統が無いときだけ**、その場で導入を案内します（上の tip 参照）。tmux / git は任意依存として状態と導入コマンドだけを表示します
+1. **エージェント CLI と依存ツールのチェック** — claude / codex / agy をすべて検出します。認証済み CLI が1つなら自動選択し、複数なら前回値または安全な既定を採用します。**1 つも使える系統が無いときだけ**、その場で導入を案内します（上の tip 参照）。tmux / git / Tailscale などの任意依存は、見つからなければ「何をどのコマンドで入れるか」を表示したうえで `tmux をインストールしますか？ [y/N]:` と **1 回だけ確認し、`y` ならその場で導入して再検出します**（`--yes` は確認を省いて導入、パイプ越しなど端末のない実行では導入せず案内だけを出します）
 2. **認証・プラン確認** — Claude は認証と Pro / Max 等、Codex は認証と ChatGPT プランを取得できる範囲で自動判定します。検出不能でも安全に未指定にできる情報は `unknown` を採用します。token やアカウント情報は保存・表示しません
 3. **MCP 接続の準備** — 検出したエージェント CLI すべてへ tako の MCP サーバーを登録します。書き込み先は claude が `~/.claude.json`、codex が `~/.codex/config.toml` の `[mcp_servers.tako]`、agy が `~/.gemini/config/mcp_config.json` です（claude だけは `tako setup-mcp --project` で `<cwd>/.mcp.json` にも入れられます）。**書き先が `~/.claude/settings.json` だったのは古い tako で、いまはそこに残った設定を掃除する側です。** codex はこれに加えて、master / worker として起動するときに起動コマンドへその場でも MCP 設定を渡します（tako の外で立ち上げた codex にツールを出さないための経路です）
 4. **推奨 profile の生成** — プラン規模に応じて master / worker、effort、worker ポリシーを `profiles/default.yaml` へ生成します。モデル名は固定せず、各 CLI の最新の既定モデルを使います。既存 profile はそのまま維持します
 5. **指示とテンプレートの準備** — 指示ファイルが未作成なら安全な開発ルールの既定値を作り、セットアップ用ファイル一式を tako のデータディレクトリ配下（macOS は `~/Library/Application Support/tako/setup/`、Windows は `%APPDATA%\tako\setup\`）に展開します。既存の指示は上書きしません
 6. **同梱推奨ルールとの比較** — 既存の指示ファイルを、tako が同梱する推奨ルール（言語 / 対話スタイル / Git 運用 / コード品質 / 安全ルール / 提案品質 / 完了検証の 7 項目）と項目レベルで突き合わせ、不足の可能性を具体的に表示します。差分がなければ「差分なし」と明示します。表示のみで、ファイルは書き換えません
 7. **設定共有の状況確認** — 別の PC と設定を共有する仕組み（[`tako config`](/guides/cli-reference/#tako-config)）について、配線済みか / `~/.claude` が既に dotfiles などの git で管理されていないか / `gh` にログイン済みかを調べ、状態と次の一手を表示します。**調べるだけ**で、リポジトリの作成や配線は起こりません。配線済みなら状態が 1 行出るだけで、設定を勧める案内は出ません
-8. **最終サマリと次の一歩** — 値の由来を `detected` / `previous` / `default` / `input` で表示し、実際に変えた項目だけを最後にまとめます。続けて `tako master` での始め方（起動して日本語で話しかけるだけ）とプロファイルの現在値を案内し、tako 内での対話実行ならその場で master の開始を提案します。認証済み単一 CLI の標準ケースでは人間への質問はありません
+8. **最終サマリと次の一歩** — 値の由来を `detected` / `previous` / `default` / `input` で表示し、実際に変えた項目だけを最後にまとめます。続けて `tako master` での始め方（起動して日本語で話しかけるだけ）とプロファイルの現在値を案内し、tako 内での対話実行ならその場で master の開始を提案します。エージェント CLI が 1 つだけ認証済みで、依存も揃っている標準ケースでは、人間への質問は 1 つも出ません
+
+### 途中でつまずいても、できるところまで進みます
+
+ログインが済んでいない、依存が入らなかった、MCP 登録に失敗した — こうした段があっても `tako setup` は**そこで止まりません**。認証の要らない段（依存の導入・MCP 登録・指示ファイル・`profiles/default.yaml`・テンプレート展開・シェル統合・`tako` CLI の PATH 設置）を最後まで済ませてから、**人の操作が要るものだけを「残り N 件」として次に打つコマンド付きで**表示します。
+
+もう一度 `tako setup` を実行すると、済んだ段は素通りして残りから再開します。「完了しました」と表示されるのは、残りが 0 件になったときだけです。
 
 :::note[MCP とは？]
 MCP（Model Context Protocol）は、AI エージェントが外部ツールを操作するための共通規格です。tako は MCP サーバーを内蔵しており、claude または codex の master が「ペインを分割する」「コマンドを実行する」「ファイルを表示する」といった操作を直接行えます。
@@ -245,11 +260,11 @@ tako setup --changes
 ```
 tako setup アップデート追従状況
 ─────────────────────────────
-  現在の setup リビジョン: 12（tako v0.6.0）
-  適用済みリビジョン: 11（tako v0.5.6 で setup 実行）
+  現在の setup リビジョン: 19（tako v0.8.17）
+  適用済みリビジョン: 18（tako v0.8.7 で setup 実行）
   未適用の変更: 1 件
 
-  [rev 12 / v0.6.0 / 2026-07-17] リモート接続を Tailscale Serve へ一本化 + setup ウィザード新設
+  [rev 19 / v0.8.14 / 2026-09-14] この環境固有のルール（prompt_blocks.append）が長くても予算に収まるようになった
       区分: auto（setup 再実行で自動適用）
       ...
 
@@ -266,18 +281,63 @@ tako setup アップデート追従状況
 tako setup --check
 ```
 
+次は「エージェント CLI は 3 つとも入っているが、まだどれにもログインしていない」Mac での実行例です。
+
 ```
 tako セットアップ 環境チェック
 ─────────────────────────────
+  [不足] エージェント CLI の導入: 使える系統がありません
+         tako setup を実行すると、ここから最後まで案内します
+         [不足] claude: Claude アカウントにログインします (auth)
+         [不足] codex: ChatGPT アカウントにログインします (auth)
+         [不足] agy: Google アカウントにログインします (auth)
+  [不足] tako CLI の PATH: 外部ターミナルからは使えません（設置先が PATH に入っていません）
+         tako setup bootstrap path で設置できます
   エージェント CLI:
-    [検出] claude: /opt/homebrew/bin/claude（認証済み / pro）
-    [検出] codex: /opt/homebrew/bin/codex（認証済み / plus）
-  [OK] 既定エージェント: codex
-  [OK] 申告・検出プラン: claude=pro, google=free, gpt=plus
+    [検出] claude: /Users/<ユーザー名>/.local/bin/claude（未認証 / プラン不明）
+    [検出] codex: /Users/<ユーザー名>/.local/bin/codex（未認証 / プラン不明）
+    [検出] agy: /Users/<ユーザー名>/.local/bin/agy（未認証 / プラン不明）
+  [OK] tmux: /opt/homebrew/bin/tmux
+  [OK] git: /usr/bin/git
+  [OK] tailscale: /usr/local/bin/tailscale
+  [OK] フルディスクアクセス: 付与済み（許可ダイアログは表示されません）
+
+  スリープ防止: mode=while-agents-running, power=ac-only
+      設定変更: tako sleep-guard set --mode <mode> --power <condition>
+  [不足] Claude MCP: tako が未登録（tako setup-mcp で登録できます）
+  [不足] codex MCP: tako が未登録（tako setup-mcp で登録できます）
+  [不足] agy MCP: tako が未登録（tako setup-mcp で登録できます）
+  [OK] Codex: master 起動時にも一時注入
+  [情報] agy: worker 専用（master は非対応）
+  [情報] config.yaml: 未作成
+  [情報] ~/.claude/CLAUDE.md: 未作成
+  [情報] ~/.codex/AGENTS.md: 未作成
+  [情報] ~/.gemini/GEMINI.md: 未作成
+  [情報] エージェント共通ルール同期: 未設定
+  [OK] スリープ防止: mode=while-agents-running, power=ac-only
+  [情報] 蓋閉じ防止: 未設定（tako sleep-guard install-lid-sleep で有効化）
   [情報] 設定共有: 未配線（複数デバイスで同じ AI 設定を使うなら `tako config init`）
+  [情報] プロファイル: 未作成（tako master で自動生成されます）
+
+残り 4 件（ここから先は人の操作が必要です）:
+  1. Claude アカウントへのログイン
+     claude auth login
+     ブラウザでの操作が要るため tako は代行しません
+  2. claude への tako MCP 登録
+     tako setup-mcp
+     登録が無いと AI から tako の画面を操作できません
+  3. codex への tako MCP 登録
+     tako setup-mcp
+     登録が無いと AI から tako の画面を操作できません
+  4. agy への tako MCP 登録
+     tako setup-mcp
+     登録が無いと AI から tako の画面を操作できません
+済んだら tako setup をもう一度実行してください（残りはここから再開します）
 ```
 
-`[不足]` や未認証と表示された項目が、まだ済んでいない設定です。
+読み方は 4 つのラベルだけです。`[OK]` は済んでいるもの、`[不足]` はまだ済んでいないもの、`[検出]` と `[情報]` は状態の報告（対応は不要）です。末尾の「残り N 件」が、**人の操作が要るぶんだけ**を抜き出したものです。ここが 0 件になれば、その行ごと出なくなります。
+
+`--check` は表示だけで、設定は一切書き換えません。
 
 ### やり直したいとき
 
@@ -349,11 +409,15 @@ Homebrew 経由なら `brew upgrade --cask takushio2525/tako/tako` でも更新�
 
 ### `tako` コマンドが見つからない（command not found）
 
-**tako の中のターミナル**で出た場合は、tako を再起動してみてください（`tako` の置き場所は tako の起動時に解決されます）。**tako の外**のターミナルで出た場合は PATH が通っていません。Homebrew でインストールした場合はターミナルを開き直し、ZIP からインストールした場合は上記の「外部ターミナルでも使いたい場合」の手順を実施してください。
+**tako の中のターミナル**で出た場合は、tako を再起動してみてください（`tako` の置き場所は tako の起動時に解決されます）。
+
+**tako の外**のターミナルで出た場合は PATH が通っていません。`tako setup bootstrap path` を実行してから、**ターミナルを開き直して**もう一度試してください（PATH の設置は次に開くターミナルから効きます）。`tako setup --check` の `tako CLI の PATH` の行で、設置済みかどうかを確認できます。
 
 ### `tako setup` が「エージェント CLI が見つかりません」と言う
 
-claude / codex / agy のいずれも PATH にありません。使う CLI を導入し、`<CLI名> --version` が通ることを確認してから再実行してください。tako はエージェント CLI 自体のインストールは行いません。
+claude / codex / agy のいずれも PATH にありません。**この状態でも `tako setup` をそのまま実行して構いません** — 公式インストーラでの導入・PATH 通し・ログイン案内までを順に案内します（何をどこに入れるかは実行前に必ず表示され、管理者権限は使いません）。
+
+系統を指定して入れたいときは `tako setup bootstrap install --agent codex` のように 1 コマンドで足せます。状態だけ見るなら `tako setup bootstrap status-all` です。**ログインだけはブラウザ操作が必要なのでご自身で**行ってください（`claude auth login` / `codex login` / 引数なしの `agy` 起動）。
 
 ### MCP ツールが認識されない（AI が tako を操作できない）
 
@@ -377,8 +441,10 @@ tmux バックエンドが無効になっている可能性があります。`ta
 ## 次のステップ
 
 - [クイックスタート](/getting-started/quickstart/) — `tako master` を起動して AI オーケストレーションを最短で体験する
-- [タブ＆ペイン管理](/features/tabs-and-panes/) — 画面分割やショートカットを覚える
+- [タブ＆ペイン管理](/features/tabs-and-panes/) — 画面分割とタブの使い分け
+- [キーボードショートカット](/guides/keyboard-shortcuts/) — 分割・移動・タブ操作の打鍵を覚える
 - [オーケストレーションとは](/features/orchestration/) — AI エージェントを並列に働かせる tako の目玉機能
+- [スマホからのリモート接続](/features/remote/) — 外出先のスマホから master と話し、ファイルを直す
 - [設定とカスタマイズ](/guides/settings/) — テーマ・表示言語・入力予測などの調整
 - [CLI リファレンス](/guides/cli-reference/) — `tako` コマンド全一覧
 - [リリースノート](/releases/) — 各バージョンの変更内容
