@@ -18212,6 +18212,10 @@ mod tests {
     /// 差し替えると並列で走る他のテストと混ざる（#1274 の教訓）。`~` 起点の解決は
     /// `links.rs` の単体（ホームを引数で注入）と隔離 GUI の実測が担保する
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows は `C:\\…` のバックスラッシュ絶対パスをリンクにしない（宣言済みの縮退。platform::support の tako_links = Degraded / #153）"
+    )]
     fn links_は画面テキストの3形から地の文に埋まったパスを検出する_1283() {
         let mut host = MockHost::new();
         let dir = std::env::temp_dir().join(format!("tako_dispatch_1283_{}", std::process::id()));
@@ -18264,6 +18268,10 @@ mod tests {
 
     /// #1283: `open` はディレクトリと拡張子で変わる（表の正本は `tako_core::open_plan`）
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows は `C:\\…` のバックスラッシュ絶対パスをリンクにしない（宣言済みの縮退。platform::support の tako_links = Degraded / #153）"
+    )]
     fn links_の_open_はディレクトリと拡張子で変わる_1283() {
         let mut host = MockHost::new();
         let dir =
@@ -19420,10 +19428,43 @@ mod tests {
 
     // --- TreeFolder テスト (#134) ---
 
+    /// テスト用の実在ディレクトリ（`/tmp` 直書きは Windows に存在しない。#1278 / #640）
+    fn tree_test_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tako-1278-tree-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れる");
+        dir
+    }
+
+    /// 一時ディレクトリに「実体 + それを指すシンボリックリンク」を作る（#1278）。
+    ///
+    /// 元は macOS の `/tmp` → `/private/tmp` を当てにしていたが、これは **macOS 固有**で
+    /// Windows には `/tmp` すら無い。自分で張れば両 OS で同じ性質（別綴りでも
+    /// 正規パスが同じなら 1 件）を検査できる。**Windows の symlink 作成には昇格
+    /// （管理者 / 開発者モード）が要る**ので、作れない環境は `None` を返し、
+    /// 呼び出し側が理由を出して skip する
+    fn symlinked_dir(tag: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let base = tree_test_dir(tag);
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).ok()?;
+        let link = base.join("link");
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&real, &link);
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_dir(&real, &link);
+        if made.is_err() {
+            let _ = std::fs::remove_dir_all(&base);
+            return None;
+        }
+        Some((real, link))
+    }
+
     #[test]
     fn tree_folder_追加と一覧と削除() {
         let mut host = MockHost::new();
         let pane = host.root_pane();
+        let dir = tree_test_dir("crud");
+        let dir_arg = dir.to_string_lossy().to_string();
 
         // 一覧: 初期は空
         let list = dispatch(
@@ -19440,12 +19481,12 @@ mod tests {
         .unwrap();
         assert_eq!(list["folders"].as_array().unwrap().len(), 0);
 
-        // 追加: /tmp（存在するディレクトリ）
+        // 追加（存在するディレクトリ。`/tmp` 直書きは Windows に無い。#1278）
         let added = dispatch(
             &mut host,
             Request::TreeFolder {
                 action: "add".into(),
-                path: Some("/tmp".into()),
+                path: Some(dir_arg.clone()),
                 tab: None,
                 pane: Some(pane),
                 limit: None,
@@ -19475,7 +19516,7 @@ mod tests {
             &mut host,
             Request::TreeFolder {
                 action: "add".into(),
-                path: Some("/tmp".into()),
+                path: Some(dir_arg.clone()),
                 tab: None,
                 pane: Some(pane),
                 limit: None,
@@ -19490,7 +19531,7 @@ mod tests {
             &mut host,
             Request::TreeFolder {
                 action: "remove".into(),
-                path: Some("/tmp".into()),
+                path: Some(dir_arg.clone()),
                 tab: None,
                 pane: Some(pane),
                 limit: None,
@@ -19514,6 +19555,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(list["folders"].as_array().unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -19593,16 +19635,22 @@ mod tests {
 
     #[test]
     fn tree_folder_symlink経由の重複追加は1エントリに畳まれる() {
-        // macOS: /tmp は /private/tmp へのシンボリックリンク
+        let Some((real, link)) = symlinked_dir("dedup") else {
+            eprintln!(
+                "skip: この環境ではディレクトリの symlink を作れない\
+                 （Windows は管理者 / 開発者モードが要る）"
+            );
+            return;
+        };
         let mut host = MockHost::new();
         let pane = host.root_pane();
 
-        // /tmp で追加（canonicalize → /private/tmp）
+        // リンク側で追加（canonicalize → 実体）
         let r1 = dispatch(
             &mut host,
             Request::TreeFolder {
                 action: "add".into(),
-                path: Some("/tmp".into()),
+                path: Some(link.to_string_lossy().to_string()),
                 tab: None,
                 pane: Some(pane),
                 limit: None,
@@ -19612,12 +19660,12 @@ mod tests {
         .unwrap();
         assert_eq!(r1["status"], "added");
 
-        // /private/tmp で追加（同じ正規パス → already_exists）
+        // 実体側で追加（同じ正規パス → already_exists）
         let r2 = dispatch(
             &mut host,
             Request::TreeFolder {
                 action: "add".into(),
-                path: Some("/private/tmp".into()),
+                path: Some(real.to_string_lossy().to_string()),
                 tab: None,
                 pane: Some(pane),
                 limit: None,
@@ -19642,26 +19690,34 @@ mod tests {
         .unwrap();
         assert_eq!(list["folders"].as_array().unwrap().len(), 1);
 
-        // 表示名は basename（/private/tmp の file_name = "tmp"）
+        // 表示名は basename（正規パス = 実体側なので `real`）
         let folder_path = list["folders"][0].as_str().unwrap();
         let basename = std::path::Path::new(folder_path)
             .file_name()
             .unwrap()
             .to_string_lossy();
-        assert_eq!(basename, "tmp");
+        assert_eq!(basename, "real");
+        let _ = std::fs::remove_dir_all(real.parent().expect("親がある"));
     }
 
     #[test]
     fn tree_folder_symlink経由でも削除できる() {
+        let Some((real, link)) = symlinked_dir("remove") else {
+            eprintln!(
+                "skip: この環境ではディレクトリの symlink を作れない\
+                 （Windows は管理者 / 開発者モードが要る）"
+            );
+            return;
+        };
         let mut host = MockHost::new();
         let pane = host.root_pane();
 
-        // /tmp で追加
+        // リンク側で追加
         dispatch(
             &mut host,
             Request::TreeFolder {
                 action: "add".into(),
-                path: Some("/tmp".into()),
+                path: Some(link.to_string_lossy().to_string()),
                 tab: None,
                 pane: Some(pane),
                 limit: None,
@@ -19670,12 +19726,12 @@ mod tests {
         )
         .unwrap();
 
-        // /private/tmp で削除（同じ正規パスなので成功する）
+        // 実体側で削除（同じ正規パスなので成功する）
         let removed = dispatch(
             &mut host,
             Request::TreeFolder {
                 action: "remove".into(),
-                path: Some("/private/tmp".into()),
+                path: Some(real.to_string_lossy().to_string()),
                 tab: None,
                 pane: Some(pane),
                 limit: None,
@@ -19698,6 +19754,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(list["folders"].as_array().unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(real.parent().expect("親がある"));
     }
 
     #[test]

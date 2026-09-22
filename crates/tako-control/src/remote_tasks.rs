@@ -700,10 +700,22 @@ mod tests {
         std::fs::create_dir_all(dir.join("real")).expect("実体");
         std::fs::write(dir.join("real/v6.mp4"), b"x").expect("添付");
         let link = dir.join("link");
+        // **symlink が作れなければこの検査は成立しない**（#1278）。
+        // 以前は非 unix で `link = real` へ倒していたが、そうすると
+        // 「素の綴りでは当たらない」という前提の assert が自分で崩れる。
+        // Windows の symlink 作成は昇格（管理者 / 開発者モード）が要る
         #[cfg(unix)]
-        std::os::unix::fs::symlink(dir.join("real"), &link).expect("symlink");
-        #[cfg(not(unix))]
-        let link = dir.join("real");
+        let made = std::os::unix::fs::symlink(dir.join("real"), &link);
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_dir(dir.join("real"), &link);
+        if made.is_err() {
+            eprintln!(
+                "skip: この環境ではディレクトリの symlink を作れない\
+                 （Windows は管理者 / 開発者モードが要る）"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
 
         let roots = vec![TreeRoot {
             id: "aaaaaaaaaaaa".into(),

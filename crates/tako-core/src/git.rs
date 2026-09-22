@@ -2423,6 +2423,19 @@ mod tests {
             std::fs::create_dir_all(&dir).expect("mkdir");
             let repo = TempRepo { dir };
             repo.git(&["init", "-q", "-b", "main"]);
+            // **リポジトリの config へ書く**（#1278）。下の `git()` は env で identity を
+            // 渡すが、**製品の関数（`merge` / `checkout` 等）が起こす git には届かない**。
+            // グローバル identity の無い機では `git merge` が
+            // 「Committer identity unknown」で落ちる（CI の Windows ランナーは
+            // ホスト名が `…(none)` になり auto-detect も失敗する = 実測）
+            repo.git(&["config", "user.name", "t"]);
+            repo.git(&["config", "user.email", "t@example.com"]);
+            // 改行変換も**リポジトリの config で切る**（#1278）。Git for Windows は
+            // `core.autocrlf=true` を system config に置くので、製品の関数が起こす git が
+            // 作業ツリーへ書くとき LF が CRLF へ化ける（実測: マージ後の本文が
+            // `"a\r\nMAIN\r\nc\r\n"`）。テストは本文をバイト単位で比べるので揺らさない
+            repo.git(&["config", "core.autocrlf", "false"]);
+            repo.git(&["config", "core.eol", "lf"]);
             repo
         }
 

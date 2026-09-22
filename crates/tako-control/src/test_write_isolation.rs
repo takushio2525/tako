@@ -113,8 +113,21 @@ mod tests {
         dir
     }
 
-    /// 「本番相当の場所」= 空の `HOME` の下に出来たファイル全部。
-    /// 何が出来たかを人が読める形で返す（0 件なら空 Vec）
+    /// **tako の書き込みではない**ので数から除くもの（#1278）。
+    ///
+    /// 子は実シェルを起こす（#1253 のシェル probe）。`HOME` / `LOCALAPPDATA` を
+    /// 差し替えた隔離では、**そのシェル自身が**自分のキャッシュをこの木の下へ書く。
+    /// tako は 1 バイトも関与しないので「本番相当の置き場へ tako が書いた」ではない。
+    /// CI の Windows ランナーで実測: PowerShell が
+    /// `AppData/Local/Microsoft/Windows/PowerShell/StartupProfileData-NonInteractive`
+    /// を書く。**前方一致で最小限だけ**除き、増やすときは「誰が書いたか」を必ず書く
+    const NOT_TAKO_WRITES: &[&str] = &[
+        // PowerShell 5.1 / 7 の起動プロファイルキャッシュ（pwsh 自身が書く）
+        "AppData/Local/Microsoft/Windows/PowerShell/",
+    ];
+
+    /// 「本番相当の場所」= 空の `HOME` の下に出来たファイル全部
+    /// （[`NOT_TAKO_WRITES`] を除く）。何が出来たかを人が読める形で返す（0 件なら空 Vec）
     fn files_under(root: &Path) -> Vec<String> {
         fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) {
             let Ok(entries) = std::fs::read_dir(dir) else {
@@ -136,6 +149,7 @@ mod tests {
         }
         let mut out = Vec::new();
         walk(root, root, &mut out);
+        out.retain(|p| !NOT_TAKO_WRITES.iter().any(|skip| p.starts_with(skip)));
         out.sort();
         out
     }

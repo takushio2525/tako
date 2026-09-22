@@ -216,28 +216,28 @@ jobs:
       # そのまま使う（実機実測: `--no-run` の後の `cargo test --workspace` は再コンパイル 0）
       - name: テストのコンパイル検査（#1264。結果ではなくビルドを守る）
         run: cargo test --workspace --no-run
-      # Windows のテストは #574 でビルドが通るようになって初めて実行され、POSIX 前提の
-      # 既存テスト 18 件（ps / symlink / `~` 展開 / sh 前提の spawn 等）が落ちている。
-      # 内訳と対応は Issue #583（#467 Windows 移植の子タスク）。
-      # **#583 が片付くまで Windows のテストは非ブロッキング**にする。ビルドは
-      # blocking のまま（このジョブの主目的は Windows ビルドスモークのため）
-      - name: テスト（#583 が片付くまで非ブロッキング）
-        continue-on-error: true
-        run: cargo test --workspace
       # #1282: 器の列挙が使う Win32 FFI（`NtQueryInformationProcess` でのコマンドライン /
       # `GetProcessTimes` での起動時刻）は **macOS では 1 行も実行できない**。
-      # 上の `cargo test --workspace` は tako-app の既知失敗（#583）でそこで打ち切られ、
-      # tako-core まで届かない（実測 2026-09-11: 622 passed / 1 failed で終了 = 以降のクレートは未実行）。
-      # そこで FFI を実際に叩く検査だけ名指しで走らせ、**ここは blocking にする**
-      # （構造体レイアウトの転記ミス・情報クラス番号・FILETIME の起点は他で捕まらない）。
+      # 全数（下のステップ）より**手前に名指しで置く**のは、そこが赤いと
+      # 以降のステップが skip されて「FFI が通ったのか」が読めなくなるため。
       # テストバイナリは上のステップで作ってあるので追加の所要は数秒
       - name: Windows FFI の実行検査（#1282。プロセスのコマンドライン / 起動時刻）
         run: cargo test -p tako-core --lib platform::procinfo
-      # #1314: psmux は **Windows でしか動かない器**なのに、上の `cargo test --workspace` は
-      # 非ブロッキングかつ tako-app の既知失敗（#583）でそこで打ち切られるため、
-      # tako-core のテストは Windows で 1 件も走っていない（#1282 と同じ状況）。
-      # conf の差し替えは NTFS の rename 意味論（開かれている置換先・`FILE_SHARE_DELETE`）に
-      # 依存するので、**この器のテストだけは Windows でも実際に走らせて blocking にする**。
+      # #1314: psmux は **Windows でしか動かない器**。conf の差し替えは NTFS の rename
+      # 意味論（開かれている置換先・`FILE_SHARE_DELETE`）に依存するので、
+      # この器のテストも**全数より手前**に名指しで置く（#1282 と同じ理由）。
       # テストバイナリは上のステップで作ってあるので追加の所要は数秒
       - name: psmux バックエンドの実行検査（#1314。conf の原子的な差し替えを含む）
         run: cargo test -p tako-core --lib backend::psmux
+      # **ワークスペース全体のテストを blocking にする**（#1278 / #583）。
+      # #583 は「POSIX 前提の既存失敗が残っているあいだ非ブロッキング」で据え置いていたが、
+      # そのあいだに未検出が溜まり、実機で 19 → 24 件まで増えていた（#1278）。
+      # テスト側の前提を直し、Windows に存在しない仕組みを見るものだけを
+      # **理由つきで名指し skip** へ寄せたので、ここを結果まで blocking にする。
+      #
+      # `--no-fail-fast` が要る: 既定の cargo は最初に失敗したテストバイナリで打ち切るので、
+      # 1 件目の失敗の先にあるクレートが 1 件も走らない（実測 2026-09-22 の main:
+      # tako-app の 1 件で止まり、tako-control / tako-core は 0 件実行）。
+      # これでは「直したら次が出る」を 1 PR 1 往復でしか進められない
+      - name: テスト（#1278 で blocking 化。全数を採るため --no-fail-fast）
+        run: cargo test --workspace --no-fail-fast

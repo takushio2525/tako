@@ -4085,7 +4085,14 @@ mod tests {
         assert!(err.contains("codex"), "どの CLI かを名指しする: {err}");
         // 文言は表示言語で変わるので**言語に依らない事実**で見る（#608 / #807 の作法）。
         // 「次の一手」が日英そろっていることは agent_cli 側のテストが担保する
-        assert!(err.contains("install.sh"), "導入コマンドが要る: {err}");
+        // 導入コマンドの正本は `agent_install::current_recipe`（#1278 / #920）。
+        // リテラルの `install.sh` は macOS のレシピにしか無く Windows で落ちる
+        let install = tako_core::platform::agent_install::current_recipe(
+            tako_core::platform::agent_install::AgentKind::Codex,
+        )
+        .source
+        .official_command;
+        assert!(err.contains(install), "導入コマンドが要る: {err}");
         let err = choose_setup_agent(&agents, "3").expect_err("未導入は選べない");
         assert!(err.contains("agy"), "{err}");
         // 未導入ぶんより後ろは範囲外

@@ -3827,6 +3827,89 @@ Windows で `load` が採れることを実機が保証する / `file_uri` 2 本
 番犬 4 本）。tako-core の failed が 14 → 13 に減っているが、passed も 1266 → 1314 と
 増えている（main が 9/2 から進んでいる）ので**この PR に帰せられる差ではない**。
 
+### CI の Windows は blocking になった（#1278 / #583。2026-09-22）
+
+**CI の Windows ジョブの `cargo test --workspace --no-fail-fast` は結果まで blocking**。
+`continue-on-error: true`（#583 の据え置き）を外した。倒し戻しは番犬
+`crates/tako-control/tests/ci_windows_test_compile.rs` が止める。契約の全文は
+`.agent/conventions.md`「CI の Windows ジョブの契約」節。
+
+#### なぜ据え置きをやめたか（実測）
+
+据え置いているあいだ**新しい赤が見えなかった**。`--no-fail-fast` が無いので既定の
+cargo は最初に失敗したテストバイナリで打ち切る。main の run 35723282752（9/22）の実測:
+
+```
+tako-app: running 698 tests → 694 passed; 1 failed   ← keybindings の 1 件
+（tako-cli / tako-control / tako-core は 1 件も実行されていない）
+```
+
+**1 回の CI で 1 件しか直せない**状態だった。`--no-fail-fast` を足して全数を採ったのが
+run 35735202680 で、**5064 passed / 21 failed / 40 ignored**。21 件のうち
+**13 件は 9/9 のベースライン（24 件）に無い**= その後 main へ増えた未検出ぶん
+（`tako_cli_path` = #1502 は当日のもの）。
+
+#### 収束（3 往復）
+
+| 巡 | run | Windows の結果 |
+|---|---|---|
+| 1 | 35735202680 | **5064 passed / 21 failed / 40 ignored** |
+| 2 | 35739986689 | **5076 passed / 2 failed / 47 ignored**（`git` の CRLF と `test_residue`） |
+| 3 | 35743661929 | **5077 passed / 0 failed / 48 ignored**（両ジョブ success） |
+
+2 巡目の 2 件はどちらも**1 巡目の修正が 1 段進めた先**に出たもの:
+`git` は identity が通った次に `core.autocrlf` の CRLF が出た。
+`test_residue` は 4 → 3 件（`tako-shell-profile-partial-…` は他のテストが
+`cleanup()` へ到達しなかった**連鎖**で、直したら消えた）。
+
+#### CI ランナーと実機は別物（照合に使わない）
+
+ランナーには **psmux / tmux / claude / codex CLI が無く、セッション 1 でもない**。
+逆にランナー固有で落ちるものがある（実測）:
+
+| ランナー固有の性質 | 落ちたテスト |
+|---|---|
+| `%TEMP%` が **8.3 短縮名**（PowerShell は長い名前を報告） | `shell_integration_powershell` の cwd 追従 3 本 |
+| git の **グローバル identity が無く auto-detect も失敗**（ホスト名が `…(none)`） | `git::マージ成功とコンフリクトと中止` |
+| Git for Windows の system config が **`core.autocrlf=true`**（製品の関数が起こす git が作業ツリーへ CRLF で書く） | 同上（identity を直したら次に出た） |
+| 子が起こす PowerShell が `%LOCALAPPDATA%` へ起動キャッシュを書く | `test_write_isolation` 2 本 |
+
+**ディレクトリの symlink は作れた**（`dispatch` / `tab` / `remote_tasks` の
+symlink テストが CI Windows で緑）。実機（非昇格）では作れないので、
+どちらでも動く形（作れなければ理由を出して skip）にしてある。
+
+#### 理由つき skip の allowlist（**10 件**。増やすときは Issue 番号を書く）
+
+| 件数 | テスト | 理由 | 追跡 |
+|---|---|---|---|
+| 3 | `links::detect_absolute_path` / `cwd不明でも絶対パスとホーム起点は検出する` / `tuiの装飾付きsoft_wrapをまたぐパスを検出する` | `C:\…` のバックスラッシュ絶対パスはリンクにしない = **宣言済みの縮退**（`platform::support` の `tako_links` = `Degraded`） | #153（設計判断。close 済み） |
+| 2 | `dispatch::links_は画面テキストの3形…_1283` / `links_の_open_は…_1283` | 同上（fixture が絶対パス） | 同上 |
+| 1 | `remote::is_process_aliveは現在のプロセスをtrueで返す` | `remote.rs` の私的ヘルパが非 unix で無条件 `false`。境界 `pid_alive` を通っていない | **#1557** |
+| 1 | `config_share::env::リポジトリ配下の実体も外部管理として検出する` | `canonicalize` の verbatim と git の `/` 表記で `strip_prefix` が外れ `repo_rel` が空（#970 の型） | **#1569** |
+| 1 | `prompt_budget_1477::baseは予算内で追記の取り分を残している` | Windows は `platform` 片 4110 B（縮退の自動生成）で base が 18944 B を 1.7〜2.7 KB 超える。**macOS 側は blocking のまま** | **#1571** |
+| 1 | `remote_fs_e2e::解決できないホストは接続前に分類される` | 分類は正しいが接続経路が戻らない（実機 536 秒）。blocking な CI でぶら下がると run を失う | #930 / #1090 |
+| 1 | `test_residue::テストを一巡してもtmpdirに残骸が残らない` | `atexit` からの `remove_dir_all` は Windows では開いたハンドルがあると失敗する（孫プロセスがまだ握っている）。起動時の掃除も `ports::process_alive` が常に `true` なので動かない | **#1581** |
+
+（`platform::bundle_install` 2 本は `#[cfg(target_os = "macos")]` で**存在しない**ので
+allowlist に数えない。`RENAME_SWAP` 相当が無い側では `MoveAside` が正しい答え）
+
+**理由の無い skip は 0 件**で、番犬
+`crates/tako-control/tests/issue1278_ignore_reason_watchdog.rs` が 2 つの規則で縛る:
+
+1. 理由の無い `#[ignore]` / `#[cfg_attr(…, ignore)]` を `file:line` で落とす
+2. **Windows だけを外す skip は理由に追跡番号（`#1557` 等）を持つ**
+   = allowlist が黙って増えない（「直したら ignore を外す」が Issue 側から辿れる）
+
+3 巡目の実測で、この allowlist の 10 件が**すべて追跡番号つきで `ignored` に出ている**
+ことを確認した（`cargo test` の出力にそのまま並ぶ）。
+
+#### 実機ベースラインとの差
+
+上の 24 件のうち **`stale_binary` 2 件と `解決できないホスト` 以外はこの PR で処置済み**。
+実機で次に `--no-fail-fast` を回すときは、**CI Windows の緑を前提に**
+「CI に無い層（psmux / 実 tmux / 実 claude / セッション 1）だけが残る」形を期待してよい。
+残る実機依存は #1073 / #1278（項目 105 / 143 の負荷依存）・#1438 / #1314 / #971。
+
 ### 次に実機を触る人への申し送り（#1090 / #1091 の着手用）
 
 - **証拠と道具は `<実機の dev>\tako-evidence-1073\` に残してある**（リポの外）:

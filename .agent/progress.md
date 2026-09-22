@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-22（#760: 自動命名がシェルの実行ファイルパスを掴まないようにした）
-- Windows のコンソールタイトルはシェル / psmux **自身**のフルパスなので、`heuristic_plan()` が OSC タイトルを最優先すると 16 文字で切った `C:\Program Files` / `C:\Users\<user>\A` が**全タブ同じ名前**になっていた（9/9 実機レビュー = 初回起動の第一印象）。`shell_exe_material()` の関門で捨てて cwd へ落とす。cwd の末尾要素は `Path::file_name` をやめ `last_segment()` へ（Unix は `\` を区切りにしないので Windows 形の素材が丸ごと 1 要素になる。Windows 形と判定したときだけ `\` も見る）
-- 指紋（cwd / OSC タイトル / 実行状態）はシェル統合の無い Windows で 3 つとも不変 = 命名がペインを開いた直後の 1 回で終わる件は、`tick()` に「同じ指紋のままやり直した回数」を持たせ `STALE_RETRY_DELAYS`（5 分 → 20 分 → 60 分）で再発火する形にした（使い切れば静まる）。画面末尾を指紋へ混ぜる本命は `main.rs` 側なので #1568 へ
-- 実測: 実 GUI の A/B（隔離・tako-vd。関門を外すと `C:\Program Files`、入れると cwd 由来 + 診断 1 行）・注入 7 通りすべて file:line 名指しで FAILED → 戻して緑・workspace 5113 passed 0 failed・clippy 3 宇宙 0・check-windows error 0
-
 ## 2026-09-23（#1539: MCP ツールカタログを起動時ロードの予算対象にした）
 - 予算表（progress 12 KB / AGENTS 30 KB / import 40 KB / global 24 KB / system prompt 24 KB ≒ 130 KB）に MCP カタログの項目が無く、**それより大きい 201,535 バイト / 152 本が誰にも測られていなかった**。`ItemKind::McpCatalog` と `MCP_CATALOG_MAX_BYTES`（210 KB）を足し、採取を `tako_control::context_budget::mcp_catalog` の 1 実装へ寄せて `inventory` に載せた（CLI 表示 / `--json` / MCP `tako_context_budget` の 3 経路が同じ 1 件を見る）。測るのは snapshot ではなく実行時に組み立てた `mcp::tools()`。1 本の JSON なので行数は測らない（`lines: 0`）
 - 上限をバイトで置いた根拠 = 実トークナイザ tiktoken `o200k_base` で **52,028 トークン**（3.87 B/tok。参考 `cl100k_base` 62,997）に対し、日本語主体で較正した既存 `estimate_tokens` は 94,934 と**約 1.8 倍**に出る。210 KB は現状 +6.7% で、#1540 の圧縮後に締め直す前提をコードのコメントへ明記。`catalog.rs` は 1 行も触らない（#1540 と並走）
@@ -49,3 +44,8 @@
 - 「復元成功: N タブ / M ペイン（…）」の内訳合計が M と合わない行が本番 52 行中 8 行あり、個別の spawn 失敗は `eprintln!` 止まり（GUI の stderr はどこにも出ない）で痕跡ゼロだった。AGENTS.md が「再起動後にエージェントが戻らないとき」の正本として案内している診断そのものの穴。無言の `continue` は Issue の 2 経路ではなく 5 経路（たまり場 / 退避タブ配下 / Web ビュー / spawn 失敗 / resume 入力の宛先なし）
 - **実測で差の正体は「たまり場・退避」だった**: 合わない 8 行はすべて #1487 着地（9/21）以降で、そのときの layout.json は 17 ペイン中 1 件がたまり場・1 件が退避タブ配下（Web ビューとプレビューは 0 件）。この 2 種は「表に出すときに起こす」設計なので失敗にせず別カテゴリで数える。件数・1 行目・2 行目の正本を `tako_control::restore_report` へ寄せ、区間（ラベルと件数）の列が合計の出どころ = カテゴリを 1 つ落とすと合計も落ちる形に。個別の失敗は `復元失敗（ペイン N）: <分類>: <エラー>` を 1 行ずつ、それでも合計が合わなければ食い違い自体を 1 行（FR-5.7.1 / A/B は `TAKO_1554_LEGACY=1`）
 - 実測: `scripts/test-restore-breakdown-1554.sh` **39 PASS 0 FAIL**（隔離 GUI で実 tako-app を 4 回起動。CI 未登録 = 実 GUI が要る）・単体 9 + 番犬 8・注入 12 通りすべて file:line 名指しで FAILED → 戻して緑・workspace 5144 passed 0 failed・clippy 3 宇宙 0・check-windows error 0。[提案] = `$VAR` の直後の全角で bash が変数名へ取り込む罠（番犬候補）/ たまり場・退避のペインが復元で器を引き継がず「復帰」タブへ別ペインとして戻る（実測済み・要 Issue）
+
+## 2026-09-23（#1278 / #583: CI の Windows の cargo test を blocking にした）
+- `continue-on-error: true`（#583 の据え置き）のあいだ**新しい赤が見えなかった**のが本題。全数を `--no-fail-fast` の blocking へ（既定の cargo は最初に落ちたバイナリで打ち切るので、main の CI は tako-app の 1 件で止まり tako-control / tako-core が 0 件実行だった = 1 回で 1 件しか直せない）。名指しの実行検査（#1282 / #1314）は全数より手前へ move
+- 4 往復で収束: **21 → 2 → 0 failed**（1 巡目 failure → 3 巡目 success が「blocking になった」実証。わざと壊す必要は無かった）。21 件のうち **13 件は 9/9 のベースライン 24 件に無い** = その後 main へ増えた未検出ぶん。テスト側を直した 20 件は期待値を製品の正から作る型（`current_recipe` / `cli_file_name` / `Path::join` / `join_paths` / `temp_dir`）+ `display()` 比較を `Path` 比較へ + `-EncodedCommand` の復号 + 自前 symlink。ランナー固有は 8.3 短縮名 / git identity 不在 / `core.autocrlf=true` / pwsh 自身の書き込みの 4 系統
+- 理由つき skip は **10 件すべて追跡番号つき**。製品側の実バグは #1557 / #1569 / #1571 / #1581 へ起票（製品コードは 1 行も触っていない）。番犬は 2 規則（理由なし ignore を落とす / Windows だけの skip に `#<数字>` を要求）で、`ci_windows_test_compile` の「非ブロッキング据え置き」は反転した

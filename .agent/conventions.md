@@ -2131,6 +2131,53 @@ CI 完了前に merge され（merge 04:24:10 / Windows 完了 04:48:24）、過
   A/B は `TAKO_1430_LEGACY=1`（ローカルを後始末せず、MERGED の再実行を 1 で拒む腕）。
   モックは Test 24〜29 が固定し、**ローカルブランチと作業ツリーだけは実 git** を触る
 
+## CI の Windows ジョブの契約（Issue #1278 / #583 / #1264）
+
+**Windows ジョブの `cargo test --workspace --no-fail-fast` は blocking**。
+壊れたら CI は赤になる。ここを `continue-on-error` へ倒し戻してはいけない
+（番犬 `crates/tako-control/tests/ci_windows_test_compile.rs`）。
+
+- #583 は「POSIX 前提の既存失敗が残っているあいだ非ブロッキング」で据え置いていたが、
+  **そのあいだに未検出が溜まった**。実機のベースラインは 19 → **24 件**まで増え、
+  それが見えたのは #1264 でコンパイルが直った 5 日後（#1278）。
+  非ブロッキングは「今の赤を許す」だけでなく「**新しい赤が見えなくなる**」
+- **`--no-fail-fast` は必須**。既定の cargo は最初に失敗したテストバイナリで打ち切るので、
+  その先のクレートが 1 件も走らない（実測 2026-09-22 の main: tako-app の 1 件で止まり
+  tako-control / tako-core は 0 件実行）。全数が採れないと 1 回の CI で 1 件しか直せない
+- ステップの順は「コンパイル検査（`--no-run`）→ 名指しの実行検査（Win32 FFI = #1282 /
+  psmux = #1314）→ **全数**」。名指しを**手前**に置くのは、全数が赤いと以降のステップが
+  skip されて「FFI は通ったのか」が読めなくなるため。名指しのステップに
+  `--workspace` を付けてはいけない（全数を 1 本に保ち、ログで責任を分ける）
+
+### CI ランナーと実機は別物として扱う
+
+Windows ランナーには **psmux / tmux / claude / codex CLI が無く、セッション 1 でもない**。
+同じ `cargo test` でも実機とは違う集合が走る（実機のベースライン = `.agent/plans/2026-08-windows-main-merge-wip.md`）。
+**CI が緑 ≠ 実機が緑**。実機の照合は従来どおり失敗名で突き合わせる。
+
+### Windows で成立しないテストの扱い（3 択。黙って塗り潰さない）
+
+1. **テストの前提を直す**（第一選択）。ほとんどは「期待値を `/` 直書きで持っている」
+   「`/tmp` を直書きしている」「PATH を `:` で組んでいる」「macOS のレシピ文字列を
+   リテラルで持っている」。**期待値は製品の正から作る**（`Path::join` の結果・
+   `agent_install::current_recipe`・`std::env::join_paths`・`std::env::temp_dir`）。
+   `display()` の文字列で比べるのをやめて **`Path` 同士で比べる**だけで直るものも多い
+   （`Path` の比較は components 単位なので区切りの綴りに依らない）
+2. **実行時に理由を出して skip**（材料が作れない環境）。`eprintln!("skip: …")` +
+   `return` で、**なぜ作れないか**を書く（例: 「Windows は symlink 作成に昇格が要る」
+   「非 unix の `process_alive` は常に true = 死んだ pid を報告しない」）
+3. **`#[cfg(...)]` / `#[cfg_attr(windows, ignore = "理由")]`**（その OS に仕組みが無い /
+   製品側の穴が別 Issue で追われている）。**理由の無い skip は禁止**で、
+   番犬 `issue1278_ignore_reason_watchdog` が `#[ignore]` /
+   `#[cfg_attr(…, ignore)]` を `file:line` で落とす。さらに
+   **Windows だけを外す skip は理由に追跡番号（`#1557` 等）を持つ**こと
+   （= allowlist が黙って増えない）。`#[cfg(...)]` で外すときは
+   **すぐ上に doc コメントで理由**を書く（属性からは理由が読めないため）
+
+**製品側の穴をテストの skip で隠すときは必ず Issue を立て、`ignore` の理由文に番号を書く**
+（例: #1557 = `remote::is_process_alive` が Windows で常に false）。
+「直したら ignore を外す」が Issue 側からも辿れる状態にする。
+
 ## 設定・データファイルのスキーマ変更（Issue #916）
 
 **永続ファイルの形式や置き場を変えるときは自動移行を同梱する。手動移行を要求しない。**

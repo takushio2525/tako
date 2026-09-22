@@ -1588,8 +1588,20 @@ set -gq copy-mode-position-format ''
     /// 掃除対象へ戻ること。実 tmux で「グループは残るがメンバー数は戻る」を踏む
     #[test]
     fn issue1188_ビューを閉じた元セッションは掃除対象へ戻る() {
-        if !crate::backend::capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        // この検査は**本物の tmux のグループ意味論**（`new-session -t` で
+        // `#{session_group_size}` が増減する）に依っている。tmux 互換を名乗る別実装
+        // （Windows の psmux）は同じ値を返さないので、「器があるか」
+        // （`survives_app_exit`）ではなく「本物の tmux を引けるか」で入る（#1278）。
+        // 判定は `tmux::announces_only_tmux` の 1 実装（#873 と同じ規則）
+        let Some(version) = crate::tmux::version_announcement() else {
+            eprintln!("skip: tmux 系の CLI が無い環境");
+            return;
+        };
+        if !crate::tmux::announces_only_tmux(version) {
+            eprintln!(
+                "skip: tmux 互換の別実装（{}）。グループ意味論が本物の tmux と違う",
+                version.lines().next().unwrap_or("").trim()
+            );
             return;
         }
         let socket = format!("tako-coretest-{}-grouped", std::process::id());

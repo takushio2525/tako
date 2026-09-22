@@ -384,12 +384,27 @@ mod tests {
         assert_ne!(ShellKind::Bash.login_profile_rel(), ".bashrc");
     }
 
+    /// PATH の区切りは OS 依存（`:` / `;`）。**fixture も `std::env::join_paths` で
+    /// 組む**（`:` 直書きだと Windows では 1 エントリに見えて必ず外れる。#1278）
+    fn joined_path(entries: &[&str]) -> String {
+        std::env::join_paths(entries.iter().map(Path::new))
+            .expect("PATH を組める")
+            .to_string_lossy()
+            .to_string()
+    }
+
     #[test]
     fn path判定は完全一致で行う() {
         let dir = Path::new("/home/u/.local/bin");
-        assert!(path_contains("/usr/bin:/home/u/.local/bin:/bin", dir));
+        assert!(path_contains(
+            &joined_path(&["/usr/bin", "/home/u/.local/bin", "/bin"]),
+            dir
+        ));
         // 部分一致で誤検出しない
-        assert!(!path_contains("/usr/bin:/home/u/.local/bin2", dir));
+        assert!(!path_contains(
+            &joined_path(&["/usr/bin", "/home/u/.local/bin2"]),
+            dir
+        ));
         assert!(!path_contains("", dir));
     }
 
@@ -440,7 +455,7 @@ mod tests {
     fn 既にpathにあるならファイルを触らない() {
         let home = temp_home("already");
         let dir = home.join(".local/bin");
-        let current = format!("/usr/bin:{}", dir.display());
+        let current = joined_path(&["/usr/bin", &dir.to_string_lossy()]);
         let out = ensure_dir_on_path_in(&home, ShellKind::Zsh, &dir, Some(&current)).unwrap();
         assert_eq!(out.change, PathChange::AlreadyOnPath);
         assert!(!out.profile.exists(), "profile を作ってしまっている");
@@ -631,7 +646,7 @@ mod tests {
         let home = temp_home("partial");
         let a = home.join(".local/bin");
         let b = PathBuf::from("/opt/tako/bin");
-        let current = format!("/usr/bin:{}", a.display());
+        let current = joined_path(&["/usr/bin", &a.to_string_lossy()]);
         let out = ensure_dirs_on_path_in(
             &home,
             ShellKind::Zsh,
@@ -640,7 +655,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.change, PathChange::Installed);
-        let both = format!("{current}:{}", b.display());
+        let both = joined_path(&["/usr/bin", &a.to_string_lossy(), &b.to_string_lossy()]);
         let out2 = ensure_dirs_on_path_in(&home, ShellKind::Zsh, &[a, b], Some(&both)).unwrap();
         assert_eq!(out2.change, PathChange::AlreadyOnPath);
         cleanup(&home);

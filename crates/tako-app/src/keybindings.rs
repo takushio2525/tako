@@ -1437,7 +1437,25 @@ mod tests {
                 "{action} のバインドが非 macOS に残っている"
             );
         }
-        assert!(macos_only_bindings().is_empty());
+        // `macos_only_bindings()` は「macOS だけに張る表」**そのもの**なので常に非空。
+        // #1278 まで `is_empty()` を見ていたが、このテストは非 macOS でしか
+        // コンパイルされない（= macOS の CI では 1 度も走らない）ので、
+        // 実機の Windows で初めて落ちた。見るべきは「表の中身が非 macOS の
+        // `key_bindings()` へ漏れていない」ことなので、**表の側から**同じことを言う
+        // （表が増えても上のリテラル 3 本と違ってこの検査は効く）
+        let table = macos_only_bindings();
+        let macos_only: Vec<&str> = table.iter().map(|b| b.action().name()).collect();
+        assert_eq!(
+            macos_only.len(),
+            MACOS_ONLY.len(),
+            "macOS 専用の表の本数が打鍵の一覧と合っていない: {macos_only:?}"
+        );
+        assert!(
+            key_bindings()
+                .iter()
+                .all(|b| !macos_only.contains(&b.action().name())),
+            "macOS 専用の表のアクションが非 macOS のバインドへ漏れている: {macos_only:?}"
+        );
     }
 
     /// macOS だけに張るバインド（#602）。Windows では Win キーへ解決されて

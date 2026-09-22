@@ -1005,7 +1005,7 @@ mod tests {
 
     /// 性能計測（通常テストでは走らせない）: `cargo test -p tako-app --release -- --ignored --nocapture perf_`
     #[test]
-    #[ignore]
+    #[ignore = "性能計測（5000 ファイルを作る。--release で --ignored 指定のとき手動実行）"]
     fn perf_ツリー計測() {
         use std::time::Instant;
         // 合成: 5000 ファイルの大ディレクトリ（node_modules / target 相当）

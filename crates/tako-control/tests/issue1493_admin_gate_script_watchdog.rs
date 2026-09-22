@@ -63,11 +63,14 @@ fn shell_scripts() -> Vec<PathBuf> {
     out
 }
 
+/// リポジトリ相対の綴り。**区切りは `/` へ正規化する**（#1278）。
+/// Windows では `display()` が `scripts\test-remote-fs-1451.sh` を返すので、
+/// `/` 直書きの許可リスト・名指しと突き合わせると必ず外れる
 fn rel(path: &Path) -> String {
     path.strip_prefix(repo_root())
         .unwrap_or(path)
-        .display()
-        .to_string()
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 fn read(path: &Path) -> String {

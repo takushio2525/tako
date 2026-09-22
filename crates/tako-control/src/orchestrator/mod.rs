@@ -6120,7 +6120,10 @@ worker_agents:
         let (k, v) = &resolved[0];
         assert_eq!(k, "CLAUDE_CONFIG_DIR");
         assert!(!v.starts_with('~'), "チルダが展開されている: {v}");
-        assert!(v.ends_with("/test-dir"), "パスが保持されている: {v}");
+        // 展開は `home.join(rest)` なので区切りは OS 依存（Windows は `\test-dir`）。
+        // 期待値も同じ区切りから作る（#1278 / #920。製品の展開自体は両 OS で正しい）
+        let tail = format!("{}test-dir", std::path::MAIN_SEPARATOR);
+        assert!(v.ends_with(&tail), "パスが保持されている: {v}");
     }
 
     #[test]

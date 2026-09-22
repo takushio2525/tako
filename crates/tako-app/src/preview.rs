@@ -2321,7 +2321,7 @@ mod tests {
 
     /// 性能計測（通常テストでは走らせない）: `cargo test -p tako-app --release -- --ignored --nocapture perf_`
     #[test]
-    #[ignore]
+    #[ignore = "性能計測（--release で --ignored 指定のとき手動実行）"]
     fn perf_ハイライト計測() {
         use std::time::Instant;
         let src_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");

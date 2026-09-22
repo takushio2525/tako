@@ -143,11 +143,13 @@ fn pathへ通すのは安定した置き場所で実体のディレクトリで�
             "crates/tako-core/src/tako_cli_path.rs: 置き場所が $HOME/{} から動いている",
             tako_cli_path::LINK_DIR_REL
         );
+        // 名前の正本は `shell_integration::cli_file_name`（Windows は `tako.exe`）。
+        // `"tako"` 直書きは Windows で必ず外れる（#1278）
         assert_eq!(
             plan.link.as_deref(),
             Some(
                 home.join(tako_cli_path::LINK_DIR_REL)
-                    .join("tako")
+                    .join(tako_core::shell_integration::cli_file_name())
                     .as_path()
             ),
             "crates/tako-core/src/tako_cli_path.rs: symlink を張らなくなっている"
