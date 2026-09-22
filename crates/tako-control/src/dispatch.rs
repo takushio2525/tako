@@ -133,6 +133,9 @@ pub enum OffloadJob {
         hash: String,
         file: Option<String>,
     },
+    /// 環境の健全性診断（#1441 / #1505）。workspace の要約と DPI だけ UI スレッドで採り、
+    /// **エージェント CLI への問い合わせ（実測 10.8 秒）は background へ出す**
+    CheckHealth { ctx: CheckHealthCtx },
     /// ファイルツリーの git ステータス（#1009）。
     /// ルートの解決は UI スレッドで済ませ、`git` の実行だけをここへ出す
     TreeGitStatus {
@@ -176,6 +179,11 @@ pub fn prepare_offload(
                 tmux_session: q.tmux_session,
             }))
         }
+        // #1505: 診断の項目が `diagnostics::collect`（= エージェント CLI への
+        // 問い合わせ）を含むようになったので、UI スレッドで走らせると窓が止まる
+        Request::CheckHealth => Some(Ok(OffloadJob::CheckHealth {
+            ctx: collect_check_health_ctx(host),
+        })),
         Request::OrchestratorWorkers { all } => Some(Ok(OffloadJob::Workers {
             live_panes: collect_live_panes(host),
             limit_resume_panes: collect_limit_resume_panes(host),
@@ -247,6 +255,7 @@ impl OffloadJob {
             OffloadJob::GitLog { cwd, max_count } => run_git_log(&cwd, max_count),
             OffloadJob::GitDiff { cwd, target } => run_git_diff(&cwd, target.as_deref()),
             OffloadJob::GitShow { cwd, hash, file } => run_git_show(&cwd, &hash, file.as_deref()),
+            OffloadJob::CheckHealth { ctx } => Ok(finish_check_health(&ctx)),
             OffloadJob::TreeGitStatus { tab, roots, limit } => {
                 Ok(tree_git_status_payload(tab, &roots, limit))
             }
@@ -11890,9 +11899,42 @@ fn run_setup_cli_within(
     }))
 }
 
+/// UI スレッドでしか採れない材料（#1505）。ここから先は workspace を触らない
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckHealthCtx {
+    tabs: usize,
+    panes: usize,
+    backgrounded: usize,
+    persist_enabled: bool,
+    /// DPI 認識レベル（#1063）。**スレッドごとの問い合わせ**（Windows の
+    /// `GetThreadDpiAwarenessContext`）なので、必ず UI スレッドで採って持ち回る
+    dpi_awareness: tako_core::platform::dpi::DpiAwareness,
+}
+
+/// UI スレッドでの文脈収集（**ここでは 1 プロセスも起こさない**）
+fn collect_check_health_ctx(host: &dyn ControlHost) -> CheckHealthCtx {
+    let ws = host.workspace();
+    CheckHealthCtx {
+        tabs: ws.tabs().len(),
+        panes: ws.tabs().iter().map(|t| t.tree().len()).sum(),
+        backgrounded: ws.all_background_panes().len(),
+        persist_enabled: host.tmux_persist_enabled(),
+        dpi_awareness: tako_core::platform::dpi::process_awareness(),
+    }
+}
+
+/// 同期経路（テスト・直呼び用）。IPC / MCP 経由は `prepare_offload` が
+/// 文脈だけ UI スレッドで採り、[`finish_check_health`] を background で走らせる
 fn check_health(host: &dyn ControlHost) -> Value {
+    finish_check_health(&collect_check_health_ctx(host))
+}
+
+fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
     let app_version = env!("CARGO_PKG_VERSION").to_string();
     let mut issues: Vec<Value> = Vec::new();
+    // #1505: 診断項目の正本。`tako setup --check` と**同じ 1 実装**から組む
+    // （片方にだけ項目が足される形をここで断つ）
+    let diagnostics = crate::diagnostics::collect();
 
     // tako CLI が PATH に通っているか。境界 B16 経由なので、見ているのは
     // **ログインシェル（= 外部ターミナル）から引けるか**（Windows は PATH + `PATHEXT` +
@@ -11977,8 +12019,13 @@ fn check_health(host: &dyn ControlHost) -> Value {
         }));
     }
 
-    // tmux の有無
-    let tmux_available = which("tmux").is_some();
+    // tmux の有無。**判定は診断項目の正本（`dep.tmux`）から引く**（#1505）。
+    // ここで `which("tmux")` を書くと `tako setup --check` と答えが割れる
+    let tmux_available = diagnostics
+        .items
+        .iter()
+        .find(|item| item.key == "dep.tmux")
+        .is_some_and(|item| item.status == crate::diagnostics::Status::Ok);
     if !tmux_available {
         issues.push(json!({
             "level": "warning",
@@ -11990,7 +12037,7 @@ fn check_health(host: &dyn ControlHost) -> Value {
     }
 
     // セッション永続化の状態
-    let persist_enabled = host.tmux_persist_enabled();
+    let persist_enabled = ctx.persist_enabled;
     let persist_available = tako_core::backend::capabilities().survives_app_exit;
     if tmux_available && !persist_enabled {
         issues.push(json!({
@@ -12004,8 +12051,13 @@ fn check_health(host: &dyn ControlHost) -> Value {
     // プロセスの DPI 認識レベル（#1063）。Windows はマニフェストで PerMonitorV2 を
     // 宣言している前提で gpui のレイアウトが組まれているので、そこから落ちたら
     // 「描画倍率とレイアウト寸法が食い違う」= 黙って縮退させない
-    let dpi_awareness = tako_core::platform::dpi::process_awareness();
-    if let Some(note) = tako_core::platform::dpi::degraded_note_here() {
+    let dpi_awareness = ctx.dpi_awareness;
+    let here = if cfg!(windows) {
+        tako_core::platform::support::Platform::Windows
+    } else {
+        tako_core::platform::support::Platform::MacOs
+    };
+    if let Some(note) = tako_core::platform::dpi::degraded_note(dpi_awareness, here) {
         issues.push(json!({
             "level": "error",
             "check": "dpi_awareness",
@@ -12032,11 +12084,10 @@ fn check_health(host: &dyn ControlHost) -> Value {
         issues.push(issue);
     }
 
-    // ワークスペースの状態サマリ
-    let ws = host.workspace();
-    let tab_count = ws.tabs().len();
-    let pane_count: usize = ws.tabs().iter().map(|t| t.tree().len()).sum();
-    let bg_count = ws.all_background_panes().len();
+    // ワークスペースの状態サマリ（UI スレッドで採った値）
+    let tab_count = ctx.tabs;
+    let pane_count = ctx.panes;
+    let bg_count = ctx.backgrounded;
 
     let healthy = issues.is_empty();
 
@@ -12070,6 +12121,10 @@ fn check_health(host: &dyn ControlHost) -> Value {
         // #1441: IPC の受け口の実測。`bound=false` なら CLI / MCP は届かない
         // （`kind=shortened` は深い data dir を短いパスへ逃がした正常な状態）
         "ipc": ipc.as_ref().map(ipc_describe),
+        // #1505: 環境診断の項目（`tako setup --check` と同じ 1 実装から出る）。
+        // `items[].key` が安定した機械キーで、`items[].lines` は `--check` が
+        // そのまま表示する行。`remaining` は人の手が要る残り作業
+        "diagnostics": diagnostics.to_json(),
         "workspace": {
             "tabs": tab_count,
             "panes": pane_count,

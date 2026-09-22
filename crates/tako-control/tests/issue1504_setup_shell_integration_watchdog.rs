@@ -136,18 +136,23 @@ fn setupがシェル統合の配置を呼んでいる() {
     );
 }
 
-/// 1': `tako setup --check` が配置状況を報告している
+/// 1': `tako setup --check` が配置状況を報告している。
+///
+/// **#1505 で `--check` の項目の組み立てが診断の正本へ移った**ので、見る先もそちら
+/// （CLI は正本が組んだ行を出すだけ）。縛る中身は同じで、状況（`check_line`）と
+/// 残り（`check_remaining`）の 1 実装が `--check` の経路から呼ばれていること
 #[test]
 fn setup_checkがシェル統合を報告している() {
-    let text = production_part(SETUP_RS, &read(SETUP_RS));
-    for needle in ["setup_shell_integration::check_line", "check_remaining"] {
+    let rel = "crates/tako-control/src/diagnostics.rs";
+    let text = production_part(rel, &read(rel));
+    for needle in ["shell_integration::check_line", "check_remaining"] {
         let hits = hits_in_fn(&text, needle);
         assert!(
-            hits.iter().any(|(_, f)| f == "run_check"),
-            "{SETUP_RS}: `tako setup --check` が `{needle}` を `run_check` から呼んでいない\
-             （#1504 / Z19）。\n\
+            hits.iter().any(|(_, f)| f == "shell_integration_item"),
+            "{rel}: `tako setup --check` が `{needle}` を `shell_integration_item` から\
+             呼んでいない（#1504 / Z19 / #1505）。\n\
              `tako setup` と同じ 1 実装で状況と残りを出すこと。見つかった場所: {}",
-            where_(SETUP_RS, &hits)
+            where_(rel, &hits)
         );
     }
 }

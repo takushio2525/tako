@@ -19,12 +19,15 @@
 //!    **寄せ先も縛る**（#1496 の 2 本立て）。`command_output` が素通しになると
 //!    1 は緑のまま症状だけ戻る
 //! 3. [`mcpの健全性確認もcommand_outputを通る`] — R4 の実物。ここだけ自前で
-//!    `Command` を組むと probe が 2 系統になる
+//!    `Command` を組むと probe が 2 系統になる（#1505 で寄せ先が
+//!    `agent_mcp::claude_health_with` + `agent_probe::output_with_timeout` へ移った）
 //! 4. [`dispatchのsetup待ちに上限がある`] — GUI / MCP 経路の蓋
 //! 5. [`上限を外す指定を作らない`] — env で「無制限」を許すと #1503 が
 //!    設定 1 つで戻る。A/B のゲートも 1 か所だけ
 //! 6. [`読み切りにも予算が掛かっている`] — 子の終了後に `read_to_end` で待つ形は
 //!    **孫がパイプを持っていると返らない**（`Command::output()` の穴。同時に塞いだ）
+//! 7. [`診断も打ち切りを載せる`] — 人へ出す知らせと同じものを診断の JSON からも
+//!    読める（#1505 で寄せ先を移したときに知らせが落ちた実例がある）
 //!
 //! 落ちるときは **file:line で名指し**する（直す場所が分からない番犬は直されない）。
 //!
@@ -47,6 +50,12 @@ mod production_range;
 const SETUP: &str = "crates/tako-cli/src/setup.rs";
 const DISPATCH: &str = "crates/tako-control/src/dispatch.rs";
 const PROBE: &str = "crates/tako-core/src/probe.rs";
+/// claude の MCP 健全性確認の寄せ先（#1505 で CLI から移った）
+const AGENT_MCP: &str = "crates/tako-control/src/agent_mcp.rs";
+/// 上限つきの問い合わせの門番（#1261 + #1503）
+const AGENT_PROBE: &str = "crates/tako-control/src/agent_probe.rs";
+/// 診断の項目の正本（#1505）。打ち切りの知らせを機械可読でも載せる
+const DIAGNOSTICS: &str = "crates/tako-control/src/diagnostics.rs";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -60,6 +69,12 @@ fn production(rel: &str) -> String {
     let src = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("{} を読めない: {e}", path.display()));
     production_range::production(&src, rel)
+}
+
+/// **肯定の存在確認**が見る眺め = コメントを落とした本文（#1609）。
+/// 全文へ `contains` すると走査先の doc コメントの綴りで緑になる
+fn production_code(rel: &str) -> String {
+    production_range::code_view::without_comments_checked(&production(rel), rel)
 }
 
 /// コメントでない行だけ（`//` で始まる行は対象外）
@@ -143,11 +158,18 @@ fn command_outputが上限つきの1実装を通している() {
     }
 }
 
-/// 3: R4 の実物。`claude mcp list` が自前の `Command` へ戻ると probe が 2 系統になる
+/// 3: R4 の実物。`claude mcp list` が自前の `Command` へ戻ると probe が 2 系統になる。
+///
+/// **#1505 で claude の MCP 健全性確認は `agent_mcp::claude_health_probe` へ移った**
+/// （`tako setup --check` と `tako check-health` が同じ 1 実装を読むため）。
+/// 縛る中身は同じで、寄せ先が `agent_probe::output_with_timeout`
+/// （#1261 の門番 + #1503 の上限）であること
 #[test]
 fn mcpの健全性確認もcommand_outputを通る() {
-    let text = production(SETUP);
-    let body = fn_body(SETUP, &text, "check_claude_mcp_health");
+    let text = production(AGENT_MCP);
+    // 問い合わせそのものを持つのは `claude_health_probe`（`claude_health_with` /
+    // `claude_health_now` はそこへ委譲するだけ = 上限も知らせも 1 か所）
+    let body = fn_body(AGENT_MCP, &text, "claude_health_probe");
     let hits: Vec<usize> = body
         .iter()
         .filter(|(_, line)| is_code(line) && line.contains("Command::new"))
@@ -155,15 +177,52 @@ fn mcpの健全性確認もcommand_outputを通る() {
         .collect();
     assert!(
         hits.is_empty(),
-        "{SETUP}:{hits:?} `check_claude_mcp_health` が自前で `Command` を組んでいる（#1503）。\n\
+        "{AGENT_MCP}:{hits:?} `claude_health_probe` が自前で `Command` を組んでいる（#1503）。\n\
          `claude mcp list` は無応答の MCP サーバ 1 台で返らなくなる = R4 の実物なので、\n\
-         必ず上限つきの `command_output` を通すこと"
+         必ず上限つきの `agent_probe::output_with_timeout` を通すこと"
     );
     assert!(
         body.iter()
-            .any(|(_, line)| is_code(line) && line.contains("command_output(")),
-        "{SETUP} の `check_claude_mcp_health` が `command_output` を呼んでいない（#1503）"
+            .any(|(_, line)| is_code(line) && line.contains("output_with_timeout(")),
+        "{AGENT_MCP} の `claude_health_probe` が上限つきの問い合わせを通っていない（#1503）"
     );
+    // 寄せ先そのものが上限を持っている（素通しになると上の検査は緑のまま症状が戻る）
+    let probe = production(AGENT_PROBE);
+    let gate = fn_body(AGENT_PROBE, &probe, "output_with_timeout");
+    assert!(
+        gate.iter()
+            .any(|(_, line)| is_code(line) && line.contains("probe::probe_timeout()")),
+        "{AGENT_PROBE} の `output_with_timeout` が既定の上限を渡していない（#1503）"
+    );
+    assert!(
+        gate.iter()
+            .any(|(_, line)| is_code(line) && line.contains("blocked()")),
+        "{AGENT_PROBE} の `output_with_timeout` が #1261 の門番を通っていない"
+    );
+    // **打ち切ったら知らせる**（#1503 の契約は「無言にしない」）。
+    // ここが落ちると `tako setup` / `--check` は固まらなくなるが、
+    // 「確認できなかった」ことを誰も知れない（実際に #1505 で 1 度落とした）
+    assert!(
+        gate.iter()
+            .any(|(_, line)| is_code(line) && line.contains("timeout_notice()")),
+        "{AGENT_PROBE} の `output_with_timeout` が打ち切りを知らせていない（#1503）。\n\
+         `[確認できません] <label>（N 秒応答なし）。打ち切って次へ進みます` を stderr へ\n\
+         出すこと（dispatch / MCP は `probe::parse_notices` でこの行を読み戻す）。"
+    );
+}
+
+/// 7: 診断（`--check` / `check_health`）も打ち切りを機械可読で載せる（#1503 / #1505）
+#[test]
+fn 診断も打ち切りを載せる() {
+    let code = production_code(DIAGNOSTICS);
+    for needle in ["probe_timeouts", "claude_health_now()"] {
+        assert!(
+            code.contains(needle),
+            "{DIAGNOSTICS} に `{needle}` が無い（#1503 / #1505）。\n\
+             人へ出す知らせ（stderr）と同じものを診断の JSON からも読めること\n\
+             （設計原則 5: UI で分かることは CLI / MCP からも分かる）"
+        );
+    }
 }
 
 /// 4: GUI / MCP 経路の蓋。ここが外れるとボタンが永久に回る

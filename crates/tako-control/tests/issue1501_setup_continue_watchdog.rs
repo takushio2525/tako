@@ -48,6 +48,8 @@ mod production_range;
 
 const SETUP: &str = "crates/tako-cli/src/setup.rs";
 const REMAINING: &str = "crates/tako-control/src/setup_remaining.rs";
+/// `tako setup --check` の項目の正本（#1505 で CLI から移った）
+const DIAGNOSTICS: &str = "crates/tako-control/src/diagnostics.rs";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -186,11 +188,13 @@ fn run_checkも同じ1実装で残りを出す() {
         "{SETUP} の `run_check` が `setup_remaining::render` を呼んでいない（#1501）。\n\
          `tako setup` と `tako setup --check` は同じ残りを同じ文面で出すこと"
     );
-    // 判定の写しを CLI 側へ持たない（段 → 残り作業の対応は setup_remaining が正本）
+    // 判定の写しを CLI 側へ持たない（段 → 残り作業の対応は setup_remaining が正本）。
+    // **#1505 で `--check` の項目そのものが診断の正本へ移った**ので、写しを通す場所も
+    // そちら（`diagnostics::shortest_bootstrap_remaining`）。縛る中身は同じ
+    let diagnostics = production(DIAGNOSTICS);
     assert!(
-        body.iter()
-            .any(|(_, line)| is_code(line) && line.contains("RemainingKind::for_step")),
-        "{SETUP} の `run_check` が `RemainingKind::for_step` を通っていない（#1501）。\n\
+        diagnostics.contains("RemainingKind::for_step"),
+        "{DIAGNOSTICS} が `RemainingKind::for_step` を通っていない（#1501 / #1505）。\n\
          段から残り作業への写しは 1 実装（別に書くと `setup` と `--check` で名前がずれる）"
     );
 }

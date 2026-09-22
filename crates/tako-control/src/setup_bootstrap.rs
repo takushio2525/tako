@@ -226,6 +226,8 @@ pub struct BootstrapState {
     /// 解決できた実行ファイル（PATH 外のランチャーも含む）
     pub binary: Option<String>,
     pub authenticated: bool,
+    /// 認証済みのときの正規化済みプラン名（#1505。未認証 / 取得できない系統は None）
+    pub account_plan: Option<String>,
     /// ランチャーの置き場所が PATH に入っているか
     pub launcher_dir: PathBuf,
     pub launcher_dir_on_path: bool,
@@ -250,6 +252,7 @@ impl BootstrapState {
             "installed": self.binary.is_some(),
             "binary": self.binary,
             "authenticated": self.authenticated,
+            "account_plan": self.account_plan,
             "launcher_dir": self.launcher_dir.display().to_string(),
             "launcher_dir_on_path": self.launcher_dir_on_path,
             "profile": self.profile.as_ref().map(|p| p.display().to_string()),
@@ -428,11 +431,28 @@ pub fn auth_probe_argv(agent: AgentKind) -> &'static [&'static str] {
     }
 }
 
+/// 認証の問い合わせ 1 回ぶんの結果（#1505）。
+///
+/// 認証の有無と**プラン名を同じ 1 回の問い合わせから**読む。以前は
+/// `is_authenticated_for`（bool だけ）と `tako setup` 側の検出（プランつき）が
+/// 別々に CLI を起こしていたので、`tako setup --check` は 3 系統ぶんを 2 度ずつ叩いていた
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuthState {
+    pub authenticated: bool,
+    /// 正規化済みプラン名。**個人識別子や token は保持しない**
+    pub plan: Option<String>,
+}
+
 /// 認証済みか。**メールアドレスや組織名は読み捨てる**（診断ログへ個人情報を出さないため）。
 ///
 /// claude だけ exit code では判断できない（未ログインでも 0 を返しうるので
 /// `loggedIn` を見る）。他の 2 系統は exit code が判定そのもの
 pub fn is_authenticated_for(agent: AgentKind, binary: &str) -> bool {
+    auth_state_for(agent, binary).authenticated
+}
+
+/// 認証の有無とプラン名（**外部 CLI への問い合わせはここ 1 か所**）
+pub fn auth_state_for(agent: AgentKind, binary: &str) -> AuthState {
     // #1261: 問い合わせの起動は正本の門番を通す。テストプロセスでは 1 つも起こさない
     // （実 CLI は起動しただけで `~/.gemini` / `~/.codex/tmp` / `~/.claude.json` を作る）
     let Some(output) = crate::agent_probe::run(
@@ -440,18 +460,132 @@ pub fn is_authenticated_for(agent: AgentKind, binary: &str) -> bool {
             .args(auth_probe_argv(agent))
             .stdin(std::process::Stdio::null()),
     ) else {
-        return false;
+        return AuthState::default();
     };
     if !output.status.success() {
-        return false;
+        return AuthState::default();
     }
     match agent {
         AgentKind::Claude => serde_json::from_slice::<Value>(&output.stdout)
             .ok()
-            .and_then(|v| v["loggedIn"].as_bool())
-            .unwrap_or(false),
-        AgentKind::Codex | AgentKind::Agy => true,
+            .map(|v| parse_claude_auth(&v))
+            .unwrap_or_default(),
+        // codex のプランは CLI が返さないので `auth.json` の JWT から読む
+        AgentKind::Codex => AuthState {
+            authenticated: true,
+            plan: codex_plan_from_auth_file().as_deref().map(normalize_plan),
+        },
+        // agy 1.1.1 は models で認証判定できるが、プラン / quota は返さない
+        AgentKind::Agy => AuthState {
+            authenticated: true,
+            plan: None,
+        },
     }
+}
+
+/// `claude auth status --json` の解釈（**純粋関数**なので実出力を fixture で固定できる）。
+///
+/// 呼び手は exit code を先に見ているので、ここは本文だけを見る
+pub fn parse_claude_auth(value: &Value) -> AuthState {
+    if !value
+        .get("loggedIn")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return AuthState::default();
+    }
+    let plan = value
+        .get("subscriptionType")
+        .and_then(|v| v.as_str())
+        .map(normalize_plan)
+        .or_else(|| {
+            value
+                .get("authMethod")
+                .and_then(|v| v.as_str())
+                .filter(|method| method.to_ascii_lowercase().contains("api"))
+                .map(|_| "api".to_string())
+        });
+    AuthState {
+        authenticated: true,
+        plan,
+    }
+}
+
+/// プラン名の表記ゆれを 1 つへ寄せる（`Max 5x` / `max_5x` → `max-5x`）
+pub fn normalize_plan(plan: &str) -> String {
+    plan.trim().to_ascii_lowercase().replace([' ', '_'], "-")
+}
+
+/// Codex の OAuth JWT payload に含まれる ChatGPT plan claim をローカルで読む。
+/// token 自体・account ID・メールアドレスは戻り値にもログにも出さない。
+pub fn codex_plan_from_auth_file() -> Option<String> {
+    let home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| tako_core::paths::home_dir().map(|h| h.join(".codex")))?;
+    codex_plan_from_auth_file_at(&home.join("auth.json"))
+}
+
+fn codex_plan_from_auth_file_at(path: &Path) -> Option<String> {
+    let value: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    if value
+        .get("OPENAI_API_KEY")
+        .and_then(|v| v.as_str())
+        .is_some_and(|key| !key.is_empty())
+    {
+        return Some("api".to_string());
+    }
+    for token_name in ["id_token", "access_token"] {
+        let token = value
+            .get("tokens")
+            .and_then(|v| v.as_object())?
+            .get(token_name)
+            .and_then(|v| v.as_str());
+        let Some(payload) = token.and_then(decode_jwt_payload) else {
+            continue;
+        };
+        if let Some(plan) = payload
+            .get("https://api.openai.com/auth")
+            .and_then(|v| v.get("chatgpt_plan_type"))
+            .and_then(|v| v.as_str())
+        {
+            return Some(plan.to_string());
+        }
+    }
+    None
+}
+
+fn decode_jwt_payload(token: &str) -> Option<Value> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = decode_base64url(payload)?;
+    serde_json::from_slice(&decoded).ok()
+}
+
+/// 依存追加を避けるための最小 base64url decoder（JWT payload 読み取り専用）。
+fn decode_base64url(input: &str) -> Option<Vec<u8>> {
+    let mut output = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buffer = 0u32;
+    let mut bits = 0u8;
+    for byte in input.bytes() {
+        if byte == b'=' {
+            break;
+        }
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        };
+        buffer = (buffer << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push((buffer >> bits) as u8);
+            buffer &= (1 << bits) - 1;
+        }
+    }
+    Some(output)
 }
 
 /// ログインシェルの種別と profile
@@ -476,9 +610,12 @@ pub fn status_for(agent: AgentKind) -> Result<BootstrapState, String> {
     let r = recipe_for(agent);
     let plan = plan_from(&r, &home);
     let binary = resolve_binary_for(agent);
-    let authenticated = binary
+    // 認証とプランは 1 回の問い合わせから読む（#1505）
+    let auth = binary
         .as_deref()
-        .is_some_and(|b| is_authenticated_for(agent, b));
+        .map(|b| auth_state_for(agent, b))
+        .unwrap_or_default();
+    let authenticated = auth.authenticated;
     let launcher_dir = r.launcher_dir_in(&home);
     let on_path = launcher_dir_on_path(agent, &launcher_dir);
     let (shell, profile) = shell_target();
@@ -500,6 +637,7 @@ pub fn status_for(agent: AgentKind) -> Result<BootstrapState, String> {
         agent,
         binary,
         authenticated,
+        account_plan: auth.plan,
         launcher_dir,
         launcher_dir_on_path: on_path,
         profile,
@@ -508,6 +646,38 @@ pub fn status_for(agent: AgentKind) -> Result<BootstrapState, String> {
         step,
         plan,
     })
+}
+
+/// どの系統を仕上げるか。**途中まで入っているものを優先する**
+/// （入れ直しではなく再開になるので、一番短い道になる）。
+///
+/// `tako setup` の bootstrap 段と `tako setup --check` の「残り 1 件」が
+/// **同じ系統**を名指しするよう、判断はここ 1 か所に置く（#1505）
+pub fn choose_target(states: &[(AgentKind, Result<BootstrapState, String>)]) -> AgentKind {
+    let started = states.iter().find_map(|(agent, state)| {
+        state
+            .as_ref()
+            .ok()
+            .filter(|s| matches!(s.step, Step::Path | Step::Auth))
+            .map(|_| *agent)
+    });
+    if let Some(agent) = started {
+        return agent;
+    }
+    // どれも未導入。代行できる系統のうち先頭（= 推奨）を採る。
+    // `bootstrap_agents()` の並びが「基準系 → master 可 → worker 専用」なので、
+    // ここで別の優先順位を作らない
+    states
+        .iter()
+        .find_map(|(agent, state)| {
+            state
+                .as_ref()
+                .ok()
+                .filter(|s| s.plan.can_run)
+                .map(|_| *agent)
+        })
+        .or_else(|| states.first().map(|(agent, _)| *agent))
+        .unwrap_or(AgentKind::Claude)
 }
 
 /// 3 系統ぶんの導入状況（**面倒を見る系統だけ**。`TAKO_989_LEGACY=1` なら claude だけ）。
@@ -1505,6 +1675,61 @@ fn homebrew_json() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_auth_jsonから認証とプランを取得する() {
+        let value = serde_json::json!({
+            "loggedIn": true,
+            "authMethod": "claude.ai",
+            "subscriptionType": "Max"
+        });
+        assert_eq!(
+            parse_claude_auth(&value),
+            AuthState {
+                authenticated: true,
+                plan: Some("max".into())
+            }
+        );
+        // 未ログインならプランも持たない
+        assert_eq!(
+            parse_claude_auth(&serde_json::json!({ "loggedIn": false })),
+            AuthState::default()
+        );
+
+        let api = serde_json::json!({"loggedIn": true, "authMethod": "api_key"});
+        assert_eq!(
+            parse_claude_auth(&api),
+            AuthState {
+                authenticated: true,
+                plan: Some("api".into())
+            }
+        );
+    }
+
+    #[test]
+    fn codexのjwtからプランだけを取得する() {
+        let dir =
+            std::env::temp_dir().join(format!("tako-issue226-codex-auth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        let payload =
+            "eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9wbGFuX3R5cGUiOiJwbHVzIn19";
+        std::fs::write(
+            &path,
+            format!(r#"{{"tokens":{{"id_token":"header.{payload}.signature"}}}}"#),
+        )
+        .unwrap();
+        assert_eq!(codex_plan_from_auth_file_at(&path).as_deref(), Some("plus"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn プラン名の表記ゆれは1つへ寄る() {
+        assert_eq!(normalize_plan(" Max 5x "), "max-5x");
+        assert_eq!(normalize_plan("max_20x"), "max-20x");
+        assert_eq!(normalize_plan("pro"), "pro");
+    }
 
     /// そのプラットフォーム・系統の手順から計画を組む
     /// （**手順と文面の出どころを 1 つにする**。組み立ては製品と同じ `plan_from`）。

@@ -144,7 +144,7 @@ tako orchestrator spawn --help
 | [`migrate`](#tako-migrate) | 設定・データファイルの形式確認と自動移行 |
 | [`config`](#tako-config) | AI 系設定のデバイス間共有（git ベース） |
 | [`platform`](#tako-platform) | この環境で使える機能の一覧 |
-| [`check-health`](#その他) | 環境の健全性診断（CLI / MCP の受け口が立っているか） |
+| [`check-health`](#その他) | 環境の健全性診断（`tako setup --check` と同じ項目を JSON でも返す） |
 | [`agent-support`](#tako-agent-support) | エージェント系統ごとの能力差 |
 | [`shell-integration`](#その他) | シェル統合（cwd 追従・コマンド状態）の確認・配置（`tako setup` が自動で通る） |
 | [`context-budget`](#その他) | 起動時ロードの予算の確認と作業ログの自動移送 |
@@ -175,7 +175,8 @@ generate-answers | tako setup --answers -
 # 前回設定を AI と個別に見直す
 tako setup --review
 
-# 環境チェックだけ実行（CLI の有無・認証・プラン・MCP・セットアップ状態を表示）
+# 環境チェックだけ実行（CLI の有無・認証・プラン・依存・シェル統合・tako CLI の PATH・
+# MCP・セットアップ状態・アップデート追従・リモート公開・CLI / MCP の受け口を表示）
 tako setup --check
 
 # アップデート追従状況を表示（前回セットアップ以降に setup へ入った変更の一覧）
@@ -187,6 +188,8 @@ tako setup --reset
 ```
 
 `tako setup` は**シェル統合**（ペインの作業ディレクトリ追従・コマンドの実行状態・入力予測）の配置も自分で行います。macOS / Linux は tako が開くシェルへ環境変数を渡すだけで効くので設定ファイルには何も書かず、状態が 1 行出るだけです。**Windows は PowerShell のプロファイル（`$PROFILE`）への追記が必要**なので、どのファイルへ何を書くか（置くのは tako の管理ブロック 1 個だけで既存の行はそのまま残ること・`tako shell-integration uninstall` で元に戻せること）を表示してから配置します。2 回目以降は差分がなければ何も書きません。配置できなかったときも setup は最後まで走り、`tako shell-integration install` を「残り」として案内します。状態だけ見たいときは `tako shell-integration` または `tako setup --check` です。
+
+`tako setup --check` が出す診断の項目は `tako check-health` と**同じ 1 つの実装**から出ています。人が読むなら `tako setup --check`、AI や監視から読むなら `tako check-health --json`（`diagnostics.items[].key` が安定した項目名、`diagnostics.remaining` が人の操作が要るぶん）で、どちらも同じ状態には同じ答えを返します。
 
 `--answers` は `selected_agent`、`provider_plans`、`instruction_content`、`profile`、`projects`、`orchestrator`、`sleep_guard` を受け取ります。同じ JSON は MCP `tako_setup` でも使えるため、AI に日本語で希望を伝えてセットアップを代行させられます。`projects` は指定時に全登録を置き換えます。
 
@@ -1419,8 +1422,8 @@ tako telemetry off
 
 tako stale-binary            # 稼働中セッションの claude バイナリの鮮度確認・張り直し
 
-tako check-health            # 環境の健全性診断（CLI の PATH・tmux・IPC の受け口）
-tako check-health --json     # 生の JSON（アプリへ届かないときは受け口だけをローカル診断）
+tako check-health            # 環境の健全性診断（`tako setup --check` と同じ項目）
+tako check-health --json     # 生の JSON（`diagnostics` に項目・状態・残り作業が入る）
 
 tako shell-integration           # シェル統合（cwd 追従・コマンド実行状態）が効いているか
 tako shell-integration install   # 配置する（tako setup が自分で通るので普段は不要）

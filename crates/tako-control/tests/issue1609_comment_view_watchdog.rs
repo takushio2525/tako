@@ -57,6 +57,7 @@ const MOVED: &[&str] = &[
     "crates/tako-control/tests/issue1403_http_workers_watchdog.rs",
     "crates/tako-control/tests/issue1425_save_layout_change_key_watchdog.rs",
     "crates/tako-control/tests/issue1449_launch_routes_watchdog.rs",
+    "crates/tako-control/tests/issue1505_diagnostics_single_source.rs",
     "crates/tako-control/tests/issue1554_restore_breakdown_watchdog.rs",
     "crates/tako-control/tests/issue757_login_expired_watchdog.rs",
     "crates/tako-control/tests/lid_guard_ownership.rs",
@@ -204,7 +205,11 @@ fn 寄せた番犬は共有部品を通している() {
         // この検査自身が #1609 の型にはまらないよう、**コメントを落とした眺め**で見る
         // （説明文に `without_comments` と書いただけで緑になっては意味が無い）
         let code = without_comments_checked(&read(rel), rel);
-        let declares = code.contains("#[path = \"common/code_view.rs\"]");
+        // 取り込みは 2 通り: 直に `mod` するか、`production_range`（#1420）が
+        // 抱えている方を `use` するか。**同じファイルを 2 度 `mod` すると
+        // `clippy::duplicate_mod` で落ちる**ので、両方を取り込む番犬は後者を通る
+        let declares = code.contains("#[path = \"common/code_view.rs\"]")
+            || code.contains("use production_range::code_view;");
         let uses = code.contains("without_comments");
         if !declares || !uses {
             missing.push(format!("{rel}（取り込み={declares} / 呼び出し={uses}）"));

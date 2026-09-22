@@ -259,147 +259,17 @@ fn detect_agents() -> Vec<DetectedAgent> {
         .into_iter()
         .filter_map(|kind| {
             let path = find_agent_command(kind)?;
-            let (authenticated, plan) = match kind {
-                SetupAgent::Claude => detect_claude_auth(&path),
-                SetupAgent::Codex => detect_codex_auth(&path),
-                SetupAgent::Agy => detect_agy_auth(&path),
-            };
+            // 認証とプランの問い合わせは正本 1 実装（#1505）。ここで別に CLI を
+            // 起こすと `tako setup --check` が 3 系統ぶんを 2 度ずつ叩くことになる
+            let auth = setup_bootstrap::auth_state_for(kind.install_kind(), &path);
             Some(DetectedAgent {
                 kind,
                 path,
-                authenticated,
-                plan,
+                authenticated: auth.authenticated,
+                plan: auth.plan,
             })
         })
         .collect()
-}
-
-fn detect_claude_auth(path: &str) -> (bool, Option<String>) {
-    let Some(output) = command_output(path, &["auth", "status", "--json"]) else {
-        return (false, None);
-    };
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
-        return (false, None);
-    };
-    parse_claude_auth_json(&value, output.status.success())
-}
-
-fn parse_claude_auth_json(
-    value: &serde_json::Value,
-    command_succeeded: bool,
-) -> (bool, Option<String>) {
-    let authenticated = command_succeeded
-        && value
-            .get("loggedIn")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-    if !authenticated {
-        return (false, None);
-    }
-    let plan = value
-        .get("subscriptionType")
-        .and_then(|v| v.as_str())
-        .map(normalize_plan)
-        .or_else(|| {
-            value
-                .get("authMethod")
-                .and_then(|v| v.as_str())
-                .filter(|method| method.to_ascii_lowercase().contains("api"))
-                .map(|_| "api".to_string())
-        });
-    (true, plan)
-}
-
-fn detect_codex_auth(path: &str) -> (bool, Option<String>) {
-    let authenticated =
-        command_output(path, &["login", "status"]).is_some_and(|output| output.status.success());
-    let plan = authenticated
-        .then(codex_plan_from_auth_file)
-        .flatten()
-        .map(|p| normalize_plan(&p));
-    (authenticated, plan)
-}
-
-fn detect_agy_auth(path: &str) -> (bool, Option<String>) {
-    let authenticated =
-        command_output(path, &["models"]).is_some_and(|output| output.status.success());
-    // agy 1.1.1 は models で認証判定できるが、プラン / quota は返さない。
-    (authenticated, None)
-}
-
-fn normalize_plan(plan: &str) -> String {
-    plan.trim().to_ascii_lowercase().replace([' ', '_'], "-")
-}
-
-/// Codex の OAuth JWT payload に含まれる ChatGPT plan claim をローカルで読む。
-/// token 自体・account ID・メールアドレスは戻り値にもログにも出さない。
-fn codex_plan_from_auth_file() -> Option<String> {
-    let path = codex_home_dir()?.join("auth.json");
-    codex_plan_from_auth_file_at(&path)
-}
-
-fn codex_plan_from_auth_file_at(path: &Path) -> Option<String> {
-    let value: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
-    if value
-        .get("OPENAI_API_KEY")
-        .and_then(|v| v.as_str())
-        .is_some_and(|key| !key.is_empty())
-    {
-        return Some("api".to_string());
-    }
-    for token_name in ["id_token", "access_token"] {
-        let token = value
-            .get("tokens")
-            .and_then(|v| v.as_object())?
-            .get(token_name)
-            .and_then(|v| v.as_str());
-        let Some(payload) = token.and_then(decode_jwt_payload) else {
-            continue;
-        };
-        if let Some(plan) = payload
-            .get("https://api.openai.com/auth")
-            .and_then(|v| v.get("chatgpt_plan_type"))
-            .and_then(|v| v.as_str())
-        {
-            return Some(plan.to_string());
-        }
-    }
-    None
-}
-
-fn decode_jwt_payload(token: &str) -> Option<serde_json::Value> {
-    let payload = token.split('.').nth(1)?;
-    let decoded = decode_base64url(payload)?;
-    serde_json::from_slice(&decoded).ok()
-}
-
-/// 依存追加を避けるための最小 base64url decoder（JWT payload 読み取り専用）。
-fn decode_base64url(input: &str) -> Option<Vec<u8>> {
-    let mut output = Vec::with_capacity(input.len() * 3 / 4);
-    let mut buffer = 0u32;
-    let mut bits = 0u8;
-    for byte in input.bytes() {
-        if byte == b'=' {
-            break;
-        }
-        let value = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'-' => 62,
-            b'_' => 63,
-            _ => return None,
-        };
-        buffer = (buffer << 6) | u32::from(value);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            output.push((buffer >> bits) as u8);
-            buffer &= (1 << bits) - 1;
-        }
-    }
-    Some(output)
 }
 
 // --- モデル一覧の実取得とピッカー（Issue #1002）---
@@ -976,7 +846,7 @@ fn run_bootstrap_stage(assume_yes: bool) -> BootstrapOutcome {
         );
     }
 
-    let target = choose_bootstrap_target(&states);
+    let target = setup_bootstrap::choose_target(&states);
     let state = match setup_bootstrap::status_for(target) {
         Ok(state) => state,
         Err(e) => {
@@ -1033,37 +903,6 @@ impl BootstrapOutcome {
             target,
         }
     }
-}
-
-/// どの系統を仕上げるか。**途中まで入っているものを優先する**
-/// （入れ直しではなく再開になるので、一番短い道になる）
-fn choose_bootstrap_target(
-    states: &[(AgentKind, Result<setup_bootstrap::BootstrapState, String>)],
-) -> AgentKind {
-    let started = states.iter().find_map(|(agent, state)| {
-        state
-            .as_ref()
-            .ok()
-            .filter(|s| matches!(s.step, Step::Path | Step::Auth))
-            .map(|_| *agent)
-    });
-    if let Some(agent) = started {
-        return agent;
-    }
-    // どれも未導入。代行できる系統のうち先頭（= 推奨）を採る。
-    // `bootstrap_agents()` の並びが「基準系 → master 可 → worker 専用」なので、
-    // ここで別の優先順位を作らない
-    states
-        .iter()
-        .find_map(|(agent, state)| {
-            state
-                .as_ref()
-                .ok()
-                .filter(|s| s.plan.can_run)
-                .map(|_| *agent)
-        })
-        .or_else(|| states.first().map(|(agent, _)| *agent))
-        .unwrap_or(AgentKind::Claude)
 }
 
 /// 1 系統ぶんの 3 段（インストール → PATH → 認証誘導）。
@@ -1308,20 +1147,6 @@ impl DepCheckMode {
                 review,
                 assume_yes,
                 stdin_is_terminal: std::io::IsTerminal::is_terminal(&std::io::stdin()),
-                legacy: setup_deps::legacy_mode(),
-            },
-        }
-    }
-
-    /// `tako setup --check`: 読み取りだけ。**何も導入しない・何も聞かない**
-    fn check_only() -> Self {
-        Self {
-            review_settings: false,
-            offer: setup_deps::DepOfferContext {
-                stage_installs: false,
-                review: false,
-                assume_yes: false,
-                stdin_is_terminal: false,
                 legacy: setup_deps::legacy_mode(),
             },
         }
@@ -1653,48 +1478,6 @@ fn run_fda_check(interactive: bool) {
     }
 }
 
-/// MCP 登録の健全性を確認。
-/// 返り値: (登録あり, 登録パスが生きている)
-fn check_claude_mcp_health(claude_path: &str) -> (bool, bool) {
-    // **`command_output` を通す**（#1503）。`claude mcp list` は登録済みの MCP サーバへ
-    // 1 台ずつ繋いで健全性を見るので、サーバが 1 つ無応答だとここで返らなくなる
-    // （#1500 の R4 = setup が無言で 6 分固まった実測の出どころ）。
-    // 上限で打ち切ったときは「未登録」と同じ扱いで先へ進む（登録し直せば済む）
-    match command_output(claude_path, &["mcp", "list"]) {
-        Some(o) if o.status.success() => {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            let has_tako = stdout.lines().any(|line| {
-                let lower = line.to_lowercase();
-                lower.contains("tako") && !lower.contains("no mcp")
-            });
-            if !has_tako {
-                return (false, false);
-            }
-            // ~/.claude.json から登録パスを直接読む（claude mcp list の出力は
-            // ✔/✘ の有無やフォーマットがバージョンで変わり得るため）
-            let path_alive = read_mcp_command_path()
-                .map(|p| std::path::Path::new(&p).is_file())
-                .unwrap_or(true); // 読めなければ楽観判定
-            (true, path_alive)
-        }
-        _ => (false, false),
-    }
-}
-
-/// ~/.claude.json から tako MCP 登録の command パスを読み取る
-fn read_mcp_command_path() -> Option<String> {
-    let home = home_dir()?;
-    let path = home.join(".claude.json");
-    let content = std::fs::read_to_string(path).ok()?;
-    let settings: serde_json::Value = serde_json::from_str(&content).ok()?;
-    settings
-        .get("mcpServers")?
-        .get("tako")?
-        .get("command")?
-        .as_str()
-        .map(String::from)
-}
-
 fn run_setup_mcp() -> Result<(), String> {
     let tako_bin = tako_control::dispatch::resolve_tako_binary();
     let scope = tako_control::dispatch::McpScope::User;
@@ -1737,7 +1520,7 @@ fn configure_agent_mcp(agents: &[DetectedAgent]) -> Vec<Remaining> {
     let mut remaining = Vec::new();
     // claude は登録の健全性まで見て修復する（従来経路。回帰させない）
     if let Some(claude) = agents.iter().find(|a| a.kind == SetupAgent::Claude) {
-        let (registered, healthy) = check_claude_mcp_health(&claude.path);
+        let (registered, healthy) = tako_control::agent_mcp::claude_health_with(&claude.path);
         if registered && healthy {
             eprintln!("  [OK] Claude MCP: tako が登録済み");
         } else {
@@ -2717,69 +2500,6 @@ fn decide_config_share_step(
     }
 }
 
-/// 設定共有の状態表示（Issue #793）。setup サマリと `--check` が**同じ判定**
-/// （`config_share::env::Guidance`）から文言を作るので、片方だけ古くならない。
-/// **質問は含まない**（#262 の質問ゼロ）。`verbose` = setup サマリ向けに説明行を足す
-fn config_share_lines(env: &ShareEnvironment, verbose: bool) -> Vec<String> {
-    use tako_control::config_share::env::Guidance;
-
-    let repo = env.repo.as_deref().unwrap_or("?");
-    let next = env.next_command();
-    let mut lines = Vec::new();
-    match env.guidance() {
-        // 配線済みなら状態を 1 行示すだけ。勧誘はしない（#793 受け入れ条件 4 = 冪等）
-        Guidance::Linked => {
-            lines.push(format!("  [OK] 設定共有: 配線済み（{repo}）"));
-            if verbose {
-                lines.push(
-                    "       差分は `tako config status`、同期は `tako config push` / `pull`".into(),
-                );
-            }
-        }
-        Guidance::Broken => {
-            lines.push(format!(
-                "  [警告] 設定共有: 配線先が git リポジトリではありません（{repo}）"
-            ));
-            lines.push(format!("         `{next}` で繋ぎ直せます"));
-        }
-        // 既に自力で共有している利用者には、まず相乗りを示す（二重管理を作らない）
-        Guidance::AdoptExisting => {
-            lines.push("  [情報] 設定共有: 未配線".into());
-            for found in &env.external {
-                lines.push(format!(
-                    "         {} は既に {} で管理されています{}",
-                    found.path,
-                    found.repo,
-                    if found.same_place {
-                        "（tako の置き場と一致）"
-                    } else {
-                        "（tako の置き場とは別）"
-                    }
-                ));
-            }
-            lines.push(format!("         同じリポジトリへ相乗りするなら `{next}`"));
-            lines.push(
-                "         別のリポジトリを作ると同じ内容が 2 箇所に並びます（二重管理）".into(),
-            );
-        }
-        Guidance::Fresh => {
-            lines.push(format!(
-                "  [情報] 設定共有: 未配線（複数デバイスで同じ AI 設定を使うなら `{next}`）"
-            ));
-            if verbose {
-                lines.push(
-                    "         claude のグローバル指示と tako の宣言的設定を git 1 本で共有します"
-                        .into(),
-                );
-                lines.push(
-                    "         秘匿情報とこのマシン固有の状態は共有対象から構造的に外れます".into(),
-                );
-            }
-        }
-    }
-    lines
-}
-
 /// 設定共有（Issue #513 / #793）の案内・配線。**標準 setup では質問を増やさない**（#262）。
 ///
 /// - `answers.config_share` があれば非対話で配線する（MCP `tako_setup` / `--answers` 経路）
@@ -2810,7 +2530,7 @@ fn apply_config_share(
         // 配線済み・案内のどちらも「表示だけ」。質問は増やさない（#262）
         ConfigShareStep::AlreadyLinked | ConfigShareStep::Info => {
             eprintln!();
-            for line in config_share_lines(env, true) {
+            for line in tako_control::diagnostics::config_share_lines(env, true) {
                 eprintln!("{line}");
             }
             // 代行できるのは対話アシスタントが続けて起動するときだけ。
@@ -3050,288 +2770,24 @@ fn mark_setup_complete(
 
 // --- メインエントリ ---
 
-/// `tako setup --check` — 環境チェックだけ実行して終了
+/// `tako setup --check` — 環境チェックだけ実行して終了。
+///
+/// **ここに判断を書かない**（#1505）。項目・判定・人へ出す行の正本は
+/// `tako_control::diagnostics`（`tako check-health` / MCP `tako_check_health` も
+/// そこを読む）で、この関数は見出しを出して結果を並べるだけ。
+/// 番犬 `issue1505_diagnostics_single_source` が正本以外から項目を組む形を落とす
 pub fn run_check() -> Result<(), String> {
     eprintln!("tako セットアップ 環境チェック");
     eprintln!("─────────────────────────────");
 
-    // 人へ残る作業（#1501）。`tako setup` の末尾と**同じ 1 実装**で出す
-    // （読むだけの経路なので、ここでは何も導入も登録もしない）
-    let mut remaining: Vec<Remaining> = Vec::new();
-
-    // ゼロスタート導入の状況（#868 → #989 で 3 系統）。未導入・PATH 未通し・
-    // 未ログインのどれで止まっているかを、系統ごとに実行はせずに先に出す。
-    // **1 つでも ready なら tako は使える**ので、そこを最初に言う
-    let bootstrap_states = setup_bootstrap::status_all();
-    let ready: Vec<&str> = bootstrap_states
-        .iter()
-        .filter(|(_, state)| state.as_ref().is_ok_and(|s| s.step == Step::Ready))
-        .map(|(agent, _)| agent.as_str())
-        .collect();
-    if ready.is_empty() {
-        eprintln!("  [不足] エージェント CLI の導入: 使える系統がありません");
-        eprintln!("         tako setup を実行すると、ここから最後まで案内します");
-    } else {
-        eprintln!(
-            "  [OK] エージェント CLI の導入: 使える系統 {}（導入 / PATH / ログイン）",
-            ready.join(" / ")
-        );
-    }
-    for (agent, state) in &bootstrap_states {
-        match state {
-            Ok(state) if state.step == Step::Ready => {
-                eprintln!("         [OK] {}: 完了", agent.as_str())
-            }
-            Ok(state) => eprintln!(
-                "         [不足] {}: {} ({})",
-                agent.as_str(),
-                state.step_description(),
-                state.step.as_str()
-            ),
-            Err(e) => eprintln!("         [警告] {}: 確認できません（{e}）", agent.as_str()),
-        }
-    }
-    // 1 つも使える系統が無いときだけ、**一番短い道**を残り作業にする
-    // （`tako setup` が選ぶ系統と同じ判断を通す）
-    if ready.is_empty() && !bootstrap_states.is_empty() {
-        let target = choose_bootstrap_target(&bootstrap_states);
-        match bootstrap_states
-            .iter()
-            .find(|(agent, _)| *agent == target)
-            .map(|(_, state)| state)
-        {
-            Some(Ok(state)) => {
-                remaining.extend(RemainingKind::for_step(state.step, target).map(Remaining::new))
-            }
-            Some(Err(e)) => remaining.push(Remaining::with_detail(
-                RemainingKind::AgentStatusUnknown,
-                vec![e.clone()],
-            )),
-            None => {}
-        }
-    }
-
-    // tako CLI の PATH 設置（FR-2.14.5 / #1502）。判定は check-health と同じ 1 実装
-    eprintln!("{}", setup_bootstrap::tako_cli_path_check_line());
-
-    // シェル統合（FR-2.14.14 / #1504）。**読み取りだけ**で、判定は `tako setup` の
-    // 段と同じ 1 実装。未配置なら末尾の「残り」にも同じ 1 行で載る
-    eprintln!("{}", setup_shell_integration::check_line());
-    remaining.extend(setup_shell_integration::check_remaining());
-
-    // エージェント CLI + 任意依存。--check では表示のみ。
-    let (agents, missing) = run_dependency_check(DepCheckMode::check_only());
-    remaining.extend(missing);
-
-    // MCP 登録（#979 で claude / codex / agy の 3 系統とも永続登録になった）
-    if let Some(claude) = agents.iter().find(|a| a.kind == SetupAgent::Claude) {
-        let (registered, healthy) = check_claude_mcp_health(&claude.path);
-        if registered && healthy {
-            eprintln!("  [OK] Claude MCP: tako が登録済み");
-        } else if registered && !healthy {
-            eprintln!("  [警告] Claude MCP: 登録済みだがパスが消失しています");
-            if let Some(cmd) = read_mcp_command_path() {
-                eprintln!("         登録パス: {cmd}");
-            }
-            eprintln!("         tako setup または tako setup-mcp で修復できます");
-        } else {
-            eprintln!("  [不足] Claude MCP: tako が未登録（tako setup-mcp で登録できます）");
-        }
-        if !(registered && healthy) {
-            remaining.push(Remaining::new(RemainingKind::Mcp {
-                agent: "claude".to_string(),
-            }));
-        }
-    }
-    for agent in &agents {
-        let kind = match agent.kind {
-            SetupAgent::Codex => tako_control::orchestrator::agent::WorkerAgent::Codex,
-            SetupAgent::Agy => tako_control::orchestrator::agent::WorkerAgent::Agy,
-            SetupAgent::Claude => continue,
-        };
-        let name = kind.as_str();
-        use tako_control::agent_mcp::McpState;
-        let state = tako_control::agent_mcp::state(kind);
-        if state.describe_gap().is_some() {
-            remaining.push(Remaining::new(RemainingKind::Mcp {
-                agent: name.to_string(),
-            }));
-        }
-        match state {
-            McpState::Ready { .. } => eprintln!("  [OK] {name} MCP: tako が登録済み"),
-            McpState::Dead { command } => {
-                eprintln!("  [警告] {name} MCP: 登録済みだがパスが消失しています");
-                eprintln!("         登録パス: {command}");
-                eprintln!("         tako setup または tako setup-mcp で修復できます");
-            }
-            // 登録行はあるのに env の転送が無い = ツールが 0 個になる（#979 の実測）。
-            // 「未登録」と混ぜると原因を追えないので別の文言にする
-            McpState::EnvMissing { .. } => {
-                eprintln!(
-                    "  [警告] {name} MCP: 登録済みだが tako と通信する env の転送設定がありません"
-                );
-                eprintln!("         そのままだとツールが 0 個になります");
-                eprintln!("         tako setup-mcp --agent {name} で入れ直せます");
-            }
-            McpState::NotRegistered => {
-                eprintln!("  [不足] {name} MCP: tako が未登録（tako setup-mcp で登録できます）")
-            }
-            // CLI は検出できているので Unknown は「一覧を読めなかった」だけ
-            McpState::Unknown => {
-                eprintln!("  [警告] {name} MCP: 登録状態を確認できません（{name} mcp list を手で確認してください）")
-            }
-        }
-    }
-    if agents.iter().any(|a| a.kind == SetupAgent::Codex) {
-        eprintln!("  [OK] Codex: master 起動時にも一時注入");
-    }
-    if agents.iter().any(|a| a.kind == SetupAgent::Agy) {
-        eprintln!("  [情報] agy: worker 専用（master は非対応）");
-    }
-
-    // config.yaml
-    let config_path = tako_control::setup::config_yaml_path()?;
-    if config_path.is_file() {
-        let config = load_config()?;
-        if config.setup.completed {
-            eprintln!(
-                "  [OK] セットアップ: 完了済み ({})",
-                config.setup.completed_at.as_deref().unwrap_or("日時不明")
-            );
-            // アップデート追従状況（Issue #94）
-            let pending = pending_changes(config.setup.applied_revision)?;
-            if pending.is_empty() {
-                eprintln!(
-                    "  [OK] アップデート追従: 最新（rev {}）",
-                    config.setup.applied_revision
-                );
-            } else {
-                eprintln!(
-                    "  [情報] アップデート追従: 未適用の setup 変更が {} 件（tako setup --changes で詳細）",
-                    pending.len()
-                );
-            }
-            if let Some(agent) = config.setup.selected_agent.as_deref() {
-                eprintln!("  [OK] 既定エージェント: {agent}");
-            }
-            if !config.setup.provider_plans.is_empty() {
-                let plans = config
-                    .setup
-                    .provider_plans
-                    .iter()
-                    .map(|(provider, plan)| format!("{provider}={plan}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                eprintln!("  [OK] 申告・検出プラン: {plans}");
-            }
-        } else {
-            eprintln!("  [情報] セットアップ: 未完了");
-        }
-    } else {
-        eprintln!("  [情報] config.yaml: 未作成");
-    }
-
-    // 検出したエージェントのグローバル指示ファイル
-    for agent in &agents {
-        if let Some(path) = instruction_path(agent.kind) {
-            if path.is_file() {
-                eprintln!("  [OK] {}: 存在します", display_home_relative(&path));
-            } else {
-                eprintln!("  [情報] {}: 未作成", display_home_relative(&path));
-            }
-        }
-    }
-
-    // エージェント共通ルール同期（Issue #136）
-    match tako_control::agents_sync::status() {
-        Ok(status) => {
-            let st = status["status"].as_str().unwrap_or("unknown");
-            match st {
-                "not_configured" => {
-                    eprintln!("  [情報] エージェント共通ルール同期: 未設定");
-                }
-                "up_to_date" => {
-                    eprintln!("  [OK] エージェント共通ルール同期: 最新");
-                }
-                "outdated" => {
-                    eprintln!(
-                        "  [情報] エージェント共通ルール同期: ずれあり（tako agents sync-rules で同期）"
-                    );
-                }
-                "source_missing" => {
-                    let path = status["source_path"].as_str().unwrap_or("?");
-                    eprintln!("  [不足] エージェント共通ルール同期: 正本が見つからない ({path})");
-                }
-                _ => {
-                    eprintln!("  ? エージェント共通ルール同期: {st}");
-                }
-            }
-        }
-        Err(e) => eprintln!("  [情報] エージェント共通ルール同期: 確認失敗 ({e})"),
-    }
-
-    // スリープ防止（Issue #173）
-    {
-        let settings = tako_control::settings::load();
-        let mode = settings.sleep_guard_mode;
-        let power = settings.sleep_guard_power;
-        match mode {
-            tako_control::sleep_guard::SleepGuardMode::Off => {
-                eprintln!("  [情報] スリープ防止: 無効（tako sleep-guard set --mode while-agents-running で有効化）");
-            }
-            _ => {
-                eprintln!(
-                    "  [OK] スリープ防止: mode={}, power={}",
-                    mode.as_str(),
-                    power.as_str()
-                );
-            }
-        }
-        // 蓋閉じ継続を持たない OS では案内しない（#524）
-        if tako_control::sleep_guard::lid_control_supported() {
-            let lid_mode = settings.lid_sleep_mode;
-            // 未完了かどうかだけを見る。手段（macOS の sudoers）は sleep_guard の内側（#697）
-            let setup_pending = tako_control::sleep_guard::lid_setup_pending();
-            match lid_mode {
-                tako_control::sleep_guard::LidSleepMode::Off => {
-                    eprintln!(
-                        "  [情報] 蓋閉じ防止: 未設定（tako sleep-guard install-lid-sleep で有効化）"
-                    );
-                }
-                tako_control::sleep_guard::LidSleepMode::WhileAgentsRunning => {
-                    if setup_pending {
-                        eprintln!("  [不足] 蓋閉じ防止: while-agents-running だが sudoers 未登録（tako sleep-guard install-lid-sleep で登録）");
-                    } else {
-                        eprintln!("  [OK] 蓋閉じ防止: while-agents-running");
-                    }
-                }
-            }
-        }
-    }
-
-    // 設定共有（Issue #513 / #793）。表示だけで、配線もリポジトリ作成もしない
-    for line in config_share_lines(&tako_control::config_share::env::detect(), false) {
+    let report = tako_control::diagnostics::collect();
+    for line in report.lines() {
         eprintln!("{line}");
     }
-
-    // プロファイル一覧
-    match tako_control::orchestrator::list_profiles() {
-        Ok(profiles) if !profiles.is_empty() => {
-            eprintln!(
-                "  [OK] プロファイル: {} 個（{}）",
-                profiles.len(),
-                profiles.join(", ")
-            );
-        }
-        Ok(_) => eprintln!("  [情報] プロファイル: 未作成（tako master で自動生成されます）"),
-        Err(e) => eprintln!("  [情報] プロファイル: 確認失敗 ({e})"),
-    }
-
-    // 残り作業（#1501）。`tako setup` と同じ判断・同じ文面で締める
-    for line in setup_remaining::render(&setup_remaining::summarize(remaining)) {
+    // 人へ残る作業（#1501）。`tako setup` の末尾と**同じ 1 実装**で締める
+    for line in setup_remaining::render(&setup_remaining::summarize(report.remaining())) {
         eprintln!("{line}");
     }
-
     Ok(())
 }
 
@@ -3582,7 +3038,7 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
         .iter()
         .find(|agent| agent.kind == SetupAgent::Claude)
         .is_some_and(|claude| {
-            let (registered, healthy) = check_claude_mcp_health(&claude.path);
+            let (registered, healthy) = tako_control::agent_mcp::claude_health_with(&claude.path);
             !registered || !healthy
         });
 
@@ -4054,44 +3510,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_auth_jsonから認証とプランを取得する() {
-        let value = serde_json::json!({
-            "loggedIn": true,
-            "authMethod": "claude.ai",
-            "subscriptionType": "Max"
-        });
-        assert_eq!(
-            parse_claude_auth_json(&value, true),
-            (true, Some("max".into()))
-        );
-        assert_eq!(parse_claude_auth_json(&value, false), (false, None));
-
-        let api = serde_json::json!({"loggedIn": true, "authMethod": "api_key"});
-        assert_eq!(
-            parse_claude_auth_json(&api, true),
-            (true, Some("api".into()))
-        );
-    }
-
-    #[test]
-    fn codexのjwtからプランだけを取得する() {
-        let dir =
-            std::env::temp_dir().join(format!("tako-issue226-codex-auth-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("auth.json");
-        let payload =
-            "eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9wbGFuX3R5cGUiOiJwbHVzIn19";
-        std::fs::write(
-            &path,
-            format!(r#"{{"tokens":{{"id_token":"header.{payload}.signature"}}}}"#),
-        )
-        .unwrap();
-        assert_eq!(codex_plan_from_auth_file_at(&path).as_deref(), Some("plus"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn 未導入の系統も選択肢に並び選ぶと導入案内が返る() {
         // 検出済みは claude だけ。codex / agy は「未導入」として 2) 3) に並ぶ（#1002）
         let agents = vec![detected(SetupAgent::Claude, true, Some("pro"))];
@@ -4411,10 +3829,10 @@ mod tests {
     /// 表示（setup サマリ / `--check`）の文言（Issue #793）。
     /// 判定は `config_share::env` の純粋関数、ここで見るのは「何をどう見せるか」
     mod config_share_notice {
-        use super::super::config_share_lines;
         use tako_control::config_share::env::{
             ExternalKind, ExternalManaged, GhStatus, ShareEnvironment,
         };
+        use tako_control::diagnostics::config_share_lines;
 
         fn env(linked: bool, external: Vec<ExternalManaged>) -> ShareEnvironment {
             ShareEnvironment {

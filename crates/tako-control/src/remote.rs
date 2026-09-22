@@ -2471,6 +2471,16 @@ fn configure_daemon_child(cmd: &mut Command) {
 /// 返り値: running=true ならポート/トークンも含む。
 /// PID ファイルは 3 行形式（PID / 実行ファイル / 起動時刻。P0-4）のため
 /// parse_pid_file で先頭行の PID を取り出す
+/// 公開デーモンが生きているなら pid を返す（**読み取りだけ**。#1505）。
+///
+/// [`daemon_status`] は死んだプロセスの残骸を掃除する（= 書き込みがある）ので、
+/// `tako setup --check` / `check_health` の診断はこちらを読む。
+/// 「生きているか」の判定そのものは `is_process_alive` の 1 実装を通る
+pub fn daemon_pid_if_alive() -> Option<u32> {
+    let info = parse_pid_file().ok()?;
+    is_process_alive(info.pid).then_some(info.pid)
+}
+
 pub fn daemon_status() -> Value {
     let pid_info = match parse_pid_file() {
         Ok(info) => info,

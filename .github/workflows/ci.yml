@@ -182,6 +182,14 @@ jobs:
       # **導入が `setup_deps` を通らない形（brew の直叩き）へ戻ったらここで落ちる**（#1509）
       - name: remote setup の依存導入の実経路テスト
         run: bash scripts/test-remote-setup-deps-1509.sh
+      # `tako setup --check` と `tako check-health` が**同じ 1 実装**から項目を出すことの
+      # 実経路テスト。隔離 HOME / TAKO_DATA_DIR / PATH + claude / codex / agy / tmux /
+      # git / tailscale のスタブで、本番の設定にも GUI にも触らない（CI では GUI を
+      # 立てないので `TAKO_1505_SKIP_GUI=1`。dispatch / MCP 経路は実機で確かめる）。
+      # **どちらかにだけ項目を足す形（診断の正本が 2 つ）へ戻ったらここで落ちる**
+      # （#1505。#1500 の棚卸し Z19 = `--check` にシェル統合・PATH・更新・remote が無かった）
+      - name: 診断の正本が 1 つであることの実経路テスト
+        run: TAKO_1505_SKIP_GUI=1 bash scripts/test-setup-check-single-source-1505.sh
       # PR の CI 完了待ちのモックテスト。偽 gh を PATH に挿し、一時ディレクトリの偽リポジトリ
       # （.github/workflows つき）だけを相手にするので本番の PR には触らない。
       # **「出ているチェックが全部 pending でなければ完了」へ戻ったらここで落ちる**

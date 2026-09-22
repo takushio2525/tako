@@ -5723,6 +5723,9 @@ fn check_health_cli(json: bool) -> Result<(), String> {
         }
         Err(reason) => {
             let local = local_ipc_report();
+            // #1505: 届かなくても**環境診断は答えられる**（項目の正本は tako-control 側で、
+            // GUI を要らない）。ここで黙ると「tako が起動していないと何も分からない」に戻る
+            let diagnostics = tako_control::diagnostics::collect();
             if json {
                 println!(
                     "{}",
@@ -5730,11 +5733,15 @@ fn check_health_cli(json: bool) -> Result<(), String> {
                         "connected": false,
                         "reason": reason,
                         "ipc": local,
+                        "diagnostics": diagnostics.to_json(),
                     }))
                 );
             } else {
                 println!("接続: 届かない（{reason}）");
                 print_ipc_section(&local);
+                for line in diagnostics.lines() {
+                    println!("{line}");
+                }
             }
             Err("tako アプリへ届かない（上の ipc 節が受け口の実測）".into())
         }
@@ -5787,6 +5794,17 @@ fn print_check_health(result: &Value) {
     );
     if let Some(ipc) = result.get("ipc").filter(|v| !v.is_null()) {
         print_ipc_section(ipc);
+    }
+    // #1505: 環境診断の項目。**`tako setup --check` と同じ行**（正本が組んだ文字列を
+    // そのまま出すので、2 つのコマンドの答えが字面まで一致する）
+    for line in result["diagnostics"]["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|item| item["lines"].as_array().into_iter().flatten())
+        .filter_map(|line| line.as_str())
+    {
+        println!("{line}");
     }
     for issue in result["issues"].as_array().into_iter().flatten() {
         println!(

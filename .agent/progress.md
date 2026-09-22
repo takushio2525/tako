@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-23（#763: リンクを開く修飾キーをプラットフォームごとに 1 箇所で決めた）
-- リンク経路 13 サイト（ターミナルのクリック / cmd+右クリック #1182 / ホバー 6 / md・PDF のクリック / リリースノート）が `Modifiers::platform` を直読みし、Windows は Win+クリック要求だった。判定を `tako_core::platform::keys::link_modifier_active(platform, platform_key, control)`（macOS = command のみ / Windows = control のみ。`platform || control` を素で足すと macOS の Ctrl+クリック = 右クリック相当と衝突）へ寄せ、GPUI 側は `keybindings::link_modifier_active` / `link_modifiers` / `non_link_modifiers` の 3 本だけが `Modifiers` を触る形にした。表記も同じ表を見る `keys::link_click` で MCP カタログ・CLI ヘルプ・docs が実行 OS に追従する
-- 実測: 番犬 `issue763_link_modifier_watchdog`（4 規則）へ注入 12 通りすべて file:line 名指しで FAILED → 戻して緑・隔離 GUI（tako-vd）のセルフテストが `TAKO_APP_SELF_TEST_OK` 完走（310 秒 / 240 診断行）で `TAKO_SELF_TEST_763: file_click=true dir_click=true wrong_modifier_opened=false`・workspace 5204 passed 0 failed・clippy 3 宇宙 0・check-windows error 0
-- 次: Windows 実機での Ctrl+クリック実測は #467 の実機レーンで（offline のため未検証）
-
 ## 2026-09-23（#1540: MCP ツールカタログの説明文を圧縮し、Issue 番号を落とした）
 - AI が引けない Issue 番号を description / inputSchema から**195 箇所すべて**落とし（根拠は `// 出自: #…` のソースコメントへ 83 ツールぶん移送）、`tako_orchestrator_worker_status` を 3,587 → 1,566 字へ。残り 76% は識別子なので地の文は 368 字（これ以上は応答キー・enum 値を捨てることになる）。ダイアログ構造は `tako_orchestrator_respond`、`prompt_delivery_failure` の値は `tako_orchestrator_workers`、`delivery` の項目は `tako_read_pane` を正本に寄せた
 - `next_step` / `degraded` を返す 9 ツールへ読み方を明記し、`tako_setup` の `orchestrator` / `sleep_guard`（カタログ唯一の description 欠落）を補い、導線の無かった 6 ツール（`select_tab` / `recent` / `git_push` / `git_pull` / `preview_undo` / `redo`）へ前提ツールを足した。規則は `.agent/conventions.md` の新節、上限は #1539 の 210 KB → **200 KB** へ締め直し
@@ -64,3 +59,8 @@
 - `line_end` が `\n` の位置を返し `newline` が `"\n"` 固定だったので、CRLF ファイルは End で CR の後ろへ止まり（実測 `cursor=4` / `"abc\r!\n"`）Enter 1 回で混在改行（CR 2 / LF 3）になっていた。`TextBuffer` に `LineEnding` を持たせ `\r\n` を 1 つの行区切りとして扱う（行末は CR の手前 / カーソルは CR と LF のあいだに入らない / BS・Delete は 2 バイトまとめて / 移動はまたぐ）
 - **既存行の改行は 1 バイトも書き換えない**（混在は多数派へ寄せず保持）。新しい改行だけが多数派に揃い、揃える口は `normalize_line_endings` の 1 実装。改行 0 のファイルだけ `for_new_file(Platform)` = OS の流儀（純関数なので macOS から両腕を固定できる。初回 CI は Windows だけ赤で、既存テスト 2 件の `\n` 直書き期待値がずれていた）。表示側の行頭オフセットも `line_start_offsets` へ
 - 実測: 4 通り（CRLF / LF / 混在 / 末尾改行なし）の往復保存が修正前 FAILED → 修正後 緑・番犬 `issue1650_line_ending_watchdog` 8 本へ注入 12 通りすべて file:line 名指しで FAILED → 戻して緑・Windows の腕を強制した全数走 5260 passed・workspace 5261 passed 0 failed・clippy 3 宇宙 0
+
+## 2026-09-23（#1505: setup --check と check-health の診断項目を 1 実装の正本から組むようにした）
+- 同じ「この環境で tako は使えるか」を 2 実装が別々に答えていた（`--check` にシェル統合・tako CLI の PATH・更新・remote・IPC の行が無く、PATH は `check-health` だけが別口 = 棚卸し Z19）。`tako_control::diagnostics::collect()` を項目・判定・行の正本にし、`run_check` は 285 行 → 15 行（判断ゼロ）、`check_health` は応答へ `diagnostics` 節。認証とプランの問い合わせも `auth_state_for` の 1 回へ寄り、`--check` は 12.4 → 10.8 秒
+- 重い正本（実測 10.8 秒）を UI スレッドで走らせないよう `Request::CheckHealth` を `prepare_offload` へ。IPC の項目は観測者で文面を変えない形に。**寄せた先で #1503 の打ち切りの知らせが落ちていた**（CI の macOS が実回帰で赤）ので `agent_probe::output_with_timeout` の 1 実装から出し直し、`diagnostics.probe_timeouts` で機械可読にもして番犬を足した
+- 実測: `scripts/test-setup-check-single-source-1505.sh` **38 PASS 0 FAIL**（隔離 GUI で dispatch・`tako mcp serve` の MCP まで実経路照合）・注入 12 通りすべて file:line 名指しで FAILED → 戻して緑・既存の隔離 5 本（81/52/49/54/verify-multiagent）全緑・workspace 5249 passed 0 failed・clippy 3 宇宙 rc=0・check-windows rc=0・docs 32 ページ警告 0

@@ -61,6 +61,33 @@ pub fn run(cmd: &mut std::process::Command) -> Option<std::process::Output> {
         .ok()
 }
 
+/// 上限つきでエージェント CLI へ問い合わせる（#1261 の門番 + #1503 の上限）。
+///
+/// `claude mcp list` のように**返らなくなりうる**問い合わせはこちらを通す。
+/// [`run`] は `output()` で待ちっぱなしなので、上限が要る経路では使わないこと
+/// （#1503 の症状は「`tako setup` が無言で 6 分固まる」だった）。
+/// 禁じられているときは**プロセスを 1 つも作らず** `Failed` を返す。
+///
+/// **打ち切ったら必ず知らせる**（#1503 / FR-2.14.13 の契約は「無言にしない」）。
+/// 文面は `probe::TimeoutNotice` の 1 実装で、`tako setup` の stderr へ 2 字下げで出る
+/// = dispatch / MCP が `probe::parse_notices` で読み戻して `probe_timeouts` に載せる形
+/// （読み戻しと対なので、ここで字下げや文面を変えない）。
+/// 知らせは戻り値にも入るので、呼び手は診断の JSON へも載せられる
+pub fn output_with_timeout(program: &str, args: &[&str]) -> tako_core::probe::Outcome {
+    if blocked() {
+        return tako_core::probe::Outcome::Failed {
+            label: tako_core::probe::label(program, args),
+            reason: "検証プロセスからの問い合わせは禁じられています（#1261）".to_string(),
+        };
+    }
+    let outcome =
+        tako_core::probe::output_with_timeout(program, args, tako_core::probe::probe_timeout());
+    if let Some(notice) = outcome.timeout_notice() {
+        eprintln!("  {notice}");
+    }
+    outcome
+}
+
 #[cfg(test)]
 mod tests {
     /// テストプロセスからは 1 プロセスも起こさない（`true` を返す実コマンドでも `None`）
