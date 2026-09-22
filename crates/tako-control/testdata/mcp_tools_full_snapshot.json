@@ -122,7 +122,7 @@
     "name": "tako_read_pane"
   },
   {
-    "description": "ターミナル画面の**リンク**（cmd+クリックで開けるもの）を列挙する。GUI の cmd+クリックと同じ判定（tako_core::links）を通すので、人手のクリック無しに「この画面のこのパスはリンクになるのか」を確かめられる（#1283）。応答の links[] は kind（url / path）・target（解決済みの絶対パス or URL）・text（画面に見えている文字列 = 下線が付く範囲）・spans（[row, start_col, end_col]）。kind=path には open（cmd+クリックの行き先: terminal / code / markdown / image / pdf / video）と is_dir が付く。パスは**実在するものだけ**がリンクになるので、「飛べない」の切り分けは検出（ここが空か）と開き方（open）の 2 段で見る。text を渡すとペインの画面の代わりにその文字列（改行区切り）を材料にする（画面の写しを貼って判定を再現できる）。",
+    "description": "ターミナル画面の**リンク**（<link-click>で開けるもの）を列挙する。GUI の<link-click>と同じ判定（tako_core::links）を通すので、人手のクリック無しに「この画面のこのパスはリンクになるのか」を確かめられる（#1283）。応答の links[] は kind（url / path）・target（解決済みの絶対パス or URL）・text（画面に見えている文字列 = 下線が付く範囲）・spans（[row, start_col, end_col]）。kind=path には open（<link-click>の行き先: terminal / code / markdown / image / pdf / video）と is_dir が付く。パスは**実在するものだけ**がリンクになるので、「飛べない」の切り分けは検出（ここが空か）と開き方（open）の 2 段で見る。text を渡すとペインの画面の代わりにその文字列（改行区切り）を材料にする（画面の写しを貼って判定を再現できる）。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -1345,7 +1345,7 @@
     "name": "tako_preview_changelog"
   },
   {
-    "description": "ファイル操作を実行する。op で種別を指定:\ncopy_absolute_path = 絶対パスを取得 / copy_relative_path = ペイン cwd 基準の相対パスを取得 /\nreveal = ファイルマネージャ（Finder / エクスプローラー）でファイルの場所を表示 /\nopen_terminal = 指定パスのディレクトリへペイン内で cd /\nrename = name でファイル名を変更 / create_file = path 配下に name でファイル作成 /\ncreate_dir = path 配下に name でフォルダ作成 /\ntrash = ゴミ箱（Windows はごみ箱）へ移動。完全削除ではないので復元できる /\nopen_default = デフォルトアプリで開く /\nopen_with = name で指定したアプリで開く（name 必須）/\nopen_in_tako = tako の中で開く（ファイル = プレビューペイン / ディレクトリ = そのディレクトリのシェル。ターミナル内のパスリンクの cmd+クリック・cmd+右クリックメニューと同じ動作）。\nrename / create_file / create_dir / open_with は name パラメータが必須。open_terminal / copy_relative_path / open_in_tako は pane パラメータでペインを指定する。",
+    "description": "ファイル操作を実行する。op で種別を指定:\ncopy_absolute_path = 絶対パスを取得 / copy_relative_path = ペイン cwd 基準の相対パスを取得 /\nreveal = ファイルマネージャ（Finder / エクスプローラー）でファイルの場所を表示 /\nopen_terminal = 指定パスのディレクトリへペイン内で cd /\nrename = name でファイル名を変更 / create_file = path 配下に name でファイル作成 /\ncreate_dir = path 配下に name でフォルダ作成 /\ntrash = ゴミ箱（Windows はごみ箱）へ移動。完全削除ではないので復元できる /\nopen_default = デフォルトアプリで開く /\nopen_with = name で指定したアプリで開く（name 必須）/\nopen_in_tako = tako の中で開く（ファイル = プレビューペイン / ディレクトリ = そのディレクトリのシェル。ターミナル内のパスリンクの<link-click>・修飾 + 右クリックメニューと同じ動作）。\nrename / create_file / create_dir / open_with は name パラメータが必須。open_terminal / copy_relative_path / open_in_tako は pane パラメータでペインを指定する。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {

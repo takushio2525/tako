@@ -584,6 +584,55 @@ fn printable_char_from_key(ks: &Keystroke) -> Option<String> {
     })
 }
 
+/// リンクを開く修飾キーが押されているか（Issue #763）。
+///
+/// **リンク経路（ターミナルの URL / パス・PDF 注釈・Markdown・リリースノート）は
+/// 全部ここを通す**。`Modifiers::platform` を直接見ると、GPUI の platform 修飾は
+/// Windows で Win キーになるので、Windows では Win+クリックを要求することになる
+/// （OS のシェルに食われて実質押せない = #763 の症状）。
+///
+/// 判定の表そのものは `tako_core::platform::keys::link_modifier_active`（純粋関数）で、
+/// ここは GPUI の `Modifiers` をその引数へ落とすだけの薄い層。**分岐をここへ書かない**
+/// （書くと macOS の CI から Windows 側を検証できなくなる = #515 と同じ方針）
+pub fn link_modifier_active(modifiers: &Modifiers) -> bool {
+    tako_core::platform::keys::link_modifier_active(
+        Platform::current(),
+        modifiers.platform,
+        modifiers.control,
+    )
+}
+
+/// リンクを開く修飾キーだけを立てた `Modifiers`（セルフテスト・検証の入力生成用）。
+///
+/// 合成イベントで `platform: true` を直書きすると、**Windows のセルフテストだけが
+/// 落ちる**（実装は Ctrl を見るのに入力は Win キーを立てている）。入力側も
+/// [`link_modifier_active`] と同じ表から組む
+pub fn link_modifiers(active: bool) -> Modifiers {
+    if !active {
+        return Modifiers::default();
+    }
+    let windows = matches!(Platform::current(), Platform::Windows);
+    Modifiers {
+        platform: !windows,
+        control: windows,
+        ..Modifiers::default()
+    }
+}
+
+/// リンクを開く修飾**ではない**ほうを立てた `Modifiers`（負の検証用。Issue #763）。
+///
+/// macOS なら control（Ctrl+クリック = 右クリック相当）、Windows なら platform
+/// （Win+クリック = OS のシェルが持つ）を立てる。「この修飾では開かない」を
+/// 実 GUI で確かめるための入力で、[`link_modifier_active`] は必ず false を返す
+pub fn non_link_modifiers() -> Modifiers {
+    let windows = matches!(Platform::current(), Platform::Windows);
+    Modifiers {
+        platform: windows,
+        control: !windows,
+        ..Modifiers::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,6 +743,43 @@ mod tests {
         }
         assert!(checked > 0, "検査対象のペーストバインドが 1 本も無い");
     }
+    /// #763: GPUI の `Modifiers` を通す薄い層が、正本の表と同じ答えを返す。
+    ///
+    /// 実 OS ぶんしか走らないので、**両 OS の分岐そのもの**は
+    /// `tako_core::platform::keys` の単体（`リンクの修飾キーはosごとに1つだけ受理する`）
+    /// が macOS 上から両方見る。ここが見るのは「配線が逆でないか」だけ
+    #[test]
+    fn リンク修飾の判定と入力生成が噛み合う() {
+        assert!(link_modifier_active(&link_modifiers(true)));
+        assert!(!link_modifier_active(&link_modifiers(false)));
+        assert!(!link_modifier_active(&Modifiers::default()));
+        assert!(
+            !link_modifier_active(&non_link_modifiers()),
+            "負の検証用の修飾でリンクが開いてしまう"
+        );
+        let only_platform = Modifiers {
+            platform: true,
+            ..Modifiers::default()
+        };
+        let only_control = Modifiers {
+            control: true,
+            ..Modifiers::default()
+        };
+        if cfg!(target_os = "windows") {
+            assert!(link_modifier_active(&only_control));
+            assert!(
+                !link_modifier_active(&only_platform),
+                "Win+クリックは受理しない"
+            );
+        } else {
+            assert!(link_modifier_active(&only_platform));
+            assert!(
+                !link_modifier_active(&only_control),
+                "macOS の Ctrl+クリックは右クリック相当なので受理しない"
+            );
+        }
+    }
+
     fn ks_ctrl(key: &str) -> Keystroke {
         Keystroke {
             modifiers: Modifiers {
@@ -1640,7 +1726,10 @@ mod tests {
     ///
     /// `shortcut_hint_for` が非 macOS の platform 修飾バインドを落とす規則と
     /// 同じで、こちらはバインド表に載っていない「修飾 + クリック」「修飾 + Enter」用。
-    /// Win+クリック / Win+Enter は押せない（#763）ので、案内すると嘘になる
+    /// Win+クリック / Win+Enter は押せないので、案内すると嘘になる。
+    ///
+    /// **リンクを開く操作はここの対象外**（#763 で Windows 側を Ctrl へ移したので、
+    /// `keys::link_modifier` は両 OS とも表記を返す）
     #[test]
     fn platform修飾の案内は非macosでは出ない() {
         use tako_core::platform::keys;

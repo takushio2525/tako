@@ -29,6 +29,16 @@ use tako_control::protocol::{Axis, Direction, Request};
 const OUTSIDE_TAKO: &str = "tako アプリへの接続情報が無い（TAKO_SOCKET / TAKO_TOKEN 未設定・\
     接続情報ファイルも無し）。tako アプリを起動するか、tako 内のターミナルで実行してください";
 
+/// ヘルプへ埋める「修飾 + クリック」の表記（実行プラットフォーム。Issue #763）。
+///
+/// macOS は `⌘+クリック` / Windows は `Ctrl+クリック`。**直書きしない**:
+/// Windows のユーザーへ `cmd+クリック` と案内すると、Win キーは OS が奪うので
+/// 書いてあるとおりに押しても開かない（#1203 と同じ事故）。表記の正本は
+/// `tako_core::platform::keys::link_modifier` で、GUI の判定と同じ表を見る
+fn link_click() -> String {
+    tako_core::platform::keys::link_click(tako_core::platform::support::Platform::current())
+}
+
 #[derive(Parser)]
 #[command(
     name = "tako",
@@ -61,7 +71,8 @@ enum Command {
     CheckHealth(CheckHealthArgs),
     /// ペインの画面内容をテキストで出力する
     Read(ReadArgs),
-    /// ターミナル画面のリンク（cmd+クリックで開けるもの）を列挙する（Issue #1283）
+    /// ターミナル画面のリンク（修飾 + クリックで開けるもの）を列挙する（Issue #1283）
+    #[command(about = format!("ターミナル画面のリンク（{}で開けるもの）を列挙する（Issue #1283）", link_click()))]
     Links(LinksArgs),
     /// スクロールバック表示を動かす（--to 0 で最下部へ）
     Scroll(ScrollArgs),
@@ -1603,7 +1614,12 @@ enum FileCommand {
     /// 指定アプリで開く
     OpenWith { path: String, name: String },
     /// tako の中で開く（ファイル = プレビューペイン / ディレクトリ = そのディレクトリの
-    /// シェル。ターミナル内のパスリンクの cmd+クリック・パスメニューと同じ動作。#1182）
+    /// シェル。ターミナル内のパスリンクの修飾 + クリック・パスメニューと同じ動作。#1182）
+    #[command(about = format!(
+        "tako の中で開く（ファイル = プレビューペイン / ディレクトリ = そのディレクトリの\
+         シェル。ターミナル内のパスリンクの{}・パスメニューと同じ動作。#1182）",
+        link_click()
+    ))]
     OpenInTako {
         path: String,
         #[arg(long)]

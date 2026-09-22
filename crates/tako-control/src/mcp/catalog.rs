@@ -4,6 +4,17 @@ use serde_json::{json, Value};
 
 use crate::protocol::PanelViewWire;
 
+/// リンクを開く「修飾 + クリック」の表記（実行プラットフォーム。Issue #763）。
+///
+/// macOS は `⌘+クリック` / Windows は `Ctrl+クリック`。**直書きしない**:
+/// カタログは MCP を繋いだエージェント全員が起動時に読むので、Windows へ
+/// `cmd+クリック` と申告すると、エージェントはユーザーへ押せない打鍵を案内する
+/// （#1203 と同じ事故を、人ではなく AI 経由で起こす）。表記の正本は
+/// `tako_core::platform::keys::link_modifier` で、判定側と同じ表を見る
+fn link_click() -> String {
+    tako_core::platform::keys::link_click(tako_core::platform::support::Platform::current())
+}
+
 /// ペイン ID 引数のスキーマ（省略時は呼び出し元）
 fn pane_schema(description: &str) -> Value {
     json!({ "type": "integer", "minimum": 0, "description": description })
@@ -210,16 +221,16 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_links",
-            "description": "ターミナル画面の**リンク**（cmd+クリックで開けるもの）を列挙する。\
-                GUI の cmd+クリックと同じ判定（tako_core::links）を通すので、\
+            "description": format!("ターミナル画面の**リンク**（{lc}で開けるもの）を列挙する。\
+                GUI の{lc}と同じ判定（tako_core::links）を通すので、\
                 人手のクリック無しに「この画面のこのパスはリンクになるのか」を確かめられる（#1283）。\
                 応答の links[] は kind（url / path）・target（解決済みの絶対パス or URL）・\
                 text（画面に見えている文字列 = 下線が付く範囲）・spans（[row, start_col, end_col]）。\
-                kind=path には open（cmd+クリックの行き先: terminal / code / markdown / image / pdf / video）と \
+                kind=path には open（{lc}の行き先: terminal / code / markdown / image / pdf / video）と \
                 is_dir が付く。パスは**実在するものだけ**がリンクになるので、\
                 「飛べない」の切り分けは検出（ここが空か）と開き方（open）の 2 段で見る。\
                 text を渡すとペインの画面の代わりにその文字列（改行区切り）を材料にする\
-                （画面の写しを貼って判定を再現できる）。",
+                （画面の写しを貼って判定を再現できる）。", lc = link_click()),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1059,7 +1070,7 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_file_op",
-            "description": "ファイル操作を実行する。op で種別を指定:\n\
+            "description": format!("ファイル操作を実行する。op で種別を指定:\n\
                 copy_absolute_path = 絶対パスを取得 / copy_relative_path = ペイン cwd 基準の相対パスを取得 /\n\
                 reveal = ファイルマネージャ（Finder / エクスプローラー）でファイルの場所を表示 /\n\
                 open_terminal = 指定パスのディレクトリへペイン内で cd /\n\
@@ -1069,9 +1080,9 @@ pub fn tools() -> Vec<Value> {
                 open_default = デフォルトアプリで開く /\n\
                 open_with = name で指定したアプリで開く（name 必須）/\n\
                 open_in_tako = tako の中で開く（ファイル = プレビューペイン / ディレクトリ = そのディレクトリのシェル。\
-                ターミナル内のパスリンクの cmd+クリック・cmd+右クリックメニューと同じ動作）。\n\
+                ターミナル内のパスリンクの{lc}・修飾 + 右クリックメニューと同じ動作）。\n\
                 rename / create_file / create_dir / open_with は name パラメータが必須。\
-                open_terminal / copy_relative_path / open_in_tako は pane パラメータでペインを指定する。",
+                open_terminal / copy_relative_path / open_in_tako は pane パラメータでペインを指定する。", lc = link_click()),
             "inputSchema": {
                 "type": "object",
                 "properties": {
