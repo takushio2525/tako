@@ -8,6 +8,34 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.8.18] - 2026-09-23
+
+Nightly patch release (automated). Changes since v0.8.17:
+夜間パッチリリース（自動）。v0.8.17 以降の変更:
+
+- [修正] orchestrator projects list を dispatch 経由へ寄せ、直読みの再発を番犬で止めた (#1544) (#1588)
+- [ドキュメント] docs の数値と Issue 参照のズレを直し、docs ビルドと og / リンク検査を CI に載せた (#1547) (#1582)
+- [修正] Windows のテスト側 POSIX 前提を直し、CI の cargo test を blocking にした (#1278 #583) (#1559)
+- [修正] 復元の内訳が全ペインを説明するようにし、個別の復元失敗を persist.log に残した (#1554) (#1566)
+- [スタイル] UI の絵文字を GPUI の描画プリミティブへ置き換えた (#1536) (#1573)
+- [ドキュメント] releases.md に v0.8 系を書き、最新の安定版の位置を移した (#1546) (#1574)
+- [ドキュメント] getting-started を 9/22 の setup 着地へ追従させ、次のステップにリモートとショートカットを足した (#1545) (#1570)
+- [機能追加] docs サイトに GA4 の gtag と AdSense の所有権確認 meta を入れた (#1583) (#1584)
+- [改善] MCP ツールカタログを起動時ロードの予算対象にした (#1539) (#1560)
+- [修正] 自動命名のヒューリスティックがシェルの実行ファイルパスを掴まないようにし、シェル統合の無い環境でも命名がやり直されるようにした (#760) (#1561)
+- [修正] docs 生成スクリプトが古い tako バイナリを黙って選ばないようにした (#1548) (#1558)
+- [修正] agent CLI の probe に待ち時間の上限を付け、無応答の claude で setup が固まらないようにした (#1503) (#1530)
+- [ドキュメント] progress.md に #1525 のエントリを追記した (#1525) (#1529)
+- [ドキュメント] AGENTS.md のリリース運用詳細を .agent/release.md へ移し、予算の余地を作った (#1525) (#1528)
+- [リファクタ] 標準 tako setup の依存 [y/N] を setup_deps::offer_and_install の 1 呼び出しへ寄せた (#1524) (#1527)
+- [ドキュメント] setup が意図して人に残す段を requirements.md へ記録した (#1512) (#1526)
+- [リファクタ] remote setup の Tailscale 導入を setup_deps の 1 実装へ寄せた (#1509) (#1523)
+- [修正] 未認証・未導入でも tako setup が全段やって完走するようにした (#1501) (#1522)
+- [修正] bash 3.2 で落ちる空配列展開を 41 箇所直し、番犬で縛った (#1518) (#1521)
+- [修正] orchestrator self --pane N が名指しどおりそのペインを答えるようにした (#1516) (#1519)
+- [機能追加] tako CLI を外部ターミナルからも打てるようにする (#1502) (#1517)
+- [機能追加] tako setup の依存チェック段で未検出の CLI 依存を [y/N] から導入できるようにした (#1499) (#1513)
+
 ## [0.8.17] - 2026-09-22
 
 Nightly patch release (automated). Changes since v0.8.16:
