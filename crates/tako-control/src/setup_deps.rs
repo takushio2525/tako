@@ -154,7 +154,29 @@ pub fn deps(platform: Platform) -> Vec<ExternalDep> {
 
 /// この環境の依存表
 pub fn current_deps() -> Vec<ExternalDep> {
-    deps(tako_core::platform::agent_install::current_platform())
+    let mut deps = deps(tako_core::platform::agent_install::current_platform());
+    if let Some(bin) = test_required_dep() {
+        for dep in deps.iter_mut() {
+            if dep.bin == bin {
+                dep.required = true;
+            }
+        }
+    }
+    deps
+}
+
+/// **テスト専用**: 表の 1 件を必須依存へ倒す（`TAKO_1501_TEST_REQUIRED_DEP=<bin>`）。
+///
+/// [`deps`] は現状すべて `required: false` なので、「必須依存が欠けている」経路を
+/// 実機で作れない（実際に必須へ載るのは「エージェント CLI が 1 つも無い」の合成項目
+/// だけ）。#1501 の受け入れ検査がその経路を**実走で**確かめるための逃げ道。
+///
+/// 認可のゲートではないので、誰が指定しても起きるのは**表示と残り作業が 1 行増える**
+/// ことだけ（#1501 以降、必須依存の不足で setup は止まらない）。表に無い名前は無視する
+fn test_required_dep() -> Option<String> {
+    std::env::var("TAKO_1501_TEST_REQUIRED_DEP")
+        .ok()
+        .filter(|value| !value.is_empty())
 }
 
 /// 1 件ぶんの検出結果

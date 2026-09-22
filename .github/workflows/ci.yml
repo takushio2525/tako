@@ -109,6 +109,13 @@ jobs:
       # 実機の利用者には検出止まりに見えていた）
       - name: setup の依存導入の実経路テスト
         run: bash scripts/test-setup-deps-prompt-1499.sh
+      # 未認証・未導入でも `tako setup` が全段やって exit 0 し、「残り」を最簡コマンド
+      # つきで出すことの実経路テスト。隔離 HOME / TAKO_DATA_DIR / PATH + claude / codex /
+      # brew / curl のスタブなので本番の設定にもネットワークにも触らない。
+      # **詰まった段で exit 1 して残りの段を捨てる形へ戻ったらここで落ちる**
+      # （#1501。#1500 の棚卸しでは新品環境で「setup を走らせても何も整わない」だった）
+      - name: setup が詰まっても完走することの実経路テスト
+        run: bash scripts/test-setup-continue-1501.sh
       # PR の CI 完了待ちのモックテスト。偽 gh を PATH に挿し、一時ディレクトリの偽リポジトリ
       # （.github/workflows つき）だけを相手にするので本番の PR には触らない。
       # **「出ているチェックが全部 pending でなければ完了」へ戻ったらここで落ちる**
