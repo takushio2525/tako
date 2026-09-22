@@ -2566,9 +2566,13 @@ GPUI の `cmd` は platform 修飾で、Windows では **Win キー**へ解決�
   `案内文の打鍵表記はバインド表と一致する` が **macOS / Windows の両方**について検査する
 - **バインド表に無い「修飾 + クリック」「修飾 + Enter」**（確認スキップ・コミット確定・
   設定の確定）は `keys::platform_modifier` / `keys::modifier_enter` を引く。
-  **非 macOS は `None`** = その案内を出さない。Win+クリック / Win+Enter は押せない（#763）ので、
+  **非 macOS は `None`** = その案内を出さない。Win+クリック / Win+Enter は押せないので、
   表記を Windows 風に置き換えるのではなく**案内ごと落とす**のが正しい
   （`shortcut_hint_for` が非 macOS の platform 修飾バインドを落とすのと同じ規則）
+- **リンクを開く「修飾 + クリック」だけは例外**で、`keys::link_click` /
+  `keys::link_modifier` が**両 OS とも表記を返す**（`Option` ではない）。#763 で
+  打鍵そのものを Windows は Ctrl へ移したので、案内を落とす理由が無い。
+  下の「リンクを開く修飾キー」節を見ること
 - 判定はすべて **`Platform` を引数に取る純粋関数**。`cfg!` で分けると
   「Windows でどう見えるか」を macOS の CI で押さえられない（#515 と同じ方針）。
   そのため `key_bindings()` の表も `cfg` をやめ、`bindings_for(platform)` が
@@ -2581,6 +2585,23 @@ GPUI の `cmd` は platform 修飾で、Windows では **Win キー**へ解決�
 - セルフテストの項目名（`check(cond, "visual-test md: ⌘C 相当の…")`）と
   実装の意図を書くコメントは対象外（画面に出ない診断文）。
   claude の TUI から採った fixture も同じ（tako の文言ではない）
+
+## リンクを開く修飾キーは 1 箇所で決める（Issue #763）
+
+ターミナルの URL / パス・PDF 注釈・Markdown・リリースノートの**リンク経路は
+`keybindings::link_modifier_active` を通す**。GPUI の `Modifiers::platform` を
+直読みすると、Windows では Win キーになって Win+クリックを要求する形になり、
+OS のシェルに食われてユーザーはリンクへ到達できない（#763 の症状）。
+
+- 判定の正本は `tako_core::platform::keys::link_modifier_active(platform, platform_key, control)`。
+  **macOS = command のみ / Windows = control のみ**で、`platform || control` を素で書くのは駄目
+  （macOS の Ctrl+クリックは右クリック相当なので、コンテキストメニューとリンク開きが同時に走る）
+- 表記は同じ表を見る `keys::link_modifier` / `keys::link_click`（`⌘+クリック` /
+  `Ctrl+クリック`）。MCP カタログ・CLI ヘルプへ `cmd+クリック` と直書きしない
+- 合成マウスイベント（セルフテスト）の修飾も `keybindings::link_modifiers` から組む。
+  `platform: true` を直書きすると**実装だけ Ctrl へ移って Windows のセルフテストが落ちる**
+- 番犬は `crates/tako-control/tests/issue763_link_modifier_watchdog.rs`（4 規則:
+  ホバー呼び出しの実引数 / クリック判定の `if` 条件 / マウスハンドラ本体 / 合成イベント）
 
 ## MCP カタログの enum は正本から生成する（Issue #1467）
 

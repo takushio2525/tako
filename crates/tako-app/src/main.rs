@@ -15144,9 +15144,13 @@ impl TakoApp {
                 .scroll_ctls
                 .get(&pane_id)
                 .is_some_and(|c| c.mirror_scrolling());
-            // cmd+クリック: リンクを開く（ミラースクロール表示中は視覚位置と
+            // 修飾 + クリック: リンクを開く（修飾は macOS = cmd / Windows = Ctrl。
+            // 判定は 1 実装 = #763。ミラースクロール表示中は視覚位置と
             // リンク検出座標が一致しないため判定しない。#159）
-            if event.modifiers.platform && event.click_count == 1 && !mirror_scrolling {
+            if crate::keybindings::link_modifier_active(&event.modifiers)
+                && event.click_count == 1
+                && !mirror_scrolling
+            {
                 if let Some(link) = self.hovered_link.take() {
                     if link.contains(pane_id, row, col) {
                         self.open_link(&link.target, link.kind, pane_id, cx);
@@ -15214,7 +15218,7 @@ impl TakoApp {
                 println!("TAKO_SELF_TEST_1182: right_click bail={reason}");
             }
         };
-        if !event.modifiers.platform {
+        if !crate::keybindings::link_modifier_active(&event.modifiers) {
             bail("no-cmd");
             return;
         }
@@ -15460,12 +15464,13 @@ impl TakoApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // cmd+ホバーでリンク検出（ボタン押下状態に関係なく判定）
-        self.update_hovered_link_at(event.position, event.modifiers.platform, window, cx);
+        // 修飾 + ホバーでリンク検出（ボタン押下状態に関係なく判定。修飾は #763 の 1 実装）
+        let link_mod = crate::keybindings::link_modifier_active(&event.modifiers);
+        self.update_hovered_link_at(event.position, link_mod, window, cx);
         // PDF プレビューのリンクホバー（#271）
-        self.update_pdf_link_hover(event.position, event.modifiers.platform, cx);
+        self.update_pdf_link_hover(event.position, link_mod, cx);
         // Markdown プレビューのリンクホバー（#680）
-        self.update_md_link_hover(event.position, event.modifiers.platform, cx);
+        self.update_md_link_hover(event.position, link_mod, cx);
 
         if event.pressed_button != Some(MouseButton::Left) {
             // ウィンドウ外でボタンが離されると MouseUp が届かないことがある。
@@ -15843,23 +15848,20 @@ impl TakoApp {
         }
     }
 
-    /// cmd 単独の押下・解放でも、現在のマウス位置にあるリンク装飾を即時更新する。
+    /// 修飾キー単独の押下・解放でも、現在のマウス位置にあるリンク装飾を即時更新する
+    /// （修飾は macOS = cmd / Windows = Ctrl。#763）。
     fn on_modifiers_changed(
         &mut self,
         event: &gpui::ModifiersChangedEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.update_hovered_link_at(
-            window.mouse_position(),
-            event.modifiers.platform,
-            window,
-            cx,
-        );
+        let link_mod = crate::keybindings::link_modifier_active(&event.modifiers);
+        self.update_hovered_link_at(window.mouse_position(), link_mod, window, cx);
         // PDF プレビューのリンクホバーも更新（#271）
-        self.update_pdf_link_hover(window.mouse_position(), event.modifiers.platform, cx);
+        self.update_pdf_link_hover(window.mouse_position(), link_mod, cx);
         // Markdown プレビューも同様（#680）
-        self.update_md_link_hover(window.mouse_position(), event.modifiers.platform, cx);
+        self.update_md_link_hover(window.mouse_position(), link_mod, cx);
     }
 
     /// ペインのリンク検出キャッシュを更新する
@@ -50051,7 +50053,7 @@ mod self_test {
                     });
                 }
 
-                let (file_click_ok, directory_click_ok) = window
+                let (file_click_ok, directory_click_ok, wrong_modifier_opened) = window
                     .update(cx, |app, win, cx| {
                         let base = app.focused_pane();
                         app.refresh_pane_links(base);
@@ -50059,6 +50061,7 @@ mod self_test {
 
                         let click = |app: &mut TakoApp,
                                      link: &tako_core::DetectedLink,
+                                     modifiers: Modifiers,
                                      win: &mut Window,
                                      cx: &mut Context<TakoApp>| {
                             let &(row, start, _) = link.spans.first()?;
@@ -50078,10 +50081,7 @@ mod self_test {
                                 &MouseDownEvent {
                                     button: MouseButton::Left,
                                     position,
-                                    modifiers: Modifiers {
-                                        platform: true,
-                                        ..Modifiers::default()
-                                    },
+                                    modifiers,
                                     click_count: 1,
                                     first_mouse: false,
                                 },
@@ -50094,7 +50094,33 @@ mod self_test {
                         let file_link = links
                             .iter()
                             .find(|link| std::path::Path::new(&link.target) == link_file)?;
-                        click(app, file_link, win, cx)?;
+                        // #763: **受理してはいけない側**の修飾（macOS = Ctrl / Windows = Win）
+                        // では開かない。`platform || control` を素で足すと macOS の
+                        // Ctrl+クリック（右クリック相当）でリンクが開いてしまう
+                        click(
+                            app,
+                            file_link,
+                            crate::keybindings::non_link_modifiers(),
+                            win,
+                            cx,
+                        )?;
+                        let wrong_modifier_opened = app
+                            .previews
+                            .iter()
+                            .any(|(_, state)| state.path == link_file);
+                        // 開かなかったぶんは選択が始まっているので畳んでから本番へ
+                        if let Some(session) = app.terminals.get(&base) {
+                            session.clear_selection();
+                        }
+                        app.selecting = None;
+
+                        click(
+                            app,
+                            file_link,
+                            crate::keybindings::link_modifiers(true),
+                            win,
+                            cx,
+                        )?;
                         let preview = app.previews.iter().find_map(|(pane, state)| {
                             (state.path == link_file).then_some(*pane)
                         });
@@ -50120,7 +50146,13 @@ mod self_test {
                             .clone();
                         let terminals_before: std::collections::HashSet<_> =
                             app.terminals.keys().copied().collect();
-                        click(app, &dir_link, win, cx)?;
+                        click(
+                            app,
+                            &dir_link,
+                            crate::keybindings::link_modifiers(true),
+                            win,
+                            cx,
+                        )?;
                         let directory_pane = app.terminals.iter().find_map(|(pane, session)| {
                             (!terminals_before.contains(pane)
                                 && session.cwd() == Some(link_dir.as_path()))
@@ -50138,15 +50170,29 @@ mod self_test {
                                 PaneOrigin::Cli,
                             );
                         }
-                        Some((file_click_ok, directory_click_ok))
+                        Some((file_click_ok, directory_click_ok, wrong_modifier_opened))
                     })
                     .ok()
                     .flatten()
-                    .unwrap_or((false, false));
+                    .unwrap_or((false, false, true));
+                // #763 の実測を 1 行で残す（`check` は成功時に何も出さないので、
+                // 「受理しない側では開かなかった」を後から読めるようにする）
+                println!(
+                    "TAKO_SELF_TEST_763: link_mod={:?} non_link_mod={:?} \
+                     file_click={file_click_ok} dir_click={directory_click_ok} \
+                     wrong_modifier_opened={wrong_modifier_opened}",
+                    crate::keybindings::link_modifiers(true),
+                    crate::keybindings::non_link_modifiers(),
+                );
                 check(file_click_ok, "cmd+クリックでファイルを分割プレビュー表示");
                 check(
                     directory_click_ok,
                     "cmd+クリックでディレクトリを分割し PTY を cwd 付きで起動",
+                );
+                check(
+                    !wrong_modifier_opened,
+                    "受理しない側の修飾 + クリックではリンクが開かない \
+                     (#763。macOS = Ctrl は右クリック相当 / Windows = Win は OS のもの)",
                 );
                 let _ = std::fs::remove_dir_all(&link_dir);
             } else {
@@ -73295,10 +73341,8 @@ mod self_test {
                                       col: usize,
                                       cmd: bool| {
                     let position = at147(row, col);
-                    let modifiers = Modifiers {
-                        platform: cmd,
-                        ..Modifiers::default()
-                    };
+                    // 修飾は実行 OS のリンク修飾（macOS = cmd / Windows = Ctrl。#763）
+                    let modifiers = crate::keybindings::link_modifiers(cmd);
                     let _ = window1182.update(cx, |app: &mut TakoApp, _, cx| {
                         app.path_link_menu = None;
                         app.hovered_link = None;

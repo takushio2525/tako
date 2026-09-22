@@ -3366,10 +3366,12 @@ impl TakoApp {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                            // ⌘クリック: Markdown リンクを既定ブラウザで開く（#680）。
-                            // ホバー状態を優先し、⌘ 単独押下の直後（ホバー未更新）でも
-                            // 位置から引き直して開く
-                            if ev.modifiers.platform && ev.click_count == 1 {
+                            // 修飾 + クリック: Markdown リンクを既定ブラウザで開く（#680）。
+                            // ホバー状態を優先し、修飾キー単独押下の直後（ホバー未更新）でも
+                            // 位置から引き直して開く。修飾は macOS = cmd / Windows = Ctrl（#763）
+                            if crate::keybindings::link_modifier_active(&ev.modifiers)
+                                && ev.click_count == 1
+                            {
                                 let md_index = this
                                     .preview_md_hovered_link
                                     .filter(|(pid, _)| *pid == pane_id)
@@ -3382,8 +3384,10 @@ impl TakoApp {
                                     return;
                                 }
                             }
-                            // ⌘クリック: PDF リンクを開く（#271）
-                            if ev.modifiers.platform && ev.click_count == 1 {
+                            // 修飾 + クリック: PDF リンクを開く（#271。修飾は #763 の 1 実装）
+                            if crate::keybindings::link_modifier_active(&ev.modifiers)
+                                && ev.click_count == 1
+                            {
                                 if let Some(link_idx) = this.preview_pdf_hovered_link
                                     .filter(|(pid, _)| *pid == pane_id)
                                     .map(|(_, idx)| idx)

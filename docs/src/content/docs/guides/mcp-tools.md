@@ -195,7 +195,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_open_remote` | SSH ホストに接続する（`target`: `split` = いまのタブに新ペイン（既定）/ `tab` = 新しいタブ / `pane` = 既存ペインをそのまま SSH 化） |
 | `tako_ssh_hosts` | `~/.ssh/config` の Host 一覧を返す |
 | `tako_recent` | 最近開いたディレクトリ / リポジトリ / SSH ホストの一覧・クリア |
-| `tako_links` | ターミナル画面のリンク（cmd+クリックで開けるもの）を列挙する（種別・行き先・画面上の範囲つき） |
+| `tako_links` | ターミナル画面のリンク（Cmd+クリック / Windows は Ctrl+クリックで開けるもの）を列挙する（種別・行き先・画面上の範囲つき） |
 | `tako_web` | ネイティブ Web ビューペインの操作（開く / 退避 / ナビゲート / JS 評価） |
 
 ## 表示・設定

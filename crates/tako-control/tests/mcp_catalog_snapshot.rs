@@ -29,9 +29,31 @@ fn canonicalize(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// 実行プラットフォームで変わる語のプレースホルダ。
+///
+/// リンクを開く打鍵は macOS = `⌘+クリック` / Windows = `Ctrl+クリック`（#763）。
+/// カタログは**実行 OS の打鍵**を申告するのが正しいので、スナップショットは
+/// そこだけ伏せて比べる（伏せないと Windows ランナーの `cargo test` が必ず割れる）
+const LINK_CLICK_PLACEHOLDER: &str = "<link-click>";
+
+/// 実行 OS に追従する語を伏せる。**1 件も見つからなければ失敗**
+/// （追従をやめて直書きへ戻したら、それはそれで検出したい）
+fn mask_platform_words(rendered: String) -> String {
+    let link_click =
+        tako_core::platform::keys::link_click(tako_core::platform::support::Platform::current());
+    assert!(
+        rendered.contains(&link_click),
+        "カタログに「{link_click}」が 1 件も無い。\
+         リンクの打鍵の申告が実行プラットフォームに追従していない（#763）"
+    );
+    rendered.replace(&link_click, LINK_CLICK_PLACEHOLDER)
+}
+
 fn rendered_catalog() -> String {
     let catalog = canonicalize(serde_json::Value::Array(mcp::tools()));
-    serde_json::to_string_pretty(&catalog).expect("MCP カタログを JSON 化できる") + "\n"
+    mask_platform_words(
+        serde_json::to_string_pretty(&catalog).expect("MCP カタログを JSON 化できる") + "\n",
+    )
 }
 
 #[test]

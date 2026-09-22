@@ -564,29 +564,32 @@ impl UpdateWindow {
                         .when(self.hovered_note_link.is_some(), |d| {
                             d.cursor(CursorStyle::PointingHand)
                         })
-                        // ⌘+ホバーで下線を強め、⌘+クリックで既定ブラウザへ（#680 と同じ規則）。
+                        // 修飾 + ホバーで下線を強め、修飾 + クリックで既定ブラウザへ
+                        // （#680 と同じ規則。修飾は macOS = cmd / Windows = Ctrl = #763）。
                         // リンクが 1 本も無いノートではイベント経路自体を載せない
                         .when(has_openable_link, |d| {
                             d.on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
-                                this.update_note_link_hover(ev.position, ev.modifiers.platform, cx);
+                                let link_mod =
+                                    crate::keybindings::link_modifier_active(&ev.modifiers);
+                                this.update_note_link_hover(ev.position, link_mod, cx);
                             }))
                             .on_modifiers_changed(cx.listener(
                                 |this, ev: &ModifiersChangedEvent, window, cx| {
                                     let position = window.mouse_position();
-                                    this.update_note_link_hover(
-                                        position,
-                                        ev.modifiers.platform,
-                                        cx,
-                                    );
+                                    let link_mod =
+                                        crate::keybindings::link_modifier_active(&ev.modifiers);
+                                    this.update_note_link_hover(position, link_mod, cx);
                                 },
                             ))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, ev: &MouseDownEvent, _, cx| {
-                                    if !ev.modifiers.platform || ev.click_count != 1 {
+                                    if !crate::keybindings::link_modifier_active(&ev.modifiers)
+                                        || ev.click_count != 1
+                                    {
                                         return;
                                     }
-                                    // ⌘ 単独押下の直後（ホバー未更新）でも位置から引き直す
+                                    // 修飾キー単独押下の直後（ホバー未更新）でも位置から引き直す
                                     let index = this
                                         .hovered_note_link
                                         .or_else(|| this.note_link_at(ev.position));
