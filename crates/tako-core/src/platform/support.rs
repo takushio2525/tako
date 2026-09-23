@@ -1346,7 +1346,7 @@ pub const MATRIX: &[Feature] = &[
         macos: Support::Supported,
         windows: Support::Supported,
         windows_evidence: Evidence::Measured(
-            "#875 の実機 before/after: 「PTY を起動できなかった」→ 出力 + __TAKO_EXIT=0。終了コード 4 型・引用符・日本語・psmux 経由まで実測 + セルフテスト項目 91(d) の実行検査が ran=true",
+            "#875 の実機 before/after: 「PTY を起動できなかった」→ 出力 + __TAKO_EXIT=0。終了コード 4 型・引用符・日本語・psmux 経由まで実測 + セルフテスト項目 91(d) の実行検査が ran=true。拡張子既定も #1655 で Windows 用の列を持つ（`python` / `.exe` / `cmd /c` / `pwsh -File`。`&&` と `./` は PowerShell 5.1 で通らないので使わない）",
         ),
     },
     Feature {
@@ -1354,7 +1354,7 @@ pub const MATRIX: &[Feature] = &[
         macos: Support::Supported,
         windows: Support::Supported,
         windows_evidence: Evidence::UnitTest(
-            "拡張子既定の登録・削除・一覧は設定ファイル I/O だけで、単体が実機で緑",
+            "拡張子既定の登録・削除・一覧は設定ファイル I/O だけで、単体が実機で緑。組み込み既定は #1655 で OS 別の表になり、Windows の列（41 拡張子中 36 件）を macOS の単体から解決結果ごと固定している",
         ),
     },
     Feature {

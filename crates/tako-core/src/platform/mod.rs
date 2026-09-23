@@ -26,6 +26,7 @@ pub mod procinfo;
 pub mod program_path;
 pub mod quit_signal;
 pub mod release_assets;
+pub mod runner_defaults;
 pub mod shell;
 pub mod shell_dialect;
 pub mod ssh_client;

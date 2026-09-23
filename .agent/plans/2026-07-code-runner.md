@@ -241,6 +241,12 @@ pub runner_defaults: std::collections::BTreeMap<String, String>,
 - このテーブルは組み込みの初期値にすぎない。方針（`.agent/conventions.md:37` の
   「機能追加は既定動作を賢くする方向で」）に沿って、実装後の追加はコード側テーブルを
   育てる（ユーザーへの案内は「settings に足して」より「ファイルに tako:run を書いて」を優先）
+- **上の表は初版（macOS 専用・21 件）の記録で、正本ではない**（#1655）。いまの正本は
+  `tako_core::platform::runner_defaults::TABLE`（**41 拡張子 × macOS / Windows の 2 列**）。
+  Windows は実行ペインが PowerShell（5.1 へ落ちうる）なので `&&` と `./` を使わず、
+  コンパイル系は出力も起動も `.exe`（`gcc a.c -o a.exe; if ($?) { .\a.exe }`）。
+  その OS で**意図して既定を置かない**行は理由（日英）を持ち、
+  `tako run` が実行コマンドを見つけられなかったときの案内へそのまま載る
 
 ### 2.3 フォールバック挙動の決定
 

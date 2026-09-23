@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::platform::support::Platform;
 use crate::shell::quote_for_shell;
 
 // --- 定数 ---
@@ -20,31 +21,18 @@ const MARKER: &str = "tako:";
 // 行末クローザ（ブロックコメント等の終端記号）
 const CLOSERS: &[&str] = &["-->", "*/", "#}", "--}}"];
 
-/// 組み込み拡張子既定マップ（設計 §2.2）
-pub fn builtin_defaults() -> &'static [(&'static str, &'static str)] {
-    &[
-        ("command", "bash ${fileBase}"),
-        ("sh", "bash ${fileBase}"),
-        ("bash", "bash ${fileBase}"),
-        ("zsh", "zsh ${fileBase}"),
-        ("py", "python3 ${fileBase}"),
-        ("js", "node ${fileBase}"),
-        ("mjs", "node ${fileBase}"),
-        ("ts", "npx tsx ${fileBase}"),
-        ("rb", "ruby ${fileBase}"),
-        ("pl", "perl ${fileBase}"),
-        ("php", "php ${fileBase}"),
-        ("lua", "lua ${fileBase}"),
-        ("c", "cc ${fileBase} -o ${fileNoExt} && ./${fileNoExt}"),
-        ("cpp", "c++ ${fileBase} -o ${fileNoExt} && ./${fileNoExt}"),
-        ("cc", "c++ ${fileBase} -o ${fileNoExt} && ./${fileNoExt}"),
-        ("cxx", "c++ ${fileBase} -o ${fileNoExt} && ./${fileNoExt}"),
-        ("rs", "rustc ${fileBase} -o ${fileNoExt} && ./${fileNoExt}"),
-        ("go", "go run ${fileBase}"),
-        ("java", "java ${fileBase}"),
-        ("swift", "swift ${fileBase}"),
-        ("tex", "latexmk -pdf -interaction=nonstopmode ${fileBase}"),
-    ]
+/// 組み込み拡張子既定マップ（この OS ぶん）。
+///
+/// 表の正本は [`crate::platform::runner_defaults::TABLE`]（**両 OS ぶんを 1 枚で持つ**）。
+/// ここは「実行中の OS の列を引く」だけの薄い入口で、OS を指定して引きたい
+/// テスト・検査は [`builtin_defaults_for`] を使う（#1655）
+pub fn builtin_defaults() -> Vec<(&'static str, &'static str)> {
+    builtin_defaults_for(Platform::current())
+}
+
+/// 指定した OS の組み込み既定。**macOS 上から Windows の表を引ける**（#1655 / #1616 の作法）
+pub fn builtin_defaults_for(platform: Platform) -> Vec<(&'static str, &'static str)> {
+    crate::platform::runner_defaults::builtin_defaults(platform)
 }
 
 // --- 型定義 ---
@@ -340,8 +328,16 @@ pub fn expand_variables(template: &str, path: &Path) -> String {
 /// 組み込み既定と settings 由来のユーザー定義をマージ。
 /// ユーザー定義が優先。空文字列は無効化
 pub fn merged_defaults(user_defaults: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    merged_defaults_for(Platform::current(), user_defaults)
+}
+
+/// 指定した OS の組み込み既定にユーザー定義を重ねる（#1655）
+pub fn merged_defaults_for(
+    platform: Platform,
+    user_defaults: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
-    for &(ext, cmd) in builtin_defaults() {
+    for (ext, cmd) in builtin_defaults_for(platform) {
         map.insert(ext.to_string(), cmd.to_string());
     }
     for (ext, cmd) in user_defaults {
@@ -354,8 +350,31 @@ pub fn merged_defaults(user_defaults: &BTreeMap<String, String>) -> BTreeMap<Str
     map
 }
 
-/// 宣言 + 拡張子既定 + オーバーライドから解決
+/// 宣言 + 拡張子既定 + オーバーライドから解決（実行中の OS 向け）
 pub fn resolve(
+    path: &Path,
+    head: &str,
+    ext_defaults: &BTreeMap<String, String>,
+    profile: Option<&str>,
+    command_override: Option<&str>,
+) -> Result<Resolution, RunnerError> {
+    resolve_for(
+        Platform::current(),
+        path,
+        head,
+        ext_defaults,
+        profile,
+        command_override,
+    )
+}
+
+/// OS を指定しての解決（#1655）。
+///
+/// `platform` が効くのは**既定が見つからなかったときの案内**だけ
+/// （どの既定表を渡すかは呼び出し側が決める）。分けてあるおかげで、
+/// macOS 上から「Windows で `.zsh` を実行しようとした人に何が出るか」まで検査できる
+pub fn resolve_for(
+    platform: Platform,
     path: &Path,
     head: &str,
     ext_defaults: &BTreeMap<String, String>,
@@ -470,25 +489,50 @@ pub fn resolve(
         .find(|p| p.profile == "default")
         .or_else(|| all_profiles.first())
         .cloned()
-        .ok_or_else(|| {
-            let hint = if ext.is_empty() {
-                "ファイル先頭に `tako:run: <コマンド>` を書くか、\
-                     `tako run-default <拡張子> \"<コマンド>\"` で拡張子既定を設定してください"
-                    .to_string()
-            } else {
-                format!(
-                    "ファイル先頭に `tako:run: <コマンド>` を書くか、\
-                     `tako run-default {ext} \"<コマンド>\"` で拡張子既定を設定してください"
-                )
-            };
-            RunnerError::NoCommand(hint)
-        })?;
+        .ok_or_else(|| RunnerError::NoCommand(no_command_hint(platform, &ext)))?;
 
     Ok(Resolution {
         plan,
         all_profiles,
         warnings,
     })
+}
+
+/// 実行コマンドが見つからなかったときの案内（純粋関数。**OS を引数で受ける**）。
+///
+/// 組み込み表がその OS で**意図して既定を置いていない**拡張子（`.zsh` on Windows /
+/// `.bat` on macOS / `.sql` のように接続先が決まらないもの）は、
+/// `platform::runner_defaults` が持つ理由を先頭に足す。理由を持たせずに
+/// 「設定してください」とだけ言うと、ユーザーには「tako がこの拡張子を
+/// 知らない」のか「置かないと決めてある」のかが区別できない（#1655）
+fn no_command_hint(platform: Platform, ext: &str) -> String {
+    let lang = crate::i18n::lang();
+    let base = match lang {
+        crate::i18n::Lang::Ja => {
+            let target = if ext.is_empty() { "<拡張子>" } else { ext };
+            format!(
+                "ファイル先頭に `tako:run: <コマンド>` を書くか、\
+                 `tako run-default {target} \"<コマンド>\"` で拡張子既定を設定してください"
+            )
+        }
+        crate::i18n::Lang::En => {
+            let target = if ext.is_empty() { "<ext>" } else { ext };
+            format!(
+                "Add `tako:run: <command>` at the top of the file, \
+                 or set an extension default with `tako run-default {target} \"<command>\"`"
+            )
+        }
+    };
+    match crate::platform::runner_defaults::absent_reason(platform, ext) {
+        Some(note) => {
+            let sep = match lang {
+                crate::i18n::Lang::Ja => "。",
+                crate::i18n::Lang::En => " ",
+            };
+            format!("{}{sep}{base}", note.text_in(lang))
+        }
+        None => base,
+    }
 }
 
 /// シングルクオートの除去（expand_variables がパスをクオートするが cwd では不要）
@@ -755,8 +799,10 @@ mod tests {
     fn 解決_拡張子既定フォールバック() {
         let path = PathBuf::from("/tmp/test.py");
         let head = "#!/usr/bin/env python3\n";
-        let defaults = merged_defaults(&BTreeMap::new());
-        let res = resolve(&path, head, &defaults, None, None).unwrap();
+        // 見ているのは**フォールバックの仕組み**なので OS を固定する（Windows 列は
+        // `python test.py` = 別の値。列そのものは `拡張子既定の解決結果を両osで固定する`）
+        let defaults = merged_defaults_for(Platform::MacOs, &BTreeMap::new());
+        let res = resolve_for(Platform::MacOs, &path, head, &defaults, None, None).unwrap();
         assert_eq!(res.plan.source, RunSource::ExtensionDefault);
         assert_eq!(res.plan.command, "python3 test.py");
     }
@@ -876,10 +922,33 @@ mod tests {
     #[test]
     fn 組み込み既定の存在確認() {
         let defaults = merged_defaults(&BTreeMap::new());
-        assert!(defaults.contains_key("py"));
-        assert!(defaults.contains_key("c"));
-        assert!(defaults.contains_key("command"));
-        assert!(defaults.contains_key("tex"));
+        for ext in ["py", "c", "command", "tex"] {
+            assert!(defaults.contains_key(ext), "この OS の一覧に .{ext} が無い");
+        }
+    }
+
+    /// `tako run-default`（引数なし）の一覧が返すのは `merged_defaults` そのもの
+    /// （`dispatch::RunnerDefaults` が同じ 1 本を呼ぶ）。**両 OS で走らせて**、
+    /// この OS の一覧に #1655 で足した拡張子が並ぶことを固定する
+    #[test]
+    fn 一覧にこのosで使える追加拡張子が並ぶ() {
+        let defaults = merged_defaults(&BTreeMap::new());
+        // どちらの OS でも既定を持つ 15 件
+        for ext in [
+            "ps1", "tsx", "jsx", "kt", "cs", "fs", "dart", "r", "jl", "scala", "hs", "clj", "ex",
+            "zig", "nim",
+        ] {
+            assert!(defaults.contains_key(ext), "一覧に .{ext} が無い");
+        }
+        // 意図して置かない拡張子は一覧に出さない（出すと「設定済み」に見える）
+        for ext in ["sql", "ipynb", "vb"] {
+            assert!(!defaults.contains_key(ext), "一覧に .{ext} が出ている");
+        }
+        // OS 固有（macOS では `.bat` を出さない / Windows では `.zsh` を出さない）
+        let mac = merged_defaults_for(Platform::MacOs, &BTreeMap::new());
+        let win = merged_defaults_for(Platform::Windows, &BTreeMap::new());
+        assert!(!mac.contains_key("bat") && win.contains_key("bat"));
+        assert!(mac.contains_key("zsh") && !win.contains_key("zsh"));
     }
 
     // --- builtin_defaults ---
@@ -890,6 +959,229 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for (ext, _) in builtins {
             assert!(seen.insert(ext), "拡張子 '{ext}' が重複");
+        }
+    }
+
+    // --- OS 別の組み込み既定（#1655）---
+
+    /// 拡張子 1 つぶんの**解決結果**（`None` = その OS では既定を置かない）。
+    ///
+    /// ここに書いてあるのは `tako run hello.<ext>` が実際に組み立てるコマンド
+    /// （`${fileBase}` 等を展開した後）。表の書き方ではなく**出てくる値**を固定するので、
+    /// 表の構造を変えても意味が保たれる。
+    ///
+    /// **macOS 列は #1655 以前と 1 マスも変えていない**（A/B の正本もここ）
+    const 解決の期待値: &[(&str, Option<&str>, Option<&str>)] = &[
+        // ext, macOS, Windows
+        (
+            "command",
+            Some("bash hello.command"),
+            Some("bash hello.command"),
+        ),
+        ("sh", Some("bash hello.sh"), Some("bash hello.sh")),
+        ("bash", Some("bash hello.bash"), Some("bash hello.bash")),
+        ("zsh", Some("zsh hello.zsh"), None),
+        ("py", Some("python3 hello.py"), Some("python hello.py")),
+        ("js", Some("node hello.js"), Some("node hello.js")),
+        ("mjs", Some("node hello.mjs"), Some("node hello.mjs")),
+        ("ts", Some("npx tsx hello.ts"), Some("npx tsx hello.ts")),
+        ("rb", Some("ruby hello.rb"), Some("ruby hello.rb")),
+        ("pl", Some("perl hello.pl"), Some("perl hello.pl")),
+        ("php", Some("php hello.php"), Some("php hello.php")),
+        ("lua", Some("lua hello.lua"), Some("lua hello.lua")),
+        (
+            "c",
+            Some("cc hello.c -o hello && ./hello"),
+            Some("gcc hello.c -o hello.exe; if ($?) { .\\hello.exe }"),
+        ),
+        (
+            "cpp",
+            Some("c++ hello.cpp -o hello && ./hello"),
+            Some("g++ hello.cpp -o hello.exe; if ($?) { .\\hello.exe }"),
+        ),
+        (
+            "cc",
+            Some("c++ hello.cc -o hello && ./hello"),
+            Some("g++ hello.cc -o hello.exe; if ($?) { .\\hello.exe }"),
+        ),
+        (
+            "cxx",
+            Some("c++ hello.cxx -o hello && ./hello"),
+            Some("g++ hello.cxx -o hello.exe; if ($?) { .\\hello.exe }"),
+        ),
+        (
+            "rs",
+            Some("rustc hello.rs -o hello && ./hello"),
+            Some("rustc hello.rs -o hello.exe; if ($?) { .\\hello.exe }"),
+        ),
+        ("go", Some("go run hello.go"), Some("go run hello.go")),
+        ("java", Some("java hello.java"), Some("java hello.java")),
+        (
+            "swift",
+            Some("swift hello.swift"),
+            Some("swift hello.swift"),
+        ),
+        (
+            "tex",
+            Some("latexmk -pdf -interaction=nonstopmode hello.tex"),
+            Some("latexmk -pdf -interaction=nonstopmode hello.tex"),
+        ),
+        // ── #1655 で追加した 20 拡張子 ──
+        (
+            "ps1",
+            Some("pwsh -NoLogo -NoProfile -File hello.ps1"),
+            Some("pwsh -NoLogo -NoProfile -File hello.ps1"),
+        ),
+        ("bat", None, Some("cmd /c hello.bat")),
+        ("cmd", None, Some("cmd /c hello.cmd")),
+        ("tsx", Some("npx tsx hello.tsx"), Some("npx tsx hello.tsx")),
+        ("jsx", Some("npx tsx hello.jsx"), Some("npx tsx hello.jsx")),
+        (
+            "kt",
+            Some("kotlinc hello.kt -include-runtime -d hello.jar && java -jar hello.jar"),
+            Some("kotlinc hello.kt -include-runtime -d hello.jar; if ($?) { java -jar hello.jar }"),
+        ),
+        (
+            "cs",
+            Some("dotnet run hello.cs"),
+            Some("dotnet run hello.cs"),
+        ),
+        (
+            "fs",
+            Some("dotnet fsi hello.fs"),
+            Some("dotnet fsi hello.fs"),
+        ),
+        ("vb", None, None),
+        (
+            "dart",
+            Some("dart run hello.dart"),
+            Some("dart run hello.dart"),
+        ),
+        ("r", Some("Rscript hello.r"), Some("Rscript hello.r")),
+        ("jl", Some("julia hello.jl"), Some("julia hello.jl")),
+        (
+            "scala",
+            Some("scala-cli run hello.scala"),
+            Some("scala-cli run hello.scala"),
+        ),
+        ("hs", Some("runghc hello.hs"), Some("runghc hello.hs")),
+        ("clj", Some("clj -M hello.clj"), Some("clj -M hello.clj")),
+        ("ex", Some("elixir hello.ex"), Some("elixir hello.ex")),
+        ("zig", Some("zig run hello.zig"), Some("zig run hello.zig")),
+        ("nim", Some("nim r hello.nim"), Some("nim r hello.nim")),
+        ("sql", None, None),
+        ("ipynb", None, None),
+    ];
+
+    fn 期待値の列<'a>(
+        row: &(&'a str, Option<&'a str>, Option<&'a str>),
+        platform: Platform,
+    ) -> Option<&'a str> {
+        match platform {
+            Platform::MacOs => row.1,
+            Platform::Windows => row.2,
+        }
+    }
+
+    #[test]
+    fn 拡張子既定の解決結果を両osで固定する() {
+        for platform in [Platform::MacOs, Platform::Windows] {
+            let defaults = merged_defaults_for(platform, &BTreeMap::new());
+            for row in 解決の期待値 {
+                let ext = row.0;
+                let path = PathBuf::from(format!("/tmp/proj/hello.{ext}"));
+                let got = resolve_for(platform, &path, "", &defaults, None, None);
+                match 期待値の列(row, platform) {
+                    Some(expected) => {
+                        let res = got.unwrap_or_else(|e| {
+                            panic!("{platform:?} の .{ext} が解決できない: {e}")
+                        });
+                        assert_eq!(
+                            res.plan.command, expected,
+                            "{platform:?} の .{ext} の解決結果"
+                        );
+                        assert_eq!(res.plan.source, RunSource::ExtensionDefault);
+                        assert_eq!(res.plan.cwd, PathBuf::from("/tmp/proj"));
+                    }
+                    None => {
+                        let err = got.err().unwrap_or_else(|| {
+                            panic!("{platform:?} の .{ext} に既定が無いはずが解決できた")
+                        });
+                        let msg = err.to_string();
+                        // 「知らない拡張子」ではなく「置かないと決めた理由」が出る
+                        let note = crate::platform::runner_defaults::absent_reason(platform, ext)
+                            .unwrap_or_else(|| panic!("{platform:?} の .{ext} に理由が無い"));
+                        assert!(
+                            msg.contains(note.text()),
+                            "{platform:?} の .{ext} の案内に理由が載っていない: {msg}"
+                        );
+                        assert!(
+                            msg.contains(&format!("tako run-default {ext}")),
+                            "{platform:?} の .{ext} の案内に設定コマンドが無い: {msg}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// 期待値の表と組み込み表が**同じ拡張子の集合**を見ている。
+    ///
+    /// 拡張子を足したのに期待値を書き忘れる（= 新しい既定が誰にも検査されない）形を落とす
+    #[test]
+    fn 期待値の表は組み込み表と同じ拡張子を網羅する() {
+        let 表: std::collections::BTreeSet<&str> = crate::platform::runner_defaults::TABLE
+            .iter()
+            .map(|e| e.ext)
+            .collect();
+        let 期待: std::collections::BTreeSet<&str> = 解決の期待値.iter().map(|row| row.0).collect();
+        assert_eq!(
+            表, 期待,
+            "組み込み表と期待値の表がずれている（拡張子を足したら期待値も足す）"
+        );
+    }
+
+    /// 理由が無い（= 表にすら無い）拡張子は、理由抜きの案内だけが出る
+    #[test]
+    fn 表に無い拡張子の案内には理由が付かない() {
+        let defaults = merged_defaults_for(Platform::Windows, &BTreeMap::new());
+        let path = PathBuf::from("/tmp/proj/hello.xyz");
+        let err = resolve_for(Platform::Windows, &path, "", &defaults, None, None)
+            .expect_err("既定が無いので失敗する");
+        let msg = err.to_string();
+        assert!(msg.contains("tako run-default xyz"), "{msg}");
+        assert!(msg.contains("tako:run:"), "{msg}");
+    }
+
+    /// 宣言（`tako:run:`）は OS に関係なくそのまま使われる（既定表より優先）
+    #[test]
+    fn 宣言は両osで既定より優先される() {
+        let path = PathBuf::from("/tmp/proj/hello.py");
+        let head = "# tako:run: uv run ${fileBase}\n";
+        for platform in [Platform::MacOs, Platform::Windows] {
+            let defaults = merged_defaults_for(platform, &BTreeMap::new());
+            let res = resolve_for(platform, &path, head, &defaults, None, None).unwrap();
+            assert_eq!(res.plan.command, "uv run hello.py");
+            assert_eq!(res.plan.source, RunSource::Declaration);
+        }
+    }
+
+    /// ユーザー定義は OS 別の既定を上書きし、空文字列は**その OS の既定ごと**消す
+    #[test]
+    fn ユーザー定義は両osの既定を上書きする() {
+        let mut user = BTreeMap::new();
+        user.insert("py".to_string(), "python -X utf8 ${fileBase}".to_string());
+        user.insert("bat".to_string(), String::new());
+        for platform in [Platform::MacOs, Platform::Windows] {
+            let merged = merged_defaults_for(platform, &user);
+            assert_eq!(
+                merged.get("py").map(String::as_str),
+                Some("python -X utf8 ${fileBase}")
+            );
+            assert!(
+                !merged.contains_key("bat"),
+                "{platform:?}: 無効化できていない"
+            );
         }
     }
 
