@@ -2718,10 +2718,27 @@ union が両採用にするのは**双方が同じ領域を書き換えた**と�
 つまり日常の「末尾追記」「`tako context-budget fix` の移送」は安全で、危ないのは
 **既存エントリの本文を書き換えながら片方がそれを消す**形だけ。union は衝突を報告しないので、
 そういう編集をしたときは merge のあとに `tako context-budget` を 1 回叩いて確認する
-（エントリが戻っていれば予算超過として CI が落ちる）。
+（戻ったエントリは下の番犬が名指しで落とす）。
 
 なお **union はその PR 自身の rebase では効かない**。属性は rebase 中に checkout されている
 ベース側のツリーから読まれるので、この行が main に入った後の PR から効き始める。
+
+### 戻ったエントリは番犬が見る。目視は補助（Issue #1645）
+
+着地キューを 1 本ずつ rebase すると、`context-budget fix` の移送（古いエントリを**消す**）と
+main 側の別 PR の移送が噛み合っても **git は衝突を報告せず auto-merge する**ので、
+main で既にアーカイブ済みのエントリが `progress.md` へ黙って戻る（9/23 だけで 4 回。
+**予算を超えなければ件数・バイトの番犬では落ちない**）。
+
+- 判定の正本は `tako_core::context_budget::revivals`。鍵は `LogEntry::archive_line()` =
+  `fix` がアーカイブへ書くのと同じ 1 行（(日付, Issue 番号) の組では同じ日・同じ Issue の
+  別エントリを誤検出する。アーカイブに実在する）
+- CI の番犬 `crates/tako-control/tests/issue1645_progress_revival_watchdog.rs` が
+  `file:line` で落とし、`tako context-budget` / MCP `tako_context_budget` の
+  violations にも同じ違反が出る。**rebase 後の目視は補助**
+- 直し方は 2 ファイルの復元:
+  `git checkout origin/main -- .agent/progress.md .agent/progress-archive.md` で main の状態へ戻し、
+  自分の 1 件を書き直してから push する（どちらの版が正かは機械には決まらないので自動では直さない）
 
 ### マーカーの例をドキュメントへ書くとき
 

@@ -382,6 +382,9 @@ pub enum Metric {
     WorkDays,
     EntryLines,
     ImportTotalBytes,
+    /// アーカイブへ移したはずのエントリが作業ログに戻っている件数（Issue #1645）。
+    /// 上限は 0（1 件でも違反）
+    RevivedEntries,
 }
 
 impl Metric {
@@ -393,6 +396,7 @@ impl Metric {
             Metric::WorkDays => "work_days",
             Metric::EntryLines => "entry_lines",
             Metric::ImportTotalBytes => "import_total_bytes",
+            Metric::RevivedEntries => "revived_entries",
         }
     }
 }
@@ -422,6 +426,16 @@ pub mod notes {
     pub const PROGRESS_ENTRY_TOO_LONG: Note = Note::new(
         "1 エントリが長すぎる。1 件は「何を / どこを / 結果」の 1〜3 行にとどめ、詳細は git log・Issue・PR に委ねる（自動では直せない = 要約の捏造になるため、書くときに守る）",
         "An entry is too long. Keep each entry to 1-3 lines (what / where / outcome) and leave details to git log, issues and PRs (not auto-fixable: summarising would fabricate text, so honour it when writing)",
+    );
+
+    pub const PROGRESS_ENTRY_REVIVED: Note = Note::new(
+        "アーカイブへ移したはずのエントリが作業ログに戻っている。rebase では「移送（古いエントリを消す）」と「末尾追記」が噛み合っても git は衝突を報告せず auto-merge するので、`git checkout origin/main -- .agent/progress.md .agent/progress-archive.md` でこの 2 ファイルだけを main の状態へ戻し、自分の 1 件を書き直してから push する",
+        "An entry that was already archived is back in the work log. During a rebase git silently auto-merges a prune (which deletes old entries) against an append, so restore just these two files with `git checkout origin/main -- .agent/progress.md .agent/progress-archive.md`, then rewrite your own entry and push again",
+    );
+
+    pub const PROGRESS_ENTRY_DUPLICATED: Note = Note::new(
+        "同じエントリが作業ログに 2 回ある。末尾追記どうしの衝突を両方残したとき（`merge=union`）や rebase のやり直しで起きる。新しい方を残して古い方を消す（本文は git 履歴に残る）",
+        "The same entry appears twice in the work log. This happens when an append-vs-append conflict is kept from both sides (`merge=union`) or a rebase is redone. Keep the newer one and delete the older (the full text stays in git history)",
     );
 
     pub const AGENTS_GUIDE_TOO_BIG: Note = Note::new(
@@ -599,7 +613,8 @@ fn strip_wrapping(s: &str) -> &str {
     s
 }
 
-fn has_issue_ref(s: &str) -> bool {
+/// `#NNN` を 1 つでも含むか。番犬の空振り検査（#1645）も引く
+pub fn has_issue_ref(s: &str) -> bool {
     first_issue_ref_in(s).is_some()
 }
 
@@ -663,8 +678,11 @@ impl ParsedLog {
     }
 }
 
-/// 見出し行から日付を採る（`## 2026-08-24（…）`）
-fn heading_date(line: &str) -> Option<String> {
+/// 見出し行から日付を採る（`## 2026-08-24（…）`）。
+///
+/// **番犬の空振り検査（#1645）が引く**ので公開する: 見出しの書式が変わって
+/// 1 件も拾えなくなったとき、突き合わせが素通りして緑のままになるのを防ぐ
+pub fn heading_date(line: &str) -> Option<String> {
     let rest = line.strip_prefix("## ")?;
     let c: Vec<char> = rest.chars().take(10).collect();
     if c.len() == 10
@@ -800,8 +818,9 @@ fn parse_archive(text: &str) -> (String, Vec<ArchiveEntry>) {
     (preamble.join("\n"), entries)
 }
 
-/// `- YYYY-MM-DD …` の 1 行形式から日付を採る
-fn one_line_date(line: &str) -> Option<String> {
+/// `- YYYY-MM-DD …` の 1 行形式から日付を採る。
+/// `heading_date` と同じ理由で公開する（#1645 の空振り検査）
+pub fn one_line_date(line: &str) -> Option<String> {
     let rest = line.strip_prefix("- ")?;
     let c: Vec<char> = rest.chars().take(10).collect();
     if c.len() == 10
@@ -980,6 +999,187 @@ fn render_archive(preamble: &str, groups: &[Vec<String>]) -> String {
         prev_multi = multi;
     }
     s
+}
+
+// ─── 復活・重複の検出（Issue #1645） ────────────────────────────────────
+
+/// 作業ログへ戻ってしまったエントリの型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevivalKind {
+    /// アーカイブへ移したはずのエントリが作業ログに居る
+    Archived,
+    /// 同じエントリが作業ログの中で 2 回以上出てくる
+    Duplicated,
+}
+
+impl RevivalKind {
+    /// JSON / CLI で使う安定した名前
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RevivalKind::Archived => "archived_entry_revived",
+            RevivalKind::Duplicated => "entry_duplicated",
+        }
+    }
+
+    /// 表示用の呼び名
+    pub fn label(self) -> Note {
+        match self {
+            RevivalKind::Archived => {
+                Note::new("アーカイブ済みのエントリが復活", "archived entry revived")
+            }
+            RevivalKind::Duplicated => Note::new("同じエントリが 2 回", "entry appears twice"),
+        }
+    }
+
+    /// 直し方（日英）
+    pub fn note(self) -> Note {
+        match self {
+            RevivalKind::Archived => notes::PROGRESS_ENTRY_REVIVED,
+            RevivalKind::Duplicated => notes::PROGRESS_ENTRY_DUPLICATED,
+        }
+    }
+}
+
+/// 検出 1 件。**行番号は 1 起点**なので `file:line` でそのまま名指しできる
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Revival {
+    pub kind: RevivalKind,
+    /// 見出しから採った日付
+    pub date: String,
+    /// 見出し行そのもの
+    pub heading: String,
+    /// 作業ログの中の見出し行（1 起点）
+    pub line: usize,
+    /// 相手側の行（1 起点）。`Archived` はアーカイブの行 /
+    /// `Duplicated` は先に出た同じ見出しの行
+    pub other_line: usize,
+    /// 突き合わせに使った 1 行（= `LogEntry::archive_line()` の出力）
+    pub key: String,
+}
+
+impl Revival {
+    /// 予算超過と同じ形の 1 件。`violations()` の戻りと混ぜて数えられる
+    pub fn violation(&self) -> Violation {
+        Violation {
+            metric: Metric::RevivedEntries,
+            actual: 1,
+            limit: 0,
+            // 自動では直せない: どちらの版が正かは移送の履歴を見ないと決まらない。
+            // 消す側を機械が選ぶと他の worker の 1 エントリが消える（#1246 と同じ事故）
+            fixable: false,
+            note: self.kind.note(),
+        }
+    }
+
+    /// 相手側のファイル（`Duplicated` は作業ログ自身）
+    pub fn other_path<'a>(&self, progress_path: &'a str, archive_path: &'a str) -> &'a str {
+        match self.kind {
+            RevivalKind::Archived => archive_path,
+            RevivalKind::Duplicated => progress_path,
+        }
+    }
+
+    /// `file:line` の名指し 1 行。**番犬も CLI / MCP もこの 1 本を使う**
+    pub fn locate(&self, progress_path: &str, archive_path: &str) -> String {
+        self.locate_in(crate::i18n::lang(), progress_path, archive_path)
+    }
+
+    /// 言語を明示しての名指し。**言語グローバルに触らず解決できる**ようにするため、
+    /// 実体はこちらの純粋関数に置く（`Note::text_in` と同じ作法）
+    pub fn locate_in(
+        &self,
+        lang: crate::i18n::Lang,
+        progress_path: &str,
+        archive_path: &str,
+    ) -> String {
+        format!(
+            "{progress_path}:{} {}: {} ← {}:{} 「{}」",
+            self.line,
+            self.kind.label().text_in(lang),
+            self.heading.trim(),
+            self.other_path(progress_path, archive_path),
+            self.other_line,
+            self.key.trim(),
+        )
+    }
+}
+
+/// 日付見出しの行番号（1 起点）。`parse_log` と**同じ述語**を使うので
+/// 戻りの件数は `ParsedLog::entries` と必ず一致する
+pub fn heading_line_numbers(text: &str) -> Vec<usize> {
+    text.lines()
+        .enumerate()
+        .filter(|(_, l)| heading_date(l).is_some())
+        .map(|(i, _)| i + 1)
+        .collect()
+}
+
+/// アーカイブの 1 行形式 → その行番号（1 起点。同じ行が複数あれば最初）
+fn archive_line_index(text: &str) -> std::collections::BTreeMap<&str, usize> {
+    let mut out = std::collections::BTreeMap::new();
+    for (i, line) in text.lines().enumerate() {
+        if one_line_date(line).is_some() {
+            out.entry(line.trim_end()).or_insert(i + 1);
+        }
+    }
+    out
+}
+
+/// 作業ログに「アーカイブへ移したはずのエントリ」が戻っていないかを見る（Issue #1645）。
+///
+/// # なぜ要るか
+///
+/// 着地キューを 1 本ずつ rebase する運用では、`context-budget fix` の移送
+/// （古いエントリを**消す**）と main 側の別 PR の移送が噛み合っても
+/// **git は衝突を報告せず auto-merge する**ので、main で既にアーカイブ済みの
+/// エントリが `progress.md` へ黙って戻る。9/23 だけで 4 回起き、毎回 worker の
+/// 目視で見つけていた。予算を超えなければ既存の番犬では落ちない。
+///
+/// # 突き合わせの鍵
+///
+/// **`LogEntry::archive_line()`**（`plan_prune` がアーカイブへ書くのと同じ 1 実装）。
+/// (日付, Issue 番号) の組を鍵にすると**実際に誤検出する**: アーカイブには
+/// 同じ日・同じ Issue の別エントリが実在し（`2026-09-14 #1450` が 3 件・
+/// `2026-07-05 #63` が 2 件）、その片方だけが移送された途中の状態を
+/// 「復活」と読んでしまう。rebase の事故は**エントリが丸ごと戻る**形なので、
+/// 行そのものを鍵にすれば検出力を落とさずに誤検出だけを落とせる。
+///
+/// 逆に、戻ったあとで本文を書き換えられると鍵が変わって見えなくなる。
+/// それは「復活を直した」か「別の 1 件を書いた」かの区別が機械には付かないので、
+/// ここでは追わない（#1352 / #1228 の merge 戦略の決着が根治）
+pub fn revivals(progress: &str, archive: &str) -> Vec<Revival> {
+    let log = parse_log(progress);
+    let lines = heading_line_numbers(progress);
+    let archived_at = archive_line_index(archive);
+    let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut out = Vec::new();
+    for (i, e) in log.entries.iter().enumerate() {
+        let key = e.archive_line();
+        let line = lines.get(i).copied().unwrap_or(0);
+        if let Some(&first) = seen.get(&key) {
+            out.push(Revival {
+                kind: RevivalKind::Duplicated,
+                date: e.date.clone(),
+                heading: e.heading.clone(),
+                line,
+                other_line: first,
+                key: key.clone(),
+            });
+        } else {
+            seen.insert(key.clone(), line);
+        }
+        if let Some(&at) = archived_at.get(key.trim_end()) {
+            out.push(Revival {
+                kind: RevivalKind::Archived,
+                date: e.date.clone(),
+                heading: e.heading.clone(),
+                line,
+                other_line: at,
+                key,
+            });
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1366,5 +1566,116 @@ mod tests {
             rule.contains("tools/list"),
             "何を測っているかを規約文に書く"
         );
+    }
+
+    // ─── 復活・重複の検出（Issue #1645） ────────────────────────────────
+
+    /// 作業ログ 1 本ぶんの素材。`fix` が書くのと同じ形で並べる
+    fn revival_fixture() -> (String, String) {
+        let progress = concat!(
+            "# Progress Log\n",
+            "\n",
+            "> 説明\n",
+            "\n",
+            "## 2026-09-22（#1501: 未認証でも setup が完走する）\n",
+            "- 何を / どこを / 結果\n",
+            "\n",
+            "## 2026-09-23（#1504: Windows のシェル統合を段にした）\n",
+            "- 何を / どこを / 結果\n",
+        )
+        .to_string();
+        let archive = concat!(
+            "# Progress Archive\n",
+            "\n",
+            "- 2026-09-20 #1490: 隔離 GUI の起動を 1 実装へ寄せた\n",
+            "- 2026-09-21 #1493: 番犬で縛った\n",
+        )
+        .to_string();
+        (progress, archive)
+    }
+
+    #[test]
+    fn 健全な作業ログでは復活を1件も出さない() {
+        let (progress, archive) = revival_fixture();
+        assert!(revivals(&progress, &archive).is_empty());
+    }
+
+    #[test]
+    fn アーカイブ済みのエントリが戻っていたら行番号つきで落とす() {
+        let (progress, mut archive) = revival_fixture();
+        // 移送済みの 1 行（= `fix` がアーカイブへ書いた形）を作って足す
+        let moved = parse_log(&progress).entries[0].archive_line();
+        assert_eq!(
+            moved, "- 2026-09-22 #1501: 未認証でも setup が完走する",
+            "鍵は fix がアーカイブへ書く 1 行そのもの"
+        );
+        archive.push_str(&moved);
+        archive.push('\n');
+
+        let hits = revivals(&progress, &archive);
+        assert_eq!(hits.len(), 1, "復活は 1 件");
+        assert_eq!(hits[0].kind, RevivalKind::Archived);
+        // 見出しは 5 行目・アーカイブの追記は 5 行目（どちらも 1 起点）
+        assert_eq!(hits[0].line, 5);
+        assert_eq!(hits[0].other_line, 5);
+        assert_eq!(hits[0].key, moved);
+        let named = hits[0].locate(".agent/progress.md", ".agent/progress-archive.md");
+        assert!(
+            named.starts_with(".agent/progress.md:5 "),
+            "file:line で名指しする: {named}"
+        );
+        assert!(
+            named.contains(".agent/progress-archive.md:5"),
+            "相手側も名指しする: {named}"
+        );
+        assert_eq!(hits[0].violation().metric, Metric::RevivedEntries);
+        assert_eq!(hits[0].violation().limit, 0, "1 件でも違反");
+        assert!(
+            !hits[0].violation().fixable,
+            "どちらの版が正かは機械には決まらない"
+        );
+    }
+
+    #[test]
+    fn 同じエントリが2回並んでいたら落とす() {
+        let (progress, archive) = revival_fixture();
+        let dup = format!("{progress}\n{}", parse_log(&progress).entries[1].render());
+        let hits = revivals(&dup, &archive);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, RevivalKind::Duplicated);
+        assert_eq!(hits[0].other_line, 8, "先に出た見出しの行を指す");
+        assert_eq!(hits[0].line, 11);
+    }
+
+    /// (日付, Issue 番号) を鍵にすると落ちる形。**実データに在る**
+    /// （アーカイブの `2026-09-14 #1450` は 3 件・`2026-07-05 #63` は 2 件）
+    #[test]
+    fn 同じ日の同じissueでも本文が違えば落とさない() {
+        let progress = concat!(
+            "# Progress Log\n",
+            "\n",
+            "## 2026-09-14（#1450: tasks ビューを右パネルへ出した）\n",
+            "- 何を / どこを / 結果\n",
+            "\n",
+            "## 2026-09-14（#1450: tasks を PWA から片付けられるようにした）\n",
+            "- 何を / どこを / 結果\n",
+        );
+        let archive = "# Progress Archive\n\n- 2026-09-14 #1450: tasks の受け口を足した\n";
+        assert!(
+            revivals(progress, archive).is_empty(),
+            "同じ日・同じ Issue の別エントリは復活ではない"
+        );
+    }
+
+    #[test]
+    fn 見出しの書式が読めなければ1件も拾えない() {
+        // 空振り検査の根拠: 述語が壊れると突き合わせは黙って素通りする
+        assert!(heading_date("## 2026-09-23（#1645 …）").is_some());
+        assert!(heading_date("## 2026/09/23（#1645 …）").is_none());
+        assert!(one_line_date("- 2026-09-23 #1645: 一言").is_some());
+        assert!(one_line_date("- 2026/09/23 #1645: 一言").is_none());
+        assert!(has_issue_ref("- 2026-09-23 #1645: 一言"));
+        assert!(!has_issue_ref("- 2026-09-23 番号なし"));
+        assert!(heading_line_numbers("## 2026-09-23（#1645）\n- x\n") == vec![1]);
     }
 }

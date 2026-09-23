@@ -59,3 +59,8 @@
 - `OpenFile` に `line` / `column`（1 始まり）を足し、CLI `tako open --line L [--column C]` と MCP `tako_open_file`（**ツールは増やさない**）を同じ dispatch へ 1:1 で載せた。md の写像は「`line` を渡された時点で code へ倒す」（レンダリング表示は 1 item = 1 ブロックで原文の行が残らない）と決めて FR-3.27 へ明記。行を持たない種別は**開く前**にエラー、超過は末尾行へ丸めて `clamped` で知らせる
 - 着地は `ListState` が描画時に作られるので「次の描画で 1 度だけ飛ぶ」予約（`preview_pending_reveal` → `consume_pending_reveal`）。省略時は wire に現れない（`skip_serializing_if`）ので JSON は引数が生える前とバイト一致
 - 実測: セルフテスト項目 153（5,000 行 / 42・1・超過・4990）が `TAKO_APP_SELF_TEST_OK` 完走・A/B `TAKO_1676_LEGACY=1` で 153a が FAILED（応答は同じ値なので画面まで見ないと差が出ない）・`scripts/test-open-line-1676.sh` **26 PASS 0 FAIL**（CLI と MCP の応答が字面一致）・注入 3 通り（写像 / 丸め / skip_serializing_if）すべて FAILED → 戻して緑・workspace 5345 passed 0 failed・clippy 3 宇宙 0
+
+## 2026-09-23（#1645: rebase で復活した作業ログのエントリを番犬で止めた）
+- `context-budget fix` の移送（古いエントリを**消す**）と main 側の移送が rebase で噛み合っても git は衝突を報告せず auto-merge するので、archive 済みのエントリが `progress.md` へ黙って戻る（9/23 だけで 4 回・毎回 worker の目視で発見。予算を超えなければ既存の番犬では落ちない）。判定を `tako_core::context_budget::revivals` の 1 実装として足し、`tako context-budget` / MCP の violations と新設の番犬が同じものを通る
+- 鍵は `LogEntry::archive_line()` = `fix` がアーカイブへ書くのと同じ 1 行。(日付, Issue 番号) の組は**実データで誤検出する**（アーカイブに `2026-09-14 #1450` が 3 件・`2026-07-05 #63` が 2 件）ので採らなかった
+- 実測: 注入 3 通り（復活 / 重複 / 見出しの書式を壊す空振り検査）すべて file:line 名指しで FAILED → 戻して緑。**この PR 自身の rebase でも 2 件の復活を file:line で捕らえた**

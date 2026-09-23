@@ -335,7 +335,45 @@ pub fn inventory(cwd: &Path, profile: Option<&str>) -> Vec<Item> {
     items
 }
 
-fn item_json(it: &Item) -> Value {
+/// 作業ログの復活・重複（#1645）を、置き場のアーカイブと突き合わせて採る。
+///
+/// アーカイブの置き場は `archive_path_for` = **`fix` が書き込む先と同じ 1 実装**。
+/// 作業ログ以外の項目には相手が無いので空を返す
+fn progress_revivals(it: &Item) -> (String, Vec<budget::Revival>) {
+    if it.kind != ItemKind::ProgressLog {
+        return (String::new(), Vec::new());
+    }
+    let Some(path) = it.path.as_ref() else {
+        return (String::new(), Vec::new());
+    };
+    let archive = archive_path_for(path);
+    let label = display_path(&archive);
+    let text = std::fs::read_to_string(&archive).unwrap_or_default();
+    let hits = budget::revivals(&it.text, &text);
+    (label, hits)
+}
+
+/// 復活・重複 1 件。**名指しは `Revival::locate` の 1 本**を通す
+/// （番犬 `issue1645_progress_revival_watchdog` も同じものを使う）
+fn revival_json(it: &Item, r: &budget::Revival, archive_label: &str) -> Value {
+    let v = r.violation();
+    json!({
+        "metric": v.metric.as_str(),
+        "kind": r.kind.as_str(),
+        "actual": v.actual,
+        "limit": v.limit,
+        "fixable": v.fixable,
+        "line": r.line,
+        "heading": r.heading,
+        "other": format!("{}:{}", r.other_path(&it.label, archive_label), r.other_line),
+        "detail": r.locate(&it.label, archive_label),
+        "note": v.note.text(),
+        "note_ja": v.note.ja(),
+        "note_en": v.note.en(),
+    })
+}
+
+fn item_json(it: &Item, revived: &[budget::Revival], archive_label: &str) -> Value {
     let m = budget::measure(it.kind, &it.text);
     let vs = budget::violations(it.kind, &m);
     let mut o = json!({
@@ -360,8 +398,10 @@ fn item_json(it: &Item) -> Value {
         o["longest_entry_lines"] = json!(m.longest_entry_lines.unwrap_or(0));
         o["over_long_entries"] = json!(m.over_long_entries.unwrap_or(0));
     }
-    if !vs.is_empty() {
-        o["violations"] = json!(vs.iter().map(|v| violation_json(it, v)).collect::<Vec<_>>());
+    let mut all: Vec<Value> = vs.iter().map(|v| violation_json(it, v)).collect();
+    all.extend(revived.iter().map(|r| revival_json(it, r, archive_label)));
+    if !all.is_empty() {
+        o["violations"] = json!(all);
     }
     o
 }
@@ -471,7 +511,25 @@ pub fn report(cwd: &Path, profile: Option<&str>) -> Result<Value, String> {
                     proposals.push(prop);
                 }
             }
-            item_json(it)
+            // #1645: アーカイブへ移したはずのエントリが戻っていないか。
+            // 予算を超えなくても違反（重複したまま main に載る）
+            let (archive_label, revived) = progress_revivals(it);
+            for r in &revived {
+                violations += 1;
+                let v = r.violation();
+                proposals.push(json!({
+                    "path": format!("{}:{}", it.label, r.line),
+                    "metric": v.metric.as_str(),
+                    "actual": v.actual,
+                    "limit": v.limit,
+                    "kind": r.kind.as_str(),
+                    "detail": r.locate(&it.label, &archive_label),
+                    "next_step": v.note.text(),
+                    "next_step_ja": v.note.ja(),
+                    "next_step_en": v.note.en(),
+                }));
+            }
+            item_json(it, &revived, &archive_label)
         })
         .collect();
 
@@ -863,7 +921,7 @@ mod tests {
             "内訳はツール本数ぶん"
         );
         // JSON にも同じ種別で出る（表示と `--json` は同じ 1 件を見る）
-        let o = item_json(it);
+        let o = item_json(it, &[], "");
         assert_eq!(o["kind"], "mcp_catalog");
         assert_eq!(o["bytes"].as_u64().unwrap() as usize, it.text.len());
         assert_eq!(o["lines"], 0, "1 本の JSON なので行数は測らない");

@@ -5700,6 +5700,10 @@ fn print_context_budget_proposals(out: &serde_json::Value) {
         if let Some(advice) = p["advice"].as_str() {
             println!("        → {advice}");
         }
+        // #1645: 復活・重複は相手側の行まで名指しする（どこを見ればいいかが分かる）
+        if let Some(detail) = p["detail"].as_str() {
+            println!("        {detail}");
+        }
     }
 }
 
