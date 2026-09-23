@@ -9,6 +9,7 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -359,6 +360,13 @@ pub struct PreviewState {
     pub truncated: bool,
     /// ロード時のファイルスタンプ（ライブリロードの変更判定用。#257）
     pub file_stamp: Option<FileStamp>,
+    /// この表示行を最後に塗った差分ハイライトの印（#1648）。
+    ///
+    /// 編集セッションのキャッシュが持つ印と一致するときだけ、表示行を**塗り足せる**。
+    /// 表示だけが外から差し替わる経路（Markdown ⇄ Code の切替は `PreviewState` を
+    /// 入れ替えるが `EditState` は残す）で、行数が偶然揃ったときに前回の編集を
+    /// 取りこぼしたまま差分を重ねるのを防ぐ
+    pub highlight_stamp: Option<u64>,
 }
 
 /// コードプレビューの軽量編集セッション（FR-3.5）。表示状態とは分離し、編集モードを
@@ -388,6 +396,9 @@ pub struct EditState {
     pub replace_text: String,
     /// 置換フィールドのカーソル位置（バイトオフセット）
     pub replace_cursor: usize,
+    /// 編集中の差分再ハイライト用の行状態（#1648）。セッションと寿命が同じなので、
+    /// ペインを閉じれば一緒に消える
+    pub highlight: HighlightCache,
 }
 
 /// 検索バー内のフォーカス先
@@ -431,6 +442,7 @@ impl EditState {
             search_index: 0,
             replace_text: String::new(),
             replace_cursor: 0,
+            highlight: HighlightCache::default(),
         })
     }
 
@@ -467,13 +479,35 @@ where
         .collect()
 }
 
-/// 編集中も既存の syntect ハイライト基盤を再利用して、読み取り時と同じ色分けで
-/// 表示する。`apply_editor_text` は UI スレッドから呼ばれるので、ファイルが巨大な
-/// 場合は上限で切り詰められたテキストを対象にする。
-pub fn apply_editor_text(preview: &mut PreviewState, edit: &EditState) {
+/// 編集中も既存の syntect ハイライト基盤を再利用して、読み取り時と同じ色分けで表示する。
+///
+/// **UI スレッドから 1 打鍵ごとに呼ばれる**ので、全文を塗り直さない（#1648）。
+/// 前回の行と再開地点を [`EditState::highlight`] が覚えていて、変わった行の手前から
+/// 状態が収束するまでだけ走らせ、残りは前回塗った行をその場で使い回す。
+/// 実測（release / 1 打鍵）: 1,087 行 75.5ms → 0.50ms・4,666 行 344.6ms → 0.56ms
+pub fn apply_editor_text(preview: &mut PreviewState, edit: &mut EditState) {
+    // 前回の行を取り出して差分で書き換える（`Vec<Line>` を作り直さないので
+    // 使い回す行は 1 バイトも触らない）。塗り足してよいのは **自分が最後に書いた表示行**
+    // だけなので、印が食い違ったら（Code 以外から切り替わった / 表示だけ外から
+    // 差し替わった）行も行状態も捨てて全文から組み直す
+    // 印は 1 から採番するので、まだ塗っていないキャッシュ（0）が一致することはない
+    let 塗り足せる = preview.highlight_stamp == Some(edit.highlight.stamp);
+    let mut lines = match std::mem::replace(&mut preview.content, PreviewContent::Loading) {
+        PreviewContent::Code(lines) if 塗り足せる => lines,
+        _ => {
+            edit.highlight.invalidate();
+            Vec::new()
+        }
+    };
+    highlighter().refresh_editor_lines(
+        &preview.path,
+        edit.buffer.text(),
+        &mut edit.highlight,
+        &mut lines,
+    );
     preview.mode = PreviewMode::Code;
-    preview.content =
-        PreviewContent::Code(highlighter().highlight(&preview.path, edit.buffer.text()));
+    preview.content = PreviewContent::Code(lines);
+    preview.highlight_stamp = Some(edit.highlight.stamp);
     preview.outline = Arc::new(PreviewOutline::default());
     preview.truncated = false;
 }
@@ -505,6 +539,7 @@ impl PreviewState {
             outline: Arc::new(PreviewOutline::default()),
             truncated: false,
             file_stamp: None,
+            highlight_stamp: None,
         }
     }
 
@@ -517,6 +552,7 @@ impl PreviewState {
             outline: Arc::new(PreviewOutline::default()),
             truncated: false,
             file_stamp: None,
+            highlight_stamp: None,
         }
     }
 }
@@ -577,6 +613,7 @@ pub fn load_image(path: &Path) -> PreviewState {
                 outline: Arc::new(PreviewOutline::default()),
                 truncated: false,
                 file_stamp: FileStamp::from_path(path),
+                highlight_stamp: None,
             }
         }
         Err(e) => PreviewState::error(
@@ -618,6 +655,7 @@ pub fn load_pdf_with_key(path: &Path, raster_key: PdfRasterKey) -> PreviewState 
                 outline: Arc::new(outline),
                 truncated: false,
                 file_stamp: FileStamp::from_path(path),
+                highlight_stamp: None,
             }
         }
         Err(e) => PreviewState::error(path, PreviewMode::Pdf, e),
@@ -665,6 +703,7 @@ pub fn load_video(path: &Path) -> PreviewState {
         outline: Arc::new(PreviewOutline::default()),
         truncated: false,
         file_stamp: FileStamp::from_path(path),
+        highlight_stamp: None,
     }
 }
 
@@ -856,6 +895,7 @@ pub fn load(path: &Path, mode: PreviewMode) -> PreviewState {
         outline: Arc::new(outline),
         truncated,
         file_stamp: FileStamp::from_path(path),
+        highlight_stamp: None,
     }
 }
 
@@ -901,6 +941,7 @@ pub fn load_fast(path: &Path, mode: PreviewMode) -> (PreviewState, Option<String
             outline: Arc::new(outline),
             truncated,
             file_stamp: FileStamp::from_path(path),
+            highlight_stamp: None,
         },
         raw,
     )
@@ -953,6 +994,7 @@ pub fn load_for_reload(
                     outline: Arc::new(outline),
                     truncated,
                     file_stamp: FileStamp::from_path(path),
+                    highlight_stamp: None,
                 },
                 (!truncated).then_some(source),
             )
@@ -1097,6 +1139,21 @@ impl Highlighter for SyntaxLease {
     }
 }
 
+impl SyntaxLease {
+    /// 編集中の差分再ハイライト（#1648）。`lines` をその場で更新する。
+    /// 全文版（[`Highlighter::highlight`]）と同じ [`SyntectHighlighter::step`] を通るので
+    /// 塗り分けは一致する
+    pub fn refresh_editor_lines(
+        &self,
+        path: &Path,
+        text: &str,
+        cache: &mut HighlightCache,
+        lines: &mut Vec<Line>,
+    ) {
+        self.0.refresh(path, text, cache, lines);
+    }
+}
+
 /// 既定ハイライタを借りる。載っていなければここでロードする（実測 0.6〜1.2 ms）
 pub fn highlighter() -> SyntaxLease {
     syntax_cache().acquire(Instant::now())
@@ -1130,10 +1187,183 @@ pub fn syntax_resident() -> bool {
     syntax_cache().resident()
 }
 
+/// テーマ側のハイライタ。tako の [`Highlighter`] trait と名前が衝突するので別名で持つ
+type ThemeHighlighter<'a> = syntect::highlighting::Highlighter<'a>;
+
+/// ハイライト中の作業状態（1 行進めるたびに更新される）
+struct LineState {
+    parse: syntect::parsing::ParseState,
+    highlight: syntect::highlighting::HighlightState,
+}
+
+/// 再開地点へ保存する縮約状態（#1648）。
+///
+/// `HighlightState` は**スコープスタックから決定的に再構築できる**（syntect の
+/// `HighlightState::new` が同じ計算をする）ので保存しない。`ParseState` は復元できないので持つ。
+/// 実測: 1 地点あたり 1,669 → 925 バイト
+#[derive(Clone, PartialEq)]
+struct SavedState {
+    parse: syntect::parsing::ParseState,
+    path: syntect::parsing::ScopeStack,
+}
+
+impl SavedState {
+    fn of(state: &LineState) -> Self {
+        Self {
+            parse: state.parse.clone(),
+            path: state.highlight.path.clone(),
+        }
+    }
+
+    fn restore(&self, theme: &ThemeHighlighter) -> LineState {
+        LineState {
+            parse: self.parse.clone(),
+            highlight: syntect::highlighting::HighlightState::new(theme, self.path.clone()),
+        }
+    }
+
+    /// 作業状態がこの再開地点と同じところへ戻ったか（clone せずに突き合わせる）
+    fn matches(&self, state: &LineState) -> bool {
+        self.parse == state.parse && self.path == state.highlight.path
+    }
+}
+
+/// 再開地点を打つ間隔（行）。
+///
+/// 1 打鍵の再ハイライトは「直前の再開地点まで戻る助走 + 変わった行 + 次の再開地点まで」なので
+/// **狭いほど速く、広いほど省メモリ**。4,666 行の Rust で実測（release / 1 打鍵あたり）:
+/// 32 行 = 4.74ms・16 行 = 2.10ms・8 行 = 0.56ms・4 行 = 0.40ms。
+/// 再開地点の実費は 1 地点 925 バイトなので、8 行間隔で 0.54 MB・4 行間隔で 1.08 MB。
+/// 目標（1 打鍵 1ms 未満）を満たす中で最も省メモリな 8 を採る
+const HIGHLIGHT_STRIDE: usize = 8;
+
+/// 構文セットの世代（#1648）。[`SYNTAX_IDLE_GRACE`] で手放して載せ直すと、
+/// 行状態が指すコンテキスト ID の意味が変わりうるので、世代を跨いだキャッシュは捨てる
+static SYNTAX_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// 編集中の再ハイライトを「変わった行 + 状態が収束するまでの後続行」へ絞る行状態キャッシュ（#1648）。
+///
+/// 1 打鍵ごとに全文を syntect へ通すと 4,666 行で 344ms（release 実測）かかり、UI スレッドが
+/// 打鍵のたびに固まる。syntect は行の切れ目の状態を持ち回れるので、**変わった行の手前から
+/// 状態が元へ収束するまでだけ**走らせ、残りは前回塗った行をそのまま使い回す。
+/// 寿命は編集セッション（[`EditState`]）と同じ = ペインを閉じれば一緒に消える
+#[derive(Clone, Default)]
+pub struct HighlightCache {
+    /// 構文セットの世代（載せ直しを跨いだ状態は使えない）
+    generation: u64,
+    /// 解決した構文の名前。1 行目の shebang で変わりうるので毎回照合する
+    syntax: String,
+    /// 直前にハイライトしたテキスト（変わった範囲の突き合わせに使う）
+    text: String,
+    /// 行の開始バイト（`text` の行数と同じ長さ）
+    starts: Vec<usize>,
+    /// 再開地点。`(行番号, その行を読む直前の状態)` の昇順で、先頭は必ず行 0
+    checkpoints: Vec<(usize, Arc<SavedState>)>,
+    /// 直近の更新で実際に走らせた行数（受け入れ条件の観測点）
+    relit: usize,
+    /// この行状態が対応する表示行の印（[`PreviewState::highlight_stamp`] と突き合わせる）
+    stamp: u64,
+}
+
+impl HighlightCache {
+    /// 直近の更新で実際に再ハイライトした行数。
+    /// **全文へ戻す退行はこの値が行数そのものになる**ので、番犬はここを見る（#1648）。
+    /// 差分化は「速いこと」ではなく「塗る行が少ないこと」でしか機械検査できない
+    /// （実時間の assert は環境で揺れるので禁止）ため、観測点を製品側に置いてある
+    #[allow(dead_code, reason = "検査のための観測点。製品コードからは読まない")]
+    pub fn relit(&self) -> usize {
+        self.relit
+    }
+
+    /// 保持している再開地点の数（メモリ実費の観測点。同上）
+    #[allow(dead_code, reason = "検査のための観測点。製品コードからは読まない")]
+    pub fn checkpoints(&self) -> usize {
+        self.checkpoints.len()
+    }
+
+    /// 次に呼ばれたら全文から塗り直す。表示行が自分の書いたものでなくなったときに使う
+    fn invalidate(&mut self) {
+        self.checkpoints.clear();
+    }
+}
+
+/// 表示行と行状態の対応を示す印（#1648）。0 は「まだ塗っていない」
+static HIGHLIGHT_STAMP: AtomicU64 = AtomicU64::new(0);
+
+// 本文を診断へ出さない（`.agent/conventions.md`）。EditState ごと `{:?}` される経路があるので
+// 行数と構文名だけを見せる
+impl std::fmt::Debug for HighlightCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HighlightCache")
+            .field("syntax", &self.syntax)
+            .field("lines", &self.starts.len())
+            .field("checkpoints", &self.checkpoints.len())
+            .field("relit", &self.relit)
+            .finish()
+    }
+}
+
+/// 差分化をやめて旧挙動（1 打鍵ごとに全文）へ戻す逃げ道（`TAKO_1648_FULL_HIGHLIGHT=1`）。
+/// #1648 の効果を同じバイナリで A/B するためのもの（#815 / #786 / #787 と同じ流儀）
+pub(crate) fn full_highlight_forced() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TAKO_1648_FULL_HIGHLIGHT").is_some())
+}
+
+/// 行の開始バイト（[`syntect::util::LinesWithEndings`] と同じ切り方）
+fn line_starts(text: &str) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut offset = 0usize;
+    for line in syntect::util::LinesWithEndings::from(text) {
+        starts.push(offset);
+        offset += line.len();
+    }
+    starts
+}
+
+/// 先頭から何バイト一致しているか。1 打鍵でもファイル末尾の編集なら全長を舐めるので、
+/// 8 バイトずつ比べてから端数を詰める（1 バイトずつだと 1 MB で ms 級になる）
+fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    let limit = a.len().min(b.len());
+    let mut i = 0;
+    while i + 8 <= limit {
+        let (x, y) = (&a[i..i + 8], &b[i..i + 8]);
+        if x != y {
+            break;
+        }
+        i += 8;
+    }
+    while i < limit && a[i] == b[i] {
+        i += 1;
+    }
+    i
+}
+
+/// 末尾から何バイト一致しているか（`limit` = 先頭一致分を除いた残り）
+fn common_suffix_len(a: &[u8], b: &[u8], limit: usize) -> usize {
+    let mut i = 0;
+    while i + 8 <= limit {
+        let (x, y) = (
+            &a[a.len() - i - 8..a.len() - i],
+            &b[b.len() - i - 8..b.len() - i],
+        );
+        if x != y {
+            break;
+        }
+        i += 8;
+    }
+    while i < limit && a[a.len() - 1 - i] == b[b.len() - 1 - i] {
+        i += 1;
+    }
+    i
+}
+
 /// syntect 実装（bat / delta と同系の定番。純 Rust 構成 = regex-fancy）
 pub struct SyntectHighlighter {
     syntaxes: syntect::parsing::SyntaxSet,
     theme: syntect::highlighting::Theme,
+    /// この構文セットの世代（#1648。[`HighlightCache`] の有効性判定に使う）
+    generation: u64,
 }
 
 impl SyntectHighlighter {
@@ -1145,7 +1375,11 @@ impl SyntectHighlighter {
             .remove("base16-eighties.dark")
             .or_else(|| themes.into_values().next())
             .unwrap_or_default();
-        Self { syntaxes, theme }
+        Self {
+            syntaxes,
+            theme,
+            generation: SYNTAX_GENERATION.fetch_add(1, Ordering::Relaxed) + 1,
+        }
     }
 
     /// 読み取り / 編集で共用する構文解決。ファイル名 → 拡張子 → shebang の優先順で
@@ -1217,52 +1451,222 @@ impl SyntectHighlighter {
         self.syntaxes.find_syntax_by_extension(mapped)
     }
 
-    fn run(&self, syntax: &syntect::parsing::SyntaxReference, text: &str) -> Vec<Line> {
-        use syntect::easy::HighlightLines;
-        use syntect::util::LinesWithEndings;
-        let mut hl = HighlightLines::new(syntax, &self.theme);
-        // `load_defaults_newlines` の構文は改行込みの入力を前提にする。`str::lines()` で
-        // 改行を落とすと shell の shebang 後などで状態遷移が閉じず、標準言語でも行全体が
-        // 同じ色になる。パーサには改行を渡し、UI の 1 行要素からは末尾改行だけ除く。
-        LinesWithEndings::from(text)
-            .map(|line| {
-                match hl.highlight_line(line, &self.syntaxes) {
-                    Ok(regions) => {
-                        let visible_len = line
-                            .strip_suffix("\r\n")
-                            .or_else(|| line.strip_suffix('\n'))
-                            .map_or(line.len(), str::len);
-                        let mut remaining = visible_len;
-                        regions
-                            .into_iter()
-                            .filter_map(|(style, fragment)| {
-                                if remaining == 0 {
-                                    return None;
-                                }
-                                let len = fragment.len().min(remaining);
-                                remaining -= len;
-                                Some(Span {
-                                    text: fragment[..len].to_string(),
-                                    color: Some(tako_core::Rgb {
-                                        r: style.foreground.r,
-                                        g: style.foreground.g,
-                                        b: style.foreground.b,
-                                    }),
-                                    bold: style
-                                        .font_style
-                                        .contains(syntect::highlighting::FontStyle::BOLD),
-                                    italic: style
-                                        .font_style
-                                        .contains(syntect::highlighting::FontStyle::ITALIC),
-                                })
-                            })
-                            .collect()
-                    }
-                    // ハイライト失敗行は素のテキストへ劣化（表示を欠けさせない）
-                    Err(_) => vec![plain_span(line.trim_end_matches(['\r', '\n']))],
+    /// 1 行分の初期状態（まだ 1 行も読んでいない地点）
+    fn initial_state(
+        &self,
+        syntax: &syntect::parsing::SyntaxReference,
+        theme: &ThemeHighlighter,
+    ) -> LineState {
+        LineState {
+            parse: syntect::parsing::ParseState::new(syntax),
+            highlight: syntect::highlighting::HighlightState::new(
+                theme,
+                syntect::parsing::ScopeStack::new(),
+            ),
+        }
+    }
+
+    /// **1 行だけ**進める。全文ハイライトも編集中の差分ハイライトもここを通る（#1648）。
+    ///
+    /// 1 行の計算を 1 実装に閉じてあるので、「全文で塗った色」と「差分で塗った色」が
+    /// 食い違うことが構造的に起こらない（食い違いは見た目の退行として表に出る）。
+    /// `load_defaults_newlines` の構文は改行込みの入力を前提にする。`str::lines()` で
+    /// 改行を落とすと shell の shebang 後などで状態遷移が閉じず、標準言語でも行全体が
+    /// 同じ色になる。パーサには改行を渡し、UI の 1 行要素からは末尾改行だけ除く。
+    fn step(&self, theme: &ThemeHighlighter, state: &mut LineState, line: &str) -> Line {
+        let regions = match state.parse.parse_line(line, &self.syntaxes) {
+            Ok(ops) => syntect::highlighting::HighlightIterator::new(
+                &mut state.highlight,
+                &ops[..],
+                line,
+                theme,
+            )
+            .collect::<Vec<_>>(),
+            // ハイライト失敗行は素のテキストへ劣化（表示を欠けさせない）
+            Err(_) => return vec![plain_span(line.trim_end_matches(['\r', '\n']))],
+        };
+        let visible_len = line
+            .strip_suffix("\r\n")
+            .or_else(|| line.strip_suffix('\n'))
+            .map_or(line.len(), str::len);
+        let mut remaining = visible_len;
+        regions
+            .into_iter()
+            .filter_map(|(style, fragment)| {
+                if remaining == 0 {
+                    return None;
                 }
+                let len = fragment.len().min(remaining);
+                remaining -= len;
+                Some(Span {
+                    text: fragment[..len].to_string(),
+                    color: Some(tako_core::Rgb {
+                        r: style.foreground.r,
+                        g: style.foreground.g,
+                        b: style.foreground.b,
+                    }),
+                    bold: style
+                        .font_style
+                        .contains(syntect::highlighting::FontStyle::BOLD),
+                    italic: style
+                        .font_style
+                        .contains(syntect::highlighting::FontStyle::ITALIC),
+                })
             })
             .collect()
+    }
+
+    fn run(&self, syntax: &syntect::parsing::SyntaxReference, text: &str) -> Vec<Line> {
+        use syntect::util::LinesWithEndings;
+        let theme = ThemeHighlighter::new(&self.theme);
+        let mut state = self.initial_state(syntax, &theme);
+        LinesWithEndings::from(text)
+            .map(|line| self.step(&theme, &mut state, line))
+            .collect()
+    }
+
+    /// 編集中の再ハイライト（#1648）。`lines` をその場で差し替え、実際に走らせた行数を
+    /// `cache.relit` へ記録する。キャッシュが使えない条件（初回・構文が変わった・
+    /// 構文セットを載せ直した・行数が食い違う）なら全文へ落ちる
+    fn refresh(&self, path: &Path, text: &str, cache: &mut HighlightCache, lines: &mut Vec<Line>) {
+        let syntax = self.syntax_for_path(path, text);
+        let reusable = !full_highlight_forced()
+            && cache.generation == self.generation
+            && cache.syntax == syntax.name
+            && !cache.checkpoints.is_empty()
+            && cache.starts.len() == lines.len();
+        if reusable {
+            self.refresh_incremental(text, cache, lines);
+        } else {
+            self.refresh_full(syntax, text, cache, lines);
+        }
+        cache.stamp = HIGHLIGHT_STAMP.fetch_add(1, Ordering::Relaxed) + 1;
+    }
+
+    /// 全文を走らせてキャッシュを作り直す
+    fn refresh_full(
+        &self,
+        syntax: &syntect::parsing::SyntaxReference,
+        text: &str,
+        cache: &mut HighlightCache,
+        lines: &mut Vec<Line>,
+    ) {
+        use syntect::util::LinesWithEndings;
+        let theme = ThemeHighlighter::new(&self.theme);
+        let mut state = self.initial_state(syntax, &theme);
+        let mut checkpoints = vec![(0usize, Arc::new(SavedState::of(&state)))];
+        lines.clear();
+        for (index, line) in LinesWithEndings::from(text).enumerate() {
+            if index > 0 && index % HIGHLIGHT_STRIDE == 0 {
+                checkpoints.push((index, Arc::new(SavedState::of(&state))));
+            }
+            lines.push(self.step(&theme, &mut state, line));
+        }
+        cache.generation = self.generation;
+        cache.syntax.clear();
+        cache.syntax.push_str(&syntax.name);
+        cache.starts = line_starts(text);
+        cache.checkpoints = checkpoints;
+        cache.relit = lines.len();
+        cache.text.clear();
+        cache.text.push_str(text);
+    }
+
+    /// 変わった行の手前から、状態が前回と同じところへ収束するまでだけ走らせる。
+    ///
+    /// 収束したら残りの行は**前回塗った結果をそのまま使う**（`lines` の後半は動かさない）。
+    /// ブロックコメントを開く打鍵のように状態が最後まで戻らない編集では、
+    /// 収束しないまま末尾まで走る = 全文と同じコストになる（原理的な最悪で、これは正しい）
+    fn refresh_incremental(&self, text: &str, cache: &mut HighlightCache, lines: &mut Vec<Line>) {
+        let (old, new) = (cache.text.as_bytes(), text.as_bytes());
+        let prefix_bytes = common_prefix_len(old, new);
+        let suffix_bytes = common_suffix_len(old, new, old.len().min(new.len()) - prefix_bytes);
+        let old_len = lines.len();
+        let new_starts = line_starts(text);
+        let new_len = new_starts.len();
+
+        // 変更点を含む行は「変わった」側へ入れる（一致とみなすのは手前で閉じた行まで）
+        let mut head = cache
+            .starts
+            .partition_point(|&start| start <= prefix_bytes)
+            .saturating_sub(1);
+        let mut tail = old_len
+            - cache
+                .starts
+                .partition_point(|&start| start < old.len() - suffix_bytes);
+        let both = old_len.min(new_len);
+        if head + tail > both {
+            head = head.min(both);
+            tail = both - head;
+        }
+
+        let resume = cache
+            .checkpoints
+            .partition_point(|(line, _)| *line <= head)
+            .saturating_sub(1);
+        let start = cache.checkpoints[resume].0;
+        let theme = ThemeHighlighter::new(&self.theme);
+        let mut state = cache.checkpoints[resume].1.restore(&theme);
+
+        // 行番号のずれ（行が増えた編集なら負、減った編集なら正）
+        let shift = old_len as isize - new_len as isize;
+        let mut candidates = cache.checkpoints[resume + 1..].iter().peekable();
+        let mut fresh: Vec<Line> = Vec::new();
+        let mut fresh_points: Vec<(usize, Arc<SavedState>)> = Vec::new();
+        let mut last_point = start;
+        let mut cursor = start;
+        // 打ち切った地点（old 側の行番号, その再開地点の添字）
+        let mut stopped: Option<(usize, usize)> = None;
+
+        while cursor < new_len {
+            let mirrored = cursor as isize + shift;
+            // 末尾の一致領域へ入っていて、old 側の再開地点と状態が揃ったらそこで打ち切る
+            if cursor + tail >= new_len && mirrored >= 0 {
+                let mirrored = mirrored as usize;
+                while candidates.peek().is_some_and(|(line, _)| *line < mirrored) {
+                    candidates.next();
+                }
+                if let Some((line, saved)) = candidates.peek() {
+                    if *line == mirrored && saved.matches(&state) {
+                        let index = cache.checkpoints.partition_point(|(l, _)| *l < mirrored);
+                        stopped = Some((mirrored, index));
+                        break;
+                    }
+                }
+            }
+            if cursor > start && cursor - last_point >= HIGHLIGHT_STRIDE {
+                fresh_points.push((cursor, Arc::new(SavedState::of(&state))));
+                last_point = cursor;
+            }
+            let end = new_starts.get(cursor + 1).copied().unwrap_or(new.len());
+            let line = &text[new_starts[cursor]..end];
+            fresh.push(self.step(&theme, &mut state, line));
+            cursor += 1;
+        }
+
+        cache.relit = cursor - start;
+        let old_stop = stopped.map_or(old_len, |(line, _)| line);
+        lines.splice(start..old_stop, fresh);
+
+        let mut points = cache.checkpoints[..=resume].to_vec();
+        points.append(&mut fresh_points);
+        if let Some((_, index)) = stopped {
+            // 使い回す後半は行番号だけずらす（状態そのものは同じ Arc を共有する）
+            for (line, saved) in &cache.checkpoints[index..] {
+                let line = (*line as isize - shift) as usize;
+                // 行を削った編集では打ち切り地点が再開地点と重なることがある。
+                // そのとき状態は同じ（そうでなければ打ち切っていない）ので 1 つにまとめ、
+                // 再開地点の列を**昇順かつ一意**に保つ（`partition_point` の前提）
+                if points.last().is_some_and(|(last, _)| *last >= line) {
+                    continue;
+                }
+                points.push((line, Arc::clone(saved)));
+            }
+        }
+        cache.checkpoints = points;
+        cache.starts = new_starts;
+        cache.text.clear();
+        cache.text.push_str(text);
     }
 }
 
@@ -2848,8 +3252,8 @@ mod tests {
             };
             assert!(read_colors > 1, "{name} の読み取り表示に複数の構文色が付く");
 
-            let edit = EditState::open(&preview).expect("編集を開始できる");
-            apply_editor_text(&mut preview, &edit);
+            let mut edit = EditState::open(&preview).expect("編集を開始できる");
+            apply_editor_text(&mut preview, &mut edit);
             let edit_colors = match &preview.content {
                 PreviewContent::Code(lines) => 色数(lines),
                 other => panic!("{name} の編集表示は Code になる: {other:?}"),
@@ -2863,6 +3267,319 @@ mod tests {
 
         std::fs::remove_dir_all(&scratchpad).ok();
     }
+    // --- #1648: 編集中の再ハイライトを差分化する ----------------------------
+
+    /// 同じテキストを全文で塗り直した結果（差分の正解）
+    fn 全文の行(path: &Path, text: &str) -> Vec<Line> {
+        highlighter().highlight(path, text)
+    }
+
+    fn 表示行(preview: &PreviewState) -> &[Line] {
+        match &preview.content {
+            PreviewContent::Code(lines) => lines,
+            other => panic!("編集中の表示は Code になる: {other:?}"),
+        }
+    }
+
+    fn 検証用ディレクトリ(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tako-1648-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れる");
+        dir
+    }
+
+    /// 編集セッションを開いて 1 度塗った状態にする
+    fn 編集を開く(dir: &Path, name: &str, source: &str) -> (PreviewState, EditState) {
+        let path = dir.join(name);
+        std::fs::write(&path, source).unwrap();
+        let mut preview = load(&path, PreviewMode::Code);
+        let mut edit = EditState::open(&preview).expect("テキストなら編集セッションを開ける");
+        apply_editor_text(&mut preview, &mut edit);
+        (preview, edit)
+    }
+
+    /// 打鍵のたびに「差分で塗った結果」と「全文で塗り直した結果」を突き合わせる
+    fn 打鍵して照合(
+        preview: &mut PreviewState,
+        edit: &mut EditState,
+        ラベル: &str,
+        操作: impl FnOnce(&mut TextBuffer),
+    ) {
+        操作(&mut edit.buffer);
+        apply_editor_text(preview, edit);
+        let 期待 = 全文の行(&preview.path, edit.buffer.text());
+        assert_eq!(
+            表示行(preview),
+            期待.as_slice(),
+            "{ラベル}: 差分ハイライトの結果が全文ハイライトと一致する"
+        );
+    }
+
+    /// 中央の行の行末オフセット（行をまたぐ編集を作りやすくするための目印）
+    fn 中央の行末(text: &str) -> usize {
+        let 行頭: Vec<usize> = std::iter::once(0)
+            .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+            .collect();
+        let 中央 = 行頭[行頭.len() / 2];
+        text[中央..]
+            .find('\n')
+            .map_or(text.len(), |offset| 中央 + offset)
+    }
+
+    /// #1648 受け入れ条件 2: 見た目（塗り分け）が 1 トークンも変わらない。
+    /// 差分で塗った `Vec<Line>` が、同じテキストを全文で塗った `Vec<Line>` と完全一致すること
+    #[test]
+    fn 差分ハイライトの結果は全文ハイライトとバイト一致する() {
+        let dir = 検証用ディレクトリ("parity");
+        let 素材 = [
+            (
+                "sample.rs",
+                "//! 見出し\nuse std::fmt;\n\n/// 説明\nfn main() {\n    let answer = 42;\n    println!(\"{answer}\");\n}\n",
+            ),
+            (
+                "sample.py",
+                "import sys\n\n\ndef greet(name):\n    \"\"\"docstring\"\"\"\n    return f\"Hello {name}\"\n\n\nprint(greet(sys.argv[1]))\n",
+            ),
+            (
+                "sample.md",
+                "# 見出し\n\n本文と `コード`。\n\n```rust\nfn main() {}\n```\n\n- 箇条書き\n- 2 つ目\n",
+            ),
+        ];
+
+        for (name, source) in 素材 {
+            let (mut preview, mut edit) = 編集を開く(&dir, name, source);
+            assert_eq!(
+                表示行(&preview),
+                全文の行(&preview.path, source).as_slice(),
+                "{name}: 編集を開いた直後（全文）も読み取りと同じ結果になる"
+            );
+
+            打鍵して照合(
+                &mut preview,
+                &mut edit,
+                &format!("{name} 中央の行末へ 1 文字"),
+                |b| {
+                    let at = 中央の行末(b.text());
+                    b.set_cursor(at, false);
+                    b.insert("x");
+                },
+            );
+            打鍵して照合(
+                &mut preview,
+                &mut edit,
+                &format!("{name} 改行を入れる"),
+                |b| {
+                    let at = 中央の行末(b.text());
+                    b.set_cursor(at, false);
+                    b.newline();
+                },
+            );
+            打鍵して照合(
+                &mut preview,
+                &mut edit,
+                &format!("{name} BS で 1 文字消す"),
+                |b| {
+                    let at = 中央の行末(b.text());
+                    b.set_cursor(at, false);
+                    b.delete_backward();
+                },
+            );
+            打鍵して照合(
+                &mut preview,
+                &mut edit,
+                &format!("{name} 先頭へ挿入"),
+                |b| {
+                    b.set_cursor(0, false);
+                    b.insert("// 先頭\n");
+                },
+            );
+            打鍵して照合(
+                &mut preview,
+                &mut edit,
+                &format!("{name} 末尾へ追記"),
+                |b| {
+                    let at = b.text().len();
+                    b.set_cursor(at, false);
+                    b.insert("// 末尾\n");
+                },
+            );
+            // 状態が末尾まで収束しない編集（原理的な最悪ケース。全文と同じコストになるが結果は正しい）
+            打鍵して照合(
+                &mut preview,
+                &mut edit,
+                &format!("{name} ブロックコメントを開く"),
+                |b| {
+                    b.set_cursor(0, false);
+                    b.insert("/*\n");
+                },
+            );
+            打鍵して照合(
+                &mut preview,
+                &mut edit,
+                &format!("{name} 複数行を貼り付け"),
+                |b| {
+                    let at = 中央の行末(b.text());
+                    b.set_cursor(at, false);
+                    b.insert("\nlet a = 1;\nlet b = 2;\nlet c = 3;");
+                },
+            );
+            打鍵して照合(
+                &mut preview,
+                &mut edit,
+                &format!("{name} 行をまるごと消す"),
+                |b| {
+                    let text = b.text().to_string();
+                    let 行頭: Vec<usize> = std::iter::once(0)
+                        .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+                        .collect();
+                    let 消す先頭 = 行頭[行頭.len() / 2];
+                    let 消す末尾 = text[消す先頭..]
+                        .find('\n')
+                        .map_or(text.len(), |offset| 消す先頭 + offset + 1);
+                    b.replace_range(消す先頭..消す末尾, "");
+                },
+            );
+            打鍵して照合(
+                &mut preview,
+                &mut edit,
+                &format!("{name} 全選択して差し替え"),
+                |b| {
+                    b.select_all();
+                    b.insert("fn replaced() -> u8 { 7 }\n");
+                },
+            );
+            打鍵して照合(
+                &mut preview,
+                &mut edit,
+                &format!("{name} 空にする"),
+                |b| {
+                    b.select_all();
+                    b.delete_backward();
+                },
+            );
+            打鍵して照合(
+                &mut preview,
+                &mut edit,
+                &format!("{name} 空から書き戻す"),
+                |b| {
+                    b.insert(source);
+                },
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #1648: 表示行だけが外から差し替わる経路（Markdown ⇄ Code の切替は `PreviewState` を
+    /// 入れ替えるが `EditState` は残す）で、前回の編集を取りこぼしたまま差分を重ねないこと。
+    /// **行数が偶然揃う**ので、行数の照合だけでは防げない
+    #[test]
+    fn 表示行が外から差し替わったら差分をあきらめて塗り直す() {
+        let dir = 検証用ディレクトリ("swap");
+        // 再開地点が複数できる長さにする（HIGHLIGHT_STRIDE 行に満たないと停止判定が
+        // 働かず毎回全行を塗るので、取りこぼしそのものが起きない）
+        let source: String = (0..40)
+            .map(|i| format!("- 箇条書き {i} alpha。\n"))
+            .collect();
+        let source = source.as_str();
+        let (mut preview, mut edit) = 編集を開く(&dir, "swap.md", source);
+
+        // **中央の行**を 1 文字だけ編集する（行数は変わらない = 行数の照合はすり抜ける）。
+        // あとで別の行を打つので、この行の編集が表示から落ちたら気づける
+        let 中央 = 中央の行末(edit.buffer.text());
+        edit.buffer.set_cursor(中央, false);
+        edit.buffer.insert("x");
+        apply_editor_text(&mut preview, &mut edit);
+        let 編集後 = edit.buffer.text().to_string();
+
+        // 表示だけをファイルから読み直したものへ差し替える（切替から戻ってきた形）
+        preview = load(&preview.path, PreviewMode::Code);
+        assert_eq!(
+            表示行(&preview).len(),
+            source.lines().count(),
+            "差し替えた表示はファイルの行数（編集後と同じ行数）になる"
+        );
+
+        // ここから**別の行**（先頭）へ 1 文字足す。差分だけを重ねる実装は、
+        // 差し替えで消えた中央の行の編集を取りこぼしたまま先頭行だけ塗り直す
+        edit.buffer.set_cursor(0, false);
+        edit.buffer.insert("y");
+        apply_editor_text(&mut preview, &mut edit);
+        assert_ne!(edit.buffer.text(), 編集後, "2 文字目まで入っている");
+        assert_eq!(
+            表示行(&preview),
+            全文の行(&preview.path, edit.buffer.text()).as_slice(),
+            "表示が外から差し替わっても、次の打鍵でバッファ全体と一致する表示に戻る"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #1648 受け入れ条件 1 / 番犬: 1 打鍵の再ハイライトが「変わった行 + 収束までの後続行」
+    /// だけになる。**全文を毎回渡す形へ戻すとこの値が行数そのものになって落ちる**
+    #[test]
+    fn 一打鍵の再ハイライトは変わった行の周辺だけを走る() {
+        let dir = 検証用ディレクトリ("scope");
+        let source: String = (0..5_000)
+            .map(|i| format!("let value{i} = {i};\n"))
+            .collect();
+        let (mut preview, mut edit) = 編集を開く(&dir, "large.rs", &source);
+        assert_eq!(
+            edit.highlight.relit(),
+            5_000,
+            "編集を開いた直後は全文を塗る（ここだけは 5,000 行走る）"
+        );
+
+        let 上限 = 2 * HIGHLIGHT_STRIDE;
+        for 回 in 0..5 {
+            let at = 中央の行末(edit.buffer.text());
+            edit.buffer.set_cursor(at, false);
+            edit.buffer.insert("x");
+            apply_editor_text(&mut preview, &mut edit);
+            assert!(
+                edit.highlight.relit() <= 上限,
+                "{回} 打鍵目の再ハイライトは {上限} 行以内（実際 {} 行 / 全 5,000 行）",
+                edit.highlight.relit()
+            );
+        }
+
+        // 4 ケース目のバイト一致（5,000 行）もここで見る
+        assert_eq!(
+            表示行(&preview),
+            全文の行(&preview.path, edit.buffer.text()).as_slice(),
+            "5,000 行でも差分ハイライトが全文ハイライトと一致する"
+        );
+
+        // 行が増減しても再開地点の行番号がずれない（次の打鍵も絞られたままになる）
+        let at = 中央の行末(edit.buffer.text());
+        edit.buffer.set_cursor(at, false);
+        edit.buffer.newline();
+        apply_editor_text(&mut preview, &mut edit);
+        assert!(
+            edit.highlight.relit() <= 上限,
+            "改行を挟んだ後も {上限} 行以内（実際 {} 行）",
+            edit.highlight.relit()
+        );
+        assert_eq!(
+            表示行(&preview),
+            全文の行(&preview.path, edit.buffer.text()).as_slice(),
+            "改行後も全文ハイライトと一致する"
+        );
+        assert_eq!(表示行(&preview).len(), 5_001, "行数は改行した分だけ増える");
+        // 再開地点が編集のたびに増え続けない（境界で密になるだけで、間隔は保たれる）
+        let 再開地点 = edit.highlight.checkpoints();
+        let 上限の地点数 = 5_001 / HIGHLIGHT_STRIDE + 8;
+        assert!(
+            再開地点 <= 上限の地点数,
+            "再開地点は {上限の地点数} 個以内（実際 {再開地点} 個 / 5,001 行）"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // --- #973: 自動保存の対象を状態から導く ---------------------------------
 
     /// 実ファイルから編集セッションを作る（`EditState::open` は実 `TextBuffer` を要求する）

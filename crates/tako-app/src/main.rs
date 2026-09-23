@@ -12499,8 +12499,8 @@ impl TakoApp {
     }
 
     fn refresh_preview_from_editor(&mut self, pane_id: PaneId) {
-        let (previews, edits) = (&mut self.previews, &self.preview_edits);
-        if let (Some(state), Some(edit)) = (previews.get_mut(&pane_id), edits.get(&pane_id)) {
+        let (previews, edits) = (&mut self.previews, &mut self.preview_edits);
+        if let (Some(state), Some(edit)) = (previews.get_mut(&pane_id), edits.get_mut(&pane_id)) {
             preview::apply_editor_text(state, edit);
         }
         self.sync_preview_selection_from_editor(pane_id);
