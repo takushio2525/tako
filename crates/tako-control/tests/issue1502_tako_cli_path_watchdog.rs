@@ -95,21 +95,24 @@ fn setupが_tako_cliのpath設置を呼んでいる() {
     );
 }
 
-/// 1': `tako setup --check` が設置状況を報告している
+/// 1': `tako setup --check` が設置状況を報告している。
+///
+/// **#1505 で報告の組み立てが診断の正本（`tako_control::diagnostics`）へ移った**ので、
+/// 見る先もそちら（`--check` はその項目をそのまま出す）。縛る中身は同じで、
+/// 「`tako_cli_path_check_line` の 1 実装が `--check` の経路から呼ばれていること」
 #[test]
 fn setup_checkが_tako_cliのpathを報告している() {
-    let rel = "crates/tako-cli/src/setup.rs";
+    let rel = "crates/tako-control/src/diagnostics.rs";
     let text = read(rel);
     let hits = hits_in_fn(&text, "tako_cli_path_check_line");
     assert!(
         !hits.is_empty(),
         "{rel}: `tako setup --check` が tako CLI の PATH を報告していない（#1502 / Z19）。\n\
-         `run_check` の中で \
-         `eprintln!(\"{{}}\", setup_bootstrap::tako_cli_path_check_line());` を呼ぶこと"
+         診断の項目 `tako_cli_path` を `setup_bootstrap::tako_cli_path_check_line()` から組むこと"
     );
     assert!(
-        hits.iter().any(|(_, f)| f == "run_check"),
-        "{rel}: 報告の呼び出しが `run_check` の外に居る（見つかった場所: {}）",
+        hits.iter().any(|(_, f)| f == "tako_cli_path_item"),
+        "{rel}: 報告の呼び出しが `tako_cli_path_item` の外に居る（見つかった場所: {}）",
         hits.iter()
             .map(|(line, f)| format!("{rel}:{line}（{f}）"))
             .collect::<Vec<_>>()

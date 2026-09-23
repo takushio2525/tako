@@ -582,6 +582,82 @@ impl McpState {
     }
 }
 
+/// claude の tako MCP 登録の健全性（**claude だけ読み方が違う**）。
+///
+/// 書き手が `dispatch::setup_mcp`（`claude mcp add` ではなく `~/.claude.json` へ
+/// 直接書く形）なので [`handled_here`] は false で、[`state`] は `Unknown` を返す。
+/// `tako setup --check` / `check_health` はどちらもここを読む（#1505）。
+///
+/// 返り値: (登録あり, 登録パスが生きている)
+pub fn claude_health() -> (bool, bool) {
+    let (registered, alive, _) = claude_health_now();
+    (registered, alive)
+}
+
+/// [`claude_health`] に**打ち切りの知らせ**（#1503）を添えた口。
+///
+/// 実行ファイルの解決はここ 1 か所（呼び手が `exe::find("claude")` を書き直さない）
+pub fn claude_health_now() -> (bool, bool, Option<tako_core::probe::TimeoutNotice>) {
+    let Some(binary) = tako_core::platform::exe::find("claude") else {
+        return (false, false, None);
+    };
+    claude_health_probe(&binary)
+}
+
+/// [`claude_health`] の本体（実行ファイルを名指しで渡す口）。
+///
+/// **上限つきの問い合わせを通す**（#1503）。`claude mcp list` は登録済みの
+/// MCP サーバへ 1 台ずつ繋いで健全性を見るので、サーバが 1 つ無応答だと返らなくなる
+/// （#1500 の R4 = setup が無言で 6 分固まった実測の出どころ）。
+/// 上限で打ち切ったときは「未登録」と同じ扱いで先へ進む（登録し直せば済む）
+pub fn claude_health_with(binary: &str) -> (bool, bool) {
+    let (registered, alive, _) = claude_health_probe(binary);
+    (registered, alive)
+}
+
+/// [`claude_health_with`] に**打ち切りの知らせ**（#1503）を添えた口。
+///
+/// 診断（`tako setup --check` / `check_health`）は「確認できなかった」ことを
+/// JSON へも載せる（設計原則 5: 人が読める知らせは AI からも読める）
+pub fn claude_health_probe(binary: &str) -> (bool, bool, Option<tako_core::probe::TimeoutNotice>) {
+    let outcome = crate::agent_probe::output_with_timeout(binary, &["mcp", "list"]);
+    let notice = outcome.timeout_notice();
+    let Some(output) = outcome.into_output().filter(|o| o.status.success()) else {
+        return (false, false, notice);
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !claude_listing_has_tako(&stdout) {
+        return (false, false, notice);
+    }
+    // ~/.claude.json から登録パスを直接読む（claude mcp list の出力は
+    // チェック印の有無やフォーマットがバージョンで変わり得るため）
+    let path_alive = claude_registered_command()
+        .map(|p| std::path::Path::new(&p).is_file())
+        .unwrap_or(true); // 読めなければ楽観判定
+    (true, path_alive, notice)
+}
+
+/// `claude mcp list` の出力に tako の行があるか（**純粋関数**）
+pub fn claude_listing_has_tako(stdout: &str) -> bool {
+    stdout.lines().any(|line| {
+        let lower = line.to_lowercase();
+        lower.contains("tako") && !lower.contains("no mcp")
+    })
+}
+
+/// `~/.claude.json` から tako MCP 登録の command パスを読み取る
+pub fn claude_registered_command() -> Option<String> {
+    let home = tako_core::paths::home_dir().filter(|p| p.is_absolute())?;
+    let content = std::fs::read_to_string(home.join(".claude.json")).ok()?;
+    let settings: serde_json::Value = serde_json::from_str(&content).ok()?;
+    settings
+        .get("mcpServers")?
+        .get("tako")?
+        .get("command")?
+        .as_str()
+        .map(String::from)
+}
+
 /// いまの登録状態を読む（CLI を 1 回だけ起こす）
 pub fn state(agent: WorkerAgent) -> McpState {
     if !handled_here(agent) {

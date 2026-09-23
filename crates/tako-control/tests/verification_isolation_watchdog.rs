@@ -145,9 +145,18 @@ fn 検証の履歴はrcの後に当て直される() {
 #[test]
 fn エージェントcliの問い合わせ起動は正本の門番を通る() {
     for (rel, func) in [
+        // #1505 で認証とプランの問い合わせが 1 本になった（`is_authenticated_for` は
+        // ここへ委譲するだけ）ので、門番を通る位置もこちら
         (
             "crates/tako-control/src/setup_bootstrap.rs",
-            "is_authenticated_for",
+            "auth_state_for",
+        ),
+        // claude の MCP 登録の読み取り（#1505 で CLI から移った）。
+        // こちらは上限つきの口（`agent_probe::output_with_timeout`）を通る
+        // （`claude_health_with` / `claude_health_now` はここへ委譲するだけ）
+        (
+            "crates/tako-control/src/agent_mcp.rs",
+            "claude_health_probe",
         ),
         ("crates/tako-control/src/agent_models.rs", "catalog"),
         (
@@ -159,9 +168,9 @@ fn エージェントcliの問い合わせ起動は正本の門番を通る() {
         let body =
             fn_body(&text, func).unwrap_or_else(|| panic!("{rel}: fn {func} が見つからない"));
         assert!(
-            body.contains("agent_probe::run"),
-            "{rel}: {func} が正本の門番（agent_probe::run）を通っていない。\
-             テストプロセスから実 claude / codex / agy が起きる（#1261）"
+            body.contains("agent_probe::run") || body.contains("agent_probe::output_with_timeout"),
+            "{rel}: {func} が正本の門番（agent_probe::run / output_with_timeout）を\
+             通っていない。テストプロセスから実 claude / codex / agy が起きる（#1261）"
         );
         assert!(
             !body.contains(".output()"),

@@ -46,6 +46,7 @@ pub mod config_share;
 pub mod context_budget;
 pub mod delivery;
 pub mod diag;
+pub mod diagnostics;
 pub mod discovery;
 pub mod dispatch;
 pub mod fda;

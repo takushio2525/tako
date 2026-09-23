@@ -35,7 +35,7 @@ tmux（ティーマックス）は「ターミナルの中身を裏で生かし�
 :::
 
 :::tip[入っているか分からないときは]
-`tako setup` を実行すると、最初に claude / codex / agy と依存ツール（tmux / git）を自動チェックします。認証済み CLI とプランは検出結果、前回値、安全な既定値の順で自動決定します。チェックだけしたい場合は `tako setup --check` を使ってください（**3 系統それぞれについて「入っているか / PATH が通っているか / ログイン済みか」を一覧で出します**）。
+`tako setup` を実行すると、最初に claude / codex / agy と依存ツール（tmux / git）を自動チェックします。認証済み CLI とプランは検出結果、前回値、安全な既定値の順で自動決定します。チェックだけしたい場合は `tako setup --check` を使ってください（**3 系統それぞれについて「入っているか / PATH が通っているか / ログイン済みか」を一覧で出し**、続けてシェル統合・tako CLI の PATH・依存ツール・MCP 登録・アップデート追従・リモート公開・CLI / MCP の受け口まで並べます）。
 :::
 
 ## 1. インストール
@@ -294,23 +294,22 @@ tako セットアップ 環境チェック
          [不足] agy: Google アカウントにログインします (auth)
   [不足] tako CLI の PATH: 外部ターミナルからは使えません（設置先が PATH に入っていません）
          tako setup bootstrap path で設置できます
+  [OK] シェル統合: 環境変数の注入で有効（zsh / bash / fish）
   エージェント CLI:
     [検出] claude: /Users/<ユーザー名>/.local/bin/claude（未認証 / プラン不明）
     [検出] codex: /Users/<ユーザー名>/.local/bin/codex（未認証 / プラン不明）
     [検出] agy: /Users/<ユーザー名>/.local/bin/agy（未認証 / プラン不明）
   [OK] tmux: /opt/homebrew/bin/tmux
   [OK] git: /usr/bin/git
-  [OK] tailscale: /usr/local/bin/tailscale
+  [OK] tailscale: /opt/homebrew/bin/tailscale
   [OK] フルディスクアクセス: 付与済み（許可ダイアログは表示されません）
-
-  スリープ防止: mode=while-agents-running, power=ac-only
-      設定変更: tako sleep-guard set --mode <mode> --power <condition>
   [不足] Claude MCP: tako が未登録（tako setup-mcp で登録できます）
   [不足] codex MCP: tako が未登録（tako setup-mcp で登録できます）
   [不足] agy MCP: tako が未登録（tako setup-mcp で登録できます）
   [OK] Codex: master 起動時にも一時注入
   [情報] agy: worker 専用（master は非対応）
   [情報] config.yaml: 未作成
+  [情報] アップデート追従: 未適用（現在の setup リビジョンは 19）
   [情報] ~/.claude/CLAUDE.md: 未作成
   [情報] ~/.codex/AGENTS.md: 未作成
   [情報] ~/.gemini/GEMINI.md: 未作成
@@ -319,6 +318,8 @@ tako セットアップ 環境チェック
   [情報] 蓋閉じ防止: 未設定（tako sleep-guard install-lid-sleep で有効化）
   [情報] 設定共有: 未配線（複数デバイスで同じ AI 設定を使うなら `tako config init`）
   [情報] プロファイル: 未作成（tako master で自動生成されます）
+  [情報] リモート公開: 停止中（スマホから使うなら tako remote start）
+  [情報] IPC の受け口: 届きません（tako アプリが起動していません）
 
 残り 4 件（ここから先は人の操作が必要です）:
   1. Claude アカウントへのログイン
@@ -336,9 +337,11 @@ tako セットアップ 環境チェック
 済んだら tako setup をもう一度実行してください（残りはここから再開します）
 ```
 
-読み方は 4 つのラベルだけです。`[OK]` は済んでいるもの、`[不足]` はまだ済んでいないもの、`[検出]` と `[情報]` は状態の報告（対応は不要）です。末尾の「残り N 件」が、**人の操作が要るぶんだけ**を抜き出したものです。ここが 0 件になれば、その行ごと出なくなります。
+読み方はラベルだけです。`[OK]` は済んでいるもの、`[不足]` はまだ済んでいないもの、`[検出]` と `[情報]` は状態の報告（対応は不要）、`[任意]` は入れなくても tako は動くもの、`[警告]` は入っているのに壊れているものです。末尾の「残り N 件」が、**人の操作が要るぶんだけ**を抜き出したものです。ここが 0 件になれば、その行ごと出なくなります。
 
 `--check` は表示だけで、設定は一切書き換えません。
+
+同じ内容は `tako check-health` からも読めます（項目は 1 つの実装から出ているので、**どちらで見ても同じ行**です）。AI から状態を読ませたいときは `tako check-health --json` の `diagnostics` を使ってください。
 
 ### やり直したいとき
 

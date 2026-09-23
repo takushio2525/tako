@@ -26,6 +26,14 @@
 //!
 //! ## #1524 で動いた置き場
 //!
+//! ## #1505 で動いた置き場（読み取り専用の経路）
+//!
+//! `tako setup --check` の依存チェックは診断の正本（`tako_control::diagnostics`）へ
+//! 移った。通る実装（`offer_and_install` を `stage_installs: false` で）は同じなので、
+//! ①の検査先だけそちらへ move してある
+//!
+//! ## #1524 で動いた置き場
+//!
 //! #1499 当時は表示と入力が CLI（`setup.rs` の `offer_dep_install`）にあったので、
 //! ①の入口検査も②の「計画を見せてから進む」も CLI を見ていた。#1524 でそのひと続きを
 //! `setup_deps::offer_and_install` へ寄せたので、**検査先だけ寄せ先へ移してある**
@@ -42,6 +50,8 @@ mod production_range;
 
 const CLI_SETUP: &str = "crates/tako-cli/src/setup.rs";
 const SETUP_DEPS: &str = "crates/tako-control/src/setup_deps.rs";
+/// `tako setup --check` の読み取り専用経路の寄せ先（#1505 で CLI から移った）
+const DIAGNOSTICS: &str = "crates/tako-control/src/diagnostics.rs";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -107,15 +117,24 @@ fn issue1499_依存チェックの対話をreviewだけで決めない() {
         "{CLI_SETUP}: その場導入は `setup_deps::offer_and_install`（中で `offer_for`）を\
          通すこと（#1499 / #1524）"
     );
-    // 呼び出しの形（`--review` に依らない本体経路 / 読み取り専用の `--check`）
+    // 呼び出しの形（`--review` に依らない本体経路）
     for shape in [
         "run_dependency_check(DepCheckMode::for_setup(review_mode, assume_yes))",
-        "run_dependency_check(DepCheckMode::check_only())",
         "stage_installs: true",
     ] {
         assert!(
             src.contains(shape),
             "{CLI_SETUP}: `{shape}` が無い（#1499 の依存チェック段の形）"
+        );
+    }
+    // **読み取り専用の経路（`tako setup --check`）は #1505 で診断の正本へ移った**。
+    // 縛る中身は同じ（同じ `offer_and_install` を `stage_installs: false` で通し、
+    // 何も導入しない・何も聞かない）ので、検査先だけ寄せ先へ move する
+    let diagnostics = production(DIAGNOSTICS);
+    for shape in ["offer_and_install(", "stage_installs: false"] {
+        assert!(
+            diagnostics.contains(shape),
+            "{DIAGNOSTICS}: `{shape}` が無い（`--check` の読み取り専用の形。#1499 / #1505）"
         );
     }
     // **#262 は壊さない**: 設定値（FDA / スリープ）の見直しは `--review` だけが対話になる
