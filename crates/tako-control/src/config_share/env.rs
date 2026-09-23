@@ -265,16 +265,19 @@ pub fn probe_path(
         ExternalKind::InRepo
     };
     // `repo_root` は git が返す物理パス。突き合わせる側も実体へ寄せておかないと
-    // `/var` → `/private/var` のような差で `strip_prefix` が外れる
-    let resolved = std::fs::canonicalize(path).ok()?;
+    // `/var` → `/private/var` のような差で対応が外れる。
+    // 解決は境界（B26）を通す: この `resolved` は `git rev-parse` の cwd として
+    // **子プロセスへ渡る**ので、Windows の verbatim を持ち回らない（#970）
+    let resolved = tako_core::platform::path::canonicalize(path).ok()?;
     let repo = tako_core::git::repo_root(&resolved)?;
     if exclude_repo.is_some_and(|excluded| same_dir(excluded, &repo)) {
         return None;
     }
-    let repo_rel = resolved
-        .strip_prefix(&repo)
-        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_default();
+    // 突き合わせに `Path::strip_prefix` を使わない: `resolved`（OS の canonicalize）と
+    // `repo`（git の戻り）は**出どころが違って表記も違う**ので、成分単位の比較は
+    // Windows で必ず外れ、`unwrap_or_default()` が `repo_rel` を黙って空文字にする
+    // （#1569。`same_place` が常に false 側へ倒れて重複警告が誤答していた）
+    let repo_rel = tako_core::platform::path::relative_under(&repo, &resolved).unwrap_or_default();
     Some(ExternalManaged {
         root,
         path: abbreviate_home(path, home),
@@ -529,17 +532,12 @@ mod tests {
         remove_temp_dir(&dir);
     }
 
-    /// **Windows では skip**（#1569）。`probe_path` は `std::fs::canonicalize` の
-    /// 返り（Windows は verbatim `\\?\C:\…`）を `git rev-parse --show-toplevel` の
-    /// 返り（`/` 区切り）へ `strip_prefix` するので、prefix 成分が別物で必ず外れ
-    /// `repo_rel` が空文字になる（#970 の型）。製品側を直す Issue が #1569 で、
-    /// 直したらこの `ignore` を外す（#1278 は CI を blocking にする作業で、
-    /// 製品の変更はスコープ外）
+    /// **Windows でも回る**（#1569 で ignore を外した）。`probe_path` が
+    /// `std::fs::canonicalize` の返り（Windows は verbatim `\\?\C:\…`）を
+    /// `git rev-parse --show-toplevel` の返りへ `strip_prefix` していたころは、
+    /// prefix 成分が別物で必ず外れて `repo_rel` が空文字になっていた（#970 の型）。
+    /// 表記の食い違いは `platform::path::relative_under` が吸収する
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows は canonicalize の verbatim で repo_rel が空になる（製品側の穴。#1569）"
-    )]
     fn リポジトリ配下の実体も外部管理として検出する() {
         let dir = temp_dir("inrepo");
         remove_temp_dir(&dir);

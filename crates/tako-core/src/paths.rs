@@ -74,8 +74,11 @@ pub fn shorten_home_with(path: &str, home: Option<&Path>) -> String {
 }
 
 /// パスの区切り。`std::path::is_separator` は cfg で変わり、macOS から
-/// Windows のパスを検査できないので自前で持つ（`\` と `/` の両方を区切りとみなす）
-fn is_path_separator(c: char) -> bool {
+/// Windows のパスを検査できないので自前で持つ（`\` と `/` の両方を区切りとみなす）。
+///
+/// 同じ理由で成分を割る側（[`crate::platform::path::relative_under`]）も
+/// これを使う（区切りの定義を 2 か所に持たない）
+pub(crate) fn is_path_separator(c: char) -> bool {
     c == '/' || c == '\\'
 }
 
