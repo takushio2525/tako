@@ -176,6 +176,115 @@ pub fn details_by_name(names: &[&str]) -> Vec<ProcDetail> {
         .collect()
 }
 
+/// 記録しておいた正体（照合の期待値。#1616）。
+///
+/// 「起動したときにこう記録した」側の値で、`None` の欄はその材料では照合しない。
+/// 記録が無いことは**一致の証拠にはならない**（[`judge_identity`] は材料が
+/// 1 つも無ければ `Unknown` を返す）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExpectedProcess<'a> {
+    /// 記録した実行ファイルのパス。比較は**名前だけ**（拡張子と大文字小文字は無視）
+    pub exe: Option<&'a str>,
+    /// 記録した起動時刻（UNIX 秒）
+    pub start_time_unix: Option<u64>,
+}
+
+/// いま OS から引けた正体の材料（#1616）。
+///
+/// 引けなかった欄は `None`。**「取れない」と「違う」を混ぜない**ための型で、
+/// 取れないものは判定の材料から外れる（[`judge_identity`]）
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObservedProcess {
+    /// 起動時のコマンドライン全体（[`command_line`]）
+    pub command_line: Option<String>,
+    /// 実行ファイルの絶対パス（[`image_path`]）
+    pub image_path: Option<std::path::PathBuf>,
+    /// 起動時刻（UNIX 秒。[`start_time_unix`]）
+    pub start_time_unix: Option<u64>,
+}
+
+/// 正体照合の結論（#1616）。
+///
+/// **`Unknown` は `Confirmed` の側へ倒さない**。「確認できなかった」は
+/// 「本物だった」ではないので、撃つ・消すといった不可逆な操作は `Confirmed`
+/// のときだけ行う（[`IdentityVerdict::confirmed`]）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityVerdict {
+    /// 引けた材料がすべて記録と一致した
+    Confirmed,
+    /// 引けた材料のどれかが記録と食い違った = 別のプロセス（pid の再利用）
+    Mismatch,
+    /// 材料が 1 つも引けなかった = 確認できない（権限が無い / 既に居ない）
+    Unknown,
+}
+
+impl IdentityVerdict {
+    /// 不可逆な操作へ進んでよいか。**`Unknown` は false**（確認できない相手は触らない）
+    pub fn confirmed(self) -> bool {
+        matches!(self, Self::Confirmed)
+    }
+}
+
+/// 起動時刻の照合で許す差（秒）。
+///
+/// 記録を書き出す時刻と OS が持つ生成時刻は同じプロセスでも一致しない
+/// （プロセス起動 → 記録の書き出しまでに間がある）。pid の再利用は
+/// 「前の持ち主が死んでから」なので、この程度の窓で取り違えることは無い
+pub const START_TIME_SLACK_SECS: u64 = 5;
+
+/// その pid の正体の材料を OS から引く（#1616）。
+///
+/// 個々の材料の可否はプラットフォームで違う（[`command_line`] は unix では
+/// `None`、[`start_time_unix`] は macOS / Windows のみ）。**呼び出し側は
+/// どの材料が取れるかを知らなくてよい** = OS 分岐を持たずに [`judge_identity`] へ渡せる
+pub fn observe_identity(pid: u32) -> ObservedProcess {
+    ObservedProcess {
+        command_line: command_line(pid),
+        image_path: image_path(pid),
+        start_time_unix: start_time_unix(pid),
+    }
+}
+
+/// 記録しておいた正体と、いま OS から引けた材料を突き合わせる（#1616。純関数）。
+///
+/// `is_expected_command_line` は「このコマンドラインは探している相手か」を決める規則。
+/// 規則そのものは呼び出し側の知識（`tako remote serve` かどうか等）なので渡してもらう。
+///
+/// 判定は**引けた材料だけ**で行う。1 つでも食い違えば `Mismatch`、
+/// 1 つも引けなければ `Unknown`（= 確認できない）。
+/// 実行ファイルは**名前だけ**で比べる: symlink 越しの起動・`versions/<版>` 実体・
+/// 8.3 短縮名で同じプロセスが別のパスに見えるため（名前が変われば別のプロセス）
+pub fn judge_identity(
+    observed: &ObservedProcess,
+    expected: ExpectedProcess<'_>,
+    is_expected_command_line: impl Fn(&str) -> bool,
+) -> IdentityVerdict {
+    let mut materials = 0usize;
+    if let Some(cmd) = observed.command_line.as_deref() {
+        if !is_expected_command_line(cmd) {
+            return IdentityVerdict::Mismatch;
+        }
+        materials += 1;
+    }
+    if let (Some(recorded), Some(actual)) = (expected.exe, observed.image_path.as_deref()) {
+        if stem_of(recorded) != stem_of(&actual.to_string_lossy()) {
+            return IdentityVerdict::Mismatch;
+        }
+        materials += 1;
+    }
+    if let (Some(recorded), Some(actual)) = (expected.start_time_unix, observed.start_time_unix) {
+        if actual.abs_diff(recorded) > START_TIME_SLACK_SECS {
+            return IdentityVerdict::Mismatch;
+        }
+        materials += 1;
+    }
+    if materials == 0 {
+        IdentityVerdict::Unknown
+    } else {
+        IdentityVerdict::Confirmed
+    }
+}
+
 /// `root` とその子孫の pid 集合（`root` 自身を含む）。
 ///
 /// 純粋関数なので **macOS 上でもテストできる**。Windows の ppid は
@@ -1382,5 +1491,221 @@ mod tests {
             // 自分の子孫には必ず自分が含まれる
             assert!(descendants_of(&procs, me).contains(&me));
         }
+    }
+
+    // ------------------------------------------------- 正体照合（#1616）
+
+    /// 材料がすべて揃って一致すれば `Confirmed`
+    #[test]
+    fn 引けた材料が全部一致すれば確認済みになる() {
+        let observed = ObservedProcess {
+            command_line: Some("\"C:\\bin\\tako.exe\" remote serve".into()),
+            image_path: Some(std::path::PathBuf::from("C:\\bin\\tako.exe")),
+            start_time_unix: Some(1_700_000_000),
+        };
+        let expected = ExpectedProcess {
+            exe: Some("C:\\bin\\tako.exe"),
+            start_time_unix: Some(1_700_000_003),
+        };
+        assert_eq!(
+            judge_identity(&observed, expected, |c| c.contains("remote serve")),
+            IdentityVerdict::Confirmed
+        );
+    }
+
+    /// **材料が 1 つも引けなければ `Unknown`**（= 確認できない）。
+    /// ここが `Confirmed` へ倒れると、生きている pid がすべて「本物」になる（#1616 の穴）
+    #[test]
+    fn 材料が1つも引けなければ確認できない扱いになる() {
+        let expected = ExpectedProcess {
+            exe: Some("/usr/local/bin/tako"),
+            start_time_unix: Some(1_700_000_000),
+        };
+        let verdict = judge_identity(&ObservedProcess::default(), expected, |_| true);
+        assert_eq!(verdict, IdentityVerdict::Unknown);
+        assert!(!verdict.confirmed(), "Unknown で撃ってはいけない");
+    }
+
+    /// 記録が空でも「一致」にはならない（材料が無いのと同じ扱い）
+    #[test]
+    fn 記録が空なら確認できない扱いになる() {
+        let observed = ObservedProcess {
+            command_line: None,
+            image_path: Some(std::path::PathBuf::from("/usr/local/bin/tako")),
+            start_time_unix: Some(1_700_000_000),
+        };
+        assert_eq!(
+            judge_identity(&observed, ExpectedProcess::default(), |_| true),
+            IdentityVerdict::Unknown,
+            "記録が無ければ照合できる材料も無い"
+        );
+    }
+
+    /// コマンドラインが規則に合わなければ `Mismatch`（他の材料が一致していても）
+    #[test]
+    fn コマンドラインが規則に合わなければ別プロセス扱いになる() {
+        let observed = ObservedProcess {
+            command_line: Some("C:\\Windows\\System32\\notepad.exe".into()),
+            image_path: Some(std::path::PathBuf::from("C:\\bin\\tako.exe")),
+            start_time_unix: Some(1_700_000_000),
+        };
+        let expected = ExpectedProcess {
+            exe: Some("C:\\bin\\tako.exe"),
+            start_time_unix: Some(1_700_000_000),
+        };
+        assert_eq!(
+            judge_identity(&observed, expected, |c| c.contains("remote serve")),
+            IdentityVerdict::Mismatch
+        );
+    }
+
+    /// 実行ファイルの**名前**が違えば `Mismatch`。パスの形の違いでは落ちない
+    #[test]
+    fn 実行ファイルは名前で照合する() {
+        let same_name_other_path = ObservedProcess {
+            image_path: Some(std::path::PathBuf::from(
+                "/Applications/tako.app/Contents/MacOS/tako",
+            )),
+            ..ObservedProcess::default()
+        };
+        assert_eq!(
+            judge_identity(
+                &same_name_other_path,
+                ExpectedProcess {
+                    exe: Some("/Users/testuser/.local/bin/tako"),
+                    start_time_unix: None,
+                },
+                |_| true
+            ),
+            IdentityVerdict::Confirmed,
+            "symlink / 実体で経路が違っても同じプロセス"
+        );
+        // 拡張子と大文字小文字は無視する（Windows の `TAKO.EXE`）
+        let windows_case = ObservedProcess {
+            image_path: Some(std::path::PathBuf::from("C:\\bin\\TAKO.EXE")),
+            ..ObservedProcess::default()
+        };
+        assert_eq!(
+            judge_identity(
+                &windows_case,
+                ExpectedProcess {
+                    exe: Some("C:\\bin\\tako.exe"),
+                    start_time_unix: None,
+                },
+                |_| true
+            ),
+            IdentityVerdict::Confirmed
+        );
+        let other = ObservedProcess {
+            image_path: Some(std::path::PathBuf::from("C:\\Windows\\notepad.exe")),
+            ..ObservedProcess::default()
+        };
+        assert_eq!(
+            judge_identity(
+                &other,
+                ExpectedProcess {
+                    exe: Some("C:\\bin\\tako.exe"),
+                    start_time_unix: None,
+                },
+                |_| true
+            ),
+            IdentityVerdict::Mismatch
+        );
+    }
+
+    /// 起動時刻は `START_TIME_SLACK_SECS` まで許し、それを超えたら `Mismatch`
+    #[test]
+    fn 起動時刻は許容差までしか許さない() {
+        let at = |secs: u64| ObservedProcess {
+            start_time_unix: Some(secs),
+            ..ObservedProcess::default()
+        };
+        let expected = ExpectedProcess {
+            exe: None,
+            start_time_unix: Some(1_700_000_000),
+        };
+        for delta in [0, START_TIME_SLACK_SECS] {
+            assert_eq!(
+                judge_identity(&at(1_700_000_000 + delta), expected, |_| true),
+                IdentityVerdict::Confirmed,
+                "{delta} 秒差は同じプロセス"
+            );
+            assert_eq!(
+                judge_identity(&at(1_700_000_000 - delta), expected, |_| true),
+                IdentityVerdict::Confirmed,
+                "-{delta} 秒差は同じプロセス"
+            );
+        }
+        assert_eq!(
+            judge_identity(
+                &at(1_700_000_000 + START_TIME_SLACK_SECS + 1),
+                expected,
+                |_| true
+            ),
+            IdentityVerdict::Mismatch,
+            "許容差を 1 秒超えたら別プロセス"
+        );
+        // 記録が 0（起動時刻を書けなかった daemon）と生きているプロセスは一致しない
+        assert_eq!(
+            judge_identity(
+                &at(1_700_000_000),
+                ExpectedProcess {
+                    exe: None,
+                    start_time_unix: Some(0)
+                },
+                |_| true
+            ),
+            IdentityVerdict::Mismatch
+        );
+    }
+
+    /// 実機の OS へ問い合わせる経路。**自分自身なら材料が引けること**を見る
+    /// （どの材料が引けるかは OS で違うので、引ける材料の中身だけを確かめる）
+    #[test]
+    fn 自分の正体の材料を引ける() {
+        let me = observe_identity(std::process::id());
+        let exe = std::env::current_exe().expect("自分の exe パス");
+        assert_eq!(
+            me.image_path.as_deref().map(stem_of_path),
+            Some(stem_of(&exe.to_string_lossy())),
+            "自分の実行ファイル名は引ける（macOS / Windows 共通）"
+        );
+        assert!(
+            me.start_time_unix.is_some_and(|t| t > 1_600_000_000),
+            "自分の起動時刻は引ける: {:?}",
+            me.start_time_unix
+        );
+        if cfg!(windows) {
+            assert!(
+                me.command_line
+                    .as_deref()
+                    .is_some_and(|c| !c.trim().is_empty()),
+                "Windows は自分のコマンドラインを引ける"
+            );
+        } else {
+            assert_eq!(me.command_line, None, "unix には引く手段が無い");
+        }
+        // 記録した正体（自分自身）と突き合わせれば Confirmed になる
+        let exe_str = exe.to_string_lossy().to_string();
+        let expected = ExpectedProcess {
+            exe: Some(exe_str.as_str()),
+            start_time_unix: me.start_time_unix,
+        };
+        assert_eq!(
+            judge_identity(&me, expected, |_| true),
+            IdentityVerdict::Confirmed
+        );
+        // 居ない pid からは材料が 1 つも引けない = 確認できない
+        let gone = observe_identity(99_999_999);
+        assert_eq!(gone, ObservedProcess::default());
+        assert_eq!(
+            judge_identity(&gone, expected, |_| true),
+            IdentityVerdict::Unknown
+        );
+    }
+
+    /// テスト側のヘルパ（`stem_of` は非公開なのでパスからも同じ語を作る）
+    fn stem_of_path(path: &std::path::Path) -> String {
+        stem_of(&path.to_string_lossy())
     }
 }

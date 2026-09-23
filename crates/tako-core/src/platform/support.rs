@@ -1292,7 +1292,7 @@ pub const MATRIX: &[Feature] = &[
             issue: 528,
         },
         windows_evidence: Evidence::UnitTest(
-            "実機の cargo test で remote::tests の 2 件（daemon_stop_impl / is_process_alive）が失敗。うち is_process_alive は「非 unix では常に false」という製品側の穴で #1557 で解消（実機の再測は未了）",
+            "実機の cargo test で remote::tests の 2 件（daemon_stop_impl / is_process_alive）が失敗。うち is_process_alive は「非 unix では常に false」という製品側の穴で #1557 で解消し、daemon_stop_impl が見ていた正体確認の素通りは #1616 で解消（どちらも実機の再測は未了）",
         ),
     },
     Feature {
@@ -1314,7 +1314,7 @@ pub const MATRIX: &[Feature] = &[
             issue: 528,
         },
         windows_evidence: Evidence::UnitTest(
-            "同上（daemon_stop_impl はpid再利用時にkillしない が失敗）",
+            "同上（daemon_stop_impl はpid再利用時にkillしない が失敗）。#1616 で Windows も正体確認を通るようになり、この検査は両 OS とも「撃たずに中止」を見る形になった（停止そのものは #1599 が未実装。実機の再測は未了）",
         ),
     },
     Feature {
