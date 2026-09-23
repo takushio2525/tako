@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-23（#1557 / #1581: pid の生存判定を境界の 1 実装へ寄せた）
-- `remote.rs` の私的 `is_process_alive` は非 unix で**無条件 false** = Windows で生きている daemon を全部「居ない」と読み、`daemon_status` の `running` も pid 再利用時の誤 kill 防止も掃除判断も揃って誤っていた。`tako_core::platform::process::pid_alive` へ委譲。macOS も EPERM は「居る」・`pid_t` 範囲外は「居ない」へ揃う（どちらも state を消さない / 撃たない側）。偽の緑だった `is_process_aliveは存在しないpidをfalseで返す` に `u32::MAX` / `0` を足した
-- **#1581 の案 1 は既に入っていた**: `test_residue.rs` は `ports::process_alive` を一度も使っておらず（`git log -S` 0 件）、`OwnerProbe` は #1296 の初版から境界を通っている。失敗テストは子の終了直後に数える形で、残る 3 件は**子自身の pid** = 起動時の掃除では原理的に直らない（`tako-agent-config-` は `auto: false` でそもそも対象外）。案 2 / 案 3 は #1581 に残す（PR は Refs のみ）
-- 実測: 番犬 5 本・実ファイル注入 3 通りすべて file:line 名指しで FAILED → 戻して緑・workspace 5147 passed 0 failed・clippy 3 宇宙 0・check-windows error 0・`windows-support.md --check` 同期。Windows 実機は CI ジョブが唯一の実行証拠
-
 ## 2026-09-23（#763: リンクを開く修飾キーをプラットフォームごとに 1 箇所で決めた）
 - リンク経路 13 サイト（ターミナルのクリック / cmd+右クリック #1182 / ホバー 6 / md・PDF のクリック / リリースノート）が `Modifiers::platform` を直読みし、Windows は Win+クリック要求だった。判定を `tako_core::platform::keys::link_modifier_active(platform, platform_key, control)`（macOS = command のみ / Windows = control のみ。`platform || control` を素で足すと macOS の Ctrl+クリック = 右クリック相当と衝突）へ寄せ、GPUI 側は `keybindings::link_modifier_active` / `link_modifiers` / `non_link_modifiers` の 3 本だけが `Modifiers` を触る形にした。表記も同じ表を見る `keys::link_click` で MCP カタログ・CLI ヘルプ・docs が実行 OS に追従する
 - 実測: 番犬 `issue763_link_modifier_watchdog`（4 規則）へ注入 12 通りすべて file:line 名指しで FAILED → 戻して緑・隔離 GUI（tako-vd）のセルフテストが `TAKO_APP_SELF_TEST_OK` 完走（310 秒 / 240 診断行）で `TAKO_SELF_TEST_763: file_click=true dir_click=true wrong_modifier_opened=false`・workspace 5204 passed 0 failed・clippy 3 宇宙 0・check-windows error 0
@@ -64,3 +59,8 @@
 - 1 打鍵ごとに全文を syntect へ通していた `apply_editor_text` を、行の切れ目の状態を 8 行ごとに持ち回る差分へ。全文経路と差分経路は同じ `step` を通すので塗り分けは食い違わない
 - 実測（release / 1 打鍵）: 4,666 行 344.6→**0.56ms**（611x・再ハイライト 8 行）・5,000 行 355.4→0.47ms（760x）。間隔 8 行は時間とメモリ（1 地点 925 バイト）の釣り合いで選んだ
 - 注入 6 通りすべて file:line 名指しで FAILED → 戻して緑。Markdown ⇄ Code の切替で表示だけ外から差し替わる経路は `highlight_stamp` の照合で塞いだ
+
+## 2026-09-23（#1650: エディタが CRLF ファイルを壊さないようにした）
+- `line_end` が `\n` の位置を返し `newline` が `"\n"` 固定だったので、CRLF ファイルは End で CR の後ろへ止まり（実測 `cursor=4` / `"abc\r!\n"`）Enter 1 回で混在改行（CR 2 / LF 3）になっていた。`TextBuffer` に `LineEnding` を持たせ `\r\n` を 1 つの行区切りとして扱う（行末は CR の手前 / カーソルは CR と LF のあいだに入らない / BS・Delete は 2 バイトまとめて / 移動はまたぐ）
+- **既存行の改行は 1 バイトも書き換えない**（混在は多数派へ寄せず保持）。新しい改行だけが多数派に揃い、揃える口は `normalize_line_endings` の 1 実装。改行 0 のファイルだけ `for_new_file(Platform)` = OS の流儀（純関数なので macOS から両腕を固定できる。初回 CI は Windows だけ赤で、既存テスト 2 件の `\n` 直書き期待値がずれていた）。表示側の行頭オフセットも `line_start_offsets` へ
+- 実測: 4 通り（CRLF / LF / 混在 / 末尾改行なし）の往復保存が修正前 FAILED → 修正後 緑・番犬 `issue1650_line_ending_watchdog` 8 本へ注入 12 通りすべて file:line 名指しで FAILED → 戻して緑・Windows の腕を強制した全数走 5260 passed・workspace 5261 passed 0 failed・clippy 3 宇宙 0
