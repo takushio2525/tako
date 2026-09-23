@@ -59,7 +59,8 @@
 - 1 打鍵ごとに全文を syntect へ通していた `apply_editor_text` を、行の切れ目の状態を 8 行ごとに持ち回る差分へ。全文経路と差分経路は同じ `step` を通すので塗り分けは食い違わない
 - 実測（release / 1 打鍵）: 4,666 行 344.6→**0.56ms**（611x・再ハイライト 8 行）・5,000 行 355.4→0.47ms（760x）。間隔 8 行は時間とメモリ（1 地点 925 バイト）の釣り合いで選んだ
 - 注入 6 通りすべて file:line 名指しで FAILED → 戻して緑。Markdown ⇄ Code の切替で表示だけ外から差し替わる経路は `highlight_stamp` の照合で塞いだ
+
 ## 2026-09-23（#1650: エディタが CRLF ファイルを壊さないようにした）
-- `line_end` が `\n` の位置を返し `newline` が `"\n"` 固定だったので、CRLF ファイルは End で CR の後ろへ止まり（実測 `cursor=4` / `"abc\r!\n"`）、Enter 1 回で混在改行（実測 CR 2 / LF 3）になっていた。`TextBuffer` に `LineEnding` を持たせ、`\r\n` を 1 つの行区切りとして扱う（行末は CR の手前 / カーソルは CR と LF のあいだに入らない / BS・Delete は 2 バイトまとめて / 移動はまたぐ）
-- **既存行の改行は 1 バイトも書き換えない**（混在は多数派へ寄せず保持）。新しく足す改行だけが多数派に揃い、揃える口は `normalize_line_endings` の 1 実装（打鍵・IME・貼り付け・dispatch が全部通る）。表示側は行頭オフセットが「表示文字数 + 1」で CRLF だと 1 行ずつずれていたので `line_start_offsets` へ
-- 実測: 4 通り（CRLF / LF / 混在 / 末尾改行なし）の往復保存テストが修正前に FAILED → 修正後に緑・番犬 `issue1650_line_ending_watchdog` 7 本へ注入 11 通りすべて file:line 名指しで FAILED → 戻して緑・workspace 5259 passed 0 failed・clippy 3 宇宙 0
+- `line_end` が `\n` の位置を返し `newline` が `"\n"` 固定だったので、CRLF ファイルは End で CR の後ろへ止まり（実測 `cursor=4` / `"abc\r!\n"`）Enter 1 回で混在改行（CR 2 / LF 3）になっていた。`TextBuffer` に `LineEnding` を持たせ `\r\n` を 1 つの行区切りとして扱う（行末は CR の手前 / カーソルは CR と LF のあいだに入らない / BS・Delete は 2 バイトまとめて / 移動はまたぐ）
+- **既存行の改行は 1 バイトも書き換えない**（混在は多数派へ寄せず保持）。新しい改行だけが多数派に揃い、揃える口は `normalize_line_endings` の 1 実装。改行 0 のファイルだけ `for_new_file(Platform)` = OS の流儀（純関数なので macOS から両腕を固定できる。初回 CI は Windows だけ赤で、既存テスト 2 件の `\n` 直書き期待値がずれていた）。表示側の行頭オフセットも `line_start_offsets` へ
+- 実測: 4 通り（CRLF / LF / 混在 / 末尾改行なし）の往復保存が修正前 FAILED → 修正後 緑・番犬 `issue1650_line_ending_watchdog` 8 本へ注入 12 通りすべて file:line 名指しで FAILED → 戻して緑・Windows の腕を強制した全数走 5260 passed・workspace 5261 passed 0 failed・clippy 3 宇宙 0

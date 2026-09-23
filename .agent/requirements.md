@@ -1729,7 +1729,10 @@ FR-3.5 実装メモ（2026-07-12、#126）:
   BS / Delete は 2 バイトまとめて消す）。新しく足す改行（Enter・挿入・置換）だけが
   `LineEnding::detect` の**多数派**に揃うので、**既存行の改行は 1 バイトも書き換わらない**
   （混在ファイルは編集した行だけが多数派になり、他の行は原文のまま = 開いて保存すれば
-  バイト一致）。改行を 1 つも持たないファイルはそのプラットフォームの流儀。
+  バイト一致）。改行を 1 つも持たないファイル（空ファイル / 改行 0 の 1 行）だけは
+  `LineEnding::for_new_file(Platform)` = **OS の流儀**（macOS = LF / Windows = CRLF。
+  VS Code の `files.eol: auto` と同じ）。`Platform` を引数で受ける純関数なので
+  **macOS 上からでも Windows の腕を検査できる**（`platform::keys` と同じ型）。
   単独の `\r` は行区切りではなく行内の制御文字として素通しする。番犬は
   `crates/tako-control/tests/issue1650_line_ending_watchdog.rs`
 - **保存競合**: 編集開始時の元バイト列を保持し、保存直前のファイル内容と完全比較する。

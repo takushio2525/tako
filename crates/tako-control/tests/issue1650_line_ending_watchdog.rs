@@ -19,7 +19,9 @@
 //! 3. [`行末判定はcrを行内文字に数えない`] — End が CR の後ろへ戻る
 //! 4. [`カーソルはcrとlfのあいだに入らない`] — 行末判定を直しても外から指されうる
 //! 5. [`ファイルを開くとき改行コードを検出する`] — 検出が消えると全ファイルが既定の流儀になる
-//! 6. [`本番コードは改行リテラルを直接挿さない`] — 新しい挿入経路が `\n` を直書きする
+//! 6. [`新規ファイルの既定はプラットフォームを引数で受ける`] — `cfg!(windows)` で分けると
+//!    macOS 上から Windows の腕を検査できず、**CI だけが落ちる**（この PR で実際に起きた）
+//! 7. [`本番コードは改行リテラルを直接挿さない`] — 新しい挿入経路が `\n` を直書きする
 //!
 //! 落ちるときは **file:line で名指し**する（直す場所が分からない番犬は直されない）。
 //!
@@ -225,6 +227,34 @@ fn ファイルを開くとき改行コードを検出する() {
     }
 }
 
+/// 5b: 新規ファイルの既定は `Platform` を引数で受ける純関数（macOS から Windows を測れる）
+#[test]
+fn 新規ファイルの既定はプラットフォームを引数で受ける() {
+    let target = target();
+    target.require("for_new_file").must_contain(
+        "Platform::Windows",
+        "改行を持たないファイルの既定は OS で変わる。`cfg!(windows)` で分けると\n\
+         macOS 上から Windows の腕を検査できず、CI だけが落ちる（#1650 で実際に起きた）",
+    );
+    target.require("platform_default").must_contain(
+        "for_new_file",
+        "腕の対応表は `for_new_file` の 1 か所だけが持つ（#1650）",
+    );
+    // 判断が `cfg!` へ散ると引数で受ける意味が消える
+    let mut offenders = Vec::new();
+    for (i, line) in target.code.lines().enumerate() {
+        if line.contains("cfg!(windows)") {
+            offenders.push(format!("{REL}:{}", i + 1));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "`cfg!(windows)` が在る:\n{}\n\n\
+         プラットフォームの分岐は `Platform` を引数で受ける純関数にすること（#1650）",
+        offenders.join("\n")
+    );
+}
+
 /// 6: 新しい挿入経路が改行リテラルを直書きしない
 #[test]
 fn 本番コードは改行リテラルを直接挿さない() {
@@ -279,6 +309,8 @@ fn 番犬の走査が成立している() {
         "open",
         "from_text",
         "normalize_line_endings",
+        "for_new_file",
+        "platform_default",
     ] {
         assert!(
             target.body(name).is_some(),

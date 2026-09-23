@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::platform::support::Platform;
+
 const UNDO_LIMIT: usize = 1000;
 
 /// 改行コード（#1650）。
@@ -57,13 +59,27 @@ impl LineEnding {
         })
     }
 
-    /// 改行を 1 つも持たないファイル用の既定（そのプラットフォームの流儀）
-    pub fn platform_default() -> Self {
-        if cfg!(windows) {
-            Self::Crlf
-        } else {
-            Self::Lf
+    /// 改行を 1 つも持たないファイルで使う改行コード（#1650）。
+    ///
+    /// ここに来るのは**空ファイルと「改行 0 の 1 行ファイル」だけ**（改行が 1 つでも
+    /// あれば [`Self::detect`] が勝つ）。本文の中に手掛かりが無いので、主要エディタと
+    /// 同じく **OS の流儀に従う**（VS Code の `files.eol: auto` / Visual Studio /
+    /// メモ帳）。Windows の利用者が tako で作った新規ファイルを他の Windows ツールで
+    /// 開いたときに驚きが無いことを優先する（tako はゼロコンフィグが最優先の設計原則）。
+    ///
+    /// `platform` を**引数で受ける**ので、macOS 上からでも Windows 側の腕を検査できる
+    /// （`platform::keys` と同じ型。これが無いと「Windows でどうなるか」を
+    /// 実機無しに固定できない = #1650 で実際に CI だけが落ちた）
+    pub fn for_new_file(platform: Platform) -> Self {
+        match platform {
+            Platform::MacOs => Self::Lf,
+            Platform::Windows => Self::Crlf,
         }
+    }
+
+    /// 実行中のプラットフォームでの [`Self::for_new_file`]
+    pub fn platform_default() -> Self {
+        Self::for_new_file(Platform::current())
     }
 
     /// 検出できなければ [`Self::platform_default`] へ倒す
@@ -740,8 +756,12 @@ mod tests {
         assert_eq!(buffer.text(), "a本語z");
         buffer.delete_forward();
         assert_eq!(buffer.text(), "a語z");
+        // 本文に改行が 1 つも無いので改行コードは新規ファイルの既定（OS で変わる。#1650）。
+        // 期待値は**製品の正**から作る（`\n` を直書きすると Windows でだけ落ちる）。
+        // 既定そのものの腕は `新規ファイルの改行コードはプラットフォームで決まる` が固定する
+        let eol = buffer.line_ending().as_str();
         buffer.insert("界\n");
-        assert_eq!(buffer.text(), "a界\n語z");
+        assert_eq!(buffer.text(), format!("a界{eol}語z"));
     }
 
     #[test]
@@ -771,11 +791,17 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         std::fs::write(&path, "").unwrap();
         let mut buffer = TextBuffer::open(&path).unwrap();
+        // 空ファイルには改行コードの手掛かりが無いので新規ファイルの既定（OS で変わる。#1650）
+        let eol = buffer.line_ending().as_str();
+        assert_eq!(buffer.line_ending(), LineEnding::platform_default());
         buffer.insert("こんにちは\n");
         assert!(buffer.dirty());
         buffer.save().unwrap();
         assert!(!buffer.dirty());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "こんにちは\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("こんにちは{eol}")
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -1314,6 +1340,32 @@ mod tests {
         // 改行を 1 つも持たないファイルはそのプラットフォームの流儀
         let buffer = TextBuffer::from_text(path("no-newline"), "abc".into());
         assert_eq!(buffer.line_ending(), LineEnding::platform_default());
+    }
+
+    #[test]
+    fn 新規ファイルの改行コードはプラットフォームで決まる() {
+        // **macOS 上からでも Windows の腕を固定する**（#1650。実機が無いと
+        // 「Windows でどうなるか」をテストできず、CI だけが落ちる形になる）
+        assert_eq!(LineEnding::for_new_file(Platform::MacOs), LineEnding::Lf);
+        assert_eq!(
+            LineEnding::for_new_file(Platform::Windows),
+            LineEnding::Crlf
+        );
+        // 実行中の既定はこの純関数と同じ答えでなければならない
+        assert_eq!(
+            LineEnding::platform_default(),
+            LineEnding::for_new_file(Platform::current())
+        );
+        // 改行を持たない本文へ入る `\n` は、その腕どおりに揃う
+        for platform in [Platform::MacOs, Platform::Windows] {
+            let ending = LineEnding::for_new_file(platform);
+            assert_eq!(
+                normalize_line_endings("a\nb", ending),
+                format!("a{}b", ending.as_str()),
+                "{} の新規ファイルへ入る改行",
+                platform.as_str()
+            );
+        }
     }
 
     #[test]
