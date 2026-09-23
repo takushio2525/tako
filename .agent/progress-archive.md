@@ -466,3 +466,4 @@
 - 2026-09-23 #1554: 復元の内訳が全ペインを説明するようにした
 - 2026-09-23 #1278 / #583: CI の Windows の cargo test を blocking にした
 - 2026-09-23 #1547: docs の数値・Issue 参照のズレを直し、docs ビルドと og / リンク検査を CI へ
+- 2026-09-23 #1544: orchestrator projects list を dispatch 経由へ寄せた

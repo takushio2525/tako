@@ -123,6 +123,19 @@ fn local_rules_body(profile: &super::Profile) -> String {
     part.on_demand.to_string()
 }
 
+/// `platform`: この環境で使えない・機能が落ちる操作の理由（#1571）。
+///
+/// 本文は対応マトリクス（`tako_core::platform::support`）からの生成物なので、
+/// **縮退が 1 件増えるたびに伸びる**。prompt へ全文載せていた頃は Windows で
+/// 4110 バイトあり、tako が作る側が取り分（18944 バイト）を 1.7〜2.7 KB 超えて
+/// 利用者の追記の取り分を削っていた。prompt に残すのは件数と引き方だけ（#1154 の作法）。
+///
+/// プロファイルには依らない（見るのは実行中のプラットフォーム）が、tako の
+/// リポジトリに本文が無い生成物なので移送の番犬の対象外 = `Dynamic` で持つ
+fn platform_body(_profile: &super::Profile) -> String {
+    crate::platform::facts::PlatformFacts::current().full_section()
+}
+
 /// 手順書の一覧（**正本**。prompt の topic 表と一致していることを番犬が見る）
 pub const GUIDES: &[Guide] = &[
     Guide {
@@ -231,6 +244,15 @@ pub const GUIDES: &[Guide] = &[
         title: "This Machine's Local Rules (on-demand part)",
         restores: &[],
         body: GuideBody::Dynamic(local_rules_body),
+    },
+    Guide {
+        topic: "platform",
+        // #1571: 縮退の理由の全文。差し戻し（A/B）は `TAKO_1571_LEGACY` 側で
+        // **生成と同じ 1 実装**（`PlatformFacts::notes_section_in`）が行うので
+        // `restores` は空（ここから戻すと platform 片が二重に出る）
+        title: "What Is Degraded on This Platform",
+        restores: &[],
+        body: GuideBody::Dynamic(platform_body),
     },
 ];
 

@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-23（#1544: orchestrator projects list を dispatch 経由へ寄せた）
-- `add` / `remove` は #1453 で dispatch へ寄せたのに `list` だけ `ProjectsConfig::load()` の直読みが残っていた（同じ関数に「直したもの」と「残したもの」が並ぶ = #1453 で実際に壊れた形）。3 分岐すべてを `dispatch_orchestrator_projects` の 1 本へ
-- 実測: 隔離 `TAKO_ORCHESTRATOR_DIR` での前後 A/B **7 ケースすべて stdout / stderr / exit がバイト一致**（未登録 / 空 / 3 件 / 桁境界 15・16・17 + 日本語キー / 空 desc / 壊れた YAML=exit 1 / 空ファイル）。本番 projects.yaml は sha256 一致で無改変
-- 番犬 `issue1544_projects_dispatch_watchdog` 3 本（注入 4 通り + 空振り検査）。直読みを戻す注入で `main.rs:4537` を名指しして FAILED → 戻して緑
-
 ## 2026-09-23（#1504: Windows のシェル統合を tako setup の段として入れた）
 - `shell_integration::install()` の呼び手が CLI と MCP だけで **setup も installer も呼んでいなかった**（棚卸し Z9）ので、Windows は人が `tako shell-integration install` を打つまで OSC 7 / 133・cwd 追従・入力予測・自動命名の素材が死んでいた。段を `tako setup`（bootstrap より前）と `--check` へ 1 実装で通し、**配置が要るかは `cfg!(windows)` ではなく `Delivery` で分岐**させたので、macOS 上でも Profile 経路の表示・冪等・失敗を全部検査できる（実機を持たない CI の穴を作らない）
 - 倒した判断: ユーザーのファイルへ書く前に「何をどこへ」を出して**同意扱いで続行**（`[y/N]` を出さない = `--yes` / 非 TTY / 端末ありで出力が一致。先例は #1502 の PATH 設置）／失敗は `RemainingKind::ShellIntegration` として末尾へ（段は `Result` を返さないので `?` で setup を止められない）／2 回目は予告も出さず差分ゼロ
@@ -59,3 +54,8 @@
 - `config_share::env::probe_path` が `std::fs::canonicalize`（Windows は verbatim `\\?\C:\…`）の戻りを `git rev-parse --show-toplevel` の戻りへ `Path::strip_prefix` していた。成分単位の比較で `Prefix(VerbatimDisk)` と `Prefix(Disk)` は別物なので必ず `Err` → `unwrap_or_default()` が `repo_rel` を黙って空文字にし、`tako config` の外部管理検出（#513）で `same_place` が常に false 側へ倒れていた。解決は境界（B26）へ（`resolved` は git の cwd として**子プロセスへ渡る** = #970 そのもの）
 - 表記の食い違いは新設の `tako_core::platform::path::relative_under` が吸収する（verbatim を**無条件で**落とす / `/` と `\` の両方で成分を割る / ドライブ文字だけ大小無視 / 配下でなければ `None`）。剥がす条件を付けないのは戻りが相対表記で Win32 へ渡らないため。`cfg` 無しなので macOS から Windows 形を検査できる。`platform_parity` の許可リストは 2 → 1 件（残る 1 件 = `same_dir` は両辺が同じ関数なので「比較キー専用」の例外が成り立つ）
 - 実測: 純粋関数テスト 4 本（`\\?\C:\repo\home\.claude` + `C:/repo` → `home/.claude`）・注入 5 通りすべて FAILED → 戻して緑・CI の Windows 実機で該当テストが `ok`（`#[cfg_attr(windows, ignore)]` を除去。5127 passed 0 failed）・workspace 5177 passed 0 failed・clippy 3 宇宙 0・check-windows error 0
+
+## 2026-09-23（#1571: Windows の master system prompt を予算内へ戻した）
+- `{{platform_notes}}` が縮退理由を**全文**並べており Windows で `platform` 片 4110 B・tako が作る側が取り分（18944 B）を 1.7〜2.7 KB 超過（CI 実測 20708 / 21420 / 21639 = そのぶん利用者の追記の取り分が削られる）。#1154 / #1477 の作法で prompt には件数と引き方だけを残し、全文は動的 topic `platform` へ。短縮形・手順書・A/B は `PlatformFacts`（`notes_section_in` / `full_section_in`）の 1 実装を共有
+- 番犬が**実機でしか測れない**のが元凶なので `Platform` を prompt 組み立てまで引数で通し（`system_prompt_pieces_on` ほか）、`prompt_budget_1477` は macOS / Windows 両方の形を測る。#1278 の `#[cfg_attr(windows, ignore)]` は外した。行き先が変わった既存番犬 2 件も追従（`platform_parity` の単一ソース検査 / MCP カタログ snapshot）
+- 実測: platform 片 4110 → 412 B・base 20709→17118 / 21421→17830 / 21640→18049（同一バイナリで旧テンプレート + A/B から main を再現）・A/B `TAKO_1571_LEGACY=1` で番犬 4 件 FAILED → 戻して緑・CI の Windows 実機で `prompt_budget_1477` が ok・clippy 3 宇宙 0・check-windows error 0
