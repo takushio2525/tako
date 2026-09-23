@@ -707,6 +707,11 @@ fn preview_edit_reply(host: &dyn ControlHost, target: PaneId) -> Value {
     if let Some(document) = host.preview_document(target) {
         out["document"] = document;
     }
+    // #1649: カーソル行が可視範囲に入っているかを応答で読めるようにする。
+    // 位置そのものは `document.cursor` が持つので、ここは器の側の事実だけを足す
+    if let Some(viewport) = host.preview_viewport(target) {
+        out["viewport"] = viewport;
+    }
     out
 }
 
@@ -15629,6 +15634,17 @@ mod tests {
                     .unwrap_or((false, false)),
             )
         }
+        /// #1649: 器の寸法を持たないモックでも「応答へ載るか」は測れるので、
+        /// 編集セッションがあるときだけ固定の形を返す（値の正しさは
+        /// `tako_core::editor_scroll` の単体テストと visual-test 節が見る）
+        fn preview_viewport(&self, pane: PaneId) -> Option<serde_json::Value> {
+            self.preview_edits.get(&pane.as_u64())?;
+            Some(json!({
+                "first_visible_line": 1,
+                "last_visible_line": 1,
+                "visible": true,
+            }))
+        }
         fn set_preview_editing(&mut self, pane: PaneId, enabled: bool) -> Result<(), String> {
             if !self.previews.contains_key(&pane.as_u64()) {
                 return Err("プレビューペインではない".into());
@@ -18885,6 +18901,9 @@ mod tests {
         .unwrap();
         assert_eq!(started["editing"].as_bool(), Some(true));
         assert_eq!(started["dirty"].as_bool(), Some(false));
+        // #1649: カーソル行が可視範囲に入っているかを GUI の外から読める
+        assert_eq!(started["viewport"]["visible"].as_bool(), Some(true));
+        assert_eq!(started["viewport"]["first_visible_line"].as_u64(), Some(1));
 
         let applied = dispatch(
             &mut host,

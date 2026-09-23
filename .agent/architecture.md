@@ -1725,6 +1725,52 @@ syntect へ通していた**。release 実測（同じ構文セット・テー�
   `scripts/test-edit-range-1658.sh`（隔離 GUI で 5,000 行の 1 行を差し替えて他の行の
   バイト一致まで見る。CI には載せない）
 
+## 編集カーソルの追従スクロール（#1649。2026-09-23）
+
+編集モードのプレビューには `ListState` へ「カーソルを見せる」スクロールの呼び出しが
+**1 件も無かった**（`preview_render.rs` にあったのは再構築時の位置保持だけ）。打鍵・
+矢印の連打・⌘F のヒットへ飛ぶ・undo / redo・貼り付けのどれでもカーソルが画面外へ
+出たまま戻らず、連鎖して IME の未確定下線も消えていた。
+
+- **判断は `tako_core::editor_scroll` の純関数**が持つ（`LineViewport` +
+  `follow_cursor` + `cursor_row_in_viewport`）。UI 層は器の寸法を測って渡すだけ。
+  UI 層に算術を置かない理由は 2 つ: 器が 2 種類あるから（#821 の仮想リストと
+  `TAKO_821_NO_VIRTUAL_LIST=1` の div スクロール。片方だけ直すと A/B で消える）と、
+  実ピクセルを持たないテストで「可視範囲に入ったか」を固定できるから
+- 余白は上下 **3 行**（`FOLLOW_MARGIN`）。0 だとカーソルが器の端に貼り付き、
+  次に打つ 1 文字の行き先が見えない。視野が狭いときは `effective_margin` が
+  `2m + 1 <= 視野` まで詰める（詰めないと上へ寄せる条件と下へ寄せる条件が同時に
+  成り立ち、毎フレーム動き続ける）
+- 器へ渡すのは**論理位置**（item 番号）。`scroll_to_item` 系は描画済みの子矩形しか
+  知らないので 5,000 行先へは飛べない（#232 の目次ジャンプと同じ理由）
+- 呼ぶのは `refresh_preview_from_editor`（編集で状態が動く**全経路**の要）と、
+  そこを通らない 2 つ = `preview_search_local`（ヒットへ飛ぶだけで本文を組み直さない）と
+  `replace_and_mark_text_in_range`（IME の変換開始はバッファを触らない）
+- **IME の 1 フレーム問題**: 行の `TextLayout` が控えられるのは paint（#821 の仮想リストは
+  高さの見積もりだけで item を解くことがあり、prepaint を通っていない `TextLayout` は
+  `bounds()` で panic するため）。だから追従を要求した直後の 1 フレームはカーソル行の
+  レイアウトが無い。旧実装はそこで `?` で抜けてターミナル枝へ落ちていたが、プレビュー
+  ペインに端末は無いので `pane_cursor_origin_for_ime` も None = 下線と候補ウィンドウの
+  除外領域が消えた。いまは `preview_pending_cursor_origin` が「可視化後にカーソル行が
+  来る位置」を器の実測値から出し、**プレビュー本文の中に必ずアンカーを残す**
+- **編集開始のキャレットは「見ている行」へ置く**（`set_preview_editing_local`）。
+  `EditState::open` はオフセット 0 から始めるので、そのまま追従させると 3,000 行目を
+  見ている状態で編集を始めた途端に器が先頭へ戻る。器がまだ描かれていない
+  （CLI / MCP から開いた直後）ときは 0 のまま = 従来と同じ
+- 追従の効きは応答の `viewport`（`first_visible_line` / `last_visible_line` /
+  `visible`）で GUI の外から読める。**カーソルの位置自体は載せない**（#1658 の
+  `document.cursor` が正本）。置き場は `dispatch::preview_edit_reply` の 1 実装なので、
+  編集系の応答すべて（#1658 の `PreviewEditRange` / `PreviewCursor` を含む）に付く
+- 回帰検出は番犬 `issue1649_cursor_follow_watchdog`（6 規則・注入 9 通り）+
+  `editor_scroll` の単体 11 本 + `preview_render` の単体 2 本 + visual-test 節
+  `cursor-follow`（7 相。実ピクセルではなく器の実測値で見るので画面収録の権限が要らない）。
+  `TAKO_1649_LEGACY=1` で旧挙動（追わない・キャレットは offset 0・IME は画面外で諦める）へ
+  丸ごと戻して同一バイナリ A/B ができ、`scripts/test-cursor-follow-1649.sh` が両腕を回す。
+  **tako-vd 実測**（1512x1440 の面・視野 37 行・4,002 行）: 新 = 7 相すべて `ok=true` /
+  `anchored=true`、旧 = 7 相すべて `ok=false` / `anchored=false`
+- 節の fixture は **`preview::MAX_LINES`（5,000 行）の内側**に置く。超えるとプレビューが
+  `truncated` になり `EditState::open` が編集を断るので、追従の対象にならない
+
 ## コードプレビューの仮想化（#821。2026-08-15）
 
 コードプレビューは**ファイル全行ぶんの element を毎フレーム**作っていた。3,884 行なら

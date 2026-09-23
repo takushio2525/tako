@@ -739,6 +739,15 @@ pub trait PreviewHost {
     fn preview_edit_state(&self, _pane: PaneId) -> Option<(bool, bool)> {
         None
     }
+    /// 本文の器から見た可視範囲と、カーソル行がそこに入っているか（#1649）。
+    ///
+    /// 追従スクロールは内部挙動なので新しい操作は増えないが、**効いているかを
+    /// GUI の外から確かめる**口がないと検証できない。カーソルの位置そのものは
+    /// [`Self::preview_document`] の `cursor` が持つので、ここは器の側の事実だけ。
+    /// 器の寸法を持たないホスト（テストのモック・ヘッドレス）は None のままでよい
+    fn preview_viewport(&self, _pane: PaneId) -> Option<serde_json::Value> {
+        None
+    }
     /// 編集モード切替。開始時のファイル読み込み・UTF-8 検査は実装側が core API で行う。
     fn set_preview_editing(&mut self, _pane: PaneId, _enabled: bool) -> Result<(), String> {
         Err("プレビュー編集は未対応".into())

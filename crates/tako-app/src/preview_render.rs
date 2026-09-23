@@ -54,6 +54,16 @@ pub(crate) fn preview_virtual_list_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("TAKO_821_NO_VIRTUAL_LIST").is_some())
 }
 
+/// 編集カーソルの追従スクロール（#1649）を切って同じバイナリで A/B を取る逃げ道
+/// （`TAKO_1649_LEGACY=1`）。旧挙動 = カーソルが画面外へ出ても器を動かさない。
+///
+/// visual-test 節 `cursor-follow` の検出力の実証に使う（同じバイナリを 2 回走らせ、
+/// `TAKO_VISUAL_PIXEL: cursor-follow …` の行を並べると「追わない」と「追う」の
+/// 差がそのまま出る）。`OnceLock` に載せず毎回読むのは、節の途中で倒せるようにするため
+pub(crate) fn cursor_follow_legacy() -> bool {
+    std::env::var_os("TAKO_1649_LEGACY").is_some()
+}
+
 /// Markdown プレビューの仮想リスト（#826）を切って同じバイナリで A/B を取る逃げ道
 /// （`TAKO_826_NO_MD_VIRTUAL_LIST=1`）。旧挙動 = 全ブロックの element を毎フレーム作る。
 ///
@@ -3712,6 +3722,112 @@ impl TakoApp {
             .map(gpui::ScrollHandle::bounds)
     }
 
+    /// コード本文の器から「先頭可視行」と「使える高さ（論理 px）」を採る（#1649）。
+    ///
+    /// 器は 2 種類ある（#821 の仮想リストと `TAKO_821_NO_VIRTUAL_LIST=1` の div
+    /// スクロール）。どちらも 1 item = 1 行なので item 番号と行番号が一致する。
+    /// md の器（1 item = 1 ブロック）は行番号で指せないので対象外
+    fn preview_body_view_metrics(&self, pane_id: PaneId) -> Option<(usize, f32)> {
+        let pad = PREVIEW_BODY_PADDING * 2.0;
+        match self.preview_body_lists.get(&pane_id) {
+            Some((list, PreviewBodyKind::Code, _)) => Some((
+                list.logical_scroll_top().item_ix,
+                f32::from(list.viewport_bounds().size.height) - pad,
+            )),
+            Some(_) => None,
+            None => {
+                let handle = self.preview_scroll_handles.get(&pane_id)?;
+                // 子矩形をまだ知らないハンドルの `top_item` は常に 0（= 実際の位置と
+                // 無関係）なので、そのまま判断材料にしない
+                handle.bounds_for_item(0)?;
+                Some((
+                    handle.top_item(),
+                    f32::from(handle.bounds().size.height) - pad,
+                ))
+            }
+        }
+    }
+
+    /// いま本文のいちばん上に見えている行（#1649。編集を始める瞬間の
+    /// キャレットの置き場に使う）
+    pub(crate) fn preview_first_visible_line(&self, pane_id: PaneId) -> Option<usize> {
+        self.preview_body_view_metrics(pane_id)
+            .map(|(first, _)| first)
+    }
+
+    /// 編集カーソルの位置と、**行の単位で見た**本文の可視範囲（#1649）。
+    ///
+    /// 器は 2 種類ある（#821 の仮想リストと `TAKO_821_NO_VIRTUAL_LIST=1` の div
+    /// スクロール）ので、どちらからも「先頭可視行」と「器の高さ」を採って
+    /// 行の単位へ揃えてから返す。判断そのものは
+    /// [`tako_core::editor_scroll`] の純関数が持つ。
+    ///
+    /// 編集セッションがあってコード本文を出しているときだけ返す。編集は
+    /// `apply_editor_text` が必ず `PreviewMode::Code` へ倒すので、編集中の器は常に
+    /// コードのリスト（1 item = 1 行）で、item 番号と行番号が一致する。
+    /// 閲覧中の ⌘F（編集セッションだけ開く経路）でも同じ器なのでそのまま効く
+    pub(crate) fn preview_cursor_viewport(
+        &self,
+        pane_id: PaneId,
+    ) -> Option<(usize, tako_core::editor_scroll::LineViewport)> {
+        let edit = self.preview_edits.get(&pane_id)?;
+        let preview::PreviewContent::Code(lines) =
+            self.previews.get(&pane_id).map(|s| &s.content)?
+        else {
+            return None;
+        };
+        let cursor_line = edit.buffer.line_byte_col(edit.buffer.cursor()).0;
+        let (first_visible, height) = self.preview_body_view_metrics(pane_id)?;
+        Some((
+            cursor_line,
+            tako_core::editor_scroll::LineViewport::from_pixels(
+                first_visible,
+                lines.len(),
+                height,
+                self.theme.line_height,
+            ),
+        ))
+    }
+
+    /// 編集カーソルを可視範囲へ追わせる（#1649）。戻り値 = 実際に器を動かしたか。
+    ///
+    /// 編集で状態が動く経路はすべて [`TakoApp::refresh_preview_from_editor`] を
+    /// 通るので、打鍵・矢印・改行・BS / Del・貼り付け・undo / redo・IME 確定・
+    /// CLI / MCP の `PreviewApply` がここ 1 か所で効く。カーソルだけが動く経路
+    /// （検索ヒットへの移動・IME の変換開始）は本文を組み直さないので、
+    /// そちらからも直接呼ぶ。
+    ///
+    /// 器へ渡すのは**論理位置**（item 番号）なので、まだ 1 度も描かれていない行へも
+    /// 届く（スクロールハンドルの実測矩形しか知らない `scroll_to_item` では
+    /// 5,000 行先へ飛べない）。#232 の目次ジャンプと同じ作り
+    pub(crate) fn follow_preview_cursor(&mut self, pane_id: PaneId) -> bool {
+        if cursor_follow_legacy() {
+            return false;
+        }
+        let Some((cursor_line, view)) = self.preview_cursor_viewport(pane_id) else {
+            return false;
+        };
+        let Some(first) = tako_core::editor_scroll::follow_cursor(
+            view,
+            cursor_line,
+            tako_core::editor_scroll::FOLLOW_MARGIN,
+        ) else {
+            return false;
+        };
+        if let Some((list, PreviewBodyKind::Code, _)) = self.preview_body_lists.get(&pane_id) {
+            list.scroll_to(gpui::ListOffset {
+                item_ix: first,
+                offset_in_item: px(0.0),
+            });
+            true
+        } else if let Some(handle) = self.preview_scroll_handles.get(&pane_id) {
+            handle.scroll_to_top_of_item(first);
+            true
+        } else {
+            false
+        }
+    }
+
     /// 仮想リストが並べているのが Markdown ブロックなら、その `ListState`（#826）。
     ///
     /// 目次ジャンプ（#232）のように「ブロック番号で位置を指す」操作は、
@@ -4795,5 +4911,80 @@ mod tests {
         assert!(r.is_empty());
         let r = search_hits_for_line(&hits, 0, 4, 9);
         assert_eq!(r, vec![(0, 1, true), (4, 5, false)]);
+    }
+
+    // --- #1649: 編集カーソルの追従スクロール ------------------------------
+
+    /// 算術（`tako_core::editor_scroll`）が出した先頭可視行を、器
+    /// （`gpui::ListState`）が**その論理位置として受け取る**ことを実機の器で確かめる。
+    ///
+    /// ここが噛み合っていないと、純関数が正しくても画面は動かない
+    /// （`scroll_to_item` 系は描画済みの子矩形しか知らないので 5,000 行先へ飛べない）。
+    /// `ListState` は `App` を要らない部分だけで組めるので、窓なしで測れる
+    #[test]
+    fn 追従の結果を器の論理位置として渡せる() {
+        use tako_core::editor_scroll::{follow_cursor, LineViewport, FOLLOW_MARGIN};
+
+        let list = gpui::ListState::new(5000, gpui::ListAlignment::Top, px(600.0));
+        // 旧挙動（`scroll_to` を 1 度も呼ばない）は先頭のまま
+        assert_eq!(list.logical_scroll_top().item_ix, 0);
+
+        // 600px の器・1 行 18px = 33 行見えている状態で 4,900 行目へ飛ぶ
+        let view = LineViewport::from_pixels(0, 5000, 600.0, 18.0);
+        assert_eq!(view.visible_lines, 33);
+        let first = follow_cursor(view, 4900, FOLLOW_MARGIN).expect("画面外なので動く");
+        list.scroll_to(gpui::ListOffset {
+            item_ix: first,
+            offset_in_item: px(0.0),
+        });
+        assert_eq!(
+            list.logical_scroll_top().item_ix,
+            first,
+            "器が論理位置を受け取っていない"
+        );
+        let moved = LineViewport {
+            first_visible: list.logical_scroll_top().item_ix,
+            ..view
+        };
+        assert!(moved.contains(4900), "追従後もカーソル行が見えない");
+        assert_eq!(moved.last_visible() - 4900, FOLLOW_MARGIN);
+        // 収束する（次のフレームでもう一度判断しても動かさない）
+        assert_eq!(follow_cursor(moved, 4900, FOLLOW_MARGIN), None);
+    }
+
+    /// 最終行で Enter を連打したときの形（行が増えながらカーソルが末尾を追う）。
+    /// 末尾より先へ器を送らないことと、追従が収束することを見る
+    #[test]
+    fn 最終行の改行連打で末尾より先へ送らない() {
+        use tako_core::editor_scroll::{follow_cursor, LineViewport, FOLLOW_MARGIN};
+
+        let visible = 10;
+        let mut first = 0usize;
+        for total in 5..40 {
+            // 改行を打った直後 = カーソルは最終行、行数は total
+            let view = LineViewport {
+                first_visible: first,
+                visible_lines: visible,
+                total_lines: total,
+            };
+            let cursor = total - 1;
+            if let Some(next) = follow_cursor(view, cursor, FOLLOW_MARGIN) {
+                first = next;
+            }
+            let moved = LineViewport {
+                first_visible: first,
+                ..view
+            };
+            assert!(moved.contains(cursor), "total={total} で最終行が見えない");
+            assert!(
+                first <= view.max_first_visible(),
+                "total={total} で末尾より先へ送った（first={first}）"
+            );
+            assert_eq!(
+                follow_cursor(moved, cursor, FOLLOW_MARGIN),
+                None,
+                "total={total} で振動する"
+            );
+        }
     }
 }

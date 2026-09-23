@@ -12510,6 +12510,10 @@ impl TakoApp {
             preview::apply_editor_text(state, edit);
         }
         self.sync_preview_selection_from_editor(pane_id);
+        // #1649: カーソルが画面外へ出たままにしない。打鍵・矢印・改行・BS / Del・
+        // 貼り付け・undo / redo・IME 確定・CLI / MCP の `PreviewApply` は
+        // すべてここを通るので、追従は**この 1 か所**で効く
+        self.follow_preview_cursor(pane_id);
     }
 
     fn sync_preview_selection_from_editor(&mut self, pane_id: PaneId) {
@@ -12565,6 +12569,18 @@ impl TakoApp {
         if enabled && !self.preview_edits.contains_key(&pane_id) {
             let state = self.previews.get(&pane_id).expect("上で確認済み");
             let mut edit = preview::EditState::open(state)?;
+            // #1649: 編集を始めた瞬間からキャレットは可視範囲に居なければならない。
+            // `EditState::open` はオフセット 0 から始めるので、3,000 行目を見ている
+            // 状態で編集を始めると追従が先頭へ引き戻す（打つ場所と見ている場所が
+            // 食い違う）。**見ている行の頭**へ置けば追従は 1 行も動かさない。
+            // 器がまだ描かれていない（CLI / MCP から開いた直後）ときは 0 のまま
+            if let Some(line) = (!preview_render::cursor_follow_legacy())
+                .then(|| self.preview_first_visible_line(pane_id))
+                .flatten()
+            {
+                let at = edit.buffer.offset_for_line_byte_col(line, 0);
+                edit.buffer.set_cursor(at, false);
+            }
             if self.preview_remote_origins.contains_key(&pane_id) {
                 // #966: リモートは自動保存を既定 OFF にする。1 回の保存が SFTP の
                 // 3 バッチ（素性 → 内容の突き合わせ → 書き戻し）なので、打鍵ごとに
@@ -12931,10 +12947,36 @@ impl TakoApp {
         }
         let total = edit.search_hits.len();
         let index = if total > 0 { edit.search_index + 1 } else { 0 };
-        Ok(serde_json::json!({
-            "query": edit.search_query,
+        let query = edit.search_query.clone();
+        // #1649: ヒットへ飛んだだけでは本文を組み直さないので、ここから直接追う
+        // （閲覧中の ⌘F も編集セッションを開くので同じ器で効く）
+        self.follow_preview_cursor(pane_id);
+        let mut out = serde_json::json!({
+            "query": query,
             "total": total,
             "index": index,
+        });
+        if let Some(viewport) = self.preview_viewport_json(pane_id) {
+            out["viewport"] = viewport;
+        }
+        Ok(out)
+    }
+
+    /// 本文の器から見た可視範囲を応答へ載せる形（#1649）。
+    ///
+    /// 「カーソル行が見えているか」を **GUI の外から機械で読める**ようにするための口。
+    /// 追従スクロールは内部挙動なので新しい操作は要らないが、効いているかどうかは
+    /// 見えないと確かめられない（visual-test は同一プロセスから読めるが、
+    /// CLI / MCP からは読めなかった）。
+    ///
+    /// **カーソルの位置そのものは載せない**。`document.cursor`（#1658）が正本なので、
+    /// ここは器の側の事実（どこからどこまで見えていて、カーソル行が入っているか）だけ
+    fn preview_viewport_json(&self, pane_id: PaneId) -> Option<serde_json::Value> {
+        let (line, view) = self.preview_cursor_viewport(pane_id)?;
+        Some(serde_json::json!({
+            "first_visible_line": view.first_visible + 1,
+            "last_visible_line": view.last_visible().min(view.total_lines.saturating_sub(1)) + 1,
+            "visible": view.contains(line),
         }))
     }
 
@@ -13662,6 +13704,64 @@ impl TakoApp {
         }
     }
 
+    /// プレビュー編集のカーソル左上（ウィンドウ座標）。#1649
+    ///
+    /// カーソル行の `TextLayout` が控えられていれば列までの実描画幅から出す
+    /// （`cell_at` の逆写像。全角混在でもずれない）。まだ無ければ
+    /// [`Self::preview_pending_cursor_origin`] の見積もりへ倒す
+    fn preview_cursor_origin(&self, pane: PaneId) -> Option<Point<Pixels>> {
+        let edit = self.preview_edits.get(&pane).filter(|edit| edit.editing)?;
+        let (line, byte_col) = edit.buffer.line_byte_col(edit.buffer.cursor());
+        let shaped = self
+            .preview_line_texts
+            .get(&pane)
+            .and_then(|texts| texts.get(line))
+            .and_then(|text| {
+                let col = snap_to_char_boundary(text, byte_col.min(text.len()));
+                self.preview_text_layouts
+                    .get(&pane)?
+                    .get(line)?
+                    .as_ref()?
+                    .position_for_index(col)
+            });
+        shaped.or_else(|| {
+            // A/B（`TAKO_1649_LEGACY=1`）では #1649 前の挙動を忠実に再現する
+            // = 画面外で諦める（visual-test 節 `cursor-follow` の相 (6) が
+            // 「下線のアンカーを失う」ことを実測して検出力を示す）
+            if preview_render::cursor_follow_legacy() {
+                return None;
+            }
+            self.preview_pending_cursor_origin(pane)
+        })
+    }
+
+    /// 追従スクロール（#1649）でカーソル行が来る位置の見積もり。
+    ///
+    /// **行のレイアウトは paint でしか控えられない**（#821 の仮想リストは高さの
+    /// 見積もりだけで item を解くことがあり、prepaint を通っていない `TextLayout` は
+    /// `bounds()` で panic する）。だから追従を要求した直後の 1 フレームは、
+    /// カーソル行のレイアウトがまだ無い。そのフレームで諦めると下線が消えるので、
+    /// 「可視化後にカーソル行が来る位置」を器の実測値から出しておく。
+    ///
+    /// x は本文の左端（列までの実描画幅はレイアウトが無いと出せない）。1 フレーム後には
+    /// 実測の位置へ吸い付くので、下線が本文の外へ出ないことだけを保証する
+    fn preview_pending_cursor_origin(&self, pane: PaneId) -> Option<Point<Pixels>> {
+        let (cursor_line, view) = self.preview_cursor_viewport(pane)?;
+        let bounds = self.preview_viewport_bounds(pane)?;
+        if f32::from(bounds.size.height) <= 0.0 {
+            return None;
+        }
+        let row = tako_core::editor_scroll::cursor_row_in_viewport(
+            view,
+            cursor_line,
+            tako_core::editor_scroll::FOLLOW_MARGIN,
+        );
+        Some(point(
+            bounds.origin.x,
+            bounds.origin.y + px(self.theme.line_height * row as f32),
+        ))
+    }
+
     /// 指定ペインのカーソルセル左上（ウィンドウ座標）。
     /// スクロールバック表示中などカーソル非表示のときは None
     /// ペインのカーソル左上のウィンドウ座標。x は描画と同じ shaping で求める
@@ -13669,12 +13769,16 @@ impl TakoApp {
     /// 線形換算だと打ち進めるほど IME 候補ウィンドウ・未確定文字列が右へずれていく
     /// （2026-06-12 実機リグレッション (5) の根本原因）
     fn pane_cursor_origin(&self, pane: PaneId, _window: &mut Window) -> Option<Point<Pixels>> {
-        if let Some(edit) = self.preview_edits.get(&pane).filter(|edit| edit.editing) {
-            let (line, byte_col) = edit.buffer.line_byte_col(edit.buffer.cursor());
-            let text = self.preview_line_texts.get(&pane)?.get(line)?;
-            let byte_col = snap_to_char_boundary(text, byte_col.min(text.len()));
-            let layout = self.preview_text_layouts.get(&pane)?.get(line)?.as_ref()?;
-            return layout.position_for_index(byte_col);
+        if self
+            .preview_edits
+            .get(&pane)
+            .is_some_and(|edit| edit.editing)
+        {
+            // #1649: プレビュー編集のペインは**必ずプレビュー本文の中で答える**。
+            // ここで None を返すとターミナル枝へ落ちるが、プレビューペインには端末が
+            // 無いので `pane_cursor_origin_for_ime` も None になり、未確定文字列の
+            // 下線と候補ウィンドウの除外領域がそのフレームだけ消える
+            return self.preview_cursor_origin(pane);
         }
         let (_, area) = self.pane_text_areas.iter().find(|(id, _)| *id == pane)?;
         let cell = self.cell_size_for_pane(pane)?;
@@ -22189,6 +22293,10 @@ impl PreviewHost for TakoApp {
         )
     }
 
+    fn preview_viewport(&self, pane: PaneId) -> Option<serde_json::Value> {
+        self.preview_viewport_json(pane)
+    }
+
     fn set_preview_editing(&mut self, pane: PaneId, enabled: bool) -> Result<(), String> {
         self.set_preview_editing_local(pane, enabled)
     }
@@ -23018,6 +23126,13 @@ impl EntityInputHandler for TakoApp {
                 text: new_text.to_string(),
                 selected_utf16: new_selected_range,
             });
+        }
+        // #1649: プレビュー編集宛ての変換は、下線を出す前にカーソル行を可視へ寄せる。
+        // 変換開始はバッファを触らないので本文の組み直しが走らず、ホイールで離れた
+        // 位置から変換を始めると下線のアンカーが採れない（カーソル行のレイアウトが
+        // 無い = 画面外）。IM への座標再通知より先に器を動かしておく
+        if let Some(pane) = self.ime.as_ref().map(|ime| ime.pane) {
+            self.follow_preview_cursor(pane);
         }
         // 未確定文字列が伸び縮みするたびに IM へ文字座標を再通知する。
         // Windows は `ImmSetCandidateWindow` によるプッシュが必要で、これが無いと
@@ -34689,6 +34804,378 @@ mod self_test {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 編集カーソルが画面外へ出たままにならないか（#1649）。
+    ///
+    /// 実ピクセルではなく**レイアウト値**（先頭可視行・末尾可視行・カーソル行）で
+    /// 見るので、画面収録の権限に依らない。器（`ListState`）が実際に描かれた高さを
+    /// 持っていることだけが前提なので、仮想ディスプレイ上の隔離インスタンスで
+    /// 走らせれば実測になる。
+    ///
+    /// `TAKO_1649_LEGACY=1` を付けた同じバイナリの実行と並べると、
+    /// 「追わない（ok=false）」と「追う（ok=true）」の差がそのまま出る
+    /// = この節の検出力の実証。**旧挙動の側も自分で期待値を持つ**ので、
+    /// どちらの腕も終了コード 0 で終わる。
+    #[cfg(feature = "visual-test")]
+    async fn cursor_follow_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        use tako_core::editor_scroll::FOLLOW_MARGIN;
+
+        inject_section_failure("cursor-follow");
+        ensure_fresh_scene(window, cx, "cursor-follow").await;
+        let legacy = preview_render::cursor_follow_legacy();
+        let dir = std::env::temp_dir().join(format!("tako-visual-cursor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("visual-test cursor 一時ディレクトリ");
+        let path = dir.join("follow.rs");
+        // 行の頭に一意な目印を置き、⌘F 相当の検索で端から端へ飛ばす。
+        // **`preview::MAX_LINES`（5,000 行）を超えない**のが要点: 超えると
+        // プレビューが `truncated` になり `EditState::open` が
+        // 「末尾を省略した大きいファイルは安全のため編集できない」で断る
+        // （編集セッションが無いと追従の対象にならず、節が相 (0) で止まる）
+        const MARKS: usize = 4000;
+        let mut source = String::from("fn main() {\n");
+        for i in 0..MARKS {
+            source.push_str(&format!("    let mark_{i:04} = {i}; // line {i}\n"));
+        }
+        source.push_str("}\n");
+        std::fs::write(&path, &source).expect("visual-test cursor fixture");
+        let total_lines = source.lines().count();
+        // 目印 `mark_N` が載る文書の行番号（0 始まり。先頭の `fn main() {` が 1 行ぶん）
+        let mark_line = |n: usize| n + 1;
+
+        let pane = window
+            .update(cx, |app, _, cx| {
+                let base = app.focused_pane().as_u64();
+                let opened = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::OpenFile {
+                        pane: Some(base),
+                        path: path.display().to_string(),
+                        mode: Some(tako_control::protocol::PreviewModeWire::Code),
+                        direction: Some(tako_control::protocol::Direction::Right),
+                        focus: Some(true),
+                        new_tab: false,
+                        // #1676 の着地行指定は使わない（この節は自分でホイールを送って
+                        // 「見ている場所」を作るので、開いた直後は先頭のままにする）
+                        line: None,
+                        column: None,
+                    },
+                    PaneOrigin::Cli,
+                )
+                .expect("visual-test cursor を dispatch で開ける");
+                cx.notify();
+                PaneId::from_raw(opened["pane"].as_u64().expect("OpenFile 応答の pane"))
+            })
+            .unwrap_or_else(|_| fail("visual-test cursor dispatch"));
+        check(
+            wait_for_preview_maps(any, window, cx, pane, false).await,
+            "visual-test カーソル追従: 座標キャッシュが揃う",
+        );
+        // 矢印キーの相は `focused_pane()` を見るので、対象ペインを明示的に掴んでおく
+        window
+            .update(cx, |app, _, cx| {
+                let _ = app.workspace.active_tab_mut().tree_mut().focus(pane);
+                cx.notify();
+            })
+            .ok();
+        notify_and_draw(any, window, cx);
+
+        // 器の実測値から見た「いま何行目が見えているか」。描画を 1 フレーム回してから
+        // 採るので、`scroll_to` の要求が反映された後の状態になる
+        let observe = |cx: &mut AsyncApp| -> (usize, usize, usize, usize, bool) {
+            notify_and_draw(any, window, cx);
+            window
+                .update(cx, |app, _, _| {
+                    let Some((line, view)) = app.preview_cursor_viewport(pane) else {
+                        return (0, 0, 0, 0, false);
+                    };
+                    (
+                        line,
+                        view.first_visible,
+                        view.last_visible(),
+                        view.visible_lines,
+                        view.contains(line),
+                    )
+                })
+                .unwrap_or((0, 0, 0, 0, false))
+        };
+        // ホイールで本文を送る（正 = 先頭方向・負 = 末尾方向）
+        let wheel = |cx: &mut AsyncApp, dy: f32| {
+            window
+                .update(cx, |app, win, cx| {
+                    let position = app
+                        .preview_viewport_bounds(pane)
+                        .map(|b| b.center())
+                        .unwrap_or_default();
+                    win.dispatch_event(
+                        gpui::PlatformInput::ScrollWheel(ScrollWheelEvent {
+                            position,
+                            delta: ScrollDelta::Pixels(point(px(0.0), px(dy))),
+                            ..ScrollWheelEvent::default()
+                        }),
+                        cx,
+                    );
+                    cx.notify();
+                })
+                .ok();
+            notify_and_draw(any, window, cx);
+        };
+        let search = |cx: &mut AsyncApp, query: &str| {
+            let query = query.to_string();
+            window
+                .update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::PreviewSearch {
+                            pane: Some(pane.as_u64()),
+                            query: Some(query),
+                            direction: Some("next".into()),
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    cx.notify();
+                })
+                .ok();
+        };
+
+        // (0) ホイールで下へ送ってから編集を始める。キャレットを「見ている行」へ
+        // 置かないと、編集開始の追従が器を先頭へ引き戻す（打つ場所と見ている場所が
+        // 食い違う）。追従は余白ぶん（最大 FOLLOW_MARGIN 行）だけ上へ寄せるので、
+        // 「先頭へ戻っていない」= 動いた量が余白以内であることを見る
+        wheel(cx, -600.0);
+        let scrolled_to = window
+            .update(cx, |app, _, _| {
+                app.preview_first_visible_line(pane).unwrap_or(0)
+            })
+            .unwrap_or(0);
+        let (editing, edit_error) = window
+            .update(cx, |app, _, cx| {
+                let result = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::PreviewEdit {
+                        pane: Some(pane.as_u64()),
+                        enabled: Some(true),
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+                match result {
+                    Ok(v) => (v["editing"].as_bool().unwrap_or(false), String::new()),
+                    Err(e) => (false, e.to_string()),
+                }
+            })
+            .unwrap_or((false, "window.update に失敗".to_string()));
+        check(
+            editing,
+            &format!("visual-test カーソル追従: 編集モードを開始できる（{edit_error}）"),
+        );
+        let (line0, first0, last0, visible_lines, vis0) = observe(cx);
+        println!(
+            "TAKO_VISUAL_PIXEL: cursor-follow edit-start lines={total_lines} \
+             visible_lines={visible_lines} scrolled_to={scrolled_to} cursor={line0} \
+             visible={first0}..={last0} ok={vis0} legacy={legacy}"
+        );
+        check(
+            visible_lines > FOLLOW_MARGIN * 2 + 1,
+            "visual-test カーソル追従: 器の高さが実測できている",
+        );
+        check(
+            scrolled_to > 0,
+            "visual-test カーソル追従: ホイールで本文が送れる",
+        );
+        if legacy {
+            check(
+                first0 == scrolled_to && !vis0,
+                "visual-test カーソル追従: 旧挙動はキャレットが先頭のまま = 画面外（検出力）",
+            );
+        } else {
+            check(
+                first0 <= scrolled_to && scrolled_to - first0 <= FOLLOW_MARGIN && vis0,
+                "visual-test カーソル追従: 編集開始が器を先頭へ引き戻さない (#1649)",
+            );
+        }
+
+        // (1) 末尾近くの目印へ飛ぶ（旧挙動では器が 1 行も動かず画面外のまま）
+        search(cx, "mark_3900");
+        let (line1, first1, last1, _, vis1) = observe(cx);
+        println!(
+            "TAKO_VISUAL_PIXEL: cursor-follow search-tail want={} cursor={line1} \
+             visible={first1}..={last1} ok={vis1}",
+            mark_line(3900)
+        );
+        check(
+            line1 == mark_line(3900),
+            "visual-test カーソル追従: 検索がヒットへ飛んでいる",
+        );
+        if legacy {
+            check(
+                !vis1,
+                "visual-test カーソル追従: 旧挙動は検索ヒットが画面外に残る（検出力）",
+            );
+        } else {
+            check(
+                vis1 && last1 - line1 >= FOLLOW_MARGIN && line1 - first1 >= FOLLOW_MARGIN,
+                "visual-test カーソル追従: 検索ヒットが余白つきで見える (#1649)",
+            );
+        }
+
+        // (2) 打鍵（macOS の insertText 相当 = 製品の印字文字の入口）
+        window
+            .update(cx, |app, win, cx| {
+                app.replace_text_in_range(None, "X", win, cx);
+                cx.notify();
+            })
+            .ok();
+        let (line2, first2, last2, _, vis2) = observe(cx);
+        println!(
+            "TAKO_VISUAL_PIXEL: cursor-follow typed cursor={line2} \
+             visible={first2}..={last2} ok={vis2}"
+        );
+        check(
+            if legacy { !vis2 } else { vis2 },
+            "visual-test カーソル追従: 打鍵の後もカーソル行が見える (#1649)",
+        );
+
+        // (3) 矢印の連打で器の下端を越える
+        window
+            .update(cx, |app, _, cx| {
+                for _ in 0..40 {
+                    app.handle_preview_edit_key(&Keystroke::parse("down").unwrap(), cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        let (line3, first3, last3, _, vis3) = observe(cx);
+        println!(
+            "TAKO_VISUAL_PIXEL: cursor-follow arrows cursor={line3} \
+             visible={first3}..={last3} ok={vis3}"
+        );
+        check(
+            line3 == line2 + 40,
+            "visual-test カーソル追従: ↓ の連打がカーソルを 40 行動かす",
+        );
+        check(
+            if legacy { !vis3 } else { vis3 },
+            "visual-test カーソル追従: 矢印連打でも追いつく (#1649)",
+        );
+
+        // (4) 先頭近くの目印へ飛ぶ（上方向の追従）
+        search(cx, "mark_0003");
+        let (line4, first4, last4, _, vis4) = observe(cx);
+        println!(
+            "TAKO_VISUAL_PIXEL: cursor-follow search-head want={} cursor={line4} \
+             visible={first4}..={last4} ok={vis4}",
+            mark_line(3)
+        );
+        check(
+            line4 == mark_line(3) && line4 < line3,
+            "visual-test カーソル追従: 検索が先頭方向のヒットへ飛んでいる",
+        );
+        if !legacy {
+            check(
+                vis4,
+                "visual-test カーソル追従: 先頭方向のヒットも見える (#1649)",
+            );
+        }
+
+        // (5) undo（打鍵した位置 = 末尾近くへ戻る。`TextBuffer::undo` はカーソルも戻す）
+        window
+            .update(cx, |app, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::PreviewUndo {
+                        pane: Some(pane.as_u64()),
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+            })
+            .ok();
+        let (line5, first5, last5, _, vis5) = observe(cx);
+        println!(
+            "TAKO_VISUAL_PIXEL: cursor-follow undo cursor={line5} \
+             visible={first5}..={last5} ok={vis5}"
+        );
+        check(
+            line5 == line2,
+            "visual-test カーソル追従: undo が打鍵した位置へ戻る",
+        );
+        check(
+            if legacy { !vis5 } else { vis5 },
+            "visual-test カーソル追従: undo の後もカーソル行が見える (#1649)",
+        );
+
+        // (6) IME の未確定下線。**両腕で同じ場所へカーソルを置いてから**
+        // ホイールで先頭へ戻し、カーソル行のレイアウトが無い状態で変換を始める。
+        // 追従が無いとアンカーが採れず、下線と候補ウィンドウの除外領域が消える
+        search(cx, "mark_2000");
+        wheel(cx, 20000.0);
+        let (before_line, before_first, _, _, before_vis) = observe(cx);
+        check(
+            before_line == mark_line(2000) && !before_vis,
+            "visual-test カーソル追従: 変換の前にカーソルを画面外へ送れている",
+        );
+        let (ime_anchored, anchor_inside) = window
+            .update(cx, |app, win, cx| {
+                app.replace_and_mark_text_in_range(None, "にほんご", None, win, cx);
+                let anchor = app.ime_overlay_anchor(win);
+                let body = app.preview_viewport_bounds(pane);
+                let inside = match (anchor, body) {
+                    (Some(p), Some(b)) => {
+                        p.x >= b.origin.x - px(1.0)
+                            && p.y >= b.origin.y - px(1.0)
+                            && p.y <= b.origin.y + b.size.height + px(1.0)
+                    }
+                    _ => false,
+                };
+                let anchored = anchor.is_some() && app.ime_overlay_anchored;
+                // 変換を畳んでから次の節へ渡す（未確定文字列を残さない）
+                app.replace_and_mark_text_in_range(None, "", None, win, cx);
+                app.ime = None;
+                cx.notify();
+                (anchored, inside)
+            })
+            .unwrap_or((false, false));
+        let (line6, first6, last6, _, vis6) = observe(cx);
+        println!(
+            "TAKO_VISUAL_PIXEL: cursor-follow ime before_first={before_first} \
+             anchored={ime_anchored} inside_body={anchor_inside} cursor={line6} \
+             visible={first6}..={last6} ok={vis6}"
+        );
+        if legacy {
+            check(
+                !ime_anchored && !vis6,
+                "visual-test カーソル追従: 旧挙動は画面外カーソルで下線のアンカーを失う（検出力）",
+            );
+        } else {
+            check(
+                ime_anchored && anchor_inside && vis6,
+                "visual-test カーソル追従: 画面外カーソルでも IME の下線が本文に残る (#1649)",
+            );
+        }
+
+        // 後片付け（この節が作ったペインと fixture を次の節へ残さない）
+        window
+            .update(cx, |app, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::Close {
+                        pane: Some(pane.as_u64()),
+                        force: true,
+                        caller_role: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+            })
+            .ok();
+        notify_and_draw(any, window, cx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// コードプレビューの開閉で live ヒープが戻るかを測る（#821）。
     ///
     /// **描画を自分で回すのが要点**。GPUI は macOS で
@@ -37403,6 +37890,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1649: 編集カーソルが画面外へ出たままにならないか（レイアウト値で見る）
+                "cursor-follow" => {
+                    cursor_follow_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #812: ペイン枠線を塗るのがルート側の 1 枚だけか
                 "pane-border" => {
                     pane_border_visual(any, window, cx).await;
@@ -39818,6 +40311,9 @@ mod self_test {
             // #821: コードプレビューの仮想化で見た目と操作が変わらないか
             // （実ピクセル + 可視範囲をまたぐドラッグ選択とコピー）
             preview_code_visual(any, window, cx).await;
+
+            // #1649: 編集カーソルの追従スクロールと、画面外カーソルでの IME アンカー
+            cursor_follow_visual(any, window, cx).await;
 
             // #947: `terminal_screen_lines` の字の大きさがペインのフォントサイズに
             // 追従するか（タブツリーのホバープレビューで測る）
