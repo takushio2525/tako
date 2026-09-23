@@ -37,6 +37,16 @@
   置き、**ID はファイル冒頭の定数 1 か所**（`GA_MEASUREMENT_ID` / `ADSENSE_PUBLISHER_ID`）で持つ。
   GA4 は `takushio2525.com` 一族で 1 プロパティを共有し、AdSense は所有権確認の meta だけ
   （広告は出さないので `adsbygoogle.js` は入れない。`ads.txt` はルートドメイン側に 1 つで足りる）
+- **Cookie 同意（Consent Mode v2）は takushio2525.com 一族で 1 実装を共有する**（Issue #1639）。
+  docs 側が持つのは 3 つだけ: Starlight `head` の `https://takushio2525.com/consent/consent.js`
+  （**gtag より前・`async` なし**。`gtag('consent', 'default', …)` が `gtag('config', …)` より前に
+  dataLayer へ入っていないと既定値が効かない）・gtag 初期化の保険 1 行
+  （`if (!window.tkConsent) gtag('consent', 'default', {…denied})`。既定値が 1 つも宣言されないと
+  gtag は全部同意済みとして動くので、読み込めなかったときは止める側へ倒す）・
+  フッター（`docs/src/components/FooterLegal.astro`）のプライバシーポリシーと「Cookie 設定」。
+  バナー本体・国判定・ポリシー本文はハブ側が正本なので docs には置かない。
+  フッターのリンクは**素の `<a>`** で書く（consent.js が document の click を拾って
+  `preventDefault()` するため、フレームワークのリンク部品だと遷移が先に走る）
 
 ## UI 文字列の i18n（Issue #435）
 
