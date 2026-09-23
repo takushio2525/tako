@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-23（#1578: CLI 出力から絵文字を消し、is_emoji の番犬を CLI へ広げた）
-- 本番リテラルの実測は 18 件（Issue の `ℹ`5 / `⚠`1 に加え `✓`4 / `✗`3 / `❯`6）。14 件を文字ラベルへ置換し、**語彙は発明せず `setup.rs` から引いた**（同じ文言を setup.rs は既に `[OK] …` で出していて main.rs だけが取り残されていた）。同じ列の `─` / `△` も揃えないと混在列になるのでその 2 つの match だけ寄せた
-- 走査は `tests/common/emoji_scan.rs` の 1 実装へ寄せ #1536 の番犬も載せ替えた。残る 4 件（`mcp/catalog.rs` の `❯`）は AI だけが読むツールカタログなので理由つき ALLOW。規約は `.agent/conventions.md`「絵文字を出さない」節
-- 実測: 隔離 CLI の before/after 4 経路・origin/main の形へ戻す注入で 14 件すべて file:line 名指しで FAILED → 戻して緑（#1536 は注入中も緑）・workspace 5178 passed 0 failed・clippy 3 宇宙 0
-
 ## 2026-09-23（#1627: Instant の巻き戻しをやめ、起動直後の panic を止めた）
 - `PaneMapping::new()` の `Instant::now() - Duration::from_secs(999)` は**ブートから 999 秒未満で panic**（`Instant` の起点はブート）。本番の呼び手は `remote serve` の起動と `backend_session_of_pane` で、CI Windows では uptime が閾値を跨ぐかだけで結果が反転していた（746 秒 = 3 件 FAILED / 1012 秒 = ok = 速い CI ほど落ちる）
 - 初期値は `Option<Instant>` の `None`（= 期限切れ。時刻を捏造しない）へ。「N 前に起きたことにする」用途は `tako_core::monotonic::rewound`（飽和する 1 実装）へ寄せ、**実は 9 箇所**あった直書き（Issue の 6 箇所は行単位 grep の見落ち = 改行に割れた 3 件）を全部通した
@@ -64,3 +59,8 @@
 - `verify_pid_identity` は照合が丸ごと `#[cfg(unix)]` の中で Windows は末尾の `true` へ直行 = 「生きている pid はすべて tako の daemon」。#1596 で生存判定が境界へ寄り先頭の `if` を通り抜けたことで露出（#1599 が先に入ると誤 kill）
 - 材料引き（`procinfo::observe_identity`）と突き合わせ（`judge_identity` = 3 値・`Unknown` は撃たない）を境界へ新設。`remote.rs` の腕は OS 分岐の無い `boundary_identity_confirmed` 1 本で、分岐は `#[cfg]` → `cfg!(unix)`（両腕を macOS でもコンパイル）
 - 実測: 注入 4 通り（素通り復帰 / 腕だけ外す / 空回り / `Unknown` 反転）すべて file:line 名指しで FAILED → 戻して緑。unix の挙動は不変（`remote::tests` 112 本そのまま緑）
+
+## 2026-09-23（#1655: Code Runner の組み込み既定を OS 別の 1 枚の表にした）
+- 21 種のうち 10 種が Windows で不成立（`python3` / `cc` / `c++` / `rustc` + `./<出力>` / `bash` / `zsh`）・`runner.rs` に `cfg(windows)` 0 件だったので、表を `platform::runner_defaults::TABLE`（**41 拡張子 × 2 列**）へ移し、`Platform` 引数 + `cfg!` で macOS の単体から Windows 列を解決結果ごと固定した
+- Windows 列は PowerShell 5.1 でも通る形（`&&` / `./` を使わず `; if ($?) { .\<名前>.exe }`）。`.ps1` / `.bat` / `.tsx` など 20 拡張子を追加し、意図して置かない 9 マスは理由（日英）を持って案内へ載る（置かない基準は「その OS に解釈系が無い / 決まらない」）
+- 実測: 注入 A/B 3 通り（属性の `#[cfg(windows)]` / Windows 列の `python3` / `.command` の Windows 列を絶やす）が名指しで FAILED → 戻して緑。初版は `.command` を Windows で既定なしにして CI の Windows が赤（`Run` が Err = dispatch の実行テスト 3 件）→ 基準を「解釈系が無い / 決まらない」へ正した。GUI 実経路は画面スリープで未実施（#1160）

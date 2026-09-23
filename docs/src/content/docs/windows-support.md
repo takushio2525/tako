@@ -76,9 +76,9 @@ AI エージェント（tako は縮退の件数と引き方を system prompt へ
 | `tako_background_kill` | 対応 | — | 実機実測: #937 の Windows 11 実測: MCP `tako_background_kill` が killed=2 を返し、`tako backgrounded` が 1 件から空になる |
 | `tako_foreground_pane` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako background --pane N` で外したペインが `tako foreground N` で由来タブへ戻る（list の panes が 1 → 1,2） |
 | `tako_show_command` | 対応 | — | 実機セルフテスト: 項目 91 / 91b（カードとカード帯）+ #875 で新規ペイン実行を実機実測 |
-| `tako_run` | 対応 | — | 実機実測: #875 の実機 before/after: 「PTY を起動できなかった」→ 出力 + __TAKO_EXIT=0。終了コード 4 型・引用符・日本語・psmux 経由まで実測 + セルフテスト項目 91(d) の実行検査が ran=true |
+| `tako_run` | 対応 | — | 実機実測: #875 の実機 before/after: 「PTY を起動できなかった」→ 出力 + __TAKO_EXIT=0。終了コード 4 型・引用符・日本語・psmux 経由まで実測 + セルフテスト項目 91(d) の実行検査が ran=true。拡張子既定も #1655 で Windows 用の列を持つ（`python` / `.exe` / `cmd /c` / `pwsh -File`。`&&` と `./` は PowerShell 5.1 で通らないので使わない） |
 | `tako_run_resolve` | 対応 | — | 実機実測: #875 の実機実測で Code Runner の宣言 / 拡張子既定の解決から実行まで通した（3 経路のうちの 1 つ） |
-| `tako_run_defaults` | 対応 | — | 実機テスト: 拡張子既定の登録・削除・一覧は設定ファイル I/O だけで、単体が実機で緑 |
+| `tako_run_defaults` | 対応 | — | 実機テスト: 拡張子既定の登録・削除・一覧は設定ファイル I/O だけで、単体が実機で緑。組み込み既定は #1655 で OS 別の表になり、Windows の列（41 拡張子中 36 件）を macOS の単体から解決結果ごと固定している |
 | `tako_run_interactive` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako run-interactive --pane <p> <コマンド>` が新ペインで実行し、`--wait` が exit_code=0 / status=exited を返す（ペインが極端に狭いとマーカーが折り返して検出できない = #651。macOS も同様） |
 | `tako_run_interactive_status` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako run-interactive-status <pane>` が exit_code=0 / status=exited を返す（狭いペインの折り返しは #651） |
 

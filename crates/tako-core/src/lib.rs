@@ -116,8 +116,9 @@ pub use preview_view::{
     PREVIEW_ZOOM_STEP,
 };
 pub use runner::{
-    builtin_defaults, expand_variables, merged_defaults, parse_declarations, read_file_head_for_ui,
-    resolve, Declarations, ProfileDecl, Resolution, RunPlan, RunSource, RunnerError,
+    builtin_defaults, builtin_defaults_for, expand_variables, merged_defaults, merged_defaults_for,
+    parse_declarations, read_file_head_for_ui, resolve, resolve_for, Declarations, ProfileDecl,
+    Resolution, RunPlan, RunSource, RunnerError,
 };
 pub use screen::{InputStatus, InputStyle, Screen, ScreenLine, StyleRun};
 pub use shell::{quote_for_shell, quote_paths_for_shell};
