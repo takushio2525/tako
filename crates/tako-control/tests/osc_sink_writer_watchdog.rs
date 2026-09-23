@@ -29,8 +29,20 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+#[path = "common/code_view.rs"]
+mod code_view;
+
 fn read(root: &Path, rel: &str) -> String {
     std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel} が読める: {e}"))
+}
+
+/// **肯定の存在確認**（「この読み口 / この入口が在る」）が見る眺め = コメントを落とした本文。
+///
+/// 全文へ `contains` すると、走査先の doc コメントに書いた同じ綴りで真になり、
+/// 実体が消えても緑のままになる（#1609）。PowerShell（`tako.ps1`）は Rust では
+/// ないので眺めを通さず全文のまま見る
+fn read_code(root: &Path, rel: &str) -> String {
+    code_view::without_comments_checked(&read(root, rel), rel)
 }
 
 #[test]
@@ -71,7 +83,7 @@ fn スクリプトの解決規則はtako_coreの正本と同じ形を作る() {
 #[test]
 fn appは書き手を区別しない読み口を持たない() {
     let root = workspace_root();
-    let main = read(&root, "crates/tako-app/src/main.rs");
+    let main = read_code(&root, "crates/tako-app/src/main.rs");
 
     assert!(
         main.contains("osc_sinks: HashMap<PaneId, tako_core::osc_sink::SinkReader>"),

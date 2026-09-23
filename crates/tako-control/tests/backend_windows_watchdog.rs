@@ -30,8 +30,19 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+#[path = "common/code_view.rs"]
+mod code_view;
+
 fn read(root: &Path, rel: &str) -> String {
     std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel} が読めない: {e}"))
+}
+
+/// **肯定の存在確認**（「この実装が在る」）が見る眺め = コメントを落とした本文。
+///
+/// 全文へ `contains` すると、走査先の doc コメントに書いた同じ綴りで真になり、
+/// 実体が消えても緑のままになる（#1609）。不在検査は全文のままでよい
+fn read_code(root: &Path, rel: &str) -> String {
+    code_view::without_comments_checked(&read(root, rel), rel)
 }
 
 /// `needle` で始まるブロックを、波括弧の対応で切り出す（見つからなければ panic）
@@ -90,14 +101,14 @@ fn listはbackend_windowsを要求時に採り直す() {
     );
 
     // trait 側に窓口があること（消えると 1 の再発）
-    let host = read(&root, "crates/tako-control/src/host.rs");
+    let host = read_code(&root, "crates/tako-control/src/host.rs");
     assert!(
         host.contains("fn refresh_backend_windows(&mut self)"),
         "TmuxHost に refresh_backend_windows の窓口が無い（#1191）"
     );
 
     // UI 実装が窓口を埋めていること（既定の no-op のままだと GUI では直らない）
-    let app = read(&root, "crates/tako-app/src/main.rs");
+    let app = read_code(&root, "crates/tako-app/src/main.rs");
     assert!(
         app.contains("fn refresh_backend_windows(&mut self)"),
         "tako-app が refresh_backend_windows を実装していない = 既定の no-op のまま\
@@ -117,7 +128,7 @@ fn 採取不能とwindow無しを混ぜていない() {
     let app = read(&root, "crates/tako-app/src/main.rs");
     let apply = block_after(&app, "fn apply_backend_windows(");
     assert!(
-        apply.contains("Option<&HashMap<String, Vec<tako_core::TmuxWindow>>>"),
+        code_only(&apply).contains("Option<&HashMap<String, Vec<tako_core::TmuxWindow>>>"),
         "apply_backend_windows が「採取できなかった」を Option で受けていない\
          （null と [] を区別できなくなる。#1191）:\n{apply}"
     );

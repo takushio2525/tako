@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-23（#1504: Windows のシェル統合を tako setup の段として入れた）
-- `shell_integration::install()` の呼び手が CLI と MCP だけで **setup も installer も呼んでいなかった**（棚卸し Z9）ので、Windows は人が `tako shell-integration install` を打つまで OSC 7 / 133・cwd 追従・入力予測・自動命名の素材が死んでいた。段を `tako setup`（bootstrap より前）と `--check` へ 1 実装で通し、**配置が要るかは `cfg!(windows)` ではなく `Delivery` で分岐**させたので、macOS 上でも Profile 経路の表示・冪等・失敗を全部検査できる（実機を持たない CI の穴を作らない）
-- 倒した判断: ユーザーのファイルへ書く前に「何をどこへ」を出して**同意扱いで続行**（`[y/N]` を出さない = `--yes` / 非 TTY / 端末ありで出力が一致。先例は #1502 の PATH 設置）／失敗は `RemainingKind::ShellIntegration` として末尾へ（段は `Result` を返さないので `?` で setup を止められない）／2 回目は予告も出さず差分ゼロ
-- 実測: `scripts/test-setup-shell-integration-1504.sh` **54 PASS 0 FAIL**（CI 登録。隔離 HOME で `$PROFILE` のマーカーが HOME のどこにも書かれないことを毎回確認）・A/B `TAKO_1504_LEGACY=1` は 34 PASS（`<data_dir>/shell-integration` が作られない = #1504 前の症状）・注入 11 通りすべて FAILED → 戻して緑（段を外すと実経路が 21 FAIL）・回帰 5 本（#1499 52 / #1501 81 / #1503 28 / #1509 49 / multiagent）全緑・workspace 5157 passed 0 failed・clippy 3 宇宙 0・check-windows error 0
-
 ## 2026-09-23（#1557 / #1581: pid の生存判定を境界の 1 実装へ寄せた）
 - `remote.rs` の私的 `is_process_alive` は非 unix で**無条件 false** = Windows で生きている daemon を全部「居ない」と読み、`daemon_status` の `running` も pid 再利用時の誤 kill 防止も掃除判断も揃って誤っていた。`tako_core::platform::process::pid_alive` へ委譲。macOS も EPERM は「居る」・`pid_t` 範囲外は「居ない」へ揃う（どちらも state を消さない / 撃たない側）。偽の緑だった `is_process_aliveは存在しないpidをfalseで返す` に `u32::MAX` / `0` を足した
 - **#1581 の案 1 は既に入っていた**: `test_residue.rs` は `ports::process_alive` を一度も使っておらず（`git log -S` 0 件）、`OwnerProbe` は #1296 の初版から境界を通っている。失敗テストは子の終了直後に数える形で、残る 3 件は**子自身の pid** = 起動時の掃除では原理的に直らない（`tako-agent-config-` は `auto: false` でそもそも対象外）。案 2 / 案 3 は #1581 に残す（PR は Refs のみ）
@@ -59,3 +54,8 @@
 - `{{platform_notes}}` が縮退理由を**全文**並べており Windows で `platform` 片 4110 B・tako が作る側が取り分（18944 B）を 1.7〜2.7 KB 超過（CI 実測 20708 / 21420 / 21639 = そのぶん利用者の追記の取り分が削られる）。#1154 / #1477 の作法で prompt には件数と引き方だけを残し、全文は動的 topic `platform` へ。短縮形・手順書・A/B は `PlatformFacts`（`notes_section_in` / `full_section_in`）の 1 実装を共有
 - 番犬が**実機でしか測れない**のが元凶なので `Platform` を prompt 組み立てまで引数で通し（`system_prompt_pieces_on` ほか）、`prompt_budget_1477` は macOS / Windows 両方の形を測る。#1278 の `#[cfg_attr(windows, ignore)]` は外した。行き先が変わった既存番犬 2 件も追従（`platform_parity` の単一ソース検査 / MCP カタログ snapshot）
 - 実測: platform 片 4110 → 412 B・base 20709→17118 / 21421→17830 / 21640→18049（同一バイナリで旧テンプレート + A/B から main を再現）・A/B `TAKO_1571_LEGACY=1` で番犬 4 件 FAILED → 戻して緑・CI の Windows 実機で `prompt_budget_1477` が ok・clippy 3 宇宙 0・check-windows error 0
+
+## 2026-09-23（#1609: 番犬が自分の doc コメントで緑になる型を棚卸しした）
+- 肯定の存在確認を**全文**へ `contains` する番犬は、実体が消えてもコメントの綴りで緑のまま（#1536 が踏み #1578 が発見した型）。`crates/*/tests/**` 180 本を 2 段の検出器で棚卸しし、該当 **27 本**を `code_view` の 3 つ目の眺め `without_comments_checked`（コメントだけ潰す / 文字列は囲みごと残す / バイト長と行番号を保つ / 空振りはその場で名指して落ちる）へ寄せた。**不在検査は全文のまま**
+- 実バグ 1 件: #1308 の「A/B 入口が在る」はドライバ本体の**アーム目印コメント**だけで満たされていた（実体の `env::var` は兄弟関数 `legacy_1308`）。分岐の呼び出しと env の読みへ分けた
+- 実測: 偽の緑の A/B **28 ケースすべて before(origin/main)=緑 / after=FAILED**・生読みサイト 50 → 18 組（走査先のコード部分に無い needle は 7 → 0）・新設番犬 `issue1609_comment_view_watchdog` 7 本・workspace 0 failed・clippy 3 宇宙 0

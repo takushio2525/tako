@@ -118,6 +118,9 @@ fn blank_arm(body: &str) -> (String, usize) {
     (out, dropped)
 }
 
+#[path = "common/code_view.rs"]
+mod code_view;
+
 fn read_src() -> String {
     std::fs::read_to_string(target()).expect("dispatch.rs を読める")
 }
@@ -201,7 +204,11 @@ fn 状態待ちのドライバは予算と診断とab経路を持つ() {
         .into_iter()
         .find(|b| b.name == DRIVER)
         .unwrap_or_else(|| panic!("状態待ちのドライバ（{DRIVER}）が切り出せていない"));
+    // A/B のアームは**コメントの目印**で測るので、除去は生の本文でやってから
+    // コメントを落とす（#1609。全文のままだと「この綴りを通す」と書いた
+    // 説明コメントで緑になり、実体が消えても気づけない）
     let (code, dropped) = blank_arm(&body.text);
+    let code = code_view::without_comments(&code);
     assert_eq!(
         dropped, 1,
         "A/B の旧経路アーム（{ARM_BEGIN}）が 1 つでない。\
@@ -219,8 +226,17 @@ fn 状態待ちのドライバは予算と診断とab経路を持つ() {
              どれかが落ちている）"
         );
     }
+    // A/B の旧経路の**入口**（env の読み）は兄弟の関数 `legacy_1308` が持ち、
+    // ドライバはそれを呼ぶだけ。ドライバ本体に現れる `TAKO_1308_LEGACY` の綴りは
+    // A/B アームの**目印コメント**しかないので、全文一致だと入口を消しても
+    // 目印だけで緑のままになる（#1609 で実測して分けた）
+    let driver_code = code_view::without_comments(&body.text);
     assert!(
-        body.text.contains("TAKO_1308_LEGACY"),
+        driver_code.contains("legacy_1308()"),
+        "ドライバが A/B の旧経路（legacy_1308）へ分岐していない"
+    );
+    assert!(
+        code_view::without_comments(&src).contains("std::env::var(\"TAKO_1308_LEGACY\")"),
         "A/B の旧経路（TAKO_1308_LEGACY=1）が無いと、直したことを実測で示せない"
     );
 }

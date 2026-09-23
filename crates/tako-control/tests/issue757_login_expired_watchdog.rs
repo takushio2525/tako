@@ -27,9 +27,21 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+#[path = "common/code_view.rs"]
+mod code_view;
+
 fn read(rel: &str) -> String {
     let path = workspace_root().join(rel);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} を読めない: {e}", path.display()))
+}
+
+/// **肯定の存在確認**（「この呼び出しが在る」）が見る眺め = コメントを落とした本文。
+///
+/// 全文へ `contains` すると、走査先の doc コメントに書いた同じ綴りで真になり、
+/// 実体が消えても緑のままになる（#1609）。**バイト長と位置が保たれる**ので、
+/// コメントの目印（`LOGIN_MARKER` 等）で測った区間をそのまま切り出せる
+fn read_code(rel: &str) -> String {
+    code_view::without_comments_checked(&read(rel), rel)
 }
 
 /// 段の目印（コメントの見出し）。並び順そのものが仕様なので、目印で位置を測る
@@ -87,7 +99,10 @@ fn ログイン失効の検知段はダイアログの後かつ上限より前�
 fn 検知段は文言の正本を呼んでいる() {
     let src = read("crates/tako-control/src/orchestrator/wait.rs");
     let (_, login, limit) = check_stage_order(&src).expect("段の順序");
-    let stage = &src[login..limit];
+    // 位置はコメントの目印で測り、中身はコメントを落とした眺めで見る（#1609）。
+    // 全文のままだと、段の説明コメントに書いた綴りで緑になる
+    let code = read_code("crates/tako-control/src/orchestrator/wait.rs");
+    let stage = &code[login..limit];
     assert!(
         stage.contains("agent_cli::login_expired_line"),
         "検知段が文言の正本（agent_cli::login_expired_line）を呼んでいない: \
@@ -115,13 +130,16 @@ fn lowercase_hits(src: &str, phrase: &str) -> usize {
 #[test]
 fn 失効の文言は正本1か所だけが持つ() {
     let agent_cli = read("crates/tako-control/src/orchestrator/agent_cli.rs");
+    // 存在の確認はコメントを落とした眺めで（#1609）。語句の**件数**を数える
+    // 下の検査は、コメントの中の引用も 1 件として見たいので全文のまま
+    let agent_code = read_code("crates/tako-control/src/orchestrator/agent_cli.rs");
     assert!(
-        agent_cli.contains("pub fn login_expired_line"),
+        agent_code.contains("pub fn login_expired_line"),
         "正本 login_expired_line が無い"
     );
     // 未認証検知（#983）が正本へ委譲していること = 語句の持ち主が 1 つ
     assert!(
-        agent_cli.contains("if login_expired_line(line) {"),
+        agent_code.contains("if login_expired_line(line) {"),
         "looks_unauthenticated_screen が正本へ委譲していない: \
          語句が 2 か所になると片方に足したときもう片方が取りこぼす"
     );

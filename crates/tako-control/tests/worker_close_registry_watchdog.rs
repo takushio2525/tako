@@ -27,6 +27,9 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+#[path = "common/code_view.rs"]
+mod code_view;
+
 fn read(root: &Path, rel: &str) -> String {
     std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel} が読める: {e}"))
 }
@@ -102,8 +105,11 @@ fn dispatchのclose系はworkerレジストリの記録フックを通る() {
 fn たまり場のkillは後始末を集約関数に任せている() {
     let root = workspace_root();
     let drawer = read(&root, "crates/tako-app/src/drawer.rs");
+    // 呼んでいることの確認はコメントを落とした眺めで（#1609）。すぐ下の不在検査は
+    // 全文のまま（コメントアウトした撤去が残っているのも #775 の再発なので見る）
     assert!(
-        drawer.contains("kill_shelved_pane("),
+        code_view::without_comments_checked(&drawer, "crates/tako-app/src/drawer.rs")
+            .contains("kill_shelved_pane("),
         "drawer が kill_shelved_pane を呼んでいない（#775）"
     );
     assert!(

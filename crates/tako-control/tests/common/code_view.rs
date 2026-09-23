@@ -9,17 +9,19 @@
 // 取り込む番犬ごとに使う関数が違う（片方しか使わないファイルがある）
 #![allow(dead_code)]
 
-/// 眺め方（同じ走査から 2 つの眺めを作る）。
+/// 眺め方（同じ走査から 3 つの眺めを作る）。
 ///
-/// 番犬ごとに正規化の写しを持たないための軸（#1441 / #1445）。
-/// [`Keep::Code`] と [`Keep::Literals`] は**同じ 1 つの走査**の出し分けなので、
-/// 片方だけが生文字列を取りこぼす形にならない
+/// 番犬ごとに正規化の写しを持たないための軸（#1441 / #1445 / #1609）。
+/// [`Keep::Code`] と [`Keep::Literals`] と [`Keep::NonComment`] は**同じ 1 つの走査**の
+/// 出し分けなので、片方だけが生文字列を取りこぼす形にならない
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Keep {
     /// コメントと文字列 / 文字リテラルを潰し、**コードだけ**残す
     Code,
     /// コメントとコードを潰し、**文字列 / 文字リテラルの中身だけ**残す
     Literals,
+    /// **コメントだけ**を潰し、コードと文字列リテラルを**囲みごと**残す（#1609）
+    NonComment,
 }
 
 /// 空白で潰したバイト（改行は残す = 行番号が保たれる）
@@ -57,16 +59,80 @@ pub fn literals_only(src: &str) -> String {
     view(src, Keep::Literals)
 }
 
-/// [`code_view`] / [`literals_only`] の共有走査（出し分けは `keep` だけ）
+/// **コメントだけ**を空白へ潰した眺め（コードと文字列リテラルは囲みごと原文のまま）。
+///
+/// 「この識別子 / この文言が本当に在るか」を確かめる番犬（肯定の存在確認）はこれを通す。
+/// 読んだ**全文**へ `contains` すると、走査先（や番犬自身）の**説明文に書いた同じ綴り**で
+/// 真になり、実体が消えても緑のままになる。#1536 の番犬は自分の doc コメントに書いた
+/// `tako_core::emoji::is_emoji` で緑だった（#1578 が発見 → #1609 で tests 配下を棚卸し）。
+///
+/// [`code_view`] と違って文字列リテラルを残すので、`env::var("TAKO_…_LEGACY")` の
+/// **文言そのもの**を見る番犬も同じ 1 実装で書ける（番犬ごとに正規化の写しを持たない）。
+/// バイト長と行番号が保たれるので `file:line` の名指しがそのまま使える。
+///
+/// **不在**を確かめる番犬（「個人情報が無い」「絵文字が無い」）はこれを通さない。
+/// コメントの中の違反も違反なので、全文を見るのが正しい
+pub fn without_comments(src: &str) -> String {
+    view(src, Keep::NonComment)
+}
+
+/// 眺めが「コードの形」を保っているかの目印（Rust の item の頭）。
+///
+/// 走査が空振りした形（読み先を間違えた / ファイルが空 / 眺めが丸ごと潰れた）は
+/// これが 1 つも残らないので落とせる。**コメントの多さでは落とさない**:
+/// 実在の最小は `tako-app/src/platform/mod.rs` の 3.4%（#1609 で 278 ファイルを実測）で、
+/// 割合の下限を置くと「よく書けた小さいファイル」が落ちるだけになる
+const ITEM_HEADS: [&str; 8] = [
+    "fn ", "struct ", "enum ", "impl ", "const ", "static ", "use ", "mod ",
+];
+
+/// [`without_comments`] + **走査が空振りしていない**ことの確認。
+///
+/// 「コメントを落としたら何も残らなかった」= 読み先を間違えた / ファイルが空 /
+/// 眺めが壊れた、のいずれかであり、そのまま `contains` へ渡すと**必ず落ちる番犬**
+/// （偽の赤）か、裏返しの検査なら**必ず緑の番犬**（偽の緑）になる。
+/// ここで先に落として `rel` を名指す
+pub fn without_comments_checked(src: &str, rel: &str) -> String {
+    let view = without_comments(src);
+    let kept: usize = view.split_whitespace().map(str::len).sum();
+    assert!(
+        kept > 0,
+        "{rel}: 走査範囲が空（コメントを落としたら 1 文字も残らない）。\n\
+         読み先かファイルの中身を確かめること（#1609）"
+    );
+    assert!(
+        ITEM_HEADS.iter().any(|head| view.contains(head)),
+        "{rel}: コメントを落とした眺めに Rust の item が 1 つも無い（{kept} 文字）。\n\
+         走査が空振りしている（読み先の取り違え / 眺めの破損）ので、\n\
+         この眺めへの `contains` は結果に関わらず信用できない（#1609）"
+    );
+    view
+}
+
+/// [`code_view`] / [`literals_only`] / [`without_comments`] の共有走査（出し分けは `keep` だけ）
 pub fn view(src: &str, keep: Keep) -> String {
     let b = src.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0usize;
-    // 空白で潰す（改行は残す = 行番号が保たれる）
+    // 空白で潰す（改行は残す = 行番号が保たれる）。**コメントだけ**がこれを通る
     let blank = |out: &mut Vec<u8>, byte: u8| out.push(blank_byte(byte));
+    // リテラルの囲み（`\"` / `'` / `r#`）。[`Keep::NonComment`] のときだけ原文のまま残す
+    // （`body.contains("\"explicit_close\"")` のように**引用符ごと**見る番犬があるため）
+    let delim = |out: &mut Vec<u8>, byte: u8| {
+        out.push(if keep == Keep::NonComment {
+            byte
+        } else {
+            blank_byte(byte)
+        });
+    };
     // `kind` の領域は `keep` と一致するときだけ原文のまま出す
+    // （[`Keep::NonComment`] はコード・リテラルのどちらも残すので常に一致扱い）
     let emit = |out: &mut Vec<u8>, byte: u8, kind: Keep| {
-        out.push(if kind == keep { byte } else { blank_byte(byte) });
+        out.push(if kind == keep || keep == Keep::NonComment {
+            byte
+        } else {
+            blank_byte(byte)
+        });
     };
     while i < b.len() {
         // 行コメント
@@ -117,7 +183,7 @@ pub fn view(src: &str, keep: Keep) -> String {
         };
         if let Some((body, hashes)) = raw_start {
             while i < body {
-                blank(&mut out, b[i]);
+                delim(&mut out, b[i]);
                 i += 1;
             }
             loop {
@@ -128,7 +194,7 @@ pub fn view(src: &str, keep: Keep) -> String {
                     && (1..=hashes).all(|k| i + k < b.len() && b[i + k] == b'#')
                     && i + hashes < b.len();
                 if closes {
-                    blank(&mut out, b[i]);
+                    delim(&mut out, b[i]);
                 } else {
                     emit(&mut out, b[i], Keep::Literals);
                 }
@@ -136,7 +202,7 @@ pub fn view(src: &str, keep: Keep) -> String {
                 if closes {
                     for _ in 0..hashes {
                         if i < b.len() {
-                            blank(&mut out, b[i]);
+                            delim(&mut out, b[i]);
                             i += 1;
                         }
                     }
@@ -147,7 +213,7 @@ pub fn view(src: &str, keep: Keep) -> String {
         }
         // 通常の文字列（`"…"` / `b"…"`）
         if b[i] == b'"' {
-            blank(&mut out, b[i]);
+            delim(&mut out, b[i]);
             i += 1;
             while i < b.len() {
                 if b[i] == b'\\' {
@@ -161,7 +227,7 @@ pub fn view(src: &str, keep: Keep) -> String {
                 }
                 let done = b[i] == b'"';
                 if done {
-                    blank(&mut out, b[i]);
+                    delim(&mut out, b[i]);
                 } else {
                     emit(&mut out, b[i], Keep::Literals);
                 }
@@ -177,7 +243,7 @@ pub fn view(src: &str, keep: Keep) -> String {
             let escaped = i + 1 < b.len() && b[i + 1] == b'\\';
             let plain = i + 2 < b.len() && b[i + 2] == b'\'';
             if escaped || plain {
-                blank(&mut out, b[i]);
+                delim(&mut out, b[i]);
                 i += 1;
                 if escaped {
                     while i < b.len() && b[i] != b'\'' {
@@ -191,7 +257,7 @@ pub fn view(src: &str, keep: Keep) -> String {
                     }
                 }
                 if i < b.len() {
-                    blank(&mut out, b[i]); // 閉じ '
+                    delim(&mut out, b[i]); // 閉じ '
                     i += 1;
                 }
                 continue;

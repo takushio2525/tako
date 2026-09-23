@@ -64,6 +64,9 @@ const ARM_END: &str = "TAKO_1252_LEGACY_ARM 終了";
 /// 切り出しとアーム除去は #1265 の番犬と共有する（前処理を 2 か所に書かない）
 #[path = "common/test_source.rs"]
 mod test_source;
+
+#[path = "common/code_view.rs"]
+mod code_view;
 use test_source::{body_of, strip_arms};
 
 fn strip_legacy_arms(body: &str) -> (String, usize) {
@@ -120,13 +123,16 @@ fn 番犬が走査対象を見つけている() {
              マーカーを消したなら番犬の前提が崩れているので、番犬側も直すこと"
         );
     }
-    // 器のペイン側のアンカーの実装そのものが在ること
+    // 器のペイン側のアンカーの実装そのものが在ること。**コメントを落とした眺め**で
+    // 見る（全文だと、この綴りを書いた説明コメントで緑になる = #1609）。
+    // A/B のアーム除去はコメントの目印で測るので、そちらは `src` のまま
+    let code = code_view::without_comments_checked(&src, "crates/tako-core/src/tmux_backend.rs");
     assert!(
-        src.contains("fn wait_pane_mouse_ready("),
+        code.contains("fn wait_pane_mouse_ready("),
         "アンカーの実装（wait_pane_mouse_ready）が消えている"
     );
     assert!(
-        src.contains("#{mouse_sgr_flag}"),
+        code.contains("#{mouse_sgr_flag}"),
         "器のペイン側のフラグ（#{{mouse_sgr_flag}}）を問い合わせていない"
     );
     // 切り出しとアーム除去そのものが効くこと（本物のソースに無い形を合成して確かめる）

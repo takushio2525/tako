@@ -18,6 +18,18 @@ fn repo_root() -> PathBuf {
         .expect("リポジトリルート")
 }
 
+#[path = "common/code_view.rs"]
+mod code_view;
+
+/// **肯定の存在確認**（「この実装が在る」）が見る眺め = コメントを落とした本文。
+///
+/// 全文へ `contains` すると、走査先の doc コメントに書いた同じ綴りで真になり、
+/// 実体が消えても緑のままになる（#1609）。不在検査は全文のままでよい
+/// シェルスクリプトと YAML は Rust ではないので、この眺めを通さず全文で見る
+fn read_code(rel: &str) -> String {
+    code_view::without_comments_checked(&read(rel), rel)
+}
+
 fn read(rel: &str) -> String {
     let path = repo_root().join(rel);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} を読めない: {e}", path.display()))
@@ -82,7 +94,7 @@ fn シェル側の写しが正本と同じ手順を踏んでいる() {
         "旧挙動へ落ちたことを伏せてはいけない（#1042）"
     );
     // 正本と同じ作業用ディレクトリ名を使っていること（残骸の掃除規則を揃えるため）
-    let rs = read("crates/tako-core/src/platform/bundle_install.rs");
+    let rs = read_code("crates/tako-core/src/platform/bundle_install.rs");
     assert!(
         rs.contains(".tako-replace-"),
         "正本の作業用ディレクトリ名が変わっている。写し側も直すこと（#1042）"

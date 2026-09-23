@@ -18,6 +18,9 @@
 
 use std::path::{Path, PathBuf};
 
+#[path = "common/code_view.rs"]
+mod code_view;
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -70,13 +73,16 @@ const EXEMPT: &[(&str, &str)] = &[];
 fn disposable_dir_sites() -> Vec<Site> {
     let mut out = Vec::new();
     for path in isolation_sources() {
-        let src = std::fs::read_to_string(&path)
+        let raw = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("{} を読める（{e}）", path.display()));
         let file = path
             .strip_prefix(repo_root())
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
+        // コメントは落としてから見る（#1609。説明文に書いた見本の綴りを
+        // 違反として拾う / 実体が消えても説明文で緑、の両方を止める）
+        let src = code_view::without_comments_checked(&raw, &file);
         // 見るのは**製品コード側**（置き場を決める関数）だけ。単体テストの中で
         // テスト本体が作る使い捨ては別の話で、そちらは ScratchDir（#1312）と
         // 下の `テストを一巡しても…`（tako-core 側の実測）が受け持つ
@@ -196,8 +202,7 @@ fn 使い捨てdirの接頭辞はkindsに載っている() {
 /// 3: 判定を通さない削除を増やさない
 #[test]
 fn 残骸の削除は判定を通した経路だけ() {
-    let path = repo_root().join("crates/tako-core/src/test_residue.rs");
-    let src = std::fs::read_to_string(&path).expect("test_residue.rs を読める");
+    let src = read_code("crates/tako-core/src/test_residue.rs");
     // 見るのは製品コードだけ（単体テストは自分で作った使い捨てを自分で片付ける）
     let src = src
         .split_once("\n#[cfg(test)]\nmod tests {")
@@ -229,8 +234,7 @@ fn 残骸の削除は判定を通した経路だけ() {
 /// 4: 起動時の掃除が作る経路から呼ばれている（案 2 が配線されたまま）
 #[test]
 fn テストのdata_dirを作る経路が起動時の掃除を呼ぶ() {
-    let path = repo_root().join("crates/tako-core/src/paths.rs");
-    let src = std::fs::read_to_string(&path).expect("paths.rs を読める");
+    let src = read_code("crates/tako-core/src/paths.rs");
     let idx = src
         .find("fn test_data_dir()")
         .expect("fn test_data_dir が無い");
@@ -244,8 +248,18 @@ fn テストのdata_dirを作る経路が起動時の掃除を呼ぶ() {
 // ----------------------------------- テスト本体の使い捨て dir（Issue #1312）
 
 fn residue_source() -> String {
-    let path = repo_root().join("crates/tako-core/src/test_residue.rs");
-    std::fs::read_to_string(&path).expect("test_residue.rs を読める")
+    read_code("crates/tako-core/src/test_residue.rs")
+}
+
+/// **肯定の存在確認**（「この呼び出しが在る」）が見る眺め = コメントを落とした本文。
+///
+/// 全文へ `contains` すると、走査先の doc コメントに書いた同じ綴りで真になり、
+/// 実体が消えても緑のままになる（#1609）。バイト長と行番号が保たれるので、
+/// `enclosing_fn` の位置決めと `{file}:{line}` の名指しはそのまま効く
+fn read_code(rel: &str) -> String {
+    let path = repo_root().join(rel);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{rel} を読める（{e}）"));
+    code_view::without_comments_checked(&text, rel)
 }
 
 /// 5: 使い捨ての器（`ScratchDir`）が「作る側が消す」形を保っている
@@ -321,6 +335,8 @@ fn 種別はcliとmcpの案内に載っている() {
         "crates/tako-control/src/protocol.rs",
     ];
     let mut missing = Vec::new();
+    // ここだけは**全文**のまま（#1609）。見ているのは「案内が書いてあるか」で、
+    // 案内は doc コメントに書くものなので、コメントを落とすと必ず落ちる
     for rel in docs {
         let src = std::fs::read_to_string(repo_root().join(rel))
             .unwrap_or_else(|e| panic!("{rel} を読める（{e}）"));
@@ -344,8 +360,7 @@ fn 種別はcliとmcpの案内に載っている() {
 ///    製品の挙動が変わる（#1253 が隔離先をここへ置いた前提が崩れる）
 #[test]
 fn 検証起動の置き場の後始末はテストプロセス限定() {
-    let path = repo_root().join("crates/tako-core/src/paths.rs");
-    let src = std::fs::read_to_string(&path).expect("paths.rs を読める");
+    let src = read_code("crates/tako-core/src/paths.rs");
     let idx = src
         .find("pub fn verification_agent_home()")
         .expect("fn verification_agent_home が無い");

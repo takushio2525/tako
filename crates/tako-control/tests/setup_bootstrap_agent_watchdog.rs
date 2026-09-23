@@ -15,6 +15,17 @@ use std::path::Path;
 use tako_core::platform::agent_install::{self, AgentKind};
 use tako_core::platform::support::Platform;
 
+#[path = "common/code_view.rs"]
+mod code_view;
+
+/// **肯定の存在確認**（「この実装 / この文言が在る」）が見る眺め = コメントを落とした本文。
+///
+/// 全文へ `contains` すると、走査先の doc コメントに書いた同じ綴りで真になり、
+/// 実体が消えても緑のままになる（#1609）。不在検査は全文のままでよい
+fn read_code(rel: &str) -> String {
+    code_view::without_comments_checked(&read(rel), rel)
+}
+
 fn read(rel: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -69,7 +80,7 @@ fn 系統ごとの手順が実際に違う() {
 /// はっきりしているか**のどちらかにする
 #[test]
 fn claude既定の引数なし入口が生えていない() {
-    let src = read("crates/tako-control/src/setup_bootstrap.rs");
+    let src = read_code("crates/tako-control/src/setup_bootstrap.rs");
     // 系統を引数で受けるべき操作（3 系統で答えが変わるもの）
     const AGENT_SCOPED: &[&str] = &[
         "recipe",
@@ -173,7 +184,7 @@ fn 呼び出し側にclaude直比較が散っていない() {
 /// **A/B の逃げ道が消えていないか**を見る
 #[test]
 fn legacy_envの逃げ道が残っている() {
-    let src = read("crates/tako-control/src/setup_bootstrap.rs");
+    let src = read_code("crates/tako-control/src/setup_bootstrap.rs");
     assert!(src.contains("TAKO_989_LEGACY"), "A/B の env が消えている");
     assert!(
         src.contains("pub fn bootstrap_agents()"),

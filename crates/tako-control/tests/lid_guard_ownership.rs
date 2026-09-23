@@ -24,9 +24,18 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+#[path = "common/code_view.rs"]
+mod code_view;
+
 fn source() -> String {
     let path = repo_root().join(SRC);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} を読めない: {e}", path.display()))
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} を読めない: {e}", path.display()));
+    // **コメントを落とした眺め**を返す（#1609）。この番犬の検査はすべて
+    // 「この呼び出しを通っているか」= 肯定の存在確認なので、全文のままだと
+    // 理由を書いた doc コメントの綴りで緑になり、実体が消えても気づけない。
+    // バイト長と行番号は保たれるので `{SRC}:{line}` の名指しはそのまま効く
+    code_view::without_comments_checked(&text, SRC)
 }
 
 /// 製品コードの範囲（`#[cfg(test)] mod tests` より前）。テストの中身は検査の対象外
