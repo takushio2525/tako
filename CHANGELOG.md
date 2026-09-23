@@ -8,6 +8,28 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.8.19] - 2026-09-24
+
+Nightly patch release (automated). Changes since v0.8.18:
+夜間パッチリリース（自動）。v0.8.18 以降の変更:
+
+- [修正] Code Runner の組み込み既定を OS 別の 1 枚の表にし、Windows で成立する形と 20 拡張子を足した (#1655) (#1665)
+- [修正] Windows の pid 正体確認を境界へ足し、素通りを番犬で止めた (#1616) (#1626)
+- [改善] tako setup --check と check-health の診断項目を 1 実装の正本から組むようにした (#1505) (#1619)
+- [修正] エディタが CRLF ファイルを壊さないよう改行コードを検出して保持する (#1650) (#1663)
+- [改善] 編集中の再ハイライトを差分化し、1 打鍵で全文を塗り直さないようにした (#1648) (#1664)
+- [改善] 番犬が自分の doc コメントで緑になる型を棚卸しし、code_view を通す形へ寄せた (#1609) (#1615)
+- [修正] Windows の master system prompt が予算に収まるよう縮退の一覧を guide platform へ回した (#1571) (#1612)
+- [修正] config_share の probe_path が Windows で repo_rel を空にしないよう canonicalize を境界に通した (#1569) (#1610)
+- [機能追加] docs サイトに Cookie 同意バナーとプライバシーポリシーの導線を入れた (#1639) (#1640)
+- [修正] Instant の巻き戻しをやめ、起動直後の panic を止めた (#1627) (#1631)
+- [修正] docs サイトの AdSense と GA4 の ID を本物のアカウントのものに差し替える (#1635) (#1636)
+- [スタイル] tako-cli の出力から絵文字を消し、is_emoji の番犬を CLI 出力へ広げた (#1578) (#1608)
+- [改善] MCP ツールカタログの説明文を圧縮し、Issue 番号を落として next_step の読み方を足した (#1540) (#1604)
+- [修正] リンクを開く修飾キーをプラットフォームごとに 1 箇所で決め、Windows は Ctrl+クリックで開くようにした (#763) (#1600)
+- [修正] Windows の pid 生存判定を platform::process::pid_alive の 1 実装へ寄せた (#1557 #1581) (#1596)
+- [機能追加] Windows のシェル統合を tako setup の段として入れた (#1504) (#1589)
+
 ## [0.8.18] - 2026-09-23
 
 Nightly patch release (automated). Changes since v0.8.17:
