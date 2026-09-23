@@ -468,3 +468,4 @@
 - 2026-09-23 #1547: docs の数値・Issue 参照のズレを直し、docs ビルドと og / リンク検査を CI へ
 - 2026-09-23 #1544: orchestrator projects list を dispatch 経由へ寄せた
 - 2026-09-23 #1504: Windows のシェル統合を tako setup の段として入れた
+- 2026-09-23 #1557 / #1581: pid の生存判定を境界の 1 実装へ寄せた

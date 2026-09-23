@@ -6,7 +6,13 @@
 //!
 //! undo/redo（#195）: 編集操作前のスナップショットをスタックに積む（上限 1000）。
 //! 検索（#195）: バイト位置ベースのインクリメンタル検索と置換。
+//!
+//! 改行コード（#1650）: バッファは**ファイルのバイト列をそのまま**持つ。`\r\n` は
+//! 「1 つの行区切り」として扱い、カーソルは CR と LF のあいだに入らない。新しく足す
+//! 改行（Enter・挿入テキスト・置換テキスト）だけが [`LineEnding`] の多数派に揃うので、
+//! 既存行の改行は 1 バイトも書き換わらない（混在ファイルを開いて閉じてもバイト一致）。
 
+use std::borrow::Cow;
 use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -14,6 +20,57 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 const UNDO_LIMIT: usize = 1000;
+
+/// 改行コード（#1650）。
+///
+/// tako が行区切りとして扱うのは `\n` と `\r\n` の 2 つだけ。単独の `\r`
+/// （Classic Mac OS の流儀）は行内の制御文字として素通しする
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineEnding {
+    Lf,
+    Crlf,
+}
+
+impl LineEnding {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lf => "\n",
+            Self::Crlf => "\r\n",
+        }
+    }
+
+    /// 本文の**多数派**を返す。改行が 1 つも無ければ `None`。
+    ///
+    /// 同数のときは LF を選ぶ（移植性の高い側へ倒す）。多数派で決めるのは、
+    /// 1 行だけ流儀の違う行が混ざっているファイルで Enter の挿入文字が
+    /// その 1 行に引きずられないようにするため
+    pub fn detect(text: &str) -> Option<Self> {
+        let lf = text.matches('\n').count();
+        if lf == 0 {
+            return None;
+        }
+        let crlf = text.matches("\r\n").count();
+        Some(if crlf > lf - crlf {
+            Self::Crlf
+        } else {
+            Self::Lf
+        })
+    }
+
+    /// 改行を 1 つも持たないファイル用の既定（そのプラットフォームの流儀）
+    pub fn platform_default() -> Self {
+        if cfg!(windows) {
+            Self::Crlf
+        } else {
+            Self::Lf
+        }
+    }
+
+    /// 検出できなければ [`Self::platform_default`] へ倒す
+    pub fn detect_or_default(text: &str) -> Self {
+        Self::detect(text).unwrap_or_else(Self::platform_default)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorMovement {
@@ -62,6 +119,8 @@ pub struct TextBuffer {
     baseline: Vec<u8>,
     cursor: usize,
     anchor: Option<usize>,
+    /// 新しく足す改行に使うコード（#1650）。既存行の改行は書き換えない
+    line_ending: LineEnding,
     undo_stack: Vec<Snapshot>,
     redo_stack: Vec<Snapshot>,
 }
@@ -71,6 +130,7 @@ impl TextBuffer {
         let bytes = std::fs::read(path).map_err(TextEditError::Read)?;
         let text = String::from_utf8(bytes.clone()).map_err(|_| TextEditError::InvalidUtf8)?;
         Ok(Self {
+            line_ending: LineEnding::detect_or_default(&text),
             path: path.to_path_buf(),
             text,
             baseline: bytes,
@@ -84,6 +144,7 @@ impl TextBuffer {
     pub fn from_text(path: PathBuf, text: String) -> Self {
         let baseline = text.as_bytes().to_vec();
         Self {
+            line_ending: LineEnding::detect_or_default(&text),
             path,
             text,
             baseline,
@@ -92,6 +153,11 @@ impl TextBuffer {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
         }
+    }
+
+    /// このバッファが新しい改行に使うコード（#1650）
+    pub fn line_ending(&self) -> LineEnding {
+        self.line_ending
     }
 
     pub fn path(&self) -> &Path {
@@ -119,15 +185,21 @@ impl TextBuffer {
         self.text.as_bytes() != self.baseline
     }
 
+    /// 本文を丸ごと差し替える（外部変更の取り込み・dispatch からの適用）。
+    ///
+    /// 渡された本文の改行コードを取り直す（#1650）。呼び出し側は「保存されるべき
+    /// 全文」を渡しているので、そこに書かれている流儀がこのファイルの流儀になる。
+    /// 改行を 1 つも含まない本文では直前の流儀を保つ
     pub fn set_text(&mut self, text: String) {
         self.push_undo();
+        self.line_ending = LineEnding::detect(&text).unwrap_or(self.line_ending);
         self.text = text;
         self.cursor = self.text.len();
         self.anchor = None;
     }
 
     pub fn set_cursor(&mut self, offset: usize, extend_selection: bool) {
-        let offset = snap_boundary(&self.text, offset.min(self.text.len()));
+        let offset = snap_cursor(&self.text, offset.min(self.text.len()));
         if extend_selection {
             self.anchor.get_or_insert(self.cursor);
         } else {
@@ -141,15 +213,21 @@ impl TextBuffer {
         self.cursor = self.text.len();
     }
 
+    /// 本文を差し込む。**入ってくる改行はこのバッファの流儀へ揃える**（#1650）。
+    ///
+    /// 打鍵・IME・貼り付け・dispatch（CLI / MCP）の挿入がすべてここを通るので、
+    /// 揃えるのをここ 1 か所にしておけば、どの経路から入れても混在改行にならない
     pub fn insert(&mut self, text: &str) {
+        let text = normalize_line_endings(text, self.line_ending);
         self.push_undo();
         self.delete_selection_inner();
-        self.text.insert_str(self.cursor, text);
+        self.text.insert_str(self.cursor, &text);
         self.cursor += text.len();
     }
 
+    /// Enter。挿す文字はこのファイルの改行コード（#1650）
     pub fn newline(&mut self) {
-        self.insert("\n");
+        self.insert(self.line_ending.as_str());
     }
 
     pub fn delete_backward(&mut self) {
@@ -164,11 +242,16 @@ impl TextBuffer {
         }
         self.push_undo();
         self.anchor = None;
-        let previous = self.text[..self.cursor]
-            .char_indices()
-            .next_back()
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+        // `\r\n` は 1 つの行区切り。片方だけ消すと裸の CR が残る（#1650）
+        let previous = if self.text[..self.cursor].ends_with("\r\n") {
+            self.cursor - 2
+        } else {
+            self.text[..self.cursor]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        };
         self.text.drain(previous..self.cursor);
         self.cursor = previous;
     }
@@ -185,12 +268,17 @@ impl TextBuffer {
         }
         self.push_undo();
         self.anchor = None;
-        let next = self.cursor
-            + self.text[self.cursor..]
-                .chars()
-                .next()
-                .map(char::len_utf8)
-                .unwrap_or(0);
+        // `\r\n` は 1 つの行区切り。片方だけ消すと裸の CR が残る（#1650）
+        let next = if self.text[self.cursor..].starts_with("\r\n") {
+            self.cursor + 2
+        } else {
+            self.cursor
+                + self.text[self.cursor..]
+                    .chars()
+                    .next()
+                    .map(char::len_utf8)
+                    .unwrap_or(0)
+        };
         self.text.drain(self.cursor..next);
     }
 
@@ -314,10 +402,12 @@ impl TextBuffer {
             .cloned()
     }
 
-    /// 指定範囲を置換文字列で置き換える（1 件置換）
+    /// 指定範囲を置換文字列で置き換える（1 件置換）。
+    /// 置換文字列の改行もこのバッファの流儀へ揃える（#1650）
     pub fn replace_range(&mut self, range: Range<usize>, replacement: &str) {
+        let replacement = normalize_line_endings(replacement, self.line_ending);
         self.push_undo();
-        self.text.replace_range(range.clone(), replacement);
+        self.text.replace_range(range.clone(), &replacement);
         self.cursor = range.start + replacement.len();
         self.anchor = None;
     }
@@ -328,13 +418,14 @@ impl TextBuffer {
         if hits.is_empty() {
             return 0;
         }
+        let replacement = normalize_line_endings(replacement, self.line_ending);
         self.push_undo();
         let mut offset: isize = 0;
         let count = hits.len();
         for hit in &hits {
             let start = (hit.start as isize + offset) as usize;
             let end = (hit.end as isize + offset) as usize;
-            self.text.replace_range(start..end, replacement);
+            self.text.replace_range(start..end, &replacement);
             offset += replacement.len() as isize - (hit.end - hit.start) as isize;
         }
         self.cursor = self.cursor.min(self.text.len());
@@ -344,11 +435,16 @@ impl TextBuffer {
 
     pub fn move_cursor(&mut self, movement: CursorMovement, extend_selection: bool) {
         let target = match movement {
+            // `\r\n` は 1 つの行区切りなので、あいだで止まらずにまたぐ（#1650）
+            CursorMovement::Left if self.text[..self.cursor].ends_with("\r\n") => self.cursor - 2,
             CursorMovement::Left => self.text[..self.cursor]
                 .char_indices()
                 .next_back()
                 .map(|(i, _)| i)
                 .unwrap_or(0),
+            CursorMovement::Right if self.text[self.cursor..].starts_with("\r\n") => {
+                self.cursor + 2
+            }
             CursorMovement::Right => {
                 self.cursor
                     + self.text[self.cursor..]
@@ -379,11 +475,8 @@ impl TextBuffer {
     /// 行番号 + 行内バイト位置を文書全体の UTF-8 バイト位置へ変換する。
     pub fn offset_for_line_byte_col(&self, line: usize, byte_col: usize) -> usize {
         let start = line_start_offset(&self.text, line).unwrap_or(self.text.len());
-        let end = self.text[start..]
-            .find('\n')
-            .map(|i| start + i)
-            .unwrap_or(self.text.len());
-        snap_boundary(&self.text, (start + byte_col).min(end))
+        let end = line_end_offset(&self.text, start);
+        snap_cursor(&self.text, (start + byte_col).min(end))
     }
 
     pub fn save(&mut self) -> Result<(), TextEditError> {
@@ -419,10 +512,7 @@ impl TextBuffer {
     }
 
     fn line_end(&self, offset: usize) -> usize {
-        self.text[offset..]
-            .find('\n')
-            .map(|i| offset + i)
-            .unwrap_or(self.text.len())
+        line_end_offset(&self.text, offset)
     }
 
     fn vertical_target(&self, delta: isize) -> usize {
@@ -546,6 +636,54 @@ fn snap_boundary(text: &str, mut offset: usize) -> usize {
         offset -= 1;
     }
     offset
+}
+
+/// 行末（改行の手前）のバイト位置。`\r\n` で終わる行では **CR の手前**を返す（#1650）。
+///
+/// `\n` の位置を返していたのが Issue #1650 の本体で、CRLF ファイルで End を押すと
+/// カーソルが画面上の行末より右（CR の後ろ）へ行き、そこで打つと `abc\r!\n` になった
+fn line_end_offset(text: &str, offset: usize) -> usize {
+    match text[offset..].find('\n') {
+        Some(i) => {
+            let newline = offset + i;
+            if text[..newline].ends_with('\r') {
+                newline - 1
+            } else {
+                newline
+            }
+        }
+        None => text.len(),
+    }
+}
+
+/// カーソルを置いてよい位置へ丸める。
+///
+/// UTF-8 の文字境界に加えて、**`\r\n` のあいだ**（CR の後ろ）を除く（#1650）。
+/// そこは画面上どこにも対応しない位置で、行末判定を直しても外から
+/// [`TextBuffer::set_cursor`]（マウスクリック・IME・dispatch）で指されうる
+fn snap_cursor(text: &str, offset: usize) -> usize {
+    let offset = snap_boundary(text, offset);
+    let bytes = text.as_bytes();
+    if offset > 0 && bytes[offset - 1] == b'\r' && bytes.get(offset) == Some(&b'\n') {
+        offset - 1
+    } else {
+        offset
+    }
+}
+
+/// 差し込む本文の改行を `ending` へ揃える（#1650）。
+///
+/// 単独の `\r` は行区切りではないので触らない。揃える必要が無いときは
+/// 借用のまま返すので、1 文字ずつの打鍵では何も確保しない
+fn normalize_line_endings(text: &str, ending: LineEnding) -> Cow<'_, str> {
+    match ending {
+        LineEnding::Lf if text.contains('\r') => Cow::Owned(text.replace("\r\n", "\n")),
+        LineEnding::Crlf if text.contains('\n') => {
+            // 一度 LF へ潰してから広げる（既に `\r\n` の場所を二重化しないため）
+            Cow::Owned(text.replace("\r\n", "\n").replace('\n', "\r\n"))
+        }
+        _ => Cow::Borrowed(text),
+    }
 }
 
 #[cfg(unix)]
@@ -1072,6 +1210,202 @@ mod tests {
         assert!(buffer.find_all("").is_empty());
         assert!(buffer.find_next("", 0).is_none());
         assert!(buffer.find_prev("", 0).is_none());
+    }
+
+    // --- #1650: 改行コード（LF / CRLF）の検出・保持 ---
+
+    /// 往復保存の実測を 1 か所で取る（開く → 行末 → Enter → 文字 → 保存）。
+    /// 戻り値は保存後の生バイト
+    fn crlf_round_trip(name: &str, original: &[u8], go_to_line: usize) -> Vec<u8> {
+        let path = path(name);
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, original).unwrap();
+        let mut buffer = TextBuffer::open(&path).unwrap();
+        for _ in 0..go_to_line {
+            buffer.move_cursor(CursorMovement::Down, false);
+        }
+        buffer.move_cursor(CursorMovement::LineEnd, false);
+        buffer.newline();
+        buffer.insert("X");
+        buffer.save().unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+        saved
+    }
+
+    #[test]
+    fn crlfファイルの行末はcrの手前へ止まる() {
+        // HL3 の再現: `line_end` が `\n` の位置を返すと、カーソルが CR の後ろ
+        // （画面上の行末より右）に来る。そこで打つと `abc\r!\n` になる
+        let mut buffer = TextBuffer::from_text(path("crlf-end"), "abc\r\ndef\r\n".into());
+        buffer.move_cursor(CursorMovement::LineEnd, false);
+        assert_eq!(buffer.cursor(), 3, "行末は CR の手前（見た目の行末）");
+        buffer.insert("!");
+        assert_eq!(buffer.text(), "abc!\r\ndef\r\n");
+    }
+
+    #[test]
+    fn crlfファイルの往復編集で改行コードが保たれる() {
+        // E3 の再現: Enter が常に `\n` を挿すと CR 2 / LF 3 の混在になる
+        let saved = crlf_round_trip("crlf-round", b"abc\r\ndef\r\n", 0);
+        assert_eq!(saved, b"abc\r\nX\r\ndef\r\n");
+        let cr = saved.iter().filter(|b| **b == b'\r').count();
+        let lf = saved.iter().filter(|b| **b == b'\n').count();
+        assert_eq!((cr, lf), (3, 3), "CRLF ファイルは CR の数 = LF の数");
+    }
+
+    #[test]
+    fn lfファイルの往復編集でcrが混ざらない() {
+        let saved = crlf_round_trip("lf-round", b"abc\ndef\n", 0);
+        assert_eq!(saved, b"abc\nX\ndef\n");
+        assert_eq!(saved.iter().filter(|b| **b == b'\r').count(), 0);
+    }
+
+    #[test]
+    fn 混在ファイルは既存の改行を残し新しい行だけ多数派になる() {
+        // `\r\n` が 2 / 裸の `\n` が 1 なので多数派は CRLF。
+        // 2 行目（`b\n`）の行末で Enter を打っても、既存の `\n` は書き換えない
+        let saved = crlf_round_trip("mixed-round", b"a\r\nb\nc\r\n", 1);
+        assert_eq!(saved, b"a\r\nb\r\nX\nc\r\n");
+    }
+
+    #[test]
+    fn 編集しなければどの改行コードでもバイト一致で保存される() {
+        for (name, original) in [
+            ("noop-crlf", &b"a\r\nb\r\n"[..]),
+            ("noop-lf", &b"a\nb\n"[..]),
+            ("noop-mixed", &b"a\r\nb\nc\r\n"[..]),
+            ("noop-no-eol", &b"a\r\nb"[..]),
+        ] {
+            let path = path(name);
+            let _ = std::fs::remove_file(&path);
+            std::fs::write(&path, original).unwrap();
+            let mut buffer = TextBuffer::open(&path).unwrap();
+            assert!(!buffer.dirty(), "{name}: 開いただけで dirty にならない");
+            buffer.save().unwrap();
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                original,
+                "{name}: バイト一致"
+            );
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn 末尾改行の有無が往復で保たれる() {
+        // 末尾に改行が無いファイルは、行末 Enter → 文字入力のあとも末尾改行なしのまま
+        let saved = crlf_round_trip("no-eol-crlf", b"abc\r\ndef", 1);
+        assert_eq!(saved, b"abc\r\ndef\r\nX");
+        let saved = crlf_round_trip("no-eol-lf", b"abc\ndef", 1);
+        assert_eq!(saved, b"abc\ndef\nX");
+    }
+
+    #[test]
+    fn 改行コードの検出は多数派を選び改行が無ければ既定へ倒れる() {
+        assert_eq!(LineEnding::detect("a\r\nb\r\n"), Some(LineEnding::Crlf));
+        assert_eq!(LineEnding::detect("a\nb\n"), Some(LineEnding::Lf));
+        assert_eq!(LineEnding::detect("a\r\nb\nc\r\n"), Some(LineEnding::Crlf));
+        assert_eq!(LineEnding::detect("a\r\nb\nc\n"), Some(LineEnding::Lf));
+        // 同数は LF（移植性の高い側へ倒す）
+        assert_eq!(LineEnding::detect("a\r\nb\n"), Some(LineEnding::Lf));
+        assert_eq!(LineEnding::detect("abc"), None);
+        assert_eq!(LineEnding::detect(""), None);
+        // 改行を 1 つも持たないファイルはそのプラットフォームの流儀
+        let buffer = TextBuffer::from_text(path("no-newline"), "abc".into());
+        assert_eq!(buffer.line_ending(), LineEnding::platform_default());
+    }
+
+    #[test]
+    fn crlfバッファでは行区切りをひとまとまりとして越える() {
+        let mut buffer = TextBuffer::from_text(path("crlf-move"), "abc\r\ndef".into());
+        buffer.set_cursor(3, false);
+        buffer.move_cursor(CursorMovement::Right, false);
+        assert_eq!(buffer.cursor(), 5, "CR と LF のあいだで止まらない");
+        buffer.move_cursor(CursorMovement::Left, false);
+        assert_eq!(buffer.cursor(), 3);
+        // 外から CR と LF のあいだを指されても見た目の行末へ丸める
+        buffer.set_cursor(4, false);
+        assert_eq!(buffer.cursor(), 3);
+        assert_eq!(buffer.offset_for_line_byte_col(0, 99), 3);
+    }
+
+    #[test]
+    fn crlfバッファの削除は行区切りをひとまとまりで消す() {
+        let mut buffer = TextBuffer::from_text(path("crlf-del-fwd"), "abc\r\ndef".into());
+        buffer.set_cursor(3, false);
+        buffer.delete_forward();
+        assert_eq!(buffer.text(), "abcdef", "前方削除が裸の CR を残さない");
+
+        let mut buffer = TextBuffer::from_text(path("crlf-del-back"), "abc\r\ndef".into());
+        buffer.set_cursor(5, false);
+        buffer.delete_backward();
+        assert_eq!(buffer.text(), "abcdef", "後方削除が裸の CR を残さない");
+    }
+
+    #[test]
+    fn 挿入テキストの改行はバッファの改行コードへ揃う() {
+        let mut crlf = TextBuffer::from_text(path("crlf-paste"), "a\r\n".into());
+        crlf.move_cursor(CursorMovement::DocumentEnd, false);
+        crlf.insert("x\ny");
+        assert_eq!(crlf.text(), "a\r\nx\r\ny", "裸の LF が混ざらない");
+        crlf.insert("\r\nz");
+        assert_eq!(
+            crlf.text(),
+            "a\r\nx\r\ny\r\nz",
+            "既に CRLF なら二重化しない"
+        );
+
+        let mut lf = TextBuffer::from_text(path("lf-paste"), "a\n".into());
+        lf.move_cursor(CursorMovement::DocumentEnd, false);
+        lf.insert("x\r\ny");
+        assert_eq!(lf.text(), "a\nx\ny", "LF ファイルへ CR を持ち込まない");
+    }
+
+    #[test]
+    fn 置換の改行もバッファの改行コードへ揃う() {
+        let mut buffer = TextBuffer::from_text(path("crlf-replace"), "a\r\nQ\r\n".into());
+        assert_eq!(buffer.replace_all("q", "1\n2"), 1);
+        assert_eq!(buffer.text(), "a\r\n1\r\n2\r\n");
+
+        let mut buffer = TextBuffer::from_text(path("crlf-replace-range"), "a\r\nQ\r\n".into());
+        buffer.replace_range(3..4, "1\n2");
+        assert_eq!(buffer.text(), "a\r\n1\r\n2\r\n");
+    }
+
+    #[test]
+    fn set_textは渡された本文から改行コードを取り直す() {
+        let mut buffer = TextBuffer::from_text(path("set-text-eol"), "a\r\nb\r\n".into());
+        assert_eq!(buffer.line_ending(), LineEnding::Crlf);
+        buffer.set_text("a\nb\n".into());
+        assert_eq!(buffer.line_ending(), LineEnding::Lf);
+        buffer.newline();
+        assert_eq!(buffer.text(), "a\nb\n\n");
+        // 改行を持たない本文では直前の改行コードを保つ
+        buffer.set_text("abc".into());
+        assert_eq!(buffer.line_ending(), LineEnding::Lf);
+    }
+
+    #[test]
+    fn crlfバッファでも上下移動が見た目の行内へ収まる() {
+        let mut buffer = TextBuffer::from_text(path("crlf-vertical"), "abcdef\r\ngh\r\nij".into());
+        buffer.move_cursor(CursorMovement::LineEnd, false);
+        assert_eq!(buffer.cursor(), 6);
+        buffer.move_cursor(CursorMovement::Down, false);
+        // 2 行目は 2 文字しかないので行末（CR の手前）で止まる
+        assert_eq!(buffer.line_byte_col(buffer.cursor()), (1, 2));
+        buffer.insert("!");
+        assert_eq!(buffer.text(), "abcdef\r\ngh!\r\nij");
+    }
+
+    #[test]
+    fn 行頭行末とカーソル位置がcrを行内文字に数えない() {
+        let buffer = TextBuffer::from_text(path("crlf-col"), "abc\r\ndef\r\n".into());
+        // 2 行目の先頭は LF の次
+        assert_eq!(buffer.line_byte_col(5), (1, 0));
+        // 2 行目の行末（CR の手前）は列 3
+        assert_eq!(buffer.line_byte_col(8), (1, 3));
+        assert_eq!(buffer.offset_for_line_byte_col(1, 3), 8);
     }
 
     #[test]
