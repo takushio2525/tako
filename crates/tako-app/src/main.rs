@@ -4830,13 +4830,17 @@ impl TakoApp {
         //   2) 前段ガード: バックエンドに実行中子プロセスがなければ Node 起動を丸ごとスキップ
         //   3) TTL 延長（2s→5s）: watch / worker_status の重複 Node 起動を抑制
         cx.spawn(async move |this, cx| {
-            let mut last_scan = std::time::Instant::now() - CLAUDE_SESSION_SCAN_INTERVAL;
+            // 「まだ一度も走らせていない」は `None` で表す（#1627）。
+            // `Instant::now() - 間隔` は稼働時間がその間隔未満のマシンで panic する
+            // （ログイン時の自動起動はブート直後に来るので実際に踏みうる）
+            let mut last_scan: Option<std::time::Instant> = None;
             loop {
                 cx.background_executor()
                     .timer(CLAUDE_SESSION_CHECK_INTERVAL)
                     .await;
                 let event_triggered = tako_control::take_claude_scan_request();
-                let timer_triggered = last_scan.elapsed() >= CLAUDE_SESSION_SCAN_INTERVAL;
+                let timer_triggered =
+                    last_scan.is_none_or(|t| t.elapsed() >= CLAUDE_SESSION_SCAN_INTERVAL);
                 if !event_triggered && !timer_triggered {
                     continue;
                 }
@@ -4875,7 +4879,7 @@ impl TakoApp {
                     })
                     .unwrap_or((false, Vec::new(), Vec::new(), Vec::new()));
                 if !should_scan {
-                    last_scan = std::time::Instant::now();
+                    last_scan = Some(std::time::Instant::now());
                     continue;
                 }
                 // 前段ガード: 走査対象に実行中の子プロセスがなければ claude も居ないので
@@ -4889,7 +4893,7 @@ impl TakoApp {
                     })
                     .await;
                 if !has_children {
-                    last_scan = std::time::Instant::now();
+                    last_scan = Some(std::time::Instant::now());
                     let _ = this.update(cx, |app: &mut TakoApp, _| {
                         // #1076: ここを `clear()` にすると、**再起動直後**（claude が
                         // まだ起動途中でどのペインも子プロセスを持たない数秒間）に
@@ -4909,7 +4913,7 @@ impl TakoApp {
                     .background_executor()
                     .spawn(async move { tako_control::agents::list_agents_for_scan(&pane_pids) })
                     .await;
-                last_scan = std::time::Instant::now();
+                last_scan = Some(std::time::Instant::now());
                 let Ok(agents_value) = agents_value else {
                     continue;
                 };
@@ -8102,7 +8106,10 @@ impl TakoApp {
             // 申し送り（`hidden`）を書けるのはメインスレッドの `on_term_event` だけなので、
             // 一度も渡らなくなると申し送りが更新されない。この間隔で必ず 1 回渡し、
             // 申し送りの古さを上限つきにする（= 表に出た直後でも自力で復帰する）
-            let mut last_hop = std::time::Instant::now() - TakoApp::HIDDEN_WAKEUP_RECHECK;
+            // 巻き戻しは飽和する 1 実装を通す（#1627: `Instant::now() - d` は稼働時間が
+            // `d` 未満で panic する）。`batch_term_events` が `&mut Instant` を受けるので
+            // 型は変えない。窓は 200ms なので飽和しても取りこぼしは起きない
+            let mut last_hop = tako_core::monotonic::rewound(TakoApp::HIDDEN_WAKEUP_RECHECK);
             while let Some(event) = rx.next().await {
                 let wakeup_only = matches!(
                     event,
@@ -29132,7 +29139,7 @@ mod self_test {
             let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
                 // デバウンス窓を空けて「要求するなら即座に要求する」状態にする
                 app.last_term_notify =
-                    std::time::Instant::now() - std::time::Duration::from_secs(1);
+                    tako_core::monotonic::rewound(std::time::Duration::from_secs(1));
                 app.on_term_event(
                     target,
                     tako_core::SessionEvent::Term(tako_core::TermEvent::Wakeup),
@@ -37163,7 +37170,7 @@ mod self_test {
             // グリッドの描画コストが測れない
             let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
                 app.last_term_notify =
-                    std::time::Instant::now() - std::time::Duration::from_secs(1);
+                    tako_core::monotonic::rewound(std::time::Duration::from_secs(1));
                 app.on_term_event(
                     pane,
                     tako_core::SessionEvent::Term(tako_core::TermEvent::Wakeup),
@@ -45570,7 +45577,7 @@ mod self_test {
                     .update(cx, |app, _, _| {
                         if let Some(ctl) = app.scroll_ctls.get_mut(&backend_pane) {
                             ctl.last_activity =
-                                std::time::Instant::now() - Duration::from_secs(3);
+                                tako_core::monotonic::rewound(Duration::from_secs(3));
                         }
                         let area = app
                             .pane_text_areas
@@ -60691,9 +60698,9 @@ mod self_test {
                 let probe_nudge = |cx: &mut AsyncApp| -> Vec<String> {
                     window
                         .update(cx, |app, _, _| {
-                            let old = std::time::Instant::now()
-                                - tako_core::handoff::NUDGE_GRACE
-                                - Duration::from_secs(10);
+                            let old = tako_core::monotonic::rewound(
+                                tako_core::handoff::NUDGE_GRACE + Duration::from_secs(10),
+                            );
                             app.handoff_nudges
                                 .insert(master_pane, HandoffNudgeTracker::new(old));
                             app.handoff_policy_cache.clear();
@@ -62028,8 +62035,8 @@ mod self_test {
                             .find(|flow| flow.pane == busy_pane)
                             .expect("直前に積んだ PromptFlow が存在する");
                         let follow_up = flow.delivery_flow == PromptDeliveryFlow::FollowUpSend;
-                        flow.created_at = std::time::Instant::now()
-                            - std::time::Duration::from_secs(121);
+                        flow.created_at =
+                            tako_core::monotonic::rewound(std::time::Duration::from_secs(121));
                         app.drive_prompt_flows();
                         follow_up
                     })
@@ -62276,8 +62283,9 @@ mod self_test {
                                 .update(cx, |app: &mut TakoApp, _, cx| {
                                     let target = pane.unwrap_or_else(|| app.focused_pane());
                                     // デバウンス窓を空けて「要求するなら即座に要求する」状態にする
-                                    app.last_term_notify = std::time::Instant::now()
-                                        - std::time::Duration::from_secs(1);
+                                    app.last_term_notify = tako_core::monotonic::rewound(
+                                        std::time::Duration::from_secs(1),
+                                    );
                                     let (r0, s0) =
                                         (app.term_redraw_requests, app.term_redraw_skipped);
                                     for _ in 0..8 {

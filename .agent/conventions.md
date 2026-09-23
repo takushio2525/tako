@@ -1568,6 +1568,34 @@ claude は空欄へ **AI のゴースト提案**を dim で描き、文面は
   **下限 30% を跨いだファイルは 0 件**で、番犬 `広げても下限を跨いだファイルは無い` が
   同じファイルの新旧を比べて常設で見張る（テストの厚いファイルでは落ちない）
 
+## `Instant` は巻き戻さない（Issue #1627）
+
+**`Instant::now() - Duration` を書かない。** `Instant` の起点はブートなので
+（Windows は QueryPerformanceCounter・macOS は `CLOCK_UPTIME_RAW`）、**稼働時間より
+長く引くと panic する**（`overflow when subtracting duration from instant`）。
+OS 依存ではない。
+
+- **「まだ一度も起きていない」は `Option<Instant>` の `None`** で表す。判定は
+  `opt.is_none_or(|t| t.elapsed() > TTL)`。時刻を捏造しないので閾値に依らない
+- **「N 前に起きたことにする」は `tako_core::monotonic::rewound(d)`**（飽和する 1 実装。
+  巻き戻せなければ「今」を返す）。自己検査でデバウンス窓を空ける用途はこちら。
+  **初期値を期限切れにする用途には使わない**（飽和すると意味が反転する）
+- #1627 の実物: `PaneMapping::new()` が「最初は必ず期限切れ」を
+  `Instant::now() - Duration::from_secs(999)` で表していたので、**ブートから
+  16 分 39 秒以内に `tako remote serve` が立つと panic**した（本番の呼び手は
+  serve の起動と `backend_session_of_pane`）。再起動直後の自動復帰（#1485）は
+  普通に起きる並び
+- **「速い CI ほど落ちる」フレークとして現れる**: 同じ head の CI を 2 回回すと、
+  テストに到達した時刻が boot から 746 秒 = panic / 1012 秒 = ok で反転した。
+  負荷や環境の揺れとして片付けると原因に届かない（#1278 で Windows の
+  `cargo test` を blocking にしたので、これは全 PR を無作為に赤くする）
+- **走査は改行をまたぐ**。Issue の初版は行単位の grep で数えたので
+  `Instant::now()` と `- Duration` が別の行に割れた 3 箇所を見落としていた
+  （実際は 9 箇所）。番犬
+  `crates/tako-control/tests/issue1627_instant_underflow_watchdog.rs` は
+  本番コード（4 クレートの `src`・コメントと文字列は `code_view` で潰す）を
+  改行ごと走査して `file:line` で名指す
+
 ## 効果を測る単体テストは実時間で比べない（Issue #1167 / #1220）
 
 「速くなっている」を `Instant::elapsed` の**比較**で固定したテストは、片方の計測窓にだけ
