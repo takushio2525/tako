@@ -33,6 +33,16 @@ export default defineConfig({
 						"location.replace('https://tako.takushio2525.com' + location.pathname + location.search + location.hash);" +
 						"}",
 				},
+				// Cookie 同意（Consent Mode v2）。takushio2525.com 一族で共用のバナー本体を読む。
+				// **Google タグより前に `async` を付けずに**置くのが条件（`gtag('consent',
+				// 'default', …)` が `gtag('config', …)` より前に dataLayer へ入っていないと
+				// 既定値が効かない）。旧ドメインからの転送より後ろなのは、転送で捨てる表示の
+				// ために同期の取得を待たせないため。バナー本体・国判定・ポリシーの正本は
+				// ハブ（takushio2525.com）側にあり、ここは読み込むだけ。
+				{
+					tag: 'script',
+					attrs: { src: 'https://takushio2525.com/consent/consent.js' },
+				},
 				// Google アナリティクス 4（gtag.js）。Google タグは 1 ページに 1 つだけ置く。
 				{
 					tag: 'script',
@@ -46,6 +56,12 @@ export default defineConfig({
 					content:
 						'window.dataLayer = window.dataLayer || [];' +
 						'function gtag(){dataLayer.push(arguments);}' +
+						// consent.js を読めなかった（通信失敗・ブロック）ときの保険。既定値が
+						// 1 つも宣言されていないと gtag は全部同意済みとして動くので、止める側へ
+						// 倒す。**省略しない。**
+						'if (!window.tkConsent) ' +
+						"gtag('consent', 'default', {ad_storage: 'denied', ad_user_data: 'denied', " +
+						"ad_personalization: 'denied', analytics_storage: 'denied'});" +
 						"gtag('js', new Date());" +
 						`gtag('config', '${GA_MEASUREMENT_ID}');`,
 				},
@@ -70,6 +86,7 @@ export default defineConfig({
 			],
 			components: {
 				Sidebar: './src/components/SidebarHelp.astro',
+				Footer: './src/components/FooterLegal.astro',
 			},
 			sidebar: [
 				{

@@ -1,0 +1,49 @@
+---
+/**
+ * Starlight の Footer を拡張して、全ページ共通の法務リンクを足す。
+ *
+ * - 「プライバシーポリシー」は takushio2525.com 一族で共通の 1 ページ（正本はハブ側）。
+ * - 「Cookie 設定」は `data-tk-consent-open` が付いているので、consent.js が
+ *   その場で同意バナーを開き直す（遷移しない）。consent.js が動かない環境では
+ *   `href` のとおりポリシーの Cookie の節へ飛ぶだけになる。
+ *
+ * この 2 本は**素の `<a>` で書く**こと。consent.js は document の click を拾って
+ * `preventDefault()` するため、フレームワークのリンク部品に置き換えると
+ * クライアント遷移が先に走ってバナーが開かない。
+ *
+ * 既定の Footer（編集リンク・更新日・前後ページ）は `@astrojs/starlight` から
+ * そのまま読む（`virtual:starlight/components/Footer` はこのファイル自身に
+ * 解決されるので使えない）。
+ */
+import StarlightFooter from '@astrojs/starlight/components/Footer.astro';
+---
+
+<StarlightFooter />
+
+<div class="tako-legal">
+  <a href="https://takushio2525.com/privacy/">プライバシーポリシー</a>
+  <a href="https://takushio2525.com/privacy/#cookie" data-tk-consent-open>Cookie 設定</a>
+</div>
+
+<style>
+  .tako-legal {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 1.25rem;
+    justify-content: center;
+    margin: 1.5rem 0 0.5rem;
+    font-size: var(--sl-text-xs);
+    color: var(--sl-color-gray-3);
+  }
+
+  .tako-legal a {
+    color: inherit;
+    text-decoration: none;
+  }
+
+  .tako-legal a:hover,
+  .tako-legal a:focus-visible {
+    color: var(--sl-color-white);
+    text-decoration: underline;
+  }
+</style>
