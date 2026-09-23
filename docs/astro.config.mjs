@@ -6,12 +6,12 @@ import starlight from '@astrojs/starlight';
 // プロパティを共有している（gtag は既定で cookie_domain: 'auto' なので `_ga` は書ける
 // 一番上のドメイン = takushio2525.com に置かれ、サブドメインをまたいでも同じ訪問者として
 // 数えられる）。サイト別に見たいときはレポートの「ホスト名」ディメンションで分ける。
-const GA_MEASUREMENT_ID = 'G-9BE9FDHVWQ';
+const GA_MEASUREMENT_ID = 'G-30GVXMB0GH';
 
 // AdSense のサイト所有権確認に使うパブリッシャー ID。ここでは所有権を示すだけで広告は
 // 出さないので adsbygoogle.js は読み込まない。ads.txt はルートドメイン takushio2525.com に
 // 1 つ置けば全サブドメインへ効くため、このサイトには置かない。
-const ADSENSE_PUBLISHER_ID = 'ca-pub-7311039699517221';
+const ADSENSE_PUBLISHER_ID = 'ca-pub-3136871606832456';
 
 export default defineConfig({
 	// 公開 URL。canonical / og:url / sitemap / OG 画像の絶対 URL の基点になる
