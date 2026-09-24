@@ -1681,7 +1681,7 @@ codex / agy は理由つき skip）。自動解決へ回った行は #1499（Z5�
 | FR-3.3.1 | **Markdown の表示品質**（#656）。①**GFM テーブルは表形式**で描く: 外枠 + セル間罫線 + セルパディング + ヘッダ行の強調（`surface_highlight` の帯 + 太字）+ 偶数行のゼブラ + 列アライメント（`:---` / `:---:` / `---:`）。列幅は内容の表示幅（全角 = 2）から比で配り、**狭いペインでも横に溢れず**セル内で折り返す。行ごとにセル数が違う壊れた表は列数をヘッダへ正規化する。②要素の描き分け: H1〜H6 はサイズ・太さ・色の 3 点でレベル差を付け H1 / H2 は下罫線、コードブロックは `mantle` のパネル + 枠 + 言語指定フェンスの syntect ハイライト（**ライトテーマでは輝度を落として可読性を確保**）、インラインコードは `surface_highlight` の背景 + `peach`、リンクは `accent` + 下線、引用は左ボーダー + 淡い面（ネスト対応。引用内のリスト・コードも同じ帯に入る）、リストはネスト段ごとにマーカー字形（● ○ ■）を変え番号付きは `accent_muted`、タスクリストは**図形のチェックボックス**（絵文字禁止）、水平線は `border_heavy`。③**選択・コピーは表のセル単位**で成立する（セル 1 つ = 選択 1 行。同じ y 帯に並ぶセルは x でヒットテストを解決する）。色はすべて Theme 経由（FR-4）で dark / light 両対応 | S |
 | FR-3.3.2 | **Markdown のリンク ⌘+クリックとコードブロックのコピー**（#680）。①`[text](url)` のリンクは ⌘+ホバーで下線を実線化 + `accent` 背景 + ポインタカーソル、⌘+クリックで **OS 既定ブラウザ**を開く（ターミナル内 URL = #146 / PDF 内リンク = #315 と同じ UX）。**開くのは http / https だけ**（`tako_core::url_guard::check_browser_url` が正。`md_links::browser_url` はその再公開。`javascript:` / `data:` / `file:` / 相対パス / アンカーは一覧には出るが開かない）。**この規則は Markdown 専用ではない**: **PDF のリンク注釈**（#271 / #315）と**ポート検知の提案チップ**（FR-2.4.3）も同じ 1 実装を通す（#1376。PDF の注釈は中身が任意の文字列で、OS の既定ハンドラは `file:` URL・UNC パス・ローカルの実行ファイルパスも開くため、素通りさせるとクリック 1 回で任意のプログラムが起動する）。経路側を落としても穴にならないよう**境界 B8（`os_integration::open_url`）にも保険**を置き、そこは http / https に加えて tako 自身が組み立てる OS 固有スキーム（`url_guard::OS_HANDLER_SCHEMES` = `x-apple.systempreferences:`）だけを通す。**弾いたリンクは黙って捨てず**通知へ出し、診断へはリンク文字列ではなく理由の分類だけを残す。当たり判定は「文字の上にあるか」= `TextLayout::index_for_position` の `Ok` のみを採り、⌘ 無しのクリック・ドラッグは従来のテキスト選択のまま。②コードブロックは右上に**コピーボタン**（常時表示だが待機中は SVG アイコンのみ・淡色の控えめな表示。ホバーとコピー直後だけ濃くする）を持ち、押すと**装飾なしの全文**（インデント・空行保持）がクリップボードへ入り一定時間チェックアイコン + 日英ラベルの成功表示になる。**`opacity(0)` + `group_hover` の「ホバーで初めて現れる」方式は採らない**（実機でホバー復帰が発火せずボタンが一度も見えないことを実測。#680）。③リンク索引の正は `md_document_links` 1 本（render のホバーと CLI / MCP の一覧が同じ並びを共有する）。④CLI / MCP は `tako preview-link-list`（応答の `kind` が `markdown` / `pdf`）・`tako preview-follow-link`・`tako preview-copy-code` / `tako_preview_copy_code`（開発不変条件） | S |
 | FR-3.4 | PDF プレビュー。PDFKit テキストレイヤによる選択・コピー、ウィンドウの device scale と表示幅に合わせた background 再ラスタライズに対応する。行間・ページ余白から選択を開始しない（#231） | C |
-| FR-3.5 | プレビューペインでの軽い編集と保存。タイトルバーで編集モードを切替え、文字入力・削除・改行・カーソル移動・選択・貼り付け・⌘S 保存・dirty 表示に対応する。UTF-8 テキストのみ対象。保存時に読み込み後の外部変更を検知したら上書きしない。**完全自動保存（既定 ON、500ms デバウンス）、⌘Z/⇧⌘Z の undo/redo、⌘F 検索（インクリメンタル・ラップ）+ 置換（1 件/全置換）を追加（#195）**。dispatch `PreviewEdit` / `PreviewApply` / `PreviewSave` / `PreviewUndo` / `PreviewRedo` / `PreviewSearch` / `PreviewReplace` / `PreviewAutosave` + CLI `tako edit` + MCP 8 ツールで同等操作を公開（✅ 2026-07-14、#195）。**編集中の再ハイライトは差分**（NFR-8。1 打鍵で塗り直すのは変わった行と状態が収束するまでの後続行だけで、残りは前回塗った行を使い回す。release 実測 4,666 行 344.6ms → 0.56ms。仕組みは `architecture.md`「編集中の差分ハイライト」。✅ 2026-09-23、#1648）。**undo 履歴は差分**（#1651。積むのは「置き換えた範囲 + 置換前後の文字列」で、全文のスナップショットは持たない。release 実測: 1 MB のバッファへ 1000 打鍵で RSS 増分 1022.0MB → 1.1MB）。**連続タイプは 1 塊**なので `hello` は undo 1 回で消える。まとまる条件は「同じ種類・位置が連なる・前回から 500ms 以内・改行をまたがない」で、**カーソル移動・改行・種別の変更・時間切れ・保存・undo / redo** が塊を切る。**上限は「操作数 1000」と「履歴 8MiB」の先に効いたほう**（1 操作で本文 2 本ぶんを積む編集 = 全文差し替え・全置換があるので操作数だけでは上限にならない。画像は FR-3.17 で512MiB の予算を持っているのにテキストだけ無予算だった）。1 回の編集が単独で予算を超えても直前の 1 件は必ず残す。粒度が変わっても口は同じ（`PreviewUndo` / `PreviewRedo` + `tako edit undo|redo` + MCP `tako_preview_undo` / `_redo`）で、1 回の呼び出しが戻す量が「1 文字」から「1 塊」になる。仕組みは `architecture.md`「undo 履歴は差分で持つ」。✅ 2026-09-23、#1651） | S |
+| FR-3.5 | プレビューペインでの軽い編集と保存。タイトルバーで編集モードを切替え、文字入力・削除・改行・カーソル移動・選択・貼り付け・⌘S 保存・dirty 表示に対応する。UTF-8 テキストのみ対象。保存時に読み込み後の外部変更を検知したら上書きしない。**完全自動保存（既定 ON、500ms デバウンス）、⌘Z/⇧⌘Z の undo/redo、⌘F 検索（インクリメンタル・ラップ）+ 置換（1 件/全置換）を追加（#195）**。dispatch `PreviewEdit` / `PreviewApply` / `PreviewSave` / `PreviewUndo` / `PreviewRedo` / `PreviewSearch` / `PreviewReplace` / `PreviewAutosave` + CLI `tako edit` + MCP 8 ツールで同等操作を公開（✅ 2026-07-14、#195）。**編集中の再ハイライトは差分**（NFR-8。1 打鍵で塗り直すのは変わった行と状態が収束するまでの後続行だけで、残りは前回塗った行を使い回す。release 実測 4,666 行 344.6ms → 0.56ms。仕組みは `architecture.md`「編集中の差分ハイライト」。✅ 2026-09-23、#1648）。**undo 履歴は差分**（#1651。積むのは「置き換えた範囲 + 置換前後の文字列」で、全文のスナップショットは持たない。release 実測: 1 MB のバッファへ 1000 打鍵で RSS 増分 1022.0MB → 1.1MB）。**連続タイプは 1 塊**なので `hello` は undo 1 回で消える。まとまる条件は「同じ種類・位置が連なる・前回から 500ms 以内・改行をまたがない」で、**カーソル移動・改行・種別の変更・時間切れ・保存・undo / redo** が塊を切る。**上限は「操作数 1000」と「履歴 8MiB」の先に効いたほう**（1 操作で本文 2 本ぶんを積む編集 = 全文差し替え・全置換があるので操作数だけでは上限にならない。画像は FR-3.17 で512MiB の予算を持っているのにテキストだけ無予算だった）。1 回の編集が単独で予算を超えても直前の 1 件は必ず残す。粒度が変わっても口は同じ（`PreviewUndo` / `PreviewRedo` + `tako edit undo|redo` + MCP `tako_preview_undo` / `_redo`）で、1 回の呼び出しが戻す量が「1 文字」から「1 塊」になる。仕組みは `architecture.md`「undo 履歴は差分で持つ」。✅ 2026-09-23、#1651）。**行・桁で指す範囲編集とカーソル操作、および文書の版**を追加（全文置換しか無かったので 1 行直すのに本文を丸ごと IPC で送っていた。dispatch `PreviewEditRange` / `PreviewCursor` + CLI `tako edit replace-range` / `cursor` + MCP `tako_preview_edit_range` / `tako_preview_cursor`。座標と拒否の契約は下の実装メモ。✅ 2026-09-24、#1658） | S |
 | FR-3.6 | 右サイドバー: git graph（コミットグラフ・ブランチ可視化、cwd のリポジトリに連動。✅ 2026-06-14） | S |
 | FR-3.25 | **git タブのブランチ操作**: ブランチ一覧の行クリックでチェックアウト、行ホバーの「マージ」で取り込み、セクション見出しの「新規」でブランチ作成。現在ブランチを明示し、リモート追跡ブランチはローカルと分けて表示する（リモート行のクリックは detached HEAD ではなく同名ローカル追跡ブランチを作る）。**破壊的になり得る操作（未コミット変更ありの切替・マージ）は実行前に「何が起きるか」をカードで提示し、承諾するまで実行しない**（黙って stash / 強制切替しない）。提示は切替なら「持ち越される変更」と「切替を妨げる変更」を分け、マージなら種別・取り込みコミット数・変更ファイル数・`git merge-tree` による**コンフリクト予測**を出す（予測不能な git ではその旨を明示し「コンフリクトなし」と誤解させない）。git が拒否すると分かっている操作は実行ボタン自体を出さない。dispatch `GitCheckout` / `GitBranchCreate` / `GitMerge` + CLI `tako git checkout/branch/merge`（既定は提示のみ・`--yes` で実行）+ MCP `tako_git_checkout` / `tako_git_branch_create` / `tako_git_merge`（`confirm` パラメータ）へ 1:1 公開する（✅ 2026-07-26、#496） | M |
 | FR-3.26 | **コンフリクトカードと解消エージェント**: merge / rebase / cherry-pick / revert の進行中状態を git タブ上部の専用カードで提示する。進行中の操作・取り込み先/元（ours ← theirs）・未解決ファイル一覧（porcelain v2 の `u` レコード）・中止導線を含む。カードから **claude / codex / agy を選んでコンフリクト解消エージェントを同じタブに起動**でき、リポジトリパス・未解決ファイル一覧・マージ元/先ブランチ・「解消したら報告し、勝手に commit / push しない」制約を含むプロンプトを自動投入する。エージェント起動は既存 spawn 基盤（`orchestrator::agent` のコマンド構築 + 事前信頼 + PromptFlow）を再利用し、新系統を作らない。プロンプト文面はバイナリ埋め込みの雛形を `<data_dir>/orchestrator/conflict-resolver.md` で差し替えられる。dispatch `GitConflicts` / `GitMergeAbort` / `GitResolveAgent` + CLI `tako git conflicts/abort/resolve` + MCP `tako_git_conflicts` / `tako_git_merge_abort` / `tako_git_resolve_agent` へ 1:1 公開する（✅ 2026-07-26、#496） | M |
@@ -1736,19 +1736,48 @@ FR-3.5 実装メモ（2026-07-12、#126）:
   **macOS 上からでも Windows の腕を検査できる**（`platform::keys` と同じ型）。
   単独の `\r` は行区切りではなく行内の制御文字として素通しする。番犬は
   `crates/tako-control/tests/issue1650_line_ending_watchdog.rs`
+- **行・桁の編集 API と文書の版（#1658）**: 編集の口が全文置換 1 つだけだったので、
+  1 行直すのに本文を丸ごと IPC で送り、`set_text` でカーソルが末尾へ飛び undo も
+  全文 1 個になっていた。`PreviewEditRange` / `PreviewCursor` を足して**変える範囲だけ**を
+  送れるようにし、応答へ**文書の版**を載せる。
+  - **座標は「行 1 始まり / 桁 0 始まりの行内 UTF-8 バイト」**。向きが違うのは、行が人と AI が
+    読む行番号（エディタ・`grep -n`・コンパイラの診断がすべて 1 始まり）で、桁が本文を切る
+    バイト位置（`&text[..column]` がそのまま通る）だから。桁の上限は**その行の改行コードを
+    除いた長さ**なので、CRLF の行では CR の手前が上限になる（= 「CR と LF のあいだ」は
+    そもそも指せない）。この綴りは `tako_core::text_edit::TextPosition` が正本で、
+    dispatch / CLI / MCP はすべてこれを通る
+  - **UTF-16 の桁へは変換しない**。LSP は `positionEncoding` の既定が UTF-16 だが、変換の
+    責務は**LSP クライアント側**（#1007 S1）に置く。tako の編集 API は本文のバイト列を扱う
+    層で、ここで UTF-16 を持つと本文を触るたびに再計算が要る
+  - **解けない指定は丸めずに拒否する**（本文を 1 バイトも触らない）。0 行目 / 範囲外の行 /
+    行の長さを超えた桁 / 文字の途中を指す桁 / 終わりが始まりより前、の 5 つが
+    `RangeEditError` の拒否理由。丸めると送り手は「3 行目を直した」と思っているのに
+    別の場所が変わるので、**版で競合を弾いても意味が無くなる**
+  - **版（`version`）は本文が変わるたびに 1 つ増える**単調増加のカウンタで、GUI の打鍵・
+    `PreviewApply`・範囲編集・undo / redo のすべてで進む（undo でも**戻らずに進む**。
+    戻すと「別の中身なのに同じ版」ができる）。カーソル移動は本文を変えないので進まない。
+    `expected_version` を渡すと、版が違うときは何もせず拒否する（楽観ロック）。
+    これは LSP の `didChange` が要求する文書の版の前払いでもある（#1007）
+  - 応答の `document` は `version` / `line_count` / `bytes` / `line_ending` / `cursor` /
+    `selection` / `undo_depth` / `undo_history_bytes` で、**編集系の応答すべて**
+    （`PreviewEdit` の状態取得を含む）に載る。組み立ては `dispatch::preview_edit_reply` の
+    1 実装。番犬は `crates/tako-control/tests/issue1658_edit_range_watchdog.rs`
 - **保存競合**: 編集開始時の元バイト列を保持し、保存直前のファイル内容と完全比較する。
   不一致なら外部変更として保存を拒否し、dirty バッファを保持する。Unix は同一ディレクトリの
   一時ファイルを `sync_all` 後に rename、Windows は既存依存だけで置換 API を使えないため
   比較後に truncate + `sync_all`（既知の原子性差）。読み取り専用属性も明示拒否
 - **安全制限**: PDF / 画像 / 動画 / バイナリ / 非 UTF-8、および 1MB・5000 行上限で末尾を
   省略したファイルは編集不可。省略表示を保存して元ファイル末尾を失う事故を構造的に防ぐ
-- **AI フルコントロール**: dispatch `PreviewEdit` / `PreviewApply` / `PreviewSave` /
-  `PreviewUndo` / `PreviewRedo` / `PreviewSearch` / `PreviewReplace` / `PreviewAutosave`、
-  CLI `tako edit start|status|apply|save|stop|undo|redo|search|replace|autosave`、MCP
-  `tako_preview_edit` / `tako_preview_apply` / `tako_preview_save` / `tako_preview_undo` /
+- **AI フルコントロール**: dispatch `PreviewEdit` / `PreviewApply` / `PreviewEditRange` /
+  `PreviewCursor` / `PreviewSave` / `PreviewUndo` / `PreviewRedo` / `PreviewSearch` /
+  `PreviewReplace` / `PreviewAutosave`、
+  CLI `tako edit start|status|apply|replace-range|cursor|save|stop|undo|redo|search|replace|autosave`、
+  MCP `tako_preview_edit` / `tako_preview_apply` / `tako_preview_edit_range` /
+  `tako_preview_cursor` / `tako_preview_save` / `tako_preview_undo` /
   `tako_preview_redo` / `tako_preview_search` / `tako_preview_replace` /
-  `tako_preview_autosave`（計 68 ツール）。個々の物理キーイベントは GUI/IME 固有で API 化せず、
-  自然な操作境界である全文適用を公開する。list の `preview.editing` / `preview.dirty` で状態取得
+  `tako_preview_autosave`。個々の物理キーイベントは GUI/IME 固有で API 化せず、
+  自然な操作境界（全文適用・行桁の範囲編集・カーソル / 選択）を公開する。
+  list の `preview.editing` / `preview.dirty` で状態取得
 - **自動保存（#195 / #973）**: 既定 ON。テキスト変更後 500ms のデバウンスタイマーで
   `TextBuffer::save()` を呼ぶ。保存競合（外部変更検知）時は上書きせずタイトルバーに
   「⚠ 競合」を表示。`PreviewAutosave` で ON/OFF 切替。OFF 時は従来の ⌘S 手動保存に戻る。

@@ -958,7 +958,8 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_preview_edit",
             "description": "コードプレビューの編集モードを開始・終了する。enabled 省略時は状態取得。\
-                PDF・画像・動画・末尾省略された巨大ファイルは編集できない。状態は editing / dirty で返す。",
+                PDF・画像・動画・末尾省略された巨大ファイルは編集できない。状態は editing / dirty で返す。\
+                document は文書の版（version）とカーソル・選択・undo 履歴で、編集系ツールの応答すべてに載る。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -979,6 +980,54 @@ pub fn tools() -> Vec<Value> {
                     "text": { "type": "string", "description": "適用するファイル全文（UTF-8）" },
                 },
                 "required": ["text"],
+                "additionalProperties": false,
+            },
+        }),
+        // 出自: #1658（範囲編集 API・文書の版）
+        json!({
+            "name": "tako_preview_edit_range",
+            "description": "コードプレビューの編集バッファを行・桁で指定した範囲だけ置き換える\
+                （全文を送る tako_preview_apply の代わり）。行は 1 始まり、桁は 0 始まりの行内 UTF-8 バイトで\
+                上限は改行を除いた行の長さ。範囲外・文字の途中・逆順は丸めずエラーにし本文は変えない。\
+                編集モード未開始なら開始する。カーソルは入れた本文の末尾に来て tako_preview_undo 1 回で戻る。\
+                応答 document は version / line_count / cursor / selection / undo_depth / undo_history_bytes。\
+                expected_version に直前の version を渡すと、間に他が編集していれば何もせず失敗する。\
+                対象は tako_open_file で開いたプレビューペイン。ファイルへ書くのは tako_preview_save。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象プレビューペイン ID（省略時は呼び出し元）"),
+                    "start_line": { "type": "integer", "minimum": 1, "description": "範囲の開始行（1 始まり）" },
+                    "start_col": { "type": "integer", "minimum": 0, "description": "開始行内のバイト桁（0 始まり・省略時 0）" },
+                    "end_line": { "type": "integer", "minimum": 1, "description": "範囲の終了行（1 始まり）" },
+                    "end_col": { "type": "integer", "minimum": 0, "description": "終了行内のバイト桁（0 始まり・省略時 0）" },
+                    "text": { "type": "string", "description": "範囲に入れる本文（空文字なら削除）" },
+                    "expected_version": { "type": "integer", "minimum": 0, "description": "文書の版。違えば何もせず失敗する" },
+                },
+                "required": ["start_line", "end_line", "text"],
+                "additionalProperties": false,
+            },
+        }),
+        // 出自: #1658
+        json!({
+            "name": "tako_preview_cursor",
+            "description": "コードプレビュー編集のカーソルを行・桁で置く。編集モード未開始なら開始する。\
+                本文は変えないので version は増えない。\
+                行は 1 始まり、桁は 0 始まりの行内 UTF-8 バイト。select_to_line を渡すと line:col から\
+                そこまでを選択し、カーソルは select_to 側に来る（select_to_col 省略時は 0）。\
+                範囲外・文字の途中はエラー。結果は応答 document の cursor / selection で読む。\
+                範囲編集は位置を自分で持つので、選択してから消す用途以外では tako_preview_edit_range だけで足りる。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象プレビューペイン ID（省略時は呼び出し元）"),
+                    "line": { "type": "integer", "minimum": 1, "description": "カーソル行（1 始まり）" },
+                    "col": { "type": "integer", "minimum": 0, "description": "行内のバイト桁（0 始まり・省略時 0）" },
+                    "select_to_line": { "type": "integer", "minimum": 1, "description": "ここまで選択する行" },
+                    "select_to_col": { "type": "integer", "minimum": 0, "description": "ここまで選択する桁（省略時 0）" },
+                    "expected_version": { "type": "integer", "minimum": 0, "description": "文書の版。違えば何もせず失敗する" },
+                },
+                "required": ["line"],
                 "additionalProperties": false,
             },
         }),

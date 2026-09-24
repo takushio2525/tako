@@ -336,6 +336,23 @@ pub(super) fn build_request(
             pane: Some(target_pane(args, caller)?),
             text: str_arg(args, "text")?.ok_or("text を指定する")?,
         },
+        "tako_preview_edit_range" => Request::PreviewEditRange {
+            pane: Some(target_pane(args, caller)?),
+            start_line: required_u64(args, "start_line")? as usize,
+            start_col: u64_arg(args, "start_col")?.unwrap_or(0) as usize,
+            end_line: required_u64(args, "end_line")? as usize,
+            end_col: u64_arg(args, "end_col")?.unwrap_or(0) as usize,
+            text: str_arg(args, "text")?.ok_or("text を指定する")?,
+            expected_version: u64_arg(args, "expected_version")?,
+        },
+        "tako_preview_cursor" => Request::PreviewCursor {
+            pane: Some(target_pane(args, caller)?),
+            line: required_u64(args, "line")? as usize,
+            col: u64_arg(args, "col")?.unwrap_or(0) as usize,
+            select_to_line: u64_arg(args, "select_to_line")?.map(|n| n as usize),
+            select_to_col: u64_arg(args, "select_to_col")?.map(|n| n as usize),
+            expected_version: u64_arg(args, "expected_version")?,
+        },
         "tako_preview_save" => Request::PreviewSave {
             pane: Some(target_pane(args, caller)?),
         },

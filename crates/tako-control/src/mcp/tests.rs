@@ -579,7 +579,8 @@ mod tests {
         // #1450 の tako_todo（ユーザー向けタスク）を追加して 150
         // #1451 の tako_remote_shortcuts（リモート閲覧のショートカット）を追加して 151
         // #1453 の tako_orchestrator_adopt（master を専用プロファイルへその場で寄せる）を追加して 152
-        assert_eq!(tools.len(), 152);
+        // #1658 の tako_preview_edit_range / tako_preview_cursor（行・桁の範囲編集とカーソル）を追加して 154
+        assert_eq!(tools.len(), 154);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

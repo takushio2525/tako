@@ -16,7 +16,7 @@ tako platform --status pending      # まだ使えないものだけ
 
 | 状態 | 件数 | 意味 |
 | --- | --- | --- |
-| 対応 | 118 / 152（78%） | macOS と同じように使えます |
+| 対応 | 120 / 154（78%） | macOS と同じように使えます |
 | 一部対応 | 15 | 使えますが機能が落ちます。落ち方は各表の「差分」列 |
 | 未実測 | 4 | 実装はあり macOS と同じ経路を通るが、Windows 実機でまだ動かしていないもの |
 | 未対応 | 13 | Windows 側の実装が無い、または動かないことが分かっているもの |
@@ -84,7 +84,7 @@ AI エージェント（tako は縮退の件数と引き方を system prompt へ
 
 ## 表示とプレビュー
 
-対応 23・一部対応 4・未対応 / 未実測 4
+対応 25・一部対応 4・未対応 / 未実測 4
 
 | 機能 | 状態 | 差分 | 根拠 |
 | --- | --- | --- | --- |
@@ -99,6 +99,8 @@ AI エージェント（tako は縮退の件数と引き方を system prompt へ
 | `tako_preview_cache` | 対応 | — | 実機セルフテスト: 項目 33d / 66c（MCP と CLI から同じ LRU 上限へ反映） |
 | `tako_preview_edit` | 対応 | — | 実機セルフテスト: 項目 66d（tako edit で開始 → 適用 → 保存） |
 | `tako_preview_apply` | 対応 | — | 実機セルフテスト: 項目 66d（全文適用） |
+| `tako_preview_edit_range` | 対応 | — | 実機テスト: 範囲の解決・版・CRLF の扱いは純粋関数で、OS 依存の分岐を持たない。text_edit の単体と dispatch の preview範囲編集は行桁で1行だけを差し替えて版を返す が CI の Windows ジョブで緑 |
+| `tako_preview_cursor` | 対応 | — | 実機テスト: 行・桁の解決は本文のバイト列だけを見る純粋関数で、OS 依存の分岐を持たない。text_edit の単体と dispatch の previewカーソルは行桁で動き選択は本文を変えない が CI の Windows ジョブで緑 |
 | `tako_preview_save` | 対応 | — | 実機セルフテスト: 項目 66d（保存と外部変更の拒否） |
 | `tako_preview_undo` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako edit undo --pane <p>` が undone=true を返す（redo と対で実測） |
 | `tako_preview_redo` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako edit redo --pane <p>` が redone=true を返す（undo と対で実測） |
