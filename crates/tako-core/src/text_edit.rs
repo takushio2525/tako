@@ -4,7 +4,9 @@
 //! 内容と現在のファイルを比較して外部変更を検知する。GPUI に依存しないため、GUI・
 //! dispatch・CLI・MCP の全経路が同じ編集セマンティクスを使える。
 //!
-//! undo/redo（#195）: 編集操作前のスナップショットをスタックに積む（上限 1000）。
+//! undo/redo（#195 / #1651）: 積むのは**差分**（置き換えた範囲 + 置換前後の文字列）で、
+//! 連続した打鍵・連続した削除は 1 塊にまとまる（`hello` は undo 1 回で消える）。
+//! 上限は「操作数」と「履歴のバイト数」の**先に効いたほう**。
 //! 検索（#195）: バイト位置ベースのインクリメンタル検索と置換。
 //!
 //! 改行コード（#1650）: バッファは**ファイルのバイト列をそのまま**持つ。`\r\n` は
@@ -13,15 +15,38 @@
 //! 既存行の改行は 1 バイトも書き換わらない（混在ファイルを開いて閉じてもバイト一致）。
 
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use thiserror::Error;
 
 use crate::platform::support::Platform;
 
+/// undo 履歴に積む操作の数の上限（#195）
 const UNDO_LIMIT: usize = 1000;
+
+/// undo 履歴が持ってよい本文のバイト数（#1651）。
+///
+/// 差分にしたので打鍵では 1 操作 1 バイト前後しか積まないが、`set_text` や全置換は
+/// 1 操作で「置換前 + 置換後」= 本文 2 本ぶんを持つ。**操作数だけでは上限にならない**
+/// ので、バイト数の上限を併せて置く（画像は FR-3.17 で 512MiB の予算を持っているのに
+/// テキストだけ無予算だったのが #1651）。
+///
+/// 8 MiB は「編集対象になる現実的なテキストファイル（数 MB）を丸ごと差し替える
+/// 操作が 1 回ぶん収まる」大きさ。これを 1 操作で超える編集は履歴 1 件だけ残す
+/// （直前の操作を取り消せることのほうが、上限を厳密に守ることより大事）
+const UNDO_BYTE_LIMIT: usize = 8 * 1024 * 1024;
+
+/// 連続した編集を 1 塊とみなす時間の幅（ミリ秒。#1651）。
+///
+/// これより間が空いた打鍵は別の塊にする（考えながら打った区切りで undo が止まる）。
+/// 自動保存のデバウンス（500ms。FR-3.5）と揃えてあるので、
+/// 「保存が走るほど手が止まった」ところが塊の切れ目になる
+const COALESCE_WINDOW_MS: u64 = 500;
 
 /// 改行コード（#1650）。
 ///
@@ -112,12 +137,77 @@ pub enum TextEditError {
     Write(#[source] std::io::Error),
 }
 
-/// undo/redo 用のスナップショット
+/// 編集の種類（#1651）。**同じ種類どうししかまとまらない**
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditKind {
+    /// 打鍵・IME・貼り付け（選択の無い挿入）
+    Insert,
+    /// Backspace（左へ伸びる削除）
+    DeleteBackward,
+    /// Delete（右へ伸びる削除）
+    DeleteForward,
+    /// 選択の差し替え・範囲置換・全置換・全文差し替え。**まとめない**
+    /// （1 回の操作として意味が閉じているので、まとめると戻しすぎになる）
+    Replace,
+}
+
+/// undo/redo 1 件ぶんの差分（#1651）。
+///
+/// 全文のスナップショットを持たない。`start` から始まる範囲を `before` ⇄ `after` で
+/// 入れ替えるだけなので、1 打鍵の記録は数十バイトで済む
+/// （スナップショットは 1 MB のファイルなら 1 打鍵 1 MB だった = Issue の症状）。
+///
+/// 改行コードも一緒に戻す。`set_text` はファイルの流儀を取り直すので、
+/// これを戻さないと undo した後の Enter が別の改行を挿す（#1650 の契約）
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Snapshot {
-    text: String,
+struct EditDelta {
+    /// 置き換えた範囲の開始バイト位置
+    start: usize,
+    /// 置換前の中身（undo で書き戻す）
+    before: String,
+    /// 置換後の中身（redo で書き直す）
+    after: String,
+    cursor_before: usize,
+    anchor_before: Option<usize>,
+    cursor_after: usize,
+    anchor_after: Option<usize>,
+    line_ending_before: LineEnding,
+    line_ending_after: LineEnding,
+    kind: EditKind,
+    /// この塊に最後に足した時刻（まとめの判定用。[`TextBuffer::now_millis`] の刻み）
+    at_millis: u64,
+}
+
+impl EditDelta {
+    /// この 1 件が抱えている本文のバイト数（予算の勘定。#1651）
+    fn bytes(&self) -> usize {
+        self.before.len() + self.after.len() + std::mem::size_of::<Self>()
+    }
+}
+
+/// 1 回の編集の指示（#1651）。本文を書き換える口はこれを [`TextBuffer::apply_edit`] へ渡す
+struct Edit<'a> {
+    /// 置き換える範囲
+    range: Range<usize>,
+    /// 置き換えた後にそこへ入る本文
+    replacement: &'a str,
+    /// 編集後のカーソル
     cursor: usize,
+    /// 編集後の選択端
     anchor: Option<usize>,
+    kind: EditKind,
+    /// この編集でファイルの改行コードが変わるなら `Some`（全文差し替えだけ）
+    line_ending: Option<LineEnding>,
+}
+
+/// プロセス開始からの経過ミリ秒（#1651）。
+///
+/// `Instant` から絶対時刻は作れないので、起点を 1 つだけ持って引き算する。
+/// **`Instant::now() - Duration` は書かない**（ブートより前へ巻き戻すと panic = #1627）。
+/// 単調なので NTP の補正でも巻き戻らない
+fn process_millis() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
 /// 検索ヒット 1 件（バイト範囲）
@@ -137,8 +227,18 @@ pub struct TextBuffer {
     anchor: Option<usize>,
     /// 新しく足す改行に使うコード（#1650）。既存行の改行は書き換えない
     line_ending: LineEnding,
-    undo_stack: Vec<Snapshot>,
-    redo_stack: Vec<Snapshot>,
+    /// 差分の履歴（#1651）。古いものから捨てるので `VecDeque`
+    undo_stack: VecDeque<EditDelta>,
+    redo_stack: Vec<EditDelta>,
+    /// 末尾の塊へまだ足してよいか（#1651）。
+    /// カーソル移動・保存・undo / redo で閉じる = そこが undo の切れ目になる
+    group_open: bool,
+    /// まとめ判定の時計を手で進めるための仮想時刻（#1651。テスト専用）。
+    ///
+    /// `None` なら実時間。**効果を実時間で比べるテストは負荷で反転する**
+    /// （`.agent/conventions.md`「効果を測る単体テストは実時間で比べない」）ので、
+    /// 「時間が空くと塊が切れる」は時計を注入して状態値で固定する
+    manual_millis: Option<u64>,
 }
 
 impl TextBuffer {
@@ -152,8 +252,10 @@ impl TextBuffer {
             baseline: bytes,
             cursor: 0,
             anchor: None,
-            undo_stack: Vec::new(),
+            undo_stack: VecDeque::new(),
             redo_stack: Vec::new(),
+            group_open: false,
+            manual_millis: None,
         })
     }
 
@@ -166,8 +268,10 @@ impl TextBuffer {
             baseline,
             cursor: 0,
             anchor: None,
-            undo_stack: Vec::new(),
+            undo_stack: VecDeque::new(),
             redo_stack: Vec::new(),
+            group_open: false,
+            manual_millis: None,
         }
     }
 
@@ -193,8 +297,7 @@ impl TextBuffer {
     }
 
     pub fn selection(&self) -> Option<Range<usize>> {
-        let anchor = self.anchor?;
-        (anchor != self.cursor).then(|| anchor.min(self.cursor)..anchor.max(self.cursor))
+        selection_range(self.anchor, self.cursor)
     }
 
     pub fn dirty(&self) -> bool {
@@ -207,24 +310,40 @@ impl TextBuffer {
     /// 全文」を渡しているので、そこに書かれている流儀がこのファイルの流儀になる。
     /// 改行を 1 つも含まない本文では直前の流儀を保つ
     pub fn set_text(&mut self, text: String) {
-        self.push_undo();
-        self.line_ending = LineEnding::detect(&text).unwrap_or(self.line_ending);
-        self.text = text;
-        self.cursor = self.text.len();
-        self.anchor = None;
+        let line_ending = LineEnding::detect(&text).unwrap_or(self.line_ending);
+        self.apply_edit(Edit {
+            range: 0..self.text.len(),
+            replacement: &text,
+            cursor: text.len(),
+            anchor: None,
+            kind: EditKind::Replace,
+            line_ending: Some(line_ending),
+        });
     }
 
     pub fn set_cursor(&mut self, offset: usize, extend_selection: bool) {
         let offset = snap_cursor(&self.text, offset.min(self.text.len()));
-        if extend_selection {
-            self.anchor.get_or_insert(self.cursor);
+        let anchor = if extend_selection {
+            Some(self.anchor.unwrap_or(self.cursor))
         } else {
-            self.anchor = None;
+            None
+        };
+        // カーソルが**実際に動いたら**打鍵の連なりは切れる（#1651）。
+        //
+        // 動いていない呼び出しで切らないのが大事: GUI の打鍵経路は 1 打鍵ごとに
+        // 「画面の選択をバッファへ写す」ため `set_cursor` を 2 回通る
+        // （`sync_editor_selection_from_preview`。書き戻しは同じ位置なので素で切ると
+        // **GUI だけ 1 文字粒度のまま**になる）。キャレットだけの `anchor` の有無は
+        // 選択範囲として同じものなので、見るのは位置と選択範囲
+        if offset != self.cursor || selection_range(anchor, offset) != self.selection() {
+            self.seal_undo_group();
         }
+        self.anchor = anchor;
         self.cursor = offset;
     }
 
     pub fn select_all(&mut self) {
+        self.seal_undo_group();
         self.anchor = Some(0);
         self.cursor = self.text.len();
     }
@@ -235,10 +354,20 @@ impl TextBuffer {
     /// 揃えるのをここ 1 か所にしておけば、どの経路から入れても混在改行にならない
     pub fn insert(&mut self, text: &str) {
         let text = normalize_line_endings(text, self.line_ending);
-        self.push_undo();
-        self.delete_selection_inner();
-        self.text.insert_str(self.cursor, &text);
-        self.cursor += text.len();
+        // 選択があれば「選択の差し替え」= 1 回の操作（まとめない。#1651）
+        let (range, kind) = match self.selection() {
+            Some(range) => (range, EditKind::Replace),
+            None => (self.cursor..self.cursor, EditKind::Insert),
+        };
+        let cursor = range.start + text.len();
+        self.apply_edit(Edit {
+            range,
+            replacement: &text,
+            cursor,
+            anchor: None,
+            kind,
+            line_ending: None,
+        });
     }
 
     /// Enter。挿す文字はこのファイルの改行コード（#1650）
@@ -247,17 +376,13 @@ impl TextBuffer {
     }
 
     pub fn delete_backward(&mut self) {
-        if self.anchor.is_some() && self.selection().is_some() {
-            self.push_undo();
-            self.delete_selection_inner();
+        if self.delete_selection() {
             return;
         }
         if self.cursor == 0 {
             self.anchor = None;
             return;
         }
-        self.push_undo();
-        self.anchor = None;
         // `\r\n` は 1 つの行区切り。片方だけ消すと裸の CR が残る（#1650）
         let previous = if self.text[..self.cursor].ends_with("\r\n") {
             self.cursor - 2
@@ -268,22 +393,24 @@ impl TextBuffer {
                 .map(|(i, _)| i)
                 .unwrap_or(0)
         };
-        self.text.drain(previous..self.cursor);
-        self.cursor = previous;
+        self.apply_edit(Edit {
+            range: previous..self.cursor,
+            replacement: "",
+            cursor: previous,
+            anchor: None,
+            kind: EditKind::DeleteBackward,
+            line_ending: None,
+        });
     }
 
     pub fn delete_forward(&mut self) {
-        if self.anchor.is_some() && self.selection().is_some() {
-            self.push_undo();
-            self.delete_selection_inner();
+        if self.delete_selection() {
             return;
         }
         if self.cursor == self.text.len() {
             self.anchor = None;
             return;
         }
-        self.push_undo();
-        self.anchor = None;
         // `\r\n` は 1 つの行区切り。片方だけ消すと裸の CR が残る（#1650）
         let next = if self.text[self.cursor..].starts_with("\r\n") {
             self.cursor + 2
@@ -295,46 +422,214 @@ impl TextBuffer {
                     .map(char::len_utf8)
                     .unwrap_or(0)
         };
-        self.text.drain(self.cursor..next);
+        self.apply_edit(Edit {
+            range: self.cursor..next,
+            replacement: "",
+            cursor: self.cursor,
+            anchor: None,
+            kind: EditKind::DeleteForward,
+            line_ending: None,
+        });
     }
 
     // --- undo / redo ---
 
-    fn snapshot(&self) -> Snapshot {
-        Snapshot {
-            text: self.text.clone(),
-            cursor: self.cursor,
-            anchor: self.anchor,
-        }
+    /// まとめ判定に使う「今」（#1651）。テストは仮想時刻を差し込む
+    fn now_millis(&self) -> u64 {
+        self.manual_millis.unwrap_or_else(process_millis)
     }
 
-    fn push_undo(&mut self) {
+    /// 末尾の塊を閉じる（#1651）。
+    ///
+    /// 次の編集はここへ足さず、新しい 1 件として積まれる = ここが undo の切れ目。
+    /// 呼ぶのは**カーソルが動いたとき・保存したとき・undo / redo したとき**
+    fn seal_undo_group(&mut self) {
+        self.group_open = false;
+    }
+
+    /// 本文を書き換える**唯一の口**（#1651）。
+    ///
+    /// ここを通さずに `self.text` を書き換えると、その編集は履歴に載らない
+    /// （undo が本文とずれる）。番犬 `issue1651_undo_delta_watchdog` が
+    /// 直接の書き換えを file:line で名指す
+    fn apply_edit(&mut self, edit: Edit<'_>) {
+        let Edit {
+            range,
+            replacement,
+            cursor,
+            anchor,
+            kind,
+            line_ending,
+        } = edit;
+        let line_ending_before = self.line_ending;
+        let line_ending_after = line_ending.unwrap_or(line_ending_before);
+        let start = range.start;
+        // 全文ではなく**置き換える範囲だけ**を写す（1 打鍵で 1 MB 積まない）
+        let before = self.text[range.clone()].to_string();
+        let cursor_before = self.cursor;
+        let anchor_before = self.anchor;
+        let at_millis = self.now_millis();
+        self.text.replace_range(range, replacement);
+        // 編集後の本文で丸める。丸めずに持つと、その位置が差分へ記録されて
+        // **undo / redo のたびに再現される**（`replace_all` は編集前のカーソルを
+        // 長さで切り詰めるだけなので、多バイト文字の途中を指しうる = 次の編集で panic）
+        let cursor = snap_cursor(&self.text, cursor.min(self.text.len()));
+        let delta = EditDelta {
+            start,
+            before,
+            after: replacement.to_string(),
+            cursor_before,
+            anchor_before,
+            cursor_after: cursor,
+            anchor_after: anchor,
+            line_ending_before,
+            line_ending_after,
+            kind,
+            at_millis,
+        };
+        self.cursor = cursor;
+        self.anchor = anchor;
+        self.line_ending = line_ending_after;
+        self.record(delta);
+    }
+
+    /// 選択があればそれを消す（#1651）。消したら `true`
+    fn delete_selection(&mut self) -> bool {
+        let Some(range) = self.selection() else {
+            self.anchor = None;
+            return false;
+        };
+        let cursor = range.start;
+        self.apply_edit(Edit {
+            range,
+            replacement: "",
+            cursor,
+            anchor: None,
+            kind: EditKind::Replace,
+            line_ending: None,
+        });
+        true
+    }
+
+    /// 差分を履歴へ積む（#1651）。直前の塊へ足せるなら足す
+    fn record(&mut self, delta: EditDelta) {
+        // 新しい編集をしたら、やり直せる先は無くなる
         self.redo_stack.clear();
-        self.undo_stack.push(self.snapshot());
-        if self.undo_stack.len() > UNDO_LIMIT {
-            self.undo_stack.remove(0);
+        if !self.merge_into_last(&delta) {
+            self.undo_stack.push_back(delta);
+        }
+        self.group_open = true;
+        self.enforce_budget();
+    }
+
+    /// 直前の塊へこの編集を足せるなら足す（#1651）。足したら `true`。
+    ///
+    /// まとまる条件は **①塊が開いている（カーソル移動・保存・undo を挟んでいない）
+    /// ②同じ種類 ③位置が連なっている ④前回から [`COALESCE_WINDOW_MS`] 以内
+    /// ⑤改行をまたがない**。どれか 1 つでも欠ければ新しい塊にする
+    fn merge_into_last(&mut self, delta: &EditDelta) -> bool {
+        if !self.group_open {
+            return false;
+        }
+        let Some(last) = self.undo_stack.back_mut() else {
+            return false;
+        };
+        if last.kind != delta.kind || delta.line_ending_after != last.line_ending_after {
+            return false;
+        }
+        if delta.at_millis.saturating_sub(last.at_millis) > COALESCE_WINDOW_MS {
+            return false;
+        }
+        // 改行はここで塊を切る（段落の区切りで undo が止まるほうが直せる）
+        if contains_newline(&delta.before)
+            || contains_newline(&delta.after)
+            || contains_newline(&last.before)
+            || contains_newline(&last.after)
+        {
+            return false;
+        }
+        match delta.kind {
+            // 打鍵は直前に書いた文字の**すぐ後ろ**に続くときだけ伸ばす
+            EditKind::Insert if delta.start == last.start + last.after.len() => {
+                last.after.push_str(&delta.after);
+            }
+            // Backspace は左へ伸びる。消した文字は前へ継ぎ足す
+            EditKind::DeleteBackward if delta.start + delta.before.len() == last.start => {
+                let mut before = delta.before.clone();
+                before.push_str(&last.before);
+                last.before = before;
+                last.start = delta.start;
+            }
+            // Delete は同じ位置から右へ伸びる。消した文字は後ろへ継ぎ足す
+            EditKind::DeleteForward if delta.start == last.start => {
+                last.before.push_str(&delta.before);
+            }
+            _ => return false,
+        }
+        last.cursor_after = delta.cursor_after;
+        last.anchor_after = delta.anchor_after;
+        last.at_millis = delta.at_millis;
+        true
+    }
+
+    /// 履歴が抱えている本文のバイト数（#1651）。undo 側と redo 側の合計。
+    ///
+    /// undo すると差分は redo 側へ**移るだけ**なので、この合計は往復で増えない
+    pub fn undo_history_bytes(&self) -> usize {
+        self.undo_stack
+            .iter()
+            .chain(self.redo_stack.iter())
+            .map(EditDelta::bytes)
+            .sum()
+    }
+
+    /// undo できる回数（= 塊の数。#1651）。`hello` を 1 塊で打てば 1
+    pub fn undo_depth(&self) -> usize {
+        self.undo_stack.len()
+    }
+
+    /// 上限（操作数 / バイト数）を超えたぶんを古い側から捨てる（#1651）。
+    ///
+    /// **先に効いたほうが効く**。1 件だけは必ず残す（1 回の編集が単独で予算を
+    /// 超えていても、直前の操作は取り消せるべき）
+    fn enforce_budget(&mut self) {
+        while self.undo_stack.len() > UNDO_LIMIT {
+            self.undo_stack.pop_front();
+        }
+        let mut total = self.undo_history_bytes();
+        while total > UNDO_BYTE_LIMIT && self.undo_stack.len() > 1 {
+            let Some(dropped) = self.undo_stack.pop_front() else {
+                break;
+            };
+            total = total.saturating_sub(dropped.bytes());
         }
     }
 
     pub fn undo(&mut self) -> bool {
-        let Some(snap) = self.undo_stack.pop() else {
+        let Some(delta) = self.undo_stack.pop_back() else {
             return false;
         };
-        self.redo_stack.push(self.snapshot());
-        self.text = snap.text;
-        self.cursor = snap.cursor;
-        self.anchor = snap.anchor;
+        let end = delta.start + delta.after.len();
+        self.text.replace_range(delta.start..end, &delta.before);
+        self.cursor = delta.cursor_before;
+        self.anchor = delta.anchor_before;
+        self.line_ending = delta.line_ending_before;
+        self.redo_stack.push(delta);
+        self.seal_undo_group();
         true
     }
 
     pub fn redo(&mut self) -> bool {
-        let Some(snap) = self.redo_stack.pop() else {
+        let Some(delta) = self.redo_stack.pop() else {
             return false;
         };
-        self.undo_stack.push(self.snapshot());
-        self.text = snap.text;
-        self.cursor = snap.cursor;
-        self.anchor = snap.anchor;
+        let end = delta.start + delta.before.len();
+        self.text.replace_range(delta.start..end, &delta.after);
+        self.cursor = delta.cursor_after;
+        self.anchor = delta.anchor_after;
+        self.line_ending = delta.line_ending_after;
+        self.undo_stack.push_back(delta);
+        self.seal_undo_group();
         true
     }
 
@@ -422,10 +717,15 @@ impl TextBuffer {
     /// 置換文字列の改行もこのバッファの流儀へ揃える（#1650）
     pub fn replace_range(&mut self, range: Range<usize>, replacement: &str) {
         let replacement = normalize_line_endings(replacement, self.line_ending);
-        self.push_undo();
-        self.text.replace_range(range.clone(), &replacement);
-        self.cursor = range.start + replacement.len();
-        self.anchor = None;
+        let cursor = range.start + replacement.len();
+        self.apply_edit(Edit {
+            range,
+            replacement: &replacement,
+            cursor,
+            anchor: None,
+            kind: EditKind::Replace,
+            line_ending: None,
+        });
     }
 
     /// 全置換。戻り値は置換件数
@@ -435,17 +735,28 @@ impl TextBuffer {
             return 0;
         }
         let replacement = normalize_line_endings(replacement, self.line_ending);
-        self.push_undo();
-        let mut offset: isize = 0;
-        let count = hits.len();
+        // 差分 1 件で表す（undo 1 回で全件戻る）。**触る範囲は最初のヒットから
+        // 最後のヒットまで**に留めるので、全文を 2 本持つことにはならない（#1651）
+        let start = hits[0].start;
+        let end = hits[hits.len() - 1].end;
+        let mut after = String::new();
+        let mut prev = start;
         for hit in &hits {
-            let start = (hit.start as isize + offset) as usize;
-            let end = (hit.end as isize + offset) as usize;
-            self.text.replace_range(start..end, &replacement);
-            offset += replacement.len() as isize - (hit.end - hit.start) as isize;
+            after.push_str(&self.text[prev..hit.start]);
+            after.push_str(&replacement);
+            prev = hit.end;
         }
-        self.cursor = self.cursor.min(self.text.len());
-        self.anchor = None;
+        let count = hits.len();
+        let new_len = self.text.len() - (end - start) + after.len();
+        let cursor = self.cursor.min(new_len);
+        self.apply_edit(Edit {
+            range: start..end,
+            replacement: &after,
+            cursor,
+            anchor: None,
+            kind: EditKind::Replace,
+            line_ending: None,
+        });
         count
     }
 
@@ -509,18 +820,10 @@ impl TextBuffer {
         }
         write_file(&self.path, self.text.as_bytes()).map_err(TextEditError::Write)?;
         self.baseline = self.text.as_bytes().to_vec();
+        // 保存したところが undo の切れ目（#1651）。
+        // 「保存した姿」まで戻せる位置が履歴に残る
+        self.seal_undo_group();
         Ok(())
-    }
-
-    fn delete_selection_inner(&mut self) -> bool {
-        let Some(range) = self.selection() else {
-            self.anchor = None;
-            return false;
-        };
-        self.text.drain(range.clone());
-        self.cursor = range.start;
-        self.anchor = None;
-        true
     }
 
     fn line_start(&self, offset: usize) -> usize {
@@ -550,6 +853,18 @@ impl TextBuffer {
             .map(|(i, _)| i)
             .unwrap_or(line_text.len());
         start + relative
+    }
+}
+
+#[cfg(test)]
+impl TextBuffer {
+    /// まとめ判定の時計を固定する（#1651。テスト専用）。
+    ///
+    /// **まとめを検査するテストは必ずこれを呼ぶ**。実時間のままだと
+    /// 「打鍵のあいだにスケジューラの待ちが入った回」だけ塊が切れて落ちる
+    /// （`.agent/conventions.md`「効果を測る単体テストは実時間で比べない」）
+    fn set_clock_millis(&mut self, millis: u64) {
+        self.manual_millis = Some(millis);
     }
 }
 
@@ -691,6 +1006,24 @@ fn snap_cursor(text: &str, offset: usize) -> usize {
 ///
 /// 単独の `\r` は行区切りではないので触らない。揃える必要が無いときは
 /// 借用のまま返すので、1 文字ずつの打鍵では何も確保しない
+/// カーソルと選択端から選択範囲を作る（#1651 で 1 実装へ）。
+///
+/// 選択端が無い / カーソルと同じ位置なら「選択なし」。
+/// [`TextBuffer::selection`] と [`TextBuffer::set_cursor`] の「動いたか」の判定が
+/// 同じ定義を見るようにしてある（片方だけずれると塊の切れ目が食い違う）
+fn selection_range(anchor: Option<usize>, cursor: usize) -> Option<Range<usize>> {
+    let anchor = anchor?;
+    (anchor != cursor).then(|| anchor.min(cursor)..anchor.max(cursor))
+}
+
+/// 改行を含むか（#1651 のまとめ判定）。
+///
+/// `\n` だけ見れば足りる（`\r\n` にも必ず `\n` が在る）。単独の `\r` は行区切りでは
+/// ないので、そこで塊を切る理由も無い
+fn contains_newline(text: &str) -> bool {
+    text.contains('\n')
+}
+
 fn normalize_line_endings(text: &str, ending: LineEnding) -> Cow<'_, str> {
     match ending {
         LineEnding::Lf if text.contains('\r') => Cow::Owned(text.replace("\r\n", "\n")),
@@ -879,12 +1212,15 @@ mod tests {
     }
 
     #[test]
-    fn undo上限を超えると古いスナップショットが消える() {
+    fn undo上限を超えると古い差分が消える() {
         let mut buffer = TextBuffer::from_text(path("undo-limit"), String::new());
+        buffer.set_clock_millis(0);
         for i in 0..UNDO_LIMIT + 10 {
+            // 1 操作 = 1 塊にするため、毎回塊を閉じる（#1651。まとめると 1 件になる）
+            buffer.seal_undo_group();
             buffer.insert(&i.to_string());
         }
-        assert!(buffer.undo_stack.len() <= UNDO_LIMIT);
+        assert_eq!(buffer.undo_depth(), UNDO_LIMIT);
     }
 
     #[test]
@@ -1469,5 +1805,418 @@ mod tests {
         assert_eq!(hits[0].end, "あいうえ".len());
         buffer.replace_range(hits[0].start..hits[0].end, "カキ");
         assert_eq!(buffer.text(), "あいカキお");
+    }
+
+    // --- #1651: undo 履歴は差分・連続タイプは 1 塊・上限はバイトでも効く ---
+
+    /// まとめを検査するバッファ（時計を固定して作る。#1651）
+    fn coalescing(name: &str, text: &str) -> TextBuffer {
+        let mut buffer = TextBuffer::from_text(path(name), text.into());
+        buffer.set_clock_millis(0);
+        buffer
+    }
+
+    #[test]
+    fn 連続して打った文字はundo1回で消える() {
+        let mut buffer = coalescing("coalesce-type", "");
+        for ch in "hello".chars() {
+            buffer.insert(&ch.to_string());
+        }
+        assert_eq!(buffer.text(), "hello");
+        assert_eq!(buffer.undo_depth(), 1, "5 打鍵が 1 塊になっていない");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "", "undo 1 回で hello が消えない");
+        assert!(!buffer.can_undo());
+        // redo も 1 回で戻る
+        assert!(buffer.redo());
+        assert_eq!(buffer.text(), "hello");
+    }
+
+    #[test]
+    fn gui打鍵経路の選択写しはundoの塊を切らない() {
+        // GUI は 1 打鍵ごとに「画面の選択をバッファへ写す → 挿す → 位置を書き戻す」を回す
+        // （`tako-app` の `sync_editor_selection_from_preview` / `..._from_editor`）。
+        // 写しは同じ位置を指すので、ここで塊が切れると **GUI だけ 1 文字粒度**へ戻る
+        let mut buffer = coalescing("gui-keystroke", "");
+        for ch in "hello".chars() {
+            // 写し（キャレットなので anchor = head = 現在位置）
+            let (line, col) = buffer.line_byte_col(buffer.cursor());
+            let offset = buffer.offset_for_line_byte_col(line, col);
+            buffer.set_cursor(offset, false);
+            buffer.set_cursor(offset, true);
+            buffer.insert(&ch.to_string());
+        }
+        assert_eq!(buffer.text(), "hello");
+        assert_eq!(
+            buffer.undo_depth(),
+            1,
+            "選択の写しが塊を切っている（GUI だけ 1 文字粒度に戻る）"
+        );
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "");
+    }
+
+    #[test]
+    fn 同じ位置へのset_cursorは選択を畳んでも塊を切らない() {
+        let mut buffer = coalescing("cursor-noop", "abcdef");
+        buffer.set_cursor(3, false);
+        buffer.insert("X");
+        // 位置も選択範囲も変わらない呼び出し
+        buffer.set_cursor(4, false);
+        buffer.insert("Y");
+        assert_eq!(buffer.text(), "abcXYdef");
+        assert_eq!(buffer.undo_depth(), 1);
+        // 位置が 1 バイトでも動けば切れる
+        buffer.set_cursor(3, false);
+        buffer.insert("Z");
+        assert_eq!(buffer.undo_depth(), 2);
+    }
+
+    #[test]
+    fn カーソル移動でundoの塊が切れる() {
+        let mut buffer = coalescing("coalesce-cursor", "");
+        buffer.insert("ab");
+        buffer.move_cursor(CursorMovement::Left, false);
+        buffer.insert("X");
+        assert_eq!(buffer.text(), "aXb");
+        assert_eq!(buffer.undo_depth(), 2, "カーソル移動が塊を切っていない");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "ab");
+    }
+
+    #[test]
+    fn 改行でundoの塊が切れる() {
+        let mut buffer = coalescing("coalesce-newline", "");
+        buffer.insert("ab");
+        buffer.newline();
+        buffer.insert("cd");
+        let eol = buffer.line_ending().as_str();
+        assert_eq!(buffer.text(), format!("ab{eol}cd"));
+        // 「ab」「改行」「cd」の 3 塊
+        assert_eq!(buffer.undo_depth(), 3, "改行が塊を切っていない");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), format!("ab{eol}"));
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "ab");
+    }
+
+    #[test]
+    fn 時間が空くとundoの塊が切れる() {
+        let mut buffer = coalescing("coalesce-time", "");
+        buffer.insert("a");
+        // 窓の内側はまとまる
+        buffer.set_clock_millis(COALESCE_WINDOW_MS);
+        buffer.insert("b");
+        assert_eq!(buffer.undo_depth(), 1, "窓の内側でまとまっていない");
+        // 窓を 1ms 超えると切れる
+        buffer.set_clock_millis(COALESCE_WINDOW_MS * 2 + 1);
+        buffer.insert("c");
+        assert_eq!(buffer.undo_depth(), 2, "窓の外でも塊が続いている");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "ab");
+    }
+
+    #[test]
+    fn 種別が変わるとundoの塊が切れる() {
+        let mut buffer = coalescing("coalesce-kind", "");
+        buffer.insert("abc");
+        buffer.delete_backward();
+        assert_eq!(buffer.text(), "ab");
+        assert_eq!(buffer.undo_depth(), 2, "挿入と削除が同じ塊になっている");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "abc");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "");
+    }
+
+    #[test]
+    fn 連続したbackspaceとdeleteはそれぞれ1塊になる() {
+        let mut buffer = coalescing("coalesce-delete", "abcdef");
+        buffer.set_cursor(3, false);
+        buffer.delete_backward();
+        buffer.delete_backward();
+        assert_eq!(buffer.text(), "adef");
+        assert_eq!(buffer.undo_depth(), 1, "連続 Backspace が 1 塊でない");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "abcdef");
+        assert_eq!(buffer.cursor(), 3, "undo でカーソルが編集前へ戻らない");
+
+        let mut buffer = coalescing("coalesce-delete-fwd", "abcdef");
+        buffer.set_cursor(1, false);
+        buffer.delete_forward();
+        buffer.delete_forward();
+        assert_eq!(buffer.text(), "adef");
+        assert_eq!(buffer.undo_depth(), 1, "連続 Delete が 1 塊でない");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "abcdef");
+    }
+
+    #[test]
+    fn 保存でundoの塊が切れる() {
+        let file = path("coalesce-save");
+        let _ = std::fs::remove_file(&file);
+        std::fs::write(&file, "").unwrap();
+        let mut buffer = TextBuffer::open(&file).unwrap();
+        buffer.set_clock_millis(0);
+        buffer.insert("ab");
+        buffer.save().unwrap();
+        buffer.insert("cd");
+        assert_eq!(buffer.text(), "abcd");
+        assert_eq!(buffer.undo_depth(), 2, "保存が塊を切っていない");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "ab", "保存した姿まで戻れない");
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn 選択の差し替えはまとめずに1回で戻る() {
+        let mut buffer = coalescing("coalesce-replace", "abcdef");
+        buffer.set_cursor(1, false);
+        buffer.set_cursor(4, true);
+        buffer.insert("X");
+        buffer.insert("Y");
+        assert_eq!(buffer.text(), "aXYef");
+        // 選択の差し替え（Replace）と続く打鍵（Insert）は別の塊
+        assert_eq!(buffer.undo_depth(), 2);
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "aXef");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "abcdef");
+    }
+
+    #[test]
+    fn 複数行の貼り付けはundo1回で戻る() {
+        let mut buffer = coalescing("paste-multiline", "head\n");
+        buffer.move_cursor(CursorMovement::DocumentEnd, false);
+        buffer.insert("1\n2\n3\n");
+        assert_eq!(buffer.text(), "head\n1\n2\n3\n");
+        assert_eq!(buffer.undo_depth(), 1, "貼り付け 1 回が 1 塊でない");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "head\n");
+    }
+
+    #[test]
+    fn 空ファイルへの最初の打鍵をundoできる() {
+        let mut buffer = coalescing("first-keystroke", "");
+        assert!(!buffer.can_undo());
+        buffer.insert("あ");
+        assert_eq!(buffer.undo_depth(), 1);
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "");
+        assert!(!buffer.can_undo());
+        assert!(buffer.can_redo());
+    }
+
+    #[test]
+    fn undoの途中で新しい編集をするとredoが捨てられる() {
+        let mut buffer = coalescing("redo-discard", "");
+        buffer.insert("ab");
+        buffer.seal_undo_group();
+        buffer.insert("cd");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "ab");
+        assert!(buffer.can_redo());
+        buffer.insert("Z");
+        assert!(!buffer.can_redo(), "新しい編集で redo が捨てられていない");
+        assert_eq!(buffer.text(), "abZ");
+        // 履歴の勘定にも redo の残骸が残らない
+        assert!(buffer.undo());
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "");
+    }
+
+    #[test]
+    fn 千打鍵の履歴が全文のスナップショットより桁で小さい() {
+        // 1 MB のバッファ（Issue の実測条件そのまま）
+        let text = "0123456789abcdef".repeat(65_536);
+        assert_eq!(text.len(), 1_048_576);
+        let mut buffer = coalescing("history-bytes", &text);
+        buffer.move_cursor(CursorMovement::DocumentEnd, false);
+        // **塊を毎回切る = まとめの効果を除いた最悪値**を測る
+        for i in 0..1_000 {
+            buffer.seal_undo_group();
+            buffer.insert(if i % 7 == 0 { "b" } else { "a" });
+        }
+        assert_eq!(buffer.undo_depth(), 1_000);
+        let bytes = buffer.undo_history_bytes();
+        // 全文スナップショットなら 1000 × 1 MB = 1 GB 超（#1651 の症状）。
+        // 差分なら 1 件あたり数十バイト。**実時間ではなく状態値で固定する**
+        assert!(
+            bytes < 1024 * 1024,
+            "1000 打鍵の履歴が 1 MiB を超えている: {bytes} バイト"
+        );
+        // まとめが効けば 1 塊まで落ちる
+        let mut merged = coalescing("history-bytes-merged", &text);
+        merged.move_cursor(CursorMovement::DocumentEnd, false);
+        for _ in 0..1_000 {
+            merged.insert("a");
+        }
+        assert_eq!(merged.undo_depth(), 1);
+        assert!(
+            merged.undo_history_bytes() < 8 * 1024,
+            "まとめた 1000 打鍵の履歴が 8 KiB を超えている: {} バイト",
+            merged.undo_history_bytes()
+        );
+    }
+
+    #[test]
+    fn 履歴のバイト上限が操作数より先に効く() {
+        // 1 操作で 2 MiB（置換前 + 置換後）を積む編集を 8 回 = 16 MiB > 8 MiB
+        let a = "a".repeat(1024 * 1024);
+        let b = "b".repeat(1024 * 1024);
+        let mut buffer = coalescing("history-budget", &a);
+        for i in 0..8 {
+            buffer.set_text(if i % 2 == 0 { b.clone() } else { a.clone() });
+        }
+        // 操作数の上限（1000）には遠く届かないのに、履歴は予算内に収まっている
+        assert!(buffer.undo_depth() < 8, "バイト上限が効いていない");
+        assert!(
+            buffer.undo_history_bytes() <= UNDO_BYTE_LIMIT,
+            "履歴が予算を超えている: {} バイト",
+            buffer.undo_history_bytes()
+        );
+        // 直前の操作は必ず取り消せる
+        assert!(buffer.undo());
+        assert_eq!(buffer.text().len(), a.len());
+    }
+
+    #[test]
+    fn 単独で予算を超える編集でも直前の1件は残る() {
+        let huge = "x".repeat(UNDO_BYTE_LIMIT + 1);
+        let mut buffer = coalescing("history-single-huge", "small");
+        buffer.set_text(huge.clone());
+        assert_eq!(buffer.undo_depth(), 1, "1 件も残らないと undo できない");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "small");
+    }
+
+    #[test]
+    fn crlfファイルの挿入をundoredoしても既存行の改行が変わらない() {
+        let original = "l1\r\nl2\r\n日本\r\n";
+        let mut buffer = coalescing("crlf-undo", original);
+        assert_eq!(buffer.line_ending(), LineEnding::Crlf);
+        buffer.set_cursor(2, false);
+        buffer.insert("X"); // 1 塊目
+        buffer.newline(); // 2 塊目（改行は塊を切る）
+        buffer.delete_backward(); // 3 塊目（種別が変わる）
+        assert_eq!(buffer.undo_depth(), 3);
+        for _ in 0..3 {
+            assert!(buffer.undo());
+        }
+        assert_eq!(
+            buffer.text().as_bytes(),
+            original.as_bytes(),
+            "undo で既存行の改行が書き換わった"
+        );
+        // redo で戻した先も CRLF のまま
+        assert!(buffer.redo());
+        assert_eq!(buffer.text(), "l1X\r\nl2\r\n日本\r\n");
+        assert!(buffer.redo());
+        assert_eq!(buffer.text(), "l1X\r\n\r\nl2\r\n日本\r\n");
+        assert_eq!(buffer.line_ending(), LineEnding::Crlf);
+    }
+
+    #[test]
+    fn set_textのundoで改行コードも戻る() {
+        let mut buffer = coalescing("undo-eol", "a\r\nb\r\n");
+        assert_eq!(buffer.line_ending(), LineEnding::Crlf);
+        buffer.set_text("a\nb\n".into());
+        assert_eq!(buffer.line_ending(), LineEnding::Lf);
+        assert!(buffer.undo());
+        assert_eq!(
+            buffer.line_ending(),
+            LineEnding::Crlf,
+            "undo で改行コードが戻らないと、次の Enter が別の改行を挿す（#1650）"
+        );
+        buffer.move_cursor(CursorMovement::DocumentEnd, false);
+        buffer.newline();
+        assert_eq!(buffer.text(), "a\r\nb\r\n\r\n");
+    }
+
+    /// 固定シードの疑似乱数（外部クレートを増やさない。xorshift64*）
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    #[test]
+    fn ランダムな編集列をundoで全部戻すと元の本文とバイト一致する() {
+        // CRLF・LF・空・日本語をすべて通す（改行コードは #1650 の契約）
+        let seeds = ["", "abc\ndef\n", "a日本語\nz", "l1\r\nl2\r\n日本\r\n"];
+        for (i, original) in seeds.iter().enumerate() {
+            let mut rng = Rng(0x1651_0000 + i as u64);
+            let mut buffer = TextBuffer::from_text(path("prop"), (*original).into());
+            for step in 0..200 {
+                // 時計も決定的に進める（窓を跨ぐ回と跨がない回の両方を通す）
+                buffer.set_clock_millis((step as u64) * 137);
+                let len = buffer.text().len();
+                let pos = if len == 0 { 0 } else { rng.below(len + 1) };
+                match rng.below(8) {
+                    0 => buffer.insert("a"),
+                    1 => buffer.insert("日本\n語"),
+                    2 => {
+                        buffer.set_cursor(pos, false);
+                        buffer.delete_backward();
+                    }
+                    3 => {
+                        buffer.set_cursor(pos, false);
+                        buffer.delete_forward();
+                    }
+                    4 => {
+                        // 選択して差し替え
+                        buffer.set_cursor(pos, false);
+                        let end = if len == 0 { 0 } else { rng.below(len + 1) };
+                        buffer.set_cursor(end, true);
+                        buffer.insert("Z\r\nZ");
+                    }
+                    5 => {
+                        buffer.select_all();
+                        buffer.insert("全選択差し替え\n2 行目");
+                    }
+                    6 => {
+                        let _ = buffer.replace_all("z", "ZZ");
+                    }
+                    _ => {
+                        buffer.newline();
+                    }
+                }
+            }
+            let edited = buffer.text().to_string();
+            let mut undone = 0;
+            while buffer.undo() {
+                undone += 1;
+            }
+            assert!(undone > 0, "seed {i}: 1 件も undo できていない");
+            assert_eq!(
+                buffer.text().as_bytes(),
+                original.as_bytes(),
+                "seed {i}: undo で元の本文へ戻らない（{undone} 件戻した）"
+            );
+            let mut redone = 0;
+            while buffer.redo() {
+                redone += 1;
+            }
+            assert_eq!(redone, undone, "seed {i}: redo の回数が undo と合わない");
+            assert_eq!(
+                buffer.text().as_bytes(),
+                edited.as_bytes(),
+                "seed {i}: redo で編集後の本文へ戻らない"
+            );
+            // 2 周目も同じ（状態が壊れていない）
+            while buffer.undo() {}
+            assert_eq!(buffer.text().as_bytes(), original.as_bytes());
+        }
     }
 }

@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-23（#1627: Instant の巻き戻しをやめ、起動直後の panic を止めた）
-- `PaneMapping::new()` の `Instant::now() - Duration::from_secs(999)` は**ブートから 999 秒未満で panic**（`Instant` の起点はブート）。本番の呼び手は `remote serve` の起動と `backend_session_of_pane` で、CI Windows では uptime が閾値を跨ぐかだけで結果が反転していた（746 秒 = 3 件 FAILED / 1012 秒 = ok = 速い CI ほど落ちる）
-- 初期値は `Option<Instant>` の `None`（= 期限切れ。時刻を捏造しない）へ。「N 前に起きたことにする」用途は `tako_core::monotonic::rewound`（飽和する 1 実装）へ寄せ、**実は 9 箇所**あった直書き（Issue の 6 箇所は行単位 grep の見落ち = 改行に割れた 3 件）を全部通した
-- 実測: 番犬 4 本（改行をまたぐ走査・寄せ先の飽和・空振り検査）+ 実ファイル注入 3 通りすべて file:line 名指しで FAILED → 戻して緑。`is_none_or` → `is_some_and` の 1 語反転も新しい単体テストが落とす
-
 ## 2026-09-23（#1569: probe_path が Windows で repo_rel を空にしないようにした）
 - `config_share::env::probe_path` が `std::fs::canonicalize`（Windows は verbatim `\\?\C:\…`）の戻りを `git rev-parse --show-toplevel` の戻りへ `Path::strip_prefix` していた。成分単位の比較で `Prefix(VerbatimDisk)` と `Prefix(Disk)` は別物なので必ず `Err` → `unwrap_or_default()` が `repo_rel` を黙って空文字にし、`tako config` の外部管理検出（#513）で `same_place` が常に false 側へ倒れていた。解決は境界（B26）へ（`resolved` は git の cwd として**子プロセスへ渡る** = #970 そのもの）
 - 表記の食い違いは新設の `tako_core::platform::path::relative_under` が吸収する（verbatim を**無条件で**落とす / `/` と `\` の両方で成分を割る / ドライブ文字だけ大小無視 / 配下でなければ `None`）。剥がす条件を付けないのは戻りが相対表記で Win32 へ渡らないため。`cfg` 無しなので macOS から Windows 形を検査できる。`platform_parity` の許可リストは 2 → 1 件（残る 1 件 = `same_dir` は両辺が同じ関数なので「比較キー専用」の例外が成り立つ）
@@ -64,3 +59,8 @@
 - 21 種のうち 10 種が Windows で不成立（`python3` / `cc` / `c++` / `rustc` + `./<出力>` / `bash` / `zsh`）・`runner.rs` に `cfg(windows)` 0 件だったので、表を `platform::runner_defaults::TABLE`（**41 拡張子 × 2 列**）へ移し、`Platform` 引数 + `cfg!` で macOS の単体から Windows 列を解決結果ごと固定した
 - Windows 列は PowerShell 5.1 でも通る形（`&&` / `./` を使わず `; if ($?) { .\<名前>.exe }`）。`.ps1` / `.bat` / `.tsx` など 20 拡張子を追加し、意図して置かない 9 マスは理由（日英）を持って案内へ載る（置かない基準は「その OS に解釈系が無い / 決まらない」）
 - 実測: 注入 A/B 3 通り（属性の `#[cfg(windows)]` / Windows 列の `python3` / `.command` の Windows 列を絶やす）が名指しで FAILED → 戻して緑。初版は `.command` を Windows で既定なしにして CI の Windows が赤（`Run` が Err = dispatch の実行テスト 3 件）→ 基準を「解釈系が無い / 決まらない」へ正した。GUI 実経路は画面スリープで未実施（#1160）
+
+## 2026-09-23（#1651: undo を差分にし、連続タイプを 1 塊にまとめた）
+- 編集のたびに `self.text.clone()` を積んでいた（release 実測: 1 MB へ 1000 打鍵で RSS 増分 **1022.0MB**・undo 1000 回）。履歴 1 件を `EditDelta`（範囲 + 置換前後 + 編集前後のカーソル・選択・**改行コード**）へ替え、**増分 1.1MB / undo 1 回**（塊を毎回切る最悪値でも 1.2MB / 1000 回）。上限は操作数 1000 と履歴 8MiB の先に効いたほう（全文差し替え・全置換は 1 操作で本文 2 本ぶん積むので操作数だけでは上限にならない）
+- 本文を書き換える口を `apply_edit` 1 本へ寄せた（通らない書き換えは undo で戻らないので番犬が名指す）。**`set_cursor` は実際に動いたときだけ塊を切る**のが要点で、GUI は 1 打鍵ごとに画面の選択をバッファへ写す（同じ位置への `set_cursor` × 2）ため、素で切ると **GUI だけ 1 文字粒度**だった
+- 実測: 注入 6 通りすべて file:line 名指しで FAILED → 戻して緑・隔離 GUI + 実 CLI で apply/replace → undo 2 回で元ファイルとバイト一致 → redo 2 回で復帰・ランダム編集列 200 手 × 4 シード（CRLF 含む）を undo で全部戻すと**元の本文とバイト一致**・workspace 5303 passed 0 failed・clippy 3 宇宙 0。`replace_all` がカーソルを多バイト文字の途中へ残す既存 panic も併せて直した
