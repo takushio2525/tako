@@ -188,7 +188,13 @@ fn check_no_signal_zero(source: &str, rel: &str) {
 }
 
 fn check_residue_delegates(source: &str, rel: &str) {
-    let (aline, abody) = fn_body(source, rel, "\n    fn alive(&self, pid: u32) -> bool {");
+    // 戻り値は 3 値（#1597: 「答えられない」を `false` へ潰さない）。
+    // 型が変わったらここも直す = 番犬が黙って別物を見に行かない
+    let (aline, abody) = fn_body(
+        source,
+        rel,
+        "\n    fn alive(&self, pid: u32) -> Option<bool> {",
+    );
     assert!(
         abody.contains(BOUNDARY),
         "{rel}:{aline} `OwnerProbe::alive` が境界 `{BOUNDARY}` を通っていない（#1581）。\n\
@@ -284,6 +290,10 @@ fn is_process_alive(pid: u32) -> bool {
             return Owner::Dead;
         }
         Owner::Unknown
+    }
+
+    fn alive(&self, pid: u32) -> Option<bool> {
+        Some(crate::ports::process_alive(pid))
     }
 ";
     assert!(
