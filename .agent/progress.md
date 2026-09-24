@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-23（#1569: probe_path が Windows で repo_rel を空にしないようにした）
-- `config_share::env::probe_path` が `std::fs::canonicalize`（Windows は verbatim `\\?\C:\…`）の戻りを `git rev-parse --show-toplevel` の戻りへ `Path::strip_prefix` していた。成分単位の比較で `Prefix(VerbatimDisk)` と `Prefix(Disk)` は別物なので必ず `Err` → `unwrap_or_default()` が `repo_rel` を黙って空文字にし、`tako config` の外部管理検出（#513）で `same_place` が常に false 側へ倒れていた。解決は境界（B26）へ（`resolved` は git の cwd として**子プロセスへ渡る** = #970 そのもの）
-- 表記の食い違いは新設の `tako_core::platform::path::relative_under` が吸収する（verbatim を**無条件で**落とす / `/` と `\` の両方で成分を割る / ドライブ文字だけ大小無視 / 配下でなければ `None`）。剥がす条件を付けないのは戻りが相対表記で Win32 へ渡らないため。`cfg` 無しなので macOS から Windows 形を検査できる。`platform_parity` の許可リストは 2 → 1 件（残る 1 件 = `same_dir` は両辺が同じ関数なので「比較キー専用」の例外が成り立つ）
-- 実測: 純粋関数テスト 4 本（`\\?\C:\repo\home\.claude` + `C:/repo` → `home/.claude`）・注入 5 通りすべて FAILED → 戻して緑・CI の Windows 実機で該当テストが `ok`（`#[cfg_attr(windows, ignore)]` を除去。5127 passed 0 failed）・workspace 5177 passed 0 failed・clippy 3 宇宙 0・check-windows error 0
-
 ## 2026-09-23（#1571: Windows の master system prompt を予算内へ戻した）
 - `{{platform_notes}}` が縮退理由を**全文**並べており Windows で `platform` 片 4110 B・tako が作る側が取り分（18944 B）を 1.7〜2.7 KB 超過（CI 実測 20708 / 21420 / 21639 = そのぶん利用者の追記の取り分が削られる）。#1154 / #1477 の作法で prompt には件数と引き方だけを残し、全文は動的 topic `platform` へ。短縮形・手順書・A/B は `PlatformFacts`（`notes_section_in` / `full_section_in`）の 1 実装を共有
 - 番犬が**実機でしか測れない**のが元凶なので `Platform` を prompt 組み立てまで引数で通し（`system_prompt_pieces_on` ほか）、`prompt_budget_1477` は macOS / Windows 両方の形を測る。#1278 の `#[cfg_attr(windows, ignore)]` は外した。行き先が変わった既存番犬 2 件も追従（`platform_parity` の単一ソース検査 / MCP カタログ snapshot）
@@ -64,3 +59,8 @@
 - 編集のたびに `self.text.clone()` を積んでいた（release 実測: 1 MB へ 1000 打鍵で RSS 増分 **1022.0MB**・undo 1000 回）。履歴 1 件を `EditDelta`（範囲 + 置換前後 + 編集前後のカーソル・選択・**改行コード**）へ替え、**増分 1.1MB / undo 1 回**（塊を毎回切る最悪値でも 1.2MB / 1000 回）。上限は操作数 1000 と履歴 8MiB の先に効いたほう（全文差し替え・全置換は 1 操作で本文 2 本ぶん積むので操作数だけでは上限にならない）
 - 本文を書き換える口を `apply_edit` 1 本へ寄せた（通らない書き換えは undo で戻らないので番犬が名指す）。**`set_cursor` は実際に動いたときだけ塊を切る**のが要点で、GUI は 1 打鍵ごとに画面の選択をバッファへ写す（同じ位置への `set_cursor` × 2）ため、素で切ると **GUI だけ 1 文字粒度**だった
 - 実測: 注入 6 通りすべて file:line 名指しで FAILED → 戻して緑・隔離 GUI + 実 CLI で apply/replace → undo 2 回で元ファイルとバイト一致 → redo 2 回で復帰・ランダム編集列 200 手 × 4 シード（CRLF 含む）を undo で全部戻すと**元の本文とバイト一致**・workspace 5303 passed 0 failed・clippy 3 宇宙 0。`replace_all` がカーソルを多バイト文字の途中へ残す既存 panic も併せて直した
+
+## 2026-09-24（#1007: LSP 統合のスライスを起票し、S1 の実装設計書を出した）
+- 調査レポート §10 の分割を現状へ更新して 19 件起票（S0-b #1676 / S0-d #1677 / **S1 #1678** / S2〜S13 #1679〜#1690 / SE-3〜SE-6 #1691〜#1694）。S0-a は #1648 で済・S0-c は #1653・SE-1 は #1652・SE-2 は #1654 を参照に載せ、依存グラフと着手順を #1007 へロールアップ
+- `.agent/plans/2026-09-lsp-s1.md`（395 行）: モジュール配置（GPUI 依存は tako-app だけ）/ スレッド + futures channel（tokio も GPUI executor も使わない。`ipc.rs` の前例）/ 検出表 = 行追加だけで言語が増える形 / 版は #1658 のものを使う / UTF-16 変換の置き場 / 偽サーバ 2 段のテスト戦略 / MCP・CLI の口 / 分割不可の理由 / 判断待ち 4 点
+- 前払い: #1648 着地済み・#1651（PR #1671）と #1658 の着地待ちが S1 の前提
