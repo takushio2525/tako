@@ -656,6 +656,20 @@ pub enum Request {
         /// 引き続き有効。`direction`（分割方向）とは分割元が無いため排他
         #[serde(default)]
         new_tab: bool,
+        /// 開いた直後に飛ぶ行（1 始まり。FR-3.27 / #1676。定義ジャンプの着地点）。
+        /// 文書の行数を超える値は**末尾行へ丸める**。指定すると表示種別は
+        /// 「原文の 1 行 = 1 item」の code へ倒れる（md のレンダリング表示は
+        /// 1 item = 1 ブロックで原文の行が残らないため）。
+        ///
+        /// **省略時は wire に現れない**（`skip_serializing_if`）ので、行を渡さない
+        /// 呼び出しの JSON はこの引数が生える前とバイト単位で同じ（#322 / #1676）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        line: Option<usize>,
+        /// 着地する桁（1 始まりの**文字**単位。FR-3.27 / #1676）。`line` と一緒に
+        /// 指定する。行の文字数 + 1（行末の次）まで受け、超えたぶんは丸める。
+        /// `line` と同じく**省略時は wire に現れない**
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        column: Option<usize>,
     },
     /// PDF・画像プレビューの表示倍率・ページ・パン操作（#234）。
     /// 全操作省略時は状態取得。zoom は百分率（150 = 150%）、page は 1 始まり、

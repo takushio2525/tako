@@ -105,8 +105,8 @@ pub use dispatch::{
     TmuxContext,
 };
 pub use host::{
-    PreviewHost, RemoteHost, SessionHost, SystemHost, TmuxHost, UiStateHost, VideoStatus,
-    WebViewHost, WorkspaceHost,
+    PreviewHost, PreviewLineTarget, RemoteHost, SessionHost, SystemHost, TmuxHost, UiStateHost,
+    VideoStatus, WebViewHost, WorkspaceHost,
 };
 pub use ipc::{IncomingRequest, IpcServer};
 pub use mcp::McpServer;

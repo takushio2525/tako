@@ -20,16 +20,6 @@
 
 ---
 
-## 2026-09-23（#1648: 編集中の再ハイライトを差分化した）
-- 1 打鍵ごとに全文を syntect へ通していた `apply_editor_text` を、行の切れ目の状態を 8 行ごとに持ち回る差分へ。全文経路と差分経路は同じ `step` を通すので塗り分けは食い違わない
-- 実測（release / 1 打鍵）: 4,666 行 344.6→**0.56ms**（611x・再ハイライト 8 行）・5,000 行 355.4→0.47ms（760x）。間隔 8 行は時間とメモリ（1 地点 925 バイト）の釣り合いで選んだ
-- 注入 6 通りすべて file:line 名指しで FAILED → 戻して緑。Markdown ⇄ Code の切替で表示だけ外から差し替わる経路は `highlight_stamp` の照合で塞いだ
-
-## 2026-09-23（#1650: エディタが CRLF ファイルを壊さないようにした）
-- `line_end` が `\n` の位置を返し `newline` が `"\n"` 固定だったので、CRLF ファイルは End で CR の後ろへ止まり（実測 `cursor=4` / `"abc\r!\n"`）Enter 1 回で混在改行（CR 2 / LF 3）になっていた。`TextBuffer` に `LineEnding` を持たせ `\r\n` を 1 つの行区切りとして扱う（行末は CR の手前 / カーソルは CR と LF のあいだに入らない / BS・Delete は 2 バイトまとめて / 移動はまたぐ）
-- **既存行の改行は 1 バイトも書き換えない**（混在は多数派へ寄せず保持）。新しい改行だけが多数派に揃い、揃える口は `normalize_line_endings` の 1 実装。改行 0 のファイルだけ `for_new_file(Platform)` = OS の流儀（純関数なので macOS から両腕を固定できる。初回 CI は Windows だけ赤で、既存テスト 2 件の `\n` 直書き期待値がずれていた）。表示側の行頭オフセットも `line_start_offsets` へ
-- 実測: 4 通り（CRLF / LF / 混在 / 末尾改行なし）の往復保存が修正前 FAILED → 修正後 緑・番犬 `issue1650_line_ending_watchdog` 8 本へ注入 12 通りすべて file:line 名指しで FAILED → 戻して緑・Windows の腕を強制した全数走 5260 passed・workspace 5261 passed 0 failed・clippy 3 宇宙 0
-
 ## 2026-09-23（#1505: setup --check と check-health の診断項目を 1 実装の正本から組むようにした）
 - 同じ「この環境で tako は使えるか」を 2 実装が別々に答えていた（`--check` にシェル統合・tako CLI の PATH・更新・remote・IPC の行が無く、PATH は `check-health` だけが別口 = 棚卸し Z19）。`tako_control::diagnostics::collect()` を項目・判定・行の正本にし、`run_check` は 285 行 → 15 行（判断ゼロ）、`check_health` は応答へ `diagnostics` 節。認証とプランの問い合わせも `auth_state_for` の 1 回へ寄り、`--check` は 12.4 → 10.8 秒
 - 重い正本（実測 10.8 秒）を UI スレッドで走らせないよう `Request::CheckHealth` を `prepare_offload` へ。IPC の項目は観測者で文面を変えない形に。**寄せた先で #1503 の打ち切りの知らせが落ちていた**（CI の macOS が実回帰で赤）ので `agent_probe::output_with_timeout` の 1 実装から出し直し、`diagnostics.probe_timeouts` で機械可読にもして番犬を足した
@@ -64,3 +54,8 @@
 - 編集の口が全文置換 1 つだけで、5,000 行の 1 行を直すのに本文を丸ごと IPC で送っていた（実測 275,000 → 61 バイト = 4,508 分の 1）。`PreviewEditRange` / `PreviewCursor` を tako-core 操作 API → dispatch → CLI `tako edit replace-range` / `cursor` → MCP `tako_preview_edit_range` / `tako_preview_cursor` へ 1:1。座標は行 1 始まり / 桁 0 始まりの行内 UTF-8 バイトで、範囲外・文字の途中・CR と LF のあいだは**丸めずに拒否**する
 - 応答へ `document`（`version` / `line_count` / `cursor` / `selection` / `undo_depth` / `undo_history_bytes`）を載せ、編集系すべてを `dispatch::preview_edit_reply` の 1 実装から組む。版は本文が変わるたびに進み（undo / redo でも戻らず進む）、`expected_version` で楽観ロックできる = LSP（#1007 S1）の `didChange` の前払い
 - 実測: 隔離 GUI の実経路 30 項目すべて OK（`scripts/test-edit-range-1658.sh`）・番犬 7 規則へ注入 10 通りすべて名指しで FAILED → 戻して緑・workspace 5360 passed 0 failed・clippy 3 宇宙 0・カタログ 202,204 / 204,800 バイト（予算内）
+
+## 2026-09-24（#1676: 開いた直後にその行へ着地できるようにした）
+- `OpenFile` に `line` / `column`（1 始まり）を足し、CLI `tako open --line L [--column C]` と MCP `tako_open_file`（**ツールは増やさない**）を同じ dispatch へ 1:1 で載せた。md の写像は「`line` を渡された時点で code へ倒す」（レンダリング表示は 1 item = 1 ブロックで原文の行が残らない）と決めて FR-3.27 へ明記。行を持たない種別は**開く前**にエラー、超過は末尾行へ丸めて `clamped` で知らせる
+- 着地は `ListState` が描画時に作られるので「次の描画で 1 度だけ飛ぶ」予約（`preview_pending_reveal` → `consume_pending_reveal`）。省略時は wire に現れない（`skip_serializing_if`）ので JSON は引数が生える前とバイト一致
+- 実測: セルフテスト項目 153（5,000 行 / 42・1・超過・4990）が `TAKO_APP_SELF_TEST_OK` 完走・A/B `TAKO_1676_LEGACY=1` で 153a が FAILED（応答は同じ値なので画面まで見ないと差が出ない）・`scripts/test-open-line-1676.sh` **26 PASS 0 FAIL**（CLI と MCP の応答が字面一致）・注入 3 通り（写像 / 丸め / skip_serializing_if）すべて FAILED → 戻して緑・workspace 5345 passed 0 failed・clippy 3 宇宙 0

@@ -2498,6 +2498,8 @@ impl TakoApp {
                 direction: None,
                 focus: Some(true),
                 new_tab: false,
+                line: None,
+                column: None,
             },
             PaneOrigin::User,
         );
@@ -2534,6 +2536,8 @@ impl TakoApp {
                 direction: None,
                 focus: Some(true),
                 new_tab: true,
+                line: None,
+                column: None,
             },
             OpenTarget::ShellInNewTab(dir) => tako_control::protocol::Request::TabNew {
                 // タブ名はフォルダ名（無ければパスそのもの）。明示タイトル =

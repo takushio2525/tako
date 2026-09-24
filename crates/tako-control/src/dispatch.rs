@@ -85,6 +85,27 @@ fn preview_mode_wire(path: &std::path::Path) -> PreviewModeWire {
     }
 }
 
+/// 行指定つきで開くときの表示種別（#1676）。判定の正本は
+/// `tako_core::open_plan::preview_route_with_line` で、ここは wire 型との橋渡しだけ
+fn preview_route_with_line_wire(mode: PreviewModeWire) -> Result<PreviewModeWire, String> {
+    let route = match mode {
+        PreviewModeWire::Code => tako_core::open_plan::PreviewRoute::Code,
+        PreviewModeWire::Markdown => tako_core::open_plan::PreviewRoute::Markdown,
+        PreviewModeWire::Image => tako_core::open_plan::PreviewRoute::Image,
+        PreviewModeWire::Pdf => tako_core::open_plan::PreviewRoute::Pdf,
+        PreviewModeWire::Video => tako_core::open_plan::PreviewRoute::Video,
+    };
+    Ok(
+        match tako_core::open_plan::preview_route_with_line(route)? {
+            tako_core::open_plan::PreviewRoute::Code => PreviewModeWire::Code,
+            tako_core::open_plan::PreviewRoute::Markdown => PreviewModeWire::Markdown,
+            tako_core::open_plan::PreviewRoute::Image => PreviewModeWire::Image,
+            tako_core::open_plan::PreviewRoute::Pdf => PreviewModeWire::Pdf,
+            tako_core::open_plan::PreviewRoute::Video => PreviewModeWire::Video,
+        },
+    )
+}
+
 /// リクエストを実行し、成功時の `result` 値を返す。
 /// `origin` は新規生成ペインの生成主体（Layer 1 CLI なら `Cli`、Phase 3 の MCP なら `Mcp`）
 /// dispatch は UI スレッド（GPUI のイベントループ）で実行されるため、ここでの遅延は
@@ -2177,11 +2198,30 @@ fn dispatch_inner(
             direction,
             focus,
             new_tab,
+            line,
+            column,
         } => {
             if new_tab && direction.is_some() {
                 return Err(DispatchError::Operation(
                     "new_tab と direction は同時に指定できない（新しいタブには分割元が無い）"
                         .into(),
+                ));
+            }
+            // #1676: 1 始まりの検査は**開く前**に済ませる（0 を渡した呼び出しで
+            // ペインが増えてから落ちる、という後始末の要る失敗を作らない）
+            if line == Some(0) {
+                return Err(DispatchError::InvalidParams(
+                    tako_core::open_plan::LINE_ONE_BASED.into(),
+                ));
+            }
+            if column == Some(0) {
+                return Err(DispatchError::InvalidParams(
+                    tako_core::open_plan::COLUMN_ONE_BASED.into(),
+                ));
+            }
+            if line.is_none() && column.is_some() {
+                return Err(DispatchError::InvalidParams(
+                    "column は line と一緒に指定する".into(),
                 ));
             }
             let (tab, target) = match pane {
@@ -2214,6 +2254,13 @@ fn dispatch_inner(
             // リンク検出の応答（`tako links` の `open`）が同じ表を引くので、
             // 「cmd+クリックがどう開くか」は機械で読める
             let mode = mode.unwrap_or_else(|| preview_mode_wire(&resolved));
+            // #1676: 行指定があるときは「原文の 1 行 = 1 item」になる code へ倒す
+            // （md のレンダリング表示は 1 item = 1 ブロックで原文の行が残らない）。
+            // 行を持たない種別（画像 / PDF / 動画）はここで弾く = **開く前**
+            let mode = match line {
+                Some(_) => preview_route_with_line_wire(mode).map_err(DispatchError::Operation)?,
+                None => mode,
+            };
             // 表示先の解決: new_tab 指定（FR-3.22 = Finder の「このアプリケーションで
             // 開く」）なら新しいタブ 1 枚をそのファイル専用にする。direction 指定
             // （FR-3.11 = D&D のドロップ位置）なら再利用せず必ずその方向へ分割。
@@ -2261,6 +2308,20 @@ fn dispatch_inner(
             let path_str = resolved.display().to_string();
             host.set_preview(view_pane, &path_str, mode)
                 .map_err(DispatchError::Operation)?;
+            // #1676: 着地点の予約は**開いたあと**（行数はロード済みの内容から数える）。
+            // ここで失敗するのは「拡張子はテキストなのに中身が読めない」ときだけなので、
+            // 開いたことが分かる文言にして返す（ペインはそのまま残る）
+            let landing = match line {
+                Some(line) => Some(host.reveal_preview_line(view_pane, line, column).map_err(
+                    |e| {
+                        DispatchError::Operation(format!(
+                            "開いたが行へ飛べない（{}: {e}）",
+                            resolved.display()
+                        ))
+                    },
+                )?),
+                None => None,
+            };
             // CLI/MCP 経由のデフォルトはフォーカスを移さない（ユーザーの入力を奪わない）
             if focus.unwrap_or(false) {
                 tree_mut(host.workspace_mut(), tab)
@@ -2273,6 +2334,13 @@ fn dispatch_inner(
                 "path": path_str,
                 "mode": mode.as_str(),
                 "created": created,
+                // #1676: 行指定が無ければ 4 つとも null・clamped は false
+                // （従来のキーはそのまま = 既存の読み手を壊さない）
+                "line": landing.map(|l| l.line),
+                "column": landing.and_then(|l| l.column),
+                "item": landing.map(|l| l.item),
+                "total_lines": landing.map(|l| l.total_lines),
+                "clamped": landing.is_some_and(|l| l.clamped),
             }))
         }
         Request::PreviewView {
@@ -2790,6 +2858,8 @@ fn dispatch_inner(
                             direction: Some(Direction::Right),
                             focus: Some(true),
                             new_tab: false,
+                            line: None,
+                            column: None,
                         }
                     };
                     let inner_result = dispatch(host, inner, origin)?;
@@ -7359,6 +7429,8 @@ pub fn remote_open_file_fetched(
             direction: None,
             focus,
             new_tab: false,
+            line: None,
+            column: None,
         },
         origin,
     )?;
@@ -15463,6 +15535,36 @@ mod tests {
         fn preview_state(&self, pane: PaneId) -> Option<(String, PreviewModeWire)> {
             self.previews.get(&pane.as_u64()).cloned()
         }
+        /// #1676: 行数は**実ファイルを読んで**数える（GUI と同じ材料）。
+        /// 丸めと 1 始まりの判定は `open_plan` の 1 実装を GUI と共有する
+        fn reveal_preview_line(
+            &mut self,
+            pane: PaneId,
+            line: usize,
+            column: Option<usize>,
+        ) -> Result<crate::host::PreviewLineTarget, String> {
+            let (path, _) = self
+                .previews
+                .get(&pane.as_u64())
+                .ok_or_else(|| "プレビューペインではない".to_string())?;
+            let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+            let lines: Vec<&str> = text.lines().collect();
+            let (line, line_clamped) = tako_core::open_plan::clamp_line(lines.len(), line)?;
+            let column = match column {
+                Some(column) => {
+                    let chars = lines.get(line - 1).map(|l| l.chars().count()).unwrap_or(0);
+                    Some(tako_core::open_plan::clamp_column(chars, column)?)
+                }
+                None => None,
+            };
+            Ok(crate::host::PreviewLineTarget {
+                line,
+                column: column.map(|(column, _)| column),
+                total_lines: lines.len(),
+                item: line - 1,
+                clamped: line_clamped || column.is_some_and(|(_, clamped)| clamped),
+            })
+        }
         fn set_preview(
             &mut self,
             pane: PaneId,
@@ -17837,6 +17939,8 @@ mod tests {
                     direction: None,
                     focus: None,
                     new_tab: false,
+                    line: None,
+                    column: None,
                 },
                 PaneOrigin::Mcp,
             )
@@ -17906,6 +18010,8 @@ mod tests {
                     direction: None,
                     focus,
                     new_tab: true,
+                    line: None,
+                    column: None,
                 },
                 PaneOrigin::Mcp,
             )
@@ -17974,6 +18080,8 @@ mod tests {
                 direction: Some(Direction::Right),
                 focus: None,
                 new_tab: true,
+                line: None,
+                column: None,
             },
             PaneOrigin::Mcp,
         );
@@ -18515,6 +18623,8 @@ mod tests {
                     direction,
                     focus: Some(true),
                     new_tab: false,
+                    line: None,
+                    column: None,
                 },
                 PaneOrigin::User,
             )
@@ -18563,6 +18673,8 @@ mod tests {
                     direction: None,
                     focus: None,
                     new_tab: false,
+                    line: None,
+                    column: None,
                 },
                 PaneOrigin::User,
             )
@@ -18577,6 +18689,159 @@ mod tests {
             message.contains("ファイルではない"),
             "ディレクトリへのリンクの理由が変わっている: {message}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1676: 行・桁を省略した `OpenFile` の JSON が、引数が生える前と**バイト一致**する。
+    ///
+    /// 期待値は origin/main の `Request::OpenFile`（pane / path / mode / direction /
+    /// focus / new_tab の 6 フィールド）をそのまま serde へ通した形。`line` / `column` は
+    /// `skip_serializing_if` を付けてあるので、渡さない呼び出しの wire には現れない
+    /// （旧い tako-cli と新しい tako-app が混ざっても JSON が変わらない）
+    #[test]
+    fn 行を渡さないopenfileのjsonは引数が生える前と一致する() {
+        let request = Request::OpenFile {
+            pane: None,
+            path: "/tmp/a.rs".into(),
+            mode: None,
+            direction: None,
+            focus: None,
+            new_tab: false,
+            line: None,
+            column: None,
+        };
+        const BEFORE: &str = concat!(
+            r#"{"method":"open_file","params":{"pane":null,"path":"/tmp/a.rs","#,
+            r#""mode":null,"direction":null,"focus":null,"new_tab":false}}"#
+        );
+        assert_eq!(serde_json::to_string(&request).unwrap(), BEFORE);
+        // 逆向き: 旧い送り手の JSON をそのまま読める（既定は「行指定なし」）
+        assert_eq!(serde_json::from_str::<Request>(BEFORE).unwrap(), request);
+    }
+
+    /// #1676: 行指定の着地点（FR-3.27）。
+    ///
+    /// ① 行は原文の行で、表示は `code` へ倒れる（`.md` でも）② 行数を超えた要求は
+    /// 末尾行へ丸める ③ 0 と「桁だけ」はエラー ④ 行を持たない種別はエラー
+    #[test]
+    fn openfileの行指定は原文のcodeへ倒して着地点を返す() {
+        let dir =
+            std::env::temp_dir().join(format!("tako-dispatch-open-line-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let code = dir.join("big.rs");
+        let body: String = (1..=5000).map(|i| format!("// 行 {i}\n")).collect();
+        std::fs::write(&code, &body).unwrap();
+        let doc = dir.join("doc.md");
+        std::fs::write(&doc, "# 見出し\n\n段落\n\n## 次\n\n本文\n").unwrap();
+        let png = dir.join("shot.png");
+        std::fs::write(&png, [0x89, b'P', b'N', b'G']).unwrap();
+
+        let open = |host: &mut MockHost, path: &std::path::Path, line, column| {
+            let root = host.root_pane();
+            dispatch(
+                host,
+                Request::OpenFile {
+                    pane: Some(root),
+                    path: path.display().to_string(),
+                    mode: None,
+                    direction: None,
+                    focus: None,
+                    new_tab: false,
+                    line,
+                    column,
+                },
+                PaneOrigin::Cli,
+            )
+        };
+
+        let mut host = MockHost::new();
+        // ① 行の中ほど: item は 0 始まりなので line - 1
+        let opened = open(&mut host, &code, Some(42), None).unwrap();
+        assert_eq!(opened["mode"].as_str(), Some("code"));
+        assert_eq!(opened["line"].as_u64(), Some(42));
+        assert_eq!(opened["item"].as_u64(), Some(41));
+        assert_eq!(opened["total_lines"].as_u64(), Some(5000));
+        assert_eq!(opened["column"], serde_json::Value::Null);
+        assert_eq!(opened["clamped"].as_bool(), Some(false));
+
+        // ② 行数を超えた要求は末尾行へ丸める（エラーにしない）
+        let clamped = open(&mut host, &code, Some(999_999), None).unwrap();
+        assert_eq!(clamped["line"].as_u64(), Some(5000));
+        assert_eq!(clamped["item"].as_u64(), Some(4999));
+        assert_eq!(clamped["clamped"].as_bool(), Some(true));
+
+        // 桁も同じ規則（行末の次までは丸めない）
+        let column = open(&mut host, &code, Some(1), Some(999)).unwrap();
+        assert_eq!(
+            column["column"].as_u64(),
+            Some("// 行 1".chars().count() as u64 + 1)
+        );
+        assert_eq!(column["clamped"].as_bool(), Some(true));
+
+        // ③ 境界: 0 は 1 始まりの文言、桁だけの指定は行とセットを促す
+        let zero_line = open(&mut host, &code, Some(0), None).unwrap_err();
+        assert!(
+            zero_line
+                .to_string()
+                .contains(tako_core::open_plan::LINE_ONE_BASED),
+            "{zero_line}"
+        );
+        let zero_column = open(&mut host, &code, Some(1), Some(0)).unwrap_err();
+        assert!(
+            zero_column
+                .to_string()
+                .contains(tako_core::open_plan::COLUMN_ONE_BASED),
+            "{zero_column}"
+        );
+        let only_column = open(&mut host, &code, None, Some(3)).unwrap_err();
+        assert!(
+            only_column.to_string().contains("line と一緒に"),
+            "{only_column}"
+        );
+
+        // ④ md は**レンダリングをやめて**原文の行へ着地する（FR-3.27 の写像）。
+        // 行を渡さなければ今までどおり markdown のまま
+        let rendered = open(&mut host, &doc, None, None).unwrap();
+        assert_eq!(rendered["mode"].as_str(), Some("markdown"));
+        assert_eq!(rendered["line"], serde_json::Value::Null);
+        assert_eq!(rendered["clamped"].as_bool(), Some(false));
+        let jumped = open(&mut host, &doc, Some(5), None).unwrap();
+        assert_eq!(jumped["mode"].as_str(), Some("code"));
+        assert_eq!(jumped["line"].as_u64(), Some(5));
+        // 原文 5 行目（`## 次`）= item 4。レンダリング表示のブロック番号ではない
+        assert_eq!(jumped["item"].as_u64(), Some(4));
+        // 明示の markdown 指定より line が勝つ（#1676 で決めた写像）
+        let root = host.root_pane();
+        let forced = dispatch(
+            &mut host,
+            Request::OpenFile {
+                pane: Some(root),
+                path: doc.display().to_string(),
+                mode: Some(PreviewModeWire::Markdown),
+                direction: None,
+                focus: None,
+                new_tab: false,
+                line: Some(3),
+                column: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(forced["mode"].as_str(), Some("code"));
+        assert_eq!(forced["item"].as_u64(), Some(2));
+
+        // ⑤ 行を持たない種別は**開く前**に断る（ペインを増やさない）
+        let tabs_before = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap()["tabs"]
+            .as_array()
+            .map(Vec::len);
+        let image = open(&mut host, &png, Some(1), None).unwrap_err();
+        assert!(image.to_string().contains("image"), "{image}");
+        let tabs_after = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap()["tabs"]
+            .as_array()
+            .map(Vec::len);
+        assert_eq!(tabs_before, tabs_after);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -18602,6 +18867,8 @@ mod tests {
                 direction: None,
                 focus: None,
                 new_tab: false,
+                line: None,
+                column: None,
             },
             PaneOrigin::Cli,
         )
@@ -18638,6 +18905,8 @@ mod tests {
                 direction: None,
                 focus: None,
                 new_tab: false,
+                line: None,
+                column: None,
             },
             PaneOrigin::User,
         );
@@ -18680,6 +18949,8 @@ mod tests {
                 direction: None,
                 focus: None,
                 new_tab: false,
+                line: None,
+                column: None,
             },
             PaneOrigin::Cli,
         )

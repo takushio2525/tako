@@ -107,6 +107,8 @@ mod tests {
                 direction: None,
                 focus: None,
                 new_tab: false,
+                line: None,
+                column: None,
             }]
         );
         // mode 省略は拡張子の自動判定に委ねる（None で渡る）。direction も省略可
@@ -124,6 +126,8 @@ mod tests {
                 direction: None,
                 focus: None,
                 new_tab: false,
+                line: None,
+                column: None,
             }]
         );
         // direction 指定（FR-3.11 = D&D のドロップ位置の同等操作）
@@ -144,8 +148,43 @@ mod tests {
                 direction: Some(Direction::Down),
                 focus: None,
                 new_tab: false,
+                line: None,
+                column: None,
             }]
         );
+        // #1676: line / column は 1 始まりでそのまま dispatch へ渡る（CLI と同じ経路）
+        let (_, requests) = run(
+            call(
+                "tako_open_file",
+                json!({ "path": "a.rs", "line": 42, "column": 7 }),
+            ),
+            Some(7),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::OpenFile {
+                pane: Some(7),
+                path: "a.rs".into(),
+                mode: None,
+                direction: None,
+                focus: None,
+                new_tab: false,
+                line: Some(42),
+                column: Some(7),
+            }]
+        );
+        // 負値は引数の型で弾く（0 と丸めは dispatch = open_plan の 1 実装が見る）
+        let (response, requests) = run(
+            call("tako_open_file", json!({ "path": "a.rs", "line": -1 })),
+            Some(7),
+            true,
+        );
+        assert!(requests.is_empty());
+        assert!(response.unwrap()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("line"));
         // 不正な mode と path 欠落は引数エラー
         let (response, requests) = run(
             call("tako_open_file", json!({ "path": "a.rs", "mode": "html" })),

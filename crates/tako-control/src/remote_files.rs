@@ -1595,6 +1595,8 @@ fn ensure_local_preview(deps: &FilesDeps, abs: &str) -> Result<PreviewTarget, Wr
                 // **フォーカスは奪わない**（Mac で作業中のユーザーの入力先を変えない）
                 focus: Some(false),
                 new_tab: false,
+                line: None,
+                column: None,
             })
             .map_err(|e| WriteFailure::app(&e))?;
             let pane = opened["pane"]

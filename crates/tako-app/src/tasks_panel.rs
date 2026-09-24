@@ -736,6 +736,8 @@ impl TakoApp {
             direction: None,
             focus: Some(false),
             new_tab: false,
+            line: None,
+            column: None,
         };
         match tako_control::dispatch(self, request, PaneOrigin::User) {
             Ok(_) => {

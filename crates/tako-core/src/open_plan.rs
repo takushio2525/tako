@@ -126,6 +126,66 @@ pub fn media_type(path: &Path) -> Option<&'static str> {
     media_type_for_extension(path.extension().and_then(|e| e.to_str()))
 }
 
+/// 行番号が 1 始まりであることの説明（0 以下を弾いたときの文言の正本）。
+///
+/// CLI（負値を型で持てる `i64`）と dispatch（`usize` なので 0 だけ）の両方が
+/// この 1 本を出すので、入口が違っても同じ文言になる
+pub const LINE_ONE_BASED: &str = "行番号は 1 始まり（0 以下は指定できない）";
+
+/// 桁番号が 1 始まりであることの説明（[`LINE_ONE_BASED`] の桁版）
+pub const COLUMN_ONE_BASED: &str = "桁番号は 1 始まり（0 以下は指定できない）";
+
+/// 行指定つきで開くときの表示種別を決める（純粋関数。Issue #1676）。
+///
+/// `line` が指す先は**原文の行**なので、着地できるのは「原文の 1 行が
+/// そのまま 1 item になる」`Code` だけ。`Markdown` はレンダリング表示の
+/// 1 item = 1 ブロック（#826）で原文の行が残らない（空行は消え、表は
+/// 1 ブロックに複数行が入る）ため、**`line` を渡された時点でソース表示へ倒す**。
+/// 画像・PDF・動画は行の概念を持たないのでエラーにする（PDF のページ送りは
+/// `PreviewView` の `page` が持つ別の操作）
+pub fn preview_route_with_line(route: PreviewRoute) -> Result<PreviewRoute, String> {
+    match route {
+        PreviewRoute::Code | PreviewRoute::Markdown => Ok(PreviewRoute::Code),
+        PreviewRoute::Image | PreviewRoute::Pdf | PreviewRoute::Video => Err(format!(
+            "行を指定して開けるのはテキスト（code / markdown）だけ: {}",
+            route.as_str()
+        )),
+    }
+}
+
+/// 要求された行を文書の実寸へ丸める（純粋関数。Issue #1676）。
+///
+/// 戻りは `(着地する行, 丸めたか)` で、行は 1 始まり。行数を超える要求は
+/// **末尾行へ丸める**（エラーにしない = 定義ジャンプの相手が古い行番号でも
+/// ファイルは開いて見せる）。空ファイルは行 1 を指す
+pub fn clamp_line(total_lines: usize, line: usize) -> Result<(usize, bool), String> {
+    if line == 0 {
+        return Err(LINE_ONE_BASED.to_string());
+    }
+    let last = total_lines.max(1);
+    if line > last {
+        Ok((last, true))
+    } else {
+        Ok((line, false))
+    }
+}
+
+/// 要求された桁をその行の実寸へ丸める（純粋関数。Issue #1676）。
+///
+/// `line_chars` はその行の**文字数**（UTF-8 のバイト数ではない）。行末の
+/// 次（`line_chars + 1`）までを有効な桁として受ける（キャレットが行末に立てる）
+pub fn clamp_column(line_chars: usize, column: usize) -> Result<(usize, bool), String> {
+    if column == 0 {
+        return Err(COLUMN_ONE_BASED.to_string());
+    }
+    let last = line_chars + 1;
+    if column > last {
+        Ok((last, true))
+    } else {
+        Ok((column, false))
+    }
+}
+
 /// パスを tako の中で開いたときの行き先。`is_dir` は呼び出し側が調べた実体の種別
 pub fn route(path: &Path, is_dir: bool) -> OpenRoute {
     if is_dir {
@@ -201,6 +261,47 @@ mod tests {
                 PreviewRoute::Code => assert_eq!(mime, None, "{ext:?}"),
             }
         }
+    }
+
+    /// #1676: 行指定は「原文の行」なので md はソース表示へ倒れ、
+    /// 行を持たない種別はエラーになる
+    #[test]
+    fn 行指定つきの種別は原文が残るcodeへ倒れる() {
+        assert_eq!(
+            preview_route_with_line(PreviewRoute::Code).unwrap(),
+            PreviewRoute::Code
+        );
+        assert_eq!(
+            preview_route_with_line(PreviewRoute::Markdown).unwrap(),
+            PreviewRoute::Code
+        );
+        for route in [PreviewRoute::Image, PreviewRoute::Pdf, PreviewRoute::Video] {
+            let err = preview_route_with_line(route).unwrap_err();
+            assert!(err.contains(route.as_str()), "{route:?}: {err}");
+        }
+    }
+
+    /// #1676: 行数を超える要求は末尾行へ丸め、0 は 1 始まりの文言で弾く
+    #[test]
+    fn 行の丸めと境界() {
+        assert_eq!(clamp_line(5000, 42).unwrap(), (42, false));
+        assert_eq!(clamp_line(5000, 5000).unwrap(), (5000, false));
+        assert_eq!(clamp_line(5000, 5001).unwrap(), (5000, true));
+        assert_eq!(clamp_line(1, 9999).unwrap(), (1, true));
+        // 空ファイル（行が 1 本も無い）でも行 1 は範囲内（キャレットの置き場）
+        assert_eq!(clamp_line(0, 1).unwrap(), (1, false));
+        assert_eq!(clamp_line(0, 7).unwrap(), (1, true));
+        assert_eq!(clamp_line(5000, 0).unwrap_err(), LINE_ONE_BASED);
+    }
+
+    /// #1676: 桁は行末の次まで受ける（キャレットが行末に立てる）
+    #[test]
+    fn 桁の丸めと境界() {
+        assert_eq!(clamp_column(10, 1).unwrap(), (1, false));
+        assert_eq!(clamp_column(10, 11).unwrap(), (11, false));
+        assert_eq!(clamp_column(10, 12).unwrap(), (11, true));
+        assert_eq!(clamp_column(0, 1).unwrap(), (1, false));
+        assert_eq!(clamp_column(10, 0).unwrap_err(), COLUMN_ONE_BASED);
     }
 
     #[test]
