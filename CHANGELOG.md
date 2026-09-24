@@ -8,6 +8,15 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.8.20] - 2026-09-25
+
+Nightly patch release (automated). Changes since v0.8.19:
+夜間パッチリリース（自動）。v0.8.19 以降の変更:
+
+- [修正] 在籍の列挙に失敗した回を「プロセス不在」と読まないようにした (#1597) (#1630)
+- [ドキュメント] LSP 統合のスライスを起票し、S1 の実装設計書を置いた (#1007) (#1695)
+- [修正] undo 履歴を全文スナップショットから差分へ替え、連続タイプを 1 塊にまとめた (#1651) (#1671)
+
 ## [0.8.19] - 2026-09-24
 
 Nightly patch release (automated). Changes since v0.8.18:
