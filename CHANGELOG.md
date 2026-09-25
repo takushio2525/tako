@@ -8,6 +8,14 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.8.21] - 2026-09-26
+
+Nightly patch release (automated). Changes since v0.8.20:
+夜間パッチリリース（自動）。v0.8.20 以降の変更:
+
+- [機能追加] OpenFile に行・桁を足し、開いた直後にその行へ着地できるようにした (#1676) (#1706)
+- [機能追加] 行・桁で指す範囲編集 API と文書の版を足し、1 行の修正で全文を送らないようにした (#1658) (#1698)
+
 ## [0.8.20] - 2026-09-25
 
 Nightly patch release (automated). Changes since v0.8.19:
