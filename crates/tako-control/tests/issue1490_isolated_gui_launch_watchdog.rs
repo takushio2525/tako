@@ -26,6 +26,9 @@
 //! 3. [`テストスクリプトは隔離起動を直書きしない`] — バイナリのパス / 面の名前の直書き
 //! 4. [`テストスクリプトはヘルパ経由で起動する`] — 手書きの背景起動と ensure を残さない
 //! 5. [`検査は実際の直書きを検出する`] — 検査そのものの検出力
+//! 6. [`ヘルパは配線済みの機でだけ面の指定を明示する`] — 明示の `TAKO_DISPLAY` を見失った
+//!    検証用 GUI は窓を開かずに終わる（#1697）ので、配線済みの機では明示し、未配線の機では
+//!    渡さない（渡すと CI・他人の機で検証が回らなくなる）
 
 use std::path::{Path, PathBuf};
 
@@ -179,6 +182,42 @@ fn ヘルパが起動の直前に面を起こす() {
         find(&body, "ISOLATED_GUI_PID=$!").is_some(),
         "{HELPER_REL}:{at}: 起こした pid を ISOLATED_GUI_PID へ置いていない（#1490）"
     );
+}
+
+/// 面の指定は**配線済みの機でだけ明示する**（#1697）。
+///
+/// tako は明示の `TAKO_DISPLAY` を見失うと窓を開かずに終わる（名前だけが読めない瞬間に
+/// ユーザーの画面へ落ちないため）。なので「配線済み」（今回 ensure が通った / この機で
+/// uuid を記録したことがある）ときは明示し、そうでない機では渡さない。
+/// 常に明示へ戻すと未配線の機で検証が回らず、常に渡さないへ戻すと配線済みの機で
+/// 「見失ったらユーザーの画面へ落ちる」側（暗黙の既定）へ倒れる
+#[test]
+fn ヘルパは配線済みの機でだけ面の指定を明示する() {
+    let src = read(HELPER_REL);
+    let (body, at) = fn_body(HELPER_REL, &src, "launch_isolated_gui()");
+    let wired = find(&body, "iso_display_recorded").unwrap_or_else(|| {
+        panic!(
+            "{HELPER_REL}:{at}: launch_isolated_gui が「この機で uuid を記録したことがあるか」を \
+             見ていない（#1697）= ensure が今回だけ失敗した配線済みの機を未配線と読み違える"
+        )
+    });
+    let explicit = find(&body, "TAKO_DISPLAY=$ISOLATED_GUI_DISPLAY").unwrap_or_else(|| {
+        panic!(
+            "{HELPER_REL}:{at}: launch_isolated_gui が配線済みの機で面の指定を明示していない \
+             （#1697）= 見失ったときユーザーの画面へ落ちる暗黙の既定に倒れる"
+        )
+    });
+    assert!(
+        wired < explicit,
+        "{HELPER_REL}:{explicit}: 面の指定を明示する行が配線の判定（{HELPER_REL}:{wired}）より前に在る（#1697）"
+    );
+    // 無条件の明示（#1697 前の形）は未配線の機で検証を止める
+    if let Some(n) = find(&body, "TAKO_DISPLAY=${TAKO_DISPLAY:-$ISOLATED_GUI_DISPLAY}") {
+        panic!(
+            "{HELPER_REL}:{n}: 面の指定を無条件に明示している（#1697 前の形）。\n\
+             → 未配線の機（CI・他人の機）では tako が窓を開かずに終わり検証が回らない"
+        );
+    }
 }
 
 // --------------------------------------------- 2. 名前一致で殺さない

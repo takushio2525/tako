@@ -43,7 +43,12 @@ ISOLATED_GUI_APP_REL=${TAKO_ISO_APP_REL:-target/debug/tako-app}
 ISOLATED_GUI_CLI_REL=${TAKO_ISO_CLI_REL:-target/debug/tako}
 
 # 窓を出す面。`TAKO_ISOLATED` が立っていれば tako 側の既定も同じ面だが、
-# **何も指定していないのか tako-vd を狙っているのかをスクリプトから読めるようにする**
+# **何も指定していないのか tako-vd を狙っているのかをスクリプトから読めるようにする**。
+#
+# 渡すのは**この機に面が配線されているときだけ**（#1697）: 明示した `TAKO_DISPLAY` を
+# tako が見失うと、検証用 GUI は既定の面（= ユーザーの画面）へ落ちずに窓を開かずに終わる。
+# 配線が無い機（CI・他人の機）で明示すると検証が回らなくなるので、そこでは渡さず
+# tako の暗黙の既定（見つからなければ既定の面へ開いて警告を出す）に任せる
 ISOLATED_GUI_DISPLAY=${ISOLATED_GUI_DISPLAY:-${TAKO_VD_NAME:-tako-vd}}
 
 # 窓の矩形（`x,y,w,h` か `w,h`）。**既定は空 = 指定しない**。
@@ -85,14 +90,25 @@ isolated_gui_bins() {
 # 窓の置き先を用意する（眠っていれば起こす）。**起動の直前に毎回通す**のが要点。
 # 配線が無い環境（CI・他人の機・Windows）では素通しして続行する
 # （そこでは既定の面へ落ちる = `.agent/conventions.md`「面が見えているのに
-# 当たらないときは落ちる」。検証そのものが回らなくなるほうが悪い）
+# 当たらないときは落ちる」。検証そのものが回らなくなるほうが悪い）。
+# 終了コードは「用意できたか」（#1697: 面の指定を明示するかの材料。起動は止めない）
 iso_ensure_display() {
     local vd
     vd="$(iso_repo_root)/scripts/lib/virtual-display.sh"
-    [ -x "$vd" ] || return 0
+    [ -x "$vd" ] || return 1
     bash "$vd" ensure >/dev/null 2>&1 || \
-        echo "  (注) 仮想ディスプレイを用意できなかった: 既定の面で続行する"
+        { echo "  (注) 仮想ディスプレイを用意できなかった: 起動は続ける（配線済みの機なら tako は窓を開かずに終わる）"; return 1; }
     return 0
+}
+
+# この機に面が配線されているか（#1697）。`ensure` が面の uuid を記録したことがあれば配線済み
+# （記録は ensure の成功でしか書かれない）。ensure が今回だけ失敗した機を「未配線」と
+# 読み違えて、ユーザーの画面へ落ちる側へ倒さないための 2 本目の材料
+iso_display_recorded() {
+    local vd
+    vd="$(iso_repo_root)/scripts/lib/virtual-display.sh"
+    [ -x "$vd" ] || return 1
+    bash "$vd" recorded-uuid >/dev/null 2>&1
 }
 
 # 隔離 GUI を起こす。pid は $ISOLATED_GUI_PID へ置く（**`$( )` で受けない**:
@@ -105,12 +121,17 @@ launch_isolated_gui() {
     shift
     [ -n "${APP_BIN:-}" ] || { iso_err "APP_BIN が空（先に isolated_gui_bins を呼ぶ）"; return 1; }
 
-    iso_ensure_display
+    # 面を起こす。配線済み（今回 ensure が通った / この機で uuid を記録したことがある）なら
+    # 面の指定を明示し、tako に「見失ったら開かない」構えを取らせる（#1697）
+    local wired=0
+    if iso_ensure_display || iso_display_recorded; then wired=1; fi
 
-    local -a env_args=(
-        "TAKO_ISOLATED=${TAKO_ISOLATED:-1}"
-        "TAKO_DISPLAY=${TAKO_DISPLAY:-$ISOLATED_GUI_DISPLAY}"
-    )
+    local -a env_args=("TAKO_ISOLATED=${TAKO_ISOLATED:-1}")
+    if [ -n "${TAKO_DISPLAY:-}" ]; then
+        env_args+=("TAKO_DISPLAY=$TAKO_DISPLAY")
+    elif [ "$wired" = 1 ]; then
+        env_args+=("TAKO_DISPLAY=$ISOLATED_GUI_DISPLAY")
+    fi
     [ -n "$ISOLATED_GUI_BOUNDS" ] && \
         env_args+=("TAKO_WINDOW_BOUNDS=${TAKO_WINDOW_BOUNDS:-$ISOLATED_GUI_BOUNDS}")
     # 呼び出し側が並べた `VAR=VAL` は既定より後ろ = そちらが勝つ

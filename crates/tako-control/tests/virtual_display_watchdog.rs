@@ -1,6 +1,6 @@
-//! 仮想ディスプレイまわりの番犬（#1141 / #1150）
+//! 仮想ディスプレイまわりの番犬（#1141 / #1150 / #1160 / #1697）
 //!
-//! 守りたい不変条件は 8 つ。どれも「壊れても動いているように見える」ので、
+//! 守りたい不変条件は 9 つ。どれも「壊れても動いているように見える」ので、
 //! 人間の記憶ではなくテストで固定する。
 //!
 //! 1. **ヘルパは消す機能を持たない**。`tako-vd` は常設で、検証のたびに作り直さない
@@ -21,8 +21,15 @@
 //!    面が在るのにユーザーのメイン画面へ落ちる
 //! 8. **置き先は窓を 1 枚も開く前に決まる**（#1160）。決める前に開くと、あとから
 //!    「開かずに終わる」ことができない（出てしまった窓は取り返せない）
+//! 9. **名前が読めない瞬間に面を見失わない**（#1697）。`ensure` の締めが面の uuid を
+//!    記録し（置き場は Rust とシェルで同じ）、`resolve_target_display` は記録済み uuid と
+//!    「明示の指定か」を核から取る。どちらかが外れると、名前だけが読めない起動で
+//!    生きている `tako-vd` を見失い、ユーザーのメイン画面へ窓が出る
 
 use std::path::{Path, PathBuf};
+
+#[path = "common/code_view.rs"]
+mod code_view;
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -396,5 +403,149 @@ fn 置き先は窓を開く前に決まる() {
         resolve_at < open_at,
         "窓を開いたあとで置き先を決めている（#1160）。\n\
          → 置き先が無いときに「開かずに終わる」ことができなくなる"
+    );
+}
+
+// ── #1697: 名前が読めない瞬間に面を見失わない ─────────────────────────
+
+/// ソース中でその文字列が最初に現れる行（1 始まり。file:line の名指し用）
+fn line_of(src: &str, needle: &str) -> usize {
+    // 改行の数で数える（`lines()` は行の途中で切った末尾も 1 行と数えるので、
+    // 行の途中に在る目印では 1 行ずれる）
+    src.find(needle)
+        .map(|at| src[..at].matches('\n').count() + 1)
+        .unwrap_or(0)
+}
+
+/// 記録済み uuid の置き場が **Rust とシェルで同じ**（#1697）。
+///
+/// ずれると `ensure` は書いたつもりで tako は読めず、名前が読めない瞬間に
+/// 面を見失う（= #1697 の症状がそのまま残る。ログは「記録も無い」と言うだけ）
+#[test]
+fn 記録済みuuidの置き場がrustとシェルでそろっている() {
+    use tako_core::platform::display::{ENV_RECORD_DIR, RECORD_SUBDIR};
+    let src = helper_source();
+    let code = code_lines(&src)
+        .into_iter()
+        .map(|(_, l)| l)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let at = line_of(&src, "VD_RECORD_DIR=");
+    let env_line = format!("VD_RECORD_DIR=${{{ENV_RECORD_DIR}:-}}");
+    assert!(
+        code.contains(&env_line),
+        "scripts/lib/virtual-display.sh:{at}: 記録の置き場を {ENV_RECORD_DIR} で差し替えられない（#1697）。\n\
+         → Rust 側（platform::display::ENV_RECORD_DIR）と同じ env 名を読むこと: {env_line}"
+    );
+    let home_line = format!("VD_RECORD_DIR=\"$HOME/{RECORD_SUBDIR}\"");
+    assert!(
+        code.contains(&home_line),
+        "scripts/lib/virtual-display.sh:{at}: 記録の既定の置き場が Rust（~/{RECORD_SUBDIR}）とずれている（#1697）。\n\
+         → 期待: {home_line}"
+    );
+}
+
+/// 締めは**面が起きていると確かめたあとで uuid を記録する**（#1697）。
+/// 記録は失敗しても ensure を失敗させない（面は用意できている = 検証は進められる）
+#[test]
+fn 締めは起きている面のuuidを記録する() {
+    let src = helper_source();
+    let body = code_only(&shell_fn_body(&src, "vd_finish_ensure"));
+    let at = line_of(&src, "vd_finish_ensure() {");
+    let drawable = body.find("vd_ensure_drawable");
+    let record = body.find("vd_record_uuid");
+    assert!(
+        record.is_some(),
+        "scripts/lib/virtual-display.sh:{at}: vd_finish_ensure が vd_record_uuid を呼んでいない（#1697）。\n\
+         → 記録が無いと、名前が読めない瞬間に tako が tako-vd を見失う"
+    );
+    assert!(
+        drawable < record,
+        "scripts/lib/virtual-display.sh:{at}: uuid の記録が「起きているかの確認」より前に在る（#1697）。\n\
+         → 眠っていて ensure が止まる道で記録を書き換えない"
+    );
+    let rec_body = code_only(&shell_fn_body(&src, "vd_record_uuid"));
+    let rec_at = line_of(&src, "vd_record_uuid() {");
+    assert!(
+        !rec_body.contains("return 1"),
+        "scripts/lib/virtual-display.sh:{rec_at}: vd_record_uuid が失敗を返す（#1697）。\n\
+         → 記録できなくても ensure は成功させる（面は用意できている）"
+    );
+    // 無効な displayID を JXA へ渡すと osascript が SIGSEGV で落ちる（実測）ので、
+    // uuid は NSScreen に居る面にだけ聞く
+    let uuid_body = shell_fn_body(&src, "vd_display_uuid");
+    assert!(
+        uuid_body.contains("NSScreen.screens")
+            && uuid_body.contains("CGDisplayCreateUUIDFromDisplayID"),
+        "scripts/lib/virtual-display.sh:{}: vd_display_uuid が NSScreen に居る面に絞らずに \
+         CGDisplayCreateUUIDFromDisplayID を呼んでいる（#1697。無効な ID で osascript が落ちる）",
+        line_of(&src, "vd_display_uuid() {")
+    );
+}
+
+/// 置き先の解決は **記録済み uuid と「明示の指定か」を核から取る**（#1697）。
+///
+/// `disp::select`（記録を見ない）へ戻る・`miss_for` に明示を渡さない、のどちらでも
+/// 名前だけが読めない起動で生きている `tako-vd` を見失い、面が見えているので
+/// 既定の面（= ユーザーのメイン画面）へ窓が出る（2026-09-24 の実測）
+#[test]
+fn 置き先の解決は記録済みuuidと明示の指定を核から取る() {
+    const REL: &str = "crates/tako-app/src/main.rs";
+    let src = app_main_source();
+    let sig = "fn resolve_target_display(cx: &App) -> Option<gpui::DisplayId> {";
+    let at = line_of(&src, sig);
+    // 肯定の存在確認はコメントを潰した眺めへ当てる（#1609: 説明文の綴りで緑にしない）
+    let body = code_view::without_comments_checked(&rust_fn_body(&src, sig), REL);
+    for (needle, why) in [
+        (
+            "disp::select_with_record(",
+            "名前で当たらないとき記録済み uuid で当てる照合",
+        ),
+        ("disp::recorded_uuid(", "ensure が残した uuid の読み込み"),
+        ("disp::explicit_request(", "TAKO_DISPLAY が明示かの判定"),
+        (
+            "disp::miss_reason(",
+            "外した理由の文（名前が読めない / 記録の有無）",
+        ),
+        (
+            "disp::inject_no_names()",
+            "名前が読めない瞬間を再現する診断 env",
+        ),
+    ] {
+        assert!(
+            body.contains(needle),
+            "{REL}:{at}: resolve_target_display が {needle} を通していない（#1697: {why}）"
+        );
+    }
+    assert!(
+        !body.contains("disp::select("),
+        "{REL}:{}: resolve_target_display が記録を見ない disp::select で照合している（#1697）。\n\
+         → 名前だけが読めない起動で tako-vd を見失う。disp::select_with_record を使う",
+        line_of(&src, "disp::select(&spec")
+    );
+    // 引数の中に `is_empty()` のような括弧が入るので、対応する閉じ括弧まで数えて切る
+    let call = body
+        .find("disp::miss_for(")
+        .map(|i| &body[i..])
+        .and_then(|rest| {
+            let mut depth = 0usize;
+            rest.char_indices().find_map(|(at, c)| match c {
+                '(' => {
+                    depth += 1;
+                    None
+                }
+                ')' => {
+                    depth -= 1;
+                    (depth == 0).then(|| &rest[..=at])
+                }
+                _ => None,
+            })
+        })
+        .unwrap_or_default();
+    assert!(
+        call.contains("explicit"),
+        "{REL}:{}: miss_for に「明示の指定か」を渡していない（#1697。呼び出し: {call:?}）。\n\
+         → TAKO_DISPLAY で明示した面を見失った検証用 GUI が既定の面へ落ちる",
+        line_of(&src, "disp::miss_for(")
     );
 }

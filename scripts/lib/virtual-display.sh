@@ -17,6 +17,7 @@
 #   scripts/lib/virtual-display.sh bounds               # "x y w h"（Quartz グローバル・ポイント）
 #   scripts/lib/virtual-display.sh status                # 状態を 1 行（眠っている面も出る）
 #   scripts/lib/virtual-display.sh status --snapshot     # 前後比較用の機械可読な現況
+#   scripts/lib/virtual-display.sh recorded-uuid         # ensure が残した面の uuid（無ければ非ゼロ）
 #   scripts/lib/virtual-display.sh move-window PID       # その窓を仮想ディスプレイへ移す
 #   scripts/lib/virtual-display.sh cleanup-orphans        # 孤児の下見（何も変えない）
 #   scripts/lib/virtual-display.sh cleanup-orphans --apply # 実行条件を満たすときだけ掃除
@@ -38,6 +39,14 @@
 #   なお status --snapshot には眠りの状態を**入れない**（前後比較は「構成が変わっていない」
 #   ことを見る道具で、眠りは構成ではない = 偽の差分を出さない）。status の 1 行には出る。
 #
+# 名前は読めないことがある（#1697）:
+#   tako 本体は面を**名前**で探すが、名前の出どころ（system_profiler）が読めない起動では
+#   全部の面が `name=?` になり、生きている tako-vd を見失う（2026-09-24 の実測）。
+#   なので ensure の締めで **その面の uuid を記録する**（vd_record_uuid。置き場は
+#   VD_RECORD_DIR = tako 側の `platform::display::record_dir` と同じ場所）。tako は名前で
+#   当たらないとき、**名前が読めない面に限って**この uuid で当てる。記録は冪等
+#   （同じ値なら書かない）で、uuid が読めなくても ensure は失敗させない。
+#
 # いまの実装は BetterDisplay の仮想スクリーン。他の実装（DeskPad 等）へ広げるときは
 # vd_backend_* だけを差し替える（表に出る ensure / bounds / status は変えない）。
 
@@ -51,6 +60,13 @@ VD_PAD_X=${TAKO_VD_PAD_X:-40}
 VD_PAD_Y=${TAKO_VD_PAD_Y:-60}
 # 眠っている面を起こすときユーザー活動を宣言する秒数（#1160）
 VD_WAKE_SECS=${TAKO_VD_WAKE_SECS:-2}
+# 面の uuid を残す置き場（#1697）。**tako 側（crates/tako-core/src/platform/display.rs の
+# ENV_RECORD_DIR / RECORD_SUBDIR）と同じ env 名・同じ綴り**（番犬が突き合わせる）。
+# data dir に置かないのは、隔離起動ごとに data dir が一時 dir へ変わる（= tako から読めない）ため
+VD_RECORD_DIR=${TAKO_VD_RECORD_DIR:-}
+if [ -z "$VD_RECORD_DIR" ] && [ -n "${HOME:-}" ]; then
+    VD_RECORD_DIR="$HOME/Library/Caches/tako/virtual-display"
+fi
 
 vd_err() { echo "ERROR: $*" >&2; }
 
@@ -138,6 +154,27 @@ out.join("\n")' 2>/dev/null
 # 蓋の生の状態（ioreg の出力そのまま）。テストから差し替えられるよう関数にしてある
 vd_clamshell_raw() {
     ioreg -r -k AppleClamshellState -d 4 2>/dev/null
+}
+
+# その displayID の面の uuid（#1697）。**GPUI の PlatformDisplay::uuid と同じ出どころ**
+# （CGDisplayCreateUUIDFromDisplayID）。読めなければ空。
+#
+# **NSScreen に居る面にしか聞かない**: 無効な ID を渡すと NULL が返り、JXA からは
+# NULL を見分けられずに CFUUIDCreateString が落ちる（実測: osascript が SIGSEGV = 139）。
+# テストから差し替えられるよう関数にしてある
+vd_display_uuid() {
+    case ${1:-} in '' | *[!0-9]*) return 1 ;; esac
+    osascript -l JavaScript -e "
+ObjC.import('AppKit');
+ObjC.import('ApplicationServices');
+var s = \$.NSScreen.screens, out = '';
+for (var i = 0; i < s.count; i++) {
+  var did = ObjC.unwrap(s.objectAtIndex(i).deviceDescription.objectForKey('NSScreenNumber'));
+  if (did === $1) {
+    out = ObjC.unwrap(ObjC.castRefToObject(\$.CFUUIDCreateString(null, \$.CGDisplayCreateUUIDFromDisplayID(did))));
+  }
+}
+out" 2>/dev/null
 }
 
 # いま走っている器（BetterDisplay）の実体数。**2 つ以上は増殖の既知原因**（癖 ⑧）
@@ -283,6 +320,29 @@ vd_sleeping_names() {
         fi
     done
     printf '%s' "$out"
+}
+
+# uuid の形か（8-4-4-4-12 の 16 進。純関数。tako 側の is_uuid_shaped と同じ規則）
+vd_is_uuid() {
+    local re='^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'
+    [[ ${1:-} =~ $re ]]
+}
+
+# 記録ファイルのパス（`<小文字の名前>.uuid`。tako 側の record_file_name と同じ規則）。
+# 置き場が決まらない（HOME も TAKO_VD_RECORD_DIR も無い）なら非ゼロ
+vd_record_file() {
+    [ -n "$VD_RECORD_DIR" ] || return 1
+    printf '%s/%s.uuid\n' "$VD_RECORD_DIR" "$(printf '%s' "$VD_NAME" | tr '[:upper:]' '[:lower:]')"
+}
+
+# 記録済みの uuid（#1697）。無い・形が崩れていれば非ゼロ
+vd_recorded_uuid() {
+    local f u
+    f=$(vd_record_file) || return 1
+    [ -f "$f" ] || return 1
+    u=$(head -1 "$f" | tr -d '[:space:]')
+    vd_is_uuid "$u" || return 1
+    printf '%s\n' "$u"
 }
 
 # 蓋の状態（純関数。$1 は vd_clamshell_raw の出力）。open / closed / unknown。
@@ -466,12 +526,55 @@ vd_ensure_drawable() {
     return 1
 }
 
-# 用意できた直後に必ず通す締め（#1150 / #1160）。
-# 増殖の検査 → 起きているかの確認（眠っていれば起こす）→ Main 保護の順。
+# いまの常設の面の uuid を記録する（#1697）。tako が名前を読めない瞬間の代わりに使う。
+# **失敗しても ensure は成功させる**（面は用意できているので検証は進められる。
+# 記録が無いときの tako は名前だけで探す = #1697 前と同じ）。同じ値なら書かない（冪等）
+vd_record_uuid() {
+    local f row did uuid tmp
+    f=$(vd_record_file) || return 0
+    row=$(vd_screens | vd_rows_named "$VD_NAME" | head -1)
+    [ -n "$row" ] || return 0
+    did=$(printf '%s\n' "$row" | awk -F'\t' '{print $6}')
+    uuid=$(vd_display_uuid "$did" | tr '[:upper:]' '[:lower:]')
+    if ! vd_is_uuid "$uuid"; then
+        echo "   (注) ${VD_NAME} の uuid を読めなかった（記録しない。tako は名前だけで探す）" >&2
+        return 0
+    fi
+    [ "$(vd_recorded_uuid 2>/dev/null)" = "$uuid" ] && return 0
+    tmp="${f}.tmp.$$"
+    if mkdir -p "$VD_RECORD_DIR" 2>/dev/null && printf '%s\n' "$uuid" > "$tmp" 2>/dev/null \
+        && mv -f "$tmp" "$f" 2>/dev/null; then
+        return 0
+    fi
+    rm -f "$tmp" 2>/dev/null
+    echo "   (注) ${VD_NAME} の uuid を記録できなかった（${f}）" >&2
+    return 0
+}
+
+# status に出す記録の 1 語（#1697）。記録の先頭 8 桁と、いまの面との一致を出す
+# （「status は使用可なのに tako が見失う」を 1 行で切り分けられるように）
+vd_record_note() {
+    local rec row did cur
+    rec=$(vd_recorded_uuid 2>/dev/null) || { echo "なし（ensure で残る）"; return 0; }
+    row=$(vd_screens | vd_rows_named "$VD_NAME" | head -1)
+    did=$(printf '%s\n' "$row" | awk -F'\t' '{print $6}')
+    cur=$(vd_display_uuid "$did" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    if [ -z "$cur" ]; then
+        echo "${rec:0:8}…（いまの面の uuid は読めない）"
+    elif [ "$cur" = "$rec" ]; then
+        echo "${rec:0:8}…（いまの面と一致）"
+    else
+        echo "${rec:0:8}…（いまの面 ${cur:0:8}… と不一致 = ensure で書き直す）"
+    fi
+}
+
+# 用意できた直後に必ず通す締め（#1150 / #1160 / #1697）。
+# 増殖の検査 → 起きているかの確認（眠っていれば起こす）→ uuid の記録 → Main 保護の順。
 # **ensure が成功で返る道はすべてここを通る**（番犬が拘束している）
 vd_finish_ensure() {
     vd_assert_single || return 1
     vd_ensure_drawable || return 1
+    vd_record_uuid
     vd_protect_main
     return 0
 }
@@ -553,7 +656,7 @@ vd_status() {
     esac
     clamshell=$(vd_clamshell_state "$(vd_clamshell_raw)")
     sleeping=$(vd_screens | vd_sleeping_names "$(vd_drawable)")
-    echo "  Main 保護: ${main_note} / 蓋: ${clamshell} / 器の実体: $(vd_backend_instances) / 眠っている面: ${sleeping:-なし}"
+    echo "  Main 保護: ${main_note} / 蓋: ${clamshell} / 器の実体: $(vd_backend_instances) / 眠っている面: ${sleeping:-なし} / 記録 uuid: $(vd_record_note)"
     return $rc
 }
 
@@ -683,6 +786,7 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
             esac
             ;;
         cleanup-orphans) vd_cleanup_orphans "${2:-}" ;;
+        recorded-uuid) vd_recorded_uuid ;;
         move-window)
             [ $# -ge 2 ] || { vd_err "move-window には pid が要る"; exit 1; }
             vd_move_window "$2"
@@ -692,10 +796,11 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
             vd_tako_window_env "$2" "$3" "${4:-}" "${5:-}"
             ;;
         *)
-            echo "使い方: ${0} {ensure|bounds|status [--snapshot]|move-window <pid>|window-env <w> <h> [x] [y]|cleanup-orphans [--apply]}" >&2
+            echo "使い方: ${0} {ensure|bounds|status [--snapshot]|recorded-uuid|move-window <pid>|window-env <w> <h> [x] [y]|cleanup-orphans [--apply]}" >&2
             echo "  ensure           仮想ディスプレイ ${VD_NAME} を用意し、眠っていれば起こす（冪等・消す機能は無い）" >&2
             echo "  bounds           \"x y w h\"（Quartz グローバル・ポイント）" >&2
             echo "  status           状態を 1 行（眠っている面も出る。--snapshot は前後比較用の機械可読な現況）" >&2
+            echo "  recorded-uuid    ensure が残した面の uuid（tako が名前を読めないときに当てる。#1697）" >&2
             echo "  move-window      その pid の窓を仮想ディスプレイへ移す（**tako には使えない** = #1442）" >&2
             echo "  window-env       tako の窓を置く env を作る: window-env <w> <h> [x] [y]（#1442）" >&2
             echo "  cleanup-orphans  孤児の下見（--apply は実行条件を満たすときだけ掃除）" >&2
