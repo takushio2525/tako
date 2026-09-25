@@ -66,6 +66,15 @@ impl LineEnding {
         }
     }
 
+    /// 外（CLI / MCP / 診断）へ出す名前（#1658）。`as_str` は改行そのものなので、
+    /// そのまま JSON へ入れると応答の中で行が割れる
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Lf => "lf",
+            Self::Crlf => "crlf",
+        }
+    }
+
     /// 本文の**多数派**を返す。改行が 1 つも無ければ `None`。
     ///
     /// 同数のときは LF を選ぶ（移植性の高い側へ倒す）。多数派で決めるのは、
@@ -217,6 +226,84 @@ pub struct SearchHit {
     pub end: usize,
 }
 
+/// 文書内の 1 点を行と桁で表す（#1658）。
+///
+/// **行は 1 始まり・桁は 0 始まりの UTF-8 バイト**。この 2 つの向きが違うのは
+/// 見た目の都合ではなく、`line` が人と AI が読む行番号（エディタ・`grep -n`・
+/// コンパイラの診断がすべて 1 始まり）で、`column` が本文のバイト列を切る位置
+/// （`&text[..column]` がそのまま通る）だから。0 行目は存在しない。
+///
+/// **UTF-16 の桁へは変換しない**。LSP は `positionEncoding` の既定が UTF-16 だが、
+/// 変換の責務は LSP クライアント（#1007 S1）が持つ —— tako の編集 API は本文の
+/// バイト列を扱う層なので、ここで UTF-16 を持つと本文を触るたびに再計算が要る。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextPosition {
+    /// 1 始まりの行番号
+    pub line: usize,
+    /// 0 始まりの行内 UTF-8 バイト位置
+    pub column: usize,
+}
+
+impl TextPosition {
+    pub fn new(line: usize, column: usize) -> Self {
+        Self { line, column }
+    }
+}
+
+/// 行・桁で指定した範囲編集 1 回ぶんの指示（#1658）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeEdit {
+    pub start: TextPosition,
+    pub end: TextPosition,
+    /// 範囲に入る本文。改行はバッファの流儀へ揃う（#1650）
+    pub text: String,
+    /// 指定すると、文書の版がこれと違うときに**何もせず**拒否する（楽観ロック）
+    pub expected_version: Option<u64>,
+}
+
+/// カーソルと選択の置き場所（#1658）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorPlacement {
+    /// 選択の起点。`select_to` が無ければここがカーソル
+    pub cursor: TextPosition,
+    /// 指定すると `cursor` からここまでを選択し、**カーソルはこちら側**へ置く
+    /// （shift+クリックと同じ = 「ここまで選ぶ」の "ここ" にキャレットが来る）
+    pub select_to: Option<TextPosition>,
+    /// 指定すると、文書の版がこれと違うときに**何もせず**拒否する
+    pub expected_version: Option<u64>,
+}
+
+/// 行・桁の指定を解けなかった理由（#1658）。
+///
+/// **黙って丸めない**。外（CLI / MCP）から来る範囲指定を丸めると、送り手は
+/// 「3 行目を直した」と思っているのに別の場所が変わる。版（`expected_version`）で
+/// 競合を弾いても、指定そのものがずれていては意味が無いので、解けない指定は
+/// 本文を 1 バイトも触らずに理由を返す
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum RangeEditError {
+    #[error("行は 1 始まり（0 行目は無い）")]
+    ZeroLine,
+    #[error("行 {line} は文書の範囲外（全 {total} 行）")]
+    LineOutOfRange { line: usize, total: usize },
+    #[error("行 {line} 桁 {column} は行の長さ {length} を超えている")]
+    ColumnOutOfRange {
+        line: usize,
+        column: usize,
+        length: usize,
+    },
+    #[error("行 {line} 桁 {column} は文字の途中を指している")]
+    NotCharBoundary { line: usize, column: usize },
+    #[error("範囲の終わり {end_line}:{end_column} が始まり {start_line}:{start_column} より前")]
+    InvertedRange {
+        start_line: usize,
+        start_column: usize,
+        end_line: usize,
+        end_column: usize,
+    },
+    #[error("文書の版が違う（指定 {expected} / 現在 {actual}）")]
+    VersionMismatch { expected: u64, actual: u64 },
+}
+
 /// 1 ファイル分の編集バッファ。カーソルと選択端は常に UTF-8 バイト境界に置く。
 #[derive(Debug, Clone)]
 pub struct TextBuffer {
@@ -239,6 +326,13 @@ pub struct TextBuffer {
     /// （`.agent/conventions.md`「効果を測る単体テストは実時間で比べない」）ので、
     /// 「時間が空くと塊が切れる」は時計を注入して状態値で固定する
     manual_millis: Option<u64>,
+    /// 文書の版（#1658）。**本文が変わるたびに 1 つ増える**単調増加のカウンタ。
+    ///
+    /// 外（CLI / MCP）から範囲編集を送るとき、送り手が読んだ版と食い違っていれば
+    /// 拒否できる（楽観ロック）。GUI の打鍵も dispatch の編集も同じ書き換え口を
+    /// 通るので、**どちらで変わっても進む**。LSP の `didChange` が要求する
+    /// 「文書の版」もこれをそのまま使える（#1007 の前払い）
+    version: u64,
 }
 
 impl TextBuffer {
@@ -256,6 +350,7 @@ impl TextBuffer {
             redo_stack: Vec::new(),
             group_open: false,
             manual_millis: None,
+            version: 0,
         })
     }
 
@@ -272,6 +367,7 @@ impl TextBuffer {
             redo_stack: Vec::new(),
             group_open: false,
             manual_millis: None,
+            version: 0,
         }
     }
 
@@ -439,6 +535,22 @@ impl TextBuffer {
         self.manual_millis.unwrap_or_else(process_millis)
     }
 
+    /// 版を 1 つ進める（#1658）。**本文が変わる経路はすべてここを通る**。
+    ///
+    /// 呼ぶのは本文を書き換える唯一の口 [`Self::apply_edit`] と undo / redo だけ。
+    /// ここ以外で `self.version` を書き換えると「版が進まない編集」ができてしまい、
+    /// 楽観ロック（`expected_version`）が黙って素通りする。番犬
+    /// `issue1658_edit_range_watchdog` が代入の散らばりを file:line で名指す
+    fn bump_version(&mut self) {
+        // 飽和させる（1 秒 1000 編集でも 5 億年かかる桁だが、巻き戻さないことを型で示す）
+        self.version = self.version.saturating_add(1);
+    }
+
+    /// 文書の版（#1658）。編集のたびに増える
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
     /// 末尾の塊を閉じる（#1651）。
     ///
     /// 次の編集はここへ足さず、新しい 1 件として積まれる = ここが undo の切れ目。
@@ -490,6 +602,8 @@ impl TextBuffer {
         self.cursor = cursor;
         self.anchor = anchor;
         self.line_ending = line_ending_after;
+        // 本文が変わった = 文書の版が進む（#1658）。書き換えの口はここ 1 つ
+        self.bump_version();
         self.record(delta);
     }
 
@@ -609,6 +723,9 @@ impl TextBuffer {
         let Some(delta) = self.undo_stack.pop_back() else {
             return false;
         };
+        // 本文が変わるので版は**戻らずに進む**（#1658）。「元へ戻す」も 1 つの変更で、
+        // 版を戻すと「別の中身なのに同じ版」が生まれて楽観ロックが効かなくなる
+        self.bump_version();
         let end = delta.start + delta.after.len();
         self.text.replace_range(delta.start..end, &delta.before);
         self.cursor = delta.cursor_before;
@@ -623,6 +740,7 @@ impl TextBuffer {
         let Some(delta) = self.redo_stack.pop() else {
             return false;
         };
+        self.bump_version();
         let end = delta.start + delta.before.len();
         self.text.replace_range(delta.start..end, &delta.after);
         self.cursor = delta.cursor_after;
@@ -804,6 +922,145 @@ impl TextBuffer {
         let start = line_start_offset(&self.text, line).unwrap_or(self.text.len());
         let end = line_end_offset(&self.text, start);
         snap_cursor(&self.text, (start + byte_col).min(end))
+    }
+
+    // --- 行・桁で指す編集 API（#1658） ---------------------------------------
+
+    /// 文書の行数（#1658）。末尾が改行で終わるファイルは、その後ろの**空行も 1 行**と
+    /// 数える（`"a\n"` は 2 行）。カーソルはそこへ置けるので、行として在る
+    pub fn line_count(&self) -> usize {
+        self.text.bytes().filter(|byte| *byte == b'\n').count() + 1
+    }
+
+    /// その行の長さ（バイト。**改行コードは含まない**。#1658）。
+    ///
+    /// CRLF の行では CR も含めない = 桁の上限が CR の手前になるので、
+    /// 「CR と LF のあいだ」を指す桁は範囲外として弾かれる（#1650 の契約）
+    fn line_span(&self, line: usize) -> Option<Range<usize>> {
+        let start = line_start_offset(&self.text, line)?;
+        Some(start..line_end_offset(&self.text, start))
+    }
+
+    /// 行・桁を文書全体のバイト位置へ**丸めずに**解く（#1658）。
+    ///
+    /// 解けない指定（範囲外の行・行より長い桁・文字の途中）は
+    /// [`RangeEditError`] で返す。`min` や `snap_cursor` で黙って寄せない
+    pub fn resolve_position(&self, position: TextPosition) -> Result<usize, RangeEditError> {
+        if position.line == 0 {
+            return Err(RangeEditError::ZeroLine);
+        }
+        let total = self.line_count();
+        let Some(span) = self.line_span(position.line - 1) else {
+            return Err(RangeEditError::LineOutOfRange {
+                line: position.line,
+                total,
+            });
+        };
+        let length = span.end - span.start;
+        if position.column > length {
+            return Err(RangeEditError::ColumnOutOfRange {
+                line: position.line,
+                column: position.column,
+                length,
+            });
+        }
+        let offset = span.start + position.column;
+        if !self.text.is_char_boundary(offset) {
+            return Err(RangeEditError::NotCharBoundary {
+                line: position.line,
+                column: position.column,
+            });
+        }
+        Ok(offset)
+    }
+
+    /// バイト位置を行・桁へ戻す（#1658）。[`Self::resolve_position`] の逆写像
+    pub fn position_of(&self, offset: usize) -> TextPosition {
+        let (line, column) = self.line_byte_col(offset);
+        TextPosition::new(line + 1, column)
+    }
+
+    /// いまのカーソル位置（行・桁。#1658）
+    pub fn cursor_position(&self) -> TextPosition {
+        self.position_of(self.cursor)
+    }
+
+    /// いまの選択範囲（行・桁。#1658）。選択が無ければ `None`
+    pub fn selection_positions(&self) -> Option<(TextPosition, TextPosition)> {
+        let range = self.selection()?;
+        Some((self.position_of(range.start), self.position_of(range.end)))
+    }
+
+    /// 外（CLI / MCP）から読む文書の状態（#1658）。**この 1 実装が応答の正本**。
+    ///
+    /// `version` は編集のたびに増える版、`cursor` / `selection` は行・桁
+    /// （行 1 始まり / 桁 0 始まりの UTF-8 バイト）、`undo_depth` /
+    /// `undo_history_bytes` は undo 履歴の状態。選択が無ければ `selection` は null
+    pub fn document_state(&self) -> serde_json::Value {
+        let position = |p: TextPosition| serde_json::json!({ "line": p.line, "column": p.column });
+        serde_json::json!({
+            "version": self.version,
+            "line_count": self.line_count(),
+            "bytes": self.text.len(),
+            "line_ending": self.line_ending.label(),
+            "cursor": position(self.cursor_position()),
+            "selection": self.selection_positions().map(|(start, end)| {
+                serde_json::json!({ "start": position(start), "end": position(end) })
+            }),
+            "undo_depth": self.undo_depth(),
+            "undo_history_bytes": self.undo_history_bytes(),
+        })
+    }
+
+    /// 版が指定と食い違っていれば拒否する（#1658）
+    fn check_version(&self, expected: Option<u64>) -> Result<(), RangeEditError> {
+        match expected {
+            Some(expected) if expected != self.version => Err(RangeEditError::VersionMismatch {
+                expected,
+                actual: self.version,
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// 行・桁で指定した範囲を置き換える（#1658）。
+    ///
+    /// 成功すると**カーソルは入れた本文の末尾**に来て、undo 1 回で丸ごと戻る
+    /// （`replace_range` = 1 操作）。入れる本文の改行はバッファの流儀へ揃い、
+    /// 範囲の外の改行は 1 バイトも変わらない（#1650 の契約）。
+    ///
+    /// 解けない指定・版違いのときは**本文を触らずに**エラーを返す
+    /// （検査をすべて先に済ませてから 1 回だけ書き換える）
+    pub fn replace_position_range(&mut self, edit: &RangeEdit) -> Result<(), RangeEditError> {
+        self.check_version(edit.expected_version)?;
+        let start = self.resolve_position(edit.start)?;
+        let end = self.resolve_position(edit.end)?;
+        if end < start {
+            return Err(RangeEditError::InvertedRange {
+                start_line: edit.start.line,
+                start_column: edit.start.column,
+                end_line: edit.end.line,
+                end_column: edit.end.column,
+            });
+        }
+        self.replace_range(start..end, &edit.text);
+        Ok(())
+    }
+
+    /// カーソルと選択を行・桁で置く（#1658）。**本文は変えない**ので版も進まない
+    pub fn set_cursor_placement(&mut self, place: &CursorPlacement) -> Result<(), RangeEditError> {
+        self.check_version(place.expected_version)?;
+        let anchor = self.resolve_position(place.cursor)?;
+        let head = match place.select_to {
+            Some(select_to) => self.resolve_position(select_to)?,
+            None => anchor,
+        };
+        // 選択の起点を先に置いてから伸ばす（`set_cursor` は現在位置を anchor にする）
+        self.set_cursor(anchor, false);
+        if head != anchor {
+            self.set_cursor(head, true);
+        }
+        Ok(())
     }
 
     pub fn save(&mut self) -> Result<(), TextEditError> {
@@ -2218,5 +2475,257 @@ mod tests {
             while buffer.undo() {}
             assert_eq!(buffer.text().as_bytes(), original.as_bytes());
         }
+    }
+
+    // --- #1658: 行・桁で指す範囲編集と文書の版 ---
+
+    fn pos(line: usize, column: usize) -> TextPosition {
+        TextPosition::new(line, column)
+    }
+
+    /// 範囲編集 1 回ぶんの指示（版の指定なし）
+    fn range_edit(start: TextPosition, end: TextPosition, text: &str) -> RangeEdit {
+        RangeEdit {
+            start,
+            end,
+            text: text.into(),
+            expected_version: None,
+        }
+    }
+
+    #[test]
+    fn 行桁は1始まりの行と0始まりのバイト桁で解ける() {
+        let buffer = TextBuffer::from_text(path("resolve"), "abc\nあいう\n".into());
+        assert_eq!(buffer.resolve_position(pos(1, 0)), Ok(0));
+        assert_eq!(buffer.resolve_position(pos(1, 3)), Ok(3));
+        // 2 行目は「あ」= 3 バイト単位
+        assert_eq!(buffer.resolve_position(pos(2, 0)), Ok(4));
+        assert_eq!(buffer.resolve_position(pos(2, 6)), Ok(10));
+        // 末尾の改行の後ろも 1 行（カーソルを置ける）
+        assert_eq!(buffer.line_count(), 3);
+        assert_eq!(buffer.resolve_position(pos(3, 0)), Ok(buffer.text().len()));
+        // 逆写像
+        assert_eq!(buffer.position_of(10), pos(2, 6));
+    }
+
+    #[test]
+    fn 範囲編集は指定した行だけを差し替えてカーソルを末尾へ置く() {
+        let mut buffer = TextBuffer::from_text(path("range-basic"), "one\ntwo\nthree\n".into());
+        let before = buffer.version();
+        buffer
+            .replace_position_range(&range_edit(pos(2, 0), pos(2, 3), "TWO!"))
+            .expect("解ける範囲");
+        assert_eq!(buffer.text(), "one\nTWO!\nthree\n");
+        assert_eq!(
+            buffer.cursor_position(),
+            pos(2, 4),
+            "カーソルが差し替え末尾に無い"
+        );
+        assert_eq!(buffer.version(), before + 1);
+        // undo 1 回で戻る（1 操作 = 1 履歴）
+        assert_eq!(buffer.undo_depth(), 1);
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "one\ntwo\nthree\n");
+    }
+
+    #[test]
+    fn 範囲編集は行をまたいでも他の行をバイトで保つ() {
+        let mut buffer = TextBuffer::from_text(path("range-multi"), "a\nb\nc\nd\ne\n".into());
+        buffer
+            .replace_position_range(&range_edit(pos(2, 0), pos(4, 0), "X\nY\n"))
+            .expect("解ける範囲");
+        assert_eq!(buffer.text(), "a\nX\nY\nd\ne\n");
+    }
+
+    #[test]
+    fn 版は打鍵と全文置換と範囲編集とundoとredoで進む() {
+        let mut buffer = TextBuffer::from_text(path("version"), "abc\n".into());
+        let mut seen = vec![buffer.version()];
+        // GUI の打鍵が通る口
+        buffer.insert("x");
+        seen.push(buffer.version());
+        // 全文置換（dispatch の PreviewApply）
+        buffer.set_text("abc\ndef\n".into());
+        seen.push(buffer.version());
+        // 範囲編集
+        buffer
+            .replace_position_range(&range_edit(pos(1, 0), pos(1, 3), "ABC"))
+            .expect("解ける範囲");
+        seen.push(buffer.version());
+        assert!(buffer.undo());
+        seen.push(buffer.version());
+        assert!(buffer.redo());
+        seen.push(buffer.version());
+        // 削除も改行も版を進める
+        buffer.delete_backward();
+        seen.push(buffer.version());
+        buffer.newline();
+        seen.push(buffer.version());
+        for pair in seen.windows(2) {
+            assert!(pair[1] > pair[0], "版が単調増加していない: {seen:?}");
+        }
+    }
+
+    #[test]
+    fn カーソル移動は本文を変えないので版を進めない() {
+        let mut buffer = TextBuffer::from_text(path("version-cursor"), "abc\ndef\n".into());
+        let before = buffer.version();
+        buffer
+            .set_cursor_placement(&CursorPlacement {
+                cursor: pos(1, 1),
+                select_to: Some(pos(2, 2)),
+                expected_version: None,
+            })
+            .expect("解ける位置");
+        assert_eq!(buffer.version(), before);
+        // 選択の起点が 1:1、カーソルは select_to 側
+        assert_eq!(buffer.cursor_position(), pos(2, 2));
+        assert_eq!(buffer.selection_positions(), Some((pos(1, 1), pos(2, 2))));
+    }
+
+    #[test]
+    fn 版が違う範囲編集と移動は本文もカーソルも触らずに拒否される() {
+        let mut buffer = TextBuffer::from_text(path("optimistic"), "abc\n".into());
+        let stale = buffer.version();
+        buffer.insert("x"); // 間に誰かが編集した
+        let text = buffer.text().to_string();
+        let cursor = buffer.cursor_position();
+        let mut edit = range_edit(pos(1, 0), pos(1, 1), "Z");
+        edit.expected_version = Some(stale);
+        assert_eq!(
+            buffer.replace_position_range(&edit),
+            Err(RangeEditError::VersionMismatch {
+                expected: stale,
+                actual: buffer.version(),
+            })
+        );
+        assert_eq!(buffer.text(), text, "拒否したのに本文が変わった");
+        let place = CursorPlacement {
+            cursor: pos(1, 0),
+            select_to: None,
+            expected_version: Some(stale),
+        };
+        assert!(buffer.set_cursor_placement(&place).is_err());
+        assert_eq!(buffer.cursor_position(), cursor);
+        // 現在の版を渡せば通る
+        edit.expected_version = Some(buffer.version());
+        assert!(buffer.replace_position_range(&edit).is_ok());
+    }
+
+    #[test]
+    fn 範囲外の行と桁は丸めずに拒否する() {
+        let mut buffer = TextBuffer::from_text(path("oob"), "abc\ndef\n".into());
+        assert_eq!(
+            buffer.resolve_position(pos(0, 0)),
+            Err(RangeEditError::ZeroLine)
+        );
+        assert_eq!(
+            buffer.resolve_position(pos(4, 0)),
+            Err(RangeEditError::LineOutOfRange { line: 4, total: 3 })
+        );
+        assert_eq!(
+            buffer.resolve_position(pos(1, 4)),
+            Err(RangeEditError::ColumnOutOfRange {
+                line: 1,
+                column: 4,
+                length: 3,
+            })
+        );
+        // 逆順の範囲
+        assert!(matches!(
+            buffer.replace_position_range(&range_edit(pos(2, 2), pos(1, 0), "X")),
+            Err(RangeEditError::InvertedRange { .. })
+        ));
+        assert_eq!(buffer.text(), "abc\ndef\n", "拒否したのに本文が変わった");
+    }
+
+    #[test]
+    fn 文字の途中を指す桁は拒否する() {
+        let mut buffer = TextBuffer::from_text(path("boundary"), "あいう\n".into());
+        // 「あ」は 3 バイト。1 と 2 は文字の途中
+        for column in [1usize, 2] {
+            assert_eq!(
+                buffer.resolve_position(pos(1, column)),
+                Err(RangeEditError::NotCharBoundary { line: 1, column })
+            );
+        }
+        assert!(buffer
+            .replace_position_range(&range_edit(pos(1, 0), pos(1, 4), "X"))
+            .is_err());
+        assert_eq!(buffer.text(), "あいう\n");
+        // 境界なら通る
+        assert!(buffer
+            .replace_position_range(&range_edit(pos(1, 0), pos(1, 3), "X"))
+            .is_ok());
+        assert_eq!(buffer.text(), "Xいう\n");
+    }
+
+    #[test]
+    fn crlfのcrとlfのあいだは行の外なので拒否する() {
+        let mut buffer = TextBuffer::from_text(path("crlf-range"), "abc\r\ndef\r\n".into());
+        // 1 行目の長さは CR を含めず 3
+        assert_eq!(buffer.resolve_position(pos(1, 3)), Ok(3));
+        assert_eq!(
+            buffer.resolve_position(pos(1, 4)),
+            Err(RangeEditError::ColumnOutOfRange {
+                line: 1,
+                column: 4,
+                length: 3,
+            })
+        );
+        // 行の中身を差し替えても既存の改行は 1 バイトも変わらない（#1650 の契約）
+        buffer
+            .replace_position_range(&range_edit(pos(1, 0), pos(1, 3), "XY"))
+            .expect("解ける範囲");
+        assert_eq!(buffer.text(), "XY\r\ndef\r\n");
+        // 入れる本文の改行はバッファの流儀へ揃う
+        buffer
+            .replace_position_range(&range_edit(pos(2, 0), pos(2, 3), "1\n2"))
+            .expect("解ける範囲");
+        assert_eq!(buffer.text(), "XY\r\n1\r\n2\r\n");
+    }
+
+    #[test]
+    fn 空範囲は挿入になり全範囲の置換は全文を差し替える() {
+        let mut buffer = TextBuffer::from_text(path("empty-range"), "abc\ndef\n".into());
+        // 空範囲 = その位置へ挿入
+        buffer
+            .replace_position_range(&range_edit(pos(2, 1), pos(2, 1), "XY"))
+            .expect("解ける範囲");
+        assert_eq!(buffer.text(), "abc\ndXYef\n");
+        // 全範囲（1:0 から最終行の末尾）の置換
+        let last = buffer.line_count();
+        buffer
+            .replace_position_range(&range_edit(pos(1, 0), pos(last, 0), "new\n"))
+            .expect("解ける範囲");
+        assert_eq!(buffer.text(), "new\n");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "abc\ndXYef\n");
+    }
+
+    #[test]
+    fn 文書状態は版とカーソルと選択とundo履歴を返す() {
+        let mut buffer = TextBuffer::from_text(path("doc-state"), "abc\ndef\n".into());
+        buffer
+            .replace_position_range(&range_edit(pos(1, 3), pos(1, 3), "!"))
+            .expect("解ける範囲");
+        let state = buffer.document_state();
+        assert_eq!(state["version"], 1);
+        assert_eq!(state["line_count"], 3);
+        assert_eq!(state["cursor"]["line"], 1);
+        assert_eq!(state["cursor"]["column"], 4);
+        assert!(state["selection"].is_null());
+        assert_eq!(state["undo_depth"], 1);
+        assert!(state["undo_history_bytes"].as_u64().unwrap() > 0);
+        buffer
+            .set_cursor_placement(&CursorPlacement {
+                cursor: pos(1, 0),
+                select_to: Some(pos(1, 2)),
+                expected_version: None,
+            })
+            .expect("解ける位置");
+        let state = buffer.document_state();
+        assert_eq!(state["selection"]["start"]["column"], 0);
+        assert_eq!(state["selection"]["end"]["column"], 2);
     }
 }

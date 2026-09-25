@@ -720,6 +720,32 @@ pub trait PreviewHost {
     fn apply_preview_text(&mut self, _pane: PaneId, _text: String) -> Result<(), String> {
         Err("プレビュー編集は未対応".into())
     }
+    /// 行・桁で指定した範囲の置き換え（#1658）。
+    ///
+    /// 全文置換（[`Self::apply_preview_text`]）しか無かったので、1 行直すのに
+    /// ファイル全体を IPC で送っていた。解けない指定・版違いは本文を触らずに失敗する
+    fn edit_preview_range(
+        &mut self,
+        _pane: PaneId,
+        _edit: &tako_core::text_edit::RangeEdit,
+    ) -> Result<(), String> {
+        Err("プレビュー編集は未対応".into())
+    }
+    /// 編集カーソルと選択の設定（#1658）。本文は変えない
+    fn set_preview_cursor(
+        &mut self,
+        _pane: PaneId,
+        _place: &tako_core::text_edit::CursorPlacement,
+    ) -> Result<(), String> {
+        Err("プレビュー編集は未対応".into())
+    }
+    /// 編集バッファの文書状態（#1658）。版・行数・カーソル・選択・undo 履歴。
+    ///
+    /// 編集系の応答はすべてこれを `document` として載せる
+    /// （`dispatch::preview_edit_reply` の 1 実装）。編集セッションが無ければ `None`
+    fn preview_document(&self, _pane: PaneId) -> Option<serde_json::Value> {
+        None
+    }
     /// 編集バッファを保存。外部変更検知を含む保存セマンティクスは core API が担う。
     fn save_preview(&mut self, _pane: PaneId) -> Result<(), String> {
         Err("プレビュー編集は未対応".into())

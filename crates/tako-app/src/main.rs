@@ -12592,6 +12592,44 @@ impl TakoApp {
         Ok(())
     }
 
+    /// 行・桁で指定した範囲を置き換える（#1658）。
+    ///
+    /// 全文置換（[`Self::apply_preview_text_local`]）と違い、**送るのは変える範囲だけ**。
+    /// カーソルは入れた本文の末尾に来て、undo 1 回で丸ごと戻る。
+    /// 解けない指定・版違いは本文を 1 バイトも触らずに失敗する
+    fn edit_preview_range_local(
+        &mut self,
+        pane_id: PaneId,
+        edit: &tako_core::text_edit::RangeEdit,
+    ) -> Result<(), String> {
+        self.set_preview_editing_local(pane_id, true)?;
+        let state = self.preview_edits.get_mut(&pane_id).expect("編集開始済み");
+        state
+            .buffer
+            .replace_position_range(edit)
+            .map_err(|e| e.to_string())?;
+        state.message = None;
+        self.refresh_preview_from_editor(pane_id);
+        Ok(())
+    }
+
+    /// カーソルと選択を行・桁で置く（#1658）。本文は変えないので dirty にならない
+    fn set_preview_cursor_local(
+        &mut self,
+        pane_id: PaneId,
+        place: &tako_core::text_edit::CursorPlacement,
+    ) -> Result<(), String> {
+        self.set_preview_editing_local(pane_id, true)?;
+        let state = self.preview_edits.get_mut(&pane_id).expect("編集開始済み");
+        state
+            .buffer
+            .set_cursor_placement(place)
+            .map_err(|e| e.to_string())?;
+        state.message = None;
+        self.refresh_preview_from_editor(pane_id);
+        Ok(())
+    }
+
     fn save_preview_local(&mut self, pane_id: PaneId) -> Result<(), String> {
         let edit = self
             .preview_edits
@@ -22092,6 +22130,26 @@ impl PreviewHost for TakoApp {
 
     fn apply_preview_text(&mut self, pane: PaneId, text: String) -> Result<(), String> {
         self.apply_preview_text_local(pane, text)
+    }
+
+    fn edit_preview_range(
+        &mut self,
+        pane: PaneId,
+        edit: &tako_core::text_edit::RangeEdit,
+    ) -> Result<(), String> {
+        self.edit_preview_range_local(pane, edit)
+    }
+
+    fn set_preview_cursor(
+        &mut self,
+        pane: PaneId,
+        place: &tako_core::text_edit::CursorPlacement,
+    ) -> Result<(), String> {
+        self.set_preview_cursor_local(pane, place)
+    }
+
+    fn preview_document(&self, pane: PaneId) -> Option<serde_json::Value> {
+        Some(self.preview_edits.get(&pane)?.buffer.document_state())
     }
 
     fn save_preview(&mut self, pane: PaneId) -> Result<(), String> {

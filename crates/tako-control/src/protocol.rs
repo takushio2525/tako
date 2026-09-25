@@ -727,6 +727,32 @@ pub enum Request {
     /// 編集バッファの全文を置き換える（GUI の個々のキー入力ではなく、CLI / MCP から
     /// 編集内容を自然に適用するための操作）。保存は PreviewSave で明示する。
     PreviewApply { pane: Option<u64>, text: String },
+    /// 編集バッファの**行・桁で指定した範囲**を置き換える（FR-3.5 / #1658）。
+    ///
+    /// 行は 1 始まり、桁は 0 始まりの行内 UTF-8 バイト。桁の上限はその行の
+    /// 改行コードを除いた長さで、範囲外・文字の途中・逆順は**丸めずに**拒否する。
+    /// `expected_version` を指定すると、文書の版が違うときは何もせず拒否する。
+    PreviewEditRange {
+        pane: Option<u64>,
+        start_line: usize,
+        start_col: usize,
+        end_line: usize,
+        end_col: usize,
+        text: String,
+        expected_version: Option<u64>,
+    },
+    /// 編集カーソルと選択を行・桁で置く（#1658）。本文は変えない。
+    ///
+    /// `select_to_line` を指定すると `line`:`col` からそこまでを選択し、
+    /// カーソルは `select_to` 側に来る（`select_to_col` 省略時は 0）。
+    PreviewCursor {
+        pane: Option<u64>,
+        line: usize,
+        col: usize,
+        select_to_line: Option<usize>,
+        select_to_col: Option<usize>,
+        expected_version: Option<u64>,
+    },
     /// 編集バッファをファイルへ保存する。外部変更を検知した場合は上書きしない。
     PreviewSave { pane: Option<u64> },
     /// undo（#195）
@@ -2300,6 +2326,8 @@ pub fn changes_layout(request: &Request) -> bool {
         | Request::PreviewCopyCode { .. }
         | Request::PreviewEdit { .. }
         | Request::PreviewApply { .. }
+        | Request::PreviewEditRange { .. }
+        | Request::PreviewCursor { .. }
         | Request::PreviewSave { .. }
         | Request::PreviewUndo { .. }
         | Request::PreviewRedo { .. }

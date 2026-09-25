@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-23（#1609: 番犬が自分の doc コメントで緑になる型を棚卸しした）
-- 肯定の存在確認を**全文**へ `contains` する番犬は、実体が消えてもコメントの綴りで緑のまま（#1536 が踏み #1578 が発見した型）。`crates/*/tests/**` 180 本を 2 段の検出器で棚卸しし、該当 **27 本**を `code_view` の 3 つ目の眺め `without_comments_checked`（コメントだけ潰す / 文字列は囲みごと残す / バイト長と行番号を保つ / 空振りはその場で名指して落ちる）へ寄せた。**不在検査は全文のまま**
-- 実バグ 1 件: #1308 の「A/B 入口が在る」はドライバ本体の**アーム目印コメント**だけで満たされていた（実体の `env::var` は兄弟関数 `legacy_1308`）。分岐の呼び出しと env の読みへ分けた
-- 実測: 偽の緑の A/B **28 ケースすべて before(origin/main)=緑 / after=FAILED**・生読みサイト 50 → 18 組（走査先のコード部分に無い needle は 7 → 0）・新設番犬 `issue1609_comment_view_watchdog` 7 本・workspace 0 failed・clippy 3 宇宙 0
-
 ## 2026-09-23（#1648: 編集中の再ハイライトを差分化した）
 - 1 打鍵ごとに全文を syntect へ通していた `apply_editor_text` を、行の切れ目の状態を 8 行ごとに持ち回る差分へ。全文経路と差分経路は同じ `step` を通すので塗り分けは食い違わない
 - 実測（release / 1 打鍵）: 4,666 行 344.6→**0.56ms**（611x・再ハイライト 8 行）・5,000 行 355.4→0.47ms（760x）。間隔 8 行は時間とメモリ（1 地点 925 バイト）の釣り合いで選んだ
@@ -64,3 +59,8 @@
 - Windows の生死判定は Toolhelp の在籍で決まるのに、**列挙に失敗した回の空 `Vec`** をそのまま読んでいた（全 pid が不在に見え、1 回の失敗で `sweep_in` が並行して走る別 worker の test dir まで消す = #625 の事故クラス）。境界へ `procinfo::snapshot_checked`（失敗 = `None`・**0 件も失敗として畳む**）+ `snapshot_supported` を足し、`pid_alive` の Windows 腕は「居る」側・`OwnerProbe` は `Roster` の 3 値で `Owner::Unknown` = 見送りへ。macOS は `Roster::PerPid` で 1 マスも変わらない
 - **先に事故を実測してから直した**: 注入 `TAKO_1597_ROSTER=empty`（#1597 以前の読み方）で**生きている子の data dir が実際に消える**（`test_data_residue.rs:422` の A/B assert を反転して実測）。受け入れは 3 本立て（`fail` = 0 件 / 注入なし = 死んだ残骸だけ消える対照 / `empty` = 消える）を実プロセスで常設
 - 番犬 `issue1597_snapshot_failure_watchdog`（構造 5 + 規則 1）。注入 8 通りすべて FAILED（7 通りは file:line 名指し）→ 戻して緑・workspace 5218 passed 0 failed・clippy 3 宇宙 0・check-windows error 0
+
+## 2026-09-24（#1658: 行・桁で指す範囲編集 API と文書の版を足した）
+- 編集の口が全文置換 1 つだけで、5,000 行の 1 行を直すのに本文を丸ごと IPC で送っていた（実測 275,000 → 61 バイト = 4,508 分の 1）。`PreviewEditRange` / `PreviewCursor` を tako-core 操作 API → dispatch → CLI `tako edit replace-range` / `cursor` → MCP `tako_preview_edit_range` / `tako_preview_cursor` へ 1:1。座標は行 1 始まり / 桁 0 始まりの行内 UTF-8 バイトで、範囲外・文字の途中・CR と LF のあいだは**丸めずに拒否**する
+- 応答へ `document`（`version` / `line_count` / `cursor` / `selection` / `undo_depth` / `undo_history_bytes`）を載せ、編集系すべてを `dispatch::preview_edit_reply` の 1 実装から組む。版は本文が変わるたびに進み（undo / redo でも戻らず進む）、`expected_version` で楽観ロックできる = LSP（#1007 S1）の `didChange` の前払い
+- 実測: 隔離 GUI の実経路 30 項目すべて OK（`scripts/test-edit-range-1658.sh`）・番犬 7 規則へ注入 10 通りすべて名指しで FAILED → 戻して緑・workspace 5360 passed 0 failed・clippy 3 宇宙 0・カタログ 202,204 / 204,800 バイト（予算内）

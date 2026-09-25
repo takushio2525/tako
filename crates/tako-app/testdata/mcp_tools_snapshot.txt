@@ -74,7 +74,9 @@ tako_preview_autosave
 tako_preview_cache
 tako_preview_changelog
 tako_preview_copy_code
+tako_preview_cursor
 tako_preview_edit
+tako_preview_edit_range
 tako_preview_follow_link
 tako_preview_link_list
 tako_preview_outline

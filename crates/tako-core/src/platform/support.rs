@@ -1095,11 +1095,27 @@ pub const MATRIX: &[Feature] = &[
         ),
     },
     Feature {
+        key: "tako_preview_cursor",
+        macos: Support::Supported,
+        windows: Support::Supported,
+        windows_evidence: Evidence::UnitTest(
+            "行・桁の解決は本文のバイト列だけを見る純粋関数で、OS 依存の分岐を持たない。text_edit の単体と dispatch の previewカーソルは行桁で動き選択は本文を変えない が CI の Windows ジョブで緑",
+        ),
+    },
+    Feature {
         key: "tako_preview_edit",
         macos: Support::Supported,
         windows: Support::Supported,
         windows_evidence: Evidence::SelfTest(
             "項目 66d（tako edit で開始 → 適用 → 保存）",
+        ),
+    },
+    Feature {
+        key: "tako_preview_edit_range",
+        macos: Support::Supported,
+        windows: Support::Supported,
+        windows_evidence: Evidence::UnitTest(
+            "範囲の解決・版・CRLF の扱いは純粋関数で、OS 依存の分岐を持たない。text_edit の単体と dispatch の preview範囲編集は行桁で1行だけを差し替えて版を返す が CI の Windows ジョブで緑",
         ),
     },
     Feature {

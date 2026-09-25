@@ -9,6 +9,7 @@
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use tako_core::text_edit::TextPosition;
 use tako_core::{
     CommandState, Pane, PaneId, PaneNode, PaneOrigin, PaneTreeError, PreviewViewUpdate,
     PreviewZoomCommand, Rect, SpawnCommand, SpawnOptions, SplitAxis, SplitDirection, TabId,
@@ -667,6 +668,25 @@ fn run_git_show(cwd: &Path, hash: &str, file: Option<&str>) -> Result<Value, Dis
             .collect::<Vec<_>>());
     }
     Ok(result)
+}
+
+/// プレビュー編集系の応答を組む**唯一の実装**（#1658）。
+///
+/// `editing` / `dirty` に加えて、`document`（文書の版・行数・カーソル・選択・
+/// undo 履歴）を載せる。アームごとに `json!` を書くと、**新しい編集口だけ版を
+/// 載せ忘れる**（外から版を読めない操作ができる）ので、ここを通す形にしてある。
+/// 番犬 `issue1658_edit_range_watchdog` がアーム本体の直書きを file:line で名指す
+fn preview_edit_reply(host: &dyn ControlHost, target: PaneId) -> Value {
+    let (editing, dirty) = host.preview_edit_state(target).unwrap_or((false, false));
+    let mut out = json!({
+        "pane": target.as_u64(),
+        "editing": editing,
+        "dirty": dirty,
+    });
+    if let Some(document) = host.preview_document(target) {
+        out["document"] = document;
+    }
+    out
 }
 
 fn dispatch_inner(
@@ -2446,35 +2466,62 @@ fn dispatch_inner(
                 host.set_preview_editing(target, enabled)
                     .map_err(DispatchError::Operation)?;
             }
-            let (editing, dirty) = host.preview_edit_state(target).unwrap_or((false, false));
-            Ok(json!({
-                "pane": target.as_u64(),
-                "editing": editing,
-                "dirty": dirty,
-            }))
+            Ok(preview_edit_reply(host, target))
         }
         Request::PreviewApply { pane, text } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
             host.apply_preview_text(target, text)
                 .map_err(DispatchError::Operation)?;
-            let (editing, dirty) = host.preview_edit_state(target).unwrap_or((false, false));
-            Ok(json!({
-                "pane": target.as_u64(),
-                "editing": editing,
-                "dirty": dirty,
-            }))
+            Ok(preview_edit_reply(host, target))
+        }
+        Request::PreviewEditRange {
+            pane,
+            start_line,
+            start_col,
+            end_line,
+            end_col,
+            text,
+            expected_version,
+        } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            // protocol は数値をそのまま運ぶ（`"3:0"` の綴りを配線の途中で解かない =
+            // 解釈が CLI と MCP で割れない）。`行:桁` を読むのは CLI の入口だけ
+            let edit = tako_core::text_edit::RangeEdit {
+                start: TextPosition::new(start_line, start_col),
+                end: TextPosition::new(end_line, end_col),
+                text,
+                expected_version,
+            };
+            host.edit_preview_range(target, &edit)
+                .map_err(DispatchError::Operation)?;
+            Ok(preview_edit_reply(host, target))
+        }
+        Request::PreviewCursor {
+            pane,
+            line,
+            col,
+            select_to_line,
+            select_to_col,
+            expected_version,
+        } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            let place = tako_core::text_edit::CursorPlacement {
+                cursor: TextPosition::new(line, col),
+                // 行だけ指定したら桁は 0（「その行の頭まで選ぶ」がいちばん短い指定）
+                select_to: select_to_line
+                    .map(|line| TextPosition::new(line, select_to_col.unwrap_or(0))),
+                expected_version,
+            };
+            host.set_preview_cursor(target, &place)
+                .map_err(DispatchError::Operation)?;
+            Ok(preview_edit_reply(host, target))
         }
         Request::PreviewSave { pane } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
             host.save_preview(target)
                 .map_err(DispatchError::Operation)?;
-            let (editing, dirty) = host.preview_edit_state(target).unwrap_or((false, false));
-            let mut out = json!({
-                "pane": target.as_u64(),
-                "editing": editing,
-                "dirty": dirty,
-                "saved": true,
-            });
+            let mut out = preview_edit_reply(host, target);
+            out["saved"] = json!(true);
             // #966: リモート由来なら「リモートへ書けたのか」まで応答に載せる
             // （ローカルの写しへ書けただけで saved=true とは言わせない）
             if let Some(remote) = host.preview_remote_state(target) {
@@ -2487,26 +2534,18 @@ fn dispatch_inner(
             let undone = host
                 .preview_undo(target)
                 .map_err(DispatchError::Operation)?;
-            let (editing, dirty) = host.preview_edit_state(target).unwrap_or((false, false));
-            Ok(json!({
-                "pane": target.as_u64(),
-                "editing": editing,
-                "dirty": dirty,
-                "undone": undone,
-            }))
+            let mut out = preview_edit_reply(host, target);
+            out["undone"] = json!(undone);
+            Ok(out)
         }
         Request::PreviewRedo { pane } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
             let redone = host
                 .preview_redo(target)
                 .map_err(DispatchError::Operation)?;
-            let (editing, dirty) = host.preview_edit_state(target).unwrap_or((false, false));
-            Ok(json!({
-                "pane": target.as_u64(),
-                "editing": editing,
-                "dirty": dirty,
-                "redone": redone,
-            }))
+            let mut out = preview_edit_reply(host, target);
+            out["redone"] = json!(redone);
+            Ok(out)
         }
         Request::PreviewAutosave { pane, enabled } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
@@ -2544,13 +2583,9 @@ fn dispatch_inner(
             let result = host
                 .preview_replace(target, &query, &replacement, all.unwrap_or(false))
                 .map_err(DispatchError::Operation)?;
-            let (editing, dirty) = host.preview_edit_state(target).unwrap_or((false, false));
-            Ok(json!({
-                "pane": target.as_u64(),
-                "editing": editing,
-                "dirty": dirty,
-                "replace": result,
-            }))
+            let mut out = preview_edit_reply(host, target);
+            out["replace"] = result;
+            Ok(out)
         }
         Request::PreviewChangelog {
             pane,
@@ -14931,7 +14966,10 @@ mod tests {
         preview_views: std::collections::HashMap<u64, tako_core::PreviewViewState>,
         preview_outlines: std::collections::HashMap<u64, tako_core::PreviewOutline>,
         last_outline_target: Option<tako_core::PreviewOutlineTarget>,
-        preview_edits: std::collections::HashMap<u64, (bool, bool, String)>,
+        /// (editing, dirty, 実バッファ)。#1658 から**本物の `TextBuffer`** を持つ:
+        /// 版・カーソル・行桁の解釈を GUI と同じ 1 実装で確かめるため
+        preview_edits:
+            std::collections::HashMap<u64, (bool, bool, tako_core::text_edit::TextBuffer)>,
         collapsed: std::collections::HashSet<u64>,
         /// ピン留め: (group, id)
         pins: Vec<(bool, u64)>,
@@ -15493,10 +15531,16 @@ mod tests {
             if !self.previews.contains_key(&pane.as_u64()) {
                 return Err("プレビューペインではない".into());
             }
-            let edit =
-                self.preview_edits
-                    .entry(pane.as_u64())
-                    .or_insert((false, false, String::new()));
+            let edit = self.preview_edits.entry(pane.as_u64()).or_insert_with(|| {
+                (
+                    false,
+                    false,
+                    tako_core::text_edit::TextBuffer::from_text(
+                        std::path::PathBuf::from("mock.txt"),
+                        String::new(),
+                    ),
+                )
+            });
             edit.0 = enabled;
             Ok(())
         }
@@ -15504,8 +15548,51 @@ mod tests {
             self.set_preview_editing(pane, true)?;
             let edit = self.preview_edits.get_mut(&pane.as_u64()).unwrap();
             edit.1 = true;
-            edit.2 = text;
+            edit.2.set_text(text);
             Ok(())
+        }
+        fn edit_preview_range(
+            &mut self,
+            pane: PaneId,
+            edit: &tako_core::text_edit::RangeEdit,
+        ) -> Result<(), String> {
+            self.set_preview_editing(pane, true)?;
+            let state = self.preview_edits.get_mut(&pane.as_u64()).unwrap();
+            state
+                .2
+                .replace_position_range(edit)
+                .map_err(|e| e.to_string())?;
+            state.1 = true;
+            Ok(())
+        }
+        fn set_preview_cursor(
+            &mut self,
+            pane: PaneId,
+            place: &tako_core::text_edit::CursorPlacement,
+        ) -> Result<(), String> {
+            self.set_preview_editing(pane, true)?;
+            let state = self.preview_edits.get_mut(&pane.as_u64()).unwrap();
+            state
+                .2
+                .set_cursor_placement(place)
+                .map_err(|e| e.to_string())
+        }
+        fn preview_document(&self, pane: PaneId) -> Option<serde_json::Value> {
+            Some(self.preview_edits.get(&pane.as_u64())?.2.document_state())
+        }
+        fn preview_undo(&mut self, pane: PaneId) -> Result<bool, String> {
+            let state = self
+                .preview_edits
+                .get_mut(&pane.as_u64())
+                .ok_or_else(|| "編集セッションがない".to_string())?;
+            Ok(state.2.undo())
+        }
+        fn preview_redo(&mut self, pane: PaneId) -> Result<bool, String> {
+            let state = self
+                .preview_edits
+                .get_mut(&pane.as_u64())
+                .ok_or_else(|| "編集セッションがない".to_string())?;
+            Ok(state.2.redo())
         }
         fn save_preview(&mut self, pane: PaneId) -> Result<(), String> {
             let edit = self
@@ -18576,6 +18663,227 @@ mod tests {
             .unwrap();
         assert_eq!(preview["preview"]["editing"].as_bool(), Some(true));
         assert_eq!(preview["preview"]["dirty"].as_bool(), Some(false));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #1658: プレビューペインを 1 枚開いて本文を入れる（範囲編集のテストの前置き）
+    fn preview_with_text(host: &mut MockHost, dir: &std::path::Path, text: &str) -> u64 {
+        let file = dir.join("range.rs");
+        std::fs::write(&file, text).unwrap();
+        let root = host.root_pane();
+        let opened = dispatch(
+            host,
+            Request::OpenFile {
+                pane: Some(root),
+                path: file.display().to_string(),
+                mode: Some(PreviewModeWire::Code),
+                direction: None,
+                focus: None,
+                new_tab: false,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let pane = opened["pane"].as_u64().unwrap();
+        dispatch(
+            host,
+            Request::PreviewApply {
+                pane: Some(pane),
+                text: text.into(),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        pane
+    }
+
+    fn range_request(pane: u64, start: (usize, usize), end: (usize, usize), text: &str) -> Request {
+        Request::PreviewEditRange {
+            pane: Some(pane),
+            start_line: start.0,
+            start_col: start.1,
+            end_line: end.0,
+            end_col: end.1,
+            text: text.into(),
+            expected_version: None,
+        }
+    }
+
+    #[test]
+    fn preview範囲編集は行桁で1行だけを差し替えて版を返す() {
+        let dir =
+            std::env::temp_dir().join(format!("tako-dispatch-edit-range-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut host = MockHost::new();
+        let pane = preview_with_text(&mut host, &dir, "one\ntwo\nthree\n");
+
+        let status = dispatch(
+            &mut host,
+            Request::PreviewEdit {
+                pane: Some(pane),
+                enabled: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        // #1658: 状態取得の応答にも文書の版が載る
+        let before = status["document"]["version"]
+            .as_u64()
+            .expect("version が無い");
+        assert_eq!(status["document"]["line_count"].as_u64(), Some(4));
+
+        let edited = dispatch(
+            &mut host,
+            range_request(pane, (2, 0), (2, 3), "TWO!"),
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(edited["dirty"].as_bool(), Some(true));
+        assert_eq!(edited["document"]["version"].as_u64(), Some(before + 1));
+        // カーソルは差し替えた本文の末尾
+        assert_eq!(edited["document"]["cursor"]["line"].as_u64(), Some(2));
+        assert_eq!(edited["document"]["cursor"]["column"].as_u64(), Some(4));
+        assert_eq!(edited["document"]["undo_depth"].as_u64(), Some(2));
+
+        // undo / redo でも版は**戻らずに進む**
+        let undone = dispatch(
+            &mut host,
+            Request::PreviewUndo { pane: Some(pane) },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(undone["undone"].as_bool(), Some(true));
+        assert_eq!(undone["document"]["version"].as_u64(), Some(before + 2));
+        let redone = dispatch(
+            &mut host,
+            Request::PreviewRedo { pane: Some(pane) },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(redone["document"]["version"].as_u64(), Some(before + 3));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn previewカーソルは行桁で動き選択は本文を変えない() {
+        let dir = std::env::temp_dir().join(format!("tako-dispatch-cursor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut host = MockHost::new();
+        let pane = preview_with_text(&mut host, &dir, "one\ntwo\nthree\n");
+        let before = dispatch(
+            &mut host,
+            Request::PreviewEdit {
+                pane: Some(pane),
+                enabled: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap()["document"]["version"]
+            .as_u64()
+            .unwrap();
+
+        let moved = dispatch(
+            &mut host,
+            Request::PreviewCursor {
+                pane: Some(pane),
+                line: 2,
+                col: 1,
+                select_to_line: Some(3),
+                select_to_col: Some(2),
+                expected_version: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        // 本文は変わらないので版は据え置き
+        assert_eq!(moved["document"]["version"].as_u64(), Some(before));
+        assert_eq!(moved["document"]["cursor"]["line"].as_u64(), Some(3));
+        assert_eq!(moved["document"]["cursor"]["column"].as_u64(), Some(2));
+        assert_eq!(
+            moved["document"]["selection"]["start"]["line"].as_u64(),
+            Some(2)
+        );
+        assert_eq!(
+            moved["document"]["selection"]["end"]["column"].as_u64(),
+            Some(2)
+        );
+
+        // 桁を省いた指定は行頭
+        let head = dispatch(
+            &mut host,
+            Request::PreviewCursor {
+                pane: Some(pane),
+                line: 3,
+                col: 0,
+                select_to_line: None,
+                select_to_col: None,
+                expected_version: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert!(head["document"]["selection"].is_null());
+        assert_eq!(head["document"]["cursor"]["column"].as_u64(), Some(0));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn preview範囲編集は版違いと解けない指定を本文を触らずに拒否する() {
+        let dir =
+            std::env::temp_dir().join(format!("tako-dispatch-range-err-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut host = MockHost::new();
+        let pane = preview_with_text(&mut host, &dir, "abc\nあいう\n");
+        let version = dispatch(
+            &mut host,
+            Request::PreviewEdit {
+                pane: Some(pane),
+                enabled: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap()["document"]["version"]
+            .as_u64()
+            .unwrap();
+
+        // 版が違えば拒否
+        let stale = dispatch(
+            &mut host,
+            Request::PreviewEditRange {
+                pane: Some(pane),
+                start_line: 1,
+                start_col: 0,
+                end_line: 1,
+                end_col: 1,
+                text: "Z".into(),
+                expected_version: Some(version + 7),
+            },
+            PaneOrigin::Mcp,
+        );
+        assert!(stale.is_err(), "版違いを通した");
+
+        // 範囲外の行・文字の途中の桁・逆順
+        for request in [
+            range_request(pane, (1, 0), (9, 0), "X"),
+            range_request(pane, (2, 1), (2, 3), "X"),
+            range_request(pane, (2, 3), (1, 0), "X"),
+        ] {
+            assert!(dispatch(&mut host, request, PaneOrigin::Cli).is_err());
+        }
+        // 版は 1 つも進んでいない = 本文を触っていない
+        let after = dispatch(
+            &mut host,
+            Request::PreviewEdit {
+                pane: Some(pane),
+                enabled: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(after["document"]["version"].as_u64(), Some(version));
         let _ = std::fs::remove_dir_all(dir);
     }
 

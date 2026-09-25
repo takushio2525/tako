@@ -1650,6 +1650,36 @@ enum EditCommand {
         #[arg(long)]
         pane: Option<u64>,
     },
+    /// 行・桁で指定した範囲だけを置き換える（保存はしない）
+    ///
+    /// 位置は `行:桁`（行は 1 始まり・桁は 0 始まりの UTF-8 バイト。桁は省略可 = 0）。
+    /// 例: `tako edit replace-range 12:0 12:34 "新しい行"`
+    ReplaceRange {
+        /// 置き換える範囲の始まり（`行:桁`）
+        start: String,
+        /// 置き換える範囲の終わり（`行:桁`）
+        end: String,
+        /// 範囲に入れる本文
+        text: String,
+        /// 文書の版。指定すると版が違うときは何もせず失敗する
+        #[arg(long)]
+        expect_version: Option<u64>,
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// カーソルを移動する（`--select-to` でそこまで選択）
+    Cursor {
+        /// カーソルの位置（`行:桁`）
+        position: String,
+        /// ここまで選択する（`行:桁`）。カーソルはこちら側へ来る
+        #[arg(long)]
+        select_to: Option<String>,
+        /// 文書の版。指定すると版が違うときは何もせず失敗する
+        #[arg(long)]
+        expect_version: Option<u64>,
+        #[arg(long)]
+        pane: Option<u64>,
+    },
     /// 編集バッファをファイルへ保存する
     Save {
         #[arg(long)]
@@ -6735,6 +6765,29 @@ fn with_id(mut req: Request, value: &str) -> Request {
     req
 }
 
+/// `行:桁` を解く（#1658）。桁を省いたら 0（行頭）。
+///
+/// **この綴りを解くのは CLI の入口だけ**。protocol / MCP は数値をそのまま運ぶので、
+/// 「`3:0` をどう読むか」が経路ごとに割れない
+fn parse_position(text: &str) -> Result<(usize, usize), String> {
+    let (line, col) = match text.split_once(':') {
+        Some((line, col)) => (line, Some(col)),
+        None => (text, None),
+    };
+    let line: usize = line
+        .trim()
+        .parse()
+        .map_err(|_| format!("位置は 行:桁 で指定する（行が数値でない: {text}）"))?;
+    let col: usize = match col {
+        Some(col) => col
+            .trim()
+            .parse()
+            .map_err(|_| format!("位置は 行:桁 で指定する（桁が数値でない: {text}）"))?,
+        None => 0,
+    };
+    Ok((line, col))
+}
+
 fn build_request(command: &Command) -> Result<Request, String> {
     Ok(match command {
         Command::Split(args) => {
@@ -6942,6 +6995,42 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 pane: target_pane(*pane)?,
                 text: text.clone(),
             },
+            EditCommand::ReplaceRange {
+                start,
+                end,
+                text,
+                expect_version,
+                pane,
+            } => {
+                let (start_line, start_col) = parse_position(start)?;
+                let (end_line, end_col) = parse_position(end)?;
+                Request::PreviewEditRange {
+                    pane: target_pane(*pane)?,
+                    start_line,
+                    start_col,
+                    end_line,
+                    end_col,
+                    text: text.clone(),
+                    expected_version: *expect_version,
+                }
+            }
+            EditCommand::Cursor {
+                position,
+                select_to,
+                expect_version,
+                pane,
+            } => {
+                let (line, col) = parse_position(position)?;
+                let select_to = select_to.as_deref().map(parse_position).transpose()?;
+                Request::PreviewCursor {
+                    pane: target_pane(*pane)?,
+                    line,
+                    col,
+                    select_to_line: select_to.map(|(line, _)| line),
+                    select_to_col: select_to.map(|(_, col)| col),
+                    expected_version: *expect_version,
+                }
+            }
             EditCommand::Save { pane } => Request::PreviewSave {
                 pane: target_pane(*pane)?,
             },
@@ -9692,6 +9781,68 @@ mod tests {
             build_request(&command).unwrap(),
             Request::PreviewSave { pane: Some(5) }
         );
+        // #1658: 位置は `行:桁`（桁は省略可 = 0）
+        let command = parse(&[
+            "tako",
+            "edit",
+            "replace-range",
+            "12:0",
+            "12:34",
+            "新しい行",
+            "--expect-version",
+            "7",
+            "--pane",
+            "5",
+        ]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::PreviewEditRange {
+                pane: Some(5),
+                start_line: 12,
+                start_col: 0,
+                end_line: 12,
+                end_col: 34,
+                text: "新しい行".into(),
+                expected_version: Some(7),
+            }
+        );
+        let command = parse(&["tako", "edit", "replace-range", "3", "4", "", "--pane", "5"]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::PreviewEditRange {
+                pane: Some(5),
+                start_line: 3,
+                start_col: 0,
+                end_line: 4,
+                end_col: 0,
+                text: String::new(),
+                expected_version: None,
+            }
+        );
+        let command = parse(&[
+            "tako",
+            "edit",
+            "cursor",
+            "3:5",
+            "--select-to",
+            "8:2",
+            "--pane",
+            "5",
+        ]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::PreviewCursor {
+                pane: Some(5),
+                line: 3,
+                col: 5,
+                select_to_line: Some(8),
+                select_to_col: Some(2),
+                expected_version: None,
+            }
+        );
+        // 数値でない位置は実行前に弾く（サーバーまで持って行かない）
+        let command = parse(&["tako", "edit", "cursor", "abc", "--pane", "5"]);
+        assert!(build_request(&command).is_err());
         let command = parse(&["tako", "edit", "undo", "--pane", "5"]);
         assert_eq!(
             build_request(&command).unwrap(),
@@ -10286,6 +10437,8 @@ mod platform_matrix_parity {
         ("config", "tako_config_share"),
         ("edit apply", "tako_preview_apply"),
         ("edit autosave", "tako_preview_autosave"),
+        ("edit cursor", "tako_preview_cursor"),
+        ("edit replace-range", "tako_preview_edit_range"),
         ("edit redo", "tako_preview_redo"),
         ("edit replace", "tako_preview_replace"),
         ("edit save", "tako_preview_save"),

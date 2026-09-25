@@ -1154,7 +1154,7 @@
     "name": "tako_scrollback"
   },
   {
-    "description": "コードプレビューの編集モードを開始・終了する。enabled 省略時は状態取得。PDF・画像・動画・末尾省略された巨大ファイルは編集できない。状態は editing / dirty で返す。",
+    "description": "コードプレビューの編集モードを開始・終了する。enabled 省略時は状態取得。PDF・画像・動画・末尾省略された巨大ファイルは編集できない。状態は editing / dirty で返す。document は文書の版（version）とカーソル・選択・undo 履歴で、編集系ツールの応答すべてに載る。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -1193,6 +1193,98 @@
       "type": "object"
     },
     "name": "tako_preview_apply"
+  },
+  {
+    "description": "コードプレビューの編集バッファを行・桁で指定した範囲だけ置き換える（全文を送る tako_preview_apply の代わり）。行は 1 始まり、桁は 0 始まりの行内 UTF-8 バイトで上限は改行を除いた行の長さ。範囲外・文字の途中・逆順は丸めずエラーにし本文は変えない。編集モード未開始なら開始する。カーソルは入れた本文の末尾に来て tako_preview_undo 1 回で戻る。応答 document は version / line_count / cursor / selection / undo_depth / undo_history_bytes。expected_version に直前の version を渡すと、間に他が編集していれば何もせず失敗する。対象は tako_open_file で開いたプレビューペイン。ファイルへ書くのは tako_preview_save。",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "end_col": {
+          "description": "終了行内のバイト桁（0 始まり・省略時 0）",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "end_line": {
+          "description": "範囲の終了行（1 始まり）",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "expected_version": {
+          "description": "文書の版。違えば何もせず失敗する",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pane": {
+          "description": "対象プレビューペイン ID（省略時は呼び出し元）",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start_col": {
+          "description": "開始行内のバイト桁（0 始まり・省略時 0）",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start_line": {
+          "description": "範囲の開始行（1 始まり）",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "text": {
+          "description": "範囲に入れる本文（空文字なら削除）",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start_line",
+        "end_line",
+        "text"
+      ],
+      "type": "object"
+    },
+    "name": "tako_preview_edit_range"
+  },
+  {
+    "description": "コードプレビュー編集のカーソルを行・桁で置く。編集モード未開始なら開始する。本文は変えないので version は増えない。行は 1 始まり、桁は 0 始まりの行内 UTF-8 バイト。select_to_line を渡すと line:col からそこまでを選択し、カーソルは select_to 側に来る（select_to_col 省略時は 0）。範囲外・文字の途中はエラー。結果は応答 document の cursor / selection で読む。範囲編集は位置を自分で持つので、選択してから消す用途以外では tako_preview_edit_range だけで足りる。",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "col": {
+          "description": "行内のバイト桁（0 始まり・省略時 0）",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "expected_version": {
+          "description": "文書の版。違えば何もせず失敗する",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "line": {
+          "description": "カーソル行（1 始まり）",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "pane": {
+          "description": "対象プレビューペイン ID（省略時は呼び出し元）",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "select_to_col": {
+          "description": "ここまで選択する桁（省略時 0）",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "select_to_line": {
+          "description": "ここまで選択する行",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "line"
+      ],
+      "type": "object"
+    },
+    "name": "tako_preview_cursor"
   },
   {
     "description": "コードプレビューの未保存編集をファイルへ書き戻す。読み込み後に外部変更があれば競合として拒否し、上書きしない。",
