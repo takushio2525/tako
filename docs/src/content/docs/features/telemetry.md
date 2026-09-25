@@ -13,9 +13,11 @@ tako には、クラッシュ（panic / 致命的エラー）の情報を自動�
 |---|---|---|
 | `version` | tako のバージョン | `0.6.0` |
 | `os_version` | OS のバージョン | `macOS 26.0 (Darwin 25.2.0)` |
-| `error_kind` | エラーの種別 | `panic` / `critical` / `invariant_violation` |
+| `error_kind` | エラーの種別 | `panic`（クラッシュ）/ `restore_failed`（起動時のレイアウト復元の失敗） |
 | `message` | エラーメッセージ（パスはマスク済み） | `index out of bounds at ~/src/main.rs:42` |
-| `backtrace` | スタックトレース（パスはマスク済み） | `~/src/...` |
+| `backtrace` | スタックトレース（パスはマスク済み。`panic` のときだけ） | `~/src/...` |
+
+このほか、通信の性質上、あなたの **IP アドレス**が受け取り側（Cloudflare）に届きます。受け取り側は IP アドレスを連続送信の制限（1 分あたり 10 件）の判定にだけ使い、約 2 分で自動的に消えます。レポートの本体には保存しません。
 
 ## 何が送られないか
 
@@ -39,7 +41,7 @@ tako telemetry on       # 有効化
 tako telemetry off      # 無効化
 ```
 
-MCP ツール `tako_telemetry` からも同じ操作ができます。`tako setup` でも有効にするかどうかを確認します。
+MCP ツール `tako_telemetry` と、設定画面の「一般 → エラーレポート」からも同じ操作ができます。`tako setup` は有効にしません（既定の無効のまま）。
 
 ## 送った内容は自分で確認できます
 
@@ -54,6 +56,7 @@ MCP ツール `tako_telemetry` からも同じ操作ができます。`tako setu
 | 閲覧できる人 | プロジェクトのオーナーのみ |
 | 書き込み口 | レート制限あり（10 リクエスト/分/IP）、認証不要 |
 | 読み出し口 | 管理者トークンが必要（バイナリには含まれていません） |
+| 受け付ける種別 | 現在の受け取り側が保存するのは `panic` だけです。`restore_failed` は受け付けずに捨てるため、送信に失敗した扱いでローカルの送信待ち（`<データディレクトリ>/telemetry_queue.jsonl`、最大 50 件）に残ります |
 
 ## 削除の依頼
 

@@ -259,6 +259,14 @@ v0.2.6 以降は署名の designated requirement が identifier 固定になり�
 
 [GPL-3.0-or-later](LICENSE) — 依存クレート（zlog / ztracing、Zed リポ由来）が GPL-3.0 のため。
 
-同梱している第三者成果物（zsh-autosuggestions ほか）の告知は
-[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) にあります。
-Notices for bundled third-party works are in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+同梱している第三者成果物（zsh-autosuggestions・ファイルアイコン・スマホ用画面の JavaScript とフォントほか）の告知は
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)、配布バイナリに静的リンクしている Rust クレートのライセンス本文と著作権表示は
+[THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md) にあります。
+Notices for bundled third-party works are in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md);
+the license texts and copyright notices of the Rust crates linked into the binaries are in
+[THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md).
+
+配布しているバイナリに対応するソースコードは、[GitHub Releases](https://github.com/takushio2525/tako/releases)
+の各リリースのタグにあります。tako は**無保証**です（GPL-3.0 第 15 条・第 16 条。詳細は [LICENSE](LICENSE)）。
+The source code for each released binary is the tag of that release on GitHub Releases.
+tako comes with **ABSOLUTELY NO WARRANTY** (sections 15 and 16 of the GPL-3.0; see [LICENSE](LICENSE)).

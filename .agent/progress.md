@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-23（#1505: setup --check と check-health の診断項目を 1 実装の正本から組むようにした）
-- 同じ「この環境で tako は使えるか」を 2 実装が別々に答えていた（`--check` にシェル統合・tako CLI の PATH・更新・remote・IPC の行が無く、PATH は `check-health` だけが別口 = 棚卸し Z19）。`tako_control::diagnostics::collect()` を項目・判定・行の正本にし、`run_check` は 285 行 → 15 行（判断ゼロ）、`check_health` は応答へ `diagnostics` 節。認証とプランの問い合わせも `auth_state_for` の 1 回へ寄り、`--check` は 12.4 → 10.8 秒
-- 重い正本（実測 10.8 秒）を UI スレッドで走らせないよう `Request::CheckHealth` を `prepare_offload` へ。IPC の項目は観測者で文面を変えない形に。**寄せた先で #1503 の打ち切りの知らせが落ちていた**（CI の macOS が実回帰で赤）ので `agent_probe::output_with_timeout` の 1 実装から出し直し、`diagnostics.probe_timeouts` で機械可読にもして番犬を足した
-- 実測: `scripts/test-setup-check-single-source-1505.sh` **38 PASS 0 FAIL**（隔離 GUI で dispatch・`tako mcp serve` の MCP まで実経路照合）・注入 12 通りすべて file:line 名指しで FAILED → 戻して緑・既存の隔離 5 本（81/52/49/54/verify-multiagent）全緑・workspace 5249 passed 0 failed・clippy 3 宇宙 rc=0・check-windows rc=0・docs 32 ページ警告 0
-
 ## 2026-09-23（#1616: Windows の pid 正体確認を境界へ足した）
 - `verify_pid_identity` は照合が丸ごと `#[cfg(unix)]` の中で Windows は末尾の `true` へ直行 = 「生きている pid はすべて tako の daemon」。#1596 で生存判定が境界へ寄り先頭の `if` を通り抜けたことで露出（#1599 が先に入ると誤 kill）
 - 材料引き（`procinfo::observe_identity`）と突き合わせ（`judge_identity` = 3 値・`Unknown` は撃たない）を境界へ新設。`remote.rs` の腕は OS 分岐の無い `boundary_identity_confirmed` 1 本で、分岐は `#[cfg]` → `cfg!(unix)`（両腕を macOS でもコンパイル）
@@ -64,3 +59,7 @@
 - `context-budget fix` の移送（古いエントリを**消す**）と main 側の移送が rebase で噛み合っても git は衝突を報告せず auto-merge するので、archive 済みのエントリが `progress.md` へ黙って戻る（9/23 だけで 4 回・毎回 worker の目視で発見。予算を超えなければ既存の番犬では落ちない）。判定を `tako_core::context_budget::revivals` の 1 実装として足し、`tako context-budget` / MCP の violations と新設の番犬が同じものを通る
 - 鍵は `LogEntry::archive_line()` = `fix` がアーカイブへ書くのと同じ 1 行。(日付, Issue 番号) の組は**実データで誤検出する**（アーカイブに `2026-09-14 #1450` が 3 件・`2026-07-05 #63` が 2 件）ので採らなかった
 - 実測: 注入 3 通り（復活 / 重複 / 見出しの書式を壊す空振り検査）すべて file:line 名指しで FAILED → 戻して緑。**この PR 自身の rebase でも 2 件の復活を file:line で捕らえた**
+
+## 2026-09-26（#1709: 配布物へライセンス本文と第三者の著作権表示を同梱した）
+- 法務監査（tako-legal）の即時修正分。`cargo about` で配布対象 547 クレートの本文・著作権表示を `THIRD-PARTY-LICENSES.md` へ生成（`about.toml` / `about.hbs`）、NOTICES に Zed のファイルアイコン（GPL + Lucide の ISC）と PWA の preact / marked / DOMPurify / Geist を追記、`build-app.sh` が 3 ファイルを `.app` の Resources へ署名前に置く
+- `cargo deny check licenses` 0 errors・docs build / og:verify / verify-links 緑・telemetry.md の食い違い 3 点を訂正。`.app` の実ビルドはマシン負荷のため未実施（同梱は script を読んで判定）。Windows の同梱とアプリ内表示は提案止まり

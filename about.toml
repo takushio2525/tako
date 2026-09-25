@@ -1,0 +1,54 @@
+# cargo-about の設定（Issue #1709）。配布バイナリへ静的リンクされる依存の
+# ライセンス本文と著作権表示を THIRD-PARTY-LICENSES.html へ書き出す。
+# 再生成: cargo about generate --fail about.hbs -o THIRD-PARTY-LICENSES.html
+#
+# accepted は「選べるときに優先するライセンス」の順。どれも GPL-3.0-or-later の
+# 配布物へ取り込めるもの（FSF の互換ライセンス一覧で確認した）だけを並べる。
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "BSL-1.0",
+    "CC0-1.0",
+    "MIT-0",
+    "0BSD",
+    "Unlicense",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+    "bzip2-1.0.6",
+    "GPL-3.0-or-later",
+]
+
+# 配布しているのは macOS（Apple Silicon）と Windows（x64）の 2 本だけ
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+# 配布バイナリに入らない依存（テスト・ビルドスクリプト用）は載せない
+ignore-dev-dependencies = true
+ignore-build-dependencies = true
+
+# 既知の癖（ring の複合ライセンス等）は cargo-about 同梱の補正を使う
+workarounds = ["ring", "rustls"]
+
+# Zed リポ由来の 2 クレートは Cargo.toml に license 欄が無い。
+# クレート直下の LICENSE-APACHE（リポ直下へのシンボリックリンク）で Apache-2.0 と確認した
+[gpui_shared_string.clarify]
+license = "Apache-2.0"
+[[gpui_shared_string.clarify.files]]
+path = "LICENSE-APACHE"
+license = "Apache-2.0"
+checksum = "752daf2fb234ca4a1fa372c073fe127f44b7b90fd2529ae44273a64f9d53da7a"
+
+[gpui_util.clarify]
+license = "Apache-2.0"
+[[gpui_util.clarify.files]]
+path = "LICENSE-APACHE"
+license = "Apache-2.0"
+checksum = "752daf2fb234ca4a1fa372c073fe127f44b7b90fd2529ae44273a64f9d53da7a"
