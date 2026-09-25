@@ -1,0 +1,51 @@
+# サードパーティのライセンス / Third-Party Licenses
+
+<!-- このファイルは生成物。手で直さない（Issue #1709）。
+     再生成: cargo about generate --fail about.hbs -o THIRD-PARTY-LICENSES.md
+     設定は about.toml（対象: aarch64-apple-darwin / x86_64-pc-windows-msvc、
+     dev / build 依存は除外）。 -->
+
+tako の配布バイナリ（macOS の `tako.app`、Windows のインストーラー / ポータブル zip）に
+静的リンクされている Rust クレートのライセンス本文と著作権表示の一覧。
+tako 本体は [GPL-3.0-or-later](LICENSE)。ソースツリーへ直接取り込んだ第三者成果物
+（アイコン・シェルスクリプト・スマホ用画面の JavaScript とフォント等）は
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) にある。
+
+This lists the license texts and copyright notices of the Rust crates statically linked
+into the tako binaries (macOS `tako.app`, Windows installer / portable zip).
+tako itself is licensed under [GPL-3.0-or-later](LICENSE). Third-party works incorporated
+into the source tree (icons, shell scripts, the JavaScript and fonts of the phone UI, etc.)
+are listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+
+## 概要 / Overview
+
+| ライセンス / License | 件数 / Count |
+|---|---|
+{{#each overview}}
+| {{{name}}} | {{count}} |
+{{/each}}
+
+## ライセンス本文 / License texts
+
+{{#each licenses}}
+### {{{name}}}
+
+使用しているクレート / Used by:
+
+{{#each used_by}}
+{{#if crate.repository}}
+{{#if crate.source}}
+- [{{crate.name}} {{crate.version}}]({{crate.repository}})
+{{else}}
+- [{{crate.name}}]({{crate.repository}})（tako 本体 / tako itself）
+{{/if}}
+{{else}}
+- {{crate.name}} {{crate.version}}（`{{{crate.source}}}`）
+{{/if}}
+{{/each}}
+
+```text
+{{{text}}}
+```
+
+{{/each}}
