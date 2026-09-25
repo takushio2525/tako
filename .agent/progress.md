@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-23（#1616: Windows の pid 正体確認を境界へ足した）
-- `verify_pid_identity` は照合が丸ごと `#[cfg(unix)]` の中で Windows は末尾の `true` へ直行 = 「生きている pid はすべて tako の daemon」。#1596 で生存判定が境界へ寄り先頭の `if` を通り抜けたことで露出（#1599 が先に入ると誤 kill）
-- 材料引き（`procinfo::observe_identity`）と突き合わせ（`judge_identity` = 3 値・`Unknown` は撃たない）を境界へ新設。`remote.rs` の腕は OS 分岐の無い `boundary_identity_confirmed` 1 本で、分岐は `#[cfg]` → `cfg!(unix)`（両腕を macOS でもコンパイル）
-- 実測: 注入 4 通り（素通り復帰 / 腕だけ外す / 空回り / `Unknown` 反転）すべて file:line 名指しで FAILED → 戻して緑。unix の挙動は不変（`remote::tests` 112 本そのまま緑）
-
 ## 2026-09-23（#1655: Code Runner の組み込み既定を OS 別の 1 枚の表にした）
 - 21 種のうち 10 種が Windows で不成立（`python3` / `cc` / `c++` / `rustc` + `./<出力>` / `bash` / `zsh`）・`runner.rs` に `cfg(windows)` 0 件だったので、表を `platform::runner_defaults::TABLE`（**41 拡張子 × 2 列**）へ移し、`Platform` 引数 + `cfg!` で macOS の単体から Windows 列を解決結果ごと固定した
 - Windows 列は PowerShell 5.1 でも通る形（`&&` / `./` を使わず `; if ($?) { .\<名前>.exe }`）。`.ps1` / `.bat` / `.tsx` など 20 拡張子を追加し、意図して置かない 9 マスは理由（日英）を持って案内へ載る（置かない基準は「その OS に解釈系が無い / 決まらない」）
@@ -63,3 +58,8 @@
 ## 2026-09-26（#1709: 配布物へライセンス本文と第三者の著作権表示を同梱した）
 - 法務監査（tako-legal）の即時修正分。`cargo about` で配布対象 547 クレートの本文・著作権表示を `THIRD-PARTY-LICENSES.md` へ生成（`about.toml` / `about.hbs`）、NOTICES に Zed のファイルアイコン（GPL + Lucide の ISC）と PWA の preact / marked / DOMPurify / Geist を追記、`build-app.sh` が 3 ファイルを `.app` の Resources へ署名前に置く
 - `cargo deny check licenses` 0 errors・docs build / og:verify / verify-links 緑・telemetry.md の食い違い 3 点を訂正。`.app` の実ビルドはマシン負荷のため未実施（同梱は script を読んで判定）。Windows の同梱とアプリ内表示は提案止まり
+
+## 2026-09-25（#1708: ドキュメントサイトの配信設定を点検した）
+- `docs/public/_headers` を新設（HSTS・frame-ancestors / X-Frame-Options・CSP の基本指令・Permissions-Policy）。CSP はスクリプトを縛らない（Pagefind の wasm と GA・同意バナーの送信先を漏れなく許可しないと検索・計測が黙って止まるため）。旧ドメイン転送はスキーム・ポートを固定し FQDN の末尾ドットも拾う形に
+- 再発防止に `docs/scripts/test-middleware.mjs`（25 ケース）と `verify-headers.mjs`（dist / 実 URL）を CI の docs 節へ。修正前の版へ当てると前者 5 件・後者 36 件で FAILED → 修正後は緑。wrangler pages dev + Playwright で検索・GA・同意の読み込みが壊れず、別オリジンの iframe だけ拒否されることを確認
+- 依存は `npm audit fix` の範囲（12 → 6 件）。残りは astro 7 / starlight 0.42 / sharp 0.35 のメジャー更新が要る（静的出力で外部から届く経路は無い）

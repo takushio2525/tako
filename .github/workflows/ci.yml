@@ -57,6 +57,14 @@ jobs:
       - name: docs の内部リンクを検査（#1547）
         working-directory: docs
         run: node scripts/verify-links.mjs
+      # 旧ドメインの転送（functions/_middleware.js）が常に正規のオリジンへ 301 すること
+      # と、dist/_headers に配信ヘッダ（HSTS・埋め込み禁止・CSP の基本指令ほか）が
+      # 載っていること。Pages 側でしか効かないので、ここで落とさないと本番で気づく（#1708）
+      - name: docs の転送と配信ヘッダを検査（#1708）
+        working-directory: docs
+        run: |
+          node scripts/test-middleware.mjs
+          node scripts/verify-headers.mjs
       # docs と能力マトリクスが「追跡先」として貼る Issue が open か。
       # 閉じた Issue を指したままだと、読む側が残りの仕事を辿れなくなる
       # （#1547 の棚卸しでは docs の Issue 参照 17 件のうち 10 件が closed だった）

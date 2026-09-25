@@ -2923,6 +2923,14 @@ docs の Issue 参照 17 件のうち 10 件が closed だった。
 （`agent-support.md` の系統別の節は「対応が 1 件でもあるか」で文言が分かれる）ので、
 手書きページからのアンカーが静かに切れる。
 
+配信の設定も同じジョブで見る（#1708）。`node docs/scripts/test-middleware.mjs` は
+旧ドメイン転送（`docs/functions/_middleware.js`）が細工したホスト・ポート・パスでも
+常に `https://tako.takushio2525.com` へ 301 することを、`node docs/scripts/verify-headers.mjs`
+は `dist/_headers`（正本は `docs/public/_headers`）に HSTS・埋め込み禁止・CSP の基本指令が
+載っていることを確かめる。後者は URL を渡すと本番のレスポンスヘッダも検査できる。
+CSP でスクリプトの出どころを縛るなら、検索（Pagefind）の WebAssembly のために
+`'wasm-unsafe-eval'` が要る（無いと検査が落ちる）。
+
 ## 個人情報を現行コードへ書かない（Issue #927）
 
 tako は public リポなので、**実ユーザー名・実ホームパス・実ホスト名・実メールアドレス・
