@@ -213,7 +213,15 @@ impl TakoApp {
                             d.bg(rgba_alpha(theme.red, 0.25))
                                 .text_color(hsla(theme.foreground))
                         })
-                        .child("×")
+                        // 印はグリフではなく描画プリミティブで描く（#1579）。色は svg 自身に
+                        // 置く（`svg()` は親の `text_color` を継承しない = #1491 と同じ罠）
+                        .child(
+                            svg()
+                                .path(crate::file_icons::ui_icon::CLOSE)
+                                .w(px(10.0))
+                                .h(px(10.0))
+                                .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8)),
+                        )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.bg_pending_kill = Some(pane_id);
                             cx.notify();
@@ -509,9 +517,18 @@ impl TakoApp {
                         .child(
                             div()
                                 .id("drawer-close")
+                                .flex()
+                                .items_center()
                                 .cursor_pointer()
                                 .hover(|d| d.text_color(hsla(theme.foreground)))
-                                .child("×")
+                                // 印はグリフではなく描画プリミティブで描く（#1579）
+                                .child(
+                                    svg()
+                                        .path(crate::file_icons::ui_icon::CLOSE)
+                                        .w(px(10.0))
+                                        .h(px(10.0))
+                                        .text_color(hsla(theme.tab_inactive_foreground)),
+                                )
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.drawer_visible = false;
                                     cx.notify();

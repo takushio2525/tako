@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-23（#1655: Code Runner の組み込み既定を OS 別の 1 枚の表にした）
-- 21 種のうち 10 種が Windows で不成立（`python3` / `cc` / `c++` / `rustc` + `./<出力>` / `bash` / `zsh`）・`runner.rs` に `cfg(windows)` 0 件だったので、表を `platform::runner_defaults::TABLE`（**41 拡張子 × 2 列**）へ移し、`Platform` 引数 + `cfg!` で macOS の単体から Windows 列を解決結果ごと固定した
-- Windows 列は PowerShell 5.1 でも通る形（`&&` / `./` を使わず `; if ($?) { .\<名前>.exe }`）。`.ps1` / `.bat` / `.tsx` など 20 拡張子を追加し、意図して置かない 9 マスは理由（日英）を持って案内へ載る（置かない基準は「その OS に解釈系が無い / 決まらない」）
-- 実測: 注入 A/B 3 通り（属性の `#[cfg(windows)]` / Windows 列の `python3` / `.command` の Windows 列を絶やす）が名指しで FAILED → 戻して緑。初版は `.command` を Windows で既定なしにして CI の Windows が赤（`Run` が Err = dispatch の実行テスト 3 件）→ 基準を「解釈系が無い / 決まらない」へ正した。GUI 実経路は画面スリープで未実施（#1160）
-
 ## 2026-09-23（#1651: undo を差分にし、連続タイプを 1 塊にまとめた）
 - 編集のたびに `self.text.clone()` を積んでいた（release 実測: 1 MB へ 1000 打鍵で RSS 増分 **1022.0MB**・undo 1000 回）。履歴 1 件を `EditDelta`（範囲 + 置換前後 + 編集前後のカーソル・選択・**改行コード**）へ替え、**増分 1.1MB / undo 1 回**（塊を毎回切る最悪値でも 1.2MB / 1000 回）。上限は操作数 1000 と履歴 8MiB の先に効いたほう（全文差し替え・全置換は 1 操作で本文 2 本ぶん積むので操作数だけでは上限にならない）
 - 本文を書き換える口を `apply_edit` 1 本へ寄せた（通らない書き換えは undo で戻らないので番犬が名指す）。**`set_cursor` は実際に動いたときだけ塊を切る**のが要点で、GUI は 1 打鍵ごとに画面の選択をバッファへ写す（同じ位置への `set_cursor` × 2）ため、素で切ると **GUI だけ 1 文字粒度**だった
@@ -63,3 +58,8 @@
 - `docs/public/_headers` を新設（HSTS・frame-ancestors / X-Frame-Options・CSP の基本指令・Permissions-Policy）。CSP はスクリプトを縛らない（Pagefind の wasm と GA・同意バナーの送信先を漏れなく許可しないと検索・計測が黙って止まるため）。旧ドメイン転送はスキーム・ポートを固定し FQDN の末尾ドットも拾う形に
 - 再発防止に `docs/scripts/test-middleware.mjs`（25 ケース）と `verify-headers.mjs`（dist / 実 URL）を CI の docs 節へ。修正前の版へ当てると前者 5 件・後者 36 件で FAILED → 修正後は緑。wrangler pages dev + Playwright で検索・GA・同意の読み込みが壊れず、別オリジンの iframe だけ拒否されることを確認
 - 依存は `npm audit fix` の範囲（12 → 6 件）。残りは astro 7 / starlight 0.42 / sharp 0.35 のメジャー更新が要る（静的出力で外部から届く経路は無い）
+
+## 2026-09-23（#1579: UI の印をグリフから描画プリミティブへ）
+- `×` U+00D7 を 8 件（drawer 2 / right_panel 4 / preview_render 1 / main 1）→ `svg().path(ui_icon::CLOSE)`、`⎇ tmux` → 語だけの `tmux`（U+2387 は多くのフォントに無く豆腐）、`● LIVE` 2 件 → `div().rounded_full()` の丸 + `LIVE`（`live_badge` の 1 実装）。新設 SVG はゼロ（CLOSE 流用 + 図形）
+- 判定を `tako_core::emoji::is_icon_glyph`（表は明示。`▾`/`▸` は診断メッセージで実使用があるのでブロックで採らない）、番犬 `issue1579_ui_glyph_icon_watchdog` は**画面へ出る 2 経路だけ**（子要素シンク `CHILD_SINKS` = `.child(` / `.children(` の文字列 / `ui_text` カタログ）を見るので**許可リスト 0 件**。実ファイル注入 10 通りすべて file:line 名指しで FAILED → 戻して緑
+- 実測: `bash scripts/test-glyph-icon-1579.sh` 5 PASS 0 FAIL（tako-vd 上・`live_dot` 82 色 / `close_icon` 9 色）・`ui_asset!("close")` を外す A/B で `close_icon` が **9 → 1 色**（`live_dot` は 82 色のまま）・workspace 5397 passed 0 failed・clippy 3 宇宙 0

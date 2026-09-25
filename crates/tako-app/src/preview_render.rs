@@ -8,6 +8,22 @@ use tako_core::PaneId;
 
 use super::*;
 
+/// ライブ更新中の印（#1579）。`●`（U+25CF）のグリフではなく**図形プリミティブの丸**で
+/// 描く（フォント次第で大きさ・太さが揺れる形を UI に残さない）。語（`LIVE`）は
+/// そのまま文字で出すので、印が読めなくても意味は落ちない
+fn live_badge(accent: tako_core::Rgb) -> gpui::Div {
+    div()
+        .flex_none()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(3.0))
+        .text_size(px(9.0))
+        .text_color(hsla(accent))
+        .child(div().w(px(5.0)).h(px(5.0)).rounded_full().bg(hsla(accent)))
+        .child("LIVE")
+}
+
 /// Markdown ブロック内の 1 選択行ぶんの選択・検索ハイライト（Issue #656）。
 /// 表だけが 1 ブロックに複数行（セル）を持つため、ブロック単位ではなく行単位で渡す
 #[derive(Default)]
@@ -680,7 +696,7 @@ impl TakoApp {
 
     /// プレビュー対象が中身（サムネイルにできる端末）を持つか。空ならポップアップ /
     /// ピンを出さない（端末なしの単一ペイン・空グループ）
-    fn preview_has_content(&self, target: PreviewTarget) -> bool {
+    pub(crate) fn preview_has_content(&self, target: PreviewTarget) -> bool {
         match target {
             PreviewTarget::Pane(pane_id) => self.terminals.contains_key(&pane_id),
             PreviewTarget::ClosedGroup(tab) => self
@@ -835,13 +851,7 @@ impl TakoApp {
                     .child(SharedString::from(truncate(&label, 40))),
             );
         if live {
-            titlebar = titlebar.child(
-                div()
-                    .flex_none()
-                    .text_size(px(9.0))
-                    .text_color(hsla(theme.accent))
-                    .child("● LIVE"),
-            );
+            titlebar = titlebar.child(live_badge(theme.accent));
         }
         if let Some(extra) = extra_title {
             titlebar = titlebar.child(extra);
@@ -952,30 +962,50 @@ impl TakoApp {
                                     .text_ellipsis()
                                     .child(SharedString::from(truncate(&label, 28))),
                             )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .text_size(px(9.0))
-                                    .text_color(hsla(theme.accent))
-                                    .child("● LIVE"),
-                            )
+                            // #1579: 印が**実ピクセルで描かれている**ことを visual-test が
+                            // 読むための実矩形（`ui_asset!` の登録漏れは無言で消える = #562）
+                            .child(live_badge(theme.accent).relative().child(
+                                crate::tab_shape::probe_canvas(
+                                    self.panel_click_probe_bounds.clone(),
+                                    format!("pin-live-{key}"),
+                                ),
+                            ))
                             .child(
                                 div()
                                     .id(("pin-close", key))
+                                    .relative()
                                     .flex_none()
                                     .px_1()
                                     .rounded_sm()
                                     .cursor_pointer()
                                     .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8))
+                                    .flex()
+                                    .items_center()
                                     .hover(|d| {
                                         d.bg(rgba_alpha(theme.red, 0.25))
                                             .text_color(hsla(theme.foreground))
                                     })
-                                    .child("×")
+                                    // 印はグリフではなく描画プリミティブで描く（#1579）。
+                                    // 色は svg 自身に置く（`svg()` は親の `text_color` を
+                                    // 継承しない = #1491 と同じ罠）
+                                    .child(
+                                        svg()
+                                            .path(crate::file_icons::ui_icon::CLOSE)
+                                            .w(px(10.0))
+                                            .h(px(10.0))
+                                            .text_color(hsla_alpha(
+                                                theme.tab_inactive_foreground,
+                                                0.8,
+                                            )),
+                                    )
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.set_pin(target, Some(false));
                                         cx.notify();
-                                    })),
+                                    }))
+                                    .child(crate::tab_shape::probe_canvas(
+                                        self.panel_click_probe_bounds.clone(),
+                                        format!("pin-close-{key}"),
+                                    )),
                             ),
                     )
                     .child(self.preview_content(target))

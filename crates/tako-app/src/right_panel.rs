@@ -433,7 +433,9 @@ impl TakoApp {
                         .text_size(px(10.0))
                         .text_color(hsla(theme.accent))
                         .bg(rgba_alpha(theme.accent, 0.15))
-                        .child("⎇ tmux"),
+                        // 印はグリフで描かない（#1579）。`⎇`（U+2387）は多くのフォントに
+                        // 無く豆腐になるうえ、意味は語（`tmux`）が全部持っている
+                        .child("tmux"),
                 )
                 .child(
                     div()
@@ -463,7 +465,15 @@ impl TakoApp {
                                 Some((kill_name.clone(), None, kill_socket.clone()));
                             cx.notify();
                         }))
-                        .child("×"),
+                        // 印はグリフではなく描画プリミティブで描く（#1579）。色は svg 自身に
+                        // 置く（`svg()` は親の `text_color` を継承しない = #1491 と同じ罠）
+                        .child(
+                            svg()
+                                .path(ui_icon::CLOSE)
+                                .w(px(10.0))
+                                .h(px(10.0))
+                                .text_color(hsla_alpha(theme.red, 0.8)),
+                        ),
                 ),
         );
         for (w_index, label) in &session.windows {
@@ -1762,7 +1772,15 @@ impl TakoApp {
                                     this.pending_pane_kill = Some(pane);
                                     cx.notify();
                                 }))
-                                .child("×"),
+                                // 印はグリフではなく描画プリミティブで描く（#1579）。色は svg 自身に
+                                // 置く（`svg()` は親の `text_color` を継承しない = #1491 と同じ罠）
+                                .child(
+                                    svg()
+                                        .path(ui_icon::CLOSE)
+                                        .w(px(10.0))
+                                        .h(px(10.0))
+                                        .text_color(hsla_alpha(theme.red, 0.8)),
+                                ),
                         ),
                 );
                 if pending_pane == Some(pane) {
@@ -2127,7 +2145,15 @@ impl TakoApp {
                                         Some((kill_name.clone(), None, kill_socket.clone()));
                                     cx.notify();
                                 }))
-                                .child("×"),
+                                // 印はグリフではなく描画プリミティブで描く（#1579）。色は svg 自身に
+                                // 置く（`svg()` は親の `text_color` を継承しない = #1491 と同じ罠）
+                                .child(
+                                    svg()
+                                        .path(ui_icon::CLOSE)
+                                        .w(px(10.0))
+                                        .h(px(10.0))
+                                        .text_color(hsla_alpha(theme.red, 0.8)),
+                                ),
                         ),
                 );
             // メタデータ行（#183: プロセス / cwd / 最終アクティビティ）
@@ -2201,7 +2227,15 @@ impl TakoApp {
                                     Some((kill_name.clone(), Some(w_index), kill_socket.clone()));
                                 cx.notify();
                             }))
-                            .child("×"),
+                            // 印はグリフではなく描画プリミティブで描く（#1579）。色は svg 自身に
+                            // 置く（`svg()` は親の `text_color` を継承しない = #1491 と同じ罠）
+                            .child(
+                                svg()
+                                    .path(ui_icon::CLOSE)
+                                    .w(px(10.0))
+                                    .h(px(10.0))
+                                    .text_color(hsla_alpha(theme.red, 0.8)),
+                            ),
                     )
             }));
             // 誤爆防止のインライン確認（FR-2.13.3 / FR-2.16.8）
