@@ -2,6 +2,7 @@
 /**
  * Starlight の Footer を拡張して、全ページ共通の法務リンクを足す。
  *
+ * - 「tako のデータの扱い」は tako アプリが送る・保存する情報の説明（`privacy.md`）。
  * - 「プライバシーポリシー」は takushio2525.com 一族で共通の 1 ページ（正本はハブ側）。
  * - 「Cookie 設定」は `data-tk-consent-open` が付いているので、consent.js が
  *   その場で同意バナーを開き直す（遷移しない）。consent.js が動かない環境では
@@ -21,6 +22,7 @@ import StarlightFooter from '@astrojs/starlight/components/Footer.astro';
 <StarlightFooter />
 
 <div class="tako-legal">
+  <a href="/privacy/">tako のデータの扱い</a>
   <a href="https://takushio2525.com/privacy/">プライバシーポリシー</a>
   <a href="https://takushio2525.com/privacy/#cookie" data-tk-consent-open>Cookie 設定</a>
 </div>
