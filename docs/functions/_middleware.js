@@ -6,16 +6,25 @@
 // `_redirects` はホスト名を条件に書けないので使えない。
 //
 // 完全一致で見るのは、プレビュー配備（<hash>.tako-docs.pages.dev）を転送しないため。
-// 後方一致にすると、本番へ出す前の確認ができなくなる。
+// 後方一致にすると、本番へ出す前の確認ができなくなる。ただし FQDN の末尾ドット
+// （`tako-docs.pages.dev.`）は同じホストなので、落としてから比べる。
+//
+// 転送先はスキーム・ホスト・ポートをすべて固定し、要求から持ち越すのはパスと
+// クエリだけにする（代替ポート `:8443` で来た要求をポート付きのまま送らない）。
+// `new URL(pathname, 'https://…')` で組み立て直さないこと: パスが `//evil.example`
+// のとき、スキーム相対の URL として別ホストへ解決されてしまう。
+// 境界の検査は scripts/test-middleware.mjs（CI の docs 節から走る）。
 
 const LEGACY_HOST = 'tako-docs.pages.dev';
 const CANONICAL_HOST = 'tako.takushio2525.com';
 
 export const onRequest = (context) => {
 	const url = new URL(context.request.url);
-	if (url.hostname !== LEGACY_HOST) {
+	if (url.hostname.replace(/\.$/, '') !== LEGACY_HOST) {
 		return context.next();
 	}
+	url.protocol = 'https:';
 	url.hostname = CANONICAL_HOST;
+	url.port = '';
 	return Response.redirect(url.toString(), 301);
 };

@@ -29,7 +29,7 @@ export default defineConfig({
 				{
 					tag: 'script',
 					content:
-						"if (location.hostname === 'tako-docs.pages.dev') {" +
+						"if (location.hostname.replace(/\\.$/, '') === 'tako-docs.pages.dev') {" +
 						"location.replace('https://tako.takushio2525.com' + location.pathname + location.search + location.hash);" +
 						"}",
 				},

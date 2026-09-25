@@ -1,0 +1,20 @@
+# Cloudflare Pages の配信ヘッダ（ビルドで dist/ 直下へそのまま写る）。
+#
+# 検査は scripts/verify-headers.mjs（CI の docs 節から走る）。値を変えたらそちらも直す。
+#
+# CSP はスクリプトの出どころを縛らない。縛るには Starlight のインラインスクリプト
+# （テーマ・サイドバー）と GA / 同意バナー（takushio2525.com/consent/consent.js）の
+# 送信先を漏れなく許可し、検索（Pagefind）の WebAssembly に 'wasm-unsafe-eval' を
+# 足す必要があり、1 つ漏れるだけで検索や計測が黙って止まる。利用者の入力を描く
+# 箇所の無い静的サイトなので、埋め込み・<base>・<object>・フォーム送信先だけを閉じる。
+#
+# Referrer-Policy と X-Content-Type-Options は Pages の既定値と同じだが、既定値に
+# 頼らず明示しておく。
+
+/*
+  Strict-Transport-Security: max-age=31536000; includeSubDomains
+  Content-Security-Policy: frame-ancestors 'none'; base-uri 'self'; object-src 'none'; form-action 'self'; upgrade-insecure-requests
+  X-Frame-Options: DENY
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: accelerometer=(), browsing-topics=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()
