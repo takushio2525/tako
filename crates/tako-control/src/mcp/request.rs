@@ -286,6 +286,10 @@ pub(super) fn build_request(
             direction: direction_arg(args)?,
             focus: bool_arg(args, "focus")?,
             new_tab: bool_arg(args, "new_tab")?.unwrap_or(false),
+            // #1676: 1 始まり。負値は `u64_arg` が「非負整数で指定する」で弾き、
+            // 0 と丸めは dispatch（open_plan）が 1 実装で見る
+            line: u64_arg(args, "line")?.map(|v| v as usize),
+            column: u64_arg(args, "column")?.map(|v| v as usize),
         },
         "tako_preview_view" => Request::PreviewView {
             pane: Some(target_pane(args, caller)?),

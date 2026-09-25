@@ -621,6 +621,20 @@ pub trait UiStateHost {
 // PreviewHost — プレビュー + 編集 + 動画（17 メソッド）
 // ---------------------------------------------------------------------------
 
+/// 行指定つきで開いたときの着地点（FR-3.27 / #1676）。
+///
+/// `line` / `column` は**丸めた後**の実値（1 始まり）で、`clamped` はどちらかが
+/// 文書の外だったことを示す。`item` は仮想リストの item 番号（0 始まり）で、
+/// 行ジャンプの着地は code 表示に倒すので常に `line - 1`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreviewLineTarget {
+    pub line: usize,
+    pub column: Option<usize>,
+    pub total_lines: usize,
+    pub item: usize,
+    pub clamped: bool,
+}
+
 pub trait PreviewHost {
     /// ペインのプレビュー状態（FR-3.2。`(path, mode)`。プレビューペインでなければ None）
     fn preview_state(&self, _pane: PaneId) -> Option<(String, crate::protocol::PreviewModeWire)> {
@@ -646,6 +660,19 @@ pub trait PreviewHost {
         _update: PreviewViewUpdate,
     ) -> Result<PreviewViewState, String> {
         Err("PDF・画像プレビューのズームは未対応".into())
+    }
+    /// 開いた直後にその行へ着地させる（FR-3.27 / #1676）。
+    ///
+    /// 仮想リスト（`ListState`）は**描画のときに作られる**ので、dispatch の時点では
+    /// まだ飛べない。実装側は「次に描くとき 1 度だけ飛ぶ」予約を置き、丸めた後の
+    /// 実値を返す。`line` / `column` はどちらも 1 始まり
+    fn reveal_preview_line(
+        &mut self,
+        _pane: PaneId,
+        _line: usize,
+        _column: Option<usize>,
+    ) -> Result<PreviewLineTarget, String> {
+        Err("行ジャンプは未対応".into())
     }
     /// ロード時に構築済みの Markdown / PDF アウトライン。
     fn preview_outline(&self, _pane: PaneId) -> Option<PreviewOutline> {

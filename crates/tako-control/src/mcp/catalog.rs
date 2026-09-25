@@ -786,8 +786,11 @@ pub fn tools() -> Vec<Value> {
                 起動しない）。direction を指定すると再利用せず必ずその方向へ分割して開く\
                 （表示位置を制御したいとき）。new_tab を指定すると新しいタブ 1 枚を\
                 そのファイル専用にする（Finder の「このアプリケーションで開く」と同じ表示）。\
+                line を指定すると開いた直後にその行へ飛ぶ（定義・参照の着地点）。\
                 「このファイルを見て」「成果物を確認して」の\
-                提示に使うこと。相対パスは pane の cwd 基準で解決する。",
+                提示に使うこと。相対パスは pane の cwd 基準で解決する。\
+                応答の line / column / item / total_lines / clamped は実際の着地点で、\
+                clamped=true は要求が文書の外だったので丸めたことを表す。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -805,6 +808,8 @@ pub fn tools() -> Vec<Value> {
                     },
                     "focus": { "type": "boolean", "description": "true にするとプレビューペインにフォーカスを移す（省略時は false = 元ペインを維持）" },
                     "new_tab": { "type": "boolean", "description": "true にすると新しいタブを作り、そのタブ 1 枚をこのファイル専用のプレビューにする（タブ名はファイル名。ターミナルは起動しない）。いまのタブを一切動かさず別物として見せたいときに使う。direction とは排他" },
+                    "line": { "type": "integer", "minimum": 1, "description": "開いた直後に飛ぶ行（1 始まり。行数を超えたら末尾行へ丸める）。指定すると mode は code になる（Markdown のレンダリング表示は原文の行が残らないため）。画像・PDF・動画にはエラー" },
+                    "column": { "type": "integer", "minimum": 1, "description": "着地する桁（1 始まりの文字単位。line と一緒に指定する。行末の次まで受け、超えたぶんは丸める）" },
                 },
                 "required": ["path"],
                 "additionalProperties": false,

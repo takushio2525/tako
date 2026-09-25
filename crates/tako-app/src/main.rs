@@ -2232,6 +2232,11 @@ struct TakoApp {
     /// 見た目を変えずに可視部分だけ描ける。値は (状態, 中身の種別, 構築時の item 数) で、
     /// **種別か item 数が変われば作り直す**（同じ行数で code ⇄ md が入れ替わる事故を防ぐ）
     preview_body_lists: HashMap<PaneId, (gpui::ListState, PreviewBodyKind, usize)>,
+    /// 開いた直後に飛ぶ先（FR-3.27 / #1676）。値は仮想リストの item 番号（0 始まり）で、
+    /// 行ジャンプは code 表示へ倒すので `line - 1` と一致する。`ListState` は
+    /// **描くときに作られる**ので `OpenFile` を処理している時点ではまだ飛べず、
+    /// 次の描画で 1 度だけ効かせて外す
+    preview_pending_reveal: HashMap<PaneId, usize>,
     /// プレビュー本文の行頭バイトオフセット（#821 / #826）。仮想化で行を飛ばして
     /// 描くため、`doc_offset` の逐次加算では検索ヒット範囲を決められない
     preview_line_starts: HashMap<PaneId, Vec<usize>>,
@@ -4070,6 +4075,7 @@ impl TakoApp {
             preview_pdf_page_image_bounds: HashMap::new(),
             preview_text_layouts: HashMap::new(),
             preview_body_lists: HashMap::new(),
+            preview_pending_reveal: HashMap::new(),
             preview_md_block_index: HashMap::new(),
             preview_line_starts: HashMap::new(),
             preview_line_texts: HashMap::new(),
@@ -14855,6 +14861,8 @@ impl TakoApp {
                     direction,
                     focus: Some(true),
                     new_tab: false,
+                    line: None,
+                    column: None,
                 },
                 PaneOrigin::User,
             );
@@ -14880,6 +14888,8 @@ impl TakoApp {
                     direction: None,
                     focus: Some(true),
                     new_tab: false,
+                    line: None,
+                    column: None,
                 },
                 PaneOrigin::User,
             );
@@ -21722,6 +21732,49 @@ impl PreviewHost for TakoApp {
         Ok(state)
     }
 
+    fn reveal_preview_line(
+        &mut self,
+        pane: PaneId,
+        line: usize,
+        column: Option<usize>,
+    ) -> Result<tako_control::PreviewLineTarget, String> {
+        let preview = self
+            .previews
+            .get(&pane)
+            .ok_or_else(|| "プレビューペインではない".to_string())?;
+        // 行指定の表示種別は dispatch が code へ倒してある（#1676）。ここで
+        // `Code` 以外なのは「拡張子はテキストなのに中身が読めない」= 読み込みの
+        // 劣化（`PreviewContent::Error`）だけなので、理由をそのまま返す
+        let preview::PreviewContent::Code(lines) = &preview.content else {
+            return Err(match &preview.content {
+                preview::PreviewContent::Error(message) => message.clone(),
+                _ => "テキストとして行を数えられない".into(),
+            });
+        };
+        let total_lines = lines.len();
+        let (line, line_clamped) = tako_core::open_plan::clamp_line(total_lines, line)?;
+        let column = match column {
+            Some(column) => {
+                // 桁は**文字**単位（UTF-8 のバイト数ではない）
+                let chars = lines
+                    .get(line - 1)
+                    .map(|spans| spans.iter().map(|s| s.text.chars().count()).sum())
+                    .unwrap_or(0);
+                Some(tako_core::open_plan::clamp_column(chars, column)?)
+            }
+            None => None,
+        };
+        let item = line - 1;
+        self.preview_pending_reveal.insert(pane, item);
+        Ok(tako_control::PreviewLineTarget {
+            line,
+            column: column.map(|(column, _)| column),
+            total_lines,
+            item,
+            clamped: line_clamped || column.is_some_and(|(_, clamped)| clamped),
+        })
+    }
+
     fn preview_outline(&self, pane: PaneId) -> Option<tako_core::PreviewOutline> {
         let preview = self.previews.get(&pane)?;
         matches!(
@@ -22093,6 +22146,8 @@ impl PreviewHost for TakoApp {
         self.preview_pdf_page_image_bounds.remove(&pane);
         self.preview_text_layouts.remove(&pane);
         self.preview_body_lists.remove(&pane);
+        // #1676: 前のファイルへの着地予約は持ち越さない（行番号の意味が変わる）
+        self.preview_pending_reveal.remove(&pane);
         // #826: 中身が変わればブロック索引の意味も変わる（次の md 描画で作り直す）
         self.preview_md_block_index.remove(&pane);
         self.preview_line_starts.remove(&pane);
@@ -30614,6 +30669,8 @@ mod self_test {
                         direction: Some(tako_control::protocol::Direction::Right),
                         focus: Some(false),
                         new_tab: false,
+                        line: None,
+                        column: None,
                     },
                     PaneOrigin::Cli,
                 )
@@ -30924,6 +30981,8 @@ mod self_test {
                         direction: Some(tako_control::protocol::Direction::Right),
                         focus: Some(true),
                         new_tab: false,
+                        line: None,
+                        column: None,
                     },
                     PaneOrigin::Cli,
                 )
@@ -31689,6 +31748,8 @@ mod self_test {
                         direction: None,
                         focus: Some(true),
                         new_tab: false,
+                        line: None,
+                        column: None,
                     },
                     PaneOrigin::Cli,
                 );
@@ -32916,6 +32977,8 @@ mod self_test {
                                 direction: Some(tako_control::protocol::Direction::Right),
                                 focus: Some(true),
                                 new_tab: false,
+                                line: None,
+                                column: None,
                             },
                             PaneOrigin::Cli,
                         )
@@ -34381,6 +34444,8 @@ mod self_test {
                         direction: Some(tako_control::protocol::Direction::Right),
                         focus: Some(true),
                         new_tab: false,
+                        line: None,
+                        column: None,
                     },
                     PaneOrigin::Cli,
                 )
@@ -34683,6 +34748,8 @@ mod self_test {
                             direction: Some(tako_control::protocol::Direction::Right),
                             focus: Some(false),
                             new_tab: false,
+                            line: None,
+                            column: None,
                         },
                         PaneOrigin::Cli,
                     )
@@ -36125,6 +36192,8 @@ mod self_test {
                             direction: Some(dir),
                             focus: Some(false),
                             new_tab: false,
+                            line: None,
+                            column: None,
                         },
                         PaneOrigin::User,
                     )
@@ -37624,6 +37693,8 @@ mod self_test {
                             direction: None,
                             focus: None,
                             new_tab: false,
+                            line: None,
+                            column: None,
                         },
                         PaneOrigin::Cli,
                     )
@@ -37703,6 +37774,8 @@ mod self_test {
                                 direction: None,
                                 focus: None,
                                 new_tab: false,
+                                line: None,
+                                column: None,
                             },
                             PaneOrigin::Cli,
                         )
@@ -41194,6 +41267,8 @@ mod self_test {
                         direction: Some(tako_control::protocol::Direction::Right),
                         focus: Some(false),
                         new_tab: false,
+                        line: None,
+                        column: None,
                     },
                     PaneOrigin::Cli,
                 )
@@ -46387,6 +46462,8 @@ mod self_test {
                             direction: None,
                             focus: None,
                             new_tab: false,
+                            line: None,
+                            column: None,
                         },
                         PaneOrigin::Cli,
                     )
@@ -47042,6 +47119,8 @@ mod self_test {
                             direction: None,
                             focus: None,
                             new_tab: false,
+                            line: None,
+                            column: None,
                         },
                         PaneOrigin::Cli,
                     )
@@ -47203,6 +47282,8 @@ mod self_test {
                             direction: None,
                             focus: None,
                             new_tab: false,
+                            line: None,
+                            column: None,
                         },
                         PaneOrigin::Cli,
                     )
@@ -47469,6 +47550,8 @@ mod self_test {
                                 direction: None,
                                 focus: None,
                                 new_tab: false,
+                                line: None,
+                                column: None,
                             },
                             PaneOrigin::Cli,
                         )
@@ -47529,6 +47612,8 @@ mod self_test {
                             direction: None,
                             focus: None,
                             new_tab: false,
+                            line: None,
+                            column: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -47567,6 +47652,8 @@ mod self_test {
                                 direction: None,
                                 focus: None,
                                 new_tab: false,
+                                line: None,
+                                column: None,
                             },
                             PaneOrigin::Cli,
                         )
@@ -47809,6 +47896,8 @@ mod self_test {
                                 direction: None,
                                 focus: None,
                                 new_tab: false,
+                                line: None,
+                                column: None,
                             },
                             PaneOrigin::Cli,
                         );
@@ -49639,6 +49728,8 @@ mod self_test {
                                 direction,
                                 focus: None,
                                 new_tab: false,
+                                line: None,
+                                column: None,
                             },
                             PaneOrigin::Cli,
                         )
@@ -49771,6 +49862,8 @@ mod self_test {
                                 direction: None,
                                 focus: None,
                                 new_tab: false,
+                                line: None,
+                                column: None,
                             },
                             PaneOrigin::Cli,
                         )
@@ -50292,6 +50385,8 @@ mod self_test {
                                 direction: None,
                                 focus: None,
                                 new_tab: false,
+                                line: None,
+                                column: None,
                             },
                             PaneOrigin::Cli,
                         )
@@ -52273,6 +52368,8 @@ mod self_test {
                                 direction: None,
                                 focus: Some(true),
                                 new_tab: false,
+                                line: None,
+                                column: None,
                             },
                             PaneOrigin::Cli,
                         )
@@ -53677,6 +53774,8 @@ mod self_test {
                                 direction: None,
                                 focus: Some(false),
                                 new_tab: true,
+                                line: None,
+                                column: None,
                             },
                             PaneOrigin::Cli,
                         )
@@ -53861,6 +53960,8 @@ mod self_test {
                                 direction: None,
                                 focus: Some(false),
                                 new_tab: true,
+                                line: None,
+                                column: None,
                             },
                             PaneOrigin::Cli,
                         )
@@ -61886,6 +61987,8 @@ mod self_test {
                         direction: Some(tako_control::protocol::Direction::Down),
                         focus: Some(false),
                         new_tab: false,
+                        line: None,
+                        column: None,
                     },
                     cx,
                 );
@@ -64138,6 +64241,8 @@ mod self_test {
                                 direction: Some(tako_control::protocol::Direction::Right),
                                 focus: Some(false),
                                 new_tab: false,
+                                line: None,
+                                column: None,
                             },
                             PaneOrigin::Cli,
                         );
@@ -64634,6 +64739,8 @@ mod self_test {
                                     direction: Some(tako_control::protocol::Direction::Right),
                                     focus: Some(false),
                                     new_tab: false,
+                                    line: None,
+                                    column: None,
                                 },
                                 PaneOrigin::Cli,
                             );
@@ -67324,6 +67431,8 @@ mod self_test {
                                     direction: Some(tako_control::protocol::Direction::Right),
                                     focus: Some(false),
                                     new_tab: false,
+                                    line: None,
+                                    column: None,
                                 },
                                 PaneOrigin::Cli,
                             );
@@ -67396,6 +67505,8 @@ mod self_test {
                                     direction: Some(tako_control::protocol::Direction::Right),
                                     focus: Some(false),
                                     new_tab: false,
+                                    line: None,
+                                    column: None,
                                 },
                                 PaneOrigin::Cli,
                             );
@@ -71826,6 +71937,8 @@ mod self_test {
                                 direction: None,
                                 focus: None,
                                 new_tab: false,
+                                line: None,
+                                column: None,
                             },
                             PaneOrigin::Cli,
                         ) {
@@ -74431,6 +74544,213 @@ mod self_test {
                     }
                 }
                 let _ = std::fs::remove_dir_all(&repo149);
+            }
+
+            // --- 項目 153: 開いた直後にその行へ着地する（FR-3.27 / #1676） ---
+            //
+            // LSP の `textDocument/definition` は `Location { uri, range }` を返すので、
+            // パスだけでは着地できない。`OpenFile` の `line` が「開く」と「その行を
+            // 見せる」を 1 回で済ませることを、**実際の `ListState` の位置**で見る。
+            //
+            // 機序（#826 の実測）: 仮想リストは論理位置で飛ぶので、**一度も描かれて
+            // いない行へも届く**。`ListState` は描くときに作られるため、dispatch は
+            // 予約を置くだけで、飛ぶのは次の描画（`consume_pending_reveal`）。
+            //
+            // 見るのは 4 つ:
+            //   (a) 中ほどの行（42）は**可視先頭 item** がその行になる
+            //   (b) 先頭の行（1）は 0 へ戻る（前の位置を引きずらない）
+            //   (c) 行数を超えた要求は末尾行へ丸め、その行が**画面に入る**
+            //   (d) 末尾近く（4990）は GPUI が手前へ寄せる（先頭 item は一致しない）が、
+            //       狙った行は画面に入る = 「着地した」の判定は可視範囲で見る
+            //
+            // 「画面に入る」は整形済みかどうかでは見ない（overdraw = 600px ぶんは
+            // 画面外も組まれる）。行の実矩形が**ビューポートの中**にあるかで判定する。
+            //
+            // 判定は**新しい挙動を無条件に主張する**（項目 149 と同じ作法）。
+            // `TAKO_1676_LEGACY=1` を立てると着地が起きないのでこの項目は FAILED になり、
+            // それが A/B の実測になる。dispatch の応答（`line` / `item`）は legacy でも
+            // 同じ値を返すので、**応答だけ見る判定では差が出ない**
+            {
+                use tako_control::protocol::Request as Req;
+                let dir1676 =
+                    std::env::temp_dir().join(format!("tako-1676-{}", std::process::id()));
+                let _ = std::fs::create_dir_all(&dir1676);
+                let src1676 = dir1676.join("big.rs");
+                const LINES_1676: usize = 5000;
+                let body1676: String = (1..=LINES_1676)
+                    .map(|i| format!("// 行 {i} :: MARK_1676_{i}\n"))
+                    .collect();
+                let _ = std::fs::write(&src1676, &body1676);
+
+                let open1676 = |cx: &mut AsyncApp,
+                                pane: Option<u64>,
+                                direction: Option<tako_control::protocol::Direction>,
+                                line: Option<usize>|
+                 -> Option<serde_json::Value> {
+                    window
+                        .update(cx, |app: &mut TakoApp, _, cx| {
+                            let r = tako_control::dispatch(
+                                app,
+                                Req::OpenFile {
+                                    pane,
+                                    path: src1676.display().to_string(),
+                                    mode: None,
+                                    direction,
+                                    focus: Some(false),
+                                    new_tab: false,
+                                    line,
+                                    column: None,
+                                },
+                                PaneOrigin::Cli,
+                            );
+                            cx.notify();
+                            r.ok()
+                        })
+                        .ok()
+                        .flatten()
+                };
+
+                // 検証用のプレビューペインを 1 枚生やす（以降は同じペインを差し替える）
+                let anchor1676 = window.update(cx, |app: &mut TakoApp, _, _| app.focused_pane()).ok();
+                let pane1676 = anchor1676
+                    .and_then(|a| {
+                        open1676(
+                            cx,
+                            Some(a.as_u64()),
+                            Some(tako_control::protocol::Direction::Right),
+                            None,
+                        )
+                    })
+                    .and_then(|v| v["pane"].as_u64())
+                    .map(PaneId::from_raw);
+                let Some(pane1676) = pane1676 else {
+                    fail("153: 検証用プレビューペインを開けない (#1676)")
+                };
+
+                // 行が画面に入っているか（矩形で見る）と、可視先頭 item を採る。
+                // **読む前に 1 フレーム描く**のは呼び出し側（#786 のキャッシュ対策）
+                let probe1676 = |cx: &mut AsyncApp, line: usize| -> (Option<usize>, bool) {
+                    window
+                        .update(cx, |app: &mut TakoApp, _, _| {
+                            let top = app
+                                .preview_body_lists
+                                .get(&pane1676)
+                                .map(|(list, _, _)| list.logical_scroll_top().item_ix);
+                            let visible = match (
+                                app.preview_viewport_bounds(pane1676),
+                                app.preview_text_layouts
+                                    .get(&pane1676)
+                                    .and_then(|l| l.get(line - 1).cloned())
+                                    .flatten(),
+                            ) {
+                                (Some(view), Some(layout)) => {
+                                    let b = layout.bounds();
+                                    b.top() >= view.top() - px(1.0)
+                                        && b.bottom() <= view.bottom() + px(1.0)
+                                }
+                                _ => false,
+                            };
+                            (top, visible)
+                        })
+                        .unwrap_or((None, false))
+                };
+
+                // 4 つの行指定を順に投げ、そのたびに「狙った行が画面へ入る」まで
+                // **状態で**待つ（固定窓で測らない。上限は混み具合で伸ばすだけ）
+                const CASES_1676: [usize; 4] = [42, 1, 999_999, 4990];
+                let mut landed1676: Vec<(Option<serde_json::Value>, Option<usize>, bool)> =
+                    Vec::with_capacity(CASES_1676.len());
+                for requested in CASES_1676 {
+                    let response = open1676(cx, Some(pane1676.as_u64()), None, Some(requested));
+                    let landed = response
+                        .as_ref()
+                        .and_then(|v| v["line"].as_u64())
+                        .unwrap_or(requested as u64) as usize;
+                    let deadline = std::time::Instant::now()
+                        + state_wait_budget(Duration::from_secs(20), machine_busy());
+                    let probe = loop {
+                        notify_and_draw(any, window, cx);
+                        let probe = probe1676(cx, landed);
+                        if probe.1 || std::time::Instant::now() >= deadline {
+                            break probe;
+                        }
+                        cx.background_executor()
+                            .timer(Duration::from_millis(100))
+                            .await;
+                    };
+                    landed1676.push((response, probe.0, probe.1));
+                }
+                let mut cases1676 = landed1676.into_iter();
+                let (res_a, top_a, visible_a) = cases1676.next().unwrap_or((None, None, false));
+                println!(
+                    "TAKO_SELF_TEST_1676_A: requested=42 line={:?} item={:?} total={:?} \
+                     clamped={:?} top_ix={top_a:?} visible={visible_a}",
+                    res_a.as_ref().and_then(|v| v["line"].as_u64()),
+                    res_a.as_ref().and_then(|v| v["item"].as_u64()),
+                    res_a.as_ref().and_then(|v| v["total_lines"].as_u64()),
+                    res_a.as_ref().and_then(|v| v["clamped"].as_bool()),
+                );
+                check(
+                    res_a.as_ref().and_then(|v| v["line"].as_u64()) == Some(42)
+                        && res_a.as_ref().and_then(|v| v["item"].as_u64()) == Some(41)
+                        && res_a.as_ref().and_then(|v| v["mode"].as_str()) == Some("code"),
+                    &format!("153a: 応答が着地点を返す (#1676。{res_a:?})"),
+                );
+                check(
+                    top_a == Some(41) && visible_a,
+                    &format!(
+                        "153a: 開いた直後の可視先頭 item が指した行 (#1676。\
+                         top_ix={top_a:?} visible={visible_a})"
+                    ),
+                );
+
+                // (b) 先頭へ戻す: 前の位置を引きずらない
+                let (_, top_b, visible_b) = cases1676.next().unwrap_or((None, None, false));
+                println!("TAKO_SELF_TEST_1676_B: requested=1 top_ix={top_b:?} visible={visible_b}");
+                check(
+                    top_b == Some(0) && visible_b,
+                    &format!("153b: 行 1 は先頭へ戻る (#1676。top_ix={top_b:?})"),
+                );
+
+                // (c) 行数超過は末尾行へ丸め、その行が画面に入る
+                let (res_c, top_c, visible_c) = cases1676.next().unwrap_or((None, None, false));
+                println!(
+                    "TAKO_SELF_TEST_1676_C: requested=999999 line={:?} clamped={:?} \
+                     top_ix={top_c:?} visible={visible_c}",
+                    res_c.as_ref().and_then(|v| v["line"].as_u64()),
+                    res_c.as_ref().and_then(|v| v["clamped"].as_bool()),
+                );
+                check(
+                    res_c.as_ref().and_then(|v| v["line"].as_u64()) == Some(LINES_1676 as u64)
+                        && res_c.as_ref().and_then(|v| v["clamped"].as_bool()) == Some(true)
+                        && visible_c,
+                    &format!("153c: 超過は末尾行へ丸めて見せる (#1676。{res_c:?} visible={visible_c})"),
+                );
+
+                // (d) 末尾近く: GPUI が手前へ寄せるので先頭 item は一致しないが、
+                // 狙った行は画面の中にいる（= 着地している）
+                let (_, top_d, visible_d) = cases1676.next().unwrap_or((None, None, false));
+                println!(
+                    "TAKO_SELF_TEST_1676_D: requested=4990 top_ix={top_d:?} visible={visible_d}"
+                );
+                check(
+                    visible_d && top_d.is_some_and(|ix| ix <= 4989),
+                    &format!("153d: 末尾近くの行も画面に入る (#1676。top_ix={top_d:?})"),
+                );
+
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        Req::Close {
+                            pane: Some(pane1676.as_u64()),
+                            force: true,
+                            caller_role: None,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    cx.notify();
+                });
+                let _ = std::fs::remove_dir_all(&dir1676);
             }
 
             // 後片付け: 隔離した接続情報ディレクトリを消す

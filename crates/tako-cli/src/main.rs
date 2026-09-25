@@ -2546,6 +2546,13 @@ struct OpenArgs {
     /// Finder の「このアプリケーションで開く」と同じ表示。#835）
     #[arg(long = "new-tab", conflicts_with_all = ["right", "down", "up", "left"])]
     new_tab: bool,
+    /// 開いた直後にこの行へ飛ぶ（1 始まり。行数を超えたら末尾行へ丸める）。
+    /// 指定すると表示は原文の行がそのまま残る code になる（#1676）
+    #[arg(long, allow_negative_numbers = true)]
+    line: Option<i64>,
+    /// 着地する桁（1 始まりの文字単位。--line と一緒に指定する）
+    #[arg(long, requires = "line", allow_negative_numbers = true)]
+    column: Option<i64>,
 }
 
 #[derive(Args)]
@@ -4794,6 +4801,8 @@ fn remote_start() -> Result<(), String> {
                     direction: None,
                     focus: Some(true),
                     new_tab: false,
+                    line: None,
+                    column: None,
                 });
                 eprintln!("スマホでスキャンしてください。");
             }
@@ -6894,6 +6903,17 @@ fn build_request(command: &Command) -> Result<Request, String> {
             tab: args.tab,
         },
         Command::Open(args) => {
+            // #1676: 負値・0 はここで弾く（文言の正本は open_plan。dispatch の
+            // `usize` は負値を持てないので、CLI 側だけがこの境界を見られる）
+            let one_based = |v: Option<i64>, message: &str| -> Result<Option<usize>, String> {
+                match v {
+                    Some(v) if v <= 0 => Err(format!("{message}: {v}")),
+                    Some(v) => Ok(Some(v as usize)),
+                    None => Ok(None),
+                }
+            };
+            let line = one_based(args.line, tako_core::open_plan::LINE_ONE_BASED)?;
+            let column = one_based(args.column, tako_core::open_plan::COLUMN_ONE_BASED)?;
             Request::OpenFile {
                 pane: target_pane(args.pane)?,
                 path: absolutize(&args.path),
@@ -6915,6 +6935,8 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 },
                 focus: if args.focus { Some(true) } else { None },
                 new_tab: args.new_tab,
+                line,
+                column,
             }
         }
         Command::Preview(args) => Request::PreviewView {
@@ -9733,6 +9755,8 @@ mod tests {
                 direction: None,
                 focus: None,
                 new_tab: false,
+                line: None,
+                column: None,
             }
         );
         // 相対パスは CLI の cwd で絶対化される
@@ -9756,6 +9780,56 @@ mod tests {
             panic!("OpenFile になる");
         };
         assert_eq!(direction, Some(Direction::Down));
+    }
+
+    /// #1676: `--line` / `--column` は 1 始まり。**負値は CLI にしか見えない**
+    /// （dispatch の `usize` は負値を持てない）ので、境界はここで見る。
+    ///
+    /// `--pane` は必ず名指しする（省略すると `target_pane` が `TAKO_PANE_ID` を読み、
+    /// tako の**中**で走らせたときだけ通る = CI と手元で結果が割れる。実際に CI の
+    /// macOS / Windows 両方で踏んだ）。隣の `openは絶対パスとモード別名を解釈する` も同じ形
+    #[test]
+    fn openの行と桁は1始まりで負値と0を弾く() {
+        let abs = if cfg!(windows) {
+            r"C:\tmp\a.rs"
+        } else {
+            "/tmp/a.rs"
+        };
+        let command = parse(&[
+            "tako", "open", abs, "--pane", "5", "--line", "42", "--column", "7",
+        ]);
+        let Request::OpenFile { line, column, .. } = build_request(&command).unwrap() else {
+            panic!("OpenFile になる");
+        };
+        assert_eq!((line, column), (Some(42), Some(7)));
+
+        // 省略時は従来どおり（行指定なし）
+        let command = parse(&["tako", "open", abs, "--pane", "5"]);
+        let Request::OpenFile { line, column, .. } = build_request(&command).unwrap() else {
+            panic!("OpenFile になる");
+        };
+        assert_eq!((line, column), (None, None));
+
+        // 0 と負値はエラー（文言の正本は open_plan の定数）
+        for value in ["0", "-1"] {
+            let command = parse(&["tako", "open", abs, "--pane", "5", "--line", value]);
+            let err = build_request(&command).unwrap_err();
+            assert!(
+                err.contains(tako_core::open_plan::LINE_ONE_BASED) && err.contains(value),
+                "--line {value}: {err}"
+            );
+            let command = parse(&[
+                "tako", "open", abs, "--pane", "5", "--line", "1", "--column", value,
+            ]);
+            let err = build_request(&command).unwrap_err();
+            assert!(
+                err.contains(tako_core::open_plan::COLUMN_ONE_BASED) && err.contains(value),
+                "--column {value}: {err}"
+            );
+        }
+
+        // --column は --line とセット（clap が引数解析の時点で弾く）
+        assert!(Cli::try_parse_from(["tako", "open", abs, "--column", "3"]).is_err());
     }
 
     #[test]

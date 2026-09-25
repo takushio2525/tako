@@ -48,6 +48,16 @@ pub(crate) fn preview_md_virtual_list_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("TAKO_826_NO_MD_VIRTUAL_LIST").is_some())
 }
 
+/// 行ジャンプ（#1676）の着地を切って同じバイナリで A/B を取る逃げ道
+/// （`TAKO_1676_LEGACY=1`）。旧挙動 = `line` を渡しても「開くだけ」で飛ばない。
+///
+/// 応答（`line` / `item`）は dispatch が返すので**そこだけ見ても差が出ない**。
+/// この腕を立てるとセルフテスト項目 153 が落ちる = 画面まで見ている証拠になる
+pub(crate) fn preview_line_reveal_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("TAKO_1676_LEGACY").is_some())
+}
+
 /// 旧挙動（全行を組む）。1 行の作り方は仮想化と同じ `render_preview_code_line` を
 /// 通すので、見た目は完全に一致する
 fn return_all_code_lines(
@@ -1404,6 +1414,16 @@ impl TakoApp {
                         // A/B 計測とトラブルシュート用の旧挙動（全行を組む）。
                         // 1 行の作り方は仮想化と同じ関数を通すので見た目は完全に一致する
                         self.preview_body_lists.remove(&pane_id);
+                        // #1676: 仮想化を切った A/B 経路（#821）は `ListState` を
+                        // 持たないので、旧来のスクロールハンドルで同じ行へ飛ばす
+                        if let Some(item) = self.preview_pending_reveal.remove(&pane_id) {
+                            if count > 0 && !preview_line_reveal_disabled() {
+                                self.preview_scroll_handles
+                                    .entry(pane_id)
+                                    .or_default()
+                                    .scroll_to_top_of_item(item.min(count - 1));
+                            }
+                        }
                         return_all_code_lines(self, pane_id, count, cx)
                     } else {
                         let list_state =
@@ -3520,6 +3540,7 @@ impl TakoApp {
         self.preview_line_starts.remove(&pane_id);
         self.preview_text_layouts.remove(&pane_id);
         self.preview_body_lists.remove(&pane_id);
+        self.preview_pending_reveal.remove(&pane_id);
         self.preview_md_block_index.remove(&pane_id);
         self.preview_changelogs.remove(&pane_id);
         self.preview_run_profiles.remove(&pane_id);
@@ -3571,6 +3592,46 @@ impl TakoApp {
     /// **種別が変わったとき（コード ⇄ md のモード切替）は持ち越さない**:
     /// item の意味が「行」から「ブロック」へ変わるので、同じ番号は別の場所を指す
     fn preview_body_list_state(
+        &mut self,
+        pane_id: PaneId,
+        kind: PreviewBodyKind,
+        count: usize,
+    ) -> gpui::ListState {
+        let state = self.preview_body_list_state_inner(pane_id, kind, count);
+        self.consume_pending_reveal(pane_id, kind, count, &state);
+        state
+    }
+
+    /// 開いた直後の着地予約（#1676）を**次の描画で 1 度だけ**効かせて外す。
+    ///
+    /// `dispatch` の時点では `ListState` がまだ無い（`set_preview` が捨てて、
+    /// ここで作り直す）ので、飛ぶのはこの位置になる。`ListState::scroll_to` は
+    /// #826 の実測どおり**一度も描かれていない item へも届く**ので、開いた直後の
+    /// ファイルでも目的の行へ落ちる。
+    ///
+    /// 行 → item が 1:1 なのは `Code` だけ（md は 1 item = 1 ブロック）なので、
+    /// 種別が合わないときは飛ばずに予約を捨てる。倒す判断そのものは
+    /// `tako_core::open_plan::preview_route_with_line` が dispatch 側で済ませている
+    fn consume_pending_reveal(
+        &mut self,
+        pane_id: PaneId,
+        kind: PreviewBodyKind,
+        count: usize,
+        state: &gpui::ListState,
+    ) {
+        let Some(item) = self.preview_pending_reveal.remove(&pane_id) else {
+            return;
+        };
+        if kind != PreviewBodyKind::Code || count == 0 || preview_line_reveal_disabled() {
+            return;
+        }
+        state.scroll_to(gpui::ListOffset {
+            item_ix: item.min(count - 1),
+            offset_in_item: px(0.0),
+        });
+    }
+
+    fn preview_body_list_state_inner(
         &mut self,
         pane_id: PaneId,
         kind: PreviewBodyKind,
