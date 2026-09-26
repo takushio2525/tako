@@ -42,7 +42,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{self, Event, EventListener, WindowSize};
 use alacritty_terminal::sync::FairMutex;
@@ -58,6 +58,19 @@ const READ_BUFFER_SIZE: usize = 0x10_0000;
 
 /// 1 回のロック中に処理する最大バイト数（upstream の `MAX_LOCKED_READ`）
 const MAX_LOCKED_READ: usize = u16::MAX as usize;
+
+/// 子の終了を観測してから PTY を読み切るときの「静かになった」判定（#1628）。
+/// この窓のあいだ 1 バイトも来なければ、もう来ないとみなす
+const EXIT_DRAIN_QUIET: Duration = Duration::from_millis(50);
+
+/// 同上の打ち切り上限。ペインが死ぬときに 1 回だけ通る段なので短くてよい（#1628）
+const EXIT_DRAIN_MAX: Duration = Duration::from_millis(500);
+
+/// A/B の旧経路アーム（`TAKO_1628_LEGACY=1`）。子の終了時に**読み切らずに畳む** =
+/// #817 の移植で落ちていた形へ戻す。検証専用で、既定では通らない
+fn legacy_1628_skip_drain() -> bool {
+    std::env::var("TAKO_1628_LEGACY").is_ok_and(|v| v == "1")
+}
 
 /// 読み取りバッファの初期サイズ。`MAX_LOCKED_READ` 以上の最小の 2 冪（64 KiB）。
 /// ロックが取れている通常経路はこのサイズで完結する
@@ -345,7 +358,7 @@ where
     }
 
     #[inline]
-    fn pty_read(&mut self, state: &mut State, buf: &mut Vec<u8>) -> io::Result<()> {
+    fn pty_read(&mut self, state: &mut State, buf: &mut Vec<u8>) -> io::Result<usize> {
         let mut unprocessed = 0;
         let mut processed = 0;
 
@@ -413,7 +426,47 @@ where
             self.notify_wakeup();
         }
 
-        Ok(())
+        // 呼び手が「まだ残っているか」を判断できるよう、処理したバイト数を返す
+        // （子の終了後の読み切り = `drain_after_child_exit` が使う。#1628）
+        Ok(processed)
+    }
+
+    /// 子の終了を観測したあと、PTY に残っているバイトを**読み切る**（#1628）。
+    ///
+    /// この段の直後で `break 'event_loop` するため、**ここで読み残した末尾は永久に
+    /// 失われる**（以後 PTY を読む者はいない）。子が短命なほど当たりやすく、実測では
+    /// Windows CI で `Write-Output` 3 行のうち 1 行目しか画面に入らなかった。
+    /// upstream alacritty は同じ位置に `drain_on_exit` の段を持つが、#817 の移植で
+    /// 「tako は使っていない」として落ちていた（実際は `..Options::default()` の
+    /// 既定 `false` を受け取っていただけで、tako が選んだ挙動ではなかった）。
+    ///
+    /// 読み手は両 OS とも**非ブロッキング**（Windows は `UnblockedReader::try_read`、
+    /// unix は `O_NONBLOCK` の master fd）なので、空なら即 0 が返りここで固まらない。
+    /// ただし Windows は別スレッドが中継するので「いま空 = もう来ない」とは限らず、
+    /// [`EXIT_DRAIN_QUIET`] のあいだ 1 バイトも来ないことをもって打ち切る
+    /// （上限は [`EXIT_DRAIN_MAX`]）。1 回の `pty_read` は `MAX_LOCKED_READ` で
+    /// 切り上げるので、**繰り返さないと 64 KiB より後ろが落ちる**
+    fn drain_after_child_exit(&mut self, state: &mut State, buf: &mut Vec<u8>) {
+        // A/B: #817 の形（読み切らずに畳む）へ戻す旧経路アーム
+        if legacy_1628_skip_drain() {
+            return;
+        }
+        let started = Instant::now();
+        let mut last_progress = Instant::now();
+        while started.elapsed() < EXIT_DRAIN_MAX {
+            match self.pty_read(state, buf) {
+                Ok(0) => {
+                    if last_progress.elapsed() >= EXIT_DRAIN_QUIET {
+                        return;
+                    }
+                    // 中継スレッドが次の塊を渡すまでの間、CPU を回し続けない
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Ok(_) => last_progress = Instant::now(),
+                // 読めなくなったらそこまで（PTY は既に畳まれている）
+                Err(_) => return,
+            }
+        }
     }
 
     #[inline]
@@ -506,6 +559,10 @@ where
                                 if let Some(ChildEvent::Exited(status)) =
                                     self.pty.next_child_event()
                                 {
+                                    // **知らせる前に読み切る**（#1628）。この先で PTY を
+                                    // 読む者はいないので、順序を逆にすると受け手は
+                                    // 「終了した」と分かった時点で末尾を読めない
+                                    self.drain_after_child_exit(&mut state, &mut buf);
                                     if let Some(status) = status {
                                         self.event_proxy.send_event(Event::ChildExit(status));
                                     }
