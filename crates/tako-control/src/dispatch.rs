@@ -2636,6 +2636,23 @@ fn dispatch_inner(
             .map_err(DispatchError::Operation)?;
             Ok(preview_edit_reply(host, target))
         }
+        Request::PreviewEditCommand {
+            pane,
+            command,
+            expected_version,
+        } => {
+            use tako_core::platform::editor_keys::EditorCommand;
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            let command = EditorCommand::from_edit_name(&command).ok_or_else(|| {
+                DispatchError::Operation(format!(
+                    "command は {} のどれか（{command:?} は無い）",
+                    EditorCommand::edit_names().join(" / ")
+                ))
+            })?;
+            host.run_preview_command(target, command, expected_version)
+                .map_err(DispatchError::Operation)?;
+            Ok(preview_edit_reply(host, target))
+        }
         Request::PreviewSave { pane } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
             host.save_preview(target)
@@ -19204,6 +19221,54 @@ mod tests {
         )
         .unwrap();
         assert_eq!(redone["document"]["version"].as_u64(), Some(before + 3));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #1654: Tab / Shift+Tab / Enter と同じ編集が dispatch から効く（インデントは既存行から推定）
+    #[test]
+    fn preview編集コマンドはインデントを推定して効く() {
+        let dir = std::env::temp_dir().join(format!("tako-dispatch-indent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut host = MockHost::new();
+        let pane = preview_with_text(&mut host, &dir, "fn f() {\n  a();\n}\n");
+        let run = |host: &mut MockHost, command: &str| {
+            dispatch(
+                host,
+                Request::PreviewEditCommand {
+                    pane: Some(pane),
+                    command: command.into(),
+                    expected_version: None,
+                },
+                PaneOrigin::Mcp,
+            )
+        };
+        // 2 行目の末尾で Enter → その行のインデント（2 桁）を引き継ぐ
+        // （MockHost のバッファは `mock.txt` なので括弧の規則は効かない = 継承だけを見る）
+        dispatch(
+            &mut host,
+            Request::PreviewCursor {
+                pane: Some(pane),
+                line: 2,
+                col: 6,
+                select_to_line: None,
+                select_to_col: None,
+                expected_version: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let entered = run(&mut host, "newline").unwrap();
+        assert_eq!(entered["document"]["cursor"]["line"].as_u64(), Some(3));
+        assert_eq!(entered["document"]["cursor"]["column"].as_u64(), Some(2));
+        assert_eq!(entered["document"]["indent"].as_str(), Some("spaces:2"));
+        let indented = run(&mut host, "indent").unwrap();
+        assert_eq!(indented["document"]["cursor"]["column"].as_u64(), Some(4));
+        let outdented = run(&mut host, "outdent").unwrap();
+        assert_eq!(outdented["document"]["cursor"]["column"].as_u64(), Some(2));
+        // 知らない綴りは候補つきで失敗する
+        let err = run(&mut host, "tab").unwrap_err();
+        assert!(format!("{err:?}").contains("indent"), "{err:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

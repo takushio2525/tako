@@ -332,9 +332,22 @@ pub(super) fn build_request(
         "tako_scrollback" => Request::Scrollback {
             lines: u64_arg(args, "lines")?.map(|n| n as usize),
         },
-        "tako_preview_edit" => Request::PreviewEdit {
-            pane: Some(target_pane(args, caller)?),
-            enabled: bool_arg(args, "enabled")?,
+        // #1654: `command` を渡すと Tab / Shift+Tab / Enter と同じ編集（ツールは増やさない）
+        "tako_preview_edit" => match str_arg(args, "command")? {
+            Some(command) => {
+                if bool_arg(args, "enabled")?.is_some() {
+                    return Err("command と enabled は同時に指定しない".into());
+                }
+                Request::PreviewEditCommand {
+                    pane: Some(target_pane(args, caller)?),
+                    command,
+                    expected_version: u64_arg(args, "expected_version")?,
+                }
+            }
+            None => Request::PreviewEdit {
+                pane: Some(target_pane(args, caller)?),
+                enabled: bool_arg(args, "enabled")?,
+            },
         },
         "tako_preview_apply" => Request::PreviewApply {
             pane: Some(target_pane(args, caller)?),

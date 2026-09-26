@@ -122,6 +122,163 @@ impl LineEnding {
     }
 }
 
+/// インデント 1 段の単位（#1654）。Tab / ⇧Tab が足し引きし、開き括弧の直後の Enter が 1 段深くする量
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndentUnit {
+    Tab,
+    /// 半角スペース n 個（2〜8）
+    Spaces(usize),
+}
+
+/// タブ 1 文字を何桁と数えるか（#1654。スペースでインデントするファイルに混ざったタブを
+/// 1 段ぶんとして扱うときと、タブでインデントするファイルに混ざったスペースを外すときの幅）
+const TAB_COLUMNS: usize = 4;
+
+/// インデントの推定に見る行数の上限（#1654。VS Code の `guessIndentation` と同じく先頭から標本を取る）
+const INDENT_SAMPLE_LINES: usize = 10_000;
+
+impl IndentUnit {
+    /// 本文の既存行から推定する（#1654）。インデントされた行が 1 つも無ければ `None`。
+    ///
+    /// **タブで始まる行がスペースで始まる行より多ければタブ**。そうでなければスペースで、
+    /// 幅は「隣り合う行のインデントの差」（2〜8 だけを数える）の**最頻値**にする。
+    /// 差を見るのは、深い入れ子しか無いファイル（全行 8 桁）や継続行の桁揃えに
+    /// 引きずられないため。1 の差（`/** … */` の ` * ` など）は数えない。
+    /// 差が 1 つも取れなければ、いちばん浅いインデント幅（2〜8 のとき）を使う
+    pub fn detect(text: &str) -> Option<Self> {
+        let mut tab_lines = 0usize;
+        let mut space_lines = 0usize;
+        let mut deltas = [0usize; 9];
+        let mut previous: Option<usize> = None;
+        let mut shallowest: Option<usize> = None;
+        for line in text.split('\n').take(INDENT_SAMPLE_LINES) {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if line.trim().is_empty() {
+                continue;
+            }
+            let width = if line.starts_with('\t') {
+                tab_lines += 1;
+                previous = None;
+                continue;
+            } else {
+                line.len() - line.trim_start_matches(' ').len()
+            };
+            if width > 0 {
+                space_lines += 1;
+                shallowest = Some(shallowest.map_or(width, |s: usize| s.min(width)));
+            }
+            if let Some(prev) = previous {
+                let delta = width.abs_diff(prev);
+                if (2..=8).contains(&delta) {
+                    deltas[delta] += 1;
+                }
+            }
+            previous = Some(width);
+        }
+        if tab_lines == 0 && space_lines == 0 {
+            return None;
+        }
+        if tab_lines > space_lines {
+            return Some(Self::Tab);
+        }
+        // 同数なら 4 → 2 → 8 → その他の順に倒す（多いものから `max_by_key` は最後の最大を返すので
+        // 優先度の低い順に並べる）
+        let best = [3usize, 5, 6, 7, 8, 2, 4]
+            .into_iter()
+            .filter(|w| deltas[*w] > 0)
+            .max_by_key(|w| deltas[*w]);
+        match best {
+            Some(w) => Some(Self::Spaces(w)),
+            None => shallowest.filter(|w| (2..=8).contains(w)).map(Self::Spaces),
+        }
+    }
+
+    /// 本文に手掛かりが無いときの既定（#1654）。**タブが文法で決まっているもの**だけタブ
+    /// （Makefile はレシピ行がタブ必須・Go は gofmt がタブ）。それ以外は 4 スペース
+    /// （VS Code / Zed の既定と同じ）
+    pub fn for_path(path: &Path) -> Self {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if matches!(name.as_str(), "makefile" | "gnumakefile")
+            || matches!(ext.as_str(), "mk" | "go")
+        {
+            Self::Tab
+        } else {
+            Self::Spaces(4)
+        }
+    }
+
+    /// 1 段ぶんの文字列
+    pub fn text(self) -> String {
+        match self {
+            Self::Tab => "\t".to_string(),
+            Self::Spaces(n) => " ".repeat(n),
+        }
+    }
+
+    /// 外（CLI / MCP の `document`）へ出す名前（`tab` / `spaces:4`）
+    pub fn label(self) -> String {
+        match self {
+            Self::Tab => "tab".to_string(),
+            Self::Spaces(n) => format!("spaces:{n}"),
+        }
+    }
+}
+
+/// Enter で 1 段深くする規則（#1654）。拡張子で決める
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IndentRules {
+    /// 行が `{` / `[` / `(` で終わっていたら深くする
+    brackets: bool,
+    /// 行が `:` で終わっていたら深くする（Python のブロック・YAML の入れ子）
+    colon: bool,
+}
+
+impl IndentRules {
+    /// Markdown・プレーンテキストは**継承だけ**（`[` はリンク、`(` は括弧書きで、
+    /// 入れ子の始まりではない）。Python と YAML は `:` でも深くする。
+    /// それ以外（コード全般）は開き括弧で深くする
+    fn for_path(path: &Path) -> Self {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        match ext.as_str() {
+            "md" | "markdown" | "mdx" | "txt" | "rst" | "adoc" => Self {
+                brackets: false,
+                colon: false,
+            },
+            "py" | "pyi" | "pyw" | "yml" | "yaml" => Self {
+                brackets: true,
+                colon: true,
+            },
+            _ => Self {
+                brackets: true,
+                colon: false,
+            },
+        }
+    }
+}
+
+/// 開き括弧に対応する閉じ括弧
+fn closing_bracket(open: char) -> Option<char> {
+    match open {
+        '{' => Some('}'),
+        '[' => Some(']'),
+        '(' => Some(')'),
+        _ => None,
+    }
+}
+
 /// カーソルの動かし方（FR-3.5 / #1652）。
 ///
 /// GUI の打鍵（`platform::editor_keys` の表）と CLI / MCP（`tako edit move` /
@@ -462,6 +619,12 @@ pub struct TextBuffer {
     /// **上下以外でカーソルが動いたら捨てる**（`set_cursor` / `set_selection` が
     /// 実際に動いたとき・編集・undo / redo・全選択）。読んで置き直すのは上下の移動だけ
     goal_column: Option<usize>,
+    /// インデント 1 段の単位（#1654）。**開いたときと全文を差し替えたときに**本文から推定する。
+    ///
+    /// 打つたびに推定し直すと、小さなファイルでは Tab で行を深くしただけで推定が変わる
+    /// （4 桁の 2 行を 8 桁にすると隣り合う行の差が 8 になり、次の ⇧Tab が 8 桁外す =
+    /// visual-test で実測）。VS Code も推定はモデルを作ったときに 1 回だけ
+    indent: IndentUnit,
     /// 器（GUI の表示域）に同時に見える行数（#1652。ページ移動の歩幅に使う）。
     ///
     /// 本文ではなく「どれだけ見えているか」なので GUI が測って渡す
@@ -475,6 +638,7 @@ impl TextBuffer {
         let text = String::from_utf8(bytes.clone()).map_err(|_| TextEditError::InvalidUtf8)?;
         Ok(Self {
             line_ending: LineEnding::detect_or_default(&text),
+            indent: IndentUnit::detect(&text).unwrap_or_else(|| IndentUnit::for_path(path)),
             path: path.to_path_buf(),
             text,
             baseline: bytes,
@@ -494,6 +658,7 @@ impl TextBuffer {
         let baseline = text.as_bytes().to_vec();
         Self {
             line_ending: LineEnding::detect_or_default(&text),
+            indent: IndentUnit::detect(&text).unwrap_or_else(|| IndentUnit::for_path(&path)),
             path,
             text,
             baseline,
@@ -545,6 +710,10 @@ impl TextBuffer {
     /// 改行を 1 つも含まない本文では直前の流儀を保つ
     pub fn set_text(&mut self, text: String) {
         let line_ending = LineEnding::detect(&text).unwrap_or(self.line_ending);
+        // インデントも同じ考え方で取り直す（手掛かりが無ければ直前の単位のまま。#1654）
+        if let Some(indent) = IndentUnit::detect(&text) {
+            self.indent = indent;
+        }
         self.apply_edit(Edit {
             range: 0..self.text.len(),
             replacement: &text,
@@ -745,6 +914,193 @@ impl TextBuffer {
             cursor: start,
             anchor: None,
             kind: EditKind::DeleteSpan,
+            line_ending: None,
+        });
+    }
+
+    // --- インデント（#1654） -------------------------------------------------
+
+    /// このバッファのインデント 1 段（#1654）。開いたとき（と全文を差し替えたとき）に
+    /// 本文から推定した単位で、手掛かりが無ければファイル名で決めた既定
+    pub fn indent_unit(&self) -> IndentUnit {
+        self.indent
+    }
+
+    /// Tab（#1654）。選択が無ければカーソル位置へ 1 段ぶん挿し（スペースなら次のタブ位置まで）、
+    /// 選択があれば選択が触れる行をまとめて 1 段深くする（undo 1 回で戻る）
+    pub fn indent(&mut self) {
+        if let Some(range) = self.selection() {
+            self.shift_lines(range, true);
+            return;
+        }
+        let unit = self.indent_unit();
+        let text = match unit {
+            IndentUnit::Tab => unit.text(),
+            IndentUnit::Spaces(n) => {
+                let column = self.visual_column(self.cursor, n);
+                " ".repeat(n - column % n)
+            }
+        };
+        self.insert(&text);
+    }
+
+    /// ⇧Tab（#1654）。選択が触れる行（選択が無ければカーソルの行）を 1 段浅くする。
+    /// 浅くできる行が無ければ本文も版も変えない
+    pub fn outdent(&mut self) {
+        let range = self.selection().unwrap_or(self.cursor..self.cursor);
+        self.shift_lines(range, false);
+    }
+
+    /// Enter（#1654）。改行を入れ、**カーソルより前にあるこの行のインデントを引き継ぐ**。
+    ///
+    /// - 行が開き括弧（Python / YAML は `:` も）で終わっていたら 1 段深くする
+    ///   （規則は拡張子で決まる。Markdown とプレーンテキストは継承だけ = [`IndentRules`]）
+    /// - `{|}` のように対応する閉じ括弧の手前で押したら、閉じ括弧を次の行へ送って
+    ///   あいだに 1 段深い空行を作る
+    /// - 空白だけの行で押したら、その行の空白は残さない（行末の空白を作らない）
+    ///
+    /// 挿す改行はこのファイルの改行コード（#1650）。選択があれば選択を差し替える。
+    /// **括弧の自動閉じはしない**（理由は `.agent/requirements.md` FR-3.5 の #1654）
+    pub fn newline_and_indent(&mut self) {
+        let eol = self.line_ending.as_str();
+        let range = self.selection().unwrap_or(self.cursor..self.cursor);
+        let line_start = self.line_start(range.start);
+        let before = &self.text[line_start..range.start];
+        let indent = &before[..before.len() - before.trim_start_matches([' ', '\t']).len()];
+        let line_end = self.line_end(range.end);
+        let after = &self.text[range.end..line_end];
+        let rules = IndentRules::for_path(&self.path);
+        let last = before.trim_end_matches([' ', '\t']).chars().last();
+        let deeper = match last {
+            Some(c) if rules.brackets && closing_bracket(c).is_some() => true,
+            Some(':') => rules.colon,
+            _ => false,
+        };
+        let unit = if deeper {
+            self.indent_unit().text()
+        } else {
+            String::new()
+        };
+        let mut start = range.start;
+        let mut end = range.end;
+        let mut replacement = format!("{eol}{indent}{unit}");
+        let cursor_in_replacement = replacement.len();
+        let after_trimmed = after.trim_start_matches([' ', '\t']);
+        let closes = last
+            .and_then(closing_bracket)
+            .is_some_and(|close| deeper && after_trimmed.starts_with(close));
+        if closes {
+            // 閉じ括弧は元のインデントの行へ（あいだの空白は捨てる）
+            end += after.len() - after_trimmed.len();
+            replacement.push_str(eol);
+            replacement.push_str(indent);
+        } else if indent.len() == before.len() && !before.is_empty() && after.is_empty() {
+            // 空白だけの行: この行の空白を消して、新しい行へ同じインデントを持っていく
+            start = line_start;
+        }
+        let cursor = start + cursor_in_replacement;
+        let kind = if start == end {
+            EditKind::Insert
+        } else {
+            EditKind::Replace
+        };
+        self.apply_edit(Edit {
+            range: start..end,
+            replacement: &replacement,
+            cursor,
+            anchor: None,
+            kind,
+            line_ending: None,
+        });
+    }
+
+    /// 行頭からその位置までの見た目の桁（タブは次の `tab` の倍数まで進む。#1654）
+    fn visual_column(&self, offset: usize, tab: usize) -> usize {
+        self.text[self.line_start(offset)..offset]
+            .chars()
+            .fold(0, |col, c| {
+                if c == '\t' {
+                    col + tab - col % tab
+                } else {
+                    col + 1
+                }
+            })
+    }
+
+    /// `range` が触れる行をまとめて 1 段深く / 浅くする（#1654）。**1 回の編集**なので undo 1 回で戻る。
+    ///
+    /// 選択の終わりが行頭（桁 0）にあるとき、その行は選んでいないものとして扱う
+    /// （行を丸ごと選ぶと終わりが次の行頭に来る。VS Code / Sublime と同じ）。
+    /// 深くするとき空行・空白だけの行は触らない（行末の空白を作らない）。
+    /// カーソルと選択は同じ文字を指し続けるようにずらす
+    fn shift_lines(&mut self, range: Range<usize>, deeper: bool) {
+        let first = self.line_start(range.start);
+        let mut last_point = range.end;
+        if range.end > range.start && self.line_start(range.end) == range.end {
+            last_point -= line_break_len_before(&self.text, range.end);
+        }
+        let block_end = self.line_end(last_point.max(first));
+        let unit = self.indent_unit();
+        let unit_text = unit.text();
+        // (元の行頭, 行頭で足した / 引いたバイト数)
+        let mut shifts: Vec<(usize, isize)> = Vec::new();
+        let mut out = String::with_capacity(block_end - first + 64);
+        let mut line_start = first;
+        for piece in self.text[first..block_end].split_inclusive('\n') {
+            let content = piece.trim_end_matches(['\r', '\n']);
+            let tail = &piece[content.len()..];
+            let delta: isize = if deeper {
+                if content.trim().is_empty() {
+                    0
+                } else {
+                    out.push_str(&unit_text);
+                    unit_text.len() as isize
+                }
+            } else {
+                -(outdent_width(content, unit) as isize)
+            };
+            let kept = if delta < 0 {
+                &content[delta.unsigned_abs()..]
+            } else {
+                content
+            };
+            out.push_str(kept);
+            out.push_str(tail);
+            shifts.push((line_start, delta));
+            line_start += piece.len();
+        }
+        if shifts.iter().all(|(_, d)| *d == 0) {
+            return;
+        }
+        // 点のずらし方: 前の行ぶんの増減は全部足し、自分の行のぶんは位置しだい
+        // （深くするとき行頭ちょうどの点は動かさない = 選択の起点が行頭なら足した
+        // インデントも選択に入る。浅くするとき消した空白の中の点は行頭へ寄せる）。
+        // ブロックより後ろの点（行頭で終わる選択の終わり）は全行ぶんずれる
+        let shift_point = |p: usize| -> usize {
+            let idx = shifts.partition_point(|(start, _)| *start <= p);
+            if idx == 0 {
+                return p;
+            }
+            let earlier: isize = shifts[..idx - 1].iter().map(|(_, d)| *d).sum();
+            let (start, delta) = shifts[idx - 1];
+            let into = p - start;
+            let own = if delta < 0 {
+                -(into.min(delta.unsigned_abs()) as isize)
+            } else if into > 0 {
+                delta
+            } else {
+                0
+            };
+            (p as isize + earlier + own) as usize
+        };
+        let cursor = shift_point(self.cursor);
+        let anchor = self.anchor.map(shift_point);
+        self.apply_edit(Edit {
+            range: first..block_end,
+            replacement: &out,
+            cursor,
+            anchor,
+            kind: EditKind::Replace,
             line_ending: None,
         });
     }
@@ -1244,6 +1600,7 @@ impl TextBuffer {
             "line_count": self.line_count(),
             "bytes": self.text.len(),
             "line_ending": self.line_ending.label(),
+            "indent": self.indent_unit().label(),
             "cursor": position(self.cursor_position()),
             "selection": self.selection_positions().map(|(start, end)| {
                 serde_json::json!({ "start": position(start), "end": position(end) })
@@ -1514,6 +1871,25 @@ fn line_end_offset(text: &str, offset: usize) -> usize {
             }
         }
         None => text.len(),
+    }
+}
+
+/// ⇧Tab で行頭から外すバイト数（#1654）。
+///
+/// 先頭がタブならそのタブ 1 つ。スペースなら 1 つ前のタブ位置まで（6 桁で 4 スペース単位なら 2 つ、
+/// 8 桁なら 4 つ）。タブでインデントするファイルに混ざったスペースは最大 [`TAB_COLUMNS`] 個
+fn outdent_width(content: &str, unit: IndentUnit) -> usize {
+    if content.starts_with('\t') {
+        return 1;
+    }
+    let spaces = content.len() - content.trim_start_matches(' ').len();
+    if spaces == 0 {
+        return 0;
+    }
+    match unit {
+        IndentUnit::Tab => spaces.min(TAB_COLUMNS),
+        IndentUnit::Spaces(n) if spaces.is_multiple_of(n) => n,
+        IndentUnit::Spaces(n) => spaces % n,
     }
 }
 
@@ -3505,5 +3881,270 @@ mod tests {
         names.dedup();
         assert_eq!(names.len(), DeleteMotion::ALL.len());
         assert_eq!(CursorMovement::from_name("word_left"), None);
+    }
+
+    // --- インデント（#1654） -------------------------------------------------
+
+    /// `|` をカーソル、`^` を選択の起点として読む（`^ab|c` → 本文 `abc`・選択 0..2・カーソル 2）
+    fn indent_buffer(name: &str, src: &str) -> TextBuffer {
+        let mut text = String::new();
+        let (mut cursor, mut anchor) = (None, None);
+        for c in src.chars() {
+            match c {
+                '|' => cursor = Some(text.len()),
+                '^' => anchor = Some(text.len()),
+                _ => text.push(c),
+            }
+        }
+        let mut buffer = TextBuffer::from_text(path(name), text);
+        let cursor = cursor.expect("カーソルの印 | がある");
+        buffer.set_selection(anchor.unwrap_or(cursor), cursor);
+        buffer
+    }
+
+    /// 本文に `|`（カーソル）と `^`（選択の起点）を差し込んで返す
+    fn show_sel(buffer: &TextBuffer) -> String {
+        let mut marks = vec![(buffer.cursor(), '|')];
+        if let Some(range) = buffer.selection() {
+            let anchor = if range.start == buffer.cursor() {
+                range.end
+            } else {
+                range.start
+            };
+            marks.push((anchor, '^'));
+        }
+        marks.sort_by_key(|m| std::cmp::Reverse(m.0));
+        let mut out = buffer.text().to_string();
+        for (at, mark) in marks {
+            out.insert(at, mark);
+        }
+        out
+    }
+
+    #[test]
+    fn インデントの単位は既存行から推定する() {
+        let cases: &[(&str, Option<IndentUnit>)] = &[
+            (
+                "fn main() {\n    let x = 1;\n}\n",
+                Some(IndentUnit::Spaces(4)),
+            ),
+            ("a:\n  b:\n    c: 1\n", Some(IndentUnit::Spaces(2))),
+            ("int main() {\n\treturn 0;\n}\n", Some(IndentUnit::Tab)),
+            // CRLF でも同じ
+            ("fn a() {\r\n  x();\r\n}\r\n", Some(IndentUnit::Spaces(2))),
+            // 深い入れ子しか無くても差で決まる（8 桁 → 12 桁 = 4）
+            (
+                "x\n        a\n            b\n        c\n",
+                Some(IndentUnit::Spaces(4)),
+            ),
+            // 差が取れなければいちばん浅い幅
+            ("- a\n  b\n", Some(IndentUnit::Spaces(2))),
+            // ` * ` の 1 桁ずれは数えない
+            (
+                "/**\n * doc\n */\nfn f() {\n    g();\n}\n",
+                Some(IndentUnit::Spaces(4)),
+            ),
+            // タブ行が多ければタブ（スペースの継続行が混ざっていても）
+            (
+                "f() {\n\ta();\n\tb();\n      c;\n}\n",
+                Some(IndentUnit::Tab),
+            ),
+            // 手掛かりなし
+            ("abc\ndef\n", None),
+            ("", None),
+        ];
+        for (text, want) in cases {
+            assert_eq!(IndentUnit::detect(text), *want, "{text:?}");
+        }
+        assert_eq!(IndentUnit::for_path(Path::new("Makefile")), IndentUnit::Tab);
+        assert_eq!(
+            IndentUnit::for_path(Path::new("a/main.go")),
+            IndentUnit::Tab
+        );
+        assert_eq!(
+            IndentUnit::for_path(Path::new("a.rs")),
+            IndentUnit::Spaces(4)
+        );
+        assert_eq!(
+            IndentUnit::for_path(Path::new("README.md")),
+            IndentUnit::Spaces(4)
+        );
+        // 本文が無ければファイル名で決まる
+        let buffer = TextBuffer::from_text(PathBuf::from("Makefile"), "all:\n".into());
+        assert_eq!(buffer.indent_unit(), IndentUnit::Tab);
+    }
+
+    /// Rust: 括弧の直後は 1 段深く・継承・`{|}` の間・空白だけの行・Tab / ⇧Tab
+    #[test]
+    fn rustのインデント() {
+        // Issue の実測 E8: `fn main() {` の中で改行すると次行が桁 0 だった
+        let mut b = indent_buffer("i.rs", "fn main() {|\n}\n");
+        b.newline_and_indent();
+        assert_eq!(show_sel(&b), "fn main() {\n    |\n}\n");
+        b.insert("let y = 2;");
+        b.newline_and_indent();
+        assert_eq!(show_sel(&b), "fn main() {\n    let y = 2;\n    |\n}\n");
+        // 空白だけの行で Enter → その行の空白は残さない
+        b.newline_and_indent();
+        assert_eq!(show_sel(&b), "fn main() {\n    let y = 2;\n\n    |\n}\n");
+        // `{|}` の間 → 閉じ括弧を次の行へ
+        let mut b = indent_buffer("i2.rs", "    if x {|}\n");
+        b.newline_and_indent();
+        assert_eq!(show_sel(&b), "    if x {\n        |\n    }\n");
+        // `(` / `[` も同じ・閉じ括弧の手前の空白は捨てる
+        let mut b = indent_buffer("i3.rs", "let v = vec![| ];\n");
+        b.newline_and_indent();
+        assert_eq!(show_sel(&b), "let v = vec![\n    |\n];\n");
+        // 括弧で終わらない行は継承だけ・インデントの途中で押したらその桁まで
+        let mut b = indent_buffer("i4.rs", "    foo();|\n");
+        b.newline_and_indent();
+        assert_eq!(show_sel(&b), "    foo();\n    |\n");
+        let mut b = indent_buffer("i5.rs", "  |  foo();\n");
+        b.newline_and_indent();
+        assert_eq!(show_sel(&b), "  \n  |  foo();\n");
+        // Tab: 次のタブ位置まで（桁 1 なら 3 つ）
+        let mut b = indent_buffer("i6.rs", "fn f() {\n    a|b\n}\n");
+        b.indent();
+        assert_eq!(show_sel(&b), "fn f() {\n    a   |b\n}\n");
+        // 選択した行をまとめて深く → 浅く（選択は同じ文字を指し続ける）
+        let mut b = indent_buffer("i7.rs", "fn f() {\n    ^a();\n    b();|\n}\n");
+        b.indent();
+        assert_eq!(show_sel(&b), "fn f() {\n        ^a();\n        b();|\n}\n");
+        b.outdent();
+        b.outdent();
+        assert_eq!(show_sel(&b), "fn f() {\n^a();\nb();|\n}\n");
+        // 浅くできない行ばかりなら本文も版も変えない
+        let version = b.version();
+        b.outdent();
+        assert_eq!(b.version(), version);
+    }
+
+    /// Python: `:` の直後は 1 段深く・継承・4 桁ずつ浅く
+    #[test]
+    fn pythonのインデント() {
+        let mut b = indent_buffer("i.py", "def f(x):|\n");
+        b.newline_and_indent();
+        assert_eq!(show_sel(&b), "def f(x):\n    |\n");
+        b.insert("if x:");
+        b.newline_and_indent();
+        assert_eq!(show_sel(&b), "def f(x):\n    if x:\n        |\n");
+        b.insert("return 1");
+        b.newline_and_indent();
+        assert_eq!(
+            show_sel(&b),
+            "def f(x):\n    if x:\n        return 1\n        |\n"
+        );
+        // ⇧Tab で 1 段戻る
+        b.outdent();
+        assert_eq!(
+            show_sel(&b),
+            "def f(x):\n    if x:\n        return 1\n    |\n"
+        );
+        // 2 スペースのファイルは 2 桁で
+        let mut b = indent_buffer("j.py", "if a:\n  b()\n  if c:|\n");
+        b.newline_and_indent();
+        assert_eq!(show_sel(&b), "if a:\n  b()\n  if c:\n    |\n");
+        // 半端な桁（6）からの ⇧Tab は 1 つ前のタブ位置（4）へ
+        let mut b = indent_buffer("k.py", "def f():\n    x = 1\n      |y\n");
+        b.outdent();
+        assert_eq!(show_sel(&b), "def f():\n    x = 1\n    |y\n");
+    }
+
+    /// Markdown: 継承だけ（`[` や `(` で深くしない）・リストの入れ子は 2 桁
+    #[test]
+    fn markdownのインデント() {
+        let mut b = indent_buffer("i.md", "- a\n  - b|\n");
+        b.newline_and_indent();
+        assert_eq!(show_sel(&b), "- a\n  - b\n  |\n");
+        let mut b = indent_buffer("j.md", "see [link](|\n");
+        b.newline_and_indent();
+        assert_eq!(show_sel(&b), "see [link](\n|\n");
+        // Tab は推定した 2 桁で行を深くする
+        let mut b = indent_buffer("k.md", "- a\n  - b\n^- c|\n");
+        b.indent();
+        assert_eq!(show_sel(&b), "- a\n  - b\n^  - c|\n");
+    }
+
+    /// タブでインデントするファイル: Tab はタブ 1 文字・⇧Tab はタブ 1 文字を外す
+    #[test]
+    fn タブのファイルはタブで足し引きする() {
+        let mut b = indent_buffer("i.c", "int f() {|\n\treturn 0;\n}\n");
+        b.newline_and_indent();
+        assert_eq!(show_sel(&b), "int f() {\n\t|\n\treturn 0;\n}\n");
+        b.indent();
+        assert_eq!(show_sel(&b), "int f() {\n\t\t|\n\treturn 0;\n}\n");
+        b.outdent();
+        assert_eq!(show_sel(&b), "int f() {\n\t|\n\treturn 0;\n}\n");
+    }
+
+    /// CRLF のファイルでは挿す改行も CRLF（#1650 の契約）
+    #[test]
+    fn crlfのファイルでも継承した改行はcrlf() {
+        let mut b = indent_buffer("i.rs", "fn f() {|\r\n}\r\n");
+        b.newline_and_indent();
+        assert_eq!(show_sel(&b), "fn f() {\r\n    |\r\n}\r\n");
+        let mut b = indent_buffer("j.rs", "fn f() {\r\n    ^a();\r\n    b();\r\n|}\r\n");
+        b.indent();
+        assert_eq!(
+            b.text(),
+            "fn f() {\r\n        a();\r\n        b();\r\n}\r\n"
+        );
+        assert_eq!(
+            b.text().matches('\n').count(),
+            b.text().matches("\r\n").count()
+        );
+    }
+
+    /// 行を丸ごと選ぶと終わりは次の行頭に来る。その行は触らない
+    #[test]
+    fn 行頭で終わる選択は次の行を含めない() {
+        let mut b = indent_buffer("i.rs", "^a\nb\n|c\n");
+        b.indent();
+        assert_eq!(show_sel(&b), "^    a\n    b\n|c\n");
+    }
+
+    /// Tab / ⇧Tab / Enter はそれぞれ undo 1 回で戻る
+    #[test]
+    fn インデントはundo1回で戻る() {
+        let src = "fn f() {\n    a();\n    b();\n}\n";
+        let mut b = indent_buffer("u.rs", "fn f() {\n    ^a();\n    b();|\n}\n");
+        b.indent();
+        assert_eq!(b.undo_depth(), 1);
+        assert!(b.undo());
+        assert_eq!(b.text(), src);
+        b.set_selection(9, src.len() - 2);
+        b.outdent();
+        assert!(b.undo());
+        assert_eq!(b.text(), src);
+        let mut b = indent_buffer("v.rs", "fn f() {|}\n");
+        b.newline_and_indent();
+        assert!(b.undo());
+        assert_eq!(b.text(), "fn f() {}\n");
+    }
+
+    /// 空行・空白だけの行は深くしない（行末の空白を作らない）
+    #[test]
+    fn 空行は深くしない() {
+        let mut b = indent_buffer("e.rs", "^a\n\n  \nb|\n");
+        b.indent();
+        assert_eq!(b.text(), "    a\n\n  \n    b\n");
+    }
+
+    /// 推定は開いたときに 1 回。Tab で深くしても単位は変わらない（visual-test の実測:
+    /// 4 桁の 2 行を 8 桁にしたあと ⇧Tab が 8 桁外していた）
+    #[test]
+    fn 深くしてもインデントの単位は変わらない() {
+        let mut b = indent_buffer("s.rs", "fn main() {\n    ^a();\n    b();\n|}\n");
+        assert_eq!(b.indent_unit(), IndentUnit::Spaces(4));
+        b.indent();
+        assert_eq!(b.indent_unit(), IndentUnit::Spaces(4));
+        b.outdent();
+        assert_eq!(b.text(), "fn main() {\n    a();\n    b();\n}\n");
+        // 全文の差し替えでは取り直す
+        b.set_text("x:\n  y: 1\n".into());
+        assert_eq!(b.indent_unit(), IndentUnit::Spaces(2));
+        // 手掛かりの無い本文へ差し替えたら直前の単位のまま
+        b.set_text("plain\n".into());
+        assert_eq!(b.indent_unit(), IndentUnit::Spaces(2));
     }
 }

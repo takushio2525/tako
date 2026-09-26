@@ -70,7 +70,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 
 | ツール名 | 説明 |
 |---|---|
-| `tako_preview_edit` | コードプレビューの編集モードを開始・終了する |
+| `tako_preview_edit` | コードプレビューの編集モードを開始・終了する（`command` で Tab / Shift+Tab / Enter と同じインデント編集） |
 | `tako_preview_apply` | 編集バッファの全文を差し替える |
 | `tako_preview_edit_range` | 行・桁で指定した範囲だけを置き換える（応答に文書の版が載る） |
 | `tako_preview_cursor` | 編集カーソルを行・桁で置く（`select_to_line` で選択） |
