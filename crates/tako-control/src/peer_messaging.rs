@@ -571,12 +571,13 @@ impl TranscriptCursor {
         let Ok(raw) = std::fs::read_to_string(path) else {
             return Verification::Unconfirmed;
         };
-        // compact 等でファイルが縮んだ場合は全文を対象にする（控えた位置は無効）
-        let appended = if (raw.len() as u64) >= self.len {
-            &raw[self.len as usize..]
-        } else {
-            raw.as_str()
-        };
+        // 控えた位置が無効なら全文を対象にする。無効 = compact 等でファイルが縮んだ（範囲外）か、
+        // 書き直されて控えた位置が多バイト文字の途中に当たった（#1757。追記だけなら位置は
+        // 前回の行末 = 文字境界に来る）。`&raw[len..]` は後者で panic するので `get` で両方を拾う
+        let appended = usize::try_from(self.len)
+            .ok()
+            .and_then(|at| raw.get(at..))
+            .unwrap_or(raw.as_str());
         verify_in_lines(appended.lines())
     }
 }
@@ -856,6 +857,65 @@ mod tests {
             "縮んだ状態を作れている"
         );
         assert_eq!(cursor.poll(), Verification::Delivered);
+        remove_temp_dir(&dir);
+    }
+
+    /// #1757: 控えた長さのあとでファイルが**書き直され**（compact が要約を先頭に置く等）、
+    /// 控えた位置が新しい本文の多バイト文字の途中に当たっても落ちない。
+    /// バイト位置 `&raw[len..]` で切っていた頃は `byte index N is not a char boundary` で
+    /// panic した（縮んでいないので「縮んだら全文」の分岐にも入らない）
+    #[test]
+    fn 書き直しで控えた位置が文字の途中に当たっても落ちず全文を見る() {
+        let dir = temp_dir("rewrite-mid-char");
+        let path = dir.join("session.jsonl");
+        let peer = json!({"type": "user", "origin": {"kind": "peer"}}).to_string();
+        let human = json!({"type": "user", "origin": {"kind": "human"}}).to_string();
+        std::fs::write(&path, format!("{human}\n")).expect("書ける");
+        let mut cursor = TranscriptCursor {
+            path: Some(path.clone()),
+            len: std::fs::metadata(&path).expect("stat").len(),
+            session_id: String::new(),
+        };
+        let at = cursor.len as usize;
+
+        // 日本語の要約が先頭に来る形へ書き直す。控えた位置が「あ」の途中に当たるよう
+        // 先頭の ASCII の詰め物で位相を合わせる（3 通りのどれかで必ず当たる）
+        let rewritten = (0..3)
+            .map(|pad| {
+                format!(
+                    "{}\n{peer}\n",
+                    json!({"type": "summary", "pad": "x".repeat(pad), "summary": "あ".repeat(at)})
+                )
+            })
+            .find(|s| !s.is_char_boundary(at))
+            .expect("どれかの詰め物で文字の途中に当たる");
+        assert!(
+            rewritten.len() >= at,
+            "縮んでいない（全文の分岐に入らない）"
+        );
+        std::fs::write(&path, &rewritten).expect("書ける");
+
+        // 控えた位置は無効なので、縮んだときと同じく全文を対象にする（痕跡は 2 行目）
+        assert_eq!(cursor.poll(), Verification::Delivered);
+
+        // 端: 空のファイルへ書き直された（位置 0 は常に文字境界）/ 4 バイト文字の途中
+        std::fs::write(&path, "").expect("書ける");
+        let mut empty = TranscriptCursor {
+            path: Some(path.clone()),
+            len: 0,
+            session_id: String::new(),
+        };
+        assert_eq!(empty.poll(), Verification::Unconfirmed);
+        let emoji = format!("{}\n{peer}\n", json!({"summary": "🎉".repeat(4)}));
+        let mid = emoji.find('🎉').expect("絵文字がある") + 1;
+        assert!(!emoji.is_char_boundary(mid));
+        std::fs::write(&path, &emoji).expect("書ける");
+        let mut four = TranscriptCursor {
+            path: Some(path.clone()),
+            len: mid as u64,
+            session_id: String::new(),
+        };
+        assert_eq!(four.poll(), Verification::Delivered);
         remove_temp_dir(&dir);
     }
 

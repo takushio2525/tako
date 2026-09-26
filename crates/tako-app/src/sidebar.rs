@@ -637,7 +637,7 @@ impl TakoApp {
                                         .overflow_hidden()
                                         .whitespace_nowrap()
                                         .text_ellipsis()
-                                        .child(SharedString::from(truncate(&project_name, 18))),
+                                        .child(SharedString::from(truncate_chars(&project_name, 18))),
                                 )
                                 // git ブランチチップ（カンプ: green / bg 10% / mono 10px）
                                 .children(git_summary.as_ref().map(|g| {
@@ -661,7 +661,7 @@ impl TakoApp {
                                                 .flex_none()
                                                 .text_color(hsla(theme.green)),
                                         )
-                                        .child(SharedString::from(truncate(&g.branch, 14)))
+                                        .child(SharedString::from(truncate_chars(&g.branch, 14)))
                                 }))
                                 .child(div().flex_grow(1.0))
                                 // 目 = 隠しファイル（ドット始まり）の表示トグル（#550）
@@ -1043,7 +1043,7 @@ impl TakoApp {
                                     FileDrag { path: drag_path },
                                     self.drag_ghost_builder(
                                         DragKind::File,
-                                        truncate(&row.entry.name, 24),
+                                        truncate_chars(&row.entry.name, 24),
                                         cx,
                                     ),
                                 );
@@ -1084,7 +1084,7 @@ impl TakoApp {
                                         .overflow_hidden()
                                         .whitespace_nowrap()
                                         .text_ellipsis()
-                                        .child(SharedString::from(truncate(&row.entry.name, 22))),
+                                        .child(SharedString::from(truncate_chars(&row.entry.name, 22))),
                                 )
                                 // #1009: ワークスペースフォルダ配下の変更件数
                                 .children(git_badge_spans(row.git_status, &theme))
@@ -1178,7 +1178,7 @@ impl TakoApp {
                                         .overflow_hidden()
                                         .whitespace_nowrap()
                                         .text_ellipsis()
-                                        .child(SharedString::from(truncate(&row.entry.name, 24))),
+                                        .child(SharedString::from(truncate_chars(&row.entry.name, 24))),
                                 );
                                 // git status バッジ（#1009）
                                 row_el = row_el.children(git_badge);
@@ -1459,7 +1459,7 @@ impl TakoApp {
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .text_ellipsis()
-                        .child(SharedString::from(truncate(&row.entry.name, 22))),
+                        .child(SharedString::from(truncate_chars(&row.entry.name, 22))),
                 )
                 .child(self.render_ssh_badge(&remote, theme));
             return el;
@@ -1515,7 +1515,7 @@ impl TakoApp {
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .text_ellipsis()
-                .child(SharedString::from(truncate(&row.entry.name, 24))),
+                .child(SharedString::from(truncate_chars(&row.entry.name, 24))),
         )
         // アイコンだけだと「何が起きているか」が伝わらないので短い語を添える
         .when(loading_file, |d| {

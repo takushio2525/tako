@@ -30,7 +30,10 @@ pub fn strip_bom(s: &str) -> &str {
 /// 基底文字と別の 1 文字として数える。基底文字と結合文字のあいだで切れることはあるが
 /// （見た目の欠け）、結果は常に正しい UTF-8 で落ちはしない。表示幅（全角 = 2 桁）は見ない。
 /// `max_chars` が 0 のときも、空でなければ `…` の 1 文字を返す。
-/// tako-app の `truncate` と同じ意味にしてある（寄せるときに挙動が変わらないように）
+///
+/// **文字数で切る実装はこれ 1 本**（#1757 で tako-app の `truncate` と context_budget の
+/// 私有版を寄せた。transcript の 1 行要約 `summary_line` も数える部分はここを通す）。
+/// 規約は `.agent/conventions.md`「文字列をバイト位置で切らない」
 pub fn truncate_chars(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         return s.to_string();
@@ -151,5 +154,23 @@ mod tests {
                 assert_truncated(src, max, &out);
             }
         }
+    }
+
+    /// #1757 で tako-app の `truncate`（タブ名・URL・実行コマンドの見出し）と
+    /// context_budget の私有版をここへ寄せた。寄せる前の 2 つと同じ固定値を持つ
+    #[test]
+    fn 寄せる前のtruncateと同じ固定値() {
+        // `…` は上限の内側に数える（24 文字の上限で 23 文字 + `…`）
+        let title = "a".repeat(30);
+        assert_eq!(truncate_chars(&title, 24), format!("{}…", "a".repeat(23)));
+        // 幅は表示幅ではなく文字数（全角も 1 文字。3 文字の上限で表示幅 5 桁）
+        assert_eq!(truncate_chars("ああああ", 3), "ああ…");
+        // 上限 0 / 1 は空でなければ `…` だけ、2 は 1 文字 + `…`
+        assert_eq!(truncate_chars("abc", 0), "…");
+        assert_eq!(truncate_chars("abc", 1), "…");
+        assert_eq!(truncate_chars("abc", 2), "a…");
+        // ちょうど上限は切らない（4 バイト文字でも数えるのは 1 文字）
+        assert_eq!(truncate_chars("🎉🎉🎉", 3), "🎉🎉🎉");
+        assert_eq!(truncate_chars("🎉🎉🎉🎉", 3), "🎉🎉…");
     }
 }

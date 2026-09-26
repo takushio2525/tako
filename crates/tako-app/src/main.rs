@@ -94,6 +94,9 @@ use tako_core::claude_resume::legacy_1076;
 use tako_core::pane_log::CloseOrigin;
 // 窓の位置・寸法の正本（#1442）。env / CLI / MCP がすべてここを通る
 use tako_core::platform::window_bounds as wb;
+// 表示用の切り詰めの正本（`…` 込みで上限文字数以内。#1728 / #1746 / #1757）。
+// サブモジュールは `use super::*` でこれを引く
+use tako_core::text::truncate_chars;
 use tako_core::{
     ratio_for_position, AgentMetrics, CommandState, Pane, PaneId, PaneOrigin, Rect, SelectionKind,
     SessionNotice, SpawnOptions, SplitAxis, SplitDirection, TabId, TerminalSession, Theme,
@@ -18237,7 +18240,11 @@ impl TakoApp {
                     .cursor(CursorStyle::OpenHand)
                     .on_drag(
                         PaneDrag { pane: pane_id },
-                        self.drag_ghost_builder(DragKind::Pane, truncate(&display_title, 24), cx),
+                        self.drag_ghost_builder(
+                            DragKind::Pane,
+                            truncate_chars(&display_title, 24),
+                            cx,
+                        ),
                     )
                     .child(
                         div()
@@ -18437,9 +18444,13 @@ impl TakoApp {
                 .child(SharedString::from(after))
         } else {
             let display = if title.is_empty() || title == url {
-                truncate(url, 60)
+                truncate_chars(url, 60)
             } else {
-                format!("{} — {}", truncate(title, 24), truncate(url, 36))
+                format!(
+                    "{} — {}",
+                    truncate_chars(title, 24),
+                    truncate_chars(url, 36)
+                )
             };
             div()
                 .id(("web-addr-bar", pane_id.as_u64()))
@@ -18485,7 +18496,7 @@ impl TakoApp {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let error_msg = SharedString::from(error_msg.to_string());
-        let url_display = SharedString::from(truncate(failed_url, 60));
+        let url_display = SharedString::from(truncate_chars(failed_url, 60));
         div()
             .flex_1()
             .bg(rgba(theme.background))
@@ -18853,7 +18864,7 @@ impl TakoApp {
                                     .h(px(12.0))
                                     .text_color(hsla(theme.accent)),
                             )
-                            .child(SharedString::from(truncate(&display_title, 36))),
+                            .child(SharedString::from(truncate_chars(&display_title, 36))),
                     )
                     .child(
                         div()
@@ -18861,7 +18872,7 @@ impl TakoApp {
                             .overflow_hidden()
                             .text_size(px(10.0))
                             .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.7))
-                            .child(SharedString::from(truncate(&url, 56))),
+                            .child(SharedString::from(truncate_chars(&url, 56))),
                     )
                     .child(
                         div()
@@ -19223,7 +19234,7 @@ impl TakoApp {
                                     .text_size(px(11.5))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(hsla(theme.foreground))
-                                    .child(SharedString::from(truncate(&w.name, 20))),
+                                    .child(SharedString::from(truncate_chars(&w.name, 20))),
                             )
                             .child(
                                 div()
@@ -19541,7 +19552,7 @@ impl TakoApp {
             .cursor(CursorStyle::OpenHand)
             .on_drag(
                 PaneDrag { pane: pane_id },
-                self.drag_ghost_builder(DragKind::Pane, truncate(&title_label, 24), cx),
+                self.drag_ghost_builder(DragKind::Pane, truncate_chars(&title_label, 24), cx),
             )
             .on_mouse_down(
                 MouseButton::Left,
@@ -19634,7 +19645,7 @@ impl TakoApp {
                                 } else {
                                     hsla(theme.text_secondary)
                                 })
-                                .child(SharedString::from(truncate(&title_label, 40))),
+                                .child(SharedString::from(truncate_chars(&title_label, 40))),
                         )
                     })
                     // #1657: 実行ペインの実行中 / 完了 / 失敗のバッジ。描画プリミティブだけで組む
@@ -19821,7 +19832,7 @@ impl TakoApp {
                                 }))
                                 .child(SharedString::from(format!(
                                     "\u{21B3} {}",
-                                    truncate(&parent_name, 16)
+                                    truncate_chars(&parent_name, 16)
                                 )))
                         }))
                     })
@@ -19917,7 +19928,7 @@ impl TakoApp {
                                         .h(px(10.0))
                                         .text_color(hsla(theme.text_muted)),
                                 )
-                                .child(SharedString::from(truncate(&short, 28)))
+                                .child(SharedString::from(truncate_chars(&short, 28)))
                         }))
                     })
                     // #1010: SSH の接続待ち / 失敗。回る弧 + 文言。
@@ -19977,7 +19988,7 @@ impl TakoApp {
                                         hsla(color),
                                     )
                                 })
-                                .child(SharedString::from(truncate(&text, 72)))
+                                .child(SharedString::from(truncate_chars(&text, 72)))
                         }))
                     })
                     // #966: リモートへの書き戻しの状態（読み取り専用 / 送信中 /
@@ -20018,7 +20029,7 @@ impl TakoApp {
                                             theme.text_muted
                                         })),
                                 )
-                                .child(SharedString::from(truncate(&text, 64)))
+                                .child(SharedString::from(truncate_chars(&text, 64)))
                         }))
                     })
                     // ターミナル情報（シェル名 · cols x rows）
@@ -24157,18 +24168,6 @@ pub(crate) fn pane_context_menu_items(facts: PaneMenuFacts) -> Vec<(&'static str
     items.push(("bg", ui_text::pane_menu::background()));
     items.push(("close", ui_text::pane_menu::close()));
     items
-}
-
-/// 文字数ベースの単純な切り詰め（タブ表示名・実行コマンドの見出しなど。`…` を含めて
-/// `max_chars` 文字以内）。表示用の切り詰めはこれを通す: バイト位置の `&s[..N]` は
-/// 文字の途中に当たると panic する（#1728）
-fn truncate(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else {
-        let cut: String = s.chars().take(max_chars.saturating_sub(1)).collect();
-        format!("{cut}…")
-    }
 }
 
 /// メニュー位置���計算（純粋関数・テスト��能）。

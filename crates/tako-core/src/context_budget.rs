@@ -596,7 +596,7 @@ impl LogEntry {
             tail.to_string()
         };
         let line = format!("- {} {}{}", self.date, refs, text);
-        truncate_chars(&line, ARCHIVE_LINE_MAX_CHARS)
+        crate::text::truncate_chars(&line, ARCHIVE_LINE_MAX_CHARS)
     }
 }
 
@@ -648,15 +648,6 @@ fn first_body_text(body: &[String]) -> String {
         .find(|l| !l.is_empty())
         .unwrap_or("")
         .to_string()
-}
-
-fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }
 
 /// パースした作業ログ
@@ -1258,6 +1249,19 @@ mod tests {
         let line = e.archive_line();
         assert_eq!(line.chars().count(), ARCHIVE_LINE_MAX_CHARS);
         assert!(line.ends_with('…'));
+        // #1757 で `text::truncate_chars` へ寄せた後も同じ文字列（`…` 込みで 160 文字）
+        assert_eq!(line, format!("- 2026-08-24 {}…", "あ".repeat(146)));
+
+        // ちょうど 160 文字は切らない（`- 2026-08-24 ` の 13 文字 + 147 文字）
+        let exact = LogEntry {
+            date: "2026-08-24".into(),
+            heading: format!("## 2026-08-24（{}）", "あ".repeat(147)),
+            body: vec![],
+        };
+        assert_eq!(
+            exact.archive_line(),
+            format!("- 2026-08-24 {}", "あ".repeat(147))
+        );
     }
 
     #[test]
