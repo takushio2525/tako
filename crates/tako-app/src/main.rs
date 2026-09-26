@@ -1254,6 +1254,10 @@ enum AppTextInput {
     GitBranch,
     /// tasks タブの返答コメント欄（#1450 B2）
     TaskComment,
+    /// ファイルツリーのインライン入力（新規ファイル / 新規フォルダ / 名前を変更。#1725）。
+    /// ここが宛先に無かったので、かなモードの打鍵（GPUI は IME へ先に渡す）の変換が
+    /// 隣のターミナルペインに束縛され、下線も候補窓もターミナルに出ていた
+    TreeName,
 }
 
 /// IME 変換中（未確定文字列 = marked text）の状態（FR-1.9）。
@@ -1981,6 +1985,16 @@ struct TakoApp {
     /// 「押した瞬間に自分が消えて `on_click` が発火しない」型のバグ（#496 / #503）を
     /// 検出できないので、実矩形が要る
     path_link_item_rects: PathLinkItemRects,
+    /// ファイルツリーの右クリックメニューの各項目の実描画矩形（#1725。
+    /// セルフテスト項目 154 が**合成マウスで実際に押す**ため。作法は `path_link_item_rects` と同じ）
+    tree_menu_item_rects: PathLinkItemRects,
+    /// ファイルツリー行（パス）の実描画矩形（#1725。項目 154 が右クリックする位置の正）。
+    /// **`tree_row_probe` が立っているフレームだけ**採る（本番の行ごとに要素を増やさない）
+    tree_row_rects: TreeRowRects,
+    tree_row_probe: bool,
+    /// インライン入力欄そのものの実描画矩形（#1725。`tree_row_probe` のときだけ採る。
+    /// 項目 154 が「変換中のキャレットが入力欄の内側に居る」を見る）
+    tree_inline_input_rect: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
     /// ファイルツリーのインライン編集
     inline_edit: Option<InlineEdit>,
     /// D&D 中のペイロード種別（FR-2.16.10 / FR-3.11）。on_drag 開始でセット、
@@ -3434,6 +3448,9 @@ enum PaneContextKind {
 /// パスメニューの項目 id → 実描画矩形の採取先（#1182。項目 147 が押す位置の正）
 type PathLinkItemRects = std::rc::Rc<std::cell::RefCell<Vec<(&'static str, Bounds<Pixels>)>>>;
 
+/// ファイルツリー行のパス → 実描画矩形の採取先（#1725。項目 154 が右クリックする位置の正）
+type TreeRowRects = std::rc::Rc<std::cell::RefCell<Vec<(std::path::PathBuf, Bounds<Pixels>)>>>;
+
 /// ターミナル内のパスリンクを cmd+右クリックしたときのメニュー（#1182）。
 ///
 /// 対象は**リンク検出（`tako_core::links`）が解決した絶対パス**なので、相対パス・
@@ -3453,15 +3470,31 @@ struct PathLinkMenu {
 struct InlineEdit {
     parent: std::path::PathBuf,
     kind: InlineEditKind,
-    text: String,
-    cursor: usize,
+    /// 打った名前とキャレット。編集操作はコミット欄・ブランチ欄・返答欄と同じ
+    /// `TextField` の 1 実装を通す（#1725。手書きのカーソル演算を持たない）
+    field: crate::text_field::TextField,
+    /// 入力欄を開いたときのフォーカスペイン（#1725）。Esc / 確定で閉じたら
+    /// 打鍵をここへ戻す（開いているあいだに外から動かされていても戻る先はぶれない）
+    origin_pane: PaneId,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum InlineEditKind {
     Rename,
     NewFile,
     NewDir,
+}
+
+impl InlineEditKind {
+    /// 右クリックメニューの項目 id から（#1725。開く入口を 1 本にするための写像）
+    fn from_menu_id(id: &str) -> Option<Self> {
+        match id {
+            "rename" => Some(Self::Rename),
+            "new-file" => Some(Self::NewFile),
+            "new-dir" => Some(Self::NewDir),
+            _ => None,
+        }
+    }
 }
 
 /// D&D ペイロード: バックグラウンドのペイン（FR-2.15.3。ドロワーからペインエリアへ復帰）
@@ -3906,6 +3939,10 @@ impl TakoApp {
             pane_context_menu: None,
             path_link_menu: None,
             path_link_item_rects: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            tree_menu_item_rects: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            tree_row_rects: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            tree_row_probe: false,
+            tree_inline_input_rect: std::rc::Rc::new(std::cell::Cell::new(None)),
             inline_edit: None,
             sidebar_width: {
                 // #789: ここではまだウィンドウが無いので上限は課さない（下限だけ）。
@@ -13481,10 +13518,9 @@ impl TakoApp {
             cx.notify();
             return;
         }
-        if let Some(ref mut edit) = self.inline_edit {
-            edit.text.insert_str(edit.cursor, &text);
-            edit.cursor += text.len();
-            cx.notify();
+        // #1725: 打鍵・IME の確定・unmark と同じ挿入関数を通す（経路ごとに挿入を書かない）
+        if self.inline_edit_visible() {
+            self.insert_app_text_input(AppTextInput::TreeName, &text, cx);
             return;
         }
         if let Some(pane_id) = self.webview_address_bar_active {
@@ -13578,7 +13614,8 @@ impl TakoApp {
     /// `cmd-v` は `PasteClipboard` アクションまで届かない
     fn text_input_swallows_keys(&self) -> bool {
         self.command_palette.is_some()
-            || self.inline_edit.is_some()
+            // #1725: 見えている入力欄に限る（見えない入力欄に打鍵を吸わせない）
+            || self.inline_edit_visible()
             || self.git_branch_input.is_some()
             // #503 と同じ条件で「見えているコミット欄」に限る（stale フラグで拾わない）
             || (self.git_commit_input_focused
@@ -13615,6 +13652,11 @@ impl TakoApp {
         if self.command_palette.is_some() && self.handle_palette_key(keystroke, cx) {
             cx.stop_propagation();
             return;
+        }
+        // #1725: 見えていない入力欄（ツリーを閉じた / タブを切り替えてルートから外れた）は
+        // 打鍵を奪わない。ここで畳んでから下のチェーン（ターミナル）へ流す
+        if self.inline_edit.is_some() && !self.inline_edit_visible() {
+            self.close_inline_edit(false);
         }
         if self.inline_edit.is_some() {
             self.handle_inline_edit_key(keystroke, cx);
@@ -13912,10 +13954,19 @@ impl TakoApp {
 
     /// いま IME の変換対象になるアプリ内テキスト入力（#561）。
     ///
-    /// 振り分けの優先順位は `replace_text_in_range` の確定文字列の振り分けと合わせる。
-    /// インライン編集 / Web dock の URL 欄が有効な間は従来経路（ペイン束縛）のままにする
+    /// 振り分けの優先順位は `handle_key`（打鍵の振り分け）と合わせる: ファイルツリーの
+    /// インライン入力が最優先（#1725。打鍵を全部握る入力欄なので、変換も同じ宛先へ束縛
+    /// しないと、かなモードの 1 打鍵目から変換がターミナルに出る）。
+    /// Web dock の URL 欄が有効な間は従来経路（ペイン束縛）のままにする
     fn app_text_input(&self) -> Option<AppTextInput> {
-        if self.inline_edit.is_some() || self.webview_dock_url_focused {
+        if self.inline_edit_visible() {
+            // A/B（`TAKO_1725_LEGACY=1`）は修正前 = ペイン束縛へ戻す
+            if Self::legacy_1725() {
+                return None;
+            }
+            return Some(AppTextInput::TreeName);
+        }
+        if self.webview_dock_url_focused {
             return None;
         }
         // #719: チャット入力欄は宛先にしない。IME はターミナルペイン宛ての
@@ -13948,6 +13999,7 @@ impl TakoApp {
             AppTextInput::GitCommit => self.git_commit_insert(text, cx),
             AppTextInput::GitBranch => self.git_branch_input_insert(text, cx),
             AppTextInput::TaskComment => self.task_comment_insert(text, cx),
+            AppTextInput::TreeName => self.tree_name_insert(text, cx),
         }
     }
 
@@ -23089,13 +23141,12 @@ impl EntityInputHandler for TakoApp {
             cx.notify();
             return;
         }
-        // インライン編集中は IME 確定文字列をインライン入力に振り分ける
-        if let Some(ref mut edit) = self.inline_edit {
-            if !text.is_empty() {
-                edit.text.insert_str(edit.cursor, text);
-                edit.cursor += text.len();
-            }
+        // インライン編集中は IME 確定文字列をインライン入力に振り分ける（変換を経ない
+        // 直接の insertText もここ。挿入は打鍵・⌘V と同じ 1 関数を通す = #1725）
+        if self.inline_edit_visible() {
             self.ime = None;
+            self.insert_app_text_input(AppTextInput::TreeName, text, cx);
+            window.invalidate_character_coordinates();
             cx.notify();
             return;
         }
@@ -26717,6 +26768,694 @@ mod self_test {
             && delta.app_notify == 0
             && delta.fallback == 0
             && delta.clock == 0
+    }
+
+    /// 項目 154 の道具: 実 OS マウスと同じ `PlatformInput` 経路で 1 回押す（#1725）。
+    /// 動かしてから 1 フレーム描くのは `click_at`（#738 / #496）と同じ理由
+    /// （hover はフレーム構築時のヒットテストで決まるので、動かしただけでは届かない）
+    fn st1725_press(
+        any: AnyWindowHandle,
+        cx: &mut AsyncApp,
+        button: MouseButton,
+        at: Point<Pixels>,
+    ) {
+        let _ = any.update(cx, |_, win, cx| {
+            win.dispatch_event(
+                gpui::PlatformInput::MouseMove(MouseMoveEvent {
+                    position: at,
+                    pressed_button: None,
+                    modifiers: Modifiers::default(),
+                }),
+                cx,
+            )
+        });
+        let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
+        for input in [
+            gpui::PlatformInput::MouseDown(MouseDownEvent {
+                button,
+                position: at,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            }),
+            gpui::PlatformInput::MouseUp(MouseUpEvent {
+                button,
+                position: at,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            }),
+        ] {
+            let _ = any.update(cx, |_, win, cx| win.dispatch_event(input, cx));
+        }
+    }
+
+    /// 項目 154 の道具: 文字列を 1 文字ずつ GPUI のキー配送へ流す（`type_text` と同じ形。
+    /// Enter は付けない）
+    fn st1725_type(any: AnyWindowHandle, cx: &mut AsyncApp, text: &str) {
+        let text = text.to_string();
+        let _ = any.update(cx, |_, win, cx| {
+            for ch in text.chars() {
+                win.dispatch_keystroke(
+                    Keystroke {
+                        modifiers: Modifiers::default(),
+                        key: ch.to_string(),
+                        key_char: Some(ch.to_string()),
+                    },
+                    cx,
+                );
+            }
+        });
+    }
+
+    /// 項目 154 の道具: **実マウスの入口**で入力欄を開く（行を右クリック → メニュー項目を
+    /// 左クリック）。押す位置は描いた矩形の実測（`tree_row_rects` / `tree_menu_item_rects`）
+    fn st1725_open(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        row: &std::path::Path,
+        id: &'static str,
+    ) -> Result<(), String> {
+        notify_and_draw(any, window, cx);
+        let rect = window
+            .update(cx, |app, _, _| {
+                app.tree_row_rects
+                    .borrow()
+                    .iter()
+                    .find(|(p, _)| p == row)
+                    .map(|(_, b)| *b)
+            })
+            .ok()
+            .flatten()
+            .ok_or_else(|| "ツリー行の実矩形が採れない（行が描かれていない）".to_string())?;
+        st1725_press(any, cx, MouseButton::Right, rect.center());
+        notify_and_draw(any, window, cx);
+        let (menu_open, item) = window
+            .update(cx, |app, _, _| {
+                (
+                    app.context_menu.is_some(),
+                    app.tree_menu_item_rects
+                        .borrow()
+                        .iter()
+                        .find(|(i, _)| *i == id)
+                        .map(|(_, b)| *b),
+                )
+            })
+            .unwrap_or((false, None));
+        let item = match (menu_open, item) {
+            (true, Some(item)) => item,
+            _ => {
+                return Err(format!(
+                    "右クリックでメニューが出ない（menu_open={menu_open}）"
+                ))
+            }
+        };
+        st1725_press(any, cx, MouseButton::Left, item.center());
+        Ok(())
+    }
+
+    /// 項目 154 の道具: そのペインの**スクロールバックまで含めた**平文（#1725）。
+    /// 出力を流しながら打つ検査なので、漏れた打鍵のエコーは画面外へ押し出される。
+    /// 可視行だけを見ると「漏れていない」が偽 PASS になる
+    fn st1725_pane_text(window: WindowHandle<TakoApp>, cx: &mut AsyncApp, pane: PaneId) -> String {
+        window
+            .update(cx, |app, _, _| {
+                app.terminals
+                    .get(&pane)
+                    .map(|s| {
+                        let mut lines = s.history_plain_lines(0, s.history_size());
+                        lines.extend(s.visible_lines());
+                        lines.join("\n")
+                    })
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 項目 154（#1725）: ファイルツリーのインライン入力（新規ファイル / 新規フォルダ /
+    /// 名前を変更）で、打鍵と IME の変換が**入力欄を出した直後から入力欄に入り、
+    /// ターミナルへ漏れない**ことを、実マウスの入口 × 繰り返し × 出力が流れている最中で固定する。
+    ///
+    /// 修正前の実測（Issue #1725 のコメント）: ASCII 打鍵は全部入力欄に入る一方、IME の
+    /// 変換は 9 通りすべてで**隣のターミナルペインに束縛**（`app_input = None`）され、
+    /// 下線と候補窓はターミナルのカーソル位置、`unmark_text` の文字列はターミナルの PTY へ
+    /// 流れていた。実機のかなモードでは GPUI が印字キーを IME へ先に渡すので、1 打鍵目から
+    /// 「ターミナルで変換が始まる」= Issue の症状。外側クリックでは入力欄が閉じなかった。
+    ///
+    /// 判定は**新しい挙動を無条件に主張する**（項目 149 / 153 と同じ作法）。
+    /// `TAKO_1725_LEGACY=1` は変換の宛先と外側クリックを修正前へ戻すので、この項目が
+    /// FAILED になる = 同一バイナリでの A/B
+    async fn st1725_tree_inline_input(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        sh: tako_core::platform::shell_dialect::ShellDialect,
+    ) {
+        use tako_control::protocol::Request as Req;
+        let legacy = TakoApp::legacy_1725();
+        let fixture0 = std::env::temp_dir().join(format!("tako-st1725-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&fixture0);
+        let _ = std::fs::create_dir_all(fixture0.join("sub"));
+        let _ = std::fs::write(fixture0.join("a.txt"), "x");
+        let _ = std::fs::write(fixture0.join("taken.txt"), "x");
+        // ピン留めは正規パスで保存されるので、行のパスも正規形で持つ（macOS の /var → /private/var）
+        let base = tako_core::platform::path::canonicalize_or_self(&fixture0);
+        let sub = base.join("sub");
+        let mut file = base.join("a.txt");
+
+        // 場面: 新しいタブ（素のシェル 1 枚）+ 右へ分割したもう 1 枚。
+        // もう 1 枚は「入力中に外（CLI / MCP）からフォーカスを動かされる」先に使う
+        let (tab, origin, prev_visible) = window
+            .update(cx, |app, _, cx| {
+                let prev_visible = app.filetree.visible;
+                let _ = tako_control::dispatch(
+                    app,
+                    Req::TabNew {
+                        title: None,
+                        focus: Some(true),
+                        cwd: None,
+                    },
+                    PaneOrigin::User,
+                );
+                let _ = app.attach_pending_sessions(cx);
+                cx.notify();
+                (
+                    app.workspace.active_tab().id(),
+                    app.focused_pane(),
+                    prev_visible,
+                )
+            })
+            .expect("項目 154 の場面づくり");
+        check(
+            wait_for_pane_ready(window, cx, origin, Duration::from_secs(20)).await,
+            "項目 154: 新しいタブのシェルが立つ (#1725)",
+        );
+        let other = window
+            .update(cx, |app, _, cx| {
+                app.split(SplitDirection::Right, cx);
+                let _ = app.attach_pending_sessions(cx);
+                let other = app
+                    .workspace
+                    .active_tab()
+                    .tree()
+                    .panes()
+                    .into_iter()
+                    .map(|p| p.id())
+                    .find(|id| *id != origin);
+                let _ = app.workspace.active_tab_mut().tree_mut().focus(origin);
+                cx.notify();
+                other
+            })
+            .ok()
+            .flatten();
+        let Some(other) = other else {
+            fail("項目 154: 右へ分割したペインが作れない (#1725)");
+        };
+        check(
+            wait_for_pane_ready(window, cx, other, Duration::from_secs(20)).await,
+            "項目 154: 分割したペインのシェルが立つ (#1725)",
+        );
+        let _ = window.update(cx, |app, _, cx| {
+            let _ = app.workspace.active_tab_mut().tree_mut().focus(origin);
+            app.filetree.visible = true;
+            if let Some(t) = app.workspace.get_tab_mut(tab) {
+                t.add_pinned_folder(base.clone());
+            }
+            app.sync_filetree_roots();
+            app.filetree.expand_dir(&base);
+            // 他のルート（ペインの cwd）は畳む: 行が多いと fixture がリストの外へ出る
+            for r in app.filetree.rows() {
+                if r.root && r.expanded && r.entry.path != base {
+                    app.filetree.toggle_dir(&r.entry.path);
+                }
+            }
+            app.tree_row_probe = true;
+            app.remote_notice = None;
+            cx.notify();
+        });
+        notify_and_draw(any, window, cx);
+
+        // 入力欄へ打つ ASCII の印。ターミナルの出力（`ST1725TICK<n>`）とは重ならない綴り
+        const LEAK_MARK: &str = "zqv";
+        let entries: [(&str, std::path::PathBuf); 3] = [
+            ("root", base.clone()),
+            ("dir", sub.clone()),
+            ("file", file.clone()),
+        ];
+        let kinds: [(&'static str, InlineEditKind); 3] = [
+            ("new-file", InlineEditKind::NewFile),
+            ("new-dir", InlineEditKind::NewDir),
+            ("rename", InlineEditKind::Rename),
+        ];
+        // 4 巡 × 3 入口 × 3 操作 = 36 回開く。1 巡目は確定（日本語の名前で作る）、
+        // 2・3 巡目はターミナルへ出力を流し続けながら Esc / 外側クリックで閉じる、
+        // 4 巡目は入力中に外からフォーカスを動かしてから Esc で閉じる
+        const ROUNDS: usize = 4;
+        let mut opened_total = 0usize;
+        let mut created: Vec<std::path::PathBuf> = Vec::new();
+        let mut busy_ticks: Option<(u64, u64)> = None;
+        for round in 1..=ROUNDS {
+            if round == 2 {
+                // ターミナルへ出力を流し始める（2・3 巡目のあいだ流れ続ける長さ）
+                type_text(
+                    any,
+                    cx,
+                    &sh.emit_numbered_lines("ST1725TICK", 4000, 10),
+                    true,
+                );
+                let started =
+                    wait_for_focused_text(window, cx, "ST1725TICK3", Duration::from_secs(20)).await;
+                check(
+                    started,
+                    "項目 154: ターミナルへ出力が流れ始める（前提。#1725）",
+                );
+            }
+            let tick_now = |window: WindowHandle<TakoApp>, cx: &mut AsyncApp| -> u64 {
+                st1725_pane_text(window, cx, origin)
+                    .lines()
+                    .filter_map(|l| l.trim().strip_prefix("ST1725TICK"))
+                    .filter_map(|n| n.parse::<u64>().ok())
+                    .max()
+                    .unwrap_or(0)
+            };
+            let tick_before = tick_now(window, cx);
+            for (entry, row) in entries.iter() {
+                let row = if *entry == "file" {
+                    file.clone()
+                } else {
+                    row.clone()
+                };
+                for (id, kind) in kinds.iter() {
+                    opened_total += 1;
+                    let n = opened_total;
+                    let label = format!("round={round} {entry}/{id} n={n}");
+                    if let Err(e) = st1725_open(any, window, cx, &row, id) {
+                        fail(&format!("項目 154: {label}: {e} (#1725)"));
+                    }
+                    // **フレームを挟まず直後に**打つ（開いた直後の取りこぼし = Issue の「多い」の検査）
+                    let token = format!("{LEAK_MARK}{n}x");
+                    st1725_type(any, cx, &token);
+                    let obs = window
+                        .update(cx, |app, _, _| {
+                            app.inline_edit
+                                .as_ref()
+                                .map(|e| (e.kind, e.field.text().to_string(), e.origin_pane))
+                        })
+                        .ok()
+                        .flatten();
+                    let Some((open_kind, text, recorded_origin)) = obs else {
+                        fail(&format!(
+                            "項目 154: {label}: メニューを押しても入力欄が開かない (#1725)"
+                        ));
+                    };
+                    check(
+                        open_kind == *kind && recorded_origin == origin,
+                        &format!("項目 154: {label}: 開いた入力欄の種別 / 戻り先が違う: {open_kind:?} {recorded_origin:?} (#1725)"),
+                    );
+                    check(
+                        text.ends_with(&token),
+                        &format!("項目 154: {label}: 開いた直後の打鍵が入力欄に入らない: text={text:?} (#1725)"),
+                    );
+                    // 4 巡目: 入力中に外（CLI / MCP の focus）からフォーカスを動かされる。
+                    // IPC の配送ループと同じ順（dispatch → clear_text_input_focus）で呼ぶ
+                    if round == 4 {
+                        let _ = window.update(cx, |app, _, cx| {
+                            let _ = tako_control::dispatch(
+                                app,
+                                Req::Focus {
+                                    pane: Some(other.as_u64()),
+                                    direction: None,
+                                },
+                                PaneOrigin::Mcp,
+                            );
+                            app.clear_text_input_focus();
+                            cx.notify();
+                        });
+                        st1725_type(any, cx, "k");
+                        let still = window
+                            .update(cx, |app, _, _| {
+                                app.inline_edit
+                                    .as_ref()
+                                    .map(|e| e.field.text().ends_with(&format!("{token}k")))
+                            })
+                            .ok()
+                            .flatten();
+                        check(
+                            still == Some(true),
+                            &format!("項目 154: {label}: 外からフォーカスを動かされると入力欄が閉じる / 打鍵が逸れる: {still:?} (#1725)"),
+                        );
+                    }
+                    // キャレットの実矩形は描いたフレームでしか書かれないので、前の回の値を
+                    // 引き継がないよう空にしてから描く（候補窓の位置 = この回の入力欄の実測）
+                    let _ = window.update(cx, |app, _, _| app.text_input_caret_bounds.set(None));
+                    for _ in 0..3 {
+                        notify_and_draw(any, window, cx);
+                    }
+                    // IME（NSTextInputClient と同じ入口）: 変換開始 → 描く → 位置 → 確定 → unmark。
+                    // 変換前のキャレット位置を控え、変換を始めて 1 フレーム描いたあとに
+                    // キャレットが**未確定文字列のぶん右へ動く**ことを見る（入力欄の中に
+                    // 実際にレイアウトされた証拠。要素を組んだだけでは動かない）
+                    let caret_before = window
+                        .update(cx, |app, _, _| app.text_input_caret_bounds.get())
+                        .ok()
+                        .flatten();
+                    let _ = window.update(cx, |app, win, cx| {
+                        app.replace_and_mark_text_in_range(None, "しりょう", None, win, cx);
+                    });
+                    notify_and_draw(any, window, cx);
+                    let caret_after = window
+                        .update(cx, |app, _, _| app.text_input_caret_bounds.get())
+                        .ok()
+                        .flatten();
+                    let caret_shift = match (caret_before, caret_after) {
+                        (Some(b), Some(a)) => f32::from(a.origin.x) - f32::from(b.origin.x),
+                        _ => f32::NAN,
+                    };
+                    // キャレットは入力欄の**内側**に居る（長い名前でも前側を詰めて見せる）
+                    let input_rect = window
+                        .update(cx, |app, _, _| app.tree_inline_input_rect.get())
+                        .ok()
+                        .flatten();
+                    let caret_inside = match (caret_after, input_rect) {
+                        (Some(k), Some(r)) => {
+                            k.origin.x >= r.origin.x
+                                && k.origin.x + k.size.width <= r.origin.x + r.size.width
+                        }
+                        _ => false,
+                    };
+                    check(
+                        caret_inside,
+                        &format!("項目 154: {label}: 変換中のキャレットが入力欄の外へ押し出される: caret={caret_after:?} input={input_rect:?} (#1725)"),
+                    );
+                    // 新規作成（打った印だけの短い名前）では、読みのぶん右へ動く = 入力欄の中に
+                    // 実際にレイアウトされた証拠（要素を組んだだけでは動かない）。
+                    // 4 文字の全角 = 12px の字でおよそ 48px。半分を下限にする（字体差を吸う）
+                    if *kind != InlineEditKind::Rename {
+                        check(
+                            caret_shift >= 24.0,
+                            &format!("項目 154: {label}: 変換中の読みが入力欄の中にレイアウトされない（キャレットが動かない: {caret_shift}px、before={caret_before:?} after={caret_after:?}） (#1725)"),
+                        );
+                    }
+                    let ime = window
+                        .update(cx, |app, win, cx| {
+                            let term_areas: Vec<Bounds<Pixels>> =
+                                app.pane_text_areas.iter().map(|(_, b)| *b).collect();
+                            let bound = app.ime.as_ref().and_then(|i| i.app_input);
+                            let overlay_off =
+                                app.ime_overlay_anchor(win).is_none() && !app.ime_overlay_anchored;
+                            let theme = app.theme.clone();
+                            let marked_inline = app
+                                .text_input_marked(AppTextInput::TreeName, &theme)
+                                .is_some();
+                            let caret = app.text_input_caret_bounds.get();
+                            let cand = app.bounds_for_range(0..4, gpui::Bounds::default(), win, cx);
+                            let sidebar_w = app.effective_sidebar_width();
+                            let cand_ok = match (cand, caret) {
+                                (Some(c), Some(k)) => {
+                                    c.origin == k.origin
+                                        && f32::from(c.origin.x) < sidebar_w
+                                        && !term_areas.iter().any(|t| t.contains(&c.origin))
+                                }
+                                _ => false,
+                            };
+                            app.replace_text_in_range(None, "資料", win, cx);
+                            let after_commit =
+                                app.inline_edit.as_ref().map(|e| e.field.text().to_string());
+                            app.replace_and_mark_text_in_range(None, "にほんご", None, win, cx);
+                            app.unmark_text(win, cx);
+                            let after_unmark =
+                                app.inline_edit.as_ref().map(|e| e.field.text().to_string());
+                            (
+                                bound,
+                                overlay_off,
+                                marked_inline,
+                                cand_ok,
+                                cand,
+                                after_commit,
+                                after_unmark,
+                                app.ime.is_none(),
+                            )
+                        })
+                        .ok();
+                    let Some((
+                        bound,
+                        overlay_off,
+                        marked_inline,
+                        cand_ok,
+                        cand,
+                        after_commit,
+                        after_unmark,
+                        ime_done,
+                    )) = ime
+                    else {
+                        fail(&format!("項目 154: {label}: IME の検査が走らない (#1725)"));
+                    };
+                    println!(
+                        "TAKO_SELF_TEST_1725: {label} legacy={legacy} bound={bound:?} overlay_off={overlay_off} \
+                         marked_inline={marked_inline} cand_ok={cand_ok} cand={cand:?} \
+                         after_commit={after_commit:?} after_unmark={after_unmark:?}"
+                    );
+                    check(
+                        bound == Some(AppTextInput::TreeName),
+                        &format!("項目 154: {label}: IME の変換が入力欄ではなく {bound:?}（None = ターミナルペイン）へ束縛された (#1725)"),
+                    );
+                    check(
+                        overlay_off && marked_inline,
+                        &format!("項目 154: {label}: 未確定文字列が入力欄の中に出ない（ターミナル側に下線: overlay_off={overlay_off} marked_inline={marked_inline}） (#1725)"),
+                    );
+                    check(
+                        cand_ok,
+                        &format!("項目 154: {label}: 変換候補窓が入力欄のキャレットに出ない: {cand:?} (#1725)"),
+                    );
+                    check(
+                        after_commit.as_deref().is_some_and(|t| t.ends_with(&format!("{token}資料")))
+                            || (round == 4 && after_commit.as_deref().is_some_and(|t| t.ends_with(&format!("{token}k資料")))),
+                        &format!("項目 154: {label}: IME の確定が入力欄に入らない: {after_commit:?} (#1725)"),
+                    );
+                    check(
+                        after_unmark.as_deref().is_some_and(|t| t.ends_with("資料にほんご")) && ime_done,
+                        &format!("項目 154: {label}: 未確定のまま確定（unmark）が入力欄に入らない: {after_unmark:?} (#1725)"),
+                    );
+                    // 閉じ方
+                    match round {
+                        1 if *id != "rename" || *entry == "file" => {
+                            // 確定: 名前を日本語だけにしてから Enter（ASCII の印は消す）
+                            let name = if *id == "rename" {
+                                format!("資料{n}にほんご.txt")
+                            } else {
+                                format!("資料{n}にほんご")
+                            };
+                            let _ = window.update(cx, |app, win, cx| {
+                                if let Some(edit) = app.inline_edit.as_mut() {
+                                    edit.field.clear();
+                                }
+                                app.replace_text_in_range(None, &name, win, cx);
+                            });
+                            press(any, cx, "enter");
+                            let parent = match (*id, *entry) {
+                                ("rename", _) => row
+                                    .parent()
+                                    .map(|p| p.to_path_buf())
+                                    .unwrap_or_else(|| base.clone()),
+                                (_, "file") => base.clone(),
+                                _ => row.clone(),
+                            };
+                            let made = parent.join(&name);
+                            let closed = window
+                                .update(cx, |app, _, _| app.inline_edit.is_none())
+                                .unwrap_or(false);
+                            let exists = if *kind == InlineEditKind::NewDir {
+                                made.is_dir()
+                            } else {
+                                made.is_file()
+                            };
+                            check(
+                                closed && exists,
+                                &format!("項目 154: {label}: 日本語の名前で作れない / 閉じない: made={exists} closed={closed} (#1725)"),
+                            );
+                            if *id == "rename" {
+                                file = made.clone();
+                            } else {
+                                created.push(made);
+                            }
+                        }
+                        2 => press(any, cx, "escape"),
+                        3 => {
+                            // 外側（押した先のターミナルのテキスト領域）をクリック
+                            let at = window
+                                .update(cx, |app, _, _| {
+                                    app.pane_text_areas
+                                        .iter()
+                                        .find(|(id, _)| *id == origin)
+                                        .map(|(_, b)| b.center())
+                                })
+                                .ok()
+                                .flatten();
+                            let Some(at) = at else {
+                                fail(&format!(
+                                    "項目 154: {label}: ターミナルの矩形が採れない (#1725)"
+                                ));
+                            };
+                            st1725_press(any, cx, MouseButton::Left, at);
+                        }
+                        _ => press(any, cx, "escape"),
+                    }
+                    notify_and_draw(any, window, cx);
+                    let (closed, focus_now) = window
+                        .update(cx, |app, _, _| {
+                            (app.inline_edit.is_none(), Some(app.focused_pane()))
+                        })
+                        .unwrap_or((false, None));
+                    check(
+                        closed,
+                        &format!("項目 154: {label}: Esc / 外側クリック / 確定で入力欄が閉じない (#1725)"),
+                    );
+                    // 閉じたら打鍵は元のペインへ戻る（4 巡目は外から動かされていたのを戻す）
+                    check(
+                        focus_now == Some(origin),
+                        &format!("項目 154: {label}: 閉じたあとフォーカスが元のペインへ戻らない: {focus_now:?} != {origin:?} (#1725)"),
+                    );
+                }
+            }
+            let tick_after = tick_now(window, cx);
+            if round == 3 {
+                busy_ticks = Some((tick_before, tick_after));
+            }
+            println!("TAKO_SELF_TEST_1725: round={round} done ticks={tick_before}->{tick_after}");
+        }
+        // 2・3 巡目のあいだ出力が本当に流れていた（busy の前提が崩れていない）
+        let (tb, ta) = busy_ticks.unwrap_or((0, 0));
+        check(
+            ta > tb,
+            &format!("項目 154: 3 巡目のあいだターミナルへ出力が流れていない（前提）: {tb}->{ta} (#1725)"),
+        );
+        check(
+            opened_total == ROUNDS * 9,
+            &format!("項目 154: 開いた回数が足りない: {opened_total} (#1725)"),
+        );
+
+        // --- エッジ ---
+        // E1: 既にある名前で新規作成 → 理由が通知欄へ出て、入力欄と打った名前は残る（#1399）
+        let e1 = {
+            if let Err(e) = st1725_open(any, window, cx, &base, "new-file") {
+                fail(&format!("項目 154: E1: {e} (#1725)"));
+            }
+            st1725_type(any, cx, "taken.txt");
+            press(any, cx, "enter");
+            window
+                .update(cx, |app, _, _| {
+                    (
+                        app.remote_notice.as_ref().is_some_and(|n| n.is_error),
+                        app.inline_edit.as_ref().map(|e| e.field.text().to_string()),
+                    )
+                })
+                .unwrap_or((false, None))
+        };
+        check(
+            e1.0 && e1.1.as_deref() == Some("taken.txt"),
+            &format!("項目 154: E1 既存名で新規作成: 通知と入力欄が残らない: {e1:?} (#1725)"),
+        );
+        press(any, cx, "escape");
+        let _ = window.update(cx, |app, _, _| app.remote_notice = None);
+        // E2: 空の名前で Enter → 閉じるだけ（何も作らない）
+        let count = |dir: &std::path::Path| std::fs::read_dir(dir).map(|d| d.count()).unwrap_or(0);
+        let before = count(&base);
+        if let Err(e) = st1725_open(any, window, cx, &base, "new-dir") {
+            fail(&format!("項目 154: E2: {e} (#1725)"));
+        }
+        press(any, cx, "enter");
+        let e2_closed = window
+            .update(cx, |app, _, _| app.inline_edit.is_none())
+            .unwrap_or(false);
+        check(
+            e2_closed && count(&base) == before,
+            &format!("項目 154: E2 空の名前で Enter: 閉じない / 何か作られた: closed={e2_closed} (#1725)"),
+        );
+        // E3: 長い日本語名。60 字（180 バイト）は作れる。300 字は OS が断り、理由が出て入力欄が残る
+        let long_ok: String = "長".repeat(60);
+        if let Err(e) = st1725_open(any, window, cx, &base, "new-file") {
+            fail(&format!("項目 154: E3: {e} (#1725)"));
+        }
+        let _ = window.update(cx, |app, win, cx| {
+            app.replace_text_in_range(None, &long_ok, win, cx)
+        });
+        press(any, cx, "enter");
+        check(
+            base.join(&long_ok).is_file(),
+            "項目 154: E3 60 字の日本語名のファイルが作れない (#1725)",
+        );
+        let long_ng: String = "長".repeat(300);
+        if let Err(e) = st1725_open(any, window, cx, &base, "new-file") {
+            fail(&format!("項目 154: E3b: {e} (#1725)"));
+        }
+        let _ = window.update(cx, |app, win, cx| {
+            app.replace_text_in_range(None, &long_ng, win, cx)
+        });
+        press(any, cx, "enter");
+        let e3b = window
+            .update(cx, |app, _, _| {
+                (
+                    app.remote_notice.as_ref().is_some_and(|n| n.is_error),
+                    app.inline_edit.as_ref().map(|e| e.field.text() == long_ng),
+                )
+            })
+            .unwrap_or((false, None));
+        check(
+            e3b == (true, Some(true)),
+            &format!(
+                "項目 154: E3b 300 字の名前: 理由が出ない / 入力欄が残らない: {e3b:?} (#1725)"
+            ),
+        );
+        press(any, cx, "escape");
+        let _ = window.update(cx, |app, _, _| app.remote_notice = None);
+        // E4: 入力欄を出したままツリーを閉じる → 見えない入力欄は打鍵を奪わない
+        //（打った行がそのままターミナルで実行される = 画面に結果が出る）
+        if let Err(e) = st1725_open(any, window, cx, &base, "new-file") {
+            fail(&format!("項目 154: E4: {e} (#1725)"));
+        }
+        let _ = window.update(cx, |app, _, cx| {
+            app.filetree.visible = false;
+            cx.notify();
+        });
+        press(any, cx, "ctrl-c");
+        type_text(any, cx, &sh.echo(&sh.marker("ST1725H", 1700, 25)), true);
+        let e4 = wait_for_focused_text(window, cx, "ST1725H1725", Duration::from_secs(15)).await;
+        let e4_closed = window
+            .update(cx, |app, _, _| app.inline_edit.is_none())
+            .unwrap_or(false);
+        check(
+            e4 && e4_closed,
+            &format!("項目 154: E4 ツリーを閉じたのに打鍵が見えない入力欄に吸われる: echoed={e4} closed={e4_closed} (#1725)"),
+        );
+
+        // --- 漏れの判定（アンカーつきの否定検査。#796）---
+        // E4 のアンカーが出たあとで、入力欄へ打った印・日本語がターミナル（履歴まで）に 1 つも無い
+        for pane in [origin, other] {
+            let text = st1725_pane_text(window, cx, pane);
+            for forbidden in [LEAK_MARK, "しりょう", "にほんご", "資料"] {
+                check(
+                    !text.contains(forbidden),
+                    &format!("項目 154: 入力欄へ打った `{forbidden}` がターミナル {pane:?} へ漏れた (#1725)"),
+                );
+            }
+        }
+        println!(
+            "TAKO_SELF_TEST_1725: legacy={legacy} opened={opened_total} created={} busy_ticks={tb}->{ta} e1={e1:?} e3b={e3b:?}",
+            created.len()
+        );
+
+        // 後片付け（自分のタブだけ閉じる・ツリーの表示を戻す）
+        let _ = window.update(cx, |app, _, cx| {
+            app.tree_row_probe = false;
+            app.close_inline_edit(false);
+            app.remove_tab(tab, cx);
+            app.filetree.visible = prev_visible;
+            app.sync_filetree_roots();
+            cx.notify();
+        });
+        if fixture0.starts_with(std::env::temp_dir()) {
+            let _ = std::fs::remove_dir_all(&fixture0);
+        }
     }
 
     fn fail(step: &str) -> ! {
@@ -54634,7 +55373,7 @@ mod self_test {
                                 cx,
                             );
                         }
-                        let typed = app.inline_edit.as_ref().is_some_and(|e| e.text == "abc.txt");
+                        let typed = app.inline_edit.as_ref().is_some_and(|e| e.field.text() == "abc.txt");
                         app.handle_inline_edit_key(&Keystroke::parse("enter").unwrap(), cx);
                         let closed = app.inline_edit.is_none();
                         let created = sub.join("abc.txt").is_file();
@@ -54699,7 +55438,7 @@ mod self_test {
                         app.filetree.set_show_hidden(false);
                         app.filetree.set_roots(vec![fixture.clone()]);
                         app.remote_notice = None;
-                        app.inline_edit = None;
+                        app.close_inline_edit(false);
 
                         // ① シナリオ 1: 消えている対象を「削除」→ 理由が通知欄へ出る
                         app.handle_context_action("trash", &gone, false, cx);
@@ -54718,11 +55457,11 @@ mod self_test {
                             .as_ref()
                             .filter(|n| n.is_error)
                             .map(|n| n.text.clone());
-                        let kept_text = app.inline_edit.as_ref().map(|e| e.text.clone());
+                        let kept_text = app.inline_edit.as_ref().map(|e| e.field.text().to_string());
 
                         // ③ 裏取り: 成功する操作では通知を出さない（誤検知していない）
                         app.remote_notice = None;
-                        app.inline_edit = None;
+                        app.close_inline_edit(false);
                         app.handle_context_action("rename", &keep, false, cx);
                         type_name(app, cx, "ok.txt");
                         let ok_silent = app.remote_notice.is_none()
@@ -75840,6 +76579,10 @@ mod self_test {
                 });
                 let _ = std::fs::remove_dir_all(&dir1676);
             }
+
+            // --- 項目 154: ファイルツリーのインライン入力の打鍵と IME（#1725） ---
+            // 本体と判定の理由は `st1725_tree_inline_input` の doc
+            st1725_tree_inline_input(any, window, cx, sh).await;
 
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {

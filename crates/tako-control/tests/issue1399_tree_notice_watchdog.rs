@@ -743,9 +743,16 @@ fn リネームの失敗で打った名前を捨てていない() {
          `Err` のときに入力欄が閉じて**打った名前ごと消える**（既存名へのリネームが\
          打ち直しになる）。`clone()` で読み、閉じるのは成功したときだけにすること"
     );
+    // 閉じる出口は #1725 で `close_inline_edit` の 1 本に揃えた（直書きの
+    // `inline_edit = None` は `issue1725_tree_inline_input_watchdog` が禁じる）。
+    // 成功の腕（`Ok(_) =>`）の中でその出口を通っていることを見る
+    let ok_arm = body
+        .split_once("Ok(_) =>")
+        .map(|(_, rest)| rest.split_once("Err(").map_or(rest, |(ok, _)| ok))
+        .expect("`commit_inline_edit` に成功の腕が無い（この検査が空振りしている）");
     assert!(
-        body.contains("self.inline_edit = None;"),
-        "`commit_inline_edit` が成功時に入力欄を閉じていない（#1399）"
+        ok_arm.contains("self.close_inline_edit("),
+        "`commit_inline_edit` が成功時に入力欄を閉じていない（#1399 / #1725）"
     );
 }
 

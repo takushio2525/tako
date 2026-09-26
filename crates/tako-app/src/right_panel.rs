@@ -4927,6 +4927,17 @@ impl TakoApp {
         target: AppTextInput,
         theme: &tako_core::Theme,
     ) -> Option<gpui::Div> {
+        self.text_input_marked_at(target, theme, 11.0)
+    }
+
+    /// [`Self::text_input_marked`] の字の大きさ指定版（#1725。ファイルツリーの入力欄は
+    /// 12px で描くので、未確定文字列だけ小さく見えないよう周りの字に合わせる）
+    pub(crate) fn text_input_marked_at(
+        &self,
+        target: AppTextInput,
+        theme: &tako_core::Theme,
+        font_px: f32,
+    ) -> Option<gpui::Div> {
         let ime = self
             .ime
             .as_ref()
@@ -4936,7 +4947,7 @@ impl TakoApp {
         let style = gpui::TextStyle {
             color: hsla(theme.tab_active_foreground),
             font_family: SharedString::from(theme.font_family.clone()),
-            font_size: px(11.0).into(),
+            font_size: px(font_px).into(),
             ..gpui::TextStyle::default()
         };
         Some(
