@@ -55,6 +55,7 @@ pub mod ipc;
 pub mod launch_cmd;
 pub mod layout;
 pub mod limit_stop;
+pub mod lsp;
 pub mod mcp;
 pub mod migrations;
 pub mod orchestrator;

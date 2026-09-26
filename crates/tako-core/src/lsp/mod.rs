@@ -7,8 +7,10 @@
 //! - [`servers`] — サーバ検出表（言語の追加 = 表への行追加）
 //! - [`root`] — プロジェクトルートの検出
 //! - [`state`] — ライフサイクルの状態機械
+//! - [`sync`] — `didChange` の中身（送った本文の写しとの差分）
 
 pub mod position;
 pub mod root;
 pub mod servers;
 pub mod state;
+pub mod sync;
