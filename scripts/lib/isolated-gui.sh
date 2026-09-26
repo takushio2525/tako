@@ -16,11 +16,20 @@
 #   `ensure` は冪等（常設の面は作り直さない・消す機能は無い）なので、毎回通して困らない。
 #   だから「起動する」を 1 本にまとめて、その中に `ensure` を畳み込むのが答え。
 #
+# **面を用意できなければ起動しない**（#1744）: `ensure` が失敗した・成功と言ったのに面が
+#   OS の一覧に無いときは、窓を開かずに終了コード 4（`ISOLATED_GUI_RC_NO_DISPLAY`）で返し、
+#   理由を stderr へ 1 行「未実測: …」と出す。以前は「起動は続ける」で素通しする作りで、
+#   面の指定を渡さない起動が tako の暗黙の既定（見えている面へ落ちる）に乗って
+#   **ユーザーの画面へ窓が出うる**潜在経路があった（この道で窓が出た実例は確認されていない）。
+#   蓋閉じ + ディスプレイスリープで面を用意できないのは日常なので、
+#   呼び出し側は `launch_isolated_gui … || exit $?` で止め、報告には「未実測」と書く。
+#   未配線の機（BetterDisplay が無い・CI）でも同じで、既定の面で続行する道は作らない。
+#
 # 使い方:
 #   . scripts/lib/isolated-gui.sh        # 関数として読む（直接実行はしない）
 #
 #   isolated_gui_bins                    # TAKO_BIN / APP_BIN を決める（無ければビルド）
-#   launch_isolated_gui "$TMP/app.log"   # ensure → env の既定 → 起動（pid は $ISOLATED_GUI_PID）
+#   launch_isolated_gui "$TMP/app.log" || exit $?   # ensure → env の既定 → 起動（pid は $ISOLATED_GUI_PID）
 #   wait_isolated_gui                    # `tako list` が通るまで待つ（任意）
 #   stop_isolated_gui                    # 自分で起こした pid だけを落とす
 #
@@ -45,11 +54,19 @@ ISOLATED_GUI_CLI_REL=${TAKO_ISO_CLI_REL:-target/debug/tako}
 # 窓を出す面。`TAKO_ISOLATED` が立っていれば tako 側の既定も同じ面だが、
 # **何も指定していないのか tako-vd を狙っているのかをスクリプトから読めるようにする**。
 #
-# 渡すのは**この機に面が配線されているときだけ**（#1697）: 明示した `TAKO_DISPLAY` を
+# 面を用意できたら**常に明示して渡す**（#1697 / #1744）: 明示した `TAKO_DISPLAY` を
 # tako が見失うと、検証用 GUI は既定の面（= ユーザーの画面）へ落ちずに窓を開かずに終わる。
-# 配線が無い機（CI・他人の機）で明示すると検証が回らなくなるので、そこでは渡さず
-# tako の暗黙の既定（見つからなければ既定の面へ開いて警告を出す）に任せる
+# 渡さない起動は tako の暗黙の既定（見つからなければ既定の面へ開いて警告を出す）に乗るので、
+# このヘルパからは作らない（用意できなければそもそも起動しない = #1744）
 ISOLATED_GUI_DISPLAY=${ISOLATED_GUI_DISPLAY:-${TAKO_VD_NAME:-tako-vd}}
+
+# 面を用意する係（`virtual-display.sh`）の置き場。**差し替えは番犬のモックのためだけ**
+# （`issue1490_isolated_gui_launch_watchdog.rs` が「用意できない面」を注入する口）
+ISOLATED_GUI_VD=${ISOLATED_GUI_VD:-}
+
+# 面を用意できずに起動しなかったときの終了コード（#1744）。tako 本体が「窓を開かずに
+# 終わる」ときの終了コード（`REFUSED_EXIT_CODE` = 4。#1160 / #1697）と同じ番号にそろえる
+ISOLATED_GUI_RC_NO_DISPLAY=4
 
 # 窓の矩形（`x,y,w,h` か `w,h`）。**既定は空 = 指定しない**。
 # 既定を与えると置き先の中央 960x600 から変わり、窓の実寸を測る検証
@@ -61,6 +78,9 @@ ISOLATED_GUI_WAIT_TRIES=${ISOLATED_GUI_WAIT_TRIES:-200}
 
 # 直前の `launch_isolated_gui` が起こした pid（呼び出し側はこれを自分の変数へ受ける）
 ISOLATED_GUI_PID=""
+
+# 直前の `iso_ensure_display` が面を用意できなかった理由（1 行。用意できたら空）
+ISOLATED_GUI_NO_DISPLAY_REASON=""
 
 iso_err() { echo "ERROR: $*" >&2; }
 
@@ -88,27 +108,34 @@ isolated_gui_bins() {
 }
 
 # 窓の置き先を用意する（眠っていれば起こす）。**起動の直前に毎回通す**のが要点。
-# 配線が無い環境（CI・他人の機・Windows）では素通しして続行する
-# （そこでは既定の面へ落ちる = `.agent/conventions.md`「面が見えているのに
-# 当たらないときは落ちる」。検証そのものが回らなくなるほうが悪い）。
-# 終了コードは「用意できたか」（#1697: 面の指定を明示するかの材料。起動は止めない）
+# 終了コードは「窓を置ける面を用意できたか」。用意できなければ理由を 1 行
+# `ISOLATED_GUI_NO_DISPLAY_REASON` へ置いて非ゼロ（#1744）。
+#
+# **用意できないときに素通しして続行しない**（#1744）: 以前は配線が無い環境（CI・他人の機）の
+# ために「起動は続ける」で返していたが、その起動は面の指定を持たず、tako の暗黙の既定で
+# ユーザーの画面へ落ちうる。`ensure` の応答だけを信じず、面が OS の一覧に居ることまで
+# `bounds` で読み戻す（器の応答文を当てにしない作法 = virtual-display.sh の癖 ② と同じ）
 iso_ensure_display() {
-    local vd
-    vd="$(iso_repo_root)/scripts/lib/virtual-display.sh"
-    [ -x "$vd" ] || return 1
-    bash "$vd" ensure >/dev/null 2>&1 || \
-        { echo "  (注) 仮想ディスプレイを用意できなかった: 起動は続ける（配線済みの機なら tako は窓を開かずに終わる）"; return 1; }
-    return 0
-}
-
-# この機に面が配線されているか（#1697）。`ensure` が面の uuid を記録したことがあれば配線済み
-# （記録は ensure の成功でしか書かれない）。ensure が今回だけ失敗した機を「未配線」と
-# 読み違えて、ユーザーの画面へ落ちる側へ倒さないための 2 本目の材料
-iso_display_recorded() {
-    local vd
-    vd="$(iso_repo_root)/scripts/lib/virtual-display.sh"
-    [ -x "$vd" ] || return 1
-    bash "$vd" recorded-uuid >/dev/null 2>&1
+    local vd out rc=0 line reason=""
+    vd="${ISOLATED_GUI_VD:-$(iso_repo_root)/scripts/lib/virtual-display.sh}"
+    ISOLATED_GUI_NO_DISPLAY_REASON=""
+    if [ ! -f "$vd" ]; then
+        reason="面を用意する ${vd##*/} が見つからない"
+    else
+        out=$(bash "$vd" ensure 2>&1) || rc=$?
+        if [ "$rc" -ne 0 ]; then
+            # ensure の理由は最後の ERROR 行（「起こせなかった」「BetterDisplay が無い」等）
+            while IFS= read -r line; do
+                case "$line" in ERROR:*) reason=${line#ERROR: } ;; esac
+            done <<< "$out"
+            reason=${reason:-"virtual-display.sh ensure が終了コード ${rc} で失敗した"}
+        elif ! bash "$vd" bounds >/dev/null 2>&1; then
+            reason="ensure は成功を返したが ${ISOLATED_GUI_DISPLAY} が OS のディスプレイ一覧に無い"
+        fi
+    fi
+    [ -z "$reason" ] && return 0
+    ISOLATED_GUI_NO_DISPLAY_REASON=$reason
+    return 1
 }
 
 # 隔離 GUI を起こす。pid は $ISOLATED_GUI_PID へ置く（**`$( )` で受けない**:
@@ -121,17 +148,17 @@ launch_isolated_gui() {
     shift
     [ -n "${APP_BIN:-}" ] || { iso_err "APP_BIN が空（先に isolated_gui_bins を呼ぶ）"; return 1; }
 
-    # 面を起こす。配線済み（今回 ensure が通った / この機で uuid を記録したことがある）なら
-    # 面の指定を明示し、tako に「見失ったら開かない」構えを取らせる（#1697）
-    local wired=0
-    if iso_ensure_display || iso_display_recorded; then wired=1; fi
-
-    local -a env_args=("TAKO_ISOLATED=${TAKO_ISOLATED:-1}")
-    if [ -n "${TAKO_DISPLAY:-}" ]; then
-        env_args+=("TAKO_DISPLAY=$TAKO_DISPLAY")
-    elif [ "$wired" = 1 ]; then
-        env_args+=("TAKO_DISPLAY=$ISOLATED_GUI_DISPLAY")
+    # 面を起こす。**用意できなければ起動しない**（#1744）。呼び出し側が `TAKO_DISPLAY` を
+    # 明示していても同じ（狙いが tako-vd なら見失っているし、別の面ならユーザーの画面へ出す）。
+    # ISOLATED_GUI_PID は触らない（先に起こした GUI を trap の後片付けから外さないため）
+    if ! iso_ensure_display; then
+        echo "未実測: ${ISOLATED_GUI_DISPLAY} を用意できないので検証用 GUI を開かない（${ISOLATED_GUI_NO_DISPLAY_REASON}。状態は scripts/lib/virtual-display.sh status。#1744）" >&2
+        return "$ISOLATED_GUI_RC_NO_DISPLAY"
     fi
+
+    # 面の指定は常に明示する = tako は見失ったら既定の面へ落ちずに窓を開かずに終わる（#1697）
+    local -a env_args=("TAKO_ISOLATED=${TAKO_ISOLATED:-1}"
+        "TAKO_DISPLAY=${TAKO_DISPLAY:-$ISOLATED_GUI_DISPLAY}")
     [ -n "$ISOLATED_GUI_BOUNDS" ] && \
         env_args+=("TAKO_WINDOW_BOUNDS=${TAKO_WINDOW_BOUNDS:-$ISOLATED_GUI_BOUNDS}")
     # 呼び出し側が並べた `VAR=VAL` は既定より後ろ = そちらが勝つ
@@ -178,7 +205,7 @@ stop_isolated_gui() {
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
     echo "使い方: . ${0}   # source して関数を使う（直接実行する口は無い）" >&2
     echo "  isolated_gui_bins                    TAKO_BIN / APP_BIN を決める（無ければビルド）" >&2
-    echo "  launch_isolated_gui <log> [VAR=VAL…] 仮想ディスプレイを起こして隔離 GUI を起動" >&2
+    echo "  launch_isolated_gui <log> [VAR=VAL…] 仮想ディスプレイを起こして隔離 GUI を起動（用意できなければ起動せず 4）" >&2
     echo "  wait_isolated_gui [log] [試行回数]    tako list が通るまで待つ" >&2
     echo "  stop_isolated_gui [pid]              自分で起こした pid だけを落とす" >&2
     exit 1

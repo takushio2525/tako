@@ -258,9 +258,15 @@ export CODEX_HOME="$HOMEDIR/.codex"
 export SHELL="$BIN/isosh"
 export PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin"
 mkdir -p "$TAKO_DISCOVERY_DIR"
-launch_isolated_gui "$SANDBOX/app.log"
+GUI_RC=0
+launch_isolated_gui "$SANDBOX/app.log" || GUI_RC=$?
 APP_PID="$ISOLATED_GUI_PID"
-if wait_isolated_gui "$SANDBOX/app.log"; then
+if [ "$GUI_RC" -ne 0 ]; then
+  # 面を用意できない（蓋閉じ + ディスプレイスリープ等）ときヘルパは窓を開かない（#1744）。
+  # C/D は「落ちた」ではなく未実測として締める（A/B の実測はそのまま生きる）
+  UNMEASURED="C/D（隔離 GUI を開けない。理由は上の「未実測:」の 1 行）"
+  echo "  未実測: ${UNMEASURED}"
+elif wait_isolated_gui "$SANDBOX/app.log"; then
   ok "隔離 GUI が立った（pid ${APP_PID}）"
   "$TAKO" check-health --json > "$SANDBOX/c-health.json" 2>"$SANDBOX/c-health.err"
   check "届くときの check-health は 0" "$?" "0"
@@ -305,3 +311,7 @@ fi
 echo
 echo "結果: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" = "0" ] || exit 1
+if [ -n "${UNMEASURED:-}" ]; then
+  echo "未実測: ${UNMEASURED}"
+  exit "$ISOLATED_GUI_RC_NO_DISPLAY"
+fi

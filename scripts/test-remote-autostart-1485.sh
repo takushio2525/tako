@@ -95,7 +95,7 @@ export TAKO_1485_ATTEMPTS=8
 start_app() {
   # 面を起こすのは launch_isolated_gui の中（#1490。①〜⑤ で何度も起動し直すので、
   # 蓋閉じで tako-vd が眠ると 2 回目以降が窓を開かずに終わる = #1160）
-  launch_isolated_gui "$TMP/app.log"
+  launch_isolated_gui "$TMP/app.log" || exit $?
   APP_PID="$ISOLATED_GUI_PID"
   sleep 5
 }

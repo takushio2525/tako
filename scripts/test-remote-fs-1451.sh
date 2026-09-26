@@ -160,7 +160,7 @@ done
 
 # --- 起動 ---------------------------------------------------------------------
 echo "=== 準備: 隔離 tako-app と daemon を起動 ==="
-launch_isolated_gui "$TMP/app.log"
+launch_isolated_gui "$TMP/app.log" || exit $?
 APP_PID="$ISOLATED_GUI_PID"
 wait_isolated_gui "$TMP/app.log" || exit 1
 # **繋がった先が隔離インスタンスであることを確かめる**（外れたまま進むと本番を触る）

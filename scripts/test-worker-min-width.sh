@@ -102,7 +102,7 @@ YAML
   "$TAKO_BIN" orchestrator projects add --key t1439 --cwd "$TMP" \
     --description "#1439 の検証（自動削除される）" >/dev/null 2>&1
 
-  launch_isolated_gui "$TMP/app.log"
+  launch_isolated_gui "$TMP/app.log" || exit $?
   APP_PID="$ISOLATED_GUI_PID"
   if ! wait_isolated_gui "$TMP/app.log"; then
     stop_isolated_gui "$APP_PID"; return 1

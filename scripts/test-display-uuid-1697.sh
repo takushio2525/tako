@@ -17,8 +17,9 @@
 # ④ は壊れていればユーザーの画面へ窓が出る道なので、①〜③ で新しいバイナリが解決の口を
 # 持つことを確かめてから最後に踏む（①〜③ のどれかが落ちたら ④ は踏まない）。
 #
-# tako-vd が使えない（蓋閉じで眠ったまま起こせない・未配線）なら何も起動せず終了 2
-# （= 未実測。検証を「通った」と読ませない）。
+# tako-vd が使えない（蓋閉じで眠ったまま起こせない・未配線）なら何も起動せず終了 4
+# （= 未実測。検証を「通った」と読ませない。番号は isolated-gui.sh の
+# ISOLATED_GUI_RC_NO_DISPLAY にそろえる = #1744）。
 set -uo pipefail
 
 # **本番 GUI を指す env を最初に落とす**（tako のペインから走らせると継承され、
@@ -101,19 +102,19 @@ launch_case() {
             *) echo "隔離されていないディレクトリ: $d"; exit 1 ;;
         esac
     done
-    launch_isolated_gui "$TMP/$name.log" "$@" || return 1
+    launch_isolated_gui "$TMP/$name.log" "$@" || exit $?
     APP_PID="$ISOLATED_GUI_PID"
 }
 
 echo "== 前提: 常設の仮想ディスプレイが使える =="
 # 眠っているだけなら起こしてから判定する（起こすのはヘルパの 1 実装。起動ごとの ensure も
-# launch_isolated_gui が通す）。使えないまま起動すると、記録の無い機では暗黙の既定が
-# ユーザーの画面へ落ちうるので、ここで止める
+# launch_isolated_gui が通し、用意できなければ起動しない = #1744）。ここで先に止めるのは
+# 面の状態（status の 1 行）を出してから未実測で終わるため
 iso_ensure_display >/dev/null 2>&1 || true
 if ! status=$(bash "$VD" status 2>&1); then
     echo "$status"
     echo "未実測: ${ISOLATED_GUI_DISPLAY} が使える状態ではない（眠っている / 未配線）。何も起動しない"
-    exit 2
+    exit "$ISOLATED_GUI_RC_NO_DISPLAY"
 fi
 echo "$status" | sed 's/^/  /'
 

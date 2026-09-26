@@ -49,7 +49,7 @@ run_section() {
         TAKO_SESSIONS_FILE="$TMP/sessions.yaml" TAKO_PANE_LOG_DIR="$TMP/panelogs" \
         TAKO_TMUX_SOCKET="tako-1649-$$" \
         TAKO_VISUAL_TEST=1 TAKO_VISUAL_ONLY=cursor-follow \
-        ${1+"$@"} || return 1
+        ${1+"$@"} || exit $?
     wait "$ISOLATED_GUI_PID"
     local rc=$?
     ISOLATED_GUI_PID=""

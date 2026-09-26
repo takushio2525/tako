@@ -101,7 +101,7 @@ field() { printf '%s\n' "$2" | sed -n "s/^${1}=//p" | head -1; }
 oneline() { printf '%s' "$1" | tr '\n' ' '; }
 
 echo "== 隔離 GUI を起こす =="
-launch_isolated_gui "$TMP/app.log" || exit 1
+launch_isolated_gui "$TMP/app.log" || exit $?
 APP_PID="$ISOLATED_GUI_PID"
 wait_isolated_gui "$TMP/app.log" || exit 1
 echo "  pid=$APP_PID data=$TAKO_DATA_DIR"

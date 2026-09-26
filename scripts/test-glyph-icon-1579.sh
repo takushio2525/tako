@@ -63,7 +63,7 @@ launch_isolated_gui "$TMP/run.log" \
     TAKO_DATA_DIR="$TMP/data" TAKO_DISCOVERY_DIR="$TMP/disc" \
     TAKO_SESSIONS_FILE="$TMP/sessions.yaml" TAKO_PANE_LOG_DIR="$TMP/panelogs" \
     TAKO_TMUX_SOCKET="tako-1579-$$" \
-    TAKO_VISUAL_TEST=1 TAKO_VISUAL_ONLY=glyph-icon TAKO_VISUAL_DUMP_DIR="$OUT" || exit 1
+    TAKO_VISUAL_TEST=1 TAKO_VISUAL_ONLY=glyph-icon TAKO_VISUAL_DUMP_DIR="$OUT" || exit $?
 wait "$ISOLATED_GUI_PID"
 RC=$?
 ISOLATED_GUI_PID=""
