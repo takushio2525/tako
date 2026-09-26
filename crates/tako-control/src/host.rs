@@ -674,6 +674,23 @@ pub trait PreviewHost {
     ) -> Result<PreviewLineTarget, String> {
         Err("行ジャンプは未対応".into())
     }
+    /// code 表示のプレビューがいま見ている行（1 始まり。FR-3.29 / #1677）。
+    ///
+    /// 行を指定して開くとき、差し替えられる側の「飛ぶ前にいた場所」としてジャンプ履歴へ
+    /// 積む。優先は 着地予約（開いた直後でまだ描いていない）> 編集カーソル > 可視先頭行。
+    /// 分からなければ `None`（戻るときは行を指定せずに開く）
+    fn preview_current_line(&self, _pane: PaneId) -> Option<usize> {
+        None
+    }
+    /// ジャンプ履歴（FR-3.29 / #1677）。GUI が 1 つ持つ実体を返す。持たない実装
+    /// （テストの host・セカンダリ等）は `None` で、`tako jump` は「使えない」と答え、
+    /// 行を指定した `OpenFile` は何も積まない
+    fn jump_history(&self) -> Option<&tako_core::jump_history::JumpHistory> {
+        None
+    }
+    fn jump_history_mut(&mut self) -> Option<&mut tako_core::jump_history::JumpHistory> {
+        None
+    }
     /// ロード時に構築済みの Markdown / PDF アウトライン。
     fn preview_outline(&self, _pane: PaneId) -> Option<PreviewOutline> {
         None

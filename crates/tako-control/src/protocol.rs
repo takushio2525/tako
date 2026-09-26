@@ -671,6 +671,21 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         column: Option<usize>,
     },
+    /// ジャンプ履歴（戻る / 進む。FR-3.29 / #1677 / #1007 S0-d）。`action`:
+    /// - "list"（既定）: 履歴の全項目と現在位置
+    /// - "back": 1 つ戻る（行を指定した `OpenFile` が積んだ位置へ）
+    /// - "forward": 1 つ進む
+    ///
+    /// 積むのは行を指定した `OpenFile` だけ（飛ぶ前にいた場所と着地点）。
+    /// 閉じたペインの項目は開き直し、`pane` はそのときの基準ペイン（省略時は
+    /// アクティブタブのフォーカス中ペイン）。`focus` で着地したペインへフォーカスを移す
+    Jump {
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        focus: Option<bool>,
+    },
     /// PDF・画像プレビューの表示倍率・ページ・パン操作（#234）。
     /// 全操作省略時は状態取得。zoom は百分率（150 = 150%）、page は 1 始まり、
     /// pan_x / pan_y は現在位置へ加える logical px。
@@ -2349,6 +2364,8 @@ pub fn changes_layout(request: &Request) -> bool {
         | Request::Lang { .. }
         // --- ペインを新しく作る / 中身を差し替える ---
         | Request::OpenFile { .. }
+        // 戻る / 進むは OpenFile を通って中身を差し替え、閉じたペインなら開き直す（#1677）
+        | Request::Jump { .. }
         | Request::OpenDir { .. }
         | Request::OpenRemote { .. }
         | Request::RemoteFolder { .. }

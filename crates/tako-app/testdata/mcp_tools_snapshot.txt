@@ -32,6 +32,7 @@ tako_git_resolve_agent
 tako_git_show
 tako_git_stage
 tako_git_unstage
+tako_jump
 tako_lang
 tako_limit_resume
 tako_limit_service
