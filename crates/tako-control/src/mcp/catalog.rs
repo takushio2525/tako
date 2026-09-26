@@ -964,7 +964,8 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_preview_edit",
             "description": "コードプレビューの編集モードを開始・終了する。enabled 省略時は状態取得。\
                 PDF・画像・動画・末尾省略された巨大ファイルは編集できない。状態は editing / dirty で返す。\
-                document は文書の版（version）とカーソル・選択・undo 履歴で、編集系ツールの応答すべてに載る。",
+                document は文書の版（version）とカーソル・選択・undo 履歴で、編集系ツールの応答すべてに載る。\
+                viewport はカーソル行が画面に入っているか（visible=false なら画面外）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1078,7 +1079,8 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_preview_search",
             "description": "コードプレビューのテキスト検索。query でインクリメンタル検索し、direction で移動（next/prev）。\
-                編集モードでなくても使える。query 省略時は現在の検索状態を返す。",
+                編集モードでなくても使える。query 省略時は現在の検索状態を返す。\
+                search.viewport でヒットへ飛んだあとにその行が画面に入っているかが読める。",
             "inputSchema": {
                 "type": "object",
                 "properties": {

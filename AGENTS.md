@@ -141,6 +141,7 @@ tako/
 | **スマホからの master 起動の実経路テスト（#1078）** | `bash scripts/test-remote-master-launch.sh` |
 | **スマホの「+」から立てる 3 種の実経路テスト（#1449）** | `bash scripts/test-remote-launch-1449.sh` |
 | リモート serve 自己検査のモックテスト（#1049） | `bash scripts/test-serve-watch.sh` |
+| **編集カーソルの追従スクロールの実測（#1649）** | `bash scripts/test-cursor-follow-1649.sh` |
 | ファイルツリーフォルダ操作 | `tako tree add <path>` |
 | **Finder の「このアプリケーションで開く」（#708 / #835）** | `tako open <file> --new-tab` |
 | **ターミナル上のパスの cmd+右クリックメニュー（#1182）** | `tako file open-in-tako <path>` |
