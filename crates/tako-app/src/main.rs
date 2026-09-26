@@ -38,6 +38,7 @@ mod form_layout;
 mod handoff_ctx;
 mod keybindings;
 mod limit_autoresume;
+mod lsp_goto_ui;
 mod md_view;
 mod menu_bar;
 mod open_files;
@@ -1706,6 +1707,29 @@ enum PaneVisibility {
     Elsewhere,
 }
 
+/// 定義ジャンプの GUI の状態（#1680）。問い合わせ・着地は dispatch の 1 実装
+/// （`tako_control::dispatch::lsp_goto_*`）で、ここは画面だけが持つもの
+#[derive(Default)]
+pub(crate) struct LspGotoUi {
+    /// ⌘ 押下中にホバーしている識別子（ペイン・0 起点の行・行内のバイト範囲）
+    hovered: Option<(PaneId, usize, std::ops::Range<usize>)>,
+    /// 問い合わせ中のペイン（ヘッダに「定義を探しています…」を出す）
+    pending: Option<PaneId>,
+    /// 問い合わせの通し番号。答えが返るまでに次を押したら古い答えは捨てる
+    seq: u64,
+    /// 候補が複数のときの一覧（押した位置に出す。選んだら同じ答えで着地し直す）
+    menu: Option<LspGotoMenu>,
+    /// 結果の一時表示（ペイン・文言・注意色か・出した時刻）。見つからない等をその場で知らせる
+    status: Option<(PaneId, String, bool, std::time::Instant)>,
+}
+
+/// 候補の一覧（#1680）
+pub(crate) struct LspGotoMenu {
+    pane: PaneId,
+    anchor: gpui::Point<Pixels>,
+    landing: tako_control::LspGotoLanding,
+}
+
 struct TakoApp {
     workspace: Workspace,
     terminals: HashMap<PaneId, TerminalSession>,
@@ -1884,6 +1908,8 @@ struct TakoApp {
     /// ジャンプ履歴（FR-3.29 / #1677）。行を指定した OpenFile が積み、⌃- / ⌃⇧- と
     /// CLI / MCP の `tako jump` が dispatch 経由でこの 1 つを動かす。永続化はしない
     jump_history: tako_core::jump_history::JumpHistory,
+    /// 定義ジャンプの GUI の状態（#1680。⌘ホバー中の識別子・問い合わせ中・候補の一覧）
+    lsp_goto: LspGotoUi,
     /// タブ・ペイン名の AI 自動リネームの検知状態（FR-2.12。ループは new で張る）
     autorename: autorename::AutoRenamer,
     /// 自動命名した時刻（タブ ID → 命名時刻。#552 案 4）。命名直後だけタブに
@@ -4024,6 +4050,7 @@ impl TakoApp {
             preview_edits: HashMap::new(),
             lsp: tako_control::lsp::LspManager::from_env(),
             jump_history: tako_core::jump_history::JumpHistory::default(),
+            lsp_goto: LspGotoUi::default(),
             autorename: autorename::AutoRenamer::new(initial_auto_rename()),
             auto_title_hints: HashMap::new(),
             port_detect: initial_port_detect(),
@@ -4767,11 +4794,44 @@ impl TakoApp {
                     let reply = incoming.reply;
                     match prepared {
                         Ok(job) => {
-                            cx.background_executor()
-                                .spawn(async move {
-                                    let _ = reply.send(job.run());
-                                })
-                                .detach();
+                            // 大半はそのまま background から応答する。workspace を変える続きが
+                            // 要るもの（#1680 の定義ジャンプの着地）だけ UI スレッドへ戻す。
+                            // 戻すのは前景の別タスクで、**この受信ループは待たない**
+                            // （問い合わせの上限まで他の IPC を詰まらせない）
+                            let origin = incoming.origin;
+                            let staged = cx.background_executor().spawn(async move {
+                                match job.run_staged() {
+                                    tako_control::OffloadOutcome::Reply(result) => {
+                                        let _ = reply.send(result);
+                                        None
+                                    }
+                                    tako_control::OffloadOutcome::OnUi(next) => Some((next, reply)),
+                                }
+                            });
+                            let weak = this.clone();
+                            cx.spawn(async move |cx| {
+                                let Some((next, reply)) = staged.await else {
+                                    return;
+                                };
+                                let outcome = weak.update(cx, |app: &mut TakoApp, cx| {
+                                    app.finish_offload_on_ui(next, origin, cx)
+                                });
+                                let result = match outcome {
+                                    Ok((result, redraw)) => {
+                                        for any in redraw {
+                                            let _ = any.update(cx, |_, window, cx| {
+                                                window.draw(cx).clear()
+                                            });
+                                        }
+                                        result
+                                    }
+                                    Err(_) => Err(tako_control::DispatchError::Operation(
+                                        "アプリが終了した".into(),
+                                    )),
+                                };
+                                let _ = reply.send(result);
+                            })
+                            .detach();
                         }
                         Err(e) => {
                             let _ = reply.send(Err(e));
@@ -4824,68 +4884,7 @@ impl TakoApp {
                             app.sync_scroll_from_dispatch(value, cx);
                         }
                     }
-                    // dispatch が依頼したセッション起動をここで実行（Context が要るため）。
-                    // PTY 起動失敗は生成済みペインを巻き戻してエラー応答にする（落とさない）
-                    for (pane, options) in std::mem::take(&mut app.pending_attach) {
-                        if let Err(e) = app.spawn_session(pane, options, cx) {
-                            app.remove_pane(pane, cx);
-                            result = Err(tako_control::DispatchError::Operation(format!(
-                                "PTY を起動できなかった: {e}"
-                            )));
-                        }
-                    }
-                    // セッション起動後の遅延書き込み（orchestrator spawn の claude 起動コマンド等）
-                    for (pane, data) in std::mem::take(&mut app.pending_writes) {
-                        if let Some(session) = app.terminals.get(&pane) {
-                            session.write(data);
-                        }
-                    }
-                    // alt_screen 遷移待ちの遅延書き込み（orchestrator spawn のプロンプト送信）
-                    app.flush_alt_screen_writes();
-                    // プレビューの syntect ハイライトを background で実行する
-                    for (pane, path, text) in std::mem::take(&mut app.pending_highlights) {
-                        app.spawn_highlight(pane, path, text, cx);
-                    }
-                    // #973: プレビュー編集の自動保存を回す。dispatch はペインの状態を
-                    // 変えるところまでで、500ms のタイマーには Context が要るので、
-                    // ここが **すべての dispatch が必ず通る 1 箇所**として消化する
-                    // （旧実装は GUI の入力経路だけがタイマーを始めていたため、
-                    // CLI / MCP の編集は autosave: true でも永久に保存されなかった）
-                    if !TakoApp::autosave_dispatch_legacy() {
-                        app.drive_autosave(cx);
-                    }
-                    // 重量プレビュー（PDF / 動画）の background 読み込み（Issue #168）
-                    app.drain_pending_preview_loads(cx);
-                    // CLI / MCP の再生・シークでもフレーム取得ティッカーを回す。
-                    // UI 操作と等価にし、一時停止中のシークで絵が古いまま残るのを
-                    // 防ぐ（#484）
-                    if app.video_players.values().any(|p| p.needs_tick()) {
-                        app.ensure_video_ticker(cx);
-                    }
-                    // ウィンドウ操作（Issue #339）の GPUI ウィンドウ生成・close を即座に
-                    // 反映する。render 冒頭の同期はウィンドウが隠れているとフレームが
-                    // 来ず走らないため、CLI / MCP 経路はここで消費する
-                    app.sync_viewports("dispatch", cx);
-                    if let Some(tab) = app.pending_settings_open.take() {
-                        app.open_settings_window_impl(tab, cx);
-                    }
-                    if std::mem::take(&mut app.pending_update_open) {
-                        app.open_update_window_impl(cx);
-                    }
-                    // コマンドカードのコピー（#666）。CLI / MCP から copy されたぶんを流す
-                    app.flush_pending_clipboard(cx);
-                    // AI / CLI 操作によるレイアウト変化を即座に永続化する（Phase 5.5）
-                    app.save_layout();
-                    cx.notify();
-                    // #1370: 描く相手は**この entity を root view にした全ビューポート**
-                    // （#339）。TakoApp の update の中で `draw` すると root view の
-                    // 二重借用でパニックするので、ハンドルだけ持ち出して外で描く
-                    // （`self_test::notify_and_draw` と同じ形・`main.rs` の poc 注記）
-                    let redraw: Vec<gpui::AnyWindowHandle> = if needs_frame {
-                        app.viewports.iter().map(|(_, h)| *h).collect()
-                    } else {
-                        Vec::new()
-                    };
+                    let redraw = app.after_dispatch(&mut result, needs_frame, cx);
                     (result, redraw)
                 });
                 match outcome {
@@ -6244,6 +6243,99 @@ impl TakoApp {
             open_preview(&url);
         }
         cx.notify();
+    }
+
+    /// IPC の dispatch 1 件のあとの後処理（#1680 で受信ループから切り出した）。
+    ///
+    /// dispatch が積んだ保留（セッション起動・遅延書き込み・ハイライト・自動保存・重いプレビューの
+    /// 読み込み・ウィンドウ操作）を消化してレイアウトを保存する。受信ループと、background から
+    /// UI スレッドへ戻った続き（[`Self::finish_offload_on_ui`]）の**両方がここを通る**。
+    /// 返すのは強制描画すべきビューポート（`needs_frame` のときだけ。#1370）
+    fn after_dispatch(
+        &mut self,
+        result: &mut Result<serde_json::Value, tako_control::DispatchError>,
+        needs_frame: bool,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyWindowHandle> {
+        // dispatch が依頼したセッション起動をここで実行（Context が要るため）。
+        // PTY 起動失敗は生成済みペインを巻き戻してエラー応答にする（落とさない）
+        for (pane, options) in std::mem::take(&mut self.pending_attach) {
+            if let Err(e) = self.spawn_session(pane, options, cx) {
+                self.remove_pane(pane, cx);
+                *result = Err(tako_control::DispatchError::Operation(format!(
+                    "PTY を起動できなかった: {e}"
+                )));
+            }
+        }
+        // セッション起動後の遅延書き込み（orchestrator spawn の claude 起動コマンド等）
+        for (pane, data) in std::mem::take(&mut self.pending_writes) {
+            if let Some(session) = self.terminals.get(&pane) {
+                session.write(data);
+            }
+        }
+        // alt_screen 遷移待ちの遅延書き込み（orchestrator spawn のプロンプト送信）
+        self.flush_alt_screen_writes();
+        // プレビューの syntect ハイライトを background で実行する
+        for (pane, path, text) in std::mem::take(&mut self.pending_highlights) {
+            self.spawn_highlight(pane, path, text, cx);
+        }
+        // #973: プレビュー編集の自動保存を回す。dispatch はペインの状態を
+        // 変えるところまでで、500ms のタイマーには Context が要るので、
+        // ここが **すべての dispatch が必ず通る 1 箇所**として消化する
+        // （旧実装は GUI の入力経路だけがタイマーを始めていたため、
+        // CLI / MCP の編集は autosave: true でも永久に保存されなかった）
+        if !Self::autosave_dispatch_legacy() {
+            self.drive_autosave(cx);
+        }
+        // 重量プレビュー（PDF / 動画）の background 読み込み（Issue #168）
+        self.drain_pending_preview_loads(cx);
+        // CLI / MCP の再生・シークでもフレーム取得ティッカーを回す。
+        // UI 操作と等価にし、一時停止中のシークで絵が古いまま残るのを
+        // 防ぐ（#484）
+        if self.video_players.values().any(|p| p.needs_tick()) {
+            self.ensure_video_ticker(cx);
+        }
+        // ウィンドウ操作（Issue #339）の GPUI ウィンドウ生成・close を即座に
+        // 反映する。render 冒頭の同期はウィンドウが隠れているとフレームが
+        // 来ず走らないため、CLI / MCP 経路はここで消費する
+        self.sync_viewports("dispatch", cx);
+        if let Some(tab) = self.pending_settings_open.take() {
+            self.open_settings_window_impl(tab, cx);
+        }
+        if std::mem::take(&mut self.pending_update_open) {
+            self.open_update_window_impl(cx);
+        }
+        // コマンドカードのコピー（#666）。CLI / MCP から copy されたぶんを流す
+        self.flush_pending_clipboard(cx);
+        // AI / CLI 操作によるレイアウト変化を即座に永続化する（Phase 5.5）
+        self.save_layout();
+        cx.notify();
+        // #1370: 描く相手は**この entity を root view にした全ビューポート**
+        // （#339）。TakoApp の update の中で `draw` すると root view の
+        // 二重借用でパニックするので、ハンドルだけ持ち出して外で描く
+        // （`self_test::notify_and_draw` と同じ形・`main.rs` の poc 注記）
+        if needs_frame {
+            self.viewports.iter().map(|(_, h)| *h).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// background で得た答えの続きを UI スレッドで行う（#1680 の定義ジャンプの着地）。
+    /// 着地は dispatch の [`tako_control::finish_offload`] の 1 実装で、後処理は受信ループと同じ
+    fn finish_offload_on_ui(
+        &mut self,
+        next: tako_control::OffloadContinuation,
+        origin: PaneOrigin,
+        cx: &mut Context<Self>,
+    ) -> (
+        Result<serde_json::Value, tako_control::DispatchError>,
+        Vec<gpui::AnyWindowHandle>,
+    ) {
+        let _span = tako_control::diag::perf_span("ipc_turn");
+        let mut result = tako_control::finish_offload(self, next, origin);
+        let redraw = self.after_dispatch(&mut result, !Self::ipc_redraw_legacy(), cx);
+        (result, redraw)
     }
 
     /// ⌃- / ⌃⇧-（Windows は Ctrl+Alt+← / →）の戻る / 進む（FR-3.29 / #1677）。
@@ -16189,6 +16281,8 @@ impl TakoApp {
         self.update_pdf_link_hover(event.position, link_mod, cx);
         // Markdown プレビューのリンクホバー（#680）
         self.update_md_link_hover(event.position, link_mod, cx);
+        // コードプレビューの識別子（定義ジャンプ。#1680）
+        self.update_code_symbol_hover(event.position, link_mod, cx);
 
         if event.pressed_button != Some(MouseButton::Left) {
             // ウィンドウ外でボタンが離されると MouseUp が届かないことがある。
@@ -16580,6 +16674,8 @@ impl TakoApp {
         self.update_pdf_link_hover(window.mouse_position(), link_mod, cx);
         // Markdown プレビューも同様（#680）
         self.update_md_link_hover(window.mouse_position(), link_mod, cx);
+        // コードプレビューの識別子も同様（#1680。⌘ を離したら下線が消える）
+        self.update_code_symbol_hover(window.mouse_position(), link_mod, cx);
     }
 
     /// ペインのリンク検出キャッシュを更新する
@@ -22450,12 +22546,76 @@ impl PreviewHost for TakoApp {
         };
         let item = line - 1;
         self.preview_pending_reveal.insert(pane, item);
+        // #1680: 編集中なら**キャレットも着地点へ**置く（同じファイル内の定義ジャンプ・戻る /
+        // 進むは編集セッションを保ったまま来る）。置かないと次の打鍵で追従（#1649）が元の場所へ
+        // 引き戻し、打つ場所と見ている場所が食い違う
+        if !tako_control::dispatch::lsp_goto_legacy() {
+            let char_column = column.map_or(0, |(column, _)| column - 1);
+            if let Some(edit) = self
+                .preview_edits
+                .get_mut(&pane)
+                .filter(|edit| edit.editing)
+            {
+                let line_start = edit.buffer.offset_for_line_byte_col(item, 0);
+                let text = edit.buffer.text();
+                let byte = text[line_start..]
+                    .char_indices()
+                    .take_while(|(_, ch)| *ch != '\n' && *ch != '\r')
+                    .nth(char_column)
+                    .map_or_else(
+                        || {
+                            text[line_start..]
+                                .find(['\n', '\r'])
+                                .map_or(text.len(), |i| line_start + i)
+                        },
+                        |(i, _)| line_start + i,
+                    );
+                edit.buffer.set_cursor(byte, false);
+                self.sync_preview_selection_from_editor(pane);
+            }
+        }
         Ok(tako_control::PreviewLineTarget {
             line,
             column: column.map(|(column, _)| column),
             total_lines,
             item,
             clamped: line_clamped || column.is_some_and(|(_, clamped)| clamped),
+        })
+    }
+
+    fn preview_goto_source(
+        &self,
+        pane: PaneId,
+        line: usize,
+    ) -> Result<tako_control::PreviewGotoSource, String> {
+        let preview = self
+            .previews
+            .get(&pane)
+            .ok_or_else(|| "プレビューペインではない".to_string())?;
+        let out_of_range = |count: usize| format!("{} 行目は無い（全 {count} 行）", line + 1);
+        // 編集セッションがあれば画面の本文はバッファ（未保存の変更を含む）
+        if let Some(edit) = self.preview_edits.get(&pane) {
+            let text = edit.buffer.text();
+            let line_text = text
+                .split('\n')
+                .nth(line)
+                .map(|l| l.strip_suffix('\r').unwrap_or(l).to_string())
+                .ok_or_else(|| out_of_range(text.split('\n').count()))?;
+            return Ok(tako_control::PreviewGotoSource {
+                line_text,
+                document: Some(text.to_string()),
+            });
+        }
+        let preview::PreviewContent::Code(lines) = &preview.content else {
+            return Err(
+                "コード表示のプレビューではない（Markdown のレンダリング表示・画像・PDF には原文の行が無い）"
+                    .into(),
+            );
+        };
+        let spans = lines.get(line).ok_or_else(|| out_of_range(lines.len()))?;
+        Ok(tako_control::PreviewGotoSource {
+            line_text: spans.iter().map(|s| s.text.as_str()).collect(),
+            document: None,
         })
     }
 
@@ -22861,6 +23021,8 @@ impl PreviewHost for TakoApp {
         self.preview_line_starts.remove(&pane);
         self.preview_line_texts.remove(&pane);
         self.forget_md_links(pane);
+        // #1680: ⌘ホバー中の行・候補の一覧は前のファイルの行を指している
+        self.forget_lsp_goto(pane);
         self.remove_preview_image_cache(pane);
         self.pending_pdf_rasters.remove(&pane);
         self.preview_views.remove(&pane);
@@ -25351,6 +25513,8 @@ impl Render for TakoApp {
             .children(pinned_overlays)
             .children(self.render_limit_service_overlay(cx))
             .children(self.render_run_menu_overlay(cx))
+            // #1680: 定義ジャンプの候補が複数のときの一覧
+            .children(self.render_lsp_goto_menu(window, cx))
             // #739: スターターのプロファイル選択。ビューポート実寸を渡して
             // 画面外へはみ出さないよう詰める（#615 のリモートカードと同じ理由）
             .children(self.render_starter_profile_menu_overlay(window, cx))

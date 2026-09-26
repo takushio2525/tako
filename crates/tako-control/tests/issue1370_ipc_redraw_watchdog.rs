@@ -146,14 +146,49 @@ fn 描画は応答を返す前に行う() {
     );
 }
 
+/// dispatch のあとの後処理（#1680 で受信ループから `fn after_dispatch` へ切り出した。
+/// background から UI スレッドへ戻った続き = 定義ジャンプの着地も同じここを通る）
+fn after_dispatch() -> (String, usize) {
+    let src = read(APP);
+    let (body, line) = region(&src, APP, "    fn after_dispatch(", "\n    }\n");
+    (code_only(body), line)
+}
+
 #[test]
 fn 描く相手は全ビューポート() {
     let (body, line) = ipc_loop();
     assert!(
-        body.contains("app.viewports.iter().map(|(_, h)| *h).collect()"),
+        body.contains("app.after_dispatch(&mut result, needs_frame, cx)"),
+        "{APP}:{line} IPC ループが後処理（after_dispatch）へ needs_frame を渡していない"
+    );
+    let (after, line) = after_dispatch();
+    assert!(
+        after.contains("self.viewports.iter().map(|(_, h)| *h).collect()"),
         "{APP}:{line} 描く相手をアクティブウィンドウ等に絞っている。\
          同一 entity を root view にした全ビューポート（#339）を描かないと、\
          2 枚目以降のウィンドウのペインだけ古い winsize で取り残される"
+    );
+}
+
+/// #1680: background から戻った続き（定義ジャンプの着地 = 新しいペインを生やしうる）も
+/// 同じ後処理を通り、A/B の口を通して 1 フレーム描く
+#[test]
+fn 続きの着地も同じ後処理で描く() {
+    let src = read(APP);
+    let (body, line) = region(&src, APP, "    fn finish_offload_on_ui(", "\n    }\n");
+    let body = code_only(body);
+    assert!(
+        body.contains("tako_control::finish_offload(self, next, origin)")
+            && body.contains("self.after_dispatch(&mut result, !Self::ipc_redraw_legacy(), cx)"),
+        "{APP}:{line} 続きの着地が後処理（after_dispatch）と強制描画の A/B を通っていない"
+    );
+    let (ipc, line) = ipc_loop();
+    let _ = ipc;
+    let whole = code_only(&src);
+    assert!(
+        whole.contains("app.finish_offload_on_ui(next, origin, cx)")
+            && whole.contains("window.draw(cx).clear()"),
+        "{APP}:{line} IPC の続き（OffloadOutcome::OnUi）を UI スレッドで着地させて描いていない"
     );
 }
 

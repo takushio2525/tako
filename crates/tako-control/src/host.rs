@@ -635,6 +635,16 @@ pub struct PreviewLineTarget {
     pub clamped: bool,
 }
 
+/// 定義ジャンプ（#1680）の起点になるプレビューの本文（[`PreviewHost::preview_goto_source`]）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewGotoSource {
+    /// 問い合わせる行の本文（改行を含まない。桁の検査と UTF-16 への変換に使う）
+    pub line_text: String,
+    /// 編集セッションがあればその全文（言語サーバが文書を開いていないとき、
+    /// ディスクの中身の代わりに渡す = 画面の本文とサーバの本文を揃える）
+    pub document: Option<String>,
+}
+
 pub trait PreviewHost {
     /// ペインのプレビュー状態（FR-3.2。`(path, mode)`。プレビューペインでなければ None）
     fn preview_state(&self, _pane: PaneId) -> Option<(String, crate::protocol::PreviewModeWire)> {
@@ -673,6 +683,15 @@ pub trait PreviewHost {
         _column: Option<usize>,
     ) -> Result<PreviewLineTarget, String> {
         Err("行ジャンプは未対応".into())
+    }
+    /// 定義ジャンプの起点（#1680）: いま表示しているコードの `line`（0 起点）行目の本文と、
+    /// 編集セッションがあればその全文。コードのプレビューでない・行が無ければ理由を返す
+    fn preview_goto_source(
+        &self,
+        _pane: PaneId,
+        _line: usize,
+    ) -> Result<PreviewGotoSource, String> {
+        Err("定義ジャンプは未対応".into())
     }
     /// code 表示のプレビューがいま見ている行（1 始まり。FR-3.29 / #1677）。
     ///

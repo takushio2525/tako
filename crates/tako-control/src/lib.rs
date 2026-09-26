@@ -103,12 +103,12 @@ pub mod worker_font;
 
 pub use dispatch::{
     dispatch, dispatch_orchestrator_accounts, dispatch_orchestrator_layout, fetch_tmux_sessions,
-    prepare_offload, remote_open_file_fetched, ControlHost, DispatchError, OffloadJob, PinnedView,
-    TmuxContext,
+    finish_offload, prepare_offload, remote_open_file_fetched, ControlHost, DispatchError,
+    LspGotoLanding, OffloadContinuation, OffloadJob, OffloadOutcome, PinnedView, TmuxContext,
 };
 pub use host::{
-    PreviewHost, PreviewLineTarget, RemoteHost, SessionHost, SystemHost, TmuxHost, UiStateHost,
-    VideoStatus, WebViewHost, WorkspaceHost,
+    PreviewGotoSource, PreviewHost, PreviewLineTarget, RemoteHost, SessionHost, SystemHost,
+    TmuxHost, UiStateHost, VideoStatus, WebViewHost, WorkspaceHost,
 };
 pub use ipc::{IncomingRequest, IpcServer};
 pub use mcp::McpServer;

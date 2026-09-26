@@ -1080,18 +1080,28 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
-        // 出自: #1679（LSP の言語機能。診断。定義ジャンプ・ホバー等は各スライスが action を足す）
+        // 出自: #1679（診断）/ #1680（定義ジャンプ）。LSP の言語機能。ホバー・補完等は各スライスが action を足す
         json!({
             "name": "tako_lsp",
-            "description": "言語サーバの言語機能。action=diagnostics（既定）で編集モードのコードの診断（エラー・警告）を返す。\
-                pane で絞り（省略で全文書）、severity でその重大度以上に絞る。位置は tako_preview_edit_range と同じ\
-                （行 1 始まり・桁 0 始まりの UTF-8 バイト）。",
+            "description": format!("言語サーバの言語機能。action=diagnostics（既定）は編集モードのコードの診断（エラー・警告）を返す\
+                （pane で絞り・省略で全文書。severity でその重大度以上に絞る）。\
+                action=definition / declaration / type-definition / implementation はコードプレビューの pane・line・column に\
+                ある識別子の飛び先へ飛ぶ（GUI の {}と同じ。pane の省略は呼び出し元）。同じファイルは同じペイン、\
+                同じタブで開いているファイルはそのペイン、それ以外は新しいペイン（open で right / down / new-tab、\
+                none は開かずに場所だけ）。status=found / choose（候補が複数。choice で選ぶ）/ not-found / timeout / \
+                not-installed 等と reason / next_step を返す。飛ぶとジャンプ履歴に積まれ tako_jump で戻れる。\
+                位置は tako_preview_edit_range と同じ（行 1 始まり・桁 0 始まりの UTF-8 バイト）。", link_click()),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": enum_schema(crate::dispatch::LSP_FEATURE_ACTIONS, "操作（既定 diagnostics）"),
-                    "pane": pane_schema("プレビューペイン ID（省略で全文書）"),
-                    "severity": enum_schema(&tako_core::lsp::diagnostic::Severity::NAMES, "この重大度以上に絞る"),
+                    "pane": pane_schema("プレビューペイン ID（diagnostics は省略で全文書、定義ジャンプは省略で呼び出し元）"),
+                    "severity": enum_schema(&tako_core::lsp::diagnostic::Severity::NAMES, "diagnostics: この重大度以上に絞る"),
+                    "line": { "type": "integer", "minimum": 1, "description": "定義ジャンプ: 行（1 始まり。必須）" },
+                    "column": { "type": "integer", "minimum": 0, "description": "定義ジャンプ: 桁（0 始まりの行内 UTF-8 バイト。文字の途中は拒否。必須）" },
+                    "open": enum_schema(&tako_core::lsp::goto::Placement::NAMES, "定義ジャンプ: 別のファイルを開く新しいペインの置き場所（省略で right）"),
+                    "choice": { "type": "integer", "minimum": 1, "description": "定義ジャンプ: 候補が複数のときに選ぶ番号（1 始まり）" },
+                    "focus": { "type": "boolean", "description": "定義ジャンプ: 着地したペインへフォーカスを移す（既定 false）" },
                 },
                 "additionalProperties": false,
             },

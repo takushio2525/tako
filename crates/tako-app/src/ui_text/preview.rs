@@ -227,6 +227,38 @@ pub fn search_toggle_word(on: bool) -> &'static str {
     }
 }
 
+// --- 定義ジャンプ（キー: preview.goto_*。#1680） ---
+// 理由・次の一手の日英は dispatch の応答（`tako_control::lsp::text`）が持つ。ここは画面だけの語
+
+/// 操作の名前（通知欄の「〜に失敗」と診断の op）
+pub fn goto_op() -> &'static str {
+    tr!("定義へ移動", "Go to definition")
+}
+
+/// 問い合わせ中の印（プレビューのヘッダに出す）
+pub fn goto_searching() -> &'static str {
+    tr!("定義を探しています…", "Finding definition…")
+}
+
+/// 候補が複数のときの一覧の見出し
+pub fn goto_choose(count: usize) -> String {
+    tr!(
+        format!("候補が {count} か所あります"),
+        format!("{count} candidates")
+    )
+}
+
+/// 通知欄へ出す 1 行（理由 + 次の一手。どちらも応答の文をそのまま使う）
+pub fn goto_notice(reason: &str, next_step: &str) -> String {
+    if next_step.is_empty() {
+        return reason.to_string();
+    }
+    tr!(
+        format!("{reason}。{next_step}"),
+        format!("{reason}. {next_step}")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests_support;
@@ -283,6 +315,10 @@ mod tests {
                 search_toggle_case(false).to_string(),
                 search_toggle_word(true).to_string(),
                 search_toggle_word(false).to_string(),
+                goto_op().to_string(),
+                goto_searching().to_string(),
+                goto_choose(3),
+                goto_notice("r", "n"),
             ]
         });
     }

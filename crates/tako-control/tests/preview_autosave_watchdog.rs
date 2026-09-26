@@ -105,13 +105,30 @@ fn ipcの1ターンが自動保存を消化する() {
         .iter()
         .position(|l| l.contains("while let Some(incoming) = control_rx.next().await"))
         .expect("IPC のリクエストループが main.rs にある（#973）");
-    // 1 ターンの後処理の最後は永続化（`save_layout`）
-    let end_at = lines[loop_at..]
+    // #1680: 1 ターンの後処理はループから `fn after_dispatch` へ切り出した（background から
+    // UI スレッドへ戻った続きも同じ後処理を通すため）。ループがそこへ委ねていることと、
+    // その本体（最後は永続化 = `save_layout`）に自動保存の消化があることの両方を見る
+    let loop_end = lines[loop_at..]
         .iter()
-        .position(|l| l.contains("app.save_layout();"))
+        .position(|l| l.contains("Err(_) => break, // View"))
         .map(|i| loop_at + i)
+        .expect("IPC のリクエストループの終わりがある");
+    assert!(
+        lines[loop_at..loop_end]
+            .iter()
+            .any(|l| !l.trim_start().starts_with("//") && l.contains("app.after_dispatch(")),
+        "IPC の 1 ターンが後処理（after_dispatch）へ委ねていない（#973 / #1680）"
+    );
+    let body_at = lines
+        .iter()
+        .position(|l| l.contains("    fn after_dispatch("))
+        .expect("後処理の本体（fn after_dispatch）が main.rs にある（#1680）");
+    let end_at = lines[body_at..]
+        .iter()
+        .position(|l| l.contains("self.save_layout();"))
+        .map(|i| body_at + i)
         .expect("IPC の 1 ターンの後処理に save_layout がある（#973）");
-    let turn = lines[loop_at..end_at]
+    let turn = lines[body_at..end_at]
         .iter()
         .filter(|l| !l.trim_start().starts_with("//"))
         .copied()

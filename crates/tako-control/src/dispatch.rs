@@ -118,6 +118,18 @@ struct OpenFileArgs {
     new_tab: bool,
     line: Option<usize>,
     column: Option<usize>,
+    /// ジャンプ履歴へ積む「飛ぶ前にいた場所」の採り方（#1680 で足した）
+    jump_from: JumpFrom,
+}
+
+/// 「飛ぶ前にいた場所」をどのペインから採るか（FR-3.29 / #1680）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JumpFrom {
+    /// 差し替えられるプレビュー（再利用するとき）か、新しく生やすなら基準ペイン（#1677 の既定）
+    Auto,
+    /// このペイン。定義ジャンプは「問い合わせたペイン」が起点で、着地先
+    /// （使い回す別のペイン）ではない = 戻るで問い合わせた場所へ帰る
+    Pane(PaneId),
 }
 
 /// 行を指定して開いたとき、ジャンプ履歴へ積むか（FR-3.29 / #1677）
@@ -148,6 +160,7 @@ fn open_file(
         new_tab,
         line,
         column,
+        jump_from: jump_from_rule,
     } = args;
     if new_tab && direction.is_some() {
         return Err(DispatchError::Operation(
@@ -255,14 +268,29 @@ fn open_file(
     // #1677: 「飛ぶ前にいた場所」= 差し替えられるプレビュー（再利用するとき）か、
     // 新しく生やすなら基準ペイン（それがプレビューなら）。**set_preview の前**に採る
     // （後だと差し替えた新しい中身を読んでしまう）
-    let jump_from = match (record, line) {
-        (JumpRecord::Record, Some(_)) => {
+    let jump_from = match (record, line, jump_from_rule) {
+        (JumpRecord::Record, Some(_), JumpFrom::Pane(pane)) => jump_origin(&*host, pane),
+        (JumpRecord::Record, Some(_), JumpFrom::Auto) => {
             jump_origin(&*host, if created { target } else { view_pane })
         }
         _ => None,
     };
-    host.set_preview(view_pane, &path_str, mode)
-        .map_err(DispatchError::Operation)?;
+    // #1680: 行を指定して**いま表示しているのと同じファイル**を開くときは読み直さない。
+    // 読み直すと編集セッションを捨て（未保存なら断られ）、同じファイル内の定義ジャンプ・
+    // 戻る / 進むのたびに編集モードが抜ける。着地（行へ飛ぶ・編集中ならキャレット）だけを行う
+    let same_document = !created
+        && line.is_some()
+        && mode == PreviewModeWire::Code
+        && !lsp_goto_legacy()
+        && host
+            .preview_state(view_pane)
+            .is_some_and(|(shown, shown_mode)| {
+                shown == path_str && shown_mode == PreviewModeWire::Code
+            });
+    if !same_document {
+        host.set_preview(view_pane, &path_str, mode)
+            .map_err(DispatchError::Operation)?;
+    }
     // #1676: 着地点の予約は**開いたあと**（行数はロード済みの内容から数える）。
     // ここで失敗するのは「拡張子はテキストなのに中身が読めない」ときだけなので、
     // 開いたことが分かる文言にして返す（ペインはそのまま残る）
@@ -314,6 +342,8 @@ fn open_file(
         "item": landing.map(|l| l.item),
         "total_lines": landing.map(|l| l.total_lines),
         "clamped": landing.is_some_and(|l| l.clamped),
+        // #1680: 同じファイルを読み直さずに着地した
+        "reloaded": !same_document,
     }))
 }
 
@@ -453,6 +483,7 @@ fn jump(
             new_tab: false,
             line: target.location.line,
             column: target.location.column,
+            jump_from: JumpFrom::Auto,
         },
         JumpRecord::Skip,
     )?;
@@ -484,6 +515,282 @@ fn jump(
         "dropped": dropped,
         "history": summary,
     }))
+}
+
+/// `TAKO_1680_LEGACY=1` で **#1680 前の挙動**へ戻す（同一バイナリで A/B を取る入口）:
+/// 行を指定して同じファイルを開いても読み直す・GUI の ⌘ホバー / ⌘クリックが定義を探さない。
+/// CLI / MCP の `tako lsp definition` は残る（戻すのは既存経路への影響だけ）
+pub fn lsp_goto_legacy() -> bool {
+    std::env::var_os("TAKO_1680_LEGACY").is_some()
+}
+
+/// 定義ジャンプの問い合わせ（#1680）。UI スレッドで [`lsp_goto_prepare`] が作り、
+/// [`LspGotoJob::run`] を背景で走らせ、答えを載せた [`LspGotoLanding`] を
+/// UI スレッドの [`lsp_goto_land`] へ戻す（GUI の ⌘クリックと CLI / MCP が同じ 3 段を通る）
+pub struct LspGotoJob {
+    manager: crate::lsp::LspManager,
+    request: crate::lsp::GotoRequest,
+    landing: LspGotoLanding,
+}
+
+impl LspGotoJob {
+    /// 言語サーバへ問い合わせる（**UI スレッドで呼ばない**。上限は `GotoRequest::timeout`）
+    pub fn run(self) -> LspGotoLanding {
+        let mut landing = self.landing;
+        landing.answer = Some(self.manager.goto(&self.request));
+        landing
+    }
+}
+
+/// 着地に要るもの（問い合わせたペインと引数）と、背景で得た答え（#1680）
+#[derive(Debug, Clone)]
+pub struct LspGotoLanding {
+    pub kind: tako_core::lsp::goto::GotoKind,
+    /// 問い合わせたペインと、そのとき表示していたファイル
+    pub source_pane: PaneId,
+    pub source_path: String,
+    /// 問い合わせた位置（行 1 始まり・桁 0 始まりの行内 UTF-8 バイト）
+    pub line: usize,
+    pub column: usize,
+    pub placement: tako_core::lsp::goto::Placement,
+    /// 候補が複数のときに選ぶ番号（1 始まり）。GUI は一覧で選んだあと入れ直して呼ぶ
+    pub choice: Option<usize>,
+    pub focus: Option<bool>,
+    /// 背景で得た答え（[`LspGotoJob::run`] が入れる）
+    pub answer: Option<Result<crate::lsp::GotoAnswer, crate::lsp::GotoError>>,
+}
+
+/// 定義ジャンプの準備（UI スレッド。#1680）。引数を検査し、問い合わせる位置を
+/// 言語サーバの座標（UTF-16 の桁）へ直す。**1 プロセスも起こさない**
+#[allow(clippy::too_many_arguments)]
+pub fn lsp_goto_prepare(
+    host: &dyn ControlHost,
+    action: &str,
+    pane: Option<u64>,
+    line: usize,
+    column: usize,
+    open: Option<&str>,
+    choice: Option<usize>,
+    focus: Option<bool>,
+) -> Result<LspGotoJob, DispatchError> {
+    use tako_core::lsp::goto::{GotoKind, Placement};
+    let kind = GotoKind::parse(action).ok_or_else(|| {
+        DispatchError::InvalidParams(format!(
+            "action が不正: {action}（{}）",
+            GotoKind::NAMES.join(" / ")
+        ))
+    })?;
+    let placement = match open {
+        None => Placement::Auto,
+        Some(name) => Placement::parse(name).ok_or_else(|| {
+            DispatchError::InvalidParams(format!(
+                "open が不正: {name}（{}）",
+                Placement::NAMES.join(" / ")
+            ))
+        })?,
+    };
+    if line == 0 {
+        return Err(DispatchError::InvalidParams(
+            tako_core::open_plan::LINE_ONE_BASED.into(),
+        ));
+    }
+    if choice == Some(0) {
+        return Err(DispatchError::InvalidParams(
+            "choice は 1 始まり（候補の一覧の番号）".into(),
+        ));
+    }
+    let (_, target) = resolve_pane(host.workspace(), pane)?;
+    let Some((path, _)) = host.preview_state(target) else {
+        return Err(DispatchError::InvalidParams(format!(
+            "プレビューペインではない: {}",
+            target.as_u64()
+        )));
+    };
+    let source = host
+        .preview_goto_source(target, line - 1)
+        .map_err(DispatchError::InvalidParams)?;
+    // 桁は丸めずに拒否する（`tako edit replace-range` と同じ。#1658）
+    if column > source.line_text.len() || !source.line_text.is_char_boundary(column) {
+        return Err(DispatchError::InvalidParams(format!(
+            "column {column} は {line} 行目（{} バイト）の文字の境界ではない",
+            source.line_text.len()
+        )));
+    }
+    let Some(manager) = host.lsp() else {
+        return Err(DispatchError::Operation(
+            crate::lsp::text::UNAVAILABLE.text().to_string(),
+        ));
+    };
+    let (_, character) = tako_core::lsp::position::lsp_position_of(&source.line_text, column);
+    Ok(LspGotoJob {
+        manager: manager.clone(),
+        request: crate::lsp::GotoRequest {
+            kind,
+            path: PathBuf::from(&path),
+            line: line - 1,
+            character,
+            timeout: crate::lsp::goto::goto_timeout(),
+            document: source.document,
+        },
+        landing: LspGotoLanding {
+            kind,
+            source_pane: target,
+            source_path: path,
+            line,
+            column,
+            placement,
+            choice,
+            focus,
+            answer: None,
+        },
+    })
+}
+
+/// 2 つのパスが同じファイルか（境界 B26 で正規化してから比べる。解けなければ字面で）
+fn same_file(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (
+        tako_core::platform::path::canonicalize(a),
+        tako_core::platform::path::canonicalize(b),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// 定義ジャンプの着地（UI スレッド。#1680）。答えを見て開き方を決め、[`open_file`] を通す
+/// （= ジャンプ履歴へ積む。起点は問い合わせたペイン）。
+///
+/// 規則の正本は `tako_core::lsp::goto::plan_landing`。「見つからない」「未応答」「未導入」等は
+/// `status` と理由・次の一手で返す（失敗ではなく答え = CLI / MCP が読んで次へ進める）
+pub fn lsp_goto_land(
+    host: &mut dyn ControlHost,
+    origin: PaneOrigin,
+    landing: &LspGotoLanding,
+) -> Result<Value, DispatchError> {
+    use tako_core::lsp::goto::{plan_landing, Landing, NewPane, Placement};
+    let kind = landing.kind;
+    let from = json!({
+        "pane": landing.source_pane.as_u64(),
+        "path": landing.source_path,
+        "line": landing.line,
+        "column": landing.column,
+    });
+    let answer = match &landing.answer {
+        Some(Ok(answer)) => answer,
+        Some(Err(error)) => {
+            let mut out = error.to_json(kind);
+            out["from"] = from;
+            return Ok(out);
+        }
+        None => {
+            return Err(DispatchError::Operation(
+                "定義ジャンプの答えがまだ無い（背景の問い合わせを経ずに着地しようとした）".into(),
+            ))
+        }
+    };
+    if answer.targets.is_empty() {
+        let mut out = crate::lsp::goto::not_found_json(kind, answer.server);
+        out["from"] = from;
+        return Ok(out);
+    }
+    let locations: Vec<Value> = answer
+        .targets
+        .iter()
+        .map(crate::lsp::goto::target_json)
+        .collect();
+    let mut out = json!({
+        "status": "found",
+        "kind": kind.slug(),
+        "server": answer.server,
+        "from": from,
+        "locations": locations,
+    });
+    let target = match (answer.targets.len(), landing.choice) {
+        (1, None) => &answer.targets[0],
+        (count, None) => {
+            out["status"] = json!("choose");
+            out["next_step"] = json!(crate::lsp::text::fill(
+                crate::lsp::text::GOTO_CHOOSE_NEXT_STEP,
+                &[("count", &count.to_string())]
+            ));
+            return Ok(out);
+        }
+        (count, Some(choice)) => answer.targets.get(choice - 1).ok_or_else(|| {
+            DispatchError::InvalidParams(format!("choice {choice} は候補（{count} か所）の外"))
+        })?,
+    };
+    out["chosen"] = json!(landing.choice.unwrap_or(1));
+    if landing.placement == Placement::None {
+        return Ok(out);
+    }
+    // 待っているあいだに問い合わせたペインが閉じられた / 差し替わったら着地しない
+    // （別のファイルの上で「同じペイン」へ飛ばない）
+    let still_there = host
+        .preview_state(landing.source_pane)
+        .is_some_and(|(path, _)| path == landing.source_path);
+    let Ok((tab, _)) = resolve_pane(host.workspace(), Some(landing.source_pane.as_u64())) else {
+        return Ok(source_gone_json(kind, out));
+    };
+    if !still_there {
+        return Ok(source_gone_json(kind, out));
+    }
+    let open_in_tab: Vec<(PaneId, PathBuf)> = host
+        .workspace()
+        .get_tab(tab)
+        .map(|t| t.tree().panes().iter().map(|p| p.id()).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|id| *id != landing.source_pane)
+        .filter_map(|id| {
+            host.preview_state(id)
+                .map(|(path, _)| (id, PathBuf::from(path)))
+        })
+        .collect();
+    let plan = plan_landing(
+        Path::new(&landing.source_path),
+        &target.path,
+        &open_in_tab,
+        landing.placement,
+        same_file,
+    );
+    let (pane, direction, new_tab) = match plan {
+        Landing::SamePane => (landing.source_pane, None, false),
+        Landing::Reuse(pane) => (pane, None, false),
+        Landing::New(NewPane::Right) => (landing.source_pane, Some(Direction::Right), false),
+        Landing::New(NewPane::Down) => (landing.source_pane, Some(Direction::Down), false),
+        Landing::New(NewPane::Tab) => (landing.source_pane, None, true),
+    };
+    let opened = open_file(
+        host,
+        origin,
+        OpenFileArgs {
+            pane: Some(pane.as_u64()),
+            path: target.path.display().to_string(),
+            mode: Some(PreviewModeWire::Code),
+            direction,
+            focus: landing.focus,
+            new_tab,
+            line: Some(target.line + 1),
+            // `OpenFile` の桁は 1 始まりの文字数
+            column: Some(target.char_column + 1),
+            jump_from: JumpFrom::Pane(landing.source_pane),
+        },
+        JumpRecord::Record,
+    )?;
+    out["landing"] = json!(plan.slug());
+    out["open"] = opened;
+    Ok(out)
+}
+
+fn source_gone_json(kind: tako_core::lsp::goto::GotoKind, mut out: Value) -> Value {
+    out["status"] = json!("source-gone");
+    out["kind"] = json!(kind.slug());
+    out["reason"] = json!(crate::lsp::text::GOTO_SOURCE_GONE_REASON.text());
+    out["next_step"] = json!(crate::lsp::text::GOTO_RETRY_NEXT_STEP.text());
+    out
 }
 
 /// リクエストを実行し、成功時の `result` 値を返す。
@@ -552,6 +859,37 @@ pub enum OffloadJob {
         action: String,
         name: Option<String>,
     },
+    /// 定義ジャンプの問い合わせ（#1680）。サーバの起動と応答を待つので background へ出し、
+    /// 着地（ペインを開く）は [`OffloadOutcome::OnUi`] で UI スレッドへ戻す
+    LspGoto(Box<LspGotoJob>),
+}
+
+/// background で走らせた結果（#1680）
+pub enum OffloadOutcome {
+    /// そのまま応答する
+    Reply(Result<Value, DispatchError>),
+    /// UI スレッドで続き（[`finish_offload`]）を行ってから応答する。
+    /// workspace を変える操作（ペインを開く）は UI スレッドでしかできないため
+    OnUi(OffloadContinuation),
+}
+
+/// UI スレッドへ戻す続き（#1680）
+pub enum OffloadContinuation {
+    /// 定義ジャンプの着地（[`lsp_goto_land`]）
+    LspGoto(Box<LspGotoLanding>),
+}
+
+/// background の結果を受けて UI スレッドで続きを行う（#1680）。IPC の受け口と GUI の
+/// ⌘クリックが同じここを通る（着地の実装を 2 本にしない）
+pub fn finish_offload(
+    host: &mut dyn ControlHost,
+    continuation: OffloadContinuation,
+    origin: PaneOrigin,
+) -> Result<Value, DispatchError> {
+    let _span = crate::diag::perf_span("dispatch:finish_offload");
+    match continuation {
+        OffloadContinuation::LspGoto(landing) => lsp_goto_land(host, origin, &landing),
+    }
 }
 
 /// リクエストが offload 対象なら UI スレッド必須の文脈を収集してジョブ化する。
@@ -650,13 +988,47 @@ pub fn prepare_offload(
                 name: name.clone(),
             })
         }),
+        // #1680: 準備（引数の検査・位置の変換）は UI スレッド、問い合わせは background
+        Request::LspGoto {
+            action,
+            pane,
+            line,
+            column,
+            open,
+            choice,
+            focus,
+        } => Some(
+            lsp_goto_prepare(
+                host,
+                action,
+                *pane,
+                *line,
+                *column,
+                open.as_deref(),
+                *choice,
+                *focus,
+            )
+            .map(|job| OffloadJob::LspGoto(Box::new(job))),
+        ),
         _ => None,
     }
 }
 
 impl OffloadJob {
-    /// ジョブ本体（サブプロセス実行）。UI スレッドで呼ばないこと
-    pub fn run(self) -> Result<Value, DispatchError> {
+    /// ジョブ本体（サブプロセス実行）。UI スレッドで呼ばないこと。
+    ///
+    /// 大半はそのまま応答（[`OffloadOutcome::Reply`]）で、workspace を変える続きが要るものだけ
+    /// [`OffloadOutcome::OnUi`] を返す（受け口は UI スレッドで [`finish_offload`] を呼ぶ）
+    pub fn run_staged(self) -> OffloadOutcome {
+        match self {
+            OffloadJob::LspGoto(job) => {
+                OffloadOutcome::OnUi(OffloadContinuation::LspGoto(Box::new(job.run())))
+            }
+            other => OffloadOutcome::Reply(other.run_reply()),
+        }
+    }
+
+    fn run_reply(self) -> Result<Value, DispatchError> {
         match self {
             OffloadJob::WorkerStatus {
                 ctx,
@@ -681,6 +1053,9 @@ impl OffloadJob {
                 action,
                 name,
             } => lsp_server_action(Some(&manager), &action, name.as_deref()),
+            OffloadJob::LspGoto(_) => Err(DispatchError::Operation(
+                "定義ジャンプは run_staged で走らせる（着地に UI スレッドの続きが要る）".into(),
+            )),
         }
     }
 }
@@ -2630,6 +3005,7 @@ fn dispatch_inner(
                 new_tab,
                 line,
                 column,
+                jump_from: JumpFrom::Auto,
             },
             JumpRecord::Record,
         ),
@@ -3551,6 +3927,30 @@ fn dispatch_inner(
         // #1679: 表を読むだけ（ロックを短く取る）なので UI スレッドで同期実行する
         Request::LspDiagnostics { pane, severity } => {
             lsp_diagnostics(host, pane, severity.as_deref())
+        }
+
+        // #1680: 通常は prepare_offload が問い合わせを background へ出す。ここへ来るのは
+        // `TAKO_OFFLOAD=0` か直呼び（テスト）で、同じ 3 段（準備 → 問い合わせ → 着地）を直列に通る
+        Request::LspGoto {
+            action,
+            pane,
+            line,
+            column,
+            open,
+            choice,
+            focus,
+        } => {
+            let job = lsp_goto_prepare(
+                host,
+                &action,
+                pane,
+                line,
+                column,
+                open.as_deref(),
+                choice,
+                focus,
+            )?;
+            lsp_goto_land(host, origin, &job.run())
         }
 
         Request::SetupMcp { scope, pane, agent } => {
@@ -12790,6 +13190,17 @@ pub struct CheckHealthCtx {
 /// `tako lsp` / MCP `tako_lsp_server` の action（#1678）。CLI と MCP はこの綴りを共有する
 pub const LSP_ACTIONS: &[&str] = &["status", "list", "restart", "stop", "logs"];
 
+/// MCP `tako_lsp`（言語機能）の action。CLI は `tako lsp <action>`。
+/// 診断（#1679）と定義ジャンプの 4 種（#1680。綴りの正本は `GotoKind::NAMES`）。
+/// 先頭が MCP の既定。ホバー・補完等のスライスはここへ足す（ツールは増やさない）
+pub const LSP_FEATURE_ACTIONS: &[&str] = &[
+    "diagnostics",
+    tako_core::lsp::goto::GotoKind::NAMES[0],
+    tako_core::lsp::goto::GotoKind::NAMES[1],
+    tako_core::lsp::goto::GotoKind::NAMES[2],
+    tako_core::lsp::goto::GotoKind::NAMES[3],
+];
+
 /// 言語サーバの操作の 1 実装（#1678）。CLI・MCP・同期実行・offload のすべてがここを通る。
 ///
 /// `manager` が無い host（テスト・セカンダリ）は「使えない」を返す。`name` は検出表の ID で、
@@ -12830,10 +13241,6 @@ pub fn lsp_server_action(
         _ => manager.status(name),
     })
 }
-
-/// MCP `tako_lsp`（言語機能）の action（#1679）。CLI は `tako lsp <action>`。
-/// 定義ジャンプ・ホバー等のスライスはここへ足す（ツールは増やさない）
-pub const LSP_FEATURE_ACTIONS: &[&str] = &["diagnostics"];
 
 /// 診断の一覧の 1 実装（#1679）。CLI `tako lsp diagnostics` と MCP `tako_lsp` が通る。
 ///
@@ -16554,6 +16961,35 @@ mod tests {
         fn preview_current_line(&self, pane: PaneId) -> Option<usize> {
             self.preview_lines.get(&pane.as_u64()).copied()
         }
+        /// #1680: 起点の本文は GUI と同じ材料（編集中ならバッファ、でなければ実ファイル）
+        fn preview_goto_source(
+            &self,
+            pane: PaneId,
+            line: usize,
+        ) -> Result<crate::host::PreviewGotoSource, String> {
+            let (path, _) = self
+                .previews
+                .get(&pane.as_u64())
+                .ok_or_else(|| "プレビューペインではない".to_string())?;
+            let (text, document) = match self.preview_edits.get(&pane.as_u64()) {
+                Some((_, _, buffer)) => {
+                    (buffer.text().to_string(), Some(buffer.text().to_string()))
+                }
+                None => (
+                    std::fs::read_to_string(path).map_err(|e| e.to_string())?,
+                    None,
+                ),
+            };
+            let line_text = text
+                .lines()
+                .nth(line)
+                .ok_or_else(|| format!("{} 行目は無い", line + 1))?
+                .to_string();
+            Ok(crate::host::PreviewGotoSource {
+                line_text,
+                document,
+            })
+        }
         fn jump_history(&self) -> Option<&tako_core::jump_history::JumpHistory> {
             Some(&self.jumps)
         }
@@ -19346,6 +19782,318 @@ mod tests {
 
     /// FR-3.22 / #835: `new_tab` は「そのファイルだけが載った 1 枚」を作る。
     /// Finder の「このアプリケーションで開く」がこの経路を通る
+    /// #1680: 背景の問い合わせを経た答え（`LspGotoJob::run` の出力）を組む。
+    /// 着地の規則はサーバ無しで測れる（答えを直に渡す）
+    fn goto_landing(
+        source: u64,
+        source_path: &std::path::Path,
+        targets: &[(&std::path::Path, usize)],
+        placement: tako_core::lsp::goto::Placement,
+        choice: Option<usize>,
+    ) -> LspGotoLanding {
+        LspGotoLanding {
+            kind: tako_core::lsp::goto::GotoKind::Definition,
+            source_pane: PaneId::from_raw(source),
+            source_path: source_path.display().to_string(),
+            line: 3,
+            column: 4,
+            placement,
+            choice,
+            focus: None,
+            answer: Some(Ok(crate::lsp::GotoAnswer {
+                server: "fake",
+                targets: targets
+                    .iter()
+                    .map(|(path, line)| crate::lsp::GotoTarget {
+                        uri: tako_core::file_uri::from_path(path),
+                        path: path.to_path_buf(),
+                        line: *line,
+                        column: 0,
+                        char_column: 0,
+                        excerpt: format!("line {line}"),
+                    })
+                    .collect(),
+            })),
+        }
+    }
+
+    /// FR-3.30 / #1680 の着地の規則: 別のファイル = 新しいペイン / 同じ定義へ 2 回 = 使い回す /
+    /// 同じファイル = 同じペイン（読み直さない）。どれもジャンプ履歴へ積み、戻るで問い合わせた
+    /// ペインへ帰る（起点は着地先ではなく問い合わせたペイン）
+    #[test]
+    fn 定義ジャンプの着地は新しいペイン_使い回し_同じペイン() {
+        use tako_core::lsp::goto::Placement;
+        let dir = jump_fixture("goto-land", &["main.rs", "other.rs"]);
+        let (main, other) = (dir.join("main.rs"), dir.join("other.rs"));
+        let main = tako_core::platform::path::canonicalize(&main).unwrap();
+        let other = tako_core::platform::path::canonicalize(&other).unwrap();
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let source = jump_open(&mut host, root, &main, None, Some(Direction::Right))["pane"]
+            .as_u64()
+            .unwrap();
+        host.preview_lines.insert(source, 12);
+        let before = pane_count(&host);
+
+        // 1. 別のファイル → 新しいペインが 1 枚増え、その行へ着地する
+        let landed = lsp_goto_land(
+            &mut host,
+            PaneOrigin::User,
+            &goto_landing(source, &main, &[(&other, 41)], Placement::Auto, None),
+        )
+        .unwrap();
+        assert_eq!(landed["status"], json!("found"));
+        assert_eq!(landed["landing"], json!("new-pane"));
+        assert_eq!(pane_count(&host), before + 1, "ペインが 1 枚増える");
+        let target = landed["open"]["pane"].as_u64().unwrap();
+        assert_ne!(target, source);
+        assert_eq!(landed["open"]["created"], json!(true));
+        assert_eq!(landed["open"]["line"], json!(42), "0 起点の 41 = 42 行目");
+        assert_eq!(host.preview_lines[&target], 42);
+        assert!(host.previews[&target].0.ends_with("other.rs"));
+        assert_eq!(landed["locations"][0]["line"], json!(42));
+
+        // 2. 同じ定義へもう一度 → ペインは増えず、同じペインを使い回す
+        let again = lsp_goto_land(
+            &mut host,
+            PaneOrigin::User,
+            &goto_landing(source, &main, &[(&other, 41)], Placement::Down, None),
+        )
+        .unwrap();
+        assert_eq!(again["landing"], json!("reused"));
+        assert_eq!(again["open"]["pane"].as_u64(), Some(target));
+        assert_eq!(again["open"]["created"], json!(false));
+        assert_eq!(pane_count(&host), before + 1, "2 回飛んでも 2 枚にならない");
+
+        // 3. 同じファイル → 同じペインのまま（読み直さない = 編集セッションを保つ）
+        let same = lsp_goto_land(
+            &mut host,
+            PaneOrigin::User,
+            &goto_landing(source, &main, &[(&main, 79)], Placement::Auto, None),
+        )
+        .unwrap();
+        assert_eq!(same["landing"], json!("same-pane"));
+        assert_eq!(same["open"]["pane"].as_u64(), Some(source));
+        assert_eq!(same["open"]["reloaded"], json!(false));
+        assert_eq!(host.preview_lines[&source], 80);
+        assert_eq!(pane_count(&host), before + 1);
+
+        // 履歴: 飛ぶ前の場所は毎回**問い合わせたペイン**（main.rs:12）で、着地先ではない。
+        // 3 回とも起点が直前の着地点と違うので、起点と着地点の対が 3 組積まれる（#1677 の規則）
+        assert_eq!(
+            jump_entries(&mut host),
+            vec![
+                "main.rs:12",
+                "other.rs:42",
+                "main.rs:12",
+                "other.rs:42",
+                "main.rs:12",
+                ">main.rs:80"
+            ]
+        );
+        // 戻る → main.rs:12（問い合わせたペインへ帰る）
+        let back = jump_call(&mut host, "back", Some(root), None);
+        assert_eq!(back["open"]["pane"].as_u64(), Some(source));
+        assert_eq!(back["open"]["line"], json!(12));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 候補が複数なら一覧を返して開かない。`choice` で選ぶとその場所へ（範囲外は拒否）
+    #[test]
+    fn 定義ジャンプの候補が複数なら一覧を返し選んで着地する() {
+        use tako_core::lsp::goto::Placement;
+        let dir = jump_fixture("goto-choose", &["main.rs", "a.rs", "b.rs"]);
+        let main = tako_core::platform::path::canonicalize(&dir.join("main.rs")).unwrap();
+        let (a, b) = (dir.join("a.rs"), dir.join("b.rs"));
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let source = jump_open(&mut host, root, &main, None, Some(Direction::Right))["pane"]
+            .as_u64()
+            .unwrap();
+        let before = pane_count(&host);
+        let targets = [(a.as_path(), 1), (b.as_path(), 5)];
+        let choose = lsp_goto_land(
+            &mut host,
+            PaneOrigin::User,
+            &goto_landing(source, &main, &targets, Placement::Auto, None),
+        )
+        .unwrap();
+        assert_eq!(choose["status"], json!("choose"));
+        assert_eq!(choose["locations"].as_array().unwrap().len(), 2);
+        assert!(choose.get("open").is_none(), "選ぶまで開かない");
+        assert_eq!(
+            choose["next_step"],
+            json!(crate::lsp::text::fill(
+                crate::lsp::text::GOTO_CHOOSE_NEXT_STEP,
+                &[("count", "2")]
+            ))
+        );
+        assert_eq!(pane_count(&host), before);
+        let chosen = lsp_goto_land(
+            &mut host,
+            PaneOrigin::User,
+            &goto_landing(source, &main, &targets, Placement::Auto, Some(2)),
+        )
+        .unwrap();
+        assert_eq!(chosen["chosen"], json!(2));
+        assert!(chosen["open"]["path"].as_str().unwrap().ends_with("b.rs"));
+        assert_eq!(chosen["open"]["line"], json!(6));
+        let out_of_range = lsp_goto_land(
+            &mut host,
+            PaneOrigin::User,
+            &goto_landing(source, &main, &targets, Placement::Auto, Some(3)),
+        );
+        assert!(matches!(out_of_range, Err(DispatchError::InvalidParams(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `open=none` は開かずに場所だけ・`new-tab` は新しいタブ・問い合わせたペインが差し替わって
+    /// いたら着地しない・失敗は status と理由・次の一手で返す
+    #[test]
+    fn 定義ジャンプの置き場所と後始末() {
+        use tako_core::lsp::goto::Placement;
+        let dir = jump_fixture("goto-place", &["main.rs", "other.rs", "third.rs"]);
+        let main = tako_core::platform::path::canonicalize(&dir.join("main.rs")).unwrap();
+        let other = dir.join("other.rs");
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let source = jump_open(&mut host, root, &main, None, Some(Direction::Right))["pane"]
+            .as_u64()
+            .unwrap();
+        let (tabs, panes) = (host.ws.tabs().len(), pane_count(&host));
+        // none: 場所だけ返し、何も開かない・積まない
+        let only = lsp_goto_land(
+            &mut host,
+            PaneOrigin::Mcp,
+            &goto_landing(source, &main, &[(&other, 9)], Placement::None, None),
+        )
+        .unwrap();
+        assert_eq!(only["status"], json!("found"));
+        assert!(only.get("open").is_none() && only.get("landing").is_none());
+        assert_eq!(pane_count(&host), panes);
+        assert!(jump_entries(&mut host).is_empty());
+        // new-tab: タブが 1 つ増える
+        let tab = lsp_goto_land(
+            &mut host,
+            PaneOrigin::Mcp,
+            &goto_landing(source, &main, &[(&other, 9)], Placement::NewTab, None),
+        )
+        .unwrap();
+        assert_eq!(tab["landing"], json!("new-tab"));
+        assert_eq!(host.ws.tabs().len(), tabs + 1);
+        // 問い合わせたペインが別のファイルへ差し替わっていたら着地しない
+        jump_open(&mut host, source, &dir.join("third.rs"), None, None);
+        let gone = lsp_goto_land(
+            &mut host,
+            PaneOrigin::Mcp,
+            &goto_landing(source, &main, &[(&other, 9)], Placement::Auto, None),
+        )
+        .unwrap();
+        assert_eq!(gone["status"], json!("source-gone"));
+        assert_eq!(
+            gone["reason"],
+            json!(crate::lsp::text::GOTO_SOURCE_GONE_REASON.text())
+        );
+        // 失敗（未応答）は理由と次の一手を返す（失敗ではなく答え）
+        let mut failed = goto_landing(source, &main, &[], Placement::Auto, None);
+        failed.answer = Some(Err(crate::lsp::GotoError::Timeout {
+            server: "fake",
+            secs: 30,
+            starting: false,
+        }));
+        let timeout = lsp_goto_land(&mut host, PaneOrigin::Mcp, &failed).unwrap();
+        assert_eq!(timeout["status"], json!("timeout"));
+        assert_eq!(timeout["from"]["line"], json!(3));
+        assert_eq!(
+            timeout["next_step"],
+            json!(crate::lsp::text::GOTO_TIMEOUT_NEXT_STEP.text())
+        );
+        // 見つからない（0 件）
+        let none = lsp_goto_land(
+            &mut host,
+            PaneOrigin::Mcp,
+            &goto_landing(source, &main, &[], Placement::Auto, None),
+        )
+        .unwrap();
+        assert_eq!(none["status"], json!("not-found"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 準備（UI スレッド）の検査: 綴り・1 始まり・桁は丸めずに拒否する（#1658 と同じ）。
+    /// 検査はサーバの有無より先（LSP の無い host でも引数の誤りは引数の誤りとして返す）
+    #[test]
+    fn 定義ジャンプの準備は引数を丸めずに拒否する() {
+        let dir = jump_fixture("goto-prepare", &["main.rs"]);
+        std::fs::write(dir.join("main.rs"), "let 名前 = 1;\n").unwrap();
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let source = jump_open(
+            &mut host,
+            root,
+            &dir.join("main.rs"),
+            None,
+            Some(Direction::Right),
+        )["pane"]
+            .as_u64()
+            .unwrap();
+        let call =
+            |host: &mut MockHost, action: &str, line: usize, column: usize, open: Option<&str>| {
+                dispatch(
+                    host,
+                    Request::LspGoto {
+                        action: action.into(),
+                        pane: Some(source),
+                        line,
+                        column,
+                        open: open.map(str::to_string),
+                        choice: None,
+                        focus: None,
+                    },
+                    PaneOrigin::Cli,
+                )
+            };
+        let invalid =
+            |r: Result<Value, DispatchError>| matches!(r, Err(DispatchError::InvalidParams(_)));
+        assert!(invalid(call(&mut host, "definitions", 1, 0, None)));
+        assert!(invalid(call(&mut host, "definition", 0, 0, None)));
+        assert!(invalid(call(&mut host, "definition", 1, 0, Some("left"))));
+        assert!(
+            invalid(call(&mut host, "definition", 2, 0, None)),
+            "行が無い"
+        );
+        // `名` は 3 バイト。4 バイト目 + 1 は文字の途中
+        assert!(
+            invalid(call(&mut host, "definition", 1, 5, None)),
+            "文字の途中"
+        );
+        assert!(
+            invalid(call(&mut host, "definition", 1, 99, None)),
+            "行末の外"
+        );
+        // 引数が正しければ、LSP の無い host は「使えない」
+        let unavailable = call(&mut host, "definition", 1, 4, None);
+        assert!(
+            matches!(&unavailable, Err(DispatchError::Operation(m)) if m == crate::lsp::text::UNAVAILABLE.text()),
+            "{unavailable:?}"
+        );
+        // ターミナルのペインは対象外
+        let terminal = dispatch(
+            &mut host,
+            Request::LspGoto {
+                action: "definition".into(),
+                pane: Some(root),
+                line: 1,
+                column: 0,
+                open: None,
+                choice: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        );
+        assert!(invalid(terminal));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn open_fileのnew_tabはファイル専用のタブを作る() {
         let dir = std::env::temp_dir().join(format!("tako-dispatch-newtab-{}", std::process::id()));

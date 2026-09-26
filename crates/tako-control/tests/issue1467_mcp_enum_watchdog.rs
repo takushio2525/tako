@@ -45,6 +45,7 @@ use tako_control::orchestrator::ProfileKind;
 use tako_control::protocol::PanelViewWire;
 use tako_core::agent_support::Agent;
 use tako_core::lsp::diagnostic::Severity;
+use tako_core::lsp::goto::Placement;
 use tako_core::remote_open::RemoteOpenTarget;
 use tako_core::session_restart::SessionRestartMode;
 use tako_core::ui_mode::UiMode;
@@ -90,7 +91,7 @@ fn registry() -> Vec<Source> {
     let all_agents = agents(&Agent::ALL);
 
     let mut out = vec![
-        // --- 消費: 正本を呼んで生成する（#1467 で寄せた 5 か所 + #1679 の 2 か所） ---
+        // --- 消費: 正本を呼んで生成する（#1467 で寄せた 5 か所 + #1679 の 2 か所 + #1680 の 1 か所） ---
         Source {
             tool: "tako_panel",
             prop: "view",
@@ -126,7 +127,8 @@ fn registry() -> Vec<Source> {
             binding: Binding::Consumed,
             values: owned(&RemoteOpenTarget::VALUES),
         },
-        // #1679: 言語機能の action と診断の重大度（どちらも正本から生成）
+        // #1679 / #1680: 言語機能の action（診断 + 定義ジャンプの 4 種）・診断の重大度・
+        // 定義ジャンプで開く新しいペインの置き場所（すべて正本から生成）
         Source {
             tool: "tako_lsp",
             prop: "action",
@@ -140,6 +142,13 @@ fn registry() -> Vec<Source> {
             origin: "Severity::NAMES（tako-core/src/lsp/diagnostic.rs）",
             binding: Binding::Consumed,
             values: owned(&Severity::NAMES),
+        },
+        Source {
+            tool: "tako_lsp",
+            prop: "open",
+            origin: "Placement::NAMES（tako-core/src/lsp/goto.rs）",
+            binding: Binding::Consumed,
+            values: owned(&Placement::NAMES),
         },
         // --- 束縛: 手書きのまま値だけ縛る（正本へ値を足したら落ちる） ---
         Source {

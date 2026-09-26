@@ -845,6 +845,27 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         severity: Option<String>,
     },
+    /// 定義ジャンプ（FR-3.30 / #1680。`tako lsp definition` 等 / MCP `tako_lsp` の
+    /// action=definition|declaration|type-definition|implementation）。GUI の ⌘クリックと同じ 1 本。
+    ///
+    /// 位置は `tako edit replace-range` と同じ（`line` は 1 始まり・`column` は 0 始まりの
+    /// 行内 UTF-8 バイト）で、範囲外・文字の途中は丸めずに拒否する。着地は
+    /// 同じファイル = 同じペイン / 同じタブで開いている = そのペイン / それ以外 = 新しいペイン。
+    /// `open` はその新しいペインの置き場所（`right` / `down` / `new-tab`。`none` は開かずに
+    /// 場所だけ返す）。候補が複数なら `choose` で一覧を返し、`choice`（1 始まり）で選ぶ
+    LspGoto {
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        line: usize,
+        column: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        open: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        choice: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        focus: Option<bool>,
+    },
     /// undo（#195）
     PreviewUndo { pane: Option<u64> },
     /// redo（#195）
@@ -2405,6 +2426,8 @@ pub fn changes_layout(request: &Request) -> bool {
         | Request::OpenFile { .. }
         // 戻る / 進むは OpenFile を通って中身を差し替え、閉じたペインなら開き直す（#1677）
         | Request::Jump { .. }
+        // 定義ジャンプ（#1680）は別のファイルなら新しいペインを生やす
+        | Request::LspGoto { .. }
         | Request::OpenDir { .. }
         | Request::OpenRemote { .. }
         | Request::RemoteFolder { .. }

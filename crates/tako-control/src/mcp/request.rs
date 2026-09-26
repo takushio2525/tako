@@ -795,12 +795,27 @@ pub(super) fn build_request(
             action: str_arg(args, "action")?.unwrap_or_else(|| "status".to_string()),
             name: str_arg(args, "name")?,
         },
-        // #1679: 言語機能の 1 ツール。action ごとに型のある要求へ振り分ける
-        "tako_lsp" => match str_arg(args, "action")?.as_deref().unwrap_or("diagnostics") {
+        // #1679 / #1680: 言語機能の 1 ツール。action ごとに型のある要求へ振り分ける
+        // （省略は LSP_FEATURE_ACTIONS の先頭 = diagnostics）
+        "tako_lsp" => match str_arg(args, "action")?
+            .as_deref()
+            .unwrap_or(crate::dispatch::LSP_FEATURE_ACTIONS[0])
+        {
             "diagnostics" => Request::LspDiagnostics {
                 pane: u64_arg(args, "pane")?,
                 severity: str_arg(args, "severity")?,
             },
+            action if tako_core::lsp::goto::GotoKind::parse(action).is_some() => {
+                Request::LspGoto {
+                    action: action.to_string(),
+                    pane: Some(target_pane(args, caller)?),
+                    line: required_u64(args, "line")? as usize,
+                    column: required_u64(args, "column")? as usize,
+                    open: str_arg(args, "open")?,
+                    choice: u64_arg(args, "choice")?.map(|n| n as usize),
+                    focus: bool_arg(args, "focus")?,
+                }
+            }
             other => {
                 return Err(format!(
                     "action が不正: {other}（{}）",

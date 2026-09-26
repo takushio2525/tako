@@ -107,3 +107,114 @@ pub fn fill(note: Note, values: &[(&str, &str)]) -> String {
     }
     text
 }
+
+// --- 定義ジャンプ（#1680）-------------------------------------------------------
+// 「見つからない」「未応答」「未導入」を**区別して**出す（#983。無言で死なない）。
+// 未導入は上の NOT_INSTALLED_* をそのまま使う（言語サーバの状態として同じもの）
+
+/// ジャンプの種類の呼び名（`tako_core::lsp::goto::GotoKind::ALL` と同じ順）
+pub const GOTO_KIND_LABELS: [Note; 4] = [
+    Note::new("定義", "definition"),
+    Note::new("宣言", "declaration"),
+    Note::new("型の定義", "type definition"),
+    Note::new("実装", "implementation"),
+];
+
+/// 見つからない（サーバは答えたが場所が 0 件）。`{kind}` = 種類の呼び名
+pub const GOTO_NOT_FOUND_REASON: Note = Note::new(
+    "{kind}が見つからなかった（言語サーバはこの位置に{kind}を返さなかった）",
+    "No {kind} found (the language server returned none for this position)",
+);
+
+/// 見つからないときの次の一手
+pub const GOTO_NOT_FOUND_NEXT_STEP: Note = Note::new(
+    "識別子の上で試す（コメント・文字列の中の語や、読み込み中のプロジェクトでは見つからないことがある）",
+    "Try on an identifier (words in comments or strings, or a project still loading, may have none)",
+);
+
+/// 未応答（問い合わせの上限を超えた）。`{server}` / `{secs}`
+pub const GOTO_TIMEOUT_REASON: Note = Note::new(
+    "{server} が {secs} 秒以内に応答しなかった",
+    "{server} did not answer within {secs} seconds",
+);
+
+/// 未応答（起動と握手が上限までに済まなかった）。`{server}` / `{secs}`
+pub const GOTO_START_TIMEOUT_REASON: Note = Note::new(
+    "{server} の起動が {secs} 秒以内に終わらなかった（プロジェクトの読み込み中の可能性）",
+    "{server} did not finish starting within {secs} seconds (the project may still be loading)",
+);
+
+/// 未応答のときの次の一手
+pub const GOTO_TIMEOUT_NEXT_STEP: Note = Note::new(
+    "少し待ってからもう一度試す。続くなら tako lsp logs で様子を見る",
+    "Wait a moment and try again; if it keeps happening, check tako lsp logs",
+);
+
+/// この種類のファイルを受け持つサーバが検出表に無い
+pub const GOTO_NO_SERVER_REASON: Note = Note::new(
+    "この種類のファイルを受け持つ言語サーバが無い",
+    "No language server handles this kind of file",
+);
+
+/// 受け持つサーバが無いときの次の一手
+pub const GOTO_NO_SERVER_NEXT_STEP: Note = Note::new(
+    "対応している拡張子は tako lsp servers で見る",
+    "See tako lsp servers for the supported extensions",
+);
+
+/// サーバがその種類のジャンプに対応していない。`{server}` / `{kind}`
+pub const GOTO_UNSUPPORTED_REASON: Note = Note::new(
+    "{server} は{kind}へのジャンプに対応していない",
+    "{server} does not support going to the {kind}",
+);
+
+/// 対応していないときの次の一手
+pub const GOTO_UNSUPPORTED_NEXT_STEP: Note = Note::new(
+    "サーバの能力（capabilities）は tako lsp status で見る",
+    "See the server capabilities in tako lsp status",
+);
+
+/// 問い合わせの途中でサーバが落ちた。`{server}`
+pub const GOTO_CRASHED_REASON: Note = Note::new(
+    "問い合わせの途中で {server} が落ちた（自動で起こし直す）",
+    "{server} exited while answering (it will be restarted automatically)",
+);
+
+/// 落ちたときの次の一手
+pub const GOTO_CRASHED_NEXT_STEP: Note = Note::new(
+    "原因は tako lsp logs で見る。起き直したらもう一度試す",
+    "See tako lsp logs for the cause, then try again once it is back",
+);
+
+/// 問い合わせの途中で文書が閉じられた（編集していたペインを閉じた等）
+pub const GOTO_CLOSED_REASON: Note = Note::new(
+    "問い合わせの途中で文書が閉じられた",
+    "The document was closed while waiting for the answer",
+);
+
+/// 文書が閉じられたときの次の一手
+pub const GOTO_RETRY_NEXT_STEP: Note = Note::new("もう一度試す", "Try again");
+
+/// サーバがエラーで答えた。`{server}` / `{code}` / `{detail}`
+pub const GOTO_SERVER_ERROR_REASON: Note = Note::new(
+    "{server} がエラーを返した（{code}）: {detail}",
+    "{server} returned an error ({code}): {detail}",
+);
+
+/// ファイルを読めず、言語サーバへ渡せない。`{error}`
+pub const GOTO_UNREADABLE_REASON: Note = Note::new(
+    "ファイルを読めない（{error}）",
+    "Cannot read the file ({error})",
+);
+
+/// 候補が複数ある（CLI / MCP の次の一手。GUI は一覧を出す）。`{count}`
+pub const GOTO_CHOOSE_NEXT_STEP: Note = Note::new(
+    "候補が {count} か所ある。同じ引数に --choice N（1 始まり）を足すとその場所へ飛ぶ",
+    "There are {count} candidates; add --choice N (1-based) to the same arguments to go there",
+);
+
+/// 問い合わせたペインが待っているあいだに閉じられた / 別のファイルへ差し替わった
+pub const GOTO_SOURCE_GONE_REASON: Note = Note::new(
+    "問い合わせたペインが閉じられたか、別のファイルへ差し替わった",
+    "The pane that asked was closed or now shows another file",
+);

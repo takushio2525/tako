@@ -219,11 +219,12 @@ pub mod notes {
         "Starting, handshaking and syncing documents are covered by the fake-server e2e, but no real language server (rust-analyzer etc.) has been handshaken on real Windows hardware yet (#1007)",
     );
 
-    /// LSP の診断の一覧（#1679）。受信・UTF-16 の変換・絞り込みは OS 非依存の e2e で見ているが、
-    /// Windows 実機で実サーバの診断を出したことはまだ無い
-    pub const WIN_LSP_DIAGNOSTICS_UNMEASURED: Note = Note::new(
-        "診断の受信・UTF-16 の桁の変換・重大度の絞り込みは偽サーバの e2e で確かめているが、Windows 実機で実サーバ（rust-analyzer 等）の診断を出したことはまだ無い（#1007）",
-        "Receiving diagnostics, converting UTF-16 columns and filtering by severity are covered by the fake-server e2e, but no real language server has produced diagnostics on real Windows hardware yet (#1007)",
+    /// LSP の言語機能（診断 #1679 / 定義ジャンプ #1680）。受信・問い合わせ・変換・絞り込み・着地は
+    /// OS 非依存の e2e と単体で見ているが、Windows 実機で実サーバの診断を出したことも定義へ
+    /// 飛んだこともまだ無い
+    pub const WIN_LSP_FEATURES_UNMEASURED: Note = Note::new(
+        "診断の受信・重大度の絞り込み・定義の問い合わせ・UTF-16 の桁の変換・Windows 形式の URI → パス・着地の規則は偽サーバの e2e と単体で確かめているが、Windows 実機で実サーバ（rust-analyzer / clangd 等）の診断を出したことも定義へ飛んだこともまだ無い（#1007）",
+        "Receiving diagnostics, filtering by severity, querying definitions, converting UTF-16 columns, mapping Windows-style URIs to paths and the landing rules are covered by the fake-server e2e and unit tests, but no real language server (rust-analyzer / clangd, etc.) has produced diagnostics or been used to go to a definition on real Windows hardware yet (#1007)",
     );
 
     // ─── そもそも要らない / 概念が無い ─────────────────────────────
@@ -790,15 +791,17 @@ pub const MATRIX: &[Feature] = &[
     },
     Feature {
         key: "tako_lsp",
-        // #1679: 診断の一覧（言語機能）。受信は S1 と同じ std のパイプとスレッドで、
-        // 変換・絞り込みは OS 非依存の純粋関数。Windows 実機で実サーバの診断を見ていない
+        // #1679 / #1680: 言語機能（診断の一覧と定義ジャンプ）。受信・問い合わせは S1 と同じ std の
+        // パイプとスレッドで、変換・絞り込み・応答の読み取り・着地の規則は OS 非依存の純粋関数。
+        // URI → パスの Windows 形式（ドライブ文字・UNC）は macOS 上から単体で固定している。
+        // Windows 実機で実サーバの診断を見たことも定義へ飛んだこともまだ無い
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_LSP_DIAGNOSTICS_UNMEASURED,
+            note: notes::WIN_LSP_FEATURES_UNMEASURED,
             issue: 1007,
         },
         windows_evidence: Evidence::UnitTest(
-            "issue1679_lsp_diagnostics（偽サーバの Diagnostic 配列 → tako lsp diagnostics の固定値・重大度の境界・UTF-16 の桁・閉じたら保持 0）が CI の Windows ジョブで緑",
+            "issue1679_lsp_diagnostics（偽サーバの Diagnostic 配列 → tako lsp diagnostics の固定値・重大度の境界・UTF-16 の桁・閉じたら保持 0）と issue1680_lsp_goto（偽サーバの Location / LocationLink → 行・桁の変換・UTF-16・見つからない / 未応答 / 未導入 / 未対応の区別・一時 didOpen の後始末）が CI の Windows ジョブで緑。URI → パスの Windows 形式は lsp::goto の単体（macOS 上で固定）",
         ),
     },
     Feature {
