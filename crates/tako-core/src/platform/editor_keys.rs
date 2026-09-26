@@ -19,7 +19,8 @@
 //!
 //! - **macOS は Cocoa のテキスト欄の慣習**（⌥ = 語、⌘ = 行 / 文書）。Home / End は
 //!   コードエディタの慣習（VS Code / Zed / Xcode）どおり行頭・行末で、文書端へは
-//!   飛ばさない
+//!   飛ばさない。Cocoa のテキスト欄が持つ Emacs 系の ⌃A（行の先頭 = 桁 0）/ ⌃E（行末）/
+//!   ⌃K（行末まで削除）も macOS の列にだけ置く（#1742。Windows に置かない理由は表の行に書く）
 //! - **Windows は Windows 標準の慣習**（Ctrl = 語、Ctrl+Home / End = 文書端）。
 //!   **Alt+矢印はペインのフォーカス移動に張ってある**（`keybindings.rs`。GPUI は
 //!   キーバインドを入口より先に発火して伝播を止める）ので、ここで使うと届かない。
@@ -262,15 +263,22 @@ pub const TABLE: &[Entry] = &[
         &[K::alt("right")],
         &[K::ctrl("right")],
     ),
-    // --- 行（Home は smart Home。macOS は ⌘←→ も）---
+    // --- 行（Home は smart Home。macOS は ⌘←→ と Emacs 系の ⌃A / ⌃E も）---
+    //
+    // ⌃A / ⌃E / ⌃K（下の削除の行）は macOS の列にだけ置く（#1742）。
+    // Windows 列に置かない理由: Windows の Ctrl+A は「すべて選択」で、Ctrl+E / Ctrl+K も
+    // 行頭・行末・行末までの削除の意味を持たない（Emacs 系の打鍵の慣習が OS に無い）。
+    // その OS で案内できない打鍵は受理もしない（#763 の規則）
     row(
         Move(CursorMovement::SmartLineStart),
         &[K::plain("home"), K::cmd("left")],
         &[K::plain("home")],
     ),
+    // ⌃A は smart Home ではなく桁 0 へ（Cocoa の moveToBeginningOfParagraph: / Emacs の C-a と同じ）
+    row(Move(CursorMovement::LineStart), &[K::ctrl("a")], &[]),
     row(
         Move(CursorMovement::LineEnd),
-        &[K::plain("end"), K::cmd("right")],
+        &[K::plain("end"), K::cmd("right"), K::ctrl("e")],
         &[K::plain("end")],
     ),
     // --- 文書端（macOS = ⌘↑↓ / Windows = Ctrl+Home / End）---
@@ -316,13 +324,18 @@ pub const TABLE: &[Entry] = &[
         &[K::alt("delete")],
         &[K::ctrl("delete")],
     ),
-    // 行頭 / 行末までの削除は macOS の慣習だけ（Windows に標準の打鍵が無い）
+    // 行頭 / 行末までの削除は macOS の慣習だけ（Windows に標準の打鍵が無い）。
+    // ⌃K は行末にいれば改行を 1 つ消す（Cocoa の deleteToEndOfParagraph: と同じ。#1742）
     row(
         Delete(DeleteMotion::ToLineStart),
         &[K::cmd("backspace")],
         &[],
     ),
-    row(Delete(DeleteMotion::ToLineEnd), &[K::cmd("delete")], &[]),
+    row(
+        Delete(DeleteMotion::ToLineEnd),
+        &[K::cmd("delete"), K::ctrl("k")],
+        &[],
+    ),
     // --- 改行・インデント・編集終了 ---
     row(Newline, &[K::plain("enter")], &[K::plain("enter")]),
     // Tab = 深く / ⇧Tab = 浅く（#1654）。Windows の Ctrl+Tab はタブ切替に張ってあるので素の Tab だけ
@@ -421,6 +434,12 @@ mod tests {
             (Platform::Windows, "tab", Some(EditorCommand::Indent)),
             (Platform::Windows, "shift-tab", Some(EditorCommand::Outdent)),
             (Platform::MacOs, "escape", Some(EditorCommand::ExitEditing)),
+            // #1742: Cocoa の Emacs 系（⌃A = 桁 0 / ⌃E = 行末 / ⌃K = 行末まで削除）
+            (Platform::MacOs, "ctrl-a", mv(M::LineStart, false)),
+            (Platform::MacOs, "ctrl-shift-a", mv(M::LineStart, true)),
+            (Platform::MacOs, "ctrl-e", mv(M::LineEnd, false)),
+            (Platform::MacOs, "ctrl-shift-e", mv(M::LineEnd, true)),
+            (Platform::MacOs, "ctrl-k", del(D::ToLineEnd)),
             // Windows
             (Platform::Windows, "ctrl-left", mv(M::WordLeft, false)),
             (Platform::Windows, "ctrl-right", mv(M::WordRight, false)),
@@ -476,7 +495,12 @@ mod tests {
             // 印字文字は表の外（入力は IME / テキスト入力の経路）
             (Platform::MacOs, "a"),
             (Platform::MacOs, "alt-a"),
+            // #1742: Emacs 系は macOS だけ（Windows の Ctrl+A は「すべて選択」の慣習）
             (Platform::Windows, "ctrl-a"),
+            (Platform::Windows, "ctrl-e"),
+            (Platform::Windows, "ctrl-k"),
+            (Platform::MacOs, "cmd-a"),
+            (Platform::MacOs, "alt-k"),
             // Ctrl+Tab はタブ切替（キーバインド側が持つ。#1654 で Tab を足しても受理しない）
             (Platform::Windows, "ctrl-tab"),
             (Platform::MacOs, "alt-tab"),
@@ -510,11 +534,8 @@ mod tests {
     /// 移動・削除の全種類がどちらかの OS で押せる（表から落ちた操作が無い）
     #[test]
     fn 移動と削除の全種類が表に載っている() {
+        // 桁 0 の行頭（line-start）も macOS の ⌃A が持つので例外は無い（#1742）
         for movement in CursorMovement::ALL {
-            // 桁 0 の行頭（line-start）は CLI / MCP から指す口で、打鍵は smart Home が持つ
-            if movement == CursorMovement::LineStart {
-                continue;
-            }
             assert!(
                 TABLE.iter().any(|e| e.action == Action::Move(movement)
                     && !(e.macos.is_empty() && e.windows.is_empty())),
@@ -547,6 +568,90 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #1742: ⌃K は行末まで消し、行末にいれば改行を 1 つ（CRLF なら CR ごと）消す。
+    /// どれも undo 1 回で戻る。打鍵表から引いて `apply` で当てる（GUI と CLI / MCP の口）
+    #[test]
+    fn ctrl_kは行末まで消し行末では改行を1つ消す() {
+        use crate::text_edit::TextBuffer;
+        use std::path::PathBuf;
+        let kill = resolve_spec(Platform::MacOs, "ctrl-k").expect("ctrl-k は macOS の表にある");
+        // (本文, カーソル, ⌃K の後の本文, カーソル)
+        let cases: &[(&str, usize, &str, usize)] = &[
+            // 行の途中: 行末まで消す（次の行は触らない）
+            ("hello world\nnext\n", 6, "hello \nnext\n", 6),
+            // 行末: 改行を 1 つ消して次の行とつなげる
+            ("hello\nnext\n", 5, "hellonext\n", 5),
+            // CRLF の行末: CR と LF をまとめて 1 つの改行として消す
+            ("ab\r\ncd\r\n", 2, "abcd\r\n", 2),
+            // CRLF の行の途中: CR は残す（行末までは CR の手前まで）
+            ("abcd\r\nef", 1, "a\r\nef", 1),
+            // 空行: その改行を消す
+            ("a\n\nb", 2, "a\nb", 2),
+            // 行頭: 行の中身だけ消えて空行が残る
+            ("abc\ndef", 4, "abc\n", 4),
+            // 全角を含む行
+            (
+                "日本語のテキスト\n",
+                "日本語".len(),
+                "日本語\n",
+                "日本語".len(),
+            ),
+        ];
+        for (text, cursor, want, want_cursor) in cases {
+            let mut buffer = TextBuffer::from_text(PathBuf::from("kill.txt"), text.to_string());
+            buffer.set_cursor(*cursor, false);
+            assert!(kill.apply(&mut buffer));
+            assert_eq!(buffer.text(), *want, "{text:?} の {cursor} で ctrl-k");
+            assert_eq!(
+                buffer.cursor(),
+                *want_cursor,
+                "{text:?} の ctrl-k 後のカーソル"
+            );
+            assert!(buffer.undo(), "{text:?} の ctrl-k を undo できない");
+            assert_eq!(buffer.text(), *text, "{text:?} が undo 1 回で戻らない");
+        }
+        // 文書の末尾: 消すものが無い = 本文も版も変わらない
+        let mut buffer = TextBuffer::from_text(PathBuf::from("kill.txt"), "abc".into());
+        buffer.set_cursor(3, false);
+        let version = buffer.version();
+        kill.apply(&mut buffer);
+        assert_eq!((buffer.text(), buffer.version()), ("abc", version));
+        // 続けて押すと 1 回ずつ undo で戻る（語・行単位の削除はまとめない = #1652）
+        let mut buffer = TextBuffer::from_text(PathBuf::from("kill.txt"), "ab\ncd\n".into());
+        kill.apply(&mut buffer);
+        kill.apply(&mut buffer);
+        assert_eq!(buffer.text(), "cd\n");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "\ncd\n");
+    }
+
+    /// #1742: ⌃A は smart Home ではなく**桁 0**（インデントの直後でも行き来しない）、
+    /// ⌃E は行末（CRLF なら CR の手前）
+    #[test]
+    fn ctrl_aは桁0へctrl_eは行末へ() {
+        use crate::text_edit::TextBuffer;
+        use std::path::PathBuf;
+        let home = resolve_spec(Platform::MacOs, "ctrl-a").expect("ctrl-a");
+        let end = resolve_spec(Platform::MacOs, "ctrl-e").expect("ctrl-e");
+        let mut buffer =
+            TextBuffer::from_text(PathBuf::from("ae.rs"), "    let x = 1;\r\nnext".into());
+        buffer.set_cursor("    let".len(), false);
+        home.apply(&mut buffer);
+        assert_eq!(buffer.cursor(), 0);
+        // もう 1 回押しても桁 0 のまま（Home はインデントの直後へ戻る）
+        home.apply(&mut buffer);
+        assert_eq!(buffer.cursor(), 0);
+        buffer.set_cursor(4, false);
+        home.apply(&mut buffer);
+        assert_eq!(buffer.cursor(), 0, "インデントの直後からも桁 0");
+        end.apply(&mut buffer);
+        assert_eq!(buffer.cursor(), "    let x = 1;".len(), "行末は CR の手前");
+        // ⇧ 付きは選択を伸ばす
+        let select_home = resolve_spec(Platform::MacOs, "ctrl-shift-a").expect("ctrl-shift-a");
+        select_home.apply(&mut buffer);
+        assert_eq!(buffer.selection(), Some(0.."    let x = 1;".len()));
     }
 
     /// `gpui_spec` の綴りが読み戻せる（キーバインドとの突き合わせはこの綴りで行う）

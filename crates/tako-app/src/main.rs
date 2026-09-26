@@ -43259,10 +43259,12 @@ mod self_test {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("visual-test editor-keys 一時ディレクトリ");
         let path = dir.join("keys.rs");
-        // 行 0..=3 が語・行の相、4..=6 が桁の記憶の相、その後ろがページ移動の相
+        // 行 0..=3 が語・行の相、4..=6 が桁の記憶の相、7..=9 が表示幅の桁の相（#1742）、
+        // その後ろがページ移動の相
         let mut source = String::from(
             "fn main() {\n    let value = 1;\n    println!(\"日本語のテキスト\");\n}\n\
-             0123456789\nab\n0123456789\n",
+             0123456789\nab\n0123456789\n\
+             あいう漢字\n\tlet x = 1;\n0123456789\n",
         );
         for i in 0..200 {
             source.push_str(&format!("// line {i:03}\n"));
@@ -43618,7 +43620,126 @@ mod self_test {
             &format!("visual-test editor-keys: undo 1 回で Tab の挿入が戻る ({restored:?})"),
         );
 
-        // (12) IME の変換中は本文にもカーソルにも触らない。確定は変換を始めた位置へ入る
+        // (12) #1742: 桁の記憶は表示幅（全角 = 2・タブ = 次のタブストップ）で持つ。
+        // (6,4) → ↓ `あい|う漢字`（文字数なら `あいう漢|字`）→ ↓ `\t|let`（文字数なら `\tlet|`）
+        // → ↓ (9,4)
+        place(cx, 6, 4);
+        press(any, cx, "down");
+        let wide = observe(cx, 7);
+        press(any, cx, "down");
+        let tab = observe(cx, 8);
+        press(any, cx, "down");
+        let back = observe(cx, 9);
+        report("display-column", "down", &tab);
+        check(
+            wide.1 == (7, "あい".len()) && tab.1 == (8, 1) && back.1 == (9, 4),
+            &format!(
+                "visual-test editor-keys: 全角とタブの行をまたいでも表示幅の桁を保つ \
+                 (#1742。{wide:?} → {tab:?} → {back:?})"
+            ),
+        );
+        // 画面上の実際の x（px）も控える。桁の判定は表示幅の規則で持つので、ここは
+        // 「描画のグリフ送り幅が桁の規則とどれだけ揃っているか」の観測値（判定には使わない）
+        let caret_x = |cx: &mut AsyncApp, line: usize, byte: usize| -> Option<f32> {
+            window
+                .update(cx, |app, _, _| {
+                    let layout = app.preview_text_layouts.get(&pane)?.get(line)?.clone()?;
+                    let origin = layout.bounds().left();
+                    layout
+                        .position_for_index(byte)
+                        .map(|p| f32::from(p.x - origin))
+                })
+                .ok()
+                .flatten()
+        };
+        println!(
+            "TAKO_VISUAL_PIXEL: editor-keys display-column-x digits4={:?} wide={:?} tab={:?}",
+            caret_x(cx, 9, 4),
+            caret_x(cx, 7, "あい".len()),
+            caret_x(cx, 8, 1)
+        );
+
+        // (13) #1742: 選択中の素の ← は選択の始点・→ は終点へ畳む（1 文字は動かない）。
+        // 行 1 = `    let value = 1;` の `let value`（桁 4..13）を選ぶ
+        select(cx, (1, 4), (1, 13));
+        press(any, cx, "left");
+        let left = observe(cx, 1);
+        select(cx, (1, 4), (1, 13));
+        press(any, cx, "right");
+        let right = observe(cx, 1);
+        report("collapse", "left/right", &right);
+        check(
+            left.1 == (1, 4) && left.2.is_none() && right.1 == (1, 13) && right.2.is_none(),
+            &format!(
+                "visual-test editor-keys: 選択中の ← は始点・→ は終点へ畳む (#1742。{left:?} {right:?})"
+            ),
+        );
+        // 複数行にまたがる選択（後ろ向き = カーソルが始点）でも → は終点へ
+        select(cx, (2, 6), (1, 8));
+        press(any, cx, "right");
+        let multi = observe(cx, 2);
+        // ⇧ 付きは従来どおり 1 文字伸ばす（畳まない）
+        select(cx, (1, 4), (1, 13));
+        press(any, cx, "shift-left");
+        let extend = observe(cx, 1);
+        report("collapse-multi", "right", &multi);
+        check(
+            multi.1 == (2, 6) && multi.2.is_none() && extend.2.as_deref() == Some("let valu"),
+            &format!(
+                "visual-test editor-keys: 複数行の選択も畳み、shift-left は伸ばす (#1742。{multi:?} {extend:?})"
+            ),
+        );
+
+        // (14) #1742: macOS の ⌃A（桁 0）/ ⌃E（行末）/ ⌃K（行末まで削除。行末なら改行を 1 つ）。
+        // Windows の列には置かない（Ctrl+A は「すべて選択」の慣習）ので macOS だけで打つ
+        if mac {
+            place(cx, 1, 13);
+            press(any, cx, "ctrl-a");
+            let first = observe(cx, 1);
+            press(any, cx, "ctrl-a");
+            let second = observe(cx, 1);
+            press(any, cx, "ctrl-e");
+            let end = observe(cx, 1);
+            report("ctrl-a-e", "ctrl-a/ctrl-e", &end);
+            check(
+                first.1 == (1, 0) && second.1 == (1, 0) && end.1 == (1, "    let value = 1;".len()),
+                &format!(
+                    "visual-test editor-keys: ctrl-a は桁 0（smart Home ではない）・ctrl-e は行末 \
+                     (#1742。{first:?} {second:?} {end:?})"
+                ),
+            );
+            place(cx, 1, 8);
+            let before = observe(cx, 1).3;
+            press(any, cx, "ctrl-k");
+            let killed = observe(cx, 1);
+            press(any, cx, "ctrl-k");
+            let joined = observe(cx, 1);
+            report("ctrl-k", "ctrl-k", &joined);
+            check(
+                killed.0 == "    let "
+                    && killed.1 == (1, 8)
+                    && killed.3 > before
+                    && joined.0 == "    let     println!(\"日本語のテキスト\");",
+                &format!(
+                    "visual-test editor-keys: ctrl-k は行末まで・行末では改行を消す (#1742。{killed:?} {joined:?})"
+                ),
+            );
+            // 1 回ずつ undo で戻る（語・行単位の削除はまとめない）
+            undo(cx);
+            let once = observe(cx, 1);
+            undo(cx);
+            let twice = observe(cx, 1);
+            check(
+                once.0 == "    let " && twice.0 == "    let value = 1;",
+                &format!(
+                    "visual-test editor-keys: ctrl-k は undo 1 回ずつで戻る ({once:?} {twice:?})"
+                ),
+            );
+        } else {
+            println!("TAKO_VISUAL_PIXEL: editor-keys ctrl-a-e-k skipped=windows（macOS の列だけ）");
+        }
+
+        // (15) IME の変換中は本文にもカーソルにも触らない。確定は変換を始めた位置へ入る
         place(cx, 1, 13);
         let before = observe(cx, 1);
         window

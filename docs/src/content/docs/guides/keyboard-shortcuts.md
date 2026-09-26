@@ -95,14 +95,15 @@ Windows では Command キーにあたる修飾が Win キーになり、多く�
 
 ### 編集中のカーソル移動と削除
 
-編集モードのときに使えます。移動の打鍵に <kbd>Shift</kbd> を足すと、その範囲まで選択を伸ばします。矢印・<kbd>Backspace</kbd>・<kbd>Delete</kbd>・<kbd>Enter</kbd> は修飾なしでも使えます。
+編集モードのときに使えます。移動の打鍵に <kbd>Shift</kbd> を足すと、その範囲まで選択を伸ばします。矢印・<kbd>Backspace</kbd>・<kbd>Delete</kbd>・<kbd>Enter</kbd> は修飾なしでも使えます。選択しているときに修飾なしの <kbd>←</kbd> を押すと選択の先頭へ、<kbd>→</kbd> を押すと選択の末尾へカーソルが移って選択が解けます。
 
 | 編集中の操作 | macOS | Windows |
 |---|---|---|
 | 前の語の頭へ | <kbd>Alt</kbd>+<kbd>←</kbd> | <kbd>Ctrl</kbd>+<kbd>←</kbd> |
 | 次の語の末尾へ | <kbd>Alt</kbd>+<kbd>→</kbd> | <kbd>Ctrl</kbd>+<kbd>→</kbd> |
 | 行頭へ（押すたびにインデントの直後と行の先頭を行き来） | <kbd>Home</kbd> / <kbd>Cmd</kbd>+<kbd>←</kbd> | <kbd>Home</kbd> |
-| 行末へ | <kbd>End</kbd> / <kbd>Cmd</kbd>+<kbd>→</kbd> | <kbd>End</kbd> |
+| 行の先頭へ（インデントの手前） | <kbd>Ctrl</kbd>+<kbd>A</kbd> | （macOS のみ） |
+| 行末へ | <kbd>End</kbd> / <kbd>Cmd</kbd>+<kbd>→</kbd> / <kbd>Ctrl</kbd>+<kbd>E</kbd> | <kbd>End</kbd> |
 | 文書の先頭へ | <kbd>Cmd</kbd>+<kbd>↑</kbd> | <kbd>Ctrl</kbd>+<kbd>Home</kbd> |
 | 文書の末尾へ | <kbd>Cmd</kbd>+<kbd>↓</kbd> | <kbd>Ctrl</kbd>+<kbd>End</kbd> |
 | 1 画面上へ | <kbd>Page Up</kbd> | <kbd>Page Up</kbd> |
@@ -110,12 +111,12 @@ Windows では Command キーにあたる修飾が Win キーになり、多く�
 | 前の語を消す | <kbd>Alt</kbd>+<kbd>Backspace</kbd> | <kbd>Ctrl</kbd>+<kbd>Backspace</kbd> |
 | 次の語を消す | <kbd>Alt</kbd>+<kbd>Delete</kbd> | <kbd>Ctrl</kbd>+<kbd>Delete</kbd> |
 | 行頭まで消す | <kbd>Cmd</kbd>+<kbd>Backspace</kbd> | （macOS のみ） |
-| 行末まで消す | <kbd>Cmd</kbd>+<kbd>Delete</kbd> | （macOS のみ） |
+| 行末まで消す（行末では改行を消して次の行とつなげる） | <kbd>Cmd</kbd>+<kbd>Delete</kbd> / <kbd>Ctrl</kbd>+<kbd>K</kbd> | （macOS のみ） |
 | 選択した行を 1 段深く（選択が無ければカーソル位置へ 1 段ぶん） | <kbd>Tab</kbd> | <kbd>Tab</kbd> |
 | 選択した行（無ければカーソルの行）を 1 段浅く | <kbd>Shift</kbd>+<kbd>Tab</kbd> | <kbd>Shift</kbd>+<kbd>Tab</kbd> |
 
 :::note[語の区切りと行の境目]
-英数字と `_` の並び（`snake_case` は 1 語）、記号の並び、漢字・ひらがな・カタカナのそれぞれの並びが 1 語です。日本語は文字の種類が切り替わるところで止まります（`日本語のテキスト` は「日本語」「の」「テキスト」）。行の先頭で前の語へ、行の末尾で次の語へ動くと隣の行へ移ります。語や行単位で消すときは行の境目で止まり、行の先頭では改行だけを消して前の行とつなげます。上下に動くときは元の桁を覚えているので、短い行を通り過ぎても次の長い行では元の桁に戻ります。Windows の <kbd>Alt</kbd>+矢印はペインのフォーカス移動に使っているため、語の移動は <kbd>Ctrl</kbd>+矢印です。MacBook のキーボードの <kbd>Delete</kbd> は <kbd>fn</kbd>+<kbd>delete</kbd> です。
+英数字と `_` の並び（`snake_case` は 1 語）、記号の並び、漢字・ひらがな・カタカナのそれぞれの並びが 1 語です。日本語は文字の種類が切り替わるところで止まります（`日本語のテキスト` は「日本語」「の」「テキスト」）。行の先頭で前の語へ、行の末尾で次の語へ動くと隣の行へ移ります。語や行単位で消すときは行の境目で止まり、行の先頭では改行だけを消して前の行とつなげます。上下に動くときは元の桁を覚えているので、短い行を通り過ぎても次の長い行では元の桁に戻ります。桁は見た目の幅で数えます（日本語などの全角文字は 2 桁、タブは次の 4 の倍数の桁まで）。Windows の <kbd>Alt</kbd>+矢印はペインのフォーカス移動に使っているため、語の移動は <kbd>Ctrl</kbd>+矢印です。MacBook のキーボードの <kbd>Delete</kbd> は <kbd>fn</kbd>+<kbd>delete</kbd> です。macOS の <kbd>Ctrl</kbd>+<kbd>A</kbd> / <kbd>E</kbd> / <kbd>K</kbd> は macOS の文字入力欄と同じ Emacs 風の操作です。Windows では <kbd>Ctrl</kbd>+<kbd>A</kbd> が「すべて選択」を意味するため割り当てていません。
 :::
 
 :::note[インデント]

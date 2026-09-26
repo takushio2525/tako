@@ -19624,6 +19624,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// #1742: 表示幅の桁（全角 = 2・タブ = タブストップ）・選択中の left / right の畳み・
+    /// line-start / line-end / to-line-end（macOS の ⌃A / ⌃E / ⌃K の中身）が dispatch から
+    /// GUI の打鍵と同じ意味で効く（CLI `tako edit move` / `delete` と MCP の口）
+    #[test]
+    fn preview移動は表示幅の桁と選択の畳みを通す_1742() {
+        let dir = std::env::temp_dir().join(format!("tako-dispatch-1742-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut host = MockHost::new();
+        let text = "0123456789\nあいう漢字\n\tlet x = 1;\n0123456789\n";
+        let pane = preview_with_text(&mut host, &dir, text);
+        let place = |host: &mut MockHost, line: usize, col: usize, to: Option<(usize, usize)>| {
+            dispatch(
+                host,
+                Request::PreviewCursor {
+                    pane: Some(pane),
+                    line,
+                    col,
+                    select_to_line: to.map(|(l, _)| l),
+                    select_to_col: to.map(|(_, c)| c),
+                    expected_version: None,
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+        };
+        let mv = |host: &mut MockHost, movement: &str| {
+            dispatch(
+                host,
+                Request::PreviewMove {
+                    pane: Some(pane),
+                    movement: movement.into(),
+                    select: false,
+                    expected_version: None,
+                },
+                PaneOrigin::Mcp,
+            )
+            .unwrap()
+        };
+        let at = |reply: &serde_json::Value| {
+            let c = &reply["document"]["cursor"];
+            (c["line"].as_u64().unwrap(), c["column"].as_u64().unwrap())
+        };
+        // 表示幅の桁: 桁 4 → 全角の行は `あい|`（6 バイト）→ タブの行は `\t|`（1 バイト）→ 桁 4
+        place(&mut host, 1, 4, None);
+        assert_eq!(at(&mv(&mut host, "down")), (2, 6));
+        assert_eq!(at(&mv(&mut host, "down")), (3, 1));
+        assert_eq!(at(&mv(&mut host, "down")), (4, 4));
+        // 選択中の left は始点・right は終点へ畳む
+        place(&mut host, 4, 2, Some((4, 7)));
+        let left = mv(&mut host, "left");
+        assert_eq!(at(&left), (4, 2));
+        assert!(left["document"]["selection"].is_null());
+        place(&mut host, 4, 7, Some((4, 2)));
+        let right = mv(&mut host, "right");
+        assert_eq!(at(&right), (4, 7));
+        assert!(right["document"]["selection"].is_null());
+        // line-start（⌃A）は桁 0・line-end（⌃E）は行末
+        place(&mut host, 3, 5, None);
+        assert_eq!(at(&mv(&mut host, "line-start")), (3, 0));
+        assert_eq!(
+            at(&mv(&mut host, "line-end")),
+            (3, "\tlet x = 1;".len() as u64)
+        );
+        // to-line-end（⌃K）: 行末まで → 行末では改行を 1 つ消す
+        place(&mut host, 1, 6, None);
+        let kill = |host: &mut MockHost| {
+            dispatch(
+                host,
+                Request::PreviewDelete {
+                    pane: Some(pane),
+                    motion: "to-line-end".into(),
+                    expected_version: None,
+                },
+                PaneOrigin::Mcp,
+            )
+            .unwrap()
+        };
+        let first = kill(&mut host);
+        assert_eq!(at(&first), (1, 6));
+        assert_eq!(first["document"]["line_count"].as_u64(), Some(5));
+        let second = kill(&mut host);
+        assert_eq!(second["document"]["line_count"].as_u64(), Some(4));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn previewカーソルは行桁で動き選択は本文を変えない() {
         let dir = std::env::temp_dir().join(format!("tako-dispatch-cursor-{}", std::process::id()));

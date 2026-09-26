@@ -1745,6 +1745,7 @@ enum EditCommand {
     ///
     /// 単位: left / right / up / down / word-left / word-right / line-start /
     /// smart-home / line-end / doc-start / doc-end / page-up / page-down。
+    /// 選択中の left / right は選択の端へ畳む（←→ の打鍵と同じ）。
     /// 例: `tako edit move word-left --select`
     Move {
         /// 動かす単位
