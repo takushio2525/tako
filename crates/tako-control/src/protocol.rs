@@ -833,7 +833,7 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
-    /// 診断の一覧（FR-3.29 / #1679。`tako lsp diagnostics` / MCP `tako_lsp` の
+    /// 診断の一覧（FR-3.30 / #1679。`tako lsp diagnostics` / MCP `tako_lsp` の
     /// action=diagnostics）。波線と右パネルの diagnostics ビューが読むのと同じ表を返す。
     ///
     /// `pane` はプレビューペイン（省略で開いている文書すべて）。`severity` は
