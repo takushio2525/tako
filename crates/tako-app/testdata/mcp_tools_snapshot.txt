@@ -38,6 +38,7 @@ tako_limit_service
 tako_links
 tako_list_panes
 tako_logs
+tako_lsp
 tako_lsp_server
 tako_menu
 tako_migrate

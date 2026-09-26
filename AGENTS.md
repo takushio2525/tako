@@ -147,6 +147,7 @@ tako/
 | **ターミナル上のパスの cmd+右クリックメニュー（#1182）** | `tako file open-in-tako <path>` |
 | **画面のどのパスがリンクになるかを読む（cmd+クリックの検証。#1283）** | `tako links [--pane N] [--text <画面テキスト>]` |
 | **言語サーバ（LSP）の状態と起動・停止（編集モードで自動的に起きる。#1678）** | `tako lsp status` |
+| **編集中のコードの診断（エラー・警告。波線と右パネルと同じ表。#1679）** | `tako lsp diagnostics` |
 | **リモートからフォルダを開く（SSH 先のワークスペース化。#919 / #65 / #976 / #1041）** | `ssh <host>` |
 | **スマホからファイルを見る・直す（#1079 / #1084 / #1085）** | `#/files` |
 | **スマホから PC 全体を Finder 風に辿る（manage 以上。#1451）** | `#/files` の「このマシン」 |
@@ -193,7 +194,7 @@ tako/
 | **agent 能力マトリクス（#982）** | `tako agent-support [--agent claude|codex|agy|local] [--status supported|degraded|pending|unsupported] [--json]` |
 | Windows 対応状況ページの生成（#591） | `cargo build -p tako-cli && node scripts/gen-windows-support-docs.mjs` |
 | **Windows のウインドウを実測する（#1063）** | `pwsh -File scripts/windows/measure-window.ps1 -TakoPid <pid>` |
-| 右パネルのビュー切替 | `tako panel --show --view <fleet|orch|git|tasks>` |
+| 右パネルのビュー切替 | `tako panel --show --view <fleet|orch|git|tasks|diagnostics>` |
 | Code Runner でファイル実行（#453） | `tako run <file> [--profile <name>]` |
 | 拡張子既定コマンド設定 | `tako run-default [ext] [command]` |
 | AI コマンド提案カード（#666/#703） | `tako show-command <コマンド>...` |

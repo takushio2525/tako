@@ -45,6 +45,11 @@ pub fn byte_offset_of_lsp_position(text: &str, line: usize, utf16_col: usize) ->
     let Some(line_start) = line_start_of(text, line) else {
         return text.len();
     };
+    byte_in_line(text, line_start, utf16_col)
+}
+
+/// 行頭 `line_start` からの UTF-16 桁 → UTF-8 バイト位置（丸めの正本。[`LineIndex`] も通る）
+fn byte_in_line(text: &str, line_start: usize, utf16_col: usize) -> usize {
     let rest = &text[line_start..];
     let mut line_end = rest.find('\n').map_or(text.len(), |i| line_start + i);
     if line_end > line_start && text.as_bytes()[line_end - 1] == b'\r' && line_end < text.len() {
@@ -68,6 +73,45 @@ fn line_start_of(text: &str, line: usize) -> Option<usize> {
         return Some(0);
     }
     text.match_indices('\n').nth(line - 1).map(|(i, _)| i + 1)
+}
+
+/// 同じ本文へ位置を何度も当てるときの行頭の索引（#1679 の診断の取り込み）。
+///
+/// [`byte_offset_of_lsp_position`] は呼ぶたびに行頭を数え直す（1 回 O(本文)）ので、
+/// 診断を数百件まとめて写すと本文 × 件数になる。これは行頭を 1 回だけ数え、
+/// **行の中の丸めは同じ関数（`byte_in_line`）を通す**（入口が増えても丸めは 1 実装のまま。
+/// 一致はテストが全位置で固定する）
+pub struct LineIndex<'a> {
+    text: &'a str,
+    /// 各行の先頭バイト位置（`starts[0] == 0`。本文の `\n` の数 + 1 個）
+    starts: Vec<usize>,
+}
+
+impl<'a> LineIndex<'a> {
+    pub fn new(text: &'a str) -> Self {
+        let mut starts = vec![0];
+        starts.extend(text.match_indices('\n').map(|(i, _)| i + 1));
+        Self { text, starts }
+    }
+
+    /// [`byte_offset_of_lsp_position`] と同じ答え
+    pub fn byte_offset(&self, line: usize, utf16_col: usize) -> usize {
+        match self.starts.get(line) {
+            Some(&start) => byte_in_line(self.text, start, utf16_col),
+            None => self.text.len(),
+        }
+    }
+
+    /// LSP の位置 → `(0 起点の行, 行内の UTF-8 バイト桁)`。
+    /// 最終行を超える行は本文の末尾の位置になる（丸めは [`Self::byte_offset`] と同じ）
+    pub fn line_byte_col(&self, line: usize, utf16_col: usize) -> (usize, usize) {
+        let offset = self.byte_offset(line, utf16_col);
+        let line = match self.starts.binary_search(&offset) {
+            Ok(i) => i,
+            Err(i) => i - 1,
+        };
+        (line, offset - self.starts[line])
+    }
 }
 
 #[cfg(test)]
@@ -188,6 +232,42 @@ mod tests {
         // 2 行目の「の」
         assert_eq!(lsp_position_of(text, 18), (1, 1));
         assert_eq!(byte_offset_of_lsp_position(text, 1, 1), 18);
+    }
+
+    /// 行頭の索引（#1679）は、どの行・どの桁でも 1 回ずつ数え直す版と同じ答えを返す
+    /// （丸め = 文字の途中・サロゲートの片割れ・CRLF・行末超え・最終行超えまで含めて）
+    #[test]
+    fn 行頭の索引は数え直す版と全位置で一致する() {
+        for text in [
+            "",
+            "ab",
+            "abc\n",
+            "\n\n\nx",
+            "ab\r\ncd",
+            "日本😀語\r\n次の行",
+            "fn 主() {\r\n\t😀 = \"é\";\n\n}\n",
+        ] {
+            let index = LineIndex::new(text);
+            let lines = text.matches('\n').count() + 1;
+            for line in 0..lines + 2 {
+                for col in 0..14 {
+                    let expected = byte_offset_of_lsp_position(text, line, col);
+                    assert_eq!(
+                        index.byte_offset(line, col),
+                        expected,
+                        "{text:?} ({line}, {col})"
+                    );
+                    let (l, c) = index.line_byte_col(line, col);
+                    let start = text[..expected].rfind('\n').map_or(0, |i| i + 1);
+                    let want_line = text[..expected].matches('\n').count();
+                    assert_eq!(
+                        (l, c),
+                        (want_line, expected - start),
+                        "{text:?} ({line}, {col})"
+                    );
+                }
+            }
+        }
     }
 
     /// すべての文字境界で「行き → 帰り」が元へ戻る（`\r` と `\n` のあいだは `\r` の手前へ）

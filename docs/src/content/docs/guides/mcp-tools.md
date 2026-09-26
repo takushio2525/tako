@@ -1,9 +1,9 @@
 ---
 title: MCP ツール一覧
-description: tako が AI エージェントに公開する 157 個の MCP ツールの全リスト
+description: tako が AI エージェントに公開する 158 個の MCP ツールの全リスト
 ---
 
-tako は **157 個の MCP ツール**を AI エージェント（Claude Code / Codex 等）に公開しています。ほぼすべてが `tako` CLI のコマンドと 1:1 で対応しているため、細かい引数や挙動は [CLI リファレンス](/guides/cli-reference/)の対応コマンドも合わせて参照してください。
+tako は **158 個の MCP ツール**を AI エージェント（Claude Code / Codex 等）に公開しています。ほぼすべてが `tako` CLI のコマンドと 1:1 で対応しているため、細かい引数や挙動は [CLI リファレンス](/guides/cli-reference/)の対応コマンドも合わせて参照してください。
 
 :::tip[登録は一度きり]
 MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度行えば、以降はどのプロジェクトでも自動的に使えます。codex を master にする場合は `tako master` の起動時にだけ設定が注入されるため、グローバル設定の変更すら不要です。
@@ -74,6 +74,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_preview_apply` | 編集バッファの全文を差し替える |
 | `tako_preview_edit_range` | 行・桁で指定した範囲だけを置き換える（応答に文書の版が載る） |
 | `tako_preview_cursor` | 編集カーソルを行・桁で置く（`select_to_line` で選択） |
+| `tako_lsp` | 言語サーバの言語機能（`action` = diagnostics で編集中のコードの診断。`pane` / `severity` で絞る） |
 | `tako_lsp_server` | 言語サーバ（LSP）の状態と起動・停止（`action` = status / list / restart / stop / logs。編集モードで自動的に起きる） |
 | `tako_preview_move` | 編集カーソルを単語・行・ページ・文書端の単位で動かす（`select` で選択を伸ばす） |
 | `tako_preview_delete` | 単語・行単位で消す（選択があれば選択を消す） |

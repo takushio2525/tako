@@ -814,7 +814,7 @@
     "name": "tako_auto_rename"
   },
   {
-    "description": "右サイドバー情報パネルの表示・非表示・幅・ビュー切替と、左サイドバーのファイルツリーの表示・非表示を操作する（全省略で現在状態の取得）。view の値は GUI のタブ表示名と同じ（fleet / orch / git / tasks）。view=fleet はタブごとの全ペイン一覧 + 管理外 / kill 漏れ tmux セッションの統合ビュー、view=orch はオーケストレーター俯瞰（master + worker のツリー）、view=git は git（差分・ステージ・コミット・ブランチ）、view=tasks は人がやること（承認待ち・レビュー・投稿）の一覧と返答。ユーザーにセッションやエージェントの状況を見せたいとき表示し、邪魔なら隠す。",
+    "description": "右サイドバー情報パネルの表示・非表示・幅・ビュー切替と、左サイドバーのファイルツリーの表示・非表示を操作する（全省略で現在状態の取得）。view の値は GUI のタブ表示名と同じ（fleet / orch / git / tasks / diagnostics）。view=fleet はタブごとの全ペイン一覧 + 管理外 / kill 漏れ tmux セッションの統合ビュー、view=orch はオーケストレーター俯瞰（master + worker のツリー）、view=git は git（差分・ステージ・コミット・ブランチ）、view=tasks は人がやること（承認待ち・レビュー・投稿）の一覧と返答、view=diagnostics は言語サーバの診断（エラー・警告）の一覧。ユーザーにセッションやエージェントの状況を見せたいとき表示し、邪魔なら隠す。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -832,12 +832,13 @@
           "type": "number"
         },
         "view": {
-          "description": "表示するビュー（GUI のタブ名と同じ。fleet | orch | git | tasks。tmux は fleet の旧称）",
+          "description": "表示するビュー（GUI のタブ名と同じ。fleet | orch | git | tasks | diagnostics。tmux は fleet の旧称）",
           "enum": [
             "fleet",
             "orch",
             "git",
             "tasks",
+            "diagnostics",
             "tmux"
           ],
           "type": "string"
@@ -1408,6 +1409,38 @@
       "type": "object"
     },
     "name": "tako_lsp_server"
+  },
+  {
+    "description": "言語サーバの言語機能。action=diagnostics（既定）で編集モードのコードの診断（エラー・警告）を返す。pane で絞り（省略で全文書）、severity でその重大度以上に絞る。位置は tako_preview_edit_range と同じ（行 1 始まり・桁 0 始まりの UTF-8 バイト）。",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "description": "操作（既定 diagnostics）",
+          "enum": [
+            "diagnostics"
+          ],
+          "type": "string"
+        },
+        "pane": {
+          "description": "プレビューペイン ID（省略で全文書）",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "severity": {
+          "description": "この重大度以上に絞る",
+          "enum": [
+            "error",
+            "warning",
+            "info",
+            "hint"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "tako_lsp"
   },
   {
     "description": "コードプレビューの未保存編集をファイルへ書き戻す。読み込み後に外部変更があれば競合として拒否し、上書きしない。",

@@ -3267,6 +3267,11 @@ fn dispatch_inner(
             lsp_server_action(host.lsp(), &action, name.as_deref())
         }
 
+        // #1679: 表を読むだけ（ロックを短く取る）なので UI スレッドで同期実行する
+        Request::LspDiagnostics { pane, severity } => {
+            lsp_diagnostics(host, pane, severity.as_deref())
+        }
+
         Request::SetupMcp { scope, pane, agent } => {
             let scope_str = scope.as_deref().unwrap_or("global");
             let mcp_scope = match scope_str {
@@ -12444,6 +12449,166 @@ pub fn lsp_server_action(
         "logs" => manager.logs(name),
         _ => manager.status(name),
     })
+}
+
+/// MCP `tako_lsp`（言語機能）の action（#1679）。CLI は `tako lsp <action>`。
+/// 定義ジャンプ・ホバー等のスライスはここへ足す（ツールは増やさない）
+pub const LSP_FEATURE_ACTIONS: &[&str] = &["diagnostics"];
+
+/// 診断の一覧の 1 実装（#1679）。CLI `tako lsp diagnostics` と MCP `tako_lsp` が通る。
+///
+/// 読むのは manager の URI ごとの表（波線と右パネルが読むのと同じ 1 つ）。
+/// `pane` を省けば**言語サーバにつながった文書すべて**（呼び出し元はたいてい端末で、
+/// 診断を持たないので「呼び出し元のペイン」を既定にしない）。`severity` は
+/// **その重大度以上**に絞る（`warning` = エラーと警告）。`counts` は絞る前の数で、
+/// `retained` は manager が保持している総数（閉じたペインのぶんが残っていないかの観測口）
+pub fn lsp_diagnostics(
+    host: &dyn ControlHost,
+    pane: Option<u64>,
+    severity: Option<&str>,
+) -> Result<Value, DispatchError> {
+    use tako_core::lsp::diagnostic::Severity;
+    let min = match severity {
+        None => None,
+        Some(name) => Some(Severity::parse(name).ok_or_else(|| {
+            DispatchError::InvalidParams(format!(
+                "severity が不正: {name}（{}）",
+                Severity::NAMES.join(" / ")
+            ))
+        })?),
+    };
+    let Some(manager) = host.lsp() else {
+        return Err(DispatchError::Operation(
+            crate::lsp::text::UNAVAILABLE.text().to_string(),
+        ));
+    };
+    let docs = host.lsp_documents();
+    let targets: Vec<crate::lsp::LspDocument> = match pane {
+        Some(raw) => {
+            let (_, target) = resolve_pane(host.workspace(), Some(raw))?;
+            let Some((path, _)) = host.preview_state(target) else {
+                return Err(DispatchError::InvalidParams(format!(
+                    "プレビューペインではない: {raw}"
+                )));
+            };
+            let found: Vec<_> = docs.into_iter().filter(|d| d.pane == raw).collect();
+            if found.is_empty() {
+                vec![crate::lsp::LspDocument {
+                    pane: raw,
+                    path,
+                    editing: false,
+                    uri: None,
+                }]
+            } else {
+                found
+            }
+        }
+        None => docs.into_iter().filter(|d| d.uri.is_some()).collect(),
+    };
+    let mut total = 0;
+    let documents: Vec<Value> = targets
+        .iter()
+        .map(|doc| {
+            let entry = lsp_diagnostics_document(manager, doc, min);
+            total += entry["diagnostics"].as_array().map_or(0, Vec::len);
+            entry
+        })
+        .collect();
+    let (retained, retained_documents) = manager.diagnostics_retained();
+    let mut out = json!({
+        "enabled": manager.is_enabled(),
+        "severity": min.map(Severity::slug),
+        "documents": documents,
+        "total": total,
+        "retained": { "diagnostics": retained, "documents": retained_documents },
+    });
+    if !manager.is_enabled() {
+        out["reason"] = json!(crate::lsp::text::DISABLED_REASON.text());
+    } else if documents.is_empty() {
+        out["note"] = json!(crate::lsp::text::NO_DOCUMENTS_NOTE.text());
+    }
+    Ok(out)
+}
+
+/// 1 文書ぶん（[`lsp_diagnostics`]）
+fn lsp_diagnostics_document(
+    manager: &crate::lsp::LspManager,
+    doc: &crate::lsp::LspDocument,
+    min: Option<tako_core::lsp::diagnostic::Severity>,
+) -> Value {
+    use crate::lsp::text;
+    let mut entry = json!({ "pane": doc.pane, "path": doc.path, "editing": doc.editing });
+    let found = doc
+        .uri
+        .as_deref()
+        .and_then(|uri| manager.document_diagnostics(uri));
+    let Some(found) = found else {
+        let (reason, next) = if doc.editing {
+            (
+                text::NOT_LINKED_REASON.text().to_string(),
+                text::NOT_LINKED_NEXT_STEP.text().to_string(),
+            )
+        } else {
+            (
+                text::NOT_EDITING_REASON.text().to_string(),
+                text::fill(
+                    text::NOT_EDITING_NEXT_STEP,
+                    &[("pane", &doc.pane.to_string())],
+                ),
+            )
+        };
+        entry["counts"] = diagnostic_counts_json(&[0; 4]);
+        entry["diagnostics"] = json!([]);
+        entry["reason"] = json!(reason);
+        entry["next_step"] = json!(next);
+        return entry;
+    };
+    let items = &found.diagnostics.items;
+    entry["server"] = json!(found.server);
+    entry["server_state"] = json!(found.server_state);
+    entry["version"] = json!(found.diagnostics.version);
+    entry["counts"] = diagnostic_counts_json(&tako_core::lsp::diagnostic::counts(items.iter()));
+    entry["diagnostics"] = Value::Array(
+        items
+            .iter()
+            .filter(|d| min.is_none_or(|min| d.severity.at_least(min)))
+            .map(diagnostic_json)
+            .collect(),
+    );
+    if found.diagnostics.dropped > 0 {
+        entry["dropped"] = json!(found.diagnostics.dropped);
+    }
+    entry
+}
+
+fn diagnostic_counts_json(counts: &[usize; 4]) -> Value {
+    let mut out = serde_json::Map::new();
+    for (name, n) in tako_core::lsp::diagnostic::Severity::NAMES
+        .iter()
+        .zip(counts)
+    {
+        out.insert((*name).to_string(), json!(n));
+    }
+    Value::Object(out)
+}
+
+/// 診断 1 件の wire 形。位置は `tako edit replace-range` と同じ
+/// （行 1 始まり・桁 0 始まりの UTF-8 バイト）なので、そのまま範囲編集へ渡せる
+pub fn diagnostic_json(d: &tako_core::lsp::diagnostic::Diagnostic) -> Value {
+    let point =
+        |p: tako_core::lsp::diagnostic::Point| json!({ "line": p.line + 1, "column": p.col });
+    let mut out = json!({
+        "severity": d.severity.slug(),
+        "range": { "start": point(d.start), "end": point(d.end) },
+        "message": d.message,
+    });
+    if let Some(source) = &d.source {
+        out["source"] = json!(source);
+    }
+    if let Some(code) = &d.code {
+        out["code"] = json!(code);
+    }
+    out
 }
 
 /// UI スレッドでの文脈収集（**ここでは 1 プロセスも起こさない**）

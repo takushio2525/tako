@@ -179,11 +179,13 @@ pub enum PanelViewWire {
     Git,
     /// ユーザー向けタスク（#1450 の分割 B2。人がやることの一覧 + 詳細 + 返答）
     Tasks,
+    /// 言語サーバの診断（#1679。エラー・警告の一覧。行を押すとその位置へ）
+    Diagnostics,
 }
 
 impl PanelViewWire {
     /// CLI / MCP が案内する正式値（GUI のタブ表示名と 1:1。#553）
-    pub const VALUES: [&'static str; 4] = ["fleet", "orch", "git", "tasks"];
+    pub const VALUES: [&'static str; 5] = ["fleet", "orch", "git", "tasks", "diagnostics"];
     /// 後方互換のみで受理する旧称と現行値の対応（#553）
     pub const LEGACY_VALUES: [(&'static str, &'static str); 1] = [("tmux", "fleet")];
 
@@ -193,6 +195,7 @@ impl PanelViewWire {
             PanelViewWire::Orch => "orch",
             PanelViewWire::Git => "git",
             PanelViewWire::Tasks => "tasks",
+            PanelViewWire::Diagnostics => "diagnostics",
         }
     }
 
@@ -203,6 +206,7 @@ impl PanelViewWire {
             "orch" => Some(PanelViewWire::Orch),
             "git" => Some(PanelViewWire::Git),
             "tasks" => Some(PanelViewWire::Tasks),
+            "diagnostics" => Some(PanelViewWire::Diagnostics),
             _ => None,
         }
     }
@@ -220,6 +224,7 @@ impl PanelViewWire {
             PanelViewWire::Orch => "オーケストレーター俯瞰（master + worker のツリー）",
             PanelViewWire::Git => "git（差分・ステージ・コミット・ブランチ）",
             PanelViewWire::Tasks => "人がやること（承認待ち・レビュー・投稿）の一覧と返答",
+            PanelViewWire::Diagnostics => "言語サーバの診断（エラー・警告）の一覧",
         }
     }
 
@@ -812,6 +817,18 @@ pub enum Request {
         action: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
+    },
+    /// 診断の一覧（FR-3.29 / #1679。`tako lsp diagnostics` / MCP `tako_lsp` の
+    /// action=diagnostics）。波線と右パネルの diagnostics ビューが読むのと同じ表を返す。
+    ///
+    /// `pane` はプレビューペイン（省略で開いている文書すべて）。`severity` は
+    /// `error` / `warning` / `info` / `hint` で、**その重大度以上**に絞る。
+    /// 位置は `tako edit replace-range` と同じ（行 1 始まり・桁 0 始まりの UTF-8 バイト）
+    LspDiagnostics {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        severity: Option<String>,
     },
     /// undo（#195）
     PreviewUndo { pane: Option<u64> },
@@ -2417,6 +2434,7 @@ pub fn changes_layout(request: &Request) -> bool {
         | Request::RemoteDevices { .. }
         | Request::RemoteShortcuts { .. }
         | Request::LspServer { .. }
+        | Request::LspDiagnostics { .. }
         // --- ペインの中身だけを触る（再描画は端末・プレビュー自身の経路が行う） ---
         | Request::Send { .. }
         | Request::Scroll { .. }
@@ -2785,8 +2803,12 @@ mod tests {
         assert_eq!(PanelViewWire::Orch.as_str(), "orch");
         assert_eq!(PanelViewWire::Git.as_str(), "git");
         assert_eq!(PanelViewWire::Tasks.as_str(), "tasks");
+        assert_eq!(PanelViewWire::Diagnostics.as_str(), "diagnostics");
         // 案内する正式値に旧称は混ざらない（GUI に出ない語を勧めない）
-        assert_eq!(PanelViewWire::VALUES, ["fleet", "orch", "git", "tasks"]);
+        assert_eq!(
+            PanelViewWire::VALUES,
+            ["fleet", "orch", "git", "tasks", "diagnostics"]
+        );
         assert!(!PanelViewWire::VALUES.contains(&"tmux"));
     }
 
@@ -2798,6 +2820,11 @@ mod tests {
         assert_eq!(PanelViewWire::parse("git"), Some(PanelViewWire::Git));
         // #1450 B2: ユーザー向けタスクのビュー
         assert_eq!(PanelViewWire::parse("tasks"), Some(PanelViewWire::Tasks));
+        // #1679: 言語サーバの診断のビュー
+        assert_eq!(
+            PanelViewWire::parse("diagnostics"),
+            Some(PanelViewWire::Diagnostics)
+        );
         assert_eq!(PanelViewWire::parse("task"), None);
         assert_eq!(PanelViewWire::parse("fleets"), None);
         assert_eq!(PanelViewWire::parse(""), None);
@@ -2822,7 +2849,10 @@ mod tests {
     #[test]
     fn panel_viewの案内文は表示名と旧称の対応を含む() {
         let hint = PanelViewWire::values_hint();
-        assert_eq!(hint, "fleet | orch | git | tasks。tmux は fleet の旧称");
+        assert_eq!(
+            hint,
+            "fleet | orch | git | tasks | diagnostics。tmux は fleet の旧称"
+        );
     }
 
     /// `values_summary` の `expect` が論理的に到達不能であることを固定する（#1467）
@@ -2841,7 +2871,7 @@ mod tests {
     fn accepted_valuesは正式値のあとに旧称を並べる() {
         assert_eq!(
             PanelViewWire::accepted_values(),
-            vec!["fleet", "orch", "git", "tasks", "tmux"]
+            vec!["fleet", "orch", "git", "tasks", "diagnostics", "tmux"]
         );
     }
 

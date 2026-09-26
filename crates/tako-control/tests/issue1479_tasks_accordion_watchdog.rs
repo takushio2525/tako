@@ -573,7 +573,7 @@ fn 逆戻りを名指しできる() {
     // (9) バッジの幅を見ずに既定 padding で並べる（直す前 = 320px で切れる）
     let mut s = Sources::load(&root);
     s.right_panel = s.right_panel.replace(
-        "            panel_tab_density(self.panel_width, badge_text.as_deref())",
+        "            panel_tab_density(self.panel_width, badge_text.as_deref(), tabs)",
         "            PanelTabDensity::Full",
     );
     expect_hit(&s, RIGHT_PANEL, "詰め方を幅から決めていない");

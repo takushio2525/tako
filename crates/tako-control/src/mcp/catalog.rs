@@ -1059,6 +1059,22 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #1679（LSP の言語機能。診断。定義ジャンプ・ホバー等は各スライスが action を足す）
+        json!({
+            "name": "tako_lsp",
+            "description": "言語サーバの言語機能。action=diagnostics（既定）で編集モードのコードの診断（エラー・警告）を返す。\
+                pane で絞り（省略で全文書）、severity でその重大度以上に絞る。位置は tako_preview_edit_range と同じ\
+                （行 1 始まり・桁 0 始まりの UTF-8 バイト）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": enum_schema(crate::dispatch::LSP_FEATURE_ACTIONS, "操作（既定 diagnostics）"),
+                    "pane": pane_schema("プレビューペイン ID（省略で全文書）"),
+                    "severity": enum_schema(&tako_core::lsp::diagnostic::Severity::NAMES, "この重大度以上に絞る"),
+                },
+                "additionalProperties": false,
+            },
+        }),
         json!({
             "name": "tako_preview_save",
             "description": "コードプレビューの未保存編集をファイルへ書き戻す。読み込み後に外部変更があれば競合として拒否し、上書きしない。",

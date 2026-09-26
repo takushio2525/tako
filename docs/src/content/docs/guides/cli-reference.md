@@ -32,7 +32,7 @@ tako orchestrator spawn --help
 | [`send`](#tako-send) | ペインへテキスト・コマンドを送る |
 | [`read`](#tako-read) | ペインの画面内容を読む |
 | [`links`](#tako-links) | 画面のリンク（Cmd+クリック / Windows は Ctrl+クリックで開けるもの）を列挙する |
-| [`lsp`](#tako-lsp) | 言語サーバ（LSP）の状態と起動・停止（編集モードで自動的に起きる） |
+| [`lsp`](#tako-lsp) | 言語サーバ（LSP）の状態と起動・停止・編集中のコードの診断（編集モードで自動的に起きる） |
 | [`list`](#tako-list) | タブ・ペインの構成を JSON で得る |
 | [`focus`](#tako-focus) | フォーカスを移す |
 | [`scroll`](#tako-scroll) | スクロールバックを動かす |
@@ -420,7 +420,7 @@ tako title --pane 3 ""   # 空文字でクリア（自動リネームに戻る�
 
 ### tako lsp
 
-コードプレビューを**編集モードにすると**、拡張子に合う言語サーバ（Rust = rust-analyzer / C・C++ = clangd / TypeScript・JavaScript = typescript-language-server / Python = pyright）が自動的に起きます。`tako lsp` はその状態を見たり、起こし直したりするコマンドです。補完や診断の表示はこれから順に入ります。
+コードプレビューを**編集モードにすると**、拡張子に合う言語サーバ（Rust = rust-analyzer / C・C++ = clangd / TypeScript・JavaScript = typescript-language-server / Python = pyright）が自動的に起きます。`tako lsp` はその状態を見たり、起こし直したり、診断（エラー・警告）を一覧したりするコマンドです。診断は画面でも、コードの波線（エラー = 赤 / 警告 = 黄 / 情報 = 青 / ヒント = 灰）と右パネルの diagnostics ビューに出ます。補完や定義ジャンプはこれから順に入ります。
 
 ```bash
 tako lsp status          # 状態（稼働中か・pid・診断の件数）。未導入なら理由と導入コマンド
@@ -428,9 +428,13 @@ tako lsp servers         # 対応している言語サーバと、入ってい�
 tako lsp restart         # 起こし直す（サーバを入れた後はこれ）
 tako lsp stop            # 止める（restart するまで起こさない）
 tako lsp logs            # サーバが出したエラー出力の直近
+tako lsp diagnostics     # 編集中のコードの診断（言語サーバにつながった文書すべて）
+tako lsp diagnostics --pane 7 --severity warning   # そのペインの、警告以上（エラーと警告）
 ```
 
 `--name rust-analyzer` のように 1 つだけを指定できます。MCP では `tako_lsp_server`（`action` 引数）が同じ操作です。
+
+`tako lsp diagnostics` は 1 件 1 行で `行:桁-行:桁  重大度  メッセージ  (出所 コード)` を出します。位置は `tako edit replace-range` と同じ（行は 1 始まり・桁は 0 始まりのバイト）なので、そのまま範囲編集へ渡せます。`--severity` は `error` / `warning` / `info` / `hint` で、**その重大度以上**に絞ります。`--json` を付けると重大度ごとの数（`counts`）と、tako が保持している診断の総数（`retained`）も返ります。MCP では `tako_lsp`（`action=diagnostics`）が同じ操作です。
 
 ## レイアウト操作
 
@@ -819,6 +823,7 @@ tako panel --show --view fleet   # fleet = 全ペイン + tmux セッション
 tako panel --view orch           # orch  = master + ワーカーツリー
 tako panel --view git            # git   = ブランチ・変更・履歴・diff
 tako panel --view tasks          # tasks = 人がやること（承認・レビュー・投稿）
+tako panel --view diagnostics    # diagnostics = 言語サーバの診断（LSP の文書があるときだけタブが出る）
 tako panel --hide
 tako panel --filetree on         # 左のファイルツリー
 tako panel --width 360

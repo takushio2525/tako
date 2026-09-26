@@ -44,6 +44,7 @@ use tako_control::mcp;
 use tako_control::orchestrator::ProfileKind;
 use tako_control::protocol::PanelViewWire;
 use tako_core::agent_support::Agent;
+use tako_core::lsp::diagnostic::Severity;
 use tako_core::remote_open::RemoteOpenTarget;
 use tako_core::session_restart::SessionRestartMode;
 use tako_core::ui_mode::UiMode;
@@ -89,7 +90,7 @@ fn registry() -> Vec<Source> {
     let all_agents = agents(&Agent::ALL);
 
     let mut out = vec![
-        // --- 消費: 正本を呼んで生成する（#1467 で寄せた 5 か所） ---
+        // --- 消費: 正本を呼んで生成する（#1467 で寄せた 5 か所 + #1679 の 2 か所） ---
         Source {
             tool: "tako_panel",
             prop: "view",
@@ -124,6 +125,21 @@ fn registry() -> Vec<Source> {
             origin: "RemoteOpenTarget::VALUES（tako-core/src/remote_open.rs）",
             binding: Binding::Consumed,
             values: owned(&RemoteOpenTarget::VALUES),
+        },
+        // #1679: 言語機能の action と診断の重大度（どちらも正本から生成）
+        Source {
+            tool: "tako_lsp",
+            prop: "action",
+            origin: "dispatch::LSP_FEATURE_ACTIONS（tako-control/src/dispatch.rs）",
+            binding: Binding::Consumed,
+            values: owned(tako_control::dispatch::LSP_FEATURE_ACTIONS),
+        },
+        Source {
+            tool: "tako_lsp",
+            prop: "severity",
+            origin: "Severity::NAMES（tako-core/src/lsp/diagnostic.rs）",
+            binding: Binding::Consumed,
+            values: owned(&Severity::NAMES),
         },
         // --- 束縛: 手書きのまま値だけ縛る（正本へ値を足したら落ちる） ---
         Source {
@@ -464,8 +480,8 @@ fn 走査が空振りしていない() {
         "直書き enum の採取が {literals} 件しかない（走査が壊れている。#1467 時点で 97 件）"
     );
     assert_eq!(
-        generated, 5,
-        "生成 site が 5 件でない（{generated} 件）。正本を消費する site を増減したら\
+        generated, 7,
+        "生成 site が 7 件でない（{generated} 件）。正本を消費する site を増減したら\
          `registry()` の Consumed も合わせること"
     );
     assert!(

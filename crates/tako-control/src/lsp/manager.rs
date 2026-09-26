@@ -32,7 +32,7 @@ use tako_core::lsp::state::{Action, Event, Lifecycle, RestartPolicy, ServerState
 use tako_core::lsp::{root, sync};
 use tako_core::platform::child_cmd::{self, ChildCmd};
 
-use super::diagnostics::DiagnosticsStore;
+use super::diagnostics::{DiagnosticsStore, DocDiagnostics};
 use super::server::{Handlers, ServerProcess};
 use super::text;
 
@@ -44,6 +44,10 @@ pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_IDLE_GRACE: Duration = Duration::from_secs(60);
 /// exit を送ってから自分で終わるのを待つ上限
 const EXIT_WAIT: Duration = Duration::from_secs(1);
+/// UI へ「この文書の診断が変わった」を知らせるキューの上限（Zed の
+/// `INCOMING_MESSAGE_QUEUE_CAPACITY` の実測値。設計書 §2 / §18）。
+/// 溢れたら捨てて「全部読み直して」の印を立てる（UI が詰まってもメモリを食わない）
+pub const DIAGNOSTICS_EVENT_CAPACITY: usize = 128;
 
 /// `TAKO_1007_LEGACY=1` で LSP を丸ごと止める（同一バイナリで旧挙動へ戻す A/B の入口）
 pub fn legacy() -> bool {
@@ -211,6 +215,10 @@ struct Inner {
     servers: BTreeMap<ServerKey, Slot>,
     docs: BTreeMap<String, Doc>,
     diagnostics: DiagnosticsStore,
+    /// 診断が変わった文書の URI を UI へ運ぶ（#1679。[`LspManager::diagnostics_events`]）
+    events: Option<futures::channel::mpsc::Sender<String>>,
+    /// キューが満杯で知らせを捨てた（UI は次に読んだとき全部を読み直す）
+    events_overflowed: bool,
     /// 未導入と分かったサーバ（ID ごと。restart で消える）
     not_installed: BTreeMap<&'static str, NotInstalled>,
     epoch: u64,
@@ -413,6 +421,55 @@ impl LspManager {
         shared.lock().diagnostics.count(&uri)
     }
 
+    /// 保持している診断の総数と URI の数（#1679。閉じたペインのぶんが残っていないかの観測口）
+    pub fn diagnostics_retained(&self) -> (usize, usize) {
+        let Some(shared) = &self.shared else {
+            return (0, 0);
+        };
+        let inner = shared.lock();
+        (inner.diagnostics.total(), inner.diagnostics.uri_count())
+    }
+
+    /// 開いている文書 1 つの診断（#1679）。`uri` は [`DocLease::uri`]。
+    /// 開いていない URI は `None`（まだ publish が無ければ空の診断で返す）
+    pub fn document_diagnostics(&self, uri: &str) -> Option<DocumentDiagnostics> {
+        let shared = self.shared.as_ref()?;
+        let inner = shared.lock();
+        let doc = inner.docs.get(uri)?;
+        let state = inner
+            .servers
+            .get(&doc.key)
+            .map_or(ServerState::Starting, |slot| slot.lifecycle.state);
+        Some(DocumentDiagnostics {
+            server: doc.key.id,
+            server_state: state.slug(),
+            diagnostics: inner.diagnostics.get(uri).unwrap_or_default(),
+        })
+    }
+
+    /// 「この文書の診断が変わった」の知らせを受け取る口（#1679。UI が 1 つだけ持つ）。
+    ///
+    /// 上限 [`DIAGNOSTICS_EVENT_CAPACITY`] の bounded channel。運ぶのは URI だけで、
+    /// 中身は受けた側が [`Self::document_diagnostics`] で読む（同じ URI が何度来ても
+    /// 最新を 1 回読めば済む）。溢れた回は [`Self::take_events_overflow`] が `true` を返す。
+    /// 呼ぶたびに前の口は閉じる。無効な manager（`TAKO_1007_LEGACY=1`）は `None`
+    pub fn diagnostics_events(&self) -> Option<futures::channel::mpsc::Receiver<String>> {
+        let shared = self.shared.as_ref()?;
+        let (tx, rx) = futures::channel::mpsc::channel(DIAGNOSTICS_EVENT_CAPACITY);
+        let mut inner = shared.lock();
+        inner.events = Some(tx);
+        inner.events_overflowed = false;
+        Some(rx)
+    }
+
+    /// キューが溢れて知らせを捨てたか（読むと倒れる）。`true` なら全文書を読み直す
+    pub fn take_events_overflow(&self) -> bool {
+        let Some(shared) = &self.shared else {
+            return false;
+        };
+        std::mem::take(&mut shared.lock().events_overflowed)
+    }
+
     /// 動いているサーバの pid（テストと診断用）
     pub fn server_pids(&self) -> Vec<u32> {
         let Some(shared) = &self.shared else {
@@ -424,6 +481,76 @@ impl LspManager {
             .values()
             .filter_map(|slot| slot.process.as_ref().map(|p| p.pid()))
             .collect()
+    }
+}
+
+/// 編集セッションを持つプレビューペイン 1 つと、言語サーバとのつながり（#1679）。
+///
+/// ペイン → 文書の対応を知っているのは GUI（`EditState` が [`DocLink`] を持つ）なので、
+/// `ControlHost::lsp_documents` がこれを返し、`tako lsp diagnostics` はこれで
+/// ペインから URI を引いて [`LspManager::document_diagnostics`] を読む
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspDocument {
+    pub pane: u64,
+    pub path: String,
+    pub editing: bool,
+    /// 開いている文書の URI（[`DocLink::Open`]）。つながっていなければ `None`
+    pub uri: Option<String>,
+}
+
+impl LspDocument {
+    pub fn new(pane: u64, path: String, editing: bool, link: &DocLink) -> Self {
+        let uri = match link {
+            DocLink::Open(lease) => Some(lease.uri().to_string()),
+            _ => None,
+        };
+        Self {
+            pane,
+            path,
+            editing,
+            uri,
+        }
+    }
+}
+
+/// 開いている文書 1 つの診断と、受け持つサーバ（[`LspManager::document_diagnostics`]）
+#[derive(Debug, Clone)]
+pub struct DocumentDiagnostics {
+    /// 検出表の ID
+    pub server: &'static str,
+    /// サーバの状態（`tako lsp status` の `state` と同じ綴り）
+    pub server_state: &'static str,
+    pub diagnostics: DocDiagnostics,
+}
+
+/// 診断が変わった知らせを UI へ積む（満杯なら捨てて印を立てる。待たない）
+fn notify_diagnostics(inner: &mut Inner, uri: &str) {
+    let Some(tx) = inner.events.as_mut() else {
+        return;
+    };
+    if let Err(error) = tx.try_send(uri.to_string()) {
+        if error.is_full() {
+            inner.events_overflowed = true;
+        } else {
+            // 受け手が居なくなった
+            inner.events = None;
+        }
+    }
+}
+
+/// そのサーバが受け持つ文書の診断を捨てる（サーバが止まった / 落ちた / 起こし直す。
+/// 古いサーバの診断を次の publish まで残すと、直したのに消えない波線になる）
+fn forget_diagnostics_of(inner: &mut Inner, key: &ServerKey) {
+    let uris: Vec<String> = inner
+        .docs
+        .iter()
+        .filter(|(_, d)| d.key == *key)
+        .map(|(uri, _)| uri.clone())
+        .collect();
+    for uri in uris {
+        if inner.diagnostics.forget(&uri) {
+            notify_diagnostics(inner, &uri);
+        }
     }
 }
 
@@ -566,7 +693,9 @@ impl Shared {
         let Some(doc) = inner.docs.remove(uri) else {
             return;
         };
-        inner.diagnostics.forget(uri);
+        if inner.diagnostics.forget(uri) {
+            notify_diagnostics(inner, uri);
+        }
         // 同じファイルで断られていた別のペインが開き直せるように
         inner.epoch = inner.epoch.wrapping_add(1);
         let still_open = inner.docs.values().any(|d| d.key == doc.key);
@@ -756,12 +885,16 @@ impl Shared {
         let mut guard = self.lock();
         let inner = &mut *guard;
         let docs = &inner.docs;
-        inner.diagnostics.publish(params, |uri| {
+        // 桁は**サーバへ送った本文の写し**（= サーバが見ている本文）で UTF-8 へ写す
+        let published = inner.diagnostics.publish(params, |uri| {
             let wanted = uri_key(uri);
             docs.iter()
                 .find(|(_, d)| d.key == *key && d.uri_key == wanted)
-                .map(|(ours, _)| ours.clone())
+                .map(|(ours, doc)| (ours.clone(), doc.text.as_str()))
         });
+        if let Some(uri) = published {
+            notify_diagnostics(inner, &uri);
+        }
     }
 
     fn on_exit(&self, key: &ServerKey, generation: u64) {
@@ -781,6 +914,10 @@ impl Shared {
                 doc.opened = None;
             }
         }
+        forget_diagnostics_of(inner, key);
+        let Some(slot) = inner.servers.get_mut(key) else {
+            return;
+        };
         if matches!(
             slot.lifecycle.state,
             ServerState::Starting | ServerState::Running
@@ -892,6 +1029,7 @@ impl Shared {
                         doc.opened = None;
                     }
                 }
+                forget_diagnostics_of(inner, &key);
                 // 止めている間に開き直された文書があれば起こし直す
                 if reopen {
                     if let Some(slot) = inner.servers.get_mut(&key) {
@@ -937,6 +1075,7 @@ impl Shared {
                     doc.opened = None;
                 }
             }
+            forget_diagnostics_of(inner, &key);
             let Some(slot) = inner.servers.get_mut(&key) else {
                 continue;
             };

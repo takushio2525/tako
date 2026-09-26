@@ -1062,6 +1062,11 @@ pub trait SystemHost {
     fn lsp(&self) -> Option<&crate::lsp::LspManager> {
         None
     }
+    /// 編集セッションを持つプレビューペインと、言語サーバとのつながり（#1679）。
+    /// `tako lsp diagnostics` がペインから文書の URI を引く。持たない実装は空
+    fn lsp_documents(&self) -> Vec<crate::lsp::LspDocument> {
+        Vec::new()
+    }
     /// ライブペインの現行ログファイル（Issue #112 B。クローズ済みペインは
     /// `pane_log::latest_for_pane` のファイル名検索にフォールバックする）
     fn pane_log_file(&self, _pane: PaneId) -> Option<std::path::PathBuf> {
