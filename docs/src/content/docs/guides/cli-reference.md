@@ -191,6 +191,8 @@ tako setup --reset
 
 `tako setup` は**シェル統合**（ペインの作業ディレクトリ追従・コマンドの実行状態・入力予測）の配置も自分で行います。macOS / Linux は tako が開くシェルへ環境変数を渡すだけで効くので設定ファイルには何も書かず、状態が 1 行出るだけです。**Windows は PowerShell のプロファイル（`$PROFILE`）への追記が必要**なので、どのファイルへ何を書くか（置くのは tako の管理ブロック 1 個だけで既存の行はそのまま残ること・`tako shell-integration uninstall` で元に戻せること）を表示してから配置します。2 回目以降は差分がなければ何も書きません。配置できなかったときも setup は最後まで走り、`tako shell-integration install` を「残り」として案内します。状態だけ見たいときは `tako shell-integration` または `tako setup --check` です。
 
+`tako setup` の最後には、**スマホから使えるか**を `スマホからの接続: …` の 1 行で出します。Tailscale の導入・ログイン・証明書・公開の状態を**読むだけ**で（何も入れず何も起動しません）、その状態で次に打つコマンドを添えます。Tailscale が未導入なら `tako setup deps install`（依存チェックの段で出るものと同じ案内）、入っていて途中まで済んでいるなら `tako remote setup`、公開まで済んでいれば接続先の URL です。Tailscale が応答しないときは `[確認できません] tailscale status --json（10 秒応答なし）` と出して先へ進むので、setup が止まることはありません。
+
 `tako setup --check` が出す診断の項目は `tako check-health` と**同じ 1 つの実装**から出ています。人が読むなら `tako setup --check`、AI や監視から読むなら `tako check-health --json`（`diagnostics.items[].key` が安定した項目名、`diagnostics.remaining` が人の操作が要るぶん）で、どちらも同じ状態には同じ答えを返します。
 
 `--answers` は `selected_agent`、`provider_plans`、`instruction_content`、`profile`、`projects`、`orchestrator`、`sleep_guard` を受け取ります。同じ JSON は MCP `tako_setup` でも使えるため、AI に日本語で希望を伝えてセットアップを代行させられます。`projects` は指定時に全登録を置き換えます。

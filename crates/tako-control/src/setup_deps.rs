@@ -620,6 +620,20 @@ pub fn deps_install_hint(state: &DepStatus) -> Option<String> {
     ))
 }
 
+/// 未検出の依存 1 件について「次に打つ 1 行」（#1507。`tako setup` の末尾の要約用）。
+///
+/// [`offer_and_install`] が案内で終えるときと**同じ文面**を返す: tako が代行できるなら
+/// 最簡形の [`deps_install_hint`]、できない（手段が無い / brew が無い）なら
+/// [`manual_hint_line`]。判断は [`offer_for`] と同じ `can_tako_install` 1 つだけ
+pub fn next_step_line(state: &DepStatus) -> String {
+    if state.can_tako_install() {
+        if let Some(hint) = deps_install_hint(state) {
+            return hint;
+        }
+    }
+    manual_hint_line(state)
+}
+
 /// 未検出の依存 1 件を、文脈に従って「案内 →（必要なら）確認 → 導入 → 再検出」する。
 ///
 /// 判断は [`offer_for`]（理由を返す純粋関数）・導入は [`install`]・再検出は
@@ -953,6 +967,36 @@ mod tests {
         // 依存表の hint（App Store 版）もここで出る
         assert!(out.contains("App Store で「Tailscale」を検索"), "{out}");
         assert!(!out.contains("[y/N]"), "代行できないのに聞いている: {out}");
+    }
+
+    /// `tako setup` の末尾の「次に打つ 1 行」（#1507）は、依存チェック段が案内で終えるときと
+    /// **字面まで同じ**（同じ実行の中で 2 通りの言い方をしない）
+    #[test]
+    fn 次の一手は依存チェック段の案内と同じ文面() {
+        let brew = DepInstaller::Brew { pkg: "tailscale" };
+        // 代行できる = 最簡形の導入口（#322）
+        let can_run = fake_status(Some(brew), Some("/opt/homebrew/bin/brew"));
+        assert_eq!(
+            next_step_line(&can_run),
+            "いま入れる: tako setup deps install   （brew install tailscale 相当）"
+        );
+        let no_terminal = DepOfferContext {
+            stdin_is_terminal: false,
+            ..ask_ctx()
+        };
+        let (_, out) = run_offer(&can_run, no_terminal, "");
+        assert!(out.contains(&next_step_line(&can_run)), "{out}");
+        // 代行できない（brew が無い）= 人が打つ手。`CannotRun` の案内と同じ
+        let cannot_run = fake_status(Some(brew), None);
+        assert_eq!(next_step_line(&cannot_run), manual_hint_line(&cannot_run));
+        let (_, out) = run_offer(&cannot_run, ask_ctx(), "");
+        assert!(out.contains(&next_step_line(&cannot_run)), "{out}");
+        // 手段が無い依存は hint だけ
+        let no_installer = fake_status(None, None);
+        assert_eq!(
+            next_step_line(&no_installer),
+            "導入方法: App Store で「Tailscale」を検索"
+        );
     }
 
     /// 端末があれば `[y/N]` を出し、N は入れずに次の一手へ落とす

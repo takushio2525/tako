@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-09-26（#1506: setup --review のプランの問いの既定を前回値にし、Enter で倍率が退行しないようにした）
-- `--review` は前回値を引き継がない経路なので `prompt_plan` へ前回値が届かず、既定が「不明」固定 = Enter・非 TTY の EOF だけで `max-5x` → `max`（GPT / Google も `unknown` へ）。問いを `plan_question`（表示と「番号 → 値」の 1 か所）へ寄せ、既定は**標準 setup が前回値から選ぶ値と同じ規則**で引く（Max 検出時は max 系だけ・選択肢に無い値は値そのものを既定に見せる）。範囲外の番号は答えなかった扱い（旧は選択肢数を問わず 1〜7 を受け、Max の問いで `4` を打つと `max`）
-- 実測: `scripts/test-setup-plan-keep-previous-1506.sh` **45 PASS 0 FAIL**（修正前ビルドでは `--review` 系の 11 項目だけ FAIL・`--yes` / MCP と同じ起動 / 初回は修正前から緑）・単体 5 本（15 通りで「Enter の結果 = 標準 setup」を照合）・注入 3 通りすべて file:line で FAILED → 戻して緑・pty-answer を共有する 1499 / 1501 / 1504 / 1509 全緑・workspace 5541 passed 0 failed・clippy 3 宇宙 0
-
 ## 2026-09-26（#1657: Code Runner の実行ペインを使い回し、内部マーカーを画面から消して終わりを案内とバッジで伝えた）
 - 再生ボタン / `tako run` は同じタブの「同じファイル + 同じプロファイル」の実行ペインを**その位置で差し替える**（`PaneTree::replace` + 旧ペインは close と同じ後始末。実行中なら止めて再実行 = `stopped_running`。`--new-pane` / MCP `new_pane` で増やす）。終了コードは側路ファイル `run-exit/<pane>.code` で運び（画面の `__TAKO_EXIT=` は書けなかったときの退避路だけ）、画面には「[tako] 終了コード N / Enter で…」、タイトルバーに実行中 / 完了 / 失敗 (N) のバッジ。読む側は `run_pane_exit_code` の 1 実装（`--wait`・カードの実行記録 #1724・`list` の `run`・バッジ）
 - 実測: `scripts/test-run-pane-reuse-1657.sh` **44 PASS 0 FAIL**（5 回で 1 枚・器つきの capture-pane にマーカー無し・A/B `TAKO_1657_LEGACY=1` で 5 枚 + マーカー・visual-test のバッジ色）・`test-remote-command-card-1724.sh` 55 PASS・注入 4 通りが file:line 名指しで FAILED → 戻して緑・workspace 5562 passed 0 failed・clippy 3 宇宙 0
@@ -64,3 +60,7 @@
 ## 2026-09-27（#1662: `--wait` に上限を持たせ、auto_close を GUI の終了検知で効かせ、CLI / MCP の run も走らせる前に保存するようにした）
 - `--wait` は `probe::poll_with_timeout` の 1 実装（既定 600 秒・env `TAKO_RUN_WAIT_TIMEOUT_SECS`・0 は既定）で、超えたら「まだ実行中」+ exit 1。閉じるのは `dispatch::auto_close_run_pane` の 1 本（GUI の出力のたび / 2 秒ごと / `RunInteractiveStatus`）で、閉じた結末は `Workspace::closed_runs` に控える。保存は dispatch `Run` の `save_previews_before_run` の 1 本へ寄せ、再生ボタンの自前保存を外した
 - 実測: `scripts/test-run-wait-save-1662.sh` **32 PASS 0 FAIL**（修正前のバイナリは 14 PASS 18 FAIL = 上限 3 秒でも 15 秒の締め切りまで返らない / `--wait` 無しで閉じない / CLI・MCP とも古い内容が走る）・注入 4 通りすべて file:line 名指しで FAILED → 戻して緑
+
+## 2026-09-27（#1507: setup の末尾にスマホからの接続の状態を 1 行出し、未導入は依存の導入口へ寄せた）
+- 末尾は Tailscale の有無に関係なく固定文 `スマホからリモート接続するには: tako remote setup`（棚卸し Z17）。`remote_setup::setup_summary_lines` が `check_status`（読み取りのみ）の JSON から状態を決めて `スマホからの接続: …` を 1 行出す（10 通り。未導入は `setup_deps::next_step_line` = 依存チェック段と同じ文面・途中までは `tako remote setup`・公開済みは URL）。導入を聞くのは依存段の 1 回だけ
+- 待ちに上限: 検出の `tailscale --version` を `probe::output_with_timeout` へ寄せ、`status --json` の打ち切りを `RunError::TimedOut` の型で持つ（`DaemonNotRunning` へ畳まず `timeouts` へ）。実測: `scripts/test-setup-remote-status-1507.sh` 41 PASS（修正前の tako で 15 FAIL）・時間切れでも 11 秒で完走・打ち切った子 0・番犬 6 本へ注入 4 通りが file:line で FAILED → 戻して緑

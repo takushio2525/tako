@@ -108,7 +108,7 @@ setup_pty(){   # setup_pty <出力先> -- <tako の引数...>
   local -a legacy=()
   [ -n "${TAKO_1504_LEGACY:-}" ] && legacy=("TAKO_1504_LEGACY=1")
   env -i $(iso_env) ${legacy[@]+"${legacy[@]}"} \
-      /usr/bin/python3 "$PTY" --stop-after "スマホからリモート接続するには" --timeout 90 \
+      /usr/bin/python3 "$PTY" --stop-after "スマホからの接続" --timeout 90 \
       -- "$TAKO" "$@" > "$out" 2>&1
   echo $?
 }

@@ -642,10 +642,19 @@ fn install_tailscale(auto_yes: bool, writer: &mut dyn io::Write) -> Result<Optio
     })
 }
 
-/// `tako remote setup` の状態チェック（非対話。status 用途）
+/// `tako remote setup` の状態チェック（非対話。status 用途）。
+///
+/// **読み取りだけ**（`tailscale status --json` / `tailscale serve status --json` を聞くだけで、
+/// 導入・起動・設定の書き換えはしない）。`tako setup` の末尾（#1507）・GUI のリモートパネル・
+/// dispatch `RemoteSetup { action: "check" }` が同じこれを読む。
+///
+/// 待ちは tailscale 側の上限（1 回 10 秒）で打ち切られ、打ち切ったものは `timeouts`
+/// （`label` / `waited_secs`。#1503 の知らせと同じ形）へ載る。空なら全部を確かめられた
 pub fn check_status() -> Value {
     let status = tailscale::setup_status();
     let mut items = Vec::new();
+    let mut timeouts: Vec<tako_core::probe::TimeoutNotice> =
+        status.timed_out.iter().cloned().collect();
 
     items.push(json!({
         "item": "tailscale",
@@ -674,7 +683,7 @@ pub fn check_status() -> Value {
     // serve 状態
     if let Some(cli) = status.cli_path.as_deref() {
         if status.ready() {
-            match tailscale::serve_state(cli) {
+            match tailscale::serve_state_checked(cli) {
                 Ok(ServeState::Proxy(target)) => {
                     items.push(json!({
                         "item": "serve",
@@ -696,10 +705,13 @@ pub fn check_status() -> Value {
                     }));
                 }
                 Err(e) => {
+                    if let tailscale::RunError::TimedOut(notice) = &e {
+                        timeouts.push(notice.clone());
+                    }
                     items.push(json!({
                         "item": "serve",
                         "status": "error",
-                        "detail": e,
+                        "detail": e.to_string(),
                     }));
                 }
             }
@@ -710,7 +722,173 @@ pub fn check_status() -> Value {
         "ready": status.ready(),
         "ts_net_url": status.ts_net_url(),
         "items": items,
+        "timeouts": timeouts
+            .iter()
+            .map(|n| json!({ "label": n.label, "waited_secs": n.waited_secs }))
+            .collect::<Vec<_>>(),
     })
+}
+
+// --- `tako setup` の末尾の 1 行（#1507） --------------------------------------
+
+/// スマホから使えるか。`tako setup` の末尾に出す 1 行の中身（#1507）。
+///
+/// [`check_status`] の JSON **だけ**から決める（[`phone_readiness`]）。setup が
+/// tailscale を別口で問い合わせると、`tako remote setup` / GUI のリモートパネルと
+/// 答えが割れる。欠けている段が複数あるときは、ウィザードの段の順
+/// （導入 → 起動 → ログイン → 証明書 → 公開）で**最初の 1 つだけ**を言う
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PhoneReadiness {
+    /// 上限で打ち切ったので確かめ切れなかった（`timeouts` が空でない）
+    Unknown,
+    /// Tailscale が見つからない
+    TailscaleMissing,
+    /// tailscaled に繋がらない
+    DaemonNotRunning,
+    /// 未ログイン（BackendState = NeedsLogin）
+    NotLoggedIn,
+    /// ログイン済みだが接続が有効でない（値は BackendState。Stopped 等）
+    BackendNotRunning(String),
+    /// tailnet の HTTPS 証明書（MagicDNS + HTTPS Certificates）が未有効
+    HttpsNotEnabled,
+    /// Tailscale 側は整っているが、まだ公開していない（serve 未設定）
+    NotPublished,
+    /// 公開済み（serve が tako 形式の単純プロキシ）。`url` は恒久固定 URL
+    Published { url: Option<String> },
+    /// tako の管理形式でない serve 設定がある
+    ServeConflict,
+    /// serve の状態を読めなかった
+    ServeUnreadable,
+}
+
+/// [`check_status`] の JSON から [`PhoneReadiness`] を決める（**純粋関数**）
+pub fn phone_readiness(status: &Value) -> PhoneReadiness {
+    if !status_timeouts(status).is_empty() {
+        return PhoneReadiness::Unknown;
+    }
+    let item = |key: &str| {
+        status["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|entry| entry["item"].as_str() == Some(key))
+    };
+    let is_ok = |key: &str| item(key).and_then(|e| e["status"].as_str()) == Some("ok");
+    if !is_ok("tailscale") {
+        return PhoneReadiness::TailscaleMissing;
+    }
+    if !is_ok("daemon") {
+        return PhoneReadiness::DaemonNotRunning;
+    }
+    if !is_ok("login") {
+        return match item("login").and_then(|e| e["detail"].as_str()) {
+            Some("NeedsLogin") | None => PhoneReadiness::NotLoggedIn,
+            Some(state) => PhoneReadiness::BackendNotRunning(state.to_string()),
+        };
+    }
+    if !is_ok("https") || !is_ok("dns_name") {
+        return PhoneReadiness::HttpsNotEnabled;
+    }
+    match item("serve").and_then(|e| e["status"].as_str()) {
+        Some("ok") => PhoneReadiness::Published {
+            url: status["ts_net_url"].as_str().map(str::to_string),
+        },
+        Some("not_configured") => PhoneReadiness::NotPublished,
+        Some("conflict") => PhoneReadiness::ServeConflict,
+        _ => PhoneReadiness::ServeUnreadable,
+    }
+}
+
+/// [`check_status`] の JSON から打ち切りの知らせを戻す（`timeouts` の読み取り）
+pub fn status_timeouts(status: &Value) -> Vec<tako_core::probe::TimeoutNotice> {
+    status["timeouts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            Some(tako_core::probe::TimeoutNotice {
+                label: entry["label"].as_str()?.to_string(),
+                waited_secs: entry["waited_secs"].as_u64()?,
+            })
+        })
+        .collect()
+}
+
+/// 末尾の 1 行の頭。PTY の実経路テストがここを「setup の出力の終わり」の目印にする
+pub const PHONE_LINE_HEAD: &str = "スマホからの接続: ";
+
+/// [`PhoneReadiness`] を 1 行にする（**純粋関数**）。
+///
+/// `install_step` は Tailscale が未導入のときの「次に打つ 1 行」で、
+/// [`crate::setup_deps::next_step_line`] が作る（依存の導入口 = #1499 / #1524 の 1 実装。
+/// ここで `brew install` を組み立てない）。提示するコマンドは常に最簡形（#322）
+pub fn phone_readiness_line(readiness: &PhoneReadiness, install_step: Option<&str>) -> String {
+    const SETUP: &str = "設定する: tako remote setup";
+    const RECHECK: &str = "確かめ直す: tako remote setup";
+    let body = match readiness {
+        PhoneReadiness::Unknown => format!("状態を確認できませんでした。{RECHECK}"),
+        PhoneReadiness::TailscaleMissing => match install_step {
+            Some(step) => format!("Tailscale が未導入です。{step}"),
+            // 依存表の側では見つかっている（検出の口が食い違う）= 導入を勧めない
+            None => format!("Tailscale を実行できませんでした。{RECHECK}"),
+        },
+        PhoneReadiness::DaemonNotRunning => format!("Tailscale が起動していません。{SETUP}"),
+        PhoneReadiness::NotLoggedIn => format!("Tailscale にログインしていません。{SETUP}"),
+        PhoneReadiness::BackendNotRunning(state) => {
+            format!("Tailscale の接続が有効ではありません（状態: {state}）。{SETUP}")
+        }
+        PhoneReadiness::HttpsNotEnabled => {
+            format!("tailnet の HTTPS 証明書が未有効です。{SETUP}")
+        }
+        PhoneReadiness::NotPublished => {
+            format!("Tailscale は準備済みです（まだ公開していません）。{SETUP}")
+        }
+        PhoneReadiness::Published { url: Some(url) } => format!("設定済みです（{url}）"),
+        PhoneReadiness::Published { url: None } => "設定済みです".to_string(),
+        PhoneReadiness::ServeConflict => {
+            format!("Tailscale Serve に tako 以外の設定があります。{SETUP}")
+        }
+        PhoneReadiness::ServeUnreadable => {
+            format!("Tailscale Serve の状態を読めませんでした。{RECHECK}")
+        }
+    };
+    format!("{PHONE_LINE_HEAD}{body}")
+}
+
+/// `tako setup` の末尾に出す行（#1507）。**読み取りだけ**で、導入も起動もしない。
+///
+/// 1. [`check_status`] を 1 回読む（待ちは tailscale 側の上限で打ち切られる）
+/// 2. 打ち切ったものがあれば #1503 の文面（`[確認できません] …（N 秒応答なし）…`）で並べる
+///    = dispatch `SetupRun` / MCP `tako_setup` が `probe::parse_notices` で読み戻して
+///    `probe_timeouts` へ載せる形
+/// 3. 最後に [`PHONE_LINE_HEAD`] で始まる 1 行
+///
+/// Tailscale の導入を**勧める・聞く**のは依存チェック段の 1 回だけ（#1499 / #1524）。
+/// ここで聞き直すと同じ実行で 2 度聞くことになるので、未導入なら導入口を指すだけにする
+pub fn setup_summary_lines() -> Vec<String> {
+    let status = check_status();
+    let readiness = phone_readiness(&status);
+    let install_step = match readiness {
+        PhoneReadiness::TailscaleMissing => tailscale_install_step(),
+        _ => None,
+    };
+    status_timeouts(&status)
+        .iter()
+        .map(|notice| format!("  {notice}"))
+        .chain(std::iter::once(phone_readiness_line(
+            &readiness,
+            install_step.as_deref(),
+        )))
+        .collect()
+}
+
+/// Tailscale が未導入のときの「次に打つ 1 行」（依存表の側でも見つからないときだけ）
+fn tailscale_install_step() -> Option<String> {
+    let state = setup_deps::status_of(TAILSCALE_DEP)?;
+    state
+        .found
+        .is_none()
+        .then(|| setup_deps::next_step_line(&state))
 }
 
 #[cfg(test)]
@@ -730,6 +908,182 @@ mod tests {
         let result = check_status();
         assert!(result["items"].is_array());
         assert!(result["ready"].is_boolean());
+        // 打ち切りの有無は常にキーごと載る（#1507。無いと「確かめ切れた」と区別できない）
+        assert!(result["timeouts"].is_array());
+    }
+
+    // --- `tako setup` の末尾の 1 行（#1507）---------------------------------
+    //
+    // 入力は `check_status` の JSON と同じ形の固定値。**状態ごとの字面を固定**する
+    // （判定の順・次に打つコマンドのどちらかが変わると、どの状態で変わったかが落ちる）
+
+    /// `check_status` と同じ形の JSON を組む。`missing_from` の段から先が欠ける（`None` = 全段 ok）
+    fn status_json(missing_from: Option<&str>, login_detail: &str, serve: Option<&str>) -> Value {
+        let order = ["tailscale", "daemon", "login", "https", "dns_name"];
+        let cut = missing_from.and_then(|key| order.iter().position(|k| *k == key));
+        let mut items: Vec<Value> = order
+            .iter()
+            .enumerate()
+            .map(|(i, key)| {
+                let ok = cut.is_none_or(|c| i < c);
+                let mut item = json!({ "item": key, "status": if ok { "ok" } else { "missing" } });
+                if *key == "login" {
+                    item["detail"] = json!(if ok { "Running" } else { login_detail });
+                }
+                item
+            })
+            .collect();
+        if let Some(serve) = serve {
+            items.push(json!({ "item": "serve", "status": serve }));
+        }
+        json!({
+            "ready": cut.is_none(),
+            "ts_net_url": "https://mac.tail1234.ts.net",
+            "items": items,
+            "timeouts": [],
+        })
+    }
+
+    const INSTALL_STEP: &str =
+        "いま入れる: tako setup deps install   （brew install tailscale 相当）";
+
+    fn line_of(status: &Value) -> String {
+        phone_readiness_line(&phone_readiness(status), Some(INSTALL_STEP))
+    }
+
+    #[test]
+    fn 状態ごとの1行を固定する() {
+        let cases: [(Value, &str); 11] = [
+            (
+                status_json(Some("tailscale"), "", None),
+                "スマホからの接続: Tailscale が未導入です。いま入れる: tako setup deps install   （brew install tailscale 相当）",
+            ),
+            (
+                status_json(Some("daemon"), "", None),
+                "スマホからの接続: Tailscale が起動していません。設定する: tako remote setup",
+            ),
+            (
+                status_json(Some("login"), "NeedsLogin", None),
+                "スマホからの接続: Tailscale にログインしていません。設定する: tako remote setup",
+            ),
+            (
+                status_json(Some("login"), "Stopped", None),
+                "スマホからの接続: Tailscale の接続が有効ではありません（状態: Stopped）。設定する: tako remote setup",
+            ),
+            (
+                status_json(Some("https"), "", None),
+                "スマホからの接続: tailnet の HTTPS 証明書が未有効です。設定する: tako remote setup",
+            ),
+            (
+                status_json(Some("dns_name"), "", None),
+                "スマホからの接続: tailnet の HTTPS 証明書が未有効です。設定する: tako remote setup",
+            ),
+            (
+                status_json(None, "", Some("not_configured")),
+                "スマホからの接続: Tailscale は準備済みです（まだ公開していません）。設定する: tako remote setup",
+            ),
+            (
+                status_json(None, "", Some("ok")),
+                "スマホからの接続: 設定済みです（https://mac.tail1234.ts.net）",
+            ),
+            (
+                status_json(None, "", Some("conflict")),
+                "スマホからの接続: Tailscale Serve に tako 以外の設定があります。設定する: tako remote setup",
+            ),
+            (
+                status_json(None, "", Some("error")),
+                "スマホからの接続: Tailscale Serve の状態を読めませんでした。確かめ直す: tako remote setup",
+            ),
+            // ready なのに serve の項目が無い（壊れた応答）は「読めなかった」へ倒す
+            (
+                status_json(None, "", None),
+                "スマホからの接続: Tailscale Serve の状態を読めませんでした。確かめ直す: tako remote setup",
+            ),
+        ];
+        for (status, expected) in cases {
+            assert_eq!(line_of(&status), expected, "入力: {status}");
+        }
+    }
+
+    /// 打ち切りが 1 つでもあれば、他の項目が何を言っていても「確認できなかった」
+    /// （`status --json` の打ち切りは項目上 `daemon: missing` になるので、見ないと
+    /// 「起動していません」と言い切ってしまう = #1503 の「無言にしない」に反する）
+    #[test]
+    fn 打ち切りは未起動と言い切らない() {
+        let mut status = status_json(Some("daemon"), "", None);
+        status["timeouts"] = json!([{ "label": "tailscale status --json", "waited_secs": 10 }]);
+        assert_eq!(phone_readiness(&status), PhoneReadiness::Unknown);
+        assert_eq!(
+            line_of(&status),
+            "スマホからの接続: 状態を確認できませんでした。確かめ直す: tako remote setup"
+        );
+        // serve 段の打ち切りも同じ扱い
+        let mut serve = status_json(None, "", Some("error"));
+        serve["timeouts"] =
+            json!([{ "label": "tailscale serve status --json", "waited_secs": 10 }]);
+        assert_eq!(phone_readiness(&serve), PhoneReadiness::Unknown);
+    }
+
+    /// 打ち切りの知らせは #1503 の文面で出る = dispatch が `parse_notices` で読み戻せる
+    #[test]
+    fn 打ち切りの知らせはdispatchが読み戻せる() {
+        let status = json!({
+            "items": [],
+            "timeouts": [{ "label": "tailscale status --json", "waited_secs": 10 }],
+        });
+        let notices = status_timeouts(&status);
+        assert_eq!(
+            notices,
+            vec![tako_core::probe::TimeoutNotice {
+                label: "tailscale status --json".into(),
+                waited_secs: 10,
+            }]
+        );
+        let printed = format!("  {}", notices[0]);
+        assert_eq!(
+            printed,
+            "  [確認できません] tailscale status --json（10 秒応答なし）。打ち切って次へ進みます"
+        );
+        assert_eq!(tako_core::probe::parse_notices(&printed), notices);
+        // キーが無い（#1507 前の応答）・形が崩れた要素は拾わない
+        assert!(status_timeouts(&json!({ "items": [] })).is_empty());
+        assert!(status_timeouts(&json!({ "timeouts": [{ "label": 1 }] })).is_empty());
+    }
+
+    /// 未導入なのに導入口が引けない（依存表の側では見つかっている）ときは導入を勧めない
+    #[test]
+    fn 導入口が無ければ導入を勧めない() {
+        let status = status_json(Some("tailscale"), "", None);
+        assert_eq!(
+            phone_readiness_line(&phone_readiness(&status), None),
+            "スマホからの接続: Tailscale を実行できませんでした。確かめ直す: tako remote setup"
+        );
+    }
+
+    /// 提示するコマンドは最簡形（#322）: 既定で済む引数を付けない
+    #[test]
+    fn 提示するコマンドは最簡形() {
+        let all = [
+            PhoneReadiness::Unknown,
+            PhoneReadiness::TailscaleMissing,
+            PhoneReadiness::DaemonNotRunning,
+            PhoneReadiness::NotLoggedIn,
+            PhoneReadiness::BackendNotRunning("Stopped".into()),
+            PhoneReadiness::HttpsNotEnabled,
+            PhoneReadiness::NotPublished,
+            PhoneReadiness::Published { url: None },
+            PhoneReadiness::ServeConflict,
+            PhoneReadiness::ServeUnreadable,
+        ];
+        for readiness in all {
+            let line = phone_readiness_line(&readiness, Some(INSTALL_STEP));
+            assert!(line.starts_with(PHONE_LINE_HEAD), "{line}");
+            assert!(
+                !line.contains("--"),
+                "引数付きのコマンドを出している: {line}"
+            );
+            assert_eq!(line.lines().count(), 1, "1 行に収まっていない: {line}");
+        }
     }
 
     #[test]
