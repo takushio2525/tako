@@ -3339,7 +3339,13 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
         );
     }
     eprintln!();
-    eprintln!("スマホからリモート接続するには: tako remote setup");
+    // スマホから使えるかを 1 行（#1507）。状態は `remote_setup::check_status` の読み取り
+    // だけで決め、ここでは導入も起動もしない（Tailscale の導入を勧めるのは依存チェック段の
+    // 1 回 = #1499 / #1524。同じ実行で 2 度聞かない）。待ちは tailscale 側の上限で打ち切られ、
+    // 打ち切ったら #1503 の文面で知らせてから締める = `--yes` / 非 TTY / `--answers` でも止まらない
+    for line in tako_control::remote_setup::setup_summary_lines() {
+        eprintln!("{line}");
+    }
 
     // --- 対話エージェント起動（Issue #295 / #322 / #391）---
     // 既定: 検出フロー完了後に setup agent を対話起動し、設定変更・解説・次の一歩を対話で行う。

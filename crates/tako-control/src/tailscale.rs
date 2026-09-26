@@ -39,15 +39,44 @@ pub fn find_tailscale() -> Option<String> {
         .map(|c| c.to_string())
 }
 
-/// コマンドが実行可能か（`--version` が起動できるか）を確認する
+/// コマンドが実行可能か（`--version` が上限内に正常終了するか）を確認する。
+///
+/// 待ちは `tako_core::probe` の 1 実装を通す（#1503 / #1507。コンソール窓の抑止 = #586 も
+/// そちらが持つ）。`--version` はデーモンへ話しかけないので普段は即座に返るが、素の
+/// `.status()` は上限を持たないので、相手が固まると呼び手（`tako setup` の末尾・
+/// `tako remote start`）ごと固まる。上限を超えた候補は「実行できない」扱いで次へ進む
 fn runnable(bin: &str) -> bool {
-    // #586: GUI プロセスから到達するのでコンソールウィンドウを出させない
-    tako_core::platform::process::no_console_window(&mut Command::new(bin))
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    matches!(
+        tako_core::probe::output_with_timeout(bin, &["--version"], TAILSCALE_TIMEOUT),
+        tako_core::probe::Outcome::Done { status, .. } if status.success()
+    )
+}
+
+/// tailscale コマンドの失敗。**打ち切り（上限超え）を他の失敗と分けて持つ**（#1507）。
+///
+/// 文字列 1 本で返すと、[`setup_status`] が「デーモンが応答しない」と「デーモンが
+/// 起動していない」を見分けられず、`tako setup` の末尾が打ち切りを黙って
+/// 「起動していません」と言ってしまう（#1503 の「打ち切ったら必ず知らせる」に反する）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunError {
+    /// 上限を超えたので打ち切った（子は kill 済み）
+    TimedOut(tako_core::probe::TimeoutNotice),
+    /// 起動できない / 待ちに失敗した / 応答を解釈できない
+    Failed(String),
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // `remote start` の失敗理由として人へ出る（#1507 前と同じ「〜がタイムアウト（N秒）」の形）
+            Self::TimedOut(notice) => write!(
+                f,
+                "{} がタイムアウト（{}秒）",
+                notice.label, notice.waited_secs
+            ),
+            Self::Failed(reason) => f.write_str(reason),
+        }
+    }
 }
 
 /// setup の不足項目。`tako remote start` はこれが 1 つでもあれば起動を拒否し、
@@ -108,6 +137,10 @@ pub struct SetupStatus {
     /// 応答した tailscaled のバージョン（`tailscale status --json` の `Version`）。
     /// CLI 側のバージョンと食い違うときは 2 系統の Tailscale が同居している（#1038）
     pub daemon_version: Option<String>,
+    /// `tailscale status --json` を上限で打ち切ったとき、何を何秒待ったか（#1507）。
+    /// このとき `missing` には `DaemonNotRunning` が入る（先へ進めない点は同じ）ので、
+    /// 「応答しない」と言い分けたい呼び手だけがこれを見る
+    pub timed_out: Option<tako_core::probe::TimeoutNotice>,
     /// 不足項目の列挙（空 = remote start 可能）
     pub missing: Vec<MissingItem>,
 }
@@ -148,9 +181,13 @@ pub fn setup_status_on(cli_path: Option<String>, socket: Option<&str>) -> SetupS
     };
     status.cli_path = Some(cli.clone());
 
-    let output = match run_tailscale_on(&cli, socket, &["status", "--json"]) {
+    let output = match run_tailscale_checked(&cli, socket, &["status", "--json"]) {
         Ok(o) => o,
-        Err(_) => {
+        Err(e) => {
+            // 打ち切りも「先へ進めない」点は未起動と同じ。ただし何を何秒待ったかを残す（#1507）
+            if let RunError::TimedOut(notice) = e {
+                status.timed_out = Some(notice);
+            }
             status.missing.push(MissingItem::DaemonNotRunning);
             return status;
         }
@@ -234,15 +271,27 @@ pub fn serve_state(cli: &str) -> Result<ServeState, String> {
 /// 既定探索は tailscaled 側の都合（GUI 版の LocalAPI 発見ファイルの作り直し）で
 /// 応答するノードが変わるので、**serve を張ったノードへ問い合わせ続ける**ために要る
 pub fn serve_state_on(cli: &str, socket: Option<&str>) -> Result<ServeState, String> {
-    let output = run_tailscale_on(cli, socket, &["serve", "status", "--json"])?;
+    serve_state_on_checked(cli, socket).map_err(|e| e.to_string())
+}
+
+/// 打ち切りを他の失敗と分けて返す [`serve_state`]（#1507。`remote_setup::check_status` 用）
+pub fn serve_state_checked(cli: &str) -> Result<ServeState, RunError> {
+    serve_state_on_checked(cli, selected_variant().socket_arg())
+}
+
+fn serve_state_on_checked(cli: &str, socket: Option<&str>) -> Result<ServeState, RunError> {
+    let output = run_tailscale_checked(cli, socket, &["serve", "status", "--json"])?;
     if !output.status.success() {
-        return Err(format!(
+        return Err(RunError::Failed(format!(
             "tailscale serve status が失敗: {}",
             String::from_utf8_lossy(&output.stderr).trim()
-        ));
+        )));
     }
-    let json: Value = serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("tailscale serve status の JSON を解釈できない: {e}"))?;
+    let json: Value = serde_json::from_slice(&output.stdout).map_err(|e| {
+        RunError::Failed(format!(
+            "tailscale serve status の JSON を解釈できない: {e}"
+        ))
+    })?;
     Ok(parse_serve_state(&json))
 }
 
@@ -956,6 +1005,25 @@ pub(crate) fn run_tailscale_on(
     socket: Option<&str>,
     args: &[&str],
 ) -> Result<std::process::Output, String> {
+    run_tailscale_checked(cli, socket, args).map_err(|e| e.to_string())
+}
+
+/// 打ち切りを [`RunError::TimedOut`] として分けて返す [`run_tailscale_on`]（#1507）
+fn run_tailscale_checked(
+    cli: &str,
+    socket: Option<&str>,
+    args: &[&str],
+) -> Result<std::process::Output, RunError> {
+    run_tailscale_within(cli, socket, args, TAILSCALE_TIMEOUT)
+}
+
+/// 上限を引数で受ける本体（単体テストが 10 秒待たずに打ち切りを作るため）
+fn run_tailscale_within(
+    cli: &str,
+    socket: Option<&str>,
+    args: &[&str],
+    budget: std::time::Duration,
+) -> Result<std::process::Output, RunError> {
     use std::io::Read;
 
     let mut argv: Vec<&str> = Vec::with_capacity(args.len() + 2);
@@ -972,7 +1040,7 @@ pub(crate) fn run_tailscale_on(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("tailscale の起動に失敗 ({cli}): {e}"))?;
+        .map_err(|e| RunError::Failed(format!("tailscale の起動に失敗 ({cli}): {e}")))?;
 
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
@@ -985,7 +1053,7 @@ pub(crate) fn run_tailscale_on(
             }
             buf
         })
-        .map_err(|e| format!("stdout drain スレッドの起動に失敗: {e}"))?;
+        .map_err(|e| RunError::Failed(format!("stdout drain スレッドの起動に失敗: {e}")))?;
     let stderr_handle = std::thread::Builder::new()
         .name("tailscale-stderr-drain".into())
         .spawn(move || {
@@ -995,27 +1063,27 @@ pub(crate) fn run_tailscale_on(
             }
             buf
         })
-        .map_err(|e| format!("stderr drain スレッドの起動に失敗: {e}"))?;
+        .map_err(|e| RunError::Failed(format!("stderr drain スレッドの起動に失敗: {e}")))?;
 
     let start = std::time::Instant::now();
     let status = loop {
         match child.try_wait() {
             Ok(Some(s)) => break s,
             Ok(None) => {
-                if start.elapsed() > TAILSCALE_TIMEOUT {
+                if start.elapsed() > budget {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(format!(
-                        "tailscale {} がタイムアウト（{}秒）",
-                        args.first().unwrap_or(&""),
-                        TAILSCALE_TIMEOUT.as_secs()
-                    ));
+                    // 名札は `probe::label` の 1 実装（引数だけ = `--socket` のパスを載せない。#927）
+                    return Err(RunError::TimedOut(tako_core::probe::TimeoutNotice {
+                        label: tako_core::probe::label(cli, args),
+                        waited_secs: budget.as_secs(),
+                    }));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
             Err(e) => {
                 let _ = child.kill();
-                return Err(format!("tailscale の待機に失敗: {e}"));
+                return Err(RunError::Failed(format!("tailscale の待機に失敗: {e}")));
             }
         }
     };
@@ -1042,6 +1110,55 @@ mod tests {
         };
         apply_status_json(&mut status, json);
         status
+    }
+
+    /// 打ち切りは文字列に埋めず型で返す（#1507）。`remote start` 側へ出る文面は同じ形のまま
+    #[test]
+    fn 打ち切りの文面は従来の形() {
+        let timed_out = RunError::TimedOut(tako_core::probe::TimeoutNotice {
+            label: "tailscale status --json".into(),
+            waited_secs: 10,
+        });
+        assert_eq!(
+            timed_out.to_string(),
+            "tailscale status --json がタイムアウト（10秒）"
+        );
+        assert_eq!(RunError::Failed("x".into()).to_string(), "x");
+    }
+
+    /// 返らない tailscale を上限で打ち切り、**何を何秒待ったか**を型で返す（#1507）。
+    /// 名札は引数だけ（`--socket` のパスを載せない = #927）
+    #[cfg(unix)]
+    #[test]
+    fn 返らないtailscaleは上限で打ち切って型で返す() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tako-1507-ts-{}", std::process::id()));
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "一時 dir の外を触らない"
+        );
+        std::fs::create_dir_all(&dir).expect("一時 dir");
+        let stub = dir.join("tailscale");
+        std::fs::write(&stub, "#!/bin/sh\nexec /bin/sleep 30\n").expect("スタブ");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        // 上限が効かなければ 30 秒後に `Ok`（sleep の正常終了）が返るので、`TimedOut` が
+        // 返ること自体が「待ち切らずに kill した」証拠（所要は assert しない = conventions.md）
+        let result = run_tailscale_within(
+            stub.to_str().expect("UTF-8"),
+            Some("/tmp/does-not-matter.sock"),
+            &["status", "--json"],
+            std::time::Duration::from_secs(1),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            result.map(|_| ()),
+            Err(RunError::TimedOut(tako_core::probe::TimeoutNotice {
+                label: "tailscale status --json".into(),
+                waited_secs: 1,
+            }))
+        );
     }
 
     #[test]
