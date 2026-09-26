@@ -1038,6 +1038,36 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_preview_move",
+            "description": "コードプレビュー編集のカーソルを単語・行・ページ単位で動かす（GUI の修飾キー付き矢印・Home・Page Down と同じ）。\
+                本文は変えない。select=true で選択を伸ばす。位置で置くなら tako_preview_cursor。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象プレビューペイン ID（省略時は呼び出し元）"),
+                    "movement": { "type": "string", "enum": tako_core::text_edit::CursorMovement::names() },
+                    "select": { "type": "boolean" },
+                    "expected_version": { "type": "integer", "minimum": 0 },
+                },
+                "required": ["movement"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_preview_delete",
+            "description": "コードプレビュー編集で単語・行単位に消す（GUI の修飾キー付き Backspace / Delete と同じ）。選択があれば選択を消す。行の境目では改行だけを消す。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象プレビューペイン ID（省略時は呼び出し元）"),
+                    "motion": { "type": "string", "enum": tako_core::text_edit::DeleteMotion::names() },
+                    "expected_version": { "type": "integer", "minimum": 0 },
+                },
+                "required": ["motion"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_preview_save",
             "description": "コードプレビューの未保存編集をファイルへ書き戻す。読み込み後に外部変更があれば競合として拒否し、上書きしない。",
             "inputSchema": {

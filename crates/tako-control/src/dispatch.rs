@@ -2589,6 +2589,53 @@ fn dispatch_inner(
                 .map_err(DispatchError::Operation)?;
             Ok(preview_edit_reply(host, target))
         }
+        Request::PreviewMove {
+            pane,
+            movement,
+            select,
+            expected_version,
+        } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            // 綴りを解くのは tako-core の名前表 1 か所（CLI と MCP で解釈が割れない）
+            let movement =
+                tako_core::text_edit::CursorMovement::from_name(&movement).ok_or_else(|| {
+                    DispatchError::Operation(format!(
+                        "movement は {} のどれか（{movement:?} は無い）",
+                        tako_core::text_edit::CursorMovement::names().join(" / ")
+                    ))
+                })?;
+            host.run_preview_command(
+                target,
+                tako_core::platform::editor_keys::EditorCommand::Move {
+                    movement,
+                    extend: select,
+                },
+                expected_version,
+            )
+            .map_err(DispatchError::Operation)?;
+            Ok(preview_edit_reply(host, target))
+        }
+        Request::PreviewDelete {
+            pane,
+            motion,
+            expected_version,
+        } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            let motion =
+                tako_core::text_edit::DeleteMotion::from_name(&motion).ok_or_else(|| {
+                    DispatchError::Operation(format!(
+                        "motion は {} のどれか（{motion:?} は無い）",
+                        tako_core::text_edit::DeleteMotion::names().join(" / ")
+                    ))
+                })?;
+            host.run_preview_command(
+                target,
+                tako_core::platform::editor_keys::EditorCommand::Delete(motion),
+                expected_version,
+            )
+            .map_err(DispatchError::Operation)?;
+            Ok(preview_edit_reply(host, target))
+        }
         Request::PreviewSave { pane } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
             host.save_preview(target)
@@ -15695,6 +15742,20 @@ mod tests {
                 .set_cursor_placement(place)
                 .map_err(|e| e.to_string())
         }
+        fn run_preview_command(
+            &mut self,
+            pane: PaneId,
+            command: tako_core::platform::editor_keys::EditorCommand,
+            expected_version: Option<u64>,
+        ) -> Result<(), String> {
+            self.set_preview_editing(pane, true)?;
+            let state = self.preview_edits.get_mut(&pane.as_u64()).unwrap();
+            if let Some(expected) = expected_version.filter(|v| *v != state.2.version()) {
+                return Err(format!("版が違う（指定 {expected}）"));
+            }
+            command.apply(&mut state.2);
+            Ok(())
+        }
         fn preview_document(&self, pane: PaneId) -> Option<serde_json::Value> {
             Some(self.preview_edits.get(&pane.as_u64())?.2.document_state())
         }
@@ -19052,6 +19113,87 @@ mod tests {
         )
         .unwrap();
         assert_eq!(redone["document"]["version"].as_u64(), Some(before + 3));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #1652: 単語・行単位の移動と削除が dispatch から GUI の打鍵と同じ意味で効く
+    #[test]
+    fn preview移動と削除は単語と行の単位で効く() {
+        let dir = std::env::temp_dir().join(format!("tako-dispatch-move-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut host = MockHost::new();
+        let pane = preview_with_text(&mut host, &dir, "    let value = 1;\nnext\n");
+        let mv = |host: &mut MockHost, movement: &str, select: bool| {
+            dispatch(
+                host,
+                Request::PreviewMove {
+                    pane: Some(pane),
+                    movement: movement.into(),
+                    select,
+                    expected_version: None,
+                },
+                PaneOrigin::Mcp,
+            )
+        };
+        // 文書頭（桁 0）→ smart Home でインデントの直後
+        let start = mv(&mut host, "doc-start", false).unwrap();
+        assert_eq!(start["document"]["cursor"]["line"].as_u64(), Some(1));
+        assert_eq!(start["document"]["cursor"]["column"].as_u64(), Some(0));
+        let home = mv(&mut host, "smart-home", false).unwrap();
+        assert_eq!(home["document"]["cursor"]["column"].as_u64(), Some(4));
+        let version = home["document"]["version"].as_u64().unwrap();
+        // 語の右 × 2（let → value）
+        mv(&mut host, "word-right", false).unwrap();
+        let moved = mv(&mut host, "word-right", true).unwrap();
+        assert_eq!(moved["document"]["cursor"]["column"].as_u64(), Some(13));
+        assert_eq!(
+            moved["document"]["selection"]["start"]["column"].as_u64(),
+            Some(7),
+            "select で選択が伸びる"
+        );
+        // 移動は本文を変えないので版は据え置き
+        assert_eq!(moved["document"]["version"].as_u64(), Some(version));
+
+        // 語の削除（選択中なら選択を消す）
+        let deleted = dispatch(
+            &mut host,
+            Request::PreviewDelete {
+                pane: Some(pane),
+                motion: "word-backward".into(),
+                expected_version: Some(version),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(deleted["dirty"].as_bool(), Some(true));
+        assert_eq!(deleted["document"]["version"].as_u64(), Some(version + 1));
+        assert_eq!(deleted["document"]["cursor"]["column"].as_u64(), Some(7));
+        // 版違いは何もせず失敗する（本文は変わらない）
+        let stale = dispatch(
+            &mut host,
+            Request::PreviewDelete {
+                pane: Some(pane),
+                motion: "word-backward".into(),
+                expected_version: Some(version),
+            },
+            PaneOrigin::Cli,
+        );
+        assert!(stale.is_err(), "{stale:?}");
+        // 知らない綴りは候補つきで失敗する
+        let err = mv(&mut host, "word_left", false).unwrap_err();
+        assert!(format!("{err:?}").contains("word-left"), "{err:?}");
+        let err = dispatch(
+            &mut host,
+            Request::PreviewDelete {
+                pane: Some(pane),
+                motion: "word".into(),
+                expected_version: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("word-backward"), "{err:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

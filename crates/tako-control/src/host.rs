@@ -775,6 +775,19 @@ pub trait PreviewHost {
     ) -> Result<(), String> {
         Err("プレビュー編集は未対応".into())
     }
+    /// 打鍵 1 つぶんの編集コマンド（#1652。単語・行・ページ単位の移動と削除）。
+    ///
+    /// GUI の打鍵が通るのと**同じ口**で、CLI `tako edit move` / `delete` と
+    /// MCP `tako_preview_move` / `tako_preview_delete` がここを呼ぶ。
+    /// `expected_version` が違えば何もせず失敗する
+    fn run_preview_command(
+        &mut self,
+        _pane: PaneId,
+        _command: tako_core::platform::editor_keys::EditorCommand,
+        _expected_version: Option<u64>,
+    ) -> Result<(), String> {
+        Err("プレビュー編集は未対応".into())
+    }
     /// 編集バッファの文書状態（#1658）。版・行数・カーソル・選択・undo 履歴。
     ///
     /// 編集系の応答はすべてこれを `document` として載せる
