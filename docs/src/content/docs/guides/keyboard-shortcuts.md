@@ -111,9 +111,15 @@ Windows では Command キーにあたる修飾が Win キーになり、多く�
 | 次の語を消す | <kbd>Alt</kbd>+<kbd>Delete</kbd> | <kbd>Ctrl</kbd>+<kbd>Delete</kbd> |
 | 行頭まで消す | <kbd>Cmd</kbd>+<kbd>Backspace</kbd> | （macOS のみ） |
 | 行末まで消す | <kbd>Cmd</kbd>+<kbd>Delete</kbd> | （macOS のみ） |
+| 選択した行を 1 段深く（選択が無ければカーソル位置へ 1 段ぶん） | <kbd>Tab</kbd> | <kbd>Tab</kbd> |
+| 選択した行（無ければカーソルの行）を 1 段浅く | <kbd>Shift</kbd>+<kbd>Tab</kbd> | <kbd>Shift</kbd>+<kbd>Tab</kbd> |
 
 :::note[語の区切りと行の境目]
 英数字と `_` の並び（`snake_case` は 1 語）、記号の並び、漢字・ひらがな・カタカナのそれぞれの並びが 1 語です。日本語は文字の種類が切り替わるところで止まります（`日本語のテキスト` は「日本語」「の」「テキスト」）。行の先頭で前の語へ、行の末尾で次の語へ動くと隣の行へ移ります。語や行単位で消すときは行の境目で止まり、行の先頭では改行だけを消して前の行とつなげます。上下に動くときは元の桁を覚えているので、短い行を通り過ぎても次の長い行では元の桁に戻ります。Windows の <kbd>Alt</kbd>+矢印はペインのフォーカス移動に使っているため、語の移動は <kbd>Ctrl</kbd>+矢印です。MacBook のキーボードの <kbd>Delete</kbd> は <kbd>fn</kbd>+<kbd>delete</kbd> です。
+:::
+
+:::note[インデント]
+1 段の幅（タブか、スペース何個か）は開いているファイルの既存の行から判断します。インデントされた行が 1 行も無いファイルでは、Makefile と Go はタブ、それ以外はスペース 4 個です。<kbd>Enter</kbd> は前の行のインデントを引き継ぎ、行が <kbd>{</kbd>・<kbd>[</kbd>・<kbd>(</kbd> で終わっていれば 1 段深くします（Python と YAML は <kbd>:</kbd> でも深くします。Markdown とテキストは引き継ぐだけです）。括弧の閉じ側は自動では入りません。
 :::
 
 ## 表示

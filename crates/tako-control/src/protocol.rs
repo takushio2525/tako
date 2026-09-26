@@ -788,6 +788,16 @@ pub enum Request {
         motion: String,
         expected_version: Option<u64>,
     },
+    /// 本文を変える打鍵 1 つぶんの編集（#1654）。GUI の Tab / ⇧Tab / Enter と同じ口を通る。
+    ///
+    /// `command` は `EditorCommand::edit_names` の綴り（`indent` = 選択行を深く /
+    /// 選択が無ければカーソル位置へ 1 段、`outdent` = 浅く、`newline` = インデントを
+    /// 引き継ぐ改行）。インデントの単位は既存行から推定する
+    PreviewEditCommand {
+        pane: Option<u64>,
+        command: String,
+        expected_version: Option<u64>,
+    },
     /// 編集バッファをファイルへ保存する。外部変更を検知した場合は上書きしない。
     PreviewSave { pane: Option<u64> },
     /// undo（#195）
@@ -2365,6 +2375,7 @@ pub fn changes_layout(request: &Request) -> bool {
         | Request::PreviewCursor { .. }
         | Request::PreviewMove { .. }
         | Request::PreviewDelete { .. }
+        | Request::PreviewEditCommand { .. }
         | Request::PreviewSave { .. }
         | Request::PreviewUndo { .. }
         | Request::PreviewRedo { .. }

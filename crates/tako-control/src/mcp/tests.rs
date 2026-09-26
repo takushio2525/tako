@@ -203,6 +203,38 @@ mod tests {
             .contains("path"));
     }
 
+    /// #1654: `tako_preview_edit` の `command` は編集コマンドへ写る（ツールを増やさない）。
+    /// `enabled` と同時に渡したら拒否する（どちらをしたいのか決まらない）
+    #[test]
+    fn preview_editのcommandは編集コマンドへ写す() {
+        let (_, requests) = run(
+            call(
+                "tako_preview_edit",
+                json!({ "command": "indent", "expected_version": 3 }),
+            ),
+            Some(7),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::PreviewEditCommand {
+                pane: Some(7),
+                command: "indent".into(),
+                expected_version: Some(3),
+            }]
+        );
+        let (response, requests) = run(
+            call(
+                "tako_preview_edit",
+                json!({ "command": "newline", "enabled": true }),
+            ),
+            Some(7),
+            true,
+        );
+        assert!(requests.is_empty(), "{requests:?}");
+        assert!(format!("{response:?}").contains("同時に"), "{response:?}");
+    }
+
     #[test]
     fn preview編集3操作をrequestへ写す() {
         let (_, requests) = run(

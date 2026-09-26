@@ -934,12 +934,15 @@ pub fn tools() -> Vec<Value> {
             "description": "コードプレビューの編集モードを開始・終了する。enabled 省略時は状態取得。\
                 PDF・画像・動画・末尾省略された巨大ファイルは編集できない。状態は editing / dirty で返す。\
                 document は文書の版（version）とカーソル・選択・undo 履歴で、編集系ツールの応答すべてに載る。\
-                viewport はカーソル行が画面に入っているか（visible=false なら画面外）。",
+                viewport はカーソル行が画面に入っているか（visible=false なら画面外）。\
+                command は Tab / Shift+Tab / Enter と同じ編集（インデントは既存行から推定）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "pane": pane_schema("対象プレビューペイン ID（省略時は呼び出し元）"),
                     "enabled": { "type": "boolean", "description": "true = 編集開始、false = 編集終了（省略時は状態取得）" },
+                    "command": { "type": "string", "enum": tako_core::platform::editor_keys::EditorCommand::edit_names() },
+                    "expected_version": { "type": "integer", "minimum": 0 },
                 },
                 "additionalProperties": false,
             },

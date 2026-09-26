@@ -29,7 +29,8 @@
 //!   ⌃←→ は Mission Control が持っていき、Windows の Win キーは OS のシェルが持って
 //!   いくので、どちらも列に書かない
 //! - **shift は「選択を伸ばす」**。移動の行だけが shift を読み、削除・改行・
-//!   編集終了は shift の有無を問わない（従来どおり ⇧⌫ は ⌫ と同じ）
+//!   編集終了は shift の有無を問わない（従来どおり ⇧⌫ は ⌫ と同じ）。
+//!   **例外は Tab だけ**で、shift は「浅くする」（⇧Tab = アンインデント。#1654）
 //! - GPUI の `function` 修飾（macOS は矢印キーにも立つ）は**見ない**
 
 use super::support::Platform;
@@ -45,13 +46,41 @@ pub enum EditorCommand {
     },
     /// 消す（選択があれば選択を消す）
     Delete(DeleteMotion),
-    /// 改行を入れる
+    /// 改行を入れる（前の行のインデントを引き継ぐ。#1654）
     Newline,
+    /// 選択行を 1 段深く / 選択が無ければカーソル位置へ 1 段ぶん挿す（Tab。#1654）
+    Indent,
+    /// 選択行（無ければカーソルの行）を 1 段浅く（⇧Tab。#1654）
+    Outdent,
     /// 編集モードを抜ける
     ExitEditing,
 }
 
+/// CLI / MCP から名前で指す編集コマンド（#1654）。
+///
+/// 移動と削除は [`CursorMovement::name`] / [`DeleteMotion::name`] の名前表を使い、
+/// それ以外で本文を変える打鍵（Tab / ⇧Tab / Enter）の綴りはここ 1 か所
+/// （`tako edit indent` / MCP `tako_preview_edit` の `command` がすべてここを引く）
+const EDIT_COMMAND_NAMES: [(&str, EditorCommand); 3] = [
+    ("indent", EditorCommand::Indent),
+    ("outdent", EditorCommand::Outdent),
+    ("newline", EditorCommand::Newline),
+];
+
 impl EditorCommand {
+    /// CLI / MCP の綴りから引く（`indent` / `outdent` / `newline`）
+    pub fn from_edit_name(name: &str) -> Option<Self> {
+        EDIT_COMMAND_NAMES
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, c)| *c)
+    }
+
+    /// 綴りの一覧（MCP の inputSchema の enum とエラー文の候補）
+    pub fn edit_names() -> Vec<&'static str> {
+        EDIT_COMMAND_NAMES.iter().map(|(n, _)| *n).collect()
+    }
+
     /// バッファへ当てる（#1652）。**GUI の打鍵と CLI / MCP が同じここを通る**。
     ///
     /// 編集モードを抜ける（[`Self::ExitEditing`]）はバッファの操作ではないので
@@ -60,7 +89,9 @@ impl EditorCommand {
         match self {
             Self::Move { movement, extend } => buffer.move_cursor(movement, extend),
             Self::Delete(motion) => buffer.delete(motion),
-            Self::Newline => buffer.newline(),
+            Self::Newline => buffer.newline_and_indent(),
+            Self::Indent => buffer.indent(),
+            Self::Outdent => buffer.outdent(),
             Self::ExitEditing => return false,
         }
         true
@@ -73,6 +104,8 @@ pub enum Action {
     Move(CursorMovement),
     Delete(DeleteMotion),
     Newline,
+    /// Tab。shift で向きが変わる（⇧Tab = 浅く。#1654）
+    Indent,
     ExitEditing,
 }
 
@@ -85,6 +118,8 @@ impl Action {
             },
             Self::Delete(motion) => EditorCommand::Delete(motion),
             Self::Newline => EditorCommand::Newline,
+            Self::Indent if shift => EditorCommand::Outdent,
+            Self::Indent => EditorCommand::Indent,
             Self::ExitEditing => EditorCommand::ExitEditing,
         }
     }
@@ -190,7 +225,7 @@ const fn row(action: Action, macos: &'static [Chord], windows: &'static [Chord])
     }
 }
 
-use Action::{Delete, ExitEditing, Move, Newline};
+use Action::{Delete, ExitEditing, Indent, Move, Newline};
 use Chord as K;
 
 /// 打鍵表（**正本**）。GUI の入口はここだけを引く
@@ -288,8 +323,10 @@ pub const TABLE: &[Entry] = &[
         &[],
     ),
     row(Delete(DeleteMotion::ToLineEnd), &[K::cmd("delete")], &[]),
-    // --- 改行・編集終了 ---
+    // --- 改行・インデント・編集終了 ---
     row(Newline, &[K::plain("enter")], &[K::plain("enter")]),
+    // Tab = 深く / ⇧Tab = 浅く（#1654）。Windows の Ctrl+Tab はタブ切替に張ってあるので素の Tab だけ
+    row(Indent, &[K::plain("tab")], &[K::plain("tab")]),
     row(ExitEditing, &[K::plain("escape")], &[K::plain("escape")]),
 ];
 
@@ -379,6 +416,10 @@ mod tests {
             (Platform::MacOs, "left", mv(M::Left, false)),
             (Platform::MacOs, "shift-up", mv(M::Up, true)),
             (Platform::MacOs, "enter", Some(EditorCommand::Newline)),
+            (Platform::MacOs, "tab", Some(EditorCommand::Indent)),
+            (Platform::MacOs, "shift-tab", Some(EditorCommand::Outdent)),
+            (Platform::Windows, "tab", Some(EditorCommand::Indent)),
+            (Platform::Windows, "shift-tab", Some(EditorCommand::Outdent)),
             (Platform::MacOs, "escape", Some(EditorCommand::ExitEditing)),
             // Windows
             (Platform::Windows, "ctrl-left", mv(M::WordLeft, false)),
@@ -436,6 +477,9 @@ mod tests {
             (Platform::MacOs, "a"),
             (Platform::MacOs, "alt-a"),
             (Platform::Windows, "ctrl-a"),
+            // Ctrl+Tab はタブ切替（キーバインド側が持つ。#1654 で Tab を足しても受理しない）
+            (Platform::Windows, "ctrl-tab"),
+            (Platform::MacOs, "alt-tab"),
         ];
         for (platform, spec) in rejected {
             assert_eq!(
@@ -521,5 +565,23 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #1654: CLI / MCP の編集コマンド名は一意に往復する
+    #[test]
+    fn 編集コマンドの名前は往復する() {
+        for name in EditorCommand::edit_names() {
+            let command = EditorCommand::from_edit_name(name).expect("表にある名前");
+            assert_ne!(command, EditorCommand::ExitEditing);
+        }
+        assert_eq!(
+            EditorCommand::from_edit_name("indent"),
+            Some(EditorCommand::Indent)
+        );
+        assert_eq!(EditorCommand::from_edit_name("tab"), None);
+        let mut names = EditorCommand::edit_names();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), EDIT_COMMAND_NAMES.len());
     }
 }

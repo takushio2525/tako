@@ -1710,6 +1710,32 @@ enum EditCommand {
         #[arg(long)]
         pane: Option<u64>,
     },
+    /// 選択行を 1 段深くする（Tab と同じ。選択が無ければカーソル位置へ 1 段ぶん挿す）
+    ///
+    /// インデントの単位（タブ / スペース幅）は既存行から推定する
+    Indent {
+        /// 文書の版。指定すると版が違うときは何もせず失敗する
+        #[arg(long)]
+        expect_version: Option<u64>,
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// 選択行（無ければカーソルの行）を 1 段浅くする（Shift+Tab と同じ）
+    Outdent {
+        /// 文書の版。指定すると版が違うときは何もせず失敗する
+        #[arg(long)]
+        expect_version: Option<u64>,
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// インデントを引き継いで改行する（Enter と同じ。開き括弧の直後は 1 段深く）
+    Newline {
+        /// 文書の版。指定すると版が違うときは何もせず失敗する
+        #[arg(long)]
+        expect_version: Option<u64>,
+        #[arg(long)]
+        pane: Option<u64>,
+    },
     /// 編集バッファをファイルへ保存する
     Save {
         #[arg(long)]
@@ -7124,6 +7150,30 @@ fn build_request(command: &Command) -> Result<Request, String> {
                     expected_version: *expect_version,
                 }
             }
+            EditCommand::Indent {
+                expect_version,
+                pane,
+            } => Request::PreviewEditCommand {
+                pane: target_pane(*pane)?,
+                command: "indent".into(),
+                expected_version: *expect_version,
+            },
+            EditCommand::Outdent {
+                expect_version,
+                pane,
+            } => Request::PreviewEditCommand {
+                pane: target_pane(*pane)?,
+                command: "outdent".into(),
+                expected_version: *expect_version,
+            },
+            EditCommand::Newline {
+                expect_version,
+                pane,
+            } => Request::PreviewEditCommand {
+                pane: target_pane(*pane)?,
+                command: "newline".into(),
+                expected_version: *expect_version,
+            },
             EditCommand::Save { pane } => Request::PreviewSave {
                 pane: target_pane(*pane)?,
             },
@@ -10025,6 +10075,26 @@ mod tests {
                 expected_version: Some(7),
             }
         );
+        // #1654: Tab / Shift+Tab / Enter と同じ編集
+        for (sub, name) in [
+            ("indent", "indent"),
+            ("outdent", "outdent"),
+            ("newline", "newline"),
+        ] {
+            let command = parse(&["tako", "edit", sub, "--pane", "5"]);
+            assert_eq!(
+                build_request(&command).unwrap(),
+                Request::PreviewEditCommand {
+                    pane: Some(5),
+                    command: name.into(),
+                    expected_version: None,
+                }
+            );
+            // 綴りは tako-core の名前表にある
+            assert!(
+                tako_core::platform::editor_keys::EditorCommand::from_edit_name(name).is_some()
+            );
+        }
         // 知らない単位は実行前に弾く
         let command = parse(&["tako", "edit", "move", "word_left", "--pane", "5"]);
         assert!(build_request(&command).is_err());
@@ -10627,6 +10697,10 @@ mod platform_matrix_parity {
         ("edit cursor", "tako_preview_cursor"),
         ("edit move", "tako_preview_move"),
         ("edit delete", "tako_preview_delete"),
+        // #1654: MCP は `tako_preview_edit` の `command` 引数（ツールを増やさない）
+        ("edit indent", "tako_preview_edit"),
+        ("edit outdent", "tako_preview_edit"),
+        ("edit newline", "tako_preview_edit"),
         ("edit replace-range", "tako_preview_edit_range"),
         ("edit redo", "tako_preview_redo"),
         ("edit replace", "tako_preview_replace"),

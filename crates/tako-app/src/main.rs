@@ -42476,7 +42476,81 @@ mod self_test {
             &format!("visual-test editor-keys: {doc_end} で文書末へ飛ぶ (#1652。{seen:?})"),
         );
 
-        // (9) IME の変換中は本文にもカーソルにも触らない。確定は変換を始めた位置へ入る
+        // (9) #1654: `{` の直後の Enter は 1 段深い行を作る（Issue の実測 E8 では桁 0 だった）
+        place(cx, 0, "fn main() {".len());
+        press(any, cx, "enter");
+        let seen = observe(cx, 1);
+        report("enter-indent", "enter", &seen);
+        check(
+            seen.0 == "    " && seen.1 == (1, 4),
+            &format!(
+                "visual-test editor-keys: 開き括弧の直後の Enter が 1 段深い (#1654。{seen:?})"
+            ),
+        );
+        undo(cx);
+
+        // (10) #1654: 選択した 2 行を Tab で 1 段深く → Shift+Tab で戻す（次の行は触らない）
+        let select = |cx: &mut AsyncApp, from: (usize, usize), to: (usize, usize)| {
+            window
+                .update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        Req::PreviewCursor {
+                            pane: Some(pane.as_u64()),
+                            line: from.0 + 1,
+                            col: from.1,
+                            select_to_line: Some(to.0 + 1),
+                            select_to_col: Some(to.1),
+                            expected_version: None,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    cx.notify();
+                })
+                .ok();
+        };
+        select(cx, (1, 0), (3, 0));
+        press(any, cx, "tab");
+        let first = observe(cx, 1);
+        let second = observe(cx, 2);
+        let untouched = observe(cx, 3);
+        report("tab-lines", "tab", &first);
+        check(
+            first.0 == "        let value = 1;"
+                && second.0.starts_with("        println!")
+                && untouched.0 == "}",
+            &format!(
+                "visual-test editor-keys: Tab で選択した行が 1 段深くなる (#1654。{first:?} {second:?} {untouched:?})"
+            ),
+        );
+        press(any, cx, "shift-tab");
+        let back = observe(cx, 1);
+        report("shift-tab-lines", "shift-tab", &back);
+        check(
+            back.0 == "    let value = 1;" && back.2.is_some(),
+            &format!(
+                "visual-test editor-keys: Shift+Tab で 1 段浅くなり選択は残る (#1654。{back:?})"
+            ),
+        );
+
+        // (11) #1654: 選択が無い Tab はカーソル位置へ 1 段ぶん（4 桁）挿す
+        place(cx, 1, 4);
+        press(any, cx, "tab");
+        let seen = observe(cx, 1);
+        report("tab-insert", "tab", &seen);
+        check(
+            seen.0 == "        let value = 1;" && seen.1 == (1, 8),
+            &format!("visual-test editor-keys: 選択の無い Tab がカーソル位置へ 4 桁挿す (#1654。{seen:?})"),
+        );
+        // Tab / Shift+Tab は差し引きゼロなので、選択の無い Tab を 1 回戻せば元の行
+        undo(cx);
+        let restored = observe(cx, 1);
+        check(
+            restored.0 == "    let value = 1;",
+            &format!("visual-test editor-keys: undo 1 回で Tab の挿入が戻る ({restored:?})"),
+        );
+
+        // (12) IME の変換中は本文にもカーソルにも触らない。確定は変換を始めた位置へ入る
         place(cx, 1, 13);
         let before = observe(cx, 1);
         window

@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-24（#1628 / #1707: 子の終了時に PTY を読み切るようにし、待ちを観測事象で段に切った）
-- 待ちの段分け（`ARGC=` を起点に `PROBE-DONE` を待つ / 上限は `state_wait_budget` 由来 / 失敗メッセージに経過・段・子の生死・混み具合）を入れたら、**Issue の前提が誤りだと分かった**: 起動は 0.2 秒で終わっていて、遅いのではなく**子の終了後に末尾が読めていない**（画面は `ARGC=1` だけ）
-- 真因は製品側。自前の `PtyLoop` は子の終了で `break 'event_loop` するが、upstream alacritty がそこに持つ `drain_on_exit` の段が **#817 の移植で落ちていた**（`..Options::default()` の既定 `false` を「未使用」と読んだ）。以後 PTY を読む者はいないので末尾は永久に失われる。**知らせる前に読み切る**段を入れた（読み手は両 OS とも非ブロッキング。1 回の `pty_read` は 64 KiB で切り上げるので繰り返しが要る）。契約「終了を知った時点で出力は全部画面にある」は `architecture.md` の `pty_loop` 節へ明記（真因は #1707 として独立起票）
-- 網は 1 度作り直した: 大量出力は**背圧**で子が tako を追い越せず再現しない。真の機構は mio の 1 束での順序競合なので、実測の形（短い出力 → 即終了）を 30 回繰り返す形へ。**修正後は毎回緑**だが逆向き（外すと落ちる）は順序次第で保証できないため、旧経路 A/B は `#[ignore]` で CI から外し Windows 実機の手順として残した。CI の Windows は `pty_exit_drain` 1 passed / 1 ignored・`spawn_arg_quoting` 0.33 秒（main と同値）
-
 ## 2026-09-24（#1649: 編集カーソルを可視範囲へ追わせ、IME の下線も消えないようにした）
 - `ListState` への `scroll_to(cursor)` が **0 件**で、打鍵 / 矢印 / ⌘F のヒット / undo / 貼り付けのどれでもカーソルが画面外のままだった。判断は `tako_core::editor_scroll`（`LineViewport` + `follow_cursor`・上下 3 行の余白・視野が狭いと詰める・端では可視化を優先）へ寄せ、UI は器の寸法を測って渡すだけにした。呼ぶのは `refresh_preview_from_editor`（編集の全経路の要）+ 検索ヒット + IME の変換開始の 3 か所、器は仮想リストと div スクロールの両方を**論理位置**で動かす
 - 連鎖症状の IME 下線は `preview_pending_cursor_origin` が「可視化後にカーソル行が来る位置」を出して**本文の中にアンカーを残す**（行のレイアウトは paint でしか控えられないので、追従の直後 1 フレームは必ず無い）。効きは編集系の応答に乗る `viewport` で GUI の外から読める（位置自体は #1658 の `document.cursor`）
@@ -63,3 +58,7 @@
 ## 2026-09-26（#1729: Code Runner の実行設定の型と Python の実行環境の検出を tako-core に置いた）
 - `runner_config`（RunConfig / RuntimeRef / merge = file > project > 宣言 > 自動）と `runtime_env`（表 `KINDS` + 戦略 6 種 + `FsProbe`）を新設。Python は uv → venv → poetry → pipenv → conda → pyenv → システムの順で、Windows の列まで macOS の単体で固定。検出は stat と先頭読みだけで、辿る範囲は引数（#1656 の candidate_dirs に任せる）
 - 番犬 `issue1729_runtime_env_table_watchdog`（表の語彙を表から集めて表の外の直書きを名指し・属性の OS 分岐・子プロセス）。注入 6 通りすべて FAILED → 戻して緑。Windows CI で区切り混在の除外漏れも露出 → 修正
+
+## 2026-09-26（#1654: Tab / ⇧Tab でインデントし、Enter でインデントを引き継ぐようにした）
+- 打鍵表に Tab の行（⇧ で浅く）を足し、`TextBuffer` に `indent` / `outdent` / `newline_and_indent` と既存行からのインデント推定（開いたとき 1 回）を追加。開き括弧の直後は 1 段深く（Python / YAML は `:` も・Markdown は継承だけ）、括弧の自動閉じは理由を書いて対象外。`PreviewEditCommand` + `tako edit indent|outdent|newline` + MCP は `tako_preview_edit` の `command`（ツールは増やさない）
+- 実測: tako-vd の実打鍵経路 12 相が緑（Enter を素の改行へ戻す注入で E8 の症状が再現して FAILED）・注入 7 通りが名指しで FAILED → 戻して緑

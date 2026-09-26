@@ -28,6 +28,10 @@
 //!    確定文字列の挿入先を動かす形
 //! 6. [`画面の選択の写し戻しは1回で置く`] — `set_cursor` の 2 段で写し戻して、選択が
 //!    あるときだけ桁の記憶（desired column）が毎打鍵で切れる形
+//! 7. [`利用者向けの一覧は打鍵表と一致する`] — docs の「編集中の操作」表と打鍵表のずれ
+//! 8. [`enterはインデントを引き継ぐ口を通る`]（#1654）— Enter が素の改行へ戻り、
+//!    `fn main() {` の中で改行すると次行が桁 0 になる形（Issue #1654 の実測 E8）
+//! 9. [`tabは両osの表に載っている`]（#1654）— Tab / ⇧Tab が表から落ちて入口を素通りする形
 //!
 //! 表の中身（両 OS の列・衝突・受理しない打鍵）は `tako_core::platform::editor_keys` の
 //! 単体、キーバインドとの衝突は tako-app の `エディタの打鍵表はキーバインドと衝突しない`、
@@ -55,6 +59,7 @@ const DISPATCH: &str = "crates/tako-control/src/dispatch.rs";
 const MCP_REQUEST: &str = "crates/tako-control/src/mcp/request.rs";
 const MCP_CATALOG: &str = "crates/tako-control/src/mcp/catalog.rs";
 const CLI: &str = "crates/tako-cli/src/main.rs";
+const EDITOR_KEYS: &str = "crates/tako-core/src/platform/editor_keys.rs";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -213,6 +218,7 @@ fn 打鍵の解釈は表の1か所だけ() {
         "\"delete\"",
         "\"enter\"",
         "\"escape\"",
+        "\"tab\"",
     ] {
         for line in entry.lines_of(key) {
             literal.push(format!(
@@ -400,7 +406,31 @@ fn 移動と削除の中身はtako_coreが持つ() {
 /// GUI の打鍵と**同じ口**（`run_editor_command_local`）へ届く
 #[test]
 fn 打鍵とcliとmcpは同じ口を通る() {
-    let wiring: [(&str, &str, &str); 12] = [
+    let wiring: [(&str, &str, &str); 19] = [
+        // #1654: Tab / ⇧Tab / Enter（MCP はツールを増やさず tako_preview_edit の command）
+        (PROTOCOL, "PreviewEditCommand {", "protocol の Request"),
+        (
+            DISPATCH,
+            "Request::PreviewEditCommand {",
+            "dispatch のアーム",
+        ),
+        (
+            DISPATCH,
+            "EditorCommand::from_edit_name(",
+            "綴りの解決（名前表 1 か所）",
+        ),
+        (
+            MCP_REQUEST,
+            "Request::PreviewEditCommand {",
+            "MCP の command から Request への写像",
+        ),
+        (
+            MCP_CATALOG,
+            "EditorCommand::edit_names()",
+            "MCP の enum（名前表から作る）",
+        ),
+        (CLI, "EditCommand::Indent {", "CLI サブコマンド"),
+        (CLI, "EditCommand::Newline {", "CLI サブコマンド"),
         (PROTOCOL, "PreviewMove {", "protocol の Request"),
         (PROTOCOL, "PreviewDelete {", "protocol の Request"),
         (DISPATCH, "Request::PreviewMove {", "dispatch のアーム"),
@@ -556,9 +586,10 @@ fn doc_chords(cell: &str) -> Vec<String> {
                     spec.push_str(prefix);
                 }
             }
+            // Shift は表の打鍵の外（移動では選択の拡張、Tab では向き）なので読んで捨てる
             assert!(
                 mods.iter()
-                    .all(|m| ["Ctrl", "Alt", "Cmd"].contains(&m.as_str())),
+                    .all(|m| ["Ctrl", "Alt", "Cmd", "Shift"].contains(&m.as_str())),
                 "{DOC}:1 編集中の操作の表に読めない修飾がある: {one}"
             );
             spec.push_str(&key);
@@ -631,6 +662,67 @@ fn 利用者向けの一覧は打鍵表と一致する() {
         }
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+// --- 8) 9) インデント（#1654） -------------------------------------------------
+
+/// Enter（表の `Newline`）はインデントを引き継ぐ `newline_and_indent` を通る。
+/// 素の `newline()` へ戻すと、その行を file:line で名指して落ちる
+#[test]
+fn enterはインデントを引き継ぐ口を通る() {
+    let apply = body(EDITOR_KEYS, "apply");
+    // 素の改行へ戻した行を先に名指す（直す場所がそのまま分かる）
+    let plain = apply.lines_of("buffer.newline()");
+    assert!(
+        plain.is_empty(),
+        "{} Enter が素の改行を挿している（インデントを引き継がない = #1654 の実測 E8）",
+        plain.first().map(|l| apply.at(*l)).unwrap_or_default()
+    );
+    assert!(
+        !apply.lines_of("buffer.newline_and_indent()").is_empty(),
+        "{} が Enter を newline_and_indent へ渡していない",
+        apply.head()
+    );
+    // 挙動でも見る: Rust の `fn main() {` の直後で Enter を当てると 1 段深い行ができる
+    let mut buffer = tako_core::TextBuffer::from_text(
+        PathBuf::from("watchdog-1654.rs"),
+        "fn main() {\n}\n".into(),
+    );
+    buffer.set_cursor("fn main() {".len(), false);
+    let enter = editor_keys::resolve(Platform::MacOs, "enter", KeyMods::default())
+        .expect("Enter は表にある");
+    enter.apply(&mut buffer);
+    assert_eq!(
+        buffer.text(),
+        "fn main() {\n    \n}\n",
+        "{EDITOR_KEYS}:1 Enter の結果がインデントを引き継いでいない"
+    );
+}
+
+/// Tab / ⇧Tab が両 OS の表に載っていて、それぞれ深く / 浅くへ解ける
+#[test]
+fn tabは両osの表に載っている() {
+    for platform in [Platform::MacOs, Platform::Windows] {
+        let tab = editor_keys::resolve(platform, "tab", KeyMods::default());
+        let shift_tab = editor_keys::resolve(
+            platform,
+            "tab",
+            KeyMods {
+                shift: true,
+                ..KeyMods::default()
+            },
+        );
+        assert_eq!(
+            tab,
+            Some(EditorCommand::Indent),
+            "{EDITOR_KEYS}:1 {platform:?} の Tab がインデントに解けない"
+        );
+        assert_eq!(
+            shift_tab,
+            Some(EditorCommand::Outdent),
+            "{EDITOR_KEYS}:1 {platform:?} の Shift+Tab がアンインデントに解けない"
+        );
+    }
 }
 
 /// 走査が空振りしていないこと（関数が見つかり、本体に中身がある）

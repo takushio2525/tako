@@ -308,7 +308,7 @@ fn 行桁の解決は丸めない() {
 
 /// 本文を変える公開 API（版が進むべきもの）。[`本文を変える公開apiはすべて版を進める`] が
 /// 挙動で確かめ、[`textbufferの書き換え口は棚卸し済み`] が取りこぼしを見る
-const MUTATES_TEXT: [&str; 11] = [
+const MUTATES_TEXT: [&str; 14] = [
     "set_text",
     "insert",
     "newline",
@@ -316,6 +316,10 @@ const MUTATES_TEXT: [&str; 11] = [
     "delete_forward",
     // 単位を指定した削除（#1652。⌥⌫ / ⌘⌫ と CLI / MCP の `delete`）
     "delete",
+    // Tab / ⇧Tab / Enter（#1654。CLI / MCP の `indent` / `outdent` / `newline`）
+    "indent",
+    "outdent",
+    "newline_and_indent",
     "undo",
     "redo",
     "replace_range",
@@ -367,6 +371,23 @@ fn 本文を変える公開apiはすべて版を進める() {
                 b.set_cursor(0, false);
                 b.delete_forward()
             }),
+        ),
+        ("indent", Box::new(|b: &mut TextBuffer| b.indent())),
+        (
+            "outdent",
+            // 浅くできる行を先に作る。set_text も版を進めるので、outdent 自身が
+            // 進めたかはこの中で確かめる（外の比較だけだと set_text の分で緑になる）
+            Box::new(|b: &mut TextBuffer| {
+                b.set_text("    one\n".into());
+                b.set_cursor(0, false);
+                let before = b.version();
+                b.outdent();
+                assert!(b.version() > before, "outdent が版を進めていない");
+            }),
+        ),
+        (
+            "newline_and_indent",
+            Box::new(|b: &mut TextBuffer| b.newline_and_indent()),
         ),
         (
             "delete",
