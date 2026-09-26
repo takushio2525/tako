@@ -4027,6 +4027,7 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     let (profile_name, suffix) = match arg {
         None => ("default", None),
         Some(s) if s.starts_with('-') => {
+            // 切り出し安全: 直前の starts_with('-') で先頭 1 バイトは ASCII の `-`
             let name = &s[1..];
             if name.is_empty() {
                 return Err("プロファイル名が空です（例: tako master -2）".into());
@@ -4243,6 +4244,7 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     let (profile_name, suffix) = match arg {
         None => ("default", None),
         Some(s) if s.starts_with('-') => {
+            // 切り出し安全: 直前の starts_with('-') で先頭 1 バイトは ASCII の `-`
             let name = &s[1..];
             if name.is_empty() {
                 return Err("プロファイル名が空です（例: tako solo -fast）".into());
@@ -8680,6 +8682,7 @@ fn ledger_cli(sub: &LedgerCommand) -> Result<(), String> {
                 entries.retain(|e| e.task_type == *t);
             }
             if entries.len() > *limit {
+                // 切り出し安全: Vec のスライス（文字列ではない）。直前で len > limit を確かめた
                 entries = entries[entries.len() - *limit..].to_vec();
             }
             let result = serde_json::json!({
@@ -9187,15 +9190,23 @@ fn print_gate_result(result: &Value) {
             };
             println!("  {marker} {id}: {kind_detail}");
             if let Some(ev) = c["evidence"].as_str() {
-                let ev_short = if ev.len() > 120 {
-                    format!("{}...", &ev[..120])
-                } else {
-                    ev.to_string()
-                };
-                println!("         {ev_short}");
+                println!("         {}", gate_evidence_preview(ev));
             }
         }
     }
+}
+
+/// 証拠の見出しの上限（文字数。`…` を含む。全文は `--json` で見られる）
+const GATE_EVIDENCE_PREVIEW_CHARS: usize = 120;
+
+/// `tako task gate set / check / show` の 1 基準ぶんの証拠の見出し。
+///
+/// 証拠はコマンドの出力そのもの（`acceptance_gates::format_evidence`）なので日本語が来る。
+/// バイト位置の `&ev[..120]` で切っていたときは、120 バイト目が文字の途中に当たると
+/// CLI ごと panic していた（#1746。`check` は結果を保存したあとで落ちるので、
+/// ゲートは記録されるのに終了コードが 101 になる）
+fn gate_evidence_preview(ev: &str) -> String {
+    tako_core::text::truncate_chars(ev, GATE_EVIDENCE_PREVIEW_CHARS)
 }
 
 /// 送達フローの顛末を 1 行で出す（Issue #1259。MCP の `delivery` と同じ材料）。
@@ -9405,9 +9416,10 @@ fn print_result(command: &Command, result: &Value) {
             if let (Some(pane), Some(sid)) =
                 (result["pane"].as_u64(), result["session_id"].as_str())
             {
+                // session_id は型の上で ASCII の保証が無いので文字単位で先頭を取る（#1746）
+                let head: String = sid.chars().take(8).collect();
                 eprintln!(
-                    "復元しました: ペイン {pane}（session {}…, cwd {}）",
-                    &sid[..sid.len().min(8)],
+                    "復元しました: ペイン {pane}（session {head}…, cwd {}）",
                     result["cwd"].as_str().unwrap_or("-"),
                 );
             }
@@ -10618,6 +10630,80 @@ mod tests {
             !without.contains("unset TAKO_PANE_ID"),
             "そもそも設定されていないなら unset は案内しない: {without}"
         );
+    }
+
+    /// 証拠の見出しが「文字境界で終わり、上限以内で、切ったなら `…` で終わる」こと（#1746）
+    fn assert_gate_preview(ev: &str, out: &str) {
+        assert!(
+            ev.starts_with(out.trim_end_matches('…')),
+            "証拠の先頭になっていない: {out:?}"
+        );
+        assert!(
+            out.chars().count() <= GATE_EVIDENCE_PREVIEW_CHARS,
+            "{GATE_EVIDENCE_PREVIEW_CHARS} 文字を超えた（{} 文字）: {out:?}",
+            out.chars().count()
+        );
+        if out != ev {
+            assert!(out.ends_with('…'), "切ったのに `…` が付いていない: {out:?}");
+        }
+    }
+
+    /// #1746 の実物: `exit 0; stdout: `（16 バイト）+ 3 バイト文字で 120 バイト目が文字の途中。
+    /// 修正前はここで `end byte index 120 is not a char boundary` の panic だった
+    #[test]
+    fn gateの証拠は120バイト目が文字の途中でも落ちない() {
+        let ev = format!("exit 0; stdout: {}", "あ".repeat(50));
+        assert!(!ev.is_char_boundary(120), "場面が #1746 の形になっていない");
+        // 66 文字しかないので切らずに全文を出す
+        assert_eq!(gate_evidence_preview(&ev), ev);
+
+        let long = format!("exit 1; stderr: {}", "テストが失敗しました".repeat(20));
+        assert!(!long.is_char_boundary(120));
+        let out = gate_evidence_preview(&long);
+        assert_gate_preview(&long, &out);
+        assert_eq!(out.chars().count(), GATE_EVIDENCE_PREVIEW_CHARS);
+    }
+
+    #[test]
+    fn gateの証拠は上限ちょうどなら切らず_1文字あふれたら切る() {
+        let exact = format!("exit 0; stdout: {}", "あ".repeat(104));
+        assert_eq!(exact.chars().count(), GATE_EVIDENCE_PREVIEW_CHARS);
+        assert_eq!(gate_evidence_preview(&exact), exact);
+
+        let over = format!("{exact}い");
+        let out = gate_evidence_preview(&over);
+        assert_gate_preview(&over, &out);
+        assert_eq!(out, format!("exit 0; stdout: {}…", "あ".repeat(103)));
+    }
+
+    #[test]
+    fn gateの証拠は空とasciiだけでも上限内() {
+        assert_eq!(gate_evidence_preview(""), "");
+        assert_eq!(gate_evidence_preview("exit 0"), "exit 0");
+        let ascii = format!("exit 0; stdout: {}", "x".repeat(200));
+        let out = gate_evidence_preview(&ascii);
+        assert_gate_preview(&ascii, &out);
+        assert_eq!(out, format!("exit 0; stdout: {}…", "x".repeat(103)));
+    }
+
+    #[test]
+    fn gateの証拠は4バイト文字と結合文字と改行でも落ちない() {
+        // 120 バイト目が絵文字（4 バイト）の途中（前置き 17 バイト + 4 バイト × n）
+        let emoji = format!("exit 0; stdout: a{}", "🎉".repeat(120));
+        assert!(!emoji.is_char_boundary(120));
+        // 濁点を合成文字で書いた「が」（macOS のファイル名は NFD で届く）
+        let nfd = format!("exit 0; stdout: {}", "か\u{3099}".repeat(70));
+        // 末尾 5 行の抜粋（`format_evidence`）は改行を含む。改行は 1 文字として数え、そのまま出す
+        let lines = format!(
+            "exit 0; stdout (last 5/7 lines): {}",
+            ["日本語の長いテスト出力の行です番号付き"; 5].join("\n")
+        );
+        for ev in [&emoji, &nfd, &lines] {
+            let out = gate_evidence_preview(ev);
+            assert_gate_preview(ev, &out);
+            assert!(out.ends_with('…'), "3 つとも上限を超える長さ: {out:?}");
+        }
+        assert!(gate_evidence_preview(&lines).contains('\n'));
     }
 }
 
