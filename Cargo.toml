@@ -27,6 +27,9 @@ alacritty_terminal = "0.26"
 polling = "3"
 # PTY スレーブ名の取得（TIOCPTYGNAME。tmux 対応付け FR-2.13）。alacritty 経由で既にツリー内
 libc = "0.2"
+# 文字の表示幅（UAX #11。エディタの上下移動の桁 = #1742）。alacritty 経由で既にツリー内で、
+# 端末のセル幅と同じ判定になる
+unicode-width = "0.2"
 futures = "0.3"
 thiserror = "2"
 tracing = "0.1"
