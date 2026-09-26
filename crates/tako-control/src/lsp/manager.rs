@@ -488,7 +488,8 @@ impl LspManager {
     /// 上限は `request.timeout`）。
     ///
     /// 文書が開いていなければ（編集モードでないプレビューから ⌘クリックした）、**問い合わせの
-    /// あいだだけ**ディスクの中身で `didOpen` し、答えを受けたら `didClose` する。
+    /// あいだだけ** `didOpen` し（本文は `request.document` = 編集セッションの全文、無ければ
+    /// ディスクの中身）、答えを受けたら `didClose` する。
     /// 「開いただけではサーバを起こさない」（設計書 §16-2）は保ったまま、利用者が明示的に
     /// 問い合わせたときだけ起こす
     pub fn goto(&self, request: &GotoRequest) -> Result<GotoAnswer, GotoError> {

@@ -67,3 +67,6 @@
 ## 2026-09-27（#1807: fd 継承の番犬が無関係な PR の CI で間欠的に落ちる件を、検査の片の偽陽性として直した）
 - 真因は実装でもテストの並列性でもなく、検査の片 `fd_inherit::inherited_probe_script` の `{ : >&N; } 2>/dev/null`。bash（macOS の `/bin/sh`）は `>&N` の前に元の fd 2 / 1 を 10 以上の空き番号へ退避するので、閉じた 10 / 11 を「開いている」と読んでいた（CI で落ちた回は fd 10）。外部コマンドの fork 子で試す形（`/usr/bin/true 2>/dev/null >&N`）へ替え、daemon と PTY の両方の番犬が同時に直った
 - 実測: 開く番号を 3〜20 で固定すると修正前は 10 / 11 だけ 100% FAILED（PTY 経路も同じ）→ 修正後 3 回ずつ全 ok。全 lib 20 回は修正前後とも失敗 0（手元では番号が 10 / 11 に当たらなかった）。seal を外す注入で両経路とも全番号で file:line 名指しの FAILED、旧い片へ戻す注入で片の単体テストが `[4, 10, 11, 12]` で FAILED → 戻して緑
+## 2026-09-27（#1680: 定義ジャンプ（⌘クリックで定義先を新しいペインに）を足した）
+- ⌘ホバーの下線（md リンクと同じ 1 実装）・⌘クリック・`tako lsp definition|declaration|type-definition|implementation` / MCP `tako_lsp` が同じ 3 段（UI で準備 → background で問い合わせ → UI で着地）を通る。offload に UI スレッドの続き（`OffloadOutcome::OnUi`）を足し、IPC ループの後処理を `after_dispatch` へ切り出した。着地は `open_file` 経由でジャンプ履歴へ積み、同じファイルは読み直さない。編集モードでなくても問い合わせのあいだだけ didOpen する
+- 実測: `scripts/test-lsp-goto-1680.sh` 38 PASS 0 FAIL（新ペイン / 使い回し / 同じペイン / #include / 戻る / 複数候補 / 3 状態 / CLI と MCP の字面一致 / UTF-16 / 未応答中も UI が止まらない）・e2e 11 本・番犬の注入 7 通り + 実ソースへの注入 A（新ペインを開かない）/ B（使い回さない）が dispatch.rs:762 / 761 を名指しで FAILED → 戻して緑

@@ -685,6 +685,34 @@ Enter 素通しの楽観 echo・会話末尾の作業中インジケータは、
       変換中にターミナルをクリックしても、読みはターミナルへ流れない
 - [ ] 3 つとも、Esc で閉じたあとに打った文字はターミナルへ入る
 
+## 定義ジャンプ（⌘クリック。#1680、2026-09-27）
+
+着地の規則（新しいペイン / 使い回し / 同じペイン / 候補の一覧）・`#include` のヘッダ・戻る・
+3 状態の文言・CLI と MCP の一致・⌘ 無しクリックの選択の不変は、偽サーバ（`tako-lsp-fake`）で
+機械検証済み（`issue1680_lsp_goto` / `issue1680_lsp_goto_watchdog` / `scripts/test-lsp-goto-1680.sh` /
+セルフテスト項目 156 / visual-test `goto-hover`）。**実サーバの答え方**（rust-analyzer の
+`LocationLink`・読み込み中の空の答え、clangd の `#include` の答え）は偽サーバでは示せないので、
+実機で 1 回ずつ見る。
+
+- [ ] rust-analyzer: tako のリポジトリの `crates/tako-core/src/lsp/goto.rs` を開き、
+      `plan_landing` の中の `same_file` を ⌘ を押しながらホバー → 下線とアクセント色が出て、
+      ⌘ を離すと消える → ⌘クリック → 同じファイル内の定義（引数の行）へ同じペインで飛ぶ
+- [ ] rust-analyzer: 同じファイルの `crate::file_uri::strip_drive_slash` を ⌘クリック →
+      `crates/tako-core/src/file_uri.rs` が**右の新しいペイン**で開き、関数の行が先頭に来る。
+      もう一度 ⌘クリックしてもペインは増えない（同じペインを使い回す）
+- [ ] rust-analyzer: ⌃-（戻る）で `goto.rs` の元の位置へ戻る
+- [ ] rust-analyzer: 初回（サーバが起きていない状態）はヘッダに「定義を探しています…」が出てから飛ぶ。
+      読み込み中で「見つからなかった」と出たら、少し待ってもう一度で飛べる
+- [ ] clangd: `compile_flags.txt`（中身は空でよい）と `main.c`（`#include "foo.h"`）・`foo.h` を
+      同じフォルダに置き、`main.c` の `foo.h` の上を ⌘ホバー → パス全体（`foo.h`）に下線 →
+      ⌘クリック → `foo.h` が新しいペインで開く
+- [ ] 見つからない: コメントの中の語を ⌘クリック → ヘッダに「定義が見つからなかった…」が数秒出て、
+      ペインは増えない（通知欄は開かない）
+- [ ] 未導入: rust-analyzer を PATH から外した状態で `.rs` を ⌘クリック → 通知欄に理由と
+      `rustup component add rust-analyzer` が出る
+- [ ] ⌘ 無しのクリック・ドラッグはこれまでどおり選択になる（定義を探しに行かない）
+- [ ] Windows: 同じ手順を Ctrl+ホバー / Ctrl+クリックで（Win キーでは何も起きない）
+
 ## ジャンプ履歴のキー（#1677、2026-09-26）
 
 戻る / 進むの積み方・着地・閉じたペインの開き直しは `jump_history` の単体 + dispatch の単体 +
