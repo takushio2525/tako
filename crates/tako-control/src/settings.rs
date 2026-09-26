@@ -606,6 +606,30 @@ mod tests {
         assert_eq!(theme.mode, tako_core::theme::ThemeMode::Dark);
     }
 
+    /// #1756: 読めない色が保存済みの settings.json も、そのまま読めて起動できる
+    /// （その色だけ既定に残して警告で返す。以前は非 ASCII の値で起動のたびに落ちた）。
+    /// 読み方は変えていないので、移行は要らない（#916）
+    #[test]
+    fn issue1756_読めない色が保存済みでもテーマを解決できる() {
+        let json = r##"{
+            "theme": "dark",
+            "theme_colors": { "dark": { "accent": "#赤色", "green": "#00ff00" } },
+            "theme_presets": { "ocean": { "base": "dark", "colors": { "accent": "#１２３４５６" } } }
+        }"##;
+        let mut s: Settings = serde_json::from_str(json).expect("旧ファイルがそのまま読める");
+        let base = tako_core::theme::Theme::default_dark();
+        let (theme, warnings) = s.resolve_theme();
+        assert_eq!(theme.accent, base.accent, "読めない値は既定のまま");
+        assert_eq!(theme.green, tako_core::theme::Rgb::new(0, 255, 0));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with("accent: "), "{warnings:?}");
+        // プリセット側に残った値も同じ
+        s.theme = "ocean".into();
+        let (theme, warnings) = s.resolve_theme();
+        assert_eq!(theme.accent, base.accent);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+    }
+
     #[test]
     fn resolve_themeはフォント設定を適用する() {
         let s = Settings {

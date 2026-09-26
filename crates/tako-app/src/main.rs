@@ -3864,12 +3864,19 @@ impl TakoApp {
             .iter()
             .any(|t| !t.remote_folders().is_empty());
 
+        // テーマは settings.json の設定値から復元（Issue #217。既定ダーク）。
+        // 読めない色の上書きはその色だけ既定へ落として起動し、理由を persist.log へ残す
+        // （#1756: 以前は非 ASCII の値で起動のたびに落ちた。settings.json は書き換えない）
+        let (startup_theme, theme_warnings) = tako_control::settings::load().resolve_theme();
+        for w in &theme_warnings {
+            persist_diag(&format!("テーマの色上書きを無視: {w}"));
+        }
+
         let mut app = Self {
             // ルートペイン（復元時は全ペイン）は下の spawn_session でセッションを張る
             workspace,
             terminals: HashMap::new(),
-            // テーマは settings.json の設定値から復元（Issue #217。既定ダーク）
-            theme: tako_control::settings::load().resolve_theme().0,
+            theme: startup_theme,
             focus_handle: cx.focus_handle(),
             cell_size: None,
             pane_font_sizes: HashMap::new(),
