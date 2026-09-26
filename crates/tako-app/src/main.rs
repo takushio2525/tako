@@ -23842,7 +23842,9 @@ pub(crate) fn pane_context_menu_items(facts: PaneMenuFacts) -> Vec<(&'static str
     items
 }
 
-/// 文字数ベースの単純な切り詰め（タブ表示名用）
+/// 文字数ベースの単純な切り詰め（タブ表示名・実行コマンドの見出しなど。`…` を含めて
+/// `max_chars` 文字以内）。表示用の切り詰めはこれを通す: バイト位置の `&s[..N]` は
+/// 文字の途中に当たると panic する（#1728）
 fn truncate(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_string()
@@ -38804,6 +38806,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1728: 実行コマンド / 検索欄を文字の途中で切って描画中に落ちないか
+                "run-command-truncate" => {
+                    run_command_truncate_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
@@ -38811,7 +38819,8 @@ mod self_test {
                          grid-bench / preview-leak / chat-leak / preview-code / \
                          remote-tree / flicker / ime-preedit / screen-lines / \
                          pane-border / tasks-panel / task-attachment / \
-                         tasks-accordion / shelve-tab / no-emoji / editor-keys）"
+                         tasks-accordion / shelve-tab / no-emoji / editor-keys / \
+                         run-command-truncate）"
                     );
                     std::process::exit(1);
                 }
@@ -42946,6 +42955,159 @@ mod self_test {
             before1487.is_some(),
             after1487.is_some()
         );
+    }
+
+    /// 実行コマンドと検索欄を**文字の途中で切って落ちない**か（#1728）。
+    ///
+    /// ヘッダの再生ボタンは描画のたびに実行コマンドを 60 で、実行メニューは行ごとに 40 で
+    /// 切り詰める。どちらもバイト位置で切っていたので、日本語のファイル名を実行できる
+    /// プレビューを開いた時点 / メニューを開いた時点で GPUI の描画中に panic し、アプリごと
+    /// 落ちた。検索欄も `PreviewSearch` がクエリだけ差し替えるとカーソルが文字の途中に残る。
+    /// 3 つを同じフレームで描かせ、**プロセスが生きたままフレームを撮れれば**合格。
+    /// A/B: 修正前のビルドはここで落ち、ログに `is not a char boundary` が出る。
+    /// 単独実行は `TAKO_VISUAL_ONLY=run-command-truncate`
+    #[cfg(feature = "visual-test")]
+    async fn run_command_truncate_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        let wait =
+            |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+
+        // 材料: Issue #1728 の 2 例をファイル名にし、実行コマンドもそのまま宣言する
+        // （1 枚目は 68 バイトで 60 バイト目が、2 枚目は 63 バイトで 40 バイト目が文字の途中）
+        let dir = std::env::temp_dir().join(format!("tako-st1728-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let first = dir.join("aデータ解析結果のまとめレポート最終版.py");
+        let second = dir.join("report_最終版_データ解析結果まとめ_v2.py");
+        let _ = std::fs::write(
+            &first,
+            "# tako:run: python3 'aデータ解析結果のまとめレポート最終版.py'\nprint(\"ok\")\n",
+        );
+        let _ = std::fs::write(
+            &second,
+            "# tako:run: python3 'report_最終版_データ解析結果まとめ_v2.py'\n\
+             # tako:run[long]: python3 'report_最終版_データ解析結果まとめ_v2.py' --出力 '最終レポート_九月分.md'\n\
+             print(\"ok\")\n",
+        );
+        let open = |app: &mut TakoApp, pane: PaneId, path: &std::path::Path, split: bool| {
+            tako_control::dispatch(
+                app,
+                tako_control::protocol::Request::OpenFile {
+                    pane: Some(pane.as_u64()),
+                    path: path.display().to_string(),
+                    mode: Some(tako_control::protocol::PreviewModeWire::Code),
+                    direction: split.then_some(tako_control::protocol::Direction::Right),
+                    focus: Some(false),
+                    new_tab: false,
+                    line: None,
+                    column: None,
+                },
+                PaneOrigin::Cli,
+            )
+            .ok()
+            .and_then(|v| v["pane"].as_u64())
+            .map(PaneId::from_raw)
+        };
+        // 各プロファイルのコマンドのバイト数と、その位置が文字の途中か（場面が
+        // 修正前に落ちる形になっているかをログで読めるようにする）
+        let commands = |app: &TakoApp, pane: PaneId, cut: usize| -> Vec<(usize, bool)> {
+            app.preview_run_profiles
+                .get(&pane)
+                .map(|plans| {
+                    plans
+                        .iter()
+                        .map(|p| {
+                            let mid = p.command.len() > cut && !p.command.is_char_boundary(cut);
+                            (p.command.len(), mid)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        // 1. 1 枚目を開く（ヘッダの再生ボタンが描画のたびに 60 で切る）
+        let opened = window
+            .update(cx, |app: &mut TakoApp, _, cx| {
+                app.drawer_visible = false;
+                app.panel_visible = false;
+                let root = app.workspace.active_tab().tree().focused();
+                let pv = open(app, root, &first, true);
+                cx.notify();
+                pv.map(|pv| (pv, commands(app, pv, 60)))
+            })
+            .ok()
+            .flatten();
+        wait(cx, 700).await;
+        let Some((pv, first_cmds)) = opened else {
+            println!("TAKO_VISUAL_1728: SKIPPED（1 枚目を開けない）");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        let first_frame = capture_frame(any, cx).is_some();
+
+        // 2. 同じペインへ 2 枚目を開き、実行メニュー（行ごとに 40 で切る）と
+        //    検索欄（「ab」を打ったあとクエリだけ「あいう」へ差し替わった状態）を出す
+        let second_state = window
+            .update(cx, |app: &mut TakoApp, win, cx| {
+                let pv2 = open(app, pv, &second, false).unwrap_or(pv);
+                let search = |app: &mut TakoApp, query: &str| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::PreviewSearch {
+                            pane: Some(pv2.as_u64()),
+                            query: Some(query.into()),
+                            direction: None,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                };
+                // 「ab」を打った状態（キー入力はクエリとカーソルを一緒に進める）
+                search(app, "ab");
+                if let Some(edit) = app.preview_edits.get_mut(&pv2) {
+                    edit.search_cursor = 2;
+                }
+                // クエリだけ差し替わる（カーソルは 2 のまま =「あ」の途中）
+                search(app, "あいう");
+                let cursor = app.preview_edits.get_mut(&pv2).map(|edit| {
+                    // 検索欄の開閉は GUI のキー操作側が持つ状態なので直接立てる（#1536 と同じ）
+                    edit.search_visible = true;
+                    edit.search_focus = preview::SearchFieldFocus::Query;
+                    (edit.search_cursor, edit.search_query.len())
+                });
+                let vp = win.viewport_size();
+                app.preview_run_menu = Some((pv2, gpui::point(vp.width * 0.75, px(72.0))));
+                cx.notify();
+                (pv2, commands(app, pv2, 40), cursor)
+            })
+            .ok();
+        wait(cx, 700).await;
+        let Some((pv2, menu_cmds, cursor)) = second_state else {
+            println!("TAKO_VISUAL_1728: SKIPPED（2 枚目の場面を組めない）");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        let frame = capture_frame(any, cx);
+        let menu_open = window
+            .update(cx, |app: &mut TakoApp, _, _| app.preview_run_menu.is_some())
+            .unwrap_or(false);
+        if let (Ok(dump), Some((frame, _))) = (std::env::var("TAKO_VISUAL_DUMP_DIR"), &frame) {
+            let _ = frame.save(std::path::Path::new(&dump).join("run-command-truncate.png"));
+        }
+        println!(
+            "TAKO_VISUAL_1728: preview={} first_cmds(bytes,mid60)={first_cmds:?} \
+             first_frame={first_frame} preview2={} menu_cmds(bytes,mid40)={menu_cmds:?} \
+             menu_open={menu_open} search(cursor,query_bytes)={cursor:?} frame={:?}",
+            pv.as_u64(),
+            pv2.as_u64(),
+            frame.as_ref().map(|(f, _)| f.dimensions())
+        );
+        let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+            app.preview_run_menu = None;
+            cx.notify();
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// UI の絵文字を置き換えた 4 箇所が**実ピクセルで描かれている**か（#1536）。
