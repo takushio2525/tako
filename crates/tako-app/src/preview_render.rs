@@ -2640,14 +2640,9 @@ impl TakoApp {
                                         .iter()
                                         .find(|p| p.profile == run_sel)
                                         .or_else(|| run_profiles.first())
-                                        .map(|p| {
-                                            let cmd = &p.command;
-                                            if cmd.len() > 60 {
-                                                format!("{}…", &cmd[..60])
-                                            } else {
-                                                cmd.clone()
-                                            }
-                                        })
+                                        // 文字数で切る（#1728。バイト位置で切ると日本語の
+                                        // ファイル名の途中に当たって描画中に panic する）
+                                        .map(|p| crate::truncate(&p.command, 60))
                                         .unwrap_or_default()
                                 } else {
                                     crate::ui_text::preview::run_no_command().to_string()
@@ -4474,11 +4469,8 @@ impl TakoApp {
                 profile_name.clone()
             };
             let is_selected = profile_name == selected;
-            let cmd_preview: String = if plan.command.len() > 40 {
-                format!("{}…", &plan.command[..40])
-            } else {
-                plan.command.clone()
-            };
+            // 文字数で切る（#1728。バイト位置で切ると文字の途中に当たって描画中に panic する）
+            let cmd_preview = crate::truncate(&plan.command, 40);
             let path = self
                 .previews
                 .get(&pane_id)
@@ -4748,9 +4740,9 @@ fn render_field_with_cursor(
         }
         return text.to_string();
     }
-    let cursor = cursor.min(text.len());
-    let before = &text[..cursor];
-    let after = &text[cursor..];
+    // カーソルはバイト位置。クエリだけ差し替わる経路（`tako preview-search`）では文字の
+    // 途中を指したまま残るので、文字境界へ丸めてから分ける（#1728。末尾超えは末尾へ寄る）
+    let (before, after) = text.split_at(text.floor_char_boundary(cursor));
     if let Some(ime) = ime_text.filter(|t| !t.is_empty()) {
         return format!("{before}[{ime}]{after}");
     }
@@ -4831,6 +4823,136 @@ mod tests {
             "a[変換]b"
         );
         assert_eq!(render_field_with_cursor("ab", 1, true, Some("")), "a|b");
+    }
+
+    // ---- #1728: 実行コマンドの見出しは文字境界で切る ----
+
+    /// Issue #1728 の例 1（68 バイト / 32 文字。60 バイト目が「終」の途中）
+    const RUN_CMD_EX1: &str = "python3 'aデータ解析結果のまとめレポート最終版.py'";
+    /// Issue #1728 の例 2（63 バイト / 37 文字。40 バイト目が「析」の途中）
+    const RUN_CMD_EX2: &str = "python3 'report_最終版_データ解析結果まとめ_v2.py'";
+    /// 4 バイト文字（58 バイト。40 バイト目が絵文字の途中）
+    const RUN_CMD_EMOJI: &str = "sh './🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉.sh'";
+
+    /// 実行メニュー（40）/ ツールチップ（60）が呼ぶ切り詰め
+    fn cut(cmd: &str, max: usize) -> String {
+        crate::truncate(cmd, max)
+    }
+
+    /// 結果が「入力の先頭を文字境界で切ったもの（切ったなら末尾に `…`）」で、
+    /// `…` を含めて `max` 文字以内であること
+    fn assert_cut_on_char_boundary(cmd: &str, max: usize, out: &str) {
+        let head = out.strip_suffix('…').unwrap_or(out);
+        assert!(
+            cmd.starts_with(head),
+            "{cmd:?} の先頭になっていない: {out:?}"
+        );
+        assert!(
+            cmd.is_char_boundary(head.len()),
+            "{cmd:?} を {} バイト目（文字の途中）で切った",
+            head.len()
+        );
+        assert!(
+            out.chars().count() <= max,
+            "{max} 文字を超えた（{} 文字）: {out:?}",
+            out.chars().count()
+        );
+        if out != cmd {
+            assert!(out.ends_with('…'), "切ったのに `…` が付いていない: {out:?}");
+        }
+    }
+
+    #[test]
+    fn 実行コマンドの見出しはissueの例1で落ちない() {
+        for max in [60, 40] {
+            let out = cut(RUN_CMD_EX1, max);
+            assert_cut_on_char_boundary(RUN_CMD_EX1, max, &out);
+        }
+    }
+
+    #[test]
+    fn 実行コマンドの見出しはissueの例2で落ちない() {
+        for max in [40, 60] {
+            let out = cut(RUN_CMD_EX2, max);
+            assert_cut_on_char_boundary(RUN_CMD_EX2, max, &out);
+        }
+    }
+
+    #[test]
+    fn 実行コマンドの見出しは絵文字の途中で切らない() {
+        let out = cut(RUN_CMD_EMOJI, 40);
+        assert_cut_on_char_boundary(RUN_CMD_EMOJI, 40, &out);
+        // 22 文字しかないので切らない
+        assert_eq!(out, RUN_CMD_EMOJI);
+        // 文字数の上限を割り込ませると絵文字の手前で切れる
+        let short = cut(RUN_CMD_EMOJI, 10);
+        assert_cut_on_char_boundary(RUN_CMD_EMOJI, 10, &short);
+        assert_eq!(short, "sh './🎉🎉🎉…");
+    }
+
+    #[test]
+    fn 実行コマンドの見出しは上限ちょうどなら切らない() {
+        // ちょうど 40 文字（うち 30 文字が 3 バイト文字）は切らずにそのまま出す
+        let exact = format!("python3 '{}'", "あ".repeat(30));
+        assert_eq!(exact.chars().count(), 40);
+        assert_eq!(cut(&exact, 40), exact);
+        // 1 文字あふれたら `…` を含めて 40 文字へ収める
+        let over = format!("python3 '{}'", "あ".repeat(31));
+        let out = cut(&over, 40);
+        assert_cut_on_char_boundary(&over, 40, &out);
+        assert_eq!(out.chars().count(), 40);
+        assert_eq!(out, format!("python3 '{}…", "あ".repeat(30)));
+    }
+
+    #[test]
+    fn 実行コマンドの見出しはasciiだけでも上限内で切る() {
+        let short = "python3 ./main.py";
+        assert_eq!(cut(short, 40), short);
+        let long = format!("python3 ./{}.py", "a".repeat(50));
+        let out = cut(&long, 40);
+        assert_cut_on_char_boundary(&long, 40, &out);
+        assert_eq!(out, format!("python3 ./{}…", "a".repeat(29)));
+    }
+
+    #[test]
+    fn 実行コマンドの見出しは空と結合文字でも落ちない() {
+        assert_eq!(cut("", 40), "");
+        // 濁点を合成文字で書いた「が」（macOS のファイル名は NFD で届くことがある）。
+        // 基底文字と濁点のあいだで切れることはあるが（見た目の欠け）、落ちはしない
+        let nfd = format!("python3 '{}.py'", "か\u{3099}".repeat(20));
+        for max in [40, 41, 42] {
+            let out = cut(&nfd, max);
+            assert_cut_on_char_boundary(&nfd, max, &out);
+        }
+    }
+
+    /// 全位置の総当たり: どの上限で切っても落ちず、文字境界で終わる
+    #[test]
+    fn 実行コマンドの見出しはどの上限でも文字境界で終わる() {
+        let nfd = format!("python3 '{}.py'", "か\u{3099}".repeat(20));
+        for cmd in [RUN_CMD_EX1, RUN_CMD_EX2, RUN_CMD_EMOJI, nfd.as_str()] {
+            for max in 1..=cmd.len() + 1 {
+                let out = cut(cmd, max);
+                assert_cut_on_char_boundary(cmd, max, &out);
+            }
+        }
+    }
+
+    /// #1728: 検索欄のカーソルが文字の途中を指していても落ちない
+    /// （`tako preview-search` はクエリだけ差し替え、カーソルは据え置く）
+    #[test]
+    fn 検索欄のカーソルが文字の途中でも落ちない() {
+        // 「ab」を打ってカーソル 2 → クエリだけ「あいう」へ差し替わった状態
+        assert_eq!(render_field_with_cursor("あいう", 2, true, None), "|あいう");
+        assert_eq!(
+            render_field_with_cursor("あいう", 4, true, Some("変換")),
+            "あ[変換]いう"
+        );
+        // 末尾を越えたカーソルは末尾へ寄せる（従来どおり）
+        assert_eq!(
+            render_field_with_cursor("あいう", 99, true, None),
+            "あいう|"
+        );
     }
 
     /// Issue #656: 表のセルは同じ y 帯に横並びになるので、ヒットテストは x で
