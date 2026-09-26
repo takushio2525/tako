@@ -75,9 +75,8 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_preview_apply` | 編集バッファの全文を差し替える |
 | `tako_preview_edit_range` | 行・桁で指定した範囲だけを置き換える（応答に文書の版が載る） |
 | `tako_preview_cursor` | 編集カーソルを行・桁で置く（`select_to_line` で選択） |
-| `tako_lsp` | 言語サーバの言語機能（`action` = diagnostics で編集中のコードの診断。`pane` / `severity` で絞る） |
+| `tako_lsp` | 言語サーバの言語機能（`action` = diagnostics（既定）で編集中のコードの診断。`pane` / `severity` で絞る。definition / declaration / type-definition / implementation で識別子の飛び先へ飛ぶ = GUI の修飾クリックと同じ。別のファイルは新しいペイン・開いているファイルはそのペイン・候補が複数なら `choice` で選ぶ） |
 | `tako_lsp_server` | 言語サーバ（LSP）の状態と起動・停止（`action` = status / list / restart / stop / logs。編集モードで自動的に起きる） |
-| `tako_lsp` | 言語サーバの言語機能。`action` = definition / declaration / type-definition / implementation で識別子の飛び先へ飛ぶ（GUI の修飾クリックと同じ。別のファイルは新しいペイン・開いているファイルはそのペイン・候補が複数なら `choice` で選ぶ） |
 | `tako_preview_move` | 編集カーソルを単語・行・ページ・文書端の単位で動かす（`select` で選択を伸ばす） |
 | `tako_preview_delete` | 単語・行単位で消す（選択があれば選択を消す） |
 | `tako_preview_save` | 未保存の編集をファイルへ保存する |

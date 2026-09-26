@@ -489,8 +489,8 @@ fn 走査が空振りしていない() {
         "直書き enum の採取が {literals} 件しかない（走査が壊れている。#1467 時点で 97 件）"
     );
     assert_eq!(
-        generated, 7,
-        "生成 site が 7 件でない（{generated} 件）。正本を消費する site を増減したら\
+        generated, 8,
+        "生成 site が 8 件でない（{generated} 件）。正本を消費する site を増減したら\
          `registry()` の Consumed も合わせること"
     );
     assert!(

@@ -423,7 +423,7 @@ tako title --pane 3 ""   # 空文字でクリア（自動リネームに戻る�
 
 ### tako lsp
 
-コードプレビューを**編集モードにすると**、拡張子に合う言語サーバ（Rust = rust-analyzer / C・C++ = clangd / TypeScript・JavaScript = typescript-language-server / Python = pyright）が自動的に起きます。`tako lsp` はその状態を見たり、起こし直したり、診断（エラー・警告）を一覧したりするコマンドです。診断は画面でも、コードの波線（エラー = 赤 / 警告 = 黄 / 情報 = 青 / ヒント = 灰）と右パネルの diagnostics ビューに出ます。補完や定義ジャンプはこれから順に入ります。
+コードプレビューを**編集モードにすると**、拡張子に合う言語サーバ（Rust = rust-analyzer / C・C++ = clangd / TypeScript・JavaScript = typescript-language-server / Python = pyright）が自動的に起きます。`tako lsp` はその状態を見たり、起こし直したり、診断（エラー・警告）を一覧したりするコマンドです。診断は画面でも、コードの波線（エラー = 赤 / 警告 = 黄 / 情報 = 青 / ヒント = 灰）と右パネルの diagnostics ビューに出ます。定義ジャンプは下の「定義へ飛ぶ」を参照してください。補完はこれから順に入ります。
 
 ```bash
 tako lsp status          # 状態（稼働中か・pid・診断の件数）。未導入なら理由と導入コマンド

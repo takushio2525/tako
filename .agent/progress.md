@@ -20,15 +20,6 @@
 
 ---
 
-## 2026-09-26（#1760: 隔離 GUI はヘルパ経由で tako-vd 以外の面の明示を通さないようにした）
-- `launch_isolated_gui` は面を用意できても `TAKO_DISPLAY=0`（= メイン画面）等の明示をそのまま渡していた（偽 GUI で実測）。起動前に `iso_display_allowed` で判定し、通すのは tako-vd の名前 / 記録済み uuid / 空 / 実在し得ない index（N ≥ 100）だけ・通さなければ終了コード 2 + stderr 1 行。旧 `ISOLATED_GUI_DISPLAY` の差し替え口は閉じ、#1697 の ④ は `index:999` へ
-- 実測: #1697 の検査が tako-vd 上で PASS=19・④ だけの A/B（面が tako-vd 1 枚の門つき）で `TAKO_1697_LEGACY=1` だと終了せず落ちる・番犬 3 本追加で注入 7 通りすべて file:line 名指しで FAILED → 戻して緑
-
-## 2026-09-26（#1677: ジャンプ履歴（戻る / 進む）を足した）
-- 行を指定した OpenFile が「飛ぶ前にいた場所」と着地点を積み、⌃- / ⌃⇧-（Windows は Ctrl+Alt+← / →。Ctrl+- は縮小のため）と CLI `tako jump back|forward|list` / MCP `tako_jump`（action の 1 ツール）が同じ dispatch で戻る / 進む。スタックは `tako_core::jump_history`（同じ行の連続を畳む・上限 100・閉じたペインは開き直す・消えたファイルは捨てる）。積む契機は行指定の open だけ・永続化しない
-- `OpenFile` の本体を `dispatch::open_file` へ移し、戻る / 進むの着地も同じ実装を通す（積まないのは `JumpRecord::Skip`）。#1398 の番犬を移動先を見る形へ直した。macOS の ⌃⇧- は shift が落ちて US = `ctrl-_` / JIS = `ctrl-=` で届くので 2 本張った
-- 実測: `scripts/test-jump-1677.sh` 31 PASS（CLI と MCP の応答が字面一致）・`test-jump-keys-1677.sh`（visual-test の打鍵経路）緑 + LEGACY で FAILED・注入 7 通りすべて file:line で FAILED → 戻して緑・workspace 5829 passed 0 failed・clippy 3 宇宙 0
-
 ## 2026-09-26（#1768: ペインの PTY の子と remote daemon が GUI の fd を受け継がないようにした）
 - 修正前は GUI が CLOEXEC 無しで開いた Metal のシェーダキャッシュが全ペインの子の fd 4 / 5 に 100%（隔離 GUI 3000 / 3000・本番の tmux クライアント 23 本）。`platform::fd_inherit`（B27）の `seal_inherited_fds` を fork 後・exec 前の子で走らせる（PTY は `spawn_sealed` で包んで atfork の子ハンドラ・daemon は既存の `pre_exec`）
 - 親で掃く案 (a) は Metal を塞いだが GUI が相方を握るパイプが 1 / 3000 残ったので、子の中で掃く (b) を採った。`scripts/test-pty-fd-leak-1768.sh` の 3000 回・同条件で 修正前 other 3000 / (a) pipe 1 / (b) pipe 0・other 0
@@ -67,6 +58,8 @@
 ## 2026-09-27（#1807: fd 継承の番犬が無関係な PR の CI で間欠的に落ちる件を、検査の片の偽陽性として直した）
 - 真因は実装でもテストの並列性でもなく、検査の片 `fd_inherit::inherited_probe_script` の `{ : >&N; } 2>/dev/null`。bash（macOS の `/bin/sh`）は `>&N` の前に元の fd 2 / 1 を 10 以上の空き番号へ退避するので、閉じた 10 / 11 を「開いている」と読んでいた（CI で落ちた回は fd 10）。外部コマンドの fork 子で試す形（`/usr/bin/true 2>/dev/null >&N`）へ替え、daemon と PTY の両方の番犬が同時に直った
 - 実測: 開く番号を 3〜20 で固定すると修正前は 10 / 11 だけ 100% FAILED（PTY 経路も同じ）→ 修正後 3 回ずつ全 ok。全 lib 20 回は修正前後とも失敗 0（手元では番号が 10 / 11 に当たらなかった）。seal を外す注入で両経路とも全番号で file:line 名指しの FAILED、旧い片へ戻す注入で片の単体テストが `[4, 10, 11, 12]` で FAILED → 戻して緑
+
 ## 2026-09-27（#1680: 定義ジャンプ（⌘クリックで定義先を新しいペインに）を足した）
 - ⌘ホバーの下線（md リンクと同じ 1 実装）・⌘クリック・`tako lsp definition|declaration|type-definition|implementation` / MCP `tako_lsp` が同じ 3 段（UI で準備 → background で問い合わせ → UI で着地）を通る。offload に UI スレッドの続き（`OffloadOutcome::OnUi`）を足し、IPC ループの後処理を `after_dispatch` へ切り出した。着地は `open_file` 経由でジャンプ履歴へ積み、同じファイルは読み直さない。編集モードでなくても問い合わせのあいだだけ didOpen する
 - 実サーバ: rust-analyzer は読み込み前に空で答えるので `experimental/serverStatus` を待って問い直す（tako の実ソースで初回 14 秒で `file_uri.rs:29` へ新ペイン・2 回目は使い回し）。clangd は `#include` → `foo.h` を新ペインで。実測: `scripts/test-lsp-goto-1680.sh` 38 PASS 0 FAIL（新ペイン / 使い回し / 同じペイン / #include / 戻る / 複数候補 / 3 状態 / CLI と MCP の字面一致 / UTF-16 / 未応答中も UI が止まらない）・e2e 11 本・番犬の注入 7 通り + 実ソースへの注入 A（新ペインを開かない）/ B（使い回さない）が dispatch.rs:762 / 761 を名指しで FAILED → 戻して緑
+- #1791（S2 診断）の上へ合流: MCP `tako_lsp` は 1 本のまま action 5 つ（既定 diagnostics）・MATRIX の `tako_lsp` は 1 行（Windows の根拠に両方の e2e）・要件は FR-3.31 へ振り直し

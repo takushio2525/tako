@@ -30,6 +30,39 @@ mod tests {
         assert!(err.contains("diagnostics"), "{err}");
     }
 
+    /// #1679 と #1680 の合流: `tako_lsp` は 1 本で、action の先頭が既定の diagnostics、
+    /// 残りは定義ジャンプの綴りの正本（`GotoKind::NAMES`）そのもの。種類を足したのに
+    /// action の表へ載せ忘れる・振り分けが受けない、のどちらもここで落ちる
+    #[test]
+    fn tako_lsp_の_action_は診断と定義ジャンプの全種を振り分ける() {
+        let actions = crate::dispatch::LSP_FEATURE_ACTIONS;
+        assert_eq!(actions[0], "diagnostics");
+        assert_eq!(&actions[1..], &tako_core::lsp::goto::GotoKind::NAMES[..]);
+        for action in &actions[1..] {
+            assert_eq!(
+                build_request(
+                    "tako_lsp",
+                    &json!({"action": action, "line": 3, "column": 4}),
+                    Some(9),
+                    None
+                )
+                .unwrap(),
+                Request::LspGoto {
+                    action: action.to_string(),
+                    pane: Some(9),
+                    line: 3,
+                    column: 4,
+                    open: None,
+                    choice: None,
+                    focus: None,
+                },
+                "{action}"
+            );
+        }
+        // 定義ジャンプは位置が要る（診断の既定へ黙って倒れない）
+        assert!(build_request("tako_lsp", &json!({"action": "definition"}), Some(9), None).is_err());
+    }
+
     #[test]
     fn 全公開ツールにrequest変換またはspecial_handlerがある() {
         for tool in tools() {

@@ -845,7 +845,7 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         severity: Option<String>,
     },
-    /// 定義ジャンプ（FR-3.30 / #1680。`tako lsp definition` 等 / MCP `tako_lsp` の
+    /// 定義ジャンプ（FR-3.31 / #1680。`tako lsp definition` 等 / MCP `tako_lsp` の
     /// action=definition|declaration|type-definition|implementation）。GUI の ⌘クリックと同じ 1 本。
     ///
     /// 位置は `tako edit replace-range` と同じ（`line` は 1 始まり・`column` は 0 始まりの
