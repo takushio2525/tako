@@ -97,6 +97,7 @@ export default defineConfig({
 						{ label: 'クイックスタート', slug: 'getting-started/quickstart' },
 						{ label: 'リリースノート', slug: 'releases' },
 						{ label: 'Windows 対応状況', slug: 'windows-support' },
+						{ label: 'プライバシーとデータの送信', slug: 'privacy' },
 					],
 				},
 				{
