@@ -641,8 +641,8 @@ fn 逆戻りを名指しできる() {
     // (4) CLI / MCP の語彙から `tasks` が抜ける（GUI にしか無いビューになる）
     let mut s = Sources::load(&root);
     s.protocol = s.protocol.replace(
-        "[\"fleet\", \"orch\", \"git\", \"tasks\"]",
-        "[\"fleet\", \"orch\", \"git\"]",
+        "[\"fleet\", \"orch\", \"git\", \"tasks\", \"diagnostics\"]",
+        "[\"fleet\", \"orch\", \"git\", \"diagnostics\"]",
     );
     expect_hit(&s, PROTOCOL, "`PanelViewWire::VALUES` に `tasks` が無い");
 

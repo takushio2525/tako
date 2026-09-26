@@ -20,6 +20,11 @@
 //! | `chatty` | initialized の後に通知を大量に投げる |
 //! | `ask` | initialized の後に `workspace/configuration` を問い合わせる |
 //! | `die` | 起動直後に即死する（initialize を読まない） |
+//!
+//! `--diagnostics <file>` か `TAKO_LSP_FAKE_DIAGNOSTICS`（LSP の `Diagnostic` の JSON 配列）を
+//! 渡すと、didOpen と didChange のたびに**その配列をそのまま** publish する（#1679。
+//! 固定の配列と tako 側の応答を突き合わせるため。didChange の回は文書の版も付ける）。
+//! 渡さなければ didOpen で 1 件だけ publish する（#1678 の既定）。
 
 use std::io::{BufRead, BufReader, Write};
 
@@ -101,6 +106,10 @@ fn main() {
         .unwrap_or_else(|| "normal".into());
     let log = arg_or_env(&args, "--log", "TAKO_LSP_FAKE_LOG");
     let spawns = arg_or_env(&args, "--spawns", "TAKO_LSP_FAKE_SPAWNS");
+    let fixed: Option<serde_json::Value> =
+        arg_or_env(&args, "--diagnostics", "TAKO_LSP_FAKE_DIAGNOSTICS")
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| serde_json::from_str(&text).ok());
     append(&spawns, &std::process::id().to_string());
     eprintln!("tako-lsp-fake: scenario={scenario}");
     if scenario == "die" {
@@ -155,6 +164,18 @@ fn main() {
                 })),
                 _ => {}
             },
+            ("textDocument/didOpen" | "textDocument/didChange", None) if fixed.is_some() => {
+                let document = &message["params"]["textDocument"];
+                out.send(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/publishDiagnostics",
+                    "params": {
+                        "uri": document["uri"].clone(),
+                        "version": document["version"].clone(),
+                        "diagnostics": fixed.clone(),
+                    },
+                }));
+            }
             ("textDocument/didOpen", None) => {
                 let uri = message["params"]["textDocument"]["uri"].clone();
                 out.send(serde_json::json!({

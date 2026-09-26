@@ -402,6 +402,10 @@ pub struct EditState {
     /// 言語サーバとのつながり（#1678）。セッションと寿命が同じなので、ペインを閉じる・
     /// ファイルを差し替える・編集モードを抜けると `didClose` が走る（落ちた時点で閉じる）
     pub lsp: tako_control::lsp::DocLink,
+    /// 言語サーバの診断（#1679）。本体は manager の表で、これは `Arc` の写し
+    /// （知らせを受けたときだけ差し替える = 描画のたびにロックを取らない）。
+    /// つながりが外れたら捨てる。セッションと寿命が同じなので、ペインを閉じれば一緒に消える
+    pub diagnostics: Option<tako_control::lsp::DocDiagnostics>,
 }
 
 /// 検索バー内のフォーカス先
@@ -447,6 +451,7 @@ impl EditState {
             replace_cursor: 0,
             highlight: HighlightCache::default(),
             lsp: tako_control::lsp::DocLink::default(),
+            diagnostics: None,
         })
     }
 
