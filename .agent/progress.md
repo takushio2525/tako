@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-23（#1645: rebase で復活した作業ログのエントリを番犬で止めた）
-- `context-budget fix` の移送（古いエントリを**消す**）と main 側の移送が rebase で噛み合っても git は衝突を報告せず auto-merge するので、archive 済みのエントリが `progress.md` へ黙って戻る（9/23 だけで 4 回・毎回 worker の目視で発見。予算を超えなければ既存の番犬では落ちない）。判定を `tako_core::context_budget::revivals` の 1 実装として足し、`tako context-budget` / MCP の violations と新設の番犬が同じものを通る
-- 鍵は `LogEntry::archive_line()` = `fix` がアーカイブへ書くのと同じ 1 行。(日付, Issue 番号) の組は**実データで誤検出する**（アーカイブに `2026-09-14 #1450` が 3 件・`2026-07-05 #63` が 2 件）ので採らなかった
-- 実測: 注入 3 通り（復活 / 重複 / 見出しの書式を壊す空振り検査）すべて file:line 名指しで FAILED → 戻して緑。**この PR 自身の rebase でも 2 件の復活を file:line で捕らえた**
-
 ## 2026-09-26（#1709: 配布物へライセンス本文と第三者の著作権表示を同梱した）
 - 法務監査（tako-legal）の即時修正分。`cargo about` で配布対象 547 クレートの本文・著作権表示を `THIRD-PARTY-LICENSES.md` へ生成（`about.toml` / `about.hbs`）、NOTICES に Zed のファイルアイコン（GPL + Lucide の ISC）と PWA の preact / marked / DOMPurify / Geist を追記、`build-app.sh` が 3 ファイルを `.app` の Resources へ署名前に置く
 - `cargo deny check licenses` 0 errors・docs build / og:verify / verify-links 緑・telemetry.md の食い違い 3 点を訂正。`.app` の実ビルドはマシン負荷のため未実施（同梱は script を読んで判定）。Windows の同梱とアプリ内表示は提案止まり
@@ -69,3 +64,7 @@
 - PC のカードには「実行済み」の状態が無かったので、tako-core のカードへコマンドごとの実行記録（実行ペイン / running・exited・closed / 回数）と「実行中の同じコマンドは再実行しない」を足し、`list` の `runs` で返す。PC のカードは同じ記録を出し、確定は `dispatch::refresh_command_card_runs` の 1 本
 - remote は宣言表 `remote_cards::CARD_ROUTES` の 2 本だけ（一覧 = Observe / 実行 = Interact・本文は受け取らない）で `ShowCommand` の list / run を素通し。PWA はペイン画面にカード + 全文の確認 1 回、observe には #1452 の権限リクエスト
 - 実測: 実経路 `scripts/test-remote-command-card-1724.sh` 55 PASS 0 FAIL・e2e 新 spec 8 本（全体 109 passed）・番犬の注入 4 通りが file:line 名指しで FAILED → 戻して緑
+
+## 2026-09-26（#1656: Code Runner がプロジェクトを見て cargo run / npm run / python -m 等で走るようにした）
+- 解決器がファイル 1 枚しか見ず、cargo プロジェクトの `.rs` を `rustc` 単体で走らせて必ず失敗していた。上へ辿る範囲の 1 実装 `tako_core::project_root`（HOME の段は見ない / `.git` で止まる / 深さ 32。`detect` は #1726 の実行設定のキー・LSP #1678 と共有）と種別の表 `runner_project::KINDS`（cargo / go / npm / python / dotnet / make = 行追加で増える）を新設し、入口を `runner::resolve_file` の 1 本へ。優先は上書き → 宣言 → ユーザーの拡張子既定 → プロジェクト既定 → 組み込み。Issue の例（bin の無い lib crate）は `cargo run` が必ず落ちるので `cargo test -p <pkg> --lib <mod>::`
+- 実測: `scripts/test-runner-project-1656.sh` **26 PASS 0 FAIL**（隔離 GUI で CLI `--dry-run` と MCP `tako_run_resolve` が字面一致・実際に `cargo run` が exit 0・HOME 直下の置き忘れを拾わない・`TAKO_1656_LEGACY=1` で `rustc` 単体へ戻る）・注入 6 通りすべて file:line 名指しで FAILED → 戻して緑・workspace 5465 passed 0 failed・clippy 3 宇宙 0
