@@ -1,9 +1,9 @@
 ---
 title: MCP ツール一覧
-description: tako が AI エージェントに公開する 157 個の MCP ツールの全リスト
+description: tako が AI エージェントに公開する 158 個の MCP ツールの全リスト
 ---
 
-tako は **157 個の MCP ツール**を AI エージェント（Claude Code / Codex 等）に公開しています。ほぼすべてが `tako` CLI のコマンドと 1:1 で対応しているため、細かい引数や挙動は [CLI リファレンス](/guides/cli-reference/)の対応コマンドも合わせて参照してください。
+tako は **158 個の MCP ツール**を AI エージェント（Claude Code / Codex 等）に公開しています。ほぼすべてが `tako` CLI のコマンドと 1:1 で対応しているため、細かい引数や挙動は [CLI リファレンス](/guides/cli-reference/)の対応コマンドも合わせて参照してください。
 
 :::tip[登録は一度きり]
 MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度行えば、以降はどのプロジェクトでも自動的に使えます。codex を master にする場合は `tako master` の起動時にだけ設定が注入されるため、グローバル設定の変更すら不要です。
@@ -54,6 +54,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | ツール名 | 説明 |
 |---|---|
 | `tako_open_file` | ファイルをプレビューペインで開く（コード / Markdown / 画像 / PDF / 動画） |
+| `tako_jump` | 行を指定して開いた位置を戻る・進む・一覧する（ジャンプ履歴） |
 | `tako_file_op` | ファイル操作（パスコピー / Finder 表示 / cd / リネーム / 作成 / ゴミ箱 / 既定アプリで開く） |
 | `tako_tree_folder` | ファイルツリーへフォルダを追加・削除・一覧する / git ステータスを取得する（`action: "git-status"`） |
 | `tako_preview_view` | PDF・画像のズーム / ページ / パン操作 |

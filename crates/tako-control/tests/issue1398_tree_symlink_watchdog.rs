@@ -190,12 +190,15 @@ fn scan_filetree(src: &str) -> Vec<Offender> {
 /// 開く側（`dispatch.rs` の `Request::OpenFile`）の検査。
 ///
 /// #1398 は**ツリー側を開く側へ揃えた**修正なので、開く側が「辿らない」形へ
-/// 動いたら同じバグが逆向きに再発する
+/// 動いたら同じバグが逆向きに再発する。
+///
+/// #1677 で `OpenFile` の本体は `fn open_file(` へ移った（戻る / 進むも同じ実装を通す）。
+/// アームがそこへ委ねていることと、**本体の中に**辿る種別検査があることの両方を見る
 fn scan_dispatch(src: &str) -> Vec<Offender> {
     let mut out = Vec::new();
     let lines: Vec<&str> = src.lines().collect();
     // dispatch の match アーム（字下げ 8 桁）だけを見る（テスト内の呼び出しは字下げが深い）
-    let Some(start) = lines
+    let Some(arm) = lines
         .iter()
         .position(|l| *l == "        Request::OpenFile {")
     else {
@@ -205,18 +208,36 @@ fn scan_dispatch(src: &str) -> Vec<Offender> {
             why: "`Request::OpenFile` のアームが見つからない（走査が空振り）".into(),
         }];
     };
-    let end = (start + 80).min(lines.len());
-    let window = lines[start..end].join("\n");
+    // アームは分解の数行のあとで本体へ委ねる（`} => open_file(`）
+    let arm_end = (arm + 12).min(lines.len());
+    if !lines[arm..arm_end]
+        .iter()
+        .any(|l| l.trim_start().starts_with("} => open_file("))
+    {
+        out.push(Offender {
+            file: DISPATCH,
+            line: arm + 1,
+            why: "`Request::OpenFile` のアームが本体（`open_file`）へ委ねていない".into(),
+        });
+        return out;
+    }
+    let Some((start, window)) = fn_window(src, "fn open_file(") else {
+        return vec![Offender {
+            file: DISPATCH,
+            line: 0,
+            why: "`fn open_file(` が見つからない（走査が空振り）".into(),
+        }];
+    };
     if let Some(i) = window.lines().position(|l| l.contains("symlink_metadata(")) {
         out.push(Offender {
             file: DISPATCH,
-            line: start + 1 + i,
+            line: start + i,
             why: "開く側がリンクを辿らない形へ変わっている（`symlink_metadata`）".into(),
         });
     } else if !window.contains(".is_file()") {
         out.push(Offender {
             file: DISPATCH,
-            line: start + 1,
+            line: start,
             why: "開く側の種別検査（`Path::is_file()` = 辿る）が無い".into(),
         });
     }
@@ -266,6 +287,12 @@ fn 走査が空振りしていない() {
     assert!(
         dispatch.lines().any(|l| l == "        Request::OpenFile {"),
         "`Request::OpenFile` のアームの形が変わっている（走査が空振り）"
+    );
+    // #1677: 本体の窓も 2 行以下で切れていない（字下げ 0 桁の `}` まで採れている）
+    let (_, body) = fn_window(&dispatch, "fn open_file(").expect("`fn open_file(` の窓が採れる");
+    assert!(
+        body.contains(".is_file()") && body.lines().count() > 20,
+        "`fn open_file(` の窓が本体を覆っていない（走査が空振り）"
     );
 }
 
@@ -329,16 +356,38 @@ fn 逆戻りを名指しできる() {
         "打ち切りの理由を落としても緑のまま"
     );
 
-    // 注入 5: 開く側を「辿らない」形へ動かす
-    let shallow_open = dispatch.replace(
-        "            if !resolved.is_file() {",
-        "            if !std::fs::symlink_metadata(&resolved).is_ok_and(|m| m.is_file()) {",
-        // 1 件目（OpenFile のアーム）だけが窓に入る
+    // 注入 5: 開く側（`fn open_file(` の本体。字下げ 4 桁は本体の 1 件だけ）を
+    // 「辿らない」形へ動かす
+    let shallow_open = dispatch.replacen(
+        "\n    if !resolved.is_file() {",
+        "\n    if !std::fs::symlink_metadata(&resolved).is_ok_and(|m| m.is_file()) {",
+        1,
     );
     assert!(shallow_open != dispatch, "注入 5 の対象が見つからない");
     let found = all(&filetree, &shallow_open);
+    let expected = shallow_open
+        .lines()
+        .position(|l| l.contains("if !std::fs::symlink_metadata(&resolved)"))
+        .expect("注入した行がある")
+        + 1;
     assert!(
-        found.iter().any(|o| o.contains(DISPATCH)),
-        "開く側の逆戻りを名指しできていない: {found:?}"
+        found
+            .iter()
+            .any(|o| o.contains(&format!("{DISPATCH}:{expected}"))),
+        "開く側の逆戻りを行まで名指しできていない: {found:?}"
+    );
+
+    // 注入 6（#1677）: アームが本体へ委ねなくなったら名指しする
+    let detached = dispatch.replacen(
+        "        } => open_file(",
+        "        } => open_file_elsewhere(",
+        1,
+    );
+    assert!(detached != dispatch, "注入 6 の対象が見つからない");
+    assert!(
+        all(&filetree, &detached)
+            .iter()
+            .any(|o| o.contains("本体（`open_file`）へ委ねていない")),
+        "アームが本体へ委ねなくなっても緑のまま"
     );
 }
