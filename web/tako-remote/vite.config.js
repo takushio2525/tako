@@ -1,19 +1,7 @@
 import { defineConfig } from 'vite';
 import preact from '@preact/preset-vite';
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-
-// PWA は daemon（Rust バイナリ）に埋め込まれて配信されるため、バージョンの正は
-// Cargo workspace version（#283: /api/me の version と突き合わせて SW キャッシュの
-// 古いシェルを検出する）。package.json ではなくルート Cargo.toml から読む
-function workspaceVersion() {
-  const cargoToml = readFileSync(
-    fileURLToPath(new URL('../../Cargo.toml', import.meta.url)),
-    'utf-8'
-  );
-  const m = cargoToml.match(/^version\s*=\s*"([^"]+)"/m);
-  return m ? m[1] : 'dev';
-}
+// 版の正はルート Cargo.toml。読み方は e2e のモックと 1 実装（#283 / #1749）
+import { workspaceVersion } from './workspace-version.js';
 
 export default defineConfig({
   plugins: [preact()],

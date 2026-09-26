@@ -16,15 +16,15 @@
 // 実行:
 //   cd web/tako-remote && npx playwright test e2e/launch-menu-1449.spec.js
 import { test, expect } from '@playwright/test';
+import { evidencePath, TAKO_VERSION } from './support.js';
 
 const IPHONE_VIEWPORT = { width: 390, height: 844 };
 const BASE = `http://localhost:${process.env.TAKO_PWA_PORT || 5174}`;
-const EVIDENCE_DIR = process.env.TAKO_EVIDENCE_DIR || `${process.env.HOME}/dev/tako-evidence/1449`;
 
 function me(role = 'manage') {
   return {
     registered: true, device_id: 'test-iphone', name: 'iPhone', role,
-    login: 'user@example.com', host: 'test-mac', version: '0.8.12', app_connected: true,
+    login: 'user@example.com', host: 'test-mac', version: TAKO_VERSION, app_connected: true,
   };
 }
 
@@ -141,7 +141,7 @@ async function setupMocks(page, opts = {}) {
     json(route, { session_id: 'x', messages: [] })
   );
   await page.route('**/api/agents', route => json(route, { agents: [] }));
-  await page.route('**/api/health', route => json(route, { status: 'ok', version: '0.8.12' }));
+  await page.route('**/api/health', route => json(route, { status: 'ok', version: TAKO_VERSION }));
   await page.route('**/ws?*', route => route.abort());
   await page.route('**/manifest.json', route => json(route, { name: 'tako remote' }));
   await page.route('**/sw.js', route =>
@@ -170,7 +170,7 @@ test.describe('#1449 「+」から 3 種を起動する — モバイル', () =>
     await expect(page.locator('.launch-kind')).toHaveCount(3);
     // 入口のラベルも master 固定ではなくなっている
     await expect(page.locator('.launch-btn')).toContainText('新規');
-    await page.screenshot({ path: `${EVIDENCE_DIR}/01-menu.png` });
+    await page.screenshot({ path: evidencePath('01-menu.png') });
   });
 
   test('02. ターミナル: POST /api/tabs だけでタブが立ち、そのペインへ移る', async ({ page }) => {
@@ -186,7 +186,7 @@ test.describe('#1449 「+」から 3 種を起動する — モバイル', () =>
     // 立ったのは素のシェルなので term ビュー（入力バー + SSH の入口）が出る
     await expect(page.locator('.term-input-field')).toBeVisible({ timeout: 10000 });
     await expect(page.locator('[data-testid="ssh-open-btn"]')).toBeVisible();
-    await page.screenshot({ path: `${EVIDENCE_DIR}/02-terminal.png` });
+    await page.screenshot({ path: evidencePath('02-terminal.png') });
   });
 
   test('03. SSH: ホスト一覧から選ぶと target=tab で開き、接続状態が読める', async ({ page }) => {
@@ -198,7 +198,7 @@ test.describe('#1449 「+」から 3 種を起動する — モバイル', () =>
     await expect(page.locator('[data-testid="ssh-host-build-box"]')).toBeVisible();
     await expect(page.locator('[data-testid="ssh-host-build-box"]')).toContainText('build-box.example.test');
     await expect(page.locator('[data-testid="ssh-host-win"]')).toBeVisible();
-    await page.screenshot({ path: `${EVIDENCE_DIR}/03-ssh-hosts.png` });
+    await page.screenshot({ path: evidencePath('03-ssh-hosts.png') });
 
     await page.locator('[data-testid="ssh-host-build-box"]').click();
     await expect.poll(() => calls.ssh.length).toBe(1);
@@ -213,7 +213,7 @@ test.describe('#1449 「+」から 3 種を起動する — モバイル', () =>
     await expect(bar).toBeVisible({ timeout: 10000 });
     await expect(bar).toContainText('接続中');
     await expect(bar).toContainText('build-box');
-    await page.screenshot({ path: `${EVIDENCE_DIR}/03-ssh-connecting.png` });
+    await page.screenshot({ path: evidencePath('03-ssh-connecting.png') });
   });
 
   test('04. master: #1078 の経路（tabs → tabs/:id/master）がそのまま生きている', async ({ page }) => {
@@ -226,7 +226,7 @@ test.describe('#1449 「+」から 3 種を起動する — モバイル', () =>
     expect(calls.tabs).toEqual([{ cwd: '/Users/dev/tako' }]);
     expect(calls.master[0].url).toContain('/api/tabs/12/master');
     expect(calls.master[0].body).toEqual({ profile: 'dev' });
-    await page.screenshot({ path: `${EVIDENCE_DIR}/04-master.png` });
+    await page.screenshot({ path: evidencePath('04-master.png') });
   });
 
   test('05. observe role では 3 択そのものが出ない', async ({ page }) => {
@@ -239,7 +239,7 @@ test.describe('#1449 「+」から 3 種を起動する — モバイル', () =>
     // 見せないだけでなく、押せる経路も無い（一覧すら引かない）
     expect(calls.hosts).toBe(0);
     expect(calls.tabs).toHaveLength(0);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/05-observe.png` });
+    await page.screenshot({ path: evidencePath('05-observe.png') });
   });
 
   test('06. サーバーが 403 を返したら理由を出す（黙って閉じない）', async ({ page }) => {
@@ -255,7 +255,7 @@ test.describe('#1449 「+」から 3 種を起動する — モバイル', () =>
     await page.locator('[data-testid="launch-kind-ssh"]').click();
     await page.locator('[data-testid="ssh-host-build-box"]').click();
     await expect(page.locator('[data-testid="ssh-sheet-error"]')).toContainText('Manage 以上');
-    await page.screenshot({ path: `${EVIDENCE_DIR}/06-forbidden.png` });
+    await page.screenshot({ path: evidencePath('06-forbidden.png') });
   });
 
   test('07-edge. ホスト一覧が空でも理由が読める', async ({ page }) => {
@@ -263,7 +263,7 @@ test.describe('#1449 「+」から 3 種を起動する — モバイル', () =>
     await openMenu(page);
     await page.locator('[data-testid="launch-kind-ssh"]').click();
     await expect(page.locator('[data-testid="ssh-hosts-empty"]')).toContainText('~/.ssh/config');
-    await page.screenshot({ path: `${EVIDENCE_DIR}/07-hosts-empty.png` });
+    await page.screenshot({ path: evidencePath('07-hosts-empty.png') });
   });
 
   test('08-edge. ホスト一覧が 403 でも黙って空にしない', async ({ page }) => {
@@ -293,7 +293,7 @@ test.describe('#1449 「+」から 3 種を起動する — モバイル', () =>
     // 一覧を何度ポーリングしてもペインは残る（#919 / #1040 の契約）
     await page.waitForTimeout(2500);
     await expect(bar).toBeVisible();
-    await page.screenshot({ path: `${EVIDENCE_DIR}/09-ssh-failed.png` });
+    await page.screenshot({ path: evidencePath('09-ssh-failed.png') });
   });
 
   test('10-edge. ターミナルを連打しても 1 枚しか立たない', async ({ page }) => {
@@ -317,6 +317,6 @@ test.describe('#1449 「+」から 3 種を起動する — モバイル', () =>
     await expect(page.locator('.launch-btn')).toContainText('master');
     // 開いた時点で #1078 のプロファイル一覧（= 旧挙動そのもの）
     await expect(page.locator('.launch-profile', { hasText: 'dev' })).toBeVisible();
-    await page.screenshot({ path: `${EVIDENCE_DIR}/11-legacy.png` });
+    await page.screenshot({ path: evidencePath('11-legacy.png') });
   });
 });

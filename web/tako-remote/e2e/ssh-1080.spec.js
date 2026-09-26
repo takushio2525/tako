@@ -11,8 +11,8 @@
 // 実行:
 //   cd web/tako-remote && npx playwright test e2e/ssh-1080.spec.js
 import { test, expect } from '@playwright/test';
+import { evidencePath, TAKO_VERSION } from './support.js';
 
-const EVIDENCE_DIR = process.env.TAKO_EVIDENCE_DIR || `${process.env.HOME}/dev/tako-evidence/1080`;
 const PREFIX = process.env.TAKO_SHOT_PREFIX || 'after';
 const IPHONE_VIEWPORT = { width: 390, height: 844 };
 const BASE = `http://localhost:${process.env.TAKO_PWA_PORT || 5174}`;
@@ -24,7 +24,7 @@ const FAKE_ME = {
   role: 'manage',
   login: 'user@example.com',
   host: 'test-mac',
-  version: '0.8.4',
+  version: TAKO_VERSION,
   app_connected: true,
 };
 
@@ -83,7 +83,7 @@ async function setupMocks(page, opts = {}) {
     json(route, { lines: ['$ '], cursor: { x: 2, y: 0 }, size: { cols: 120, rows: 40 } })
   );
   await page.route('**/api/agents', route => json(route, { agents: [] }));
-  await page.route('**/api/health', route => json(route, { status: 'ok', version: '0.8.4' }));
+  await page.route('**/api/health', route => json(route, { status: 'ok', version: TAKO_VERSION }));
   await page.route('**/ws?*', route => route.abort());
   await page.route('**/manifest.json', route => json(route, { name: 'tako remote' }));
   await page.route('**/sw.js', route =>
@@ -132,7 +132,7 @@ test('① ホストを選ぶと接続が始まり、新しいペインへ移る�
   await mockOpen(page, state, { pane: 11, target: 'split', after });
 
   await openSshSheet(page);
-  await page.screenshot({ path: `${EVIDENCE_DIR}/${PREFIX}-01-sheet.png` });
+  await page.screenshot({ path: evidencePath(`${PREFIX}-01-sheet.png`) });
   await page.click('[data-testid="ssh-target-split"]');
   await page.click('[data-testid="ssh-host-build-box"]');
 
@@ -146,7 +146,7 @@ test('① ホストを選ぶと接続が始まり、新しいペインへ移る�
   await page.waitForSelector('[data-testid="ssh-connect-bar"]', { timeout: 10000 });
   await expect(page.locator('[data-testid="ssh-connect-bar"]')).toContainText('接続中');
   await expect(page.locator('[data-testid="ssh-connect-bar"]')).toContainText('build-box');
-  await page.screenshot({ path: `${EVIDENCE_DIR}/${PREFIX}-02-connecting.png` });
+  await page.screenshot({ path: evidencePath(`${PREFIX}-02-connecting.png`) });
 });
 
 test('① このペインを SSH にする（target=pane）とペインは増えず移動もしない', async ({ page }) => {
@@ -189,7 +189,7 @@ test('② 到達不能ホストは理由が出てペインが消えない', asyn
   await expect(bar).toBeVisible({ timeout: 10000 });
   await expect(bar).toContainText('接続できません');
   await expect(bar).toContainText('Operation timed out');
-  await page.screenshot({ path: `${EVIDENCE_DIR}/${PREFIX}-03-failed.png` });
+  await page.screenshot({ path: evidencePath(`${PREFIX}-03-failed.png`) });
 
   // ペインは残り続ける。一覧を何度ポーリングしても消えないし、理由も消えない
   await page.waitForTimeout(6000);
@@ -215,7 +215,7 @@ test('② 再接続中は試行回数と次の再試行までの秒数が出る�
   await expect(bar).toContainText('2/6 回目');
   await expect(bar).toContainText('5 秒後に再試行');
   await expect(bar).toContainText('ssh build-box を手で実行');
-  await page.screenshot({ path: `${EVIDENCE_DIR}/${PREFIX}-04-reconnecting.png` });
+  await page.screenshot({ path: evidencePath(`${PREFIX}-04-reconnecting.png`) });
 });
 
 test('③ can_ssh が false のペインは「このペイン」が選択肢に出ない', async ({ page }) => {
@@ -233,7 +233,7 @@ test('③ can_ssh が false のペインは「このペイン」が選択肢に�
   // 出さないだけでなく、理由は読める（スマホには右クリックのような別入口が無い）
   await expect(page.locator('[data-testid="ssh-pane-blocked"]')).toContainText('AI エージェントのペイン');
   await expect(page.locator('[data-testid="ssh-pane-blocked"]')).toContainText('target=split');
-  await page.screenshot({ path: `${EVIDENCE_DIR}/${PREFIX}-05-blocked.png` });
+  await page.screenshot({ path: evidencePath(`${PREFIX}-05-blocked.png`) });
   // 既定は「新しいペイン」に倒れている（押せない選択肢が選ばれた状態にしない）
   await expect(page.locator('[data-testid="ssh-target-split"]')).toHaveClass(/sheet-effort-active/);
 });
@@ -242,5 +242,5 @@ test('権限やホスト一覧の失敗は理由が読める（黙って空に�
   await setupMocks(page, { hostsStatus: 403 });
   await openSshSheet(page);
   await expect(page.locator('[data-testid="ssh-sheet-error"]')).toContainText('manage 権限');
-  await page.screenshot({ path: `${EVIDENCE_DIR}/${PREFIX}-06-forbidden.png` });
+  await page.screenshot({ path: evidencePath(`${PREFIX}-06-forbidden.png`) });
 });

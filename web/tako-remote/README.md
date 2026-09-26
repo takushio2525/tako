@@ -33,7 +33,8 @@ npm run e2e:install   # 初回だけ（chromium を取得）
 npm run e2e
 ```
 
-`e2e/` の 6 spec（50 項目）が走る。API はすべて `page.route` でモックするので、
+`e2e/` の spec がすべて走る（件数は spec を足すたびに増えるので書かない。末尾の
+`N passed` が正）。API はすべて `page.route` でモックするので、
 **tako 本体も claude も実機のエージェントも要らない**（dev サーバーだけで完結する）。
 `playwright.config.js` が `headless: true` 固定なので**画面に窓は出ない**。
 dev サーバーは Playwright が自分で起こして終了時に落とす。
@@ -73,23 +74,47 @@ Playwright 自身が起こす場合は `--strictPort` 付きなので、**黙っ
 browserType.launch: Executable doesn't exist at .../chromium_headless_shell-<番号>/...
 ```
 
-`npm run e2e:install` で復旧する（実測: 空キャッシュから 14 秒 → 50 項目 PASS）。
+`npm run e2e:install` で復旧する（#1357 時点の実測: 空キャッシュから 14 秒 → 50 項目 PASS）。
 Playwright を上げたときも同じコマンドで追従する。
 
 ### スクリーンショットの出力先
 
-spec はカンプ比較用に PNG を撮る（PASS / FAIL には影響しない）。
+spec はカンプ比較用に PNG を撮る（PASS / FAIL には影響しない）。置き場は
+`e2e/support.js` の `evidencePath('<名前>.png')` の 1 実装で決まり、**既定は Playwright の
+outputDir**（`test-results/<テストごとの dir>/`。`.gitignore` 対象で、run の開始時に
+Playwright が消す）。失敗時のトレース・エラー文脈も同じ dir に残る。
 
-- `panes-621` / `remote-link-1077` / `master-launch-1078` / `ssh-1080` —
-  `TAKO_EVIDENCE_DIR`（既定 `~/dev/tako-evidence/<Issue 番号>/`）
-- `screenshots` / `screenshots-5b` — `~/Desktop/tako-284-evidence/` /
-  `~/Desktop/tako-285-evidence/` 固定（`TAKO_EVIDENCE_DIR` を見ない）
+リポの外へ残したいときだけ、実行する人が置き場を渡す（spec の側でホームを組み立てない）:
 
-失敗時のトレース・エラー文脈は `test-results/`（`.gitignore` 対象）に残る。
+```
+TAKO_EVIDENCE_DIR=/tmp/pwa-shots npm run e2e -- e2e/panes-621.spec.js
+```
+
+#1749 までは spec ごとに `~/Desktop/tako-28{4,5}-evidence/` や `~/dev/tako-evidence/<番号>/`
+を組み立てていて、`npm run e2e` を回すだけでホームへ PNG が 80 枚書かれていた。
+`crates/tako-control/tests/issue1749_pwa_e2e_output_watchdog.rs` が、spec へホームの
+組み立て（`process.env.HOME` / `homedir()` / `Desktop`）・`evidencePath(` を通らない
+スクショ・版の直書きが戻ると file:line を名指しして落とす。
+
+ホームへ何も書かないことは一時 `HOME` で確かめられる（ブラウザと npm のキャッシュは
+一時 `HOME` の外を向けておく。向けないと chromium が見つからず全項目が落ちる）:
+
+```
+H=$(mktemp -d); B="$HOME/Library/Caches/ms-playwright"   # B は macOS の既定の置き場
+HOME="$H" PLAYWRIGHT_BROWSERS_PATH="$B" npm_config_cache="$(mktemp -d)" npm run e2e
+find "$H" -mindepth 1   # 何も出なければよい
+```
+
+### モックが返す版
+
+PWA は `/api/me` の版とビルドへ埋め込んだ版（`__TAKO_VERSION__`）が違うと「アプリの表示が
+古い可能性があります」のバナーを出す。モックの版は `e2e/support.js` の `TAKO_VERSION` を
+使う（vite と同じ `workspace-version.js` でルートの `Cargo.toml` から読む）ので、版を
+上げてもモックの画面にバナーは写らない。数字を spec へ直書きしない。
 
 ### CI
 
 `.github/workflows/ci.yml` の macOS ジョブ末尾で `npm run e2e:install` →
 `npm run e2e` が **blocking** で走る（#1357）。PWA の実装契約が変わって spec が
-取り残されたら、そこで落ちる。追加の所要は実測 46〜87 秒（`50 passed` が 33 秒〜1.2 分。
+取り残されたら、そこで落ちる。追加の所要は #1357 時点の実測で 46〜87 秒（`50 passed` が 33 秒〜1.2 分。
 Playwright の既定 worker 数がランナーの CPU 数に従うので run ごとに幅が出る）。

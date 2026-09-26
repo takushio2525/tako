@@ -18,16 +18,16 @@
 // 実行:
 //   cd web/tako-remote && npx playwright test e2e/permission-request-1452.spec.js
 import { test, expect } from '@playwright/test';
+import { evidencePath, TAKO_VERSION } from './support.js';
 
 const IPHONE_VIEWPORT = { width: 390, height: 844 };
 const BASE = `http://localhost:${process.env.TAKO_PWA_PORT || 5174}`;
-const EVIDENCE_DIR = process.env.TAKO_EVIDENCE_DIR || `${process.env.HOME}/dev/tako-evidence/1452`;
 
 // 実端末名・実ホスト名は書かない（#927）
 function me(over = {}) {
   return {
     registered: true, device_id: 'nPHONEA', name: 'phone-a', role: 'observe',
-    login: 'tester@example.com', host: 'test-mac', version: '0.8.12', app_connected: true,
+    login: 'tester@example.com', host: 'test-mac', version: TAKO_VERSION, app_connected: true,
     pending: false, denied: false,
     ...over,
   };
@@ -83,7 +83,7 @@ async function setupMocks(page, opts = {}) {
   }
   await page.route('**/api/v2/panes', route => json(route, { api_version: 2, panes: [] }));
   await page.route('**/api/agents', route => json(route, { agents: [] }));
-  await page.route('**/api/health', route => json(route, { status: 'ok', version: '0.8.12' }));
+  await page.route('**/api/health', route => json(route, { status: 'ok', version: TAKO_VERSION }));
   await page.route('**/ws?*', route => route.abort());
   await page.route('**/manifest.json', route => json(route, { name: 'tako remote' }));
   await page.route('**/sw.js', route =>
@@ -112,7 +112,7 @@ test.describe('#1452 権限の更新をリクエストする — モバイル', 
     await expect(page.locator('[data-testid="permission-role-admin"]')).toBeVisible();
     await expect(page.locator('[data-testid="permission-role-observe"]')).toHaveCount(0);
     await expect(page.locator('[data-testid="permission-send"]')).toBeVisible();
-    await page.screenshot({ path: `${EVIDENCE_DIR}/01-request.png` });
+    await page.screenshot({ path: evidencePath('01-request.png') });
   });
 
   test('02. 押すと POST /api/pair だけが飛ぶ（要求 role・理由・端末名つき）', async ({ page }) => {
@@ -131,7 +131,7 @@ test.describe('#1452 権限の更新をリクエストする — モバイル', 
     expect(typeof calls.pair[0].name).toBe('string');
     // 管理 API・端末管理 API には一切触らない
     expect(calls.other).toEqual([]);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/02-pending.png` });
+    await page.screenshot({ path: evidencePath('02-pending.png') });
   });
 
   test('03. 承認待ちの間だけ /api/me を見に行く', async ({ page }) => {
@@ -170,7 +170,7 @@ test.describe('#1452 権限の更新をリクエストする — モバイル', 
     const settled = calls.me;
     await page.waitForTimeout(5000);
     expect(calls.me - settled).toBeLessThanOrEqual(1);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/04-granted.png` });
+    await page.screenshot({ path: evidencePath('04-granted.png') });
   });
 
   test('05. 拒否されたら理由が出て、もう一度要求できる（ポーリングは止まる）', async ({ page }) => {
@@ -194,7 +194,7 @@ test.describe('#1452 権限の更新をリクエストする — モバイル', 
     // もう一度要求できる（行き止まりにしない）
     await denied.locator('button').click();
     await expect(page.locator('[data-testid="permission-request"]')).toBeVisible();
-    await page.screenshot({ path: `${EVIDENCE_DIR}/05-denied.png` });
+    await page.screenshot({ path: evidencePath('05-denied.png') });
   });
 
   test('06. 画面を離れるとポーリングは止まる', async ({ page }) => {
@@ -263,6 +263,6 @@ test.describe('#1452 権限の更新をリクエストする — モバイル', 
     await expect(page.locator('[data-testid="permission-send"]')).toHaveCount(0);
     await expect(page.locator('[data-testid="permission-request"]')).toHaveCount(0);
     expect(calls.pair).toEqual([]);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/10-legacy.png` });
+    await page.screenshot({ path: evidencePath('10-legacy.png') });
   });
 });

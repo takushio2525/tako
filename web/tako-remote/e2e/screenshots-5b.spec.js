@@ -2,8 +2,8 @@
 // カンプ 1b（承認カード）/ 1c（選択肢ボタン）/ 1e（スラコマ候補）/
 // 1f（モデルシート）/ 1g（添付シート）を iPhone viewport で撮影する。
 import { test, expect } from '@playwright/test';
+import { evidencePath, TAKO_VERSION } from './support.js';
 
-const EVIDENCE_DIR = process.env.HOME + '/Desktop/tako-285-evidence';
 const IPHONE_VIEWPORT = { width: 390, height: 844 };
 const BASE = `http://localhost:${process.env.TAKO_PWA_PORT || 5174}`;
 
@@ -14,7 +14,7 @@ const FAKE_ME = {
   role: 'interact',
   login: 'user@example.com',
   host: 'test-mac',
-  version: '0.5.5',
+  version: TAKO_VERSION,
   app_connected: true,
 };
 
@@ -140,7 +140,7 @@ async function setupMocks(page, meData = FAKE_ME) {
     route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(FAKE_PANES) })
   );
   await page.route('**/api/health', route =>
-    route.fulfill({ status: 200, contentType: 'application/json', body: '{"status":"ok","version":"0.5.5"}' })
+    route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ status: 'ok', version: TAKO_VERSION }) })
   );
   await page.route('**/api/agents', route =>
     route.fulfill({ status: 200, contentType: 'application/json', body: '{"agents":[]}' })
@@ -185,7 +185,7 @@ test.describe('弾5b: UI 高度機能スクショ — iPhone viewport', () => {
     // 承認カードが実際に出るまで待つ。固定時間で撮ると #1089 のように
     // 「カードの無い承認カードのスクショ」が無言で撮れ続ける（#796 の作法）
     await page.waitForSelector('.approval-card', { timeout: 10000 });
-    await page.screenshot({ path: `${EVIDENCE_DIR}/1b-approval-card.png`, fullPage: false });
+    await page.screenshot({ path: evidencePath('1b-approval-card.png'), fullPage: false });
     expect(external).toEqual([]);
   });
 
@@ -198,7 +198,7 @@ test.describe('弾5b: UI 高度機能スクショ — iPhone viewport', () => {
     await page.goto(`${BASE}/#/panes/3`);
     await page.waitForSelector('.chat-scroll', { timeout: 10000 });
     await page.waitForTimeout(1000);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/1c-choice-buttons.png`, fullPage: false });
+    await page.screenshot({ path: evidencePath('1c-choice-buttons.png'), fullPage: false });
     expect(external).toEqual([]);
   });
 
@@ -213,7 +213,7 @@ test.describe('弾5b: UI 高度機能スクショ — iPhone viewport', () => {
     await page.waitForTimeout(500);
     await page.fill('.composer-input', '/c');
     await page.waitForTimeout(300);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/1e-slash-commands.png`, fullPage: false });
+    await page.screenshot({ path: evidencePath('1e-slash-commands.png'), fullPage: false });
     expect(external).toEqual([]);
   });
 
@@ -229,7 +229,7 @@ test.describe('弾5b: UI 高度機能スクショ — iPhone viewport', () => {
     await page.click('.composer-chip');
     await page.waitForSelector('.sheet-panel', { timeout: 5000 });
     await page.waitForTimeout(300);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/1f-model-effort-sheet.png`, fullPage: false });
+    await page.screenshot({ path: evidencePath('1f-model-effort-sheet.png'), fullPage: false });
     expect(external).toEqual([]);
   });
 
@@ -245,7 +245,7 @@ test.describe('弾5b: UI 高度機能スクショ — iPhone viewport', () => {
     await page.click('.composer-btn-attach');
     await page.waitForSelector('.attach-sources', { timeout: 5000 });
     await page.waitForTimeout(300);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/1g-attach-sheet.png`, fullPage: false });
+    await page.screenshot({ path: evidencePath('1g-attach-sheet.png'), fullPage: false });
     expect(external).toEqual([]);
   });
 
@@ -295,14 +295,14 @@ test.describe('弾5b: UI 高度機能スクショ — iPhone viewport', () => {
     const buttons = page.locator('.approval-card button');
     await expect(buttons).toHaveCount(FAKE_PERMISSION_DIALOG.options.length);
     await expect(buttons.nth(0)).toHaveText(`1. ${FAKE_PERMISSION_DIALOG.options[0]}`);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/e2e-approval-before.png`, fullPage: false });
+    await page.screenshot({ path: evidencePath('e2e-approval-before.png'), fullPage: false });
 
     // 許可 = 最後以外の選択肢（approval-btn-allow）。3 択なので 1 番目を押す
     await page.locator('.approval-btn-allow').first().click();
 
     // 固定時間ではなくリクエスト到達を待つ（#796）
     await expect.poll(() => respondRequests.length, { timeout: 5000 }).toBeGreaterThan(0);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/e2e-approval-after.png`, fullPage: false });
+    await page.screenshot({ path: evidencePath('e2e-approval-after.png'), fullPage: false });
 
     const last = respondRequests[respondRequests.length - 1];
     expect(last.url).toContain('/api/panes/2/respond');

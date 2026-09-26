@@ -18,6 +18,7 @@
 // 実行:
 //   cd web/tako-remote && npx playwright test e2e/tasks-preview-1472.spec.js
 import { test, expect } from '@playwright/test';
+import { evidencePath, TAKO_VERSION } from './support.js';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -25,7 +26,6 @@ import { dirname, join } from 'node:path';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const IPHONE_VIEWPORT = { width: 390, height: 844 };
 const BASE = `http://localhost:${process.env.TAKO_PWA_PORT || 5174}`;
-const EVIDENCE_DIR = process.env.TAKO_EVIDENCE_DIR || `${process.env.HOME}/dev/tako-evidence/1472b`;
 
 const THUMB_PNG = readFileSync(join(HERE, 'fixtures/thumb.png'));
 const CLIP_WEBM = readFileSync(join(HERE, 'fixtures/clip.webm'));
@@ -37,7 +37,7 @@ const NOW = Math.floor(Date.now() / 1000);
 function me(role = 'manage') {
   return {
     registered: true, device_id: 'test-iphone', name: 'iPhone', role,
-    login: 'user@example.com', host: 'test-mac', version: '0.8.13', app_connected: true,
+    login: 'user@example.com', host: 'test-mac', version: TAKO_VERSION, app_connected: true,
   };
 }
 
@@ -88,7 +88,7 @@ async function setupMocks(page, tasks, opts = {}) {
   await page.route('**/api/me', route => json(route, me(role)));
   await page.route('**/api/v2/panes', route => json(route, { api_version: 2, panes: [] }));
   await page.route('**/api/agents', route => json(route, { agents: [] }));
-  await page.route('**/api/health', route => json(route, { status: 'ok', version: '0.8.13' }));
+  await page.route('**/api/health', route => json(route, { status: 'ok', version: TAKO_VERSION }));
   await page.route('**/ws?*', route => route.abort());
   await page.route('**/manifest.json', route => json(route, { name: 'tako remote' }));
   await page.route('**/sw.js', route =>
@@ -162,7 +162,7 @@ test.describe('#1472 B スマホで添付をその場で見る — モバイル'
     expect(href).not.toContain('disposition=inline');
 
     expect(calls.download.filter(c => c.disposition === 'inline')).toHaveLength(1);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/01-image-inline.png`, fullPage: true });
+    await page.screenshot({ path: evidencePath('01-image-inline.png'), fullPage: true });
   });
 
   test('02. 画像をタップで拡大 → 閉じられる', async ({ page }) => {
@@ -177,7 +177,7 @@ test.describe('#1472 B スマホで添付をその場で見る — モバイル'
     const zoomSrc = await zoom.locator('img').getAttribute('src');
     expect(zoomSrc).toContain('/api/files/download?');
     expect(zoomSrc).toContain('disposition=inline');
-    await page.screenshot({ path: `${EVIDENCE_DIR}/02-image-zoom.png` });
+    await page.screenshot({ path: evidencePath('02-image-zoom.png') });
 
     await page.locator('[data-testid="task-image-zoom-close"]').click();
     await expect(zoom).toHaveCount(0);
@@ -216,7 +216,7 @@ test.describe('#1472 B スマホで添付をその場で見る — モバイル'
     expect(await video.evaluate(el => el.videoWidth)).toBe(160);
 
     expect(calls.download.some(c => c.disposition === 'inline')).toBe(true);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/03-video-inline.png`, fullPage: true });
+    await page.screenshot({ path: evidencePath('03-video-inline.png'), fullPage: true });
   });
 
   test('04. 消えた添付・解決できない添付はプレビューを出さない', async ({ page }) => {
@@ -239,7 +239,7 @@ test.describe('#1472 B スマホで添付をその場で見る — モバイル'
     await expect(page.locator('[data-testid="task-attachment"]').first()).toContainText('ファイルが消えています');
     await expect(page.locator('[data-testid="task-attachment"]').nth(1)).toContainText('PC のファイルツリーに出ていないフォルダです');
     expect(calls.download).toHaveLength(0);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/04-unavailable.png`, fullPage: true });
+    await page.screenshot({ path: evidencePath('04-unavailable.png'), fullPage: true });
   });
 
   test('05. 一覧を開いただけでは添付を 1 本も取りに行かない', async ({ page }) => {
@@ -309,7 +309,7 @@ test.describe('#1472 B スマホで添付をその場で見る — モバイル'
     const seen = calls.download.find(c => c.disposition === 'inline' && c.path.includes('サムネ'));
     expect(seen, '日本語のファイル名がそのまま daemon へ渡る').toBeTruthy();
     expect(seen.path).toBe('Users/testuser/out/サムネ 01.png');
-    await page.screenshot({ path: `${EVIDENCE_DIR}/07-mixed.png`, fullPage: true });
+    await page.screenshot({ path: evidencePath('07-mixed.png'), fullPage: true });
   });
 
   test('08. 巨大画像でも一覧は軽いまま（詳細でだけ読み、頭が止まる）', async ({ page }) => {

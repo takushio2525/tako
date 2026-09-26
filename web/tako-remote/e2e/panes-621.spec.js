@@ -8,8 +8,8 @@
 //   cd web/tako-remote && npx playwright test e2e/panes-621.spec.js
 //   TAKO_SHOT_PREFIX=before npx playwright test e2e/panes-621.spec.js  # 改修前の記録用
 import { test, expect } from '@playwright/test';
+import { evidencePath, TAKO_VERSION } from './support.js';
 
-const EVIDENCE_DIR = process.env.TAKO_EVIDENCE_DIR || `${process.env.HOME}/dev/tako-evidence/621`;
 const PREFIX = process.env.TAKO_SHOT_PREFIX || 'after';
 const IPHONE_VIEWPORT = { width: 390, height: 844 };
 const BASE = `http://localhost:${process.env.TAKO_PWA_PORT || 5174}`;
@@ -21,7 +21,7 @@ const FAKE_ME = {
   role: 'interact',
   login: 'user@example.com',
   host: 'test-mac',
-  version: '0.6.0',
+  version: TAKO_VERSION,
   app_connected: true,
 };
 
@@ -237,7 +237,7 @@ async function setupMocks(page, { panes = FAKE_PANES, screenFails = false } = {}
     })
   );
   await page.route('**/api/agents', route => json(route, { agents: [] }));
-  await page.route('**/api/health', route => json(route, { status: 'ok', version: '0.6.0' }));
+  await page.route('**/api/health', route => json(route, { status: 'ok', version: TAKO_VERSION }));
   await page.route('**/ws?*', route => route.abort());
   await page.route('**/manifest.json', route => json(route, { name: 'tako remote' }));
   await page.route('**/sw.js', route =>
@@ -265,12 +265,12 @@ test.describe('#621 ペイン選択画面 — モバイル', () => {
   test('01. 混在構成の一覧（全体）', async ({ page }) => {
     await setupMocks(page);
     await gotoPanes(page);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/${PREFIX}-01-list-viewport.png` });
+    await page.screenshot({ path: evidencePath(`${PREFIX}-01-list-viewport.png`) });
     // 一覧は `.card-list` 内スクロールなので fullPage が効かない。
     // 縦長ビューポートにして全カードを 1 枚に収める
     await page.setViewportSize({ width: 390, height: 2000 });
     await page.waitForTimeout(400);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/${PREFIX}-01-list-full.png` });
+    await page.screenshot({ path: evidencePath(`${PREFIX}-01-list-full.png`) });
     await page.setViewportSize(IPHONE_VIEWPORT);
     await page.waitForTimeout(200);
 
@@ -334,7 +334,7 @@ test.describe('#621 ペイン選択画面 — モバイル', () => {
     const card = cardByTitle(page, 'docs-site');
     await expect(card.locator('.card-permission')).toContainText('rm -rf build');
     await card.scrollIntoViewIfNeeded();
-    await page.screenshot({ path: `${EVIDENCE_DIR}/${PREFIX}-05-permission-card.png` });
+    await page.screenshot({ path: evidencePath(`${PREFIX}-05-permission-card.png`) });
   });
 
   test('06. エラーは種別と対処が見える', async ({ page }) => {
@@ -351,7 +351,7 @@ test.describe('#621 ペイン選択画面 — モバイル', () => {
     await page.waitForTimeout(300);
     // permission + error の 2 件だけが残る
     await expect(page.locator('.pane-card')).toHaveCount(2);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/${PREFIX}-07-filter-needs-you.png` });
+    await page.screenshot({ path: evidencePath(`${PREFIX}-07-filter-needs-you.png`) });
   });
 
   test('08. カードから会話画面へ遷移できる（チャット非回帰）', async ({ page }) => {
@@ -367,7 +367,7 @@ test.describe('#621 ペイン選択画面 — モバイル', () => {
     await page.goto(`${BASE}/#/`);
     await page.waitForSelector('.empty-state', { timeout: 10000 });
     await page.waitForTimeout(400);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/${PREFIX}-09-empty.png` });
+    await page.screenshot({ path: evidencePath(`${PREFIX}-09-empty.png`) });
     await expect(page.locator('.empty-state')).toBeVisible();
   });
 
@@ -384,7 +384,7 @@ test.describe('#621 ペイン選択画面 — モバイル', () => {
     await setupMocks(page, { panes: noPreview, screenFails: true });
     await gotoPanes(page);
     await page.waitForTimeout(1200);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/${PREFIX}-10-preview-unavailable.png`, fullPage: true });
+    await page.screenshot({ path: evidencePath(`${PREFIX}-10-preview-unavailable.png`), fullPage: true });
     await expect(page.locator('.preview-unavailable').first()).toBeVisible();
   });
 
@@ -400,7 +400,7 @@ test.describe('#621 ペイン選択画面 — モバイル', () => {
     await page.goto(`${BASE}/#/panes/13`);
     await page.waitForSelector('.approval-card', { timeout: 10000 });
     await expect(page.locator('.approval-card-body')).toContainText('rm -rf build');
-    await page.screenshot({ path: `${EVIDENCE_DIR}/${PREFIX}-11-chat-approval.png` });
+    await page.screenshot({ path: evidencePath(`${PREFIX}-11-chat-approval.png`) });
 
     await page.locator('.approval-btn-allow').first().click();
     await page.waitForTimeout(400);

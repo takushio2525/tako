@@ -2,8 +2,8 @@
 // Vite dev サーバーに接続し、API をモック（page.route）して各画面を iPhone viewport で撮影する。
 // 実行: cd web/tako-remote && npx playwright test e2e/screenshots.spec.js
 import { test, expect } from '@playwright/test';
+import { evidencePath, TAKO_VERSION } from './support.js';
 
-const EVIDENCE_DIR = process.env.HOME + '/Desktop/tako-284-evidence';
 const IPHONE_VIEWPORT = { width: 390, height: 844 };
 const BASE = `http://localhost:${process.env.TAKO_PWA_PORT || 5174}`;
 
@@ -15,7 +15,7 @@ const FAKE_ME = {
   role: 'interact',
   login: 'user@example.com',
   host: 'test-mac',
-  version: '0.5.5',
+  version: TAKO_VERSION,
   app_connected: true,
 };
 
@@ -23,14 +23,14 @@ const FAKE_ME_PENDING = {
   registered: false,
   pending: true,
   host: 'test-mac',
-  version: '0.5.5',
+  version: TAKO_VERSION,
 };
 
 const FAKE_ME_DENIED = {
   registered: false,
   denied: true,
   host: 'test-mac',
-  version: '0.5.5',
+  version: TAKO_VERSION,
 };
 
 const FAKE_PANES = {
@@ -118,7 +118,7 @@ async function setupMocks(page) {
     route.fulfill({ status: 200, contentType: 'application/json', body: '{"agents":[]}' })
   );
   await page.route('**/api/health', route =>
-    route.fulfill({ status: 200, contentType: 'application/json', body: '{"status":"ok","version":"0.5.5"}' })
+    route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ status: 'ok', version: TAKO_VERSION }) })
   );
   // WS 接続はモックページでは使わない
   await page.route('**/ws?*', route => route.abort());
@@ -181,7 +181,7 @@ test.describe('PWA screenshots — iPhone viewport', () => {
     await page.goto(`${BASE}/#/`);
     await page.waitForSelector('.pane-card', { timeout: 10000 });
     await page.waitForTimeout(500);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/01-pane-list.png`, fullPage: false });
+    await page.screenshot({ path: evidencePath('01-pane-list.png'), fullPage: false });
     expect(external).toEqual([]);
   });
 
@@ -191,7 +191,7 @@ test.describe('PWA screenshots — iPhone viewport', () => {
     await page.goto(`${BASE}/#/panes/1`);
     await page.waitForSelector('.chat-scroll', { timeout: 10000 });
     await page.waitForTimeout(800);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/02-chat-claude.png`, fullPage: false });
+    await page.screenshot({ path: evidencePath('02-chat-claude.png'), fullPage: false });
     expect(external).toEqual([]);
   });
 
@@ -204,7 +204,7 @@ test.describe('PWA screenshots — iPhone viewport', () => {
     await termBtn.click();
     await page.waitForSelector('.quick-keys', { timeout: 10000 });
     await page.waitForTimeout(500);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/03-term-view.png`, fullPage: false });
+    await page.screenshot({ path: evidencePath('03-term-view.png'), fullPage: false });
     expect(external).toEqual([]);
   });
 
@@ -213,7 +213,7 @@ test.describe('PWA screenshots — iPhone viewport', () => {
     await page.goto(`${BASE}/`);
     await page.waitForSelector('.connect-card', { timeout: 10000 });
     await page.waitForTimeout(500);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/04-pairing-pending.png`, fullPage: false });
+    await page.screenshot({ path: evidencePath('04-pairing-pending.png'), fullPage: false });
   });
 
   test('05. ペアリング拒否', async ({ page }) => {
@@ -221,21 +221,21 @@ test.describe('PWA screenshots — iPhone viewport', () => {
     await page.goto(`${BASE}/`);
     await page.waitForSelector('.connect-card', { timeout: 10000 });
     await page.waitForTimeout(500);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/05-pairing-denied.png`, fullPage: false });
+    await page.screenshot({ path: evidencePath('05-pairing-denied.png'), fullPage: false });
   });
 
   test('06. codex ペイン', async ({ page }) => {
     await setupMocks(page);
     await page.goto(`${BASE}/#/panes/2`);
     await page.waitForTimeout(2000);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/06-codex-pane.png`, fullPage: false });
+    await page.screenshot({ path: evidencePath('06-codex-pane.png'), fullPage: false });
   });
 
   test('07. agy ペイン', async ({ page }) => {
     await setupMocks(page);
     await page.goto(`${BASE}/#/panes/3`);
     await page.waitForTimeout(2000);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/07-agy-pane.png`, fullPage: false });
+    await page.screenshot({ path: evidencePath('07-agy-pane.png'), fullPage: false });
   });
 
   test('08. 外部リクエスト 0 件（ネットワーク証拠）', async ({ page }) => {
@@ -255,13 +255,13 @@ test.describe('PWA screenshots — iPhone viewport', () => {
     await page.waitForSelector('.composer-input', { timeout: 10000 });
     await page.fill('.composer-input', 'テスト入力');
     await page.waitForTimeout(300);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/09-chat-input.png`, fullPage: false });
+    await page.screenshot({ path: evidencePath('09-chat-input.png'), fullPage: false });
 
     const termBtn = page.locator('.view-toggle-btn', { hasText: 'term' });
     await termBtn.click();
     await page.waitForSelector('.term-input-field', { timeout: 10000 });
     await page.fill('.term-input-field', 'ls -la');
     await page.waitForTimeout(300);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/09-term-input.png`, fullPage: false });
+    await page.screenshot({ path: evidencePath('09-term-input.png'), fullPage: false });
   });
 });
