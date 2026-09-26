@@ -356,6 +356,21 @@ impl PaneTree {
         Ok(pane)
     }
 
+    /// target ペインを**同じ位置のまま**新しいペインへ差し替え、取り除いた方を返す
+    /// （#1657 の実行ペインの再利用）。分割の向き・比率・兄弟はそのまま残る。
+    /// フォーカス中のペインを差し替えたらフォーカスも新しいペインへ移る
+    pub fn replace(&mut self, target: PaneId, pane: Pane) -> Result<Pane, PaneTreeError> {
+        let new_id = pane.id();
+        let slot = self
+            .get_mut(target)
+            .ok_or(PaneTreeError::PaneNotFound(target))?;
+        let old = std::mem::replace(slot, pane);
+        if self.focused == target {
+            self.focused = new_id;
+        }
+        Ok(old)
+    }
+
     pub fn focus(&mut self, target: PaneId) -> Result<(), PaneTreeError> {
         if !self.contains(target) {
             return Err(PaneTreeError::PaneNotFound(target));
@@ -1019,6 +1034,39 @@ mod tests {
         // root は左半分のまま
         assert_close_to(rect_of(&t, root).width, 0.5);
         assert_close_to(rect_of(&t, root).height, 1.0);
+    }
+
+    /// #1657: 差し替えはペインの数も位置も比率も変えない（再生ボタンを押し直しても積まない）
+    #[test]
+    fn replaceは位置と比率を保ったまま差し替える() {
+        let (mut t, root) = tree();
+        let run = t
+            .split_with_ratio(root, SplitDirection::Down, 0.3, Pane::new(PaneOrigin::User))
+            .unwrap();
+        t.focus(root).unwrap();
+        let before = rect_of(&t, run);
+        let fresh = Pane::new(PaneOrigin::User);
+        let fresh_id = fresh.id();
+        let old = t.replace(run, fresh).unwrap();
+        assert_eq!(old.id(), run);
+        assert_eq!(t.len(), 2, "ペインが増減した");
+        assert!(!t.contains(run));
+        let after = rect_of(&t, fresh_id);
+        assert_close_to(after.y, before.y);
+        assert_close_to(after.height, before.height);
+        // フォーカスは差し替えた側に無かったので動かない
+        assert_eq!(t.focused(), root);
+        // フォーカス中を差し替えたら新しい方へ移る
+        let again = Pane::new(PaneOrigin::User);
+        let again_id = again.id();
+        t.focus(fresh_id).unwrap();
+        t.replace(fresh_id, again).unwrap();
+        assert_eq!(t.focused(), again_id);
+        // 居ないペインはエラー
+        assert_eq!(
+            t.replace(run, Pane::new(PaneOrigin::User)).unwrap_err(),
+            PaneTreeError::PaneNotFound(run)
+        );
     }
 
     #[test]

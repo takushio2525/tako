@@ -436,6 +436,10 @@ struct RunArgs {
     /// 完了まで待って exit code を返す（ポーリング）
     #[arg(long)]
     wait: bool,
+    /// 同じファイルの実行ペインを使い回さず、新しく分割する（#1657。既定は
+    /// 同じファイル・プロファイルの実行ペインをその位置で差し替える）
+    #[arg(long)]
+    new_pane: bool,
     /// 実行せずプロファイル一覧を表示する（--dry-run / --list）
     #[arg(long, alias = "dry-run")]
     list: bool,
@@ -8717,6 +8721,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 ratio: args.ratio,
                 auto_close: Some(args.auto_close.clone()),
                 focus: Some(args.focus),
+                new_pane: args.new_pane.then_some(true),
             }
         }
         Command::RunDefault(ref args) => Request::RunnerDefaults {

@@ -38,7 +38,7 @@ pub fn login_shell_command(command: SpawnCommand) -> SpawnCommand {
 /// 成功したときは従来どおり即 close（`exit 0` するだけ）、非 0 のときだけ
 /// 終了コードのマーカー行 + 案内を出して入力待ちで止める。
 ///
-/// マーカーの形は実行ペイン（[`run_pane_command`]）と同じ `<marker_prefix><code>` で、
+/// マーカーの形は実行ペイン（[`run_pane_command`]）の退避路と同じ `<marker_prefix><code>` で、
 /// 読む側（`tako_control::dispatch::find_exit_marker`）も 1 つ。**接頭辞は呼び出し側が渡す**
 /// （契約の持ち主を増やさない）。
 ///
@@ -74,16 +74,43 @@ fn legacy_1031() -> bool {
 /// 実行ペイン（#453 Code Runner / #666 コマンド提案カード / `tako run-interactive`）を
 /// 起こすコマンド。
 ///
-/// 組み立てる形は「コマンド本体 → 終了コードを `<marker_prefix><code>` の 1 行で出力 →
-/// 入力待ちで停止」。入力待ちで止めるのは、即終了するコマンドでも出力を読めるように
-/// ペインを残すため。`RunInteractiveStatus` はこのマーカー行を画面から拾って
-/// 終了コードと auto_close を決めるので、**マーカーの出力が唯一の契約**
-/// （`tako_control::dispatch::find_exit_marker`）。
+/// 組み立てる形は「コマンド本体 → 終了コードを**側路ファイル `exit_file` へ** `<code>\n` で
+/// 書く → 画面には人の言葉の案内（[`run_exit_hint`]。日英）→ 入力待ちで停止 →
+/// Enter で側路ファイルを消して終わる」（#1657）。入力待ちで止めるのは、即終了する
+/// コマンドでも出力を読めるようにペインを残すため。
+///
+/// **画面へ `<marker_prefix><code>` を出すのは側路へ書けなかったときだけ**（退避路）。
+/// #1657 以前は常に画面へ出しており、内部の契約がユーザーに見えていた。読む側は
+/// 「側路ファイル → 画面のマーカー」の順に見る 1 実装
+/// （`tako_control::dispatch::run_pane_exit_code`）。側路が用意できない（`exit_file` が
+/// `None`）ときも画面のマーカーで伝わるので、`--wait` が止まることはない。
 ///
 /// 呼び出し側（`dispatch`）が `/bin/sh -c` を直書きしていたため Windows では
-/// `CreateProcess` が失敗し、ペインだけ生えて PTY が立たなかった（#875）
-pub fn run_pane_command(command: &str, marker_prefix: &str) -> SpawnCommand {
-    imp::run_pane_command(command, marker_prefix)
+/// `CreateProcess` が失敗し、ペインだけ生えて PTY が立たなかった（#875）。
+///
+/// `TAKO_1657_LEGACY=1` では #1657 前の形（常に画面のマーカー・案内なし）へ戻る
+pub fn run_pane_command(
+    command: &str,
+    marker_prefix: &str,
+    exit_file: Option<&std::path::Path>,
+) -> SpawnCommand {
+    if crate::run_pane::legacy_1657() {
+        return imp::run_pane_command_legacy(command, marker_prefix);
+    }
+    imp::run_pane_command(command, marker_prefix, exit_file, crate::i18n::lang())
+}
+
+/// 実行ペインが終わったときに画面へ出す案内（日英。#1657）。終了コードを
+/// **挟む前後の 2 片**で返す（コードはシェルが実行時に埋める）。
+///
+/// シェルへは単引用符で埋め込む（POSIX は `quote_for_shell`、PowerShell は
+/// `quote_arg`）ので、どの文字でも壊れない。純粋関数にしてあるので macOS 上から
+/// 両言語を検査できる
+pub fn run_exit_hint(lang: crate::i18n::Lang) -> (&'static str, &'static str) {
+    match lang {
+        crate::i18n::Lang::Ja => ("[tako] 終了コード ", " / Enter でこのペインを閉じます"),
+        crate::i18n::Lang::En => ("[tako] Exit code ", " / Press Enter to close this pane"),
+    }
 }
 
 /// スクリプト本文をそのままシェルへ渡すペイン用コマンド（境界 B1。#919）。
@@ -220,7 +247,16 @@ mod imp {
         super::posix_hold_on_failure_command(&command, marker_prefix, hint)
     }
 
-    pub(crate) fn run_pane_command(command: &str, marker_prefix: &str) -> SpawnCommand {
+    pub(crate) fn run_pane_command(
+        command: &str,
+        marker_prefix: &str,
+        exit_file: Option<&std::path::Path>,
+        lang: crate::i18n::Lang,
+    ) -> SpawnCommand {
+        super::posix_run_pane_command_1657(command, marker_prefix, exit_file, lang)
+    }
+
+    pub(crate) fn run_pane_command_legacy(command: &str, marker_prefix: &str) -> SpawnCommand {
         super::posix_run_pane_command(command, marker_prefix)
     }
 
@@ -294,7 +330,22 @@ mod imp {
         super::powershell_hold_on_failure_command(&run_pane_shell(), &command, marker_prefix, hint)
     }
 
-    pub(crate) fn run_pane_command(command: &str, marker_prefix: &str) -> SpawnCommand {
+    pub(crate) fn run_pane_command(
+        command: &str,
+        marker_prefix: &str,
+        exit_file: Option<&std::path::Path>,
+        lang: crate::i18n::Lang,
+    ) -> SpawnCommand {
+        super::powershell_run_pane_command_1657(
+            &run_pane_shell(),
+            command,
+            marker_prefix,
+            exit_file,
+            lang,
+        )
+    }
+
+    pub(crate) fn run_pane_command_legacy(command: &str, marker_prefix: &str) -> SpawnCommand {
         super::powershell_run_pane_command(&run_pane_shell(), command, marker_prefix)
     }
 
@@ -458,6 +509,134 @@ fn posix_run_pane_command(command: &str, marker_prefix: &str) -> SpawnCommand {
         program: "/bin/sh".to_string(),
         args: vec!["-c".to_string(), wrapped],
     }
+}
+
+/// #1657 の POSIX の実行ペイン用コマンド（純粋関数）。
+///
+/// [`posix_run_pane_command`]（#1657 前の形。A/B 用に残す）との違いは 3 つ:
+///
+/// 1. 終了コードを**側路ファイルへ**書く。書けなかったときだけ画面へマーカー行を出す
+///    （`{ … > file; } 2>/dev/null || echo …`）。`exit_file` が無ければ最初から画面へ出す
+/// 2. 画面には人の言葉の案内（[`run_exit_hint`]）を淡色で出す。前の出力と混ざらないよう
+///    空行を 1 つ挟む
+/// 3. Enter のあとで側路ファイルを消す（消えるのはペインが閉じる直前 = 読む側はもう要らない）
+///
+/// 片を `;` ではなく改行で繋ぐのは、ユーザーのコマンドが `# …` のコメントで終わっていても
+/// 後ろの片が巻き込まれて消えないようにするため
+#[cfg_attr(windows, allow(dead_code))]
+fn posix_run_pane_command_1657(
+    command: &str,
+    marker_prefix: &str,
+    exit_file: Option<&std::path::Path>,
+    lang: crate::i18n::Lang,
+) -> SpawnCommand {
+    SpawnCommand {
+        program: "/bin/sh".to_string(),
+        args: vec![
+            "-c".to_string(),
+            posix_run_pane_script(command, marker_prefix, exit_file, lang),
+        ],
+    }
+}
+
+/// [`posix_run_pane_command_1657`] が `/bin/sh -c` へ渡すスクリプト（純粋関数）
+#[cfg_attr(windows, allow(dead_code))]
+fn posix_run_pane_script(
+    command: &str,
+    marker_prefix: &str,
+    exit_file: Option<&std::path::Path>,
+    lang: crate::i18n::Lang,
+) -> String {
+    let marker_line = format!("echo \"{marker_prefix}$__tako_code\"");
+    let (report, cleanup) = match exit_file {
+        Some(path) => {
+            let file = crate::shell::quote_for_shell(&path.to_string_lossy());
+            (
+                format!(
+                    "{{ printf '%s\\n' \"$__tako_code\" > {file}; }} 2>/dev/null || {marker_line}"
+                ),
+                format!("\nrm -f {file} 2>/dev/null"),
+            )
+        }
+        None => (marker_line, String::new()),
+    };
+    let (head, tail) = run_exit_hint(lang);
+    format!(
+        "{command}\n\
+         __tako_code=$?\n\
+         {report}\n\
+         printf '\\n\\033[2m%s%s%s\\033[0m\\n' {head} \"$__tako_code\" {tail}\n\
+         read -r __TAKO_DUMMY__ 2>/dev/null || true{cleanup}",
+        head = crate::shell::quote_for_shell(head),
+        tail = crate::shell::quote_for_shell(tail),
+    )
+}
+
+/// #1657 の Windows の実行ペイン用コマンド（純粋関数。**macOS 上でもテストできる**）。
+///
+/// 符号化の理由は [`powershell_run_pane_command`] と同じ。終了コードの決め方は
+/// [`powershell_exit_code_script`] の 1 実装を共有する
+#[cfg_attr(not(windows), allow(dead_code))]
+fn powershell_run_pane_command_1657(
+    program: &str,
+    command: &str,
+    marker_prefix: &str,
+    exit_file: Option<&std::path::Path>,
+    lang: crate::i18n::Lang,
+) -> SpawnCommand {
+    SpawnCommand {
+        program: program.to_string(),
+        args: vec![
+            "-NoLogo".to_string(),
+            "-EncodedCommand".to_string(),
+            encode_powershell_command(&powershell_run_pane_script(
+                command,
+                marker_prefix,
+                exit_file,
+                lang,
+            )),
+        ],
+    }
+}
+
+/// [`powershell_run_pane_command_1657`] が走らせるスクリプト（純粋関数）。
+///
+/// 側路へは `Set-Content` で書く（`[IO.File]::WriteAllText` を使わないのは、制約付き
+/// 言語モード（ConstrainedLanguage）の環境で .NET のメソッド呼び出しが止められるため）。
+/// 書けなければ `catch` で画面へマーカー行を出す = POSIX の `||` と同じ退避路
+#[cfg_attr(not(windows), allow(dead_code))]
+fn powershell_run_pane_script(
+    command: &str,
+    marker_prefix: &str,
+    exit_file: Option<&std::path::Path>,
+    lang: crate::i18n::Lang,
+) -> String {
+    let q = |w: &str| ShellDialect::PowerShell.quote_arg(w);
+    let marker_line = format!("Write-Host ({} + $__tako_code)", q(marker_prefix));
+    let (report, cleanup) = match exit_file {
+        Some(path) => {
+            let file = q(&path.to_string_lossy());
+            (
+                format!(
+                    "try {{ Set-Content -LiteralPath {file} -Value ([string]$__tako_code) \
+                     -Encoding ascii -ErrorAction Stop }} catch {{ {marker_line} }}"
+                ),
+                format!("Remove-Item -LiteralPath {file} -ErrorAction SilentlyContinue\n"),
+            )
+        }
+        None => (marker_line, String::new()),
+    };
+    let (head, tail) = run_exit_hint(lang);
+    format!(
+        "{}{report}\n\
+         Write-Host ''\n\
+         Write-Host ({} + $__tako_code + {}) -ForegroundColor DarkGray\n\
+         try {{ $null = [Console]::ReadLine() }} catch {{ }}\n\
+         {cleanup}",
+        powershell_exit_code_script(command),
+        q(head),
+        q(tail),
+    )
 }
 
 /// Windows の実行ペイン用コマンド（純粋関数。**macOS 上でもテストできる**）。
@@ -1084,7 +1263,8 @@ mod tests {
     // --- 実行ペイン: POSIX 側の不変（#875 で Windows 対応を入れても 1 バイトも変えない） ---
 
     /// #875 以前に `dispatch::spawn_command_pane` が直書きしていた文字列そのもの。
-    /// **これが変わると macOS の実行ペインの挙動が変わる**ので、リテラルで固定する
+    /// #1657 からは `TAKO_1657_LEGACY=1` の A/B が再現する**旧形**で、A/B の比較先が
+    /// 動かないようにリテラルで固定する（現行の形は `tests_1657`）
     const POSIX_EXPECTED: &str =
         "npm test; echo \"__TAKO_EXIT=$?\"; read -r __TAKO_DUMMY__ 2>/dev/null || true";
 
@@ -1439,5 +1619,207 @@ mod tests {
             "tty::new へ渡す前に apply_arg_escaping を通していない\
              （Windows で空白入りの語が割れてペインが即死する。#884）"
         );
+    }
+}
+
+/// #1657: 実行ペインは終了コードを**側路ファイルへ**書き、画面には人の言葉の案内だけを出す
+#[cfg(test)]
+mod tests_1657 {
+    use super::*;
+    use crate::i18n::Lang;
+
+    const MARKER: &str = "__TAKO_EXIT=";
+    const PWSH: &str = "C:\\Program Files\\PowerShell\\7\\pwsh.exe";
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tako-1657-shell-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 案内は両言語とも「前 + 終了コード + 後」で組める（コードを挟む位置がある）
+    #[test]
+    fn 終了の案内は両言語で前後の2片を持つ() {
+        for lang in [Lang::Ja, Lang::En] {
+            let (head, tail) = run_exit_hint(lang);
+            assert!(!head.is_empty() && !tail.is_empty(), "{lang:?}");
+            // 案内は内部のマーカーを含まない（人の言葉だけ）
+            assert!(!head.contains(MARKER) && !tail.contains(MARKER), "{lang:?}");
+        }
+        assert_ne!(run_exit_hint(Lang::Ja), run_exit_hint(Lang::En));
+    }
+
+    /// 画面へマーカーを出すのは**側路へ書けなかったとき**（`||` の右）だけ
+    #[test]
+    fn posixはマーカーを退避路にだけ置く() {
+        let file = std::path::Path::new("/tmp/tako data/12.code");
+        let script = posix_run_pane_script("npm test", MARKER, Some(file), Lang::Ja);
+        assert!(script.starts_with("npm test\n__tako_code=$?\n"), "{script}");
+        // 書き先は空白入りでも 1 語のまま
+        assert!(
+            script.contains(
+                "> '/tmp/tako data/12.code'; } 2>/dev/null || echo \"__TAKO_EXIT=$__tako_code\""
+            ),
+            "{script}"
+        );
+        assert_eq!(
+            script.matches(MARKER).count(),
+            1,
+            "マーカーが退避路の外にも出ている: {script}"
+        );
+        // 案内・入力待ち・後片付けの順
+        let (head, _) = run_exit_hint(Lang::Ja);
+        let hint_at = script.find(head).expect("案内がある");
+        let read_at = script
+            .find("read -r __TAKO_DUMMY__")
+            .expect("入力待ちがある");
+        let rm_at = script
+            .find("rm -f '/tmp/tako data/12.code'")
+            .expect("後片付けがある");
+        assert!(hint_at < read_at && read_at < rm_at, "{script}");
+    }
+
+    /// 側路が無い（データディレクトリを解決できない）ときは画面のマーカーで伝える
+    #[test]
+    fn 側路が無ければマーカーを画面へ出す() {
+        let script = posix_run_pane_script("x", MARKER, None, Lang::En);
+        assert!(
+            script.contains("\necho \"__TAKO_EXIT=$__tako_code\"\n"),
+            "{script}"
+        );
+        assert!(!script.contains("rm -f"), "{script}");
+        let ps = powershell_run_pane_script("x", MARKER, None, Lang::En);
+        assert!(
+            ps.contains("Write-Host ('__TAKO_EXIT=' + $__tako_code)\n"),
+            "{ps}"
+        );
+        assert!(!ps.contains("Remove-Item"), "{ps}");
+    }
+
+    /// Windows 側も同じ形: 側路へ書き、書けなかったとき（`catch`）だけマーカー
+    #[test]
+    fn powershellはマーカーを退避路にだけ置く() {
+        let file =
+            std::path::Path::new("C:\\Users\\winuser\\AppData\\Roaming\\tako\\run-exit\\12.code");
+        let got =
+            powershell_run_pane_command_1657(PWSH, "cargo test", MARKER, Some(file), Lang::Ja);
+        assert_eq!(got.program, PWSH);
+        assert_eq!(&got.args[..2], ["-NoLogo", "-EncodedCommand"]);
+        let script = decode_powershell_command(&got.args[2]);
+        // 終了コードの決め方は PTY 無しの実行と同じ 1 実装（#935）
+        assert!(
+            script.starts_with(&powershell_exit_code_script("cargo test")),
+            "{script}"
+        );
+        let quoted = "'C:\\Users\\winuser\\AppData\\Roaming\\tako\\run-exit\\12.code'";
+        assert!(
+            script.contains(&format!(
+                "try {{ Set-Content -LiteralPath {quoted} -Value ([string]$__tako_code) -Encoding ascii -ErrorAction Stop }} catch {{ Write-Host ('__TAKO_EXIT=' + $__tako_code) }}"
+            )),
+            "{script}"
+        );
+        assert_eq!(script.matches(MARKER).count(), 1, "{script}");
+        let (head, tail) = run_exit_hint(Lang::Ja);
+        assert!(
+            script.contains(&format!(
+                "Write-Host ('{head}' + $__tako_code + '{tail}') -ForegroundColor DarkGray"
+            )),
+            "{script}"
+        );
+        let read_at = script.find("[Console]::ReadLine()").expect("入力待ち");
+        let rm_at = script
+            .find(&format!("Remove-Item -LiteralPath {quoted}"))
+            .expect("後片付け");
+        assert!(read_at < rm_at, "{script}");
+        // 引用符・空白を含んでも符号化の外へ漏れない（#906 の二重パディングも無い）
+        assert!(got.args[2]
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b)));
+        assert!(!got.args[2].ends_with("=="));
+    }
+
+    /// 書き先の単引用符は PowerShell 流に二重化する（`tako's` のようなフォルダ名）
+    #[test]
+    fn powershellの書き先の単引用符は二重化する() {
+        let file = std::path::Path::new("C:\\Users\\winuser\\tako's\\run-exit\\1.code");
+        let script = powershell_run_pane_script("x", MARKER, Some(file), Lang::En);
+        assert!(
+            script.contains("'C:\\Users\\winuser\\tako''s\\run-exit\\1.code'"),
+            "{script}"
+        );
+    }
+
+    /// 実際に `/bin/sh` で走らせる: 画面（stdout）にマーカーが出ず、側路に
+    /// `<code>\n` が入り、Enter（stdin の改行）で側路が消える
+    #[cfg(unix)]
+    #[test]
+    fn posixの実行ペインは画面にマーカーを出さず側路へ書く() {
+        use std::io::Write;
+        let dir = temp_dir("run");
+        let file = dir.join("5.code");
+        let got = posix_run_pane_command_1657(
+            "printf 'out-1657\\n'; (exit 7)",
+            MARKER,
+            Some(&file),
+            Lang::Ja,
+        );
+        let mut child = std::process::Command::new(&got.program)
+            .args(&got.args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("sh が走る");
+        // Enter を送る前に側路が埋まる（入力待ちで止まっている）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::run_pane::read(&file).is_none() {
+            assert!(std::time::Instant::now() < deadline, "側路に書かれない");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(crate::run_pane::read(&file), Some(7));
+        child.stdin.take().unwrap().write_all(b"\n").unwrap();
+        let out = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("out-1657"), "{stdout}");
+        assert!(!stdout.contains(MARKER), "画面にマーカーが出た: {stdout:?}");
+        let (head, tail) = run_exit_hint(Lang::Ja);
+        assert!(stdout.contains(&format!("{head}7{tail}")), "{stdout:?}");
+        assert!(!file.exists(), "Enter のあとも側路が残っている");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 側路へ書けない（置き場が無い）ときは画面のマーカーへ落ちる = `--wait` が止まらない
+    #[cfg(unix)]
+    #[test]
+    fn posixは側路へ書けなければ画面のマーカーへ落ちる() {
+        let dir = temp_dir("fallback");
+        let file = dir.join("no-such-dir").join("5.code");
+        let got = posix_run_pane_command_1657("(exit 3)", MARKER, Some(&file), Lang::En);
+        let out = std::process::Command::new(&got.program)
+            .args(&got.args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("sh が走る");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("__TAKO_EXIT=3"), "{stdout:?}");
+        assert!(
+            out.stderr.is_empty(),
+            "書き込み失敗のエラーが画面へ漏れた: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1657 の A/B: 旧形（常に画面のマーカー）は同じ入口から引ける
+    #[cfg(unix)]
+    #[test]
+    fn legacyの形は1657前と同じ() {
+        let got = imp::run_pane_command_legacy("npm test", MARKER);
+        let want = posix_run_pane_command("npm test", MARKER);
+        assert_eq!((got.program, got.args), (want.program, want.args));
     }
 }
