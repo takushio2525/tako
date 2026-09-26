@@ -1803,11 +1803,14 @@ fn detected_provider_plans(agents: &[DetectedAgent]) -> Vec<(Provider, Option<St
         .collect()
 }
 
+/// `read_line` はプランの問い（`--review` の対話だけ）の答えを 1 行読む。
+/// 本番は標準入力（[`read_stdin_line`]）、テストは答えを注入する
 fn collect_provider_plans(
     agents: &[DetectedAgent],
     previous: &BTreeMap<String, String>,
     reuse_previous: bool,
     assume_yes: bool,
+    read_line: &mut dyn FnMut() -> String,
 ) -> BTreeMap<String, ResolvedSetupValue> {
     let mut plans = if reuse_previous {
         previous
@@ -1829,11 +1832,10 @@ fn collect_provider_plans(
             // Claude の status は max の倍率を返さない。前回倍率がなければ安全な max
             // （固定モデルを選ばない）へ丸め、--review 時だけ詳細を聞く。
             Some("max") if provider == Provider::Claude => {
-                if reuse_previous
-                    && previous_plan
-                        .is_some_and(|plan| matches!(plan, "max" | "max-5x" | "max-20x"))
-                {
-                    let plan = previous_plan.unwrap_or("max");
+                // 保てる前回値は max 系だけ（pro 等は検出値 max と食い違うので検出値を優先）。
+                // `--review` の既定もこれを使う = Enter を押し続けた結果が標準 setup と揃う（#1506）
+                let keep = previous_plan.filter(|plan| CLAUDE_MAX_CHOICES.contains(plan));
+                if let Some(plan) = keep.filter(|_| reuse_previous) {
                     eprintln!(
                         "  [previous] {} プラン: {plan}（detected: max）",
                         provider.label()
@@ -1847,7 +1849,7 @@ fn collect_provider_plans(
                             provider.label()
                         );
                     }
-                    prompt_plan(provider, Some("max"), assume_yes)
+                    prompt_plan(provider, Some("max"), keep, assume_yes, read_line)
                 }
             }
             Some(plan) => {
@@ -1882,15 +1884,133 @@ fn collect_provider_plans(
                 );
                 resolved
             }
-            None => prompt_plan(provider, None, assume_yes),
+            None => prompt_plan(provider, None, previous_plan, assume_yes, read_line),
         };
         plans.insert(provider.as_str().to_string(), resolved);
     }
     plans
 }
 
-fn prompt_plan(provider: Provider, detected: Option<&str>, assume_yes: bool) -> ResolvedSetupValue {
+/// Claude Max 検出時の倍率の選択肢（番号順）。標準 setup が前回値を引き継ぐかの判定も
+/// これを引く（「max 系」の一覧を 2 か所に書かない）。末尾の `max` が「不明」
+const CLAUDE_MAX_CHOICES: &[&str] = &["max-5x", "max-20x", "max"];
+
+/// プランの問い 1 つぶん（Issue #1506）。**表示と「番号 → 値」を 1 か所に持つ**ので、
+/// 既定の番号を前回値から引いても、表示の番号と保存される値がずれない
+struct PlanQuestion {
+    heading: &'static str,
+    /// 選択肢の表示行（1 行に複数並べてよい）
+    lines: &'static [&'static str],
+    /// 番号 `i + 1` で保存される値。**末尾が「不明」**（前回値が無いときの既定）
+    choices: &'static [&'static str],
+}
+
+fn plan_question(provider: Provider, detected: Option<&str>) -> PlanQuestion {
+    match provider {
+        Provider::Claude if detected == Some("max") => PlanQuestion {
+            heading: "Claude Max を検出しました。契約倍率を選んでください:",
+            lines: &["  1) Max 5x", "  2) Max 20x", "  3) 不明"],
+            choices: CLAUDE_MAX_CHOICES,
+        },
+        Provider::Claude => PlanQuestion {
+            heading: "Claude のプランを選んでください:",
+            lines: &[
+                "  1) Free / 未契約  2) Pro  3) Max 5x  4) Max 20x",
+                "  5) Team / Enterprise  6) API  7) 不明",
+            ],
+            choices: &[
+                "free",
+                "pro",
+                "max-5x",
+                "max-20x",
+                "team-enterprise",
+                "api",
+                "unknown",
+            ],
+        },
+        Provider::Gpt => PlanQuestion {
+            heading: "GPT / ChatGPT のプランを選んでください:",
+            lines: &[
+                "  1) Free / 未契約  2) Plus  3) Pro",
+                "  4) Business / Enterprise  5) API  6) 不明",
+            ],
+            choices: &[
+                "free",
+                "plus",
+                "pro",
+                "business-enterprise",
+                "api",
+                "unknown",
+            ],
+        },
+        Provider::Google => PlanQuestion {
+            heading: "Google のプランを選んでください（agy からは自動取得できません）:",
+            lines: &[
+                "  1) Free / 未契約  2) Google AI Pro  3) Google AI Ultra",
+                "  4) Workspace / Enterprise  5) 不明",
+            ],
+            choices: &[
+                "free",
+                "google-ai-pro",
+                "google-ai-ultra",
+                "workspace-enterprise",
+                "unknown",
+            ],
+        },
+    }
+}
+
+impl PlanQuestion {
+    /// 答えなかったとき（Enter / 範囲外の番号 / EOF）に保存する値と出どころ。
+    /// **前回値があればそれを保つ**（#1506: 既定が「不明」固定だったので、Enter だけで
+    /// 保存済みの `max-5x` が `max` へ戻った）
+    fn default_value(&self, previous: Option<&str>) -> (String, SetupValueSource) {
+        match previous {
+            Some(previous) => (previous.to_string(), SetupValueSource::Previous),
+            None => (
+                self.choices[self.choices.len() - 1].to_string(),
+                SetupValueSource::Default,
+            ),
+        }
+    }
+
+    /// `選択 [ ]` に出す既定の表記。選択肢にある値は番号で、無い値（検出由来の
+    /// `team` 等）は値そのもので見せる（Enter で何が残るかを答える前に分かるように）
+    fn default_label(&self, previous: Option<&str>) -> String {
+        let value = previous.unwrap_or(self.choices[self.choices.len() - 1]);
+        self.choices
+            .iter()
+            .position(|choice| *choice == value)
+            .map_or_else(|| value.to_string(), |index| (index + 1).to_string())
+    }
+
+    /// 入力 1 行を解く。**範囲内の番号だけが回答**で、それ以外は既定
+    /// （#1506 前は問いの選択肢数に関係なく 1〜7 を回答として受け、Max の問いで
+    /// `4` を打つと「不明」扱いの `max` が保存された）
+    fn resolve(&self, input: &str, previous: Option<&str>) -> (String, SetupValueSource) {
+        let input = input.trim();
+        match (1..=self.choices.len()).find(|number| number.to_string() == input) {
+            Some(number) => (
+                self.choices[number - 1].to_string(),
+                SetupValueSource::Input,
+            ),
+            None => self.default_value(previous),
+        }
+    }
+}
+
+/// プランを 1 つ決める。`previous` は「答えなければ保つ」前回値で、**保てるものだけ**を
+/// 呼び手が渡す（選び方は標準 setup の前回値の引き継ぎと同じ規則 = `collect_provider_plans`）
+fn prompt_plan(
+    provider: Provider,
+    detected: Option<&str>,
+    previous: Option<&str>,
+    assume_yes: bool,
+    read_line: &mut dyn FnMut() -> String,
+) -> ResolvedSetupValue {
     if assume_yes {
+        // ここで前回値が渡るのは初回（`--reset` 後を含む）だけ。前回値の引き継ぎは
+        // 呼び手が `reuse_previous` で済ませていて、初回は引き継がない（FR-2.14.8）
         let resolved = if provider == Provider::Claude && detected == Some("max") {
             eprintln!(
                 "  [detected] {} プラン: max（倍率は未検出のため [default] 未指定）",
@@ -1914,74 +2034,14 @@ fn prompt_plan(provider: Provider, detected: Option<&str>, assume_yes: bool) -> 
         return resolved;
     }
 
+    let question = plan_question(provider, detected);
     eprintln!();
-    let (value, source) = match provider {
-        Provider::Claude if detected == Some("max") => {
-            eprintln!("Claude Max を検出しました。契約倍率を選んでください:");
-            eprintln!("  1) Max 5x");
-            eprintln!("  2) Max 20x");
-            eprintln!("  3) 不明");
-            eprint!("選択 [3]: ");
-            let (choice, source) = read_choice("3");
-            let value = match choice.as_str() {
-                "1" => "max-5x".into(),
-                "2" => "max-20x".into(),
-                _ => "max".into(),
-            };
-            (value, source)
-        }
-        Provider::Claude => {
-            eprintln!("Claude のプランを選んでください:");
-            eprintln!("  1) Free / 未契約  2) Pro  3) Max 5x  4) Max 20x");
-            eprintln!("  5) Team / Enterprise  6) API  7) 不明");
-            eprint!("選択 [7]: ");
-            let (choice, source) = read_choice("7");
-            let value = match choice.as_str() {
-                "1" => "free",
-                "2" => "pro",
-                "3" => "max-5x",
-                "4" => "max-20x",
-                "5" => "team-enterprise",
-                "6" => "api",
-                _ => "unknown",
-            }
-            .into();
-            (value, source)
-        }
-        Provider::Gpt => {
-            eprintln!("GPT / ChatGPT のプランを選んでください:");
-            eprintln!("  1) Free / 未契約  2) Plus  3) Pro");
-            eprintln!("  4) Business / Enterprise  5) API  6) 不明");
-            eprint!("選択 [6]: ");
-            let (choice, source) = read_choice("6");
-            let value = match choice.as_str() {
-                "1" => "free",
-                "2" => "plus",
-                "3" => "pro",
-                "4" => "business-enterprise",
-                "5" => "api",
-                _ => "unknown",
-            }
-            .into();
-            (value, source)
-        }
-        Provider::Google => {
-            eprintln!("Google のプランを選んでください（agy からは自動取得できません）:");
-            eprintln!("  1) Free / 未契約  2) Google AI Pro  3) Google AI Ultra");
-            eprintln!("  4) Workspace / Enterprise  5) 不明");
-            eprint!("選択 [5]: ");
-            let (choice, source) = read_choice("5");
-            let value = match choice.as_str() {
-                "1" => "free",
-                "2" => "google-ai-pro",
-                "3" => "google-ai-ultra",
-                "4" => "workspace-enterprise",
-                _ => "unknown",
-            }
-            .into();
-            (value, source)
-        }
-    };
+    eprintln!("{}", question.heading);
+    for line in question.lines {
+        eprintln!("{line}");
+    }
+    eprint!("選択 [{}]: ", question.default_label(previous));
+    let (value, source) = question.resolve(&read_line(), previous);
     eprintln!(
         "  [{}] {} プラン: {value}",
         source.label(),
@@ -1994,15 +2054,11 @@ fn prompt_plan(provider: Provider, detected: Option<&str>, assume_yes: bool) -> 
     }
 }
 
-fn read_choice(default: &str) -> (String, SetupValueSource) {
+/// 標準入力から 1 行読む（EOF・読み取り失敗は空行 = 既定を選んだのと同じ）
+fn read_stdin_line() -> String {
     let mut input = String::new();
     let _ = std::io::stdin().read_line(&mut input);
-    let trimmed = input.trim();
-    if matches!(trimmed, "1" | "2" | "3" | "4" | "5" | "6" | "7") {
-        (trimmed.to_string(), SetupValueSource::Input)
-    } else {
-        (default.to_string(), SetupValueSource::Default)
-    }
+    input
 }
 
 fn plain_provider_plans(plans: &BTreeMap<String, ResolvedSetupValue>) -> BTreeMap<String, String> {
@@ -2986,6 +3042,7 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
         &config.setup.provider_plans,
         reuse_previous,
         !review,
+        &mut read_stdin_line,
     );
     for (provider, value) in &answers.provider_plans {
         let detected = resolved_plans
@@ -3670,9 +3727,165 @@ mod tests {
             &BTreeMap::new(),
             false,
             true,
+            &mut || panic!("--yes は問いを読まない"),
         );
         assert_eq!(max["claude"].value, "max");
         assert_eq!(max["claude"].source, SetupValueSource::Detected);
+    }
+
+    /// `--review` の対話（前回値を引き継がず、問いを読む）でプランを決める
+    fn review_plan(
+        agents: &[DetectedAgent],
+        previous: &BTreeMap<String, String>,
+        input: &str,
+    ) -> BTreeMap<String, ResolvedSetupValue> {
+        collect_provider_plans(agents, previous, false, false, &mut || input.to_string())
+    }
+
+    #[test]
+    fn issue1506_reviewで答えずに進めても保存済みの倍率を保つ() {
+        // #1506 の症状: 既定が「3) 不明」固定なので Enter だけで max-5x が max へ戻った
+        let agents = [detected(SetupAgent::Claude, true, Some("max"))];
+        for saved in ["max-5x", "max-20x"] {
+            let previous = BTreeMap::from([("claude".to_string(), saved.to_string())]);
+            // "" は非 TTY の EOF（read_line が 0 バイトで返る）= 答えなかったのと同じ
+            for input in ["\n", ""] {
+                let plans = review_plan(&agents, &previous, input);
+                assert_eq!(plans["claude"].value, saved, "入力 {input:?}");
+                assert_eq!(plans["claude"].source, SetupValueSource::Previous);
+            }
+        }
+        let max = plan_question(Provider::Claude, Some("max"));
+        assert_eq!(
+            max.default_label(Some("max-5x")),
+            "1",
+            "既定の表記も前回値を指す"
+        );
+        assert_eq!(max.default_label(Some("max-20x")), "2");
+    }
+
+    #[test]
+    fn issue1506_reviewで答えなかった結果は標準setupの引き継ぎと揃う() {
+        // Enter を押し続けた `--review` と前回値を引き継ぐ標準 setup が**同じ値**を保存する。
+        // ずれると「見直しただけで設定が変わる」（#1506）。検出値と食い違う前回値・
+        // 選択肢に無い値・前回値なしも含めて全部揃うこと
+        let cases: &[(SetupAgent, Option<&str>, Option<&str>)] = &[
+            (SetupAgent::Claude, Some("max"), Some("max-5x")),
+            (SetupAgent::Claude, Some("max"), Some("max-20x")),
+            (SetupAgent::Claude, Some("max"), Some("max")),
+            // 検出値 max と食い違う前回値は保たない（検出値を優先 = FR-2.14.8）
+            (SetupAgent::Claude, Some("max"), Some("pro")),
+            (SetupAgent::Claude, Some("max"), Some("max-50x")),
+            (SetupAgent::Claude, Some("max"), None),
+            (SetupAgent::Claude, None, Some("pro")),
+            // 選択肢に無い検出由来の値（normalize_plan は任意の文字列を返しうる）
+            (SetupAgent::Claude, None, Some("team")),
+            (SetupAgent::Claude, None, None),
+            (SetupAgent::Claude, Some("pro"), Some("max-5x")),
+            (SetupAgent::Codex, None, Some("plus")),
+            (SetupAgent::Codex, None, Some("business")),
+            (SetupAgent::Codex, None, None),
+            (SetupAgent::Agy, None, Some("google-ai-pro")),
+            (SetupAgent::Agy, None, None),
+        ];
+        for &(kind, plan, saved) in cases {
+            let agents = [detected(kind, true, plan)];
+            let key = kind.provider().as_str().to_string();
+            let previous: BTreeMap<String, String> = saved
+                .map(|saved| (key.clone(), saved.to_string()))
+                .into_iter()
+                .collect();
+            let standard = collect_provider_plans(&agents, &previous, true, true, &mut || {
+                panic!("標準 setup は問いを読まない")
+            });
+            let review = review_plan(&agents, &previous, "\n");
+            assert_eq!(
+                review[&key].value,
+                standard[&key].value,
+                "{} detected={plan:?} previous={saved:?}: --review の Enter が標準 setup と違う値を保存した",
+                kind.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn issue1506_明示の選択は反映され範囲外の番号は答えなかった扱い() {
+        let agents = [detected(SetupAgent::Claude, true, Some("max"))];
+        let previous = BTreeMap::from([("claude".to_string(), "max-5x".to_string())]);
+        let chosen = review_plan(&agents, &previous, "2\n");
+        assert_eq!(chosen["claude"].value, "max-20x");
+        assert_eq!(chosen["claude"].source, SetupValueSource::Input);
+        // 「不明」も明示で選べる（前回値より答えが勝つ）
+        let unknown = review_plan(&agents, &previous, " 3 \n");
+        assert_eq!(unknown["claude"].value, "max");
+        assert_eq!(unknown["claude"].source, SetupValueSource::Input);
+        // #1506 前は問いの選択肢数に関係なく 1〜7 を回答として受け、`4` で max が保存された
+        for input in ["4\n", "7\n", "0\n", "9\n", "abc\n", "1x\n", "+1\n"] {
+            let kept = review_plan(&agents, &previous, input);
+            assert_eq!(kept["claude"].value, "max-5x", "入力 {input:?}");
+            assert_eq!(kept["claude"].source, SetupValueSource::Previous);
+        }
+        // Max 以外の問いでも同じ（GPT は 6 択なので 7 は範囲外）
+        let codex = [detected(SetupAgent::Codex, true, None)];
+        let gpt_previous = BTreeMap::from([("gpt".to_string(), "plus".to_string())]);
+        assert_eq!(
+            review_plan(&codex, &gpt_previous, "7\n")["gpt"].value,
+            "plus"
+        );
+        assert_eq!(
+            review_plan(&codex, &gpt_previous, "3\n")["gpt"].value,
+            "pro"
+        );
+    }
+
+    #[test]
+    fn issue1506_前回値が無い初回の問いは従来どおり() {
+        let max = plan_question(Provider::Claude, Some("max"));
+        assert_eq!(max.default_label(None), "3");
+        let agents = [detected(SetupAgent::Claude, true, Some("max"))];
+        let first = review_plan(&agents, &BTreeMap::new(), "\n");
+        assert_eq!(first["claude"].value, "max");
+        assert_eq!(first["claude"].source, SetupValueSource::Default);
+        for (provider, agent, label) in [
+            (Provider::Claude, SetupAgent::Claude, "7"),
+            (Provider::Gpt, SetupAgent::Codex, "6"),
+            (Provider::Google, SetupAgent::Agy, "5"),
+        ] {
+            assert_eq!(plan_question(provider, None).default_label(None), label);
+            let plans = review_plan(&[detected(agent, true, None)], &BTreeMap::new(), "\n");
+            assert_eq!(plans[provider.as_str()].value, "unknown");
+            assert_eq!(plans[provider.as_str()].source, SetupValueSource::Default);
+        }
+        // 選択肢に無い前回値は値そのもので見せる（番号へ化けさせない）
+        assert_eq!(
+            plan_question(Provider::Claude, None).default_label(Some("team")),
+            "team"
+        );
+    }
+
+    #[test]
+    fn プランの問いは表示の番号と保存する値の数が揃う() {
+        // 番号 → 値の対応は `choices` 1 か所。表示だけ増減するとずれるので数を突き合わせる
+        for (provider, detected) in [
+            (Provider::Claude, Some("max")),
+            (Provider::Claude, None),
+            (Provider::Gpt, None),
+            (Provider::Google, None),
+        ] {
+            let question = plan_question(provider, detected);
+            let shown: Vec<usize> = question
+                .lines
+                .iter()
+                .flat_map(|line| line.split_whitespace())
+                .filter_map(|word| word.strip_suffix(')')?.parse().ok())
+                .collect();
+            assert_eq!(
+                shown,
+                (1..=question.choices.len()).collect::<Vec<_>>(),
+                "{} detected={detected:?}",
+                provider.as_str()
+            );
+        }
     }
 
     #[test]

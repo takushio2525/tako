@@ -10,6 +10,10 @@
                   [--stop-after '<この文字列が出たら打ち切る>'] [--timeout 120]
                   -- <コマンド> [引数...]
 
+`--expect` は複数渡せる（どれか 1 つが出るたびに次の答えを返す。#1506 の
+`tako setup --review` は `[y/N]:` と `選択 [N]:` が混ざって出る）。
+省略時は `[y/N]:` だけ。
+
 子プロセスが PTY へ書いたものをそのまま stdout へ流し、終了コードを引き継ぐ。
 答えを使い切ったあとのプロンプトには改行だけ（= 既定の N）を返す。
 時間切れは子を殺して 124（`timeout(1)` と同じ）。
@@ -32,7 +36,8 @@ import time
 
 def main() -> int:
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--expect", default="[y/N]:")
+    # 既定は append の外で入れる（default に置くと指定したぶんが既定へ足される）
+    parser.add_argument("--expect", action="append", default=None)
     parser.add_argument("--answer", action="append", default=[])
     parser.add_argument("--stop-after")
     parser.add_argument("--timeout", type=float, default=120.0)
@@ -51,6 +56,7 @@ def main() -> int:
     os.close(slave)
 
     answers = list(args.answer)
+    expects = args.expect or ["[y/N]:"]
     # 4096 バイト境界で UTF-8 が割れても文字を壊さない（出力は日本語なので
     # 壊れると `--expect` / `--stop-after` の突き合わせが空振りする）
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
@@ -85,8 +91,13 @@ def main() -> int:
                 stopped = True
                 break
         pending += text
-        while args.expect in pending:
-            pending = pending.split(args.expect, 1)[1]
+        while True:
+            # 出てきた順に答える（複数の --expect のうち先に現れたものから）
+            hits = [(pending.find(e), e) for e in expects if e in pending]
+            if not hits:
+                break
+            at, expect = min(hits)
+            pending = pending[at + len(expect) :]
             answer = answers.pop(0) if answers else ""
             os.write(master, (answer + "\n").encode())
 
