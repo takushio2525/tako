@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-26（#1750: ⌘K パレット・Web のアドレスバー・dock の URL 欄の IME をターミナルから入力欄へ戻した）
-- 修正前の実測（一時プローブ・隔離 GUI・実マウスの入口）: 3 つとも ASCII と ⌘V は欄に入る一方、変換は**ターミナルペインに束縛**（下線・候補窓はターミナルのカーソル位置）、確定はパレット / アドレスバーで PTY へ、unmark は 3 つとも PTY へ。Web ペインにフォーカスがあるとアドレスバーの確定は消え、git のコミット欄が残ったままパレットを開くと変換は裏のコミット欄へ入った
-- `AppTextInput` に `Palette` / `WebAddress` / `WebDockUrl` を足し（パレット最優先 = `handle_key` と同じ順）、4 経路を 1 挿入関数・開く / 閉じるを 1 本ずつ（閉じる出口が変換を捨てる）・Web の 2 欄は `TextField` へ・見えない欄は奪わない・長い URL は `inline_input_window` で詰める
-- 実測: セルフテスト項目 155 緑 / `TAKO_1750_LEGACY=1` で FAILED・番犬 `issue1750_palette_web_ime_watchdog`（注入 15 通り）+ 実ソース注入 3 通りが `main.rs:<line>` で名指し → 戻して緑・項目 154 緑・workspace 5798 passed 0 failed・clippy 3 宇宙 0。実 IME は `manual-checks.md`
-
 ## 2026-09-26（#1742: 上下移動の桁を表示幅で覚え、選択中の ←→ で畳み、macOS の ⌃A・⌃E・⌃K を足した）
 - 桁の記憶を文字数 → 表示幅（全角 2・タブは 4 桁ごとのタブストップ。`unicode-width` は alacritty 経由で既にツリー内の版を直接依存へ）、選択中の素の ←→ は選択の端へ畳む、⌃A（桁 0）/ ⌃E / ⌃K は `editor_keys` の macOS 列だけ（Windows に置かない理由は表の行）。操作は足さず `tako edit move` / `delete`・MCP の既存の口で同じ結果
 - 実測: `scripts/test-editor-keys-1652.sh` **37 PASS 0 FAIL**（tako-vd の実打鍵 15 相 + CLI / MCP の字面照合。bash 3.2 で通す）・注入 3 通りが単体と実 GUI で名指しの FAILED → 戻して緑・workspace 5644 passed 0 failed・clippy 3 宇宙 0。描画は全角 13px / タブ 28px で桁の規則（桁 4 = 31.3px）と 3〜5px ずれる = 描画側の別件
@@ -64,3 +59,7 @@
 ## 2026-09-27（#1775: PWA e2e の証拠を spec ごとのサブ dir へ分け、CI だけ 2 workers にした）
 - `TAKO_EVIDENCE_DIR` の平置きで `01-list.png` / `05-observe.png` / `06-forbidden.png` が spec をまたいで上書きし、80 回撮って 76 枚しか残らなかった。`evidencePath()` の 1 実装で `<dir>/<spec 名>/` を挟み 80 枚（outputDir 側は不変）。番犬 `issue1749_pwa_e2e_output_watchdog` に規則 5（サブ dir）・6（spec 内の同名）を足し、注入 3 通りが file:line 名指しで FAILED → 戻して緑
 - CI の macOS（3 vCPU）は既定 50% で 1 worker = ステップ 129〜138 秒。同ランナーの実測で 2 workers 73〜87 秒・`--repeat-each=3` 327 項目 × 2 台 flaky 0 → ci.yml だけ `--workers=2`（3 は dev サーバーの取り分が無い）。README / commands.md の所要時間を実測値へ
+
+## 2026-09-27（#1784: 隔離 GUI のヘルパが呼び出し側の偽の TAKO_ISOLATED を通さないようにした）
+- `launch_isolated_gui` は既定 `${TAKO_ISOLATED:-1}` を `"$@"` の前に置いていたので、引数 / export の `0`・空・`false` がそのまま GUI へ届いていた（偽 GUI で実測）。GUI へは常に `TAKO_ISOLATED=1` を `"$@"` より後ろで渡し、偽（tako の `is_verification_gui` が偽と読む値）は面を起こす前に終了コード 2 + stderr 1 行で断る（#1760 と同じ「使い方の誤り」）
+- 実測: 番犬 3 本追加（構造 / `/bin/bash` 3.2 の実走 / tako の真偽との突き合わせ）で注入 6 通りすべて file:line 名指しで FAILED → 戻して緑・tako-vd の実 GUI でも偽は起動せず 2、`on` は実プロセスの env が `TAKO_ISOLATED=1`

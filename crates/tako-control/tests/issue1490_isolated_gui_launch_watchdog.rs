@@ -61,6 +61,23 @@
 //! 13. [`実在し得ないindexはtakoでも見失いになり窓を開かない`] — ヘルパが通す
 //!     「当たらない面」（#1697 の ④ が使う）が tako の当て方でも本当に当たらず、
 //!     明示の見失い（窓を開かずに終わる = #1697 の道）になる
+//!
+//! ## #1784: 検証用 GUI の印を偽にさせない
+//!
+//! #1760 のあとも、呼び出し側が `TAKO_ISOLATED=0` を並べると既定（`${TAKO_ISOLATED:-1}`）より
+//! 後ろなのでそのまま GUI へ届き、検証用 GUI として扱われなかった（面の指定を見失うと、窓を
+//! 開かずに終わる #1697 の道ではなく既定の面 = ユーザーの画面へ落ちる）。ヘルパは偽（tako が
+//! 真と読む 1 / true / on 以外。空も含む）を渡されたら面を起こす前に終了コード 2 で断り、
+//! GUI へは常に `TAKO_ISOLATED=1` を呼び出し側の `VAR=VAL` より後ろで渡す。
+//!
+//! 14. [`ヘルパは検証用guiの印を呼び出し側より後ろで真に固定する`] — 起動行で `"$@"` より後ろに
+//!     `"TAKO_ISOLATED=1"` が在り、呼び出し側の値を素通しする既定が無く、判定と断る行が
+//!     面を起こす行より前に在る
+//! 15. [`偽のtako_isolatedではヘルパは起動せずに理由を1行出す`] — 実際に `/bin/bash` で走らせ、
+//!     引数 / export / 空 / 両方 / 面を用意できない機のどれでも偽なら偽の GUI が起きず、
+//!     真と未指定では偽の GUI が `TAKO_ISOLATED=1` を受け取ることを見る
+//! 16. [`ヘルパが真と読むtako_isolatedはtakoの読み方と同じ`] — 値ごとにヘルパの判定を
+//!     tako の `is_verification_gui` と突き合わせる
 
 use std::path::{Path, PathBuf};
 
@@ -571,16 +588,19 @@ esac
 #[cfg(unix)]
 const STUB_VD_NAME: &str = "tako-vd-watchdog-1744-absent";
 
-/// GUI の偽物。起きたら受け取った面の指定を印へ書く（窓は出さない）
+/// GUI の偽物。起きたら受け取った面の指定と検証用 GUI の印（#1784）を印へ書く（窓は出さない）
 #[cfg(unix)]
 const STUB_APP: &str = r#"#!/bin/bash
 echo "TAKO_DISPLAY=${TAKO_DISPLAY-<unset>}" > "$STUB_MARK"
+echo "TAKO_ISOLATED=${TAKO_ISOLATED-<unset>}" > "$STUB_MARK.isolated"
 "#;
 
 #[cfg(unix)]
 struct Run {
     rc: i32,
     started: Option<String>,
+    /// 偽の GUI が受け取った `TAKO_ISOLATED=…`（起きなければ None。#1784）
+    isolated: Option<String>,
     stderr: String,
 }
 
@@ -594,8 +614,10 @@ fn run_helper(scratch: &Scratch, vd: &Path, env: &[(&str, &str)], args: &[&str])
     std::fs::write(&app, STUB_APP).expect("偽の GUI を書く");
     std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     let mark = dir.join("mark");
+    let isolated_mark = dir.join("mark.isolated");
     let err = dir.join("err");
     let _ = std::fs::remove_file(&mark);
+    let _ = std::fs::remove_file(&isolated_mark);
     let helper = repo_root().join(HELPER_REL);
     let script = r#"
 . "$HELPER"
@@ -631,6 +653,9 @@ exit "$rc"
     Run {
         rc: status.code().unwrap_or(-1),
         started: std::fs::read_to_string(&mark).ok(),
+        isolated: std::fs::read_to_string(&isolated_mark)
+            .ok()
+            .map(|s| s.trim_end_matches('\n').to_string()),
         stderr: std::fs::read_to_string(&err).unwrap_or_default(),
     }
 }
@@ -731,6 +756,11 @@ fn 面を用意できないとヘルパは起動せずに理由を1行出す() {
         r.started.as_deref().map(str::trim),
         Some(format!("TAKO_DISPLAY={STUB_VD_NAME}").as_str()),
         "{HELPER_REL}:{launch}: 通常経路で GUI へ渡る面の指定が違う（#1697 / #1744）"
+    );
+    assert_eq!(
+        r.isolated.as_deref(),
+        Some("TAKO_ISOLATED=1"),
+        "{HELPER_REL}:{launch}: 通常経路で GUI へ渡る検証用 GUI の印が 1 ではない（#1784）"
     );
     assert!(
         r.stderr.trim().is_empty(),
@@ -983,6 +1013,11 @@ fn tako_vd以外の面の明示ではヘルパは起動せずに理由を1行出
             Some(want.as_str()),
             "{HELPER_REL}:{launch}: {name} で GUI へ渡る面の指定が違う（#1760）"
         );
+        assert_eq!(
+            r.isolated.as_deref(),
+            Some("TAKO_ISOLATED=1"),
+            "{HELPER_REL}:{launch}: {name} で GUI へ渡る検証用 GUI の印が 1 ではない（#1784）"
+        );
         assert!(
             r.stderr.trim().is_empty(),
             "{name}: stderr が空ではない: {}",
@@ -1225,5 +1260,291 @@ fn 失敗の拾い方の検査は実際の取りこぼしを検出する() {
     ] {
         let (_, bad) = unhandled_launches(src);
         assert!(bad.is_empty(), "検査が正しい書き方を誤検出している: {src} → {bad:?}");
+    }
+}
+
+// --------------------------------------------- 14. 検証用 GUI の印を偽にさせない（#1784）
+
+/// `launch_isolated_gui` の中の `(印を判定する行, 断る行, 面を起こす行, GUI を起こす行)`
+fn isolated_refusal_lines(src: &str) -> (Option<usize>, Option<usize>, usize, usize) {
+    let (body, at) = fn_body(HELPER_REL, src, "launch_isolated_gui()");
+    let ensure = find(&body, "iso_ensure_display").unwrap_or_else(|| {
+        panic!("{HELPER_REL}:{at}: launch_isolated_gui が面を起こしていない（#1490）")
+    });
+    let launch = find(&body, "\"$APP_BIN\"").unwrap_or_else(|| {
+        panic!("{HELPER_REL}:{at}: launch_isolated_gui が GUI を起こす行が見つからない")
+    });
+    let judge = body
+        .iter()
+        .find(|(_, l)| {
+            l.trim_start().starts_with("if ") && l.contains("! iso_isolated_allowed \"$isolated\"")
+        })
+        .map(|(n, _)| *n);
+    let refuse = judge.and_then(|j| {
+        body.iter()
+            .find(|(n, l)| *n > j && l.contains("return \"$ISOLATED_GUI_RC_NOT_ISOLATED\""))
+            .map(|(n, _)| *n)
+    });
+    (judge, refuse, ensure, launch)
+}
+
+#[test]
+fn ヘルパは検証用guiの印を呼び出し側より後ろで真に固定する() {
+    let src = read(HELPER_REL);
+    let (body, _) = fn_body(HELPER_REL, &src, "launch_isolated_gui()");
+    let (judge, refuse, ensure, launch) = isolated_refusal_lines(&src);
+    let lines: Vec<&str> = src.lines().collect();
+    let launch_line = lines[launch - 1].trim();
+
+    // GUI へ渡す印は固定の 1 で、呼び出し側の `VAR=VAL`（"$@"）より後ろ = 呼び出し側の
+    // `TAKO_ISOLATED=0` が env で勝てない
+    let args_at = launch_line.find("\"$@\"").unwrap_or_else(|| {
+        panic!(
+            "{HELPER_REL}:{launch}: GUI を起こす行が呼び出し側の VAR=VAL（\"$@\"）を渡していない\n    {launch_line}"
+        )
+    });
+    let fixed_at = launch_line.find("\"TAKO_ISOLATED=1\"").unwrap_or_else(|| {
+        panic!(
+            "{HELPER_REL}:{launch}: GUI を起こす行が固定の `\"TAKO_ISOLATED=1\"` を渡していない（#1784）\n    {launch_line}\n\
+             → 呼び出し側の `TAKO_ISOLATED=0` がそのまま GUI へ届き、検証用 GUI として扱われない"
+        )
+    });
+    assert!(
+        args_at < fixed_at,
+        "{HELPER_REL}:{launch}: 検証用 GUI の印が呼び出し側の VAR=VAL より前に在る \
+         = 呼び出し側の `TAKO_ISOLATED=0` が勝って GUI へ届く（#1784）\n    {launch_line}"
+    );
+    // 呼び出し側の値を素通しする既定（#1784 前の `TAKO_ISOLATED=${TAKO_ISOLATED:-1}`）が無い
+    if let Some((n, l)) = body.iter().find(|(_, l)| l.contains("TAKO_ISOLATED=${")) {
+        panic!(
+            "{HELPER_REL}:{n}: 呼び出し側の TAKO_ISOLATED を素通しして GUI へ渡している（#1784 前の形）\n    {}",
+            l.trim()
+        );
+    }
+
+    // 偽を断る判定は面を起こす前に在る = 面を用意できない機（CI）でも書き方の誤りが
+    // 4（未実測）に紛れない
+    let judge = judge.unwrap_or_else(|| {
+        panic!(
+            "{HELPER_REL}:{ensure}: 検証用 GUI の印を判定せずに面を起こしている（#1784）\n\
+             → `if [ -n \"$isolated_from\" ] && ! iso_isolated_allowed \"$isolated\"; then …; \
+             return \"$ISOLATED_GUI_RC_NOT_ISOLATED\"; fi` を面を起こす前に置く"
+        )
+    });
+    let refuse = refuse.unwrap_or_else(|| {
+        panic!(
+            "{HELPER_REL}:{judge}: 検証用 GUI の印を判定しても断っていない（#1784）。\n\
+             → `return \"$ISOLATED_GUI_RC_NOT_ISOLATED\"` で返す"
+        )
+    });
+    assert!(
+        judge < ensure && refuse < ensure,
+        "{HELPER_REL}:{judge}: 印の判定（断る行 {HELPER_REL}:{refuse}）が面を起こす行\
+         （{HELPER_REL}:{ensure}）より後ろに在る = 面を用意できない機では書き方の誤りが \
+         4（未実測）に紛れる（#1784）"
+    );
+    // 断るときの終了コードは面の指定の誤り（#1760）と同じ 2 = 使い方の誤り
+    assert!(
+        src.lines()
+            .any(|l| l.trim() == "ISOLATED_GUI_RC_NOT_ISOLATED=2"),
+        "{HELPER_REL}: ISOLATED_GUI_RC_NOT_ISOLATED が 2 ではない（#1784。\
+         #1760 と同じ「使い方の誤り」。4 = 未実測と読ませない）"
+    );
+}
+
+// --------------------------------------------- 15. 実際に走らせて断ることを見る（#1784）
+
+#[cfg(unix)]
+#[test]
+fn 偽のtako_isolatedではヘルパは起動せずに理由を1行出す() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = Scratch::new("isolated");
+    let vd = scratch.0.join("virtual-display.sh");
+    std::fs::write(&vd, STUB_VD).expect("偽の係を書く");
+    std::fs::set_permissions(&vd, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let src = read(HELPER_REL);
+    let (judge, _, _, launch) = isolated_refusal_lines(&src);
+    // 名指す行: 判定の行（消えていれば起動行）と判定の実体
+    let judge_at = judge.unwrap_or(launch);
+    let (_, allowed_at) = fn_body(HELPER_REL, &src, "iso_isolated_allowed()");
+    type Env<'a> = &'a [(&'a str, &'a str)];
+
+    const ARG: &str = "（launch_isolated_gui の引数）";
+    const EXPORT: &str = "（export）";
+    // (場面, 係と export への env, launch_isolated_gui へ並べる VAR=VAL, 理由に出る値と出どころ)
+    let refused: &[(&str, Env, &[&str], String)] = &[
+        (
+            "引数で 0",
+            &[],
+            &["TAKO_ISOLATED=0"],
+            format!("TAKO_ISOLATED='0'{ARG}"),
+        ),
+        (
+            "export で 0",
+            &[("TAKO_ISOLATED", "0")],
+            &[],
+            format!("TAKO_ISOLATED='0'{EXPORT}"),
+        ),
+        (
+            "引数で空",
+            &[],
+            &["TAKO_ISOLATED="],
+            format!("TAKO_ISOLATED=''{ARG}"),
+        ),
+        (
+            "export の空（tako は空を偽と読む）",
+            &[("TAKO_ISOLATED", "")],
+            &[],
+            format!("TAKO_ISOLATED=''{EXPORT}"),
+        ),
+        (
+            "引数で false",
+            &[],
+            &["TAKO_ISOLATED=false"],
+            format!("TAKO_ISOLATED='false'{ARG}"),
+        ),
+        (
+            "export で false",
+            &[("TAKO_ISOLATED", "false")],
+            &[],
+            format!("TAKO_ISOLATED='false'{EXPORT}"),
+        ),
+        (
+            "export は 1・引数で 0（引数が勝つ）",
+            &[("TAKO_ISOLATED", "1")],
+            &["TAKO_ISOLATED=0"],
+            format!("TAKO_ISOLATED='0'{ARG}"),
+        ),
+        (
+            "引数で 1 のあとに 0（最後が勝つ）",
+            &[],
+            &["TAKO_ISOLATED=1", "TAKO_ISOLATED=0"],
+            format!("TAKO_ISOLATED='0'{ARG}"),
+        ),
+        (
+            "面を用意できない機でも 4 に紛れない",
+            &[
+                ("STUB_ENSURE_RC", "1"),
+                ("STUB_ENSURE_ERR", "tako-vd を起こせなかった"),
+            ],
+            &["TAKO_ISOLATED=0"],
+            format!("TAKO_ISOLATED='0'{ARG}"),
+        ),
+    ];
+    for (name, env, args, why) in refused {
+        let r = run_helper(&scratch, &vd, env, args);
+        assert!(
+            r.started.is_none() && r.isolated.is_none(),
+            "{HELPER_REL}:{judge_at}: 偽の TAKO_ISOLATED（{name}）で GUI を起動した（#1784）。\n\
+             判定の実体は {HELPER_REL}:{allowed_at}。GUI が受け取った印: {:?}",
+            r.isolated
+        );
+        assert_eq!(
+            r.rc, 2,
+            "{HELPER_REL}:{judge_at}: 偽の TAKO_ISOLATED（{name}）で終了コードが 2 ではない（#1784）\n\
+             stderr: {}",
+            r.stderr
+        );
+        let lines: Vec<&str> = r.stderr.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "{HELPER_REL}:{judge_at}: 理由が 1 行ではない（{name}）: {lines:?}"
+        );
+        assert!(
+            lines[0].starts_with("ERROR: TAKO_ISOLATED=")
+                && lines[0].contains(why.as_str())
+                && lines[0].contains("#1784"),
+            "{HELPER_REL}:{judge_at}: 理由の 1 行が「ERROR: {why}… #1784」になっていない（{name}）: {}",
+            lines[0]
+        );
+    }
+
+    // 対照: 未指定と真の値は起動し、GUI が受け取る印は必ず `1`（呼び出し側の綴りを素通ししない）
+    let allowed: &[(&str, Env, &[&str])] = &[
+        ("未指定", &[], &[]),
+        ("引数で 1", &[], &["TAKO_ISOLATED=1"]),
+        ("引数で true", &[], &["TAKO_ISOLATED=true"]),
+        ("export で on", &[("TAKO_ISOLATED", "on")], &[]),
+        (
+            "export は 0・引数で 1（引数が勝つ）",
+            &[("TAKO_ISOLATED", "0")],
+            &["TAKO_ISOLATED=1"],
+        ),
+        (
+            "引数で on と別の VAR=VAL",
+            &[],
+            &["TAKO_ISOLATED=on", "TAKO_1784_PROBE=1"],
+        ),
+    ];
+    for (name, env, args) in allowed {
+        let r = run_helper(&scratch, &vd, env, args);
+        assert_eq!(
+            r.rc, 0,
+            "{HELPER_REL}:{allowed_at}: 真の TAKO_ISOLATED（{name}）を断った（#1784）: {}",
+            r.stderr
+        );
+        assert_eq!(
+            r.isolated.as_deref(),
+            Some("TAKO_ISOLATED=1"),
+            "{HELPER_REL}:{launch}: {name} で GUI へ渡る検証用 GUI の印が 1 ではない \
+             = 呼び出し側の値が固定の 1 より後ろで勝っている（#1784）"
+        );
+        assert!(
+            r.stderr.trim().is_empty(),
+            "{name}: stderr が空ではない: {}",
+            r.stderr
+        );
+    }
+}
+
+// --------------------------------------------- 16. 真の読み方は tako と同じ（#1784）
+
+/// ヘルパが真と読む値は tako の `is_verification_gui` と同じ集合。
+/// 広げると「ヘルパは真と見たのに tako は偽と読む」値が生まれ、狭めると正しい値を断る
+#[cfg(unix)]
+#[test]
+fn ヘルパが真と読むtako_isolatedはtakoの読み方と同じ() {
+    use std::os::unix::fs::PermissionsExt;
+    use tako_core::platform::display::is_verification_gui;
+    let scratch = Scratch::new("isolated-parity");
+    let vd = scratch.0.join("virtual-display.sh");
+    std::fs::write(&vd, STUB_VD).expect("偽の係を書く");
+    std::fs::set_permissions(&vd, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let src = read(HELPER_REL);
+    let (_, allowed_at) = fn_body(HELPER_REL, &src, "iso_isolated_allowed()");
+
+    let values = [
+        "1", "true", "on", "0", "", "false", "off", "no", "yes", "TRUE", "True", "ON", " 1", "1 ",
+        "01", "2",
+    ];
+    // 真と偽の両方が並んでいる = 突き合わせが片側だけの空振りになっていない
+    assert!(
+        values
+            .iter()
+            .any(|v| is_verification_gui(Some(v), false, false))
+            && values
+                .iter()
+                .any(|v| !is_verification_gui(Some(v), false, false)),
+        "突き合わせる値に真と偽の両方が無い"
+    );
+    for v in values {
+        let want = is_verification_gui(Some(v), false, false);
+        let arg = format!("TAKO_ISOLATED={v}");
+        let r = run_helper(&scratch, &vd, &[], &[arg.as_str()]);
+        let got = r.rc == 0 && r.isolated.is_some();
+        let say = |b: bool| if b { "真" } else { "偽" };
+        assert_eq!(
+            got,
+            want,
+            "{HELPER_REL}:{allowed_at}: TAKO_ISOLATED={v:?} をヘルパは{}と読むが、tako \
+             （crates/tako-core/src/platform/display.rs の is_verification_gui）は{}と読む（#1784）\n\
+             rc={} stderr: {}",
+            say(got),
+            say(want),
+            r.rc,
+            r.stderr
+        );
     }
 }
