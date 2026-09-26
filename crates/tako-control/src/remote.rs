@@ -2447,8 +2447,12 @@ fn reset_signal_mask() {
 /// - シグナルマスクを空に戻す: 親（GUI = GPUI / AppKit）がブロックしている
 ///   シグナルは exec をまたいで継承される。戻さないと生まれた daemon が SIGTERM を
 ///   受け取れず、`tako remote stop` と GUI の kill switch が無言で失敗する
-///   （`pre_exec` は fork 後・exec 前の子プロセスで走るので、ここで呼ぶ
-///   `setsid` / `pthread_sigmask` はどちらも async-signal-safe）
+/// - GUI の fd を受け継がない（#1768）: GUI が CLOEXEC 無しで開いた fd（Metal の
+///   シェーダキャッシュ等）へ CLOEXEC を立て、長生きする daemon に握らせない。
+///   子の中で掃くので、掃いてから fork までに別スレッドが開いた fd の隙間も無い
+///
+/// （`pre_exec` は fork 後・exec 前の子プロセスで走るので、ここで呼ぶ
+/// `setsid` / `pthread_sigmask` / `seal_inherited_fds` はどれも async-signal-safe）
 fn configure_daemon_child(cmd: &mut Command) {
     #[cfg(unix)]
     {
@@ -2457,6 +2461,7 @@ fn configure_daemon_child(cmd: &mut Command) {
             cmd.pre_exec(|| {
                 libc::setsid();
                 reset_signal_mask();
+                tako_core::platform::fd_inherit::seal_inherited_fds();
                 Ok(())
             });
         }
@@ -8625,6 +8630,60 @@ mod tests {
                 "configure_daemon_child 後は SIGTERM が届いて子が終了する"
             );
         }
+    }
+
+    /// #1768: `configure_daemon_child` を通した daemon の子は、GUI が CLOEXEC 無しで
+    /// 開いた fd（Metal のシェーダキャッシュ等）を受け継がない。
+    ///
+    /// 掃除は子の中（`pre_exec`）で走るので、**親の fd は CLOEXEC 無しのまま残る**。
+    /// 測っているあいだに親の fd へ CLOEXEC が立った回（親で掃除を直接呼ぶ誰かが
+    /// 並走した）は、子で見えないのがどちらの手柄か分からないので、開き直して測り直す
+    #[cfg(unix)]
+    #[test]
+    fn configure_daemon_childの子はguiがcloexec無しで開いたfdを受け継がない() {
+        use tako_core::platform::fd_inherit::{inherited_probe_script, observed_inherited};
+        let site = include_str!("remote.rs")
+            .lines()
+            .position(|l| l.starts_with("fn configure_daemon_child("))
+            .map_or_else(|| "?".to_string(), |i| (i + 1).to_string());
+        let cloexec = |fd: i32| unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC != 0;
+        let run = |fd: i32, configure: bool| -> Option<Vec<i32>> {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.args(["-c", &inherited_probe_script(&[fd])])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            if configure {
+                configure_daemon_child(&mut cmd);
+            }
+            let out = cmd.output().expect("sh を起動できる");
+            observed_inherited(&String::from_utf8_lossy(&out.stdout))
+        };
+        for _ in 0..5 {
+            let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+            assert!(fd >= 3, "/dev/null を開ける: {fd}");
+            let raw = run(fd, false);
+            let configured = run(fd, true);
+            let parent_untouched = !cloexec(fd);
+            unsafe { libc::close(fd) };
+            if !parent_untouched {
+                continue;
+            }
+            assert_eq!(
+                raw,
+                Some(vec![fd]),
+                "前提: 素の spawn では CLOEXEC 無しの fd が子へ見える"
+            );
+            assert_eq!(
+                configured,
+                Some(vec![]),
+                "crates/tako-control/src/remote.rs:{site}: daemon の子が CLOEXEC 無しの fd {fd} を\
+                 受け継いだ。configure_daemon_child の pre_exec で \
+                 platform::fd_inherit::seal_inherited_fds() を通していない（#1768）"
+            );
+            return;
+        }
+        panic!("5 回とも別のテストが親で fd を掃いたので、子の中の掃除を測れなかった");
     }
 
     /// 使い捨ての子プロセスを起動する（#619 のテスト用）。
