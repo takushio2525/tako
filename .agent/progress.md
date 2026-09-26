@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-09-26（#1729: Code Runner の実行設定の型と Python の実行環境の検出を tako-core に置いた）
-- `runner_config`（RunConfig / RuntimeRef / merge = file > project > 宣言 > 自動）と `runtime_env`（表 `KINDS` + 戦略 6 種 + `FsProbe`）を新設。Python は uv → venv → poetry → pipenv → conda → pyenv → システムの順で、Windows の列まで macOS の単体で固定。検出は stat と先頭読みだけで、辿る範囲は引数（#1656 の candidate_dirs に任せる）
-- 番犬 `issue1729_runtime_env_table_watchdog`（表の語彙を表から集めて表の外の直書きを名指し・属性の OS 分岐・子プロセス）。注入 6 通りすべて FAILED → 戻して緑。Windows CI で区切り混在の除外漏れも露出 → 修正
-
 ## 2026-09-26（#1654: Tab / ⇧Tab でインデントし、Enter でインデントを引き継ぐようにした）
 - 打鍵表に Tab の行（⇧ で浅く）を足し、`TextBuffer` に `indent` / `outdent` / `newline_and_indent` と既存行からのインデント推定（開いたとき 1 回）を追加。開き括弧の直後は 1 段深く（Python / YAML は `:` も・Markdown は継承だけ）、括弧の自動閉じは理由を書いて対象外。`PreviewEditCommand` + `tako edit indent|outdent|newline` + MCP は `tako_preview_edit` の `command`（ツールは増やさない）
 - 実測: tako-vd の実打鍵経路 12 相が緑（Enter を素の改行へ戻す注入で E8 の症状が再現して FAILED）・注入 7 通りが名指しで FAILED → 戻して緑
@@ -64,3 +60,7 @@
 ## 2026-09-26（#1506: setup --review のプランの問いの既定を前回値にし、Enter で倍率が退行しないようにした）
 - `--review` は前回値を引き継がない経路なので `prompt_plan` へ前回値が届かず、既定が「不明」固定 = Enter・非 TTY の EOF だけで `max-5x` → `max`（GPT / Google も `unknown` へ）。問いを `plan_question`（表示と「番号 → 値」の 1 か所）へ寄せ、既定は**標準 setup が前回値から選ぶ値と同じ規則**で引く（Max 検出時は max 系だけ・選択肢に無い値は値そのものを既定に見せる）。範囲外の番号は答えなかった扱い（旧は選択肢数を問わず 1〜7 を受け、Max の問いで `4` を打つと `max`）
 - 実測: `scripts/test-setup-plan-keep-previous-1506.sh` **45 PASS 0 FAIL**（修正前ビルドでは `--review` 系の 11 項目だけ FAIL・`--yes` / MCP と同じ起動 / 初回は修正前から緑）・単体 5 本（15 通りで「Enter の結果 = 標準 setup」を照合）・注入 3 通りすべて file:line で FAILED → 戻して緑・pty-answer を共有する 1499 / 1501 / 1504 / 1509 全緑・workspace 5541 passed 0 failed・clippy 3 宇宙 0
+
+## 2026-09-26（#1657: Code Runner の実行ペインを使い回し、内部マーカーを画面から消して終わりを案内とバッジで伝えた）
+- 再生ボタン / `tako run` は同じタブの「同じファイル + 同じプロファイル」の実行ペインを**その位置で差し替える**（`PaneTree::replace` + 旧ペインは close と同じ後始末。実行中なら止めて再実行 = `stopped_running`。`--new-pane` / MCP `new_pane` で増やす）。終了コードは側路ファイル `run-exit/<pane>.code` で運び（画面の `__TAKO_EXIT=` は書けなかったときの退避路だけ）、画面には「[tako] 終了コード N / Enter で…」、タイトルバーに実行中 / 完了 / 失敗 (N) のバッジ。読む側は `run_pane_exit_code` の 1 実装（`--wait`・カードの実行記録 #1724・`list` の `run`・バッジ）
+- 実測: `scripts/test-run-pane-reuse-1657.sh` **44 PASS 0 FAIL**（5 回で 1 枚・器つきの capture-pane にマーカー無し・A/B `TAKO_1657_LEGACY=1` で 5 枚 + マーカー・visual-test のバッジ色）・`test-remote-command-card-1724.sh` 55 PASS・注入 4 通りが file:line 名指しで FAILED → 戻して緑・workspace 5562 passed 0 failed・clippy 3 宇宙 0

@@ -2430,6 +2430,10 @@ struct TakoApp {
     /// #1199: 待ち合わせ先は「そのペインのシェルの pid」で分かれる（器の中の別のシェルが
     /// 同じファイルへ書けてしまうため）ので、pid が分かった時点で張り替える
     osc_sinks: HashMap<PaneId, tako_core::osc_sink::SinkReader>,
+    /// 終了コードの届いていない実行ペイン（#1657）。出力があるたびにここに居るペインだけ
+    /// 側路を見に行き、終わった瞬間にタイトルバーのバッジを切り替える。
+    /// 取りこぼしは 2 秒ごとの `settle_run_panes` が拾う（ここは「すぐ出す」ための近道）
+    run_exit_watch: std::collections::HashSet<PaneId>,
     /// スリープ防止の最新状態（ステータスバーチップ + 詳細ポップオーバー表示用。
     /// ポーリングで更新。#173/#218/#440）
     sleep_guard_state: Option<tako_control::sleep_guard::SleepGuardState>,
@@ -4191,6 +4195,7 @@ impl TakoApp {
             pending_close_confirm: None,
             running_children_scan: tako_control::agents::RunningChildrenScanState::default(),
             osc_sinks: HashMap::new(),
+            run_exit_watch: std::collections::HashSet::new(),
             sleep_guard_state: None,
             sleep_guard_popover_open: false,
             sleep_guard_popover_anchor: None,
@@ -5196,6 +5201,28 @@ impl TakoApp {
                     // 変わったときだけカードの表示を描き直す
                     if tako_control::dispatch::refresh_command_card_runs(app) {
                         wcx.notify();
+                    }
+                    // #1657: 実行ペインの終了を確定してバッジを切り替える（出力の無い終わり方・
+                    // CLI の `--wait` より先に終わったぶんの取りこぼしを拾う）。
+                    // 見張りの一覧からは、終わった・閉じたペインを外す
+                    {
+                        let _s = tako_control::diag::perf_span("periodic_prep:run_panes");
+                        for pane_id in tako_control::dispatch::settle_run_panes(app) {
+                            if let Some(view) = app.pane_headers.get(&pane_id).cloned() {
+                                view.update(wcx, |_, cx| cx.notify());
+                            }
+                        }
+                        let workspace = &app.workspace;
+                        app.run_exit_watch.retain(|pane| {
+                            workspace
+                                .find_tab_of_pane(*pane)
+                                .and_then(|t| workspace.get_tab(t))
+                                .and_then(|t| t.tree().get(*pane))
+                                .and_then(|p| p.interactive_meta())
+                                .is_some_and(|m| {
+                                    m.status() == tako_core::run_pane::RunStatus::Running
+                                })
+                        });
                     }
                     let running_children_scan = {
                         let _s = tako_control::diag::perf_span("periodic_prep:sleep_guard");
@@ -8150,6 +8177,17 @@ impl TakoApp {
             .scrollback_lines
             .get_or_insert(self.scrollback_lines);
         let (session, mut rx) = TerminalSession::spawn(INITIAL_COLS, INITIAL_ROWS, options)?;
+        // #1657: 実行ペインは終了コードが届くまで出力のたびに側路を見る（バッジをすぐ出す）
+        let running_run_pane = self
+            .workspace
+            .find_tab_of_pane(pane_id)
+            .and_then(|t| self.workspace.get_tab(t))
+            .and_then(|t| t.tree().get(pane_id))
+            .and_then(|p| p.interactive_meta())
+            .is_some_and(|m| m.status() == tako_core::run_pane::RunStatus::Running);
+        if running_run_pane {
+            self.run_exit_watch.insert(pane_id);
+        }
         // #1199: 器なしのペインは PTY 直下の子がそのままシェルなので、側路の待ち合わせ先を
         // ここで張れる（器ありは器へ `#{pane_pid}` を聞いてから張る = 下のリトライ）
         if backend_session.is_none() {
@@ -8328,6 +8366,15 @@ impl TakoApp {
             // タイトル（OSC 0/2）はタブ名・ペインヘッダに出る = ペイン外の UI
             Some(SessionNotice::TitleChanged) => ui_outside_pane = true,
             None => {}
+        }
+        // #1657: 実行ペインが終わったら（スクリプトは側路を書いてから案内を出すので、
+        // 案内の出力でここへ来た時点で読める）タイトルバーのバッジを切り替える
+        if !need_immediate
+            && self.run_exit_watch.contains(&pane_id)
+            && tako_control::dispatch::settle_run_pane(self, pane_id)
+        {
+            self.run_exit_watch.remove(&pane_id);
+            ui_outside_pane = true;
         }
         // 重要イベント（ペイン消滅・クリップボード）は即座に再描画する
         if need_immediate {
@@ -19175,7 +19222,14 @@ impl TakoApp {
                 tako_core::CommandState::Unknown => (None, None),
             })
             .unwrap_or((None, None));
-        let is_failed = matches!(state_label, Some("failed"));
+        // #1657: 実行ペインの状態（実行中 / 完了 / 失敗）。`list` の `run` と同じ値で、
+        // 実行ペインのヘッダは OSC 133 の状態表示の代わりにこのバッジを出す
+        let run_status = pane_info
+            .and_then(|p| p.interactive_meta())
+            .map(|m| m.status());
+        let run_failed =
+            run_status.and_then(|s| s.outcome()) == Some(tako_core::run_pane::RunOutcome::Failed);
+        let is_failed = matches!(state_label, Some("failed")) || run_failed;
         // 稼働時間（カンプ: running · 4m12s。OSC 133 の状態遷移からの経過）
         let state_elapsed = self
             .terminals
@@ -19450,6 +19504,67 @@ impl TakoApp {
                                 .child(SharedString::from(truncate(&title_label, 40))),
                         )
                     })
+                    // #1657: 実行ペインの実行中 / 完了 / 失敗のバッジ。描画プリミティブだけで組む
+                    // （角丸の面 + 丸 + 文言。絵文字は使わない）。文言は ui_text の日英カタログ
+                    .when(hv.run_badge, |d| {
+                        let probes = self.panel_click_probe_bounds.clone();
+                        d.children(run_status.map(|status| {
+                            use tako_core::run_pane::RunOutcome;
+                            let (color, label) = match status.outcome() {
+                                None => (
+                                    theme.accent,
+                                    crate::ui_text::pane_menu::run_badge_running().to_string(),
+                                ),
+                                Some(RunOutcome::Succeeded) => (
+                                    theme.green,
+                                    crate::ui_text::pane_menu::run_badge_succeeded().to_string(),
+                                ),
+                                Some(RunOutcome::Failed) => (
+                                    theme.red,
+                                    crate::ui_text::pane_menu::run_badge_failed(
+                                        status.exit_code().unwrap_or_default(),
+                                    ),
+                                ),
+                            };
+                            let tip =
+                                crate::ui_text::pane_menu::run_badge_tooltip(status.exit_code());
+                            let tip_theme = theme.clone();
+                            div()
+                                .id(("pane-run-badge", pane_id.as_u64()))
+                                .flex()
+                                .flex_none()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(4.0))
+                                .px(px(6.0))
+                                .py(px(1.0))
+                                .rounded(px(5.0))
+                                .bg(rgba_alpha(color, 0.16))
+                                .border_1()
+                                .border_color(hsla_alpha(color, 0.35))
+                                .text_size(px(10.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(hsla(color))
+                                .tooltip(move |_, cx| {
+                                    cx.new(|_| {
+                                        crate::tab_bar::HintTooltip::new(
+                                            tip.clone(),
+                                            tip_theme.clone(),
+                                        )
+                                    })
+                                    .into()
+                                })
+                                .child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color)))
+                                .child(SharedString::from(label))
+                                // 実描画矩形の観測点（visual-test の `run-badge` 節が色を数える。
+                                // 何も描かない absolute なプローブ）
+                                .relative()
+                                .child(crate::tab_shape::probe_canvas(
+                                    probes.clone(),
+                                    format!("pane-run-badge-{}", pane_id.as_u64()),
+                                ))
+                        }))
+                    })
                     // role ラベル（カンプ: 素のテキスト 9.5px 600 tracking 0.06em）
                     .when(hv.role, |d| {
                         d.children(role_label.map(|(label, color)| {
@@ -19577,8 +19692,9 @@ impl TakoApp {
                                 )))
                         }))
                     })
-                    // 状態表示（ドット + running · 4m12s / fail_x + failed）
-                    .when(hv.state && is_failed, |d| {
+                    // 状態表示（ドット + running · 4m12s / fail_x + failed）。
+                    // 実行ペインは上のバッジが状態を言うので出さない（#1657。二重に言わない）
+                    .when(hv.state && is_failed && run_status.is_none(), |d| {
                         d.child(
                             div()
                                 .flex()
@@ -19599,7 +19715,7 @@ impl TakoApp {
                                 .child("failed"),
                         )
                     })
-                    .when(hv.state && !is_failed, |d| {
+                    .when(hv.state && !is_failed && run_status.is_none(), |d| {
                         d.children(state_dot.map(|color| {
                             let label = match (state_label, &state_elapsed) {
                                 (Some("running"), Some(el)) if hv.state_elapsed => {
@@ -38815,6 +38931,13 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1657: 実行ペインのタイトルバーに実行中 / 完了 / 失敗のバッジが
+                // 実ピクセルで描かれているか（実 `Run` → GUI の終了確定経路まで通す）
+                "run-badge" => {
+                    run_badge_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1579: 絵文字ではないグリフ（× / ●）を置き換えた印が
                 // 実ピクセルで描かれているか
                 "glyph-icon" => {
@@ -43930,6 +44053,208 @@ mod self_test {
             painted
         );
         let _ = std::fs::remove_file(&md1536);
+    }
+
+    /// 実行ペインのタイトルバーのバッジが**実ピクセルで描かれている**か（#1657）。
+    ///
+    /// 3 本の実行（成功 / 失敗 / 実行中）を**実 `Request::Run`** で走らせ、終了の確定は
+    /// GUI 自身の経路（出力のたびの `settle_run_pane`）に任せてから撮る。判定は
+    /// 「バッジの実矩形の中に、その状態の色（緑 / 赤 / アクセント）の画素がある」と
+    /// 「別の状態の色の画素がそれより少ない」の 2 つ。
+    /// A/B は `render_pane_header` の `.when(hv.run_badge, …)` の塊を外して撮り直す
+    /// （矩形の観測点ごと消えるので `rect=None` で落ちる）。
+    /// 単独実行は `TAKO_VISUAL_ONLY=run-badge`
+    #[cfg(feature = "visual-test")]
+    async fn run_badge_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        let wait =
+            |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+        let dir = std::env::temp_dir().join(format!("tako-st1657-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let cases: [(&str, &str); 3] = [
+            ("ok.sh", "# tako:run: printf 'ok-1657\\n'\n"),
+            ("ng.sh", "# tako:run: printf 'ng-1657\\n'; (exit 2)\n"),
+            ("slow.sh", "# tako:run: sleep 30\n"),
+        ];
+        for (name, body) in cases {
+            let _ = std::fs::write(dir.join(name), body);
+        }
+        let panes = window
+            .update(cx, |app: &mut TakoApp, _, cx| {
+                app.drawer_visible = false;
+                app.panel_visible = false;
+                let mut base = app.workspace.active_tab().tree().focused();
+                let mut out = Vec::new();
+                for (i, (name, _)) in cases.iter().enumerate() {
+                    let v = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Run {
+                            path: dir.join(name).display().to_string(),
+                            pane: Some(base.as_u64()),
+                            tab: None,
+                            profile: None,
+                            command: None,
+                            direction: Some(if i == 0 {
+                                tako_control::protocol::Direction::Down
+                            } else {
+                                tako_control::protocol::Direction::Right
+                            }),
+                            ratio: Some(0.5),
+                            auto_close: None,
+                            focus: Some(false),
+                            new_pane: None,
+                        },
+                        PaneOrigin::User,
+                    );
+                    // dispatch はセッションの起動を積むだけ（再生ボタンと同じ後処理）
+                    for (pane, options) in std::mem::take(&mut app.pending_attach) {
+                        if app.spawn_session(pane, options, cx).is_err() {
+                            app.remove_pane(pane, cx);
+                        }
+                    }
+                    let pane = v
+                        .ok()
+                        .and_then(|v| v["pane"].as_u64())
+                        .map(PaneId::from_raw);
+                    // 次の分割の基準は最後に作った実行ペイン（3 本を横並びにする）
+                    if let Some(p) = pane {
+                        base = p;
+                    }
+                    out.push(pane);
+                }
+                app.panel_click_probe_bounds.borrow_mut().clear();
+                cx.notify();
+                out
+            })
+            .unwrap_or_default();
+        let (Some(ok), Some(ng), Some(slow)) = (
+            panes.first().copied().flatten(),
+            panes.get(1).copied().flatten(),
+            panes.get(2).copied().flatten(),
+        ) else {
+            println!("TAKO_VISUAL_1657: SKIPPED（実行ペインを作れない: {panes:?}）");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+
+        // 成功 / 失敗の 2 本が GUI の経路で確定するまで待つ（**状態で待つ**）
+        let status_of = |app: &TakoApp, pane: PaneId| {
+            app.workspace
+                .find_tab_of_pane(pane)
+                .and_then(|t| app.workspace.get_tab(t))
+                .and_then(|t| t.tree().get(pane))
+                .and_then(|p| p.interactive_meta())
+                .map(|m| m.status())
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut settled = (None, None, None);
+        while std::time::Instant::now() < deadline {
+            settled = window
+                .update(cx, |app: &mut TakoApp, _, _| {
+                    (status_of(app, ok), status_of(app, ng), status_of(app, slow))
+                })
+                .unwrap_or((None, None, None));
+            if settled.0.is_some_and(|s| s.exit_code().is_some())
+                && settled.1.is_some_and(|s| s.exit_code().is_some())
+            {
+                break;
+            }
+            wait(cx, 100).await;
+        }
+        wait(cx, 400).await;
+
+        let (frame, scale) = match capture_frame(any, cx) {
+            Some(v) => v,
+            None => {
+                println!("TAKO_VISUAL_1657: SKIPPED（フレームを読めない）");
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        };
+        let Ok((palette, rects)) = window.update(cx, |app: &mut TakoApp, _, _| {
+            let probes = app.panel_click_probe_bounds.borrow();
+            let rect = |p: PaneId| {
+                probes
+                    .get(&format!("pane-run-badge-{}", p.as_u64()))
+                    .copied()
+            };
+            (
+                [app.theme.green, app.theme.red, app.theme.accent],
+                [rect(ok), rect(ng), rect(slow)],
+            )
+        }) else {
+            println!("TAKO_VISUAL_1657: SKIPPED（窓を読めない）");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        // 矩形の中の「その色に近い画素」の数（丸と文言は不透明の原色で描く）
+        let near = |rect: Option<Bounds<Pixels>>, want: tako_core::Rgb| -> Option<usize> {
+            let r = rect?;
+            let x0 = ((f32::from(r.origin.x) * scale) as u32).min(frame.width().saturating_sub(1));
+            let y0 = ((f32::from(r.origin.y) * scale) as u32).min(frame.height().saturating_sub(1));
+            let w = ((f32::from(r.size.width) * scale) as u32)
+                .max(1)
+                .min(frame.width() - x0);
+            let h = ((f32::from(r.size.height) * scale) as u32)
+                .max(1)
+                .min(frame.height() - y0);
+            let mut n = 0usize;
+            for y in y0..y0 + h {
+                for x in x0..x0 + w {
+                    let p = frame.get_pixel(x, y).0;
+                    let d = (p[0] as i32 - want.r as i32).abs()
+                        + (p[1] as i32 - want.g as i32).abs()
+                        + (p[2] as i32 - want.b as i32).abs();
+                    if d <= 60 {
+                        n += 1;
+                    }
+                }
+            }
+            Some(n)
+        };
+        let mut all_ok = true;
+        for (label, rect, status, want) in [
+            ("ok", rects[0], settled.0, 0usize),
+            ("ng", rects[1], settled.1, 1),
+            ("slow", rects[2], settled.2, 2),
+        ] {
+            let counts: Vec<Option<usize>> = palette.iter().map(|c| near(rect, *c)).collect();
+            let mine = counts[want].unwrap_or(0);
+            let others = counts
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != want)
+                .map(|(_, c)| c.unwrap_or(0))
+                .max()
+                .unwrap_or(0);
+            let pass = rect.is_some() && mine >= 8 && mine > others;
+            all_ok &= pass;
+            println!(
+                "TAKO_VISUAL_1657: badge={label} status={status:?} rect={:?} \
+                 colors(green,red,accent)={counts:?} ok={pass}",
+                rect.map(|r| (
+                    f32::from(r.origin.x) as i32,
+                    f32::from(r.origin.y) as i32,
+                    f32::from(r.size.width) as i32,
+                    f32::from(r.size.height) as i32
+                ))
+            );
+        }
+        if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+            let _ = frame.save(std::path::Path::new(&dump).join("run-badge-1657.png"));
+        }
+        println!("TAKO_VISUAL_1657: all_ok={all_ok}");
+        // 実行中の 1 本（sleep 30）も含めて自分で片付ける
+        let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+            for pane in [ok, ng, slow] {
+                app.close_pane_button(pane, CloseOrigin::Internal, cx);
+            }
+            cx.notify();
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// グリフから描画プリミティブへ替えた印が**実ピクセルで描かれている**か（#1579）。

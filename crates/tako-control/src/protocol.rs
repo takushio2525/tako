@@ -2052,7 +2052,8 @@ pub enum Request {
         auto_close: Option<String>,
     },
     /// run-interactive で起動したペインの完了状態を問い合わせる（Issue #305）。
-    /// マーカー `__TAKO_EXIT=<code>` をペイン出力から探し、見つかれば exit code を返す。
+    /// 終了コードは側路ファイル → 画面のマーカーの順に探し（#1657。
+    /// `dispatch::run_pane_exit_code`）、見つかれば exit code を返す。
     /// auto_close 方針に従い、完了済みペインを自動 close する
     RunInteractiveStatus {
         pane: u64,
@@ -2084,6 +2085,11 @@ pub enum Request {
         /// 新ペインにフォーカスを移すか（既定 false）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         focus: Option<bool>,
+        /// true = 同じファイルの実行ペインがあっても使い回さず、新しく分割する（#1657。
+        /// 既定 false = 同じタブの「同じファイル + 同じプロファイル」の実行ペインを
+        /// その位置で差し替える。実行中なら止めて走らせ直す）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        new_pane: Option<bool>,
     },
     /// Code Runner: ファイルの実行プロファイル一覧を解決して返す（実行しない。FR-3.18, #453）
     RunResolve { path: String, pane: Option<u64> },

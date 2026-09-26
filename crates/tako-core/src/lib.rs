@@ -53,6 +53,7 @@ pub mod recent;
 pub mod remote_fs;
 pub mod remote_open;
 pub mod remote_shortcuts;
+pub mod run_pane;
 pub mod runner;
 pub mod runner_config;
 pub mod runner_project;

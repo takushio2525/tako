@@ -89,8 +89,9 @@ pub struct Pane {
     role: Option<String>,
     /// spawn 元ペイン（オーケストレーター worker 用。セッション内で使い捨て、永続化不要）
     spawned_by: Option<PaneId>,
-    /// run-interactive のメタデータ (auto_close_policy, command)。セッション内で使い捨て
-    interactive_meta: Option<(String, String)>,
+    /// 実行ペイン（run-interactive / Code Runner / カード）のメタデータ。
+    /// セッション内で使い捨て（#1657 で終了コードの状態と再利用の鍵も持つ）
+    interactive_meta: Option<crate::run_pane::InteractiveMeta>,
     /// 利用上限（5h / 週次）後の自動復帰を有効にするか（#813）。既定 OFF。
     /// ペイン単位のオプトインで、layout.json に保存して再起動・復元をまたいで維持する
     limit_autoresume: bool,
@@ -186,13 +187,17 @@ impl Pane {
         self.spawned_by = parent;
     }
 
-    /// run-interactive のメタデータ (auto_close_policy, command)
-    pub fn interactive_meta(&self) -> Option<&(String, String)> {
+    /// 実行ペインのメタデータ（実行ペインでなければ `None`）
+    pub fn interactive_meta(&self) -> Option<&crate::run_pane::InteractiveMeta> {
         self.interactive_meta.as_ref()
     }
 
-    pub fn set_interactive_meta(&mut self, auto_close: String, command: String) {
-        self.interactive_meta = Some((auto_close, command));
+    pub fn interactive_meta_mut(&mut self) -> Option<&mut crate::run_pane::InteractiveMeta> {
+        self.interactive_meta.as_mut()
+    }
+
+    pub fn set_interactive_meta(&mut self, meta: crate::run_pane::InteractiveMeta) {
+        self.interactive_meta = Some(meta);
     }
 
     /// 利用上限後の自動復帰が有効か（#813。既定 false）

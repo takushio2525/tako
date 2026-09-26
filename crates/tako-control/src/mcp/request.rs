@@ -1179,6 +1179,7 @@ pub(super) fn build_request(
                 ratio: f32_arg(args, "ratio")?,
                 auto_close: str_arg(args, "auto_close")?,
                 focus: bool_arg(args, "focus")?,
+                new_pane: bool_arg(args, "new_pane")?,
             }
         }
         "tako_run_resolve" => Request::RunResolve {

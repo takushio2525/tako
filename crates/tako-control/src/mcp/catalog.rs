@@ -3932,6 +3932,10 @@ pub fn tools() -> Vec<Value> {
                         "type": "boolean",
                         "description": "新ペインにフォーカスを移すか（既定 false）",
                     },
+                    "new_pane": {
+                        "type": "boolean",
+                        "description": "true で新しく分割する。既定は同じファイル・プロファイルの実行ペインをその位置で差し替える（実行中なら止めて再実行）",
+                    },
                 },
                 "required": ["path"],
                 "additionalProperties": false,

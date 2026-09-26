@@ -4476,6 +4476,8 @@ impl TakoApp {
                 ratio: Some(0.3),
                 auto_close: None,
                 focus: Some(true),
+                // 再生ボタンは既定 = 同じファイルの実行ペインを使い回す（#1657）
+                new_pane: None,
             },
             PaneOrigin::User,
         );

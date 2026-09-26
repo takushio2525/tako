@@ -88,6 +88,35 @@ pub fn limit_resume_indicator() -> &'static str {
     )
 }
 
+/// 実行ペインのタイトルバーのバッジ（#1657）: まだ終了コードが届いていない
+pub fn run_badge_running() -> &'static str {
+    tr!("実行中", "Running")
+}
+
+/// 実行ペインのタイトルバーのバッジ（#1657）: 終了コード 0 で終わった
+pub fn run_badge_succeeded() -> &'static str {
+    tr!("完了", "Done")
+}
+
+/// 実行ペインのタイトルバーのバッジ（#1657）: 0 以外で終わった（終了コードを添える）
+pub fn run_badge_failed(code: i32) -> String {
+    tr!(format!("失敗 ({code})"), format!("Failed ({code})"))
+}
+
+/// バッジのツールチップ（#1657）。終了コードと、Enter で閉じられることを言葉で添える
+pub fn run_badge_tooltip(code: Option<i32>) -> String {
+    match code {
+        None => tr!(
+            "実行中。終わると終了コードをここに表示します".to_string(),
+            "Running. The exit code will appear here when it finishes".to_string()
+        ),
+        Some(code) => tr!(
+            format!("終了コード {code}。ペインで Enter を押すと閉じます"),
+            format!("Exit code {code}. Press Enter in the pane to close it")
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests_support;
@@ -114,6 +143,11 @@ mod tests {
                 limit_resume_toggle(false).to_string(),
                 limit_resume_toggle(true).to_string(),
                 limit_resume_indicator().to_string(),
+                run_badge_running().to_string(),
+                run_badge_succeeded().to_string(),
+                run_badge_failed(1),
+                run_badge_tooltip(None),
+                run_badge_tooltip(Some(1)),
             ]
         });
     }
