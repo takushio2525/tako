@@ -1797,9 +1797,26 @@ syntect へ通していた**。release 実測（同じ構文セット・テー�
   見ている状態で編集を始めた途端に器が先頭へ戻る。器がまだ描かれていない
   （CLI / MCP から開いた直後）ときは 0 のまま = 従来と同じ
 - 追従の効きは応答の `viewport`（`first_visible_line` / `last_visible_line` /
-  `visible`）で GUI の外から読める。**カーソルの位置自体は載せない**（#1658 の
+  `visible_lines` / `visible`）で GUI の外から読める。**カーソルの位置自体は載せない**（#1658 の
   `document.cursor` が正本）。置き場は `dispatch::preview_edit_reply` の 1 実装なので、
   編集系の応答すべて（#1658 の `PreviewEditRange` / `PreviewCursor` を含む）に付く
+- **可視行数は描いた行の実寸から数える 1 実装**（#1741）: `preview_row_geometry` が
+  先頭可視行の上端（器の上端 + 上余白 `PREVIEW_BODY_PADDING` − 論理スクロールの offset）から
+  `preview_text_layouts` に控えた行の高さ（折り返した行はその高さ）を積み、下端が器に収まる
+  行だけを `editor_scroll::visible_rows` で数える。追従（`preview_cursor_viewport`）・
+  ページ移動の歩幅（`run_editor_command_local`）・IME の 1 フレーム目の見積もり
+  （`preview_pending_cursor_origin`）がすべてこれを使う。旧実装は追従が器の高さ − 上下の
+  余白を `theme.line_height`（ターミナルのセル高 13pt × 1.3 = 17px）で、ページ移動が
+  器の高さ − 上余白を描いた行の高さで、別々に数えていた。コード行は祖先の文字サイズ ×
+  gpui の既定の行高（φ 倍を丸めた値 = 21px）で組まれ、GPUI の `list` は下の余白の中まで
+  描く（クリップは器の矩形）。661px の器で実矩形 30 行を追従は 37 行と数え、↓ で進むと
+  カーソルが画面の外へ出ていた。文書が器より短いときは残りを 1 行の高さで埋めて器の容量を
+  返し、まだ 1 行も描いていなければ同じ gpui の計算で行の高さを見積もる。既知の限界:
+  追従の算術は行の単位なので、折り返しで行の高さが不揃いな区間では下の余白が 2〜4 行で
+  揺れる（カーソルは器の外へ出ない。tako-vd 実測）。番犬は
+  `issue1741_viewport_lines_watchdog`（4 規則）、実測は `scripts/test-viewport-lines-1741.sh`
+  （visual-test 節 `viewport-lines`。正解は描いた行の実矩形。文字サイズ 8 / 13 / 32pt で
+  実矩形 49 / 30 / 12 行と一致・器が動き始める行と下の余白 3 行が設計どおり）
 - 回帰検出は番犬 `issue1649_cursor_follow_watchdog`（6 規則・注入 9 通り）+
   `editor_scroll` の単体 11 本 + `preview_render` の単体 2 本 + visual-test 節
   `cursor-follow`（7 相。実ピクセルではなく器の実測値で見るので画面収録の権限が要らない）。

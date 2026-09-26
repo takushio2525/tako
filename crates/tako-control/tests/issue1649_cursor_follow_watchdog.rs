@@ -163,10 +163,11 @@ fn 追従の判断はcoreの純関数を通る() {
 
     let viewport = fn_body(&code, "preview_cursor_viewport");
     assert!(
-        viewport.contains("LineViewport::from_pixels("),
-        "{RENDER}:{} の `preview_cursor_viewport` が `LineViewport::from_pixels` を\
-         通っていない（#1649。器の高さを 1 行の高さで割る算術を直書きすると、\
-         高さが 0 のフレームで可視行数が飽和して「どこへ飛んでも見えている」へ倒れる）",
+        viewport.contains("preview_row_geometry("),
+        "{RENDER}:{} の `preview_cursor_viewport` が可視行数を `preview_row_geometry` から\
+         採っていない（#1649 / #1741。器の高さを 1 行の高さで割る算術を直書きすると、\
+         高さが 0 のフレームで可視行数が飽和して「どこへ飛んでも見えている」へ倒れ、\
+         ページ移動の歩幅とも食い違う。測り方の番犬は `issue1741_viewport_lines_watchdog`）",
         line_of(&code, "fn preview_cursor_viewport(")
     );
 }

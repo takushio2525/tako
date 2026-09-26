@@ -19,48 +19,77 @@
 /// （改行の直後がいちばん分かりやすい）。3 行は Zed / VSCode の既定と同じ水準
 pub const FOLLOW_MARGIN: usize = 3;
 
+/// 行の下端が器の下端に「収まっている」とみなす誤差（論理 px）。
+///
+/// 行の高さは 21.03px のような端数を持ち、何十行も積むと下端が 0.5px 未満だけ
+/// はみ出す計算になることがある。画面上は収まっている行を数え落とさないための幅
+const EDGE_EPSILON: f32 = 0.5;
+
 /// 器の実測値から割り出した「行の単位で見た可視範囲」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LineViewport {
     /// いちばん上に見えている行（0 始まり）
     pub first_visible: usize,
-    /// 同時に見える行数（1 以上）
+    /// 同時に見える行数（1 以上）。[`visible_rows`] で測る
     pub visible_lines: usize,
     /// 文書の全行数
     pub total_lines: usize,
 }
 
-impl LineViewport {
-    /// 器の高さと 1 行の高さ（どちらも論理 px）から作る。
-    ///
-    /// **高さが取れない場合を 0 除算へ落とさない**のが要点。器がまだ 1 度も
-    /// 描かれていないフレームでは高さが 0 で、そのまま割ると可視行数が
-    /// 無限（`as usize` は飽和するので `usize::MAX`）になり、どこへ飛んでも
-    /// 「見えている」に倒れて追従が空振りする
-    pub fn from_pixels(
-        first_visible: usize,
-        total_lines: usize,
-        viewport_height: f32,
-        line_height: f32,
-    ) -> Self {
-        let measurable = viewport_height.is_finite()
-            && viewport_height > 0.0
-            && line_height.is_finite()
-            && line_height > 0.0;
-        let visible_lines = if measurable {
-            // 端に半端に覗く行は数えない（切り捨て）。余白の取り方が
-            // 「見えているつもりの行」に引きずられないようにする
-            ((viewport_height / line_height).floor() as usize).max(1)
-        } else {
-            1
-        };
-        Self {
-            first_visible,
-            visible_lines,
-            total_lines,
-        }
+/// 器に**はみ出さずに見える行数**を、実際に描いた行の実寸から数える（#1741）。
+///
+/// 可視行数の測り方はこの 1 実装だけにする。追従スクロールの余白（#1649）と
+/// ページ移動の歩幅（#1652）が別の値を使うと、Page Down の着地が画面の最下段に
+/// 貼り付いたり、追従が「見えている」と判断した行が画面の外にあったりする。
+///
+/// - `first_row_top`: 先頭可視行の上端（論理 px。器の上端から上余白ぶん下がった位置）
+/// - `viewport_bottom`: 器の下端。下端がここまでに収まる行だけを数える
+///   （端に半端に覗く行は数えない = 余白の取り方が「見えているつもりの行」に引きずられない）
+/// - `row_heights`: 先頭可視行から順に、描いた行の実寸（`None` = まだ描いていない行）。
+///   折り返して 2 行ぶんの高さになった行は、その高さのまま効く
+/// - `line_height`: 実寸が尽きた先（文書末 / 未描画）を埋める 1 行の高さ
+///
+/// 実寸が尽きたら、残りの高さを `line_height` の行で埋めたと見なして足す。これで
+/// 可視行数は文書の長さに依らない（1 行だけのファイルでも器の容量として数える）。
+///
+/// 旧実装は器の高さを `theme.line_height`（17px）で割っていたが、コード行は実測 21px で、
+/// 先頭行は器の上端から上余白（14px）ぶん下に描かれる。可視行数を多く見積もるので
+/// 追従の下の余白が画面の外へ出ていた（661px の器で実矩形 30 行に対し 37 行と数えた）。
+///
+/// **測れない値を 0 除算へ落とさない**。器がまだ 1 度も描かれていないフレームでは
+/// 高さが 0 で、そのまま割ると可視行数が飽和し、どこへ飛んでも「見えている」に倒れて
+/// 追従が空振りする。測れないときは 1 行として返す
+pub fn visible_rows(
+    first_row_top: f32,
+    viewport_bottom: f32,
+    row_heights: impl IntoIterator<Item = Option<f32>>,
+    line_height: f32,
+) -> usize {
+    let positive = |v: f32| v.is_finite() && v > 0.0;
+    if !first_row_top.is_finite() || !viewport_bottom.is_finite() || !positive(line_height) {
+        return 1;
     }
+    let bottom = viewport_bottom + EDGE_EPSILON;
+    let mut y = first_row_top;
+    let mut count = 0usize;
+    for height in row_heights {
+        let Some(height) = height.filter(|h| positive(*h)) else {
+            break;
+        };
+        if y + height > bottom {
+            return count.max(1);
+        }
+        y += height;
+        count += 1;
+    }
+    let rest = bottom - y;
+    if rest > 0.0 {
+        count += (rest / line_height).floor() as usize;
+    }
+    count.max(1)
+}
 
+impl LineViewport {
     /// いちばん下に見えている行（0 始まり）
     pub fn last_visible(&self) -> usize {
         self.first_visible
@@ -247,34 +276,62 @@ mod tests {
         assert_eq!(follow_cursor(view(500, 20, 10), 0, FOLLOW_MARGIN), Some(0));
     }
 
-    /// 高さが取れないフレームでも 0 除算へ落ちない
+    /// 高さが取れないフレームでも 0 除算へ落ちない（#1649 → #1741）
     #[test]
     fn 高さが取れないときは一行として扱う() {
-        for (h, lh) in [
-            (0.0_f32, 18.0_f32),
-            (600.0, 0.0),
-            (f32::NAN, 18.0),
-            (600.0, f32::NAN),
-            (-1.0, 18.0),
+        for (top, bottom, lh) in [
+            (0.0_f32, 0.0_f32, 18.0_f32),
+            (0.0, 600.0, 0.0),
+            (0.0, f32::NAN, 18.0),
+            (0.0, 600.0, f32::NAN),
+            (f32::NAN, 600.0, 18.0),
+            (0.0, -1.0, 18.0),
+            (0.0, 600.0, -18.0),
         ] {
-            let v = LineViewport::from_pixels(0, 500, h, lh);
-            assert_eq!(v.visible_lines, 1, "h={h} lh={lh} で可視行数が 1 でない");
+            let visible_lines = visible_rows(top, bottom, [], lh);
+            assert_eq!(
+                visible_lines, 1,
+                "top={top} bottom={bottom} lh={lh} で可視行数が 1 でない"
+            );
             // 「どこへ飛んでも見えている」に倒れない
+            let v = view(0, visible_lines, 500);
             assert_eq!(follow_cursor(v, 100, FOLLOW_MARGIN), Some(100));
         }
-        // 実測値が入れば切り捨てで数える（半端に覗く行は数えない）
+        // 実寸の行が 0 や NaN でも、そこで数えるのをやめて見積もりへ倒す
+        assert_eq!(visible_rows(0.0, 600.0, [Some(0.0)], 20.0), 30);
+        assert_eq!(visible_rows(0.0, 600.0, [Some(f32::NAN)], 20.0), 30);
+    }
+
+    /// #1741 の実測値そのもの: 661px の器・上余白 14px・行 21px は 30 行。
+    /// 旧実装（器の高さ − 上下の余白を 17px で割る）は 37 行と数えていた
+    #[test]
+    fn 上余白と描いた行の高さで数える() {
+        let rows = std::iter::repeat_n(Some(21.0_f32), 400);
+        assert_eq!(visible_rows(14.0, 661.0, rows, 21.0), 30);
+        // 描いた行が無くても、同じ行の高さなら同じ数になる（見積もりが実寸と一致する）
+        assert_eq!(visible_rows(14.0, 661.0, [], 21.0), 30);
+        // 半端に覗く行は数えない（5 行目は下端 105px で、100px の器を 5px はみ出す）
+        assert_eq!(visible_rows(0.0, 100.0, [Some(21.0); 10], 21.0), 4);
+        // 端数のある行の高さを積んでも、画面上収まっている行は数え落とさない
+        let odd = std::iter::repeat_n(Some(21.034_f32), 40);
         assert_eq!(
-            LineViewport::from_pixels(0, 500, 600.0, 18.0).visible_lines,
-            33
+            visible_rows(14.0, 14.0 + 21.034 * 30.0 - 0.3, odd, 21.034),
+            30
         );
     }
 
-    /// 折り返しで 1 行が 2 行分の高さになった器（高さを実測して渡す前提）
+    /// 折り返しで 2〜3 行ぶんの高さになった行は、その高さのまま効く
     #[test]
-    fn 折り返しで行の高さが増えても可視化する() {
-        // 器 600px・折り返しで 1 行 36px → 16 行しか見えない
-        let v = LineViewport::from_pixels(0, 500, 600.0, 36.0);
-        assert_eq!(v.visible_lines, 16);
+    fn 折り返した行は実寸の高さで数える() {
+        // 21px の行の中に 63px（3 行ぶん）の行が 2 本 → 30 行の器に 26 行
+        let mut rows = vec![Some(21.0_f32); 40];
+        rows[2] = Some(63.0);
+        rows[7] = Some(63.0);
+        assert_eq!(visible_rows(14.0, 661.0, rows, 21.0), 26);
+        // 器の高さより高い 1 行（巨大な折り返し）でも 1 行として見える扱い
+        assert_eq!(visible_rows(14.0, 661.0, [Some(2000.0)], 21.0), 1);
+        // 追従はその可視行数で余白を取る
+        let v = view(0, 26, 500);
         let first = follow_cursor(v, 200, FOLLOW_MARGIN).expect("画面外なので動く");
         let moved = LineViewport {
             first_visible: first,
@@ -282,6 +339,26 @@ mod tests {
         };
         assert!(moved.contains(200));
         assert_eq!(moved.last_visible() - 200, FOLLOW_MARGIN);
+    }
+
+    /// 文書が器より短いときも、可視行数は器の容量（1 行のファイルでも同じ）
+    #[test]
+    fn 文書末より先は見積もりの行で埋める() {
+        // 1 行だけのファイル
+        assert_eq!(visible_rows(14.0, 661.0, [Some(21.0)], 21.0), 30);
+        // 5 行のファイル（折り返し 1 本を含む）
+        let short = [Some(21.0), Some(42.0), Some(21.0), Some(21.0), Some(21.0)];
+        assert_eq!(visible_rows(14.0, 661.0, short, 21.0), 29);
+        // まだ描いていない行（None）で止めて、残りを見積もりで埋める
+        let partial = [Some(21.0), Some(21.0), None, Some(900.0)];
+        assert_eq!(visible_rows(14.0, 661.0, partial, 21.0), 30);
+    }
+
+    /// 先頭可視行が上へ半分送られている（ホイールで offset が付いた）状態
+    #[test]
+    fn 先頭行が上へずれていてもその位置から数える() {
+        // 先頭行の上端が器の上端より 10px 上 → 下へ 1 行ぶん余計に入る
+        assert_eq!(visible_rows(-10.0, 661.0, [Some(21.0); 40], 21.0), 31);
     }
 
     #[test]

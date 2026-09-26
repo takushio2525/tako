@@ -44,6 +44,19 @@ pub(crate) const MD_COPY_FEEDBACK: std::time::Duration = std::time::Duration::fr
 /// 同じリテラルを散らさず 1 か所に置く
 pub(crate) const PREVIEW_BODY_PADDING: f32 = PANE_PADDING + 4.0;
 
+/// 本文の器を行の単位で測った値（#1741。[`TakoApp::preview_row_geometry`] が作る）
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PreviewRowGeometry {
+    /// いちばん上に見えている行（0 始まり）
+    pub(crate) first_visible: usize,
+    /// はみ出さずに見える行数（1 以上）。追従の余白とページ移動の歩幅の両方がこれを使う
+    pub(crate) visible_lines: usize,
+    /// 先頭可視行の上端（ウィンドウ座標）
+    pub(crate) first_row_top: Pixels,
+    /// 1 行の高さ（描いた行の実寸。まだ 1 行も描いていなければ文字サイズからの見積もり）
+    pub(crate) line_height: Pixels,
+}
+
 /// コードプレビューの仮想リスト（#821）を切って同じバイナリで A/B を取る逃げ道
 /// （`TAKO_821_NO_VIRTUAL_LIST=1`）。旧挙動 = ファイル全行の element を毎フレーム作る。
 ///
@@ -3717,45 +3730,100 @@ impl TakoApp {
             .map(gpui::ScrollHandle::bounds)
     }
 
-    /// コード本文の器から「先頭可視行」と「使える高さ（論理 px）」を採る（#1649）。
+    /// いま本文のいちばん上に見えている行（#1649。編集を始める瞬間の
+    /// キャレットの置き場と、可視範囲の起点に使う）。
     ///
     /// 器は 2 種類ある（#821 の仮想リストと `TAKO_821_NO_VIRTUAL_LIST=1` の div
     /// スクロール）。どちらも 1 item = 1 行なので item 番号と行番号が一致する。
     /// md の器（1 item = 1 ブロック）は行番号で指せないので対象外
-    fn preview_body_view_metrics(&self, pane_id: PaneId) -> Option<(usize, f32)> {
-        let pad = PREVIEW_BODY_PADDING * 2.0;
+    pub(crate) fn preview_first_visible_line(&self, pane_id: PaneId) -> Option<usize> {
         match self.preview_body_lists.get(&pane_id) {
-            Some((list, PreviewBodyKind::Code, _)) => Some((
-                list.logical_scroll_top().item_ix,
-                f32::from(list.viewport_bounds().size.height) - pad,
-            )),
+            Some((list, PreviewBodyKind::Code, _)) => Some(list.logical_scroll_top().item_ix),
             Some(_) => None,
             None => {
                 let handle = self.preview_scroll_handles.get(&pane_id)?;
                 // 子矩形をまだ知らないハンドルの `top_item` は常に 0（= 実際の位置と
                 // 無関係）なので、そのまま判断材料にしない
                 handle.bounds_for_item(0)?;
-                Some((
-                    handle.top_item(),
-                    f32::from(handle.bounds().size.height) - pad,
-                ))
+                Some(handle.top_item())
             }
         }
     }
 
-    /// いま本文のいちばん上に見えている行（#1649。編集を始める瞬間の
-    /// キャレットの置き場に使う）
-    pub(crate) fn preview_first_visible_line(&self, pane_id: PaneId) -> Option<usize> {
-        self.preview_body_view_metrics(pane_id)
-            .map(|(first, _)| first)
+    /// 本文の器を**行の単位**で測る（#1741。可視行数の唯一の実装）。
+    ///
+    /// 追従スクロール（#1649 の [`Self::preview_cursor_viewport`]）・ページ移動の歩幅
+    /// （#1652 の `run_editor_command_local`）・IME の 1 フレーム目の見積もり
+    /// （`preview_pending_cursor_origin`）がすべてここを通る。測り方が 2 つあると、
+    /// 追従が「見えている」と判断した行が画面の外にあったり、Page Down の着地が
+    /// 最下段に貼り付いたりする。
+    ///
+    /// 数えるのは**実際に描いた行の実寸**: 先頭可視行の上端から、`preview_text_layouts` に
+    /// 控えた行の高さ（折り返した行はその高さ）を積み、下端が器に収まる行だけを数える
+    /// （[`tako_core::editor_scroll::visible_rows`]）。器の高さを `theme.line_height` で
+    /// 割ってはいけない: あれはターミナルのセル高（13pt × 1.3 = 17px）で、コード行は祖先の
+    /// 文字サイズと gpui の既定の行高（φ 倍 = 21px）で組まれる。先頭行は器の上端から
+    /// 上余白（`PREVIEW_BODY_PADDING`）ぶん下に描かれ、GPUI の `list` は下の余白の中まで
+    /// 描く（クリップは器の矩形）ので、数える下端は器の下端そのもの
+    pub(crate) fn preview_row_geometry(&self, pane_id: PaneId) -> Option<PreviewRowGeometry> {
+        let first_visible = self.preview_first_visible_line(pane_id)?;
+        let bounds = self.preview_viewport_bounds(pane_id)?;
+        let painted = self.preview_text_layouts.get(&pane_id);
+        let row = |ix: usize| {
+            painted
+                .and_then(|rows| rows.get(ix))
+                .and_then(Option::as_ref)
+        };
+        let line_height = painted
+            .and_then(|rows| rows.iter().flatten().next())
+            .map(TextLayout::line_height)
+            .unwrap_or_else(|| self.preview_code_line_height_estimate());
+        // 仮想リストはスクロール状態から出す（`scroll_to` は論理位置を即座に書き換えるので、
+        // 次の描画を待たずに連打された ↓ でも正しい位置から数えられる）。div スクロールは
+        // 描いた行の位置を使う
+        let first_row_top = match self.preview_body_lists.get(&pane_id) {
+            Some((list, PreviewBodyKind::Code, _)) => {
+                bounds.top() + px(PREVIEW_BODY_PADDING) - list.logical_scroll_top().offset_in_item
+            }
+            _ => row(first_visible)
+                .map(|layout| layout.bounds().top())
+                .unwrap_or(bounds.top() + px(PREVIEW_BODY_PADDING)),
+        };
+        let total = painted.map_or(0, Vec::len);
+        let heights = (first_visible..total)
+            .map(|ix| row(ix).map(|layout| f32::from(layout.bounds().size.height)));
+        let visible_lines = tako_core::editor_scroll::visible_rows(
+            f32::from(first_row_top),
+            f32::from(bounds.bottom()),
+            heights,
+            f32::from(line_height),
+        );
+        Some(PreviewRowGeometry {
+            first_visible,
+            visible_lines,
+            first_row_top,
+            line_height,
+        })
+    }
+
+    /// 行をまだ 1 行も描いていないときの、コード行 1 行の高さの見積もり（#1741）。
+    ///
+    /// コード行は高さを指定せず、祖先（ルート）の文字サイズ + gpui の既定の行高
+    /// （`TextStyle::default().line_height` = 文字サイズの φ 倍を丸めた値）で組まれるので、
+    /// 同じ計算をここでもする
+    fn preview_code_line_height_estimate(&self) -> Pixels {
+        let style = gpui::TextStyle {
+            font_size: px(self.theme.font_size).into(),
+            ..gpui::TextStyle::default()
+        };
+        // 行高は相対値（φ）で文字サイズは px 指定なので、rem は計算に効かない
+        style.line_height_in_pixels(px(self.theme.font_size))
     }
 
     /// 編集カーソルの位置と、**行の単位で見た**本文の可視範囲（#1649）。
     ///
-    /// 器は 2 種類ある（#821 の仮想リストと `TAKO_821_NO_VIRTUAL_LIST=1` の div
-    /// スクロール）ので、どちらからも「先頭可視行」と「器の高さ」を採って
-    /// 行の単位へ揃えてから返す。判断そのものは
-    /// [`tako_core::editor_scroll`] の純関数が持つ。
+    /// 可視範囲は [`Self::preview_row_geometry`]（#1741。ページ移動の歩幅と同じ 1 実装）から
+    /// 採る。判断そのものは [`tako_core::editor_scroll`] の純関数が持つ。
     ///
     /// 編集セッションがあってコード本文を出しているときだけ返す。編集は
     /// `apply_editor_text` が必ず `PreviewMode::Code` へ倒すので、編集中の器は常に
@@ -3772,15 +3840,14 @@ impl TakoApp {
             return None;
         };
         let cursor_line = edit.buffer.line_byte_col(edit.buffer.cursor()).0;
-        let (first_visible, height) = self.preview_body_view_metrics(pane_id)?;
+        let rows = self.preview_row_geometry(pane_id)?;
         Some((
             cursor_line,
-            tako_core::editor_scroll::LineViewport::from_pixels(
-                first_visible,
-                lines.len(),
-                height,
-                self.theme.line_height,
-            ),
+            tako_core::editor_scroll::LineViewport {
+                first_visible: rows.first_visible,
+                visible_lines: rows.visible_lines,
+                total_lines: lines.len(),
+            },
         ))
     }
 
@@ -5045,14 +5112,18 @@ mod tests {
     /// `ListState` は `App` を要らない部分だけで組めるので、窓なしで測れる
     #[test]
     fn 追従の結果を器の論理位置として渡せる() {
-        use tako_core::editor_scroll::{follow_cursor, LineViewport, FOLLOW_MARGIN};
+        use tako_core::editor_scroll::{follow_cursor, visible_rows, LineViewport, FOLLOW_MARGIN};
 
         let list = gpui::ListState::new(5000, gpui::ListAlignment::Top, px(600.0));
         // 旧挙動（`scroll_to` を 1 度も呼ばない）は先頭のまま
         assert_eq!(list.logical_scroll_top().item_ix, 0);
 
-        // 600px の器・1 行 18px = 33 行見えている状態で 4,900 行目へ飛ぶ
-        let view = LineViewport::from_pixels(0, 5000, 600.0, 18.0);
+        // 先頭行の上端から器の下端まで 600px・1 行 18px = 33 行見えている状態で 4,900 行目へ飛ぶ
+        let view = LineViewport {
+            first_visible: 0,
+            visible_lines: visible_rows(14.0, 614.0, std::iter::repeat_n(Some(18.0), 40), 18.0),
+            total_lines: 5000,
+        };
         assert_eq!(view.visible_lines, 33);
         let first = follow_cursor(view, 4900, FOLLOW_MARGIN).expect("画面外なので動く");
         list.scroll_to(gpui::ListOffset {
