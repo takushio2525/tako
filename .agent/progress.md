@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-09-26（#1656: Code Runner がプロジェクトを見て cargo run / npm run / python -m 等で走るようにした）
-- 解決器がファイル 1 枚しか見ず、cargo プロジェクトの `.rs` を `rustc` 単体で走らせて必ず失敗していた。上へ辿る範囲の 1 実装 `tako_core::project_root`（HOME の段は見ない / `.git` で止まる / 深さ 32。`detect` は #1726 の実行設定のキー・LSP #1678 と共有）と種別の表 `runner_project::KINDS`（cargo / go / npm / python / dotnet / make = 行追加で増える）を新設し、入口を `runner::resolve_file` の 1 本へ。優先は上書き → 宣言 → ユーザーの拡張子既定 → プロジェクト既定 → 組み込み。Issue の例（bin の無い lib crate）は `cargo run` が必ず落ちるので `cargo test -p <pkg> --lib <mod>::`
-- 実測: `scripts/test-runner-project-1656.sh` **26 PASS 0 FAIL**（隔離 GUI で CLI `--dry-run` と MCP `tako_run_resolve` が字面一致・実際に `cargo run` が exit 0・HOME 直下の置き忘れを拾わない・`TAKO_1656_LEGACY=1` で `rustc` 単体へ戻る）・注入 6 通りすべて file:line 名指しで FAILED → 戻して緑・workspace 5465 passed 0 failed・clippy 3 宇宙 0
-
 ## 2026-09-26（#1725: ツリーのインライン入力の IME をターミナルから入力欄へ戻した）
 - 実測で真因を確定: ASCII 打鍵は 9/9 で入力欄に入る一方、IME の変換は 9/9 で**隣のターミナルペインに束縛**（`app_text_input` がインライン編集を宛先から外していた）。GPUI はかなモードの印字キーを IME へ先に渡すので、下線・候補窓はターミナルのカーソルに出て、unmark の文字列は PTY へ流れていた。外側クリックでは閉じなかった
 - `AppTextInput::TreeName` を足し、打鍵・⌘V・確定・unmark の 4 経路を `tree_name_insert` の 1 関数へ、状態を `TextField` へ、開く / 閉じるを 1 本ずつへ。未確定文字列とキャレットは共有部品で入力欄の中に描き、長い名前は `…` で詰める。Esc / 確定で元のペインへ戻り、`on_mouse_down_out` で閉じ、見えない入力欄は打鍵を奪わない
@@ -65,3 +61,7 @@
 ## 2026-09-26（#1745: stdio ブリッジからも非同期 run が使えるようにした）
 - 実測で確定: 非同期 run は HTTP MCP のハンドラが受け口のチャネルを握って立てており、`tako mcp serve`（`McpSession.ipc_tx: None`）は spawn 前に JSON-RPC エラー（`sync=true` を指定）で返っていた。受け口へ渡す処理を `ipc::submit` の 1 実装へ寄せ、新しい `Request::OrchestratorRunStart` をそこで受ける（IPC 接続スレッド・HTTP・完了待ちスレッドが同じ道）。`ipc_tx` は廃止し、guide `spawning` と prompt を非同期の既定（run_id → run_status → run_result）へ直した
 - 実測: `scripts/test-orchestrator-run-stdio-1745.sh` 修正前 10 PASS 9 FAIL（落ちたのは stdio の非同期 9 項目）→ 修正後全 PASS。注入 A/B 2 通り（受け口で受けない / エンジンを旧エラーへ戻す）が名指しで FAILED → 戻して緑
+
+## 2026-09-26（#1741: 追従スクロールとページ移動の可視行数を描いた行の実寸から数える 1 実装へ寄せた）
+- 追従は「器 − 上下余白 28px」÷ `theme.line_height`(17px)、Page は「器 − 14px」÷ 描いた行(21px) と別々に数えていた（修正前実測: 661px の器で実矩形 30 行を追従は 37 行・↓ で行 30〜36 のカーソルが画面外・Page Down は最下段に貼り付き）。`editor_scroll::visible_rows`（実寸を積む純関数）+ `preview_row_geometry` の 1 実装へ寄せ、追従・Page・IME の見積もりが使う。`viewport.visible_lines` を応答へ
+- 実測: 新節 `scripts/test-viewport-lines-1741.sh`（正解は実矩形）が修正前 FAIL=5 → 修正後 PASS=5（8 / 13 / 32pt で 49 / 30 / 12 行が一致・余白 3 行）・番犬 4 規則に注入 7 通りすべて file:line で FAILED・#1649 / #1652 の実 GUI スクリプト緑・workspace 5470 passed 0 failed・clippy 3 宇宙 0

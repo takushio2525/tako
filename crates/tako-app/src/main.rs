@@ -13047,12 +13047,15 @@ impl TakoApp {
     /// CLI / MCP からは読めなかった）。
     ///
     /// **カーソルの位置そのものは載せない**。`document.cursor`（#1658）が正本なので、
-    /// ここは器の側の事実（どこからどこまで見えていて、カーソル行が入っているか）だけ
+    /// ここは器の側の事実（どこからどこまで見えていて、カーソル行が入っているか）だけ。
+    /// `visible_lines` は器にはみ出さずに見える行数（#1741。追従の余白とページ移動の歩幅が
+    /// 使う値そのもの）で、文書が器より短くても器の容量を返す
     fn preview_viewport_json(&self, pane_id: PaneId) -> Option<serde_json::Value> {
         let (line, view) = self.preview_cursor_viewport(pane_id)?;
         Some(serde_json::json!({
             "first_visible_line": view.first_visible + 1,
             "last_visible_line": view.last_visible().min(view.total_lines.saturating_sub(1)) + 1,
+            "visible_lines": view.visible_lines,
             "visible": view.contains(line),
         }))
     }
@@ -13263,32 +13266,14 @@ impl TakoApp {
         })
     }
 
-    /// 器に同時に見える行数（#1652。ページ移動の歩幅）。器をまだ測れていなければ `None`
-    ///
-    /// 数えるのは**はみ出さずに見える行**だけ。1 行の高さは実際に描いた行のレイアウトから
-    /// 採り、器の高さからは本文の上余白（`PREVIEW_BODY_PADDING`）を引く。
-    /// 実測（高さ 381px の器）: 先頭行の上端は器の上端から 14px 下・1 行 21px で、
-    /// はみ出さずに見えるのは 17 行。`theme.line_height`（17px）で器の高さを割ると 22 行に
-    /// なり、Page Down が画面の外まで進んでいた。レイアウトの控えは paint 時にしか入らない
-    /// （#821）ので、読めるのは prepaint 済みのものだけ。まだ 1 行も描いていなければ
-    /// `theme.line_height` で見積もる
-    fn preview_viewport_lines(&self, pane_id: PaneId) -> Option<usize> {
-        let height = f32::from(self.preview_viewport_bounds(pane_id)?.size.height)
-            - preview_render::PREVIEW_BODY_PADDING;
-        let line = self
-            .preview_text_layouts
-            .get(&pane_id)
-            .and_then(|layouts| layouts.iter().flatten().next())
-            .map(|layout| f32::from(layout.line_height()))
-            .unwrap_or(self.theme.line_height);
-        (height > 0.0 && line > 0.0).then(|| ((height / line).floor() as usize).max(1))
-    }
-
     /// 編集コマンド 1 つを当てる（#1652）。**GUI の打鍵と CLI / MCP の
     /// `move` / `delete` が同じ口を通る**（UI 層に閉じた編集ロジックを作らない）。
     ///
     /// 移動・削除の中身は `TextBuffer`（tako-core）が持つ。ここがするのは
     /// 器の寸法（ページ移動の歩幅）を渡すことと、プレビューへの反映だけ。
+    /// 歩幅の元になる可視行数は追従スクロールと同じ `preview_row_geometry`（#1741）から
+    /// 採る（別の測り方をすると、Page Down の着地が追従の余白と食い違う）。
+    /// 器をまだ測れていなければ渡さない（`TextBuffer` の既定の歩幅になる）。
     /// 本文が変わったら `Ok(true)`（呼び手が自動保存を回す）
     fn run_editor_command_local(
         &mut self,
@@ -13300,7 +13285,9 @@ impl TakoApp {
             self.set_preview_editing_local(pane_id, false)?;
             return Ok(false);
         }
-        let viewport_lines = self.preview_viewport_lines(pane_id);
+        let viewport_lines = self
+            .preview_row_geometry(pane_id)
+            .map(|rows| rows.visible_lines);
         let edit = self
             .preview_edits
             .get_mut(&pane_id)
@@ -13906,10 +13893,14 @@ impl TakoApp {
     /// カーソル行のレイアウトがまだ無い。そのフレームで諦めると下線が消えるので、
     /// 「可視化後にカーソル行が来る位置」を器の実測値から出しておく。
     ///
-    /// x は本文の左端（列までの実描画幅はレイアウトが無いと出せない）。1 フレーム後には
-    /// 実測の位置へ吸い付くので、下線が本文の外へ出ないことだけを保証する
+    /// 縦の位置は可視行数と同じ `preview_row_geometry`（#1741）の先頭行の上端と 1 行の
+    /// 高さから出す（器の上端 + `theme.line_height` × 行 で出すと、上余白と行の高さの差で
+    /// 下の行ほど本文の上へずれる）。x は本文の左端（列までの実描画幅はレイアウトが無いと
+    /// 出せない）。1 フレーム後には実測の位置へ吸い付くので、下線が本文の外へ出ないことだけを
+    /// 保証する
     fn preview_pending_cursor_origin(&self, pane: PaneId) -> Option<Point<Pixels>> {
         let (cursor_line, view) = self.preview_cursor_viewport(pane)?;
+        let rows = self.preview_row_geometry(pane)?;
         let bounds = self.preview_viewport_bounds(pane)?;
         if f32::from(bounds.size.height) <= 0.0 {
             return None;
@@ -13921,7 +13912,7 @@ impl TakoApp {
         );
         Some(point(
             bounds.origin.x,
-            bounds.origin.y + px(self.theme.line_height * row as f32),
+            rows.first_row_top + rows.line_height * row as f32,
         ))
     }
 
@@ -38849,6 +38840,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1741: 可視行数（追従の余白・ページ移動の歩幅）が描いた行の実矩形と合うか
+                "viewport-lines" => {
+                    viewport_lines_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
@@ -38857,7 +38854,7 @@ mod self_test {
                          remote-tree / flicker / ime-preedit / screen-lines / \
                          pane-border / tasks-panel / task-attachment / \
                          tasks-accordion / shelve-tab / no-emoji / editor-keys / \
-                         run-command-truncate）"
+                         run-command-truncate / viewport-lines）"
                     );
                     std::process::exit(1);
                 }
@@ -38908,6 +38905,10 @@ mod self_test {
             // #1652: 修飾キー付きの打鍵（⌥← / ⌥⌫ / ⌘↑ / Page Down / Home）が
             // 実 GUI の打鍵経路で編集に効くか + IME の変換中は本文に触らないか
             editor_keys_visual(any, window, cx).await;
+
+            // #1741: 追従の余白と Page Down の歩幅が、描いた行の実矩形の可視行数と合うか
+            // （文字サイズの最大・最小 / 1 行 / 短い / 折り返しのファイルを含む）
+            viewport_lines_visual(any, window, cx).await;
 
             // #589: ファイルツリーのインデントガイド線が連続しているか。
             // 4 階層のフィクスチャを開き、ダーク / ライト / スクロール後の 3 状態で
@@ -42464,13 +42465,18 @@ mod self_test {
             ),
         );
 
-        // (7) ページ移動: 歩幅は器に見える行数 − 1
+        // (7) ページ移動: 歩幅は器に見える行数 − 1（可視行数は追従スクロールと同じ
+        // `preview_row_geometry` の 1 実装。#1741）
+        place(cx, 0, 0);
+        let _ = observe(cx, 0);
         let viewport = window
-            .update(cx, |app, _, _| app.preview_viewport_lines(pane))
+            .update(cx, |app, _, _| {
+                app.preview_row_geometry(pane)
+                    .map(|rows| rows.visible_lines)
+            })
             .ok()
             .flatten()
             .unwrap_or(0);
-        place(cx, 0, 0);
         press(any, cx, "pagedown");
         let seen = observe(cx, 0);
         report("page-down", "pagedown", &seen);
@@ -42479,8 +42485,10 @@ mod self_test {
             viewport > 2 && seen.1.0 == viewport - 1,
             &format!("visual-test editor-keys: Page Down で 1 画面ぶん進む (viewport={viewport} {seen:?})"),
         );
-        // 歩幅の算術が実際の画面と合っているか: 着地した行は器の中に収まり、
-        // その次の行は器の下端をはみ出す（= 着地した行が最下段）。行の実矩形で見る
+        // 歩幅と追従が実際の画面と合っているか（#1741）: 着地した行と、その下の追従の余白
+        // （FOLLOW_MARGIN 行）が器に収まり、その次の行は収まらない。行の実矩形で見る。
+        // 着地行が最下段に貼り付く（余白 0）のは、追従が可視行数を多く見積もって
+        // 動かなかった #1741 の症状
         let fits = |cx: &mut AsyncApp, line: usize| -> Option<bool> {
             window
                 .update(cx, |app, _, _| {
@@ -42492,15 +42500,22 @@ mod self_test {
                 .ok()
                 .flatten()
         };
+        let margin = tako_core::editor_scroll::FOLLOW_MARGIN;
         let landed = fits(cx, seen.1 .0);
-        let next = fits(cx, seen.1 .0 + 1);
+        let margin_rows: Vec<Option<bool>> =
+            (1..=margin).map(|d| fits(cx, seen.1 .0 + d)).collect();
+        let beyond = fits(cx, seen.1 .0 + margin + 1);
         println!(
-            "TAKO_VISUAL_PIXEL: editor-keys page-fit landed_visible={landed:?} next_visible={next:?}"
+            "TAKO_VISUAL_PIXEL: editor-keys page-fit landed_visible={landed:?} \
+             margin_visible={margin_rows:?} beyond_visible={beyond:?}"
         );
         check(
-            landed == Some(true) && next == Some(false),
+            landed == Some(true)
+                && margin_rows.iter().all(|fit| *fit == Some(true))
+                && beyond != Some(true),
             &format!(
-                "visual-test editor-keys: Page Down の着地行が画面の最下段                  (landed={landed:?} next={next:?})"
+                "visual-test editor-keys: Page Down の着地行の下に余白 {margin} 行が見える \
+                 (#1741。landed={landed:?} margin={margin_rows:?} beyond={beyond:?})"
             ),
         );
 
@@ -42633,6 +42648,556 @@ mod self_test {
         });
         let _ = std::fs::remove_dir_all(&dir);
         println!("TAKO_VISUAL_PIXEL: editor-keys ok legacy={legacy}");
+    }
+
+    /// #1741: 可視行数（追従スクロールの余白とページ移動の歩幅）が**実際に描いた行の
+    /// 矩形**と合っているか。
+    ///
+    /// 正解は実 GUI から採る: 1 フレーム描いたあと `preview_text_layouts` に控えられた行
+    /// （= そのフレームで paint された行）のうち、矩形が器（`preview_viewport_bounds`）に
+    /// 収まるものが「はみ出さずに見えている行」。実装の値（追従が使う可視行数）は
+    /// 突き合わせる相手として並べるだけで、正解には使わない。打鍵は
+    /// `window.dispatch_keystroke` へ流す（キーバインド判定 → 編集の入口 → 追従）。
+    ///
+    /// 相: (1) 寸法 (2) 下端の追従 (3) 上端の追従 (4) Page Down / Up (5) 文字サイズ
+    /// （⌘+ と全体の文字サイズの最大・最小） (6) 1 行 / 視野より短い / 折り返しのある行。
+    /// 判定は溜めて節の最後にまとめて落とす（修正前のビルドで全相のずれを 1 回で並べるため）。
+    /// 単独実行は `TAKO_VISUAL_ONLY=viewport-lines`
+    #[cfg(feature = "visual-test")]
+    async fn viewport_lines_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        use tako_control::protocol::Request as Req;
+        use tako_core::editor_scroll::FOLLOW_MARGIN;
+
+        /// 描いた行の矩形から採った正解（と、突き合わせる実装の値）
+        #[derive(Debug, Clone, Copy, Default)]
+        struct Rows {
+            /// はみ出さずに見えている最初 / 最後の行と、その数（= 正解の可視行数）
+            first: usize,
+            last: usize,
+            count: usize,
+            /// 描いた行の 1 行の高さ・器の上端から先頭行の上端まで・器の高さ（論理 px）
+            row_h: f32,
+            top_gap: f32,
+            view_h: f32,
+            /// カーソル行と、それがはみ出さずに見えているか
+            cursor: usize,
+            cursor_visible: bool,
+            /// 実装の値（追従が使う可視行数）
+            follow_lines: usize,
+        }
+        impl Rows {
+            /// カーソル行の下に見えている行数（カーソルが見えていなければ None）
+            fn below(&self) -> Option<usize> {
+                self.cursor_visible.then(|| self.last - self.cursor)
+            }
+            /// カーソル行の上に見えている行数
+            fn above(&self) -> Option<usize> {
+                self.cursor_visible.then(|| self.cursor - self.first)
+            }
+        }
+
+        async fn open_edit(
+            any: AnyWindowHandle,
+            window: WindowHandle<TakoApp>,
+            cx: &mut AsyncApp,
+            path: &std::path::Path,
+        ) -> PaneId {
+            let pane = window
+                .update(cx, |app, _, cx| {
+                    let base = app.focused_pane().as_u64();
+                    let opened = tako_control::dispatch(
+                        app,
+                        Req::OpenFile {
+                            pane: Some(base),
+                            path: path.display().to_string(),
+                            mode: Some(tako_control::protocol::PreviewModeWire::Code),
+                            direction: Some(tako_control::protocol::Direction::Right),
+                            focus: Some(true),
+                            new_tab: false,
+                            line: None,
+                            column: None,
+                        },
+                        PaneOrigin::Cli,
+                    )
+                    .expect("visual-test viewport-lines を dispatch で開ける");
+                    cx.notify();
+                    PaneId::from_raw(opened["pane"].as_u64().expect("OpenFile 応答の pane"))
+                })
+                .unwrap_or_else(|_| fail("visual-test viewport-lines dispatch"));
+            check(
+                wait_for_preview_maps(any, window, cx, pane, false).await,
+                "visual-test viewport-lines: 座標キャッシュが揃う",
+            );
+            let editing = window
+                .update(cx, |app, _, cx| {
+                    // 打鍵の入口は `focused_pane()` を見るので、対象ペインを明示的に掴む
+                    let _ = app.workspace.active_tab_mut().tree_mut().focus(pane);
+                    let r = tako_control::dispatch(
+                        app,
+                        Req::PreviewEdit {
+                            pane: Some(pane.as_u64()),
+                            enabled: Some(true),
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    cx.notify();
+                    r.ok().and_then(|v| v["editing"].as_bool()).unwrap_or(false)
+                })
+                .unwrap_or(false);
+            check(
+                editing,
+                "visual-test viewport-lines: 編集モードを開始できる",
+            );
+            notify_and_draw(any, window, cx);
+            pane
+        }
+
+        fn close(window: WindowHandle<TakoApp>, cx: &mut AsyncApp, pane: PaneId) {
+            let _ = window.update(cx, |app, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    Req::Close {
+                        pane: Some(pane.as_u64()),
+                        force: true,
+                        caller_role: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+            });
+        }
+
+        fn expect(failures: &mut Vec<String>, cond: bool, what: String) {
+            if !cond {
+                println!("TAKO_VISUAL_PIXEL: viewport-lines NG {what}");
+                failures.push(what);
+            }
+        }
+
+        inject_section_failure("viewport-lines");
+        ensure_fresh_scene(window, cx, "viewport-lines").await;
+        let zoom_in = if cfg!(target_os = "macos") {
+            "cmd-="
+        } else {
+            "ctrl-="
+        };
+        let dir = std::env::temp_dir().join(format!("tako-visual-vlines-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("visual-test viewport-lines 一時ディレクトリ");
+        let write = |name: &str, body: String| -> std::path::PathBuf {
+            let path = dir.join(name);
+            std::fs::write(&path, body).expect("visual-test viewport-lines fixture");
+            path
+        };
+        let long = write(
+            "long.rs",
+            (0..400)
+                .map(|i| format!("    let row_{i:03} = {i};\n"))
+                .collect(),
+        );
+        let one = write("one.rs", "fn main() {}".to_string());
+        let short = write(
+            "short.rs",
+            (0..5).map(|i| format!("let s{i} = {i};\n")).collect(),
+        );
+        // 5 行に 1 行、器の幅で折り返す長い行を混ぜる（その行だけ 2 行ぶん以上の高さになる）
+        let wrapped = write(
+            "wrapped.rs",
+            (0..200)
+                .map(|i| {
+                    if i % 5 == 2 {
+                        format!("    // wrap {i:03} {}\n", "abcdefghij ".repeat(24))
+                    } else {
+                        format!("    let row_{i:03} = {i};\n")
+                    }
+                })
+                .collect(),
+        );
+
+        let rows = |cx: &mut AsyncApp, pane: PaneId| -> Rows {
+            notify_and_draw(any, window, cx);
+            window
+                .update(cx, |app, _, _| {
+                    let mut out = Rows::default();
+                    let Some(view) = app.preview_viewport_bounds(pane) else {
+                        return out;
+                    };
+                    out.view_h = f32::from(view.size.height);
+                    if let Some(edit) = app.preview_edits.get(&pane) {
+                        out.cursor = edit.buffer.line_byte_col(edit.buffer.cursor()).0;
+                    }
+                    out.follow_lines = app
+                        .preview_cursor_viewport(pane)
+                        .map(|(_, v)| v.visible_lines)
+                        .unwrap_or(0);
+                    let Some(layouts) = app.preview_text_layouts.get(&pane) else {
+                        return out;
+                    };
+                    let mut seen = false;
+                    for (ix, slot) in layouts.iter().enumerate() {
+                        let Some(layout) = slot else { continue };
+                        let b = layout.bounds();
+                        if b.top() < view.top() - px(0.5) || b.bottom() > view.bottom() + px(0.5) {
+                            continue;
+                        }
+                        if !seen {
+                            seen = true;
+                            out.first = ix;
+                            out.top_gap = f32::from(b.top() - view.top());
+                            out.row_h = f32::from(layout.line_height());
+                        }
+                        out.last = ix;
+                        out.count += 1;
+                        out.cursor_visible |= ix == out.cursor;
+                    }
+                    out
+                })
+                .unwrap_or_default()
+        };
+        let place = |cx: &mut AsyncApp, pane: PaneId, line: usize| {
+            window
+                .update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        Req::PreviewCursor {
+                            pane: Some(pane.as_u64()),
+                            line: line + 1,
+                            col: 0,
+                            select_to_line: None,
+                            select_to_col: None,
+                            expected_version: None,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    cx.notify();
+                })
+                .ok();
+        };
+        let report = |label: &str, key: &str, r: &Rows| {
+            println!(
+                "TAKO_VISUAL_PIXEL: viewport-lines {label} key={key} cursor={} visible={}..={} \
+                 count={} follow_lines={} below={:?} above={:?}",
+                r.cursor,
+                r.first,
+                r.last,
+                r.count,
+                r.follow_lines,
+                r.below(),
+                r.above()
+            );
+        };
+        // 先頭から ↓ を押し続けた各段の観測（下端の追従）
+        let walk = |cx: &mut AsyncApp, pane: PaneId, label: &str, key: &str, steps: usize| {
+            let mut seen = Vec::with_capacity(steps);
+            for _ in 0..steps {
+                press(any, cx, key);
+                let r = rows(cx, pane);
+                report(label, key, &r);
+                seen.push(r);
+            }
+            seen
+        };
+        // 下端の追従の判定。設計: カーソルの下に FOLLOW_MARGIN 行が見えなくなる段
+        // （= 先頭から数えて可視行数 − 余白の行）で器が動き始め、以降は下の余白が
+        // ちょうど FOLLOW_MARGIN 行のまま。どの段でもカーソル行ははみ出さずに見えている
+        fn judge_down(failures: &mut Vec<String>, label: &str, visible: usize, seen: &[Rows]) {
+            let want = visible - FOLLOW_MARGIN;
+            let hidden: Vec<usize> = seen
+                .iter()
+                .filter(|r| !r.cursor_visible)
+                .map(|r| r.cursor)
+                .collect();
+            let start = seen.iter().find(|r| r.first > 0).map(|r| r.cursor);
+            let margins: Vec<Option<usize>> = seen
+                .iter()
+                .skip_while(|r| r.first == 0)
+                .map(Rows::below)
+                .collect();
+            println!(
+                "TAKO_VISUAL_PIXEL: viewport-lines {label} judge visible={visible} \
+                 scroll_start={start:?} want_start={want} hidden={hidden:?} margins={margins:?}"
+            );
+            expect(
+                failures,
+                hidden.is_empty(),
+                format!("{label}: ↓ の途中でカーソル行が器の外へ出た (行 {hidden:?})"),
+            );
+            expect(
+                failures,
+                start == Some(want),
+                format!("{label}: 器が動き始めた行 {start:?} が設計（可視 {visible} 行 − 余白 = {want}）と違う"),
+            );
+            let exact = !margins.is_empty() && margins.iter().all(|m| *m == Some(FOLLOW_MARGIN));
+            expect(
+                failures,
+                exact,
+                format!(
+                    "{label}: 動き始めてからの下の余白が {FOLLOW_MARGIN} 行でない ({margins:?})"
+                ),
+            );
+        }
+        let mut failures: Vec<String> = Vec::new();
+
+        // (1) 寸法: 先頭を見ている状態で、実装の可視行数と実矩形の行数を並べる
+        let pane = open_edit(any, window, cx, &long).await;
+        place(cx, pane, 0);
+        let top = rows(cx, pane);
+        println!(
+            "TAKO_VISUAL_PIXEL: viewport-lines geometry view_h={:.1} top_gap={:.1} row_h={:.2} \
+             truth={} follow_lines={}",
+            top.view_h, top.top_gap, top.row_h, top.count, top.follow_lines
+        );
+        check(
+            top.first == 0 && top.count > FOLLOW_MARGIN * 2 + 1,
+            &format!("visual-test viewport-lines: 先頭が見えていて器の高さが測れる ({top:?})"),
+        );
+        let capacity = top.count;
+        expect(
+            &mut failures,
+            top.follow_lines == capacity,
+            format!(
+                "寸法: 追従の可視行数 {} が実矩形の {capacity} 行と違う",
+                top.follow_lines
+            ),
+        );
+
+        // (2) 下端の追従
+        let down = walk(cx, pane, "bottom-edge", "down", capacity + 6);
+        judge_down(&mut failures, "bottom-edge", capacity, &down);
+
+        // (3) 上端の追従: そこから ↑ を押し続ける。器が上へ動き始めてからは、
+        // 文書頭に着くまで上の余白がちょうど FOLLOW_MARGIN 行
+        let start_first = down.last().map(|r| r.first).unwrap_or(0);
+        let up = walk(cx, pane, "top-edge", "up", capacity + 6);
+        let moved_up: Vec<Option<usize>> = up
+            .iter()
+            .skip_while(|r| r.first == start_first)
+            .filter(|r| r.first > 0)
+            .map(Rows::above)
+            .collect();
+        let hidden_up: Vec<usize> = up
+            .iter()
+            .filter(|r| !r.cursor_visible)
+            .map(|r| r.cursor)
+            .collect();
+        println!(
+            "TAKO_VISUAL_PIXEL: viewport-lines top-edge judge hidden={hidden_up:?} \
+             margins={moved_up:?}"
+        );
+        expect(
+            &mut failures,
+            hidden_up.is_empty(),
+            format!("上端: ↑ の途中でカーソル行が器の外へ出た (行 {hidden_up:?})"),
+        );
+        expect(
+            &mut failures,
+            !moved_up.is_empty() && moved_up.iter().all(|m| *m == Some(FOLLOW_MARGIN)),
+            format!("上端: 動き始めてからの上の余白が {FOLLOW_MARGIN} 行でない ({moved_up:?})"),
+        );
+
+        // (4) Page Down / Up: 歩幅は「見えている行数 − 1」、着地のあとも余白つきで見える。
+        // 2 回目の Page Down では前の画面の最下段が新しい画面の最上段に残る
+        place(cx, pane, 0);
+        let _ = rows(cx, pane);
+        press(any, cx, "pagedown");
+        let p1 = rows(cx, pane);
+        report("page-down-1", "pagedown", &p1);
+        press(any, cx, "pagedown");
+        let p2 = rows(cx, pane);
+        report("page-down-2", "pagedown", &p2);
+        press(any, cx, "pageup");
+        let p3 = rows(cx, pane);
+        report("page-up", "pageup", &p3);
+        let step = p1.cursor;
+        expect(
+            &mut failures,
+            step + 1 == capacity,
+            format!("Page Down: 歩幅 {step} が「実矩形の可視 {capacity} 行 − 1」と違う"),
+        );
+        expect(
+            &mut failures,
+            p1.below() == Some(FOLLOW_MARGIN) && p2.below() == Some(FOLLOW_MARGIN),
+            format!(
+                "Page Down: 着地のあとの下の余白が {FOLLOW_MARGIN} 行でない ({:?} / {:?})",
+                p1.below(),
+                p2.below()
+            ),
+        );
+        expect(
+            &mut failures,
+            p2.cursor == step * 2 && p2.first == p1.last,
+            format!(
+                "Page Down: 2 回目で前の画面の最下段 {} が最上段に残らない (first={} cursor={})",
+                p1.last, p2.first, p2.cursor
+            ),
+        );
+        expect(
+            &mut failures,
+            p3.cursor == step && p3.above() == Some(FOLLOW_MARGIN),
+            format!(
+                "Page Up: 着地 {} / 上の余白 {:?} が設計（{step} / {FOLLOW_MARGIN}）と違う",
+                p3.cursor,
+                p3.above()
+            ),
+        );
+
+        // (5a) ⌘+（ペインの文字サイズ）。コードプレビューの行の高さが変わるかも観測する
+        place(cx, pane, 0);
+        let before = rows(cx, pane);
+        for _ in 0..3 {
+            press(any, cx, zoom_in);
+        }
+        place(cx, pane, 0);
+        let zoomed = rows(cx, pane);
+        let pane_fs = window
+            .update(cx, |app, _, _| app.pane_font_size(pane))
+            .unwrap_or(0.0);
+        println!(
+            "TAKO_VISUAL_PIXEL: viewport-lines zoom-in pane_font={pane_fs} row_h={:.2}->{:.2} \
+             truth={} follow_lines={}",
+            before.row_h, zoomed.row_h, zoomed.count, zoomed.follow_lines
+        );
+        expect(
+            &mut failures,
+            zoomed.follow_lines == zoomed.count,
+            format!(
+                "⌘+: 追従の可視行数 {} が実矩形の {} 行と違う",
+                zoomed.follow_lines, zoomed.count
+            ),
+        );
+        let _ = window.update(cx, |app, _, cx| {
+            app.pane_font_sizes.remove(&pane);
+            app.pane_cell_sizes.remove(&pane);
+            cx.notify();
+        });
+
+        // (5b) 全体の文字サイズを最大・最小へ（設定の再読込と同じくセル寸法の控えを捨てる）
+        let font_before = window
+            .update(cx, |app, _, _| app.theme.font_size)
+            .unwrap_or(13.0);
+        for (label, size) in [
+            ("font-max", TakoApp::FONT_SIZE_MAX),
+            ("font-min", TakoApp::FONT_SIZE_MIN),
+        ] {
+            let _ = window.update(cx, |app, _, cx| {
+                app.theme.font_size = size;
+                app.theme.line_height = size * 1.3;
+                app.cell_size = None;
+                app.pane_cell_sizes.clear();
+                cx.notify();
+            });
+            place(cx, pane, 0);
+            let r = rows(cx, pane);
+            println!(
+                "TAKO_VISUAL_PIXEL: viewport-lines {label} font={size} row_h={:.2} truth={} \
+                 follow_lines={}",
+                r.row_h, r.count, r.follow_lines
+            );
+            expect(
+                &mut failures,
+                r.follow_lines == r.count,
+                format!(
+                    "{label}: 追従の可視行数 {} が実矩形の {} 行と違う",
+                    r.follow_lines, r.count
+                ),
+            );
+            let seen = walk(cx, pane, label, "down", r.count + 4);
+            judge_down(&mut failures, label, r.count, &seen);
+        }
+        let _ = window.update(cx, |app, _, cx| {
+            app.theme.font_size = font_before;
+            app.theme.line_height = font_before * 1.3;
+            app.cell_size = None;
+            app.pane_cell_sizes.clear();
+            cx.notify();
+        });
+        close(window, cx, pane);
+
+        // (6a) 1 行だけのファイル: 可視行数は器の容量のまま、↓ / Page Down で動かない
+        let pane = open_edit(any, window, cx, &one).await;
+        let r = rows(cx, pane);
+        press(any, cx, "down");
+        press(any, cx, "pagedown");
+        let moved = rows(cx, pane);
+        report("one-line", "pagedown", &moved);
+        expect(
+            &mut failures,
+            r.follow_lines == capacity && moved.cursor == 0 && moved.first == 0,
+            format!(
+                "1 行: 可視行数 {} / 容量 {capacity}・カーソル {}・先頭 {}",
+                r.follow_lines, moved.cursor, moved.first
+            ),
+        );
+        close(window, cx, pane);
+
+        // (6b) 視野より短いファイル: Page Down は末尾行で止まり、器は動かない
+        let pane = open_edit(any, window, cx, &short).await;
+        let r = rows(cx, pane);
+        press(any, cx, "pagedown");
+        let moved = rows(cx, pane);
+        report("short", "pagedown", &moved);
+        expect(
+            &mut failures,
+            r.follow_lines == capacity && moved.cursor == 5 && moved.first == 0,
+            format!(
+                "短い: 可視行数 {} / 容量 {capacity}・カーソル {}（末尾行 5）・先頭 {}",
+                r.follow_lines, moved.cursor, moved.first
+            ),
+        );
+        close(window, cx, pane);
+
+        // (6c) 折り返しのある行: 見えている行数は実矩形どおり（折り返した行は 2 行ぶん以上）、
+        // ↓ で進む間ずっとカーソル行が見えている
+        let pane = open_edit(any, window, cx, &wrapped).await;
+        place(cx, pane, 0);
+        let r = rows(cx, pane);
+        press(any, cx, "pagedown");
+        let paged = rows(cx, pane);
+        report("wrapped", "pagedown", &paged);
+        println!(
+            "TAKO_VISUAL_PIXEL: viewport-lines wrapped truth={} follow_lines={} page_step={} \
+             capacity={capacity}",
+            r.count, r.follow_lines, paged.cursor
+        );
+        expect(
+            &mut failures,
+            r.count < capacity && r.follow_lines == r.count && paged.cursor + 1 == r.count,
+            format!(
+                "折り返し: 実矩形 {} 行（容量 {capacity}）・追従 {}・Page Down の歩幅 {}",
+                r.count, r.follow_lines, paged.cursor
+            ),
+        );
+        place(cx, pane, 0);
+        let seen = walk(cx, pane, "wrapped", "down", 60);
+        let hidden: Vec<usize> = seen
+            .iter()
+            .filter(|r| !r.cursor_visible)
+            .map(|r| r.cursor)
+            .collect();
+        let margins: Vec<Option<usize>> = seen.iter().map(Rows::below).collect();
+        println!(
+            "TAKO_VISUAL_PIXEL: viewport-lines wrapped judge hidden={hidden:?} margins={margins:?}"
+        );
+        expect(
+            &mut failures,
+            hidden.is_empty(),
+            format!("折り返し: ↓ の途中でカーソル行が器の外へ出た (行 {hidden:?})"),
+        );
+        close(window, cx, pane);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        check(
+            failures.is_empty(),
+            &format!(
+                "visual-test viewport-lines (#1741): {}",
+                failures.join(" / ")
+            ),
+        );
+        println!("TAKO_VISUAL_PIXEL: viewport-lines ok");
     }
 
     /// タブバーの「ー」を**実マウスで**押すとタブが 1 単位で退避し、たまり場の
