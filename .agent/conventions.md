@@ -2265,8 +2265,41 @@ CLOEXEC 無しで受け継ぎ、exec 後も握る。漏れた先が長生きす�
   テストプロセスより長生きし、生まれた瞬間に受け継いだ fd（別モジュールのテストのパイプ）を握り続ける
 - 番犬 `crates/tako-control/tests/issue1748_fake_claude_serial_watchdog.rs` が、
   偽 claude を起こす `#[test]` のロック欠落・後取り・孫の放置を `file:line` で落とす
-- 同じ隙間は製品にもある（GUI プロセス内の spawn のパイプが PTY のシェルへ漏れうる。
-  alacritty_terminal 0.26 の `pre_exec` は slave / master しか閉じない）
+- 同じ隙間は製品にもあるが、製品の条件では当たらなかった（隔離 GUI で 3000 回中 0 回）。
+  製品で実際に漏れていたのは別の型（GUI が CLOEXEC 無しで開いた fd）で、次の節で塞いだ
+
+## 長生きする子へ GUI の fd を渡さない（Issue #1768）
+
+**fork + exec で起きる子は、fork の瞬間に GUI が CLOEXEC 無しで開いていた fd をすべて受け継ぐ。**
+ペインの PTY の子（alacritty の PTY は `pre_exec` を持つ `Command` = fork + exec）と
+`remote serve` の daemon がこれに当たる。修正前は、Metal のシェーダキャッシュ
+（`com.apple.metal/…/functions*.data` / `.list`。Apple のフレームワークが開く）が
+**全ペインの子の fd 4 / 5 に 100%** 入っていた（隔離 GUI 3000 / 3000・本番の tmux クライアント 23 本）。
+
+- **掃除は `platform::fd_inherit::seal_inherited_fds()` の 1 実装を、fork 後・exec 前の子の中で
+  走らせる**。自分の fd 3 以上のうち CLOEXEC が無いものへ `FD_CLOEXEC` を立てる（macOS は
+  `proc_pidinfo(PROC_PIDLISTFDS)` で開いている fd だけを列挙する。fd 上限は起こし方で
+  256〜13 万と桁で変わるので総当たりにしない）。本体は async-signal-safe（確保しない・
+  ロックを取らない）に保つ
+- **自前の `pre_exec` を書くなら、その中で呼ぶ**（`remote.rs` の `configure_daemon_child`）
+- **`pre_exec` を足せない起動（alacritty の PTY）は `fd_inherit::spawn_sealed(|| …)` で包む**。
+  包んでいるあいだだけ `pthread_atfork` の子ハンドラが構え、そのスレッドが起こした fork の子で
+  掃除を走らせる（ほかのスレッドの fork には効かない。親の fd は書き換えない）
+- **親で掃いてから起こす形にしない**: 「掃いてから fork までに別スレッドが CLOEXEC 無しで
+  開いた fd」が残る。macOS の std は `Stdio::piped()` のパイプを `pipe()` → `set_cloexec` の
+  2 手で作るので、実測（隔離 GUI・GitLog の並行負荷・3000 回）で親で掃く版は Metal の漏れを
+  塞いだが、**GUI が相方を握るパイプが 1 回入った**
+- **close ではなく CLOEXEC**: fork 後の子で閉じると、std が exec の失敗を親へ返す error pipe まで
+  閉じ、失敗が成功に化ける
+- tako は子へ fd を意図して渡していない（`Stdio::from(fd)` は std が子の中で 0 / 1 / 2 へ
+  dup2 するので掃除と衝突しない）。fd 3 以上を子へ渡す機能を足すなら、この規約と衝突するので
+  先に設計を相談する
+- **Windows は掃かない**（`fd_inherit::seals` が偽）。ConPTY は `CreateProcessW` に
+  `bInheritHandles = FALSE` を渡し、Windows のハンドルは既定で継承されない
+- 挙動は `tako-core/tests/pty_fd_inherit.rs`（実 PTY）と `remote.rs` の単体テスト（daemon）、
+  構造は番犬 `crates/tako-control/tests/issue1768_fd_inherit_watchdog.rs` が見る
+  （PTY の起動口と `pre_exec` の掃除の欠落・本体の確保を `file:line` で落とす）。
+  製品での実測は `scripts/test-pty-fd-leak-1768.sh`（隔離 GUI。CI には載せない）
 
 ## ゲートを足す変更は、そのゲートを通る隔離テストも同じコミットで直す（Issue #1452 / #1493）
 
