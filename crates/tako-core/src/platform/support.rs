@@ -219,6 +219,13 @@ pub mod notes {
         "Starting, handshaking and syncing documents are covered by the fake-server e2e, but no real language server (rust-analyzer etc.) has been handshaken on real Windows hardware yet (#1007)",
     );
 
+    /// LSP の診断の一覧（#1679）。受信・UTF-16 の変換・絞り込みは OS 非依存の e2e で見ているが、
+    /// Windows 実機で実サーバの診断を出したことはまだ無い
+    pub const WIN_LSP_DIAGNOSTICS_UNMEASURED: Note = Note::new(
+        "診断の受信・UTF-16 の桁の変換・重大度の絞り込みは偽サーバの e2e で確かめているが、Windows 実機で実サーバ（rust-analyzer 等）の診断を出したことはまだ無い（#1007）",
+        "Receiving diagnostics, converting UTF-16 columns and filtering by severity are covered by the fake-server e2e, but no real language server has produced diagnostics on real Windows hardware yet (#1007)",
+    );
+
     // ─── そもそも要らない / 概念が無い ─────────────────────────────
 
     /// OS が同等機能を標準で持っていて、tako 側の実装が不要なもの（#600）
@@ -769,6 +776,19 @@ pub const MATRIX: &[Feature] = &[
         windows: Support::Supported,
         windows_evidence: Evidence::SelfTest(
             "項目 87 / 104（ペインログのクローズマーカーと発生源）",
+        ),
+    },
+    Feature {
+        key: "tako_lsp",
+        // #1679: 診断の一覧（言語機能）。受信は S1 と同じ std のパイプとスレッドで、
+        // 変換・絞り込みは OS 非依存の純粋関数。Windows 実機で実サーバの診断を見ていない
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_LSP_DIAGNOSTICS_UNMEASURED,
+            issue: 1007,
+        },
+        windows_evidence: Evidence::UnitTest(
+            "issue1679_lsp_diagnostics（偽サーバの Diagnostic 配列 → tako lsp diagnostics の固定値・重大度の境界・UTF-16 の桁・閉じたら保持 0）が CI の Windows ジョブで緑",
         ),
     },
     Feature {

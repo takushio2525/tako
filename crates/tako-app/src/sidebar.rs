@@ -396,6 +396,9 @@ pub(crate) enum NoticeArm {
     /// リモート daemon の自動復帰（`TAKO_1485_LEGACY`）。判定そのものの A/B と
     /// 同じ env を使う（旧挙動では自動復帰しないので、通知だけ残っても意味がない）
     Issue1485,
+    /// 右パネル diagnostics ビューの行を押した失敗（`TAKO_1007_LEGACY`）。LSP ごと止める
+    /// A/B と同じ env を使う（旧挙動ではビューに行が出ないので、通知だけ残っても意味がない）
+    Issue1679,
 }
 
 impl NoticeArm {
@@ -412,6 +415,7 @@ impl NoticeArm {
             NoticeArm::Issue1450B2 => crate::tasks_panel::legacy_1450_b2(),
             NoticeArm::Issue1473 => tako_control::sleep_guard::legacy_1473(),
             NoticeArm::Issue1485 => tako_control::remote_autostart::legacy_mode(),
+            NoticeArm::Issue1679 => tako_control::lsp::legacy(),
         }
     }
 }

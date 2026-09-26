@@ -69,6 +69,36 @@ pub const UNAVAILABLE: Note = Note::new(
     "LSP is not available in this environment",
 );
 
+/// 診断を問われたペインが編集モードでない（#1679）
+pub const NOT_EDITING_REASON: Note = Note::new(
+    "編集モードではない（言語サーバは編集モードに入ったときに起きる）",
+    "Not in edit mode (a language server starts when you enter edit mode)",
+);
+
+/// 編集モードでないときの次の一手。`{pane}` = ペイン ID
+pub const NOT_EDITING_NEXT_STEP: Note = Note::new(
+    "tako edit start --pane {pane} で編集モードにする",
+    "Run tako edit start --pane {pane} to enter edit mode",
+);
+
+/// 編集中だが言語サーバとつながっていない（#1679）
+pub const NOT_LINKED_REASON: Note = Note::new(
+    "受け持つ言語サーバが無い・未導入・同じファイルを別のペインが編集している",
+    "No language server handles this file, it is not installed, or another pane is editing the same file",
+);
+
+/// つながっていないときの次の一手
+pub const NOT_LINKED_NEXT_STEP: Note = Note::new(
+    "理由は tako lsp status と tako lsp servers で見る",
+    "See tako lsp status and tako lsp servers for the reason",
+);
+
+/// つながっている文書が 1 つも無い（#1679）
+pub const NO_DOCUMENTS_NOTE: Note = Note::new(
+    "言語サーバにつながった文書が無い（対応する言語のファイルを編集モードで開くと診断が出る）",
+    "No document is connected to a language server (edit a supported file to see diagnostics)",
+);
+
 /// `{…}` を差し込む
 pub fn fill(note: Note, values: &[(&str, &str)]) -> String {
     let mut text = note.text().to_string();

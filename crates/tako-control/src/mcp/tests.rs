@@ -2,6 +2,34 @@
 mod tests {
     use super::*;
 
+    /// #1679: `tako_lsp` は CLI `tako lsp diagnostics` と同じ要求になる。
+    /// pane を省けば全文書（呼び出し元のペインで補わない。呼び出し元はたいてい端末）
+    #[test]
+    fn tako_lsp_は_cli_と同じ診断の要求になる() {
+        assert_eq!(
+            build_request("tako_lsp", &json!({}), Some(3), None).unwrap(),
+            Request::LspDiagnostics {
+                pane: None,
+                severity: None
+            }
+        );
+        assert_eq!(
+            build_request(
+                "tako_lsp",
+                &json!({"action": "diagnostics", "pane": 7, "severity": "warning"}),
+                Some(3),
+                None
+            )
+            .unwrap(),
+            Request::LspDiagnostics {
+                pane: Some(7),
+                severity: Some("warning".into())
+            }
+        );
+        let err = build_request("tako_lsp", &json!({"action": "hover"}), None, None).unwrap_err();
+        assert!(err.contains("diagnostics"), "{err}");
+    }
+
     #[test]
     fn 全公開ツールにrequest変換またはspecial_handlerがある() {
         for tool in tools() {
@@ -652,7 +680,8 @@ mod tests {
         // #1658 の tako_preview_edit_range / tako_preview_cursor（行・桁の範囲編集とカーソル）を追加して 154
         // #1652 の tako_preview_move / tako_preview_delete（単語・行単位の移動と削除）を追加して 156
         // #1678 の tako_lsp_server（言語サーバの状態と起動・停止）を追加して 157
-        assert_eq!(tools.len(), 157);
+        // #1679 の tako_lsp（言語機能。診断の一覧）を追加して 158
+        assert_eq!(tools.len(), 158);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

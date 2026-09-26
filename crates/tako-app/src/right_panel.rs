@@ -5574,11 +5574,16 @@ impl TakoApp {
         // **バッジの幅を含めて**段を選ぶので、件数が増えた日に数字が切れない
         let badge_text = panel_tab_badge(open_tasks);
         let legacy_tabs = legacy_1479();
+        // #1679: diagnostics タブは LSP につながった文書があるとき（か、そのビューを
+        // 選んでいるとき）だけ出す。常設すると既定幅 320px でラベルが全員ぶん落ちる
+        // （#1479 の段の選び方で 5 本目のぶんが入らない）ので、使っていない人の画面は変えない
+        let diagnostics_tab = view == PanelView::Diagnostics || self.lsp_documents_open();
+        let tabs = PANEL_BASE_TABS + usize::from(diagnostics_tab);
         let density = if legacy_tabs {
             // A/B: 幅を見ない（= 直す前）
             PanelTabDensity::Full
         } else {
-            panel_tab_density(self.panel_width, badge_text.as_deref())
+            panel_tab_density(self.panel_width, badge_text.as_deref(), tabs)
         };
         // カンプ準拠のタブ（アイコン + ラベル、active は下線 inset）
         let tab_button =
@@ -5779,6 +5784,22 @@ impl TakoApp {
                                 cx.notify();
                             })),
                         )
+                        .when(diagnostics_tab, |row| {
+                            row.child(
+                                tab_button(
+                                    PANEL_TAB_LABELS[PANEL_BASE_TABS],
+                                    crate::file_icons::ui_icon::WARNING,
+                                    PanelView::Diagnostics,
+                                    view == PanelView::Diagnostics,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.panel_view = PanelView::Diagnostics;
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                        })
                         .child(div().flex_grow(1.0).min_w(px(0.0)))
                         .child(
                             div()
@@ -5806,6 +5827,7 @@ impl TakoApp {
                     PanelView::Orch => self.render_orch_view(cx).into_any_element(),
                     PanelView::Git => self.render_git_view(cx).into_any_element(),
                     PanelView::Tasks => self.render_tasks_view(cx).into_any_element(),
+                    PanelView::Diagnostics => self.render_diagnostics_view(cx).into_any_element(),
                 })
                 .child(
                     // 左端のリサイズハンドル（ドラッグで幅調整）
@@ -5859,8 +5881,11 @@ pub(crate) fn legacy_1479() -> bool {
     *LEGACY.get_or_init(|| std::env::var("TAKO_1479_LEGACY").map(|v| v == "1") == Ok(true))
 }
 
-/// タブ列に並ぶラベル（**並び順そのもの**。描画も幅の見積りもここを読む）
-pub(crate) const PANEL_TAB_LABELS: [&str; 4] = ["fleet", "orch", "git", "tasks"];
+/// タブ列に並ぶラベル（**並び順そのもの**。描画も幅の見積りもここを読む）。
+/// 末尾の `diagnostics`（#1679）だけは条件つきで、先頭の [`PANEL_BASE_TABS`] 本が常設
+pub(crate) const PANEL_TAB_LABELS: [&str; 5] = ["fleet", "orch", "git", "tasks", "diagnostics"];
+/// 常設のタブの数（fleet / orch / git / tasks）
+pub(crate) const PANEL_BASE_TABS: usize = 4;
 /// バッジが付くタブの位置（[`PANEL_TAB_LABELS`] の添字）
 pub(crate) const PANEL_TAB_BADGE_ON: usize = 3;
 
@@ -5892,11 +5917,16 @@ pub(crate) enum PanelTabDensity {
     Compact,
     /// ラベルを落としてアイコン + バッジだけ（ラベルはツールチップで出す）
     IconsOnly,
+    /// アイコンだけで padding も詰める（#1679）。diagnostics タブが出ている 5 本 +
+    /// 3 桁のバッジが最小幅 220px に入らない（`IconsOnly` だと 0.5px 溢れる）ぶんの受け皿。
+    /// 常設 4 本はどの幅でも `IconsOnly` までで収まるので、4 本の見た目は変わらない
+    IconsTight,
 }
 
 impl PanelTabDensity {
     /// 広い順。[`panel_tab_density`] はこの順に見て**最初に収まる段**を返す
-    pub(crate) const LADDER: [PanelTabDensity; 3] = [Self::Full, Self::Compact, Self::IconsOnly];
+    pub(crate) const LADDER: [PanelTabDensity; 4] =
+        [Self::Full, Self::Compact, Self::IconsOnly, Self::IconsTight];
 
     /// 1 タブの左右 padding
     pub(crate) fn pad_x(self) -> f32 {
@@ -5904,12 +5934,13 @@ impl PanelTabDensity {
             Self::Full => 12.0,
             Self::Compact => 6.0,
             Self::IconsOnly => 8.0,
+            Self::IconsTight => 5.0,
         }
     }
 
     /// ラベルの文字を出すか（`false` ならツールチップへ回す）
     pub(crate) fn labels(self) -> bool {
-        !matches!(self, Self::IconsOnly)
+        !matches!(self, Self::IconsOnly | Self::IconsTight)
     }
 }
 
@@ -5934,11 +5965,16 @@ fn panel_tab_badge_width(badge: Option<&str>) -> f32 {
     }
 }
 
-/// タブ列がその段で要する幅（px）。**溢れ判定の正本**
-pub(crate) fn panel_tab_row_width(density: PanelTabDensity, badge: Option<&str>) -> f32 {
+/// タブ列がその段で要する幅（px）。**溢れ判定の正本**。`tabs` は出ているタブの数
+/// （[`PANEL_TAB_LABELS`] の先頭から数える）
+pub(crate) fn panel_tab_row_width(
+    density: PanelTabDensity,
+    badge: Option<&str>,
+    tabs: usize,
+) -> f32 {
     use panel_tab_metrics::*;
     let mut sum = CLOSE_W;
-    for (i, label) in PANEL_TAB_LABELS.iter().enumerate() {
+    for (i, label) in PANEL_TAB_LABELS.iter().take(tabs).enumerate() {
         sum += density.pad_x() * 2.0 + ICON;
         if density.labels() {
             sum += GAP + LABEL_CHAR_W * label.chars().count() as f32;
@@ -5959,12 +5995,16 @@ pub(crate) fn panel_tab_row_available(panel_width: f32) -> f32 {
 ///
 /// **最後の段は必ず返る**（どれも収まらない幅でも `IconsOnly` を返す）。
 /// `PANEL_MIN_WIDTH` 以上では `IconsOnly` が必ず収まることを単体テストが固定する
-pub(crate) fn panel_tab_density(panel_width: f32, badge: Option<&str>) -> PanelTabDensity {
+pub(crate) fn panel_tab_density(
+    panel_width: f32,
+    badge: Option<&str>,
+    tabs: usize,
+) -> PanelTabDensity {
     let available = panel_tab_row_available(panel_width);
     PanelTabDensity::LADDER
         .into_iter()
-        .find(|d| panel_tab_row_width(*d, badge) <= available)
-        .unwrap_or(PanelTabDensity::IconsOnly)
+        .find(|d| panel_tab_row_width(*d, badge, tabs) <= available)
+        .unwrap_or(PanelTabDensity::IconsTight)
 }
 
 #[cfg(test)]
@@ -5998,17 +6038,20 @@ mod tests {
     /// **全域で**含む
     #[test]
     fn 選んだ段はどの幅でも収まる() {
-        for w in 220..=900 {
-            let panel_width = w as f32;
-            for n in [0usize, 1, 9, 22, 99, 150, 4000] {
-                let badge = panel_tab_badge(n);
-                let density = panel_tab_density(panel_width, badge.as_deref());
-                let need = panel_tab_row_width(density, badge.as_deref());
-                let have = panel_tab_row_available(panel_width);
-                assert!(
-                    need <= have,
-                    "幅 {panel_width}px / {n} 件で {density:?} が溢れる（要 {need}px > 使える {have}px）"
-                );
+        // #1679: diagnostics タブが出ている 5 本でも同じ
+        for tabs in [PANEL_BASE_TABS, PANEL_BASE_TABS + 1] {
+            for w in 220..=900 {
+                let panel_width = w as f32;
+                for n in [0usize, 1, 9, 22, 99, 150, 4000] {
+                    let badge = panel_tab_badge(n);
+                    let density = panel_tab_density(panel_width, badge.as_deref(), tabs);
+                    let need = panel_tab_row_width(density, badge.as_deref(), tabs);
+                    let have = panel_tab_row_available(panel_width);
+                    assert!(
+                        need <= have,
+                        "{tabs} 本・幅 {panel_width}px / {n} 件で {density:?} が溢れる（要 {need}px > 使える {have}px）"
+                    );
+                }
             }
         }
     }
@@ -6019,7 +6062,7 @@ mod tests {
     fn 受け入れ条件の幅と件数での段() {
         let case = |w: f32, n: usize| {
             let badge = panel_tab_badge(n);
-            panel_tab_density(w, badge.as_deref())
+            panel_tab_density(w, badge.as_deref(), PANEL_BASE_TABS)
         };
         // 240px: ラベルは入らないのでアイコン + バッジへ落ちる
         assert_eq!(case(240.0, 22), PanelTabDensity::IconsOnly);
@@ -6046,13 +6089,15 @@ mod tests {
                 .position(|x| *x == d)
                 .expect("ladder に居る")
         };
-        for n in [0usize, 9, 22, 150] {
-            let badge = panel_tab_badge(n);
-            let mut prev = rank(panel_tab_density(220.0, badge.as_deref()));
-            for w in 221..=900 {
-                let now = rank(panel_tab_density(w as f32, badge.as_deref()));
-                assert!(now <= prev, "幅 {w}px / {n} 件で段が逆行した");
-                prev = now;
+        for tabs in [PANEL_BASE_TABS, PANEL_BASE_TABS + 1] {
+            for n in [0usize, 9, 22, 150] {
+                let badge = panel_tab_badge(n);
+                let mut prev = rank(panel_tab_density(220.0, badge.as_deref(), tabs));
+                for w in 221..=900 {
+                    let now = rank(panel_tab_density(w as f32, badge.as_deref(), tabs));
+                    assert!(now <= prev, "{tabs} 本・幅 {w}px / {n} 件で段が逆行した");
+                    prev = now;
+                }
             }
         }
     }
@@ -6066,12 +6111,17 @@ mod tests {
                 .position(|x| *x == d)
                 .expect("ladder に居る")
         };
-        for w in [220.0f32, 260.0, 320.0, 400.0, 480.0, 600.0] {
-            let mut prev = 0usize;
-            for n in [0usize, 9, 22, 150] {
-                let now = rank(panel_tab_density(w, panel_tab_badge(n).as_deref()));
-                assert!(now >= prev, "幅 {w}px で {n} 件のときに段が緩んだ");
-                prev = now;
+        for tabs in [PANEL_BASE_TABS, PANEL_BASE_TABS + 1] {
+            for w in [220.0f32, 260.0, 320.0, 400.0, 480.0, 600.0] {
+                let mut prev = 0usize;
+                for n in [0usize, 9, 22, 150] {
+                    let now = rank(panel_tab_density(w, panel_tab_badge(n).as_deref(), tabs));
+                    assert!(
+                        now >= prev,
+                        "{tabs} 本・幅 {w}px で {n} 件のときに段が緩んだ"
+                    );
+                    prev = now;
+                }
             }
         }
     }
@@ -6081,9 +6131,9 @@ mod tests {
     #[test]
     fn バッジは幅の見積りに入っている() {
         for d in PanelTabDensity::LADDER {
-            let none = panel_tab_row_width(d, None);
-            let two = panel_tab_row_width(d, Some("22"));
-            let three = panel_tab_row_width(d, Some("99+"));
+            let none = panel_tab_row_width(d, None, PANEL_BASE_TABS);
+            let two = panel_tab_row_width(d, Some("22"), PANEL_BASE_TABS);
+            let three = panel_tab_row_width(d, Some("99+"), PANEL_BASE_TABS);
             assert!(two > none, "{d:?} でバッジぶんが数えられていない");
             assert!(three > two, "{d:?} で桁数が数えられていない");
         }
@@ -6092,12 +6142,46 @@ mod tests {
     /// ラベルを落とす段でもアイコンぶんは数える（アイコンが溢れたら押せない）
     #[test]
     fn アイコンだけの段でも最小幅で収まる() {
-        let need = panel_tab_row_width(PanelTabDensity::IconsOnly, Some("99+"));
+        let need = panel_tab_row_width(PanelTabDensity::IconsOnly, Some("99+"), PANEL_BASE_TABS);
         let have = panel_tab_row_available(220.0);
         assert!(
             need <= have,
             "最小幅 220px でアイコン + 3 桁バッジが収まらない（要 {need}px / 使える {have}px）"
         );
+    }
+
+    /// #1679: diagnostics タブ（5 本目）は条件つき。**常設 4 本の段はどの幅でも変わらない**
+    /// （= LSP を使っていない人の画面は 1px も変えない）。5 本のときは段が詰まる側へ動き、
+    /// 最小幅でも梯子の最後の段で収まる
+    #[test]
+    fn diagnostics_タブは常設4本の段を変えず_5本でも収まる() {
+        assert_eq!(PANEL_TAB_LABELS[PANEL_BASE_TABS], "diagnostics");
+        for w in 220..=900 {
+            let w = w as f32;
+            for n in [0usize, 22, 150] {
+                let badge = panel_tab_badge(n);
+                let four = panel_tab_density(w, badge.as_deref(), PANEL_BASE_TABS);
+                // 4 本は `IconsTight` まで落ちない（足した段は 5 本のための受け皿）
+                assert_ne!(four, PanelTabDensity::IconsTight, "4 本・{w}px / {n} 件");
+                let five = panel_tab_density(w, badge.as_deref(), PANEL_BASE_TABS + 1);
+                let rank = |d| {
+                    PanelTabDensity::LADDER
+                        .iter()
+                        .position(|x| *x == d)
+                        .unwrap()
+                };
+                assert!(rank(five) >= rank(four), "5 本で段が緩んだ: {w}px / {n} 件");
+            }
+        }
+        let tight = panel_tab_row_width(
+            PanelTabDensity::IconsTight,
+            Some("99+"),
+            PANEL_BASE_TABS + 1,
+        );
+        assert!(tight <= panel_tab_row_available(220.0));
+        // 既定幅 320px はアイコンへ落ち、広げればラベルが戻る
+        assert!(!panel_tab_density(320.0, None, PANEL_BASE_TABS + 1).labels());
+        assert!(panel_tab_density(480.0, None, PANEL_BASE_TABS + 1).labels());
     }
 
     /// #551 案 1: git タブを開いた直後に見えるのは「変更」と「コミット」であること。

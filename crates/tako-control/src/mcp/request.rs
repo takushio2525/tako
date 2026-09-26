@@ -784,6 +784,19 @@ pub(super) fn build_request(
             action: str_arg(args, "action")?.unwrap_or_else(|| "status".to_string()),
             name: str_arg(args, "name")?,
         },
+        // #1679: 言語機能の 1 ツール。action ごとに型のある要求へ振り分ける
+        "tako_lsp" => match str_arg(args, "action")?.as_deref().unwrap_or("diagnostics") {
+            "diagnostics" => Request::LspDiagnostics {
+                pane: u64_arg(args, "pane")?,
+                severity: str_arg(args, "severity")?,
+            },
+            other => {
+                return Err(format!(
+                    "action が不正: {other}（{}）",
+                    crate::dispatch::LSP_FEATURE_ACTIONS.join(" / ")
+                ))
+            }
+        },
         "tako_remote_setup" => Request::RemoteSetup {
             action: str_arg(args, "action")?.ok_or("action を指定する（check / run）")?,
             answers: args.get("answers").cloned(),

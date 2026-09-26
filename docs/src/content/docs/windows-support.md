@@ -16,10 +16,10 @@ tako platform --status pending      # まだ使えないものだけ
 
 | 状態 | 件数 | 意味 |
 | --- | --- | --- |
-| 対応 | 122 / 157（78%） | macOS と同じように使えます |
+| 対応 | 122 / 158（77%） | macOS と同じように使えます |
 | 一部対応 | 15 | 使えますが機能が落ちます。落ち方は各表の「差分」列 |
 | 未実測 | 4 | 実装はあり macOS と同じ経路を通るが、Windows 実機でまだ動かしていないもの |
-| 未対応 | 14 | Windows 側の実装が無い、または動かないことが分かっているもの |
+| 未対応 | 15 | Windows 側の実装が無い、または動かないことが分かっているもの |
 | 対象外 | 2 | Windows にその概念が無い、または OS が同等機能を標準で持つ |
 
 ### 「未実測」について
@@ -84,7 +84,7 @@ AI エージェント（tako は縮退の件数と引き方を system prompt へ
 
 ## 表示とプレビュー
 
-対応 27・一部対応 4・未対応 / 未実測 5
+対応 27・一部対応 4・未対応 / 未実測 6
 
 | 機能 | 状態 | 差分 | 根拠 |
 | --- | --- | --- | --- |
@@ -103,6 +103,7 @@ AI エージェント（tako は縮退の件数と引き方を system prompt へ
 | `tako_preview_cursor` | 対応 | — | 実機テスト: 行・桁の解決は本文のバイト列だけを見る純粋関数で、OS 依存の分岐を持たない。text_edit の単体と dispatch の previewカーソルは行桁で動き選択は本文を変えない が CI の Windows ジョブで緑 |
 | `tako_preview_move` | 対応 | — | 実機テスト: 単語・行・ページの移動は本文のバイト列だけを見る純粋関数で、OS 依存の分岐を持たない。打鍵（Ctrl+←→ / Ctrl+Home / End）の Windows 列は editor_keys の単体が macOS 上からも検査し、dispatch の preview移動と削除は単語と行の単位で効く が CI の Windows ジョブで緑 |
 | `tako_preview_delete` | 対応 | — | 実機テスト: 語・行単位の削除は本文のバイト列だけを見る純粋関数で、OS 依存の分岐を持たない。打鍵（Ctrl+Backspace / Ctrl+Delete）の Windows 列は editor_keys の単体が macOS 上からも検査し、dispatch の preview移動と削除は単語と行の単位で効く が CI の Windows ジョブで緑 |
+| `tako_lsp` | 未対応 / 未実測 | 診断の受信・UTF-16 の桁の変換・重大度の絞り込みは偽サーバの e2e で確かめているが、Windows 実機で実サーバ（rust-analyzer 等）の診断を出したことはまだ無い（#1007） | 実機テスト: issue1679_lsp_diagnostics（偽サーバの Diagnostic 配列 → tako lsp diagnostics の固定値・重大度の境界・UTF-16 の桁・閉じたら保持 0）が CI の Windows ジョブで緑 |
 | `tako_lsp_server` | 未対応 / 未実測 | 言語サーバの起動・握手・文書同期は偽サーバの e2e で確かめているが、Windows 実機で実サーバ（rust-analyzer 等）と握手したことはまだ無い（#1007） | 実機テスト: issue1678_lsp_e2e（偽サーバとの握手・送信列・分割受信・再起動の上限・親が落ちたら子も終わる）が CI の Windows ジョブで緑 |
 | `tako_preview_save` | 対応 | — | 実機セルフテスト: 項目 66d（保存と外部変更の拒否） |
 | `tako_preview_undo` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako edit undo --pane <p>` が undone=true を返す（redo と対で実測） |

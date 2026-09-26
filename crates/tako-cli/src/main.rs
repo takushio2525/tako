@@ -888,24 +888,49 @@ enum LspCommand {
         #[arg(long)]
         name: Option<String>,
     },
+    /// 編集中のコードの診断（エラー・警告）。位置は `tako edit replace-range` と同じ
+    /// （行 1 始まり・桁 0 始まりの UTF-8 バイト）。MCP は `tako_lsp` の action=diagnostics（#1679）
+    Diagnostics {
+        /// プレビューペイン ID（省略で言語サーバにつながった文書すべて）
+        #[arg(long)]
+        pane: Option<u64>,
+        /// この重大度以上に絞る（warning = エラーと警告）
+        #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(
+            tako_core::lsp::diagnostic::Severity::NAMES
+        ))]
+        severity: Option<String>,
+        /// JSON のまま出す
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl LspCommand {
-    /// dispatch の action（綴りの正本は `dispatch::LSP_ACTIONS`）と対象
-    fn action(&self) -> (&'static str, Option<&str>) {
+    /// dispatch の要求（action の綴りの正本は `dispatch::LSP_ACTIONS`）
+    fn request(&self) -> Request {
+        let server = |action: &str, name: &Option<String>| Request::LspServer {
+            action: action.to_string(),
+            name: name.clone(),
+        };
         match self {
-            Self::Status { name, .. } => ("status", name.as_deref()),
-            Self::Servers { .. } => ("list", None),
-            Self::Restart { name } => ("restart", name.as_deref()),
-            Self::Stop { name } => ("stop", name.as_deref()),
-            Self::Logs { name } => ("logs", name.as_deref()),
+            Self::Status { name, .. } => server("status", name),
+            Self::Servers { .. } => server("list", &None),
+            Self::Restart { name } => server("restart", name),
+            Self::Stop { name } => server("stop", name),
+            Self::Logs { name } => server("logs", name),
+            Self::Diagnostics { pane, severity, .. } => Request::LspDiagnostics {
+                pane: *pane,
+                severity: severity.clone(),
+            },
         }
     }
 
     fn json(&self) -> bool {
         matches!(
             self,
-            Self::Status { json: true, .. } | Self::Servers { json: true }
+            Self::Status { json: true, .. }
+                | Self::Servers { json: true }
+                | Self::Diagnostics { json: true, .. }
         )
     }
 }
@@ -7093,13 +7118,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
             max_mb: args.max_mb,
         },
         Command::Scrollback(args) => Request::Scrollback { lines: args.lines },
-        Command::Lsp(sub) => {
-            let (action, name) = sub.action();
-            Request::LspServer {
-                action: action.to_string(),
-                name: name.map(str::to_string),
-            }
-        }
+        Command::Lsp(sub) => sub.request(),
         Command::Links(args) => {
             // `--text -` は標準入力から読む（画面の写しをパイプで流せる形）
             let text = match args.text.as_deref() {
@@ -9312,13 +9331,24 @@ fn delivery_line(result: &Value) -> Option<String> {
 
 /// `tako lsp` の表示（#1678）。中身の正本は dispatch の応答で、ここは体裁だけ
 fn print_lsp(sub: &LspCommand, result: &Value) {
-    if sub.json() || !matches!(sub, LspCommand::Status { .. } | LspCommand::Servers { .. }) {
+    if sub.json()
+        || !matches!(
+            sub,
+            LspCommand::Status { .. } | LspCommand::Servers { .. } | LspCommand::Diagnostics { .. }
+        )
+    {
         println!("{}", pretty_json(result));
         return;
     }
     let text = |v: &Value| v.as_str().unwrap_or("").to_string();
     if result["enabled"] == Value::Bool(false) {
         println!("{}", text(&result["reason"]));
+        return;
+    }
+    if matches!(sub, LspCommand::Diagnostics { .. }) {
+        for line in lsp_diagnostics_lines(result) {
+            println!("{line}");
+        }
         return;
     }
     let servers = result["servers"].as_array().cloned().unwrap_or_default();
@@ -9363,6 +9393,60 @@ fn print_lsp(sub: &LspCommand, result: &Value) {
             }
         }
     }
+}
+
+/// `tako lsp diagnostics` の人向けの体裁（#1679）。
+///
+/// 文書ごとに見出し（パス・ペイン・重大度ごとの数）→ 1 件 1 行。位置は
+/// `tako edit replace-range` へそのまま渡せる `行:桁-行:桁`（桁は 0 始まりの UTF-8 バイト）
+fn lsp_diagnostics_lines(result: &Value) -> Vec<String> {
+    let text = |v: &Value| v.as_str().unwrap_or("").to_string();
+    let mut out = Vec::new();
+    let documents = result["documents"].as_array().cloned().unwrap_or_default();
+    if documents.is_empty() {
+        if let Some(note) = result["note"].as_str() {
+            out.push(note.to_string());
+        }
+        return out;
+    }
+    for doc in &documents {
+        let counts = tako_core::lsp::diagnostic::Severity::NAMES
+            .iter()
+            .map(|name| format!("{name}={}", doc["counts"][name].as_u64().unwrap_or(0)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        out.push(format!(
+            "{} (pane {}) {counts}",
+            text(&doc["path"]),
+            doc["pane"]
+        ));
+        for key in ["reason", "next_step"] {
+            if let Some(line) = doc[key].as_str() {
+                out.push(format!("  {line}"));
+            }
+        }
+        for d in doc["diagnostics"].as_array().into_iter().flatten() {
+            let at = |p: &Value| format!("{}:{}", p["line"], p["column"]);
+            let origin = [d["source"].as_str(), d["code"].as_str()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let message = text(&d["message"]);
+            let first = message.lines().next().unwrap_or("");
+            let mut line = format!(
+                "  {}-{}  {:<7}  {first}",
+                at(&d["range"]["start"]),
+                at(&d["range"]["end"]),
+                text(&d["severity"]),
+            );
+            if !origin.is_empty() {
+                line.push_str(&format!("  ({origin})"));
+            }
+            out.push(line);
+        }
+    }
+    out
 }
 
 fn print_result(command: &Command, result: &Value) {
@@ -10257,6 +10341,57 @@ mod tests {
                 }
             );
         }
+        // #1679: 診断は言語機能の要求（MCP `tako_lsp` と同じ要求になる）
+        assert_eq!(
+            build_request(&parse(&["tako", "lsp", "diagnostics"])).unwrap(),
+            Request::LspDiagnostics {
+                pane: None,
+                severity: None
+            }
+        );
+        assert_eq!(
+            build_request(&parse(&[
+                "tako",
+                "lsp",
+                "diagnostics",
+                "--pane",
+                "7",
+                "--severity",
+                "warning"
+            ]))
+            .unwrap(),
+            Request::LspDiagnostics {
+                pane: Some(7),
+                severity: Some("warning".into())
+            }
+        );
+        // 綴り違いは clap が弾く（`0 件` に見せない）
+        assert!(Cli::try_parse_from(["tako", "lsp", "diagnostics", "--severity", "warn"]).is_err());
+        // 人向けの表示: 見出し（パス・ペイン・重大度ごとの数）→ 1 件 1 行（位置は replace-range の形）
+        let lines = lsp_diagnostics_lines(&serde_json::json!({
+            "documents": [{
+                "pane": 7, "path": "/w/src/main.rs",
+                "counts": {"error": 1, "warning": 0, "info": 0, "hint": 1},
+                "diagnostics": [
+                    {"severity": "error", "message": "mismatched types\nexpected i32",
+                     "range": {"start": {"line": 3, "column": 17}, "end": {"line": 3, "column": 20}},
+                     "source": "rustc", "code": "E0308"},
+                    {"severity": "hint", "message": "h",
+                     "range": {"start": {"line": 1, "column": 0}, "end": {"line": 1, "column": 2}}},
+                ],
+            }],
+        }));
+        assert_eq!(
+            lines,
+            vec![
+                "/w/src/main.rs (pane 7) error=1 warning=0 info=0 hint=1".to_string(),
+                "  3:17-3:20  error    mismatched types  (rustc E0308)".to_string(),
+                "  1:0-1:2  hint     h".to_string(),
+            ]
+        );
+        // つながった文書が無ければ案内だけ
+        let note = lsp_diagnostics_lines(&serde_json::json!({"documents": [], "note": "n"}));
+        assert_eq!(note, vec!["n".to_string()]);
         let command = parse(&["tako", "edit", "undo", "--pane", "5"]);
         assert_eq!(
             build_request(&command).unwrap(),
@@ -10950,8 +11085,14 @@ mod platform_matrix_parity {
         ("git branch", "tako_git_branch_create"),
         ("git resolve", "tako_git_resolve_agent"),
         ("list", "tako_list_panes"),
-        // #1678: CLI は `tako lsp <操作>`、MCP は action 引数を持つ 1 ツール
-        ("lsp", "tako_lsp_server"),
+        // #1678: CLI は `tako lsp <操作>`、MCP は action 引数を持つ 1 ツール。
+        // ライフサイクルは `tako_lsp_server`、言語機能（#1679 以降）は `tako_lsp`
+        ("lsp status", "tako_lsp_server"),
+        ("lsp servers", "tako_lsp_server"),
+        ("lsp restart", "tako_lsp_server"),
+        ("lsp stop", "tako_lsp_server"),
+        ("lsp logs", "tako_lsp_server"),
+        ("lsp", "tako_lsp"),
         ("open-in dir", "tako_open_dir"),
         ("open-in remote", "tako_open_remote"),
         // #919: CLI は `tako remote-folder <操作>`、MCP は action 引数を持つ 1 ツール
