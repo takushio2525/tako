@@ -942,6 +942,12 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
             "境界 B16 の unix 実装（ログインシェル経由）。Windows 実装は子プロセスを起こさない",
         ),
         (
+            "crates/tako-core/src/platform/fd_inherit.rs",
+            1,
+            "テストモジュール内（#1807。fd 継承の検査の片を `/bin/sh` で実際に走らせ、\
+             シェルが退避に使う fd 10 / 11 を「受け継いだ」と読まないことを見る。`#[cfg(unix)]`）",
+        ),
+        (
             "crates/tako-core/src/platform/locale.rs",
             1,
             "`defaults`（macOS 限定）",
