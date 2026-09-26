@@ -42,7 +42,8 @@ pub const STDERR_LINE_BYTES: usize = 400;
 /// 要求の失敗
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RpcError {
-    #[error("応答が {0} 秒以内に来なかった")]
+    /// 待った上限（ミリ秒。秒で持つと 1 秒未満の上限が「0 秒」に潰れる）
+    #[error("応答が {0}ms 以内に来なかった")]
     Timeout(u64),
     #[error("サーバとの接続が切れた")]
     Disconnected,
@@ -295,7 +296,9 @@ impl ServerProcess {
             Err(RecvTimeoutError::Timeout) => {
                 self.forget(&id);
                 let _ = self.cancel(&id);
-                Err(RpcError::Timeout(timeout.as_secs()))
+                Err(RpcError::Timeout(
+                    u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                ))
             }
             Err(RecvTimeoutError::Disconnected) => Err(RpcError::Disconnected),
         };

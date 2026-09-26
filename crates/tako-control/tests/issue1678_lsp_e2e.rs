@@ -288,22 +288,69 @@ fn 応答しないサーバはタイムアウトで起こし直し上限で諦�
         state(&manager) == "gave_up"
     });
     let status = server_status(&manager);
-    assert_eq!(spawn_pids(&scratch).len(), 4);
+    // 数えるのは**こちらが起こした回数**。500ms で打ち切る回は、偽サーバが自分の pid を
+    // 書く前に kill されうる（負荷の高い `cargo test --workspace` で 3 件になった実測）
+    assert_eq!(status["spawn_count"], json!(4), "初回 + 再起動 3 回");
+    let recorded = spawn_pids(&scratch).len();
+    assert!(recorded <= 4, "起こした回数より多く記録されている: {recorded}");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(spawn_pids(&scratch).len(), recorded, "諦めた後は起こさない");
     assert!(
         status["last_exit"]
             .as_str()
             .is_some_and(|s| s.starts_with("initialize:")),
         "{status}"
     );
-    // 待ちの表は空（タイムアウトで消えている）。プロセスはもう居ない
+    // プロセスはもう居ない
     assert!(status["pid"].is_null());
     for pid in spawn_pids(&scratch) {
         wait_until("偽サーバの終了", Duration::from_secs(5), || {
             !tako_core::platform::process::pid_alive(pid)
         });
     }
-    // 送った initialize には取り消しが続く
-    assert!(methods(&scratch).contains(&"$/cancelRequest".to_string()));
+}
+
+/// エッジケース: タイムアウトした要求は待ちの表から消え、`$/cancelRequest` が続く。
+/// manager は打ち切った直後に kill するので、取り消しの受信はプロセスを殺さない
+/// `ServerProcess` 単体で測る（kill と送信の競走を検査へ持ち込まない）
+#[test]
+fn タイムアウトした要求は取り消しを送り待ちの表から消える() {
+    use tako_control::lsp::server::{Handlers, RpcError, ServerProcess};
+    let scratch = Scratch::new("cancel");
+    let plan = ChildCmd {
+        program: FAKE.to_string(),
+        args: vec![
+            "--scenario".into(),
+            "slow".into(),
+            "--log".into(),
+            scratch.log().display().to_string(),
+        ],
+    };
+    let handlers = Handlers {
+        on_notification: Box::new(|_, _| {}),
+        on_exit: Box::new(|| {}),
+    };
+    let process = ServerProcess::spawn(&plan, "fake", handlers, None).unwrap();
+    let outcome = process.request("initialize", json!({}), Duration::from_millis(300));
+    assert_eq!(outcome, Err(RpcError::Timeout(300)));
+    assert_eq!(process.pending_count(), 0, "タイムアウトした待ちは表から消える");
+    wait_until("取り消しの受信", Duration::from_secs(10), || {
+        methods(&scratch).contains(&"$/cancelRequest".to_string())
+    });
+    let cancel = received(&scratch)
+        .into_iter()
+        .find(|m| m["method"] == json!("$/cancelRequest"))
+        .unwrap();
+    let initialize = received(&scratch)
+        .into_iter()
+        .find(|m| m["method"] == json!("initialize"))
+        .unwrap();
+    assert_eq!(cancel["params"]["id"], initialize["id"], "取り消すのは打ち切った要求の id");
+    let pid = process.pid();
+    drop(process);
+    wait_until("Drop で終わる", Duration::from_secs(5), || {
+        !tako_core::platform::process::pid_alive(pid)
+    });
 }
 
 /// 受け入れ条件: サーバ未導入のとき status に理由 + 次の一手（導入コマンド）が入る
