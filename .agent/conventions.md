@@ -761,6 +761,39 @@ psmux は入力送出を持たないので、**tako-app が保持していない
   通ってしまうので、**実 CLI でディスクの中身が変わるところまで**見る（セルフテスト項目 141。
   dispatch を直接叩くと消化する側を検証できない）
 
+## CLI の出力はパイプの切断で panic させない（Issue #1758）
+
+**tako-cli の `println!` / `print!` / `eprintln!` / `eprint!` は std の版ではなく、
+`crates/tako-cli/src/stdio.rs` の同名マクロを指す。** Rust は SIGPIPE を無視した状態で
+main に入るので、std の版は読み手が先に閉じたパイプへの書き込み（EPIPE）で panic する。
+修正前の実測: `tako agent-support --json | head -1` で panic メッセージ 2 つ
+（`failed printing to stdout: Broken pipe` + `メインスレッドが異常終了した`）と終了コード 101。
+93 バイトしか出さない `agent-support --agent claude --status unsupported` でも `| head -0` なら同じ。
+Windows には SIGPIPE が無く、同じ場面は `ERROR_NO_DATA` = `ErrorKind::BrokenPipe` の Err で返る。
+
+- **標準出力の切断 → そこで打ち切って終了コード 0**（ripgrep と同じ）。`resume_unwind` で
+  巻き戻すので panic メッセージは出ず、`Drop` は panic のときと同じく走る。`main` が印
+  （`stdio::StdoutClosed`）を見て 0 を返す
+- **標準エラーの切断 → その行を捨てて続ける**。打ち切ると `error: …` の後の 1 が 0 に化ける
+- それ以外の書き込みエラー（書き先のディスクが一杯 等）は std と同じく panic
+- **SIGPIPE を既定へ戻す案は採らない**: Windows に効かない / 同じバイナリの
+  `tako remote serve`（起動情報を読んだ親が stdio のパイプを捨てる daemon）が 1 行の出力で
+  プロセスごと死ぬ / `tako mcp serve` の終わり方が「エラー終了」から「シグナル死」へ変わる
+
+### 書くときの決まり
+
+- `std::println!` と綴って差し替えを迂回しない。`#[macro_use] mod stdio;` は `main.rs` の
+  **最初の `mod` 宣言**に置く（マクロは宣言より後ろにしか効かず、順を崩すと前にある
+  `mod setup;` が黙って std の版へ戻る）。番犬は `crates/tako-cli/tests/issue1758_broken_pipe.rs`
+  の `出力マクロの宣言が他のmodより先にある`
+- `tako-main` 以外のスレッドから出力するなら、その join 側でも `StdoutClosed` を見る
+  （見ずに `expect` するとそこで panic メッセージが出る）
+- `stdout()` を自分で握って書く経路（`mcp serve` の `writeln!`）は従来どおり `Result` で返す。
+  `mcp serve` の終わり方（stdin の EOF → 0 / 読み手が先に閉じる → `error: stdout への書き込みに失敗` で 1）は変えていない
+- 単体テストのビルドでは std の経路へ流す（テストハーネスの出力の捕捉は std の `print!` にしか
+  効かない）。切断の扱いは実バイナリを起こす同じ統合テストが、**子を起こす前に読み手を
+  閉じたパイプ**（最初の書き込みで必ず EPIPE）と、パイプの容量を超える出力の 1 行読みで見る
+
 ## 外部コマンドを待つときは上限を持つ（Issue #1503）
 
 **`Command::output()` / `Child::wait_with_output()` を「相手は必ず返る」前提で書かないこと。**

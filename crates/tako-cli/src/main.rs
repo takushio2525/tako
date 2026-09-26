@@ -15,6 +15,11 @@
 //! tako read --pane "$worker" --lines 20
 //! ```
 
+// 出力マクロ（`println!` 等）を std の版から差し替える。**他の `mod` より先に置く**
+// （マクロは宣言より後ろにしか効かない。理由は `stdio.rs` の先頭 = #1758）
+#[macro_use]
+mod stdio;
+
 mod setup;
 
 use std::process::ExitCode;
@@ -3605,13 +3610,17 @@ fn main() -> ExitCode {
     // `origin/main` の `tako.exe list` も実機で `has overflowed its stack` で落ちる
     // （スライス 3 の IPC 検証はユニットテストだったため踏まなかった）。
     // 本体を十分なスタックのワーカースレッドで実行する（プラットフォーム共通・挙動不変）
-    std::thread::Builder::new()
+    let joined = std::thread::Builder::new()
         .name("tako-main".into())
         .stack_size(16 * 1024 * 1024)
         .spawn(cli_main)
         .expect("メインスレッドを起動できない")
-        .join()
-        .expect("メインスレッドが異常終了した")
+        .join();
+    // 標準出力の読み手が先に閉じた（`tako … | head -1`）のは失敗ではないので静かに 0（#1758）
+    if matches!(&joined, Err(payload) if payload.is::<stdio::StdoutClosed>()) {
+        return ExitCode::SUCCESS;
+    }
+    joined.expect("メインスレッドが異常終了した")
 }
 
 fn cli_main() -> ExitCode {
@@ -9465,6 +9474,15 @@ fn print_task_list(result: &Value) {
 }
 
 fn print_gate_result(result: &Value) {
+    print!("{}", gate_result_text(result));
+}
+
+/// 証拠の行頭の字下げ（2 行目以降も同じ幅で揃える = #1758）
+const GATE_EVIDENCE_INDENT: &str = "         ";
+
+/// `tako task gate set / check / show` の表示本文（機械検証できるよう印字と分けてある）
+fn gate_result_text(result: &Value) -> String {
+    let mut out = String::new();
     let task_id = result["task_id"].as_str().unwrap_or("-");
     let overall = result["overall"].as_str().unwrap_or("?");
     let overall_marker = match overall {
@@ -9472,7 +9490,7 @@ fn print_gate_result(result: &Value) {
         "failed" => "[FAILED]",
         _ => "[PENDING]",
     };
-    println!("Gate: {task_id}  {overall_marker}");
+    out.push_str(&format!("Gate: {task_id}  {overall_marker}\n"));
     if let Some(criteria) = result["criteria"].as_array() {
         for c in criteria {
             let id = c["id"].as_str().unwrap_or("-");
@@ -9489,12 +9507,18 @@ fn print_gate_result(result: &Value) {
                 "custom" => c["kind"]["description"].as_str().unwrap_or("").to_string(),
                 _ => String::new(),
             };
-            println!("  {marker} {id}: {kind_detail}");
+            out.push_str(&format!("  {marker} {id}: {kind_detail}\n"));
             if let Some(ev) = c["evidence"].as_str() {
-                println!("         {}", gate_evidence_preview(ev));
+                // 証拠は複数行で来る（`format_evidence` の stdout の末尾 5 行など）。
+                // 1 行目にだけ字下げを付けると 2 行目以降が 0 桁目へ落ちる（#1758）
+                for line in gate_evidence_preview(ev).split('\n') {
+                    let line = line.strip_suffix('\r').unwrap_or(line);
+                    out.push_str(&format!("{GATE_EVIDENCE_INDENT}{line}\n"));
+                }
             }
         }
     }
+    out
 }
 
 /// 証拠の見出しの上限（文字数。`…` を含む。全文は `--json` で見られる）
@@ -11385,6 +11409,82 @@ mod tests {
             assert!(out.ends_with('…'), "3 つとも上限を超える長さ: {out:?}");
         }
         assert!(gate_evidence_preview(&lines).contains('\n'));
+    }
+
+    fn gate_with_evidence(evidence: &str) -> Value {
+        serde_json::json!({
+            "task_id": "t1758",
+            "overall": "pending",
+            "criteria": [
+                {
+                    "id": "cmd_1",
+                    "status": "passed",
+                    "kind": { "type": "command", "cmd": "printf 'line-a\\nline-b\\n'" },
+                    "evidence": evidence,
+                },
+                { "id": "custom_1", "status": "pending", "kind": { "type": "custom", "description": "手動確認" } },
+            ],
+        })
+    }
+
+    /// #1758 の実物: 修正前は 2 行目以降が 0 桁目へ落ち、次の基準の行と見分けが付かなかった
+    #[test]
+    fn gateの証拠は複数行でも全行が同じ字下げで出る() {
+        let text = gate_result_text(&gate_with_evidence(
+            "exit 0; stdout: line-a\nline-b\nline-c",
+        ));
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            [
+                "Gate: t1758  [PENDING]",
+                "  [PASSED] cmd_1: printf 'line-a\\nline-b\\n'",
+                "         exit 0; stdout: line-a",
+                "         line-b",
+                "         line-c",
+                "  [      ] custom_1: 手動確認",
+            ],
+            "{text}"
+        );
+    }
+
+    /// Windows の出力（CRLF）・末尾 5 行の抜粋・120 文字での切り詰めを通っても字下げが揃う
+    #[test]
+    fn gateの証拠はcrlfと切り詰めを通っても全行が同じ字下げ() {
+        let crlf = "exit 1; stderr: 1 件目の失敗\r\n2 件目の失敗\r\n3 件目の失敗";
+        let long = format!(
+            "exit 0; stdout (last 5/7 lines): {}",
+            ["日本語の長いテスト出力の行です番号付き"; 5].join("\n")
+        );
+        for ev in [crlf, long.as_str()] {
+            let text = gate_result_text(&gate_with_evidence(ev));
+            // `lines()` は行末の `\r` を剥がすので、CR が残ったかを見るには `\n` で割る
+            let evidence: Vec<&str> = text
+                .split('\n')
+                .skip(2)
+                .take_while(|l| !l.starts_with("  ["))
+                .collect();
+            let preview = gate_evidence_preview(ev);
+            assert_eq!(
+                evidence.len(),
+                preview.split('\n').count(),
+                "証拠の行が欠けた: {text}"
+            );
+            for line in &evidence {
+                assert!(
+                    line.starts_with(GATE_EVIDENCE_INDENT),
+                    "字下げが無い行: {line:?}\n{text}"
+                );
+                assert!(!line.ends_with('\r'), "CR が残った: {line:?}");
+            }
+        }
+        // 1 行だけ・空の証拠は修正前と同じ形（字下げ + 本文の 1 行）
+        let one = gate_result_text(&gate_with_evidence("exit 0"));
+        assert!(one.contains("\n         exit 0\n"), "{one}");
+        let empty = gate_result_text(&gate_with_evidence(""));
+        assert!(
+            empty.contains(&format!("\n{GATE_EVIDENCE_INDENT}\n")),
+            "{empty}"
+        );
     }
 }
 

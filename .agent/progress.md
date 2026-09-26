@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-26（#1768: ペインの PTY の子と remote daemon が GUI の fd を受け継がないようにした）
-- 修正前は GUI が CLOEXEC 無しで開いた Metal のシェーダキャッシュが全ペインの子の fd 4 / 5 に 100%（隔離 GUI 3000 / 3000・本番の tmux クライアント 23 本）。`platform::fd_inherit`（B27）の `seal_inherited_fds` を fork 後・exec 前の子で走らせる（PTY は `spawn_sealed` で包んで atfork の子ハンドラ・daemon は既存の `pre_exec`）
-- 親で掃く案 (a) は Metal を塞いだが GUI が相方を握るパイプが 1 / 3000 残ったので、子の中で掃く (b) を採った。`scripts/test-pty-fd-leak-1768.sh` の 3000 回・同条件で 修正前 other 3000 / (a) pipe 1 / (b) pipe 0・other 0
-- 注入 6 通り（包み・子ハンドラ・(a) 戻し・daemon・確保・逃げ道）が file:line 名指しで FAILED → 戻して緑。実 PTY の統合テスト 9 本・daemon の単体・番犬 4 本
-
 ## 2026-09-27（#1757: バイト位置の切り詰めの残りを直し、文字数の切り詰めを 1 実装へ寄せた）
 - peer_messaging の `&raw[len..]` は書き直されたファイルで文字の途中を指して panic（修正前に単体テストで実測）→ `raw.get(len..)` で「位置が無効 = 全文」へ。chat_view の `label[..1]` は文字単位の `capitalize_first` へ（family は既知の語に絞られていて今の入口からは届かない潜在バグ）
 - 文字数の切り詰めを `tako_core::text::truncate_chars` の 1 本へ（tako-app の `truncate` 68 呼び出し・context_budget の私有版を寄せ、transcript の同名関数は `summary_line` へ改名して数える部分を委譲）。範囲添字の検出を `tests/common/range_index.rs` へまとめ #1728 / #1746 の番犬が呼ぶ。規約は conventions.md「文字列をバイト位置で切らない」
@@ -63,3 +58,7 @@
 - ⌘ホバーの下線（md リンクと同じ 1 実装）・⌘クリック・`tako lsp definition|declaration|type-definition|implementation` / MCP `tako_lsp` が同じ 3 段（UI で準備 → background で問い合わせ → UI で着地）を通る。offload に UI スレッドの続き（`OffloadOutcome::OnUi`）を足し、IPC ループの後処理を `after_dispatch` へ切り出した。着地は `open_file` 経由でジャンプ履歴へ積み、同じファイルは読み直さない。編集モードでなくても問い合わせのあいだだけ didOpen する
 - 実サーバ: rust-analyzer は読み込み前に空で答えるので `experimental/serverStatus` を待って問い直す（tako の実ソースで初回 14 秒で `file_uri.rs:29` へ新ペイン・2 回目は使い回し）。clangd は `#include` → `foo.h` を新ペインで。実測: `scripts/test-lsp-goto-1680.sh` 38 PASS 0 FAIL（新ペイン / 使い回し / 同じペイン / #include / 戻る / 複数候補 / 3 状態 / CLI と MCP の字面一致 / UTF-16 / 未応答中も UI が止まらない）・e2e 11 本・番犬の注入 7 通り + 実ソースへの注入 A（新ペインを開かない）/ B（使い回さない）が dispatch.rs:762 / 761 を名指しで FAILED → 戻して緑
 - #1791（S2 診断）の上へ合流: MCP `tako_lsp` は 1 本のまま action 5 つ（既定 diagnostics）・MATRIX の `tako_lsp` は 1 行（Windows の根拠に両方の e2e）・要件は FR-3.31 へ振り直し
+
+## 2026-09-27（#1758: CLI の出力をパイプで途中で閉じても panic しないようにし、gate の証拠の字下げを揃えた）
+- std の `println!` が EPIPE で panic していた（実測: `agent-support --json | head -1` で panic 2 つ + 終了コード 101。Windows は `ERROR_NO_DATA`）。tako-cli の出力マクロ 4 種を `stdio.rs` の同名マクロへ差し替え、標準出力の切断は `resume_unwind` で静かに 0、標準エラーの切断は捨てて続行（失敗の 1 を保つ）。SIGPIPE を既定へ戻す案は Windows に効かず `remote serve` の daemon を殺すので不採用。`gate set / check / show` の証拠は全行へ同じ字下げ
+- 実測: 統合テスト 4 本（読み手を先に閉じたパイプ / 111 KB の 1 行読み / `2>&1` 形で終了コード保持 / 宣言順の番犬）+ unit 2 本。注入 7 通りすべて FAILED → 戻して緑。`mcp serve` の終わり方 4 通りは修正前と字面一致・workspace 5971 passed 0 failed・clippy 3 宇宙 0
