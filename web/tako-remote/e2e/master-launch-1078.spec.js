@@ -12,10 +12,10 @@
 // 実行:
 //   cd web/tako-remote && npx playwright test e2e/master-launch-1078.spec.js
 import { test, expect } from '@playwright/test';
+import { evidencePath, TAKO_VERSION } from './support.js';
 
 const IPHONE_VIEWPORT = { width: 390, height: 844 };
 const BASE = `http://localhost:${process.env.TAKO_PWA_PORT || 5174}`;
-const EVIDENCE_DIR = process.env.TAKO_EVIDENCE_DIR || `${process.env.HOME}/dev/tako-evidence/1078`;
 
 const LINK_URL = 'https://claude.ai/code/session_01TESTTESTTESTTESTTEST02';
 
@@ -27,7 +27,7 @@ function me(role = 'manage') {
     role,
     login: 'user@example.com',
     host: 'test-mac',
-    version: '0.8.4',
+    version: TAKO_VERSION,
     app_connected: true,
   };
 }
@@ -162,7 +162,7 @@ async function setupMocks(page, opts = {}) {
     json(route, { session_id: 'x', messages: [] })
   );
   await page.route('**/api/agents', route => json(route, { agents: [] }));
-  await page.route('**/api/health', route => json(route, { status: 'ok', version: '0.8.4' }));
+  await page.route('**/api/health', route => json(route, { status: 'ok', version: TAKO_VERSION }));
   await page.route('**/ws?*', route => route.abort());
   await page.route('**/manifest.json', route => json(route, { name: 'tako remote' }));
   await page.route('**/sw.js', route =>
@@ -200,7 +200,7 @@ test.describe('#1078 スマホから master を起動 — モバイル', () => {
     // 起動フォルダと担当プロジェクトも手がかりとして出る
     await expect(rows.nth(1)).toContainText('/Users/dev/tako');
     await expect(rows.nth(1)).toContainText('tako');
-    await page.screenshot({ path: `${EVIDENCE_DIR}/01-picker.png` });
+    await page.screenshot({ path: evidencePath('01-picker.png') });
   });
 
   test('02. 1 操作でタブ + master が立ち、繋がったら Claude へ送り出す', async ({ page }) => {
@@ -210,14 +210,14 @@ test.describe('#1078 スマホから master を起動 — モバイル', () => {
     await page.locator('.launch-profile', { hasText: 'dev' }).click();
     // 待ち画面（bridge_status が出るまでポーリング）
     await expect(page.locator('.launch-waiting')).toBeVisible();
-    await page.screenshot({ path: `${EVIDENCE_DIR}/02-waiting.png` });
+    await page.screenshot({ path: evidencePath('02-waiting.png') });
 
     // 繋がったら「Claude で開く」（URL は daemon が返したもの）
     const link = page.locator('.launch-result .claude-open');
     await expect(link).toBeVisible({ timeout: 15000 });
     await expect(link).toHaveAttribute('href', LINK_URL);
     await expect(link).toHaveAttribute('target', '_blank');
-    await page.screenshot({ path: `${EVIDENCE_DIR}/02-connected.png` });
+    await page.screenshot({ path: evidencePath('02-connected.png') });
 
     // 叩いた経路と本体（タブ → そのタブで master）
     expect(calls.tabs).toEqual([{ cwd: '/Users/dev/tako' }]);
@@ -239,7 +239,7 @@ test.describe('#1078 スマホから master を起動 — モバイル', () => {
     await page.locator('.launch-result-actions .btn', { hasText: '閉じる' }).click();
     await expect(page.locator('.tab-group-name', { hasText: 'master-dev' })).toBeVisible({ timeout: 10000 });
     await expect(page.locator('.pane-card[data-pane-id="90"]')).toBeVisible();
-    await page.screenshot({ path: `${EVIDENCE_DIR}/03-list-after.png` });
+    await page.screenshot({ path: evidencePath('03-list-after.png') });
   });
 
   test('04. opt-in していないプロファイルでは公式リンクが出ず理由が出る', async ({ page }) => {
@@ -257,7 +257,7 @@ test.describe('#1078 スマホから master を起動 — モバイル', () => {
     await expect(result.locator('.remote-link-reason code')).toHaveText(
       'tako orchestrator profiles set default --remote-control true'
     );
-    await page.screenshot({ path: `${EVIDENCE_DIR}/04-opt-in-off.png` });
+    await page.screenshot({ path: evidencePath('04-opt-in-off.png') });
   });
 
   test('05. observe role では押す前に理由が出る', async ({ page }) => {
@@ -267,7 +267,7 @@ test.describe('#1078 スマホから master を起動 — モバイル', () => {
     await expect(page.locator('.sheet')).toContainText('Manage 以上');
     // 選択肢そのものを出さない（押しても 403 になるものを押させない）
     expect(await page.locator('.launch-profile').count()).toBe(0);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/05-observe.png` });
+    await page.screenshot({ path: evidencePath('05-observe.png') });
   });
 
   test('06. interact role でもサーバーが 403 なら理由を出す', async ({ page }) => {
@@ -278,7 +278,7 @@ test.describe('#1078 スマホから master を起動 — モバイル', () => {
     await page.locator('.launch-profile', { hasText: 'dev' }).click();
     await expect(page.locator('.sheet .error-text')).toContainText('Manage 以上');
     expect(await page.locator('.claude-open').count()).toBe(0);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/06-forbidden.png` });
+    await page.screenshot({ path: evidencePath('06-forbidden.png') });
   });
 
   test('07. 繋がらないまま上限に達したら理由へ切り替える', async ({ page }) => {
@@ -301,6 +301,6 @@ test.describe('#1078 スマホから master を起動 — モバイル', () => {
     // 理由（このペインの remote_link）が読める
     await expect(page.locator('.remote-link-reason')).toBeVisible();
     expect(await page.locator('.claude-open').count()).toBe(0);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/07-timeout.png` });
+    await page.screenshot({ path: evidencePath('07-timeout.png') });
   });
 });

@@ -12,10 +12,10 @@
 // 実行:
 //   cd web/tako-remote && npx playwright test e2e/remote-link-1077.spec.js
 import { test, expect } from '@playwright/test';
+import { evidencePath, TAKO_VERSION } from './support.js';
 
 const IPHONE_VIEWPORT = { width: 390, height: 844 };
 const BASE = `http://localhost:${process.env.TAKO_PWA_PORT || 5174}`;
-const EVIDENCE_DIR = process.env.TAKO_EVIDENCE_DIR || `${process.env.HOME}/dev/tako-evidence/1077`;
 
 const FAKE_ME = {
   registered: true,
@@ -24,7 +24,7 @@ const FAKE_ME = {
   role: 'interact',
   login: 'user@example.com',
   host: 'test-mac',
-  version: '0.8.4',
+  version: TAKO_VERSION,
   app_connected: true,
 };
 
@@ -145,7 +145,7 @@ async function setupMocks(page, { panes = PANES } = {}) {
     })
   );
   await page.route('**/api/agents', route => json(route, { agents: [] }));
-  await page.route('**/api/health', route => json(route, { status: 'ok', version: '0.8.4' }));
+  await page.route('**/api/health', route => json(route, { status: 'ok', version: TAKO_VERSION }));
   await page.route('**/ws?*', route => route.abort());
   await page.route('**/manifest.json', route => json(route, { name: 'tako remote' }));
   await page.route('**/sw.js', route =>
@@ -193,7 +193,7 @@ test.describe('#1077 Claude 公式へ送り出す — モバイル', () => {
     for (const title of ['fix-auth', 'docs-site', 'policy-master', 'zsh']) {
       expect(await cardByTitle(page, title).locator('.claude-open').count()).toBe(0);
     }
-    await page.screenshot({ path: `${EVIDENCE_DIR}/01-list.png` });
+    await page.screenshot({ path: evidencePath('01-list.png') });
   });
 
   test('02. 「Claude で開く」はカードを開かず外部リンクだけを踏む', async ({ page }) => {
@@ -228,7 +228,7 @@ test.describe('#1077 Claude 公式へ送り出す — モバイル', () => {
     await expect(reason.locator('code')).toHaveText(
       'tako orchestrator profiles set dev --remote-control true'
     );
-    await page.screenshot({ path: `${EVIDENCE_DIR}/03-not-connected.png` });
+    await page.screenshot({ path: evidencePath('03-not-connected.png') });
   });
 
   test('04. 環境側の阻害では opt-in コマンドを出さない（押しても直らないものを勧めない）', async ({ page }) => {
@@ -247,7 +247,7 @@ test.describe('#1077 Claude 公式へ送り出す — モバイル', () => {
     await codex.locator('.remote-link-toggle').click();
     await expect(codex.locator('.remote-link-reason')).toContainText('claude 専用');
     expect(await codex.locator('.remote-link-reason code').count()).toBe(0);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/04-ineligible.png` });
+    await page.screenshot({ path: evidencePath('04-ineligible.png') });
   });
 
   test('05. アカウント表示が一覧に出る（別アカウントで出ない問題を切り分けられる）', async ({ page }) => {
@@ -283,7 +283,7 @@ test.describe('#1077 Claude 公式へ送り出す — モバイル', () => {
     await expect(page.locator('.page.terminal-page')).toContainText('テストを実行します');
     // 同じ画面から公式へも行ける
     await expect(page.locator('.claude-open')).toHaveAttribute('href', LINK_URL);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/07-pane-chat.png` });
+    await page.screenshot({ path: evidencePath('07-pane-chat.png') });
 
     // term ビューへの切替も従来どおり
     await page.locator('.view-toggle-btn', { hasText: 'term' }).click();

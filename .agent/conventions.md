@@ -2193,6 +2193,12 @@ Dock のピン留めは `.app` への **file URL ブックマーク**（`com.app
   両方を満たすものだけで、名前が一致しないものは「要確認」として消さずに並べる
   （モックテスト `scripts/test-clean-trust-residue.sh` が偽の HOME で実プロジェクトの
   巻き添えを落とす。CI の macOS ジョブで毎 PR 走る）
+- **PWA の e2e（Playwright）も同じ**（#1749）。スクショは `web/tako-remote/e2e/support.js` の
+  `evidencePath('<名前>.png')` を通し、既定は Playwright の outputDir（`test-results/`）。
+  spec の側で `process.env.HOME` / `homedir()` / `Desktop` を組み立てない（修正前は
+  `npm run e2e` だけでホームへ PNG 80 枚）。リポの外へ残すのは実行する人が
+  `TAKO_EVIDENCE_DIR` を渡したときだけ。番犬は
+  `crates/tako-control/tests/issue1749_pwa_e2e_output_watchdog.rs`
 
 ### 使い捨ての置き場は作った経路が消す（Issue #1296）
 

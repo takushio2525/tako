@@ -17,10 +17,10 @@
 // 実行:
 //   cd web/tako-remote && npx playwright test e2e/files-1451.spec.js
 import { test, expect } from '@playwright/test';
+import { evidencePath, TAKO_VERSION } from './support.js';
 
 const IPHONE_VIEWPORT = { width: 390, height: 844 };
 const BASE = `http://localhost:${process.env.TAKO_PWA_PORT || 5174}`;
-const EVIDENCE_DIR = process.env.TAKO_EVIDENCE_DIR || `${process.env.HOME}/dev/tako-evidence/1451`;
 
 // 偽のホーム（#927: 実ユーザー名・実パスを書かない）
 const HOME = '/Users/testuser';
@@ -28,7 +28,7 @@ const HOME = '/Users/testuser';
 function me(role = 'manage') {
   return {
     registered: true, device_id: 'test-iphone', name: 'iPhone', role,
-    login: 'user@example.com', host: 'test-mac', version: '0.8.12', app_connected: true,
+    login: 'user@example.com', host: 'test-mac', version: TAKO_VERSION, app_connected: true,
   };
 }
 
@@ -108,7 +108,7 @@ async function setupMocks(page, opts = {}) {
   await page.route('**/api/me', route => json(route, me(role)));
   await page.route('**/api/v2/panes', route => json(route, { api_version: 2, panes: [] }));
   await page.route('**/api/agents', route => json(route, { agents: [] }));
-  await page.route('**/api/health', route => json(route, { status: 'ok', version: '0.8.12' }));
+  await page.route('**/api/health', route => json(route, { status: 'ok', version: TAKO_VERSION }));
   await page.route('**/ws?*', route => route.abort());
   await page.route('**/manifest.json', route => json(route, { name: 'tako remote' }));
   await page.route('**/sw.js', route =>
@@ -203,7 +203,7 @@ test.describe('#1451 Finder 風の全体閲覧とショートカット — モ�
     await expect(page.locator(`[data-testid="tree-root-${TREE_ROOT.id}"]`)).toContainText('tako');
     // 既定ショートカット（ホーム）は `~` で出る = 実ホームパスを画面に出さない
     await expect(page.locator('[data-testid="shortcut-b0b0b0b0b0b0"]')).toContainText('~');
-    await page.screenshot({ path: `${EVIDENCE_DIR}/01-roots.png` });
+    await page.screenshot({ path: evidencePath('01-roots.png') });
   });
 
   test('02. `/` から辿ってファイルをプレビューできる', async ({ page }) => {
@@ -214,7 +214,7 @@ test.describe('#1451 Finder 風の全体閲覧とショートカット — モ�
     await expect(page.locator('[data-testid="entry-Users"]')).toBeVisible();
     // パンくずは絶対パス（ルート名が区切りなので二重の `/` にならない）
     await expect(page.locator('.file-crumb')).toHaveText('/');
-    await page.screenshot({ path: `${EVIDENCE_DIR}/02-root-dir.png` });
+    await page.screenshot({ path: evidencePath('02-root-dir.png') });
 
     await page.locator('[data-testid="entry-Users"]').click();
     await expect(page.locator('[data-testid="entry-testuser"]')).toBeVisible();
@@ -227,7 +227,7 @@ test.describe('#1451 Finder 風の全体閲覧とショートカット — モ�
     await page.locator('[data-testid="entry-notes.md"]').click();
     await expect(page.locator('.file-preview')).toContainText('全体閲覧から開いたファイル');
     await expect.poll(() => calls.content).toContain('Users/testuser/notes.md');
-    await page.screenshot({ path: `${EVIDENCE_DIR}/03-preview.png` });
+    await page.screenshot({ path: evidencePath('03-preview.png') });
   });
 
   test('03. 読めないフォルダは理由と戻り道が出る', async ({ page }) => {
@@ -240,7 +240,7 @@ test.describe('#1451 Finder 風の全体閲覧とショートカット — モ�
     await expect(notice).toBeVisible();
     await expect(notice).toContainText('読み取れませんでした');
     await expect(notice.locator('button')).toContainText('上のフォルダへ戻る');
-    await page.screenshot({ path: `${EVIDENCE_DIR}/04-unreadable-dir.png` });
+    await page.screenshot({ path: evidencePath('04-unreadable-dir.png') });
 
     // 戻り道が実際に効く
     await notice.locator('button').click();
@@ -258,7 +258,7 @@ test.describe('#1451 Finder 風の全体閲覧とショートカット — モ�
     await expect(page.locator('[data-testid="entry-broken-link"]')).toContainText('リンク先を読めません');
     // 読める行は従来どおりサイズ / 更新日時
     await expect(page.locator('[data-testid="entry-notes.md"]')).toContainText('2.0 KB');
-    await page.screenshot({ path: `${EVIDENCE_DIR}/05-unreadable-entry.png` });
+    await page.screenshot({ path: evidencePath('05-unreadable-entry.png') });
   });
 
   test('05. ショートカットを足して消せる（既定は消せない）', async ({ page }) => {
@@ -274,7 +274,7 @@ test.describe('#1451 Finder 風の全体閲覧とショートカット — モ�
     await add.click();
     await expect(page.locator('.file-notice.ok')).toContainText('ショートカットに追加しました');
     await expect.poll(() => calls.added.map(a => a.path)).toContain('/Users');
-    await page.screenshot({ path: `${EVIDENCE_DIR}/06-shortcut-added.png` });
+    await page.screenshot({ path: evidencePath('06-shortcut-added.png') });
 
     // 一覧へ戻ると増えている
     await openFiles(page);
@@ -311,7 +311,7 @@ test.describe('#1451 Finder 風の全体閲覧とショートカット — モ�
     // **呼びもしない**（押してもいない操作で 403 の赤を出さない）
     expect(calls.shortcuts).toHaveLength(0);
     expect(calls.added).toHaveLength(0);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/07-interact.png` });
+    await page.screenshot({ path: evidencePath('07-interact.png') });
   });
 
   test('08. observe は従来どおり権限不足の案内', async ({ page }) => {
@@ -332,7 +332,7 @@ test.describe('#1451 Finder 風の全体閲覧とショートカット — モ�
     // **ショートカットは呼ばない**のが legacy 腕の観測点
     expect(calls.shortcuts).toHaveLength(0);
     await expect(page.locator('[data-testid="files-section-shortcuts"]')).toHaveCount(0);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/08-legacy.png` });
+    await page.screenshot({ path: evidencePath('08-legacy.png') });
   });
 
   test('10. ショートカット API が落ちてもファイルビューは開く', async ({ page }) => {

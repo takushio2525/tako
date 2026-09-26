@@ -17,10 +17,10 @@
 // 実行:
 //   cd web/tako-remote && npx playwright test e2e/tasks-1450b3.spec.js
 import { test, expect } from '@playwright/test';
+import { evidencePath, TAKO_VERSION } from './support.js';
 
 const IPHONE_VIEWPORT = { width: 390, height: 844 };
 const BASE = `http://localhost:${process.env.TAKO_PWA_PORT || 5174}`;
-const EVIDENCE_DIR = process.env.TAKO_EVIDENCE_DIR || `${process.env.HOME}/dev/tako-evidence/1450b3`;
 
 // 偽のホーム（#927）
 const HOME = '/Users/testuser';
@@ -29,7 +29,7 @@ const NOW = Math.floor(Date.now() / 1000);
 function me(role = 'manage') {
   return {
     registered: true, device_id: 'test-iphone', name: 'iPhone', role,
-    login: 'user@example.com', host: 'test-mac', version: '0.8.12', app_connected: true,
+    login: 'user@example.com', host: 'test-mac', version: TAKO_VERSION, app_connected: true,
   };
 }
 
@@ -114,7 +114,7 @@ async function setupMocks(page, opts = {}) {
   await page.route('**/api/me', route => json(route, me(role)));
   await page.route('**/api/v2/panes', route => json(route, { api_version: 2, panes: [] }));
   await page.route('**/api/agents', route => json(route, { agents: [] }));
-  await page.route('**/api/health', route => json(route, { status: 'ok', version: '0.8.12' }));
+  await page.route('**/api/health', route => json(route, { status: 'ok', version: TAKO_VERSION }));
   await page.route('**/ws?*', route => route.abort());
   await page.route('**/manifest.json', route => json(route, { name: 'tako remote' }));
   await page.route('**/sw.js', route =>
@@ -197,7 +197,7 @@ test.describe('#1450 B3 スマホからタスクを片付ける — モバイル
     await expect(rows.first()).toContainText('投稿');
     // 未確定の配送を「届いた」と書かない
     await expect(rows.nth(1)).toContainText('送信済み（確認待ち）');
-    await page.screenshot({ path: `${EVIDENCE_DIR}/01-list.png`, fullPage: true });
+    await page.screenshot({ path: evidencePath('01-list.png'), fullPage: true });
   });
 
   test('02. 詳細に本文 / 添付 / コピー用テキスト / リンクが出る', async ({ page }) => {
@@ -219,7 +219,7 @@ test.describe('#1450 B3 スマホからタスクを片付ける — モバイル
     // コピー用テキストは 3 件
     await expect(page.locator('[data-testid="task-copy"]')).toHaveCount(3);
     await expect(page.locator('.task-link')).toHaveText('https://example.com/tako');
-    await page.screenshot({ path: `${EVIDENCE_DIR}/02-detail.png`, fullPage: true });
+    await page.screenshot({ path: evidencePath('02-detail.png'), fullPage: true });
   });
 
   test('03. 添付のリンクが既存のファイル API（root + 相対パス）を指す', async ({ page }) => {
@@ -270,7 +270,7 @@ test.describe('#1450 B3 スマホからタスクを片付ける — モバイル
     expect(calls.respond).toEqual([
       { id: 'u-12', decision: 'needs_change', comment: 'サムネを差し替えてほしい' },
     ]);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/05-responded.png`, fullPage: true });
+    await page.screenshot({ path: evidencePath('05-responded.png'), fullPage: true });
   });
 
   test('06. 完了すると一覧から消える', async ({ page }) => {
@@ -300,7 +300,7 @@ test.describe('#1450 B3 スマホからタスクを片付ける — モバイル
     // 添付も落とせない（理由つき）
     await expect(page.locator('[data-testid="task-download"]')).toHaveCount(0);
     await expect(page.locator('.task-attachment-why').first()).toContainText('権限が足りません');
-    await page.screenshot({ path: `${EVIDENCE_DIR}/07-observe.png`, fullPage: true });
+    await page.screenshot({ path: evidencePath('07-observe.png'), fullPage: true });
   });
 
   test('08. タスクが 0 件なら「人がやることはありません」', async ({ page }) => {

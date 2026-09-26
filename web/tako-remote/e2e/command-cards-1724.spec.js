@@ -16,17 +16,17 @@
 // 実行:
 //   cd web/tako-remote && npx playwright test e2e/command-cards-1724.spec.js
 import { test, expect } from '@playwright/test';
+import { evidencePath, TAKO_VERSION } from './support.js';
 
 const IPHONE_VIEWPORT = { width: 390, height: 844 };
 const BASE = `http://localhost:${process.env.TAKO_PWA_PORT || 5174}`;
-const EVIDENCE_DIR = process.env.TAKO_EVIDENCE_DIR || `${process.env.HOME}/dev/tako-evidence/1724`;
 
 const PANE = 7;
 
 function me(role = 'interact') {
   return {
     registered: true, device_id: 'nPHONE1724', name: 'phone-a', role,
-    login: 'tester@example.com', host: 'test-mac', version: '0.8.12', app_connected: true,
+    login: 'tester@example.com', host: 'test-mac', version: TAKO_VERSION, app_connected: true,
     pending: false, denied: false,
   };
 }
@@ -75,7 +75,7 @@ async function setupMocks(page, opts = {}) {
   });
   await page.route('**/api/v2/panes', route => json(route, { api_version: 2, panes: [PANE_INFO] }));
   await page.route('**/api/agents', route => json(route, { agents: [] }));
-  await page.route('**/api/health', route => json(route, { status: 'ok', version: '0.8.12' }));
+  await page.route('**/api/health', route => json(route, { status: 'ok', version: TAKO_VERSION }));
   await page.route('**/api/tasks**', route => json(route, { tasks: [], count: 0, open_count: 0 }));
   await page.route('**/ws?*', route => route.abort());
   await page.route('**/manifest.json', route => json(route, { name: 'tako remote' }));
@@ -146,7 +146,7 @@ test.describe('#1724 スマホからコマンドカードを実行する — モ
     await expect(page.locator('[data-testid="command-run"]')).toHaveCount(3);
     // 一覧は**このペイン**を名指して引く
     expect(calls.list.every(p => p === String(PANE))).toBe(true);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/01-cards.png`, fullPage: true });
+    await page.screenshot({ path: evidencePath('01-cards.png'), fullPage: true });
   });
 
   test('02. interact: 実行 → 確認（全文）→ 1 回だけ撃ち、記録が出る', async ({ page }) => {
@@ -159,7 +159,7 @@ test.describe('#1724 スマホからコマンドカードを実行する — モ
     await expect(page.locator('[data-testid="command-confirm-text"]')).toHaveText('cargo test --workspace -j 4');
     await expect(sheet).toContainText('テストを回す');
     await expect(sheet).toContainText('test-mac の同じタブに新しいペインを開いて実行します');
-    await page.screenshot({ path: `${EVIDENCE_DIR}/02-confirm.png`, fullPage: true });
+    await page.screenshot({ path: evidencePath('02-confirm.png'), fullPage: true });
     expect(calls.run).toHaveLength(0);
 
     await page.locator('[data-testid="command-confirm-run"]').click();
@@ -171,14 +171,14 @@ test.describe('#1724 スマホからコマンドカードを実行する — モ
     const block = page.locator('[data-testid="command-block"]').first();
     await expect(block.locator('[data-testid="command-run-state"]')).toHaveText('実行中');
     await expect(block.locator('[data-testid="command-run"]')).toBeDisabled();
-    await page.screenshot({ path: `${EVIDENCE_DIR}/03-running.png`, fullPage: true });
+    await page.screenshot({ path: evidencePath('03-running.png'), fullPage: true });
 
     // PC 側で終わった（一覧の記録が exited へ）→ 次の一覧で揃う・また押せる
     state.cards[0].runs = [{ pane: 40, state: 'exited', exit_code: 0, count: 1 }];
     await expect(block.locator('[data-testid="command-run-state"]'))
       .toHaveText('実行済み（終了コード 0）', { timeout: 12000 });
     await expect(block.locator('[data-testid="command-run"]')).toBeEnabled();
-    await page.screenshot({ path: `${EVIDENCE_DIR}/04-exited.png`, fullPage: true });
+    await page.screenshot({ path: evidencePath('04-exited.png'), fullPage: true });
   });
 
   test('03. 確認で「やめる」なら撃たない', async ({ page }) => {
@@ -205,7 +205,7 @@ test.describe('#1724 スマホからコマンドカードを実行する — モ
     const link = page.locator('[data-testid="command-run-permission"]');
     await expect(link).toContainText('interact 以上');
     await expect(link).toContainText('observe');
-    await page.screenshot({ path: `${EVIDENCE_DIR}/05-observe.png`, fullPage: true });
+    await page.screenshot({ path: evidencePath('05-observe.png'), fullPage: true });
 
     await link.click();
     await expect(page.locator('[data-testid="permission-request"]')).toBeVisible();
@@ -215,7 +215,7 @@ test.describe('#1724 スマホからコマンドカードを実行する — モ
     expect(calls.pair).toHaveLength(1);
     expect(calls.pair[0].role).toBe('interact');
     expect(calls.run).toHaveLength(0);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/06-permission.png`, fullPage: true });
+    await page.screenshot({ path: evidencePath('06-permission.png'), fullPage: true });
   });
 
   test('05. 実行中は押せない・古い一覧から押しても 409 の理由が出る', async ({ page }) => {
@@ -246,7 +246,7 @@ test.describe('#1724 スマホからコマンドカードを実行する — モ
     // 一覧からカードが消えても、押した結果は残る（黙って全部消えない）
     await expect(page.locator('[data-testid="command-card"]')).toHaveCount(0);
     await expect(page.locator('[data-testid="command-notice"]')).toHaveText(/このカードは PC 側で閉じられました/);
-    await page.screenshot({ path: `${EVIDENCE_DIR}/07-closed.png`, fullPage: true });
+    await page.screenshot({ path: evidencePath('07-closed.png'), fullPage: true });
     // 閉じれば節ごと消える
     await page.locator('.cmd-notice-close').click();
     await expect(page.locator('[data-testid="command-cards"]')).toHaveCount(0);
