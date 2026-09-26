@@ -2240,6 +2240,28 @@ Dock のピン留めは `.app` への **file URL ブックマーク**（`com.app
   `crates/tako-control/tests/test_residue_watchdog.rs` の静的検査。A/B は `TAKO_1312_LEGACY=1`
   （器を修正前 = 作りっぱなしへ戻す。実測 19 件が残る）
 
+### 長生きする子を残すテストは、パイプを読むテストと spawn を重ねない（Issue #1748）
+
+**macOS では、同じテストバイナリの別スレッドが spawn した子へパイプが漏れる。**
+std は `Stdio::piped()` のパイプを `pipe()` → `FD_CLOEXEC` の 2 手で作る（原子的に作る
+`pipe2` が macOS に無い）ので、その隙間に来た `posix_spawn` の子はそのパイプを
+CLOEXEC 無しで受け継ぎ、exec 後も握る。漏れた先が長生きすると、読む側は EOF を見ない。
+
+- 実測（Rust 1.95.0 / macOS）: 並行 spawn 3 スレッドの下で子を 3000 回起こすと 8 回、
+  余計なパイプ fd を受け継いだ（並行 spawn なしでは 0 回）。ETXTBSY は起きない
+  （書き込み用に開いたままのスクリプトを exec しても通る）
+- #1748 の実物: autorename の上限テストが stdout を握ったまま **30 秒眠る孫**をわざと残し、
+  兄弟テストの stdout の書き込み側がそこへ漏れると、兄弟は `READ_GRACE`（10 秒）で
+  `Failed` へ落ちた（`run_claude_with(..).is_some()` が偽）。再現の手順と回数は #1748 を閉じた PR の本文
+- **直し方は「起こす瞬間を重ねない」**: 漏れる相手と漏らす側を同じ `Mutex` で直列にする
+  （`autorename::tests::fake_claude_lock`）。待ち時間を延ばす・再試行する、は窓を狭めるだけ
+- **眠る孫を残すなら pid を残させて止める**（`StopGrandchild`）。止めないと孫は
+  テストプロセスより長生きし、生まれた瞬間に受け継いだ fd（別モジュールのテストのパイプ）を握り続ける
+- 番犬 `crates/tako-control/tests/issue1748_fake_claude_serial_watchdog.rs` が、
+  偽 claude を起こす `#[test]` のロック欠落・後取り・孫の放置を `file:line` で落とす
+- 同じ隙間は製品にもある（GUI プロセス内の spawn のパイプが PTY のシェルへ漏れうる。
+  alacritty_terminal 0.26 の `pre_exec` は slave / master しか閉じない）
+
 ## ゲートを足す変更は、そのゲートを通る隔離テストも同じコミットで直す（Issue #1452 / #1493）
 
 **認可・所有者・呼び出し元を見るゲートを足したら、そのゲートを通る実経路テストを
