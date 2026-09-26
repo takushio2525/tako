@@ -1863,6 +1863,9 @@ struct TakoApp {
     preview_reload_apply_count: u64,
     /// コードプレビューの編集セッション。未保存バッファは表示モードを OFF にしても保持する。
     preview_edits: HashMap<PaneId, preview::EditState>,
+    /// 言語サーバの束ね（#1678）。編集モードに入ったときだけサーバを起こす。
+    /// CLI / MCP の `tako lsp` も dispatch 経由でこの 1 つを触る
+    lsp: tako_control::lsp::LspManager,
     /// タブ・ペイン名の AI 自動リネームの検知状態（FR-2.12。ループは new で張る）
     autorename: autorename::AutoRenamer,
     /// 自動命名した時刻（タブ ID → 命名時刻。#552 案 4）。命名直後だけタブに
@@ -3989,6 +3992,7 @@ impl TakoApp {
             next_preview_reload_generation: 0,
             preview_reload_apply_count: 0,
             preview_edits: HashMap::new(),
+            lsp: tako_control::lsp::LspManager::from_env(),
             autorename: autorename::AutoRenamer::new(initial_auto_rename()),
             auto_title_hints: HashMap::new(),
             port_detect: initial_port_detect(),
@@ -4290,6 +4294,9 @@ impl TakoApp {
         cx.on_app_quit(|this: &mut TakoApp, _cx| {
             // #777 の検証専用の注入: 終了処理に入ったまま返らないアプリを作る
             inject_777_hang("hang-quit");
+            // #1678: 言語サーバへ shutdown → exit を送り、期限を過ぎたら kill する
+            // （孤児を残さない。kill -9 で落ちたときはサーバが stdin の EOF で自分で終わる）
+            this.lsp.shutdown_all(std::time::Duration::from_secs(2));
             // 終了の痕跡を必ず残す（#381: silent death 調査で「このログがあるのに次の
             // 起動が無い = 正常終了、ログすら無い = kill / パニック」を切り分けるため）
             if !this.secondary {
@@ -12564,6 +12571,22 @@ impl TakoApp {
         // 貼り付け・undo / redo・IME 確定・CLI / MCP の `PreviewApply` は
         // すべてここを通るので、追従は**この 1 か所**で効く
         self.follow_preview_cursor(pane_id);
+        // #1678: 言語サーバへの同期も同じ理由でここ 1 か所（本文が変わる経路はすべて通る）
+        self.sync_preview_lsp(pane_id);
+    }
+
+    /// 編集セッション 1 つを言語サーバへ同期する（#1678）。
+    ///
+    /// 編集モードで開いていれば `didOpen` / `didChange`、抜けていれば `didClose`。
+    /// 受け持つサーバが無い・未導入なら何もしない（編集の経路は 1 バイトも変えない）。
+    /// 版が同じなら何も送らないので、カーソル移動だけの呼び出しは素通りする
+    fn sync_preview_lsp(&mut self, pane_id: PaneId) {
+        if let Some(edit) = self.preview_edits.get_mut(&pane_id) {
+            let editing = edit.editing;
+            let preview::EditState { buffer, lsp, .. } = edit;
+            self.lsp
+                .sync(lsp, editing, buffer.path(), buffer.text(), buffer.version());
+        }
     }
 
     fn sync_preview_selection_from_editor(&mut self, pane_id: PaneId) {
@@ -12652,6 +12675,9 @@ impl TakoApp {
             .is_some_and(|edit| !edit.dirty())
         {
             self.preview_edits.remove(&pane_id);
+        } else {
+            // #1678: 未保存のまま編集モードを抜けた（セッションは残る）ので明示的に閉じる
+            self.sync_preview_lsp(pane_id);
         }
         Ok(())
     }
@@ -22828,6 +22854,10 @@ impl WebViewHost for TakoApp {
 impl SystemHost for TakoApp {
     fn is_secondary(&self) -> bool {
         self.secondary
+    }
+
+    fn lsp(&self) -> Option<&tako_control::lsp::LspManager> {
+        Some(&self.lsp)
     }
 
     fn persist_restore_report(&self) -> Option<String> {

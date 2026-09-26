@@ -73,6 +73,56 @@ pub fn native_separators_with(path: &str, main_separator: char) -> std::borrow::
     std::borrow::Cow::Owned(out)
 }
 
+/// ローカルパスを `file://` URI へ（#1678。LSP の `rootUri` / `textDocument.uri`）。
+///
+/// 上の関数群と**逆向き**の変換で、RFC 8089 の Windows 形式もここ 1 箇所で持つ
+/// （`C:\a\b` → `file:///C:/a/b`、UNC `\\host\share\x` → `file://host/share/x`、
+/// verbatim の `\\?\` は剥がす）。パスは RFC 3986 の unreserved と `/` 以外を
+/// `%XX`（UTF-8 のバイト単位・大文字）へ符号化する。`canonicalize` はしない
+/// （受け取ったパスをそのまま写す。`.agent/conventions.md`「Issue #970」）
+pub fn from_path(path: &std::path::Path) -> String {
+    from_path_str(&path.to_string_lossy(), cfg!(windows))
+}
+
+/// [`from_path`] の OS 明示版（**macOS 上から Windows 形式を検証できる**よう純粋関数にする）
+pub fn from_path_str(path: &str, windows: bool) -> String {
+    if !windows {
+        return format!("file://{}", percent_encode_path(path));
+    }
+    let path = path
+        .strip_prefix(r"\\?\UNC\")
+        .map(|rest| format!(r"\\{rest}"))
+        .unwrap_or_else(|| path.strip_prefix(r"\\?\").unwrap_or(path).to_string());
+    let slashed = path.replace('\\', "/");
+    if let Some(unc) = slashed.strip_prefix("//") {
+        let (host, rest) = unc.split_once('/').unwrap_or((unc, ""));
+        return format!("file://{host}/{}", percent_encode_path(rest));
+    }
+    // ドライブ文字の `:` はそのまま残す（`file:///C:/…`）
+    let bytes = slashed.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return format!(
+            "file:///{}:{}",
+            &slashed[..1],
+            percent_encode_path(&slashed[2..])
+        );
+    }
+    format!("file://{}", percent_encode_path(&slashed))
+}
+
+/// unreserved（英数字と `-._~`）と `/` 以外を `%XX` にする
+fn percent_encode_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for &byte in path.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +188,39 @@ mod tests {
         assert_eq!(
             std::path::Path::new(native.as_ref()),
             std::path::Path::new("C:/Users/x/dev")
+        );
+    }
+
+    #[test]
+    fn パスから_file_uri_を組む_posix() {
+        assert_eq!(
+            from_path_str("/w/src/main.rs", false),
+            "file:///w/src/main.rs"
+        );
+        assert_eq!(
+            from_path_str("/w/a b/日本.rs", false),
+            "file:///w/a%20b/%E6%97%A5%E6%9C%AC.rs"
+        );
+        assert_eq!(from_path_str("/w/#x%y", false), "file:///w/%23x%25y");
+    }
+
+    #[test]
+    fn パスから_file_uri_を組む_windows() {
+        assert_eq!(
+            from_path_str(r"C:\w\src\main.rs", true),
+            "file:///C:/w/src/main.rs"
+        );
+        assert_eq!(
+            from_path_str(r"\\?\C:\w\a b.rs", true),
+            "file:///C:/w/a%20b.rs"
+        );
+        assert_eq!(
+            from_path_str(r"\\host\share\x.rs", true),
+            "file://host/share/x.rs"
+        );
+        assert_eq!(
+            from_path_str(r"\\?\UNC\host\share\x.rs", true),
+            "file://host/share/x.rs"
         );
     }
 }

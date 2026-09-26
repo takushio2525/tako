@@ -1385,6 +1385,31 @@
     "name": "tako_preview_delete"
   },
   {
+    "description": "言語サーバ（LSP）の状態と起動・停止。コードプレビューを編集モードにすると拡張子に合うサーバ（rust-analyzer 等）が起きる。action=status（既定）で状態・能力・診断件数、list で検出表と導入済みか、restart で起こし直す（未導入・諦めたも）、stop で止める、logs で stderr の直近。未導入なら reason / next_step / install_command を返す。",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "default": "status",
+          "enum": [
+            "status",
+            "list",
+            "restart",
+            "stop",
+            "logs"
+          ],
+          "type": "string"
+        },
+        "name": {
+          "description": "サーバの ID（省略で全部）",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "tako_lsp_server"
+  },
+  {
     "description": "コードプレビューの未保存編集をファイルへ書き戻す。読み込み後に外部変更があれば競合として拒否し、上書きしない。",
     "inputSchema": {
       "additionalProperties": false,

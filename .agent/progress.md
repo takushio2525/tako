@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-09-26（#1726: Code Runner の実行設定と Python の実行環境の設計書を出した）
-- `.agent/plans/2026-09-runner-settings.md`: 棚卸し（file:line）/ `run-configs.json` 新設（ローカル区分）/ 実行環境は ID で保存し実行時に解く / 自動選択 uv → `.venv` → poetry → pipenv → conda → pyenv → システム / env は境界 B1 でコマンドへ埋める / MCP は既存 2 本へ足す
-- スライス S0〜S7（#1728〜#1735）と判断待ち J1〜J5（全部推奨どおりで確定）。着地順は #1656 → S2 → #1657 → #1662 → S3〜S6
-
 ## 2026-09-26（#1724: スマホからコマンドカードを実行できるようにした）
 - PC のカードには「実行済み」の状態が無かったので、tako-core のカードへコマンドごとの実行記録（実行ペイン / running・exited・closed / 回数）と「実行中の同じコマンドは再実行しない」を足し、`list` の `runs` で返す。PC のカードは同じ記録を出し、確定は `dispatch::refresh_command_card_runs` の 1 本
 - remote は宣言表 `remote_cards::CARD_ROUTES` の 2 本だけ（一覧 = Observe / 実行 = Interact・本文は受け取らない）で `ShowCommand` の list / run を素通し。PWA はペイン画面にカード + 全文の確認 1 回、observe には #1452 の権限リクエスト
@@ -66,3 +62,7 @@
 - 疑いの ETXTBSY は macOS では起きない（実測）。真因は std が `Stdio::piped()` を `pipe()` → `FD_CLOEXEC` の 2 手で作る隙間に上限テストの spawn が重なり、30 秒眠る孫が兄弟の stdout の書き込み側を握ること → `READ_GRACE` 10 秒で `Failed`（lsof で相方 = 落ちたテストのプロセスを 3/3 件照合）
 - 偽 claude を起こす 4 本を `fake_claude_lock()` で直列化・孫は pid を残させ `StopGrandchild` で止める（寿命 29.9 → 1.6 秒）・番犬 `issue1748_fake_claude_serial_watchdog`（注入 6 通りを名指し）・conventions に節
 - 実測: autorename 28 件 × 4 本同時 × 250 周で修正前 3/1000 FAILED・漏れ 7 → 修正後 0/1000・漏れ 0（sleep 883 本）・workspace 5466 passed 0 failed・clippy 3 宇宙 0
+
+## 2026-09-26（#1678: LSP 基盤（S1）を入れ、編集モードで言語サーバと握手して文書を同期するようにした）
+- tako-core::lsp（UTF-8 ⇄ UTF-16 の入口 2 本・検出表 4 行・ルート検出・状態機械 8 状態・写しとの差分）+ tako-control::lsp（Content-Length の自作フレーミング・1 サーバ 3 スレッド・再起動 3 回まで・猶予 60 秒で停止・診断は開いている文書のぶんだけ）。`lsp-types` 0.97 を追加し tokio は 0 件のまま。操作は dispatch `LspServer` → CLI `tako lsp status/servers/restart/stop/logs` → MCP `tako_lsp_server`
+- 実測: e2e `issue1678_lsp_e2e` 17 本（偽サーバの実プロセス。`TAKO_1007_LEGACY=1` で FAILED）・番犬 5 本（注入 2 通りが file:line で FAILED → 戻して緑）・隔離 GUI の `scripts/test-lsp-1678.sh`（アイドル 60 秒で受信 0 行・編集結果が 3 通りでバイト一致・kill -9 で孤児なし）・実 rust-analyzer 1.95.0 と握手（0.32 秒で稼働・能力 27 キー・診断 2 件。#1678 にコメント）

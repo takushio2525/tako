@@ -25,6 +25,7 @@ pub mod i18n;
 pub mod ipc_socket;
 pub mod limit_resume;
 pub mod links;
+pub mod lsp;
 pub mod md_links;
 pub mod migration;
 pub mod monotonic;

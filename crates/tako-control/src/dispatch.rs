@@ -165,6 +165,13 @@ pub enum OffloadJob {
         roots: Vec<PathBuf>,
         limit: Option<usize>,
     },
+    /// 言語サーバの操作（#1678）。実行ファイルの探索（unix はログインシェル）・
+    /// shutdown の待ちを含むので、UI スレッドでは manager の複製だけを取る
+    Lsp {
+        manager: crate::lsp::LspManager,
+        action: String,
+        name: Option<String>,
+    },
 }
 
 /// リクエストが offload 対象なら UI スレッド必須の文脈を収集してジョブ化する。
@@ -255,6 +262,14 @@ pub fn prepare_offload(
                 limit: *limit,
             }))
         }
+        // #1678: manager を持たない host は同期実行へ落として「使えない」を返す
+        Request::LspServer { action, name } => host.lsp().map(|manager| {
+            Ok(OffloadJob::Lsp {
+                manager: manager.clone(),
+                action: action.clone(),
+                name: name.clone(),
+            })
+        }),
         _ => None,
     }
 }
@@ -281,6 +296,11 @@ impl OffloadJob {
             OffloadJob::TreeGitStatus { tab, roots, limit } => {
                 Ok(tree_git_status_payload(tab, &roots, limit))
             }
+            OffloadJob::Lsp {
+                manager,
+                action,
+                name,
+            } => lsp_server_action(Some(&manager), &action, name.as_deref()),
         }
     }
 }
@@ -3238,6 +3258,12 @@ fn dispatch_inner(
         }
 
         Request::CheckHealth => Ok(check_health(host)),
+
+        // #1678: 通常は prepare_offload が background へ出す。ここへ来るのは
+        // `TAKO_OFFLOAD=0` か manager を持たない host（= 「使えない」と答える）
+        Request::LspServer { action, name } => {
+            lsp_server_action(host.lsp(), &action, name.as_deref())
+        }
 
         Request::SetupMcp { scope, pane, agent } => {
             let scope_str = scope.as_deref().unwrap_or("global");
@@ -12177,6 +12203,50 @@ pub struct CheckHealthCtx {
     /// DPI 認識レベル（#1063）。**スレッドごとの問い合わせ**（Windows の
     /// `GetThreadDpiAwarenessContext`）なので、必ず UI スレッドで採って持ち回る
     dpi_awareness: tako_core::platform::dpi::DpiAwareness,
+}
+
+/// `tako lsp` / MCP `tako_lsp_server` の action（#1678）。CLI と MCP はこの綴りを共有する
+pub const LSP_ACTIONS: &[&str] = &["status", "list", "restart", "stop", "logs"];
+
+/// 言語サーバの操作の 1 実装（#1678）。CLI・MCP・同期実行・offload のすべてがここを通る。
+///
+/// `manager` が無い host（テスト・セカンダリ）は「使えない」を返す。`name` は検出表の ID で、
+/// 表に無い名前は実行前に弾く（綴り違いで「対象 0 件」を成功に見せない）
+pub fn lsp_server_action(
+    manager: Option<&crate::lsp::LspManager>,
+    action: &str,
+    name: Option<&str>,
+) -> Result<Value, DispatchError> {
+    if !LSP_ACTIONS.contains(&action) {
+        return Err(DispatchError::InvalidParams(format!(
+            "action が不正: {action}（{}）",
+            LSP_ACTIONS.join(" / ")
+        )));
+    }
+    if let Some(name) = name {
+        if tako_core::lsp::servers::find_in(tako_core::lsp::servers::SERVERS, name).is_none() {
+            let known: Vec<&str> = tako_core::lsp::servers::SERVERS
+                .iter()
+                .map(|s| s.id)
+                .collect();
+            return Err(DispatchError::InvalidParams(format!(
+                "サーバ名が不正: {name}（{}）",
+                known.join(" / ")
+            )));
+        }
+    }
+    let Some(manager) = manager else {
+        return Err(DispatchError::Operation(
+            crate::lsp::text::UNAVAILABLE.text().to_string(),
+        ));
+    };
+    Ok(match action {
+        "list" => manager.servers(),
+        "restart" => manager.restart(name),
+        "stop" => manager.stop(name),
+        "logs" => manager.logs(name),
+        _ => manager.status(name),
+    })
 }
 
 /// UI スレッドでの文脈収集（**ここでは 1 プロセスも起こさない**）

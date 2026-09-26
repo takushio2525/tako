@@ -511,6 +511,16 @@ pub const CATALOG: &[Entry] = &[
         local_fields: &[],
         needs_local_unless: &[],
     },
+    // #1678: 言語サーバとの生の JSON-RPC（`TAKO_LSP_DIAG=1` のときだけ書く診断）。
+    // ソースコード本文を含むので端末の外へ出さない
+    Entry {
+        root: Root::TakoData,
+        path: "lsp/",
+        class: Class::Local,
+        note: notes::DIAGNOSTIC,
+        local_fields: &[],
+        needs_local_unless: &[],
+    },
     Entry {
         root: Root::TakoData,
         path: "pane-logs/",

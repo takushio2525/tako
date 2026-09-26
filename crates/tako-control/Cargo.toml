@@ -23,3 +23,4 @@ image.workspace = true
 rust-embed.workspace = true
 libc.workspace = true
 ureq.workspace = true
+lsp-types.workspace = true

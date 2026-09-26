@@ -41,6 +41,10 @@ clap = { version = "4", features = ["derive"] }
 # 同期・スレッドベースの最小 HTTP サーバーで「tokio を持ち込まない」方針を維持する
 # （公式 Rust SDK の rmcp は tokio 必須のため不採用。.agent/architecture.md「Layer 2」節）
 tiny_http = "0.12"
+# 言語サーバ（LSP）クライアントのメッセージ型（#1678 / #1007 S1）。型定義だけを借り、
+# JSON-RPC の配線は自作する（Zed と同じ形）。依存は serde 系と URI だけで tokio を引かない
+# （`async-lsp` は既定 features に tokio が入るので不採用。.agent/plans/2026-09-lsp-s1.md §16-1）
+lsp-types = "0.97"
 # リモートアクセスの QR コード生成（ターミナル表示用。pure Rust・軽量）
 qrcode = "0.14"
 # マシン ID 生成（Phase 3 remote。UUID v4、CSPRNG ベース）

@@ -1057,6 +1057,11 @@ pub trait SystemHost {
     }
     /// ペインログ設定の反映（`tako logs set`）。GUI はライブの PaneLogManager へ適用する
     fn apply_pane_log_config(&mut self, _config: tako_core::pane_log::PaneLogConfig) {}
+    /// 言語サーバの束ね（#1678）。GUI が 1 つ持つ実体を返す。持たない実装
+    /// （テストの host・セカンダリ等）は `None` で、`tako lsp` は「使えない」と答える
+    fn lsp(&self) -> Option<&crate::lsp::LspManager> {
+        None
+    }
     /// ライブペインの現行ログファイル（Issue #112 B。クローズ済みペインは
     /// `pane_log::latest_for_pane` のファイル名検索にフォールバックする）
     fn pane_log_file(&self, _pane: PaneId) -> Option<std::path::PathBuf> {

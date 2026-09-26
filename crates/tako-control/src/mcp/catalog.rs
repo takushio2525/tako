@@ -1039,6 +1039,26 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #1678（LSP 基盤。言語機能は各スライスが足す）
+        json!({
+            "name": "tako_lsp_server",
+            "description": "言語サーバ（LSP）の状態と起動・停止。コードプレビューを編集モードにすると\
+                拡張子に合うサーバ（rust-analyzer 等）が起きる。action=status（既定）で状態・能力・診断件数、\
+                list で検出表と導入済みか、restart で起こし直す（未導入・諦めたも）、stop で止める、\
+                logs で stderr の直近。未導入なら reason / next_step / install_command を返す。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "list", "restart", "stop", "logs"],
+                        "default": "status",
+                    },
+                    "name": { "type": "string", "description": "サーバの ID（省略で全部）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
         json!({
             "name": "tako_preview_save",
             "description": "コードプレビューの未保存編集をファイルへ書き戻す。読み込み後に外部変更があれば競合として拒否し、上書きしない。",

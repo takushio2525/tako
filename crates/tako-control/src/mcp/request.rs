@@ -780,6 +780,10 @@ pub(super) fn build_request(
             path: str_arg(args, "path")?,
             name: str_arg(args, "name")?,
         },
+        "tako_lsp_server" => Request::LspServer {
+            action: str_arg(args, "action")?.unwrap_or_else(|| "status".to_string()),
+            name: str_arg(args, "name")?,
+        },
         "tako_remote_setup" => Request::RemoteSetup {
             action: str_arg(args, "action")?.ok_or("action を指定する（check / run）")?,
             answers: args.get("answers").cloned(),

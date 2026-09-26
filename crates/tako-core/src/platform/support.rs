@@ -212,6 +212,13 @@ pub mod notes {
         "The hard-coded unix socket serve target was removed in #1038 (the daemon now listens on loopback TCP), so `unix socket serve target is not supported on Windows` no longer applies. The end-to-end run on real Windows hardware (setup step 4 -> daemon start -> phone access) is still unmeasured (#971)",
     );
 
+    /// #1678。起動・同期の経路は OS 分岐を持たず偽サーバの e2e が Windows でも走るが、
+    /// 実サーバとの握手は macOS の rust-analyzer でしか実測していない
+    pub const WIN_LSP_REAL_SERVER_UNMEASURED: Note = Note::new(
+        "言語サーバの起動・握手・文書同期は偽サーバの e2e で確かめているが、Windows 実機で実サーバ（rust-analyzer 等）と握手したことはまだ無い（#1007）",
+        "Starting, handshaking and syncing documents are covered by the fake-server e2e, but no real language server (rust-analyzer etc.) has been handshaken on real Windows hardware yet (#1007)",
+    );
+
     // ─── そもそも要らない / 概念が無い ─────────────────────────────
 
     /// OS が同等機能を標準で持っていて、tako 側の実装が不要なもの（#600）
@@ -762,6 +769,20 @@ pub const MATRIX: &[Feature] = &[
         windows: Support::Supported,
         windows_evidence: Evidence::SelfTest(
             "項目 87 / 104（ペインログのクローズマーカーと発生源）",
+        ),
+    },
+    Feature {
+        key: "tako_lsp_server",
+        // #1678: 実行ファイルの探索は exe::find（Windows は PATHEXT）、起動は child_cmd
+        // （Windows はシェルを経由しない）を通り、I/O は std のパイプとスレッドだけ。
+        // それでも Supported と名乗らないのは、Windows 実機で実サーバと握手していないため
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_LSP_REAL_SERVER_UNMEASURED,
+            issue: 1007,
+        },
+        windows_evidence: Evidence::UnitTest(
+            "issue1678_lsp_e2e（偽サーバとの握手・送信列・分割受信・再起動の上限・親が落ちたら子も終わる）が CI の Windows ジョブで緑",
         ),
     },
     Feature {
