@@ -74,6 +74,9 @@ enum Command {
     /// ターミナル画面のリンク（修飾 + クリックで開けるもの）を列挙する（Issue #1283）
     #[command(about = format!("ターミナル画面のリンク（{}で開けるもの）を列挙する（Issue #1283）", link_click()))]
     Links(LinksArgs),
+    /// 言語サーバ（LSP）の状態と起動・停止（Issue #1678。編集モードで自動的に起きる）
+    #[command(subcommand)]
+    Lsp(LspCommand),
     /// スクロールバック表示を動かす（--to 0 で最下部へ）
     Scroll(ScrollArgs),
     /// 直接ペインのスクロールバック保持上限（行）の確認・変更（Issue #818）
@@ -847,6 +850,60 @@ enum ChatCommand {
         #[arg(long)]
         list: bool,
     },
+}
+
+/// `tako lsp`（#1678）。MCP は `action` 引数を持つ 1 ツール `tako_lsp_server`
+#[derive(Subcommand)]
+enum LspCommand {
+    /// 状態・能力・診断件数（未導入なら理由と導入コマンド）
+    Status {
+        /// サーバの ID（省略で全部）
+        #[arg(long)]
+        name: Option<String>,
+        /// JSON のまま出す
+        #[arg(long)]
+        json: bool,
+    },
+    /// 検出表と、導入済みかどうか
+    Servers {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 止めて起こし直す（未導入・諦めた・止めたも対象）
+    Restart {
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// 止める（restart まで自動では起こさない）
+    Stop {
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// サーバが stderr へ出した直近の行
+    Logs {
+        #[arg(long)]
+        name: Option<String>,
+    },
+}
+
+impl LspCommand {
+    /// dispatch の action（綴りの正本は `dispatch::LSP_ACTIONS`）と対象
+    fn action(&self) -> (&'static str, Option<&str>) {
+        match self {
+            Self::Status { name, .. } => ("status", name.as_deref()),
+            Self::Servers { .. } => ("list", None),
+            Self::Restart { name } => ("restart", name.as_deref()),
+            Self::Stop { name } => ("stop", name.as_deref()),
+            Self::Logs { name } => ("logs", name.as_deref()),
+        }
+    }
+
+    fn json(&self) -> bool {
+        matches!(
+            self,
+            Self::Status { json: true, .. } | Self::Servers { json: true }
+        )
+    }
 }
 
 #[derive(Subcommand)]
@@ -7033,6 +7090,13 @@ fn build_request(command: &Command) -> Result<Request, String> {
             max_mb: args.max_mb,
         },
         Command::Scrollback(args) => Request::Scrollback { lines: args.lines },
+        Command::Lsp(sub) => {
+            let (action, name) = sub.action();
+            Request::LspServer {
+                action: action.to_string(),
+                name: name.map(str::to_string),
+            }
+        }
         Command::Links(args) => {
             // `--text -` は標準入力から読む（画面の写しをパイプで流せる形）
             let text = match args.text.as_deref() {
@@ -9242,6 +9306,61 @@ fn delivery_line(result: &Value) -> Option<String> {
     Some(line)
 }
 
+/// `tako lsp` の表示（#1678）。中身の正本は dispatch の応答で、ここは体裁だけ
+fn print_lsp(sub: &LspCommand, result: &Value) {
+    if sub.json() || !matches!(sub, LspCommand::Status { .. } | LspCommand::Servers { .. }) {
+        println!("{}", pretty_json(result));
+        return;
+    }
+    let text = |v: &Value| v.as_str().unwrap_or("").to_string();
+    if result["enabled"] == Value::Bool(false) {
+        println!("{}", text(&result["reason"]));
+        return;
+    }
+    let servers = result["servers"].as_array().cloned().unwrap_or_default();
+    if servers.is_empty() {
+        if let Some(note) = result["note"].as_str() {
+            println!("{note}");
+        }
+        return;
+    }
+    for server in &servers {
+        if matches!(sub, LspCommand::Servers { .. }) {
+            let installed = server["installed"].as_bool().unwrap_or(false);
+            let where_ = if installed {
+                text(&server["path"])
+            } else {
+                "-".into()
+            };
+            println!(
+                "{:<28} {:<14} {}",
+                text(&server["id"]),
+                if installed {
+                    "installed"
+                } else {
+                    "not_installed"
+                },
+                where_
+            );
+        } else {
+            println!(
+                "{:<28} {:<14} pid={} docs={} diagnostics={} {}",
+                text(&server["id"]),
+                text(&server["state"]),
+                server["pid"],
+                server["documents"],
+                server["diagnostics"],
+                text(&server["root"])
+            );
+        }
+        for key in ["reason", "next_step"] {
+            if let Some(line) = server[key].as_str() {
+                println!("  {line}");
+            }
+        }
+    }
+}
+
 fn print_result(command: &Command, result: &Value) {
     match command {
         // 新ペイン ID をそのままスクリプトで使えるよう数値のみ出力する
@@ -9295,6 +9414,7 @@ fn print_result(command: &Command, result: &Value) {
         Command::PreviewLinkList(_) => println!("{}", pretty_json(result)),
         // #1283: 検出結果はスパンまで読みたいので整形して出す
         Command::Links(_) => println!("{}", pretty_json(result)),
+        Command::Lsp(sub) => print_lsp(sub, result),
         Command::PreviewFollowLink(_) => println!("{result}"),
         // #680: コピーしたコード全文は改行込みで読みたいので整形して出す
         Command::PreviewCopyCode(_) => println!("{}", pretty_json(result)),
@@ -10112,6 +10232,27 @@ mod tests {
         assert!(build_request(&command).is_err());
         let command = parse(&["tako", "edit", "delete", "word", "--pane", "5"]);
         assert!(build_request(&command).is_err());
+        // #1678: `tako lsp <操作>` は action の綴りを dispatch の正本と共有する
+        for (argv, action, name) in [
+            (vec!["tako", "lsp", "status"], "status", None),
+            (vec!["tako", "lsp", "servers"], "list", None),
+            (
+                vec!["tako", "lsp", "restart", "--name", "x"],
+                "restart",
+                Some("x"),
+            ),
+            (vec!["tako", "lsp", "stop"], "stop", None),
+            (vec!["tako", "lsp", "logs"], "logs", None),
+        ] {
+            assert!(tako_control::dispatch::LSP_ACTIONS.contains(&action));
+            assert_eq!(
+                build_request(&parse(&argv)).unwrap(),
+                Request::LspServer {
+                    action: action.into(),
+                    name: name.map(str::to_string),
+                }
+            );
+        }
         let command = parse(&["tako", "edit", "undo", "--pane", "5"]);
         assert_eq!(
             build_request(&command).unwrap(),
@@ -10805,6 +10946,8 @@ mod platform_matrix_parity {
         ("git branch", "tako_git_branch_create"),
         ("git resolve", "tako_git_resolve_agent"),
         ("list", "tako_list_panes"),
+        // #1678: CLI は `tako lsp <操作>`、MCP は action 引数を持つ 1 ツール
+        ("lsp", "tako_lsp_server"),
         ("open-in dir", "tako_open_dir"),
         ("open-in remote", "tako_open_remote"),
         // #919: CLI は `tako remote-folder <操作>`、MCP は action 引数を持つ 1 ツール

@@ -800,6 +800,19 @@ pub enum Request {
     },
     /// 編集バッファをファイルへ保存する。外部変更を検知した場合は上書きしない。
     PreviewSave { pane: Option<u64> },
+    /// 言語サーバ（LSP）のライフサイクル（FR-3.30 / #1678）。`action`:
+    /// - "status"（既定）: 状態・能力・文書数・診断件数（未導入なら理由 + 導入コマンド）
+    /// - "list": 検出表と解決結果（導入済み / 未導入）。実行ファイルを探すので待ちうる
+    /// - "restart": 止めて起こし直す（未導入・諦めた・止めたも対象）
+    /// - "stop": 止める（restart まで自動では起こさない）
+    /// - "logs": サーバの stderr の直近の行（診断用）
+    ///
+    /// `name` はサーバの ID（省略で全部）。言語機能（診断の描画・補完…）は各スライスが足す
+    LspServer {
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
     /// undo（#195）
     PreviewUndo { pane: Option<u64> },
     /// redo（#195）
@@ -2355,6 +2368,7 @@ pub fn changes_layout(request: &Request) -> bool {
         | Request::RemoteScrollback { .. }
         | Request::RemoteDevices { .. }
         | Request::RemoteShortcuts { .. }
+        | Request::LspServer { .. }
         // --- ペインの中身だけを触る（再描画は端末・プレビュー自身の経路が行う） ---
         | Request::Send { .. }
         | Request::Scroll { .. }

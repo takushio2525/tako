@@ -399,6 +399,9 @@ pub struct EditState {
     /// 編集中の差分再ハイライト用の行状態（#1648）。セッションと寿命が同じなので、
     /// ペインを閉じれば一緒に消える
     pub highlight: HighlightCache,
+    /// 言語サーバとのつながり（#1678）。セッションと寿命が同じなので、ペインを閉じる・
+    /// ファイルを差し替える・編集モードを抜けると `didClose` が走る（落ちた時点で閉じる）
+    pub lsp: tako_control::lsp::DocLink,
 }
 
 /// 検索バー内のフォーカス先
@@ -443,6 +446,7 @@ impl EditState {
             replace_text: String::new(),
             replace_cursor: 0,
             highlight: HighlightCache::default(),
+            lsp: tako_control::lsp::DocLink::default(),
         })
     }
 

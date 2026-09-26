@@ -20,7 +20,7 @@
 //! | `chatty` | initialized の後に通知を大量に投げる |
 //! | `ask` | initialized の後に `workspace/configuration` を問い合わせる |
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 
 fn arg_or_env(args: &[String], flag: &str, env: &str) -> Option<String> {
     args.iter()

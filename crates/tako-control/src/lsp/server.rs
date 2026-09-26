@@ -52,10 +52,13 @@ pub enum RpcError {
     Server(ResponseError),
 }
 
+/// サーバからの通知を受ける関数（method, params）
+pub type NotificationHandler = Box<dyn Fn(&str, Value) + Send + Sync>;
+
 /// reader スレッドから呼び手へ渡すもの
 pub struct Handlers {
     /// サーバからの通知（`textDocument/publishDiagnostics` 等）
-    pub on_notification: Box<dyn Fn(&str, Value) + Send + Sync>,
+    pub on_notification: NotificationHandler,
     /// stdout が閉じた（= プロセスが終わった）。1 度だけ呼ばれる
     pub on_exit: Box<dyn FnOnce() + Send>,
 }

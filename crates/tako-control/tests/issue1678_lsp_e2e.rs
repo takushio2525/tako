@@ -481,8 +481,7 @@ fn restart_は今の本文で開き直す() {
     assert!(status["generation"].as_u64().unwrap() > before);
     let reopened = received(&scratch)
         .into_iter()
-        .filter(|m| m["method"] == json!("textDocument/didOpen"))
-        .last()
+        .rfind(|m| m["method"] == json!("textDocument/didOpen"))
         .unwrap();
     assert_eq!(
         reopened["params"]["textDocument"]["text"],

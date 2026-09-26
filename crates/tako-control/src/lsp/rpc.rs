@@ -407,10 +407,7 @@ mod tests {
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].0, b);
         assert_eq!(table.len(), 1, "タイムアウトした待ちは表から消える");
-        assert_eq!(
-            table.resolve(&a).map(|(m, w)| (m, w)),
-            Some(("initialize".into(), "a"))
-        );
+        assert_eq!(table.resolve(&a), Some(("initialize".into(), "a")));
         assert!(table.resolve(&a).is_none(), "2 度目は引けない");
         assert!(table.is_empty());
         table.register("x", Duration::from_secs(1), now, "c");
