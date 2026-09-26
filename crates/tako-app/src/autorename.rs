@@ -1099,11 +1099,48 @@ TAIL
             .collect()
     }
 
+    /// 偽 claude を起こすテストを 1 本ずつにする（#1748）。**起こすテストは必ずこれを取る**
+    /// （番犬 `crates/tako-control/tests/issue1748_fake_claude_serial_watchdog.rs`）。
+    ///
+    /// macOS の std は `Stdio::piped()` のパイプを `pipe()` → `FD_CLOEXEC` の 2 手で作る
+    /// （原子的に作る `pipe2` が無い）。その隙間に**別スレッドの spawn** が来ると、子は
+    /// そのパイプを CLOEXEC 無しで受け継ぎ、exec 後も握り続ける。上限のテストの孫
+    /// （30 秒眠る）が兄弟テストの stdout の書き込み側を受け継ぐと、兄弟の読み出しは
+    /// 孫が死ぬまで EOF を見ず、[`READ_GRACE`] で [`ClaudeRun::Failed`] に落ちる
+    /// = `run_claude_with(..).is_some()` が偽。起こす瞬間が重ならなければ受け継ぎは起きない
+    #[cfg(unix)]
+    fn fake_claude_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // 兄弟が panic しても直列のまま続ける（poison で連鎖して落とさない）
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// 上限のテストの孫を止める（#1748）。孫は 30 秒眠るので、止めないとテストプロセスより
+    /// 長生きし、生まれた瞬間に受け継いだ fd（並行する別モジュールのテストのパイプ）を
+    /// 30 秒握り続ける。止める相手は偽 claude が書き残した pid だけ（名前一致で撃たない）
+    #[cfg(unix)]
+    struct StopGrandchild(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for StopGrandchild {
+        fn drop(&mut self) {
+            // 孫を起こす前に打ち切られた回は pid が無い = 止める相手も居ない
+            let pid = std::fs::read_to_string(&self.0)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok());
+            if let Some(pid) = pid {
+                let _ = tako_control::platform::process::terminate(pid, true);
+            }
+        }
+    }
+
     /// 受け入れ 2（#758）: **フラグを拒否する古い CLI でも自動命名が黙って無効化されない**。
     /// フラグ無しで 1 回だけ再試行して成功し、2 回目以降は再試行が走らない
     #[test]
     #[cfg(unix)]
     fn 古いclaudeがフラグを拒否してもフォールバックで命名できる() {
+        let _serial = fake_claude_lock();
         let dir = temp_dir_for("reject");
         let (bin, log) = write_fake_claude(&dir, "reject-strict");
         let state = AtomicU8::new(StrictMcp::Unknown as u8);
@@ -1146,6 +1183,7 @@ TAIL
     #[test]
     #[cfg(unix)]
     fn フラグが通るclaudeでは再試行せず付けたままになる() {
+        let _serial = fake_claude_lock();
         let dir = temp_dir_for("accept");
         let (bin, log) = write_fake_claude(&dir, "accept");
         let state = AtomicU8::new(StrictMcp::Unknown as u8);
@@ -1183,6 +1221,7 @@ TAIL
     #[test]
     #[cfg(unix)]
     fn どちらでも失敗するなら従来どおりヒューリスティックへ落ちる() {
+        let _serial = fake_claude_lock();
         let dir = temp_dir_for("fail");
         let (bin, log) = write_fake_claude(&dir, "always-fail");
         let state = AtomicU8::new(StrictMcp::Unknown as u8);
@@ -1223,17 +1262,23 @@ TAIL
     #[test]
     #[cfg(unix)]
     fn 上限に当たった起動は再試行しない側になる() {
+        let _serial = fake_claude_lock();
         let dir = temp_dir_for("timeout");
         let bin = dir.join("claude");
         let log = dir.join("args.log");
+        let grandchild_pid = dir.join("grandchild.pid");
+        // 孫（`sleep 30`）が stdout を握ったまま残る形。背景で起こして pid を残すのは
+        // 後始末のため（#1748）で、`wait` で待つので偽 claude 自身は上限まで返らない
         std::fs::write(
             &bin,
             format!(
-                "#!/bin/sh\necho \"$@\" >> '{}'\ncat >/dev/null\nsleep 30\n",
-                log.display()
+                "#!/bin/sh\necho \"$@\" >> '{}'\ncat >/dev/null\nsleep 30 &\necho $! > '{}'\nwait\n",
+                log.display(),
+                grandchild_pid.display()
             ),
         )
         .expect("眠る偽 claude を書ける");
+        let grandchild = StopGrandchild(grandchild_pid);
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
@@ -1260,6 +1305,8 @@ TAIL
         let calls = arg_lines(&log);
         assert!(calls.len() <= 1, "打ち切りなのに再試行している: {calls:?}");
 
+        // pid の置き場ごと消す前に孫を止める
+        drop(grandchild);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
