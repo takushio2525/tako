@@ -1764,6 +1764,27 @@ syntect へ通していた**。release 実測（同じ構文セット・テー�
 - **ログ**: perf.log は要求の method 名・所要・結果の種別、persist.log は起動 / 終了 /
   停止の回数だけ。stderr の直近 50 行はメモリに持ち、`tako lsp logs` で求められたときだけ返す
 
+### 診断の描画（#1679。2026-09-27）
+
+- **正本は manager の URI ごとの表 1 つ**（`tako_control::lsp::diagnostics`）。publish を受けた
+  reader スレッドがその場で **サーバへ送った本文の写し**を使って tako の座標へ写す
+  （`LineIndex` で行頭を 1 回だけ数える）。波線・右パネル・`tako lsp diagnostics` /
+  MCP `tako_lsp` は全部これを読む（GUI の絵と CLI の答えが食い違う経路が無い）
+- **UI へのキュー**: 設計書 §2 / §18 の bounded 128。運ぶのは URI だけで、中身は受けた側が
+  表から読む（同じ URI が何度来ても最新を 1 回読めば済む）。満杯なら捨てて印を立て、
+  UI は印を見て全部を読み直す。受信ループは届いた分を上限まで 1 回の `update` に畳む
+  （= 1 フレームで処理する件数の上限）。`EditState::diagnostics` は表の `Arc` を共有する写しで、
+  **描画のたびにロックを取らない**
+- **波線**: `preview_code_line_sel` が `HighlightStyle.underline { wavy: true }` を積む
+  （範囲は描く文字列そのものから `diagnostic::line_spans` で切る）。gpui は波を下線の原点
+  （ベースライン + descent × 0.618）から太さの 3 倍の高さに描く。コードプレビューの行は
+  21px（端末の 17px より行間がある）なので波は行ボックスの中に収まり、#797 の
+  「行ボックス端の content mask に切られる」は起きない。行ごとの `overflow_hidden` も無い
+  （`gpui::list` の mask はリスト全体の矩形）。visual-test `preview-code` の 2 枚目が
+  振れ幅（3.0px）と最後の 1 文字の下のインクで固定する
+- **pull 型は使わない**: 申告しなければサーバは push を続ける。flycheck は push だけで、
+  pull はタイマーが要る（#772 と衝突）。判断の経緯は FR-3.29
+
 ## 編集カーソルの追従スクロール（#1649。2026-09-23）
 
 編集モードのプレビューには `ListState` へ「カーソルを見せる」スクロールの呼び出しが

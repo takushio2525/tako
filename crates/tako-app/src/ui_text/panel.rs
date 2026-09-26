@@ -613,6 +613,42 @@ pub fn tasks_load_failed(reason: &str) -> String {
     )
 }
 
+// --- diagnostics ビュー（キー: panel.diagnostics_*。#1679） ---
+
+pub fn diagnostics_title() -> &'static str {
+    tr!("診断", "Diagnostics")
+}
+pub fn diagnostics_empty() -> &'static str {
+    tr!(
+        "言語サーバにつながった文書はありません。コードを編集モードで開くと、エラーと警告がここに並びます",
+        "No document is connected to a language server. Edit a code file to see its errors and warnings here"
+    )
+}
+pub fn diagnostics_disabled() -> &'static str {
+    tr!(
+        "LSP は TAKO_1007_LEGACY=1 で止まっています",
+        "LSP is disabled by TAKO_1007_LEGACY=1"
+    )
+}
+pub fn diagnostics_clean() -> &'static str {
+    tr!("問題はありません", "No problems")
+}
+pub fn diagnostics_waiting() -> &'static str {
+    tr!(
+        "言語サーバの解析を待っています",
+        "Waiting for the language server"
+    )
+}
+pub fn diagnostics_more(n: usize) -> String {
+    tr!(
+        format!("ほか {n} 件（全件は tako lsp diagnostics）"),
+        format!("{n} more (see tako lsp diagnostics for all)")
+    )
+}
+pub fn diagnostics_pane(pane: u64) -> String {
+    tr!(format!("ペイン {pane}"), format!("pane {pane}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests_support;

@@ -27,6 +27,7 @@ mod about_window;
 mod autorename;
 mod chat_view;
 mod command_card_ui;
+mod diagnostics_panel;
 mod drawer;
 mod file_icons;
 mod filetree;
@@ -439,6 +440,8 @@ enum PanelView {
     Git,
     /// ユーザー向けタスク（#1450 の分割 B2。人がやることの一覧 + 詳細 + 返答）
     Tasks,
+    /// 言語サーバの診断（#1679）。タブは LSP につながった文書があるときだけ出す
+    Diagnostics,
 }
 
 /// プレビューヘッダから開くナビゲーションドロップダウン（Issue #232）。
@@ -4708,6 +4711,9 @@ impl TakoApp {
         if !secondary {
             app.spawn_remote_autostart(cx);
         }
+
+        // #1679: 言語サーバの診断の知らせを受けて波線・右パネルを描き直す
+        app.spawn_lsp_diagnostics_loop(cx);
 
         // IPC リクエストを UI スレッドで dispatch するループ。
         // 操作セマンティクスは tako-control::dispatch に一元化されている（設計原則 5）
@@ -12633,6 +12639,75 @@ impl TakoApp {
             let preview::EditState { buffer, lsp, .. } = edit;
             self.lsp
                 .sync(lsp, editing, buffer.path(), buffer.text(), buffer.version());
+            // #1679: つながりが外れた（編集モードを抜けた・受け持つサーバが無い）なら
+            // 診断の写しも捨てる（manager 側は `didClose` と一緒に捨てている）
+            if !matches!(edit.lsp, tako_control::lsp::DocLink::Open(_)) {
+                edit.diagnostics = None;
+            }
+        }
+    }
+
+    /// 言語サーバの診断の知らせを受けて写しを差し替えるループ（#1679）。
+    ///
+    /// manager は reader スレッドで診断を表へ入れ、URI だけを bounded のキュー
+    /// （上限 [`tako_control::lsp::DIAGNOSTICS_EVENT_CAPACITY`]）へ積む。ここは届いた分を
+    /// **その場にあるだけ**まとめて（同じ URI は 1 つに畳む）1 回の更新で反映する。
+    /// 1 回に畳む数はキューの上限まで = 1 フレームで処理する件数に上限を置く（設計書 §2）。
+    /// LSP が無効（`TAKO_1007_LEGACY=1`）なら口が無いので何もしない
+    fn spawn_lsp_diagnostics_loop(&self, cx: &mut Context<Self>) {
+        let Some(mut rx) = self.lsp.diagnostics_events() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            while let Some(first) = rx.next().await {
+                let mut uris = std::collections::HashSet::from([first]);
+                while uris.len() < tako_control::lsp::DIAGNOSTICS_EVENT_CAPACITY {
+                    match rx.try_recv() {
+                        Ok(uri) => {
+                            uris.insert(uri);
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let applied = this.update(cx, |app: &mut TakoApp, cx| {
+                    let all = app.lsp.take_events_overflow();
+                    app.apply_lsp_diagnostics(&uris, all, cx);
+                });
+                if applied.is_err() {
+                    break; // View が破棄された
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 言語サーバの診断が変わった文書の写しを差し替える（#1679）。
+    ///
+    /// `uris` は manager のキューから来た URI（同じ URI は 1 回にまとまっている）。
+    /// `all` はキューが溢れた回で、つながっている文書をすべて読み直す。
+    /// 中身は manager の表をそのまま `Arc` で共有する（描画と CLI / MCP が同じものを読む）
+    fn apply_lsp_diagnostics(
+        &mut self,
+        uris: &std::collections::HashSet<String>,
+        all: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = false;
+        for edit in self.preview_edits.values_mut() {
+            let tako_control::lsp::DocLink::Open(lease) = &edit.lsp else {
+                continue;
+            };
+            if !all && !uris.contains(lease.uri()) {
+                continue;
+            }
+            edit.diagnostics = self
+                .lsp
+                .document_diagnostics(lease.uri())
+                .map(|d| d.diagnostics);
+            changed = true;
+        }
+        if changed {
+            cx.notify();
         }
     }
 
@@ -21609,6 +21684,7 @@ impl UiStateHost for TakoApp {
             PanelView::Orch => tako_control::protocol::PanelViewWire::Orch,
             PanelView::Git => tako_control::protocol::PanelViewWire::Git,
             PanelView::Tasks => tako_control::protocol::PanelViewWire::Tasks,
+            PanelView::Diagnostics => tako_control::protocol::PanelViewWire::Diagnostics,
         };
         (self.panel_visible, self.panel_width, view)
     }
@@ -21663,6 +21739,7 @@ impl UiStateHost for TakoApp {
                 tako_control::protocol::PanelViewWire::Orch => PanelView::Orch,
                 tako_control::protocol::PanelViewWire::Git => PanelView::Git,
                 tako_control::protocol::PanelViewWire::Tasks => PanelView::Tasks,
+                tako_control::protocol::PanelViewWire::Diagnostics => PanelView::Diagnostics,
             };
         }
         // #503: パネルが非表示になったらテキスト入力フラグをクリア
@@ -22965,6 +23042,23 @@ impl SystemHost for TakoApp {
 
     fn lsp(&self) -> Option<&tako_control::lsp::LspManager> {
         Some(&self.lsp)
+    }
+
+    fn lsp_documents(&self) -> Vec<tako_control::lsp::LspDocument> {
+        let mut out: Vec<_> = self
+            .preview_edits
+            .iter()
+            .map(|(pane, edit)| {
+                tako_control::lsp::LspDocument::new(
+                    pane.as_u64(),
+                    edit.buffer.path().display().to_string(),
+                    edit.editing,
+                    &edit.lsp,
+                )
+            })
+            .collect();
+        out.sort_by_key(|d| d.pane);
+        out
     }
 
     fn persist_restore_report(&self) -> Option<String> {
@@ -35783,6 +35877,630 @@ mod self_test {
             leftovers == 0,
             "visual-test コード: close で行データが残らない (#821)",
         );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // #1679: 同じ節で「診断のある画面」を 1 枚撮る（腕と全節実行の両方がここを通る）
+        preview_code_diagnostics_visual(any, window, cx).await;
+    }
+
+    /// 診断の波線（#1679）を実ピクセルで見る。`preview-code` 節の 2 枚目。
+    ///
+    /// 偽サーバ（`tako-lsp-fake`）に固定の `Diagnostic` 配列を publish させ、**本番と同じ経路**
+    /// （編集モード → didOpen → publish → manager の表 → UI へのキュー → 写し → 描画）で出す。
+    /// 基準画像は同じ場面で診断の写しだけを外した 1 枚で、2 枚の差分が
+    ///
+    /// - 波線の帯（診断の範囲の真下）の**外に 1 ピクセルも無い**（文字・他の行が変わらない）
+    /// - 帯の中には必ずある（範囲は UTF-16 の桁から写したバイト位置。期待値はここで
+    ///   本文から独立に数える = 変換がずれれば帯の外に出て落ちる）
+    /// - 重大度 4 段の色が**実ピクセルで互いに異なる**
+    /// - 行末まで伸びる範囲は最後の 1 文字の下まで描かれ、波の縦の振れ幅が切られずに
+    ///   残っている（#797 の `overflow_hidden` の回帰。#797 は装飾が行ボックスの端の
+    ///   content mask に丸ごと切られた。切られれば振れ幅が潰れるか 0 になる）
+    ///
+    /// ことを見る。最後にペインを閉じ、保持件数の口が 0 を返すこと（#830 の機序）も見る。
+    /// A/B: `TAKO_1007_LEGACY=1` で LSP を丸ごと止めると波線が消えて FAILED になる
+    #[cfg(feature = "visual-test")]
+    async fn preview_code_diagnostics_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        use tako_core::lsp::diagnostic::Severity;
+        let wait =
+            |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+        let fake = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|d| d.to_path_buf()))
+            .map(|d| d.join(format!("tako-lsp-fake{}", std::env::consts::EXE_SUFFIX)))
+            .filter(|p| p.is_file())
+            .unwrap_or_else(|| {
+                fail(
+                    "visual-test 診断: 偽サーバが無い（cargo build -p tako-control --bin tako-lsp-fake を先に）",
+                )
+            });
+        let dir = std::env::temp_dir().join(format!("tako-visual-diag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).expect("visual-test 診断の一時ディレクトリ");
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"v\"\n").expect("Cargo.toml");
+        let lines = [
+            "fn main() {",
+            "    let 日本語 = 1;",
+            "    let err = \"s\";",
+            "    let info = 2;",
+            "    let hint = 3;",
+            "    let to_the_end = 4;",
+            "    let eol = 5",
+            "}",
+        ];
+        let source = lines.join("\n") + "\n";
+        let path = dir.join("src").join("main.rs");
+        std::fs::write(&path, &source).expect("visual-test 診断の fixture");
+        // (行, UTF-16 の始点, 終点, 重大度) → 期待する UTF-8 バイトの範囲はここで独立に数える
+        let utf16 =
+            |line: usize, byte: usize| -> usize { lines[line][..byte].encode_utf16().count() };
+        struct Expect {
+            line: usize,
+            bytes: std::ops::Range<usize>,
+            severity: Severity,
+            past_end: bool,
+        }
+        let find = |line: usize, needle: &str| {
+            let at = lines[line].find(needle).expect("fixture に在る");
+            at..at + needle.len()
+        };
+        let expects = [
+            // 多バイト（UTF-16 で 3 桁 / UTF-8 で 9 バイト）
+            Expect {
+                line: 1,
+                bytes: find(1, "日本語"),
+                severity: Severity::Warning,
+                past_end: false,
+            },
+            Expect {
+                line: 2,
+                bytes: find(2, "\"s\""),
+                severity: Severity::Error,
+                past_end: false,
+            },
+            Expect {
+                line: 3,
+                bytes: find(3, "info"),
+                severity: Severity::Information,
+                past_end: false,
+            },
+            Expect {
+                line: 4,
+                bytes: find(4, "hint"),
+                severity: Severity::Hint,
+                past_end: false,
+            },
+            // 行の右端まで（終点は桁 999 = 行末を超える → 行末へ丸める）
+            Expect {
+                line: 5,
+                bytes: 4..lines[5].len(),
+                severity: Severity::Error,
+                past_end: false,
+            },
+            // 行末の幅 0（「ここに ; が要る」型）→ 行末の外の 1 文字ぶん
+            Expect {
+                line: 6,
+                bytes: lines[6].len()..lines[6].len() + 1,
+                severity: Severity::Error,
+                past_end: true,
+            },
+        ];
+        let lsp_severity = |s: Severity| s.rank() + 1;
+        let published: Vec<serde_json::Value> = expects
+            .iter()
+            .map(|e| {
+                let start = utf16(e.line, e.bytes.start.min(lines[e.line].len()));
+                let end = if e.past_end {
+                    start
+                } else if e.line == 5 {
+                    999
+                } else {
+                    utf16(e.line, e.bytes.end)
+                };
+                serde_json::json!({
+                    "range": {
+                        "start": {"line": e.line, "character": start},
+                        "end": {"line": e.line, "character": end},
+                    },
+                    "severity": lsp_severity(e.severity),
+                    "message": format!("visual {}", e.severity.slug()),
+                })
+            })
+            .collect();
+        let fixture = dir.join("diagnostics.json");
+        std::fs::write(&fixture, serde_json::Value::Array(published).to_string())
+            .expect("diagnostics.json");
+        // 受け持つサーバの差し替え口（`TAKO_LSP_BIN_<ID>`）は検出表から引く（名前を書かない）
+        let spec = tako_core::lsp::servers::resolve_in(tako_core::lsp::servers::SERVERS, &path)
+            .expect("fixture の拡張子を受け持つサーバが表に在る")
+            .spec;
+        let override_env = tako_core::lsp::servers::override_env_name(spec.id);
+        std::env::set_var(&override_env, &fake);
+        std::env::set_var("TAKO_LSP_FAKE_DIAGNOSTICS", &fixture);
+
+        let pane = window
+            .update(cx, |app, _, cx| {
+                let base = app.focused_pane().as_u64();
+                let opened = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::OpenFile {
+                        pane: Some(base),
+                        path: path.display().to_string(),
+                        mode: Some(tako_control::protocol::PreviewModeWire::Code),
+                        direction: Some(tako_control::protocol::Direction::Right),
+                        focus: Some(true),
+                        new_tab: false,
+                        line: None,
+                        column: None,
+                    },
+                    PaneOrigin::Cli,
+                )
+                .expect("visual-test 診断を dispatch で開ける");
+                let pane = opened["pane"].as_u64().expect("OpenFile 応答の pane");
+                tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::PreviewEdit {
+                        pane: Some(pane),
+                        enabled: Some(true),
+                    },
+                    PaneOrigin::Cli,
+                )
+                .expect("visual-test 診断: 編集モードへ入れる");
+                cx.notify();
+                PaneId::from_raw(pane)
+            })
+            .unwrap_or_else(|_| fail("visual-test 診断 dispatch"));
+        // 知らせが UI へ届くまで（LEGACY では届かない = 下のピクセル検査で落ちる）
+        let mut arrived = 0;
+        for _ in 0..300 {
+            notify_and_draw(any, window, cx);
+            arrived = window
+                .update(cx, |app, _, _| {
+                    app.preview_edits
+                        .get(&pane)
+                        .and_then(|e| e.diagnostics.as_ref())
+                        .map_or(0, |d| d.items.len())
+                })
+                .unwrap_or(0);
+            if arrived == expects.len() {
+                break;
+            }
+            wait(cx, 50).await;
+        }
+        check(
+            wait_for_preview_maps(any, window, cx, pane, false).await,
+            "visual-test 診断: 座標キャッシュが揃う",
+        );
+        let Some((with_waves, scale)) = capture_frame(any, cx) else {
+            fail("visual-test 診断: フレーム採取")
+        };
+        // 基準画像: 同じ場面から診断の写しだけを外す
+        let saved = window
+            .update(cx, |app, _, cx| {
+                let saved = app
+                    .preview_edits
+                    .get_mut(&pane)
+                    .and_then(|e| e.diagnostics.take());
+                cx.notify();
+                saved
+            })
+            .ok()
+            .flatten();
+        let Some((reference, _)) = capture_frame(any, cx) else {
+            fail("visual-test 診断: 基準フレーム採取")
+        };
+        let _ = window.update(cx, |app, _, cx| {
+            if let Some(edit) = app.preview_edits.get_mut(&pane) {
+                edit.diagnostics = saved;
+            }
+            cx.notify();
+        });
+
+        // 帯（論理座標）: 範囲の x × 行の下半分〜行ボックスの 4px 下
+        struct Band {
+            all: Bounds<Pixels>,
+            last_glyph: Bounds<Pixels>,
+            /// 行ボックスの下端（論理 px）
+            line_bottom: Pixels,
+        }
+        let (bands, viewport, line_rows) = window
+            .update(cx, |app, _, _| {
+                let layouts = app
+                    .preview_text_layouts
+                    .get(&pane)
+                    .cloned()
+                    .unwrap_or_default();
+                let bands: Vec<Option<Band>> = expects
+                    .iter()
+                    .map(|e| {
+                        let layout = layouts.get(e.line)?.as_ref()?;
+                        let x0 = layout.position_for_index(e.bytes.start)?;
+                        // 行末の外（幅 0 の診断）は描き手が空白を 1 つ足したときだけ位置が在る。
+                        // 波線が無い（LEGACY 等）ときも帯は組めるように 1 文字ぶんで見積もる
+                        let cell = if lines[e.line].is_empty() {
+                            px(8.0)
+                        } else {
+                            (layout.position_for_index(lines[e.line].len())?.x
+                                - layout.position_for_index(0)?.x)
+                                / lines[e.line].chars().count() as f32
+                        };
+                        let x1 = layout
+                            .position_for_index(e.bytes.end)
+                            .unwrap_or(point(x0.x + cell, x0.y));
+                        let last = layout
+                            .position_for_index(
+                                lines[e.line][..e.bytes.end.min(lines[e.line].len())]
+                                    .char_indices()
+                                    .last()
+                                    .map_or(e.bytes.start, |(i, _)| i),
+                            )
+                            .unwrap_or(x0);
+                        let lh = layout.line_height();
+                        let top = x0.y;
+                        let rect = |l: Pixels, r: Pixels, t: Pixels, b: Pixels| Bounds {
+                            origin: point(l, t),
+                            size: gpui::size(r - l, b - t),
+                        };
+                        Some(Band {
+                            all: rect(
+                                x0.x - px(1.0),
+                                x1.x + px(1.0),
+                                top + lh * 0.5,
+                                top + lh + px(4.0),
+                            ),
+                            last_glyph: rect(last.x, x1.x, top + lh * 0.5, top + lh + px(4.0)),
+                            line_bottom: top + lh,
+                        })
+                    })
+                    .collect();
+                let rows: Vec<String> = expects
+                    .iter()
+                    .map(|e| {
+                        layouts
+                            .get(e.line)
+                            .and_then(Option::as_ref)
+                            .map(|l| format!("{:.1}", f32::from(l.bounds().top())))
+                            .unwrap_or_else(|| "-".into())
+                    })
+                    .collect();
+                (bands, app.preview_viewport_bounds(pane), rows)
+            })
+            .unwrap_or_else(|_| fail("visual-test 診断: 帯の幾何"));
+        let bands: Vec<Band> = bands
+            .into_iter()
+            .map(|b| b.unwrap_or_else(|| fail("visual-test 診断: 診断のある行が描かれていない")))
+            .collect();
+        let viewport = viewport.unwrap_or_else(|| fail("visual-test 診断: ビューポート矩形"));
+
+        // 論理矩形 → 画像のピクセル（Metal の読み戻しは上下の向きがありうるので
+        // 波線が実際に見つかる側を採る = #812 の作法）
+        let (width, height) = with_waves.dimensions();
+        let to_px = |b: &Bounds<Pixels>, flip: bool| {
+            let l = (f32::from(b.left()) * scale).floor().max(0.0) as u32;
+            let r = ((f32::from(b.right()) * scale).ceil().max(0.0) as u32).min(width);
+            let t = (f32::from(b.top()) * scale).floor().max(0.0) as u32;
+            let bt = ((f32::from(b.bottom()) * scale).ceil().max(0.0) as u32).min(height);
+            if flip {
+                (l, r, height.saturating_sub(bt), height.saturating_sub(t))
+            } else {
+                (l, r, t.min(height), bt)
+            }
+        };
+        let changed = |rects: &[&Bounds<Pixels>], flip: bool| -> (usize, [u64; 3]) {
+            let mut seen = std::collections::HashSet::new();
+            let mut sum = [0u64; 3];
+            for b in rects {
+                let (l, r, t, bt) = to_px(b, flip);
+                for y in t..bt {
+                    for x in l..r {
+                        let a = with_waves.get_pixel(x, y);
+                        if a != reference.get_pixel(x, y) && seen.insert((x, y)) {
+                            for (c, s) in sum.iter_mut().enumerate() {
+                                *s += u64::from(a.0[c]);
+                            }
+                        }
+                    }
+                }
+            }
+            (seen.len(), sum)
+        };
+        // 差分の縦の広がり（画像の行。論理 px へ戻して返す）
+        let changed_rows = |b: &Bounds<Pixels>, flip: bool| -> Option<(f32, f32)> {
+            let (l, r, t, bt) = to_px(b, flip);
+            let rows: Vec<u32> = (t..bt)
+                .filter(|&y| {
+                    (l..r).any(|x| with_waves.get_pixel(x, y) != reference.get_pixel(x, y))
+                })
+                .collect();
+            let (first, last) = (*rows.first()?, *rows.last()?);
+            let logical = |y: u32| {
+                let y = if flip { height - 1 - y } else { y };
+                y as f32 / scale
+            };
+            let (a, b) = (logical(first), logical(last));
+            Some((a.min(b), a.max(b) + 1.0 / scale))
+        };
+        let all_bands: Vec<&Bounds<Pixels>> = bands.iter().map(|b| &b.all).collect();
+        let flip = changed(&all_bands, true).0 > changed(&all_bands, false).0;
+        let (in_bands, _) = changed(&all_bands, flip);
+        let (in_viewport, _) = changed(&[&viewport], flip);
+        let outside = in_viewport.saturating_sub(in_bands);
+        let mut per_band = Vec::new();
+        let mut colors: Vec<(Severity, [f32; 3])> = Vec::new();
+        for (e, b) in expects.iter().zip(&bands) {
+            let (n, sum) = changed(&[&b.all], flip);
+            let avg = if n > 0 {
+                [
+                    sum[0] as f32 / n as f32,
+                    sum[1] as f32 / n as f32,
+                    sum[2] as f32 / n as f32,
+                ]
+            } else {
+                [0.0; 3]
+            };
+            let need = ((f32::from(b.all.size.width) - 2.0) * scale * 0.5).max(1.0) as usize;
+            per_band.push(format!("L{}:{}={n}/{need}", e.line + 1, e.severity.slug()));
+            check(
+                n >= need,
+                &format!(
+                    "visual-test 診断: {} 行目の{}の波線が描かれていない（{n} < {need} px）",
+                    e.line + 1,
+                    e.severity.slug()
+                ),
+            );
+            if !colors.iter().any(|(s, _)| *s == e.severity) {
+                colors.push((e.severity, avg));
+            }
+        }
+        let eol = &bands[4];
+        let (last_glyph, _) = changed(&[&eol.last_glyph], flip);
+        // 波の縦の振れ幅（gpui は太さの 3 倍の高さに波を描く）。切られれば潰れる
+        let wave_rows = changed_rows(&eol.all, flip);
+        let wave_extent = wave_rows.map_or(0.0, |(a, b)| b - a);
+        let need_extent = 2.0 * crate::preview_render::DIAGNOSTIC_UNDERLINE_THICKNESS;
+        let distance = |a: [f32; 3], b: [f32; 3]| {
+            ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+        };
+        let mut closest = f32::MAX;
+        for (i, (_, a)) in colors.iter().enumerate() {
+            for (_, b) in &colors[i + 1..] {
+                closest = closest.min(distance(*a, *b));
+            }
+        }
+        let color_text = colors
+            .iter()
+            .map(|(s, c)| format!("{}=({:.0},{:.0},{:.0})", s.slug(), c[0], c[1], c[2]))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!(
+            "TAKO_VISUAL_PIXEL: preview-code diagnostics arrived={arrived} flip={flip} \
+             bands=[{}] rows=[{}] outside={outside} eol_last_glyph={last_glyph} \
+             eol_wave_rows={} eol_line_bottom={:.1} wave_extent={wave_extent:.1}/{need_extent:.1} \
+             colors=[{color_text}] closest={closest:.1} scale={scale}",
+            per_band.join(" "),
+            line_rows.join(","),
+            wave_rows.map_or("-".into(), |(a, b)| format!("{a:.1}..{b:.1}")),
+            f32::from(eol.line_bottom),
+        );
+        if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+            let dump = std::path::Path::new(&dump);
+            let _ = std::fs::create_dir_all(dump);
+            let _ = with_waves.save(dump.join("preview-code-diagnostics.png"));
+            let _ = reference.save(dump.join("preview-code-diagnostics-reference.png"));
+            println!("TAKO_VISUAL_DUMP: {}", dump.display());
+        }
+        check(
+            outside == 0,
+            &format!("visual-test 診断: 基準画像との差分が波線の帯の外にある（{outside} px）"),
+        );
+        check(
+            colors.len() == 4 && closest >= 24.0,
+            &format!("visual-test 診断: 重大度 4 段の色が実ピクセルで区別できない（最も近い 2 色の距離 {closest:.1}）"),
+        );
+        check(
+            last_glyph > 0,
+            "visual-test 診断: 行の右端まで伸びる範囲の最後の 1 文字の下に波線が無い（#797）",
+        );
+        check(
+            wave_extent >= need_extent,
+            &format!(
+                "visual-test 診断: 行末まで伸びる波の振れ幅が切られている（{wave_extent:.1} < {need_extent:.1} px。#797 の overflow_hidden）"
+            ),
+        );
+
+        // 右パネルの diagnostics ビュー: 同じ写しから 1 件 1 行で並ぶ
+        let _ = window.update(cx, |app, _, cx| {
+            let _ = tako_control::dispatch(
+                app,
+                tako_control::protocol::Request::Panel {
+                    visible: Some(true),
+                    width: None,
+                    view: Some(tako_control::protocol::PanelViewWire::Diagnostics),
+                    filetree: None,
+                    sidebar_width: None,
+                    show_hidden: None,
+                },
+                PaneOrigin::Cli,
+            );
+            cx.notify();
+        });
+        let mut rows = 0;
+        for _ in 0..40 {
+            notify_and_draw(any, window, cx);
+            wait(cx, 50).await;
+            rows = window
+                .update(cx, |app, _, _| {
+                    let probes = app.panel_click_probe_bounds.borrow();
+                    (0..expects.len())
+                        .filter(|i| probes.contains_key(&format!("diag-row-{}-{i}", pane.as_u64())))
+                        .count()
+                })
+                .unwrap_or(0);
+            if rows == expects.len() {
+                break;
+            }
+        }
+        // CLI / MCP と同じ 1 実装（dispatch）の答え。位置は行 1 始まり・桁 0 始まりのバイト
+        let listed = window
+            .update(cx, |app, _, _| {
+                tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::LspDiagnostics {
+                        pane: Some(pane.as_u64()),
+                        severity: None,
+                    },
+                    PaneOrigin::Cli,
+                )
+                .ok()
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let listed_ranges: Vec<(u64, u64, u64)> = listed["documents"][0]["diagnostics"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|d| {
+                (
+                    d["range"]["start"]["line"].as_u64().unwrap_or(0),
+                    d["range"]["start"]["column"].as_u64().unwrap_or(0),
+                    d["range"]["end"]["column"].as_u64().unwrap_or(0),
+                )
+            })
+            .collect();
+        let expected_ranges: Vec<(u64, u64, u64)> = expects
+            .iter()
+            .map(|e| {
+                let end = if e.past_end {
+                    e.bytes.start
+                } else {
+                    e.bytes.end
+                };
+                (e.line as u64 + 1, e.bytes.start as u64, end as u64)
+            })
+            .collect();
+        if let Some((frame, _)) = capture_frame(any, cx) {
+            if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                let _ = frame
+                    .save(std::path::Path::new(&dump).join("preview-code-diagnostics-panel.png"));
+            }
+        }
+        println!(
+            "TAKO_VISUAL_PIXEL: preview-code diagnostics panel_rows={rows} listed={listed_ranges:?}"
+        );
+        check(
+            rows == expects.len(),
+            "visual-test 診断: 右パネルの diagnostics ビューに 1 件 1 行で並ばない",
+        );
+        // 行を押すと、そのペインへフォーカスが移って診断の範囲が選ばれる
+        // （`tako edit cursor` と同じ要求を dispatch で通す。実 OS マウスと同じ入力経路で押す）
+        let (row_center, base) = window
+            .update(cx, |app, _, _| {
+                let base = app
+                    .workspace
+                    .active_tab()
+                    .tree()
+                    .panes()
+                    .into_iter()
+                    .map(|p| p.id())
+                    .find(|p| *p != pane);
+                if let Some(base) = base {
+                    let _ = app.workspace.active_tab_mut().tree_mut().focus(base);
+                }
+                let center = app
+                    .panel_click_probe_bounds
+                    .borrow()
+                    .get(&format!("diag-row-{}-1", pane.as_u64()))
+                    .map(|b| b.center());
+                (center, base)
+            })
+            .unwrap_or((None, None));
+        let row_center =
+            row_center.unwrap_or_else(|| fail("visual-test 診断: 右パネルの 2 行目の矩形が無い"));
+        click_at(any, cx, row_center);
+        notify_and_draw(any, window, cx);
+        let (focused, picked) = window
+            .update(cx, |app, _, _| {
+                let picked = app.preview_edits.get(&pane).map(|e| {
+                    let head = e.buffer.line_byte_col(e.buffer.cursor());
+                    let anchor = e
+                        .buffer
+                        .line_byte_col(e.buffer.anchor().unwrap_or(e.buffer.cursor()));
+                    let (a, b) = if anchor <= head {
+                        (anchor, head)
+                    } else {
+                        (head, anchor)
+                    };
+                    (a, b)
+                });
+                (app.focused_pane(), picked)
+            })
+            .unwrap_or((PaneId::from_raw(0), None));
+        let want = (
+            (expects[1].line, expects[1].bytes.start),
+            (expects[1].line, expects[1].bytes.end),
+        );
+        println!(
+            "TAKO_VISUAL_PIXEL: preview-code diagnostics click base={:?} focused={} picked={picked:?} want={want:?}",
+            base.map(PaneId::as_u64),
+            focused.as_u64(),
+        );
+        check(
+            base.is_some() && focused == pane && picked == Some(want),
+            "visual-test 診断: 右パネルの行を押してもその位置へ移らない",
+        );
+        check(
+            listed_ranges == expected_ranges,
+            "visual-test 診断: tako lsp diagnostics の位置が本文から数えた位置と一致しない",
+        );
+
+        // 閉じたら保持 0（#830）
+        let _ = window.update(cx, |app, _, cx| {
+            let _ = tako_control::dispatch(
+                app,
+                tako_control::protocol::Request::Close {
+                    pane: Some(pane.as_u64()),
+                    force: true,
+                    caller_role: None,
+                },
+                PaneOrigin::Cli,
+            );
+            let _ = tako_control::dispatch(
+                app,
+                tako_control::protocol::Request::Panel {
+                    visible: Some(false),
+                    width: None,
+                    view: Some(tako_control::protocol::PanelViewWire::Fleet),
+                    filetree: None,
+                    sidebar_width: None,
+                    show_hidden: None,
+                },
+                PaneOrigin::Cli,
+            );
+            cx.notify();
+        });
+        let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
+        let (retained, edits_left) = window
+            .update(cx, |app, _, _| {
+                (
+                    app.lsp.diagnostics_retained(),
+                    app.preview_edits.contains_key(&pane),
+                )
+            })
+            .unwrap_or(((9, 9), true));
+        println!(
+            "TAKO_VISUAL_PIXEL: preview-code diagnostics closed retained={retained:?} edit_left={edits_left}"
+        );
+        check(
+            retained == (0, 0) && !edits_left,
+            "visual-test 診断: ペインを閉じても診断が保持されたまま (#830)",
+        );
+        std::env::remove_var(&override_env);
+        std::env::remove_var("TAKO_LSP_FAKE_DIAGNOSTICS");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

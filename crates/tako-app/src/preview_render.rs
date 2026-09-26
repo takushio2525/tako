@@ -8,6 +8,24 @@ use tako_core::PaneId;
 
 use super::*;
 
+/// 診断の波線の太さ（論理 px。gpui は波の高さをこの 3 倍で描く）
+pub(crate) const DIAGNOSTIC_UNDERLINE_THICKNESS: f32 = 1.0;
+
+/// 診断の重大度の色（#1679）。波線と右パネルの印が同じ 1 つを読む。
+/// エラー = 赤・警告 = 黄・情報 = 青（accent）・ヒント = 控えめ（Zed / VS Code と同じ並び）
+pub(crate) fn diagnostic_color(
+    theme: &tako_core::Theme,
+    severity: tako_core::lsp::diagnostic::Severity,
+) -> tako_core::Rgb {
+    use tako_core::lsp::diagnostic::Severity;
+    match severity {
+        Severity::Error => theme.red,
+        Severity::Warning => theme.yellow,
+        Severity::Information => theme.accent,
+        Severity::Hint => theme.text_muted,
+    }
+}
+
 /// ライブ更新中の印（#1579）。`●`（U+25CF）のグリフではなく**図形プリミティブの丸**で
 /// 描く（フォント次第で大きさ・太さが揺れる形を UI に残さない）。語（`LIVE`）は
 /// そのまま文字で出すので、印が読めなくても意味は落ちない
@@ -3950,6 +3968,12 @@ impl TakoApp {
                 ))
             })
             .unwrap_or_default();
+        // #1679: 言語サーバの診断（編集中だけ。写しは知らせのたびに差し替わる）
+        let diagnostics = edit
+            .filter(|e| e.editing)
+            .and_then(|e| e.diagnostics.as_ref())
+            .filter(|d| !d.items.is_empty())
+            .map(|d| (&*d.items, ix));
         // #821: レイアウトの控えは **paint 時**に入れる。仮想リストは高さの見積もりで
         // item を `layout_as_root` するだけのことがあり、その `TextLayout` は
         // prepaint を通っていないので `bounds()` / `index_for_position()` が
@@ -3960,6 +3984,7 @@ impl TakoApp {
             Some((ix + 1, number_width)),
             (sel_range, cursor_col),
             &hit_ranges,
+            diagnostics,
             Some((cx.entity().downgrade(), pane_id, ix)),
             cx,
         );
@@ -4095,12 +4120,14 @@ impl TakoApp {
     /// その行の枠へレイアウトを控える（#821）。キャレット用の canvas に相乗りするので
     /// 要素は増えない。prepaint を通っていないレイアウトを外へ出さないための仕組みで、
     /// 出すと `bounds()` の unwrap でプロセスごと落ちる
+    #[allow(clippy::too_many_arguments)]
     fn preview_code_line_sel(
         &self,
         line: &preview::Line,
         number: Option<(usize, usize)>,
         interaction: (Option<(usize, usize)>, Option<usize>),
         search_hit_ranges: &[(usize, usize, bool)],
+        diagnostics: Option<(&[tako_core::lsp::diagnostic::Diagnostic], usize)>,
         record: Option<(gpui::WeakEntity<Self>, PaneId, usize)>,
         _cx: &mut Context<Self>,
     ) -> (gpui::Div, TextLayout) {
@@ -4122,8 +4149,33 @@ impl TakoApp {
                 highlights.push((start..text.len(), style));
             }
         }
+        // #1679: 診断の範囲は**描く文字列そのもの**から切る（行の本文とバイト位置がずれない）
+        let line_len = text.len();
+        let diagnostic_spans = diagnostics
+            .map(|(items, ix)| tako_core::lsp::diagnostic::line_spans(items, ix, &text))
+            .unwrap_or_default();
         if text.is_empty() {
             text.push(' ');
+        }
+        // 行末・空行を指す幅 0 の診断は、行末の外の 1 文字ぶん（空白）の下へ引く
+        if text.len() == line_len && diagnostic_spans.iter().any(|d| d.past_end) {
+            text.push(' ');
+        }
+        // 波線は重大度で色を変える。並びは軽い順なので、重なったら重い色が勝つ
+        // （`merge_highlights` は後から積んだ装飾で上書きする）。選択・検索は背景色だけなので
+        // 同じ文字に重なっても下線は残る
+        for span in &diagnostic_spans {
+            highlights.push((
+                span.range.clone(),
+                HighlightStyle {
+                    underline: Some(gpui::UnderlineStyle {
+                        color: Some(hsla(diagnostic_color(theme, span.severity))),
+                        thickness: px(DIAGNOSTIC_UNDERLINE_THICKNESS),
+                        wavy: true,
+                    }),
+                    ..HighlightStyle::default()
+                },
+            ));
         }
         // 検索ヒットハイライト（選択より先に追加し、選択が上に重なるようにする）
         for &(start, end, is_current) in search_hit_ranges {
