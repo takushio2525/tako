@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-09-26（#1749: PWA の e2e がホームへ書かないようにし、モックの版をビルドの版から取るようにした）
-- 一時 HOME の実測で `npm run e2e` だけでホームへ PNG 80 枚（`~/Desktop/tako-28{4,5}-evidence/` 16 枚・`~/dev/tako-evidence/<番号>/` 64 枚）。スクショは `e2e/support.js` の `evidencePath()`（既定 = outputDir）へ、モックの版は vite と同じ `workspace-version.js` の `TAKO_VERSION` へ寄せた（旧 0.8.12 等で「表示が古い」バナーが写っていた）
-- 実測: 109 passed・一時 HOME 配下 0 件（初回 / 2 回連続 / スクショ spec 単独）・番犬 `issue1749_pwa_e2e_output_watchdog` の注入 4 通りが file:line 名指しで FAILED → 戻して緑
-
 ## 2026-09-26（#1506: setup --review のプランの問いの既定を前回値にし、Enter で倍率が退行しないようにした）
 - `--review` は前回値を引き継がない経路なので `prompt_plan` へ前回値が届かず、既定が「不明」固定 = Enter・非 TTY の EOF だけで `max-5x` → `max`（GPT / Google も `unknown` へ）。問いを `plan_question`（表示と「番号 → 値」の 1 か所）へ寄せ、既定は**標準 setup が前回値から選ぶ値と同じ規則**で引く（Max 検出時は max 系だけ・選択肢に無い値は値そのものを既定に見せる）。範囲外の番号は答えなかった扱い（旧は選択肢数を問わず 1〜7 を受け、Max の問いで `4` を打つと `max`）
 - 実測: `scripts/test-setup-plan-keep-previous-1506.sh` **45 PASS 0 FAIL**（修正前ビルドでは `--review` 系の 11 項目だけ FAIL・`--yes` / MCP と同じ起動 / 初回は修正前から緑）・単体 5 本（15 通りで「Enter の結果 = 標準 setup」を照合）・注入 3 通りすべて file:line で FAILED → 戻して緑・pty-answer を共有する 1499 / 1501 / 1504 / 1509 全緑・workspace 5541 passed 0 failed・clippy 3 宇宙 0
@@ -64,3 +60,7 @@
 - publish を受けた時点で「サーバへ送った本文の写し」で tako の座標へ写し（`LineIndex`）、manager の URI 別の表 1 つを波線・右パネル・CLI / MCP `tako_lsp` が読む。UI へは bounded 128 のキュー（溢れたら全部読み直す印）。pull 型は申告しない（flycheck は push だけ・pull はタイマーが要る = #772）。閉じた / サーバが止まったら捨てる
 - 右パネルの diagnostics タブは LSP の文書があるときだけ（常設すると #1479 の段で既定 320px のラベルが全員ぶん落ちる）。5 本 + 3 桁バッジが 220px で 0.5px 溢れるぶんは `IconsTight` を梯子の最後に足した（4 本は不変）
 - 実測: visual-test `preview-code` の 2 枚目で基準との差分は帯の外 0 px・4 色の最小距離 61.8・行末の波の振れ幅 3.0px・右パネル 6 行・閉じたら保持 0、`TAKO_1007_LEGACY=1` で FAILED。`scripts/test-lsp-diagnostics-1679.sh` 16 PASS（実 rust-analyzer の E0308 まで）・e2e 6 本（LEGACY で 5 本 FAILED）
+
+## 2026-09-27（#1662: `--wait` に上限を持たせ、auto_close を GUI の終了検知で効かせ、CLI / MCP の run も走らせる前に保存するようにした）
+- `--wait` は `probe::poll_with_timeout` の 1 実装（既定 600 秒・env `TAKO_RUN_WAIT_TIMEOUT_SECS`・0 は既定）で、超えたら「まだ実行中」+ exit 1。閉じるのは `dispatch::auto_close_run_pane` の 1 本（GUI の出力のたび / 2 秒ごと / `RunInteractiveStatus`）で、閉じた結末は `Workspace::closed_runs` に控える。保存は dispatch `Run` の `save_previews_before_run` の 1 本へ寄せ、再生ボタンの自前保存を外した
+- 実測: `scripts/test-run-wait-save-1662.sh` **32 PASS 0 FAIL**（修正前のバイナリは 14 PASS 18 FAIL = 上限 3 秒でも 15 秒の締め切りまで返らない / `--wait` 無しで閉じない / CLI・MCP とも古い内容が走る）・注入 4 通りすべて file:line 名指しで FAILED → 戻して緑

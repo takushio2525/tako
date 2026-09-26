@@ -37,6 +37,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::PaneId;
+
 /// 側路ファイルを置くディレクトリ名（`<data_dir>/<この名前>/`）
 const DIR: &str = "run-exit";
 
@@ -174,6 +176,71 @@ impl InteractiveMeta {
         }
         self.status = RunStatus::Exited(code);
         true
+    }
+
+    /// auto_close の方針どおりなら閉じるべきか（#1662。**判定はこの 1 本**）。
+    ///
+    /// 終わっていない（`Running`）ものは閉じない。`success` は 0 のときだけ、
+    /// `always` は終了コードによらず、`never` と不明な綴りは閉じない
+    pub fn wants_close(&self) -> bool {
+        let Some(code) = self.status.exit_code() else {
+            return false;
+        };
+        match self.auto_close.as_str() {
+            "always" => true,
+            "success" => code == 0,
+            _ => false,
+        }
+    }
+}
+
+/// auto_close で閉じた実行ペインの結末（#1662）。
+///
+/// GUI が終わりを検知して閉じると、あとから `tako run --wait` /
+/// `tako_run_interactive_status` が聞きに来たときには**ペインがもう無い**。
+/// ペインと一緒に結末まで消すと「成功したので閉じた」が「そんなペインは無い」に
+/// 化けるので、閉じる側がここへ控えを残す
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosedRun {
+    pub pane: PaneId,
+    pub exit_code: i32,
+    /// ユーザーのコマンド（包む前）
+    pub command: String,
+}
+
+/// 閉じた実行ペインの控えを残す上限（古いものから捨てる）。
+///
+/// 控えを読むのは「閉じた直後に結末を聞きに来る」呼び手だけなので、
+/// 同時に `--wait` で待たれる実行ペインの数を十分に上回れば足りる
+pub const CLOSED_RUNS_CAP: usize = 64;
+
+/// 閉じた実行ペインの控え（[`crate::Workspace`] が持つ。layout.json には保存しない）
+#[derive(Debug, Default)]
+pub struct ClosedRuns {
+    entries: std::collections::VecDeque<ClosedRun>,
+}
+
+impl ClosedRuns {
+    /// 控えを残す。同じペインの古い控えは置き換え、上限を超えたら古いものから捨てる
+    pub fn record(&mut self, run: ClosedRun) {
+        self.entries.retain(|r| r.pane != run.pane);
+        self.entries.push_back(run);
+        while self.entries.len() > CLOSED_RUNS_CAP {
+            self.entries.pop_front();
+        }
+    }
+
+    /// そのペインの控え（無ければ `None`）
+    pub fn get(&self, pane: PaneId) -> Option<&ClosedRun> {
+        self.entries.iter().find(|r| r.pane == pane)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -327,5 +394,55 @@ mod tests {
         assert_eq!(meta.status().outcome(), Some(RunOutcome::Failed));
         assert_eq!(RunStatus::Exited(0).outcome(), Some(RunOutcome::Succeeded));
         assert_eq!(RunStatus::Running.outcome(), None);
+    }
+
+    #[test]
+    fn auto_closeの判定は方針と終了コードで決まる() {
+        let decide = |policy: &str, code: Option<i32>| {
+            let mut meta = InteractiveMeta::new(policy.into(), "x".into(), None);
+            if let Some(code) = code {
+                meta.settle(code);
+            }
+            meta.wants_close()
+        };
+        // 終わっていないものはどの方針でも閉じない
+        for policy in ["success", "always", "never"] {
+            assert!(!decide(policy, None), "{policy}: 実行中に閉じた");
+        }
+        assert!(decide("success", Some(0)));
+        assert!(!decide("success", Some(1)), "失敗を success で閉じた");
+        assert!(!decide("success", Some(-1)));
+        assert!(decide("always", Some(0)));
+        assert!(decide("always", Some(3)));
+        assert!(!decide("never", Some(0)));
+        assert!(!decide("謎の綴り", Some(0)), "不明な方針で閉じた");
+    }
+
+    #[test]
+    fn 閉じた実行の控えは上限つきで同じペインは置き換える() {
+        let mut runs = ClosedRuns::default();
+        let run = |id: u64, code: i32| ClosedRun {
+            pane: PaneId::from_raw(id),
+            exit_code: code,
+            command: format!("cmd-{id}"),
+        };
+        runs.record(run(1, 0));
+        runs.record(run(1, 2));
+        assert_eq!(runs.len(), 1, "同じペインの控えが 2 件になった");
+        assert_eq!(runs.get(PaneId::from_raw(1)).map(|r| r.exit_code), Some(2));
+        for id in 2..(CLOSED_RUNS_CAP as u64 + 10) {
+            runs.record(run(id, 0));
+        }
+        assert_eq!(runs.len(), CLOSED_RUNS_CAP);
+        assert!(
+            runs.get(PaneId::from_raw(1)).is_none(),
+            "古いものから捨てていない"
+        );
+        let newest = CLOSED_RUNS_CAP as u64 + 9;
+        assert_eq!(
+            runs.get(PaneId::from_raw(newest))
+                .map(|r| r.command.as_str()),
+            Some(format!("cmd-{newest}").as_str())
+        );
     }
 }

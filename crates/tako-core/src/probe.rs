@@ -55,6 +55,15 @@
 //!
 //! `TAKO_1503_LEGACY=1` で上限を持たない #1503 前の待ちへ戻る（= 固まる）。
 //! ゲートは [`legacy_unbounded`] の 1 か所だけ。
+//!
+//! ## 子プロセスでない相手を待つとき（Issue #1662）
+//!
+//! `tako run --wait` / `tako run-interactive --wait` は、実行ペインの終わりを IPC で
+//! **2 秒ごとに聞き直す**形で待つ（相手は子プロセスではない）。ここも上限が無く、
+//! サーバーや入力待ちを `--wait` で走らせると CLI が永久に返らなかった。
+//! 聞き直しの上限は [`poll_with_timeout`] の 1 実装で、既定は
+//! [`DEFAULT_RUN_WAIT_TIMEOUT`]（env [`RUN_WAIT_TIMEOUT_ENV`]。扱いは probe と同じで
+//! 0 / 不正 / 空は既定へ落ちる = 外せない）
 
 use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -77,6 +86,19 @@ pub const PROBE_TIMEOUT_ENV: &str = "TAKO_SETUP_PROBE_TIMEOUT_SECS";
 
 /// `tako setup` 本体の上限の上書き（秒）。扱いは [`PROBE_TIMEOUT_ENV`] と同じ
 pub const SETUP_RUN_TIMEOUT_ENV: &str = "TAKO_SETUP_RUN_TIMEOUT_SECS";
+
+/// `tako run --wait` / `tako run-interactive --wait` が実行ペインの終わりを待つ
+/// 既定の上限（#1662）。
+///
+/// 根拠（実測）: Code Runner で走らせる正当な実行でいちばん重いのは「冷えたビルド」で、
+/// このリポジトリの新しい worktree で `cargo build -p tako-cli -p tako-app` が
+/// **128.8 秒**だった。600 秒はその約 4.7 倍で、`--wait` を叩く主な呼び手
+/// （AI エージェントのシェル実行ツール。Claude Code の Bash ツールは最長 600 秒）の
+/// 上限とも揃う（それより長く待っても、呼び手のほうが先に打ち切られる）
+pub const DEFAULT_RUN_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// `--wait` の上限の上書き（秒）。扱いは [`PROBE_TIMEOUT_ENV`] と同じ（**0 は既定へ**）
+pub const RUN_WAIT_TIMEOUT_ENV: &str = "TAKO_RUN_WAIT_TIMEOUT_SECS";
 
 /// 打ち切りを知らせる 1 行の頭。CLI が出し、dispatch が拾う（**文面は 1 実装**）
 const NOTICE_HEAD: &str = "[確認できません] ";
@@ -224,6 +246,66 @@ pub fn setup_run_timeout() -> Duration {
         std::env::var(SETUP_RUN_TIMEOUT_ENV).ok().as_deref(),
         DEFAULT_SETUP_RUN_TIMEOUT,
     )
+}
+
+/// `--wait` の上限（env で上書き可。外すことはできない。#1662）
+pub fn run_wait_timeout() -> Duration {
+    parse_timeout_secs(
+        std::env::var(RUN_WAIT_TIMEOUT_ENV).ok().as_deref(),
+        DEFAULT_RUN_WAIT_TIMEOUT,
+    )
+}
+
+/// 上限つきの聞き直し（[`poll_with_timeout`]）の結末
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Polled<T> {
+    /// 上限内（上限ちょうどを含む）に答えが出た
+    Done(T),
+    /// 上限まで聞き直しても答えが出なかった。`waited` は実際に待った長さ
+    TimedOut { waited: Duration },
+}
+
+/// 状態を**上限つきで**聞き直す 1 実装（#1662）。
+///
+/// `step` が `Some` を返したら [`Polled::Done`]、`Err` はそのまま返す。
+/// 間隔の眠りは**残り時間で頭打ち**にするので上限を `interval` ぶん踏み越えず、
+/// 上限に達した回も**打ち切る前に 1 回は聞く**ので、上限ちょうどに終わったものを
+/// 取りこぼさない（どちらも `poll_with_clock` の単体テストが時計を差し替えて固定する）
+pub fn poll_with_timeout<T, E>(
+    budget: Duration,
+    interval: Duration,
+    step: impl FnMut() -> Result<Option<T>, E>,
+) -> Result<Polled<T>, E> {
+    let start = Instant::now();
+    poll_with_clock(
+        budget,
+        interval,
+        step,
+        || start.elapsed(),
+        std::thread::sleep,
+    )
+}
+
+/// [`poll_with_timeout`] の本体（時計と眠りを差し替えられる形）
+fn poll_with_clock<T, E>(
+    budget: Duration,
+    interval: Duration,
+    mut step: impl FnMut() -> Result<Option<T>, E>,
+    mut elapsed: impl FnMut() -> Duration,
+    mut sleep: impl FnMut(Duration),
+) -> Result<Polled<T>, E> {
+    // 間隔 0 で空回りしない（呼び手の取り違えで CPU を 1 本食い潰さない）
+    let interval = interval.max(POLL);
+    loop {
+        if let Some(value) = step()? {
+            return Ok(Polled::Done(value));
+        }
+        let now = elapsed();
+        if now >= budget {
+            return Ok(Polled::TimedOut { waited: now });
+        }
+        sleep(interval.min(budget - now));
+    }
 }
 
 /// env 値の解釈（純粋関数）。**0 / 不正 / 空はすべて既定**へ落とす。
@@ -558,5 +640,91 @@ mod tests {
             DEFAULT_SETUP_RUN_TIMEOUT > DEFAULT_PROBE_TIMEOUT,
             "導入器が走る setup 本体のほうが長い"
         );
+    }
+
+    /// 差し替えた時計で [`poll_with_clock`] を回す（**実時間は使わない**）。
+    /// `done_at` 以降の聞き直しで答えが出る。戻りは (結末, 聞いた時刻の列, 眠った長さの列)
+    fn fake_poll(
+        budget: Duration,
+        interval: Duration,
+        done_at: Option<Duration>,
+    ) -> (Polled<Duration>, Vec<Duration>, Vec<Duration>) {
+        use std::cell::{Cell, RefCell};
+        let now = Cell::new(Duration::ZERO);
+        let asked = RefCell::new(Vec::new());
+        let slept = RefCell::new(Vec::new());
+        let outcome = poll_with_clock::<_, ()>(
+            budget,
+            interval,
+            || {
+                asked.borrow_mut().push(now.get());
+                Ok(done_at.filter(|at| now.get() >= *at).map(|_| now.get()))
+            },
+            || now.get(),
+            |d| {
+                // 上限の判定を外す回帰は**固まらずに落とす**（無限に聞き直すのを回数で止める）
+                assert!(
+                    slept.borrow().len() < 10_000,
+                    "上限で打ち切らずに聞き直し続けている（#1662 の症状）"
+                );
+                slept.borrow_mut().push(d);
+                now.set(now.get() + d);
+            },
+        )
+        .unwrap();
+        (outcome, asked.into_inner(), slept.into_inner())
+    }
+
+    #[test]
+    fn 聞き直しは上限で打ち切られ上限を踏み越えない() {
+        let s = Duration::from_secs;
+        let (outcome, asked, slept) = fake_poll(s(5), s(2), None);
+        assert_eq!(outcome, Polled::TimedOut { waited: s(5) });
+        // 眠りは残り時間で頭打ち（2 + 2 + 1 = 5。2 + 2 + 2 = 6 へ踏み越えない）
+        assert_eq!(slept, vec![s(2), s(2), s(1)]);
+        // 上限に達した回も打ち切る前に 1 回は聞く
+        assert_eq!(asked, vec![s(0), s(2), s(4), s(5)]);
+    }
+
+    #[test]
+    fn 上限ちょうどに終わったものは取りこぼさない() {
+        let s = Duration::from_secs;
+        let (outcome, asked, _) = fake_poll(s(5), s(2), Some(s(5)));
+        assert_eq!(outcome, Polled::Done(s(5)), "上限ちょうどの答えを捨てた");
+        assert_eq!(asked.last(), Some(&s(5)));
+        // 上限の手前で終われば、そこで返る（上限まで待たない）
+        let (outcome, asked, _) = fake_poll(s(600), s(2), Some(s(3)));
+        assert_eq!(outcome, Polled::Done(s(4)));
+        assert_eq!(asked.len(), 3);
+        // 最初の 1 回で答えが出れば眠らない
+        let (outcome, _, slept) = fake_poll(s(600), s(2), Some(s(0)));
+        assert_eq!(outcome, Polled::Done(s(0)));
+        assert!(slept.is_empty(), "答えが出ているのに眠った");
+    }
+
+    #[test]
+    fn 聞き直しの失敗はそのまま返り間隔0でも空回りしない() {
+        let err: Result<Polled<()>, &str> = poll_with_clock(
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+            || Err("接続できない"),
+            || Duration::ZERO,
+            |_| panic!("失敗したのに眠った"),
+        );
+        assert_eq!(err, Err("接続できない"));
+        let (_, _, slept) = fake_poll(Duration::from_millis(100), Duration::ZERO, None);
+        assert!(
+            slept.iter().all(|d| *d > Duration::ZERO),
+            "間隔 0 で眠らずに回った: {slept:?}"
+        );
+    }
+
+    #[test]
+    fn waitの上限はenvで変えられ0は既定へ落ちる() {
+        let d = DEFAULT_RUN_WAIT_TIMEOUT;
+        assert_eq!(parse_timeout_secs(Some("3"), d), Duration::from_secs(3));
+        assert_eq!(parse_timeout_secs(Some("0"), d), d, "0 を無制限にしない");
+        assert_eq!(parse_timeout_secs(Some("abc"), d), d);
+        assert!(d > Duration::ZERO && d < Duration::MAX, "既定は有限");
     }
 }
