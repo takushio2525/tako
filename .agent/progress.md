@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-24（#1676: 開いた直後にその行へ着地できるようにした）
-- `OpenFile` に `line` / `column`（1 始まり）を足し、CLI `tako open --line L [--column C]` と MCP `tako_open_file`（**ツールは増やさない**）を同じ dispatch へ 1:1 で載せた。md の写像は「`line` を渡された時点で code へ倒す」（レンダリング表示は 1 item = 1 ブロックで原文の行が残らない）と決めて FR-3.27 へ明記。行を持たない種別は**開く前**にエラー、超過は末尾行へ丸めて `clamped` で知らせる
-- 着地は `ListState` が描画時に作られるので「次の描画で 1 度だけ飛ぶ」予約（`preview_pending_reveal` → `consume_pending_reveal`）。省略時は wire に現れない（`skip_serializing_if`）ので JSON は引数が生える前とバイト一致
-- 実測: セルフテスト項目 153（5,000 行 / 42・1・超過・4990）が `TAKO_APP_SELF_TEST_OK` 完走・A/B `TAKO_1676_LEGACY=1` で 153a が FAILED（応答は同じ値なので画面まで見ないと差が出ない）・`scripts/test-open-line-1676.sh` **26 PASS 0 FAIL**（CLI と MCP の応答が字面一致）・注入 3 通り（写像 / 丸め / skip_serializing_if）すべて FAILED → 戻して緑・workspace 5345 passed 0 failed・clippy 3 宇宙 0
-
 ## 2026-09-23（#1645: rebase で復活した作業ログのエントリを番犬で止めた）
 - `context-budget fix` の移送（古いエントリを**消す**）と main 側の移送が rebase で噛み合っても git は衝突を報告せず auto-merge するので、archive 済みのエントリが `progress.md` へ黙って戻る（9/23 だけで 4 回・毎回 worker の目視で発見。予算を超えなければ既存の番犬では落ちない）。判定を `tako_core::context_budget::revivals` の 1 実装として足し、`tako context-budget` / MCP の violations と新設の番犬が同じものを通る
 - 鍵は `LogEntry::archive_line()` = `fix` がアーカイブへ書くのと同じ 1 行。(日付, Issue 番号) の組は**実データで誤検出する**（アーカイブに `2026-09-14 #1450` が 3 件・`2026-07-05 #63` が 2 件）ので採らなかった
@@ -65,3 +60,7 @@
 ## 2026-09-26（#1711: MCP ツールカタログの説明文を短くし、LSP 用に 16 KiB の余白を作った）
 - `tools/list` が予算 204,800 B の残り 1.8 KB だったので、156 本中 47 本の description / 引数説明から根拠・仕組み・経緯・重複（`clear_*` 13 本・「省略で現状維持」・schema と同じ値）を外し **188,323 B**（main 116a63a の 204,579 B から -16,256 B）。ツール名・順序・型・必須は機械照合で不変、外した原文は `.agent/mcp-catalog-notes.md`
 - 実測: 隔離 GUI + `tako mcp serve` の tools/list と `tako context-budget` が一致・violations 0・workspace 5463 passed 0 failed・clippy 3 宇宙 0。初回は面の名前が読めず「メイン画面へ開いた」警告が出たが、uuid 照合で窓は tako-vd 上だった（#1697 の症状）
+
+## 2026-09-26（#1726: Code Runner の実行設定と Python の実行環境の設計書を出した）
+- `.agent/plans/2026-09-runner-settings.md`: 棚卸し（file:line）/ `run-configs.json` 新設（ローカル区分）/ 実行環境は ID で保存し実行時に解く / 自動選択 uv → `.venv` → poetry → pipenv → conda → pyenv → システム / env は境界 B1 でコマンドへ埋める / MCP は既存 2 本へ足す
+- スライス S0〜S7（#1728〜#1735）と判断待ち J1〜J5（全部推奨どおりで確定）。着地順は #1656 → S2 → #1657 → #1662 → S3〜S6
