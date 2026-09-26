@@ -365,6 +365,12 @@ backspace / delete / 左右 / Home / End / 挿入をする同じコードにな�
 - 番犬は `crates/tako-control/tests/issue1450b2_tasks_panel_watchdog.rs`。
   `tasks_panel.rs` / `right_panel.rs` に `floor_char_boundary` / `.drain(` / `char_indices()`
   が現れたら `file:line` で名指しする（**猶予表は空** = 走査は全面適用）
+- **打鍵を握る入力欄を足したら IME の宛先（`AppTextInput`）にも載せる**（#561 / #1725 / #1750。
+  同じ型が 3 回起きた）。載せないと英数モードでは動いて見えるのに、かなモードでは GPUI が印字キーを
+  IME へ先に渡すので**変換だけがターミナルへ流れる**（目視では気づけない）。`app_text_input` の
+  優先順位は `handle_key` と同じ順、打鍵・⌘V・IME の確定・unmark の 4 経路は 1 つの挿入関数、
+  閉じる出口は `discard_app_text_ime` でその欄宛ての変換を捨てる。番犬は
+  `issue1725_tree_inline_input_watchdog`（ツリー）/ `issue1750_palette_web_ime_watchdog`（パレット・Web の 2 欄）
 
 ## UI に絵文字を使わない・印は描画プリミティブで描く（Issue #217 / #1536 / #1579）
 

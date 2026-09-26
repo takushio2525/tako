@@ -1258,6 +1258,15 @@ enum AppTextInput {
     /// ここが宛先に無かったので、かなモードの打鍵（GPUI は IME へ先に渡す）の変換が
     /// 隣のターミナルペインに束縛され、下線も候補窓もターミナルに出ていた
     TreeName,
+    /// ⌘K コマンドパレットの検索欄（#1750）。#1725 と同じ型で宛先に無く、変換も確定も
+    /// unmark もターミナルへ流れていた（パレットの裏の git のコミット欄が握る変種もあった）
+    Palette,
+    /// Web ビューペインのアドレスバー（#337 / #1750）。同じ型でターミナルへ流れ、
+    /// Web ペインにフォーカスがあると確定した文字がどこにも入らず消えていた
+    WebAddress,
+    /// Web dock の URL 欄（#207 / #1750）。確定だけは欄に入る一方、下線・候補窓は
+    /// ターミナルに出て、未確定のまま確定（unmark）した文字列はターミナルの PTY へ流れていた
+    WebDockUrl,
 }
 
 /// IME 変換中（未確定文字列 = marked text）の状態（FR-1.9）。
@@ -1998,6 +2007,12 @@ struct TakoApp {
     /// インライン入力欄そのものの実描画矩形（#1725。`tree_row_probe` のときだけ採る。
     /// 項目 154 が「変換中のキャレットが入力欄の内側に居る」を見る）
     tree_inline_input_rect: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
+    /// ⌘K パレット・Web ビューのアドレスバー・Web dock の URL 欄の実描画矩形（#1750。
+    /// 項目 155 が合成マウスで押す位置と「変換中のキャレットが入力欄の内側に居る」の正）。
+    /// **`input_rect_probe` が立っているフレームだけ**採る。id ごとに上書きする
+    /// （ペイン本体は `AnyView::cached` なので、毎フレーム空にすると描き直さないフレームで消える）
+    input_rects: PathLinkItemRects,
+    input_rect_probe: bool,
     /// ファイルツリーのインライン編集
     inline_edit: Option<InlineEdit>,
     /// D&D 中のペイロード種別（FR-2.16.10 / FR-3.11）。on_drag 開始でセット、
@@ -2281,14 +2296,14 @@ struct TakoApp {
     webview_marks: std::collections::HashSet<webview::WebViewId>,
     /// Web ビュー dock パネルの開閉（ステータスバーの Web ボタン）
     webview_dock_open: bool,
-    /// Web ビュー dock の URL 入力欄（#207）
-    webview_dock_url_input: String,
-    /// URL 入力欄のカーソル位置（バイト）
-    webview_dock_url_cursor: usize,
+    /// Web ビュー dock の URL 入力欄（#207）。編集はコミット欄・ブランチ欄・返答欄と同じ
+    /// `TextField` の 1 実装を通す（#1750。手書きのカーソル演算を持たない）
+    webview_dock_url: crate::text_field::TextField,
     /// URL 入力欄がフォーカスされているか（dock は開いていてもターミナルへ入力できる）
     webview_dock_url_focused: bool,
-    /// Web ビューペインのアドレスバー編集状態（#337。pane_id → (入力文字列, カーソル位置)）
-    webview_address_bar: HashMap<u64, (String, usize)>,
+    /// Web ビューペインのアドレスバー編集状態（#337。pane_id → 入力中の URL とキャレット。
+    /// #1750 で `TextField` へ寄せた）
+    webview_address_bar: HashMap<u64, crate::text_field::TextField>,
     /// アドレスバー編集中の pane_id（同時に 1 つのみ）
     webview_address_bar_active: Option<PaneId>,
     /// wry の親にする GPUI ウィンドウの生ハンドル（初回 render で採取）
@@ -3957,6 +3972,8 @@ impl TakoApp {
             tree_row_rects: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             tree_row_probe: false,
             tree_inline_input_rect: std::rc::Rc::new(std::cell::Cell::new(None)),
+            input_rects: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            input_rect_probe: false,
             inline_edit: None,
             sidebar_width: {
                 // #789: ここではまだウィンドウが無いので上限は課さない（下限だけ）。
@@ -4138,8 +4155,7 @@ impl TakoApp {
             webview_next_id: 1,
             webview_marks: std::collections::HashSet::new(),
             webview_dock_open: false,
-            webview_dock_url_input: String::new(),
-            webview_dock_url_cursor: 0,
+            webview_dock_url: crate::text_field::TextField::default(),
             webview_dock_url_focused: false,
             webview_address_bar: HashMap::new(),
             webview_address_bar_active: None,
@@ -8550,10 +8566,9 @@ impl TakoApp {
         // #1450 B2: 返答コメント欄も同じ経路で落とす（IME の宛先を 1 つに保つ）
         self.user_tasks.comment_focused = false;
         self.git_agent_menu_open = false;
-        self.webview_dock_url_focused = false;
-        if let Some(pane_id) = self.webview_address_bar_active.take() {
-            self.webview_address_bar.remove(&pane_id.as_u64());
-        }
+        // #1750: Web の 2 つの URL 欄は閉じる出口を通す（その欄宛ての変換も捨てる）
+        self.blur_web_dock_url();
+        self.close_web_address_bar();
         // #1481: GPUI のフラグだけでは足りない。Web ビューはネイティブビュー
         // （macOS = WKWebView）なので、ページをクリックすると **AppKit の**
         // キー入力の宛先（NSWindow の first responder）がそちらへ移る。
@@ -10671,13 +10686,13 @@ impl TakoApp {
         };
         match keystroke.key.as_str() {
             "escape" => {
-                self.command_palette = None;
+                self.close_command_palette();
             }
             "enter" => {
                 let query = palette.query.clone();
                 let selected = palette.selected;
                 let items = self.palette_items(&query);
-                self.command_palette = None;
+                self.close_command_palette();
                 if let Some(item) = items.into_iter().nth(selected) {
                     self.palette_execute(item, cx);
                 }
@@ -10692,12 +10707,17 @@ impl TakoApp {
                 palette.query.pop();
                 palette.selected = 0;
             }
-            _ => {
-                if let Some(ch) = keystroke.key_char.as_deref() {
-                    if !ch.chars().any(|c| c.is_control()) {
-                        palette.query.push_str(ch);
-                        palette.selected = 0;
+            key => {
+                // 打鍵も ⌘V・IME の確定・unmark と同じ挿入関数を通す（#1750）
+                match keystroke.key_char.as_deref() {
+                    Some(ch) if !ch.is_empty() => {
+                        self.insert_app_text_input(AppTextInput::Palette, ch, cx)
                     }
+                    // 空白は key_char が来ないことがある（#487 と同じ実機の観測）
+                    _ if key == "space" => {
+                        self.insert_app_text_input(AppTextInput::Palette, " ", cx)
+                    }
+                    _ => {}
                 }
             }
         }
@@ -13579,10 +13599,9 @@ impl TakoApp {
         };
         // handle_key と同じ優先順位で入力先を振り分ける（#414）。
         // on_action 経由で直接呼ばれるため handle_key のチェーンを迂回する
-        if let Some(palette) = self.command_palette.as_mut() {
-            palette.query.push_str(&text);
-            palette.selected = 0;
-            cx.notify();
+        // #1750: パレット・Web の 2 欄も打鍵・IME の確定・unmark と同じ挿入関数を通す
+        if self.command_palette.is_some() {
+            self.insert_app_text_input(AppTextInput::Palette, &text, cx);
             return;
         }
         // #1725: 打鍵・IME の確定・unmark と同じ挿入関数を通す（経路ごとに挿入を書かない）
@@ -13590,20 +13609,12 @@ impl TakoApp {
             self.insert_app_text_input(AppTextInput::TreeName, &text, cx);
             return;
         }
-        if let Some(pane_id) = self.webview_address_bar_active {
-            let key = pane_id.as_u64();
-            if let Some((input, cursor)) = self.webview_address_bar.get_mut(&key) {
-                input.insert_str(*cursor, &text);
-                *cursor += text.len();
-            }
-            cx.notify();
+        if self.web_address_bar_editing().is_some() {
+            self.insert_app_text_input(AppTextInput::WebAddress, &text, cx);
             return;
         }
-        if self.webview_dock_url_focused {
-            self.webview_dock_url_input
-                .insert_str(self.webview_dock_url_cursor, &text);
-            self.webview_dock_url_cursor += text.len();
-            cx.notify();
+        if self.web_dock_url_active() {
+            self.insert_app_text_input(AppTextInput::WebDockUrl, &text, cx);
             return;
         }
         // #496: ブランチ名入力が優先（コミット欄と同時にフォーカスされることはない）
@@ -13763,13 +13774,21 @@ impl TakoApp {
             return;
         }
 
-        if self.webview_address_bar_active.is_some()
+        // #1750: 見えていない Web の URL 欄（編集中のペインが閉じられた / 別タブへ移った・
+        // dock が閉じた）は打鍵を奪わない。ここで畳んでから下のチェーン（ターミナル）へ流す
+        if self.webview_address_bar_active.is_some() && self.web_address_bar_editing().is_none() {
+            self.close_web_address_bar();
+        }
+        if self.webview_dock_url_focused && !self.web_dock_url_active() {
+            self.blur_web_dock_url();
+        }
+        if self.web_address_bar_editing().is_some()
             && self.handle_webview_address_bar_key(keystroke, cx)
         {
             cx.stop_propagation();
             return;
         }
-        if self.webview_dock_url_focused && self.handle_webview_dock_url_key(keystroke, cx) {
+        if self.web_dock_url_active() && self.handle_webview_dock_url_key(keystroke, cx) {
             cx.stop_propagation();
             return;
         }
@@ -14025,11 +14044,17 @@ impl TakoApp {
 
     /// いま IME の変換対象になるアプリ内テキスト入力（#561）。
     ///
-    /// 振り分けの優先順位は `handle_key`（打鍵の振り分け）と合わせる: ファイルツリーの
-    /// インライン入力が最優先（#1725。打鍵を全部握る入力欄なので、変換も同じ宛先へ束縛
-    /// しないと、かなモードの 1 打鍵目から変換がターミナルに出る）。
-    /// Web dock の URL 欄が有効な間は従来経路（ペイン束縛）のままにする
+    /// 振り分けの優先順位は `handle_key`（打鍵の振り分け）と合わせる。打鍵を握る入力欄は
+    /// 変換も同じ宛先へ束縛しないと、かなモードの 1 打鍵目から変換がターミナルに出る
+    /// （GPUI はかなモードの印字キーを IME へ先に渡す = #1725 / #1750 の機序）:
+    /// ⌘K パレット（開いている間は全キーを消費するモーダル）→ ファイルツリーのインライン入力
+    /// → git のブランチ名 / コミット欄 → 返答コメント欄 → Web のアドレスバー → dock の URL 欄
     fn app_text_input(&self) -> Option<AppTextInput> {
+        // A/B（`TAKO_1750_LEGACY=1`）は修正前 = パレット・Web の 2 欄をペイン束縛へ戻す
+        let legacy_1750 = Self::legacy_1750();
+        if self.command_palette.is_some() && !legacy_1750 {
+            return Some(AppTextInput::Palette);
+        }
         if self.inline_edit_visible() {
             // A/B（`TAKO_1725_LEGACY=1`）は修正前 = ペイン束縛へ戻す
             if Self::legacy_1725() {
@@ -14037,7 +14062,7 @@ impl TakoApp {
             }
             return Some(AppTextInput::TreeName);
         }
-        if self.webview_dock_url_focused {
+        if legacy_1750 && self.webview_dock_url_focused {
             return None;
         }
         // #719: チャット入力欄は宛先にしない。IME はターミナルペイン宛ての
@@ -14057,6 +14082,16 @@ impl TakoApp {
         {
             return Some(AppTextInput::TaskComment);
         }
+        if legacy_1750 {
+            return None;
+        }
+        // #1750: Web の 2 つの URL 欄も「見えているときだけ」（打鍵の振り分けと同じ判定）
+        if self.web_address_bar_editing().is_some() {
+            return Some(AppTextInput::WebAddress);
+        }
+        if self.web_dock_url_active() {
+            return Some(AppTextInput::WebDockUrl);
+        }
         None
     }
 
@@ -14071,7 +14106,147 @@ impl TakoApp {
             AppTextInput::GitBranch => self.git_branch_input_insert(text, cx),
             AppTextInput::TaskComment => self.task_comment_insert(text, cx),
             AppTextInput::TreeName => self.tree_name_insert(text, cx),
+            AppTextInput::Palette => self.palette_insert(text, cx),
+            AppTextInput::WebAddress => self.web_address_insert(text, cx),
+            AppTextInput::WebDockUrl => self.web_dock_url_insert(text, cx),
         }
+    }
+
+    /// その入力欄宛ての変換を捨てる（#1750。閉じる出口が呼ぶ）。
+    ///
+    /// 閉じた入力欄を宛先に持ったままだと、続く確定がどこにも入らない / 次の変換の
+    /// 宛先がずれる（#1725 の `close_inline_edit` と同じ理由）
+    fn discard_app_text_ime(&mut self, target: AppTextInput) {
+        if self
+            .ime
+            .as_ref()
+            .is_some_and(|ime| ime.app_input == Some(target))
+        {
+            self.ime = None;
+        }
+    }
+
+    /// ⌘K パレットの検索語へ文字列を入れる（#1750。**挿入はここ 1 本**）。
+    ///
+    /// 打鍵（`handle_palette_key`）・⌘V（`paste`）・IME の確定（`replace_text_in_range`）・
+    /// 未確定のまま確定（`unmark_text`）の 4 経路がすべて
+    /// `insert_app_text_input(AppTextInput::Palette, …)` からここへ来る。
+    /// 検索語は 1 行なので制御文字（改行・タブ）は落とす
+    fn palette_insert(&mut self, text: &str, cx: &mut Context<Self>) {
+        if let Some(palette) = self.command_palette.as_mut() {
+            let filtered: String = text.chars().filter(|c| !c.is_control()).collect();
+            if !filtered.is_empty() {
+                palette.query.push_str(&filtered);
+                palette.selected = 0;
+            }
+        }
+        cx.notify();
+    }
+
+    /// ⌘K パレットを閉じる（#1750。**閉じる出口はここ 1 本**。パレット宛ての変換も捨てる）
+    pub(crate) fn close_command_palette(&mut self) {
+        self.command_palette = None;
+        self.discard_app_text_ime(AppTextInput::Palette);
+    }
+
+    /// Web ビューのアドレスバーが**画面に出ていて**編集中ならそのペイン（#1750）。
+    ///
+    /// 編集中のペインが閉じられた / 別タブへ移った入力欄は描かれない。そのとき打鍵や変換を
+    /// 奪い続けると「押しても何も起きない」になる（#1725 の `inline_edit_visible` と同じ規則）
+    /// ので、打鍵の振り分け（`handle_key`）と変換の宛先（`app_text_input`）はこの 1 判定を使う
+    fn web_address_bar_editing(&self) -> Option<PaneId> {
+        self.webview_address_bar_active.filter(|pane| {
+            self.workspace.active_tab().tree().contains(*pane)
+                && self.webviews.iter().any(|e| e.pane == Some(*pane))
+                && self.webview_address_bar.contains_key(&pane.as_u64())
+        })
+    }
+
+    /// Web ビューのアドレスバーの編集を始める（#1750。**開く入口はここ 1 本**）。
+    ///
+    /// 他の入力欄（git のコミット / ブランチ名・返答コメント・dock の URL）は先に畳む。
+    /// アドレスバーの押下は伝播を止めるのでルートの一括クリアが走らず、残すと git の欄が
+    /// 打鍵と変換を握ったままになる（#503 と同じ罠）
+    fn open_web_address_bar(&mut self, pane_id: PaneId) {
+        self.clear_text_input_focus();
+        let current_url = self
+            .webviews
+            .iter()
+            .find(|e| e.pane == Some(pane_id))
+            .map(|e| e.current_url())
+            .unwrap_or_default();
+        let mut field = crate::text_field::TextField::default();
+        field.set_text(current_url);
+        self.webview_address_bar.insert(pane_id.as_u64(), field);
+        self.webview_address_bar_active = Some(pane_id);
+        // アドレスバー編集中は webview を隠してキー入力を GPUI に渡す
+        if let Some(e) = self.webviews.iter_mut().find(|e| e.pane == Some(pane_id)) {
+            e.sync_frame(None);
+        }
+    }
+
+    /// Web ビューのアドレスバーの編集を終える（#1750。**閉じる出口はここ 1 本**）。
+    /// 編集していたペインと打った URL を返す。アドレスバー宛ての変換も捨てる
+    fn close_web_address_bar(&mut self) -> Option<(PaneId, String)> {
+        let pane = self.webview_address_bar_active.take()?;
+        let text = self
+            .webview_address_bar
+            .remove(&pane.as_u64())
+            .map(|field| field.text().to_string())
+            .unwrap_or_default();
+        self.discard_app_text_ime(AppTextInput::WebAddress);
+        Some((pane, text))
+    }
+
+    /// Web ビューのアドレスバーへ文字列を入れる（#1750。**挿入はここ 1 本**。4 経路は
+    /// `palette_insert` と同じ）。URL は 1 行なので制御文字は `TextField` が落とす
+    fn web_address_insert(&mut self, text: &str, cx: &mut Context<Self>) {
+        if let Some(pane) = self.web_address_bar_editing() {
+            if let Some(field) = self.webview_address_bar.get_mut(&pane.as_u64()) {
+                // 上限は設けない（修正前と同じ。長い data: URL を貼る用途がある）
+                let _fits = field.insert(text, usize::MAX, false);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Web dock の URL 欄が**画面に出ていて**打鍵・変換を受けるか（#1750）。
+    /// dock を閉じた（ページの破棄で自動的に閉じた場合を含む）のに欄のフラグだけが
+    /// 残っていても拾わない
+    fn web_dock_url_active(&self) -> bool {
+        self.webview_dock_url_focused && self.webview_dock_open
+    }
+
+    /// Web dock の URL 欄へフォーカスする（#1750。**開く入口はここ 1 本**。
+    /// 他の入力欄を先に畳む理由は `open_web_address_bar` と同じ）
+    fn focus_web_dock_url(&mut self) {
+        self.clear_text_input_focus();
+        self.webview_dock_url_focused = true;
+    }
+
+    /// Web dock の URL 欄からフォーカスを外す（#1750。**閉じる出口はここ 1 本**。
+    /// 打った URL は残す = dock を開き直せば続きから打てる。欄宛ての変換は捨てる）
+    fn blur_web_dock_url(&mut self) {
+        self.webview_dock_url_focused = false;
+        self.discard_app_text_ime(AppTextInput::WebDockUrl);
+    }
+
+    /// Web dock の URL 欄へ文字列を入れる（#1750。**挿入はここ 1 本**。4 経路は
+    /// `palette_insert` と同じ）
+    fn web_dock_url_insert(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.web_dock_url_active() {
+            // 上限は設けない（修正前と同じ）
+            let _fits = self.webview_dock_url.insert(text, usize::MAX, false);
+        }
+        cx.notify();
+    }
+
+    /// #1750 の A/B。`TAKO_1750_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
+    /// （⌘K パレット・Web のアドレスバー・dock の URL 欄を IME の宛先に入れない =
+    /// 変換がターミナルペインに束縛される）。セルフテスト項目 155 が FAILED になるのが A/B の実測
+    pub(crate) fn legacy_1750() -> bool {
+        static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *LEGACY.get_or_init(|| std::env::var("TAKO_1750_LEGACY").map(|v| v == "1") == Ok(true))
     }
 
     /// IME 未確定文字列オーバーレイのアンカーを解決する（#497）。
@@ -18134,34 +18309,85 @@ impl TakoApp {
                         &url,
                         &display_title,
                         focused,
+                        area.size.width,
                         cx,
                     )),
             )
             .child(body)
     }
 
-    /// Web ビューペインのアドレスバー（#337）。通常は URL 表示、クリックで編集モード
+    /// 入力欄の実矩形を採る何も描かない canvas（#1750。`input_rect_probe` のときだけ
+    /// `Some`。本番のフレームでは要素を増やさない）。付ける側は `.relative()` にする
+    pub(crate) fn input_rect_probe_canvas(&self, id: &'static str) -> Option<gpui::Canvas<()>> {
+        let rects = self.input_rect_probe.then(|| self.input_rects.clone())?;
+        Some(
+            canvas(
+                move |bounds, _, _| {
+                    let mut rects = rects.borrow_mut();
+                    rects.retain(|(i, _)| *i != id);
+                    rects.push((id, bounds));
+                },
+                |_, _, _, _| (),
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full(),
+        )
+    }
+
+    /// Web ビューペインのアドレスバー（#337）。通常は URL 表示、クリックで編集モード。
+    /// `pane_width` はペイン本文の幅（編集中に見せるぶんの見積もりに使う = #1750）
     fn render_webview_address_bar(
         &self,
         pane_id: PaneId,
         url: &str,
         title: &str,
         focused: bool,
+        pane_width: Pixels,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        /// アドレスバーの 1 桁の幅（px。#1750）。11px の字の半角の送り幅を広めに見積もる
+        /// （= はみ出さない側。全角は 2 桁ぶん）
+        const WEB_ADDR_CELL_PX: f32 = 6.8;
+        /// タイトルバーのうちアドレスバーの中身以外が取る幅（px。#1750）: 閉じる / 隠す 16×2 +
+        /// 戻る・進む・再読み込み + 地球アイコン 12 + 子のあいだの gap + 左右の余白 +
+        /// アドレスバーの左右 padding 4×2 + 枠 1×2。実測（幅 470px のペインで欄は 320px）より広めに取る
+        const WEB_ADDR_CHROME_PX: f32 = 160.0;
         let theme = &self.theme;
         let editing = self.webview_address_bar_active == Some(pane_id);
         if editing {
-            let (input, cursor) = self
+            let field = self
                 .webview_address_bar
                 .get(&pane_id.as_u64())
                 .cloned()
                 .unwrap_or_default();
-            let cursor = cursor.min(input.len());
-            let before = &input[..cursor];
-            let after = &input[cursor..];
+            let (before_full, after_full) = field.split_at_caret();
+            // #1750: 未確定文字列とキャレットはコミット欄・ツリーの入力欄と同じ共有部品で
+            // 入力欄の中に描く。キャレットの実矩形は変換候補窓の位置出しに使われる
+            let marked = self.text_input_marked_at(AppTextInput::WebAddress, theme, 11.0);
+            // 編集は現在の URL が入った状態で始まるので、長い URL の末尾で打つと
+            // キャレットと変換中の読みが欄の外へ押し出される（見えない・候補窓が欄の外に出る）。
+            // ツリーの入力欄と同じ 1 実装で、キャレット側を残して `…` で詰める（#1725 / #1750）
+            let marked_text: String = self
+                .ime
+                .as_ref()
+                .filter(|ime| ime.app_input == Some(AppTextInput::WebAddress))
+                .map(|ime| ime.text.clone())
+                .unwrap_or_default();
+            let cells = ((f32::from(pane_width) - WEB_ADDR_CHROME_PX) / WEB_ADDR_CELL_PX)
+                .floor()
+                .max(4.0) as usize;
+            let (before, after) =
+                crate::sidebar::inline_input_window(before_full, &marked_text, after_full, cells);
+            let caret = self
+                .text_input_caret(AppTextInput::WebAddress, theme)
+                .h(px(14.0));
             div()
                 .id(("web-addr-bar", pane_id.as_u64()))
+                .when_some(self.input_rect_probe_canvas("web-addr-bar"), |d, c| {
+                    d.relative().child(c)
+                })
                 .flex_1()
                 .flex()
                 .flex_row()
@@ -18179,15 +18405,10 @@ impl TakoApp {
                     MouseButton::Left,
                     cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
                 )
-                .child(SharedString::from(before.to_string()))
-                .child(
-                    div()
-                        .w(px(1.5))
-                        .h(px(14.0))
-                        .flex_none()
-                        .bg(hsla(theme.accent)),
-                )
-                .child(SharedString::from(after.to_string()))
+                .child(SharedString::from(before))
+                .children(marked)
+                .child(caret)
+                .child(SharedString::from(after))
         } else {
             let display = if title.is_empty() || title == url {
                 truncate(url, 60)
@@ -18196,6 +18417,9 @@ impl TakoApp {
             };
             div()
                 .id(("web-addr-bar", pane_id.as_u64()))
+                .when_some(self.input_rect_probe_canvas("web-addr-bar"), |d, c| {
+                    d.relative().child(c)
+                })
                 .flex_1()
                 .flex()
                 .flex_row()
@@ -18216,21 +18440,7 @@ impl TakoApp {
                     MouseButton::Left,
                     cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                         cx.stop_propagation();
-                        let current_url = this
-                            .webviews
-                            .iter()
-                            .find(|e| e.pane == Some(pane_id))
-                            .map(|e| e.current_url())
-                            .unwrap_or_default();
-                        let len = current_url.len();
-                        this.webview_address_bar
-                            .insert(pane_id.as_u64(), (current_url, len));
-                        this.webview_address_bar_active = Some(pane_id);
-                        // アドレスバー編集中は webview を隠してキー入力を GPUI に渡す
-                        if let Some(e) = this.webviews.iter_mut().find(|e| e.pane == Some(pane_id))
-                        {
-                            e.sync_frame(None);
-                        }
+                        this.open_web_address_bar(pane_id);
                         cx.notify();
                     }),
                 )
@@ -18453,20 +18663,21 @@ impl TakoApp {
         cx.notify();
     }
 
-    /// アドレスバーのキー処理（#337）。編集中のみ呼ばれる
+    /// アドレスバーのキー処理（#337）。編集中のみ呼ばれる。
+    ///
+    /// この欄だけの割り当て（Enter = 移動 / Esc = 取り消し）を先に見て、編集操作は
+    /// `TextField` へ委ねる（#1750。手書きのカーソル演算を持たない）。挿入は
+    /// ⌘V・IME の確定・unmark と同じ `web_address_insert` の 1 関数を通す
     fn handle_webview_address_bar_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) -> bool {
-        let Some(pane_id) = self.webview_address_bar_active else {
+        let Some(pane_id) = self.web_address_bar_editing() else {
             return false;
         };
-        let key = pane_id.as_u64();
         match ks.key.as_str() {
             "enter" => {
                 let url = self
-                    .webview_address_bar
-                    .remove(&key)
-                    .map(|(s, _)| s)
+                    .close_web_address_bar()
+                    .map(|(_, url)| url)
                     .unwrap_or_default();
-                self.webview_address_bar_active = None;
                 let url = url.trim().to_string();
                 if !url.is_empty() {
                     let normalized = webview::normalize_url(&url);
@@ -18474,172 +18685,67 @@ impl TakoApp {
                         let _ = e.navigate(&normalized);
                     }
                 }
-                cx.notify();
-                true
             }
             "escape" => {
-                self.webview_address_bar.remove(&key);
-                self.webview_address_bar_active = None;
-                cx.notify();
-                true
+                self.close_web_address_bar();
             }
-            "backspace" => {
-                if let Some((input, cursor)) = self.webview_address_bar.get_mut(&key) {
-                    if *cursor > 0 {
-                        let prev = input[..*cursor]
-                            .char_indices()
-                            .next_back()
-                            .map(|(i, _)| i)
-                            .unwrap_or(0);
-                        input.drain(prev..*cursor);
-                        *cursor = prev;
-                    }
-                }
-                cx.notify();
-                true
-            }
-            "delete" => {
-                if let Some((input, cursor)) = self.webview_address_bar.get_mut(&key) {
-                    if *cursor < input.len() {
-                        let next = *cursor
-                            + input[*cursor..]
-                                .chars()
-                                .next()
-                                .map(|c| c.len_utf8())
-                                .unwrap_or(0);
-                        input.drain(*cursor..next);
-                    }
-                }
-                cx.notify();
-                true
-            }
-            "left" => {
-                if let Some((input, cursor)) = self.webview_address_bar.get_mut(&key) {
-                    if *cursor > 0 {
-                        *cursor = input[..*cursor]
-                            .char_indices()
-                            .next_back()
-                            .map(|(i, _)| i)
-                            .unwrap_or(0);
-                    }
-                }
-                cx.notify();
-                true
-            }
-            "right" => {
-                if let Some((input, cursor)) = self.webview_address_bar.get_mut(&key) {
-                    if *cursor < input.len() {
-                        *cursor += input[*cursor..]
-                            .chars()
-                            .next()
-                            .map(|c| c.len_utf8())
-                            .unwrap_or(0);
-                    }
-                }
-                cx.notify();
-                true
-            }
-            _ => {
-                if let Some(ch) = ks.key_char.as_deref() {
-                    if !ch.chars().any(|c| c.is_control()) {
-                        if let Some((input, cursor)) = self.webview_address_bar.get_mut(&key) {
-                            input.insert_str(*cursor, ch);
-                            *cursor += ch.len();
+            key => {
+                let edited = self
+                    .webview_address_bar
+                    .get_mut(&pane_id.as_u64())
+                    .is_some_and(|field| field.handle_edit_key(key));
+                if !edited {
+                    match ks.key_char.as_deref() {
+                        Some(ch) if !ch.is_empty() => {
+                            self.insert_app_text_input(AppTextInput::WebAddress, ch, cx)
                         }
-                        cx.notify();
-                        return true;
+                        // 空白は key_char が来ないことがある（#487 と同じ実機の観測）
+                        _ if key == "space" => {
+                            self.insert_app_text_input(AppTextInput::WebAddress, " ", cx)
+                        }
+                        _ => {}
                     }
                 }
-                true
             }
         }
+        // 修飾なしキーも含めて欄が握る（ターミナルへ漏らさない。修正前と同じ）
+        cx.notify();
+        true
     }
 
     /// Web dock URL 入力欄のキー処理（#207）。dock が開いているときだけ呼ばれる。
-    /// 入力を消費したら true を返す
+    /// 入力を消費したら true を返す。編集操作と挿入の委ね方はアドレスバーと同じ（#1750）
     fn handle_webview_dock_url_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) -> bool {
         match ks.key.as_str() {
             "enter" => {
-                let url = self.webview_dock_url_input.trim().to_string();
+                let url = self.webview_dock_url.text().trim().to_string();
                 if url.is_empty() {
                     return true;
                 }
                 self.open_webview_from_dock(&url, cx);
-                true
             }
             "escape" => {
-                self.webview_dock_url_input.clear();
-                self.webview_dock_url_cursor = 0;
-                self.webview_dock_url_focused = false;
+                self.webview_dock_url.clear();
+                self.blur_web_dock_url();
                 self.webview_dock_open = false;
-                cx.notify();
-                true
             }
-            "backspace" => {
-                if self.webview_dock_url_cursor > 0 {
-                    let prev = self.webview_dock_url_input[..self.webview_dock_url_cursor]
-                        .char_indices()
-                        .next_back()
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                    self.webview_dock_url_input
-                        .drain(prev..self.webview_dock_url_cursor);
-                    self.webview_dock_url_cursor = prev;
-                }
-                cx.notify();
-                true
-            }
-            "delete" => {
-                if self.webview_dock_url_cursor < self.webview_dock_url_input.len() {
-                    let next = self.webview_dock_url_cursor
-                        + self.webview_dock_url_input[self.webview_dock_url_cursor..]
-                            .chars()
-                            .next()
-                            .map(|c| c.len_utf8())
-                            .unwrap_or(0);
-                    self.webview_dock_url_input
-                        .drain(self.webview_dock_url_cursor..next);
-                }
-                cx.notify();
-                true
-            }
-            "left" => {
-                if self.webview_dock_url_cursor > 0 {
-                    self.webview_dock_url_cursor = self.webview_dock_url_input
-                        [..self.webview_dock_url_cursor]
-                        .char_indices()
-                        .next_back()
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                }
-                cx.notify();
-                true
-            }
-            "right" => {
-                if self.webview_dock_url_cursor < self.webview_dock_url_input.len() {
-                    self.webview_dock_url_cursor += self.webview_dock_url_input
-                        [self.webview_dock_url_cursor..]
-                        .chars()
-                        .next()
-                        .map(|c| c.len_utf8())
-                        .unwrap_or(0);
-                }
-                cx.notify();
-                true
-            }
-            _ => {
-                if let Some(ch) = ks.key_char.as_deref() {
-                    if !ch.chars().any(|c| c.is_control()) {
-                        self.webview_dock_url_input
-                            .insert_str(self.webview_dock_url_cursor, ch);
-                        self.webview_dock_url_cursor += ch.len();
-                        cx.notify();
-                        return true;
+            key => {
+                if !self.webview_dock_url.handle_edit_key(key) {
+                    match ks.key_char.as_deref() {
+                        Some(ch) if !ch.is_empty() => {
+                            self.insert_app_text_input(AppTextInput::WebDockUrl, ch, cx)
+                        }
+                        // 空白は key_char が来ないことがある（#487 と同じ実機の観測）
+                        _ if key == "space" => {
+                            self.insert_app_text_input(AppTextInput::WebDockUrl, " ", cx)
+                        }
+                        _ => {}
                     }
                 }
-                true
             }
         }
+        cx.notify();
+        true
     }
 
     /// URL を指定して Web ビューペインを開く（#207。dock UI からの共通入口）。
@@ -18649,9 +18755,8 @@ impl TakoApp {
         match self.create_webview(&normalized) {
             Ok(id) => {
                 self.webview_show_from_dock(id, cx);
-                self.webview_dock_url_input.clear();
-                self.webview_dock_url_cursor = 0;
-                self.webview_dock_url_focused = false;
+                self.webview_dock_url.clear();
+                self.blur_web_dock_url();
                 self.webview_dock_open = false;
             }
             Err(e) => {
@@ -18768,6 +18873,8 @@ impl TakoApp {
                                 }
                                 if this.webviews.is_empty() {
                                     this.webview_dock_open = false;
+                                    // 閉じた dock の URL 欄は打鍵も変換も握らない（#1750）
+                                    this.blur_web_dock_url();
                                 }
                                 cx.notify();
                             }))
@@ -18801,12 +18908,11 @@ impl TakoApp {
 
     /// Web dock URL 入力行の描画（#207 / #375）
     fn render_webview_dock_url_input(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
-        let cursor = self
-            .webview_dock_url_cursor
-            .min(self.webview_dock_url_input.len());
-        let before = &self.webview_dock_url_input[..cursor];
-        let after = &self.webview_dock_url_input[cursor..];
-        let placeholder = self.webview_dock_url_input.is_empty();
+        let (before, after) = self.webview_dock_url.split_at_caret();
+        // #1750: 未確定文字列とキャレットは共有部品で入力欄の中に描く（候補窓の位置出しに
+        // キャレットの実矩形が渡る）。変換中はプレースホルダを出さない（読みと重なる）
+        let marked = self.text_input_marked_at(AppTextInput::WebDockUrl, theme, 11.0);
+        let placeholder = self.webview_dock_url.text().is_empty() && marked.is_none();
         let focused = self.webview_dock_url_focused;
         let text_content = div()
             .flex_1()
@@ -18826,13 +18932,11 @@ impl TakoApp {
                 d.text_color(hsla(theme.foreground))
                     .child(SharedString::from(before.to_string()))
             })
+            .children(marked)
             .when(focused, |d| {
                 d.child(
-                    div()
-                        .w(px(1.5))
-                        .h(px(14.0))
-                        .flex_none()
-                        .bg(hsla(theme.accent)),
+                    self.text_input_caret(AppTextInput::WebDockUrl, theme)
+                        .h(px(14.0)),
                 )
             })
             .when(!placeholder, |d| {
@@ -18860,6 +18964,9 @@ impl TakoApp {
             .child(
                 div()
                     .id("webdock-url-input")
+                    .when_some(self.input_rect_probe_canvas("webdock-url-input"), |d, c| {
+                        d.relative().child(c)
+                    })
                     .flex_1()
                     .px(px(6.0))
                     .py(px(2.0))
@@ -18871,7 +18978,7 @@ impl TakoApp {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                            this.webview_dock_url_focused = true;
+                            this.focus_web_dock_url();
                             cx.stop_propagation();
                             cx.notify();
                         }),
@@ -18890,7 +18997,7 @@ impl TakoApp {
                     .text_size(px(11.0))
                     .text_color(hsla(theme.accent))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        let url = this.webview_dock_url_input.trim().to_string();
+                        let url = this.webview_dock_url.text().trim().to_string();
                         if !url.is_empty() {
                             this.open_webview_from_dock(&url, cx);
                         }
@@ -23285,21 +23392,21 @@ impl EntityInputHandler for TakoApp {
             cx.notify();
             return;
         }
+        // #1750: ⌘K パレットが開いている間は確定文字列をパレットへ（変換を経ない直接の
+        // insertText もここ。打鍵の振り分けと同じくパレットが最優先）
+        if self.command_palette.is_some() {
+            self.ime = None;
+            self.insert_app_text_input(AppTextInput::Palette, text, cx);
+            window.invalidate_character_coordinates();
+            cx.notify();
+            return;
+        }
         // インライン編集中は IME 確定文字列をインライン入力に振り分ける（変換を経ない
         // 直接の insertText もここ。挿入は打鍵・⌘V と同じ 1 関数を通す = #1725）
         if self.inline_edit_visible() {
             self.ime = None;
             self.insert_app_text_input(AppTextInput::TreeName, text, cx);
             window.invalidate_character_coordinates();
-            cx.notify();
-            return;
-        }
-        // Web dock URL 入力中
-        if self.webview_dock_url_focused && !text.is_empty() {
-            self.webview_dock_url_input
-                .insert_str(self.webview_dock_url_cursor, text);
-            self.webview_dock_url_cursor += text.len();
-            self.ime = None;
             cx.notify();
             return;
         }
@@ -23328,6 +23435,22 @@ impl EntityInputHandler for TakoApp {
                 self.task_comment_insert(text, cx);
             }
             self.ime = None;
+            cx.notify();
+            return;
+        }
+        // #1750: Web のアドレスバー / dock の URL 欄（変換を経ない直接の insertText もここ。
+        // 宛先は打鍵・変換と同じ判定で決め、挿入は 4 経路で共有の 1 関数を通す）
+        let web_input = if self.web_address_bar_editing().is_some() {
+            Some(AppTextInput::WebAddress)
+        } else if self.web_dock_url_active() {
+            Some(AppTextInput::WebDockUrl)
+        } else {
+            None
+        };
+        if let Some(target) = web_input {
+            self.ime = None;
+            self.insert_app_text_input(target, text, cx);
+            window.invalidate_character_coordinates();
             cx.notify();
             return;
         }
@@ -27602,6 +27725,776 @@ mod self_test {
         if fixture0.starts_with(std::env::temp_dir()) {
             let _ = std::fs::remove_dir_all(&fixture0);
         }
+    }
+
+    /// 項目 155 で入力欄へ打つ ASCII の印（ターミナルの出力 `ST1750TICK<n>` とは重ならない綴り）
+    const ST1750_LEAK_MARK: &str = "zqv";
+
+    /// 項目 155 の道具: 入力欄の実矩形（`input_rects` の id。`input_rect_probe` のフレームだけ採れる）
+    fn st1750_input_rect(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        id: &'static str,
+    ) -> Option<Bounds<Pixels>> {
+        window
+            .update(cx, |app, _, _| {
+                app.input_rects
+                    .borrow()
+                    .iter()
+                    .find(|(i, _)| *i == id)
+                    .map(|(_, b)| *b)
+            })
+            .ok()
+            .flatten()
+    }
+
+    /// 項目 155 の道具: いま開いている入力欄 1 つへ、打鍵（英数モード）・⌘V・IME
+    /// （変換開始 → 下線 → 候補窓 → 確定 → unmark）が**全部その入力欄へ**入ることを検査する（#1750）。
+    ///
+    /// `read` は入力欄の中身（閉じていれば `None`）。`check_shift` は「変換を始めると
+    /// キャレットが読みのぶん右へ動く」= 読みが入力欄の中に実際にレイアウトされた証拠を見るか
+    /// （長い URL が入ったアドレスバーは前側を `…` で詰めるのでキャレットが動かない。#1725 の
+    /// リネームと同じ事情で外す）
+    #[allow(clippy::too_many_arguments)]
+    fn st1750_input_round(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        label: &str,
+        target: AppTextInput,
+        rect_id: &'static str,
+        read: fn(&TakoApp) -> Option<String>,
+        n: usize,
+        check_shift: bool,
+    ) {
+        let legacy = TakoApp::legacy_1750();
+        // 打鍵: 開いた直後に**フレームを挟まず**打つ
+        let token = format!("{ST1750_LEAK_MARK}{n}x");
+        st1725_type(any, cx, &token);
+        let typed = window.update(cx, |app, _, _| read(app)).ok().flatten();
+        check(
+            typed.as_deref().is_some_and(|t| t.ends_with(&token)),
+            &format!("項目 155: {label}: 開いた直後の打鍵が入力欄に入らない: {typed:?} (#1750)"),
+        );
+        // ⌘V（GPUI のキー配送 → PasteClipboard → `paste()`）
+        let paste = format!("PASTE{n}");
+        let _ = window.update(cx, |_, _, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(paste.clone()))
+        });
+        press(
+            any,
+            cx,
+            if cfg!(target_os = "macos") {
+                "cmd-v"
+            } else {
+                "ctrl-v"
+            },
+        );
+        let prefix = format!("{token}{paste}");
+        let pasted = window.update(cx, |app, _, _| read(app)).ok().flatten();
+        check(
+            pasted.as_deref().is_some_and(|t| t.ends_with(&prefix)),
+            &format!("項目 155: {label}: ⌘V が入力欄に入らない: {pasted:?} (#1750)"),
+        );
+        // IME（NSTextInputClient と同じ入口）。キャレットの実矩形は描いたフレームでしか
+        // 書かれないので、前の回の値を引き継がないよう空にしてから描く
+        let _ = window.update(cx, |app, _, _| app.text_input_caret_bounds.set(None));
+        for _ in 0..3 {
+            notify_and_draw(any, window, cx);
+        }
+        let caret_before = window
+            .update(cx, |app, _, _| app.text_input_caret_bounds.get())
+            .ok()
+            .flatten();
+        let _ = window.update(cx, |app, win, cx| {
+            app.replace_and_mark_text_in_range(None, "しりょう", None, win, cx);
+        });
+        notify_and_draw(any, window, cx);
+        let caret_after = window
+            .update(cx, |app, _, _| app.text_input_caret_bounds.get())
+            .ok()
+            .flatten();
+        let caret_shift = match (caret_before, caret_after) {
+            (Some(b), Some(a)) => f32::from(a.origin.x) - f32::from(b.origin.x),
+            _ => f32::NAN,
+        };
+        let input_rect = st1750_input_rect(window, cx, rect_id);
+        let caret_inside = match (caret_after, input_rect) {
+            (Some(k), Some(r)) => {
+                r.contains(&k.origin) && k.origin.x + k.size.width <= r.origin.x + r.size.width
+            }
+            _ => false,
+        };
+        let ime = window
+            .update(cx, |app, win, cx| {
+                let bound = app.ime.as_ref().and_then(|i| i.app_input);
+                let overlay_off =
+                    app.ime_overlay_anchor(win).is_none() && !app.ime_overlay_anchored;
+                let theme = app.theme.clone();
+                let marked_inline = app.text_input_marked(target, &theme).is_some();
+                let caret = app.text_input_caret_bounds.get();
+                let cand = app.bounds_for_range(0..4, gpui::Bounds::default(), win, cx);
+                // 候補窓はキャレットの実矩形に出て、入力欄の内側に居て、修正前に出ていた
+                // 場所（フォーカスペインのカーソル位置）ではない。「ターミナルの本文矩形の外」
+                // では判定しない: パレットはペインの上に重なるオーバーレイなので、配置次第で
+                // 本文矩形がパレットの下に広がり、正しい位置でも幾何的には含まれる
+                let term_cursor = app.pane_cursor_origin_for_ime(app.focused_pane(), win);
+                let cand_ok = match (cand, caret, input_rect) {
+                    (Some(c), Some(k), Some(r)) => {
+                        c.origin == k.origin
+                            && r.contains(&c.origin)
+                            && term_cursor.is_none_or(|t| t != c.origin)
+                    }
+                    _ => false,
+                };
+                app.replace_text_in_range(None, "資料", win, cx);
+                let after_commit = read(app);
+                app.replace_and_mark_text_in_range(None, "にほんご", None, win, cx);
+                let bound2 = app.ime.as_ref().and_then(|i| i.app_input);
+                app.unmark_text(win, cx);
+                let after_unmark = read(app);
+                (
+                    bound,
+                    overlay_off,
+                    marked_inline,
+                    cand_ok,
+                    cand,
+                    after_commit,
+                    bound2,
+                    after_unmark,
+                    app.ime.is_none(),
+                )
+            })
+            .ok();
+        let Some((
+            bound,
+            overlay_off,
+            marked_inline,
+            cand_ok,
+            cand,
+            after_commit,
+            bound2,
+            after_unmark,
+            ime_done,
+        )) = ime
+        else {
+            fail(&format!("項目 155: {label}: IME の検査が走らない (#1750)"));
+        };
+        println!(
+            "TAKO_SELF_TEST_1750: {label} legacy={legacy} bound={bound:?} overlay_off={overlay_off} \
+             marked_inline={marked_inline} cand_ok={cand_ok} cand={cand:?} caret={caret_after:?} \
+             input={input_rect:?} shift={caret_shift} after_commit={after_commit:?} \
+             after_unmark={after_unmark:?}"
+        );
+        check(
+            bound == Some(target),
+            &format!("項目 155: {label}: IME の変換が入力欄ではなく {bound:?}（None = ターミナルペイン）へ束縛された (#1750)"),
+        );
+        check(
+            overlay_off && marked_inline,
+            &format!("項目 155: {label}: 未確定文字列が入力欄の中に出ない（ターミナル側に下線: overlay_off={overlay_off} marked_inline={marked_inline}） (#1750)"),
+        );
+        check(
+            cand_ok,
+            &format!("項目 155: {label}: 変換候補窓が入力欄のキャレットに出ない: cand={cand:?} caret={caret_after:?} input={input_rect:?} (#1750)"),
+        );
+        check(
+            caret_inside,
+            &format!("項目 155: {label}: 変換中のキャレットが入力欄の外へ押し出される: caret={caret_after:?} input={input_rect:?} (#1750)"),
+        );
+        // 4 文字の全角 = 11〜13px の字でおよそ 44〜52px。半分弱を下限にする（字体差を吸う）
+        if check_shift {
+            check(
+                caret_shift >= 20.0,
+                &format!("項目 155: {label}: 変換中の読みが入力欄の中にレイアウトされない（キャレットが動かない: {caret_shift}px、before={caret_before:?} after={caret_after:?}） (#1750)"),
+            );
+        }
+        check(
+            after_commit
+                .as_deref()
+                .is_some_and(|t| t.ends_with(&format!("{prefix}資料"))),
+            &format!("項目 155: {label}: IME の確定が入力欄に入らない: {after_commit:?} (#1750)"),
+        );
+        check(
+            bound2 == Some(target)
+                && after_unmark
+                    .as_deref()
+                    .is_some_and(|t| t.ends_with(&format!("{prefix}資料にほんご")))
+                && ime_done,
+            &format!("項目 155: {label}: 未確定のまま確定（unmark）が入力欄に入らない: bound={bound2:?} {after_unmark:?} (#1750)"),
+        );
+    }
+
+    /// 項目 155 の道具: CLI / MCP の focus と同じ順（dispatch → `clear_text_input_focus`）で
+    /// 外からフォーカスを動かす（IPC の配送ループと同じ）
+    fn st1750_focus_from_outside(window: WindowHandle<TakoApp>, cx: &mut AsyncApp, pane: PaneId) {
+        let _ = window.update(cx, |app, _, cx| {
+            let _ = tako_control::dispatch(
+                app,
+                tako_control::protocol::Request::Focus {
+                    pane: Some(pane.as_u64()),
+                    direction: None,
+                },
+                PaneOrigin::Mcp,
+            );
+            app.clear_text_input_focus();
+            cx.notify();
+        });
+    }
+
+    /// 項目 155（#1750）: ⌘K パレット・Web ビューのアドレスバー・Web dock の URL 欄で、
+    /// 打鍵と IME の変換が**入力欄に入り、ターミナルへ漏れない**ことを固定する。
+    ///
+    /// 修正前の実測（Issue #1750 のコメント）: 3 つとも ASCII の打鍵と ⌘V は入力欄に入る一方、
+    /// IME の変換は**ターミナルペインに束縛**（`app_input = None`）され、下線と候補窓は
+    /// ターミナルのカーソル位置に出た。確定は パレット / アドレスバーでターミナルの PTY へ、
+    /// unmark は 3 つともターミナルの PTY へ流れた（dock の確定だけは欄に入っていた）。
+    /// Web ペインにフォーカスがあるとアドレスバーの確定はどこにも入らず消え、git のコミット欄に
+    /// フォーカスが残ったままパレットを開くと変換はパレットの裏のコミット欄へ入った。
+    ///
+    /// 判定は**新しい挙動を無条件に主張する**（項目 154 と同じ作法）。
+    /// `TAKO_1750_LEGACY=1` は変換の宛先を修正前へ戻すので、この項目が FAILED になる
+    /// = 同一バイナリでの A/B
+    async fn st1750_palette_web_ime(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        sh: tako_core::platform::shell_dialect::ShellDialect,
+    ) {
+        use tako_control::protocol::Request as Req;
+        let palette_combo = if cfg!(target_os = "macos") {
+            "cmd-k"
+        } else {
+            "ctrl-shift-p"
+        };
+        // 場面: 新しいタブ（素のシェル 1 枚）+ 右へ分割したもう 1 枚（外からフォーカスを動かす先）
+        let (tab, origin, prev_panel) = window
+            .update(cx, |app, _, cx| {
+                let prev_panel = (app.panel_visible, app.panel_view);
+                let _ = tako_control::dispatch(
+                    app,
+                    Req::TabNew {
+                        title: None,
+                        focus: Some(true),
+                        cwd: None,
+                    },
+                    PaneOrigin::User,
+                );
+                let _ = app.attach_pending_sessions(cx);
+                cx.notify();
+                (
+                    app.workspace.active_tab().id(),
+                    app.focused_pane(),
+                    prev_panel,
+                )
+            })
+            .expect("項目 155 の場面づくり");
+        check(
+            wait_for_pane_ready(window, cx, origin, Duration::from_secs(20)).await,
+            "項目 155: 新しいタブのシェルが立つ (#1750)",
+        );
+        let other = window
+            .update(cx, |app, _, cx| {
+                app.split(SplitDirection::Right, cx);
+                let _ = app.attach_pending_sessions(cx);
+                let other = app
+                    .workspace
+                    .active_tab()
+                    .tree()
+                    .panes()
+                    .into_iter()
+                    .map(|p| p.id())
+                    .find(|id| *id != origin);
+                let _ = app.workspace.active_tab_mut().tree_mut().focus(origin);
+                cx.notify();
+                other
+            })
+            .ok()
+            .flatten();
+        let Some(other) = other else {
+            fail("項目 155: 右へ分割したペインが作れない (#1750)");
+        };
+        check(
+            wait_for_pane_ready(window, cx, other, Duration::from_secs(20)).await,
+            "項目 155: 分割したペインのシェルが立つ (#1750)",
+        );
+        let focus_origin = |window: WindowHandle<TakoApp>, cx: &mut AsyncApp| {
+            let _ = window.update(cx, |app, _, cx| {
+                let _ = app.workspace.active_tab_mut().tree_mut().focus(origin);
+                app.clear_text_input_focus();
+                cx.notify();
+            });
+        };
+        let _ = window.update(cx, |app, _, cx| {
+            app.input_rect_probe = true;
+            cx.notify();
+        });
+        focus_origin(window, cx);
+        notify_and_draw(any, window, cx);
+        let mut n = 0usize;
+
+        // --- 1. ⌘K パレット（1 巡目は静かなターミナル、2 巡目は出力が流れている最中）---
+        let read_palette: fn(&TakoApp) -> Option<String> =
+            |app| app.command_palette.as_ref().map(|p| p.query.clone());
+        // 流れている出力の最新の番号（2 巡目のあいだ本当に流れていたかの前提に使う）
+        let tick_now = |window: WindowHandle<TakoApp>, cx: &mut AsyncApp| -> u64 {
+            st1725_pane_text(window, cx, origin)
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("ST1750TICK"))
+                .filter_map(|n| n.parse::<u64>().ok())
+                .max()
+                .unwrap_or(0)
+        };
+        let mut busy_ticks = (0, 0);
+        for round in 1..=2 {
+            if round == 2 {
+                // 自然に終わる長さで流す（Ctrl-C で止める形は、ループの止まり方が
+                // 割り込みの届く瞬間に依存して止まらない回があった）
+                type_text(
+                    any,
+                    cx,
+                    &sh.emit_numbered_lines("ST1750TICK", 400, 10),
+                    true,
+                );
+                check(
+                    wait_for_focused_text(window, cx, "ST1750TICK3", Duration::from_secs(20)).await,
+                    "項目 155: ターミナルへ出力が流れ始める（前提。#1750）",
+                );
+                busy_ticks.0 = tick_now(window, cx);
+            }
+            n += 1;
+            let label = format!("palette round={round}");
+            press(any, cx, palette_combo);
+            let opened = window
+                .update(cx, |app, _, _| app.command_palette.is_some())
+                .unwrap_or(false);
+            check(
+                opened,
+                &format!("項目 155: {label}: {palette_combo} でパレットが開かない (#1750)"),
+            );
+            notify_and_draw(any, window, cx);
+            st1750_input_round(
+                any,
+                window,
+                cx,
+                &label,
+                AppTextInput::Palette,
+                "palette-input",
+                read_palette,
+                n,
+                true,
+            );
+            if round == 2 {
+                // 入力中に外（CLI / MCP の focus）からフォーカスを動かされても、パレットは
+                // 開いたまま打鍵と変換を握る（モーダル。閉じるのはユーザーの Esc / 選択）
+                st1750_focus_from_outside(window, cx, other);
+                st1725_type(any, cx, "k");
+                let still = window
+                    .update(cx, |app, _, _| {
+                        (
+                            read_palette(app).is_some_and(|q| q.ends_with('k')),
+                            app.app_text_input(),
+                        )
+                    })
+                    .unwrap_or((false, None));
+                check(
+                    still == (true, Some(AppTextInput::Palette)),
+                    &format!("項目 155: {label}: 外からフォーカスを動かすとパレットが打鍵・変換を手放す: {still:?} (#1750)"),
+                );
+            }
+            // 閉じる（変換中に閉じたら、その変換も捨てる）
+            let _ = window.update(cx, |app, win, cx| {
+                app.replace_and_mark_text_in_range(None, "とちゅう", None, win, cx);
+            });
+            press(any, cx, "escape");
+            let closed = window
+                .update(cx, |app, _, _| {
+                    (app.command_palette.is_none(), app.ime.is_none())
+                })
+                .unwrap_or((false, false));
+            check(
+                closed == (true, true),
+                &format!("項目 155: {label}: Esc で閉じない / パレット宛ての変換が残る: {closed:?} (#1750)"),
+            );
+            if round == 2 {
+                busy_ticks.1 = tick_now(window, cx);
+            }
+        }
+        check(
+            busy_ticks.1 > busy_ticks.0,
+            &format!("項目 155: 2 巡目のあいだターミナルへ出力が流れていない（前提）: {busy_ticks:?} (#1750)"),
+        );
+        // 出力が流れ終わるのを待ち、閉じたあとの打鍵がターミナルへ届く（= 以降の否定検査のアンカー）
+        focus_origin(window, cx);
+        check(
+            wait_for_focused_text(window, cx, "ST1750TICK399", Duration::from_secs(60)).await,
+            "項目 155: 流した出力が終わる（前提。#1750）",
+        );
+        type_text(any, cx, &sh.echo(&sh.marker("ST1750P", 1700, 50)), true);
+        check(
+            wait_for_focused_text(window, cx, "ST1750P1750", Duration::from_secs(15)).await,
+            "項目 155: パレットを閉じたあとの打鍵がターミナルへ届く (#1750)",
+        );
+
+        // --- 1b. git のコミット欄にフォーカスが残ったままパレットを開く ---
+        // 修正前はパレットの裏のコミット欄が変換を握っていた（打鍵はパレットが握る = 割れる）
+        let _ = window.update(cx, |app, _, cx| {
+            app.panel_visible = true;
+            app.panel_view = PanelView::Git;
+            app.git_commit_input_focused = true;
+            app.git_commit.clear();
+            cx.notify();
+        });
+        notify_and_draw(any, window, cx);
+        press(any, cx, palette_combo);
+        let over_git = window
+            .update(cx, |app, win, cx| {
+                let dest = app.app_text_input();
+                app.replace_and_mark_text_in_range(None, "かくにん", None, win, cx);
+                let bound = app.ime.as_ref().and_then(|i| i.app_input);
+                app.replace_text_in_range(None, "確認", win, cx);
+                (
+                    dest,
+                    bound,
+                    read_palette(app),
+                    app.git_commit.text().to_string(),
+                )
+            })
+            .ok();
+        println!("TAKO_SELF_TEST_1750: palette-over-git {over_git:?}");
+        check(
+            over_git.as_ref().is_some_and(|(dest, bound, q, git)| {
+                *dest == Some(AppTextInput::Palette)
+                    && *bound == Some(AppTextInput::Palette)
+                    && q.as_deref().is_some_and(|q| q.ends_with("確認"))
+                    && git.is_empty()
+            }),
+            &format!("項目 155: git のコミット欄が残ったままパレットを開くと変換がパレットへ入らない: {over_git:?} (#1750)"),
+        );
+        press(any, cx, "escape");
+        let back = window
+            .update(cx, |app, _, _| app.app_text_input())
+            .ok()
+            .flatten();
+        check(
+            back == Some(AppTextInput::GitCommit),
+            &format!(
+                "項目 155: パレットを閉じたら変換の宛先がコミット欄へ戻らない: {back:?} (#1750)"
+            ),
+        );
+        let _ = window.update(cx, |app, _, cx| {
+            app.git_commit_input_focused = false;
+            app.git_commit.clear();
+            (app.panel_visible, app.panel_view) = prev_panel;
+            cx.notify();
+        });
+
+        // --- 2. Web ビューのアドレスバー ---
+        // Windows の WebView2 は data: URL で落ちる（項目 71 と同じ事情 = #724 症状②）
+        if cfg!(target_os = "windows") {
+            println!(
+                "TAKO_SELF_TEST_SKIPPED: 155 のアドレスバー（Web ビューが WebView2 側の非巻き戻し \
+                 panic で落ちる。#724 症状②）"
+            );
+        } else {
+            focus_origin(window, cx);
+            // ツリーを畳み、幅の広い右のペインを**下へ**割って開く（アドレスバーに 20 桁強が
+            // 入る幅を取る。狭いと短い入力でも前側を `…` で詰める側に入り、読みのぶん
+            // キャレットが動くかを見る検査が成り立たない）。ツリーの表示は節の終わりで戻す
+            let prev_tree = window
+                .update(cx, |app, _, cx| {
+                    let prev = app.filetree.visible;
+                    app.filetree.visible = false;
+                    cx.notify();
+                    prev
+                })
+                .unwrap_or(false);
+            let opened = window
+                .update(cx, |app, _, _cx| {
+                    tako_control::dispatch(
+                        app,
+                        Req::Web {
+                            action: "open".into(),
+                            url: Some("data:text/html,<title>tako-st1750</title>st1750".into()),
+                            id: None,
+                            pane: Some(other.as_u64()),
+                            direction: Some(tako_control::protocol::Direction::Down),
+                            to: None,
+                            js: None,
+                            token: None,
+                            focus: None,
+                        },
+                        PaneOrigin::Cli,
+                    )
+                    .ok()
+                    .and_then(|v| v["pane"].as_u64())
+                })
+                .ok()
+                .flatten();
+            let Some(web_pane) = opened.map(PaneId::from_raw) else {
+                fail("項目 155: Web ビューを開けない (#1750)");
+            };
+            let read_addr: fn(&TakoApp) -> Option<String> = |app| {
+                let pane = app.web_address_bar_editing()?;
+                app.webview_address_bar
+                    .get(&pane.as_u64())
+                    .map(|f| f.text().to_string())
+            };
+            for variant in ["term-focused", "web-focused"] {
+                n += 1;
+                let label = format!("addr-bar {variant}");
+                let focus_to = if variant == "term-focused" {
+                    origin
+                } else {
+                    web_pane
+                };
+                let _ = window.update(cx, |app, _, cx| {
+                    let _ = app.workspace.active_tab_mut().tree_mut().focus(focus_to);
+                    app.clear_text_input_focus();
+                    cx.notify();
+                });
+                notify_and_draw(any, window, cx);
+                notify_and_draw(any, window, cx);
+                // **実マウスの入口**で編集を始める（アドレスバーを左クリック）
+                let Some(rect) = st1750_input_rect(window, cx, "web-addr-bar") else {
+                    fail(&format!(
+                        "項目 155: {label}: アドレスバーの実矩形が採れない (#1750)"
+                    ));
+                };
+                st1725_press(any, cx, MouseButton::Left, rect.center());
+                notify_and_draw(any, window, cx);
+                let (editing, focus_now, text) = window
+                    .update(cx, |app, _, _| {
+                        (
+                            app.web_address_bar_editing(),
+                            app.focused_pane(),
+                            read_addr(app),
+                        )
+                    })
+                    .unwrap_or((None, origin, None));
+                check(
+                    editing == Some(web_pane)
+                        && focus_now == focus_to
+                        && text.as_deref().is_some_and(|t| t.starts_with("data:")),
+                    &format!("項目 155: {label}: アドレスバーを押しても現在の URL で編集が始まらない: editing={editing:?} focus={focus_now:?} text={text:?} (#1750)"),
+                );
+                // 1 本目は URL を Backspace で消してから打つ（ユーザーの操作と同じ）。
+                // 2 本目は URL を残したまま末尾で打つ（長い URL は前側を `…` で詰めて
+                // キャレットと読みを欄の中に残す）
+                if variant == "term-focused" {
+                    for _ in 0..200 {
+                        let empty = window
+                            .update(cx, |app, _, _| read_addr(app).is_some_and(|t| t.is_empty()))
+                            .unwrap_or(true);
+                        if empty {
+                            break;
+                        }
+                        press(any, cx, "backspace");
+                    }
+                    let empty = window
+                        .update(cx, |app, _, _| read_addr(app).is_some_and(|t| t.is_empty()))
+                        .unwrap_or(false);
+                    check(
+                        empty,
+                        &format!("項目 155: {label}: Backspace で URL を消せない (#1750)"),
+                    );
+                    // 前提: 打つぶん（印 + 貼り付け 11 桁 + 読み 8 桁 + キャレット）が詰めずに入る幅
+                    let width = st1750_input_rect(window, cx, "web-addr-bar")
+                        .map(|r| f32::from(r.size.width))
+                        .unwrap_or(0.0);
+                    let layout = window
+                        .update(cx, |app, win, _| {
+                            format!(
+                                "viewport={:?} tree={} panel={} areas={:?}",
+                                win.viewport_size(),
+                                app.filetree.visible,
+                                app.panel_visible,
+                                app.pane_text_areas
+                            )
+                        })
+                        .unwrap_or_default();
+                    check(
+                        width >= 150.0,
+                        &format!("項目 155: {label}: アドレスバーが狭すぎて検査の前提が立たない（{width}px {layout}。前提。#1750）"),
+                    );
+                }
+                st1750_input_round(
+                    any,
+                    window,
+                    cx,
+                    &label,
+                    AppTextInput::WebAddress,
+                    "web-addr-bar",
+                    read_addr,
+                    n,
+                    variant == "term-focused",
+                );
+                if variant == "term-focused" {
+                    // 変換中に Esc 相当で閉じたら、その変換も捨てる
+                    let _ = window.update(cx, |app, win, cx| {
+                        app.replace_and_mark_text_in_range(None, "とちゅう", None, win, cx);
+                    });
+                    press(any, cx, "escape");
+                } else {
+                    // 入力中に外（CLI / MCP の focus）からフォーカスを動かされたら閉じ、
+                    // アドレスバー宛ての変換は捨てる（続く打鍵はターミナルへ）
+                    let _ = window.update(cx, |app, win, cx| {
+                        app.replace_and_mark_text_in_range(None, "とちゅう", None, win, cx);
+                    });
+                    st1750_focus_from_outside(window, cx, origin);
+                }
+                let closed = window
+                    .update(cx, |app, win, cx| {
+                        let closed = app.webview_address_bar_active.is_none() && app.ime.is_none();
+                        // 捨てた変換の unmark が来ても、どこにも入らない
+                        app.unmark_text(win, cx);
+                        closed
+                    })
+                    .unwrap_or(false);
+                check(
+                    closed,
+                    &format!("項目 155: {label}: 閉じない / アドレスバー宛ての変換が残る (#1750)"),
+                );
+            }
+            let _ = window.update(cx, |app, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    Req::Close {
+                        pane: Some(web_pane.as_u64()),
+                        force: true,
+                        caller_role: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+                app.filetree.visible = prev_tree;
+                cx.notify();
+            });
+            notify_and_draw(any, window, cx);
+        }
+
+        // --- 3. Web dock の URL 欄 ---
+        let read_dock: fn(&TakoApp) -> Option<String> = |app| {
+            app.web_dock_url_active()
+                .then(|| app.webview_dock_url.text().to_string())
+        };
+        for round in 1..=2 {
+            n += 1;
+            let label = format!("dock-url round={round}");
+            focus_origin(window, cx);
+            let _ = window.update(cx, |app, _, cx| {
+                app.webview_dock_open = true;
+                cx.notify();
+            });
+            notify_and_draw(any, window, cx);
+            notify_and_draw(any, window, cx);
+            // **実マウスの入口**で URL 欄を押す
+            let Some(rect) = st1750_input_rect(window, cx, "webdock-url-input") else {
+                fail(&format!(
+                    "項目 155: {label}: dock の URL 欄の実矩形が採れない (#1750)"
+                ));
+            };
+            st1725_press(any, cx, MouseButton::Left, rect.center());
+            notify_and_draw(any, window, cx);
+            let active = window
+                .update(cx, |app, _, _| app.web_dock_url_active())
+                .unwrap_or(false);
+            check(
+                active,
+                &format!("項目 155: {label}: URL 欄を押してもフォーカスが入らない (#1750)"),
+            );
+            if round == 1 {
+                st1750_input_round(
+                    any,
+                    window,
+                    cx,
+                    &label,
+                    AppTextInput::WebDockUrl,
+                    "webdock-url-input",
+                    read_dock,
+                    n,
+                    true,
+                );
+                let _ = window.update(cx, |app, win, cx| {
+                    app.replace_and_mark_text_in_range(None, "とちゅう", None, win, cx);
+                });
+                press(any, cx, "escape");
+            } else {
+                // 入力中に外からフォーカスを動かされたら URL 欄は手放し、変換も捨てる
+                let _ = window.update(cx, |app, win, cx| {
+                    app.replace_and_mark_text_in_range(None, "とちゅう", None, win, cx);
+                });
+                let bound = window
+                    .update(cx, |app, _, _| app.ime.as_ref().and_then(|i| i.app_input))
+                    .ok()
+                    .flatten();
+                check(
+                    bound == Some(AppTextInput::WebDockUrl),
+                    &format!(
+                        "項目 155: {label}: URL 欄の変換が欄へ束縛されない: {bound:?} (#1750)"
+                    ),
+                );
+                st1750_focus_from_outside(window, cx, other);
+            }
+            let released = window
+                .update(cx, |app, win, cx| {
+                    let released = !app.web_dock_url_active() && app.ime.is_none();
+                    app.unmark_text(win, cx);
+                    released
+                })
+                .unwrap_or(false);
+            check(
+                released,
+                &format!(
+                    "項目 155: {label}: URL 欄が打鍵を手放さない / 欄宛ての変換が残る (#1750)"
+                ),
+            );
+            let _ = window.update(cx, |app, _, cx| {
+                app.webview_dock_open = false;
+                app.webview_dock_url.clear();
+                cx.notify();
+            });
+        }
+
+        // --- 閉じたあとの打鍵はターミナルへ + 漏れの判定（アンカーつきの否定検査。#796）---
+        focus_origin(window, cx);
+        notify_and_draw(any, window, cx);
+        type_text(any, cx, &sh.echo(&sh.marker("ST1750E", 1700, 51)), true);
+        check(
+            wait_for_focused_text(window, cx, "ST1750E1751", Duration::from_secs(15)).await,
+            "項目 155: Web の URL 欄を閉じたあとの打鍵がターミナルへ届く (#1750)",
+        );
+        for pane in [origin, other] {
+            let text = st1725_pane_text(window, cx, pane);
+            for forbidden in [
+                ST1750_LEAK_MARK,
+                "PASTE",
+                "しりょう",
+                "資料",
+                "にほんご",
+                "とちゅう",
+                "かくにん",
+                "確認",
+            ] {
+                check(
+                    !text.contains(forbidden),
+                    &format!("項目 155: 入力欄へ打った `{forbidden}` がターミナル {pane:?} へ漏れた (#1750)"),
+                );
+            }
+        }
+        println!(
+            "TAKO_SELF_TEST_1750: legacy={} rounds={n} ok",
+            TakoApp::legacy_1750()
+        );
+
+        // 後片付け（自分のタブだけ閉じる）
+        let _ = window.update(cx, |app, _, cx| {
+            app.input_rect_probe = false;
+            app.close_command_palette();
+            app.webview_dock_open = false;
+            app.clear_text_input_focus();
+            app.remove_tab(tab, cx);
+            cx.notify();
+        });
     }
 
     fn fail(step: &str) -> ! {
@@ -51744,8 +52637,7 @@ mod self_test {
                     .update(cx, |app, _, cx| {
                         app.webview_dock_open = true;
                         app.webview_dock_url_focused = true;
-                        app.webview_dock_url_input.clear();
-                        app.webview_dock_url_cursor = 0;
+                        app.webview_dock_url.clear();
                         cx.notify();
                         let opened = app.webview_dock_open && app.webview_dock_url_focused;
                         let char_ks = |c: &str| Keystroke {
@@ -51755,14 +52647,13 @@ mod self_test {
                         };
                         app.handle_webview_dock_url_key(&char_ks("e"), cx);
                         app.handle_webview_dock_url_key(&char_ks("x"), cx);
-                        let typed = app.webview_dock_url_input == "ex";
+                        let typed = app.webview_dock_url.text() == "ex";
                         app.handle_webview_dock_url_key(
                             &Keystroke::parse("backspace").unwrap(),
                             cx,
                         );
-                        let bs_ok = app.webview_dock_url_input == "e";
-                        app.webview_dock_url_input = "example.com".into();
-                        app.webview_dock_url_cursor = 11;
+                        let bs_ok = app.webview_dock_url.text() == "e";
+                        app.webview_dock_url.set_text("example.com");
                         app.handle_webview_dock_url_key(
                             &Keystroke::parse("enter").unwrap(),
                             cx,
@@ -51780,18 +52671,17 @@ mod self_test {
                         webview::set_has_webview(false);
                         app.webview_dock_open = true;
                         app.webview_dock_url_focused = true;
-                        app.webview_dock_url_input = "test".into();
+                        app.webview_dock_url.set_text("test");
                         app.handle_webview_dock_url_key(
                             &Keystroke::parse("escape").unwrap(),
                             cx,
                         );
                         let esc_ok = !app.webview_dock_url_focused
                             && !app.webview_dock_open
-                            && app.webview_dock_url_input.is_empty();
+                            && app.webview_dock_url.text().is_empty();
                         app.webview_dock_open = false;
                         app.webview_dock_url_focused = false;
-                        app.webview_dock_url_input.clear();
-                        app.webview_dock_url_cursor = 0;
+                        app.webview_dock_url.clear();
                         cx.notify();
                         opened && typed && bs_ok && enter_closed && esc_ok
                     })
@@ -51806,18 +52696,16 @@ mod self_test {
                     .update(cx, |app, _, cx| {
                         app.webview_dock_open = true;
                         app.webview_dock_url_focused = true;
-                        app.webview_dock_url_input.clear();
-                        app.webview_dock_url_cursor = 0;
+                        app.webview_dock_url.clear();
                         cx.write_to_clipboard(ClipboardItem::new_string(
                             "https://example.com".into(),
                         ));
                         app.paste(cx);
-                        let pasted = app.webview_dock_url_input == "https://example.com"
-                            && app.webview_dock_url_cursor == 19;
+                        let pasted = app.webview_dock_url.text() == "https://example.com"
+                            && app.webview_dock_url.cursor() == 19;
                         app.webview_dock_open = false;
                         app.webview_dock_url_focused = false;
-                        app.webview_dock_url_input.clear();
-                        app.webview_dock_url_cursor = 0;
+                        app.webview_dock_url.clear();
                         cx.notify();
                         pasted
                     })
@@ -53973,7 +54861,7 @@ mod self_test {
                         && {
                             let _ = window.update(cx, |app, _, cx| {
                                 app.webview_address_bar
-                                    .insert(wv_pane.as_u64(), (String::new(), 0));
+                                    .insert(wv_pane.as_u64(), Default::default());
                                 app.webview_address_bar_active = Some(wv_pane);
                                 cx.notify();
                             });
@@ -77746,6 +78634,10 @@ mod self_test {
             // --- 項目 154: ファイルツリーのインライン入力の打鍵と IME（#1725） ---
             // 本体と判定の理由は `st1725_tree_inline_input` の doc
             st1725_tree_inline_input(any, window, cx, sh).await;
+
+            // --- 項目 155: ⌘K パレット・Web のアドレスバー・dock の URL 欄の打鍵と IME（#1750） ---
+            // 本体と判定の理由は `st1750_palette_web_ime` の doc
+            st1750_palette_web_ime(any, window, cx, sh).await;
 
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
