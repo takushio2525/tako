@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-09-26（#1746: tako task gate の証拠をバイト位置で切らず文字境界で切るようにした）
-- `print_gate_result` が証拠を `&ev[..120]` で切っていて、`exit 0; stdout: ` + 日本語だと 120 バイト目が「あ」の途中に当たり `gate check` / `show` が exit 101 で落ちた（修正前ビルドで実測。`check` は保存後に落ちる）。表示の切り詰めを `tako_core::text::truncate_chars`（文字数・`…` 込み 120 文字）へ寄せ、`sessions resume` の session id の先頭 8 バイトも文字単位へ
-- 棚卸し: tako-cli の本番の範囲添字 5 件（危険 2 件を直し、安全 3 件へ `切り出し安全:` の理由コメント）/ tako-control 85 件は表示の切り詰めが丸め済みの 1 件だけ。番犬 `issue1746_cli_byte_slice_watchdog` は注入 2 通りを file:line で名指し → 戻して緑
-
 ## 2026-09-26（#1756: テーマの色の指定を文字単位で検査し、非 ASCII の値で GUI ごと落ちないようにした）
 - `parse_hex_color` がバイト長 6 を確かめてから `&hex[0..2]` で切っており、`#赤色`（6 バイト）で GUI のメインスレッドが panic → abort（実測: CLI の `theme color` で Abort trap: 6・settings.json に残ると `did_finish_launching` で起動のたびに落ちる）。文字単位の検査 + `HexColorError`（空 / 16 進でない文字 / 桁違い）の `Result` へ替え、理由の文（日英）を dispatch（CLI / MCP / 設定画面）と起動時の persist.log が共有。`#+f+f+f`（`from_str_radix` の `+`）も弾く
 - 実測: `scripts/test-theme-color-1756.sh` 修正前 8 PASS 17 FAIL → 修正後 31 PASS 0 FAIL・旧ロジック注入で新テスト 6 本が同じ panic で FAILED → 戻して緑・workspace 5469 passed 0 failed・clippy 3 宇宙 0
@@ -61,3 +57,7 @@
 - 修正前の実測（一時プローブ・隔離 GUI・実マウスの入口）: 3 つとも ASCII と ⌘V は欄に入る一方、変換は**ターミナルペインに束縛**（下線・候補窓はターミナルのカーソル位置）、確定はパレット / アドレスバーで PTY へ、unmark は 3 つとも PTY へ。Web ペインにフォーカスがあるとアドレスバーの確定は消え、git のコミット欄が残ったままパレットを開くと変換は裏のコミット欄へ入った
 - `AppTextInput` に `Palette` / `WebAddress` / `WebDockUrl` を足し（パレット最優先 = `handle_key` と同じ順）、4 経路を 1 挿入関数・開く / 閉じるを 1 本ずつ（閉じる出口が変換を捨てる）・Web の 2 欄は `TextField` へ・見えない欄は奪わない・長い URL は `inline_input_window` で詰める
 - 実測: セルフテスト項目 155 緑 / `TAKO_1750_LEGACY=1` で FAILED・番犬 `issue1750_palette_web_ime_watchdog`（注入 15 通り）+ 実ソース注入 3 通りが `main.rs:<line>` で名指し → 戻して緑・項目 154 緑・workspace 5798 passed 0 failed・clippy 3 宇宙 0。実 IME は `manual-checks.md`
+
+## 2026-09-26（#1742: 上下移動の桁を表示幅で覚え、選択中の ←→ で畳み、macOS の ⌃A・⌃E・⌃K を足した）
+- 桁の記憶を文字数 → 表示幅（全角 2・タブは 4 桁ごとのタブストップ。`unicode-width` は alacritty 経由で既にツリー内の版を直接依存へ）、選択中の素の ←→ は選択の端へ畳む、⌃A（桁 0）/ ⌃E / ⌃K は `editor_keys` の macOS 列だけ（Windows に置かない理由は表の行）。操作は足さず `tako edit move` / `delete`・MCP の既存の口で同じ結果
+- 実測: `scripts/test-editor-keys-1652.sh` **37 PASS 0 FAIL**（tako-vd の実打鍵 15 相 + CLI / MCP の字面照合。bash 3.2 で通す）・注入 3 通りが単体と実 GUI で名指しの FAILED → 戻して緑・workspace 5644 passed 0 failed・clippy 3 宇宙 0。描画は全角 13px / タブ 28px で桁の規則（桁 4 = 31.3px）と 3〜5px ずれる = 描画側の別件

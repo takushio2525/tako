@@ -131,8 +131,49 @@ pub enum IndentUnit {
 }
 
 /// タブ 1 文字を何桁と数えるか（#1654。スペースでインデントするファイルに混ざったタブを
-/// 1 段ぶんとして扱うときと、タブでインデントするファイルに混ざったスペースを外すときの幅）
+/// 1 段ぶんとして扱うときと、タブでインデントするファイルに混ざったスペースを外すときの幅）。
+///
+/// 上下移動の桁の記憶（#1742）では**タブストップの間隔**として使う（タブは次の
+/// 4 の倍数の桁まで進む。VS Code / Zed の既定と同じ）。タブ幅の正本はここ 1 か所
 const TAB_COLUMNS: usize = 4;
+
+/// 1 文字ぶん進んだあとの表示桁（#1742）。`column` はその文字の手前の桁。
+///
+/// 全角（UAX #11 の W / F）= 2・タブ = 次のタブストップ（[`TAB_COLUMNS`] 桁ごと）・
+/// 結合文字など幅を持たない文字 = 0・制御文字（単独の CR など）= 0。
+/// 全角の判定は端末のセル幅と同じ `unicode-width`（alacritty_terminal が使う版）で、
+/// **エディタの表示幅はこの関数 1 つが決める**
+fn advance_display_column(column: usize, c: char) -> usize {
+    match c {
+        '\t' => column + TAB_COLUMNS - column % TAB_COLUMNS,
+        _ => column + unicode_width::UnicodeWidthChar::width(c).unwrap_or(0),
+    }
+}
+
+/// 行頭から `line_prefix` の終わりまでの表示幅（桁。#1742）
+fn display_width(line_prefix: &str) -> usize {
+    line_prefix.chars().fold(0, advance_display_column)
+}
+
+/// 行の中で表示桁 `goal` にいちばん近い文字境界（行頭からのバイト。#1742）。
+///
+/// 全角文字やタブの途中に当たったら近いほうの端へ寄せ、等距離なら手前へ寄せる
+/// （VS Code の `columnFromVisibleColumn` と同じ）。行が短ければ行末
+fn byte_for_display_column(line: &str, goal: usize) -> usize {
+    let mut column = 0;
+    for (i, c) in line.char_indices() {
+        let next = advance_display_column(column, c);
+        if next > goal {
+            return if next - goal < goal - column {
+                i + c.len_utf8()
+            } else {
+                i
+            };
+        }
+        column = next;
+    }
+    line.len()
+}
 
 /// インデントの推定に見る行数の上限（#1654。VS Code の `guessIndentation` と同じく先頭から標本を取る）
 const INDENT_SAMPLE_LINES: usize = 10_000;
@@ -286,7 +327,9 @@ fn closing_bracket(open: char) -> Option<char> {
 /// [`Self::name`] の 1 か所（CLI の引数・MCP の enum・エラー文がすべてここを引く）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorMovement {
+    /// 1 文字左へ。選択中（⇧ なし）は動かずに選択の始点へ畳む（#1742）
     Left,
+    /// 1 文字右へ。選択中（⇧ なし）は動かずに選択の終点へ畳む（#1742）
     Right,
     Up,
     Down,
@@ -294,7 +337,7 @@ pub enum CursorMovement {
     WordLeft,
     /// 次の語の末尾へ（#1652）。行末では次の行へまたぐ
     WordRight,
-    /// 行頭（桁 0）
+    /// 行頭（桁 0。macOS の ⌃A。#1742）
     LineStart,
     /// 最初の非空白 ⇄ 桁 0 を行き来する行頭（smart Home。#1652）
     SmartLineStart,
@@ -613,9 +656,11 @@ pub struct TextBuffer {
     /// 通るので、**どちらで変わっても進む**。LSP の `didChange` が要求する
     /// 「文書の版」もこれをそのまま使える（#1007 の前払い）
     version: u64,
-    /// 上下移動で狙い続ける桁（行頭からの文字数。desired column。#1652）。
+    /// 上下移動で狙い続ける桁（行頭からの**表示幅**。desired column。#1652 / #1742）。
     ///
     /// ↓ を続けて押す途中で短い行を通っても、その先の長い行では元の桁へ戻る。
+    /// 文字数ではなく表示幅（全角 = 2・タブ = タブストップ）で持つので、全角やタブが
+    /// 混ざった行をまたいでも**見た目の桁**が保たれる（#1742）。
     /// **上下以外でカーソルが動いたら捨てる**（`set_cursor` / `set_selection` が
     /// 実際に動いたとき・編集・undo / redo・全選択）。読んで置き直すのは上下の移動だけ
     goal_column: Option<usize>,
@@ -1460,11 +1505,16 @@ impl TextBuffer {
     }
 
     pub fn move_cursor(&mut self, movement: CursorMovement, extend_selection: bool) {
+        // 選択中の素の ← → は 1 文字動かずに選択の端へ畳む（#1742）
+        if let Some(edge) = self.collapse_edge(movement, extend_selection) {
+            self.set_cursor(edge, false);
+            return;
+        }
         // 上下の移動は「狙う桁」を持ち越す（#1652 の desired column）。
         // 短い行で行末へ寄せられても、記憶しているのは元の桁のまま
         let goal = movement.is_vertical().then(|| {
             self.goal_column
-                .unwrap_or_else(|| self.char_column(self.cursor))
+                .unwrap_or_else(|| self.display_column(self.cursor))
         });
         let goal_col = goal.unwrap_or(0);
         let page = self.page_step() as isize;
@@ -1689,12 +1739,26 @@ impl TextBuffer {
         line_end_offset(&self.text, offset)
     }
 
-    /// その位置の桁（行頭からの**文字数**）。上下移動の桁の記憶はこの単位で持つ
-    fn char_column(&self, offset: usize) -> usize {
-        self.text[self.line_start(offset)..offset].chars().count()
+    /// 選択中の素の ← → の行き先（#1742）。← は選択の始点・→ は終点へ畳む
+    /// （VS Code / macOS のテキスト欄の標準）。
+    ///
+    /// 選択が無い・⇧ 付き（選択を伸ばす）・左右以外の移動なら `None`
+    /// （語の移動や上下は従来どおりカーソルの位置から動く）
+    fn collapse_edge(&self, movement: CursorMovement, extend_selection: bool) -> Option<usize> {
+        let range = self.selection().filter(|_| !extend_selection)?;
+        match movement {
+            CursorMovement::Left => Some(range.start),
+            CursorMovement::Right => Some(range.end),
+            _ => None,
+        }
     }
 
-    /// `delta` 行ぶん上下した行の、桁 `goal`（文字数）の位置。
+    /// その位置の桁（行頭からの**表示幅**。#1742）。上下移動の桁の記憶はこの単位で持つ
+    fn display_column(&self, offset: usize) -> usize {
+        display_width(&self.text[self.line_start(offset)..offset])
+    }
+
+    /// `delta` 行ぶん上下した行の、表示桁 `goal` にいちばん近い位置（#1742）。
     ///
     /// 行き先の行が短ければその行末へ寄せる（桁の記憶は呼び出し側が持ち越す）。
     /// 文書の端より先へは行かない: ページ移動は端の行で止まり、1 行の移動は
@@ -1714,12 +1778,7 @@ impl TextBuffer {
             return self.cursor;
         };
         let line_text = &self.text[start..self.line_end(start)];
-        let relative = line_text
-            .char_indices()
-            .nth(goal)
-            .map(|(i, _)| i)
-            .unwrap_or(line_text.len());
-        start + relative
+        start + byte_for_display_column(line_text, goal)
     }
 
     /// smart Home の行き先（#1652）。
@@ -3716,9 +3775,10 @@ mod tests {
         assert_eq!(buffer.line_byte_col(buffer.cursor()), (2, 8));
     }
 
-    /// 桁は**文字数**で持つ（多バイト・CRLF の行でもバイト数に引きずられない）
+    /// 桁はバイト数に引きずられない（多バイト・CRLF の行）。全角だけの行どうしは
+    /// 文字数で数えても表示幅で数えても同じ桁になる（全角と半角の混在は次のテスト）
     #[test]
-    fn 桁の記憶は多バイトとcrlfでも文字で数える() {
+    fn 桁の記憶は多バイトとcrlfでもバイトに引きずられない() {
         let mut buffer = TextBuffer::from_text(
             path("goal-mb"),
             "日本語テキスト\r\nab\r\nかなカナ漢字です\r\n".into(),
@@ -3734,6 +3794,163 @@ mod tests {
             show(&buffer),
             "日本語テキスト\r\nab\r\nかなカナ漢|字です\r\n"
         );
+    }
+
+    /// #1742: 桁は**表示幅**（全角 = 2）で持つ。文字数で覚えると `abcd|` の ↓ が
+    /// `あいう|`（4 文字目 = 行末）へ飛び、見た目で 2 桁右へずれる
+    #[test]
+    fn 桁の記憶は全角を2桁と数える_1742() {
+        let text = "abcdef\nあいう\nabcdef\n";
+        let mut buffer = TextBuffer::from_text(path("goal-wide"), text.into());
+        buffer.set_cursor("abcd".len(), false);
+        buffer.move_cursor(CursorMovement::Down, false);
+        assert_eq!(show(&buffer), "abcdef\nあい|う\nabcdef\n");
+        buffer.move_cursor(CursorMovement::Down, false);
+        assert_eq!(show(&buffer), "abcdef\nあいう\nabcd|ef\n");
+        // 全角 → 半角: `あ|` は見た目で 2 桁なので `ab|` へ（文字数なら `a|`）
+        buffer.set_cursor("abcdef\nあ".len(), false);
+        buffer.move_cursor(CursorMovement::Up, false);
+        assert_eq!(show(&buffer), "ab|cdef\nあいう\nabcdef\n");
+        // 全角の途中（桁 3）に当たったら近いほうへ、等距離なら手前へ寄せる。
+        // 記憶している桁は 3 のままなので、次の半角の行では桁 3 へ戻る
+        buffer.set_cursor(3, false);
+        buffer.move_cursor(CursorMovement::Down, false);
+        assert_eq!(show(&buffer), "abcdef\nあ|いう\nabcdef\n");
+        buffer.move_cursor(CursorMovement::Down, false);
+        assert_eq!(show(&buffer), "abcdef\nあいう\nabc|def\n");
+        // 全角スペース（U+3000）も 2 桁
+        let mut buffer = TextBuffer::from_text(path("goal-ideo"), "\u{3000}x\nabcd".into());
+        buffer.set_cursor("\u{3000}".len(), false);
+        buffer.move_cursor(CursorMovement::Down, false);
+        assert_eq!(show(&buffer), "\u{3000}x\nab|cd");
+    }
+
+    /// #1742: タブは**次のタブストップ**（4 桁ごと）まで進む幅で数える。
+    /// 固定の 4 桁ではないので、行頭の空白 2 つの後ろのタブは 2 桁ぶんしか取らない
+    #[test]
+    fn 桁の記憶はタブをタブストップで数える_1742() {
+        let text = "\tlet x = 1;\nabcdefgh\n  \tz\n";
+        let mut buffer = TextBuffer::from_text(path("goal-tab"), text.into());
+        // タブの直後 = 桁 4（文字数なら 1 で `a|`）
+        buffer.set_cursor(1, false);
+        buffer.move_cursor(CursorMovement::Down, false);
+        assert_eq!(show(&buffer), "\tlet x = 1;\nabcd|efgh\n  \tz\n");
+        // `  \t` の後ろもタブストップの桁 4（固定 4 桁なら桁 6 で、`  |\tz` へずれる）
+        buffer.move_cursor(CursorMovement::Down, false);
+        assert_eq!(show(&buffer), "\tlet x = 1;\nabcdefgh\n  \t|z\n");
+        // 桁 6 から上へ: タブ（0→4）+ `le` = 桁 6（文字数なら `\tlet x|`）
+        buffer.set_cursor("\tlet x = 1;\nabcdef".len(), false);
+        buffer.move_cursor(CursorMovement::Up, false);
+        assert_eq!(show(&buffer), "\tle|t x = 1;\nabcdefgh\n  \tz\n");
+        // タブの途中（桁 3）に当たったら近いほう = タブの後ろ（桁 4）へ寄せる
+        let mut buffer = TextBuffer::from_text(path("goal-tab-mid"), "abc\n\tx".into());
+        buffer.set_cursor(3, false);
+        buffer.move_cursor(CursorMovement::Down, false);
+        assert_eq!(show(&buffer), "abc\n\t|x");
+        // 桁 1 なら近いほう = タブの手前（桁 0）
+        buffer.set_cursor(1, false);
+        buffer.move_cursor(CursorMovement::Down, false);
+        assert_eq!(show(&buffer), "abc\n|\tx");
+    }
+
+    /// #1742: CRLF の行でも同じ（行末は CR の手前で、CR と LF のあいだへは入らない）
+    #[test]
+    fn 桁の記憶はcrlfの行でも表示幅で数える_1742() {
+        let text = "abcd\r\nあいう\r\n\tx\r\nab\r\n";
+        let mut buffer = TextBuffer::from_text(path("goal-crlf"), text.into());
+        buffer.set_cursor(4, false);
+        buffer.move_cursor(CursorMovement::Down, false);
+        assert_eq!(show(&buffer), "abcd\r\nあい|う\r\n\tx\r\nab\r\n");
+        buffer.move_cursor(CursorMovement::Down, false);
+        assert_eq!(show(&buffer), "abcd\r\nあいう\r\n\t|x\r\nab\r\n");
+        // 短い行（桁 2）では CR の手前へ寄せ、記憶した桁 4 は持ち越す
+        buffer.move_cursor(CursorMovement::Down, false);
+        assert_eq!(show(&buffer), "abcd\r\nあいう\r\n\tx\r\nab|\r\n");
+        buffer.move_cursor(CursorMovement::Up, false);
+        buffer.move_cursor(CursorMovement::Up, false);
+        buffer.move_cursor(CursorMovement::Up, false);
+        assert_eq!(show(&buffer), "abcd|\r\nあいう\r\n\tx\r\nab\r\n");
+    }
+
+    /// #1742: 選択中の素の ← は選択の始点・→ は終点へ畳む（1 文字は動かない）。
+    /// ⇧ 付きは従来どおり伸ばす。上下と語の移動はカーソルの位置から動く
+    #[test]
+    fn 選択中の素の左右は選択の端へ畳む_1742() {
+        let text = "hello world\nsecond line\n";
+        let select = |anchor: usize, head: usize| {
+            let mut buffer = TextBuffer::from_text(path("collapse"), text.into());
+            buffer.set_selection(anchor, head);
+            buffer
+        };
+        // 前向きの選択（カーソルは終点）
+        let mut buffer = select(0, 5);
+        buffer.move_cursor(CursorMovement::Left, false);
+        assert_eq!((buffer.cursor(), buffer.selection()), (0, None));
+        let mut buffer = select(0, 5);
+        buffer.move_cursor(CursorMovement::Right, false);
+        assert_eq!((buffer.cursor(), buffer.selection()), (5, None));
+        // 後ろ向きの選択（カーソルは始点）
+        let mut buffer = select(5, 0);
+        buffer.move_cursor(CursorMovement::Right, false);
+        assert_eq!((buffer.cursor(), buffer.selection()), (5, None));
+        let mut buffer = select(5, 0);
+        buffer.move_cursor(CursorMovement::Left, false);
+        assert_eq!((buffer.cursor(), buffer.selection()), (0, None));
+        // 複数行にまたがる選択
+        let end = "hello world\nsec".len();
+        let mut buffer = select(3, end);
+        buffer.move_cursor(CursorMovement::Left, false);
+        assert_eq!(buffer.cursor(), 3);
+        let mut buffer = select(end, 3);
+        buffer.move_cursor(CursorMovement::Right, false);
+        assert_eq!(buffer.cursor(), end);
+        // 文書の先頭・末尾を含む全選択
+        let mut buffer = select(0, text.len());
+        buffer.move_cursor(CursorMovement::Left, false);
+        assert_eq!(buffer.cursor(), 0);
+        let mut buffer = select(0, text.len());
+        buffer.move_cursor(CursorMovement::Right, false);
+        assert_eq!(buffer.cursor(), text.len());
+        // 畳むのは 1 回だけ。次の → からは 1 文字ずつ動く
+        buffer.move_cursor(CursorMovement::Left, false);
+        assert_eq!(buffer.cursor(), text.len() - 1);
+        // ⇧ 付きは選択を伸ばす（畳まない）
+        let mut buffer = select(0, 5);
+        buffer.move_cursor(CursorMovement::Left, true);
+        assert_eq!((buffer.cursor(), buffer.selection()), (4, Some(0..4)));
+        let mut buffer = select(0, 5);
+        buffer.move_cursor(CursorMovement::Right, true);
+        assert_eq!(buffer.selection(), Some(0..6));
+        // 上下・語の移動はカーソル（選択の先端）から動く
+        let mut buffer = select(0, 5);
+        buffer.move_cursor(CursorMovement::Down, false);
+        assert_eq!(buffer.line_byte_col(buffer.cursor()), (1, 5));
+        let mut buffer = select(0, 5);
+        buffer.move_cursor(CursorMovement::WordRight, false);
+        assert_eq!(buffer.cursor(), "hello world".len());
+        // CRLF をまたぐ選択でも CR と LF のあいだへは畳まない
+        let mut buffer = TextBuffer::from_text(path("collapse-crlf"), "ab\r\ncd".into());
+        buffer.set_selection(1, 4);
+        buffer.move_cursor(CursorMovement::Right, false);
+        assert_eq!(buffer.cursor(), 4);
+        buffer.set_selection(4, 2);
+        buffer.move_cursor(CursorMovement::Left, false);
+        assert_eq!(buffer.cursor(), 2);
+    }
+
+    /// #1742: 畳んだら上下の桁の記憶は捨てる（横移動と同じ）。
+    /// ⇧↓ で覚えた桁 8 を → で畳んだあとの ↓ は、畳んだ位置の桁から動く
+    #[test]
+    fn 選択を畳んだら桁の記憶は捨てる_1742() {
+        let text = "0123456789\nab\n0123456789";
+        let mut buffer = TextBuffer::from_text(path("collapse-goal"), text.into());
+        buffer.set_cursor(8, false);
+        buffer.move_cursor(CursorMovement::Down, true);
+        assert_eq!(buffer.selection(), Some(8.."0123456789\nab".len()));
+        buffer.move_cursor(CursorMovement::Right, false);
+        assert_eq!(buffer.line_byte_col(buffer.cursor()), (1, 2));
+        buffer.move_cursor(CursorMovement::Down, false);
+        assert_eq!(buffer.line_byte_col(buffer.cursor()), (2, 2));
     }
 
     /// 上下以外で動いたら・打ったら桁の記憶は捨てる
