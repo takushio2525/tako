@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-24（#1649: 編集カーソルを可視範囲へ追わせ、IME の下線も消えないようにした）
-- `ListState` への `scroll_to(cursor)` が **0 件**で、打鍵 / 矢印 / ⌘F のヒット / undo / 貼り付けのどれでもカーソルが画面外のままだった。判断は `tako_core::editor_scroll`（`LineViewport` + `follow_cursor`・上下 3 行の余白・視野が狭いと詰める・端では可視化を優先）へ寄せ、UI は器の寸法を測って渡すだけにした。呼ぶのは `refresh_preview_from_editor`（編集の全経路の要）+ 検索ヒット + IME の変換開始の 3 か所、器は仮想リストと div スクロールの両方を**論理位置**で動かす
-- 連鎖症状の IME 下線は `preview_pending_cursor_origin` が「可視化後にカーソル行が来る位置」を出して**本文の中にアンカーを残す**（行のレイアウトは paint でしか控えられないので、追従の直後 1 フレームは必ず無い）。効きは編集系の応答に乗る `viewport` で GUI の外から読める（位置自体は #1658 の `document.cursor`）
-- 実測: **tako-vd 上の visual-test 節 `cursor-follow`（7 相）が新 = 全相 `ok=true` / `anchored=true`・旧（`TAKO_1649_LEGACY=1`）= 全相 `ok=false` / `anchored=false`**（視野 37 行 / 4,002 行 / PASS=10 FAIL=0）。番犬 6 本へ注入 9 通りすべて file:line 名指しで FAILED → 戻して緑・`editor_scroll` 単体 11 本 + `preview_render` 単体 2 本・workspace 0 failed・clippy 3 宇宙 0
-
 ## 2026-09-26（#1652: 修飾キー付きの打鍵が入口で全部捨てられていたのを直した）
 - 入口の `if platform || control || alt { return false }` を外し、打鍵の意味を `platform::editor_keys` の 1 枚の表（両 OS の列）へ。`TextBuffer` に単語 / 行 / ページ / 文書端の移動と語・行単位の削除・smart Home・桁の記憶（desired column）を足し、`PreviewMove` / `PreviewDelete` + `tako edit move|delete` + MCP 2 本が打鍵と同じ口を通る
 - 実測: `scripts/test-editor-keys-1652.sh` で tako-vd 上の実打鍵経路 9 相が緑・A/B `TAKO_1652_LEGACY=1` は ⌘↑ の相で FAILED・注入 7 通りがすべて file:line 名指しで FAILED → 戻して緑
@@ -66,3 +61,7 @@
 ## 2026-09-26（#1744: 隔離 GUI は面を用意できなければ起動しないようにした）
 - `launch_isolated_gui` は `ensure` 失敗でも「起動は続ける」で素通しする作りで、uuid の記録が無い機では面の指定を持たない起動が tako の暗黙の既定でユーザーの画面へ落ちうる潜在経路があった（実例は未確認。9/26 の報告は #1697 の誤警告）。`ensure` 失敗・成功でも `bounds` で一覧に無いときは起動せず終了コード 4 + stderr へ「未実測: …」1 行。呼び手は `|| exit $?`、1505 は C/D だけ未実測で続行
 - 番犬（#1490 の番犬を拡張）: ヘルパを `/bin/bash` で走らせ「用意できない面」5 通りを注入して偽 GUI が起きないこと + 呼び手の失敗の拾い方。注入 5 通りすべて file:line 名指しで FAILED → 戻して緑。実呼び手 1676 は面なしで exit 4・通常経路 26 PASS（persist.log `ディスプレイ指定 tako-vd: name で解決`）
+
+## 2026-09-26（#1746: tako task gate の証拠をバイト位置で切らず文字境界で切るようにした）
+- `print_gate_result` が証拠を `&ev[..120]` で切っていて、`exit 0; stdout: ` + 日本語だと 120 バイト目が「あ」の途中に当たり `gate check` / `show` が exit 101 で落ちた（修正前ビルドで実測。`check` は保存後に落ちる）。表示の切り詰めを `tako_core::text::truncate_chars`（文字数・`…` 込み 120 文字）へ寄せ、`sessions resume` の session id の先頭 8 バイトも文字単位へ
+- 棚卸し: tako-cli の本番の範囲添字 5 件（危険 2 件を直し、安全 3 件へ `切り出し安全:` の理由コメント）/ tako-control 85 件は表示の切り詰めが丸め済みの 1 件だけ。番犬 `issue1746_cli_byte_slice_watchdog` は注入 2 通りを file:line で名指し → 戻して緑
