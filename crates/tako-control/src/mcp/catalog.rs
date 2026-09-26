@@ -3852,8 +3852,8 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_run",
             "description": "ファイルを実行する（Code Runner）。\
-                ファイル内の tako:run 宣言または拡張子既定コマンドで新ペインを分割して実行する\
-                （cwd の既定はファイルのあるディレクトリ。完了確認は tako_run_interactive_status）。\
+                ファイル内の tako:run 宣言・プロジェクト既定・拡張子既定コマンドで新ペインを分割して実行する\
+                （cwd の既定はファイルのあるディレクトリ・プロジェクト既定はそのルート。完了確認は tako_run_interactive_status）。\
                 \n\ntako:run 宣言（ファイル先頭 64 行 / 16 KiB 以内のコメントに書く。\
                 各言語のコメント記法に依存しない = 接頭辞は任意）:\n\
                 - `tako:run: <コマンド>` — 既定の実行コマンド\n\
@@ -3864,8 +3864,11 @@ pub fn tools() -> Vec<Value> {
                 \n変数展開（コマンド・cwd 内。自動シングルクオートエスケープ）: \
                 `${file}` = ファイルの絶対パス / `${fileDir}` = ファイルのあるディレクトリ / \
                 `${fileBase}` = ファイル名（拡張子付き）/ `${fileNoExt}` = ファイル名（拡張子なし）/ \
-                `${ext}` = 拡張子（小文字・ドットなし）\n\
-                \n解決順: command 引数 → ファイル内宣言 → 拡張子既定（settings + 組み込み）→ エラー。",
+                `${ext}` = 拡張子（小文字・ドットなし）/ `${workspaceRoot}` = プロジェクトのルート\
+                （無ければ git のルート → ファイルのディレクトリ）\n\
+                \n解決順: command 引数 → ファイル内宣言 → ユーザー設定の拡張子既定 → プロジェクト既定\
+                （Cargo.toml / package.json / pyproject.toml / go.mod / *.csproj / Makefile を上へ辿る）→ \
+                組み込みの拡張子既定 → エラー。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3915,7 +3918,7 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_run_resolve",
             "description": "ファイルの実行プロファイル一覧を解決して返す（実行しない。FR-3.18）。\
-                ファイル内宣言と拡張子既定から検出されたプロファイル一覧・コマンド・cwd・source を返す。\
+                ファイル内宣言・プロジェクト既定・拡張子既定から検出されたプロファイル一覧・コマンド・cwd・source と、属するプロジェクト（project）を返す。\
                 UI のドロップダウンと同じデータ。tako_run 実行前の事前確認に使う。",
             "inputSchema": {
                 "type": "object",

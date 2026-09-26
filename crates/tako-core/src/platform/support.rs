@@ -1410,7 +1410,7 @@ pub const MATRIX: &[Feature] = &[
         macos: Support::Supported,
         windows: Support::Supported,
         windows_evidence: Evidence::Measured(
-            "#875 の実機実測で Code Runner の宣言 / 拡張子既定の解決から実行まで通した（3 経路のうちの 1 つ）",
+            "#875 の実機実測で Code Runner の宣言 / 拡張子既定の解決から実行まで通した（3 経路のうちの 1 つ）。#1656 のプロジェクト既定（cargo / npm / python / go / dotnet / make）は Windows の列を macOS の単体から固定したが実機は未検証",
         ),
     },
     Feature {

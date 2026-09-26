@@ -229,14 +229,15 @@ pub const TABLE: &[Entry] = &[
         run("kotlinc ${fileBase} -include-runtime -d ${fileNoExt}.jar && java -jar ${fileNoExt}.jar"),
         run("kotlinc ${fileBase} -include-runtime -d ${fileNoExt}.jar; if ($?) { java -jar ${fileNoExt}.jar }"),
     ),
-    // .NET 10 の file-based apps（`dotnet run app.cs`）。プロジェクトとしての実行は #1656
+    // .NET 10 の file-based apps（`dotnet run app.cs`）。`.csproj` の中なら
+    // プロジェクト既定（`dotnet run`。`runner_project` の表 = #1656）が先に効く
     same("cs", "dotnet run ${fileBase}"),
     // F# は FSI がソースをそのまま走らせる（`.fsx` でなくてもよい）
     same("fs", "dotnet fsi ${fileBase}"),
     same_absent(
         "vb",
-        ".NET の単体ファイル実行（file-based apps）は C# だけで、VB は `.vbproj` を持つプロジェクトが要る（プロジェクトとしての実行は #1656）",
-        "The .NET file-based app runner supports C# only; VB requires a project with a `.vbproj` (project-aware running is tracked in #1656).",
+        ".NET の単体ファイル実行（file-based apps）は C# だけで、VB は `.vbproj` を持つプロジェクトが要る（`.vbproj` のあるフォルダの中なら `dotnet run` で走る）",
+        "The .NET file-based app runner supports C# only; VB requires a project with a `.vbproj` (inside a folder that has one, it runs with `dotnet run`).",
     ),
     same("dart", "dart run ${fileBase}"),
     same("r", "Rscript ${fileBase}"),
