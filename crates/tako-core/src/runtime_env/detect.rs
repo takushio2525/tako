@@ -159,6 +159,31 @@ pub fn resolve_ref(
     })
 }
 
+/// Tier P（道具への問い合わせ）が返した環境の置き場を、包む形の候補へ activation として重ねる
+/// （#1730。`poetry env info -p` の答え → PATH の前置 + `VIRTUAL_ENV`）。
+///
+/// 置き場の中の配置は表（その検出器の [`super::ProbeCmd::layout`]）が持つ。表が問い合わせを
+/// 持たない検出器なら何もしない（`false`）
+pub fn apply_probed_env(
+    kind: &RuntimeKind,
+    platform: Platform,
+    c: &mut Candidate,
+    env_dir: &Path,
+) -> bool {
+    let Some(Detector::Wrapper(s)) = kind.detector(c.manager) else {
+        return false;
+    };
+    let Some(probe) = &s.env_dir_probe else {
+        return false;
+    };
+    let a = activate(&probe.layout, platform, env_dir, None);
+    c.location = Some(env_dir.to_path_buf());
+    c.applied.path_prepend = a.path_prepend;
+    c.applied.env = a.env;
+    c.needs_probe = false;
+    true
+}
+
 // ─── 印を見つけたらツールで包む ─────────────────────────────────────────
 
 fn detect_wrapper(
@@ -845,7 +870,7 @@ fn read_version(source: &VersionSource, location: &Path, fs: &dyn FsProbe) -> Op
 }
 
 /// `3.12.4.final.0` / `3.12.4` → `3.12.4`（数字の成分を 3 つまで）
-fn normalize_version(raw: &str) -> Option<String> {
+pub(super) fn normalize_version(raw: &str) -> Option<String> {
     let parts: Vec<&str> = raw
         .split('.')
         .take_while(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
@@ -854,7 +879,7 @@ fn normalize_version(raw: &str) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("."))
 }
 
-fn bare_program(name: &str) -> &str {
+pub(super) fn bare_program(name: &str) -> &str {
     name.strip_suffix(".exe").unwrap_or(name)
 }
 
@@ -915,6 +940,13 @@ fn msg_alias_only(dir: &Path) -> String {
             "Only an app execution alias was found on PATH ({})",
             dir.display()
         ),
+    )
+}
+
+pub(super) fn msg_interpreter_missing(label: &str, interpreter: &str) -> String {
+    tr(
+        format!("{label} は {interpreter} が無い（壊れている）ので自動では選ばない"),
+        format!("{label} has no {interpreter} (broken), so it is not picked automatically"),
     )
 }
 

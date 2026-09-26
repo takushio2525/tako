@@ -3939,7 +3939,8 @@ pub fn tools() -> Vec<Value> {
                 `${file}` = ファイルの絶対パス / `${fileDir}` = ファイルのあるディレクトリ / \
                 `${fileBase}` = ファイル名（拡張子付き）/ `${fileNoExt}` = ファイル名（拡張子なし）/ \
                 `${ext}` = 拡張子（小文字・ドットなし）/ `${workspaceRoot}` = プロジェクトのルート\
-                （無ければ git のルート → ファイルのディレクトリ）\n\
+                （無ければ git のルート → ファイルのディレクトリ）/ `${python}` = 実行環境の python\n\
+                \n.py はプロジェクトの .venv / uv / poetry / conda / pyenv を自動で使う（応答の runtime）。\n\
                 \n解決順: command 引数 → ファイル内宣言 → ユーザー設定の拡張子既定 → プロジェクト既定\
                 （Cargo.toml / package.json / pyproject.toml / go.mod / *.csproj / Makefile を上へ辿る）→ \
                 組み込みの拡張子既定 → エラー。",
@@ -3997,6 +3998,7 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_run_resolve",
             "description": "ファイルの実行プロファイル一覧を解決して返す（実行しない。FR-3.18）。\
                 ファイル内宣言・プロジェクト既定・拡張子既定から検出されたプロファイル一覧・コマンド・cwd・source と、属するプロジェクト（project）を返す。\
+                実行環境の候補（runtimes: id / manager / label / version / auto / tier）・走らせるもの（runtime）・項目ごとの実効値と出典（config）も返す。\
                 UI のドロップダウンと同じデータ。tako_run 実行前の事前確認に使う。",
             "inputSchema": {
                 "type": "object",
@@ -4006,6 +4008,10 @@ pub fn tools() -> Vec<Value> {
                         "description": "対象ファイルパス（相対パスは呼び出し元ペインの cwd 基準）",
                     },
                     "pane": pane_schema("相対パス解決の基準ペイン ID（省略時は呼び出し元）"),
+                    "refresh": {
+                        "type": "boolean",
+                        "description": "true で道具の場所・版の問い合わせをやり直す",
+                    },
                 },
                 "required": ["path"],
                 "additionalProperties": false,

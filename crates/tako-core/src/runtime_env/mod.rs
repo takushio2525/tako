@@ -33,6 +33,7 @@
 
 mod detect;
 pub mod kinds;
+pub mod tier_p;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -40,7 +41,7 @@ use std::path::{Path, PathBuf};
 use crate::platform::support::Platform;
 use crate::runner_config::RuntimeRef;
 
-pub use detect::{detect, resolve_ref};
+pub use detect::{apply_probed_env, detect, resolve_ref};
 pub use kinds::KINDS;
 
 // ─── 表の型 ────────────────────────────────────────────────────────────
@@ -157,6 +158,19 @@ pub struct InProjectEnv {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProbeCmd {
     pub args: &'static [&'static str],
+    /// 問い合わせが返したディレクトリ（環境の置き場）の中の置き場。
+    /// 分かれば包む形と同時に activation もする（`pytest` を直接呼ぶ宣言にも環境が効く）
+    pub layout: EnvLayout,
+}
+
+/// 一覧ファイルが無いときに、道具へ一覧を聞く問い合わせ（Tier P）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListProbe {
+    /// 道具の実行ファイル名（Tier P でログインシェル / PATH から探す）
+    pub program: PerOs<&'static str>,
+    pub args: &'static [&'static str],
+    /// 応答（JSON オブジェクト）の中で、置き場の配列を持つキー
+    pub json_key: &'static str,
 }
 
 /// 印を見つけたらツールで包む（`<道具> run python …`）
@@ -203,6 +217,8 @@ pub struct NamedEnvListSpec {
     pub name_key: &'static str,
     pub layout: EnvLayout,
     pub version: VersionSource,
+    /// 一覧ファイルが無いときの問い合わせ（Tier P）
+    pub list_probe: Option<ListProbe>,
 }
 
 /// 版を書いたファイル → 道具の置き場の `versions/<版>`
@@ -278,6 +294,8 @@ pub struct RuntimeKind {
     pub fallback: PerOs<&'static str>,
     /// 包む形のときに道具の後ろへ置くプログラム名（`<道具> run <これ>`）
     pub wrapped_program: &'static str,
+    /// 版を聞く引数（Tier P。`<interpreter> <これ>` の出力の最初の版らしい語を採る）
+    pub version_args: &'static [&'static str],
     /// **自動選択の順**に並べた検出器
     pub detectors: &'static [Detector],
 }
@@ -476,6 +494,38 @@ impl Detection {
     pub fn auto_candidate(&self) -> Option<&Candidate> {
         self.auto.and_then(|i| self.candidates.get(i))
     }
+
+    /// 自動で選べる候補のうち、**interpreter のパスが実在しないもの**（`python` の消えた
+    /// 壊れた `.venv` 等）を自動の対象から外して選び直す（#1730）。
+    ///
+    /// 印（`pyvenv.cfg`）だけ残った環境を自動で選ぶと、実行ペインが「そのファイルは無い」で
+    /// 落ちる。次の候補（最後はシステム = 名前のまま、解くのはシェル）へ進め、外した理由は
+    /// `warnings` に残す。候補の一覧には残す（利用者が見て直せるように）。
+    ///
+    /// 見るのは語の先頭が**パスの形**（区切りを含む）のときだけ。素の名前（`python3`）は
+    /// 実行ペインのシェルが PATH から解くものなので、ここでは確かめない
+    pub fn demote_missing_interpreters(&mut self, fs: &dyn FsProbe) {
+        let Self {
+            candidates,
+            auto,
+            warnings,
+        } = self;
+        for c in candidates.iter_mut() {
+            let Some(first) = c.applied.program.first() else {
+                continue;
+            };
+            if c.auto_eligible && is_path_like(first) && !fs.is_file(Path::new(first)) {
+                c.auto_eligible = false;
+                warnings.push(detect::msg_interpreter_missing(&c.label, first));
+            }
+        }
+        *auto = candidates.iter().position(|c| c.auto_eligible);
+    }
+}
+
+/// 語が素の名前ではなくパスの形か（区切りはどちらの OS のものも見る）
+pub fn is_path_like(word: &str) -> bool {
+    word.contains('/') || word.contains('\\')
 }
 
 /// 保存した参照が解けなかった（**既定へ落とさない** = #1466。呼び出し側はエラーにする）

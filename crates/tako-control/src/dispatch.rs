@@ -862,6 +862,10 @@ pub enum OffloadJob {
     /// 定義ジャンプの問い合わせ（#1680）。サーバの起動と応答を待つので background へ出し、
     /// 着地（ペインを開く）は [`OffloadOutcome::OnUi`] で UI スレッドへ戻す
     LspGoto(Box<LspGotoJob>),
+    /// Code Runner の実行プロファイルと実行環境の一覧（#1730）。実行環境の Tier P
+    /// （道具の場所・版・環境の置き場を子プロセスに聞く）を含むので、UI スレッドでは
+    /// 相対パスの基準（ペインの cwd）だけを採る
+    RunResolve { ctx: RunResolveCtx },
 }
 
 /// background で走らせた結果（#1680）
@@ -1010,6 +1014,15 @@ pub fn prepare_offload(
             )
             .map(|job| OffloadJob::LspGoto(Box::new(job))),
         ),
+        // #1730: 実行環境の Tier P（子プロセス。1 回の上限 5 秒）を UI スレッドで待たない
+        Request::RunResolve {
+            path,
+            pane,
+            refresh,
+        } => Some(
+            collect_run_resolve(host, path, *pane, *refresh)
+                .map(|ctx| OffloadJob::RunResolve { ctx }),
+        ),
         _ => None,
     }
 }
@@ -1053,6 +1066,7 @@ impl OffloadJob {
                 action,
                 name,
             } => lsp_server_action(Some(&manager), &action, name.as_deref()),
+            OffloadJob::RunResolve { ctx } => finish_run_resolve(&ctx),
             OffloadJob::LspGoto(_) => Err(DispatchError::Operation(
                 "定義ジャンプは run_staged で走らせる（着地に UI スレッドの続きが要る）".into(),
             )),
@@ -6155,6 +6169,10 @@ fn dispatch_inner(
             // ファイル先頭 16 KiB を読む
             let head = read_file_head(&resolved)?;
 
+            // 実行環境（#1730）: プロジェクトの `.venv` / uv / poetry 等を設定なしで選ぶ。
+            // Tier F（stat と先頭読み）+ 一覧で覚えた Tier P の事実だけ = 子プロセスは起こさない
+            let runtime = crate::runtime_probe::for_run(&resolved);
+
             // 解決（宣言 → ユーザーの拡張子既定 → プロジェクト既定 → 組み込み。#1656）
             let settings = crate::settings::load();
             let resolution = tako_core::resolve_file(
@@ -6163,6 +6181,7 @@ fn dispatch_inner(
                 &settings.runner_defaults,
                 profile.as_deref(),
                 cmd_override.as_deref(),
+                &runtime.as_ref().map(|r| r.words()).unwrap_or_default(),
             )
             .map_err(|e| DispatchError::Operation(e.to_string()))?;
 
@@ -6178,12 +6197,28 @@ fn dispatch_inner(
             }
 
             // シェル指定時はコマンドを包む（包み方は宣言されたシェルの方言で決まる。#875）
-            let final_command = match &plan.shell {
+            let wrapped = match &plan.shell {
                 Some(shell) => {
                     tako_core::platform::shell::declared_shell_command(shell, &plan.command)
                 }
                 None => plan.command.clone(),
             };
+            // 実行環境の activation（PATH の前置 + `VIRTUAL_ENV` 等）はコマンド文字列の先頭へ
+            // 埋める（器の中へ届き、rc が PATH を組み直した後に効く = 境界 B1 の 1 実装。#1730）。
+            // 前に付けるものが無ければ `wrapped` のまま（今と 1 バイトも変わらない）
+            let env = runtime.as_ref().map(|r| r.env()).unwrap_or_default();
+            let path_prepend = runtime
+                .as_ref()
+                .map(|r| r.path_prepend())
+                .unwrap_or_default();
+            let final_command = tako_core::platform::shell::compose_run_script(
+                tako_core::platform::shell::run_pane_dialect(),
+                &tako_core::platform::shell::RunScript {
+                    env: &env,
+                    path_prepend: &path_prepend,
+                    command: &wrapped,
+                },
+            );
 
             // #1657: 同じファイルの同じプロファイルの実行ペインがこのタブに生きていれば、
             // **その位置で**差し替える（再生ボタンを 5 回押しても 1 枚のまま）。
@@ -6256,58 +6291,25 @@ fn dispatch_inner(
                 "stopped_running": stopped_running,
                 // #1662: 走らせる前に保存したプレビュー（未保存の編集が無ければ空）
                 "saved_panes": saved_panes.iter().map(|p| p.as_u64()).collect::<Vec<_>>(),
+                // #1730: 走らせた実行環境（無い拡張子・A/B 中は null）と、項目ごとの出典
+                "runtime": crate::runtime_probe::runtime_json(runtime.as_ref()),
+                "config_sources": crate::runtime_probe::config_sources_json(
+                    &crate::runtime_probe::effective_config(
+                        runtime.as_ref(),
+                        resolution.declared_cwd.as_deref(),
+                    ),
+                ),
+                "warnings": crate::runtime_probe::warnings(runtime.as_ref(), plan),
             }))
         }
 
-        Request::RunResolve { path, pane } => {
-            let (_, target) = resolve_pane(host.workspace(), pane)?;
-
-            let mut resolved = PathBuf::from(&path);
-            if resolved.is_relative() {
-                if let Some(cwd) = host.session(target).and_then(|s| s.cwd()) {
-                    resolved = cwd.join(resolved);
-                }
-            }
-            // 解決は境界（B26）を通す（保存・応答・子プロセスへ渡る値。#970）
-            let resolved = tako_core::platform::path::canonicalize(&resolved).map_err(|e| {
-                DispatchError::Operation(format!("ファイルを開けない（{path}: {e}）"))
-            })?;
-            if !resolved.is_file() {
-                return Err(DispatchError::Operation(format!(
-                    "ファイルではない: {}",
-                    resolved.display()
-                )));
-            }
-
-            let head = read_file_head(&resolved)?;
-            let settings = crate::settings::load();
-
-            let resolution =
-                tako_core::resolve_file(&resolved, &head, &settings.runner_defaults, None, None)
-                    .map_err(|e| DispatchError::Operation(e.to_string()))?;
-
-            let profiles: Vec<Value> = resolution
-                .all_profiles
-                .iter()
-                .map(|p| {
-                    json!({
-                        "profile": p.profile,
-                        "command": p.command,
-                        "cwd": p.cwd.display().to_string(),
-                        "source": p.source.as_str(),
-                    })
-                })
-                .collect();
-
-            Ok(json!({
-                "path": resolved.display().to_string(),
-                "profiles": profiles,
-                "warnings": resolution.warnings,
-                "default_profile": resolution.plan.profile,
-                "project": run_project_json(resolution.project.as_ref()),
-                "workspace_root": resolution.workspace_root.display().to_string(),
-            }))
-        }
+        // #1730: 一覧は Tier P（子プロセスの問い合わせ）を含むので、IPC からは
+        // `prepare_offload` で background へ出る。ここは offload を使わない host の同期経路
+        Request::RunResolve {
+            path,
+            pane,
+            refresh,
+        } => finish_run_resolve(&collect_run_resolve(host, &path, pane, refresh)?),
 
         Request::RunnerDefaults {
             ext,
@@ -6730,6 +6732,103 @@ fn dispatch_show_command(
             "不明な action: {other:?}（show / list / copy / run / dismiss のいずれか）"
         ))),
     }
+}
+
+/// `RunResolve` の UI スレッド側で採る文脈（#1730）。相対パスの基準（ペインの cwd）だけを
+/// ここで読み、ファイルの読み取り・検出・子プロセスの問い合わせは [`finish_run_resolve`] が行う
+pub struct RunResolveCtx {
+    /// 呼び手が渡したパス（エラーの文面に使う）
+    raw: String,
+    /// ペインの cwd を基準にした（まだ正規化していない）パス
+    joined: PathBuf,
+    refresh: bool,
+}
+
+fn collect_run_resolve(
+    host: &dyn ControlHost,
+    path: &str,
+    pane: Option<u64>,
+    refresh: bool,
+) -> Result<RunResolveCtx, DispatchError> {
+    let (_, target) = resolve_pane(host.workspace(), pane)?;
+    let mut joined = PathBuf::from(path);
+    if joined.is_relative() {
+        if let Some(cwd) = host.session(target).and_then(|s| s.cwd()) {
+            joined = cwd.join(joined);
+        }
+    }
+    Ok(RunResolveCtx {
+        raw: path.to_string(),
+        joined,
+        refresh,
+    })
+}
+
+/// `RunResolve` の本体（**UI スレッドで呼ばない**。実行環境の Tier P が子プロセスを起こす）
+fn finish_run_resolve(ctx: &RunResolveCtx) -> Result<Value, DispatchError> {
+    // 解決は境界（B26）を通す（保存・応答・子プロセスへ渡る値。#970）
+    let resolved = tako_core::platform::path::canonicalize(&ctx.joined)
+        .map_err(|e| DispatchError::Operation(format!("ファイルを開けない（{}: {e}）", ctx.raw)))?;
+    if !resolved.is_file() {
+        return Err(DispatchError::Operation(format!(
+            "ファイルではない: {}",
+            resolved.display()
+        )));
+    }
+
+    let head = read_file_head(&resolved)?;
+    let settings = crate::settings::load();
+    // 実行環境の候補（Tier F + 足りない Tier P を聞いて覚える。`refresh` で聞き直す）
+    let runtime = crate::runtime_probe::for_resolve(&resolved, ctx.refresh);
+
+    let resolution = tako_core::resolve_file(
+        &resolved,
+        &head,
+        &settings.runner_defaults,
+        None,
+        None,
+        &runtime.as_ref().map(|r| r.words()).unwrap_or_default(),
+    )
+    .map_err(|e| DispatchError::Operation(e.to_string()))?;
+
+    let profiles: Vec<Value> = resolution
+        .all_profiles
+        .iter()
+        .map(|p| {
+            json!({
+                "profile": p.profile,
+                "command": p.command,
+                "cwd": p.cwd.display().to_string(),
+                "source": p.source.as_str(),
+            })
+        })
+        .collect();
+    let mut warnings = resolution.warnings.clone();
+    warnings.extend(crate::runtime_probe::warnings(
+        runtime.as_ref(),
+        &resolution.plan,
+    ));
+
+    Ok(json!({
+        "path": resolved.display().to_string(),
+        "profiles": profiles,
+        "warnings": warnings,
+        "default_profile": resolution.plan.profile,
+        "project": run_project_json(resolution.project.as_ref()),
+        "workspace_root": resolution.workspace_root.display().to_string(),
+        // #1730: 実行設定の実効値・走らせる実行環境・候補の全部・プロジェクトのルート
+        "project_root": resolution
+            .project
+            .as_ref()
+            .map(|p| p.root.display().to_string()),
+        "config": crate::runtime_probe::config_json(&crate::runtime_probe::effective_config(
+            runtime.as_ref(),
+            resolution.declared_cwd.as_deref(),
+        )),
+        "runtime": crate::runtime_probe::runtime_json(runtime.as_ref()),
+        "runtimes": crate::runtime_probe::runtimes_json(runtime.as_ref()),
+        "probe": crate::runtime_probe::probe_json(runtime.as_ref()),
+    }))
 }
 
 /// Code Runner の応答に載せるプロジェクト（`Run` / `RunResolve` 共通。#1656）。
@@ -29152,6 +29251,7 @@ mod tests {
             Request::RunResolve {
                 path: main.display().to_string(),
                 pane: Some(pane.as_u64()),
+                refresh: false,
             },
             PaneOrigin::Mcp,
         )
@@ -29236,6 +29336,7 @@ mod tests {
             Request::RunResolve {
                 path: loose.display().to_string(),
                 pane: Some(pane.as_u64()),
+                refresh: false,
             },
             PaneOrigin::Mcp,
         )
@@ -29250,6 +29351,165 @@ mod tests {
             loose_dir.display().to_string().as_str()
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- #1730: 設定なしでプロジェクトの実行環境（.venv 等）で走る ---
+
+    /// 一時 dir に `.venv`（印 + interpreter）のあるプロジェクトを組む。`.git` の段で
+    /// 探索が止まるので、外側にある実機の環境を拾わない。返すのは (器, ルート, venv, a.py)
+    fn venv_project_1730(
+        tag: &str,
+        with_venv: bool,
+    ) -> (
+        tako_core::test_residue::ScratchDir,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+    ) {
+        let scratch = tako_core::test_residue::ScratchDir::new(tag);
+        let base = tako_core::platform::path::canonicalize(scratch.path()).unwrap();
+        std::fs::create_dir_all(base.join(".git")).unwrap();
+        let venv = base.join(".venv");
+        if with_venv {
+            std::fs::create_dir_all(venv.join("bin")).unwrap();
+            std::fs::create_dir_all(venv.join("Scripts")).unwrap();
+            std::fs::write(venv.join("pyvenv.cfg"), "version = 3.12.4\n").unwrap();
+            std::fs::write(venv.join("bin/python"), "").unwrap();
+            std::fs::write(venv.join("Scripts/python.exe"), "").unwrap();
+        }
+        let file = base.join("a.py");
+        std::fs::write(&file, "import sys\nprint(sys.prefix)\n").unwrap();
+        (scratch, base, venv, file)
+    }
+
+    fn venv_interpreter_1730(venv: &Path) -> PathBuf {
+        if cfg!(windows) {
+            venv.join("Scripts").join("python.exe")
+        } else {
+            venv.join("bin").join("python")
+        }
+    }
+
+    fn run_1730(host: &mut MockHost, file: &Path) -> Value {
+        let pane = host.ws.active_tab().tree().focused();
+        dispatch(
+            host,
+            Request::Run {
+                path: file.display().to_string(),
+                pane: Some(pane.as_u64()),
+                tab: None,
+                profile: None,
+                command: None,
+                direction: None,
+                ratio: None,
+                auto_close: None,
+                focus: None,
+                new_pane: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap()
+    }
+
+    /// 受け入れ条件: `RunResolve` は Tier P（子プロセス）を含むので `prepare_offload` を通り、
+    /// background で走らせた答えは同期経路と同じになる
+    #[test]
+    fn run_resolveはprepare_offloadを通り同期経路と同じ応答を返す() {
+        let (_s, _base, venv, file) = venv_project_1730("dispatch-1730-offload", true);
+        let mut host = MockHost::new();
+        let pane = host.ws.active_tab().tree().focused();
+        let req = Request::RunResolve {
+            path: file.display().to_string(),
+            pane: Some(pane.as_u64()),
+            refresh: false,
+        };
+        let job = prepare_offload(&host, &req)
+            .expect("RunResolve は offload の対象")
+            .expect("文脈を採れる");
+        assert!(matches!(job, OffloadJob::RunResolve { .. }));
+        let mut offloaded = job.run().unwrap();
+        let mut sync = dispatch(&mut host, req, PaneOrigin::Mcp).unwrap();
+        // 所要（ms）は回ごとに違うので落として比べる
+        for v in [&mut offloaded, &mut sync] {
+            v.as_object_mut().unwrap().remove("probe");
+        }
+        assert_eq!(offloaded, sync);
+
+        let rt = &sync["runtime"];
+        assert_eq!(rt["manager"], "venv", "{sync}");
+        assert_eq!(rt["source"], "auto");
+        assert_eq!(rt["path"], venv.display().to_string().as_str());
+        assert_eq!(
+            rt["program"][0],
+            venv_interpreter_1730(&venv).display().to_string().as_str()
+        );
+        let list = sync["runtimes"].as_array().unwrap();
+        assert!(list.len() >= 2, "venv とシステムが並ぶ: {sync}");
+        assert_eq!(list.iter().filter(|c| c["selected"] == true).count(), 1);
+        assert!(sync["project_root"].is_null(), "印の無いプロジェクト");
+        assert_eq!(sync["config"]["runtime"]["python"]["source"], "auto");
+        assert_eq!(sync["config"]["cwd"]["source"], "default");
+
+        // 相対パスの基準（ペインの cwd）を取れないペインはエラーで返る（offload へ出さない）
+        let bad = Request::RunResolve {
+            path: "a.py".into(),
+            pane: Some(999_999),
+            refresh: false,
+        };
+        assert!(matches!(prepare_offload(&host, &bad), Some(Err(_))));
+    }
+
+    /// 受け入れ条件: `.venv` があれば設定なしでその interpreter と activation
+    /// （PATH の前置 + `VIRTUAL_ENV`。コマンド文字列の先頭 = 境界 B1）で走る
+    #[test]
+    fn runは設定なしでvenvのinterpreterとactivationで走らせる() {
+        let (_s, _base, venv, file) = venv_project_1730("dispatch-1730-run", true);
+        let mut host = MockHost::new();
+        let result = run_1730(&mut host, &file);
+        let python = venv_interpreter_1730(&venv).display().to_string();
+        let expected = format!(
+            "{} a.py",
+            tako_core::platform::shell::run_pane_dialect().command_words(&[python])
+        );
+        assert_eq!(result["command"], expected.as_str(), "{result}");
+        assert_eq!(result["runtime"]["manager"], "venv");
+        assert_eq!(result["config_sources"]["runtime"], "auto");
+        let pane = result["pane"].as_u64().unwrap();
+        let env = vec![("VIRTUAL_ENV".to_string(), venv.display().to_string())];
+        let path_prepend = vec![venv_interpreter_1730(&venv)
+            .parent()
+            .unwrap()
+            .display()
+            .to_string()];
+        let launch = tako_core::platform::shell::compose_run_script(
+            tako_core::platform::shell::run_pane_dialect(),
+            &tako_core::platform::shell::RunScript {
+                env: &env,
+                path_prepend: &path_prepend,
+                command: result["command"].as_str().unwrap(),
+            },
+        );
+        let opts = host.attached_options.get(&pane).expect("options 記録");
+        assert_run_pane_command(opts.command.as_ref().expect("command"), &launch, pane);
+    }
+
+    /// 受け入れ条件: 実行環境が無ければ今と同じ（`python3 a.py` / `python a.py`・前置なし）
+    #[test]
+    fn runは実行環境が無ければ今と同じコマンドで走らせる() {
+        let (_s, _base, _venv, file) = venv_project_1730("dispatch-1730-none", false);
+        let mut host = MockHost::new();
+        let result = run_1730(&mut host, &file);
+        // #1730 以前の組み込み既定（macOS `python3 ${fileBase}` / Windows `python ${fileBase}`）
+        let fallback = if cfg!(windows) { "python" } else { "python3" };
+        assert_eq!(result["command"], format!("{fallback} a.py").as_str());
+        assert_eq!(result["runtime"]["manager"], "system", "{result}");
+        let pane = result["pane"].as_u64().unwrap();
+        let opts = host.attached_options.get(&pane).expect("options 記録");
+        assert_run_pane_command(
+            opts.command.as_ref().expect("command"),
+            &format!("{fallback} a.py"),
+            pane,
+        );
     }
 
     #[test]

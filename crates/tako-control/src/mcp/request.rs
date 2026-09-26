@@ -1222,6 +1222,7 @@ pub(super) fn build_request(
         "tako_run_resolve" => Request::RunResolve {
             path: str_arg(args, "path")?.ok_or("path を指定する")?,
             pane: u64_arg(args, "pane")?.or(caller),
+            refresh: bool_arg(args, "refresh")?.unwrap_or(false),
         },
         "tako_run_defaults" => Request::RunnerDefaults {
             ext: str_arg(args, "ext")?,

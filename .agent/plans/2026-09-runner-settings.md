@@ -630,6 +630,20 @@ tako run-config report.py --reset runtime        # 自動選択へ戻す（--res
   - Tier F の所要を実測して PR に書く（目標 50 ms 以内。assert にはしない）
   - `tako context-budget` の `mcp_catalog` が予算内で、増分を PR に書く
 - 依存: S1 / **#1656 の着地**（`runner.rs` と dispatch の `Run` / `RunResolve` が重なる）/ 規模: L
+- **実装で決めたこと（#1730。この節の案からの差分。正本は FR-3.18.3）**:
+  - **Tier P の答えは「事実」として覚え、Tier F の結果は覚えない**（§5.3 の「検出結果を指紋付きでキャッシュ」から変えた）。
+    検出結果ごと覚えると、ディレクトリの mtime の粒度（HFS+ / FAT は秒）で `.venv` を作った直後の実行が古い答えを引きうる。
+    Tier F は毎回走らせ（実測 0.1 ms 前後）、覚えるのは子プロセスの答え（道具の場所 / env の一覧 / 環境の置き場 / 版）だけにして、
+    それぞれ指紋（ファイルが在るか / 印のファイルの mtime の組 / interpreter の mtime）で古さを見る。`tako-control::runtime_probe`
+  - Tier P の答えは Tier F の材料（GUI の PATH の前 / 一覧ファイルの代わり）へ重ねて**もう一度 Tier F を回す**形で戻す
+    （`runtime_env::tier_p`。検出の規則を 2 か所に書かない）。一覧ファイルが無いときの `conda info --envs --json` は表の
+    `NamedEnvListSpec::list_probe`、包む形の環境の置き場の配置は `ProbeCmd::layout`、版の引数は `RuntimeKind::version_args` として表へ足した
+  - **interpreter の消えた環境（壊れた `.venv`）は自動で選ばない**（`Detection::demote_missing_interpreters`。S1 の検出は印しか見ない）
+  - `command` の上書きにも実行環境を効かせる（§4.3 の「素通り」は S3 以降の保存した設定の層の話として読んだ。`${python}` を書いた上書きが
+    venv の python を指さないと、`--command "${python} -m pytest"` が PATH の python で走る）
+  - #1656 のプロジェクト既定の解釈系（`uv.lock` → `poetry.lock` → `.venv` の推定）は、実行環境の層が値を渡したときはその値を使い、
+    渡さないとき（A/B / 再生ボタンの一覧）だけ #1656 の推定を使う（`runner_project::interpreter`）
+  - 再生ボタンのドロップダウンの表示（`detect_preview_run_profiles`）は実行環境を重ねない（UI スレッドで Tier F を回さない。寄せ先は S5）
 
 ### S3: 実行設定を覚える（保存・実行環境とプロファイルの選択）
 
