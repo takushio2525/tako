@@ -19,6 +19,7 @@
 //! | `garbage` | initialize の応答の前に壊れた JSON を 1 つ混ぜる |
 //! | `chatty` | initialized の後に通知を大量に投げる |
 //! | `ask` | initialized の後に `workspace/configuration` を問い合わせる |
+//! | `die` | 起動直後に即死する（initialize を読まない） |
 
 use std::io::{BufRead, BufReader, Write};
 
@@ -102,6 +103,10 @@ fn main() {
     let spawns = arg_or_env(&args, "--spawns", "TAKO_LSP_FAKE_SPAWNS");
     append(&spawns, &std::process::id().to_string());
     eprintln!("tako-lsp-fake: scenario={scenario}");
+    if scenario == "die" {
+        // 起動直後に即死する（initialize を 1 通も読まない）
+        std::process::exit(2);
+    }
 
     let out = Out {
         split: scenario == "split-header",

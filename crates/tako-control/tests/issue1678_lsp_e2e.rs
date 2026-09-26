@@ -292,7 +292,10 @@ fn 応答しないサーバはタイムアウトで起こし直し上限で諦�
     // 書く前に kill されうる（負荷の高い `cargo test --workspace` で 3 件になった実測）
     assert_eq!(status["spawn_count"], json!(4), "初回 + 再起動 3 回");
     let recorded = spawn_pids(&scratch).len();
-    assert!(recorded <= 4, "起こした回数より多く記録されている: {recorded}");
+    assert!(
+        recorded <= 4,
+        "起こした回数より多く記録されている: {recorded}"
+    );
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(spawn_pids(&scratch).len(), recorded, "諦めた後は起こさない");
     assert!(
@@ -308,6 +311,27 @@ fn 応答しないサーバはタイムアウトで起こし直し上限で諦�
             !tako_core::platform::process::pid_alive(pid)
         });
     }
+}
+
+/// エッジケース: 起動直後に即死するサーバ（initialize を 1 通も読まない）も、
+/// 待ち続けずに上限まで起こし直して諦める
+#[test]
+fn 起動直後に即死するサーバも上限で諦める() {
+    let scratch = Scratch::new("die");
+    let manager = LspManager::new(config(&scratch, "die"));
+    let mut link = DocLink::default();
+    open(&manager, &mut link, &scratch.file(), "fn main() {}\n", 0);
+    wait_until("諦めた", Duration::from_secs(20), || {
+        state(&manager) == "gave_up"
+    });
+    let status = server_status(&manager);
+    assert_eq!(status["spawn_count"], json!(4));
+    assert!(status["pid"].is_null());
+    assert!(status["last_exit"].is_string(), "{status}");
+    assert_eq!(
+        status["reason"],
+        json!(text::fill(text::GAVE_UP_REASON, &[("count", "4")]))
+    );
 }
 
 /// エッジケース: タイムアウトした要求は待ちの表から消え、`$/cancelRequest` が続く。
@@ -333,7 +357,11 @@ fn タイムアウトした要求は取り消しを送り待ちの表から消�
     let process = ServerProcess::spawn(&plan, "fake", handlers, None).unwrap();
     let outcome = process.request("initialize", json!({}), Duration::from_millis(300));
     assert_eq!(outcome, Err(RpcError::Timeout(300)));
-    assert_eq!(process.pending_count(), 0, "タイムアウトした待ちは表から消える");
+    assert_eq!(
+        process.pending_count(),
+        0,
+        "タイムアウトした待ちは表から消える"
+    );
     wait_until("取り消しの受信", Duration::from_secs(10), || {
         methods(&scratch).contains(&"$/cancelRequest".to_string())
     });
@@ -345,7 +373,10 @@ fn タイムアウトした要求は取り消しを送り待ちの表から消�
         .into_iter()
         .find(|m| m["method"] == json!("initialize"))
         .unwrap();
-    assert_eq!(cancel["params"]["id"], initialize["id"], "取り消すのは打ち切った要求の id");
+    assert_eq!(
+        cancel["params"]["id"], initialize["id"],
+        "取り消すのは打ち切った要求の id"
+    );
     let pid = process.pid();
     drop(process);
     wait_until("Drop で終わる", Duration::from_secs(5), || {
