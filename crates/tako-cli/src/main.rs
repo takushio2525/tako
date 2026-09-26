@@ -3876,7 +3876,6 @@ fn mcp_serve() -> Result<(), String> {
                     caller_role: caller_role.clone(),
                     connected,
                     exec: &mut exec,
-                    ipc_tx: None,
                 };
                 tako_control::mcp::handle_message(&message, &mut session)
             }

@@ -3588,6 +3588,14 @@ fn dispatch_inner(
             )
         }
 
+        // 非同期 run の開始（#1745）は受け口（`ipc::submit`）が spawn と完了待ちに分けて
+        // 頼むので、ここへは来ない。UI スレッドの上では spawn の完了を待てないため、
+        // 直に届いたら黙って固まらずに断る
+        Request::OrchestratorRunStart { .. } => Err(DispatchError::Operation(
+            "非同期 run の開始は受け口（IPC / MCP）が処理する要求で、dispatch では実行できない"
+                .into(),
+        )),
+
         // 非同期 run の進捗照会・結果回収（#121）。レジストリはプロセス内グローバルで
         // ControlHost 不要のため dispatch で直接呼ぶ
         Request::OrchestratorRunStatus { run_id } => match run_id {
@@ -25220,7 +25228,6 @@ mod tests {
             caller_role: None,
             connected: true,
             exec: &mut exec,
-            ipc_tx: None,
         };
         let call = serde_json::json!({
             "jsonrpc": "2.0",

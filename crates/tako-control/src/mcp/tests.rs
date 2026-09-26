@@ -29,7 +29,6 @@ mod tests {
             caller_role: None,
             connected,
             exec: &mut exec,
-            ipc_tx: None,
         };
         let response = handle_message(&message, &mut session);
         (response, seen)
@@ -831,7 +830,6 @@ mod tests {
             caller_role: None,
             connected: true,
             exec: &mut exec,
-            ipc_tx: None,
         };
         let response = handle_message(&call("tako_list_panes", json!({})), &mut session).unwrap();
         let result = &response["result"];
@@ -1120,6 +1118,85 @@ mod tests {
             .contains("direction"));
     }
 
+    /// #1745: stdio ブリッジ（`tako mcp serve`）は受け口のチャネルを持たない。
+    /// 非同期 run が exec（= IPC）へ開始要求を 1 件渡すだけなら HTTP と同じ答えになる。
+    /// #1745 まではここで JSON-RPC エラー（`sync=true` を指定してください）が返っていた
+    #[test]
+    fn orchestrator_runの非同期は開始要求をexecへ渡すだけ() {
+        let mut seen = Vec::new();
+        let response = {
+            let mut exec = |request: Request| -> Result<Value, String> {
+                seen.push(request);
+                Ok(json!({ "run_id": "run-9", "pane_id": 42, "spawned_by": 7, "tmux_session": null }))
+            };
+            let mut session = McpSession {
+                caller_pane: Some(7),
+                caller_role: Some("master:t".into()),
+                connected: true,
+                exec: &mut exec,
+            };
+            let message = call(
+                "tako_orchestrator_run",
+                json!({ "project": "demo", "prompt": "やって", "label": "l" }),
+            );
+            handle_message(&message, &mut session).expect("応答がある")
+        };
+        assert!(
+            response.get("error").is_none(),
+            "非同期 run が JSON-RPC エラーになった: {response}"
+        );
+        assert_eq!(response["result"]["isError"], false);
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["run_id"], "run-9");
+
+        assert_eq!(
+            seen.len(),
+            1,
+            "exec へ渡すのは開始要求 1 件だけ（spawn も完了待ちも受け口側）: {seen:?}"
+        );
+        let opts = wait::RunOptions::from_start_request(&seen[0])
+            .unwrap_or_else(|| panic!("開始要求ではない: {:?}", seen[0]));
+        assert_eq!(opts.project, "demo");
+        assert_eq!(opts.label.as_deref(), Some("l"));
+        assert_eq!(opts.pane, Some(7), "pane 省略は呼び出し元");
+        assert_eq!(opts.caller_role.as_deref(), Some("master:t"));
+        assert_eq!(opts.timeout, std::time::Duration::from_secs(1800));
+        assert!(opts.auto_close);
+        assert_eq!(opts.output_lines, 200);
+        assert_eq!(opts.initial_delay, wait::RUN_INITIAL_DELAY);
+        assert_eq!(opts.interval, wait::RUN_INTERVAL);
+    }
+
+    /// sync=true は従来どおり MCP 側で spawn から合成する（開始要求は使わない）
+    #[test]
+    fn orchestrator_runのsyncはspawnから合成する() {
+        let mut seen = Vec::new();
+        let response = {
+            // spawn で断れば完了待ち（20 秒の初期待機）へ進まずに返る
+            let mut exec = |request: Request| -> Result<Value, String> {
+                seen.push(request);
+                Err("spawn できない".into())
+            };
+            let mut session = McpSession {
+                caller_pane: Some(7),
+                caller_role: None,
+                connected: true,
+                exec: &mut exec,
+            };
+            let message = call(
+                "tako_orchestrator_run",
+                json!({ "project": "demo", "prompt": "やって", "sync": true }),
+            );
+            handle_message(&message, &mut session).expect("応答がある")
+        };
+        assert!(
+            matches!(seen.as_slice(), [Request::OrchestratorSpawn { .. }]),
+            "{seen:?}"
+        );
+        assert_eq!(response["error"]["message"], "spawn できない");
+    }
+
     #[test]
     fn orchestrator_spawnのpaneとtab優先順位() {
         // pane のみ → pane が使われ tab は None
@@ -1215,9 +1292,11 @@ mod tests {
 
     mod http {
         use super::*;
+        use crate::ipc::IncomingRequest;
         use futures::channel::mpsc::unbounded;
         use futures::StreamExt;
         use std::io::{Read, Write};
+        use tako_core::PaneOrigin;
 
         const TOKEN: &str = "http-test-token";
 
@@ -1447,7 +1526,6 @@ mod tests {
             caller_role: Some("master:takodev".into()),
             connected: true,
             exec: &mut exec,
-            ipc_tx: None,
         };
         let response = handle_message(
             &call("tako_orchestrator_guide", json!({ "topic": "monitoring" })),

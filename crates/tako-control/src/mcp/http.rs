@@ -140,19 +140,9 @@ fn handle_http(
         });
         return respond(request, 400, Some(error.to_string()));
     };
+    // 受け口へ渡すのは IPC の接続スレッドと同じ 1 実装（#1745。非同期 run の開始もそこで受ける）
     let mut exec = |req: Request| -> Result<Value, String> {
-        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
-        tx.unbounded_send(IncomingRequest {
-            request: req,
-            origin: PaneOrigin::Mcp,
-            reply: reply_tx,
-        })
-        .map_err(|_| "アプリ側の受け口が閉じている".to_string())?;
-        match reply_rx.recv() {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(e)) => Err(e.to_string()),
-            Err(_) => Err("アプリ側から応答が返らなかった".into()),
-        }
+        crate::ipc::submit(tx, req, PaneOrigin::Mcp).map_err(|e| e.to_string())
     };
     let caller_role = header_value(&request, "x-tako-role").map(|v| v.to_string());
     let mut session = McpSession {
@@ -160,7 +150,6 @@ fn handle_http(
         caller_role,
         connected: true,
         exec: &mut exec,
-        ipc_tx: Some(tx.clone()),
     };
     match handle_message(&message, &mut session) {
         Some(response) => respond(request, 200, Some(response.to_string())),

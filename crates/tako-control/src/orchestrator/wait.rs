@@ -471,6 +471,82 @@ pub struct RunOptions {
     pub account: Option<String>,
 }
 
+/// run の起動直後の待ち（claude 起動 + プロンプト送達。MCP の本番値）
+pub const RUN_INITIAL_DELAY: Duration = Duration::from_secs(20);
+/// run の完了待ちのポーリング間隔（MCP の本番値）
+pub const RUN_INTERVAL: Duration = Duration::from_secs(5);
+
+impl RunOptions {
+    /// 非同期 run の開始要求へ写す（#1745）。受け口（`ipc::submit`）が
+    /// [`RunOptions::from_start_request`] で戻すので、欄を足すときは両方を直す
+    /// （往復で欄を落とさないことはテストが見る）
+    pub fn start_request(&self) -> Request {
+        let millis = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+        Request::OrchestratorRunStart {
+            project: self.project.clone(),
+            prompt: self.prompt.clone(),
+            label: self.label.clone(),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+            agent: self.agent.clone(),
+            pane: self.pane,
+            tab: self.tab,
+            caller_role: self.caller_role.clone(),
+            timeout_seconds: self.timeout.as_secs(),
+            auto_close: self.auto_close,
+            output_lines: self.output_lines as u64,
+            task_type: self.task_type.clone(),
+            account: self.account.clone(),
+            initial_delay_ms: Some(millis(self.initial_delay)),
+            interval_ms: Some(millis(self.interval)),
+        }
+    }
+
+    /// [`RunOptions::start_request`] の逆。開始要求でなければ `None`
+    /// （受け口は全要求をここへ通すので、欄を写すのは開始要求のときだけにする）
+    pub fn from_start_request(request: &Request) -> Option<Self> {
+        let Request::OrchestratorRunStart {
+            project,
+            prompt,
+            label,
+            model,
+            effort,
+            agent,
+            pane,
+            tab,
+            caller_role,
+            timeout_seconds,
+            auto_close,
+            output_lines,
+            task_type,
+            account,
+            initial_delay_ms,
+            interval_ms,
+        } = request
+        else {
+            return None;
+        };
+        Some(Self {
+            project: project.clone(),
+            prompt: prompt.clone(),
+            label: label.clone(),
+            model: model.clone(),
+            effort: effort.clone(),
+            agent: agent.clone(),
+            pane: *pane,
+            tab: *tab,
+            caller_role: caller_role.clone(),
+            timeout: Duration::from_secs(*timeout_seconds),
+            auto_close: *auto_close,
+            output_lines: usize::try_from(*output_lines).unwrap_or(usize::MAX),
+            initial_delay: initial_delay_ms.map_or(RUN_INITIAL_DELAY, Duration::from_millis),
+            interval: interval_ms.map_or(RUN_INTERVAL, Duration::from_millis),
+            task_type: task_type.clone(),
+            account: account.clone(),
+        })
+    }
+}
+
 /// spawn + 完了待ち + 出力取得 + close を 1 回で行う（`orchestrator run` の本体）。
 /// `on_spawned(pane_id, tmux_session)` は spawn 直後に呼ばれる進捗フック
 /// （CLI の経過表示用。不要なら no-op を渡す）。
@@ -3514,6 +3590,68 @@ mod tests {
     fn run_listは全run一覧を返す() {
         let list = run_list();
         assert!(list["runs"].is_array());
+    }
+
+    // --- #1745: 非同期 run の開始要求（受け口へ Request として運ぶ） ---
+
+    #[test]
+    fn run_optionsは開始要求を往復しても欄を落とさない() {
+        // 片道で欄が落ちると、stdio ブリッジ経由の run だけ設定が効かなくなる
+        let opts = RunOptions {
+            project: "p".into(),
+            prompt: "q".into(),
+            label: Some("l".into()),
+            model: Some("m".into()),
+            effort: Some("e".into()),
+            agent: Some("codex".into()),
+            pane: Some(3),
+            tab: Some(4),
+            caller_role: Some("master:x".into()),
+            timeout: Duration::from_secs(90),
+            auto_close: false,
+            output_lines: 77,
+            initial_delay: Duration::from_millis(1500),
+            interval: Duration::from_millis(250),
+            task_type: Some("docs".into()),
+            account: Some("sub".into()),
+        };
+        let request = opts.start_request();
+        let back = RunOptions::from_start_request(&request).expect("開始要求として戻る");
+        assert_eq!(back.start_request(), request);
+        // IPC に載る JSON の往復でも同じ
+        let wire: Request =
+            serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+        assert_eq!(wire, request);
+    }
+
+    #[test]
+    fn 開始要求の待ち時間を省くとrunの既定になる() {
+        let request: Request = serde_json::from_value(json!({
+            "method": "orchestrator_run_start",
+            "params": {
+                "project": "p",
+                "prompt": "q",
+                "timeout_seconds": 60,
+                "auto_close": true,
+                "output_lines": 10,
+            },
+        }))
+        .unwrap();
+        let opts = RunOptions::from_start_request(&request).expect("開始要求として戻る");
+        assert_eq!(opts.initial_delay, RUN_INITIAL_DELAY);
+        assert_eq!(opts.interval, RUN_INTERVAL);
+        assert_eq!(opts.timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn 開始要求でなければnoneを返す() {
+        let request = Request::OrchestratorRunStatus {
+            run_id: Some("run-1".into()),
+        };
+        assert!(
+            RunOptions::from_start_request(&request).is_none(),
+            "進捗照会を開始要求として読んだ"
+        );
     }
 
     // --- #224: stalled 検出 ---

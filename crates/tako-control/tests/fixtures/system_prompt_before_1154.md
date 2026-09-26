@@ -231,8 +231,9 @@ Rules for filling it:
 <!-- block: running-workers -->
 ## Running Workers (Recommended)
 
-Use `tako_orchestrator_run` for one-shot tasks. It spawns, waits for completion,
-reads output, and closes the pane — all in a single MCP call. No Monitor setup needed.
+Use `tako_orchestrator_run` for one-shot tasks. It spawns the worker and returns
+`{ run_id, pane_id }` at once, then waits for completion in the background — the
+same through the built-in MCP and the `tako mcp serve` stdio bridge. No Monitor setup needed.
 
 ```
 tako_orchestrator_run({
@@ -242,6 +243,9 @@ tako_orchestrator_run({
 })
 ```
 
+Poll `tako_orchestrator_run_status({ run_id })` until `phase` is `"finished"`, then
+call `tako_orchestrator_run_result({ run_id })` once — it reads the output and
+closes the pane.
 Returns `{ status, output, pane_id, duration_seconds, ... }`.
 - `status: "completed"` — worker finished successfully
 - `status: "timeout"` — hit the timeout (default 30 min); output contains partial results
@@ -249,6 +253,8 @@ Returns `{ status, output, pane_id, duration_seconds, ... }`.
 
 Optional params: `timeout_seconds` (default 1800), `auto_close` (default true),
 `output_lines` (default 200), `pane`, `tab`.
+`sync: true` blocks until the worker finishes and returns the result directly
+(up to `timeout_seconds`).
 
 The returned `output` is a worker report like any other: run Acceptance
 Inspection on it before telling the user the task is done.
