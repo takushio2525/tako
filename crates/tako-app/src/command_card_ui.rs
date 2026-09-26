@@ -330,6 +330,12 @@ impl TakoApp {
         let theme = self.theme.clone();
         let total = commands.len();
         let heading = label.unwrap_or_else(|| crate::ui_text::command_card::heading().to_string());
+        // #1724: コマンドごとの実行記録（スマホから押しても同じ記録がここへ出る）
+        let runs: Vec<Option<tako_core::CardRun>> = self
+            .command_cards
+            .get(tako_core::CommandCardId::from_raw(card_id))
+            .map(|c| c.runs().to_vec())
+            .unwrap_or_default();
         div()
             .id(("command-card", card_id))
             .flex_shrink_0()
@@ -394,6 +400,11 @@ impl TakoApp {
                 let index = i + 1;
                 let is_copied = copied.is_some_and(|(id, idx, _)| id == card_id && idx == index);
                 let theme = theme.clone();
+                let run_status = runs
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .map(|run| run_status_text(run.state, &theme));
                 div()
                     .flex_shrink_0()
                     .flex()
@@ -433,6 +444,18 @@ impl TakoApp {
                                         .child(SharedString::from(
                                             crate::ui_text::command_card::index_label(index, total),
                                         )),
+                                )
+                            })
+                            .when_some(run_status, |d, (text, color)| {
+                                d.child(
+                                    div()
+                                        .id((
+                                            "command-card-run-state",
+                                            card_id * 100 + index as u64,
+                                        ))
+                                        .text_size(px(10.0))
+                                        .text_color(hsla(color))
+                                        .child(text),
                                 )
                             })
                             .child(div().flex_1())
@@ -645,6 +668,28 @@ impl TakoApp {
         self.command_cards.retain_panes(|p| alive.contains(&p));
         self.card_bands.retain(|p, _| alive.contains(p));
         self.card_band_probes.retain(|p, _| alive.contains(p));
+    }
+}
+
+/// 実行記録の一言と色（#1724）。終了コード 0 は緑・0 以外は赤・実行中はアクセント
+fn run_status_text(
+    state: tako_core::CardRunState,
+    theme: &tako_core::Theme,
+) -> (SharedString, tako_core::Rgb) {
+    use tako_core::CardRunState;
+    match state {
+        CardRunState::Running => (
+            crate::ui_text::command_card::run_running().into(),
+            theme.accent,
+        ),
+        CardRunState::Exited(code) => (
+            crate::ui_text::command_card::run_exited(code).into(),
+            if code == 0 { theme.green } else { theme.red },
+        ),
+        CardRunState::Closed => (
+            crate::ui_text::command_card::run_closed().into(),
+            theme.text_muted,
+        ),
     }
 }
 

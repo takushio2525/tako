@@ -10,6 +10,7 @@ import { AgentIcon, agentColor } from '../components/agent-icon';
 import { ChatView } from '../components/chat-view';
 import { SshSheet, SshConnectBar } from '../components/ssh';
 import { RemoteLinkRow } from '../components/remote-link';
+import { CommandCards } from '../components/command-cards';
 
 const QUICK_KEYS = [
   { label: 'esc',    seq: 'Escape' },
@@ -114,7 +115,7 @@ function buildScreen(screenLines, cursor) {
   return frag;
 }
 
-export function TerminalPage({ paneId, me }) {
+export function TerminalPage({ paneId, me, onMeRefresh }) {
   const [view, setView] = useState('chat');
   const [loading, setLoading] = useState(true);
   const [info, setInfo] = useState(null);
@@ -470,6 +471,15 @@ export function TerminalPage({ paneId, me }) {
       {/* #1077: Claude 公式へ送り出す 1 行。繋がっていれば「Claude で開く」、
           繋がっていなければ理由をたたんで出す（自前チャットはフォールバックとして残す） */}
       <RemoteLinkRow link={info?.remote_link} />
+
+      {/* #1724: AI が PC のこのペインに出したコマンドカード。chat / term のどちらでも出す
+          （カードは会話の外 = PC でもターミナル領域の下の帯に出ている） */}
+      <CommandCards
+        client={clientRef.current}
+        paneId={paneId}
+        me={me}
+        onMeRefresh={onMeRefresh}
+      />
 
       {/* chat ビュー */}
       {view === 'chat' && hasChatSupport && (

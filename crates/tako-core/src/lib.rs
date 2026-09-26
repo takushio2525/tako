@@ -87,7 +87,9 @@ pub mod wait_budget;
 pub mod workspace;
 
 pub use byte_lru::ByteLru;
-pub use command_card::{CommandCard, CommandCardError, CommandCardId, CommandCards};
+pub use command_card::{
+    CardRun, CardRunState, CommandCard, CommandCardError, CommandCardId, CommandCards,
+};
 pub use git::{
     CheckoutPreview, CommitBlock, CommitDetail, CommitFileChange, ConflictState, DiffFile,
     DiffHunk, DiffLine, DiffLineKind, DiffTarget, GitBranch, GitCommit, GitStatus, GitStatusEntry,

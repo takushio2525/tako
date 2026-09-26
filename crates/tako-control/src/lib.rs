@@ -65,6 +65,7 @@ pub mod reach;
 pub mod remote;
 pub mod remote_auth;
 pub mod remote_autostart;
+pub mod remote_cards;
 pub mod remote_files;
 pub mod remote_launch;
 pub mod remote_preview;

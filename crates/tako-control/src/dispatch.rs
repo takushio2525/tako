@@ -5693,7 +5693,65 @@ fn command_card_json(card: &tako_core::CommandCard) -> Value {
         "label": card.label(),
         "commands": card.commands(),
         "count": card.commands().len(),
+        // #1724: コマンドごとの実行記録（`commands` と同じ並び。未実行は null）。
+        // PC のカードもスマホもこの 1 つを読むので、どちらで押しても状態が揃う
+        "runs": card.runs().iter().map(card_run_json).collect::<Vec<_>>(),
     })
+}
+
+/// 実行記録 1 件の JSON 表現（#1724）
+fn card_run_json(run: &Option<tako_core::CardRun>) -> Value {
+    match run {
+        None => Value::Null,
+        Some(run) => json!({
+            "pane": run.pane.as_u64(),
+            "state": run.state.as_str(),
+            "exit_code": run.state.exit_code(),
+            "count": run.count,
+        }),
+    }
+}
+
+/// カードの実行記録を実行ペインの実態へ寄せる（#1724）。
+///
+/// 実行中の記録ごとに、実行ペインが**閉じていれば** `Closed`、画面に終了マーカー
+/// （`RunInteractiveStatus` と同じ `find_exit_marker`）が**出ていれば** `Exited(code)` へ確定する。
+/// どちらでもなければ実行中のまま（セッションがまだ attach 前でもここへ落ちる）。
+///
+/// 呼ぶのは dispatch の `list` / `run`（CLI / MCP / remote が見る直前）と、GUI の
+/// 2 秒ポーリング（PC のカードの表示）。**判定はこの 1 本**で、画面ごとに作り直さない。
+/// 戻り値は 1 件でも書き換えたか
+pub fn refresh_command_card_runs(host: &mut dyn ControlHost) -> bool {
+    let running = match host.command_cards() {
+        Some(cards) => cards.running(),
+        None => return false,
+    };
+    if running.is_empty() {
+        return false;
+    }
+    let alive = host.workspace().all_pane_ids();
+    let settled: Vec<_> = running
+        .into_iter()
+        .filter_map(|(id, index, pane)| {
+            if !alive.contains(&pane) {
+                return Some((id, index, pane, tako_core::CardRunState::Closed));
+            }
+            let rows = host
+                .session(pane)
+                .map(|s| s.visible_lines_filled())
+                .unwrap_or_default();
+            find_exit_marker(&rows)
+                .map(|code| (id, index, pane, tako_core::CardRunState::Exited(code)))
+        })
+        .collect();
+    let Some(store) = host.command_cards_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for (id, index, pane, state) in settled {
+        changed |= store.settle_run(id, index, pane, state);
+    }
+    changed
 }
 
 /// カード保管庫を持たないホスト（GUI 不在）向けのエラー
@@ -5712,6 +5770,8 @@ fn command_card_err(e: tako_core::CommandCardError) -> DispatchError {
         } else {
             e.to_string()
         }),
+        // #1724: 頼み方は正しいが、前回の実行がまだ終わっていない = 状態が合わない
+        tako_core::CommandCardError::StillRunning { .. } => DispatchError::Operation(e.to_string()),
         _ => DispatchError::InvalidParams(e.to_string()),
     }
 }
@@ -5763,6 +5823,8 @@ fn dispatch_show_command(
 
         "list" => {
             let (_, target) = resolve_pane(host.workspace(), pane.or(card_pane))?;
+            // 読む直前に実行記録を実態へ寄せる（#1724。スマホは GUI の 2 秒ポーリングを待たない）
+            refresh_command_card_runs(host);
             let store = host.command_cards().ok_or_else(cards_unsupported)?;
             Ok(json!({
                 "pane": target.as_u64(),
@@ -5789,10 +5851,21 @@ fn dispatch_show_command(
                 let store = host.command_cards().ok_or_else(cards_unsupported)?;
                 let card = store.resolve(target, card_id).map_err(command_card_err)?;
                 (
-                    card.id().as_u64(),
+                    card.id(),
                     card.command(idx).map_err(command_card_err)?.to_string(),
                 )
             };
+            if action == "run" {
+                // #1724: 同じコマンドの前回の実行がまだ走っていれば**ペインを割る前に**断る
+                // （スマホの押し直し・PC のダブルクリックで同じコマンドを 2 本走らせない）。
+                // 記録は先に実態へ寄せる = 終わった / 閉じた実行で断らない
+                refresh_command_card_runs(host);
+                host.command_cards()
+                    .ok_or_else(cards_unsupported)?
+                    .check_can_run(resolved_id, idx)
+                    .map_err(command_card_err)?;
+            }
+            let resolved_id_raw = resolved_id.as_u64();
             if action == "copy" {
                 if !host.queue_clipboard_copy(command.clone()) {
                     return Err(DispatchError::Operation(
@@ -5801,7 +5874,7 @@ fn dispatch_show_command(
                 }
                 return Ok(json!({
                     "copied": true,
-                    "card": resolved_id,
+                    "card": resolved_id_raw,
                     "index": idx,
                     // 論理文字列をそのまま返す（AI 側でも同一性を検証できる）
                     "command": command,
@@ -5845,14 +5918,21 @@ fn dispatch_show_command(
             {
                 p.set_title(Some(format!("(>) {head}")));
             }
+            // 実行したことをカードへ残す（#1724。PC のカードとスマホがこれを読む）
+            let run = host
+                .command_cards_mut()
+                .ok_or_else(cards_unsupported)?
+                .record_run(resolved_id, idx, new_id)
+                .map_err(command_card_err)?;
             Ok(json!({
                 "pane": new_id.as_u64(),
                 "from_pane": target.as_u64(),
-                "card": resolved_id,
+                "card": resolved_id_raw,
                 "index": idx,
                 "command": command,
                 "cwd": cwd.map(|p| p.display().to_string()),
                 "focus": focus,
+                "run": card_run_json(&Some(run)),
             }))
         }
 
@@ -28652,6 +28732,20 @@ mod tests {
         .unwrap();
         assert_eq!(listed["cards"].as_array().unwrap().len(), 1);
 
+        // #1724: 同じコマンドは前回の実行が走っているうちは再実行できない
+        // （ペインを割る前に断る）。ここで見たいのは focus の既定だけなので、
+        // 1 回目の実行ペインを閉じて記録を確定させてから押し直す
+        dispatch(
+            &mut host,
+            Request::Close {
+                pane: Some(new_pane),
+                force: false,
+                caller_role: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .expect("1 回目の実行ペインを閉じる");
+
         // focus=true を明示したときだけ新ペインへ移る
         let v = dispatch(
             &mut host,
@@ -28826,6 +28920,194 @@ mod tests {
             host.clipboard.is_empty(),
             "失敗した操作で副作用を起こさない"
         );
+    }
+
+    fn card_run_req(card: u64, index: usize) -> Request {
+        Request::ShowCommand {
+            action: Some("run".into()),
+            commands: Vec::new(),
+            label: None,
+            pane: None,
+            card: Some(card),
+            index: Some(index),
+            focus: None,
+        }
+    }
+
+    /// #1724: `run` はカードに実行記録を残し、`list` がそれを返す（PC とスマホが読む正本）。
+    /// 同じコマンドの前回の実行が走っているうちは**ペインを割る前に**断る
+    #[test]
+    fn issue1724_runは実行記録を残し実行中の再実行を断る() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let card = dispatch(
+            &mut host,
+            show_command_req("show", &["npm run dev", "echo two"], Some(pane)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap()["card"]["id"]
+            .as_u64()
+            .unwrap();
+        // 未実行 = runs は commands と同じ長さの null
+        let listed = dispatch(
+            &mut host,
+            show_command_req("list", &[], Some(pane)),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(listed["cards"][0]["runs"], json!([null, null]));
+
+        let v = dispatch(&mut host, card_run_req(card, 1), PaneOrigin::Cli).unwrap();
+        let run_pane = v["pane"].as_u64().unwrap();
+        assert_eq!(
+            v["run"],
+            json!({ "pane": run_pane, "state": "running", "exit_code": null, "count": 1 })
+        );
+        let listed = dispatch(
+            &mut host,
+            show_command_req("list", &[], Some(pane)),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(listed["cards"][0]["runs"][0]["state"], "running");
+        assert_eq!(listed["cards"][0]["runs"][0]["pane"], run_pane);
+        assert_eq!(
+            listed["cards"][0]["runs"][1],
+            Value::Null,
+            "押していないコマンドには記録が付かない"
+        );
+
+        // 実行ペインが生きている（マーカー未出力）うちは断る。**ペインは増えない**
+        let panes_before = host.ws.active_tab().tree().panes().len();
+        let err = dispatch(&mut host, card_run_req(card, 1), PaneOrigin::Cli).unwrap_err();
+        assert!(
+            matches!(err, DispatchError::Operation(_)),
+            "状態の不一致は Operation: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains(tako_core::command_card::STILL_RUNNING_MARK),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains(&format!("ペイン {run_pane}")),
+            "{err}"
+        );
+        assert_eq!(
+            host.ws.active_tab().tree().panes().len(),
+            panes_before,
+            "断った run でペインを割らない"
+        );
+        // 別のコマンドは独立に走らせられる
+        dispatch(&mut host, card_run_req(card, 2), PaneOrigin::Cli).expect("2 件目は走る");
+    }
+
+    /// #1724: 実行ペインが閉じられたら記録は `closed` に確定し、再実行できる（回数が進む）
+    #[test]
+    fn issue1724_実行ペインを閉じると確定して再実行できる() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let card = dispatch(
+            &mut host,
+            show_command_req("show", &["echo hi"], Some(pane)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap()["card"]["id"]
+            .as_u64()
+            .unwrap();
+        let run_pane = dispatch(&mut host, card_run_req(card, 1), PaneOrigin::Cli).unwrap()["pane"]
+            .as_u64()
+            .unwrap();
+        dispatch(
+            &mut host,
+            Request::Close {
+                pane: Some(run_pane),
+                force: false,
+                caller_role: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .expect("実行ペインを閉じる");
+        let listed = dispatch(
+            &mut host,
+            show_command_req("list", &[], Some(pane)),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(
+            listed["cards"][0]["runs"][0],
+            json!({ "pane": run_pane, "state": "closed", "exit_code": null, "count": 1 })
+        );
+        let v = dispatch(&mut host, card_run_req(card, 1), PaneOrigin::Cli).expect("再実行できる");
+        assert_eq!(v["run"]["count"], 2);
+        assert_ne!(v["pane"].as_u64(), Some(run_pane), "新しいペインで走る");
+    }
+
+    /// #1724: 実行ペインの画面に終了マーカーが出たら `exited` + 終了コードに確定する。
+    /// 判定は `RunInteractiveStatus` と同じ `find_exit_marker` の 1 本（実 PTY で確かめる）
+    #[cfg(unix)]
+    #[test]
+    fn issue1724_終了マーカーで終了コードに確定する() {
+        use std::time::{Duration, Instant};
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let card = dispatch(
+            &mut host,
+            show_command_req("show", &["false"], Some(pane)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap()["card"]["id"]
+            .as_u64()
+            .unwrap();
+        let run_pane = dispatch(&mut host, card_run_req(card, 1), PaneOrigin::Cli).unwrap()["pane"]
+            .as_u64()
+            .unwrap();
+        // 実行ペインのセッションを実 PTY で張る（マーカーを出して止まる = 実行ペインの契約）
+        let (session, _rx) = TerminalSession::spawn(
+            80,
+            24,
+            SpawnOptions {
+                command: Some(tako_core::SpawnCommand {
+                    program: "/bin/sh".to_string(),
+                    args: vec![
+                        "-c".to_string(),
+                        format!("printf '{EXIT_MARKER_PREFIX}3\\n'; sleep 60"),
+                    ],
+                }),
+                ..SpawnOptions::default()
+            },
+        )
+        .expect("PTY を張れる");
+        host.sessions.insert(run_pane, session);
+
+        // **状態で待つ**（固定時間で待たない）。上限は機の混み具合で伸ばすだけ
+        let budget = tako_core::wait_budget::state_wait_budget(
+            Duration::from_secs(20),
+            tako_core::wait_budget::machine_busy(),
+        );
+        let deadline = Instant::now() + budget;
+        let mut state = Value::Null;
+        while Instant::now() < deadline {
+            let listed = dispatch(
+                &mut host,
+                show_command_req("list", &[], Some(pane)),
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+            state = listed["cards"][0]["runs"][0].clone();
+            if state["state"] == "exited" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            state,
+            json!({ "pane": run_pane, "state": "exited", "exit_code": 3, "count": 1 }),
+            "終了マーカーから終了コードを確定できていない（budget={budget:?}）"
+        );
+        // 確定したので再実行できる（ペインが生きたままでも = 入力待ちで止まっている）
+        dispatch(&mut host, card_run_req(card, 1), PaneOrigin::Cli)
+            .expect("終わった実行は再実行できる");
     }
 
     #[test]

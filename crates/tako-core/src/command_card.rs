@@ -77,6 +77,61 @@ pub enum CommandCardError {
     CardNotFound { id: u64 },
     #[error("コマンド番号が範囲外（指定: {index}、このカードは 1〜{len}）")]
     IndexOutOfRange { index: usize, len: usize },
+    /// 同じコマンドの前回の実行がまだ終わっていない（#1724）。
+    /// 文言の先頭は [`STILL_RUNNING_MARK`] で固定する（remote が 409 へ分ける目印）
+    #[error(
+        "{mark}（{index} 件目・ペイン {pane}）。終わるか、そのペインを閉じてからもう一度実行する",
+        mark = STILL_RUNNING_MARK
+    )]
+    StillRunning { index: usize, pane: u64 },
+}
+
+/// [`CommandCardError::StillRunning`] の文言の目印（#1724）。
+///
+/// dispatch のエラーは IPC を越えると文字列になるので、remote daemon は
+/// この目印で「実行中なので断った（409）」と「頼み方が悪い（400）」を分ける
+pub const STILL_RUNNING_MARK: &str = "このコマンドはまだ実行中";
+
+/// コマンド 1 件の実行の顛末（#1724）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardRunState {
+    /// 実行ペインが生きていて、終了マーカーをまだ見ていない
+    Running,
+    /// 終了マーカーを見た（終了コード）
+    Exited(i32),
+    /// 終了マーカーを見る前に実行ペインが閉じられた（結果は分からない）
+    Closed,
+}
+
+impl CardRunState {
+    /// ワイヤ上の名前（CLI / MCP / remote が同じ語彙で読む）
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Exited(_) => "exited",
+            Self::Closed => "closed",
+        }
+    }
+
+    pub fn exit_code(self) -> Option<i32> {
+        match self {
+            Self::Exited(code) => Some(code),
+            _ => None,
+        }
+    }
+}
+
+/// コマンド 1 件の実行記録（#1724）。**最後に実行したとき**の 1 件だけを持つ
+///
+/// カードは「PC で押した」も「スマホで押した」も同じ dispatch の `run` を通るので、
+/// この記録がどちらの画面にも同じ状態を見せる正本になる
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CardRun {
+    /// 実行したペイン（`run` が同じタブへ割った新しいペイン）
+    pub pane: PaneId,
+    pub state: CardRunState,
+    /// このコマンドを実行した回数（再実行の区別に使う）
+    pub count: u32,
 }
 
 /// 表示中のコマンド提案カード 1 枚
@@ -88,6 +143,8 @@ pub struct CommandCard {
     commands: Vec<String>,
     /// 何のためのコマンドかの説明（任意）
     label: Option<String>,
+    /// コマンドごとの実行記録（`commands` と同じ長さ。未実行は `None`。#1724）
+    runs: Vec<Option<CardRun>>,
 }
 
 impl CommandCard {
@@ -116,6 +173,17 @@ impl CommandCard {
             });
         }
         Ok(&self.commands[index - 1])
+    }
+
+    /// コマンドごとの実行記録（`commands()` と同じ並び・同じ長さ。#1724）
+    pub fn runs(&self) -> &[Option<CardRun>] {
+        &self.runs
+    }
+
+    /// 1 始まりの番号で実行記録を取り出す
+    pub fn run(&self, index: usize) -> Result<Option<&CardRun>, CommandCardError> {
+        self.command(index)?;
+        Ok(self.runs[index - 1].as_ref())
     }
 }
 
@@ -147,11 +215,13 @@ impl CommandCards {
         self.next_id = self.next_id.max(1);
         let id = CommandCardId(self.next_id);
         self.next_id += 1;
+        let runs = vec![None; commands.len()];
         self.cards.push(CommandCard {
             id,
             pane,
             commands,
             label,
+            runs,
         });
 
         // 同一ペインの古いカードから溢れさせる（追加順 = Vec の順序）
@@ -195,6 +265,93 @@ impl CommandCards {
             None => self
                 .latest_for(pane)
                 .ok_or(CommandCardError::CardNotFound { id: 0 }),
+        }
+    }
+
+    /// 実行してよいかを確かめる（#1724）。同じコマンドの前回の実行が
+    /// [`CardRunState::Running`] のままなら断る。
+    ///
+    /// **判定は記録だけを見る**: 実行ペインが終わったか・閉じたかを記録へ反映するのは
+    /// 呼び出し側（dispatch の `refresh_command_card_runs`）の仕事で、ここは画面を知らない。
+    /// 呼び出し側は**反映してから**これを呼ぶ（古い記録で断らない）
+    pub fn check_can_run(&self, id: CommandCardId, index: usize) -> Result<(), CommandCardError> {
+        let card = self
+            .get(id)
+            .ok_or(CommandCardError::CardNotFound { id: id.as_u64() })?;
+        match card.run(index)? {
+            Some(run) if run.state == CardRunState::Running => {
+                Err(CommandCardError::StillRunning {
+                    index,
+                    pane: run.pane.as_u64(),
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// 実行したことを記録する（#1724）。回数を 1 つ進め、状態は [`CardRunState::Running`]
+    pub fn record_run(
+        &mut self,
+        id: CommandCardId,
+        index: usize,
+        pane: PaneId,
+    ) -> Result<CardRun, CommandCardError> {
+        let card = self
+            .cards
+            .iter_mut()
+            .find(|c| c.id == id)
+            .ok_or(CommandCardError::CardNotFound { id: id.as_u64() })?;
+        card.command(index)?;
+        let slot = &mut card.runs[index - 1];
+        let run = CardRun {
+            pane,
+            state: CardRunState::Running,
+            count: slot.map_or(0, |r| r.count).saturating_add(1),
+        };
+        *slot = Some(run);
+        Ok(run)
+    }
+
+    /// 実行中の記録の一覧（`(カード, 1 始まりの番号, 実行ペイン)`）。
+    /// 呼び出し側はこれを画面の実態と突き合わせて [`Self::settle_run`] で確定させる
+    pub fn running(&self) -> Vec<(CommandCardId, usize, PaneId)> {
+        self.cards
+            .iter()
+            .flat_map(|c| {
+                c.runs.iter().enumerate().filter_map(move |(i, r)| match r {
+                    Some(run) if run.state == CardRunState::Running => {
+                        Some((c.id, i + 1, run.pane))
+                    }
+                    _ => None,
+                })
+            })
+            .collect()
+    }
+
+    /// 実行中の記録を確定させる（終了コード / ペインが閉じた）。
+    /// **同じペインの記録にだけ効く**（確定を調べているあいだに再実行されていたら触らない）。
+    /// 戻り値は書き換えたか
+    pub fn settle_run(
+        &mut self,
+        id: CommandCardId,
+        index: usize,
+        pane: PaneId,
+        state: CardRunState,
+    ) -> bool {
+        let Some(slot) = self
+            .cards
+            .iter_mut()
+            .find(|c| c.id == id)
+            .and_then(|c| index.checked_sub(1).and_then(|i| c.runs.get_mut(i)))
+        else {
+            return false;
+        };
+        match slot {
+            Some(run) if run.pane == pane && run.state == CardRunState::Running => {
+                run.state = state;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -526,6 +683,109 @@ mod tests {
         assert_eq!(cards.list(Some(a)).len(), 0);
         assert_eq!(cards.list(None).len(), 1, "他ペインは無傷");
         assert_eq!(cards.dismiss(None, Some(a1)), 0, "二重破棄は 0 件");
+    }
+
+    #[test]
+    fn 実行記録はコマンドごとに持ち回数と状態が進む() {
+        let mut cards = CommandCards::new();
+        let (p, run_pane) = (pane(), pane());
+        let id = cards
+            .show(p, &["a".to_string(), "b".to_string()], None)
+            .unwrap();
+        // 未実行 = 全件 None・長さは commands と同じ
+        assert_eq!(cards.get(id).unwrap().runs(), &[None, None]);
+        assert!(cards.check_can_run(id, 1).is_ok());
+
+        let run = cards.record_run(id, 2, run_pane).unwrap();
+        assert_eq!(run.state, CardRunState::Running);
+        assert_eq!(run.count, 1);
+        let card = cards.get(id).unwrap();
+        assert_eq!(card.run(1).unwrap(), None, "他のコマンドには記録が付かない");
+        assert_eq!(card.run(2).unwrap().map(|r| r.pane), Some(run_pane));
+        assert_eq!(cards.running(), vec![(id, 2, run_pane)]);
+    }
+
+    #[test]
+    fn 実行中の同じコマンドは再実行を断り確定後は通す() {
+        let mut cards = CommandCards::new();
+        let (p, first, second) = (pane(), pane(), pane());
+        let id = cards.show(p, &["npm run dev".to_string()], None).unwrap();
+        cards.record_run(id, 1, first).unwrap();
+        let err = cards.check_can_run(id, 1).unwrap_err();
+        assert_eq!(
+            err,
+            CommandCardError::StillRunning {
+                index: 1,
+                pane: first.as_u64()
+            }
+        );
+        // remote が 409 へ分ける目印が文言の先頭に居る
+        assert!(err.to_string().starts_with(STILL_RUNNING_MARK), "{err}");
+
+        // 終了コードで確定 → 再実行できる。回数は 2 へ進み、状態は実行中へ戻る
+        assert!(cards.settle_run(id, 1, first, CardRunState::Exited(0)));
+        assert_eq!(
+            cards.get(id).unwrap().run(1).unwrap().map(|r| r.state),
+            Some(CardRunState::Exited(0))
+        );
+        assert!(cards.check_can_run(id, 1).is_ok());
+        let again = cards.record_run(id, 1, second).unwrap();
+        assert_eq!((again.count, again.state), (2, CardRunState::Running));
+        assert!(cards.running().iter().all(|(_, _, pane)| *pane == second));
+    }
+
+    #[test]
+    fn 確定は同じ実行ペインの実行中の記録にだけ効く() {
+        let mut cards = CommandCards::new();
+        let (p, first, second) = (pane(), pane(), pane());
+        let id = cards.show(p, &["ls".to_string()], None).unwrap();
+        cards.record_run(id, 1, first).unwrap();
+        cards.settle_run(id, 1, first, CardRunState::Closed);
+        cards.record_run(id, 1, second).unwrap();
+        // 古い実行ペインの確定は、再実行した記録を上書きしない
+        assert!(!cards.settle_run(id, 1, first, CardRunState::Exited(3)));
+        assert_eq!(
+            cards.get(id).unwrap().run(1).unwrap().map(|r| r.state),
+            Some(CardRunState::Running)
+        );
+        // 確定済みは二度と書き換えない
+        assert!(cards.settle_run(id, 1, second, CardRunState::Exited(3)));
+        assert!(!cards.settle_run(id, 1, second, CardRunState::Exited(0)));
+        assert_eq!(CardRunState::Exited(3).exit_code(), Some(3));
+        assert_eq!(CardRunState::Closed.exit_code(), None);
+        // 範囲外・知らないカードは何もしない（panic しない）
+        assert!(!cards.settle_run(id, 0, second, CardRunState::Closed));
+        assert!(!cards.settle_run(id, 9, second, CardRunState::Closed));
+        assert!(!cards.settle_run(
+            CommandCardId::from_raw(999),
+            1,
+            second,
+            CardRunState::Closed
+        ));
+    }
+
+    #[test]
+    fn 実行記録は範囲外と閉じたカードを拒否する() {
+        let mut cards = CommandCards::new();
+        let p = pane();
+        let id = cards.show(p, &["ls".to_string()], None).unwrap();
+        assert!(matches!(
+            cards.record_run(id, 2, p),
+            Err(CommandCardError::IndexOutOfRange { index: 2, len: 1 })
+        ));
+        assert!(matches!(
+            cards.check_can_run(id, 0),
+            Err(CommandCardError::IndexOutOfRange { .. })
+        ));
+        cards.dismiss(None, Some(id));
+        assert_eq!(
+            cards.check_can_run(id, 1),
+            Err(CommandCardError::CardNotFound { id: id.as_u64() })
+        );
+        assert_eq!(
+            cards.record_run(id, 1, p),
+            Err(CommandCardError::CardNotFound { id: id.as_u64() })
+        );
     }
 
     /// 実測に近い寸法: 17px 行 / テキスト領域 340px（20 行）

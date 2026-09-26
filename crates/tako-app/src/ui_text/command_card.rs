@@ -30,6 +30,22 @@ pub fn run_failed() -> &'static str {
     tr!("実行できませんでした", "Could not run")
 }
 
+/// 実行記録: 実行ペインがまだ走っている（#1724）
+pub fn run_running() -> &'static str {
+    tr!("実行中", "Running")
+}
+/// 実行記録: 終了マーカーを見た（#1724）
+pub fn run_exited(code: i32) -> String {
+    tr!(
+        format!("実行済み（終了コード {code}）"),
+        format!("Ran (exit {code})")
+    )
+}
+/// 実行記録: 終了を見る前に実行ペインが閉じられた（#1724）
+pub fn run_closed() -> &'static str {
+    tr!("実行済み（ペインは閉じた）", "Ran (pane closed)")
+}
+
 /// カード操作が失敗したときに通知欄へ出す**操作名**（#1432）。
 ///
 /// **押したボタンの文言をそのまま返す**（#1399 の物差し。押したものと失敗したものの
@@ -59,6 +75,9 @@ mod tests {
                 run().to_string(),
                 index_label(2, 3),
                 run_failed().to_string(),
+                run_running().to_string(),
+                run_exited(2),
+                run_closed().to_string(),
                 op_action("copy").to_string(),
                 op_action("run").to_string(),
                 op_action("dismiss").to_string(),

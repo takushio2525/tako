@@ -352,3 +352,24 @@ Geist / Geist Mono。**フォントは自己ホスト**（Google Fonts 参照禁
   タイムアウトを置くこと**（`/api/files` の IPC は 10 秒・`/api/v2/panes` の tmux は 5 秒）
 - 検証は `cargo test -p tako-control --lib remote::tests`（順序・IPC の直列化・panic 耐性・
   合流・本数の解釈）と番犬 `issue1403_http_workers_watchdog`
+
+## 12. スマホから PC の操作を実行する受け口を足すときの不変条件（#1724。2026-09-26）
+
+コマンド提案カードの実行（`remote_cards`）で採った形。**PC のボタンと同じ dispatch を
+素通しするだけ**にし、受け口の中に操作の実装を置かない（FR-6.24）。
+
+- **経路は宣言表で持つ**（`remote_cards::CARD_ROUTES`。`remote_tasks` / `remote_launch` /
+  `remote_files` と同じ作り）。`remote::required_role` が表を引き、表に無い
+  `/api/cards…` は床の Manage へ落ちる = 受け口だけ先に生えても弱い role へこぼれない
+- **スマホから本文を渡せる口を作らない**。スマホが渡すのは「どれを」（カード ID + 番号）
+  だけで、走る文字列は AI が PC に置いたもの。`show` のように本文を受け取る action を
+  表へ載せると、Interact の端末が任意のコマンドを**打鍵より見えにくい経路**で走らせられる
+- **受け口の中でも role を確かめる**（二重の門）。正は層②だが、ルータの配線を誤って
+  表を通らない枝へ繋いでも実行だけは開かない
+- **失敗は画面が出し分ける 2 つだけ寄せ直す**（409 = 実行中 / 404 = PC 側で閉じられた）。
+  dispatch のエラーは IPC を越えると文字列なので、目印は定数（`STILL_RUNNING_MARK`）で持つ
+- **監査と persist.log には「どの端末から・どれを・結果」だけ**。断った実行も残す
+  （監査から「押したが断られた」が落ちないよう、番号は応答ではなく要求の本文から取る）
+- 検証は番犬 `issue1724_remote_card_run_watchdog`（注入 4 通りが file:line 名指しで落ちる）+
+  全経路テスト `remote::tests::issue1724_権限外からのカード実行はapiで拒否される` +
+  e2e `command-cards-1724.spec.js` + 実経路 `bash scripts/test-remote-command-card-1724.sh`

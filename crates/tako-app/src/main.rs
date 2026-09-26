@@ -5140,6 +5140,12 @@ impl TakoApp {
                     }
                     // #666: 閉じたペインのコマンドカードを掃除する（メモリ操作のみ）
                     app.prune_command_cards();
+                    // #1724: 実行ペインの終了 / 消滅をカードの実行記録へ反映する。
+                    // 判定は dispatch の 1 本（スマホ・CLI が読む `list` と同じ）で、
+                    // 変わったときだけカードの表示を描き直す
+                    if tako_control::dispatch::refresh_command_card_runs(app) {
+                        wcx.notify();
+                    }
                     let running_children_scan = {
                         let _s = tako_control::diag::perf_span("periodic_prep:sleep_guard");
                         (
