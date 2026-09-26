@@ -417,6 +417,33 @@ impl ShellDialect {
         }
     }
 
+    /// **コマンド位置から始まる語の列**（`[<interpreter>]` / `[<道具>, "run", "python"]`）を
+    /// 1 本の文字列にする（Code Runner の `${python}`。#1730）。
+    ///
+    /// 先頭は [`Self::command_word`] の規則（PowerShell で囲むときは `&` が付く。付けないと
+    /// パスが式として評価されて表示されるだけになる）。どの語も**囲む必要が無ければ囲まない**
+    /// ので、実行環境が見つからないときの `python3` は素のまま = 組み込み既定の展開が今と
+    /// 1 バイトも変わらない。POSIX は `${fileBase}` 等の展開と同じ `quote_for_shell` の集合で
+    /// 囲むか決める（`command_word` の POSIX 側は集合が狭く、見た目がずれる）
+    pub fn command_words(self, words: &[String]) -> String {
+        let plain_ps = |w: &str| {
+            !w.is_empty()
+                && w.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-/\\:".contains(&b))
+        };
+        words
+            .iter()
+            .enumerate()
+            .map(|(i, w)| match self {
+                Self::Posix => crate::shell::quote_for_shell(w),
+                Self::PowerShell if i == 0 => self.command_word(w),
+                Self::PowerShell if plain_ps(w) => w.clone(),
+                Self::PowerShell => ps_quote(w),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// シェル片を走らせる **argv**（`Split { command }` / `spawn_session` へ渡す形）。
     ///
     /// 検証用の疑似 TUI をペインで走らせるのに使う。`/bin/sh` は Windows に無いので
@@ -764,6 +791,51 @@ fn ps_restore_env(name: &str, tmp: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn words(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// #1730: `${python}` に入る語の列。素で通る語は囲まず、PowerShell で先頭を囲むときは
+    /// `&` を付ける（付けないとパスが式として評価されて実行されない）
+    #[test]
+    fn command_wordsは必要なときだけ囲みpowershellの先頭には呼び出し演算子を付ける() {
+        let cases: &[(&[&str], &str, &str)] = &[
+            // 実行環境が見つからないとき = 今の既定表と同じ素の名前
+            (&["python3"], "python3", "python3"),
+            (
+                &["/p/.venv/bin/python"],
+                "/p/.venv/bin/python",
+                "/p/.venv/bin/python",
+            ),
+            (
+                &["/my proj/.venv/bin/python"],
+                "'/my proj/.venv/bin/python'",
+                "& '/my proj/.venv/bin/python'",
+            ),
+            (
+                &[r"C:\p\.venv\Scripts\python.exe"],
+                r"'C:\p\.venv\Scripts\python.exe'",
+                r"C:\p\.venv\Scripts\python.exe",
+            ),
+            (
+                &[r"C:\Users\a b\uv.exe", "run", "python"],
+                r"'C:\Users\a b\uv.exe' run python",
+                r"& 'C:\Users\a b\uv.exe' run python",
+            ),
+            (
+                &["/プロジェクト/it's/python"],
+                "'/プロジェクト/it'\\''s/python'",
+                "& '/プロジェクト/it''s/python'",
+            ),
+        ];
+        for (input, posix, ps) in cases {
+            let w = words(input);
+            assert_eq!(ShellDialect::Posix.command_words(&w), *posix, "{input:?}");
+            assert_eq!(ShellDialect::PowerShell.command_words(&w), *ps, "{input:?}");
+        }
+        assert_eq!(ShellDialect::Posix.command_words(&[]), "");
+    }
 
     /// #1127: 打ち込んだ行に本文が現れない出力手段。
     /// 両方言ぶんを macOS からも Windows からも検証する

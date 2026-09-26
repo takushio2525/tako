@@ -100,6 +100,18 @@ pub const DEFAULT_RUN_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
 /// `--wait` の上限の上書き（秒）。扱いは [`PROBE_TIMEOUT_ENV`] と同じ（**0 は既定へ**）
 pub const RUN_WAIT_TIMEOUT_ENV: &str = "TAKO_RUN_WAIT_TIMEOUT_SECS";
 
+/// Code Runner の実行環境の問い合わせ（Tier P）1 回あたりの既定の上限（#1730）。
+///
+/// 根拠（実測 2026-09-27・macOS）: ログインシェル（zsh `-l -i`）の `command -v python3` が
+/// 0.34〜0.35 秒、`conda info --envs --json` が 0.34〜0.41 秒、`python3 --version` は
+/// 0.01 秒未満。この機械に無い `poetry env info -p` は Python の起動 + poetry の import で
+/// 1.5 秒前後が上限の見込みで、5 秒はその約 3 倍。問い合わせは一覧の取得（`RunResolve`。
+/// background で走る）と再検出のときだけで、**実行（`Run`）の経路では走らない**
+pub const DEFAULT_RUNTIME_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 実行環境の問い合わせの上限の上書き（秒）。扱いは [`PROBE_TIMEOUT_ENV`] と同じ（**0 は既定へ**）
+pub const RUNTIME_PROBE_TIMEOUT_ENV: &str = "TAKO_RUN_PROBE_TIMEOUT_SECS";
+
 /// 打ち切りを知らせる 1 行の頭。CLI が出し、dispatch が拾う（**文面は 1 実装**）
 const NOTICE_HEAD: &str = "[確認できません] ";
 const NOTICE_OPEN: char = '（';
@@ -256,6 +268,14 @@ pub fn run_wait_timeout() -> Duration {
     )
 }
 
+/// 実行環境の問い合わせの上限（env で上書き可。外すことはできない。#1730）
+pub fn runtime_probe_timeout() -> Duration {
+    parse_timeout_secs(
+        std::env::var(RUNTIME_PROBE_TIMEOUT_ENV).ok().as_deref(),
+        DEFAULT_RUNTIME_PROBE_TIMEOUT,
+    )
+}
+
 /// 上限つきの聞き直し（[`poll_with_timeout`]）の結末
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Polled<T> {
@@ -335,8 +355,24 @@ pub fn legacy_unbounded() -> bool {
 ///
 /// 名札（`label`）は [`label`] が組む = 引数だけで、**パスは含めない**（#927）
 pub fn output_with_timeout(program: &str, args: &[&str], budget: Duration) -> Outcome {
+    output_with_timeout_in(program, args, None, budget)
+}
+
+/// [`output_with_timeout`] の作業ディレクトリを指定する版（#1730）。
+///
+/// 答えがカレントディレクトリで決まる問い合わせ（`poetry env info -p` /
+/// `pipenv --venv` = そのプロジェクトの環境の置き場）のためにある。待ちの扱いは同じ
+pub fn output_with_timeout_in(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&std::path::Path>,
+    budget: Duration,
+) -> Outcome {
     let name = label(program, args);
     let mut cmd = Command::new(program);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
     crate::platform::process::no_console_window(&mut cmd)
         .args(args)
         .stdin(Stdio::null())
