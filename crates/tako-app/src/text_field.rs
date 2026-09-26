@@ -16,7 +16,9 @@
 //!
 //! 既存 2 本は #1459 でここへ移し終えた。ファイルツリーのインライン入力（名前を変更 /
 //! 新規ファイル / 新規フォルダ）も #1725 でここへ寄せた（番犬は
-//! `issue1725_tree_inline_input_watchdog`）。境界を丸める [`floor_char_boundary`] は
+//! `issue1725_tree_inline_input_watchdog`）。Web ビューのアドレスバーと Web dock の URL 欄も
+//! #1750 でここへ寄せた（番犬は `issue1750_palette_web_ime_watchdog`）。
+//! 境界を丸める [`floor_char_boundary`] は
 //! **このモジュールの外へ出さない**（`pub` を付けない）ので、キャレットを自前で
 //! 丸める実装はコンパイラの時点で書けない。番犬
 //! `issue1450b2_tasks_panel_watchdog` が `tasks_panel.rs` / `right_panel.rs` の

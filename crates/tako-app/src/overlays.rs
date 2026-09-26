@@ -200,6 +200,15 @@ impl TakoApp {
         };
         let items = self.palette_items(&query);
         let selected = palette.selected.min(items.len().saturating_sub(1));
+        // #1750: 未確定文字列とキャレットはコミット欄・ツリーの入力欄と同じ共有部品で
+        // 検索欄の中に描く（キャレットの実矩形が変換候補窓の位置出しに渡る）。
+        // 変換中はプレースホルダを出さない（読みと重なる）
+        let marked = self.text_input_marked_at(crate::AppTextInput::Palette, &theme, 13.0);
+        let show_placeholder = query.is_empty() && marked.is_none();
+        let caret = self
+            .text_input_caret(crate::AppTextInput::Palette, &theme)
+            .h(px(16.0))
+            .ml(px(1.0));
         Some(
             div()
                 .absolute()
@@ -214,7 +223,7 @@ impl TakoApp {
                 .occlude()
                 .bg(gpui::hsla(0., 0., 0., 0.3))
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.command_palette = None;
+                    this.close_command_palette();
                     cx.notify();
                 }))
                 .child(
@@ -258,12 +267,16 @@ impl TakoApp {
                                 )
                                 .child(
                                     div()
+                                        .when_some(
+                                            self.input_rect_probe_canvas("palette-input"),
+                                            |d, c| d.relative().child(c),
+                                        )
                                         .flex_1()
                                         .flex()
                                         .flex_row()
                                         .items_center()
                                         .text_size(px(13.0))
-                                        .when(query.is_empty(), |d| {
+                                        .when(show_placeholder, |d| {
                                             d.child(
                                                 div()
                                                     .text_color(hsla(theme.text_faint))
@@ -274,14 +287,9 @@ impl TakoApp {
                                             d.text_color(hsla(theme.foreground))
                                                 .child(SharedString::from(query.clone()))
                                         })
-                                        .child(
-                                            // カーソル
-                                            div()
-                                                .w(px(1.5))
-                                                .h(px(16.0))
-                                                .ml(px(1.0))
-                                                .bg(hsla(theme.accent)),
-                                        ),
+                                        .children(marked)
+                                        // カーソル
+                                        .child(caret),
                                 )
                                 .child(
                                     div()
@@ -346,7 +354,7 @@ impl TakoApp {
                                                     .map(|p| p.query.clone())
                                                     .unwrap_or_default();
                                                 let items = this.palette_items(&query);
-                                                this.command_palette = None;
+                                                this.close_command_palette();
                                                 if let Some(item) = items.into_iter().nth(i) {
                                                     this.palette_execute(item, cx);
                                                 }
