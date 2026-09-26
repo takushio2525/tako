@@ -232,8 +232,16 @@ impl Sandbox {
         }
     }
 
+    /// 箱の中のパス。`/` 区切りの相対を**成分ごとに** join する（`root.join("a/b")` は
+    /// Windows で `…\a/b` の混在形になり、成分で組む本番のパス `…\a\b` と文字列で一致しない）
+    fn path(&self, rel: &str) -> PathBuf {
+        rel.split('/')
+            .filter(|c| !c.is_empty())
+            .fold(self.root.clone(), |p, c| p.join(c))
+    }
+
     fn write(&self, rel: &str, content: &str) -> PathBuf {
-        let p = self.root.join(rel);
+        let p = self.path(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, content).unwrap();
         p
@@ -241,14 +249,14 @@ impl Sandbox {
 
     fn env(&self, path_dirs: &[&str]) -> DetectEnv {
         DetectEnv {
-            home: Some(self.root.join("home")),
+            home: Some(self.path("home")),
             vars: Default::default(),
-            path_dirs: path_dirs.iter().map(|d| self.root.join(d)).collect(),
+            path_dirs: path_dirs.iter().map(|d| self.path(d)).collect(),
         }
     }
 
     fn dirs(&self, file_rel: &str) -> Vec<PathBuf> {
-        let file = self.root.join(file_rel);
+        let file = self.path(file_rel);
         candidate_dirs(
             file.parent().unwrap(),
             &SearchBounds::with_ceilings([self.root.clone()]),
@@ -345,7 +353,7 @@ fn venvがあれば設定なしでそのinterpreterとactivationで走る() {
     assert!(snap
         .env()
         .iter()
-        .any(|(_, v)| *v == s.root.join(format!("proj/{venv}")).to_string_lossy()));
+        .any(|(_, v)| *v == s.path(&format!("proj/{venv}")).to_string_lossy()));
     // 子プロセスは起こしていない
     assert!(snap.tier_p_elapsed.is_none());
     assert_eq!(snap.tier_of(c), Tier::F);
@@ -479,7 +487,7 @@ fn 包む形の環境の置き場は印の指紋が変わるまで覚える() {
     let lock = s.write(&format!("proj/{}", marker_file(w)), "");
     s.write("proj/a.py", "");
     let tool = s.write(&format!("tools/{}", exe(w.program.macos)), "");
-    let envdir = s.root.join("cache/env-1");
+    let envdir = s.path("cache/env-1");
     std::fs::create_dir_all(&envdir).unwrap();
     let probe_args = w.env_dir_probe.unwrap().args.join(" ");
     let prober = FakeProber {
@@ -562,7 +570,7 @@ fn 一覧ファイルが無ければ道具に一覧を聞いて候補へ並べ�
         .unwrap();
     let probe = list.list_probe.unwrap();
     let tool = s.write(&format!("tools/{}", exe(probe.program.macos)), "");
-    let prefix = s.root.join("opt/envs/ml");
+    let prefix = s.path("opt/envs/ml");
     // interpreter も置く（無いと壊れた環境として自動では選ばない）
     s.write(
         &format!(

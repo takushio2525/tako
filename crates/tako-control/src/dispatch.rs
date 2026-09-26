@@ -29374,8 +29374,8 @@ mod tests {
             std::fs::create_dir_all(venv.join("bin")).unwrap();
             std::fs::create_dir_all(venv.join("Scripts")).unwrap();
             std::fs::write(venv.join("pyvenv.cfg"), "version = 3.12.4\n").unwrap();
-            std::fs::write(venv.join("bin/python"), "").unwrap();
-            std::fs::write(venv.join("Scripts/python.exe"), "").unwrap();
+            std::fs::write(venv.join("bin").join("python"), "").unwrap();
+            std::fs::write(venv.join("Scripts").join("python.exe"), "").unwrap();
         }
         let file = base.join("a.py");
         std::fs::write(&file, "import sys\nprint(sys.prefix)\n").unwrap();
