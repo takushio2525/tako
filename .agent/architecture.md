@@ -1725,6 +1725,36 @@ syntect へ通していた**。release 実測（同じ構文セット・テー�
   `scripts/test-edit-range-1658.sh`（隔離 GUI で 5,000 行の 1 行を差し替えて他の行の
   バイト一致まで見る。CI には載せない）
 
+## LSP クライアントの基盤（#1678。2026-09-26）
+
+言語サーバと会話できる状態までを持つ層で、**言語機能は 1 つも出さない**（#1679 以降の
+スライスがこの上に乗る）。実装設計の正本は `.agent/plans/2026-09-lsp-s1.md`（§18 に着地時の差分）。
+
+- **置き場**: 純粋部分は `tako_core::lsp`（`position` = UTF-8 ⇄ UTF-16 の入口 2 本 /
+  `servers` = 検出表 / `root` = ルート検出 / `state` = 状態機械 / `sync` = `didChange` の中身）、
+  プロセスと I/O は `tako_control::lsp`（`rpc` / `server` / `manager` / `diagnostics` / `text`）。
+  **GPUI 依存は tako-app だけ**のまま。manager の実体は GUI が 1 つ持ち、CLI / MCP は
+  dispatch → `SystemHost::lsp` で同じ 1 つを触る
+- **並行モデル**: 1 サーバ 3 スレッド（writer / reader / stderr）と std の `sync_channel`。
+  tokio も GPUI の executor も使わない（「IPC トランスポート」節と同じ形。`Cargo.lock` の
+  tokio 0 件は番犬が固定）。送信キューは 256 件で頭打ちにし、UI スレッドは `try_send` で
+  待たない。S1 は UI へ上げる受信が無いので、診断は reader が manager の表へ直接書く
+  （**UI へのキューは描画する #1679 が足す**）
+- **UI スレッドで待たない**: 打鍵のたびに通る `LspManager::sync` はロックを短く取って
+  キューへ積むだけ。実行ファイルの解決（unix はログインシェル）・spawn・initialize・
+  shutdown は専用スレッド、dispatch の `LspServer` は `prepare_offload` で background へ出す
+- **同期**: 編集セッション（`preview::EditState`）が `DocLink` を持ち、
+  `refresh_preview_from_editor` の 1 か所で同期する（打鍵・undo・CLI / MCP の編集が
+  すべて通る）。`didChange` は**送った本文の写しとの差分**で、同期の合間に編集が
+  溜まっても 1 件で正しく当たる（`EditDelta` は非公開で、写しは再起動後の `didOpen` にも要る）。
+  セッションが落ちると `DocLease` の Drop で `didClose`
+- **寿命**: 状態機械は純粋関数（`Lifecycle::step`）で、manager は返ってきた `Action`
+  （Spawn / Respawn / Shutdown / ScheduleRestart）を実行するだけ。世代（spawn のたびに進む）で
+  古いスレッドからの知らせを捨てる。子は Drop / 終了経路で kill し、kill -9 で親が落ちた
+  ときは stdin の EOF でサーバが自分で終わる（`issue1678_lsp_e2e` の `親が落ちたら偽サーバも終わる`）
+- **ログ**: perf.log は要求の method 名・所要・結果の種別、persist.log は起動 / 終了 /
+  停止の回数だけ。stderr の直近 50 行はメモリに持ち、`tako lsp logs` で求められたときだけ返す
+
 ## 編集カーソルの追従スクロール（#1649。2026-09-23）
 
 編集モードのプレビューには `ListState` へ「カーソルを見せる」スクロールの呼び出しが

@@ -764,6 +764,14 @@ pub const MATRIX: &[Feature] = &[
         ),
     },
     Feature {
+        key: "tako_logs",
+        macos: Support::Supported,
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 87 / 104（ペインログのクローズマーカーと発生源）",
+        ),
+    },
+    Feature {
         key: "tako_lsp_server",
         // #1678: 実行ファイルの探索は exe::find（Windows は PATHEXT）、起動は child_cmd
         // （Windows はシェルを経由しない）を通り、I/O は std のパイプとスレッドだけ。
@@ -775,14 +783,6 @@ pub const MATRIX: &[Feature] = &[
         },
         windows_evidence: Evidence::UnitTest(
             "issue1678_lsp_e2e（偽サーバとの握手・送信列・分割受信・再起動の上限・親が落ちたら子も終わる）が CI の Windows ジョブで緑",
-        ),
-    },
-    Feature {
-        key: "tako_logs",
-        macos: Support::Supported,
-        windows: Support::Supported,
-        windows_evidence: Evidence::SelfTest(
-            "項目 87 / 104（ペインログのクローズマーカーと発生源）",
         ),
     },
     Feature {

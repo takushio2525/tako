@@ -1,11 +1,11 @@
 ---
 title: CLI リファレンス
-description: tako コマンド全 86 種の逆引き一覧 — 目的・使い方・実行例・よく使うオプション
+description: tako コマンド全 87 種の逆引き一覧 — 目的・使い方・実行例・よく使うオプション
 ---
 
 `tako` CLI は、ターミナルの画面操作（ペイン分割・テキスト送信・レイアウト変更など）をコマンドとして実行するためのツールです。シェルスクリプトからの自動化にも、AI エージェントからの操作にも使われます。
 
-トップレベルのコマンドは **86 種**で、その多くがさらにサブコマンドを持ちます。ほぼすべてが同名の MCP ツールと 1:1 で対応しており（[MCP ツール一覧](/guides/mcp-tools/)）、人ができる操作は AI も同じ経路で実行できます。
+トップレベルのコマンドは **87 種**で、その多くがさらにサブコマンドを持ちます。ほぼすべてが同名の MCP ツールと 1:1 で対応しており（[MCP ツール一覧](/guides/mcp-tools/)）、人ができる操作は AI も同じ経路で実行できます。
 
 ## 共通の前提
 
@@ -22,7 +22,7 @@ tako orchestrator spawn --help
 
 ## コマンド早見表
 
-やりたいことから引くための全 86 コマンドの一覧です。詳細のあるものはリンクから飛べます。
+やりたいことから引くための全 87 コマンドの一覧です。詳細のあるものはリンクから飛べます。
 
 ### 画面を操作する
 
@@ -32,6 +32,7 @@ tako orchestrator spawn --help
 | [`send`](#tako-send) | ペインへテキスト・コマンドを送る |
 | [`read`](#tako-read) | ペインの画面内容を読む |
 | [`links`](#tako-links) | 画面のリンク（Cmd+クリック / Windows は Ctrl+クリックで開けるもの）を列挙する |
+| [`lsp`](#tako-lsp) | 言語サーバ（LSP）の状態と起動・停止（編集モードで自動的に起きる） |
 | [`list`](#tako-list) | タブ・ペインの構成を JSON で得る |
 | [`focus`](#tako-focus) | フォーカスを移す |
 | [`scroll`](#tako-scroll) | スクロールバックを動かす |
@@ -416,6 +417,20 @@ tako title --pane 3 "dev server"
 tako title --pane 3 --role worker-1 "修復係"
 tako title --pane 3 ""   # 空文字でクリア（自動リネームに戻る）
 ```
+
+### tako lsp
+
+コードプレビューを**編集モードにすると**、拡張子に合う言語サーバ（Rust = rust-analyzer / C・C++ = clangd / TypeScript・JavaScript = typescript-language-server / Python = pyright）が自動的に起きます。`tako lsp` はその状態を見たり、起こし直したりするコマンドです。補完や診断の表示はこれから順に入ります。
+
+```bash
+tako lsp status          # 状態（稼働中か・pid・診断の件数）。未導入なら理由と導入コマンド
+tako lsp servers         # 対応している言語サーバと、入っているかどうか
+tako lsp restart         # 起こし直す（サーバを入れた後はこれ）
+tako lsp stop            # 止める（restart するまで起こさない）
+tako lsp logs            # サーバが出したエラー出力の直近
+```
+
+`--name rust-analyzer` のように 1 つだけを指定できます。MCP では `tako_lsp_server`（`action` 引数）が同じ操作です。
 
 ## レイアウト操作
 
