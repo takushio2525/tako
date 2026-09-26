@@ -1255,6 +1255,45 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         worker: Option<String>,
     },
+    /// オーケストレーター: 非同期 run の開始（#121 / #1745）。spawn して即
+    /// `{run_id, pane_id, spawned_by, tmux_session}` を返し、完了待ちは GUI プロセスの
+    /// バックグラウンドで回す（`OrchestratorRunStatus` / `OrchestratorRunResult` で追う）。
+    ///
+    /// **dispatch ではなく受け口（`ipc::submit`）が処理する**: spawn と完了待ちの
+    /// ポーリングは UI スレッドの dispatch を往復するので、UI スレッドの上では待てない。
+    /// 受け口は GUI プロセスにしか無いので、HTTP MCP・stdio ブリッジ（IPC 経由）の
+    /// どちらから頼んでもレジストリは GUI 側の 1 つになる。欄は `wait::RunOptions` と 1:1
+    OrchestratorRunStart {
+        project: String,
+        prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tab: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_role: Option<String>,
+        timeout_seconds: u64,
+        auto_close: bool,
+        output_lines: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
+        /// 起動直後の待ち（ミリ秒）。省略時は run の既定（`wait::RUN_INITIAL_DELAY`）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initial_delay_ms: Option<u64>,
+        /// ポーリング間隔（ミリ秒）。省略時は run の既定（`wait::RUN_INTERVAL`）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interval_ms: Option<u64>,
+    },
     /// オーケストレーター: 非同期 run の進捗照会（#121）。
     /// run_id が不明なら Err。run_id 省略時は全 run の一覧を返す
     OrchestratorRunStatus {
@@ -2322,6 +2361,9 @@ pub fn changes_layout(request: &Request) -> bool {
         | Request::TmuxOpen { .. }
         | Request::TmuxSelectWindow { .. }
         | Request::OrchestratorSpawn { .. }
+        // 受け口（`ipc::submit`）が spawn に分けて頼むので UI の loop へは来ないが、
+        // 意味としてはペインを 1 枚増やす要求
+        | Request::OrchestratorRunStart { .. }
         | Request::OrchestratorHandoff { .. }
         | Request::GitResolveAgent { .. }
         // --- 別ウィンドウを開く ---

@@ -460,6 +460,15 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
   読む（エージェントの子プロセスとして起動されるため、ペインのシェル → エージェント →
   ブリッジと環境が継承される = 呼び出し元ペインの特定が自動で成立する）。
   tako の外で起動された場合は **0 ツール**を返して無害化する
+- **受け口へ渡すのは `ipc::submit` の 1 実装**（#1745）: IPC の接続スレッド・HTTP MCP の
+  ハンドラスレッド・非同期 run の完了待ちスレッドがここを通る。**非同期 run の開始
+  （`Request::OrchestratorRunStart`）だけは dispatch ではなくここで受ける**唯一の例外で、
+  spawn と完了待ちのポーリングが UI スレッドの dispatch を往復するため UI スレッドでは待てない。
+  待つ係と run のレジストリは受け口を持つ GUI プロセスに置くので、HTTP・stdio ブリッジの
+  どちらから頼んでも同じレジストリに載り、`run_status` / `run_result`（dispatch）と CLI から
+  同じ run が見える。#1745 まではこの処理が HTTP のハンドラにだけあり、stdio ブリッジからの
+  非同期 run は `sync=true` を付けないと JSON-RPC エラーで返っていた。
+  実経路の検証は `scripts/test-orchestrator-run-stdio-1745.sh`（3 経路 × 境界値）
 
 #### Claude Code「設定ゼロ接続」の検証結果（2.1.172、2026-06-11）
 

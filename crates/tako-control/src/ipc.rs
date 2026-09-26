@@ -16,10 +16,12 @@
 use std::io;
 
 use futures::channel::mpsc::UnboundedSender;
+use serde_json::Value;
 use tako_core::PaneOrigin;
 
 use crate::dispatch::DispatchError;
-use crate::protocol::Request;
+use crate::orchestrator::wait;
+use crate::protocol::{error_code, Request};
 
 /// UI 側へ渡す 1 リクエスト。`reply` へ dispatch の結果を返すと接続スレッドが応答を書く。
 /// `origin` は新規生成ペインの生成主体（IPC 直 = Cli、MCP 経由 = Mcp）
@@ -27,6 +29,79 @@ pub struct IncomingRequest {
     pub request: Request,
     pub origin: PaneOrigin,
     pub reply: std::sync::mpsc::SyncSender<Result<serde_json::Value, DispatchError>>,
+}
+
+/// [`submit`] の失敗。受け口まで届かなかったのか、dispatch が断ったのかを分ける
+/// （IPC の応答コードが変わる: 前者は `INTERNAL`、後者は dispatch の分類）
+#[derive(Debug)]
+pub enum SubmitError {
+    /// 受け口が閉じている / 応答が返らなかった（アプリの終了中など）
+    Unreachable(&'static str),
+    /// dispatch（または非同期 run の開始）が断った
+    Rejected(DispatchError),
+}
+
+impl SubmitError {
+    /// IPC 応答の JSON-RPC エラーコード
+    pub fn code(&self) -> i64 {
+        match self {
+            SubmitError::Unreachable(_) => error_code::INTERNAL,
+            SubmitError::Rejected(e) => e.code(),
+        }
+    }
+}
+
+impl std::fmt::Display for SubmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SubmitError::Unreachable(message) => f.write_str(message),
+            SubmitError::Rejected(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// 要求を受け口（UI スレッドの dispatch）へ渡して応答を待つ **1 実装**（#1745）。
+///
+/// IPC の接続スレッド・HTTP MCP のハンドラスレッド・非同期 run の完了待ちスレッドが
+/// すべてここを通る。**非同期 run の開始（`OrchestratorRunStart`）だけはここで受ける**:
+/// spawn と完了待ちのポーリングは dispatch の往復なので UI スレッドの上では待てず、
+/// 待つ係（ポーリングのスレッド）とレジストリは受け口を持つこのプロセス（GUI）に置く。
+/// #1745 まではこの処理が HTTP MCP のハンドラにだけあり、stdio ブリッジ（IPC 経由）からは
+/// 頼む口が無かった（`sync=true` を付けないと JSON-RPC エラーで返っていた）
+pub fn submit(
+    tx: &UnboundedSender<IncomingRequest>,
+    request: Request,
+    origin: PaneOrigin,
+) -> Result<Value, SubmitError> {
+    if let Some(opts) = wait::RunOptions::from_start_request(&request) {
+        return start_run(tx, &opts, origin);
+    }
+    let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+    tx.unbounded_send(IncomingRequest {
+        request,
+        origin,
+        reply: reply_tx,
+    })
+    .map_err(|_| SubmitError::Unreachable("アプリ側の受け口が閉じている"))?;
+    match reply_rx.recv() {
+        Ok(result) => result.map_err(SubmitError::Rejected),
+        Err(_) => Err(SubmitError::Unreachable("アプリ側から応答が返らなかった")),
+    }
+}
+
+/// 非同期 run を開始する: spawn はこのスレッドから受け口へ頼み、完了待ちは
+/// `wait::run_start` が立てるスレッドから同じ受け口へ頼む
+fn start_run(
+    tx: &UnboundedSender<IncomingRequest>,
+    opts: &wait::RunOptions,
+    origin: PaneOrigin,
+) -> Result<Value, SubmitError> {
+    let mut exec = |req: Request| submit(tx, req, origin).map_err(|e| e.to_string());
+    let poll_tx = tx.clone();
+    wait::run_start(&mut exec, opts, move || {
+        Box::new(move |req: Request| submit(&poll_tx, req, origin).map_err(|e| e.to_string()))
+    })
+    .map_err(|e| SubmitError::Rejected(DispatchError::Operation(e)))
 }
 
 /// IPC サーバーのハンドル。drop でソケットファイル（と #1441 の参照ファイル）を片付ける。
@@ -146,32 +221,15 @@ mod conn {
                 "認証に失敗した（TAKO_TOKEN が一致しない）",
             );
         }
-        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
         // MCP stdio ブリッジ（`tako mcp serve`）経由のリクエストは origin = Mcp として扱う
         let origin = match envelope.origin.as_deref() {
             Some("mcp") => PaneOrigin::Mcp,
             _ => PaneOrigin::Cli,
         };
-        let incoming = IncomingRequest {
-            request: envelope.request,
-            origin,
-            reply: reply_tx,
-        };
-        if tx.unbounded_send(incoming).is_err() {
-            return ResponseEnvelope::err(
-                envelope.id,
-                error_code::INTERNAL,
-                "アプリ側の受け口が閉じている",
-            );
-        }
-        match reply_rx.recv() {
-            Ok(Ok(result)) => ResponseEnvelope::ok(envelope.id, result),
-            Ok(Err(e)) => ResponseEnvelope::err(envelope.id, e.code(), e.to_string()),
-            Err(_) => ResponseEnvelope::err(
-                envelope.id,
-                error_code::INTERNAL,
-                "アプリ側から応答が返らなかった",
-            ),
+        // 受け口へ渡すのは HTTP MCP と同じ 1 実装（非同期 run の開始もここで受ける = #1745）
+        match super::submit(tx, envelope.request, origin) {
+            Ok(result) => ResponseEnvelope::ok(envelope.id, result),
+            Err(e) => ResponseEnvelope::err(envelope.id, e.code(), e.to_string()),
         }
     }
 }
@@ -443,6 +501,177 @@ mod unix_imp {
     }
 }
 
+/// 非同期 run の開始を IPC 越しに頼む回帰テストの本体（#1745）。unix（ソケット）と
+/// windows（名前付きパイプ）のテストが「1 往復する係」だけを差し替えて呼ぶ
+#[cfg(test)]
+mod run_start_over_ipc {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use futures::channel::mpsc::UnboundedReceiver;
+    use futures::StreamExt;
+    use serde_json::{json, Value};
+
+    use super::IncomingRequest;
+    use crate::dispatch::DispatchError;
+    use crate::orchestrator::wait;
+    use crate::protocol::{Request, RequestEnvelope, ResponseEnvelope};
+
+    /// UI スレッドの dispatch の代役。run が使う要求だけに答え、受けた種別を記録する。
+    /// worker は `done` が立つまで busy と答える（開始が完了を待たないことを、
+    /// 実時間ではなく「完了させる前に running が見える」で確かめるため）。
+    /// run_status / run_result は本物の dispatch と同じく `wait` の関数を直に呼ぶ
+    pub(super) struct FakeApp {
+        seen: Arc<Mutex<Vec<String>>>,
+        done: Arc<AtomicBool>,
+    }
+
+    pub(super) fn spawn_fake_app(mut rx: UnboundedReceiver<IncomingRequest>) -> FakeApp {
+        let app = FakeApp {
+            seen: Arc::new(Mutex::new(Vec::new())),
+            done: Arc::new(AtomicBool::new(false)),
+        };
+        let (log, done) = (Arc::clone(&app.seen), Arc::clone(&app.done));
+        std::thread::spawn(move || {
+            while let Some(incoming) = futures::executor::block_on(rx.next()) {
+                let _ = incoming.reply.send(answer(incoming.request, &log, &done));
+            }
+        });
+        app
+    }
+
+    fn answer(
+        request: Request,
+        log: &Arc<Mutex<Vec<String>>>,
+        done: &AtomicBool,
+    ) -> Result<Value, DispatchError> {
+        log.lock().unwrap().push(request.kind_name());
+        match request {
+            Request::OrchestratorSpawn { .. } => {
+                Ok(json!({ "pane_id": 42, "spawned_by": 7, "tmux_session": null }))
+            }
+            Request::OrchestratorWorkerStatus { .. } => Ok(if done.load(Ordering::SeqCst) {
+                json!({
+                    "status": "idle",
+                    "status_source": "agents",
+                    "recent_output": "作業が完了しました\n❯ \n──────\nmodel: opus",
+                })
+            } else {
+                json!({ "status": "busy", "status_source": "agents", "recent_output": "" })
+            }),
+            Request::Read { .. } => Ok(json!({ "text": "WORKER REPORT" })),
+            Request::Close { .. } => Ok(json!({})),
+            Request::OrchestratorRunStatus { run_id: Some(id) } => {
+                wait::run_status(&id).map_err(DispatchError::Operation)
+            }
+            Request::OrchestratorRunResult { run_id } => wait::run_result(&run_id, &mut |req| {
+                answer(req, log, done).map_err(|e| e.to_string())
+            })
+            .map_err(DispatchError::Operation),
+            // 本物の dispatch も開始要求は断る（受け口で受けずに流れてきたら失敗させる）
+            other => Err(DispatchError::Operation(format!(
+                "dispatch では扱わない: {}",
+                other.kind_name()
+            ))),
+        }
+    }
+
+    /// 1 要求を IPC で往復する。stdio ブリッジ（`tako mcp serve`）と同じく origin = mcp
+    pub(super) fn exchange<S: Read + Write>(
+        mut stream: S,
+        token: &str,
+        request: Request,
+    ) -> ResponseEnvelope {
+        let mut envelope = RequestEnvelope::new(1, token, request);
+        envelope.origin = Some("mcp".into());
+        writeln!(stream, "{}", serde_json::to_string(&envelope).unwrap()).unwrap();
+        stream.flush().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        serde_json::from_str(&line).expect("レスポンスを解釈できる")
+    }
+
+    /// 開始 → run_status で完了まで追う → run_result で回収、をすべて IPC 越しに行う
+    pub(super) fn drive(app: &FakeApp, send: impl Fn(Request) -> ResponseEnvelope) {
+        let opts = wait::RunOptions {
+            project: "demo".into(),
+            prompt: "やって".into(),
+            label: None,
+            model: None,
+            effort: None,
+            agent: None,
+            pane: Some(7),
+            tab: None,
+            caller_role: None,
+            timeout: Duration::from_secs(30),
+            auto_close: true,
+            output_lines: 50,
+            initial_delay: Duration::ZERO,
+            interval: Duration::from_millis(10),
+            task_type: None,
+            account: None,
+        };
+        let status_of = |run_id: &str| {
+            send(Request::OrchestratorRunStatus {
+                run_id: Some(run_id.to_string()),
+            })
+            .result
+            .expect("run_status が IPC 越しに引ける")
+        };
+
+        let response = send(opts.start_request());
+        let body = response.result.unwrap_or_else(|| {
+            panic!(
+                "非同期 run の開始が IPC 越しに断られた（#1745）: {:?}",
+                response.error
+            )
+        });
+        let run_id = body["run_id"].as_str().expect("run_id が返る").to_string();
+        assert_eq!(body["pane_id"], 42);
+        // worker を完了させる前に開始が返っている = 完了を待っていない
+        // （待つ実装なら run 自身の timeout で finished/timeout になってから返る）
+        let before = status_of(&run_id);
+        assert_eq!(before["phase"], "running", "{before}");
+
+        app.done.store(true, Ordering::SeqCst);
+        // 完了待ちは回数で縛る（1 回 20ms の待ちを最大 500 回）
+        let finished = (0..500)
+            .find_map(|_| {
+                let status = status_of(&run_id);
+                if status["phase"] == "finished" {
+                    return Some(status);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+                None
+            })
+            .expect("run が finished にならない");
+        assert_eq!(finished["status"], "completed");
+
+        let result = send(Request::OrchestratorRunResult {
+            run_id: run_id.clone(),
+        })
+        .result
+        .expect("run_result が IPC 越しに引ける");
+        assert_eq!(result["status"], "completed");
+        assert_eq!(result["output"], "WORKER REPORT");
+        assert_eq!(result["closed"], true);
+
+        // spawn も完了待ちも受け口の代役（= UI スレッドの dispatch）へ届き、
+        // 開始要求そのものは dispatch へ流れていない
+        let kinds = app.seen.lock().unwrap().clone();
+        let count = |kind: &str| kinds.iter().filter(|k| *k == kind).count();
+        assert_eq!(count("OrchestratorSpawn"), 1, "{kinds:?}");
+        assert!(count("OrchestratorWorkerStatus") >= 3, "{kinds:?}");
+        assert_eq!(
+            count("OrchestratorRunStart"),
+            0,
+            "開始要求が dispatch へ流れた: {kinds:?}"
+        );
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use std::io::{BufRead, BufReader, Write};
@@ -553,6 +782,21 @@ mod tests {
         assert!(response.result.is_none());
     }
 
+    /// #1745: stdio ブリッジ（`tako mcp serve`）は IPC 越しに頼むしかない。開始要求が
+    /// IPC で届いても受け口側（このプロセス）で spawn と完了待ちが回り、
+    /// run_status / run_result を IPC で引けることを固定する
+    #[test]
+    fn 非同期runの開始はipc越しでも受け口側で回る() {
+        let (tx, rx) = unbounded::<IncomingRequest>();
+        let server = IpcServer::start(tx, TEST_TOKEN.into()).expect("IPC サーバーを起動できる");
+        let app = super::run_start_over_ipc::spawn_fake_app(rx);
+        let endpoint = server.endpoint().to_string();
+        super::run_start_over_ipc::drive(&app, |request| {
+            let stream = UnixStream::connect(&endpoint).expect("ソケットへ接続できる");
+            super::run_start_over_ipc::exchange(stream, TEST_TOKEN, request)
+        });
+    }
+
     #[test]
     fn dropでソケットファイルが消える() {
         let (tx, _rx) = unbounded::<IncomingRequest>();
@@ -614,6 +858,19 @@ mod windows_tests {
         let error = response.error.expect("エラーになる");
         assert_eq!(error.code, error_code::AUTH);
         assert!(response.result.is_none());
+    }
+
+    /// #1745: unix 側の同名テストの対（名前付きパイプ越し）
+    #[test]
+    fn 非同期runの開始はipc越しでも受け口側で回る() {
+        let (tx, rx) = unbounded::<IncomingRequest>();
+        let server = IpcServer::start(tx, TEST_TOKEN.into()).expect("IPC サーバーを起動できる");
+        let app = super::run_start_over_ipc::spawn_fake_app(rx);
+        let endpoint = server.endpoint().to_string();
+        super::run_start_over_ipc::drive(&app, |request| {
+            let stream = named_pipe::connect_client(&endpoint, 3_000).expect("パイプへ接続できる");
+            super::run_start_over_ipc::exchange(stream, TEST_TOKEN, request)
+        });
     }
 
     #[test]

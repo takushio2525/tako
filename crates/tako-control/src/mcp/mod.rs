@@ -25,11 +25,8 @@ mod request;
 pub use catalog::tools;
 pub use http::McpServer;
 
-use futures::channel::mpsc::UnboundedSender;
 use serde_json::{json, Value};
-use tako_core::PaneOrigin;
 
-use crate::ipc::IncomingRequest;
 use crate::orchestrator::wait;
 use crate::protocol::Request;
 use request::{bool_arg, build_request, str_arg, u64_arg, validate_known_params};
@@ -53,12 +50,10 @@ pub struct McpSession<'a> {
     /// false のとき tools/list は空を返す（tako の外で起動された stdio ブリッジ用。
     /// 登録済みでも tako 外の Claude Code セッションを邪魔しない）
     pub connected: bool,
-    /// 操作の実行係（HTTP: dispatch チャネル往復、stdio: IPC 往復）。
+    /// 操作の実行係（HTTP: dispatch チャネル往復、stdio: IPC 往復）。どちらも GUI 側では
+    /// `ipc::submit` の 1 実装へ入る（非同期 run の開始もそこで受ける = #1745）。
     /// Err は「ツール実行エラー」として isError 付き結果になる
     pub exec: &'a mut dyn FnMut(Request) -> Result<Value, String>,
-    /// 非同期 run のポーリングスレッド用 IPC チャネル（#121）。
-    /// HTTP 経路では tx.clone() でスレッドに渡す。stdio ブリッジでは None（sync のみ）
-    pub ipc_tx: Option<UnboundedSender<IncomingRequest>>,
 }
 
 /// MCP メッセージを 1 件処理する。応答すべき JSON-RPC レスポンスを返す
@@ -193,11 +188,10 @@ fn call_tool(params: &Value, session: &mut McpSession) -> Result<Value, (i64, St
         };
     }
 
-    // orchestrator_run はポーリングループを伴うため MCP ハンドラスレッドで合成する
+    // orchestrator_run の sync=true はポーリングループを伴うため MCP ハンドラ側で合成する
     // （dispatch は同期・UI スレッド実行のため長時間ブロック不可）
     if matches!(special_tool(name), Some(SpecialTool::OrchestratorRun)) {
-        let ipc_tx = session.ipc_tx.as_ref().cloned();
-        return orchestrator_run(&args, session, ipc_tx.as_ref());
+        return orchestrator_run(&args, session);
     }
 
     let request = build_request(
@@ -274,13 +268,9 @@ fn list_panes_with_caller(
 /// `tako_orchestrator_run` — spawn + 完了待ち + 出力取得 + close の合成操作（#121 で非同期化）。
 /// 既定（sync=false）は spawn 後に即座に `{run_id, pane_id, ...}` を返す非同期モード。
 /// sync=true は旧挙動（完了までブロッキング）を維持する後方互換モード。
-/// `ipc_tx` は非同期モードのポーリングスレッド用 IPC チャネル。None のとき
-/// 非同期モードは「IPC チャネルが渡されていない」エラーを返す（stdio ブリッジ等）
-fn orchestrator_run(
-    args: &Value,
-    session: &mut McpSession,
-    ipc_tx: Option<&UnboundedSender<IncomingRequest>>,
-) -> Result<Value, (i64, String)> {
+/// 非同期モードは開始要求を exec へ渡すだけで、spawn と完了待ちは GUI 側の受け口
+/// （`ipc::submit`）が回す。HTTP / stdio ブリッジのどちらでも同じ 1 本を通る（#1745）
+fn orchestrator_run(args: &Value, session: &mut McpSession) -> Result<Value, (i64, String)> {
     let map_err = |e: String| (-32602i64, e);
 
     // --- パラメータ解析 ---
@@ -333,8 +323,8 @@ fn orchestrator_run(
         timeout: std::time::Duration::from_secs(timeout_secs),
         auto_close,
         output_lines,
-        initial_delay: std::time::Duration::from_secs(20),
-        interval: std::time::Duration::from_secs(5),
+        initial_delay: wait::RUN_INITIAL_DELAY,
+        interval: wait::RUN_INTERVAL,
         task_type,
         account,
     };
@@ -349,32 +339,9 @@ fn orchestrator_run(
         }));
     }
 
-    // 非同期モード（#121）
-    let tx = ipc_tx
-        .ok_or((
-            -32602,
-            "非同期 run は HTTP MCP 経由でのみ利用可能（stdio は sync=true を指定してください）"
-                .to_string(),
-        ))?
-        .clone();
-    let result = wait::run_start(&mut *session.exec, &opts, move || {
-        let tx = tx;
-        Box::new(move |req: Request| -> Result<Value, String> {
-            let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
-            tx.unbounded_send(IncomingRequest {
-                request: req,
-                origin: PaneOrigin::Mcp,
-                reply: reply_tx,
-            })
-            .map_err(|_| "アプリ側の受け口が閉じている".to_string())?;
-            match reply_rx.recv() {
-                Ok(Ok(value)) => Ok(value),
-                Ok(Err(e)) => Err(e.to_string()),
-                Err(_) => Err("アプリ側から応答が返らなかった".into()),
-            }
-        })
-    })
-    .map_err(|e| (-32602, e))?;
+    // 非同期モード（#121）。#1745 までは HTTP の受け口のチャネルをここで握って
+    // run を立てていたため、別プロセスの stdio ブリッジからは使えなかった
+    let result = (session.exec)(opts.start_request()).map_err(|e| (-32602, e))?;
     Ok(json!({
         "content": [{ "type": "text", "text": result.to_string() }],
         "isError": false,

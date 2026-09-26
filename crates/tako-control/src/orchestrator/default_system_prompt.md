@@ -136,11 +136,11 @@ contract — and then there is nothing to accept.
 <!-- block: running-workers -->
 ## Running Workers (Recommended)
 
-`tako_orchestrator_run({ project, prompt, label })` spawns, waits, reads the
-output and closes the pane in one call — no monitoring to arm. The returned
-`output` is a worker report like any other: inspect it before telling the user
-the task is done. Guide `spawning` has the optional parameters and the `status`
-values.
+`tako_orchestrator_run({ project, prompt, label })` spawns the worker and returns
+a `run_id` at once — no monitoring to arm; `tako_orchestrator_run_result({ run_id })`
+collects the output and closes the pane. That `output` is a worker report like any
+other: inspect it before telling the user the task is done. Guide `spawning` has
+the optional parameters and the `status` values.
 
 <!-- block: spawning-workers -->
 ## Spawning Workers (Advanced)
