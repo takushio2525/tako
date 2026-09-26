@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-09-26（#1678: LSP 基盤（S1）を入れ、編集モードで言語サーバと握手して文書を同期するようにした）
-- tako-core::lsp（UTF-8 ⇄ UTF-16 の入口 2 本・検出表 4 行・ルート検出・状態機械 8 状態・写しとの差分）+ tako-control::lsp（Content-Length の自作フレーミング・1 サーバ 3 スレッド・再起動 3 回まで・猶予 60 秒で停止・診断は開いている文書のぶんだけ）。`lsp-types` 0.97 を追加し tokio は 0 件のまま。操作は dispatch `LspServer` → CLI `tako lsp status/servers/restart/stop/logs` → MCP `tako_lsp_server`
-- 実測: e2e `issue1678_lsp_e2e` 17 本（偽サーバの実プロセス。`TAKO_1007_LEGACY=1` で FAILED）・番犬 5 本（注入 2 通りが file:line で FAILED → 戻して緑）・隔離 GUI の `scripts/test-lsp-1678.sh`（アイドル 60 秒で受信 0 行・編集結果が 3 通りでバイト一致・kill -9 で孤児なし）・実 rust-analyzer 1.95.0 と握手（0.32 秒で稼働・能力 27 キー・診断 2 件。#1678 にコメント）
-
 ## 2026-09-26（#1745: stdio ブリッジからも非同期 run が使えるようにした）
 - 実測で確定: 非同期 run は HTTP MCP のハンドラが受け口のチャネルを握って立てており、`tako mcp serve`（`McpSession.ipc_tx: None`）は spawn 前に JSON-RPC エラー（`sync=true` を指定）で返っていた。受け口へ渡す処理を `ipc::submit` の 1 実装へ寄せ、新しい `Request::OrchestratorRunStart` をそこで受ける（IPC 接続スレッド・HTTP・完了待ちスレッドが同じ道）。`ipc_tx` は廃止し、guide `spawning` と prompt を非同期の既定（run_id → run_status → run_result）へ直した
 - 実測: `scripts/test-orchestrator-run-stdio-1745.sh` 修正前 10 PASS 9 FAIL（落ちたのは stdio の非同期 9 項目）→ 修正後全 PASS。注入 A/B 2 通り（受け口で受けない / エンジンを旧エラーへ戻す）が名指しで FAILED → 戻して緑
@@ -61,3 +57,8 @@
 - 行を指定した OpenFile が「飛ぶ前にいた場所」と着地点を積み、⌃- / ⌃⇧-（Windows は Ctrl+Alt+← / →。Ctrl+- は縮小のため）と CLI `tako jump back|forward|list` / MCP `tako_jump`（action の 1 ツール）が同じ dispatch で戻る / 進む。スタックは `tako_core::jump_history`（同じ行の連続を畳む・上限 100・閉じたペインは開き直す・消えたファイルは捨てる）。積む契機は行指定の open だけ・永続化しない
 - `OpenFile` の本体を `dispatch::open_file` へ移し、戻る / 進むの着地も同じ実装を通す（積まないのは `JumpRecord::Skip`）。#1398 の番犬を移動先を見る形へ直した。macOS の ⌃⇧- は shift が落ちて US = `ctrl-_` / JIS = `ctrl-=` で届くので 2 本張った
 - 実測: `scripts/test-jump-1677.sh` 31 PASS（CLI と MCP の応答が字面一致）・`test-jump-keys-1677.sh`（visual-test の打鍵経路）緑 + LEGACY で FAILED・注入 7 通りすべて file:line で FAILED → 戻して緑・workspace 5829 passed 0 failed・clippy 3 宇宙 0
+
+## 2026-09-26（#1768: ペインの PTY の子と remote daemon が GUI の fd を受け継がないようにした）
+- 修正前は GUI が CLOEXEC 無しで開いた Metal のシェーダキャッシュが全ペインの子の fd 4 / 5 に 100%（隔離 GUI 3000 / 3000・本番の tmux クライアント 23 本）。`platform::fd_inherit`（B27）の `seal_inherited_fds` を fork 後・exec 前の子で走らせる（PTY は `spawn_sealed` で包んで atfork の子ハンドラ・daemon は既存の `pre_exec`）
+- 親で掃く案 (a) は Metal を塞いだが GUI が相方を握るパイプが 1 / 3000 残ったので、子の中で掃く (b) を採った。`scripts/test-pty-fd-leak-1768.sh` の 3000 回・同条件で 修正前 other 3000 / (a) pipe 1 / (b) pipe 0・other 0
+- 注入 6 通り（包み・子ハンドラ・(a) 戻し・daemon・確保・逃げ道）が file:line 名指しで FAILED → 戻して緑。実 PTY の統合テスト 9 本・daemon の単体・番犬 4 本

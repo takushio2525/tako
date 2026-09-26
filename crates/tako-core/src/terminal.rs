@@ -527,7 +527,13 @@ impl TerminalSession {
         // コマンドラインへ組み直す必要があり、既定は素の空白連結なので空白を含む語
         // （`-c <空白入り cwd>` 等）が割れてペインが即死する。OS 差は境界の中だけが知る
         crate::platform::shell::apply_arg_escaping(&mut tty_options);
-        let mut pty = tty::new(&tty_options, window_size, 0).map_err(SessionError::Pty)?;
+        // GUI が CLOEXEC 無しで開いた fd（Metal のシェーダキャッシュ・並行 spawn のパイプ）を
+        // 子へ渡さない（#1768）。alacritty の PTY は fork + exec で起き、`pre_exec` を足す口が
+        // 無いので、包んでいるあいだだけ fork の子ハンドラが構え、exec の前に子の中で掃く。
+        // OS 差（Windows はハンドルを継承しない）は境界の中だけが知る
+        let mut pty =
+            crate::platform::fd_inherit::spawn_sealed(|| tty::new(&tty_options, window_size, 0))
+                .map_err(SessionError::Pty)?;
         // PTY スレーブの tty 名（/dev/ttysNNN）。tmux クライアントとの対応付けに使う（FR-2.13.2）
         let tty_name = slave_tty_name(&mut pty);
         // 疑似コンソールの文字コードを UTF-8 に固定する（#655。Windows のみ実体を持つ）。

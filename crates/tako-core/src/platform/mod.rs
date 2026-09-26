@@ -16,6 +16,7 @@ pub mod display;
 pub mod dpi;
 pub mod editor_keys;
 pub mod exe;
+pub mod fd_inherit;
 pub mod font;
 pub mod ime;
 pub mod install_info;
