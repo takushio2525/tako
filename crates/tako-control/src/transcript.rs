@@ -323,7 +323,7 @@ pub fn first_user_text(session_id: &str, max_chars: usize) -> Option<String> {
         if trimmed.is_empty() {
             continue;
         }
-        return Some(truncate_chars(trimmed, max_chars));
+        return Some(summary_line(trimmed, max_chars));
     }
     None
 }
@@ -587,7 +587,7 @@ fn notice_summary(inner: &str) -> String {
                 .map(str::to_string)
         })
         .unwrap_or_default();
-    truncate_chars(&candidate, NOTICE_SUMMARY_MAX_CHARS)
+    summary_line(&candidate, NOTICE_SUMMARY_MAX_CHARS)
 }
 
 /// 残存する `<…>` を落とす（要約に生 XML を混ぜないための最後の関所）
@@ -878,10 +878,10 @@ fn merge_assistant(prev: &mut Value, text: &str, thinking: &str, tools: Vec<Valu
 fn tool_summary(input: &Value) -> String {
     for key in ["command", "file_path", "description", "prompt"] {
         if let Some(v) = input[key].as_str() {
-            return truncate_chars(v, SUMMARY_MAX_CHARS);
+            return summary_line(v, SUMMARY_MAX_CHARS);
         }
     }
-    truncate_chars(&input.to_string(), SUMMARY_MAX_CHARS)
+    summary_line(&input.to_string(), SUMMARY_MAX_CHARS)
 }
 
 /// transcript から直近 `count` 件の assistant テキスト（text ブロックのみ）を抽出する。
@@ -955,15 +955,13 @@ fn extract_assistant_texts(lines: impl Iterator<Item = String>, count: usize) ->
     out.into_iter().collect()
 }
 
-/// 文字数ベースの切り詰め（マルチバイト安全）。超過時は … を付ける
-fn truncate_chars(s: &str, max: usize) -> String {
+/// 1 行の要約（前後の空白を落とし、改行を空白へ畳んで、内容を最大 `max` 文字 + `…`）。
+///
+/// 数えるのは `tako_core::text::truncate_chars` の 1 実装（#1757）。`…` を上限の外に
+/// 付ける契約なので上限を `max + 1` で渡す = 出力は `…` 込みで最大 `max + 1` 文字
+fn summary_line(s: &str, max: usize) -> String {
     let s = s.trim().replace('\n', " ");
-    if s.chars().count() <= max {
-        s
-    } else {
-        let head: String = s.chars().take(max).collect();
-        format!("{head}…")
-    }
+    tako_core::text::truncate_chars(&s, max.saturating_add(1))
 }
 
 #[cfg(test)]
@@ -1578,14 +1576,38 @@ mod tests {
     }
 
     #[test]
-    fn truncate_charsはマルチバイト安全() {
-        assert_eq!(truncate_chars("短い", 10), "短い");
+    fn summary_lineはマルチバイト安全() {
+        assert_eq!(summary_line("短い", 10), "短い");
         let long = "あ".repeat(130);
-        let out = truncate_chars(&long, 120);
+        let out = summary_line(&long, 120);
         assert_eq!(out.chars().count(), 121); // 120 + …
         assert!(out.ends_with('…'));
         // 改行は空白へ
-        assert_eq!(truncate_chars("a\nb", 10), "a b");
+        assert_eq!(summary_line("a\nb", 10), "a b");
+    }
+
+    /// #1757 で数える部分を `tako_core::text::truncate_chars` へ寄せた後の固定値。
+    /// 内容は最大 `max` 文字で `…` は上限の外（= `…` 込みで最大 `max + 1` 文字）
+    #[test]
+    fn summary_lineの幅は寄せる前と同じ() {
+        // ちょうど max 文字は切らない
+        assert_eq!(summary_line(&"あ".repeat(120), 120), "あ".repeat(120));
+        // max + 2 文字以上は内容 max 文字 + `…`（寄せる前と同じ文字列）
+        assert_eq!(
+            summary_line(&"あ".repeat(122), 120),
+            format!("{}…", "あ".repeat(120))
+        );
+        assert_eq!(
+            summary_line(&"🎉".repeat(200), 100),
+            format!("{}…", "🎉".repeat(100))
+        );
+        // max + 1 文字ちょうどは原文のまま（寄せる前は「max 文字 + `…`」= 同じ幅で
+        // 末尾 1 文字を `…` に置き換えていた。幅は同じで欠けが無くなる、唯一の差）
+        assert_eq!(summary_line(&"あ".repeat(121), 120), "あ".repeat(121));
+        // 前後の空白は落とし、改行は畳んでから数える
+        assert_eq!(summary_line("  a\nb  ", 3), "a b");
+        assert_eq!(summary_line("", 120), "");
+        assert_eq!(summary_line(" \n ", 120), "");
     }
 
     #[test]

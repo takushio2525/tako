@@ -37,11 +37,14 @@ use std::path::{Path, PathBuf};
 #[path = "common/production_range.rs"]
 mod production_range;
 
+// 範囲添字の検出・理由コメントの読み方は #1728 の番犬と共有する 1 実装（#1757）
+#[path = "common/range_index.rs"]
+mod range_index;
+
+use range_index::{range_indexes, REASON_MARK};
+
 const CLI_SRC: &str = "crates/tako-cli/src";
 const CLI_MAIN: &str = "crates/tako-cli/src/main.rs";
-
-/// 理由コメントの目印（同じ行か 1 行上）
-const REASON_MARK: &str = "切り出し安全:";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -92,66 +95,6 @@ fn code_of(src: &str) -> String {
     production_range::code_view_of(&production_range::scan(src).text)
 }
 
-/// 範囲添字の開き括弧の位置と、括弧の中身。
-///
-/// 添字として数えるのは「直前が識別子・`)`・`]`・`?`」の `[` だけ（配列リテラル・型・
-/// 属性 `#[`・マクロ `vec![` は直前がそれ以外）。中身の最上位に `..` があり、`,` / `;` が
-/// 無いもの（`[a, .., b]` のスライスパターンや `[0; n]` を外す）で、`[..]`（全体）は数えない
-fn range_indexes(code: &str) -> Vec<(usize, String)> {
-    let bytes = code.as_bytes();
-    let mut hits = Vec::new();
-    for (open, &b) in bytes.iter().enumerate() {
-        if b != b'[' || open == 0 {
-            continue;
-        }
-        let prev = bytes[open - 1];
-        if !(prev.is_ascii_alphanumeric() || matches!(prev, b'_' | b')' | b']' | b'?')) {
-            continue;
-        }
-        let mut depth = 0i32;
-        let mut close = None;
-        for (at, &c) in bytes.iter().enumerate().skip(open) {
-            match c {
-                b'[' | b'(' | b'{' => depth += 1,
-                b']' | b')' | b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        close = Some(at);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let Some(close) = close else { continue };
-        let inner = &code[open + 1..close];
-        let mut nest = 0i32;
-        let mut top = String::new();
-        for c in inner.chars() {
-            match c {
-                '[' | '(' | '{' => nest += 1,
-                ']' | ')' | '}' => nest -= 1,
-                _ if nest == 0 => top.push(c),
-                _ => {}
-            }
-        }
-        if !top.contains("..") || top.contains(',') || top.contains(';') || inner.trim() == ".." {
-            continue;
-        }
-        hits.push((open, inner.to_string()));
-    }
-    hits
-}
-
-/// バイト位置の行番号（1 始まり）
-fn line_at(text: &str, at: usize) -> usize {
-    text.as_bytes()[..at]
-        .iter()
-        .filter(|&&b| b == b'\n')
-        .count()
-        + 1
-}
-
 /// 関数の窓（宣言行の 1 始まりの行番号と本文）。終わりは宣言行と同じ字下げの `}`
 fn fn_window(code: &str, needle: &str) -> Option<(usize, String)> {
     let lines: Vec<&str> = code.lines().collect();
@@ -178,23 +121,13 @@ fn sites(raw: &str, code: &str) -> Vec<Site> {
     let raw_lines: Vec<&str> = raw.lines().collect();
     range_indexes(code)
         .into_iter()
-        .map(|(open, inner)| {
-            let line = line_at(code, open);
-            let here = raw_lines.get(line - 1).copied().unwrap_or("");
-            let above = line
-                .checked_sub(2)
-                .and_then(|i| raw_lines.get(i))
-                .copied()
-                .unwrap_or("");
-            let rounded =
-                inner.contains("floor_char_boundary(") || inner.contains("ceil_char_boundary(");
-            let commented = here.contains(REASON_MARK)
-                || (above.trim_start().starts_with("//") && above.contains(REASON_MARK));
-            Site {
-                line,
-                text: here.trim().to_string(),
-                excused: rounded || commented,
-            }
+        .map(|r| Site {
+            line: r.line,
+            text: raw_lines
+                .get(r.line - 1)
+                .map(|l| l.trim().to_string())
+                .unwrap_or_default(),
+            excused: r.is_rounded() || range_index::has_reason(&raw_lines, r.line),
         })
         .collect()
 }
@@ -292,10 +225,7 @@ fn 走査が空振りしていない() {
     // 単体テストの中の範囲添字は本番コードではないので潰れている
     // （テスト側には居て、その行は本番の検出結果に 1 つも混ざらない）
     let tests = production_range::code_view_of(&production_range::tests_only(&raw));
-    let test_lines: Vec<usize> = range_indexes(&tests)
-        .into_iter()
-        .map(|(open, _)| line_at(&tests, open))
-        .collect();
+    let test_lines: Vec<usize> = range_indexes(&tests).into_iter().map(|r| r.line).collect();
     assert!(
         !test_lines.is_empty(),
         "テストの眺めに範囲添字が 1 つも無い（#1420 の範囲取りが壊れている）"

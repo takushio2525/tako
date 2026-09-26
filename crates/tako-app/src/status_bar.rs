@@ -268,7 +268,7 @@ impl TakoApp {
                             .text_ellipsis()
                             .whitespace_nowrap()
                             .text_color(hsla(theme.text_faint))
-                            .child(SharedString::from(truncate(&parent, 28))),
+                            .child(SharedString::from(truncate_chars(&parent, 28))),
                     )
                     .child(
                         div()
@@ -278,7 +278,7 @@ impl TakoApp {
                             .whitespace_nowrap()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(hsla(theme.foreground))
-                            .child(SharedString::from(truncate(&leaf, 20))),
+                            .child(SharedString::from(truncate_chars(&leaf, 20))),
                     )
                     .child(
                         svg()
@@ -591,7 +591,7 @@ impl TakoApp {
                             .font_family(theme.font_family.clone())
                             .text_size(px(10.5))
                             .text_color(hsla(theme.accent))
-                            .child(SharedString::from(truncate(&active_tab_name, 12))),
+                            .child(SharedString::from(truncate_chars(&active_tab_name, 12))),
                     )
                     .child(
                         div()
@@ -707,12 +707,12 @@ impl TakoApp {
                     let branch = self
                         .sidebar_git
                         .as_ref()
-                        .map(|g| truncate(&g.branch, 16))
+                        .map(|g| truncate_chars(&g.branch, 16))
                         .or_else(|| {
                             self.git_data
                                 .as_ref()
                                 .and_then(|d| d.branches.iter().find(|b| b.is_current))
-                                .map(|b| truncate(&b.name, 16))
+                                .map(|b| truncate_chars(&b.name, 16))
                         })
                         .unwrap_or_else(|| "git".into());
                     SharedString::from(branch)

@@ -281,7 +281,7 @@ impl TakoApp {
                 .cursor_pointer()
                 .hover(|d| d.bg(rgba(theme.surface_hover)))
                 .child(tab_state_dot(tab_state_color(&theme, &agg), false))
-                .child(tab_pill_label(truncate(&group.title, 18), false))
+                .child(tab_pill_label(truncate_chars(&group.title, 18), false))
                 .child(tab_pill_badge(&theme, panes.to_string()))
                 .child(
                     tab_pill_slot()

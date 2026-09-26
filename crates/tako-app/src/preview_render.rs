@@ -688,7 +688,10 @@ impl TakoApp {
     fn background_group_label(&self, tab: TabId) -> String {
         let count = self.background_entries_of_tab(tab).len();
         if let Some(entry) = self.workspace.shelved_tab(tab) {
-            return crate::ui_text::panel::shelved_tab_group(&truncate(entry.title(), 20), count);
+            return crate::ui_text::panel::shelved_tab_group(
+                &truncate_chars(entry.title(), 20),
+                count,
+            );
         }
         let title = self
             .workspace
@@ -697,7 +700,7 @@ impl TakoApp {
             .find(|p| p.origin_tab() == tab)
             .map(|p| p.origin_tab_title().to_string())
             .unwrap_or_default();
-        crate::ui_text::panel::closed_tab_group(&truncate(&title, 20), count)
+        crate::ui_text::panel::closed_tab_group(&truncate_chars(&title, 20), count)
     }
 
     fn preview_label(&self, target: PreviewTarget) -> String {
@@ -806,7 +809,7 @@ impl TakoApp {
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .text_ellipsis()
-                                    .child(SharedString::from(truncate(&entry.label, 32))),
+                                    .child(SharedString::from(truncate_chars(&entry.label, 32))),
                             )
                             .child(
                                 div()
@@ -871,7 +874,7 @@ impl TakoApp {
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
-                    .child(SharedString::from(truncate(&label, 40))),
+                    .child(SharedString::from(truncate_chars(&label, 40))),
             );
         if live {
             titlebar = titlebar.child(live_badge(theme.accent));
@@ -983,7 +986,7 @@ impl TakoApp {
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .text_ellipsis()
-                                    .child(SharedString::from(truncate(&label, 28))),
+                                    .child(SharedString::from(truncate_chars(&label, 28))),
                             )
                             // #1579: 印が**実ピクセルで描かれている**ことを visual-test が
                             // 読むための実矩形（`ui_asset!` の登録漏れは無言で消える = #562）
@@ -2335,7 +2338,7 @@ impl TakoApp {
                     .cursor(CursorStyle::OpenHand)
                     .on_drag(
                         PaneDrag { pane: pane_id },
-                        self.drag_ghost_builder(DragKind::Pane, truncate(&file_name, 24), cx),
+                        self.drag_ghost_builder(DragKind::Pane, truncate_chars(&file_name, 24), cx),
                     )
                     // #185: プレビューヘッダ右クリックメニュー
                     .on_mouse_down(
@@ -2412,7 +2415,7 @@ impl TakoApp {
                                             } else {
                                                 ""
                                             };
-                                            format!("{}{suffix}", truncate(&file_name, 36))
+                                            format!("{}{suffix}", truncate_chars(&file_name, 36))
                                         })),
                                 )
                             })
@@ -2437,7 +2440,7 @@ impl TakoApp {
                                     } else {
                                         theme.green
                                     }))
-                                    .child(SharedString::from(truncate(&message, 36)))
+                                    .child(SharedString::from(truncate_chars(&message, 36)))
                             }))
                             .when(phv.page_info, |d| {
                                 d.children(pdf_info.map(|(current, total)| {
@@ -2655,7 +2658,7 @@ impl TakoApp {
                                         .or_else(|| run_profiles.first())
                                         // 文字数で切る（#1728。バイト位置で切ると日本語の
                                         // ファイル名の途中に当たって描画中に panic する）
-                                        .map(|p| crate::truncate(&p.command, 60))
+                                        .map(|p| tako_core::text::truncate_chars(&p.command, 60))
                                         .unwrap_or_default()
                                 } else {
                                     crate::ui_text::preview::run_no_command().to_string()
@@ -4537,7 +4540,7 @@ impl TakoApp {
             };
             let is_selected = profile_name == selected;
             // 文字数で切る（#1728。バイト位置で切ると文字の途中に当たって描画中に panic する）
-            let cmd_preview = crate::truncate(&plan.command, 40);
+            let cmd_preview = tako_core::text::truncate_chars(&plan.command, 40);
             let path = self
                 .previews
                 .get(&pane_id)
@@ -4903,7 +4906,7 @@ mod tests {
 
     /// 実行メニュー（40）/ ツールチップ（60）が呼ぶ切り詰め
     fn cut(cmd: &str, max: usize) -> String {
-        crate::truncate(cmd, max)
+        tako_core::text::truncate_chars(cmd, max)
     }
 
     /// 結果が「入力の先頭を文字境界で切ったもの（切ったなら末尾に `…`）」で、
