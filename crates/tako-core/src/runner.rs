@@ -300,19 +300,38 @@ fn strip_closers(value: &str) -> &str {
 
 // --- 変数展開 ---
 
-/// コマンド・cwd の値中の変数を展開。展開値はシングルクオートで自動エスケープ。
+/// 変数展開の文脈（#1656）。
 ///
-/// `${workspaceRoot}` はプロジェクトを知らないのでファイルのディレクトリになる
-/// （プロジェクトのルートで展開したいときは [`expand_variables_in`]）
-pub fn expand_variables(template: &str, path: &Path) -> String {
-    let file_dir = path.parent().unwrap_or(Path::new("")).to_path_buf();
-    expand_variables_in(template, path, &file_dir)
+/// 展開に使う値はここへ集める。後続（#1726 S2。`.agent/plans/2026-09-runner-settings.md`
+/// §6.1）が `${python}` / `${args}` の値を**同じ構造体へ足す**ので、`expand_variables` の
+/// 引数を増やさない
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunVars {
+    /// 実行対象（`${file}` / `${fileDir}` / `${fileBase}` / `${fileNoExt}` / `${ext}` の元）
+    pub path: PathBuf,
+    /// `${workspaceRoot}`（プロジェクトのルート → git のルート → ファイルのディレクトリ）
+    pub workspace_root: PathBuf,
 }
 
-/// [`expand_variables`] に `${workspaceRoot}` の値を渡す版（#1656）
-pub fn expand_variables_in(template: &str, path: &Path, workspace_root: &Path) -> String {
+impl RunVars {
+    pub fn new(path: &Path, workspace_root: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            workspace_root: workspace_root.to_path_buf(),
+        }
+    }
+
+    /// プロジェクトを知らない文脈（`${workspaceRoot}` はファイルのディレクトリ）
+    pub fn for_file(path: &Path) -> Self {
+        Self::new(path, path.parent().unwrap_or(Path::new("")))
+    }
+}
+
+/// コマンド・cwd の値中の変数を展開。展開値はシングルクオートで自動エスケープ
+pub fn expand_variables(template: &str, vars: &RunVars) -> String {
+    let path = vars.path.as_path();
     let file_str = path.to_string_lossy();
-    let root_str = workspace_root.to_string_lossy();
+    let root_str = vars.workspace_root.to_string_lossy();
     let file_dir = path
         .parent()
         .map(|p| p.to_string_lossy().into_owned())
@@ -516,7 +535,8 @@ fn resolve_core(
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    let expand = |template: &str| expand_variables_in(template, path, &workspace_root);
+    let vars = RunVars::new(path, &workspace_root);
+    let expand = |template: &str| expand_variables(template, &vars);
 
     let decls = parse_declarations(head);
     let warnings = decls.warnings;
@@ -880,49 +900,49 @@ mod tests {
     #[test]
     fn 変数展開_基本() {
         let path = PathBuf::from("/Users/a/src/main.c");
-        let result = expand_variables("cc ${fileBase} -o ${fileNoExt}", &path);
+        let result = expand_variables("cc ${fileBase} -o ${fileNoExt}", &RunVars::for_file(&path));
         assert_eq!(result, "cc main.c -o main");
     }
 
     #[test]
     fn 変数展開_フルパス() {
         let path = PathBuf::from("/Users/a/src/main.c");
-        let result = expand_variables("${file}", &path);
+        let result = expand_variables("${file}", &RunVars::for_file(&path));
         assert_eq!(result, "/Users/a/src/main.c");
     }
 
     #[test]
     fn 変数展開_拡張子() {
         let path = PathBuf::from("/tmp/test.PY");
-        let result = expand_variables("${ext}", &path);
+        let result = expand_variables("${ext}", &RunVars::for_file(&path));
         assert_eq!(result, "py");
     }
 
     #[test]
     fn 変数展開_空白パスはクオート() {
         let path = PathBuf::from("/Users/a/my project/main tool.c");
-        let result = expand_variables("cc ${fileBase}", &path);
+        let result = expand_variables("cc ${fileBase}", &RunVars::for_file(&path));
         assert_eq!(result, "cc 'main tool.c'");
     }
 
     #[test]
     fn 変数展開_日本語パス() {
         let path = PathBuf::from("/Users/a/ドキュメント/テスト.py");
-        let result = expand_variables("python3 ${fileBase}", &path);
+        let result = expand_variables("python3 ${fileBase}", &RunVars::for_file(&path));
         assert_eq!(result, "python3 'テスト.py'");
     }
 
     #[test]
     fn 変数展開_シングルクオート含み() {
         let path = PathBuf::from("/tmp/it's.sh");
-        let result = expand_variables("bash ${fileBase}", &path);
+        let result = expand_variables("bash ${fileBase}", &RunVars::for_file(&path));
         assert_eq!(result, "bash 'it'\\''s.sh'");
     }
 
     #[test]
     fn 変数展開_未知変数はそのまま() {
         let path = PathBuf::from("/tmp/test.sh");
-        let result = expand_variables("echo ${HOME} ${fileBase}", &path);
+        let result = expand_variables("echo ${HOME} ${fileBase}", &RunVars::for_file(&path));
         assert_eq!(result, "echo ${HOME} test.sh");
     }
 
@@ -930,7 +950,7 @@ mod tests {
     #[allow(non_snake_case)]
     fn 変数展開_fileDir() {
         let path = PathBuf::from("/Users/a/src/main.c");
-        let result = expand_variables("${fileDir}", &path);
+        let result = expand_variables("${fileDir}", &RunVars::for_file(&path));
         assert_eq!(result, "/Users/a/src");
     }
 
@@ -1655,7 +1675,48 @@ mod tests {
         assert_eq!(res.workspace_root, p.base.join("plain"));
         // プロジェクトを知らない展開はファイルのディレクトリ
         let path = PathBuf::from("/tmp/src/main.c");
-        assert_eq!(expand_variables("${workspaceRoot}", &path), "/tmp/src");
+        assert_eq!(
+            expand_variables("${workspaceRoot}", &RunVars::for_file(&path)),
+            "/tmp/src"
+        );
+    }
+
+    /// `project_root::detect`（#1726 が実行設定のキーに使う）は**実行の cwd と同じ答え**を返す。
+    /// ずれると「project に保存した設定が効かない」になる。先頭（head）を見る種別（Go）も含める
+    #[test]
+    fn project_root_detectは実行のcwdと同じ答え() {
+        let p = Proj::new("same-root");
+        p.write("ws/Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
+        p.write("ws/crates/core/Cargo.toml", "[package]\nname = \"core\"\n");
+        p.write("ws/crates/core/src/lib.rs", "");
+        p.write("ws/crates/core/src/a.rs", "");
+        p.write("go/go.mod", "module m\n");
+        p.write("go/internal/x/x.go", "package x\n");
+        p.write("py/pyproject.toml", "");
+        p.write("py/pkg/cli.py", "");
+        p.write("js/packages/web/package.json", "{}");
+        p.write("js/packages/web/src/a.ts", "");
+        p.write("c/Makefile", "all:\n");
+        p.write("c/src/main.c", "");
+        p.write("loose/x.rs", "");
+        for rel in [
+            "ws/crates/core/src/a.rs",
+            "go/internal/x/x.go",
+            "py/pkg/cli.py",
+            "js/packages/web/src/a.ts",
+            "c/src/main.c",
+            "loose/x.rs",
+        ] {
+            let file = p.base.join(rel);
+            let info = crate::project_root::detect_in(&file, &p.bounds);
+            let res = p.resolve(Platform::current(), rel, &BTreeMap::new());
+            let run_root = res.ok().and_then(|r| r.project).map(|m| (m.root, m.kind));
+            assert_eq!(info.map(|i| (i.root, i.kind)), run_root, "{rel}");
+        }
+        // cargo の member は印の段（パッケージ）ではなくワークスペースのルート
+        let info =
+            crate::project_root::detect_in(&p.base.join("ws/crates/core/src/a.rs"), &p.bounds);
+        assert_eq!(info.map(|i| i.root), Some(p.base.join("ws")));
     }
 
     #[test]

@@ -19,8 +19,19 @@
 //!
 //! [`crate::git::repo_root`] は `git rev-parse` を起こす。Code Runner の検出は
 //! プレビューを開くたびに UI スレッドで走るので、段ごとの `exists` だけで決める。
+//!
+//! ## 「このファイルのプロジェクトのルートはどこか」は [`detect`] の 1 本
+//!
+//! Code Runner の実行設定（#1726。`.agent/plans/2026-09-runner-settings.md` §4.5）は
+//! プロジェクトのルートを設定のキーにする。ルートが Code Runner の cwd とずれると
+//! 「project に保存した設定が効かない」になるので、[`detect`] は**種別の表
+//! （[`crate::runner_project::KINDS`]）へ委ねて、実行の cwd と同じ答えを返す**。
+//! cargo のワークスペースのように「印のある段」と「ルート」が違う種別があるので、
+//! ルートの決め方をここへ複製しない。
 
 use std::path::{Path, PathBuf};
+
+use crate::platform::support::Platform;
 
 /// 上へ辿る段数の上限（開始ディレクトリを 1 段目と数える）
 pub const MAX_DEPTH: usize = 32;
@@ -120,9 +131,26 @@ pub struct Found {
 
 /// 境界の内側で、`markers` のどれかを持つ最も近いディレクトリを探す
 pub fn find_upward(start_dir: &Path, markers: &[&str], bounds: &SearchBounds) -> Option<Found> {
+    find_upward_map(start_dir, bounds, |dir| {
+        marker_in(dir, markers).map(|marker| Found {
+            dir: dir.to_path_buf(),
+            marker,
+        })
+    })
+}
+
+/// 境界の内側で、近い段から `probe` を当てて最初に `Some` を返したものを返す。
+///
+/// 印がファイル名で表せない探し方（`.venv` の**ディレクトリ**がある段・中身を読んで
+/// 決める段）はこちらを使う。辿る範囲は [`candidate_dirs`] と同じ
+pub fn find_upward_map<T>(
+    start_dir: &Path,
+    bounds: &SearchBounds,
+    mut probe: impl FnMut(&Path) -> Option<T>,
+) -> Option<T> {
     candidate_dirs(start_dir, bounds)
         .into_iter()
-        .find_map(|dir| marker_in(&dir, markers).map(|marker| Found { dir, marker }))
+        .find_map(|dir| probe(&dir))
 }
 
 /// `dir` 直下にある印のうち、`markers` の並びで最初のもの。
@@ -158,6 +186,33 @@ pub fn repo_root_within(start_dir: &Path, bounds: &SearchBounds) -> Option<PathB
         .into_iter()
         .last()
         .filter(|dir| dir.join(".git").exists())
+}
+
+/// ファイルの属するプロジェクト
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectInfo {
+    /// プロジェクトのルート（= Code Runner のプロジェクト既定の cwd = `${workspaceRoot}`）
+    pub root: PathBuf,
+    /// 種別（[`crate::runner_project::ProjectKind::id`]。`"cargo"` 等）
+    pub kind: &'static str,
+}
+
+/// ファイルの属するプロジェクトのルートと種別（本番の境界 = HOME を天井にする）。
+///
+/// **Code Runner の実行の cwd と同じ答え**を返す（種別の表へ委ねる）。どの種別も
+/// 受け持たない拡張子・印の見つからないファイルは `None`
+pub fn detect(file: &Path) -> Option<ProjectInfo> {
+    detect_in(file, &SearchBounds::for_user())
+}
+
+/// [`detect`] の境界を外から渡す版（テスト用）
+pub fn detect_in(file: &Path, bounds: &SearchBounds) -> Option<ProjectInfo> {
+    // ルートは OS にもファイルの中身にも依らない（中身を見るのはコマンドの選び方だけ =
+    // Go の `package` 句）ので、実行中の OS と空の先頭で表を引く
+    crate::runner_project::detect(Platform::current(), file, "", bounds).map(|m| ProjectInfo {
+        root: m.root,
+        kind: m.kind,
+    })
 }
 
 #[cfg(test)]

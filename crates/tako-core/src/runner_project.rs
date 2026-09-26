@@ -54,7 +54,9 @@ pub struct Probe<'a> {
     pub platform: Platform,
     /// 実行対象（絶対パス）
     pub file: &'a Path,
-    /// ファイル先頭（`runner` が読んだ 16 KiB。Go の `package` 句を見る）
+    /// ファイル先頭（`runner` が読んだ 16 KiB。Go の `package` 句を見る）。
+    /// **コマンドの選び方にだけ使い、ルートの決定には使わない**
+    /// （[`crate::project_root::detect`] は空の先頭で引いて、実行の cwd と同じ答えを返す）
     pub head: &'a str,
     /// 印のあったディレクトリ
     pub marker_dir: &'a Path,
@@ -1426,10 +1428,15 @@ mod tests {
     #[test]
     fn リポジトリの外の印はプロジェクトと読まない() {
         let s = Sandbox::new("outside-repo");
-        s.write("parent/Cargo.toml", PKG);
+        // Makefile の計画は必ず成立するので、境界が効いていなければここで拾ってしまう
+        // （外側の印が Cargo.toml だと、計画のほうが不成立で緑になり境界を検査できない）
+        s.write("parent/Makefile", "run:\n");
         s.dir("parent/repo/.git");
-        s.write("parent/repo/src/main.rs", "");
-        assert_eq!(s.detect(Platform::MacOs, "parent/repo/src/main.rs"), None);
+        s.write("parent/repo/src/main.c", "");
+        assert_eq!(s.detect(Platform::MacOs, "parent/repo/src/main.c"), None);
+        // 対照: `.git` が無ければ同じ配置で外側の Makefile へ届く
+        std::fs::remove_dir_all(s.base.join("parent/repo/.git")).unwrap();
+        assert_eq!(s.same_on_both("parent/repo/src/main.c").1, "parent");
     }
 
     /// 表の行が自己矛盾していない（id の重複・印や拡張子の空・大文字の拡張子）
