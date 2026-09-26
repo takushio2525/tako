@@ -193,17 +193,83 @@ impl Rgb {
     }
 }
 
-/// `#RRGGBB` 文字列を Rgb へパースする（6 桁のみ。3 桁 #RGB は非対応）
-pub fn parse_hex_color(s: &str) -> Option<Rgb> {
+/// 色の指定（`#RRGGBB`）を読めなかった理由（Issue #1756）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HexColorError {
+    /// 空（`#` だけ・空白だけも含む）
+    Empty,
+    /// 16 進数字（ASCII の 0-9 / a-f / A-F）ではない文字を含む（最初に見つかった 1 文字）
+    InvalidChar(char),
+    /// 16 進数字の桁数が 6 でない（3 桁の `#RGB` も含む）
+    WrongLength(usize),
+}
+
+impl HexColorError {
+    /// 利用者へ返す理由の文（日英）。`value` は受け取った指定そのもの。
+    /// dispatch のエラー（CLI / MCP / 設定画面が表示する）と起動時の警告が同じ文を使う
+    pub fn message(&self, value: &str) -> crate::i18n::Text {
+        // 制御文字・ゼロ幅文字は見える形へ直して返す（コピペで紛れた U+200B を名指せるように）
+        let value = value.escape_debug();
+        match self {
+            Self::Empty => crate::i18n::Text::new(
+                "色の値が空（#RRGGBB の形で指定する。例: #89b4fa）",
+                "The color value is empty (use the #RRGGBB form, e.g. #89b4fa)",
+            ),
+            Self::InvalidChar(c) => {
+                let c = c.escape_debug();
+                crate::i18n::Text::new(
+                    format!(
+                        "不正な色値: {value}（16 進数字 0-9 / a-f ではない文字 '{c}' を含む。\
+                         #RRGGBB の形で指定する。例: #89b4fa）"
+                    ),
+                    format!(
+                        "Invalid color value: {value} (contains '{c}', which is not a hex digit \
+                         0-9 / a-f; use the #RRGGBB form, e.g. #89b4fa)"
+                    ),
+                )
+            }
+            Self::WrongLength(n) => crate::i18n::Text::new(
+                format!(
+                    "不正な色値: {value}（16 進数字が {n} 桁。#RRGGBB の 6 桁で指定する。\
+                     例: #89b4fa）"
+                ),
+                format!(
+                    "Invalid color value: {value} ({n} hex digits; use the 6-digit #RRGGBB form, \
+                     e.g. #89b4fa)"
+                ),
+            ),
+        }
+    }
+}
+
+/// `#RRGGBB` 文字列を Rgb へパースする（6 桁のみ。3 桁 #RGB は非対応。`#` は省略可）。
+///
+/// **検査は文字単位で行う**（#1756）。バイト長で 6 を確かめてから `&hex[0..2]` で切ると、
+/// 「赤色」（3 バイト × 2 = 6 バイト）のような非 ASCII の値が長さの検査を通り、文字の途中で
+/// 切って panic する。呼び出し元は GUI の dispatch と起動時のテーマ解決なので GUI ごと落ちる
+/// （起動時は settings.json に残った値で毎回落ちる）。`u8::from_str_radix` も先頭の `+` を
+/// 受け付けるので使わない（`#+f+f+f` が色として通っていた）
+pub fn parse_hex_color(s: &str) -> Result<Rgb, HexColorError> {
     let s = s.trim();
     let hex = s.strip_prefix('#').unwrap_or(s);
-    if hex.len() != 6 {
-        return None;
+    if hex.is_empty() {
+        return Err(HexColorError::Empty);
     }
-    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-    Some(Rgb::new(r, g, b))
+    let mut value: u32 = 0;
+    let mut digits = 0usize;
+    for c in hex.chars() {
+        // `char::to_digit` は ASCII の 0-9 / a-z / A-Z だけを数字とみなす（全角数字は弾かれる）
+        let d = c.to_digit(16).ok_or(HexColorError::InvalidChar(c))?;
+        // 桁が多すぎる値でもあふれないよう、積むのは 6 桁ぶんまで（超過は下で弾く）
+        if digits < 6 {
+            value = (value << 4) | d;
+        }
+        digits += 1;
+    }
+    if digits != 6 {
+        return Err(HexColorError::WrongLength(digits));
+    }
+    Ok(Rgb::from_hex(value))
 }
 
 impl Default for Theme {
@@ -430,14 +496,13 @@ impl Theme {
         let mut warnings = Vec::new();
         for (key, hex) in overrides {
             match parse_hex_color(hex) {
-                Some(c) => {
+                Ok(c) => {
                     if !self.set_color(key, c) {
                         warnings.push(format!("未知の色キー: {key}"));
                     }
                 }
-                None => {
-                    warnings.push(format!("不正な色値: {key}={hex}（#RRGGBB 形式が必要）"));
-                }
+                // 警告は診断ログ（persist.log）へ出すものなので日本語側を使う
+                Err(e) => warnings.push(format!("{key}: {}", e.message(hex).ja())),
             }
         }
         warnings
@@ -800,23 +865,175 @@ mod tests {
 
     #[test]
     fn parse_hex_colorの基本() {
-        assert_eq!(parse_hex_color("#ff0000"), Some(Rgb::new(255, 0, 0)));
-        assert_eq!(parse_hex_color("#00ff00"), Some(Rgb::new(0, 255, 0)));
-        assert_eq!(parse_hex_color("89b4fa"), Some(Rgb::new(0x89, 0xb4, 0xfa)));
+        assert_eq!(parse_hex_color("#ff0000"), Ok(Rgb::new(255, 0, 0)));
+        assert_eq!(parse_hex_color("#00ff00"), Ok(Rgb::new(0, 255, 0)));
+        assert_eq!(parse_hex_color("89b4fa"), Ok(Rgb::new(0x89, 0xb4, 0xfa)));
+        assert_eq!(parse_hex_color(" #1e1e2e "), Ok(Rgb::new(0x1e, 0x1e, 0x2e)));
+        // 3桁は非対応
+        assert_eq!(parse_hex_color("#fff"), Err(HexColorError::WrongLength(3)));
         assert_eq!(
-            parse_hex_color(" #1e1e2e "),
-            Some(Rgb::new(0x1e, 0x1e, 0x2e))
+            parse_hex_color("#gggggg"),
+            Err(HexColorError::InvalidChar('g'))
         );
-        assert_eq!(parse_hex_color("#fff"), None); // 3桁は非対応
-        assert_eq!(parse_hex_color("#gggggg"), None);
-        assert_eq!(parse_hex_color(""), None);
+        assert_eq!(parse_hex_color(""), Err(HexColorError::Empty));
     }
 
     #[test]
     fn rgb_to_hexの往復() {
         let c = Rgb::new(0x89, 0xb4, 0xfa);
         assert_eq!(c.to_hex(), "#89b4fa");
-        assert_eq!(parse_hex_color(&c.to_hex()), Some(c));
+        assert_eq!(parse_hex_color(&c.to_hex()), Ok(c));
+    }
+
+    /// #1756: 検査はバイトではなく文字で行う。「赤色」は 3 バイト × 2 = 6 バイトなので、
+    /// バイト長で 6 を確かめてから `&hex[0..2]` で切る旧実装では長さの検査を通り、
+    /// 文字の途中で切って panic した（GUI の dispatch と起動時のテーマ解決が呼ぶので
+    /// GUI ごと落ちる。実測: `theme.rs:203` の "end byte index 2 is not a char boundary"）
+    #[test]
+    fn issue1756_非asciiと桁違いはpanicせず理由付きで弾く() {
+        use HexColorError::{Empty, InvalidChar, WrongLength};
+        let accent = Rgb::new(0x89, 0xb4, 0xfa);
+        let cases: &[(&str, Result<Rgb, HexColorError>)] = &[
+            // 6 バイトの非 ASCII（旧実装はここで panic する）
+            ("#赤色", Err(InvalidChar('赤'))),
+            ("赤色", Err(InvalidChar('赤'))),
+            // 1 + 3 + 2 = 6 バイト。ASCII で始まり 2 バイト目で文字の途中に当たる
+            ("#a赤de", Err(InvalidChar('赤'))),
+            // 2 バイト × 3（é は合成済みの U+00E9）
+            ("#\u{e9}\u{e9}\u{e9}", Err(InvalidChar('\u{e9}'))),
+            // 5 / 7 桁
+            ("#12345", Err(WrongLength(5))),
+            ("#1234567", Err(WrongLength(7))),
+            // `#` 無し
+            ("89b4fa", Ok(accent)),
+            ("12345", Err(WrongLength(5))),
+            // 大文字小文字（混在も含めて同じ色）
+            ("#89B4FA", Ok(accent)),
+            ("#89b4FA", Ok(accent)),
+            // 空
+            ("", Err(Empty)),
+            ("#", Err(Empty)),
+            ("   ", Err(Empty)),
+            // 全角数字・全角の `#`
+            ("#１２３４５６", Err(InvalidChar('１'))),
+            ("＃ff0000", Err(InvalidChar('＃'))),
+            // `u8::from_str_radix` が受け付ける先頭の `+`（旧実装は #0f0f0f として通していた）
+            ("#+f+f+f", Err(InvalidChar('+'))),
+            // コピペで紛れるゼロ幅空白
+            ("#ff\u{200b}0000", Err(InvalidChar('\u{200b}'))),
+            // 不正な文字は桁数より先に名指す
+            ("#1234567赤", Err(InvalidChar('赤'))),
+        ];
+        for (input, want) in cases {
+            assert_eq!(&parse_hex_color(input), want, "入力 {input:?}");
+        }
+    }
+
+    /// #1756: 1〜4 バイトの文字を混ぜた列を総当たりし、panic しないことと
+    /// 「ASCII の 16 進数字だけで 6 桁」のときに限って色になることを固定する
+    #[test]
+    fn issue1756_文字の総当たりでpanicせず6桁の16進だけを受ける() {
+        // 16 進数字（小文字・大文字・数字）と、2 / 3 / 4 バイトの文字（é / 赤 / 𠮷）
+        const ALPHABET: [char; 6] = ['a', 'F', '0', '\u{e9}', '赤', '\u{20bb7}'];
+        let mut checked = 0usize;
+        for len in 1..=6u32 {
+            for n in 0..ALPHABET.len().pow(len) {
+                let mut rest = n;
+                let mut body = String::new();
+                for _ in 0..len {
+                    body.push(ALPHABET[rest % ALPHABET.len()]);
+                    rest /= ALPHABET.len();
+                }
+                let is_color =
+                    body.chars().count() == 6 && body.chars().all(|c| c.is_ascii_hexdigit());
+                for input in [body.clone(), format!("#{body}")] {
+                    let got = parse_hex_color(&input);
+                    assert_eq!(got.is_ok(), is_color, "入力 {input:?} → {got:?}");
+                    if let Ok(c) = got {
+                        let want = u32::from_str_radix(&body, 16).expect("16 進数字だけ");
+                        assert_eq!(c, Rgb::from_hex(want), "入力 {input:?}");
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        // 6^1 + … + 6^6 = 55,986 通り × `#` の有無
+        assert_eq!(checked, 55_986 * 2);
+    }
+
+    /// #1756: 理由の文は日英とも「何が悪いか」を名指す（問題の文字・桁数）。
+    /// 文面の正本は `HexColorError::message` で、ここでは文面を直書きしない
+    #[test]
+    fn issue1756_理由の文は日英とも問題の箇所を名指す() {
+        let has_japanese = |s: &str| {
+            s.chars().any(|c| {
+                ('\u{3000}'..='\u{30ff}').contains(&c)
+                    || ('\u{4e00}'..='\u{9fff}').contains(&c)
+                    || ('\u{ff00}'..='\u{ffef}').contains(&c)
+            })
+        };
+        // (入力, 理由に載るべき断片)。断片は受け取った値そのものには現れない形にしておく
+        // （値のこだまで検査が通ってしまわないように）
+        let cases = [
+            ("#赤色", "'赤'"),
+            ("#abcde", "5"),
+            ("#gggggg", "'g'"),
+            // 見えない文字は見える形（エスケープ）で名指す
+            ("#ff\u{200b}0000", "'\\u{200b}'"),
+            ("", "#RRGGBB"),
+        ];
+        for (input, needle) in cases {
+            let err = parse_hex_color(input).expect_err("不正な値のはず");
+            let m = err.message(input);
+            for (lang, text) in [("ja", m.ja()), ("en", m.en())] {
+                assert!(
+                    text.contains(needle),
+                    "{lang}: {input:?} の理由に {needle:?} が無い: {text}"
+                );
+                assert!(text.contains("#RRGGBB"), "{lang}: 期待する形が無い: {text}");
+                assert!(
+                    !text.chars().any(crate::emoji::is_emoji),
+                    "{lang}: 絵文字を含む: {text}"
+                );
+                assert!(
+                    !text.contains('\u{200b}'),
+                    "{lang}: 見えない文字をそのまま返している: {text:?}"
+                );
+            }
+            assert!(has_japanese(m.ja()), "ja 側が日本語でない: {}", m.ja());
+            // 英語側に日本語が残っていない（受け取った値の「赤色」を除いて見る）
+            assert!(
+                !has_japanese(&m.en().replace(['赤', '色'], "")),
+                "en 側に日本語が残っている: {}",
+                m.en()
+            );
+        }
+    }
+
+    /// #1756: settings.json に残った読めない値は、その色だけ既定へ落として警告で返す
+    /// （起動時のテーマ解決がここを通る。以前は非 ASCII の値で起動のたびに落ちた）
+    #[test]
+    fn issue1756_読めない上書きはその色だけ既定に残して警告する() {
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("accent".to_string(), "#赤色".to_string());
+        overrides.insert("red".to_string(), "#ｆｆ００００".to_string());
+        overrides.insert("green".to_string(), "#00ff00".to_string());
+        let mut t = Theme::default_dark();
+        let warnings = t.apply_overrides(&overrides);
+        let base = Theme::default_dark();
+        assert_eq!(t.accent, base.accent, "読めない値は既定のまま");
+        assert_eq!(t.red, base.red, "読めない値は既定のまま");
+        assert_eq!(t.green, Rgb::new(0, 255, 0), "同じ表の正しい値は効く");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        let accent = parse_hex_color("#赤色").unwrap_err().message("#赤色");
+        assert!(
+            warnings.contains(&format!("accent: {}", accent.ja())),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.starts_with("red: ")),
+            "{warnings:?}"
+        );
     }
 
     #[test]

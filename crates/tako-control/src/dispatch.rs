@@ -4262,8 +4262,9 @@ fn dispatch_inner(
                     if !Theme::COLOR_KEYS.contains(&k) {
                         return Err(DispatchError::InvalidParams(format!("未知の色キー: {k}")));
                     }
-                    parse_hex_color(v).ok_or_else(|| {
-                        DispatchError::InvalidParams(format!("不正な色値: {v}（#RRGGBB 形式が必要）"))
+                    // 読めない値は保存より前に理由付きで返す（#1756: 非 ASCII で GUI ごと落ちていた）
+                    parse_hex_color(v).map_err(|e| {
+                        DispatchError::InvalidParams(e.message(v).text().to_string())
                     })?;
                     if should_save {
                         let mut settings = crate::settings::load();
@@ -25090,6 +25091,91 @@ mod tests {
             PaneOrigin::Cli,
         )
         .is_err());
+    }
+
+    /// #1756: 色の値は文字単位で検査する。6 バイトの非 ASCII（`#赤色`）がバイト長の検査を
+    /// 通り、文字の途中で切って GUI ごと panic していた（実測: 隔離 GUI が Abort trap: 6）。
+    /// CLI（dispatch 直）と MCP（tools/call → dispatch）の両方で理由付きのエラーが返り、
+    /// 落ちないことを固定する
+    #[test]
+    fn issue1756_set_colorは非asciiの値を理由付きのエラーで返す() {
+        use tako_core::theme::parse_hex_color;
+        let set_color = |value: &str| Request::Theme {
+            action: Some("set-color".into()),
+            mode: None,
+            target: None,
+            key: Some("accent".into()),
+            value: Some(value.into()),
+            name: None,
+            font_family: None,
+            font_size: None,
+        };
+        // 期待する理由は正本（`HexColorError::message`）から引く。表示言語は並列の
+        // テスト（表示言語の set）が切り替えうるので、日英どちらかに一致すればよい
+        let reason = |value: &str| {
+            parse_hex_color(value)
+                .expect_err("不正な値のはず")
+                .message(value)
+        };
+        let mut host = MockHost::new();
+        for value in [
+            "#赤色",
+            "赤色",
+            "#ｆｆ００００",
+            "＃ff0000",
+            "#12345",
+            "#1234567",
+            "",
+            "#",
+            "#+f+f+f",
+        ] {
+            match dispatch(&mut host, set_color(value), PaneOrigin::Cli) {
+                Err(DispatchError::InvalidParams(msg)) => {
+                    let want = reason(value);
+                    assert!(
+                        msg == want.ja() || msg == want.en(),
+                        "{value:?} の理由が正本と一致しない: {msg}"
+                    );
+                }
+                other => panic!("{value:?} は InvalidParams で返るはず: {other:?}"),
+            }
+        }
+
+        // MCP: tools/call tako_theme → 同じ dispatch。isError 付きの結果で理由が返る
+        let mut exec = |req: Request| -> Result<serde_json::Value, String> {
+            dispatch(&mut host, req, PaneOrigin::Mcp).map_err(|e| e.to_string())
+        };
+        let mut session = crate::mcp::McpSession {
+            caller_pane: None,
+            caller_role: None,
+            connected: true,
+            exec: &mut exec,
+            ipc_tx: None,
+        };
+        let call = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "tako_theme",
+                "arguments": { "action": "set-color", "key": "accent", "value": "#赤色" },
+            },
+        });
+        let response = crate::mcp::handle_message(&call, &mut session).expect("応答がある");
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("本文がある");
+        let want = reason("#赤色");
+        assert!(
+            text.ends_with(want.ja()) || text.ends_with(want.en()),
+            "MCP の理由が正本と一致しない: {text}"
+        );
+
+        // 正しい値（大文字を含む）は従来どおり通る
+        let v = dispatch(&mut host, set_color("#89B4FA"), PaneOrigin::Cli).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["value"], "#89B4FA");
     }
 
     #[test]
