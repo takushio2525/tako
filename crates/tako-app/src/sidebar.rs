@@ -13,6 +13,120 @@ const INLINE_NEW_MARKER: &str = "__tako_inline_new__";
 /// 1 階層ぶんのインデント幅（カンプ: margin-left 17px）
 const INDENT_STEP: f32 = 17.0;
 
+/// インライン入力に入る名前の上限（バイト。#1725）。OS の名前の上限（255 バイト）より
+/// 十分大きく取り、超えた名前は作成時に OS が理由つきで断る（#1399 の通知欄に出る）。
+/// ここは巨大な貼り付けで描画が詰まらないための歯止めだけ
+const TREE_NAME_MAX_BYTES: usize = 1024;
+
+/// インライン入力の 1 桁の幅（px。#1725）。ツリーの字（12px の等幅）の半角の送り幅。
+/// 全角はこの 2 桁ぶんとして数える（実際の送り幅より広めに見積もる = はみ出さない側）
+const INLINE_CELL_PX: f32 = 7.2;
+
+/// 入力欄の中身以外が行の中で取る幅（px。#1725）: chevron の空き 14 + アイコン 16 +
+/// 子のあいだの gap 4×2 + 右の余白 6 + 入力欄の左右 padding 3×2 + 枠 1×2
+const INLINE_ROW_CHROME_PX: f32 = 52.0;
+
+/// 全角（2 桁）として数える文字か（#1725。表示窓の概算用で、端末の桁計算とは別物）
+fn inline_is_wide(c: char) -> bool {
+    matches!(c as u32,
+        0x1100..=0x115F       // ハングル字母
+        | 0x2E80..=0xA4CF     // CJK 部首・記号・かな・漢字
+        | 0xAC00..=0xD7A3     // ハングル音節
+        | 0xF900..=0xFAFF     // CJK 互換漢字
+        | 0xFE30..=0xFE4F     // CJK 互換形
+        | 0xFF00..=0xFF60     // 全角英数・記号
+        | 0xFFE0..=0xFFE6     // 全角記号
+        | 0x1F300..=0x1FAFF   // 絵文字（ファイル名に来うる）
+        | 0x20000..=0x3FFFD   // CJK 拡張
+    )
+}
+
+/// 桁数（半角 = 1 / 全角 = 2）
+fn inline_cells(s: &str) -> usize {
+    s.chars().map(inline_char_cells).sum()
+}
+
+fn inline_char_cells(c: char) -> usize {
+    if inline_is_wide(c) {
+        2
+    } else {
+        1
+    }
+}
+
+/// インライン入力に**見せる**ぶんを切り出す（#1725。GPUI 非依存の純粋関数）。
+///
+/// 入力欄は行の残り幅しか無いので、長い名前（深い階層のリネーム・長い日本語名）を
+/// そのまま並べるとキャレットと変換中の読みが入力欄の外へ押し出され、見えない上に
+/// 変換候補窓もサイドバーの外（ターミナルの上）に出る。そこで
+///
+/// - 変換中の読み（`marked`）とキャレットは**必ず**見せる
+/// - キャレットの前は**末尾から**入るぶんだけ、後ろは**先頭から**残りに入るぶんだけ
+/// - 切ったほうには `…` を付ける（切れていることを見せる）
+///
+/// を `cells` 桁（半角 = 1 / 全角 = 2）の中で決める。文字の途中では切らない
+pub(crate) fn inline_input_window(
+    before: &str,
+    marked: &str,
+    after: &str,
+    cells: usize,
+) -> (String, String) {
+    // キャレットの 1 桁ぶんを先に取る
+    let mut budget = cells.saturating_sub(1).saturating_sub(inline_cells(marked));
+    let before_vis: String = if inline_cells(before) <= budget {
+        budget -= inline_cells(before);
+        before.to_string()
+    } else {
+        // `…` の 1 桁を差し引いてから末尾を詰める
+        let room = budget.saturating_sub(1);
+        let mut used = 0;
+        let mut tail: Vec<char> = Vec::new();
+        for c in before.chars().rev() {
+            let w = inline_char_cells(c);
+            if used + w > room {
+                break;
+            }
+            used += w;
+            tail.push(c);
+        }
+        budget = 0;
+        std::iter::once('…').chain(tail.into_iter().rev()).collect()
+    };
+    let after_vis: String = if inline_cells(after) <= budget {
+        after.to_string()
+    } else if budget == 0 {
+        String::new()
+    } else {
+        let room = budget.saturating_sub(1);
+        let mut used = 0;
+        let mut head = String::new();
+        for c in after.chars() {
+            let w = inline_char_cells(c);
+            if used + w > room {
+                break;
+            }
+            used += w;
+            head.push(c);
+        }
+        head.push('…');
+        head
+    };
+    (before_vis, after_vis)
+}
+
+/// インライン入力の対象がいまのツリーに出ているか（#1725。GPUI 非依存の純粋関数）。
+///
+/// ツリーが閉じている・対象（作成先 / 名前を変える項目）がどのルートの配下にも無い、の
+/// どちらでも入力欄は描かれない。描かれない入力欄が打鍵と変換を握ると
+/// 「押しても何も起きない」になるので、打鍵の振り分けと変換の宛先はこの判定を共有する
+pub(crate) fn inline_edit_target_visible(
+    tree_visible: bool,
+    roots: &[std::path::PathBuf],
+    target: &std::path::Path,
+) -> bool {
+    tree_visible && roots.iter().any(|root| target.starts_with(root))
+}
+
 // ─────────────── git ステータスの見せ方（#1009） ───────────────
 //
 // 「何色にするか」は分類 1 つだけで決める（`TreeGitState`）。分類そのもの
@@ -426,6 +540,27 @@ impl TakoApp {
             );
         }
         let inline_edit_snapshot = self.inline_edit.clone();
+        // #1725: 入力欄の中身（未確定文字列とキャレット）はコミット欄・ブランチ欄と同じ
+        // 共有部品で組む。キャレットの実矩形は変換候補窓の位置出しに使われる
+        // （`bounds_for_range`）。入力欄は 1 つしか出ないので行の中で 1 度だけ取り出す
+        let mut inline_marked = self.text_input_marked_at(AppTextInput::TreeName, &theme, 12.0);
+        // 見える窓の見積もりに使う読み（描く要素は上の共有部品。ここは幅を数えるだけ）
+        let inline_marked_text: String = self
+            .ime
+            .as_ref()
+            .filter(|ime| ime.app_input == Some(AppTextInput::TreeName))
+            .map(|ime| ime.text.clone())
+            .unwrap_or_default();
+        let mut inline_caret = Some(self.text_input_caret(AppTextInput::TreeName, &theme));
+        // 入力欄の実矩形の採取（`tree_row_probe` のときだけ。項目 154 が使う）
+        let mut inline_rect_slot = self
+            .tree_row_probe
+            .then(|| self.tree_inline_input_rect.clone());
+        // #1725: 行の実矩形の採取（セルフテストが立てたフレームだけ。本番は None で要素を増やさない）
+        let row_rects = self.tree_row_probe.then(|| {
+            self.tree_row_rects.borrow_mut().clear();
+            self.tree_row_rects.clone()
+        });
         // #919: 期限切れの成功通知は落とす（失敗は expired() が false なので残る）
         if self.remote_notice.as_ref().is_some_and(|n| n.expired()) {
             self.remote_notice = None;
@@ -708,9 +843,27 @@ impl TakoApp {
                                         crate::ui_text::sidebar::new_dir_placeholder()
                                     }
                                 };
-                                let before_cursor = &edit.text[..edit.cursor];
-                                let after_cursor = &edit.text[edit.cursor..];
-                                let empty = edit.text.is_empty();
+                                let (before_full, after_full) = edit.field.split_at_caret();
+                                // 行の残り幅（通常行と同じインデント規則）から見える桁数を出し、
+                                // キャレットと変換中の読みが入力欄の中に収まる窓を切り出す
+                                let left_px = if row.depth >= 1 {
+                                    INDENT_STEP * row.depth as f32 + 14.0
+                                } else {
+                                    12.0
+                                };
+                                let cells = ((sidebar_w - left_px - INLINE_ROW_CHROME_PX)
+                                    / INLINE_CELL_PX)
+                                    .floor()
+                                    .max(4.0) as usize;
+                                let (before_cursor, after_cursor) = inline_input_window(
+                                    before_full,
+                                    &inline_marked_text,
+                                    after_full,
+                                    cells,
+                                );
+                                let composing = inline_marked.is_some();
+                                // 未確定文字列があれば空欄の案内は出さない（変換中の読みが案内と重なる）
+                                let empty = edit.field.text().is_empty() && !composing;
                                 // #559: インデントは通常行とまったく同じ規則で置く
                                 // （ml 17*depth + 左ガイド線 + pl 14）。ここが揃っていないと
                                 // 「どの階層に作られるのか」が読めない。自分の深さの線だけ
@@ -744,8 +897,24 @@ impl TakoApp {
                                     }))
                                     .child(
                                         div()
+                                            .id("filetree-inline-input")
                                             .flex_1()
                                             .min_w(px(0.0))
+                                            // 見積もりの誤差ではみ出しても行の外へ描かない
+                                            .overflow_hidden()
+                                            .relative()
+                                            .when_some(inline_rect_slot.take(), |d, slot| {
+                                                d.child(
+                                                    canvas(
+                                                        move |bounds, _, _| slot.set(Some(bounds)),
+                                                        |_, _, _, _| (),
+                                                    )
+                                                    .absolute()
+                                                    .top_0()
+                                                    .left_0()
+                                                    .size_full(),
+                                                )
+                                            })
                                             .flex()
                                             .flex_row()
                                             .items_center()
@@ -762,15 +931,24 @@ impl TakoApp {
                                                 spread_radius: px(1.),
                                                 inset: false,
                                             }])
+                                            // #1725: 入力欄の外を押したら取り消す（捕捉フェーズで
+                                            // 受けるので、押した先が伝播を止める要素でも取りこぼさない）。
+                                            // 打鍵の戻り先は押した先が決める（ペインを押せばそのペイン）
+                                            .on_mouse_down_out(cx.listener(
+                                                |this, _: &gpui::MouseDownEvent, _, cx| {
+                                                    if this.inline_edit.is_some()
+                                                        && !TakoApp::legacy_1725()
+                                                    {
+                                                        this.close_inline_edit(false);
+                                                        cx.notify();
+                                                    }
+                                                },
+                                            ))
+                                            .child(SharedString::from(before_cursor))
+                                            .children(inline_marked.take())
+                                            .children(inline_caret.take())
                                             .when(empty, |d| {
                                                 d.child(
-                                                    div()
-                                                        .w(px(1.5))
-                                                        .h(px(13.0))
-                                                        .bg(hsla(theme.accent))
-                                                        .flex_none(),
-                                                )
-                                                .child(
                                                     div()
                                                         .pl(px(3.0))
                                                         .text_color(hsla(theme.text_muted))
@@ -779,19 +957,7 @@ impl TakoApp {
                                                         )),
                                                 )
                                             })
-                                            .when(!empty, |d| {
-                                                d.child(SharedString::from(
-                                                    before_cursor.to_string(),
-                                                ))
-                                                .child(
-                                                    div()
-                                                        .w(px(1.5))
-                                                        .h(px(13.0))
-                                                        .bg(hsla(theme.accent))
-                                                        .flex_none(),
-                                                )
-                                                .child(SharedString::from(after_cursor.to_string()))
-                                            }),
+                                            .child(SharedString::from(after_cursor)),
                                     );
                             }
                             let is_open = !is_dir && open_paths.contains(&path);
@@ -806,6 +972,22 @@ impl TakoApp {
                                 .items_center()
                                 .py(px(1.0))
                                 .cursor_pointer()
+                                // 何も描かない矩形採取（#1725。`tree_row_probe` のときだけ）
+                                .when_some(row_rects.clone(), |d, rects| {
+                                    let probe_path = path.clone();
+                                    d.relative().child(
+                                        canvas(
+                                            move |bounds, _, _| {
+                                                rects.borrow_mut().push((probe_path, bounds))
+                                            },
+                                            |_, _, _, _| (),
+                                        )
+                                        .absolute()
+                                        .top_0()
+                                        .left_0()
+                                        .size_full(),
+                                    )
+                                })
                                 .when(is_inline_parent, |d| {
                                     d.bg(rgba_alpha(theme.accent, 0.16))
                                         .text_color(hsla(theme.foreground))
@@ -1555,6 +1737,8 @@ impl TakoApp {
             .sum::<f32>()
             + padding_y;
         let adjusted = clamp_menu_position(pos, menu_width, menu_height, window);
+        // 実矩形プローブの器を毎フレーム作り直す（#1725。項目 154 が押す位置の正）
+        self.tree_menu_item_rects.borrow_mut().clear();
 
         let menu = div()
             .absolute()
@@ -1581,8 +1765,10 @@ impl TakoApp {
                         .into_any_element();
                 }
                 let path = path.clone();
+                let rects = self.tree_menu_item_rects.clone();
                 div()
                     .id(("ctx-item", i as u64))
+                    .relative()
                     .w_full()
                     .px_2()
                     .py(px(2.0))
@@ -1594,6 +1780,17 @@ impl TakoApp {
                     }))
                     .when(id == "trash", |d| d.text_color(hsla(theme.red)))
                     .child(SharedString::from(label.to_string()))
+                    // 何も描かない矩形採取（#1182 と同じ作法。見た目にもレイアウトにも出ない）
+                    .child(
+                        canvas(
+                            move |bounds, _, _| rects.borrow_mut().push((id, bounds)),
+                            |_, _, _, _| (),
+                        )
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                    )
                     .into_any_element()
             }));
         let backdrop = div()
@@ -1620,87 +1817,129 @@ impl TakoApp {
         Some(backdrop.into_any_element())
     }
 
+    /// インライン入力を開く（新規ファイル / 新規フォルダ / 名前を変更。#1725）。
+    ///
+    /// **開く入口はここ 1 本**（右クリックメニューの 3 項目はすべてこれを呼ぶ）。
+    /// 開いた瞬間から打鍵・⌘V・IME の変換がすべてこの入力欄へ向く:
+    /// `handle_key` が打鍵を、`app_text_input` が変換の宛先（`AppTextInput::TreeName`）を
+    /// 同じ `inline_edit_visible` で決めるので、2 つの判断が割れない。
+    ///
+    /// 他の入力欄（git のコミット / ブランチ名・返答コメント・Web の URL）は先に畳む。
+    /// 残すと、この入力欄を閉じた瞬間に古いフラグが打鍵を拾い直す（#503 と同じ罠）
+    pub(crate) fn open_inline_edit(&mut self, kind: InlineEditKind, path: &std::path::Path) {
+        self.clear_text_input_focus();
+        let text = match kind {
+            InlineEditKind::Rename => path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            _ => String::new(),
+        };
+        let mut field = crate::text_field::TextField::default();
+        field.set_text(text);
+        let parent = if kind == InlineEditKind::Rename || path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.parent().unwrap_or(path).to_path_buf()
+        };
+        if kind != InlineEditKind::Rename {
+            // 作成先を開いておく（入力欄はその直下に出る = #559）
+            self.filetree.expand_dir(&parent);
+        }
+        self.inline_edit = Some(InlineEdit {
+            parent,
+            kind,
+            field,
+            origin_pane: self.focused_pane(),
+        });
+    }
+
+    /// インライン入力を閉じる（#1725。**閉じる出口はここ 1 本**）。
+    ///
+    /// - この入力欄宛ての変換が残っていたら捨てる（閉じた入力欄を宛先に持ったままだと、
+    ///   続く確定がどこにも入らない / 次の変換の宛先がずれる）
+    /// - `restore_focus` のとき（Esc / 確定）は、開いたときのペインへ打鍵を戻す。
+    ///   外側のクリックで閉じたときは戻さない（押した先が次のフォーカスを決める）
+    pub(crate) fn close_inline_edit(&mut self, restore_focus: bool) {
+        let Some(edit) = self.inline_edit.take() else {
+            return;
+        };
+        if self
+            .ime
+            .as_ref()
+            .is_some_and(|ime| ime.app_input == Some(AppTextInput::TreeName))
+        {
+            self.ime = None;
+        }
+        if restore_focus && self.focused_pane() != edit.origin_pane {
+            // 開いていたあいだに外から（CLI / MCP の focus 等）動かされていても戻る。
+            // 元のペインがもう無い / 別タブなら何もしない（今のフォーカスのまま）
+            let _ = self
+                .workspace
+                .active_tab_mut()
+                .tree_mut()
+                .focus(edit.origin_pane);
+        }
+    }
+
+    /// インライン入力が**画面に出ていて**打鍵・変換を受けるか（#1725）。
+    ///
+    /// ツリーを閉じた・タブを切り替えて作成先がルートから外れた、のどれでも入力欄は
+    /// 描かれない。そのとき打鍵を奪い続けると「押しても何も起きない」になるので、
+    /// 打鍵の振り分け（`handle_key`）と変換の宛先（`app_text_input`）はこの 1 判定を使う
+    pub(crate) fn inline_edit_visible(&self) -> bool {
+        self.inline_edit.as_ref().is_some_and(|edit| {
+            inline_edit_target_visible(self.filetree.visible, self.filetree.roots(), &edit.parent)
+        })
+    }
+
+    /// インライン入力へ文字列を入れる（#1725。**挿入はここ 1 本**）。
+    ///
+    /// 打鍵（`handle_inline_edit_key`）・⌘V（`paste`）・IME の確定
+    /// （`replace_text_in_range`）・未確定のまま確定（`unmark_text`）の 4 経路が
+    /// すべて `insert_app_text_input(AppTextInput::TreeName, …)` からここへ来る。
+    /// 制御文字（改行・タブ）は `TextField` が落とす = ファイル名に混ざらない
+    pub(crate) fn tree_name_insert(&mut self, text: &str, cx: &mut Context<Self>) {
+        if let Some(edit) = self.inline_edit.as_mut() {
+            // 上限は OS の名前の上限（255 バイト）より十分大きく取る。超えた名前は
+            // 作成時に OS が理由つきで断り、#1399 の通知欄に出る（入力欄は残る）。
+            // ここは巨大な貼り付けで描画が詰まらないための歯止めだけ
+            let _fits = edit.field.insert(text, TREE_NAME_MAX_BYTES, false);
+        }
+        cx.notify();
+    }
+
     pub(crate) fn handle_inline_edit_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) {
+        // この入力欄だけの割り当て（Enter = 確定 / Esc = 取り消し）を先に見る。
+        // 編集操作は `TextField` へ委ねる（#1459 / #1725。手書きのカーソル演算を持たない）
         match ks.key.as_str() {
             "enter" => {
                 self.commit_inline_edit(cx);
             }
             "escape" => {
-                self.inline_edit = None;
+                self.close_inline_edit(true);
                 cx.notify();
             }
-            "backspace" => {
-                if let Some(ref mut edit) = self.inline_edit {
-                    if edit.cursor > 0 {
-                        let prev = edit.text[..edit.cursor]
-                            .char_indices()
-                            .next_back()
-                            .map(|(i, _)| i)
-                            .unwrap_or(0);
-                        edit.text.drain(prev..edit.cursor);
-                        edit.cursor = prev;
-                    }
-                }
-                cx.notify();
-            }
-            "delete" => {
-                if let Some(ref mut edit) = self.inline_edit {
-                    if edit.cursor < edit.text.len() {
-                        let next = edit.text[edit.cursor..]
-                            .char_indices()
-                            .nth(1)
-                            .map(|(i, _)| edit.cursor + i)
-                            .unwrap_or(edit.text.len());
-                        edit.text.drain(edit.cursor..next);
-                    }
-                }
-                cx.notify();
-            }
-            "left" => {
-                if let Some(ref mut edit) = self.inline_edit {
-                    if edit.cursor > 0 {
-                        edit.cursor = edit.text[..edit.cursor]
-                            .char_indices()
-                            .next_back()
-                            .map(|(i, _)| i)
-                            .unwrap_or(0);
-                    }
-                }
-                cx.notify();
-            }
-            "right" => {
-                if let Some(ref mut edit) = self.inline_edit {
-                    if edit.cursor < edit.text.len() {
-                        edit.cursor = edit.text[edit.cursor..]
-                            .char_indices()
-                            .nth(1)
-                            .map(|(i, _)| edit.cursor + i)
-                            .unwrap_or(edit.text.len());
-                    }
-                }
-                cx.notify();
-            }
-            "home" => {
-                if let Some(ref mut edit) = self.inline_edit {
-                    edit.cursor = 0;
-                }
-                cx.notify();
-            }
-            "end" => {
-                if let Some(ref mut edit) = self.inline_edit {
-                    edit.cursor = edit.text.len();
-                }
-                cx.notify();
-            }
-            _ => {
-                if let Some(ch) = ks.key_char.as_ref() {
-                    if !ch.is_empty() && !ks.modifiers.control && !ks.modifiers.platform {
-                        if let Some(ref mut edit) = self.inline_edit {
-                            edit.text.insert_str(edit.cursor, ch);
-                            edit.cursor += ch.len();
-                        }
+            key => {
+                if let Some(edit) = self.inline_edit.as_mut() {
+                    if edit.field.handle_edit_key(key) {
                         cx.notify();
+                        return;
                     }
+                }
+                if ks.modifiers.control || ks.modifiers.platform {
+                    return;
+                }
+                match ks.key_char.as_deref() {
+                    Some(ch) if !ch.is_empty() => {
+                        self.insert_app_text_input(AppTextInput::TreeName, ch, cx)
+                    }
+                    // 空白は key_char が来ないことがある（#487 と同じ実機の観測）
+                    _ if key == "space" => {
+                        self.insert_app_text_input(AppTextInput::TreeName, " ", cx)
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1742,10 +1981,10 @@ impl TakoApp {
         let Some(edit) = self.inline_edit.clone() else {
             return;
         };
-        let name = edit.text.trim().to_string();
+        let name = edit.field.text().trim().to_string();
         if name.is_empty() {
             // 空 Enter は従来どおり「取り消し」（入力欄を閉じる）
-            self.inline_edit = None;
+            self.close_inline_edit(true);
             cx.notify();
             return;
         }
@@ -1766,7 +2005,7 @@ impl TakoApp {
         );
         match result {
             Ok(_) => {
-                self.inline_edit = None;
+                self.close_inline_edit(true);
                 // #550 × #559: ドット始まりを作ったのに非表示設定で消える（= 何も起きて
                 // いないように見える）のを防ぐ。明示的に作った物は必ず見せる
                 if filetree::is_hidden_name(&name) && !self.filetree.show_hidden() {
@@ -1787,7 +2026,7 @@ impl TakoApp {
             // （legacy アームだけ旧挙動 = 閉じて無言）
             Err(e) => {
                 if Self::legacy_1399() {
-                    self.inline_edit = None;
+                    self.close_inline_edit(true);
                 }
                 let op_label = match edit.kind {
                     InlineEditKind::Rename => crate::ui_text::sidebar::menu_rename(),
@@ -1904,37 +2143,8 @@ impl TakoApp {
                 }
             }
             "rename" | "new-file" | "new-dir" => {
-                let init_text = if action == "rename" {
-                    path.file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned()
-                } else {
-                    String::new()
-                };
-                let cursor = init_text.len();
-                self.inline_edit = Some(InlineEdit {
-                    parent: if action == "rename" || path.is_dir() {
-                        path.to_path_buf()
-                    } else {
-                        path.parent().unwrap_or(path).to_path_buf()
-                    },
-                    kind: match action {
-                        "rename" => InlineEditKind::Rename,
-                        "new-file" => InlineEditKind::NewFile,
-                        _ => InlineEditKind::NewDir,
-                    },
-                    text: init_text,
-                    cursor,
-                });
-                if action != "rename" {
-                    if let Some(parent_path) = if path.is_dir() {
-                        Some(path.to_path_buf())
-                    } else {
-                        path.parent().map(|p| p.to_path_buf())
-                    } {
-                        self.filetree.expand_dir(&parent_path);
-                    }
+                if let Some(kind) = InlineEditKind::from_menu_id(action) {
+                    self.open_inline_edit(kind, path);
                 }
             }
             "trash" => {
@@ -2332,6 +2542,14 @@ impl TakoApp {
     pub(crate) fn legacy_1399() -> bool {
         static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *LEGACY.get_or_init(|| std::env::var("TAKO_1399_LEGACY").map(|v| v == "1") == Ok(true))
+    }
+
+    /// #1725 の A/B。`TAKO_1725_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
+    /// （インライン入力を IME の宛先に入れない = 変換がターミナルペインに束縛される /
+    /// 外側クリックで閉じない）。セルフテスト項目 154 が FAILED になるのが A/B の実測
+    pub(crate) fn legacy_1725() -> bool {
+        static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *LEGACY.get_or_init(|| std::env::var("TAKO_1725_LEGACY").map(|v| v == "1") == Ok(true))
     }
 
     /// #1417 の A/B。`TAKO_1417_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
@@ -2968,6 +3186,87 @@ fn pick_app_and_open(path: &std::path::Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// #1725: 長い名前でもキャレットと変換中の読みは必ず見え、窓からはみ出さない
+    #[test]
+    fn インライン入力の見える窓はキャレットと読みを必ず含む() {
+        // 入り切るなら切らない
+        assert_eq!(
+            inline_input_window("a.txt", "", "", 30),
+            ("a.txt".to_string(), String::new())
+        );
+        // 前が長いときは末尾を残して `…` を付ける（キャレット直前の字は必ず見える）
+        let long = "tako-st1725-12345zqv3x";
+        let (b, a) = inline_input_window(long, "しりょう", "", 20);
+        let kept = b.strip_prefix('…').expect("切った側に … が付く");
+        assert!(long.ends_with(kept) && !kept.is_empty(), "{b}");
+        // 窓の幅 = 前 + 読み + キャレット 1 桁 が上限に収まる
+        assert!(inline_cells(&b) + inline_cells("しりょう") < 20, "{b}");
+        assert!(a.is_empty());
+        // 全角は 2 桁で数える（途中で切らない = 文字単位）
+        let jp = "資料".repeat(20);
+        let (b, _) = inline_input_window(&jp, "", "", 11);
+        assert!(inline_cells(&b) <= 10, "{b}");
+        assert!(b.chars().skip(1).all(|c| c == '資' || c == '料'), "{b}");
+        // 後ろは入るぶんだけ先頭から出して `…` を付ける
+        let (b, a) = inline_input_window("ab", "", "cdefghijklmnop", 8);
+        assert_eq!(b, "ab");
+        let shown = a.strip_suffix('…').expect("切った側に … が付く");
+        assert!("cdefghijklmnop".starts_with(shown), "{a}");
+        assert!(inline_cells(&b) + inline_cells(&a) < 8, "{b}|{a}");
+        // 読みだけで窓を使い切っても落ちない（前は `…` だけ・後ろは空）
+        let (b, a) = inline_input_window("abc", "ながいよみがなです", "def", 6);
+        assert!(inline_cells(&b) <= 1 && a.is_empty(), "{b}|{a}");
+        // 窓が 0 桁でも落ちない
+        let _ = inline_input_window("abc", "", "def", 0);
+    }
+
+    /// #1725: 見えていない入力欄は打鍵も変換も奪わない。ツリーが閉じている /
+    /// 対象がどのルートの配下にも無い（タブを切り替えた等）ときは偽
+    #[test]
+    fn インライン入力の対象はツリーに出ているときだけ見える() {
+        let roots = vec![PathBuf::from("/w/proj"), PathBuf::from("/w/other")];
+        // ルートそのもの（ルート行の新規作成 / 名前を変更）とその配下は見える
+        assert!(inline_edit_target_visible(
+            true,
+            &roots,
+            std::path::Path::new("/w/proj")
+        ));
+        assert!(inline_edit_target_visible(
+            true,
+            &roots,
+            std::path::Path::new("/w/proj/src/a.rs")
+        ));
+        assert!(inline_edit_target_visible(
+            true,
+            &roots,
+            std::path::Path::new("/w/other/日本語")
+        ));
+        // ツリーを閉じていれば見えない
+        assert!(!inline_edit_target_visible(
+            false,
+            &roots,
+            std::path::Path::new("/w/proj/src")
+        ));
+        // どのルートの配下でもない（タブを切り替えてルートから外れた）
+        assert!(!inline_edit_target_visible(
+            true,
+            &roots,
+            std::path::Path::new("/w/elsewhere/x")
+        ));
+        // 名前の前方一致ではなくパスの要素で見る（`/w/proj2` は `/w/proj` の配下ではない）
+        assert!(!inline_edit_target_visible(
+            true,
+            &roots,
+            std::path::Path::new("/w/proj2/x")
+        ));
+        // ルートが 1 つも無いツリー
+        assert!(!inline_edit_target_visible(
+            true,
+            &[],
+            std::path::Path::new("/w/proj")
+        ));
+    }
 
     /// 画面の識別子は診断（`area=`）で画面を見分けるためのものなので、
     /// 2 つの画面が同じ札を名乗ったら「どこで起きたか」が消える（#1417 / #1432）
