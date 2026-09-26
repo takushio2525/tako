@@ -673,16 +673,23 @@ fn path_lookup_candidate(
     }
 }
 
-/// ディレクトリの同一判定。Windows のファイルシステムは大文字小文字を区別しない
+/// ディレクトリの同一判定。Windows は大文字小文字を区別せず、`/` も `\\` も区切りとして読む
+/// （`%LOCALAPPDATA%` から組んだパスと PATH の項目で区切りが混ざっても同じ置き場と見る）
 fn same_dir(platform: Platform, a: &Path, b: &Path) -> bool {
-    let norm = |p: &Path| {
-        p.to_string_lossy()
-            .trim_end_matches(['/', '\\'])
-            .to_string()
-    };
     match platform {
-        Platform::Windows => norm(a).eq_ignore_ascii_case(&norm(b)),
-        Platform::MacOs => norm(a) == norm(b),
+        Platform::Windows => {
+            let norm = |p: &Path| {
+                p.to_string_lossy()
+                    .replace('/', "\\")
+                    .trim_end_matches('\\')
+                    .to_ascii_lowercase()
+            };
+            norm(a) == norm(b)
+        }
+        Platform::MacOs => {
+            let norm = |p: &Path| p.to_string_lossy().trim_end_matches('/').to_string();
+            norm(a) == norm(b)
+        }
     }
 }
 

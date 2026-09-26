@@ -51,8 +51,27 @@ fn env_of<'a>(c: &'a Candidate, var: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
+fn env_slash(c: &Candidate, var: &str) -> Option<String> {
+    env_of(c, var).map(slash)
+}
+
+/// 区切りを `/` に揃える（Windows のホストでは `join` が `\\` を使うので、期待値を
+/// `/` 区切りの 1 通りで書けるようにする。偽の置き場の名前には `\\` を使わない）
+fn slash(s: &str) -> String {
+    s.replace('\\', "/")
+}
+
 fn ps(v: &[PathBuf]) -> Vec<String> {
-    v.iter().map(|x| x.to_string_lossy().into_owned()).collect()
+    v.iter().map(|x| slash(&x.to_string_lossy())).collect()
+}
+
+/// `${python}` に入る語の列（区切りを `/` に揃えたもの）
+fn prog(c: &Candidate) -> Vec<String> {
+    c.applied.program.iter().map(|w| slash(w)).collect()
+}
+
+fn loc(c: &Candidate) -> Option<String> {
+    c.location.as_deref().map(|l| slash(&l.to_string_lossy()))
 }
 
 // ─── §5.2 の順を 1 行ずつ ───────────────────────────────────────────────
@@ -69,9 +88,12 @@ fn uvのプロジェクトはuv_runで包みvenvがあればactivationも併用�
     let d = detect_py(MAC, &["/h/proj/src", "/h/proj"], &fs, &home("/h"));
     let c = auto(&d);
     assert_eq!(c.manager, "uv");
-    assert_eq!(c.applied.program, ["/h/.local/bin/uv", "run", "python"]);
+    assert_eq!(prog(c), ["/h/.local/bin/uv", "run", "python"]);
     assert_eq!(ps(&c.applied.path_prepend), ["/h/proj/.venv/bin"]);
-    assert_eq!(env_of(c, "VIRTUAL_ENV"), Some("/h/proj/.venv"));
+    assert_eq!(
+        env_slash(c, "VIRTUAL_ENV").as_deref(),
+        Some("/h/proj/.venv")
+    );
     assert_eq!(c.found_in, Some(p("/h/proj")));
     assert!(!c.needs_probe);
     // .venv も候補として並ぶ（自動ではないが選べる）
@@ -118,7 +140,7 @@ fn uvが見つからなければ自動では選ばずvenvへ落ちる() {
     assert!(!uv.auto_eligible);
     assert!(uv.needs_probe, "Tier P で確かめれば選べる");
     // 見つかっていない道具は名前のまま（解くのはシェル）
-    assert_eq!(uv.applied.program, ["uv", "run", "python"]);
+    assert_eq!(prog(uv), ["uv", "run", "python"]);
     assert_eq!(d.warnings.len(), 1, "{:?}", d.warnings);
 }
 
@@ -130,10 +152,13 @@ fn venvだけならactivationで使い版をpyvenv_cfgから読む() {
     assert_eq!(c.manager, "venv");
     assert_eq!(c.label, ".venv");
     assert_eq!(c.version.as_deref(), Some("3.12.4"));
-    assert_eq!(c.applied.program, ["/h/proj/.venv/bin/python"]);
+    assert_eq!(prog(c), ["/h/proj/.venv/bin/python"]);
     assert_eq!(ps(&c.applied.path_prepend), ["/h/proj/.venv/bin"]);
-    assert_eq!(env_of(c, "VIRTUAL_ENV"), Some("/h/proj/.venv"));
-    assert_eq!(c.location, Some(p("/h/proj/.venv")));
+    assert_eq!(
+        env_slash(c, "VIRTUAL_ENV").as_deref(),
+        Some("/h/proj/.venv")
+    );
+    assert_eq!(loc(c).as_deref(), Some("/h/proj/.venv"));
 }
 
 #[test]
@@ -180,12 +205,12 @@ fn monorepoでは近い段のvenvが勝つ() {
         &fs,
         &home("/h"),
     );
-    assert_eq!(auto(&d).location, Some(p("/h/mono/pkg/a/.venv")));
+    assert_eq!(loc(auto(&d)).as_deref(), Some("/h/mono/pkg/a/.venv"));
     // 遠い段の venv も候補に残る
     assert!(d
         .candidates
         .iter()
-        .any(|c| c.location == Some(p("/h/mono/.venv"))));
+        .any(|c| loc(c).as_deref() == Some("/h/mono/.venv")));
 }
 
 #[test]
@@ -200,7 +225,7 @@ fn poetryは包む形で選ぶ() {
         let d = detect_py(MAC, &["/h/proj"], &fs, &home("/h"));
         let c = auto(&d);
         assert_eq!(c.manager, "poetry", "{marker}");
-        assert_eq!(c.applied.program, ["/h/.local/bin/poetry", "run", "python"]);
+        assert_eq!(prog(c), ["/h/.local/bin/poetry", "run", "python"]);
         // 走らせるのに Tier P は要らないが、環境の置き場は道具に聞かないと分からない
         assert!(c.auto_eligible && c.needs_probe);
         assert!(c.applied.path_prepend.is_empty());
@@ -225,10 +250,7 @@ fn pipenvはpipfileで包む() {
     let d = detect_py(MAC, &["/h/proj"], &fs, &home("/h"));
     let c = auto(&d);
     assert_eq!(c.manager, "pipenv");
-    assert_eq!(
-        c.applied.program,
-        ["/opt/homebrew/bin/pipenv", "run", "python"]
-    );
+    assert_eq!(prog(c), ["/opt/homebrew/bin/pipenv", "run", "python"]);
 }
 
 #[test]
@@ -241,7 +263,7 @@ fn 道具はguiプロセスのpathからも探す() {
         ..home("/h")
     };
     let d = detect_py(MAC, &["/h/proj"], &fs, &env);
-    assert_eq!(auto(&d).applied.program[0], "/somewhere/bin/pipenv");
+    assert_eq!(prog(auto(&d))[0], "/somewhere/bin/pipenv");
 }
 
 fn conda_fs(list: &str) -> FakeFs {
@@ -272,9 +294,12 @@ fn condaは宣言の名前が一覧とちょうど1つ一致したときだけ�
     assert_eq!(c.manager, "conda");
     assert_eq!((c.key.as_str(), c.label.as_str()), ("ml", "conda: ml"));
     assert_eq!(c.version.as_deref(), Some("3.10.14"));
-    assert_eq!(c.applied.program, ["/h/miniconda3/envs/ml/bin/python"]);
+    assert_eq!(prog(c), ["/h/miniconda3/envs/ml/bin/python"]);
     assert_eq!(ps(&c.applied.path_prepend), ["/h/miniconda3/envs/ml/bin"]);
-    assert_eq!(env_of(c, "CONDA_PREFIX"), Some("/h/miniconda3/envs/ml"));
+    assert_eq!(
+        env_slash(c, "CONDA_PREFIX").as_deref(),
+        Some("/h/miniconda3/envs/ml")
+    );
     assert_eq!(env_of(c, "CONDA_DEFAULT_ENV"), Some("ml"));
     // 一致しない env も選べるように並ぶ（自動ではない）
     let others: Vec<&str> = d
@@ -348,7 +373,7 @@ fn pyenvはpython_versionの版をversionsから引く() {
         (c.key.as_str(), c.label.as_str()),
         ("3.11.9", "pyenv 3.11.9")
     );
-    assert_eq!(c.applied.program, ["/h/.pyenv/versions/3.11.9/bin/python"]);
+    assert_eq!(prog(c), ["/h/.pyenv/versions/3.11.9/bin/python"]);
     assert_eq!(
         ps(&c.applied.path_prepend),
         ["/h/.pyenv/versions/3.11.9/bin"]
@@ -380,10 +405,7 @@ fn pyenv_rootがあればそちらを見る() {
     let mut env = home("/h");
     env.vars.insert("PYENV_ROOT".into(), "/opt/pyenv".into());
     let d = detect_py(MAC, &["/h/proj"], &fs, &env);
-    assert_eq!(
-        auto(&d).applied.program,
-        ["/opt/pyenv/versions/3.11.9/bin/python"]
-    );
+    assert_eq!(prog(auto(&d)), ["/opt/pyenv/versions/3.11.9/bin/python"]);
 }
 
 #[test]
@@ -403,7 +425,7 @@ fn 何も無ければシステムの名前のまま今と同じ() {
         let d = detect_py(platform, &["/h/proj"], &fs, &home("/h"));
         let c = auto(&d);
         assert_eq!(c.manager, "system");
-        assert_eq!(c.applied.program, [name], "{platform:?}");
+        assert_eq!(prog(c), [name], "{platform:?}");
         assert!(c.applied.path_prepend.is_empty() && c.applied.env.is_empty());
         assert_eq!(fallback_value(python(), platform), name);
         assert_eq!(d.candidates.len(), 1);
@@ -442,12 +464,8 @@ fn windowsのvenvはscriptsのpython_exe() {
     let fs = FakeFs::new().file("/w/proj/.venv/pyvenv.cfg", "");
     let d = detect_py(WIN, &["/w/proj"], &fs, &home("/w"));
     let c = auto(&d);
-    let venv = p("/w/proj/.venv");
-    assert_eq!(
-        c.applied.program,
-        [venv.join("Scripts").join("python.exe").to_string_lossy()]
-    );
-    assert_eq!(c.applied.path_prepend, [venv.join("Scripts")]);
+    assert_eq!(prog(c), ["/w/proj/.venv/Scripts/python.exe"]);
+    assert_eq!(ps(&c.applied.path_prepend), ["/w/proj/.venv/Scripts"]);
 }
 
 #[test]
@@ -459,19 +477,15 @@ fn windowsのcondaは5本をpathへ足す() {
         .dir(prefix);
     let d = detect_py(WIN, &["/w/proj"], &fs, &home("/w"));
     let c = auto(&d);
-    let base = p(prefix);
+    assert_eq!(prog(c), [format!("{prefix}/python.exe")]);
     assert_eq!(
-        c.applied.program,
-        [base.join("python.exe").to_string_lossy()]
-    );
-    assert_eq!(
-        c.applied.path_prepend,
+        ps(&c.applied.path_prepend),
         [
-            base.clone(),
-            base.join("Library").join("mingw-w64").join("bin"),
-            base.join("Library").join("usr").join("bin"),
-            base.join("Library").join("bin"),
-            base.join("Scripts"),
+            prefix.to_string(),
+            format!("{prefix}/Library/mingw-w64/bin"),
+            format!("{prefix}/Library/usr/bin"),
+            format!("{prefix}/Library/bin"),
+            format!("{prefix}/Scripts"),
         ]
     );
 }
@@ -483,9 +497,12 @@ fn windowsのpyenvはpyenv_winの置き場() {
         .dir("/w/.pyenv/pyenv-win/versions/3.11.9");
     let d = detect_py(WIN, &["/w/proj"], &fs, &home("/w"));
     let c = auto(&d);
-    let v = p("/w/.pyenv/pyenv-win/versions/3.11.9");
-    assert_eq!(c.applied.program, [v.join("python.exe").to_string_lossy()]);
-    assert_eq!(c.applied.path_prepend, [v.clone(), v.join("Scripts")]);
+    let v = "/w/.pyenv/pyenv-win/versions/3.11.9";
+    assert_eq!(prog(c), [format!("{v}/python.exe")]);
+    assert_eq!(
+        ps(&c.applied.path_prepend),
+        [v.to_string(), format!("{v}/Scripts")]
+    );
 }
 
 #[test]
@@ -494,10 +511,7 @@ fn windowsの道具はexeを探し見つからなければ名前のまま() {
         .file("/w/proj/uv.lock", "")
         .file("/w/.local/bin/uv.exe", "");
     let d = detect_py(WIN, &["/w/proj"], &found, &home("/w"));
-    assert_eq!(
-        auto(&d).applied.program[0],
-        p("/w/.local/bin").join("uv.exe").to_string_lossy()
-    );
+    assert_eq!(prog(auto(&d))[0], "/w/.local/bin/uv.exe");
 
     // macOS の名前（拡張子なし）だけが置いてあっても Windows では道具と見なさない
     let wrong = FakeFs::new()
@@ -506,10 +520,7 @@ fn windowsの道具はexeを探し見つからなければ名前のまま() {
     let d = detect_py(WIN, &["/w/proj"], &wrong, &home("/w"));
     let uv = d.candidates.iter().find(|c| c.manager == "uv").unwrap();
     assert!(!uv.auto_eligible);
-    assert_eq!(
-        uv.applied.program[0], "uv",
-        "PowerShell には拡張子なしの名前で渡す"
-    );
+    assert_eq!(prog(uv)[0], "uv", "PowerShell には拡張子なしの名前で渡す");
 }
 
 #[test]
@@ -541,10 +552,10 @@ fn windowsのapp_execution_aliasは実体として扱わない() {
     let d = detect_py(WIN, &["/w/proj"], &fs, &env);
     let c = auto(&d);
     assert_eq!(c.manager, "system");
-    assert_eq!(c.location, Some(p("/w/Python312/python.exe")));
+    assert_eq!(loc(c).as_deref(), Some("/w/Python312/python.exe"));
     assert!(d.warnings.is_empty(), "{:?}", d.warnings);
     // 走らせるのは名前（解くのはシェル）で、見つけた場所は表示用
-    assert_eq!(c.applied.program, ["python"]);
+    assert_eq!(prog(c), ["python"]);
 }
 
 #[test]
@@ -560,6 +571,20 @@ fn windowsで別名しか無ければ場所を持たずwarningsで知らせる()
     assert_eq!(d.warnings.len(), 1, "{:?}", d.warnings);
 }
 
+/// `%LOCALAPPDATA%` から組んだ置き場（`/` と `\\` が混ざりうる）と、`\\` で書かれた
+/// PATH の項目を同じ置き場と見る。区切りの違いで別名を実体として拾わない
+#[test]
+fn windowsの除外は区切りが混ざっても効く() {
+    let alias = p(r"\w\AppData\Local\Microsoft\WindowsApps");
+    let fs = FakeFs::new()
+        .file(alias.join("python.exe"), "")
+        .file("/w/Python312/python.exe", "");
+    let mut env = windows_env(&["/w/Python312"]);
+    env.path_dirs.insert(0, alias);
+    let d = detect_py(WIN, &["/w/proj"], &fs, &env);
+    assert_eq!(loc(auto(&d)).as_deref(), Some("/w/Python312/python.exe"));
+}
+
 #[test]
 fn macosでは同じ綴りの置き場を外す理由が無い() {
     // 除外の置き場は Windows の列にしか無い
@@ -567,7 +592,7 @@ fn macosでは同じ綴りの置き場を外す理由が無い() {
     let mut env = home("/h");
     env.path_dirs = dirs(&["/usr/bin"]);
     let d = detect_py(MAC, &["/h/proj"], &fs, &env);
-    assert_eq!(auto(&d).location, Some(p("/usr/bin/python3")));
+    assert_eq!(loc(auto(&d)).as_deref(), Some("/usr/bin/python3"));
 }
 
 // ─── 保存した参照を解く ─────────────────────────────────────────────────
@@ -578,7 +603,7 @@ fn venvの相対の鍵はルートから解き鍵はそのまま返す() {
     let r = RuntimeRef::new("venv", ".venv");
     let c = resolve_ref(python(), MAC, &r, Some(&p("/h/proj")), &fs, &home("/h")).unwrap();
     assert_eq!(c.key, ".venv");
-    assert_eq!(c.applied.program, ["/h/proj/.venv/bin/python"]);
+    assert_eq!(prog(&c), ["/h/proj/.venv/bin/python"]);
     assert_eq!(c.reference(), r);
 }
 
@@ -603,7 +628,7 @@ fn 指定したinterpreterはその隣をpathへ足す() {
     let fs = FakeFs::new().file("/opt/py/bin/python3.13", "");
     let r = RuntimeRef::new(RuntimeRef::EXPLICIT_PATH, "/opt/py/bin/python3.13");
     let c = resolve_ref(python(), MAC, &r, None, &fs, &home("/h")).unwrap();
-    assert_eq!(c.applied.program, ["/opt/py/bin/python3.13"]);
+    assert_eq!(prog(&c), ["/opt/py/bin/python3.13"]);
     assert_eq!(ps(&c.applied.path_prepend), ["/opt/py/bin"]);
 
     let gone = RuntimeRef::new(RuntimeRef::EXPLICIT_PATH, "/opt/py/bin/python9");
@@ -621,10 +646,7 @@ fn condaは名前で一意なら解け曖昧なら解けない() {
         &fs,
         &home("/h"),
     );
-    assert_eq!(
-        ok.unwrap().applied.program,
-        ["/h/miniconda3/envs/web/bin/python"]
-    );
+    assert_eq!(prog(&ok.unwrap()), ["/h/miniconda3/envs/web/bin/python"]);
 
     let fs = conda_fs("/h/miniconda3/envs/ml\n/h/anaconda3/envs/ml\n");
     let e = resolve_ref(
@@ -679,10 +701,7 @@ fn uvは印の消えたディレクトリでは解けない() {
         &fs,
         &home("/h"),
     );
-    assert_eq!(
-        ok.unwrap().applied.program,
-        ["/h/.local/bin/uv", "run", "python"]
-    );
+    assert_eq!(prog(&ok.unwrap()), ["/h/.local/bin/uv", "run", "python"]);
     let ng = resolve_ref(
         python(),
         MAC,
@@ -706,7 +725,7 @@ fn システムは名前をそのまま使う() {
         &home("/h"),
     )
     .unwrap();
-    assert_eq!(c.applied.program, ["python3.12"]);
+    assert_eq!(prog(&c), ["python3.12"]);
 }
 
 #[test]
@@ -759,7 +778,7 @@ fn 環境変数で切り替える戦略はtomlのキーと素の1行の両方を
             [("TOY_TOOLCHAIN".to_string(), "1.80".to_string())],
             "{file}"
         );
-        assert_eq!(c.applied.program, ["toyc"]);
+        assert_eq!(prog(c), ["toyc"]);
     }
     let none = detect(
         &TOOLCHAIN_KIND,
@@ -850,12 +869,14 @@ fn 本物のファイルシステムでも同じ順で選ぶ() {
     assert_eq!((c.manager, c.label.as_str()), ("venv", "myenv"));
     assert_eq!(c.version.as_deref(), Some("3.12.4"));
     assert_eq!(
-        c.applied.program,
-        [proj
-            .join("myenv")
-            .join("bin")
-            .join("python")
-            .to_string_lossy()]
+        prog(c),
+        [slash(
+            &proj
+                .join("myenv")
+                .join("bin")
+                .join("python")
+                .to_string_lossy()
+        )]
     );
     let poetry = d.candidates.iter().find(|x| x.manager == "poetry").unwrap();
     assert!(
