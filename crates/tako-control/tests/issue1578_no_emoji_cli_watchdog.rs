@@ -56,7 +56,9 @@ const MCP_CATALOG: &str = "crates/tako-control/src/mcp/catalog.rs";
 const ALLOW: &[Allow] = &[Allow {
     rel: MCP_CATALOG,
     ch: '\u{276F}', // ❯
-    count: 4,
+    // #1711 で tako_send_input の説明の重複（await_prompt の説明を description にも
+    // 書いていた 1 文）を外して 4 → 3。残る 3 件は await_prompt と input_status の説明
+    count: 3,
     why: "claude TUI の入力行の字（tako_send_input の await_prompt / tako_read_pane の \
           input_status が何を見ているか）。MCP ツールカタログは AI が読む説明文で\
           端末へは出ず、この字そのものが判定対象を指す情報なので置き換えられない",
