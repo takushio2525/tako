@@ -644,11 +644,14 @@ tako web close
 
 同じタブに**同じファイル・同じプロファイルの実行ペイン**があれば、分割せずに**その位置で差し替えて**走らせ直します（何度押してもペインは 1 枚のまま。前の実行がまだ走っていれば止めてから走らせ直し、応答の `stopped_running` が `true` になります）。別々に並べたいときだけ `--new-pane` を付けます。終わると画面に「`[tako] 終了コード N / Enter でこのペインを閉じます`」が出て、ペインのタイトルバーに「完了」「失敗 (N)」のバッジが付きます（実行中は「実行中」）。同じ状態は `tako list` の各ペインの `run`（`status` / `exit_code` / `outcome`）でも読めます。
 
+プレビューに**保存していない編集**があれば、走らせる前に保存します（再生ボタンと同じ。保存したペインは応答の `saved_panes` に載ります。読み取り専用などで保存できないときは走らせずにエラーを返します）。`--auto-close success` / `always` は `--wait` を付けなくても効き、終わった時点でペインを閉じます（閉じたあとも `tako run-interactive-status <pane>` で終了コードを読めます）。`--wait` は**最長 600 秒**待ち、超えると「まだ実行中」を返して非 0 で終わります（実行は止めません）。上限は環境変数 `TAKO_RUN_WAIT_TIMEOUT_SECS` で変えられます（0 は既定の 600 秒）。
+
 ```bash
 tako run script.py                 # 実行（同じファイルの実行ペインがあれば差し替える）
 tako run script.py --profile test  # プロファイルを指定
 tako run script.py --list          # 使えるプロファイルの一覧
-tako run script.py --wait          # 完了まで待って終了コードを返す
+tako run script.py --wait          # 完了まで待って終了コードを返す（最長 600 秒）
+tako run script.py --auto-close success  # 成功したらペインを閉じる
 tako run script.py --new-pane      # 差し替えずに新しいペインで走らせる
 
 tako run-default                   # 拡張子ごとの既定コマンド一覧

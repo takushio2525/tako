@@ -98,6 +98,8 @@ pub struct Workspace {
     assignments: HashMap<TabId, WindowId>,
     /// フォーカスされている論理ウィンドウ。不変条件: `active` は常にこのウィンドウの表示タブ
     active_window: WindowId,
+    /// auto_close で閉じた実行ペインの結末の控え（#1662。layout.json には保存しない）
+    closed_runs: crate::run_pane::ClosedRuns,
 }
 
 /// バックグラウンドへバックグラウンドしたペイン（FR-2.15）。「タブ別分離」表示（タブツリー・ドロワー）と
@@ -288,6 +290,7 @@ impl Workspace {
             windows: vec![WorkspaceWindow { id: wid, active }],
             assignments,
             active_window: wid,
+            closed_runs: Default::default(),
         }
     }
 
@@ -667,11 +670,21 @@ impl Workspace {
             windows: ws_windows,
             assignments,
             active_window,
+            closed_runs: Default::default(),
         })
     }
 
     pub fn shelved_panes(&self) -> &[BackgroundPane] {
         &self.shelved
+    }
+
+    /// auto_close で閉じた実行ペインの結末の控え（#1662）
+    pub fn closed_runs(&self) -> &crate::run_pane::ClosedRuns {
+        &self.closed_runs
+    }
+
+    pub fn closed_runs_mut(&mut self) -> &mut crate::run_pane::ClosedRuns {
+        &mut self.closed_runs
     }
 
     /// バックグラウンドペインを 1 件引く（由来タブの参照・復帰先解決に使う）

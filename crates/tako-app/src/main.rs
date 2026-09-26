@@ -5212,6 +5212,11 @@ impl TakoApp {
                                 view.update(wcx, |_, cx| cx.notify());
                             }
                         }
+                        // #1662: 終わった実行ペインを auto_close の方針どおりに閉じる
+                        // （出力の無い終わり方・`tako list` が先に確定させたぶんもここで拾う）
+                        if app.auto_close_finished_run_panes() {
+                            wcx.notify();
+                        }
                         let workspace = &app.workspace;
                         app.run_exit_watch.retain(|pane| {
                             workspace
@@ -8375,6 +8380,9 @@ impl TakoApp {
         {
             self.run_exit_watch.remove(&pane_id);
             ui_outside_pane = true;
+            // #1662: 終わった瞬間に auto_close を効かせる（`--wait` で誰かが聞きに来るのを
+            // 待たない）。閉じたらペインはもう無いので、消滅と同じく即座に描き直す
+            need_immediate = self.auto_close_finished_run_pane(pane_id);
         }
         // 重要イベント（ペイン消滅・クリップボード）は即座に再描画する
         if need_immediate {
@@ -9349,6 +9357,33 @@ impl TakoApp {
         }
         self.sync_preview_watches();
         cx.notify();
+    }
+
+    /// 終わった実行ペイン 1 枚を auto_close の方針どおりに閉じる（#1662）。戻り値は閉じたか。
+    ///
+    /// 判定と閉じ方は dispatch の 1 実装（`RunInteractiveStatus` と同じ
+    /// `auto_close_run_pane`）で、ここは GUI の後始末（見張りから外す・レイアウトの保存 =
+    /// IPC の dispatch 後と同じ扱い）だけを持つ
+    fn auto_close_finished_run_pane(&mut self, pane: PaneId) -> bool {
+        let closed = tako_control::dispatch::auto_close_run_pane(self, pane, CloseOrigin::Internal);
+        if closed {
+            self.run_exit_watch.remove(&pane);
+            self.save_layout();
+        }
+        closed
+    }
+
+    /// 全タブの終わった実行ペインを auto_close の方針どおりに閉じる（#1662。2 秒ごとの
+    /// 定期更新から）。戻り値は 1 枚でも閉じたか
+    fn auto_close_finished_run_panes(&mut self) -> bool {
+        let closed = tako_control::dispatch::auto_close_run_panes(self, CloseOrigin::Internal);
+        for pane in &closed {
+            self.run_exit_watch.remove(pane);
+        }
+        if !closed.is_empty() {
+            self.save_layout();
+        }
+        !closed.is_empty()
     }
 
     /// タブを閉じる（既定の発生源は GUI のタブ ×。Issue #566）
