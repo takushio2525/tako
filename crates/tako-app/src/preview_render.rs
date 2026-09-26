@@ -4443,21 +4443,8 @@ impl TakoApp {
         profile: &str,
         cx: &mut gpui::Context<Self>,
     ) {
-        // dirty バッファがあれば先に保存
-        if self
-            .preview_edits
-            .get(&pane_id)
-            .is_some_and(preview::EditState::dirty)
-        {
-            if let Err(msg) = self.save_preview_local(pane_id) {
-                if let Some(edit) = self.preview_edits.get_mut(&pane_id) {
-                    edit.message = Some(msg);
-                }
-                cx.notify();
-                return;
-            }
-        }
-
+        // 未保存の編集は dispatch `Run` が走らせる前に保存する（#1662。`tako run` /
+        // MCP `tako_run` と同じ 1 実装。保存できなければ Err で返り、下の通知欄に出る）
         let profile_param = if profile == "default" {
             None
         } else {

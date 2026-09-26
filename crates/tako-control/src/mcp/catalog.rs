@@ -3853,11 +3853,10 @@ pub fn tools() -> Vec<Value> {
         // 出自: #305
         json!({
             "name": "tako_run_interactive_status",
-            "description": "run-interactive で起動したペインの完了状態を確認する。\
-                ペイン出力から exit code マーカーを探し、見つかれば exit code と auto_close の \
-                結果を返す。見つからなければ status: running を返す。\
-                完了検知後、auto_close 方針に従いペインを自動 close する（success: exit 0 のみ / \
-                always: 常に / never: 残す）。AI は完了まで定期的にポーリングすること。",
+            "description": "run-interactive / tako_run で起動したペインの完了状態を確認する。\
+                終わっていれば exit code と auto_close の結果（closed）を返し、まだなら status: running を返す。\
+                auto_close（success: exit 0 のみ / always: 常に / never: 残す）は終わった時点で \
+                tako が効かせ、閉じたあとも結果を返す。AI は完了まで定期的にポーリングすること。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3877,6 +3876,7 @@ pub fn tools() -> Vec<Value> {
             "description": "ファイルを実行する（Code Runner）。\
                 ファイル内の tako:run 宣言・プロジェクト既定・拡張子既定コマンドで新ペインを分割して実行する\
                 （cwd の既定はファイルのあるディレクトリ・プロジェクト既定はそのルート。完了確認は tako_run_interactive_status）。\
+                プレビューの未保存の編集は走らせる前に保存する（応答の saved_panes。保存できなければ走らせない）。\
                 \n\ntako:run 宣言（ファイル先頭 64 行 / 16 KiB 以内のコメントに書く。\
                 各言語のコメント記法に依存しない = 接頭辞は任意）:\n\
                 - `tako:run: <コマンド>` — 既定の実行コマンド\n\

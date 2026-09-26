@@ -8806,22 +8806,7 @@ fn run_interactive_wait(command: &Command) -> Result<(), String> {
         "pane {pane} で対話コマンドを起動しました（status: {}）",
         result["status"].as_str().unwrap_or("?")
     );
-
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        let status = send_request(Request::RunInteractiveStatus {
-            pane,
-            no_wait: false,
-        })?;
-        if status["status"].as_str() == Some("exited") {
-            println!("{}", pretty_json(&status));
-            let code = status["exit_code"].as_i64().unwrap_or(1);
-            if code != 0 {
-                return Err(format!("コマンドが exit code {code} で終了"));
-            }
-            return Ok(());
-        }
-    }
+    wait_run_pane(pane)
 }
 
 /// run --wait: 起動 → ポーリングで完了待ち → exit code を返す
@@ -8835,22 +8820,80 @@ fn run_wait(command: &Command) -> Result<(), String> {
         "pane {pane} でコマンドを実行中（command: {}）",
         result["command"].as_str().unwrap_or("?")
     );
+    // #1662: 走らせる前に保存した未保存の編集（無ければ出さない）
+    if let Some(saved) = result["saved_panes"]
+        .as_array()
+        .filter(|panes| !panes.is_empty())
+    {
+        let panes: Vec<String> = saved.iter().map(Value::to_string).collect();
+        println!(
+            "実行前に未保存の編集を保存しました（pane {}）",
+            panes.join(", ")
+        );
+    }
+    wait_run_pane(pane)
+}
 
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(2));
+/// `--wait` の聞き直しの間隔（#1657 以前からの 2 秒）
+const RUN_WAIT_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// run / run-interactive の `--wait` の本体（#1662）: 実行ペインの終わりを**上限つきで**待つ。
+///
+/// #1662 以前は 2 秒刻みの無限ループで、サーバーや入力待ちを `--wait` で走らせると
+/// CLI が永久に返らなかった（`.agent/conventions.md`「外部コマンドを待つときは上限を持つ」）。
+/// 上限は `tako_core::probe::run_wait_timeout`（env `TAKO_RUN_WAIT_TIMEOUT_SECS`。
+/// 0 / 不正は既定）、聞き直しは `probe::poll_with_timeout` の 1 実装。
+/// 超えたら「まだ実行中」を出して非 0 で返す（**実行は止めない**）
+fn wait_run_pane(pane: u64) -> Result<(), String> {
+    use tako_core::probe::{poll_with_timeout, run_wait_timeout, Polled};
+    let budget = run_wait_timeout();
+    println!("終わるまで最長 {} 秒待ちます", budget.as_secs());
+    let polled = poll_with_timeout(budget, RUN_WAIT_POLL, || {
         let status = send_request(Request::RunInteractiveStatus {
             pane,
             no_wait: false,
         })?;
-        if status["status"].as_str() == Some("exited") {
+        Ok::<_, String>((status["status"].as_str() == Some("exited")).then_some(status))
+    })?;
+    match polled {
+        Polled::Done(status) => {
             println!("{}", pretty_json(&status));
             let code = status["exit_code"].as_i64().unwrap_or(1);
             if code != 0 {
                 return Err(format!("コマンドが exit code {code} で終了"));
             }
-            return Ok(());
+            Ok(())
+        }
+        Polled::TimedOut { waited } => {
+            println!("{}", pretty_json(&run_wait_timed_out(pane, waited, budget)));
+            Err(run_wait_timed_out_message(pane, budget))
         }
     }
+}
+
+/// `--wait` が上限まで待っても終わらなかったときの応答（#1662。JSON の形はここだけ）
+fn run_wait_timed_out(
+    pane: u64,
+    waited: std::time::Duration,
+    budget: std::time::Duration,
+) -> Value {
+    serde_json::json!({
+        "pane": pane,
+        "status": "running",
+        "timed_out": true,
+        "waited_secs": waited.as_secs(),
+        "limit_secs": budget.as_secs(),
+    })
+}
+
+/// 上限で打ち切ったときの 1 行（続きの聞き方は最簡形 = #322）
+fn run_wait_timed_out_message(pane: u64, budget: std::time::Duration) -> String {
+    format!(
+        "まだ実行中です（pane {pane}。{} 秒待って打ち切りました。実行は止めていません）。\
+         続きは `tako run-interactive-status {pane}`。上限は {} で変えられます",
+        budget.as_secs(),
+        tako_core::probe::RUN_WAIT_TIMEOUT_ENV
+    )
 }
 
 /// run --list: ファイルの実行プロファイル一覧を表示する（実行しない）
@@ -10669,6 +10712,27 @@ mod tests {
                 pane: 42,
                 no_wait: false,
             }
+        );
+    }
+
+    /// #1662: `--wait` が上限で打ち切ったときは「まだ実行中」を機械可読で出し、
+    /// 続きの聞き方は最簡形（#322）で案内する
+    #[test]
+    fn waitの打ち切りはまだ実行中を返し続きの聞き方を案内する() {
+        let budget = std::time::Duration::from_secs(600);
+        let v = run_wait_timed_out(7, std::time::Duration::from_millis(600_400), budget);
+        assert_eq!(v["pane"], 7);
+        assert_eq!(v["status"], "running", "{v}");
+        assert_eq!(v["timed_out"], true, "{v}");
+        assert_eq!(v["waited_secs"], 600, "{v}");
+        assert_eq!(v["limit_secs"], 600, "{v}");
+        let msg = run_wait_timed_out_message(7, budget);
+        assert!(msg.contains("まだ実行中"), "{msg}");
+        assert!(msg.contains("`tako run-interactive-status 7`"), "{msg}");
+        assert!(msg.contains("TAKO_RUN_WAIT_TIMEOUT_SECS"), "{msg}");
+        assert!(
+            msg.contains("止めていません"),
+            "実行を止めたと誤読させない: {msg}"
         );
     }
 

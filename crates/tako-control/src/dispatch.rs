@@ -5360,60 +5360,49 @@ fn dispatch_inner(
         }
 
         Request::RunInteractiveStatus { pane, no_wait: _ } => {
-            let (tab_id, target) = resolve_pane(host.workspace(), Some(pane))?;
+            // #1662: auto_close は GUI が終わりを検知した時点で効く（`--wait` 無しでも閉じる）
+            // ので、聞きに来たときにはペインがもう無いことがある。閉じた側が残した控えから
+            // 結末を返す（「成功したので閉じた」を「そんなペインは無い」にしない）
+            let pane_id = PaneId::from_raw(pane);
+            if host.workspace().find_tab_of_pane(pane_id).is_none() {
+                if let Some(run) = host.workspace().closed_runs().get(pane_id) {
+                    return Ok(json!({
+                        "pane": pane,
+                        "status": "exited",
+                        "exit_code": run.exit_code,
+                        "command": run.command,
+                        "closed": true,
+                    }));
+                }
+            }
+            let (_, target) = resolve_pane(host.workspace(), Some(pane))?;
 
             // 終了コードは側路ファイル → 画面のマーカーの順に見る 1 実装（#1657）。
             // 確定した値はペインへ控える（GUI のバッジ・`list` の `run` と同じ値になる）
             settle_run_pane(host, target);
             let exit_code = run_pane_exit_code(host, target);
-
-            let meta = host
-                .workspace()
-                .get_tab(tab_id)
-                .and_then(|t| t.tree().get(target))
+            let cmd = pane_in(host.workspace(), target)
                 .and_then(|p| p.interactive_meta())
-                .cloned();
+                .map(|m| m.command().to_string())
+                .unwrap_or_default();
 
             match exit_code {
                 Some(code) => {
-                    let should_close = match meta.as_ref().map(|m| m.auto_close()) {
-                        Some("always") => true,
-                        Some("success") => code == 0,
-                        _ => false,
-                    };
-                    let cmd = meta
-                        .as_ref()
-                        .map(|m| m.command().to_string())
-                        .unwrap_or_default();
-
-                    if should_close {
-                        let _ = tree_mut(host.workspace_mut(), tab_id).close(target);
-                        host.detach_session(target, close_origin_of(origin), None);
-                        // 入力待ちのまま閉じたのでスクリプトは側路を消せていない
-                        if let Some(file) = meta.as_ref().and_then(|m| m.exit_file()) {
-                            tako_core::run_pane::discard(file);
-                        }
-                    }
-
+                    // 閉じるかどうかと閉じ方は GUI の終了検知と同じ 1 実装（#1662）
+                    let closed = auto_close_run_pane(host, target, close_origin_of(origin));
                     Ok(json!({
                         "pane": pane,
                         "status": "exited",
                         "exit_code": code,
                         "command": cmd,
-                        "closed": should_close,
+                        "closed": closed,
                     }))
                 }
-                None => {
-                    let cmd = meta
-                        .as_ref()
-                        .map(|m| m.command().to_string())
-                        .unwrap_or_default();
-                    Ok(json!({
-                        "pane": pane,
-                        "status": "running",
-                        "command": cmd,
-                    }))
-                }
+                None => Ok(json!({
+                    "pane": pane,
+                    "status": "running",
+                    "command": cmd,
+                })),
             }
         }
 
@@ -5467,6 +5456,10 @@ fn dispatch_inner(
                     resolved.display()
                 )));
             }
+
+            // #1662: 未保存の編集を先に保存する（再生ボタン / `tako run` / MCP `tako_run` の
+            // 1 実装）。宣言（`tako:run:`）の書き換えも効くよう、先頭を読むより前に置く
+            let saved_panes = save_previews_before_run(host, &resolved, target)?;
 
             // ファイル先頭 16 KiB を読む
             let head = read_file_head(&resolved)?;
@@ -5570,6 +5563,8 @@ fn dispatch_inner(
                 // 前の実行がまだ終わっていなかったか（= 止めて走らせ直した）
                 "reused_from": reuse.map(|p| p.as_u64()),
                 "stopped_running": stopped_running,
+                // #1662: 走らせる前に保存したプレビュー（未保存の編集が無ければ空）
+                "saved_panes": saved_panes.iter().map(|p| p.as_u64()).collect::<Vec<_>>(),
             }))
         }
 
@@ -6255,6 +6250,110 @@ pub fn settle_run_panes(host: &mut dyn ControlHost) -> Vec<PaneId> {
         .into_iter()
         .filter(|&pane| settle_run_pane(host, pane))
         .collect()
+}
+
+/// 終わった実行ペインを auto_close の方針どおりに閉じる（#1662）。戻り値は閉じたか。
+///
+/// **閉じるのはこの 1 実装**で、GUI の終了検知（出力のたび・2 秒ごと）と
+/// `RunInteractiveStatus`（`--wait` / `tako_run_interactive_status`）が同じものを呼ぶ。
+/// #1662 以前は `RunInteractiveStatus` の中にしか無く、`--wait` 無しで
+/// `--auto-close success` を付けても誰も聞きに来ないので閉じなかった。
+///
+/// 閉じたら結末を [`tako_core::run_pane::ClosedRuns`] へ控える（あとから聞きに来た
+/// `--wait` が「ペインが無い」で失敗しないため）。タブ最後の 1 枚は閉じない
+/// （タブごと消すのは auto_close の範囲を超える）
+pub fn auto_close_run_pane(
+    host: &mut dyn ControlHost,
+    pane: PaneId,
+    origin: tako_core::pane_log::CloseOrigin,
+) -> bool {
+    let Some(tab) = host.workspace().find_tab_of_pane(pane) else {
+        return false;
+    };
+    let Some(meta) = pane_in(host.workspace(), pane)
+        .and_then(|p| p.interactive_meta())
+        .filter(|m| m.wants_close())
+        .cloned()
+    else {
+        return false;
+    };
+    let Some(exit_code) = meta.status().exit_code() else {
+        return false;
+    };
+    if tree_mut(host.workspace_mut(), tab).close(pane).is_err() {
+        return false;
+    }
+    host.detach_session(pane, origin, None);
+    // 入力待ち（Enter で閉じる案内）のまま閉じたので、スクリプトは側路を消せていない
+    if let Some(file) = meta.exit_file() {
+        tako_core::run_pane::discard(file);
+    }
+    host.workspace_mut()
+        .closed_runs_mut()
+        .record(tako_core::run_pane::ClosedRun {
+            pane,
+            exit_code,
+            command: meta.command().to_string(),
+        });
+    true
+}
+
+/// 全タブの終わった実行ペインのうち、auto_close の方針が「閉じる」ものを閉じる（#1662）。
+///
+/// GUI の 2 秒ごとの定期更新が [`settle_run_panes`] の直後に呼ぶ。**確定した瞬間だけでなく
+/// 確定済みのものも見る**のは、`tako list` などの読み取りが先に確定させた実行ペインを
+/// 取りこぼさないため（確定の「変化」だけを見ると、先に確定した側が閉じないまま残る）
+pub fn auto_close_run_panes(
+    host: &mut dyn ControlHost,
+    origin: tako_core::pane_log::CloseOrigin,
+) -> Vec<PaneId> {
+    let due: Vec<PaneId> = host
+        .workspace()
+        .tabs()
+        .iter()
+        .flat_map(|t| t.tree().panes())
+        .filter(|p| p.interactive_meta().is_some_and(|m| m.wants_close()))
+        .map(|p| p.id())
+        .collect();
+    due.into_iter()
+        .filter(|&pane| auto_close_run_pane(host, pane, origin))
+        .collect()
+}
+
+/// 実行の前に、そのファイルを表示している**未保存の**プレビューを保存する（#1662）。
+///
+/// 再生ボタン・`tako run`・MCP `tako_run` はすべて dispatch `Run` のここを通る
+/// （#1662 以前は再生ボタンだけが GUI 側で保存しており、AI が `tako_run` を呼ぶと
+/// ディスク上の古い内容が走った）。保存できなければ**走らせない**（古い内容を
+/// 走らせて「直したのに直っていない」を作らない）。戻り値は保存したペイン。
+/// 起点のペイン（再生ボタンなら押されたプレビュー）を先に保存する
+fn save_previews_before_run(
+    host: &mut dyn ControlHost,
+    file: &Path,
+    first: PaneId,
+) -> Result<Vec<PaneId>, DispatchError> {
+    let mut panes: Vec<PaneId> = host.workspace().all_pane_ids().into_iter().collect();
+    panes.sort_by_key(|p| (*p != first, p.as_u64()));
+    let dirty: Vec<PaneId> = panes
+        .into_iter()
+        .filter(|&pane| {
+            host.preview_edit_state(pane)
+                .is_some_and(|(_, dirty)| dirty)
+                && host.preview_state(pane).is_some_and(|(path, _)| {
+                    tako_core::platform::path::canonicalize(Path::new(&path))
+                        .is_ok_and(|p| p == file)
+                })
+        })
+        .collect();
+    for &pane in &dirty {
+        host.save_preview(pane).map_err(|e| {
+            DispatchError::Operation(format!(
+                "実行前の保存に失敗したので実行しない（pane {}: {e}）",
+                pane.as_u64()
+            ))
+        })?;
+    }
+    Ok(dirty)
 }
 
 /// `list` の `run` 欄（#1657。実行ペインでなければ null）。GUI のバッジと同じ値
@@ -27601,6 +27700,242 @@ mod tests {
         assert_eq!(st["closed"], true, "{st}");
         assert!(!host.ws.active_tab().tree().contains(pane));
         assert!(!exit_file.exists(), "閉じたのに側路が残っている");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `auto_close` を付けて走らせ、(実行ペイン, 側路ファイル) を返す（#1662）
+    fn issue1662_run(
+        host: &mut MockHost,
+        file: &std::path::Path,
+        from: PaneId,
+        auto_close: &str,
+    ) -> (PaneId, std::path::PathBuf) {
+        let v = dispatch(
+            host,
+            Request::Run {
+                path: file.display().to_string(),
+                pane: Some(from.as_u64()),
+                tab: None,
+                profile: None,
+                command: None,
+                direction: None,
+                ratio: None,
+                auto_close: Some(auto_close.into()),
+                focus: None,
+                new_pane: Some(true),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let pane = PaneId::from_raw(v["pane"].as_u64().unwrap());
+        let exit_file = pane_in(&host.ws, pane)
+            .and_then(|p| p.interactive_meta())
+            .and_then(|m| m.exit_file().map(Path::to_path_buf))
+            .expect("側路が用意されている");
+        (pane, exit_file)
+    }
+
+    fn issue1662_status(host: &mut MockHost, pane: PaneId) -> Value {
+        dispatch(
+            host,
+            Request::RunInteractiveStatus {
+                pane: pane.as_u64(),
+                no_wait: false,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap()
+    }
+
+    /// 受け入れ条件 2: `--wait` 無しでも（= 誰も `RunInteractiveStatus` を聞きに来なくても）
+    /// GUI の終了検知の経路（`settle_run_panes` → `auto_close_run_panes`）で閉じる。
+    /// **読み取りが先に確定させた**ものも拾い、閉じたあとの問い合わせは控えから結末を返す
+    #[test]
+    fn issue1662_auto_closeは聞きに来なくても閉じて結末を控える() {
+        let (dir, file) = issue1657_target("1662-close", "a.sh");
+        let mut host = MockHost::new();
+        let root = host.ws.active_tab().tree().focused();
+        let (pane, exit_file) = issue1662_run(&mut host, &file, root, "success");
+        // 終わる前は閉じない
+        assert!(auto_close_run_panes(&mut host, CloseOrigin::Internal).is_empty());
+        std::fs::write(&exit_file, "0\n").unwrap();
+        // `tako list` が先に確定させた（GUI の見張りの「変化」はもう起きない）
+        dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
+        assert!(
+            settle_run_panes(&mut host).is_empty(),
+            "確定済みなのに変化扱い"
+        );
+        let closed = auto_close_run_panes(&mut host, CloseOrigin::Internal);
+        assert_eq!(closed, vec![pane], "確定済みの成功を閉じていない");
+        assert!(!host.ws.active_tab().tree().contains(pane));
+        assert!(
+            host.detached.contains(&pane.as_u64()),
+            "セッションを畳んでいない"
+        );
+        assert!(!exit_file.exists(), "閉じたのに側路が残っている");
+        // 閉じたあとに `--wait` / `tako_run_interactive_status` が聞きに来ても結末を返す
+        let st = issue1662_status(&mut host, pane);
+        assert_eq!(st["status"], "exited", "{st}");
+        assert_eq!(st["exit_code"], 0, "{st}");
+        assert_eq!(st["closed"], true, "{st}");
+        assert_eq!(st["command"], "echo run-1657", "{st}");
+        // 2 度目の定期更新は何もしない（冪等）
+        assert!(auto_close_run_panes(&mut host, CloseOrigin::Internal).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// エッジ: `success` は失敗（非 0）では閉じない / `always` は閉じる / `never` は閉じない
+    #[test]
+    fn issue1662_auto_closeは方針と終了コードに従う() {
+        let (dir, file) = issue1657_target("1662-policy", "a.sh");
+        let mut host = MockHost::new();
+        let root = host.ws.active_tab().tree().focused();
+        let (ng, ng_file) = issue1662_run(&mut host, &file, root, "success");
+        let (always, always_file) = issue1662_run(&mut host, &file, root, "always");
+        let (never, never_file) = issue1662_run(&mut host, &file, root, "never");
+        for f in [&ng_file, &always_file, &never_file] {
+            std::fs::write(f, "3\n").unwrap();
+        }
+        settle_run_panes(&mut host);
+        let closed = auto_close_run_panes(&mut host, CloseOrigin::Internal);
+        assert_eq!(closed, vec![always], "閉じたもの: {closed:?}");
+        let tree = host.ws.active_tab().tree();
+        assert!(tree.contains(ng), "失敗を success で閉じた");
+        assert!(tree.contains(never), "never を閉じた");
+        let st = issue1662_status(&mut host, ng);
+        assert_eq!(
+            (st["exit_code"].clone(), st["closed"].clone()),
+            (json!(3), json!(false))
+        );
+        let st = issue1662_status(&mut host, always);
+        assert_eq!(
+            (st["exit_code"].clone(), st["closed"].clone()),
+            (json!(3), json!(true))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// エッジ: タブ最後の 1 枚になった実行ペインは閉じない（タブごと消さない）
+    #[test]
+    fn issue1662_auto_closeはタブ最後の1枚を閉じない() {
+        let (dir, file) = issue1657_target("1662-last", "a.sh");
+        let mut host = MockHost::new();
+        let root = host.ws.active_tab().tree().focused();
+        let (pane, exit_file) = issue1662_run(&mut host, &file, root, "always");
+        dispatch(
+            &mut host,
+            Request::Close {
+                pane: Some(root.as_u64()),
+                force: false,
+                caller_role: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        std::fs::write(&exit_file, "0\n").unwrap();
+        settle_run_panes(&mut host);
+        assert!(auto_close_run_panes(&mut host, CloseOrigin::Internal).is_empty());
+        assert!(host.ws.active_tab().tree().contains(pane));
+        assert!(
+            !host.detached.contains(&pane.as_u64()),
+            "閉じないのにセッションを畳んだ"
+        );
+        assert_eq!(issue1662_status(&mut host, pane)["closed"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 受け入れ条件 2: `Run`（再生ボタン / `tako run` / MCP `tako_run` の 1 実装）は、
+    /// **そのファイルを表示している未保存のプレビューだけ**を走らせる前に保存する
+    #[test]
+    fn issue1662_runは走らせる前にそのファイルの未保存の編集を保存する() {
+        let (dir, file) = issue1657_target("1662-save", "a.sh");
+        let other = dir.join("other.sh");
+        std::fs::write(&other, "# tako:run: echo other\n").unwrap();
+        for origin in [PaneOrigin::User, PaneOrigin::Cli, PaneOrigin::Mcp] {
+            let mut host = MockHost::new();
+            let root = host.ws.active_tab().tree().focused();
+            // 同じファイルのプレビュー（dirty）/ 別ファイルのプレビュー（dirty）/
+            // 同じファイルのプレビュー（編集なし）
+            let split = |host: &mut MockHost| {
+                let v = dispatch(
+                    host,
+                    Request::Split {
+                        pane: Some(root.as_u64()),
+                        tab: None,
+                        direction: Some(Direction::Right),
+                        ratio: None,
+                        command: None,
+                        cwd: None,
+                        focus: None,
+                    },
+                    PaneOrigin::Cli,
+                )
+                .unwrap();
+                PaneId::from_raw(v["pane"].as_u64().unwrap())
+            };
+            let (same, elsewhere, clean) = (split(&mut host), split(&mut host), split(&mut host));
+            // 相対・非正規のパスで開いていても同じファイルとして見る
+            let loose = format!("{}/./a.sh", dir.display());
+            for (pane, path) in [
+                (same, loose.as_str()),
+                (elsewhere, other.to_str().unwrap()),
+                (clean, file.to_str().unwrap()),
+            ] {
+                host.previews
+                    .insert(pane.as_u64(), (path.to_string(), PreviewModeWire::Code));
+            }
+            host.apply_preview_text(same, "# tako:run: echo edited\n".into())
+                .unwrap();
+            host.apply_preview_text(elsewhere, "# 触らない\n".into())
+                .unwrap();
+            let v = dispatch(
+                &mut host,
+                Request::Run {
+                    path: file.display().to_string(),
+                    pane: Some(root.as_u64()),
+                    tab: None,
+                    profile: None,
+                    command: None,
+                    direction: None,
+                    ratio: None,
+                    auto_close: None,
+                    focus: None,
+                    new_pane: None,
+                },
+                origin,
+            )
+            .unwrap();
+            assert_eq!(v["saved_panes"], json!([same.as_u64()]), "{origin:?}: {v}");
+            assert_eq!(
+                host.preview_edit_state(same),
+                Some((true, false)),
+                "{origin:?}"
+            );
+            assert_eq!(
+                host.preview_edit_state(elsewhere),
+                Some((true, true)),
+                "{origin:?}: 別ファイルの編集まで保存した"
+            );
+            // 未保存の編集が無ければ空（保存を空振りしない）
+            let again = dispatch(
+                &mut host,
+                Request::Run {
+                    path: file.display().to_string(),
+                    pane: Some(root.as_u64()),
+                    tab: None,
+                    profile: None,
+                    command: None,
+                    direction: None,
+                    ratio: None,
+                    auto_close: None,
+                    focus: None,
+                    new_pane: None,
+                },
+                origin,
+            )
+            .unwrap();
+            assert_eq!(again["saved_panes"], json!([]), "{origin:?}: {again}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
