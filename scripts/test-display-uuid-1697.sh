@@ -12,6 +12,11 @@
 #   ③ TAKO_DISPLAY 未指定（検証用の暗黙の既定）は従来どおり名前で解決する（explicit=false）
 #   ④ 明示の指定がどの面にも当たらなければ窓を開かずに終了 4（理由と候補を stderr へ）
 #
+# ④ の「当たらない面」は **実在し得ない index（index:999）で指す**（#1760）。ヘルパは
+# tako-vd 以外の面の明示を通さない（当たらないはずの名前も、その名前の面が無いことを
+# 確かめられないので通さない）。index:999 は tako の当て方（uuid → 名前 → 記録 uuid →
+# index）のどれにも当たらず、以前の no-such-display-1697 と同じ「明示の見失い」の道を通る
+#
 # **旧挙動（ユーザーの画面へ落ちる）は実 GUI で再現しない**。それは単体の番犬
 # （crates/tako-core/src/platform/display.rs の #1697 節・TAKO_1697_LEGACY=1 の A/B）で固定する。
 # ④ は壊れていればユーザーの画面へ窓が出る道なので、①〜③ で新しいバイナリが解決の口を
@@ -171,7 +176,8 @@ if [ "$FAIL" -gt 0 ]; then
 fi
 
 echo "== ④: 明示の指定がどの面にも当たらなければ窓を開かずに終了 4 =="
-launch_case miss "TAKO_DISPLAY=no-such-display-1697" || exit 1
+# 実在し得ない index で「当たらない面」を指す（当たらない面としてヘルパが通すのはこの形だけ = #1760）
+launch_case miss "TAKO_DISPLAY=index:999" || exit 1
 pid="$APP_PID"
 # 終了を待つ（状態待ち。窓を開かない道なので IPC は立たない）
 for _ in $(seq 1 100); do
@@ -186,6 +192,7 @@ else
     ISOLATED_GUI_PID=""
     check_eq "終了コードは 4（REFUSED_EXIT_CODE）" "4" "$rc"
     err=$(cat "$TMP/miss.log")
+    check_contains "狙った指定がそのまま tako へ届いている" "$err" "置き先 index:999"
     check_contains "stderr に開かなかったことを出す" "$err" "窓を開かずに終了した"
     check_contains "stderr に見失った理由を出す" "$err" "どの面にも当たらない"
     check_contains "stderr に候補を出す" "$err" "[0] id="
