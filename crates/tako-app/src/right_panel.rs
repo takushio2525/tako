@@ -421,7 +421,7 @@ impl TakoApp {
                     },
                     self.drag_ghost_builder(
                         DragKind::TmuxSession,
-                        format!("tmux: {}", truncate(&session.name, 24)),
+                        format!("tmux: {}", truncate_chars(&session.name, 24)),
                         cx,
                     ),
                 )
@@ -445,7 +445,7 @@ impl TakoApp {
                         .text_ellipsis()
                         .font_weight(FontWeight::BOLD)
                         .text_size(px(11.0))
-                        .child(SharedString::from(truncate(&session.name, 24))),
+                        .child(SharedString::from(truncate_chars(&session.name, 24))),
                 )
                 .child(
                     div()
@@ -504,7 +504,7 @@ impl TakoApp {
                         },
                         self.drag_ghost_builder(
                             DragKind::TmuxSession,
-                            format!("tmux: {}", truncate(label, 24)),
+                            format!("tmux: {}", truncate_chars(label, 24)),
                             cx,
                         ),
                     )
@@ -515,7 +515,7 @@ impl TakoApp {
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_ellipsis()
-                            .child(SharedString::from(truncate(label, 40))),
+                            .child(SharedString::from(truncate_chars(label, 40))),
                     )
                     .child(
                         div()
@@ -592,7 +592,11 @@ impl TakoApp {
             .cursor(CursorStyle::OpenHand)
             .on_drag(
                 BackgroundPaneDrag { pane: pane_id },
-                self.drag_ghost_builder(DragKind::BackgroundPane, truncate(&entry.label, 24), cx),
+                self.drag_ghost_builder(
+                    DragKind::BackgroundPane,
+                    truncate_chars(&entry.label, 24),
+                    cx,
+                ),
             )
             // #1536: ドラッグ用グリップ。点字（U+283F）はフォント依存で化けるので
             // 描画プリミティブ（6 点の SVG）で描く
@@ -622,7 +626,7 @@ impl TakoApp {
                 .text_ellipsis()
                 .child(SharedString::from(format!(
                     "{}（BG）",
-                    truncate(&entry.label, 22)
+                    truncate_chars(&entry.label, 22)
                 ))),
         )
         .child(
@@ -870,7 +874,9 @@ impl TakoApp {
                                             .text_size(px(12.5))
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(hsla(theme.foreground))
-                                            .child(SharedString::from(truncate(&card.name, 18))),
+                                            .child(SharedString::from(truncate_chars(
+                                                &card.name, 18,
+                                            ))),
                                     )
                                     .child(
                                         div()
@@ -885,7 +891,7 @@ impl TakoApp {
                                             .font_family(theme.font_family.clone())
                                             .text_size(px(10.0))
                                             .text_color(hsla(theme.text_muted))
-                                            .child(SharedString::from(truncate(
+                                            .child(SharedString::from(truncate_chars(
                                                 &card.tab_title,
                                                 12,
                                             ))),
@@ -1053,7 +1059,7 @@ impl TakoApp {
                                                                     theme.text_secondary,
                                                                 ))
                                                                 .child(SharedString::from(
-                                                                    truncate(&w.name, 22),
+                                                                    truncate_chars(&w.name, 22),
                                                                 )),
                                                         )
                                                         .child(
@@ -1130,7 +1136,7 @@ impl TakoApp {
                                         .text_size(px(11.5))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(hsla(theme.text_secondary))
-                                        .child(SharedString::from(truncate(&name, 24))),
+                                        .child(SharedString::from(truncate_chars(&name, 24))),
                                 )
                                 .child(div().flex_grow(1.0))
                                 .child(
@@ -1437,7 +1443,7 @@ impl TakoApp {
                                 .overflow_hidden()
                                 .whitespace_nowrap()
                                 .text_ellipsis()
-                                .child(SharedString::from(truncate(&group.title, 28))),
+                                .child(SharedString::from(truncate_chars(&group.title, 28))),
                         )
                         .child(
                             div()
@@ -1597,13 +1603,14 @@ impl TakoApp {
                     .filter(|s| s.pane == pane.as_u64())
                     .collect();
                 let _detail = if !row.detail_title.is_empty() {
-                    truncate(&row.detail_title, 36)
+                    truncate_chars(&row.detail_title, 36)
                 } else if !hosted.is_empty() {
-                    let names: Vec<String> = hosted.iter().map(|s| truncate(&s.name, 18)).collect();
+                    let names: Vec<String> =
+                        hosted.iter().map(|s| truncate_chars(&s.name, 18)).collect();
                     format!("tmux: {}", names.join(" / "))
                 } else {
                     match &row.backend {
-                        Some(b) => format!("tmux: {}", truncate(b, 24)),
+                        Some(b) => format!("tmux: {}", truncate_chars(b, 24)),
                         None => String::new(),
                     }
                 };
@@ -1694,7 +1701,7 @@ impl TakoApp {
                                 .font_family("Monaco")
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_size(px(12.0))
-                                .child(SharedString::from(truncate(&row.label, 20))),
+                                .child(SharedString::from(truncate_chars(&row.label, 20))),
                         )
                         // ロールタグ
                         .when(pane_role.contains("orchestrator-master"), |d| {
@@ -1799,7 +1806,7 @@ impl TakoApp {
                             continue; // アクティブ window はペイン本体が表示
                         }
                         let win_index = w.index;
-                        let win_label = format!("  ↳ {}:{}", w.index, truncate(&w.name, 16));
+                        let win_label = format!("  ↳ {}:{}", w.index, truncate_chars(&w.name, 16));
                         // 通知欄に出す対象名（#1417）。行ラベルは表示用の矢印と
                         // インデントを含むので、失敗の文には素の `index:name` を出す
                         let win_target = format!("{}:{}", w.index, w.name);
@@ -1991,9 +1998,9 @@ impl TakoApp {
             let open_socket = session.socket.clone();
             // 表示名: ロールがあればロール、なければセッション名
             let display_name = if !session.role.is_empty() {
-                truncate(&session.role, 24)
+                truncate_chars(&session.role, 24)
             } else {
-                truncate(&session.name, 24)
+                truncate_chars(&session.name, 24)
             };
             // メタデータ行（#183: プロセス / cwd / 最終アクティビティ）
             let mut meta_parts: Vec<String> = Vec::new();
@@ -2050,7 +2057,7 @@ impl TakoApp {
                             },
                             self.drag_ghost_builder(
                                 DragKind::TmuxSession,
-                                format!("tmux: {}", truncate(&session.name, 24)),
+                                format!("tmux: {}", truncate_chars(&session.name, 24)),
                                 cx,
                             ),
                         )
@@ -2197,7 +2204,7 @@ impl TakoApp {
                         },
                         self.drag_ghost_builder(
                             DragKind::TmuxSession,
-                            format!("tmux: {}", truncate(label, 24)),
+                            format!("tmux: {}", truncate_chars(label, 24)),
                             cx,
                         ),
                     )
@@ -2208,7 +2215,7 @@ impl TakoApp {
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_ellipsis()
-                            .child(SharedString::from(truncate(label, 40))),
+                            .child(SharedString::from(truncate_chars(label, 40))),
                     )
                     .child(
                         div()
@@ -2323,7 +2330,7 @@ impl TakoApp {
                             .text_ellipsis()
                             .child(SharedString::from(
                                 crate::ui_text::panel::shelved_tab_group(
-                                    &truncate(&group.title, 16),
+                                    &truncate_chars(&group.title, 16),
                                     group.entries.len(),
                                 ),
                             )),
@@ -2494,7 +2501,7 @@ impl TakoApp {
                                 .text_ellipsis()
                                 .child(SharedString::from(
                                     crate::ui_text::panel::closed_tab_group(
-                                        &truncate(&shelf_group.title, 20),
+                                        &truncate_chars(&shelf_group.title, 20),
                                         shelf_group.entries.len(),
                                     ),
                                 )),

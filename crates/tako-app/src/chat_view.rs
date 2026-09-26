@@ -249,9 +249,20 @@ pub(crate) fn short_model_name(model: &str) -> String {
     if version.is_empty() {
         return model.to_string();
     }
-    let mut label = family.to_string();
-    label[..1].make_ascii_uppercase();
-    format!("{label} {}", version.join("."))
+    format!("{} {}", capitalize_first(family), version.join("."))
+}
+
+/// 先頭の 1 文字だけ ASCII の大文字にする（`opus` → `Opus`）。
+///
+/// 文字単位で扱うので、空文字や非 ASCII で始まる語でも落ちない（#1757。旧 `label[..1]` は
+/// 1 バイト目で切るので、空なら範囲外・多バイト文字なら文字の途中で panic する。
+/// 今の呼び手は既知の family に絞ってから渡すが、語の一覧を増やしたときの地雷にしない）
+fn capitalize_first(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+        None => String::new(),
+    }
 }
 
 /// `transcript::read_messages_at` の正規化 JSON を描画用の型へ落とす（純関数）。
@@ -4450,11 +4461,28 @@ mod tests {
         assert_eq!(short_model_name("claude-unknown-9"), "claude-unknown-9");
         assert_eq!(short_model_name("claude"), "claude");
         assert_eq!(short_model_name("claude-opus"), "claude-opus");
+        // 空・非 ASCII の family は既知の語に当たらないので原文のまま（落ちない。#1757）
+        assert_eq!(short_model_name("claude-"), "claude-");
+        assert_eq!(short_model_name("claude--5"), "claude--5");
+        assert_eq!(short_model_name("claude-オーパス-5"), "claude-オーパス-5");
+        assert_eq!(short_model_name("claude-🎉-5"), "claude-🎉-5");
         // 1M コンテキスト等のサフィックス付きは省略せずそのまま出す
         assert_eq!(
             short_model_name("claude-opus-4-6[1m]"),
             "claude-opus-4-6[1m]"
         );
+    }
+
+    /// #1757: 大文字化は文字単位（旧 `label[..1]` は空・非 ASCII で始まる語で panic した）
+    #[test]
+    fn 先頭の大文字化は空と非asciiで始まる語でも落ちない() {
+        assert_eq!(capitalize_first("opus"), "Opus");
+        assert_eq!(capitalize_first("o"), "O");
+        assert_eq!(capitalize_first(""), "");
+        // ASCII 以外の先頭文字は変えない（2 / 3 / 4 バイト文字）
+        assert_eq!(capitalize_first("éclair"), "éclair");
+        assert_eq!(capitalize_first("日本"), "日本");
+        assert_eq!(capitalize_first("🎉x"), "🎉x");
     }
 
     #[test]

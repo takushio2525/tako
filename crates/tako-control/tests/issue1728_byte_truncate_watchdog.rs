@@ -17,8 +17,8 @@
 //!
 //! 1. 本番コードに**先頭からの範囲添字**（`[..<式>]` / `[..=<式>]`）が無い。
 //!    `N` がリテラルでも変数でも落とす（`&cmd[..max]` へ書き換えても危険は同じ）。
-//!    表示の切り詰めは `crate::truncate`（文字数）、分割は `str::floor_char_boundary` で
-//!    丸めてから `split_at` する。`Vec` のスライスも同じ字面なので巻き込むが、
+//!    表示の切り詰めは `tako_core::text::truncate_chars`（文字数）、分割は
+//!    `str::floor_char_boundary` で丸めてから `split_at` する。`Vec` のスライスも同じ字面なので巻き込むが、
 //!    このファイルでは 0 件なので、要るときは `.get(..n)` / `iter().take(n)` で書く
 //! 2. 検索欄の描画（`render_field_with_cursor`）はカーソルを `floor_char_boundary` で
 //!    丸めてから分ける（丸めを外すと `split_at` が同じ panic を起こす）
@@ -35,6 +35,10 @@ use std::path::{Path, PathBuf};
 // ファイル途中の `#[cfg(test)]`（`preview_render.rs` にも 1 つある）で走査範囲が消えない
 #[path = "common/production_range.rs"]
 mod production_range;
+
+// 範囲添字の検出は #1746 の番犬と共有する 1 実装（#1757）。ここは先頭からの範囲だけを見る
+#[path = "common/range_index.rs"]
+mod range_index;
 
 const PREVIEW_RENDER: &str = "crates/tako-app/src/preview_render.rs";
 
@@ -60,20 +64,13 @@ fn code_of(src: &str, rel: &str) -> String {
 /// 先頭からの範囲添字（`[..<式>]` / `[..=<式>]`）が居る行（1 始まり）。
 ///
 /// `[..]`（全体）と `[.., last]`（スライスパターン）は切り詰めではないので数えない
+/// （どちらも共有部品の `range_indexes` が外す）
 fn byte_prefix_slices(code: &str) -> Vec<usize> {
-    const HEAD: &str = "[..";
-    let mut hits = Vec::new();
-    let mut from = 0usize;
-    while let Some(at) = code[from..].find(HEAD) {
-        let at = from + at;
-        from = at + HEAD.len();
-        let next = code[from..].trim_start().chars().next();
-        if matches!(next, Some(']') | Some(',')) {
-            continue;
-        }
-        hits.push(code[..at].matches('\n').count() + 1);
-    }
-    hits
+    range_index::range_indexes(code)
+        .into_iter()
+        .filter(|r| r.is_prefix())
+        .map(|r| r.line)
+        .collect()
 }
 
 /// 関数の窓（宣言行の 1 始まりの行番号と本文）。終わりは宣言行と同じ字下げの `}`
@@ -102,7 +99,8 @@ fn offenders(raw: &str, code: &str, rel: &str) -> Vec<String> {
             format!(
                 "{rel}:{line} — 文字列をバイト位置で切っている（`{text}`）。多バイト文字の途中に\
                  当たると描画中に panic してアプリごと落ちる（#1728）。表示の切り詰めは \
-                 `crate::truncate`（文字数）、分割は `floor_char_boundary` で丸めてから `split_at`"
+                 `tako_core::text::truncate_chars`（文字数）、分割は `floor_char_boundary` で\
+                 丸めてから `split_at`"
             )
         })
         .collect();
@@ -232,7 +230,7 @@ fn render_field_with_cursor(text: &str, cursor: usize) -> String {
     let ok = format!(
         "
 fn ok(cmd: &str, xs: &[u8], s: &str) {{
-    let a = crate::truncate(cmd, 40);
+    let a = tako_core::text::truncate_chars(cmd, 40);
     let b = &xs[..];
     if let [.., last] = xs {{}}
     let c = s.get(..40);
