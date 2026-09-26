@@ -202,6 +202,49 @@ mod tests {
             .contains("path"));
     }
 
+    /// #1677: `tako_jump` は action 引数の 1 ツールで `Request::Jump` へ写る（CLI と同じ綴り）。
+    /// action 省略は list、基準ペインは呼び出し元へフォールバックし、分からなくても失敗しない
+    #[test]
+    fn jumpはactionをそのまま渡し既定はlist() {
+        for action in crate::dispatch::JUMP_ACTIONS {
+            let (_, requests) = run(
+                call("tako_jump", json!({ "action": action, "focus": true })),
+                Some(7),
+                true,
+            );
+            assert_eq!(
+                requests,
+                vec![Request::Jump {
+                    action: action.to_string(),
+                    pane: Some(7),
+                    focus: Some(true),
+                }]
+            );
+        }
+        let (_, requests) = run(call("tako_jump", json!({})), None, true);
+        assert_eq!(
+            requests,
+            vec![Request::Jump {
+                action: "list".into(),
+                pane: None,
+                focus: None,
+            }]
+        );
+        let (_, requests) = run(
+            call("tako_jump", json!({ "action": "back", "pane": 3 })),
+            Some(7),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::Jump {
+                action: "back".into(),
+                pane: Some(3),
+                focus: None,
+            }]
+        );
+    }
+
     /// #1654: `tako_preview_edit` の `command` は編集コマンドへ写る（ツールを増やさない）。
     /// `enabled` と同時に渡したら拒否する（どちらをしたいのか決まらない）
     #[test]
@@ -652,7 +695,8 @@ mod tests {
         // #1658 の tako_preview_edit_range / tako_preview_cursor（行・桁の範囲編集とカーソル）を追加して 154
         // #1652 の tako_preview_move / tako_preview_delete（単語・行単位の移動と削除）を追加して 156
         // #1678 の tako_lsp_server（言語サーバの状態と起動・停止）を追加して 157
-        assert_eq!(tools.len(), 157);
+        // #1677 の tako_jump（ジャンプ履歴の戻る / 進む / 一覧）を追加して 158
+        assert_eq!(tools.len(), 158);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

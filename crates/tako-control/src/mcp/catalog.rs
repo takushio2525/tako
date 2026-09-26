@@ -784,6 +784,27 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #1677（ジャンプ履歴。#1007 S0-d）
+        json!({
+            "name": "tako_jump",
+            "description": "ジャンプ履歴を戻る・進む・一覧する。tako_open_file に line を渡して開くたびに、\
+                開く前にいた位置と着地点が積まれる（line なしの open は積まない）。\
+                閉じたペインの項目は pane を基準に開き直し（reopened=true）、消えたファイルの項目は\
+                読み飛ばして捨てる（dropped）。端では moved=false。GUI のキーも同じ操作を通る。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "back", "forward"],
+                        "default": "list",
+                    },
+                    "pane": pane_schema("閉じたペインの項目を開き直すときの基準（省略時は呼び出し元）"),
+                    "focus": { "type": "boolean", "description": "着地したペインへフォーカスを移す（既定 false）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
         json!({
             "name": "tako_preview_view",
             "description": "PDF・画像プレビューのズーム・ページ・パンを操作する。全操作を省略すると現在状態を返す。\

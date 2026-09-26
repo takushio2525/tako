@@ -41,7 +41,7 @@ const CATEGORIES = [
     'tako_run_defaults', 'tako_run_interactive', 'tako_run_interactive_status',
   ]],
   ['表示とプレビュー', [
-    'tako_open_file', 'tako_open_dir', 'tako_preview_view', 'tako_preview_outline',
+    'tako_open_file', 'tako_jump', 'tako_open_dir', 'tako_preview_view', 'tako_preview_outline',
     'tako_preview_link_list', 'tako_preview_follow_link', 'tako_preview_copy_code',
     'tako_preview_reload', 'tako_preview_cache', 'tako_preview_edit',
     'tako_preview_apply', 'tako_preview_edit_range', 'tako_preview_cursor',

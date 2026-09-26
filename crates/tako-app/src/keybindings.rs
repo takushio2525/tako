@@ -67,7 +67,10 @@ actions!(
         ShowOrchPanel,
         ShowGitPanel,
         OpenDocumentation,
-        ReportIssue
+        ReportIssue,
+        // #1677: ジャンプ履歴の戻る / 進む（割当と理由は `jump_bindings`）
+        JumpBack,
+        JumpForward
     ]
 );
 
@@ -83,15 +86,53 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
 /// コンパイル時に持つのはそのためで、`cfg` で片方を消すと「Windows でどう見えるか」
 /// を macOS の CI で押さえられなくなる（対応マトリクス = #515 と同じ方針）。
 ///
-/// 実際に GPUI へ登録するのは `Platform::current()` の分だけなので、
-/// **張るキーの集合は #585 / #517 当時から 1 本も変わっていない**
+/// 実際に GPUI へ登録するのは `Platform::current()` の分だけ。
+/// #585 / #517 当時の集合へ足したのは #1677 の [`jump_bindings`] だけ
 fn bindings_for(platform: Platform) -> Vec<KeyBinding> {
     let mut bindings = base_bindings();
     match platform {
         Platform::MacOs => bindings.extend(macos_only_bindings()),
         Platform::Windows => bindings.extend(non_macos_bindings()),
     }
+    bindings.extend(jump_bindings(platform));
     bindings
+}
+
+/// ジャンプ履歴の戻る / 進む（FR-3.29 / #1677）。案内の表記は
+/// `tako_core::platform::keys::jump_back` / `jump_forward`（番犬が突き合わせる）
+///
+/// ## macOS = ⌃- / ⌃⇧-（VS Code と同じ）
+///
+/// macOS 側で **cmd を伴わない唯一の割当**。ctrl 付きの記号キーは GPUI macOS が
+/// `key_char` を None にして届けるので、[`keystroke_to_bytes`] は PTY へ **1 バイトも
+/// 送っていない**（readline の undo = `^_` も元から届いていない）。奪っても端末の
+/// 入力手段は減らない（`macosのジャンプキーは端末へ何も送っていない` テストが実変換で固定）。
+///
+/// ⌃⇧- は shift が落ちて**シフト後の字面**で届く（GPUI macOS の `parse_keystroke`:
+/// 英小文字以外に shift が付くと shift を下ろしてシフト後の文字を key にする）。
+/// その字面は配列で変わる（US = `_` / JIS = `=`）ので 2 本張る。`ctrl-shift--` と
+/// 書いても**どの配列でも一致しない**。副作用として US 配列の ⌃= も進むになるが、
+/// これも PTY へは何も送っていない
+///
+/// ## Windows = Ctrl+Alt+← / →（JetBrains 系と同じ）
+///
+/// Windows の `ctrl--` は縮小（ZoomOut）、JIS の Ctrl+Shift+- は `ctrl-=` として拡大に
+/// 当たるので ⌃- 系は使えない。VS Code の Alt+← / → はペインのフォーカス移動に
+/// 使っている。Ctrl+Alt+← / → は #585 の割当原則（alt は矢印だけ・shift と記号を
+/// 組み合わせない）にも沿う。奪う入力は `\x1b[1;7D` / `\x1b[1;7C` で、Ctrl+← / →
+/// （`;5` = readline の単語移動）と違って一般的なシェルの既定の割当は無い
+fn jump_bindings(platform: Platform) -> Vec<KeyBinding> {
+    match platform {
+        Platform::MacOs => vec![
+            KeyBinding::new("ctrl--", JumpBack, None),
+            KeyBinding::new("ctrl-_", JumpForward, None),
+            KeyBinding::new("ctrl-=", JumpForward, None),
+        ],
+        Platform::Windows => vec![
+            KeyBinding::new("ctrl-alt-left", JumpBack, None),
+            KeyBinding::new("ctrl-alt-right", JumpForward, None),
+        ],
+    }
 }
 
 /// 両プラットフォーム共通のバインド（`cmd-` は macOS = Command / Windows = Win キー）
@@ -1290,6 +1331,9 @@ mod tests {
             // コマンドパレット
             ("ctrl-shift-p", "tako::OpenCommandPalette"),
             ("ctrl-shift-k", "tako::OpenCommandPalette"),
+            // ジャンプ履歴（#1677。Ctrl+- は縮小なので JetBrains 系の Ctrl+Alt+← / →）
+            ("ctrl-alt-left", "tako::JumpBack"),
+            ("ctrl-alt-right", "tako::JumpForward"),
         ]
     }
 
@@ -1637,13 +1681,28 @@ mod tests {
     ///
     /// #1203 で表を `cfg` から `Platform` 引数へ移したので、**macOS 上でも Windows 上でも
     /// 同じことを検査できる**（以前は macOS の CI でしか走らなかった）
+    ///
+    /// **例外は #1677 のジャンプ履歴（⌃- / ⌃⇧-）だけ**。これは #585 の Windows 用
+    /// バインドの漏れではなく macOS 向けに意図して張ったもので、PTY へ何も送らない
+    /// ことを `macosのジャンプキーは端末へ何も送っていない` が実変換で固定している
     #[test]
     fn macosには非platform修飾のバインドが無い() {
+        let jump: Vec<&str> = vec!["tako::JumpBack", "tako::JumpForward"];
         assert!(
             bindings_for(Platform::MacOs)
                 .iter()
-                .all(|b| b.keystrokes().iter().all(|k| k.inner().modifiers.platform)),
+                .all(|b| jump.contains(&b.action().name())
+                    || b.keystrokes().iter().all(|k| k.inner().modifiers.platform)),
             "macOS に非 platform 修飾のバインドが混入している"
+        );
+        // 例外は ctrl だけを使い、ジャンプ以外のアクションへ広がっていない
+        assert_eq!(
+            bindings_for(Platform::MacOs)
+                .iter()
+                .filter(|b| b.keystrokes().iter().any(|k| !k.inner().modifiers.platform))
+                .count(),
+            jump_bindings(Platform::MacOs).len(),
+            "macOS の非 platform 修飾バインドがジャンプ履歴の割当より多い"
         );
         // 逆に Windows 側は #585 の追加バインドが確実に載っていること
         assert!(
@@ -1687,6 +1746,97 @@ mod tests {
                 "{id}: バインドが無いのにショートカットを表示している"
             );
         }
+    }
+
+    /// #1677: macOS の ⌃- / ⌃⇧-（US = `ctrl-_` / JIS = `ctrl-=`）は PTY へ
+    /// **1 バイトも送っていない**。GPUI macOS は ctrl 付きのキーの `key_char` を None で
+    /// 届けるので、実機と同じ形の打鍵を実際の変換へ通して固定する。
+    /// ここが落ちたら（= 何かを送るようになったら）ジャンプへ奪う判断をやり直すこと
+    #[test]
+    fn macosのジャンプキーは端末へ何も送っていない() {
+        for binding in jump_bindings(Platform::MacOs) {
+            for k in binding.keystrokes() {
+                let k = k.inner();
+                assert!(k.modifiers.control && !k.modifiers.platform && !k.modifiers.alt);
+                assert_eq!(
+                    keystroke_to_bytes_default(&ks_ctrl(&k.key)),
+                    None,
+                    "ctrl-{} が PTY へ送られている（奪うと端末の入力手段が減る）",
+                    k.key
+                );
+            }
+        }
+    }
+
+    /// #1677: ジャンプの打鍵が**両 OS で**既存の割当と衝突しない。
+    /// Windows の ⌃- は縮小（ZoomOut）なので別のキーへ逃がしてある = この検査が
+    /// 「同じキーに 2 つのアクション」を名指しで落とす
+    #[test]
+    fn ジャンプの打鍵は両osで既存の割当と衝突しない() {
+        for platform in [Platform::MacOs, Platform::Windows] {
+            let all = bindings_for(platform);
+            let jump = jump_bindings(platform);
+            assert!(!jump.is_empty(), "{platform:?}: ジャンプの打鍵が無い");
+            for b in &jump {
+                let mine = b.keystrokes()[0].inner().clone();
+                let others: Vec<&str> = all
+                    .iter()
+                    .filter(|o| {
+                        let k = o.keystrokes()[0].inner();
+                        o.keystrokes().len() == 1
+                            && k.key == mine.key
+                            && k.modifiers == mine.modifiers
+                            && o.action().name() != b.action().name()
+                    })
+                    .map(|o| o.action().name())
+                    .collect();
+                assert!(
+                    others.is_empty(),
+                    "{platform:?}: {:?} が {} と {others:?} で衝突している",
+                    mine,
+                    b.action().name()
+                );
+            }
+        }
+        // 端末の単語移動（Ctrl+← / →）と Windows のフォーカス移動（Alt+← / →）は奪わない
+        for spec in ["ctrl-left", "ctrl-right"] {
+            let parsed = Keystroke::parse(spec).unwrap();
+            for platform in [Platform::MacOs, Platform::Windows] {
+                assert!(
+                    jump_bindings(platform).iter().all(|b| {
+                        let k = b.keystrokes()[0].inner();
+                        !(k.key == parsed.key && k.modifiers == parsed.modifiers)
+                    }),
+                    "{platform:?}: {spec} をジャンプに奪っている"
+                );
+            }
+        }
+    }
+
+    /// #1677: 案内の打鍵（`platform::keys::jump_back` / `jump_forward`）が実際の割当と一致する。
+    /// macOS の進むだけは押す形（⌃⇧-）と届く字面（`ctrl-_` / `ctrl-=`）が違うので、
+    /// 字面側の 2 本が揃っていることを別に見る
+    #[test]
+    fn ジャンプの案内はバインド表と一致する() {
+        use tako_core::platform::keys;
+        for platform in [Platform::MacOs, Platform::Windows] {
+            assert_eq!(
+                Some(keys::jump_back(platform).to_string()),
+                shortcut_hint_for("tako::JumpBack", platform),
+                "{platform:?}: 戻るの案内が割当と食い違う"
+            );
+        }
+        assert_eq!(
+            Some(keys::jump_forward(Platform::Windows).to_string()),
+            shortcut_hint_for("tako::JumpForward", Platform::Windows)
+        );
+        let forward: Vec<String> = jump_bindings(Platform::MacOs)
+            .iter()
+            .filter(|b| b.action().name() == "tako::JumpForward")
+            .map(|b| b.keystrokes()[0].inner().key.clone())
+            .collect();
+        assert_eq!(forward, vec!["_".to_string(), "=".to_string()]);
+        assert_eq!(keys::jump_forward(Platform::MacOs), "\u{2303}\u{21e7}-");
     }
 
     /// #1203: 案内文（UI 文言 / CLI / MCP）へ載せる打鍵表記の正本
