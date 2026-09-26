@@ -8,7 +8,9 @@
 //! - [`root`] — プロジェクトルートの検出
 //! - [`state`] — ライフサイクルの状態機械
 //! - [`sync`] — `didChange` の中身（送った本文の写しとの差分）
+//! - [`diagnostic`] — 診断のモデル（重大度・範囲・出所・コード。#1679）
 
+pub mod diagnostic;
 pub mod position;
 pub mod root;
 pub mod servers;
