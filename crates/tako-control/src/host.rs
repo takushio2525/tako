@@ -784,6 +784,15 @@ pub trait PreviewHost {
     fn preview_viewport(&self, _pane: PaneId) -> Option<serde_json::Value> {
         None
     }
+    /// 上限を超えて末尾を省略しているなら、その理由と値（#1660）。
+    ///
+    /// 省略した表示は編集できない（保存すると元ファイルの末尾を失う）。`tako edit` の応答は
+    /// これを `limit` として載せるので、**なぜ編集できないかを CLI / MCP が同じ形で読める**。
+    /// 形は `tako_core::preview_limit::Truncation::to_json`（`reason` / `bytes` か `lines` /
+    /// `max_bytes` / `max_lines` / `message`）。上限内なら `None`
+    fn preview_limit(&self, _pane: PaneId) -> Option<serde_json::Value> {
+        None
+    }
     /// 編集モード切替。開始時のファイル読み込み・UTF-8 検査は実装側が core API で行う。
     fn set_preview_editing(&mut self, _pane: PaneId, _enabled: bool) -> Result<(), String> {
         Err("プレビュー編集は未対応".into())

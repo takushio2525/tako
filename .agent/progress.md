@@ -60,3 +60,6 @@
 ## 2026-09-27（#1763: 実行中のテーマの読み直しでも読めない色を persist.log へ残すようにした）
 - 起動時だけが警告を残し、`reload_theme`（`tako theme` / MCP / 設定画面）とタブバーのトグルは `resolve_theme()` の警告を捨てていた。3 経路とも `load_theme_logged` → `settings::ThemeWarningLog` の 1 本へ寄せ、前回と同じ警告は出さず増えたぶんを起動時と同じ「無視」、消えたぶんを「解消」で出す
 - 実測: `scripts/test-theme-reload-1763.sh` 修正前 16 PASS 10 FAIL（読み直し 0 行）→ 修正後 30 PASS 0 FAIL（CLI / MCP / toggle / 壊れた JSON）・注入 7 通りすべて file:line 名指しで FAILED → 戻して緑
+## 2026-09-27（#1660: 10 万行 / 10 MB まで編集できるようにし、上限に当たったら理由と値を言うようにした）
+- 上限 1 MB / 5,000 行 → 10 MB / 10 万行（正本 `tako_core::preview_limit`）。断る理由と値を画面のフッタ・`tako edit start`・応答の `limit` へ 1 実装から出す。大きい文書は編集開始の全文ハイライトを background へ、差分の塗りは 250 行で打ち切り、TextBuffer に行頭索引・描画の行テキストを差し替え範囲だけ更新・IME の UTF-16 換算を 10 倍速に。#1648 の「行をつなぐと表示が後半だけ」の穴も塞いだ
+- 実測（release・tako-vd の実 GUI）: tako の main.rs 写し 85,953 行で編集開始 19 ms（旧経路 3,986 ms）・1 打鍵 中央値 3.2〜3.7 ms / 最悪 4.8 ms（偽 LSP あり 5.5 ms / 6.6 ms）・⌘Z で元とバイト一致・保存がディスクと一致。`scripts/test-large-file-edit-1660.sh` **24 PASS 0 FAIL**・番犬 5 規則へ注入 5 通りすべて file:line 名指しで FAILED → 戻して緑

@@ -42,6 +42,7 @@ pub mod pdf_links;
 pub mod platform;
 pub mod ports;
 pub mod preview_cache;
+pub mod preview_limit;
 pub mod preview_outline;
 pub mod preview_reload;
 pub mod preview_view;

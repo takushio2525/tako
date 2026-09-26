@@ -1483,7 +1483,7 @@ impl TakoApp {
         let editable = matches!(
             &state.content,
             preview::PreviewContent::Code(_) | preview::PreviewContent::Markdown(_)
-        ) && !truncated;
+        ) && truncated.is_none();
         let zoomable = matches!(
             mode,
             preview::PreviewMode::Image | preview::PreviewMode::Pdf
@@ -1579,27 +1579,46 @@ impl TakoApp {
                 // 高さの実測は GPUI の `list`（可変高さ + 遅延計測）へ任せる
                 preview::PreviewContent::Code(lines) => {
                     let count = lines.len();
-                    line_texts = lines
-                        .iter()
-                        .map(|line| line.iter().map(|s| s.text.as_str()).collect::<String>())
-                        .collect();
-                    // 行頭バイトオフセット（検索ヒットの行内範囲を出すのに要る）。
-                    // 検索ヒットは編集バッファのバイト位置なので、**同じ本文**から
-                    // 数える（#1650。表示用の行テキストは CR を落としてあるため、
-                    // そこから足し上げると CRLF ファイルで 1 行ごとにずれる）
-                    let starts = match self.preview_edits.get(&pane_id) {
-                        Some(edit) => line_start_offsets(edit.buffer.text()),
-                        None => {
-                            let mut starts = Vec::with_capacity(count);
-                            let mut doc_offset: usize = 0;
-                            for text in &line_texts {
-                                starts.push(doc_offset);
-                                doc_offset += text.len() + 1; // +1 for '\n'
+                    // #1660: 行テキストと行頭は表示行から全行ぶん作るので、10 万行では
+                    // 1 フレーム 7.8ms かかる。表示行の版が前のフレームと同じなら使い回す
+                    // （打鍵・読み込み・塗りの差し替えのたびに版が進む）
+                    let rev = state.content_rev;
+                    // 行頭が欠けていれば行テキストも使い回さない（両方を同じ版で揃える）
+                    let previous = self
+                        .preview_line_cache_rev
+                        .get(&pane_id)
+                        .copied()
+                        .filter(|_| self.preview_line_starts.contains_key(&pane_id))
+                        .and_then(|cached| {
+                            Some((self.preview_line_texts.remove(&pane_id)?, cached))
+                        });
+                    let splice = self
+                        .preview_edits
+                        .get(&pane_id)
+                        .and_then(|edit| edit.line_splice.as_ref());
+                    let (texts, reuse) = preview::code_line_texts(previous, rev, splice, lines);
+                    line_texts = texts;
+                    if reuse != preview::LineTextsReuse::Same {
+                        // 行頭バイトオフセット（検索ヒットの行内範囲を出すのに要る）。
+                        // 検索ヒットは編集バッファのバイト位置なので、**同じ本文**から
+                        // 数える（#1650。表示用の行テキストは CR を落としてあるため、
+                        // そこから足し上げると CRLF ファイルで 1 行ごとにずれる）。
+                        // 編集中はバッファの行頭索引（#1660）をそのまま写す（数え直さない）
+                        let starts = match self.preview_edits.get(&pane_id) {
+                            Some(edit) => edit.buffer.line_starts().to_vec(),
+                            None => {
+                                let mut starts = Vec::with_capacity(count);
+                                let mut doc_offset: usize = 0;
+                                for text in &line_texts {
+                                    starts.push(doc_offset);
+                                    doc_offset += text.len() + 1; // +1 for '\n'
+                                }
+                                starts
                             }
-                            starts
-                        }
-                    };
-                    self.preview_line_starts.insert(pane_id, starts);
+                        };
+                        self.preview_line_starts.insert(pane_id, starts);
+                        self.preview_line_cache_rev.insert(pane_id, rev);
+                    }
                     // 可視行が自分の枠へ書き込む器。索引は常に文書の行番号。
                     // ここで先に入れておくのが要点で、`list` の item は
                     // このあとの prepaint で自分の枠へ書き込む
@@ -1677,6 +1696,8 @@ impl TakoApp {
                         }
                     }
                     self.preview_line_starts.insert(pane_id, starts);
+                    // #1660: md は毎フレーム組み直すので、コードの使い回しの印を残さない
+                    self.preview_line_cache_rev.remove(&pane_id);
                     self.preview_md_block_index.insert(pane_id, index);
                     // 可視ブロックが自分の枠へ書き込む器。索引は常に文書の行番号
                     self.preview_text_layouts
@@ -3694,7 +3715,7 @@ impl TakoApp {
                         }
                     }))
                     .children(body)
-                    .children(truncated.then(|| {
+                    .children(truncated.map(|limit| {
                         div()
                             .pt_2()
                             // #821 / #826: 仮想化した本文では縦の余白がリスト側に
@@ -3702,7 +3723,8 @@ impl TakoApp {
                             .when(body_virtualized, |d| d.pb(px(PREVIEW_BODY_PADDING)))
                             .text_size(px(11.0))
                             .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8))
-                            .child(crate::ui_text::preview::tail_omitted())
+                            // #1660: 何を超えたか・上限・編集できないことを必ず言う
+                            .child(crate::ui_text::preview::tail_omitted(&limit))
                     }))
             })
             .children((!pdf_highlight_bounds.is_empty()).then(|| {
@@ -3759,6 +3781,10 @@ impl TakoApp {
         self.preview_line_bounds.remove(&pane_id);
         self.preview_line_texts.remove(&pane_id);
         self.preview_line_starts.remove(&pane_id);
+        self.preview_line_cache_rev.remove(&pane_id);
+        // #1660: 閉じたペインの全文の塗りは起こさない（起きていても取り込み先が無く捨てる）
+        self.pending_editor_seeds
+            .retain(|(pane, _)| *pane != pane_id);
         self.preview_text_layouts.remove(&pane_id);
         self.preview_body_lists.remove(&pane_id);
         self.preview_pending_reveal.remove(&pane_id);
@@ -5045,41 +5071,34 @@ fn search_hits_for_line(
     result
 }
 
-/// 行頭のバイトオフセット列（#1650）。
-///
-/// 行の切り方は syntect の `LinesWithEndings`（= `split_inclusive('\n')`）と同じなので、
-/// 返す添字は描画済みの行の添字とそのまま対応する。**行区切りの長さを仮定しない**のが
-/// 要点で、CRLF ファイルで「行の表示文字数 + 1」と数えると 1 行につき 1 バイトずつ
-/// ずれ、検索ハイライトが下の行ほど右へ流れる（表示用の行テキストは CR を落としてある）
-fn line_start_offsets(text: &str) -> Vec<usize> {
-    let mut starts = Vec::new();
-    let mut offset = 0;
-    for line in text.split_inclusive('\n') {
-        starts.push(offset);
-        offset += line.len();
-    }
-    starts
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// #1650: 行頭オフセットが改行コードの長さを仮定しない
+    /// #1650: 行頭オフセットが改行コードの長さを仮定しない。
+    ///
+    /// 編集中の行頭は `TextBuffer` の行頭索引（#1660）を写すので、それが描画の行
+    /// （syntect の `LinesWithEndings` の切り方）と添字で対応することを見る。
+    /// 末尾が改行で終わる本文では索引の方が 1 つ多い（その後ろの空行 = カーソルを置ける）が、
+    /// 描画は添字で引くだけなので困らない
     #[test]
     fn 行頭オフセットがcrlfでもバッファのバイト位置と一致する() {
-        // syntect の `LinesWithEndings` と同じ行の切り方であること
+        let starts_of = |text: &str| {
+            tako_core::TextBuffer::from_text(std::path::PathBuf::from("/tmp/x.rs"), text.into())
+                .line_starts()
+                .to_vec()
+        };
         for text in ["abc\r\ndef\r\n", "abc\ndef\n", "a\r\nb\nc", "", "x"] {
-            let starts = line_start_offsets(text);
+            let starts = starts_of(text);
             let lines: Vec<&str> = syntect::util::LinesWithEndings::from(text).collect();
-            assert_eq!(starts.len(), lines.len(), "{text:?} の行数");
-            for (i, start) in starts.iter().enumerate() {
+            assert!(starts.len() >= lines.len(), "{text:?} の行数");
+            for (i, start) in starts.iter().take(lines.len()).enumerate() {
                 assert!(text[*start..].starts_with(lines[i]), "{text:?} の {i} 行目");
             }
         }
         // CRLF では行区切りが 2 バイト（旧実装の「表示文字数 + 1」は 0, 4, 8 だった）
-        assert_eq!(line_start_offsets("abc\r\ndef\r\nghi"), vec![0, 5, 10]);
-        assert_eq!(line_start_offsets("abc\ndef\nghi"), vec![0, 4, 8]);
+        assert_eq!(starts_of("abc\r\ndef\r\nghi"), vec![0, 5, 10]);
+        assert_eq!(starts_of("abc\ndef\nghi"), vec![0, 4, 8]);
     }
 
     #[test]

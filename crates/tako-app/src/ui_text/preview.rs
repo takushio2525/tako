@@ -104,10 +104,19 @@ pub fn item_count(n: usize) -> String {
 pub fn loading() -> &'static str {
     tr!("読み込み中…", "Loading…")
 }
-pub fn tail_omitted() -> &'static str {
+/// 上限を超えて末尾を省略したときのフッタ（#1660）。**理由と値を必ず出す**
+/// （何を超えたか・上限はいくつか・編集できないこと）。値の文面は
+/// `tako_core::preview_limit::Truncation` の 1 実装から取るので `tako edit` の応答と一致する
+pub fn tail_omitted(limit: &tako_core::preview_limit::Truncation) -> String {
     tr!(
-        "…（大きいファイルのため末尾を省略して表示）",
-        "… (tail omitted for large file)"
+        format!(
+            "…（上限を超えるため末尾を省略して表示し、編集できません: {}）",
+            limit.detail_ja()
+        ),
+        format!(
+            "… (tail omitted and editing disabled: {})",
+            limit.detail_en()
+        )
     )
 }
 /// 動画の再生ボタンの**語**（#1536）。
@@ -294,7 +303,8 @@ mod tests {
                 op_run_file().to_string(),
                 item_count(12),
                 loading().to_string(),
-                tail_omitted().to_string(),
+                tail_omitted(&tako_core::preview_limit::Truncation::Lines { lines: 123_456 }),
+                tail_omitted(&tako_core::preview_limit::Truncation::Bytes { size: 12_345_678 }),
                 video_play().to_string(),
                 video_resolution(1920, 1080),
                 video_duration(3, 5),

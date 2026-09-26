@@ -1555,26 +1555,64 @@ fn ime_highlight_ranges(
     highlights
 }
 
-/// UTF-16 コード単位のオフセットを UTF-8 バイトオフセットへ変換する（範囲外は末尾へ丸める）。
-/// NSTextInputClient（macOS の IME プロトコル）は範囲をすべて UTF-16 で渡してくる
-fn utf16_to_byte_offset(text: &str, utf16_offset: usize) -> usize {
-    let mut utf16 = 0;
-    for (byte, c) in text.char_indices() {
-        if utf16 >= utf16_offset {
-            return byte;
+/// UTF-8 のバイト列が UTF-16 で何単位になるか（#1660）。
+///
+/// 文字の頭（継続バイト `10xxxxxx` 以外）で 1、4 バイト文字の頭（`11110xxx`）でもう 1
+/// （サロゲートペア）。IME は打鍵のたびにカーソルの位置を UTF-16 で問うので、10 MB の
+/// 文書の末尾では 1 文字ずつ復号する版が 1 回 3.9ms かかっていた。
+///
+/// 127 バイトずつ u8 で足してから usize へ寄せる（1 バイトの寄与は最大 2 なので
+/// 127 × 2 = 254 で u8 に収まる）。u8 の足し算は 1 命令で 16 バイトぶん進むので、
+/// 10 MB で 0.38ms（復号版の 10 分の 1。usize で直接足すと 2.4ms）。
+/// `bytes` は文字の境界で切れていること（復号版と同じ前提）
+fn utf16_units(bytes: &[u8]) -> usize {
+    let mut total = 0usize;
+    for chunk in bytes.chunks(127) {
+        let mut units: u8 = 0;
+        for &b in chunk {
+            units += u8::from((b & 0xC0) != 0x80) + u8::from(b >= 0xF0);
         }
-        utf16 += c.len_utf16();
+        total += usize::from(units);
+    }
+    total
+}
+
+/// UTF-16 コード単位のオフセットを UTF-8 バイトオフセットへ変換する（範囲外は末尾へ丸める）。
+/// NSTextInputClient（macOS の IME プロトコル）は範囲をすべて UTF-16 で渡してくる。
+///
+/// 目的の位置を含む塊までは塊ごとの単位数だけ足して飛ばす（#1660。文書の先頭から
+/// 1 文字ずつ数えない）。サロゲートペアの途中を指されたら次の文字の頭を返す（従来どおり）
+fn utf16_to_byte_offset(text: &str, utf16_offset: usize) -> usize {
+    const CHUNK: usize = 4096;
+    let bytes = text.as_bytes();
+    let mut units = 0;
+    let mut at = 0;
+    while at + CHUNK <= bytes.len() {
+        let chunk = utf16_units(&bytes[at..at + CHUNK]);
+        if units + chunk >= utf16_offset {
+            break;
+        }
+        units += chunk;
+        at += CHUNK;
+    }
+    for (i, &b) in bytes[at..].iter().enumerate() {
+        if (b & 0xC0) != 0x80 {
+            if units >= utf16_offset {
+                return at + i;
+            }
+            units += if b >= 0xF0 { 2 } else { 1 };
+        }
     }
     text.len()
 }
 
 fn utf16_len(text: &str) -> usize {
-    text.chars().map(char::len_utf16).sum()
+    utf16_units(text.as_bytes())
 }
 
 fn byte_to_utf16_offset(text: &str, byte_offset: usize) -> usize {
     let offset = snap_to_char_boundary(text, byte_offset.min(text.len()));
-    text[..offset].chars().map(char::len_utf16).sum()
+    utf16_units(&text.as_bytes()[..offset])
 }
 
 /// ドラッグ選択中の自動スクロール状態（#310 ターミナル / #309 PDF プレビュー）
@@ -1840,6 +1878,9 @@ struct TakoApp {
     queued_recovery: std::collections::HashMap<PaneId, QueuedRecovery>,
     /// dispatch 中に依頼されたプレビューの background ハイライト（ペイン, パス, 生テキスト）
     pending_highlights: Vec<(PaneId, std::path::PathBuf, String)>,
+    /// 大きい文書の編集で background へ出す全文の塗り（#1660）。
+    /// 編集の経路は `Context` を持たないので、次の render の入口で起こす
+    pending_editor_seeds: Vec<(PaneId, preview::SeedRequest)>,
     /// dispatch 中に依頼された重量プレビュー（PDF / 動画）の background 読み込み
     /// （Issue #168。Loading 表示 → 完了時差し替え。GPUI の Context が要るため遅延実行）
     pending_preview_loads: Vec<(PaneId, std::path::PathBuf, preview::PreviewMode)>,
@@ -2331,6 +2372,9 @@ struct TakoApp {
     /// プレビューの行ごとのプレーンテキスト（選択テキスト抽出用）。
     /// **仮想化しても全行ぶんを持つ**（⌘A / コピー / ヒットテストの正）
     preview_line_texts: HashMap<PaneId, Vec<String>>,
+    /// `preview_line_texts` / `preview_line_starts` を作った表示行の版（#1660）。
+    /// `PreviewState::content_rev` と同じなら render は作り直さない（10 万行で 1 フレーム 7.8ms）
+    preview_line_cache_rev: HashMap<PaneId, u64>,
     /// Markdown プレビュー内リンクの当たり判定（#680）。render で「選択と同じ
     /// 行・バイト範囲」の座標系で記録し、⌘+ホバー / ⌘+クリックがこれを引く
     /// （CLI / MCP 一覧は PreviewHost::preview_md_links が別途数え直す）
@@ -3987,6 +4031,7 @@ impl TakoApp {
             agent_relaunches: Vec::new(),
             queued_recovery: std::collections::HashMap::new(),
             pending_highlights: Vec::new(),
+            pending_editor_seeds: Vec::new(),
             pending_preview_loads: Vec::new(),
             preview_device_scale: 1.0,
             pending_pdf_rasters: HashMap::new(),
@@ -4202,6 +4247,7 @@ impl TakoApp {
             preview_md_block_index: HashMap::new(),
             preview_line_starts: HashMap::new(),
             preview_line_texts: HashMap::new(),
+            preview_line_cache_rev: HashMap::new(),
             preview_md_link_hits: HashMap::new(),
             preview_md_hovered_link: None,
             preview_md_copied: None,
@@ -12813,6 +12859,9 @@ impl TakoApp {
         if let (Some(state), Some(edit)) = (previews.get_mut(&pane_id), edits.get_mut(&pane_id)) {
             preview::apply_editor_text(state, edit);
         }
+        // #1660: 大きい文書の全文の塗りは background へ（ここは `Context` を持たないので
+        // 積むだけ。次の render の入口 `drain_pending_editor_seeds` が起こす）
+        self.queue_editor_seed(pane_id);
         self.sync_preview_selection_from_editor(pane_id);
         // #1649: カーソルが画面外へ出たままにしない。打鍵・矢印・改行・BS / Del・
         // 貼り付け・undo / redo・IME 確定・CLI / MCP の `PreviewApply` は
@@ -23070,6 +23119,13 @@ impl PreviewHost for TakoApp {
         self.preview_viewport_json(pane)
     }
 
+    fn preview_limit(&self, pane: PaneId) -> Option<serde_json::Value> {
+        self.previews
+            .get(&pane)?
+            .truncated
+            .map(|limit| limit.to_json())
+    }
+
     fn set_preview_editing(&mut self, pane: PaneId, enabled: bool) -> Result<(), String> {
         self.set_preview_editing_local(pane, enabled)
     }
@@ -23104,7 +23160,12 @@ impl PreviewHost for TakoApp {
     }
 
     fn preview_document(&self, pane: PaneId) -> Option<serde_json::Value> {
-        Some(self.preview_edits.get(&pane)?.buffer.document_state())
+        let edit = self.preview_edits.get(&pane)?;
+        let mut document = edit.buffer.document_state();
+        // #1660: 大きい文書の全文の塗りを background で待っている間は true
+        // （本文も編集も即時で、色だけが後から揃う。検証はこれが false になるのを待つ）
+        document["highlight_pending"] = serde_json::json!(edit.highlight_pending());
+        Some(document)
     }
 
     fn save_preview(&mut self, pane: PaneId) -> Result<(), String> {
@@ -24721,6 +24782,8 @@ impl Render for TakoApp {
         let _span = tako_control::diag::perf_span("render");
         // #945: 「操作していないのにフレームが要求され続けていないか」の実測用
         self.root_renders = self.root_renders.saturating_add(1);
+        // #1660: 編集の経路（打鍵・CLI / MCP）が積んだ全文の塗りを background で起こす
+        self.drain_pending_editor_seeds(cx);
         // IME 経路の自己修復の保険（#332）: 本線は wire_focus_self_heal の
         // on_focus_lost（draw 末尾で発火し view render の reuse に依存しない）。
         // ここは購読が何らかの理由で効かなかった場合に、次の notify 契機で
@@ -41442,6 +41505,13 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1660: 大きいファイル（8 万行超）を実 GUI の打鍵経路で編集できるか。
+                // 数秒かかる計測なので全節実行の並びには入れない（単独実行だけ）
+                "large-file-edit" => {
+                    large_file_edit_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1677: ジャンプ履歴の戻る / 進むが実 GUI の打鍵経路で効くか
                 "jump-keys" => {
                     jump_keys_visual(any, window, cx).await;
@@ -45756,6 +45826,398 @@ mod self_test {
         });
         let _ = std::fs::remove_dir_all(&dir);
         println!("TAKO_VISUAL_PIXEL: editor-keys ok legacy={legacy}");
+    }
+
+    /// #1660: 大きいファイル（既定は tako 自身の `main.rs` の写し = 8 万行超）を
+    /// **実 GUI の打鍵経路**で編集できるか・1 打鍵にいくらかかるか。
+    ///
+    /// 打鍵は `window.dispatch_keystroke`（`x->x` = キー判定 → 入力ハンドラの
+    /// `replace_text_in_range` まで = 実機の文字入力と同じ入口）で流し、1 打鍵ごとに
+    /// 1 フレーム描かせてから測る（打鍵から描画までの UI スレッドのコスト）。
+    /// 相: (1) 開く (2) 読み取り表示の塗り (3) 編集開始 (4) 全文の塗り（background）
+    /// (5) 先頭・中央・末尾の打鍵 / Enter / Backspace (6) ⌘Z で全部戻すと元とバイト一致
+    /// (7) 打って保存するとディスクと一致。**実時間は判定に使わない**（数字は出力するだけ。
+    /// `.agent/conventions.md`「効果を測る単体テストは実時間で比べない」）。
+    /// 対象は `TAKO_1660_FILE` で差し替えられる（写しを一時ディレクトリへ置いて触るので
+    /// 元のファイルは変わらない）。単独実行は `TAKO_VISUAL_ONLY=large-file-edit`
+    #[cfg(feature = "visual-test")]
+    async fn large_file_edit_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        use std::time::Instant;
+        use tako_control::protocol::Request as Req;
+
+        fn rss_kb() -> u64 {
+            let mut ps = std::process::Command::new("ps");
+            tako_core::platform::process::no_console_window(&mut ps)
+                .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
+                .unwrap_or(0)
+        }
+        fn summary(mut samples: Vec<Duration>) -> String {
+            samples.sort();
+            let median = samples[samples.len() / 2];
+            let worst = samples[samples.len() - 1];
+            format!(
+                "median_us={} max_us={} n={}",
+                median.as_micros(),
+                worst.as_micros(),
+                samples.len()
+            )
+        }
+
+        inject_section_failure("large-file-edit");
+        ensure_fresh_scene(window, cx, "large-file-edit").await;
+        let source = std::env::var_os("TAKO_1660_FILE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs")
+            });
+        let original = std::fs::read(&source).expect("visual-test large-file-edit 元ファイル");
+        let dir = std::env::temp_dir().join(format!("tako-visual-1660-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("visual-test large-file-edit 一時ディレクトリ");
+        // 言語サーバの根（Cargo.toml）を置く = 偽サーバを繋いだときに受け持たせる
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"large\"\n").ok();
+        let ext = source
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("txt")
+            .to_string();
+        let path = dir.join(format!("large.{ext}"));
+        std::fs::write(&path, &original).expect("visual-test large-file-edit 写し");
+        let lines = original.iter().filter(|b| **b == b'\n').count();
+        println!(
+            "TAKO_VISUAL_PIXEL: large-file-edit file lines={lines} bytes={} ext={ext}",
+            original.len()
+        );
+        let rss0 = rss_kb();
+
+        // (1) 開く（dispatch + 1 フレーム）
+        let t = Instant::now();
+        let pane = window
+            .update(cx, |app, _, cx| {
+                let base = app.focused_pane().as_u64();
+                let opened = tako_control::dispatch(
+                    app,
+                    Req::OpenFile {
+                        pane: Some(base),
+                        path: path.display().to_string(),
+                        mode: Some(tako_control::protocol::PreviewModeWire::Code),
+                        direction: Some(tako_control::protocol::Direction::Right),
+                        focus: Some(true),
+                        new_tab: false,
+                        line: None,
+                        column: None,
+                    },
+                    PaneOrigin::Cli,
+                )
+                .expect("visual-test large-file-edit を dispatch で開ける");
+                // IPC の 1 ターンの後処理と同じく、読み取り表示の塗りを background で起こす
+                // （dispatch を直接呼ぶ節は IPC の後処理を通らない）
+                app.drain_pending_highlights(cx);
+                cx.notify();
+                PaneId::from_raw(opened["pane"].as_u64().expect("OpenFile 応答の pane"))
+            })
+            .unwrap_or_else(|_| fail("visual-test large-file-edit dispatch"));
+        notify_and_draw(any, window, cx);
+        let open_ui = t.elapsed();
+        let limit = window
+            .update(cx, |app, _, _| {
+                app.previews.get(&pane).and_then(|state| state.truncated)
+            })
+            .ok()
+            .flatten();
+        check(
+            limit.is_none(),
+            &format!("visual-test large-file-edit: 上限の内側なので全文を読む（{limit:?}）"),
+        );
+
+        // (2) 読み取り表示の塗り（background）が戻るまで
+        let t = Instant::now();
+        let colored = |app: &TakoApp| {
+            matches!(
+                app.previews.get(&pane).map(|s| &s.content),
+                Some(preview::PreviewContent::Code(lines))
+                    if lines.iter().take(50).any(|l| l.iter().any(|s| s.color.is_some()))
+            )
+        };
+        let mut view_ready = false;
+        for _ in 0..3000 {
+            if window.update(cx, |app, _, _| colored(app)).unwrap_or(false) {
+                view_ready = true;
+                break;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(10))
+                .await;
+            notify_and_draw(any, window, cx);
+        }
+        let view_highlight = t.elapsed();
+        check(
+            view_ready,
+            "visual-test large-file-edit: 読み取り表示が塗られる",
+        );
+        let rss_view = rss_kb();
+
+        // (3) 編集開始（dispatch + 1 フレーム）
+        let t = Instant::now();
+        let editing = window
+            .update(cx, |app, _, cx| {
+                let _ = app.workspace.active_tab_mut().tree_mut().focus(pane);
+                let r = tako_control::dispatch(
+                    app,
+                    Req::PreviewEdit {
+                        pane: Some(pane.as_u64()),
+                        enabled: Some(true),
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+                r.map_err(|e| e.to_string())
+                    .map(|v| v["editing"].as_bool().unwrap_or(false))
+            })
+            .unwrap_or_else(|_| Err("window".into()));
+        notify_and_draw(any, window, cx);
+        let edit_ui = t.elapsed();
+        check(
+            editing == Ok(true),
+            &format!("visual-test large-file-edit: 編集モードを開始できる（{editing:?}）"),
+        );
+
+        // (4) 全文の塗り（background）が戻るまで。打鍵はこの間も通る（塗りを待たない）
+        let t = Instant::now();
+        let pending = |cx: &mut AsyncApp| {
+            window
+                .update(cx, |app, _, _| {
+                    app.preview_edits
+                        .get(&pane)
+                        .is_some_and(preview::EditState::highlight_pending)
+                })
+                .unwrap_or(false)
+        };
+        let deferred = pending(cx);
+        for _ in 0..6000 {
+            if !pending(cx) {
+                break;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(10))
+                .await;
+            notify_and_draw(any, window, cx);
+        }
+        let seed = t.elapsed();
+        check(
+            !pending(cx),
+            "visual-test large-file-edit: 全文の塗りが戻って揃う",
+        );
+        let lsp_servers = window
+            .update(cx, |app, _, _| app.lsp.server_pids().len())
+            .unwrap_or(0);
+        let rss_edit = rss_kb();
+        println!(
+            "TAKO_VISUAL_PIXEL: large-file-edit open open_ui_us={} view_highlight_ms={} \
+             edit_ui_us={} deferred={deferred} seed_ms={} lsp_servers={lsp_servers} \
+             sync_seed_forced={}",
+            open_ui.as_micros(),
+            view_highlight.as_millis(),
+            edit_ui.as_micros(),
+            seed.as_millis(),
+            preview::sync_seed_forced(),
+        );
+
+        // (5) 打鍵。起点は CLI と同じ dispatch で置く
+        let place = |cx: &mut AsyncApp, line: usize, col: usize| {
+            window
+                .update(cx, |app, _, cx| {
+                    let r = tako_control::dispatch(
+                        app,
+                        Req::PreviewCursor {
+                            pane: Some(pane.as_u64()),
+                            line: line + 1,
+                            col,
+                            select_to_line: None,
+                            select_to_col: None,
+                            expected_version: None,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    cx.notify();
+                    r.is_ok()
+                })
+                .unwrap_or(false)
+        };
+        let total = lines.max(1);
+        const KEYS: usize = 60;
+        for (label, line) in [
+            ("head", 10usize.min(total - 1)),
+            ("middle", total / 2),
+            ("tail", total.saturating_sub(10)),
+        ] {
+            check(
+                place(cx, line, 0),
+                &format!("visual-test large-file-edit: {label} に起点を置ける"),
+            );
+            notify_and_draw(any, window, cx);
+            let mut keys = Vec::with_capacity(KEYS);
+            for _ in 0..KEYS {
+                let t = Instant::now();
+                press(any, cx, "x->x");
+                notify_and_draw(any, window, cx);
+                keys.push(t.elapsed());
+            }
+            let mut enters = Vec::new();
+            let mut backs = Vec::new();
+            for _ in 0..5 {
+                let t = Instant::now();
+                press(any, cx, "enter");
+                notify_and_draw(any, window, cx);
+                enters.push(t.elapsed());
+            }
+            for _ in 0..5 {
+                let t = Instant::now();
+                press(any, cx, "backspace");
+                notify_and_draw(any, window, cx);
+                backs.push(t.elapsed());
+            }
+            let typed = window
+                .update(cx, |app, _, _| {
+                    let edit = app.preview_edits.get(&pane)?;
+                    let b = &edit.buffer;
+                    let start = b.offset_for_line_byte_col(line, 0);
+                    Some(b.text()[start..].starts_with(&"x".repeat(KEYS)))
+                })
+                .ok()
+                .flatten()
+                .unwrap_or(false);
+            check(
+                typed,
+                &format!("visual-test large-file-edit: {label} で打った {KEYS} 文字が本文に入る"),
+            );
+            println!(
+                "TAKO_VISUAL_PIXEL: large-file-edit keys at={label} line={} {} enter={} backspace={}",
+                line + 1,
+                summary(keys),
+                summary(enters),
+                summary(backs),
+            );
+        }
+        let rss_keys = rss_kb();
+        let (undo_depth, history_bytes) = window
+            .update(cx, |app, _, _| {
+                app.preview_edits
+                    .get(&pane)
+                    .map(|e| (e.buffer.undo_depth(), e.buffer.undo_history_bytes()))
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+
+        // (6) ⌘Z / Ctrl+Z で全部戻すと元とバイト一致
+        let undo_key = if cfg!(target_os = "macos") {
+            "cmd-z"
+        } else {
+            "ctrl-z"
+        };
+        let mut undos = Vec::new();
+        for _ in 0..undo_depth + 5 {
+            let can = window
+                .update(cx, |app, _, _| {
+                    app.preview_edits
+                        .get(&pane)
+                        .is_some_and(|e| e.buffer.can_undo())
+                })
+                .unwrap_or(false);
+            if !can {
+                break;
+            }
+            let t = Instant::now();
+            press(any, cx, undo_key);
+            notify_and_draw(any, window, cx);
+            undos.push(t.elapsed());
+        }
+        let restored = window
+            .update(cx, |app, _, _| {
+                app.preview_edits
+                    .get(&pane)
+                    .is_some_and(|e| e.buffer.text().as_bytes() == original.as_slice())
+            })
+            .unwrap_or(false);
+        check(
+            restored,
+            "visual-test large-file-edit: undo で全部戻すと元とバイト一致",
+        );
+
+        // (7) 先頭・中央・末尾に 1 文字ずつ打って保存 → ディスクと一致
+        for line in [10usize.min(total - 1), total / 2, total.saturating_sub(10)] {
+            place(cx, line, 0);
+            press(any, cx, "y->y");
+            notify_and_draw(any, window, cx);
+        }
+        let t = Instant::now();
+        let saved = window
+            .update(cx, |app, _, cx| {
+                let r = tako_control::dispatch(
+                    app,
+                    Req::PreviewSave {
+                        pane: Some(pane.as_u64()),
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+                r.map_err(|e| e.to_string())
+            })
+            .unwrap_or_else(|_| Err("window".into()));
+        let save_ms = t.elapsed().as_millis();
+        check(
+            saved.is_ok(),
+            &format!("visual-test large-file-edit: 保存できる（{saved:?}）"),
+        );
+        let (disk_matches, ys) = window
+            .update(cx, |app, _, _| {
+                let buffer = app
+                    .preview_edits
+                    .get(&pane)
+                    .map(|e| e.buffer.text().to_string());
+                let disk = std::fs::read(&path).unwrap_or_default();
+                let ys = disk.len() as isize - original.len() as isize;
+                (buffer.is_some_and(|b| b.as_bytes() == disk.as_slice()), ys)
+            })
+            .unwrap_or((false, 0));
+        check(
+            disk_matches && ys == 3,
+            &format!(
+                "visual-test large-file-edit: 保存した内容がディスクと一致し 3 文字増えている \
+                 （一致={disk_matches} 増分={ys}）"
+            ),
+        );
+        println!(
+            "TAKO_VISUAL_PIXEL: large-file-edit undo {} depth={undo_depth} history_bytes={history_bytes} \
+             restored={restored} save_ms={save_ms} disk_matches={disk_matches}",
+            summary(undos),
+        );
+        println!(
+            "TAKO_VISUAL_PIXEL: large-file-edit rss start_kb={rss0} view_kb={rss_view} \
+             edit_kb={rss_edit} keys_kb={rss_keys}"
+        );
+
+        let _ = window.update(cx, |app, _, cx| {
+            let _ = tako_control::dispatch(
+                app,
+                Req::Close {
+                    pane: Some(pane.as_u64()),
+                    force: true,
+                    caller_role: None,
+                },
+                PaneOrigin::Cli,
+            );
+            cx.notify();
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("TAKO_VISUAL_PIXEL: large-file-edit ok");
     }
 
     /// #1741: 可視行数（追従スクロールの余白とページ移動の歩幅）が**実際に描いた行の
@@ -54389,13 +54851,13 @@ mod self_test {
             .await
             .unwrap_or_else(|| fail("rename 元のパス復帰後に再読み込み"));
 
-            // 1 MB 超は全体を読まず上限 + 1 byte で止め、既存の省略表示へ劣化。
+            // 上限（#1660 で 10 MB）超は全体を読まず上限 + 1 byte で止め、既存の省略表示へ劣化。
             std::fs::write(&note_path, vec![b'x'; preview::MAX_BYTES + 128])
                 .expect("巨大ファイルを書ける");
             wait_for_preview_state(window, cx, Duration::from_secs(3), |app| {
                 app.previews
                     .get(&reload_pane)
-                    .is_some_and(|state| state.truncated)
+                    .is_some_and(|state| state.truncated.is_some())
             })
             .await
             .unwrap_or_else(|| fail("巨大ファイルを省略表示"));
@@ -81294,6 +81756,47 @@ mod ime_tests {
     fn 非変換中はフォーカスペインを対象にする() {
         let focused = PaneId::from_raw(2);
         assert_eq!(resolve_ime_pane(None, |_| true, focused), focused);
+    }
+
+    /// #1660: バイト数えの UTF-16 換算が、1 文字ずつ復号する旧実装と全位置で一致する。
+    /// 塊（4096 バイト）の境目を多バイト文字・サロゲートペアがまたぐ本文で見る
+    #[test]
+    fn utf16の換算は復号版と全位置で一致する() {
+        fn naive_to_byte(text: &str, utf16_offset: usize) -> usize {
+            let mut utf16 = 0;
+            for (byte, c) in text.char_indices() {
+                if utf16 >= utf16_offset {
+                    return byte;
+                }
+                utf16 += c.len_utf16();
+            }
+            text.len()
+        }
+        let unit = "ab日本😀\r\nx";
+        let mut long = String::new();
+        while long.len() < 4096 * 3 + 7 {
+            long.push_str(unit);
+        }
+        for text in [String::new(), "😀".into(), "日本".into(), long] {
+            let total: usize = text.chars().map(char::len_utf16).sum();
+            assert_eq!(super::utf16_len(&text), total);
+            for offset in 0..=total + 2 {
+                assert_eq!(
+                    super::utf16_to_byte_offset(&text, offset),
+                    naive_to_byte(&text, offset),
+                    "utf16 {offset} → byte"
+                );
+            }
+            for byte in 0..=text.len() + 1 {
+                let snapped = super::snap_to_char_boundary(&text, byte.min(text.len()));
+                let expected: usize = text[..snapped].chars().map(char::len_utf16).sum();
+                assert_eq!(
+                    super::byte_to_utf16_offset(&text, byte),
+                    expected,
+                    "byte {byte}"
+                );
+            }
+        }
     }
 }
 

@@ -74,8 +74,11 @@ set -uo pipefail
 
 # 起動するバイナリの置き場（**`target/…/tako-app` の直書きをこの 2 行に閉じる**。
 # 散らすと「stale な target を掴んでいた」に気づけない = #432 の罠）
-ISOLATED_GUI_APP_REL=${TAKO_ISO_APP_REL:-target/debug/tako-app}
-ISOLATED_GUI_CLI_REL=${TAKO_ISO_CLI_REL:-target/debug/tako}
+# ビルドの種類は `TAKO_ISO_PROFILE`（既定 debug）で選ぶ（#1660。性能を測る検証は
+# `TAKO_ISO_PROFILE=release`）。種類を変えても置き場の組み立てはこの 2 行のまま
+ISOLATED_GUI_PROFILE=${TAKO_ISO_PROFILE:-debug}
+ISOLATED_GUI_APP_REL=${TAKO_ISO_APP_REL:-target/$ISOLATED_GUI_PROFILE/tako-app}
+ISOLATED_GUI_CLI_REL=${TAKO_ISO_CLI_REL:-target/$ISOLATED_GUI_PROFILE/tako}
 
 # 窓を出す面。`TAKO_ISOLATED` が立っていれば tako 側の既定も同じ面だが、
 # **何も指定していないのか tako-vd を狙っているのかをスクリプトから読めるようにする**。
@@ -157,7 +160,11 @@ isolated_gui_bins() {
     APP_BIN="${APP_BIN:-$root/$ISOLATED_GUI_APP_REL}"
     if [ ! -x "$TAKO_BIN" ] || [ ! -x "$APP_BIN" ]; then
         echo "バイナリをビルドします…"
-        (cd "$root" && cargo build -p tako-cli -p tako-app --quiet)
+        if [ "$ISOLATED_GUI_PROFILE" = release ]; then
+            (cd "$root" && cargo build --release -p tako-cli -p tako-app --quiet)
+        else
+            (cd "$root" && cargo build -p tako-cli -p tako-app --quiet)
+        fi
     fi
     local b
     for b in "$TAKO_BIN" "$APP_BIN"; do

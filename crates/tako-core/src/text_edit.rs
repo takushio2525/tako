@@ -708,6 +708,14 @@ pub enum RangeEditError {
 pub struct TextBuffer {
     path: PathBuf,
     text: String,
+    /// 行頭のバイト位置（#1660）。`[0]` は常に 0、以後は `\n` の直後。
+    ///
+    /// 行・桁の換算（`line_byte_col` / `offset_for_line_byte_col` / `line_count`）を
+    /// 文書の先頭から数え直さないための索引。10 万行 / 10 MB の文書では数え直しが
+    /// 1 回数 ms かかり、GUI は 1 打鍵・1 フレームにこれを何度も呼ぶ（表示中の行ごと・
+    /// 選択の往復・追従スクロール）。本文を書き換える 3 つの口（`apply_edit` /
+    /// `undo` / `redo`）が [`Self::splice_line_starts`] で追従させる
+    line_starts: Vec<usize>,
     baseline: Vec<u8>,
     cursor: usize,
     anchor: Option<usize>,
@@ -797,6 +805,7 @@ impl TextBuffer {
             line_ending: LineEnding::detect_or_default(&text),
             indent: IndentUnit::detect(&text).unwrap_or_else(|| IndentUnit::for_path(path)),
             path: path.to_path_buf(),
+            line_starts: compute_line_starts(&text),
             text,
             baseline: bytes,
             cursor: 0,
@@ -818,6 +827,7 @@ impl TextBuffer {
             line_ending: LineEnding::detect_or_default(&text),
             indent: IndentUnit::detect(&text).unwrap_or_else(|| IndentUnit::for_path(&path)),
             path,
+            line_starts: compute_line_starts(&text),
             text,
             baseline,
             cursor: 0,
@@ -1320,6 +1330,7 @@ impl TextBuffer {
         let cursor_before = self.cursor;
         let anchor_before = self.anchor;
         let at_millis = self.now_millis();
+        self.splice_line_starts(range.clone(), replacement);
         self.text.replace_range(range, replacement);
         // 編集後の本文で丸める。丸めずに持つと、その位置が差分へ記録されて
         // **undo / redo のたびに再現される**（`replace_all` は編集前のカーソルを
@@ -1468,6 +1479,7 @@ impl TextBuffer {
         // 版を戻すと「別の中身なのに同じ版」が生まれて楽観ロックが効かなくなる
         self.bump_version();
         let end = delta.start + delta.after.len();
+        self.splice_line_starts(delta.start..end, &delta.before);
         self.text.replace_range(delta.start..end, &delta.before);
         self.cursor = delta.cursor_before;
         self.anchor = delta.anchor_before;
@@ -1484,6 +1496,7 @@ impl TextBuffer {
         };
         self.bump_version();
         let end = delta.start + delta.before.len();
+        self.splice_line_starts(delta.start..end, &delta.after);
         self.text.replace_range(delta.start..end, &delta.after);
         self.cursor = delta.cursor_after;
         self.anchor = delta.anchor_after;
@@ -1702,15 +1715,14 @@ impl TextBuffer {
     /// 0 起点の行と、その行内 UTF-8 バイト位置を返す。
     pub fn line_byte_col(&self, offset: usize) -> (usize, usize) {
         let offset = snap_boundary(&self.text, offset.min(self.text.len()));
-        let prefix = &self.text[..offset];
-        let line = prefix.bytes().filter(|b| *b == b'\n').count();
-        let start = prefix.rfind('\n').map(|i| i + 1).unwrap_or(0);
-        (line, offset - start)
+        // 行頭索引の二分探索（#1660）。`[0] == 0` なので添字は必ず 1 以上になる
+        let line = self.line_starts.partition_point(|&start| start <= offset) - 1;
+        (line, offset - self.line_starts[line])
     }
 
     /// 行番号 + 行内バイト位置を文書全体の UTF-8 バイト位置へ変換する。
     pub fn offset_for_line_byte_col(&self, line: usize, byte_col: usize) -> usize {
-        let start = line_start_offset(&self.text, line).unwrap_or(self.text.len());
+        let start = self.line_start_of(line).unwrap_or(self.text.len());
         let end = line_end_offset(&self.text, start);
         snap_cursor(&self.text, (start + byte_col).min(end))
     }
@@ -1720,7 +1732,44 @@ impl TextBuffer {
     /// 文書の行数（#1658）。末尾が改行で終わるファイルは、その後ろの**空行も 1 行**と
     /// 数える（`"a\n"` は 2 行）。カーソルはそこへ置けるので、行として在る
     pub fn line_count(&self) -> usize {
-        self.text.bytes().filter(|byte| *byte == b'\n').count() + 1
+        self.line_starts.len()
+    }
+
+    /// 行頭のバイト位置の一覧（#1660）。`[行番号]` がその行の頭。
+    /// 描画が表示行ごとの頭を引くのに使う（本文を数え直して作らない）
+    pub fn line_starts(&self) -> &[usize] {
+        &self.line_starts
+    }
+
+    /// その行（0 始まり）の頭のバイト位置（#1660）。文書の範囲外なら `None`
+    fn line_start_of(&self, line: usize) -> Option<usize> {
+        self.line_starts.get(line).copied()
+    }
+
+    /// 本文の `range` を `replacement` へ置き換えるのに合わせて行頭索引を直す（#1660）。
+    ///
+    /// **`self.text` を書き換える直前に呼ぶ**（位置はどちらも置き換え前の本文で数える）。
+    /// 消える範囲の中にあった行頭を外し、`replacement` の改行ぶんを足して、
+    /// 後ろの行頭を長さの差だけずらす。ずらすのは O(後ろの行数) の足し算だけで、
+    /// 本文を読み直さない
+    fn splice_line_starts(&mut self, range: Range<usize>, replacement: &str) {
+        let first = self
+            .line_starts
+            .partition_point(|&start| start <= range.start);
+        let last = self
+            .line_starts
+            .partition_point(|&start| start <= range.end);
+        let inserted: Vec<usize> = replacement
+            .match_indices('\n')
+            .map(|(i, _)| range.start + i + 1)
+            .collect();
+        let added = inserted.len();
+        self.line_starts.splice(first..last, inserted);
+        let removed = range.end - range.start;
+        let added_bytes = replacement.len();
+        for start in &mut self.line_starts[first + added..] {
+            *start = *start + added_bytes - removed;
+        }
     }
 
     /// その行の長さ（バイト。**改行コードは含まない**。#1658）。
@@ -1728,7 +1777,7 @@ impl TextBuffer {
     /// CRLF の行では CR も含めない = 桁の上限が CR の手前になるので、
     /// 「CR と LF のあいだ」を指す桁は範囲外として弾かれる（#1650 の契約）
     fn line_span(&self, line: usize) -> Option<Range<usize>> {
-        let start = line_start_offset(&self.text, line)?;
+        let start = self.line_start_of(line)?;
         Some(start..line_end_offset(&self.text, start))
     }
 
@@ -1918,7 +1967,7 @@ impl TextBuffer {
         if target_line == line {
             return self.cursor;
         }
-        let Some(start) = line_start_offset(&self.text, target_line) else {
+        let Some(start) = self.line_start_of(target_line) else {
             return self.cursor;
         };
         let line_text = &self.text[start..self.line_end(start)];
@@ -2075,11 +2124,11 @@ impl Lowered {
     }
 }
 
-fn line_start_offset(text: &str, target: usize) -> Option<usize> {
-    if target == 0 {
-        return Some(0);
-    }
-    text.match_indices('\n').nth(target - 1).map(|(i, _)| i + 1)
+/// 本文から行頭索引を作る（#1660。開いたときに 1 回だけ。以後は差分で追従する）
+fn compute_line_starts(text: &str) -> Vec<usize> {
+    std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+        .collect()
 }
 
 fn snap_boundary(text: &str, mut offset: usize) -> usize {
@@ -3798,6 +3847,90 @@ mod tests {
             // 2 周目も同じ（状態が壊れていない）
             while buffer.undo() {}
             assert_eq!(buffer.text().as_bytes(), original.as_bytes());
+        }
+    }
+
+    // --- #1660: 行頭索引 ---
+
+    /// 行・桁の素朴な換算（索引を使わない正解）
+    fn naive_line_byte_col(text: &str, offset: usize) -> (usize, usize) {
+        let prefix = &text[..offset];
+        let line = prefix.bytes().filter(|b| *b == b'\n').count();
+        let start = prefix.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        (line, offset - start)
+    }
+
+    #[test]
+    fn 行頭索引は編集_undo_redo_全文差し替えのあとも本文から作り直したものと一致する() {
+        let seeds = [
+            "",
+            "abc\ndef\n",
+            "a日本語\nz",
+            "l1\r\nl2\r\n日本\r\n",
+            "\n\n\n",
+        ];
+        for (i, original) in seeds.iter().enumerate() {
+            let mut rng = Rng(0x1660_0000 + i as u64);
+            let mut buffer = TextBuffer::from_text(path("index"), (*original).into());
+            for step in 0..400 {
+                buffer.set_clock_millis((step as u64) * 97);
+                let len = buffer.text().len();
+                let pos = if len == 0 { 0 } else { rng.below(len + 1) };
+                match rng.below(10) {
+                    0 => buffer.insert("a"),
+                    1 => buffer.insert("日本\n語\n"),
+                    2 => {
+                        buffer.set_cursor(pos, false);
+                        buffer.delete_backward();
+                    }
+                    3 => {
+                        buffer.set_cursor(pos, false);
+                        buffer.delete_forward();
+                    }
+                    4 => {
+                        buffer.set_cursor(pos, false);
+                        let end = if len == 0 { 0 } else { rng.below(len + 1) };
+                        buffer.set_cursor(end, true);
+                        buffer.insert("Z\r\nZ\n");
+                    }
+                    5 => buffer.set_text("全文\n差し替え\r\n".into()),
+                    6 => {
+                        let _ = buffer.replace_all("a", "\n");
+                    }
+                    7 => {
+                        buffer.undo();
+                    }
+                    8 => {
+                        buffer.redo();
+                    }
+                    _ => buffer.newline(),
+                }
+                assert_eq!(
+                    buffer.line_starts(),
+                    compute_line_starts(buffer.text()).as_slice(),
+                    "seed {i} step {step}: 行頭索引が本文とずれた"
+                );
+                assert_eq!(
+                    buffer.line_count(),
+                    buffer.text().bytes().filter(|b| *b == b'\n').count() + 1
+                );
+                // 行・桁の換算は素朴な数え方と一致する（文字の途中は手前の境界へ寄る）
+                let len = buffer.text().len();
+                let probe = if len == 0 { 0 } else { rng.below(len + 1) };
+                let snapped = snap_boundary(buffer.text(), probe);
+                let (line, col) = buffer.line_byte_col(probe);
+                assert_eq!(
+                    (line, col),
+                    naive_line_byte_col(buffer.text(), snapped),
+                    "seed {i} step {step}: line_byte_col({probe})"
+                );
+                // CR と LF のあいだは行末（CR の手前）へ寄せる契約（#1650）なので往復から外す
+                let between_crlf = buffer.text()[..snapped].ends_with('\r')
+                    && buffer.text()[snapped..].starts_with('\n');
+                if !between_crlf {
+                    assert_eq!(buffer.offset_for_line_byte_col(line, col), snapped);
+                }
+            }
         }
     }
 

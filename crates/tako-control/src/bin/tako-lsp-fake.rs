@@ -22,6 +22,7 @@
 //! | `die` | 起動直後に即死する（initialize を読まない） |
 //! | `no-goto` | 定義ジャンプの能力（`definitionProvider` 等）を申告しない（#1680） |
 //! | `loading` | initialized の後 `experimental/serverStatus`（`quiescent: false`）を送り、読み込み（既定 0.8 秒。`--loading-ms` / `TAKO_LSP_FAKE_LOADING_MS`）が済むまで定義ジャンプに空（`[]`）で答え、済んだら `quiescent: true` を送る（rust-analyzer の振る舞い。#1680） |
+//! | `full-sync` | `normal` と同じだが全文同期（`change: 1`）を申告する |
 //!
 //! `--diagnostics <file>` か `TAKO_LSP_FAKE_DIAGNOSTICS`（LSP の `Diagnostic` の JSON 配列）を
 //! 渡すと、didOpen と didChange のたびに**その配列をそのまま** publish する（#1679。
@@ -190,9 +191,12 @@ fn main() {
                 if scenario == "garbage" {
                     out.raw(b"Content-Length: 5\r\n\r\n{nope");
                 }
+                // `full-sync` は全文同期（change = 1）を申告する（#1660 の計測で
+                // 大きいファイルの 1 打鍵が全文を送るときの負荷を測る）
+                let change = if scenario == "full-sync" { 1 } else { 2 };
                 let mut capabilities = serde_json::json!({
                     "positionEncoding": "utf-16",
-                    "textDocumentSync": { "openClose": true, "change": 2 },
+                    "textDocumentSync": { "openClose": true, "change": change },
                 });
                 if scenario != "no-goto" {
                     for key in GOTO_PROVIDERS {
