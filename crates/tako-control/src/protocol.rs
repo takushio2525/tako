@@ -849,18 +849,34 @@ pub enum Request {
     PreviewUndo { pane: Option<u64> },
     /// redo（#195）
     PreviewRedo { pane: Option<u64> },
-    /// 検索（#195）。query を指定してヒット一覧を返す。direction で次/前を移動
+    /// 検索（#195）。query を指定してヒット一覧を返す。direction で次/前を移動。
+    ///
+    /// 条件（#1653）: `case_sensitive`（既定 true = 大文字小文字を区別する）と
+    /// `whole_word`（既定 false）。**query を渡したときは既定から組み直し、省略したときは
+    /// 今の検索の条件を引き継ぐ**（`tako_core::text_edit::SearchOptions::resolve`）。
+    /// 省略時は wire に現れない（引数が生える前の JSON とバイト一致）
     PreviewSearch {
         pane: Option<u64>,
         query: Option<String>,
         direction: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        case_sensitive: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        whole_word: Option<bool>,
     },
-    /// 置換（#195）。query に一致する箇所を replacement で置換。all=true で全置換
+    /// 置換（#195）。query に一致する箇所を replacement で置換。all=true で全置換。
+    ///
+    /// 条件（#1653）は検索と同じ 2 つで、**省略した項目は常に既定**（区別する・単語単位なし）。
+    /// 置換は 1 回ごとに query を持つので、画面の検索欄の状態を引き継がない
     PreviewReplace {
         pane: Option<u64>,
         query: String,
         replacement: String,
         all: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        case_sensitive: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        whole_word: Option<bool>,
     },
     /// 自動保存設定の取得・変更（#195）。enabled 省略時は状態取得のみ
     PreviewAutosave {

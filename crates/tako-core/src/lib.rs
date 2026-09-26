@@ -143,7 +143,8 @@ pub use terminal::{
     TermEvent, TerminalSession,
 };
 pub use text_edit::{
-    CursorMovement, DeleteMotion, IndentUnit, LineEnding, SearchHit, TextBuffer, TextEditError,
+    CursorMovement, DeleteMotion, IndentUnit, LineEnding, SearchHit, SearchOptions, TextBuffer,
+    TextEditError,
 };
 pub use theme::{Rgb, Theme};
 pub use tmux::{TmuxSession, TmuxView, TmuxWindow};

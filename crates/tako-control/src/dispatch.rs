@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tako_core::jump_history::{JumpHistory, JumpLocation, Liveness};
-use tako_core::text_edit::TextPosition;
+use tako_core::text_edit::{SearchOptions, TextPosition};
 use tako_core::{
     CommandState, Pane, PaneId, PaneNode, PaneOrigin, PaneTreeError, PreviewViewUpdate,
     PreviewZoomCommand, Rect, SpawnCommand, SpawnOptions, SplitAxis, SplitDirection, TabId,
@@ -1113,6 +1113,17 @@ fn preview_edit_reply(host: &dyn ControlHost, target: PaneId) -> Value {
         out["viewport"] = viewport;
     }
     out
+}
+
+/// 検索・置換の応答へ、実際に使った条件を載せる（#1653）。
+///
+/// クエリを省略した検索は画面の条件を引き継ぐので、呼び手は応答を見るまで
+/// 「区別したのか」を知らない。GUI・CLI・MCP のどれから来ても同じ形で返す
+fn with_search_options(result: &mut Value, options: SearchOptions) {
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert("case_sensitive".into(), options.case_sensitive.into());
+        obj.insert("whole_word".into(), options.whole_word.into());
+    }
 }
 
 fn dispatch_inner(
@@ -2979,11 +2990,19 @@ fn dispatch_inner(
             pane,
             query,
             direction,
+            case_sensitive,
+            whole_word,
         } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
-            let result = host
-                .preview_search(target, query, direction.as_deref())
+            // 条件の決め方は tako-core の 1 実装（#1653）。query を渡せば既定から、
+            // 省略すれば今の検索の条件から組む
+            let current = host.preview_search_options(target).unwrap_or_default();
+            let options =
+                SearchOptions::resolve(current, query.is_some(), case_sensitive, whole_word);
+            let mut result = host
+                .preview_search(target, query, options, direction.as_deref())
                 .map_err(DispatchError::Operation)?;
+            with_search_options(&mut result, options);
             Ok(json!({
                 "pane": target.as_u64(),
                 "search": result,
@@ -2994,11 +3013,16 @@ fn dispatch_inner(
             query,
             replacement,
             all,
+            case_sensitive,
+            whole_word,
         } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
-            let result = host
-                .preview_replace(target, &query, &replacement, all.unwrap_or(false))
+            // 置換は画面の検索欄の条件を引き継がない = 省略した項目は常に既定（#1653）
+            let options = SearchOptions::DEFAULT.with(case_sensitive, whole_word);
+            let mut result = host
+                .preview_replace(target, &query, &replacement, all.unwrap_or(false), options)
                 .map_err(DispatchError::Operation)?;
+            with_search_options(&mut result, options);
             let mut out = preview_edit_reply(host, target);
             out["replace"] = result;
             Ok(out)
@@ -15998,6 +16022,8 @@ mod tests {
         /// 版・カーソル・行桁の解釈を GUI と同じ 1 実装で確かめるため
         preview_edits:
             std::collections::HashMap<u64, (bool, bool, tako_core::text_edit::TextBuffer)>,
+        /// 検索欄の状態（#1653）: (クエリ, 条件)。GUI の `EditState` の検索部分の写し
+        preview_search: std::collections::HashMap<u64, (String, SearchOptions)>,
         collapsed: std::collections::HashSet<u64>,
         /// ピン留め: (group, id)
         pins: Vec<(bool, u64)>,
@@ -16095,6 +16121,7 @@ mod tests {
                 preview_outlines: std::collections::HashMap::new(),
                 last_outline_target: None,
                 preview_edits: std::collections::HashMap::new(),
+                preview_search: std::collections::HashMap::new(),
                 collapsed: std::collections::HashSet::new(),
                 pins: Vec::new(),
                 stale_pane_map: std::collections::HashMap::new(),
@@ -16676,6 +16703,52 @@ mod tests {
         }
         fn preview_document(&self, pane: PaneId) -> Option<serde_json::Value> {
             Some(self.preview_edits.get(&pane.as_u64())?.2.document_state())
+        }
+        fn preview_search_options(&self, pane: PaneId) -> Option<SearchOptions> {
+            self.preview_search.get(&pane.as_u64()).map(|(_, o)| *o)
+        }
+        /// #1653: 本物の `TextBuffer::find_all` で数える（条件の解釈を GUI と同じ 1 実装で見る）
+        fn preview_search(
+            &mut self,
+            pane: PaneId,
+            query: Option<String>,
+            options: SearchOptions,
+            _direction: Option<&str>,
+        ) -> Result<serde_json::Value, String> {
+            let buffer = &self
+                .preview_edits
+                .get(&pane.as_u64())
+                .ok_or_else(|| "編集セッションがない".to_string())?
+                .2;
+            let state = self
+                .preview_search
+                .entry(pane.as_u64())
+                .or_insert_with(|| (String::new(), SearchOptions::DEFAULT));
+            if let Some(query) = query {
+                state.0 = query;
+            }
+            state.1 = options;
+            let total = buffer.find_all(&state.0, options).len();
+            Ok(json!({ "query": state.0, "total": total }))
+        }
+        fn preview_replace(
+            &mut self,
+            pane: PaneId,
+            query: &str,
+            replacement: &str,
+            all: bool,
+            options: SearchOptions,
+        ) -> Result<serde_json::Value, String> {
+            let state = self
+                .preview_edits
+                .get_mut(&pane.as_u64())
+                .ok_or_else(|| "編集セッションがない".to_string())?;
+            let replaced = if all {
+                state.2.replace_all(query, replacement, options)
+            } else {
+                state.2.replace_next(query, replacement, options)
+            };
+            Ok(json!({ "replaced": replaced }))
         }
         fn preview_undo(&mut self, pane: PaneId) -> Result<bool, String> {
             let state = self
@@ -20253,6 +20326,107 @@ mod tests {
         )
         .unwrap();
         pane
+    }
+
+    /// #1653: 検索・置換の条件は dispatch の 1 実装（`SearchOptions::resolve`）で決まる。
+    ///
+    /// - 省略すると**区別する**（Issue の本体。`replace_all("value"→"item")` が型名を潰さない）
+    /// - クエリを省略した検索は今の条件を引き継ぎ、新しいクエリは既定から組み直す
+    /// - 置換は検索欄の条件を引き継がない（1 回ごとに query を持つので）
+    /// - 応答には実際に使った条件が載る（呼び手が「区別したのか」を読める）
+    #[test]
+    fn issue1653_検索と置換は省略すると大文字小文字を区別する() {
+        let dir = std::env::temp_dir().join(format!("tako-dispatch-1653-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut host = MockHost::new();
+        let text = "let value = Value::new();\nvalue VALUE values\n";
+        let pane = preview_with_text(&mut host, &dir, text);
+        let search = |host: &mut MockHost,
+                      query: Option<&str>,
+                      case_sensitive: Option<bool>,
+                      whole_word: Option<bool>| {
+            let out = dispatch(
+                host,
+                Request::PreviewSearch {
+                    pane: Some(pane),
+                    query: query.map(str::to_string),
+                    direction: None,
+                    case_sensitive,
+                    whole_word,
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+            let s = &out["search"];
+            (
+                s["total"].as_u64().unwrap(),
+                s["case_sensitive"].as_bool().unwrap(),
+                s["whole_word"].as_bool().unwrap(),
+            )
+        };
+        // 省略 = 区別する（value / value / values の 3 件。Value と VALUE は当たらない）
+        assert_eq!(
+            search(&mut host, Some("value"), None, None),
+            (3, true, false)
+        );
+        // クエリを省略して条件だけ変える
+        assert_eq!(
+            search(&mut host, None, Some(false), None),
+            (5, false, false)
+        );
+        // 区別しない + 単語単位: value / Value / value / VALUE（values は外れる）
+        assert_eq!(search(&mut host, None, None, Some(true)), (4, false, true));
+        // クエリも条件も省略（次へ / 前へ）= 今の条件を引き継ぐ
+        assert_eq!(search(&mut host, None, None, None), (4, false, true));
+        // 新しいクエリは既定から組み直す（画面の条件を黙って引き継がない）
+        assert_eq!(
+            search(&mut host, Some("value"), None, None),
+            (3, true, false)
+        );
+
+        let replace = |host: &mut MockHost,
+                       all: Option<bool>,
+                       case_sensitive: Option<bool>,
+                       whole_word: Option<bool>| {
+            dispatch(
+                host,
+                Request::PreviewReplace {
+                    pane: Some(pane),
+                    query: "value".into(),
+                    replacement: "item".into(),
+                    all,
+                    case_sensitive,
+                    whole_word,
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap()
+        };
+        // 検索欄を「区別しない」にしておいても、置換の省略は既定（区別する）
+        search(&mut host, None, Some(false), None);
+        let out = replace(&mut host, Some(true), None, None);
+        assert_eq!(out["replace"]["replaced"], 3);
+        assert_eq!(out["replace"]["case_sensitive"], true);
+        assert_eq!(out["replace"]["whole_word"], false);
+        let body = |host: &MockHost| host.preview_edits[&pane].2.text().to_string();
+        assert_eq!(
+            body(&host),
+            "let item = Value::new();\nitem VALUE items\n",
+            "既定の全置換が型名（Value）まで書き換えた"
+        );
+        assert!(out["document"]["version"].as_u64().is_some(), "{out}");
+        // 区別しない + 単語単位の 1 件置換: カーソル（先頭）以降の最初 = Value
+        host.preview_edits
+            .get_mut(&pane)
+            .unwrap()
+            .2
+            .set_cursor(0, false);
+        let out = replace(&mut host, None, Some(false), Some(true));
+        assert_eq!(out["replace"]["replaced"], 1);
+        assert_eq!(out["replace"]["case_sensitive"], false);
+        assert_eq!(body(&host), "let item = item::new();\nitem VALUE items\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn range_request(pane: u64, start: (usize, usize), end: (usize, usize), text: &str) -> Request {

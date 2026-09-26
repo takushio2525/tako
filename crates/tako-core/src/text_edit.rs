@@ -7,7 +7,10 @@
 //! undo/redo（#195 / #1651）: 積むのは**差分**（置き換えた範囲 + 置換前後の文字列）で、
 //! 連続した打鍵・連続した削除は 1 塊にまとまる（`hello` は undo 1 回で消える）。
 //! 上限は「操作数」と「履歴のバイト数」の**先に効いたほう**。
-//! 検索（#195）: バイト位置ベースのインクリメンタル検索と置換。
+//! 検索（#195 / #1653）: バイト位置ベースのインクリメンタル検索と置換。条件は
+//! [`SearchOptions`] で、**既定は大文字小文字を区別する**（コード編集で `value` と `Value` を
+//! 同じ語として扱うと全置換がデータを壊す）。区別しない検索の小文字写しは検索したときだけ作り、
+//! 本文が変わるまで使い回す。
 //!
 //! 改行コード（#1650）: バッファは**ファイルのバイト列をそのまま**持つ。`\r\n` は
 //! 「1 つの行区切り」として扱い、カーソルは CR と LF のあいだに入らない。新しく足す
@@ -19,6 +22,7 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -549,6 +553,78 @@ pub struct SearchHit {
     pub end: usize,
 }
 
+/// 検索・置換の条件（#1653）。
+///
+/// **既定は「大文字小文字を区別する・単語単位でない」**。コード編集では `value`（変数）と
+/// `Value`（型）は別の名前なので、区別しないのを既定にすると
+/// `replace_all("value", "item")` が `let value = Value::new();` を
+/// `let item = item::new();` に書き換える（#1653 で実測したデータ破壊）。
+/// GUI の検索欄・CLI `tako edit search|replace`・MCP `tako_preview_search|replace` が
+/// どれもこの既定を使う
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchOptions {
+    /// 大文字小文字を区別する（既定 true）
+    pub case_sensitive: bool,
+    /// 単語単位（一致の前後が単語の文字に続かない位置だけを当てる。既定 false）
+    pub whole_word: bool,
+}
+
+impl SearchOptions {
+    /// 既定（区別する・単語単位でない）
+    pub const DEFAULT: Self = Self {
+        case_sensitive: true,
+        whole_word: false,
+    };
+
+    /// 指定のあった項目だけを差し替える（`None` の項目はそのまま）
+    pub fn with(self, case_sensitive: Option<bool>, whole_word: Option<bool>) -> Self {
+        Self {
+            case_sensitive: case_sensitive.unwrap_or(self.case_sensitive),
+            whole_word: whole_word.unwrap_or(self.whole_word),
+        }
+    }
+
+    /// 検索の指示（CLI / MCP / GUI）から、使う条件を決める（#1653）。
+    ///
+    /// - **新しいクエリを渡した**: 既定から組み直す = 省略した項目は既定
+    ///   （区別する・単語単位でない）。呼び手が前の検索の条件を知らなくても結果が決まる
+    /// - **クエリを省略した**（今の検索の中で次へ / 前へ動く・条件だけ変える）: 今の条件を
+    ///   引き継ぐ。`tako edit search --direction prev` が画面のトグルを黙って戻さない
+    pub fn resolve(
+        current: Self,
+        new_query: bool,
+        case_sensitive: Option<bool>,
+        whole_word: Option<bool>,
+    ) -> Self {
+        let base = if new_query { Self::DEFAULT } else { current };
+        base.with(case_sensitive, whole_word)
+    }
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// `from` 以降で最初のヒット（なければ先頭へラップ）。
+///
+/// ヒットの一覧は 1 回の [`TextBuffer::find_all`] で得たものを使い回す（#1653。
+/// 次へ / 前へのたびに全文を探し直さない）
+pub fn next_hit(hits: &[SearchHit], from: usize) -> Option<&SearchHit> {
+    hits.iter()
+        .find(|h| h.start >= from)
+        .or_else(|| hits.first())
+}
+
+/// `from` より前で最後のヒット（なければ末尾へラップ）
+pub fn prev_hit(hits: &[SearchHit], from: usize) -> Option<&SearchHit> {
+    hits.iter()
+        .rev()
+        .find(|h| h.start < from)
+        .or_else(|| hits.last())
+}
+
 /// 文書内の 1 点を行と桁で表す（#1658）。
 ///
 /// **行は 1 始まり・桁は 0 始まりの UTF-8 バイト**。この 2 つの向きが違うのは
@@ -675,6 +751,42 @@ pub struct TextBuffer {
     /// 本文ではなく「どれだけ見えているか」なので GUI が測って渡す
     /// （Zed の `Editor::visible_line_count` と同じ置き方）。`None` は未計測
     viewport_lines: Option<usize>,
+    /// 大文字小文字を区別しない検索のための小文字写し（#1653）
+    fold: FoldCache,
+}
+
+/// 大文字小文字を区別しない検索のための小文字写しの置き場（#1653）。
+///
+/// 写しを作るのは**区別しない検索をしたときだけ**で、本文が変わるまで使い回す。
+/// 修正前は検索欄の 1 打鍵ごとに全文の写しを 2 回（`find_all` と `find_next`）作り直していた
+/// （release 実測: 1 MB で 1 打鍵 4.4ms）。捨てるのは版が進むとき
+/// （[`TextBuffer::bump_version`]。本文が変わる経路はすべてそこを通る）と
+/// [`TextBuffer::release_search_cache`] を呼んだとき
+#[derive(Default)]
+struct FoldCache {
+    lowered: OnceLock<Lowered>,
+    /// 写しを作った回数（#1653）。「1 打鍵ごとに作り直さない」を時間ではなく回数で固定する
+    builds: AtomicUsize,
+}
+
+impl Clone for FoldCache {
+    /// 写しは本文から作り直せる控えなので複製しない（1 MB の本文なら 1 MB を余計に抱える）
+    fn clone(&self) -> Self {
+        Self {
+            lowered: OnceLock::new(),
+            builds: AtomicUsize::new(self.builds.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+impl std::fmt::Debug for FoldCache {
+    /// 写しの中身は出さない（本文と同じ大きさがある）
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FoldCache")
+            .field("built", &self.lowered.get().is_some())
+            .field("builds", &self.builds.load(Ordering::Relaxed))
+            .finish()
+    }
 }
 
 impl TextBuffer {
@@ -696,6 +808,7 @@ impl TextBuffer {
             version: 0,
             goal_column: None,
             viewport_lines: None,
+            fold: FoldCache::default(),
         })
     }
 
@@ -716,6 +829,7 @@ impl TextBuffer {
             version: 0,
             goal_column: None,
             viewport_lines: None,
+            fold: FoldCache::default(),
         }
     }
 
@@ -1166,6 +1280,9 @@ impl TextBuffer {
     fn bump_version(&mut self) {
         // 飽和させる（1 秒 1000 編集でも 5 億年かかる桁だが、巻き戻さないことを型で示す）
         self.version = self.version.saturating_add(1);
+        // 本文が変わったので、区別しない検索の小文字写しは古くなった（#1653）。
+        // 本文が変わる経路はすべてここを通るので、捨てる場所もここ 1 つ
+        self.fold.lowered.take();
     }
 
     /// 文書の版（#1658）。編集のたびに増える
@@ -1387,24 +1504,43 @@ impl TextBuffer {
 
     // --- 検索・置換 ---
 
-    /// 大文字小文字を区別しない全ヒットを返す
+    /// 条件 `options` に合う全ヒットを返す（#195 / #1653）。
     ///
-    /// 返す位置は**元テキストのバイト位置**。小文字化はバイト長を変えうる
-    /// （`İ` U+0130 は 2 → 3 バイト、`ẞ` U+1E9E は 3 → 2 バイト）ので、
-    /// 小文字化した写しのバイト位置をそのまま元テキストの位置として使うとずれる（#1016）。
-    /// 本文全体のバイト長が一致していても安全ではない（`İ` と `ẞ` が両方あると
-    /// 伸縮が打ち消しあって総和だけ一致し、途中の位置は食い違う）。
+    /// 返す位置は**元テキストのバイト位置**で、常に文字境界に載る。
     ///
-    /// そこで探索そのものは小文字化した写しに対する高速な部分文字列探索のまま残し、
-    /// 見つかった位置を [`Lowered::to_original`] で元テキストへ戻す。
-    /// 戻せない位置（展開された文字の途中で始まる／終わる一致）はヒットにしない。
-    pub fn find_all(&self, query: &str) -> Vec<SearchHit> {
-        let lower_query = lowercase_per_char(query);
-        if lower_query.is_empty() {
+    /// - **区別する**（既定）: 本文そのものを探す。小文字写しは作らない
+    /// - **区別しない**: 小文字写し（[`Self::folded`]）を探し、見つかった位置を
+    ///   [`Lowered::to_original`] で元テキストへ戻す。小文字化はバイト長を変えうる
+    ///   （`İ` U+0130 は 2 → 3 バイト、`ẞ` U+1E9E は 3 → 2 バイト）ので、写しの位置を
+    ///   そのまま元テキストの位置として使うとずれる（#1016）。本文全体のバイト長が
+    ///   一致していても安全ではない（伸縮が打ち消しあって総和だけ一致し、途中は食い違う）。
+    ///   戻せない位置（展開された文字の途中で始まる／終わる一致）はヒットにしない
+    /// - **単語単位**: 一致の前後を元テキストで確かめる（[`at_word_boundary`]）。
+    ///   外れた候補は 1 文字だけ進めて探し直すので、`xfoo foo` の 2 つ目を取りこぼさない
+    pub fn find_all(&self, query: &str, options: SearchOptions) -> Vec<SearchHit> {
+        if query.is_empty() {
             return Vec::new();
         }
-        let lowered = Lowered::build(&self.text);
+        let accept = |start: usize, end: usize| {
+            !options.whole_word || at_word_boundary(&self.text, start, end)
+        };
         let mut hits = Vec::new();
+        if options.case_sensitive {
+            let mut cursor = 0;
+            while let Some(pos) = self.text[cursor..].find(query) {
+                let start = cursor + pos;
+                let end = start + query.len();
+                if accept(start, end) {
+                    hits.push(SearchHit { start, end });
+                    cursor = end;
+                } else {
+                    cursor = start + char_len_at(&self.text, start);
+                }
+            }
+            return hits;
+        }
+        let lower_query = lowercase_per_char(query);
+        let lowered = self.folded();
         let mut cursor = 0;
         while let Some(pos) = lowered.text[cursor..].find(&lower_query) {
             let lower_start = cursor + pos;
@@ -1413,48 +1549,40 @@ impl TextBuffer {
                 lowered.to_original(lower_start),
                 lowered.to_original(lower_end),
             ) {
-                (Some(start), Some(end)) => {
+                (Some(start), Some(end)) if accept(start, end) => {
                     hits.push(SearchHit { start, end });
                     cursor = lower_end;
                 }
-                // 元テキストに対応する位置が無い一致は返せない
-                // （返すと slice が文字境界を割って panic する）。次の文字境界から探し直す
-                _ => {
-                    let step = lowered.text[lower_start..]
-                        .chars()
-                        .next()
-                        .map(char::len_utf8)
-                        .unwrap_or(1);
-                    cursor = lower_start + step;
-                }
+                // 元テキストに対応する位置が無い一致は返せない（返すと slice が文字境界を
+                // 割って panic する）。単語の切れ目に載らない一致も返さない。
+                // どちらも次の文字境界から探し直す
+                _ => cursor = lower_start + char_len_at(&lowered.text, lower_start),
             }
         }
         hits
     }
 
-    /// `from` 以降で最初のヒットを返す（ラップ検索）
-    pub fn find_next(&self, query: &str, from: usize) -> Option<SearchHit> {
-        let hits = self.find_all(query);
-        if hits.is_empty() {
-            return None;
-        }
-        hits.iter()
-            .find(|h| h.start >= from)
-            .or_else(|| hits.first())
-            .cloned()
+    /// 区別しない検索に使う小文字写し（#1653）。**作るのはここだけ**。
+    ///
+    /// 本文が変わるまで使い回すので、検索欄の打鍵・次へ / 前へでは作り直さない
+    fn folded(&self) -> &Lowered {
+        self.fold.lowered.get_or_init(|| {
+            self.fold.builds.fetch_add(1, Ordering::Relaxed);
+            Lowered::build(&self.text)
+        })
     }
 
-    /// `from` より前で最後のヒットを返す（逆ラップ検索）
-    pub fn find_prev(&self, query: &str, from: usize) -> Option<SearchHit> {
-        let hits = self.find_all(query);
-        if hits.is_empty() {
-            return None;
-        }
-        hits.iter()
-            .rev()
-            .find(|h| h.start < from)
-            .or_else(|| hits.last())
-            .cloned()
+    /// 区別しない検索の小文字写しを作った回数（#1653。計測用）。
+    ///
+    /// 「検索欄の 1 打鍵ごとに全文を写し直さない」を時間ではなく回数で確かめる口
+    /// （`.agent/conventions.md`「効果を測る単体テストは実時間で比べない」）
+    pub fn search_fold_builds(&self) -> usize {
+        self.fold.builds.load(Ordering::Relaxed)
+    }
+
+    /// 小文字写しを手放す（#1653）。検索欄を閉じたときに呼ぶ（本文と同じ大きさがある）
+    pub fn release_search_cache(&mut self) {
+        self.fold.lowered.take();
     }
 
     /// 指定範囲を置換文字列で置き換える（1 件置換）。
@@ -1472,9 +1600,25 @@ impl TextBuffer {
         });
     }
 
+    /// カーソル以降で最初のヒット（なければ先頭へラップ）を 1 件置換する（#195 / #1653）。
+    /// 戻り値は置換件数（0 か 1）
+    pub fn replace_next(
+        &mut self,
+        query: &str,
+        replacement: &str,
+        options: SearchOptions,
+    ) -> usize {
+        let hits = self.find_all(query, options);
+        let Some(hit) = next_hit(&hits, self.cursor).cloned() else {
+            return 0;
+        };
+        self.replace_range(hit.start..hit.end, replacement);
+        1
+    }
+
     /// 全置換。戻り値は置換件数
-    pub fn replace_all(&mut self, query: &str, replacement: &str) -> usize {
-        let hits = self.find_all(query);
+    pub fn replace_all(&mut self, query: &str, replacement: &str, options: SearchOptions) -> usize {
+        let hits = self.find_all(query, options);
         if hits.is_empty() {
             return 0;
         }
@@ -1812,6 +1956,36 @@ impl TextBuffer {
     fn set_clock_millis(&mut self, millis: u64) {
         self.manual_millis = Some(millis);
     }
+}
+
+/// `offset` から始まる 1 文字のバイト長（末尾なら 1。探し直しの歩幅に使う）
+fn char_len_at(text: &str, offset: usize) -> usize {
+    text[offset..]
+        .chars()
+        .next()
+        .map(char::len_utf8)
+        .unwrap_or(1)
+}
+
+/// 単語単位の検索で「単語の文字」とみなすか（#1653）。
+///
+/// 識別子を作る文字 = Unicode の英数字と `_`。**漢字・かなも単語の文字に数える**ので、
+/// `値value` の中の `value` は単語単位では当たらない（Rust などの識別子として 1 語だから）。
+/// 日本語の文の中の語は空白で区切られないので、単語単位では切り出せない（区切るのは
+/// 句読点・空白・記号だけ）。語で探したいときは単語単位を外す
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// `start..end` の一致が単語の切れ目に載っているか（#1653）。
+///
+/// 端の文字が単語の文字でないとき（`.foo` や `foo(` をクエリにしたとき）は、その側の
+/// 隣は問わない（VS Code の「単語単位」と同じ判定）
+fn at_word_boundary(text: &str, start: usize, end: usize) -> bool {
+    let matched = &text[start..end];
+    let joined = |outer: Option<char>, inner: Option<char>| matches!((outer, inner), (Some(o), Some(i)) if is_word_char(o) && is_word_char(i));
+    !joined(text[..start].chars().next_back(), matched.chars().next())
+        && !joined(text[end..].chars().next(), matched.chars().next_back())
 }
 
 /// 1 文字ずつ小文字化して連結する（#1016）
@@ -2165,6 +2339,12 @@ mod tests {
         std::env::temp_dir().join(format!("tako-text-edit-{}-{name}", std::process::id()))
     }
 
+    /// 大文字小文字を区別しない検索（#1653 で既定ではなくなった側。#1016 の検査はこちらを通す）
+    const IGNORE_CASE: SearchOptions = SearchOptions {
+        case_sensitive: false,
+        whole_word: false,
+    };
+
     #[test]
     fn utf8の入力削除とカーソル移動は文字境界を保つ() {
         let mut buffer = TextBuffer::from_text(path("utf8"), "a日本語z".into());
@@ -2331,39 +2511,44 @@ mod tests {
     }
 
     #[test]
-    fn find_allで大文字小文字を無視して検索できる() {
+    fn 区別しない検索は大文字小文字を無視して当てる() {
         let buffer = TextBuffer::from_text(path("search"), "Hello hello HELLO".into());
-        let hits = buffer.find_all("hello");
+        let hits = buffer.find_all("hello", IGNORE_CASE);
         assert_eq!(hits.len(), 3);
         assert_eq!(hits[0].start, 0);
         assert_eq!(hits[0].end, 5);
     }
 
     #[test]
-    fn find_nextはラップ検索する() {
+    fn next_hitはラップ検索する() {
         let buffer = TextBuffer::from_text(path("search-wrap"), "aXbXc".into());
-        let hit = buffer.find_next("x", 3).unwrap();
+        let hits = buffer.find_all("x", IGNORE_CASE);
+        let hit = next_hit(&hits, 3).unwrap();
         assert_eq!(hit.start, 3);
         // from を末尾にするとラップして先頭へ
-        let hit = buffer.find_next("x", 5).unwrap();
+        let hit = next_hit(&hits, 5).unwrap();
         assert_eq!(hit.start, 1);
     }
 
     #[test]
-    fn find_prevは逆ラップ検索する() {
+    fn prev_hitは逆ラップ検索する() {
         let buffer = TextBuffer::from_text(path("search-prev"), "aXbXc".into());
-        let hit = buffer.find_prev("x", 2).unwrap();
+        let hits = buffer.find_all("x", IGNORE_CASE);
+        let hit = prev_hit(&hits, 2).unwrap();
         assert_eq!(hit.start, 1);
         // from を先頭にするとラップして末尾へ
-        let hit = buffer.find_prev("x", 0).unwrap();
+        let hit = prev_hit(&hits, 0).unwrap();
         assert_eq!(hit.start, 3);
     }
 
     #[test]
     fn 空クエリの検索は空を返す() {
         let buffer = TextBuffer::from_text(path("search-empty"), "abc".into());
-        assert!(buffer.find_all("").is_empty());
-        assert!(buffer.find_next("", 0).is_none());
+        for options in [SearchOptions::DEFAULT, IGNORE_CASE] {
+            let hits = buffer.find_all("", options);
+            assert!(hits.is_empty());
+            assert!(next_hit(&hits, 0).is_none());
+        }
     }
 
     #[test]
@@ -2378,7 +2563,7 @@ mod tests {
     #[test]
     fn replace_allは全件を置き換える() {
         let mut buffer = TextBuffer::from_text(path("replace-all"), "aXbXcX".into());
-        let count = buffer.replace_all("x", "YY");
+        let count = buffer.replace_all("x", "YY", IGNORE_CASE);
         assert_eq!(count, 3);
         assert_eq!(buffer.text(), "aYYbYYcYY");
         assert!(buffer.undo());
@@ -2423,15 +2608,18 @@ mod tests {
     #[test]
     fn 空バッファへの検索は空を返す() {
         let buffer = TextBuffer::from_text(path("edge-empty-search"), String::new());
-        assert!(buffer.find_all("abc").is_empty());
-        assert!(buffer.find_next("abc", 0).is_none());
-        assert!(buffer.find_prev("abc", 0).is_none());
+        for options in [SearchOptions::DEFAULT, IGNORE_CASE] {
+            let hits = buffer.find_all("abc", options);
+            assert!(hits.is_empty());
+            assert!(next_hit(&hits, 0).is_none());
+            assert!(prev_hit(&hits, 0).is_none());
+        }
     }
 
     #[test]
     fn 空バッファへの全置換は0件を返す() {
         let mut buffer = TextBuffer::from_text(path("edge-empty-replace"), String::new());
-        assert_eq!(buffer.replace_all("a", "b"), 0);
+        assert_eq!(buffer.replace_all("a", "b", SearchOptions::DEFAULT), 0);
     }
 
     #[test]
@@ -2455,9 +2643,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let buffer = TextBuffer::from_text(path("edge-large-search"), text);
-        let hits = buffer.find_all("テスト行");
+        let hits = buffer.find_all("テスト行", SearchOptions::DEFAULT);
         assert_eq!(hits.len(), 5_000);
-        let hit = buffer.find_next("4999", 0).unwrap();
+        let hits = buffer.find_all("4999", SearchOptions::DEFAULT);
+        let hit = next_hit(&hits, 0).unwrap();
         assert!(hit.start > 0);
     }
 
@@ -2527,7 +2716,7 @@ mod tests {
         // バイト位置を元テキストの位置として流用すると、後続のヒットがずれる
         let text = "İstanbul needle";
         let buffer = TextBuffer::from_text(path("u1016-grow"), text.into());
-        let hits = buffer.find_all("needle");
+        let hits = buffer.find_all("needle", IGNORE_CASE);
         assert_eq!(hits.len(), 1);
         let expected = text.find("needle").unwrap();
         assert_eq!(hits[0].start, expected);
@@ -2540,7 +2729,7 @@ mod tests {
         // `ẞ`（U+1E9E）は小文字化で 3 → 2 バイトに縮む
         let text = "ẞ needle";
         let buffer = TextBuffer::from_text(path("u1016-shrink"), text.into());
-        let hits = buffer.find_all("needle");
+        let hits = buffer.find_all("needle", IGNORE_CASE);
         assert_eq!(hits.len(), 1);
         let expected = text.find("needle").unwrap();
         assert_eq!(hits[0].start, expected);
@@ -2554,7 +2743,7 @@ mod tests {
         let text = "İ needle ẞ";
         assert_eq!(text.len(), text.to_lowercase().len());
         let buffer = TextBuffer::from_text(path("u1016-cancel"), text.into());
-        let hits = buffer.find_all("needle");
+        let hits = buffer.find_all("needle", IGNORE_CASE);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].start, text.find("needle").unwrap());
     }
@@ -2563,7 +2752,7 @@ mod tests {
     fn 行頭と行末と複数ヒットでも位置が元テキスト基準になる() {
         let text = "needle İ\nneedle İ needle";
         let buffer = TextBuffer::from_text(path("u1016-multi"), text.into());
-        let hits = buffer.find_all("NEEDLE");
+        let hits = buffer.find_all("NEEDLE", IGNORE_CASE);
         assert_eq!(hits.len(), 3);
         let expected: Vec<usize> = text.match_indices("needle").map(|(i, _)| i).collect();
         assert_eq!(
@@ -2582,7 +2771,7 @@ mod tests {
         // 終端に「元クエリのバイト長」を足すと本文の範囲外を指し、置換が panic する
         let text = "İ";
         let mut buffer = TextBuffer::from_text(path("u1016-range"), text.into());
-        let hits = buffer.find_all("i\u{307}");
+        let hits = buffer.find_all("i\u{307}", IGNORE_CASE);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].start, 0);
         assert_eq!(
@@ -2599,7 +2788,7 @@ mod tests {
         // `İ` の小文字化は `i` + U+0307。U+0307 から始まるクエリは元テキストの
         // 文字境界に対応しないので、返せる位置が存在しない（返すと slice が panic する）
         let buffer = TextBuffer::from_text(path("u1016-mid"), "İstanbul".into());
-        assert!(buffer.find_all("\u{307}stanbul").is_empty());
+        assert!(buffer.find_all("\u{307}stanbul", IGNORE_CASE).is_empty());
     }
 
     #[test]
@@ -2608,7 +2797,7 @@ mod tests {
         // クエリを別々に丸ごと小文字化すると同じ文字列同士が一致しないことがある
         let text = "ΟΔΟΣΧ";
         let buffer = TextBuffer::from_text(path("u1016-sigma"), text.into());
-        let hits = buffer.find_all("ΟΔΟΣ");
+        let hits = buffer.find_all("ΟΔΟΣ", IGNORE_CASE);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].start, 0);
         assert_eq!(&text[hits[0].start..hits[0].end], "ΟΔΟΣ");
@@ -2618,7 +2807,7 @@ mod tests {
     fn 小文字化で伸びる文字を含む本文を壊さずに全置換できる() {
         let mut buffer =
             TextBuffer::from_text(path("u1016-replace-all"), "İstanbul foo İzmir foo".into());
-        let count = buffer.replace_all("foo", "bar");
+        let count = buffer.replace_all("foo", "bar", IGNORE_CASE);
         assert_eq!(count, 2);
         assert_eq!(buffer.text(), "İstanbul bar İzmir bar");
         assert!(buffer.undo());
@@ -2628,7 +2817,7 @@ mod tests {
     #[test]
     fn 伸びる文字そのものを全置換しても本文が壊れない() {
         let mut buffer = TextBuffer::from_text(path("u1016-replace-char"), "aİbİc".into());
-        let count = buffer.replace_all("İ", "-");
+        let count = buffer.replace_all("İ", "-", IGNORE_CASE);
         assert_eq!(count, 2);
         assert_eq!(buffer.text(), "a-b-c");
     }
@@ -2637,27 +2826,333 @@ mod tests {
     fn asciiのみと日本語のみの検索置換は従来どおり動く() {
         // 回帰確認: 小文字化でバイト長が変わらない文字だけの本文
         let buffer = TextBuffer::from_text(path("u1016-ascii"), "Foo foo FOO".into());
-        let hits = buffer.find_all("foo");
+        let hits = buffer.find_all("foo", IGNORE_CASE);
         assert_eq!(
             hits.iter().map(|h| (h.start, h.end)).collect::<Vec<_>>(),
             vec![(0, 3), (4, 7), (8, 11)]
         );
 
         let mut jp = TextBuffer::from_text(path("u1016-jp"), "あいうえお かきくけこ".into());
-        let hits = jp.find_all("うえ");
+        let hits = jp.find_all("うえ", IGNORE_CASE);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].start, "あい".len());
         assert_eq!(hits[0].end, "あいうえ".len());
-        assert_eq!(jp.replace_all("かき", "サシ"), 1);
+        assert_eq!(jp.replace_all("かき", "サシ", IGNORE_CASE), 1);
         assert_eq!(jp.text(), "あいうえお サシくけこ");
     }
 
     #[test]
     fn 伸びる文字を含む本文でも空クエリは空を返す() {
         let buffer = TextBuffer::from_text(path("u1016-empty"), "İstanbul".into());
-        assert!(buffer.find_all("").is_empty());
-        assert!(buffer.find_next("", 0).is_none());
-        assert!(buffer.find_prev("", 0).is_none());
+        let hits = buffer.find_all("", IGNORE_CASE);
+        assert!(hits.is_empty());
+        assert!(next_hit(&hits, 0).is_none());
+        assert!(prev_hit(&hits, 0).is_none());
+    }
+
+    // --- #1653: 大文字小文字の区別（既定 = 区別する）と単語単位 ---
+
+    fn spans(hits: &[SearchHit]) -> Vec<(usize, usize)> {
+        hits.iter().map(|h| (h.start, h.end)).collect()
+    }
+
+    /// 4 通りの条件を名前つきで並べる（落ちたときにどの組み合わせかが読める）
+    fn matrix() -> [(&'static str, SearchOptions); 4] {
+        let o = |case_sensitive, whole_word| SearchOptions {
+            case_sensitive,
+            whole_word,
+        };
+        [
+            ("区別する・単語単位なし", o(true, false)),
+            ("区別する・単語単位", o(true, true)),
+            ("区別しない・単語単位なし", o(false, false)),
+            ("区別しない・単語単位", o(false, true)),
+        ]
+    }
+
+    #[test]
+    fn 既定の検索は大文字小文字を区別する_1653() {
+        // Issue #1653 の実測: 修正前は 3 件（Foo / foo / FOO）
+        let buffer = TextBuffer::from_text(path("u1653-default"), "Foo foo FOO".into());
+        assert_eq!(SearchOptions::default(), SearchOptions::DEFAULT);
+        assert_eq!(
+            SearchOptions::DEFAULT,
+            SearchOptions {
+                case_sensitive: true,
+                whole_word: false,
+            },
+            "既定は「区別する・単語単位なし」"
+        );
+        let hits = buffer.find_all("foo", SearchOptions::DEFAULT);
+        assert_eq!(
+            spans(&hits),
+            vec![(4, 7)],
+            "既定で当たるのは小文字の foo だけ"
+        );
+    }
+
+    #[test]
+    fn 既定の全置換は型名を潰さない_1653() {
+        // Issue #1653 の実測: 修正前は `let item = item::new();`（型名まで書き換わる）
+        let mut buffer =
+            TextBuffer::from_text(path("u1653-value"), "let value = Value::new();".into());
+        assert_eq!(
+            buffer.replace_all("value", "item", SearchOptions::DEFAULT),
+            1
+        );
+        assert_eq!(buffer.text(), "let item = Value::new();");
+    }
+
+    #[test]
+    fn 区別と単語単位の4通りで件数と置換結果が決まる_1653() {
+        // 境界に置いたもの: 型名・全大文字・接尾（values）・接頭（_value）・漢字の直後・
+        // かぎ括弧の中・小文字化で伸びる İ（2 → 3 バイト）の後ろ・縮む ẞ（3 → 2 バイト）の直後
+        let text =
+            "let value = Value::new(); // VALUE values _value 値value 「value」 İ value ẞvalue";
+        let expected: [(&str, usize, &str); 4] = [
+            (
+                "区別する・単語単位なし",
+                7,
+                "let item = Value::new(); // VALUE items _item 値item 「item」 İ item ẞitem",
+            ),
+            (
+                "区別する・単語単位",
+                3,
+                "let item = Value::new(); // VALUE values _value 値value 「item」 İ item ẞvalue",
+            ),
+            (
+                "区別しない・単語単位なし",
+                9,
+                "let item = item::new(); // item items _item 値item 「item」 İ item ẞitem",
+            ),
+            (
+                "区別しない・単語単位",
+                5,
+                "let item = item::new(); // item values _value 値value 「item」 İ item ẞvalue",
+            ),
+        ];
+        for ((name, options), (expected_name, count, replaced)) in
+            matrix().into_iter().zip(expected)
+        {
+            assert_eq!(name, expected_name);
+            let mut buffer = TextBuffer::from_text(path("u1653-matrix"), text.into());
+            let hits = buffer.find_all("value", options);
+            assert_eq!(hits.len(), count, "{name}: 件数");
+            for hit in &hits {
+                // 位置は元テキスト基準で、当たった部分は大文字小文字を無視すれば value
+                assert!(text.is_char_boundary(hit.start) && text.is_char_boundary(hit.end));
+                assert_eq!(text[hit.start..hit.end].to_lowercase(), "value", "{name}");
+            }
+            assert_eq!(
+                buffer.replace_all("value", "item", options),
+                count,
+                "{name}"
+            );
+            assert_eq!(buffer.text(), replaced, "{name}: 置換結果");
+            // 全置換は undo 1 回で戻る（#1651 の差分 1 件）
+            assert!(buffer.undo());
+            assert_eq!(buffer.text(), text, "{name}: undo");
+        }
+    }
+
+    #[test]
+    fn 長さが変わる文字は区別の有無で当たり方が変わる_1653() {
+        // トルコ語の İ は小文字化で i + U+0307（2 → 3 バイト）。区別しない検索でも
+        // `istanbul` は `İstanbul` に当たらない（写しは `i̇stanbul` で、間に U+0307 が挟まる）
+        let text = "İstanbul istanbul ISTANBUL";
+        let buffer = TextBuffer::from_text(path("u1653-turkish"), text.into());
+        let at = |needle: &str| {
+            text.match_indices(needle)
+                .map(|(i, m)| (i, i + m.len()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            spans(&buffer.find_all("istanbul", SearchOptions::DEFAULT)),
+            at("istanbul")
+        );
+        let mut ignore = at("istanbul");
+        ignore.extend(at("ISTANBUL"));
+        assert_eq!(spans(&buffer.find_all("istanbul", IGNORE_CASE)), ignore);
+        // İ そのものをクエリにすれば、区別する / しないのどちらでも元の 1 語に当たる
+        for options in [SearchOptions::DEFAULT, IGNORE_CASE] {
+            assert_eq!(
+                spans(&buffer.find_all("İstanbul", options)),
+                vec![(0, "İstanbul".len())]
+            );
+        }
+        // 1 文字の i は区別しないとき İ の途中（展開の途中）に当たらない = panic しない
+        let hits = buffer.find_all("i", IGNORE_CASE);
+        for hit in &hits {
+            assert!(text.is_char_boundary(hit.start) && text.is_char_boundary(hit.end));
+        }
+        assert!(
+            hits.iter().all(|h| h.start != 0),
+            "İ（位置 0）には当たらない"
+        );
+        // 縮む ẞ（3 → 2 バイト）: 区別しないと ß に当たり、位置は元テキスト基準
+        let sharp = TextBuffer::from_text(path("u1653-sharp"), "ẞ ß".into());
+        assert_eq!(
+            spans(&sharp.find_all("ß", SearchOptions::DEFAULT)),
+            vec![(4, 6)]
+        );
+        assert_eq!(
+            spans(&sharp.find_all("ß", IGNORE_CASE)),
+            vec![(0, 3), (4, 6)]
+        );
+    }
+
+    #[test]
+    fn 単語単位は日本語の境界で切れない_1653() {
+        // 漢字・かなは単語の文字（識別子に使える）。空白・句読点・括弧だけが区切り
+        let text = "東京都 東京 東京タワー、東京。";
+        let buffer = TextBuffer::from_text(path("u1653-jp-word"), text.into());
+        let whole = SearchOptions::DEFAULT.with(None, Some(true));
+        assert_eq!(buffer.find_all("東京", SearchOptions::DEFAULT).len(), 4);
+        let hits = buffer.find_all("東京", whole);
+        let second = text.find(" 東京 ").unwrap() + 1;
+        let fourth = text.find("、東京").unwrap() + "、".len();
+        assert_eq!(
+            spans(&hits),
+            vec![
+                (second, second + "東京".len()),
+                (fourth, fourth + "東京".len())
+            ]
+        );
+    }
+
+    #[test]
+    fn 一文字と記号で始まるクエリの単語単位_1653() {
+        let buffer = TextBuffer::from_text(path("u1653-one"), "a A aa a_".into());
+        let counts: Vec<usize> = matrix()
+            .iter()
+            .map(|(_, o)| buffer.find_all("a", *o).len())
+            .collect();
+        // 区別する: a / aa の 2 文字 / a_ = 4、単語単位は先頭の a だけ = 1、
+        // 区別しない: A も足して 5、単語単位は a と A = 2
+        assert_eq!(counts, vec![4, 1, 5, 2]);
+        // 端が単語の文字でないクエリは、その側の隣を問わない（`.foo` は `x.foo` に当たる）
+        let dotted = TextBuffer::from_text(path("u1653-dot"), "x.foo x.foobar".into());
+        let whole = SearchOptions::DEFAULT.with(None, Some(true));
+        assert_eq!(spans(&dotted.find_all(".foo", whole)), vec![(1, 5)]);
+        // 外れた候補の後ろから探し直す（xfoo の中の foo で探索を打ち切らない）
+        let retry = TextBuffer::from_text(path("u1653-retry"), "xfoo foo".into());
+        assert_eq!(spans(&retry.find_all("foo", whole)), vec![(5, 8)]);
+    }
+
+    #[test]
+    fn 区別する検索は本文の部分文字列探索と一致する_1653() {
+        let text = "fn a() { a(); aa(); }\n// ａ全角 a\tA\r\na";
+        let buffer = TextBuffer::from_text(path("u1653-plain"), text.into());
+        for query in ["a", "a(", "aa", "ａ", "\r\n", "} ", "A"] {
+            let expected: Vec<(usize, usize)> = text
+                .match_indices(query)
+                .map(|(i, m)| (i, i + m.len()))
+                .collect();
+            assert_eq!(
+                spans(&buffer.find_all(query, SearchOptions::DEFAULT)),
+                expected,
+                "{query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn 検索欄の打鍵では小文字写しを作り直さない_1653() {
+        // Issue #1653 の実測（release・1 MB）: 修正前は検索欄の 1 打鍵ごとに全文の写しを
+        // 2 回作っていた（1 打鍵 4.4ms）。時間ではなく「作った回数」で固定する
+        let line = "    let value = Value::new(); // コメント İ\n";
+        let mut text = String::new();
+        while text.len() < 1024 * 1024 {
+            text.push_str(line);
+        }
+        let lines = text.len() / line.len();
+        let mut buffer = TextBuffer::from_text(path("u1653-fold"), text);
+        let query = "Value::new";
+        // 検索欄へ 1 文字ずつ打つ = クエリが 1 文字ずつ伸びる
+        let type_query = |buffer: &TextBuffer, options: SearchOptions| {
+            let mut last = 0;
+            for n in 1..=query.len() {
+                last = buffer.find_all(&query[..n], options).len();
+            }
+            last
+        };
+        // 区別する（既定）: 写しは 1 度も作らない
+        assert_eq!(type_query(&buffer, SearchOptions::DEFAULT), lines);
+        assert_eq!(buffer.search_fold_builds(), 0, "区別する検索が写しを作った");
+        // 区別しない: 打鍵 10 回 × 2 往復でも写しは 1 回だけ
+        assert_eq!(type_query(&buffer, IGNORE_CASE), lines);
+        assert_eq!(type_query(&buffer, IGNORE_CASE), lines);
+        assert_eq!(
+            buffer.search_fold_builds(),
+            1,
+            "打鍵のたびに写しを作り直した"
+        );
+        // 本文が変わったら作り直す（古い写しで探すとヒットの位置がずれる）
+        buffer.move_cursor(CursorMovement::DocumentEnd, false);
+        buffer.insert("VALUE::NEW");
+        assert_eq!(buffer.find_all(query, IGNORE_CASE).len(), lines + 1);
+        assert_eq!(buffer.search_fold_builds(), 2);
+        // undo / redo も本文を変えるので捨てる
+        assert!(buffer.undo());
+        assert_eq!(buffer.find_all(query, IGNORE_CASE).len(), lines);
+        assert!(buffer.redo());
+        assert_eq!(buffer.find_all(query, IGNORE_CASE).len(), lines + 1);
+        assert_eq!(buffer.search_fold_builds(), 4);
+        // カーソルが動いただけ（本文は同じ）なら作り直さない
+        buffer.set_cursor(0, false);
+        assert_eq!(buffer.find_all(query, IGNORE_CASE).len(), lines + 1);
+        assert_eq!(buffer.search_fold_builds(), 4);
+        // 検索欄を閉じたら手放し、次に区別しない検索をしたときにだけ作る
+        buffer.release_search_cache();
+        assert_eq!(buffer.find_all(query, SearchOptions::DEFAULT).len(), lines);
+        assert_eq!(buffer.search_fold_builds(), 4);
+        assert_eq!(buffer.find_all(query, IGNORE_CASE).len(), lines + 1);
+        assert_eq!(buffer.search_fold_builds(), 5);
+    }
+
+    #[test]
+    fn 一件置換はカーソル以降の最初を置き換えてラップする_1653() {
+        let mut buffer = TextBuffer::from_text(path("u1653-next"), "foo Foo foo".into());
+        buffer.set_cursor(1, false);
+        assert_eq!(buffer.replace_next("foo", "bar", SearchOptions::DEFAULT), 1);
+        assert_eq!(buffer.text(), "foo Foo bar", "区別するので Foo は飛ばす");
+        // カーソル（bar の後ろ）より後ろに無いので先頭へラップ
+        assert_eq!(buffer.replace_next("foo", "bar", SearchOptions::DEFAULT), 1);
+        assert_eq!(buffer.text(), "bar Foo bar");
+        assert_eq!(buffer.replace_next("foo", "bar", SearchOptions::DEFAULT), 0);
+        assert_eq!(buffer.replace_next("foo", "bar", IGNORE_CASE), 1);
+        assert_eq!(buffer.text(), "bar bar bar");
+        assert_eq!(
+            buffer.replace_next("", "x", IGNORE_CASE),
+            0,
+            "空クエリは何もしない"
+        );
+    }
+
+    #[test]
+    fn 条件の決め方は新しいクエリなら既定から組み直す_1653() {
+        let ignore_whole = SearchOptions {
+            case_sensitive: false,
+            whole_word: true,
+        };
+        // 新しいクエリ: 省略した項目は既定（今の条件を引き継がない）
+        assert_eq!(
+            SearchOptions::resolve(ignore_whole, true, None, None),
+            SearchOptions::DEFAULT
+        );
+        assert_eq!(
+            SearchOptions::resolve(SearchOptions::DEFAULT, true, Some(false), None),
+            IGNORE_CASE
+        );
+        // クエリ省略（次へ / 前へ・条件だけ変える）: 今の条件を引き継ぐ
+        assert_eq!(
+            SearchOptions::resolve(ignore_whole, false, None, None),
+            ignore_whole
+        );
+        assert_eq!(
+            SearchOptions::resolve(ignore_whole, false, None, Some(false)),
+            IGNORE_CASE
+        );
     }
 
     // --- #1650: 改行コード（LF / CRLF）の検出・保持 ---
@@ -2839,7 +3334,7 @@ mod tests {
     #[test]
     fn 置換の改行もバッファの改行コードへ揃う() {
         let mut buffer = TextBuffer::from_text(path("crlf-replace"), "a\r\nQ\r\n".into());
-        assert_eq!(buffer.replace_all("q", "1\n2"), 1);
+        assert_eq!(buffer.replace_all("q", "1\n2", IGNORE_CASE), 1);
         assert_eq!(buffer.text(), "a\r\n1\r\n2\r\n");
 
         let mut buffer = TextBuffer::from_text(path("crlf-replace-range"), "a\r\nQ\r\n".into());
@@ -2885,7 +3380,7 @@ mod tests {
     #[test]
     fn 日本語を含む検索と置換が正しいバイト位置で動く() {
         let mut buffer = TextBuffer::from_text(path("edge-jp-search"), "あいうえお".into());
-        let hits = buffer.find_all("うえ");
+        let hits = buffer.find_all("うえ", SearchOptions::DEFAULT);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].start, "あい".len());
         assert_eq!(hits[0].end, "あいうえ".len());
@@ -3272,7 +3767,7 @@ mod tests {
                         buffer.insert("全選択差し替え\n2 行目");
                     }
                     6 => {
-                        let _ = buffer.replace_all("z", "ZZ");
+                        let _ = buffer.replace_all("z", "ZZ", IGNORE_CASE);
                     }
                     _ => {
                         buffer.newline();

@@ -209,6 +209,24 @@ pub fn notice_link_blocked() -> &'static str {
     )
 }
 
+// --- 検索欄のトグル（#1653。キー: preview.search_toggle_*） ---
+
+/// 印は SVG で描くので、語だけを持つ（#1536）。オン / オフは状態で言い分ける
+pub fn search_toggle_case(on: bool) -> &'static str {
+    if on {
+        tr!("大文字と小文字を区別する（オン）", "Match case (on)")
+    } else {
+        tr!("大文字と小文字を区別する（オフ）", "Match case (off)")
+    }
+}
+pub fn search_toggle_word(on: bool) -> &'static str {
+    if on {
+        tr!("単語単位で探す（オン）", "Match whole word (on)")
+    } else {
+        tr!("単語単位で探す（オフ）", "Match whole word (off)")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests_support;
@@ -261,6 +279,10 @@ mod tests {
                 binary_file().to_string(),
                 code_copied().to_string(),
                 notice_link_blocked().to_string(),
+                search_toggle_case(true).to_string(),
+                search_toggle_case(false).to_string(),
+                search_toggle_word(true).to_string(),
+                search_toggle_word(false).to_string(),
             ]
         });
     }

@@ -81,7 +81,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_preview_delete` | 単語・行単位で消す（選択があれば選択を消す） |
 | `tako_preview_save` | 未保存の編集をファイルへ保存する |
 | `tako_preview_undo` / `tako_preview_redo` | 編集バッファの undo / redo（ディスクへ書くのは `tako_preview_save`） |
-| `tako_preview_search` / `tako_preview_replace` | テキストの検索 / 置換 |
+| `tako_preview_search` / `tako_preview_replace` | テキストの検索 / 置換（**既定は大文字小文字を区別する**。`case_sensitive: false` で区別しない・`whole_word: true` で単語単位。検索で `query` を省略したときは今の条件を引き継ぐ） |
 | `tako_preview_autosave` | 編集の自動保存設定 |
 
 ### 動画

@@ -157,6 +157,9 @@ static EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
     ui_asset!("stop"),
     // プレビュー検索の置換欄の印（#1536。絵文字は使わない = #217）
     ui_asset!("swap"),
+    // プレビュー検索欄のトグル（#1653。大文字小文字の区別 / 単語単位）
+    ui_asset!("case_sensitive"),
+    ui_asset!("whole_word"),
     ui_asset!("sun"),
     ui_asset!("tasks"),
     ui_asset!("trend"),
@@ -225,6 +228,10 @@ pub mod ui_icon {
     /// プレビューの検索置換欄の印（#1536。左右 2 本の矢印 = 置き換え）。
     /// 絵文字（`↔` U+2194）を置き換えた枠（#217 の「UI に絵文字を使わない」）
     pub const SWAP: &str = "icons/ui/swap.svg";
+    /// プレビュー検索欄の「大文字小文字を区別する」トグル（#1653。`A` と `a` を線で描く）
+    pub const CASE_SENSITIVE: &str = "icons/ui/case_sensitive.svg";
+    /// プレビュー検索欄の「単語単位」トグル（#1653。`ab` の下を括弧で囲う）
+    pub const WHOLE_WORD: &str = "icons/ui/whole_word.svg";
     /// 右パネル tasks タブ（#1450 B2。チェックリストのパス。絵文字は使わない）
     pub const TASKS: &str = "icons/ui/tasks.svg";
     pub const TREND: &str = "icons/ui/trend.svg";

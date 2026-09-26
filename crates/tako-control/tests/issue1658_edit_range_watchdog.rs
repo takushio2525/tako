@@ -308,7 +308,7 @@ fn 行桁の解決は丸めない() {
 
 /// 本文を変える公開 API（版が進むべきもの）。[`本文を変える公開apiはすべて版を進める`] が
 /// 挙動で確かめ、[`textbufferの書き換え口は棚卸し済み`] が取りこぼしを見る
-const MUTATES_TEXT: [&str; 14] = [
+const MUTATES_TEXT: [&str; 15] = [
     "set_text",
     "insert",
     "newline",
@@ -324,6 +324,8 @@ const MUTATES_TEXT: [&str; 14] = [
     "redo",
     "replace_range",
     "replace_all",
+    // カーソル以降の最初を 1 件置換（#1653。検索欄の Enter と `tako edit replace`）
+    "replace_next",
     "replace_position_range",
 ];
 
@@ -331,7 +333,7 @@ const MUTATES_TEXT: [&str; 14] = [
 ///
 /// カーソル・選択は「どこを見ているか」で文書の中身ではない。`save` はディスクへ
 /// 書くだけで本文を変えない（変えると保存のたびに版が飛び、楽観ロックが使えなくなる）
-const KEEPS_TEXT: [&str; 7] = [
+const KEEPS_TEXT: [&str; 8] = [
     "set_cursor",
     "select_all",
     "move_cursor",
@@ -341,6 +343,8 @@ const KEEPS_TEXT: [&str; 7] = [
     "set_selection",
     // 器に見える行数（#1652。ページ移動の歩幅。本文ではない）
     "set_viewport_lines",
+    // 区別しない検索の小文字写しを手放す（#1653。本文から作り直せる控えで、本文ではない）
+    "release_search_cache",
 ];
 
 /// 検査する操作 1 つ（名前 + バッファへ当てる手）
@@ -407,7 +411,13 @@ fn 本文を変える公開apiはすべて版を進める() {
         (
             "replace_all",
             Box::new(|b: &mut TextBuffer| {
-                b.replace_all("o", "0");
+                b.replace_all("o", "0", tako_core::SearchOptions::DEFAULT);
+            }),
+        ),
+        (
+            "replace_next",
+            Box::new(|b: &mut TextBuffer| {
+                b.replace_next("o", "0", tako_core::SearchOptions::DEFAULT);
             }),
         ),
         (
@@ -491,15 +501,32 @@ fn textbufferの書き換え口は棚卸し済み() {
     let code = code_view(&production_range::production(&src, TEXT_EDIT));
     let mut unknown = Vec::new();
     let mut seen = Vec::new();
-    for (i, line) in code.lines().enumerate() {
+    let lines: Vec<&str> = code.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim_start();
         // 関数の頭かどうかは共有ヘルパが決める（#1496。`pub(crate) fn` / `async fn` を
         // 取りこぼすと、中の違反が**手前の関数名**で報告される）
         let Some(name) = fn_head_name(trimmed) else {
             continue;
         };
+        // 引数は**シグネチャ全体**（頭の行から本体の `{` / 宣言の `;` まで）で見る（#1653）。
+        // 頭の行だけを見ると、rustfmt が引数を折り返した口（`pub fn replace_next(\n
+        // &mut self, …`）が棚卸しから漏れ、新しい書き換え口が素通りする
+        let signature: String = lines[i..]
+            .iter()
+            .scan(false, |closed, l| {
+                if *closed {
+                    return None;
+                }
+                *closed = l.contains('{') || l.contains(';');
+                Some(l.trim())
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
         // 外から触れて本文を変えうるのは「公開 + `&mut self`」だけ
-        if !trimmed.starts_with("pub") || !trimmed.contains("(&mut self") {
+        if !trimmed.starts_with("pub")
+            || !(signature.contains("(&mut self") || signature.contains("( &mut self"))
+        {
             continue;
         }
         seen.push(name.to_string());

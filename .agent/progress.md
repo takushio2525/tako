@@ -63,3 +63,7 @@
 ## 2026-09-27（#1784: 隔離 GUI のヘルパが呼び出し側の偽の TAKO_ISOLATED を通さないようにした）
 - `launch_isolated_gui` は既定 `${TAKO_ISOLATED:-1}` を `"$@"` の前に置いていたので、引数 / export の `0`・空・`false` がそのまま GUI へ届いていた（偽 GUI で実測）。GUI へは常に `TAKO_ISOLATED=1` を `"$@"` より後ろで渡し、偽（tako の `is_verification_gui` が偽と読む値）は面を起こす前に終了コード 2 + stderr 1 行で断る（#1760 と同じ「使い方の誤り」）
 - 実測: 番犬 3 本追加（構造 / `/bin/bash` 3.2 の実走 / tako の真偽との突き合わせ）で注入 6 通りすべて file:line 名指しで FAILED → 戻して緑・tako-vd の実 GUI でも偽は起動せず 2、`on` は実プロセスの env が `TAKO_ISOLATED=1`
+
+## 2026-09-27（#1653: 検索・置換で大文字小文字を区別し（既定）、単語単位のトグルを足した）
+- `find_all` が常に小文字化し `replace_all("value"→"item")` が `Value::new()` を `item::new()` にしていた。`SearchOptions`（既定 = 区別する）を tako-core → dispatch（省略時は `SearchOptions::resolve` の 1 実装）→ CLI `-i` / `-w` → MCP `case_sensitive` / `whole_word` → 検索欄の SVG トグル 2 つへ 1:1。小文字写しは区別しない検索のときだけ作り本文が変わるまで使い回す（1 MB の 1 打鍵 4.449 → 0.509ms / 区別しない 1.251ms）
+- 実測: `scripts/test-search-case-1653.sh` **25 PASS 0 FAIL**（tako-vd でトグルを実マウスで押して 3 → 5 → 4 → 2 → 3 件・置換で `Value` が残る + CLI / MCP の字面一致）・番犬 `issue1653_search_case_watchdog` + 単体へ注入 6 通りすべて file:line 名指しで FAILED → 戻して緑

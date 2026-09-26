@@ -401,12 +401,16 @@ pub(super) fn build_request(
             pane: Some(target_pane(args, caller)?),
             query: str_arg(args, "query")?,
             direction: str_arg(args, "direction")?,
+            case_sensitive: bool_arg(args, "case_sensitive")?,
+            whole_word: bool_arg(args, "whole_word")?,
         },
         "tako_preview_replace" => Request::PreviewReplace {
             pane: Some(target_pane(args, caller)?),
             query: str_arg(args, "query")?.ok_or("query を指定する")?,
             replacement: str_arg(args, "replacement")?.ok_or("replacement を指定する")?,
             all: bool_arg(args, "all")?,
+            case_sensitive: bool_arg(args, "case_sensitive")?,
+            whole_word: bool_arg(args, "whole_word")?,
         },
         "tako_preview_autosave" => Request::PreviewAutosave {
             pane: Some(target_pane(args, caller)?),
