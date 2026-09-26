@@ -244,6 +244,11 @@
 - `kind`: 「review=生成物のレビュー / confirm=確認 / permission=権限の確認 / post=投稿」→ guide `user-tasks`（Pick `kind` by what you are asking for の表）
 - 「起票元（プロファイル・会話・ペイン）は自動で入るので指定は要らない。」の括弧 → guide `user-tasks`
 
+### tako_preview_move / tako_preview_delete（#1652 で追加、#1711 の rebase で短くした）
+
+- move: 「（GUI の修飾キー付き矢印・Home・Page Down と同じ）」→ 打鍵と値の対応の正本は `tako_core::platform::editor_keys`（要件は `.agent/requirements.md` FR-3.5 の #1652 の段）。値は `tako_core::text_edit::CursorMovement`
+- delete: 「（GUI の修飾キー付き Backspace / Delete と同じ）」→ 同じく `tako_core::platform::editor_keys`。値は `tako_core::text_edit::DeleteMotion`
+
 ### tako_run
 
 - 「ファイル先頭 64 行以内に以下の形式でコメント内に記述する」「`tako:cwd[name]: <ディレクトリ>` — プロファイル別作業ディレクトリ」は 1 行へ畳んだ（書式はすべて説明文に残る）

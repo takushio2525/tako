@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-24（#1658: 行・桁で指す範囲編集 API と文書の版を足した）
-- 編集の口が全文置換 1 つだけで、5,000 行の 1 行を直すのに本文を丸ごと IPC で送っていた（実測 275,000 → 61 バイト = 4,508 分の 1）。`PreviewEditRange` / `PreviewCursor` を tako-core 操作 API → dispatch → CLI `tako edit replace-range` / `cursor` → MCP `tako_preview_edit_range` / `tako_preview_cursor` へ 1:1。座標は行 1 始まり / 桁 0 始まりの行内 UTF-8 バイトで、範囲外・文字の途中・CR と LF のあいだは**丸めずに拒否**する
-- 応答へ `document`（`version` / `line_count` / `cursor` / `selection` / `undo_depth` / `undo_history_bytes`）を載せ、編集系すべてを `dispatch::preview_edit_reply` の 1 実装から組む。版は本文が変わるたびに進み（undo / redo でも戻らず進む）、`expected_version` で楽観ロックできる = LSP（#1007 S1）の `didChange` の前払い
-- 実測: 隔離 GUI の実経路 30 項目すべて OK（`scripts/test-edit-range-1658.sh`）・番犬 7 規則へ注入 10 通りすべて名指しで FAILED → 戻して緑・workspace 5360 passed 0 failed・clippy 3 宇宙 0・カタログ 202,204 / 204,800 バイト（予算内）
-
 ## 2026-09-24（#1676: 開いた直後にその行へ着地できるようにした）
 - `OpenFile` に `line` / `column`（1 始まり）を足し、CLI `tako open --line L [--column C]` と MCP `tako_open_file`（**ツールは増やさない**）を同じ dispatch へ 1:1 で載せた。md の写像は「`line` を渡された時点で code へ倒す」（レンダリング表示は 1 item = 1 ブロックで原文の行が残らない）と決めて FR-3.27 へ明記。行を持たない種別は**開く前**にエラー、超過は末尾行へ丸めて `clamped` で知らせる
 - 着地は `ListState` が描画時に作られるので「次の描画で 1 度だけ飛ぶ」予約（`preview_pending_reveal` → `consume_pending_reveal`）。省略時は wire に現れない（`skip_serializing_if`）ので JSON は引数が生える前とバイト一致
@@ -66,6 +61,7 @@
 ## 2026-09-26（#1652: 修飾キー付きの打鍵が入口で全部捨てられていたのを直した）
 - 入口の `if platform || control || alt { return false }` を外し、打鍵の意味を `platform::editor_keys` の 1 枚の表（両 OS の列）へ。`TextBuffer` に単語 / 行 / ページ / 文書端の移動と語・行単位の削除・smart Home・桁の記憶（desired column）を足し、`PreviewMove` / `PreviewDelete` + `tako edit move|delete` + MCP 2 本が打鍵と同じ口を通る
 - 実測: `scripts/test-editor-keys-1652.sh` で tako-vd 上の実打鍵経路 9 相が緑・A/B `TAKO_1652_LEGACY=1` は ⌘↑ の相で FAILED・注入 7 通りがすべて file:line 名指しで FAILED → 戻して緑
-## 2026-09-26（#1711: MCP ツールカタログの説明文を短くし、LSP 用に 17.6 KiB の余白を作った）
-- `tools/list` が予算 204,800 B の残り 1.8 KB（202,956 B）だったので、154 本中 45 本の description / 引数説明から根拠・仕組み・経緯・重複（`clear_*` 13 本・「省略で現状維持」・schema と同じ値）を外し **186,820 B**。ツール名・順序・型・必須は機械照合で不変、外した原文は `.agent/mcp-catalog-notes.md`
-- 実測: 隔離 GUI + `tako mcp serve` の tools/list 186,820 B（`tako context-budget` と一致・violations 0）・workspace 5397 passed 0 failed・clippy 3 宇宙 0。仮想ディスプレイが作れず検証窓がメイン画面に約 10 秒出た
+
+## 2026-09-26（#1711: MCP ツールカタログの説明文を短くし、LSP 用に 16 KiB の余白を作った）
+- `tools/list` が予算 204,800 B の残り 1.8 KB だったので、156 本中 47 本の description / 引数説明から根拠・仕組み・経緯・重複（`clear_*` 13 本・「省略で現状維持」・schema と同じ値）を外し **188,323 B**（main 116a63a の 204,579 B から -16,256 B）。ツール名・順序・型・必須は機械照合で不変、外した原文は `.agent/mcp-catalog-notes.md`
+- 実測: 隔離 GUI + `tako mcp serve` の tools/list と `tako context-budget` が一致・violations 0・workspace 5463 passed 0 failed・clippy 3 宇宙 0。初回は面の名前が読めず「メイン画面へ開いた」警告が出たが、uuid 照合で窓は tako-vd 上だった（#1697 の症状）

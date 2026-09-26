@@ -1008,8 +1008,8 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_preview_move",
-            "description": "コードプレビュー編集のカーソルを単語・行・ページ単位で動かす（GUI の修飾キー付き矢印・Home・Page Down と同じ）。\
-                本文は変えない。select=true で選択を伸ばす。位置で置くなら tako_preview_cursor。",
+            "description": "コードプレビュー編集のカーソルを単語・行・ページ単位で動かす\
+                （本文は変えない。select=true で選択を伸ばす）。位置で置くなら tako_preview_cursor。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1024,7 +1024,7 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_preview_delete",
-            "description": "コードプレビュー編集で単語・行単位に消す（GUI の修飾キー付き Backspace / Delete と同じ）。選択があれば選択を消す。行の境目では改行だけを消す。",
+            "description": "コードプレビュー編集で単語・行単位に消す（選択があれば選択を消し、行の境目では改行だけを消す）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
