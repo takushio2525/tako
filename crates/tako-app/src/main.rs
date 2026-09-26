@@ -25593,14 +25593,19 @@ static TARGET_DISPLAY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::n
 
 /// 置き先のディスプレイを決めて記録する（窓を 1 枚も開く前に 1 回だけ呼ぶ）。
 ///
-/// 見つからないときの構えは `tako_core::platform::display::miss_for` が決める（#1160）。
-/// 分かれ目は**面が 1 枚も見えていないか**:
+/// 見つからないときの構えは `tako_core::platform::display::miss_for` が決める（#1160 / #1697）。
+/// 分かれ目は**面が 1 枚も見えていないか**と **`TAKO_DISPLAY` を明示したか**:
 ///
 /// - **空 + 検証用 GUI** → 窓を開かずに終わる（既定の面 = ユーザーの画面なので落とさない）
-/// - **面は見えているが当たらない** → 既定の面へ落ちる。その機に置き先が無いということで、
-///   ここで開かないと `build-app.sh --verify` や Windows 実機のセルフテストが起動できない。
-///   代わりに `fallback_notice` で起動時に見える警告を出す
+/// - **面は見えているが当たらない + 明示 + 検証用 GUI** → 窓を開かずに終わる（#1697。
+///   狙った面を見失っただけ = 名前だけが読めない瞬間に生きている `tako-vd` を見失った実測）
+/// - **面は見えているが当たらない + 暗黙の既定** → 既定の面へ落ちる。その機に置き先が
+///   無いということで、ここで開かないと `build-app.sh --verify` や Windows 実機の
+///   セルフテストが起動できない。代わりに `fallback_notice` で起動時に見える警告を出す
 /// - **通常起動** → 常に既定の面（指定が外れるのは tako が起動できない理由ではない）
+///
+/// 名前で当たらないときは `virtual-display.sh ensure` が残した uuid で、**名前が読めない面に
+/// 限って**当てる（#1697。`select_with_record`）。
 ///
 /// **待つのは空のあいだだけ**。macOS の `cx.displays()` は `CGGetActiveDisplayList` なので
 /// ディスプレイスリープ中は面が在っても 0 件になる（#1160 の実測: `NSScreen` に 2 枚
@@ -25615,15 +25620,17 @@ fn resolve_target_display(cx: &App) -> Option<gpui::DisplayId> {
         std::env::var_os("TAKO_SELF_TEST").is_some(),
         std::env::var_os("TAKO_VISUAL_TEST").is_some(),
     );
-    let spec = disp::requested_spec(
-        std::env::var(disp::ENV_DISPLAY).ok().as_deref(),
-        verification,
-    );
+    let env_display = std::env::var(disp::ENV_DISPLAY).ok();
+    let spec = disp::requested_spec(env_display.as_deref(), verification);
     let Some(spec) = spec else {
         disp::record_placement(disp::Placement::not_requested());
         let _ = TARGET_DISPLAY.set(None);
         return None;
     };
+    // #1697: 明示の指定を見失ったら検証用 GUI は開かない（暗黙の既定は従来どおり落ちる）
+    let explicit = disp::explicit_request(env_display.as_deref());
+    // #1697: 名前が読めない瞬間の代わり（`virtual-display.sh ensure` が残す。無ければ None）
+    let recorded = disp::recorded_uuid(&spec);
 
     let retry = disp::retry_policy(verification);
     let primary = cx.primary_display().map(|d| u64::from(d.id()));
@@ -25644,7 +25651,12 @@ fn resolve_target_display(cx: &App) -> Option<gpui::DisplayId> {
         };
         let ids: Vec<u64> = displays.iter().map(|d| u64::from(d.id())).collect();
         if names_for.as_deref() != Some(ids.as_slice()) {
-            names = disp::display_names();
+            // #1697 の診断 env: 名前が読めない瞬間（全部の面が `name=?`）を再現する
+            names = if disp::inject_no_names() {
+                Vec::new()
+            } else {
+                disp::display_names()
+            };
             names_for = Some(ids);
         }
         let candidates: Vec<disp::DisplayCandidate> = displays
@@ -25675,7 +25687,7 @@ fn resolve_target_display(cx: &App) -> Option<gpui::DisplayId> {
                 }
             })
             .collect();
-        let selection = disp::select(&spec, &candidates);
+        let selection = disp::select_with_record(&spec, &candidates, recorded.as_deref());
         // **待つのは「面が 1 枚も見えない」あいだだけ**（#1160）。それは「置き先が無い」
         // ではなく**まだ分からない**状態（ディスプレイスリープ）なので待つ価値がある。
         // 面が見えているのに当たらないなら待っても答えは変わらないので即決める
@@ -25713,35 +25725,32 @@ fn resolve_target_display(cx: &App) -> Option<gpui::DisplayId> {
                     // 当たったので「外したときどうしたか」は無い
                     miss_policy: None,
                     verification,
+                    explicit,
                 },
             )
         }
         disp::Selection::NotFound { spec, available } => {
-            // 面が 1 枚も見えないのか、見えているのに当たらないのかで落とし所が変わる
-            let miss = disp::miss_for(verification, available.is_empty());
-            // 「そもそも 1 枚も見えていない」と「見えているが当たらない」を切り分ける。
-            // 前者は #1160 の症状（ディスプレイスリープ）で、直し方が違う
-            let reason = if available.is_empty() {
-                "OS のディスプレイ一覧が空（ディスプレイスリープ中は面が在っても列挙から落ちる）"
-            } else if !disp::name_lookup_supported() {
-                // 名前を引けない環境（Windows）で名前を指定された、を切り分けられるようにする
-                "該当なし（このプラットフォームでは名前を引けないので UUID か index で指定する）"
-            } else {
-                "該当なし"
-            };
+            // 面が 1 枚も見えないのか、見えているのに当たらないのか、指定が明示か暗黙かで
+            // 落とし所が変わる（#1160 / #1697）
+            let miss = disp::miss_for(verification, available.is_empty(), explicit);
+            // 直し方が違うものを別の文にする（一覧が空 / 名前を引けない / 名前が読めない面が
+            // ある = #1697 / 素の不一致）。文の正は核
+            let reason = disp::miss_reason(&candidates, recorded.as_deref());
             (
                 None,
                 disp::Placement {
                     requested: Some(spec),
                     resolved: None,
                     matched_by: None,
-                    reason: Some(reason.to_string()),
+                    reason: Some(reason),
                     available,
                     retries,
-                    // 列挙が空 + 検証用 GUI のときだけユーザーの画面へ落ちない（#1160）
+                    // 検証用 GUI は「列挙が空」と「明示の指定を見失った」でユーザーの画面へ
+                    // 落ちない（#1160 / #1697）
                     refused: miss == disp::Miss::Refuse,
                     miss_policy: Some(miss),
                     verification,
+                    explicit,
                 },
             )
         }
@@ -25759,8 +25768,8 @@ fn resolve_target_display(cx: &App) -> Option<gpui::DisplayId> {
         // セルフテストを無音終了にしない（ハーネスが見ているのは FAILED 行）
         if std::env::var_os("TAKO_SELF_TEST").is_some() {
             println!(
-                "TAKO_APP_SELF_TEST_FAILED: 145: 検証用 GUI の置き先が列挙に\
-                 出ないので窓を開かずに終了した (#1160)"
+                "TAKO_APP_SELF_TEST_FAILED: 145: 検証用 GUI の置き先が見つからないので\
+                 窓を開かずに終了した (#1160 / #1697)"
             );
         }
         disp::record_placement(placement);
@@ -73030,21 +73039,32 @@ mod self_test {
                 // 使った別の起動で測る。`TAKO_1160_LEGACY=1` ではここが両方落ちる
                 let retry = disp::retry_policy(true);
                 check(
-                    disp::miss_for(true, true) == disp::Miss::Refuse,
+                    disp::miss_for(true, true, false) == disp::Miss::Refuse,
                     &format!(
                         "145b: 列挙が空なら検証用 GUI は既定の面へ落ちない (#1160。\
                          miss={})",
-                        disp::miss_for(true, true).as_str(),
+                        disp::miss_for(true, true, false).as_str(),
                     ),
                 );
-                // 面が見えているのに当たらないときは落ちる（置き先を配線していない
-                // 環境で検証が回らなくならないように = この機以外で効く不変条件）
+                // 暗黙の既定で面が見えているのに当たらないときは落ちる（置き先を配線して
+                // いない環境で検証が回らなくならないように = この機以外で効く不変条件）
                 check(
-                    disp::miss_for(true, false) == disp::Miss::FallBack,
+                    disp::miss_for(true, false, false) == disp::Miss::FallBack,
                     &format!(
                         "145b: 面が見えているのに当たらないときは既定の面へ開く (#1160。\
                          miss={})",
-                        disp::miss_for(true, false).as_str(),
+                        disp::miss_for(true, false, false).as_str(),
+                    ),
+                );
+                // --- 145c: 明示の指定を見失ったら既定の面へ落ちない（#1697）---
+                // 名前だけが読めない瞬間に生きている tako-vd を見失い、面が見えているので
+                // 落ちる側へ倒れてユーザーの画面へ窓が出た。`TAKO_1697_LEGACY=1` で落ちる
+                check(
+                    disp::miss_for(true, false, true) == disp::Miss::Refuse,
+                    &format!(
+                        "145c: TAKO_DISPLAY で明示した面を見失ったら検証用 GUI は既定の面へ\
+                         落ちない (#1697。miss={})",
+                        disp::miss_for(true, false, true).as_str(),
                     ),
                 );
                 check(

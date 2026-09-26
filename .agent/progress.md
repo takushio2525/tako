@@ -63,3 +63,7 @@
 - `×` U+00D7 を 8 件（drawer 2 / right_panel 4 / preview_render 1 / main 1）→ `svg().path(ui_icon::CLOSE)`、`⎇ tmux` → 語だけの `tmux`（U+2387 は多くのフォントに無く豆腐）、`● LIVE` 2 件 → `div().rounded_full()` の丸 + `LIVE`（`live_badge` の 1 実装）。新設 SVG はゼロ（CLOSE 流用 + 図形）
 - 判定を `tako_core::emoji::is_icon_glyph`（表は明示。`▾`/`▸` は診断メッセージで実使用があるのでブロックで採らない）、番犬 `issue1579_ui_glyph_icon_watchdog` は**画面へ出る 2 経路だけ**（子要素シンク `CHILD_SINKS` = `.child(` / `.children(` の文字列 / `ui_text` カタログ）を見るので**許可リスト 0 件**。実ファイル注入 10 通りすべて file:line 名指しで FAILED → 戻して緑
 - 実測: `bash scripts/test-glyph-icon-1579.sh` 5 PASS 0 FAIL（tako-vd 上・`live_dot` 82 色 / `close_icon` 9 色）・`ui_asset!("close")` を外す A/B で `close_icon` が **9 → 1 色**（`live_dot` は 82 色のまま）・workspace 5397 passed 0 failed・clippy 3 宇宙 0
+
+## 2026-09-26（#1697: 名前が読めない瞬間に検証用 GUI がユーザーの画面へ落ちないようにした）
+- `ensure` が面の uuid を記録し、名前が読めない面（`name=?`）はその uuid で当てる。`TAKO_DISPLAY` 明示を見失った検証用 GUI は開かずに終了 4（`isolated-gui.sh` は配線済みの機でだけ明示）
+- 実測: A/B `TAKO_1697_LEGACY=1` と注入 5 通りが file:line 名指しで FAILED → 戻して緑・tako-vd 実経路 18 PASS・workspace 全 ok

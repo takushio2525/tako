@@ -15,6 +15,8 @@
 #   4. 前後比較（status --snapshot）が同じ構成に対して同じ 1 枚の絵を出す
 #   5. ensure の完了条件に「面が起きている（描画可能）」が入っている（#1160）。
 #      NSScreen に居るだけで通すと、面は在るのに tako から見えず検証が始まらない
+#   6. ensure の締めが面の uuid を記録する（#1697）。名前が読めない瞬間に tako が
+#      uuid で当てる材料で、読めなくても ensure は失敗させない・同じ値なら書かない
 set -uo pipefail
 cd "$(dirname "$0")/.."
 PASS=0
@@ -30,6 +32,9 @@ source "$PWD/scripts/lib/virtual-display.sh"
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
+# **記録の置き場を真っ先に一時 dir へ向ける**（#1697）。これより後ろのどの ensure も
+# 本物の ~/Library/Caches へ書かない（テストから本番へ書かない）
+VD_RECORD_DIR="$TMP/record"
 
 # ── スタブ（source した本物の関数を上書きする）──────────────────────
 TABLE="$TMP/table"
@@ -52,6 +57,12 @@ vd_wake_displays() {
     echo wake >> "$WAKE_LOG"
     [ -f "$TMP/drawable.after-wake" ] && cp "$TMP/drawable.after-wake" "$TMP/drawable"
     return 0
+}
+# 面の uuid（#1697）。既定は displayID から作る大文字のダミー（実機の JXA と同じ大文字）。
+# STUB_UUID を立てればそれが答えになり、空文字なら「読めない」を再現する
+vd_display_uuid() {
+    if [ -n "${STUB_UUID+x}" ]; then printf '%s' "$STUB_UUID"; return 0; fi
+    printf 'AAAAAAAA-0000-4000-8000-%012d' "${1:-0}"
 }
 vd_backend_instances() { printf '%s' "${STUB_INSTANCES:-1}"; }
 vd_backend_strays() { printf '%s' "${STUB_STRAYS:-}"; }
@@ -320,6 +331,56 @@ set_drawable "$DRAW_AWAKE"; snap_awake=$(vd_status_snapshot)
 set_drawable "$DRAW_ASLEEP"; snap_asleep=$(vd_status_snapshot)
 assert_eq "眠っただけでは構成の絵が変わらない" "$snap_awake" "$snap_asleep"
 assert_lacks "スナップショットに眠りを入れない" "asleep" "$snap_awake"
+
+echo "== Test 19: ensure の締めが面の uuid を記録する（#1697）=="
+reset_bd; set_table "$VD_TABLE_17"; set_clamshell No
+set_drawable "$DRAW_AWAKE"; rm -rf "$VD_RECORD_DIR"; unset STUB_UUID
+out=$(vd_ensure 2>&1); rc=$?
+assert_eq "記録しても ensure は 0" "$rc" "0"
+assert_eq "記録は黙って行う（既定の道の出力を増やさない）" "$out" ""
+assert_eq "記録は小文字の名前のファイル" "$(ls "$VD_RECORD_DIR")" "tako-vd.uuid"
+assert_eq "tako-vd の displayID の uuid を小文字で残す" \
+    "$(cat "$VD_RECORD_DIR/tako-vd.uuid")" "aaaaaaaa-0000-4000-8000-000000000017"
+assert_eq "recorded-uuid が読み返す" "$(vd_recorded_uuid)" "aaaaaaaa-0000-4000-8000-000000000017"
+# 同じ値なら書かない（冪等。mtime ではなく中身を別の値へ置いて、上書きされないことで見る）
+printf '%s\n' "aaaaaaaa-0000-4000-8000-000000000017" > "$VD_RECORD_DIR/tako-vd.uuid"
+touch -t 200001010000 "$VD_RECORD_DIR/tako-vd.uuid"
+vd_ensure >/dev/null 2>&1
+assert_eq "同じ値なら書き直さない" \
+    "$(ls -l -T "$VD_RECORD_DIR/tako-vd.uuid" 2>/dev/null | awk '{print $9}')" "2000"
+# 面が作り直されて uuid が変わったら書き直す
+STUB_UUID="CCCCCCCC-0000-4000-8000-000000000099"
+vd_ensure >/dev/null 2>&1
+assert_eq "uuid が変わったら書き直す" "$(vd_recorded_uuid)" "cccccccc-0000-4000-8000-000000000099"
+# uuid が読めなければ記録しないが ensure は失敗させない（面は用意できている）
+rm -rf "$VD_RECORD_DIR"; STUB_UUID=""
+out=$(vd_ensure 2>&1); rc=$?
+assert_eq "uuid が読めなくても ensure は 0" "$rc" "0"
+assert_has "読めなかったことは言う" "uuid を読めなかった" "$out"
+assert_eq "読めなければ記録しない" "$(ls "$VD_RECORD_DIR" 2>/dev/null)" ""
+unset STUB_UUID
+# 形の崩れた記録は「無い」と同じ
+mkdir -p "$VD_RECORD_DIR"; printf 'not-a-uuid\n' > "$VD_RECORD_DIR/tako-vd.uuid"
+vd_recorded_uuid >/dev/null 2>&1; rc=$?
+assert_eq "崩れた記録は非ゼロ" "$rc" "1"
+assert_eq "uuid の形（純関数）" "$(vd_is_uuid 'aaaaaaaa-0000-4000-8000-000000000017' && echo y)" "y"
+assert_eq "uuid でない形は弾く" "$(vd_is_uuid 'tako-vd' || echo n)" "n"
+# 眠っていて ensure が止まる道では記録しない（締めは起きているかの確認で止まる）
+reset_bd; rm -rf "$VD_RECORD_DIR"; set_drawable "$DRAW_VD_ASLEEP"
+vd_ensure >/dev/null 2>&1
+assert_eq "ensure が止まる道では記録しない" "$(ls "$VD_RECORD_DIR" 2>/dev/null)" ""
+
+echo "== Test 20: status は記録済み uuid といまの面の一致を出す（#1697）=="
+reset_bd; set_table "$VD_TABLE_17"; set_clamshell No; set_drawable "$DRAW_AWAKE"
+rm -rf "$VD_RECORD_DIR"
+assert_has "記録が無ければそう言う" "記録 uuid: なし" "$(vd_status 2>&1)"
+vd_ensure >/dev/null 2>&1
+out=$(vd_status 2>&1)
+assert_has "記録といまの面が一致" "aaaaaaaa…（いまの面と一致）" "$out"
+assert_lacks "uuid を全桁は出さない（貼り付けで広まらないように）" "000000000017" "$out"
+STUB_UUID="CCCCCCCC-0000-4000-8000-000000000099"
+assert_has "作り直された面とは不一致と出す" "不一致" "$(vd_status 2>&1)"
+unset STUB_UUID
 
 echo
 echo "PASS=${PASS} FAIL=${FAIL}"

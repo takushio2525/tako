@@ -26,19 +26,21 @@
 //! [`select`] は候補の一覧を受け取るだけなので **macOS 上から Windows 側の挙動も検証できる**
 //! （`support` / `window_lifecycle` / `dpi` と同じ作法）。
 //!
-//! ## 見つからないときの構え（#1160）
+//! ## 見つからないときの構え（#1160 / #1697）
 //!
 //! [`Selection::NotFound`] のあとどうするかは [`miss_for`] が決める。分かれ目は
-//! **面が 1 枚も見えていないか**（`enumeration_empty`）で、`is_verification_gui` だけで
-//! 決めてはいけない。
+//! **面が 1 枚も見えていないか**（`enumeration_empty`）と **`TAKO_DISPLAY` を明示したか**
+//! （`explicit`）で、`is_verification_gui` だけで決めてはいけない。
 //!
 //! - **面が 1 枚も見えない + 検証用 GUI**: **窓を開かずに終わる**。列挙が空なのは
 //!   「置き先が無い」ではなく**まだ分からない**状態（下記）なので、ここで既定の面へ
 //!   落とすと #1141 の目的が黙って破れる
-//! - **面は見えているが当たらない**: 既定の面へ落ちて起動は止めない。その機に置き先が
-//!   無いということで（CI・他人の環境・仮想ディスプレイを配線していない Windows =
-//!   FR-4.8.10）、**ここで開かないと検証そのものが回らなくなる**。代わりに
+//! - **面は見えているが当たらない + 暗黙の既定**: 既定の面へ落ちて起動は止めない。
+//!   その機に置き先が無いということで（CI・他人の環境・仮想ディスプレイを配線していない
+//!   Windows = FR-4.8.10）、**ここで開かないと検証そのものが回らなくなる**。代わりに
 //!   [`Placement::fallback_notice`] で起動時に見える警告を出す
+//! - **面は見えているが当たらない + `TAKO_DISPLAY` を明示 + 検証用 GUI**: 窓を開かずに
+//!   終わる（#1697）。狙った面を見失っただけなので、既定の面へ落とす理由が無い
 //! - **通常起動で `TAKO_DISPLAY` が外れた**: 常に既定の面へ落ちる。指定が外れるのは
 //!   検証の都合であって、tako が起動できない理由ではない
 //!
@@ -55,7 +57,29 @@
 //! 面が見えているのに当たらないなら待っても答えは変わらない（読めている一覧に無い）。
 //! 眠っている面を**起こす**のは tako ではなく `scripts/lib/virtual-display.sh ensure`
 //! （面を用意する係）の担当で、ここは「現れるまで少し待つ」だけを行う。
+//!
+//! ## 名前が読めない瞬間がある（#1697）
+//!
+//! 名前は `system_profiler` から引く（[`display_names`]）ので、それが読めない起動では
+//! 面は見えているのに**全部の面が `name=?`** になる（2026-09-24 の実測: 候補 2 枚とも
+//! `name=?` で、うち 1 枚の uuid は `tako-vd` そのもの。直前の起動では同じ面が名前で
+//! 解決できていた。応答待ちの打ち切りか出力の欠けかは未確定）。名前だけで探すと
+//! ここで外れ、面が見えているので「落ちる」側へ倒れて**ユーザーのメイン画面へ窓が出た**。
+//!
+//! 塞ぎ方は 2 段で、どちらも `TAKO_1697_LEGACY=1` で #1697 前へ戻せる:
+//!
+//! - **照合を name → 記録済み uuid の 2 段にする**。`scripts/lib/virtual-display.sh ensure`
+//!   が面を用意した直後にその面の uuid を [`record_dir`] へ残し、名前で当たらないときは
+//!   **名前が読めない面に限って**その uuid で当てる（[`MatchKind::RecordedUuid`]）。
+//!   名前が読めていて別の名前の面には当てない（記録より、いま読めた名前が正）
+//! - **明示の指定を見失ったら検証用 GUI は開かない**（[`miss_for`] の `explicit`）。
+//!   `TAKO_DISPLAY` を明示したのに当たらないのは「その機に置き先が無い」ではなく
+//!   「狙った面を見失った」なので、既定の面へ落とすと #1141 の目的が黙って破れる。
+//!   検証用 GUI が既定の面へ落ちるのは **`TAKO_DISPLAY` 未指定（暗黙の既定）**のときだけで、
+//!   これは置き先を配線していない環境（CI・他人の機・Windows）のために残す
 
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -79,6 +103,24 @@ pub const ENV_LEGACY_1160: &str = "TAKO_1160_LEGACY";
 /// 大きな値を渡せば「やり直しても現れない」= 窓を開かずに終わる道も踏める。
 /// **本番動作には影響しない**（明示されたときだけ効く）
 pub const ENV_INJECT_EMPTY_1160: &str = "TAKO_1160_INJECT_EMPTY";
+
+/// #1697 の前（名前だけで探し、`TAKO_DISPLAY` を明示していても面が見えていれば既定の面へ
+/// 落ちる）へ戻す env。検出力の A/B 用で、同一バイナリのまま旧挙動を再現できる
+pub const ENV_LEGACY_1697: &str = "TAKO_1697_LEGACY";
+
+/// 面の名前が**読めない瞬間**を再現する診断 env（#1697）。
+///
+/// 立っていれば名前引き（[`display_names`]）を空として扱い、全部の面が `name=?` になる
+/// （本物の `system_profiler` を止めずに #1697 の一覧を作る）。**本番動作には影響しない**
+pub const ENV_INJECT_NO_NAMES_1697: &str = "TAKO_1697_INJECT_NO_NAMES";
+
+/// 記録済み uuid の置き場を差し替える env（#1697）。
+/// **シェル側（`scripts/lib/virtual-display.sh`）と同じ名前**を読む（番犬が突き合わせる）
+pub const ENV_RECORD_DIR: &str = "TAKO_VD_RECORD_DIR";
+
+/// 記録済み uuid の既定の置き場（ホームからの相対。macOS だけ）。
+/// **シェル側と同じ綴り**（番犬が突き合わせる）
+pub const RECORD_SUBDIR: &str = "Library/Caches/tako/virtual-display";
 
 /// 列挙をやり直す間隔（#1160）
 pub const RETRY_INTERVAL: Duration = Duration::from_millis(100);
@@ -157,36 +199,73 @@ fn retry_policy_for(verification_gui: bool, legacy: bool) -> RetryPolicy {
     }
 }
 
-/// 外したときの落とし所を決める（#1160）。
+/// 外したときの落とし所を決める（#1160 / #1697）。
 ///
-/// **分かれ目は「面が 1 枚も見えていないか」**（`enumeration_empty`）で、検証用 GUI か
-/// どうかだけでは決めない。
+/// 見るのは 3 つ: 検証用 GUI か / **面が 1 枚も見えていないか**（`enumeration_empty`）/
+/// **`TAKO_DISPLAY` を明示したか**（`explicit`。[`explicit_request`]）。
 ///
+/// - 通常起動 → 常に [`Miss::FallBack`]（起動を止める理由にならない。FR-4.8.4）
 /// - 空 + 検証用 GUI → [`Miss::Refuse`]（窓を開かずに終わる）。列挙が空なのは
 ///   「置き先が無い」ではなく**まだ分からない**状態（ディスプレイスリープ）なので、
-///   ここで既定の面 = ユーザーの画面へ落とすと #1141 の目的が黙って破れる
-/// - 面は見えているが当たらない → [`Miss::FallBack`]。その機に置き先が無いということで、
-///   **ここで開かないと検証そのものが回らなくなる**（CI・他人の環境・仮想ディスプレイを
-///   配線していない Windows = FR-4.8.10 では、狙いが外れるのが正しい挙動）。
-///   代わりに [`Placement::fallback_notice`] で起動時に見える警告を出す
-/// - 通常起動 → 常に [`Miss::FallBack`]（起動を止める理由にならない）
-pub fn miss_for(verification_gui: bool, enumeration_empty: bool) -> Miss {
-    miss_for_with(verification_gui, enumeration_empty, legacy_1160())
+///   ここで既定の面 = ユーザーの画面へ落とすと #1141 の目的が黙って破れる（#1160）
+/// - 面は見えているが当たらない + 明示 + 検証用 GUI → [`Miss::Refuse`]（#1697）。
+///   狙った面を**見失った**のであって、その機に置き先が無いのではない
+///   （#1697 の実測: 名前だけが読めない瞬間に、生きている `tako-vd` を見失った）
+/// - 面は見えているが当たらない + 暗黙の既定 → [`Miss::FallBack`]。その機に置き先が
+///   無いということで、**ここで開かないと検証そのものが回らなくなる**（CI・他人の環境・
+///   仮想ディスプレイを配線していない Windows = FR-4.8.10 では、狙いが外れるのが正しい
+///   挙動）。代わりに [`Placement::fallback_notice`] で起動時に見える警告を出す
+pub fn miss_for(verification_gui: bool, enumeration_empty: bool, explicit: bool) -> Miss {
+    miss_for_with(
+        verification_gui,
+        enumeration_empty,
+        explicit,
+        legacy_1160(),
+        legacy_1697(),
+    )
 }
 
 /// [`miss_for`] の中身（env を引数へ出した純粋関数）
-fn miss_for_with(verification_gui: bool, enumeration_empty: bool, legacy: bool) -> Miss {
-    if !legacy && verification_gui && enumeration_empty {
+fn miss_for_with(
+    verification_gui: bool,
+    enumeration_empty: bool,
+    explicit: bool,
+    legacy_1160: bool,
+    legacy_1697: bool,
+) -> Miss {
+    // #1160 前は構えそのものが無い（必ず落ちる）
+    if legacy_1160 || !verification_gui {
+        return Miss::FallBack;
+    }
+    if enumeration_empty || (explicit && !legacy_1697) {
         Miss::Refuse
     } else {
         Miss::FallBack
     }
 }
 
+/// `TAKO_DISPLAY` が**明示されている**か（#1697）。空・空白だけは未指定と同じ
+/// （[`requested_spec`] と同じ読み = 「狙った」と「落ちてよい」の判定がずれない）
+pub fn explicit_request(env_display: Option<&str>) -> bool {
+    env_display.is_some_and(|s| !s.trim().is_empty())
+}
+
 /// `TAKO_1160_LEGACY` が立っているか（プロセス内で 1 回だけ読む）
 pub fn legacy_1160() -> bool {
     static LEGACY: OnceLock<bool> = OnceLock::new();
     *LEGACY.get_or_init(|| std::env::var_os(ENV_LEGACY_1160).is_some())
+}
+
+/// `TAKO_1697_LEGACY` が立っているか（プロセス内で 1 回だけ読む）
+pub fn legacy_1697() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os(ENV_LEGACY_1697).is_some())
+}
+
+/// `TAKO_1697_INJECT_NO_NAMES` が立っているか（名前引きを空として扱う。#1697 の診断 env）
+pub fn inject_no_names() -> bool {
+    static INJECT: OnceLock<bool> = OnceLock::new();
+    *INJECT.get_or_init(|| std::env::var_os(ENV_INJECT_NO_NAMES_1697).is_some())
 }
 
 /// 列挙を空に見せる残り回数（`TAKO_1160_INJECT_EMPTY` の値。未指定なら 0）。
@@ -294,6 +373,8 @@ pub enum MatchKind {
     Uuid,
     /// 表示名の完全一致（大文字小文字は無視）
     Name,
+    /// 名前が読めない面を、`virtual-display.sh ensure` が残した uuid で当てた（#1697）
+    RecordedUuid,
     /// `cx.displays()` の並び順（0 始まり）
     Index,
 }
@@ -304,6 +385,7 @@ impl MatchKind {
         match self {
             MatchKind::Uuid => "uuid",
             MatchKind::Name => "name",
+            MatchKind::RecordedUuid => "recorded_uuid",
             MatchKind::Index => "index",
         }
     }
@@ -337,7 +419,32 @@ pub fn is_verification_gui(isolated: Option<&str>, self_test: bool, visual_test:
 /// 当てる順は **UUID → 名前 → index**。UUID は 36 文字ハイフン区切りで構造的に紛れないので
 /// 先に見る。名前を index より先に見るのは、「2」という名前のディスプレイがあったときに
 /// 名前を優先したいから（index はいつでも UUID / 名前で言い換えられる）。
+///
+/// 記録済み uuid は見ない（見るのは [`select_with_record`]）。
 pub fn select(spec: &str, candidates: &[DisplayCandidate]) -> Selection {
+    select_with(spec, candidates, None)
+}
+
+/// [`select`] + **記録済み uuid**（#1697）。当てる順は **UUID → 名前 → 記録済み uuid → index**。
+///
+/// 記録済み uuid（[`recorded_uuid`]）で当てるのは **名前が読めない面（`name=None`）だけ**。
+/// 名前が読めていて別の名前の面は、uuid が記録と一致しても当てない（記録より、いま読めた
+/// 名前が正。面の作り直しや改名のあとに古い記録で別の面へ出さない）。
+/// `TAKO_1697_LEGACY=1` なら記録を見ない（= [`select`] と同じ = #1697 前）
+pub fn select_with_record(
+    spec: &str,
+    candidates: &[DisplayCandidate],
+    recorded_uuid: Option<&str>,
+) -> Selection {
+    select_with(spec, candidates, recorded_uuid.filter(|_| !legacy_1697()))
+}
+
+/// [`select`] / [`select_with_record`] の中身（env を読まない純粋関数）
+fn select_with(
+    spec: &str,
+    candidates: &[DisplayCandidate],
+    recorded_uuid: Option<&str>,
+) -> Selection {
     let spec = spec.trim();
     if spec.is_empty() {
         return Selection::NotRequested;
@@ -361,6 +468,18 @@ pub fn select(spec: &str, candidates: &[DisplayCandidate]) -> Selection {
                 .map(|c| (c, MatchKind::Name))
         })
         .or_else(|| {
+            let recorded = recorded_uuid?;
+            candidates
+                .iter()
+                .find(|c| {
+                    c.name.is_none()
+                        && c.uuid
+                            .as_deref()
+                            .is_some_and(|u| u.eq_ignore_ascii_case(recorded))
+                })
+                .map(|c| (c, MatchKind::RecordedUuid))
+        })
+        .or_else(|| {
             let raw = spec.strip_prefix("index:").unwrap_or(spec);
             raw.parse::<usize>()
                 .ok()
@@ -377,6 +496,109 @@ pub fn select(spec: &str, candidates: &[DisplayCandidate]) -> Selection {
             spec: spec.to_string(),
             available: candidates.iter().map(DisplayCandidate::label).collect(),
         },
+    }
+}
+
+/// 36 文字・8-4-4-4-12 の 16 進 + ハイフンか（#1697。記録の中身の検査と、
+/// 「uuid の指定に記録を引かない」判定に使う）
+pub fn is_uuid_shaped(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 36
+        && b.iter().enumerate().all(|(i, c)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                *c == b'-'
+            } else {
+                c.is_ascii_hexdigit()
+            }
+        })
+}
+
+/// 記録済み uuid の置き場（#1697）。
+///
+/// `TAKO_VD_RECORD_DIR` があればそれ、無ければ macOS は `~/`[`RECORD_SUBDIR`]、
+/// それ以外は `None`（面を用意するヘルパが無い = 記録も無い）。
+/// **書くのは `scripts/lib/virtual-display.sh ensure`**（面を用意する係）で、tako は読むだけ。
+/// data dir に置かないのは、隔離起動ごとに data dir が一時 dir へ変わる（= 読めない）ため
+pub fn record_dir() -> Option<PathBuf> {
+    record_dir_from(
+        std::env::var_os(ENV_RECORD_DIR),
+        crate::paths::home_dir(),
+        cfg!(target_os = "macos"),
+    )
+}
+
+/// [`record_dir`] の中身（env とホームを引数へ出した純粋関数）
+fn record_dir_from(env: Option<OsString>, home: Option<PathBuf>, macos: bool) -> Option<PathBuf> {
+    if let Some(dir) = env.filter(|d| !d.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    if !macos {
+        return None;
+    }
+    home.map(|h| h.join(RECORD_SUBDIR))
+}
+
+/// 名前の指定 → 記録ファイル名（`<小文字の名前>.uuid`）。
+/// 置き場の外を指せる名前（区切り・先頭のドット）と uuid / 空の指定は `None`
+fn record_file_name(spec: &str) -> Option<String> {
+    let name = spec.trim().to_ascii_lowercase();
+    let safe = !name.is_empty()
+        && !name.starts_with('.')
+        && !is_uuid_shaped(&name)
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    safe.then(|| format!("{name}.uuid"))
+}
+
+/// 記録ファイルの中身 → uuid（1 行目だけを見る。形が崩れていれば `None`）
+fn parse_record(text: &str) -> Option<String> {
+    let first = text.lines().next()?.trim();
+    is_uuid_shaped(first).then(|| first.to_ascii_lowercase())
+}
+
+/// その名前の面について `virtual-display.sh ensure` が残した uuid（#1697）。
+/// 記録が無い・読めない・形が崩れている・指定が名前でないなら `None`
+pub fn recorded_uuid(spec: &str) -> Option<String> {
+    recorded_uuid_in(&record_dir()?, spec)
+}
+
+/// [`recorded_uuid`] の置き場を引数へ出したもの（テストは一時 dir を渡す = HOME を読まない）
+pub fn recorded_uuid_in(dir: &Path, spec: &str) -> Option<String> {
+    let file = record_file_name(spec)?;
+    parse_record(&std::fs::read_to_string(dir.join(file)).ok()?)
+}
+
+/// 外したときの理由（persist.log / 診断の 1 行。#1160 / #1697）。
+///
+/// 直し方が違うものを**別の文**にする: 一覧が空（ディスプレイスリープ）/ 名前を引けない
+/// プラットフォーム / **名前が読めない面がある**（#1697。記録済み uuid の有無も書く）/ 素の不一致
+pub fn miss_reason(candidates: &[DisplayCandidate], recorded_uuid: Option<&str>) -> String {
+    miss_reason_for(candidates, recorded_uuid, name_lookup_supported())
+}
+
+/// [`miss_reason`] の中身（プラットフォームを引数へ出した純粋関数）
+fn miss_reason_for(
+    candidates: &[DisplayCandidate],
+    recorded_uuid: Option<&str>,
+    lookup_supported: bool,
+) -> String {
+    if candidates.is_empty() {
+        "OS のディスプレイ一覧が空（ディスプレイスリープ中は面が在っても列挙から落ちる）".into()
+    } else if !lookup_supported {
+        // 名前を引けない環境（Windows）で名前を指定された、を切り分けられるようにする
+        "該当なし（このプラットフォームでは名前を引けないので UUID か index で指定する）".into()
+    } else if candidates.iter().any(|c| c.name.is_none()) {
+        match recorded_uuid {
+            Some(u) => {
+                format!("該当なし（名前が読めない面があり、記録済みの uuid {u} にも当たらない）")
+            }
+            None => "該当なし（名前が読めない面があり、uuid の記録も無い。\
+                     scripts/lib/virtual-display.sh ensure が記録する）"
+                .into(),
+        }
+    } else {
+        "該当なし".into()
     }
 }
 
@@ -405,6 +627,9 @@ pub struct Placement {
     /// `requested` が `None` のとき（= 通常起動）は常に `false`
     /// （検証用の起動は [`requested_spec`] が必ず指定を返すため）
     pub verification: bool,
+    /// `requested` が `TAKO_DISPLAY` の**明示**か（`false` なら検証用の暗黙の既定）。
+    /// 外したときに「開かなかった / 既定へ落ちた」を分けた材料そのもの（#1697）
+    pub explicit: bool,
 }
 
 impl Placement {
@@ -420,6 +645,7 @@ impl Placement {
             refused: false,
             miss_policy: None,
             verification: false,
+            explicit: false,
         }
     }
 
@@ -487,6 +713,8 @@ impl Placement {
             "refused": self.refused,
             "miss_policy": self.miss_policy.map(Miss::as_str),
             "verification": self.verification,
+            // #1697: 指定が `TAKO_DISPLAY` の明示か（false = 検証用の暗黙の既定）
+            "explicit": self.explicit,
         })
     }
 
@@ -503,10 +731,16 @@ impl Placement {
         let reason = self.reason.as_deref().unwrap_or("不明");
         let available = self.available.join(", ");
         let (level, message) = if self.refused {
+            // 一覧が空（#1160）と、面は見えているのに明示の指定を見失った（#1697）は直し方が違う
+            let what = if self.available.is_empty() {
+                "が列挙に出ない"
+            } else {
+                "がどの面にも当たらない"
+            };
             (
                 "error",
                 format!(
-                    "検証用 GUI の置き先 {spec} が列挙に出ないので窓を開かずに終了した\
+                    "検証用 GUI の置き先 {spec} {what}ので窓を開かずに終了した\
                      （理由={reason} / 候補=[{available}] / やり直し={} 回）。\
                      scripts/lib/virtual-display.sh ensure で用意できる",
                     self.retries,
@@ -550,7 +784,7 @@ impl Placement {
         ))
     }
 
-    /// 窓を開かずに終わるときに**人へ見せる**案内（#1160）。
+    /// 窓を開かずに終わるときに**人へ見せる**案内（#1160 / #1697）。
     ///
     /// persist.log を読むまで気づけないのが #1160 の症状だったので、起動時に
     /// stderr へ出す用の文をここで作る（文言の正はこのモジュール）。
@@ -560,6 +794,22 @@ impl Placement {
             return None;
         }
         let spec = self.requested.as_deref().unwrap_or("?");
+        if !self.available.is_empty() {
+            // #1697: 面は見えているのに明示の指定を見失った。候補を全部出す
+            // （どの面が tako-vd だったのかを人が 1 行で突き合わせられるように）
+            return Some(format!(
+                "検証用 GUI の置き先 {spec}（{ENV_DISPLAY} で指定）が OS のディスプレイ一覧の\
+                 どの面にも当たらないので、窓を開かずに終了した（理由={} / 候補=[{}] / \
+                 やり直し={} 回）。\n\
+                 ユーザーのメイン画面へ検証用の窓を出さないため（#1141 / #1697）。\
+                 面を用意して uuid を記録する: scripts/lib/virtual-display.sh ensure\n\
+                 置き先を配線していない機では {ENV_DISPLAY} を外す\
+                 （未指定なら既定の面へ開いて警告を出す）",
+                self.reason.as_deref().unwrap_or("不明"),
+                self.available.join(", "),
+                self.retries,
+            ));
+        }
         Some(format!(
             "検証用 GUI の置き先 {spec} が OS のディスプレイ一覧に出ていないので、\
              窓を開かずに終了した（理由={} / 候補={} 枚 / やり直し={} 回）。\n\
@@ -905,23 +1155,27 @@ mod tests {
     /// 「開かない」より悪い。`TAKO_1160_LEGACY=1` では `FallBack` に戻るのでこの検査が落ちる
     #[test]
     fn 列挙が空なら検証用guiは窓を開かない() {
-        assert_eq!(
-            miss_for(true, true),
-            Miss::Refuse,
-            "検証用 GUI が既定の面（= ユーザーの画面）へ落ちる構えになっている"
-        );
+        for explicit in [false, true] {
+            assert_eq!(
+                miss_for(true, true, explicit),
+                Miss::Refuse,
+                "検証用 GUI が既定の面（= ユーザーの画面）へ落ちる構えになっている \
+                 explicit={explicit}"
+            );
+        }
     }
 
-    /// **面が見えているのに当たらないときは落ちる**（#1160 で狭めた点）。
+    /// **暗黙の既定で面が見えているのに当たらないときは落ちる**（#1160 で狭めた点）。
     ///
     /// その機に置き先が無いということで、`tako-vd` を配線していない環境
     /// （CI・他人の機・Windows = FR-4.8.10）はここを通る。**開かない構えにすると
     /// 検証そのものが回らなくなる**（`build-app.sh --verify` と Windows 実機の
-    /// セルフテストが起動できなくなる）ので、落として警告を出す
+    /// セルフテストが起動できなくなる）ので、落として警告を出す。
+    /// `TAKO_DISPLAY` を明示したときは落ちない（#1697。下の検査）
     #[test]
     fn 面が見えているのに当たらないときは検証用でも既定の面へ開く() {
         assert_eq!(
-            miss_for(true, false),
+            miss_for(true, false, false),
             Miss::FallBack,
             "置き先を配線していない環境で検証用 GUI が起動できなくなる"
         );
@@ -931,12 +1185,18 @@ mod tests {
     /// 指定が外れるのは検証の都合であって、tako が起動できない理由ではない
     #[test]
     fn 通常起動は置き先が外れても既定の面へ開く() {
-        assert_eq!(miss_for(false, false), Miss::FallBack);
-        assert_eq!(
-            miss_for(false, true),
-            Miss::FallBack,
-            "空でも通常起動は開く"
-        );
+        for explicit in [false, true] {
+            assert_eq!(
+                miss_for(false, false, explicit),
+                Miss::FallBack,
+                "explicit={explicit}"
+            );
+            assert_eq!(
+                miss_for(false, true, explicit),
+                Miss::FallBack,
+                "空でも通常起動は開く explicit={explicit}"
+            );
+        }
     }
 
     /// 列挙が空のあいだは**やり直す**（1 回引いて諦めるのが #1160 の原因）。
@@ -984,17 +1244,19 @@ mod tests {
                     0,
                     "verification={verification}"
                 );
-                assert_eq!(
-                    miss_for_with(verification, empty, true),
-                    Miss::FallBack,
-                    "verification={verification} empty={empty}"
-                );
+                for explicit in [false, true] {
+                    assert_eq!(
+                        miss_for_with(verification, empty, explicit, true, false),
+                        Miss::FallBack,
+                        "verification={verification} empty={empty} explicit={explicit}"
+                    );
+                }
             }
         }
         // 新挙動は同じ入力で構えが変わる（= A/B が本当に効いている）
         assert_ne!(
-            miss_for_with(true, true, false),
-            miss_for_with(true, true, true),
+            miss_for_with(true, true, false, false, false),
+            miss_for_with(true, true, false, true, false),
             "legacy と新挙動が同じなら A/B に検出力が無い"
         );
     }
@@ -1194,6 +1456,289 @@ mod tests {
         assert!(!hit.log_line().contains("やり直し"), "{}", hit.log_line());
         assert_eq!(Placement::not_requested().retries, 0);
         assert!(!Placement::not_requested().refused);
+    }
+
+    // ── #1697: 名前が読めない瞬間にユーザーの画面へ落ちない ──────────────
+
+    /// 主画面のダミー uuid（実機の値は置かない = public リポ）
+    const UUID_MAIN: &str = "AAAAAAAA-0000-4000-8000-000000000001";
+    /// 仮想ディスプレイのダミー uuid。GPUI は小文字で、記録（JXA）は大文字で出るので
+    /// 候補側は小文字・記録側は大文字で持ち、大文字小文字を無視して当たることも固定する
+    const UUID_VD: &str = "BBBBBBBB-0000-4000-8000-000000000002";
+
+    /// 2026-09-24 の実測の形（候補 2 枚とも `name=?`・うち 1 枚の uuid が tako-vd）
+    fn names_unreadable() -> Vec<DisplayCandidate> {
+        vec![
+            cand(0, 1, None, Some(&UUID_MAIN.to_ascii_lowercase())),
+            cand(1, 6, None, Some(&UUID_VD.to_ascii_lowercase())),
+        ]
+    }
+
+    /// **#1697 の本体**: 名前が読めない一覧でも、記録済みの uuid で tako-vd へ解決する。
+    /// `TAKO_1697_LEGACY=1` では記録を見ない（= 名前だけで探す）のでここが落ちる
+    #[test]
+    fn 名前が読めない一覧でも記録済みuuidで仮想ディスプレイへ解決する() {
+        let s = select_with_record(
+            DEFAULT_VIRTUAL_DISPLAY_NAME,
+            &names_unreadable(),
+            Some(UUID_VD),
+        );
+        let Selection::Selected {
+            display,
+            matched_by,
+            spec,
+        } = s
+        else {
+            panic!("名前が読めない瞬間に tako-vd を見失う（#1697 の症状）: {s:?}");
+        };
+        assert_eq!(display.id, 6, "記録済み uuid の面へ当たる");
+        assert_eq!(matched_by, MatchKind::RecordedUuid);
+        assert_eq!(spec, DEFAULT_VIRTUAL_DISPLAY_NAME);
+        // persist.log の解決行から「何で当てたか」が読める
+        let line = Placement {
+            requested: Some(spec),
+            resolved: Some(display),
+            matched_by: Some(matched_by),
+            ..Placement::not_requested()
+        }
+        .log_line();
+        assert!(line.contains("recorded_uuid で解決"), "{line}");
+    }
+
+    /// 名前が読めていれば**記録より名前が勝つ**（記録は名前が読めないときの代わり）
+    #[test]
+    fn 名前が読めていれば記録済みuuidより名前が勝つ() {
+        let cands = vec![
+            cand(0, 1, None, Some(UUID_VD)),
+            cand(1, 13, Some("tako-vd"), Some(UUID_MAIN)),
+        ];
+        match select_with_record("tako-vd", &cands, Some(UUID_VD)) {
+            Selection::Selected {
+                display,
+                matched_by,
+                ..
+            } => {
+                assert_eq!(display.id, 13);
+                assert_eq!(matched_by, MatchKind::Name);
+            }
+            other => panic!("名前で当たらない: {other:?}"),
+        }
+    }
+
+    /// 名前と記録が**別の面を指す矛盾**: 記録の uuid の面に別の名前が読めているなら当てない
+    /// （作り直し・改名のあとに古い記録で別の面へ出さない）。当たらないので見つからない
+    #[test]
+    fn 名前が読めて別名の面には記録済みuuidで当てない() {
+        let cands = vec![
+            cand(0, 1, Some("Color LCD"), Some(UUID_MAIN)),
+            cand(1, 6, Some("External"), Some(UUID_VD)),
+        ];
+        assert!(
+            matches!(
+                select_with_record("tako-vd", &cands, Some(UUID_VD)),
+                Selection::NotFound { .. }
+            ),
+            "名前が External と読めている面へ tako-vd の記録で当ててしまう"
+        );
+    }
+
+    /// 記録が無い / 形が崩れていれば、名前が読めない一覧では従来どおり見つからない
+    #[test]
+    fn 記録が無ければ名前が読めない一覧では見つからない() {
+        let cands = names_unreadable();
+        let Selection::NotFound { available, .. } = select_with_record("tako-vd", &cands, None)
+        else {
+            panic!("記録が無いのに当たった");
+        };
+        assert_eq!(available.len(), 2, "候補は全部出す: {available:?}");
+        assert!(
+            matches!(select("tako-vd", &cands), Selection::NotFound { .. }),
+            "select は記録を見ない"
+        );
+    }
+
+    /// **明示の指定を見失ったら検証用 GUI は開かない**（#1697 の 2 段目）。
+    /// 面が見えているので #1160 の構えでは「落ちる」側だった。
+    /// `TAKO_1697_LEGACY=1` では `FallBack` に戻るのでここが落ちる
+    #[test]
+    fn 明示の指定を見失ったら検証用guiは窓を開かない() {
+        assert_eq!(
+            miss_for(true, false, true),
+            Miss::Refuse,
+            "TAKO_DISPLAY で明示した面を見失った検証用 GUI が既定の面（= ユーザーの画面）へ落ちる"
+        );
+    }
+
+    /// A/B（`TAKO_1697_LEGACY=1`）の中身: 記録を見ず、明示でも面が見えていれば落ちる = #1697 前
+    #[test]
+    fn legacy1697は記録を見ず明示でも既定の面へ落ちる() {
+        assert_eq!(
+            miss_for_with(true, false, true, false, true),
+            Miss::FallBack
+        );
+        // 列挙が空の拒否（#1160）は #1697 の A/B では戻さない
+        assert_eq!(miss_for_with(true, true, true, false, true), Miss::Refuse);
+        assert!(matches!(
+            select_with(DEFAULT_VIRTUAL_DISPLAY_NAME, &names_unreadable(), None),
+            Selection::NotFound { .. }
+        ));
+        // 新挙動は同じ入力で構えが変わる（= A/B が本当に効いている）
+        assert_ne!(
+            miss_for_with(true, false, true, false, false),
+            miss_for_with(true, false, true, false, true),
+            "legacy と新挙動が同じなら A/B に検出力が無い"
+        );
+    }
+
+    /// 明示かどうかは `requested_spec` と同じ読み（空・空白だけは未指定）
+    #[test]
+    fn 明示の判定は空と空白を未指定として扱う() {
+        assert!(!explicit_request(None));
+        assert!(!explicit_request(Some("")));
+        assert!(!explicit_request(Some("  ")));
+        assert!(explicit_request(Some("tako-vd")));
+        assert!(explicit_request(Some(UUID_VD)));
+    }
+
+    /// 見失って開かなかった記録・案内・診断は**候補を全部出し**、一覧が空の拒否と別の文になる
+    #[test]
+    fn 明示の指定を見失った拒否は候補を出して一覧が空の拒否と別の文になる() {
+        let cands = names_unreadable();
+        let refused = Placement {
+            requested: Some(DEFAULT_VIRTUAL_DISPLAY_NAME.into()),
+            reason: Some(miss_reason_for(&cands, None, true)),
+            available: cands.iter().map(DisplayCandidate::label).collect(),
+            refused: true,
+            miss_policy: Some(Miss::Refuse),
+            verification: true,
+            explicit: true,
+            ..Placement::not_requested()
+        };
+        let line = refused.log_line();
+        assert!(line.contains("窓を開かずに終了する"), "{line}");
+        assert!(!line.contains("既定の面へ開く"), "{line}");
+        let notice = refused.refusal_notice().expect("refused なら案内が出る");
+        assert!(notice.contains("どの面にも当たらない"), "{notice}");
+        for label in &refused.available {
+            assert!(
+                notice.contains(label.as_str()),
+                "候補 {label} が出ない: {notice}"
+            );
+        }
+        assert!(notice.contains("virtual-display.sh ensure"), "{notice}");
+        assert!(
+            !notice.contains("一覧に出ていない"),
+            "一覧が空の拒否（#1160）の文が混ざっている: {notice}"
+        );
+        let issue = refused.health_issue().expect("拒否は申告する");
+        assert_eq!(issue["level"], "error");
+        let msg = issue["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("どの面にも当たらない"), "{msg}");
+        assert_eq!(refused.describe()["explicit"], true);
+        assert!(
+            refused.fallback_notice().is_none(),
+            "開いていないので落ちた警告は出さない"
+        );
+
+        // 一覧が空の拒否（#1160）は従来の文のまま
+        let blind = Placement {
+            available: Vec::new(),
+            ..refused.clone()
+        };
+        let notice = blind.refusal_notice().expect("refused なら案内が出る");
+        assert!(notice.contains("一覧に出ていない"), "{notice}");
+        let msg = blind.health_issue().expect("申告する")["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(msg.contains("列挙に出ない"), "{msg}");
+    }
+
+    /// 外した理由は直し方ごとに別の文（#1697 は名前が読めないことと記録の有無を書く）
+    #[test]
+    fn 外した理由は直し方ごとに別の文になる() {
+        assert!(miss_reason_for(&[], None, true).contains("一覧が空"));
+        let unreadable = names_unreadable();
+        assert!(miss_reason_for(&unreadable, None, false).contains("名前を引けない"));
+        let no_record = miss_reason_for(&unreadable, None, true);
+        assert!(no_record.contains("名前が読めない面"), "{no_record}");
+        assert!(no_record.contains("記録も無い"), "{no_record}");
+        let stale = miss_reason_for(&unreadable, Some(UUID_VD), true);
+        assert!(
+            stale.contains(UUID_VD),
+            "当たらなかった記録を名指す: {stale}"
+        );
+        assert_eq!(miss_reason_for(&fixture(), None, true), "該当なし");
+    }
+
+    /// 一時 dir を片付けるガード（パニックしても残骸を残さない）
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 記録は `<小文字の名前>.uuid` に 1 行の uuid。読めない形・置き場の外を指す名前は無視する
+    #[test]
+    fn 記録は名前ごとに1行のuuidで壊れた記録は無視する() {
+        let dir =
+            TempDir(std::env::temp_dir().join(format!("tako-1697-record-{}", std::process::id())));
+        std::fs::create_dir_all(&dir.0).expect("一時 dir");
+        let file = dir.0.join("tako-vd.uuid");
+        std::fs::write(&file, format!("{UUID_VD}\n")).expect("記録を書く");
+        let got = recorded_uuid_in(&dir.0, "tako-vd");
+        assert_eq!(got.as_deref(), Some(UUID_VD.to_ascii_lowercase().as_str()));
+        // 指定の大文字小文字は無視する（名前の照合と同じ）
+        assert_eq!(recorded_uuid_in(&dir.0, " TAKO-VD "), got);
+        // 無い名前・置き場の外を指す名前・uuid の指定は引かない
+        assert_eq!(recorded_uuid_in(&dir.0, "other"), None);
+        for spec in ["../tako-vd", "a/b", ".hidden", "", UUID_VD] {
+            assert_eq!(recorded_uuid_in(&dir.0, spec), None, "spec={spec:?}");
+        }
+        // 形の崩れた記録は無いのと同じ
+        for broken in ["", "not-a-uuid\n", "BBBBBBBB-0000-4000-8000-00000000000\n"] {
+            std::fs::write(&file, broken).expect("記録を書く");
+            assert_eq!(
+                recorded_uuid_in(&dir.0, "tako-vd"),
+                None,
+                "broken={broken:?}"
+            );
+        }
+    }
+
+    /// 置き場: env が勝つ / macOS はホーム配下 / それ以外は無い（HOME は読まずに引数で渡す）
+    #[test]
+    fn 記録の置き場はenvが勝ちmacosだけホーム配下() {
+        let home = Some(PathBuf::from("/home-for-test"));
+        assert_eq!(
+            record_dir_from(Some("/x".into()), home.clone(), true),
+            Some(PathBuf::from("/x"))
+        );
+        assert_eq!(
+            record_dir_from(None, home.clone(), true),
+            Some(PathBuf::from("/home-for-test").join(RECORD_SUBDIR))
+        );
+        assert_eq!(
+            record_dir_from(Some("".into()), home.clone(), true),
+            Some(PathBuf::from("/home-for-test").join(RECORD_SUBDIR)),
+            "空の env は未指定と同じ"
+        );
+        assert_eq!(record_dir_from(None, home, false), None);
+        assert_eq!(
+            record_dir_from(Some("/x".into()), None, false),
+            Some(PathBuf::from("/x")),
+            "env はどの OS でも効く"
+        );
+    }
+
+    #[test]
+    fn uuidの形は8_4_4_4_12の16進() {
+        assert!(is_uuid_shaped(UUID_VD));
+        assert!(is_uuid_shaped(&UUID_VD.to_ascii_lowercase()));
+        assert!(!is_uuid_shaped("tako-vd"));
+        assert!(!is_uuid_shaped("BBBBBBBB-0000-4000-8000-00000000000Z"));
+        assert!(!is_uuid_shaped("BBBBBBBB00000-4000-8000-000000000002"));
     }
 
     #[cfg(target_os = "macos")]
