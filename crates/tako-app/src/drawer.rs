@@ -118,7 +118,7 @@ impl TakoApp {
             .cursor(CursorStyle::OpenHand)
             .on_drag(
                 BackgroundPaneDrag { pane: pane_id },
-                self.drag_ghost_builder(DragKind::BackgroundPane, truncate(&label, 24), cx),
+                self.drag_ghost_builder(DragKind::BackgroundPane, truncate_chars(&label, 24), cx),
             );
 
         if is_pending_kill {
@@ -183,7 +183,7 @@ impl TakoApp {
                         .overflow_x_hidden()
                         .text_ellipsis()
                         .text_color(hsla(theme.foreground))
-                        .child(SharedString::from(truncate(&label, 40))),
+                        .child(SharedString::from(truncate_chars(&label, 40))),
                 )
                 .child(
                     div()
@@ -237,7 +237,7 @@ impl TakoApp {
                 .justify_center()
                 .text_size(px(11.0))
                 .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.6))
-                .child(SharedString::from(truncate(&label, 24)))
+                .child(SharedString::from(truncate_chars(&label, 24)))
         } else {
             div()
                 .flex_1()
@@ -294,7 +294,7 @@ impl TakoApp {
             for group in shelved_tabs.iter().cloned() {
                 bg_groups.push((
                     crate::ui_text::drawer::shelved_tab_group(
-                        &truncate(&group.title, 14),
+                        &truncate_chars(&group.title, 14),
                         group.entries.len(),
                     ),
                     Some(group.tab),
@@ -307,7 +307,10 @@ impl TakoApp {
             let entries = self.background_entries_of_tab(tab.id());
             if !entries.is_empty() {
                 bg_groups.push((
-                    crate::ui_text::drawer::tab_group(&truncate(tab.title(), 18), entries.len()),
+                    crate::ui_text::drawer::tab_group(
+                        &truncate_chars(tab.title(), 18),
+                        entries.len(),
+                    ),
                     None,
                     entries,
                 ));
@@ -316,7 +319,7 @@ impl TakoApp {
         for closed in self.tmux_view_closed_origin_background() {
             bg_groups.push((
                 crate::ui_text::drawer::tab_group(
-                    &truncate(&crate::ui_text::drawer::closed_tab_group(&closed.title), 18),
+                    &truncate_chars(&crate::ui_text::drawer::closed_tab_group(&closed.title), 18),
                     closed.entries.len(),
                 ),
                 None,

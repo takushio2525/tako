@@ -482,7 +482,7 @@ impl TakoApp {
                                 dot.into_any_element()
                             };
 
-                            let truncated = truncate(&label, label_max);
+                            let truncated = truncate_chars(&label, label_max);
 
                             // タブ D&D 並べ替えの挿入インジケータ（#371）
                             let show_indicator = is_tab_dragging && tab_reorder == Some(Some(id));
