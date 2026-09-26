@@ -5409,15 +5409,12 @@ fn dispatch_inner(
             // ファイル先頭 16 KiB を読む
             let head = read_file_head(&resolved)?;
 
-            // 拡張子既定のマージ
+            // 解決（宣言 → ユーザーの拡張子既定 → プロジェクト既定 → 組み込み。#1656）
             let settings = crate::settings::load();
-            let ext_defaults = tako_core::merged_defaults(&settings.runner_defaults);
-
-            // 解決
-            let resolution = tako_core::resolve(
+            let resolution = tako_core::resolve_file(
                 &resolved,
                 &head,
-                &ext_defaults,
+                &settings.runner_defaults,
                 profile.as_deref(),
                 cmd_override.as_deref(),
             )
@@ -5479,6 +5476,8 @@ fn dispatch_inner(
                 "profile": plan.profile,
                 "command": plan.command,
                 "cwd": cwd.display().to_string(),
+                "source": plan.source.as_str(),
+                "project": run_project_json(resolution.project.as_ref()),
                 "auto_close": ac,
             }))
         }
@@ -5505,10 +5504,10 @@ fn dispatch_inner(
 
             let head = read_file_head(&resolved)?;
             let settings = crate::settings::load();
-            let ext_defaults = tako_core::merged_defaults(&settings.runner_defaults);
 
-            let resolution = tako_core::resolve(&resolved, &head, &ext_defaults, None, None)
-                .map_err(|e| DispatchError::Operation(e.to_string()))?;
+            let resolution =
+                tako_core::resolve_file(&resolved, &head, &settings.runner_defaults, None, None)
+                    .map_err(|e| DispatchError::Operation(e.to_string()))?;
 
             let profiles: Vec<Value> = resolution
                 .all_profiles
@@ -5518,11 +5517,7 @@ fn dispatch_inner(
                         "profile": p.profile,
                         "command": p.command,
                         "cwd": p.cwd.display().to_string(),
-                        "source": match p.source {
-                            tako_core::RunSource::Declaration => "declaration",
-                            tako_core::RunSource::ExtensionDefault => "extension_default",
-                            tako_core::RunSource::Override => "override",
-                        },
+                        "source": p.source.as_str(),
                     })
                 })
                 .collect();
@@ -5532,6 +5527,8 @@ fn dispatch_inner(
                 "profiles": profiles,
                 "warnings": resolution.warnings,
                 "default_profile": resolution.plan.profile,
+                "project": run_project_json(resolution.project.as_ref()),
+                "workspace_root": resolution.workspace_root.display().to_string(),
             }))
         }
 
@@ -5956,6 +5953,20 @@ fn dispatch_show_command(
         other => Err(DispatchError::InvalidParams(format!(
             "不明な action: {other:?}（show / list / copy / run / dismiss のいずれか）"
         ))),
+    }
+}
+
+/// Code Runner の応答に載せるプロジェクト（`Run` / `RunResolve` 共通。#1656）。
+/// 見つからなければ `null`（拡張子既定・宣言で走る）
+fn run_project_json(project: Option<&tako_core::runner_project::ProjectMatch>) -> Value {
+    match project {
+        Some(p) => json!({
+            "kind": p.kind,
+            "root": p.root.display().to_string(),
+            "marker": p.marker.display().to_string(),
+            "command": p.command,
+        }),
+        None => Value::Null,
     }
 }
 
@@ -26730,6 +26741,131 @@ mod tests {
             assert!(sh_code.contains("__TAKO_EXIT="), "{sh_code}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 一時 dir に cargo プロジェクトを組む（根に `.git` を置き、探索をその中へ閉じ込める。
+    /// 実 HOME の中は読まない）。戻り値は（実体パスの根, 実行対象の main.rs）
+    fn cargo_project_1656(tag: &str) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!(
+            "tako-1656-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join(".git")).unwrap();
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::write(base.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        std::fs::write(base.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let base = tako_core::platform::path::canonicalize(&base).unwrap();
+        let main = base.join("src/main.rs");
+        (base, main)
+    }
+
+    /// #1656: `RunResolve`（CLI `tako run --dry-run` / MCP `tako_run_resolve`）が
+    /// プロジェクト既定を返す。cwd はプロジェクトのルート
+    #[test]
+    fn run_resolveはプロジェクト既定を返す() {
+        let (root, main) = cargo_project_1656("resolve");
+        let mut host = MockHost::new();
+        let pane = host.ws.active_tab().tree().focused();
+        let result = dispatch(
+            &mut host,
+            Request::RunResolve {
+                path: main.display().to_string(),
+                pane: Some(pane.as_u64()),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        let root_str = root.display().to_string();
+        assert_eq!(
+            result["profiles"][0]["source"], "project_default",
+            "{result}"
+        );
+        assert_eq!(result["profiles"][0]["command"], "cargo run", "{result}");
+        assert_eq!(result["profiles"][0]["cwd"], root_str.as_str(), "{result}");
+        assert_eq!(result["project"]["kind"], "cargo", "{result}");
+        assert_eq!(result["project"]["root"], root_str.as_str(), "{result}");
+        assert_eq!(
+            result["project"]["marker"],
+            root.join("Cargo.toml").display().to_string().as_str()
+        );
+        assert_eq!(result["workspace_root"], root_str.as_str(), "{result}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #1656: `Run`（再生ボタン / `tako run` / MCP `tako_run`）がプロジェクトのルートで
+    /// `cargo run` を起こす（`rustc main.rs` 単体へ落ちない）
+    #[test]
+    fn runはプロジェクトのルートでcargo_runを起こす() {
+        let (root, main) = cargo_project_1656("run");
+        let mut host = MockHost::new();
+        let pane = host.ws.active_tab().tree().focused();
+        let result = dispatch(
+            &mut host,
+            Request::Run {
+                path: main.display().to_string(),
+                pane: Some(pane.as_u64()),
+                tab: None,
+                profile: None,
+                command: None,
+                direction: None,
+                ratio: None,
+                auto_close: None,
+                focus: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(result["command"], "cargo run", "{result}");
+        assert_eq!(result["source"], "project_default", "{result}");
+        assert_eq!(
+            result["cwd"],
+            root.display().to_string().as_str(),
+            "{result}"
+        );
+        assert_eq!(result["project"]["kind"], "cargo", "{result}");
+        let new_pane = result["pane"].as_u64().unwrap();
+        let opts = host.attached_options.get(&new_pane).expect("options 記録");
+        assert_eq!(
+            opts.cwd.as_deref(),
+            Some(root.as_path()),
+            "ペインの cwd がルート"
+        );
+        assert_run_pane_command(opts.command.as_ref().expect("command"), "cargo run");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #1656: プロジェクトの外のファイルは従来どおり拡張子既定（`project` は null）
+    #[test]
+    fn run_resolveはプロジェクトの外なら拡張子既定() {
+        let (root, _) = cargo_project_1656("outside");
+        // `.git` の段で探索が止まるので、隣の単独ファイルは cargo プロジェクトに入らない
+        let loose_dir = root.join("loose");
+        std::fs::create_dir_all(loose_dir.join(".git")).unwrap();
+        let loose = loose_dir.join("hello.py");
+        std::fs::write(&loose, "print(1)\n").unwrap();
+        let mut host = MockHost::new();
+        let pane = host.ws.active_tab().tree().focused();
+        let result = dispatch(
+            &mut host,
+            Request::RunResolve {
+                path: loose.display().to_string(),
+                pane: Some(pane.as_u64()),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(
+            result["profiles"][0]["source"], "extension_default",
+            "{result}"
+        );
+        assert!(result["project"].is_null(), "{result}");
+        assert_eq!(
+            result["workspace_root"],
+            loose_dir.display().to_string().as_str()
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

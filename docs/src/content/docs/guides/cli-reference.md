@@ -625,7 +625,7 @@ tako web close
 
 ### tako run / run-default
 
-**Code Runner**。ファイル内の `tako:run` 宣言、または拡張子ごとの既定コマンドで、新しいペインを分割して実行します。プレビューヘッダの再生ボタンと同じ経路です。
+**Code Runner**。ファイル内の `tako:run` 宣言、プロジェクト既定（`Cargo.toml` / `package.json` / `pyproject.toml` / `go.mod` などを上へ辿り、そのルートで `cargo run` / `npm run` 等を走らせる）、または拡張子ごとの既定コマンドで、新しいペインを分割して実行します。プレビューヘッダの再生ボタンと同じ経路です。`--list`（`--dry-run`）はどのプロジェクトとして解決したか（`project`）も返します。
 
 ```bash
 tako run script.py                 # 実行（新ペインを分割）

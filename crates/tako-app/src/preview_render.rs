@@ -4359,8 +4359,8 @@ impl TakoApp {
         use tako_core::runner;
         if let Some(head) = runner::read_file_head_for_ui(path) {
             let settings = tako_control::settings::load();
-            let ext_defaults = runner::merged_defaults(&settings.runner_defaults);
-            match runner::resolve(path, &head, &ext_defaults, None, None) {
+            // dispatch `Run` と同じ 1 本（プロジェクト既定まで見る。#1656）
+            match runner::resolve_file(path, &head, &settings.runner_defaults, None, None) {
                 Ok(resolution) => {
                     self.preview_run_profiles
                         .insert(pane, resolution.all_profiles);

@@ -150,9 +150,22 @@ tako preview-changelog
 
 実行コマンドは、ファイル先頭の `tako:run` 宣言か、拡張子ごとの既定から決まります。プロファイルが複数あるときは再生ボタン横のドロップダウンで選べます。
 
+ファイルがプロジェクトの中にあるときは、そのプロジェクトの流儀で走ります。ファイルのあるフォルダから上へ辿って `Cargo.toml` / `package.json` / `pyproject.toml` / `go.mod` / `*.csproj` / `Makefile` を探し、見つかったフォルダ（プロジェクトのルート）で実行します。
+
+| プロジェクト | 実行されるコマンドの例 |
+|---|---|
+| Rust（`Cargo.toml`） | `cargo run`（ワークスペースの中なら `cargo run -p <パッケージ>`。bin の無いライブラリはそのモジュールのテスト `cargo test -p <パッケージ> --lib <モジュール>::`） |
+| Node.js（`package.json`） | そのファイルを走らせている script があれば `npm run <script>`（pnpm / yarn / bun はロックファイルで判別）、無ければ `node <ファイル>` |
+| Python（`pyproject.toml`） | パッケージの中なら `python3 -m <モジュール>`、テストファイルなら `python3 -m pytest <ファイル>`（`uv.lock` / `poetry.lock` / `.venv` があればそちらの Python） |
+| Go（`go.mod`） | `go run ./<パッケージ>`（main でないパッケージとテストファイルは `go test`） |
+| .NET（`*.csproj` 等） | `dotnet run`（テストプロジェクトは `dotnet test`） |
+| C / C++（`Makefile`） | `run` 規則があれば `make run`、無ければ `make` |
+
+探索は git リポジトリのルートより上へは出ず、ホームフォルダ（`~`）直下にある `package.json` などの置き忘れもプロジェクトとはみなしません。ファイルに `tako:run` を書けばそちらが優先され、`tako run-default` で拡張子の既定を設定した場合もそちらが優先されます。`${workspaceRoot}` と書くとプロジェクトのルートに置き換わります（例: `tako:cwd: ${workspaceRoot}`）。
+
 ```bash
 tako run script.py
-tako run script.py --list        # 使えるプロファイル
+tako run script.py --list        # 使えるプロファイル（どのプロジェクトとして解決したかも出る）
 tako run-default py "python3"    # 拡張子の既定を設定
 ```
 

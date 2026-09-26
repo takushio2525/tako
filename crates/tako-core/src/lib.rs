@@ -44,6 +44,7 @@ pub mod preview_outline;
 pub mod preview_reload;
 pub mod preview_view;
 pub mod probe;
+pub mod project_root;
 pub mod prompt_append;
 pub mod prompt_delivery;
 pub mod pty_loop;
@@ -52,6 +53,7 @@ pub mod remote_fs;
 pub mod remote_open;
 pub mod remote_shortcuts;
 pub mod runner;
+pub mod runner_project;
 pub mod screen;
 pub mod scroll;
 pub mod scroll_mirror;
@@ -119,9 +121,9 @@ pub use preview_view::{
     PREVIEW_ZOOM_STEP,
 };
 pub use runner::{
-    builtin_defaults, builtin_defaults_for, expand_variables, merged_defaults, merged_defaults_for,
-    parse_declarations, read_file_head_for_ui, resolve, resolve_for, Declarations, ProfileDecl,
-    Resolution, RunPlan, RunSource, RunnerError,
+    builtin_defaults, builtin_defaults_for, expand_variables, expand_variables_in, merged_defaults,
+    merged_defaults_for, parse_declarations, read_file_head_for_ui, resolve_file, resolve_file_in,
+    Declarations, ProfileDecl, Resolution, RunPlan, RunSource, RunnerError,
 };
 pub use screen::{InputStatus, InputStyle, Screen, ScreenLine, StyleRun};
 pub use shell::{quote_for_shell, quote_paths_for_shell};

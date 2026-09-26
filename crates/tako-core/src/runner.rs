@@ -1,12 +1,23 @@
 //! Code Runner: ファイル内宣言パーサ + コマンド解決器（FR-3.18）
 //!
 //! ファイル先頭の `tako:run:` 等の宣言を解析し、実行コマンドを解決する。
-//! GPUI 非依存・純関数。設計: `.agent/plans/2026-07-code-runner.md`
+//! GPUI 非依存。設計: `.agent/plans/2026-07-code-runner.md`
+//!
+//! ## 入口は [`resolve_file`] の 1 本（#1656）
+//!
+//! 解決の優先順位は「`command` の上書き → ファイル内宣言 → **ユーザーが設定した**拡張子既定 →
+//! プロジェクト既定（[`crate::runner_project`]）→ 組み込みの拡張子既定」。
+//! プロジェクト既定はファイルシステムを見る（上へ辿って `Cargo.toml` 等を探す）ので、
+//! dispatch（CLI / MCP / 再生ボタン）はすべて [`resolve_file`] を通す。
+//! ファイルシステムを見ない [`resolve_for`] はこのモジュールのテスト専用で、外へは出さない
+//! （出すと、プロジェクトを見ない解決がどこかの入口に残る）。
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::platform::support::Platform;
+use crate::project_root::{self, SearchBounds};
+use crate::runner_project::{self, ProjectMatch};
 use crate::shell::quote_for_shell;
 
 // --- 定数 ---
@@ -44,8 +55,22 @@ pub enum RunSource {
     Declaration,
     /// 拡張子既定（settings / 組み込み）
     ExtensionDefault,
+    /// プロジェクト既定（`Cargo.toml` / `package.json` 等を上へ辿って決めたもの。#1656）
+    ProjectDefault,
     /// CLI / MCP の明示 `--command` オーバーライド
     Override,
+}
+
+impl RunSource {
+    /// CLI / MCP の応答に出す名前（`tako run --dry-run` / `tako_run_resolve` の `source`）
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Declaration => "declaration",
+            Self::ExtensionDefault => "extension_default",
+            Self::ProjectDefault => "project_default",
+            Self::Override => "override",
+        }
+    }
 }
 
 /// 1 プロファイル分の解決済み実行計画
@@ -85,6 +110,10 @@ pub struct Resolution {
     /// 全検出プロファイル一覧（ドロップダウン用）
     pub all_profiles: Vec<RunPlan>,
     pub warnings: Vec<String>,
+    /// ファイルの属するプロジェクト（見つからなければ `None`。宣言が勝った場合も載る）
+    pub project: Option<ProjectMatch>,
+    /// `${workspaceRoot}` の値（プロジェクトのルート → git のルート → ファイルのディレクトリ）
+    pub workspace_root: PathBuf,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -271,9 +300,19 @@ fn strip_closers(value: &str) -> &str {
 
 // --- 変数展開 ---
 
-/// コマンド・cwd の値中の変数を展開。展開値はシングルクオートで自動エスケープ
+/// コマンド・cwd の値中の変数を展開。展開値はシングルクオートで自動エスケープ。
+///
+/// `${workspaceRoot}` はプロジェクトを知らないのでファイルのディレクトリになる
+/// （プロジェクトのルートで展開したいときは [`expand_variables_in`]）
 pub fn expand_variables(template: &str, path: &Path) -> String {
+    let file_dir = path.parent().unwrap_or(Path::new("")).to_path_buf();
+    expand_variables_in(template, path, &file_dir)
+}
+
+/// [`expand_variables`] に `${workspaceRoot}` の値を渡す版（#1656）
+pub fn expand_variables_in(template: &str, path: &Path, workspace_root: &Path) -> String {
     let file_str = path.to_string_lossy();
+    let root_str = workspace_root.to_string_lossy();
     let file_dir = path
         .parent()
         .map(|p| p.to_string_lossy().into_owned())
@@ -305,6 +344,7 @@ pub fn expand_variables(template: &str, path: &Path) -> String {
                     "fileBase" => Some(quote_for_shell(&file_base)),
                     "fileNoExt" => Some(quote_for_shell(&file_no_ext)),
                     "ext" => Some(quote_for_shell(&ext)),
+                    "workspaceRoot" => Some(quote_for_shell(&root_str)),
                     _ => None, // 未知は展開せずそのまま
                 };
                 if let Some(rep) = replacement {
@@ -350,8 +390,66 @@ pub fn merged_defaults_for(
     map
 }
 
-/// 宣言 + 拡張子既定 + オーバーライドから解決（実行中の OS 向け）
-pub fn resolve(
+/// 実ファイルの解決（実行中の OS 向け）。**dispatch / 再生ボタンはこれを通す**（#1656）。
+///
+/// `user_defaults` は settings.json の `runner_defaults`（ユーザーが設定した拡張子既定）。
+/// 組み込み既定との重ね合わせと、プロジェクト既定との優先順位はここで決める
+pub fn resolve_file(
+    path: &Path,
+    head: &str,
+    user_defaults: &BTreeMap<String, String>,
+    profile: Option<&str>,
+    command_override: Option<&str>,
+) -> Result<Resolution, RunnerError> {
+    // A/B（`TAKO_1656_LEGACY=1`）: プロジェクトを見ない #1656 以前の解決へ戻す
+    let bounds = SearchBounds::for_user();
+    let detect = !std::env::var("TAKO_1656_LEGACY").is_ok_and(|v| v == "1");
+    resolve_file_in(
+        Platform::current(),
+        path,
+        head,
+        user_defaults,
+        profile,
+        command_override,
+        detect.then_some(&bounds),
+    )
+}
+
+/// [`resolve_file`] の OS と探索範囲を外から渡す版（テスト・検査用）。
+///
+/// `bounds` が `None` ならプロジェクトを探さない（`${workspaceRoot}` はファイルのディレクトリ）
+pub fn resolve_file_in(
+    platform: Platform,
+    path: &Path,
+    head: &str,
+    user_defaults: &BTreeMap<String, String>,
+    profile: Option<&str>,
+    command_override: Option<&str>,
+    bounds: Option<&SearchBounds>,
+) -> Result<Resolution, RunnerError> {
+    let file_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let project = bounds.and_then(|b| runner_project::detect(platform, path, head, b));
+    let workspace_root = match (&project, bounds) {
+        (Some(p), _) => p.root.clone(),
+        (None, Some(b)) => project_root::repo_root_within(&file_dir, b).unwrap_or(file_dir),
+        (None, None) => file_dir,
+    };
+    resolve_core(
+        platform,
+        path,
+        head,
+        &merged_defaults_for(platform, user_defaults),
+        user_defaults,
+        project,
+        workspace_root,
+        profile,
+        command_override,
+    )
+}
+
+/// 宣言 + 拡張子既定 + オーバーライドから解決（実行中の OS 向け・プロジェクトを見ない）
+#[cfg(test)]
+pub(crate) fn resolve(
     path: &Path,
     head: &str,
     ext_defaults: &BTreeMap<String, String>,
@@ -368,12 +466,13 @@ pub fn resolve(
     )
 }
 
-/// OS を指定しての解決（#1655）。
+/// OS を指定しての解決（#1655。プロジェクトを見ない = ファイルシステムに触らない）。
 ///
 /// `platform` が効くのは**既定が見つからなかったときの案内**だけ
 /// （どの既定表を渡すかは呼び出し側が決める）。分けてあるおかげで、
 /// macOS 上から「Windows で `.zsh` を実行しようとした人に何が出るか」まで検査できる
-pub fn resolve_for(
+#[cfg(test)]
+pub(crate) fn resolve_for(
     platform: Platform,
     path: &Path,
     head: &str,
@@ -382,10 +481,42 @@ pub fn resolve_for(
     command_override: Option<&str>,
 ) -> Result<Resolution, RunnerError> {
     let file_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    resolve_core(
+        platform,
+        path,
+        head,
+        ext_defaults,
+        &BTreeMap::new(),
+        None,
+        file_dir,
+        profile,
+        command_override,
+    )
+}
+
+/// 解決の核（ファイルシステムに触らない）。
+///
+/// - `ext_defaults`: 組み込み + ユーザー設定を重ねた拡張子既定
+/// - `user_defaults`: そのうちユーザーが設定したもの（**プロジェクト既定より強い**のは
+///   こちらだけ。明示の設定を tako の推定で上書きしない）
+#[allow(clippy::too_many_arguments)]
+fn resolve_core(
+    platform: Platform,
+    path: &Path,
+    head: &str,
+    ext_defaults: &BTreeMap<String, String>,
+    user_defaults: &BTreeMap<String, String>,
+    project: Option<ProjectMatch>,
+    workspace_root: PathBuf,
+    profile: Option<&str>,
+    command_override: Option<&str>,
+) -> Result<Resolution, RunnerError> {
+    let file_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
     let ext = path
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
+    let expand = |template: &str| expand_variables_in(template, path, &workspace_root);
 
     let decls = parse_declarations(head);
     let warnings = decls.warnings;
@@ -397,7 +528,7 @@ pub fn resolve_for(
     if let Some(cmd_override) = command_override {
         let plan = RunPlan {
             profile: profile.unwrap_or("default").to_string(),
-            command: expand_variables(cmd_override, path),
+            command: expand(cmd_override),
             cwd: file_dir.clone(),
             shell: None,
             source: RunSource::Override,
@@ -407,6 +538,8 @@ pub fn resolve_for(
             plan,
             all_profiles,
             warnings,
+            project,
+            workspace_root,
         });
     }
 
@@ -432,7 +565,7 @@ pub fn resolve_for(
                 .or(common_cwd);
 
             let resolved_cwd = if let Some(cwd_str) = raw_cwd {
-                let expanded = expand_variables(cwd_str, path);
+                let expanded = expand(cwd_str);
                 // シングルクオート除去（expand_variables がクオートするが cwd はパスとして使う）
                 let cleaned = strip_quotes(&expanded);
                 let cwd_path = Path::new(&cleaned);
@@ -447,7 +580,7 @@ pub fn resolve_for(
 
             all_profiles.push(RunPlan {
                 profile: decl.name.clone(),
-                command: expand_variables(run_cmd, path),
+                command: expand(run_cmd),
                 cwd: resolved_cwd,
                 shell: decl.shell.clone(),
                 source: RunSource::Declaration,
@@ -455,16 +588,30 @@ pub fn resolve_for(
         }
     }
 
-    // 3. 拡張子既定（宣言がない場合のフォールバック）
-    if all_profiles.is_empty() && !ext.is_empty() {
-        if let Some(default_cmd) = ext_defaults.get(&ext) {
-            all_profiles.push(RunPlan {
+    // 3〜5. 宣言がない場合のフォールバック:
+    //   ユーザーが設定した拡張子既定 → プロジェクト既定 → 組み込みの拡張子既定
+    if all_profiles.is_empty() {
+        // 空文字列は「組み込みを無効化」の意味（設計 §2.1）で、プロジェクト既定は止めない
+        let user_set = user_defaults.get(&ext).is_some_and(|c| !c.is_empty());
+        match &project {
+            Some(p) if !user_set => all_profiles.push(RunPlan {
                 profile: "default".to_string(),
-                command: expand_variables(default_cmd, path),
-                cwd: file_dir.clone(),
+                command: p.command.clone(),
+                cwd: p.root.clone(),
                 shell: None,
-                source: RunSource::ExtensionDefault,
-            });
+                source: RunSource::ProjectDefault,
+            }),
+            _ => {
+                if let Some(default_cmd) = ext_defaults.get(&ext).filter(|_| !ext.is_empty()) {
+                    all_profiles.push(RunPlan {
+                        profile: "default".to_string(),
+                        command: expand(default_cmd),
+                        cwd: file_dir.clone(),
+                        shell: None,
+                        source: RunSource::ExtensionDefault,
+                    });
+                }
+            }
         }
     }
 
@@ -480,6 +627,8 @@ pub fn resolve_for(
             plan,
             all_profiles,
             warnings,
+            project,
+            workspace_root,
         });
     }
 
@@ -495,6 +644,8 @@ pub fn resolve_for(
         plan,
         all_profiles,
         warnings,
+        project,
+        workspace_root,
     })
 }
 
@@ -1214,5 +1365,304 @@ mod tests {
         let res = resolve(&path, head, &defaults, Some("test"), None).unwrap();
         // test プロファイルには個別 cwd がないので共通 cwd が使われる
         assert_eq!(res.plan.cwd, PathBuf::from("/tmp/build"));
+    }
+
+    // --- プロジェクト既定（#1656）---
+
+    /// 一時 dir にプロジェクトを組む箱。天井は箱の根なので実 HOME を読まない
+    struct Proj {
+        base: PathBuf,
+        bounds: SearchBounds,
+    }
+
+    impl Proj {
+        fn new(tag: &str) -> Self {
+            let base = std::env::temp_dir().join(format!(
+                "tako-1656-runner-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).unwrap();
+            let base = crate::platform::path::canonicalize(&base).unwrap();
+            let bounds = SearchBounds::with_ceilings([base.clone()]);
+            Self { base, bounds }
+        }
+
+        fn write(&self, rel: &str, content: &str) -> PathBuf {
+            let path = self.base.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, content).unwrap();
+            path
+        }
+
+        fn resolve(
+            &self,
+            platform: Platform,
+            rel: &str,
+            user: &BTreeMap<String, String>,
+        ) -> Result<Resolution, RunnerError> {
+            let file = self.base.join(rel);
+            let head = std::fs::read_to_string(&file).unwrap_or_default();
+            resolve_file_in(platform, &file, &head, user, None, None, Some(&self.bounds))
+        }
+    }
+
+    impl Drop for Proj {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    /// 受け入れ条件 1: cargo / npm / python / go のプロジェクト内のファイルは
+    /// 種別の既定・cwd = ルート・source = ProjectDefault（両 OS の列を固定）
+    #[test]
+    fn プロジェクトの中のファイルはプロジェクト既定で解決する() {
+        let p = Proj::new("kinds");
+        p.write("rs/Cargo.toml", "[package]\nname = \"demo\"\n");
+        p.write("rs/src/main.rs", "fn main() {}\n");
+        p.write("js/package.json", r#"{"scripts":{"start":"node app.js"}}"#);
+        p.write("js/app.js", "");
+        p.write("py/pyproject.toml", "");
+        p.write("py/pkg/cli.py", "");
+        p.write("go/go.mod", "module m\n");
+        p.write("go/cmd/srv/main.go", "package main\n");
+        // (ファイル, ルート, macOS, Windows)
+        let cases = [
+            ("rs/src/main.rs", "rs", "cargo run", "cargo run"),
+            ("js/app.js", "js", "npm run start", "npm run start"),
+            (
+                "py/pkg/cli.py",
+                "py",
+                "python3 -m pkg.cli",
+                "python -m pkg.cli",
+            ),
+            (
+                "go/cmd/srv/main.go",
+                "go",
+                "go run ./cmd/srv",
+                "go run ./cmd/srv",
+            ),
+        ];
+        for (rel, root, mac, win) in cases {
+            for (platform, expected) in [(Platform::MacOs, mac), (Platform::Windows, win)] {
+                let res = p
+                    .resolve(platform, rel, &BTreeMap::new())
+                    .unwrap_or_else(|e| panic!("{platform:?} の {rel} が解決できない: {e}"));
+                assert_eq!(
+                    res.plan.source,
+                    RunSource::ProjectDefault,
+                    "{platform:?} {rel}"
+                );
+                assert_eq!(res.plan.command, expected, "{platform:?} {rel}");
+                assert_eq!(res.plan.cwd, p.base.join(root), "{platform:?} {rel}");
+                assert_eq!(res.workspace_root, p.base.join(root));
+                assert_eq!(res.all_profiles.len(), 1);
+            }
+        }
+    }
+
+    /// Issue の症状そのもの: cargo の lib crate の `.rs` が `rustc` 単体へ落ちない
+    #[test]
+    fn cargoのlib_crateはrustc単体へ落ちない() {
+        let p = Proj::new("issue");
+        p.write("repo/Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
+        p.write(
+            "repo/crates/tako-core/Cargo.toml",
+            "[package]\nname = \"tako-core\"\n",
+        );
+        p.write("repo/crates/tako-core/src/lib.rs", "pub mod runner;\n");
+        p.write("repo/crates/tako-core/src/runner.rs", "//! doc\n");
+        for platform in [Platform::MacOs, Platform::Windows] {
+            let res = p
+                .resolve(
+                    platform,
+                    "repo/crates/tako-core/src/runner.rs",
+                    &BTreeMap::new(),
+                )
+                .unwrap();
+            assert_eq!(res.plan.command, "cargo test -p tako-core --lib runner::");
+            assert_eq!(res.plan.cwd, p.base.join("repo"));
+            assert!(!res.plan.command.contains("rustc"), "{}", res.plan.command);
+            let project = res.project.expect("プロジェクトが載る");
+            assert_eq!(project.kind, "cargo");
+            assert_eq!(
+                project.marker,
+                p.base.join("repo/crates/tako-core/Cargo.toml")
+            );
+        }
+    }
+
+    /// 受け入れ条件 2（前半）: `tako:run` 宣言はプロジェクト既定より勝つ
+    #[test]
+    fn 宣言はプロジェクト既定より勝つ() {
+        let p = Proj::new("decl");
+        p.write("rs/Cargo.toml", "[package]\nname = \"demo\"\n");
+        p.write(
+            "rs/src/main.rs",
+            "// tako:run: cargo run --release\n// tako:run[check]: cargo clippy\nfn main() {}\n",
+        );
+        for platform in [Platform::MacOs, Platform::Windows] {
+            let res = p
+                .resolve(platform, "rs/src/main.rs", &BTreeMap::new())
+                .unwrap();
+            assert_eq!(res.plan.source, RunSource::Declaration);
+            assert_eq!(res.plan.command, "cargo run --release");
+            // 宣言の cwd は従来どおりファイルのディレクトリ（プロジェクト既定の cwd を持ち込まない）
+            assert_eq!(res.plan.cwd, p.base.join("rs/src"));
+            assert_eq!(
+                res.all_profiles.len(),
+                2,
+                "プロジェクト既定は一覧に混ざらない"
+            );
+            // 宣言が勝っても、どのプロジェクトの中かは応答に載る
+            assert_eq!(res.project.map(|m| m.kind), Some("cargo"));
+        }
+    }
+
+    /// ユーザーが `tako run-default` で設定した拡張子既定は、tako の推定（プロジェクト既定）より強い。
+    /// 空文字列（組み込みの無効化）はプロジェクト既定を止めない
+    #[test]
+    fn ユーザーが設定した拡張子既定はプロジェクト既定より勝つ() {
+        let p = Proj::new("user");
+        p.write("py/pyproject.toml", "");
+        p.write("py/pkg/cli.py", "");
+        let mut user = BTreeMap::new();
+        user.insert("py".to_string(), "python3.12 ${fileBase}".to_string());
+        let res = p.resolve(Platform::MacOs, "py/pkg/cli.py", &user).unwrap();
+        assert_eq!(res.plan.source, RunSource::ExtensionDefault);
+        assert_eq!(res.plan.command, "python3.12 cli.py");
+        assert_eq!(res.plan.cwd, p.base.join("py/pkg"));
+
+        user.insert("py".to_string(), String::new());
+        let res = p.resolve(Platform::MacOs, "py/pkg/cli.py", &user).unwrap();
+        assert_eq!(res.plan.source, RunSource::ProjectDefault);
+        assert_eq!(res.plan.command, "python3 -m pkg.cli");
+
+        // 別の拡張子のユーザー設定は効かない
+        let mut other = BTreeMap::new();
+        other.insert("rb".to_string(), "ruby -w ${fileBase}".to_string());
+        let res = p.resolve(Platform::MacOs, "py/pkg/cli.py", &other).unwrap();
+        assert_eq!(res.plan.source, RunSource::ProjectDefault);
+    }
+
+    /// 受け入れ条件 2（後半）: マーカーが無ければ従来の拡張子既定（回帰なし）
+    #[test]
+    fn マーカーが無ければ従来の拡張子既定() {
+        let p = Proj::new("nomarker");
+        p.write("loose/hello.rs", "fn main() {}\n");
+        p.write("loose/hello.py", "");
+        p.write("loose/hello.go", "package main\n");
+        p.write("loose/hello.js", "");
+        for platform in [Platform::MacOs, Platform::Windows] {
+            for ext in ["rs", "py", "go", "js"] {
+                let rel = format!("loose/hello.{ext}");
+                let res = p.resolve(platform, &rel, &BTreeMap::new()).unwrap();
+                // #1655 の期待値の表と同じ値（拡張子既定の解決結果を両osで固定する）
+                let row = 解決の期待値.iter().find(|r| r.0 == ext).unwrap();
+                assert_eq!(
+                    Some(res.plan.command.as_str()),
+                    期待値の列(row, platform),
+                    "{platform:?} {rel}"
+                );
+                assert_eq!(res.plan.source, RunSource::ExtensionDefault);
+                assert_eq!(res.plan.cwd, p.base.join("loose"));
+                assert!(res.project.is_none());
+            }
+        }
+    }
+
+    /// 探索しない（`bounds = None` = `TAKO_1656_LEGACY=1` の形）ときは #1656 以前と同じ
+    #[test]
+    fn 探索しなければ1656以前の解決() {
+        let p = Proj::new("legacy");
+        p.write("rs/Cargo.toml", "[package]\nname = \"demo\"\n");
+        let file = p.write("rs/src/main.rs", "fn main() {}\n");
+        let res = resolve_file_in(
+            Platform::MacOs,
+            &file,
+            "fn main() {}\n",
+            &BTreeMap::new(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(res.plan.source, RunSource::ExtensionDefault);
+        assert_eq!(res.plan.command, "rustc main.rs -o main && ./main");
+        assert_eq!(res.workspace_root, p.base.join("rs/src"));
+    }
+
+    #[test]
+    fn makefileは拡張子が無くてもプロジェクト既定で走る() {
+        let p = Proj::new("make");
+        p.write("c/Makefile", "run: app\n\t./app\n");
+        let res = p
+            .resolve(Platform::Windows, "c/Makefile", &BTreeMap::new())
+            .unwrap();
+        assert_eq!(res.plan.command, "make run");
+        assert_eq!(res.plan.source, RunSource::ProjectDefault);
+        // プロファイル名 default で明示しても引ける（再生ボタンの既定プロファイル）
+        let file = p.base.join("c/Makefile");
+        let res = resolve_file_in(
+            Platform::MacOs,
+            &file,
+            "",
+            &BTreeMap::new(),
+            Some("default"),
+            None,
+            Some(&p.bounds),
+        )
+        .unwrap();
+        assert_eq!(res.plan.command, "make run");
+    }
+
+    #[test]
+    fn workspace_root変数はプロジェクトのルートへ展開される() {
+        let p = Proj::new("wsroot");
+        p.write("my proj/Cargo.toml", "[package]\nname = \"demo\"\n");
+        p.write(
+            "my proj/src/main.rs",
+            "// tako:run: ls ${workspaceRoot}\n// tako:cwd: ${workspaceRoot}\n",
+        );
+        let res = p
+            .resolve(Platform::MacOs, "my proj/src/main.rs", &BTreeMap::new())
+            .unwrap();
+        let root = p.base.join("my proj");
+        assert_eq!(
+            res.plan.command,
+            format!("ls {}", quote_for_shell(&root.to_string_lossy()))
+        );
+        assert_eq!(res.plan.cwd, root, "cwd はクオートを外したパス");
+        assert_eq!(res.workspace_root, root);
+    }
+
+    /// プロジェクトが無ければ git のルート、それも無ければファイルのディレクトリ
+    #[test]
+    fn workspace_root変数のフォールバック() {
+        let p = Proj::new("wsroot-fallback");
+        std::fs::create_dir_all(p.base.join("repo/.git")).unwrap();
+        p.write("repo/docs/run.sh", "# tako:run: echo ${workspaceRoot}\n");
+        p.write("plain/run.sh", "# tako:run: echo ${workspaceRoot}\n");
+        let res = p
+            .resolve(Platform::MacOs, "repo/docs/run.sh", &BTreeMap::new())
+            .unwrap();
+        assert_eq!(res.workspace_root, p.base.join("repo"));
+        assert!(res.project.is_none());
+        let res = p
+            .resolve(Platform::MacOs, "plain/run.sh", &BTreeMap::new())
+            .unwrap();
+        assert_eq!(res.workspace_root, p.base.join("plain"));
+        // プロジェクトを知らない展開はファイルのディレクトリ
+        let path = PathBuf::from("/tmp/src/main.c");
+        assert_eq!(expand_variables("${workspaceRoot}", &path), "/tmp/src");
+    }
+
+    #[test]
+    fn 出典の名前() {
+        assert_eq!(RunSource::Declaration.as_str(), "declaration");
+        assert_eq!(RunSource::ExtensionDefault.as_str(), "extension_default");
+        assert_eq!(RunSource::ProjectDefault.as_str(), "project_default");
+        assert_eq!(RunSource::Override.as_str(), "override");
     }
 }
