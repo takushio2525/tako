@@ -128,6 +128,16 @@ export function createClient() {
     dismissTask(id) {
       return request('POST', `/api/tasks/${encodeURIComponent(id)}/dismiss`);
     },
+    // --- コマンド提案カード（#1724。経路は `remote_cards::CARD_ROUTES` が正）---
+    // そのペインに PC で出ているカード（論理文字列 + 実行記録）。observe で読める
+    commandCards(paneId) {
+      return request('GET', `/api/cards?pane=${encodeURIComponent(paneId)}`);
+    },
+    // カードの 1 件を PC で実行する（interact 以上）。**送るのは番号だけ**で、
+    // 走る文字列は AI が PC に置いたもの（本文をスマホから渡す口は無い）
+    runCommandCard(cardId, index) {
+      return request('POST', `/api/cards/${encodeURIComponent(cardId)}/run`, { index });
+    },
     // リサイズ要求は存在しない: リモート表示は PC 側のペインサイズに一切影響しない（#63）
     wsUrl(paneId) {
       const proto = base.startsWith('https') ? 'wss' : 'ws';

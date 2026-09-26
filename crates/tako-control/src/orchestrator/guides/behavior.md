@@ -141,6 +141,10 @@
    Exceptions: commands you run yourself (just run them), commands that need
    interactive input (use `tako_run_interactive`), and inline mentions of a
    command inside an explanation that the user is not being asked to execute.
+   The card also appears on that pane's screen in tako remote (the phone), where an
+   interact-or-higher device can run it after one confirmation, so it works while the
+   user is away from the PC too. Running the same command again is refused while its
+   previous run is still going; `action: "list"` reports each command's run state.
 13. **Never put verification GUIs on the user's screen**: anything that opens a
    window — an isolated `tako-app` (`TAKO_ISOLATED=1`), the GUI self-test, the
    visual test, a screen recording — goes to the standing virtual display, never

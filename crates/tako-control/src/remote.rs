@@ -4958,6 +4958,12 @@ fn required_role(method: &tiny_http::Method, path: &str) -> DeviceRole {
     if let Some(role) = crate::remote_tasks::role_for(method.as_str(), path) {
         return role;
     }
+    // #1724: スマホからコマンド提案カードを見る / 実行する経路も宣言表が正
+    // （`remote_cards::CARD_ROUTES`）。一覧は Observe・実行は Interact で、
+    // **表に無い `/api/cards…` は表側が Manage へ落とす**
+    if let Some(role) = crate::remote_cards::role_for(method.as_str(), path) {
+        return role;
+    }
     // 表に無い形の SSH 系（#1080）も読み書きとも Manage。一覧が GET なのに
     // Observe でないのは、①`~/.ssh/config` の Host 名・user・port は画面に映らない
     // **別の在庫情報**で、画面を見るだけの端末へ配る理由が無い ②一覧の用途は
@@ -5757,6 +5763,25 @@ fn handle_api_v2_routes(
                 role: device.role,
             };
             crate::remote_tasks::handle_tasks_request(request, p, url_full, &deps)
+        }
+        // #1724: コマンド提案カードの一覧 / 実行。実装は `remote_cards` に閉じてあり、
+        // 中身は FR-2.22 の `Request::ShowCommand`（list / run）を素通しするだけ
+        // = PC のカードのボタン・CLI・MCP と同じ dispatch を通る（実行ロジックを新設しない）
+        (_, p) if crate::remote_cards::owns_path(p) => {
+            let deps = crate::remote_cards::CardsDeps {
+                send: &|req| app_dispatch(app_conn, req, "コマンドカードの操作"),
+                audit: &|event, extra| {
+                    ctx.registry
+                        .lock()
+                        .unwrap()
+                        .audit(event, &device.id, &device.name, extra)
+                },
+                cors: cors_headers(),
+                // 認可済みの role をそのまま渡す（受け口の二重の門はこの値で判定する）
+                role: device.role,
+                device_id: &device.id,
+            };
+            crate::remote_cards::handle_cards_request(request, p, url_full, &deps)
         }
         // #1079: ファイル API（一覧 / プレビュー / ダウンロード）と
         // #1084 / #1085 の書き込み（保存 / 送り直し）。実装は `remote_files` に
@@ -6907,6 +6932,190 @@ mod tests {
         std::env::remove_var("TAKO_REMOTE_TRUSTED_PEER_NAMES");
 
         handle.join().expect("サーバースレッド");
+        std::env::remove_var("TAKO_REMOTE_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1724: **権限外からのコマンドカード実行は API で拒否される**（画面で隠すだけにしない）。
+    ///
+    /// 実 HTTP を層①（接続元検証）→ 層②（`required_role` + `authorize_device`）→ 受け口
+    /// （`remote_cards::handle_cards_request`）まで通して、
+    ///
+    /// - observe / **降格した直後** / 失効 / 未登録の端末の実行は **403**
+    /// - interact の実行は認可を通って app へ届く（この器には app が居ないので **503** =
+    ///   「認可は通った」の証拠。403 と取り違えない）
+    /// - observe でも一覧は認可を通る（カードは見えるが実行は出ない = Issue の記載）
+    /// - 断った実行は受け口へ届かない = persist.log に「実行」の行が残らない
+    ///
+    /// を見る。**表の role を Observe へ緩める / `required_role` が表を引かなくなる**と
+    /// ①の observe が 403 でなくなり、この assert が落ちる（番犬の A/B は
+    /// `tests/issue1724_remote_card_run_watchdog.rs` に書いた手順で再現できる）
+    #[test]
+    fn issue1724_権限外からのカード実行はapiで拒否される() {
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "tako-1724-cards-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("一時ディレクトリ");
+        std::env::set_var("TAKO_REMOTE_STATE_DIR", dir.as_os_str());
+        std::env::remove_var("TAKO_841_LEGACY");
+        // 層①は本番と同じ経路を通す。接続元（= このテストプロセス）を信頼名に載せる
+        // （#841 のテスト ④ と同じ代理。実 tailscaled は root で動くので起こせない）
+        let own = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .expect("自分の実行ファイル名");
+        std::env::set_var("TAKO_REMOTE_TRUSTED_PEER_NAMES", &own);
+
+        let who = |id: &str, host: &str| crate::tailscale::WhoisInfo {
+            stable_id: id.to_string(),
+            node_name: format!("{host}.tail0000.ts.net"),
+            hostname: host.to_string(),
+            login: "user@example.com".to_string(),
+        };
+        let observe = who("nTEST1724OBSERVE", "phone-observe");
+        let interact = who("nTEST1724INTERACT", "phone-interact");
+        let revoked = who("nTEST1724REVOKED", "phone-revoked");
+        let stranger = who("nTEST1724STRANGER", "phone-stranger");
+        let mut registry = DeviceRegistry::open(&dir).expect("レジストリ");
+        for (ip, w, role) in [
+            ("100.64.0.21", &observe, Some(DeviceRole::Observe)),
+            ("100.64.0.22", &interact, Some(DeviceRole::Interact)),
+            ("100.64.0.23", &revoked, Some(DeviceRole::Interact)),
+            ("100.64.0.24", &stranger, None),
+        ] {
+            registry.cache_whois(ip, w.clone());
+            if let Some(role) = role {
+                registry.request_pairing(w, &w.hostname, role, "");
+                registry.approve(&w.stable_id, Some(role)).expect("承認");
+            }
+        }
+        registry.revoke(&revoked.stable_id).expect("失効");
+
+        let (server, endpoint) =
+            local_endpoint::bind(&local_endpoint::EndpointSpec::Loopback).expect("bind");
+        let ctx = Arc::new(DaemonCtx {
+            registry: Mutex::new(registry),
+            ts_cli: "tailscale".to_string(),
+            admin_token: "test-admin-token".to_string(),
+            tmux_socket: "tako-test-1724".to_string(),
+            ws_connections: Mutex::new(HashMap::new()),
+            base_url: "https://example.tail0000.ts.net".to_string(),
+            expected_host: "example.tail0000.ts.net".to_string(),
+            endpoint: endpoint.clone(),
+            peer_rejects: Mutex::new(PeerRejectState::default()),
+        });
+        let app_conn = Arc::new(RwLock::new(AppConnection::new()));
+        let pane_mapping = Arc::new(RwLock::new(PaneMapping::new()));
+        let broadcasters = new_broadcaster_map();
+
+        // 下で撃つ本数と同じにする（多いと最後の recv_timeout をまるごと待つ）
+        const REQUESTS: usize = 8;
+        let server_ctx = Arc::clone(&ctx);
+        let handle = std::thread::spawn(move || {
+            for _ in 0..REQUESTS {
+                match server.recv_timeout(std::time::Duration::from_secs(10)) {
+                    Ok(Some(req)) => {
+                        handle_request_v2(req, &server_ctx, &app_conn, &pane_mapping, &broadcasters)
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        let call = |method: &str, path: &str, ip: &str, body: &str| -> (u16, String) {
+            let raw = format!(
+                "{method} {path} HTTP/1.1\r\nHost: localhost\r\n\
+                 X-Forwarded-For: {ip}\r\n\
+                 X-Forwarded-Host: example.tail0000.ts.net\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let resp = local_endpoint::request_raw(
+                &endpoint,
+                &raw,
+                Some(std::time::Duration::from_secs(10)),
+            )
+            .expect("応答");
+            let status = resp
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|s| s.parse().ok())
+                .expect("ステータス行");
+            (status, resp)
+        };
+        let run = |ip: &str| call("POST", "/api/cards/7/run", ip, r#"{"index":1}"#);
+
+        // ① observe の実行は層②で 403（受け口へ届かない）
+        let (status, body) = run("100.64.0.21");
+        assert_eq!(status, 403, "observe の端末が実行できてしまう: {body}");
+        assert!(
+            body.contains("interact 以上"),
+            "足りない role を名指す: {body}"
+        );
+        // ② observe でも一覧は認可を通る（app が居ないので 503 = 認可は通った）
+        let (status, body) = call("GET", "/api/cards?pane=1", "100.64.0.21", "");
+        assert_eq!(
+            status, 503,
+            "observe は一覧を読める（Issue の記載）: {body}"
+        );
+        // ③ interact の実行は認可を通って app へ届く（403 ではない）
+        let (status, body) = run("100.64.0.22");
+        assert_eq!(status, 503, "interact は実行の認可を通る: {body}");
+        assert!(body.contains("app_unreachable"), "{body}");
+        // ④ **その場で降格した直後**の実行は 403（認可は毎回レジストリを引く）
+        ctx.registry
+            .lock()
+            .unwrap()
+            .set_role(&interact.stable_id, DeviceRole::Observe)
+            .expect("降格");
+        let (status, body) = run("100.64.0.22");
+        assert_eq!(status, 403, "降格した直後の端末が実行できてしまう: {body}");
+        // ⑤ 失効した端末 / ⑥ 未登録の端末
+        let (status, body) = run("100.64.0.23");
+        assert_eq!(status, 403, "失効した端末が実行できてしまう: {body}");
+        let (status, body) = run("100.64.0.24");
+        assert_eq!(status, 403, "未登録の端末が実行できてしまう: {body}");
+        // ⑦ 表に無い操作（カードを作る / PC のクリップボードを書く）は interact 以上でも通らない
+        ctx.registry
+            .lock()
+            .unwrap()
+            .set_role(&interact.stable_id, DeviceRole::Interact)
+            .expect("戻す");
+        let (status, body) = call(
+            "POST",
+            "/api/cards/7/show",
+            "100.64.0.22",
+            r#"{"commands":["rm -rf /"]}"#,
+        );
+        assert_eq!(status, 403, "表に無い受け口は床の Manage: {body}");
+        let (status, body) = call("POST", "/api/cards/7/copy", "100.64.0.22", "{}");
+        assert_eq!(status, 403, "表に無い受け口は床の Manage: {body}");
+
+        handle.join().expect("サーバースレッド");
+
+        // 断った実行は受け口へ届いていない = 「実行」の行は interact の 1 回だけ
+        let log = crate::diag::persist_log_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default();
+        let ran: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("リモートからコマンドカードを実行"))
+            .filter(|l| l.contains("nTEST1724"))
+            .collect();
+        assert_eq!(ran.len(), 1, "受け口へ届いた実行は 1 回だけのはず: {ran:?}");
+        assert!(
+            ran[0].contains("端末=nTEST1724INTERACT カード=7 番号=1 結果=app_unreachable"),
+            "どの端末から・どのカードを・どうなったかが残る: {ran:?}"
+        );
+
+        std::env::remove_var("TAKO_REMOTE_TRUSTED_PEER_NAMES");
         std::env::remove_var("TAKO_REMOTE_STATE_DIR");
         let _ = std::fs::remove_dir_all(&dir);
     }

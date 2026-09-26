@@ -127,7 +127,8 @@ export function App() {
   const { segments } = route;
   let page;
   if (segments[0] === 'panes' && segments[1]) {
-    page = <TerminalPage paneId={segments[1]} me={me} />;
+    // #1724: カードの実行権限が変わったとき（降格・承認）に me を取り直す
+    page = <TerminalPage paneId={segments[1]} me={me} onMeRefresh={refreshMe} />;
   } else if (segments[0] === 'tasks') {
     // #1450 B3: 人がやること（id はクエリで持つので端末の戻るが効く）
     page = (

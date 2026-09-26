@@ -329,3 +329,10 @@ call it with `TAKO_ORCHESTRATOR_ROLE=master:<profile>` so the reply has an addre
 <!-- 節を分けるための見出し 1 行だけが新規なのでここへ宣言する。 -->
 
 ## Scout Workers: Reconnaissance Before a Real Task
+
+<!-- #1724: コマンド提案カードはスマホ（tako remote）からも実行できる。behavior の -->
+<!-- 行動規範 12 の末尾へ追記した本文をそのまま貼る。prompt 側は 1 行も足していない。 -->
+   The card also appears on that pane's screen in tako remote (the phone), where an
+   interact-or-higher device can run it after one confirmation, so it works while the
+   user is away from the PC too. Running the same command again is refused while its
+   previous run is still going; `action: "list"` reports each command's run state.
