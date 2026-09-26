@@ -28,6 +28,10 @@
 - PC のカードには「実行済み」の状態が無かったので、tako-core のカードへコマンドごとの実行記録（実行ペイン / running・exited・closed / 回数）と「実行中の同じコマンドは再実行しない」を足し、`list` の `runs` で返す。PC のカードは同じ記録を出し、確定は `dispatch::refresh_command_card_runs` の 1 本
 - remote は宣言表 `remote_cards::CARD_ROUTES` の 2 本だけ（一覧 = Observe / 実行 = Interact・本文は受け取らない）で `ShowCommand` の list / run を素通し。PWA はペイン画面にカード + 全文の確認 1 回、observe には #1452 の権限リクエスト
 - 実測: 実経路 `scripts/test-remote-command-card-1724.sh` 55 PASS 0 FAIL・e2e 新 spec 8 本（全体 109 passed）・番犬の注入 4 通りが file:line 名指しで FAILED → 戻して緑
+## 2026-09-23（#1645: rebase で復活した作業ログのエントリを番犬で止めた）
+- `context-budget fix` の移送（古いエントリを**消す**）と main 側の移送が rebase で噛み合っても git は衝突を報告せず auto-merge するので、archive 済みのエントリが `progress.md` へ黙って戻る（9/23 だけで 4 回・毎回 worker の目視で発見。予算を超えなければ既存の番犬では落ちない）。判定を `tako_core::context_budget::revivals` の 1 実装として足し、`tako context-budget` / MCP の violations と新設の番犬が同じものを通る
+- 鍵は `LogEntry::archive_line()` = `fix` がアーカイブへ書くのと同じ 1 行。(日付, Issue 番号) の組は**実データで誤検出する**（アーカイブに `2026-09-14 #1450` が 3 件・`2026-07-05 #63` が 2 件）ので採らなかった
+- 実測: 注入 3 通り（復活 / 重複 / 見出しの書式を壊す空振り検査）すべて file:line 名指しで FAILED → 戻して緑。**この PR 自身の rebase でも 2 件の復活を file:line で捕らえた**
 
 ## 2026-09-26（#1656: Code Runner がプロジェクトを見て cargo run / npm run / python -m 等で走るようにした）
 - 解決器がファイル 1 枚しか見ず、cargo プロジェクトの `.rs` を `rustc` 単体で走らせて必ず失敗していた。上へ辿る範囲の 1 実装 `tako_core::project_root`（HOME の段は見ない / `.git` で止まる / 深さ 32。`detect` は #1726 の実行設定のキー・LSP #1678 と共有）と種別の表 `runner_project::KINDS`（cargo / go / npm / python / dotnet / make = 行追加で増える）を新設し、入口を `runner::resolve_file` の 1 本へ。優先は上書き → 宣言 → ユーザーの拡張子既定 → プロジェクト既定 → 組み込み。Issue の例（bin の無い lib crate）は `cargo run` が必ず落ちるので `cargo test -p <pkg> --lib <mod>::`
@@ -66,3 +70,10 @@
 - 疑いの ETXTBSY は macOS では起きない（実測）。真因は std が `Stdio::piped()` を `pipe()` → `FD_CLOEXEC` の 2 手で作る隙間に上限テストの spawn が重なり、30 秒眠る孫が兄弟の stdout の書き込み側を握ること → `READ_GRACE` 10 秒で `Failed`（lsof で相方 = 落ちたテストのプロセスを 3/3 件照合）
 - 偽 claude を起こす 4 本を `fake_claude_lock()` で直列化・孫は pid を残させ `StopGrandchild` で止める（寿命 29.9 → 1.6 秒）・番犬 `issue1748_fake_claude_serial_watchdog`（注入 6 通りを名指し）・conventions に節
 - 実測: autorename 28 件 × 4 本同時 × 250 周で修正前 3/1000 FAILED・漏れ 7 → 修正後 0/1000・漏れ 0（sleep 883 本）・workspace 5466 passed 0 failed・clippy 3 宇宙 0
+## 2026-09-26（#1711: MCP ツールカタログの説明文を短くし、LSP 用に 16 KiB の余白を作った）
+- `tools/list` が予算 204,800 B の残り 1.8 KB だったので、156 本中 47 本の description / 引数説明から根拠・仕組み・経緯・重複（`clear_*` 13 本・「省略で現状維持」・schema と同じ値）を外し **188,323 B**（main 116a63a の 204,579 B から -16,256 B）。ツール名・順序・型・必須は機械照合で不変、外した原文は `.agent/mcp-catalog-notes.md`
+- 実測: 隔離 GUI + `tako mcp serve` の tools/list と `tako context-budget` が一致・violations 0・workspace 5463 passed 0 failed・clippy 3 宇宙 0。初回は面の名前が読めず「メイン画面へ開いた」警告が出たが、uuid 照合で窓は tako-vd 上だった（#1697 の症状）
+
+## 2026-09-26（#1678: LSP 基盤（S1）を入れ、編集モードで言語サーバと握手して文書を同期するようにした）
+- tako-core::lsp（UTF-8 ⇄ UTF-16 の入口 2 本・検出表 4 行・ルート検出・状態機械 8 状態・写しとの差分）+ tako-control::lsp（Content-Length の自作フレーミング・1 サーバ 3 スレッド・再起動 3 回まで・猶予 60 秒で停止・診断は開いている文書のぶんだけ）。`lsp-types` 0.97 を追加し tokio は 0 件のまま。操作は dispatch `LspServer` → CLI `tako lsp status/servers/restart/stop/logs` → MCP `tako_lsp_server`（157 ツール）
+- 実測: e2e `issue1678_lsp_e2e` 15 本（偽サーバの実プロセス。`TAKO_1007_LEGACY=1` で 13 本 FAILED）・番犬 5 本（注入 2 通りが file:line で FAILED → 戻して緑）・隔離 GUI の `scripts/test-lsp-1678.sh`（アイドル 60 秒で受信 0 行・編集結果が 3 通りでバイト一致・kill -9 で孤児なし）・実 rust-analyzer 1.95.0 と握手（0.32 秒で稼働・能力 27 キー・診断 2 件。#1678 にコメント）

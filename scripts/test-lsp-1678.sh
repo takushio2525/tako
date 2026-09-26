@@ -92,6 +92,13 @@ wait_for() { # 説明 秒数 コマンド…
 }
 state_is() { [ "$("$TAKO_BIN" lsp status --json 2>/dev/null | json 'd["servers"][0]["state"]')" = "$1" ]; }
 log_has() { case " $(methods) " in *" $1 "*) return 0 ;; esac; return 1; }
+# 待ちの条件は**関数にする**（`test "$(lines …)" -ge 2` を渡すと呼び出し時に 1 度だけ展開され、
+# 条件が再評価されないまま上限まで待って素通りする）
+spawns_at_least() { [ "$(lines "$SPAWNS")" -ge "$1" ]; }
+expect() { # 説明 秒数 コマンド… — 待ちが外れたら FAIL として数える
+  local what="$1"
+  if wait_for "$@"; then pass "$what"; else fail "$what"; fi
+}
 
 start_gui() { # ログ名 追加の env…
   local name="$1"; shift
@@ -136,8 +143,8 @@ sleep 1
 check_eq "開いただけではサーバが 0 件" "0" "$("$TAKO_BIN" lsp status --json | json 'len(d["servers"])')"
 check_eq "偽サーバは起きていない" "0" "$(lines "$SPAWNS")"
 "$TAKO_BIN" edit start --pane "$PANE" >/dev/null
-wait_for "稼働" 20 state_is running && pass "編集モードで稼働した"
-wait_for "didOpen" 10 log_has textDocument/didOpen && pass "didOpen が届いた"
+expect "編集モードで稼働した" 20 state_is running
+expect "didOpen が届いた" 10 log_has textDocument/didOpen
 check_eq "握手の順序" "initialize initialized textDocument/didOpen " "$(methods)"
 STATUS="$("$TAKO_BIN" lsp status --json)"
 check_eq "能力: 同期は incremental" "incremental" "$(printf '%s' "$STATUS" | json 'd["servers"][0]["text_document_sync"]')"
@@ -147,7 +154,7 @@ check_eq "診断を 1 件受けて保持" "1" "$(printf '%s' "$STATUS" | json 'd
 echo
 echo "== ② 範囲編集が didChange で届く（UTF-16 の桁・#1658 の版） =="
 VERSION="$("$TAKO_BIN" edit replace-range 1:13 1:13 "語" --pane "$PANE" | json 'd["document"]["version"]')"
-wait_for "didChange" 10 log_has textDocument/didChange && pass "didChange が届いた"
+expect "didChange が届いた" 10 log_has textDocument/didChange
 CHANGE="$(python3 -c 'import json,sys
 for l in open(sys.argv[1]):
     m = json.loads(l)
@@ -198,25 +205,25 @@ check_eq "アイドル中の受信" "0" "$((AFTER - BEFORE))"
 echo
 echo "== ④ restart で起こし直し、stop で止まる =="
 "$TAKO_BIN" lsp restart >/dev/null
-wait_for "2 回目の起動" 20 test "$(lines "$SPAWNS")" -ge 2 && pass "restart で起こし直した"
-wait_for "稼働" 20 state_is running && pass "起こし直して稼働"
+expect "restart で起こし直した" 20 spawns_at_least 2
+expect "起こし直して稼働" 20 state_is running
 REOPENED="$(python3 -c 'import json,sys
 opens = [json.loads(l) for l in open(sys.argv[1]) if "didOpen" in l]
 print(len(opens), "語" in opens[-1]["params"]["textDocument"]["text"])' "$LOG")"
 check_eq "今の本文で didOpen し直す" "2 True" "$REOPENED"
 MCP_RESTART="$(mcp restart | json 'len(d["restarted"])')"
 check_eq "MCP の restart も同じ口" "1" "$MCP_RESTART"
-wait_for "3 回目の起動" 20 test "$(lines "$SPAWNS")" -ge 3 && pass "MCP の restart で起こし直した"
-wait_for "稼働" 20 state_is running
+expect "MCP の restart で起こし直した" 20 spawns_at_least 3
+expect "MCP の restart の後も稼働" 20 state_is running
 "$TAKO_BIN" lsp stop >/dev/null
-wait_for "止めた" 20 state_is stopped && pass "stop で止まる"
+expect "stop で止まる" 20 state_is stopped
 SPAWNED="$(lines "$SPAWNS")"
 "$TAKO_BIN" edit replace-range 2:0 2:0 "" --pane "$PANE" >/dev/null
 "$TAKO_BIN" edit replace-range 2:0 2:0 "// z\n" --pane "$PANE" >/dev/null
 sleep 1
 check_eq "止めた後は打鍵しても起こさない" "$SPAWNED" "$(lines "$SPAWNS")"
 "$TAKO_BIN" lsp restart >/dev/null
-wait_for "稼働" 20 state_is running
+expect "止めた後の restart で稼働" 20 state_is running
 
 echo
 echo "== ⑦-A 偽サーバありの編集列 =="
@@ -231,7 +238,7 @@ if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
   wait "$APP_PID" 2>/dev/null
   APP_PID=""
   gone() { ! kill -0 "$SERVER_PID" 2>/dev/null; }
-  wait_for "偽サーバの終了" 10 gone && pass "GUI が落ちたら偽サーバも終わった（孤児なし）"
+  expect "GUI が落ちたら偽サーバも終わった（孤児なし）" 10 gone
 else
   fail "偽サーバの pid を採れない"
 fi
