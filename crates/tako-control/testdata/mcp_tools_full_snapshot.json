@@ -1297,6 +1297,82 @@
     "name": "tako_preview_cursor"
   },
   {
+    "description": "コードプレビュー編集のカーソルを単語・行・ページ単位で動かす（GUI の修飾キー付き矢印・Home・Page Down と同じ）。本文は変えない。select=true で選択を伸ばす。位置で置くなら tako_preview_cursor。",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_version": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "movement": {
+          "enum": [
+            "left",
+            "right",
+            "up",
+            "down",
+            "word-left",
+            "word-right",
+            "line-start",
+            "smart-home",
+            "line-end",
+            "doc-start",
+            "doc-end",
+            "page-up",
+            "page-down"
+          ],
+          "type": "string"
+        },
+        "pane": {
+          "description": "対象プレビューペイン ID（省略時は呼び出し元）",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "select": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "movement"
+      ],
+      "type": "object"
+    },
+    "name": "tako_preview_move"
+  },
+  {
+    "description": "コードプレビュー編集で単語・行単位に消す（GUI の修飾キー付き Backspace / Delete と同じ）。選択があれば選択を消す。行の境目では改行だけを消す。",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_version": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "motion": {
+          "enum": [
+            "char-backward",
+            "char-forward",
+            "word-backward",
+            "word-forward",
+            "to-line-start",
+            "to-line-end"
+          ],
+          "type": "string"
+        },
+        "pane": {
+          "description": "対象プレビューペイン ID（省略時は呼び出し元）",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "motion"
+      ],
+      "type": "object"
+    },
+    "name": "tako_preview_delete"
+  },
+  {
     "description": "コードプレビューの未保存編集をファイルへ書き戻す。読み込み後に外部変更があれば競合として拒否し、上書きしない。",
     "inputSchema": {
       "additionalProperties": false,

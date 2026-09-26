@@ -357,6 +357,17 @@ pub(super) fn build_request(
             select_to_col: u64_arg(args, "select_to_col")?.map(|n| n as usize),
             expected_version: u64_arg(args, "expected_version")?,
         },
+        "tako_preview_move" => Request::PreviewMove {
+            pane: Some(target_pane(args, caller)?),
+            movement: str_arg(args, "movement")?.ok_or("movement を指定する")?,
+            select: bool_arg(args, "select")?.unwrap_or(false),
+            expected_version: u64_arg(args, "expected_version")?,
+        },
+        "tako_preview_delete" => Request::PreviewDelete {
+            pane: Some(target_pane(args, caller)?),
+            motion: str_arg(args, "motion")?.ok_or("motion を指定する")?,
+            expected_version: u64_arg(args, "expected_version")?,
+        },
         "tako_preview_save" => Request::PreviewSave {
             pane: Some(target_pane(args, caller)?),
         },

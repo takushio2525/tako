@@ -133,7 +133,9 @@ pub use terminal::{
     SelectionKind, SessionError, SessionEvent, SessionNotice, SpawnCommand, SpawnOptions,
     TermEvent, TerminalSession,
 };
-pub use text_edit::{CursorMovement, LineEnding, SearchHit, TextBuffer, TextEditError};
+pub use text_edit::{
+    CursorMovement, DeleteMotion, LineEnding, SearchHit, TextBuffer, TextEditError,
+};
 pub use theme::{Rgb, Theme};
 pub use tmux::{TmuxSession, TmuxView, TmuxWindow};
 pub use ui_mode::{pane_display, PaneDisplay, PaneDisplayInput, StarterAction, UiMode};

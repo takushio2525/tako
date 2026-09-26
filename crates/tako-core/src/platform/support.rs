@@ -1103,6 +1103,14 @@ pub const MATRIX: &[Feature] = &[
         ),
     },
     Feature {
+        key: "tako_preview_delete",
+        macos: Support::Supported,
+        windows: Support::Supported,
+        windows_evidence: Evidence::UnitTest(
+            "語・行単位の削除は本文のバイト列だけを見る純粋関数で、OS 依存の分岐を持たない。打鍵（Ctrl+Backspace / Ctrl+Delete）の Windows 列は editor_keys の単体が macOS 上からも検査し、dispatch の preview移動と削除は単語と行の単位で効く が CI の Windows ジョブで緑",
+        ),
+    },
+    Feature {
         key: "tako_preview_edit",
         macos: Support::Supported,
         windows: Support::Supported,
@@ -1136,6 +1144,14 @@ pub const MATRIX: &[Feature] = &[
         },
         windows_evidence: Evidence::SelfTest(
             "項目 90 / 114（Markdown リンク索引は緑。PDF 注釈リンクは不可）",
+        ),
+    },
+    Feature {
+        key: "tako_preview_move",
+        macos: Support::Supported,
+        windows: Support::Supported,
+        windows_evidence: Evidence::UnitTest(
+            "単語・行・ページの移動は本文のバイト列だけを見る純粋関数で、OS 依存の分岐を持たない。打鍵（Ctrl+←→ / Ctrl+Home / End）の Windows 列は editor_keys の単体が macOS 上からも検査し、dispatch の preview移動と削除は単語と行の単位で効く が CI の Windows ジョブで緑",
         ),
     },
     Feature {

@@ -1680,6 +1680,36 @@ enum EditCommand {
         #[arg(long)]
         pane: Option<u64>,
     },
+    /// カーソルを単語・行・ページ・文書端の単位で動かす（⌥← / Home / Page Down と同じ）
+    ///
+    /// 単位: left / right / up / down / word-left / word-right / line-start /
+    /// smart-home / line-end / doc-start / doc-end / page-up / page-down。
+    /// 例: `tako edit move word-left --select`
+    Move {
+        /// 動かす単位
+        movement: String,
+        /// 選択を伸ばす（⇧ 付きの打鍵と同じ）
+        #[arg(long)]
+        select: bool,
+        /// 文書の版。指定すると版が違うときは何もせず失敗する
+        #[arg(long)]
+        expect_version: Option<u64>,
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// 単語・行単位で消す（⌥⌫ / ⌘⌫ と同じ。選択があれば選択を消す）
+    ///
+    /// 単位: char-backward / char-forward / word-backward / word-forward /
+    /// to-line-start / to-line-end。例: `tako edit delete word-backward`
+    Delete {
+        /// 消す単位
+        motion: String,
+        /// 文書の版。指定すると版が違うときは何もせず失敗する
+        #[arg(long)]
+        expect_version: Option<u64>,
+        #[arg(long)]
+        pane: Option<u64>,
+    },
     /// 編集バッファをファイルへ保存する
     Save {
         #[arg(long)]
@@ -7057,6 +7087,43 @@ fn build_request(command: &Command) -> Result<Request, String> {
                     expected_version: *expect_version,
                 }
             }
+            EditCommand::Move {
+                movement,
+                select,
+                expect_version,
+                pane,
+            } => {
+                // 綴りは実行前に弾く（サーバーまで持って行かない）。表は tako-core の 1 か所
+                if tako_core::text_edit::CursorMovement::from_name(movement).is_none() {
+                    return Err(format!(
+                        "移動の単位は {} のどれか（{movement:?} は無い）",
+                        tako_core::text_edit::CursorMovement::names().join(" / ")
+                    ));
+                }
+                Request::PreviewMove {
+                    pane: target_pane(*pane)?,
+                    movement: movement.clone(),
+                    select: *select,
+                    expected_version: *expect_version,
+                }
+            }
+            EditCommand::Delete {
+                motion,
+                expect_version,
+                pane,
+            } => {
+                if tako_core::text_edit::DeleteMotion::from_name(motion).is_none() {
+                    return Err(format!(
+                        "削除の単位は {} のどれか（{motion:?} は無い）",
+                        tako_core::text_edit::DeleteMotion::names().join(" / ")
+                    ));
+                }
+                Request::PreviewDelete {
+                    pane: target_pane(*pane)?,
+                    motion: motion.clone(),
+                    expected_version: *expect_version,
+                }
+            }
             EditCommand::Save { pane } => Request::PreviewSave {
                 pane: target_pane(*pane)?,
             },
@@ -9921,6 +9988,48 @@ mod tests {
         // 数値でない位置は実行前に弾く（サーバーまで持って行かない）
         let command = parse(&["tako", "edit", "cursor", "abc", "--pane", "5"]);
         assert!(build_request(&command).is_err());
+        // #1652: 単位で動かす / 消す
+        let command = parse(&[
+            "tako",
+            "edit",
+            "move",
+            "word-left",
+            "--select",
+            "--pane",
+            "5",
+        ]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::PreviewMove {
+                pane: Some(5),
+                movement: "word-left".into(),
+                select: true,
+                expected_version: None,
+            }
+        );
+        let command = parse(&[
+            "tako",
+            "edit",
+            "delete",
+            "word-backward",
+            "--expect-version",
+            "7",
+            "--pane",
+            "5",
+        ]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::PreviewDelete {
+                pane: Some(5),
+                motion: "word-backward".into(),
+                expected_version: Some(7),
+            }
+        );
+        // 知らない単位は実行前に弾く
+        let command = parse(&["tako", "edit", "move", "word_left", "--pane", "5"]);
+        assert!(build_request(&command).is_err());
+        let command = parse(&["tako", "edit", "delete", "word", "--pane", "5"]);
+        assert!(build_request(&command).is_err());
         let command = parse(&["tako", "edit", "undo", "--pane", "5"]);
         assert_eq!(
             build_request(&command).unwrap(),
@@ -10516,6 +10625,8 @@ mod platform_matrix_parity {
         ("edit apply", "tako_preview_apply"),
         ("edit autosave", "tako_preview_autosave"),
         ("edit cursor", "tako_preview_cursor"),
+        ("edit move", "tako_preview_move"),
+        ("edit delete", "tako_preview_delete"),
         ("edit replace-range", "tako_preview_edit_range"),
         ("edit redo", "tako_preview_redo"),
         ("edit replace", "tako_preview_replace"),

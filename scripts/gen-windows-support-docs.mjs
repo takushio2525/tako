@@ -45,6 +45,7 @@ const CATEGORIES = [
     'tako_preview_link_list', 'tako_preview_follow_link', 'tako_preview_copy_code',
     'tako_preview_reload', 'tako_preview_cache', 'tako_preview_edit',
     'tako_preview_apply', 'tako_preview_edit_range', 'tako_preview_cursor',
+    'tako_preview_move', 'tako_preview_delete',
     'tako_preview_save', 'tako_preview_undo',
     'tako_preview_redo', 'tako_preview_search', 'tako_preview_replace',
     'tako_preview_autosave', 'tako_preview_changelog', 'tako_pin_preview',

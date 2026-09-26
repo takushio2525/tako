@@ -767,6 +767,27 @@ pub enum Request {
         select_to_col: Option<usize>,
         expected_version: Option<u64>,
     },
+    /// 編集カーソルを単語・行・ページ・文書端の単位で動かす（#1652）。本文は変えない。
+    ///
+    /// `movement` は `tako_core::text_edit::CursorMovement::name` の綴り
+    /// （`word-left` / `smart-home` / `page-down` など）。GUI の打鍵
+    /// （⌥← / Home / Page Down）と同じ口を通る。`select` で選択を伸ばす（⇧ 付きの打鍵）
+    PreviewMove {
+        pane: Option<u64>,
+        movement: String,
+        #[serde(default)]
+        select: bool,
+        expected_version: Option<u64>,
+    },
+    /// 単語・行単位で消す（#1652）。選択があれば選択を消す。
+    ///
+    /// `motion` は `tako_core::text_edit::DeleteMotion::name` の綴り
+    /// （`word-backward` / `to-line-start` など）。GUI の ⌥⌫ / ⌘⌫ と同じ口を通る
+    PreviewDelete {
+        pane: Option<u64>,
+        motion: String,
+        expected_version: Option<u64>,
+    },
     /// 編集バッファをファイルへ保存する。外部変更を検知した場合は上書きしない。
     PreviewSave { pane: Option<u64> },
     /// undo（#195）
@@ -2342,6 +2363,8 @@ pub fn changes_layout(request: &Request) -> bool {
         | Request::PreviewApply { .. }
         | Request::PreviewEditRange { .. }
         | Request::PreviewCursor { .. }
+        | Request::PreviewMove { .. }
+        | Request::PreviewDelete { .. }
         | Request::PreviewSave { .. }
         | Request::PreviewUndo { .. }
         | Request::PreviewRedo { .. }

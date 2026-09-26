@@ -93,6 +93,29 @@ Windows では Command キーにあたる修飾が Win キーになり、多く�
 ターミナルでは <kbd>Ctrl</kbd>+<kbd>Z</kbd>（プロセスの一時停止）を奪えないため、取り消しも <kbd>Shift</kbd> 段に置いています。やり直しは Windows 慣習どおり <kbd>Y</kbd> です。
 :::
 
+### 編集中のカーソル移動と削除
+
+編集モードのときに使えます。移動の打鍵に <kbd>Shift</kbd> を足すと、その範囲まで選択を伸ばします。矢印・<kbd>Backspace</kbd>・<kbd>Delete</kbd>・<kbd>Enter</kbd> は修飾なしでも使えます。
+
+| 編集中の操作 | macOS | Windows |
+|---|---|---|
+| 前の語の頭へ | <kbd>Alt</kbd>+<kbd>←</kbd> | <kbd>Ctrl</kbd>+<kbd>←</kbd> |
+| 次の語の末尾へ | <kbd>Alt</kbd>+<kbd>→</kbd> | <kbd>Ctrl</kbd>+<kbd>→</kbd> |
+| 行頭へ（押すたびにインデントの直後と行の先頭を行き来） | <kbd>Home</kbd> / <kbd>Cmd</kbd>+<kbd>←</kbd> | <kbd>Home</kbd> |
+| 行末へ | <kbd>End</kbd> / <kbd>Cmd</kbd>+<kbd>→</kbd> | <kbd>End</kbd> |
+| 文書の先頭へ | <kbd>Cmd</kbd>+<kbd>↑</kbd> | <kbd>Ctrl</kbd>+<kbd>Home</kbd> |
+| 文書の末尾へ | <kbd>Cmd</kbd>+<kbd>↓</kbd> | <kbd>Ctrl</kbd>+<kbd>End</kbd> |
+| 1 画面上へ | <kbd>Page Up</kbd> | <kbd>Page Up</kbd> |
+| 1 画面下へ | <kbd>Page Down</kbd> | <kbd>Page Down</kbd> |
+| 前の語を消す | <kbd>Alt</kbd>+<kbd>Backspace</kbd> | <kbd>Ctrl</kbd>+<kbd>Backspace</kbd> |
+| 次の語を消す | <kbd>Alt</kbd>+<kbd>Delete</kbd> | <kbd>Ctrl</kbd>+<kbd>Delete</kbd> |
+| 行頭まで消す | <kbd>Cmd</kbd>+<kbd>Backspace</kbd> | （macOS のみ） |
+| 行末まで消す | <kbd>Cmd</kbd>+<kbd>Delete</kbd> | （macOS のみ） |
+
+:::note[語の区切りと行の境目]
+英数字と `_` の並び（`snake_case` は 1 語）、記号の並び、漢字・ひらがな・カタカナのそれぞれの並びが 1 語です。日本語は文字の種類が切り替わるところで止まります（`日本語のテキスト` は「日本語」「の」「テキスト」）。行の先頭で前の語へ、行の末尾で次の語へ動くと隣の行へ移ります。語や行単位で消すときは行の境目で止まり、行の先頭では改行だけを消して前の行とつなげます。上下に動くときは元の桁を覚えているので、短い行を通り過ぎても次の長い行では元の桁に戻ります。Windows の <kbd>Alt</kbd>+矢印はペインのフォーカス移動に使っているため、語の移動は <kbd>Ctrl</kbd>+矢印です。MacBook のキーボードの <kbd>Delete</kbd> は <kbd>fn</kbd>+<kbd>delete</kbd> です。
+:::
+
 ## 表示
 
 | 操作 | macOS | Windows |

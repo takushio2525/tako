@@ -308,12 +308,14 @@ fn 行桁の解決は丸めない() {
 
 /// 本文を変える公開 API（版が進むべきもの）。[`本文を変える公開apiはすべて版を進める`] が
 /// 挙動で確かめ、[`textbufferの書き換え口は棚卸し済み`] が取りこぼしを見る
-const MUTATES_TEXT: [&str; 10] = [
+const MUTATES_TEXT: [&str; 11] = [
     "set_text",
     "insert",
     "newline",
     "delete_backward",
     "delete_forward",
+    // 単位を指定した削除（#1652。⌥⌫ / ⌘⌫ と CLI / MCP の `delete`）
+    "delete",
     "undo",
     "redo",
     "replace_range",
@@ -325,12 +327,16 @@ const MUTATES_TEXT: [&str; 10] = [
 ///
 /// カーソル・選択は「どこを見ているか」で文書の中身ではない。`save` はディスクへ
 /// 書くだけで本文を変えない（変えると保存のたびに版が飛び、楽観ロックが使えなくなる）
-const KEEPS_TEXT: [&str; 5] = [
+const KEEPS_TEXT: [&str; 7] = [
     "set_cursor",
     "select_all",
     "move_cursor",
     "set_cursor_placement",
     "save",
+    // 選択をまとめて置く（#1652。GUI の画面選択の写し戻し）
+    "set_selection",
+    // 器に見える行数（#1652。ページ移動の歩幅。本文ではない）
+    "set_viewport_lines",
 ];
 
 /// 検査する操作 1 つ（名前 + バッファへ当てる手）
@@ -360,6 +366,13 @@ fn 本文を変える公開apiはすべて版を進める() {
             Box::new(|b: &mut TextBuffer| {
                 b.set_cursor(0, false);
                 b.delete_forward()
+            }),
+        ),
+        (
+            "delete",
+            Box::new(|b: &mut TextBuffer| {
+                b.move_cursor(tako_core::text_edit::CursorMovement::DocumentEnd, false);
+                b.delete(tako_core::text_edit::DeleteMotion::WordBackward)
             }),
         ),
         (

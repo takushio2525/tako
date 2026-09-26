@@ -62,3 +62,7 @@
 - `ListState` への `scroll_to(cursor)` が **0 件**で、打鍵 / 矢印 / ⌘F のヒット / undo / 貼り付けのどれでもカーソルが画面外のままだった。判断は `tako_core::editor_scroll`（`LineViewport` + `follow_cursor`・上下 3 行の余白・視野が狭いと詰める・端では可視化を優先）へ寄せ、UI は器の寸法を測って渡すだけにした。呼ぶのは `refresh_preview_from_editor`（編集の全経路の要）+ 検索ヒット + IME の変換開始の 3 か所、器は仮想リストと div スクロールの両方を**論理位置**で動かす
 - 連鎖症状の IME 下線は `preview_pending_cursor_origin` が「可視化後にカーソル行が来る位置」を出して**本文の中にアンカーを残す**（行のレイアウトは paint でしか控えられないので、追従の直後 1 フレームは必ず無い）。効きは編集系の応答に乗る `viewport` で GUI の外から読める（位置自体は #1658 の `document.cursor`）
 - 実測: **tako-vd 上の visual-test 節 `cursor-follow`（7 相）が新 = 全相 `ok=true` / `anchored=true`・旧（`TAKO_1649_LEGACY=1`）= 全相 `ok=false` / `anchored=false`**（視野 37 行 / 4,002 行 / PASS=10 FAIL=0）。番犬 6 本へ注入 9 通りすべて file:line 名指しで FAILED → 戻して緑・`editor_scroll` 単体 11 本 + `preview_render` 単体 2 本・workspace 0 failed・clippy 3 宇宙 0
+
+## 2026-09-26（#1652: 修飾キー付きの打鍵が入口で全部捨てられていたのを直した）
+- 入口の `if platform || control || alt { return false }` を外し、打鍵の意味を `platform::editor_keys` の 1 枚の表（両 OS の列）へ。`TextBuffer` に単語 / 行 / ページ / 文書端の移動と語・行単位の削除・smart Home・桁の記憶（desired column）を足し、`PreviewMove` / `PreviewDelete` + `tako edit move|delete` + MCP 2 本が打鍵と同じ口を通る
+- 実測: `scripts/test-editor-keys-1652.sh` で tako-vd 上の実打鍵経路 9 相が緑・A/B `TAKO_1652_LEGACY=1` は ⌘↑ の相で FAILED・注入 7 通りがすべて file:line 名指しで FAILED → 戻して緑

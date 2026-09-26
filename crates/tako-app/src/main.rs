@@ -12544,8 +12544,9 @@ impl TakoApp {
         let head = edit
             .buffer
             .offset_for_line_byte_col(selection.head.0, selection.head.1);
-        edit.buffer.set_cursor(anchor, false);
-        edit.buffer.set_cursor(head, true);
+        // 1 回で置く（#1652）。`set_cursor` を 2 段で呼ぶと途中でカーソルが anchor へ
+        // 飛ぶので、選択があるときだけ毎打鍵で上下移動の桁の記憶と undo の塊が切れる
+        edit.buffer.set_selection(anchor, head);
     }
 
     fn set_preview_editing_local(&mut self, pane_id: PaneId, enabled: bool) -> Result<(), String> {
@@ -13100,8 +13101,6 @@ impl TakoApp {
     }
 
     fn handle_preview_edit_key(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) -> bool {
-        use tako_core::CursorMovement;
-
         let pane_id = self.focused_pane();
 
         // 検索バー表示中: キーを検索/置換フィールドにルーティング
@@ -13110,12 +13109,6 @@ impl TakoApp {
             .get(&pane_id)
             .is_some_and(|edit| edit.search_visible)
         {
-            if keystroke.modifiers.platform
-                || keystroke.modifiers.control
-                || keystroke.modifiers.alt
-            {
-                return false;
-            }
             return self.handle_search_bar_key(pane_id, keystroke, cx);
         }
 
@@ -13126,68 +13119,152 @@ impl TakoApp {
         {
             return false;
         }
-        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
+        // #1652: 打鍵の解釈は 1 枚の表（`tako_core::platform::editor_keys`）だけが持つ。
+        // 修飾キー付きの打鍵を入口で捨てていた（⌥← も ⌥⌫ も ⌘↑ も何も起きなかった）のが
+        // Issue の本体なので、ここで修飾キーを見て弾かない。表に無い打鍵だけが素通りする
+        let Some(command) = Self::editor_key_command(keystroke) else {
             return false;
-        }
-        if keystroke.key == "escape" {
-            let _ = self.set_preview_editing_local(pane_id, false);
-            cx.notify();
+        };
+        // IME の変換中は本文にもカーソルにも触らない（#1652）。未確定文字列は本文の外
+        // （`self.ime`）にあってカーソル位置へ重ねて描いているだけなので、ここで動かすと
+        // 確定の挿入先が変わり、消すと未確定文字列の手前の本文が消える。通常は IME が
+        // 打鍵を先に取るが、IME が素通しした打鍵（`doCommandBySelector:` 経由）はここへ来る
+        if self.ime_composing_in(pane_id) {
             return true;
         }
         self.sync_editor_selection_from_preview(pane_id);
-        let shift = keystroke.modifiers.shift;
-        let Some(edit) = self.preview_edits.get_mut(&pane_id) else {
-            return false;
-        };
-        let handled = match keystroke.key.as_str() {
-            "backspace" => {
-                edit.buffer.delete_backward();
-                true
+        match self.run_editor_command_local(pane_id, command) {
+            Ok(changed) => {
+                if changed {
+                    self.drive_autosave(cx);
+                }
             }
-            "delete" => {
-                edit.buffer.delete_forward();
-                true
+            Err(message) => {
+                if let Some(edit) = self.preview_edits.get_mut(&pane_id) {
+                    edit.message = Some(message);
+                }
             }
-            "enter" => {
-                edit.buffer.newline();
-                true
-            }
-            "left" => {
-                edit.buffer.move_cursor(CursorMovement::Left, shift);
-                true
-            }
-            "right" => {
-                edit.buffer.move_cursor(CursorMovement::Right, shift);
-                true
-            }
-            "up" => {
-                edit.buffer.move_cursor(CursorMovement::Up, shift);
-                true
-            }
-            "down" => {
-                edit.buffer.move_cursor(CursorMovement::Down, shift);
-                true
-            }
-            "home" => {
-                edit.buffer.move_cursor(CursorMovement::LineStart, shift);
-                true
-            }
-            "end" => {
-                edit.buffer.move_cursor(CursorMovement::LineEnd, shift);
-                true
-            }
-            _ => false,
-        };
-        let is_text_change = matches!(keystroke.key.as_str(), "backspace" | "delete" | "enter");
-        if handled {
-            edit.message = None;
-            self.refresh_preview_from_editor(pane_id);
-            if is_text_change {
-                self.drive_autosave(cx);
-            }
-            cx.notify();
         }
-        handled
+        cx.notify();
+        true
+    }
+
+    /// 打鍵を編集コマンドへ解く（#1652）。**表を引く口はここ 1 つ**。
+    ///
+    /// 修飾キーは GPUI の `Modifiers` から bool を写して渡す（表は GPUI に依存しない
+    /// tako-core にあり、`Platform` を引数で受けるので Windows の列も macOS の単体で
+    /// 検査できる = #763 の作法）
+    fn editor_key_command(
+        keystroke: &Keystroke,
+    ) -> Option<tako_core::platform::editor_keys::EditorCommand> {
+        let m = &keystroke.modifiers;
+        // A/B の口（`TAKO_1652_LEGACY=1`）: 修飾キー付きの打鍵を入口で捨てる旧経路。
+        // visual-test 節 `editor-keys` がこれで落ちることが検出力の証拠
+        if Self::editor_modifier_keys_legacy() && (m.platform || m.control || m.alt) {
+            return None;
+        }
+        tako_core::platform::editor_keys::resolve(
+            tako_core::platform::support::Platform::current(),
+            &keystroke.key,
+            tako_core::platform::editor_keys::KeyMods {
+                shift: m.shift,
+                alt: m.alt,
+                control: m.control,
+                platform: m.platform,
+            },
+        )
+    }
+
+    fn editor_modifier_keys_legacy() -> bool {
+        static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *LEGACY.get_or_init(|| std::env::var_os("TAKO_1652_LEGACY").is_some())
+    }
+
+    /// このペインへ IME が変換中か（#1652。未確定文字列を持っている間だけ真）
+    fn ime_composing_in(&self, pane_id: PaneId) -> bool {
+        self.ime.as_ref().is_some_and(|ime| {
+            ime.app_input.is_none() && ime.pane == pane_id && !ime.text.is_empty()
+        })
+    }
+
+    /// 器に同時に見える行数（#1652。ページ移動の歩幅）。器をまだ測れていなければ `None`
+    ///
+    /// 数えるのは**はみ出さずに見える行**だけ。1 行の高さは実際に描いた行のレイアウトから
+    /// 採り、器の高さからは本文の上余白（`PREVIEW_BODY_PADDING`）を引く。
+    /// 実測（高さ 381px の器）: 先頭行の上端は器の上端から 14px 下・1 行 21px で、
+    /// はみ出さずに見えるのは 17 行。`theme.line_height`（17px）で器の高さを割ると 22 行に
+    /// なり、Page Down が画面の外まで進んでいた。レイアウトの控えは paint 時にしか入らない
+    /// （#821）ので、読めるのは prepaint 済みのものだけ。まだ 1 行も描いていなければ
+    /// `theme.line_height` で見積もる
+    fn preview_viewport_lines(&self, pane_id: PaneId) -> Option<usize> {
+        let height = f32::from(self.preview_viewport_bounds(pane_id)?.size.height)
+            - preview_render::PREVIEW_BODY_PADDING;
+        let line = self
+            .preview_text_layouts
+            .get(&pane_id)
+            .and_then(|layouts| layouts.iter().flatten().next())
+            .map(|layout| f32::from(layout.line_height()))
+            .unwrap_or(self.theme.line_height);
+        (height > 0.0 && line > 0.0).then(|| ((height / line).floor() as usize).max(1))
+    }
+
+    /// 編集コマンド 1 つを当てる（#1652）。**GUI の打鍵と CLI / MCP の
+    /// `move` / `delete` が同じ口を通る**（UI 層に閉じた編集ロジックを作らない）。
+    ///
+    /// 移動・削除の中身は `TextBuffer`（tako-core）が持つ。ここがするのは
+    /// 器の寸法（ページ移動の歩幅）を渡すことと、プレビューへの反映だけ。
+    /// 本文が変わったら `Ok(true)`（呼び手が自動保存を回す）
+    fn run_editor_command_local(
+        &mut self,
+        pane_id: PaneId,
+        command: tako_core::platform::editor_keys::EditorCommand,
+    ) -> Result<bool, String> {
+        use tako_core::platform::editor_keys::EditorCommand;
+        if command == EditorCommand::ExitEditing {
+            self.set_preview_editing_local(pane_id, false)?;
+            return Ok(false);
+        }
+        let viewport_lines = self.preview_viewport_lines(pane_id);
+        let edit = self
+            .preview_edits
+            .get_mut(&pane_id)
+            .filter(|edit| edit.editing)
+            .ok_or_else(|| "編集モードを開始していない".to_string())?;
+        let version = edit.buffer.version();
+        if let Some(lines) = viewport_lines {
+            edit.buffer.set_viewport_lines(lines);
+        }
+        command.apply(&mut edit.buffer);
+        let changed = edit.buffer.version() != version;
+        edit.message = None;
+        self.refresh_preview_from_editor(pane_id);
+        Ok(changed)
+    }
+
+    /// CLI / MCP から編集コマンドを当てる（#1652）。編集モード未開始なら開始する
+    /// （`tako edit cursor` と同じ）。`expected_version` が違えば何もせず失敗する
+    fn run_preview_command_local(
+        &mut self,
+        pane_id: PaneId,
+        command: tako_core::platform::editor_keys::EditorCommand,
+        expected_version: Option<u64>,
+    ) -> Result<(), String> {
+        self.set_preview_editing_local(pane_id, true)?;
+        if let Some(expected) = expected_version {
+            let actual = self
+                .preview_edits
+                .get(&pane_id)
+                .map(|edit| edit.buffer.version())
+                .unwrap_or_default();
+            if expected != actual {
+                return Err(tako_core::text_edit::RangeEditError::VersionMismatch {
+                    expected,
+                    actual,
+                }
+                .to_string());
+            }
+        }
+        self.run_editor_command_local(pane_id, command).map(|_| ())
     }
 
     fn handle_search_bar_key(
@@ -13196,6 +13273,11 @@ impl TakoApp {
         keystroke: &Keystroke,
         cx: &mut Context<Self>,
     ) -> bool {
+        // 検索 / 置換フィールドは修飾キー付きの打鍵を扱わない（⌘F / ⌘Z などは
+        // キーバインドが先に取る）。編集本文の入口とは別の判断なのでここに置く
+        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
+            return false;
+        }
         let Some(edit) = self.preview_edits.get_mut(&pane_id) else {
             return false;
         };
@@ -22319,6 +22401,15 @@ impl PreviewHost for TakoApp {
         place: &tako_core::text_edit::CursorPlacement,
     ) -> Result<(), String> {
         self.set_preview_cursor_local(pane, place)
+    }
+
+    fn run_preview_command(
+        &mut self,
+        pane: PaneId,
+        command: tako_core::platform::editor_keys::EditorCommand,
+        expected_version: Option<u64>,
+    ) -> Result<(), String> {
+        self.run_preview_command_local(pane, command, expected_version)
     }
 
     fn preview_document(&self, pane: PaneId) -> Option<serde_json::Value> {
@@ -37962,6 +38053,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1652: 修飾キー付きの打鍵が実 GUI の打鍵経路で編集に効くか
+                "editor-keys" => {
+                    editor_keys_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
@@ -37969,7 +38066,7 @@ mod self_test {
                          grid-bench / preview-leak / chat-leak / preview-code / \
                          remote-tree / flicker / ime-preedit / screen-lines / \
                          pane-border / tasks-panel / task-attachment / \
-                         tasks-accordion / shelve-tab / no-emoji）"
+                         tasks-accordion / shelve-tab / no-emoji / editor-keys）"
                     );
                     std::process::exit(1);
                 }
@@ -38016,6 +38113,10 @@ mod self_test {
             // #1487: タブバーの ー を**実マウスで**押すとタブが 1 単位で退避し、
             // 「タブごと復帰」で分割ツリーのまま元の位置へ戻るか
             shelve_tab_visual(any, window, cx).await;
+
+            // #1652: 修飾キー付きの打鍵（⌥← / ⌥⌫ / ⌘↑ / Page Down / Home）が
+            // 実 GUI の打鍵経路で編集に効くか + IME の変換中は本文に触らないか
+            editor_keys_visual(any, window, cx).await;
 
             // #589: ファイルツリーのインデントガイド線が連続しているか。
             // 4 階層のフィクスチャを開き、ダーク / ライト / スクロール後の 3 状態で
@@ -41310,6 +41411,363 @@ mod self_test {
             cx.notify();
         });
         println!("TAKO_VISUAL_1472: thumb={thumb_ready}");
+    }
+
+    /// #1652: 修飾キー付きの打鍵が**実 GUI の打鍵経路**で編集に効くか。
+    ///
+    /// 打鍵は `window.dispatch_keystroke`（= GPUI のキーバインド判定 → `on_key_down` →
+    /// `handle_key` → 編集の入口 → 打鍵表 → `TextBuffer`）へ流す。入口の直呼びでは
+    /// 「キーバインドが先に食う」「入口の手前で修飾キーを弾く」型を検出できない。
+    ///
+    /// 打鍵の綴りは **OS の慣習どおりにここで直書きする**（表から引くと、表が壊れても
+    /// 同じ壊れ方で緑になる）。見るのは状態（本文・カーソル・選択）で、ピクセルは見ない。
+    ///
+    /// 判定は新しい挙動を無条件に主張する。`TAKO_1652_LEGACY=1`（入口で修飾キー付きの
+    /// 打鍵を捨てる旧経路）では最初の修飾キーの相で落ちる = A/B の検出力。
+    /// 単独実行は `TAKO_VISUAL_ONLY=editor-keys`
+    #[cfg(feature = "visual-test")]
+    async fn editor_keys_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        use tako_control::protocol::Request as Req;
+
+        inject_section_failure("editor-keys");
+        ensure_fresh_scene(window, cx, "editor-keys").await;
+        let legacy = TakoApp::editor_modifier_keys_legacy();
+        let mac = cfg!(target_os = "macos");
+        let key =
+            |mac_spec: &'static str, win_spec: &'static str| if mac { mac_spec } else { win_spec };
+        let word_left = key("alt-left", "ctrl-left");
+        let word_right = key("alt-right", "ctrl-right");
+        let word_left_select = key("alt-shift-left", "ctrl-shift-left");
+        let doc_start = key("cmd-up", "ctrl-home");
+        let doc_end = key("cmd-down", "ctrl-end");
+        let delete_word_back = key("alt-backspace", "ctrl-backspace");
+        let delete_word_forward = key("alt-delete", "ctrl-delete");
+
+        let dir = std::env::temp_dir().join(format!("tako-visual-keys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("visual-test editor-keys 一時ディレクトリ");
+        let path = dir.join("keys.rs");
+        // 行 0..=3 が語・行の相、4..=6 が桁の記憶の相、その後ろがページ移動の相
+        let mut source = String::from(
+            "fn main() {\n    let value = 1;\n    println!(\"日本語のテキスト\");\n}\n\
+             0123456789\nab\n0123456789\n",
+        );
+        for i in 0..200 {
+            source.push_str(&format!("// line {i:03}\n"));
+        }
+        std::fs::write(&path, &source).expect("visual-test editor-keys fixture");
+        let last_line = source.matches('\n').count();
+
+        let pane = window
+            .update(cx, |app, _, cx| {
+                let base = app.focused_pane().as_u64();
+                let opened = tako_control::dispatch(
+                    app,
+                    Req::OpenFile {
+                        pane: Some(base),
+                        path: path.display().to_string(),
+                        mode: Some(tako_control::protocol::PreviewModeWire::Code),
+                        direction: Some(tako_control::protocol::Direction::Right),
+                        focus: Some(true),
+                        new_tab: false,
+                        line: None,
+                        column: None,
+                    },
+                    PaneOrigin::Cli,
+                )
+                .expect("visual-test editor-keys を dispatch で開ける");
+                cx.notify();
+                PaneId::from_raw(opened["pane"].as_u64().expect("OpenFile 応答の pane"))
+            })
+            .unwrap_or_else(|_| fail("visual-test editor-keys dispatch"));
+        check(
+            wait_for_preview_maps(any, window, cx, pane, false).await,
+            "visual-test editor-keys: 座標キャッシュが揃う",
+        );
+        let editing = window
+            .update(cx, |app, _, cx| {
+                // 入口は `focused_pane()` を見るので、対象ペインを明示的に掴んでおく
+                let _ = app.workspace.active_tab_mut().tree_mut().focus(pane);
+                let r = tako_control::dispatch(
+                    app,
+                    Req::PreviewEdit {
+                        pane: Some(pane.as_u64()),
+                        enabled: Some(true),
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+                r.ok().and_then(|v| v["editing"].as_bool()).unwrap_or(false)
+            })
+            .unwrap_or(false);
+        check(editing, "visual-test editor-keys: 編集モードを開始できる");
+        notify_and_draw(any, window, cx);
+
+        // 本文の 1 行・カーソル（行, 桁）・選択された文字列
+        type Seen = (String, (usize, usize), Option<String>, u64);
+        let observe = |cx: &mut AsyncApp, line: usize| -> Seen {
+            notify_and_draw(any, window, cx);
+            window
+                .update(cx, |app, _, _| {
+                    let Some(edit) = app.preview_edits.get(&pane) else {
+                        return (String::new(), (0, 0), None, 0);
+                    };
+                    let b = &edit.buffer;
+                    (
+                        b.text()
+                            .split('\n')
+                            .nth(line)
+                            .unwrap_or_default()
+                            .to_string(),
+                        b.line_byte_col(b.cursor()),
+                        b.selection().map(|r| b.text()[r].to_string()),
+                        b.version(),
+                    )
+                })
+                .unwrap_or_default()
+        };
+        // 相の起点を置く（CLI と同じ dispatch。画面の選択も同じ位置へ写る）
+        let place = |cx: &mut AsyncApp, line: usize, col: usize| {
+            window
+                .update(cx, |app, _, cx| {
+                    let r = tako_control::dispatch(
+                        app,
+                        Req::PreviewCursor {
+                            pane: Some(pane.as_u64()),
+                            line: line + 1,
+                            col,
+                            select_to_line: None,
+                            select_to_col: None,
+                            expected_version: None,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    cx.notify();
+                    r.is_ok()
+                })
+                .unwrap_or(false)
+        };
+        let undo = |cx: &mut AsyncApp| {
+            window
+                .update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        Req::PreviewUndo {
+                            pane: Some(pane.as_u64()),
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    cx.notify();
+                })
+                .ok();
+        };
+        let report = |label: &str, spec: &str, seen: &Seen| {
+            println!(
+                "TAKO_VISUAL_PIXEL: editor-keys {label} key={spec} line={:?} cursor={:?} \
+                 selection={:?} version={} legacy={legacy}",
+                seen.0, seen.1, seen.2, seen.3
+            );
+        };
+
+        // (1) 文書頭（⌘↑ / Ctrl+Home）
+        check(place(cx, 2, 8), "visual-test editor-keys: 起点を置ける");
+        press(any, cx, doc_start);
+        let seen = observe(cx, 0);
+        report("doc-start", doc_start, &seen);
+        check(
+            seen.1 == (0, 0),
+            &format!("visual-test editor-keys: {doc_start} で文書頭へ飛ぶ (#1652。{seen:?})"),
+        );
+
+        // (2) 語の左右（⌥←→ / Ctrl+←→）。行 1 = `    let value = 1;`
+        place(cx, 1, 13);
+        press(any, cx, word_left);
+        let seen = observe(cx, 1);
+        report("word-left", word_left, &seen);
+        check(
+            seen.1 == (1, 8),
+            &format!("visual-test editor-keys: {word_left} で語の頭へ (#1652。{seen:?})"),
+        );
+        place(cx, 1, 4);
+        press(any, cx, word_right);
+        let seen = observe(cx, 1);
+        report("word-right", word_right, &seen);
+        check(
+            seen.1 == (1, 7),
+            &format!("visual-test editor-keys: {word_right} で語の末尾へ (#1652。{seen:?})"),
+        );
+        // 日本語は文字種の切り替わりが境目。行 2 = `    println!("日本語のテキスト");`
+        let jp_start = "    println!(\"".len();
+        place(cx, 2, jp_start);
+        press(any, cx, word_right);
+        let seen = observe(cx, 2);
+        report("word-right-jp", word_right, &seen);
+        check(
+            seen.1 == (2, jp_start + "日本語".len()),
+            &format!("visual-test editor-keys: 日本語の語の末尾で止まる (#1652。{seen:?})"),
+        );
+
+        // (3) ⇧ 付きで選択を伸ばす
+        place(cx, 1, 13);
+        press(any, cx, word_left_select);
+        let seen = observe(cx, 1);
+        report("word-left-select", word_left_select, &seen);
+        check(
+            seen.2.as_deref() == Some("value"),
+            &format!("visual-test editor-keys: {word_left_select} で語を選ぶ (#1652。{seen:?})"),
+        );
+
+        // (4) 語の削除（⌥⌫ / ⌥⌦）。消したら undo で戻す
+        place(cx, 1, 13);
+        let before = observe(cx, 1).3;
+        press(any, cx, delete_word_back);
+        let seen = observe(cx, 1);
+        report("delete-word-back", delete_word_back, &seen);
+        check(
+            seen.0 == "    let  = 1;" && seen.1 == (1, 8) && seen.3 > before,
+            &format!("visual-test editor-keys: {delete_word_back} で語を消す (#1652。{seen:?})"),
+        );
+        undo(cx);
+        place(cx, 1, 4);
+        press(any, cx, delete_word_forward);
+        let seen = observe(cx, 1);
+        report("delete-word-forward", delete_word_forward, &seen);
+        check(
+            seen.0 == "     value = 1;",
+            &format!("visual-test editor-keys: {delete_word_forward} で語を消す (#1652。{seen:?})"),
+        );
+        undo(cx);
+        let seen = observe(cx, 1);
+        check(
+            seen.0 == "    let value = 1;",
+            &format!("visual-test editor-keys: undo で語が戻る ({seen:?})"),
+        );
+
+        // (5) smart Home（修飾なし。最初の非空白 ⇄ 桁 0）
+        place(cx, 1, 13);
+        press(any, cx, "home");
+        let first = observe(cx, 1);
+        press(any, cx, "home");
+        let second = observe(cx, 1);
+        report("smart-home", "home", &second);
+        check(
+            first.1 == (1, 4) && second.1 == (1, 0),
+            &format!("visual-test editor-keys: Home がインデントの直後 ⇄ 桁 0 を行き来する ({first:?} → {second:?})"),
+        );
+
+        // (6) 桁の記憶: (4,8) → ↓ (5,2) → ↓ (6,8)
+        place(cx, 4, 8);
+        press(any, cx, "down");
+        let short = observe(cx, 5);
+        press(any, cx, "down");
+        let back = observe(cx, 6);
+        report("goal-column", "down", &back);
+        check(
+            short.1 == (5, 2) && back.1 == (6, 8),
+            &format!(
+                "visual-test editor-keys: 短い行をまたいでも元の桁へ戻る ({short:?} → {back:?})"
+            ),
+        );
+
+        // (7) ページ移動: 歩幅は器に見える行数 − 1
+        let viewport = window
+            .update(cx, |app, _, _| app.preview_viewport_lines(pane))
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        place(cx, 0, 0);
+        press(any, cx, "pagedown");
+        let seen = observe(cx, 0);
+        report("page-down", "pagedown", &seen);
+        println!("TAKO_VISUAL_PIXEL: editor-keys viewport_lines={viewport}");
+        check(
+            viewport > 2 && seen.1.0 == viewport - 1,
+            &format!("visual-test editor-keys: Page Down で 1 画面ぶん進む (viewport={viewport} {seen:?})"),
+        );
+        // 歩幅の算術が実際の画面と合っているか: 着地した行は器の中に収まり、
+        // その次の行は器の下端をはみ出す（= 着地した行が最下段）。行の実矩形で見る
+        let fits = |cx: &mut AsyncApp, line: usize| -> Option<bool> {
+            window
+                .update(cx, |app, _, _| {
+                    let view = app.preview_viewport_bounds(pane)?;
+                    let layout = app.preview_text_layouts.get(&pane)?.get(line)?.clone()?;
+                    let b = layout.bounds();
+                    Some(b.top() >= view.top() - px(1.0) && b.bottom() <= view.bottom() + px(1.0))
+                })
+                .ok()
+                .flatten()
+        };
+        let landed = fits(cx, seen.1 .0);
+        let next = fits(cx, seen.1 .0 + 1);
+        println!(
+            "TAKO_VISUAL_PIXEL: editor-keys page-fit landed_visible={landed:?} next_visible={next:?}"
+        );
+        check(
+            landed == Some(true) && next == Some(false),
+            &format!(
+                "visual-test editor-keys: Page Down の着地行が画面の最下段                  (landed={landed:?} next={next:?})"
+            ),
+        );
+
+        // (8) 文書末（⌘↓ / Ctrl+End）
+        press(any, cx, doc_end);
+        let seen = observe(cx, 0);
+        report("doc-end", doc_end, &seen);
+        check(
+            seen.1 == (last_line, 0),
+            &format!("visual-test editor-keys: {doc_end} で文書末へ飛ぶ (#1652。{seen:?})"),
+        );
+
+        // (9) IME の変換中は本文にもカーソルにも触らない。確定は変換を始めた位置へ入る
+        place(cx, 1, 13);
+        let before = observe(cx, 1);
+        window
+            .update(cx, |app, window, cx| {
+                app.replace_and_mark_text_in_range(None, "にほん", None, window, cx);
+            })
+            .ok();
+        press(any, cx, word_left);
+        press(any, cx, delete_word_back);
+        let during = observe(cx, 1);
+        let composing = window
+            .update(cx, |app, _, _| app.ime_composing_in(pane))
+            .unwrap_or(false);
+        report("ime", word_left, &during);
+        check(
+            composing && during.0 == before.0 && during.1 == before.1 && during.3 == before.3,
+            &format!(
+                "visual-test editor-keys: 変換中の修飾キーは本文とカーソルを動かさない \
+                 (composing={composing} {before:?} → {during:?})"
+            ),
+        );
+        window
+            .update(cx, |app, window, cx| app.unmark_text(window, cx))
+            .ok();
+        let committed = observe(cx, 1);
+        report("ime-commit", "-", &committed);
+        check(
+            committed.0 == "    let valueにほん = 1;",
+            &format!("visual-test editor-keys: 確定は変換を始めた位置へ入る ({committed:?})"),
+        );
+
+        let _ = window.update(cx, |app, _, cx| {
+            let _ = tako_control::dispatch(
+                app,
+                Req::Close {
+                    pane: Some(pane.as_u64()),
+                    force: true,
+                    caller_role: None,
+                },
+                PaneOrigin::Cli,
+            );
+            cx.notify();
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("TAKO_VISUAL_PIXEL: editor-keys ok legacy={legacy}");
     }
 
     /// タブバーの「ー」を**実マウスで**押すとタブが 1 単位で退避し、たまり場の

@@ -122,17 +122,137 @@ impl LineEnding {
     }
 }
 
+/// カーソルの動かし方（FR-3.5 / #1652）。
+///
+/// GUI の打鍵（`platform::editor_keys` の表）と CLI / MCP（`tako edit move` /
+/// `tako_preview_move`）が**同じ値**を指す。外から名前で指すときの綴りは
+/// [`Self::name`] の 1 か所（CLI の引数・MCP の enum・エラー文がすべてここを引く）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorMovement {
     Left,
     Right,
     Up,
     Down,
+    /// 前の語の頭へ（#1652）。行頭では前の行へまたぐ
+    WordLeft,
+    /// 次の語の末尾へ（#1652）。行末では次の行へまたぐ
+    WordRight,
+    /// 行頭（桁 0）
     LineStart,
+    /// 最初の非空白 ⇄ 桁 0 を行き来する行頭（smart Home。#1652）
+    SmartLineStart,
     LineEnd,
     DocumentStart,
     DocumentEnd,
+    /// 1 画面ぶん上へ（行数は [`TextBuffer::set_viewport_lines`]。#1652）
+    PageUp,
+    /// 1 画面ぶん下へ（#1652）
+    PageDown,
 }
+
+impl CursorMovement {
+    /// 全種類（名前の表・MCP の enum・単体の網羅に使う）
+    pub const ALL: [Self; 13] = [
+        Self::Left,
+        Self::Right,
+        Self::Up,
+        Self::Down,
+        Self::WordLeft,
+        Self::WordRight,
+        Self::LineStart,
+        Self::SmartLineStart,
+        Self::LineEnd,
+        Self::DocumentStart,
+        Self::DocumentEnd,
+        Self::PageUp,
+        Self::PageDown,
+    ];
+
+    /// 外（CLI / MCP）から指すときの綴り（#1652）
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Up => "up",
+            Self::Down => "down",
+            Self::WordLeft => "word-left",
+            Self::WordRight => "word-right",
+            Self::LineStart => "line-start",
+            Self::SmartLineStart => "smart-home",
+            Self::LineEnd => "line-end",
+            Self::DocumentStart => "doc-start",
+            Self::DocumentEnd => "doc-end",
+            Self::PageUp => "page-up",
+            Self::PageDown => "page-down",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.name() == name)
+    }
+
+    /// 綴りの一覧（MCP の inputSchema の enum とエラー文の候補）
+    pub fn names() -> Vec<&'static str> {
+        Self::ALL.iter().map(|m| m.name()).collect()
+    }
+
+    /// 上下方向の移動か。**桁の記憶（desired column）を使い、保つ**のはこれだけ
+    fn is_vertical(self) -> bool {
+        matches!(self, Self::Up | Self::Down | Self::PageUp | Self::PageDown)
+    }
+}
+
+/// 消し方（FR-3.5 / #1652）。選択があればどれも「選択を消す」になる
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteMotion {
+    /// Backspace
+    CharBackward,
+    /// Delete
+    CharForward,
+    /// 前の語の頭まで（⌥⌫ / Ctrl+Backspace）。行頭では改行だけを消す
+    WordBackward,
+    /// 次の語の末尾まで（⌥⌦ / Ctrl+Delete）。行末では改行だけを消す
+    WordForward,
+    /// 行頭まで（⌘⌫）。行頭では改行だけを消す
+    ToLineStart,
+    /// 行末まで（⌘⌦）。行末では改行だけを消す
+    ToLineEnd,
+}
+
+impl DeleteMotion {
+    pub const ALL: [Self; 6] = [
+        Self::CharBackward,
+        Self::CharForward,
+        Self::WordBackward,
+        Self::WordForward,
+        Self::ToLineStart,
+        Self::ToLineEnd,
+    ];
+
+    /// 外（CLI / MCP）から指すときの綴り（#1652）
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::CharBackward => "char-backward",
+            Self::CharForward => "char-forward",
+            Self::WordBackward => "word-backward",
+            Self::WordForward => "word-forward",
+            Self::ToLineStart => "to-line-start",
+            Self::ToLineEnd => "to-line-end",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.name() == name)
+    }
+
+    pub fn names() -> Vec<&'static str> {
+        Self::ALL.iter().map(|m| m.name()).collect()
+    }
+}
+
+/// 1 画面の行数がまだ測れていないとき（CLI から開いた直後で、器を 1 度も描いて
+/// いないなど）のページ移動の行数（#1652）
+const DEFAULT_PAGE_STEP: usize = 20;
 
 #[derive(Debug, Error)]
 pub enum TextEditError {
@@ -155,6 +275,9 @@ enum EditKind {
     DeleteBackward,
     /// Delete（右へ伸びる削除）
     DeleteForward,
+    /// 語・行単位の削除（⌥⌫ / ⌥⌦ / ⌘⌫ / ⌘⌦。#1652）。**まとめない**
+    /// （1 打鍵で意味のある単位を消すので、undo 1 回で 1 単位ずつ戻るのが自然）
+    DeleteSpan,
     /// 選択の差し替え・範囲置換・全置換・全文差し替え。**まとめない**
     /// （1 回の操作として意味が閉じているので、まとめると戻しすぎになる）
     Replace,
@@ -333,6 +456,17 @@ pub struct TextBuffer {
     /// 通るので、**どちらで変わっても進む**。LSP の `didChange` が要求する
     /// 「文書の版」もこれをそのまま使える（#1007 の前払い）
     version: u64,
+    /// 上下移動で狙い続ける桁（行頭からの文字数。desired column。#1652）。
+    ///
+    /// ↓ を続けて押す途中で短い行を通っても、その先の長い行では元の桁へ戻る。
+    /// **上下以外でカーソルが動いたら捨てる**（`set_cursor` / `set_selection` が
+    /// 実際に動いたとき・編集・undo / redo・全選択）。読んで置き直すのは上下の移動だけ
+    goal_column: Option<usize>,
+    /// 器（GUI の表示域）に同時に見える行数（#1652。ページ移動の歩幅に使う）。
+    ///
+    /// 本文ではなく「どれだけ見えているか」なので GUI が測って渡す
+    /// （Zed の `Editor::visible_line_count` と同じ置き方）。`None` は未計測
+    viewport_lines: Option<usize>,
 }
 
 impl TextBuffer {
@@ -351,6 +485,8 @@ impl TextBuffer {
             group_open: false,
             manual_millis: None,
             version: 0,
+            goal_column: None,
+            viewport_lines: None,
         })
     }
 
@@ -368,6 +504,8 @@ impl TextBuffer {
             group_open: false,
             manual_millis: None,
             version: 0,
+            goal_column: None,
+            viewport_lines: None,
         }
     }
 
@@ -433,15 +571,53 @@ impl TextBuffer {
         // 選択範囲として同じものなので、見るのは位置と選択範囲
         if offset != self.cursor || selection_range(anchor, offset) != self.selection() {
             self.seal_undo_group();
+            // 上下以外で動いたら、狙っていた桁も捨てる（#1652。上下の移動は
+            // `move_cursor` がこのあと置き直す）
+            self.goal_column = None;
         }
         self.anchor = anchor;
         self.cursor = offset;
     }
 
+    /// 選択の起点と先端を**まとめて**置く（#1652）。`anchor == head` なら選択なし。
+    ///
+    /// `set_cursor(anchor, false)` → `set_cursor(head, true)` の 2 段で置くと、途中で
+    /// カーソルが一度 `anchor` へ飛ぶので「動いた」と数えられ、undo の塊と
+    /// 上下移動の桁の記憶が**選択があるときだけ毎回切れる**。GUI は 1 打鍵ごとに
+    /// 画面の選択をバッファへ写す（`sync_editor_selection_from_preview`）ので、
+    /// 2 段のままだと ⇧↓ を続けたときだけ桁が短い行に吸われる。ここは最終形だけを比べる
+    pub fn set_selection(&mut self, anchor: usize, head: usize) {
+        let anchor = snap_cursor(&self.text, anchor.min(self.text.len()));
+        let head = snap_cursor(&self.text, head.min(self.text.len()));
+        let anchor = (anchor != head).then_some(anchor);
+        if head != self.cursor || selection_range(anchor, head) != self.selection() {
+            self.seal_undo_group();
+            self.goal_column = None;
+        }
+        self.anchor = anchor;
+        self.cursor = head;
+    }
+
     pub fn select_all(&mut self) {
         self.seal_undo_group();
+        self.goal_column = None;
         self.anchor = Some(0);
         self.cursor = self.text.len();
+    }
+
+    /// 器に同時に見える行数を渡す（#1652。ページ移動の歩幅になる）。**本文は変えない**
+    pub fn set_viewport_lines(&mut self, lines: usize) {
+        self.viewport_lines = Some(lines.max(1));
+    }
+
+    /// ページ移動 1 回で進む行数（#1652）。
+    ///
+    /// 見えている行数 − 1。前の画面のいちばん端の 1 行が次の画面にも残るので、
+    /// どこから続きを読めばよいか見失わない。未計測なら [`DEFAULT_PAGE_STEP`]
+    fn page_step(&self) -> usize {
+        self.viewport_lines
+            .map(|lines| lines.saturating_sub(1).max(1))
+            .unwrap_or(DEFAULT_PAGE_STEP)
     }
 
     /// 本文を差し込む。**入ってくる改行はこのバッファの流儀へ揃える**（#1650）。
@@ -528,6 +704,51 @@ impl TextBuffer {
         });
     }
 
+    /// 単位を指定して消す（#1652）。GUI の打鍵と CLI / MCP の `delete` が同じ口を通る。
+    ///
+    /// 選択があれば単位によらず選択を消す。語・行単位の削除は**行の境目で止まる**:
+    /// 行頭で「前へ」消すと改行だけが消えて前の行とつながり、行末で「後ろへ」
+    /// 消すと改行だけが消える（`\r\n` は 1 つの行区切り。#1650）。
+    /// 語の区切りは [`word_left_offset`] / [`word_right_offset`] の 1 実装で、
+    /// ⌥←→ の移動と同じ境界を使う
+    pub fn delete(&mut self, motion: DeleteMotion) {
+        match motion {
+            DeleteMotion::CharBackward => return self.delete_backward(),
+            DeleteMotion::CharForward => return self.delete_forward(),
+            _ => {}
+        }
+        if self.delete_selection() {
+            return;
+        }
+        let cursor = self.cursor;
+        let before = line_break_len_before(&self.text, cursor);
+        let after = line_break_len_after(&self.text, cursor);
+        let range = match motion {
+            DeleteMotion::WordBackward if before > 0 => cursor - before..cursor,
+            DeleteMotion::WordBackward => word_left_offset(&self.text, cursor)..cursor,
+            DeleteMotion::WordForward if after > 0 => cursor..cursor + after,
+            DeleteMotion::WordForward => cursor..word_right_offset(&self.text, cursor),
+            DeleteMotion::ToLineStart if before > 0 => cursor - before..cursor,
+            DeleteMotion::ToLineStart => self.line_start(cursor)..cursor,
+            DeleteMotion::ToLineEnd if after > 0 => cursor..cursor + after,
+            DeleteMotion::ToLineEnd => cursor..self.line_end(cursor),
+            DeleteMotion::CharBackward | DeleteMotion::CharForward => return,
+        };
+        // 文書の端（先頭で前へ・末尾で後ろへ）は消すものが無い = 本文も版も変えない
+        if range.is_empty() {
+            return;
+        }
+        let start = range.start;
+        self.apply_edit(Edit {
+            range,
+            replacement: "",
+            cursor: start,
+            anchor: None,
+            kind: EditKind::DeleteSpan,
+            line_ending: None,
+        });
+    }
+
     // --- undo / redo ---
 
     /// まとめ判定に使う「今」（#1651）。テストは仮想時刻を差し込む
@@ -602,6 +823,8 @@ impl TextBuffer {
         self.cursor = cursor;
         self.anchor = anchor;
         self.line_ending = line_ending_after;
+        // 編集したら上下移動の桁の記憶は捨てる（#1652。打った後の ↓ は打った桁から）
+        self.goal_column = None;
         // 本文が変わった = 文書の版が進む（#1658）。書き換えの口はここ 1 つ
         self.bump_version();
         self.record(delta);
@@ -733,6 +956,7 @@ impl TextBuffer {
         self.line_ending = delta.line_ending_before;
         self.redo_stack.push(delta);
         self.seal_undo_group();
+        self.goal_column = None;
         true
     }
 
@@ -748,6 +972,7 @@ impl TextBuffer {
         self.line_ending = delta.line_ending_after;
         self.undo_stack.push_back(delta);
         self.seal_undo_group();
+        self.goal_column = None;
         true
     }
 
@@ -879,6 +1104,14 @@ impl TextBuffer {
     }
 
     pub fn move_cursor(&mut self, movement: CursorMovement, extend_selection: bool) {
+        // 上下の移動は「狙う桁」を持ち越す（#1652 の desired column）。
+        // 短い行で行末へ寄せられても、記憶しているのは元の桁のまま
+        let goal = movement.is_vertical().then(|| {
+            self.goal_column
+                .unwrap_or_else(|| self.char_column(self.cursor))
+        });
+        let goal_col = goal.unwrap_or(0);
+        let page = self.page_step() as isize;
         let target = match movement {
             // `\r\n` は 1 つの行区切りなので、あいだで止まらずにまたぐ（#1650）
             CursorMovement::Left if self.text[..self.cursor].ends_with("\r\n") => self.cursor - 2,
@@ -898,14 +1131,22 @@ impl TextBuffer {
                         .map(char::len_utf8)
                         .unwrap_or(0)
             }
-            CursorMovement::Up => self.vertical_target(-1),
-            CursorMovement::Down => self.vertical_target(1),
+            CursorMovement::Up => self.vertical_target(-1, goal_col),
+            CursorMovement::Down => self.vertical_target(1, goal_col),
+            CursorMovement::PageUp => self.vertical_target(-page, goal_col),
+            CursorMovement::PageDown => self.vertical_target(page, goal_col),
+            CursorMovement::WordLeft => word_left_offset(&self.text, self.cursor),
+            CursorMovement::WordRight => word_right_offset(&self.text, self.cursor),
             CursorMovement::LineStart => self.line_start(self.cursor),
+            CursorMovement::SmartLineStart => self.smart_line_start(self.cursor),
             CursorMovement::LineEnd => self.line_end(self.cursor),
             CursorMovement::DocumentStart => 0,
             CursorMovement::DocumentEnd => self.text.len(),
         };
         self.set_cursor(target, extend_selection);
+        // `set_cursor` は動いたら記憶を捨てるので、そのあとで置き直す
+        // （上下以外の移動では `None` = 捨てたまま）
+        self.goal_column = goal;
     }
 
     /// 0 起点の行と、その行内 UTF-8 バイト位置を返す。
@@ -1091,13 +1332,25 @@ impl TextBuffer {
         line_end_offset(&self.text, offset)
     }
 
-    fn vertical_target(&self, delta: isize) -> usize {
+    /// その位置の桁（行頭からの**文字数**）。上下移動の桁の記憶はこの単位で持つ
+    fn char_column(&self, offset: usize) -> usize {
+        self.text[self.line_start(offset)..offset].chars().count()
+    }
+
+    /// `delta` 行ぶん上下した行の、桁 `goal`（文字数）の位置。
+    ///
+    /// 行き先の行が短ければその行末へ寄せる（桁の記憶は呼び出し側が持ち越す）。
+    /// 文書の端より先へは行かない: ページ移動は端の行で止まり、1 行の移動は
+    /// 端の行で押しても動かない（↑ を先頭行で押しても桁 0 へは飛ばない = 従来どおり）
+    fn vertical_target(&self, delta: isize, goal: usize) -> usize {
         let (line, _) = self.line_byte_col(self.cursor);
-        let char_col = self.text[self.line_start(self.cursor)..self.cursor]
-            .chars()
-            .count();
-        let target_line = line.saturating_add_signed(delta);
-        if target_line == line && delta != 0 {
+        let last = self.line_count() - 1;
+        let target_line = if delta < 0 {
+            line.saturating_sub(delta.unsigned_abs())
+        } else {
+            line.saturating_add(delta.unsigned_abs()).min(last)
+        };
+        if target_line == line {
             return self.cursor;
         }
         let Some(start) = line_start_offset(&self.text, target_line) else {
@@ -1106,10 +1359,30 @@ impl TextBuffer {
         let line_text = &self.text[start..self.line_end(start)];
         let relative = line_text
             .char_indices()
-            .nth(char_col)
+            .nth(goal)
             .map(|(i, _)| i)
             .unwrap_or(line_text.len());
         start + relative
+    }
+
+    /// smart Home の行き先（#1652）。
+    ///
+    /// 最初の非空白（インデントの直後）にいれば桁 0 へ、それ以外なら最初の非空白へ。
+    /// 押すたびに 2 点を行き来する（VS Code / Zed / Xcode と同じ）。インデントとして
+    /// 数えるのは半角スペースとタブだけ。空行・空白だけの行では「最初の非空白」が
+    /// 行末になる
+    fn smart_line_start(&self, offset: usize) -> usize {
+        let start = self.line_start(offset);
+        let end = self.line_end(offset);
+        let indent = self.text[start..end]
+            .find(|c: char| c != ' ' && c != '\t')
+            .unwrap_or(end - start);
+        let first = start + indent;
+        if offset == first {
+            start
+        } else {
+            first
+        }
     }
 }
 
@@ -1242,6 +1515,127 @@ fn line_end_offset(text: &str, offset: usize) -> usize {
         }
         None => text.len(),
     }
+}
+
+/// `offset` の直前にある行区切りのバイト数（#1652）。`\r\n` なら 2、`\n` なら 1、無ければ 0
+fn line_break_len_before(text: &str, offset: usize) -> usize {
+    let head = &text[..offset];
+    if head.ends_with("\r\n") {
+        2
+    } else if head.ends_with('\n') {
+        1
+    } else {
+        0
+    }
+}
+
+/// `offset` の直後にある行区切りのバイト数（#1652）。`\r\n` なら 2、`\n` なら 1、無ければ 0
+fn line_break_len_after(text: &str, offset: usize) -> usize {
+    let tail = &text[offset..];
+    if tail.starts_with("\r\n") {
+        2
+    } else if tail.starts_with('\n') {
+        1
+    } else {
+        0
+    }
+}
+
+/// 語の区切りに使う文字の種類（#1652）。**同じ種類が続くあいだが 1 語**。
+///
+/// 空白をまたいで次の塊へ進み、塊の端で止まる。英数字と `_` は 1 種類
+/// （`snake_case` は 1 語）、記号の並びは記号どうしで 1 語。日本語は分かち書きを
+/// しないので、**文字種の切り替わり**を語の境目にする（`日本語のテキスト` は
+/// 日本語 / の / テキスト の 3 語）。辞書による分割は持たない
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CharClass {
+    /// 行内の空白（スペース・タブ・全角スペース・単独の CR）
+    Space,
+    /// 英数字と `_`（全角の英数字も含む）
+    Word,
+    /// 漢字（`々` を含む）
+    Han,
+    Hiragana,
+    /// カタカナ（長音符 `ー`・半角カナを含む）
+    Katakana,
+    /// それ以外（記号・句読点・絵文字）
+    Punct,
+}
+
+fn char_class(c: char) -> CharClass {
+    if c.is_whitespace() {
+        return CharClass::Space;
+    }
+    match u32::from(c) {
+        0x3040..=0x309F => CharClass::Hiragana,
+        0x30A0..=0x30FF | 0x31F0..=0x31FF | 0xFF66..=0xFF9F => CharClass::Katakana,
+        0x3005 | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF => CharClass::Han,
+        _ if c.is_alphanumeric() || c == '_' => CharClass::Word,
+        _ => CharClass::Punct,
+    }
+}
+
+/// ⌥← / Ctrl+← の行き先（#1652）: 前の語の頭。
+///
+/// 左へ空白を飛ばし、そこにある塊の頭で止まる。**行頭で押すと前の行の最後の語の
+/// 頭へ**またぐ（改行をまたいでから同じ規則。VS Code / macOS のテキスト欄と同じ）。
+/// 空白の途中で行頭に着いたらそこで止まる（インデントの手前で止まる）
+fn word_left_offset(text: &str, offset: usize) -> usize {
+    let mut p = offset;
+    p -= line_break_len_before(text, p);
+    let prev = |p: usize| text[..p].chars().next_back();
+    while let Some(c) = prev(p) {
+        if c == '\n' || char_class(c) != CharClass::Space {
+            break;
+        }
+        p -= c.len_utf8();
+    }
+    let Some(first) = prev(p).filter(|c| *c != '\n') else {
+        return p;
+    };
+    let class = char_class(first);
+    while let Some(c) = prev(p) {
+        if c == '\n' || char_class(c) != class {
+            break;
+        }
+        p -= c.len_utf8();
+    }
+    p
+}
+
+/// ⌥→ / Ctrl+→ の行き先（#1652）: 次の語の末尾。
+///
+/// 右へ空白を飛ばし、そこにある塊の末尾で止まる。**行末で押すと次の行の最初の語の
+/// 末尾へ**またぐ。空白のまま行末に着いたらそこで止まる。`\r\n` の CR は
+/// 行区切りの一部として扱い、空白として飛ばさない（カーソルが CR と LF の
+/// あいだへ入らない = #1650）
+fn word_right_offset(text: &str, offset: usize) -> usize {
+    let mut p = offset;
+    p += line_break_len_after(text, p);
+    let next = |p: usize| {
+        if line_break_len_after(text, p) > 0 {
+            None
+        } else {
+            text[p..].chars().next()
+        }
+    };
+    while let Some(c) = next(p) {
+        if char_class(c) != CharClass::Space {
+            break;
+        }
+        p += c.len_utf8();
+    }
+    let Some(first) = next(p) else {
+        return p;
+    };
+    let class = char_class(first);
+    while let Some(c) = next(p) {
+        if char_class(c) != class {
+            break;
+        }
+        p += c.len_utf8();
+    }
+    p
 }
 
 /// カーソルを置いてよい位置へ丸める。
@@ -2727,5 +3121,389 @@ mod tests {
         let state = buffer.document_state();
         assert_eq!(state["selection"]["start"]["column"], 0);
         assert_eq!(state["selection"]["end"]["column"], 2);
+    }
+
+    // --- 修飾キーの移動・削除（#1652） -----------------------------------------
+
+    /// `|` をカーソル位置の印として読む（`foo |bar` → 本文 `foo bar` / カーソル 4）
+    fn marked(src: &str) -> (String, usize) {
+        let at = src.find('|').expect("カーソルの印 | がある");
+        (src.replacen('|', "", 1), at)
+    }
+
+    /// 本文とカーソルを `|` 付きの 1 本の文字列へ戻す（失敗時に読める形で出す）
+    fn show(buffer: &TextBuffer) -> String {
+        let mut out = buffer.text().to_string();
+        out.insert(buffer.cursor(), '|');
+        out
+    }
+
+    fn buffer_at(src: &str) -> TextBuffer {
+        let (text, cursor) = marked(src);
+        let mut buffer = TextBuffer::from_text(path("keys"), text);
+        buffer.set_cursor(cursor, false);
+        buffer
+    }
+
+    /// 移動の表（多バイト・CRLF・空行・行末・文書端を含む）
+    #[test]
+    fn 語と行の移動は表どおりに止まる() {
+        use CursorMovement as M;
+        let cases: &[(&str, M, &str)] = &[
+            // 語の右: 空白を飛ばして次の塊の末尾
+            ("|foo bar", M::WordRight, "foo| bar"),
+            ("foo| bar", M::WordRight, "foo bar|"),
+            ("fo|o bar", M::WordRight, "foo| bar"),
+            ("|snake_case x", M::WordRight, "snake_case| x"),
+            // 記号の並びは記号どうしで 1 語
+            ("self|.buffer", M::WordRight, "self.|buffer"),
+            ("|a += 1", M::WordRight, "a| += 1"),
+            ("a| += 1", M::WordRight, "a +=| 1"),
+            // 日本語は文字種の切り替わりが境目
+            ("|日本語のテキスト", M::WordRight, "日本語|のテキスト"),
+            ("日本語|のテキスト", M::WordRight, "日本語の|テキスト"),
+            ("日本語の|テキスト", M::WordRight, "日本語のテキスト|"),
+            ("|全角　スペース", M::WordRight, "全角|　スペース"),
+            // 行末では次の行の最初の語の末尾へまたぐ（インデントは飛ばす）
+            ("foo|\n    bar baz", M::WordRight, "foo\n    bar| baz"),
+            // 次の行が空なら、その空行で止まる
+            ("foo|\n\nbar", M::WordRight, "foo\n|\nbar"),
+            // 空白のまま行末に着いたらそこで止まる
+            ("foo|   \nbar", M::WordRight, "foo   |\nbar"),
+            // CRLF は 1 つの行区切り（CR と LF のあいだに止まらない）
+            ("foo|\r\nbar", M::WordRight, "foo\r\nbar|"),
+            ("foo|   \r\nbar", M::WordRight, "foo   |\r\nbar"),
+            // 文書末では動かない
+            ("foo bar|", M::WordRight, "foo bar|"),
+            ("|", M::WordRight, "|"),
+            // 語の左: 空白を飛ばして前の塊の頭
+            ("foo bar|", M::WordLeft, "foo |bar"),
+            ("foo |bar", M::WordLeft, "|foo bar"),
+            ("foo ba|r", M::WordLeft, "foo |bar"),
+            ("self.|buffer", M::WordLeft, "self|.buffer"),
+            ("日本語のテキスト|", M::WordLeft, "日本語の|テキスト"),
+            ("日本語|のテキスト", M::WordLeft, "|日本語のテキスト"),
+            // 行頭では前の行の最後の語の頭へまたぐ
+            ("foo bar\n|baz", M::WordLeft, "foo |bar\nbaz"),
+            ("foo bar\r\n|baz", M::WordLeft, "foo |bar\r\nbaz"),
+            // 前の行が空なら、その空行で止まる
+            ("foo\n\n|bar", M::WordLeft, "foo\n|\nbar"),
+            // インデントの途中では行頭で止まる（前の行へ抜けない）
+            ("foo\n    |bar", M::WordLeft, "foo\n|    bar"),
+            // 文書頭では動かない
+            ("|foo", M::WordLeft, "|foo"),
+            // smart Home: 最初の非空白 ⇄ 桁 0
+            ("    let x|", M::SmartLineStart, "    |let x"),
+            ("    |let x", M::SmartLineStart, "|    let x"),
+            ("|    let x", M::SmartLineStart, "    |let x"),
+            ("  |  let x", M::SmartLineStart, "    |let x"),
+            ("\t\tfn|()", M::SmartLineStart, "\t\t|fn()"),
+            ("a\r\n    b|c\r\nd", M::SmartLineStart, "a\r\n    |bc\r\nd"),
+            // インデントの無い行は桁 0 のまま（トグル先も桁 0）
+            ("ab|c", M::SmartLineStart, "|abc"),
+            ("|abc", M::SmartLineStart, "|abc"),
+            // 空白だけの行: 最初の非空白 = 行末
+            ("x\n  |  \ny", M::SmartLineStart, "x\n    |\ny"),
+            ("x\n    |\ny", M::SmartLineStart, "x\n|    \ny"),
+            // 空行
+            ("x\n|\ny", M::SmartLineStart, "x\n|\ny"),
+            // 行末（CRLF の CR の手前 = #1650）
+            ("a|b\r\nc", M::LineEnd, "ab|\r\nc"),
+            // 桁 0 の行頭（CLI / MCP から指す口）はインデントを見ない
+            ("    let |x", M::LineStart, "|    let x"),
+            // 文書端
+            ("ab\nc|d\nef", M::DocumentStart, "|ab\ncd\nef"),
+            ("ab\nc|d\nef", M::DocumentEnd, "ab\ncd\nef|"),
+        ];
+        for (src, movement, want) in cases {
+            let mut buffer = buffer_at(src);
+            buffer.move_cursor(*movement, false);
+            assert_eq!(
+                show(&buffer),
+                *want,
+                "{src:?} で {movement:?} → {want:?} のはず"
+            );
+        }
+    }
+
+    /// 削除の表（語・行単位は行の境目で止まり、端では何も消さない）
+    #[test]
+    fn 語と行の削除は表どおりに消す() {
+        use DeleteMotion as D;
+        let cases: &[(&str, D, &str)] = &[
+            ("foo bar|", D::WordBackward, "foo |"),
+            ("foo |bar", D::WordBackward, "|bar"),
+            ("foo ba|r", D::WordBackward, "foo |r"),
+            ("日本語の|テキスト", D::WordBackward, "日本語|テキスト"),
+            // 行頭では改行だけを消して前の行とつなぐ（LF / CRLF とも 1 単位）
+            ("foo\n|bar", D::WordBackward, "foo|bar"),
+            ("foo\r\n|bar", D::WordBackward, "foo|bar"),
+            // インデントだけを消す（前の行へ抜けない）
+            ("x\n    |y", D::WordBackward, "x\n|y"),
+            // 文書頭では何も消さない
+            ("|foo", D::WordBackward, "|foo"),
+            ("|foo bar", D::WordForward, "| bar"),
+            ("foo| bar", D::WordForward, "foo|"),
+            ("|日本語のテキスト", D::WordForward, "|のテキスト"),
+            // 行末では改行だけを消す
+            ("foo|\nbar", D::WordForward, "foo|bar"),
+            ("foo|\r\nbar", D::WordForward, "foo|bar"),
+            // 空白のあとが行末なら空白だけ消える（次の行は消えない）
+            ("foo|   \nbar", D::WordForward, "foo|\nbar"),
+            // 文書末では何も消さない
+            ("foo|", D::WordForward, "foo|"),
+            // 行頭まで / 行末まで
+            ("  ab|cd", D::ToLineStart, "|cd"),
+            ("x\n|cd", D::ToLineStart, "x|cd"),
+            ("ab|cd\r\nx", D::ToLineEnd, "ab|\r\nx"),
+            ("ab|\r\nx", D::ToLineEnd, "ab|x"),
+            // 1 文字（従来の Backspace / Delete と同じ）
+            ("a日|b", D::CharBackward, "a|b"),
+            ("a|日b", D::CharForward, "a|b"),
+            ("a\r\n|b", D::CharBackward, "a|b"),
+        ];
+        for (src, motion, want) in cases {
+            let mut buffer = buffer_at(src);
+            buffer.delete(*motion);
+            assert_eq!(
+                show(&buffer),
+                *want,
+                "{src:?} で {motion:?} → {want:?} のはず"
+            );
+        }
+    }
+
+    /// 選択があれば単位によらず選択を消す
+    #[test]
+    fn 選択中の語削除は選択を消す() {
+        for motion in DeleteMotion::ALL {
+            let mut buffer = TextBuffer::from_text(path("sel-del"), "one two three".into());
+            buffer.set_selection(4, 7);
+            buffer.delete(motion);
+            assert_eq!(buffer.text(), "one  three", "{motion:?}");
+            assert_eq!(buffer.cursor(), 4, "{motion:?}");
+            assert_eq!(buffer.selection(), None, "{motion:?}");
+        }
+    }
+
+    /// 端で押しても本文も版も変わらない（楽観ロックを無駄に外さない）
+    #[test]
+    fn 端での語削除は版を進めない() {
+        let mut buffer = TextBuffer::from_text(path("edge"), "ab".into());
+        let before = buffer.version();
+        buffer.set_cursor(0, false);
+        buffer.delete(DeleteMotion::WordBackward);
+        buffer.delete(DeleteMotion::ToLineStart);
+        buffer.set_cursor(2, false);
+        buffer.delete(DeleteMotion::WordForward);
+        buffer.delete(DeleteMotion::ToLineEnd);
+        assert_eq!(buffer.text(), "ab");
+        assert_eq!(buffer.version(), before);
+        assert_eq!(buffer.undo_depth(), 0);
+    }
+
+    /// 語削除は 1 回ずつ undo で戻る（連続しても 1 塊にまとめない）
+    #[test]
+    fn 語削除はundo1回で1語ずつ戻る() {
+        let mut buffer = TextBuffer::from_text(path("undo-word"), "one two three".into());
+        buffer.set_clock_millis(0);
+        buffer.move_cursor(CursorMovement::DocumentEnd, false);
+        buffer.delete(DeleteMotion::WordBackward);
+        buffer.delete(DeleteMotion::WordBackward);
+        assert_eq!(buffer.text(), "one ");
+        assert_eq!(buffer.undo_depth(), 2);
+        assert!(buffer.undo());
+        assert_eq!(show(&buffer), "one two |");
+        assert!(buffer.undo());
+        assert_eq!(show(&buffer), "one two three|");
+    }
+
+    /// Issue の実測の再現: (0,8) → ↓ (1,2) → ↓ は (2,8) へ戻る
+    #[test]
+    fn 上下移動は短い行をまたいでも元の桁へ戻る() {
+        let mut buffer = TextBuffer::from_text(path("goal"), "0123456789\nab\n0123456789\n".into());
+        buffer.set_cursor(8, false);
+        buffer.move_cursor(CursorMovement::Down, false);
+        assert_eq!(buffer.line_byte_col(buffer.cursor()), (1, 2));
+        buffer.move_cursor(CursorMovement::Down, false);
+        assert_eq!(buffer.line_byte_col(buffer.cursor()), (2, 8));
+        // 上へ戻っても同じ
+        buffer.move_cursor(CursorMovement::Up, false);
+        buffer.move_cursor(CursorMovement::Up, false);
+        assert_eq!(buffer.line_byte_col(buffer.cursor()), (0, 8));
+        // 末尾の空行（改行で終わるファイルの後ろ）も 1 行として通る
+        buffer.move_cursor(CursorMovement::Down, false);
+        buffer.move_cursor(CursorMovement::Down, false);
+        buffer.move_cursor(CursorMovement::Down, false);
+        assert_eq!(buffer.line_byte_col(buffer.cursor()), (3, 0));
+        buffer.move_cursor(CursorMovement::Up, false);
+        assert_eq!(buffer.line_byte_col(buffer.cursor()), (2, 8));
+    }
+
+    /// 桁は**文字数**で持つ（多バイト・CRLF の行でもバイト数に引きずられない）
+    #[test]
+    fn 桁の記憶は多バイトとcrlfでも文字で数える() {
+        let mut buffer = TextBuffer::from_text(
+            path("goal-mb"),
+            "日本語テキスト\r\nab\r\nかなカナ漢字です\r\n".into(),
+        );
+        buffer.set_cursor("日本語テキ".len(), false);
+        buffer.move_cursor(CursorMovement::Down, false);
+        assert_eq!(
+            show(&buffer),
+            "日本語テキスト\r\nab|\r\nかなカナ漢字です\r\n"
+        );
+        buffer.move_cursor(CursorMovement::Down, false);
+        assert_eq!(
+            show(&buffer),
+            "日本語テキスト\r\nab\r\nかなカナ漢|字です\r\n"
+        );
+    }
+
+    /// 上下以外で動いたら・打ったら桁の記憶は捨てる
+    #[test]
+    fn 横移動と編集で桁の記憶は捨てる() {
+        let text = "0123456789\nab\n0123456789";
+        // 横移動
+        let mut buffer = TextBuffer::from_text(path("goal-h"), text.into());
+        buffer.set_cursor(8, false);
+        buffer.move_cursor(CursorMovement::Down, false);
+        buffer.move_cursor(CursorMovement::Left, false);
+        buffer.move_cursor(CursorMovement::Down, false);
+        assert_eq!(buffer.line_byte_col(buffer.cursor()), (2, 1));
+        // 編集
+        let mut buffer = TextBuffer::from_text(path("goal-e"), text.into());
+        buffer.set_cursor(8, false);
+        buffer.move_cursor(CursorMovement::Down, false);
+        buffer.insert("Z");
+        buffer.move_cursor(CursorMovement::Down, false);
+        assert_eq!(buffer.line_byte_col(buffer.cursor()), (2, 3));
+        // クリック（set_cursor）
+        let mut buffer = TextBuffer::from_text(path("goal-c"), text.into());
+        buffer.set_cursor(8, false);
+        buffer.move_cursor(CursorMovement::Down, false);
+        buffer.set_cursor("0123456789\na".len(), false);
+        buffer.move_cursor(CursorMovement::Down, false);
+        assert_eq!(buffer.line_byte_col(buffer.cursor()), (2, 1));
+    }
+
+    /// GUI は 1 打鍵ごとに画面の選択をバッファへ写す（`set_selection`）。
+    /// 同じ選択の写し戻しでは桁の記憶も undo の塊も切れない
+    #[test]
+    fn 同じ選択の写し戻しは桁の記憶を切らない() {
+        let mut buffer =
+            TextBuffer::from_text(path("goal-sel"), "0123456789\nab\n0123456789".into());
+        buffer.set_cursor(8, false);
+        buffer.move_cursor(CursorMovement::Down, true);
+        // GUI の写し戻し（同じ選択）
+        let (anchor, head) = (buffer.anchor().unwrap(), buffer.cursor());
+        buffer.set_selection(anchor, head);
+        buffer.move_cursor(CursorMovement::Down, true);
+        assert_eq!(buffer.line_byte_col(buffer.cursor()), (2, 8));
+        assert_eq!(buffer.selection(), Some(8..buffer.cursor()));
+        // 違う選択を写したら切れる
+        buffer.set_selection(0, 1);
+        buffer.move_cursor(CursorMovement::Down, false);
+        assert_eq!(buffer.line_byte_col(buffer.cursor()), (1, 1));
+    }
+
+    /// ページ移動: 歩幅は「見えている行数 − 1」、端の行で止まり、桁の記憶を使う
+    #[test]
+    fn ページ移動は見えている行数から1行残して進む() {
+        let text: String = (0..100)
+            .map(|i| format!("line {i:03} xxxxxxxx\n"))
+            .collect();
+        let mut buffer = TextBuffer::from_text(path("page"), text);
+        buffer.set_viewport_lines(10);
+        buffer.set_cursor("line 000 xx".len(), false);
+        buffer.move_cursor(CursorMovement::PageDown, false);
+        assert_eq!(buffer.line_byte_col(buffer.cursor()), (9, 11));
+        buffer.move_cursor(CursorMovement::PageDown, true);
+        assert_eq!(buffer.line_byte_col(buffer.cursor()), (18, 11));
+        assert_eq!(
+            buffer.selection().map(|r| r.start),
+            Some("line 000 xxxxxxxx\n".len() * 9 + 11)
+        );
+        buffer.move_cursor(CursorMovement::PageUp, false);
+        assert_eq!(buffer.line_byte_col(buffer.cursor()), (9, 11));
+        // 文書の端の行で止まる（末尾は改行の後ろの空行 = 行 100。短い行へは行末で着く）
+        for _ in 0..20 {
+            buffer.move_cursor(CursorMovement::PageDown, false);
+        }
+        assert_eq!(buffer.line_byte_col(buffer.cursor()), (100, 0));
+        // 端から戻ると桁は記憶どおり
+        buffer.move_cursor(CursorMovement::PageUp, false);
+        assert_eq!(buffer.line_byte_col(buffer.cursor()), (91, 11));
+        for _ in 0..20 {
+            buffer.move_cursor(CursorMovement::PageUp, false);
+        }
+        assert_eq!(buffer.line_byte_col(buffer.cursor()), (0, 11));
+        // 1 行しか見えない器でも止まらずに 1 行ずつ進む
+        buffer.set_viewport_lines(1);
+        buffer.move_cursor(CursorMovement::PageDown, false);
+        assert_eq!(buffer.line_byte_col(buffer.cursor()), (1, 11));
+    }
+
+    /// 器を 1 度も測っていないときは既定の歩幅で進む（CLI から開いた直後など）
+    #[test]
+    fn 器が未計測ならページ移動は既定の歩幅() {
+        let text: String = (0..50).map(|i| format!("{i}\n")).collect();
+        let mut buffer = TextBuffer::from_text(path("page-default"), text);
+        buffer.move_cursor(CursorMovement::PageDown, false);
+        assert_eq!(buffer.line_byte_col(buffer.cursor()).0, DEFAULT_PAGE_STEP);
+    }
+
+    /// ⇧ 付きの移動は選択を伸ばし、⇧ なしの移動は選択を畳む
+    #[test]
+    fn 修飾付きの移動は選択を伸ばせる() {
+        use CursorMovement as M;
+        for (movement, src, want_sel) in [
+            (M::WordRight, "a |foo bar", "foo"),
+            (M::WordLeft, "a foo| bar", "foo"),
+            (M::SmartLineStart, "  ab|c", "ab"),
+            (M::LineEnd, "a|bc\nd", "bc"),
+            (M::DocumentEnd, "a|b\ncd", "b\ncd"),
+            (M::DocumentStart, "ab\nc|d", "ab\nc"),
+        ] {
+            let mut buffer = buffer_at(src);
+            buffer.move_cursor(movement, true);
+            let range = buffer.selection().expect("選択が伸びる");
+            assert_eq!(&buffer.text()[range], want_sel, "{movement:?} {src:?}");
+            buffer.move_cursor(movement, false);
+            assert_eq!(buffer.selection(), None, "{movement:?} {src:?}");
+        }
+    }
+
+    /// 移動は本文を変えないので版を進めない（楽観ロックが移動で外れない）
+    #[test]
+    fn 修飾付きの移動は版を進めない() {
+        let mut buffer = TextBuffer::from_text(path("move-version"), "one two\nthree\n".into());
+        buffer.set_viewport_lines(5);
+        let before = buffer.version();
+        for movement in CursorMovement::ALL {
+            buffer.move_cursor(movement, false);
+            buffer.move_cursor(movement, true);
+        }
+        assert_eq!(buffer.version(), before);
+    }
+
+    /// 名前の表: 全種類が一意に往復する（CLI / MCP はこの綴りだけを使う）
+    #[test]
+    fn 移動と削除の名前は往復する() {
+        for movement in CursorMovement::ALL {
+            assert_eq!(CursorMovement::from_name(movement.name()), Some(movement));
+        }
+        for motion in DeleteMotion::ALL {
+            assert_eq!(DeleteMotion::from_name(motion.name()), Some(motion));
+        }
+        let mut names = CursorMovement::names();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), CursorMovement::ALL.len());
+        let mut names = DeleteMotion::names();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), DeleteMotion::ALL.len());
+        assert_eq!(CursorMovement::from_name("word_left"), None);
     }
 }

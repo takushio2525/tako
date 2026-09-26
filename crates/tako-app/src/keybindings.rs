@@ -1902,4 +1902,56 @@ mod tests {
             "macOS に非 platform 修飾のコピーバインドが混入している"
         );
     }
+
+    /// #1652: コード編集の打鍵表（`tako_core::platform::editor_keys`）のどの打鍵にも
+    /// キーバインドが張られていないこと（**両 OS について**）。
+    ///
+    /// GPUI はキーバインドのアクションを `on_key_down` より先に発火して伝播を止めるので、
+    /// ここが重なると編集の入口へ打鍵が**届かない**（Windows の Alt+矢印 = ペインの
+    /// フォーカス移動がまさにそれで、Windows の単語移動を Ctrl+矢印に置いた理由）。
+    /// 表とバインドのどちらかへ足した打鍵が、もう片方の既存の打鍵を黙って食う形を止める。
+    /// shift 付きの打鍵（選択の拡張）も同じ理由で見る
+    #[test]
+    fn エディタの打鍵表はキーバインドと衝突しない() {
+        use tako_core::platform::editor_keys;
+        let mut checked = 0usize;
+        let mut collisions = Vec::new();
+        for platform in [Platform::MacOs, Platform::Windows] {
+            let bound: Vec<(String, Keystroke)> = bindings_for(platform)
+                .iter()
+                .filter(|b| b.keystrokes().len() == 1)
+                .map(|b| {
+                    (
+                        b.action().name().to_string(),
+                        b.keystrokes()[0].inner().clone(),
+                    )
+                })
+                .collect();
+            for (action, chord) in editor_keys::all_chords(platform) {
+                for shift in [false, true] {
+                    let spec = if shift {
+                        format!("shift-{}", chord.gpui_spec())
+                    } else {
+                        chord.gpui_spec()
+                    };
+                    let want = Keystroke::parse(&spec).expect("表の綴りは GPUI が読める");
+                    checked += 1;
+                    for (name, got) in &bound {
+                        if got.key == want.key && got.modifiers == want.modifiers {
+                            collisions.push(format!(
+                                "{platform:?}: {spec}（編集の {action:?}）に {name} が張られている"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 40, "打鍵表を読めていない（{checked} 件）");
+        assert!(
+            collisions.is_empty(),
+            "エディタの打鍵がキーバインドに食われる:\n{}\n\
+             → crates/tako-core/src/platform/editor_keys.rs の列か keybindings.rs のバインドを動かす",
+            collisions.join("\n")
+        );
+    }
 }
