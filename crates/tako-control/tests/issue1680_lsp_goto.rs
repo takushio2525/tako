@@ -417,6 +417,108 @@ fn 起動が終わらなければ上限で未応答() {
     manager.shutdown_all(Duration::from_secs(2));
 }
 
+fn config_with(scratch: &Scratch, scenario: &str, rules: &Value, extra: &[&str]) -> LspConfig {
+    let mut config = config(scratch, scenario, rules);
+    let mut args = vec![
+        "--scenario".to_string(),
+        scenario.to_string(),
+        "--log".to_string(),
+        scratch.log().display().to_string(),
+        "--goto".to_string(),
+        scratch.rules().display().to_string(),
+    ];
+    args.extend(extra.iter().map(|s| s.to_string()));
+    config.launcher = Arc::new(move |_spec: &ServerSpec| Launch::Found {
+        plan: ChildCmd {
+            program: FAKE.to_string(),
+            args: args.clone(),
+        },
+        program_path: FAKE.to_string(),
+    });
+    config
+}
+
+fn definition_count(scratch: &Scratch) -> usize {
+    methods(scratch)
+        .iter()
+        .filter(|m| *m == "textDocument/definition")
+        .count()
+}
+
+/// 読み込みの前の問い合わせに**空で答える**サーバ（rust-analyzer）: 空の答えを「見つからない」と
+/// 読まず、サーバが「読み込みが済んだ」（`experimental/serverStatus` の `quiescent: true`）と
+/// 知らせるのを待って問い直す。初期化で知らせてもらう能力を申告している
+#[test]
+fn 読み込み中の空の答えは済むのを待って問い直す() {
+    let scratch = Scratch::new("loading");
+    let main = scratch.write("src/main.rs", "fn main() { helper(); }\n");
+    let other = scratch.write("src/other.rs", "pub fn helper() {}\n");
+    let rules = json!([{ "result": location(&other, 0, 7) }]);
+    let manager = LspManager::new(config(&scratch, "loading", &rules));
+    let answer = manager
+        .goto(&request(&main, 0, 12, 10))
+        .expect("答えが来る");
+    assert_eq!(
+        answer.targets.len(),
+        1,
+        "読み込みが済んでから問い直して見つかる"
+    );
+    assert_eq!(answer.targets[0].path, other);
+    assert_eq!(
+        definition_count(&scratch),
+        2,
+        "空の答えのあと 1 回だけ問い直す"
+    );
+    assert_eq!(
+        received(&scratch)[0]["params"]["capabilities"]["experimental"]["serverStatusNotification"],
+        json!(true)
+    );
+    manager.shutdown_all(Duration::from_secs(2));
+}
+
+/// 読み込みが上限までに済まなければ「起動が終わらなかった」系の未応答（見つからないにしない）
+#[test]
+fn 読み込みが上限までに済まなければ未応答() {
+    let scratch = Scratch::new("loading-slow");
+    let main = scratch.write("src/main.rs", "fn main() { helper(); }\n");
+    let manager = LspManager::new(config_with(
+        &scratch,
+        "loading",
+        &json!([]),
+        &["--loading-ms", "60000"],
+    ));
+    let error = manager.goto(&request(&main, 0, 12, 1)).unwrap_err();
+    assert!(
+        matches!(error, GotoError::Timeout { starting: true, .. }),
+        "{error:?}"
+    );
+    manager.shutdown_all(Duration::from_secs(2));
+}
+
+/// 状態を送らないサーバ（clangd・偽サーバの normal）: 空の答えは見つからない。
+/// 握手の直後だけは知らせを猶予のあいだ待ち、1 回だけ問い直す（それ以上は待たない）
+#[test]
+fn 状態を送らないサーバの空の答えは見つからない() {
+    let scratch = Scratch::new("nostatus");
+    let main = scratch.write("src/main.rs", "fn main() {}\n");
+    let manager = LspManager::new(config(&scratch, "normal", &json!([])));
+    let answer = manager.goto(&request(&main, 0, 3, 10)).unwrap();
+    assert!(answer.targets.is_empty());
+    let asked = definition_count(&scratch);
+    assert!(asked <= 2, "握手の直後の猶予で 1 回だけ問い直す: {asked}");
+    // 猶予を過ぎてからの空の答えは待たずに見つからない（問い直さない）
+    std::thread::sleep(tako_control::lsp::goto::STATUS_GRACE);
+    let before = definition_count(&scratch);
+    let again = manager.goto(&request(&main, 0, 3, 10)).unwrap();
+    assert!(again.targets.is_empty());
+    assert_eq!(
+        definition_count(&scratch),
+        before + 1,
+        "猶予の後は 1 回きり"
+    );
+    manager.shutdown_all(Duration::from_secs(2));
+}
+
 /// 能力に無い種類は問い合わせずに「未対応」を返す
 #[test]
 fn 能力に無ければ未対応() {

@@ -249,6 +249,11 @@ struct Slot {
     root_uri: String,
     /// 直近の stderr（プロセスが終わっても `tako lsp logs` で読めるように写しておく）
     last_stderr: Vec<String>,
+    /// サーバが知らせた「読み込みが済んだか」（`experimental/serverStatus` の `quiescent`。#1680）。
+    /// 送らないサーバは `None` のまま
+    quiescent: Option<bool>,
+    /// 握手が済んだ時刻（状態を送るサーバかを起動直後の猶予のあいだだけ待って確かめる。#1680）
+    running_since: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -739,6 +744,8 @@ impl Shared {
         slot.capabilities = None;
         slot.server_info = None;
         slot.position_encoding = None;
+        slot.quiescent = None;
+        slot.running_since = None;
         let generation = slot.generation;
         let Some(shared) = self.arc() else {
             return;
@@ -863,6 +870,7 @@ impl Shared {
         slot.server_info = result.get("serverInfo").cloned();
         let _ = process.notify("initialized", json!({}));
         self.step(slot, Event::Initialized);
+        slot.running_since = Some(Instant::now());
         for (uri, doc) in inner.docs.iter_mut() {
             if doc.key == *key {
                 send_did_open(&process, uri, doc, generation);
@@ -894,6 +902,13 @@ impl Shared {
     }
 
     fn on_notification(&self, key: &ServerKey, method: &str, params: Value) {
+        // #1680: 読み込みが済んだか（定義ジャンプが空の答えを「見つからない」と読み違えないため）
+        if method == super::goto::SERVER_STATUS_METHOD {
+            if let Some(slot) = self.lock().servers.get_mut(key) {
+                slot.quiescent = super::goto::quiescent_of(&params);
+            }
+            return;
+        }
         if method != "textDocument/publishDiagnostics" {
             // window/logMessage・$/progress 等は S1 では受けて捨てる
             return;
@@ -1291,10 +1306,48 @@ impl Shared {
                 }
             }
         };
-        let (process, capabilities) = self.wait_ready(&uri, spec, request, deadline)?;
+        let (process, capabilities, key) = self.wait_ready(&uri, spec, request, deadline)?;
         if !tako_core::lsp::goto::server_supports(&capabilities, request.kind) {
             return Err(GotoError::Unsupported { server: spec.id });
         }
+        loop {
+            let targets = self.goto_once(&process, &uri, spec, request, deadline)?;
+            if !targets.is_empty() {
+                return Ok(GotoAnswer {
+                    server: spec.id,
+                    targets,
+                });
+            }
+            // 空の答え: 読み込み中のサーバ（rust-analyzer は読み込みの前の問い合わせに空で答える）
+            // なら、済むのを待って問い直す。済んでいる / 状態を送らないサーバなら見つからない
+            match self.wait_loaded(&key, deadline) {
+                super::goto::Loading::Retry => continue,
+                super::goto::Loading::Settled => {
+                    return Ok(GotoAnswer {
+                        server: spec.id,
+                        targets,
+                    })
+                }
+                super::goto::Loading::TimedOut => {
+                    return Err(GotoError::Timeout {
+                        server: spec.id,
+                        secs: request.timeout.as_secs(),
+                        starting: true,
+                    })
+                }
+            }
+        }
+    }
+
+    /// 要求を 1 回投げて、答えを tako の座標へ直す
+    fn goto_once(
+        &self,
+        process: &ServerProcess,
+        uri: &str,
+        spec: &'static ServerSpec,
+        request: &GotoRequest,
+        deadline: Instant,
+    ) -> Result<Vec<super::goto::GotoTarget>, GotoError> {
         let params = json!({
             "textDocument": { "uri": uri },
             "position": { "line": request.line, "character": request.character },
@@ -1320,7 +1373,7 @@ impl Shared {
             }
             Err(_) => return Err(GotoError::Crashed { server: spec.id }),
         };
-        let targets = tako_core::lsp::goto::parse_locations(&answer)
+        Ok(tako_core::lsp::goto::parse_locations(&answer)
             .into_iter()
             .filter_map(|location| {
                 let path = tako_core::lsp::goto::path_of_uri(&location.uri, cfg!(windows))?;
@@ -1340,11 +1393,42 @@ impl Shared {
                     source,
                 ))
             })
-            .collect();
-        Ok(GotoAnswer {
-            server: spec.id,
-            targets,
-        })
+            .collect())
+    }
+
+    /// 空の答えのあと、サーバの読み込みが済むのを待つ（上限つき）。
+    ///
+    /// 読み込み中と知らせていれば（`quiescent: false`）済むまで待って `Retry`。状態を
+    /// まだ 1 度も知らせていなければ、握手の直後の猶予（[`super::goto::STATUS_GRACE`]）の
+    /// あいだだけ知らせを待つ（送るサーバは握手の直後に送る）。済んでいる・送らないサーバは
+    /// 待たずに `Settled`（= 本当に見つからない）
+    fn wait_loaded(&self, key: &ServerKey, deadline: Instant) -> super::goto::Loading {
+        let mut waited = false;
+        loop {
+            let (quiescent, since) = {
+                let inner = self.lock();
+                match inner.servers.get(key) {
+                    Some(slot) => (slot.quiescent, slot.running_since),
+                    None => (None, None),
+                }
+            };
+            let loading = match quiescent {
+                Some(ready) => !ready,
+                None => since.is_some_and(|t| t.elapsed() < super::goto::STATUS_GRACE),
+            };
+            if !loading {
+                return if waited {
+                    super::goto::Loading::Retry
+                } else {
+                    super::goto::Loading::Settled
+                };
+            }
+            if Instant::now() >= deadline {
+                return super::goto::Loading::TimedOut;
+            }
+            waited = true;
+            std::thread::sleep(super::goto::READY_POLL);
+        }
     }
 
     /// 未導入と分かっていれば、その理由と導入コマンド（#983）
@@ -1369,7 +1453,7 @@ impl Shared {
         spec: &'static ServerSpec,
         request: &GotoRequest,
         deadline: Instant,
-    ) -> Result<(Arc<ServerProcess>, Value), GotoError> {
+    ) -> Result<(Arc<ServerProcess>, Value, ServerKey), GotoError> {
         loop {
             {
                 let inner = self.lock();
@@ -1382,7 +1466,11 @@ impl Shared {
                             if let (Some(process), Some(capabilities)) =
                                 (&slot.process, &slot.capabilities)
                             {
-                                return Ok((Arc::clone(process), capabilities.clone()));
+                                return Ok((
+                                    Arc::clone(process),
+                                    capabilities.clone(),
+                                    doc.key.clone(),
+                                ));
                             }
                         }
                         ServerState::GaveUp | ServerState::Stopped => {
@@ -1437,6 +1525,8 @@ impl Slot {
             idle_token: 0,
             root_uri: tako_core::file_uri::from_path(root),
             last_stderr: Vec::new(),
+            quiescent: None,
+            running_since: None,
         }
     }
 }
@@ -1586,6 +1676,9 @@ fn initialize_params(root_uri: &str, root_name: &str) -> Value {
             }]
         }),
         capabilities: ClientCapabilities {
+            // #1680: 読み込みが済んだかを知らせてもらう（`experimental/serverStatus`。
+            // 送るサーバだけが送り、知らないサーバは無視する）
+            experimental: Some(super::goto::experimental_capabilities()),
             general: Some(GeneralClientCapabilities {
                 position_encodings: Some(vec![PositionEncodingKind::UTF16]),
                 ..Default::default()

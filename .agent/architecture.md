@@ -1807,6 +1807,11 @@ syntect へ通していた**。release 実測（同じ構文セット・テー�
   ペイン）。行を指定して**いま表示している同じファイル**を開くときは `set_preview` を呼ばない
   （`same_document`。読み直すと編集セッションを捨て、未保存なら断られる）。編集中の着地は
   `reveal_preview_line` がキャレットも置く（置かないと次の打鍵で追従 #1649 が引き戻す）
+- **読み込み中の空の答え**: rust-analyzer は読み込みの前の問い合わせに空で答えるので、
+  初期化で `experimental.serverStatusNotification` を申告し、`experimental/serverStatus` の
+  `quiescent` を slot に持つ。空の答えのとき、読み込み中なら済むまで待って問い直す
+  （`wait_loaded` → `Loading::Retry`）。状態を 1 度も送らないサーバは握手の直後
+  `STATUS_GRACE`（2 秒）だけ待つ。`$/progress` は検査（`cargo check`）の進捗まで含むので待たない
 - **応答の座標**: サーバの UTF-16 桁は、飛び先が開いている文書ならサーバへ送った写し、
   そうでなければディスクの中身で UTF-8 バイト（`tako edit replace-range` の桁）と文字数
   （`OpenFile` の桁）へ直す（`lsp::goto::locate`）

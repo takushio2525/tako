@@ -24,6 +24,36 @@ pub const DEFAULT_GOTO_TIMEOUT: Duration = Duration::from_secs(30);
 /// 起動を待つあいだに状態を読み直す間隔（待つのは問い合わせ中だけ。アイドル時は何もしない）
 pub const READY_POLL: Duration = Duration::from_millis(20);
 
+/// サーバが「読み込みが済んだか」を知らせる通知（rust-analyzer 等の拡張。#1680）。
+/// 読み込みの前の問い合わせに**空で答える**サーバがあり、それを「見つからない」と
+/// 読み違えないために受ける（LSP 標準の `$/progress` は検査（`cargo check` 等）の進捗まで
+/// 含むので、それを待つと答えが遅れすぎる）
+pub const SERVER_STATUS_METHOD: &str = "experimental/serverStatus";
+
+/// 状態を 1 度も知らせないサーバを「送らないサーバ」とみなすまでの猶予（握手の直後から数える）
+pub const STATUS_GRACE: Duration = Duration::from_secs(2);
+
+/// クライアントの `experimental` 能力（[`SERVER_STATUS_METHOD`] を送ってもらう）
+pub fn experimental_capabilities() -> Value {
+    json!({ "serverStatusNotification": true })
+}
+
+/// `experimental/serverStatus` の `quiescent`（無ければ `None` = 分からない）
+pub fn quiescent_of(params: &Value) -> Option<bool> {
+    params.get("quiescent").and_then(Value::as_bool)
+}
+
+/// 空の答えのあとに待った結果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Loading {
+    /// 読み込みが済んだ（待った）ので問い直す
+    Retry,
+    /// 済んでいる / 状態を送らないサーバ = 本当に見つからない
+    Settled,
+    /// 上限までに済まなかった
+    TimedOut,
+}
+
 /// 候補の一覧に載せる行の抜粋の上限（文字数）
 pub const EXCERPT_CHARS: usize = 160;
 

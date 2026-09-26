@@ -21,6 +21,7 @@
 //! | `ask` | initialized の後に `workspace/configuration` を問い合わせる |
 //! | `die` | 起動直後に即死する（initialize を読まない） |
 //! | `no-goto` | 定義ジャンプの能力（`definitionProvider` 等）を申告しない（#1680） |
+//! | `loading` | initialized の後 `experimental/serverStatus`（`quiescent: false`）を送り、読み込み（既定 0.8 秒。`--loading-ms` / `TAKO_LSP_FAKE_LOADING_MS`）が済むまで定義ジャンプに空（`[]`）で答え、済んだら `quiescent: true` を送る（rust-analyzer の振る舞い。#1680） |
 //!
 //! `--diagnostics <file>` か `TAKO_LSP_FAKE_DIAGNOSTICS`（LSP の `Diagnostic` の JSON 配列）を
 //! 渡すと、didOpen と didChange のたびに**その配列をそのまま** publish する（#1679。
@@ -168,9 +169,14 @@ fn main() {
         std::process::exit(2);
     }
 
-    let out = Out {
+    let out = std::sync::Arc::new(Out {
         split: scenario == "split-header",
-    };
+    });
+    // `loading`: 読み込みが済んだか（済むまでは定義ジャンプに空で答える）
+    let loaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(scenario != "loading"));
+    let loading_ms: u64 = arg_or_env(&args, "--loading-ms", "TAKO_LSP_FAKE_LOADING_MS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(800);
     let mut input = BufReader::new(std::io::stdin());
     while let Some(message) = read_one(&mut input) {
         append(&log, &message.to_string());
@@ -204,6 +210,23 @@ fn main() {
             }
             ("initialized", None) => match scenario.as_str() {
                 "crash" => std::process::exit(3),
+                "loading" => {
+                    out.send(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "experimental/serverStatus",
+                        "params": { "health": "ok", "quiescent": false },
+                    }));
+                    let (out, loaded) = (out.clone(), loaded.clone());
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(loading_ms));
+                        loaded.store(true, std::sync::atomic::Ordering::SeqCst);
+                        out.send(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "experimental/serverStatus",
+                            "params": { "health": "ok", "quiescent": true },
+                        }));
+                    });
+                }
                 "chatty" => {
                     for n in 0..5000 {
                         out.send(serde_json::json!({
@@ -252,6 +275,10 @@ fn main() {
                 }));
             }
             (method, Some(id)) if GOTO_METHODS.contains(&method) => {
+                if !loaded.load(std::sync::atomic::Ordering::SeqCst) {
+                    out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": [] }));
+                    continue;
+                }
                 let Some(rule) = goto_rule(&goto_rules, method, &message["params"]) else {
                     out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": null }));
                     continue;

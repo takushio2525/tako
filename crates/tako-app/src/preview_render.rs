@@ -52,6 +52,13 @@ pub(crate) struct MdLineSel {
     hovered_link: Option<std::ops::Range<usize>>,
 }
 
+/// コード 1 行の操作の重ね物（選択の範囲・キャレットの桁・⌘ホバー中の識別子の範囲。#1680）
+type CodeLineInteraction = (
+    Option<(usize, usize)>,
+    Option<usize>,
+    Option<std::ops::Range<usize>>,
+);
+
 /// コードブロックのコピー成功フィードバックを出しておく時間（#680。カードと同値）
 pub(crate) const MD_COPY_FEEDBACK: std::time::Duration = std::time::Duration::from_millis(2200);
 
@@ -4276,11 +4283,7 @@ impl TakoApp {
         &self,
         line: &preview::Line,
         number: Option<(usize, usize)>,
-        interaction: (
-            Option<(usize, usize)>,
-            Option<usize>,
-            Option<std::ops::Range<usize>>,
-        ),
+        interaction: CodeLineInteraction,
         search_hit_ranges: &[(usize, usize, bool)],
         diagnostics: Option<(&[tako_core::lsp::diagnostic::Diagnostic], usize)>,
         record: Option<(gpui::WeakEntity<Self>, PaneId, usize)>,
