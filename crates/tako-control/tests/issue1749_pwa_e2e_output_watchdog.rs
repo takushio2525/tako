@@ -19,6 +19,9 @@
 //! 2. スクショは `evidencePath(` を通し、ファイルを書く口を spec に生やさない
 //! 3. `evidencePath` の既定が outputDir（`test.info().outputPath(`）のまま
 //! 4. モックの版を数字のリテラルで書かず、ビルドの版と同じ 1 実装から取る
+//! 5. `TAKO_EVIDENCE_DIR` の下へ spec 名のサブ dir を挟む（#1775: 平置きだと `01-list.png` を
+//!    撮る spec 同士が上書きし合い、80 回撮って 76 枚しか残らなかった）
+//! 6. 同じ spec の中で同じ名前を 2 回撮らない（5 のサブ dir は spec をまたぐ衝突しか防げない）
 //!
 //! ## 相方（実挙動）
 //!
@@ -31,8 +34,12 @@
 //! ① どれかの spec に `const D = process.env.HOME + '/Desktop/x';` を足す → 1 /
 //! ② `path: evidencePath('01.png')` を `` path: `/tmp/x/01.png` `` へ → 2 /
 //! ③ `support.js` の `test.info().outputPath(name)` を `join('/tmp', name)` へ → 3 /
-//! ④ モックの `version: TAKO_VERSION` を `version: '0.8.12'` へ → 4
+//! ④ モックの `version: TAKO_VERSION` を `version: '0.8.12'` へ → 4 /
+//! ⑤ `support.js` の `join(dir, specDir(), name)` を `join(dir, name)` へ → 5 /
+//! ⑥ `specDir()` の本体を `return 'evidence';` へ → 5 /
+//! ⑦ どれかの spec の 2 つの `evidencePath('…')` を同じ名前にする → 6
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
@@ -242,15 +249,14 @@ fn スクショの置き場はevidencepathだけ() {
 
 // --------------------------------------------- 3. 既定は outputDir
 
-/// 注入 ③: `evidencePath` の既定を outputDir 以外へ向ける
-#[test]
-fn evidencepathの既定はplaywrightのoutputdir() {
-    let src = read(SUPPORT_REL);
+/// `support.js` のトップレベル関数 1 つ分（`header` を含む行から、行頭の `}` まで）。
+/// 返すのは (開始行の番号, 本文)
+fn support_function(src: &str, header: &str) -> (usize, String) {
     let lines: Vec<&str> = src.lines().collect();
     let start = lines
         .iter()
-        .position(|l| l.contains("export function evidencePath("))
-        .unwrap_or_else(|| panic!("{SUPPORT_REL}: `export function evidencePath(` が無い"));
+        .position(|l| l.contains(header))
+        .unwrap_or_else(|| panic!("{SUPPORT_REL}: `{header}` が無い"));
     let end = lines
         .iter()
         .enumerate()
@@ -259,21 +265,26 @@ fn evidencepathの既定はplaywrightのoutputdir() {
         .map(|(i, _)| i)
         .unwrap_or_else(|| {
             panic!(
-                "{SUPPORT_REL}:{}: evidencePath を閉じる `}}` が無い",
+                "{SUPPORT_REL}:{}: `{header}` を閉じる `}}` が無い",
                 start + 1
             )
         });
-    let body = lines[start..=end].join("\n");
+    (start + 1, lines[start..=end].join("\n"))
+}
+
+/// 注入 ③: `evidencePath` の既定を outputDir 以外へ向ける
+#[test]
+fn evidencepathの既定はplaywrightのoutputdir() {
+    let src = read(SUPPORT_REL);
+    let (start, body) = support_function(&src, "export function evidencePath(");
     assert!(
         body.contains("test.info().outputPath(name)"),
-        "{SUPPORT_REL}:{}: evidencePath の既定が Playwright の outputDir \
-         （`test.info().outputPath(name)`）ではなくなった（#1749）:\n{body}",
-        start + 1
+        "{SUPPORT_REL}:{start}: evidencePath の既定が Playwright の outputDir \
+         （`test.info().outputPath(name)`）ではなくなった（#1749）:\n{body}"
     );
     assert!(
         body.contains("process.env.TAKO_EVIDENCE_DIR"),
-        "{SUPPORT_REL}:{}: 置き場を変える口は実行する人が渡す `TAKO_EVIDENCE_DIR` だけ（#1749）:\n{body}",
-        start + 1
+        "{SUPPORT_REL}:{start}: 置き場を変える口は実行する人が渡す `TAKO_EVIDENCE_DIR` だけ（#1749）:\n{body}"
     );
 }
 
@@ -376,4 +387,95 @@ fn 版のリテラル検出は形を見分ける() {
     assert!(literal_version("  version: TAKO_VERSION,").is_none());
     assert!(literal_version("{ api_version: 2, panes: [] }").is_none());
     assert!(literal_version("const apiversion = '1';").is_none());
+}
+
+// --------------------------------------------- 5. TAKO_EVIDENCE_DIR の下は spec ごとのサブ dir
+
+/// 注入 ⑤ / ⑥: `TAKO_EVIDENCE_DIR` の下へ平置きに戻す
+#[test]
+fn evidence_dirの下はspecごとのサブdir() {
+    let src = read(SUPPORT_REL);
+    let (start, body) = support_function(&src, "export function evidencePath(");
+    let joins: Vec<(usize, &str)> = body
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !is_comment(l) && l.contains("join(dir"))
+        .map(|(i, l)| (start + i, l.trim()))
+        .collect();
+    assert!(
+        !joins.is_empty(),
+        "{SUPPORT_REL}:{start}: evidencePath が `TAKO_EVIDENCE_DIR`（`dir`）から置き場を組んでいない（#1775）:\n{body}"
+    );
+    for (n, line) in joins {
+        assert!(
+            line.contains("join(dir, specDir(),"),
+            "{SUPPORT_REL}:{n}: `TAKO_EVIDENCE_DIR` の下へ spec 名のサブ dir を挟んでいない（#1775: \
+             渡した dir は全 spec で共有するので、`01-list.png` を撮る spec 同士が上書きし合う）: {line}\n\
+             → `join(dir, specDir(), name)` の形にする"
+        );
+    }
+    let (at, spec_dir) = support_function(&src, "function specDir(");
+    let code: String = spec_dir
+        .lines()
+        .filter(|l| !is_comment(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        code.contains("info.file") && code.contains("testDir"),
+        "{SUPPORT_REL}:{at}: specDir() が走っている spec のパス（`test.info().file` の testDir からの相対）\
+         から組まれていない（#1775: spec によらない名前を返すと平置きと同じく上書きし合う）:\n{spec_dir}"
+    );
+}
+
+// --------------------------------------------- 6. spec の中で同じ名前を 2 回撮らない
+
+/// 注入 ⑦: 同じ spec の 2 か所で同じ名前を撮る。5 のサブ dir は spec をまたぐ衝突しか
+/// 防げないので、spec の中の重複は `TAKO_EVIDENCE_DIR` を渡した run で黙って上書きになる
+#[test]
+fn 同じspecで同じ名前を2回撮らない() {
+    let mut calls = 0usize;
+    let mut hits = Vec::new();
+    for (rel, src) in e2e_sources() {
+        if !rel.ends_with(".spec.js") {
+            continue;
+        }
+        let commented: Vec<bool> = src.lines().map(is_comment).collect();
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        let mut from = 0;
+        // import 行の `evidencePath` は `(` が続かないので拾わない
+        while let Some(at) = src[from..].find("evidencePath(") {
+            let open = from + at + "evidencePath".len();
+            from = open;
+            let n = line_at(&src, open);
+            if commented[n - 1] {
+                continue;
+            }
+            let call = call_text(&src, open);
+            let arg = call
+                .strip_prefix('(')
+                .and_then(|c| c.strip_suffix(')'))
+                .unwrap_or(call)
+                .trim()
+                .to_string();
+            calls += 1;
+            match seen.get(&arg) {
+                Some(first) => {
+                    hits.push(format!("{rel}:{first} と {rel}:{n}: evidencePath({arg})"))
+                }
+                None => {
+                    seen.insert(arg, n);
+                }
+            }
+        }
+    }
+    assert!(
+        calls >= 10,
+        "{E2E_REL}: `evidencePath(` の呼び出しが {calls} 件しか拾えない（走査範囲が壊れている）"
+    );
+    assert!(
+        hits.is_empty(),
+        "同じ spec の中で同じ名前のスクショを 2 回撮っている（#1775: `TAKO_EVIDENCE_DIR` を渡すと \
+         spec のサブ dir の中で後の 1 枚が前の 1 枚を上書きする）:\n  {}\n→ 名前を分ける",
+        hits.join("\n  ")
+    );
 }

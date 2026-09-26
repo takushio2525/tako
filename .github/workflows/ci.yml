@@ -206,20 +206,27 @@ jobs:
       # scripts/wait-pr-checks.sh の 1 実装で、master / worker もこれを呼ぶ = #1333）
       - name: CI 完了待ちのモックテスト
         run: bash scripts/test-wait-pr-checks.sh
-      # PWA の Playwright e2e（6 spec / 50 項目）。**この e2e は CI で 1 度も走っておらず、
+      # PWA の Playwright e2e（件数は spec を足すたびに増えるので書かない）。
+      # **この e2e は CI で 1 度も走っておらず、
       # 走らせ方もどこにも書かれていなかった**ので、#425 の契約変更（承認カードを
       # transcript 推定 → permission_dialog 実在へ / 送信先を /input → /respond へ）で
       # spec が取り残されたまま 6 週間誰も気づかず、同じ症状が #1089 として独立に
       # 再起票された（#632 / #1357）。**PWA の実装契約が spec とズレたらここで落ちる**。
       # node_modules は上の「PWA をビルド」の npm ci をそのまま使い、ブラウザは
       # chromium だけ（config の projects も chromium 1 本・headless 固定）。
-      # 手順とローカルでの回し方は web/tako-remote/README.md
+      # worker 数は CI だけ 2 に固定する（#1775）: Playwright の既定は CPU 数の 50% で、
+      # macos-latest（3 vCPU）では 1 worker に落ち、2026-09-26 時点の 109 項目に 2.2 分かかっていた。
+      # 同じランナーでの実測は 1 worker 124〜152 秒 / 2 workers 73〜87 秒 / 3 workers 55〜64 秒で、
+      # `--repeat-each=3` の 327 項目 × 2 台は 2 でも 3 でも flaky 0。3 は vCPU を chromium で
+      # 埋めて dev サーバーとランナーの取り分が無くなるので 2 にした（上の cargo test とは
+      # 直列のステップなので CPU の取り合いは無い）。手順とローカルでの回し方は
+      # web/tako-remote/README.md
       - name: PWA e2e のブラウザを取得（#1357）
         working-directory: web/tako-remote
         run: npm run e2e:install
-      - name: PWA e2e（Playwright 6 spec / 50 項目。#1357）
+      - name: PWA e2e（Playwright。#1357・#1775）
         working-directory: web/tako-remote
-        run: npm run e2e
+        run: npm run e2e -- --workers=2
 
   windows:
     name: Windows（build + test スモーク）

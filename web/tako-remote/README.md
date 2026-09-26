@@ -90,11 +90,17 @@ Playwright が消す）。失敗時のトレース・エラー文脈も同じ di
 TAKO_EVIDENCE_DIR=/tmp/pwa-shots npm run e2e -- e2e/panes-621.spec.js
 ```
 
+渡した dir の下は spec 名のサブ dir に分かれる（`/tmp/pwa-shots/panes-621/after-01-list-viewport.png`）。
+dir が無ければ Playwright が作る。#1775 までは平置きで、`01-list.png` / `05-observe.png` /
+`06-forbidden.png` を複数の spec が撮っていたため、全 spec を回すと 80 回撮って 76 枚しか
+残らなかった。
+
 #1749 までは spec ごとに `~/Desktop/tako-28{4,5}-evidence/` や `~/dev/tako-evidence/<番号>/`
 を組み立てていて、`npm run e2e` を回すだけでホームへ PNG が 80 枚書かれていた。
 `crates/tako-control/tests/issue1749_pwa_e2e_output_watchdog.rs` が、spec へホームの
 組み立て（`process.env.HOME` / `homedir()` / `Desktop`）・`evidencePath(` を通らない
-スクショ・版の直書きが戻ると file:line を名指しして落とす。
+スクショ・版の直書き・`TAKO_EVIDENCE_DIR` の平置き・同じ spec の中での同名が戻ると
+file:line を名指しして落とす。
 
 ホームへ何も書かないことは一時 `HOME` で確かめられる（ブラウザと npm のキャッシュは
 一時 `HOME` の外を向けておく。向けないと chromium が見つからず全項目が落ちる）:
@@ -116,5 +122,11 @@ PWA は `/api/me` の版とビルドへ埋め込んだ版（`__TAKO_VERSION__`�
 
 `.github/workflows/ci.yml` の macOS ジョブ末尾で `npm run e2e:install` →
 `npm run e2e` が **blocking** で走る（#1357）。PWA の実装契約が変わって spec が
-取り残されたら、そこで落ちる。追加の所要は #1357 時点の実測で 46〜87 秒（`50 passed` が 33 秒〜1.2 分。
-Playwright の既定 worker 数がランナーの CPU 数に従うので run ごとに幅が出る）。
+取り残されたら、そこで落ちる。
+
+worker 数は **CI だけ `--workers=2` に固定**している（#1775）。Playwright の既定は CPU 数の 50% で、
+macos-latest（3 vCPU）では 1 worker に落ちる。2026-09-26 の実測で、`109 passed` のステップが
+1 worker のとき 129〜138 秒（main の 6 run）かかっていた。同じランナーでの worker 数ごとの壁時計は
+1 → 124〜152 秒 / 2 → 73〜87 秒 / 3 → 55〜64 秒で、`--repeat-each=3`（327 項目）を 2 台で回すと
+2 でも 3 でも flaky は 0 件だった。3 は vCPU を chromium で埋めて dev サーバーとランナーの取り分が
+無くなるので 2 にした。ブラウザ取得（`e2e:install`）は別に 9〜16 秒かかる。ローカルは既定（CPU 数の 50%）のまま。
