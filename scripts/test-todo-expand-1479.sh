@@ -77,7 +77,7 @@ for k in sys.argv[1:]:
 print("null" if d is None else d)' "$@"; }
 
 echo "== 隔離 GUI を起こす =="
-launch_isolated_gui "$TMP/app.log"
+launch_isolated_gui "$TMP/app.log" || exit $?
 APP_PID="$ISOLATED_GUI_PID"
 wait_isolated_gui "$TMP/app.log" || exit 1
 TABS="$("$TAKO_BIN" list | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["tabs"]))')"

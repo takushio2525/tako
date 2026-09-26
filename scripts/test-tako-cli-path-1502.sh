@@ -253,7 +253,7 @@ mkdir -p "$TMP/disc"
 IPC_GUARD=("TAKO_DISCOVERY_DIR=$TMP/disc")
 launch_isolated_gui "$TMP/app.log" \
     "HOME=$ISO_HOME" "TAKO_DATA_DIR=$TMP/d" "TAKO_ORCHESTRATOR_DIR=$TMP/d/orch" \
-    "TAKO_TMUX_SOCKET=$TMP/tmux.sock" "TAKO_DISCOVERY_DIR=$TMP/disc"
+    "TAKO_TMUX_SOCKET=$TMP/tmux.sock" "TAKO_DISCOVERY_DIR=$TMP/disc" || exit $?
 GUI_PID="$ISOLATED_GUI_PID"
 ready=0
 for _ in $(seq 1 200); do
@@ -279,7 +279,7 @@ if [ "$ready" = "1" ]; then
     check "$([ ! -e "$ISO_HOME/.local/bin/tako" ] && echo 1 || echo 0)" "H6 移動でリンクが切れる（前提）"
     APP_BIN="$MOVED2/tako-app" launch_isolated_gui "$TMP/app2.log" \
         "HOME=$ISO_HOME" "TAKO_DATA_DIR=$TMP/d" "TAKO_ORCHESTRATOR_DIR=$TMP/d/orch" \
-        "TAKO_TMUX_SOCKET=$TMP/tmux.sock" "TAKO_DISCOVERY_DIR=$TMP/disc"
+        "TAKO_TMUX_SOCKET=$TMP/tmux.sock" "TAKO_DISCOVERY_DIR=$TMP/disc" || exit $?
     GUI_PID="$ISOLATED_GUI_PID"
     repaired=0
     for _ in $(seq 1 200); do

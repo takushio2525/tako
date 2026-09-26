@@ -107,7 +107,7 @@ start_app() {
   shift
   : > "$PLOG"
   # 面を起こすのは launch_isolated_gui の中（#1490）
-  launch_isolated_gui "$TMP/app-${name}.log" ${@+"$@"}
+  launch_isolated_gui "$TMP/app-${name}.log" ${@+"$@"} || exit $?
   APP_PID="$ISOLATED_GUI_PID"
   wait_isolated_gui "$TMP/app-${name}.log" || exit 1
 }
@@ -323,7 +323,7 @@ stop_app
 echo "== ⑥ エッジ: 端末ペインだけの layout で全滅（「1 つも起動できない」と二重に出ない） =="
 python3 "$TOOL" only_plain "$TMP/layout-good.json" "$LAYOUT" >/dev/null || { echo "端末ペインだけの layout を作れない"; exit 1; }
 : > "$PLOG"
-launch_isolated_gui "$TMP/app-fatal.log" "$SABOTAGE_ENV_1" "$SABOTAGE_ENV_2"
+launch_isolated_gui "$TMP/app-fatal.log" "$SABOTAGE_ENV_1" "$SABOTAGE_ENV_2" || exit $?
 FATAL_PID="$ISOLATED_GUI_PID"
 APP_PID="$FATAL_PID"
 # 致命終了を待つ（上限つき。生き残ったら検査を落として自分で片付ける）

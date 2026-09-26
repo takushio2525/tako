@@ -61,7 +61,7 @@ done
 run_section() {
   local log="$1"
   shift
-  launch_isolated_gui "$log" TAKO_VISUAL_TEST=1 TAKO_VISUAL_ONLY=editor-keys "$@" || return 1
+  launch_isolated_gui "$log" TAKO_VISUAL_TEST=1 TAKO_VISUAL_ONLY=editor-keys "$@" || exit $?
   local pid="$ISOLATED_GUI_PID" i
   for i in $(seq 1 1800); do
     kill -0 "$pid" 2>/dev/null || break

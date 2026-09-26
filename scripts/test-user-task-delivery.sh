@@ -156,7 +156,7 @@ start_app() {
   # 仮想ディスプレイは検証の合間に眠る（眠ると列挙から落ちて起動が中止される。#1160）。
   # ②「落として起動し直す」の 2 回目で実際に踏むので、起こす手は launch_isolated_gui
   # が起動ごとに通す（#1490）
-  launch_isolated_gui "$TMP/app.log"
+  launch_isolated_gui "$TMP/app.log" || exit $?
   APP_PID="$ISOLATED_GUI_PID"
   wait_isolated_gui "$TMP/app.log" 300 || exit 1
   # **関門**: 繋がった先が隔離インスタンスか（socket が $TMP の下か）を必ず確かめる。

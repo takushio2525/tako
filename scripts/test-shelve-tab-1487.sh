@@ -84,7 +84,7 @@ print("__NOT_FOUND__")'
 start_app() {
   # 面を起こすのは launch_isolated_gui の中（#1490。蓋閉じ運用では tako-vd が Main に
   # なりアイドルで眠るので、1 回目と 2 回目のあいだに列挙から落ちることがある）
-  launch_isolated_gui "$TMP/app-$1.log"
+  launch_isolated_gui "$TMP/app-$1.log" || exit $?
   APP_PID="$ISOLATED_GUI_PID"
   wait_isolated_gui "$TMP/app-$1.log" || exit 1
 }
@@ -223,7 +223,7 @@ stop_app
 
 echo "== ⑥ A/B: TAKO_1487_LEGACY=1 で旧挙動（平坦化）が再現する =="
 rm -rf "$TAKO_DATA_DIR"; mkdir -p "$TAKO_DATA_DIR"
-launch_isolated_gui "$TMP/app-legacy.log" TAKO_1487_LEGACY=1
+launch_isolated_gui "$TMP/app-legacy.log" TAKO_1487_LEGACY=1 || exit $?
 APP_PID="$ISOLATED_GUI_PID"
 wait_isolated_gui "$TMP/app-legacy.log" || exit 1
 LTAB="$("$TAKO_BIN" list | python3 -c 'import json,sys; print(json.load(sys.stdin)["tabs"][0]["id"])')"

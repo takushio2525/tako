@@ -62,3 +62,7 @@
 ## 2026-09-26（#1654: Tab / ⇧Tab でインデントし、Enter でインデントを引き継ぐようにした）
 - 打鍵表に Tab の行（⇧ で浅く）を足し、`TextBuffer` に `indent` / `outdent` / `newline_and_indent` と既存行からのインデント推定（開いたとき 1 回）を追加。開き括弧の直後は 1 段深く（Python / YAML は `:` も・Markdown は継承だけ）、括弧の自動閉じは理由を書いて対象外。`PreviewEditCommand` + `tako edit indent|outdent|newline` + MCP は `tako_preview_edit` の `command`（ツールは増やさない）
 - 実測: tako-vd の実打鍵経路 12 相が緑（Enter を素の改行へ戻す注入で E8 の症状が再現して FAILED）・注入 7 通りが名指しで FAILED → 戻して緑
+
+## 2026-09-26（#1744: 隔離 GUI は面を用意できなければ起動しないようにした）
+- `launch_isolated_gui` は `ensure` 失敗でも「起動は続ける」で素通しする作りで、uuid の記録が無い機では面の指定を持たない起動が tako の暗黙の既定でユーザーの画面へ落ちうる潜在経路があった（実例は未確認。9/26 の報告は #1697 の誤警告）。`ensure` 失敗・成功でも `bounds` で一覧に無いときは起動せず終了コード 4 + stderr へ「未実測: …」1 行。呼び手は `|| exit $?`、1505 は C/D だけ未実測で続行
+- 番犬（#1490 の番犬を拡張）: ヘルパを `/bin/bash` で走らせ「用意できない面」5 通りを注入して偽 GUI が起きないこと + 呼び手の失敗の拾い方。注入 5 通りすべて file:line 名指しで FAILED → 戻して緑。実呼び手 1676 は面なしで exit 4・通常経路 26 PASS（persist.log `ディスプレイ指定 tako-vd: name で解決`）

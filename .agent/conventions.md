@@ -3018,7 +3018,7 @@ CI で特定の語も見張りたいときは `TAKO_PII_TERMS`（`,` 区切り�
 ```sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
 isolated_gui_bins                     # TAKO_BIN / APP_BIN を決める（無ければビルド）
-launch_isolated_gui "$TMP/app.log"    # ensure → 面と窓の env → 起動（pid は $ISOLATED_GUI_PID）
+launch_isolated_gui "$TMP/app.log" || exit $?   # ensure → 面と窓の env → 起動（pid は $ISOLATED_GUI_PID）
 wait_isolated_gui "$TMP/app.log"      # `tako list` が通るまで待つ（任意）
 stop_isolated_gui                     # 自分で起こした pid だけを落とす
 ```
@@ -3034,10 +3034,27 @@ stop_isolated_gui                     # 自分で起こした pid だけを落�
 落とすのは `stop_isolated_gui` = **自分で起こした pid だけ**で、
 `pkill -f tako` のような名前一致は本番 GUI と他 worker に当たるので使わない。
 
+**面を用意できなければ起動しない**（#1744）。`ensure` が失敗した・成功と言ったのに面が
+OS の一覧に無い（`bounds` で読み戻す）ときは、`launch_isolated_gui` は窓を開かずに
+**終了コード 4**（tako 本体の「窓を開かずに終わる」と同じ番号）で返し、stderr へ
+「未実測: …（理由）」を 1 行出す。以前は「起動は続ける」で素通しする作りで、面の指定を
+持たない起動が tako の暗黙の既定に乗って**ユーザーの画面へ窓が出うる**潜在経路があった
+（この道で窓が出た実例は確認されていない）。
+蓋閉じ + ディスプレイスリープでは `ensure` が面を起こせないのが日常なので、
+**呼び出し側は必ず `|| exit $?` で止め、報告に「未実測」と書く**（関数の中でも `exit` で
+止める。`|| return 1` は呼び手が戻り値を捨てると 4 が消える）。一部の段だけ未実測にして
+続けたいときは `launch_isolated_gui … || GUI_RC=$?` で受けて自分で明記する
+（`test-setup-check-single-source-1505.sh` の C/D 段）。未配線の機（器が無い・CI）でも
+同じで、**既定の面で続行する道は作らない**。`TAKO_DISPLAY` を手で渡しても面を用意できなければ
+起動しない（狙いが `tako-vd` なら見失っているし、別の面ならユーザーの画面へ出す）。
+
 番犬は `crates/tako-control/tests/issue1490_isolated_gui_launch_watchdog.rs`。
 `scripts/test-*.sh` に `target/…/tako-app` / `cargo run -p tako-app` /
 `TAKO_DISPLAY=tako-vd` の直書き・手書きの背景起動・手書きの `ensure` が生えたら
 file:line を名指して落ちる（除外はヘルパ自身と `test-virtual-display-guard.sh` だけ）。
+起動の失敗を拾っていない呼び出し（#1744）と、ヘルパが面を用意できないのに起動する形も落とす
+（後者はヘルパを `/bin/bash` で実際に走らせ、`ISOLATED_GUI_VD` で「用意できない面」を注入して
+偽の GUI が起きないことを見る）。
 
 **眠った状態を手で再現する**（受け入れ検査用）: `pmset displaysleepnow` を撃つと面が眠り、
 `virtual-display.sh status` が「眠っている」に変わる（蓋閉じで内蔵が居ない機なら
@@ -3124,9 +3141,8 @@ env -u TAKO_SOCKET -u TAKO_TOKEN -u TAKO_PANE_ID \
   （起動時に stderr へ警告）。理由が persist.log しか無くて気づけなかったのが #1160 の症状の一部だった
 - **`TAKO_DISPLAY` を明示したのに見失ったら、検証用の起動は落ちずに窓を開かずに終わる**（#1697。
   終了コード 4・stderr に理由と候補の全行）。狙った面を見失っただけで、置き先が無いのではない。
-  `isolated-gui.sh` は**配線済みの機でだけ**明示する（今回 `ensure` が通った / この機で uuid を
-  記録したことがある）ので、未配線の機では暗黙の既定のまま回る。検証スクリプトで
-  `TAKO_DISPLAY` を手で渡すと未配線の機では立たなくなる点に注意
+  `isolated-gui.sh` は面を用意できたら**常に**明示する（用意できなければそもそも起動しない =
+  上の #1744 の項）ので、ヘルパ経由の起動が暗黙の既定に乗ることは無い
 - **`tako-vd` は常設。消さない**（ヘルパにも消す機能を作っていない）。ユーザーの
   ディスプレイ構成・解像度・配置・ミラーリングにも触らない。落として良いのは
   **器の管理外へ外れた残骸（孤児）だけ**で、それも `cleanup-orphans` の実行条件を

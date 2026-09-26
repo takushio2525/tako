@@ -117,9 +117,9 @@ start_app() {
   # 面を起こすのは launch_isolated_gui の中（#1490。検証の合間に眠ると列挙から
   # 落ちて起動が中止される = #1160）
   if [ -n "$legacy" ]; then
-    launch_isolated_gui "$TMP/app.log" TAKO_1466_LEGACY=1
+    launch_isolated_gui "$TMP/app.log" TAKO_1466_LEGACY=1 || exit $?
   else
-    launch_isolated_gui "$TMP/app.log"
+    launch_isolated_gui "$TMP/app.log" || exit $?
   fi
   APP_PID="$ISOLATED_GUI_PID"
   wait_isolated_gui "$TMP/app.log" || exit 1

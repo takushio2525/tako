@@ -125,7 +125,7 @@ oneline() { printf '%s' "$1" | tr '\n' ' '; }
 
 start_gui() { # start_gui <ログ> [VAR=VAL…]
   local log="$1"; shift
-  launch_isolated_gui "$log" ${1+"$@"} || return 1
+  launch_isolated_gui "$log" ${1+"$@"} || exit $?
   APP_PID="$ISOLATED_GUI_PID"
   wait_isolated_gui "$log" || return 1
   ROOT="$("$TAKO_BIN" list 2>/dev/null | python3 -c 'import json,sys
