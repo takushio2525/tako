@@ -961,6 +961,34 @@
     "name": "tako_open_file"
   },
   {
+    "description": "ジャンプ履歴を戻る・進む・一覧する。tako_open_file に line を渡して開くたびに、開く前にいた位置と着地点が積まれる（line なしの open は積まない）。閉じたペインの項目は pane を基準に開き直し（reopened=true）、消えたファイルの項目は読み飛ばして捨てる（dropped）。端では moved=false。GUI のキーも同じ操作を通る。",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "default": "list",
+          "enum": [
+            "list",
+            "back",
+            "forward"
+          ],
+          "type": "string"
+        },
+        "focus": {
+          "description": "着地したペインへフォーカスを移す（既定 false）",
+          "type": "boolean"
+        },
+        "pane": {
+          "description": "閉じたペインの項目を開き直すときの基準（省略時は呼び出し元）",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "name": "tako_jump"
+  },
+  {
     "description": "PDF・画像プレビューのズーム・ページ・パンを操作する。全操作を省略すると現在状態を返す。zoom は百分率（150 = 150%）、page は 1 始まり。zoom と page を同時指定できるため、『3 ページ目を 150% で見せて』を 1 回で実行できる。zoom_in / zoom_out は 1 段階、reset は幅フィット（100%）+ パン位置リセット。pan_x / pan_y は現在位置へ加える logical px。",
     "inputSchema": {
       "additionalProperties": false,

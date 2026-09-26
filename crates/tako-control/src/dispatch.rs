@@ -8,7 +8,9 @@
 //! [`ControlHost`] trait の向こう側（UI 層）に置く。
 
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use tako_core::jump_history::{JumpHistory, JumpLocation, Liveness};
 use tako_core::text_edit::TextPosition;
 use tako_core::{
     CommandState, Pane, PaneId, PaneNode, PaneOrigin, PaneTreeError, PreviewViewUpdate,
@@ -104,6 +106,384 @@ fn preview_route_with_line_wire(mode: PreviewModeWire) -> Result<PreviewModeWire
             tako_core::open_plan::PreviewRoute::Video => PreviewModeWire::Video,
         },
     )
+}
+
+/// `OpenFile` の引数（#1677 で本体を [`open_file`] へ移したときに束ねた。wire の形は変えていない）
+struct OpenFileArgs {
+    pane: Option<u64>,
+    path: String,
+    mode: Option<PreviewModeWire>,
+    direction: Option<Direction>,
+    focus: Option<bool>,
+    new_tab: bool,
+    line: Option<usize>,
+    column: Option<usize>,
+}
+
+/// 行を指定して開いたとき、ジャンプ履歴へ積むか（FR-3.29 / #1677）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JumpRecord {
+    /// 積む（CLI / MCP / GUI からの `OpenFile`）
+    Record,
+    /// 積まない（戻る / 進む自身が開くとき。積むと戻った先で履歴を書き換えてしまう）
+    Skip,
+}
+
+/// ファイルをプレビューで開く（FR-3.2 / FR-3.11 / FR-3.22 / FR-3.27）。
+///
+/// `OpenFile` と戻る / 進む（[`jump`]）が**同じ実装**を通る（開き方を 2 本にしない）。
+/// 行を指定して開いたときだけ、`record` が `Record` ならジャンプ履歴へ積む（#1677）
+fn open_file(
+    host: &mut dyn ControlHost,
+    origin: PaneOrigin,
+    args: OpenFileArgs,
+    record: JumpRecord,
+) -> Result<Value, DispatchError> {
+    let OpenFileArgs {
+        pane,
+        path,
+        mode,
+        direction,
+        focus,
+        new_tab,
+        line,
+        column,
+    } = args;
+    if new_tab && direction.is_some() {
+        return Err(DispatchError::Operation(
+            "new_tab と direction は同時に指定できない（新しいタブには分割元が無い）".into(),
+        ));
+    }
+    // #1676: 1 始まりの検査は**開く前**に済ませる（0 を渡した呼び出しで
+    // ペインが増えてから落ちる、という後始末の要る失敗を作らない）
+    if line == Some(0) {
+        return Err(DispatchError::InvalidParams(
+            tako_core::open_plan::LINE_ONE_BASED.into(),
+        ));
+    }
+    if column == Some(0) {
+        return Err(DispatchError::InvalidParams(
+            tako_core::open_plan::COLUMN_ONE_BASED.into(),
+        ));
+    }
+    if line.is_none() && column.is_some() {
+        return Err(DispatchError::InvalidParams(
+            "column は line と一緒に指定する".into(),
+        ));
+    }
+    let (tab, target) = match pane {
+        Some(_) => resolve_pane(host.workspace(), pane)?,
+        None => {
+            let ws = host.workspace();
+            let active = ws.active_tab_id();
+            let focused = ws.active_tab().tree().focused();
+            (active, focused)
+        }
+    };
+    // 相対パスは対象ペインの cwd（OSC 7。無ければプロセスの cwd）基準で解決する
+    let mut resolved = std::path::PathBuf::from(&path);
+    if resolved.is_relative() {
+        if let Some(cwd) = host.session(target).and_then(|s| s.cwd()) {
+            resolved = cwd.join(resolved);
+        }
+    }
+    // 解決は境界（B26）を通す（保存・応答・子プロセスへ渡る値。#970）
+    let resolved = tako_core::platform::path::canonicalize(&resolved)
+        .map_err(|e| DispatchError::Operation(format!("ファイルを開けない（{path}: {e}）")))?;
+    if !resolved.is_file() {
+        return Err(DispatchError::Operation(format!(
+            "ファイルではない: {}",
+            resolved.display()
+        )));
+    }
+    // 拡張子 → プレビュー種別の対応表は `tako_core::open_plan` が正本（#1283）。
+    // リンク検出の応答（`tako links` の `open`）が同じ表を引くので、
+    // 「cmd+クリックがどう開くか」は機械で読める
+    let mode = mode.unwrap_or_else(|| preview_mode_wire(&resolved));
+    // #1676: 行指定があるときは「原文の 1 行 = 1 item」になる code へ倒す
+    // （md のレンダリング表示は 1 item = 1 ブロックで原文の行が残らない）。
+    // 行を持たない種別（画像 / PDF / 動画）はここで弾く = **開く前**
+    let mode = match line {
+        Some(_) => preview_route_with_line_wire(mode).map_err(DispatchError::Operation)?,
+        None => mode,
+    };
+    // 表示先の解決: new_tab 指定（FR-3.22 = Finder の「このアプリケーションで
+    // 開く」）なら新しいタブ 1 枚をそのファイル専用にする。direction 指定
+    // （FR-3.11 = D&D のドロップ位置）なら再利用せず必ずその方向へ分割。
+    // どちらも省略時は 対象自身がプレビュー > 同タブの既存プレビュー（再利用）
+    // > 右分割で新設。いずれの経路でもターミナルセッションは起動しない
+    let (tab, view_pane, created) = if new_tab {
+        let prev_active = host.workspace().active_tab_id();
+        let new_pane = Pane::new(origin);
+        let new_id = new_pane.id();
+        let title = resolved
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| resolved.display().to_string());
+        let tab_id = host.workspace_mut().create_tab(title, new_pane);
+        // ファイル名は「このタブが何か」そのものなので、自動リネーム（FR-2.12）に
+        // 奪わせない。プレビュー専用タブには命名材料になる端末出力も無い
+        if let Some(t) = host.workspace_mut().get_tab_mut(tab_id) {
+            let title = t.title().to_string();
+            t.set_title_manual(title);
+        }
+        // CLI/MCP 経由のデフォルトはアクティブタブを維持（ユーザーの入力を奪わない）
+        if !focus.unwrap_or(false) {
+            let _ = host.workspace_mut().activate_tab(prev_active);
+        }
+        (tab_id, new_id, true)
+    } else if let Some(direction) = direction {
+        let new_pane = Pane::new(origin);
+        let new_id = new_pane.id();
+        tree_mut(host.workspace_mut(), tab)
+            .split_with_ratio(target, direction.to_core(), 0.5, new_pane)
+            .map_err(op_err)?;
+        (tab, new_id, true)
+    } else if host.preview_state(target).is_some() {
+        (tab, target, false)
+    } else if let Some(existing) = host.preview_pane_of_tab(tab) {
+        (tab, existing, false)
+    } else {
+        let new_pane = Pane::new(origin);
+        let new_id = new_pane.id();
+        tree_mut(host.workspace_mut(), tab)
+            .split_with_ratio(target, SplitDirection::Right, 0.5, new_pane)
+            .map_err(op_err)?;
+        (tab, new_id, true)
+    };
+    let path_str = resolved.display().to_string();
+    // #1677: 「飛ぶ前にいた場所」= 差し替えられるプレビュー（再利用するとき）か、
+    // 新しく生やすなら基準ペイン（それがプレビューなら）。**set_preview の前**に採る
+    // （後だと差し替えた新しい中身を読んでしまう）
+    let jump_from = match (record, line) {
+        (JumpRecord::Record, Some(_)) => {
+            jump_origin(&*host, if created { target } else { view_pane })
+        }
+        _ => None,
+    };
+    host.set_preview(view_pane, &path_str, mode)
+        .map_err(DispatchError::Operation)?;
+    // #1676: 着地点の予約は**開いたあと**（行数はロード済みの内容から数える）。
+    // ここで失敗するのは「拡張子はテキストなのに中身が読めない」ときだけなので、
+    // 開いたことが分かる文言にして返す（ペインはそのまま残る）
+    let landing = match line {
+        Some(line) => Some(
+            host.reveal_preview_line(view_pane, line, column)
+                .map_err(|e| {
+                    DispatchError::Operation(format!(
+                        "開いたが行へ飛べない（{}: {e}）",
+                        resolved.display()
+                    ))
+                })?,
+        ),
+        None => None,
+    };
+    // #1677: 行を指定して開いた = ジャンプなので、飛ぶ前の場所と着地点を積む。
+    // 行を渡さない「開く」は積まない（ファイルツリーで眺めるたびに履歴が埋まる）
+    if let (Some(landing), JumpRecord::Record) = (landing, record) {
+        if !jump_record_legacy() {
+            if let Some(history) = host.jump_history_mut() {
+                history.record_jump(
+                    jump_from,
+                    JumpLocation {
+                        pane: view_pane,
+                        path: path_str.clone(),
+                        line: Some(landing.line),
+                        column: landing.column,
+                    },
+                );
+            }
+        }
+    }
+    // CLI/MCP 経由のデフォルトはフォーカスを移さない（ユーザーの入力を奪わない）
+    if focus.unwrap_or(false) {
+        tree_mut(host.workspace_mut(), tab)
+            .focus(view_pane)
+            .map_err(op_err)?;
+    }
+    Ok(json!({
+        "tab": tab.as_u64(),
+        "pane": view_pane.as_u64(),
+        "path": path_str,
+        "mode": mode.as_str(),
+        "created": created,
+        // #1676: 行指定が無ければ 4 つとも null・clamped は false
+        // （従来のキーはそのまま = 既存の読み手を壊さない）
+        "line": landing.map(|l| l.line),
+        "column": landing.and_then(|l| l.column),
+        "item": landing.map(|l| l.item),
+        "total_lines": landing.map(|l| l.total_lines),
+        "clamped": landing.is_some_and(|l| l.clamped),
+    }))
+}
+
+/// `TAKO_1677_LEGACY=1` で **#1677 前の挙動**（行を指定して開いてもジャンプ履歴へ
+/// 何も積まない）へ戻す。同一バイナリで A/B を取る入口（`scripts/test-jump-1677.sh`）
+fn jump_record_legacy() -> bool {
+    std::env::var_os("TAKO_1677_LEGACY").is_some()
+}
+
+/// プレビューペインがいま見ている位置（FR-3.29 / #1677。「飛ぶ前にいた場所」）。
+/// プレビューでなければ `None`。行は code 表示のときだけ持つ（Markdown のレンダリング
+/// 表示・画像・PDF は原文の行を持たないので、戻るときは行を指定せずに開く）
+fn jump_origin(host: &dyn ControlHost, pane: PaneId) -> Option<JumpLocation> {
+    let (path, mode) = host.preview_state(pane)?;
+    let line = match mode {
+        PreviewModeWire::Code => host.preview_current_line(pane),
+        _ => None,
+    };
+    Some(JumpLocation {
+        pane,
+        path,
+        line,
+        column: None,
+    })
+}
+
+/// `tako jump` / MCP `tako_jump` の action（#1677）。CLI と MCP はこの綴りを共有する
+pub const JUMP_ACTIONS: &[&str] = &["list", "back", "forward"];
+
+/// 履歴の項目の今の状態（生死の判定はここ 1 か所。方針は `tako_core::jump_history`）
+fn jump_liveness(location: &JumpLocation, live: &HashSet<PaneId>) -> Liveness {
+    if !Path::new(&location.path).is_file() {
+        Liveness::FileMissing
+    } else if live.contains(&location.pane) {
+        Liveness::Shown
+    } else {
+        Liveness::PaneClosed
+    }
+}
+
+fn jump_location_json(location: &JumpLocation, live: &HashSet<PaneId>) -> Value {
+    json!({
+        "pane": location.pane.as_u64(),
+        "path": location.path,
+        "line": location.line,
+        "column": location.column,
+        "pane_alive": live.contains(&location.pane),
+    })
+}
+
+/// 位置と端の状態だけ（戻る / 進むの応答に載せる要約）
+fn jump_summary_json(history: &JumpHistory) -> Value {
+    json!({
+        "current": history.cursor(),
+        "len": history.len(),
+        "capacity": history.capacity(),
+        "can_back": history.can_back(),
+        "can_forward": history.can_forward(),
+    })
+}
+
+/// ジャンプ履歴の操作の 1 実装（FR-3.29 / #1677）。CLI・MCP・GUI のキー（⌃- / ⌃⇧-）が
+/// すべてここを通る。
+///
+/// 戻る / 進むの着地は [`open_file`] へ委ね（開き方を 2 本にしない）、そのときは履歴へ
+/// 積まない（[`JumpRecord::Skip`]）。閉じたペインの項目は `pane` を基準に開き直し、
+/// 同じペインを指していた他の項目も開き直した先へ付け替える
+fn jump(
+    host: &mut dyn ControlHost,
+    origin: PaneOrigin,
+    action: &str,
+    pane: Option<u64>,
+    focus: Option<bool>,
+) -> Result<Value, DispatchError> {
+    use tako_core::jump_history::Direction as JumpDirection;
+    let direction = match action {
+        "list" => None,
+        "back" => Some(JumpDirection::Back),
+        "forward" => Some(JumpDirection::Forward),
+        other => {
+            return Err(DispatchError::InvalidParams(format!(
+                "action が不正: {other}（{}）",
+                JUMP_ACTIONS.join(" / ")
+            )))
+        }
+    };
+    // 生死は履歴を可変で借りる前に集めておく（判定中に workspace を読めないため）
+    let live = host.workspace().all_pane_ids();
+    let Some(history) = host.jump_history_mut() else {
+        return Err(DispatchError::Operation(
+            "ジャンプ履歴はこの tako では使えない（GUI の中でだけ持つ）".into(),
+        ));
+    };
+    let Some(direction) = direction else {
+        return Ok(json!({
+            "entries": history
+                .entries()
+                .map(|e| jump_location_json(e, &live))
+                .collect::<Vec<_>>(),
+            "history": jump_summary_json(history),
+        }));
+    };
+    let nav = history.navigate(direction, |location| jump_liveness(location, &live));
+    let dropped: Vec<Value> = nav
+        .dropped
+        .iter()
+        .map(|e| jump_location_json(e, &live))
+        .collect();
+    let Some(target) = nav.target else {
+        return Ok(json!({
+            "moved": false,
+            "action": action,
+            "reason": match direction {
+                JumpDirection::Back => "これより前の履歴は無い",
+                JumpDirection::Forward => "これより先の履歴は無い",
+            },
+            "dropped": dropped,
+            "history": jump_summary_json(history),
+        }));
+    };
+    let entry_pane = target.location.pane;
+    let opened = open_file(
+        host,
+        origin,
+        OpenFileArgs {
+            // 生きていればそのペインへ、閉じていれば基準ペインから開き直す
+            // （基準の同じタブにプレビューがあれば使い回し、無ければ右へ分割 = OpenFile の既定）
+            pane: if target.reopen {
+                pane
+            } else {
+                Some(entry_pane.as_u64())
+            },
+            path: target.location.path.clone(),
+            mode: None,
+            direction: None,
+            focus: None,
+            new_tab: false,
+            line: target.location.line,
+            column: target.location.column,
+        },
+        JumpRecord::Skip,
+    )?;
+    let landed = opened["pane"].as_u64().map(PaneId::from_raw);
+    let mut location = target.location;
+    if let (true, Some(landed), Some(history)) = (target.reopen, landed, host.jump_history_mut()) {
+        history.retarget_pane(entry_pane, landed);
+        location.pane = landed;
+    }
+    // 別タブのペインへ出たときはタブも切り替える（`Focus` と同じ）。
+    // CLI / MCP の既定はフォーカスを移さない（ユーザーの入力を奪わない）
+    if let (true, Some(landed)) = (focus.unwrap_or(false), landed) {
+        let (tab, landed) = resolve_pane(host.workspace(), Some(landed.as_u64()))?;
+        let ws = host.workspace_mut();
+        tree_mut(ws, tab).focus(landed).map_err(op_err)?;
+        ws.activate_tab(tab).map_err(op_err)?;
+    }
+    let live = host.workspace().all_pane_ids();
+    let summary = host
+        .jump_history()
+        .map(jump_summary_json)
+        .unwrap_or(Value::Null);
+    Ok(json!({
+        "moved": true,
+        "action": action,
+        "reopened": target.reopen,
+        "location": jump_location_json(&location, &live),
+        "open": opened,
+        "dropped": dropped,
+        "history": summary,
+    }))
 }
 
 /// リクエストを実行し、成功時の `result` 値を返す。
@@ -2225,149 +2605,26 @@ fn dispatch_inner(
             new_tab,
             line,
             column,
-        } => {
-            if new_tab && direction.is_some() {
-                return Err(DispatchError::Operation(
-                    "new_tab と direction は同時に指定できない（新しいタブには分割元が無い）"
-                        .into(),
-                ));
-            }
-            // #1676: 1 始まりの検査は**開く前**に済ませる（0 を渡した呼び出しで
-            // ペインが増えてから落ちる、という後始末の要る失敗を作らない）
-            if line == Some(0) {
-                return Err(DispatchError::InvalidParams(
-                    tako_core::open_plan::LINE_ONE_BASED.into(),
-                ));
-            }
-            if column == Some(0) {
-                return Err(DispatchError::InvalidParams(
-                    tako_core::open_plan::COLUMN_ONE_BASED.into(),
-                ));
-            }
-            if line.is_none() && column.is_some() {
-                return Err(DispatchError::InvalidParams(
-                    "column は line と一緒に指定する".into(),
-                ));
-            }
-            let (tab, target) = match pane {
-                Some(_) => resolve_pane(host.workspace(), pane)?,
-                None => {
-                    let ws = host.workspace();
-                    let active = ws.active_tab_id();
-                    let focused = ws.active_tab().tree().focused();
-                    (active, focused)
-                }
-            };
-            // 相対パスは対象ペインの cwd（OSC 7。無ければプロセスの cwd）基準で解決する
-            let mut resolved = std::path::PathBuf::from(&path);
-            if resolved.is_relative() {
-                if let Some(cwd) = host.session(target).and_then(|s| s.cwd()) {
-                    resolved = cwd.join(resolved);
-                }
-            }
-            // 解決は境界（B26）を通す（保存・応答・子プロセスへ渡る値。#970）
-            let resolved = tako_core::platform::path::canonicalize(&resolved).map_err(|e| {
-                DispatchError::Operation(format!("ファイルを開けない（{path}: {e}）"))
-            })?;
-            if !resolved.is_file() {
-                return Err(DispatchError::Operation(format!(
-                    "ファイルではない: {}",
-                    resolved.display()
-                )));
-            }
-            // 拡張子 → プレビュー種別の対応表は `tako_core::open_plan` が正本（#1283）。
-            // リンク検出の応答（`tako links` の `open`）が同じ表を引くので、
-            // 「cmd+クリックがどう開くか」は機械で読める
-            let mode = mode.unwrap_or_else(|| preview_mode_wire(&resolved));
-            // #1676: 行指定があるときは「原文の 1 行 = 1 item」になる code へ倒す
-            // （md のレンダリング表示は 1 item = 1 ブロックで原文の行が残らない）。
-            // 行を持たない種別（画像 / PDF / 動画）はここで弾く = **開く前**
-            let mode = match line {
-                Some(_) => preview_route_with_line_wire(mode).map_err(DispatchError::Operation)?,
-                None => mode,
-            };
-            // 表示先の解決: new_tab 指定（FR-3.22 = Finder の「このアプリケーションで
-            // 開く」）なら新しいタブ 1 枚をそのファイル専用にする。direction 指定
-            // （FR-3.11 = D&D のドロップ位置）なら再利用せず必ずその方向へ分割。
-            // どちらも省略時は 対象自身がプレビュー > 同タブの既存プレビュー（再利用）
-            // > 右分割で新設。いずれの経路でもターミナルセッションは起動しない
-            let (tab, view_pane, created) = if new_tab {
-                let prev_active = host.workspace().active_tab_id();
-                let new_pane = Pane::new(origin);
-                let new_id = new_pane.id();
-                let title = resolved
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| resolved.display().to_string());
-                let tab_id = host.workspace_mut().create_tab(title, new_pane);
-                // ファイル名は「このタブが何か」そのものなので、自動リネーム（FR-2.12）に
-                // 奪わせない。プレビュー専用タブには命名材料になる端末出力も無い
-                if let Some(t) = host.workspace_mut().get_tab_mut(tab_id) {
-                    let title = t.title().to_string();
-                    t.set_title_manual(title);
-                }
-                // CLI/MCP 経由のデフォルトはアクティブタブを維持（ユーザーの入力を奪わない）
-                if !focus.unwrap_or(false) {
-                    let _ = host.workspace_mut().activate_tab(prev_active);
-                }
-                (tab_id, new_id, true)
-            } else if let Some(direction) = direction {
-                let new_pane = Pane::new(origin);
-                let new_id = new_pane.id();
-                tree_mut(host.workspace_mut(), tab)
-                    .split_with_ratio(target, direction.to_core(), 0.5, new_pane)
-                    .map_err(op_err)?;
-                (tab, new_id, true)
-            } else if host.preview_state(target).is_some() {
-                (tab, target, false)
-            } else if let Some(existing) = host.preview_pane_of_tab(tab) {
-                (tab, existing, false)
-            } else {
-                let new_pane = Pane::new(origin);
-                let new_id = new_pane.id();
-                tree_mut(host.workspace_mut(), tab)
-                    .split_with_ratio(target, SplitDirection::Right, 0.5, new_pane)
-                    .map_err(op_err)?;
-                (tab, new_id, true)
-            };
-            let path_str = resolved.display().to_string();
-            host.set_preview(view_pane, &path_str, mode)
-                .map_err(DispatchError::Operation)?;
-            // #1676: 着地点の予約は**開いたあと**（行数はロード済みの内容から数える）。
-            // ここで失敗するのは「拡張子はテキストなのに中身が読めない」ときだけなので、
-            // 開いたことが分かる文言にして返す（ペインはそのまま残る）
-            let landing = match line {
-                Some(line) => Some(host.reveal_preview_line(view_pane, line, column).map_err(
-                    |e| {
-                        DispatchError::Operation(format!(
-                            "開いたが行へ飛べない（{}: {e}）",
-                            resolved.display()
-                        ))
-                    },
-                )?),
-                None => None,
-            };
-            // CLI/MCP 経由のデフォルトはフォーカスを移さない（ユーザーの入力を奪わない）
-            if focus.unwrap_or(false) {
-                tree_mut(host.workspace_mut(), tab)
-                    .focus(view_pane)
-                    .map_err(op_err)?;
-            }
-            Ok(json!({
-                "tab": tab.as_u64(),
-                "pane": view_pane.as_u64(),
-                "path": path_str,
-                "mode": mode.as_str(),
-                "created": created,
-                // #1676: 行指定が無ければ 4 つとも null・clamped は false
-                // （従来のキーはそのまま = 既存の読み手を壊さない）
-                "line": landing.map(|l| l.line),
-                "column": landing.and_then(|l| l.column),
-                "item": landing.map(|l| l.item),
-                "total_lines": landing.map(|l| l.total_lines),
-                "clamped": landing.is_some_and(|l| l.clamped),
-            }))
-        }
+        } => open_file(
+            host,
+            origin,
+            OpenFileArgs {
+                pane,
+                path,
+                mode,
+                direction,
+                focus,
+                new_tab,
+                line,
+                column,
+            },
+            JumpRecord::Record,
+        ),
+        Request::Jump {
+            action,
+            pane,
+            focus,
+        } => jump(host, origin, &action, pane, focus),
         Request::PreviewView {
             pane,
             zoom,
@@ -15274,6 +15531,10 @@ mod tests {
         /// #566: close の発生源マーカー（ペインログへ書かれる文字列と同一）
         detached_markers: Vec<String>,
         previews: std::collections::HashMap<u64, (String, PreviewModeWire)>,
+        /// #1677: プレビューがいま見ている行（着地で更新。テストはスクロールをここで模擬する）
+        preview_lines: std::collections::HashMap<u64, usize>,
+        /// #1677: ジャンプ履歴の実体（GUI の `TakoApp::jump_history` に当たる）
+        jumps: tako_core::jump_history::JumpHistory,
         preview_views: std::collections::HashMap<u64, tako_core::PreviewViewState>,
         preview_outlines: std::collections::HashMap<u64, tako_core::PreviewOutline>,
         last_outline_target: Option<tako_core::PreviewOutlineTarget>,
@@ -15372,6 +15633,8 @@ mod tests {
                 panel: (false, 0.0, crate::protocol::PanelViewWire::Fleet),
                 user_task_expanded: None,
                 previews: std::collections::HashMap::new(),
+                preview_lines: std::collections::HashMap::new(),
+                jumps: tako_core::jump_history::JumpHistory::default(),
                 preview_views: std::collections::HashMap::new(),
                 preview_outlines: std::collections::HashMap::new(),
                 last_outline_target: None,
@@ -15796,6 +16059,7 @@ mod tests {
                 }
                 None => None,
             };
+            self.preview_lines.insert(pane.as_u64(), line);
             Ok(crate::host::PreviewLineTarget {
                 line,
                 column: column.map(|(column, _)| column),
@@ -15803,6 +16067,15 @@ mod tests {
                 item: line - 1,
                 clamped: line_clamped || column.is_some_and(|(_, clamped)| clamped),
             })
+        }
+        fn preview_current_line(&self, pane: PaneId) -> Option<usize> {
+            self.preview_lines.get(&pane.as_u64()).copied()
+        }
+        fn jump_history(&self) -> Option<&tako_core::jump_history::JumpHistory> {
+            Some(&self.jumps)
+        }
+        fn jump_history_mut(&mut self) -> Option<&mut tako_core::jump_history::JumpHistory> {
+            Some(&mut self.jumps)
         }
         fn set_preview(
             &mut self,
@@ -15818,6 +16091,8 @@ mod tests {
                 return Err("未保存の変更があるため別ファイルを開けない".into());
             }
             self.previews.insert(pane.as_u64(), (path.into(), mode));
+            // 行ジャンプ無しで開き直したら先頭から見る（GUI も差し替えで位置を捨てる）
+            self.preview_lines.insert(pane.as_u64(), 1);
             self.preview_outlines.remove(&pane.as_u64());
             if matches!(mode, PreviewModeWire::Pdf | PreviewModeWire::Image) {
                 self.preview_views
@@ -18248,6 +18523,295 @@ mod tests {
         // 存在しないパス・ディレクトリはエラー
         assert!(open(&mut host, dir.join("no-such").display().to_string(), None).is_err());
         assert!(open(&mut host, dir.display().to_string(), None).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1677 の検証用ディレクトリ（`name` ごとに別。100 行のファイルを並べる）
+    fn jump_fixture(name: &str, files: &[&str]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tako-dispatch-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body: String = (1..=100).map(|i| format!("// {i}\n")).collect();
+        for file in files {
+            std::fs::write(dir.join(file), &body).unwrap();
+        }
+        dir
+    }
+
+    fn jump_open(
+        host: &mut MockHost,
+        pane: u64,
+        path: &std::path::Path,
+        line: Option<usize>,
+        direction: Option<Direction>,
+    ) -> Value {
+        dispatch(
+            host,
+            Request::OpenFile {
+                pane: Some(pane),
+                path: path.display().to_string(),
+                mode: None,
+                direction,
+                focus: None,
+                new_tab: false,
+                line,
+                column: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap()
+    }
+
+    fn jump_call(
+        host: &mut MockHost,
+        action: &str,
+        pane: Option<u64>,
+        focus: Option<bool>,
+    ) -> Value {
+        dispatch(
+            host,
+            Request::Jump {
+                action: action.into(),
+                pane,
+                focus,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap()
+    }
+
+    /// 履歴の中身を「ファイル名:行」で並べる（現在位置に `>`）
+    fn jump_entries(host: &mut MockHost) -> Vec<String> {
+        let list = jump_call(host, "list", None, None);
+        let current = list["history"]["current"].as_u64();
+        list["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let name = std::path::Path::new(e["path"].as_str().unwrap())
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                let mark = if current == Some(i as u64) { ">" } else { "" };
+                format!("{mark}{name}:{}", e["line"])
+            })
+            .collect()
+    }
+
+    /// FR-3.29 / #1677: 行を指定した OpenFile が「飛ぶ前にいた場所」と着地点を積み、
+    /// 戻る / 進むは OpenFile と同じ実装で着地する（そのときは積まない）。
+    /// 行を渡さない open は積まない
+    #[test]
+    fn jumpは行指定のopenで積み戻る進むで着地する() {
+        let dir = jump_fixture("jump", &["a.rs", "b.rs"]);
+        let (a, b) = (dir.join("a.rs"), dir.join("b.rs"));
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        // 行なしの open（ファイルツリーで眺める）は積まない
+        let preview = jump_open(&mut host, root, &a, None, None)["pane"]
+            .as_u64()
+            .unwrap();
+        assert!(
+            jump_entries(&mut host).is_empty(),
+            "行なしの open は積まない"
+        );
+        // a.rs を 30 行目まで読み進めてから b.rs:50 へ飛ぶ → a:30 と b:50 が積まれる
+        host.preview_lines.insert(preview, 30);
+        let opened = jump_open(&mut host, root, &b, Some(50), None);
+        assert_eq!(
+            opened["pane"].as_u64(),
+            Some(preview),
+            "同タブのプレビューを使い回す"
+        );
+        assert_eq!(jump_entries(&mut host), vec!["a.rs:30", ">b.rs:50"]);
+        // b.rs:50 から a.rs:7 へ。飛ぶ前の場所（b:50）は直前の着地点と同じなので畳む
+        jump_open(&mut host, root, &a, Some(7), None);
+        assert_eq!(
+            jump_entries(&mut host),
+            vec!["a.rs:30", "b.rs:50", ">a.rs:7"]
+        );
+
+        // 戻る: b.rs:50 へ着地し、プレビューの中身も差し替わる。履歴は動かさない（積まない）
+        let back = jump_call(&mut host, "back", Some(root), None);
+        assert_eq!(back["moved"], json!(true));
+        assert_eq!(back["reopened"], json!(false));
+        assert_eq!(back["open"]["pane"].as_u64(), Some(preview));
+        assert_eq!(back["open"]["line"].as_u64(), Some(50));
+        assert!(host.previews[&preview].0.ends_with("b.rs"));
+        assert_eq!(
+            jump_entries(&mut host),
+            vec!["a.rs:30", ">b.rs:50", "a.rs:7"]
+        );
+        // もう一度戻ると最初に読んでいた a.rs:30、その先は無い（位置は変えない）
+        let back = jump_call(&mut host, "back", Some(root), None);
+        assert_eq!(back["location"]["line"].as_u64(), Some(30));
+        assert!(host.previews[&preview].0.ends_with("a.rs"));
+        let edge = jump_call(&mut host, "back", Some(root), None);
+        assert_eq!(edge["moved"], json!(false));
+        assert_eq!(edge["reason"], json!("これより前の履歴は無い"));
+        assert_eq!(edge["history"]["current"].as_u64(), Some(0));
+        // 進む → b.rs:50、さらに進む → a.rs:7、その先は無い
+        let fwd = jump_call(&mut host, "forward", Some(root), None);
+        assert_eq!(fwd["location"]["line"].as_u64(), Some(50));
+        let fwd = jump_call(&mut host, "forward", Some(root), None);
+        assert_eq!(fwd["location"]["line"].as_u64(), Some(7));
+        let edge = jump_call(&mut host, "forward", Some(root), None);
+        assert_eq!(edge["moved"], json!(false));
+        assert_eq!(edge["reason"], json!("これより先の履歴は無い"));
+        assert_eq!(
+            jump_entries(&mut host),
+            vec!["a.rs:30", "b.rs:50", ">a.rs:7"]
+        );
+        // 戻る / 進むでペインは増えない
+        assert_eq!(host.ws.active_tab().tree().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FR-3.29 / #1677: 閉じたペインの項目は**開き直す**（基準ペインのタブのプレビューを
+    /// 使い回し、閉じたペインの項目を開き直した先へ付け替える）。ファイルが消えた項目は
+    /// 読み飛ばして捨て、応答の `dropped` で知らせる
+    #[test]
+    fn jumpは閉じたペインの項目を開き直し消えたファイルは捨てる() {
+        let dir = jump_fixture("jump-closed", &["a.rs", "b.rs", "c.rs"]);
+        let (a, b, c) = (dir.join("a.rs"), dir.join("b.rs"), dir.join("c.rs"));
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        // 端末から開いたので「飛ぶ前の場所」は無い（端末はファイルの位置を持たない）
+        let p1 = jump_open(&mut host, root, &a, Some(10), Some(Direction::Right))["pane"]
+            .as_u64()
+            .unwrap();
+        let p2 = jump_open(&mut host, root, &b, Some(20), Some(Direction::Down))["pane"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(jump_entries(&mut host), vec!["a.rs:10", ">b.rs:20"]);
+        dispatch(
+            &mut host,
+            Request::Close {
+                pane: Some(p1),
+                force: true,
+                caller_role: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        // 閉じても項目は消えない（list で閉じたことが分かる）
+        let list = jump_call(&mut host, "list", None, None);
+        assert_eq!(list["entries"][0]["pane_alive"], json!(false));
+        assert_eq!(list["entries"][1]["pane_alive"], json!(true));
+
+        let back = jump_call(&mut host, "back", Some(root), None);
+        assert_eq!(back["moved"], json!(true));
+        assert_eq!(
+            back["reopened"],
+            json!(true),
+            "閉じたペインの項目は開き直す"
+        );
+        assert_eq!(
+            back["location"]["pane_alive"],
+            json!(true),
+            "開き直した先へ付け替わる"
+        );
+        assert_eq!(
+            back["open"]["pane"].as_u64(),
+            Some(p2),
+            "同タブのプレビューを使い回す"
+        );
+        assert_eq!(back["open"]["line"].as_u64(), Some(10));
+        assert!(host.previews[&p2].0.ends_with("a.rs"));
+        let list = jump_call(&mut host, "list", None, None);
+        let panes: Vec<u64> = list["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["pane"].as_u64().unwrap())
+            .collect();
+        assert_eq!(panes, vec![p2, p2]);
+
+        // c.rs:5 へ飛んでから b.rs を消す → 戻ると b は読み飛ばして a へ
+        jump_call(&mut host, "forward", Some(root), None);
+        jump_open(&mut host, root, &c, Some(5), None);
+        assert_eq!(
+            jump_entries(&mut host),
+            vec!["a.rs:10", "b.rs:20", ">c.rs:5"]
+        );
+        std::fs::remove_file(&b).unwrap();
+        let back = jump_call(&mut host, "back", Some(root), None);
+        assert_eq!(back["location"]["line"].as_u64(), Some(10));
+        let dropped = back["dropped"].as_array().unwrap();
+        assert_eq!(dropped.len(), 1);
+        assert!(dropped[0]["path"].as_str().unwrap().ends_with("b.rs"));
+        assert_eq!(jump_entries(&mut host), vec![">a.rs:10", "c.rs:5"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FR-3.29 / #1677: 空の履歴で戻る / 進むを呼んでも失敗しない（`moved: false`）。
+    /// 不正な action は引数エラー
+    #[test]
+    fn jumpは空の履歴でも失敗せず不正なactionを弾く() {
+        let mut host = MockHost::new();
+        for action in ["back", "forward"] {
+            let r = jump_call(&mut host, action, None, None);
+            assert_eq!(r["moved"], json!(false));
+            assert_eq!(r["dropped"], json!([]));
+            assert_eq!(r["history"]["len"], json!(0));
+            assert_eq!(r["history"]["current"], Value::Null);
+        }
+        let list = jump_call(&mut host, "list", None, None);
+        assert_eq!(list["entries"], json!([]));
+        assert_eq!(
+            list["history"]["capacity"].as_u64(),
+            Some(tako_core::jump_history::DEFAULT_CAPACITY as u64)
+        );
+        let err = dispatch(
+            &mut host,
+            Request::Jump {
+                action: "up".into(),
+                pane: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(matches!(err, DispatchError::InvalidParams(_)), "{err:?}");
+    }
+
+    /// FR-3.29 / #1677: `focus` を渡すと、別タブにいた項目へ戻るときタブも切り替える
+    /// （GUI のキーはこの形で呼ぶ）。渡さなければアクティブタブを動かさない
+    #[test]
+    fn jumpのfocusは着地したペインのタブへ切り替える() {
+        let dir = jump_fixture("jump-focus", &["a.rs", "b.rs"]);
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let tab1 = host.ws.active_tab_id();
+        let p1 = jump_open(&mut host, root, &dir.join("a.rs"), Some(3), None)["pane"]
+            .as_u64()
+            .unwrap();
+        let tab2_pane = dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: Some(true),
+                cwd: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap()["pane"]
+            .as_u64()
+            .unwrap();
+        let tab2 = host.ws.active_tab_id();
+        jump_open(&mut host, tab2_pane, &dir.join("b.rs"), Some(4), None);
+        // focus なし: 着地はするがタブは動かさない
+        let back = jump_call(&mut host, "back", Some(tab2_pane), None);
+        assert_eq!(back["open"]["pane"].as_u64(), Some(p1));
+        assert_eq!(host.ws.active_tab_id(), tab2);
+        // focus あり: 着地したペインのタブへ切り替えてフォーカスする
+        jump_call(&mut host, "forward", Some(tab2_pane), None);
+        jump_call(&mut host, "back", Some(tab2_pane), Some(true));
+        assert_eq!(host.ws.active_tab_id(), tab1);
+        assert_eq!(host.ws.active_tab().tree().focused().as_u64(), p1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

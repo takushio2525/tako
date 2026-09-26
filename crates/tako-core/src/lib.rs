@@ -23,6 +23,7 @@ pub mod handoff;
 pub mod header_layout;
 pub mod i18n;
 pub mod ipc_socket;
+pub mod jump_history;
 pub mod limit_resume;
 pub mod links;
 pub mod lsp;

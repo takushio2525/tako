@@ -1866,6 +1866,9 @@ struct TakoApp {
     /// 言語サーバの束ね（#1678）。編集モードに入ったときだけサーバを起こす。
     /// CLI / MCP の `tako lsp` も dispatch 経由でこの 1 つを触る
     lsp: tako_control::lsp::LspManager,
+    /// ジャンプ履歴（FR-3.29 / #1677）。行を指定した OpenFile が積み、⌃- / ⌃⇧- と
+    /// CLI / MCP の `tako jump` が dispatch 経由でこの 1 つを動かす。永続化はしない
+    jump_history: tako_core::jump_history::JumpHistory,
     /// タブ・ペイン名の AI 自動リネームの検知状態（FR-2.12。ループは new で張る）
     autorename: autorename::AutoRenamer,
     /// 自動命名した時刻（タブ ID → 命名時刻。#552 案 4）。命名直後だけタブに
@@ -3993,6 +3996,7 @@ impl TakoApp {
             preview_reload_apply_count: 0,
             preview_edits: HashMap::new(),
             lsp: tako_control::lsp::LspManager::from_env(),
+            jump_history: tako_core::jump_history::JumpHistory::default(),
             autorename: autorename::AutoRenamer::new(initial_auto_rename()),
             auto_title_hints: HashMap::new(),
             port_detect: initial_port_detect(),
@@ -6182,6 +6186,28 @@ impl TakoApp {
             eprintln!("warning: Web ビューを開けないため外部ブラウザへ委譲: {e}");
             open_preview(&url);
         }
+        cx.notify();
+    }
+
+    /// ⌃- / ⌃⇧-（Windows は Ctrl+Alt+← / →）の戻る / 進む（FR-3.29 / #1677）。
+    ///
+    /// CLI / MCP の `tako jump` と**同じ dispatch** を通す（UI 層に閉じたロジックを作らない）。
+    /// キーはユーザー自身の操作なので、着地したペインへフォーカスを移す（別タブならタブも）。
+    /// 端で押したとき・履歴が空のときは何も起きない（`moved: false` が返るだけ）
+    fn jump_step(&mut self, action: &str, cx: &mut Context<Self>) {
+        let anchor = self.focused_pane();
+        if let Err(e) = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::Jump {
+                action: action.into(),
+                pane: Some(anchor.as_u64()),
+                focus: Some(true),
+            },
+            PaneOrigin::User,
+        ) {
+            eprintln!("warning: ジャンプ履歴の {action} に失敗: {}", e.class());
+        }
+        self.sync_filetree_roots();
         cx.notify();
     }
 
@@ -22053,6 +22079,30 @@ impl PreviewHost for TakoApp {
         })
     }
 
+    fn preview_current_line(&self, pane: PaneId) -> Option<usize> {
+        // #1677: 開いた直後でまだ描いていないなら、予約した着地点がいま見ている行
+        // （`ListState` は描くときに作られるので、可視先頭はまだ前の位置のまま）
+        if let Some(item) = self.preview_pending_reveal.get(&pane) {
+            return Some(item + 1);
+        }
+        if let Some(edit) = self.preview_edits.get(&pane).filter(|edit| edit.editing) {
+            return Some(edit.buffer.line_byte_col(edit.buffer.cursor()).0 + 1);
+        }
+        self.preview_first_visible_line(pane)
+            .map(|line| line + 1)
+            // まだ一度も描いていない（器の位置が無い）= 差し替えた直後なので先頭。
+            // 開いた直後に続けて飛ぶと描画より先に来るので、ここで None にしない
+            .or_else(|| self.previews.contains_key(&pane).then_some(1))
+    }
+
+    fn jump_history(&self) -> Option<&tako_core::jump_history::JumpHistory> {
+        Some(&self.jump_history)
+    }
+
+    fn jump_history_mut(&mut self) -> Option<&mut tako_core::jump_history::JumpHistory> {
+        Some(&mut self.jump_history)
+    }
+
     fn preview_outline(&self, pane: PaneId) -> Option<tako_core::PreviewOutline> {
         let preview = self.previews.get(&pane)?;
         matches!(
@@ -24687,6 +24737,8 @@ impl Render for TakoApp {
                 let _ = this.preview_redo_local(pane_id);
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &JumpBack, _, cx| this.jump_step("back", cx)))
+            .on_action(cx.listener(|this, _: &JumpForward, _, cx| this.jump_step("forward", cx)))
             .on_action(cx.listener(|this, _: &FindPreview, _, cx| {
                 let pane_id = this.focused_pane();
                 if let Some(edit) = this.preview_edits.get_mut(&pane_id) {
@@ -38834,6 +38886,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1677: ジャンプ履歴の戻る / 進むが実 GUI の打鍵経路で効くか
+                "jump-keys" => {
+                    jump_keys_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1728: 実行コマンド / 検索欄を文字の途中で切って描画中に落ちないか
                 "run-command-truncate" => {
                     run_command_truncate_visual(any, window, cx).await;
@@ -38854,7 +38912,7 @@ mod self_test {
                          remote-tree / flicker / ime-preedit / screen-lines / \
                          pane-border / tasks-panel / task-attachment / \
                          tasks-accordion / shelve-tab / no-emoji / editor-keys / \
-                         run-command-truncate / viewport-lines）"
+                         run-command-truncate / viewport-lines / jump-keys）"
                     );
                     std::process::exit(1);
                 }
@@ -38909,6 +38967,10 @@ mod self_test {
             // #1741: 追従の余白と Page Down の歩幅が、描いた行の実矩形の可視行数と合うか
             // （文字サイズの最大・最小 / 1 行 / 短い / 折り返しのファイルを含む）
             viewport_lines_visual(any, window, cx).await;
+
+            // #1677: ジャンプ履歴の戻る / 進む（⌃- / ⌃⇧-・Windows は Ctrl+Alt+← / →）が
+            // 実 GUI の打鍵経路で効くか
+            jump_keys_visual(any, window, cx).await;
 
             // #589: ファイルツリーのインデントガイド線が連続しているか。
             // 4 階層のフィクスチャを開き、ダーク / ライト / スクロール後の 3 状態で
@@ -42203,6 +42265,194 @@ mod self_test {
             cx.notify();
         });
         println!("TAKO_VISUAL_1472: thumb={thumb_ready}");
+    }
+
+    /// #1677: ジャンプ履歴の戻る / 進むが**実 GUI の打鍵経路**で効くか。
+    ///
+    /// 打鍵は `window.dispatch_keystroke`（= GPUI のキーバインド判定 → アクション →
+    /// `jump_step` → dispatch `Jump`）へ流す。dispatch の直呼びでは「キーが張られていない」
+    /// 「別のアクションが先に食う（Windows の Ctrl+- = 縮小）」型を検出できない。
+    ///
+    /// 打鍵の綴りは OS の慣習どおりにここで直書きする（表から引くと、表が壊れても
+    /// 同じ壊れ方で緑になる）。macOS の進むは US 配列（`ctrl-_`）と JIS 配列（`ctrl-=`）の
+    /// 両方の届き方を押す。見るのは状態（プレビューのファイル・可視先頭行・フォーカス）で、
+    /// ピクセルは見ない。
+    ///
+    /// 判定は新しい挙動を無条件に主張する。`TAKO_1677_LEGACY=1`（行を指定した open が
+    /// 何も積まない）では最初の「戻る」の相で落ちる = A/B の検出力。
+    /// 単独実行は `TAKO_VISUAL_ONLY=jump-keys`
+    #[cfg(feature = "visual-test")]
+    async fn jump_keys_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        use tako_control::protocol::Request as Req;
+
+        inject_section_failure("jump-keys");
+        let anchor = ensure_fresh_scene(window, cx, "jump-keys").await;
+        let mac = cfg!(target_os = "macos");
+        let back = if mac { "ctrl--" } else { "ctrl-alt-left" };
+        let forward_keys: &[&str] = if mac {
+            &["ctrl-_", "ctrl-="]
+        } else {
+            &["ctrl-alt-right"]
+        };
+
+        let dir = std::env::temp_dir().join(format!("tako-visual-jump-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("visual-test jump-keys 一時ディレクトリ");
+        let body: String = (1..=300).map(|i| format!("// line {i}\n")).collect();
+        let (a, b) = (dir.join("a.rs"), dir.join("b.rs"));
+        std::fs::write(&a, &body).expect("visual-test jump-keys fixture a");
+        std::fs::write(&b, &body).expect("visual-test jump-keys fixture b");
+
+        // CLI / MCP と同じ dispatch で行を指定して開く（a.rs:120 → b.rs:40 と飛ぶ）
+        let open = |cx: &mut AsyncApp,
+                    path: &std::path::Path,
+                    line: usize,
+                    direction: Option<tako_control::protocol::Direction>|
+         -> Option<PaneId> {
+            window
+                .update(cx, |app, _, cx| {
+                    let r = tako_control::dispatch(
+                        app,
+                        Req::OpenFile {
+                            pane: Some(anchor.as_u64()),
+                            path: path.display().to_string(),
+                            mode: None,
+                            direction,
+                            focus: Some(false),
+                            new_tab: false,
+                            line: Some(line),
+                            column: None,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    cx.notify();
+                    r.ok()
+                        .and_then(|v| v["pane"].as_u64())
+                        .map(PaneId::from_raw)
+                })
+                .ok()
+                .flatten()
+        };
+        let Some(preview) = open(cx, &a, 120, Some(tako_control::protocol::Direction::Right))
+        else {
+            fail("visual-test jump-keys: a.rs:120 を開けない (#1677)")
+        };
+        let _ = open(cx, &b, 40, None);
+
+        // (ファイル名, 可視先頭行 1 始まり, フォーカス中のペイン)
+        type Seen = (String, Option<usize>, u64);
+        let observe = |cx: &mut AsyncApp| -> Seen {
+            notify_and_draw(any, window, cx);
+            window
+                .update(cx, |app, _, _| {
+                    let name = app
+                        .previews
+                        .get(&preview)
+                        .and_then(|p| p.path.file_name())
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    (
+                        name,
+                        app.preview_first_visible_line(preview).map(|l| l + 1),
+                        app.focused_pane().as_u64(),
+                    )
+                })
+                .unwrap_or_default()
+        };
+        // 狙った (ファイル, 行) になるまで**状態で**待つ（着地は次の描画で効く = #1676）
+        let wait_for = async |cx: &mut AsyncApp, file: &str, line: usize| -> Seen {
+            let deadline = std::time::Instant::now()
+                + state_wait_budget(Duration::from_secs(20), machine_busy());
+            loop {
+                let seen = observe(cx);
+                if (seen.0 == file && seen.1 == Some(line)) || std::time::Instant::now() >= deadline
+                {
+                    return seen;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+            }
+        };
+        let seen = wait_for(cx, "b.rs", 40).await;
+        println!("TAKO_VISUAL_PIXEL: jump-keys landed={seen:?}");
+        check(
+            seen.0 == "b.rs" && seen.1 == Some(40),
+            &format!(
+                "visual-test jump-keys: 行指定の open で b.rs:40 に着地する (#1677。{seen:?})"
+            ),
+        );
+
+        // 端末ペインにフォーカスを置いたまま押す（履歴はペインを選ばない）
+        let _ = window.update(cx, |app, _, _| {
+            let _ = app.workspace.active_tab_mut().tree_mut().focus(anchor);
+        });
+        press(any, cx, back);
+        let seen = wait_for(cx, "a.rs", 120).await;
+        println!("TAKO_VISUAL_PIXEL: jump-keys key={back} seen={seen:?}");
+        check(
+            seen.0 == "a.rs" && seen.1 == Some(120),
+            &format!("visual-test jump-keys: {back} で a.rs:120 へ戻る (#1677。{seen:?})"),
+        );
+        check(
+            seen.2 == preview.as_u64(),
+            &format!(
+                "visual-test jump-keys: キーの戻るは着地したペインへフォーカスを移す \
+                 (#1677。focused={} preview={})",
+                seen.2,
+                preview.as_u64()
+            ),
+        );
+        // 先頭で押しても何も起きない（落ちない・位置も変わらない）
+        press(any, cx, back);
+        let seen = observe(cx);
+        check(
+            seen.0 == "a.rs" && seen.1 == Some(120),
+            &format!("visual-test jump-keys: 先頭で {back} を押しても動かない (#1677。{seen:?})"),
+        );
+
+        for (i, key) in forward_keys.iter().enumerate() {
+            if i > 0 {
+                press(any, cx, back);
+                let seen = wait_for(cx, "a.rs", 120).await;
+                check(
+                    seen.0 == "a.rs",
+                    &format!("visual-test jump-keys: {key} の前に戻る (#1677。{seen:?})"),
+                );
+            }
+            press(any, cx, key);
+            let seen = wait_for(cx, "b.rs", 40).await;
+            println!("TAKO_VISUAL_PIXEL: jump-keys key={key} seen={seen:?}");
+            check(
+                seen.0 == "b.rs" && seen.1 == Some(40),
+                &format!("visual-test jump-keys: {key} で b.rs:40 へ進む (#1677。{seen:?})"),
+            );
+        }
+        // 末尾で押しても何も起きない
+        press(any, cx, forward_keys[0]);
+        let seen = observe(cx);
+        check(
+            seen.0 == "b.rs" && seen.1 == Some(40),
+            &format!("visual-test jump-keys: 末尾で進んでも動かない (#1677。{seen:?})"),
+        );
+
+        let _ = window.update(cx, |app, _, cx| {
+            let _ = tako_control::dispatch(
+                app,
+                Req::Close {
+                    pane: Some(preview.as_u64()),
+                    force: true,
+                    caller_role: None,
+                },
+                PaneOrigin::Cli,
+            );
+            cx.notify();
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #1652: 修飾キー付きの打鍵が**実 GUI の打鍵経路**で編集に効くか。

@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-26（#1725: ツリーのインライン入力の IME をターミナルから入力欄へ戻した）
-- 実測で真因を確定: ASCII 打鍵は 9/9 で入力欄に入る一方、IME の変換は 9/9 で**隣のターミナルペインに束縛**（`app_text_input` がインライン編集を宛先から外していた）。GPUI はかなモードの印字キーを IME へ先に渡すので、下線・候補窓はターミナルのカーソルに出て、unmark の文字列は PTY へ流れていた。外側クリックでは閉じなかった
-- `AppTextInput::TreeName` を足し、打鍵・⌘V・確定・unmark の 4 経路を `tree_name_insert` の 1 関数へ、状態を `TextField` へ、開く / 閉じるを 1 本ずつへ。未確定文字列とキャレットは共有部品で入力欄の中に描き、長い名前は `…` で詰める。Esc / 確定で元のペインへ戻り、`on_mouse_down_out` で閉じ、見えない入力欄は打鍵を奪わない
-- 実測: セルフテスト項目 154（実マウスの入口 × 36 回・出力が流れている最中・外からの focus 移動）緑 / `TAKO_1725_LEGACY=1` で 1 回目から FAILED・番犬の注入 13 通り + 実ソースの逆戻りが `main.rs:13770` で名指し → 戻して緑
-
 ## 2026-09-26（#1728: 実行コマンドの切り詰めを文字境界へ寄せ、プレビュー描画の panic を直した）
 - Code Runner のツールチップ（`&cmd[..60]`）と実行メニュー（`&plan.command[..40]`）がバイト位置で切っていて、日本語のファイル名で描画中に panic していた。既存の文字数ベース `crate::truncate` へ寄せ、同じファイルの検索欄（`&text[..cursor]`。`tako preview-search` がクエリだけ差し替えるとカーソルが文字の途中に残る）も `floor_char_boundary` で丸めてから分ける
 - 実測: 修正前は単体 8 件 FAILED（7 件が `is not a char boundary`）→ 修正後 9 件 ok・番犬 `issue1728_byte_truncate_watchdog` は実ファイルへの注入 3 通りを file:line で名指し → 戻して緑・visual 節 `run-command-truncate` で修正前ビルドは例 1 を開いた時点で `preview_render.rs:2635` の panic（exit 134）、修正後は 3 か所を同じフレームで描いて完走・workspace 5424 passed（落ちた予算テスト 1 件は追記途中の本ファイルを読んだもので、移送後に単独で 13 ok）
@@ -65,3 +60,8 @@
 ## 2026-09-26（#1741: 追従スクロールとページ移動の可視行数を描いた行の実寸から数える 1 実装へ寄せた）
 - 追従は「器 − 上下余白 28px」÷ `theme.line_height`(17px)、Page は「器 − 14px」÷ 描いた行(21px) と別々に数えていた（修正前実測: 661px の器で実矩形 30 行を追従は 37 行・↓ で行 30〜36 のカーソルが画面外・Page Down は最下段に貼り付き）。`editor_scroll::visible_rows`（実寸を積む純関数）+ `preview_row_geometry` の 1 実装へ寄せ、追従・Page・IME の見積もりが使う。`viewport.visible_lines` を応答へ
 - 実測: 新節 `scripts/test-viewport-lines-1741.sh`（正解は実矩形）が修正前 FAIL=5 → 修正後 PASS=5（8 / 13 / 32pt で 49 / 30 / 12 行が一致・余白 3 行）・番犬 4 規則に注入 7 通りすべて file:line で FAILED・#1649 / #1652 の実 GUI スクリプト緑・workspace 5470 passed 0 failed・clippy 3 宇宙 0
+
+## 2026-09-26（#1677: ジャンプ履歴（戻る / 進む）を足した）
+- 行を指定した OpenFile が「飛ぶ前にいた場所」と着地点を積み、⌃- / ⌃⇧-（Windows は Ctrl+Alt+← / →。Ctrl+- は縮小のため）と CLI `tako jump back|forward|list` / MCP `tako_jump`（action の 1 ツール）が同じ dispatch で戻る / 進む。スタックは `tako_core::jump_history`（同じ行の連続を畳む・上限 100・閉じたペインは開き直す・消えたファイルは捨てる）。積む契機は行指定の open だけ・永続化しない
+- `OpenFile` の本体を `dispatch::open_file` へ移し、戻る / 進むの着地も同じ実装を通す（積まないのは `JumpRecord::Skip`）。#1398 の番犬を移動先を見る形へ直した。macOS の ⌃⇧- は shift が落ちて US = `ctrl-_` / JIS = `ctrl-=` で届くので 2 本張った
+- 実測: `scripts/test-jump-1677.sh` 31 PASS（CLI と MCP の応答が字面一致）・`test-jump-keys-1677.sh`（visual-test の打鍵経路）緑 + LEGACY で FAILED・注入 7 通りすべて file:line で FAILED → 戻して緑・workspace 5779 passed 0 failed・clippy 3 宇宙 0

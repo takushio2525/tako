@@ -291,6 +291,13 @@ pub(super) fn build_request(
             line: u64_arg(args, "line")?.map(|v| v as usize),
             column: u64_arg(args, "column")?.map(|v| v as usize),
         },
+        // #1677: 基準ペインは閉じたペインの項目を開き直すときだけ使うので、
+        // 呼び出し元が分からなくても失敗させない（dispatch がアクティブタブへ倒す）
+        "tako_jump" => Request::Jump {
+            action: str_arg(args, "action")?.unwrap_or_else(|| "list".to_string()),
+            pane: u64_arg(args, "pane")?.or(caller),
+            focus: bool_arg(args, "focus")?,
+        },
         "tako_preview_view" => Request::PreviewView {
             pane: Some(target_pane(args, caller)?),
             zoom: f32_arg(args, "zoom")?,

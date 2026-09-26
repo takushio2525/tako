@@ -713,6 +713,16 @@ pub const MATRIX: &[Feature] = &[
         ),
     },
     Feature {
+        // #1677: 履歴は OS 分岐を持たない純粋なスタックで、戻る / 進むの着地は
+        // OpenFile と同じ実装を通る。GUI のキーだけ OS で違う（Windows の Ctrl+- は縮小）
+        key: "tako_jump",
+        macos: Support::Supported,
+        windows: Support::Supported,
+        windows_evidence: Evidence::UnitTest(
+            "履歴の積み方・畳み方・上限・閉じたペインの開き直しは OS 分岐を持たない純粋関数で、jump_history の単体と dispatch の jump（行指定の open で積み、戻る / 進むで着地する）が CI の Windows ジョブで緑",
+        ),
+    },
+    Feature {
         key: "tako_lang",
         macos: Support::Supported,
         windows: Support::Supported,

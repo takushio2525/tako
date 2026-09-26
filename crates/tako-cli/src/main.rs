@@ -39,6 +39,15 @@ fn link_click() -> String {
     tako_core::platform::keys::link_click(tako_core::platform::support::Platform::current())
 }
 
+/// ジャンプ履歴の戻る / 進むの打鍵（#1677。実行中の OS の表記）
+fn jump_keys() -> (&'static str, &'static str) {
+    let platform = tako_core::platform::support::Platform::current();
+    (
+        tako_core::platform::keys::jump_back(platform),
+        tako_core::platform::keys::jump_forward(platform),
+    )
+}
+
 #[derive(Parser)]
 #[command(
     name = "tako",
@@ -92,6 +101,9 @@ enum Command {
     /// ファイルをプレビューペインで開く（コード = ハイライト表示、
     /// .md は既定でレンダリング表示。--mode code でソース表示へ切替）
     Open(OpenArgs),
+    /// ジャンプ履歴（行を指定して開いた位置）を戻る・進む・一覧する（Issue #1677）
+    #[command(subcommand)]
+    Jump(JumpCommand),
     /// PDF・画像プレビューのズーム・ページ・パン操作。引数なしで現在状態を表示する
     Preview(PreviewArgs),
     /// Markdown・PDF プレビューのアウトラインを表示し、項目へジャンプする
@@ -850,6 +862,47 @@ enum ChatCommand {
         #[arg(long)]
         list: bool,
     },
+}
+
+/// `tako jump`（#1677）。MCP は `action` 引数を持つ 1 ツール `tako_jump`
+#[derive(Subcommand)]
+enum JumpCommand {
+    /// 1 つ戻る（行を指定して開く前にいた場所へ）
+    #[command(about = format!("1 つ戻る（行を指定して開く前にいた場所へ。GUI は {}）", jump_keys().0))]
+    Back(JumpMoveArgs),
+    /// 1 つ進む
+    #[command(about = format!("1 つ進む（GUI は {}）", jump_keys().1))]
+    Forward(JumpMoveArgs),
+    /// 履歴の全項目と現在位置（行を指定して開くと積まれる）
+    List {
+        /// JSON のまま出す
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Args)]
+struct JumpMoveArgs {
+    /// 閉じたペインの項目を開き直すときの基準ペイン（省略時は呼び出し元）
+    #[arg(long)]
+    pane: Option<u64>,
+    /// 着地したペインへフォーカスを移す（省略時は元ペインを維持）
+    #[arg(long)]
+    focus: bool,
+    /// JSON のまま出す（MCP `tako_jump` と同じ応答）
+    #[arg(long)]
+    json: bool,
+}
+
+impl JumpCommand {
+    /// dispatch の action（綴りの正本は `dispatch::JUMP_ACTIONS`）
+    fn action(&self) -> &'static str {
+        match self {
+            Self::Back(_) => "back",
+            Self::Forward(_) => "forward",
+            Self::List { .. } => "list",
+        }
+    }
 }
 
 /// `tako lsp`（#1678）。MCP は `action` 引数を持つ 1 ツール `tako_lsp_server`
@@ -7089,6 +7142,21 @@ fn build_request(command: &Command) -> Result<Request, String> {
             max_mb: args.max_mb,
         },
         Command::Scrollback(args) => Request::Scrollback { lines: args.lines },
+        // #1677: 基準ペインは閉じたペインの項目を開き直すときだけ使う。tako の外から
+        // 叩いて呼び出し元が分からなくても失敗させない（dispatch がアクティブタブへ倒す）
+        Command::Jump(sub) => {
+            let (pane, focus) = match sub {
+                JumpCommand::Back(args) | JumpCommand::Forward(args) => {
+                    (args.pane.or_else(caller_pane), args.focus.then_some(true))
+                }
+                JumpCommand::List { .. } => (None, None),
+            };
+            Request::Jump {
+                action: sub.action().to_string(),
+                pane,
+                focus,
+            }
+        }
         Command::Lsp(sub) => {
             let (action, name) = sub.action();
             Request::LspServer {
@@ -9305,6 +9373,68 @@ fn delivery_line(result: &Value) -> Option<String> {
     Some(line)
 }
 
+/// `tako jump` の表示（#1677）。中身の正本は dispatch の応答で、ここは体裁だけ
+fn print_jump(sub: &JumpCommand, result: &Value) {
+    let place = |v: &Value| -> String {
+        let path = v["path"].as_str().unwrap_or("");
+        match v["line"].as_u64() {
+            Some(line) => format!("{path}:{line}"),
+            None => path.to_string(),
+        }
+    };
+    match sub {
+        JumpCommand::List { json: true } => println!("{}", pretty_json(result)),
+        JumpCommand::Back(args) | JumpCommand::Forward(args) if args.json => {
+            println!("{}", pretty_json(result))
+        }
+        JumpCommand::List { json: false } => {
+            let entries = result["entries"].as_array().cloned().unwrap_or_default();
+            if entries.is_empty() {
+                println!(
+                    "ジャンプ履歴は空（行を指定して開くと積まれる: tako open <file> --line <行>）"
+                );
+                return;
+            }
+            let current = result["history"]["current"].as_u64();
+            for (i, entry) in entries.iter().enumerate() {
+                let mark = if current == Some(i as u64) { ">" } else { " " };
+                let closed = if entry["pane_alive"] == Value::Bool(false) {
+                    "（ペインは閉じた。戻ると開き直す）"
+                } else {
+                    ""
+                };
+                println!(
+                    "{mark} {i:>3}  {}  pane {}{closed}",
+                    place(entry),
+                    entry["pane"]
+                );
+            }
+        }
+        JumpCommand::Back(_) | JumpCommand::Forward(_) => {
+            for gone in result["dropped"].as_array().into_iter().flatten() {
+                println!("読み飛ばした（ファイルが無い）: {}", place(gone));
+            }
+            if result["moved"] == Value::Bool(true) {
+                let reopened = if result["reopened"] == Value::Bool(true) {
+                    "（閉じたペインの項目なので開き直した）"
+                } else {
+                    ""
+                };
+                println!(
+                    "{}  pane {}{reopened}",
+                    place(&result["location"]),
+                    result["open"]["pane"]
+                );
+            } else {
+                println!(
+                    "{}",
+                    result["reason"].as_str().unwrap_or("移れる履歴が無い")
+                );
+            }
+        }
+    }
+}
+
 /// `tako lsp` の表示（#1678）。中身の正本は dispatch の応答で、ここは体裁だけ
 fn print_lsp(sub: &LspCommand, result: &Value) {
     if sub.json() || !matches!(sub, LspCommand::Status { .. } | LspCommand::Servers { .. }) {
@@ -9414,6 +9544,7 @@ fn print_result(command: &Command, result: &Value) {
         // #1283: 検出結果はスパンまで読みたいので整形して出す
         Command::Links(_) => println!("{}", pretty_json(result)),
         Command::Lsp(sub) => print_lsp(sub, result),
+        Command::Jump(sub) => print_jump(sub, result),
         Command::PreviewFollowLink(_) => println!("{result}"),
         // #680: コピーしたコード全文は改行込みで読みたいので整形して出す
         Command::PreviewCopyCode(_) => println!("{}", pretty_json(result)),
@@ -10249,6 +10380,33 @@ mod tests {
                 Request::LspServer {
                     action: action.into(),
                     name: name.map(str::to_string),
+                }
+            );
+        }
+        // #1677: `tako jump <操作>` は action の綴りを dispatch の正本と共有する。
+        // list は基準ペインもフォーカスも持たない（読むだけ）
+        for (argv, action, pane, focus) in [
+            (vec!["tako", "jump", "list"], "list", None, None),
+            (
+                vec!["tako", "jump", "back", "--pane", "5"],
+                "back",
+                Some(5),
+                None,
+            ),
+            (
+                vec!["tako", "jump", "forward", "--pane", "5", "--focus"],
+                "forward",
+                Some(5),
+                Some(true),
+            ),
+        ] {
+            assert!(tako_control::dispatch::JUMP_ACTIONS.contains(&action));
+            assert_eq!(
+                build_request(&parse(&argv)).unwrap(),
+                Request::Jump {
+                    action: action.into(),
+                    pane,
+                    focus,
                 }
             );
         }

@@ -36,6 +36,28 @@ pub fn save_preview(platform: Platform) -> &'static str {
     }
 }
 
+/// ジャンプ履歴を戻る打鍵（FR-3.29 / #1677）。
+///
+/// Windows の `Ctrl+-` は縮小（ZoomOut）に使っているので、JetBrains 系と同じ
+/// `Ctrl+Alt+←` に置く（理由の全文は tako-app の `keybindings::jump_bindings`）。
+pub fn jump_back(platform: Platform) -> &'static str {
+    match platform {
+        Platform::MacOs => "\u{2303}-",
+        Platform::Windows => "Ctrl+Alt+\u{2190}",
+    }
+}
+
+/// ジャンプ履歴を進む打鍵（FR-3.29 / #1677）。
+///
+/// macOS の `⌃⇧-` は配列によって届く字面が変わる（US = `ctrl-_` / JIS = `ctrl-=`）ので
+/// バインドは 2 本あるが、案内は**押す形**の 1 本だけを出す。
+pub fn jump_forward(platform: Platform) -> &'static str {
+    match platform {
+        Platform::MacOs => "\u{2303}\u{21e7}-",
+        Platform::Windows => "Ctrl+Alt+\u{2192}",
+    }
+}
+
 /// tako を終了する打鍵。
 pub fn quit(platform: Platform) -> &'static str {
     match platform {
