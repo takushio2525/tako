@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-09-27（#1662: `--wait` に上限を持たせ、auto_close を GUI の終了検知で効かせ、CLI / MCP の run も走らせる前に保存するようにした）
-- `--wait` は `probe::poll_with_timeout` の 1 実装（既定 600 秒・env `TAKO_RUN_WAIT_TIMEOUT_SECS`・0 は既定）で、超えたら「まだ実行中」+ exit 1。閉じるのは `dispatch::auto_close_run_pane` の 1 本（GUI の出力のたび / 2 秒ごと / `RunInteractiveStatus`）で、閉じた結末は `Workspace::closed_runs` に控える。保存は dispatch `Run` の `save_previews_before_run` の 1 本へ寄せ、再生ボタンの自前保存を外した
-- 実測: `scripts/test-run-wait-save-1662.sh` **32 PASS 0 FAIL**（修正前のバイナリは 14 PASS 18 FAIL = 上限 3 秒でも 15 秒の締め切りまで返らない / `--wait` 無しで閉じない / CLI・MCP とも古い内容が走る）・注入 4 通りすべて file:line 名指しで FAILED → 戻して緑
-
 ## 2026-09-27（#1507: setup の末尾にスマホからの接続の状態を 1 行出し、未導入は依存の導入口へ寄せた）
 - 末尾は Tailscale の有無に関係なく固定文 `スマホからリモート接続するには: tako remote setup`（棚卸し Z17）。`remote_setup::setup_summary_lines` が `check_status`（読み取りのみ）の JSON から状態を決めて `スマホからの接続: …` を 1 行出す（10 通り。未導入は `setup_deps::next_step_line` = 依存チェック段と同じ文面・途中までは `tako remote setup`・公開済みは URL）。導入を聞くのは依存段の 1 回だけ
 - 待ちに上限: 検出の `tailscale --version` を `probe::output_with_timeout` へ寄せ、`status --json` の打ち切りを `RunError::TimedOut` の型で持つ（`DaemonNotRunning` へ畳まず `timeouts` へ）。実測: `scripts/test-setup-remote-status-1507.sh` 41 PASS（修正前の tako で 15 FAIL）・時間切れでも 11 秒で完走・打ち切った子 0・番犬 6 本へ注入 4 通りが file:line で FAILED → 戻して緑
@@ -60,3 +56,7 @@
 ## 2026-09-27（#1797: setup の依存段が tailscale を remote と同じ検出で探すようにした）
 - 依存段（`setup_deps::resolve`）は tailscale を PATH だけで探し、PATH 外の App Store 版を「見つかりません」→ `--yes` で brew 版まで入れていた（#1038 の 2 系統同居）。正本 `tailscale::detect_tailscale`（Runnable / Unrunnable / Absent）を足して依存段・`find_tailscale`・remote setup [1/5] が読む。在るが動かない CLI は導入済みと読み入れ直させない。`run_tailscale_within` の自前の待ち（子の終了後に join）は `probe::output_with_timeout` へ寄せた
 - 実測: `scripts/test-setup-tailscale-detect-1797.sh` 55 PASS（修正前の tako で 25 FAIL = PATH 外で brew 1 回 → 0 回 / 孫がパイプを握る tailscale で 60 秒の締め切り → 5 秒）・番犬 6 本へ注入 5 通りが file:line で FAILED → 戻して緑・setup 系の隔離 10 本全緑（1499 / 1505 は tailscale を `TAKO_TAILSCALE_BIN` で閉じ込めるよう直した）・workspace 5919 passed 0 failed・clippy 3 宇宙 0・check-windows 0
+
+## 2026-09-27（#1783: TAKO_VD_NAME に物理画面の名前を渡しても tako-vd と見なさないようにし、面の指定の判定を面を起こす前へ移した）
+- `ensure` の締めの先頭に「器が作った仮想ディスプレイか」（内蔵 = CGDisplayIsBuiltin / 器の一覧に名前が無い）を置き、物理画面なら終了コード 3 と理由 1 行で断る（修正前はスタブ実測で rc=0・その面の uuid を記録・内蔵なら器へ main を撃っていた）。ヘルパは 3 を使い方の誤り（2）として返し、`TAKO_DISPLAY` の判定を面を起こす前へ移した（uuid の記録との突き合わせだけは起こした後。FR-4.8.20〜22）
+- 実測: 注入 9 通りすべて file:line 名指しで FAILED → 戻して緑・モック 154 PASS（/bin/bash 3.2）・本物の tako-vd で ensure rc=0（構成の前後差分なし）・書き方の誤った `TAKO_DISPLAY` は ensure を呼ばず 0.01 秒で rc=2

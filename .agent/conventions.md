@@ -3218,7 +3218,7 @@ CI で特定の語も見張りたいときは `TAKO_PII_TERMS`（`,` 区切り�
 ```sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
 isolated_gui_bins                     # TAKO_BIN / APP_BIN を決める（無ければビルド）
-launch_isolated_gui "$TMP/app.log" || exit $?   # 印の判定 → ensure → 面の指定の判定 → 起動（pid は $ISOLATED_GUI_PID）
+launch_isolated_gui "$TMP/app.log" || exit $?   # 印と面の指定の判定 → ensure → uuid の突き合わせ → 起動（pid は $ISOLATED_GUI_PID）
 wait_isolated_gui "$TMP/app.log"      # `tako list` が通るまで待つ（任意）
 stop_isolated_gui                     # 自分で起こした pid だけを落とす
 ```
@@ -3248,16 +3248,18 @@ OS の一覧に無い（`bounds` で読み戻す）ときは、`launch_isolated_
 同じで、**既定の面で続行する道は作らない**。`TAKO_DISPLAY` を手で渡しても面を用意できなければ
 起動しない（狙いが `tako-vd` なら見失っているし、別の面ならユーザーの画面へ出す）。
 
-**`tako-vd` 以外の面の明示は通さない**（#1760）。面を用意できても、`launch_isolated_gui` は
+**`tako-vd` 以外の面の明示は通さない**（#1760）。`launch_isolated_gui` は
 GUI へ渡す `TAKO_DISPLAY`（呼び出し側の `VAR=VAL` → export → 既定の `tako-vd` の順で 1 つに
-決めた値）を起動の前に判定し、通さない値なら窓を開かずに**終了コード 2**で返して
+決めた値）を**面を起こす前に**判定し（#1783）、通さない値なら窓を開かずに**終了コード 2**で返して
 stderr へ「ERROR: TAKO_DISPLAY=… は通さない…」を 1 行出す（4 = 未実測とは分ける。書き方の誤りを
-未実測と読ませない）。通すのは表の上 4 行だけで、opt-in で別の面を通す口は作らない:
+未実測と読ませない。面を用意できない機でも 2 になる）。**uuid の記録との突き合わせだけは面を起こした後**
+（記録は `ensure` の締めが書くので、起こす前に読むと初回や面の作り直しでいまの `tako-vd` の uuid を断る。
+起こす前は uuid の形だけを見る）。通すのは表の上 4 行だけで、opt-in で別の面を通す口は作らない:
 
 | 値 | 通すか | 理由 |
 |---|---|---|
 | `tako-vd`（大文字小文字・前後の空白は無視） | 通す | tako は名前で `tako-vd` に当てる |
-| `ensure` が記録した `tako-vd` の uuid | 通す | 記録が無い・違う uuid は通さない |
+| `ensure` が記録した `tako-vd` の uuid | 通す | 記録が無い・違う uuid は通さない（突き合わせは面を起こした後） |
 | 空（`TAKO_DISPLAY=`） | 通す | tako の定義で未指定 = 検証用の既定で `tako-vd` を探す |
 | `index:N` / `N`（N ≥ 100） | 通す | 実在し得ない面。tako は見失って窓を開かずに 4 で終わる |
 | `0` / `index:1` など N < 100 の index | 通さない | 並びは起動までに変わりうる。`tako-vd` を指していても通さない |
@@ -3266,6 +3268,15 @@ stderr へ「ERROR: TAKO_DISPLAY=… は通さない…」を 1 行出す（4 = 
 「わざと当たらない面」を指したい検査は `TAKO_DISPLAY=index:999` を使う
 （`test-display-uuid-1697.sh` の ④）。面の名前は面を用意する係と同じ `TAKO_VD_NAME` だけを見て、
 ヘルパ側で別に差し替える口（旧 `ISOLATED_GUI_DISPLAY` の上書き）は無い。
+
+**`TAKO_VD_NAME` に物理画面の名前を渡しても `tako-vd` と見なさない**（#1783）。面の名前の正本が
+`TAKO_VD_NAME` なので、以前はそこへ内蔵ディスプレイ等の名前を入れると `ensure` がその面を成功で返し、
+ヘルパもその名前を通していた（名前 1 つの取り違えで物理画面を指せる口）。`ensure` の締めは最初に
+「器が作った仮想ディスプレイか」を確かめ、**内蔵（`CGDisplayIsBuiltin`）**か**器の仮想スクリーン一覧に
+その名前が無い**なら**終了コード 3** と理由 1 行で断る（uuid の記録・Main 保護へ進まない）。器に聞けず
+確かめられないときも通さない（1）。ヘルパは 3 を「使い方の誤り」として**終了コード 2**で返し、stderr へ
+「ERROR: TAKO_VD_NAME=… は仮想ディスプレイではない…」を 1 行出す。`TAKO_VD_NAME` を上書きしてよいのは
+器が作る（作った）仮想ディスプレイの名前だけ。
 
 **検証用 GUI の印（`TAKO_ISOLATED`）は偽にできない**（#1784）。`launch_isolated_gui` は GUI へ常に
 `TAKO_ISOLATED=1` を渡し、`TAKO_DISPLAY` と同じく呼び出し側の `VAR=VAL` より後ろに置く（以前は
@@ -3289,8 +3300,11 @@ PASS と読ませないため。真偽の読み方は tako の `is_verification_
 file:line を名指して落ちる（除外はヘルパ自身と `test-virtual-display-guard.sh` だけ）。
 起動の失敗を拾っていない呼び出し（#1744）と、ヘルパが面を用意できないのに起動する形、
 `tako-vd` 以外の面の明示を通す形（#1760）、偽の `TAKO_ISOLATED` を通す形・GUI へ届く印が `1` で
-ない形（#1784）も落とす（後の 3 つはヘルパを `/bin/bash` で実際に走らせ、`ISOLATED_GUI_VD` で
-偽の係を注入して偽の GUI が起きないこと・受け取った env を見る）。
+ない形（#1784）、面の指定の判定が面を起こした後へ戻る形・係の「物理画面」（3）を未実測（4）と読む形
+（#1783）も落とす（後の 4 つはヘルパを `/bin/bash` で実際に走らせ、`ISOLATED_GUI_VD` で
+偽の係を注入して偽の GUI が起きないこと・受け取った env・係の `ensure` が呼ばれたかを見る）。
+`ensure` 自体が物理画面の名前で断ることは `crates/tako-control/tests/virtual_display_watchdog.rs` が
+本物の `virtual-display.sh` を画面と器のスタブの下で走らせて見る。
 
 **眠った状態を手で再現する**（受け入れ検査用）: `pmset displaysleepnow` を撃つと面が眠り、
 `virtual-display.sh status` が「眠っている」に変わる（蓋閉じで内蔵が居ない機なら
