@@ -14,6 +14,9 @@
 #   ③ 同じファイルの 2 ペイン目: didOpen は 1 回・2 つ目のペインにも加わった直後から診断が出る
 #      （`drawn`）・片方の編集は 1 文書の didChange・読み取り表示のペインは持ち手にならない・
 #      片方を閉じても開いたまま・両方閉じると didClose が 1 回
+#   ④ 外部変更（#1659 との合流）: 未編集のペインがディスクへ黙って追従したとき・編集済みのペインが
+#      競合から `tako edit reload` で読み直したときに、didChange の版が進み、サーバの本文が
+#      ディスクの送る形に追いつく（競合のあいだは編集中の本文のまま）
 #
 # 使い方: bash scripts/test-lsp-followup-1769.sh
 #
@@ -54,6 +57,11 @@ cargo build -q -p tako-cli -p tako-control --bin tako --bin tako-lsp-fake 2>/dev
 isolated_gui_bins || exit 1
 FAKE="$(dirname "$APP_BIN")/tako-lsp-fake"
 [ -x "$FAKE" ] || { echo "偽サーバが無い: $FAKE"; exit 1; }
+# 作り直した直後の実行ファイルは macOS が初回の起動を検査で待たせる（実測 4.6 秒。2 回目から 0.02 秒）。
+# ② で初めて起こすと、その待ちが「開いてから診断が出るまで」の窓を食って間欠的に落ちるので、先に 1 回起こす
+W0="$(python3 -c 'import time; print(int(time.time() * 1000))')"
+"$FAKE" </dev/null >/dev/null 2>&1 || true
+echo "  観測: 偽サーバの初回の起動 $(($(python3 -c 'import time; print(int(time.time() * 1000))') - W0)) ms"
 
 mkdir -p "$TMP/home" "$TMP/zdot" "$TMP/disc" "$TMP/orch" "$TMP/bin" "$TMP/proj/src"
 # 証拠ログに実ユーザー名・実ホスト名を写さない（#927）
@@ -402,6 +410,75 @@ check_eq "両方閉じると didClose が 1 回" "1" "$(received_count textDocum
 check_eq "保持している診断は 0" "(0, 0)" \
   "$("$TAKO_BIN" lsp diagnostics --json | json '(d["retained"]["diagnostics"], d["retained"]["documents"])')"
 [ -n "$C" ] && { "$TAKO_BIN" close --pane "$C" --force >/dev/null 2>&1 || true; }
+
+echo
+echo "== ④ 外部変更（#1659 との合流）: 未編集の追従・読み直しでもサーバの本文が追いつく =="
+# 読み直しは `apply_edit` を通る 1 回の編集なので版が進み、didChange が飛ぶはず。飛ばないと
+# サーバの本文がディスクより古いまま残る（診断・定義ジャンプが古い本文で答える）
+"$TAKO_BIN" preview-reload on >/dev/null 2>&1
+wait_server_matches() { # ファイル uri の末尾
+  for _ in $(seq 1 150); do
+    [ "$(server_matches_wire "$1" "$2")" = "True" ] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+# 偽サーバが受けた didChange の版の最大（uri の末尾で絞る）
+last_change_version() {
+  python3 -c '
+import json, sys
+v = 0
+for line in open(sys.argv[1], encoding="utf-8"):
+    try:
+        m = json.loads(line)
+    except Exception:
+        continue
+    doc = (m.get("params") or {}).get("textDocument") or {}
+    if m.get("method") == "textDocument/didChange" and doc.get("uri", "").endswith(sys.argv[2]):
+        v = max(v, doc.get("version", 0))
+print(v)' "$TMP/received.jsonl" "$1" 2>/dev/null || echo 0
+}
+conflict_state() {
+  "$TAKO_BIN" edit status --pane "$1" 2>/dev/null | json '(d.get("conflict") or {}).get("state")'
+}
+EXT="$TMP/proj/src/ext.rs"
+printf 'fn one() {}\n' > "$EXT"
+D="$("$TAKO_BIN" open "$EXT" --pane "$ROOT" --right 2>/dev/null | json 'd["pane"]')"
+[ -n "$D" ] || { echo "ext.rs を開けない"; exit 1; }
+"$TAKO_BIN" edit start --pane "$D" >/dev/null
+"$TAKO_BIN" edit autosave false --pane "$D" >/dev/null 2>&1
+wait_server_matches "$EXT" ext.rs
+check_eq "開いた直後: サーバの本文 = ディスク" "True" "$(server_matches_wire "$EXT" ext.rs)"
+V0="$(last_change_version ext.rs)"
+# (a) 未編集のままディスクを書き換える → 黙って追従する（単独 CR を混ぜて送る形まで見る）
+printf 'fn one() {}\r// outside A\n' > "$EXT"
+wait_server_matches "$EXT" ext.rs
+check_eq "未編集の追従: サーバの本文 = ディスクの送る形" "True" "$(server_matches_wire "$EXT" ext.rs)"
+VA="$(last_change_version ext.rs)"
+check_eq "未編集の追従で didChange の版が進む（${V0} → ${VA}）" "1" \
+  "$([ "$VA" -gt "$V0" ] && echo 1 || echo 0)"
+# (b) 編集してから外で書き換える → 競合 → `tako edit reload` で読み直す
+"$TAKO_BIN" edit replace-range 1:0 1:0 "// mine " --pane "$D" >/dev/null
+for _ in $(seq 1 100); do
+  [ "$(last_change_version ext.rs)" -gt "$VA" ] && break
+  sleep 0.1
+done
+VB="$(last_change_version ext.rs)"
+printf 'fn two() {}\r// outside B\n' > "$EXT"
+for _ in $(seq 1 150); do
+  [ "$(conflict_state "$D")" = "changed" ] && break
+  sleep 0.1
+done
+check_eq "編集済みのペインは追従せず競合になる" "changed" "$(conflict_state "$D")"
+check_eq "競合のあいだサーバの本文は編集中の本文のまま（ディスクと違う）" "False" \
+  "$(server_matches_wire "$EXT" ext.rs)"
+"$TAKO_BIN" edit reload --pane "$D" >/dev/null
+wait_server_matches "$EXT" ext.rs
+check_eq "読み直し: サーバの本文 = ディスクの送る形" "True" "$(server_matches_wire "$EXT" ext.rs)"
+VR="$(last_change_version ext.rs)"
+check_eq "読み直しで didChange の版が進む（${VB} → ${VR}）" "1" \
+  "$([ "$VR" -gt "$VB" ] && echo 1 || echo 0)"
+"$TAKO_BIN" close --pane "$D" --force >/dev/null 2>&1 || true
 
 stop_isolated_gui "$APP_PID"
 APP_PID=""

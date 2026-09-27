@@ -64,4 +64,4 @@
 
 ## 2026-09-27（#1769: LSP S1 の続き = 単独 CR・同じファイルの 2 ペイン目・サーバ解決のキャッシュ）
 - LSP の行を仕様どおり単独 CR でも区切り、送る本文の単独 CR を LF に揃えた（実測: rust-analyzer / clangd の問い合わせは `\n` だけ・clangd の診断 / pyright / TS は仕様どおり）。同じファイルは 1 URI = 1 文書を持ち手で共有（didOpen / didClose は最初 / 最後だけ・版は単調）。解決はキャッシュし、restart・シェル統合の合図（cwd 変化 / コマンド終了）・パス消失で引き直す。探索は #1730 と同じ `exe::find_with_timeout`（上限つき）の 1 実装へ合流で寄せた
-- 実測: 隔離 GUI の実経路 41 PASS 0 FAIL（servers 1 回目 1075 ms → 2 回目 33 ms）・注入 15 通りすべて FAILED → 戻して緑。限界: rust-analyzer の flycheck 診断は単独 CR の後ろでずれる（rustc が `\n` だけで数える = 実測）
+- 実測: 隔離 GUI の実経路 48 PASS 0 FAIL（servers 1 回目 1075 ms → 2 回目 33 ms・#1659 の追従 / 読み直しでも didChange が飛ぶ）・注入 15 通りすべて FAILED → 戻して緑。限界: rust-analyzer の flycheck 診断は単独 CR の後ろでずれる（rustc が `\n` だけで数える = 実測）
