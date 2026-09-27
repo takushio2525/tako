@@ -29427,7 +29427,11 @@ mod tests {
             .expect("RunResolve は offload の対象")
             .expect("文脈を採れる");
         assert!(matches!(job, OffloadJob::RunResolve { .. }));
-        let mut offloaded = job.run().unwrap();
+        // 受け口（IPC / GUI）と同じ入口を通す。UI スレッドの続きは要らない = そのまま応答
+        let mut offloaded = match job.run_staged() {
+            OffloadOutcome::Reply(result) => result.unwrap(),
+            OffloadOutcome::OnUi(_) => panic!("RunResolve は UI スレッドの続きを要らない"),
+        };
         let mut sync = dispatch(&mut host, req, PaneOrigin::Mcp).unwrap();
         // 所要（ms）は回ごとに違うので落として比べる
         for v in [&mut offloaded, &mut sync] {
