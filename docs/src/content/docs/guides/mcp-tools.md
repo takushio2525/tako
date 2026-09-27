@@ -79,7 +79,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_lsp_server` | 言語サーバ（LSP）の状態と起動・停止（`action` = status / list / restart / stop / logs。編集モードで自動的に起きる） |
 | `tako_preview_move` | 編集カーソルを単語・行・ページ・文書端の単位で動かす（`select` で選択を伸ばす） |
 | `tako_preview_delete` | 単語・行単位で消す（選択があれば選択を消す） |
-| `tako_preview_save` | 未保存の編集をファイルへ保存する |
+| `tako_preview_save` | 未保存の編集をファイルへ保存する。ディスク側が外で変わっていたら書かずに断り、`action` で抜ける（`overwrite` = 自分の変更で上書き / `reload` = ディスクから読み直す / `diff` = ディスク → 編集中の差分を返すだけ） |
 | `tako_preview_undo` / `tako_preview_redo` | 編集バッファの undo / redo（ディスクへ書くのは `tako_preview_save`） |
 | `tako_preview_search` / `tako_preview_replace` | テキストの検索 / 置換（**既定は大文字小文字を区別する**。`case_sensitive: false` で区別しない・`whole_word: true` で単語単位。検索で `query` を省略したときは今の条件を引き継ぐ） |
 | `tako_preview_autosave` | 編集の自動保存設定 |

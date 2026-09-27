@@ -1403,6 +1403,8 @@ impl TakoApp {
             replace_text: String,
             replace_cursor: usize,
             ime_text: Option<String>,
+            conflict: Option<preview::DiskConflict>,
+            conflict_diff: Option<std::sync::Arc<tako_core::DiskDiff>>,
         }
         let ime_for_search = self
             .ime
@@ -1431,6 +1433,8 @@ impl TakoApp {
             } else {
                 None
             },
+            conflict: edit.conflict,
+            conflict_diff: edit.conflict_diff.clone(),
         });
         let editing = edit_snap.as_ref().is_some_and(|s| s.editing);
         let dirty = edit_snap.as_ref().is_some_and(|s| s.dirty);
@@ -1442,6 +1446,19 @@ impl TakoApp {
         // item を組み直すので、ここでキャプチャすると古い位置が焼き付く）
         let save_status = edit_snap.as_ref().and_then(|s| s.save_status.clone());
         let autosave = edit_snap.as_ref().is_some_and(|s| s.autosave);
+        // #1659: 外部変更の競合の帯（タイトルバーの直下）
+        let conflict = edit_snap.as_ref().and_then(|s| s.conflict);
+        let conflict_bar = edit_snap.as_ref().and_then(|s| {
+            let conflict = s.conflict?;
+            Some(self.render_conflict_bar(
+                pane_id,
+                conflict,
+                s.conflict_diff.clone(),
+                s.autosave,
+                &theme,
+                cx,
+            ))
+        });
         let search_visible = edit_snap.as_ref().is_some_and(|s| s.search_visible);
         let search_focus = edit_snap
             .as_ref()
@@ -2563,7 +2580,11 @@ impl TakoApp {
                                             hsla(theme.tab_inactive_foreground)
                                         })
                                         .child(SharedString::from({
-                                            let suffix = if autosave {
+                                            // #1659: 競合は自動保存の設定によらず出す
+                                            // （undo / redo が `save_status` を消しても残る）
+                                            let suffix = if conflict.is_some() {
+                                                crate::ui_text::preview::conflict_suffix()
+                                            } else if autosave {
                                                 match &save_status {
                                                     Some(preview::SaveStatus::Saved) => {
                                                         crate::ui_text::preview::saved_suffix()
@@ -3143,7 +3164,7 @@ impl TakoApp {
                                         )
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             cx.stop_propagation();
-                                            let _ = this.save_preview_local(pane_id);
+                                            let _ = this.save_preview_local(pane_id, false);
                                             cx.notify();
                                         }))
                                         .child(crate::ui_text::preview::save_with_key(
@@ -3190,6 +3211,7 @@ impl TakoApp {
                             ),
                     )
             })
+            .children(conflict_bar)
             .children(navigation_panel.map(|panel| {
                 let (label, rows): (&str, Vec<gpui::AnyElement>) = match panel {
                     PreviewNavigationPanel::Outline => {
@@ -4954,6 +4976,199 @@ impl TakoApp {
             );
         }
         elements
+    }
+
+    /// 外部変更の競合の帯（#1659）。タイトルバーの直下に出し、2 択と差分を置く。
+    ///
+    /// ボタンは CLI / MCP と同じ口を呼ぶ（上書き = `save_preview_local(force)` =
+    /// `tako edit save --force`、読み直し = `revert_preview_local` = `tako edit reload`、
+    /// 差分 = `TextBuffer::disk_diff` = `tako edit diff`）。印は絵文字を使わず GPUI の矩形で描く
+    fn render_conflict_bar(
+        &self,
+        pane_id: PaneId,
+        conflict: preview::DiskConflict,
+        diff: Option<std::sync::Arc<tako_core::DiskDiff>>,
+        autosave: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let deleted = conflict.state == tako_core::DiskState::Deleted;
+        let key = pane_id.as_u64();
+        // 実矩形は visual-test が実マウスで押すために記録する（キーは `<id>-<ペイン>`。
+        // 検索欄のトグルと同じ置き方 = #1653）
+        let button = |id: &'static str, label: &'static str| {
+            let probe = self.panel_click_probe_bounds.clone();
+            let probe_key = format!("{id}-{key}");
+            div()
+                .id((id, key))
+                .relative()
+                .flex_none()
+                .px(px(6.0))
+                .py(px(1.0))
+                .rounded_sm()
+                .cursor_pointer()
+                .border_1()
+                .border_color(hsla_alpha(theme.yellow, 0.5))
+                .text_color(hsla(theme.foreground))
+                .hover(|d| d.bg(rgba_alpha(theme.yellow, 0.2)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                )
+                .child(label)
+                // 記録は上書きのみ（render 冒頭でクリアすると空を読む窓ができる。#315）
+                .child(
+                    canvas(
+                        |_, _, _| (),
+                        move |bounds, _, _, _| {
+                            probe.borrow_mut().insert(probe_key.clone(), bounds);
+                        },
+                    )
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+                )
+        };
+        let message = if deleted {
+            crate::ui_text::preview::conflict_deleted()
+        } else {
+            crate::ui_text::preview::conflict_changed()
+        };
+        // 文面の行とボタンの行を分ける（半幅のペインでもボタンに押されて文面が切れない）
+        let notice = div()
+            .flex()
+            .flex_row()
+            .items_start()
+            .gap(px(6.0))
+            .px(px(8.0))
+            .pt(px(4.0))
+            // 印: 黄色の縦棒（GPUI の矩形。絵文字・記号の字形に頼らない）
+            .child(
+                div()
+                    .flex_none()
+                    .mt(px(1.0))
+                    .w(px(3.0))
+                    .h(px(14.0))
+                    .rounded(px(1.5))
+                    .bg(hsla(theme.yellow)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_color(hsla(theme.foreground))
+                    .child(SharedString::from(if autosave {
+                        format!(
+                            "{message} \u{00B7} {}",
+                            crate::ui_text::preview::conflict_autosave_paused()
+                        )
+                    } else {
+                        message.to_string()
+                    })),
+            );
+        let row = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .justify_end()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(8.0))
+            .py(px(4.0))
+            .child(
+                button(
+                    "preview-conflict-diff",
+                    if diff.is_some() {
+                        crate::ui_text::preview::conflict_hide_diff()
+                    } else {
+                        crate::ui_text::preview::conflict_show_diff()
+                    },
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.toggle_conflict_diff(pane_id);
+                    cx.notify();
+                })),
+            )
+            .child(
+                button(
+                    "preview-conflict-overwrite",
+                    if deleted {
+                        crate::ui_text::preview::conflict_recreate()
+                    } else {
+                        crate::ui_text::preview::conflict_overwrite()
+                    },
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    // ⌘S と同じく、リモート由来なら背景で押し出す（#966）
+                    if this.save_preview_local(pane_id, true).is_ok() {
+                        this.push_preview_remote_async(pane_id, cx);
+                    }
+                    cx.notify();
+                })),
+            )
+            .when(!deleted, |d| {
+                d.child(
+                    button(
+                        "preview-conflict-reload",
+                        crate::ui_text::preview::conflict_reload(),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        if let Err(message) = this.revert_preview_local(pane_id) {
+                            if let Some(edit) = this.preview_edits.get_mut(&pane_id) {
+                                edit.message = Some(message);
+                            }
+                        }
+                        cx.notify();
+                    })),
+                )
+            });
+        let body = diff.map(|diff| {
+            let legend =
+                crate::ui_text::preview::conflict_diff_legend(diff.diff.added, diff.diff.removed);
+            div()
+                .id(("preview-conflict-diff-body", key))
+                .max_h(px(240.0))
+                .overflow_y_scroll()
+                .border_t_1()
+                .border_color(hsla_alpha(theme.yellow, 0.3))
+                .child(
+                    div()
+                        .px_4()
+                        .py(px(2.0))
+                        .text_xs()
+                        .text_color(hsla_alpha(theme.foreground, 0.6))
+                        .child(SharedString::from(legend)),
+                )
+                .child(self.render_changelog_diff(&diff.diff.hunks, theme))
+                .when(diff.diff.truncated, |d| {
+                    d.child(
+                        div()
+                            .px_4()
+                            .py(px(2.0))
+                            .text_xs()
+                            .text_color(hsla_alpha(theme.foreground, 0.6))
+                            .child(crate::ui_text::preview::conflict_diff_truncated()),
+                    )
+                })
+        });
+        div()
+            .id(("preview-conflict", key))
+            .flex_none()
+            .w_full()
+            .flex()
+            .flex_col()
+            .text_size(px(11.0))
+            .bg(rgba_alpha(theme.yellow, 0.12))
+            .border_b_1()
+            .border_color(hsla_alpha(theme.yellow, 0.5))
+            .child(notice)
+            .child(row)
+            .children(body)
+            .into_any_element()
     }
 
     /// チェンジログの diff 展開描画

@@ -388,9 +388,23 @@ pub(super) fn build_request(
             motion: str_arg(args, "motion")?.ok_or("motion を指定する")?,
             expected_version: u64_arg(args, "expected_version")?,
         },
-        "tako_preview_save" => Request::PreviewSave {
-            pane: Some(target_pane(args, caller)?),
-        },
+        // #1659: ツールを増やさず action で外部変更の後の逃げ道を表す
+        // （overwrite = CLI の save --force / reload = edit reload / diff = edit diff）
+        "tako_preview_save" => {
+            let pane = Some(target_pane(args, caller)?);
+            match str_arg(args, "action")?.as_deref() {
+                None | Some("save") => Request::PreviewSave { pane, force: false },
+                Some("overwrite") => Request::PreviewSave { pane, force: true },
+                Some("reload") => Request::PreviewRevert { pane },
+                Some("diff") => Request::PreviewDiff { pane },
+                Some(other) => {
+                    return Err(format!(
+                        "action は {} のどれか（{other:?} は無い）",
+                        crate::dispatch::PREVIEW_SAVE_ACTIONS.join(" / ")
+                    ))
+                }
+            }
+        }
         "tako_preview_undo" => Request::PreviewUndo {
             pane: Some(target_pane(args, caller)?),
         },

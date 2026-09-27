@@ -427,6 +427,28 @@ pub struct EditState {
     /// 直前の打鍵で表示行のどこを差し替えたか（#1660）。描画はこれを写して
     /// 行テキストを全行作り直さない（10 万行で 1 打鍵 7.2ms）
     pub line_splice: Option<LineSplice>,
+    /// 外部変更の競合（#1659）。立っているあいだは**自動保存を止め**（[`Self::autosave_due`]）、
+    /// タイトルバーの下の帯で「上書き保存 / 読み直す / 差分」を出す
+    pub conflict: Option<DiskConflict>,
+    /// 帯で広げている差分（#1659）。広げたときに 1 回だけ作り、競合が変わる・解けると捨てる
+    pub conflict_diff: Option<Arc<tako_core::DiskDiff>>,
+}
+
+/// 編集中のファイルが外で書き換わった / 消された（#1659）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskConflict {
+    /// `Changed` か `Deleted`
+    pub state: tako_core::DiskState,
+    /// 利用者へ知らせた回数。検知した 1 回だけ知らせる（状態が変わったらもう 1 回）
+    pub notices: u32,
+}
+
+/// `TAKO_1659_LEGACY=1` で **#1659 前の挙動**へ戻す（同一バイナリで A/B を取る入口）:
+/// 競合中も自動保存を止めない（= 500ms ごとに同じ競合を知らせ直す）・未編集の編集セッションも
+/// ディスクへ追従しない・未保存のプレビューへ別のファイルを開こうとして断られる。
+/// 判定は dispatch の 1 実装（`OpenFile` の差し替え回避も同じ口で戻る）
+pub fn external_change_legacy() -> bool {
+    tako_control::dispatch::external_change_legacy()
 }
 
 /// 表示行の差し替え 1 回ぶん（#1660）。版 `from_rev` の表示行の `range` を `inserted` 行で
@@ -498,7 +520,46 @@ impl EditState {
             lsp: tako_control::lsp::DocLink::default(),
             diagnostics: None,
             line_splice: None,
+            conflict: None,
+            conflict_diff: None,
         })
+    }
+
+    /// 外部変更の競合を記録する（#1659）。**知らせるのは新しく分かったときだけ**で、
+    /// 同じ状態を何度検知しても回数は増えない（修正前は自動保存が 500ms ごとに
+    /// 同じ競合を出し続けた）。知らせたら `true`
+    pub fn note_conflict(&mut self, state: tako_core::DiskState) -> bool {
+        if self.conflict.is_some_and(|c| c.state == state) && !external_change_legacy() {
+            return false;
+        }
+        let notices = self.conflict.map_or(0, |c| c.notices).saturating_add(1);
+        self.conflict = Some(DiskConflict { state, notices });
+        self.save_status = Some(SaveStatus::Conflict);
+        // 帯が文面を持つので、ヘッダの一時表示（「保存しました」等）は残さない
+        self.message = None;
+        self.conflict_diff = None;
+        true
+    }
+
+    /// 競合が解けた（#1659。上書き・読み直し・外で元に戻された）。解けたら `true`
+    pub fn clear_conflict(&mut self) -> bool {
+        self.conflict_diff = None;
+        if self.conflict.take().is_none() {
+            return false;
+        }
+        if self.save_status == Some(SaveStatus::Conflict) {
+            self.save_status = None;
+        }
+        true
+    }
+
+    /// 保存・読み直しの失敗を競合として読むなら、その状態（#1659）
+    pub fn conflict_state_of(error: &tako_core::TextEditError) -> Option<tako_core::DiskState> {
+        match error {
+            tako_core::TextEditError::ExternalChanged => Some(tako_core::DiskState::Changed),
+            tako_core::TextEditError::ExternalDeleted => Some(tako_core::DiskState::Deleted),
+            _ => None,
+        }
     }
 
     pub fn dirty(&self) -> bool {
@@ -529,8 +590,14 @@ impl EditState {
     /// **「編集した人がフラグを立てる」形をやめ、状態から必要性を導く**ための判定。
     /// 旧実装は編集経路ごとに手で保留フラグを立てていたので、GUI の入力経路だけが
     /// タイマーまで回し、dispatch（CLI / MCP）の編集は保留に入ったまま誰も保存しなかった
+    ///
+    /// **外部変更の競合中は対象にしない**（#1659）。保存しても断られるだけなので、
+    /// 回すと 500ms ごとに同じ競合を知らせ続ける。利用者が 2 択を選ぶまで止める
     fn autosave_due(&self) -> bool {
-        self.autosave && self.editing && self.dirty()
+        self.autosave
+            && self.editing
+            && self.dirty()
+            && (self.conflict.is_none() || external_change_legacy())
     }
 }
 
@@ -4393,6 +4460,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// #1659: 外部変更の競合中は自動保存を止め、知らせるのは新しく分かったときだけ
+    #[test]
+    fn 競合中は自動保存の対象にせず同じ競合は1回だけ知らせる() {
+        let dir = autosave_dir("conflict-1659");
+        let pending = std::collections::HashSet::new();
+        let mut edit = edit_session(&dir, "conflict.txt");
+        edit.buffer.set_text("mine\n".into());
+        assert_eq!(autosave_due([(&1u64, &edit)], &pending), vec![1]);
+
+        // 検知した 1 回だけ知らせる（自動保存の失敗・監視・手動保存の失敗のどれでも同じ口）
+        assert!(edit.note_conflict(tako_core::DiskState::Changed));
+        for _ in 0..10 {
+            assert!(!edit.note_conflict(tako_core::DiskState::Changed));
+        }
+        assert_eq!(edit.conflict.map(|c| c.notices), Some(1));
+        assert_eq!(edit.save_status, Some(SaveStatus::Conflict));
+        assert!(
+            autosave_due([(&1u64, &edit)], &pending).is_empty(),
+            "競合中は自動保存の対象にしない（500ms ごとの競合を出し続けない）"
+        );
+
+        // 状態が変わった（書き換わった → 消された）ら、それは新しい事実なのでもう 1 回
+        assert!(edit.note_conflict(tako_core::DiskState::Deleted));
+        assert_eq!(edit.conflict.map(|c| c.notices), Some(2));
+
+        // 解けたら（上書き・読み直し）自動保存の対象へ戻り、次の競合はまた 1 回目から
+        assert!(edit.clear_conflict());
+        assert!(!edit.clear_conflict(), "解けた後に解いても何も起きない");
+        assert_eq!(edit.save_status, None);
+        assert_eq!(autosave_due([(&1u64, &edit)], &pending), vec![1]);
+        assert!(edit.note_conflict(tako_core::DiskState::Changed));
+        assert_eq!(edit.conflict.map(|c| c.notices), Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1659: 保存・読み直しの失敗を競合と読むのは型だけ（文面の部分一致で判定しない）
+    #[test]
+    fn 競合と読む失敗は外部変更と削除だけ() {
+        use tako_core::TextEditError;
+        assert_eq!(
+            EditState::conflict_state_of(&TextEditError::ExternalChanged),
+            Some(tako_core::DiskState::Changed)
+        );
+        assert_eq!(
+            EditState::conflict_state_of(&TextEditError::ExternalDeleted),
+            Some(tako_core::DiskState::Deleted)
+        );
+        assert_eq!(
+            EditState::conflict_state_of(&TextEditError::InvalidUtf8),
+            None
+        );
+        assert_eq!(
+            EditState::conflict_state_of(&TextEditError::Write(std::io::Error::other("x"))),
+            None
+        );
     }
 
     #[test]

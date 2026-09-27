@@ -1956,8 +1956,21 @@ enum EditCommand {
         #[arg(long)]
         pane: Option<u64>,
     },
-    /// 編集バッファをファイルへ保存する
+    /// 編集バッファをファイルへ保存する（外で変わっていたら書かずに断る）
     Save {
+        /// 外で変わっていても自分の変更で上書きする（消されていれば作り直す。#1659）
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// ディスクから読み直す（編集中の変更は捨てる。undo 1 回で戻せる。#1659）
+    Reload {
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// ディスクと編集中の差分（ディスク → 編集中の unified diff。何も変えない。#1659）
+    Diff {
         #[arg(long)]
         pane: Option<u64>,
     },
@@ -7440,7 +7453,14 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 command: "newline".into(),
                 expected_version: *expect_version,
             },
-            EditCommand::Save { pane } => Request::PreviewSave {
+            EditCommand::Save { force, pane } => Request::PreviewSave {
+                pane: target_pane(*pane)?,
+                force: *force,
+            },
+            EditCommand::Reload { pane } => Request::PreviewRevert {
+                pane: target_pane(*pane)?,
+            },
+            EditCommand::Diff { pane } => Request::PreviewDiff {
                 pane: target_pane(*pane)?,
             },
             EditCommand::Undo { pane } => Request::PreviewUndo {
@@ -10540,7 +10560,29 @@ mod tests {
         let command = parse(&["tako", "edit", "save", "--pane", "5"]);
         assert_eq!(
             build_request(&command).unwrap(),
-            Request::PreviewSave { pane: Some(5) }
+            Request::PreviewSave {
+                pane: Some(5),
+                force: false
+            }
+        );
+        // #1659: 外部変更の後の逃げ道（上書き / 読み直し / 差分）
+        let command = parse(&["tako", "edit", "save", "--force", "--pane", "5"]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::PreviewSave {
+                pane: Some(5),
+                force: true
+            }
+        );
+        let command = parse(&["tako", "edit", "reload", "--pane", "5"]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::PreviewRevert { pane: Some(5) }
+        );
+        let command = parse(&["tako", "edit", "diff", "--pane", "5"]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::PreviewDiff { pane: Some(5) }
         );
         // #1658: 位置は `行:桁`（桁は省略可 = 0）
         let command = parse(&[
@@ -11579,6 +11621,9 @@ mod platform_matrix_parity {
         ("edit redo", "tako_preview_redo"),
         ("edit replace", "tako_preview_replace"),
         ("edit save", "tako_preview_save"),
+        // #1659: MCP は `tako_preview_save` の `action`（reload / diff。ツールを増やさない）
+        ("edit reload", "tako_preview_save"),
+        ("edit diff", "tako_preview_save"),
         ("edit search", "tako_preview_search"),
         ("edit undo", "tako_preview_undo"),
         ("edit start", "tako_preview_edit"),

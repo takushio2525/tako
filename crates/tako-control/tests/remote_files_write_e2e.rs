@@ -288,7 +288,9 @@ impl FakeApp {
                 p.buffer = Some(text);
                 Ok(json!({ "pane": p.id, "editing": p.editing, "dirty": p.dirty() }))
             }
-            Request::PreviewSave { pane } => {
+            Request::PreviewSave { pane, force } => {
+                // スマホの保存は外部変更を踏み越えない（検証子で守る経路。#1659 の force は使わない）
+                assert!(!force, "スマホからの保存が force を立てた");
                 self.state.lock().unwrap().calls.push("preview_save".into());
                 let pane = pane.ok_or("pane が要る")?;
                 // ローカルの写しへ書くところ（`TextBuffer::save` 相当）

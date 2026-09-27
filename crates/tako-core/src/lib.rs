@@ -83,6 +83,7 @@ pub mod terminal;
 pub mod test_residue;
 pub mod text;
 pub mod text_block;
+pub mod text_diff;
 pub mod text_edit;
 pub mod theme;
 pub mod tmux;
@@ -144,8 +145,8 @@ pub use terminal::{
     TermEvent, TerminalSession,
 };
 pub use text_edit::{
-    CursorMovement, DeleteMotion, IndentUnit, LineEnding, SearchHit, SearchOptions, TextBuffer,
-    TextEditError,
+    CursorMovement, DeleteMotion, DiskDiff, DiskState, IndentUnit, LineEnding, SearchHit,
+    SearchOptions, TextBuffer, TextEditError,
 };
 pub use theme::{Rgb, Theme};
 pub use tmux::{TmuxSession, TmuxView, TmuxWindow};

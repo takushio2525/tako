@@ -459,7 +459,44 @@ mod tests {
             }]
         );
         let (_, requests) = run(call("tako_preview_save", json!({})), Some(7), true);
-        assert_eq!(requests, vec![Request::PreviewSave { pane: Some(7) }]);
+        assert_eq!(
+            requests,
+            vec![Request::PreviewSave {
+                pane: Some(7),
+                force: false
+            }]
+        );
+    }
+
+    /// #1659: 外部変更の後の逃げ道はツールを増やさず `tako_preview_save` の action で表す
+    #[test]
+    fn preview_saveのactionは上書きと読み直しと差分へ写る() {
+        let cases = [
+            ("save", Request::PreviewSave { pane: Some(7), force: false }),
+            ("overwrite", Request::PreviewSave { pane: Some(7), force: true }),
+            ("reload", Request::PreviewRevert { pane: Some(7) }),
+            ("diff", Request::PreviewDiff { pane: Some(7) }),
+        ];
+        // 綴り表（カタログの enum）と写像の対応が 1 つも欠けない
+        assert_eq!(
+            cases.iter().map(|(a, _)| *a).collect::<Vec<_>>(),
+            crate::dispatch::PREVIEW_SAVE_ACTIONS
+        );
+        for (action, expected) in cases {
+            let (_, requests) = run(
+                call("tako_preview_save", json!({ "action": action })),
+                Some(7),
+                true,
+            );
+            assert_eq!(requests, vec![expected], "action={action}");
+        }
+        let (response, requests) = run(
+            call("tako_preview_save", json!({ "action": "force" })),
+            Some(7),
+            true,
+        );
+        assert!(requests.is_empty(), "知らない action は送らない");
+        assert!(format!("{response:?}").contains("overwrite"), "{response:?}");
     }
 
     #[test]

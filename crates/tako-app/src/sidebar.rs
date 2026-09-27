@@ -3210,13 +3210,56 @@ impl TakoApp {
             .get_mut(&pane)
             .filter(|edit| edit.editing || edit.dirty())
         {
-            // 自分自身の保存でも OS イベントは発生する。同じ内容なら競合にせず、
-            // 真の外部変更または削除だけを既存 FR-3.5 の競合表示へ接続する。
-            if loaded.source_bytes.as_deref() == Some(edit.buffer.text().as_bytes()) {
+            if preview::external_change_legacy() {
+                // #1659 前の経路（A/B の口）: 中身が本文と違えば毎回競合として知らせ直す
+                if loaded.source_bytes.as_deref() == Some(edit.buffer.text().as_bytes()) {
+                    return;
+                }
+                edit.note_conflict(tako_core::DiskState::Changed);
+                edit.message = Some(crate::ui_text::sidebar::note_external_change().into());
+                cx.notify();
                 return;
             }
-            edit.save_status = Some(preview::SaveStatus::Conflict);
-            edit.message = Some(crate::ui_text::sidebar::note_external_change().into());
+            // #1659: 基準（開いた / 保存した / 読み直した時点の中身）と突き合わせる。
+            // 自分自身の保存でも OS イベントは発生するが、そのときは基準と同じ = 競合ではない。
+            // 読めなかった（消された・上限を超えた）ときだけ、ここで読み直して区別する
+            let state = match loaded.source_bytes.as_deref() {
+                Some(bytes) => edit.buffer.observe_disk(Some(bytes)),
+                None => edit
+                    .buffer
+                    .refresh_disk_state()
+                    .unwrap_or(tako_core::DiskState::Changed),
+            };
+            let mut follow = false;
+            match state {
+                // 外で元へ戻された・外で自分と同じ中身に書かれた = 競合が解けた
+                tako_core::DiskState::Unchanged => {
+                    edit.clear_conflict();
+                }
+                // 未編集ならディスクへ黙って追従する（VS Code / Zed と同じ。読み直しは
+                // 1 回の編集として積むので undo で戻せる）。読み直せない中身なら競合として残す
+                tako_core::DiskState::Changed if !edit.dirty() => {
+                    match loaded
+                        .source_bytes
+                        .map(|bytes| edit.buffer.reload_from(bytes))
+                    {
+                        Some(Ok(())) => {
+                            edit.clear_conflict();
+                            follow = true;
+                        }
+                        _ => {
+                            edit.note_conflict(state);
+                        }
+                    }
+                }
+                // 知らせるのは新しく分かったときだけ（同じ競合を何度検知しても 1 回）
+                state => {
+                    edit.note_conflict(state);
+                }
+            }
+            if follow {
+                self.refresh_preview_from_editor(pane);
+            }
             cx.notify();
             return;
         }

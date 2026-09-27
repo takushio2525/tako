@@ -819,7 +819,21 @@ pub enum Request {
         expected_version: Option<u64>,
     },
     /// 編集バッファをファイルへ保存する。外部変更を検知した場合は上書きしない。
-    PreviewSave { pane: Option<u64> },
+    ///
+    /// `force`（#1659）で外部変更があっても**自分の変更で上書き**する（外で消されて
+    /// いれば作り直す）。省略時は wire に現れない（引数が生える前の JSON とバイト一致）
+    PreviewSave {
+        pane: Option<u64>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        force: bool,
+    },
+    /// 編集バッファを**ディスクの中身で読み直す**（#1659）。編集中の変更は捨てるが、
+    /// 読み直しは 1 回の編集として積むので undo 1 回で戻せる。外部変更の競合を
+    /// 「ディスク側を採る」で解く口（`force` 付きの保存が「自分の側を採る」口）
+    PreviewRevert { pane: Option<u64> },
+    /// ディスク上のファイルと編集バッファの差分（#1659）。向きは「ディスク → 編集中」
+    /// = 上書き保存すると何が変わるか。本文もファイルも変えない
+    PreviewDiff { pane: Option<u64> },
     /// 言語サーバ（LSP）のライフサイクル（FR-3.28 / #1678）。`action`:
     /// - "status"（既定）: 状態・能力・文書数・診断件数（未導入なら理由 + 導入コマンド）
     /// - "list": 検出表と解決結果（導入済み / 未導入）。実行ファイルを探すので待ちうる
@@ -2520,6 +2534,8 @@ pub fn changes_layout(request: &Request) -> bool {
         | Request::PreviewDelete { .. }
         | Request::PreviewEditCommand { .. }
         | Request::PreviewSave { .. }
+        | Request::PreviewRevert { .. }
+        | Request::PreviewDiff { .. }
         | Request::PreviewUndo { .. }
         | Request::PreviewRedo { .. }
         | Request::PreviewSearch { .. }

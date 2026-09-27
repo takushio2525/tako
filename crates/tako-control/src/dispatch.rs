@@ -225,6 +225,22 @@ fn open_file(
     // （FR-3.11 = D&D のドロップ位置）なら再利用せず必ずその方向へ分割。
     // どちらも省略時は 対象自身がプレビュー > 同タブの既存プレビュー（再利用）
     // > 右分割で新設。いずれの経路でもターミナルセッションは起動しない
+    let path_str = resolved.display().to_string();
+    // #1659: 未保存の変更があるプレビューへ**別のファイル**を出さない。差し替えると変更を
+    // 失うので `set_preview` が断り、別のファイルを開けない行き止まりだった
+    // （保存できない競合と重なると、ペインを閉じる以外に抜けられなかった）。
+    // 再利用の候補がそれなら右へ分割して開く（VS Code のプレビュータブが未保存になると
+    // 差し替えられないのと同じ）。同じファイルならそのペインへ着地する（下の `same_document`）
+    let holds_other_unsaved = |host: &dyn ControlHost, pane: PaneId| {
+        !external_change_legacy()
+            && host
+                .preview_edit_state(pane)
+                .is_some_and(|(_, dirty)| dirty)
+            && host
+                .preview_state(pane)
+                .is_some_and(|(shown, _)| shown != path_str)
+    };
+    let mut kept_unsaved = None;
     let (tab, view_pane, created) = if new_tab {
         let prev_active = host.workspace().active_tab_id();
         let new_pane = Pane::new(origin);
@@ -252,11 +268,20 @@ fn open_file(
             .split_with_ratio(target, direction.to_core(), 0.5, new_pane)
             .map_err(op_err)?;
         (tab, new_id, true)
-    } else if host.preview_state(target).is_some() {
+    } else if host.preview_state(target).is_some() && !holds_other_unsaved(&*host, target) {
         (tab, target, false)
-    } else if let Some(existing) = host.preview_pane_of_tab(tab) {
+    } else if let Some(existing) = host
+        .preview_pane_of_tab(tab)
+        .filter(|&existing| existing != target || host.preview_state(target).is_none())
+        .filter(|&existing| !holds_other_unsaved(&*host, existing))
+    {
         (tab, existing, false)
     } else {
+        if host.preview_state(target).is_some() {
+            kept_unsaved = Some(target);
+        } else if let Some(existing) = host.preview_pane_of_tab(tab) {
+            kept_unsaved = Some(existing);
+        }
         let new_pane = Pane::new(origin);
         let new_id = new_pane.id();
         tree_mut(host.workspace_mut(), tab)
@@ -264,7 +289,6 @@ fn open_file(
             .map_err(op_err)?;
         (tab, new_id, true)
     };
-    let path_str = resolved.display().to_string();
     // #1677: 「飛ぶ前にいた場所」= 差し替えられるプレビュー（再利用するとき）か、
     // 新しく生やすなら基準ペイン（それがプレビューなら）。**set_preview の前**に採る
     // （後だと差し替えた新しい中身を読んでしまう）
@@ -287,6 +311,17 @@ fn open_file(
             .is_some_and(|(shown, shown_mode)| {
                 shown == path_str && shown_mode == PreviewModeWire::Code
             });
+    // #1659: 未保存の変更がある同じファイルを開き直したら、読み直さずにそのペインを使う
+    // （読み直すと変更を捨てるので `set_preview` が断る = 開き直すだけで失敗していた）
+    let same_document = same_document
+        || (!created
+            && !external_change_legacy()
+            && host
+                .preview_edit_state(view_pane)
+                .is_some_and(|(_, dirty)| dirty)
+            && host
+                .preview_state(view_pane)
+                .is_some_and(|(shown, _)| shown == path_str));
     if !same_document {
         host.set_preview(view_pane, &path_str, mode)
             .map_err(DispatchError::Operation)?;
@@ -329,7 +364,7 @@ fn open_file(
             .focus(view_pane)
             .map_err(op_err)?;
     }
-    Ok(json!({
+    let mut out = json!({
         "tab": tab.as_u64(),
         "pane": view_pane.as_u64(),
         "path": path_str,
@@ -344,7 +379,21 @@ fn open_file(
         "clamped": landing.is_some_and(|l| l.clamped),
         // #1680: 同じファイルを読み直さずに着地した
         "reloaded": !same_document,
-    }))
+    });
+    // #1659: 未保存の変更があるので差し替えずに残したペイン（分割して開いた理由）
+    if let Some(kept) = kept_unsaved {
+        out["kept_unsaved"] = json!(kept.as_u64());
+    }
+    Ok(out)
+}
+
+/// `TAKO_1659_LEGACY=1` で **#1659 前の挙動**へ戻す（同一バイナリで A/B を取る入口。
+/// 判定はこの 1 つで、GUI 側の `preview::external_change_legacy` もここを呼ぶ）:
+/// 未保存のプレビューへ別のファイルを開こうとして断られる・競合中も自動保存を止めない
+/// （= 同じ競合を知らせ直す）・未編集の編集セッションもディスクへ追従しない。
+/// 隔離の実経路 `scripts/test-external-change-1659.sh` の検出力の実証に使う
+pub fn external_change_legacy() -> bool {
+    std::env::var_os("TAKO_1659_LEGACY").is_some()
 }
 
 /// `TAKO_1677_LEGACY=1` で **#1677 前の挙動**（行を指定して開いてもジャンプ履歴へ
@@ -1506,7 +1555,62 @@ fn preview_edit_reply(host: &dyn ControlHost, target: PaneId) -> Value {
     if let Some(limit) = host.preview_limit(target) {
         out["limit"] = limit;
     }
+    // #1659: 外で変わった / 消されたなら、保存が通らない理由をどの応答でも読めるようにする
+    // （競合していなければキーごと無い = 従来の応答と同じ形）
+    if let Some(conflict) = host.preview_conflict(target) {
+        out["conflict"] = json!({
+            "state": conflict.state.name(),
+            "notices": conflict.notices,
+            "autosave_paused": conflict.autosave_paused,
+        });
+    }
     out
+}
+
+/// MCP `tako_preview_save` の action（#1659）。カタログの enum と request 変換がこの 1 つを引く。
+///
+/// `save`（既定）/ `overwrite`（= CLI `tako edit save --force`）/ `reload`（= `tako edit reload`）/
+/// `diff`（= `tako edit diff`）
+pub const PREVIEW_SAVE_ACTIONS: &[&str] = &["save", "overwrite", "reload", "diff"];
+
+/// 外部変更の競合・未保存の変更から抜ける手段の案内（#1659）。
+///
+/// 保存が断られた・別のファイルを開けなかったときのエラーへ添える（「保存しなかった」とだけ
+/// 返すと、呼び手はペインを閉じる以外の抜け方を知らない = Issue の症状）。
+/// CLI と MCP のどちらから来ても同じ文面で、MCP は `tako_preview_save` の `action` で同じ操作になる。
+/// `conflict` は外部変更の状態（`None` = 競合は無く、未保存の変更だけがある）
+pub fn preview_recovery_hint(conflict: Option<tako_core::DiskState>) -> &'static str {
+    match conflict {
+        Some(tako_core::DiskState::Deleted) => {
+            "作り直す: tako edit save --force / 差分: tako edit diff\
+             （MCP は tako_preview_save の action=overwrite / diff）"
+        }
+        Some(_) => {
+            "上書き: tako edit save --force / 読み直し（自分の変更は undo で戻せる）: \
+             tako edit reload / 差分: tako edit diff\
+             （MCP は tako_preview_save の action=overwrite / reload / diff）"
+        }
+        None => {
+            "保存: tako edit save / 変更を捨てる: tako edit reload\
+             （MCP は tako_preview_save / action=reload）"
+        }
+    }
+}
+
+/// `PreviewDiff` の応答の `diff` 節（#1659）。向きは「ディスク → 編集中」
+fn disk_diff_json(diff: &tako_core::DiskDiff, path: &str) -> Value {
+    json!({
+        // ディスクと基準（開いた / 保存した / 読み直した時点）の関係
+        "state": diff.state.name(),
+        "identical": diff.diff.is_empty(),
+        "added": diff.diff.added,
+        "removed": diff.diff.removed,
+        "truncated": diff.diff.truncated,
+        "approximate": diff.diff.approximate,
+        "unified": diff
+            .diff
+            .unified(&format!("{path}（ディスク）"), &format!("{path}（編集中）")),
+    })
 }
 
 /// 検索・置換の応答へ、実際に使った条件を載せる（#1653）。
@@ -3338,10 +3442,20 @@ fn dispatch_inner(
                 .map_err(DispatchError::Operation)?;
             Ok(preview_edit_reply(host, target))
         }
-        Request::PreviewSave { pane } => {
+        Request::PreviewSave { pane, force } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
-            host.save_preview(target)
-                .map_err(DispatchError::Operation)?;
+            if let Err(message) = host.save_preview(target, force) {
+                // #1659: 外部変更で断られたなら抜け方を添える
+                return Err(DispatchError::Operation(
+                    match host.preview_conflict(target) {
+                        Some(conflict) => format!(
+                            "{message}（{}）",
+                            preview_recovery_hint(Some(conflict.state))
+                        ),
+                        None => message,
+                    },
+                ));
+            }
             let mut out = preview_edit_reply(host, target);
             out["saved"] = json!(true);
             // #966: リモート由来なら「リモートへ書けたのか」まで応答に載せる
@@ -3349,6 +3463,27 @@ fn dispatch_inner(
             if let Some(remote) = host.preview_remote_state(target) {
                 out["remote"] = remote;
             }
+            Ok(out)
+        }
+        Request::PreviewRevert { pane } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            host.revert_preview(target)
+                .map_err(DispatchError::Operation)?;
+            let mut out = preview_edit_reply(host, target);
+            out["reverted"] = json!(true);
+            Ok(out)
+        }
+        Request::PreviewDiff { pane } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            let diff = host
+                .preview_disk_diff(target)
+                .map_err(DispatchError::Operation)?;
+            let path = host
+                .preview_state(target)
+                .map(|(path, _)| path)
+                .unwrap_or_default();
+            let mut out = preview_edit_reply(host, target);
+            out["diff"] = disk_diff_json(&diff, &path);
             Ok(out)
         }
         Request::PreviewUndo { pane } => {
@@ -7145,7 +7280,7 @@ fn save_previews_before_run(
         })
         .collect();
     for &pane in &dirty {
-        host.save_preview(pane).map_err(|e| {
+        host.save_preview(pane, false).map_err(|e| {
             DispatchError::Operation(format!(
                 "実行前の保存に失敗したので実行しない（pane {}: {e}）",
                 pane.as_u64()
@@ -16551,6 +16686,11 @@ mod tests {
         preview_search: std::collections::HashMap<u64, (String, SearchOptions)>,
         /// #1660: 上限を超えて末尾を省略したプレビュー（GUI の `PreviewState::truncated` の代役）
         preview_limits: std::collections::HashMap<u64, tako_core::preview_limit::Truncation>,
+        /// #1659: 編集開始で**実ファイルを開く**か（既定 false = 従来どおり空のバッファ）。
+        /// 外部変更の往復を本物の `TextBuffer` の保存・読み直しで確かめるテストだけが立てる
+        preview_real_files: bool,
+        /// #1659: 外部変更の競合（GUI の `EditState::conflict` の代役）
+        preview_conflicts: std::collections::HashMap<u64, crate::host::PreviewConflict>,
         collapsed: std::collections::HashSet<u64>,
         /// ピン留め: (group, id)
         pins: Vec<(bool, u64)>,
@@ -16652,6 +16792,8 @@ mod tests {
                 preview_edits: std::collections::HashMap::new(),
                 preview_search: std::collections::HashMap::new(),
                 preview_limits: std::collections::HashMap::new(),
+                preview_real_files: false,
+                preview_conflicts: std::collections::HashMap::new(),
                 collapsed: std::collections::HashSet::new(),
                 pins: Vec::new(),
                 stale_pane_map: std::collections::HashMap::new(),
@@ -17215,16 +17357,21 @@ mod tests {
                     return Err(limit.edit_refusal());
                 }
             }
-            let edit = self.preview_edits.entry(pane.as_u64()).or_insert_with(|| {
-                (
-                    false,
-                    false,
-                    tako_core::text_edit::TextBuffer::from_text(
+            if !self.preview_edits.contains_key(&pane.as_u64()) {
+                let buffer = match self.previews.get(&pane.as_u64()) {
+                    Some((path, _)) if self.preview_real_files => {
+                        tako_core::text_edit::TextBuffer::open(std::path::Path::new(path))
+                            .map_err(|e| e.to_string())?
+                    }
+                    _ => tako_core::text_edit::TextBuffer::from_text(
                         std::path::PathBuf::from("mock.txt"),
                         String::new(),
                     ),
-                )
-            });
+                };
+                self.preview_edits
+                    .insert(pane.as_u64(), (false, false, buffer));
+            }
+            let edit = self.preview_edits.get_mut(&pane.as_u64()).unwrap();
             edit.0 = enabled;
             Ok(())
         }
@@ -17338,13 +17485,70 @@ mod tests {
                 .ok_or_else(|| "編集セッションがない".to_string())?;
             Ok(state.2.redo())
         }
-        fn save_preview(&mut self, pane: PaneId) -> Result<(), String> {
+        fn save_preview(&mut self, pane: PaneId, force: bool) -> Result<(), String> {
+            let real = self.preview_real_files;
             let edit = self
                 .preview_edits
                 .get_mut(&pane.as_u64())
                 .ok_or_else(|| "編集セッションがない".to_string())?;
+            if real {
+                let result = if force {
+                    edit.2.save_overwrite()
+                } else {
+                    edit.2.save()
+                };
+                let state = match &result {
+                    Err(tako_core::TextEditError::ExternalChanged) => {
+                        Some(tako_core::DiskState::Changed)
+                    }
+                    Err(tako_core::TextEditError::ExternalDeleted) => {
+                        Some(tako_core::DiskState::Deleted)
+                    }
+                    _ => None,
+                };
+                edit.1 = edit.2.dirty();
+                match (result, state) {
+                    (Ok(()), _) => {
+                        self.preview_conflicts.remove(&pane.as_u64());
+                        return Ok(());
+                    }
+                    (Err(error), Some(state)) => {
+                        self.preview_conflicts.insert(
+                            pane.as_u64(),
+                            crate::host::PreviewConflict {
+                                state,
+                                notices: 1,
+                                autosave_paused: false,
+                            },
+                        );
+                        return Err(error.to_string());
+                    }
+                    (Err(error), None) => return Err(error.to_string()),
+                }
+            }
             edit.1 = false;
             Ok(())
+        }
+        fn revert_preview(&mut self, pane: PaneId) -> Result<(), String> {
+            let edit = self
+                .preview_edits
+                .get_mut(&pane.as_u64())
+                .ok_or_else(|| "編集セッションがない".to_string())?;
+            edit.2.reload_from_disk().map_err(|e| e.to_string())?;
+            edit.1 = edit.2.dirty();
+            self.preview_conflicts.remove(&pane.as_u64());
+            Ok(())
+        }
+        fn preview_disk_diff(&self, pane: PaneId) -> Result<tako_core::DiskDiff, String> {
+            self.preview_edits
+                .get(&pane.as_u64())
+                .ok_or_else(|| "編集セッションがない".to_string())?
+                .2
+                .disk_diff()
+                .map_err(|e| e.to_string())
+        }
+        fn preview_conflict(&self, pane: PaneId) -> Option<crate::host::PreviewConflict> {
+            self.preview_conflicts.get(&pane.as_u64()).copied()
         }
         fn preview_pane_of_tab(&self, tab: TabId) -> Option<PaneId> {
             self.ws
@@ -21142,7 +21346,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(applied["dirty"].as_bool(), Some(true));
-        let blocked = dispatch(
+        // #1659: 未保存の変更があるペインは差し替えない（変更を失う）。以前は拒否して
+        // 別のファイルを開けない行き止まりだったので、右へ分割して開く
+        let beside = dispatch(
             &mut host,
             Request::OpenFile {
                 pane: Some(pane),
@@ -21155,15 +21361,48 @@ mod tests {
                 column: None,
             },
             PaneOrigin::User,
+        )
+        .unwrap();
+        assert_ne!(
+            beside["pane"].as_u64(),
+            Some(pane),
+            "差し替えずに別のペイン"
         );
-        assert!(
-            blocked.is_err(),
-            "未保存変更があるペインの差し替えを拒否する"
+        assert_eq!(beside["created"].as_bool(), Some(true));
+        assert_eq!(beside["kept_unsaved"].as_u64(), Some(pane));
+        assert_eq!(
+            host.preview_state(PaneId::from_raw(pane)).map(|(p, _)| p),
+            opened["path"].as_str().map(str::to_string),
+            "未保存のペインは元のファイルのまま"
         );
+        assert_eq!(host.preview_edits[&pane].2.text(), "日本語\n");
+        // 同じファイルを開き直しても読み直さない（変更を捨てない）
+        let again = dispatch(
+            &mut host,
+            Request::OpenFile {
+                pane: Some(pane),
+                path: first.display().to_string(),
+                mode: None,
+                direction: None,
+                focus: None,
+                new_tab: false,
+                line: None,
+                column: None,
+            },
+            PaneOrigin::User,
+        )
+        .unwrap();
+        assert_eq!(again["pane"].as_u64(), Some(pane));
+        assert_eq!(again["reloaded"].as_bool(), Some(false));
+        assert!(again.get("kept_unsaved").is_none());
+        assert_eq!(host.preview_edits[&pane].2.text(), "日本語\n");
 
         let saved = dispatch(
             &mut host,
-            Request::PreviewSave { pane: Some(pane) },
+            Request::PreviewSave {
+                pane: Some(pane),
+                force: false,
+            },
             PaneOrigin::Mcp,
         )
         .unwrap();
@@ -21179,6 +21418,198 @@ mod tests {
         assert_eq!(preview["preview"]["editing"].as_bool(), Some(true));
         assert_eq!(preview["preview"]["dirty"].as_bool(), Some(false));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #1659: 外部変更を検知した後の逃げ道（上書き / 読み直し / 差分）が dispatch の
+    /// 1 本で通り、保存の失敗には抜け方が添えられ、応答の `conflict` で状態が読める
+    #[test]
+    fn issue1659_外部変更の後に上書きと読み直しと差分が通る() {
+        let dir = std::env::temp_dir().join(format!("tako-dispatch-1659-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("conflict.rs");
+        std::fs::write(&file, "a\nb\nc\n").unwrap();
+        let mut host = MockHost::new();
+        host.preview_real_files = true;
+        let root = host.root_pane();
+        let pane = dispatch(
+            &mut host,
+            Request::OpenFile {
+                pane: Some(root),
+                path: file.display().to_string(),
+                mode: Some(PreviewModeWire::Code),
+                direction: None,
+                focus: None,
+                new_tab: false,
+                line: None,
+                column: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap()["pane"]
+            .as_u64()
+            .unwrap();
+        let run = |host: &mut MockHost, request: Request| dispatch(host, request, PaneOrigin::Cli);
+        run(
+            &mut host,
+            Request::PreviewEditRange {
+                pane: Some(pane),
+                start_line: 2,
+                start_col: 0,
+                end_line: 2,
+                end_col: 1,
+                text: "MINE".into(),
+                expected_version: None,
+            },
+        )
+        .unwrap();
+        std::fs::write(&file, "a\nDISK\nc\n").unwrap();
+
+        // ① 保存は断られ、抜け方が添えられ、以後の応答に conflict が載る
+        let refused = run(
+            &mut host,
+            Request::PreviewSave {
+                pane: Some(pane),
+                force: false,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(refused.contains("外部で変更"), "{refused}");
+        assert!(refused.contains("tako edit save --force"), "{refused}");
+        assert!(refused.contains("tako edit reload"), "{refused}");
+        assert!(refused.contains("action=overwrite"), "{refused}");
+        let status = run(
+            &mut host,
+            Request::PreviewEdit {
+                pane: Some(pane),
+                enabled: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(status["conflict"]["state"].as_str(), Some("changed"));
+        assert_eq!(status["dirty"].as_bool(), Some(true));
+
+        // ② 差分は「ディスク → 編集中」で、本文もファイルも変えない
+        let diff = run(&mut host, Request::PreviewDiff { pane: Some(pane) }).unwrap();
+        assert_eq!(diff["diff"]["state"].as_str(), Some("changed"));
+        assert_eq!(
+            (
+                diff["diff"]["added"].as_u64(),
+                diff["diff"]["removed"].as_u64()
+            ),
+            (Some(1), Some(1))
+        );
+        let unified = diff["diff"]["unified"].as_str().unwrap();
+        assert!(unified.contains("-DISK\n+MINE\n"), "{unified}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "a\nDISK\nc\n");
+
+        // ③ 上書き（force）で競合が解け、自分の変更がディスクへ残る
+        let forced = run(
+            &mut host,
+            Request::PreviewSave {
+                pane: Some(pane),
+                force: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(forced["saved"].as_bool(), Some(true));
+        assert_eq!(forced["dirty"].as_bool(), Some(false));
+        assert!(forced.get("conflict").is_none(), "{forced}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "a\nMINE\nc\n");
+
+        // ④ 読み直し: もう一度ぶつけてから、ディスク側を採る
+        run(
+            &mut host,
+            Request::PreviewEditRange {
+                pane: Some(pane),
+                start_line: 1,
+                start_col: 0,
+                end_line: 1,
+                end_col: 1,
+                text: "A".into(),
+                expected_version: None,
+            },
+        )
+        .unwrap();
+        std::fs::write(&file, "a\nMINE\nc\nexternal\n").unwrap();
+        assert!(run(
+            &mut host,
+            Request::PreviewSave {
+                pane: Some(pane),
+                force: false,
+            },
+        )
+        .is_err());
+        let reverted = run(&mut host, Request::PreviewRevert { pane: Some(pane) }).unwrap();
+        assert_eq!(reverted["reverted"].as_bool(), Some(true));
+        assert_eq!(reverted["dirty"].as_bool(), Some(false));
+        assert!(reverted.get("conflict").is_none(), "{reverted}");
+        assert_eq!(host.preview_edits[&pane].2.text(), "a\nMINE\nc\nexternal\n");
+        // 読み直しの後は通常の保存がそのまま通る（競合から抜けた）
+        run(
+            &mut host,
+            Request::PreviewSave {
+                pane: Some(pane),
+                force: false,
+            },
+        )
+        .unwrap();
+        // 読み直しは undo 1 回で自分の変更へ戻る
+        run(&mut host, Request::PreviewUndo { pane: Some(pane) }).unwrap();
+        assert_eq!(host.preview_edits[&pane].2.text(), "A\nMINE\nc\n");
+
+        // ⑤ 外で消された: 保存は「作り直す」を案内し、force で作り直せる
+        std::fs::remove_file(&file).unwrap();
+        let refused = run(
+            &mut host,
+            Request::PreviewSave {
+                pane: Some(pane),
+                force: false,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(refused.contains("削除"), "{refused}");
+        assert!(refused.contains("作り直す"), "{refused}");
+        let diff = run(&mut host, Request::PreviewDiff { pane: Some(pane) }).unwrap();
+        assert_eq!(diff["diff"]["state"].as_str(), Some("deleted"));
+        assert!(run(&mut host, Request::PreviewRevert { pane: Some(pane) }).is_err());
+        run(
+            &mut host,
+            Request::PreviewSave {
+                pane: Some(pane),
+                force: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "A\nMINE\nc\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `force: false` は wire に現れない（引数が生える前の JSON とバイト一致 = 旧 GUI とも話せる）
+    #[test]
+    fn issue1659_force無しの保存はwireの形を変えない() {
+        let plain = serde_json::to_value(Request::PreviewSave {
+            pane: Some(3),
+            force: false,
+        })
+        .unwrap();
+        assert!(plain.to_string().find("force").is_none(), "{plain}");
+        let parsed: Request = serde_json::from_value(plain).unwrap();
+        assert_eq!(
+            parsed,
+            Request::PreviewSave {
+                pane: Some(3),
+                force: false
+            }
+        );
+        let forced = serde_json::to_value(Request::PreviewSave {
+            pane: Some(3),
+            force: true,
+        })
+        .unwrap();
+        assert!(forced.to_string().contains("\"force\":true"), "{forced}");
     }
 
     /// #1658: プレビューペインを 1 枚開いて本文を入れる（範囲編集のテストの前置き）

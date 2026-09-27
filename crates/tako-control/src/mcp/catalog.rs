@@ -1108,11 +1108,14 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_preview_save",
-            "description": "コードプレビューの未保存編集をファイルへ書き戻す。読み込み後に外部変更があれば競合として拒否し、上書きしない。",
+            "description": "コードプレビューの未保存編集をファイルへ書き戻す。読み込み後に外部変更があれば競合として拒否し、上書きしない\
+                （応答 conflict に state=changed|deleted）。競合の抜け方は action: overwrite = 自分の変更で上書き（消されていれば作り直す）/ \
+                reload = 自分の変更を捨ててディスクから読み直す（tako_preview_undo 1 回で戻せる）/ diff = ディスク→編集中の unified diff を返すだけ。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "pane": pane_schema("対象プレビューペイン ID（省略時は呼び出し元）"),
+                    "action": { "type": "string", "enum": crate::dispatch::PREVIEW_SAVE_ACTIONS },
                 },
                 "additionalProperties": false,
             },

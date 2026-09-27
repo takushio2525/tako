@@ -323,7 +323,8 @@ fn 塊を閉じる口が配線されている() {
     for (name, why) in [
         ("set_cursor", "カーソルを動かしたら打鍵の連なりは切れる"),
         ("select_all", "全選択も位置の移動なので塊を切る"),
-        ("save", "保存した姿まで戻れる位置を履歴に残す"),
+        // 保存の本体（`save` と `save_overwrite` が通る 1 本。#1659）
+        ("save_inner", "保存した姿まで戻れる位置を履歴に残す"),
         ("undo", "undo した直後の編集を前の塊へ足すと戻しすぎる"),
         ("redo", "redo した直後も同じ"),
     ] {
@@ -376,6 +377,7 @@ fn 番犬の走査が成立している() {
         "set_cursor",
         "select_all",
         "save",
+        "save_inner",
     ] {
         assert!(
             target.body(name).is_some(),

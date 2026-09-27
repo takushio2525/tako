@@ -59,6 +59,69 @@ pub fn saved_message() -> &'static str {
     tr!("保存しました", "Saved")
 }
 
+// --- 外部変更の競合（#1659。キー: preview.conflict_*） ---
+
+/// 帯の文面（ディスク上で書き換わった）
+pub fn conflict_changed() -> &'static str {
+    tr!(
+        "ディスク上のファイルが変更されました。編集中の内容は保持しています",
+        "The file changed on disk. Your edits are kept"
+    )
+}
+/// 帯の文面（ディスク上で消された）
+pub fn conflict_deleted() -> &'static str {
+    tr!(
+        "ディスク上のファイルが削除されました。編集中の内容は保持しています",
+        "The file was deleted on disk. Your edits are kept"
+    )
+}
+/// 自動保存 ON のときだけ添える（競合中は止めている）
+pub fn conflict_autosave_paused() -> &'static str {
+    tr!("自動保存は停止中", "Autosave paused")
+}
+pub fn conflict_show_diff() -> &'static str {
+    tr!("差分", "Diff")
+}
+pub fn conflict_hide_diff() -> &'static str {
+    tr!("差分を閉じる", "Hide diff")
+}
+/// 自分の変更で上書きする（`tako edit save --force` と同じ）
+pub fn conflict_overwrite() -> &'static str {
+    tr!("上書き保存", "Overwrite")
+}
+/// 消されたファイルを自分の変更で作り直す（`tako edit save --force` と同じ）
+pub fn conflict_recreate() -> &'static str {
+    tr!("作り直して保存", "Save anyway")
+}
+/// ディスクの中身を採る（`tako edit reload` と同じ。自分の変更は undo で戻せる）
+pub fn conflict_reload() -> &'static str {
+    tr!("ディスクから読み直す", "Reload from disk")
+}
+/// 差分の向きの凡例（`-` がディスク、`+` が編集中）
+pub fn conflict_diff_legend(added: usize, removed: usize) -> String {
+    tr!(
+        format!("- ディスク {removed} 行 / + 編集中 {added} 行"),
+        format!("- disk {removed} lines / + your edits {added} lines")
+    )
+}
+pub fn conflict_diff_truncated() -> &'static str {
+    tr!(
+        "差分が長いため先頭だけを表示しています",
+        "Diff is long; showing the beginning only"
+    )
+}
+/// ヘッダの一時表示（「保存しました」と同じ場所）。ファイル名を押し潰さない長さに留める
+pub fn reloaded_message() -> &'static str {
+    tr!("ディスクから読み直しました", "Reloaded from disk")
+}
+/// リモート由来の写しは読み直しても最新にならない（#966）
+pub fn remote_revert_unsupported() -> &'static str {
+    tr!(
+        "リモートのファイルは読み直せません。開き直してリモートから取り直してください",
+        "Remote files cannot be reloaded here. Reopen the file to fetch it again"
+    )
+}
+
 // --- 目次ポップオーバー（#232。キー: preview.outline_*） ---
 
 pub fn outline_section() -> &'static str {

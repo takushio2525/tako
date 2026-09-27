@@ -108,8 +108,8 @@ pub use dispatch::{
     LspGotoLanding, OffloadContinuation, OffloadJob, OffloadOutcome, PinnedView, TmuxContext,
 };
 pub use host::{
-    PreviewGotoSource, PreviewHost, PreviewLineTarget, RemoteHost, SessionHost, SystemHost,
-    TmuxHost, UiStateHost, VideoStatus, WebViewHost, WorkspaceHost,
+    PreviewConflict, PreviewGotoSource, PreviewHost, PreviewLineTarget, RemoteHost, SessionHost,
+    SystemHost, TmuxHost, UiStateHost, VideoStatus, WebViewHost, WorkspaceHost,
 };
 pub use ipc::{IncomingRequest, IpcServer};
 pub use mcp::McpServer;
