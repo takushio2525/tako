@@ -708,6 +708,14 @@ pub enum RangeEditError {
 pub struct TextBuffer {
     path: PathBuf,
     text: String,
+    /// 行頭のバイト位置（#1660）。`[0]` は常に 0、以後は `\n` の直後。
+    ///
+    /// 行・桁の換算（`line_byte_col` / `offset_for_line_byte_col` / `line_count`）を
+    /// 文書の先頭から数え直さないための索引。10 万行 / 10 MB の文書では数え直しが
+    /// 1 回数 ms かかり、GUI は 1 打鍵・1 フレームにこれを何度も呼ぶ（表示中の行ごと・
+    /// 選択の往復・追従スクロール）。本文を書き換える 3 つの口（`apply_edit` /
+    /// `undo` / `redo`）が [`Self::splice_line_starts`] で追従させる
+    line_starts: Vec<usize>,
     baseline: Vec<u8>,
     cursor: usize,
     anchor: Option<usize>,
@@ -797,6 +805,7 @@ impl TextBuffer {
             line_ending: LineEnding::detect_or_default(&text),
             indent: IndentUnit::detect(&text).unwrap_or_else(|| IndentUnit::for_path(path)),
             path: path.to_path_buf(),
+            line_starts: compute_line_starts(&text),
             text,
             baseline: bytes,
             cursor: 0,
@@ -818,6 +827,7 @@ impl TextBuffer {
             line_ending: LineEnding::detect_or_default(&text),
             indent: IndentUnit::detect(&text).unwrap_or_else(|| IndentUnit::for_path(&path)),
             path,
+            line_starts: compute_line_starts(&text),
             text,
             baseline,
             cursor: 0,
@@ -1320,6 +1330,7 @@ impl TextBuffer {
         let cursor_before = self.cursor;
         let anchor_before = self.anchor;
         let at_millis = self.now_millis();
+        self.splice_line_starts(range.clone(), replacement);
         self.text.replace_range(range, replacement);
         // 編集後の本文で丸める。丸めずに持つと、その位置が差分へ記録されて
         // **undo / redo のたびに再現される**（`replace_all` は編集前のカーソルを
@@ -1468,6 +1479,7 @@ impl TextBuffer {
         // 版を戻すと「別の中身なのに同じ版」が生まれて楽観ロックが効かなくなる
         self.bump_version();
         let end = delta.start + delta.after.len();
+        self.splice_line_starts(delta.start..end, &delta.before);
         self.text.replace_range(delta.start..end, &delta.before);
         self.cursor = delta.cursor_before;
         self.anchor = delta.anchor_before;
@@ -1484,6 +1496,7 @@ impl TextBuffer {
         };
         self.bump_version();
         let end = delta.start + delta.before.len();
+        self.splice_line_starts(delta.start..end, &delta.after);
         self.text.replace_range(delta.start..end, &delta.after);
         self.cursor = delta.cursor_after;
         self.anchor = delta.anchor_after;
@@ -1702,15 +1715,14 @@ impl TextBuffer {
     /// 0 起点の行と、その行内 UTF-8 バイト位置を返す。
     pub fn line_byte_col(&self, offset: usize) -> (usize, usize) {
         let offset = snap_boundary(&self.text, offset.min(self.text.len()));
-        let prefix = &self.text[..offset];
-        let line = prefix.bytes().filter(|b| *b == b'\n').count();
-        let start = prefix.rfind('\n').map(|i| i + 1).unwrap_or(0);
-        (line, offset - start)
+        // 行頭索引の二分探索（#1660）。`[0] == 0` なので添字は必ず 1 以上になる
+        let line = self.line_starts.partition_point(|&start| start <= offset) - 1;
+        (line, offset - self.line_starts[line])
     }
 
     /// 行番号 + 行内バイト位置を文書全体の UTF-8 バイト位置へ変換する。
     pub fn offset_for_line_byte_col(&self, line: usize, byte_col: usize) -> usize {
-        let start = line_start_offset(&self.text, line).unwrap_or(self.text.len());
+        let start = self.line_start_of(line).unwrap_or(self.text.len());
         let end = line_end_offset(&self.text, start);
         snap_cursor(&self.text, (start + byte_col).min(end))
     }
@@ -1720,7 +1732,44 @@ impl TextBuffer {
     /// 文書の行数（#1658）。末尾が改行で終わるファイルは、その後ろの**空行も 1 行**と
     /// 数える（`"a\n"` は 2 行）。カーソルはそこへ置けるので、行として在る
     pub fn line_count(&self) -> usize {
-        self.text.bytes().filter(|byte| *byte == b'\n').count() + 1
+        self.line_starts.len()
+    }
+
+    /// 行頭のバイト位置の一覧（#1660）。`[行番号]` がその行の頭。
+    /// 描画が表示行ごとの頭を引くのに使う（本文を数え直して作らない）
+    pub fn line_starts(&self) -> &[usize] {
+        &self.line_starts
+    }
+
+    /// その行（0 始まり）の頭のバイト位置（#1660）。文書の範囲外なら `None`
+    fn line_start_of(&self, line: usize) -> Option<usize> {
+        self.line_starts.get(line).copied()
+    }
+
+    /// 本文の `range` を `replacement` へ置き換えるのに合わせて行頭索引を直す（#1660）。
+    ///
+    /// **`self.text` を書き換える直前に呼ぶ**（位置はどちらも置き換え前の本文で数える）。
+    /// 消える範囲の中にあった行頭を外し、`replacement` の改行ぶんを足して、
+    /// 後ろの行頭を長さの差だけずらす。ずらすのは O(後ろの行数) の足し算だけで、
+    /// 本文を読み直さない
+    fn splice_line_starts(&mut self, range: Range<usize>, replacement: &str) {
+        let first = self
+            .line_starts
+            .partition_point(|&start| start <= range.start);
+        let last = self
+            .line_starts
+            .partition_point(|&start| start <= range.end);
+        let inserted: Vec<usize> = replacement
+            .match_indices('\n')
+            .map(|(i, _)| range.start + i + 1)
+            .collect();
+        let added = inserted.len();
+        self.line_starts.splice(first..last, inserted);
+        let removed = range.end - range.start;
+        let added_bytes = replacement.len();
+        for start in &mut self.line_starts[first + added..] {
+            *start = *start + added_bytes - removed;
+        }
     }
 
     /// その行の長さ（バイト。**改行コードは含まない**。#1658）。
@@ -1728,7 +1777,7 @@ impl TextBuffer {
     /// CRLF の行では CR も含めない = 桁の上限が CR の手前になるので、
     /// 「CR と LF のあいだ」を指す桁は範囲外として弾かれる（#1650 の契約）
     fn line_span(&self, line: usize) -> Option<Range<usize>> {
-        let start = line_start_offset(&self.text, line)?;
+        let start = self.line_start_of(line)?;
         Some(start..line_end_offset(&self.text, start))
     }
 
@@ -1918,7 +1967,7 @@ impl TextBuffer {
         if target_line == line {
             return self.cursor;
         }
-        let Some(start) = line_start_offset(&self.text, target_line) else {
+        let Some(start) = self.line_start_of(target_line) else {
             return self.cursor;
         };
         let line_text = &self.text[start..self.line_end(start)];
@@ -2075,11 +2124,11 @@ impl Lowered {
     }
 }
 
-fn line_start_offset(text: &str, target: usize) -> Option<usize> {
-    if target == 0 {
-        return Some(0);
-    }
-    text.match_indices('\n').nth(target - 1).map(|(i, _)| i + 1)
+/// 本文から行頭索引を作る（#1660。開いたときに 1 回だけ。以後は差分で追従する）
+fn compute_line_starts(text: &str) -> Vec<usize> {
+    std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+        .collect()
 }
 
 fn snap_boundary(text: &str, mut offset: usize) -> usize {
@@ -3799,6 +3848,187 @@ mod tests {
             while buffer.undo() {}
             assert_eq!(buffer.text().as_bytes(), original.as_bytes());
         }
+    }
+
+    // --- #1660: 行頭索引 ---
+
+    /// 行・桁の素朴な換算（索引を使わない正解）
+    fn naive_line_byte_col(text: &str, offset: usize) -> (usize, usize) {
+        let prefix = &text[..offset];
+        let line = prefix.bytes().filter(|b| *b == b'\n').count();
+        let start = prefix.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        (line, offset - start)
+    }
+
+    /// 行頭索引が本文から作り直したものと一致し、行・桁の換算が素朴な数え方と
+    /// 一致することを確かめる（#1660）
+    fn assert_line_index(buffer: &TextBuffer, rng: &mut Rng, label: &str) {
+        assert_eq!(
+            buffer.line_starts(),
+            compute_line_starts(buffer.text()).as_slice(),
+            "{label}: 行頭索引が本文とずれた"
+        );
+        assert_eq!(
+            buffer.line_count(),
+            buffer.text().bytes().filter(|b| *b == b'\n').count() + 1,
+            "{label}: 行数"
+        );
+        // 行・桁の換算は素朴な数え方と一致する（文字の途中は手前の境界へ寄る）
+        let len = buffer.text().len();
+        let probe = if len == 0 { 0 } else { rng.below(len + 1) };
+        let snapped = snap_boundary(buffer.text(), probe);
+        let (line, col) = buffer.line_byte_col(probe);
+        assert_eq!(
+            (line, col),
+            naive_line_byte_col(buffer.text(), snapped),
+            "{label}: line_byte_col({probe})"
+        );
+        // CR と LF のあいだは行末（CR の手前）へ寄せる契約（#1650）なので往復から外す
+        let between_crlf =
+            buffer.text()[..snapped].ends_with('\r') && buffer.text()[snapped..].starts_with('\n');
+        if !between_crlf {
+            assert_eq!(
+                buffer.offset_for_line_byte_col(line, col),
+                snapped,
+                "{label}: offset_for_line_byte_col({line}, {col})"
+            );
+        }
+    }
+
+    /// 検索条件の 4 通り（#1653: 大文字小文字の区別 × 単語単位）
+    fn search_options(rng: &mut Rng) -> SearchOptions {
+        SearchOptions {
+            case_sensitive: rng.below(2) == 0,
+            whole_word: rng.below(2) == 0,
+        }
+    }
+
+    /// 本文を書き換える公開の口すべて（置換の 4 条件を含む）をランダムに混ぜても、
+    /// 行頭索引は本文から作り直したものと常に一致する（#1660 × #1653 / #1654 / #1658 / #1742）。
+    ///
+    /// 構造の保証は番犬 2 本（#1651 = 本文を書き換えるのは `apply_edit` / `undo` / `redo` だけ・
+    /// #1660 = その 3 つが索引を追従させる）で、ここは**実際の編集列**で確かめる。置換は
+    /// 大文字小文字を畳むと長さが変わる字（`İ` = 2 バイト → `i̇` = 3 バイト・`ẞ` → `ß`）と
+    /// 改行を含む置換文字列を混ぜ、ヒットの位置が元の本文のバイト位置へ正しく戻らないと
+    /// 索引が本文とずれる形にしてある
+    #[test]
+    fn 行頭索引は置換を含むすべての書き換え経路のあとも本文から作り直したものと一致する() {
+        let seeds = [
+            "",
+            "abc\ndef\n",
+            "a日本語\nz",
+            "l1\r\nl2\r\n日本\r\n",
+            "\n\n\n",
+            "let value = Value::new();\nVALUE value_x 値value\n",
+            "İstanbul i̇ ẞtraße\r\nß SS İ\r\nVALUE\r\n",
+            "\tfn a() {\n\t\tvalue\n\t}\n",
+        ];
+        const QUERIES: [&str; 7] = ["a", "value", "VALUE", "İ", "ẞ", "\n", "e\nV"];
+        const REPLACEMENTS: [&str; 6] = ["", "\n", "x\r\ny", "İ\n", "Value", "\n\n改行\n"];
+        const MOTIONS: [DeleteMotion; 6] = [
+            DeleteMotion::CharBackward,
+            DeleteMotion::CharForward,
+            DeleteMotion::WordBackward,
+            DeleteMotion::WordForward,
+            DeleteMotion::ToLineStart,
+            DeleteMotion::ToLineEnd,
+        ];
+        let mut replaced = 0usize;
+        for (i, original) in seeds.iter().enumerate() {
+            let mut rng = Rng(0x1660_0000 + i as u64);
+            let mut buffer = TextBuffer::from_text(path("index"), (*original).into());
+            for step in 0..600 {
+                buffer.set_clock_millis((step as u64) * 97);
+                let len = buffer.text().len();
+                let pos = if len == 0 { 0 } else { rng.below(len + 1) };
+                let query = QUERIES[rng.below(QUERIES.len())];
+                let replacement = REPLACEMENTS[rng.below(REPLACEMENTS.len())];
+                let op = rng.below(18);
+                match op {
+                    0 => buffer.insert("a"),
+                    1 => buffer.insert("日本\n語\n"),
+                    2 => {
+                        buffer.set_cursor(pos, false);
+                        buffer.delete_backward();
+                    }
+                    3 => {
+                        buffer.set_cursor(pos, false);
+                        buffer.delete_forward();
+                    }
+                    4 => {
+                        let end = if len == 0 { 0 } else { rng.below(len + 1) };
+                        buffer.set_selection(pos, end);
+                        buffer.insert("Z\r\nZ\n");
+                    }
+                    5 => buffer.set_text("全文\n差し替え\r\n".into()),
+                    // #1653: 全置換（4 条件）
+                    6 | 7 => {
+                        replaced +=
+                            buffer.replace_all(query, replacement, search_options(&mut rng));
+                    }
+                    // #1653: 1 件置換（4 条件。カーソル以降の最初のヒット）
+                    8 | 9 => {
+                        buffer.set_cursor(pos, false);
+                        replaced +=
+                            buffer.replace_next(query, replacement, search_options(&mut rng));
+                    }
+                    10 => {
+                        buffer.undo();
+                    }
+                    11 => {
+                        buffer.redo();
+                    }
+                    12 => {
+                        buffer.set_cursor(pos, false);
+                        buffer.delete(MOTIONS[rng.below(MOTIONS.len())]);
+                    }
+                    13 => {
+                        let end = if len == 0 { 0 } else { rng.below(len + 1) };
+                        buffer.set_selection(pos, end);
+                        if rng.below(2) == 0 {
+                            buffer.indent();
+                        } else {
+                            buffer.outdent();
+                        }
+                    }
+                    14 => {
+                        buffer.set_cursor(pos, false);
+                        buffer.newline_and_indent();
+                    }
+                    15 => {
+                        let start = snap_boundary(buffer.text(), pos);
+                        let end = snap_boundary(buffer.text(), rng.below(len + 1).max(start));
+                        buffer.replace_range(start.min(end)..end.max(start), replacement);
+                    }
+                    // #1658: 行・桁で指す範囲編集（解けない指定は何もしないで拒否 = それも確かめる）
+                    16 => {
+                        let lines = buffer.line_count();
+                        let edit = RangeEdit {
+                            start: TextPosition::new(1 + rng.below(lines), rng.below(4)),
+                            end: TextPosition::new(1 + rng.below(lines + 1), rng.below(6)),
+                            text: replacement.into(),
+                            expected_version: None,
+                        };
+                        let _ = buffer.replace_position_range(&edit);
+                    }
+                    _ => buffer.newline(),
+                }
+                let label = format!("seed {i} step {step} op {op} query {query:?}");
+                assert_line_index(&buffer, &mut rng, &label);
+            }
+            // 最後に履歴を底まで戻し、また先頭まで進め直しても索引は本文と一致する
+            let mut guard = 0;
+            while buffer.undo() {
+                guard += 1;
+                assert!(guard < 10_000, "undo が止まらない");
+                assert_line_index(&buffer, &mut rng, &format!("seed {i} undo {guard}"));
+            }
+            while buffer.redo() {
+                assert_line_index(&buffer, &mut rng, &format!("seed {i} redo"));
+            }
+        }
+        // 置換の経路を実際に通ったこと（当たらない列だけで緑になっていない）
+        assert!(replaced > 100, "置換が {replaced} 件しか起きていない");
     }
 
     // --- #1658: 行・桁で指す範囲編集と文書の版 ---

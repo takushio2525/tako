@@ -2861,11 +2861,69 @@ impl TakoApp {
                 .spawn(async move { preview::highlight_text(&p, &text) });
             let lines = task.await;
             let _ = this.update(cx, |app, cx| {
+                // #1660: 編集セッションがあれば表示行はエディタの持ち物（打った分を
+                // 反映している）。読み取り表示の塗りで上書きすると、大きいファイルを
+                // 開いてすぐ編集を始めたとき（塗りに数秒かかる）打った文字が表示から消える
+                if app.preview_edits.contains_key(&pane) {
+                    return;
+                }
                 if let Some(state) = app.previews.get_mut(&pane) {
                     if state.path == path {
                         state.content = preview::PreviewContent::Code(lines);
+                        state.content_rev = preview::next_content_rev();
                         cx.notify();
                     }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 編集セッションが全文の塗りを待っていれば、その材料を待ち行列へ積む（#1660）
+    pub(crate) fn queue_editor_seed(&mut self, pane: PaneId) {
+        if let Some(request) = self
+            .preview_edits
+            .get_mut(&pane)
+            .and_then(preview::EditState::take_seed_request)
+        {
+            self.pending_editor_seeds.push((pane, request));
+        }
+    }
+
+    /// 積まれた全文の塗りを background で起こす（#1660。render の入口から呼ぶ）
+    pub(crate) fn drain_pending_editor_seeds(&mut self, cx: &mut Context<Self>) {
+        for (pane, request) in std::mem::take(&mut self.pending_editor_seeds) {
+            self.spawn_editor_seed(pane, request, cx);
+        }
+    }
+
+    /// 大きい文書の全文を background で塗り、終わったら編集セッションへ取り込む（#1660）。
+    ///
+    /// 塗っている間に打った分は取り込むときに差分で塗り足す。差分が大きければ
+    /// 取り込まずに今の本文で出し直す（`adopt_editor_seed` が印を立て直す）
+    pub(crate) fn spawn_editor_seed(
+        &self,
+        pane: PaneId,
+        request: preview::SeedRequest,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let task = cx
+                .background_executor()
+                .spawn(async move { preview::seed_editor_highlight(request) });
+            let seed = task.await;
+            let _ = this.update(cx, |app, cx| {
+                let (previews, edits) = (&mut app.previews, &mut app.preview_edits);
+                let (Some(state), Some(edit)) = (previews.get_mut(&pane), edits.get_mut(&pane))
+                else {
+                    return;
+                };
+                if preview::adopt_editor_seed(state, edit, seed) {
+                    cx.notify();
+                }
+                // 取り込めなかった（差分が大きい / 構文セットを載せ直した）なら出し直す
+                if let Some(request) = edit.take_seed_request() {
+                    app.spawn_editor_seed(pane, request, cx);
                 }
             });
         })

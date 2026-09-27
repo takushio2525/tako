@@ -1487,6 +1487,11 @@ fn preview_edit_reply(host: &dyn ControlHost, target: PaneId) -> Value {
     if let Some(viewport) = host.preview_viewport(target) {
         out["viewport"] = viewport;
     }
+    // #1660: 上限を超えて編集できないなら、理由と値を**無言にせず**載せる
+    // （`tako edit start` が断った理由を `tako edit status` でも読める）
+    if let Some(limit) = host.preview_limit(target) {
+        out["limit"] = limit;
+    }
     out
 }
 
@@ -16431,6 +16436,8 @@ mod tests {
             std::collections::HashMap<u64, (bool, bool, tako_core::text_edit::TextBuffer)>,
         /// 検索欄の状態（#1653）: (クエリ, 条件)。GUI の `EditState` の検索部分の写し
         preview_search: std::collections::HashMap<u64, (String, SearchOptions)>,
+        /// #1660: 上限を超えて末尾を省略したプレビュー（GUI の `PreviewState::truncated` の代役）
+        preview_limits: std::collections::HashMap<u64, tako_core::preview_limit::Truncation>,
         collapsed: std::collections::HashSet<u64>,
         /// ピン留め: (group, id)
         pins: Vec<(bool, u64)>,
@@ -16529,6 +16536,7 @@ mod tests {
                 last_outline_target: None,
                 preview_edits: std::collections::HashMap::new(),
                 preview_search: std::collections::HashMap::new(),
+                preview_limits: std::collections::HashMap::new(),
                 collapsed: std::collections::HashSet::new(),
                 pins: Vec::new(),
                 stale_pane_map: std::collections::HashMap::new(),
@@ -17065,6 +17073,11 @@ mod tests {
         /// #1649: 器の寸法を持たないモックでも「応答へ載るか」は測れるので、
         /// 編集セッションがあるときだけ固定の形を返す（値の正しさは
         /// `tako_core::editor_scroll` の単体テストと visual-test 節が見る）
+        fn preview_limit(&self, pane: PaneId) -> Option<serde_json::Value> {
+            self.preview_limits
+                .get(&pane.as_u64())
+                .map(tako_core::preview_limit::Truncation::to_json)
+        }
         fn preview_viewport(&self, pane: PaneId) -> Option<serde_json::Value> {
             self.preview_edits.get(&pane.as_u64())?;
             Some(json!({
@@ -17076,6 +17089,12 @@ mod tests {
         fn set_preview_editing(&mut self, pane: PaneId, enabled: bool) -> Result<(), String> {
             if !self.previews.contains_key(&pane.as_u64()) {
                 return Err("プレビューペインではない".into());
+            }
+            // #1660: GUI の `EditState::open` と同じ 1 実装の文面で断る
+            if let Some(limit) = self.preview_limits.get(&pane.as_u64()) {
+                if enabled {
+                    return Err(limit.edit_refusal());
+                }
             }
             let edit = self.preview_edits.entry(pane.as_u64()).or_insert_with(|| {
                 (
@@ -21187,6 +21206,99 @@ mod tests {
             text: text.into(),
             expected_version: None,
         }
+    }
+
+    /// #1660: 上限を超えて末尾を省略したプレビューは、編集の開始を**理由と値つきで**断り、
+    /// 状態取得の応答（`tako edit status` / MCP `tako_preview_edit` の enabled 省略）に
+    /// `limit` を載せる。CLI と MCP は同じ dispatch なので、発生源を変えても同じ文面
+    #[test]
+    fn preview上限を超えた編集は理由と値を返す() {
+        use tako_core::preview_limit::{Truncation, MAX_LINES};
+        let dir = std::env::temp_dir().join(format!("tako-dispatch-limit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let file = dir.join("huge.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        let opened = dispatch(
+            &mut host,
+            Request::OpenFile {
+                pane: Some(root),
+                path: file.display().to_string(),
+                mode: Some(PreviewModeWire::Code),
+                direction: None,
+                focus: None,
+                new_tab: false,
+                line: None,
+                column: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let pane = opened["pane"].as_u64().unwrap();
+        host.preview_limits.insert(
+            pane,
+            Truncation::Lines {
+                lines: MAX_LINES + 1,
+            },
+        );
+
+        let mut refusals = Vec::new();
+        for origin in [PaneOrigin::Cli, PaneOrigin::Mcp] {
+            let err = dispatch(
+                &mut host,
+                Request::PreviewEdit {
+                    pane: Some(pane),
+                    enabled: Some(true),
+                },
+                origin,
+            )
+            .expect_err("上限を超えたプレビューは編集を始めない");
+            refusals.push(err.to_string());
+        }
+        assert!(
+            refusals[0].contains("100,001 行（上限 100,000 行）"),
+            "断る文面に数えた行数と上限が載る: {}",
+            refusals[0]
+        );
+        assert_eq!(refusals[0], refusals[1], "CLI と MCP で同じ文面");
+
+        let status = dispatch(
+            &mut host,
+            Request::PreviewEdit {
+                pane: Some(pane),
+                enabled: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(status["editing"].as_bool(), Some(false));
+        assert_eq!(status["limit"]["reason"], "lines");
+        assert_eq!(status["limit"]["lines"], MAX_LINES + 1);
+        assert_eq!(status["limit"]["max_lines"], MAX_LINES);
+        assert!(status["limit"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("100,001 行"));
+
+        // 上限の内側のプレビューは `limit` を載せない（無いことが「編集できる」の印）
+        host.preview_limits.clear();
+        let ok = dispatch(
+            &mut host,
+            Request::PreviewEdit {
+                pane: Some(pane),
+                enabled: Some(true),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(ok["editing"].as_bool(), Some(true));
+        assert!(
+            ok.get("limit").is_none(),
+            "上限の内側なら limit は無い: {ok}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
