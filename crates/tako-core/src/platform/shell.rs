@@ -1961,6 +1961,8 @@ mod tests_1657 {
     const MARKER: &str = "__TAKO_EXIT=";
     const PWSH: &str = "C:\\Program Files\\PowerShell\\7\\pwsh.exe";
 
+    /// 使うのは posix の実行ペインの検査（`#[cfg(unix)]`）だけ（#1827）
+    #[cfg(unix)]
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "tako-1657-shell-{tag}-{}-{:?}",

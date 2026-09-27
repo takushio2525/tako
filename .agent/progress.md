@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-09-27（#1758: CLI の出力をパイプで途中で閉じても panic しないようにし、gate の証拠の字下げを揃えた）
-- std の `println!` が EPIPE で panic していた（実測: `agent-support --json | head -1` で panic 2 つ + 終了コード 101。Windows は `ERROR_NO_DATA`）。tako-cli の出力マクロ 4 種を `stdio.rs` の同名マクロへ差し替え、標準出力の切断は `resume_unwind` で静かに 0、標準エラーの切断は捨てて続行（失敗の 1 を保つ）。SIGPIPE を既定へ戻す案は Windows に効かず `remote serve` の daemon を殺すので不採用。`gate set / check / show` の証拠は全行へ同じ字下げ
-- 実測: 統合テスト 4 本（読み手を先に閉じたパイプ / 111 KB の 1 行読み / `2>&1` 形で終了コード保持 / 宣言順の番犬）+ unit 2 本。注入 7 通りすべて FAILED → 戻して緑。`mcp serve` の終わり方 4 通りは修正前と字面一致・workspace 5971 passed 0 failed・clippy 3 宇宙 0
-
 ## 2026-09-27（#1811: テスト判定から外れたら安全側へ倒し、deps/ の外のテストバイナリが本番へ書かないようにした）
 - `is_test_process()` が置き場（`deps/`）だけで決まり、`/tmp` へコピーしたテストバイナリが本番の `recent.json` 上書き・`cli-dir` を空に・実 agent CLI を実 HOME で起動した。製品の `main`（`tako-app` / `tako`）の 1 文目で `paths::mark_product_process()` を呼び、「`deps/` にある **または** 宣言が無い」をテストとする（規則は `judge_test_process` の 1 実装・倒した回は stderr へ 1 回知らせる）
 - 実測: 一時 HOME を本番に見立てた再現で修正前 17 ファイル → 修正後 0（同じ名前 / 改名とも）・製品 `tako` は一時 HOME の本番相当を解決し知らせ無し・番犬 3 段（入口の静的検査 / deps 外の子 / 製品 CLI の実行時）へ注入 5 通りすべて FAILED → 戻して緑
@@ -69,3 +65,7 @@
 ## 2026-09-27（#1778: split --command の保持を側路へ寄せ、プログラムが印字したマーカーで偽の確定をしないようにした）
 - `split --command` の失敗時の保持が画面へ `__TAKO_EXIT=N` を出し、読む側は側路を持つ実行ペインでも画面を読んでいた（`__TAKO_EXIT=7` を印字して 0 で終わると 7 で確定・3000 行印字すると 141 で確定）。側路を `Pane::exit_file` へ移し、保持も実行ペインと同じ置き場・同じ伝える片（`posix_exit_report` / `powershell_exit_report`）へ寄せた。`run_pane_exit_code` は側路を持つペインで画面を読まない。`--wait` の打ち切りは exit 124、auto_close のペインログは `close:auto`
 - 実測: `scripts/test-run-pane-followup-1778.sh` main 26 PASS 15 FAIL → 修正後 41 PASS 0 FAIL・注入 5 通りすべて file:line 名指しで FAILED → 戻して緑・workspace 6117 passed 0 failed・clippy 3 宇宙 0・check-windows error 0・MCP カタログ +0 B
+
+## 2026-09-27（#1832 / #1814 / #1827: 偽の FAILED になるテスト 3 本と Windows の未使用警告を直した）
+- tailscale のスタブは作った直後の起動が負荷で 1 秒を超えていた（54 回中 24 回）→ 終わるスタブは終わるまで待つ。`depsの外でも明示…` は子が出力ゼロで死ぬ形（原因は未確定）→ その回だけ上限 3 回で起こし直し終了状態を残す。`issue1724_…` は端末 ID の印の行だけ数える
+- 実測: 注入 A/B（上限 1ms / 最初の子を SIGKILL）before 10/10 FAIL → after 0/10・data dir 使い回し 3 回緑・check-windows warning 31 → 28・workspace 6074 passed 0 failed

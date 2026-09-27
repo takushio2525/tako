@@ -44,10 +44,15 @@ mod tests {
     const RESOLVED_MARKER: &str = "TAKO_1261_RESOLVED=";
 
     /// 子に**実シェルを起こさせる**ときの目印（#1253）
+    #[cfg(unix)]
     const SHELL_PROBE_ENV: &str = "TAKO_1253_SHELL_PROBE";
 
     /// シェル probe が打つコマンドの目印
+    #[cfg(unix)]
     const SHELL_PROBE_MARKER: &str = "TAKO_1253_HISTORY_MARKER";
+
+    /// 出力ゼロで終わった子を起こし直す上限（初回を含む。[`run_child_at`]。#1832）
+    const SILENT_CHILD_ATTEMPTS: usize = 3;
 
     /// 空の `HOME`（と必要なら `TAKO_DATA_DIR`）で子テストを 1 回走らせる。
     /// 戻り値は `(子の終了状態が成功か, 子の標準出力, HOME 配下に出来たファイル)`
@@ -113,9 +118,29 @@ mod tests {
         for (key, val) in extra {
             cmd.env(key, val);
         }
-        let out = cmd.output().expect("子テストプロセスを起こせる");
+        // 子が **1 バイトも出さずに**失敗した回は、子のテスト本体まで届いていない
+        // （libtest は本体より先に `running 1 test` を出す）= 見たい性質を 1 つも検査して
+        // いないし、書き込みも起きていない。#1832 で観測した落ち方がこれ（負荷の下の
+        // workspace 全体の実行で 1 回。子の stdout / stderr はどちらも空）なので、上限つきで
+        // 起こし直す。諦めたときは各回の終了状態（コード / シグナル）を出力の末尾へ残す
+        let mut statuses: Vec<String> = Vec::new();
+        let out = loop {
+            let out = cmd.output().expect("子テストプロセスを起こせる");
+            let reached = out.status.success() || !out.stdout.is_empty() || !out.stderr.is_empty();
+            if reached || statuses.len() + 1 >= SILENT_CHILD_ATTEMPTS {
+                break out;
+            }
+            statuses.push(out.status.to_string());
+        };
         let mut stdout = String::from_utf8_lossy(&out.stdout).to_string();
         stdout.push_str(&String::from_utf8_lossy(&out.stderr));
+        if !out.status.success() {
+            statuses.push(out.status.to_string());
+            stdout.push_str(&format!(
+                "\n[#1832] 子の終了状態（起こし直した回を含む）: {}\n",
+                statuses.join(" / ")
+            ));
+        }
         (out.status.success(), stdout, files_under(fake_home))
     }
 

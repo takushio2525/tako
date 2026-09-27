@@ -1275,16 +1275,21 @@ mod tests {
         // 返ること自体が「待ち切らずに打ち切った」証拠（所要は assert しない = conventions.md）
         let hang = stub("hang", "exec /bin/sleep 30");
         let missing = dir.path().join("missing");
-        let budget = std::time::Duration::from_secs(1);
+        // 自分で終わるスタブ（ok / nonzero）は**終わるまで待つ**。作った直後のスタブの起動は
+        // 負荷の下で 1 秒を超える（#1832 の実測: 54 回中 24 回が 1 秒で打ち切られた。
+        // 同じ負荷でも `/bin/echo` は 30ms 未満）ので、短い上限では `ok` が「動かない」に化ける。
+        // 打ち切りを見る `hang` だけを短い上限で試す（遅れても打ち切られるだけで答えは変わらない）
+        let until_exit = std::time::Duration::from_secs(60);
+        let cut_off = std::time::Duration::from_secs(1);
 
-        assert_eq!(probe_candidate(&ok, budget), CandidateProbe::Runnable);
+        assert_eq!(probe_candidate(&ok, until_exit), CandidateProbe::Runnable);
         assert_eq!(
-            probe_candidate(&nonzero, budget),
+            probe_candidate(&nonzero, until_exit),
             CandidateProbe::Unrunnable
         );
-        assert_eq!(probe_candidate(&hang, budget), CandidateProbe::Unrunnable);
+        assert_eq!(probe_candidate(&hang, cut_off), CandidateProbe::Unrunnable);
         assert_eq!(
-            probe_candidate(missing.to_str().expect("UTF-8"), budget),
+            probe_candidate(missing.to_str().expect("UTF-8"), until_exit),
             CandidateProbe::Absent
         );
     }
