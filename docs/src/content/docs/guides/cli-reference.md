@@ -437,6 +437,8 @@ tako lsp diagnostics --pane 7 --severity warning   # そのペインの、警告
 
 `--name rust-analyzer` のように 1 つだけを指定できます。MCP では `tako_lsp_server`（`action` 引数）が同じ操作です。
 
+`tako lsp servers` の答え（入っているか・どこに在るか）は覚えておくので、2 回目からはすぐ返ります。探し直すのは `tako lsp restart` のときと、tako のターミナルでコマンドを実行したり `cd` したりしたとき（PATH が変わりうるため）です。同じファイルを 2 つのペインで編集しても、言語サーバには 1 つの文書として届き、診断は両方のペインに出ます。
+
 `tako lsp diagnostics` は 1 件 1 行で `行:桁-行:桁  重大度  メッセージ  (出所 コード)` を出します。位置は `tako edit replace-range` と同じ（行は 1 始まり・桁は 0 始まりのバイト）なので、そのまま範囲編集へ渡せます。`--severity` は `error` / `warning` / `info` / `hint` で、**その重大度以上**に絞ります。`--json` を付けると重大度ごとの数（`counts`）と、tako が保持している診断の総数（`retained`）も返ります。MCP では `tako_lsp`（`action=diagnostics`）が同じ操作です。
 
 #### 定義へ飛ぶ（tako lsp definition）

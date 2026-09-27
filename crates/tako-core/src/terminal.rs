@@ -1019,6 +1019,11 @@ impl TerminalSession {
 
     /// OSC 7 / 133 タップの検知を cwd・コマンド実行状態へ反映する（FR-2.4.1）
     fn process_osc_event(&mut self, event: OscEvent) {
+        // #1769: PATH が変わりうる出来事（cwd の変化・コマンドの終わり）を数える
+        // （LSP のサーバ解決のキャッシュが引き直す合図。`shell_activity` の冒頭）
+        if crate::shell_activity::is_activity(self.cwd.as_deref(), &event) {
+            crate::shell_activity::note();
+        }
         match event {
             OscEvent::CwdChanged(path) => self.cwd = Some(path),
             OscEvent::Mark(mark) => {

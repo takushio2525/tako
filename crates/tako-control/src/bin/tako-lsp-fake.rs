@@ -42,7 +42,24 @@
 //!
 //! `method` / `uri_suffix` / `line`（要求の 0 起点の行）は省けば何にでも当たる。
 //! `silent` は答えない（未応答の検査）、`crash` は自分で落ちる（途中で落ちたときの検査）。
+//! `echo` は問われた位置の語（英数字と `_`）の範囲をそのまま `Location` で返す（#1769。
+//! 位置を往復させて tako の変換とサーバの数え方が揃っているかを見る）。
 //! 当たる規則が無ければ `null`（= 見つからない）で答える。
+//!
+//! ## 本文の模型（#1769）
+//!
+//! 受けた本文（didOpen の全文・didChange の範囲 / 全文）を**自前で当てて**持つ。位置の数え方は
+//! **tako の実装を使わずに**ここで組む（tako の変換に穴があっても偽サーバが同じ穴で辻褄を
+//! 合わせないように）。`--line-breaks <spec|lf>`（`TAKO_LSP_FAKE_LINE_BREAKS`。既定 `spec`）:
+//!
+//! - `spec` = `\n` / `\r\n` / 単独の `\r` で行を区切る（LSP の仕様。pyright / TypeScript の実測）
+//! - `lf` = `\n` だけで区切る（rust-analyzer / clangd が問い合わせの位置を数える形の実測）
+//!
+//! `--mark <語>`（`TAKO_LSP_FAKE_MARK`）を渡すと、didOpen / didChange のたびに自分の本文で
+//! その語が現れる所すべてへ診断を publish する（`message` は `<語>#<0 起点の番号>`）。
+//! `--doc-log <file>`（`TAKO_LSP_FAKE_DOC_LOG`）を渡すと、当てた後の全文（`fake_doc`）と
+//! `echo` で問われた位置の語（`fake_goto`）を 1 行 1 JSON で残す（`--log` とは別のファイル =
+//! 受けたメッセージの並びを数えるテストの添字をずらさない）。
 
 use std::io::{BufRead, BufReader, Write};
 
@@ -134,6 +151,140 @@ const GOTO_PROVIDERS: [&str; 4] = [
     "implementationProvider",
 ];
 
+/// 行の数え方（#1769。模型の説明は冒頭）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Breaks {
+    Spec,
+    Lf,
+}
+
+/// 各行の先頭バイト位置
+fn line_starts(text: &str, breaks: Breaks) -> Vec<usize> {
+    let bytes = text.as_bytes();
+    let mut starts = vec![0];
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => starts.push(i + 1),
+            b'\r' if breaks == Breaks::Spec => {
+                if bytes.get(i + 1) == Some(&b'\n') {
+                    i += 1;
+                }
+                starts.push(i + 1);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    starts
+}
+
+/// `line` 行目の中身の範囲（改行を除く。`lf` でも `\r\n` の `\r` は除く）
+fn line_span(text: &str, starts: &[usize], line: usize, breaks: Breaks) -> (usize, usize) {
+    let start = starts[line];
+    let bytes = text.as_bytes();
+    let mut end = starts.get(line + 1).copied().unwrap_or(text.len());
+    if end > start && bytes[end - 1] == b'\n' {
+        end -= 1;
+        if end > start && bytes[end - 1] == b'\r' {
+            end -= 1;
+        }
+    } else if end > start && bytes[end - 1] == b'\r' && breaks == Breaks::Spec {
+        end -= 1;
+    }
+    (start, end)
+}
+
+/// `(行, UTF-16 桁)` → バイト位置（行末・本文の末尾で頭打ち）
+fn offset_at(text: &str, breaks: Breaks, line: usize, character: usize) -> usize {
+    let starts = line_starts(text, breaks);
+    if line >= starts.len() {
+        return text.len();
+    }
+    let (start, end) = line_span(text, &starts, line, breaks);
+    let mut units = 0;
+    for (i, ch) in text[start..end].char_indices() {
+        if units >= character {
+            return start + i;
+        }
+        units += ch.len_utf16();
+    }
+    end
+}
+
+/// バイト位置 → `(行, UTF-16 桁)`
+fn position_at(text: &str, breaks: Breaks, offset: usize) -> (usize, usize) {
+    let starts = line_starts(text, breaks);
+    let line = starts.partition_point(|&s| s <= offset) - 1;
+    let (start, end) = line_span(text, &starts, line, breaks);
+    let character = text[start..offset.min(end)]
+        .chars()
+        .map(char::len_utf16)
+        .sum();
+    (line, character)
+}
+
+fn range_json(text: &str, breaks: Breaks, from: usize, to: usize) -> serde_json::Value {
+    let (sl, sc) = position_at(text, breaks, from);
+    let (el, ec) = position_at(text, breaks, to);
+    serde_json::json!({
+        "start": { "line": sl, "character": sc },
+        "end": { "line": el, "character": ec },
+    })
+}
+
+/// didOpen / didChange を自前の模型へ当てる
+fn apply_document(
+    docs: &mut std::collections::HashMap<String, String>,
+    breaks: Breaks,
+    method: &str,
+    params: &serde_json::Value,
+) -> Option<String> {
+    let uri = params["textDocument"]["uri"].as_str()?.to_string();
+    if method == "textDocument/didOpen" {
+        let text = params["textDocument"]["text"].as_str()?.to_string();
+        docs.insert(uri.clone(), text);
+        return Some(uri);
+    }
+    let text = docs.get_mut(&uri)?;
+    for change in params["contentChanges"].as_array()? {
+        let new = change["text"].as_str()?;
+        match change.get("range") {
+            Some(range) => {
+                let at = |key: &str| {
+                    let p = &range[key];
+                    offset_at(
+                        text,
+                        breaks,
+                        p["line"].as_u64().unwrap_or(0) as usize,
+                        p["character"].as_u64().unwrap_or(0) as usize,
+                    )
+                };
+                let (from, to) = (at("start"), at("end"));
+                text.replace_range(from..to.max(from), new);
+            }
+            None => *text = new.to_string(),
+        }
+    }
+    Some(uri)
+}
+
+/// 語の範囲（英数字と `_`）。位置が語の上に無ければ `None`
+fn word_at(text: &str, offset: usize) -> Option<(usize, usize)> {
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let start = text[..offset]
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| is_word(*c))
+        .last()
+        .map_or(offset, |(i, _)| i);
+    let end = text[offset..]
+        .char_indices()
+        .find(|(_, c)| !is_word(*c))
+        .map_or(text.len(), |(i, _)| offset + i);
+    (end > start).then_some((start, end))
+}
+
 /// 規則のうち、この要求に最初に当たるもの
 fn goto_rule<'a>(
     rules: &'a [serde_json::Value],
@@ -163,6 +314,14 @@ fn main() {
         .and_then(|path| std::fs::read_to_string(path).ok())
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default();
+    // #1769: 本文の模型（冒頭の説明）
+    let breaks = match arg_or_env(&args, "--line-breaks", "TAKO_LSP_FAKE_LINE_BREAKS").as_deref() {
+        Some("lf") => Breaks::Lf,
+        _ => Breaks::Spec,
+    };
+    let mark = arg_or_env(&args, "--mark", "TAKO_LSP_FAKE_MARK");
+    let doc_log = arg_or_env(&args, "--doc-log", "TAKO_LSP_FAKE_DOC_LOG");
+    let mut docs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     append(&spawns, &std::process::id().to_string());
     eprintln!("tako-lsp-fake: scenario={scenario}");
     if scenario == "die" {
@@ -183,6 +342,40 @@ fn main() {
         append(&log, &message.to_string());
         let method = message.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let id = message.get("id").cloned();
+        if matches!(method, "textDocument/didOpen" | "textDocument/didChange") {
+            let params = &message["params"];
+            if let Some(uri) = apply_document(&mut docs, breaks, method, params) {
+                let text = docs.get(&uri).cloned().unwrap_or_default();
+                let version = params["textDocument"]["version"].clone();
+                append(
+                    &doc_log,
+                    &serde_json::json!({
+                        "fake_doc": { "uri": uri, "version": version, "text": text }
+                    })
+                    .to_string(),
+                );
+                // `--mark`: 自分の本文でその語が現れる所すべてへ（`--diagnostics` が先に勝つ）
+                if let (Some(mark), None) = (&mark, &fixed) {
+                    let diagnostics: Vec<serde_json::Value> = text
+                        .match_indices(mark.as_str())
+                        .enumerate()
+                        .map(|(n, (at, _))| {
+                            serde_json::json!({
+                                "range": range_json(&text, breaks, at, at + mark.len()),
+                                "severity": 2,
+                                "message": format!("{mark}#{n}"),
+                            })
+                        })
+                        .collect();
+                    out.send(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "textDocument/publishDiagnostics",
+                        "params": { "uri": uri, "version": version, "diagnostics": diagnostics },
+                    }));
+                    continue;
+                }
+            }
+        }
         match (method, id) {
             ("initialize", Some(id)) => {
                 if scenario == "slow" {
@@ -291,6 +484,34 @@ fn main() {
                     std::process::exit(4);
                 }
                 if rule["silent"].as_bool() == Some(true) {
+                    continue;
+                }
+                if rule["echo"].as_bool() == Some(true) {
+                    // 問われた位置の語を自分の本文で引き、その範囲を返す（#1769）
+                    let params = &message["params"];
+                    let uri = params["textDocument"]["uri"].as_str().unwrap_or("");
+                    let text = docs.get(uri).cloned().unwrap_or_default();
+                    let line = params["position"]["line"].as_u64().unwrap_or(0) as usize;
+                    let character = params["position"]["character"].as_u64().unwrap_or(0) as usize;
+                    let offset = offset_at(&text, breaks, line, character);
+                    let word = word_at(&text, offset);
+                    append(
+                        &doc_log,
+                        &serde_json::json!({ "fake_goto": {
+                            "line": line,
+                            "character": character,
+                            "word": word.map(|(a, b)| text[a..b].to_string()),
+                        }})
+                        .to_string(),
+                    );
+                    let result = match word {
+                        Some((a, b)) => serde_json::json!({
+                            "uri": uri,
+                            "range": range_json(&text, breaks, a, b),
+                        }),
+                        None => serde_json::Value::Null,
+                    };
+                    out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }));
                     continue;
                 }
                 out.send(serde_json::json!({

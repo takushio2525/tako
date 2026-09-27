@@ -131,12 +131,12 @@ fn wait_until(what: &str, limit: Duration, mut done: impl FnMut() -> bool) {
     }
 }
 
-fn request(path: &Path, line: usize, character: usize, secs: u64) -> GotoRequest {
+fn request(path: &Path, line: usize, column: usize, secs: u64) -> GotoRequest {
     GotoRequest {
         kind: GotoKind::Definition,
         path: path.to_path_buf(),
         line,
-        character,
+        column,
         timeout: Duration::from_secs(secs),
         document: None,
     }

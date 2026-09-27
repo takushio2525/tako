@@ -570,19 +570,21 @@ fn restart_は今の本文で開き直す() {
     manager.shutdown_all(Duration::from_secs(2));
 }
 
-/// 同じファイルを 2 つ目のペインで開いても LSP へは 1 回しか開かない
+/// 同じファイルを 2 つ目のペインで開いても LSP へは 1 回しか開かない（#1769 からは断らずに
+/// 同じ文書の持ち手になる。編集・版・閉じ方は `issue1769_lsp_followup` が測る）
 #[test]
-fn 同じファイルの2つ目は断り1つ目を閉じたら開ける() {
+fn 同じファイルの2つ目は同じ文書の持ち手になる() {
     let scratch = Scratch::new("dup");
     let manager = LspManager::new(config(&scratch, "normal"));
     let path = scratch.file();
     let (mut first, mut second) = (DocLink::default(), DocLink::default());
     open(&manager, &mut first, &path, "a\n", 0);
     open(&manager, &mut second, &path, "a\n", 0);
-    assert!(matches!(second, DocLink::Declined { .. }));
-    drop(first);
-    open(&manager, &mut second, &path, "a\n", 0);
-    assert!(matches!(second, DocLink::Open(_)));
+    let (DocLink::Open(a), DocLink::Open(b)) = (&first, &second) else {
+        panic!("どちらも開いている: {first:?} / {second:?}");
+    };
+    assert_eq!(a.uri(), b.uri());
+    assert_eq!(manager.status(None)["documents"], json!(1));
     manager.shutdown_all(Duration::from_secs(2));
 }
 

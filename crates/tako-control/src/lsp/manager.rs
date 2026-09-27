@@ -12,6 +12,17 @@
 //! [`LspManager::servers`] / [`LspManager::restart`] / [`LspManager::stop`] は
 //! 待ちうるので、dispatch は `prepare_offload` で background へ出す。
 //!
+//! ## 実行ファイルの解決のキャッシュ（#1769）
+//!
+//! 解決（unix はサーバ 1 つにつきログインシェル 1 つ）の結果（見つかった + パス / 見つからない /
+//! 打ち切った）をサーバの ID ごとに持ち、`servers` と起動の両方が使う。**引き直すのは**
+//! `restart`（明示）と、PATH が変わりうる出来事（シェル統合が知らせた cwd の変化・コマンドの終わり =
+//! `tako_core::shell_activity`）があったときと、見つかったパスが実行できなくなったとき（stat 1 回）
+//! だけ。キャッシュに無いサーバの解決は並行して行う（1 つずつ待つと合計になる）。
+//! ログインシェルは `platform::exe::find_with_timeout`（Code Runner の #1730 と同じ 1 実装）=
+//! `probe::output_with_timeout` の上限を通る（profile が入力を待つ形でも固まらず、打ち切ったことを
+//! [`Launch::TimedOut`] で知らせる）。
+//!
 //! ## 文書の同期
 //!
 //! 文書ごとに**サーバへ送った本文の写し**を持ち、今の本文との差分を `didChange` で送る
@@ -20,6 +31,17 @@
 //!
 //! **サーバが無くても編集経路は何も変わらない**（ゼロコンフィグ原則）。対象外の拡張子・
 //! 未導入のサーバは [`DocLink::Declined`] で覚え、打鍵のたびに探し直さない。
+//!
+//! ## 同じファイルを複数のペインで開く（#1769）
+//!
+//! **1 URI = 1 文書**を持ち手（[`DocLease`]。編集セッション 1 つにつき 1 つ）で共有する
+//! （エディタで広く使われる形。LSP は 1 URI に 1 open しか許さない）。`didOpen` は最初の 1 つが
+//! 開いたとき、`didClose` は最後の 1 つが閉じたときだけ送る。どのペインの編集も**同じ文書の版**を
+//! 進める（版はペインの `TextBuffer::version` より小さくならないよう文書ごとに単調に進める =
+//! 2 つ目のペインのバッファの版は 1 つ目より若いことがある）。持ち手ごとに「最後に送った自分の
+//! バッファの版」を覚え、**自分の本文が変わったペインだけが送る**（変わっていないペインの同期で
+//! 相手の編集を巻き戻さない）。ペインごとのバッファは別々なので、サーバが見るのは最後に編集した
+//! ペインの本文で、診断はその本文の座標で両方のペインへ出る。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -29,7 +51,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use tako_core::lsp::servers::{self, ServerSpec};
 use tako_core::lsp::state::{Action, Event, Lifecycle, RestartPolicy, ServerState};
-use tako_core::lsp::{root, sync};
+use tako_core::lsp::{position, root, sync};
 use tako_core::platform::child_cmd::{self, ChildCmd};
 
 use super::diagnostics::{DiagnosticsStore, DocDiagnostics};
@@ -71,12 +93,14 @@ pub enum Launch {
         program: String,
         override_env: Option<String>,
     },
+    /// 探すのに起こしたログインシェルが上限までに返らなかった（#1769。打ち切った）
+    TimedOut { program: String, waited_secs: u64 },
 }
 
 /// 起動の方法を決める関数（本番は [`default_launch`]。テストは偽サーバを返す）
 pub type Launcher = Arc<dyn Fn(&ServerSpec) -> Launch + Send + Sync>;
 
-/// 本番の解決: `TAKO_LSP_BIN_<ID>` → `platform::exe::find`（境界 B16）→ `child_cmd`（B21）
+/// 本番の解決: `TAKO_LSP_BIN_<ID>` → `platform::exe::find_with_timeout`（境界 B16）→ `child_cmd`（B21）
 ///
 /// unix は `$SHELL -l -c 'exec <path> <args>'` で起こす（`.app` を Dock から起動すると
 /// PATH が最小構成で、rust-analyzer が `cargo` を見つけられない）。`exec` なので
@@ -93,7 +117,20 @@ pub fn default_launch(spec: &ServerSpec) -> Launch {
             }
             Some(path)
         }
-        _ => tako_core::platform::exe::find(spec.program),
+        // #1769: ログインシェルは上限つき（`probe::probe_timeout` = 既定 15 秒。外せない）
+        _ => {
+            let found = tako_core::platform::exe::find_with_timeout(
+                spec.program,
+                tako_core::probe::probe_timeout(),
+            );
+            if let Some(notice) = found.timeout {
+                return Launch::TimedOut {
+                    program: spec.program.to_string(),
+                    waited_secs: notice.waited_secs,
+                };
+            }
+            found.path
+        }
     };
     let Some(program_path) = resolved else {
         return Launch::NotFound {
@@ -165,17 +202,19 @@ pub enum DocLink {
     /// まだ試していない
     #[default]
     Unlinked,
-    /// 受け持つサーバが無い / 未導入 / 同じファイルを別のペインが開いている。
-    /// `epoch` が進むまで（restart・他の文書を閉じた）探し直さない
+    /// 受け持つサーバが無い / 未導入。`epoch` が進むまで（restart）探し直さない
     Declined { epoch: u64 },
     /// 開いている。最後の 1 つが落ちると `didClose` を送る
     Open(Arc<DocLease>),
 }
 
-/// 開いている文書 1 つ。[`Drop`] で `didClose` と診断の破棄が走る
+/// 開いている文書の持ち手 1 つ（編集セッション 1 つにつき 1 つ）。[`Drop`] で持ち手を外し、
+/// **最後の持ち手**なら `didClose` と診断の破棄が走る（#1769）
 pub struct DocLease {
     shared: Weak<Shared>,
     uri: String,
+    /// 持ち手の番号（文書の `holders` の鍵）
+    holder: u64,
 }
 
 impl std::fmt::Debug for DocLease {
@@ -193,7 +232,7 @@ impl DocLease {
 impl Drop for DocLease {
     fn drop(&mut self) {
         if let Some(shared) = self.shared.upgrade() {
-            shared.close(&self.uri);
+            shared.close(&self.uri, self.holder);
         }
     }
 }
@@ -222,7 +261,11 @@ struct Inner {
     events_overflowed: bool,
     /// 未導入と分かったサーバ（ID ごと。restart で消える）
     not_installed: BTreeMap<&'static str, NotInstalled>,
+    /// 実行ファイルの解決の結果（ID ごと。#1769 = モジュール冒頭）
+    resolved: BTreeMap<&'static str, Resolved>,
     epoch: u64,
+    /// 次に配る持ち手の番号（#1769）
+    next_holder: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -283,11 +326,36 @@ struct Doc {
     opened: Option<u64>,
     /// 診断の URI 照合用に正規化した形
     uri_key: String,
+    /// 持ち手（編集セッション）ごとに、最後に写しへ取り込んだ**その持ち手のバッファの版**（#1769）。
+    /// 空になったら閉じる
+    holders: BTreeMap<u64, u64>,
 }
 
 struct NotInstalled {
     program: String,
     override_env: Option<String>,
+    /// 解決のログインシェルを打ち切った（秒。#1769）。`None` は見つからなかった
+    timed_out: Option<u64>,
+}
+
+/// 解決 1 つぶん（#1769）
+struct Resolved {
+    launch: Launch,
+    /// 引いたときの `shell_activity::epoch`（違えば引き直す）
+    activity: u64,
+}
+
+impl Resolved {
+    /// まだ使えるか: PATH が変わりうる出来事が無く、見つかったパスがまだ実行できる
+    fn fresh(&self, activity: u64) -> bool {
+        self.activity == activity
+            && match &self.launch {
+                Launch::Found { program_path, .. } => {
+                    tako_core::platform::exe::is_executable_file(Path::new(program_path))
+                }
+                _ => true,
+            }
+    }
 }
 
 fn to_lsp_version(version: u64) -> i32 {
@@ -365,7 +433,7 @@ impl LspManager {
             return;
         }
         match link {
-            DocLink::Open(lease) => shared.change(lease.uri(), text, version),
+            DocLink::Open(lease) => shared.change(lease, text, version),
             DocLink::Declined { epoch } if *epoch == shared.lock().epoch => {}
             _ => *link = shared.open(path, text, version),
         }
@@ -517,6 +585,9 @@ pub struct LspDocument {
     pub editing: bool,
     /// 開いている文書の URI（[`DocLink::Open`]）。つながっていなければ `None`
     pub uri: Option<String>,
+    /// そのペインがいま波線として描いている診断の数（GUI の写し = `EditState::diagnostics`。#1769）。
+    /// 表（manager）の数と同じになっていれば、そのペインに診断が出ている
+    pub drawn: usize,
 }
 
 impl LspDocument {
@@ -530,7 +601,14 @@ impl LspDocument {
             path,
             editing,
             uri,
+            drawn: 0,
         }
+    }
+
+    /// 描いている診断の数を添える（#1769）
+    pub fn with_drawn(mut self, drawn: usize) -> Self {
+        self.drawn = drawn;
+        self
     }
 }
 
@@ -618,8 +696,20 @@ impl Shared {
         };
         let mut guard = self.lock();
         let inner = &mut *guard;
-        if inner.docs.contains_key(&uri) {
-            return DocLink::Declined { epoch: inner.epoch };
+        let holder = inner.next_holder;
+        inner.next_holder = inner.next_holder.wrapping_add(1);
+        let lease = |uri: String| {
+            DocLink::Open(Arc::new(DocLease {
+                shared: self.this.clone(),
+                uri,
+                holder,
+            }))
+        };
+        // #1769: 同じファイルを別のペインが開いていれば、その文書の持ち手に加わるだけ
+        // （didOpen は送らない。本文は自分が編集したときに送る = 相手の未保存の編集を上書きしない）
+        if let Some(doc) = inner.docs.get_mut(&uri) {
+            doc.holders.insert(holder, version);
+            return lease(uri);
         }
         inner.docs.insert(
             uri.clone(),
@@ -630,6 +720,7 @@ impl Shared {
                 version: to_lsp_version(version),
                 opened: None,
                 uri_key: uri_key(&uri),
+                holders: BTreeMap::from([(holder, version)]),
             },
         );
         let slot = inner
@@ -650,22 +741,31 @@ impl Shared {
                 }
             }
         }
-        DocLink::Open(Arc::new(DocLease {
-            shared: self.this.clone(),
-            uri,
-        }))
+        lease(uri)
     }
 
-    fn change(&self, uri: &str, text: &str, version: u64) {
-        let version = to_lsp_version(version);
+    fn change(&self, lease: &DocLease, text: &str, buffer_version: u64) {
+        let uri = lease.uri();
         let mut guard = self.lock();
         let inner = &mut *guard;
         let Some(doc) = inner.docs.get_mut(uri) else {
             return;
         };
-        if doc.version == version {
+        // 自分のバッファが変わっていなければ送らない（#1769: 変わっていないペインの同期 =
+        // カーソル移動だけの呼び出しで、別のペインの編集を巻き戻さない）。取り込んだ版を
+        // 覚えるのは写しへ取り込めたときだけ（送れなかった回は次の同期で送り直す）
+        let holder = lease.holder;
+        match doc.holders.get(&holder) {
+            Some(&seen) if seen != buffer_version => {}
+            _ => return,
+        }
+        if doc.text == text {
+            doc.holders.insert(holder, buffer_version);
             return;
         }
+        // 版は文書ごとに単調に進める（ペインが 1 つならバッファの版そのもの。2 つ目のペインの
+        // バッファの版は若いことがあるので、下回るときは 1 つ進める）
+        let version = to_lsp_version(buffer_version).max(doc.version.saturating_add(1));
         let slot = inner.servers.get(&doc.key);
         let live = slot.and_then(|slot| {
             (slot.lifecycle.state == ServerState::Running && doc.opened == Some(slot.generation))
@@ -676,11 +776,12 @@ impl Shared {
             // まだ開いていない（起動中・未導入）: 写しだけ進める。開いたときに全文で送る
             replace_text(&mut doc.text, text);
             doc.version = version;
+            doc.holders.insert(holder, buffer_version);
             return;
         };
         let changes = match kind {
             SyncKind::None => None,
-            SyncKind::Full => Some(vec![json!({ "text": text })]),
+            SyncKind::Full => Some(vec![json!({ "text": position::wire_text(text) })]),
             SyncKind::Incremental => sync::diff_change(&doc.text, text).map(|change| {
                 vec![match change.range {
                     Some(((sl, sc), (el, ec))) => json!({
@@ -706,19 +807,26 @@ impl Shared {
         }
         replace_text(&mut doc.text, text);
         doc.version = version;
+        doc.holders.insert(holder, buffer_version);
     }
 
-    fn close(&self, uri: &str) {
+    fn close(&self, uri: &str, holder: u64) {
         let mut guard = self.lock();
         let inner = &mut *guard;
+        // #1769: 持ち手を外す。まだ別のペインが開いていれば文書は開いたまま（didClose を送らない）
+        let Some(doc) = inner.docs.get_mut(uri) else {
+            return;
+        };
+        doc.holders.remove(&holder);
+        if !doc.holders.is_empty() {
+            return;
+        }
         let Some(doc) = inner.docs.remove(uri) else {
             return;
         };
         if inner.diagnostics.forget(uri) {
             notify_diagnostics(inner, uri);
         }
-        // 同じファイルで断られていた別のペインが開き直せるように
-        inner.epoch = inner.epoch.wrapping_add(1);
         let still_open = inner.docs.values().any(|d| d.key == doc.key);
         let Some(slot) = inner.servers.get_mut(&doc.key) else {
             return;
@@ -765,13 +873,22 @@ impl Shared {
         let Some(spec) = self.lock().servers.get(key).map(|slot| slot.spec) else {
             return;
         };
-        let launch = (self.config.launcher)(spec);
-        let plan = match launch {
-            Launch::Found { plan, .. } => plan,
+        let (launch, _) = self.resolve(spec);
+        // 見つからない / 打ち切った は同じ「未導入」の扱い（理由の文だけが違う。#1769）
+        let found = match launch {
+            Launch::Found { plan, .. } => Ok(plan),
             Launch::NotFound {
                 program,
                 override_env,
-            } => {
+            } => Err((program, override_env, None)),
+            Launch::TimedOut {
+                program,
+                waited_secs,
+            } => Err((program, None, Some(waited_secs))),
+        };
+        let plan = match found {
+            Ok(plan) => plan,
+            Err((program, override_env, timed_out)) => {
                 let mut inner = self.lock();
                 let Some(slot) = inner.servers.get_mut(key) else {
                     return;
@@ -780,12 +897,16 @@ impl Shared {
                     return;
                 }
                 self.step(slot, Event::NotFound);
-                crate::diag::persist_log(&format!("LSP 未導入: server={}", spec.id));
+                crate::diag::persist_log(&match timed_out {
+                    Some(secs) => format!("LSP 解決の打ち切り: server={} {secs} 秒", spec.id),
+                    None => format!("LSP 未導入: server={}", spec.id),
+                });
                 inner.not_installed.insert(
                     spec.id,
                     NotInstalled {
                         program,
                         override_env,
+                        timed_out,
                     },
                 );
                 return;
@@ -1085,6 +1206,10 @@ impl Shared {
         for id in &cleared {
             inner.not_installed.remove(id);
         }
+        // #1769: 解決のキャッシュも捨てる（入れた・PATH を直したあとの明示の引き直し）
+        inner
+            .resolved
+            .retain(|id, _| name.is_some_and(|n| n != *id));
         let mut restarted = Vec::new();
         let keys: Vec<ServerKey> = inner
             .servers
@@ -1204,19 +1329,23 @@ impl Shared {
     }
 
     fn servers(&self) -> Value {
+        let resolved = self.resolve_all(self.config.table);
         let rows: Vec<Value> = self
             .config
             .table
             .iter()
-            .map(|spec| {
+            .zip(resolved)
+            .map(|(spec, (launch, cached))| {
                 let extensions: Vec<&str> = spec.documents.iter().map(|d| d.extension).collect();
                 let mut row = json!({
                     "id": spec.id,
                     "program": spec.program,
                     "extensions": extensions,
                     "install_command": spec.install.command(),
+                    // #1769: 解決をキャッシュから答えたか（false = いま引いた）
+                    "cached": cached,
                 });
-                match (self.config.launcher)(spec) {
+                match launch {
                     Launch::Found { program_path, .. } => {
                         row["installed"] = json!(true);
                         row["path"] = json!(program_path);
@@ -1227,7 +1356,17 @@ impl Shared {
                     } => {
                         row["installed"] = json!(false);
                         let guidance =
-                            not_installed_guidance(spec, &program, override_env.as_deref());
+                            not_installed_guidance(spec, &program, override_env.as_deref(), None);
+                        merge(&mut row, guidance);
+                    }
+                    Launch::TimedOut {
+                        program,
+                        waited_secs,
+                    } => {
+                        row["installed"] = json!(false);
+                        row["timed_out"] = json!(true);
+                        let guidance =
+                            not_installed_guidance(spec, &program, None, Some(waited_secs));
                         merge(&mut row, guidance);
                     }
                 }
@@ -1235,6 +1374,69 @@ impl Shared {
             })
             .collect();
         json!({ "enabled": true, "servers": rows })
+    }
+
+    /// 実行ファイルの解決（#1769）。キャッシュが使えればそれを、無ければ引いて覚える。
+    /// 戻り値の `bool` はキャッシュから答えたか
+    fn resolve(&self, spec: &'static ServerSpec) -> (Launch, bool) {
+        let activity = tako_core::shell_activity::epoch();
+        if let Some(hit) = self.cached_launch(spec, activity) {
+            return (hit, true);
+        }
+        // 解決は待ちうる（ログインシェル）のでロックの外で
+        let launch = (self.config.launcher)(spec);
+        self.lock().resolved.insert(
+            spec.id,
+            Resolved {
+                launch: launch.clone(),
+                activity,
+            },
+        );
+        (launch, false)
+    }
+
+    fn cached_launch(&self, spec: &ServerSpec, activity: u64) -> Option<Launch> {
+        self.lock()
+            .resolved
+            .get(spec.id)
+            .filter(|r| r.fresh(activity))
+            .map(|r| r.launch.clone())
+    }
+
+    /// 表のすべてを解決する。キャッシュに無いものは**並行して**引く
+    /// （ログインシェルを 1 つずつ待つと 4 つぶんの合計になる）
+    fn resolve_all(&self, specs: &'static [ServerSpec]) -> Vec<(Launch, bool)> {
+        let activity = tako_core::shell_activity::epoch();
+        let hits: Vec<Option<Launch>> = specs
+            .iter()
+            .map(|spec| self.cached_launch(spec, activity))
+            .collect();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = specs
+                .iter()
+                .zip(hits)
+                .map(|(spec, hit)| match hit {
+                    Some(launch) => Err((launch, true)),
+                    None => Ok(scope.spawn(move || self.resolve(spec))),
+                })
+                .collect();
+            specs
+                .iter()
+                .zip(handles)
+                .map(|(spec, handle)| match handle {
+                    Err(hit) => hit,
+                    Ok(handle) => handle.join().unwrap_or_else(|_| {
+                        (
+                            Launch::NotFound {
+                                program: spec.program.to_string(),
+                                override_env: None,
+                            },
+                            false,
+                        )
+                    }),
+                })
+                .collect()
+        })
     }
 
     fn logs(&self, name: Option<&str>) -> Value {
@@ -1293,16 +1495,13 @@ impl Shared {
                 }
             };
             match self.open(&request.path, &source, 0) {
+                // すれ違いで別のペインが開いていれば、その文書の持ち手に加わる（#1769）
                 DocLink::Open(lease) => Some(lease),
-                // 断られた = 未導入の記録がある / すれ違いで別のペインが開いた
+                // 断られた = 未導入の記録がある / 受け持つサーバが無い
                 _ => {
-                    if let Some(error) = self.not_installed_error(spec) {
-                        return Err(error);
-                    }
-                    if !self.lock().docs.contains_key(&uri) {
-                        return Err(GotoError::NoServer);
-                    }
-                    None
+                    return Err(self
+                        .not_installed_error(spec)
+                        .unwrap_or(GotoError::NoServer))
                 }
             }
         };
@@ -1310,8 +1509,17 @@ impl Shared {
         if !tako_core::lsp::goto::server_supports(&capabilities, request.kind) {
             return Err(GotoError::Unsupported { server: spec.id });
         }
+        // 問い合わせる位置は**サーバが見ている本文**（送った写し）で LSP の座標へ直す
+        // （#1769: 単独の `\r` の後ろは LSP では次の行。画面の 1 行だけでは数えられない）
+        let at = {
+            let inner = self.lock();
+            let Some(doc) = inner.docs.get(&uri) else {
+                return Err(GotoError::Closed);
+            };
+            position::lsp_position_of_line_col(&doc.text, request.line, request.column)
+        };
         loop {
-            let targets = self.goto_once(&process, &uri, spec, request, deadline)?;
+            let targets = self.goto_once(&process, &uri, spec, request, at, deadline)?;
             if !targets.is_empty() {
                 return Ok(GotoAnswer {
                     server: spec.id,
@@ -1346,11 +1554,12 @@ impl Shared {
         uri: &str,
         spec: &'static ServerSpec,
         request: &GotoRequest,
+        (line, character): (usize, usize),
         deadline: Instant,
     ) -> Result<Vec<super::goto::GotoTarget>, GotoError> {
         let params = json!({
             "textDocument": { "uri": uri },
-            "position": { "line": request.line, "character": request.character },
+            "position": { "line": line, "character": character },
         });
         let remaining = deadline
             .saturating_duration_since(Instant::now())
@@ -1435,8 +1644,12 @@ impl Shared {
     fn not_installed_error(&self, spec: &'static ServerSpec) -> Option<GotoError> {
         let inner = self.lock();
         let record = inner.not_installed.get(spec.id)?;
-        let guidance =
-            not_installed_guidance(spec, &record.program, record.override_env.as_deref());
+        let guidance = not_installed_guidance(
+            spec,
+            &record.program,
+            record.override_env.as_deref(),
+            record.timed_out,
+        );
         let field = |key: &str| guidance[key].as_str().unwrap_or_default().to_string();
         Some(GotoError::NotInstalled {
             server: spec.id,
@@ -1539,6 +1752,13 @@ fn slot_status(inner: &Inner, key: &ServerKey, slot: &Slot) -> Value {
         .map(|(uri, _)| uri)
         .collect();
     let diagnostics: usize = docs.iter().map(|uri| inner.diagnostics.count(uri)).sum();
+    // 文書を開いている持ち手（編集セッション + 問い合わせ中の一時的な持ち手）の数（#1769）
+    let views: usize = inner
+        .docs
+        .values()
+        .filter(|d| d.key == *key)
+        .map(|d| d.holders.len())
+        .sum();
     let mut value = json!({
         "id": key.id,
         "root": key.root.display().to_string(),
@@ -1549,6 +1769,7 @@ fn slot_status(inner: &Inner, key: &ServerKey, slot: &Slot) -> Value {
         "spawn_count": slot.spawn_count,
         "crashes": slot.lifecycle.crashes,
         "documents": docs.len(),
+        "views": views,
         "diagnostics": diagnostics,
         "text_document_sync": slot.sync_kind.slug(),
         "position_encoding": slot.position_encoding.as_deref().unwrap_or("utf-16"),
@@ -1562,14 +1783,14 @@ fn slot_status(inner: &Inner, key: &ServerKey, slot: &Slot) -> Value {
     });
     match slot.lifecycle.state {
         ServerState::NotInstalled => {
-            let (program, override_env) = inner
+            let (program, override_env, timed_out) = inner
                 .not_installed
                 .get(key.id)
-                .map(|n| (n.program.clone(), n.override_env.clone()))
-                .unwrap_or_else(|| (slot.spec.program.to_string(), None));
+                .map(|n| (n.program.clone(), n.override_env.clone(), n.timed_out))
+                .unwrap_or_else(|| (slot.spec.program.to_string(), None, None));
             merge(
                 &mut value,
-                not_installed_guidance(slot.spec, &program, override_env.as_deref()),
+                not_installed_guidance(slot.spec, &program, override_env.as_deref(), timed_out),
             );
         }
         ServerState::GaveUp => {
@@ -1588,8 +1809,25 @@ fn slot_status(inner: &Inner, key: &ServerKey, slot: &Slot) -> Value {
     value
 }
 
-/// 未導入の「理由 + 次の一手（導入コマンド）」（#983 の作法）
-fn not_installed_guidance(spec: &ServerSpec, program: &str, override_env: Option<&str>) -> Value {
+/// 未導入の「理由 + 次の一手（導入コマンド）」（#983 の作法）。`timed_out` は解決の
+/// ログインシェルを打ち切った秒数（#1769。見つからないのではなく、確かめられなかった）
+fn not_installed_guidance(
+    spec: &ServerSpec,
+    program: &str,
+    override_env: Option<&str>,
+    timed_out: Option<u64>,
+) -> Value {
+    let command = spec.install.command();
+    if let Some(secs) = timed_out {
+        return json!({
+            "reason": text::fill(
+                text::RESOLVE_TIMEOUT_REASON,
+                &[("program", program), ("secs", &secs.to_string())]
+            ),
+            "next_step": text::RESOLVE_TIMEOUT_NEXT_STEP.text(),
+            "install_command": command,
+        });
+    }
     let reason = match override_env {
         Some(env) => text::fill(
             text::OVERRIDE_INVALID_REASON,
@@ -1597,7 +1835,6 @@ fn not_installed_guidance(spec: &ServerSpec, program: &str, override_env: Option
         ),
         None => text::fill(text::NOT_INSTALLED_REASON, &[("program", program)]),
     };
-    let command = spec.install.command();
     json!({
         "reason": reason,
         "next_step": text::fill(text::NOT_INSTALLED_NEXT_STEP, &[("command", command)]),
@@ -1629,7 +1866,8 @@ fn send_did_open(process: &ServerProcess, uri: &str, doc: &mut Doc, generation: 
             "uri": uri,
             "languageId": doc.language_id,
             "version": doc.version,
-            "text": doc.text,
+            // 単独の `\r` は `\n` に替えて送る（写しは替えない。#1769 = `position` の冒頭）
+            "text": position::wire_text(&doc.text),
         }
     });
     if process.notify("textDocument/didOpen", params).is_ok() {

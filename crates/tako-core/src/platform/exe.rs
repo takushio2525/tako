@@ -67,7 +67,9 @@ pub struct BoundedFind {
 ///
 /// unix の [`find`] はログインシェルを起こして `command -v` を聞く = rc ファイル次第で
 /// いくらでも待ちうる子プロセスで、待ちに上限が無い。Code Runner の実行環境の検出
-/// （Tier P）はここを通し、待ちは `probe::output_with_timeout` の 1 実装に掛ける。
+/// （Tier P）と言語サーバの解決（#1769。`lsp::manager::default_launch`）はここを通し、
+/// 待ちは `probe::output_with_timeout` の 1 実装に掛ける（profile が入力を待つ形でも
+/// 呼び手が固まらず、打ち切ったことを [`BoundedFind::timeout`] で知らせる）。
 /// Windows は PATH の走査だけ（子プロセスを起こさない）なので [`find`] と同じ。
 ///
 /// `name` はコマンド名だけを受ける（`[A-Za-z0-9._+-]`。シェルへ文字列として渡すため、
@@ -96,6 +98,21 @@ fn pick_found_path(stdout: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// ログインシェル `shell` で `name` を探す（unix の [`find_with_timeout`] の本体。
+/// シェルを差し替えて上限・判定をテストで固定するために分けてある = #1769）。
+/// `name` は [`find_with_timeout`] が検査済み
+#[cfg(unix)]
+fn login_shell_find(shell: &str, name: &str, budget: std::time::Duration) -> BoundedFind {
+    let lookup = format!("command -v {name}");
+    let outcome = crate::probe::output_with_timeout(shell, &["-l", "-c", &lookup], budget);
+    let timeout = outcome.timeout_notice();
+    let path = outcome
+        .into_output()
+        .filter(|o| o.status.success())
+        .and_then(|o| pick_found_path(&String::from_utf8_lossy(&o.stdout)));
+    BoundedFind { path, timeout }
+}
+
 /// 「実行できる通常ファイル」か。symlink は追う（`which` と同じ判定）。
 ///
 /// unix は mode の実行ビット、Windows は拡張子が `PATHEXT` に在るかを見る
@@ -121,11 +138,7 @@ mod imp {
     /// ログインシェル経由で探す。`.app`（Dock 起動）の痩せた PATH でも
     /// ユーザーの PATH で解決できるようにするため（この経路を外すと Homebrew が全滅する）
     pub fn find(name: &str) -> Option<String> {
-        let shell = std::env::var("SHELL")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "/bin/sh".into());
-        let output = std::process::Command::new(shell)
+        let output = std::process::Command::new(user_shell())
             .args(["-l", "-c", &format!("command -v {name}")])
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -140,18 +153,14 @@ mod imp {
 
     /// [`find`] と同じ問い合わせを `probe::output_with_timeout`（待ちの 1 実装）で行う
     pub fn find_with_timeout(name: &str, budget: std::time::Duration) -> super::BoundedFind {
-        let shell = std::env::var("SHELL")
+        super::login_shell_find(&user_shell(), name, budget)
+    }
+
+    fn user_shell() -> String {
+        std::env::var("SHELL")
             .ok()
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "/bin/sh".into());
-        let lookup = format!("command -v {name}");
-        let outcome = crate::probe::output_with_timeout(&shell, &["-l", "-c", &lookup], budget);
-        let timeout = outcome.timeout_notice();
-        let path = outcome
-            .into_output()
-            .filter(|o| o.status.success())
-            .and_then(|o| super::pick_found_path(&String::from_utf8_lossy(&o.stdout)));
-        super::BoundedFind { path, timeout }
+            .unwrap_or_else(|| "/bin/sh".into())
     }
 
     pub fn is_executable(_path: &std::path::Path, meta: &std::fs::Metadata) -> bool {
@@ -427,6 +436,66 @@ fn resolve_with_pathext(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 偽のログインシェル（`-l -c <script>` を無視して本文を実行する）を置く
+    #[cfg(unix)]
+    fn fake_shell(dir: &std::path::Path, name: &str, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.display().to_string()
+    }
+
+    /// #1769: profile が入力を待つ形（返らないログインシェル）でも上限で打ち切って知らせる
+    #[cfg(unix)]
+    #[test]
+    fn ログインシェルの探索は上限で打ち切る() {
+        let dir = crate::test_residue::ScratchDir::new("exe-lookup-timeout");
+        // `exec` で置き換える = 打ち切りの kill が眠る本人に当たる（孫を残さない = #1748）
+        let shell = fake_shell(dir.path(), "hang", "exec sleep 30");
+        // 状態で見る（実時間の予算は assert しない = conventions「効果を測る単体テストは実時間で
+        // 比べない」）。上限が無ければ 30 秒眠ったあと空の出力 = NotFound で返るので、
+        // 打ち切りの知らせが返ったこと自体が「上限で打ち切った」の証拠
+        let got = login_shell_find(&shell, "x", std::time::Duration::from_millis(300));
+        assert!(got.timeout.is_some() && got.path.is_none(), "{got:?}");
+    }
+
+    /// #1769: 見つかったことにするのは実行できるファイルだけ（エイリアス・失敗・空は見つからない）。
+    /// rc が挨拶文を出しても最後の行の答えを採る（#1730 の [`pick_found_path`] を実シェルで通す）
+    #[cfg(unix)]
+    #[test]
+    fn ログインシェルの答えは実行できるファイルだけを採る() {
+        let dir = crate::test_residue::ScratchDir::new("exe-lookup-answer");
+        let budget = std::time::Duration::from_secs(10);
+        for (name, body) in [
+            ("found", "echo /bin/sh"),
+            ("greeting", "echo 'Welcome!'; echo /bin/sh"),
+        ] {
+            let shell = fake_shell(dir.path(), name, body);
+            assert_eq!(
+                login_shell_find(&shell, "x", budget),
+                BoundedFind {
+                    path: Some("/bin/sh".into()),
+                    timeout: None,
+                },
+                "{name}"
+            );
+        }
+        for (name, body) in [
+            ("alias", "echo \"alias x='y'\""),
+            ("fail", "exit 1"),
+            ("empty", "true"),
+            ("missing", "echo /nonexistent/tako-1769"),
+        ] {
+            let shell = fake_shell(dir.path(), name, body);
+            assert_eq!(
+                login_shell_find(&shell, "x", budget),
+                BoundedFind::default(),
+                "{name}"
+            );
+        }
+    }
 
     fn dirs(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_string()).collect()

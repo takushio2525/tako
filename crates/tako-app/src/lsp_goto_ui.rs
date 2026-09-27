@@ -5,8 +5,8 @@
 //! ## 問い合わせと着地はここに無い
 //!
 //! ⌘クリックは CLI `tako lsp definition` / MCP `tako_lsp` と**同じ 3 段**を通る:
-//! `tako_control::prepare_offload`（UI スレッドで引数の検査と位置の変換）→
-//! `OffloadJob::run_staged`（background で言語サーバの起動と応答を待つ）→
+//! `tako_control::prepare_offload`（UI スレッドで引数の検査）→
+//! `OffloadJob::run_staged`（background で位置を UTF-16 へ直し、言語サーバの起動と応答を待つ）→
 //! `tako_control::finish_offload`（UI スレッドで着地 = `open_file` がジャンプ履歴へ積む）。
 //! ここが持つのは画面だけ: どこに下線を引くか（検出は `tako_core::lsp::goto::symbol_at`）と、
 //! 答え（見つからない・未導入・候補が複数…）の見せ方。

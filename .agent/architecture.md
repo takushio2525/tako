@@ -1742,7 +1742,7 @@ syntect へ通していた**。release 実測（同じ構文セット・テー�
 言語サーバと会話できる状態までを持つ層で、**言語機能は 1 つも出さない**（#1679 以降の
 スライスがこの上に乗る）。実装設計の正本は `.agent/plans/2026-09-lsp-s1.md`（§18 に着地時の差分）。
 
-- **置き場**: 純粋部分は `tako_core::lsp`（`position` = UTF-8 ⇄ UTF-16 の入口 2 本 /
+- **置き場**: 純粋部分は `tako_core::lsp`（`position` = UTF-8 ⇄ UTF-16 の変換と行の区切りの 1 実装 /
   `servers` = 検出表 / `root` = ルート検出 / `state` = 状態機械 / `sync` = `didChange` の中身）、
   プロセスと I/O は `tako_control::lsp`（`rpc` / `server` / `manager` / `diagnostics` / `text`）。
   **GPUI 依存は tako-app だけ**のまま。manager の実体は GUI が 1 つ持ち、CLI / MCP は
@@ -1790,8 +1790,9 @@ syntect へ通していた**。release 実測（同じ構文セット・テー�
 
 ### 定義ジャンプ（#1680。2026-09-27）
 
-- **3 段で 1 本**: 準備（UI スレッド。引数の検査・行の本文から UTF-16 の桁へ）=
-  `dispatch::lsp_goto_prepare` → 問い合わせ（background。サーバの起動と応答を上限つきで待つ）=
+- **3 段で 1 本**: 準備（UI スレッド。引数の検査）=
+  `dispatch::lsp_goto_prepare` → 問い合わせ（background。位置を**サーバへ送った写し**で UTF-16 の
+  桁へ直し（#1769）、サーバの起動と応答を上限つきで待つ）=
   `LspGotoJob::run` → `LspManager::goto` → 着地（UI スレッド）= `dispatch::lsp_goto_land`。
   GUI の ⌘クリック（`lsp_goto_ui.rs`）も IPC / MCP も同じ 3 段を通り、UI 層は着地を持たない
   （番犬 `issue1680_lsp_goto_watchdog`）
@@ -1818,6 +1819,31 @@ syntect へ通していた**。release 実測（同じ構文セット・テー�
 - **応答の座標**: サーバの UTF-16 桁は、飛び先が開いている文書ならサーバへ送った写し、
   そうでなければディスクの中身で UTF-8 バイト（`tako edit replace-range` の桁）と文字数
   （`OpenFile` の桁）へ直す（`lsp::goto::locate`）
+
+### S1 の続き（#1769。2026-09-27）
+
+- **行の区切りは 2 種類**（正本 = `tako_core::lsp::position` の冒頭）: LSP の行は仕様どおり
+  `\n` / `\r\n` / 単独の `\r`、tako の行は `\n`（単独の `\r` は行内の文字 = #1650）。
+  実サーバは仕様どおりに数えない（実測: rust-analyzer と clangd の**問い合わせ**は `\n` だけで数え、
+  clangd の**診断**・pyright・TypeScript は仕様どおり = 1 つのサーバの中でも食い違う）ので、
+  **送る本文の単独の `\r` を `\n` に替える**（`wire_text` / `wire_range`。1 バイト → 1 バイトで
+  UTF-16 の幅も同じ = 位置は 1 対 1）。写しと `TextBuffer` は替えない（保存はバイト一致）。
+  `didChange` は `\r` の直後から始めない（次の 1 バイトで `\r` が単独か `\r\n` の片割れかが
+  変わる）。定義ジャンプの位置は写しの全文で数える（画面の 1 行だけでは単独 CR の後ろの行が分からない）。
+  `lsp_position_of` / `wire_range` は打鍵のたびに文書の先頭から通るので、`\n` は一括の数え上げ・
+  単独の `\r` は `\r` の在る所だけを見る（1 バイトずつ判定すると #1660 の 10 MB で差分同期の
+  1 打鍵が末尾 5.3 → 8.0 ms・全文同期が 7.0 → 9.0 ms に重くなった = 合流で実測。答えは 1 バイトずつの
+  定義と総当たりで一致）
+- **1 URI = 1 文書を持ち手で共有**（`DocLease` = 編集セッション 1 つ）。`didOpen` は最初・`didClose` は
+  最後の持ち手のときだけ。持ち手ごとに「最後に取り込んだ自分のバッファの版」を持ち、変わった持ち手
+  だけが送る。版は文書ごとに単調（`max(バッファの版, 前 + 1)`）。GUI は加わった直後のペインへ表の
+  診断をその場で読み込む（`sync_preview_lsp`。publish を待たない）
+- **解決のキャッシュ**（`Inner::resolved`。ID ごと）: `servers` と起動が同じものを引く。鮮度は
+  `tako_core::shell_activity::epoch`（`TerminalSession::process_osc_event` が cwd の変化・コマンドの
+  終わりで進めるプロセス全体の番号）+ 見つかったパスの stat 1 回。`restart` が捨てる。無いものは
+  `std::thread::scope` で並行して引く。ログインシェルは `platform::exe::find_with_timeout`
+  （Code Runner の #1730 と同じ 1 実装。`probe` の上限つき。打ち切りは `Launch::TimedOut` =
+  見つからないと区別して理由を返す）
 
 ## 大きいファイルの編集（#1660。2026-09-27）
 

@@ -609,8 +609,8 @@ pub struct LspGotoLanding {
     pub answer: Option<Result<crate::lsp::GotoAnswer, crate::lsp::GotoError>>,
 }
 
-/// 定義ジャンプの準備（UI スレッド。#1680）。引数を検査し、問い合わせる位置を
-/// 言語サーバの座標（UTF-16 の桁）へ直す。**1 プロセスも起こさない**
+/// 定義ジャンプの準備（UI スレッド。#1680）。引数を検査する（言語サーバの座標 = UTF-16 の桁へは
+/// manager がサーバの見ている本文で直す。#1769）。**1 プロセスも起こさない**
 #[allow(clippy::too_many_arguments)]
 pub fn lsp_goto_prepare(
     host: &dyn ControlHost,
@@ -670,14 +670,14 @@ pub fn lsp_goto_prepare(
             crate::lsp::text::UNAVAILABLE.text().to_string(),
         ));
     };
-    let (_, character) = tako_core::lsp::position::lsp_position_of(&source.line_text, column);
+    // LSP の座標（UTF-16）へは manager がサーバの見ている本文で直す（#1769）
     Ok(LspGotoJob {
         manager: manager.clone(),
         request: crate::lsp::GotoRequest {
             kind,
             path: PathBuf::from(&path),
             line: line - 1,
-            character,
+            column,
             timeout: crate::lsp::goto::goto_timeout(),
             document: source.document,
         },
@@ -1041,7 +1041,7 @@ pub fn prepare_offload(
                 name: name.clone(),
             })
         }),
-        // #1680: 準備（引数の検査・位置の変換）は UI スレッド、問い合わせは background
+        // #1680: 準備（引数の検査）は UI スレッド、問い合わせ（位置の変換を含む。#1769）は background
         Request::LspGoto {
             action,
             pane,
@@ -13533,6 +13533,7 @@ pub fn lsp_diagnostics(
                     path,
                     editing: false,
                     uri: None,
+                    drawn: 0,
                 }]
             } else {
                 found
@@ -13572,7 +13573,13 @@ fn lsp_diagnostics_document(
     min: Option<tako_core::lsp::diagnostic::Severity>,
 ) -> Value {
     use crate::lsp::text;
-    let mut entry = json!({ "pane": doc.pane, "path": doc.path, "editing": doc.editing });
+    // `drawn` = そのペインがいま描いている数（#1769。GUI の写し。表の数と揃えば画面にも出ている）
+    let mut entry = json!({
+        "pane": doc.pane,
+        "path": doc.path,
+        "editing": doc.editing,
+        "drawn": doc.drawn,
+    });
     let found = doc
         .uri
         .as_deref()
