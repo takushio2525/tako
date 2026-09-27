@@ -303,3 +303,134 @@ fn 単独の_cr_の後ろの語へ位置を往復させても同じ語へ着く(
         manager.shutdown_all(Duration::from_secs(2));
     }
 }
+
+// --- 2. 同じファイルの 2 ペイン目 ---------------------------------------------
+
+/// 受け入れ条件 2: 同じファイルを 2 ペインで開いて片方で編集すると、サーバには **1 文書**として
+/// didChange が届き（didOpen は 1 回）、診断は両方のペインの持つ URI で読める。版は文書ごとに
+/// 単調に進む（2 つ目のペインのバッファの版が若くても下回らない）。変わっていないペインの同期は
+/// 何も送らない（相手の編集を巻き戻さない）。片方を閉じても文書は開いたまま、両方閉じると
+/// didClose が 1 回。読み取り表示のペイン（編集していない）は持ち手にならない
+#[test]
+fn 同じファイルの2ペインは1つの文書を共有し最後が閉じたときだけ閉じる() {
+    let scratch = Scratch::new("shared");
+    let manager = LspManager::new(config_with(fake_args(
+        &scratch,
+        "spec",
+        &["--mark", "MARK"],
+    )));
+    let path = scratch.path("src/main.rs");
+    let (mut a, mut b, mut viewer) = (DocLink::default(), DocLink::default(), DocLink::default());
+    manager.sync(&mut a, true, &path, "MARK a\n", 1);
+    wait_until("didOpen", Duration::from_secs(10), || {
+        count(&scratch, "textDocument/didOpen") == 1
+    });
+    // A だけが編集を進める（A のバッファの版は 5）
+    manager.sync(&mut a, true, &path, "MARK a\nx\n", 5);
+    // B はディスクから開いた若いバッファ（版 1）。読み取り表示のペインは編集していない
+    manager.sync(&mut b, true, &path, "MARK a\n", 1);
+    manager.sync(&mut viewer, false, &path, "MARK a\n", 1);
+    assert!(
+        matches!(viewer, DocLink::Unlinked),
+        "読み取り表示は持ち手にならない"
+    );
+    let status = manager.status(None);
+    assert_eq!(status["documents"], json!(1));
+    assert_eq!(status["servers"][0]["views"], json!(2), "持ち手は A と B");
+    // B で編集 → 1 文書として didChange（版は A の 5 を下回らない）
+    manager.sync(&mut b, true, &path, "MARK a\nMARK b\n", 2);
+    wait_until("B の編集の didChange", Duration::from_secs(10), || {
+        count(&scratch, "textDocument/didChange") == 2
+    });
+    assert_eq!(
+        count(&scratch, "textDocument/didOpen"),
+        1,
+        "2 つ目は didOpen しない"
+    );
+    // 変わっていない A の同期（カーソル移動だけ）は何も送らない = B の編集を巻き戻さない
+    manager.sync(&mut a, true, &path, "MARK a\nx\n", 5);
+    manager.sync(&mut b, true, &path, "MARK a\nMARK b\nMARK c\n", 3);
+    wait_until(
+        "B の 2 回目の didChange",
+        Duration::from_secs(10),
+        || count(&scratch, "textDocument/didChange") == 3,
+    );
+    let versions: Vec<u64> = read_jsonl(&scratch.log())
+        .iter()
+        .filter(|m| m["method"] == json!("textDocument/didChange"))
+        .map(|m| m["params"]["textDocument"]["version"].as_u64().unwrap())
+        .collect();
+    assert_eq!(versions, vec![5, 6, 7], "版は文書ごとに単調に進む");
+    assert_eq!(
+        server_text(&scratch, 7).as_deref(),
+        Some("MARK a\nMARK b\nMARK c\n"),
+        "サーバが持つのは最後に編集したペインの本文"
+    );
+    // 診断は両方のペインが持つ URI で読める（同じ 1 つ）
+    let uri = |link: &DocLink| match link {
+        DocLink::Open(lease) => lease.uri().to_string(),
+        other => panic!("開いていない: {other:?}"),
+    };
+    assert_eq!(uri(&a), uri(&b));
+    let expected = expected_marks("MARK a\nMARK b\nMARK c\n");
+    wait_until(
+        "両方のペインの診断",
+        Duration::from_secs(10),
+        || mark_diagnostics(&manager, &a) == expected && mark_diagnostics(&manager, &b) == expected,
+    );
+    // A を閉じても文書は開いたまま（didClose なし・診断も残る）
+    manager.sync(&mut a, false, &path, "", 5);
+    manager.sync(&mut b, true, &path, "MARK a\n", 4);
+    wait_until(
+        "A を閉じた後の B の didChange",
+        Duration::from_secs(10),
+        || count(&scratch, "textDocument/didChange") == 4,
+    );
+    assert_eq!(count(&scratch, "textDocument/didClose"), 0);
+    let status = manager.status(None);
+    assert_eq!(status["documents"], json!(1));
+    assert_eq!(status["servers"][0]["views"], json!(1));
+    wait_until("B の診断", Duration::from_secs(10), || {
+        mark_diagnostics(&manager, &b) == expected_marks("MARK a\n")
+    });
+    // B も閉じると didClose が 1 回・診断は捨てる
+    manager.sync(&mut b, false, &path, "", 4);
+    wait_until("didClose", Duration::from_secs(10), || {
+        count(&scratch, "textDocument/didClose") == 1
+    });
+    assert_eq!(manager.status(None)["documents"], json!(0));
+    assert_eq!(manager.diagnostics_retained(), (0, 0));
+    // 開き直せば didOpen から（2 回目）
+    manager.sync(&mut a, true, &path, "MARK a\n", 1);
+    wait_until("開き直しの didOpen", Duration::from_secs(10), || {
+        count(&scratch, "textDocument/didOpen") == 2
+    });
+    assert_eq!(count(&scratch, "textDocument/didClose"), 1);
+    manager.shutdown_all(Duration::from_secs(2));
+}
+
+/// サーバが起きる前に 2 ペインが開いて両方が編集しても、握手の後の didOpen は 1 回で、
+/// 本文は最後に編集したペインのもの
+#[test]
+fn 起動中に2ペインが編集しても握手の後の_did_open_は1回() {
+    let scratch = Scratch::new("shared-starting");
+    let manager = LspManager::new(config_with(fake_args(&scratch, "spec", &[])));
+    let path = scratch.path("src/main.rs");
+    let (mut a, mut b) = (DocLink::default(), DocLink::default());
+    manager.sync(&mut a, true, &path, "fn a() {}\n", 1);
+    manager.sync(&mut b, true, &path, "fn a() {}\n", 1);
+    manager.sync(&mut b, true, &path, "fn b() {}\n", 2);
+    wait_until("didOpen", Duration::from_secs(10), || {
+        count(&scratch, "textDocument/didOpen") >= 1
+    });
+    // 起動中の編集は写しに溜まり、握手の後の didOpen が最新の本文を運ぶ（または直後の didChange）
+    wait_until("サーバの本文", Duration::from_secs(10), || {
+        read_jsonl(&scratch.doc_log())
+            .last()
+            .and_then(|e| e["fake_doc"]["text"].as_str().map(str::to_string))
+            .as_deref()
+            == Some("fn b() {}\n")
+    });
+    assert_eq!(count(&scratch, "textDocument/didOpen"), 1);
+    manager.shutdown_all(Duration::from_secs(2));
+}

@@ -83,8 +83,8 @@ pub const NOT_EDITING_NEXT_STEP: Note = Note::new(
 
 /// 編集中だが言語サーバとつながっていない（#1679）
 pub const NOT_LINKED_REASON: Note = Note::new(
-    "受け持つ言語サーバが無い・未導入・同じファイルを別のペインが編集している",
-    "No language server handles this file, it is not installed, or another pane is editing the same file",
+    "受け持つ言語サーバが無い・未導入",
+    "No language server handles this file, or it is not installed",
 );
 
 /// つながっていないときの次の一手

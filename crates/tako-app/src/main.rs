@@ -12888,8 +12888,18 @@ impl TakoApp {
                 .sync(lsp, editing, buffer.path(), buffer.text(), buffer.version());
             // #1679: つながりが外れた（編集モードを抜けた・受け持つサーバが無い）なら
             // 診断の写しも捨てる（manager 側は `didClose` と一緒に捨てている）
-            if !matches!(edit.lsp, tako_control::lsp::DocLink::Open(_)) {
-                edit.diagnostics = None;
+            match &edit.lsp {
+                // #1769: 別のペインが開いている文書へ加わった直後は publish が来ないので、
+                // その場で表から読む（2 つ目のペインにも診断が出る）
+                tako_control::lsp::DocLink::Open(lease) if edit.diagnostics.is_none() => {
+                    edit.diagnostics = self
+                        .lsp
+                        .document_diagnostics(lease.uri())
+                        .map(|d| d.diagnostics)
+                        .filter(|d| !d.items.is_empty());
+                }
+                tako_control::lsp::DocLink::Open(_) => {}
+                _ => edit.diagnostics = None,
             }
         }
     }

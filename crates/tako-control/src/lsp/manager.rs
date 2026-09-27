@@ -20,6 +20,17 @@
 //!
 //! **サーバが無くても編集経路は何も変わらない**（ゼロコンフィグ原則）。対象外の拡張子・
 //! 未導入のサーバは [`DocLink::Declined`] で覚え、打鍵のたびに探し直さない。
+//!
+//! ## 同じファイルを複数のペインで開く（#1769）
+//!
+//! **1 URI = 1 文書**を持ち手（[`DocLease`]。編集セッション 1 つにつき 1 つ）で共有する
+//! （エディタで広く使われる形。LSP は 1 URI に 1 open しか許さない）。`didOpen` は最初の 1 つが
+//! 開いたとき、`didClose` は最後の 1 つが閉じたときだけ送る。どのペインの編集も**同じ文書の版**を
+//! 進める（版はペインの `TextBuffer::version` より小さくならないよう文書ごとに単調に進める =
+//! 2 つ目のペインのバッファの版は 1 つ目より若いことがある）。持ち手ごとに「最後に送った自分の
+//! バッファの版」を覚え、**自分の本文が変わったペインだけが送る**（変わっていないペインの同期で
+//! 相手の編集を巻き戻さない）。ペインごとのバッファは別々なので、サーバが見るのは最後に編集した
+//! ペインの本文で、診断はその本文の座標で両方のペインへ出る。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -165,17 +176,19 @@ pub enum DocLink {
     /// まだ試していない
     #[default]
     Unlinked,
-    /// 受け持つサーバが無い / 未導入 / 同じファイルを別のペインが開いている。
-    /// `epoch` が進むまで（restart・他の文書を閉じた）探し直さない
+    /// 受け持つサーバが無い / 未導入。`epoch` が進むまで（restart）探し直さない
     Declined { epoch: u64 },
     /// 開いている。最後の 1 つが落ちると `didClose` を送る
     Open(Arc<DocLease>),
 }
 
-/// 開いている文書 1 つ。[`Drop`] で `didClose` と診断の破棄が走る
+/// 開いている文書の持ち手 1 つ（編集セッション 1 つにつき 1 つ）。[`Drop`] で持ち手を外し、
+/// **最後の持ち手**なら `didClose` と診断の破棄が走る（#1769）
 pub struct DocLease {
     shared: Weak<Shared>,
     uri: String,
+    /// 持ち手の番号（文書の `holders` の鍵）
+    holder: u64,
 }
 
 impl std::fmt::Debug for DocLease {
@@ -193,7 +206,7 @@ impl DocLease {
 impl Drop for DocLease {
     fn drop(&mut self) {
         if let Some(shared) = self.shared.upgrade() {
-            shared.close(&self.uri);
+            shared.close(&self.uri, self.holder);
         }
     }
 }
@@ -223,6 +236,8 @@ struct Inner {
     /// 未導入と分かったサーバ（ID ごと。restart で消える）
     not_installed: BTreeMap<&'static str, NotInstalled>,
     epoch: u64,
+    /// 次に配る持ち手の番号（#1769）
+    next_holder: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -283,6 +298,9 @@ struct Doc {
     opened: Option<u64>,
     /// 診断の URI 照合用に正規化した形
     uri_key: String,
+    /// 持ち手（編集セッション）ごとに、最後に写しへ取り込んだ**その持ち手のバッファの版**（#1769）。
+    /// 空になったら閉じる
+    holders: BTreeMap<u64, u64>,
 }
 
 struct NotInstalled {
@@ -365,7 +383,7 @@ impl LspManager {
             return;
         }
         match link {
-            DocLink::Open(lease) => shared.change(lease.uri(), text, version),
+            DocLink::Open(lease) => shared.change(lease, text, version),
             DocLink::Declined { epoch } if *epoch == shared.lock().epoch => {}
             _ => *link = shared.open(path, text, version),
         }
@@ -618,8 +636,20 @@ impl Shared {
         };
         let mut guard = self.lock();
         let inner = &mut *guard;
-        if inner.docs.contains_key(&uri) {
-            return DocLink::Declined { epoch: inner.epoch };
+        let holder = inner.next_holder;
+        inner.next_holder = inner.next_holder.wrapping_add(1);
+        let lease = |uri: String| {
+            DocLink::Open(Arc::new(DocLease {
+                shared: self.this.clone(),
+                uri,
+                holder,
+            }))
+        };
+        // #1769: 同じファイルを別のペインが開いていれば、その文書の持ち手に加わるだけ
+        // （didOpen は送らない。本文は自分が編集したときに送る = 相手の未保存の編集を上書きしない）
+        if let Some(doc) = inner.docs.get_mut(&uri) {
+            doc.holders.insert(holder, version);
+            return lease(uri);
         }
         inner.docs.insert(
             uri.clone(),
@@ -630,6 +660,7 @@ impl Shared {
                 version: to_lsp_version(version),
                 opened: None,
                 uri_key: uri_key(&uri),
+                holders: BTreeMap::from([(holder, version)]),
             },
         );
         let slot = inner
@@ -650,22 +681,31 @@ impl Shared {
                 }
             }
         }
-        DocLink::Open(Arc::new(DocLease {
-            shared: self.this.clone(),
-            uri,
-        }))
+        lease(uri)
     }
 
-    fn change(&self, uri: &str, text: &str, version: u64) {
-        let version = to_lsp_version(version);
+    fn change(&self, lease: &DocLease, text: &str, buffer_version: u64) {
+        let uri = lease.uri();
         let mut guard = self.lock();
         let inner = &mut *guard;
         let Some(doc) = inner.docs.get_mut(uri) else {
             return;
         };
-        if doc.version == version {
+        // 自分のバッファが変わっていなければ送らない（#1769: 変わっていないペインの同期 =
+        // カーソル移動だけの呼び出しで、別のペインの編集を巻き戻さない）。取り込んだ版を
+        // 覚えるのは写しへ取り込めたときだけ（送れなかった回は次の同期で送り直す）
+        let holder = lease.holder;
+        match doc.holders.get(&holder) {
+            Some(&seen) if seen != buffer_version => {}
+            _ => return,
+        }
+        if doc.text == text {
+            doc.holders.insert(holder, buffer_version);
             return;
         }
+        // 版は文書ごとに単調に進める（ペインが 1 つならバッファの版そのもの。2 つ目のペインの
+        // バッファの版は若いことがあるので、下回るときは 1 つ進める）
+        let version = to_lsp_version(buffer_version).max(doc.version.saturating_add(1));
         let slot = inner.servers.get(&doc.key);
         let live = slot.and_then(|slot| {
             (slot.lifecycle.state == ServerState::Running && doc.opened == Some(slot.generation))
@@ -676,6 +716,7 @@ impl Shared {
             // まだ開いていない（起動中・未導入）: 写しだけ進める。開いたときに全文で送る
             replace_text(&mut doc.text, text);
             doc.version = version;
+            doc.holders.insert(holder, buffer_version);
             return;
         };
         let changes = match kind {
@@ -706,19 +747,26 @@ impl Shared {
         }
         replace_text(&mut doc.text, text);
         doc.version = version;
+        doc.holders.insert(holder, buffer_version);
     }
 
-    fn close(&self, uri: &str) {
+    fn close(&self, uri: &str, holder: u64) {
         let mut guard = self.lock();
         let inner = &mut *guard;
+        // #1769: 持ち手を外す。まだ別のペインが開いていれば文書は開いたまま（didClose を送らない）
+        let Some(doc) = inner.docs.get_mut(uri) else {
+            return;
+        };
+        doc.holders.remove(&holder);
+        if !doc.holders.is_empty() {
+            return;
+        }
         let Some(doc) = inner.docs.remove(uri) else {
             return;
         };
         if inner.diagnostics.forget(uri) {
             notify_diagnostics(inner, uri);
         }
-        // 同じファイルで断られていた別のペインが開き直せるように
-        inner.epoch = inner.epoch.wrapping_add(1);
         let still_open = inner.docs.values().any(|d| d.key == doc.key);
         let Some(slot) = inner.servers.get_mut(&doc.key) else {
             return;
@@ -1293,16 +1341,13 @@ impl Shared {
                 }
             };
             match self.open(&request.path, &source, 0) {
+                // すれ違いで別のペインが開いていれば、その文書の持ち手に加わる（#1769）
                 DocLink::Open(lease) => Some(lease),
-                // 断られた = 未導入の記録がある / すれ違いで別のペインが開いた
+                // 断られた = 未導入の記録がある / 受け持つサーバが無い
                 _ => {
-                    if let Some(error) = self.not_installed_error(spec) {
-                        return Err(error);
-                    }
-                    if !self.lock().docs.contains_key(&uri) {
-                        return Err(GotoError::NoServer);
-                    }
-                    None
+                    return Err(self
+                        .not_installed_error(spec)
+                        .unwrap_or(GotoError::NoServer))
                 }
             }
         };
@@ -1549,6 +1594,13 @@ fn slot_status(inner: &Inner, key: &ServerKey, slot: &Slot) -> Value {
         .map(|(uri, _)| uri)
         .collect();
     let diagnostics: usize = docs.iter().map(|uri| inner.diagnostics.count(uri)).sum();
+    // 文書を開いている持ち手（編集セッション + 問い合わせ中の一時的な持ち手）の数（#1769）
+    let views: usize = inner
+        .docs
+        .values()
+        .filter(|d| d.key == *key)
+        .map(|d| d.holders.len())
+        .sum();
     let mut value = json!({
         "id": key.id,
         "root": key.root.display().to_string(),
@@ -1559,6 +1611,7 @@ fn slot_status(inner: &Inner, key: &ServerKey, slot: &Slot) -> Value {
         "spawn_count": slot.spawn_count,
         "crashes": slot.lifecycle.crashes,
         "documents": docs.len(),
+        "views": views,
         "diagnostics": diagnostics,
         "text_document_sync": slot.sync_kind.slug(),
         "position_encoding": slot.position_encoding.as_deref().unwrap_or("utf-16"),
