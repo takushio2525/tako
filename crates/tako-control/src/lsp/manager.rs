@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use tako_core::lsp::servers::{self, ServerSpec};
 use tako_core::lsp::state::{Action, Event, Lifecycle, RestartPolicy, ServerState};
-use tako_core::lsp::{root, sync};
+use tako_core::lsp::{position, root, sync};
 use tako_core::platform::child_cmd::{self, ChildCmd};
 
 use super::diagnostics::{DiagnosticsStore, DocDiagnostics};
@@ -680,7 +680,7 @@ impl Shared {
         };
         let changes = match kind {
             SyncKind::None => None,
-            SyncKind::Full => Some(vec![json!({ "text": text })]),
+            SyncKind::Full => Some(vec![json!({ "text": position::wire_text(text) })]),
             SyncKind::Incremental => sync::diff_change(&doc.text, text).map(|change| {
                 vec![match change.range {
                     Some(((sl, sc), (el, ec))) => json!({
@@ -1310,8 +1310,17 @@ impl Shared {
         if !tako_core::lsp::goto::server_supports(&capabilities, request.kind) {
             return Err(GotoError::Unsupported { server: spec.id });
         }
+        // 問い合わせる位置は**サーバが見ている本文**（送った写し）で LSP の座標へ直す
+        // （#1769: 単独の `\r` の後ろは LSP では次の行。画面の 1 行だけでは数えられない）
+        let at = {
+            let inner = self.lock();
+            let Some(doc) = inner.docs.get(&uri) else {
+                return Err(GotoError::Closed);
+            };
+            position::lsp_position_of_line_col(&doc.text, request.line, request.column)
+        };
         loop {
-            let targets = self.goto_once(&process, &uri, spec, request, deadline)?;
+            let targets = self.goto_once(&process, &uri, spec, request, at, deadline)?;
             if !targets.is_empty() {
                 return Ok(GotoAnswer {
                     server: spec.id,
@@ -1346,11 +1355,12 @@ impl Shared {
         uri: &str,
         spec: &'static ServerSpec,
         request: &GotoRequest,
+        (line, character): (usize, usize),
         deadline: Instant,
     ) -> Result<Vec<super::goto::GotoTarget>, GotoError> {
         let params = json!({
             "textDocument": { "uri": uri },
-            "position": { "line": request.line, "character": request.character },
+            "position": { "line": line, "character": character },
         });
         let remaining = deadline
             .saturating_duration_since(Instant::now())
@@ -1629,7 +1639,8 @@ fn send_did_open(process: &ServerProcess, uri: &str, doc: &mut Doc, generation: 
             "uri": uri,
             "languageId": doc.language_id,
             "version": doc.version,
-            "text": doc.text,
+            // 単独の `\r` は `\n` に替えて送る（写しは替えない。#1769 = `position` の冒頭）
+            "text": position::wire_text(&doc.text),
         }
     });
     if process.notify("textDocument/didOpen", params).is_ok() {

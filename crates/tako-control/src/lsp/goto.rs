@@ -72,9 +72,10 @@ pub struct GotoRequest {
     pub kind: GotoKind,
     /// 問い合わせる文書
     pub path: PathBuf,
-    /// LSP の座標（0 起点の行・UTF-16 の桁）。呼び手が行の本文から変換済み
+    /// tako の座標（0 起点の行・行内の UTF-8 バイト桁）。LSP の座標（UTF-16）へは
+    /// manager が**サーバが見ている本文**で直す（#1769: 単独の `\r` の後ろは LSP では次の行）
     pub line: usize,
-    pub character: usize,
+    pub column: usize,
     pub timeout: Duration,
     /// 文書を開いていないときにサーバへ渡す本文（編集セッションの全文）。`None` ならディスクから読む
     pub document: Option<String>,
