@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-09-27（#1662: `--wait` に上限を持たせ、auto_close を GUI の終了検知で効かせ、CLI / MCP の run も走らせる前に保存するようにした）
-- `--wait` は `probe::poll_with_timeout` の 1 実装（既定 600 秒・env `TAKO_RUN_WAIT_TIMEOUT_SECS`・0 は既定）で、超えたら「まだ実行中」+ exit 1。閉じるのは `dispatch::auto_close_run_pane` の 1 本（GUI の出力のたび / 2 秒ごと / `RunInteractiveStatus`）で、閉じた結末は `Workspace::closed_runs` に控える。保存は dispatch `Run` の `save_previews_before_run` の 1 本へ寄せ、再生ボタンの自前保存を外した
-- 実測: `scripts/test-run-wait-save-1662.sh` **32 PASS 0 FAIL**（修正前のバイナリは 14 PASS 18 FAIL = 上限 3 秒でも 15 秒の締め切りまで返らない / `--wait` 無しで閉じない / CLI・MCP とも古い内容が走る）・注入 4 通りすべて file:line 名指しで FAILED → 戻して緑
-
 ## 2026-09-27（#1507: setup の末尾にスマホからの接続の状態を 1 行出し、未導入は依存の導入口へ寄せた）
 - 末尾は Tailscale の有無に関係なく固定文 `スマホからリモート接続するには: tako remote setup`（棚卸し Z17）。`remote_setup::setup_summary_lines` が `check_status`（読み取りのみ）の JSON から状態を決めて `スマホからの接続: …` を 1 行出す（10 通り。未導入は `setup_deps::next_step_line` = 依存チェック段と同じ文面・途中までは `tako remote setup`・公開済みは URL）。導入を聞くのは依存段の 1 回だけ
 - 待ちに上限: 検出の `tailscale --version` を `probe::output_with_timeout` へ寄せ、`status --json` の打ち切りを `RunError::TimedOut` の型で持つ（`DaemonNotRunning` へ畳まず `timeouts` へ）。実測: `scripts/test-setup-remote-status-1507.sh` 41 PASS（修正前の tako で 15 FAIL）・時間切れでも 11 秒で完走・打ち切った子 0・番犬 6 本へ注入 4 通りが file:line で FAILED → 戻して緑
@@ -92,4 +88,4 @@
 - 競合中は自動保存を止め通知 1 回・未編集は追従・未保存のプレビューへ別ファイルは分割。実経路 45/45（main のバイナリは 30 FAIL）・注入 7 通り名指し FAILED
 ## 2026-09-27（#1769: LSP S1 の続き = 単独 CR・同じファイルの 2 ペイン目・サーバ解決のキャッシュ）
 - LSP の行を仕様どおり単独 CR でも区切り、送る本文の単独 CR を LF に揃えた（実測: rust-analyzer / clangd の問い合わせは `\n` だけ・clangd の診断 / pyright / TS は仕様どおり）。同じファイルは 1 URI = 1 文書を持ち手で共有（didOpen / didClose は最初 / 最後だけ・版は単調）。解決はキャッシュし、restart・シェル統合の合図（cwd 変化 / コマンド終了）・パス消失で引き直す。ログインシェルは probe の上限つき
-- 実測: 隔離 GUI の実経路 41 PASS 0 FAIL（servers 1 回目 1044 ms → 2 回目 22 ms）・注入 15 通りすべて FAILED → 戻して緑。限界: rust-analyzer の flycheck 診断は単独 CR の後ろでずれる（rustc が `\n` だけで数える = 実測）
+- 実測: 隔離 GUI の実経路 41 PASS 0 FAIL（servers 1 回目 1075 ms → 2 回目 33 ms）・注入 15 通りすべて FAILED → 戻して緑。限界: rust-analyzer の flycheck 診断は単独 CR の後ろでずれる（rustc が `\n` だけで数える = 実測）
