@@ -1834,6 +1834,11 @@ syntect へ通していた**。release 実測（同じ構文セット・テー�
   最後の持ち手のときだけ。持ち手ごとに「最後に取り込んだ自分のバッファの版」を持ち、変わった持ち手
   だけが送る。版は文書ごとに単調（`max(バッファの版, 前 + 1)`）。GUI は加わった直後のペインへ表の
   診断をその場で読み込む（`sync_preview_lsp`。publish を待たない）
+- **解決のキャッシュ**（`Inner::resolved`。ID ごと）: `servers` と起動が同じものを引く。鮮度は
+  `tako_core::shell_activity::epoch`（`TerminalSession::process_osc_event` が cwd の変化・コマンドの
+  終わりで進めるプロセス全体の番号）+ 見つかったパスの stat 1 回。`restart` が捨てる。無いものは
+  `std::thread::scope` で並行して引く。ログインシェルは `platform::exe::lookup`（`probe` の上限つき。
+  打ち切りは `Launch::TimedOut` = 見つからないと区別して理由を返す）
 
 ## 大きいファイルの編集（#1660。2026-09-27）
 

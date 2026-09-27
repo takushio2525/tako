@@ -12,6 +12,16 @@
 //! [`LspManager::servers`] / [`LspManager::restart`] / [`LspManager::stop`] は
 //! 待ちうるので、dispatch は `prepare_offload` で background へ出す。
 //!
+//! ## 実行ファイルの解決のキャッシュ（#1769）
+//!
+//! 解決（unix はサーバ 1 つにつきログインシェル 1 つ）の結果（見つかった + パス / 見つからない /
+//! 打ち切った）をサーバの ID ごとに持ち、`servers` と起動の両方が使う。**引き直すのは**
+//! `restart`（明示）と、PATH が変わりうる出来事（シェル統合が知らせた cwd の変化・コマンドの終わり =
+//! `tako_core::shell_activity`）があったときと、見つかったパスが実行できなくなったとき（stat 1 回）
+//! だけ。キャッシュに無いサーバの解決は並行して行う（1 つずつ待つと合計になる）。
+//! ログインシェルは `platform::exe::lookup` = `probe::output_with_timeout` の上限を通る
+//! （profile が入力を待つ形でも固まらず、打ち切ったことを [`Launch::TimedOut`] で知らせる）。
+//!
 //! ## 文書の同期
 //!
 //! 文書ごとに**サーバへ送った本文の写し**を持ち、今の本文との差分を `didChange` で送る
@@ -82,6 +92,8 @@ pub enum Launch {
         program: String,
         override_env: Option<String>,
     },
+    /// 探すのに起こしたログインシェルが上限までに返らなかった（#1769。打ち切った）
+    TimedOut { program: String, waited_secs: u64 },
 }
 
 /// 起動の方法を決める関数（本番は [`default_launch`]。テストは偽サーバを返す）
@@ -104,7 +116,20 @@ pub fn default_launch(spec: &ServerSpec) -> Launch {
             }
             Some(path)
         }
-        _ => tako_core::platform::exe::find(spec.program),
+        // #1769: ログインシェルは上限つき（`probe::probe_timeout` = 既定 15 秒。外せない）
+        _ => {
+            match tako_core::platform::exe::lookup(spec.program, tako_core::probe::probe_timeout())
+            {
+                tako_core::platform::exe::Lookup::Found(path) => Some(path),
+                tako_core::platform::exe::Lookup::NotFound => None,
+                tako_core::platform::exe::Lookup::TimedOut(waited) => {
+                    return Launch::TimedOut {
+                        program: spec.program.to_string(),
+                        waited_secs: waited.as_secs(),
+                    }
+                }
+            }
+        }
     };
     let Some(program_path) = resolved else {
         return Launch::NotFound {
@@ -235,6 +260,8 @@ struct Inner {
     events_overflowed: bool,
     /// 未導入と分かったサーバ（ID ごと。restart で消える）
     not_installed: BTreeMap<&'static str, NotInstalled>,
+    /// 実行ファイルの解決の結果（ID ごと。#1769 = モジュール冒頭）
+    resolved: BTreeMap<&'static str, Resolved>,
     epoch: u64,
     /// 次に配る持ち手の番号（#1769）
     next_holder: u64,
@@ -306,6 +333,28 @@ struct Doc {
 struct NotInstalled {
     program: String,
     override_env: Option<String>,
+    /// 解決のログインシェルを打ち切った（秒。#1769）。`None` は見つからなかった
+    timed_out: Option<u64>,
+}
+
+/// 解決 1 つぶん（#1769）
+struct Resolved {
+    launch: Launch,
+    /// 引いたときの `shell_activity::epoch`（違えば引き直す）
+    activity: u64,
+}
+
+impl Resolved {
+    /// まだ使えるか: PATH が変わりうる出来事が無く、見つかったパスがまだ実行できる
+    fn fresh(&self, activity: u64) -> bool {
+        self.activity == activity
+            && match &self.launch {
+                Launch::Found { program_path, .. } => {
+                    tako_core::platform::exe::is_executable_file(Path::new(program_path))
+                }
+                _ => true,
+            }
+    }
 }
 
 fn to_lsp_version(version: u64) -> i32 {
@@ -813,13 +862,21 @@ impl Shared {
         let Some(spec) = self.lock().servers.get(key).map(|slot| slot.spec) else {
             return;
         };
-        let launch = (self.config.launcher)(spec);
+        let (launch, _) = self.resolve(spec);
         let plan = match launch {
             Launch::Found { plan, .. } => plan,
-            Launch::NotFound {
-                program,
-                override_env,
-            } => {
+            missing => {
+                let (program, override_env, timed_out) = match missing {
+                    Launch::NotFound {
+                        program,
+                        override_env,
+                    } => (program, override_env, None),
+                    Launch::TimedOut {
+                        program,
+                        waited_secs,
+                    } => (program, None, Some(waited_secs)),
+                    Launch::Found { .. } => unreachable!("上の腕で受けた"),
+                };
                 let mut inner = self.lock();
                 let Some(slot) = inner.servers.get_mut(key) else {
                     return;
@@ -828,12 +885,16 @@ impl Shared {
                     return;
                 }
                 self.step(slot, Event::NotFound);
-                crate::diag::persist_log(&format!("LSP 未導入: server={}", spec.id));
+                crate::diag::persist_log(&match timed_out {
+                    Some(secs) => format!("LSP 解決の打ち切り: server={} {secs} 秒", spec.id),
+                    None => format!("LSP 未導入: server={}", spec.id),
+                });
                 inner.not_installed.insert(
                     spec.id,
                     NotInstalled {
                         program,
                         override_env,
+                        timed_out,
                     },
                 );
                 return;
@@ -1133,6 +1194,10 @@ impl Shared {
         for id in &cleared {
             inner.not_installed.remove(id);
         }
+        // #1769: 解決のキャッシュも捨てる（入れた・PATH を直したあとの明示の引き直し）
+        inner
+            .resolved
+            .retain(|id, _| name.is_some_and(|n| n != *id));
         let mut restarted = Vec::new();
         let keys: Vec<ServerKey> = inner
             .servers
@@ -1252,19 +1317,23 @@ impl Shared {
     }
 
     fn servers(&self) -> Value {
+        let resolved = self.resolve_all(self.config.table);
         let rows: Vec<Value> = self
             .config
             .table
             .iter()
-            .map(|spec| {
+            .zip(resolved)
+            .map(|(spec, (launch, cached))| {
                 let extensions: Vec<&str> = spec.documents.iter().map(|d| d.extension).collect();
                 let mut row = json!({
                     "id": spec.id,
                     "program": spec.program,
                     "extensions": extensions,
                     "install_command": spec.install.command(),
+                    // #1769: 解決をキャッシュから答えたか（false = いま引いた）
+                    "cached": cached,
                 });
-                match (self.config.launcher)(spec) {
+                match launch {
                     Launch::Found { program_path, .. } => {
                         row["installed"] = json!(true);
                         row["path"] = json!(program_path);
@@ -1275,7 +1344,17 @@ impl Shared {
                     } => {
                         row["installed"] = json!(false);
                         let guidance =
-                            not_installed_guidance(spec, &program, override_env.as_deref());
+                            not_installed_guidance(spec, &program, override_env.as_deref(), None);
+                        merge(&mut row, guidance);
+                    }
+                    Launch::TimedOut {
+                        program,
+                        waited_secs,
+                    } => {
+                        row["installed"] = json!(false);
+                        row["timed_out"] = json!(true);
+                        let guidance =
+                            not_installed_guidance(spec, &program, None, Some(waited_secs));
                         merge(&mut row, guidance);
                     }
                 }
@@ -1283,6 +1362,69 @@ impl Shared {
             })
             .collect();
         json!({ "enabled": true, "servers": rows })
+    }
+
+    /// 実行ファイルの解決（#1769）。キャッシュが使えればそれを、無ければ引いて覚える。
+    /// 戻り値の `bool` はキャッシュから答えたか
+    fn resolve(&self, spec: &'static ServerSpec) -> (Launch, bool) {
+        let activity = tako_core::shell_activity::epoch();
+        if let Some(hit) = self.cached_launch(spec, activity) {
+            return (hit, true);
+        }
+        // 解決は待ちうる（ログインシェル）のでロックの外で
+        let launch = (self.config.launcher)(spec);
+        self.lock().resolved.insert(
+            spec.id,
+            Resolved {
+                launch: launch.clone(),
+                activity,
+            },
+        );
+        (launch, false)
+    }
+
+    fn cached_launch(&self, spec: &ServerSpec, activity: u64) -> Option<Launch> {
+        self.lock()
+            .resolved
+            .get(spec.id)
+            .filter(|r| r.fresh(activity))
+            .map(|r| r.launch.clone())
+    }
+
+    /// 表のすべてを解決する。キャッシュに無いものは**並行して**引く
+    /// （ログインシェルを 1 つずつ待つと 4 つぶんの合計になる）
+    fn resolve_all(&self, specs: &'static [ServerSpec]) -> Vec<(Launch, bool)> {
+        let activity = tako_core::shell_activity::epoch();
+        let hits: Vec<Option<Launch>> = specs
+            .iter()
+            .map(|spec| self.cached_launch(spec, activity))
+            .collect();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = specs
+                .iter()
+                .zip(hits)
+                .map(|(spec, hit)| match hit {
+                    Some(launch) => Err((launch, true)),
+                    None => Ok(scope.spawn(move || self.resolve(spec))),
+                })
+                .collect();
+            specs
+                .iter()
+                .zip(handles)
+                .map(|(spec, handle)| match handle {
+                    Err(hit) => hit,
+                    Ok(handle) => handle.join().unwrap_or_else(|_| {
+                        (
+                            Launch::NotFound {
+                                program: spec.program.to_string(),
+                                override_env: None,
+                            },
+                            false,
+                        )
+                    }),
+                })
+                .collect()
+        })
     }
 
     fn logs(&self, name: Option<&str>) -> Value {
@@ -1490,8 +1632,12 @@ impl Shared {
     fn not_installed_error(&self, spec: &'static ServerSpec) -> Option<GotoError> {
         let inner = self.lock();
         let record = inner.not_installed.get(spec.id)?;
-        let guidance =
-            not_installed_guidance(spec, &record.program, record.override_env.as_deref());
+        let guidance = not_installed_guidance(
+            spec,
+            &record.program,
+            record.override_env.as_deref(),
+            record.timed_out,
+        );
         let field = |key: &str| guidance[key].as_str().unwrap_or_default().to_string();
         Some(GotoError::NotInstalled {
             server: spec.id,
@@ -1625,14 +1771,14 @@ fn slot_status(inner: &Inner, key: &ServerKey, slot: &Slot) -> Value {
     });
     match slot.lifecycle.state {
         ServerState::NotInstalled => {
-            let (program, override_env) = inner
+            let (program, override_env, timed_out) = inner
                 .not_installed
                 .get(key.id)
-                .map(|n| (n.program.clone(), n.override_env.clone()))
-                .unwrap_or_else(|| (slot.spec.program.to_string(), None));
+                .map(|n| (n.program.clone(), n.override_env.clone(), n.timed_out))
+                .unwrap_or_else(|| (slot.spec.program.to_string(), None, None));
             merge(
                 &mut value,
-                not_installed_guidance(slot.spec, &program, override_env.as_deref()),
+                not_installed_guidance(slot.spec, &program, override_env.as_deref(), timed_out),
             );
         }
         ServerState::GaveUp => {
@@ -1651,8 +1797,25 @@ fn slot_status(inner: &Inner, key: &ServerKey, slot: &Slot) -> Value {
     value
 }
 
-/// 未導入の「理由 + 次の一手（導入コマンド）」（#983 の作法）
-fn not_installed_guidance(spec: &ServerSpec, program: &str, override_env: Option<&str>) -> Value {
+/// 未導入の「理由 + 次の一手（導入コマンド）」（#983 の作法）。`timed_out` は解決の
+/// ログインシェルを打ち切った秒数（#1769。見つからないのではなく、確かめられなかった）
+fn not_installed_guidance(
+    spec: &ServerSpec,
+    program: &str,
+    override_env: Option<&str>,
+    timed_out: Option<u64>,
+) -> Value {
+    let command = spec.install.command();
+    if let Some(secs) = timed_out {
+        return json!({
+            "reason": text::fill(
+                text::RESOLVE_TIMEOUT_REASON,
+                &[("program", program), ("secs", &secs.to_string())]
+            ),
+            "next_step": text::RESOLVE_TIMEOUT_NEXT_STEP.text(),
+            "install_command": command,
+        });
+    }
     let reason = match override_env {
         Some(env) => text::fill(
             text::OVERRIDE_INVALID_REASON,
@@ -1660,7 +1823,6 @@ fn not_installed_guidance(spec: &ServerSpec, program: &str, override_env: Option
         ),
         None => text::fill(text::NOT_INSTALLED_REASON, &[("program", program)]),
     };
-    let command = spec.install.command();
     json!({
         "reason": reason,
         "next_step": text::fill(text::NOT_INSTALLED_NEXT_STEP, &[("command", command)]),

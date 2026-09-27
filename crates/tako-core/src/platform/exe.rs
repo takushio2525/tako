@@ -96,6 +96,46 @@ fn pick_found_path(stdout: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// [`lookup`] の答え（#1769）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Lookup {
+    /// 見つかった（[`is_executable_file`] を満たすパス）
+    Found(String),
+    NotFound,
+    /// 探すのに起こしたログインシェルが上限までに返らなかった（打ち切った。子は kill 済み）
+    TimedOut(std::time::Duration),
+}
+
+/// 上限つきの [`find`]（#1769）。unix のログインシェルは `probe::output_with_timeout` の
+/// 1 実装で待つ（#1503 / #1532 の上限の作法。profile が入力を待つ形でも呼び手が固まらず、
+/// 打ち切ったことを [`Lookup::TimedOut`] で知らせる）。Windows はシェルを起こさない
+/// （PATH を自分で走査する）ので上限に掛かることは無い。
+///
+/// 返すパスは [`find`] と同じく必ず [`is_executable_file`] を満たす（`command -v` が
+/// エイリアスや関数の定義を返しても「見つかった」にしない = #1372）
+pub fn lookup(name: &str, budget: std::time::Duration) -> Lookup {
+    imp::lookup(name, budget)
+}
+
+/// ログインシェル `shell` で `name` を探す（unix の [`lookup`] の本体。シェルを差し替えて
+/// 上限・判定をテストで固定するために分けてある）
+#[cfg(unix)]
+fn login_shell_lookup(shell: &str, name: &str, budget: std::time::Duration) -> Lookup {
+    let script = format!("command -v {}", crate::shell::quote_for_shell(name));
+    match crate::probe::output_with_timeout(shell, &["-l", "-c", &script], budget) {
+        crate::probe::Outcome::Done { status, stdout, .. } => {
+            let path = String::from_utf8_lossy(&stdout).trim().to_string();
+            if status.success() && is_executable_file(std::path::Path::new(&path)) {
+                Lookup::Found(path)
+            } else {
+                Lookup::NotFound
+            }
+        }
+        crate::probe::Outcome::TimedOut { waited, .. } => Lookup::TimedOut(waited),
+        crate::probe::Outcome::Failed { .. } => Lookup::NotFound,
+    }
+}
+
 /// 「実行できる通常ファイル」か。symlink は追う（`which` と同じ判定）。
 ///
 /// unix は mode の実行ビット、Windows は拡張子が `PATHEXT` に在るかを見る
@@ -121,11 +161,7 @@ mod imp {
     /// ログインシェル経由で探す。`.app`（Dock 起動）の痩せた PATH でも
     /// ユーザーの PATH で解決できるようにするため（この経路を外すと Homebrew が全滅する）
     pub fn find(name: &str) -> Option<String> {
-        let shell = std::env::var("SHELL")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "/bin/sh".into());
-        let output = std::process::Command::new(shell)
+        let output = std::process::Command::new(user_shell())
             .args(["-l", "-c", &format!("command -v {name}")])
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -154,6 +190,18 @@ mod imp {
         super::BoundedFind { path, timeout }
     }
 
+    /// 上限つきの探索（#1769。[`super::lookup`]）
+    pub fn lookup(name: &str, budget: std::time::Duration) -> super::Lookup {
+        super::login_shell_lookup(&user_shell(), name, budget)
+    }
+
+    fn user_shell() -> String {
+        std::env::var("SHELL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/bin/sh".into())
+    }
+
     pub fn is_executable(_path: &std::path::Path, meta: &std::fs::Metadata) -> bool {
         use std::os::unix::fs::PermissionsExt;
         meta.permissions().mode() & 0o111 != 0
@@ -169,6 +217,14 @@ mod imp {
 
 #[cfg(windows)]
 mod imp {
+    /// シェルを起こさない（PATH を自分で走査する）ので上限に掛かることは無い（#1769）
+    pub fn lookup(name: &str, _budget: std::time::Duration) -> super::Lookup {
+        match find(name) {
+            Some(path) => super::Lookup::Found(path),
+            None => super::Lookup::NotFound,
+        }
+    }
+
     pub fn find(name: &str) -> Option<String> {
         super::find_in_windows_path(
             name,
@@ -427,6 +483,59 @@ fn resolve_with_pathext(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 偽のログインシェル（`-l -c <script>` を無視して本文を実行する）を置く
+    #[cfg(unix)]
+    fn fake_shell(dir: &std::path::Path, name: &str, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.display().to_string()
+    }
+
+    /// #1769: profile が入力を待つ形（返らないログインシェル）でも上限で打ち切って知らせる
+    #[cfg(unix)]
+    #[test]
+    fn ログインシェルの探索は上限で打ち切る() {
+        let dir = crate::test_residue::ScratchDir::new("exe-lookup-timeout");
+        // `exec` で置き換える = 打ち切りの kill が眠る本人に当たる（孫を残さない = #1748）
+        let shell = fake_shell(dir.path(), "hang", "exec sleep 30");
+        let started = std::time::Instant::now();
+        let got = login_shell_lookup(&shell, "x", std::time::Duration::from_millis(300));
+        assert!(matches!(got, Lookup::TimedOut(_)), "{got:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "上限で返る: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// #1769: 見つかったことにするのは実行できるファイルだけ（エイリアス・失敗・空は見つからない）
+    #[cfg(unix)]
+    #[test]
+    fn ログインシェルの答えは実行できるファイルだけを採る() {
+        let dir = crate::test_residue::ScratchDir::new("exe-lookup-answer");
+        let budget = std::time::Duration::from_secs(10);
+        let found = fake_shell(dir.path(), "found", "echo /bin/sh");
+        assert_eq!(
+            login_shell_lookup(&found, "x", budget),
+            Lookup::Found("/bin/sh".into())
+        );
+        for (name, body) in [
+            ("alias", "echo \"alias x='y'\""),
+            ("fail", "exit 1"),
+            ("empty", "true"),
+            ("missing", "echo /nonexistent/tako-1769"),
+        ] {
+            let shell = fake_shell(dir.path(), name, body);
+            assert_eq!(
+                login_shell_lookup(&shell, "x", budget),
+                Lookup::NotFound,
+                "{name}"
+            );
+        }
+    }
 
     fn dirs(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_string()).collect()

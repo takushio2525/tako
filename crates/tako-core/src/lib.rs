@@ -66,6 +66,7 @@ pub mod scroll_mirror;
 pub mod scrollback;
 pub mod session_restart;
 pub mod shell;
+pub mod shell_activity;
 pub mod shell_integration;
 pub mod shell_profile;
 pub mod shell_send;

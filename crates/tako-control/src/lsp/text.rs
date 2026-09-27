@@ -18,6 +18,18 @@ pub const OVERRIDE_INVALID_REASON: Note = Note::new(
     "{path} set in {env} is not an executable file",
 );
 
+/// 解決のログインシェルを打ち切った（#1769。見つからないのではなく、確かめられなかった）
+pub const RESOLVE_TIMEOUT_REASON: Note = Note::new(
+    "{program} を探すログインシェルが {secs} 秒で返らなかったので打ち切った",
+    "The login shell looking up {program} did not return within {secs}s, so it was stopped",
+);
+
+/// 打ち切ったときの次の一手
+pub const RESOLVE_TIMEOUT_NEXT_STEP: Note = Note::new(
+    "ログインシェルの設定（~/.zprofile 等）が入力を待っていないか確かめ、tako lsp restart で探し直す",
+    "Check that your login shell profile (e.g. ~/.zprofile) is not waiting for input, then run tako lsp restart",
+);
+
 /// 未導入のときの次の一手。`{command}` = 導入コマンド
 pub const NOT_INSTALLED_NEXT_STEP: Note = Note::new(
     "導入する: {command}（入れたら tako lsp restart）",

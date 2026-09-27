@@ -24,6 +24,10 @@ use tako_core::test_residue::ScratchDir;
 
 const FAKE: &str = env!("CARGO_BIN_EXE_tako-lsp-fake");
 
+// 本番コードの範囲取りは 1 実装（#1420）。配線の番犬（末尾）が使う
+#[path = "common/production_range.rs"]
+mod production_range;
+
 /// 1 件ぶんの置き場（スコープを抜けると消える = #1312）
 struct Scratch {
     dir: ScratchDir,
@@ -433,4 +437,267 @@ fn 起動中に2ペインが編集しても握手の後の_did_open_は1回() {
     });
     assert_eq!(count(&scratch, "textDocument/didOpen"), 1);
     manager.shutdown_all(Duration::from_secs(2));
+}
+
+// --- 3. サーバの解決のキャッシュ ----------------------------------------------
+
+/// 数える launcher: 表の先頭 2 つは偽サーバで「見つかった」、3 つ目は `found_path`（消せる
+/// 実行ファイル）で「見つかった」、残りは「見つからない」。呼ばれるたびに ID を記録する
+fn counting_config(
+    scratch: &Scratch,
+    found_path: PathBuf,
+    calls: Arc<std::sync::Mutex<Vec<&'static str>>>,
+) -> LspConfig {
+    let args = fake_args(scratch, "spec", &[]);
+    let mut config = config_with(args.clone());
+    config.launcher = Arc::new(move |spec: &ServerSpec| {
+        calls.lock().unwrap().push(spec.id);
+        let index = servers::SERVERS
+            .iter()
+            .position(|s| s.id == spec.id)
+            .unwrap();
+        match index {
+            0 | 1 => Launch::Found {
+                plan: ChildCmd {
+                    program: FAKE.to_string(),
+                    args: args.clone(),
+                },
+                program_path: FAKE.to_string(),
+            },
+            2 => Launch::Found {
+                plan: ChildCmd {
+                    program: FAKE.to_string(),
+                    args: args.clone(),
+                },
+                program_path: found_path.display().to_string(),
+            },
+            _ => Launch::NotFound {
+                program: spec.program.to_string(),
+                override_env: None,
+            },
+        }
+    });
+    config
+}
+
+fn cached_flags(value: &Value) -> Vec<bool> {
+    value["servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["cached"].as_bool().unwrap())
+        .collect()
+}
+
+/// `cached` を除いた行（解決の答えそのものは同じであること）
+fn without_cached(value: &Value) -> Value {
+    let mut value = value.clone();
+    for row in value["servers"].as_array_mut().unwrap() {
+        row.as_object_mut().unwrap().remove("cached");
+    }
+    value
+}
+
+/// 受け入れ条件 3: `servers` の 2 回目以降は解決（ログインシェル）を起こさない。
+/// 引き直すのはシェル統合の合図（cwd の変化・コマンドの終わり）・`restart`（名指しならその 1 つ）・
+/// 見つかったパスが実行できなくなったときだけ。起動もキャッシュを使う
+#[test]
+fn servers_の2回目以降は解決を起こさず合図と_restart_で引き直す() {
+    let scratch = Scratch::new("resolve-cache");
+    let removable = scratch.path("removable-server");
+    std::fs::copy(FAKE, &removable).unwrap();
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let manager = LspManager::new(counting_config(
+        &scratch,
+        removable.clone(),
+        Arc::clone(&calls),
+    ));
+    let n = servers::SERVERS.len();
+    let calls_now = || calls.lock().unwrap().len();
+
+    let first = manager.servers();
+    assert_eq!(calls_now(), n, "1 回目は表のすべてを引く");
+    assert_eq!(cached_flags(&first), vec![false; n]);
+    let second = manager.servers();
+    assert_eq!(calls_now(), n, "2 回目は 1 つも引かない");
+    assert_eq!(cached_flags(&second), vec![true; n]);
+    assert_eq!(
+        without_cached(&first),
+        without_cached(&second),
+        "答えは同じ"
+    );
+
+    // シェル統合の合図（PATH が変わりうる出来事）で全部を引き直す
+    tako_core::shell_activity::note();
+    assert_eq!(cached_flags(&manager.servers()), vec![false; n]);
+    assert_eq!(calls_now(), 2 * n);
+    assert_eq!(cached_flags(&manager.servers()), vec![true; n]);
+
+    // 名指しの restart はその 1 つだけ引き直す
+    let named = servers::SERVERS[1].id;
+    manager.restart(Some(named));
+    let flags = cached_flags(&manager.servers());
+    assert_eq!(calls_now(), 2 * n + 1);
+    assert_eq!(calls.lock().unwrap().last(), Some(&named));
+    assert_eq!(
+        flags,
+        (0..n).map(|i| i != 1).collect::<Vec<_>>(),
+        "名指ししたものだけがいま引いた"
+    );
+
+    // 見つかったパスが消えたら（アンインストール）そのサーバだけ引き直す
+    std::fs::remove_file(&removable).unwrap();
+    let flags = cached_flags(&manager.servers());
+    assert_eq!(calls_now(), 2 * n + 2);
+    assert_eq!(flags, (0..n).map(|i| i != 2).collect::<Vec<_>>());
+
+    // 名指しなしの restart は全部を引き直す
+    manager.restart(None);
+    assert_eq!(cached_flags(&manager.servers()), vec![false; n]);
+    assert_eq!(calls_now(), 3 * n + 2);
+
+    // 起動もキャッシュを使う（編集モードに入っても引かない）
+    let mut link = DocLink::default();
+    manager.sync(
+        &mut link,
+        true,
+        &scratch.path("src/main.rs"),
+        "fn main() {}\n",
+        1,
+    );
+    wait_until("稼働", Duration::from_secs(10), || {
+        manager.status(None)["servers"][0]["state"] == json!("running")
+    });
+    assert_eq!(calls_now(), 3 * n + 2, "起動で解決を起こさない");
+    manager.shutdown_all(Duration::from_secs(2));
+}
+
+/// 解決のログインシェルを打ち切ったら、見つからないとは言わずに理由と次の一手を返す
+/// （`servers` の行・起動しようとした文書の状態・定義ジャンプの答えのどれでも）
+#[test]
+fn 解決が打ち切られたら理由と次の一手を返す() {
+    let scratch = Scratch::new("resolve-timeout");
+    let mut config = config_with(fake_args(&scratch, "spec", &[]));
+    config.launcher = Arc::new(|spec: &ServerSpec| Launch::TimedOut {
+        program: spec.program.to_string(),
+        waited_secs: 15,
+    });
+    let manager = LspManager::new(config);
+    let spec = &servers::SERVERS[0];
+    let reason = tako_control::lsp::text::fill(
+        tako_control::lsp::text::RESOLVE_TIMEOUT_REASON,
+        &[("program", spec.program), ("secs", "15")],
+    );
+    let next_step = tako_control::lsp::text::RESOLVE_TIMEOUT_NEXT_STEP.text();
+    let row = manager.servers()["servers"][0].clone();
+    assert_eq!(row["installed"], json!(false));
+    assert_eq!(row["timed_out"], json!(true));
+    assert_eq!(row["reason"], json!(reason));
+    assert_eq!(row["next_step"], json!(next_step));
+
+    let path = scratch.path("src/main.rs");
+    std::fs::write(&path, "fn main() {}\n").unwrap();
+    let mut link = DocLink::default();
+    manager.sync(&mut link, true, &path, "fn main() {}\n", 1);
+    wait_until("未導入", Duration::from_secs(10), || {
+        manager.status(None)["servers"][0]["state"] == json!("not_installed")
+    });
+    let status = manager.status(None)["servers"][0].clone();
+    assert_eq!(status["reason"], json!(reason));
+    assert_eq!(status["next_step"], json!(next_step));
+    let error = manager.goto(&goto(&path, 0, 3)).unwrap_err();
+    let answer = error.to_json(GotoKind::Definition);
+    assert_eq!(answer["reason"], json!(reason));
+    assert!(read_jsonl(&scratch.log()).is_empty(), "何も起こしていない");
+}
+
+/// 既定の解決（`default_launch`）の子プロセス側。`CHILD_ENV` があるときだけ動く
+const CHILD_ENV: &str = "TAKO_1769_LAUNCH_CHILD";
+
+#[test]
+fn 子プロセス_既定の解決を1回走らせて結果を書く() {
+    let Ok(out) = std::env::var(CHILD_ENV) else {
+        return;
+    };
+    let started = Instant::now();
+    let launch = tako_control::lsp::manager::default_launch(&servers::SERVERS[0]);
+    std::fs::write(
+        out,
+        format!("{launch:?}\n{}", started.elapsed().as_millis()),
+    )
+    .unwrap();
+}
+
+/// 既定の解決は、ログインシェルを #1532 の上限（`probe::output_with_timeout` = `probe_timeout`）で
+/// 打ち切る。`$SHELL` を返らない偽物にした子プロセスで実際に `default_launch` を走らせる
+/// （env を変えるので子に分ける = 並行する他のテストの env を汚さない）
+#[cfg(unix)]
+#[test]
+fn 既定の解決はログインシェルを上限で打ち切る() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = Scratch::new("default-launch");
+    let shell = scratch.path("hanging-shell");
+    // `exec` で置き換える = 打ち切りの kill が眠る本人に当たる（孫を残さない = #1748）
+    std::fs::write(&shell, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = scratch.path("result.txt");
+    let started = Instant::now();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "子プロセス_既定の解決を1回走らせて結果を書く",
+            "--nocapture",
+        ])
+        .env(CHILD_ENV, &out)
+        .env("SHELL", &shell)
+        .env(tako_core::probe::PROBE_TIMEOUT_ENV, "1")
+        .env_remove(servers::override_env_name(servers::SERVERS[0].id))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let result = std::fs::read_to_string(&out).unwrap();
+    assert!(
+        result.starts_with("TimedOut"),
+        "打ち切りとして返る: {result}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "上限（1 秒）で返る: {:?}",
+        started.elapsed()
+    );
+}
+
+/// 配線の番犬（#1769）: シェル統合の出来事を受ける 1 か所（`TerminalSession::process_osc_event`）が
+/// 解決のキャッシュの合図（`shell_activity`）を進めている。外れると「コマンドを打っても
+/// `tako lsp servers` が古い答えを返し続ける」が単体テストを緑のまま起きる（判定の純粋関数は
+/// `tako_core::shell_activity` の単体が、キャッシュの規則は上の e2e が固定する）
+#[test]
+fn シェル統合の出来事は解決のキャッシュの合図を進める() {
+    let rel = "crates/tako-core/src/terminal.rs";
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let src = std::fs::read_to_string(root.join(rel)).unwrap();
+    let code = production_range::code_view::without_comments_checked(
+        &production_range::production(&src, rel),
+        rel,
+    );
+    let head = "fn process_osc_event(";
+    let start = code
+        .find(head)
+        .unwrap_or_else(|| panic!("{rel} に `{head}` が無い（改名したなら番犬も追うこと）"));
+    let body = &code[start..];
+    let end = body[head.len()..]
+        .find("\n    fn ")
+        .or_else(|| body[head.len()..].find("\n    pub fn "))
+        .map_or(body.len(), |i| i + head.len());
+    let body = &body[..end];
+    let line = code[..start].matches('\n').count() + 1;
+    for needle in ["shell_activity::is_activity(", "shell_activity::note()"] {
+        assert!(
+            body.contains(needle),
+            "{rel}:{line}（fn process_osc_event）が `{needle}` を呼んでいない = \
+             シェル統合の cwd の変化・コマンドの終わりで LSP の解決のキャッシュが引き直されない"
+        );
+    }
 }

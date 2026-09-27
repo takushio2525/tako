@@ -929,7 +929,7 @@ enum LspCommand {
         #[arg(long)]
         json: bool,
     },
-    /// 検出表と、導入済みかどうか
+    /// 検出表と、導入済みかどうか（解決は 2 回目からキャッシュ。引き直しは restart）
     Servers {
         #[arg(long)]
         json: bool,
