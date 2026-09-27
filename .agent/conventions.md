@@ -3136,7 +3136,7 @@ CI で特定の語も見張りたいときは `TAKO_PII_TERMS`（`,` 区切り�
 ```sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
 isolated_gui_bins                     # TAKO_BIN / APP_BIN を決める（無ければビルド）
-launch_isolated_gui "$TMP/app.log" || exit $?   # ensure → 面と窓の env → 起動（pid は $ISOLATED_GUI_PID）
+launch_isolated_gui "$TMP/app.log" || exit $?   # 印の判定 → ensure → 面の指定の判定 → 起動（pid は $ISOLATED_GUI_PID）
 wait_isolated_gui "$TMP/app.log"      # `tako list` が通るまで待つ（任意）
 stop_isolated_gui                     # 自分で起こした pid だけを落とす
 ```
@@ -3185,13 +3185,30 @@ stderr へ「ERROR: TAKO_DISPLAY=… は通さない…」を 1 行出す（4 = 
 （`test-display-uuid-1697.sh` の ④）。面の名前は面を用意する係と同じ `TAKO_VD_NAME` だけを見て、
 ヘルパ側で別に差し替える口（旧 `ISOLATED_GUI_DISPLAY` の上書き）は無い。
 
+**検証用 GUI の印（`TAKO_ISOLATED`）は偽にできない**（#1784）。`launch_isolated_gui` は GUI へ常に
+`TAKO_ISOLATED=1` を渡し、`TAKO_DISPLAY` と同じく呼び出し側の `VAR=VAL` より後ろに置く（以前は
+既定を前に置いていたので、呼び出し側の `TAKO_ISOLATED=0` がそのまま届いて検証用 GUI として扱われず、
+面の指定を見失うと窓を開かずに終わる #1697 の道ではなく既定の面 = ユーザーの画面へ落ちた）。
+呼び出し側が偽を渡したら（値は `VAR=VAL` → export の順で 1 つに決める）、**面を起こす前に**窓を開かずに
+**終了コード 2**で返し、stderr へ「ERROR: TAKO_ISOLATED='…'（出どころ）は tako では偽と読む…」を
+1 行出す。面の指定の誤りと同じ「使い方の誤り」で、面を起こす前に見るのは面を用意できない機（CI）でも
+4 = 未実測に紛れさせないため。真へ書き換えて続行しないのは、偽を求めた検査を隔離の挙動で測って
+PASS と読ませないため。真偽の読み方は tako の `is_verification_gui` と同じ集合で、番犬が突き合わせる:
+
+| 値（引数でも export でも同じ） | 扱い |
+|---|---|
+| 渡さない | 通す（GUI へは `1`） |
+| `1` / `true` / `on` | 通す（GUI へは `1` に揃えて渡す） |
+| 空（`TAKO_ISOLATED=`）・`0` / `false` / `yes` / `TRUE` / ` 1` など上記以外 | 通さない（tako が偽と読む。大文字小文字・前後の空白も区別する） |
+
 番犬は `crates/tako-control/tests/issue1490_isolated_gui_launch_watchdog.rs`。
 `scripts/test-*.sh` に `target/…/tako-app` / `cargo run -p tako-app` /
 `TAKO_DISPLAY=tako-vd` の直書き・手書きの背景起動・手書きの `ensure` が生えたら
 file:line を名指して落ちる（除外はヘルパ自身と `test-virtual-display-guard.sh` だけ）。
 起動の失敗を拾っていない呼び出し（#1744）と、ヘルパが面を用意できないのに起動する形、
-`tako-vd` 以外の面の明示を通す形（#1760）も落とす（後の 2 つはヘルパを `/bin/bash` で実際に
-走らせ、`ISOLATED_GUI_VD` で偽の係を注入して偽の GUI が起きないことを見る）。
+`tako-vd` 以外の面の明示を通す形（#1760）、偽の `TAKO_ISOLATED` を通す形・GUI へ届く印が `1` で
+ない形（#1784）も落とす（後の 3 つはヘルパを `/bin/bash` で実際に走らせ、`ISOLATED_GUI_VD` で
+偽の係を注入して偽の GUI が起きないこと・受け取った env を見る）。
 
 **眠った状態を手で再現する**（受け入れ検査用）: `pmset displaysleepnow` を撃つと面が眠り、
 `virtual-display.sh status` が「眠っている」に変わる（蓋閉じで内蔵が居ない機なら
