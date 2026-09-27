@@ -20,14 +20,6 @@
 
 ---
 
-## 2026-09-27（#1775: PWA e2e の証拠を spec ごとのサブ dir へ分け、CI だけ 2 workers にした）
-- `TAKO_EVIDENCE_DIR` の平置きで `01-list.png` / `05-observe.png` / `06-forbidden.png` が spec をまたいで上書きし、80 回撮って 76 枚しか残らなかった。`evidencePath()` の 1 実装で `<dir>/<spec 名>/` を挟み 80 枚（outputDir 側は不変）。番犬 `issue1749_pwa_e2e_output_watchdog` に規則 5（サブ dir）・6（spec 内の同名）を足し、注入 3 通りが file:line 名指しで FAILED → 戻して緑
-- CI の macOS（3 vCPU）は既定 50% で 1 worker = ステップ 129〜138 秒。同ランナーの実測で 2 workers 73〜87 秒・`--repeat-each=3` 327 項目 × 2 台 flaky 0 → ci.yml だけ `--workers=2`（3 は dev サーバーの取り分が無い）。README / commands.md の所要時間を実測値へ
-
-## 2026-09-27（#1784: 隔離 GUI のヘルパが呼び出し側の偽の TAKO_ISOLATED を通さないようにした）
-- `launch_isolated_gui` は既定 `${TAKO_ISOLATED:-1}` を `"$@"` の前に置いていたので、引数 / export の `0`・空・`false` がそのまま GUI へ届いていた（偽 GUI で実測）。GUI へは常に `TAKO_ISOLATED=1` を `"$@"` より後ろで渡し、偽（tako の `is_verification_gui` が偽と読む値）は面を起こす前に終了コード 2 + stderr 1 行で断る（#1760 と同じ「使い方の誤り」）
-- 実測: 番犬 3 本追加（構造 / `/bin/bash` 3.2 の実走 / tako の真偽との突き合わせ）で注入 6 通りすべて file:line 名指しで FAILED → 戻して緑・tako-vd の実 GUI でも偽は起動せず 2、`on` は実プロセスの env が `TAKO_ISOLATED=1`
-
 ## 2026-09-27（#1653: 検索・置換で大文字小文字を区別し（既定）、単語単位のトグルを足した）
 - `find_all` が常に小文字化し `replace_all("value"→"item")` が `Value::new()` を `item::new()` にしていた。`SearchOptions`（既定 = 区別する）を tako-core → dispatch（省略時は `SearchOptions::resolve` の 1 実装）→ CLI `-i` / `-w` → MCP `case_sensitive` / `whole_word` → 検索欄の SVG トグル 2 つへ 1:1。小文字写しは区別しない検索のときだけ作り本文が変わるまで使い回す（1 MB の 1 打鍵 4.449 → 0.509ms / 区別しない 1.251ms）
 - 実測: `scripts/test-search-case-1653.sh` **25 PASS 0 FAIL**（tako-vd でトグルを実マウスで押して 3 → 5 → 4 → 2 → 3 件・置換で `Value` が残る + CLI / MCP の字面一致）・番犬 `issue1653_search_case_watchdog` + 単体へ注入 6 通りすべて file:line 名指しで FAILED → 戻して緑
@@ -69,6 +61,7 @@
 ## 2026-09-27（#1819: 実行中に 2 回目以降に壊れた設定の中身も退避へ積んで残すようにした）
 - `quarantine_unreadable` は `.unreadable.bak` が在ると何も写さず、settings.json の申告も 1 プロセス 1 回 = 実行中に 2 回目に壊れた中身は保存（load → 既定値 → save）で跡形もなく消えていた（隔離 GUI で実測。recent / shortcuts / layout（`.corrupt` の rename）も同型）。2 本目以降を `.unreadable.<n>.bak` へ積み（同じ中身は積まない・上限 10 本で 1 本目を残して 2 本目から押し出し = persist.log に記録）、申告は壊れた中身ごとに 1 回へ
 - 実測: `scripts/test-unreadable-quarantine-1819.sh` before 21 PASS / 17 FAIL → after 38 PASS / 0 FAIL・注入 5 通りすべて file:line 名指しで FAILED → 戻して緑・workspace 5995 passed 0 failed・clippy 3 宇宙 0
+
 ## 2026-09-27（#1730: 設定なしでプロジェクトの .venv / uv / poetry 等で走るようにした）
 - `.py` が常に PATH の `python3` で走っていたので、S1 の検出（`runtime_env`）を `Run` / `RunResolve` へ配線した。`py` 行は `${python} ${fileBase}`（実行環境が無ければ今とバイト一致）、activation は境界 B1 の `compose_run_script` でコマンドの先頭へ埋める。Tier P は `probe::output_with_timeout` だけを通し、答えを覚えて `Run` は子プロセス無しで重ねる（`runtime_probe`）。`RunResolve` は `prepare_offload` へ載せ `refresh` を足した
-- 実測: `scripts/test-runner-runtime-1730.sh` **24 PASS 0 FAIL**（venv / uv run / 壊れた venv / 空白と日本語 / 固まる Tier P の打ち切り / CLI と MCP の字面一致 / `TAKO_1730_LEGACY=1` で ① が FAILED）・Tier F 0.09〜0.35 ms・合流後の workspace 6041 passed 0 failed・MCP カタログ +434 B
+- 実測: `scripts/test-runner-runtime-1730.sh` **24 PASS 0 FAIL**（venv / uv run / 壊れた venv / 空白と日本語 / 固まる Tier P の打ち切り / CLI と MCP の字面一致 / `TAKO_1730_LEGACY=1` で ① が FAILED）・Tier F 0.09〜0.35 ms・合流後の workspace 6070 passed 0 failed・MCP カタログ +434 B
