@@ -1837,8 +1837,9 @@ syntect へ通していた**。release 実測（同じ構文セット・テー�
 - **解決のキャッシュ**（`Inner::resolved`。ID ごと）: `servers` と起動が同じものを引く。鮮度は
   `tako_core::shell_activity::epoch`（`TerminalSession::process_osc_event` が cwd の変化・コマンドの
   終わりで進めるプロセス全体の番号）+ 見つかったパスの stat 1 回。`restart` が捨てる。無いものは
-  `std::thread::scope` で並行して引く。ログインシェルは `platform::exe::lookup`（`probe` の上限つき。
-  打ち切りは `Launch::TimedOut` = 見つからないと区別して理由を返す）
+  `std::thread::scope` で並行して引く。ログインシェルは `platform::exe::find_with_timeout`
+  （Code Runner の #1730 と同じ 1 実装。`probe` の上限つき。打ち切りは `Launch::TimedOut` =
+  見つからないと区別して理由を返す）
 
 ## 大きいファイルの編集（#1660。2026-09-27）
 

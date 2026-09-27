@@ -19,8 +19,9 @@
 //! `restart`（明示）と、PATH が変わりうる出来事（シェル統合が知らせた cwd の変化・コマンドの終わり =
 //! `tako_core::shell_activity`）があったときと、見つかったパスが実行できなくなったとき（stat 1 回）
 //! だけ。キャッシュに無いサーバの解決は並行して行う（1 つずつ待つと合計になる）。
-//! ログインシェルは `platform::exe::lookup` = `probe::output_with_timeout` の上限を通る
-//! （profile が入力を待つ形でも固まらず、打ち切ったことを [`Launch::TimedOut`] で知らせる）。
+//! ログインシェルは `platform::exe::find_with_timeout`（Code Runner の #1730 と同じ 1 実装）=
+//! `probe::output_with_timeout` の上限を通る（profile が入力を待つ形でも固まらず、打ち切ったことを
+//! [`Launch::TimedOut`] で知らせる）。
 //!
 //! ## 文書の同期
 //!
@@ -99,7 +100,7 @@ pub enum Launch {
 /// 起動の方法を決める関数（本番は [`default_launch`]。テストは偽サーバを返す）
 pub type Launcher = Arc<dyn Fn(&ServerSpec) -> Launch + Send + Sync>;
 
-/// 本番の解決: `TAKO_LSP_BIN_<ID>` → `platform::exe::find`（境界 B16）→ `child_cmd`（B21）
+/// 本番の解決: `TAKO_LSP_BIN_<ID>` → `platform::exe::find_with_timeout`（境界 B16）→ `child_cmd`（B21）
 ///
 /// unix は `$SHELL -l -c 'exec <path> <args>'` で起こす（`.app` を Dock から起動すると
 /// PATH が最小構成で、rust-analyzer が `cargo` を見つけられない）。`exec` なので
@@ -118,17 +119,17 @@ pub fn default_launch(spec: &ServerSpec) -> Launch {
         }
         // #1769: ログインシェルは上限つき（`probe::probe_timeout` = 既定 15 秒。外せない）
         _ => {
-            match tako_core::platform::exe::lookup(spec.program, tako_core::probe::probe_timeout())
-            {
-                tako_core::platform::exe::Lookup::Found(path) => Some(path),
-                tako_core::platform::exe::Lookup::NotFound => None,
-                tako_core::platform::exe::Lookup::TimedOut(waited) => {
-                    return Launch::TimedOut {
-                        program: spec.program.to_string(),
-                        waited_secs: waited.as_secs(),
-                    }
-                }
+            let found = tako_core::platform::exe::find_with_timeout(
+                spec.program,
+                tako_core::probe::probe_timeout(),
+            );
+            if let Some(notice) = found.timeout {
+                return Launch::TimedOut {
+                    program: spec.program.to_string(),
+                    waited_secs: notice.waited_secs,
+                };
             }
+            found.path
         }
     };
     let Some(program_path) = resolved else {

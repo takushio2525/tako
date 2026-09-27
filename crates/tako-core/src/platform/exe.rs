@@ -67,7 +67,9 @@ pub struct BoundedFind {
 ///
 /// unix の [`find`] はログインシェルを起こして `command -v` を聞く = rc ファイル次第で
 /// いくらでも待ちうる子プロセスで、待ちに上限が無い。Code Runner の実行環境の検出
-/// （Tier P）はここを通し、待ちは `probe::output_with_timeout` の 1 実装に掛ける。
+/// （Tier P）と言語サーバの解決（#1769。`lsp::manager::default_launch`）はここを通し、
+/// 待ちは `probe::output_with_timeout` の 1 実装に掛ける（profile が入力を待つ形でも
+/// 呼び手が固まらず、打ち切ったことを [`BoundedFind::timeout`] で知らせる）。
 /// Windows は PATH の走査だけ（子プロセスを起こさない）なので [`find`] と同じ。
 ///
 /// `name` はコマンド名だけを受ける（`[A-Za-z0-9._+-]`。シェルへ文字列として渡すため、
@@ -96,44 +98,19 @@ fn pick_found_path(stdout: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// [`lookup`] の答え（#1769）
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Lookup {
-    /// 見つかった（[`is_executable_file`] を満たすパス）
-    Found(String),
-    NotFound,
-    /// 探すのに起こしたログインシェルが上限までに返らなかった（打ち切った。子は kill 済み）
-    TimedOut(std::time::Duration),
-}
-
-/// 上限つきの [`find`]（#1769）。unix のログインシェルは `probe::output_with_timeout` の
-/// 1 実装で待つ（#1503 / #1532 の上限の作法。profile が入力を待つ形でも呼び手が固まらず、
-/// 打ち切ったことを [`Lookup::TimedOut`] で知らせる）。Windows はシェルを起こさない
-/// （PATH を自分で走査する）ので上限に掛かることは無い。
-///
-/// 返すパスは [`find`] と同じく必ず [`is_executable_file`] を満たす（`command -v` が
-/// エイリアスや関数の定義を返しても「見つかった」にしない = #1372）
-pub fn lookup(name: &str, budget: std::time::Duration) -> Lookup {
-    imp::lookup(name, budget)
-}
-
-/// ログインシェル `shell` で `name` を探す（unix の [`lookup`] の本体。シェルを差し替えて
-/// 上限・判定をテストで固定するために分けてある）
+/// ログインシェル `shell` で `name` を探す（unix の [`find_with_timeout`] の本体。
+/// シェルを差し替えて上限・判定をテストで固定するために分けてある = #1769）。
+/// `name` は [`find_with_timeout`] が検査済み
 #[cfg(unix)]
-fn login_shell_lookup(shell: &str, name: &str, budget: std::time::Duration) -> Lookup {
-    let script = format!("command -v {}", crate::shell::quote_for_shell(name));
-    match crate::probe::output_with_timeout(shell, &["-l", "-c", &script], budget) {
-        crate::probe::Outcome::Done { status, stdout, .. } => {
-            let path = String::from_utf8_lossy(&stdout).trim().to_string();
-            if status.success() && is_executable_file(std::path::Path::new(&path)) {
-                Lookup::Found(path)
-            } else {
-                Lookup::NotFound
-            }
-        }
-        crate::probe::Outcome::TimedOut { waited, .. } => Lookup::TimedOut(waited),
-        crate::probe::Outcome::Failed { .. } => Lookup::NotFound,
-    }
+fn login_shell_find(shell: &str, name: &str, budget: std::time::Duration) -> BoundedFind {
+    let lookup = format!("command -v {name}");
+    let outcome = crate::probe::output_with_timeout(shell, &["-l", "-c", &lookup], budget);
+    let timeout = outcome.timeout_notice();
+    let path = outcome
+        .into_output()
+        .filter(|o| o.status.success())
+        .and_then(|o| pick_found_path(&String::from_utf8_lossy(&o.stdout)));
+    BoundedFind { path, timeout }
 }
 
 /// 「実行できる通常ファイル」か。symlink は追う（`which` と同じ判定）。
@@ -176,23 +153,7 @@ mod imp {
 
     /// [`find`] と同じ問い合わせを `probe::output_with_timeout`（待ちの 1 実装）で行う
     pub fn find_with_timeout(name: &str, budget: std::time::Duration) -> super::BoundedFind {
-        let shell = std::env::var("SHELL")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "/bin/sh".into());
-        let lookup = format!("command -v {name}");
-        let outcome = crate::probe::output_with_timeout(&shell, &["-l", "-c", &lookup], budget);
-        let timeout = outcome.timeout_notice();
-        let path = outcome
-            .into_output()
-            .filter(|o| o.status.success())
-            .and_then(|o| super::pick_found_path(&String::from_utf8_lossy(&o.stdout)));
-        super::BoundedFind { path, timeout }
-    }
-
-    /// 上限つきの探索（#1769。[`super::lookup`]）
-    pub fn lookup(name: &str, budget: std::time::Duration) -> super::Lookup {
-        super::login_shell_lookup(&user_shell(), name, budget)
+        super::login_shell_find(&user_shell(), name, budget)
     }
 
     fn user_shell() -> String {
@@ -217,14 +178,6 @@ mod imp {
 
 #[cfg(windows)]
 mod imp {
-    /// シェルを起こさない（PATH を自分で走査する）ので上限に掛かることは無い（#1769）
-    pub fn lookup(name: &str, _budget: std::time::Duration) -> super::Lookup {
-        match find(name) {
-            Some(path) => super::Lookup::Found(path),
-            None => super::Lookup::NotFound,
-        }
-    }
-
     pub fn find(name: &str) -> Option<String> {
         super::find_in_windows_path(
             name,
@@ -503,22 +456,32 @@ mod tests {
         let shell = fake_shell(dir.path(), "hang", "exec sleep 30");
         // 状態で見る（実時間の予算は assert しない = conventions「効果を測る単体テストは実時間で
         // 比べない」）。上限が無ければ 30 秒眠ったあと空の出力 = NotFound で返るので、
-        // TimedOut が返ったこと自体が「上限で打ち切った」の証拠
-        let got = login_shell_lookup(&shell, "x", std::time::Duration::from_millis(300));
-        assert!(matches!(got, Lookup::TimedOut(_)), "{got:?}");
+        // 打ち切りの知らせが返ったこと自体が「上限で打ち切った」の証拠
+        let got = login_shell_find(&shell, "x", std::time::Duration::from_millis(300));
+        assert!(got.timeout.is_some() && got.path.is_none(), "{got:?}");
     }
 
-    /// #1769: 見つかったことにするのは実行できるファイルだけ（エイリアス・失敗・空は見つからない）
+    /// #1769: 見つかったことにするのは実行できるファイルだけ（エイリアス・失敗・空は見つからない）。
+    /// rc が挨拶文を出しても最後の行の答えを採る（#1730 の [`pick_found_path`] を実シェルで通す）
     #[cfg(unix)]
     #[test]
     fn ログインシェルの答えは実行できるファイルだけを採る() {
         let dir = crate::test_residue::ScratchDir::new("exe-lookup-answer");
         let budget = std::time::Duration::from_secs(10);
-        let found = fake_shell(dir.path(), "found", "echo /bin/sh");
-        assert_eq!(
-            login_shell_lookup(&found, "x", budget),
-            Lookup::Found("/bin/sh".into())
-        );
+        for (name, body) in [
+            ("found", "echo /bin/sh"),
+            ("greeting", "echo 'Welcome!'; echo /bin/sh"),
+        ] {
+            let shell = fake_shell(dir.path(), name, body);
+            assert_eq!(
+                login_shell_find(&shell, "x", budget),
+                BoundedFind {
+                    path: Some("/bin/sh".into()),
+                    timeout: None,
+                },
+                "{name}"
+            );
+        }
         for (name, body) in [
             ("alias", "echo \"alias x='y'\""),
             ("fail", "exit 1"),
@@ -527,8 +490,8 @@ mod tests {
         ] {
             let shell = fake_shell(dir.path(), name, body);
             assert_eq!(
-                login_shell_lookup(&shell, "x", budget),
-                Lookup::NotFound,
+                login_shell_find(&shell, "x", budget),
+                BoundedFind::default(),
                 "{name}"
             );
         }
