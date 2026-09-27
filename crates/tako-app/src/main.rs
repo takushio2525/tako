@@ -23648,6 +23648,8 @@ impl SystemHost for TakoApp {
                     edit.editing,
                     &edit.lsp,
                 )
+                // #1769: 画面に出ている数（同じファイルの 2 ペイン目にも出ているかを外から読む）
+                .with_drawn(edit.diagnostics.as_ref().map_or(0, |d| d.items.len()))
             })
             .collect();
         out.sort_by_key(|d| d.pane);

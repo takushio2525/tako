@@ -584,6 +584,9 @@ pub struct LspDocument {
     pub editing: bool,
     /// 開いている文書の URI（[`DocLink::Open`]）。つながっていなければ `None`
     pub uri: Option<String>,
+    /// そのペインがいま波線として描いている診断の数（GUI の写し = `EditState::diagnostics`。#1769）。
+    /// 表（manager）の数と同じになっていれば、そのペインに診断が出ている
+    pub drawn: usize,
 }
 
 impl LspDocument {
@@ -597,7 +600,14 @@ impl LspDocument {
             path,
             editing,
             uri,
+            drawn: 0,
         }
+    }
+
+    /// 描いている診断の数を添える（#1769）
+    pub fn with_drawn(mut self, drawn: usize) -> Self {
+        self.drawn = drawn;
+        self
     }
 }
 

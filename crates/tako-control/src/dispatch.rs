@@ -13533,6 +13533,7 @@ pub fn lsp_diagnostics(
                     path,
                     editing: false,
                     uri: None,
+                    drawn: 0,
                 }]
             } else {
                 found
@@ -13572,7 +13573,13 @@ fn lsp_diagnostics_document(
     min: Option<tako_core::lsp::diagnostic::Severity>,
 ) -> Value {
     use crate::lsp::text;
-    let mut entry = json!({ "pane": doc.pane, "path": doc.path, "editing": doc.editing });
+    // `drawn` = そのペインがいま描いている数（#1769。GUI の写し。表の数と揃えば画面にも出ている）
+    let mut entry = json!({
+        "pane": doc.pane,
+        "path": doc.path,
+        "editing": doc.editing,
+        "drawn": doc.drawn,
+    });
     let found = doc
         .uri
         .as_deref()
