@@ -20,31 +20,6 @@
 
 ---
 
-## 2026-09-27（#1507: setup の末尾にスマホからの接続の状態を 1 行出し、未導入は依存の導入口へ寄せた）
-- 末尾は Tailscale の有無に関係なく固定文 `スマホからリモート接続するには: tako remote setup`（棚卸し Z17）。`remote_setup::setup_summary_lines` が `check_status`（読み取りのみ）の JSON から状態を決めて `スマホからの接続: …` を 1 行出す（10 通り。未導入は `setup_deps::next_step_line` = 依存チェック段と同じ文面・途中までは `tako remote setup`・公開済みは URL）。導入を聞くのは依存段の 1 回だけ
-- 待ちに上限: 検出の `tailscale --version` を `probe::output_with_timeout` へ寄せ、`status --json` の打ち切りを `RunError::TimedOut` の型で持つ（`DaemonNotRunning` へ畳まず `timeouts` へ）。実測: `scripts/test-setup-remote-status-1507.sh` 41 PASS（修正前の tako で 15 FAIL）・時間切れでも 11 秒で完走・打ち切った子 0・番犬 6 本へ注入 4 通りが file:line で FAILED → 戻して緑
-
-## 2026-09-27（#1775: PWA e2e の証拠を spec ごとのサブ dir へ分け、CI だけ 2 workers にした）
-- `TAKO_EVIDENCE_DIR` の平置きで `01-list.png` / `05-observe.png` / `06-forbidden.png` が spec をまたいで上書きし、80 回撮って 76 枚しか残らなかった。`evidencePath()` の 1 実装で `<dir>/<spec 名>/` を挟み 80 枚（outputDir 側は不変）。番犬 `issue1749_pwa_e2e_output_watchdog` に規則 5（サブ dir）・6（spec 内の同名）を足し、注入 3 通りが file:line 名指しで FAILED → 戻して緑
-- CI の macOS（3 vCPU）は既定 50% で 1 worker = ステップ 129〜138 秒。同ランナーの実測で 2 workers 73〜87 秒・`--repeat-each=3` 327 項目 × 2 台 flaky 0 → ci.yml だけ `--workers=2`（3 は dev サーバーの取り分が無い）。README / commands.md の所要時間を実測値へ
-
-## 2026-09-27（#1784: 隔離 GUI のヘルパが呼び出し側の偽の TAKO_ISOLATED を通さないようにした）
-- `launch_isolated_gui` は既定 `${TAKO_ISOLATED:-1}` を `"$@"` の前に置いていたので、引数 / export の `0`・空・`false` がそのまま GUI へ届いていた（偽 GUI で実測）。GUI へは常に `TAKO_ISOLATED=1` を `"$@"` より後ろで渡し、偽（tako の `is_verification_gui` が偽と読む値）は面を起こす前に終了コード 2 + stderr 1 行で断る（#1760 と同じ「使い方の誤り」）
-- 実測: 番犬 3 本追加（構造 / `/bin/bash` 3.2 の実走 / tako の真偽との突き合わせ）で注入 6 通りすべて file:line 名指しで FAILED → 戻して緑・tako-vd の実 GUI でも偽は起動せず 2、`on` は実プロセスの env が `TAKO_ISOLATED=1`
-
-## 2026-09-27（#1653: 検索・置換で大文字小文字を区別し（既定）、単語単位のトグルを足した）
-- `find_all` が常に小文字化し `replace_all("value"→"item")` が `Value::new()` を `item::new()` にしていた。`SearchOptions`（既定 = 区別する）を tako-core → dispatch（省略時は `SearchOptions::resolve` の 1 実装）→ CLI `-i` / `-w` → MCP `case_sensitive` / `whole_word` → 検索欄の SVG トグル 2 つへ 1:1。小文字写しは区別しない検索のときだけ作り本文が変わるまで使い回す（1 MB の 1 打鍵 4.449 → 0.509ms / 区別しない 1.251ms）
-- 実測: `scripts/test-search-case-1653.sh` **25 PASS 0 FAIL**（tako-vd でトグルを実マウスで押して 3 → 5 → 4 → 2 → 3 件・置換で `Value` が残る + CLI / MCP の字面一致）・番犬 `issue1653_search_case_watchdog` + 単体へ注入 6 通りすべて file:line 名指しで FAILED → 戻して緑
-
-## 2026-09-27（#1807: fd 継承の番犬が無関係な PR の CI で間欠的に落ちる件を、検査の片の偽陽性として直した）
-- 真因は実装でもテストの並列性でもなく、検査の片 `fd_inherit::inherited_probe_script` の `{ : >&N; } 2>/dev/null`。bash（macOS の `/bin/sh`）は `>&N` の前に元の fd 2 / 1 を 10 以上の空き番号へ退避するので、閉じた 10 / 11 を「開いている」と読んでいた（CI で落ちた回は fd 10）。外部コマンドの fork 子で試す形（`/usr/bin/true 2>/dev/null >&N`）へ替え、daemon と PTY の両方の番犬が同時に直った
-- 実測: 開く番号を 3〜20 で固定すると修正前は 10 / 11 だけ 100% FAILED（PTY 経路も同じ）→ 修正後 3 回ずつ全 ok。全 lib 20 回は修正前後とも失敗 0（手元では番号が 10 / 11 に当たらなかった）。seal を外す注入で両経路とも全番号で file:line 名指しの FAILED、旧い片へ戻す注入で片の単体テストが `[4, 10, 11, 12]` で FAILED → 戻して緑
-
-## 2026-09-27（#1680: 定義ジャンプ（⌘クリックで定義先を新しいペインに）を足した）
-- ⌘ホバーの下線（md リンクと同じ 1 実装）・⌘クリック・`tako lsp definition|declaration|type-definition|implementation` / MCP `tako_lsp` が同じ 3 段（UI で準備 → background で問い合わせ → UI で着地）を通る。offload に UI スレッドの続き（`OffloadOutcome::OnUi`）を足し、IPC ループの後処理を `after_dispatch` へ切り出した。着地は `open_file` 経由でジャンプ履歴へ積み、同じファイルは読み直さない。編集モードでなくても問い合わせのあいだだけ didOpen する
-- 実サーバ: rust-analyzer は読み込み前に空で答えるので `experimental/serverStatus` を待って問い直す（tako の実ソースで初回 14 秒で `file_uri.rs:29` へ新ペイン・2 回目は使い回し）。clangd は `#include` → `foo.h` を新ペインで。実測: `scripts/test-lsp-goto-1680.sh` 38 PASS 0 FAIL（新ペイン / 使い回し / 同じペイン / #include / 戻る / 複数候補 / 3 状態 / CLI と MCP の字面一致 / UTF-16 / 未応答中も UI が止まらない）・e2e 11 本・番犬の注入 7 通り + 実ソースへの注入 A（新ペインを開かない）/ B（使い回さない）が dispatch.rs:762 / 761 を名指しで FAILED → 戻して緑
-- #1791（S2 診断）の上へ合流: MCP `tako_lsp` は 1 本のまま action 5 つ（既定 diagnostics）・MATRIX の `tako_lsp` は 1 行（Windows の根拠に両方の e2e）・要件は FR-3.31 へ振り直し
-
 ## 2026-09-27（#1758: CLI の出力をパイプで途中で閉じても panic しないようにし、gate の証拠の字下げを揃えた）
 - std の `println!` が EPIPE で panic していた（実測: `agent-support --json | head -1` で panic 2 つ + 終了コード 101。Windows は `ERROR_NO_DATA`）。tako-cli の出力マクロ 4 種を `stdio.rs` の同名マクロへ差し替え、標準出力の切断は `resume_unwind` で静かに 0、標準エラーの切断は捨てて続行（失敗の 1 を保つ）。SIGPIPE を既定へ戻す案は Windows に効かず `remote serve` の daemon を殺すので不採用。`gate set / check / show` の証拠は全行へ同じ字下げ
 - 実測: 統合テスト 4 本（読み手を先に閉じたパイプ / 111 KB の 1 行読み / `2>&1` 形で終了コード保持 / 宣言順の番犬）+ unit 2 本。注入 7 通りすべて FAILED → 戻して緑。`mcp serve` の終わり方 4 通りは修正前と字面一致・workspace 5971 passed 0 failed・clippy 3 宇宙 0
@@ -86,6 +61,7 @@
 ## 2026-09-27（#1659: 外部変更を検知した後の逃げ道（上書き / 読み直し / 差分）を足した）
 - core `save_overwrite` / `reload_from_disk`（食い違った範囲だけ = undo で戻る）/ `disk_diff` → `PreviewSave{force}` / `PreviewRevert` / `PreviewDiff` → `tako edit save --force|reload|diff` → MCP `tako_preview_save` の `action`（+403 B）→ GUI の帯
 - 競合中は自動保存を止め通知 1 回・未編集は追従・未保存のプレビューへ別ファイルは分割。実経路 45/45（main のバイナリは 30 FAIL）・注入 7 通り名指し FAILED
+
 ## 2026-09-27（#1769: LSP S1 の続き = 単独 CR・同じファイルの 2 ペイン目・サーバ解決のキャッシュ）
-- LSP の行を仕様どおり単独 CR でも区切り、送る本文の単独 CR を LF に揃えた（実測: rust-analyzer / clangd の問い合わせは `\n` だけ・clangd の診断 / pyright / TS は仕様どおり）。同じファイルは 1 URI = 1 文書を持ち手で共有（didOpen / didClose は最初 / 最後だけ・版は単調）。解決はキャッシュし、restart・シェル統合の合図（cwd 変化 / コマンド終了）・パス消失で引き直す。ログインシェルは probe の上限つき
+- LSP の行を仕様どおり単独 CR でも区切り、送る本文の単独 CR を LF に揃えた（実測: rust-analyzer / clangd の問い合わせは `\n` だけ・clangd の診断 / pyright / TS は仕様どおり）。同じファイルは 1 URI = 1 文書を持ち手で共有（didOpen / didClose は最初 / 最後だけ・版は単調）。解決はキャッシュし、restart・シェル統合の合図（cwd 変化 / コマンド終了）・パス消失で引き直す。探索は #1730 と同じ `exe::find_with_timeout`（上限つき）の 1 実装へ合流で寄せた
 - 実測: 隔離 GUI の実経路 41 PASS 0 FAIL（servers 1 回目 1075 ms → 2 回目 33 ms）・注入 15 通りすべて FAILED → 戻して緑。限界: rust-analyzer の flycheck 診断は単独 CR の後ろでずれる（rustc が `\n` だけで数える = 実測）
