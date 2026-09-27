@@ -504,7 +504,10 @@ fn without_cached(value: &Value) -> Value {
 #[test]
 fn servers_の2回目以降は解決を起こさず合図と_restart_で引き直す() {
     let scratch = Scratch::new("resolve-cache");
-    let removable = scratch.path("removable-server");
+    // Windows の「実行できるか」は拡張子（PATHEXT）で決まるので、消せるサーバの写しも `.exe` にする
+    // （本番の「見つかった」パスは `exe::find` / 差し替えの検査を通るので必ず実行できる形 = #1372。
+    // 拡張子の無い写しだと Windows では毎回「実行できなくなった」と読まれて引き直される）
+    let removable = scratch.path(&format!("removable-server{}", std::env::consts::EXE_SUFFIX));
     std::fs::copy(FAKE, &removable).unwrap();
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
     let manager = LspManager::new(counting_config(
