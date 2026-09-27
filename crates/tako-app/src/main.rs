@@ -21925,6 +21925,11 @@ impl UiStateHost for TakoApp {
         self.theme = load_theme_logged(&mut self.theme_warning_log);
     }
 
+    // #1820: `tako theme` / MCP `tako_theme` の応答へ、persist.log と同じ帳簿から載せる
+    fn theme_warnings(&self) -> Vec<String> {
+        self.theme_warning_log.current().to_vec()
+    }
+
     // #694: UI 表示モード（GUI ライク表示）。TakoApp は全ウィンドウ共有 entity（#339）
     // なので、値を差し替えれば次の render で全窓に反映される
     fn ui_mode(&self) -> tako_core::ui_mode::UiMode {
@@ -26002,7 +26007,7 @@ fn view_menu() -> gpui::Menu {
 }
 
 /// 「ウインドウ」メニュー（#657）。ズーム項目のラベルだけプラットフォームで違う
-/// （macOS = 「拡大 / 縮小」のトグル、Windows = 「最大化 / 元のサイズに戻す」）。
+/// （macOS = 「拡大・縮小」のトグル、Windows = 「最大化・元のサイズに戻す」）。
 ///
 /// ラベルの選択は呼び出し側の `#[cfg]` ではなく**この中の `cfg!`** で行う。
 /// `#[cfg]` で片方の呼び出しを消すと、使われなくなった `ui_text::menu` の関数が
@@ -26308,7 +26313,7 @@ fn set_window_frame(
 ) {
 }
 
-/// メニューの「拡大 / 縮小」（`ZoomWindow`）の実体（macOS。Issue #657）。
+/// メニューの「拡大・縮小」（`ZoomWindow`）の実体（macOS。Issue #657）。
 ///
 /// NSWindow の zoom はトグルなので**現状のまま**素直に呼ぶ（挙動不変）
 #[cfg(not(target_os = "windows"))]
@@ -26316,7 +26321,7 @@ fn toggle_window_zoom(window: &mut Window) {
     window.zoom_window();
 }
 
-/// メニューの「最大化 / 元のサイズに戻す」（`ZoomWindow`）の実体（Windows。Issue #657）。
+/// メニューの「最大化・元のサイズに戻す」（`ZoomWindow`）の実体（Windows。Issue #657）。
 ///
 /// GPUI Windows の `zoom()` は `SW_MAXIMIZE` 固定でトグルにならない（#584 で判明）。
 /// メニュー項目が「最大化しかできない」のは動作の欠けなので、復元は #584 で用意した
@@ -84904,6 +84909,209 @@ mod app_menu_tests {
                 "{label} のアクション {action} に on_action ハンドラが無い"
             );
         }
+    }
+
+    /// メニュー木の名前（メニュー名・サブメニュー名・項目名）を集める。
+    /// OS 管理のサブメニュー（Services）は tako から invoke できず一覧にも出ないので除く
+    fn collect_names(items: &[MenuItem], out: &mut Vec<String>) {
+        for item in items {
+            match item {
+                MenuItem::Action { name, .. } => out.push(name.to_string()),
+                MenuItem::Submenu(sub) => {
+                    out.push(sub.name.to_string());
+                    collect_names(&sub.items, out);
+                }
+                MenuItem::Separator | MenuItem::SystemMenu(_) => {}
+            }
+        }
+    }
+
+    /// 1 行の中の文字列リテラルの中身を取り出す（`\"` などのエスケープを飛ばす）
+    fn string_literals(line: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            if c != '"' {
+                continue;
+            }
+            let mut lit = String::new();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => {
+                        chars.next();
+                    }
+                    '"' => break,
+                    _ => lit.push(c),
+                }
+            }
+            out.push(lit);
+        }
+        out
+    }
+
+    /// **メニュー名・項目名に `/` を入れない**（#1820 / #1058）。
+    ///
+    /// `tako menu invoke` / MCP `tako_menu` のパス区切りが `/` なので、ラベルに含めると
+    /// `resolve_menu_item` が分割してその項目を名指しできない（「ライト / ダークを切替」が
+    /// `メニュー項目 '…' が見つかりません` で実際に invoke できなかった）。
+    ///
+    /// 2 段で見る: ①この OS で組んだ実メニューの全ラベル（日英。`ui_text::menu` の外から
+    /// 来る項目名も拾う）②`ui_text/menu.rs` の本番部の全文字列リテラル（もう片方の OS で
+    /// だけ出る項目 = macOS の「拡大・縮小」/ Windows の「最大化・元のサイズに戻す」も拾う）。
+    /// 違反は file:line で名指しする
+    #[test]
+    fn メニューの名前にパス区切りが無い() {
+        let ui_text_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui_text");
+        let menu_rs = include_str!("ui_text/menu.rs");
+        let rel = |file: &str| format!("crates/tako-app/src/ui_text/{file}");
+        let mut offenders = std::collections::BTreeSet::new();
+
+        // ② ui_text/menu.rs の本番部（テストモジュールより前）の文字列リテラル
+        let production = menu_rs.split("#[cfg(test)]").next().unwrap_or(menu_rs);
+        for (i, line) in production.lines().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            for lit in string_literals(line) {
+                if lit.contains('/') {
+                    offenders.insert(format!("{}:{}: {lit:?}", rel("menu.rs"), i + 1));
+                }
+            }
+        }
+
+        // ① 実メニューの全ラベル（日英）。位置は ui_text の中のリテラルから引く
+        // （menu.rs を先に見る。同じ文言がパレット側にもあるとき、そちらを名指ししない）
+        let labels = std::cell::RefCell::new(Vec::new());
+        crate::ui_text::tests_support::for_each_lang(|| {
+            for menu in app_menus() {
+                let mut names = vec![menu.name.to_string()];
+                collect_names(&menu.items, &mut names);
+                labels.borrow_mut().extend(names);
+            }
+        });
+        let mut files: Vec<(String, String)> = std::fs::read_dir(&ui_text_dir)
+            .expect("ui_text を読める")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".rs"))
+            .map(|name| {
+                let body = std::fs::read_to_string(ui_text_dir.join(&name)).unwrap_or_default();
+                (name, body)
+            })
+            .collect();
+        files.sort_by_key(|(name, _)| name != "menu.rs");
+        let labels = labels.into_inner();
+        assert!(labels.len() >= 60, "ラベルが少なすぎる: {}", labels.len());
+        for label in labels.iter().filter(|l| l.contains('/')) {
+            let needle = format!("\"{label}\"");
+            let at = files.iter().find_map(|(name, body)| {
+                body.lines()
+                    .position(|line| line.contains(&needle))
+                    .map(|i| format!("{}:{}", rel(name), i + 1))
+            });
+            offenders.insert(format!(
+                "{}: {label:?}",
+                at.unwrap_or_else(|| "（ui_text に同じリテラルが無い）".into())
+            ));
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "メニューの名前に `/` がある（`tako menu invoke` のパス区切りと衝突して名指しできない。\
+             2 つを並べるなら「・」で書く。#1820）:\n  {}",
+            offenders.into_iter().collect::<Vec<_>>().join("\n  ")
+        );
+    }
+
+    /// **全項目が `tako menu invoke` で名指しでき、その項目のアクションが発火できる**（#1820）。
+    ///
+    /// UI でできることは CLI / MCP からもできる（開発不変条件）。実メニュー（日英）の全項目を
+    /// フルパス（`表示/テーマを切替（ライト・ダーク）`）と項目名だけの両方で dispatch と同じ
+    /// `resolve_menu_item` へ通し、**その項目自身**へ解決することを見る（別の項目へ化ける・
+    /// 曖昧で断られる・見つからない、のどれも落とす）。解決したアクション名は
+    /// `drain_menu_ops` と同じ `find_menu_action_in` で引けることまで見る。
+    ///
+    /// 実際に発火はさせない（「tako を終了」「ペインを閉じる」「しまう」の副作用が大きい）。
+    /// 発火した先に `on_action` があることは `全項目が実在のアクションに配線されている` が、
+    /// 実 GUI での invoke → 状態変化は `scripts/test-menu-theme-1820.sh` が見る
+    #[test]
+    fn 全項目がtako_menu_invokeで名指しできる() {
+        use tako_control::protocol::{MenuBarSnapshot, MenuItemSnapshot};
+        let failures = std::cell::RefCell::new(Vec::<String>::new());
+        let checked = std::cell::Cell::new(0usize);
+        crate::ui_text::tests_support::for_each_lang(|| {
+            let lang = tako_core::i18n::lang();
+            let defs: Vec<gpui::OwnedMenu> = app_menus().into_iter().map(|m| m.owned()).collect();
+            let snapshot = MenuBarSnapshot {
+                in_window: false,
+                open: None,
+                menus: crate::menu_bar::menu_snapshots(&defs),
+            };
+            // (フルパス, 項目名, アクション名)
+            let mut items: Vec<(String, String, String)> = Vec::new();
+            for menu in &snapshot.menus {
+                for item in &menu.items {
+                    match item {
+                        MenuItemSnapshot::Action { label, action, .. } => items.push((
+                            format!("{}/{label}", menu.name),
+                            label.clone(),
+                            action.clone(),
+                        )),
+                        MenuItemSnapshot::Submenu { label, items: sub } => {
+                            for child in sub {
+                                if let MenuItemSnapshot::Action {
+                                    label: child_label,
+                                    action,
+                                    ..
+                                } = child
+                                {
+                                    items.push((
+                                        format!("{}/{label}/{child_label}", menu.name),
+                                        child_label.clone(),
+                                        action.clone(),
+                                    ));
+                                }
+                            }
+                        }
+                        MenuItemSnapshot::Separator => {}
+                    }
+                }
+            }
+            for (path, label, action) in &items {
+                for query in [path.as_str(), label.as_str()] {
+                    checked.set(checked.get() + 1);
+                    match tako_control::dispatch::resolve_menu_item(&snapshot, query) {
+                        Ok(hit) if hit.path == *path && hit.action == *action => {
+                            if crate::menu_bar::find_menu_action_in(&defs, &hit.action).is_none() {
+                                failures.borrow_mut().push(format!(
+                                    "[{lang:?}] {query:?} は解決したがアクション {} を発火できない",
+                                    hit.action
+                                ));
+                            }
+                        }
+                        Ok(hit) => failures.borrow_mut().push(format!(
+                            "[{lang:?}] {query:?} が別の項目へ解決した: {} ({})。期待 {path} ({action})",
+                            hit.path, hit.action
+                        )),
+                        Err(e) => failures
+                            .borrow_mut()
+                            .push(format!("[{lang:?}] {query:?} を解決できない: {e}")),
+                    }
+                }
+            }
+        });
+        assert!(
+            checked.get() >= 120,
+            "照合した数が少なすぎる: {}",
+            checked.get()
+        );
+        let failures = failures.into_inner();
+        assert!(
+            failures.is_empty(),
+            "`tako menu invoke` で名指しできない項目がある（UI でできることは CLI / MCP からも\
+             できる = 開発不変条件。#1820）:\n  {}",
+            failures.join("\n  ")
+        );
     }
 
     /// macOS のアプリ名メニュー（#485）。Windows はアプリ名メニューを持たない（#657）

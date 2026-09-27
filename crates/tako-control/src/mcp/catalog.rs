@@ -2633,7 +2633,8 @@ pub fn tools() -> Vec<Value> {
                 toggle = ダーク / ライトを反転 / colors = 58 色キーの現在値とソース / \
                 set-color = key の色を value へ変更 / reset-color = key の色上書きを削除しビルトインへ戻す / \
                 reset-colors = 全色上書きを削除 / save-preset = 現在の色を name で保存 / \
-                delete-preset = プリセットを削除 / set-font = フォントファミリーやサイズを変更。",
+                delete-preset = プリセットを削除 / set-font = フォントファミリーやサイズを変更。\
+                status / set / toggle は読めない色を無視していれば warnings（キー: 理由）も返す。",
             "inputSchema": {
                 "type": "object",
                 "properties": {

@@ -571,6 +571,12 @@ pub trait UiStateHost {
     fn set_limit_service(&mut self, _service: tako_core::LimitService) {}
     /// settings から resolve_theme し直してテーマを差し替える（Issue #459 色変更用）
     fn reload_theme(&mut self) {}
+    /// いま適用しているテーマで無視している色の上書き（`<キー>: <理由>`。Issue #1820）。
+    /// persist.log へ出した行と同じ帳簿（`settings::ThemeWarningLog::current`）から返す。
+    /// テーマを読み直さないホストは無視した色を持たないので既定は空
+    fn theme_warnings(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// 設定画面を開く（Issue #459）。tab でタブ指定可能
     fn open_settings_window(&mut self, _tab: Option<&str>) {}
     /// 設定画面が開いているか（Issue #459）

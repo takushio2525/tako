@@ -245,87 +245,106 @@ pub(crate) fn shortcut_map() -> std::collections::HashMap<String, String> {
     out
 }
 
+/// メニュー定義を CLI / MCP へ渡す形へ写す（Issue #657）。
+///
+/// `tako menu invoke` / MCP `tako_menu` が照合するラベルはここで作られる。
+/// `build_menu_bar_snapshot` と番犬（`app_menu_tests` の #1820 の 2 本）が**同じ写し方**を
+/// 通るので、番犬は本番の CLI / MCP が見るのと同じラベルを検査する
+pub(crate) fn menu_snapshots(
+    defs: &[gpui::OwnedMenu],
+) -> Vec<tako_control::protocol::MenuSnapshot> {
+    use tako_control::protocol::{MenuItemSnapshot, MenuSnapshot};
+    let shortcuts = shortcut_map();
+    let to_item = |item: &gpui::OwnedMenuItem| -> Option<MenuItemSnapshot> {
+        match item {
+            gpui::OwnedMenuItem::Separator => Some(MenuItemSnapshot::Separator),
+            gpui::OwnedMenuItem::Action { name, action, .. } => {
+                let action_name = action.name().to_string();
+                Some(MenuItemSnapshot::Action {
+                    label: name.clone(),
+                    shortcut: shortcuts.get(&action_name).cloned(),
+                    action: action_name,
+                })
+            }
+            gpui::OwnedMenuItem::Submenu(sub) => Some(MenuItemSnapshot::Submenu {
+                label: sub.name.to_string(),
+                items: sub
+                    .items
+                    .iter()
+                    .filter_map(|child| match child {
+                        gpui::OwnedMenuItem::Action { name, action, .. } => {
+                            let action_name = action.name().to_string();
+                            Some(MenuItemSnapshot::Action {
+                                label: name.clone(),
+                                shortcut: shortcuts.get(&action_name).cloned(),
+                                action: action_name,
+                            })
+                        }
+                        _ => None,
+                    })
+                    .collect(),
+            }),
+            // macOS の Services 等。tako から実行できないので一覧にも出さない
+            gpui::OwnedMenuItem::SystemMenu(_) => None,
+        }
+    };
+    defs.iter()
+        .map(|menu| MenuSnapshot {
+            name: menu.name.to_string(),
+            items: menu.items.iter().filter_map(to_item).collect(),
+        })
+        .collect()
+}
+
+/// アクション名（`tako::NewTab`）からメニュー定義中のアクションを引く（Issue #657）。
+///
+/// `gpui::Action` を名前から作る一般的な手段が無いので、**表示しているメニューに
+/// 実在する項目だけ**発火できる形にする（CLI から任意のアクションを撃てない = 安全側）。
+/// `find_menu_action` の本体で、番犬（#1820）も `tako menu invoke` の解決結果を
+/// ここへ通して「解決したアクションが発火できる」ことを見る
+pub(crate) fn find_menu_action_in(
+    defs: &[gpui::OwnedMenu],
+    name: &str,
+) -> Option<Box<dyn gpui::Action>> {
+    for menu in defs {
+        for item in &menu.items {
+            match item {
+                gpui::OwnedMenuItem::Action { action, .. } if action.name() == name => {
+                    return Some(action.boxed_clone());
+                }
+                gpui::OwnedMenuItem::Submenu(sub) => {
+                    for child in &sub.items {
+                        if let gpui::OwnedMenuItem::Action { action, .. } = child {
+                            if action.name() == name {
+                                return Some(action.boxed_clone());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
 impl TakoApp {
     /// メニュー構成のスナップショット（Issue #657。CLI / MCP `tako_menu` 用）
     pub(crate) fn build_menu_bar_snapshot(&self) -> tako_control::protocol::MenuBarSnapshot {
-        use tako_control::protocol::{MenuBarSnapshot, MenuItemSnapshot, MenuSnapshot};
-        let shortcuts = shortcut_map();
-        let to_item = |item: &gpui::OwnedMenuItem| -> Option<MenuItemSnapshot> {
-            match item {
-                gpui::OwnedMenuItem::Separator => Some(MenuItemSnapshot::Separator),
-                gpui::OwnedMenuItem::Action { name, action, .. } => {
-                    let action_name = action.name().to_string();
-                    Some(MenuItemSnapshot::Action {
-                        label: name.clone(),
-                        shortcut: shortcuts.get(&action_name).cloned(),
-                        action: action_name,
-                    })
-                }
-                gpui::OwnedMenuItem::Submenu(sub) => Some(MenuItemSnapshot::Submenu {
-                    label: sub.name.to_string(),
-                    items: sub
-                        .items
-                        .iter()
-                        .filter_map(|child| match child {
-                            gpui::OwnedMenuItem::Action { name, action, .. } => {
-                                let action_name = action.name().to_string();
-                                Some(MenuItemSnapshot::Action {
-                                    label: name.clone(),
-                                    shortcut: shortcuts.get(&action_name).cloned(),
-                                    action: action_name,
-                                })
-                            }
-                            _ => None,
-                        })
-                        .collect(),
-                }),
-                // macOS の Services 等。tako から実行できないので一覧にも出さない
-                gpui::OwnedMenuItem::SystemMenu(_) => None,
-            }
-        };
-        MenuBarSnapshot {
+        tako_control::protocol::MenuBarSnapshot {
             in_window: MENU_BAR_HEIGHT > 0.0,
             open: self
                 .menu_bar
                 .open
                 .and_then(|i| self.menu_defs.get(i))
                 .map(|m| m.name.to_string()),
-            menus: self
-                .menu_defs
-                .iter()
-                .map(|menu| MenuSnapshot {
-                    name: menu.name.to_string(),
-                    items: menu.items.iter().filter_map(to_item).collect(),
-                })
-                .collect(),
+            menus: menu_snapshots(&self.menu_defs),
         }
     }
 
-    /// アクション名（`tako::NewTab`）からメニュー定義中のアクションを引く（Issue #657）。
-    ///
-    /// `gpui::Action` を名前から作る一般的な手段が無いので、**表示しているメニューに
-    /// 実在する項目だけ**発火できる形にする（CLI から任意のアクションを撃てない = 安全側）
+    /// アクション名からメニュー定義中のアクションを引く（本体は [`find_menu_action_in`]）
     pub(crate) fn find_menu_action(&self, name: &str) -> Option<Box<dyn gpui::Action>> {
-        for menu in &self.menu_defs {
-            for item in &menu.items {
-                match item {
-                    gpui::OwnedMenuItem::Action { action, .. } if action.name() == name => {
-                        return Some(action.boxed_clone());
-                    }
-                    gpui::OwnedMenuItem::Submenu(sub) => {
-                        for child in &sub.items {
-                            if let gpui::OwnedMenuItem::Action { action, .. } = child {
-                                if action.name() == name {
-                                    return Some(action.boxed_clone());
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        None
+        find_menu_action_in(&self.menu_defs, name)
     }
 
     /// メニュー定義（言語別）を貼り直す（Issue #657）。

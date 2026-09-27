@@ -527,7 +527,7 @@ TAKO_WINDOW_BOUNDS=1400,900 tako          # 寸法だけ（画面の中央へ）
 
 ```bash
 tako menu list                       # メニュー構成と開閉状態（項目名とショートカット付き）
-tako menu invoke ファイル/新規タブ   # 項目を実行する
+tako menu invoke ファイル/新規タブ   # 項目を実行する（項目名だけでもよい）
 tako menu open 表示                  # メニューを開く（Windows のみ）
 tako menu close                      # 閉じる（Windows のみ）
 ```
@@ -969,6 +969,8 @@ tako theme preset save mytheme   # 現在の配色をプリセットとして保
 ```
 
 `tako theme --help` に色キー・プリセット・フォント指定の全オプションが出ます。
+
+settings.json の色の上書きに読めない値（`#赤色` など）があると、その色だけ既定へ戻して使います。そのあいだは `tako theme`（`dark` / `light` / `toggle` も）の応答に `warnings` が載り、無視した色と理由が `"accent: 不正な色値: …"` の形で並びます。persist.log に残る行と同じ内容です。
 
 ### tako lang
 
