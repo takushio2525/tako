@@ -75,7 +75,10 @@ fn 区間<'a>(
 
 // --- 規則 1: 入口 ---
 
-/// dispatch の `Run` / `RunResolve` の腕がどちらも `resolve_file` を通る
+/// dispatch の `Run` の腕と `RunResolve` の本体がどちらも `resolve_file` を通る。
+///
+/// `RunResolve` の本体は #1730 で `finish_run_resolve` へ移った（実行環境の Tier P を含むので
+/// `prepare_offload` から background で走る）。腕の区間と本体の関数の両方を数える
 fn dispatchの入口を確かめる(src: &str) -> Result<(), String> {
     let view = code_view(&production(src, DISPATCH));
     let (from, arms) = 区間(
@@ -84,11 +87,13 @@ fn dispatchの入口を確かめる(src: &str) -> Result<(), String> {
         "Request::Run {\n            path,",
         "Request::RunnerDefaults {",
     )?;
-    let calls = arms.matches("tako_core::resolve_file(").count();
+    let (_, resolve_body) = 区間(&view, DISPATCH, "fn finish_run_resolve(", "\n}\n")?;
+    let calls = arms.matches("tako_core::resolve_file(").count()
+        + resolve_body.matches("tako_core::resolve_file(").count();
     if calls != 2 {
         return Err(format!(
-            "{DISPATCH}:{} の `Run` / `RunResolve` が `tako_core::resolve_file` を {calls} 回しか\
-             通っていない（2 回 = 両方の腕が要る）。プロジェクトを見ない解決に戻すと、\
+            "{DISPATCH}:{} の `Run` の腕 / `RunResolve` の本体（`finish_run_resolve`）が \
+             `tako_core::resolve_file` を {calls} 回しか通っていない（2 回 = 両方が要る）。プロジェクトを見ない解決に戻すと、\
              cargo プロジェクトの `.rs` が `rustc` 単体で走って必ず失敗する（Issue #1656）",
             行番号(src, from)
         ));

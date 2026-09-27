@@ -457,9 +457,12 @@ struct RunArgs {
     /// 同じファイル・プロファイルの実行ペインをその位置で差し替える）
     #[arg(long)]
     new_pane: bool,
-    /// 実行せずプロファイル一覧を表示する（--dry-run / --list）
+    /// 実行せずプロファイル一覧と実行環境の候補を表示する（--dry-run / --list）
     #[arg(long, alias = "dry-run")]
     list: bool,
+    /// --list で、実行環境の問い合わせ（道具の場所・版）を覚えた答えを捨てて聞き直す
+    #[arg(long, requires = "list")]
+    refresh: bool,
 }
 
 #[derive(Args)]
@@ -9106,6 +9109,7 @@ fn run_list(command: &Command) -> Result<(), String> {
     let request = Request::RunResolve {
         path: args.file.clone(),
         pane: target_pane(args.pane)?,
+        refresh: args.refresh,
     };
     let result = send_request(request)?;
     println!("{}", pretty_json(&result));

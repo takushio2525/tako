@@ -148,11 +148,16 @@ pub const TABLE: &[Entry] = &[
         ),
     ),
     // ─── スクリプト言語 ─────────────────────────────────────────────
+    // `${python}` はプロジェクトの実行環境（`.venv` / uv / poetry / conda / pyenv）を
+    // 自動で選んだ interpreter（#1730。表は `runtime_env::KINDS`）。実行環境が無いときは
+    // その表の `fallback` = macOS `python3` / Windows `python` へ展開されるので、
+    // 展開結果は #1730 以前の `python3 ${fileBase}` / `python ${fileBase}` と 1 バイトも
+    // 変わらない（`runner::tests::拡張子既定の解決結果を両osで固定する` が縛る）。
     // Windows に `python3` は無い。素の `python3` は Microsoft Store の
     // エイリアススタブ（起動すると Store が開くだけ）へ化けることがあり、
     // 一番たちの悪い失敗になる。`py`（python.org の Launcher）は入っていない
     // 配布（Store 版 / conda / uv）があるので既定にしない（#322 = 最簡形）
-    split("py", run("python3 ${fileBase}"), run("python ${fileBase}")),
+    same("py", "${python} ${fileBase}"),
     same("js", "node ${fileBase}"),
     same("mjs", "node ${fileBase}"),
     same("ts", "npx tsx ${fileBase}"),

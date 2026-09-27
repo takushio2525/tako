@@ -755,6 +755,7 @@ const TOOLCHAIN_KIND: RuntimeKind = RuntimeKind {
     variable: "toy",
     fallback: PerOs::same("toyc"),
     wrapped_program: "toyc",
+    version_args: &[],
     detectors: &[Detector::EnvSwitch(EnvSwitchSpec {
         id: "switch",
         label_prefix: "toy ",
@@ -914,4 +915,56 @@ fn 似た名前を版や宣言と読み違えない() {
     let c = auto(&d);
     assert_eq!((c.manager, c.key.as_str()), ("conda", "ml"));
     assert_eq!(c.version.as_deref(), Some("3.11.9"));
+}
+
+// ─── #1730: 壊れた環境を自動で選ばない ─────────────────────────────────
+
+#[test]
+fn interpreterの消えた環境は自動で選ばず次の候補へ進む() {
+    // 印（pyvenv.cfg）はあるが bin/python が無い = 壊れた .venv
+    let fs = FakeFs::new()
+        .file("/h/proj/.venv/pyvenv.cfg", &venv_cfg("version = 3.12.4"))
+        .file("/usr/bin/python3", "");
+    let env = DetectEnv {
+        path_dirs: vec![p("/usr/bin")],
+        ..home("/h")
+    };
+    let mut d = detect_py(MAC, &["/h/proj"], &fs, &env);
+    // S1 の検出だけなら壊れていても選ばれる（印しか見ない）
+    assert_eq!(auto(&d).manager, "venv");
+    d.demote_missing_interpreters(&fs);
+    let c = auto(&d);
+    assert_eq!(c.manager, "system", "{:?}", d.warnings);
+    assert_eq!(
+        prog(c),
+        ["python3"],
+        "解くのは実行ペインのシェル（今と同じ）"
+    );
+    // 候補の一覧には残り、外した理由が warnings に載る
+    assert!(d.candidates.iter().any(|x| x.manager == "venv"));
+    assert!(
+        d.warnings.iter().any(|w| w.contains(".venv")),
+        "{:?}",
+        d.warnings
+    );
+
+    // 直れば（python を置けば）自動で選ばれる
+    let fixed = FakeFs::new()
+        .file("/h/proj/.venv/pyvenv.cfg", &venv_cfg("version = 3.12.4"))
+        .file("/h/proj/.venv/bin/python", "");
+    let mut d = detect_py(MAC, &["/h/proj"], &fixed, &env);
+    d.demote_missing_interpreters(&fixed);
+    assert_eq!(auto(&d).manager, "venv");
+    assert!(d.warnings.is_empty(), "{:?}", d.warnings);
+}
+
+#[test]
+fn 素の名前の候補は実在を確かめない() {
+    // 何も無い = システムの名前のまま（解くのはシェル）。確かめて外すと実行できなくなる
+    let fs = FakeFs::new();
+    let mut d = detect_py(WIN, &["/h/proj"], &fs, &home("/h"));
+    d.demote_missing_interpreters(&fs);
+    let c = auto(&d);
+    assert_eq!(c.manager, "system");
+    assert_eq!(prog(c), ["python"]);
 }

@@ -156,7 +156,7 @@ tako preview-changelog
 |---|---|
 | Rust（`Cargo.toml`） | `cargo run`（ワークスペースの中なら `cargo run -p <パッケージ>`。bin の無いライブラリはそのモジュールのテスト `cargo test -p <パッケージ> --lib <モジュール>::`） |
 | Node.js（`package.json`） | そのファイルを走らせている script があれば `npm run <script>`（pnpm / yarn / bun はロックファイルで判別）、無ければ `node <ファイル>` |
-| Python（`pyproject.toml`） | パッケージの中なら `python3 -m <モジュール>`、テストファイルなら `python3 -m pytest <ファイル>`（`uv.lock` / `poetry.lock` / `.venv` があればそちらの Python） |
+| Python（`pyproject.toml`） | パッケージの中なら `python3 -m <モジュール>`、テストファイルなら `python3 -m pytest <ファイル>`（Python は下の「Python の実行環境」の順で自動で選ぶ） |
 | Go（`go.mod`） | `go run ./<パッケージ>`（main でないパッケージとテストファイルは `go test`） |
 | .NET（`*.csproj` 等） | `dotnet run`（テストプロジェクトは `dotnet test`） |
 | C / C++（`Makefile`） | `run` 規則があれば `make run`、無ければ `make` |
@@ -168,6 +168,29 @@ tako run script.py
 tako run script.py --list        # 使えるプロファイル（どのプロジェクトとして解決したかも出る）
 tako run-default py "python3"    # 拡張子の既定を設定
 ```
+
+### Python の実行環境（.venv / uv / poetry など）
+
+`.py` は、設定しなくてもプロジェクトの実行環境で走ります。ファイルのあるフォルダから上へ辿り、次の順で最初に見つかったものを使います。
+
+1. uv のプロジェクト（`uv.lock` か `pyproject.toml` の `[tool.uv]`）→ `uv run python`
+2. プロジェクトの中の venv（`.venv` / `venv` / `pyvenv.cfg` を持つフォルダ。近いフォルダのものが優先）
+3. Poetry（`poetry.lock`）→ `poetry run python`
+4. Pipenv（`Pipfile`）→ `pipenv run python`
+5. conda（`environment.yml` の `name:` と一致する env がちょうど 1 つあるとき）
+6. pyenv（`.python-version`）
+7. どれも無ければ、これまでどおり `python3`（Windows は `python`）
+
+venv や conda の env を使うときは、その env の `bin`（Windows は `Scripts`）を PATH の先頭へ足し、`VIRTUAL_ENV` なども設定してから走らせます。`tako:run: pytest` のように python を直接書かない宣言でも、その環境の `pytest` が使われます。宣言の中で `${python}` と書くと、選ばれた Python に置き換わります（例: `tako:run: ${python} -m pytest`）。
+
+どれが選ばれたかと、選べる候補の一覧は `--list` で確認できます。python の実体が消えた壊れた `.venv` は選ばず、理由を `warnings` に出します。
+
+```bash
+tako run script.py --list            # runtime（選ばれた環境）と runtimes（候補）
+tako run script.py --list --refresh  # uv / poetry の場所や Python の版を調べ直す
+```
+
+conda の env は PATH と `CONDA_PREFIX` を設定するだけで、`activate.d` のスクリプトは走りません。必要なら `tako:run: conda run -n <名前> python ${fileBase}` と書いてください。環境を固定したいときも同じように `tako:run:` で直接書けます。
 
 ## AI からの操作
 

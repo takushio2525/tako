@@ -182,6 +182,80 @@ pub fn declared_shell_command(shell: &str, command: &str) -> String {
     }
 }
 
+/// 実行ペイン（[`run_pane_command`]）がコマンド本体を解釈させるシェルの方言。
+///
+/// unix は `/bin/sh -c`、Windows は PowerShell（どちらも [`run_pane_command`] が決め打ちで
+/// 起こす）なので、**OS の列から引ける**。`Platform` を引数で受けるので、macOS の単体から
+/// Windows の組み立て（`$env:PATH = …`）まで検査できる（#1655 / #1616 の作法）
+pub fn run_pane_dialect_for(platform: crate::platform::support::Platform) -> ShellDialect {
+    match platform {
+        crate::platform::support::Platform::MacOs => ShellDialect::Posix,
+        crate::platform::support::Platform::Windows => ShellDialect::PowerShell,
+    }
+}
+
+/// [`run_pane_dialect_for`] の実行中の OS 版
+pub fn run_pane_dialect() -> ShellDialect {
+    run_pane_dialect_for(crate::platform::support::Platform::current())
+}
+
+/// 実行ペインへ渡す前に、コマンド本体の前へ置くもの（Code Runner の実行環境。#1730）
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunScript<'a> {
+    /// 実行ペインへ渡す環境変数（値はリテラル。シェルの `$VAR` は展開させない）
+    pub env: &'a [(String, String)],
+    /// PATH の先頭へ足すディレクトリ（並びがそのまま PATH の順）
+    pub path_prepend: &'a [String],
+    /// コマンド本体（`tako:shell` の包みまで済んだもの）
+    pub command: &'a str,
+}
+
+/// 実行環境の env と PATH の前置をコマンド本体の前に付ける（境界 B1 の 1 実装。#1730）。
+///
+/// **`SpawnOptions.env` ではなくコマンド文字列へ埋める**のが要点
+/// （`.agent/plans/2026-09-runner-settings.md` §6.3）:
+///
+/// 1. `SpawnOptions.env` の任意のキーは tmux の器（persist ON）の中へ届かない
+/// 2. 実行ペインはユーザーの対話シェルで起きるので、rc ファイル（`eval "$(pyenv init -)"` 等）が
+///    PATH を組み直す。プロセスの env で前置しても上書きされうるが、コマンド文字列の先頭なら
+///    rc の**後に**効く
+///
+/// 値の引用は方言の [`ShellDialect::quote_arg`] に委ねる（POSIX は必要なときだけ単引用符、
+/// PowerShell は単引用符 = どちらもリテラル）。前に付けるものが無ければ `command` を
+/// **そのまま返す**（実行環境が無いときの実行ペインは今と 1 バイトも変わらない）。
+/// 方言を引数で受けるので、macOS の単体から PowerShell の形まで固定できる。
+///
+/// 前提: 変数名は識別子（`[A-Za-z_][A-Za-z0-9_]*`）。いま渡すのは実行環境の表が持つ名前
+/// （`VIRTUAL_ENV` / `CONDA_PREFIX` …）だけで、利用者が書く env（#1726 S4）を載せるときは
+/// 呼び出し側で名前を検める
+pub fn compose_run_script(dialect: ShellDialect, s: &RunScript<'_>) -> String {
+    if s.env.is_empty() && s.path_prepend.is_empty() {
+        return s.command.to_string();
+    }
+    let mut parts: Vec<String> = Vec::with_capacity(s.env.len() + 2);
+    for (name, value) in s.env {
+        parts.push(match dialect {
+            ShellDialect::Posix => format!("export {name}={}", dialect.quote_arg(value)),
+            ShellDialect::PowerShell => format!("$env:{name} = {}", dialect.quote_arg(value)),
+        });
+    }
+    if !s.path_prepend.is_empty() {
+        parts.push(match dialect {
+            ShellDialect::Posix => format!(
+                "export PATH={}:\"$PATH\"",
+                dialect.quote_arg(&s.path_prepend.join(":"))
+            ),
+            // PowerShell 5.1 でも通る形（`+` で連結。`;` が区切り）
+            ShellDialect::PowerShell => format!(
+                "$env:PATH = {} + $env:PATH",
+                dialect.quote_arg(&format!("{};", s.path_prepend.join(";")))
+            ),
+        });
+    }
+    parts.push(s.command.to_string());
+    parts.join("; ")
+}
+
 /// PTY の子へ argv を「1 語 = 1 引数」で届ける（#884）。
 ///
 /// unix は `execvp` へ argv がそのまま渡るので**何もしない**。Windows には argv という
@@ -1618,6 +1692,108 @@ mod tests {
             body.contains("apply_arg_escaping(&mut tty_options)"),
             "tty::new へ渡す前に apply_arg_escaping を通していない\
              （Windows で空白入りの語が割れてペインが即死する。#884）"
+        );
+    }
+}
+
+/// #1730: 実行環境の env と PATH の前置（両方言の形を macOS から固定する）
+#[cfg(test)]
+mod tests_1730 {
+    use super::*;
+    use crate::platform::support::Platform;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter()
+            .map(|(k, x)| (k.to_string(), x.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn 前に付けるものが無ければコマンドをそのまま返す() {
+        for dialect in [ShellDialect::Posix, ShellDialect::PowerShell] {
+            let got = compose_run_script(
+                dialect,
+                &RunScript {
+                    command: "python3 'a b.py'",
+                    ..RunScript::default()
+                },
+            );
+            assert_eq!(got, "python3 'a b.py'", "{dialect:?}");
+        }
+    }
+
+    #[test]
+    fn 両方言でenvとpathを前に付ける() {
+        let env = pairs(&[("VIRTUAL_ENV", "/my proj/.venv")]);
+        let path = s(&["/my proj/.venv/bin", "/x"]);
+        let script = RunScript {
+            env: &env,
+            path_prepend: &path,
+            command: "python a.py",
+        };
+        assert_eq!(
+            compose_run_script(ShellDialect::Posix, &script),
+            "export VIRTUAL_ENV='/my proj/.venv'; \
+             export PATH='/my proj/.venv/bin:/x':\"$PATH\"; python a.py"
+        );
+        let win_env = pairs(&[("VIRTUAL_ENV", r"C:\it's\.venv")]);
+        let win_path = s(&[r"C:\it's\.venv\Scripts"]);
+        assert_eq!(
+            compose_run_script(
+                ShellDialect::PowerShell,
+                &RunScript {
+                    env: &win_env,
+                    path_prepend: &win_path,
+                    command: "python a.py",
+                }
+            ),
+            r"$env:VIRTUAL_ENV = 'C:\it''s\.venv'; $env:PATH = 'C:\it''s\.venv\Scripts;' + $env:PATH; python a.py"
+        );
+    }
+
+    #[test]
+    fn 実行ペインの方言はosの列から引く() {
+        assert_eq!(run_pane_dialect_for(Platform::MacOs), ShellDialect::Posix);
+        assert_eq!(
+            run_pane_dialect_for(Platform::Windows),
+            ShellDialect::PowerShell
+        );
+        // 実行中の OS の版は実際に起こすシェルと一致する
+        assert_eq!(run_pane_dialect(), script_dialect());
+    }
+
+    /// 組み立てた文字列を実際の `/bin/sh` へ通し、値がリテラルのまま届き、
+    /// 前置した PATH が先に引かれることを確かめる（形だけでなく効き目を見る）
+    #[cfg(unix)]
+    #[test]
+    fn posixの形はshで値がリテラルのまま効く() {
+        let scratch = crate::test_residue::ScratchDir::new("compose-1730");
+        let bin = scratch.path().join("b i$n");
+        std::fs::create_dir_all(&bin).unwrap();
+        let tool = bin.join("tako1730tool");
+        std::fs::write(&tool, "#!/bin/sh\necho from-prepended\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let env = pairs(&[("TAKO_1730_V", "it's $HOME")]);
+        let path = vec![bin.to_string_lossy().into_owned()];
+        let line = compose_run_script(
+            ShellDialect::Posix,
+            &RunScript {
+                env: &env,
+                path_prepend: &path,
+                command: "printf '%s|' \"$TAKO_1730_V\"; tako1730tool",
+            },
+        );
+        // unix の `output_command` は `sh -c <片>`（実行ペインの本体と同じ POSIX シェル）
+        let out = output_command(&line).output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "it's $HOME|from-prepended\n",
+            "{line}"
         );
     }
 }

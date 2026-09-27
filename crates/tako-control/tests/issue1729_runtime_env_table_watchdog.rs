@@ -43,8 +43,12 @@ fn read(rel: &str) -> String {
 const OUTSIDE_TABLE: &[&str] = &[
     "crates/tako-core/src/runtime_env/mod.rs",
     "crates/tako-core/src/runtime_env/detect.rs",
+    "crates/tako-core/src/runtime_env/tier_p.rs",
     "crates/tako-core/src/runner_config.rs",
 ];
+/// 名前の規則（規則 1）だけを見る本番コード（#1730）。Tier P を実際に起こす層なので、
+/// 子プロセスと実行中の OS（規則 3・4）はここの仕事として正しく持つ
+const NAMES_ONLY: &[&str] = &["crates/tako-control/src/runtime_probe.rs"];
 /// 表そのもの（規則 2〜4 はここも見る）
 const TABLE: &str = "crates/tako-core/src/runtime_env/kinds.rs";
 
@@ -100,6 +104,9 @@ fn 表の語彙() -> Vec<&'static str> {
                         words.push(e.marker);
                         words.extend(e.layout.env.iter().map(|(v, _)| *v));
                     }
+                    if let Some(p) = &s.env_dir_probe {
+                        words.extend(p.layout.env.iter().map(|(v, _)| *v));
+                    }
                 }
                 Detector::MarkerDir(s) => {
                     words.extend(s.names.iter().copied());
@@ -110,6 +117,9 @@ fn 表の語彙() -> Vec<&'static str> {
                     words.push(s.label_prefix.trim_end_matches([':', ' ']));
                     words.extend(s.project_files.iter().copied());
                     words.extend(s.layout.env.iter().map(|(v, _)| *v));
+                    if let Some(p) = &s.list_probe {
+                        words.extend([p.program.macos, p.program.windows]);
+                    }
                 }
                 Detector::VersionFile(s) => {
                     words.push(s.label_prefix.trim());
@@ -192,9 +202,26 @@ fn 表の語彙は見張るのに十分な数がある() {
 #[test]
 fn 表の外に言語と道具の名前を書かない() {
     let words = 表の語彙();
-    for rel in OUTSIDE_TABLE {
+    for rel in OUTSIDE_TABLE.iter().chain(NAMES_ONLY) {
         表の外の名前を探す(&read(rel), rel, &words).unwrap_or_else(|e| panic!("{e}"));
     }
+}
+
+/// #1730: 実行環境の層（Tier P を起こす側）へ言語の名前を書くと、同じく名指しで落ちる
+#[test]
+fn 実行環境の層へ注入した表の語をfile_lineで名指しする() {
+    let rel = NAMES_ONLY[0];
+    let src = read(rel);
+    let anchor = "pub fn legacy_1730(";
+    assert!(src.contains(anchor), "注入の目印が変わった: {rel}");
+    let injected = src.replacen(
+        anchor,
+        &format!("fn legacy(k: &str) -> bool {{ k == \"python\" }}\n{anchor}"),
+        1,
+    );
+    let err =
+        表の外の名前を探す(&injected, rel, &表の語彙()).expect_err("直書きを検出できていない");
+    assert!(err.contains(&format!("{rel}:")), "名指ししていない: {err}");
 }
 
 #[test]

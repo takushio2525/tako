@@ -15,9 +15,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::platform::shell::run_pane_dialect_for;
+use crate::platform::shell_dialect::ShellDialect;
 use crate::platform::support::Platform;
 use crate::project_root::{self, SearchBounds};
 use crate::runner_project::{self, ProjectMatch};
+use crate::runtime_env;
 use crate::shell::quote_for_shell;
 
 // --- 定数 ---
@@ -78,10 +81,22 @@ impl RunSource {
 pub struct RunPlan {
     pub profile: String,
     pub command: String,
+    /// 展開前のコマンド（宣言・既定の書いたまま。プロジェクト既定は組み立て済みの形）。
+    /// 「実行環境の変数を使っているか」を読む材料（#1730）
+    pub template: String,
     pub cwd: std::path::PathBuf,
     /// `tako:shell` 指定（None = ログインシェル）
     pub shell: Option<String>,
     pub source: RunSource,
+}
+
+impl RunPlan {
+    /// コマンドが実行環境の変数（`${<variable>}`）を使っているか。包む形の実行環境
+    /// （`uv run python`）は、変数を使わない宣言（`tako:run: pytest`）には効かない
+    pub fn uses_variable(&self, variable: &str) -> bool {
+        self.source == RunSource::ProjectDefault
+            || self.template.contains(&format!("${{{variable}}}"))
+    }
 }
 
 /// パース結果: 1 プロファイル分の宣言内容（未展開）
@@ -114,6 +129,9 @@ pub struct Resolution {
     pub project: Option<ProjectMatch>,
     /// `${workspaceRoot}` の値（プロジェクトのルート → git のルート → ファイルのディレクトリ）
     pub workspace_root: PathBuf,
+    /// 選んだプロファイルの宣言が明示した作業ディレクトリ（書いたままの値。`tako:cwd`）。
+    /// 実行設定の項目の出典（`declaration`）を示す材料（#1726）
+    pub declared_cwd: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -300,24 +318,42 @@ fn strip_closers(value: &str) -> &str {
 
 // --- 変数展開 ---
 
-/// 変数展開の文脈（#1656）。
+/// 実行環境の層（#1730。`tako-control::runtime_probe`）が決めた変数の値。
 ///
-/// 展開に使う値はここへ集める。後続（#1726 S2。`.agent/plans/2026-09-runner-settings.md`
-/// §6.1）が `${python}` / `${args}` の値を**同じ構造体へ足す**ので、`expand_variables` の
-/// 引数を増やさない
+/// 鍵は実行環境の表の `variable`（`${python}` の `python`）、値は `${…}` に入る**語の列**
+/// （`[<interpreter>]` / `[<道具>, "run", "python"]`）。語の列のまま持つのは、引用の仕方が
+/// 置き先のシェルで変わるため（`tako:shell` の宣言があればそのシェルの方言で囲む）。
+/// **空 = 実行環境の層を通っていない**（`TAKO_1730_LEGACY=1` / UI の一覧）
+pub type RuntimeWords = BTreeMap<String, Vec<String>>;
+
+/// 変数展開の文脈（#1656 / #1730）。
+///
+/// 展開に使う値はここへ集める。後続（#1726 S4）が `${args}` の値を**同じ構造体へ足す**ので、
+/// `expand_variables` の引数を増やさない
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunVars {
     /// 実行対象（`${file}` / `${fileDir}` / `${fileBase}` / `${fileNoExt}` / `${ext}` の元）
     pub path: PathBuf,
     /// `${workspaceRoot}`（プロジェクトのルート → git のルート → ファイルのディレクトリ）
     pub workspace_root: PathBuf,
+    /// 実行環境の変数（`${python}` 等）。無い変数は表の `fallback`（[`Self::platform`] の列）で
+    /// 展開する = 実行環境が見つからないときの展開が今と 1 バイトも変わらない
+    pub runtime: RuntimeWords,
+    /// `fallback` の列を引く OS
+    pub platform: Platform,
+    /// 実行環境の語を置くシェルの方言（PowerShell は囲んだパスを `&` で起こす）
+    pub dialect: ShellDialect,
 }
 
 impl RunVars {
     pub fn new(path: &Path, workspace_root: &Path) -> Self {
+        let platform = Platform::current();
         Self {
             path: path.to_path_buf(),
             workspace_root: workspace_root.to_path_buf(),
+            runtime: RuntimeWords::new(),
+            platform,
+            dialect: run_pane_dialect_for(platform),
         }
     }
 
@@ -325,6 +361,42 @@ impl RunVars {
     pub fn for_file(path: &Path) -> Self {
         Self::new(path, path.parent().unwrap_or(Path::new("")))
     }
+
+    /// OS を決める（`fallback` の列と、実行ペインのシェルの方言）。macOS から Windows の
+    /// 展開を検査するときに使う
+    pub fn on(mut self, platform: Platform) -> Self {
+        self.platform = platform;
+        self.dialect = run_pane_dialect_for(platform);
+        self
+    }
+
+    /// 実行環境の層が決めた値を載せる
+    pub fn with_runtime(mut self, runtime: &RuntimeWords) -> Self {
+        self.runtime = runtime.clone();
+        self
+    }
+
+    /// 語を置くシェルの方言を差し替える（`tako:shell` の宣言）
+    fn in_dialect(&self, dialect: ShellDialect) -> Self {
+        Self {
+            dialect,
+            ..self.clone()
+        }
+    }
+
+    /// 実行環境の変数（表の `variable`）の値。表に無い名前は `None`（展開せず残す）
+    fn runtime_value(&self, name: &str) -> Option<String> {
+        let kind = runtime_env::KINDS.iter().find(|k| k.variable == name)?;
+        Some(match self.runtime.get(name).filter(|w| !w.is_empty()) {
+            Some(words) => self.dialect.command_words(words),
+            None => runtime_env::fallback_value(kind, self.platform).to_string(),
+        })
+    }
+}
+
+/// `tako:shell` の宣言が決める方言（判定できないシェルは POSIX = `declared_shell_command` と同じ）
+fn declared_dialect(shell: &str) -> ShellDialect {
+    ShellDialect::from_program(shell).unwrap_or(ShellDialect::Posix)
 }
 
 /// コマンド・cwd の値中の変数を展開。展開値はシングルクオートで自動エスケープ
@@ -364,7 +436,8 @@ pub fn expand_variables(template: &str, vars: &RunVars) -> String {
                     "fileNoExt" => Some(quote_for_shell(&file_no_ext)),
                     "ext" => Some(quote_for_shell(&ext)),
                     "workspaceRoot" => Some(quote_for_shell(&root_str)),
-                    _ => None, // 未知は展開せずそのまま
+                    // 実行環境の変数（`${python}`。#1730）。未知は展開せずそのまま
+                    other => vars.runtime_value(other),
                 };
                 if let Some(rep) = replacement {
                     result.push_str(&rep);
@@ -412,13 +485,17 @@ pub fn merged_defaults_for(
 /// 実ファイルの解決（実行中の OS 向け）。**dispatch / 再生ボタンはこれを通す**（#1656）。
 ///
 /// `user_defaults` は settings.json の `runner_defaults`（ユーザーが設定した拡張子既定）。
-/// 組み込み既定との重ね合わせと、プロジェクト既定との優先順位はここで決める
+/// 組み込み既定との重ね合わせと、プロジェクト既定との優先順位はここで決める。
+///
+/// `runtime` は実行環境の層（`tako-control::runtime_probe`。#1730）が決めた `${python}` 等の値。
+/// 空なら実行環境の変数は表の `fallback`（今までの既定表の名前）で展開する
 pub fn resolve_file(
     path: &Path,
     head: &str,
     user_defaults: &BTreeMap<String, String>,
     profile: Option<&str>,
     command_override: Option<&str>,
+    runtime: &RuntimeWords,
 ) -> Result<Resolution, RunnerError> {
     // A/B（`TAKO_1656_LEGACY=1`）: プロジェクトを見ない #1656 以前の解決へ戻す
     let bounds = SearchBounds::for_user();
@@ -431,12 +508,14 @@ pub fn resolve_file(
         profile,
         command_override,
         detect.then_some(&bounds),
+        runtime,
     )
 }
 
 /// [`resolve_file`] の OS と探索範囲を外から渡す版（テスト・検査用）。
 ///
 /// `bounds` が `None` ならプロジェクトを探さない（`${workspaceRoot}` はファイルのディレクトリ）
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_file_in(
     platform: Platform,
     path: &Path,
@@ -445,9 +524,10 @@ pub fn resolve_file_in(
     profile: Option<&str>,
     command_override: Option<&str>,
     bounds: Option<&SearchBounds>,
+    runtime: &RuntimeWords,
 ) -> Result<Resolution, RunnerError> {
     let file_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-    let project = bounds.and_then(|b| runner_project::detect(platform, path, head, b));
+    let project = bounds.and_then(|b| runner_project::detect(platform, path, head, b, runtime));
     let workspace_root = match (&project, bounds) {
         (Some(p), _) => p.root.clone(),
         (None, Some(b)) => project_root::repo_root_within(&file_dir, b).unwrap_or(file_dir),
@@ -463,6 +543,7 @@ pub fn resolve_file_in(
         workspace_root,
         profile,
         command_override,
+        runtime,
     )
 }
 
@@ -510,6 +591,7 @@ pub(crate) fn resolve_for(
         file_dir,
         profile,
         command_override,
+        &RuntimeWords::new(),
     )
 }
 
@@ -529,26 +611,32 @@ fn resolve_core(
     workspace_root: PathBuf,
     profile: Option<&str>,
     command_override: Option<&str>,
+    runtime: &RuntimeWords,
 ) -> Result<Resolution, RunnerError> {
     let file_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
     let ext = path
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    let vars = RunVars::new(path, &workspace_root);
+    let vars = RunVars::new(path, &workspace_root)
+        .on(platform)
+        .with_runtime(runtime);
     let expand = |template: &str| expand_variables(template, &vars);
 
     let decls = parse_declarations(head);
-    let warnings = decls.warnings;
+    let warnings = decls.warnings.clone();
 
     // 全プロファイルの RunPlan を構築（ドロップダウン用）
     let mut all_profiles: Vec<RunPlan> = Vec::new();
+    // 宣言が明示した作業ディレクトリ（プロファイル名 → 書いたままの値。実行設定の出典に使う）
+    let mut declared_cwds: BTreeMap<String, String> = BTreeMap::new();
 
     // 1. コマンドオーバーライド
     if let Some(cmd_override) = command_override {
         let plan = RunPlan {
             profile: profile.unwrap_or("default").to_string(),
             command: expand(cmd_override),
+            template: cmd_override.to_string(),
             cwd: file_dir.clone(),
             shell: None,
             source: RunSource::Override,
@@ -560,31 +648,18 @@ fn resolve_core(
             warnings,
             project,
             workspace_root,
+            declared_cwd: None,
         });
     }
 
     // 2. 宣言プロファイル
-    // 共通 cwd（無添字 tako:cwd）
-    let common_cwd = decls
-        .profiles
-        .iter()
-        .find(|p| p.name == "default")
-        .and_then(|p| p.cwd.as_deref());
-
     for decl in &decls.profiles {
         if let Some(run_cmd) = &decl.run {
             // cwd 解決: プロファイル別 → 共通 → ファイルのディレクトリ
-            let raw_cwd = decl
-                .cwd
-                .as_deref()
-                .or(if decl.name != "default" {
-                    common_cwd
-                } else {
-                    None
-                })
-                .or(common_cwd);
+            let raw_cwd = declared_cwd(&decls, &decl.name);
 
             let resolved_cwd = if let Some(cwd_str) = raw_cwd {
+                declared_cwds.insert(decl.name.clone(), cwd_str.to_string());
                 let expanded = expand(cwd_str);
                 // シングルクオート除去（expand_variables がクオートするが cwd はパスとして使う）
                 let cleaned = strip_quotes(&expanded);
@@ -598,9 +673,15 @@ fn resolve_core(
                 file_dir.clone()
             };
 
+            // `tako:shell` で内側のシェルが変わるなら、実行環境の語はそのシェルの方言で囲む
+            let command = match &decl.shell {
+                Some(shell) => expand_variables(run_cmd, &vars.in_dialect(declared_dialect(shell))),
+                None => expand(run_cmd),
+            };
             all_profiles.push(RunPlan {
                 profile: decl.name.clone(),
-                command: expand(run_cmd),
+                command,
+                template: run_cmd.clone(),
                 cwd: resolved_cwd,
                 shell: decl.shell.clone(),
                 source: RunSource::Declaration,
@@ -617,6 +698,7 @@ fn resolve_core(
             Some(p) if !user_set => all_profiles.push(RunPlan {
                 profile: "default".to_string(),
                 command: p.command.clone(),
+                template: p.command.clone(),
                 cwd: p.root.clone(),
                 shell: None,
                 source: RunSource::ProjectDefault,
@@ -626,6 +708,7 @@ fn resolve_core(
                     all_profiles.push(RunPlan {
                         profile: "default".to_string(),
                         command: expand(default_cmd),
+                        template: default_cmd.clone(),
                         cwd: file_dir.clone(),
                         shell: None,
                         source: RunSource::ExtensionDefault,
@@ -643,12 +726,14 @@ fn resolve_core(
             .find(|p| p.profile == profile_name)
             .cloned()
             .ok_or_else(|| RunnerError::ProfileNotFound(profile_name.to_string()))?;
+        let declared_cwd = declared_cwds.get(&plan.profile).cloned();
         return Ok(Resolution {
             plan,
             all_profiles,
             warnings,
             project,
             workspace_root,
+            declared_cwd,
         });
     }
 
@@ -659,6 +744,7 @@ fn resolve_core(
         .or_else(|| all_profiles.first())
         .cloned()
         .ok_or_else(|| RunnerError::NoCommand(no_command_hint(platform, &ext)))?;
+    let declared_cwd = declared_cwds.get(&plan.profile).cloned();
 
     Ok(Resolution {
         plan,
@@ -666,7 +752,23 @@ fn resolve_core(
         warnings,
         project,
         workspace_root,
+        declared_cwd,
     })
+}
+
+/// 宣言の作業ディレクトリ（書いたままの値）。プロファイル別 → 共通（無添字の `tako:cwd`）
+fn declared_cwd<'a>(decls: &'a Declarations, profile: &str) -> Option<&'a str> {
+    let common = decls
+        .profiles
+        .iter()
+        .find(|p| p.name == "default")
+        .and_then(|p| p.cwd.as_deref());
+    decls
+        .profiles
+        .iter()
+        .find(|p| p.name == profile)
+        .and_then(|p| p.cwd.as_deref())
+        .or(common)
 }
 
 /// 実行コマンドが見つからなかったときの案内（純粋関数。**OS を引数で受ける**）。
@@ -952,6 +1054,165 @@ mod tests {
         let path = PathBuf::from("/Users/a/src/main.c");
         let result = expand_variables("${fileDir}", &RunVars::for_file(&path));
         assert_eq!(result, "/Users/a/src");
+    }
+
+    // --- 実行環境の変数（#1730）---
+
+    fn rt(words: &[&str]) -> RuntimeWords {
+        let kind = &runtime_env::KINDS[0];
+        BTreeMap::from([(
+            kind.variable.to_string(),
+            words.iter().map(|w| w.to_string()).collect(),
+        )])
+    }
+
+    /// 受け入れ条件: 実行環境が無いときの `py` の展開が #1730 以前と両 OS でバイト一致。
+    /// 変更前の表の行（macOS `python3 ${fileBase}` / Windows `python ${fileBase}`）を
+    /// ここへ写して、引用の要る名前（空白・日本語・`'`・`$`）まで突き合わせる
+    #[test]
+    fn 実行環境が無いときのpyの展開は1730以前と両osでバイト一致() {
+        let before = [
+            (Platform::MacOs, "python3 ${fileBase}"),
+            (Platform::Windows, "python ${fileBase}"),
+        ];
+        let names = [
+            "a.py",
+            "my script.py",
+            "データ解析.py",
+            "it's.py",
+            "$HOME.py",
+            "a;b.py",
+        ];
+        for (platform, old_template) in before {
+            let now = crate::platform::runner_defaults::entry("py")
+                .and_then(|e| e.get(platform).command())
+                .expect("py の行がある");
+            for name in names {
+                let path = PathBuf::from(format!("/tmp/プロジェクト x/{name}"));
+                let vars = RunVars::for_file(&path).on(platform);
+                assert_eq!(
+                    expand_variables(now, &vars),
+                    expand_variables(old_template, &vars),
+                    "{platform:?} {name}"
+                );
+                // 空の実行環境（層を通ったが値が無い）も同じ
+                let empty = vars.clone().with_runtime(&BTreeMap::from([(
+                    runtime_env::KINDS[0].variable.to_string(),
+                    Vec::new(),
+                )]));
+                assert_eq!(
+                    expand_variables(now, &empty),
+                    expand_variables(old_template, &vars)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn 実行環境の変数は方言で囲む() {
+        let path = PathBuf::from("/p/a.py");
+        let venv = rt(&["/my proj/.venv/bin/python"]);
+        let mac = RunVars::for_file(&path)
+            .on(Platform::MacOs)
+            .with_runtime(&venv);
+        assert_eq!(
+            expand_variables("${python} ${fileBase}", &mac),
+            "'/my proj/.venv/bin/python' a.py"
+        );
+        let win = RunVars::for_file(&path)
+            .on(Platform::Windows)
+            .with_runtime(&rt(&[r"C:\a b\.venv\Scripts\python.exe"]));
+        assert_eq!(
+            expand_variables("${python} -m pytest", &win),
+            r"& 'C:\a b\.venv\Scripts\python.exe' -m pytest"
+        );
+        // 包む形（道具 + run + python）
+        let wrapped = RunVars::for_file(&path)
+            .on(Platform::MacOs)
+            .with_runtime(&rt(&["/h/.local/bin/uv", "run", "python"]));
+        assert_eq!(
+            expand_variables("${python} ${fileBase}", &wrapped),
+            "/h/.local/bin/uv run python a.py"
+        );
+        // 表に無い名前は今までどおり残す
+        assert_eq!(
+            expand_variables("${node} ${HOME}", &wrapped),
+            "${node} ${HOME}"
+        );
+    }
+
+    #[test]
+    fn 実行環境の値は宣言にも拡張子既定にも効き宣言のシェルの方言で囲む() {
+        let path = PathBuf::from("/p/a.py");
+        let venv = rt(&["/v env/bin/python"]);
+        let defaults = merged_defaults_for(Platform::MacOs, &BTreeMap::new());
+        let res = resolve_core(
+            Platform::MacOs,
+            &path,
+            "",
+            &defaults,
+            &BTreeMap::new(),
+            None,
+            PathBuf::from("/p"),
+            None,
+            None,
+            &venv,
+        )
+        .unwrap();
+        assert_eq!(res.plan.command, "'/v env/bin/python' a.py");
+        assert_eq!(res.plan.template, "${python} ${fileBase}");
+        assert!(res.plan.uses_variable("python"));
+
+        // Windows でも `tako:shell: bash` の宣言なら、語は POSIX で囲む（`&` を付けない）
+        let head = "# tako:shell: bash\n# tako:run: ${python} -m pytest\n# tako:run[raw]: pytest\n";
+        let win = resolve_core(
+            Platform::Windows,
+            &path,
+            head,
+            &merged_defaults_for(Platform::Windows, &BTreeMap::new()),
+            &BTreeMap::new(),
+            None,
+            PathBuf::from("/p"),
+            None,
+            None,
+            &venv,
+        )
+        .unwrap();
+        assert_eq!(win.plan.command, "'/v env/bin/python' -m pytest");
+        let raw = win
+            .all_profiles
+            .iter()
+            .find(|p| p.profile == "raw")
+            .unwrap();
+        assert!(!raw.uses_variable("python"), "変数を使わない宣言");
+        // 上書きのコマンドも同じ変数で展開する
+        let over = resolve_core(
+            Platform::MacOs,
+            &path,
+            "",
+            &defaults,
+            &BTreeMap::new(),
+            None,
+            PathBuf::from("/p"),
+            None,
+            Some("${python} -V"),
+            &venv,
+        )
+        .unwrap();
+        assert_eq!(over.plan.command, "'/v env/bin/python' -V");
+    }
+
+    #[test]
+    fn 宣言の作業ディレクトリは書いたままの値で返る() {
+        let path = PathBuf::from("/tmp/src/main.c");
+        let head = "// tako:cwd: ${fileDir}/..\n// tako:run: make\n// tako:run[t]: make t\n// tako:cwd[t]: build\n";
+        let defaults = merged_defaults(&BTreeMap::new());
+        let res = resolve(&path, head, &defaults, None, None).unwrap();
+        assert_eq!(res.declared_cwd.as_deref(), Some("${fileDir}/.."));
+        let res = resolve(&path, head, &defaults, Some("t"), None).unwrap();
+        assert_eq!(res.declared_cwd.as_deref(), Some("build"));
+        let res = resolve(&path, "// tako:run: make\n", &defaults, None, None).unwrap();
+        assert_eq!(res.declared_cwd, None);
     }
 
     // --- resolve ---
@@ -1424,7 +1685,16 @@ mod tests {
         ) -> Result<Resolution, RunnerError> {
             let file = self.base.join(rel);
             let head = std::fs::read_to_string(&file).unwrap_or_default();
-            resolve_file_in(platform, &file, &head, user, None, None, Some(&self.bounds))
+            resolve_file_in(
+                platform,
+                &file,
+                &head,
+                user,
+                None,
+                None,
+                Some(&self.bounds),
+                &RuntimeWords::new(),
+            )
         }
     }
 
@@ -1606,6 +1876,7 @@ mod tests {
             None,
             None,
             None,
+            &RuntimeWords::new(),
         )
         .unwrap();
         assert_eq!(res.plan.source, RunSource::ExtensionDefault);
@@ -1632,6 +1903,7 @@ mod tests {
             Some("default"),
             None,
             Some(&p.bounds),
+            &RuntimeWords::new(),
         )
         .unwrap();
         assert_eq!(res.plan.command, "make run");

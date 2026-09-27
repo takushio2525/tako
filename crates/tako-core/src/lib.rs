@@ -129,7 +129,7 @@ pub use preview_view::{
 pub use runner::{
     builtin_defaults, builtin_defaults_for, expand_variables, merged_defaults, merged_defaults_for,
     parse_declarations, read_file_head_for_ui, resolve_file, resolve_file_in, Declarations,
-    ProfileDecl, Resolution, RunPlan, RunSource, RunVars, RunnerError,
+    ProfileDecl, Resolution, RunPlan, RunSource, RunVars, RunnerError, RuntimeWords,
 };
 pub use screen::{InputStatus, InputStyle, Screen, ScreenLine, StyleRun};
 pub use shell::{quote_for_shell, quote_paths_for_shell};

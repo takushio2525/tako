@@ -27,6 +27,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::platform::support::Platform;
 use crate::project_root::{self, SearchBounds};
+use crate::runner::RuntimeWords;
 use crate::shell::quote_for_shell;
 
 /// 種別 1 つぶんの行
@@ -63,6 +64,8 @@ pub struct Probe<'a> {
     /// 見つかった印のファイル名
     pub marker: &'a str,
     pub bounds: &'a SearchBounds,
+    /// 実行環境の層が決めた `${python}` 等の値（#1730。空 = 層を通っていない）
+    pub runtime: &'a RuntimeWords,
 }
 
 /// 計画関数の戻り値
@@ -143,6 +146,7 @@ pub fn detect(
     file: &Path,
     head: &str,
     bounds: &SearchBounds,
+    runtime: &RuntimeWords,
 ) -> Option<ProjectMatch> {
     let ext = file
         .extension()
@@ -169,6 +173,7 @@ pub fn detect(
                 marker_dir: &dir,
                 marker: &marker,
                 bounds,
+                runtime,
             };
             if let Some(planned) = (kind.plan)(&probe) {
                 return Some(ProjectMatch {
@@ -734,9 +739,28 @@ fn plan_npm(p: &Probe<'_>) -> Option<Planned> {
 
 // ─── python ────────────────────────────────────────────────────────────
 
-/// 解釈系（`uv.lock` → `uv run python` / `poetry.lock` → `poetry run python` /
+/// 解釈系。**実行環境の層（#1730）が値を決めていればそれを使う**
+/// （`runtime_env` の表と自動選択の順 = `.venv` / uv / poetry / conda / pyenv / システムの 1 実装。
+/// `tako:run` の宣言・拡張子既定の `${python}` と同じ答えになる）。
+///
+/// 層を通っていないとき（`TAKO_1730_LEGACY=1` / 再生ボタンの一覧）は #1656 の推定
+/// （[`python_command_1656`]）のまま
+fn interpreter(p: &Probe<'_>) -> String {
+    let ext = file_ext(p.file);
+    let words = crate::runtime_env::kind_for_ext(&ext)
+        .and_then(|k| p.runtime.get(k.variable))
+        .filter(|w| !w.is_empty());
+    match words {
+        Some(words) => {
+            crate::platform::shell::run_pane_dialect_for(p.platform).command_words(words)
+        }
+        None => python_command_1656(p.marker_dir, p.platform, &ext),
+    }
+}
+
+/// #1656 の解釈系の推定（`uv.lock` → `uv run python` / `poetry.lock` → `poetry run python` /
 /// `.venv` → その中の python / どれも無ければ OS の既定）
-fn python_command(root: &Path, platform: Platform) -> String {
+fn python_command_1656(root: &Path, platform: Platform, ext: &str) -> String {
     if root.join("uv.lock").is_file() {
         return "uv run python".to_string();
     }
@@ -758,10 +782,10 @@ fn python_command(root: &Path, platform: Platform) -> String {
     if venv.exists() {
         return spelled.to_string();
     }
-    // OS の既定は拡張子既定の表（`py` の行）と**同じ 1 マス**から引く（2 か所に書かない）
-    crate::platform::runner_defaults::entry("py")
-        .and_then(|e| e.get(platform).command())
-        .and_then(|c| c.split_whitespace().next())
+    // OS の既定は実行環境の表の `fallback`（拡張子既定の `${python}` が実行環境の無いときに
+    // 展開される値）と**同じ 1 マス**から引く（2 か所に書かない）
+    crate::runtime_env::kind_for_ext(ext)
+        .map(|k| crate::runtime_env::fallback_value(k, platform))
         .unwrap_or("python")
         .to_string()
 }
@@ -793,7 +817,7 @@ fn python_module(parts: &[String]) -> Option<String> {
 fn plan_python(p: &Probe<'_>) -> Option<Planned> {
     let root = p.marker_dir;
     let rel = rel_parts(root, p.file)?;
-    let py = python_command(root, p.platform);
+    let py = interpreter(p);
     let rel_slash = rel.join("/");
     let name = rel.last()?;
     let command = if is_pytest_file(name) {
@@ -927,7 +951,7 @@ mod tests {
         fn detect(&self, platform: Platform, rel: &str) -> Option<ProjectMatch> {
             let file = self.base.join(rel);
             let head = std::fs::read_to_string(&file).unwrap_or_default();
-            detect(platform, &file, &head, &self.bounds)
+            detect(platform, &file, &head, &self.bounds, &RuntimeWords::new())
         }
 
         /// 両 OS で同じ結果になることを確かめ、(kind, root の相対, command) を返す
@@ -1316,6 +1340,33 @@ mod tests {
         s.write("p/uv.lock", "");
         let (_, _, cmd) = s.same_on_both("p/src/pkg/app.py");
         assert_eq!(cmd, "uv run python -m pkg.app");
+    }
+
+    /// #1730: 実行環境の層が値を決めていれば、印の推定（#1656）ではなくその値で走らせる
+    /// （宣言・拡張子既定の `${python}` と同じ答え）。値は実行ペインのシェルの方言で囲む
+    #[test]
+    fn pythonは実行環境の層が決めた値を使う() {
+        let s = Sandbox::new("py-runtime");
+        s.write("p/pyproject.toml", "");
+        s.write("p/poetry.lock", "");
+        s.write("p/pkg/app.py", "");
+        let file = s.base.join("p/pkg/app.py");
+        let kind = crate::runtime_env::kind_for_ext("py").unwrap();
+        let words = |w: &[&str]| -> RuntimeWords {
+            RuntimeWords::from([(
+                kind.variable.to_string(),
+                w.iter().map(|x| x.to_string()).collect(),
+            )])
+        };
+        let venv = words(&["/my proj/.venv/bin/python"]);
+        let m = detect(Platform::MacOs, &file, "", &s.bounds, &venv).unwrap();
+        assert_eq!(m.command, "'/my proj/.venv/bin/python' -m pkg.app");
+        let win = words(&[r"C:\a b\Scripts\python.exe"]);
+        let m = detect(Platform::Windows, &file, "", &s.bounds, &win).unwrap();
+        assert_eq!(m.command, r"& 'C:\a b\Scripts\python.exe' -m pkg.app");
+        // 層を通っていない（空）なら #1656 の推定のまま
+        let m = detect(Platform::MacOs, &file, "", &s.bounds, &RuntimeWords::new()).unwrap();
+        assert_eq!(m.command, "poetry run python -m pkg.app");
     }
 
     // ─── dotnet ───

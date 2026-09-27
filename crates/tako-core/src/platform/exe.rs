@@ -53,6 +53,49 @@ pub fn find(name: &str) -> Option<String> {
     imp::find(name)
 }
 
+/// [`find_with_timeout`] の結果
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BoundedFind {
+    /// 見つかった実行ファイル（[`is_executable_file`] を満たすものだけ）
+    pub path: Option<String>,
+    /// 上限を超えて打ち切った（= 見つからなかったのではなく**確かめられなかった**）
+    pub timeout: Option<crate::probe::TimeoutNotice>,
+}
+
+/// [`find`] の**待ちに上限を持つ**版（#1730。`.agent/conventions.md`「外部コマンドを待つときは
+/// 上限を持つ（Issue #1503）」）。
+///
+/// unix の [`find`] はログインシェルを起こして `command -v` を聞く = rc ファイル次第で
+/// いくらでも待ちうる子プロセスで、待ちに上限が無い。Code Runner の実行環境の検出
+/// （Tier P）はここを通し、待ちは `probe::output_with_timeout` の 1 実装に掛ける。
+/// Windows は PATH の走査だけ（子プロセスを起こさない）なので [`find`] と同じ。
+///
+/// `name` はコマンド名だけを受ける（`[A-Za-z0-9._+-]`。シェルへ文字列として渡すため、
+/// それ以外は探さずに `None`）。ログインシェルが別名・関数の定義を返したとき
+/// （`alias uv=…`）や rc が余計な行を出したときは、**絶対パスの行だけ**を採る
+pub fn find_with_timeout(name: &str, budget: std::time::Duration) -> BoundedFind {
+    let valid = !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b));
+    if !valid {
+        return BoundedFind::default();
+    }
+    imp::find_with_timeout(name, budget)
+}
+
+/// ログインシェルの出力から「実行できる絶対パス」の行を選ぶ（純粋に近い部分。rc が
+/// 挨拶文を出しても、`command -v` の答えは最後の行に来る）
+#[cfg_attr(windows, allow(dead_code))]
+fn pick_found_path(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .rev()
+        .find(|l| l.starts_with('/') && is_executable_file(std::path::Path::new(l)))
+        .map(str::to_string)
+}
+
 /// 「実行できる通常ファイル」か。symlink は追う（`which` と同じ判定）。
 ///
 /// unix は mode の実行ビット、Windows は拡張子が `PATHEXT` に在るかを見る
@@ -95,6 +138,22 @@ mod imp {
         (!path.is_empty()).then_some(path)
     }
 
+    /// [`find`] と同じ問い合わせを `probe::output_with_timeout`（待ちの 1 実装）で行う
+    pub fn find_with_timeout(name: &str, budget: std::time::Duration) -> super::BoundedFind {
+        let shell = std::env::var("SHELL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/bin/sh".into());
+        let lookup = format!("command -v {name}");
+        let outcome = crate::probe::output_with_timeout(&shell, &["-l", "-c", &lookup], budget);
+        let timeout = outcome.timeout_notice();
+        let path = outcome
+            .into_output()
+            .filter(|o| o.status.success())
+            .and_then(|o| super::pick_found_path(&String::from_utf8_lossy(&o.stdout)));
+        super::BoundedFind { path, timeout }
+    }
+
     pub fn is_executable(_path: &std::path::Path, meta: &std::fs::Metadata) -> bool {
         use std::os::unix::fs::PermissionsExt;
         meta.permissions().mode() & 0o111 != 0
@@ -118,6 +177,14 @@ mod imp {
             &user_install_dirs(),
             &|p| std::path::Path::new(p).is_file(),
         )
+    }
+
+    /// Windows の探索は PATH の走査だけ（子プロセスを起こさない）なので待ちが無い
+    pub fn find_with_timeout(name: &str, _budget: std::time::Duration) -> super::BoundedFind {
+        super::BoundedFind {
+            path: find(name),
+            timeout: None,
+        }
     }
 
     fn split_path_list(value: Option<std::ffi::OsString>) -> Vec<String> {
@@ -367,6 +434,30 @@ mod tests {
 
     fn ext() -> Vec<String> {
         dirs(&[".COM", ".EXE", ".BAT", ".CMD"])
+    }
+
+    /// #1730: 探す名前はコマンド名だけ（シェルへ文字列で渡すので、それ以外は起こさずに None）
+    #[test]
+    fn find_with_timeoutはコマンド名以外を探さない() {
+        for bad in ["", "uv; rm -rf x", "a b", "$(id)", "../uv", "u`v`"] {
+            let got = find_with_timeout(bad, std::time::Duration::from_secs(1));
+            assert_eq!(got, BoundedFind::default(), "{bad:?}");
+        }
+    }
+
+    /// #1730: rc が挨拶文を出しても `command -v` の答え（実行できる絶対パスの最後の行）だけを採る。
+    /// 別名・関数の定義は採らない
+    #[cfg(unix)]
+    #[test]
+    fn ログインシェルの出力から実行できる絶対パスだけを採る() {
+        let sh = "/bin/sh";
+        assert_eq!(
+            pick_found_path(&format!("Welcome!\n{sh}\n")).as_deref(),
+            Some(sh)
+        );
+        assert_eq!(pick_found_path("alias uv='uvx'\n"), None);
+        assert_eq!(pick_found_path("/no/such/tako-1730-bin\n"), None);
+        assert_eq!(pick_found_path(""), None);
     }
 
     #[test]

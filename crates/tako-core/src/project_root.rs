@@ -209,7 +209,14 @@ pub fn detect(file: &Path) -> Option<ProjectInfo> {
 pub fn detect_in(file: &Path, bounds: &SearchBounds) -> Option<ProjectInfo> {
     // ルートは OS にもファイルの中身にも依らない（中身を見るのはコマンドの選び方だけ =
     // Go の `package` 句）ので、実行中の OS と空の先頭で表を引く
-    crate::runner_project::detect(Platform::current(), file, "", bounds).map(|m| ProjectInfo {
+    crate::runner_project::detect(
+        Platform::current(),
+        file,
+        "",
+        bounds,
+        &crate::runner::RuntimeWords::new(),
+    )
+    .map(|m| ProjectInfo {
         root: m.root,
         kind: m.kind,
     })

@@ -2160,8 +2160,15 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         new_pane: Option<bool>,
     },
-    /// Code Runner: ファイルの実行プロファイル一覧を解決して返す（実行しない。FR-3.18, #453）
-    RunResolve { path: String, pane: Option<u64> },
+    /// Code Runner: ファイルの実行プロファイル一覧を解決して返す（実行しない。FR-3.18, #453）。
+    /// 実行環境（`.venv` / uv / poetry 等）の候補と実効値も返す（FR-3.18.3, #1730）
+    RunResolve {
+        path: String,
+        pane: Option<u64>,
+        /// true = 実行環境の子プロセスの問い合わせ（道具の場所・版）を覚えた答えを捨てて聞き直す
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        refresh: bool,
+    },
     /// 拡張子既定コマンドの一覧/設定/削除（FR-3.18, #453）
     RunnerDefaults {
         /// 拡張子（省略時は一覧を返す）

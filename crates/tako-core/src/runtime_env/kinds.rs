@@ -9,8 +9,9 @@
 //! Windows 実測で食い違えばここを直す（`platform::support::MATRIX` には実測分だけを書く = #591）。
 
 use super::{
-    Detector, EnvLayout, EnvValue, InProjectEnv, KnownDir, Marker, MarkerDirSpec, NamedEnvListSpec,
-    PathLookupSpec, PerOs, ProbeCmd, RuntimeKind, VersionFileSpec, VersionSource, WrapperSpec,
+    Detector, EnvLayout, EnvValue, InProjectEnv, KnownDir, ListProbe, Marker, MarkerDirSpec,
+    NamedEnvListSpec, PathLookupSpec, PerOs, ProbeCmd, RuntimeKind, VersionFileSpec, VersionSource,
+    WrapperSpec,
 };
 
 /// venv（PEP 405。`pyvenv.cfg` を持つディレクトリ）の中の置き場
@@ -132,8 +133,11 @@ const PYTHON_DETECTORS: &[Detector] = &[
         run_args: &["run"],
         program_dirs: TOOL_DIRS,
         in_project_env: None,
+        // Tier P: 環境の置き場（`<キャッシュ>/virtualenvs/<名前>-<ハッシュ>-py<版>`）を聞く。
+        // 中身は venv なので、分かれば activation も併用する
         env_dir_probe: Some(ProbeCmd {
             args: &["env", "info", "-p"],
+            layout: VENV_LAYOUT,
         }),
     }),
     // 4. Pipenv: 3 と同じ理由で包む形
@@ -148,7 +152,10 @@ const PYTHON_DETECTORS: &[Detector] = &[
         run_args: &["run"],
         program_dirs: TOOL_DIRS,
         in_project_env: None,
-        env_dir_probe: Some(ProbeCmd { args: &["--venv"] }),
+        env_dir_probe: Some(ProbeCmd {
+            args: &["--venv"],
+            layout: VENV_LAYOUT,
+        }),
     }),
     // 5. conda: プロジェクトの外にある環境なので venv より後ろ。
     //    `environment.yml` の名前と一覧が**ちょうど 1 つ**一致したときだけ自動で選ぶ（#1466）
@@ -163,6 +170,15 @@ const PYTHON_DETECTORS: &[Detector] = &[
             dir: &["conda-meta"],
             prefix: "python-",
         },
+        // Tier P: 一覧ファイルが無い（古い conda / 手で消した）ときだけ本体へ聞く
+        list_probe: Some(ListProbe {
+            program: PerOs {
+                macos: "conda",
+                windows: "conda.exe",
+            },
+            args: &["info", "--envs", "--json"],
+            json_key: "envs",
+        }),
     }),
     // 6. pyenv: `.python-version` は版しか決めない（依存は決めない）ので venv より後ろ
     Detector::VersionFile(VersionFileSpec {
@@ -204,6 +220,8 @@ pub const KINDS: &[RuntimeKind] = &[RuntimeKind {
         windows: "python",
     },
     wrapped_program: "python",
+    // Tier P: `Python 3.12.4` の形で返る（2 系は stderr へ出すので、呼び手は両方を見る）
+    version_args: &["--version"],
     detectors: PYTHON_DETECTORS,
 }];
 
@@ -248,9 +266,10 @@ mod tests {
         }
     }
 
-    /// 実行環境が見つからないときの展開が、組み込み既定表の今の形と同じ名前になる
+    /// 組み込み既定表のこの kind の行は interpreter を `${<variable>}` で受け（#1730）、
+    /// 実行環境が見つからないときは fallback（#1730 以前の既定表の先頭の語）へ展開される
     #[test]
-    fn fallbackは組み込み既定表の先頭の語と一致する() {
+    fn 既定表の行は変数で受け実行環境が無ければfallbackへ展開される() {
         for kind in KINDS {
             for ext in kind.extensions {
                 let entry = crate::platform::runner_defaults::entry(ext)
@@ -259,11 +278,18 @@ mod tests {
                     let Some(cmd) = entry.get(p).command() else {
                         continue;
                     };
-                    let first = cmd.split_whitespace().next().unwrap_or_default();
+                    let var = format!("${{{}}}", kind.variable);
+                    assert!(
+                        cmd.starts_with(&format!("{var} ")),
+                        "{ext} / {p:?}: 既定表の `{cmd}` が {var} で interpreter を受けていない"
+                    );
+                    let path = std::path::PathBuf::from(format!("/tmp/x/a.{ext}"));
+                    let vars = crate::runner::RunVars::for_file(&path).on(p);
+                    let expanded = crate::runner::expand_variables(cmd, &vars);
                     assert_eq!(
-                        first,
-                        kind.fallback.get(p),
-                        "{ext} / {p:?}: 既定表の `{cmd}` と fallback がずれている"
+                        expanded.split_whitespace().next(),
+                        Some(kind.fallback.get(p)),
+                        "{ext} / {p:?}: 実行環境が無いときの展開 `{expanded}`"
                     );
                 }
             }

@@ -4671,7 +4671,16 @@ impl TakoApp {
         if let Some(head) = runner::read_file_head_for_ui(path) {
             let settings = tako_control::settings::load();
             // dispatch `Run` と同じ 1 本（プロジェクト既定まで見る。#1656）
-            match runner::resolve_file(path, &head, &settings.runner_defaults, None, None) {
+            match runner::resolve_file(
+                path,
+                &head,
+                &settings.runner_defaults,
+                None,
+                None,
+                // 一覧の表示用（実行は dispatch `Run` が実行環境を重ねる。一覧を RunResolve へ
+                // 寄せるのは #1726 S5）
+                &runner::RuntimeWords::new(),
+            ) {
                 Ok(resolution) => {
                     self.preview_run_profiles
                         .insert(pane, resolution.all_profiles);
