@@ -88,14 +88,24 @@ pub fn lsp_position_of(text: &str, byte_offset: usize) -> (usize, usize) {
     if offset > 0 && bytes[offset - 1] == b'\r' && bytes.get(offset) == Some(&b'\n') {
         offset -= 1;
     }
-    let mut line = 0;
-    let mut line_start = 0;
-    for i in 0..offset {
-        if ends_lsp_line(bytes, i) {
-            line += 1;
-            line_start = i + 1;
-        }
-    }
+    // 打鍵のたびに変更の頭と尻の 2 回、文書の先頭から数える（`sync::diff_change`。#1660 で
+    // 10 MB まで編集できる）ので、1 バイトずつ `ends_lsp_line` を呼ばない: `\n` は一括の
+    // 数え上げ、単独の `\r` は `\r` の在る所だけを見る（LF のファイルには 1 つも無い）。
+    // 答えは 1 バイトずつ数える定義と全位置で一致する（テスト `速い数え方は1バイトずつの定義と一致する`）
+    let before = &text[..offset];
+    let lone_cr = |i: &usize| is_lone_cr(bytes, *i);
+    let line = before.bytes().filter(|&b| b == b'\n').count()
+        + before
+            .match_indices('\r')
+            .map(|(i, _)| i)
+            .filter(lone_cr)
+            .count();
+    let after_lf = before.rfind('\n').map_or(0, |i| i + 1);
+    let line_start = before[after_lf..]
+        .rmatch_indices('\r')
+        .map(|(i, _)| after_lf + i)
+        .find(lone_cr)
+        .map_or(after_lf, |i| i + 1);
     let column = text[line_start..offset].chars().map(char::len_utf16).sum();
     (line, column)
 }
@@ -174,7 +184,11 @@ pub fn wire_text(text: &str) -> Cow<'_, str> {
 pub fn wire_range(text: &str, range: Range<usize>) -> Cow<'_, str> {
     let bytes = text.as_bytes();
     let slice = &text[range.clone()];
-    if !range.clone().any(|i| is_lone_cr(bytes, i)) {
+    // `\r` の在る所だけを見る（全文同期のサーバでは打鍵のたびに全文がここを通る = #1660）
+    if !slice
+        .match_indices('\r')
+        .any(|(i, _)| is_lone_cr(bytes, range.start + i))
+    {
         return Cow::Borrowed(slice);
     }
     let out: Vec<u8> = range
@@ -520,6 +534,74 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// [`lsp_position_of`] と [`wire_range`] の速い数え方（`\n` の一括の数え上げ + `\r` の在る所
+    /// だけ）が、1 バイトずつ見る定義と全位置・全範囲で一致する（合流で 10 MB の打鍵が
+    /// 重くなったのを直したとき = #1769 × #1660）。`\r` / `\n` / 多バイト文字の長さ 5 までの
+    /// 並びを総当たりにする（単独 CR・CRLF・`\r\r\n`・末尾の `\r`・文字の途中を含む）
+    #[test]
+    fn 速い数え方は1バイトずつの定義と一致する() {
+        fn by_bytes(text: &str, byte_offset: usize) -> (usize, usize) {
+            let bytes = text.as_bytes();
+            let mut offset = snap(text, byte_offset);
+            if offset > 0 && bytes[offset - 1] == b'\r' && bytes.get(offset) == Some(&b'\n') {
+                offset -= 1;
+            }
+            let mut line = 0;
+            let mut line_start = 0;
+            for i in 0..offset {
+                if ends_lsp_line(bytes, i) {
+                    line += 1;
+                    line_start = i + 1;
+                }
+            }
+            (
+                line,
+                text[line_start..offset].chars().map(char::len_utf16).sum(),
+            )
+        }
+        const ALPHABET: [&str; 6] = ["a", "\r", "\n", "é", "😀", "\t"];
+        let mut texts = vec![String::new()];
+        let mut frontier = vec![String::new()];
+        for _ in 0..5 {
+            frontier = frontier
+                .iter()
+                .flat_map(|t| ALPHABET.iter().map(move |c| format!("{t}{c}")))
+                .collect();
+            texts.extend(frontier.iter().cloned());
+        }
+        let mut checked = 0;
+        for text in &texts {
+            for offset in 0..=text.len() + 1 {
+                assert_eq!(
+                    lsp_position_of(text, offset),
+                    by_bytes(text, offset),
+                    "{text:?} offset {offset}"
+                );
+                checked += 1;
+            }
+            // 送る形（`wire_range`）も、範囲の中の単独 CR を 1 バイトずつ替える定義と一致する
+            let bounds: Vec<usize> = (0..=text.len())
+                .filter(|&i| text.is_char_boundary(i))
+                .collect();
+            for (k, &a) in bounds.iter().enumerate() {
+                for &b in &bounds[k..] {
+                    let want: String = text[a..b]
+                        .char_indices()
+                        .map(|(i, c)| {
+                            if is_lone_cr(text.as_bytes(), a + i) {
+                                '\n'
+                            } else {
+                                c
+                            }
+                        })
+                        .collect();
+                    assert_eq!(wire_range(text, a..b), want, "{text:?} {a}..{b}");
+                }
+            }
+        }
+        assert!(checked > 50_000, "総当たりの件数 {checked}");
     }
 
     /// すべての文字境界で「行き → 帰り」が元へ戻る（`\r` と `\n` のあいだは `\r` の手前へ）。
