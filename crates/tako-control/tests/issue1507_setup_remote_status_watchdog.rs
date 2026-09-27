@@ -194,7 +194,8 @@ fn 未導入の次の一手は依存の導入口から引く() {
 /// **5**: tailscale の検出（`--version`）の待ちに上限がある
 #[test]
 fn tailscaleの検出の待ちに上限がある() {
-    let (body, base) = fn_body(TAILSCALE, "runnable");
+    // #1797 で候補 1 つを試す関数は `probe_candidate` へ改名（3 値を返す）
+    let (body, base) = fn_body(TAILSCALE, "probe_candidate");
     let mut offenders = hits(&body, base, TAILSCALE, ".status()");
     offenders.extend(hits(&body, base, TAILSCALE, ".output()"));
     assert!(
@@ -206,7 +207,7 @@ fn tailscaleの検出の待ちに上限がある() {
     );
     assert!(
         body.contains("tako_core::probe::output_with_timeout("),
-        "{TAILSCALE}:{base}: `runnable` が待ちの 1 実装（`tako_core::probe::output_with_timeout`）を\
+        "{TAILSCALE}:{base}: `probe_candidate` が待ちの 1 実装（`tako_core::probe::output_with_timeout`）を\
          通っていない（#1503 / #1507）"
     );
 }

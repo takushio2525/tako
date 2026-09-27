@@ -11,6 +11,9 @@
 #     /etc/profile を読んで実機の PATH へ戻すので、SHELL を `-l` 剥ぎのラッパへ
 #   - `resolve()` の器フォールバック `backend::binary()` は /opt/homebrew/bin/tmux 等の
 #     既知の置き場を直接見るので、TAKO_TMUX_BIN を未作成のパスへ向ける
+#   - tailscale の検出（`tailscale::detect_tailscale`。#1797）も /opt/homebrew/bin・
+#     /Applications の既知の置き場を直接見るので、TAKO_TAILSCALE_BIN を未作成のパスへ向ける
+#     （brew スタブが入れる先 = `$BIN/tailscale`。実機の Tailscale は 1 度も試されない）
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -74,7 +77,8 @@ setup_pty(){   # setup_pty <出力先> <answers...> -- <tako の引数...>
   # （macOS 同梱の bash 3.2 は `set -u` 下で空配列の `"${arr[@]}"` を未定義扱いにする）
   local answers=() ; while [ "${1:-}" != "--" ]; do answers+=(--answer "$1"); shift; done; shift
   env -i HOME="$SANDBOX/home" TAKO_DATA_DIR="$SANDBOX/d" TAKO_ISOLATED=1 \
-      SHELL="$BIN/isosh" TAKO_TMUX_BIN="$BIN/tmux" ${LEGACY:+TAKO_1499_LEGACY=1} \
+      SHELL="$BIN/isosh" TAKO_TMUX_BIN="$BIN/tmux" TAKO_TAILSCALE_BIN="$BIN/tailscale" \
+      TAKO_TAILSCALE_SOCKET= ${LEGACY:+TAKO_1499_LEGACY=1} \
       PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TERM=dumb LANG=ja_JP.UTF-8 \
       python3 "$PTY" ${answers[@]+"${answers[@]}"} ${STOP_AFTER:+--stop-after "$STOP_AFTER"} \
       --timeout 60 -- "$TAKO" "$@" > "$out" 2>&1
@@ -83,7 +87,8 @@ setup_pty(){   # setup_pty <出力先> <answers...> -- <tako の引数...>
 setup_pipe(){  # setup_pipe <出力先> -- <tako の引数...>
   local out="$1"; shift; shift
   env -i HOME="$SANDBOX/home" TAKO_DATA_DIR="$SANDBOX/d" TAKO_ISOLATED=1 \
-      SHELL="$BIN/isosh" TAKO_TMUX_BIN="$BIN/tmux" ${LEGACY:+TAKO_1499_LEGACY=1} \
+      SHELL="$BIN/isosh" TAKO_TMUX_BIN="$BIN/tmux" TAKO_TAILSCALE_BIN="$BIN/tailscale" \
+      TAKO_TAILSCALE_SOCKET= ${LEGACY:+TAKO_1499_LEGACY=1} \
       PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TERM=dumb LANG=ja_JP.UTF-8 \
       "$TAKO" "$@" < /dev/null > "$out" 2>&1
   echo $?

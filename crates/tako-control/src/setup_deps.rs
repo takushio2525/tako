@@ -354,13 +354,46 @@ fn resolve_container() -> Option<String> {
 /// 解決してキャッシュするので、導入直後の再確認では答えが変わらない。
 ///
 /// **`tako setup` の再検出もこれを通す**（#1499）。`exe::find` だけで確かめると
-/// 器の別名・`TAKO_TMUX_BIN` 指定を取りこぼして「入れたのに見つかりません」になる
+/// 器の別名・`TAKO_TMUX_BIN` 指定を取りこぼして「入れたのに見つかりません」になる。
+///
+/// tailscale は PATH を見ない（#1797）。答えは remote と同じ検出の正本
+/// （[`resolve_tailscale`]）だけから出す
 pub fn resolve(dep: &ExternalDep) -> Option<String> {
+    if is_tailscale(dep) {
+        return resolve_tailscale();
+    }
     let found = tako_core::platform::exe::find(dep.bin);
     if found.is_some() || !is_container(dep) {
         return found;
     }
     resolve_container()
+}
+
+/// tailscale は **remote が使う検出**（`tailscale::detect_tailscale`）の答えを返す（#1797）。
+///
+/// PATH だけで探すと、CLI が PATH の外にある App Store 版 / GUI 版
+/// （`/Applications/Tailscale.app/Contents/MacOS/Tailscale`）を「見つかりません」と判定し、
+/// `--yes` で brew 版まで入れていた。2 系統が同居すると GUI 版がノード実体のときに
+/// tako remote が 502 になる（#1038）。同じ setup の末尾の 1 行（`remote_setup::check_status`）は
+/// 正本を通すので、依存段だけが食い違っていた。
+///
+/// 「在るが動かない」（`--version` が固まる / 非 0）も**導入済み**と答える（入れ直させない）。
+/// 末尾の 1 行はこの答えを見て「実行できませんでした」と言い分ける（`tailscale_install_step`）
+fn resolve_tailscale() -> Option<String> {
+    crate::tailscale::detect_tailscale()
+        .into_present()
+        .map(display_path)
+}
+
+/// 正本が素の名前（PATH の `tailscale`）で答えたときだけ、表示用に絶対パスへ直す。
+///
+/// **判定には使わない**（在るかどうかは [`resolve_tailscale`] が正本の答えだけで決めた後）。
+/// 直せなければ素の名前のまま返す
+fn display_path(path: String) -> String {
+    if std::path::Path::new(&path).components().count() > 1 {
+        return path;
+    }
+    tako_core::platform::exe::find(&path).unwrap_or(path)
 }
 
 /// 依存の検出（読み取りだけ）
@@ -394,6 +427,11 @@ fn probe(dep: ExternalDep) -> DepStatus {
 /// その依存が「永続化の器」か（名前の解決規則が他と違う）
 fn is_container(dep: &ExternalDep) -> bool {
     matches!(dep.bin, "tmux" | "psmux")
+}
+
+/// その依存が tailscale か（検出の正本が `tailscale` モジュールにある。#1797）
+fn is_tailscale(dep: &ExternalDep) -> bool {
+    dep.bin == "tailscale"
 }
 
 /// 検出結果の JSON（`tako_setup_bootstrap` の `deps` と同じ形を保つ）

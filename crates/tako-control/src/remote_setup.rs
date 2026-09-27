@@ -422,6 +422,18 @@ pub fn run_interactive(
     let status = tailscale::setup_status();
 
     if status.cli_path.is_none() {
+        // 在るが実行できない（`--version` が固まる / 非 0）は「未導入」と言わず、入れ直させない。
+        // 依存の導入口は「在る」ものを導入済みとして飛ばすので、そのまま渡すと
+        // 「確認を省略してインストールします」と言ったまま何もせずに終わる（#1797）
+        if let tailscale::Detection::Unrunnable(path) = tailscale::detect_tailscale() {
+            writeln!(writer, "実行できません ({path})").map_err(|e| e.to_string())?;
+            writeln!(
+                writer,
+                "  Tailscale は入っていますが応答しません。入れ直す前に、Tailscale の起動し直しか更新を試してください。"
+            )
+            .map_err(|e| e.to_string())?;
+            return Err("Tailscale を実行できません".into());
+        }
         writeln!(writer, "未導入").map_err(|e| e.to_string())?;
         writeln!(writer).map_err(|e| e.to_string())?;
         match install_tailscale(auto_yes, writer)? {
@@ -438,8 +450,8 @@ pub fn run_interactive(
             }
         }
         // 導入できたと言えるかは**この先の段が引けるか**で決まる。`setup_deps` の
-        // 再検出（`exe::find`）と remote の解決規則（`find_tailscale`）は
-        // 見る場所が違うので、ここでもう一度 remote 側の規則で確かめる
+        // 再検出は「在るか」（動かない CLI も導入済みと答える = #1797）なので、
+        // ここでもう一度「実行できるか」（`find_tailscale`）で確かめる
         if tailscale::setup_status().cli_path.is_none() {
             return Err("インストール後も Tailscale を検出できません。".into());
         }
@@ -829,7 +841,7 @@ pub fn phone_readiness_line(readiness: &PhoneReadiness, install_step: Option<&st
         PhoneReadiness::Unknown => format!("状態を確認できませんでした。{RECHECK}"),
         PhoneReadiness::TailscaleMissing => match install_step {
             Some(step) => format!("Tailscale が未導入です。{step}"),
-            // 依存表の側では見つかっている（検出の口が食い違う）= 導入を勧めない
+            // 在るが実行できない（`--version` が固まる / 非 0。#1797）= 導入を勧めない
             None => format!("Tailscale を実行できませんでした。{RECHECK}"),
         },
         PhoneReadiness::DaemonNotRunning => format!("Tailscale が起動していません。{SETUP}"),
@@ -882,7 +894,11 @@ pub fn setup_summary_lines() -> Vec<String> {
         .collect()
 }
 
-/// Tailscale が未導入のときの「次に打つ 1 行」（依存表の側でも見つからないときだけ）
+/// Tailscale が未導入のときの「次に打つ 1 行」（依存表の側でも見つからないときだけ）。
+///
+/// 依存表の検出（`setup_deps::status_of`）と `check_status` は同じ正本
+/// （`tailscale::detect_tailscale`）を読む（#1797）。こちらで見つかるのに `check_status` が
+/// 未導入と言うのは「在るが実行できない」ときだけで、そのときは入れ直させない
 fn tailscale_install_step() -> Option<String> {
     let state = setup_deps::status_of(TAILSCALE_DEP)?;
     state
@@ -1050,7 +1066,7 @@ mod tests {
         assert!(status_timeouts(&json!({ "timeouts": [{ "label": 1 }] })).is_empty());
     }
 
-    /// 未導入なのに導入口が引けない（依存表の側では見つかっている）ときは導入を勧めない
+    /// 未導入なのに導入口が引けない（在るが実行できない = #1797）ときは導入を勧めない
     #[test]
     fn 導入口が無ければ導入を勧めない() {
         let status = status_json(Some("tailscale"), "", None);
