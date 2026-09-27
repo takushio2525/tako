@@ -873,20 +873,21 @@ impl Shared {
             return;
         };
         let (launch, _) = self.resolve(spec);
-        let plan = match launch {
-            Launch::Found { plan, .. } => plan,
-            missing => {
-                let (program, override_env, timed_out) = match missing {
-                    Launch::NotFound {
-                        program,
-                        override_env,
-                    } => (program, override_env, None),
-                    Launch::TimedOut {
-                        program,
-                        waited_secs,
-                    } => (program, None, Some(waited_secs)),
-                    Launch::Found { .. } => unreachable!("上の腕で受けた"),
-                };
+        // 見つからない / 打ち切った は同じ「未導入」の扱い（理由の文だけが違う。#1769）
+        let found = match launch {
+            Launch::Found { plan, .. } => Ok(plan),
+            Launch::NotFound {
+                program,
+                override_env,
+            } => Err((program, override_env, None)),
+            Launch::TimedOut {
+                program,
+                waited_secs,
+            } => Err((program, None, Some(waited_secs))),
+        };
+        let plan = match found {
+            Ok(plan) => plan,
+            Err((program, override_env, timed_out)) => {
                 let mut inner = self.lock();
                 let Some(slot) = inner.servers.get_mut(key) else {
                     return;

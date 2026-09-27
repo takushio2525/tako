@@ -642,7 +642,7 @@ fn 既定の解決はログインシェルを上限で打ち切る() {
     std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
     let out = scratch.path("result.txt");
     let started = Instant::now();
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
             "子プロセス_既定の解決を1回走らせて結果を書く",
@@ -652,20 +652,25 @@ fn 既定の解決はログインシェルを上限で打ち切る() {
         .env("SHELL", &shell)
         .env(tako_core::probe::PROBE_TIMEOUT_ENV, "1")
         .env_remove(servers::override_env_name(servers::SERVERS[0].id))
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+        .stdin(std::process::Stdio::null())
+        .output()
         .unwrap();
-    assert!(status.success());
+    assert!(
+        child.status.success(),
+        "子プロセスが落ちた（{}）: {}",
+        child.status,
+        String::from_utf8_lossy(&child.stderr)
+    );
     let result = std::fs::read_to_string(&out).unwrap();
+    // 状態で見る（実時間の予算は assert しない）。上限が無ければ 30 秒眠ったあと
+    // 空の出力 = NotFound で返るので、TimedOut が返ったこと自体が打ち切りの証拠。所要は証拠として出す
+    eprintln!(
+        "既定の解決（子プロセス全体）: {:?} / 子の報告: {result:?}",
+        started.elapsed()
+    );
     assert!(
         result.starts_with("TimedOut"),
         "打ち切りとして返る: {result}"
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(20),
-        "上限（1 秒）で返る: {:?}",
-        started.elapsed()
     );
 }
 

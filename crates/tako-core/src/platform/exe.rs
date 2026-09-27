@@ -501,14 +501,11 @@ mod tests {
         let dir = crate::test_residue::ScratchDir::new("exe-lookup-timeout");
         // `exec` で置き換える = 打ち切りの kill が眠る本人に当たる（孫を残さない = #1748）
         let shell = fake_shell(dir.path(), "hang", "exec sleep 30");
-        let started = std::time::Instant::now();
+        // 状態で見る（実時間の予算は assert しない = conventions「効果を測る単体テストは実時間で
+        // 比べない」）。上限が無ければ 30 秒眠ったあと空の出力 = NotFound で返るので、
+        // TimedOut が返ったこと自体が「上限で打ち切った」の証拠
         let got = login_shell_lookup(&shell, "x", std::time::Duration::from_millis(300));
         assert!(matches!(got, Lookup::TimedOut(_)), "{got:?}");
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(10),
-            "上限で返る: {:?}",
-            started.elapsed()
-        );
     }
 
     /// #1769: 見つかったことにするのは実行できるファイルだけ（エイリアス・失敗・空は見つからない）
