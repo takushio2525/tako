@@ -466,8 +466,47 @@ pub enum TextEditError {
     InvalidUtf8,
     #[error("ファイルが外部で変更されたため保存しなかった")]
     ExternalChanged,
+    /// 開いた後にファイルが消された（#1659）。上書き保存なら作り直せる
+    #[error("ファイルが外部で削除されている")]
+    ExternalDeleted,
+    /// 読み直そうとしたディスクの中身が編集できない（上限超過・バイナリ。#1659）
+    #[error("{0}")]
+    NotEditable(String),
     #[error("ファイルへ保存できない: {0}")]
     Write(#[source] std::io::Error),
+}
+
+/// ディスク上のファイルと、バッファの**基準**（開いた / 最後に保存した / 読み直した時点の
+/// ファイルの中身）の関係（#1659）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskState {
+    /// 基準のまま（外から変わっていない）
+    Unchanged,
+    /// 外から書き換わった（中身が基準と違う）
+    Changed,
+    /// 外から消された
+    Deleted,
+}
+
+impl DiskState {
+    /// 外（CLI / MCP の応答）へ出す綴り
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Unchanged => "unchanged",
+            Self::Changed => "changed",
+            Self::Deleted => "deleted",
+        }
+    }
+}
+
+/// ディスク上のファイルと編集中の本文の差分（#1659）。
+///
+/// 向きは「ディスク → 編集中」= **上書き保存すると何が変わるか**（`-` がディスクにあって
+/// 消える行、`+` が自分の変更）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskDiff {
+    pub state: DiskState,
+    pub diff: crate::text_diff::TextDiff,
 }
 
 /// 編集の種類（#1651）。**同じ種類どうししかまとまらない**
@@ -1904,17 +1943,50 @@ impl TextBuffer {
         Ok(())
     }
 
+    /// 保存する。開いた後にファイルが外で変わっていれば**書かずに**
+    /// [`TextEditError::ExternalChanged`]（消されていれば [`TextEditError::ExternalDeleted`]）を返す。
+    ///
+    /// ディスクの中身が既に編集中の本文と同じなら、書かずにそれを新しい基準にする
+    /// （どちらを採っても同じ = 競合ではない。#1659）
     pub fn save(&mut self) -> Result<(), TextEditError> {
-        let metadata = std::fs::metadata(&self.path).map_err(TextEditError::Read)?;
-        if metadata.permissions().readonly() {
-            return Err(TextEditError::Write(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "読み取り専用ファイル",
-            )));
-        }
-        let current = std::fs::read(&self.path).map_err(TextEditError::Read)?;
-        if current != self.baseline {
-            return Err(TextEditError::ExternalChanged);
+        self.save_inner(false)
+    }
+
+    /// 外部変更があっても**自分の変更で上書き**する（#1659。`tako edit save --force`）。
+    ///
+    /// 外で消されたファイルは作り直す（権限は新規ファイルの既定）。読み取り専用の
+    /// ファイルは上書きしない（外部変更の検知を外すだけで、書けないものは書かない）
+    pub fn save_overwrite(&mut self) -> Result<(), TextEditError> {
+        self.save_inner(true)
+    }
+
+    fn save_inner(&mut self, overwrite: bool) -> Result<(), TextEditError> {
+        match std::fs::metadata(&self.path) {
+            Ok(metadata) if metadata.permissions().readonly() => {
+                return Err(TextEditError::Write(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "読み取り専用ファイル",
+                )));
+            }
+            Ok(_) => {
+                let current = std::fs::read(&self.path).map_err(TextEditError::Read)?;
+                if current != self.baseline {
+                    if current == self.text.as_bytes() {
+                        // 外で書かれた中身が自分の本文と同じ。書き直す必要も競合も無い
+                        self.baseline = current;
+                        self.seal_undo_group();
+                        return Ok(());
+                    }
+                    if !overwrite {
+                        return Err(TextEditError::ExternalChanged);
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && overwrite => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(TextEditError::ExternalDeleted);
+            }
+            Err(e) => return Err(TextEditError::Read(e)),
         }
         write_file(&self.path, self.text.as_bytes()).map_err(TextEditError::Write)?;
         self.baseline = self.text.as_bytes().to_vec();
@@ -1922,6 +1994,119 @@ impl TextBuffer {
         // 「保存した姿」まで戻せる位置が履歴に残る
         self.seal_undo_group();
         Ok(())
+    }
+
+    /// ディスクの中身（消されていれば `None`）
+    fn read_disk(&self) -> Result<Option<Vec<u8>>, TextEditError> {
+        match std::fs::read(&self.path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(TextEditError::Read(e)),
+        }
+    }
+
+    /// ディスクの今の中身と基準を突き合わせる（#1659）。
+    ///
+    /// ディスクの中身が編集中の本文と同じなら、**それを新しい基準として取り込み**
+    /// `Unchanged` を返す（どちらを採っても同じ = 競合ではない）
+    pub fn refresh_disk_state(&mut self) -> Result<DiskState, TextEditError> {
+        let current = self.read_disk()?;
+        Ok(self.observe_disk(current.as_deref()))
+    }
+
+    /// 読み済みのディスクの中身（消されていれば `None`）で [`Self::refresh_disk_state`] と
+    /// 同じ判定をする（#1659）。ファイル監視は background で読んだバイト列を持っているので、
+    /// UI スレッドで読み直さずに済む
+    pub fn observe_disk(&mut self, current: Option<&[u8]>) -> DiskState {
+        let Some(current) = current else {
+            return DiskState::Deleted;
+        };
+        if current == self.baseline.as_slice() {
+            return DiskState::Unchanged;
+        }
+        if current == self.text.as_bytes() {
+            self.baseline = current.to_vec();
+            return DiskState::Unchanged;
+        }
+        DiskState::Changed
+    }
+
+    /// ディスクから読み直す（#1659。`tako edit reload`）。**編集中の変更は捨てる**が、
+    /// 読み直しは 1 回の編集として履歴に積むので **undo 1 回で自分の変更へ戻せる**。
+    ///
+    /// 書き換えるのは食い違っている範囲だけ（共通の先頭・末尾は触らない）なので、
+    /// 10 MB のファイルでも差分が小さければ履歴は小さい。カーソルは同じ場所に残す
+    /// （書き換えた範囲の中にいたらその範囲の中へ寄せる）。改行コードとインデントは
+    /// 読み直した中身から取り直す（`set_text` と同じ考え方。#1650 / #1654）。
+    ///
+    /// 消されていれば [`TextEditError::ExternalDeleted`]、上限を超えた・バイナリになった
+    /// なら [`TextEditError::NotEditable`] で、**どちらも本文を 1 バイトも触らない**
+    pub fn reload_from_disk(&mut self) -> Result<(), TextEditError> {
+        let bytes = self.read_disk()?.ok_or(TextEditError::ExternalDeleted)?;
+        self.reload_from(bytes)
+    }
+
+    /// 読み済みのディスクの中身で [`Self::reload_from_disk`] と同じ読み直しをする（#1659。
+    /// ファイル監視が background で読んだバイト列を使う口）
+    pub fn reload_from(&mut self, bytes: Vec<u8>) -> Result<(), TextEditError> {
+        let text = std::str::from_utf8(&bytes).map_err(|_| TextEditError::InvalidUtf8)?;
+        if let Some(limit) = crate::preview_limit::Truncation::judge(
+            bytes.len(),
+            Some(bytes.len() as u64),
+            text.lines().count(),
+        ) {
+            return Err(TextEditError::NotEditable(format!(
+                "ディスクの中身が編集できる上限を超えるため読み直せない: {}",
+                limit.detail_ja()
+            )));
+        }
+        if text.contains('\0') {
+            return Err(TextEditError::NotEditable(
+                "バイナリファイルは編集できない".into(),
+            ));
+        }
+        if text != self.text {
+            let line_ending = LineEnding::detect(text).unwrap_or(self.line_ending);
+            if let Some(indent) = IndentUnit::detect(text) {
+                self.indent = indent;
+            }
+            let (range, replacement) = changed_span(&self.text, text);
+            let cursor = follow_offset(self.cursor, &range, replacement.len());
+            // 直前の打鍵とまとめない（読み直しは 1 回で丸ごと戻る単位）
+            self.seal_undo_group();
+            self.apply_edit(Edit {
+                range,
+                replacement,
+                cursor,
+                anchor: None,
+                kind: EditKind::Replace,
+                line_ending: Some(line_ending),
+            });
+            self.seal_undo_group();
+        }
+        self.baseline = bytes;
+        Ok(())
+    }
+
+    /// ディスク上のファイルと編集中の本文の差分（#1659。`tako edit diff`）。
+    ///
+    /// 向きは「ディスク → 編集中」。消されていれば空の本文からの差分
+    /// （全行が `+`）。ディスクが UTF-8 でなくなっていても落とさず、読める形に置き換えて比べる
+    pub fn disk_diff(&self) -> Result<DiskDiff, TextEditError> {
+        let current = self.read_disk()?;
+        let state = match &current {
+            None => DiskState::Deleted,
+            Some(bytes) if *bytes == self.baseline => DiskState::Unchanged,
+            Some(_) => DiskState::Changed,
+        };
+        let disk = current
+            .as_deref()
+            .map(String::from_utf8_lossy)
+            .unwrap_or_default();
+        Ok(DiskDiff {
+            state,
+            diff: crate::text_diff::diff_lines(&disk, &self.text),
+        })
     }
 
     fn line_start(&self, offset: usize) -> usize {
@@ -2296,6 +2481,45 @@ fn word_right_offset(text: &str, offset: usize) -> usize {
     p
 }
 
+/// `old` を `new` にするのに書き換える範囲と、そこへ入る本文（#1659）。
+///
+/// 共通の先頭・末尾を除いた中央だけを返す（文字の途中では切らない）。
+/// 読み直しの履歴を「食い違った範囲」だけにするための計算
+fn changed_span<'a>(old: &str, new: &'a str) -> (Range<usize>, &'a str) {
+    let (a, b) = (old.as_bytes(), new.as_bytes());
+    let mut prefix = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    // 共通部分は同じバイト列なので、片方で文字境界なら他方でも境界
+    while !old.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let max_suffix = a.len().min(b.len()) - prefix;
+    let mut suffix = a
+        .iter()
+        .rev()
+        .zip(b.iter().rev())
+        .take(max_suffix)
+        .take_while(|(x, y)| x == y)
+        .count();
+    while !old.is_char_boundary(a.len() - suffix) {
+        suffix -= 1;
+    }
+    (prefix..a.len() - suffix, &new[prefix..b.len() - suffix])
+}
+
+/// `range` を長さ `inserted` の本文で置き換えた後、`offset` がどこへ移るか（#1659）。
+///
+/// 範囲より前はそのまま、後ろは長さの差だけずらす。範囲の中にいたら、
+/// 範囲の頭からの距離を保ったまま置き換えた本文の中へ寄せる
+fn follow_offset(offset: usize, range: &Range<usize>, inserted: usize) -> usize {
+    if offset <= range.start {
+        offset
+    } else if offset >= range.end {
+        offset - range.end + range.start + inserted
+    } else {
+        range.start + (offset - range.start).min(inserted)
+    }
+}
+
 /// カーソルを置いてよい位置へ丸める。
 ///
 /// UTF-8 の文字境界に加えて、**`\r\n` のあいだ**（CR の後ろ）を除く（#1650）。
@@ -2359,8 +2583,13 @@ fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let result = (|| {
         file.write_all(bytes)?;
         file.sync_all()?;
-        let permissions = std::fs::metadata(path)?.permissions();
-        std::fs::set_permissions(&temp, permissions)?;
+        match std::fs::metadata(path) {
+            Ok(metadata) => std::fs::set_permissions(&temp, metadata.permissions())?,
+            // 外で消されたファイルを上書き保存で作り直す（#1659）。引き継ぐ権限が無いので
+            // 一時ファイルの既定（新規ファイルと同じ）のまま置く
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
         std::fs::rename(&temp, path)?;
         std::fs::File::open(parent)?.sync_all()
     })();
@@ -2372,8 +2601,11 @@ fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 #[cfg(not(unix))]
 fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    // `create`: 外で消されたファイルを上書き保存で作り直す（#1659）。
+    // 消えたファイルへの通常の保存は `save_inner` が書く前に断る
     let mut file = std::fs::OpenOptions::new()
         .write(true)
+        .create(true)
         .truncate(true)
         .open(path)?;
     file.write_all(bytes)?;
@@ -2617,6 +2849,231 @@ mod tests {
         assert_eq!(buffer.text(), "aYYbYYcYY");
         assert!(buffer.undo());
         assert_eq!(buffer.text(), "aXbXcX");
+    }
+
+    /// #1659: 外部変更を検知した後の 2 択（上書き / 読み直し）の往復
+    #[test]
+    fn 外部変更の後に上書き保存すると自分の変更が残る() {
+        let path = path("overwrite-1659");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "before\n").unwrap();
+        let mut buffer = TextBuffer::open(&path).unwrap();
+        buffer.set_text("mine\n".into());
+        std::fs::write(&path, "external\n").unwrap();
+        assert!(matches!(buffer.save(), Err(TextEditError::ExternalChanged)));
+        assert_eq!(buffer.refresh_disk_state().unwrap(), DiskState::Changed);
+        buffer.save_overwrite().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine\n");
+        assert!(!buffer.dirty());
+        assert_eq!(buffer.refresh_disk_state().unwrap(), DiskState::Unchanged);
+        // 競合が解けたので、以後は通常の保存がそのまま通る
+        buffer.set_cursor(0, false);
+        buffer.insert("more ");
+        buffer.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "more mine\n");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn 外部変更の後に読み直すとディスクの中身になりundoで自分の変更へ戻る() {
+        let path = path("reload-1659");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "line1\nline2\nline3\n").unwrap();
+        let mut buffer = TextBuffer::open(&path).unwrap();
+        buffer.set_cursor("line1\nline2".len(), false);
+        buffer.insert(" mine");
+        std::fs::write(&path, "line1\nline2\nline3 external\n").unwrap();
+        assert!(matches!(buffer.save(), Err(TextEditError::ExternalChanged)));
+        let version = buffer.version();
+        buffer.reload_from_disk().unwrap();
+        assert_eq!(buffer.text(), "line1\nline2\nline3 external\n");
+        assert!(!buffer.dirty());
+        assert!(
+            buffer.version() > version,
+            "読み直しも本文の変更なので版が進む"
+        );
+        // 通常の保存が通る（基準がディスクの中身になった）
+        buffer.save().unwrap();
+        // 読み直しは 1 回の編集 = undo 1 回で自分の変更へ戻る
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "line1\nline2 mine\nline3\n");
+        assert!(buffer.dirty());
+        // 戻した自分の変更は、今度は競合せずに保存できる（基準はディスクの中身）
+        buffer.save().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "line1\nline2 mine\nline3\n"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn 読み直しは食い違った範囲だけを履歴に積む() {
+        let path = path("reload-span-1659");
+        let _ = std::fs::remove_file(&path);
+        let body: String = (0..50_000).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&path, &body).unwrap();
+        let mut buffer = TextBuffer::open(&path).unwrap();
+        // 自分の編集（25001 行目）と外部の編集（25000 行目）が近い = 食い違いは数十バイト
+        let at = buffer.offset_for_line_byte_col(25_001, 0);
+        buffer.set_cursor(at, false);
+        buffer.insert("x");
+        std::fs::write(&path, body.replace("line 25000\n", "changed\n")).unwrap();
+        let before = buffer.undo_history_bytes();
+        buffer.reload_from_disk().unwrap();
+        // 全文（約 600 KB）を 2 本積まない
+        assert!(
+            buffer.undo_history_bytes() - before < 1024,
+            "history={} before={before}",
+            buffer.undo_history_bytes()
+        );
+        assert!(!buffer.dirty());
+        assert_eq!(
+            buffer.line_starts(),
+            &compute_line_starts(buffer.text())[..]
+        );
+
+        // 離れていれば間ごと 1 範囲になるが、全文差し替え（本文 2 本ぶん）より大きくはならない
+        buffer.set_cursor(0, false);
+        buffer.insert("y");
+        std::fs::write(&path, body.replace("line 49999\n", "tail\n")).unwrap();
+        let before = buffer.undo_history_bytes();
+        buffer.reload_from_disk().unwrap();
+        // 余裕の 1 KiB は差分 1 件ぶんの器（`EditDelta` 自身の大きさ）
+        assert!(buffer.undo_history_bytes() <= before + 2 * body.len() + 1024);
+        assert_eq!(buffer.text(), body.replace("line 49999\n", "tail\n"));
+        assert_eq!(
+            buffer.line_starts(),
+            &compute_line_starts(buffer.text())[..]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn 読み直してもカーソルは同じ場所に残る() {
+        let path = path("reload-cursor-1659");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "aaa\nbbb\nccc\n").unwrap();
+        let mut buffer = TextBuffer::open(&path).unwrap();
+        buffer.set_cursor("aaa\nbbb\nc".len(), false);
+        // カーソルより前の行が 1 行増える
+        std::fs::write(&path, "aaa\nNEW\nbbb\nccc\n").unwrap();
+        buffer.reload_from_disk().unwrap();
+        assert_eq!(buffer.cursor(), "aaa\nNEW\nbbb\nc".len());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn 外で消されたファイルは保存も読み直しも断り上書きなら作り直す() {
+        let path = path("deleted-1659");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "before").unwrap();
+        let mut buffer = TextBuffer::open(&path).unwrap();
+        buffer.set_text("mine".into());
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(buffer.refresh_disk_state().unwrap(), DiskState::Deleted);
+        assert!(matches!(buffer.save(), Err(TextEditError::ExternalDeleted)));
+        assert!(matches!(
+            buffer.reload_from_disk(),
+            Err(TextEditError::ExternalDeleted)
+        ));
+        assert_eq!(buffer.text(), "mine", "読み直せないときは本文を触らない");
+        assert!(!path.exists(), "通常の保存は作り直さない");
+        let diff = buffer.disk_diff().unwrap();
+        assert_eq!(diff.state, DiskState::Deleted);
+        assert_eq!((diff.diff.added, diff.diff.removed), (1, 0));
+        buffer.save_overwrite().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine");
+        assert!(!buffer.dirty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn 外で自分と同じ中身に書かれたら競合にしない() {
+        let path = path("same-1659");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "before").unwrap();
+        let mut buffer = TextBuffer::open(&path).unwrap();
+        buffer.set_text("after".into());
+        std::fs::write(&path, "after").unwrap();
+        assert_eq!(buffer.refresh_disk_state().unwrap(), DiskState::Unchanged);
+        assert!(!buffer.dirty());
+        buffer.save().unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn 差分はディスクから編集中への向き() {
+        let path = path("diff-1659");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "a\nb\nc\n").unwrap();
+        let mut buffer = TextBuffer::open(&path).unwrap();
+        buffer.set_text("a\nMINE\nc\n".into());
+        std::fs::write(&path, "a\nDISK\nc\n").unwrap();
+        let diff = buffer.disk_diff().unwrap();
+        assert_eq!(diff.state, DiskState::Changed);
+        assert_eq!(
+            diff.diff.unified("disk", "buffer"),
+            "--- disk\n+++ buffer\n@@ -1,3 +1,3 @@\n a\n-DISK\n+MINE\n c\n"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn 読み直しは改行コードをディスクから取り直しcrlfを保つ() {
+        let path = path("reload-crlf-1659");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "a\nb\n").unwrap();
+        let mut buffer = TextBuffer::open(&path).unwrap();
+        buffer.insert("x");
+        std::fs::write(&path, "a\r\nb\r\nc\r\n").unwrap();
+        buffer.reload_from_disk().unwrap();
+        assert_eq!(buffer.line_ending(), LineEnding::Crlf);
+        buffer.set_cursor(buffer.text().len(), false);
+        buffer.newline();
+        assert!(buffer.text().ends_with("c\r\n\r\n"), "新しい改行も CRLF");
+        buffer.save().unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"a\r\nb\r\nc\r\n\r\n".to_vec()
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn 読み直せない中身なら本文を触らない() {
+        let path = path("reload-binary-1659");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "text").unwrap();
+        let mut buffer = TextBuffer::open(&path).unwrap();
+        buffer.insert("mine ");
+        std::fs::write(&path, b"bin\0ary").unwrap();
+        assert!(matches!(
+            buffer.reload_from_disk(),
+            Err(TextEditError::NotEditable(_))
+        ));
+        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+        assert!(matches!(
+            buffer.reload_from_disk(),
+            Err(TextEditError::InvalidUtf8)
+        ));
+        assert_eq!(buffer.text(), "mine text");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn 書き換える範囲は文字の途中で切らない() {
+        // 「あ」と「い」は先頭 2 バイトが同じ（E3 81 82 / E3 81 84）
+        let (range, inserted) = changed_span("xあy", "xいy");
+        assert_eq!(range, 1..4);
+        assert_eq!(inserted, "い");
+        let (range, inserted) = changed_span("same", "same");
+        assert_eq!((range, inserted), (4..4, ""));
+        let (range, inserted) = changed_span("aaaa", "aa");
+        assert_eq!((range.len(), inserted), (2, ""));
+        assert_eq!(follow_offset(0, &(2..4), 1), 0);
+        assert_eq!(follow_offset(9, &(2..4), 1), 8);
+        assert_eq!(follow_offset(3, &(2..4), 0), 2);
     }
 
     #[test]

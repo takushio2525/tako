@@ -1649,6 +1649,8 @@ fn apply_and_save(
         .map_err(|e| WriteFailure::app(&e))?;
         (deps.send)(crate::protocol::Request::PreviewSave {
             pane: Some(target.pane),
+            // スマホの保存は外部変更を踏み越えない（検証子の突き合わせと同じ考え方。#1659）
+            force: false,
         })
         .map_err(|e| WriteFailure::app(&e))
     })();

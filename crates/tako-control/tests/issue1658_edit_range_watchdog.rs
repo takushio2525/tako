@@ -308,8 +308,11 @@ fn 行桁の解決は丸めない() {
 
 /// 本文を変える公開 API（版が進むべきもの）。[`本文を変える公開apiはすべて版を進める`] が
 /// 挙動で確かめ、[`textbufferの書き換え口は棚卸し済み`] が取りこぼしを見る
-const MUTATES_TEXT: [&str; 15] = [
+const MUTATES_TEXT: [&str; 17] = [
     "set_text",
+    // ディスクから読み直す（#1659。`tako edit reload`。食い違った範囲だけを 1 回の編集として積む）
+    "reload_from_disk",
+    "reload_from",
     "insert",
     "newline",
     "delete_backward",
@@ -333,12 +336,17 @@ const MUTATES_TEXT: [&str; 15] = [
 ///
 /// カーソル・選択は「どこを見ているか」で文書の中身ではない。`save` はディスクへ
 /// 書くだけで本文を変えない（変えると保存のたびに版が飛び、楽観ロックが使えなくなる）
-const KEEPS_TEXT: [&str; 8] = [
+const KEEPS_TEXT: [&str; 11] = [
     "set_cursor",
     "select_all",
     "move_cursor",
     "set_cursor_placement",
     "save",
+    // 外部変更があっても上書きする保存（#1659）。`save` と同じくディスクへ書くだけ
+    "save_overwrite",
+    // ディスクと基準の突き合わせ（#1659）。変わるのは基準（どこまで保存したか）で本文ではない
+    "refresh_disk_state",
+    "observe_disk",
     // 選択をまとめて置く（#1652。GUI の画面選択の写し戻し）
     "set_selection",
     // 器に見える行数（#1652。ページ移動の歩幅。本文ではない）
@@ -433,6 +441,21 @@ fn 本文を変える公開apiはすべて版を進める() {
             }),
         ),
         (
+            "reload_from",
+            Box::new(|b: &mut TextBuffer| {
+                b.reload_from(b"one\nTWO\n".to_vec())
+                    .expect("UTF-8 のテキストは読み直せる");
+            }),
+        ),
+        (
+            // 下のループが実ファイルから開いた buffer を渡し、ディスク側を書き換えておく
+            "reload_from_disk",
+            Box::new(|b: &mut TextBuffer| {
+                b.reload_from_disk()
+                    .expect("書き換えたディスクから読み直せる");
+            }),
+        ),
+        (
             "undo",
             Box::new(|b: &mut TextBuffer| {
                 b.undo();
@@ -454,8 +477,20 @@ fn 本文を変える公開apiはすべて版を進める() {
         listed, expected,
         "MUTATES_TEXT と実際に当てる手が食い違っている（片方だけ足した）"
     );
+    // `reload_from_disk` だけは実ファイルが要る（一時 dir に置き、開いた後でディスク側を変える）
+    let disk = std::env::temp_dir().join(format!(
+        "tako-watchdog-1658-{}-reload.txt",
+        std::process::id()
+    ));
     for (name, op) in &ops {
-        let mut buffer = TextBuffer::from_text(path.clone(), "one\ntwo\n".into());
+        let mut buffer = if *name == "reload_from_disk" {
+            std::fs::write(&disk, "one\ntwo\n").expect("一時ファイルを書ける");
+            let buffer = TextBuffer::open(&disk).expect("一時ファイルを開ける");
+            std::fs::write(&disk, "one\nchanged\n").expect("一時ファイルを書き換えられる");
+            buffer
+        } else {
+            TextBuffer::from_text(path.clone(), "one\ntwo\n".into())
+        };
         // undo / redo は「戻すものがある」状態を先に作る
         if *name == "undo" || *name == "redo" {
             buffer.insert("seed");
@@ -471,6 +506,7 @@ fn 本文を変える公開apiはすべて版を進める() {
              本文を変える口は bump_version を通すこと"
         );
     }
+    let _ = std::fs::remove_file(&disk);
     // 逆に、本文を変えないカーソル移動は版を進めない（進めると毎回の移動で
     // 楽観ロックが外れ、`expected_version` が使い物にならなくなる）
     let mut buffer = TextBuffer::from_text(path, "one\ntwo\n".into());

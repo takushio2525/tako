@@ -401,7 +401,8 @@ fn runは走らせる前に未保存の編集を保存し再生ボタンも同�
     let (body, at) = fn_body(DISPATCH, &src, "fn save_previews_before_run(");
     let text = joined(&body);
     assert!(
-        text.contains("host.save_preview(pane).map_err(") && text.contains("})?;"),
+        // `false` = 実行前の保存は外部変更を踏み越えない（#1659 の上書きは使わない）
+        text.contains("host.save_preview(pane, false).map_err(") && text.contains("})?;"),
         "{DISPATCH}:{at}: save_previews_before_run が保存の失敗で止まっていない（古い内容を走らせる）"
     );
     assert!(

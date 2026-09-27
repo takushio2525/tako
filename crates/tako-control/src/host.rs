@@ -641,6 +641,18 @@ pub struct PreviewLineTarget {
     pub clamped: bool,
 }
 
+/// 編集中のファイルが外で変わった / 消された状態（#1659。[`PreviewHost::preview_conflict`]）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreviewConflict {
+    /// `Changed`（書き換わった）か `Deleted`（消された）
+    pub state: tako_core::DiskState,
+    /// 利用者へ知らせた回数。**検知した 1 回だけ**知らせ、競合のあいだは自動保存を
+    /// 止めるので増えない（修正前は自動保存が 500ms ごとに同じ競合を出し続けた）
+    pub notices: u32,
+    /// 自動保存が有効なのに競合で止めているか
+    pub autosave_paused: bool,
+}
+
 /// 定義ジャンプ（#1680）の起点になるプレビューの本文（[`PreviewHost::preview_goto_source`]）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviewGotoSource {
@@ -847,8 +859,27 @@ pub trait PreviewHost {
         None
     }
     /// 編集バッファを保存。外部変更検知を含む保存セマンティクスは core API が担う。
-    fn save_preview(&mut self, _pane: PaneId) -> Result<(), String> {
+    ///
+    /// `force`（#1659）なら外部変更があっても自分の変更で上書きする
+    /// （`TextBuffer::save_overwrite`）。成功すれば外部変更の競合は解ける
+    fn save_preview(&mut self, _pane: PaneId, _force: bool) -> Result<(), String> {
         Err("プレビュー編集は未対応".into())
+    }
+    /// 編集バッファをディスクの中身で読み直す（#1659。`TextBuffer::reload_from_disk`）。
+    /// 成功すれば外部変更の競合は解ける。編集中の変更は undo 1 回で戻せる
+    fn revert_preview(&mut self, _pane: PaneId) -> Result<(), String> {
+        Err("プレビュー編集は未対応".into())
+    }
+    /// ディスク上のファイルと編集バッファの差分（#1659。`TextBuffer::disk_diff`）
+    fn preview_disk_diff(&self, _pane: PaneId) -> Result<tako_core::DiskDiff, String> {
+        Err("プレビュー編集は未対応".into())
+    }
+    /// 外部変更の競合（#1659）。競合していなければ `None`。
+    ///
+    /// 編集系の応答はこれを `conflict` として載せる（`dispatch::preview_edit_reply` の
+    /// 1 実装）ので、**保存が通らない理由と、抜け方を CLI / MCP が同じ形で読める**
+    fn preview_conflict(&self, _pane: PaneId) -> Option<PreviewConflict> {
+        None
     }
     /// undo（#195）
     fn preview_undo(&mut self, _pane: PaneId) -> Result<bool, String> {

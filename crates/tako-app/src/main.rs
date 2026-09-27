@@ -13098,22 +13098,76 @@ impl TakoApp {
         Ok(())
     }
 
-    fn save_preview_local(&mut self, pane_id: PaneId) -> Result<(), String> {
+    /// 保存する。`force`（#1659）なら外部変更があっても自分の変更で上書きする
+    /// （GUI の帯の「上書き保存」・`tako edit save --force`・MCP の `action=overwrite`）。
+    ///
+    /// 外部変更で断られたら競合として記録する（知らせるのは新しく分かったときだけ）。
+    /// 通れば競合は解ける
+    fn save_preview_local(&mut self, pane_id: PaneId, force: bool) -> Result<(), String> {
         let edit = self
             .preview_edits
             .get_mut(&pane_id)
             .ok_or_else(|| "編集モードを開始していない".to_string())?;
-        match edit.buffer.save() {
+        let result = if force {
+            edit.buffer.save_overwrite()
+        } else {
+            edit.buffer.save()
+        };
+        match result {
             Ok(()) => {
+                edit.clear_conflict();
                 edit.message = Some(crate::ui_text::preview::saved_message().into());
                 self.refresh_preview_from_editor(pane_id);
                 Ok(())
             }
             Err(error) => {
                 let message = error.to_string();
-                edit.message = Some(message.clone());
+                match preview::EditState::conflict_state_of(&error) {
+                    // 帯が文面と抜け方を出すので、ヘッダへは書かない
+                    Some(state) => {
+                        edit.note_conflict(state);
+                    }
+                    None => edit.message = Some(message.clone()),
+                }
                 Err(message)
             }
+        }
+    }
+
+    /// ディスクから読み直す（#1659。帯の「読み直す」・`tako edit reload`・MCP の
+    /// `action=reload`）。編集中の変更は捨てるが undo 1 回で戻せる。通れば競合は解ける
+    fn revert_preview_local(&mut self, pane_id: PaneId) -> Result<(), String> {
+        if self.preview_remote_origins.contains_key(&pane_id) {
+            // #966: 手元の写しを読み直してもリモートの最新にはならない（取り直しは開き直し）
+            return Err(crate::ui_text::preview::remote_revert_unsupported().into());
+        }
+        let edit = self
+            .preview_edits
+            .get_mut(&pane_id)
+            .ok_or_else(|| "編集モードを開始していない".to_string())?;
+        edit.buffer.reload_from_disk().map_err(|error| {
+            if let Some(state) = preview::EditState::conflict_state_of(&error) {
+                edit.note_conflict(state);
+            }
+            error.to_string()
+        })?;
+        edit.clear_conflict();
+        edit.message = Some(crate::ui_text::preview::reloaded_message().into());
+        self.refresh_preview_from_editor(pane_id);
+        Ok(())
+    }
+
+    /// 帯の「差分」を開く / 閉じる（#1659）。開くときに 1 回だけ差分を作る
+    fn toggle_conflict_diff(&mut self, pane_id: PaneId) {
+        let Some(edit) = self.preview_edits.get_mut(&pane_id) else {
+            return;
+        };
+        if edit.conflict_diff.take().is_some() {
+            return;
+        }
+        match edit.buffer.disk_diff() {
+            Ok(diff) => edit.conflict_diff = Some(std::sync::Arc::new(diff)),
+            Err(error) => edit.message = Some(error.to_string()),
         }
     }
 
@@ -13299,7 +13353,7 @@ impl TakoApp {
         let pane_id = self.focused_pane();
         // ローカルの写しへ書くところまでは同期（速い・確実に残る）。
         // リモートへの押し出しは背景（UI スレッドで待たない）
-        if self.save_preview_local(pane_id).is_ok() {
+        if self.save_preview_local(pane_id, false).is_ok() {
             self.push_preview_remote_async(pane_id, cx);
         }
         cx.notify();
@@ -13525,14 +13579,20 @@ impl TakoApp {
         if !self.autosave_pending.remove(&pane_id) {
             return;
         }
+        // #1659: 競合中は保存しない（断られるだけで、同じ競合を知らせ直すことになる）。
+        // 保留へ入れる判定（`autosave_due`）と同じ条件を、500ms 待った後にも見る
         if !self
             .preview_edits
             .get(&pane_id)
             .is_some_and(|edit| edit.autosave && edit.editing && edit.dirty())
+            || self
+                .preview_edits
+                .get(&pane_id)
+                .is_some_and(|edit| edit.conflict.is_some() && !preview::external_change_legacy())
         {
             return;
         }
-        match self.save_preview_local(pane_id) {
+        match self.save_preview_local(pane_id, false) {
             Ok(()) => {
                 if let Some(edit) = self.preview_edits.get_mut(&pane_id) {
                     edit.save_status = Some(preview::SaveStatus::Saved);
@@ -13544,12 +13604,13 @@ impl TakoApp {
                 self.push_preview_remote_async(pane_id, cx);
             }
             Err(msg) => {
-                if let Some(edit) = self.preview_edits.get_mut(&pane_id) {
-                    if msg.contains("外部") {
-                        edit.save_status = Some(preview::SaveStatus::Conflict);
-                    } else {
-                        edit.save_status = Some(preview::SaveStatus::Error(msg));
-                    }
+                // 外部変更は `save_preview_local` が競合として記録済み（文面で判定しない）
+                if let Some(edit) = self
+                    .preview_edits
+                    .get_mut(&pane_id)
+                    .filter(|edit| edit.conflict.is_none())
+                {
+                    edit.save_status = Some(preview::SaveStatus::Error(msg));
                 }
             }
         }
@@ -23050,16 +23111,20 @@ impl PreviewHost for TakoApp {
         path: &str,
         mode: tako_control::protocol::PreviewModeWire,
     ) -> Result<(), String> {
-        if self
+        if let Some(edit) = self
             .preview_edits
-            .get(&pane)
-            .is_some_and(preview::EditState::dirty)
+            .get_mut(&pane)
+            .filter(|edit| edit.dirty())
         {
-            let message = "未保存の変更があるため別ファイルを開けない（先に保存してください）";
-            if let Some(edit) = self.preview_edits.get_mut(&pane) {
-                edit.message = Some(message.into());
-            }
-            return Err(message.into());
+            // 差し替えると未保存の変更を失う。dispatch の `OpenFile` はこのペインを避けて
+            // 分割して開く（#1659）ので、ここへ来るのは直接この口を叩いたときだけ。
+            // 行き止まりにしないよう抜け方を添える
+            let message = format!(
+                "未保存の変更があるため別ファイルを開けない（{}）",
+                tako_control::dispatch::preview_recovery_hint(edit.conflict.map(|c| c.state))
+            );
+            edit.message = Some(message.clone());
+            return Err(message);
         }
         let path = std::path::Path::new(path);
         let mode = preview::PreviewMode::from_wire(mode);
@@ -23177,11 +23242,35 @@ impl PreviewHost for TakoApp {
         Some(document)
     }
 
-    fn save_preview(&mut self, pane: PaneId) -> Result<(), String> {
-        self.save_preview_local(pane)?;
+    fn save_preview(&mut self, pane: PaneId, force: bool) -> Result<(), String> {
+        self.save_preview_local(pane, force)?;
         // #966: リモート由来なら**リモートへ書けるまでが保存**。
-        // ローカルの写しへ書けただけで Ok を返すと「保存できた気になる」に戻る
-        self.push_preview_remote_sync(pane, false)
+        // ローカルの写しへ書けただけで Ok を返すと「保存できた気になる」に戻る。
+        // `force`（#1659）はリモートの競合検知にもそのまま渡す（`remote_fs::save_file`）
+        self.push_preview_remote_sync(pane, force)
+    }
+
+    fn revert_preview(&mut self, pane: PaneId) -> Result<(), String> {
+        self.revert_preview_local(pane)
+    }
+
+    fn preview_disk_diff(&self, pane: PaneId) -> Result<tako_core::DiskDiff, String> {
+        self.preview_edits
+            .get(&pane)
+            .ok_or_else(|| "編集モードを開始していない".to_string())?
+            .buffer
+            .disk_diff()
+            .map_err(|e| e.to_string())
+    }
+
+    fn preview_conflict(&self, pane: PaneId) -> Option<tako_control::PreviewConflict> {
+        let edit = self.preview_edits.get(&pane)?;
+        let conflict = edit.conflict?;
+        Some(tako_control::PreviewConflict {
+            state: conflict.state,
+            notices: conflict.notices,
+            autosave_paused: edit.autosave && !preview::external_change_legacy(),
+        })
     }
 
     fn preview_undo(&mut self, pane: PaneId) -> Result<bool, String> {
@@ -41558,6 +41647,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1659: 外部変更の帯が出て、実マウスで差分・上書き・読み直しが効くか
+                "external-change" => {
+                    external_change_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
@@ -41567,7 +41662,7 @@ mod self_test {
                          pane-border / tasks-panel / task-attachment / \
                          tasks-accordion / shelve-tab / no-emoji / editor-keys / \
                          run-command-truncate / viewport-lines / jump-keys / search-case / goto-hover / \
-                         large-file-edit / large-file-decor）"
+                         large-file-edit / large-file-decor / external-change）"
                     );
                     std::process::exit(1);
                 }
@@ -41630,6 +41725,9 @@ mod self_test {
             // #1653: 検索欄のトグル（大文字小文字の区別 / 単語単位）を**実マウスで**押すと
             // 件数が変わり、既定（区別する）の置換が型名 `Value` を残すか
             search_case_visual(any, window, cx).await;
+            // #1659: 外部変更の帯（差分 / 上書き保存 / 読み直す）を実マウスで押して抜けられるか・
+            // 競合中に打鍵を続けても知らせは 1 回のままか
+            external_change_visual(any, window, cx).await;
             // #1680: ⌘ホバー中の識別子の下線が実ピクセルで描かれ、⌘ を離すと消えるか
             goto_hover_visual(any, window, cx).await;
 
@@ -46181,6 +46279,7 @@ mod self_test {
                     app,
                     Req::PreviewSave {
                         pane: Some(pane.as_u64()),
+                        force: false,
                     },
                     PaneOrigin::Cli,
                 );
@@ -47964,6 +48063,246 @@ mod self_test {
             before1487.is_some(),
             after1487.is_some()
         );
+    }
+
+    /// 外部変更を検知した後の逃げ道を**実マウスで**押して抜けられるか（#1659）。
+    ///
+    /// 場面: コードを開いて実キーで打ち、その直後にディスク側を書き換える。
+    /// ①監視か自動保存が競合を見つけてタイトルバーの下に帯が出る ②競合中に打鍵を続けても
+    /// 知らせは 1 回のまま・ディスクは外の中身のまま（修正前は自動保存が 500ms ごとに
+    /// 同じ競合を出し続けた）③「差分」を押すとディスク → 編集中の差分が広がる
+    /// ④「上書き保存」を押すと自分の本文がディスクへ残り競合が解ける ⑤もう一度ぶつけて
+    /// 「読み直す」を押すと本文がディスクの中身になり競合が解ける。
+    /// ハンドラ直呼びでは「描かれていない / 押しても発火しない」型を検出できないので、
+    /// 描いた実矩形（`panel_click_probe_bounds`）の中央を `click_at` で押す。
+    /// A/B: `TAKO_1659_LEGACY=1`（競合中も自動保存を止めない）は ② の回数が落ちる。
+    /// 単独実行は `TAKO_VISUAL_ONLY=external-change`
+    #[cfg(feature = "visual-test")]
+    async fn external_change_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        use tako_control::protocol::Request as Req;
+        let wait =
+            |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+        let dir = std::env::temp_dir().join(format!("tako-visual-1659-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("visual-test external-change 一時ディレクトリ");
+        let path = dir.join("conflict.rs");
+        std::fs::write(&path, "fn main() {\n    before();\n}\n")
+            .expect("visual-test external-change fixture");
+
+        let pane = window
+            .update(cx, |app, _, cx| {
+                // 他の節の残骸を畳んでから組む（#1083 / #948）
+                app.drawer_visible = false;
+                app.panel_visible = false;
+                let base = app.focused_pane().as_u64();
+                let opened = tako_control::dispatch(
+                    app,
+                    Req::OpenFile {
+                        pane: Some(base),
+                        path: path.display().to_string(),
+                        mode: Some(tako_control::protocol::PreviewModeWire::Code),
+                        direction: Some(tako_control::protocol::Direction::Right),
+                        focus: Some(true),
+                        new_tab: false,
+                        line: None,
+                        column: None,
+                    },
+                    PaneOrigin::Cli,
+                )
+                .expect("visual-test external-change を dispatch で開ける");
+                cx.notify();
+                PaneId::from_raw(opened["pane"].as_u64().expect("OpenFile 応答の pane"))
+            })
+            .unwrap_or_else(|_| fail("visual-test external-change dispatch"));
+        check(
+            wait_for_preview_maps(any, window, cx, pane, false).await,
+            "visual-test external-change: 座標キャッシュが揃う (#1659)",
+        );
+        let editing = window
+            .update(cx, |app, _, cx| {
+                let _ = app.workspace.active_tab_mut().tree_mut().focus(pane);
+                let r = tako_control::dispatch(
+                    app,
+                    Req::PreviewEdit {
+                        pane: Some(pane.as_u64()),
+                        enabled: Some(true),
+                    },
+                    PaneOrigin::Cli,
+                );
+                app.panel_click_probe_bounds.borrow_mut().clear();
+                cx.notify();
+                r.ok().and_then(|v| v["editing"].as_bool()).unwrap_or(false)
+            })
+            .unwrap_or(false);
+        check(
+            editing,
+            "visual-test external-change: 編集モードを開始できる (#1659)",
+        );
+        notify_and_draw(any, window, cx);
+
+        // (競合の状態, 知らせた回数, dirty, 本文)
+        let observe = |cx: &mut AsyncApp| {
+            notify_and_draw(any, window, cx);
+            window
+                .update(cx, |app, _, _| {
+                    app.preview_edits.get(&pane).map(|e| {
+                        (
+                            e.conflict.map(|c| c.state),
+                            e.conflict.map_or(0, |c| c.notices),
+                            e.dirty(),
+                            e.buffer.text().to_string(),
+                        )
+                    })
+                })
+                .ok()
+                .flatten()
+                .unwrap_or((None, 0, false, String::new()))
+        };
+        let disk = || std::fs::read_to_string(&path).unwrap_or_default();
+        let probe = |cx: &mut AsyncApp, key: &str| {
+            let key = format!("{key}-{}", pane.as_u64());
+            window
+                .update(cx, |app, _, _| {
+                    app.panel_click_probe_bounds.borrow().get(&key).copied()
+                })
+                .ok()
+                .flatten()
+        };
+        let dump = |cx: &mut AsyncApp, name: &str| {
+            if let Ok(dir) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                if let Some((frame, _)) = capture_frame(any, cx) {
+                    let _ = frame.save(std::path::Path::new(&dir).join(name));
+                }
+            }
+        };
+        // 競合が分かるまで待つ（監視の 300ms か自動保存の 500ms の先に来たほう）
+        async fn until_conflict(
+            cx: &mut AsyncApp,
+            window: WindowHandle<TakoApp>,
+            pane: PaneId,
+        ) -> bool {
+            for _ in 0..60 {
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+                let seen = window
+                    .update(cx, |app, _, _| {
+                        app.preview_edits
+                            .get(&pane)
+                            .is_some_and(|e| e.conflict.is_some())
+                    })
+                    .unwrap_or(false);
+                if seen {
+                    return true;
+                }
+            }
+            false
+        }
+
+        // ① 実キーで打ち、**自動保存が書く前に**ディスク側を書き換える
+        type_text(any, cx, "mine ", false);
+        let external = "fn main() {\n    external();\n}\n";
+        std::fs::write(&path, external).expect("visual-test external-change 外部変更");
+        check(
+            until_conflict(cx, window, pane).await,
+            "visual-test external-change: 外部変更を競合として検知する (#1659)",
+        );
+        notify_and_draw(any, window, cx);
+        check(
+            probe(cx, "preview-conflict-overwrite").is_some()
+                && probe(cx, "preview-conflict-reload").is_some()
+                && probe(cx, "preview-conflict-diff").is_some(),
+            "visual-test external-change: 帯に 差分 / 上書き保存 / 読み直す が描かれる (#1659)",
+        );
+        dump(cx, "external-change-0-bar.png");
+
+        // ② 競合中に打鍵を続けても知らせは 1 回のまま・ディスクは外の中身のまま
+        for _ in 0..3 {
+            type_text(any, cx, "z", false);
+            wait(cx, 700).await;
+        }
+        let (state, notices, dirty, _) = observe(cx);
+        if notices != 1 {
+            eprintln!("TAKO_VISUAL_1659: 競合中に 3 回打った後の notices={notices}");
+        }
+        check(
+            state == Some(tako_core::DiskState::Changed) && notices == 1 && dirty,
+            "visual-test external-change: 競合中は自動保存を止め、知らせは 1 回だけ (#1659)",
+        );
+        check(
+            disk() == external,
+            "visual-test external-change: 競合中にディスクの外部変更を踏み潰さない (#1659)",
+        );
+
+        // ③「差分」を押すと、ディスク → 編集中の差分が広がる
+        match probe(cx, "preview-conflict-diff") {
+            None => fail("visual-test external-change: 差分ボタンが描かれない (#1659)"),
+            Some(rect) => click_at(any, cx, rect.center()),
+        }
+        wait(cx, 150).await;
+        let diff = window
+            .update(cx, |app, _, _| {
+                app.preview_edits
+                    .get(&pane)
+                    .and_then(|e| e.conflict_diff.clone())
+                    .map(|d| (d.diff.added, d.diff.removed))
+            })
+            .ok()
+            .flatten();
+        check(
+            diff.is_some_and(|(added, removed)| added >= 1 && removed >= 1),
+            "visual-test external-change: 差分ボタンで ディスク → 編集中 の差分が開く (#1659)",
+        );
+        notify_and_draw(any, window, cx);
+        dump(cx, "external-change-1-diff.png");
+
+        // ④「上書き保存」で自分の本文がディスクへ残り、競合が解ける
+        match probe(cx, "preview-conflict-overwrite") {
+            None => fail("visual-test external-change: 上書き保存ボタンが描かれない (#1659)"),
+            Some(rect) => click_at(any, cx, rect.center()),
+        }
+        wait(cx, 200).await;
+        let (state, _, dirty, text) = observe(cx);
+        check(
+            state.is_none() && !dirty && disk() == text && text.starts_with("mine "),
+            "visual-test external-change: 上書き保存で自分の本文がディスクへ残り競合が解ける (#1659)",
+        );
+
+        // ⑤ もう一度ぶつけて「読み直す」を押すと、本文がディスクの中身になる
+        type_text(any, cx, "again ", false);
+        let external2 = "fn main() {\n    external_again();\n}\n";
+        std::fs::write(&path, external2).expect("visual-test external-change 2 回目の外部変更");
+        check(
+            until_conflict(cx, window, pane).await,
+            "visual-test external-change: 2 回目の外部変更も競合として検知する (#1659)",
+        );
+        notify_and_draw(any, window, cx);
+        match probe(cx, "preview-conflict-reload") {
+            None => fail("visual-test external-change: 読み直すボタンが描かれない (#1659)"),
+            Some(rect) => click_at(any, cx, rect.center()),
+        }
+        wait(cx, 200).await;
+        let (state, _, dirty, text) = observe(cx);
+        if text != external2 {
+            eprintln!("TAKO_VISUAL_1659: 読み直した後の本文 = {text:?}");
+        }
+        check(
+            state.is_none() && !dirty && text == external2 && disk() == external2,
+            "visual-test external-change: 読み直すで本文がディスクの中身になり競合が解ける (#1659)",
+        );
+        dump(cx, "external-change-2-reloaded.png");
+        println!("TAKO_VISUAL_1659: bar / notices=1 / diff / overwrite / reload OK");
+
+        // 後片付け: 編集を捨ててから閉じられるようにする
+        let _ = window.update(cx, |app, _, cx| {
+            app.preview_edits.remove(&pane);
+            cx.notify();
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 検索欄のトグルを**実マウスで**押すと条件が切り替わり、件数が変わるか（#1653）。
@@ -55639,17 +55978,34 @@ mod self_test {
             .await
             .unwrap_or_else(|| fail("巨大ファイル後に通常表示へ復帰"));
 
-            // 編集モード中は外部変更を適用せず、FR-3.5 の Conflict へ接続する。
-            let (edit_buffer_before, conflict_apply_before) = window
+            // 編集モード中の外部変更（FR-3.15 → FR-3.5）。#1659: **未編集ならディスクへ追従**し、
+            // 未保存の変更があれば上書きせず、競合として 1 回だけ知らせる。
+            window
                 .update(cx, |app, _, _| {
                     app.set_preview_editing_local(reload_pane, true)
                         .expect("編集モードを開始できる");
-                    (
-                        app.preview_edits
-                            .get(&reload_pane)
-                            .map(|edit| edit.buffer.text().to_string()),
-                        app.preview_reload_apply_count,
-                    )
+                    if let Some(edit) = app.preview_edits.get_mut(&reload_pane) {
+                        // 自動保存が先に書くと「未保存の変更」が消えて競合を作れない
+                        edit.autosave = false;
+                    }
+                })
+                .ok();
+            std::fs::write(&note_path, "# Followed\n").expect("編集中に外部変更できる");
+            wait_for_preview_state(window, cx, Duration::from_secs(3), |app| {
+                app.preview_edits.get(&reload_pane).is_some_and(|edit| {
+                    edit.buffer.text() == "# Followed\n" && edit.conflict.is_none() && !edit.dirty()
+                })
+            })
+            .await
+            .unwrap_or_else(|| fail("未編集の編集セッションはディスクへ追従する (#1659)"));
+            let (edit_buffer_before, conflict_apply_before) = window
+                .update(cx, |app, _, _| {
+                    let text = app.preview_edits.get_mut(&reload_pane).map(|edit| {
+                        edit.buffer.set_cursor(0, false);
+                        edit.buffer.insert("mine ");
+                        edit.buffer.text().to_string()
+                    });
+                    (text, app.preview_reload_apply_count)
                 })
                 .unwrap_or((None, 0));
             std::fs::write(&note_path, "# External conflict\n")
@@ -55661,6 +56017,7 @@ mod self_test {
                 |app| {
                     app.preview_edits.get(&reload_pane).is_some_and(|edit| {
                         edit.save_status == Some(preview::SaveStatus::Conflict)
+                            && edit.conflict.is_some_and(|c| c.notices == 1)
                     })
                 },
             )
@@ -55672,9 +56029,12 @@ mod self_test {
                     let preserved = edit.map(|edit| edit.buffer.text().to_string())
                         == edit_buffer_before
                         && app.preview_reload_apply_count == conflict_apply_before;
+                    // 後の節がこのペインへ別のファイルを開くので、未保存の変更を捨ててから抜ける
+                    // （#1659 から、未保存のプレビューは差し替えずに分割して開く）
+                    let reverted = app.revert_preview_local(reload_pane).is_ok();
                     app.set_preview_editing_local(reload_pane, false)
                         .expect("編集モードを終了できる");
-                    preserved
+                    preserved && reverted && !app.preview_edits.contains_key(&reload_pane)
                 })
                 .unwrap_or(false);
             check(conflict_preserved, "競合時は編集バッファを上書きしない");
@@ -55890,6 +56250,7 @@ mod self_test {
                         app,
                         tako_control::protocol::Request::PreviewSave {
                             pane: Some(edit_preview_pane),
+                            force: false,
                         },
                         PaneOrigin::Mcp,
                     );
@@ -74996,6 +75357,7 @@ mod self_test {
                             app,
                             tako_control::protocol::Request::PreviewSave {
                                 pane: Some(pane.as_u64()),
+                                force: false,
                             },
                             PaneOrigin::Cli,
                         );
