@@ -22,7 +22,8 @@
 //!   何もしない。「移行した記録」を別ファイルに持つと共有で必ずズレるので持たない
 //! - **旧ファイルを消さない**: 書き換える前に [`backup_path`] へ退避する（`.pre-v<N>.bak`）
 //! - **解釈できない内容を捨てない**: 変換に失敗したら [`quarantine_path`] へ丸ごと退避し、
-//!   何が起きたかを [`FileOutcome::Unreadable`] で申告する（黙って既定値へ落とさない）
+//!   何が起きたかを [`FileOutcome::Unreadable`] で申告する（黙って既定値へ落とさない）。
+//!   **2 回目以降に別の中身で壊れても積んで残す**（[`quarantine_unreadable`]。#1819）
 //! - **実施の可視化**: 何をどう変えたかは [`MigrationReport`] に残り、CLI / MCP / ログが
 //!   同じ 1 本から文言を作る（日英は [`Note`]）
 //!
@@ -327,10 +328,12 @@ pub enum FileOutcome {
     /// `reason` は何をもとに作ったかの説明（日英）
     Created { reason: Note },
     /// 解釈できない。退避したなら `quarantine` にその場所が入る
-    /// （`None` = 退避しない種別 = 秘匿情報つき / 作り直せる短命なファイル）
+    /// （`None` = 退避しない種別 = 秘匿情報つき / 作り直せる短命なファイル）。
+    /// `evicted` は退避が上限に達していたので最も古い 1 本を押し出したか（#1819）
     Unreadable {
         quarantine: Option<PathBuf>,
         reason: String,
+        evicted: bool,
     },
     /// 登録の壊れ方が判明したので触らなかった
     Refused { reason: String },
@@ -479,9 +482,48 @@ pub fn backup_path(path: &Path, from_version: u32) -> PathBuf {
 }
 
 /// 解釈できなかった内容の退避先（`<name>.unreadable.bak`）。
-/// 既定値へ落とす前に**必ず**ここへ写す（黙って捨てない）
+/// 既定値へ落とす前に**必ず**ここへ写す（黙って捨てない）。
+/// 最初に壊れた中身の置き場で、2 本目以降は [`quarantine_slot_path`] が決める
 pub fn quarantine_path(path: &Path) -> PathBuf {
     sibling(path, ".unreadable.bak")
+}
+
+/// 1 ファイルあたりの退避の本数の上限（#1819）。
+///
+/// **同じ中身の写しは積まない**ので、本数が増えるのは「別の中身で壊れた」回だけ。
+/// 上限に達したら 1 本目（最初に壊れた中身）は動かさず、2 本目（その次に古い中身）を
+/// 押し出して詰め、最新を末尾に置く。容量は元ファイル × この本数で頭打ちになる
+pub const QUARANTINE_LIMIT: usize = 10;
+// 満杯時の詰め直しは「1 本目を残して 2 本目を押し出す」なので 2 本以上が要る
+const _: () = assert!(QUARANTINE_LIMIT >= 2);
+
+/// `n` 本目（1 始まり）の退避先。1 本目は [`quarantine_path`]（`<name>.unreadable.bak`）、
+/// 2 本目以降は `<name>.unreadable.<n>.bak`
+pub fn quarantine_slot_path(path: &Path, n: usize) -> PathBuf {
+    if n <= 1 {
+        quarantine_path(path)
+    } else {
+        sibling(path, &format!(".unreadable.{n}.bak"))
+    }
+}
+
+/// 押し出したことを診断ログ（persist.log）へ書くときの一言。
+/// settings の申告と移行の記録が同じ 1 本を使う
+pub fn eviction_note() -> String {
+    format!(
+        "退避が上限の {QUARANTINE_LIMIT} 本に達したので 2 本目（最も古い中身）を押し出して詰めた"
+    )
+}
+
+/// [`quarantine_unreadable`] の結果
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Quarantine {
+    /// 今回の中身が残っている退避先
+    pub path: PathBuf,
+    /// 今回新しく写したか（false = 同じ中身の退避が既に在ったので何も書いていない）
+    pub copied: bool,
+    /// 上限（[`QUARANTINE_LIMIT`]）に達していたので、最も古い退避（2 本目）を押し出したか
+    pub evicted: bool,
 }
 
 /// `<path>` と同じディレクトリに、ファイル名へ接尾辞を足したパスを作る。
@@ -644,13 +686,21 @@ fn migrate_file_outcome(spec: &SchemaSpec, path: &Path, io: &dyn MigrationIo) ->
     };
     if let Some(validate) = spec.validate {
         if let Err(reason) = validate(&text) {
-            // 読めないものは移行しない。退避してよい種別なら**捨てずに残す**
-            let quarantine = if spec.preserve_unreadable {
-                Some(quarantine_unreadable(path, io).unwrap_or_else(|| quarantine_path(path)))
+            // 読めないものは移行しない。退避してよい種別なら**捨てずに残す**。
+            // 書けない io（`status` の見るだけ）では「写すならここ」を申告する
+            let (quarantine, evicted) = if spec.preserve_unreadable {
+                match quarantine_text(path, &text, io) {
+                    Ok(q) => (Some(q.path), q.evicted),
+                    Err(planned) => (Some(planned), false),
+                }
             } else {
-                None
+                (None, false)
             };
-            return FileOutcome::Unreadable { quarantine, reason };
+            return FileOutcome::Unreadable {
+                quarantine,
+                reason,
+                evicted,
+            };
         }
     }
     let already_once = |from: u32| {
@@ -707,16 +757,74 @@ fn migrate_file_outcome(spec: &SchemaSpec, path: &Path, io: &dyn MigrationIo) ->
 /// 解釈できなかったファイルを退避する（**既定値へ落とす前に必ず呼ぶ**）。
 ///
 /// 「壊れた settings.json を黙って既定値扱いし、次の保存で上書きして消す」型の
-/// 事故（#916 の棚卸しで実測）を構造的に防ぐための共通口。退避できたパスを返す。
-/// 退避先が既にあるときは**上書きしない**（最初に壊れた内容こそ残す価値がある）
-pub fn quarantine_unreadable(path: &Path, io: &dyn MigrationIo) -> Option<PathBuf> {
-    let dest = quarantine_path(path);
-    if io.exists(&dest) {
-        return Some(dest);
-    }
+/// 事故（#916 の棚卸しで実測）を構造的に防ぐための共通口。今回の中身が残った
+/// 退避先を返す（読めない・書けないなら `None`）。
+///
+/// **2 回目以降に別の中身で壊れても積んで残す**（#1819）。以前は退避先が既にあると
+/// 何も写さずにそのパスを返していたので、実行中にもう一度壊れると 2 回目の中身は
+/// どこにも残らず、呼び出し側の保存が既定値で上書きして消していた（実測）。
+///
+/// - 1 本目（最初に壊れた中身）は `<name>.unreadable.bak`。人が消したらまたそこへ写す
+/// - 同じ中身の退避が既にあれば何も書かない（読み込みのたびに写しが増えない）
+/// - 別の中身なら空いている一番若い番号へ写す（`<name>.unreadable.<n>.bak`）
+/// - [`QUARANTINE_LIMIT`] 本すべて埋まっていたら、1 本目は動かさず 2 本目を押し出して
+///   詰め、今回の中身を末尾へ置く（押し出したことは [`Quarantine::evicted`] で返る）
+pub fn quarantine_unreadable(path: &Path, io: &dyn MigrationIo) -> Option<Quarantine> {
     let text = io.read(path).ok().flatten()?;
-    io.write(&dest, &text).ok()?;
-    Some(dest)
+    quarantine_text(path, &text, io).ok()
+}
+
+/// [`quarantine_unreadable`] の本体。書けなかったら「写すはずだった場所」を `Err` で返す
+/// （見るだけの io で呼ぶ `tako migrate status` が予定の置き場を申告するのに使う）
+fn quarantine_text(path: &Path, text: &str, io: &dyn MigrationIo) -> Result<Quarantine, PathBuf> {
+    let slots: Vec<PathBuf> = (1..=QUARANTINE_LIMIT)
+        .map(|n| quarantine_slot_path(path, n))
+        .collect();
+    let present: Vec<bool> = slots.iter().map(|slot| io.exists(slot)).collect();
+    // 同じ中身は積まない。新しいほう（番号の大きいほう）から見る = 直前に写したものに当たる
+    for (slot, _) in slots.iter().zip(&present).rev().filter(|(_, p)| **p) {
+        if io.read(slot).ok().flatten().as_deref() == Some(text) {
+            return Ok(Quarantine {
+                path: slot.clone(),
+                copied: false,
+                evicted: false,
+            });
+        }
+    }
+    if let Some(free) = present.iter().position(|p| !p) {
+        let dest = slots[free].clone();
+        return match io.write(&dest, text) {
+            Ok(()) => Ok(Quarantine {
+                path: dest,
+                copied: true,
+                evicted: false,
+            }),
+            Err(_) => Err(dest),
+        };
+    }
+    // 満杯。**読めた中身だけで詰め直す**（1 本でも読めなければ何も書き換えない =
+    // 押し出しだけ起きて今回の中身も残らない、という半端な形を作らない）
+    let last = slots[QUARANTINE_LIMIT - 1].clone();
+    let mut kept = Vec::with_capacity(QUARANTINE_LIMIT - 2);
+    for slot in &slots[2..] {
+        match io.read(slot) {
+            Ok(Some(body)) => kept.push(body),
+            _ => return Err(last),
+        }
+    }
+    for (slot, body) in slots[1..].iter().zip(&kept) {
+        if io.write(slot, body).is_err() {
+            return Err(last);
+        }
+    }
+    match io.write(&last, text) {
+        Ok(()) => Ok(Quarantine {
+            path: last,
+            copied: true,
+            evicted: true,
+        }),
+        Err(_) => Err(last),
+    }
 }
 
 #[cfg(test)]
@@ -944,6 +1052,7 @@ mod tests {
             outcome: FileOutcome::Unreadable {
                 quarantine: Some(PathBuf::from("/tmp/recent.json.unreadable.bak")),
                 reason: "壊れている".into(),
+                evicted: false,
             },
         });
         assert_eq!(report.attention().count(), 1);
@@ -1134,29 +1243,149 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 解釈不能な内容の保全: 既定値へ落とす前に退避され、最初の内容が守られる
+    /// 壊れた中身を書いて退避する（テスト用の 1 手）
+    fn break_and_quarantine(path: &Path, body: &str) -> Quarantine {
+        std::fs::write(path, body).expect("書ける");
+        quarantine_unreadable(path, &FsIo).expect("退避できる")
+    }
+
+    /// 退避先の中身を 1 本目から順に並べる（無い番号は飛ばす）
+    fn quarantined(path: &Path) -> Vec<String> {
+        (1..=QUARANTINE_LIMIT + 2)
+            .filter_map(|n| std::fs::read_to_string(quarantine_slot_path(path, n)).ok())
+            .collect()
+    }
+
+    /// 解釈不能な内容の保全: 既定値へ落とす前に退避され、**2 回目以降に別の中身で
+    /// 壊れても積んで残す**（#1819。以前は 2 回目の中身をどこにも写さずに捨てていた）
     #[test]
     fn 解釈できない内容は退避して残す() {
         let dir = temp_dir("quarantine");
         let path = dir.join("settings.json");
-        std::fs::write(&path, "{ こわれた").expect("書ける");
-        let dest = quarantine_unreadable(&path, &FsIo).expect("退避できる");
+        let first = break_and_quarantine(&path, "{ こわれた");
+        assert_eq!(first.path, quarantine_path(&path), "1 本目は従来の名前");
+        assert!(first.copied && !first.evicted);
+        let second = break_and_quarantine(&path, "べつのこわれかた");
         assert_eq!(
-            std::fs::read_to_string(&dest).expect("読める"),
-            "{ こわれた",
-            "捨てずに残す"
+            second.path,
+            dir.join("settings.json.unreadable.2.bak"),
+            "2 回目に壊れた中身は 2 本目へ写す（1 本目を返して捨てない）"
         );
-        // 2 回目は最初の退避を塗り潰さない
-        std::fs::write(&path, "べつのこわれかた").expect("書ける");
-        let again = quarantine_unreadable(&path, &FsIo).expect("退避先を返す");
-        assert_eq!(again, dest);
+        assert!(second.copied);
+        let third = break_and_quarantine(&path, "みっつめ");
+        assert_eq!(third.path, dir.join("settings.json.unreadable.3.bak"));
         assert_eq!(
-            std::fs::read_to_string(&dest).expect("読める"),
-            "{ こわれた",
-            "最初に壊れた内容こそ残す"
+            quarantined(&path),
+            ["{ こわれた", "べつのこわれかた", "みっつめ"],
+            "壊れた中身はすべて・壊れた順に残る（最初の 1 本も塗り潰さない）"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// 同じ中身の写しは積まない（`settings::load` は多くの経路から呼ばれるので、
+    /// 読み込みのたびに増えると上限をすぐ食い潰す）
+    #[test]
+    fn 同じ中身は積まない() {
+        let dir = temp_dir("quarantine-same");
+        let path = dir.join("settings.json");
+        let a = break_and_quarantine(&path, "A");
+        let again = quarantine_unreadable(&path, &FsIo).expect("退避先を返す");
+        assert_eq!(again.path, a.path);
+        assert!(!again.copied, "同じ中身なら何も書かない");
+        break_and_quarantine(&path, "B");
+        // A → B → A と戻っても、A の写しは 1 本のまま
+        let back = break_and_quarantine(&path, "A");
+        assert_eq!(back.path, a.path);
+        assert!(!back.copied);
+        assert_eq!(quarantined(&path), ["A", "B"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 人が 1 本目を消したら、次に壊れた中身はまた 1 本目（従来の名前）へ写す。
+    /// 残っている 2 本目以降には触らない
+    #[test]
+    fn 人が消した1本目へまた写す() {
+        let dir = temp_dir("quarantine-removed");
+        let path = dir.join("settings.json");
+        break_and_quarantine(&path, "A");
+        break_and_quarantine(&path, "B");
+        std::fs::remove_file(quarantine_path(&path)).expect("消せる");
+        let c = break_and_quarantine(&path, "C");
+        assert_eq!(c.path, quarantine_path(&path));
+        assert_eq!(quarantined(&path), ["C", "B"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 上限: 1 本目は動かさず、2 本目（その次に古い中身）から押し出して最新を末尾へ置く。
+    /// 本数は上限を超えない
+    #[test]
+    fn 上限に達したら2本目を押し出して最新を末尾へ置く() {
+        let dir = temp_dir("quarantine-limit");
+        let path = dir.join("settings.json");
+        for i in 1..=QUARANTINE_LIMIT {
+            let q = break_and_quarantine(&path, &format!("#{i}"));
+            assert!(!q.evicted, "{i} 本目までは押し出さない");
+        }
+        for i in QUARANTINE_LIMIT + 1..=QUARANTINE_LIMIT + 3 {
+            let q = break_and_quarantine(&path, &format!("#{i}"));
+            assert!(q.evicted && q.copied, "{i} 本目は押し出して写す");
+            assert_eq!(q.path, quarantine_slot_path(&path, QUARANTINE_LIMIT));
+        }
+        let expected: Vec<String> = std::iter::once(1)
+            .chain(5..=QUARANTINE_LIMIT + 3)
+            .map(|i| format!("#{i}"))
+            .collect();
+        assert_eq!(
+            quarantined(&path),
+            expected,
+            "1 本目 + 新しいほうから {} 本が壊れた順に残る",
+            QUARANTINE_LIMIT - 1
+        );
+        assert!(
+            !quarantine_slot_path(&path, QUARANTINE_LIMIT + 1).exists(),
+            "上限を超えた番号は作らない"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 書けない io（`tako migrate status` の見るだけ）: 何も書き換えず、写すはずだった
+    /// 置き場を申告する（満杯でも押し出さない）
+    #[test]
+    fn 書けない置き場では何も書き換えず予定の退避先を申告する() {
+        struct NoWrite;
+        impl MigrationIo for NoWrite {
+            fn read(&self, path: &Path) -> std::io::Result<Option<String>> {
+                FsIo.read(path)
+            }
+            fn write(&self, _: &Path, _: &str) -> std::io::Result<()> {
+                Err(std::io::Error::other("書かない"))
+            }
+            fn exists(&self, path: &Path) -> bool {
+                FsIo.exists(path)
+            }
+        }
+        let dir = temp_dir("quarantine-readonly");
+        let path = dir.join("settings.json");
+        break_and_quarantine(&path, "A");
+        std::fs::write(&path, "B").expect("書ける");
+        assert_eq!(quarantine_unreadable(&path, &NoWrite), None);
+        assert_eq!(
+            quarantine_text(&path, "B", &NoWrite),
+            Err(quarantine_slot_path(&path, 2))
+        );
+        for i in 2..=QUARANTINE_LIMIT {
+            break_and_quarantine(&path, &format!("#{i}"));
+        }
+        let before = quarantined(&path);
+        std::fs::write(&path, "満杯のあと").expect("書ける");
+        assert_eq!(
+            quarantine_text(&path, "満杯のあと", &NoWrite),
+            Err(quarantine_slot_path(&path, QUARANTINE_LIMIT))
+        );
+        assert_eq!(quarantined(&path), before, "押し出しも起きない");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn 読めない内容は移行せず退避して申告する() {
         fn reject(_: &str) -> Result<(), String> {
@@ -1176,7 +1405,9 @@ mod tests {
         std::fs::write(&path, "{ こわれた").expect("書ける");
         let report = migrate_file(&SPEC, &path, &FsIo);
         match &report.outcome {
-            FileOutcome::Unreadable { quarantine, reason } => {
+            FileOutcome::Unreadable {
+                quarantine, reason, ..
+            } => {
                 assert!(reason.contains("JSON"), "{reason}");
                 let quarantine = quarantine.as_ref().expect("退避される種別");
                 assert_eq!(
@@ -1186,9 +1417,23 @@ mod tests {
             }
             other => panic!("退避されるはず: {other:?}"),
         }
+        // 2 回目に別の中身で壊れても、申告する退避先にはその中身が在る（#1819。
+        // 以前は 1 本目を返すだけで、2 回目の中身はどこにも写っていなかった）
+        std::fs::write(&path, "{ 2 回目").expect("書ける");
+        match &migrate_file(&SPEC, &path, &FsIo).outcome {
+            FileOutcome::Unreadable { quarantine, .. } => {
+                let quarantine = quarantine.as_ref().expect("退避される種別");
+                assert_eq!(quarantine, &quarantine_slot_path(&path, 2));
+                assert_eq!(
+                    std::fs::read_to_string(quarantine).expect("読める"),
+                    "{ 2 回目"
+                );
+            }
+            other => panic!("退避されるはず: {other:?}"),
+        }
         assert_eq!(
             std::fs::read_to_string(&path).expect("読める"),
-            "{ こわれた",
+            "{ 2 回目",
             "元のファイルは触らない"
         );
         let _ = std::fs::remove_dir_all(&dir);

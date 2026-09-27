@@ -321,35 +321,91 @@ pub fn load() -> Settings {
 /// 情報を持つのに、旧実装は破損を黙って既定値扱いし、直後の [`save`] が
 /// 元の内容を上書きして復元不能にしていた
 pub fn load_from(path: &std::path::Path) -> Option<Settings> {
-    let json = std::fs::read_to_string(path).ok()?;
+    load_and_report(path).0
+}
+
+/// [`load_from`] の本体。破損を persist.log へ申告したら、その 1 行も返す
+/// （「実行中に何度壊れても毎回記録される」をテストが配線ごと確かめる口。#1819）
+fn load_and_report(path: &std::path::Path) -> (Option<Settings>, Option<String>) {
+    let Ok(json) = std::fs::read_to_string(path) else {
+        return (None, None);
+    };
     match serde_json::from_str(&json) {
-        Ok(settings) => Some(settings),
+        Ok(settings) => {
+            UNREADABLE_SEEN.forget(path);
+            (Some(settings), None)
+        }
         Err(e) => {
             let quarantine =
                 tako_core::migration::quarantine_unreadable(path, &tako_core::migration::FsIo);
-            warn_unreadable_once(path, &e.to_string(), quarantine.as_deref());
-            None
+            if !UNREADABLE_SEEN.first_sighting(path, &json) {
+                return (None, None);
+            }
+            let line = unreadable_line(path, &e.to_string(), quarantine.as_ref());
+            crate::diag::persist_log(&line);
+            (None, Some(line))
         }
     }
 }
 
-/// 破損の申告は 1 プロセス 1 回だけ（`load` は多くの経路から呼ばれるのでログが溢れる）
-fn warn_unreadable_once(
+/// 破損の申告の重複除け（#1819）。**壊れた中身ごとに 1 回**申告する。
+///
+/// `load` は多くの経路から呼ばれるので、読むたびに申告するとログが溢れる。以前は
+/// 「1 プロセス 1 回」で抑えていたので、実行中にもう一度（別の中身で）壊れても
+/// 記録が残らなかった（実測）。いまは「そのファイルで直前に申告した中身と違う」ときに
+/// 申告し、読めた回に忘れる（壊れる → 直る → 同じ中身でまた壊れる、も 2 回と数える）
+struct UnreadableSeen(std::sync::Mutex<Vec<(PathBuf, String)>>);
+
+static UNREADABLE_SEEN: UnreadableSeen = UnreadableSeen::new();
+
+impl UnreadableSeen {
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new(Vec::new()))
+    }
+
+    /// そのファイルがこの中身で壊れているのを見たのが初めてなら true
+    /// （以後は同じ中身のあいだ false）
+    fn first_sighting(&self, path: &std::path::Path, body: &str) -> bool {
+        let mut seen = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match seen.iter_mut().find(|(p, _)| p == path) {
+            Some((_, last)) if last == body => false,
+            Some((_, last)) => {
+                *last = body.to_string();
+                true
+            }
+            None => {
+                seen.push((path.to_path_buf(), body.to_string()));
+                true
+            }
+        }
+    }
+
+    /// 読めた = 直った。次に壊れたら中身が前と同じでも申告する
+    fn forget(&self, path: &std::path::Path) {
+        let mut seen = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        seen.retain(|(p, _)| p != path);
+    }
+}
+
+/// 破損の申告の 1 行（退避先と、押し出しが起きたならその旨も載せる）
+fn unreadable_line(
     path: &std::path::Path,
     reason: &str,
-    quarantine: Option<&std::path::Path>,
-) {
-    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return;
-    }
-    let where_to = quarantine
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "（退避できず）".to_string());
-    crate::diag::persist_log(&format!(
-        "settings.json を解釈できないので既定値で起動: {}（{reason}・退避 {where_to}）",
+    quarantine: Option<&tako_core::migration::Quarantine>,
+) -> String {
+    let where_to = match quarantine {
+        Some(q) if q.evicted => format!(
+            "{}・{}",
+            q.path.display(),
+            tako_core::migration::eviction_note()
+        ),
+        Some(q) => q.path.display().to_string(),
+        None => "（退避できず）".to_string(),
+    };
+    format!(
+        "settings.json を解釈できないので既定値で動く: {}（{reason}・退避 {where_to}）",
         path.display()
-    ));
+    )
 }
 
 /// 読めない色の上書きを無視した行の頭（起動時・読み直しで共通。#1756 / #1763）
@@ -450,7 +506,96 @@ mod tests {
         save_to(&path, &Settings::default()).expect("保存できる");
         assert!(quarantine.is_file());
         assert!(load_from(&path).is_some(), "保存後は読める");
+        // #1819: 実行中にもう一度、別の中身で壊れても、その中身も保存の前に残る
+        // （以前は 1 本目が在ると何も写さず、直後の保存が 2 回目の中身を消していた）
+        std::fs::write(&path, "{ \"theme\": \"light\", ").expect("書ける");
+        assert!(load_from(&path).is_none(), "壊れているので None");
+        save_to(&path, &Settings::default()).expect("保存できる");
+        assert_eq!(
+            std::fs::read_to_string(tako_core::migration::quarantine_slot_path(&path, 2))
+                .expect("2 本目の退避が読める"),
+            "{ \"theme\": \"light\", ",
+            "2 回目に壊れた中身も残る"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&quarantine).expect("退避が読める"),
+            "{ \"theme\": ",
+            "1 本目は塗り潰さない"
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1819: 実行中に何度壊れても、**壊れた回ごとに**退避と申告が両方残る
+    /// （`load_from` の配線ごと固定する。以前は 1 プロセス 1 回しか申告せず、
+    /// 2 回目の中身は退避されずに直後の保存で消えていた）
+    #[test]
+    fn 実行中に何度壊れても退避と申告が毎回残る() {
+        let path = temp_path("second-break");
+        let dir = path.parent().expect("親がある").to_path_buf();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("作れる");
+        let bodies = [
+            "{ \"theme\": \"1\"",
+            "{ \"theme\": \"2\"",
+            "{ \"theme\": \"3\"",
+        ];
+        for (i, body) in bodies.iter().enumerate() {
+            std::fs::write(&path, body).expect("書ける");
+            let (loaded, line) = load_and_report(&path);
+            assert!(loaded.is_none(), "{} 回目: 壊れているので None", i + 1);
+            let dest = tako_core::migration::quarantine_slot_path(&path, i + 1);
+            let line = line.unwrap_or_else(|| panic!("{} 回目も申告する", i + 1));
+            assert!(
+                line.contains(&dest.display().to_string()),
+                "{} 回目の申告は今回の退避先を名指す: {line}",
+                i + 1
+            );
+            // 同じ中身を読み直しただけでは申告しない（ログを溢れさせない）
+            assert_eq!(load_and_report(&path).1, None, "{} 回目の読み直し", i + 1);
+            // 呼び出し側の保存（load → 既定値 → save）が上書きしても消えない
+            save_to(&path, &Settings::default()).expect("保存できる");
+            assert_eq!(
+                std::fs::read_to_string(&dest).expect("退避が読める"),
+                *body,
+                "{} 回目に壊れた中身が残る",
+                i + 1
+            );
+        }
+        // 読めたら忘れる = 直ったあと同じ中身でまた壊れたら、それも申告する
+        assert!(load_from(&path).is_some());
+        std::fs::write(&path, bodies[2]).expect("書ける");
+        assert!(
+            load_and_report(&path).1.is_some(),
+            "直ってから壊れた回も申告する"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1819: 破損の申告は「壊れた中身ごとに 1 回」。以前は 1 プロセス 1 回だったので、
+    /// 実行中に 2 回目に壊れた事実が persist.log に残らなかった
+    #[test]
+    fn 破損の申告は壊れた中身ごとに1回() {
+        let seen = UnreadableSeen::new();
+        let path = std::path::Path::new("/tmp/tako-1819/settings.json");
+        assert!(seen.first_sighting(path, "A"), "1 回目は申告する");
+        assert!(
+            !seen.first_sighting(path, "A"),
+            "同じ中身を読み直しただけなら申告しない（load は多くの経路から呼ばれる）"
+        );
+        assert!(
+            seen.first_sighting(path, "B"),
+            "別の中身で壊れたら 2 回目も申告する"
+        );
+        seen.forget(path);
+        assert!(
+            seen.first_sighting(path, "B"),
+            "直ってから同じ中身でまた壊れたら、それも申告する"
+        );
+        seen.forget(std::path::Path::new("/tmp/tako-1819/other.json"));
+        assert!(
+            !seen.first_sighting(path, "B"),
+            "別のファイルが読めても忘れない"
+        );
     }
 
     fn temp_path(name: &str) -> PathBuf {

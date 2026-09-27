@@ -398,7 +398,7 @@ fn read_from(path: &std::path::Path) -> RecordRead {
             let quarantine =
                 tako_core::migration::quarantine_unreadable(path, &tako_core::migration::FsIo);
             let where_to = match quarantine {
-                Some(dest) => format!("。内容は {} へ退避しました", dest.display()),
+                Some(dest) => format!("。内容は {} へ退避しました", dest.path.display()),
                 None => String::new(),
             };
             Err(format!(

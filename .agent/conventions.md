@@ -2676,11 +2676,44 @@ false になり、`status` の予告と `run` の報告が食い違った。
 |---|---|
 | 冪等 | 版数は外部の記録ではなく**内容から判定**（`detect`）。`apply` は「もう当たっている」なら `Ok(None)` を返す |
 | 旧ファイルを消さない | 書く前に `<name>.pre-v<from>.bak` へ退避。退避が取れなければ**書かない** |
-| 解釈できない内容を捨てない | `validate` が Err なら `<name>.unreadable.bak` へ丸ごと退避して申告（既定値へ黙って落とさない） |
+| 解釈できない内容を捨てない | `validate` が Err なら `<name>.unreadable.bak` へ丸ごと退避して申告（既定値へ黙って落とさない）。**2 回目以降に別の中身で壊れても積んで残す**（下の「2 回目以降に壊れた中身も残す」） |
 | 秘匿情報の写しを残さない | `preserve_unreadable: false` の種別（`instances/control-*.json` = トークンつき / `remote/devices.json` = Secret）は**退避せず**「読めない」ことだけ申告する。退避は「利用者が手で書いた情報を守る」ためのものなので、寿命の短いトークンつきファイルには当てはまらない |
 | 失敗時に元を守る | `apply` が Err なら元のファイルを 1 バイトも触らない |
 | 未来の形式を壊さない | ファイルが `target_version` より新しければ触らず `Refused` |
 | 実施の可視化 | persist.log へ「移行: <種別> v1 -> v2: <パス>（退避 …・発生源 …）」 |
+
+### 2 回目以降に壊れた中身も残す（Issue #1819）
+
+退避の口は `tako_core::migration::quarantine_unreadable` の 1 実装で、移行（`migrate_file`）と
+「読めなければ既定値へ落とす」読み手（`settings::load_from` / `RecentList::load_from` /
+`ShortcutsFile::load_from` / `lid.rs` の `read_from`）が全員ここを通る。
+
+以前は退避先（`<name>.unreadable.bak`）が既にあると**何も写さずそのパスを返していた**ので、
+実行中にもう一度別の中身で壊れると 2 回目の中身はどこにも残らず、呼び出し側の保存
+（load → 既定値 → save）が消していた。settings.json の申告も 1 プロセス 1 回だったので記録も
+残らなかった（実行中の隔離 GUI で実測。layout.json も 3 回目の起動で `.corrupt` の rename が
+2 回目の中身を上書きしていた）。いまの規則:
+
+| 場面 | どうなるか |
+|---|---|
+| 1 回目 | 従来どおり `<name>.unreadable.bak` |
+| 別の中身で 2 回目以降 | 空いている一番若い番号へ（`<name>.unreadable.2.bak` 〜 `.unreadable.10.bak`） |
+| 同じ中身をもう一度 | 何も書かない（`load` は多くの経路から呼ばれるので、読むたびに写すと上限を食い潰す） |
+| 人が退避を消した | 空いた番号へまた写す（1 本目を消したら次は `.unreadable.bak`） |
+| 上限（`QUARANTINE_LIMIT` = 10 本）に達した | **1 本目（最初に壊れた中身）は動かさず**、2 本目（その次に古い中身）を押し出して詰め、最新を 10 本目へ置く。押し出したことは persist.log に残す |
+
+- **容量の上限は「元ファイル × 10 本」**で、別にバイト上限は設けない。退避は元ファイルの
+  写しなので、切り詰めて残すと保全にならず、写さない選択は「消す」と同じになるため
+- 上限を超える押し出しは「消さない」の例外として**必ず記録する**（settings の申告と移行の
+  記録が `migration::eviction_note` の 1 本を使う。`tako migrate` の応答には
+  `quarantine_evicted: true`）
+- 書けない io（`tako migrate status` の見るだけ）では何も書き換えず、「写すならここ」を
+  `quarantine_planned` で申告する（満杯でも押し出さない）
+- settings.json の申告は**壊れた中身ごとに 1 回**（`UnreadableSeen`）。同じ中身の読み直しでは
+  申告せず、読めた回に忘れる（直ったあと同じ中身でまた壊れたら、それも申告する）
+- 実経路の検査は `scripts/test-unreadable-quarantine-1819.sh`（隔離 GUI に対して 3 回壊す /
+  同じ中身 / 人が消した後 / 壊れたまま再起動 / 上限 / recent・shortcuts / layout /
+  projects・profiles の fail-loud）
 
 ### 置き場を変える移行は隔離中に走らせない（Issue #1019）
 

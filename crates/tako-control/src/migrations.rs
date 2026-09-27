@@ -1013,7 +1013,9 @@ pub fn setup_lines() -> Vec<String> {
                 }
                 lines.push(format!("旧内容の退避先: {}", backup.display()));
             }
-            FileOutcome::Unreadable { quarantine, reason } => lines.push(match quarantine {
+            FileOutcome::Unreadable {
+                quarantine, reason, ..
+            } => lines.push(match quarantine {
                 Some(dest) => format!(
                     "{} は読めなかったので {} へ退避しました（{reason}）",
                     file.path.display(),
@@ -1123,7 +1125,11 @@ fn file_json(file: &FileReport, did_apply: bool) -> serde_json::Value {
                     .into(),
             );
         }
-        FileOutcome::Unreadable { quarantine, reason } => {
+        FileOutcome::Unreadable {
+            quarantine,
+            reason,
+            evicted,
+        } => {
             // 退避しない種別（秘匿情報つき / 短命）はキー自体を出さない
             if let Some(dest) = quarantine {
                 map.insert(
@@ -1135,6 +1141,10 @@ fn file_json(file: &FileReport, did_apply: bool) -> serde_json::Value {
                     .into(),
                     dest.display().to_string().into(),
                 );
+            }
+            // 押し出しが起きた回だけ載せる（#1819。普段の応答の形は変えない）
+            if *evicted {
+                map.insert("quarantine_evicted".into(), true.into());
             }
             map.insert("reason".into(), reason.clone().into());
         }
@@ -1164,11 +1174,19 @@ fn record(report: &MigrationReport, origin: &str) {
                 file.path.display(),
                 reason.text()
             )),
-            FileOutcome::Unreadable { quarantine, reason } => {
-                let where_to = match quarantine {
+            FileOutcome::Unreadable {
+                quarantine,
+                reason,
+                evicted,
+            } => {
+                let mut where_to = match quarantine {
                     Some(dest) => format!("退避 {}", dest.display()),
                     None => "退避しない種別".to_string(),
                 };
+                if *evicted {
+                    where_to.push('・');
+                    where_to.push_str(&migration::eviction_note());
+                }
                 crate::diag::persist_log(&format!(
                     "移行できず: {} {}（{reason}・{where_to}・発生源 {origin}）",
                     file.id.as_str(),
