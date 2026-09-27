@@ -47,6 +47,13 @@
 #   当たらないとき、**名前が読めない面に限って**この uuid で当てる。記録は冪等
 #   （同じ値なら書かない）で、uuid が読めなくても ensure は失敗させない。
 #
+# 名前が一致しても仮想ディスプレイとは限らない（#1783）:
+#   面は名前（TAKO_VD_NAME）で探すので、そこへ実在の物理画面の名前（内蔵ディスプレイ・
+#   外部モニタ）を渡すと、以前の ensure はその面を tako-vd と見なして成功を返していた
+#   （締めがその面の uuid を記録し、内蔵なら Main 保護が器へ main を撃つ）。締めの**最初に**
+#   「器が作った仮想ディスプレイか」を確かめ（vd_assert_virtual）、物理画面なら
+#   終了コード VD_RC_NOT_VIRTUAL と理由 1 行で断る。確かめられないときも通さない。
+#
 # いまの実装は BetterDisplay の仮想スクリーン。他の実装（DeskPad 等）へ広げるときは
 # vd_backend_* だけを差し替える（表に出る ensure / bounds / status は変えない）。
 
@@ -67,6 +74,10 @@ VD_RECORD_DIR=${TAKO_VD_RECORD_DIR:-}
 if [ -z "$VD_RECORD_DIR" ] && [ -n "${HOME:-}" ]; then
     VD_RECORD_DIR="$HOME/Library/Caches/tako/virtual-display"
 fi
+# 名指しされた面が物理画面だったときの ensure の終了コード（#1783）。**1 とは分ける**:
+# 1 は「面を用意できない = 環境が揃わない」、こちらは TAKO_VD_NAME の渡し方の誤り。
+# isolated-gui.sh はこの番号を見て「使い方の誤り」（2）として断る（番犬が番号を突き合わせる）
+VD_RC_NOT_VIRTUAL=3
 
 vd_err() { echo "ERROR: $*" >&2; }
 
@@ -285,6 +296,48 @@ vd_main_protection_plan() {
         return 0
     fi
     echo "restore ${builtin_id} ${builtin_name}"
+}
+
+# 名指しされた面が器の作った仮想ディスプレイかの判定（純関数。#1783）。
+# stdin はテーブル、$1 は基準名、$2 は器の仮想スクリーン一覧（vd_backend_list の出力 =
+# tagID<TAB>displayID<TAB>name）、$3 は一覧を器から読めたか（1 / 0）。出力は 1 行:
+#   virtual           器の仮想スクリーンと確かめられた（終了 0）
+#   physical <理由>   物理画面と分かった（終了 1）
+#   unknown <理由>    確かめられない（終了 2）
+#
+# 物理の証拠は**独立に 2 つ**見る（片方の読み違いで通ってしまわないように）:
+#   - 内蔵（CGDisplayIsBuiltin）: 器に聞かずに決まる。器の一覧に同じ名前があっても内蔵は内蔵
+#   - 器の仮想スクリーン一覧にその名前が無い: 外部モニタはこちらで分かる
+# **確かめられないものは通さない**。眠りの判定（vd_id_drawable の「証明できるときだけ断る」）
+# とは向きが逆で、こちらは誤って通すと検証用 GUI がユーザーの画面へ出る（#1744 と同じく、
+# 窓を出す側へは倒さない）。名前は OS に見えている綴りの枝番を落として比べ、器の名前とは
+# 完全一致で比べる（器の一覧は枝番を付けない）
+vd_virtual_verdict() {
+    local want=$1 list=${2-} listed=${3:-0}
+    local rows line name x y w h did builtin is_main
+    rows=$(vd_rows_named "$want")
+    if [ -z "$rows" ]; then
+        echo "unknown ${want} が OS のディスプレイ一覧に居ない"
+        return 2
+    fi
+    while IFS=$'\t' read -r name x y w h did builtin is_main; do
+        if [ "${builtin:-0}" = 1 ]; then
+            echo "physical ${name} は内蔵ディスプレイ（CGDisplayIsBuiltin）"
+            return 1
+        fi
+    done <<< "$rows"
+    if [ "$listed" != 1 ]; then
+        echo "unknown 器（BetterDisplay）の仮想スクリーン一覧を読めない"
+        return 2
+    fi
+    # 名前は行の最後の欄で取る（`read` はタブを空白扱いで畳むので、displayID が空の行
+    # `17<TAB><TAB>tako-vd` だと名前が 2 欄目へずれる）
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        [ "${line##*$'\t'}" = "$want" ] && { echo virtual; return 0; }
+    done <<< "$list"
+    echo "physical 器（BetterDisplay）の仮想スクリーン一覧に ${want} が無い = 器が作った面ではない"
+    return 1
 }
 
 # その displayID が描画可能か（純関数。$1 = displayID、stdin = vd_drawable の出力）。
@@ -568,10 +621,35 @@ vd_record_note() {
     fi
 }
 
-# 用意できた直後に必ず通す締め（#1150 / #1160 / #1697）。
-# 増殖の検査 → 起きているかの確認（眠っていれば起こす）→ uuid の記録 → Main 保護の順。
-# **ensure が成功で返る道はすべてここを通る**（番犬が拘束している）
+# 名指しされた面（VD_NAME）が器の作った仮想ディスプレイであることを確かめる（#1783）。
+# 物理画面なら理由を 1 行出して VD_RC_NOT_VIRTUAL、確かめられなければ 1。
+# 器に聞くのは内蔵で決まらないときだけ（内蔵の名前を渡されたら器を起こさずに断る）
+vd_assert_virtual() {
+    local table verdict rc list=""
+    table=$(vd_screens)
+    verdict=$(printf '%s\n' "$table" | vd_virtual_verdict "$VD_NAME" "" 0); rc=$?
+    if [ "$rc" = 2 ] && vd_backend_ready >/dev/null; then
+        list=$(vd_backend_list)
+        verdict=$(printf '%s\n' "$table" | vd_virtual_verdict "$VD_NAME" "$list" 1); rc=$?
+    fi
+    case $rc in
+        0) return 0 ;;
+        1)
+            vd_err "${VD_NAME} は仮想ディスプレイではないので使わない: ${verdict#physical }（TAKO_VD_NAME に物理画面の名前を渡していないか。検証用 GUI をユーザーの画面へ出さない = #1783）"
+            return "$VD_RC_NOT_VIRTUAL"
+            ;;
+    esac
+    vd_err "${VD_NAME} が仮想ディスプレイか確かめられないので使わない: ${verdict#unknown }（#1783）"
+    return 1
+}
+
+# 用意できた直後に必ず通す締め（#1150 / #1160 / #1697 / #1783）。
+# 仮想ディスプレイかの確認 → 増殖の検査 → 起きているかの確認（眠っていれば起こす）→
+# uuid の記録 → Main 保護の順。**ensure が成功で返る道はすべてここを通る**（番犬が拘束している）。
+# 仮想かの確認が先頭なのは、物理画面の uuid を tako-vd の記録として残す・物理画面の名前を
+# 仮想と読んだ Main 保護が器へ main を撃つ、のどちらも起こさないため（#1783）
 vd_finish_ensure() {
+    vd_assert_virtual || return $?
     vd_assert_single || return 1
     vd_ensure_drawable || return 1
     vd_record_uuid
@@ -797,7 +875,7 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
             ;;
         *)
             echo "使い方: ${0} {ensure|bounds|status [--snapshot]|recorded-uuid|move-window <pid>|window-env <w> <h> [x] [y]|cleanup-orphans [--apply]}" >&2
-            echo "  ensure           仮想ディスプレイ ${VD_NAME} を用意し、眠っていれば起こす（冪等・消す機能は無い）" >&2
+            echo "  ensure           仮想ディスプレイ ${VD_NAME} を用意し、眠っていれば起こす（冪等・消す機能は無い。物理画面の名前なら ${VD_RC_NOT_VIRTUAL} で断る）" >&2
             echo "  bounds           \"x y w h\"（Quartz グローバル・ポイント）" >&2
             echo "  status           状態を 1 行（眠っている面も出る。--snapshot は前後比較用の機械可読な現況）" >&2
             echo "  recorded-uuid    ensure が残した面の uuid（tako が名前を読めないときに当てる。#1697）" >&2

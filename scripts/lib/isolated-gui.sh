@@ -31,7 +31,16 @@
 #   終了コード 2（`ISOLATED_GUI_RC_FOREIGN_DISPLAY`）で返して理由を stderr へ 1 行出す。
 #   通すのは tako-vd の名前 / tako-vd の uuid / 空（tako の定義で未指定）/ 実在し得ない
 #   index（`index:999` 等 = tako は見失って窓を開かずに終わる）だけ。「わざと当たらない面」を
-#   指したい検査（#1697 の ④）は `TAKO_DISPLAY=index:999` を使う。opt-in で別の面を通す口は作らない
+#   指したい検査（#1697 の ④）は `TAKO_DISPLAY=index:999` を使う。opt-in で別の面を通す口は作らない。
+#   判定は**面を起こす前**（#1783。面を用意できない機で書き方の誤りを 4 = 未実測に紛れさせない）。
+#   uuid だけは形を起こす前に見て、ensure が記録した値との突き合わせ（iso_display_uuid_recorded）を
+#   起こした後に残す（記録は ensure の締めが書くので、起こす前だと初回や面の作り直しで正しい uuid を断る）
+#
+# **tako-vd の名前に物理画面を渡されたら起動しない**（#1783）: 面の名前の正本は `TAKO_VD_NAME` なので、
+#   そこへ内蔵ディスプレイ等の名前を入れると、以前は `ensure` がその面を tako-vd と見なして成功し、
+#   ヘルパもその名前を通していた。いまの `ensure` は物理画面なら終了コード 3 で断り、ヘルパはそれを
+#   「使い方の誤り」として終了コード 2（`ISOLATED_GUI_RC_NOT_VIRTUAL`）で返して理由を stderr へ 1 行出す
+#   （4 = 未実測と読ませない）
 #
 # **検証用 GUI の印（`TAKO_ISOLATED`）は偽にできない**（#1784）: このヘルパは検証用 GUI 専用の
 #   入口なので、GUI へは常に `TAKO_ISOLATED=1` を呼び出し側の `VAR=VAL` より後ろに置いて渡す。
@@ -46,7 +55,7 @@
 #   . scripts/lib/isolated-gui.sh        # 関数として読む（直接実行はしない）
 #
 #   isolated_gui_bins                    # TAKO_BIN / APP_BIN を決める（無ければビルド）
-#   launch_isolated_gui "$TMP/app.log" || exit $?   # 印の判定 → ensure → 面の指定の判定 → 起動（pid は $ISOLATED_GUI_PID）
+#   launch_isolated_gui "$TMP/app.log" || exit $?   # 印と面の指定の判定 → ensure → uuid の突き合わせ → 起動（pid は $ISOLATED_GUI_PID）
 #   wait_isolated_gui                    # `tako list` が通るまで待つ（任意）
 #   stop_isolated_gui                    # 自分で起こした pid だけを落とす
 #
@@ -98,6 +107,16 @@ ISOLATED_GUI_RC_FOREIGN_DISPLAY=2
 # 面の指定の誤り（#1760）と同じ「使い方の誤り = 2」
 ISOLATED_GUI_RC_NOT_ISOLATED=2
 
+# `TAKO_VD_NAME` が物理画面を指していて起動しなかったときの終了コード（#1783）。これも「使い方の誤り = 2」
+ISOLATED_GUI_RC_NOT_VIRTUAL=2
+
+# 面を用意する係の `ensure` が「名指しされた面は物理画面」と断ったときの終了コード（#1783）。
+# **virtual-display.sh の VD_RC_NOT_VIRTUAL と同じ番号**（番犬が突き合わせる）
+ISOLATED_GUI_VD_RC_NOT_VIRTUAL=3
+
+# uuid の形（小文字で比べる。tako 側の is_uuid_shaped と同じ 8-4-4-4-12）
+ISOLATED_GUI_UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+
 # この番号以上の index は「実在し得ない面」として通す（#1760）。実機の面は 100 枚に届かない
 # ので、tako は必ず見失い、明示の見失いとして窓を開かずに終わる（#1697）
 ISOLATED_GUI_ABSENT_INDEX_MIN=100
@@ -115,6 +134,9 @@ ISOLATED_GUI_PID=""
 
 # 直前の `iso_ensure_display` が面を用意できなかった理由（1 行。用意できたら空）
 ISOLATED_GUI_NO_DISPLAY_REASON=""
+
+# 直前の `iso_ensure_display` が「名指しされた面は物理画面」で断られた理由（1 行。それ以外は空。#1783）
+ISOLATED_GUI_NOT_VIRTUAL_REASON=""
 
 # 直前の `iso_display_allowed` が面の指定を通さなかった理由（1 行。通したら空）
 ISOLATED_GUI_FOREIGN_REASON=""
@@ -151,11 +173,15 @@ isolated_gui_bins() {
 # **用意できないときに素通しして続行しない**（#1744）: 以前は配線が無い環境（CI・他人の機）の
 # ために「起動は続ける」で返していたが、その起動は面の指定を持たず、tako の暗黙の既定で
 # ユーザーの画面へ落ちうる。`ensure` の応答だけを信じず、面が OS の一覧に居ることまで
-# `bounds` で読み戻す（器の応答文を当てにしない作法 = virtual-display.sh の癖 ② と同じ）
+# `bounds` で読み戻す（器の応答文を当てにしない作法 = virtual-display.sh の癖 ② と同じ）。
+#
+# `ensure` が「名指しされた面は物理画面」（終了コード ISOLATED_GUI_VD_RC_NOT_VIRTUAL）で断ったときは
+# 理由を `ISOLATED_GUI_NOT_VIRTUAL_REASON` にも置く（#1783。呼び手が未実測ではなく使い方の誤りとして断る）
 iso_ensure_display() {
     local vd out rc=0 line reason=""
     vd="${ISOLATED_GUI_VD:-$(iso_repo_root)/scripts/lib/virtual-display.sh}"
     ISOLATED_GUI_NO_DISPLAY_REASON=""
+    ISOLATED_GUI_NOT_VIRTUAL_REASON=""
     if [ ! -f "$vd" ]; then
         reason="面を用意する ${vd##*/} が見つからない"
     else
@@ -172,7 +198,15 @@ iso_ensure_display() {
     fi
     [ -z "$reason" ] && return 0
     ISOLATED_GUI_NO_DISPLAY_REASON=$reason
+    [ "$rc" -eq "$ISOLATED_GUI_VD_RC_NOT_VIRTUAL" ] && ISOLATED_GUI_NOT_VIRTUAL_REASON=$reason
     return 1
+}
+
+# 前後の空白を落とす（tako も面の指定の前後の空白を無視する）
+iso_trim() {
+    local s="${1-}"
+    s=${s#"${s%%[![:space:]]*}"}
+    printf '%s' "${s%"${s##*[![:space:]]}"}"
 }
 
 # 面の指定（`TAKO_DISPLAY` の値）を GUI へ渡してよいかを判定する（#1760）。
@@ -182,30 +216,24 @@ iso_ensure_display() {
 # （tako 側の当て方は crates/tako-core/src/platform/display.rs の select_with）:
 #   - 空・空白だけ: tako の定義で未指定（explicit_request）= 検証用の既定で tako-vd を探す
 #   - tako-vd の名前（大文字小文字は無視。tako と同じ）
-#   - tako-vd の uuid: `ensure` が記録した値と一致するものだけ。記録が無ければ確かめられないので通さない
+#   - uuid の形の値: **ここでは形だけ見て通し**、`ensure` が記録した値との突き合わせは
+#     面を起こした後の iso_display_uuid_recorded が行う（記録と一致しなければそこで断る）
 #   - 実在し得ない index（`index:N` / `N` で N >= ISOLATED_GUI_ABSENT_INDEX_MIN）
 # **tako-vd を index で指すのは通さない**: index は OS の列挙順で決まり、判定から起動までに
 # 面が眠る・繋がると並びがずれて別の面（ユーザーの画面）を指す。当たらないはずの名前
 # （`no-such-display` 等）も通さない: その名前の面が無いことをこちらからは確かめられない
-# （名前が読めない瞬間もある = #1697）。わざと当たらない面は index で指す
+# （名前が読めない瞬間もある = #1697）。わざと当たらない面は index で指す。
+#
+# **面を起こす前に呼ぶ**（#1783）: 係（virtual-display.sh）に何も聞かない = 面を用意できない機
+# （CI）でも書き方の誤りを 4（未実測）ではなく 2 で断れる
 iso_display_allowed() {
-    local raw="${1-}" spec lower recorded n vd
-    local uuid_re='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    local spec lower n
     ISOLATED_GUI_FOREIGN_REASON=""
-    # 前後の空白は tako と同じく無視する
-    spec=${raw#"${raw%%[![:space:]]*}"}
-    spec=${spec%"${spec##*[![:space:]]}"}
+    spec=$(iso_trim "${1-}")
     [ -n "$spec" ] || return 0
     lower=$(printf '%s' "$spec" | tr '[:upper:]' '[:lower:]')
     [ "$lower" = "$(printf '%s' "$ISOLATED_GUI_DISPLAY" | tr '[:upper:]' '[:lower:]')" ] && return 0
-    if [[ $lower =~ $uuid_re ]]; then
-        # 記録を読むのも面を用意した係（iso_ensure_display と同じ差し替え口）
-        vd="${ISOLATED_GUI_VD:-$(iso_repo_root)/scripts/lib/virtual-display.sh}"
-        recorded=$(bash "$vd" recorded-uuid 2>/dev/null | tr '[:upper:]' '[:lower:]')
-        [ -n "$recorded" ] && [ "$lower" = "$recorded" ] && return 0
-        ISOLATED_GUI_FOREIGN_REASON="uuid ${spec} は ensure が記録した ${ISOLATED_GUI_DISPLAY} の uuid と一致しない。記録: ${recorded:-なし}"
-        return 1
-    fi
+    [[ $lower =~ $ISOLATED_GUI_UUID_RE ]] && return 0
     n=${lower#index:}
     case "$n" in
         '' | *[!0-9]*) ;;
@@ -220,6 +248,33 @@ iso_display_allowed() {
     esac
     ISOLATED_GUI_FOREIGN_REASON="${spec} は ${ISOLATED_GUI_DISPLAY} の名前ではない"
     return 1
+}
+
+# uuid の形の面の指定が、`ensure` が記録した tako-vd の uuid と一致するか（#1760）。
+# 一致すれば 0、しなければ理由を 1 行 `ISOLATED_GUI_FOREIGN_REASON` へ置いて非ゼロ。uuid の形で
+# ない値は iso_display_allowed が判定済みなので 0。記録が無ければ確かめられないので通さない。
+#
+# **面を起こした後に呼ぶ**（#1783 で確かめた）: 記録は `ensure` の締め（vd_record_uuid）が書くので、
+# 起こす前に読むと、初回（隔離した HOME で記録がまだ無い = test-display-uuid-1697.sh の形）や
+# 面の作り直し（uuid が変わった）で**いまの tako-vd の uuid を断る**。起こした後へ残しても、
+# 面を用意できない機ではそもそも起動しない（4）ので、違う uuid が画面へ届く道は無い
+iso_display_uuid_recorded() {
+    local spec lower recorded vd
+    ISOLATED_GUI_FOREIGN_REASON=""
+    spec=$(iso_trim "${1-}")
+    lower=$(printf '%s' "$spec" | tr '[:upper:]' '[:lower:]')
+    [[ $lower =~ $ISOLATED_GUI_UUID_RE ]] || return 0
+    # 記録を読むのも面を用意した係（iso_ensure_display と同じ差し替え口）
+    vd="${ISOLATED_GUI_VD:-$(iso_repo_root)/scripts/lib/virtual-display.sh}"
+    recorded=$(bash "$vd" recorded-uuid 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    [ -n "$recorded" ] && [ "$lower" = "$recorded" ] && return 0
+    ISOLATED_GUI_FOREIGN_REASON="uuid ${spec} は ensure が記録した ${ISOLATED_GUI_DISPLAY} の uuid と一致しない。記録: ${recorded:-なし}"
+    return 1
+}
+
+# 面の指定を通さなかったことを stderr へ 1 行出す（#1760。判定は起こす前と、uuid だけ起こした後の 2 か所）
+iso_refuse_display() {
+    iso_err "TAKO_DISPLAY=${1-} は通さないので検証用 GUI を開かない（${ISOLATED_GUI_FOREIGN_REASON}。ヘルパ経由の起動が通すのは ${ISOLATED_GUI_DISPLAY} の名前か uuid だけで、わざと当たらない面は TAKO_DISPLAY=index:999 で指す。#1760）"
 }
 
 # 検証用 GUI の印（`TAKO_ISOLATED` の値）を tako が真と読むかを判定する（#1784）。真なら 0。
@@ -257,14 +312,6 @@ launch_isolated_gui() {
         return "$ISOLATED_GUI_RC_NOT_ISOLATED"
     fi
 
-    # 面を起こす。**用意できなければ起動しない**（#1744）。呼び出し側が `TAKO_DISPLAY` を
-    # 明示していても同じ（狙いが tako-vd なら見失っているし、別の面ならユーザーの画面へ出す）。
-    # ISOLATED_GUI_PID は触らない（先に起こした GUI を trap の後片付けから外さないため）
-    if ! iso_ensure_display; then
-        echo "未実測: ${ISOLATED_GUI_DISPLAY} を用意できないので検証用 GUI を開かない（${ISOLATED_GUI_NO_DISPLAY_REASON}。状態は scripts/lib/virtual-display.sh status。#1744）" >&2
-        return "$ISOLATED_GUI_RC_NO_DISPLAY"
-    fi
-
     # 面の指定は常に明示する = tako は見失ったら既定の面へ落ちずに窓を開かずに終わる（#1697）。
     # 値は 1 つに決めてから判定する: 呼び出し側が並べた `TAKO_DISPLAY=`（最後のものが勝つ =
     # env と同じ）→ export された TAKO_DISPLAY（空は未指定扱い）→ tako-vd
@@ -272,9 +319,29 @@ launch_isolated_gui() {
     for arg in "$@"; do
         case "$arg" in TAKO_DISPLAY=*) display=${arg#TAKO_DISPLAY=} ;; esac
     done
-    # **tako-vd 以外の面の明示は通さない**（#1760。通すとユーザーの画面へ窓が出る）
+    # **tako-vd 以外の面の明示は通さない**（#1760。通すとユーザーの画面へ窓が出る）。
+    # これも**面を起こす前に**見る（#1783。印の判定と同じ理由で、4 = 未実測に紛れさせない）
     if ! iso_display_allowed "$display"; then
-        iso_err "TAKO_DISPLAY=${display} は通さないので検証用 GUI を開かない（${ISOLATED_GUI_FOREIGN_REASON}。ヘルパ経由の起動が通すのは ${ISOLATED_GUI_DISPLAY} の名前か uuid だけで、わざと当たらない面は TAKO_DISPLAY=index:999 で指す。#1760）"
+        iso_refuse_display "$display"
+        return "$ISOLATED_GUI_RC_FOREIGN_DISPLAY"
+    fi
+
+    # 面を起こす。**用意できなければ起動しない**（#1744）。呼び出し側が `TAKO_DISPLAY` を
+    # 明示していても同じ（狙いが tako-vd なら見失っているし、別の面ならユーザーの画面へ出す）。
+    # ISOLATED_GUI_PID は触らない（先に起こした GUI を trap の後片付けから外さないため）
+    if ! iso_ensure_display; then
+        # 名指しされた面が物理画面（#1783）= 環境ではなく TAKO_VD_NAME の渡し方の誤り
+        if [ -n "$ISOLATED_GUI_NOT_VIRTUAL_REASON" ]; then
+            iso_err "TAKO_VD_NAME=${ISOLATED_GUI_DISPLAY} は仮想ディスプレイではないので検証用 GUI を開かない（${ISOLATED_GUI_NOT_VIRTUAL_REASON}。TAKO_VD_NAME は仮想ディスプレイの名前だけ = #1783）"
+            return "$ISOLATED_GUI_RC_NOT_VIRTUAL"
+        fi
+        echo "未実測: ${ISOLATED_GUI_DISPLAY} を用意できないので検証用 GUI を開かない（${ISOLATED_GUI_NO_DISPLAY_REASON}。状態は scripts/lib/virtual-display.sh status。#1744）" >&2
+        return "$ISOLATED_GUI_RC_NO_DISPLAY"
+    fi
+
+    # uuid の指定だけは面を起こした後で記録と突き合わせる（記録は ensure の締めが書く。#1760 / #1783）
+    if ! iso_display_uuid_recorded "$display"; then
+        iso_refuse_display "$display"
         return "$ISOLATED_GUI_RC_FOREIGN_DISPLAY"
     fi
     local -a env_args=()
@@ -326,7 +393,7 @@ stop_isolated_gui() {
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
     echo "使い方: . ${0}   # source して関数を使う（直接実行する口は無い）" >&2
     echo "  isolated_gui_bins                    TAKO_BIN / APP_BIN を決める（無ければビルド）" >&2
-    echo "  launch_isolated_gui <log> [VAR=VAL…] 仮想ディスプレイを起こして隔離 GUI を起動（用意できなければ起動せず 4・tako-vd 以外の面の指定と偽の TAKO_ISOLATED は起動せず 2）" >&2
+    echo "  launch_isolated_gui <log> [VAR=VAL…] 仮想ディスプレイを起こして隔離 GUI を起動（用意できなければ起動せず 4・tako-vd 以外の面の指定と偽の TAKO_ISOLATED と物理画面を指す TAKO_VD_NAME は起動せず 2）" >&2
     echo "  wait_isolated_gui [log] [試行回数]    tako list が通るまで待つ" >&2
     echo "  stop_isolated_gui [pid]              自分で起こした pid だけを落とす" >&2
     exit 1

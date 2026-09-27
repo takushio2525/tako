@@ -1,6 +1,6 @@
 //! 仮想ディスプレイまわりの番犬（#1141 / #1150 / #1160 / #1697）
 //!
-//! 守りたい不変条件は 9 つ。どれも「壊れても動いているように見える」ので、
+//! 守りたい不変条件は 10 個。どれも「壊れても動いているように見える」ので、
 //! 人間の記憶ではなくテストで固定する。
 //!
 //! 1. **ヘルパは消す機能を持たない**。`tako-vd` は常設で、検証のたびに作り直さない
@@ -25,6 +25,10 @@
 //!    記録し（置き場は Rust とシェルで同じ）、`resolve_target_display` は記録済み uuid と
 //!    「明示の指定か」を核から取る。どちらかが外れると、名前だけが読めない起動で
 //!    生きている `tako-vd` を見失い、ユーザーのメイン画面へ窓が出る
+//! 10. **名前が一致しても物理画面なら使わない**（#1783）。`ensure` の締めが**最初に**
+//!     「器が作った仮想ディスプレイか」を確かめ、物理画面（内蔵 / 器の一覧に無い面）なら
+//!     終了コード `VD_RC_NOT_VIRTUAL` で断る。後ろに置くと物理画面の uuid を記録し、
+//!     内蔵なら Main 保護が器へ main を撃つ（`TAKO_VD_NAME` の取り違え 1 つで起きる）
 
 use std::path::{Path, PathBuf};
 
@@ -547,5 +551,200 @@ fn 置き先の解決は記録済みuuidと明示の指定を核から取る() {
         "{REL}:{}: miss_for に「明示の指定か」を渡していない（#1697。呼び出し: {call:?}）。\n\
          → TAKO_DISPLAY で明示した面を見失った検証用 GUI が既定の面へ落ちる",
         line_of(&src, "disp::miss_for(")
+    );
+}
+
+// ── #1783: 名前が一致しても仮想ディスプレイとは限らない ─────────────────────
+
+/// 締めは**最初に**「器が作った仮想ディスプレイか」を確かめる（#1783）。
+///
+/// 後ろに置くと、`TAKO_VD_NAME` に物理画面の名前を渡されたときに uuid の記録（物理画面の
+/// uuid を「その名前の面」の記録として残す）や Main 保護（物理画面を仮想と読んで器へ
+/// main を撃つ）へ先に進む。終了コードは潰さずに返す（`|| return 1` だとヘルパが
+/// 物理画面の拒否を「面を用意できない = 未実測」と読む）
+#[test]
+fn 締めは最初に仮想ディスプレイかを確かめる() {
+    const REL: &str = "scripts/lib/virtual-display.sh";
+    let src = helper_source();
+    let body = code_only(&shell_fn_body(&src, "vd_finish_ensure"));
+    let at = line_of(&src, "vd_finish_ensure() {");
+    let virt = body.find("vd_assert_virtual").unwrap_or_else(|| {
+        panic!(
+            "{REL}:{at}: vd_finish_ensure が仮想ディスプレイかの確認（vd_assert_virtual）を通っていない（#1783）。\n\
+             → TAKO_VD_NAME に物理画面の名前を渡すと、その面を tako-vd と見なして成功を返す"
+        )
+    });
+    for later in [
+        "vd_assert_single",
+        "vd_ensure_drawable",
+        "vd_record_uuid",
+        "vd_protect_main",
+    ] {
+        let pos = body
+            .find(later)
+            .unwrap_or_else(|| panic!("{REL}:{at}: vd_finish_ensure が {later} を呼んでいない"));
+        assert!(
+            virt < pos,
+            "{REL}:{at}: 仮想ディスプレイかの確認が {later} より後ろに在る（#1783）。\n\
+             → 物理画面の名前で {later} へ先に進む（uuid の記録・Main 保護は物理画面に触る）"
+        );
+    }
+    assert!(
+        body.contains("vd_assert_virtual || return $?"),
+        "{REL}:{at}: vd_assert_virtual の終了コードを潰している（#1783）。\n\
+         → `vd_assert_virtual || return $?` で VD_RC_NOT_VIRTUAL をそのまま返す"
+    );
+    // 判定は純関数（器・画面に触らない）で、内蔵は CoreGraphics の列（builtin）で見る
+    let verdict = code_only(&shell_fn_body(&src, "vd_virtual_verdict"));
+    let vat = line_of(&src, "vd_virtual_verdict() {");
+    for banned in ["vd_bd", "vd_screens", "vd_backend_list", "osascript"] {
+        assert!(
+            !verdict.contains(banned),
+            "{REL}:{vat}: 仮想ディスプレイかの判定（vd_virtual_verdict）が {banned} を呼んでいる（#1783）。\n\
+             → 判定は stdin のテーブルと引数だけを見る純関数のままにする（スタブ無しで回せる形）"
+        );
+    }
+    assert!(
+        verdict.contains("builtin"),
+        "{REL}:{vat}: vd_virtual_verdict が内蔵（CGDisplayIsBuiltin の列）を見ていない（#1783）"
+    );
+}
+
+/// 実際に `/bin/bash`（macOS 同梱の 3.2）で `virtual-display.sh` を走らせ、物理画面の名前では
+/// `ensure` が断ることを見る（#1783）。画面の列挙・器・起こす手立てはスタブにして
+/// **実ディスプレイに一切触らない**
+#[cfg(unix)]
+#[test]
+fn 物理画面の名前ではensureが断る() {
+    const REL: &str = "scripts/lib/virtual-display.sh";
+    let src = helper_source();
+    let at = line_of(&src, "vd_assert_virtual() {");
+    // 判定の本体（内蔵 / 器の一覧）。理由の中身が違うときはこちらを名指す
+    let vat = line_of(&src, "vd_virtual_verdict() {");
+    let rc_not_virtual: i32 = src
+        .lines()
+        .find_map(|l| l.strip_prefix("VD_RC_NOT_VIRTUAL="))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or_else(|| panic!("{REL}: `VD_RC_NOT_VIRTUAL=<数>` が見つからない"));
+
+    // 抜けるとき（assert で落ちたときも）一時 dir を消す。**消す前に一時 dir の下であることを確かめる**
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            if self.0.starts_with(std::env::temp_dir()) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+    let scratch =
+        Scratch(std::env::temp_dir().join(format!("tako-1783-vd-{}", std::process::id())));
+    let dir = &scratch.0;
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).expect("一時 dir を作る");
+    // 蓋を開けた MacBook + 外部モニタ + tako-vd（名前は一般的な既定名）
+    let script = r#"
+. "$HELPER"
+vd_screens() { printf 'Color LCD\t0\t0\t1512\t982\t1\t1\t1\nExternal 4K\t1512\t0\t3840\t2160\t7\t0\t0\ntako-vd\t5352\t0\t2560\t1440\t13\t0\t0\n'; }
+vd_drawable() { printf '1\t1\t0\n7\t1\t0\n13\t1\t0\n'; }
+vd_display_uuid() { printf 'AAAAAAAA-0000-4000-8000-%012d' "${1:-0}"; }
+vd_wake_displays() { echo wake >> "$STUB_LOG"; }
+vd_backend_ready() { echo ready >> "$STUB_LOG"; return 0; }
+vd_backend_list() { printf '17\t13\ttako-vd\n'; }
+vd_bd() { echo "bd $*" >> "$STUB_LOG"; }
+sleep() { :; }
+vd_ensure 2>"$STUB_ERR"
+"#;
+    let run = |name: &str| {
+        let case = dir.join(name.replace(' ', "_"));
+        let _ = std::fs::remove_dir_all(&case);
+        std::fs::create_dir_all(&case).expect("場面の dir を作る");
+        let log = case.join("log");
+        let err = case.join("err");
+        let record = case.join("record");
+        let status = std::process::Command::new("/bin/bash")
+            .arg("-c")
+            .arg(script)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &case)
+            .env("HELPER", repo_root().join(REL))
+            .env("TAKO_VD_NAME", name)
+            .env("TAKO_VD_RECORD_DIR", &record)
+            .env(
+                "TAKO_VD_BETTERDISPLAY_APP",
+                case.join("NoBetterDisplay.app"),
+            )
+            .env("STUB_LOG", &log)
+            .env("STUB_ERR", &err)
+            .status()
+            .expect("/bin/bash を起こす");
+        let recorded: Vec<String> = std::fs::read_dir(&record)
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        (
+            status.code().unwrap_or(-1),
+            std::fs::read_to_string(&log).unwrap_or_default(),
+            std::fs::read_to_string(&err).unwrap_or_default(),
+            recorded,
+        )
+    };
+
+    for (name, why) in [
+        ("Color LCD", "内蔵ディスプレイ"),
+        ("External 4K", "仮想スクリーン一覧に External 4K が無い"),
+    ] {
+        let (rc, log, err, recorded) = run(name);
+        assert_eq!(
+            rc, rc_not_virtual,
+            "{REL}:{at}: TAKO_VD_NAME={name}（物理画面）で ensure が VD_RC_NOT_VIRTUAL（{rc_not_virtual}）で断らない（#1783）\n\
+             stderr: {err}"
+        );
+        let lines: Vec<&str> = err.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert!(
+            lines.len() == 1
+                && lines[0].starts_with(&format!("ERROR: {name} は仮想ディスプレイではない"))
+                && lines[0].contains(why)
+                && lines[0].contains("#1783"),
+            "{REL}:{vat}: TAKO_VD_NAME={name} の理由が「ERROR: {name} は仮想ディスプレイではない…{why}…#1783」の 1 行ではない\
+             （呼び口は {REL}:{at}）: {lines:?}"
+        );
+        assert!(
+            !log.contains("main=on"),
+            "{REL}:{at}: TAKO_VD_NAME={name} で Main 保護が器へ main を撃った（#1783。物理画面を仮想と読んでいる）\n{log}"
+        );
+        assert!(
+            recorded.is_empty(),
+            "{REL}:{at}: TAKO_VD_NAME={name} で物理画面の uuid を記録した（#1783）: {recorded:?}"
+        );
+        assert!(
+            !log.contains("wake"),
+            "{REL}:{at}: TAKO_VD_NAME={name} で面を起こす手立てを撃った（#1783。確認より先に進んでいる）"
+        );
+    }
+    // 内蔵は器に聞かずに決まる（器を起こさない）
+    let (_, log, _, _) = run("Color LCD");
+    assert!(
+        !log.contains("ready"),
+        "{REL}:{vat}: 内蔵の名前で器に聞いている（#1783。内蔵は CoreGraphics の列だけで決まる。呼び口は {REL}:{at}）"
+    );
+
+    // 対照: 本物の tako-vd（器の一覧に居る非内蔵の面）は従来どおり成功して記録する
+    let (rc, _, err, recorded) = run("tako-vd");
+    assert_eq!(
+        rc, 0,
+        "{REL}:{at}: 本物の tako-vd で ensure が失敗した（#1783 で既定の道を壊した）: {err}"
+    );
+    assert_eq!(
+        recorded,
+        vec!["tako-vd.uuid".to_string()],
+        "{REL}:{at}: 本物の tako-vd の uuid を記録していない（#1697 の道を壊した）"
+    );
+    assert!(
+        err.trim().is_empty(),
+        "{REL}:{at}: 本物の tako-vd で余計な出力: {err}"
     );
 }

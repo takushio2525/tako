@@ -78,6 +78,25 @@
 //!     真と未指定では偽の GUI が `TAKO_ISOLATED=1` を受け取ることを見る
 //! 16. [`ヘルパが真と読むtako_isolatedはtakoの読み方と同じ`] — 値ごとにヘルパの判定を
 //!     tako の `is_verification_gui` と突き合わせる
+//!
+//! ## #1783: 面の指定の誤りは面を起こす前に断り、物理画面を指す `TAKO_VD_NAME` も断る
+//!
+//! `TAKO_DISPLAY` の判定（#1760）は面を起こした**後**に在ったので、面を用意できない機（CI など）
+//! では書き方の誤りが終了コード 4（未実測）に紛れていた。判定を面を起こす前へ移し、uuid の
+//! 記録との突き合わせだけを起こした後に残す（記録は `ensure` の締めが書くので、起こす前に読むと
+//! 初回や面の作り直しで正しい uuid を断る）。また面の名前の正本 `TAKO_VD_NAME` に物理画面の
+//! 名前を入れると `ensure` がその面を tako-vd と見なしていた。いまの `ensure` は物理画面なら
+//! 終了コード 3 で断り、ヘルパはそれを使い方の誤り（2）として返す。
+//!
+//! 17. [`ヘルパは面の指定の書き方の誤りを面を起こす前に断る`] — 判定と断る行が面を起こす行より
+//!     前、uuid の突き合わせは面を起こす行と起動行のあいだ。起こす前の判定は係に何も聞かない
+//! 18. [`面を用意できない機でも面の指定の誤りは2で断り面を起こさない`] — 実際に走らせ、
+//!     面を用意できない係の下でも別の面の指定は 2 で断られ、係の `ensure` が呼ばれないことを見る。
+//!     `ensure` が初めて記録を書く機（隔離した HOME）でも、その uuid の指定が通ることを見る
+//! 19. [`名指しされた面が物理画面ならヘルパは起動せずに2で理由を1行出す`] — 係の `ensure` が 3 で
+//!     断ったら偽の GUI が起きず 2 と理由 1 行。他の失敗は従来どおり 4
+//! 20. [`物理画面で断る終了コードが係とヘルパでそろっている`] — `VD_RC_NOT_VIRTUAL` と
+//!     `ISOLATED_GUI_VD_RC_NOT_VIRTUAL` が同じ番号
 
 use std::path::{Path, PathBuf};
 
@@ -564,11 +583,16 @@ impl Drop for Scratch {
 }
 
 /// 面を用意する係の偽物。`STUB_ENSURE_RC` / `STUB_ENSURE_ERR` / `STUB_BOUNDS_RC` /
-/// `STUB_RECORDED_UUID`（空なら記録なし）で振る舞いを決める
+/// `STUB_RECORDED_UUID`（空なら記録なし）で振る舞いを決める。
+/// `STUB_ENSURE_MARK` を置けば `ensure` が呼ばれた回数をそこへ書き（#1783: 面を起こす前に
+/// 断ったかを見る）、`STUB_ENSURE_WRITES_UUID` を置けば `ensure` が初めて記録を
+/// `STUB_RECORD_FILE` へ書く（本物の締めが uuid を記録する形。`recorded-uuid` はそこを読む）
 #[cfg(unix)]
 const STUB_VD: &str = r#"#!/bin/bash
 case "$1" in
   ensure)
+    if [ -n "${STUB_ENSURE_MARK:-}" ]; then echo ensure >> "$STUB_ENSURE_MARK"; fi
+    if [ -n "${STUB_ENSURE_WRITES_UUID:-}" ]; then echo "$STUB_ENSURE_WRITES_UUID" > "$STUB_RECORD_FILE"; fi
     echo "   仮想スクリーン tako-vd を接続"
     [ -n "${STUB_ENSURE_ERR:-}" ] && echo "ERROR: $STUB_ENSURE_ERR" >&2
     exit "${STUB_ENSURE_RC:-0}" ;;
@@ -576,8 +600,9 @@ case "$1" in
     [ "${STUB_BOUNDS_RC:-0}" = 0 ] && echo "0 0 1920 1080"
     exit "${STUB_BOUNDS_RC:-0}" ;;
   recorded-uuid)
-    [ -n "${STUB_RECORDED_UUID:-}" ] || exit 1
-    echo "$STUB_RECORDED_UUID" ;;
+    if [ -n "${STUB_RECORDED_UUID:-}" ]; then echo "$STUB_RECORDED_UUID"; exit 0; fi
+    if [ -n "${STUB_RECORD_FILE:-}" ] && [ -s "$STUB_RECORD_FILE" ]; then cat "$STUB_RECORD_FILE"; exit 0; fi
+    exit 1 ;;
   *) exit 9 ;;
 esac
 "#;
@@ -690,10 +715,11 @@ fn 面を用意できないとヘルパは起動せずに理由を1行出す() {
             "tako-vd を起こせなかった",
         ),
         (
+            // 番号は係が意味を持たせていないもの（3 は「物理画面」= 使い方の誤りの予約。#1783）
             "ensure が非 0 で ERROR 行が無い",
             &vd,
-            &[("STUB_ENSURE_RC", "3")],
-            "終了コード 3",
+            &[("STUB_ENSURE_RC", "7")],
+            "終了コード 7",
         ),
         (
             "ensure は 0 だが OS の一覧に居ない",
@@ -703,10 +729,11 @@ fn 面を用意できないとヘルパは起動せずに理由を1行出す() {
         ),
         ("面を用意する係が無い", &missing, &[], "見つからない"),
         (
+            // 明示の値は tako-vd の名前（通す値）。別の面の明示は面を起こす前に 2 で断る（#1783）
             "呼び出し側が TAKO_DISPLAY を明示していても ensure が非 0",
             &vd,
             &[
-                ("TAKO_DISPLAY", "0"),
+                ("TAKO_DISPLAY", STUB_VD_NAME),
                 ("STUB_ENSURE_RC", "1"),
                 (
                     "STUB_ENSURE_ERR",
@@ -816,6 +843,14 @@ fn ヘルパはtako_vd以外の面の明示を起動の前に断る() {
         judge < launch && refuse < launch,
         "{HELPER_REL}:{judge}: 面の指定の判定（断る行 {HELPER_REL}:{refuse}）が \
          GUI を起こす行（{HELPER_REL}:{launch}）より後ろに在る（#1760）"
+    );
+    // 面を起こす前でもある（#1783）。詳しい拘束は 17 の検査
+    let (ensure, _, _) = refusal_lines(&src);
+    assert!(
+        refuse < ensure,
+        "{HELPER_REL}:{judge}: 面の指定の判定（断る行 {HELPER_REL}:{refuse}）が面を起こす行\
+         （{HELPER_REL}:{ensure}）より後ろに在る = 面を用意できない機では書き方の誤りが \
+         4（未実測）に紛れる（#1783）"
     );
     // GUI へ渡すのは判定した値。呼び出し側の `VAR=VAL`（"$@"）より後ろに置かないと、
     // 判定と違う値が GUI へ届く道が残る
@@ -1547,4 +1582,323 @@ fn ヘルパが真と読むtako_isolatedはtakoの読み方と同じ() {
             r.stderr
         );
     }
+}
+
+// --------------------------------------------- 17. 面の指定の誤りは面を起こす前に断る（#1783）
+
+/// `launch_isolated_gui` の中の `(面を起こす行, uuid を突き合わせる行, その断る行, GUI を起こす行)`
+fn uuid_check_lines(src: &str) -> (usize, Option<usize>, Option<usize>, usize) {
+    let (body, at) = fn_body(HELPER_REL, src, "launch_isolated_gui()");
+    let ensure = find(&body, "iso_ensure_display").unwrap_or_else(|| {
+        panic!("{HELPER_REL}:{at}: launch_isolated_gui が面を起こしていない（#1490）")
+    });
+    let launch = find(&body, "\"$APP_BIN\"").unwrap_or_else(|| {
+        panic!("{HELPER_REL}:{at}: launch_isolated_gui が GUI を起こす行が見つからない")
+    });
+    let check = body
+        .iter()
+        .find(|(_, l)| {
+            l.trim_start()
+                .starts_with("if ! iso_display_uuid_recorded \"$display\"")
+        })
+        .map(|(n, _)| *n);
+    let refuse = check.and_then(|c| {
+        body.iter()
+            .find(|(n, l)| *n > c && l.contains("return \"$ISOLATED_GUI_RC_FOREIGN_DISPLAY\""))
+            .map(|(n, _)| *n)
+    });
+    (ensure, check, refuse, launch)
+}
+
+#[test]
+fn ヘルパは面の指定の書き方の誤りを面を起こす前に断る() {
+    let src = read(HELPER_REL);
+    let (judge, refuse, _) = foreign_refusal_lines(&src);
+    let (ensure, check, uuid_refuse, launch) = uuid_check_lines(&src);
+    let judge = judge.unwrap_or_else(|| {
+        panic!("{HELPER_REL}:{ensure}: 面の指定を判定せずに面を起こしている（#1760 / #1783）")
+    });
+    let refuse = refuse.unwrap_or_else(|| {
+        panic!("{HELPER_REL}:{judge}: 面の指定を判定しても断っていない（#1760）")
+    });
+    assert!(
+        judge < ensure && refuse < ensure,
+        "{HELPER_REL}:{judge}: 面の指定の判定（断る行 {HELPER_REL}:{refuse}）が面を起こす行\
+         （{HELPER_REL}:{ensure}）より後ろに在る（#1783）。\n\
+         → 面を用意できない機（CI）では書き方の誤りが 4（未実測）に紛れる。\
+         `if ! iso_display_allowed \"$display\"` を面を起こす前へ置く"
+    );
+
+    // 起こす前の判定は係に何も聞かない（係に聞くと、起こす前の古い記録で正しい uuid を断る /
+    // 面を用意できない機で判定そのものが揺れる）
+    let (allowed, allowed_at) = fn_body(HELPER_REL, &src, "iso_display_allowed()");
+    for needle in ["recorded-uuid", "ISOLATED_GUI_VD", "virtual-display.sh"] {
+        if let Some((n, l)) = allowed.iter().find(|(_, l)| l.contains(needle)) {
+            panic!(
+                "{HELPER_REL}:{n}: 面を起こす前の判定（iso_display_allowed。{HELPER_REL}:{allowed_at}）が\
+                 係（{needle}）に聞いている（#1783）\n    {}\n\
+                 → uuid の記録との突き合わせは面を起こした後の iso_display_uuid_recorded で行う",
+                l.trim()
+            );
+        }
+    }
+
+    // uuid の記録との突き合わせは面を起こした後・起動の前（記録は ensure の締めが書く）
+    let check = check.unwrap_or_else(|| {
+        panic!(
+            "{HELPER_REL}:{ensure}: uuid の指定を ensure の記録と突き合わせていない（#1760 / #1783）。\n\
+             → 面を起こした後に `if ! iso_display_uuid_recorded \"$display\"; then …; \
+             return \"$ISOLATED_GUI_RC_FOREIGN_DISPLAY\"; fi` を置く（違う uuid が GUI へ届く）"
+        )
+    });
+    let uuid_refuse = uuid_refuse.unwrap_or_else(|| {
+        panic!("{HELPER_REL}:{check}: uuid を突き合わせても断っていない（#1760）")
+    });
+    assert!(
+        ensure < check,
+        "{HELPER_REL}:{check}: uuid の記録との突き合わせが面を起こす行（{HELPER_REL}:{ensure}）より\
+         前に在る（#1783）。\n\
+         → 記録は ensure の締めが書くので、起こす前だと初回（記録なし）や面の作り直しで\
+         いまの tako-vd の uuid を断る"
+    );
+    assert!(
+        uuid_refuse < launch,
+        "{HELPER_REL}:{uuid_refuse}: uuid で断る行が GUI を起こす行（{HELPER_REL}:{launch}）より後ろに在る（#1760）"
+    );
+    let (uuid_body, uuid_at) = fn_body(HELPER_REL, &src, "iso_display_uuid_recorded()");
+    assert!(
+        find(&uuid_body, "recorded-uuid").is_some(),
+        "{HELPER_REL}:{uuid_at}: iso_display_uuid_recorded が ensure の記録（recorded-uuid）を読んでいない（#1760）"
+    );
+}
+
+// --------------------------------------------- 18. 実際に走らせて面を起こさずに断ることを見る（#1783）
+
+#[cfg(unix)]
+#[test]
+fn 面を用意できない機でも面の指定の誤りは2で断り面を起こさない() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = Scratch::new("before-ensure");
+    let vd = scratch.0.join("virtual-display.sh");
+    std::fs::write(&vd, STUB_VD).expect("偽の係を書く");
+    std::fs::set_permissions(&vd, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let src = read(HELPER_REL);
+    let (judge, _, launch) = foreign_refusal_lines(&src);
+    let judge_at = judge.unwrap_or(launch);
+    let (ensure, check, _, _) = uuid_check_lines(&src);
+    let check_at = check.unwrap_or(launch);
+
+    // 面を用意できない係（蓋閉じ + ディスプレイスリープ / 器なし）の下で、書き方の誤りを流す
+    let bad = [
+        "TAKO_DISPLAY=0",
+        "TAKO_DISPLAY=index:1",
+        "TAKO_DISPLAY=Built-in Retina Display",
+        "TAKO_DISPLAY=no-such-display-1783",
+    ];
+    for (i, arg) in bad.iter().enumerate() {
+        for (tag, ensure_rc) in [("面を用意できない係", "1"), ("面を用意できる係", "0")]
+        {
+            let mark = scratch.0.join(format!("ensure-{i}-{ensure_rc}"));
+            let _ = std::fs::remove_file(&mark);
+            let mark_s = mark.to_str().expect("一時 dir は UTF-8");
+            let r = run_helper(
+                &scratch,
+                &vd,
+                &[
+                    ("STUB_ENSURE_RC", ensure_rc),
+                    (
+                        "STUB_ENSURE_ERR",
+                        "tako-vd を起こせなかった（描画可能にならない）",
+                    ),
+                    ("STUB_ENSURE_MARK", mark_s),
+                ],
+                &[arg],
+            );
+            assert!(
+                r.started.is_none(),
+                "{HELPER_REL}:{judge_at}: 書き方の誤った面の指定（{arg}・{tag}）で GUI を起動した（#1760）"
+            );
+            assert_eq!(
+                r.rc, 2,
+                "{HELPER_REL}:{judge_at}: 書き方の誤った面の指定（{arg}・{tag}）の終了コードが 2 ではない\
+                 （#1783。4 なら判定が面を起こす行 {HELPER_REL}:{ensure} より後ろへ戻り、\
+                 未実測に紛れている）\nstderr: {}",
+                r.stderr
+            );
+            let lines: Vec<&str> = r.stderr.lines().filter(|l| !l.trim().is_empty()).collect();
+            assert!(
+                lines.len() == 1 && lines[0].starts_with("ERROR: TAKO_DISPLAY=") && lines[0].contains("#1760"),
+                "{HELPER_REL}:{judge_at}: 理由が「ERROR: TAKO_DISPLAY=… #1760」の 1 行ではない（{arg}・{tag}）: {lines:?}"
+            );
+            assert!(
+                !mark.exists(),
+                "{HELPER_REL}:{ensure}: 書き方の誤った面の指定（{arg}・{tag}）なのに面を起こした（#1783）。\n\
+                 → 判定（{HELPER_REL}:{judge_at}）は係の ensure より前で断る"
+            );
+        }
+    }
+
+    // 対照: ensure が**初めて**記録を書く機（隔離した HOME = test-display-uuid-1697.sh の形）でも、
+    // その uuid の指定は通る = 突き合わせは面を起こした後（起こす前へ移すと、ここで 2 になる）
+    const FRESH_UUID: &str = "22222222-3333-4444-8555-666666666666";
+    let record = scratch.0.join("fresh-record");
+    let _ = std::fs::remove_file(&record);
+    let record_s = record.to_str().expect("一時 dir は UTF-8");
+    let arg = format!("TAKO_DISPLAY={FRESH_UUID}");
+    let r = run_helper(
+        &scratch,
+        &vd,
+        &[
+            ("STUB_ENSURE_WRITES_UUID", FRESH_UUID),
+            ("STUB_RECORD_FILE", record_s),
+        ],
+        &[arg.as_str()],
+    );
+    assert_eq!(
+        r.rc, 0,
+        "{HELPER_REL}:{check_at}: ensure が初めて記録した tako-vd の uuid を断った（#1783）。\n\
+         → uuid の突き合わせが面を起こす行（{HELPER_REL}:{ensure}）より前へ移っている\nstderr: {}",
+        r.stderr
+    );
+    assert_eq!(
+        r.started.as_deref().map(|s| s.trim_end_matches('\n')),
+        Some(arg.as_str()),
+        "{HELPER_REL}:{launch}: 記録と一致する uuid が GUI へそのまま渡っていない（#1760）"
+    );
+    // 起こした後の突き合わせは生きている（記録と違う uuid は、記録を書いた後でも 2）
+    let _ = std::fs::remove_file(&record);
+    let other = "TAKO_DISPLAY=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    let r = run_helper(
+        &scratch,
+        &vd,
+        &[
+            ("STUB_ENSURE_WRITES_UUID", FRESH_UUID),
+            ("STUB_RECORD_FILE", record_s),
+        ],
+        &[other],
+    );
+    assert!(
+        r.started.is_none() && r.rc == 2,
+        "{HELPER_REL}:{check_at}: ensure の記録と違う uuid を通した（#1760）: rc={} stderr: {}",
+        r.rc,
+        r.stderr
+    );
+}
+
+// --------------------------------------------- 19. 物理画面を指す TAKO_VD_NAME を断る（#1783）
+
+#[cfg(unix)]
+#[test]
+fn 名指しされた面が物理画面ならヘルパは起動せずに2で理由を1行出す() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = Scratch::new("not-virtual");
+    let vd = scratch.0.join("virtual-display.sh");
+    std::fs::write(&vd, STUB_VD).expect("偽の係を書く");
+    std::fs::set_permissions(&vd, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let src = read(HELPER_REL);
+    let (ensure, _, launch) = refusal_lines(&src);
+    let (_, ens_at) = fn_body(HELPER_REL, &src, "iso_ensure_display()");
+    let vd_rc = shell_const(VD_REL, "VD_RC_NOT_VIRTUAL").to_string();
+
+    // 係の ensure が「物理画面」で断る（本物の文面の形）
+    let why = "Color LCD は仮想ディスプレイではないので使わない: Color LCD は内蔵ディスプレイ（CGDisplayIsBuiltin）";
+    let r = run_helper(
+        &scratch,
+        &vd,
+        &[("STUB_ENSURE_RC", vd_rc.as_str()), ("STUB_ENSURE_ERR", why)],
+        &[],
+    );
+    assert!(
+        r.started.is_none(),
+        "{HELPER_REL}:{launch}: 係が物理画面と断ったのに GUI を起動した（#1783）"
+    );
+    assert_eq!(
+        r.rc, 2,
+        "{HELPER_REL}:{ensure}: 係が物理画面と断ったときの終了コードが 2 ではない（#1783。\
+         4 は未実測 = 環境が揃わない番号で、TAKO_VD_NAME の渡し方の誤りを見逃させる。\
+         係の番号の読み取りは {HELPER_REL}:{ens_at}）\nstderr: {}",
+        r.stderr
+    );
+    let lines: Vec<&str> = r.stderr.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "{HELPER_REL}:{ensure}: 理由が 1 行ではない: {lines:?}"
+    );
+    assert!(
+        lines[0].starts_with("ERROR: TAKO_VD_NAME=")
+            && lines[0].contains("#1783")
+            && lines[0].contains("内蔵ディスプレイ"),
+        "{HELPER_REL}:{ensure}: 理由の 1 行が「ERROR: TAKO_VD_NAME=…（係の理由）… #1783」になっていない: {}",
+        lines[0]
+    );
+
+    // 対照: 係の他の失敗は従来どおり 4（未実測）。3 以外を使い方の誤りと読ませない
+    let r = run_helper(
+        &scratch,
+        &vd,
+        &[
+            ("STUB_ENSURE_RC", "1"),
+            ("STUB_ENSURE_ERR", "tako-vd を起こせなかった"),
+        ],
+        &[],
+    );
+    assert!(
+        r.started.is_none() && r.rc == 4 && r.stderr.starts_with("未実測: "),
+        "{HELPER_REL}:{ensure}: 面を用意できない失敗が 4（未実測）ではなくなった（#1744）: rc={} stderr: {}",
+        r.rc,
+        r.stderr
+    );
+}
+
+// --------------------------------------------- 20. 番号の突き合わせ（#1783）
+
+/// `NAME=<数>` の行から数を読む（行頭・字下げなし。見つからなければ FAILED）
+fn shell_const(rel: &str, name: &str) -> u32 {
+    shell_const_at(rel, name).0
+}
+
+/// `NAME=<数>` の `(数, 行番号)`（file:line で名指すため）
+fn shell_const_at(rel: &str, name: &str) -> (u32, usize) {
+    let src = read(rel);
+    let prefix = format!("{name}=");
+    src.lines()
+        .enumerate()
+        .find_map(|(i, l)| {
+            l.strip_prefix(prefix.as_str())
+                .and_then(|v| v.trim().parse().ok())
+                .map(|v| (v, i + 1))
+        })
+        .unwrap_or_else(|| panic!("{rel}: `{name}=<数>` が見つからない"))
+}
+
+#[test]
+fn 物理画面で断る終了コードが係とヘルパでそろっている() {
+    let (vd, vd_at) = shell_const_at(VD_REL, "VD_RC_NOT_VIRTUAL");
+    let (helper, helper_at) = shell_const_at(HELPER_REL, "ISOLATED_GUI_VD_RC_NOT_VIRTUAL");
+    assert_eq!(
+        vd, helper,
+        "{HELPER_REL}:{helper_at}: ISOLATED_GUI_VD_RC_NOT_VIRTUAL（{helper}）が {VD_REL}:{vd_at} の \
+         VD_RC_NOT_VIRTUAL（{vd}）とずれている（#1783）。\n\
+         → ずれるとヘルパは物理画面の拒否を「面を用意できない = 未実測（4）」と読む"
+    );
+    // 係の番号は「面を用意できない」（1）と分ける
+    assert_ne!(
+        vd, 1,
+        "{VD_REL}:{vd_at}: VD_RC_NOT_VIRTUAL が 1（面を用意できない）と同じ番号（#1783）"
+    );
+    let (rc, rc_at) = shell_const_at(HELPER_REL, "ISOLATED_GUI_RC_NOT_VIRTUAL");
+    assert_eq!(
+        rc, 2,
+        "{HELPER_REL}:{rc_at}: ISOLATED_GUI_RC_NOT_VIRTUAL が 2 ではない（#1783。#1760 / #1784 と同じ「使い方の誤り」）"
+    );
+    // ヘルパは係の番号を名前で読む（数字の直書きは番号がずれても気づけない）
+    let src = read(HELPER_REL);
+    let (body, at) = fn_body(HELPER_REL, &src, "iso_ensure_display()");
+    assert!(
+        find(&body, "$ISOLATED_GUI_VD_RC_NOT_VIRTUAL").is_some(),
+        "{HELPER_REL}:{at}: iso_ensure_display が係の終了コードを ISOLATED_GUI_VD_RC_NOT_VIRTUAL で見ていない（#1783）"
+    );
 }

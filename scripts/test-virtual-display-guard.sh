@@ -7,7 +7,7 @@
 # （vd_clamshell_raw）・器の実体数（vd_backend_instances）をすべてスタブへ差し替え、
 # 一時ディレクトリのテーブルだけを相手にする。CI（ランナーに画面が無い）でも走る。
 #
-# 見ているのは 5 点:
+# 見ているのは 7 点:
 #   1. 同名の面が 2 枚以上になったら ensure が理由つきで止まる（#1150 の増殖）
 #   2. Main 保護は「内蔵あり かつ Main が仮想」のときだけ器へ main を撃つ
 #   3. 孤児の後片付けは実行条件（内蔵が NSScreen に居る + 蓋開き）を満たすまで拒否する
@@ -17,6 +17,8 @@
 #      NSScreen に居るだけで通すと、面は在るのに tako から見えず検証が始まらない
 #   6. ensure の締めが面の uuid を記録する（#1697）。名前が読めない瞬間に tako が
 #      uuid で当てる材料で、読めなくても ensure は失敗させない・同じ値なら書かない
+#   7. 名指しされた面が物理画面なら ensure が断る（#1783）。TAKO_VD_NAME に内蔵・外部モニタの
+#      名前を渡しても tako-vd と見なさない（uuid の記録・Main 保護へ進む前に止まる）
 set -uo pipefail
 cd "$(dirname "$0")/.."
 PASS=0
@@ -66,7 +68,16 @@ vd_display_uuid() {
 }
 vd_backend_instances() { printf '%s' "${STUB_INSTANCES:-1}"; }
 vd_backend_strays() { printf '%s' "${STUB_STRAYS:-}"; }
-vd_backend_ready() { return 0; }
+# 器が応答するか（#1783 で聞いた回数も数える）。STUB_BACKEND_DOWN を立てれば「器に聞けない」
+READY_LOG="$TMP/ready.log"
+: > "$READY_LOG"
+vd_backend_ready() { echo ready >> "$READY_LOG"; [ -z "${STUB_BACKEND_DOWN:-}" ]; }
+# 器の仮想スクリーン一覧（#1783。tagID<TAB>displayID<TAB>name）。既定は「tako-vd が器の仮想
+# スクリーン」。STUB_BACKEND_LIST を立てればそれが答えになる（空文字なら「仮想スクリーンが 0 枚」）
+vd_backend_list() {
+    if [ -n "${STUB_BACKEND_LIST+x}" ]; then printf '%s' "$STUB_BACKEND_LIST"; return 0; fi
+    printf '17\t13\ttako-vd\n'
+}
 # 器へ渡した引数を記録し、「効いた後」のテーブルへ差し替える（応答文ではなく
 # 読み戻しで確かめる本物の作法を、スタブ側でも再現する）
 vd_bd() {
@@ -84,11 +95,12 @@ set_table() { printf '%s\n' "$1" > "$TABLE"; }
 set_clamshell() { printf '  |   "AppleClamshellState" = %s\n' "$1" > "$CLAMSHELL"; }
 no_clamshell() { : > "$CLAMSHELL"; }
 reset_bd() {
-    : > "$BD_LOG"; : > "$WAKE_LOG"
+    : > "$BD_LOG"; : > "$WAKE_LOG"; : > "$READY_LOG"
     rm -f "$TMP/table.after-main" "$TMP/table.after-restart" "$TMP/drawable" "$TMP/drawable.after-wake"
 }
 bd_log() { cat "$BD_LOG"; }
 wake_count() { grep -c . "$WAKE_LOG" 2>/dev/null || true; }
+ready_count() { grep -c . "$READY_LOG" 2>/dev/null || true; }
 # 眠っている状態を作る（$1 = 起きている id を列挙。省略なら全部眠っている）
 set_drawable() { printf '%s\n' "$1" > "$TMP/drawable"; }
 
@@ -381,6 +393,87 @@ assert_lacks "uuid を全桁は出さない（貼り付けで広まらないよ�
 STUB_UUID="CCCCCCCC-0000-4000-8000-000000000099"
 assert_has "作り直された面とは不一致と出す" "不一致" "$(vd_status 2>&1)"
 unset STUB_UUID
+
+echo "== Test 21: 仮想ディスプレイかの判定（純関数。#1783）=="
+LIST_VD=$(t '17\t13\ttako-vd')
+v=$(printf '%s\n' "$FIX_OK" | vd_virtual_verdict tako-vd "$LIST_VD" 1); rc=$?
+assert_eq "器の一覧に居る非内蔵の面は virtual（終了 0）" "$v/$rc" "virtual/0"
+v=$(printf '%s\n' "$FIX_OK" | vd_virtual_verdict "Color LCD" "$LIST_VD" 1); rc=$?
+assert_eq "内蔵は physical（終了 1）" "$rc" "1"
+assert_has "理由は内蔵（CoreGraphics）" "内蔵ディスプレイ（CGDisplayIsBuiltin）" "$v"
+v=$(printf '%s\n' "$FIX_OK" | vd_virtual_verdict "Color LCD" "" 0); rc=$?
+assert_eq "内蔵は器の一覧を読まなくても physical" "$rc" "1"
+v=$(printf '%s\n' "$FIX_OK" | vd_virtual_verdict "Color LCD" "$(t '17\t13\tColor LCD')" 1); rc=$?
+assert_eq "器に同じ名前の仮想スクリーンがあっても内蔵は内蔵" "$rc" "1"
+v=$(printf '%s\n' "$FIX_EXTERNAL_MAIN" | vd_virtual_verdict "External 4K" "$LIST_VD" 1); rc=$?
+assert_eq "器の一覧に無い外部モニタは physical" "$rc" "1"
+assert_has "理由は器の一覧に無いこと" "仮想スクリーン一覧に External 4K が無い" "$v"
+v=$(printf '%s\n' "$FIX_EXTERNAL_MAIN" | vd_virtual_verdict "External 4K" "" 0); rc=$?
+assert_eq "器の一覧を読めなければ unknown（終了 2）" "$rc" "2"
+v=$(printf '%s\n' "$FIX_OK" | vd_virtual_verdict tako-vd "" 1); rc=$?
+assert_eq "器が応答して仮想スクリーンが 0 枚なら physical" "$rc" "1"
+v=$(printf '%s\n' "$FIX_OK" | vd_virtual_verdict tako-vd "$(t '17\t\ttako-vd')" 1); rc=$?
+assert_eq "displayID が空の行でも名前を読み違えない" "$v/$rc" "virtual/0"
+v=$(printf '%s\n' "$FIX_OK" | vd_virtual_verdict tako-vd "$(t '17\t13\ttako-vd-other')" 1); rc=$?
+assert_eq "前方一致では通さない（完全一致）" "$rc" "1"
+v=$(printf '%s\n' "$FIX_OK" | vd_virtual_verdict no-such "$LIST_VD" 1); rc=$?
+assert_eq "OS の一覧に居ない名前は unknown" "$rc" "2"
+v=$(printf '%s\n' "$FIX_DUP" | vd_virtual_verdict tako-vd "$LIST_VD" 1); rc=$?
+assert_eq "枝番付き（増殖）も器の面と読む（増殖の検査は vd_assert_single の仕事）" "$v/$rc" "virtual/0"
+FIX_JA=$(t '検証 用 vd\t0\t0\t2560\t1440\t21\t0\t1')
+v=$(printf '%s\n' "$FIX_JA" | vd_virtual_verdict "検証 用 vd" "$(t '17\t21\t検証 用 vd')" 1); rc=$?
+assert_eq "空白・日本語を含む名前でも一致で読む" "$v/$rc" "virtual/0"
+
+echo "== Test 22: ensure は物理画面の名前で断る（#1783 の本体）=="
+reset_bd; set_table "$FIX_OK"; set_clamshell No; set_drawable "$(t '1\t1\t0\n13\t1\t0')"
+rm -rf "$VD_RECORD_DIR"
+VD_NAME="Color LCD"
+out=$(vd_ensure 2>&1); rc=$?
+assert_eq "内蔵の名前は終了コード VD_RC_NOT_VIRTUAL（3）" "$rc" "$VD_RC_NOT_VIRTUAL"
+assert_eq "終了コードの値" "$VD_RC_NOT_VIRTUAL" "3"
+assert_eq "理由は 1 行" "$(printf '%s\n' "$out" | grep -c .)" "1"
+assert_has "理由の行は ERROR と名前と #1783" "ERROR: Color LCD は仮想ディスプレイではない" "$out"
+assert_has "理由に #1783" "#1783" "$out"
+assert_eq "内蔵の名前なら器に聞かずに断る" "$(ready_count)" "0"
+assert_lacks "Main 保護へ進まない（物理画面を仮想と読んで main を撃たない）" "main=on" "$(bd_log)"
+assert_eq "物理画面の uuid を記録しない" "$(ls "$VD_RECORD_DIR" 2>/dev/null)" ""
+assert_eq "起こす手立ても撃たない" "$(wake_count)" "0"
+reset_bd; set_table "$FIX_EXTERNAL_MAIN"; set_drawable "$(t '1\t1\t0\n7\t1\t0\n13\t1\t0')"
+VD_NAME="External 4K"
+out=$(vd_ensure 2>&1); rc=$?
+assert_eq "器の一覧に無い外部モニタも 3" "$rc" "3"
+assert_has "理由は器の一覧に無いこと" "仮想スクリーン一覧に External 4K が無い" "$out"
+assert_eq "物理画面の uuid を記録しない（外部）" "$(ls "$VD_RECORD_DIR" 2>/dev/null)" ""
+reset_bd; STUB_BACKEND_DOWN=1
+out=$(vd_ensure 2>&1); rc=$?
+assert_eq "器に聞けなければ確かめられない = 1（通さない）" "$rc" "1"
+assert_has "確かめられないと言う" "確かめられないので使わない" "$out"
+assert_eq "確かめられないときも記録しない" "$(ls "$VD_RECORD_DIR" 2>/dev/null)" ""
+reset_bd; set_table "$FIX_OK"; VD_NAME="Color LCD"
+out=$(vd_ensure 2>&1); rc=$?
+assert_eq "器に聞けなくても内蔵は 3（器に頼らず決まる）" "$rc" "3"
+unset STUB_BACKEND_DOWN
+# 画面が 1 枚だけ（蓋閉じで tako-vd だけ）の構成は従来どおり通る
+reset_bd; set_table "$(t 'tako-vd\t0\t0\t2560\t1440\t6\t0\t1')"; set_drawable "$(t '6\t1\t0')"
+VD_NAME=tako-vd
+out=$(vd_ensure 2>&1); rc=$?
+assert_eq "tako-vd だけの 1 枚構成は 0" "$rc" "0"
+assert_lacks "tako-vd では断らない" "仮想ディスプレイではない" "$out"
+# 画面が内蔵 1 枚だけでその名前を渡されたら 3
+reset_bd; set_table "$(t 'Color LCD\t0\t0\t1512\t982\t1\t1\t1')"; set_drawable "$(t '1\t1\t0')"
+VD_NAME="Color LCD"
+out=$(vd_ensure 2>&1); rc=$?
+assert_eq "内蔵 1 枚だけの機でその名前は 3" "$rc" "3"
+# 器が作った空白・日本語の名前は通る（TAKO_VD_NAME の上書き自体は壊さない）
+reset_bd; set_table "$FIX_JA"; set_drawable "$(t '21\t1\t0')"; rm -rf "$VD_RECORD_DIR"
+STUB_BACKEND_LIST=$(t '17\t21\t検証 用 vd')
+VD_NAME="検証 用 vd"
+out=$(vd_ensure 2>&1); rc=$?
+assert_eq "器が作った空白・日本語の名前は 0" "$rc" "0"
+assert_eq "その面の uuid は記録する" "$(ls "$VD_RECORD_DIR" 2>/dev/null)" "検証 用 vd.uuid"
+unset STUB_BACKEND_LIST
+VD_NAME=tako-vd
+rm -rf "$VD_RECORD_DIR"
 
 echo
 echo "PASS=${PASS} FAIL=${FAIL}"
