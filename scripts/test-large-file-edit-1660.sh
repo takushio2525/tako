@@ -14,6 +14,10 @@
 #   ⑤ CLI と MCP: ちょうど上限（10 万行 / 10,000,000 バイト）は編集できる・上限 + 1 行 /
 #      + 1 バイトは**理由と値つきで**断る（CLI と MCP で同じ文面）・`tako edit status` の
 #      `limit`・改行の無い 10 MB の 1 行・CRLF の 10 万行（保存しても CR が残る）
+#   ⑥ visual-test 節 `large-file-decor`（10 万行 / 10 MB の LF と CRLF・偽の言語サーバあり）:
+#      末尾近くの行で、閲覧中の ⌘F の検索の強調・⌘ホバーの下線・診断の波線が実ピクセルで
+#      描かれる / 編集中に検索欄へ打って絞った強調 / 10 万か所の全置換 → undo で元とバイト一致。
+#      描いた行頭がバッファの行頭索引と一致することも見る（#1800 / #1802 との合流で足した）
 #
 # 数字は出力するだけで判定に使わない（`.agent/conventions.md`「効果を測る単体テストは
 # 実時間で比べない」）。判定は「編集できる / 断る / 本文とディスクのバイト一致」だけ。
@@ -91,18 +95,19 @@ print(cur if isinstance(cur, str) else json.dumps(cur, ensure_ascii=False, sort_
 ' "$1"
 }
 
-# visual-test 節を 1 回走らせて、終わるまで**状態で**待つ（上限 600 秒）
+# visual-test 節を 1 回走らせて、終わるまで**状態で**待つ（上限 600 秒）。
+# 節は `SECTION`（既定 large-file-edit）で選ぶ
 run_section() { # ログ 追加の env…
-  local log="$1"
+  local log="$1" section="${SECTION:-large-file-edit}"
   shift
-  launch_isolated_gui "$log" TAKO_VISUAL_TEST=1 TAKO_VISUAL_ONLY=large-file-edit "$@" || exit $?
+  launch_isolated_gui "$log" TAKO_VISUAL_TEST=1 TAKO_VISUAL_ONLY="$section" "$@" || exit $?
   local pid="$ISOLATED_GUI_PID" i
   for i in $(seq 1 6000); do
     kill -0 "$pid" 2>/dev/null || break
     sleep 0.1
   done
   stop_isolated_gui "$pid"
-  grep "TAKO_VISUAL_PIXEL: large-file-edit" "$log" | sed 's/^/    /'
+  grep "TAKO_VISUAL_PIXEL: $section" "$log" | sed 's/^/    /'
   if grep -q "TAKO_VISUAL_TEST_OK" "$log"; then
     return 0
   fi
@@ -314,6 +319,26 @@ PY
 "$TAKO_BIN" close --pane "$P" --force >/dev/null 2>&1
 stop_isolated_gui "$CLI_GUI_PID"
 CLI_GUI_PID=""
+
+echo
+echo "⑥ 10 万行 / 10 MB の装飾（LF / CRLF・偽の言語サーバあり）"
+if SECTION=large-file-decor run_section "$TMP/decor.log" \
+  TAKO_LSP_BIN_RUST_ANALYZER="$FAKE" TAKO_LSP_FAKE_DIAGNOSTICS="$TMP/decor-diagnostics.json"; then
+  pass "節が緑（閲覧中の検索・⌘ホバー・診断の波線・検索欄への打鍵・全置換 → undo）"
+else
+  fail "節が緑にならない（装飾）"
+fi
+for CASE in lf crlf; do
+  for PHASE in view-search hover diagnostic edit-search after-undo; do
+    if grep -q "large-file-decor $CASE $PHASE SKIPPED" "$TMP/decor.log"; then
+      fail "$CASE の $PHASE が未実測（SKIPPED）"
+    elif grep -q "large-file-decor $CASE $PHASE " "$TMP/decor.log"; then
+      pass "$CASE の $PHASE を実ピクセルで見た"
+    else
+      fail "$CASE の $PHASE の行が出ていない"
+    fi
+  done
+done
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

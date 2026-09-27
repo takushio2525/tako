@@ -5307,8 +5307,20 @@ mod large_file_tests {
                     7 => {
                         edit.buffer.redo();
                     }
+                    // #1653: 置換は大文字小文字の区別 × 単語単位の 4 条件と 1 件 / 全件を混ぜる
+                    // （どれも `apply_edit` を通るので、塗りと行テキストの差し替えも同じ経路）
                     _ => {
-                        let _ = edit.buffer.replace_all("let", "let ");
+                        let options = SearchOptions {
+                            case_sensitive: rng.below(2) == 0,
+                            whole_word: rng.below(2) == 0,
+                        };
+                        let query = ["let", "LET", "fn", "s"][rng.below(4)];
+                        let replacement = ["let ", "\n", "Let\n//"][rng.below(3)];
+                        let _ = if rng.below(2) == 0 {
+                            edit.buffer.replace_all(query, replacement, options)
+                        } else {
+                            edit.buffer.replace_next(query, replacement, options)
+                        };
                     }
                 }
                 apply_editor_text(&mut preview, &mut edit);

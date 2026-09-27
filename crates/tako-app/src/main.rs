@@ -2372,9 +2372,13 @@ struct TakoApp {
     /// プレビューの行ごとのプレーンテキスト（選択テキスト抽出用）。
     /// **仮想化しても全行ぶんを持つ**（⌘A / コピー / ヒットテストの正）
     preview_line_texts: HashMap<PaneId, Vec<String>>,
-    /// `preview_line_texts` / `preview_line_starts` を作った表示行の版（#1660）。
-    /// `PreviewState::content_rev` と同じなら render は作り直さない（10 万行で 1 フレーム 7.8ms）
-    preview_line_cache_rev: HashMap<PaneId, u64>,
+    /// `preview_line_texts` / `preview_line_starts` を作った表示行の版と、行頭の出どころ（#1660）。
+    /// 版が `PreviewState::content_rev` と同じなら render は行テキストを作り直さない
+    /// （10 万行で 1 フレーム 7.8ms）。出どころは編集セッションのバッファの版（無ければ `None` =
+    /// 表示行から数えた）で、これが変わったら行頭だけ取り直す。表示行の版だけを鍵にすると、
+    /// 閲覧中の ⌘F（セッションが生えるだけで表示行は変わらない）で表示行から数えた行頭が残り、
+    /// CRLF の文書で検索の強調が 1 行につき 1 バイトずつ手前へずれる
+    preview_line_cache_rev: HashMap<PaneId, (u64, Option<u64>)>,
     /// Markdown プレビュー内リンクの当たり判定（#680）。render で「選択と同じ
     /// 行・バイト範囲」の座標系で記録し、⌘+ホバー / ⌘+クリックがこれを引く
     /// （CLI / MCP 一覧は PreviewHost::preview_md_links が別途数え直す）
@@ -41512,6 +41516,13 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1660: 10 万行 / 10 MB の末尾近くで検索の強調・⌘ホバーの下線・診断の波線が
+                // 描かれるか（LF / CRLF）。素材が大きいので全節実行の並びには入れない
+                "large-file-decor" => {
+                    large_file_decor_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1677: ジャンプ履歴の戻る / 進むが実 GUI の打鍵経路で効くか
                 "jump-keys" => {
                     jump_keys_visual(any, window, cx).await;
@@ -41550,7 +41561,8 @@ mod self_test {
                          remote-tree / flicker / ime-preedit / screen-lines / \
                          pane-border / tasks-panel / task-attachment / \
                          tasks-accordion / shelve-tab / no-emoji / editor-keys / \
-                         run-command-truncate / viewport-lines / jump-keys / search-case / goto-hover）"
+                         run-command-truncate / viewport-lines / jump-keys / search-case / goto-hover / \
+                         large-file-edit / large-file-decor）"
                     );
                     std::process::exit(1);
                 }
@@ -46218,6 +46230,752 @@ mod self_test {
         });
         let _ = std::fs::remove_dir_all(&dir);
         println!("TAKO_VISUAL_PIXEL: large-file-edit ok");
+    }
+
+    /// #1660 × #1653 / #1679 / #1680: 10 万行 / 10 MB の文書の**末尾近くの行**で、検索の強調・
+    /// ⌘ホバーの下線・診断の波線が実ピクセルで描かれるか（LF と CRLF の 2 本）。
+    ///
+    /// #1660 は描画の下ごしらえ（行テキストと行頭）を表示行の版（`content_rev`）で使い回す。
+    /// 行頭は検索ヒットを行へ割り当てる座標、行テキストは ⌘ホバーの識別子を切る材料なので、
+    /// 版が進まずに材料だけ変わる経路で古いまま残ると装飾がずれる。実例が閲覧中の ⌘F で、
+    /// 編集セッションが生えるだけで表示行は変わらない（版が進まない）ため、表示行から数えた
+    /// 行頭（CR を落とした行 + 1）が残り、CRLF の文書では 1 行につき 1 バイトずつ手前へずれて
+    /// 末尾近くの強調が描かれなかった（#1800 / #1802 との合流で発見）。
+    ///
+    /// 相（LF / CRLF それぞれ）:
+    /// (1) 閲覧中に ⌘F（実キー）→ 末尾近くの 1 件を検索 → 当たった文字の地の色が強調の色になり、
+    ///     同じ行の当たっていない所はならない。描いたフレームの行頭はバッファの行頭索引と一致する
+    /// (2) ⌘ホバー（実マウス + 修飾）で同じ識別子に下線、修飾を離すと消える
+    /// (3) 編集を始める → 偽の言語サーバの診断（同じ行）に赤の波線。サーバの規則ファイルの
+    ///     置き場 `TAKO_LSP_FAKE_DIAGNOSTICS` を渡されたときだけ回す（中身はこの節が書く）
+    /// (4) 編集中に検索欄へ 1 文字ずつ打つ（打つたびに全文を探して描き直す = 10 万件当たる
+    ///     途中を通る）→ 最後の 1 件に強調が乗る。1 打鍵の所要を出す（判定には使わない）
+    /// (5) 全置換（10 万か所）→ undo で元とバイト一致 → 探し直すと強調が同じ文字に乗る
+    ///
+    /// 単独実行は `TAKO_VISUAL_ONLY=large-file-decor`
+    #[cfg(feature = "visual-test")]
+    async fn large_file_decor_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        inject_section_failure("large-file-decor");
+        ensure_fresh_scene(window, cx, "large-file-decor").await;
+        let dir = std::env::temp_dir().join(format!("tako-visual-1660d-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("visual-test large-file-decor 一時ディレクトリ");
+        // 言語サーバの根（Cargo.toml）。⌘ホバーは `.rs` を受け持つサーバがあることだけを見る
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"decor\"\n").ok();
+        // 偽サーバは起動時に規則ファイルを読むので、編集を始める（= サーバが起きる）前に書く
+        let diagnostics = std::env::var_os("TAKO_LSP_FAKE_DIAGNOSTICS").map(|path| {
+            let rule = serde_json::json!([{
+                "range": {
+                    "start": { "line": DECOR_TARGET, "character": DECOR_HIT.start },
+                    "end": { "line": DECOR_TARGET, "character": DECOR_HIT.end },
+                },
+                "severity": 1,
+                "source": "tako-lsp-fake",
+                "message": "visual-test large-file-decor",
+            }]);
+            std::fs::write(&path, rule.to_string())
+                .expect("visual-test large-file-decor 診断の規則ファイル");
+        });
+        for crlf in [false, true] {
+            large_file_decor_case(any, window, cx, &dir, crlf, diagnostics.is_some()).await;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("TAKO_VISUAL_PIXEL: large-file-decor ok");
+    }
+
+    /// large-file-decor の対象の行（0 起点）と、その行で検索が当たる範囲（行内バイト）。
+    /// 行は `let value_99990 = 99990; // ~~~…` で、`value_99990` は文書に 1 つしかない
+    #[cfg(feature = "visual-test")]
+    const DECOR_TARGET: usize = 99_990;
+    #[cfg(feature = "visual-test")]
+    const DECOR_HIT: std::ops::Range<usize> = 4..15;
+    /// 同じ行の当たっていない所（`~` の並び）。地の色の基準に使う
+    #[cfg(feature = "visual-test")]
+    const DECOR_PLAIN: std::ops::Range<usize> = 30..41;
+
+    #[cfg(feature = "visual-test")]
+    async fn large_file_decor_case(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        dir: &std::path::Path,
+        crlf: bool,
+        diagnostics: bool,
+    ) {
+        use std::time::Instant;
+        use tako_control::protocol::Request as Req;
+
+        /// 矩形（ウィンドウ座標の論理 px。`a` / `b` は行の同じ段の左端と右端）の内側で
+        /// いちばん多い色（8 階調へ丸めた代表色）。文字より地が広いので、地の色になる
+        fn dominant(
+            frame: &image::RgbaImage,
+            scale: f32,
+            (a, b, h): (Point<Pixels>, Point<Pixels>, Pixels),
+        ) -> Option<[i32; 3]> {
+            let x0 = (f32::from(a.x) * scale).ceil() as u32 + 1;
+            let x1 = ((f32::from(b.x) * scale).floor() as u32).saturating_sub(1);
+            let y0 = (f32::from(a.y) * scale).ceil() as u32 + 1;
+            let y1 = ((f32::from(a.y + h) * scale).floor() as u32)
+                .saturating_sub(1)
+                .min(frame.height());
+            if x1 <= x0 || y1 <= y0 || x1 > frame.width() {
+                return None;
+            }
+            let mut counts: HashMap<[u8; 3], usize> = HashMap::new();
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let p = frame.get_pixel(x, y).0;
+                    *counts.entry([p[0] >> 3, p[1] >> 3, p[2] >> 3]).or_default() += 1;
+                }
+            }
+            counts
+                .into_iter()
+                .max_by_key(|(_, n)| *n)
+                .map(|(c, _)| c.map(|v| i32::from(v) * 8 + 4))
+        }
+        fn distance(a: [i32; 3], b: [i32; 3]) -> i32 {
+            (0..3).map(|i| (a[i] - b[i]).abs()).sum()
+        }
+        /// 矩形の下半分（下線・波線の置き場）で `color` に近い画素の数と、見た列の数
+        fn ink_below(
+            frame: &image::RgbaImage,
+            scale: f32,
+            (a, b, h): (Point<Pixels>, Point<Pixels>, Pixels),
+            color: tako_core::Rgb,
+        ) -> (usize, usize) {
+            let x0 = (f32::from(a.x) * scale).ceil() as u32 + 1;
+            let x1 = ((f32::from(b.x) * scale).floor() as u32).saturating_sub(1);
+            let y0 = (f32::from(a.y + h * 0.5) * scale) as u32;
+            let y1 = ((f32::from(a.y + h) * scale) as u32 + 3).min(frame.height());
+            if x1 <= x0 || x1 > frame.width() {
+                return (0, 0);
+            }
+            let want = [i32::from(color.r), i32::from(color.g), i32::from(color.b)];
+            let hits = (y0..y1)
+                .flat_map(|y| (x0..x1).map(move |x| (x, y)))
+                .filter(|&(x, y)| {
+                    let p = frame.get_pixel(x, y).0;
+                    distance([p[0].into(), p[1].into(), p[2].into()], want) <= 70
+                })
+                .count();
+            (hits, (x1 - x0) as usize)
+        }
+        fn median_us(mut samples: Vec<Duration>) -> String {
+            if samples.is_empty() {
+                return "n=0".into();
+            }
+            samples.sort();
+            format!(
+                "median_us={} max_us={} n={}",
+                samples[samples.len() / 2].as_micros(),
+                samples[samples.len() - 1].as_micros(),
+                samples.len()
+            )
+        }
+
+        let label = if crlf { "crlf" } else { "lf" };
+        let eol = if crlf { "\r\n" } else { "\n" };
+        let find_key = if cfg!(target_os = "macos") {
+            "cmd-f"
+        } else {
+            "ctrl-shift-f"
+        };
+        // 1 行 100 バイト（改行込み）× 10 万行 = ちょうど 10,000,000 バイト（編集の上限）
+        let mut source = String::with_capacity(10_000_000);
+        for i in 0..100_000usize {
+            let head = format!("let value_{i} = {i}; // ");
+            source.push_str(&head);
+            source.push_str(&"~".repeat(100 - eol.len() - head.len()));
+            source.push_str(eol);
+        }
+        check(
+            source.len() == 10_000_000,
+            &format!(
+                "visual-test large-file-decor {label}: 素材が 10 MB（{}）",
+                source.len()
+            ),
+        );
+        let path = dir.join(format!("decor_{label}.rs"));
+        std::fs::write(&path, &source).expect("visual-test large-file-decor 素材");
+        let query = format!("value_{DECOR_TARGET}");
+
+        // 閲覧表示で開く（新しいタブ = 行が折り返さない幅）
+        let pane = window
+            .update(cx, |app, _, cx| {
+                let base = app.focused_pane().as_u64();
+                let opened = tako_control::dispatch(
+                    app,
+                    Req::OpenFile {
+                        pane: Some(base),
+                        path: path.display().to_string(),
+                        mode: Some(tako_control::protocol::PreviewModeWire::Code),
+                        direction: None,
+                        focus: Some(true),
+                        new_tab: true,
+                        line: None,
+                        column: None,
+                    },
+                    PaneOrigin::Cli,
+                )
+                .expect("visual-test large-file-decor を dispatch で開ける");
+                app.drain_pending_highlights(cx);
+                cx.notify();
+                PaneId::from_raw(opened["pane"].as_u64().expect("OpenFile 応答の pane"))
+            })
+            .unwrap_or_else(|_| fail("visual-test large-file-decor dispatch"));
+        check(
+            wait_for_preview_maps(any, window, cx, pane, false).await,
+            &format!("visual-test large-file-decor {label}: 行が描かれる"),
+        );
+        // 読み取り表示の塗り（background）が戻るのを待つ。戻ると表示行が差し替わって版が
+        // 進むので、待たないと ⌘F の後に版が進んで古い行頭が偶然消える（検出力が落ちる）
+        let colored = |app: &TakoApp| {
+            matches!(
+                app.previews.get(&pane).map(|s| &s.content),
+                Some(preview::PreviewContent::Code(lines))
+                    if lines.iter().take(50).any(|l| l.iter().any(|s| s.color.is_some()))
+            )
+        };
+        let mut view_ready = false;
+        for _ in 0..3000 {
+            if window.update(cx, |app, _, _| colored(app)).unwrap_or(false) {
+                view_ready = true;
+                break;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(10))
+                .await;
+            notify_and_draw(any, window, cx);
+        }
+        check(
+            view_ready,
+            &format!("visual-test large-file-decor {label}: 読み取り表示が塗られる"),
+        );
+        notify_and_draw(any, window, cx);
+
+        // 件数（応答の `total`）。取れなければ応答そのものを理由に載せる
+        let search = |cx: &mut AsyncApp, q: &str| -> Result<u64, String> {
+            window
+                .update(cx, |app, _, cx| {
+                    let r = tako_control::dispatch(
+                        app,
+                        Req::PreviewSearch {
+                            pane: Some(pane.as_u64()),
+                            query: Some(q.to_string()),
+                            direction: None,
+                            case_sensitive: None,
+                            whole_word: None,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    cx.notify();
+                    match r {
+                        Ok(v) => v["search"]["total"].as_u64().ok_or_else(|| v.to_string()),
+                        Err(e) => Err(e.to_string()),
+                    }
+                })
+                .unwrap_or_else(|_| Err("window".into()))
+        };
+        // 対象の行が描かれた（layout が控えられた）かを、描きながら待つ
+        let wait_drawn = |cx: &mut AsyncApp| {
+            for _ in 0..200 {
+                notify_and_draw(any, window, cx);
+                let drawn = window
+                    .update(cx, |app, _, _| {
+                        app.preview_text_layouts
+                            .get(&pane)
+                            .and_then(|slots| slots.get(DECOR_TARGET))
+                            .is_some_and(Option::is_some)
+                    })
+                    .unwrap_or(false);
+                if drawn {
+                    return true;
+                }
+            }
+            false
+        };
+        // 対象の行の `range`（行内バイト）の矩形。行が折り返して段を跨ぐなら None
+        let rect_of = |cx: &mut AsyncApp, range: std::ops::Range<usize>| {
+            window
+                .update(cx, |app, _, _| {
+                    let layout = app
+                        .preview_text_layouts
+                        .get(&pane)?
+                        .get(DECOR_TARGET)?
+                        .clone()?;
+                    let a = layout.position_for_index(range.start)?;
+                    let b = layout.position_for_index(range.end)?;
+                    (a.y == b.y && b.x > a.x).then(|| (a, b, layout.line_height()))
+                })
+                .ok()
+                .flatten()
+        };
+        // 描いた行ぶんの行頭 = バッファの行頭索引（検索ヒットはバッファのバイト位置）。
+        // 索引は末尾の改行の後ろの空行も 1 行と数えるので、比べるのは表示行の数まで
+        let starts_match = |cx: &mut AsyncApp| {
+            window
+                .update(cx, |app, _, _| {
+                    let edit = app.preview_edits.get(&pane)?;
+                    let drawn = app.preview_line_starts.get(&pane)?;
+                    let shown = match &app.previews.get(&pane)?.content {
+                        preview::PreviewContent::Code(lines) => lines.len(),
+                        _ => return None,
+                    };
+                    let index = edit.buffer.line_starts();
+                    Some(
+                        drawn.len() >= shown
+                            && index.len() >= shown
+                            && drawn[..shown] == index[..shown],
+                    )
+                })
+                .ok()
+                .flatten()
+                .unwrap_or(false)
+        };
+        let theme = window
+            .update(cx, |app, _, _| app.theme.clone())
+            .unwrap_or_else(|_| fail("visual-test large-file-decor テーマ"));
+        let yellow = [
+            i32::from(theme.yellow.r),
+            i32::from(theme.yellow.g),
+            i32::from(theme.yellow.b),
+        ];
+        let dump = |frame: &image::RgbaImage, name: &str| {
+            if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                let _ = frame.save(
+                    std::path::Path::new(&dump)
+                        .join(format!("large-file-decor-{label}-{name}.png")),
+                );
+            }
+        };
+        // 強調が `hit` の文字に乗り、同じ行の `DECOR_PLAIN` には乗っていないか。
+        // 今のヒット（1 件だけ = 今のヒット）の地は黄の 50% を地へ重ねた色
+        let highlight_on = |cx: &mut AsyncApp, hit: std::ops::Range<usize>, name: &str| {
+            let (Some(hit_rect), Some(plain_rect)) =
+                (rect_of(cx, hit.clone()), rect_of(cx, DECOR_PLAIN))
+            else {
+                fail(&format!(
+                    "visual-test large-file-decor {label} {name}: 対象の行の矩形を採れない \
+                     （折り返し or 未描画）"
+                ))
+            };
+            let Some((frame, scale)) = capture_frame(any, cx) else {
+                println!("TAKO_VISUAL_PIXEL: large-file-decor SKIPPED（フレームを読めない）");
+                fail(&format!(
+                    "visual-test large-file-decor {label} {name}: フレームを読めない"
+                ))
+            };
+            dump(&frame, name);
+            let (Some(on), Some(ground)) = (
+                dominant(&frame, scale, hit_rect),
+                dominant(&frame, scale, plain_rect),
+            ) else {
+                fail(&format!(
+                    "visual-test large-file-decor {label} {name}: 矩形が画面の外"
+                ))
+            };
+            let expected = [0, 1, 2].map(|i| ground[i] + (yellow[i] - ground[i]) / 2);
+            println!(
+                "TAKO_VISUAL_PIXEL: large-file-decor {label} {name} hit={hit:?} on={on:?} \
+                 ground={ground:?} expected={expected:?}"
+            );
+            distance(on, expected) <= 60 && distance(on, ground) >= 30
+        };
+
+        // (1) 閲覧中に ⌘F（実キー）→ 末尾近くの 1 件を検索
+        let _ = window.update(cx, |app, _, cx| {
+            let _ = app.workspace.active_tab_mut().tree_mut().focus(pane);
+            cx.notify();
+        });
+        press(any, cx, find_key);
+        notify_and_draw(any, window, cx);
+        let opened = window
+            .update(cx, |app, _, _| {
+                app.preview_edits
+                    .get(&pane)
+                    .map(|e| (e.search_visible, e.editing))
+            })
+            .ok()
+            .flatten();
+        check(
+            opened == Some((true, false)),
+            &format!(
+                "visual-test large-file-decor {label}: 閲覧中の ⌘F で検索欄が開く（{opened:?}）"
+            ),
+        );
+        let total = search(cx, &query);
+        check(
+            total == Ok(1),
+            &format!("visual-test large-file-decor {label}: {query} は 1 件（{total:?}）"),
+        );
+        check(
+            wait_drawn(cx),
+            &format!("visual-test large-file-decor {label}: 当たった行まで追従して描く"),
+        );
+        check(
+            highlight_on(cx, DECOR_HIT, "view-search"),
+            &format!(
+                "visual-test large-file-decor {label}: 閲覧中の検索の強調が当たった文字に乗る"
+            ),
+        );
+        check(
+            starts_match(cx),
+            &format!(
+                "visual-test large-file-decor {label}: 閲覧中の ⌘F の後も、描いた行頭が \
+                 バッファの行頭索引と一致する（表示行の版だけで使い回さない）"
+            ),
+        );
+
+        // (2) ⌘ホバー（実マウス + 修飾）。識別子は描画の行テキスト（#1660 で使い回す）から切る
+        let lsp_on = window
+            .update(cx, |app, _, _| app.lsp_goto_enabled_for(pane))
+            .unwrap_or(false);
+        if lsp_on {
+            let Some((a, b, h)) = rect_of(cx, DECOR_HIT) else {
+                fail(&format!(
+                    "visual-test large-file-decor {label}: ⌘ホバーの矩形を採れない"
+                ))
+            };
+            let at = point((a.x + b.x) / 2.0, a.y + h / 2.0);
+            let _ = any.update(cx, |_, win, cx| {
+                win.dispatch_event(
+                    gpui::PlatformInput::MouseMove(MouseMoveEvent {
+                        position: at,
+                        pressed_button: None,
+                        modifiers: crate::keybindings::link_modifiers(true),
+                    }),
+                    cx,
+                )
+            });
+            notify_and_draw(any, window, cx);
+            let hovered = window
+                .update(cx, |app, _, _| app.lsp_goto.hovered.clone())
+                .ok()
+                .flatten();
+            check(
+                hovered == Some((pane, DECOR_TARGET, DECOR_HIT)),
+                &format!(
+                    "visual-test large-file-decor {label}: ⌘ホバーが末尾近くの識別子を掴む \
+                     （{hovered:?}）"
+                ),
+            );
+            let Some((frame, scale)) = capture_frame(any, cx) else {
+                fail(&format!(
+                    "visual-test large-file-decor {label}: フレームを読めない（⌘ホバー）"
+                ))
+            };
+            dump(&frame, "hover");
+            let (ink, cols) = ink_below(&frame, scale, (a, b, h), theme.accent);
+            let plain = rect_of(cx, DECOR_PLAIN)
+                .map(|r| ink_below(&frame, scale, r, theme.accent).0)
+                .unwrap_or(usize::MAX);
+            println!(
+                "TAKO_VISUAL_PIXEL: large-file-decor {label} hover underline_ink={ink} cols={cols} \
+                 plain_ink={plain}"
+            );
+            check(
+                ink >= cols && plain < cols / 4,
+                &format!(
+                    "visual-test large-file-decor {label}: ⌘ホバーの下線が識別子の下に描かれる \
+                     （ink={ink} cols={cols} plain={plain}）"
+                ),
+            );
+            let _ = any.update(cx, |_, win, cx| {
+                win.dispatch_event(
+                    gpui::PlatformInput::ModifiersChanged(gpui::ModifiersChangedEvent {
+                        modifiers: Modifiers::default(),
+                        capslock: gpui::Capslock::default(),
+                    }),
+                    cx,
+                )
+            });
+            notify_and_draw(any, window, cx);
+            let released = window
+                .update(cx, |app, _, _| app.lsp_goto.hovered.is_none())
+                .unwrap_or(false);
+            check(
+                released,
+                &format!("visual-test large-file-decor {label}: 修飾を離すと下線が消える"),
+            );
+        } else {
+            println!("TAKO_VISUAL_PIXEL: large-file-decor {label} hover SKIPPED（LSP が無効）");
+        }
+
+        // (3) 編集を始める（閲覧中の検索セッションを使い回す = 検索欄は開いたまま）
+        let editing = window
+            .update(cx, |app, _, cx| {
+                let r = tako_control::dispatch(
+                    app,
+                    Req::PreviewEdit {
+                        pane: Some(pane.as_u64()),
+                        enabled: Some(true),
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+                r.ok().and_then(|v| v["editing"].as_bool()).unwrap_or(false)
+            })
+            .unwrap_or(false);
+        check(
+            editing,
+            &format!("visual-test large-file-decor {label}: 編集モードを開始できる"),
+        );
+        let pending = |cx: &mut AsyncApp| {
+            window
+                .update(cx, |app, _, _| {
+                    app.preview_edits
+                        .get(&pane)
+                        .is_some_and(preview::EditState::highlight_pending)
+                })
+                .unwrap_or(false)
+        };
+        for _ in 0..6000 {
+            if !pending(cx) {
+                break;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(10))
+                .await;
+            notify_and_draw(any, window, cx);
+        }
+        check(
+            !pending(cx),
+            &format!("visual-test large-file-decor {label}: 全文の塗りが戻って揃う"),
+        );
+        check(
+            wait_drawn(cx),
+            &format!("visual-test large-file-decor {label}: 編集開始後も対象の行を描く"),
+        );
+        if diagnostics {
+            let mut arrived = false;
+            for _ in 0..2000 {
+                arrived = window
+                    .update(cx, |app, _, _| {
+                        app.preview_edits
+                            .get(&pane)
+                            .and_then(|e| e.diagnostics.as_ref())
+                            .is_some_and(|d| !d.items.is_empty())
+                    })
+                    .unwrap_or(false);
+                if arrived {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(10))
+                    .await;
+                notify_and_draw(any, window, cx);
+            }
+            check(
+                arrived,
+                &format!("visual-test large-file-decor {label}: 偽サーバの診断が届く"),
+            );
+            notify_and_draw(any, window, cx);
+            let (Some(rect), Some(plain)) = (rect_of(cx, DECOR_HIT), rect_of(cx, DECOR_PLAIN))
+            else {
+                fail(&format!(
+                    "visual-test large-file-decor {label}: 診断の矩形を採れない"
+                ))
+            };
+            let Some((frame, scale)) = capture_frame(any, cx) else {
+                fail(&format!(
+                    "visual-test large-file-decor {label}: フレームを読めない（診断）"
+                ))
+            };
+            dump(&frame, "diagnostic");
+            let (ink, cols) = ink_below(&frame, scale, rect, theme.red);
+            let (plain_ink, _) = ink_below(&frame, scale, plain, theme.red);
+            println!(
+                "TAKO_VISUAL_PIXEL: large-file-decor {label} diagnostic wavy_ink={ink} cols={cols} \
+                 plain_ink={plain_ink}"
+            );
+            check(
+                ink >= cols / 2 && plain_ink < cols / 8,
+                &format!(
+                    "visual-test large-file-decor {label}: 診断の波線が範囲の下に描かれる \
+                     （ink={ink} cols={cols} plain={plain_ink}）"
+                ),
+            );
+        } else {
+            println!(
+                "TAKO_VISUAL_PIXEL: large-file-decor {label} diagnostic SKIPPED（偽サーバの規則なし）"
+            );
+        }
+
+        // (4) 編集中に検索欄へ 1 文字ずつ打つ（実キー。打つたびに全文を探して描き直す）
+        let _ = window.update(cx, |app, _, cx| {
+            if let Some(edit) = app.preview_edits.get_mut(&pane) {
+                edit.search_visible = true;
+                edit.search_focus = preview::SearchFieldFocus::Query;
+                edit.search_query.clear();
+                edit.search_cursor = 0;
+            }
+            cx.notify();
+        });
+        notify_and_draw(any, window, cx);
+        let mut keys = Vec::new();
+        let mut totals = Vec::new();
+        for ch in query.chars() {
+            let t = Instant::now();
+            press(any, cx, &format!("{ch}->{ch}"));
+            notify_and_draw(any, window, cx);
+            keys.push(t.elapsed());
+            totals.push(
+                window
+                    .update(cx, |app, _, _| {
+                        app.preview_edits.get(&pane).map(|e| e.search_hits.len())
+                    })
+                    .ok()
+                    .flatten()
+                    .unwrap_or(usize::MAX),
+            );
+        }
+        let typed = window
+            .update(cx, |app, _, _| {
+                app.preview_edits
+                    .get(&pane)
+                    .map(|e| (e.search_query.clone(), e.search_hits.len()))
+            })
+            .ok()
+            .flatten();
+        println!(
+            "TAKO_VISUAL_PIXEL: large-file-decor {label} search-typing {} hits_per_key={totals:?}",
+            median_us(keys)
+        );
+        check(
+            typed == Some((query.clone(), 1)),
+            &format!(
+                "visual-test large-file-decor {label}: 編集中に検索欄へ打った {query} が 1 件に絞れる \
+                 （{typed:?}）"
+            ),
+        );
+        check(
+            totals.iter().any(|&n| n >= 100_000),
+            &format!(
+                "visual-test large-file-decor {label}: 打つ途中で全行に当たる段を通る（{totals:?}）"
+            ),
+        );
+        check(
+            wait_drawn(cx) && starts_match(cx),
+            &format!("visual-test large-file-decor {label}: 打った後も描いた行頭が索引と一致する"),
+        );
+        check(
+            highlight_on(cx, DECOR_HIT, "edit-search"),
+            &format!(
+                "visual-test large-file-decor {label}: 編集中に打って絞った強調が当たった文字に乗る"
+            ),
+        );
+
+        // (5) 全置換（10 万か所）→ undo で元とバイト一致 → 探し直すと強調が同じ文字に乗る
+        let t = Instant::now();
+        let replaced = window
+            .update(cx, |app, _, cx| {
+                let r = tako_control::dispatch(
+                    app,
+                    Req::PreviewReplace {
+                        pane: Some(pane.as_u64()),
+                        query: "value_".into(),
+                        replacement: "Value_\n".into(),
+                        all: Some(true),
+                        case_sensitive: None,
+                        whole_word: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+                r.ok().and_then(|v| v["replace"]["replaced"].as_u64())
+            })
+            .ok()
+            .flatten();
+        notify_and_draw(any, window, cx);
+        let replace_us = t.elapsed().as_micros();
+        let after = window
+            .update(cx, |app, _, _| {
+                app.preview_edits
+                    .get(&pane)
+                    .map(|e| (e.buffer.line_count(), e.buffer.line_starts().len()))
+            })
+            .ok()
+            .flatten();
+        check(
+            replaced == Some(100_000) && after.is_some_and(|(n, _)| n == 200_001),
+            &format!(
+                "visual-test large-file-decor {label}: 全置換で 10 万か所が変わり、改行を含む置換で \
+                 行が倍になる（{replaced:?} {after:?}）"
+            ),
+        );
+        notify_and_draw(any, window, cx);
+        check(
+            starts_match(cx),
+            &format!(
+                "visual-test large-file-decor {label}: 全置換の後も描いた行頭が索引と一致する"
+            ),
+        );
+        let t = Instant::now();
+        let undone = window
+            .update(cx, |app, _, cx| {
+                let r = tako_control::dispatch(
+                    app,
+                    Req::PreviewUndo {
+                        pane: Some(pane.as_u64()),
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+                r.is_ok()
+            })
+            .unwrap_or(false);
+        notify_and_draw(any, window, cx);
+        let undo_us = t.elapsed().as_micros();
+        let restored = window
+            .update(cx, |app, _, _| {
+                app.preview_edits
+                    .get(&pane)
+                    .is_some_and(|e| e.buffer.text() == source)
+            })
+            .unwrap_or(false);
+        println!(
+            "TAKO_VISUAL_PIXEL: large-file-decor {label} replace_all replaced={replaced:?} \
+             replace_us={replace_us} undo_us={undo_us} restored={restored}"
+        );
+        check(
+            undone && restored,
+            &format!("visual-test large-file-decor {label}: undo 1 回で全置換が戻り元とバイト一致"),
+        );
+        let total = search(cx, &query);
+        check(
+            total == Ok(1),
+            &format!(
+                "visual-test large-file-decor {label}: undo の後に探し直すと 1 件（{total:?}）"
+            ),
+        );
+        check(
+            wait_drawn(cx) && starts_match(cx),
+            &format!("visual-test large-file-decor {label}: undo の後も描いた行頭が索引と一致する"),
+        );
+        check(
+            highlight_on(cx, DECOR_HIT, "after-undo"),
+            &format!(
+                "visual-test large-file-decor {label}: undo の後に探し直した強調が当たった文字に乗る"
+            ),
+        );
+
+        let _ = window.update(cx, |app, _, cx| {
+            let _ = tako_control::dispatch(
+                app,
+                Req::Close {
+                    pane: Some(pane.as_u64()),
+                    force: true,
+                    caller_role: None,
+                },
+                PaneOrigin::Cli,
+            );
+            cx.notify();
+        });
+        println!("TAKO_VISUAL_PIXEL: large-file-decor {label} ok");
     }
 
     /// #1741: 可視行数（追従スクロールの余白とページ移動の歩幅）が**実際に描いた行の

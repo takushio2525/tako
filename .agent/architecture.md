@@ -1850,7 +1850,13 @@ syntect へ通していた**。release 実測（同じ構文セット・テー�
 - **描画の下ごしらえ**: 行テキスト（選択・コピー・当たり判定の正）と行頭を毎フレーム全行から
   作っていた（10 万行で 7.2ms）。表示行の版（`PreviewState::content_rev`）が同じフレームは
   使い回し、打鍵 1 回ぶんは `EditState::line_splice`（差し替えた範囲）を写すだけ
-  （`preview::code_line_texts`。結果は全行から作ったものと常に一致 = property テスト）
+  （`preview::code_line_texts`。結果は全行から作ったものと常に一致 = property テスト）。
+  **行頭は出どころも鍵に含める**（`preview_line_cache_rev` = (表示行の版, バッファの版)）:
+  行頭は検索ヒット（バッファのバイト位置）を行へ割り当てる座標で、編集セッションがあれば
+  バッファの行頭索引、無ければ表示行から数える。閲覧中の ⌘F はセッションを生やすだけで
+  表示行の版を進めないので、版だけを鍵にすると表示行から数えた行頭（CR を落とした行 + 1）が
+  残り、CRLF の文書で強調が 1 行につき 1 バイトずつ手前へずれて末尾近くでは描かれなかった
+  （#1800 / #1802 との合流で実 GUI で再現・番犬の規則 6）
 - **IME の UTF-16 換算**: 打鍵のたびに文書の先頭から 1 文字ずつ復号していた（10 MB の末尾で
   3.9ms）。127 バイトずつ u8 で「文字の頭 + 4 バイト文字の頭」を数える形にした（0.38ms）
 - **#1648 の穴を 1 つ塞いだ**: 変わった範囲の尻の一致行数（`changed_lines` の `tail`）が、
@@ -1898,8 +1904,11 @@ LSP を繋いだとき（偽サーバ・10 MB）の `LspManager::sync` は 1 打
 
 回帰検出は `preview::large_file_tests`（background の塗り・打ち切り・古い番号の破棄・
 行をつなぐ編集・ランダム編集で表示の文字が常に本文と一致）・`text_edit` の行頭索引の
-property テスト・`preview_limit` の単体・番犬 `issue1660_large_file_edit_watchdog`・
-実経路 `bash scripts/test-large-file-edit-1660.sh`（visual-test 節 `large-file-edit`）。
+property テスト（置換の 4 条件 = 大文字小文字 × 単語単位と、本文を書き換える公開の口を
+すべて混ぜる）・`preview_limit` の単体・番犬 `issue1660_large_file_edit_watchdog`・
+実経路 `bash scripts/test-large-file-edit-1660.sh`（visual-test 節 `large-file-edit` と、
+10 万行 / 10 MB の LF / CRLF の末尾近くで検索の強調・⌘ホバーの下線・診断の波線を実ピクセルで
+数える `large-file-decor`）。
 
 ## 編集カーソルの追従スクロール（#1649。2026-09-23）
 

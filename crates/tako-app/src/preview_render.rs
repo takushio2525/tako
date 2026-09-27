@@ -1583,22 +1583,30 @@ impl TakoApp {
                     // 1 フレーム 7.8ms かかる。表示行の版が前のフレームと同じなら使い回す
                     // （打鍵・読み込み・塗りの差し替えのたびに版が進む）
                     let rev = state.content_rev;
+                    // 行頭の出どころ: 編集セッションのバッファ（その版）か、無ければ表示行。
+                    // 閲覧中の ⌘F はセッションを生やすだけで表示行の版を進めないので、
+                    // 版だけを見ると表示行から数えた行頭（CRLF では 1 行 1 バイト短い）が残る
+                    let source = self
+                        .preview_edits
+                        .get(&pane_id)
+                        .map(|edit| edit.buffer.version());
                     // 行頭が欠けていれば行テキストも使い回さない（両方を同じ版で揃える）
-                    let previous = self
+                    let cached = self
                         .preview_line_cache_rev
                         .get(&pane_id)
                         .copied()
-                        .filter(|_| self.preview_line_starts.contains_key(&pane_id))
-                        .and_then(|cached| {
-                            Some((self.preview_line_texts.remove(&pane_id)?, cached))
-                        });
+                        .filter(|_| self.preview_line_starts.contains_key(&pane_id));
+                    let previous = cached.and_then(|(cached_rev, _)| {
+                        Some((self.preview_line_texts.remove(&pane_id)?, cached_rev))
+                    });
                     let splice = self
                         .preview_edits
                         .get(&pane_id)
                         .and_then(|edit| edit.line_splice.as_ref());
                     let (texts, reuse) = preview::code_line_texts(previous, rev, splice, lines);
                     line_texts = texts;
-                    if reuse != preview::LineTextsReuse::Same {
+                    let same_source = cached.is_some_and(|(_, cached)| cached == source);
+                    if reuse != preview::LineTextsReuse::Same || !same_source {
                         // 行頭バイトオフセット（検索ヒットの行内範囲を出すのに要る）。
                         // 検索ヒットは編集バッファのバイト位置なので、**同じ本文**から
                         // 数える（#1650。表示用の行テキストは CR を落としてあるため、
@@ -1617,7 +1625,7 @@ impl TakoApp {
                             }
                         };
                         self.preview_line_starts.insert(pane_id, starts);
-                        self.preview_line_cache_rev.insert(pane_id, rev);
+                        self.preview_line_cache_rev.insert(pane_id, (rev, source));
                     }
                     // 可視行が自分の枠へ書き込む器。索引は常に文書の行番号。
                     // ここで先に入れておくのが要点で、`list` の item は
