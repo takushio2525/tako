@@ -111,7 +111,8 @@ run_section() { # ログ 追加の env…
   if grep -q "TAKO_VISUAL_TEST_OK" "$log"; then
     return 0
   fi
-  grep -E "FAILED|panicked|ERROR" "$log" | tail -5 | sed 's/^/    /'
+  # 置き先の面を見失って窓を開かずに終わった起動（#1160 / #1697）は stderr の `error:` 1 行で分かる
+  grep -E "FAILED|panicked|ERROR|^error:" "$log" | tail -5 | sed 's/^/    /'
   return 1
 }
 
