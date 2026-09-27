@@ -109,8 +109,15 @@ pub fn needs_seal(fd: i32, flags: i32, cloexec: i32) -> bool {
 }
 
 /// 子の中で `fds` が開いているかを調べて `FDCHK=[…]` を 1 行出す `/bin/sh` の片
-/// （検証用。`{ : >&N; }` は N が開いていなければ失敗する。読み取り専用の fd でも
-/// dup は通るので向きを問わない）
+/// （検証用。`>&N` は N が開いていなければ失敗する。読み取り専用の fd でも
+/// dup は通るので向きを問わない）。
+///
+/// `>&N` は**外部コマンドの fork 子で**試す（`/usr/bin/true 2>/dev/null >&N`）。
+/// 組み込みで試す形（`{ : >&N; } 2>/dev/null`）にしないこと: bash（macOS の `/bin/sh`）は
+/// 組み込みへのリダイレクトの前に元の fd 2 / 1 を **10 以上の空き番号**へ退避するので、
+/// N が閉じていても 10 / 11 を「開いている」と読む。テストが開いた fd がたまたま 10 / 11 に
+/// 当たった回だけ落ち、無関係な PR の CI を間欠で赤にしていた（#1807）。
+/// fork 子のリダイレクトは戻す必要が無いので退避が起きない
 pub fn inherited_probe_script(fds: &[i32]) -> String {
     let list = fds
         .iter()
@@ -118,7 +125,7 @@ pub fn inherited_probe_script(fds: &[i32]) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     format!(
-        "open=''; for n in {list}; do if {{ : >&$n; }} 2>/dev/null; then open=\"$open $n\"; fi; done; \
+        "open=''; for n in {list}; do if /usr/bin/true 2>/dev/null >&$n; then open=\"$open $n\"; fi; done; \
          echo \"FDCHK=[${{open# }}]\""
     )
 }
@@ -343,6 +350,51 @@ mod tests {
         let script = inherited_probe_script(&[4, 12]);
         assert!(script.contains("for n in 4 12;"), "{script}");
         assert!(script.contains("FDCHK=["), "{script}");
+    }
+
+    /// #1807: 検査の片は、シェルが自分の fd の退避に使う番号（10 以上の空き）を
+    /// 「子が受け継いだ」と読まない。
+    ///
+    /// 子の中で fd 3 以上をすべて閉じる側へ倒し（掃除の本体）、4 と 12 だけを開き直して
+    /// exec する。退避先の 10 / 11 を挟むように 3〜15 を調べ、開いているのは 4 と 12 だけと
+    /// 読めることを見る。開き直しは子の fd 表の写しにだけ効くので、並走するテストの fd に
+    /// 左右されない
+    #[cfg(unix)]
+    #[test]
+    fn 検査の片はシェルが退避に使うfdを受け継いだと読まない() {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        let site = include_str!("fd_inherit.rs")
+            .lines()
+            .position(|l| l.starts_with("pub fn inherited_probe_script("))
+            .map_or_else(|| "?".to_string(), |i| (i + 1).to_string());
+        let probed: Vec<i32> = (3..=15).collect();
+        let out = unsafe {
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(inherited_probe_script(&probed))
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .pre_exec(|| {
+                    seal_inherited_fds();
+                    // stdin（/dev/null）の写しを CLOEXEC 無しで置く = 受け継いだ fd の代わり
+                    for fd in [4, 12] {
+                        if libc::dup2(0, fd) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                })
+                .output()
+                .expect("/bin/sh を起こせる")
+        };
+        assert_eq!(
+            observed_inherited(&String::from_utf8_lossy(&out.stdout)),
+            Some(vec![4, 12]),
+            "crates/tako-core/src/platform/fd_inherit.rs:{site}: 検査の片が、子で閉じている fd を\
+             開いていると読んだ（10 / 11 ならシェルがリダイレクトの前に退避した fd。\
+             `>&N` を組み込みで試す形へ戻っていないか。#1807）"
+        );
     }
 
     #[cfg(unix)]
