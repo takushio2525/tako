@@ -336,7 +336,7 @@ const MUTATES_TEXT: [&str; 17] = [
 ///
 /// カーソル・選択は「どこを見ているか」で文書の中身ではない。`save` はディスクへ
 /// 書くだけで本文を変えない（変えると保存のたびに版が飛び、楽観ロックが使えなくなる）
-const KEEPS_TEXT: [&str; 11] = [
+const KEEPS_TEXT: [&str; 12] = [
     "set_cursor",
     "select_all",
     "move_cursor",
@@ -353,6 +353,8 @@ const KEEPS_TEXT: [&str; 11] = [
     "set_viewport_lines",
     // 区別しない検索の小文字写しを手放す（#1653。本文から作り直せる控えで、本文ではない）
     "release_search_cache",
+    // ファイルの移動に付き添ってパスだけを差し替える（#1834。本文も基準も動かさない = 版は進めない）
+    "retarget",
 ];
 
 /// 検査する操作 1 つ（名前 + バッファへ当てる手）

@@ -891,6 +891,16 @@ impl TextBuffer {
         &self.path
     }
 
+    /// ファイルの移動に付き添ってパスだけを差し替える（#1834）。
+    ///
+    /// 本文・基準（`baseline`）・履歴・版・カーソルは**そのまま**にする。中身は
+    /// 動いていないので、未保存の変更も undo もそのまま続き、新しいパスで
+    /// [`Self::refresh_disk_state`] を引けば `Unchanged` が返る
+    /// （付け替えないと元の場所を見て `Deleted` = #1659 の「外で削除された」になる）
+    pub fn retarget(&mut self, path: PathBuf) {
+        self.path = path;
+    }
+
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -2986,6 +2996,41 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine");
         assert!(!buffer.dirty());
         let _ = std::fs::remove_file(path);
+    }
+
+    /// #1834: 移したファイルへパスを付け替えると、未保存の変更も undo も残ったまま
+    /// 「外で削除された」にならない（付け替えないと元の場所を見て `Deleted`）
+    #[test]
+    fn 移動に付き添って付け替えると未保存の変更が残り削除扱いにならない() {
+        let from = path("moved-1834-from");
+        let to = path("moved-1834-to");
+        let _ = std::fs::remove_file(&from);
+        let _ = std::fs::remove_file(&to);
+        std::fs::write(&from, "before").unwrap();
+        let mut buffer = TextBuffer::open(&from).unwrap();
+        buffer.set_text("mine".into());
+        let version = buffer.version();
+        std::fs::rename(&from, &to).unwrap();
+        assert_eq!(
+            buffer.clone().refresh_disk_state().unwrap(),
+            DiskState::Deleted,
+            "付け替えなければ元の場所を見て削除扱い（A/B の対照）"
+        );
+        buffer.retarget(to.clone());
+        assert_eq!(buffer.path(), to.as_path());
+        assert_eq!(buffer.refresh_disk_state().unwrap(), DiskState::Unchanged);
+        assert_eq!(buffer.text(), "mine");
+        assert!(buffer.dirty(), "未保存の変更はそのまま");
+        assert_eq!(
+            buffer.version(),
+            version,
+            "版は進めない（本文は変わっていない）"
+        );
+        assert!(buffer.can_undo());
+        buffer.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "mine");
+        assert!(!from.exists(), "保存は新しい場所へ書く");
+        let _ = std::fs::remove_file(to);
     }
 
     #[test]

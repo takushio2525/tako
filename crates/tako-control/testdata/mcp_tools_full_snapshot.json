@@ -1680,10 +1680,14 @@
     "name": "tako_preview_changelog"
   },
   {
-    "description": "ファイル操作を実行する。op で種別を指定:\ncopy_absolute_path = 絶対パスを取得 / copy_relative_path = ペイン cwd 基準の相対パスを取得 /\nreveal = ファイルマネージャ（Finder / エクスプローラー）で場所を表示 /\nopen_terminal = そのディレクトリへペイン内で cd /\nrename = name へ改名 / create_file・create_dir = path 配下に name で作成 /\ntrash = ゴミ箱へ移動（復元できる）/ open_default = デフォルトアプリで開く /\nopen_with = name のアプリで開く /\nopen_in_tako = tako の中で開く（ファイル = プレビューペイン / ディレクトリ = そこのシェル。ターミナル内のパスリンクの<link-click>・修飾 + 右クリックメニューと同じ動作）。\nrename / create_file / create_dir / open_with は name が必須。",
+    "description": "ファイル操作を実行する。op で種別を指定:\ncopy_absolute_path = 絶対パスを取得 / copy_relative_path = ペイン cwd 基準の相対パスを取得 /\nreveal = ファイルマネージャ（Finder / エクスプローラー）で場所を表示 /\nopen_terminal = そのディレクトリへペイン内で cd /\nrename = name へ改名 / create_file・create_dir = path 配下に name で作成 /\ntrash = ゴミ箱へ移動（復元できる）/ open_default = デフォルトアプリで開く /\nopen_with = name のアプリで開く /\nopen_in_tako = tako の中で開く（ファイル = プレビューペイン / ディレクトリ = そこのシェル。ターミナル内のパスリンクの<link-click>・修飾 + 右クリックメニューと同じ動作）/\nmove = dest のフォルダへ移す（ツリーの D&D と同じ。同名・自分の配下・別のボリュームは断る。開いているペインは新しいパスへ付け替わる）。\nrename / create_file / create_dir / open_with は name、move は dest が必須。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "dest": {
+          "description": "move の移動先フォルダ",
+          "type": "string"
+        },
         "name": {
           "description": "新しい名前 / アプリ名",
           "type": "string"
@@ -1701,7 +1705,8 @@
             "trash",
             "open_default",
             "open_with",
-            "open_in_tako"
+            "open_in_tako",
+            "move"
           ],
           "type": "string"
         },

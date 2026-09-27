@@ -69,3 +69,6 @@
 ## 2026-09-28（#1772: ⌘+ / ⌘- / ⌘0 をコードプレビュー（エディタ）と md の本文に効かせた）
 - ペインの文字サイズ（`pane_font_sizes`）は 13 → 16 に動くのに、本文はルートの `theme.font_size` を継承していた。本文の器 `preview-scroll` で `.text_size` + `.line_height(φ)` を継承側に指定し、md の基準・コピーボタン・行高の見積もり・仮想リストの `remeasure` を `preview_body_font_size` の 1 実装へ寄せた。#611 は行ピッチ（φ = 21px）を保ち、継承側で指定する半分だけ入れた
 - 実測（tako-vd）: `scripts/test-editor-font-1772.sh` 新 = 11 相緑（行 21 → 26px・可視 30 → 24 行・帯 158×21 → 194×26px・md 22 → 27px・10 万行末尾）/ `TAKO_1772_LEGACY=1` = 名指し FAILED、CLI 30 → 24 → 30 行・MCP 24 行（main v0.8.23 は 30 → 30）・番犬 6 規則へ注入 8 通りすべて file:line で FAILED
+## 2026-09-27（#1834: ファイルツリーの D&D でファイル・フォルダを別のフォルダへ移せるようにした）
+- 判定・実行・付け替え先は `tako_core::file_move` の 1 実装 → dispatch `FileOp{op: move, dest}` → CLI `tako file move` / MCP `tako_file_op` の `op=move`（ツールは増やさない）。同名・自分の配下・別のボリューム（EXDEV）は理由つきで断る
+- 開いているペイン（未保存の編集中・フォルダの配下）はパス・バッファ・LSP（didClose → didOpen）・監視ごと付け替わり #1659 の削除扱いにならない。実マウス 13 場面 + CLI/MCP 字面一致 7 組・A/B `TAKO_1834_LEGACY=1` で FAILED・番犬 13 本

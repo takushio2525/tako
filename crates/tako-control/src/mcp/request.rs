@@ -450,6 +450,7 @@ pub(super) fn build_request(
                 "open_default" => crate::protocol::FileOpKind::OpenDefault,
                 "open_with" => crate::protocol::FileOpKind::OpenWith,
                 "open_in_tako" => crate::protocol::FileOpKind::OpenInTako,
+                "move" => crate::protocol::FileOpKind::Move,
                 other => return Err(format!("op が不正: {other}")),
             };
             Request::FileOp {
@@ -463,6 +464,8 @@ pub(super) fn build_request(
                     | crate::protocol::FileOpKind::OpenInTako => Some(target_pane(args, caller)?),
                     _ => None,
                 },
+                // #1834: 移動先のフォルダ（必須かどうかの判定は dispatch の 1 か所）
+                dest: str_arg(args, "dest")?,
             }
         }
         "tako_git_log" => Request::GitLog {

@@ -714,6 +714,7 @@ impl TakoApp {
             path: path.to_string(),
             name: None,
             pane: None,
+            dest: None,
         };
         if let Err(e) = tako_control::dispatch(self, request, PaneOrigin::User) {
             self.notify_ui_dispatch_failed(

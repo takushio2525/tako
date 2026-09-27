@@ -3604,6 +3604,7 @@ fn dispatch_inner(
             path,
             name,
             pane,
+            dest,
         } => {
             let path = std::path::PathBuf::from(&path);
             match op {
@@ -3782,6 +3783,13 @@ fn dispatch_inner(
                         "kind": if is_dir { "dir" } else { "file" },
                         "result": inner_result,
                     }))
+                }
+                // FR-3.32 / #1834: ツリーの D&D・CLI・MCP の移動はすべてここ 1 つ
+                FileOpKind::Move => {
+                    let dest = dest.ok_or(DispatchError::InvalidParams(
+                        "dest（移動先のフォルダ）を指定する".into(),
+                    ))?;
+                    run_file_move(host, &path, std::path::Path::new(&dest))
                 }
             }
         }
@@ -14600,6 +14608,74 @@ fn dir_of(path: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
+/// ファイル・フォルダを別のフォルダへ移す（FR-3.32 / #1834）。
+///
+/// 判定・実行・付け替え先の計算は `tako_core::file_move` の 1 実装、移した後の
+/// 後始末（開いているペインの付け替え・ツリーの読み直し）は
+/// [`crate::host::PreviewHost::file_moved`] の 1 本。**付け替え先は移す前に決める**
+/// （実体の形で照合できるのは元の場所にあるうちだけ）。
+///
+/// 応答は `moved`（移したか）/ `from` / `to` / `kind`（`file` / `dir` / `symlink`）/
+/// `followed`（付け替えたペイン）。断ったときはエラー文に理由を載せる
+/// （GUI の通知欄・CLI・MCP が同じ文面を出す）
+fn run_file_move(
+    host: &mut dyn ControlHost,
+    src: &std::path::Path,
+    dest: &std::path::Path,
+) -> Result<Value, DispatchError> {
+    use tako_core::file_move::{self, Planned};
+    let refused = |refusal: file_move::MoveRefusal| {
+        DispatchError::Operation(format!(
+            "移動できない: {}（{} → {}）",
+            refusal.reason(),
+            src.display(),
+            dest.display()
+        ))
+    };
+    let plan = match file_move::plan(src, dest).map_err(refused)? {
+        Planned::Unchanged { at, kind } => {
+            let at = at.display().to_string();
+            return Ok(json!({
+                "moved": false,
+                "from": at,
+                "to": at,
+                "kind": kind.slug(),
+                "followed": [],
+                "note": "既にそのフォルダにある（何もしていない）",
+            }));
+        }
+        Planned::Move(plan) => plan,
+    };
+    let open: Vec<(u64, std::path::PathBuf)> = host
+        .open_file_paths()
+        .into_iter()
+        .map(|(pane, path)| (pane.as_u64(), path))
+        .collect();
+    // A/B（`TAKO_1834_LEGACY=1`）: 付け替えだけを外す。移したファイルを開いている
+    // 編集ペインが「外で削除された」（#1659）の帯を出すのが対照になる
+    let follows = if file_move::follow_legacy() {
+        Vec::new()
+    } else {
+        file_move::follows(&plan, &open)
+    };
+    file_move::execute(&plan).map_err(refused)?;
+    host.file_moved(&plan.from, &plan.to, &follows);
+    Ok(json!({
+        "moved": true,
+        "from": plan.from.display().to_string(),
+        "to": plan.to.display().to_string(),
+        "kind": plan.kind.slug(),
+        "followed": follows
+            .iter()
+            .map(|f| json!({
+                "pane": f.pane,
+                "from": f.from.display().to_string(),
+                "to": f.to.display().to_string(),
+            }))
+            .collect::<Vec<_>>(),
+    }))
+}
+
 /// ペインをそのまま SSH 化できるか（#1006 の `can_ssh_pane` を `list` に載せる。#1080）。
 ///
 /// `{ "ok": true }` か `{ "ok": false, "reason": <slug>, "note": <日本語の理由 + 次の一手> }`。
@@ -16783,6 +16859,8 @@ mod tests {
         tab_cols: Option<f32>,
         /// #1439: ペインへ当てたフォント倍率（None のキー = 当て直しで外された）
         font_scales: std::collections::HashMap<PaneId, Option<f32>>,
+        /// #1834: `file_moved` が受け取った (from, to)（移した後の後始末が 1 回だけ走るかの検証用）
+        file_moves: Vec<(std::path::PathBuf, std::path::PathBuf)>,
         /// #1187: cleanup が受け取ったソケット（`--socket` が届いているかの検証用）と、
         /// 返させる結果
         cleanup_socket: std::cell::RefCell<Vec<Option<String>>>,
@@ -16851,6 +16929,7 @@ mod tests {
                 sessions: std::collections::HashMap::new(),
                 tab_cols: None,
                 font_scales: std::collections::HashMap::new(),
+                file_moves: Vec::new(),
                 cleanup_socket: std::cell::RefCell::new(Vec::new()),
                 cleanup_report: None,
                 server_outcome: None,
@@ -17583,6 +17662,33 @@ mod tests {
                 .into_iter()
                 .map(|p| p.id())
                 .find(|p| self.previews.contains_key(&p.as_u64()))
+        }
+        /// #1834: GUI と同じく表示と編集バッファの両方を見る
+        fn open_file_paths(&self) -> Vec<(PaneId, std::path::PathBuf)> {
+            let mut out: Vec<(PaneId, std::path::PathBuf)> = self
+                .previews
+                .iter()
+                .map(|(pane, (path, _))| (PaneId::from_raw(*pane), std::path::PathBuf::from(path)))
+                .collect();
+            out.sort_by_key(|(pane, _)| pane.as_u64());
+            out
+        }
+        /// #1834: GUI の `follow_file_move` の代役（表示のパスと編集バッファを付け替える）
+        fn file_moved(
+            &mut self,
+            from: &std::path::Path,
+            to: &std::path::Path,
+            follows: &[tako_core::file_move::Follow],
+        ) {
+            self.file_moves.push((from.to_path_buf(), to.to_path_buf()));
+            for follow in follows {
+                if let Some((path, _)) = self.previews.get_mut(&follow.pane) {
+                    *path = follow.to.display().to_string();
+                }
+                if let Some((_, _, buffer)) = self.preview_edits.get_mut(&follow.pane) {
+                    buffer.retarget(follow.to.clone());
+                }
+            }
         }
     }
 
@@ -34023,5 +34129,212 @@ mod tests {
             "window が無い器は空配列"
         );
         assert_eq!(host.backend_windows_refreshes.get(), 3, "要求ごとに 1 回");
+    }
+
+    /// #1834 のテストの置き場。**必ず一時 dir の中**（本物のファイルを動かさない = #1811）
+    fn issue1834_scratch(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("tako-dispatch-1834-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("folder/inner")).unwrap();
+        std::fs::create_dir_all(dir.join("dst")).unwrap();
+        std::fs::write(dir.join("src/a.txt"), "disk\n").unwrap();
+        std::fs::write(dir.join("folder/inner/x.txt"), "x\n").unwrap();
+        let dir = tako_core::platform::path::canonicalize(&dir).unwrap();
+        let tmp = tako_core::platform::path::canonicalize(&std::env::temp_dir()).unwrap();
+        assert!(dir.starts_with(&tmp), "一時 dir の外: {}", dir.display());
+        dir
+    }
+
+    fn issue1834_move(src: &std::path::Path, dest: &std::path::Path) -> Request {
+        Request::FileOp {
+            op: FileOpKind::Move,
+            path: src.display().to_string(),
+            name: None,
+            pane: None,
+            dest: Some(dest.display().to_string()),
+        }
+    }
+
+    fn issue1834_open(host: &mut MockHost, pane: u64, path: &std::path::Path) -> u64 {
+        dispatch(
+            host,
+            Request::OpenFile {
+                pane: Some(pane),
+                path: path.display().to_string(),
+                mode: Some(PreviewModeWire::Code),
+                direction: Some(Direction::Right),
+                focus: None,
+                new_tab: false,
+                line: None,
+                column: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap()["pane"]
+            .as_u64()
+            .unwrap()
+    }
+
+    /// #1834: 移すと、開いているペイン（未保存の編集中を含む）が新しいパスへ付け替わり、
+    /// 本文は残り、新しい場所で「外で削除された」にならない。フォルダの配下も同じ
+    #[test]
+    fn issue1834_移すと開いているペインが新しいパスへ付け替わり未保存の本文が残る() {
+        let dir = issue1834_scratch("follow");
+        let mut host = MockHost::new();
+        host.preview_real_files = true;
+        // 成分ごとに組む（Windows では区切りが `\` になるので、比較も Path 同士 = 成分単位）
+        let at = |parts: &[&str]| parts.iter().fold(dir.clone(), |acc, part| acc.join(part));
+        let path_of = |v: &Value| std::path::PathBuf::from(v.as_str().unwrap_or_default());
+        let root = host.root_pane();
+        let edited = issue1834_open(&mut host, root, &at(&["src", "a.txt"]));
+        dispatch(
+            &mut host,
+            Request::PreviewApply {
+                pane: Some(edited),
+                text: "unsaved\n".into(),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let inner = issue1834_open(&mut host, edited, &at(&["folder", "inner", "x.txt"]));
+        assert_ne!(
+            inner, edited,
+            "2 つ目は別のペインで開く（未保存のペインを避ける）"
+        );
+
+        let moved = dispatch(
+            &mut host,
+            issue1834_move(&at(&["src", "a.txt"]), &at(&["dst"])),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(moved["moved"].as_bool(), Some(true));
+        assert_eq!(moved["kind"].as_str(), Some("file"));
+        let to = at(&["dst", "a.txt"]);
+        assert_eq!(path_of(&moved["to"]), to);
+        let followed = moved["followed"].as_array().cloned().unwrap_or_default();
+        assert_eq!(followed.len(), 1, "{moved}");
+        assert_eq!(followed[0]["pane"].as_u64(), Some(edited));
+        assert_eq!(path_of(&followed[0]["from"]), at(&["src", "a.txt"]));
+        assert_eq!(path_of(&followed[0]["to"]), to);
+        assert_eq!(std::path::PathBuf::from(&host.previews[&edited].0), to);
+        let buffer = &mut host.preview_edits.get_mut(&edited).unwrap().2;
+        assert_eq!(buffer.path(), to.as_path());
+        assert_eq!(buffer.text(), "unsaved\n", "未保存の本文が残る");
+        assert!(buffer.dirty());
+        assert_eq!(
+            buffer.refresh_disk_state().unwrap(),
+            tako_core::DiskState::Unchanged,
+            "新しい場所で外部変更（削除）扱いにならない"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&to).unwrap(),
+            "disk\n",
+            "移動は保存しない（ディスクの中身は移す前のまま）"
+        );
+
+        let moved = dispatch(
+            &mut host,
+            issue1834_move(&at(&["folder"]), &at(&["dst"])),
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(moved["kind"].as_str(), Some("dir"));
+        assert_eq!(
+            moved["followed"][0]["pane"].as_u64(),
+            Some(inner),
+            "フォルダを移すと配下を開いているペインが付け替わる"
+        );
+        assert_eq!(
+            std::path::PathBuf::from(&host.previews[&inner].0),
+            at(&["dst", "folder", "inner", "x.txt"])
+        );
+        assert_eq!(host.file_moves.len(), 2, "移した後の後始末は 1 回ずつ");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #1834: 同名・自分自身・自分の配下・移動先の欠落は理由つきで断り、
+    /// 何も動かさない（後始末も呼ばない）。同じ場所は何もせず `moved: false`
+    #[test]
+    fn issue1834_同名と配下への移動は理由つきで断り何も動かさない() {
+        let dir = issue1834_scratch("refuse");
+        std::fs::write(dir.join("dst/a.txt"), "existing\n").unwrap();
+        let mut host = MockHost::new();
+        let err = |host: &mut MockHost, request: Request| {
+            dispatch(host, request, PaneOrigin::Cli)
+                .unwrap_err()
+                .to_string()
+        };
+        let taken = err(
+            &mut host,
+            issue1834_move(&dir.join("src/a.txt"), &dir.join("dst")),
+        );
+        assert!(taken.contains("同じ名前"), "{taken}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("dst/a.txt")).unwrap(),
+            "existing\n",
+            "上書きしない"
+        );
+        assert!(dir.join("src/a.txt").is_file(), "元も残る");
+        let descendant = err(
+            &mut host,
+            issue1834_move(&dir.join("folder"), &dir.join("folder/inner")),
+        );
+        assert!(descendant.contains("配下"), "{descendant}");
+        let itself = err(
+            &mut host,
+            issue1834_move(&dir.join("folder"), &dir.join("folder")),
+        );
+        assert!(itself.contains("自分自身"), "{itself}");
+        assert!(dir.join("folder/inner/x.txt").is_file());
+        let missing = dispatch(
+            &mut host,
+            Request::FileOp {
+                op: FileOpKind::Move,
+                path: dir.join("src/a.txt").display().to_string(),
+                name: None,
+                pane: None,
+                dest: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(matches!(missing, DispatchError::InvalidParams(_)));
+        assert!(host.file_moves.is_empty(), "断ったら後始末も走らない");
+
+        let same = dispatch(
+            &mut host,
+            issue1834_move(&dir.join("src/a.txt"), &dir.join("src")),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(same["moved"].as_bool(), Some(false));
+        assert!(host.file_moves.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #1834: `dest` は省略時に wire へ現れない（旧クライアントの JSON がそのまま通る）
+    #[test]
+    fn issue1834_destは省略時にwireへ現れず旧いjsonも読める() {
+        let old = Request::FileOp {
+            op: FileOpKind::Rename,
+            path: "/w/a".into(),
+            name: Some("b".into()),
+            pane: None,
+            dest: None,
+        };
+        let text = serde_json::to_string(&old).unwrap();
+        assert!(!text.contains("dest"), "{text}");
+        let back: Request = serde_json::from_str(&text).unwrap();
+        assert!(matches!(back, Request::FileOp { dest: None, .. }));
+        let moved = serde_json::to_string(&issue1834_move(
+            std::path::Path::new("/w/a"),
+            std::path::Path::new("/w/d"),
+        ))
+        .unwrap();
+        assert!(moved.contains("\"dest\":\"/w/d\""), "{moved}");
+        assert!(moved.contains("\"move\""), "{moved}");
     }
 }

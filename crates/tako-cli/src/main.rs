@@ -1822,6 +1822,14 @@ enum FileCommand {
     },
     /// ファイル・フォルダの名前を変更する
     Rename { path: String, name: String },
+    /// ファイル・フォルダを別のフォルダへ移す（ファイルツリーのドラッグ＆ドロップと同じ。
+    /// 同名・自分の配下・別のボリュームは断る。開いているペインは新しいパスへ付け替わる）
+    Move {
+        /// 移すファイル・フォルダ
+        path: String,
+        /// 移動先のフォルダ
+        dest: String,
+    },
     /// 新しいファイルを作成する（path 配下に name で作成）
     Create { path: String, name: String },
     /// 新しいフォルダを作成する（path 配下に name で作成）
@@ -8026,6 +8034,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                     path: abs,
                     name: None,
                     pane: target_pane(*pane)?,
+                    dest: None,
                 }
             } else {
                 Request::FileOp {
@@ -8033,6 +8042,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                     path: abs,
                     name: None,
                     pane: None,
+                    dest: None,
                 }
             }
         }
@@ -8041,48 +8051,64 @@ fn build_request(command: &Command) -> Result<Request, String> {
             path: resolve_cli_path(path),
             name: None,
             pane: None,
+            dest: None,
         },
         Command::File(FileCommand::OpenTerminal { path, pane }) => Request::FileOp {
             op: tako_control::protocol::FileOpKind::OpenTerminal,
             path: resolve_cli_path(path),
             name: None,
             pane: target_pane(*pane)?,
+            dest: None,
         },
         Command::File(FileCommand::Rename { path, name }) => Request::FileOp {
             op: tako_control::protocol::FileOpKind::Rename,
             path: resolve_cli_path(path),
             name: Some(name.clone()),
             pane: None,
+            dest: None,
+        },
+        // #1834: 移す元・移動先ともに CLI の cwd 基準で絶対パスへ（GUI の cwd で読ませない）
+        Command::File(FileCommand::Move { path, dest }) => Request::FileOp {
+            op: tako_control::protocol::FileOpKind::Move,
+            path: resolve_cli_path(path),
+            name: None,
+            pane: None,
+            dest: Some(resolve_cli_path(dest)),
         },
         Command::File(FileCommand::Create { path, name }) => Request::FileOp {
             op: tako_control::protocol::FileOpKind::CreateFile,
             path: resolve_cli_path(path),
             name: Some(name.clone()),
             pane: None,
+            dest: None,
         },
         Command::File(FileCommand::Mkdir { path, name }) => Request::FileOp {
             op: tako_control::protocol::FileOpKind::CreateDir,
             path: resolve_cli_path(path),
             name: Some(name.clone()),
             pane: None,
+            dest: None,
         },
         Command::File(FileCommand::Trash { path }) => Request::FileOp {
             op: tako_control::protocol::FileOpKind::Trash,
             path: resolve_cli_path(path),
             name: None,
             pane: None,
+            dest: None,
         },
         Command::File(FileCommand::Open { path }) => Request::FileOp {
             op: tako_control::protocol::FileOpKind::OpenDefault,
             path: resolve_cli_path(path),
             name: None,
             pane: None,
+            dest: None,
         },
         Command::File(FileCommand::OpenWith { path, name }) => Request::FileOp {
             op: tako_control::protocol::FileOpKind::OpenWith,
             path: resolve_cli_path(path),
             name: Some(name.clone()),
             pane: None,
+            dest: None,
         },
         // #1182: 開き先（プレビュー / シェル）は分割元のペインを基準に決まるので pane を渡す
         Command::File(FileCommand::OpenInTako { path, pane }) => Request::FileOp {
@@ -8090,6 +8116,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
             path: resolve_cli_path(path),
             name: None,
             pane: target_pane(*pane)?,
+            dest: None,
         },
         Command::Video(VideoCommand::Play { pane }) => Request::VideoPlayback {
             pane: target_pane(*pane)?,
