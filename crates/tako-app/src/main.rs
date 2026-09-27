@@ -26947,6 +26947,9 @@ fn self_test_isolation_defaults(
 }
 
 fn main() {
+    // #1811: 製品の入口を通ったと宣言する（**必ず 1 文目**）。これが無いプロセスは
+    // 置き場に関係なくテスト扱い = 本番の data dir / ホーム配下へ書かない
+    tako_core::paths::mark_product_process();
     // Issue #168: メインスレッド・ストール診断。重い区間（dispatch / render /
     // save_layout 等）の 2 秒超え継続を drop を待たず perf.log に記録する
     // #782: ここ（GUI プロセスのメインスレッド）を基準に、以後 perf_span は

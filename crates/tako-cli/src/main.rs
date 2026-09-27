@@ -3605,6 +3605,9 @@ enum MenuCommand {
 }
 
 fn main() -> ExitCode {
+    // #1811: 製品の入口を通ったと宣言する（**必ず 1 文目**。`cli_main` のスレッドより前）。
+    // これが無いプロセスは置き場に関係なくテスト扱い = 本番の data dir / ホーム配下へ書かない
+    tako_core::paths::mark_product_process();
     // Windows のメインスレッドは既定 1MB スタックで、コマンド定義（clap の巨大ツリー）の
     // 構築だけで debug ビルドが溢れる（macOS / Linux は 8MB）。**main 由来の既存バグ**で、
     // `origin/main` の `tako.exe list` も実機で `has overflowed its stack` で落ちる

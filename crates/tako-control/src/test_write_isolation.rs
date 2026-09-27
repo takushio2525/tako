@@ -21,6 +21,11 @@
 //! 子（[`tests::子プロセス_本番相当の書き込みを一通り行う`]）を
 //! `--exact` で名指しして起こす。子は目印の環境変数が無ければ即座に返るので、
 //! 通常の `cargo test` では 1 度も書き込みを試みない。
+//!
+//! **子を `deps/` の外へ置いても同じ**であることも見る（#1811）。テスト判定が
+//! 「実行ファイルの置き場」だけだった頃は、計測のために `/tmp` へコピーした
+//! テストバイナリが本番の `recent.json` を上書きし、`shell-integration/cli-dir` を空にした。
+//! 親はこのテストバイナリを一時 dir へ置き直し（同じ名前 / 改名）、そこから子を起こす。
 
 #[cfg(test)]
 mod tests {
@@ -62,7 +67,19 @@ mod tests {
         extra: &[(&str, &str)],
     ) -> (bool, String, Vec<String>) {
         let exe = std::env::current_exe().expect("テストバイナリのパス");
-        let mut cmd = std::process::Command::new(&exe);
+        run_child_at(&exe, fake_home, data_dir, legacy, extra)
+    }
+
+    /// [`run_child_with`] の子を**指定の実行ファイル**から起こす版（#1811）。
+    /// `deps/` の外へ置き直したこのテストバイナリ（[`placed_outside_deps`]）を渡す
+    fn run_child_at(
+        exe: &Path,
+        fake_home: &Path,
+        data_dir: Option<&Path>,
+        legacy: bool,
+        extra: &[(&str, &str)],
+    ) -> (bool, String, Vec<String>) {
+        let mut cmd = std::process::Command::new(exe);
         // `--nocapture`: 子が自分の観測（[`RESOLVED_MARKER`]）を親へ渡す唯一の口。
         // libtest は既定で子テストの標準出力を飲み込むので、これが無いと親は
         // 「子が CLI を解決できたのか」を知れない
@@ -76,6 +93,8 @@ mod tests {
             .env("LOCALAPPDATA", fake_home.join("AppData/Local"))
             // 逃げ道を全部塞ぐ: これらが立っていると「隔離できている」ように見えてしまう
             .env_remove("TAKO_ISOLATED")
+            .env_remove("TAKO_SELF_TEST")
+            .env_remove("TAKO_VISUAL_TEST")
             .env_remove("TAKO_ORCHESTRATOR_DIR")
             .env_remove("TAKO_PERF_LOG")
             .env_remove("CLAUDE_CONFIG_DIR")
@@ -89,6 +108,8 @@ mod tests {
         } else {
             cmd.env_remove("TAKO_944_LEGACY");
         }
+        // #1811 の A/B は `extra` で名指ししたときだけ立てる（親の env から漏らさない）
+        cmd.env_remove("TAKO_1811_LEGACY");
         for (key, val) in extra {
             cmd.env(key, val);
         }
@@ -96,6 +117,49 @@ mod tests {
         let mut stdout = String::from_utf8_lossy(&out.stdout).to_string();
         stdout.push_str(&String::from_utf8_lossy(&out.stderr));
         (out.status.success(), stdout, files_under(fake_home))
+    }
+
+    /// このテストバイナリを**`deps/` の外**（一時 dir）へ置き直したパス（#1811）。
+    ///
+    /// `rename` が偽なら同じ名前（`<名前>-<hash>`。#1811 の事故の形）、真なら
+    /// ハッシュの付かない名前にする（名前の形で拾う判定では救えない形）。
+    /// 置き直しはプロセスで 1 回だけ（テストバイナリは大きいので、テストごとに複製しない）。
+    /// 置き場は [`tako_core::test_residue::process_scratch`] = プロセス終了時に消える
+    fn placed_outside_deps(rename: bool) -> PathBuf {
+        static SAME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        static RENAMED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        let slot = if rename { &RENAMED } else { &SAME };
+        slot.get_or_init(|| {
+            let exe = std::env::current_exe().expect("テストバイナリのパス");
+            let name = if rename {
+                format!("tako-1811-renamed{}", std::env::consts::EXE_SUFFIX)
+            } else {
+                exe.file_name()
+                    .expect("テストバイナリのファイル名")
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let dir = tako_core::test_residue::process_scratch(if rename {
+                "1811-renamed"
+            } else {
+                "1811-same"
+            });
+            let to = dir.join(name);
+            // 同じボリュームならハードリンク（一瞬で済む）、跨ぐならコピーへ落とす
+            // （Windows の CI は一時 dir と作業ツリーのドライブが違う）
+            if std::fs::hard_link(&exe, &to).is_err() {
+                std::fs::copy(&exe, &to).expect("テストバイナリを一時 dir へ置き直せる");
+            }
+            assert!(
+                to.parent()
+                    .and_then(Path::file_name)
+                    .is_none_or(|n| n != "deps"),
+                "置き直し先が deps/ の直下になっている: {}",
+                to.display()
+            );
+            to
+        })
+        .clone()
     }
 
     /// 使い捨ての空ディレクトリ（テスト間で衝突しない名前）
@@ -188,6 +252,15 @@ mod tests {
 
         // 4. タスクチェックポイント（<data_dir>/task_checkpoints.yaml と .lock）
         let _ = crate::task_checkpoints::suspend_by_pane(944, "#944 番犬");
+
+        // 4b. 最近開いた項目（<data_dir>/recent.json）。#1811 の実害はここで、
+        //     deps/ の外へコピーしたテストバイナリが本番の一覧を 1 件で上書きした
+        //     （復元元なし）。tako-core 側の書き込みなので cfg(test) は届かない
+        let mut recent = tako_core::recent::RecentList::default();
+        recent.push(tako_core::recent::RecentEntry::Ssh {
+            host: "tako-1811-probe".into(),
+        });
+        recent.save();
 
         // 5. 外部エージェントの事前信頼（~/.claude.json・~/.codex/config.toml・
         //    ~/.gemini/antigravity-cli/settings.json）
@@ -308,6 +381,10 @@ mod tests {
         assert!(
             has("shell-integration/"),
             "旧挙動で shell-integration が出ない: {created:#?}"
+        );
+        assert!(
+            has("recent.json"),
+            "旧挙動で recent.json が出ない（子の 4b が書いていない）: {created:#?}"
         );
         // data dir の外（tako-control の cfg(test) 隔離を切ったぶん）
         assert!(
@@ -520,6 +597,98 @@ mod tests {
         assert!(
             in_home.is_empty(),
             "TAKO_DATA_DIR を渡しても HOME へ書いている: {in_home:#?}"
+        );
+    }
+
+    /// 安全側へ倒したときに子が stderr へ出す目印（`paths::warn_no_product_entry`）
+    const FAILSAFE_MARKER: &str = "Issue #1811";
+
+    /// #1811: **テストバイナリを `deps/` の外へ置いても**本番相当の置き場へ 1 バイトも書かない。
+    ///
+    /// 修正前は `is_test_process()` が実行ファイルの置き場だけで決まっていたので、
+    /// 計測のために `/tmp` へコピーしたテストバイナリが本番の `recent.json` を上書きし、
+    /// `shell-integration/cli-dir` を空にし、実 agent CLI を実 HOME で起動した。
+    /// 同じ名前のまま置き直した形（事故の形）と、改名した形（名前の形で拾う判定では
+    /// 救えない形）の両方を見る。どちらも**安全側へ倒した理由**（製品の入口を通っていない）
+    /// を stderr へ出すことまで確かめる（`deps/` の判定で偶然真になったのではない）
+    #[test]
+    fn depsの外へ置いたテストバイナリも本番相当の置き場へ何も書かない() {
+        for rename in [false, true] {
+            let exe = placed_outside_deps(rename);
+            let home = tako_core::test_residue::ScratchDir::new("1811-home");
+            let (ok, stdout, created) = run_child_at(&exe, home.path(), None, false, &[]);
+
+            assert!(ok, "子テストが失敗した（rename={rename}）\n{stdout}");
+            assert!(
+                stdout.contains("1 passed"),
+                "子テストが実行されていない（rename={rename}）\n{stdout}"
+            );
+            assert!(
+                created.is_empty(),
+                "deps/ の外のテストバイナリが本番相当の HOME へ書いた（#1811。rename={rename}）: \
+                 {created:#?}"
+            );
+            assert!(
+                stdout.contains(FAILSAFE_MARKER),
+                "安全側へ倒した知らせが出ていない（rename={rename}）\n{stdout}"
+            );
+        }
+    }
+
+    /// A/B: 修正前の判定（`TAKO_1811_LEGACY=1` = 置き場だけで決める）へ戻すと、
+    /// `deps/` の外へ置いた**同じ子**が本番相当の場所へ書く = 上の番犬に検出力がある。
+    ///
+    /// 事故で観測した書き込み（`recent.json` の上書き・`shell-integration/cli-dir`・
+    /// `persist.log`・`~/.claude.json` 系）をここで名指しで再現する
+    #[test]
+    fn 修正前の判定ではdepsの外のテストバイナリが本番相当の置き場へ書く() {
+        let exe = placed_outside_deps(false);
+        let home = tako_core::test_residue::ScratchDir::new("1811-legacy");
+        let (ok, stdout, created) =
+            run_child_at(&exe, home.path(), None, false, &[("TAKO_1811_LEGACY", "1")]);
+
+        assert!(ok, "子テストが失敗した\n{stdout}");
+        let has = |needle: &str| created.iter().any(|f| f.contains(needle));
+        for needle in [
+            "recent.json",
+            "shell-integration/cli-dir",
+            "persist.log",
+            ".claude",
+        ] {
+            assert!(
+                has(needle),
+                "修正前の判定で {needle} が出ない（検出力が無い）: {created:#?}"
+            );
+        }
+        assert!(
+            !stdout.contains(FAILSAFE_MARKER),
+            "修正前の判定なのに安全側へ倒した知らせが出ている\n{stdout}"
+        );
+    }
+
+    /// #1811 のエッジ: `deps/` の外でも**明示の `TAKO_DATA_DIR` は尊重**し、
+    /// ホーム側（外部エージェントの設定）は倒したままにする
+    #[test]
+    fn depsの外でも明示のtako_data_dirは尊重される() {
+        let exe = placed_outside_deps(true);
+        let base = tako_core::test_residue::ScratchDir::new("1811-explicit");
+        let fake_home = base.path().join("home");
+        let data_dir = base.path().join("data");
+        std::fs::create_dir_all(&fake_home).expect("空の HOME を作れる");
+
+        let (ok, stdout, in_home) = run_child_at(&exe, &fake_home, Some(&data_dir), false, &[]);
+        let in_data = files_under(&data_dir);
+
+        assert!(ok, "子テストが失敗した\n{stdout}");
+        for name in ["persist.log", "recent.json"] {
+            assert!(
+                in_data.iter().any(|f| f == name),
+                "明示した TAKO_DATA_DIR へ {name} が書かれていない: {in_data:#?}"
+            );
+        }
+        assert!(
+            in_home.is_empty(),
+            "deps/ の外で TAKO_DATA_DIR を渡しても HOME へ書いている: {in_home:#?}"
         );
     }
 }

@@ -2248,8 +2248,9 @@ Dock のピン留めは `.app` への **file URL ブックマーク**（`com.app
 - **data dir 配下 → `tako_core::paths::data_dir()` が実行時に倒す**（1 か所で全部）。
   `cfg(test)` は**クレートを跨がない**（`tako-control` のテストから呼ばれた
   `tako-core::shell_integration::install` は素通りする / 統合テストから見た lib も
-  非テストビルド）ので、テストプロセスかどうかを **`current_exe()` の置き場**で判定する
-  （`<target>/<profile>/deps/<名前>-<hash>`。`cargo run` も `.app` も `deps/` を通らない）。
+  非テストビルド）ので、テストプロセスかどうかを**実行時に**判定する
+  （`paths::is_test_process`。`current_exe()` が `deps/<名前>-<hash>` にある**か**、
+  **製品の入口を通っていない**か。後者は下の「判定から外れたら安全側へ倒す」）。
   **明示の `TAKO_DATA_DIR` は常に優先**する
 - **ホーム配下の外部エージェント設定 → `orchestrator::agent_config_home()`**（`cfg(test)` で
   隔離）。`home_dir()` 自体は倒さない（表示・比較のテストが壊れる）。
@@ -2289,6 +2290,40 @@ Dock のピン留めは `.app` への **file URL ブックマーク**（`com.app
   `npm run e2e` だけでホームへ PNG 80 枚）。リポの外へ残すのは実行する人が
   `TAKO_EVIDENCE_DIR` を渡したときだけ。番犬は
   `crates/tako-control/tests/issue1749_pwa_e2e_output_watchdog.rs`
+
+### 判定から外れたら安全側へ倒す（Issue #1811）
+
+**本番の置き場へ届くのは、製品の入口を通ったプロセスだけ。**
+テスト判定が「実行ファイルが `deps/` にあるか」の 1 つだけだった頃は、置き場を変えるだけで
+偽になった。計測のためにテストバイナリを `/tmp` へコピーして走らせた worker が、本番の
+`recent.json` を上書きし（復元元なし）・`shell-integration/cli-dir` を空にし・
+実 agy / codex / claude を実 HOME で起動した（修正前の実測: 一時 HOME を本番に見立てると
+17 ファイル）。
+
+- **製品の `main`（`tako-app` / `tako`）は 1 文目で `tako_core::paths::mark_product_process()`
+  を呼ぶ**。`is_test_process()` は「`deps/` にある」**または**「この宣言が無い」で真になるので、
+  libtest のハーネス（製品の `main` を通らない）は、コピー・改名・別ランナーの置き場の
+  どれでもテスト扱いのまま残る。安全側へ倒した回は stderr へ 1 回だけ
+  `…（Issue #1811）` と知らせる（実行ファイルは名前だけ出す）
+- `deps/` の中では宣言してもテストのまま（テストが製品の入口を呼んで「製品に化ける」経路を作らない）。
+  規則は `paths::judge_test_process` の 1 実装で、`data_dir()` / `agent_config_home()` /
+  `agent_probe::blocked()` / シェル履歴の隔離はすべてここを通る = 1 か所で全部に効く
+- **1 文目でなければならない**: `is_verification_process()` は判定を `OnceLock` に覚えるので、
+  宣言より前に判定を配ると製品がテスト扱いのまま固まる（debug ビルドは宣言側の
+  `debug_assert!` で落ちる）
+- **実行ファイルの入口を足したら分類する**: 配布物に入る製品なら 1 文目で宣言、検証・テスト用
+  （`examples/mcp_host.rs` / `src/bin/tako-lsp-fake.rs`）なら宣言せず、番犬の `NOT_PRODUCT` へ
+  理由つきで載せる。宣言しない入口は `TAKO_DATA_DIR` を渡さない限り一時 dir を使う
+- 番犬は 3 段: `crates/tako-control/tests/issue1811_product_entry_watchdog.rs`（1 文目にあること /
+  製品の入口以外が宣言していないこと / 入口が全部分類されていること）、
+  `tako_control::test_write_isolation` の `depsの外へ置いたテストバイナリも…`（このテストバイナリを
+  一時 dir へ**同じ名前 / 改名**で置き直し、空の HOME へ 1 つも書かないことを実測）、
+  `crates/tako-cli/tests/issue1811_product_not_test.rs`（ビルドした製品の `tako` が一時 HOME で
+  本番相当の置き場を解決する = 逆向きの誤判定が無い）。A/B は `TAKO_1811_LEGACY=1`
+  （置き場だけで決める修正前の判定。同じ子が `recent.json` / `cli-dir` / `~/.claude` 系を書く）
+- それでも**テストバイナリを `deps/` の外へ持ち出して走らせない**のが既定の作法
+  （計測は `cargo test` か `target/<profile>/deps/` の正規の置き場から、`TAKO_DATA_DIR` と
+  一時 HOME を付けて走らせる）。この節の規則は、作法を外した回に本番を守る最後の柵
 
 ### 使い捨ての置き場は作った経路が消す（Issue #1296）
 
