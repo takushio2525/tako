@@ -2071,6 +2071,12 @@ FR-2.7.6 は画像ペインを並べて実現する）。
 #916）ので、記録済みの警告の「解消」が出る。構造の番犬は
 `crates/tako-control/tests/issue1763_theme_reload_warnings_watchdog.rs`、実経路は
 `scripts/test-theme-reload-1763.sh`（CLI / MCP の読み直し・トグル・壊れた JSON）。
+**応答にも載せる**（#1820）: `tako theme` / MCP `tako_theme` の status / set / toggle の応答へ
+`warnings`（`<キー>: <理由>` の配列 = persist.log の行の本体と同じ文字列）を足す。引くのは
+GUI が**適用中のテーマ**の帳簿（`ThemeWarningLog::current` → `ControlHost::theme_warnings`）で、
+settings.json を読み直した値ではない（監視は無いので、手で直して未反映の値を応答にだけ
+出すと persist.log と食い違う）。警告が無いときはキーごと出さない（応答は #1820 以前と
+バイト一致）。実経路は `scripts/test-menu-theme-1820.sh`。
 
 ### FR-4.7 プロファイルの GUI 編集（Issue #721。✅ 2026-08-01）
 

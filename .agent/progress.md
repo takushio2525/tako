@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-09-27（#1653: 検索・置換で大文字小文字を区別し（既定）、単語単位のトグルを足した）
-- `find_all` が常に小文字化し `replace_all("value"→"item")` が `Value::new()` を `item::new()` にしていた。`SearchOptions`（既定 = 区別する）を tako-core → dispatch（省略時は `SearchOptions::resolve` の 1 実装）→ CLI `-i` / `-w` → MCP `case_sensitive` / `whole_word` → 検索欄の SVG トグル 2 つへ 1:1。小文字写しは区別しない検索のときだけ作り本文が変わるまで使い回す（1 MB の 1 打鍵 4.449 → 0.509ms / 区別しない 1.251ms）
-- 実測: `scripts/test-search-case-1653.sh` **25 PASS 0 FAIL**（tako-vd でトグルを実マウスで押して 3 → 5 → 4 → 2 → 3 件・置換で `Value` が残る + CLI / MCP の字面一致）・番犬 `issue1653_search_case_watchdog` + 単体へ注入 6 通りすべて file:line 名指しで FAILED → 戻して緑
-
 ## 2026-09-27（#1807: fd 継承の番犬が無関係な PR の CI で間欠的に落ちる件を、検査の片の偽陽性として直した）
 - 真因は実装でもテストの並列性でもなく、検査の片 `fd_inherit::inherited_probe_script` の `{ : >&N; } 2>/dev/null`。bash（macOS の `/bin/sh`）は `>&N` の前に元の fd 2 / 1 を 10 以上の空き番号へ退避するので、閉じた 10 / 11 を「開いている」と読んでいた（CI で落ちた回は fd 10）。外部コマンドの fork 子で試す形（`/usr/bin/true 2>/dev/null >&N`）へ替え、daemon と PTY の両方の番犬が同時に直った
 - 実測: 開く番号を 3〜20 で固定すると修正前は 10 / 11 だけ 100% FAILED（PTY 経路も同じ）→ 修正後 3 回ずつ全 ok。全 lib 20 回は修正前後とも失敗 0（手元では番号が 10 / 11 に当たらなかった）。seal を外す注入で両経路とも全番号で file:line 名指しの FAILED、旧い片へ戻す注入で片の単体テストが `[4, 10, 11, 12]` で FAILED → 戻して緑
@@ -65,3 +61,8 @@
 ## 2026-09-27（#1730: 設定なしでプロジェクトの .venv / uv / poetry 等で走るようにした）
 - `.py` が常に PATH の `python3` で走っていたので、S1 の検出（`runtime_env`）を `Run` / `RunResolve` へ配線した。`py` 行は `${python} ${fileBase}`（実行環境が無ければ今とバイト一致）、activation は境界 B1 の `compose_run_script` でコマンドの先頭へ埋める。Tier P は `probe::output_with_timeout` だけを通し、答えを覚えて `Run` は子プロセス無しで重ねる（`runtime_probe`）。`RunResolve` は `prepare_offload` へ載せ `refresh` を足した
 - 実測: `scripts/test-runner-runtime-1730.sh` **24 PASS 0 FAIL**（venv / uv run / 壊れた venv / 空白と日本語 / 固まる Tier P の打ち切り / CLI と MCP の字面一致 / `TAKO_1730_LEGACY=1` で ① が FAILED）・Tier F 0.09〜0.35 ms・合流後の workspace 6070 passed 0 failed・MCP カタログ +434 B
+
+## 2026-09-27（#1820: メニュー項目名から `/` を外して全項目を invoke できるようにし、tako theme の応答に warnings を載せた）
+- 「ライト / ダークを切替」など 4 項目（日英）がパス区切りで割れて `tako menu invoke` で名指しできなかった（英語の `Light/Dark` は空白が無く偶然届いていた）。「・」へ言い換え、番犬 2 本（全ラベルの `/` を両 OS の文言まで file:line で名指し / 実メニューの全項目を日英でフルパス・項目名の両方から `resolve_menu_item` → `find_menu_action_in` へ通す）
+- `tako theme` / MCP `tako_theme` の status / set / toggle へ `warnings`（persist.log と同じ帳簿 `ThemeWarningLog::current` から。0 件ならキーごと出さず従来とバイト一致）。カタログ +105 B（#1730 と合流後 194,174 / 204,800）
+- 実測: `scripts/test-menu-theme-1820.sh` 修正後 33 PASS 0 FAIL / main 15 PASS 18 FAIL・注入 6 通りすべて FAILED → 戻して緑・clippy 3 宇宙 0

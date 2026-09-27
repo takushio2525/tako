@@ -60,6 +60,11 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
 - 関数名がロケールキー（例: `sleep_guard::chip_active` → キー `sleep_guard.chip_active`）。
   モジュールの `catalog_has_both_languages_and_no_emoji` テストに新文字列を追加する
   （非空・絵文字なし・英語側に日本語が残っていないことを機械検査）
+- **メニュー名・項目名に `/` を入れない**（日英とも。#1820）。`tako menu invoke` / MCP
+  `tako_menu` のパス区切りが `/` なので、含めた項目は AI から名指しできない（「ライト / ダークを
+  切替」が実際に invoke できなかった）。2 つを並べるときは「・」で書く。番犬は
+  `app_menu_tests::メニューの名前にパス区切りが無い`（両 OS の文言を file:line で名指し）と
+  `全項目がtako_menu_invokeで名指しできる`（実メニューの全項目を日英で `resolve_menu_item` へ通す）
 - **対象は「画面に描画される文字列」のみ**。診断ログ（eprintln / persist.log）・
   dispatch / CLI / MCP のエラーメッセージ・AI へのプロンプトは対象外（現状維持 = 日本語可）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は

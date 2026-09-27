@@ -2,6 +2,11 @@
 //!
 //! メニューは起動時に `cx.set_menus` で OS へ渡すため、言語切替時は
 //! `TakoApp::render` の言語監視が `app_menus()` を再構築して貼り直す。
+//!
+//! **メニュー名・項目名に `/` を入れない**（日英とも。#1058 / #1820）: `tako menu invoke` /
+//! MCP `tako_menu` のパス区切りが `/` なので、含めるとその項目を AI から名指しできなくなる
+//! （`resolve_menu_item` が分割する。「ライト / ダークを切替」が実際に invoke できなかった）。
+//! 2 つを並べるときは「・」で書く。番犬は `app_menu_tests::メニューの名前にパス区切りが無い`
 
 // --- メニュー名 -------------------------------------------------------------
 
@@ -153,13 +158,13 @@ pub fn reset_zoom() -> &'static str {
     tr!("文字サイズを戻す", "Reset Zoom")
 }
 pub fn toggle_theme() -> &'static str {
-    tr!("ライト / ダークを切替", "Toggle Light/Dark Theme")
+    tr!(
+        "テーマを切替（ライト・ダーク）",
+        "Toggle Theme (Light, Dark)"
+    )
 }
 /// 表示モード切替（#1058）。タブバー右端のボタンは狭い / 高 DPI のウインドウでは
-/// 画面外へ出ることがある（Windows 実機で実測）ので、**常に見えるメニューからも**切り替える。
-///
-/// **ラベルに `/` を入れない**こと: `tako menu` / MCP `tako_menu` のパス区切りが `/` なので、
-/// 含めるとその項目を AI から名指しできなくなる（`resolve_menu_item` が分割する）
+/// 画面外へ出ることがある（Windows 実機で実測）ので、**常に見えるメニューからも**切り替える
 pub fn toggle_ui_mode() -> &'static str {
     tr!("表示モードを切替", "Toggle Display Mode")
 }
@@ -167,8 +172,8 @@ pub fn toggle_ui_mode() -> &'static str {
 /// 英語側に「日本語」を含む意図的な例外のため訳し漏れ検査の対象外）
 pub fn switch_language() -> &'static str {
     tr!(
-        "表示言語を切替（日本語 / English）",
-        "Switch Language (日本語 / English)"
+        "表示言語を切替（日本語・English）",
+        "Switch Language (日本語, English)"
     )
 }
 pub fn toggle_fullscreen() -> &'static str {
@@ -181,13 +186,13 @@ pub fn minimize() -> &'static str {
     tr!("しまう", "Minimize")
 }
 pub fn zoom_window() -> &'static str {
-    tr!("拡大 / 縮小", "Zoom")
+    tr!("拡大・縮小", "Zoom")
 }
-/// Windows 版の「拡大 / 縮小」（#657）。GPUI Windows の `zoom()` は `SW_MAXIMIZE`
+/// Windows 版の「拡大・縮小」（#657）。GPUI Windows の `zoom()` は `SW_MAXIMIZE`
 /// 固定でトグルにならないため、tako 側で最大化 ↔ 復元を出し分ける。macOS の
-/// 「拡大 / 縮小」と違って**状態が明確な 2 択**なので、Windows 慣習の語で書く
+/// 「拡大・縮小」と違って**状態が明確な 2 択**なので、Windows 慣習の語で書く
 pub fn maximize_restore() -> &'static str {
-    tr!("最大化 / 元のサイズに戻す", "Maximize / Restore")
+    tr!("最大化・元のサイズに戻す", "Maximize or Restore")
 }
 pub fn next_tab() -> &'static str {
     tr!("次のタブ", "Next Tab")

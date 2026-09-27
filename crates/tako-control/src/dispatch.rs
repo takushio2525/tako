@@ -4921,15 +4921,24 @@ fn dispatch_inner(
             use tako_core::theme::{parse_hex_color, Theme, ThemeMode};
             let action = action.as_deref().unwrap_or("status");
             let should_save = !cfg!(test) && std::env::var_os("TAKO_SELF_TEST").is_none();
+            // #1820: 読めない色を無視しているときは `warnings`（`<キー>: <理由>`）を載せる。
+            // GUI が適用中のテーマの帳簿（persist.log へ出した行と同じ）から引くので、
+            // 手で直して未反映の settings.json を読み直した値にはならない。
+            // 無いときはキーごと出さない（応答は #1820 以前とバイト一致）
             let make_status = |host: &dyn ControlHost| {
                 let settings = crate::settings::load();
                 let presets: Vec<String> = settings.theme_presets.keys().cloned().collect();
-                serde_json::json!({
+                let mut status = serde_json::json!({
                     "theme": settings.theme,
                     "mode": host.theme_mode().as_str(),
                     "available": ["dark", "light"],
                     "presets": presets,
-                })
+                });
+                let warnings = host.theme_warnings();
+                if !warnings.is_empty() {
+                    status["warnings"] = serde_json::json!(warnings);
+                }
+                status
             };
             match action {
                 "status" => Ok(make_status(host)),
@@ -14254,7 +14263,8 @@ fn resolve_menu_index(
 }
 
 /// `resolve_menu_item` の戻り
-pub(crate) struct MenuHit {
+#[derive(Debug)]
+pub struct MenuHit {
     /// 解決したフルパス（`ファイル/新規タブ`）
     pub path: String,
     /// アクション名（`tako::NewTab`）
@@ -14266,8 +14276,12 @@ pub(crate) struct MenuHit {
 ///
 /// `path` は `/` 区切りで「メニュー/項目」「メニュー/サブメニュー/項目」または
 /// 項目名のみ（全メニュー横断）。各段の照合は `resolve_menu_index` と同じ
-/// 完全 → 前方 → 部分の順で、曖昧なら候補を並べて拒否する
-fn resolve_menu_item(
+/// 完全 → 前方 → 部分の順で、曖昧なら候補を並べて拒否する。
+///
+/// 公開しているのは tako-app の番犬（#1820）が**実メニューの全項目**をこの 1 実装へ通して
+/// 「`tako menu invoke` で名指しできる」ことを日英で固定するため（ラベルに `/` があると
+/// 分割されて届かない。「ライト / ダークを切替」で実在した穴）
+pub fn resolve_menu_item(
     snapshot: &crate::protocol::MenuBarSnapshot,
     path: &str,
 ) -> Result<MenuHit, DispatchError> {
@@ -16544,6 +16558,8 @@ mod tests {
         stale_pane_map: std::collections::HashMap<PaneId, PaneId>,
         /// #217: UI テーマモード
         theme_mode: tako_core::theme::ThemeMode,
+        /// #1820: 適用中のテーマで無視している色の上書き（`ThemeWarningLog::current` の代役）
+        theme_warnings: Vec<String>,
         /// #694: UI 表示モードとペイン単位の揮発解除
         ui_mode: tako_core::ui_mode::UiMode,
         starter_released: std::collections::HashSet<u64>,
@@ -16640,6 +16656,7 @@ mod tests {
                 pins: Vec::new(),
                 stale_pane_map: std::collections::HashMap::new(),
                 theme_mode: tako_core::theme::ThemeMode::Dark,
+                theme_warnings: Vec::new(),
                 ui_mode: tako_core::ui_mode::UiMode::Terminal,
                 starter_released: std::collections::HashSet::new(),
                 lang_setting: tako_core::i18n::LangSetting::System,
@@ -16942,6 +16959,9 @@ mod tests {
         }
         fn set_theme_mode(&mut self, mode: tako_core::theme::ThemeMode) {
             self.theme_mode = mode;
+        }
+        fn theme_warnings(&self) -> Vec<String> {
+            self.theme_warnings.clone()
         }
         // #694: UI 表示モード（GUI ライク表示）
         fn ui_mode(&self) -> tako_core::ui_mode::UiMode {
@@ -27408,6 +27428,46 @@ mod tests {
             PaneOrigin::Cli,
         )
         .is_err());
+    }
+
+    /// #1820: 読めない色を無視しているとき、status / set / toggle の応答に `warnings`
+    /// （persist.log の行の本体と同じ `<キー>: <理由>`）が載る。無いときはキーごと出さず、
+    /// 応答は #1820 以前と同じキーの組になる
+    #[test]
+    fn テーマの応答に無視した色の警告が載る() {
+        let theme = |action: &str| Request::Theme {
+            action: Some(action.into()),
+            mode: (action == "set").then(|| "dark".into()),
+            target: None,
+            key: None,
+            value: None,
+            name: None,
+            font_family: None,
+            font_size: None,
+        };
+        let mut host = MockHost::new();
+        for action in ["status", "set", "toggle"] {
+            let v = dispatch(&mut host, theme(action), PaneOrigin::Cli).unwrap();
+            let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                ["available", "mode", "presets", "theme"],
+                "{action}: 警告が無いときは warnings を出さない"
+            );
+        }
+        host.theme_warnings = vec![
+            "accent: 不正な色値: '#赤色'".into(),
+            "未知の色キー: nosuch".into(),
+        ];
+        for action in ["status", "set", "toggle"] {
+            let v = dispatch(&mut host, theme(action), PaneOrigin::Cli).unwrap();
+            assert_eq!(
+                v["warnings"],
+                serde_json::json!(["accent: 不正な色値: '#赤色'", "未知の色キー: nosuch"]),
+                "{action}: 帳簿の警告がそのまま順に載る"
+            );
+        }
     }
 
     /// #1756: 色の値は文字単位で検査する。6 バイトの非 ASCII（`#赤色`）がバイト長の検査を

@@ -455,6 +455,15 @@ impl ThemeWarningLog {
         self.last = warnings;
         lines
     }
+
+    /// いま適用しているテーマで無視している色の上書き（`<キー>: <理由>`。#1820）。
+    ///
+    /// 最後の [`Self::reload`] の警告そのもので、persist.log へ
+    /// [`THEME_WARNING_IGNORED`] を付けて出した行の本体と同じ文字列。
+    /// `tako theme` / MCP `tako_theme` の応答の `warnings` はここから組む
+    pub fn current(&self) -> &[String] {
+        &self.last
+    }
 }
 
 /// 設定を書き出す。tmp へ書いて rename する（読み手と競合しない。discovery と同方式）
@@ -856,6 +865,39 @@ mod tests {
             vec![format!("テーマの色上書きを無視: {}", warnings[0])],
             "起動時（帳簿が空）の行は #1756 と同じ `無視: <キー>: <理由>`"
         );
+    }
+
+    /// #1820: `current`（`tako theme` の応答の `warnings`）は、persist.log へ「無視」として
+    /// 出して「解消」でまだ打ち消していない行の本体と常に同じ
+    #[test]
+    fn issue1820_currentはpersist_logの未解消の行と同じ() {
+        let replay = |lines: Vec<String>, live: &mut Vec<String>| {
+            for line in lines {
+                if let Some(w) = line.strip_prefix(THEME_WARNING_IGNORED) {
+                    live.push(w.to_string());
+                } else if let Some(w) = line.strip_prefix(THEME_WARNING_RESOLVED) {
+                    live.retain(|x| x != w);
+                }
+            }
+        };
+        let mut log = ThemeWarningLog::default();
+        let mut live: Vec<String> = Vec::new();
+        assert!(log.current().is_empty(), "読み直す前は空");
+        for colors in [
+            &[("accent", "#赤色"), ("red", "#12345")][..],
+            &[("accent", "#赤色"), ("red", "#12345"), ("blue", "#ｇ00000")],
+            &[("accent", "#ff8800"), ("blue", "#ｇ00000")],
+            &[("accent", "#ff8800")],
+        ] {
+            let s = dark_overrides(colors);
+            replay(reload_lines(&mut log, &s), &mut live);
+            let mut current = log.current().to_vec();
+            current.sort();
+            live.sort();
+            assert_eq!(current, live, "{colors:?}");
+            assert_eq!(log.current(), s.resolve_theme().1.as_slice(), "{colors:?}");
+        }
+        assert!(log.current().is_empty(), "直し終えたら空");
     }
 
     /// #1763: 同じ内容のまま何度読み直しても行を積まない
