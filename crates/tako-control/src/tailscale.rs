@@ -5,8 +5,6 @@
 //! （弾 0）が正。setup 状態の判定関数（`setup_status`）は `tako remote start` の
 //! 起動前チェックと、弾 6 の `tako remote setup` ウィザードの両方が共有する。
 
-use std::process::{Command, Stdio};
-
 use serde_json::Value;
 
 /// tailscale CLI の探索候補。PATH → brew 標準 → App Store 版 / brew cask 版
@@ -23,33 +21,104 @@ const TAILSCALE_CANDIDATES: &[&str] = &[
 /// ブロックさせないための上限
 const TAILSCALE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// tailscale CLI のパスを解決する。`TAKO_TAILSCALE_BIN` で差し替え可能
-/// （テスト・検証用。存在しないパスを指定すれば「未導入」を偽装できる）
-pub fn find_tailscale() -> Option<String> {
-    if let Ok(bin) = std::env::var("TAKO_TAILSCALE_BIN") {
-        // 明示指定は候補探索をせず、そのパスが実行可能かだけ確認する
-        if runnable(&bin) {
-            return Some(bin);
-        }
-        return None;
-    }
-    TAILSCALE_CANDIDATES
-        .iter()
-        .find(|c| runnable(c))
-        .map(|c| c.to_string())
+/// tailscale CLI の検出結果（#1797）。**「在るが動かない」を「無い」と分けて持つ**。
+///
+/// `tako setup` の依存チェック段（`setup_deps::resolve`）と remote の段
+/// （[`find_tailscale`] → `remote_setup::check_status`）はどちらもこれを読む。
+/// 依存段が PATH だけで探していた頃は、PATH の外に CLI がある App Store 版を
+/// 「見つかりません」と判定して `--yes` で brew 版まで入れていた（2 系統の同居 = #1038 の条件）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Detection {
+    /// `--version` が上限内に正常終了した（remote はこれだけを使う）
+    Runnable(String),
+    /// 起動はできたが `--version` が上限内に正常終了しなかった（固まる / 非 0）。
+    /// **導入済みとして扱う**: ここで「未導入」と言うと 2 系統目を入れさせる
+    Unrunnable(String),
+    /// どの候補も起動できなかった
+    Absent,
 }
 
-/// コマンドが実行可能か（`--version` が上限内に正常終了するか）を確認する。
+impl Detection {
+    /// remote が使える CLI（[`find_tailscale`] の答え）
+    pub fn into_runnable(self) -> Option<String> {
+        match self {
+            Self::Runnable(path) => Some(path),
+            Self::Unrunnable(_) | Self::Absent => None,
+        }
+    }
+
+    /// 在る CLI（動くかは問わない。依存段の「導入済みか」の答え）
+    pub fn into_present(self) -> Option<String> {
+        match self {
+            Self::Runnable(path) | Self::Unrunnable(path) => Some(path),
+            Self::Absent => None,
+        }
+    }
+}
+
+/// 候補 1 つを試した結果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateProbe {
+    Runnable,
+    Unrunnable,
+    Absent,
+}
+
+/// tailscale CLI を検出する（**検出の正本**。#1797）。`TAKO_TAILSCALE_BIN` で差し替え可能
+/// （テスト・検証用。存在しないパスを指定すれば「未導入」を偽装できる）
+pub fn detect_tailscale() -> Detection {
+    if let Ok(bin) = std::env::var("TAKO_TAILSCALE_BIN") {
+        // 明示指定は候補探索をせず、そのパスだけを試す
+        return pick_candidate([bin.as_str()], |c| probe_candidate(c, TAILSCALE_TIMEOUT));
+    }
+    pick_candidate(TAILSCALE_CANDIDATES.iter().copied(), |c| {
+        probe_candidate(c, TAILSCALE_TIMEOUT)
+    })
+}
+
+/// tailscale CLI のパスを解決する（remote が使う = 実行できるものだけ）
+pub fn find_tailscale() -> Option<String> {
+    detect_tailscale().into_runnable()
+}
+
+/// 候補を順に試して 1 つに決める（**純粋関数**。試し方を差し替えて検査する）。
+///
+/// 実行できる候補が 1 つでもあれば先頭のそれを採る（#1797 前の [`find_tailscale`] と同じ答え）。
+/// 無ければ「在るが動かない」先頭の候補を返し、それも無ければ [`Detection::Absent`]
+fn pick_candidate<'a>(
+    candidates: impl IntoIterator<Item = &'a str>,
+    mut probe: impl FnMut(&str) -> CandidateProbe,
+) -> Detection {
+    let mut unrunnable = None;
+    for candidate in candidates {
+        match probe(candidate) {
+            CandidateProbe::Runnable => return Detection::Runnable(candidate.to_string()),
+            CandidateProbe::Unrunnable => {
+                unrunnable.get_or_insert_with(|| candidate.to_string());
+            }
+            CandidateProbe::Absent => {}
+        }
+    }
+    unrunnable.map_or(Detection::Absent, Detection::Unrunnable)
+}
+
+/// 候補 1 つを試す（`--version` が上限内に正常終了するか。上限は単体テストが縮められるよう引数）。
 ///
 /// 待ちは `tako_core::probe` の 1 実装を通す（#1503 / #1507。コンソール窓の抑止 = #586 も
 /// そちらが持つ）。`--version` はデーモンへ話しかけないので普段は即座に返るが、素の
 /// `.status()` は上限を持たないので、相手が固まると呼び手（`tako setup` の末尾・
-/// `tako remote start`）ごと固まる。上限を超えた候補は「実行できない」扱いで次へ進む
-fn runnable(bin: &str) -> bool {
-    matches!(
-        tako_core::probe::output_with_timeout(bin, &["--version"], TAILSCALE_TIMEOUT),
-        tako_core::probe::Outcome::Done { status, .. } if status.success()
-    )
+/// `tako remote start`）ごと固まる。起動できない（`Failed`）候補は「無い」、
+/// 起動できたのに上限を超えた / 非 0 で終わった候補は「在るが動かない」（#1797）
+fn probe_candidate(bin: &str, budget: std::time::Duration) -> CandidateProbe {
+    match tako_core::probe::output_with_timeout(bin, &["--version"], budget) {
+        tako_core::probe::Outcome::Done { status, .. } if status.success() => {
+            CandidateProbe::Runnable
+        }
+        tako_core::probe::Outcome::Done { .. } | tako_core::probe::Outcome::TimedOut { .. } => {
+            CandidateProbe::Unrunnable
+        }
+        tako_core::probe::Outcome::Failed { .. } => CandidateProbe::Absent,
+    }
 }
 
 /// tailscale コマンドの失敗。**打ち切り（上限超え）を他の失敗と分けて持つ**（#1507）。
@@ -991,8 +1060,7 @@ pub fn resolve_serve_handle(expected_host: Option<&str>) -> Result<ServeHandle, 
     }
 }
 
-/// tailscale コマンドをタイムアウト付きで実行する。
-/// stdout / stderr は別スレッドで drain し pipe deadlock を避ける（remote.rs H-5 と同型）
+/// tailscale コマンドをタイムアウト付きで実行する（待ちは [`run_tailscale_within`]）
 fn run_tailscale(cli: &str, args: &[&str]) -> Result<std::process::Output, String> {
     let variant = selected_variant();
     run_tailscale_on(cli, variant.socket_arg(), args)
@@ -1017,15 +1085,18 @@ fn run_tailscale_checked(
     run_tailscale_within(cli, socket, args, TAILSCALE_TIMEOUT)
 }
 
-/// 上限を引数で受ける本体（単体テストが 10 秒待たずに打ち切りを作るため）
+/// 上限を引数で受ける本体（単体テストが 10 秒待たずに打ち切りを作るため）。
+///
+/// 待ちは `tako_core::probe::output_with_timeout` の 1 実装を通す（#1503 / #1797）。
+/// 自前の待ちは子が終わった後に吸い出しスレッドを **join していた**ので、子が残した孫が
+/// パイプの書き手として居ると上限を持たずに固まった（#1503 の「読み切りにも同じ予算」）。
+/// コンソール窓の抑止（#586）と stdin の遮断も寄せ先が持つ
 fn run_tailscale_within(
     cli: &str,
     socket: Option<&str>,
     args: &[&str],
     budget: std::time::Duration,
 ) -> Result<std::process::Output, RunError> {
-    use std::io::Read;
-
     let mut argv: Vec<&str> = Vec::with_capacity(args.len() + 2);
     if let Some(sock) = socket {
         argv.push("--socket");
@@ -1033,68 +1104,27 @@ fn run_tailscale_within(
     }
     argv.extend_from_slice(args);
 
-    // #586: GUI プロセスから到達するのでコンソールウィンドウを出させない
-    let mut child = tako_core::platform::process::no_console_window(&mut Command::new(cli))
-        .args(&argv)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| RunError::Failed(format!("tailscale の起動に失敗 ({cli}): {e}")))?;
-
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-    let stdout_handle = std::thread::Builder::new()
-        .name("tailscale-stdout-drain".into())
-        .spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut pipe) = stdout_pipe {
-                let _ = pipe.read_to_end(&mut buf);
-            }
-            buf
-        })
-        .map_err(|e| RunError::Failed(format!("stdout drain スレッドの起動に失敗: {e}")))?;
-    let stderr_handle = std::thread::Builder::new()
-        .name("tailscale-stderr-drain".into())
-        .spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut pipe) = stderr_pipe {
-                let _ = pipe.read_to_end(&mut buf);
-            }
-            buf
-        })
-        .map_err(|e| RunError::Failed(format!("stderr drain スレッドの起動に失敗: {e}")))?;
-
-    let start = std::time::Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break s,
-            Ok(None) => {
-                if start.elapsed() > budget {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    // 名札は `probe::label` の 1 実装（引数だけ = `--socket` のパスを載せない。#927）
-                    return Err(RunError::TimedOut(tako_core::probe::TimeoutNotice {
-                        label: tako_core::probe::label(cli, args),
-                        waited_secs: budget.as_secs(),
-                    }));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            Err(e) => {
-                let _ = child.kill();
-                return Err(RunError::Failed(format!("tailscale の待機に失敗: {e}")));
-            }
+    match tako_core::probe::output_with_timeout(cli, &argv, budget) {
+        tako_core::probe::Outcome::Done {
+            status,
+            stdout,
+            stderr,
+        } => Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        // 名札は引数だけで組み直す（寄せ先の名札は argv 全体 = `--socket` のパスが載る。#927）
+        tako_core::probe::Outcome::TimedOut { waited, .. } => {
+            Err(RunError::TimedOut(tako_core::probe::TimeoutNotice {
+                label: tako_core::probe::label(cli, args),
+                waited_secs: waited.as_secs(),
+            }))
         }
-    };
-
-    let stdout = stdout_handle.join().unwrap_or_default();
-    let stderr = stderr_handle.join().unwrap_or_default();
-    Ok(std::process::Output {
-        status,
-        stdout,
-        stderr,
-    })
+        tako_core::probe::Outcome::Failed { reason, .. } => Err(RunError::Failed(format!(
+            "tailscale の起動に失敗 ({cli}): {reason}"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -1158,6 +1188,104 @@ mod tests {
                 label: "tailscale status --json".into(),
                 waited_secs: 1,
             }))
+        );
+    }
+
+    // --- 検出の正本（#1797）-----------------------------------------------------
+
+    /// 候補ごとの試した結果を並べて `pick_candidate` に通す（戻り値の 2 つ目は試した順）
+    fn pick(results: &[(&'static str, CandidateProbe)]) -> (Detection, Vec<String>) {
+        let mut tried = Vec::new();
+        let detection = pick_candidate(results.iter().map(|(c, _)| *c), |c| {
+            tried.push(c.to_string());
+            results.iter().find(|(n, _)| *n == c).expect("候補").1
+        });
+        (detection, tried)
+    }
+
+    /// 実行できる候補があれば先頭のそれを採り、**後ろの候補は試さない**（#1797 前と同じ答え）
+    #[test]
+    fn 実行できる候補は動かない候補より優先する() {
+        use CandidateProbe::*;
+        let (detection, tried) = pick(&[
+            ("tailscale", Unrunnable),
+            ("/opt/homebrew/bin/tailscale", Absent),
+            (
+                "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+                Runnable,
+            ),
+            ("/後ろ", Runnable),
+        ]);
+        assert_eq!(
+            detection,
+            Detection::Runnable("/Applications/Tailscale.app/Contents/MacOS/Tailscale".into())
+        );
+        assert_eq!(tried.len(), 3, "採った後の候補まで試している: {tried:?}");
+    }
+
+    /// 動く候補が 1 つも無ければ「在るが動かない」先頭を返す（「無い」と言わない = 入れ直させない）
+    #[test]
+    fn 動かない候補しか無ければ在るものとして返す() {
+        use CandidateProbe::*;
+        let (detection, _) = pick(&[
+            ("tailscale", Absent),
+            ("/opt/homebrew/bin/tailscale", Unrunnable),
+            (
+                "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+                Unrunnable,
+            ),
+        ]);
+        assert_eq!(
+            detection,
+            Detection::Unrunnable("/opt/homebrew/bin/tailscale".into())
+        );
+        assert_eq!(detection.clone().into_runnable(), None, "remote は使わない");
+        assert_eq!(
+            detection.into_present().as_deref(),
+            Some("/opt/homebrew/bin/tailscale"),
+            "依存段は導入済みと読む"
+        );
+    }
+
+    #[test]
+    fn どの候補も起動できなければ無い() {
+        use CandidateProbe::*;
+        let (detection, tried) = pick(&[("tailscale", Absent), ("/x", Absent)]);
+        assert_eq!(detection, Detection::Absent);
+        assert_eq!(tried.len(), 2);
+        assert_eq!(detection.clone().into_present(), None);
+        assert_eq!(detection.into_runnable(), None);
+    }
+
+    /// 1 候補の分類: 正常終了 = 動く / 非 0・上限超え = 在るが動かない / 起動できない = 無い
+    #[cfg(unix)]
+    #[test]
+    fn 候補1つを3値に分ける() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tako_core::test_residue::ScratchDir::new("tako-1797-probe");
+        let stub = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("スタブ");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            path.to_str().expect("UTF-8").to_string()
+        };
+        let ok = stub("ok", "echo 1.80.0");
+        let nonzero = stub("nonzero", "exit 1");
+        // 上限が効かなければ 30 秒後に正常終了 = `Runnable` になるので、`Unrunnable` が
+        // 返ること自体が「待ち切らずに打ち切った」証拠（所要は assert しない = conventions.md）
+        let hang = stub("hang", "exec /bin/sleep 30");
+        let missing = dir.path().join("missing");
+        let budget = std::time::Duration::from_secs(1);
+
+        assert_eq!(probe_candidate(&ok, budget), CandidateProbe::Runnable);
+        assert_eq!(
+            probe_candidate(&nonzero, budget),
+            CandidateProbe::Unrunnable
+        );
+        assert_eq!(probe_candidate(&hang, budget), CandidateProbe::Unrunnable);
+        assert_eq!(
+            probe_candidate(missing.to_str().expect("UTF-8"), budget),
+            CandidateProbe::Absent
         );
     }
 

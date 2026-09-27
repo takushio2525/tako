@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-27（#1679: LSP の診断を波線・右パネル・tako lsp diagnostics で出した）
-- publish を受けた時点で「サーバへ送った本文の写し」で tako の座標へ写し（`LineIndex`）、manager の URI 別の表 1 つを波線・右パネル・CLI / MCP `tako_lsp` が読む。UI へは bounded 128 のキュー（溢れたら全部読み直す印）。pull 型は申告しない（flycheck は push だけ・pull はタイマーが要る = #772）。閉じた / サーバが止まったら捨てる
-- 右パネルの diagnostics タブは LSP の文書があるときだけ（常設すると #1479 の段で既定 320px のラベルが全員ぶん落ちる）。5 本 + 3 桁バッジが 220px で 0.5px 溢れるぶんは `IconsTight` を梯子の最後に足した（4 本は不変）
-- 実測: visual-test `preview-code` の 2 枚目で基準との差分は帯の外 0 px・4 色の最小距離 61.8・行末の波の振れ幅 3.0px・右パネル 6 行・閉じたら保持 0、`TAKO_1007_LEGACY=1` で FAILED。`scripts/test-lsp-diagnostics-1679.sh` 16 PASS（実 rust-analyzer の E0308 まで）・e2e 6 本（LEGACY で 5 本 FAILED）
-
 ## 2026-09-27（#1662: `--wait` に上限を持たせ、auto_close を GUI の終了検知で効かせ、CLI / MCP の run も走らせる前に保存するようにした）
 - `--wait` は `probe::poll_with_timeout` の 1 実装（既定 600 秒・env `TAKO_RUN_WAIT_TIMEOUT_SECS`・0 は既定）で、超えたら「まだ実行中」+ exit 1。閉じるのは `dispatch::auto_close_run_pane` の 1 本（GUI の出力のたび / 2 秒ごと / `RunInteractiveStatus`）で、閉じた結末は `Workspace::closed_runs` に控える。保存は dispatch `Run` の `save_previews_before_run` の 1 本へ寄せ、再生ボタンの自前保存を外した
 - 実測: `scripts/test-run-wait-save-1662.sh` **32 PASS 0 FAIL**（修正前のバイナリは 14 PASS 18 FAIL = 上限 3 秒でも 15 秒の締め切りまで返らない / `--wait` 無しで閉じない / CLI・MCP とも古い内容が走る）・注入 4 通りすべて file:line 名指しで FAILED → 戻して緑
@@ -61,3 +56,7 @@
 ## 2026-09-27（#1811: テスト判定から外れたら安全側へ倒し、deps/ の外のテストバイナリが本番へ書かないようにした）
 - `is_test_process()` が置き場（`deps/`）だけで決まり、`/tmp` へコピーしたテストバイナリが本番の `recent.json` 上書き・`cli-dir` を空に・実 agent CLI を実 HOME で起動した。製品の `main`（`tako-app` / `tako`）の 1 文目で `paths::mark_product_process()` を呼び、「`deps/` にある **または** 宣言が無い」をテストとする（規則は `judge_test_process` の 1 実装・倒した回は stderr へ 1 回知らせる）
 - 実測: 一時 HOME を本番に見立てた再現で修正前 17 ファイル → 修正後 0（同じ名前 / 改名とも）・製品 `tako` は一時 HOME の本番相当を解決し知らせ無し・番犬 3 段（入口の静的検査 / deps 外の子 / 製品 CLI の実行時）へ注入 5 通りすべて FAILED → 戻して緑
+
+## 2026-09-27（#1797: setup の依存段が tailscale を remote と同じ検出で探すようにした）
+- 依存段（`setup_deps::resolve`）は tailscale を PATH だけで探し、PATH 外の App Store 版を「見つかりません」→ `--yes` で brew 版まで入れていた（#1038 の 2 系統同居）。正本 `tailscale::detect_tailscale`（Runnable / Unrunnable / Absent）を足して依存段・`find_tailscale`・remote setup [1/5] が読む。在るが動かない CLI は導入済みと読み入れ直させない。`run_tailscale_within` の自前の待ち（子の終了後に join）は `probe::output_with_timeout` へ寄せた
+- 実測: `scripts/test-setup-tailscale-detect-1797.sh` 55 PASS（修正前の tako で 25 FAIL = PATH 外で brew 1 回 → 0 回 / 孫がパイプを握る tailscale で 60 秒の締め切り → 5 秒）・番犬 6 本へ注入 5 通りが file:line で FAILED → 戻して緑・setup 系の隔離 10 本全緑（1499 / 1505 は tailscale を `TAKO_TAILSCALE_BIN` で閉じ込めるよう直した）・workspace 5919 passed 0 failed・clippy 3 宇宙 0・check-windows 0

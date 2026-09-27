@@ -821,6 +821,12 @@ Windows には SIGPIPE が無く、同じ場面は `ERROR_NO_DATA` = `ErrorKind:
   子が残した孫がパイプの書き手として居ると `read_to_end` から返らない。
   吸い出しは別スレッドへ出して **join しない**（join した時点で上限が無意味になる）。
   「少しだけ出してから固まる子」はパイプが詰まるので、`try_wait` のポーリングだけでも足りない
+- **上限を持つ自前の待ちも残さない**（#1797）。`tailscale::run_tailscale_within` は上限こそ
+  持っていたが、子が終わった後に吸い出しスレッドを **join していた**ので、tailscale が孫を残して
+  終わると（孫がパイプの書き手のまま）上限を持たずに固まった。上限の有無だけでなく読み切りまで
+  1 実装を通す。名札を自分で組み直す（`--socket <パス>` を載せない = #927）ときは `Outcome` の
+  中身だけを受け取り、子の起動は寄せ先に任せる（番犬
+  `crates/tako-control/tests/issue1797_tailscale_detect_single_source.rs`）
 - **打ち切るのは読み取りだけの問い合わせに限る**。書き込み
   （`claude mcp add` は `~/.claude.json` を書く）を途中で kill すると利用者の設定を
   壊しうるので、#1503 では probe だけを打ち切る（残りは `.agent/plans` ではなく Issue で追う）

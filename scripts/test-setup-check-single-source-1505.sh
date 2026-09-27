@@ -61,6 +61,9 @@ DATADIR="$SANDBOX/d"
 # `authed`（claude を認証済みにするか）/ `withdeps`（任意依存を置くか）で状態を作り分ける。
 # **tmux は不在の側に使えない**: 器の解決（`setup_deps::resolve`）は PATH 外の実体も
 # 拾うので、走らせる機に tmux が入っていると「不在」を作れない（実測で踏んだ）
+# **tailscale は `TAKO_TAILSCALE_BIN` で閉じ込める**: 検出の正本（`tailscale::detect_tailscale`。
+# #1797）は /opt/homebrew/bin・/Applications の既知の置き場も見るので、PATH から外すだけでは
+# 「不在」にならない。隔離 PATH の `$BIN/tailscale`（`withdeps=0` なら未作成）へ向ける
 mkstubs(){
   local authed="${1:-1}" withdeps="${2:-1}" dep
   rm -rf "$BIN" "$HOMEDIR" "$DATADIR"
@@ -115,6 +118,7 @@ iso_env(){
   echo "HOME=$HOMEDIR" "TAKO_DATA_DIR=$DATADIR" "TAKO_ORCHESTRATOR_DIR=$DATADIR/orch" \
        "TAKO_TMUX_SOCKET=$SANDBOX/tmux.sock" "TAKO_DISCOVERY_DIR=$SANDBOX/nowhere" \
        "TAKO_ISOLATED=1" "SHELL=$BIN/isosh" "CODEX_HOME=$HOMEDIR/.codex" \
+       "TAKO_TAILSCALE_BIN=$BIN/tailscale" "TAKO_TAILSCALE_SOCKET=" \
        "PATH=$BIN:/usr/bin:/bin:/usr/sbin:/sbin" "TERM=dumb" "LANG=ja_JP.UTF-8"
 }
 run_iso(){  # run_iso <出力先> -- <tako の引数...>（stdout + stderr）
@@ -256,6 +260,8 @@ export TAKO_DISCOVERY_DIR="$SANDBOX/disc"
 export TAKO_TMUX_SOCKET="$SANDBOX/tmux.sock"
 export CODEX_HOME="$HOMEDIR/.codex"
 export SHELL="$BIN/isosh"
+export TAKO_TAILSCALE_BIN="$BIN/tailscale"
+export TAKO_TAILSCALE_SOCKET=
 export PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin"
 mkdir -p "$TAKO_DISCOVERY_DIR"
 GUI_RC=0
