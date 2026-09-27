@@ -399,6 +399,9 @@ pub(crate) enum NoticeArm {
     /// 右パネル diagnostics ビューの行を押した失敗（`TAKO_1007_LEGACY`）。LSP ごと止める
     /// A/B と同じ env を使う（旧挙動ではビューに行が出ないので、通知だけ残っても意味がない）
     Issue1679,
+    /// 定義ジャンプ（⌘クリック）の未導入・未応答・落ちた等（`TAKO_1680_LEGACY`）。
+    /// 旧挙動では ⌘クリックが定義を探さないので、通知だけ残っても意味がない
+    Issue1680,
 }
 
 impl NoticeArm {
@@ -416,6 +419,7 @@ impl NoticeArm {
             NoticeArm::Issue1473 => tako_control::sleep_guard::legacy_1473(),
             NoticeArm::Issue1485 => tako_control::remote_autostart::legacy_mode(),
             NoticeArm::Issue1679 => tako_control::lsp::legacy(),
+            NoticeArm::Issue1680 => tako_control::dispatch::lsp_goto_legacy(),
         }
     }
 }

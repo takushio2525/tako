@@ -24,7 +24,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tako_core::lsp::servers::{self, ServerSpec};
@@ -33,6 +33,7 @@ use tako_core::lsp::{root, sync};
 use tako_core::platform::child_cmd::{self, ChildCmd};
 
 use super::diagnostics::{DiagnosticsStore, DocDiagnostics};
+use super::goto::{GotoAnswer, GotoError, GotoRequest};
 use super::server::{Handlers, ServerProcess};
 use super::text;
 
@@ -248,6 +249,11 @@ struct Slot {
     root_uri: String,
     /// 直近の stderr（プロセスが終わっても `tako lsp logs` で読めるように写しておく）
     last_stderr: Vec<String>,
+    /// サーバが知らせた「読み込みが済んだか」（`experimental/serverStatus` の `quiescent`。#1680）。
+    /// 送らないサーバは `None` のまま
+    quiescent: Option<bool>,
+    /// 握手が済んだ時刻（状態を送るサーバかを起動直後の猶予のあいだだけ待って確かめる。#1680）
+    running_since: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -481,6 +487,21 @@ impl LspManager {
             .values()
             .filter_map(|slot| slot.process.as_ref().map(|p| p.pid()))
             .collect()
+    }
+
+    /// 定義ジャンプの問い合わせ（#1680）。**背景スレッドから呼ぶ**（サーバの起動と応答を待つ。
+    /// 上限は `request.timeout`）。
+    ///
+    /// 文書が開いていなければ（編集モードでないプレビューから ⌘クリックした）、**問い合わせの
+    /// あいだだけ** `didOpen` し（本文は `request.document` = 編集セッションの全文、無ければ
+    /// ディスクの中身）、答えを受けたら `didClose` する。
+    /// 「開いただけではサーバを起こさない」（設計書 §16-2）は保ったまま、利用者が明示的に
+    /// 問い合わせたときだけ起こす
+    pub fn goto(&self, request: &GotoRequest) -> Result<GotoAnswer, GotoError> {
+        match &self.shared {
+            Some(shared) => shared.goto(request),
+            None => Err(GotoError::Disabled),
+        }
     }
 }
 
@@ -723,6 +744,8 @@ impl Shared {
         slot.capabilities = None;
         slot.server_info = None;
         slot.position_encoding = None;
+        slot.quiescent = None;
+        slot.running_since = None;
         let generation = slot.generation;
         let Some(shared) = self.arc() else {
             return;
@@ -847,6 +870,7 @@ impl Shared {
         slot.server_info = result.get("serverInfo").cloned();
         let _ = process.notify("initialized", json!({}));
         self.step(slot, Event::Initialized);
+        slot.running_since = Some(Instant::now());
         for (uri, doc) in inner.docs.iter_mut() {
             if doc.key == *key {
                 send_did_open(&process, uri, doc, generation);
@@ -878,6 +902,13 @@ impl Shared {
     }
 
     fn on_notification(&self, key: &ServerKey, method: &str, params: Value) {
+        // #1680: 読み込みが済んだか（定義ジャンプが空の答えを「見つからない」と読み違えないため）
+        if method == super::goto::SERVER_STATUS_METHOD {
+            if let Some(slot) = self.lock().servers.get_mut(key) {
+                slot.quiescent = super::goto::quiescent_of(&params);
+            }
+            return;
+        }
         if method != "textDocument/publishDiagnostics" {
             // window/logMessage・$/progress 等は S1 では受けて捨てる
             return;
@@ -1234,6 +1265,250 @@ impl Shared {
     }
 }
 
+// --- 定義ジャンプ（#1680）---------------------------------------------------
+
+impl Shared {
+    fn goto(&self, request: &GotoRequest) -> Result<GotoAnswer, GotoError> {
+        let deadline = Instant::now() + request.timeout;
+        let Some(resolved) = servers::resolve_in(self.config.table, &request.path) else {
+            return Err(GotoError::NoServer);
+        };
+        let spec = resolved.spec;
+        let uri = tako_core::file_uri::from_path(&request.path);
+        // 開いていなければ問い合わせのあいだだけ開く（lease が落ちると didClose）
+        let _transient = if self.lock().docs.contains_key(&uri) {
+            None
+        } else {
+            if let Some(error) = self.not_installed_error(spec) {
+                return Err(error);
+            }
+            let source = match &request.document {
+                Some(document) => std::borrow::Cow::Borrowed(document.as_str()),
+                None => {
+                    let bytes =
+                        std::fs::read(&request.path).map_err(|e| GotoError::Unreadable {
+                            error: e.kind().to_string(),
+                        })?;
+                    std::borrow::Cow::Owned(String::from_utf8_lossy(&bytes).into_owned())
+                }
+            };
+            match self.open(&request.path, &source, 0) {
+                DocLink::Open(lease) => Some(lease),
+                // 断られた = 未導入の記録がある / すれ違いで別のペインが開いた
+                _ => {
+                    if let Some(error) = self.not_installed_error(spec) {
+                        return Err(error);
+                    }
+                    if !self.lock().docs.contains_key(&uri) {
+                        return Err(GotoError::NoServer);
+                    }
+                    None
+                }
+            }
+        };
+        let (process, capabilities, key) = self.wait_ready(&uri, spec, request, deadline)?;
+        if !tako_core::lsp::goto::server_supports(&capabilities, request.kind) {
+            return Err(GotoError::Unsupported { server: spec.id });
+        }
+        loop {
+            let targets = self.goto_once(&process, &uri, spec, request, deadline)?;
+            if !targets.is_empty() {
+                return Ok(GotoAnswer {
+                    server: spec.id,
+                    targets,
+                });
+            }
+            // 空の答え: 読み込み中のサーバ（rust-analyzer は読み込みの前の問い合わせに空で答える）
+            // なら、済むのを待って問い直す。済んでいる / 状態を送らないサーバなら見つからない
+            match self.wait_loaded(&key, deadline) {
+                super::goto::Loading::Retry => continue,
+                super::goto::Loading::Settled => {
+                    return Ok(GotoAnswer {
+                        server: spec.id,
+                        targets,
+                    })
+                }
+                super::goto::Loading::TimedOut => {
+                    return Err(GotoError::Timeout {
+                        server: spec.id,
+                        secs: request.timeout.as_secs(),
+                        starting: true,
+                    })
+                }
+            }
+        }
+    }
+
+    /// 要求を 1 回投げて、答えを tako の座標へ直す
+    fn goto_once(
+        &self,
+        process: &ServerProcess,
+        uri: &str,
+        spec: &'static ServerSpec,
+        request: &GotoRequest,
+        deadline: Instant,
+    ) -> Result<Vec<super::goto::GotoTarget>, GotoError> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": request.line, "character": request.character },
+        });
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1));
+        let answer = match process.request(request.kind.method(), params, remaining) {
+            Ok(answer) => answer,
+            Err(super::server::RpcError::Timeout(_)) => {
+                return Err(GotoError::Timeout {
+                    server: spec.id,
+                    secs: request.timeout.as_secs(),
+                    starting: false,
+                })
+            }
+            Err(super::server::RpcError::Server(e)) => {
+                return Err(GotoError::ServerError {
+                    server: spec.id,
+                    code: e.code,
+                    detail: e.message,
+                })
+            }
+            Err(_) => return Err(GotoError::Crashed { server: spec.id }),
+        };
+        Ok(tako_core::lsp::goto::parse_locations(&answer)
+            .into_iter()
+            .filter_map(|location| {
+                let path = tako_core::lsp::goto::path_of_uri(&location.uri, cfg!(windows))?;
+                let shadow = self.shadow_text(&location.uri);
+                let disk = match &shadow {
+                    Some(_) => None,
+                    None => std::fs::read(&path)
+                        .ok()
+                        .map(|b| String::from_utf8_lossy(&b).into_owned()),
+                };
+                let source = shadow.as_deref().or(disk.as_deref());
+                Some(super::goto::locate(
+                    location.uri,
+                    path,
+                    location.line,
+                    location.character,
+                    source,
+                ))
+            })
+            .collect())
+    }
+
+    /// 空の答えのあと、サーバの読み込みが済むのを待つ（上限つき）。
+    ///
+    /// 読み込み中と知らせていれば（`quiescent: false`）済むまで待って `Retry`。状態を
+    /// まだ 1 度も知らせていなければ、握手の直後の猶予（[`super::goto::STATUS_GRACE`]）の
+    /// あいだだけ知らせを待つ（送るサーバは握手の直後に送る）。済んでいる・送らないサーバは
+    /// 待たずに `Settled`（= 本当に見つからない）
+    fn wait_loaded(&self, key: &ServerKey, deadline: Instant) -> super::goto::Loading {
+        let mut waited = false;
+        loop {
+            let (quiescent, since) = {
+                let inner = self.lock();
+                match inner.servers.get(key) {
+                    Some(slot) => (slot.quiescent, slot.running_since),
+                    None => (None, None),
+                }
+            };
+            let loading = match quiescent {
+                Some(ready) => !ready,
+                None => since.is_some_and(|t| t.elapsed() < super::goto::STATUS_GRACE),
+            };
+            if !loading {
+                return if waited {
+                    super::goto::Loading::Retry
+                } else {
+                    super::goto::Loading::Settled
+                };
+            }
+            if Instant::now() >= deadline {
+                return super::goto::Loading::TimedOut;
+            }
+            waited = true;
+            std::thread::sleep(super::goto::READY_POLL);
+        }
+    }
+
+    /// 未導入と分かっていれば、その理由と導入コマンド（#983）
+    fn not_installed_error(&self, spec: &'static ServerSpec) -> Option<GotoError> {
+        let inner = self.lock();
+        let record = inner.not_installed.get(spec.id)?;
+        let guidance =
+            not_installed_guidance(spec, &record.program, record.override_env.as_deref());
+        let field = |key: &str| guidance[key].as_str().unwrap_or_default().to_string();
+        Some(GotoError::NotInstalled {
+            server: spec.id,
+            reason: field("reason"),
+            next_step: field("next_step"),
+            install_command: spec.install.command(),
+        })
+    }
+
+    /// 文書を受け持つサーバが握手を終えて `didOpen` まで済むのを待つ（上限つき）
+    fn wait_ready(
+        &self,
+        uri: &str,
+        spec: &'static ServerSpec,
+        request: &GotoRequest,
+        deadline: Instant,
+    ) -> Result<(Arc<ServerProcess>, Value, ServerKey), GotoError> {
+        loop {
+            {
+                let inner = self.lock();
+                let Some(doc) = inner.docs.get(uri) else {
+                    return Err(GotoError::Closed);
+                };
+                if let Some(slot) = inner.servers.get(&doc.key) {
+                    match slot.lifecycle.state {
+                        ServerState::Running if doc.opened == Some(slot.generation) => {
+                            if let (Some(process), Some(capabilities)) =
+                                (&slot.process, &slot.capabilities)
+                            {
+                                return Ok((
+                                    Arc::clone(process),
+                                    capabilities.clone(),
+                                    doc.key.clone(),
+                                ));
+                            }
+                        }
+                        ServerState::GaveUp | ServerState::Stopped => {
+                            return Err(GotoError::Unavailable {
+                                server: spec.id,
+                                state: slot.lifecycle.state,
+                                crashes: slot.lifecycle.crashes,
+                            })
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(error) = self.not_installed_error(spec) {
+                return Err(error);
+            }
+            if Instant::now() >= deadline {
+                return Err(GotoError::Timeout {
+                    server: spec.id,
+                    secs: request.timeout.as_secs(),
+                    starting: true,
+                });
+            }
+            std::thread::sleep(super::goto::READY_POLL);
+        }
+    }
+
+    /// 開いている文書ならサーバへ送った本文の写し（URI は照合用の正規化で突き合わせる）
+    fn shadow_text(&self, uri: &str) -> Option<String> {
+        let wanted = uri_key(uri);
+        self.lock()
+            .docs
+            .values()
+            .find(|d| d.uri_key == wanted)
+            .map(|d| d.text.clone())
+    }
+}
+
 impl Slot {
     fn new(spec: &'static ServerSpec, root: &Path) -> Self {
         Self {
@@ -1250,6 +1525,8 @@ impl Slot {
             idle_token: 0,
             root_uri: tako_core::file_uri::from_path(root),
             last_stderr: Vec::new(),
+            quiescent: None,
+            running_since: None,
         }
     }
 }
@@ -1372,13 +1649,20 @@ fn stop_process(process: &ServerProcess, timeout: Duration) {
     process.kill();
 }
 
-/// クライアントの能力。**S1 で実際に使うものだけ**を申告する
-/// （文書同期と診断の受信。使わない能力を申告するとサーバが無駄な仕事をする）
+/// クライアントの能力。**実際に使うものだけ**を申告する（使わない能力を申告すると
+/// サーバが無駄な仕事をする）。S1 は文書同期と診断の受信、#1680 が定義ジャンプの 4 種を足した
 fn initialize_params(root_uri: &str, root_name: &str) -> Value {
     use lsp_types::{
-        ClientCapabilities, ClientInfo, GeneralClientCapabilities, InitializeParams,
-        PositionEncodingKind, PublishDiagnosticsClientCapabilities, TextDocumentClientCapabilities,
-        TextDocumentSyncClientCapabilities, Uri, WorkspaceFolder,
+        ClientCapabilities, ClientInfo, GeneralClientCapabilities, GotoCapability,
+        InitializeParams, PositionEncodingKind, PublishDiagnosticsClientCapabilities,
+        TextDocumentClientCapabilities, TextDocumentSyncClientCapabilities, Uri, WorkspaceFolder,
+    };
+    // #1680: 定義ジャンプの 4 種。`LocationLink` を受けられる（識別子の範囲へ正確に着地する）
+    let goto = || {
+        Some(GotoCapability {
+            dynamic_registration: Some(false),
+            link_support: Some(true),
+        })
     };
     let uri: Option<Uri> = root_uri.parse().ok();
     #[allow(deprecated)]
@@ -1392,6 +1676,9 @@ fn initialize_params(root_uri: &str, root_name: &str) -> Value {
             }]
         }),
         capabilities: ClientCapabilities {
+            // #1680: 読み込みが済んだかを知らせてもらう（`experimental/serverStatus`。
+            // 送るサーバだけが送り、知らないサーバは無視する）
+            experimental: Some(super::goto::experimental_capabilities()),
             general: Some(GeneralClientCapabilities {
                 position_encodings: Some(vec![PositionEncodingKind::UTF16]),
                 ..Default::default()
@@ -1407,6 +1694,10 @@ fn initialize_params(root_uri: &str, root_name: &str) -> Value {
                     version_support: Some(true),
                     ..Default::default()
                 }),
+                definition: goto(),
+                declaration: goto(),
+                type_definition: goto(),
+                implementation: goto(),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1474,7 +1765,7 @@ mod tests {
     }
 
     #[test]
-    fn 初期化の申告は_utf16_と文書同期と診断だけ() {
+    fn 初期化の申告は_utf16_と文書同期と診断と定義ジャンプだけ() {
         let params = initialize_params("file:///w", "w");
         assert_eq!(
             params["capabilities"]["general"]["positionEncodings"],
@@ -1483,7 +1774,21 @@ mod tests {
         let text_document = params["capabilities"]["textDocument"].as_object().unwrap();
         let mut keys: Vec<&String> = text_document.keys().collect();
         keys.sort();
-        assert_eq!(keys, vec!["publishDiagnostics", "synchronization"]);
+        assert_eq!(
+            keys,
+            vec![
+                "declaration",
+                "definition",
+                "implementation",
+                "publishDiagnostics",
+                "synchronization",
+                "typeDefinition"
+            ]
+        );
+        assert_eq!(
+            params["capabilities"]["textDocument"]["definition"]["linkSupport"],
+            json!(true)
+        );
         assert_eq!(params["rootUri"], json!("file:///w"));
         assert_eq!(params["workspaceFolders"][0]["name"], json!("w"));
         assert_eq!(params["clientInfo"]["name"], json!("tako"));

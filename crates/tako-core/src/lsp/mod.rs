@@ -9,8 +9,10 @@
 //! - [`state`] — ライフサイクルの状態機械
 //! - [`sync`] — `didChange` の中身（送った本文の写しとの差分）
 //! - [`diagnostic`] — 診断のモデル（重大度・範囲・出所・コード。#1679）
+//! - [`goto`] — 定義ジャンプ（S3 / #1680）の応答の読み取り・⌘ホバーの対象・着地の規則
 
 pub mod diagnostic;
+pub mod goto;
 pub mod position;
 pub mod root;
 pub mod servers;

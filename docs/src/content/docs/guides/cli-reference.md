@@ -423,7 +423,7 @@ tako title --pane 3 ""   # 空文字でクリア（自動リネームに戻る�
 
 ### tako lsp
 
-コードプレビューを**編集モードにすると**、拡張子に合う言語サーバ（Rust = rust-analyzer / C・C++ = clangd / TypeScript・JavaScript = typescript-language-server / Python = pyright）が自動的に起きます。`tako lsp` はその状態を見たり、起こし直したり、診断（エラー・警告）を一覧したりするコマンドです。診断は画面でも、コードの波線（エラー = 赤 / 警告 = 黄 / 情報 = 青 / ヒント = 灰）と右パネルの diagnostics ビューに出ます。補完や定義ジャンプはこれから順に入ります。
+コードプレビューを**編集モードにすると**、拡張子に合う言語サーバ（Rust = rust-analyzer / C・C++ = clangd / TypeScript・JavaScript = typescript-language-server / Python = pyright）が自動的に起きます。`tako lsp` はその状態を見たり、起こし直したり、診断（エラー・警告）を一覧したりするコマンドです。診断は画面でも、コードの波線（エラー = 赤 / 警告 = 黄 / 情報 = 青 / ヒント = 灰）と右パネルの diagnostics ビューに出ます。定義ジャンプは下の「定義へ飛ぶ」を参照してください。補完はこれから順に入ります。
 
 ```bash
 tako lsp status          # 状態（稼働中か・pid・診断の件数）。未導入なら理由と導入コマンド
@@ -438,6 +438,26 @@ tako lsp diagnostics --pane 7 --severity warning   # そのペインの、警告
 `--name rust-analyzer` のように 1 つだけを指定できます。MCP では `tako_lsp_server`（`action` 引数）が同じ操作です。
 
 `tako lsp diagnostics` は 1 件 1 行で `行:桁-行:桁  重大度  メッセージ  (出所 コード)` を出します。位置は `tako edit replace-range` と同じ（行は 1 始まり・桁は 0 始まりのバイト）なので、そのまま範囲編集へ渡せます。`--severity` は `error` / `warning` / `info` / `hint` で、**その重大度以上**に絞ります。`--json` を付けると重大度ごとの数（`counts`）と、tako が保持している診断の総数（`retained`）も返ります。MCP では `tako_lsp`（`action=diagnostics`）が同じ操作です。
+
+#### 定義へ飛ぶ（tako lsp definition）
+
+コードプレビューで識別子を **⌘+クリック**（Windows は Ctrl+クリック）すると、その定義へ飛びます。⌘ を押しながら識別子の上に乗せると下線が出ます。C / C++ の `#include "foo.h"` の上ならヘッダが開きます。編集モードでなくても使えます（そのときだけ言語サーバを起こします）。
+
+- 定義が**同じファイル**にあれば、同じペインのままその行へ
+- 定義のあるファイルを**同じタブの別のペインが開いていれば**、そのペインを使い回す（同じ定義へ何度飛んでもペインは増えません）
+- それ以外は**新しいペイン**（右）で開く
+- 候補が複数あれば一覧が出るので、選んだ場所へ飛ぶ
+
+飛んだあとは `tako jump back`（macOS は ⌃-）で元の場所へ戻れます。同じことを CLI からも行えます。位置は `tako edit replace-range` と同じ（行は 1 始まり・桁は 0 始まりの行内バイト）です。
+
+```bash
+tako lsp definition --pane 3 --line 12 --column 8        # 定義へ飛ぶ
+tako lsp definition --pane 3 --line 12 --column 8 --open none   # 飛ばずに場所だけ知る
+tako lsp definition --pane 3 --line 12 --column 8 --choice 2    # 候補が複数のとき 2 番目へ
+tako lsp implementation --pane 3 --line 12 --column 8    # 実装へ（declaration / type-definition も同じ引数）
+```
+
+`--open` で新しいペインの置き場所（`right` / `down` / `new-tab`）を選べます。見つからない・言語サーバが応答しない・入っていないときは、それぞれ別の理由と次の一手を返します。MCP では `tako_lsp`（`action` = definition 等）が同じ操作です。
 
 ## レイアウト操作
 

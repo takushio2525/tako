@@ -956,16 +956,56 @@ enum LspCommand {
         #[arg(long)]
         json: bool,
     },
+    /// 識別子の定義へ飛ぶ（GUI の修飾クリック = macOS は ⌘・Windows は Ctrl と同じ。#1680）。
+    /// 同じファイルは同じペイン、同じタブで開いているファイルはそのペイン、それ以外は新しいペイン。
+    /// MCP は `tako_lsp` の action=definition
+    Definition(LspGotoArgs),
+    /// 宣言へ飛ぶ（引数は definition と同じ）
+    Declaration(LspGotoArgs),
+    /// 型の定義へ飛ぶ（引数は definition と同じ）
+    TypeDefinition(LspGotoArgs),
+    /// 実装へ飛ぶ（引数は definition と同じ）
+    Implementation(LspGotoArgs),
+}
+
+/// `tako lsp definition` 等の引数（#1680）。位置は `tako edit replace-range` と同じ
+/// （行 1 始まり・桁 0 始まりの行内 UTF-8 バイト。`tako lsp` の応答の位置もこの形）
+#[derive(clap::Args)]
+struct LspGotoArgs {
+    /// コードプレビューのペイン ID（省略時は呼び出し元）
+    #[arg(long)]
+    pane: Option<u64>,
+    /// 行（1 始まり）
+    #[arg(long)]
+    line: usize,
+    /// 桁（0 始まりの行内 UTF-8 バイト。文字の途中は拒否）
+    #[arg(long)]
+    column: usize,
+    /// 別のファイルを開く新しいペインの置き場所（省略で right。none は開かずに場所だけ返す）
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(
+        tako_core::lsp::goto::Placement::NAMES
+    ))]
+    open: Option<String>,
+    /// 候補が複数のときに選ぶ番号（1 始まり）
+    #[arg(long)]
+    choice: Option<usize>,
+    /// 着地したペインへフォーカスを移す
+    #[arg(long)]
+    focus: bool,
+    /// JSON のまま出す
+    #[arg(long)]
+    json: bool,
 }
 
 impl LspCommand {
-    /// dispatch の要求（action の綴りの正本は `dispatch::LSP_ACTIONS`）
-    fn request(&self) -> Request {
+    /// dispatch の要求（action の綴りの正本は `dispatch::LSP_ACTIONS` /
+    /// 言語機能は `dispatch::LSP_FEATURE_ACTIONS`）
+    fn request(&self) -> Result<Request, String> {
         let server = |action: &str, name: &Option<String>| Request::LspServer {
             action: action.to_string(),
             name: name.clone(),
         };
-        match self {
+        Ok(match self {
             Self::Status { name, .. } => server("status", name),
             Self::Servers { .. } => server("list", &None),
             Self::Restart { name } => server("restart", name),
@@ -975,16 +1015,48 @@ impl LspCommand {
                 pane: *pane,
                 severity: severity.clone(),
             },
-        }
+            Self::Definition(args)
+            | Self::Declaration(args)
+            | Self::TypeDefinition(args)
+            | Self::Implementation(args) => Request::LspGoto {
+                action: self
+                    .goto_kind()
+                    .map(|k| k.slug())
+                    .unwrap_or_default()
+                    .to_string(),
+                pane: target_pane(args.pane)?,
+                line: args.line,
+                column: args.column,
+                open: args.open.clone(),
+                choice: args.choice,
+                focus: args.focus.then_some(true),
+            },
+        })
+    }
+
+    /// 定義ジャンプ系なら種類
+    fn goto_kind(&self) -> Option<tako_core::lsp::goto::GotoKind> {
+        use tako_core::lsp::goto::GotoKind;
+        Some(match self {
+            Self::Definition(_) => GotoKind::Definition,
+            Self::Declaration(_) => GotoKind::Declaration,
+            Self::TypeDefinition(_) => GotoKind::TypeDefinition,
+            Self::Implementation(_) => GotoKind::Implementation,
+            _ => return None,
+        })
     }
 
     fn json(&self) -> bool {
-        matches!(
-            self,
-            Self::Status { json: true, .. }
-                | Self::Servers { json: true }
-                | Self::Diagnostics { json: true, .. }
-        )
+        match self {
+            Self::Status { json, .. } | Self::Servers { json } | Self::Diagnostics { json, .. } => {
+                *json
+            }
+            Self::Definition(args)
+            | Self::Declaration(args)
+            | Self::TypeDefinition(args)
+            | Self::Implementation(args) => args.json,
+            _ => false,
+        }
     }
 }
 
@@ -7209,7 +7281,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 focus,
             }
         }
-        Command::Lsp(sub) => sub.request(),
+        Command::Lsp(sub) => sub.request()?,
         Command::Links(args) => {
             // `--text -` は標準入力から読む（画面の写しをパイプで流せる形）
             let text = match args.text.as_deref() {
@@ -9535,6 +9607,12 @@ fn print_jump(sub: &JumpCommand, result: &Value) {
 
 /// `tako lsp` の表示（#1678）。中身の正本は dispatch の応答で、ここは体裁だけ
 fn print_lsp(sub: &LspCommand, result: &Value) {
+    if !sub.json() && sub.goto_kind().is_some() {
+        for line in lsp_goto_lines(result) {
+            println!("{line}");
+        }
+        return;
+    }
     if sub.json()
         || !matches!(
             sub,
@@ -9648,6 +9726,38 @@ fn lsp_diagnostics_lines(result: &Value) -> Vec<String> {
                 line.push_str(&format!("  ({origin})"));
             }
             out.push(line);
+        }
+    }
+    out
+}
+
+/// `tako lsp definition` 等の人向けの体裁（#1680）。中身の正本は dispatch の応答。
+///
+/// 1 行目は `status`（found / choose / not-found / timeout …）。飛び先は `パス:行:桁  抜粋`
+/// （桁は 0 始まりの UTF-8 バイト）を番号つきで並べ、着地したら `landing` とペインを添える。
+/// 理由と次の一手があれば字下げして続ける
+fn lsp_goto_lines(result: &Value) -> Vec<String> {
+    let text = |v: &Value| v.as_str().unwrap_or("").to_string();
+    let mut out = vec![text(&result["status"])];
+    let locations = result["locations"].as_array().cloned().unwrap_or_default();
+    let chosen = result["chosen"].as_u64();
+    for (index, location) in locations.iter().enumerate() {
+        let number = index as u64 + 1;
+        let mark = if chosen == Some(number) { "*" } else { " " };
+        out.push(format!(
+            "{mark}{number:>3}  {}:{}:{}  {}",
+            text(&location["path"]),
+            location["line"],
+            location["column"],
+            text(&location["text"])
+        ));
+    }
+    if let Some(landing) = result["landing"].as_str() {
+        out.push(format!("  {landing} (pane {})", result["open"]["pane"]));
+    }
+    for key in ["reason", "next_step", "install_command"] {
+        if let Some(line) = result[key].as_str() {
+            out.push(format!("  {line}"));
         }
     }
     out
@@ -11377,7 +11487,7 @@ mod platform_matrix_parity {
         ("git resolve", "tako_git_resolve_agent"),
         ("list", "tako_list_panes"),
         // #1678: CLI は `tako lsp <操作>`、MCP は action 引数を持つ 1 ツール。
-        // ライフサイクルは `tako_lsp_server`、言語機能（#1679 以降）は `tako_lsp`
+        // ライフサイクルは `tako_lsp_server`、言語機能（#1679 の診断・#1680 の定義ジャンプ以降）は `tako_lsp`
         ("lsp status", "tako_lsp_server"),
         ("lsp servers", "tako_lsp_server"),
         ("lsp restart", "tako_lsp_server"),

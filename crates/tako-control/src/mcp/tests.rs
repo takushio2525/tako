@@ -30,6 +30,39 @@ mod tests {
         assert!(err.contains("diagnostics"), "{err}");
     }
 
+    /// #1679 と #1680 の合流: `tako_lsp` は 1 本で、action の先頭が既定の diagnostics、
+    /// 残りは定義ジャンプの綴りの正本（`GotoKind::NAMES`）そのもの。種類を足したのに
+    /// action の表へ載せ忘れる・振り分けが受けない、のどちらもここで落ちる
+    #[test]
+    fn tako_lsp_の_action_は診断と定義ジャンプの全種を振り分ける() {
+        let actions = crate::dispatch::LSP_FEATURE_ACTIONS;
+        assert_eq!(actions[0], "diagnostics");
+        assert_eq!(&actions[1..], &tako_core::lsp::goto::GotoKind::NAMES[..]);
+        for action in &actions[1..] {
+            assert_eq!(
+                build_request(
+                    "tako_lsp",
+                    &json!({"action": action, "line": 3, "column": 4}),
+                    Some(9),
+                    None
+                )
+                .unwrap(),
+                Request::LspGoto {
+                    action: action.to_string(),
+                    pane: Some(9),
+                    line: 3,
+                    column: 4,
+                    open: None,
+                    choice: None,
+                    focus: None,
+                },
+                "{action}"
+            );
+        }
+        // 定義ジャンプは位置が要る（診断の既定へ黙って倒れない）
+        assert!(build_request("tako_lsp", &json!({"action": "definition"}), Some(9), None).is_err());
+    }
+
     #[test]
     fn 全公開ツールにrequest変換またはspecial_handlerがある() {
         for tool in tools() {
@@ -815,7 +848,7 @@ mod tests {
         // #1652 の tako_preview_move / tako_preview_delete（単語・行単位の移動と削除）を追加して 156
         // #1678 の tako_lsp_server（言語サーバの状態と起動・停止）を追加して 157
         // #1677 の tako_jump（ジャンプ履歴の戻る / 進む / 一覧）を追加して 158
-        // #1679 の tako_lsp（言語機能。診断の一覧）を追加して 159
+        // #1679 の tako_lsp（言語機能。診断の一覧）を追加して 159。#1680 の定義ジャンプは同じツールの action なので増えない
         assert_eq!(tools.len(), 159);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();

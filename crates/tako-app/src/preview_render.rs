@@ -52,6 +52,13 @@ pub(crate) struct MdLineSel {
     hovered_link: Option<std::ops::Range<usize>>,
 }
 
+/// コード 1 行の操作の重ね物（選択の範囲・キャレットの桁・⌘ホバー中の識別子の範囲。#1680）
+type CodeLineInteraction = (
+    Option<(usize, usize)>,
+    Option<usize>,
+    Option<std::ops::Range<usize>>,
+);
+
 /// コードブロックのコピー成功フィードバックを出しておく時間（#680。カードと同値）
 pub(crate) const MD_COPY_FEEDBACK: std::time::Duration = std::time::Duration::from_millis(2200);
 
@@ -1428,6 +1435,8 @@ impl TakoApp {
         let editing = edit_snap.as_ref().is_some_and(|s| s.editing);
         let dirty = edit_snap.as_ref().is_some_and(|s| s.dirty);
         let edit_message = edit_snap.as_ref().and_then(|s| s.message.clone());
+        // #1680: 定義ジャンプの問い合わせ中 / 結果（見つからない等）の一時表示
+        let goto_status = self.lsp_goto_header_status(pane_id);
         // キャレット位置はコード行を組むときに `render_preview_code_line` が
         // その場で引き直す（#821 の仮想リストは TakoApp の描画を伴わずに
         // item を組み直すので、ここでキャプチャすると古い位置が焼き付く）
@@ -2571,6 +2580,22 @@ impl TakoApp {
                                     }))
                                     .child(SharedString::from(truncate_chars(&message, 36)))
                             }))
+                            .children(goto_status.map(|(message, is_error)| {
+                                div()
+                                    .id(("preview-goto-status", pane_id.as_u64()))
+                                    .flex_none()
+                                    .max_w(px(260.0))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(px(10.0))
+                                    .text_color(hsla(if is_error {
+                                        theme.yellow
+                                    } else {
+                                        theme.accent
+                                    }))
+                                    .child(SharedString::from(message))
+                            }))
                             .when(phv.page_info, |d| {
                                 d.children(pdf_info.map(|(current, total)| {
                                     div()
@@ -3503,6 +3528,7 @@ impl TakoApp {
                             || self
                                 .preview_md_hovered_link
                                 .is_some_and(|(pid, _)| pid == pane_id)
+                            || self.code_symbol_hovered_in(pane_id)
                         {
                             CursorStyle::PointingHand
                         } else if mode == preview::PreviewMode::Image {
@@ -3612,6 +3638,18 @@ impl TakoApp {
                                 if let Some(idx) = this.pdf_link_at_position(pane_id, ev.position) {
                                     this.follow_pdf_link(pane_id, idx, cx);
                                     cx.notify();
+                                    return;
+                                }
+                            }
+                            // 修飾 + クリック: コードの識別子の定義へ飛ぶ（#1680）。識別子の上で
+                            // なければ下の選択へ落ちる（修飾なしのクリックはこの枝に入らない）
+                            if crate::keybindings::link_modifier_active(&ev.modifiers)
+                                && ev.click_count == 1
+                            {
+                                if let Some((line, range)) =
+                                    this.code_symbol_at_position(pane_id, ev.position)
+                                {
+                                    this.start_lsp_goto(pane_id, line, range.start, ev.position, cx);
                                     return;
                                 }
                             }
@@ -3748,6 +3786,7 @@ impl TakoApp {
         self.remove_video_frame_cache(pane_id);
         self.video_seek_bar_bounds.remove(&pane_id);
         self.forget_md_links(pane_id);
+        self.forget_lsp_goto(pane_id);
     }
 
     /// プレビュー本文のビューポート矩形（#821 / #826）。
@@ -4096,10 +4135,12 @@ impl TakoApp {
         // prepaint を通っていないので `bounds()` / `index_for_position()` が
         // panic する（gpui `elements/text.rs` は None を unwrap する）。
         // 実測: 描かれていない行を掴んだ瞬間にプロセスごと abort した
+        // #1680: ⌘ホバー中の識別子（装飾は md リンクと同じ 1 実装）
+        let hovered = self.code_symbol_hovered_on(pane_id, ix);
         let (element, _layout) = self.preview_code_line_sel(
             line,
             Some((ix + 1, number_width)),
-            (sel_range, cursor_col),
+            (sel_range, cursor_col, hovered),
             &hit_ranges,
             diagnostics,
             Some((cx.entity().downgrade(), pane_id, ix)),
@@ -4242,13 +4283,13 @@ impl TakoApp {
         &self,
         line: &preview::Line,
         number: Option<(usize, usize)>,
-        interaction: (Option<(usize, usize)>, Option<usize>),
+        interaction: CodeLineInteraction,
         search_hit_ranges: &[(usize, usize, bool)],
         diagnostics: Option<(&[tako_core::lsp::diagnostic::Diagnostic], usize)>,
         record: Option<(gpui::WeakEntity<Self>, PaneId, usize)>,
         _cx: &mut Context<Self>,
     ) -> (gpui::Div, TextLayout) {
-        let (sel_range, cursor_col) = interaction;
+        let (sel_range, cursor_col, hovered) = interaction;
         let theme = &self.theme;
         let mut text = String::new();
         let mut highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = Vec::new();
@@ -4293,6 +4334,11 @@ impl TakoApp {
                     ..HighlightStyle::default()
                 },
             ));
+        }
+        // #1680: ⌘ホバー中の識別子。構文色 → 診断の波線 → ⌘ホバー → 検索 → 選択の順
+        // （merge_highlights は後の指定が勝つ = md の MdSelectionSink と同じ重ね順）
+        if let Some(range) = hovered.as_ref() {
+            crate::md_view::push_hovered_link_highlight(&mut highlights, &text, range, theme);
         }
         // 検索ヒットハイライト（選択より先に追加し、選択が上に重なるようにする）
         for &(start, end, is_current) in search_hit_ranges {

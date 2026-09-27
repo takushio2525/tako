@@ -1785,6 +1785,37 @@ syntect へ通していた**。release 実測（同じ構文セット・テー�
 - **pull 型は使わない**: 申告しなければサーバは push を続ける。flycheck は push だけで、
   pull はタイマーが要る（#772 と衝突）。判断の経緯は FR-3.30
 
+### 定義ジャンプ（#1680。2026-09-27）
+
+- **3 段で 1 本**: 準備（UI スレッド。引数の検査・行の本文から UTF-16 の桁へ）=
+  `dispatch::lsp_goto_prepare` → 問い合わせ（background。サーバの起動と応答を上限つきで待つ）=
+  `LspGotoJob::run` → `LspManager::goto` → 着地（UI スレッド）= `dispatch::lsp_goto_land`。
+  GUI の ⌘クリック（`lsp_goto_ui.rs`）も IPC / MCP も同じ 3 段を通り、UI 層は着地を持たない
+  （番犬 `issue1680_lsp_goto_watchdog`）
+- **offload の続き**: 着地はペインを開く = workspace を変えるので background では行えない。
+  `OffloadJob::run_staged` が `OffloadOutcome::OnUi(OffloadContinuation)` を返せるようにし、
+  受け口（IPC ループ）は背景の結果を**前景の別タスク**で `finish_offload` へ渡す
+  （受信ループそのものは待たない = 未応答の上限まで他の IPC を詰まらせない）。
+  dispatch 後の後処理（ハイライト・読み込み・自動保存・保存・強制描画）はループから
+  `TakoApp::after_dispatch` へ切り出し、続きの着地も同じ後処理を通す（#1370 / #973 の番犬が追従）
+- **一時的な didOpen**: 編集モードでないプレビューは `DocLink` を持たないので、問い合わせの
+  あいだだけ manager の `open` で文書を開き（本文は編集セッションの全文かディスク）、lease の
+  Drop で `didClose` する。起動中なら `READY_POLL`（20ms）で状態を読み直して握手と `didOpen` の
+  完了を待つ（待つのは問い合わせ中だけ = アイドル時の無送信 #772 は保つ）
+- **着地の規則**は `tako_core::lsp::goto::plan_landing`（純粋関数。同じファイル → 使い回し →
+  新しいペイン）。開くのは FR-3.27 と同じ `open_file` で、起点は `JumpFrom::Pane`（問い合わせた
+  ペイン）。行を指定して**いま表示している同じファイル**を開くときは `set_preview` を呼ばない
+  （`same_document`。読み直すと編集セッションを捨て、未保存なら断られる）。編集中の着地は
+  `reveal_preview_line` がキャレットも置く（置かないと次の打鍵で追従 #1649 が引き戻す）
+- **読み込み中の空の答え**: rust-analyzer は読み込みの前の問い合わせに空で答えるので、
+  初期化で `experimental.serverStatusNotification` を申告し、`experimental/serverStatus` の
+  `quiescent` を slot に持つ。空の答えのとき、読み込み中なら済むまで待って問い直す
+  （`wait_loaded` → `Loading::Retry`）。状態を 1 度も送らないサーバは握手の直後
+  `STATUS_GRACE`（2 秒）だけ待つ。`$/progress` は検査（`cargo check`）の進捗まで含むので待たない
+- **応答の座標**: サーバの UTF-16 桁は、飛び先が開いている文書ならサーバへ送った写し、
+  そうでなければディスクの中身で UTF-8 バイト（`tako edit replace-range` の桁）と文字数
+  （`OpenFile` の桁）へ直す（`lsp::goto::locate`）
+
 ## 編集カーソルの追従スクロール（#1649。2026-09-23）
 
 編集モードのプレビューには `ListState` へ「カーソルを見せる」スクロールの呼び出しが
