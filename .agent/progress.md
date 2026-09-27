@@ -65,3 +65,7 @@
 ## 2026-09-27（#1769: LSP S1 の続き = 単独 CR・同じファイルの 2 ペイン目・サーバ解決のキャッシュ）
 - LSP の行を仕様どおり単独 CR でも区切り、送る本文の単独 CR を LF に揃えた（実測: rust-analyzer / clangd の問い合わせは `\n` だけ・clangd の診断 / pyright / TS は仕様どおり）。同じファイルは 1 URI = 1 文書を持ち手で共有（didOpen / didClose は最初 / 最後だけ・版は単調）。解決はキャッシュし、restart・シェル統合の合図（cwd 変化 / コマンド終了）・パス消失で引き直す。探索は #1730 と同じ `exe::find_with_timeout`（上限つき）の 1 実装へ合流で寄せた
 - 実測: 隔離 GUI の実経路 48 PASS 0 FAIL（servers 1 回目 1075 ms → 2 回目 33 ms・#1659 の追従 / 読み直しでも didChange が飛ぶ）・注入 15 通りすべて FAILED → 戻して緑。限界: rust-analyzer の flycheck 診断は単独 CR の後ろでずれる（rustc が `\n` だけで数える = 実測）
+
+## 2026-09-27（#1778: split --command の保持を側路へ寄せ、プログラムが印字したマーカーで偽の確定をしないようにした）
+- `split --command` の失敗時の保持が画面へ `__TAKO_EXIT=N` を出し、読む側は側路を持つ実行ペインでも画面を読んでいた（`__TAKO_EXIT=7` を印字して 0 で終わると 7 で確定・3000 行印字すると 141 で確定）。側路を `Pane::exit_file` へ移し、保持も実行ペインと同じ置き場・同じ伝える片（`posix_exit_report` / `powershell_exit_report`）へ寄せた。`run_pane_exit_code` は側路を持つペインで画面を読まない。`--wait` の打ち切りは exit 124、auto_close のペインログは `close:auto`
+- 実測: `scripts/test-run-pane-followup-1778.sh` main 26 PASS 15 FAIL → 修正後 41 PASS 0 FAIL・注入 5 通りすべて file:line 名指しで FAILED → 戻して緑・workspace 6117 passed 0 failed・clippy 3 宇宙 0・check-windows error 0・MCP カタログ +0 B

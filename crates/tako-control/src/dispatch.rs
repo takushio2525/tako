@@ -1652,8 +1652,16 @@ fn dispatch_inner(
             } else {
                 resolve_pane(host.workspace(), pane)?
             };
-            let new_pane = Pane::new(origin);
+            let mut new_pane = Pane::new(origin);
             let new_id = new_pane.id();
+            let command = command.filter(|c| !c.is_empty());
+            // #1778: 失敗時の保持も終了コードを側路で運ぶ（実行ペインと同じ置き場・同じ読み手
+            // `run_pane_exit_code`）。側路はペインに控えるだけで、実行ペイン（バッジ・
+            // `list` の `run`・auto_close）にはしない
+            let exit_file = command
+                .as_ref()
+                .and_then(|_| prepare_exit_file(host.workspace(), new_id));
+            new_pane.set_exit_file(exit_file.clone());
             // 呼び出し元（target）と同じタブに生える（FR-2.1.2）
             tree_mut(host.workspace_mut(), tab)
                 .split_with_ratio(
@@ -1666,16 +1674,20 @@ fn dispatch_inner(
             let options = SpawnOptions {
                 // #1031: 明示コマンドのペインは「コマンド終了 = close」なので、起動に
                 // 失敗すると数秒で消えて理由が残らなかった。**失敗したときだけ**
-                // 終了コード（実行ペインと同じ `__TAKO_EXIT=` マーカー）+ 案内を出して
+                // 終了コードを伝え（側路 + 「終了コード N / Enter で閉じる」の案内。
+                // 画面の `__TAKO_EXIT=` は側路を用意できなかったときだけ = #1778）、
                 // 止める形に包む。成功時は従来どおり即 close
                 command: command
-                    .filter(|c| !c.is_empty())
                     .map(|mut c| SpawnCommand {
                         program: c.remove(0),
                         args: c,
                     })
                     .map(|c| {
-                        tako_core::platform::shell::hold_on_failure_command(c, EXIT_MARKER_PREFIX)
+                        tako_core::platform::shell::hold_on_failure_command(
+                            c,
+                            EXIT_MARKER_PREFIX,
+                            exit_file.as_deref(),
+                        )
                     }),
                 // cwd 未指定なら分割元ペインの cwd（OSC 7 通知）を継承する。
                 // ssh 先などローカルに存在しないパスは無視しホーム既定に任せる
@@ -6238,7 +6250,7 @@ fn dispatch_inner(
             match exit_code {
                 Some(code) => {
                     // 閉じるかどうかと閉じ方は GUI の終了検知と同じ 1 実装（#1662）
-                    let closed = auto_close_run_pane(host, target, close_origin_of(origin));
+                    let closed = auto_close_run_pane(host, target);
                     Ok(json!({
                         "pane": pane,
                         "status": "exited",
@@ -7023,9 +7035,8 @@ fn spawn_command_pane(
 
     match replace {
         Some(old) => {
-            let old_exit_file = pane_in(host.workspace(), old)
-                .and_then(|p| p.interactive_meta())
-                .and_then(|m| m.exit_file().map(Path::to_path_buf));
+            let old_exit_file =
+                pane_in(host.workspace(), old).and_then(|p| p.exit_file().map(Path::to_path_buf));
             tree_mut(host.workspace_mut(), tab_id)
                 .replace(old, new_pane)
                 .map_err(op_err)?;
@@ -7047,12 +7058,7 @@ fn spawn_command_pane(
     let exit_file = if tako_core::run_pane::legacy_1657() {
         None
     } else {
-        let alive = host.workspace().all_pane_ids();
-        tako_core::paths::data_dir().and_then(|dir| {
-            tako_core::run_pane::prepare(&dir, new_id.as_u64(), &|id| {
-                alive.contains(&PaneId::from_raw(id))
-            })
-        })
+        prepare_exit_file(host.workspace(), new_id)
     };
 
     // 実行ペインの起動コマンドはシェルの方言差があるので境界（B1）へ委ねる。
@@ -7084,11 +7090,23 @@ fn spawn_command_pane(
         p.set_interactive_meta(tako_core::run_pane::InteractiveMeta::new(
             auto_close.to_string(),
             command.to_string(),
-            exit_file,
         ));
+        p.set_exit_file(exit_file);
     }
 
     Ok(new_id)
+}
+
+/// 新しいペインの終了コードの側路を用意する（#1657 / #1778。実行ペインと
+/// `split --command` の保持が同じここを通る）。用意できなければ `None`
+/// = スクリプトは画面のマーカーで伝え、読む側も画面を読む（退避路）
+fn prepare_exit_file(ws: &tako_core::Workspace, pane: PaneId) -> Option<PathBuf> {
+    let alive = ws.all_pane_ids();
+    tako_core::paths::data_dir().and_then(|dir| {
+        tako_core::run_pane::prepare(&dir, pane.as_u64(), &|id| {
+            alive.contains(&PaneId::from_raw(id))
+        })
+    })
 }
 
 /// ワークスペースのどこかにあるペイン（タブを問わない）
@@ -7123,21 +7141,24 @@ fn find_run_pane(
 
 /// 実行ペインの終了コード（#1657）。**読む側はこの 1 実装だけ**で、
 /// `tako run --wait` / `tako run-interactive --wait`（CLI）・`tako_run_interactive_status`
-/// （MCP）・コマンド提案カードの実行記録（#1724）・`list` の `run`・GUI のバッジが同じものを見る。
+/// （MCP）・コマンド提案カードの実行記録（#1724）・`list` の `run`・GUI のバッジ、
+/// `tako split --command` の失敗時の保持（#1778）が同じものを見る。
 ///
-/// 見る順は「確定済みの値 → 側路ファイル → 画面のマーカー」。画面のマーカーは
-/// **側路へ書けなかったときの退避路**（`platform::shell::run_pane_command` の doc）で、
+/// 見る順は「確定済みの値 → 側路ファイル」。**側路を持つペインでは画面を読まない**（#1778）:
+/// 実行中のプログラム自身が `__TAKO_EXIT=7` を印字すると、側路が書かれる前に画面から 7 を
+/// 拾って終了を早め、しかも確定は 1 回きりなので偽の値のまま固まっていた。画面のマーカーは
+/// **側路を用意できなかったペインの退避路**（`platform::shell::run_pane_command` の doc）で、
 /// 折り返しに耐える読み方（#651）は [`find_exit_marker`] がそのまま担う
 pub fn run_pane_exit_code(host: &dyn ControlHost, pane: PaneId) -> Option<i32> {
-    let meta = pane_in(host.workspace(), pane).and_then(|p| p.interactive_meta());
-    if let Some(code) = meta.and_then(|m| m.status().exit_code()) {
-        return Some(code);
-    }
-    if let Some(code) = meta
-        .and_then(|m| m.exit_file())
-        .and_then(tako_core::run_pane::read)
+    let target = pane_in(host.workspace(), pane);
+    if let Some(code) = target
+        .and_then(|p| p.interactive_meta())
+        .and_then(|m| m.status().exit_code())
     {
         return Some(code);
+    }
+    if let Some(file) = target.and_then(|p| p.exit_file()) {
+        return tako_core::run_pane::read(file);
     }
     // ペインの画面からマーカーを探す。行が**右端まで埋まっているか**まで採るのは、
     // 幅が 13 桁（`__TAKO_EXIT=0`）未満のペインでは端末がマーカーを割るため（#651）
@@ -7195,20 +7216,20 @@ pub fn settle_run_panes(host: &mut dyn ControlHost) -> Vec<PaneId> {
 ///
 /// 閉じたら結末を [`tako_core::run_pane::ClosedRuns`] へ控える（あとから聞きに来た
 /// `--wait` が「ペインが無い」で失敗しないため）。タブ最後の 1 枚は閉じない
-/// （タブごと消すのは auto_close の範囲を超える）
-pub fn auto_close_run_pane(
-    host: &mut dyn ControlHost,
-    pane: PaneId,
-    origin: tako_core::pane_log::CloseOrigin,
-) -> bool {
+/// （タブごと消すのは auto_close の範囲を超える）。
+///
+/// ペインログのクローズマーカーは**常に `close:auto`**（#1778。以前は GUI の終了検知が
+/// `close:internal`、`--wait` の聞き直しが `close:dispatch(cli)` と引き金ごとに違い、
+/// 手で閉じたのか自動で閉じたのかを後から見分けられなかった）
+pub fn auto_close_run_pane(host: &mut dyn ControlHost, pane: PaneId) -> bool {
     let Some(tab) = host.workspace().find_tab_of_pane(pane) else {
         return false;
     };
-    let Some(meta) = pane_in(host.workspace(), pane)
-        .and_then(|p| p.interactive_meta())
-        .filter(|m| m.wants_close())
-        .cloned()
-    else {
+    let Some((meta, exit_file)) = pane_in(host.workspace(), pane).and_then(|p| {
+        p.interactive_meta()
+            .filter(|m| m.wants_close())
+            .map(|m| (m.clone(), p.exit_file().map(Path::to_path_buf)))
+    }) else {
         return false;
     };
     let Some(exit_code) = meta.status().exit_code() else {
@@ -7217,10 +7238,10 @@ pub fn auto_close_run_pane(
     if tree_mut(host.workspace_mut(), tab).close(pane).is_err() {
         return false;
     }
-    host.detach_session(pane, origin, None);
+    host.detach_session(pane, tako_core::pane_log::CloseOrigin::AutoClose, None);
     // 入力待ち（Enter で閉じる案内）のまま閉じたので、スクリプトは側路を消せていない
-    if let Some(file) = meta.exit_file() {
-        tako_core::run_pane::discard(file);
+    if let Some(file) = exit_file {
+        tako_core::run_pane::discard(&file);
     }
     host.workspace_mut()
         .closed_runs_mut()
@@ -7237,10 +7258,7 @@ pub fn auto_close_run_pane(
 /// GUI の 2 秒ごとの定期更新が [`settle_run_panes`] の直後に呼ぶ。**確定した瞬間だけでなく
 /// 確定済みのものも見る**のは、`tako list` などの読み取りが先に確定させた実行ペインを
 /// 取りこぼさないため（確定の「変化」だけを見ると、先に確定した側が閉じないまま残る）
-pub fn auto_close_run_panes(
-    host: &mut dyn ControlHost,
-    origin: tako_core::pane_log::CloseOrigin,
-) -> Vec<PaneId> {
+pub fn auto_close_run_panes(host: &mut dyn ControlHost) -> Vec<PaneId> {
     let due: Vec<PaneId> = host
         .workspace()
         .tabs()
@@ -7250,7 +7268,7 @@ pub fn auto_close_run_panes(
         .map(|p| p.id())
         .collect();
     due.into_iter()
-        .filter(|&pane| auto_close_run_pane(host, pane, origin))
+        .filter(|&pane| auto_close_run_pane(host, pane))
         .collect()
 }
 
@@ -29570,7 +29588,9 @@ mod tests {
             assert_eq!(cmd.program, "/bin/sh");
             assert_eq!(cmd.args.first().map(String::as_str), Some("-c"));
             let sh_code = cmd.args.get(1).expect("-c の引数");
-            assert!(sh_code.contains("__TAKO_EXIT="), "{sh_code}");
+            // 終了コードは側路で運ぶ（画面のマーカーは側路を用意できなかったときだけ。#1778）
+            assert!(!sh_code.contains("__TAKO_EXIT="), "{sh_code}");
+            assert!(sh_code.contains(&format!("{pane_id}.code")), "{sh_code}");
             assert!(sh_code.contains(r#"read "ans?input: ""#), "{sh_code}");
             // Enter まで止まる（#1657 からは Enter のあとで側路を消して終わる）
             assert!(
@@ -29605,7 +29625,8 @@ mod tests {
 
     /// #1031: `tako split --command` のペインは「コマンド終了 = close」なので、
     /// 起動に失敗すると数秒で消えて理由がどこにも残らなかった。境界の
-    /// `hold_on_failure_command` を通す = 失敗したときだけ終了コードを出して止まる
+    /// `hold_on_failure_command` を通す = 失敗したときだけ終了コードを伝えて止まる。
+    /// #1778: 終了コードは実行ペインと同じ側路で運び（ペインに控える）、画面にマーカーを出さない
     #[test]
     fn splitのコマンドは失敗時に止まる形で包まれる() {
         let mut host = MockHost::new();
@@ -29627,6 +29648,18 @@ mod tests {
         let pane_id = result["pane"].as_u64().unwrap();
         let opts = host.attached_options.get(&pane_id).expect("options 記録");
         let cmd = opts.command.as_ref().expect("command が設定されている");
+        // 側路は実行ペインと同じ置き場（読む側 `run_pane_exit_code` が引く = ペインに控える）
+        let exit_file = pane_in(&host.ws, PaneId::from_raw(pane_id))
+            .and_then(|p| p.exit_file().map(Path::to_path_buf));
+        assert_eq!(
+            exit_file,
+            tako_core::paths::data_dir().map(|d| tako_core::run_pane::exit_path(&d, pane_id)),
+            "split の保持が側路をペインに控えていない"
+        );
+        // 実行ペインにはしない（バッジ・`list` の `run`・auto_close の対象外）
+        assert!(pane_in(&host.ws, PaneId::from_raw(pane_id))
+            .and_then(|p| p.interactive_meta())
+            .is_none());
         // 境界の出力と 1 バイトも食い違わない（接頭辞は読む側と同じ定数から採る）
         let want = tako_core::platform::shell::hold_on_failure_command(
             SpawnCommand {
@@ -29634,6 +29667,7 @@ mod tests {
                 args: vec!["run".into(), "dev".into()],
             },
             EXIT_MARKER_PREFIX,
+            exit_file.as_deref(),
         );
         assert_eq!(
             (&cmd.program, &cmd.args),
@@ -29643,8 +29677,8 @@ mod tests {
         #[cfg(unix)]
         {
             let sh_code = cmd.args.get(1).expect("-c の引数");
-            assert!(sh_code.starts_with("npm run dev; "), "{sh_code}");
-            assert!(sh_code.contains("__TAKO_EXIT="), "{sh_code}");
+            assert!(sh_code.starts_with("npm run dev\n"), "{sh_code}");
+            assert!(!sh_code.contains("__TAKO_EXIT="), "{sh_code}");
         }
     }
 
@@ -29671,6 +29705,10 @@ mod tests {
         let pane_id = result["pane"].as_u64().unwrap();
         let opts = host.attached_options.get(&pane_id).expect("options 記録");
         assert!(opts.command.is_none(), "command={:?}", opts.command);
+        // 素のシェルは側路を持たない（終了コードを伝える相手ではない。#1778）
+        assert!(pane_in(&host.ws, PaneId::from_raw(pane_id))
+            .and_then(|p| p.exit_file())
+            .is_none());
     }
 
     #[test]
@@ -29714,7 +29752,8 @@ mod tests {
             assert_eq!(cmd.args.first().map(String::as_str), Some("-c"));
             let sh_code = cmd.args.get(1).expect("-c の引数");
             assert!(sh_code.starts_with("bash hello.command"), "{sh_code}");
-            assert!(sh_code.contains("__TAKO_EXIT="), "{sh_code}");
+            assert!(!sh_code.contains("__TAKO_EXIT="), "{sh_code}");
+            assert!(sh_code.contains(&format!("{pane_id}.code")), "{sh_code}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -30208,8 +30247,7 @@ mod tests {
             .active_tab()
             .tree()
             .get(pane)
-            .and_then(|p| p.interactive_meta())
-            .and_then(|m| m.exit_file().map(Path::to_path_buf))
+            .and_then(|p| p.exit_file().map(Path::to_path_buf))
             .expect("側路が用意されている");
         assert!(!exit_file.exists(), "前回のぶんが残っている");
 
@@ -30295,8 +30333,7 @@ mod tests {
             .active_tab()
             .tree()
             .get(pane)
-            .and_then(|p| p.interactive_meta())
-            .and_then(|m| m.exit_file().map(Path::to_path_buf))
+            .and_then(|p| p.exit_file().map(Path::to_path_buf))
             .unwrap();
         std::fs::write(&exit_file, "0\n").unwrap();
         let st = dispatch(
@@ -30311,6 +30348,12 @@ mod tests {
         assert_eq!(st["closed"], true, "{st}");
         assert!(!host.ws.active_tab().tree().contains(pane));
         assert!(!exit_file.exists(), "閉じたのに側路が残っている");
+        // #1778: `--wait`（MCP）の聞き直しが引き金でも「人が閉じた」形にしない
+        assert_eq!(
+            host.detached_markers,
+            vec!["close:auto".to_string()],
+            "auto_close のマーカーが手で閉じた形と見分けられない"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -30340,8 +30383,7 @@ mod tests {
         .unwrap();
         let pane = PaneId::from_raw(v["pane"].as_u64().unwrap());
         let exit_file = pane_in(&host.ws, pane)
-            .and_then(|p| p.interactive_meta())
-            .and_then(|m| m.exit_file().map(Path::to_path_buf))
+            .and_then(|p| p.exit_file().map(Path::to_path_buf))
             .expect("側路が用意されている");
         (pane, exit_file)
     }
@@ -30368,7 +30410,7 @@ mod tests {
         let root = host.ws.active_tab().tree().focused();
         let (pane, exit_file) = issue1662_run(&mut host, &file, root, "success");
         // 終わる前は閉じない
-        assert!(auto_close_run_panes(&mut host, CloseOrigin::Internal).is_empty());
+        assert!(auto_close_run_panes(&mut host).is_empty());
         std::fs::write(&exit_file, "0\n").unwrap();
         // `tako list` が先に確定させた（GUI の見張りの「変化」はもう起きない）
         dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
@@ -30376,13 +30418,15 @@ mod tests {
             settle_run_panes(&mut host).is_empty(),
             "確定済みなのに変化扱い"
         );
-        let closed = auto_close_run_panes(&mut host, CloseOrigin::Internal);
+        let closed = auto_close_run_panes(&mut host);
         assert_eq!(closed, vec![pane], "確定済みの成功を閉じていない");
         assert!(!host.ws.active_tab().tree().contains(pane));
         assert!(
             host.detached.contains(&pane.as_u64()),
             "セッションを畳んでいない"
         );
+        // #1778: GUI の終了検知で閉じたものも `close:auto`（以前は `close:internal`）
+        assert_eq!(host.detached_markers, vec!["close:auto".to_string()]);
         assert!(!exit_file.exists(), "閉じたのに側路が残っている");
         // 閉じたあとに `--wait` / `tako_run_interactive_status` が聞きに来ても結末を返す
         let st = issue1662_status(&mut host, pane);
@@ -30391,7 +30435,7 @@ mod tests {
         assert_eq!(st["closed"], true, "{st}");
         assert_eq!(st["command"], "echo run-1657", "{st}");
         // 2 度目の定期更新は何もしない（冪等）
-        assert!(auto_close_run_panes(&mut host, CloseOrigin::Internal).is_empty());
+        assert!(auto_close_run_panes(&mut host).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -30408,7 +30452,7 @@ mod tests {
             std::fs::write(f, "3\n").unwrap();
         }
         settle_run_panes(&mut host);
-        let closed = auto_close_run_panes(&mut host, CloseOrigin::Internal);
+        let closed = auto_close_run_panes(&mut host);
         assert_eq!(closed, vec![always], "閉じたもの: {closed:?}");
         let tree = host.ws.active_tab().tree();
         assert!(tree.contains(ng), "失敗を success で閉じた");
@@ -30445,7 +30489,7 @@ mod tests {
         .unwrap();
         std::fs::write(&exit_file, "0\n").unwrap();
         settle_run_panes(&mut host);
-        assert!(auto_close_run_panes(&mut host, CloseOrigin::Internal).is_empty());
+        assert!(auto_close_run_panes(&mut host).is_empty());
         assert!(host.ws.active_tab().tree().contains(pane));
         assert!(
             !host.detached.contains(&pane.as_u64()),
@@ -32819,7 +32863,8 @@ mod tests {
     }
 
     /// #1724: 実行ペインの画面に終了マーカーが出たら `exited` + 終了コードに確定する。
-    /// 判定は `RunInteractiveStatus` と同じ `find_exit_marker` の 1 本（実 PTY で確かめる）
+    /// 判定は `RunInteractiveStatus` と同じ `find_exit_marker` の 1 本（実 PTY で確かめる）。
+    /// #1778 からは**側路を用意できなかった**ペインだけの退避路なので、側路を外して確かめる
     #[cfg(unix)]
     #[test]
     fn issue1724_終了マーカーで終了コードに確定する() {
@@ -32837,7 +32882,11 @@ mod tests {
         let run_pane = dispatch(&mut host, card_run_req(card, 1), PaneOrigin::Cli).unwrap()["pane"]
             .as_u64()
             .unwrap();
-        // 実行ペインのセッションを実 PTY で張る（マーカーを出して止まる = 実行ペインの契約）
+        // 側路を用意できなかったペイン（退避路）にする
+        pane_in_mut(&mut host.ws, PaneId::from_raw(run_pane))
+            .expect("実行ペイン")
+            .set_exit_file(None);
+        // 実行ペインのセッションを実 PTY で張る（マーカーを出して止まる = 退避路の契約）
         let (session, _rx) = TerminalSession::spawn(
             80,
             24,
@@ -32948,6 +32997,181 @@ mod tests {
             "画面に内部マーカーが出ている: {screen:?}"
         );
         assert!(screen.contains(&format!("{head}4")), "{screen:?}");
+    }
+
+    /// 実 PTY のセッションで `RunInteractiveStatus` を聞き直し、`done` が真になった応答を返す
+    /// （#1778。**状態で待つ**。上限は機の混み具合で伸ばすだけ）
+    #[cfg(unix)]
+    fn issue1778_poll_status(
+        host: &mut MockHost,
+        pane: u64,
+        mut done: impl FnMut(&MockHost, &Value) -> bool,
+    ) -> Value {
+        use std::time::{Duration, Instant};
+        let budget = tako_core::wait_budget::state_wait_budget(
+            Duration::from_secs(20),
+            tako_core::wait_budget::machine_busy(),
+        );
+        let deadline = Instant::now() + budget;
+        let mut st = Value::Null;
+        while Instant::now() < deadline {
+            st = dispatch(
+                host,
+                Request::RunInteractiveStatus {
+                    pane,
+                    no_wait: false,
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+            if done(host, &st) {
+                return st;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("状態が揃わない（budget={budget:?} 最後の応答={st}）");
+    }
+
+    /// #1778 受け入れ条件 2: 実行中のプログラム自身が `__TAKO_EXIT=7` を印字してから
+    /// 0 で終わっても、確定する終了コードは 0（側路を持つペインは画面のマーカーを読まない）。
+    /// #1778 以前は印字が画面に出た瞬間に 7 で確定し、あとで側路に 0 が書かれても直らなかった
+    #[cfg(unix)]
+    #[test]
+    fn issue1778_プログラムが印字したマーカーで偽の確定をしない() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let command = format!("printf '{EXIT_MARKER_PREFIX}7\\n'; sleep 2");
+        let pane = dispatch(
+            &mut host,
+            Request::RunInteractive {
+                pane: Some(root),
+                tab: None,
+                command,
+                input_hint: None,
+                direction: None,
+                ratio: None,
+                auto_close: Some("never".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap()["pane"]
+            .as_u64()
+            .unwrap();
+        assert!(
+            pane_in(&host.ws, PaneId::from_raw(pane))
+                .and_then(|p| p.exit_file())
+                .is_some(),
+            "側路を用意できていない（この検査の前提）"
+        );
+        let options = host
+            .attached_options
+            .get(&pane)
+            .cloned()
+            .expect("起動コマンド");
+        let (session, _rx) = TerminalSession::spawn(80, 24, options).expect("PTY を張れる");
+        host.sessions.insert(pane, session);
+
+        let marker = format!("{EXIT_MARKER_PREFIX}7");
+        // プログラムの印字が画面に出た時点（まだ `sleep` の最中）で聞く
+        let during = issue1778_poll_status(&mut host, pane, |host, _| {
+            host.sessions[&pane]
+                .visible_lines()
+                .join("\n")
+                .contains(&marker)
+        });
+        assert_ne!(
+            during["exit_code"],
+            json!(7),
+            "プログラムが印字したマーカーで確定した（#1778 の症状）: {during}"
+        );
+        // 終わったら側路の値（0）で確定する
+        let (head, _) = tako_core::platform::shell::run_exit_hint(tako_core::i18n::lang());
+        let end = issue1778_poll_status(&mut host, pane, |host, st| {
+            st["status"] == "exited" && host.sessions[&pane].visible_lines().join("").contains(head)
+        });
+        assert_eq!(end["exit_code"], json!(0), "{end}");
+        let list = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
+        let run = list["tabs"][0]["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == pane)
+            .map(|p| p["run"].clone())
+            .unwrap();
+        assert_eq!(
+            (run["exit_code"].clone(), run["outcome"].clone()),
+            (json!(0), json!("success")),
+            "{run}"
+        );
+    }
+
+    /// #1778 受け入れ条件 1: `split --command` が失敗したペインは、画面に `__TAKO_EXIT=` を
+    /// 出さず「終了コード N / Enter で閉じる」の案内だけを出して止まり、終了コードは
+    /// `RunInteractiveStatus`（`tako run-interactive-status` / MCP）で側路から読める
+    #[cfg(unix)]
+    #[test]
+    fn issue1778_splitの失敗は案内だけを出し終了コードは側路から読める() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let pane = dispatch(
+            &mut host,
+            Request::Split {
+                pane: Some(root),
+                tab: None,
+                direction: None,
+                ratio: None,
+                command: Some(vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "echo split-1778; exit 7".into(),
+                ]),
+                cwd: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap()["pane"]
+            .as_u64()
+            .unwrap();
+        let exit_file = pane_in(&host.ws, PaneId::from_raw(pane))
+            .and_then(|p| p.exit_file().map(Path::to_path_buf))
+            .expect("側路を用意できていない（この検査の前提）");
+        let options = host
+            .attached_options
+            .get(&pane)
+            .cloned()
+            .expect("起動コマンド");
+        let (session, _rx) = TerminalSession::spawn(80, 24, options).expect("PTY を張れる");
+        host.sessions.insert(pane, session);
+
+        let (head, tail) = tako_core::platform::shell::run_exit_hint(tako_core::i18n::lang());
+        let st = issue1778_poll_status(&mut host, pane, |host, st| {
+            st["status"] == "exited" && host.sessions[&pane].visible_lines().join("").contains(head)
+        });
+        assert_eq!(st["exit_code"], json!(7), "{st}");
+        assert_eq!(st["closed"], json!(false), "保持のペインを閉じた: {st}");
+        let screen = host.sessions[&pane].visible_lines().join("\n");
+        assert!(screen.contains("split-1778"), "{screen:?}");
+        assert!(
+            !screen.contains(EXIT_MARKER_PREFIX),
+            "画面に内部マーカーが出ている: {screen:?}"
+        );
+        assert!(
+            screen.contains(&format!("{head}7{tail}")),
+            "案内が無い: {screen:?}"
+        );
+        assert_eq!(tako_core::run_pane::read(&exit_file), Some(7));
+        // 実行ペインにはならない（`list` の `run` は null のまま = バッジも出ない）
+        let list = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
+        let run = list["tabs"][0]["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == pane)
+            .map(|p| p["run"].clone())
+            .unwrap();
+        assert_eq!(run, Value::Null, "{list}");
+        tako_core::run_pane::discard(&exit_file);
     }
 
     #[test]

@@ -9,8 +9,8 @@
 //! 1. 終了コードを読む側が 2 つに割れる（画面を直接読む口が `run_pane_exit_code` の外に
 //!    生える = 側路で確定した値とずれる。#1724 のカード実行記録もここを通す）
 //! 2. `Run` の腕が再利用の鍵で探さなくなる / 見つけたペインを `spawn_command_pane` へ渡さない
-//! 3. 実行ペインのスクリプトがマーカー行を**退避路の外**で出す（POSIX の `||` の右 /
-//!    PowerShell の `catch` の中だけに居るはず）
+//! 3. 実行ペインのスクリプトがマーカー行を**退避路の外**で出す（側路を用意できなかった
+//!    `None` の腕だけに居るはず。#1778 で「書けなかったとき」= `||` / `catch` からも外した）
 //! 4. タイトルバーのバッジが描かれなくなる（`render_pane_header` の 3 状態の文言・id）
 //! 5. GUI が終わった瞬間の確定をやめる（出力のたびの `settle_run_pane` と 2 秒ごとの
 //!    `settle_run_panes`）
@@ -33,7 +33,7 @@
 //! ① `refresh_command_card_runs` の `run_pane_exit_code(host, pane)` を画面の
 //!    `find_exit_marker(&rows)` へ戻す /
 //! ② `Run` の腕の `spawn_command_pane(… reuse,)` の `reuse` を `None` へ /
-//! ③ `posix_run_pane_script` の `report` を `marker_line` 決め打ちへ（常に画面へ出す）/
+//! ③ `posix_exit_report` の `Some` の腕へ `|| echo "{marker_prefix}…"` を戻す（側路があるのに画面へ出す）/
 //! ④ `render_pane_header` の `.when(hv.run_badge, …)` の塊を消す
 
 use std::path::{Path, PathBuf};
@@ -232,41 +232,95 @@ fn runの腕は再利用の鍵で探して差し替えへ渡す() {
 
 // --------------------------------------------- 3. マーカーは退避路だけ
 
-/// スクリプト本体で `marker_line` を使ってよい形（退避路 / 側路が無いとき）以外の行
-fn marker_outside_fallback(body: &[(usize, String)], fallback: &str) -> Vec<String> {
-    body.iter()
-        .filter(|(_, l)| l.contains("marker_line") && !l.contains("let marker_line"))
-        .filter(|(_, l)| !l.contains(fallback) && !l.contains("None => (marker_line"))
-        .map(|(n, l)| format!("{SHELL}:{n}: {}", l.trim()))
-        .collect()
+/// 伝える片（`posix_exit_report` / `powershell_exit_report` の本体）で、接頭辞
+/// `marker_prefix` を `None` の腕（側路を用意できなかったとき）の外で使っている行。
+/// `None` の腕はその行から、次の腕か本体の終わりまで
+fn marker_outside_fallback(body: &[(usize, String)]) -> Vec<String> {
+    let mut in_none = false;
+    let mut out = Vec::new();
+    for (n, l) in body {
+        let t = l.trim_start();
+        if t.starts_with("None =>") {
+            in_none = true;
+        } else if t.starts_with("Some(") {
+            in_none = false;
+        }
+        let uses = l.contains("marker_prefix") && !l.contains("marker_prefix: &str");
+        if uses && !in_none {
+            out.push(format!("{SHELL}:{n}: {}", l.trim()));
+        }
+    }
+    out
 }
 
 #[test]
 fn 実行ペインのマーカーは退避路でだけ出す() {
     let src = production(SHELL);
-    for (sig, fallback) in [
-        ("fn posix_run_pane_script(", "2>/dev/null || {marker_line}"),
+    // 伝える片: マーカーは `None` の腕だけ（側路があれば書けなくても画面へ出さない。#1778）
+    for sig in ["fn posix_exit_report(", "fn powershell_exit_report("] {
+        let (body, at) = fn_body(SHELL, &src, sig);
+        let text = joined(&body);
+        assert!(
+            text.contains("None =>") && text.contains("marker_prefix"),
+            "{SHELL}:{at}: {sig:?} に側路を用意できなかったときの退避路（None の腕のマーカー）が無い"
+        );
+        let bad = marker_outside_fallback(&body);
+        assert!(
+            bad.is_empty(),
+            "{sig:?} が内部マーカーを退避路の外で画面へ出している（#1657 / #1778）:\n{}",
+            bad.join("\n")
+        );
+    }
+    // 実行ペインと `split --command` の保持は同じ片を通し、人の言葉の案内を出す
+    for (sig, report, hint) in [
+        (
+            "fn posix_run_pane_script(",
+            "posix_exit_report(marker_prefix, exit_file)",
+            "posix_exit_hint_line(lang)",
+        ),
         (
             "fn powershell_run_pane_script(",
-            "catch {{ {marker_line} }}",
+            "powershell_exit_report(marker_prefix, exit_file)",
+            "powershell_exit_hint_line(lang)",
+        ),
+        (
+            "fn posix_hold_on_failure_command(",
+            "posix_exit_report(marker_prefix, exit_file)",
+            "posix_exit_hint_line(lang)",
+        ),
+        (
+            "fn powershell_hold_on_failure_command(",
+            "powershell_exit_report(marker_prefix, exit_file)",
+            "powershell_exit_hint_line(lang)",
         ),
     ] {
         let (body, at) = fn_body(SHELL, &src, sig);
         let text = joined(&body);
         assert!(
-            text.contains(fallback),
-            "{SHELL}:{at}: {sig:?} に側路へ書けなかったときの退避路 {fallback:?} が無い"
+            text.contains(report),
+            "{SHELL}:{at}: {sig:?} が終了コードを伝える片 {report:?} を通っていない（#1778）"
         );
-        let bad = marker_outside_fallback(&body, fallback);
         assert!(
-            bad.is_empty(),
-            "{sig:?} が内部マーカーを退避路の外で画面へ出している（#1657）:\n{}",
-            bad.join("\n")
+            text.contains(hint),
+            "{SHELL}:{at}: {sig:?} が「終了コード N / Enter で閉じる」の案内 {hint:?} を出していない"
         );
-        // 案内（人の言葉）を出している
+        let own: Vec<String> = body
+            .iter()
+            .filter(|(_, l)| l.contains("marker_prefix") && !l.contains("marker_prefix: &str"))
+            .filter(|(_, l)| !l.contains(report))
+            .map(|(n, l)| format!("{SHELL}:{n}: {}", l.trim()))
+            .collect();
         assert!(
-            text.contains("run_exit_hint(lang)"),
-            "{SHELL}:{at}: {sig:?} が「終了コード N / Enter で閉じる」の案内を出していない"
+            own.is_empty(),
+            "{sig:?} がマーカーを自前で組んでいる（伝え方が 2 つに割れる。#1778）:\n{}",
+            own.join("\n")
+        );
+    }
+    for sig in ["fn posix_exit_hint_line(", "fn powershell_exit_hint_line("] {
+        let (body, at) = fn_body(SHELL, &src, sig);
+        assert!(
+            joined(&body).contains("run_exit_hint(lang)"),
+            "{SHELL}:{at}: {sig:?} が案内の文言 run_exit_hint を使っていない"
         );
     }
     // 公開の入口は #1657 の形を既定にしている（旧形は A/B のときだけ）
@@ -280,18 +334,27 @@ fn 実行ペインのマーカーは退避路でだけ出す() {
 
 #[test]
 fn i1657_注入_マーカーの常時出力を名指しで落とせる() {
-    // 注入 ③: `report` を `marker_line` 決め打ちにした形
+    // 注入 ③: `Some` の腕へ「書けなかったら画面へ」を戻した形（#1778 以前の形）
     let body = vec![
-        (10, "    let marker_line = format!(\"echo …\");".to_string()),
-        (11, "    let report = marker_line.clone();".to_string()),
+        (
+            10,
+            "fn posix_exit_report(marker_prefix: &str, exit_file: Option<&Path>) -> (String, String) {"
+                .to_string(),
+        ),
+        (11, "        Some(path) => {".to_string()),
         (
             12,
-            "            None => (marker_line, String::new()),".to_string(),
+            "                format!(\"{{ printf … > {file}; }} 2>/dev/null || echo \\\"{marker_prefix}$c\\\"\"),"
+                .to_string(),
+        ),
+        (
+            13,
+            "        None => (format!(\"echo \\\"{marker_prefix}$c\\\"\"), String::new()),".to_string(),
         ),
     ];
-    let got = marker_outside_fallback(&body, "2>/dev/null || {marker_line}");
+    let got = marker_outside_fallback(&body);
     assert_eq!(got.len(), 1, "{got:?}");
-    assert!(got[0].contains(":11:"), "{got:?}");
+    assert!(got[0].contains(":12:"), "{got:?}");
 }
 
 // --------------------------------------------- 4. バッジ

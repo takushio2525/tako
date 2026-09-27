@@ -92,6 +92,12 @@ pub struct Pane {
     /// 実行ペイン（run-interactive / Code Runner / カード）のメタデータ。
     /// セッション内で使い捨て（#1657 で終了コードの状態と再利用の鍵も持つ）
     interactive_meta: Option<crate::run_pane::InteractiveMeta>,
+    /// 終了コードの側路ファイル（`crate::run_pane`）。実行ペイン（#1657）と
+    /// `tako split --command` の失敗時の保持（#1778）が持つ。**実行ペインのメタとは別**に
+    /// 置くのは、保持のペインを実行ペイン（バッジ・`list` の `run`・auto_close）に
+    /// しないため。`None` = 用意できなかった / 持たない = 画面のマーカーだけが頼り。
+    /// セッション内で使い捨て（layout.json には保存しない）
+    exit_file: Option<std::path::PathBuf>,
     /// 利用上限（5h / 週次）後の自動復帰を有効にするか（#813）。既定 OFF。
     /// ペイン単位のオプトインで、layout.json に保存して再起動・復元をまたいで維持する
     limit_autoresume: bool,
@@ -107,6 +113,7 @@ impl Pane {
             role: None,
             spawned_by: None,
             interactive_meta: None,
+            exit_file: None,
             limit_autoresume: false,
         }
     }
@@ -130,6 +137,7 @@ impl Pane {
             role,
             spawned_by: None,
             interactive_meta: None,
+            exit_file: None,
             limit_autoresume,
         }
     }
@@ -198,6 +206,15 @@ impl Pane {
 
     pub fn set_interactive_meta(&mut self, meta: crate::run_pane::InteractiveMeta) {
         self.interactive_meta = Some(meta);
+    }
+
+    /// 終了コードの側路ファイル（持たなければ `None`。#1657 / #1778）
+    pub fn exit_file(&self) -> Option<&std::path::Path> {
+        self.exit_file.as_deref()
+    }
+
+    pub fn set_exit_file(&mut self, file: Option<std::path::PathBuf>) {
+        self.exit_file = file;
     }
 
     /// 利用上限後の自動復帰が有効か（#813。既定 false）

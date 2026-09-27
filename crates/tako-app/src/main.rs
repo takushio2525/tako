@@ -9574,7 +9574,7 @@ impl TakoApp {
     /// `auto_close_run_pane`）で、ここは GUI の後始末（見張りから外す・レイアウトの保存 =
     /// IPC の dispatch 後と同じ扱い）だけを持つ
     fn auto_close_finished_run_pane(&mut self, pane: PaneId) -> bool {
-        let closed = tako_control::dispatch::auto_close_run_pane(self, pane, CloseOrigin::Internal);
+        let closed = tako_control::dispatch::auto_close_run_pane(self, pane);
         if closed {
             self.run_exit_watch.remove(&pane);
             self.save_layout();
@@ -9585,7 +9585,7 @@ impl TakoApp {
     /// 全タブの終わった実行ペインを auto_close の方針どおりに閉じる（#1662。2 秒ごとの
     /// 定期更新から）。戻り値は 1 枚でも閉じたか
     fn auto_close_finished_run_panes(&mut self) -> bool {
-        let closed = tako_control::dispatch::auto_close_run_panes(self, CloseOrigin::Internal);
+        let closed = tako_control::dispatch::auto_close_run_panes(self);
         for pane in &closed {
             self.run_exit_watch.remove(pane);
         }
@@ -80471,11 +80471,15 @@ mod self_test {
                 let Some(bad_pane) = pane_of(&fail143) else {
                     fail(&format!("143: 失敗コマンドの split が失敗した (#1031。{fail143:?})"))
                 };
-                let hint143 = tako_core::platform::shell::hold_hint(tako_core::i18n::lang());
+                // #1778: 画面には人の言葉の案内（「終了コード 7 / Enter で閉じる」）だけが出て、
+                // 終了コードは側路から `run_pane_exit_code`（`run-interactive-status`）で読める
+                let (head143, tail143) =
+                    tako_core::platform::shell::run_exit_hint(tako_core::i18n::lang());
+                let hint143 = squash_ws(&format!("{head143}7{tail143}"));
                 let held = wait_for_app_state(
                     window,
                     cx,
-                    "143: 失敗したコマンドが終了コードと案内を残す (#1031)",
+                    "143: 失敗したコマンドが終了コードと案内を残す (#1031 / #1778)",
                     Duration::from_secs(12),
                     |app| {
                         app.terminals
@@ -80483,14 +80487,18 @@ mod self_test {
                             .map(|s| {
                                 // 案内は狭いペインで**行を折り返す**ので、空白と改行を
                                 // 落としてから見る（実測: 「…このペインを閉じ」「ます。」）
-                                let joined = squash_ws(&s.visible_lines().join(""));
-                                joined.contains("__TAKO_EXIT=7")
-                                    && joined.contains(&squash_ws(hint143))
+                                squash_ws(&s.visible_lines().join("")).contains(&hint143)
                             })
                             .unwrap_or(false)
                     },
                 )
                 .await;
+                let code143 = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        tako_control::dispatch::run_pane_exit_code(app, bad_pane)
+                    })
+                    .ok()
+                    .flatten();
                 let screen143 = window
                     .update(cx, |app: &mut TakoApp, _, _| {
                         app.terminals
@@ -80510,11 +80518,13 @@ mod self_test {
                         app.terminals.contains_key(&bad_pane)
                     })
                     .unwrap_or(false);
+                let marker143 = screen143.iter().any(|l| l.contains("__TAKO_EXIT="));
                 check(
-                    held && alive143,
+                    held && alive143 && code143 == Some(7) && !marker143,
                     &format!(
-                        "143 (c): 失敗したコマンドは終了コードと案内を残して止まる \
-                         (#1031) held={held} alive={alive143} screen={screen143:?}"
+                        "143 (c): 失敗したコマンドは案内を残して止まり、終了コードは側路から読める \
+                         (#1031 / #1778) held={held} alive={alive143} code={code143:?} \
+                         marker={marker143} screen={screen143:?}"
                     ),
                 );
                 let _ = window.update(cx, |app: &mut TakoApp, _, cx| {

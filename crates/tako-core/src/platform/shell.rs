@@ -36,34 +36,26 @@ pub fn login_shell_command(command: SpawnCommand) -> SpawnCommand {
 /// `tako split --command` のペインは「コマンドの終了 = ペイン close」なので、
 /// 起動に失敗すると数秒で消え、理由が画面にもログにも残らなかった（#1031 実発）。
 /// 成功したときは従来どおり即 close（`exit 0` するだけ）、非 0 のときだけ
-/// 終了コードのマーカー行 + 案内を出して入力待ちで止める。
+/// 終了コードを伝えて入力待ちで止める。
 ///
-/// マーカーの形は実行ペイン（[`run_pane_command`]）の退避路と同じ `<marker_prefix><code>` で、
-/// 読む側（`tako_control::dispatch::find_exit_marker`）も 1 つ。**接頭辞は呼び出し側が渡す**
+/// 伝え方は実行ペイン（[`run_pane_command`]）と**同じ 1 実装**（#1778）: 終了コードは
+/// 側路ファイル `exit_file` へ `<code>\n` で書き、画面には人の言葉の案内
+/// （[`run_exit_hint`]。「終了コード N / Enter でこのペインを閉じます」）だけを出す。
+/// 画面へ `<marker_prefix><code>` を出すのは側路を用意できなかった（`None`）ときだけで、
+/// 読む側も同じ `tako_control::dispatch::run_pane_exit_code`。#1778 以前は失敗のたびに
+/// 画面へ `__TAKO_EXIT=N` をそのまま出していた。**接頭辞は呼び出し側が渡す**
 /// （契約の持ち主を増やさない）。
 ///
 /// `TAKO_1031_LEGACY=1` では**包まない** = #1031 前の「失敗しても黙って消える」へ戻る
-pub fn hold_on_failure_command(command: SpawnCommand, marker_prefix: &str) -> SpawnCommand {
+pub fn hold_on_failure_command(
+    command: SpawnCommand,
+    marker_prefix: &str,
+    exit_file: Option<&std::path::Path>,
+) -> SpawnCommand {
     if legacy_1031() {
         return command;
     }
-    imp::hold_on_failure_command(command, marker_prefix, hold_hint(crate::i18n::lang()))
-}
-
-/// 失敗したペインに出す案内（日英）。
-///
-/// シェルへ**そのまま埋め込む**ので `"` / `$` / バッククォート / `\` を含めない
-/// （POSIX は二重引用符の中、PowerShell は単引用符の中に置く）。
-/// 純粋関数にしてあるので macOS 上から両言語を検査できる
-pub fn hold_hint(lang: crate::i18n::Lang) -> &'static str {
-    match lang {
-        crate::i18n::Lang::Ja => {
-            "[tako] コマンドが失敗しました。上の出力を確認できます。Enter でこのペインを閉じます。"
-        }
-        crate::i18n::Lang::En => {
-            "[tako] The command failed. The output above is kept. Press Enter to close this pane."
-        }
-    }
+    imp::hold_on_failure_command(command, marker_prefix, exit_file, crate::i18n::lang())
 }
 
 /// #1031 の A/B ゲート（対話シェル化と失敗時の保持を両方 #1031 前へ戻す）
@@ -79,11 +71,12 @@ fn legacy_1031() -> bool {
 /// Enter で側路ファイルを消して終わる」（#1657）。入力待ちで止めるのは、即終了する
 /// コマンドでも出力を読めるようにペインを残すため。
 ///
-/// **画面へ `<marker_prefix><code>` を出すのは側路へ書けなかったときだけ**（退避路）。
-/// #1657 以前は常に画面へ出しており、内部の契約がユーザーに見えていた。読む側は
-/// 「側路ファイル → 画面のマーカー」の順に見る 1 実装
-/// （`tako_control::dispatch::run_pane_exit_code`）。側路が用意できない（`exit_file` が
-/// `None`）ときも画面のマーカーで伝わるので、`--wait` が止まることはない。
+/// **画面へ `<marker_prefix><code>` を出すのは側路を用意できなかった（`exit_file` が
+/// `None`）ときだけ**（退避路。#1778 で「書けなかったとき」の画面出力もやめた）。
+/// #1657 以前は常に画面へ出しており、内部の契約がユーザーに見えていた。読む側
+/// （`tako_control::dispatch::run_pane_exit_code` の 1 実装）も、側路を持つペインでは
+/// 画面を読まない（プログラム自身が印字した `__TAKO_EXIT=N` で偽の確定をしない）。
+/// 側路が用意できないときは画面のマーカーで伝わるので、`--wait` が止まることはない。
 ///
 /// 呼び出し側（`dispatch`）が `/bin/sh -c` を直書きしていたため Windows では
 /// `CreateProcess` が失敗し、ペインだけ生えて PTY が立たなかった（#875）。
@@ -316,9 +309,10 @@ mod imp {
     pub(crate) fn hold_on_failure_command(
         command: SpawnCommand,
         marker_prefix: &str,
-        hint: &str,
+        exit_file: Option<&std::path::Path>,
+        lang: crate::i18n::Lang,
     ) -> SpawnCommand {
-        super::posix_hold_on_failure_command(&command, marker_prefix, hint)
+        super::posix_hold_on_failure_command(&command, marker_prefix, exit_file, lang)
     }
 
     pub(crate) fn run_pane_command(
@@ -399,9 +393,16 @@ mod imp {
     pub(crate) fn hold_on_failure_command(
         command: SpawnCommand,
         marker_prefix: &str,
-        hint: &str,
+        exit_file: Option<&std::path::Path>,
+        lang: crate::i18n::Lang,
     ) -> SpawnCommand {
-        super::powershell_hold_on_failure_command(&run_pane_shell(), &command, marker_prefix, hint)
+        super::powershell_hold_on_failure_command(
+            &run_pane_shell(),
+            &command,
+            marker_prefix,
+            exit_file,
+            lang,
+        )
     }
 
     pub(crate) fn run_pane_command(
@@ -497,8 +498,9 @@ fn posix_login_shell_command(shell: &str, script: &str, interactive: bool) -> Sp
 
 /// POSIX の「失敗したときだけ止める」argv（純粋関数。#1031）。
 ///
-/// 成功時は `exit 0` で即終了する = ペインは従来どおり閉じる。非 0 のときだけ
-/// マーカー行 + 案内を出して `read` で待つ。最後に元の終了コードで `exit` するので、
+/// 成功時は `exit 0` で即終了する = ペインは従来どおり閉じる（側路にも書かない）。
+/// 非 0 のときだけ、実行ペインと同じ片（[`posix_exit_report`] / [`posix_exit_hint_line`]。
+/// #1778）で終了コードを伝えて `read` で待つ。最後に元の終了コードで `exit` するので、
 /// 呼び出し元（`login_shell_command` のラッパーシェル）から見た終了コードも保たれる。
 ///
 /// `/bin/sh` 決め打ちの理由は [`posix_run_pane_command`] と同じ
@@ -508,17 +510,21 @@ fn posix_login_shell_command(shell: &str, script: &str, interactive: bool) -> Sp
 fn posix_hold_on_failure_command(
     command: &SpawnCommand,
     marker_prefix: &str,
-    hint: &str,
+    exit_file: Option<&std::path::Path>,
+    lang: crate::i18n::Lang,
 ) -> SpawnCommand {
     let inner = crate::tmux_backend::shell_quoted(command);
+    let (report, cleanup) = posix_exit_report(marker_prefix, exit_file);
     let script = format!(
-        "{inner}; __tako_code=$?; \
-         if [ \"$__tako_code\" -ne 0 ]; then \
-         echo \"{marker_prefix}$__tako_code\"; \
-         echo \"{hint}\"; \
-         read -r __TAKO_HOLD__ 2>/dev/null || true; \
-         fi; \
-         exit \"$__tako_code\""
+        "{inner}\n\
+         __tako_code=$?\n\
+         if [ \"$__tako_code\" -ne 0 ]; then\n\
+         {report}\n\
+         {hint}\n\
+         read -r __TAKO_HOLD__ 2>/dev/null || true{cleanup}\n\
+         fi\n\
+         exit \"$__tako_code\"",
+        hint = posix_exit_hint_line(lang),
     );
     SpawnCommand {
         program: "/bin/sh".to_string(),
@@ -528,7 +534,8 @@ fn posix_hold_on_failure_command(
 
 /// Windows の「失敗したときだけ止める」argv（純粋関数。**macOS 上でもテストできる**。#1031）。
 ///
-/// 終了コードの決め方は [`powershell_exit_code_script`] に任せる（規則を 2 つ持たない）。
+/// 終了コードの決め方は [`powershell_exit_code_script`] に、伝え方は実行ペインと同じ
+/// [`powershell_exit_report`] / [`powershell_exit_hint_line`] に任せる（規則を 2 つ持たない。#1778）。
 /// argv は呼び出し演算子（`&`）で起こす: `Invoke-Expression` と違って**語のリストのまま**
 /// 渡せるので、空白や日本語を含む引数が割れない
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -536,22 +543,23 @@ fn powershell_hold_on_failure_command(
     program: &str,
     command: &SpawnCommand,
     marker_prefix: &str,
-    hint: &str,
+    exit_file: Option<&std::path::Path>,
+    lang: crate::i18n::Lang,
 ) -> SpawnCommand {
     let invocation = std::iter::once(&command.program)
         .chain(command.args.iter())
         .map(|w| ShellDialect::PowerShell.quote_arg(w))
         .collect::<Vec<_>>()
         .join(" ");
-    let marker = ShellDialect::PowerShell.quote_arg(marker_prefix);
-    let hint_lit = ShellDialect::PowerShell.quote_arg(hint);
+    let (report, cleanup) = powershell_exit_report(marker_prefix, exit_file);
     let script = format!(
         "{}if ($__tako_code -ne 0) {{\n\
-         Write-Host ({marker} + $__tako_code)\n\
-         Write-Host {hint_lit}\n\
+         {report}\n\
+         {hint}\n\
          try {{ $null = [Console]::ReadLine() }} catch {{ }}\n\
-         }}\nexit $__tako_code\n",
-        powershell_exit_code_script(&format!("& {invocation}"))
+         {cleanup}}}\nexit $__tako_code\n",
+        powershell_exit_code_script(&format!("& {invocation}")),
+        hint = powershell_exit_hint_line(lang),
     );
     SpawnCommand {
         program: program.to_string(),
@@ -589,9 +597,9 @@ fn posix_run_pane_command(command: &str, marker_prefix: &str) -> SpawnCommand {
 ///
 /// [`posix_run_pane_command`]（#1657 前の形。A/B 用に残す）との違いは 3 つ:
 ///
-/// 1. 終了コードを**側路ファイルへ**書く。書けなかったときだけ画面へマーカー行を出す
-///    （`{ … > file; } 2>/dev/null || echo …`）。`exit_file` が無ければ最初から画面へ出す
-/// 2. 画面には人の言葉の案内（[`run_exit_hint`]）を淡色で出す。前の出力と混ざらないよう
+/// 1. 終了コードを**側路ファイルへ**書く（[`posix_exit_report`]）。`exit_file` が無いときだけ
+///    画面へマーカー行を出す（#1778 までは「書けなかったとき」も出していた）
+/// 2. 画面には人の言葉の案内（[`posix_exit_hint_line`]）を淡色で出す。前の出力と混ざらないよう
 ///    空行を 1 つ挟む
 /// 3. Enter のあとで側路ファイルを消す（消えるのはペインが閉じる直前 = 読む側はもう要らない）
 ///
@@ -621,28 +629,50 @@ fn posix_run_pane_script(
     exit_file: Option<&std::path::Path>,
     lang: crate::i18n::Lang,
 ) -> String {
-    let marker_line = format!("echo \"{marker_prefix}$__tako_code\"");
-    let (report, cleanup) = match exit_file {
-        Some(path) => {
-            let file = crate::shell::quote_for_shell(&path.to_string_lossy());
-            (
-                format!(
-                    "{{ printf '%s\\n' \"$__tako_code\" > {file}; }} 2>/dev/null || {marker_line}"
-                ),
-                format!("\nrm -f {file} 2>/dev/null"),
-            )
-        }
-        None => (marker_line, String::new()),
-    };
-    let (head, tail) = run_exit_hint(lang);
+    let (report, cleanup) = posix_exit_report(marker_prefix, exit_file);
     format!(
         "{command}\n\
          __tako_code=$?\n\
          {report}\n\
-         printf '\\n\\033[2m%s%s%s\\033[0m\\n' {head} \"$__tako_code\" {tail}\n\
+         {hint}\n\
          read -r __TAKO_DUMMY__ 2>/dev/null || true{cleanup}",
-        head = crate::shell::quote_for_shell(head),
-        tail = crate::shell::quote_for_shell(tail),
+        hint = posix_exit_hint_line(lang),
+    )
+}
+
+/// `$__tako_code` を伝える片（POSIX。実行ペインと `split --command` の保持の 1 実装。
+/// #1657 / #1778）。戻り値は（伝える片, Enter のあとの後片付け = 先頭に改行つき）。
+///
+/// 側路があれば側路へ `<code>\n` を書くだけで、**画面へはマーカーを出さない**。書けなくても
+/// 出さない: 読む側（`run_pane_exit_code`）は側路を持つペインで画面を読まないので、出しても
+/// 誰も読まず、内部の契約がユーザーに見えるだけになる（書けなかったときの縮退は
+/// `run_pane` の doc）。側路が無いときだけ画面へマーカー行を出す（退避路）
+#[cfg_attr(windows, allow(dead_code))]
+fn posix_exit_report(marker_prefix: &str, exit_file: Option<&std::path::Path>) -> (String, String) {
+    match exit_file {
+        Some(path) => {
+            let file = crate::shell::quote_for_shell(&path.to_string_lossy());
+            (
+                format!("{{ printf '%s\\n' \"$__tako_code\" > {file}; }} 2>/dev/null"),
+                format!("\nrm -f {file} 2>/dev/null"),
+            )
+        }
+        None => (
+            format!("echo \"{marker_prefix}$__tako_code\""),
+            String::new(),
+        ),
+    }
+}
+
+/// 終わったときの案内の 1 行（POSIX。「終了コード N / Enter でこのペインを閉じます」を淡色で。
+/// 前の出力と混ざらないよう空行を 1 つ挟む）。案内の文言は [`run_exit_hint`]
+#[cfg_attr(windows, allow(dead_code))]
+fn posix_exit_hint_line(lang: crate::i18n::Lang) -> String {
+    let (head, tail) = run_exit_hint(lang);
+    format!(
+        "printf '\\n\\033[2m%s%s%s\\033[0m\\n' {} \"$__tako_code\" {}",
+        crate::shell::quote_for_shell(head),
+        crate::shell::quote_for_shell(tail),
     )
 }
 
@@ -673,11 +703,7 @@ fn powershell_run_pane_command_1657(
     }
 }
 
-/// [`powershell_run_pane_command_1657`] が走らせるスクリプト（純粋関数）。
-///
-/// 側路へは `Set-Content` で書く（`[IO.File]::WriteAllText` を使わないのは、制約付き
-/// 言語モード（ConstrainedLanguage）の環境で .NET のメソッド呼び出しが止められるため）。
-/// 書けなければ `catch` で画面へマーカー行を出す = POSIX の `||` と同じ退避路
+/// [`powershell_run_pane_command_1657`] が走らせるスクリプト（純粋関数）
 #[cfg_attr(not(windows), allow(dead_code))]
 fn powershell_run_pane_script(
     command: &str,
@@ -685,29 +711,55 @@ fn powershell_run_pane_script(
     exit_file: Option<&std::path::Path>,
     lang: crate::i18n::Lang,
 ) -> String {
+    let (report, cleanup) = powershell_exit_report(marker_prefix, exit_file);
+    format!(
+        "{}{report}\n\
+         {hint}\n\
+         try {{ $null = [Console]::ReadLine() }} catch {{ }}\n\
+         {cleanup}",
+        powershell_exit_code_script(command),
+        hint = powershell_exit_hint_line(lang),
+    )
+}
+
+/// `$__tako_code` を伝える片（PowerShell。[`posix_exit_report`] と同じ取り決め。#1657 / #1778）。
+/// 戻り値は（伝える片, Enter のあとの後片付け = 末尾に改行つき）。
+///
+/// 側路へは `Set-Content` で書く（`[IO.File]::WriteAllText` を使わないのは、制約付き
+/// 言語モード（ConstrainedLanguage）の環境で .NET のメソッド呼び出しが止められるため）。
+/// 書けなくても画面へマーカーを出さない（`catch` は空 = POSIX の `2>/dev/null` と同じ）
+#[cfg_attr(not(windows), allow(dead_code))]
+fn powershell_exit_report(
+    marker_prefix: &str,
+    exit_file: Option<&std::path::Path>,
+) -> (String, String) {
     let q = |w: &str| ShellDialect::PowerShell.quote_arg(w);
-    let marker_line = format!("Write-Host ({} + $__tako_code)", q(marker_prefix));
-    let (report, cleanup) = match exit_file {
+    match exit_file {
         Some(path) => {
             let file = q(&path.to_string_lossy());
             (
                 format!(
                     "try {{ Set-Content -LiteralPath {file} -Value ([string]$__tako_code) \
-                     -Encoding ascii -ErrorAction Stop }} catch {{ {marker_line} }}"
+                     -Encoding ascii -ErrorAction Stop }} catch {{ }}"
                 ),
                 format!("Remove-Item -LiteralPath {file} -ErrorAction SilentlyContinue\n"),
             )
         }
-        None => (marker_line, String::new()),
-    };
+        None => (
+            format!("Write-Host ({} + $__tako_code)", q(marker_prefix)),
+            String::new(),
+        ),
+    }
+}
+
+/// 終わったときの案内（PowerShell。[`posix_exit_hint_line`] と同じ形を 2 行で）
+#[cfg_attr(not(windows), allow(dead_code))]
+fn powershell_exit_hint_line(lang: crate::i18n::Lang) -> String {
+    let q = |w: &str| ShellDialect::PowerShell.quote_arg(w);
     let (head, tail) = run_exit_hint(lang);
     format!(
-        "{}{report}\n\
-         Write-Host ''\n\
-         Write-Host ({} + $__tako_code + {}) -ForegroundColor DarkGray\n\
-         try {{ $null = [Console]::ReadLine() }} catch {{ }}\n\
-         {cleanup}",
-        powershell_exit_code_script(command),
+        "Write-Host ''\n\
+         Write-Host ({} + $__tako_code + {}) -ForegroundColor DarkGray",
         q(head),
         q(tail),
     )
@@ -1093,13 +1145,22 @@ mod tests_1031 {
         }
     }
 
-    /// **配線**の検査（`hold_on_failure_command` の既定は「包む」）
+    /// **配線**の検査（`hold_on_failure_command` の既定は「包む」）。側路を渡せば画面の
+    /// マーカーを持たず側路へ書き、渡さなければ退避路（画面のマーカー）を持つ（#1778）
     #[test]
     fn 配線された失敗時の保持が既定で有効() {
         assert!(std::env::var_os("TAKO_1031_LEGACY").is_none());
-        let got = hold_on_failure_command(cmd(&["npm", "run", "dev"]), "__TAKO_EXIT=");
+        let file = std::path::Path::new("/tmp/tako-1778/run-exit/9.code");
+        let got = hold_on_failure_command(cmd(&["npm", "run", "dev"]), "__TAKO_EXIT=", Some(file));
         assert_ne!(got.program, "npm", "包まれていない: {got:?}");
         let script = wired_script(&got);
+        assert!(!script.contains("__TAKO_EXIT="), "script={script}");
+        assert!(
+            script.contains("9.code"),
+            "側路へ書いていない: script={script}"
+        );
+        let fallback = hold_on_failure_command(cmd(&["npm", "run", "dev"]), "__TAKO_EXIT=", None);
+        let script = wired_script(&fallback);
         assert!(script.contains("__TAKO_EXIT="), "script={script}");
     }
 
@@ -1115,42 +1176,83 @@ mod tests_1031 {
         );
     }
 
-    /// 成功時は従来どおり即終了（ペインが閉じる）、失敗時だけマーカー + 案内 + 待ち
+    const FILE_1778: &str = "/tmp/tako data/run-exit/12.code";
+
+    /// 成功時は従来どおり即終了（ペインが閉じる）、失敗時だけ側路 + 案内 + 待ち（#1778）
     #[test]
     fn 失敗時だけ止めるposix片の構造() {
         let got = posix_hold_on_failure_command(
             &cmd(&["npm", "run", "dev"]),
             "__TAKO_EXIT=",
-            "[tako] failed",
+            Some(std::path::Path::new(FILE_1778)),
+            Lang::Ja,
         );
         assert_eq!(got.program, "/bin/sh");
         assert_eq!(got.args[0], "-c");
         let script = &got.args[1];
         // 本体はそのまま先頭に居る（余計な包みを増やさない）
-        assert!(script.starts_with("npm run dev; "), "script={script}");
+        assert!(
+            script.starts_with("npm run dev\n__tako_code=$?\n"),
+            "script={script}"
+        );
         // 判定は非 0 のときだけ
-        assert!(
-            script.contains(r#"if [ "$__tako_code" -ne 0 ]; then"#),
-            "script={script}"
-        );
-        // 実行ペインと同じマーカー行
-        assert!(
-            script.contains(r#"echo "__TAKO_EXIT=$__tako_code""#),
-            "script={script}"
-        );
-        assert!(
-            script.contains(r#"echo "[tako] failed""#),
-            "script={script}"
-        );
-        // 待つのは失敗したときだけ（`fi` の前）
+        let if_at = script
+            .find(r#"if [ "$__tako_code" -ne 0 ]; then"#)
+            .expect("判定が要る");
+        // 伝え方は実行ペインと同じ片（側路へ書く・案内を出す）で、画面にマーカーを出さない
+        let (report, cleanup) =
+            posix_exit_report("__TAKO_EXIT=", Some(std::path::Path::new(FILE_1778)));
+        let report_at = script.find(&report).expect("側路へ書く片が要る");
+        let hint_at = script
+            .find(&posix_exit_hint_line(Lang::Ja))
+            .expect("案内が要る");
+        assert!(!script.contains("__TAKO_EXIT="), "script={script}");
+        // 待つのは失敗したときだけ（`fi` の前）。後片付けは Enter のあと
         let read_at = script.find("read -r __TAKO_HOLD__").expect("待ちが要る");
-        let fi_at = script.rfind("fi;").expect("fi が要る");
-        assert!(read_at < fi_at, "待ちが if の外にある: {script}");
+        let rm_at = script.find(cleanup.trim_start()).expect("後片付けが要る");
+        let fi_at = script.rfind("\nfi\n").expect("fi が要る");
+        assert!(
+            if_at < report_at && report_at < hint_at && hint_at < read_at && read_at < rm_at,
+            "並びが違う: {script}"
+        );
+        assert!(rm_at < fi_at, "後片付けが if の外にある: {script}");
         // 終了コードは元のまま返す（呼び出し元のラッパーから見た値を変えない）
         assert!(
             script.trim_end().ends_with(r#"exit "$__tako_code""#),
             "script={script}"
         );
+    }
+
+    /// 側路が無い（データディレクトリを解決できない）ときだけ画面のマーカーで伝える
+    #[test]
+    fn 失敗時の保持も側路が無ければマーカーを画面へ出す() {
+        let got = posix_hold_on_failure_command(
+            &cmd(&["npm", "run", "dev"]),
+            "__TAKO_EXIT=",
+            None,
+            Lang::En,
+        );
+        let script = &got.args[1];
+        assert!(
+            script.contains("\necho \"__TAKO_EXIT=$__tako_code\"\n"),
+            "{script}"
+        );
+        assert!(!script.contains("rm -f"), "{script}");
+        let ps = decode_powershell_command(
+            &powershell_hold_on_failure_command(
+                "pwsh.exe",
+                &cmd(&["npm", "run", "dev"]),
+                "__TAKO_EXIT=",
+                None,
+                Lang::En,
+            )
+            .args[2],
+        );
+        assert!(
+            ps.contains("Write-Host ('__TAKO_EXIT=' + $__tako_code)\n"),
+            "{ps}"
+        );
+        assert!(!ps.contains("Remove-Item"), "{ps}");
     }
 
     /// 空白・日本語・引用符を含む語が 1 語のまま届く（#884 と同じ不変条件）
@@ -1159,7 +1261,8 @@ mod tests_1031 {
         let got = posix_hold_on_failure_command(
             &cmd(&["/bin/echo", "a b", "検証", "it's"]),
             "__TAKO_EXIT=",
-            "[tako] failed",
+            None,
+            Lang::Ja,
         );
         let script = &got.args[1];
         assert!(
@@ -1182,28 +1285,87 @@ mod tests_1031 {
         }
     }
 
-    /// 成功したコマンドは待たずに終わる（= ペインが従来どおり閉じる）
+    #[cfg(unix)]
+    fn temp_dir_1778(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tako-1778-hold-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 成功したコマンドは待たずに終わる（= ペインが従来どおり閉じる）。側路にも書かない
     #[cfg(unix)]
     #[test]
     fn 成功したコマンドは待たずに終わる() {
-        let got = posix_hold_on_failure_command(&cmd(&["true"]), "__TAKO_EXIT=", "[tako] failed");
+        let dir = temp_dir_1778("ok");
+        let file = dir.join("3.code");
+        let got =
+            posix_hold_on_failure_command(&cmd(&["true"]), "__TAKO_EXIT=", Some(&file), Lang::Ja);
         let out = std::process::Command::new(&got.program)
             .args(&got.args)
             .output()
             .expect("sh が走る");
         assert_eq!(out.status.code(), Some(0));
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "");
+        assert!(!file.exists(), "成功したのに側路へ書いた");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 失敗したコマンドはマーカーと案内を出し、終了コードを保つ
-    /// （stdin が閉じているので `read` は即戻る = テストがハングしない）
+    /// 失敗したコマンドは側路へ終了コードを書き、画面には案内だけを出して止まる。
+    /// Enter で側路を消し、終了コードは元のまま返す（#1778）
     #[cfg(unix)]
     #[test]
-    fn 失敗したコマンドは終了コードと案内を出す() {
+    fn 失敗したコマンドは側路へ終了コードを書き画面には案内だけを出す() {
+        use std::io::Write;
+        let dir = temp_dir_1778("ng");
+        let file = dir.join("4.code");
+        let got = posix_hold_on_failure_command(
+            &cmd(&["sh", "-c", "echo out-1778; exit 7"]),
+            "__TAKO_EXIT=",
+            Some(&file),
+            Lang::Ja,
+        );
+        let mut child = std::process::Command::new(&got.program)
+            .args(&got.args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("sh が走る");
+        // Enter を送る前に側路が埋まる（入力待ちで止まっている）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::run_pane::read(&file).is_none() {
+            assert!(std::time::Instant::now() < deadline, "側路に書かれない");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(crate::run_pane::read(&file), Some(7));
+        child.stdin.take().unwrap().write_all(b"\n").unwrap();
+        let out = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("out-1778"), "{stdout}");
+        assert!(
+            !stdout.contains("__TAKO_EXIT="),
+            "画面にマーカーが出た: {stdout:?}"
+        );
+        let (head, tail) = run_exit_hint(Lang::Ja);
+        assert!(stdout.contains(&format!("{head}7{tail}")), "{stdout:?}");
+        assert_eq!(out.status.code(), Some(7));
+        assert!(!file.exists(), "Enter のあとも側路が残っている");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 側路が無ければ画面のマーカー + 案内（退避路。stdin が閉じているので `read` は即戻る）
+    #[cfg(unix)]
+    #[test]
+    fn 失敗したコマンドは側路が無ければ画面のマーカーで伝える() {
         let got = posix_hold_on_failure_command(
             &cmd(&["sh", "-c", "exit 7"]),
             "__TAKO_EXIT=",
-            "[tako] failed",
+            None,
+            Lang::En,
         );
         let out = std::process::Command::new(&got.program)
             .args(&got.args)
@@ -1212,19 +1374,26 @@ mod tests_1031 {
             .expect("sh が走る");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(stdout.contains("__TAKO_EXIT=7"), "stdout={stdout}");
-        assert!(stdout.contains("[tako] failed"), "stdout={stdout}");
+        let (head, tail) = run_exit_hint(Lang::En);
+        assert!(
+            stdout.contains(&format!("{head}7{tail}")),
+            "stdout={stdout}"
+        );
         assert_eq!(out.status.code(), Some(7));
     }
 
     /// Windows 側（**macOS 上で検査する**）: `&` で argv を起こし、
-    /// 失敗したときだけマーカー + 案内 + 待ちを出す
+    /// 失敗したときだけ側路 + 案内 + 待ちを出す（伝え方は実行ペインと同じ片。#1778）
     #[test]
     fn 失敗時だけ止めるpowershell片の構造() {
+        let file =
+            std::path::Path::new("C:\\Users\\winuser\\AppData\\Roaming\\tako\\run-exit\\12.code");
         let got = powershell_hold_on_failure_command(
             "pwsh.exe",
             &cmd(&["npm", "run dev", "it's"]),
             "__TAKO_EXIT=",
-            "[tako] failed",
+            Some(file),
+            Lang::Ja,
         );
         assert_eq!(got.program, "pwsh.exe");
         assert_eq!(got.args[0], "-NoLogo");
@@ -1236,23 +1405,28 @@ mod tests_1031 {
             "script={script}"
         );
         // 終了コードの決め方は 1 実装（`powershell_exit_code_script`）に任せている
-        assert!(script.contains("$__tako_code"), "script={script}");
         assert!(
-            script.contains("if ($__tako_code -ne 0) {"),
+            script.starts_with(&powershell_exit_code_script("& 'npm' 'run dev' 'it''s'")),
             "script={script}"
         );
+        let if_at = script
+            .find("if ($__tako_code -ne 0) {")
+            .expect("判定が要る");
+        let (report, cleanup) = powershell_exit_report("__TAKO_EXIT=", Some(file));
+        let report_at = script.find(&report).expect("側路へ書く片が要る");
+        let hint_at = script
+            .find(&powershell_exit_hint_line(Lang::Ja))
+            .expect("案内が要る");
+        let read_at = script.find("[Console]::ReadLine()").expect("待ちが要る");
+        let rm_at = script.find(&cleanup).expect("後片付けが要る");
         assert!(
-            script.contains("Write-Host ('__TAKO_EXIT=' + $__tako_code)"),
-            "script={script}"
+            if_at < report_at && report_at < hint_at && hint_at < read_at && read_at < rm_at,
+            "並びが違う: {script}"
         );
-        assert!(
-            script.contains("Write-Host '[tako] failed'"),
-            "script={script}"
-        );
-        assert!(script.contains("[Console]::ReadLine()"), "script={script}");
+        assert!(!script.contains("__TAKO_EXIT="), "script={script}");
         // 親へ返す終了コードは元のまま（`-EncodedCommand` は素通ししない。#935 の実測）
         assert!(
-            script.trim_end().ends_with("exit $__tako_code"),
+            script.trim_end().ends_with("}\nexit $__tako_code"),
             "script={script}"
         );
         // プロファイルは読む（実行ペイン `run_pane_command` と環境を揃える）
@@ -1261,26 +1435,6 @@ mod tests_1031 {
             "args={:?}",
             got.args
         );
-    }
-
-    /// 案内は日英とも用意し、**シェルへ直に埋め込める文字だけ**で書く
-    #[test]
-    fn 失敗時の案内は日英ともシェル安全() {
-        let ja = hold_hint(Lang::Ja);
-        let en = hold_hint(Lang::En);
-        assert_ne!(ja, en);
-        for (name, hint) in [("ja", ja), ("en", en)] {
-            assert!(hint.contains("tako"), "{name}: 発信元が分からない");
-            for bad in ['"', '$', '`', '\\'] {
-                assert!(
-                    !hint.contains(bad),
-                    "{name}: シェルが解釈する文字が入っている: {bad:?}"
-                );
-            }
-        }
-        // Enter で閉じられることを両言語で伝える
-        assert!(ja.contains("Enter"), "ja={ja}");
-        assert!(en.contains("Enter"), "en={en}");
     }
 }
 
@@ -1830,23 +1984,23 @@ mod tests_1657 {
         assert_ne!(run_exit_hint(Lang::Ja), run_exit_hint(Lang::En));
     }
 
-    /// 画面へマーカーを出すのは**側路へ書けなかったとき**（`||` の右）だけ
+    /// 側路を用意できたペインは画面へマーカーを出さない（書けなかったときも出さない。#1778）
     #[test]
-    fn posixはマーカーを退避路にだけ置く() {
+    fn posixは側路があれば画面へマーカーを出さない() {
         let file = std::path::Path::new("/tmp/tako data/12.code");
         let script = posix_run_pane_script("npm test", MARKER, Some(file), Lang::Ja);
         assert!(script.starts_with("npm test\n__tako_code=$?\n"), "{script}");
         // 書き先は空白入りでも 1 語のまま
         assert!(
             script.contains(
-                "> '/tmp/tako data/12.code'; } 2>/dev/null || echo \"__TAKO_EXIT=$__tako_code\""
+                "\n{ printf '%s\\n' \"$__tako_code\" > '/tmp/tako data/12.code'; } 2>/dev/null\n"
             ),
             "{script}"
         );
         assert_eq!(
             script.matches(MARKER).count(),
-            1,
-            "マーカーが退避路の外にも出ている: {script}"
+            0,
+            "側路があるのにマーカーを画面へ出す形が残っている: {script}"
         );
         // 案内・入力待ち・後片付けの順
         let (head, _) = run_exit_hint(Lang::Ja);
@@ -1877,9 +2031,9 @@ mod tests_1657 {
         assert!(!ps.contains("Remove-Item"), "{ps}");
     }
 
-    /// Windows 側も同じ形: 側路へ書き、書けなかったとき（`catch`）だけマーカー
+    /// Windows 側も同じ形: 側路へ書き、書けなくても（`catch`）画面へマーカーを出さない
     #[test]
-    fn powershellはマーカーを退避路にだけ置く() {
+    fn powershellは側路があれば画面へマーカーを出さない() {
         let file =
             std::path::Path::new("C:\\Users\\winuser\\AppData\\Roaming\\tako\\run-exit\\12.code");
         let got =
@@ -1895,11 +2049,11 @@ mod tests_1657 {
         let quoted = "'C:\\Users\\winuser\\AppData\\Roaming\\tako\\run-exit\\12.code'";
         assert!(
             script.contains(&format!(
-                "try {{ Set-Content -LiteralPath {quoted} -Value ([string]$__tako_code) -Encoding ascii -ErrorAction Stop }} catch {{ Write-Host ('__TAKO_EXIT=' + $__tako_code) }}"
+                "try {{ Set-Content -LiteralPath {quoted} -Value ([string]$__tako_code) -Encoding ascii -ErrorAction Stop }} catch {{ }}\n"
             )),
             "{script}"
         );
-        assert_eq!(script.matches(MARKER).count(), 1, "{script}");
+        assert_eq!(script.matches(MARKER).count(), 0, "{script}");
         let (head, tail) = run_exit_hint(Lang::Ja);
         assert!(
             script.contains(&format!(
@@ -1968,10 +2122,12 @@ mod tests_1657 {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 側路へ書けない（置き場が無い）ときは画面のマーカーへ落ちる = `--wait` が止まらない
+    /// 側路へ書けない（置き場が無い）ときも画面へマーカーを出さず、エラーも漏らさない。
+    /// 案内（人の言葉）は出る = 人は終了コードを読める（読む側が確定しない縮退は
+    /// `run_pane` の doc。#1778）
     #[cfg(unix)]
     #[test]
-    fn posixは側路へ書けなければ画面のマーカーへ落ちる() {
+    fn posixは側路へ書けなくても画面へマーカーを出さない() {
         let dir = temp_dir("fallback");
         let file = dir.join("no-such-dir").join("5.code");
         let got = posix_run_pane_command_1657("(exit 3)", MARKER, Some(&file), Lang::En);
@@ -1981,13 +2137,29 @@ mod tests_1657 {
             .output()
             .expect("sh が走る");
         let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(stdout.contains("__TAKO_EXIT=3"), "{stdout:?}");
+        assert!(!stdout.contains(MARKER), "{stdout:?}");
+        let (head, tail) = run_exit_hint(Lang::En);
+        assert!(stdout.contains(&format!("{head}3{tail}")), "{stdout:?}");
         assert!(
             out.stderr.is_empty(),
             "書き込み失敗のエラーが画面へ漏れた: {}",
             String::from_utf8_lossy(&out.stderr)
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 側路が無いときは実際の `/bin/sh` でも画面のマーカーで伝える（退避路）
+    #[cfg(unix)]
+    #[test]
+    fn posixは側路が無ければ画面のマーカーで伝える() {
+        let got = posix_run_pane_command_1657("(exit 3)", MARKER, None, Lang::En);
+        let out = std::process::Command::new(&got.program)
+            .args(&got.args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("sh が走る");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("__TAKO_EXIT=3"), "{stdout:?}");
     }
 
     /// #1657 の A/B: 旧形（常に画面のマーカー）は同じ入口から引ける
