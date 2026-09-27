@@ -229,6 +229,7 @@ pub fn verification_histfile_env() -> Vec<(String, String)> {
 }
 
 /// このプロセスが `cargo test` の起こしたテストバイナリか。
+/// **判定から外れたときは真（= 安全側）へ倒す**（#1811）。
 ///
 /// **`cfg!(test)` では足りない**（#944）: `cfg(test)` はそのクレートを
 /// テストビルドしたときだけ真なので、`tako-control` のテストから呼ばれた
@@ -236,17 +237,117 @@ pub fn verification_histfile_env() -> Vec<(String, String)> {
 /// 統合テスト（`crates/*/tests/*.rs`）から見た lib も同じく非テストビルドになる。
 /// 書き先を 1 か所（[`data_dir`]）で塞ぐには**実行時に**判定するしかない。
 ///
-/// 判定材料は実行ファイルの置き場: libtest のバイナリは必ず
-/// `<target>/<profile>/deps/<名前>-<cargo のメタデータハッシュ>` に置かれる。
-/// 製品の起動経路（`cargo run` = `<target>/<profile>/<名前>`・`.app` バンドル・
-/// `~/.cargo/bin`・インストーラの配置先）は **`deps/` を通らない**ので誤検知しない
+/// 判定材料は 2 つで、**どちらかが立てば真**（規則は [`judge_test_process`] の 1 実装）:
+///
+/// 1. 実行ファイルの置き場（#944）: libtest のバイナリは必ず
+///    `<target>/<profile>/deps/<名前>-<cargo のメタデータハッシュ>` に置かれる
+/// 2. **製品の入口を通っていない**（#1811）: 製品のバイナリ（`tako-app` / `tako`）は
+///    `main` の 1 文目で [`mark_product_process`] を呼ぶ。libtest のハーネスは製品の
+///    `main` を通らないので、テストバイナリを `deps/` の外へコピー・改名して走らせても
+///    真のまま残る
+///
+/// 1 だけだった頃は「置き場を変える」だけで偽になった。計測のために `/tmp` へコピーした
+/// テストバイナリが、本番の `recent.json` を上書きし（復元元なし）・
+/// `shell-integration/cli-dir` を空にし・実 agent CLI を実 HOME で起動した（#1811）。
+/// 既定を「製品と名乗らない限りテスト」へ倒したので、置き場や名前をどう変えても
+/// 本番の置き場へは届かない。
+///
+/// 製品側の条件は 1 と独立に効く（`deps/` の中で [`mark_product_process`] を呼んでも
+/// テストのまま）。テストが製品の入口を呼んで「製品に化ける」経路を作らないため
 pub fn is_test_process() -> bool {
-    static IS_TEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *IS_TEST.get_or_init(|| {
+    static IN_DEPS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let in_deps = *IN_DEPS.get_or_init(|| {
         std::env::current_exe()
             .ok()
             .is_some_and(|exe| is_test_exe_path(&exe))
+    });
+    let verdict = judge_test_process(
+        in_deps,
+        PRODUCT_ENTRY.load(std::sync::atomic::Ordering::Acquire),
+        issue1811_legacy(),
+    );
+    if verdict == TestVerdict::NoProductEntry {
+        warn_no_product_entry();
+    }
+    verdict != TestVerdict::NotTest
+}
+
+/// 製品の入口（`tako-app` / `tako` の `main`）を通ったか（#1811）
+static PRODUCT_ENTRY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`warn_no_product_entry`] を 1 プロセス 1 回に絞る
+static NO_PRODUCT_ENTRY_WARNED: std::sync::Once = std::sync::Once::new();
+
+/// 製品の入口を通ったと宣言する（#1811）。**`tako-app` / `tako` の `main` の 1 文目でだけ呼ぶ**。
+///
+/// これを呼ばないプロセスは、`deps/` の外で走っていても [`is_test_process`] が真になり、
+/// 本番の data dir・ホーム配下の外部エージェント設定・実 agent CLI の問い合わせに届かない。
+/// 呼び場所は番犬 `crates/tako-control/tests/issue1811_product_entry_watchdog.rs` が固定する
+/// （製品の `main` の 1 文目にあること・それ以外から呼ばれていないこと）。
+///
+/// 1 文目でなければならないのは、[`is_verification_process`] が判定を `OnceLock` に
+/// 覚えるため。宣言の前に判定を配っていたら debug ビルドではここで落とす
+pub fn mark_product_process() {
+    debug_assert!(
+        !NO_PRODUCT_ENTRY_WARNED.is_completed(),
+        "mark_product_process は main の 1 文目で呼ぶ（宣言の前にテスト判定を配った。#1811）"
+    );
+    PRODUCT_ENTRY.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// A/B 用の逃げ道（`TAKO_1811_LEGACY=1`）。#1811 の判定（製品の入口を通っていなければ
+/// テスト）を切り、置き場だけで決める**修正前の判定を再現**する。
+///
+/// 番犬（`tako_control::test_write_isolation`）が「これを立てて `deps/` の外で走らせると
+/// 本番相当の場所へ書いてしまう」ことを実測して、検査に検出力があること自体を固定する
+pub fn issue1811_legacy() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_1811_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
     })
+}
+
+/// [`is_test_process`] の判定結果。真になった理由を区別して持つ
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestVerdict {
+    /// `deps/` 配下のテストバイナリ（#944）
+    DepsBinary,
+    /// `deps/` の外だが、製品の入口を通っていない（#1811。安全側へ倒した）
+    NoProductEntry,
+    /// テストではない（製品の入口を通った / A/B で修正前の判定へ戻した）
+    NotTest,
+}
+
+/// [`is_test_process`] の規則そのもの（env・`current_exe`・静的状態に触らない純関数）
+fn judge_test_process(in_deps: bool, product_entry: bool, legacy_1811: bool) -> TestVerdict {
+    if in_deps {
+        TestVerdict::DepsBinary
+    } else if product_entry || legacy_1811 {
+        TestVerdict::NotTest
+    } else {
+        TestVerdict::NoProductEntry
+    }
+}
+
+/// 安全側へ倒したことを stderr へ 1 回だけ知らせる（#1811）。
+///
+/// 黙って倒すと「書いたはずのファイルが無い」ときに理由を辿れない。
+/// 書き先は stderr だけにする（persist.log は倒した先の data dir にあり、本番ではない）。
+/// 実行ファイルは**名前だけ**出す（パスにはホームのユーザー名が入る）
+fn warn_no_product_entry() {
+    NO_PRODUCT_ENTRY_WARNED.call_once(|| {
+        let exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_default();
+        eprintln!(
+            "tako: {exe} は製品の入口（tako-app / tako の main）を通っていないので、\
+             テストとして扱い、本番の data dir とホーム配下の設定へは書きません（Issue #1811）"
+        );
+    });
 }
 
 /// [`is_test_process`] の純粋ロジック（`current_exe` と分離してテストする）。
@@ -501,6 +602,37 @@ mod tests {
         assert!(!is_test_exe_path(Path::new(
             "/w/target/debug/deps/-0123456789abcdef"
         )));
+    }
+
+    /// #1811: 判定から外れたら**安全側（テスト）へ倒す**規則の表。
+    ///
+    /// 修正前は置き場（`in_deps`）だけで決めていたので、テストバイナリを `deps/` の外へ
+    /// コピーするだけで偽 = 本番の置き場へ書いた。偽にしてよいのは「製品の入口を通った」
+    /// ときだけで、`deps/` の中ではそれでもテストのまま（テストが製品に化けない）
+    #[test]
+    fn 製品の入口を通っていなければdepsの外でもテストとみなす() {
+        use TestVerdict::*;
+        // (in_deps, product_entry, legacy_1811) → 判定
+        let table = [
+            ((true, false, false), DepsBinary),
+            // deps/ の中で製品の入口を呼んでもテストのまま
+            ((true, true, false), DepsBinary),
+            ((true, false, true), DepsBinary),
+            // #1811 の本体: deps/ の外へコピー・改名したテストバイナリ
+            ((false, false, false), NoProductEntry),
+            // 製品（tako-app / tako の main が宣言済み）
+            ((false, true, false), NotTest),
+            ((false, true, true), NotTest),
+            // A/B: 修正前の判定（置き場だけで決める）
+            ((false, false, true), NotTest),
+        ];
+        for ((in_deps, product_entry, legacy), want) in table {
+            assert_eq!(
+                judge_test_process(in_deps, product_entry, legacy),
+                want,
+                "in_deps={in_deps} product_entry={product_entry} legacy={legacy}"
+            );
+        }
     }
 
     /// #944 の不変条件: テストプロセスは**製品の置き場**へ書かない。

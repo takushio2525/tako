@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-27（#1757: バイト位置の切り詰めの残りを直し、文字数の切り詰めを 1 実装へ寄せた）
-- peer_messaging の `&raw[len..]` は書き直されたファイルで文字の途中を指して panic（修正前に単体テストで実測）→ `raw.get(len..)` で「位置が無効 = 全文」へ。chat_view の `label[..1]` は文字単位の `capitalize_first` へ（family は既知の語に絞られていて今の入口からは届かない潜在バグ）
-- 文字数の切り詰めを `tako_core::text::truncate_chars` の 1 本へ（tako-app の `truncate` 68 呼び出し・context_budget の私有版を寄せ、transcript の同名関数は `summary_line` へ改名して数える部分を委譲）。範囲添字の検出を `tests/common/range_index.rs` へまとめ #1728 / #1746 の番犬が呼ぶ。規約は conventions.md「文字列をバイト位置で切らない」
-- 実測: 注入 A/B 2 か所が file:line 名指しで FAILED → 戻して緑・workspace 5768 passed 0 failed・clippy 3 宇宙 0。repo 全体の危ない型は 50 件あり番犬化は保留
-
 ## 2026-09-27（#1679: LSP の診断を波線・右パネル・tako lsp diagnostics で出した）
 - publish を受けた時点で「サーバへ送った本文の写し」で tako の座標へ写し（`LineIndex`）、manager の URI 別の表 1 つを波線・右パネル・CLI / MCP `tako_lsp` が読む。UI へは bounded 128 のキュー（溢れたら全部読み直す印）。pull 型は申告しない（flycheck は push だけ・pull はタイマーが要る = #772）。閉じた / サーバが止まったら捨てる
 - 右パネルの diagnostics タブは LSP の文書があるときだけ（常設すると #1479 の段で既定 320px のラベルが全員ぶん落ちる）。5 本 + 3 桁バッジが 220px で 0.5px 溢れるぶんは `IconsTight` を梯子の最後に足した（4 本は不変）
@@ -62,3 +57,7 @@
 ## 2026-09-27（#1758: CLI の出力をパイプで途中で閉じても panic しないようにし、gate の証拠の字下げを揃えた）
 - std の `println!` が EPIPE で panic していた（実測: `agent-support --json | head -1` で panic 2 つ + 終了コード 101。Windows は `ERROR_NO_DATA`）。tako-cli の出力マクロ 4 種を `stdio.rs` の同名マクロへ差し替え、標準出力の切断は `resume_unwind` で静かに 0、標準エラーの切断は捨てて続行（失敗の 1 を保つ）。SIGPIPE を既定へ戻す案は Windows に効かず `remote serve` の daemon を殺すので不採用。`gate set / check / show` の証拠は全行へ同じ字下げ
 - 実測: 統合テスト 4 本（読み手を先に閉じたパイプ / 111 KB の 1 行読み / `2>&1` 形で終了コード保持 / 宣言順の番犬）+ unit 2 本。注入 7 通りすべて FAILED → 戻して緑。`mcp serve` の終わり方 4 通りは修正前と字面一致・workspace 5971 passed 0 failed・clippy 3 宇宙 0
+
+## 2026-09-27（#1811: テスト判定から外れたら安全側へ倒し、deps/ の外のテストバイナリが本番へ書かないようにした）
+- `is_test_process()` が置き場（`deps/`）だけで決まり、`/tmp` へコピーしたテストバイナリが本番の `recent.json` 上書き・`cli-dir` を空に・実 agent CLI を実 HOME で起動した。製品の `main`（`tako-app` / `tako`）の 1 文目で `paths::mark_product_process()` を呼び、「`deps/` にある **または** 宣言が無い」をテストとする（規則は `judge_test_process` の 1 実装・倒した回は stderr へ 1 回知らせる）
+- 実測: 一時 HOME を本番に見立てた再現で修正前 17 ファイル → 修正後 0（同じ名前 / 改名とも）・製品 `tako` は一時 HOME の本番相当を解決し知らせ無し・番犬 3 段（入口の静的検査 / deps 外の子 / 製品 CLI の実行時）へ注入 5 通りすべて FAILED → 戻して緑
