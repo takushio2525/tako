@@ -498,6 +498,94 @@ mod pdf_hit_test_tests {
 }
 
 impl TakoApp {
+    /// 検索欄のトグル 1 つ（#1653）。
+    ///
+    /// 印は SVG で描き（`Aa` を文字で置かない = #1536 / #1579）、何のトグルで今どちらかは
+    /// ツールチップの語で出す。押すと `toggle_search_option` が条件を書き換え、クエリを
+    /// 打ち直したのと同じ形で件数・ハイライト・最初のヒットを更新する。
+    /// 実矩形は visual-test が実マウスで押すために `panel_click_probe_bounds` へ記録する
+    /// （キーは `search-toggle-case-<ペイン>` / `search-toggle-word-<ペイン>`）
+    fn render_search_toggle(
+        &self,
+        pane_id: PaneId,
+        toggle: preview::SearchToggle,
+        active: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = &self.theme;
+        let (icon, label, key) = match toggle {
+            preview::SearchToggle::CaseSensitive => (
+                crate::file_icons::ui_icon::CASE_SENSITIVE,
+                crate::ui_text::preview::search_toggle_case(active),
+                "search-toggle-case",
+            ),
+            preview::SearchToggle::WholeWord => (
+                crate::file_icons::ui_icon::WHOLE_WORD,
+                crate::ui_text::preview::search_toggle_word(active),
+                "search-toggle-word",
+            ),
+        };
+        let tip_theme = theme.clone();
+        let probe = self.panel_click_probe_bounds.clone();
+        let probe_key = format!("{key}-{}", pane_id.as_u64());
+        div()
+            .id((key, pane_id.as_u64()))
+            .relative()
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(18.0))
+            .h(px(16.0))
+            .rounded_sm()
+            .border_1()
+            .cursor_pointer()
+            .when(active, |d| {
+                d.bg(rgba_alpha(theme.accent, 0.3))
+                    .border_color(hsla_alpha(theme.accent, 0.8))
+            })
+            .when(!active, |d| {
+                d.border_color(hsla_alpha(theme.accent, 0.0))
+                    .hover(|d| d.bg(rgba(theme.surface_highlight)))
+            })
+            .tooltip(move |_, cx| {
+                cx.new(|_| crate::tab_bar::HintTooltip::new(label.to_string(), tip_theme.clone()))
+                    .into()
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    this.toggle_search_option(pane_id, toggle);
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .child(
+                svg()
+                    .path(icon)
+                    .w(px(12.0))
+                    .h(px(12.0))
+                    .text_color(if active {
+                        hsla(theme.foreground)
+                    } else {
+                        hsla_alpha(theme.tab_inactive_foreground, 0.8)
+                    }),
+            )
+            // 記録は上書きのみ（render 冒頭でクリアすると空を読む窓ができる。#315）
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, _, _| {
+                        probe.borrow_mut().insert(probe_key.clone(), bounds);
+                    },
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            )
+    }
+
     /// プレビューの目次の行を押したときの処理（#680 / #1417）。
     ///
     /// `render` のクロージャから切り出してあるのは、**クリックが通る経路そのもの**を
@@ -1304,6 +1392,7 @@ impl TakoApp {
             search_cursor: usize,
             search_total: usize,
             search_index: usize,
+            search_options: tako_core::SearchOptions,
             replace_text: String,
             replace_cursor: usize,
             ime_text: Option<String>,
@@ -1327,6 +1416,7 @@ impl TakoApp {
             // 行のハイライト範囲は可視部分を組むときに `preview_edits` から直に引く
             search_total: edit.search_hits.len(),
             search_index: edit.search_index,
+            search_options: edit.search_options,
             replace_text: edit.replace_text.clone(),
             replace_cursor: edit.replace_cursor,
             ime_text: if edit.search_visible {
@@ -1360,6 +1450,27 @@ impl TakoApp {
             .map(|s| s.replace_text.clone())
             .unwrap_or_default();
         let replace_cursor = edit_snap.as_ref().map(|s| s.replace_cursor).unwrap_or(0);
+        // 検索欄のトグル（#1653）。検索欄を出していないフレームでは組まない
+        let search_toggles = search_visible.then(|| {
+            let options = edit_snap
+                .as_ref()
+                .map(|s| s.search_options)
+                .unwrap_or_default();
+            (
+                self.render_search_toggle(
+                    pane_id,
+                    preview::SearchToggle::CaseSensitive,
+                    options.case_sensitive,
+                    cx,
+                ),
+                self.render_search_toggle(
+                    pane_id,
+                    preview::SearchToggle::WholeWord,
+                    options.whole_word,
+                    cx,
+                ),
+            )
+        });
         let editable = matches!(
             &state.content,
             preview::PreviewContent::Code(_) | preview::PreviewContent::Markdown(_)
@@ -3246,6 +3357,9 @@ impl TakoApp {
                                             query_ime.as_deref(),
                                         ))),
                                 )
+                                .when_some(search_toggles, |el, (case, word)| {
+                                    el.child(case).child(word)
+                                })
                                 .when(st > 0, |el| {
                                     el.child(
                                         div()
@@ -5112,7 +5226,12 @@ mod tests {
         let text = "İstanbul needle\nneedle İ needle";
         let buffer =
             tako_core::TextBuffer::from_text(std::path::PathBuf::from("u1016"), text.into());
-        let hits = buffer.find_all("NEEDLE");
+        // 大文字小文字を区別しない検索（#1653 で既定ではなくなった側）が #1016 の経路
+        let ignore_case = tako_core::SearchOptions {
+            case_sensitive: false,
+            whole_word: false,
+        };
+        let hits = buffer.find_all("NEEDLE", ignore_case);
         assert_eq!(hits.len(), 3);
 
         let mut highlighted = Vec::new();

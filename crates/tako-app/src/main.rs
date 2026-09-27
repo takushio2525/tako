@@ -13174,6 +13174,7 @@ impl TakoApp {
         &mut self,
         pane_id: PaneId,
         query: Option<String>,
+        options: tako_core::SearchOptions,
         direction: Option<&str>,
     ) -> Result<serde_json::Value, String> {
         // 閲覧中でも検索可能にするため、編集セッションが無ければバッファを開く
@@ -13188,16 +13189,22 @@ impl TakoApp {
             .preview_edits
             .get_mut(&pane_id)
             .ok_or_else(|| "プレビューペインではない".to_string())?;
+        // #1653: 全文を探すのはクエリか条件が変わったときと、本文が変わった後だけ。
+        // 次へ / 前へは数えたヒットを使い回す（修正前は移動のたびに全文を探し直していた）
+        let conditions_changed = query.is_some() || edit.search_options != options;
         if let Some(q) = query {
             edit.search_query = q;
-            edit.search_hits = edit.buffer.find_all(&edit.search_query);
-            edit.search_index = 0;
+        }
+        edit.search_options = options;
+        if conditions_changed {
+            edit.refresh_search_hits();
+        } else {
+            edit.ensure_search_hits();
         }
         match direction.unwrap_or("next") {
             "prev" => {
-                if let Some(hit) = edit
-                    .buffer
-                    .find_prev(&edit.search_query, edit.buffer.cursor())
+                if let Some(hit) =
+                    tako_core::text_edit::prev_hit(&edit.search_hits, edit.buffer.cursor()).cloned()
                 {
                     edit.buffer.set_cursor(hit.start, false);
                     edit.search_index = edit
@@ -13218,7 +13225,8 @@ impl TakoApp {
                             .map(char::len_utf8)
                             .unwrap_or(0)
                 };
-                if let Some(hit) = edit.buffer.find_next(&edit.search_query, from) {
+                if let Some(hit) = tako_core::text_edit::next_hit(&edit.search_hits, from).cloned()
+                {
                     edit.buffer.set_cursor(hit.start, false);
                     edit.search_index = edit
                         .search_hits
@@ -13272,6 +13280,7 @@ impl TakoApp {
         query: &str,
         replacement: &str,
         all: bool,
+        options: tako_core::SearchOptions,
     ) -> Result<serde_json::Value, String> {
         let edit = self
             .preview_edits
@@ -13280,27 +13289,25 @@ impl TakoApp {
         if !edit.editing {
             return Err("編集モードが無効".into());
         }
-        if all {
-            let count = edit.buffer.replace_all(query, replacement);
-            edit.search_hits = edit.buffer.find_all(&edit.search_query);
-            self.refresh_preview_from_editor(pane_id);
-            Ok(serde_json::json!({ "replaced": count }))
+        // 1 件 / 全置換のどちらも tako-core の 1 実装（#1653。カーソル以降の最初 → 先頭へラップ）
+        let count = if all {
+            edit.buffer.replace_all(query, replacement, options)
         } else {
-            let hits = edit.buffer.find_all(query);
-            if let Some(hit) = hits.into_iter().find(|h| h.start >= edit.buffer.cursor()) {
-                edit.buffer.replace_range(hit.start..hit.end, replacement);
-                edit.search_hits = edit.buffer.find_all(&edit.search_query);
-                self.refresh_preview_from_editor(pane_id);
-                Ok(serde_json::json!({ "replaced": 1 }))
-            } else if let Some(hit) = edit.buffer.find_all(query).into_iter().next() {
-                edit.buffer.replace_range(hit.start..hit.end, replacement);
-                edit.search_hits = edit.buffer.find_all(&edit.search_query);
-                self.refresh_preview_from_editor(pane_id);
-                Ok(serde_json::json!({ "replaced": 1 }))
-            } else {
-                Ok(serde_json::json!({ "replaced": 0 }))
-            }
+            edit.buffer.replace_next(query, replacement, options)
+        };
+        if count > 0 {
+            // 本文が変わったので検索欄のヒットを数え直す（検索欄の条件で）。
+            // 「今のヒット」は置き換えた直後（カーソル）以降の最初 = Enter を続けて押せる
+            edit.refresh_search_hits();
+            let cursor = edit.buffer.cursor();
+            edit.search_index = edit
+                .search_hits
+                .iter()
+                .position(|h| h.start >= cursor)
+                .unwrap_or(0);
+            self.refresh_preview_from_editor(pane_id);
         }
+        Ok(serde_json::json!({ "replaced": count }))
     }
 
     /// `TAKO_973_LEGACY=1` で **#973 前の挙動**（dispatch = CLI / MCP の編集では
@@ -13553,6 +13560,8 @@ impl TakoApp {
         match keystroke.key.as_str() {
             "escape" => {
                 edit.search_visible = false;
+                // 区別しない検索の小文字写しは本文と同じ大きさがあるので、閉じたら手放す（#1653）
+                edit.buffer.release_search_cache();
                 cx.notify();
                 true
             }
@@ -13562,12 +13571,14 @@ impl TakoApp {
                     edit.search_focus == preview::SearchFieldFocus::Replace && edit.editing;
                 let q = edit.search_query.clone();
                 let r = edit.replace_text.clone();
+                // 検索欄の置換・移動は、画面のトグルが持つ条件で行う（#1653）
+                let options = edit.search_options;
                 if shift {
-                    let _ = self.preview_search_local(pane_id, None, Some("prev"));
+                    let _ = self.preview_search_local(pane_id, None, options, Some("prev"));
                 } else if do_replace {
-                    let _ = self.preview_replace_local(pane_id, &q, &r, false);
+                    let _ = self.preview_replace_local(pane_id, &q, &r, false, options);
                 } else {
-                    let _ = self.preview_search_local(pane_id, None, Some("next"));
+                    let _ = self.preview_search_local(pane_id, None, options, Some("next"));
                 }
                 self.refresh_preview_from_editor(pane_id);
                 cx.notify();
@@ -13711,16 +13722,39 @@ impl TakoApp {
         }
     }
 
+    /// 検索欄の 1 打鍵（クエリが変わった）とトグルの切り替えで呼ぶ。
+    ///
+    /// 全文を探すのは `refresh_search_hits` の 1 回だけで、最初のヒットはその結果から取る
+    /// （#1653。修正前は `find_all` と `find_next` で 1 打鍵に 2 回探し、どちらも全文の
+    /// 小文字写しを作り直していた = release 実測 1 MB で 1 打鍵 4.4ms）
     fn update_search_hits(&mut self, pane_id: PaneId) {
         let Some(edit) = self.preview_edits.get_mut(&pane_id) else {
             return;
         };
-        edit.search_hits = edit.buffer.find_all(&edit.search_query);
-        edit.search_index = 0;
-        if let Some(hit) = edit.buffer.find_next(&edit.search_query, 0) {
+        edit.refresh_search_hits();
+        if let Some(hit) = edit.search_hits.first().cloned() {
             edit.buffer.set_cursor(hit.start, false);
             self.refresh_preview_from_editor(pane_id);
         }
+    }
+
+    /// 検索欄のトグル（大文字小文字の区別 / 単語単位）を切り替える（#1653）。
+    ///
+    /// 条件を書き換えてからクエリの打ち直しと同じ `update_search_hits` を通すので、
+    /// 件数・ハイライト・最初のヒットへの移動が打鍵と同じ形で更新される。
+    /// CLI / MCP は `PreviewSearch` の `case_sensitive` / `whole_word` で同じ状態を書く
+    fn toggle_search_option(&mut self, pane_id: PaneId, option: preview::SearchToggle) {
+        let Some(edit) = self.preview_edits.get_mut(&pane_id) else {
+            return;
+        };
+        let current = edit.search_options;
+        edit.search_options = match option {
+            preview::SearchToggle::CaseSensitive => {
+                current.with(Some(!current.case_sensitive), None)
+            }
+            preview::SearchToggle::WholeWord => current.with(None, Some(!current.whole_word)),
+        };
+        self.update_search_hits(pane_id);
     }
 
     fn paste(&mut self, cx: &mut Context<Self>) {
@@ -22922,13 +22956,20 @@ impl PreviewHost for TakoApp {
         Ok(())
     }
 
+    fn preview_search_options(&self, pane: PaneId) -> Option<tako_core::SearchOptions> {
+        self.preview_edits
+            .get(&pane)
+            .map(|edit| edit.search_options)
+    }
+
     fn preview_search(
         &mut self,
         pane: PaneId,
         query: Option<String>,
+        options: tako_core::SearchOptions,
         direction: Option<&str>,
     ) -> Result<serde_json::Value, String> {
-        self.preview_search_local(pane, query, direction)
+        self.preview_search_local(pane, query, options, direction)
     }
 
     fn preview_replace(
@@ -22937,8 +22978,9 @@ impl PreviewHost for TakoApp {
         query: &str,
         replacement: &str,
         all: bool,
+        options: tako_core::SearchOptions,
     ) -> Result<serde_json::Value, String> {
-        self.preview_replace_local(pane, query, replacement, all)
+        self.preview_replace_local(pane, query, replacement, all, options)
     }
 
     fn preview_pane_of_tab(&self, tab: TabId) -> Option<PaneId> {
@@ -25110,6 +25152,10 @@ impl Render for TakoApp {
                 let pane_id = this.focused_pane();
                 if let Some(edit) = this.preview_edits.get_mut(&pane_id) {
                     edit.search_visible = !edit.search_visible;
+                    // 閉じたら区別しない検索の小文字写しを手放す（Escape と同じ。#1653）
+                    if !edit.search_visible {
+                        edit.buffer.release_search_cache();
+                    }
                 } else if this.previews.contains_key(&pane_id) {
                     if let Ok(mut new_edit) =
                         preview::EditState::open(this.previews.get(&pane_id).unwrap())
@@ -37612,6 +37658,8 @@ mod self_test {
                             pane: Some(pane.as_u64()),
                             query: Some(query),
                             direction: Some("next".into()),
+                            case_sensitive: None,
+                            whole_word: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -40672,6 +40720,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1653: 検索欄のトグルを実マウスで押すと件数が変わり、置換で型名が残るか
+                "search-case" => {
+                    search_case_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
@@ -40680,7 +40734,7 @@ mod self_test {
                          remote-tree / flicker / ime-preedit / screen-lines / \
                          pane-border / tasks-panel / task-attachment / \
                          tasks-accordion / shelve-tab / no-emoji / editor-keys / \
-                         run-command-truncate / viewport-lines / jump-keys）"
+                         run-command-truncate / viewport-lines / jump-keys / search-case）"
                     );
                     std::process::exit(1);
                 }
@@ -40739,6 +40793,10 @@ mod self_test {
             // #1677: ジャンプ履歴の戻る / 進む（⌃- / ⌃⇧-・Windows は Ctrl+Alt+← / →）が
             // 実 GUI の打鍵経路で効くか
             jump_keys_visual(any, window, cx).await;
+
+            // #1653: 検索欄のトグル（大文字小文字の区別 / 単語単位）を**実マウスで**押すと
+            // 件数が変わり、既定（区別する）の置換が型名 `Value` を残すか
+            search_case_visual(any, window, cx).await;
 
             // #589: ファイルツリーのインデントガイド線が連続しているか。
             // 4 階層のフィクスチャを開き、ダーク / ライト / スクロール後の 3 状態で
@@ -45772,6 +45830,280 @@ mod self_test {
         );
     }
 
+    /// 検索欄のトグルを**実マウスで**押すと条件が切り替わり、件数が変わるか（#1653）。
+    ///
+    /// 場面: `let value = Value::new();` を含むコードを開き、⌘F（Windows は Ctrl+Shift+F）で
+    /// 検索欄を出して `value` を打つ。既定（区別する）で 3 件 → 「区別する」を押して 5 件 →
+    /// 「単語単位」を押して 4 件 → 「区別する」を戻して 2 件 → 「単語単位」を戻して 3 件。
+    /// 最後に置換欄へ `item` を打って Enter を押し、**型名 `Value` が残る**ことを見る
+    /// （修正前は区別できず、`Value::new()` が `item::new()` になった）。
+    /// ハンドラ直呼びでは「押した瞬間に消えて発火しない」型を検出できないので、
+    /// 描いた実矩形（`panel_click_probe_bounds`）の中央を `click_at` で押す。
+    /// A/B: トグルを押しても条件が変わらないビルド（配線漏れ）は件数の check が落ちる。
+    /// 単独実行は `TAKO_VISUAL_ONLY=search-case`
+    #[cfg(feature = "visual-test")]
+    async fn search_case_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        use tako_control::protocol::Request as Req;
+        let wait =
+            |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+        let find_key = if cfg!(target_os = "macos") {
+            "cmd-f"
+        } else {
+            "ctrl-shift-f"
+        };
+
+        let dir = std::env::temp_dir().join(format!("tako-visual-1653-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("visual-test search-case 一時ディレクトリ");
+        let path = dir.join("value.rs");
+        let source = "let value = Value::new();\nlet values = value + VALUE;\n";
+        std::fs::write(&path, source).expect("visual-test search-case fixture");
+
+        let pane = window
+            .update(cx, |app, _, cx| {
+                // 他の節の残骸を畳んでから組む（#1083 / #948）
+                app.drawer_visible = false;
+                app.panel_visible = false;
+                let base = app.focused_pane().as_u64();
+                let opened = tako_control::dispatch(
+                    app,
+                    Req::OpenFile {
+                        pane: Some(base),
+                        path: path.display().to_string(),
+                        mode: Some(tako_control::protocol::PreviewModeWire::Code),
+                        direction: Some(tako_control::protocol::Direction::Right),
+                        focus: Some(true),
+                        new_tab: false,
+                        line: None,
+                        column: None,
+                    },
+                    PaneOrigin::Cli,
+                )
+                .expect("visual-test search-case を dispatch で開ける");
+                cx.notify();
+                PaneId::from_raw(opened["pane"].as_u64().expect("OpenFile 応答の pane"))
+            })
+            .unwrap_or_else(|_| fail("visual-test search-case dispatch"));
+        check(
+            wait_for_preview_maps(any, window, cx, pane, false).await,
+            "visual-test search-case: 座標キャッシュが揃う (#1653)",
+        );
+        let editing = window
+            .update(cx, |app, _, cx| {
+                // 入口は `focused_pane()` を見るので、対象ペインを明示的に掴んでおく
+                let _ = app.workspace.active_tab_mut().tree_mut().focus(pane);
+                let r = tako_control::dispatch(
+                    app,
+                    Req::PreviewEdit {
+                        pane: Some(pane.as_u64()),
+                        enabled: Some(true),
+                    },
+                    PaneOrigin::Cli,
+                );
+                app.panel_click_probe_bounds.borrow_mut().clear();
+                cx.notify();
+                r.ok().and_then(|v| v["editing"].as_bool()).unwrap_or(false)
+            })
+            .unwrap_or(false);
+        check(
+            editing,
+            "visual-test search-case: 編集モードを開始できる (#1653)",
+        );
+        notify_and_draw(any, window, cx);
+
+        // 検索欄を実キーで開き、クエリを実キーで打つ（入力は IME の口 = 打鍵と同じ経路）
+        press(any, cx, find_key);
+        wait(cx, 100).await;
+        type_text(any, cx, "value", false);
+        wait(cx, 100).await;
+        notify_and_draw(any, window, cx);
+
+        // (件数, 区別する, 単語単位)
+        let observe = |cx: &mut AsyncApp| -> (usize, bool, bool) {
+            notify_and_draw(any, window, cx);
+            window
+                .update(cx, |app, _, _| {
+                    app.preview_edits
+                        .get(&pane)
+                        .map(|e| {
+                            (
+                                e.search_hits.len(),
+                                e.search_options.case_sensitive,
+                                e.search_options.whole_word,
+                            )
+                        })
+                        .unwrap_or((usize::MAX, false, false))
+                })
+                .unwrap_or((usize::MAX, false, false))
+        };
+        let query_ok = window
+            .update(cx, |app, _, _| {
+                app.preview_edits
+                    .get(&pane)
+                    .is_some_and(|e| e.search_visible && e.search_query == "value")
+            })
+            .unwrap_or(false);
+        check(
+            query_ok,
+            "visual-test search-case: 検索欄が開き、打った value が入る (#1653)",
+        );
+        check(
+            observe(cx) == (3, true, false),
+            "visual-test search-case: 既定は大文字小文字を区別する（value / values の頭 / value の 3 件）(#1653)",
+        );
+        let dump = |cx: &mut AsyncApp, name: &str| {
+            if let Ok(dir) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                if let Some((frame, _)) = capture_frame(any, cx) {
+                    let _ = frame.save(std::path::Path::new(&dir).join(name));
+                }
+            }
+        };
+        dump(cx, "search-case-0-default.png");
+
+        let probe = |cx: &mut AsyncApp, key: &str| {
+            let key = format!("{key}-{}", pane.as_u64());
+            window
+                .update(cx, |app, _, _| {
+                    app.panel_click_probe_bounds.borrow().get(&key).copied()
+                })
+                .ok()
+                .flatten()
+        };
+        // 押す → 描き直す → 読む。トグルが描かれていなければそこで落とす
+        // （押す印の鍵, 押した後の (件数, 区別する, 単語単位), check の見出し, フレームの名前）
+        type Step = (
+            &'static str,
+            (usize, bool, bool),
+            &'static str,
+            &'static str,
+        );
+        let steps: [Step; 4] = [
+            (
+                "search-toggle-case",
+                (5, false, false),
+                "visual-test search-case: 「区別する」を押すと区別しなくなり Value / VALUE も当たる（5 件）(#1653)",
+                "search-case-1-ignore-case.png",
+            ),
+            (
+                "search-toggle-word",
+                (4, false, true),
+                "visual-test search-case: 「単語単位」を押すと values が外れる（4 件）(#1653)",
+                "search-case-2-ignore-case-word.png",
+            ),
+            (
+                "search-toggle-case",
+                (2, true, true),
+                "visual-test search-case: 「区別する」を戻すと単語単位の value だけ（2 件）(#1653)",
+                "search-case-3-word.png",
+            ),
+            (
+                "search-toggle-word",
+                (3, true, false),
+                "visual-test search-case: 「単語単位」を戻すと既定の 3 件へ戻る (#1653)",
+                "search-case-4-default.png",
+            ),
+        ];
+        for (key, expected, step, frame) in steps {
+            match probe(cx, key) {
+                None => check(
+                    false,
+                    &format!("visual-test search-case: 検索欄に {key} が描かれない (#1653)"),
+                ),
+                Some(rect) => {
+                    click_at(any, cx, rect.center());
+                    wait(cx, 150).await;
+                    let seen = observe(cx);
+                    if seen != expected {
+                        eprintln!(
+                            "TAKO_VISUAL_1653: {key} を押した後 = {seen:?}（期待 {expected:?}）"
+                        );
+                    }
+                    check(seen == expected, step);
+                    dump(cx, frame);
+                }
+            }
+        }
+
+        // 置換欄へ Tab で移り、item を打って Enter = カーソル以降の最初の value を 1 件置換。
+        // 検索欄の条件（既定 = 区別する）で置き換えるので、型名 Value は残る
+        let _ = window.update(cx, |app, _, cx| {
+            if let Some(edit) = app.preview_edits.get_mut(&pane) {
+                edit.buffer.set_cursor(0, false);
+            }
+            cx.notify();
+        });
+        press(any, cx, "tab");
+        type_text(any, cx, "item", false);
+        press(any, cx, "enter");
+        wait(cx, 150).await;
+        let body = |cx: &mut AsyncApp| {
+            window
+                .update(cx, |app, _, _| {
+                    app.preview_edits
+                        .get(&pane)
+                        .map(|e| e.buffer.text().to_string())
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default()
+        };
+        let after_one = body(cx);
+        check(
+            after_one == "let item = Value::new();\nlet values = value + VALUE;\n",
+            "visual-test search-case: 置換欄の Enter が value だけを置き換え、型名 Value を残す (#1653)",
+        );
+        // 全置換は CLI / MCP と同じ dispatch（条件の省略 = 区別する）
+        let replaced = window
+            .update(cx, |app, _, cx| {
+                let r = tako_control::dispatch(
+                    app,
+                    Req::PreviewReplace {
+                        pane: Some(pane.as_u64()),
+                        query: "value".into(),
+                        replacement: "item".into(),
+                        all: Some(true),
+                        case_sensitive: None,
+                        whole_word: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+                r.ok()
+                    .map(|v| v["replace"]["replaced"].as_u64().unwrap_or(0))
+            })
+            .ok()
+            .flatten();
+        let after_all = body(cx);
+        if after_all != "let item = Value::new();\nlet items = item + VALUE;\n" {
+            eprintln!("TAKO_VISUAL_1653: 全置換の後 = {after_all:?}");
+        }
+        check(
+            replaced == Some(2)
+                && after_all == "let item = Value::new();\nlet items = item + VALUE;\n",
+            "visual-test search-case: 全置換（条件の省略 = 区別する）も Value / VALUE を残す (#1653)",
+        );
+        // 置換後の件数も検索欄の条件で数え直されている（残りの value は 0 件）
+        check(
+            observe(cx).0 == 0,
+            "visual-test search-case: 置換の後に検索欄の件数が数え直される (#1653)",
+        );
+        dump(cx, "search-case-5-replaced.png");
+        println!(
+            "TAKO_VISUAL_1653: toggles=4 steps OK / replace_one={after_one:?} / replace_all={after_all:?}"
+        );
+
+        // 後片付け: 検索欄を閉じ、保存せずに閉じられるよう編集を捨てる
+        press(any, cx, "escape");
+        let _ = window.update(cx, |app, _, cx| {
+            app.preview_edits.remove(&pane);
+            cx.notify();
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 実行コマンドと検索欄を**文字の途中で切って落ちない**か（#1728）。
     ///
     /// ヘッダの再生ボタンは描画のたびに実行コマンドを 60 で、実行メニューは行ごとに 40 で
@@ -45874,6 +46206,8 @@ mod self_test {
                             pane: Some(pv2.as_u64()),
                             query: Some(query.into()),
                             direction: None,
+                            case_sensitive: None,
+                            whole_word: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -45992,6 +46326,8 @@ mod self_test {
                             pane: Some(pv.as_u64()),
                             query: Some("alpha".into()),
                             direction: None,
+                            case_sensitive: None,
+                            whole_word: None,
                         },
                         PaneOrigin::Cli,
                     );

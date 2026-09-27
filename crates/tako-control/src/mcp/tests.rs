@@ -45,6 +45,97 @@ mod tests {
         }
     }
 
+    /// #1653: 検索・置換の条件は省略すると wire に載らない（= dispatch が既定で埋める）。
+    /// 指定したときだけ CLI（`-i` / `-w`）と同じ値が 1:1 で渡る
+    #[test]
+    fn issue1653_検索と置換の条件は省略と指定がそのまま渡る() {
+        let (_, requests) = run(
+            call("tako_preview_search", json!({ "query": "value" })),
+            Some(7),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::PreviewSearch {
+                pane: Some(7),
+                query: Some("value".into()),
+                direction: None,
+                case_sensitive: None,
+                whole_word: None,
+            }]
+        );
+        let (_, requests) = run(
+            call(
+                "tako_preview_search",
+                json!({ "case_sensitive": false, "whole_word": true }),
+            ),
+            Some(7),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::PreviewSearch {
+                pane: Some(7),
+                query: None,
+                direction: None,
+                case_sensitive: Some(false),
+                whole_word: Some(true),
+            }]
+        );
+        let (_, requests) = run(
+            call(
+                "tako_preview_replace",
+                json!({ "query": "value", "replacement": "item", "all": true }),
+            ),
+            Some(7),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::PreviewReplace {
+                pane: Some(7),
+                query: "value".into(),
+                replacement: "item".into(),
+                all: Some(true),
+                case_sensitive: None,
+                whole_word: None,
+            }]
+        );
+        let (_, requests) = run(
+            call(
+                "tako_preview_replace",
+                json!({ "query": "v", "replacement": "w", "case_sensitive": false }),
+            ),
+            Some(7),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::PreviewReplace {
+                pane: Some(7),
+                query: "v".into(),
+                replacement: "w".into(),
+                all: None,
+                case_sensitive: Some(false),
+                whole_word: None,
+            }]
+        );
+        // 省略したときの wire は引数が生える前とバイト一致（skip_serializing_if）
+        let wire = serde_json::to_value(&requests[0]).unwrap();
+        assert!(wire.get("whole_word").is_none(), "{wire}");
+        // 型違いは黙って捨てずに拒否する
+        let (response, requests) = run(
+            call(
+                "tako_preview_search",
+                json!({ "query": "v", "case_sensitive": "no" }),
+            ),
+            Some(7),
+            true,
+        );
+        assert!(requests.is_empty(), "型違いが Request まで届いた");
+        assert!(response.unwrap().to_string().contains("case_sensitive"));
+    }
+
     /// 受けた Request を記録して固定値を返す exec
     fn run(message: Value, caller: Option<u64>, connected: bool) -> (Option<Value>, Vec<Request>) {
         let mut seen = Vec::new();

@@ -1891,17 +1891,24 @@ enum EditCommand {
         #[arg(long)]
         pane: Option<u64>,
     },
-    /// テキスト検索（query 省略時は現在の検索状態を返す）
+    /// テキスト検索（query 省略時は現在の検索状態を返す）。
+    /// 既定は大文字小文字を区別する。query を省略したときは今の検索の条件を引き継ぐ
     Search {
         /// 検索文字列
         query: Option<String>,
         /// 移動方向（next / prev）
         #[arg(long, default_value = "next")]
         direction: String,
+        /// 大文字小文字を区別しない（既定は区別する）
+        #[arg(short = 'i', long)]
+        ignore_case: bool,
+        /// 単語単位で探す（前後が英数字・かな漢字・_ に続く一致を外す）
+        #[arg(short = 'w', long)]
+        whole_word: bool,
         #[arg(long)]
         pane: Option<u64>,
     },
-    /// テキスト置換（1 件または全置換）
+    /// テキスト置換（1 件または全置換）。既定は大文字小文字を区別する
     Replace {
         /// 検索文字列
         query: String,
@@ -1910,6 +1917,12 @@ enum EditCommand {
         /// 全置換
         #[arg(long)]
         all: bool,
+        /// 大文字小文字を区別しない（既定は区別する）
+        #[arg(short = 'i', long)]
+        ignore_case: bool,
+        /// 単語単位で置き換える
+        #[arg(short = 'w', long)]
+        whole_word: bool,
         #[arg(long)]
         pane: Option<u64>,
     },
@@ -6809,6 +6822,15 @@ fn target_pane(explicit: Option<u64>) -> Result<Option<u64>, String> {
     })
 }
 
+/// 検索条件のスイッチを wire の値へ写す（#1653）。
+///
+/// 付けたときだけ `Some(value)` を送り、付けなければ `None`（= dispatch が既定か
+/// 今の検索の条件で埋める）。`-i` は「区別する」を `false` にするスイッチなので
+/// `value = false`、`-w` は `true`
+fn search_flag(set: bool, value: bool) -> Option<bool> {
+    set.then_some(value)
+}
+
 /// `tako todo` の各サブコマンドを [`Request::UserTask`] へ畳む（#1450）。
 ///
 /// **CLI 側で store を直接触らない**（`tako task gate` のようなローカル処理にしない）のは、
@@ -7343,22 +7365,30 @@ fn build_request(command: &Command) -> Result<Request, String> {
             EditCommand::Search {
                 query,
                 direction,
+                ignore_case,
+                whole_word,
                 pane,
             } => Request::PreviewSearch {
                 pane: target_pane(*pane)?,
                 query: query.clone(),
                 direction: Some(direction.clone()),
+                case_sensitive: search_flag(*ignore_case, false),
+                whole_word: search_flag(*whole_word, true),
             },
             EditCommand::Replace {
                 query,
                 replacement,
                 all,
+                ignore_case,
+                whole_word,
                 pane,
             } => Request::PreviewReplace {
                 pane: target_pane(*pane)?,
                 query: query.clone(),
                 replacement: replacement.clone(),
                 all: Some(*all),
+                case_sensitive: search_flag(*ignore_case, false),
+                whole_word: search_flag(*whole_word, true),
             },
             EditCommand::Autosave { enabled, pane } => Request::PreviewAutosave {
                 pane: target_pane(*pane)?,
@@ -10611,6 +10641,20 @@ mod tests {
                 pane: Some(5),
                 query: Some("hello".into()),
                 direction: Some("next".into()),
+                case_sensitive: None,
+                whole_word: None,
+            }
+        );
+        // #1653: -i / -w を付けたときだけ条件を送る（付けなければ既定 = 区別する）
+        let command = parse(&["tako", "edit", "search", "hello", "-i", "-w", "--pane", "5"]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::PreviewSearch {
+                pane: Some(5),
+                query: Some("hello".into()),
+                direction: Some("next".into()),
+                case_sensitive: Some(false),
+                whole_word: Some(true),
             }
         );
         let command = parse(&[
@@ -10623,6 +10667,30 @@ mod tests {
                 query: "old".into(),
                 replacement: "new".into(),
                 all: Some(true),
+                case_sensitive: None,
+                whole_word: None,
+            }
+        );
+        let command = parse(&[
+            "tako",
+            "edit",
+            "replace",
+            "old",
+            "new",
+            "--ignore-case",
+            "--whole-word",
+            "--pane",
+            "5",
+        ]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::PreviewReplace {
+                pane: Some(5),
+                query: "old".into(),
+                replacement: "new".into(),
+                all: Some(false),
+                case_sensitive: Some(false),
+                whole_word: Some(true),
             }
         );
         let command = parse(&["tako", "edit", "autosave", "true", "--pane", "5"]);

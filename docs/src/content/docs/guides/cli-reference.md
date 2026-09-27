@@ -600,6 +600,16 @@ tako preview-changelog
 tako edit --help    # 開始 / 全文適用 / 保存のサブコマンドを確認
 ```
 
+検索と置換は**大文字小文字を区別するのが既定**です（`value` で探しても `Value` には当たりません）。区別しないときは `-i`、単語単位で探すときは `-w` を付けます。
+
+```bash
+tako edit search value               # 区別する（既定）
+tako edit search value -i            # 区別しない
+tako edit search value -w            # 単語単位（values / _value には当たらない）
+tako edit search --direction prev    # 次へ / 前へ（条件は今の検索のまま）
+tako edit replace value item --all   # 全置換（区別するので Value は残る）
+```
+
 ### tako file
 
 ファイルツリーの右クリックメニューに相当する操作群です。

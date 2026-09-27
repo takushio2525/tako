@@ -1520,6 +1520,10 @@
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "case_sensitive": {
+          "description": "大文字小文字を区別（既定 true。query 省略時は今の条件）",
+          "type": "boolean"
+        },
         "direction": {
           "description": "移動方向（省略時は next）",
           "enum": [
@@ -1534,8 +1538,12 @@
           "type": "integer"
         },
         "query": {
-          "description": "検索文字列（大文字小文字区別なし）",
+          "description": "検索文字列",
           "type": "string"
+        },
+        "whole_word": {
+          "description": "単語単位（既定 false。同上）",
+          "type": "boolean"
         }
       },
       "type": "object"
@@ -1551,6 +1559,10 @@
           "description": "true = 全置換、false = 1 件（既定 false）",
           "type": "boolean"
         },
+        "case_sensitive": {
+          "description": "大文字小文字を区別（既定 true）",
+          "type": "boolean"
+        },
         "pane": {
           "description": "対象プレビューペイン ID（省略時は呼び出し元）",
           "minimum": 0,
@@ -1563,6 +1575,10 @@
         "replacement": {
           "description": "置換文字列",
           "type": "string"
+        },
+        "whole_word": {
+          "description": "単語単位（既定 false）",
+          "type": "boolean"
         }
       },
       "required": [

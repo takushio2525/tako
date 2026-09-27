@@ -9,7 +9,7 @@ use tako_core::pane_log::CloseOrigin;
 use tako_core::ui_mode::PaneDisplayStatus;
 use tako_core::{
     PaneId, PreviewOutline, PreviewOutlineTarget, PreviewViewState, PreviewViewUpdate,
-    SpawnOptions, TabId, TerminalSession, Workspace,
+    SearchOptions, SpawnOptions, TabId, TerminalSession, Workspace,
 };
 
 /// ピン留め中のプレビュー 1 件分（FR-2.16.15。list / MCP 公開用）。
@@ -832,22 +832,30 @@ pub trait PreviewHost {
     fn set_preview_autosave(&mut self, _pane: PaneId, _enabled: bool) -> Result<(), String> {
         Err("プレビュー編集は未対応".into())
     }
-    /// 検索クエリの設定とヒット取得（#195）
+    /// 今の検索の条件（#1653）。検索したことが無いペインは `None`（= 既定）。
+    /// `PreviewSearch` がクエリを省略したときに引き継ぐ条件の出どころ
+    fn preview_search_options(&self, _pane: PaneId) -> Option<SearchOptions> {
+        None
+    }
+    /// 検索クエリの設定とヒット取得（#195）。`options` は dispatch が
+    /// [`SearchOptions::resolve`] で決めた条件（#1653）
     fn preview_search(
         &mut self,
         _pane: PaneId,
         _query: Option<String>,
+        _options: SearchOptions,
         _direction: Option<&str>,
     ) -> Result<serde_json::Value, String> {
         Err("プレビュー編集は未対応".into())
     }
-    /// 置換（#195）
+    /// 置換（#195）。`options` は省略した項目を既定で埋めた条件（#1653）
     fn preview_replace(
         &mut self,
         _pane: PaneId,
         _query: &str,
         _replacement: &str,
         _all: bool,
+        _options: SearchOptions,
     ) -> Result<serde_json::Value, String> {
         Err("プレビュー編集は未対応".into())
     }

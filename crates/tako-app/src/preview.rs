@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 
 use tako_control::protocol::PreviewModeWire;
 use tako_core::{
-    PdfLinks, PreviewOutline, PreviewOutlineItem, PreviewOutlineTarget, SearchHit, TextBuffer,
+    PdfLinks, PreviewOutline, PreviewOutlineItem, PreviewOutlineTarget, SearchHit, SearchOptions,
+    TextBuffer,
 };
 
 use crate::platform;
@@ -388,8 +389,13 @@ pub struct EditState {
     pub search_query: String,
     /// 検索フィールドのカーソル位置（バイトオフセット）
     pub search_cursor: usize,
-    /// 検索ヒット一覧（検索クエリ変更時に更新）
+    /// 検索ヒット一覧（検索クエリ・条件の変更時と、本文が変わった後の移動時に更新）
     pub search_hits: Vec<SearchHit>,
+    /// 検索の条件（#1653。既定 = 大文字小文字を区別する・単語単位なし）。
+    /// 検索欄のトグルと `PreviewSearch` の `case_sensitive` / `whole_word` が同じここを書く
+    pub search_options: SearchOptions,
+    /// `search_hits` を数えたときの文書の版（#1653）。本文が変わっていたら数え直す
+    pub search_hits_version: u64,
     /// 現在フォーカス中のヒットインデックス
     pub search_index: usize,
     /// 置換テキスト
@@ -413,6 +419,15 @@ pub struct EditState {
 pub enum SearchFieldFocus {
     Query,
     Replace,
+}
+
+/// 検索欄のトグル（#1653）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchToggle {
+    /// 大文字小文字を区別する
+    CaseSensitive,
+    /// 単語単位
+    WholeWord,
 }
 
 /// 自動保存の表示状態
@@ -446,6 +461,8 @@ impl EditState {
             search_query: String::new(),
             search_cursor: 0,
             search_hits: Vec::new(),
+            search_options: SearchOptions::DEFAULT,
+            search_hits_version: 0,
             search_index: 0,
             replace_text: String::new(),
             replace_cursor: 0,
@@ -457,6 +474,25 @@ impl EditState {
 
     pub fn dirty(&self) -> bool {
         self.buffer.dirty()
+    }
+
+    /// 今のクエリと条件で数え直す（#1653）。**検索欄の全文検索はここだけ**を通す。
+    ///
+    /// 1 回の `find_all` で得たヒットを次へ / 前へ・件数表示・ハイライトが使い回す
+    /// （修正前は 1 打鍵で `find_all` と `find_next` が全文を 2 回探していた）
+    pub fn refresh_search_hits(&mut self) {
+        self.search_hits = self
+            .buffer
+            .find_all(&self.search_query, self.search_options);
+        self.search_hits_version = self.buffer.version();
+        self.search_index = 0;
+    }
+
+    /// 数えた後に本文が変わっていたら数え直す（#1653。古い位置へ飛ばない）
+    pub fn ensure_search_hits(&mut self) {
+        if self.search_hits_version != self.buffer.version() {
+            self.refresh_search_hits();
+        }
     }
 
     /// #973: このセッションを自動保存の保留へ入れるべきか（保留の重複は呼び出し側が見る）。
