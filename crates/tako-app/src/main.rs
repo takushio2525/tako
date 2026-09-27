@@ -999,6 +999,21 @@ fn persist_diag(msg: &str) {
     tako_control::diag::persist_log(&msg);
 }
 
+/// settings.json からテーマを解決し、読めない色の警告を persist.log へ残す（#1756 / #1763）。
+///
+/// **起動時と実行中の読み直し（`reload_theme` / タブバーのトグル）がこの 1 本を通る**。
+/// 以前は起動時だけが警告を残し、読み直しは捨てていたので、実行中に settings.json を
+/// 手で直した値がなぜ効かないのかを追えなかった。どの行を出すか（同じ警告が続く
+/// 読み直しでは積まない）は `ThemeWarningLog` の 1 実装が決める。番犬は
+/// `crates/tako-control/tests/issue1763_theme_reload_warnings_watchdog.rs`
+fn load_theme_logged(log: &mut tako_control::settings::ThemeWarningLog) -> Theme {
+    let (theme, lines) = log.reload();
+    for line in &lines {
+        persist_diag(line);
+    }
+    theme
+}
+
 /// 個別の復元失敗を**内訳へ数えて persist.log へ 1 行残す**（Issue #1554）。
 ///
 /// 数えるだけでは「合計は合うのに、どのペインがなぜ戻らなかったか」が読めない。
@@ -1734,6 +1749,8 @@ struct TakoApp {
     workspace: Workspace,
     terminals: HashMap<PaneId, TerminalSession>,
     theme: Theme,
+    /// テーマの読めない色の警告をどこまで persist.log へ残したか（#1763。`load_theme_logged`）
+    theme_warning_log: tako_control::settings::ThemeWarningLog,
     focus_handle: FocusHandle,
     /// 実測したセル寸法（最初の render で確定。デフォルトフォントサイズ用）
     cell_size: Option<Size<Pixels>>,
@@ -3923,17 +3940,17 @@ impl TakoApp {
 
         // テーマは settings.json の設定値から復元（Issue #217。既定ダーク）。
         // 読めない色の上書きはその色だけ既定へ落として起動し、理由を persist.log へ残す
-        // （#1756: 以前は非 ASCII の値で起動のたびに落ちた。settings.json は書き換えない）
-        let (startup_theme, theme_warnings) = tako_control::settings::load().resolve_theme();
-        for w in &theme_warnings {
-            persist_diag(&format!("テーマの色上書きを無視: {w}"));
-        }
+        // （#1756: 以前は非 ASCII の値で起動のたびに落ちた。settings.json は書き換えない）。
+        // 実行中の読み直しも同じ帳簿を通す（#1763）
+        let mut theme_warning_log = tako_control::settings::ThemeWarningLog::default();
+        let startup_theme = load_theme_logged(&mut theme_warning_log);
 
         let mut app = Self {
             // ルートペイン（復元時は全ペイン）は下の spawn_session でセッションを張る
             workspace,
             terminals: HashMap::new(),
             theme: startup_theme,
+            theme_warning_log,
             focus_handle: cx.focus_handle(),
             cell_size: None,
             pane_font_sizes: HashMap::new(),
@@ -10295,8 +10312,9 @@ impl TakoApp {
             if let Err(e) = tako_control::settings::save(&settings) {
                 eprintln!("warning: 設定を保存できない: {e}");
             }
-            // 保存した設定（プリセット・色オーバーライド）を読み直して適用する
-            self.theme = tako_control::settings::load().resolve_theme().0;
+            // 保存した設定（プリセット・色オーバーライド）を読み直して適用する。
+            // 読めない色の警告は dispatch の読み直しと同じ帳簿へ残す（#1763）
+            self.theme = load_theme_logged(&mut self.theme_warning_log);
         } else {
             // 保存していないので settings.json を読み直すと切替が即座に巻き戻る。
             // メモリ上の適用を正とする（セルフテストのテーマ検査が常に失敗していた）
@@ -21849,10 +21867,9 @@ impl UiStateHost for TakoApp {
         self.theme = Theme::for_mode(mode);
     }
 
+    // #1763: 起動時と同じ 1 本を通し、読めない色の警告を persist.log へ残す
     fn reload_theme(&mut self) {
-        let settings = tako_control::settings::load();
-        let (theme, _) = settings.resolve_theme();
-        self.theme = theme;
+        self.theme = load_theme_logged(&mut self.theme_warning_log);
     }
 
     // #694: UI 表示モード（GUI ライク表示）。TakoApp は全ウィンドウ共有 entity（#339）
