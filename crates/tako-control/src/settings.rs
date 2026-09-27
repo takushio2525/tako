@@ -352,6 +352,55 @@ fn warn_unreadable_once(
     ));
 }
 
+/// 読めない色の上書きを無視した行の頭（起動時・読み直しで共通。#1756 / #1763）
+pub const THEME_WARNING_IGNORED: &str = "テーマの色上書きを無視: ";
+
+/// 前回無視した上書きが、読み直した設定では警告にならなくなった行の頭（#1763）。
+/// 手で直したときのほか、テーマを切り替えてその上書きを読まなくなったときも出る
+pub const THEME_WARNING_RESOLVED: &str =
+    "テーマの色上書きの警告が解消（読み直した設定では出ない）: ";
+
+/// テーマを settings.json から解決し、読めない色の警告を persist.log へ出す行を決める帳簿（#1763）。
+///
+/// **起動時と実行中の読み直し（`ControlHost::reload_theme` / タブバーのトグル）が
+/// [`ThemeWarningLog::reload`] の 1 本を通る**。以前は起動時だけが警告を残し、読み直しは
+/// 捨てていたので、実行中に settings.json を手で直した値がなぜ効かないのかを追えなかった。
+///
+/// 読み直しは色を 1 つ変えるたび・テーマを切り替えるたびに走るので、警告をそのまま出すと
+/// 同じ行が積もる。そこで**前回と同じ警告は出さず**、変わったぶんだけを出す:
+/// 消えた警告は [`THEME_WARNING_RESOLVED`]、増えた警告は起動時と同じ
+/// [`THEME_WARNING_IGNORED`] の形式で出す（同じ色の値が別の読めない値へ変わったときは両方が出る）
+#[derive(Debug, Default)]
+pub struct ThemeWarningLog {
+    /// 前回までに persist.log へ反映した警告（起動前は空）
+    last: Vec<String>,
+}
+
+impl ThemeWarningLog {
+    /// settings.json を読んでテーマを解決し、persist.log へ出す行と一緒に返す
+    pub fn reload(&mut self) -> (tako_core::theme::Theme, Vec<String>) {
+        let (theme, warnings) = load().resolve_theme();
+        let lines = self.record(warnings);
+        (theme, lines)
+    }
+
+    /// 今回の警告から persist.log へ出す行を決め、帳簿を今回の状態へ進める
+    pub fn record(&mut self, warnings: Vec<String>) -> Vec<String> {
+        let resolved = self
+            .last
+            .iter()
+            .filter(|w| !warnings.contains(w))
+            .map(|w| format!("{THEME_WARNING_RESOLVED}{w}"));
+        let ignored = warnings
+            .iter()
+            .filter(|w| !self.last.contains(w))
+            .map(|w| format!("{THEME_WARNING_IGNORED}{w}"));
+        let lines = resolved.chain(ignored).collect();
+        self.last = warnings;
+        lines
+    }
+}
+
 /// 設定を書き出す。tmp へ書いて rename する（読み手と競合しない。discovery と同方式）
 pub fn save(settings: &Settings) -> io::Result<PathBuf> {
     let path = settings_path().ok_or_else(|| {
@@ -628,6 +677,115 @@ mod tests {
         let (theme, warnings) = s.resolve_theme();
         assert_eq!(theme.accent, base.accent);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
+    }
+
+    /// dark の色上書きだけを持つ設定（#1763 のテスト用）
+    fn dark_overrides(pairs: &[(&str, &str)]) -> Settings {
+        let mut s = Settings::default();
+        s.theme_colors.insert(
+            "dark".into(),
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        );
+        s
+    }
+
+    /// 帳簿へ 1 回の読み直しぶんの警告を渡し、出す行を返す
+    fn reload_lines(log: &mut ThemeWarningLog, s: &Settings) -> Vec<String> {
+        log.record(s.resolve_theme().1)
+    }
+
+    /// #1763: 行の頭は #1756 の起動時の記録と同じ文面のまま（persist.log を
+    /// 「テーマの色上書き」で引く人・スクリプトの当てを変えない）
+    #[test]
+    fn issue1763_無視の行は起動時の記録と同じ文面() {
+        assert_eq!(THEME_WARNING_IGNORED, "テーマの色上書きを無視: ");
+        assert!(THEME_WARNING_RESOLVED.starts_with("テーマの色上書き"));
+        let s = dark_overrides(&[("accent", "#赤色"), ("green", "#00ff00")]);
+        let (_, warnings) = s.resolve_theme();
+        let mut log = ThemeWarningLog::default();
+        assert_eq!(
+            reload_lines(&mut log, &s),
+            vec![format!("テーマの色上書きを無視: {}", warnings[0])],
+            "起動時（帳簿が空）の行は #1756 と同じ `無視: <キー>: <理由>`"
+        );
+    }
+
+    /// #1763: 同じ内容のまま何度読み直しても行を積まない
+    #[test]
+    fn issue1763_同じ警告が続く読み直しでは何も出さない() {
+        let s = dark_overrides(&[("accent", "#赤色"), ("red", "#12345")]);
+        let mut log = ThemeWarningLog::default();
+        assert_eq!(reload_lines(&mut log, &s).len(), 2, "起動時は 2 件とも出す");
+        for i in 0..100 {
+            assert!(
+                reload_lines(&mut log, &s).is_empty(),
+                "{i} 回目の読み直しで同じ警告を積んだ"
+            );
+        }
+        // 警告の無い設定も、何度読み直しても何も出さない
+        let clean = dark_overrides(&[("accent", "#ff0000")]);
+        let mut log = ThemeWarningLog::default();
+        for _ in 0..3 {
+            assert!(reload_lines(&mut log, &clean).is_empty());
+        }
+    }
+
+    /// #1763: 実行中に足した読めない色は、起動時と同じ形式で増えたぶんだけ出す
+    #[test]
+    fn issue1763_増えた警告だけを起動時と同じ形式で出す() {
+        let mut log = ThemeWarningLog::default();
+        reload_lines(&mut log, &dark_overrides(&[("accent", "#赤色")]));
+        let s = dark_overrides(&[("accent", "#赤色"), ("red", "#12345")]);
+        let lines = reload_lines(&mut log, &s);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let red = s
+            .resolve_theme()
+            .1
+            .into_iter()
+            .find(|w| w.starts_with("red: "))
+            .expect("red の警告");
+        assert_eq!(lines[0], format!("{THEME_WARNING_IGNORED}{red}"));
+    }
+
+    /// #1763: 直した・テーマを切り替えた・別の読めない値へ変えた、のどれでも
+    /// 前回の警告が消えたことを名指す（最後に出た行が今の状態を表す）
+    #[test]
+    fn issue1763_消えた警告は解消として名指す() {
+        let bad = dark_overrides(&[("accent", "#赤色"), ("red", "#12345")]);
+        let bad_warnings = bad.resolve_theme().1;
+        // 直した
+        let mut log = ThemeWarningLog::default();
+        reload_lines(&mut log, &bad);
+        let fixed = dark_overrides(&[("accent", "#ff8800"), ("red", "#ff0000")]);
+        let lines = reload_lines(&mut log, &fixed);
+        let want: Vec<String> = bad_warnings
+            .iter()
+            .map(|w| format!("{THEME_WARNING_RESOLVED}{w}"))
+            .collect();
+        assert_eq!(lines, want);
+        assert!(reload_lines(&mut log, &fixed).is_empty(), "解消も積まない");
+
+        // ライトへ切り替えた = dark の上書きを読まなくなった
+        let mut log = ThemeWarningLog::default();
+        reload_lines(&mut log, &bad);
+        let mut light = bad.clone();
+        light.theme = "light".into();
+        assert_eq!(reload_lines(&mut log, &light), want);
+        // ダークへ戻すと、また起動時と同じ形式で出る
+        let back = reload_lines(&mut log, &bad);
+        assert_eq!(back.len(), 2, "{back:?}");
+        assert!(back.iter().all(|l| l.starts_with(THEME_WARNING_IGNORED)));
+
+        // 同じ色を別の読めない値へ変えた: 解消が先・無視が後（最後の行が今の値）
+        let mut log = ThemeWarningLog::default();
+        reload_lines(&mut log, &dark_overrides(&[("accent", "#赤色")]));
+        let lines = reload_lines(&mut log, &dark_overrides(&[("accent", "#abc")]));
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with(THEME_WARNING_RESOLVED) && lines[0].contains("#赤色"));
+        assert!(lines[1].starts_with(THEME_WARNING_IGNORED) && lines[1].contains("#abc"));
     }
 
     #[test]

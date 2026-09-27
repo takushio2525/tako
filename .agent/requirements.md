@@ -2054,6 +2054,20 @@ FR-2.7.6 は画像ペインを並べて実現する）。
 引かれる構造を最初から守り、後の AI テーマ操作（Phase 3 以降）で手戻りしないようにする。
 設定ファイルの形式・読み込み・テーマ操作の MCP / CLI 公開は Phase 3 以降で設計する。
 
+実装メモ（2026-09-27、FR-4.4 / FR-4.6 / #1756 / #1763）: settings.json の**読めない色の上書き**
+（`#赤色` / `#12345` 等）は起動も読み直しも止めず、その色だけ既定へ落とす（settings.json は
+書き換えない）。理由は persist.log へ `テーマの色上書きを無視: <キー>: <理由> [pid N]` の形で残す。
+**起動時と実行中の読み直し**（`ControlHost::reload_theme` = `tako theme` / MCP `tako_theme` /
+設定画面、およびタブバー・メニュー・⌘K のトグル）は同じ 1 実装（tako-app の `load_theme_logged`
+→ `tako_control::settings::ThemeWarningLog`）を通る。読み直しは色を 1 つ変えるたび・テーマを
+切り替えるたびに走るので、**前回と同じ警告は出さない**。増えた警告は上の形式で、消えた警告は
+`テーマの色上書きの警告が解消（読み直した設定では出ない）: <キー>: <理由>` で出す（手で直したとき
+のほか、テーマを切り替えてその上書きを読まなくなったときも出る）。settings.json 自体が壊れた JSON
+のときは、dispatch が読み直しの前に既定値で保存し直す（壊れた中身は `.unreadable.bak` へ退避。
+#916）ので、記録済みの警告の「解消」が出る。構造の番犬は
+`crates/tako-control/tests/issue1763_theme_reload_warnings_watchdog.rs`、実経路は
+`scripts/test-theme-reload-1763.sh`（CLI / MCP の読み直し・トグル・壊れた JSON）。
+
 ### FR-4.7 プロファイルの GUI 編集（Issue #721。✅ 2026-08-01）
 
 > `tako master` / `tako solo` の起動設定（`profiles/*.yaml` / `solo-profiles/*.yaml`）は
