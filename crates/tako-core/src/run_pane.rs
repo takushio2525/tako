@@ -1,5 +1,5 @@
 //! 実行ペイン（Code Runner #453 / `tako run-interactive` #305 / コマンド提案カード #666）の
-//! 状態と、終了コードの受け渡し（#1657）
+//! 状態と、終了コードの受け渡し（#1657。`tako split --command` の失敗時の保持も同じ経路 = #1778）
 //!
 //! ## 終了コードは画面ではなく側路ファイルで運ぶ
 //!
@@ -19,17 +19,30 @@
 //! - **起動スクリプトへパスを埋め込んだファイル**（採用）: 直 PTY / tmux / psmux の
 //!   どれでも 1 経路で、GUI の接続状態にも依らない
 //!
-//! 書き手（`platform::shell::run_pane_command` が組むスクリプト）は `<code>\n` を書く。
-//! **末尾の改行までそろって初めて読める**取り決めにして、書き込み途中の読み取り
-//! （`12` だけ見えて `127` の途中）を構造的に除く。書けなかったときだけ画面へ
-//! マーカーを出す（退避路）ので、読む側は「ファイル → 画面のマーカー」の順に見る
-//! （`tako_control::dispatch::run_pane_exit_code` の 1 実装）。
+//! 書き手（`platform::shell::run_pane_command` / `hold_on_failure_command` が組むスクリプト）は
+//! `<code>\n` を書く。**末尾の改行までそろって初めて読める**取り決めにして、書き込み途中の
+//! 読み取り（`12` だけ見えて `127` の途中）を構造的に除く。
+//!
+//! ## 画面のマーカーは「側路を用意できなかったペイン」の退避路だけ（#1778）
+//!
+//! 画面へ `__TAKO_EXIT=<code>` を出すのは、側路を用意できなかった（`prepare` が `None`）
+//! ペインだけ。読む側（`tako_control::dispatch::run_pane_exit_code` の 1 実装）も、
+//! **側路を持つペインでは画面を読まない**。#1778 以前は「ファイル → 画面」の順に両方を
+//! 見ていたので、実行中のプログラム自身が `__TAKO_EXIT=7` を印字すると（tako のテストの
+//! 出力・ペインログの `cat` 等）、側路が書かれる前に画面から 7 を拾い、終了を早め・偽の
+//! 値で確定していた（確定は 1 回きりなので、あとで側路に 0 が書かれても直らない）。
+//!
+//! その代わり、側路を用意できたのに**書けなかった**とき（ディスク満杯等）は確定しない
+//! （バッジは「実行中」のまま・`--wait` は上限で打ち切る）。書けなかったことを画面から
+//! 見分けるには、プログラムの印字と区別できる印（ペインごとの乱数など）が要り、
+//! #651 の読み取りと両 OS のスクリプトへ波及するため、今は持たない。
 //!
 //! ## 後片付け
 //!
-//! ファイルは Enter でペインを閉じたときにスクリプト自身が消す。× で閉じた・
-//! 置き換えた（再利用）・auto_close で閉じたときは読む側が消す。
-//! それでも残ったもの（プロセスごと落ちた等）は、次に実行ペインを作るときに
+//! ファイルは Enter でペインを閉じたときにスクリプト自身が消す。置き換えた（再利用）・
+//! auto_close で閉じたときは読む側が消す。`tako split --command` の保持は**失敗したときだけ**
+//! 書く（成功した回はペインがすぐ閉じるので書かない）。
+//! それでも残ったもの（× で閉じた・プロセスごと落ちた等）は、次に側路を用意するときに
 //! **生きていないペインのぶんで、十分古いもの**だけを消す（[`prepare`]）。
 //! 古さを条件に足すのは、同じデータディレクトリを見る別のホスト
 //! （テストの並列実行）が今まさに使っているファイルを消さないため。
@@ -119,26 +132,26 @@ impl RunOutcome {
     }
 }
 
-/// 実行ペインのメタデータ。セッション内で使い捨て（layout.json には保存しない）
+/// 実行ペインのメタデータ。セッション内で使い捨て（layout.json には保存しない）。
+///
+/// 終了コードの側路ファイルはここではなくペインが持つ（`crate::Pane::exit_file`。
+/// `tako split --command` の保持のペインも使うため = #1778）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InteractiveMeta {
     /// 完了後の自動 close 方針（`success` / `always` / `never`）
     auto_close: String,
     /// ユーザーのコマンド（包む前）
     command: String,
-    /// 終了コードの側路ファイル（`None` = 用意できなかった = 画面のマーカーだけが頼り）
-    exit_file: Option<PathBuf>,
     /// Code Runner の再利用の鍵（`tako run-interactive` / カードは `None` = 再利用しない）
     run_key: Option<RunKey>,
     status: RunStatus,
 }
 
 impl InteractiveMeta {
-    pub fn new(auto_close: String, command: String, exit_file: Option<PathBuf>) -> Self {
+    pub fn new(auto_close: String, command: String) -> Self {
         Self {
             auto_close,
             command,
-            exit_file,
             run_key: None,
             status: RunStatus::Running,
         }
@@ -150,10 +163,6 @@ impl InteractiveMeta {
 
     pub fn command(&self) -> &str {
         &self.command
-    }
-
-    pub fn exit_file(&self) -> Option<&Path> {
-        self.exit_file.as_deref()
     }
 
     pub fn run_key(&self) -> Option<&RunKey> {
@@ -250,7 +259,7 @@ pub fn exit_path(data_dir: &Path, pane_id: u64) -> PathBuf {
 }
 
 /// 側路ファイルを用意して書き先を返す。作れなければ `None`（スクリプトは画面の
-/// マーカーへ落ちる = 見た目は #1657 前に戻るが、`--wait` は止まらない）。
+/// マーカーへ落ち、読む側も画面を読む = 見た目は #1657 前に戻るが、`--wait` は止まらない）。
 ///
 /// 同じペイン ID の前回のぶんは必ず消す。ペイン ID は再起動をまたいで再利用される
 /// ので（#210）、残すと**前回の終了コード**を今回の実行直後に読んでしまう。
@@ -386,7 +395,7 @@ mod tests {
 
     #[test]
     fn 確定した終了コードは動かさない() {
-        let mut meta = InteractiveMeta::new("never".into(), "x".into(), None);
+        let mut meta = InteractiveMeta::new("never".into(), "x".into());
         assert_eq!(meta.status(), RunStatus::Running);
         assert!(meta.settle(1));
         assert!(!meta.settle(0), "確定済みを上書きした");
@@ -399,7 +408,7 @@ mod tests {
     #[test]
     fn auto_closeの判定は方針と終了コードで決まる() {
         let decide = |policy: &str, code: Option<i32>| {
-            let mut meta = InteractiveMeta::new(policy.into(), "x".into(), None);
+            let mut meta = InteractiveMeta::new(policy.into(), "x".into());
             if let Some(code) = code {
                 meta.settle(code);
             }

@@ -73,6 +73,10 @@ pub enum CloseOrigin {
     Dispatch,
     /// アプリ内部の後始末（PTY 起動失敗のロールバック・死亡ビューの掃除等）
     Internal,
+    /// 実行ペインの auto_close（#1662 / #1778）。終わった実行ペインを方針どおり閉じた。
+    /// 気づいたのが GUI の終了検知でも `--wait` の聞き直しでも、閉じたのは人ではないので
+    /// 1 つにまとめる（手で閉じた `close:gui` / `close:dispatch(…)` と後から見分ける）
+    AutoClose,
     /// アプリ終了に伴う最終フラッシュ
     AppQuit,
     /// プロセス終了・PTY 死亡（ユーザー操作ではない）
@@ -90,6 +94,7 @@ impl CloseOrigin {
             CloseOrigin::Mcp => "close:dispatch(mcp)",
             CloseOrigin::Dispatch => "close:dispatch",
             CloseOrigin::Internal => "close:internal",
+            CloseOrigin::AutoClose => "close:auto",
             CloseOrigin::AppQuit => "close:app-quit",
             CloseOrigin::ProcessExit => "exit",
         }
@@ -942,6 +947,7 @@ mod tests {
         assert_eq!(CloseOrigin::Mcp.marker(), "close:dispatch(mcp)");
         assert_eq!(CloseOrigin::Dispatch.marker(), "close:dispatch");
         assert_eq!(CloseOrigin::Internal.marker(), "close:internal");
+        assert_eq!(CloseOrigin::AutoClose.marker(), "close:auto");
         assert_eq!(CloseOrigin::AppQuit.marker(), "close:app-quit");
         assert_eq!(CloseOrigin::ProcessExit.marker(), "exit");
         // 全て相異なる = 事後の区別がつく
@@ -953,6 +959,7 @@ mod tests {
             CloseOrigin::Mcp,
             CloseOrigin::Dispatch,
             CloseOrigin::Internal,
+            CloseOrigin::AutoClose,
             CloseOrigin::AppQuit,
             CloseOrigin::ProcessExit,
         ];
@@ -978,6 +985,11 @@ mod tests {
         assert_eq!(
             CloseOrigin::ProcessExit.marker_with_caller(Some("x")),
             "exit"
+        );
+        // auto_close は `--wait` の聞き直しが引き金でも「人が閉じた」形にしない（#1778）
+        assert_eq!(
+            CloseOrigin::AutoClose.marker_with_caller(Some("orchestrator-master")),
+            "close:auto"
         );
         // 空・空白のみは付かない
         assert_eq!(

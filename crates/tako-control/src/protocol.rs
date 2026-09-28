@@ -2135,8 +2135,9 @@ pub enum Request {
         auto_close: Option<String>,
     },
     /// run-interactive で起動したペインの完了状態を問い合わせる（Issue #305）。
-    /// 終了コードは側路ファイル → 画面のマーカーの順に探し（#1657。
-    /// `dispatch::run_pane_exit_code`）、見つかれば exit code を返す。
+    /// 終了コードは側路ファイルから読み、側路を持たないペインだけ画面のマーカーを探す
+    /// （#1657 / #1778。`dispatch::run_pane_exit_code`）。見つかれば exit code を返す。
+    /// `tako split --command` の失敗で止まったペインにも効く（#1778）。
     /// auto_close 方針に従い、完了済みペインを自動 close する
     RunInteractiveStatus {
         pane: u64,

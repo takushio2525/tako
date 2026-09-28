@@ -5,7 +5,7 @@
 # 隔離した data / tmux で**実 tako-app** を立て、
 #
 #   ① `tako run --wait` は上限（`TAKO_RUN_WAIT_TIMEOUT_SECS`）で「まだ実行中」を返して非 0 で
-#      終わる。実行は止めない（ペインは running のまま）
+#      終わる（#1778 から 124 = `timeout(1)` と同じ）。実行は止めない（ペインは running のまま）
 #   ② env が 0 のときは既定（600 秒）へ落ちる（0 = 無制限にしない）。`--wait` は普通に終わる
 #   ③ `--wait` 無しでも `--auto-close success` が成功した実行ペインを GUI 側で閉じる。
 #      閉じたあとの `run-interactive-status` は控えから exited / closed=true を返す
@@ -152,7 +152,8 @@ wait_status() {
   done
   return 1
 }
-# 外側の締め切りつきで走らせる。打ち切ったら 124（修正前の「返らない」を固まらずに測る）
+# 外側の締め切りつきで走らせる。打ち切ったら 125（修正前の「返らない」を固まらずに測る。
+# 124 は #1778 から CLI 自身が「上限で打ち切った」に使うので、印を分ける）
 #   run_deadline <秒> <出力ファイル> <コマンド…>
 run_deadline() {
   local secs="$1" out="$2" pid i=0
@@ -163,7 +164,7 @@ run_deadline() {
     if [ "$i" -ge $((secs * 10)) ]; then
       kill "$pid" 2>/dev/null
       wait "$pid" 2>/dev/null
-      return 124
+      return 125
     fi
     sleep 0.1
     i=$((i + 1))
@@ -236,10 +237,10 @@ RC=$?
 T1=$(date +%s)
 echo "  rc=$RC 所要=$((T1 - T0)) 秒（外側の締め切り 15 秒・上限 3 秒）"
 sed 's/^/  | /' "$TMP/wait-cap.log"
-if [ "$RC" = 124 ]; then
+if [ "$RC" = 125 ]; then
   fail "--wait が上限で返らない（外側の締め切りで打ち切った = #1662 の症状）"
 elif [ "$RC" != 0 ]; then
-  pass "--wait は上限で非 0 で返る（rc=${RC}）"
+  pass "--wait は上限で非 0 で返る（rc=${RC}。#1778 からは 124）"
 else
   fail "--wait が上限なのに 0 で返った"
 fi

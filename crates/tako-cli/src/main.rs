@@ -3988,10 +3988,13 @@ fn cli_main() -> ExitCode {
         // 実体は dispatch と共通の tako_control::shell_integration::run
         Command::ShellIntegration(ref args) => shell_integration_local(args),
         Command::Config(ref args) => config_share_local(args),
-        // run-interactive --wait は起動 + ポーリングの合成
-        Command::RunInteractive(ref args) if args.wait => run_interactive_wait(&cli.command),
+        // run-interactive --wait は起動 + ポーリングの合成。終了コードは結末から決まる
+        // （上限で打ち切ったら 124 = `timeout(1)` と同じ。#1778）
+        Command::RunInteractive(ref args) if args.wait => {
+            return wait_exit_code(run_interactive_wait(&cli.command));
+        }
         // run --wait / --list は合成処理
-        Command::Run(ref args) if args.wait => run_wait(&cli.command),
+        Command::Run(ref args) if args.wait => return wait_exit_code(run_wait(&cli.command)),
         Command::Run(ref args) if args.list => run_list(&cli.command),
         command => run(command),
     };
@@ -9021,7 +9024,7 @@ fn ledger_cli(sub: &LedgerCommand) -> Result<(), String> {
 }
 
 /// run-interactive --wait: 起動 → ポーリングで完了待ち → exit code を返す
-fn run_interactive_wait(command: &Command) -> Result<(), String> {
+fn run_interactive_wait(command: &Command) -> Result<WaitEnd, String> {
     let request = build_request(command)?;
     let result = send_request(request)?;
     let pane = result["pane"]
@@ -9035,7 +9038,7 @@ fn run_interactive_wait(command: &Command) -> Result<(), String> {
 }
 
 /// run --wait: 起動 → ポーリングで完了待ち → exit code を返す
-fn run_wait(command: &Command) -> Result<(), String> {
+fn run_wait(command: &Command) -> Result<WaitEnd, String> {
     let request = build_request(command)?;
     let result = send_request(request)?;
     let pane = result["pane"]
@@ -9062,14 +9065,67 @@ fn run_wait(command: &Command) -> Result<(), String> {
 /// `--wait` の聞き直しの間隔（#1657 以前からの 2 秒）
 const RUN_WAIT_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// `--wait` が上限で打ち切ったときの CLI の終了コード（#1778）。
+///
+/// `timeout(1)` と同じ 124。#1778 以前は 1 で、**コマンド自身の失敗（非 0 はすべて 1）と
+/// 見分けられなかった**。コマンドが自分で 124 で終わっても CLI は 1 を返す（非 0 は 1 に
+/// 畳む）ので、124 は打ち切りだけを指す。応答 JSON の `timed_out: true` と対になる
+const RUN_WAIT_TIMED_OUT_EXIT: u8 = 124;
+
+/// `--wait` の結末（#1778。CLI の終了コードは [`WaitEnd::exit_code`] の 1 か所で決まる）
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WaitEnd {
+    /// コマンドが終わった（終了コード）
+    Exited(i64),
+    /// 上限まで待っても終わらなかった（実行は止めていない）。値は stderr へ出す 1 行
+    TimedOut(String),
+}
+
+impl WaitEnd {
+    /// CLI の終了コード: 0 = 成功 / 1 = コマンドが非 0 で終わった / 124 = 上限で打ち切った
+    fn exit_code(&self) -> u8 {
+        match self {
+            WaitEnd::Exited(0) => 0,
+            WaitEnd::Exited(_) => 1,
+            WaitEnd::TimedOut(_) => RUN_WAIT_TIMED_OUT_EXIT,
+        }
+    }
+
+    /// stderr へ出す 1 行（成功なら無し）
+    fn message(&self) -> Option<String> {
+        match self {
+            WaitEnd::Exited(0) => None,
+            WaitEnd::Exited(code) => Some(format!("コマンドが exit code {code} で終了")),
+            WaitEnd::TimedOut(message) => Some(message.clone()),
+        }
+    }
+}
+
+/// `--wait` の結末を CLI の終了コードへ写す（エラーの出し方は他のコマンドと同じ `error: …`）
+fn wait_exit_code(result: Result<WaitEnd, String>) -> ExitCode {
+    match result {
+        Ok(end) => {
+            if let Some(message) = end.message() {
+                eprintln!("error: {message}");
+            }
+            ExitCode::from(end.exit_code())
+        }
+        Err(message) => {
+            eprintln!("error: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// run / run-interactive の `--wait` の本体（#1662）: 実行ペインの終わりを**上限つきで**待つ。
 ///
 /// #1662 以前は 2 秒刻みの無限ループで、サーバーや入力待ちを `--wait` で走らせると
 /// CLI が永久に返らなかった（`.agent/conventions.md`「外部コマンドを待つときは上限を持つ」）。
 /// 上限は `tako_core::probe::run_wait_timeout`（env `TAKO_RUN_WAIT_TIMEOUT_SECS`。
 /// 0 / 不正は既定）、聞き直しは `probe::poll_with_timeout` の 1 実装。
-/// 超えたら「まだ実行中」を出して非 0 で返す（**実行は止めない**）
-fn wait_run_pane(pane: u64) -> Result<(), String> {
+/// 超えたら「まだ実行中」を出して [`WaitEnd::TimedOut`]（= 終了コード 124。#1778）で返す
+/// （**実行は止めない**）
+fn wait_run_pane(pane: u64) -> Result<WaitEnd, String> {
     use tako_core::probe::{poll_with_timeout, run_wait_timeout, Polled};
     let budget = run_wait_timeout();
     println!("終わるまで最長 {} 秒待ちます", budget.as_secs());
@@ -9083,15 +9139,11 @@ fn wait_run_pane(pane: u64) -> Result<(), String> {
     match polled {
         Polled::Done(status) => {
             println!("{}", pretty_json(&status));
-            let code = status["exit_code"].as_i64().unwrap_or(1);
-            if code != 0 {
-                return Err(format!("コマンドが exit code {code} で終了"));
-            }
-            Ok(())
+            Ok(WaitEnd::Exited(status["exit_code"].as_i64().unwrap_or(1)))
         }
         Polled::TimedOut { waited } => {
             println!("{}", pretty_json(&run_wait_timed_out(pane, waited, budget)));
-            Err(run_wait_timed_out_message(pane, budget))
+            Ok(WaitEnd::TimedOut(run_wait_timed_out_message(pane, budget)))
         }
     }
 }
@@ -11279,6 +11331,29 @@ mod tests {
             msg.contains("止めていません"),
             "実行を止めたと誤読させない: {msg}"
         );
+    }
+
+    /// #1778: `--wait` の終了コードは結末から決まる。上限での打ち切りは 124
+    /// （`timeout(1)` と同じ）で、コマンド自身の失敗（1）と見分けられる
+    #[test]
+    fn waitの終了コードは打ち切りを124でコマンドの失敗と分ける() {
+        assert_eq!(WaitEnd::Exited(0).exit_code(), 0);
+        assert_eq!(WaitEnd::Exited(0).message(), None);
+        assert_eq!(WaitEnd::Exited(1).exit_code(), 1);
+        // 非 0 は 1 に畳む = コマンドが自分で 124 を返しても打ち切りと混ざらない
+        assert_eq!(WaitEnd::Exited(7).exit_code(), 1);
+        assert_eq!(WaitEnd::Exited(124).exit_code(), 1);
+        assert_eq!(WaitEnd::Exited(-1).exit_code(), 1);
+        assert!(WaitEnd::Exited(7)
+            .message()
+            .is_some_and(|m| m.contains("exit code 7")));
+        let budget = std::time::Duration::from_secs(3);
+        let timed_out = WaitEnd::TimedOut(run_wait_timed_out_message(7, budget));
+        assert_eq!(timed_out.exit_code(), 124);
+        assert_eq!(RUN_WAIT_TIMED_OUT_EXIT, 124);
+        assert!(timed_out
+            .message()
+            .is_some_and(|m| m.contains("まだ実行中")));
     }
 
     /// Issue #553: GUI に見えている fleet をそのまま指定できる。

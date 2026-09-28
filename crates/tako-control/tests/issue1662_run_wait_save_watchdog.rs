@@ -289,11 +289,11 @@ fn auto_closeはguiの終了検知から効き判定はdispatchの1実装() {
     for (sig, needle) in [
         (
             "fn auto_close_finished_run_pane(",
-            "tako_control::dispatch::auto_close_run_pane(self, pane,",
+            "tako_control::dispatch::auto_close_run_pane(self, pane)",
         ),
         (
             "fn auto_close_finished_run_panes(",
-            "tako_control::dispatch::auto_close_run_panes(self,",
+            "tako_control::dispatch::auto_close_run_panes(self)",
         ),
     ] {
         let (body, at) = fn_body(APP, &app, sig);
@@ -324,7 +324,8 @@ fn auto_closeはguiの終了検知から効き判定はdispatchの1実装() {
         ".wants_close()",
         "run_pane::discard(",
         "closed_runs_mut()",
-        "host.detach_session(pane, origin, None)",
+        // #1778: 閉じた発生源は引き金に依らず `close:auto`（手で閉じた形と見分ける）
+        "host.detach_session(pane, tako_core::pane_log::CloseOrigin::AutoClose, None)",
     ] {
         assert!(
             text.contains(needle),
@@ -340,7 +341,7 @@ fn auto_closeはguiの終了検知から効き判定はdispatchの1実装() {
     );
     let text = joined(&arm);
     assert!(
-        text.contains("auto_close_run_pane(host, target, close_origin_of(origin))"),
+        text.contains("auto_close_run_pane(host, target)"),
         "{DISPATCH}:{at}: RunInteractiveStatus が auto_close_run_pane を通っていない（閉じ方が 2 つに割れる）"
     );
     assert!(
