@@ -950,6 +950,24 @@ pub trait PreviewHost {
     fn preview_pane_of_tab(&self, _tab: TabId) -> Option<PaneId> {
         None
     }
+    /// 開いているファイル（プレビュー・編集中）の一覧（FR-3.32 / #1834）。
+    ///
+    /// ファイルの移動が**移す前に**読み、`tako_core::file_move::follows` で付け替え先を決める
+    fn open_file_paths(&self) -> Vec<(PaneId, std::path::PathBuf)> {
+        Vec::new()
+    }
+    /// ファイル・フォルダを移した**後**の後始末（FR-3.32 / #1834）。
+    ///
+    /// `follows` のペインを新しいパスへ付け替え（プレビュー・編集バッファ・言語サーバの文書）、
+    /// ファイルツリーを読み直す。移動の口は dispatch の `FileOpKind::Move` 1 つで、
+    /// GUI の D&D・CLI・MCP のどれから来てもここを 1 回だけ通る
+    fn file_moved(
+        &mut self,
+        _from: &std::path::Path,
+        _to: &std::path::Path,
+        _follows: &[tako_core::file_move::Follow],
+    ) {
+    }
     /// 動画プレイヤーの操作（"play" / "pause" / "toggle" / "mute" / "unmute" /
     /// "toggle_mute" / "loop_on" / "loop_off" / "toggle_loop"）。
     /// 戻り値は現在の state（"playing" / "paused"）

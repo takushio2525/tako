@@ -651,6 +651,7 @@ tako file copy-path src/main.rs        # 絶対パスを出力（--relative で�
 tako file reveal src/main.rs           # Finder で表示
 tako file open-terminal ~/Documents/webapp  # ペイン内で cd
 tako file rename old.txt new.txt
+tako file move notes.md docs          # 別のフォルダへ移す（ツリーの D&D と同じ。同名・自分の配下・別のボリュームは断る）
 tako file create src helper.ts         # path 配下に name で作成
 tako file mkdir src components
 tako file trash old-notes.md           # ゴミ箱へ移動

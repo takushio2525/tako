@@ -238,6 +238,24 @@ impl JumpHistory {
         }
         count
     }
+
+    /// ファイル・フォルダの移動（#1834）に合わせて、`from`（またはその配下）を指す項目を
+    /// 移した後のパスへ付け替える。付け替えた件数を返す。
+    ///
+    /// 付け替えないと、戻る / 進むで当たったときに「ファイルが消えていた」として
+    /// 読み飛ばされ、移しただけの項目が履歴から捨てられる
+    pub fn retarget_path(&mut self, from: &std::path::Path, to: &std::path::Path) -> usize {
+        let mut count = 0;
+        for entry in self.entries.iter_mut() {
+            if let Some(moved) =
+                crate::file_move::remap(std::path::Path::new(&entry.path), from, to)
+            {
+                entry.path = moved.display().to_string();
+                count += 1;
+            }
+        }
+        count
+    }
 }
 
 #[cfg(test)]
@@ -426,6 +444,30 @@ mod tests {
         assert_eq!(
             nav.target.map(|t| (t.location.path, t.reopen)),
             Some(("/o.rs".into(), false))
+        );
+    }
+
+    /// #1834: 移したファイル・フォルダを指す項目は、移した後のパスへ付け替わる
+    /// （付け替えないと戻る / 進むで「消えていた」として捨てられる）
+    #[test]
+    fn 移したフォルダの配下を指す項目は新しいパスへ付け替わる() {
+        let mut h = JumpHistory::default();
+        h.record_jump(Some(at(1, "/w/d/a.rs", 5)), at(1, "/w/d/sub/b.rs", 10));
+        h.record_jump(Some(at(1, "/w/d/sub/b.rs", 10)), at(1, "/w/dd/c.rs", 1));
+        assert_eq!(
+            h.retarget_path(std::path::Path::new("/w/d"), std::path::Path::new("/w/x/d")),
+            2
+        );
+        // Path 同士（成分単位）で比べる: Windows では付け替えた後の区切りが `\` になる
+        let paths: Vec<std::path::PathBuf> = h.entries().map(|e| e.path.clone().into()).collect();
+        // `/w/dd` は `/w/d` の配下ではない（成分単位）
+        assert_eq!(
+            paths,
+            vec![
+                std::path::Path::new("/w/x/d").join("a.rs"),
+                std::path::Path::new("/w/x/d").join("sub").join("b.rs"),
+                std::path::PathBuf::from("/w/dd/c.rs"),
+            ]
         );
     }
 

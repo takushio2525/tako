@@ -179,6 +179,45 @@ pub fn menu_remove_root() -> &'static str {
     tr!("ツリーから除去", "Remove from tree")
 }
 
+// --- ツリー内のドラッグ＆ドロップによる移動（FR-3.32 / #1834。キー: sidebar.move_*） ---
+
+/// 失敗の通知に出す操作名（押した操作と失敗した操作の名前を揃える = #1399）
+pub fn move_op() -> &'static str {
+    tr!("移動", "Move")
+}
+/// 移せる落とし先の行に出す札
+pub fn move_here() -> &'static str {
+    tr!("ここへ移動", "Move here")
+}
+/// 移せない行に出す札の理由（短く。判定は `tako_core::file_move` の 1 実装）
+pub fn move_refused(refusal: &tako_core::file_move::MoveRefusal) -> String {
+    use tako_core::file_move::MoveRefusal;
+    match refusal {
+        MoveRefusal::IntoSelf => tr!("自分自身へは移せない", "Can't move into itself").into(),
+        MoveRefusal::IntoDescendant => tr!(
+            "自分の配下へは移せない",
+            "Can't move into its own subfolder"
+        )
+        .into(),
+        MoveRefusal::NameTaken => tr!("同じ名前がある", "Name already exists").into(),
+        MoveRefusal::Remote => tr!(
+            "リモート（SSH）の項目は移せない",
+            "Remote (SSH) items can't be moved"
+        )
+        .into(),
+        MoveRefusal::WorkspaceRoot => tr!(
+            "見出しのフォルダは移せない",
+            "Workspace folders can't be moved"
+        )
+        .into(),
+        MoveRefusal::CrossDevice => {
+            tr!("別のボリュームへは移せない", "Can't move across volumes").into()
+        }
+        // ホバー中には出ない（FS を読む判定は dispatch 側）。出たら core の文面をそのまま
+        other => other.reason(),
+    }
+}
+
 // --- ヘッダのトグル（#550。キー: sidebar.hidden_*） ---
 
 pub fn hidden_show() -> &'static str {

@@ -208,6 +208,169 @@ fn git_badge_spans(status: Option<filetree::TreeGitStatus>, theme: &Theme) -> Op
     Some(badge)
 }
 
+/// ツリー内のドラッグで、いまカーソルが載っている行と判定（FR-3.32 / #1834）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TreeDropHover {
+    /// カーソルが載っている行
+    pub(crate) row: std::path::PathBuf,
+    /// その行がリモート（SSH）の行か（パスの字面が同じローカル行と取り違えない）
+    pub(crate) row_remote: bool,
+    /// 落とし先のフォルダ（ファイル行の上なら親フォルダ）
+    pub(crate) dest: std::path::PathBuf,
+    /// ドラッグしている項目
+    pub(crate) src: std::path::PathBuf,
+    /// 判定（`tako_core::file_move::drop_verdict` = dispatch と同じ規則）
+    pub(crate) verdict: tako_core::file_move::DropVerdict,
+}
+
+/// ドラッグしている項目を行 `row` の上へ持ってきたときの判定（行をまたいだときだけ呼ぶ）。
+///
+/// 掴んだ行そのものの上では何も出さない（`None`）。そこで離すのは取り消しで、
+/// 「自分自身へは移せない」を毎回出すと、ペインへ運ぶ途中にも赤い札が付いて回る
+pub(crate) fn tree_drop_hover(
+    src: &std::path::Path,
+    src_root: bool,
+    row: &std::path::Path,
+    row_is_dir: bool,
+    row_remote: bool,
+) -> Option<TreeDropHover> {
+    use tako_core::file_move::{drop_verdict, DragItem};
+    if row == src && !row_remote {
+        return None;
+    }
+    // ファイル行の上 = そのファイルのあるフォルダへ（VSCode と同じ。狙う行が広くなる）
+    let dest = if row_is_dir || row_remote {
+        row.to_path_buf()
+    } else {
+        row.parent()?.to_path_buf()
+    };
+    let verdict = drop_verdict(
+        DragItem {
+            path: src,
+            workspace_root: src_root,
+            remote: false,
+        },
+        &dest,
+        row_remote,
+        |to| std::fs::symlink_metadata(to).is_ok(),
+    );
+    Some(TreeDropHover {
+        row: row.to_path_buf(),
+        row_remote,
+        dest,
+        src: src.to_path_buf(),
+        verdict,
+    })
+}
+
+/// 行ごとの強調の種類（[`tree_drop_mark`] が決める）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TreeDropMark {
+    /// 落とし先のフォルダの行（「ここへ移動」の札）
+    Target,
+    /// 落とし先のフォルダの中に見えている行（薄く塗る = どこへ入るかの範囲）
+    Inside,
+    /// 移せない行（理由の札）
+    Refused(tako_core::file_move::MoveRefusal),
+}
+
+/// 行（`row` / `remote`）にどの強調を出すか（純関数。描画は写すだけ）
+pub(crate) fn tree_drop_mark(
+    hover: Option<&TreeDropHover>,
+    row: &std::path::Path,
+    remote: bool,
+) -> Option<TreeDropMark> {
+    use tako_core::file_move::DropVerdict;
+    let hover = hover?;
+    match &hover.verdict {
+        DropVerdict::Move if !remote && row == hover.dest => Some(TreeDropMark::Target),
+        DropVerdict::Move if !remote && row.starts_with(&hover.dest) => Some(TreeDropMark::Inside),
+        DropVerdict::Refused(refusal) if row == hover.row && remote == hover.row_remote => {
+            Some(TreeDropMark::Refused(refusal.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// ツリー行に移動の強調を重ねる（FR-3.32 / #1834）。
+///
+/// **行の中身を組み終えた最後に**重ねる（開いているファイルの塗り・ホバーの塗りより
+/// 前に置くと上書きされて見えない）。縁取りは内側の影、札は絶対配置なので、
+/// 行の高さも並びも 1px も動かさない（ドラッグ中に行が跳ねない）
+fn with_tree_drop_mark(
+    el: gpui::Stateful<gpui::Div>,
+    mark: Option<TreeDropMark>,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
+    let Some(mark) = mark else {
+        return el;
+    };
+    let outline = |color: tako_core::Rgb| {
+        vec![BoxShadow {
+            color: hsla(color),
+            offset: point(px(0.), px(0.)),
+            blur_radius: px(0.),
+            spread_radius: px(1.),
+            inset: true,
+        }]
+    };
+    let (el, pill) = match &mark {
+        TreeDropMark::Target => (
+            el.bg(rgba_alpha(theme.accent, 0.24))
+                .shadow(outline(theme.accent)),
+            Some((
+                theme.accent,
+                None,
+                crate::ui_text::sidebar::move_here().to_string(),
+            )),
+        ),
+        TreeDropMark::Inside => (el.bg(rgba_alpha(theme.accent, 0.07)), None),
+        TreeDropMark::Refused(refusal) => (
+            el.bg(rgba_alpha(theme.red, 0.16))
+                .shadow(outline(theme.red)),
+            Some((
+                theme.red,
+                Some(file_icons::ui_icon::FAIL_X),
+                crate::ui_text::sidebar::move_refused(refusal),
+            )),
+        ),
+    };
+    let Some((color, icon, text)) = pill else {
+        return el;
+    };
+    el.relative().child(
+        div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right(px(4.0))
+            .flex()
+            .items_center()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(3.0))
+                    .px(px(5.0))
+                    .rounded(px(4.0))
+                    .bg(rgba(theme.mantle))
+                    .border_1()
+                    .border_color(hsla(color))
+                    .text_size(px(10.0))
+                    .text_color(hsla(color))
+                    .children(icon.map(|path| {
+                        svg()
+                            .path(path)
+                            .size(px(9.0))
+                            .flex_none()
+                            .text_color(hsla(color))
+                    }))
+                    .child(SharedString::from(text)),
+            ),
+    )
+}
+
 /// インデントガイド線（#589）。
 ///
 /// 旧実装は行ボックスの `border-left` 1 本だけを引いていたため、**その行の深さの線しか
@@ -580,6 +743,12 @@ impl TakoApp {
         // #789: 親（root render）が渡す幅と同じ実効幅を使う（要求値ではない）
         let sidebar_w = self.effective_sidebar_width();
         let drop_highlight = self.sidebar_drop_highlight;
+        // #1834: ツリーの行からドラッグしている間だけ、行へ移動の受け口を付ける。
+        // gpui のドラッグが外部要因（Esc・窓の外で離す）で消えたフレームでは判定を畳む
+        let tree_drag_live = cx.has_active_drag() && self.drag_kind == Some(DragKind::File);
+        if !cx.has_active_drag() {
+            self.tree_drop = None;
+        }
         Some(
             div()
                 .w(px(sidebar_w))
@@ -809,7 +978,13 @@ impl TakoApp {
                             // リモートの POSIX パスを載せた見せかけの PathBuf なので、
                             // ここから下の `canonicalize` / `join` に触れさせない
                             if row.remote.is_some() {
-                                return self.render_remote_row(index, &row, &theme, cx);
+                                let el = self.render_remote_row(index, &row, &theme, cx);
+                                // #1834: リモートの行は移せない・移し先にもならない（理由を出す）。
+                                // 情報行（読み込み中・失敗）は押せない行なので飾らない
+                                if row.note.is_some() {
+                                    return el;
+                                }
+                                return self.decorate_tree_row(el, &row, tree_drag_live, &theme, cx);
                             }
                             // #1398: ローカルの情報行（シンボリックリンクの循環で
                             // 展開を打ち切った説明）。押せない行なので、インライン編集・
@@ -1046,16 +1221,20 @@ impl TakoApp {
                                         }
                                     }),
                                 )
-                                // ファイルは D&D でドロップ位置にプレビューとして開ける（FR-3.11）
+                                // ファイルは D&D でドロップ位置にプレビューとして開ける（FR-3.11）。
+                                // ツリーのフォルダ行へ落とせば移す（FR-3.32 / #1834）
                                 .on_drag(
-                                    FileDrag { path: drag_path },
+                                    FileDrag {
+                                        path: drag_path,
+                                        root: row.root,
+                                    },
                                     self.drag_ghost_builder(
                                         DragKind::File,
                                         truncate_chars(&row.entry.name, 24),
                                         cx,
                                     ),
                                 );
-                            if row.root {
+                            let row_el = if row.root {
                                 // ワークスペースフォルダの見出し行: 太字 + 上仕切り線（2 つ目以降）
                                 base.when(index > 0, |d| {
                                     d.border_t_1()
@@ -1191,7 +1370,9 @@ impl TakoApp {
                                 // git status バッジ（#1009）
                                 row_el = row_el.children(git_badge);
                                 row_el
-                            }
+                            };
+                            // #1834: 移動の強調と受け口は行を組み終えた最後に重ねる
+                            self.decorate_tree_row(row_el, &row, tree_drag_live, &theme, cx)
                         })),
                 )
                 // フッター: git 変更サマリ（カンプ: N modified +A −R / diff →）
@@ -2008,6 +2189,7 @@ impl TakoApp {
                 path: path_str,
                 name: Some(name.clone()),
                 pane: None,
+                dest: None,
             },
             PaneOrigin::User,
         );
@@ -2072,6 +2254,7 @@ impl TakoApp {
                         path: path_str,
                         name: None,
                         pane: None,
+                        dest: None,
                     },
                     PaneOrigin::User,
                 ) {
@@ -2096,6 +2279,7 @@ impl TakoApp {
                         path: path_str,
                         name: None,
                         pane: Some(pane),
+                        dest: None,
                     },
                     PaneOrigin::User,
                 ) {
@@ -2119,6 +2303,7 @@ impl TakoApp {
                         path: path_str,
                         name: None,
                         pane: None,
+                        dest: None,
                     },
                     PaneOrigin::User,
                 );
@@ -2139,6 +2324,7 @@ impl TakoApp {
                         path: path_str,
                         name: None,
                         pane: Some(pane),
+                        dest: None,
                     },
                     PaneOrigin::User,
                 );
@@ -2165,6 +2351,7 @@ impl TakoApp {
                         path: path_str,
                         name: None,
                         pane: None,
+                        dest: None,
                     },
                     PaneOrigin::User,
                 );
@@ -2185,6 +2372,7 @@ impl TakoApp {
                         path: path_str,
                         name: None,
                         pane: None,
+                        dest: None,
                     },
                     PaneOrigin::User,
                 );
@@ -2988,6 +3176,219 @@ impl TakoApp {
         }
     }
 
+    /// ツリーの行に移動の強調とドラッグの受け口を付ける（FR-3.32 / #1834）。
+    ///
+    /// 受け口（`on_drag_move` / `on_drop`）は**ツリーの行からドラッグしている間だけ**付ける。
+    /// gpui の `on_drag_move` はカーソルがどこにあっても全リスナーへ届くので、常時付けると
+    /// 行の数だけのリスナーがマウス移動のたびに走る。ペインへ落とす既存の D&D
+    /// （FR-3.11 / FR-3.13）はペイン側のオーバーレイが受けるので、ここと干渉しない
+    fn decorate_tree_row(
+        &self,
+        el: gpui::Stateful<gpui::Div>,
+        row: &filetree::Row,
+        drag_live: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let remote = row.remote.is_some();
+        let is_dir = row.entry.is_dir;
+        let mark = tree_drop_mark(self.tree_drop.as_ref(), &row.entry.path, remote);
+        let mut el = with_tree_drop_mark(el, mark, theme);
+        if remote {
+            // 掴んだ時点で理由をゴーストに出す（どこにも落とせない）
+            el = el.on_drag(
+                RemoteRowDrag,
+                self.drag_ghost_builder(
+                    DragKind::RemoteRow,
+                    crate::ui_text::sidebar::move_refused(
+                        &tako_core::file_move::MoveRefusal::Remote,
+                    ),
+                    cx,
+                ),
+            );
+        }
+        if !drag_live {
+            return el;
+        }
+        let over_path = row.entry.path.clone();
+        let drop_path = row.entry.path.clone();
+        el.on_drag_move::<FileDrag>(cx.listener(
+            move |this, e: &gpui::DragMoveEvent<FileDrag>, _, cx| {
+                let drag = e.drag(cx).clone();
+                let inside = e.bounds.contains(&e.event.position);
+                this.track_tree_drop(&over_path, is_dir, remote, inside, &drag, cx);
+            },
+        ))
+        .on_drop::<FileDrag>(cx.listener(move |this, drag: &FileDrag, _, cx| {
+            this.drop_on_tree_row(&drop_path, is_dir, remote, drag, cx);
+        }))
+    }
+
+    /// ドラッグ中のカーソルが行に入った / 出たときの判定の更新（FR-3.32 / #1834）。
+    ///
+    /// **同じ行の上に居る間は判定し直さない**（同名の stat を 1 行につき 1 回で済ませる）。
+    /// 出たときは自分が立てた判定だけを畳む（入った先の行が新しい判定を立てる。
+    /// リスナーが呼ばれる順に依らない）
+    pub(crate) fn track_tree_drop(
+        &mut self,
+        row: &std::path::Path,
+        row_is_dir: bool,
+        row_remote: bool,
+        inside: bool,
+        drag: &FileDrag,
+        cx: &mut Context<Self>,
+    ) {
+        let mine = |h: &TreeDropHover| h.row == row && h.row_remote == row_remote;
+        if !inside {
+            if self.tree_drop.as_ref().is_some_and(mine) {
+                self.tree_drop = None;
+                cx.notify();
+            }
+            return;
+        }
+        if self
+            .tree_drop
+            .as_ref()
+            .is_some_and(|h| mine(h) && h.src == drag.path)
+        {
+            return;
+        }
+        let next = tree_drop_hover(&drag.path, drag.root, row, row_is_dir, row_remote);
+        if self.tree_drop != next {
+            self.tree_drop = next;
+            cx.notify();
+        }
+    }
+
+    /// ツリーの行へのドロップ（FR-3.32 / #1834）。
+    ///
+    /// 移せる・移せないの**最終判断は dispatch の `FileOpKind::Move` の 1 実装**
+    /// （断った理由の文面が CLI / MCP と揃う）。画面が先に止めるのは、dispatch へ渡せない
+    /// リモートの行と、画面の方針で断る見出し行だけ
+    pub(crate) fn drop_on_tree_row(
+        &mut self,
+        row: &std::path::Path,
+        row_is_dir: bool,
+        row_remote: bool,
+        drag: &FileDrag,
+        cx: &mut Context<Self>,
+    ) {
+        use tako_control::protocol::{FileOpKind, Request};
+        use tako_core::file_move::{DropVerdict, MoveRefusal};
+        // ペインへのドロップと同じ後始末（`take_drop_zone`）。ここへ来たときは
+        // gpui が stop_propagation するので、ルートの `on_mouse_up` は走らない
+        self.tree_drop = None;
+        self.drag_kind = None;
+        self.drop_cmd_held = false;
+        self.drop_target = None;
+        let Some(hover) = tree_drop_hover(&drag.path, drag.root, row, row_is_dir, row_remote)
+        else {
+            // 掴んだ行へ戻した = 取り消し
+            cx.notify();
+            return;
+        };
+        let src = drag.path.display().to_string();
+        let op = crate::ui_text::sidebar::move_op();
+        match hover.verdict {
+            DropVerdict::Unchanged => {}
+            DropVerdict::Refused(refusal @ (MoveRefusal::Remote | MoveRefusal::WorkspaceRoot)) => {
+                self.notify_tree_op_failed(
+                    op,
+                    Some(&src),
+                    &crate::ui_text::sidebar::move_refused(&refusal),
+                );
+            }
+            DropVerdict::Move | DropVerdict::Refused(_) => {
+                let result = tako_control::dispatch(
+                    self,
+                    Request::FileOp {
+                        op: FileOpKind::Move,
+                        path: src.clone(),
+                        name: None,
+                        pane: None,
+                        dest: Some(hover.dest.display().to_string()),
+                    },
+                    PaneOrigin::User,
+                );
+                match result {
+                    // 付け替え・ツリーの読み直しは dispatch の中（`file_moved`）で済んでいる。
+                    // 読み込み中だったプレビューの読み直しと、パスの変わったレイアウトの保存だけ
+                    Ok(_) => {
+                        self.drain_pending_preview_loads(cx);
+                        self.save_layout();
+                    }
+                    Err(e) => self.notify_tree_dispatch_failed(op, Some(&src), &e),
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// ファイル・フォルダを移した**後**の追従（FR-3.32 / #1834）。
+    ///
+    /// dispatch `FileOpKind::Move` が `PreviewHost::file_moved` から 1 回だけ呼ぶ
+    /// （ツリーの D&D・CLI・MCP のどれでも同じ）。`follows` は移す前に
+    /// `tako_core::file_move::follows` が決めた付け替え先で、ここは写すだけ。
+    ///
+    /// **付け替えないと**、ディスクの監視が元の場所を見て「外で削除された」（#1659）と読み、
+    /// 未保存の変更が競合の帯の向こうへ閉じ込められる。本文・undo・カーソル・版は
+    /// バッファに残したまま、パスだけを差し替える
+    pub(crate) fn follow_file_move(
+        &mut self,
+        from: &std::path::Path,
+        to: &std::path::Path,
+        follows: &[tako_core::file_move::Follow],
+    ) {
+        use tako_core::file_move::remap;
+        // 積んだまま未着手の読み込み・塗りは、新しいパスで起こす
+        for (_, path, _) in self.pending_preview_loads.iter_mut() {
+            if let Some(moved) = remap(path, from, to) {
+                *path = moved;
+            }
+        }
+        for (_, path, _) in self.pending_highlights.iter_mut() {
+            if let Some(moved) = remap(path, from, to) {
+                *path = moved;
+            }
+        }
+        for follow in follows {
+            let pane = PaneId::from_raw(follow.pane);
+            let mut reload = None;
+            if let Some(state) = self.previews.get_mut(&pane) {
+                state.path = follow.to.clone();
+                // 読み込み中の結果は「読み込み中に別ファイルへ差し替わった」として
+                // 捨てられる（後勝ち）ので、新しいパスで読み直す
+                if matches!(state.content, preview::PreviewContent::Loading) {
+                    reload = Some(state.mode);
+                }
+            }
+            if let Some(mode) = reload {
+                if !self
+                    .pending_preview_loads
+                    .iter()
+                    .any(|(p, _, _)| *p == pane)
+                {
+                    self.pending_preview_loads
+                        .push((pane, follow.to.clone(), mode));
+                }
+            }
+            if let Some(edit) = self.preview_edits.get_mut(&pane) {
+                edit.buffer.retarget(follow.to.clone());
+                // 言語サーバの文書は URI ごと開き直す（つながりを外す = 旧 URI の didClose、
+                // 次の同期 = 新 URI の didOpen）。診断は旧 URI のものなので捨てる
+                edit.lsp = tako_control::lsp::DocLink::Unlinked;
+                edit.diagnostics = None;
+            }
+            self.sync_preview_lsp(pane);
+            // Code Runner の宣言はパスから決まる（`${file}` の展開先も変わる）
+            self.detect_preview_run_profiles(pane, &follow.to);
+        }
+        // 戻る / 進むの項目も付け替える（残すと「消えていた」として捨てられる）
+        self.jump_history.retarget_path(from, to);
+        self.filetree.note_moved(from, to);
+        self.sync_preview_watches();
+    }
+
     /// 表示中かつ対応形式のパスだけを親ディレクトリの非再帰監視へ同期する。
     /// render からは呼ばず、open / close / 設定切替時だけ実行する。
     /// BG 退避中のプレビューは監視対象から除外する（#230）。
@@ -3295,6 +3696,58 @@ fn pick_app_and_open(path: &std::path::Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// #1834: 掴んだ行の上では何も出さず、ファイル行の上はそのフォルダへ、
+    /// リモートの行は理由つきで断る（判定は core の `drop_verdict` = dispatch と同じ規則）
+    #[test]
+    fn ツリーのドロップ判定は掴んだ行とファイル行とリモートを見分ける() {
+        use tako_core::file_move::{DropVerdict, MoveRefusal};
+        let src = PathBuf::from("/nonexistent-1834/w/a.txt");
+        let w = PathBuf::from("/nonexistent-1834/w");
+        let other = PathBuf::from("/nonexistent-1834/other");
+        assert_eq!(tree_drop_hover(&src, false, &src, false, false), None);
+        // 兄弟のファイル行の上 = 同じフォルダ = 何も起きない
+        let sibling = tree_drop_hover(&src, false, &w.join("b.txt"), false, false).unwrap();
+        assert_eq!(
+            (sibling.dest.clone(), sibling.verdict.clone()),
+            (w.clone(), DropVerdict::Unchanged)
+        );
+        // 別のフォルダのファイル行の上 = そのファイルのあるフォルダへ移せる
+        let into = tree_drop_hover(&src, false, &other.join("c.txt"), false, false).unwrap();
+        assert_eq!(
+            (into.dest.clone(), into.verdict.clone()),
+            (other.clone(), DropVerdict::Move)
+        );
+        // リモートの行は字面が同じでも断る
+        let remote = tree_drop_hover(&src, false, &other, true, true).unwrap();
+        assert_eq!(remote.verdict, DropVerdict::Refused(MoveRefusal::Remote));
+        // 見出しの行を掴んだら、どこへ持って行っても断る
+        let root = tree_drop_hover(&w, true, &other, true, false).unwrap();
+        assert_eq!(
+            root.verdict,
+            DropVerdict::Refused(MoveRefusal::WorkspaceRoot)
+        );
+
+        // 強調: 移せるなら落とし先の行が Target・中の行が Inside、リモートの同じ字面には出さない
+        assert_eq!(
+            tree_drop_mark(Some(&into), &other, false),
+            Some(TreeDropMark::Target)
+        );
+        assert_eq!(
+            tree_drop_mark(Some(&into), &other.join("c.txt"), false),
+            Some(TreeDropMark::Inside)
+        );
+        assert_eq!(tree_drop_mark(Some(&into), &other, true), None);
+        assert_eq!(tree_drop_mark(Some(&into), &w, false), None);
+        // 断るならカーソルの載っている行だけ（ローカルの同じ字面には出さない）
+        assert_eq!(
+            tree_drop_mark(Some(&remote), &other, true),
+            Some(TreeDropMark::Refused(MoveRefusal::Remote))
+        );
+        assert_eq!(tree_drop_mark(Some(&remote), &other, false), None);
+        // 同じ場所は何も出さない
+        assert_eq!(tree_drop_mark(Some(&sibling), &w, false), None);
+    }
 
     /// #1725: 長い名前でもキャレットと変換中の読みは必ず見え、窓からはみ出さない
     #[test]

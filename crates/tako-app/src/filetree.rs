@@ -226,6 +226,32 @@ impl FileTree {
         self.cache.retain(|p, _| !orphaned(p));
     }
 
+    /// ファイル・フォルダを移した**後**の追従（FR-3.32 / #1834）。
+    ///
+    /// 展開状態は新しい場所へ持ち越す（開いていたフォルダを移しても中身が畳まれない）。
+    /// 元の場所の読み取り結果は捨て、元の親・移動先・持ち越した展開をその場で読み直す
+    /// （2 秒ポーリングを待たずに結果を見せる = #559 と同じ扱い）。
+    /// 移動先のフォルダは開く（移したものがどこへ行ったか見える）。
+    /// ディレクトリ数個の `read_dir` なので UI スレッドで同期に呼んでよい
+    pub fn note_moved(&mut self, from: &Path, to: &Path) {
+        let carried: Vec<PathBuf> = self
+            .expanded
+            .iter()
+            .filter_map(|p| tako_core::file_move::remap(p, from, to))
+            .collect();
+        self.expanded.retain(|p| !p.starts_with(from));
+        self.cache.retain(|p, _| !p.starts_with(from));
+        let dest = to.parent().map(Path::to_path_buf);
+        for dir in carried.iter().chain(dest.iter()) {
+            self.expanded.insert(dir.clone());
+            self.cache.insert(dir.clone(), read_dir_sorted(dir));
+        }
+        if let Some(parent) = from.parent() {
+            self.refresh_dir(parent);
+        }
+        self.rows_cache = None;
+    }
+
     /// ディレクトリを展開する（既に展開中なら何もしない）
     pub fn expand_dir(&mut self, path: &Path) {
         if !self.expanded.contains(path) {
@@ -923,6 +949,46 @@ mod tests {
             .iter()
             .map(|r| (r.entry.name.clone(), r.depth, r.root))
             .collect()
+    }
+
+    /// #1834: 開いていたフォルダを移すと、移動先で開いたまま中身が見え、
+    /// 元の場所の行は消える（ポーリングを待たない）
+    #[test]
+    fn 移したフォルダは移動先で開いたまま見え元の行は消える() {
+        let scratch = empty_scratch("move-1834");
+        let dir = scratch.path().to_path_buf();
+        std::fs::create_dir_all(dir.join("folder/inner")).unwrap();
+        std::fs::write(dir.join("folder/inner/x.txt"), "x").unwrap();
+        std::fs::create_dir_all(dir.join("dst")).unwrap();
+        let mut tree = FileTree::default();
+        assert!(tree.set_roots(vec![dir.clone()]));
+        tree.toggle_dir(&dir.join("folder"));
+        tree.toggle_dir(&dir.join("folder/inner"));
+        assert!(names(&mut tree).contains(&("x.txt".to_string(), 3, false)));
+
+        std::fs::rename(dir.join("folder"), dir.join("dst/folder")).unwrap();
+        tree.note_moved(&dir.join("folder"), &dir.join("dst/folder"));
+        let rows = tree.rows();
+        let paths: Vec<PathBuf> = rows.iter().map(|r| r.entry.path.clone()).collect();
+        assert!(
+            !paths.contains(&dir.join("folder")),
+            "元の場所の行が残っている: {paths:?}"
+        );
+        for expected in [
+            dir.join("dst"),
+            dir.join("dst/folder"),
+            dir.join("dst/folder/inner"),
+            dir.join("dst/folder/inner/x.txt"),
+        ] {
+            assert!(
+                paths.contains(&expected),
+                "{} が出ていない: {paths:?}",
+                expected.display()
+            );
+        }
+        let expanded = |p: PathBuf| rows.iter().any(|r| r.entry.path == p && r.expanded);
+        assert!(expanded(dir.join("dst")), "移動先は開く");
+        assert!(expanded(dir.join("dst/folder/inner")), "展開状態を持ち越す");
     }
 
     #[test]

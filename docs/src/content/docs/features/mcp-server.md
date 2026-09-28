@@ -52,7 +52,7 @@ tako は **159 個**の MCP ツールを公開しています。全リストは 
 
 ### ファイル・プレビュー
 - `tako_open_file` — ファイルをプレビューペインで表示（コード / Markdown / 画像 / PDF / 動画）
-- `tako_file_op` — ファイル操作（パスコピー・リネーム・作成・ゴミ箱等）
+- `tako_file_op` — ファイル操作（パスコピー・リネーム・別のフォルダへ移動・作成・ゴミ箱等）
 
 ### タブ操作
 - `tako_create_tab` / `tako_select_tab` / `tako_rename_tab` / `tako_move_pane_to_tab`

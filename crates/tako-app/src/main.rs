@@ -2116,6 +2116,9 @@ struct TakoApp {
     drop_cmd_held: bool,
     /// ドラッグ中のドロップ先（ペイン, 挿入位置）。挿入プレビュー表示の状態
     drop_target: Option<(PaneId, DropZone)>,
+    /// ファイルツリー内のドラッグで、いまカーソルが載っている行と判定（FR-3.32 / #1834）。
+    /// 行をまたいだときだけ判定し直す（同名の stat を 1 行につき 1 回で済ませる）
+    tree_drop: Option<sidebar::TreeDropHover>,
     /// タブバーへのペイン D&D: ドロップ先タブ（Some(id) = 既存タブへ合流、None = 新タブ化）
     tab_drop_target: Option<Option<TabId>>,
     /// タブ D&D 並べ替え中の挿入位置インジケータ（#308）。
@@ -3405,11 +3408,21 @@ struct TmuxSessionDrag {
     window: Option<u32>,
 }
 
-/// D&D ペイロード: ファイルツリーのファイル行（FR-3.11。`on_drop` の型キー）
+/// D&D ペイロード: ファイルツリーのファイル行（FR-3.11。`on_drop` の型キー）。
+/// ペインへ落とせば開く / パスを入れる（FR-3.11 / FR-3.13）、ツリーのフォルダ行へ
+/// 落とせば移す（FR-3.32 / #1834）
 #[derive(Debug, Clone)]
 struct FileDrag {
     path: std::path::PathBuf,
+    /// ワークスペースのフォルダの見出し行から掴んだ（ツリー内の移動は断る。#1834）
+    root: bool,
 }
+
+/// D&D ペイロード: リモート（SSH）の行（#1834）。**どこにも落とせない**。
+/// 掴んだ時点で「移せない理由」をゴーストに出すためだけに持つ
+/// （リモートの行はローカルのファイルシステムの操作を通さない = #919）
+#[derive(Debug, Clone, Copy)]
+struct RemoteRowDrag;
 
 /// D&D ペイロード: ペインのタイトルバー（FR-1.10。iTerm2 流のペイン移動）
 #[derive(Debug, Clone, Copy)]
@@ -3650,6 +3663,9 @@ enum DragKind {
     Pane,
     BackgroundPane,
     Tab,
+    /// リモート（SSH）の行（#1834）。落とせる先が無いので、ペインへの
+    /// ドロップ先オーバーレイも出さない（[`drop_overlay_kind`]）
+    RemoteRow,
 }
 
 /// ドロップ先の挿入位置。上下左右 = その方向へ分割、Center = ファイル D&D のみで
@@ -3697,6 +3713,10 @@ fn external_drop_legacy() -> bool {
 /// `Entered` を出すので、ファイル以外の外部ドラッグでこの状態にはならない
 fn drop_overlay_kind(drag_kind: Option<DragKind>, has_active_drag: bool) -> Option<DragKind> {
     if !has_active_drag {
+        return None;
+    }
+    // #1834: リモートの行はどのペインにも落とせない（「ここで開く」を出すと嘘になる）
+    if drag_kind == Some(DragKind::RemoteRow) {
         return None;
     }
     Some(drag_kind.unwrap_or(DragKind::ExternalFile))
@@ -4156,6 +4176,7 @@ impl TakoApp {
             drag_kind: None,
             drop_cmd_held: false,
             drop_target: None,
+            tree_drop: None,
             tab_drop_target: None,
             tab_reorder_indicator: None,
             dragging_tab: None,
@@ -16021,6 +16042,8 @@ impl TakoApp {
                     (DragKind::Pane, _) => "この位置に移動",
                     (DragKind::BackgroundPane, _) => "ここに復帰",
                     (DragKind::Tab, _) => "この位置に移動",
+                    // #1834: `drop_overlay_kind` がオーバーレイを作らないので来ない
+                    (DragKind::RemoteRow, _) => "",
                 }
             };
             let highlight = div()
@@ -16307,6 +16330,7 @@ impl TakoApp {
                 path: target.to_string(),
                 name: None,
                 pane: Some(pane_id.as_u64()),
+                dest: None,
             },
             PaneOrigin::User,
         );
@@ -16852,6 +16876,7 @@ impl TakoApp {
         // ここはドロップ先以外で離した場合のクリア）
         if self.drag_kind.take().is_some()
             | self.drop_target.take().is_some()
+            | self.tree_drop.take().is_some()
             | self.tab_drop_target.take().is_some()
             | self.tab_reorder_indicator.take().is_some()
             | self.dragging_tab.take().is_some()
@@ -23347,6 +23372,32 @@ impl PreviewHost for TakoApp {
             .into_iter()
             .map(|p| p.id())
             .find(|id| self.previews.contains_key(id))
+    }
+
+    /// #1834: 表示と編集バッファは同じパスを指す（編集は表示の上に乗る）が、
+    /// 取りこぼさないよう両方を見て 1 ペイン 1 件にする
+    fn open_file_paths(&self) -> Vec<(PaneId, std::path::PathBuf)> {
+        let mut out: Vec<(PaneId, std::path::PathBuf)> = self
+            .previews
+            .iter()
+            .map(|(pane, state)| (*pane, state.path.clone()))
+            .collect();
+        for (pane, edit) in &self.preview_edits {
+            if !out.iter().any(|(p, _)| p == pane) {
+                out.push((*pane, edit.buffer.path().to_path_buf()));
+            }
+        }
+        out.sort_by_key(|(pane, _)| pane.as_u64());
+        out
+    }
+
+    fn file_moved(
+        &mut self,
+        from: &std::path::Path,
+        to: &std::path::Path,
+        follows: &[tako_core::file_move::Follow],
+    ) {
+        self.follow_file_move(from, to, follows);
     }
 
     fn preview_changelog_state(&self, pane: PaneId) -> Option<bool> {
@@ -41680,6 +41731,13 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1834: ツリーの行を実マウスでドラッグして移せるか・断る場所で理由が出るか・
+                // 開いているペインが付け替わるか・ペインへの既存の D&D が壊れていないか
+                "tree-move" => {
+                    tree_move_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
@@ -41689,7 +41747,7 @@ mod self_test {
                          pane-border / tasks-panel / task-attachment / \
                          tasks-accordion / shelve-tab / no-emoji / editor-keys / \
                          run-command-truncate / viewport-lines / jump-keys / search-case / goto-hover / \
-                         large-file-edit / large-file-decor / external-change / editor-font）"
+                         large-file-edit / large-file-decor / external-change / editor-font / tree-move）"
                     );
                     std::process::exit(1);
                 }
@@ -44067,6 +44125,9 @@ mod self_test {
             // #812: ペイン枠線のインクがルート側のオーバーレイ 1 枚からだけ出るか
             // （丸め角の AA 二重合成の再発防止）
             pane_border_visual(any, window, cx).await;
+
+            // #1834: ツリーの行のドラッグ＆ドロップによる移動（実マウス）
+            tree_move_visual(any, window, cx).await;
 
             // #932: ちらつきの機械検証。**最後に回す**（専用タブを作り、分割・
             // プレビュー・連続出力まで状態を動かすので、他の節の前提を壊さない）
@@ -49345,6 +49406,906 @@ mod self_test {
             cx.notify();
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1834 の道具: 1 回のドラッグで観測したもの
+    #[cfg(feature = "visual-test")]
+    struct Vt1834Drag {
+        /// 離す直前のホバー判定
+        hover: Option<crate::sidebar::TreeDropHover>,
+        /// 離す直前に gpui のドラッグが立ち、種別がツリーの行だったか
+        dragging: bool,
+        /// 離す直前の `drag_kind`
+        kind: Option<DragKind>,
+        /// 離す直前の行の実矩形
+        rows: Vec<(std::path::PathBuf, Bounds<Pixels>)>,
+        /// 離す直前のフレーム
+        frame: Option<(image::RgbaImage, f32)>,
+    }
+
+    /// #1834 の道具: ツリーの行の実矩形（`tree_row_probe` が立っているフレームで採る）
+    #[cfg(feature = "visual-test")]
+    fn vt1834_rows(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) -> Vec<(std::path::PathBuf, Bounds<Pixels>)> {
+        notify_and_draw(any, window, cx);
+        window
+            .update(cx, |app, _, _| app.tree_row_rects.borrow().clone())
+            .unwrap_or_default()
+    }
+
+    /// #1834 の道具: 行のドラッグ開始位置（左寄り = ゴーストが左に出て、右端の札と重ならない）
+    #[cfg(feature = "visual-test")]
+    fn vt1834_grab(row: Bounds<Pixels>) -> Point<Pixels> {
+        point(row.left() + px(28.0), row.center().y)
+    }
+
+    /// #1834 の道具: 画面上の 2 点のあいだを**実 OS マウスと同じ `PlatformInput` 経路**で
+    /// ドラッグする。押す → 閾値（2px）を越えて動かしてドラッグを立てる → 描く（行に受け口が
+    /// 付く）→ 落とし先へ動かす → 描く（強調が出る。ここで撮る）→ 離す。
+    /// ハンドラ直呼びでは「受け口がツリーに無い」型（#1043 と同じ根）を検出できない
+    #[cfg(feature = "visual-test")]
+    fn vt1834_drag(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        from: Point<Pixels>,
+        to: Point<Pixels>,
+    ) -> Vt1834Drag {
+        vt1834_drag_via(any, window, cx, from, &[to])
+    }
+
+    /// [`vt1834_drag`] の経由点つき版（最後の点で離す）。途中の行を通ってから戻る検査に使う
+    #[cfg(feature = "visual-test")]
+    fn vt1834_drag_via(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        from: Point<Pixels>,
+        via: &[Point<Pixels>],
+    ) -> Vt1834Drag {
+        let Some(&to) = via.last() else {
+            fail("visual-test tree-move: 経由点が無い");
+        };
+        let send = |cx: &mut AsyncApp, input: gpui::PlatformInput| {
+            let _ = any.update(cx, |_, win, cx| win.dispatch_event(input, cx));
+        };
+        let mods = Modifiers::default();
+        let moved = |position: Point<Pixels>, pressed: Option<MouseButton>| {
+            gpui::PlatformInput::MouseMove(MouseMoveEvent {
+                position,
+                pressed_button: pressed,
+                modifiers: mods,
+            })
+        };
+        send(cx, moved(from, None));
+        notify_and_draw(any, window, cx);
+        send(
+            cx,
+            gpui::PlatformInput::MouseDown(MouseDownEvent {
+                button: MouseButton::Left,
+                position: from,
+                modifiers: mods,
+                click_count: 1,
+                first_mouse: false,
+            }),
+        );
+        notify_and_draw(any, window, cx);
+        send(
+            cx,
+            moved(point(from.x + px(8.0), from.y), Some(MouseButton::Left)),
+        );
+        notify_and_draw(any, window, cx);
+        let end = point(to.x + px(1.0), to.y);
+        for step in via.iter().copied().chain([end]) {
+            send(cx, moved(step, Some(MouseButton::Left)));
+            notify_and_draw(any, window, cx);
+        }
+        let (hover, dragging, kind) = window
+            .update(cx, |app, _, cx| {
+                (app.tree_drop.clone(), cx.has_active_drag(), app.drag_kind)
+            })
+            .unwrap_or((None, false, None));
+        let rows = vt1834_rows(any, window, cx);
+        let frame = capture_frame(any, cx);
+        send(
+            cx,
+            gpui::PlatformInput::MouseUp(MouseUpEvent {
+                button: MouseButton::Left,
+                position: end,
+                modifiers: mods,
+                click_count: 1,
+            }),
+        );
+        notify_and_draw(any, window, cx);
+        Vt1834Drag {
+            hover,
+            dragging,
+            kind,
+            rows,
+            frame,
+        }
+    }
+
+    /// #1834 の道具: 行の右端の帯（札が出る場所）で `color` に近い画素が `before` から
+    /// いくつ増えたか。上下の向きは多い方を採る（読み戻しの向きは機で変わる = #812）
+    #[cfg(feature = "visual-test")]
+    fn vt1834_gain(
+        before: &image::RgbaImage,
+        after: &image::RgbaImage,
+        row: Bounds<Pixels>,
+        scale: f32,
+        color: tako_core::Rgb,
+    ) -> usize {
+        let band = Bounds::new(
+            point(row.right() - px(110.0), row.top()),
+            size(px(110.0), row.size.height),
+        );
+        [false, true]
+            .into_iter()
+            .map(|flip| {
+                color_pixels_in_bounds(after, band, scale, color, 14, flip)
+                    .saturating_sub(color_pixels_in_bounds(before, band, scale, color, 14, flip))
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// ファイルツリーのドラッグ＆ドロップによる移動（FR-3.32 / #1834）を**実マウスで**確かめる。
+    ///
+    /// ①ファイルを移す（札が出る・行が跳ねない・開いている編集ペインが付け替わり、未保存の
+    /// 本文が残り、待っても「外で削除された」の帯が出ない）②自分の配下へ ③同名 ④同じ場所
+    /// ⑤掴んだ行へ戻す ⑥見出し行 ⑦フォルダごと（配下の付け替え・展開の持ち越し）⑧日本語と
+    /// 空白 ⑨言語サーバの文書の付け替え（偽サーバを差したときだけ）⑩リモートの行
+    /// ⑪⑫ペインへの既存の D&D（分割して開く / パスを入れる）⑬別のタブを表示中の移動。
+    ///
+    /// 判定は新しい挙動を無条件に主張する。`TAKO_1834_LEGACY=1` は付け替えを外すので
+    /// ① が FAILED になる = 同一バイナリでの A/B。単独実行は `TAKO_VISUAL_ONLY=tree-move`
+    #[cfg(feature = "visual-test")]
+    async fn tree_move_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        use tako_control::protocol::{Direction, PreviewModeWire, Request as Req};
+        use tako_core::file_move::{DropVerdict, MoveRefusal};
+        inject_section_failure("tree-move");
+        let p0 = ensure_fresh_scene(window, cx, "tree-move").await;
+        let wait =
+            |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+
+        // --- 場面: 一時 dir の中だけに fixture を作る（本物のファイルを動かさない = #1811） ---
+        let tmp = tako_core::platform::path::canonicalize_or_self(&std::env::temp_dir());
+        let raw = tmp.join(format!("tako-vt1834-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&raw);
+        for dir in ["src", "folder/inner", "dst", "taken", "日本 語"] {
+            std::fs::create_dir_all(raw.join(dir)).expect("visual-test tree-move fixture");
+        }
+        let base = tako_core::platform::path::canonicalize_or_self(&raw);
+        if !base.starts_with(&tmp) || base == tmp {
+            fail(&format!(
+                "visual-test tree-move: fixture が一時 dir の外 ({})",
+                base.display()
+            ));
+        }
+        let at = |rel: &str| base.join(rel);
+        for (rel, body) in [
+            ("Cargo.toml", "[package]\nname = \"vt1834\"\n"),
+            ("src/a.txt", "A\n"),
+            ("src/b.md", "# b\n"),
+            ("src/c.txt", "C\n"),
+            ("src/d.txt", "D\n"),
+            ("src/e.txt", "E\n"),
+            ("src/lib.rs", "pub fn f() {}\n"),
+            ("folder/inner/x.txt", "X\n"),
+            ("taken/a.txt", "既存\n"),
+        ] {
+            std::fs::write(at(rel), body).expect("visual-test tree-move fixture");
+        }
+        let lsp_log = std::env::var("TAKO_LSP_FAKE_LOG").ok();
+        let lsp_fake =
+            std::env::var_os("TAKO_LSP_BIN_RUST_ANALYZER").is_some() && lsp_log.is_some();
+
+        let tab = window
+            .update(cx, |app, _, cx| {
+                app.drawer_visible = false;
+                app.panel_visible = false;
+                app.filetree.visible = true;
+                let tab = app.workspace.active_tab_id();
+                if let Some(t) = app.workspace.get_tab_mut(tab) {
+                    t.add_pinned_folder(base.clone());
+                }
+                app.sync_filetree_roots();
+                // 他のルート（ペインの cwd）は畳む: 行が多いと fixture がリストの外へ出る
+                for r in app.filetree.rows() {
+                    if r.root && r.expanded && r.entry.path != base {
+                        app.filetree.toggle_dir(&r.entry.path);
+                    }
+                }
+                app.filetree.expand_dir(&base);
+                for rel in ["src", "folder", "folder/inner", "taken"] {
+                    app.filetree.expand_dir(&base.join(rel));
+                }
+                app.tree_row_probe = true;
+                app.remote_notice = None;
+                cx.notify();
+                tab
+            })
+            .unwrap_or_else(|_| fail("visual-test tree-move: 場面づくり"));
+
+        // 開いておくペイン: a.txt（編集・未保存・自動保存 OFF）/ x.txt（表示だけ）/
+        // lib.rs（偽の言語サーバを差したときだけ編集モード = didOpen が走る）
+        let open = |cx: &mut AsyncApp, anchor: PaneId, path: std::path::PathBuf, dir: Direction| {
+            window
+                .update(cx, |app, _, cx| {
+                    let r = tako_control::dispatch(
+                        app,
+                        Req::OpenFile {
+                            pane: Some(anchor.as_u64()),
+                            path: path.display().to_string(),
+                            mode: Some(PreviewModeWire::Code),
+                            direction: Some(dir),
+                            focus: Some(false),
+                            new_tab: false,
+                            line: None,
+                            column: None,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    cx.notify();
+                    r.ok()
+                        .and_then(|v| v["pane"].as_u64())
+                        .map(PaneId::from_raw)
+                })
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| {
+                    fail(&format!(
+                        "visual-test tree-move: {} を開けない",
+                        path.display()
+                    ))
+                })
+        };
+        let run = |cx: &mut AsyncApp, request: Req| {
+            window
+                .update(cx, |app, _, cx| {
+                    let r = tako_control::dispatch(app, request, PaneOrigin::Cli);
+                    cx.notify();
+                    r
+                })
+                .unwrap_or_else(|_| fail("visual-test tree-move: dispatch"))
+        };
+        let pv_a = open(cx, p0, at("src/a.txt"), Direction::Right);
+        let edit_ok = run(
+            cx,
+            Req::PreviewEdit {
+                pane: Some(pv_a.as_u64()),
+                enabled: Some(true),
+            },
+        )
+        .is_ok()
+            && run(
+                cx,
+                Req::PreviewAutosave {
+                    pane: Some(pv_a.as_u64()),
+                    enabled: Some(false),
+                },
+            )
+            .is_ok()
+            && run(
+                cx,
+                Req::PreviewApply {
+                    pane: Some(pv_a.as_u64()),
+                    text: "A\nunsaved\n".into(),
+                },
+            )
+            .is_ok();
+        check(
+            edit_ok,
+            "visual-test tree-move: a.txt を編集中・未保存にする（前提。#1834）",
+        );
+        let pv_x = open(cx, pv_a, at("folder/inner/x.txt"), Direction::Down);
+        let pv_rs = lsp_fake.then(|| {
+            let pane = open(cx, pv_x, at("src/lib.rs"), Direction::Down);
+            let _ = run(
+                cx,
+                Req::PreviewEdit {
+                    pane: Some(pane.as_u64()),
+                    enabled: Some(true),
+                },
+            );
+            pane
+        });
+        wait(cx, 400).await;
+
+        // 観測の道具
+        let observe = |cx: &mut AsyncApp, pane: PaneId| {
+            window
+                .update(cx, |app, _, _| {
+                    let path = app.previews.get(&pane).map(|s| s.path.clone());
+                    let edit = app.preview_edits.get(&pane).map(|e| {
+                        (
+                            e.buffer.path().to_path_buf(),
+                            e.buffer.text().to_string(),
+                            e.dirty(),
+                            e.conflict.map(|c| c.state),
+                        )
+                    });
+                    (path, edit)
+                })
+                .unwrap_or((None, None))
+        };
+        let notice = |cx: &mut AsyncApp| {
+            window
+                .update(cx, |app, _, _| {
+                    app.remote_notice.as_ref().map(|n| n.text.clone())
+                })
+                .ok()
+                .flatten()
+        };
+        let clear_notice = |cx: &mut AsyncApp| {
+            let _ = window.update(cx, |app, _, cx| {
+                app.remote_notice = None;
+                cx.notify();
+            });
+        };
+        let rect_of = |rows: &[(std::path::PathBuf, Bounds<Pixels>)], path: &std::path::Path| {
+            rows.iter().find(|(p, _)| p == path).map(|(_, b)| *b)
+        };
+        let theme = window
+            .update(cx, |app, _, _| app.theme.clone())
+            .unwrap_or_else(|_| fail("visual-test tree-move: テーマ"));
+        let base_frame = |cx: &mut AsyncApp| {
+            capture_frame(any, cx).unwrap_or_else(|| fail("visual-test tree-move: 基準フレーム"))
+        };
+        // 1 回ぶんのドラッグ（行 → 行）
+        let drag_rows = |cx: &mut AsyncApp, from: &std::path::Path, to: &std::path::Path| {
+            let rows = vt1834_rows(any, window, cx);
+            let (Some(src), Some(dst)) = (rect_of(&rows, from), rect_of(&rows, to)) else {
+                fail(&format!(
+                    "visual-test tree-move: 行が描かれていない（{} → {}）",
+                    from.display(),
+                    to.display()
+                ));
+            };
+            let (before, scale) = base_frame(cx);
+            let drag = vt1834_drag(any, window, cx, vt1834_grab(src), vt1834_grab(dst));
+            (rows, before, scale, dst, drag)
+        };
+        let pill_th = |scale: f32| (40.0 * scale) as usize;
+
+        // ① ファイルを移す（編集中・未保存のペインが付け替わる）
+        let (rows1, before1, scale1, dst_row, drag1) = drag_rows(cx, &at("src/a.txt"), &at("dst"));
+        check(
+            drag1.dragging && drag1.kind == Some(DragKind::File),
+            "visual-test tree-move ①: 実マウスでツリーの行のドラッグが立つ (#1834)",
+        );
+        check(
+            drag1.hover.as_ref().map(|h| (&h.verdict, h.dest.clone()))
+                == Some((&DropVerdict::Move, at("dst"))),
+            &format!(
+                "visual-test tree-move ①: フォルダ行の上で「移せる」判定になる (#1834。hover={:?})",
+                drag1.hover
+            ),
+        );
+        let gain1 = drag1
+            .frame
+            .as_ref()
+            .map(|(f, _)| vt1834_gain(&before1, f, dst_row, scale1, theme.accent))
+            .unwrap_or(0);
+        println!(
+            "TAKO_VISUAL_PIXEL: tree-move ① target accent_gain={gain1} th={}",
+            pill_th(scale1)
+        );
+        check(
+            gain1 >= pill_th(scale1),
+            &format!(
+                "visual-test tree-move ①: 落とし先の行に「ここへ移動」の札が描かれる (#1834。gain={gain1})"
+            ),
+        );
+        let jitter: Vec<String> = rows1
+            .iter()
+            .filter_map(|(p, b)| {
+                rect_of(&drag1.rows, p)
+                    .filter(|d| d != b)
+                    .map(|d| format!("{} {b:?}→{d:?}", p.display()))
+            })
+            .collect();
+        check(
+            jitter.is_empty(),
+            &format!(
+                "visual-test tree-move ①: 強調を出しても行が 1px も動かない (#1834。{})",
+                jitter.join(" / ")
+            ),
+        );
+        let rows_after = vt1834_rows(any, window, cx);
+        check(
+            at("dst/a.txt").is_file() && !at("src/a.txt").exists(),
+            "visual-test tree-move ①: ドロップでファイルが移る (#1834)",
+        );
+        check(
+            rect_of(&rows_after, &at("dst/a.txt")).is_some()
+                && rect_of(&rows_after, &at("src/a.txt")).is_none(),
+            "visual-test tree-move ①: ツリーが移動先の行を出し、元の行を消す（ポーリングを待たない。#1834）",
+        );
+        let follow1 = |cx: &mut AsyncApp| {
+            let (path, edit) = observe(cx, pv_a);
+            path == Some(at("dst/a.txt"))
+                && edit.as_ref().is_some_and(|(p, text, dirty, conflict)| {
+                    *p == at("dst/a.txt") && text == "A\nunsaved\n" && *dirty && conflict.is_none()
+                })
+        };
+        check(
+            follow1(cx),
+            &format!(
+                "visual-test tree-move ①: 編集中のペインが新しいパスへ付け替わり、未保存の本文が残る (#1834。{:?})",
+                observe(cx, pv_a)
+            ),
+        );
+        // 監視の知らせ（300ms のデバウンス + 読み直し）が届くまで待っても削除扱いにならない
+        wait(cx, 1500).await;
+        notify_and_draw(any, window, cx);
+        check(
+            follow1(cx),
+            &format!(
+                "visual-test tree-move ①: 待っても「外で削除された」の帯が出ない (#1834 × #1659。{:?})",
+                observe(cx, pv_a)
+            ),
+        );
+        check(
+            std::fs::read_to_string(at("dst/a.txt")).ok().as_deref() == Some("A\n"),
+            "visual-test tree-move ①: 移動は保存しない（ディスクは移す前の中身のまま。#1834）",
+        );
+
+        // ② 自分の配下へ
+        clear_notice(cx);
+        let (_, before2, scale2, inner_row, drag2) =
+            drag_rows(cx, &at("folder"), &at("folder/inner"));
+        let verdict2 = drag2.hover.as_ref().map(|h| h.verdict.clone());
+        let gain2 = drag2
+            .frame
+            .as_ref()
+            .map(|(f, _)| vt1834_gain(&before2, f, inner_row, scale2, theme.red))
+            .unwrap_or(0);
+        println!("TAKO_VISUAL_PIXEL: tree-move ② refused red_gain={gain2} verdict={verdict2:?}");
+        check(
+            verdict2 == Some(DropVerdict::Refused(MoveRefusal::IntoDescendant)) && gain2 >= pill_th(scale2),
+            &format!("visual-test tree-move ②: 自分の配下の行に「移せない」の札が出る (#1834。gain={gain2})"),
+        );
+        let n2 = notice(cx).unwrap_or_default();
+        check(
+            n2.contains("配下") && at("folder/inner/x.txt").is_file(),
+            &format!(
+                "visual-test tree-move ②: 落とすと理由が出て何も動かない (#1834。notice={n2:?})"
+            ),
+        );
+
+        // ③ 同名（上書きしない）
+        clear_notice(cx);
+        let (_, before3, scale3, taken_row, drag3) = drag_rows(cx, &at("dst/a.txt"), &at("taken"));
+        let verdict3 = drag3.hover.as_ref().map(|h| h.verdict.clone());
+        let gain3 = drag3
+            .frame
+            .as_ref()
+            .map(|(f, _)| vt1834_gain(&before3, f, taken_row, scale3, theme.red))
+            .unwrap_or(0);
+        check(
+            verdict3 == Some(DropVerdict::Refused(MoveRefusal::NameTaken)) && gain3 >= pill_th(scale3),
+            &format!("visual-test tree-move ③: 同名がある行に「移せない」の札が出る (#1834。gain={gain3})"),
+        );
+        let n3 = notice(cx).unwrap_or_default();
+        check(
+            n3.contains("同じ名前")
+                && std::fs::read_to_string(at("taken/a.txt")).ok().as_deref() == Some("既存\n")
+                && at("dst/a.txt").is_file(),
+            &format!(
+                "visual-test tree-move ③: 落とすと理由が出て上書きしない (#1834。notice={n3:?})"
+            ),
+        );
+
+        // ④ 同じ場所（何も起きない）
+        clear_notice(cx);
+        let (_, before4, scale4, dst_row4, drag4) = drag_rows(cx, &at("dst/a.txt"), &at("dst"));
+        let quiet4 = drag4.frame.as_ref().map(|(f, _)| {
+            vt1834_gain(&before4, f, dst_row4, scale4, theme.accent)
+                + vt1834_gain(&before4, f, dst_row4, scale4, theme.red)
+        });
+        check(
+            drag4.hover.as_ref().map(|h| h.verdict.clone()) == Some(DropVerdict::Unchanged)
+                && quiet4.is_some_and(|g| g < pill_th(scale4) / 4),
+            &format!(
+                "visual-test tree-move ④: 同じ場所では札を出さない (#1834。{:?} gain={quiet4:?})",
+                drag4.hover
+            ),
+        );
+        check(
+            notice(cx).is_none() && at("dst/a.txt").is_file(),
+            "visual-test tree-move ④: 同じ場所へ落としても何も起きない (#1834)",
+        );
+
+        // ⑤ 掴んだ行へ戻す（取り消し）
+        let rows5 = vt1834_rows(any, window, cx);
+        if let (Some(src5), Some(other5)) =
+            (rect_of(&rows5, &at("dst")), rect_of(&rows5, &at("taken")))
+        {
+            // 別の行（移せる先）を通ってから掴んだ行へ戻って離す
+            let drag5 = vt1834_drag_via(
+                any,
+                window,
+                cx,
+                vt1834_grab(src5),
+                &[vt1834_grab(other5), vt1834_grab(src5)],
+            );
+            check(
+                drag5.hover.is_none()
+                    && notice(cx).is_none()
+                    && at("dst/a.txt").is_file()
+                    && !at("taken/dst").exists(),
+                &format!(
+                    "visual-test tree-move ⑤: 掴んだ行で離すと何も起きない (#1834。{:?})",
+                    drag5.hover
+                ),
+            );
+        } else {
+            fail("visual-test tree-move ⑤: 行が描かれていない");
+        }
+        clear_notice(cx);
+
+        // ⑥ 見出し行（ワークスペースのフォルダ）は移せない
+        let (_, _, _, _, drag6) = drag_rows(cx, &base, &at("dst"));
+        let n6 = notice(cx).unwrap_or_default();
+        check(
+            drag6.hover.as_ref().map(|h| h.verdict.clone())
+                == Some(DropVerdict::Refused(MoveRefusal::WorkspaceRoot))
+                && !n6.is_empty()
+                && base.is_dir()
+                && !at("dst")
+                    .join(base.file_name().unwrap_or_default())
+                    .exists(),
+            &format!("visual-test tree-move ⑥: 見出し行は移さず理由が出る (#1834。notice={n6:?})"),
+        );
+        clear_notice(cx);
+
+        // ⑦ フォルダごと移す（配下を開いているペインの付け替え・展開の持ち越し）
+        let (_, _, _, _, drag7) = drag_rows(cx, &at("folder"), &at("dst"));
+        let rows7 = vt1834_rows(any, window, cx);
+        let (x_path, _) = observe(cx, pv_x);
+        check(
+            drag7.hover.as_ref().map(|h| h.verdict.clone()) == Some(DropVerdict::Move)
+                && at("dst/folder/inner/x.txt").is_file()
+                && !at("folder").exists(),
+            "visual-test tree-move ⑦: フォルダがドロップで移る (#1834)",
+        );
+        check(
+            x_path == Some(at("dst/folder/inner/x.txt")),
+            &format!("visual-test tree-move ⑦: 配下のファイルを開いているペインが付け替わる (#1834。{x_path:?})"),
+        );
+        check(
+            rect_of(&rows7, &at("dst/folder/inner/x.txt")).is_some(),
+            "visual-test tree-move ⑦: 開いていたフォルダは移動先でも開いたまま (#1834)",
+        );
+
+        // ⑧ 日本語と空白を含むフォルダへ
+        let _ = drag_rows(cx, &at("src/b.md"), &at("日本 語"));
+        check(
+            at("日本 語/b.md").is_file() && !at("src/b.md").exists(),
+            "visual-test tree-move ⑧: 日本語と空白を含むフォルダへ移せる (#1834)",
+        );
+
+        // ⑨ 言語サーバの文書が URI ごと付け替わる（偽サーバを差したときだけ）
+        match (pv_rs, lsp_log.as_ref().filter(|_| lsp_fake)) {
+            (Some(pane), Some(log)) => {
+                let linked = |cx: &mut AsyncApp| {
+                    window
+                        .update(cx, |app, _, _| {
+                            app.preview_edits
+                                .get(&pane)
+                                .is_some_and(|e| matches!(e.lsp, tako_control::lsp::DocLink::Open(_)))
+                        })
+                        .unwrap_or(false)
+                };
+                let mut opened = false;
+                for _ in 0..50 {
+                    let text = std::fs::read_to_string(log).unwrap_or_default();
+                    if linked(cx) && text.contains("textDocument/didOpen") {
+                        opened = true;
+                        break;
+                    }
+                    wait(cx, 100).await;
+                }
+                check(opened, "visual-test tree-move ⑨: 移す前に言語サーバが文書を開く（前提。#1834）");
+                let _ = drag_rows(cx, &at("src/lib.rs"), &at("dst"));
+                let mut swapped = false;
+                let mut tail = String::new();
+                for _ in 0..50 {
+                    let text = std::fs::read_to_string(log).unwrap_or_default();
+                    let closed_old = text.lines().any(|l| {
+                        l.contains("textDocument/didClose") && l.contains("/src/lib.rs")
+                    });
+                    let opened_new = text.lines().any(|l| {
+                        l.contains("textDocument/didOpen") && l.contains("/dst/lib.rs")
+                    });
+                    tail = text.lines().rev().take(4).collect::<Vec<_>>().join(" | ");
+                    if closed_old && opened_new && linked(cx) {
+                        swapped = true;
+                        break;
+                    }
+                    wait(cx, 100).await;
+                }
+                println!("TAKO_VISUAL_PIXEL: tree-move ⑨ lsp swapped={swapped}");
+                check(
+                    swapped,
+                    &format!("visual-test tree-move ⑨: 言語サーバへ旧 URI の didClose と新 URI の didOpen が届く (#1834。tail={tail:.300})"),
+                );
+            }
+            _ => println!(
+                "TAKO_VISUAL_PIXEL: tree-move ⑨ 未実測（偽の言語サーバ TAKO_LSP_BIN_RUST_ANALYZER / TAKO_LSP_FAKE_LOG が無い）"
+            ),
+        }
+
+        // ⑩ リモートの行: 落とし先にならない / 掴んでもペインへの落とし先を出さない
+        clear_notice(cx);
+        let remote_root = tako_core::remote_fs::RemoteRef::new("visualhost", "/srv/vt1834");
+        let _ = window.update(cx, |app, _, cx| {
+            if let Some(t) = app.workspace.get_tab_mut(tab) {
+                t.add_remote_folder(tako_core::remote_fs::RemoteFolder::auto(
+                    remote_root.clone(),
+                ));
+            }
+            app.sync_filetree_roots();
+            app.filetree.apply_remote_dir(
+                remote_root.clone(),
+                Ok(vec![tako_core::remote_fs::RemoteEntry {
+                    name: "remote-dir".into(),
+                    path: "/srv/vt1834/remote-dir".into(),
+                    kind: tako_core::remote_fs::RemoteKind::Dir,
+                    size: 0,
+                }]),
+            );
+            cx.notify();
+        });
+        notify_and_draw(any, window, cx);
+        let remote_rect = window
+            .update(cx, |app, _, _| {
+                let handle = app.filetree_scroll_handle.clone();
+                let offset_y = handle.offset().y;
+                app.filetree
+                    .rows()
+                    .iter()
+                    .position(|r| r.remote.is_some() && !r.root && r.entry.name == "remote-dir")
+                    .and_then(|i| handle.bounds_for_item(i))
+                    .map(|mut b| {
+                        b.origin.y += offset_y;
+                        b
+                    })
+            })
+            .ok()
+            .flatten();
+        let rows10 = vt1834_rows(any, window, cx);
+        match (remote_rect, rect_of(&rows10, &at("dst/a.txt"))) {
+            (Some(remote), Some(local)) => {
+                let (before10, scale10) = base_frame(cx);
+                let drag10 = vt1834_drag(any, window, cx, vt1834_grab(local), vt1834_grab(remote));
+                let gain10 = drag10
+                    .frame
+                    .as_ref()
+                    .map(|(f, _)| vt1834_gain(&before10, f, remote, scale10, theme.red))
+                    .unwrap_or(0);
+                check(
+                    drag10.hover.as_ref().map(|h| h.verdict.clone())
+                        == Some(DropVerdict::Refused(MoveRefusal::Remote))
+                        && gain10 >= pill_th(scale10),
+                    &format!("visual-test tree-move ⑩: リモートの行に「移せない」の札が出る (#1834。gain={gain10} {:?})", drag10.hover),
+                );
+                let n10 = notice(cx).unwrap_or_default();
+                check(
+                    n10.contains("リモート") && at("dst/a.txt").is_file(),
+                    &format!("visual-test tree-move ⑩: リモートの行へ落とすと理由が出て何も動かない (#1834。notice={n10:?})"),
+                );
+                // リモートの行を掴んでペインの上へ運ぶ: 種別は RemoteRow、ペインの落とし先は出ない。
+                // 通知の帯はツリーの上に出て行を押し下げるので、消してから測り直す
+                clear_notice(cx);
+                notify_and_draw(any, window, cx);
+                let remote = window
+                    .update(cx, |app, _, _| {
+                        let handle = app.filetree_scroll_handle.clone();
+                        let offset_y = handle.offset().y;
+                        app.filetree
+                            .rows()
+                            .iter()
+                            .position(|r| {
+                                r.remote.is_some() && !r.root && r.entry.name == "remote-dir"
+                            })
+                            .and_then(|i| handle.bounds_for_item(i))
+                            .map(|mut b| {
+                                b.origin.y += offset_y;
+                                b
+                            })
+                    })
+                    .ok()
+                    .flatten()
+                    .unwrap_or(remote);
+                let pane_center = window
+                    .update(cx, |app, _, _| app.pane_last_text_areas.get(&p0).copied())
+                    .ok()
+                    .flatten()
+                    .map(|b| b.center());
+                if let Some(center) = pane_center {
+                    let drag = vt1834_drag(any, window, cx, vt1834_grab(remote), center);
+                    let target = window
+                        .update(cx, |app, _, _| app.drop_target)
+                        .ok()
+                        .flatten();
+                    check(
+                        drag.kind == Some(DragKind::RemoteRow) && target.is_none(),
+                        &format!("visual-test tree-move ⑩: リモートの行を掴んでもペインの落とし先を出さない (#1834。kind={:?})", drag.kind),
+                    );
+                } else {
+                    fail("visual-test tree-move ⑩: 端末ペインの矩形が採れない");
+                }
+            }
+            other => fail(&format!(
+                "visual-test tree-move ⑩: 行が描かれていない ({other:?})"
+            )),
+        }
+        let _ = window.update(cx, |app, _, cx| {
+            if let Some(t) = app.workspace.get_tab_mut(tab) {
+                t.remove_remote_folder(&remote_root);
+            }
+            app.sync_filetree_roots();
+            app.remote_notice = None;
+            cx.notify();
+        });
+
+        // ⑪ 既存の D&D: ターミナルペインの右端へ落とすと分割して開く（FR-3.11）
+        let area = window
+            .update(cx, |app, _, _| app.pane_last_text_areas.get(&p0).copied())
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| fail("visual-test tree-move ⑪: 端末ペインの矩形が採れない"));
+        let rows11 = vt1834_rows(any, window, cx);
+        let before_panes = window
+            .update(cx, |app, _, _| app.previews.len())
+            .unwrap_or(0);
+        let edge = point(area.right() - px(6.0), area.center().y);
+        match rect_of(&rows11, &at("src/c.txt")) {
+            Some(c) => {
+                let _ = vt1834_drag(any, window, cx, vt1834_grab(c), edge);
+                wait(cx, 300).await;
+                let opened = window
+                    .update(cx, |app, _, _| {
+                        (
+                            app.previews.len(),
+                            app.previews.values().any(|s| s.path == at("src/c.txt")),
+                        )
+                    })
+                    .unwrap_or((0, false));
+                check(
+                    opened == (before_panes + 1, true) && at("src/c.txt").is_file(),
+                    &format!("visual-test tree-move ⑪: ペインの端へ落とすと分割して開く・移さない（FR-3.11 の非回帰。{opened:?}）"),
+                );
+            }
+            None => fail("visual-test tree-move ⑪: c.txt の行が描かれていない"),
+        }
+
+        // ⑫ 既存の D&D: ターミナルペインの中央へ落とすとパスが入る（FR-3.13）
+        let area = window
+            .update(cx, |app, _, _| app.pane_last_text_areas.get(&p0).copied())
+            .ok()
+            .flatten()
+            .unwrap_or(area);
+        let rows12 = vt1834_rows(any, window, cx);
+        match rect_of(&rows12, &at("src/d.txt")) {
+            Some(d) => {
+                let _ = vt1834_drag(any, window, cx, vt1834_grab(d), area.center());
+                let mut inserted = false;
+                for _ in 0..50 {
+                    let screen = window
+                        .update(cx, |app, _, _| {
+                            app.terminals
+                                .get(&p0)
+                                .map(|s| {
+                                    s.visible_lines()
+                                        .iter()
+                                        .map(|l| l.trim_end())
+                                        .collect::<String>()
+                                })
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default();
+                    if screen.contains("src/d.txt") {
+                        inserted = true;
+                        break;
+                    }
+                    wait(cx, 100).await;
+                }
+                check(
+                    inserted && at("src/d.txt").is_file(),
+                    "visual-test tree-move ⑫: ターミナルの中央へ落とすとパスが入る・移さない（FR-3.13 の非回帰）",
+                );
+            }
+            None => fail("visual-test tree-move ⑫: d.txt の行が描かれていない"),
+        }
+
+        // ⑬ 別のタブ（別のワークスペースのフォルダ）を表示している間の移動（CLI / MCP と同じ口）。
+        // 別のタブのフォルダは fixture の外（兄弟の dir）に置く
+        let elsewhere = tmp.join(format!("tako-vt1834-other-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&elsewhere);
+        let other_ok = window
+            .update(cx, |app, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    Req::TabNew {
+                        title: None,
+                        focus: Some(true),
+                        cwd: Some(elsewhere.display().to_string()),
+                    },
+                    PaneOrigin::User,
+                );
+                let _ = app.attach_pending_sessions(cx);
+                app.sync_filetree_roots();
+                let r = tako_control::dispatch(
+                    app,
+                    Req::FileOp {
+                        op: tako_control::protocol::FileOpKind::Move,
+                        path: at("src/e.txt").display().to_string(),
+                        name: None,
+                        pane: None,
+                        dest: Some(at("dst").display().to_string()),
+                    },
+                    PaneOrigin::Cli,
+                );
+                let shown_elsewhere = app
+                    .filetree
+                    .rows()
+                    .iter()
+                    .any(|r| r.entry.path.starts_with(&base) && !r.root);
+                let _ = app.workspace.activate_tab(tab);
+                app.sync_filetree_roots();
+                // タブを切り替えると展開状態は畳まれる（既存の挙動 = ルートの外は捨てる）ので、
+                // 戻ってから開き直して、古い読み取り結果が残っていないことを見る
+                app.filetree.expand_dir(&base.join("src"));
+                app.filetree.expand_dir(&base.join("dst"));
+                cx.notify();
+                r.is_ok() && !shown_elsewhere
+            })
+            .unwrap_or(false);
+        let rows13 = vt1834_rows(any, window, cx);
+        check(
+            other_ok
+                && at("dst/e.txt").is_file()
+                && rect_of(&rows13, &at("dst/e.txt")).is_some()
+                && rect_of(&rows13, &at("src/e.txt")).is_none(),
+            "visual-test tree-move ⑬: 別のタブを表示中に移しても落ちず、戻ると移動先に出る (#1834)",
+        );
+        let _ = std::fs::remove_dir_all(&elsewhere);
+
+        let dump = std::env::var("TAKO_VISUAL_DUMP_DIR").ok();
+        if let (Some(dump), Some((frame, _))) = (dump, drag1.frame.as_ref()) {
+            let _ = frame.save(std::path::Path::new(&dump).join("tree-move-target.png"));
+            if let Some((f, _)) = drag2.frame.as_ref() {
+                let _ = f.save(std::path::Path::new(&dump).join("tree-move-refused.png"));
+            }
+        }
+        println!("TAKO_VISUAL_PIXEL: tree-move ok");
+
+        // 後片付け: 編集を捨て、fixture とピン留めを外す
+        let _ = window.update(cx, |app, _, cx| {
+            for pane in [Some(pv_a), Some(pv_x), pv_rs].into_iter().flatten() {
+                app.preview_edits.remove(&pane);
+            }
+            if let Some(t) = app.workspace.get_tab_mut(tab) {
+                t.remove_pinned_folder(&base);
+            }
+            app.tree_row_probe = false;
+            app.sync_filetree_roots();
+            cx.notify();
+        });
+        if base.starts_with(&tmp) && base != tmp {
+            let _ = std::fs::remove_dir_all(&base);
+        }
     }
 
     /// 検索欄のトグルを**実マウスで**押すと条件が切り替わり、件数が変わるか（#1653）。
@@ -84404,6 +85365,8 @@ mod scroll_tests {
         ] {
             assert_eq!(drop_overlay_kind(Some(kind), true), Some(kind));
         }
+        // #1834: リモートの行はどのペインにも落とせないのでオーバーレイを出さない
+        assert_eq!(drop_overlay_kind(Some(DragKind::RemoteRow), true), None);
     }
 
     #[test]

@@ -1222,18 +1222,21 @@ pub fn tools() -> Vec<Value> {
                 trash = ゴミ箱へ移動（復元できる）/ open_default = デフォルトアプリで開く /\n\
                 open_with = name のアプリで開く /\n\
                 open_in_tako = tako の中で開く（ファイル = プレビューペイン / ディレクトリ = そこのシェル。\
-                ターミナル内のパスリンクの{lc}・修飾 + 右クリックメニューと同じ動作）。\n\
-                rename / create_file / create_dir / open_with は name が必須。", lc = link_click()),
+                ターミナル内のパスリンクの{lc}・修飾 + 右クリックメニューと同じ動作）/\n\
+                move = dest のフォルダへ移す（ツリーの D&D と同じ。同名・自分の配下・別のボリュームは断る。\
+                開いているペインは新しいパスへ付け替わる）。\n\
+                rename / create_file / create_dir / open_with は name、move は dest が必須。", lc = link_click()),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "op": {
                         "type": "string",
-                        "enum": ["copy_absolute_path","copy_relative_path","reveal","open_terminal","rename","create_file","create_dir","trash","open_default","open_with","open_in_tako"],
+                        "enum": ["copy_absolute_path","copy_relative_path","reveal","open_terminal","rename","create_file","create_dir","trash","open_default","open_with","open_in_tako","move"],
                         "description": "操作種別",
                     },
                     "path": { "type": "string", "description": "対象のファイル・フォルダパス（必須）" },
                     "name": { "type": "string", "description": "新しい名前 / アプリ名" },
+                    "dest": { "type": "string", "description": "move の移動先フォルダ" },
                     "pane": pane_schema("対象ペイン ID（open_terminal の cd 先 / copy_relative_path の基準 / open_in_tako の分割元。省略時は呼び出し元）"),
                 },
                 "required": ["op", "path"],

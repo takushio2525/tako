@@ -933,6 +933,10 @@ pub enum Request {
         path: String,
         name: Option<String>,
         pane: Option<u64>,
+        /// 移動先のフォルダ（`op = move` のときだけ使う。FR-3.32 / #1834）。
+        /// 省略時は wire に現れない（旧クライアントの JSON がそのまま通る）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dest: Option<String>,
     },
     /// git ログ取得（FR-3.6 git graph）。`pane` の cwd のリポジトリのコミット一覧・
     /// ブランチ・status を返す。`max_count` は取得上限（省略時 200）
@@ -2689,6 +2693,11 @@ pub enum FileOpKind {
     /// 振り分けなので、開く側の作法（プレビュー再利用の有無・cwd の渡し方）は
     /// それぞれの Request が正のまま
     OpenInTako,
+    /// **別のフォルダへ移す**（FR-3.32 / #1834）。`dest`（移動先のフォルダ）必須。
+    /// 判定と実行は `tako_core::file_move` の 1 実装で、同名・自分の配下・別のボリュームは
+    /// 理由を返して断る。移したファイル（フォルダならその配下）を開いているペインは
+    /// 新しいパスへ付け替わる（ファイルツリーの D&D もここを通る）
+    Move,
 }
 
 #[cfg(test)]
