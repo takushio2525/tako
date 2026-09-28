@@ -2354,9 +2354,17 @@ struct TakoApp {
     preview_text_layouts: HashMap<PaneId, Vec<Option<TextLayout>>>,
     /// プレビュー本文の仮想リスト状態（コード = #821 / Markdown = #826）。
     /// 可変高（折り返し・表・コードブロック）を GPUI 側が実測して持つので、
-    /// 見た目を変えずに可視部分だけ描ける。値は (状態, 中身の種別, 構築時の item 数) で、
-    /// **種別か item 数が変われば作り直す**（同じ行数で code ⇄ md が入れ替わる事故を防ぐ）
-    preview_body_lists: HashMap<PaneId, (gpui::ListState, PreviewBodyKind, usize)>,
+    /// 見た目を変えずに可視部分だけ描ける。値は (状態, 中身の種別, 構築時の item 数と文字サイズ) で、
+    /// **種別か item 数が変われば作り直す**（同じ行数で code ⇄ md が入れ替わる事故を防ぐ）。
+    /// 文字サイズだけが変われば item の高さを測り直す（#1772）
+    preview_body_lists: HashMap<
+        PaneId,
+        (
+            gpui::ListState,
+            PreviewBodyKind,
+            preview_render::PreviewBodyBuild,
+        ),
+    >,
     /// 開いた直後に飛ぶ先（FR-3.27 / #1676）。値は仮想リストの item 番号（0 始まり）で、
     /// 行ジャンプは code 表示へ倒すので `line - 1` と一致する。`ListState` は
     /// **描くときに作られる**ので `OpenFile` を処理している時点ではまだ飛べず、
@@ -41653,6 +41661,13 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1772: ⌘+ / ⌘- / ⌘0 でコードプレビュー（エディタ）と md の本文の字と行の高さが
+                // ペインの文字サイズに従うか。10 万行の素材を開くので全節実行の並びには入れない
+                "editor-font" => {
+                    editor_font_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1653: 検索欄のトグルを実マウスで押すと件数が変わり、置換で型名が残るか
                 "search-case" => {
                     search_case_visual(any, window, cx).await;
@@ -41674,7 +41689,7 @@ mod self_test {
                          pane-border / tasks-panel / task-attachment / \
                          tasks-accordion / shelve-tab / no-emoji / editor-keys / \
                          run-command-truncate / viewport-lines / jump-keys / search-case / goto-hover / \
-                         large-file-edit / large-file-decor / external-change）"
+                         large-file-edit / large-file-decor / external-change / editor-font）"
                     );
                     std::process::exit(1);
                 }
@@ -47642,6 +47657,1021 @@ mod self_test {
             ),
         );
         println!("TAKO_VISUAL_PIXEL: viewport-lines ok");
+    }
+
+    /// ⌘+ / ⌘- / ⌘0 でコードプレビュー（エディタ）と md の本文の**字と行の高さ**が
+    /// ペインの文字サイズに従うか（#1772）。
+    ///
+    /// 見るのは 3 種類の指紋: ①描いた行の `TextLayout`（1 行の高さ・行頭から行末までの
+    /// 字送りの幅）と器に収まる行の実矩形（= 可視行数の正解。#1741 と同じ採り方）、
+    /// ②**実ピクセル**（1 行を行頭から行末まで選択した絵と選択していない絵の差の外接矩形
+    /// = 選択の帯の幅と高さ）、③実装の値（追従とページ移動が使う可視行数）。
+    /// 打鍵は `window.dispatch_keystroke`（キーバインド判定 → `ZoomIn` → `zoom_focused_pane`）へ、
+    /// クリックは合成マウスで実フレームの hitbox へ流す。
+    ///
+    /// 相: (1) 既定 (2) ⌘+ × 3（字・行の高さ・実ピクセルが文字サイズの比で伸び、可視行数が
+    /// 実矩形と一致）(3) 拡大したままの ↓ の追従・Page Down / Up・クリックの位置 (4) ⌘-
+    /// (5) ⌘0 で既定へ戻る (6) 最小 8pt / 最大 32pt (7) 折り返しのある行 (8) md のレンダリング
+    /// 表示 (9) 別のペイン（ターミナル）だけを拡大してもプレビューは動かない = ペイン単位
+    /// (10) CLI / MCP と同じ口（dispatch `MenuInvoke`）で拡大しても ⌘+ と同じ値
+    /// (11) 10 万行の末尾付近。
+    ///
+    /// 判定は溜めて節の最後にまとめて落とす（`TAKO_1772_LEGACY=1` の旧挙動で全相のずれを
+    /// 1 回で並べるため）。10 万行の素材を開くので全節実行の並びには入れない
+    /// （単独実行 `TAKO_VISUAL_ONLY=editor-font` だけ。#1660 の大ファイル節と同じ扱い）
+    #[cfg(feature = "visual-test")]
+    async fn editor_font_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        use tako_control::protocol::{PreviewModeWire, Request as Req};
+        use tako_core::editor_scroll::FOLLOW_MARGIN;
+
+        /// 描いた行から採った指紋（と、突き合わせる実装の値）
+        #[derive(Debug, Clone, Copy, Default)]
+        struct Probe {
+            /// ペインの文字サイズ（pt）
+            pane_fs: f32,
+            /// 描いた行の 1 行の高さ（`TextLayout::line_height`。論理 px）
+            row_h: f32,
+            /// 先頭の可視行の、行頭から行末までの字送りの幅（論理 px。字の大きさに比例する）
+            line_w: f32,
+            /// はみ出さずに見えている最初 / 最後の行と、その数（= 正解の可視行数）
+            first: usize,
+            last: usize,
+            count: usize,
+            /// カーソルの行・桁と、カーソル行がはみ出さずに見えているか
+            cursor: usize,
+            col: usize,
+            cursor_visible: bool,
+            /// 実装の値（追従とページ移動が使う可視行数）
+            follow_lines: usize,
+        }
+        impl Probe {
+            fn below(&self) -> Option<usize> {
+                self.cursor_visible.then(|| self.last - self.cursor)
+            }
+            fn above(&self) -> Option<usize> {
+                self.cursor_visible.then(|| self.cursor - self.first)
+            }
+        }
+
+        fn expect(failures: &mut Vec<String>, cond: bool, what: String) {
+            if !cond {
+                println!("TAKO_VISUAL_PIXEL: editor-font NG {what}");
+                failures.push(what);
+            }
+        }
+        /// gpui がコード行の 1 行の高さに使う値（文字サイズ × φ を**デバイスピクセルへ**丸めた値。
+        /// `StyledText` は `window.pixel_snap` を通すので、2x の画面では 15pt が 24.5px になる）
+        fn snap_row(fs: f32, scale: f32) -> f32 {
+            let device = fs * 1.618_034 * scale;
+            // gpui の `round_half_toward_zero`（ちょうど .5 は 0 の側へ）
+            let rounded = if (device - device.trunc() - 0.5).abs() < 1e-4 {
+                device.trunc()
+            } else {
+                device.round()
+            };
+            rounded / scale
+        }
+        /// 2 つの長さの比が文字サイズの比と合っているか（字送りはグリフの丸めで数 % 揺れる）
+        fn scaled(a: f32, b: f32, fs_a: f32, fs_b: f32) -> bool {
+            a > 0.0 && ((b / a) / (fs_b / fs_a) - 1.0).abs() < 0.05
+        }
+
+        async fn open(
+            any: AnyWindowHandle,
+            window: WindowHandle<TakoApp>,
+            cx: &mut AsyncApp,
+            base: PaneId,
+            path: &std::path::Path,
+            mode: PreviewModeWire,
+        ) -> PaneId {
+            let pane = window
+                .update(cx, |app, _, cx| {
+                    let opened = tako_control::dispatch(
+                        app,
+                        Req::OpenFile {
+                            pane: Some(base.as_u64()),
+                            path: path.display().to_string(),
+                            mode: Some(mode),
+                            direction: Some(tako_control::protocol::Direction::Right),
+                            focus: Some(true),
+                            new_tab: false,
+                            line: None,
+                            column: None,
+                        },
+                        PaneOrigin::Cli,
+                    )
+                    .expect("visual-test editor-font を dispatch で開ける");
+                    app.drain_pending_highlights(cx);
+                    cx.notify();
+                    PaneId::from_raw(opened["pane"].as_u64().expect("OpenFile 応答の pane"))
+                })
+                .unwrap_or_else(|_| fail("visual-test editor-font dispatch"));
+            check(
+                wait_for_preview_maps(any, window, cx, pane, false).await,
+                "visual-test editor-font: 座標キャッシュが揃う",
+            );
+            pane
+        }
+
+        fn start_edit(window: WindowHandle<TakoApp>, cx: &mut AsyncApp, pane: PaneId) -> bool {
+            window
+                .update(cx, |app, _, cx| {
+                    // 打鍵の入口は `focused_pane()` を見るので、対象ペインを明示的に掴む
+                    let _ = app.workspace.active_tab_mut().tree_mut().focus(pane);
+                    let r = tako_control::dispatch(
+                        app,
+                        Req::PreviewEdit {
+                            pane: Some(pane.as_u64()),
+                            enabled: Some(true),
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    cx.notify();
+                    r.ok().and_then(|v| v["editing"].as_bool()).unwrap_or(false)
+                })
+                .unwrap_or(false)
+        }
+
+        fn focus(window: WindowHandle<TakoApp>, cx: &mut AsyncApp, pane: PaneId) {
+            let _ = window.update(cx, |app, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    Req::Focus {
+                        pane: Some(pane.as_u64()),
+                        direction: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+            });
+        }
+
+        fn close(window: WindowHandle<TakoApp>, cx: &mut AsyncApp, pane: PaneId) {
+            let _ = window.update(cx, |app, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    Req::Close {
+                        pane: Some(pane.as_u64()),
+                        force: true,
+                        caller_role: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+            });
+        }
+
+        // カーソルを置く（`select` があれば行 `line` の桁 0 からそこまでを選ぶ）
+        let cursor = |cx: &mut AsyncApp, pane: PaneId, line: usize, select: Option<usize>| {
+            let _ = window.update(cx, |app, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    Req::PreviewCursor {
+                        pane: Some(pane.as_u64()),
+                        line: line + 1,
+                        col: 0,
+                        select_to_line: select.map(|_| line + 1),
+                        select_to_col: select,
+                        expected_version: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+            });
+        };
+
+        let probe = |cx: &mut AsyncApp, pane: PaneId| -> Probe {
+            notify_and_draw(any, window, cx);
+            window
+                .update(cx, |app, _, _| {
+                    let mut out = Probe {
+                        pane_fs: app.pane_font_size(pane),
+                        ..Probe::default()
+                    };
+                    let Some(view) = app.preview_viewport_bounds(pane) else {
+                        return out;
+                    };
+                    if let Some(edit) = app.preview_edits.get(&pane) {
+                        (out.cursor, out.col) = edit.buffer.line_byte_col(edit.buffer.cursor());
+                    }
+                    out.follow_lines = app
+                        .preview_cursor_viewport(pane)
+                        .map(|(_, v)| v.visible_lines)
+                        .unwrap_or(0);
+                    let texts = app.preview_line_texts.get(&pane);
+                    let Some(layouts) = app.preview_text_layouts.get(&pane) else {
+                        return out;
+                    };
+                    let mut seen = false;
+                    for (ix, slot) in layouts.iter().enumerate() {
+                        let Some(layout) = slot else { continue };
+                        let b = layout.bounds();
+                        if b.top() < view.top() - px(0.5) || b.bottom() > view.bottom() + px(0.5) {
+                            continue;
+                        }
+                        if !seen {
+                            seen = true;
+                            out.first = ix;
+                            out.row_h = f32::from(layout.line_height());
+                            let len = texts.and_then(|t| t.get(ix)).map_or(0, String::len);
+                            out.line_w = match (
+                                layout.position_for_index(0),
+                                layout.position_for_index(len),
+                            ) {
+                                (Some(a), Some(b)) => f32::from(b.x - a.x),
+                                _ => 0.0,
+                            };
+                        }
+                        out.last = ix;
+                        out.count += 1;
+                        out.cursor_visible |= ix == out.cursor;
+                    }
+                    out
+                })
+                .unwrap_or_default()
+        };
+        let report = |label: &str, p: &Probe| {
+            println!(
+                "TAKO_VISUAL_PIXEL: editor-font {label} pane_font={} row_h={:.2} line_w={:.2} \
+                 visible={}..={} truth={} follow_lines={} cursor={}:{} below={:?} above={:?}",
+                p.pane_fs,
+                p.row_h,
+                p.line_w,
+                p.first,
+                p.last,
+                p.count,
+                p.follow_lines,
+                p.cursor,
+                p.col,
+                p.below(),
+                p.above()
+            );
+        };
+
+        // 実ピクセル: 行 `line` を行頭から行末まで選んだ絵と選んでいない絵の差の外接矩形。
+        // 選択の帯は「行の字送りの幅 × 行の高さ」で塗られる（+ 行末のキャレット 1.5px）ので、
+        // 字と行の高さが**画面の上で**伸びたかを色に依らず測れる。論理 px の (幅, 高さ)
+        let pixel_band = |cx: &mut AsyncApp, pane: PaneId, line: usize| -> Option<(f32, f32)> {
+            let len = window
+                .update(cx, |app, _, _| {
+                    app.preview_line_texts
+                        .get(&pane)
+                        .and_then(|t| t.get(line))
+                        .map(String::len)
+                })
+                .ok()
+                .flatten()?;
+            cursor(cx, pane, line, None);
+            let (plain, scale) = capture_frame(any, cx)?;
+            cursor(cx, pane, line, Some(len));
+            let (selected, _) = capture_frame(any, cx)?;
+            cursor(cx, pane, line, None);
+            let area = window
+                .update(cx, |app, _, _| app.preview_viewport_bounds(pane))
+                .ok()
+                .flatten()?;
+            let (w, h) = plain.dimensions();
+            let left = (f32::from(area.left()) * scale).floor().max(0.0) as u32;
+            let right = ((f32::from(area.right()) * scale).ceil().max(0.0) as u32).min(w);
+            let raw_top = (f32::from(area.top()) * scale).floor().max(0.0) as u32;
+            let raw_bottom = ((f32::from(area.bottom()) * scale).ceil().max(0.0) as u32).min(h);
+            // Metal の読み戻しは上下が反転することがあるので、差の多い向きを採る
+            let measure = |flip: bool| -> (u32, u32, u32) {
+                let (top, bottom) = if flip {
+                    (h.saturating_sub(raw_bottom), h.saturating_sub(raw_top))
+                } else {
+                    (raw_top.min(h), raw_bottom.min(h))
+                };
+                let mut rows = vec![0u32; bottom.saturating_sub(top) as usize];
+                let mut cols = vec![0u32; right.saturating_sub(left) as usize];
+                let mut total = 0u32;
+                for y in top..bottom {
+                    for x in left..right {
+                        if plain.get_pixel(x, y) != selected.get_pixel(x, y) {
+                            rows[(y - top) as usize] += 1;
+                            cols[(x - left) as usize] += 1;
+                            total += 1;
+                        }
+                    }
+                }
+                let span = |v: &[u32]| -> u32 {
+                    match (
+                        v.iter().position(|&c| c > 0),
+                        v.iter().rposition(|&c| c > 0),
+                    ) {
+                        (Some(a), Some(b)) => (b - a + 1) as u32,
+                        _ => 0,
+                    }
+                };
+                (span(&cols), span(&rows), total)
+            };
+            let (normal, flipped) = (measure(false), measure(true));
+            let best = if flipped.2 > normal.2 {
+                flipped
+            } else {
+                normal
+            };
+            (best.2 > 0).then(|| (best.0 as f32 / scale, best.1 as f32 / scale))
+        };
+
+        // 行 `line` の桁 `col` の字の上を合成マウスでクリックする
+        let click_cell = |cx: &mut AsyncApp, pane: PaneId, line: usize, col: usize| -> bool {
+            let pos = window
+                .update(cx, |app, _, _| {
+                    let layout = app.preview_text_layouts.get(&pane)?.get(line)?.as_ref()?;
+                    let at = layout.position_for_index(col)?;
+                    let next = layout.position_for_index(col + 1)?;
+                    Some(point(
+                        at.x + (next.x - at.x) * 0.3,
+                        at.y + layout.line_height() / 2.0,
+                    ))
+                })
+                .ok()
+                .flatten();
+            match pos {
+                Some(pos) => {
+                    click_at(any, cx, pos);
+                    true
+                }
+                None => false,
+            }
+        };
+
+        // 先頭から ↓ を押し続け、カーソル行が器の外へ出ず、器が「可視行数 − 余白」の行で
+        // 動き始めて以降は下の余白がちょうど FOLLOW_MARGIN 行かを見る（#1741 と同じ設計）
+        let walk_down = |cx: &mut AsyncApp,
+                         failures: &mut Vec<String>,
+                         pane: PaneId,
+                         label: &str,
+                         visible: usize| {
+            cursor(cx, pane, 0, None);
+            let _ = probe(cx, pane);
+            let mut seen = Vec::with_capacity(visible + 4);
+            for _ in 0..visible + 4 {
+                press(any, cx, "down");
+                seen.push(probe(cx, pane));
+            }
+            let hidden: Vec<usize> = seen
+                .iter()
+                .filter(|p| !p.cursor_visible)
+                .map(|p| p.cursor)
+                .collect();
+            let start = seen.iter().find(|p| p.first > 0).map(|p| p.cursor);
+            let margins: Vec<Option<usize>> = seen
+                .iter()
+                .skip_while(|p| p.first == 0)
+                .map(Probe::below)
+                .collect();
+            let want = visible.saturating_sub(FOLLOW_MARGIN);
+            println!(
+                "TAKO_VISUAL_PIXEL: editor-font {label} walk visible={visible} \
+                 scroll_start={start:?} want_start={want} hidden={hidden:?} margins={margins:?}"
+            );
+            expect(
+                failures,
+                hidden.is_empty(),
+                format!("{label}: ↓ の途中でカーソル行が器の外へ出た (行 {hidden:?})"),
+            );
+            expect(
+                failures,
+                start == Some(want),
+                format!("{label}: 器が動き始めた行 {start:?} が設計（可視 {visible} 行 − 余白 = {want}）と違う"),
+            );
+            expect(
+                failures,
+                !margins.is_empty() && margins.iter().all(|m| *m == Some(FOLLOW_MARGIN)),
+                format!(
+                    "{label}: 動き始めてからの下の余白が {FOLLOW_MARGIN} 行でない ({margins:?})"
+                ),
+            );
+        };
+
+        inject_section_failure("editor-font");
+        let shell = ensure_fresh_scene(window, cx, "editor-font").await;
+        let legacy = preview_render::preview_font_legacy();
+        let scale = window.update(cx, |_, w, _| w.scale_factor()).unwrap_or(1.0);
+        let phi_row = |fs: f32| snap_row(fs, scale);
+        println!("TAKO_VISUAL_PIXEL: editor-font arm legacy={legacy} scale={scale}");
+        let (zoom_in, zoom_out, zoom_reset, doc_end) = if cfg!(target_os = "macos") {
+            ("cmd-=", "cmd--", "cmd-0", "cmd-down")
+        } else {
+            ("ctrl-=", "ctrl--", "ctrl-0", "ctrl-end")
+        };
+        let dir = std::env::temp_dir().join(format!("tako-visual-1772-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("visual-test editor-font 一時ディレクトリ");
+        let write = |name: &str, body: String| -> std::path::PathBuf {
+            let path = dir.join(name);
+            std::fs::write(&path, body).expect("visual-test editor-font fixture");
+            path
+        };
+        let long = write(
+            "long.rs",
+            (0..400)
+                .map(|i| format!("    let row_{i:03} = {i};\n"))
+                .collect(),
+        );
+        // 5 行に 1 行、器の幅で折り返す長い行を混ぜる（その行だけ 2 行ぶん以上の高さになる）
+        let wrapped = write(
+            "wrapped.rs",
+            (0..200)
+                .map(|i| {
+                    if i % 5 == 2 {
+                        format!("    // wrap {i:03} {}\n", "abcdefghij ".repeat(24))
+                    } else {
+                        format!("    let row_{i:03} = {i};\n")
+                    }
+                })
+                .collect(),
+        );
+        let doc = write(
+            "doc.md",
+            "# 見出しの行\n\nparagraph body text for measuring the glyph advance.\n\n\
+             ## 二つ目の見出し\n\n二つ目の段落\n"
+                .to_string(),
+        );
+        // 10 万行 = 編集できる上限ちょうど（`tako_core::preview_limit::MAX_LINES`）。
+        // 末尾に改行を付けない（付けると編集バッファは空の 100,001 行目を持ち、
+        // 「最終行」がプレビューの行と 1 つずれる）
+        let big = write(
+            "big.rs",
+            (0..tako_core::preview_limit::MAX_LINES)
+                .map(|i| format!("    let row_{i:06} = {i};"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let mut failures: Vec<String> = Vec::new();
+
+        // (1) 既定の文字サイズ
+        let pane = open(any, window, cx, shell, &long, PreviewModeWire::Code).await;
+        check(
+            start_edit(window, cx, pane),
+            "visual-test editor-font: 編集モードを開始できる",
+        );
+        cursor(cx, pane, 0, None);
+        let base = probe(cx, pane);
+        report("base", &base);
+        check(
+            base.first == 0 && base.count > FOLLOW_MARGIN * 2 + 1 && base.line_w > 0.0,
+            &format!("visual-test editor-font: 先頭が見えていて行が測れる ({base:?})"),
+        );
+        let band0 = pixel_band(cx, pane, 1);
+        println!("TAKO_VISUAL_PIXEL: editor-font pixel base band={band0:?}");
+
+        // (2) ⌘+ × 3
+        for _ in 0..3 {
+            press(any, cx, zoom_in);
+        }
+        cursor(cx, pane, 0, None);
+        let zoomed = probe(cx, pane);
+        report("zoom-in", &zoomed);
+        let band1 = pixel_band(cx, pane, 1);
+        println!("TAKO_VISUAL_PIXEL: editor-font pixel zoom-in band={band1:?}");
+        expect(
+            &mut failures,
+            (zoomed.pane_fs - (base.pane_fs + 3.0)).abs() < 0.01,
+            format!(
+                "⌘+: ペインの文字サイズ {} が {} + 3 になっていない",
+                zoomed.pane_fs, base.pane_fs
+            ),
+        );
+        expect(
+            &mut failures,
+            zoomed.row_h > base.row_h && (zoomed.row_h - phi_row(zoomed.pane_fs)).abs() < 0.01,
+            format!(
+                "⌘+: 行の高さ {:.2} → {:.2} が文字サイズ {} の φ 倍（{}）に従わない",
+                base.row_h,
+                zoomed.row_h,
+                zoomed.pane_fs,
+                phi_row(zoomed.pane_fs)
+            ),
+        );
+        expect(
+            &mut failures,
+            scaled(base.line_w, zoomed.line_w, base.pane_fs, zoomed.pane_fs),
+            format!(
+                "⌘+: 字送りの幅 {:.2} → {:.2} が文字サイズの比 {} / {} で伸びない",
+                base.line_w, zoomed.line_w, zoomed.pane_fs, base.pane_fs
+            ),
+        );
+        expect(
+            &mut failures,
+            zoomed.count < base.count && zoomed.follow_lines == zoomed.count,
+            format!(
+                "⌘+: 実矩形 {} → {} 行・追従の可視行数 {}（減って実矩形と一致するはず）",
+                base.count, zoomed.count, zoomed.follow_lines
+            ),
+        );
+        match (band0, band1) {
+            (Some((w0, h0)), Some((w1, h1))) => {
+                expect(
+                    &mut failures,
+                    (h0 - base.row_h).abs() <= 1.5 && (h1 - zoomed.row_h).abs() <= 1.5,
+                    format!(
+                        "実ピクセル: 選択の帯の高さ {h0:.1} / {h1:.1} が行の高さ {:.1} / {:.1} と違う",
+                        base.row_h, zoomed.row_h
+                    ),
+                );
+                expect(
+                    &mut failures,
+                    scaled(w0, w1, base.pane_fs, zoomed.pane_fs),
+                    format!(
+                        "実ピクセル: 選択の帯の幅 {w0:.1} → {w1:.1} が文字サイズの比で伸びない"
+                    ),
+                );
+            }
+            other => expect(
+                &mut failures,
+                false,
+                format!("実ピクセル: 選択の帯を測れない ({other:?})"),
+            ),
+        }
+
+        // (3) 拡大したままの ↓ の追従・Page Down / Up・クリックの位置
+        walk_down(cx, &mut failures, pane, "zoom-in", zoomed.count);
+        cursor(cx, pane, 0, None);
+        let _ = probe(cx, pane);
+        press(any, cx, "pagedown");
+        let p1 = probe(cx, pane);
+        report("zoom-page-down-1", &p1);
+        press(any, cx, "pagedown");
+        let p2 = probe(cx, pane);
+        report("zoom-page-down-2", &p2);
+        press(any, cx, "pageup");
+        let p3 = probe(cx, pane);
+        report("zoom-page-up", &p3);
+        let step = zoomed.count.saturating_sub(1);
+        expect(
+            &mut failures,
+            p1.cursor == step && p1.below() == Some(FOLLOW_MARGIN),
+            format!(
+                "⌘+ の Page Down: 着地 {} / 下の余白 {:?} が設計（{step} / {FOLLOW_MARGIN}）と違う",
+                p1.cursor,
+                p1.below()
+            ),
+        );
+        expect(
+            &mut failures,
+            p2.cursor == step * 2 && p2.below() == Some(FOLLOW_MARGIN),
+            format!(
+                "⌘+ の 2 回目の Page Down: 着地 {} / 下の余白 {:?}",
+                p2.cursor,
+                p2.below()
+            ),
+        );
+        expect(
+            &mut failures,
+            p3.cursor == step && p3.above() == Some(FOLLOW_MARGIN),
+            format!(
+                "⌘+ の Page Up: 着地 {} / 上の余白 {:?} が設計（{step} / {FOLLOW_MARGIN}）と違う",
+                p3.cursor,
+                p3.above()
+            ),
+        );
+        let target = p3.first + 2;
+        let clicked = click_cell(cx, pane, target, 6);
+        let after_click = probe(cx, pane);
+        report("zoom-click", &after_click);
+        expect(
+            &mut failures,
+            clicked && after_click.cursor == target && after_click.col == 6,
+            format!(
+                "⌘+ のクリック: 行 {target} 桁 6 の字の上を押したのにカーソルが {}:{}",
+                after_click.cursor, after_click.col
+            ),
+        );
+
+        // (4) ⌘-
+        press(any, cx, zoom_out);
+        cursor(cx, pane, 0, None);
+        let out = probe(cx, pane);
+        report("zoom-out", &out);
+        expect(
+            &mut failures,
+            (out.pane_fs - (zoomed.pane_fs - 1.0)).abs() < 0.01
+                && (out.row_h - phi_row(out.pane_fs)).abs() < 0.01
+                && out.follow_lines == out.count,
+            format!(
+                "⌘-: 文字サイズ {} / 行の高さ {:.2}（φ 倍 {}）/ 追従 {} と実矩形 {}",
+                out.pane_fs,
+                out.row_h,
+                phi_row(out.pane_fs),
+                out.follow_lines,
+                out.count
+            ),
+        );
+
+        // (5) ⌘0 で既定へ
+        press(any, cx, zoom_reset);
+        cursor(cx, pane, 0, None);
+        let reset = probe(cx, pane);
+        report("zoom-reset", &reset);
+        expect(
+            &mut failures,
+            (reset.pane_fs - base.pane_fs).abs() < 0.01
+                && (reset.row_h - base.row_h).abs() < 0.01
+                && (reset.line_w - base.line_w).abs() < 0.5
+                && reset.count == base.count
+                && reset.follow_lines == reset.count,
+            format!("⌘0: 既定（{base:?}）へ戻らない ({reset:?})"),
+        );
+
+        // (6) 最小 8pt / 最大 32pt（それ以上押しても動かない）
+        for (label, key, bound) in [
+            ("font-min", zoom_out, TakoApp::FONT_SIZE_MIN),
+            ("font-max", zoom_in, TakoApp::FONT_SIZE_MAX),
+        ] {
+            for _ in 0..40 {
+                press(any, cx, key);
+            }
+            cursor(cx, pane, 0, None);
+            let p = probe(cx, pane);
+            report(label, &p);
+            expect(
+                &mut failures,
+                (p.pane_fs - bound).abs() < 0.01
+                    && (p.row_h - phi_row(bound)).abs() < 0.01
+                    && p.follow_lines == p.count
+                    && p.count > 0,
+                format!(
+                    "{label}: 文字サイズ {} / 行の高さ {:.2}（φ 倍 {}）/ 追従 {} と実矩形 {}",
+                    p.pane_fs,
+                    p.row_h,
+                    phi_row(bound),
+                    p.follow_lines,
+                    p.count
+                ),
+            );
+            press(any, cx, "pagedown");
+            let paged = probe(cx, pane);
+            report(&format!("{label}-page-down"), &paged);
+            expect(
+                &mut failures,
+                paged.cursor + 1 == p.count && paged.cursor_visible,
+                format!(
+                    "{label}: Page Down の歩幅 {} が「実矩形の可視 {} 行 − 1」と違う",
+                    paged.cursor, p.count
+                ),
+            );
+        }
+        press(any, cx, zoom_reset);
+        close(window, cx, pane);
+
+        // (7) 折り返しのある行: 折り返した行の高さが行の高さの整数倍で、拡大すると
+        // 折り返しが増える。可視行数は実矩形どおり・↓ の間カーソルは器の外へ出ない
+        let pane = open(any, window, cx, shell, &wrapped, PreviewModeWire::Code).await;
+        check(
+            start_edit(window, cx, pane),
+            "visual-test editor-font: 折り返しの素材で編集モードを開始できる",
+        );
+        let wrap_rows = |cx: &mut AsyncApp, pane: PaneId| -> (Probe, f32) {
+            cursor(cx, pane, 0, None);
+            let p = probe(cx, pane);
+            let rows = window
+                .update(cx, |app, _, _| {
+                    let layout = app.preview_text_layouts.get(&pane)?.get(2)?.as_ref()?;
+                    Some(f32::from(layout.bounds().size.height) / f32::from(layout.line_height()))
+                })
+                .ok()
+                .flatten()
+                .unwrap_or(0.0);
+            (p, rows)
+        };
+        let (w0, wrap0) = wrap_rows(cx, pane);
+        for _ in 0..3 {
+            press(any, cx, zoom_in);
+        }
+        let (w1, wrap1) = wrap_rows(cx, pane);
+        println!(
+            "TAKO_VISUAL_PIXEL: editor-font wrapped row_h={:.2}->{:.2} wrap_rows={wrap0:.2}->{wrap1:.2} \
+             truth={}->{} follow_lines={}->{}",
+            w0.row_h, w1.row_h, w0.count, w1.count, w0.follow_lines, w1.follow_lines
+        );
+        expect(
+            &mut failures,
+            wrap0 >= 2.0 && wrap1 > wrap0 && (wrap1 - wrap1.round()).abs() < 0.01,
+            format!("折り返し: 折り返した行が {wrap0:.2} → {wrap1:.2} 行ぶん（拡大で増えるはず）"),
+        );
+        expect(
+            &mut failures,
+            w1.follow_lines == w1.count,
+            format!(
+                "折り返し: 追従の可視行数 {} が実矩形の {} 行と違う",
+                w1.follow_lines, w1.count
+            ),
+        );
+        cursor(cx, pane, 0, None);
+        let mut hidden = Vec::new();
+        for _ in 0..40 {
+            press(any, cx, "down");
+            let p = probe(cx, pane);
+            if !p.cursor_visible {
+                hidden.push(p.cursor);
+            }
+        }
+        expect(
+            &mut failures,
+            hidden.is_empty(),
+            format!("折り返し: ↓ の途中でカーソル行が器の外へ出た (行 {hidden:?})"),
+        );
+        press(any, cx, zoom_reset);
+        close(window, cx, pane);
+
+        // (8) md のレンダリング表示: 見出し・段落の行の高さと段落の字送りが文字サイズの比で動く
+        let pane = open(any, window, cx, shell, &doc, PreviewModeWire::Markdown).await;
+        focus(window, cx, pane);
+        let md = |cx: &mut AsyncApp, pane: PaneId| -> (f32, f32, f32, f32) {
+            notify_and_draw(any, window, cx);
+            window
+                .update(cx, |app, _, _| {
+                    let layouts = app.preview_text_layouts.get(&pane)?;
+                    let heading = layouts.first()?.as_ref()?;
+                    let para = layouts.get(1)?.as_ref()?;
+                    let len = app.preview_line_texts.get(&pane)?.get(1)?.len();
+                    let w = para.position_for_index(len)?.x - para.position_for_index(0)?.x;
+                    Some((
+                        app.pane_font_size(pane),
+                        f32::from(heading.line_height()),
+                        f32::from(para.line_height()),
+                        f32::from(w),
+                    ))
+                })
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+        };
+        let m0 = md(cx, pane);
+        for _ in 0..3 {
+            press(any, cx, zoom_in);
+        }
+        let m1 = md(cx, pane);
+        println!(
+            "TAKO_VISUAL_PIXEL: editor-font markdown pane_font={}->{} heading_h={:.2}->{:.2} \
+             para_h={:.2}->{:.2} para_w={:.2}->{:.2}",
+            m0.0, m1.0, m0.1, m1.1, m0.2, m1.2, m0.3, m1.3
+        );
+        expect(
+            &mut failures,
+            m1.0 > m0.0
+                && m1.1 > m0.1
+                && m1.2 > m0.2
+                && (m1.2 / m0.2 - m1.0 / m0.0).abs() < 0.06
+                && scaled(m0.3, m1.3, m0.0, m1.0),
+            format!("md: ⌘+ で見出し / 段落の行の高さ・段落の字送りが文字サイズの比で動かない ({m0:?} → {m1:?})"),
+        );
+        press(any, cx, zoom_reset);
+        close(window, cx, pane);
+
+        // (9) 別のペイン（ターミナル）だけを拡大する: 文字サイズはペイン単位なので
+        // プレビューの本文は動かない
+        let pane = open(any, window, cx, shell, &long, PreviewModeWire::Code).await;
+        let before = probe(cx, pane);
+        focus(window, cx, shell);
+        for _ in 0..3 {
+            press(any, cx, zoom_in);
+        }
+        let other = probe(cx, pane);
+        let shell_fs = window
+            .update(cx, |app, _, _| app.pane_font_size(shell))
+            .unwrap_or(0.0);
+        println!(
+            "TAKO_VISUAL_PIXEL: editor-font other-pane shell_font={shell_fs} preview_font={} \
+             row_h={:.2}->{:.2}",
+            other.pane_fs, before.row_h, other.row_h
+        );
+        expect(
+            &mut failures,
+            (shell_fs - (base.pane_fs + 3.0)).abs() < 0.01
+                && (other.pane_fs - base.pane_fs).abs() < 0.01
+                && (other.row_h - before.row_h).abs() < 0.01
+                && (other.line_w - before.line_w).abs() < 0.5,
+            format!(
+                "別のペイン: ターミナル {shell_fs} だけを拡大したのにプレビューが動いた \
+                 ({before:?} → {other:?})"
+            ),
+        );
+        press(any, cx, zoom_reset);
+
+        // (10) CLI / MCP と同じ口（dispatch `MenuInvoke`。`tako menu invoke` / MCP `tako_menu`）
+        // で 3 回拡大すると ⌘+ × 3 と同じ値になり、「文字サイズを戻す」で既定へ戻る
+        check(
+            start_edit(window, cx, pane),
+            "visual-test editor-font: メニュー経路の素材で編集モードを開始できる",
+        );
+        let menu = |cx: &mut AsyncApp, item: &str| -> bool {
+            window
+                .update(cx, |app, _, cx| {
+                    let r = tako_control::dispatch(
+                        app,
+                        Req::MenuInvoke {
+                            path: format!("{}/{item}", crate::ui_text::menu::view()),
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    cx.notify();
+                    r.is_ok()
+                })
+                .unwrap_or(false)
+        };
+        let mut invoked = true;
+        for n in 1..=3 {
+            invoked &= menu(cx, crate::ui_text::menu::zoom_in());
+            let want = base.pane_fs + n as f32;
+            invoked &= wait_for_drawn_state(
+                window,
+                any,
+                cx,
+                "editor-font menu zoom-in",
+                Duration::from_secs(5),
+                move |app| (app.pane_font_size(pane) - want).abs() < 0.01,
+            )
+            .await;
+        }
+        cursor(cx, pane, 0, None);
+        let via_menu = probe(cx, pane);
+        report("menu-zoom-in", &via_menu);
+        expect(
+            &mut failures,
+            invoked
+                && (via_menu.pane_fs - zoomed.pane_fs).abs() < 0.01
+                && (via_menu.row_h - zoomed.row_h).abs() < 0.01
+                && (via_menu.line_w - zoomed.line_w).abs() < 0.5
+                && via_menu.count == zoomed.count
+                && via_menu.follow_lines == zoomed.follow_lines,
+            format!("メニュー経路: ⌘+ × 3（{zoomed:?}）と値が違う ({via_menu:?})"),
+        );
+        let mut reset_ok = menu(cx, crate::ui_text::menu::reset_zoom());
+        let want = base.pane_fs;
+        reset_ok &= wait_for_drawn_state(
+            window,
+            any,
+            cx,
+            "editor-font menu reset",
+            Duration::from_secs(5),
+            move |app| (app.pane_font_size(pane) - want).abs() < 0.01,
+        )
+        .await;
+        cursor(cx, pane, 0, None);
+        let menu_reset = probe(cx, pane);
+        report("menu-reset", &menu_reset);
+        expect(
+            &mut failures,
+            reset_ok
+                && (menu_reset.row_h - base.row_h).abs() < 0.01
+                && menu_reset.count == base.count,
+            format!(
+                "メニュー経路: 「文字サイズを戻す」で既定（{base:?}）へ戻らない ({menu_reset:?})"
+            ),
+        );
+        close(window, cx, pane);
+
+        // (11) 10 万行の末尾付近
+        let pane = open(any, window, cx, shell, &big, PreviewModeWire::Code).await;
+        check(
+            start_edit(window, cx, pane),
+            "visual-test editor-font: 10 万行で編集モードを開始できる",
+        );
+        let last = tako_core::preview_limit::MAX_LINES - 1;
+        let near = last - 10;
+        cursor(cx, pane, near, None);
+        let _ = probe(cx, pane);
+        let b0 = probe(cx, pane);
+        report("big-base", &b0);
+        for _ in 0..3 {
+            press(any, cx, zoom_in);
+        }
+        cursor(cx, pane, near, None);
+        let _ = probe(cx, pane);
+        let b1 = probe(cx, pane);
+        report("big-zoom-in", &b1);
+        expect(
+            &mut failures,
+            b1.row_h > b0.row_h
+                && (b1.row_h - phi_row(b1.pane_fs)).abs() < 0.01
+                && b1.count < b0.count
+                && b1.follow_lines == b1.count
+                && b1.cursor == near
+                && b1.cursor_visible,
+            format!("10 万行: 末尾付近で拡大した寸法とカーソル（{b0:?} → {b1:?}）"),
+        );
+        press(any, cx, "pageup");
+        let b2 = probe(cx, pane);
+        report("big-page-up", &b2);
+        let big_step = b1.count.saturating_sub(1);
+        expect(
+            &mut failures,
+            b2.cursor == near - big_step && b2.above() == Some(FOLLOW_MARGIN),
+            format!(
+                "10 万行: Page Up の着地 {} / 上の余白 {:?} が設計（{} / {FOLLOW_MARGIN}）と違う",
+                b2.cursor,
+                b2.above(),
+                near - big_step
+            ),
+        );
+        press(any, cx, "pagedown");
+        let b3 = probe(cx, pane);
+        report("big-page-down", &b3);
+        expect(
+            &mut failures,
+            b3.cursor == near && b3.below() == Some(FOLLOW_MARGIN),
+            format!(
+                "10 万行: Page Down の着地 {} / 下の余白 {:?} が設計（{near} / {FOLLOW_MARGIN}）と違う",
+                b3.cursor,
+                b3.below()
+            ),
+        );
+        press(any, cx, doc_end);
+        let b4 = probe(cx, pane);
+        report("big-doc-end", &b4);
+        // 文書末では gpui の `list` が最終行を器の下端へ揃えるので、最上段の行が上へ半分
+        // はみ出す。可視行数（#1741 の `preview_row_geometry`）はその行も数えるので実矩形より
+        // 1 行多い。**文字サイズに依らない既存の境界**（⌘0 の後の 13pt でも同じ）なので、
+        // ここでは判定せず観測として並べる（報告の [提案] に回す。#1772 の範囲外）
+        let doc_end_top = |cx: &mut AsyncApp| {
+            window
+                .update(cx, |app, _, _| {
+                    app.preview_body_lists.get(&pane).map(|(list, _, _)| {
+                        let top = list.logical_scroll_top();
+                        (top.item_ix, f32::from(top.offset_in_item))
+                    })
+                })
+                .ok()
+                .flatten()
+        };
+        println!(
+            "TAKO_VISUAL_PIXEL: editor-font big-doc-end partial-top scroll_top={:?} pad={} \
+             truth={} follow_lines={}",
+            doc_end_top(cx),
+            preview_render::PREVIEW_BODY_PADDING,
+            b4.count,
+            b4.follow_lines
+        );
+        expect(
+            &mut failures,
+            b4.cursor == last && b4.last == last && b4.cursor_visible,
+            format!(
+                "10 万行: 文書末へ飛ぶと最終行 {last} が見える（カーソル {} / 最下段 {}）",
+                b4.cursor, b4.last
+            ),
+        );
+        let target = b4.first + 1;
+        let clicked = click_cell(cx, pane, target, 4);
+        let b5 = probe(cx, pane);
+        report("big-click", &b5);
+        expect(
+            &mut failures,
+            clicked && b5.cursor == target && b5.col == 4,
+            format!(
+                "10 万行: 行 {target} 桁 4 の字の上を押したのにカーソルが {}:{}",
+                b5.cursor, b5.col
+            ),
+        );
+        press(any, cx, zoom_reset);
+        let b6 = probe(cx, pane);
+        report("big-reset", &b6);
+        println!(
+            "TAKO_VISUAL_PIXEL: editor-font big-reset partial-top scroll_top={:?} truth={} \
+             follow_lines={}",
+            doc_end_top(cx),
+            b6.count,
+            b6.follow_lines
+        );
+        expect(
+            &mut failures,
+            (b6.row_h - b0.row_h).abs() < 0.01
+                && (b6.line_w - b0.line_w).abs() < 0.5
+                && b6.cursor_visible,
+            format!("10 万行: ⌘0 で既定の寸法へ戻らない ({b6:?})"),
+        );
+        // 文書末から離れれば（最上段がはみ出さなければ）可視行数は実矩形と一致する。
+        // いったん 200 行上へ飛んでから戻す（文書末の表示のままだとカーソルが余白の内側に
+        // あって追従が器を動かさない）
+        cursor(cx, pane, near - 200, None);
+        let _ = probe(cx, pane);
+        cursor(cx, pane, near, None);
+        let _ = probe(cx, pane);
+        let b7 = probe(cx, pane);
+        report("big-reset-near", &b7);
+        expect(
+            &mut failures,
+            b7.follow_lines == b7.count && b7.count == b0.count && b7.cursor_visible,
+            format!(
+                "10 万行: ⌘0 の後の末尾付近で可視行数 {} が実矩形 {} と違う",
+                b7.follow_lines, b7.count
+            ),
+        );
+        close(window, cx, pane);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        check(
+            failures.is_empty(),
+            &format!("visual-test editor-font (#1772): {}", failures.join(" / ")),
+        );
+        println!("TAKO_VISUAL_PIXEL: editor-font ok");
     }
 
     /// タブバーの「ー」を**実マウスで**押すとタブが 1 単位で退避し、たまり場の

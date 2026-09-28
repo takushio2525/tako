@@ -254,15 +254,19 @@ pub(crate) fn heading_look(
 
 /// md ブロック 1 個を描く（**幾何とテーマ色の唯一の実装**）。
 ///
+/// `base` は本文の文字サイズ（pt）。見出しの大きさ・余白・行の高さはすべてこれに対する比で、
+/// 段落の字そのものは呼び出し側の器（`text_size`）から継承する。プレビューはペインの
+/// 文字サイズ（#1772。⌘+ / ⌘- で動く）を、アップデート詳細・チャットは `theme.font_size` を渡す。
+///
 /// `code_index` はコードブロックの出現順（0 始まり）。`None` を渡すと
 /// コピーボタン等の装飾を要求しない。
 pub(crate) fn render_block(
     theme: &Theme,
+    base: f32,
     block: &MdBlock,
     code_index: Option<usize>,
     sink: &mut impl MdTextSink,
 ) -> AnyElement {
-    let base = theme.font_size;
     let in_quote = block.quote_depth > 0;
     // 引用の中は本文より一段淡く。引用の入れ子はさらに淡くして深さが分かるようにする
     let body_color = if in_quote {
@@ -365,7 +369,7 @@ pub(crate) fn render_block(
             align,
             header,
             rows,
-        } => render_table(theme, block, align, header, rows, sink),
+        } => render_table(theme, base, block, align, header, rows, sink),
         MdBlockKind::Rule => {
             sink.spacer();
             div()
@@ -464,7 +468,13 @@ pub(crate) fn render_document(
             code_blocks += 1;
             code_blocks - 1
         });
-        elements.push(render_block(theme, block, code_index, &mut sink));
+        elements.push(render_block(
+            theme,
+            theme.font_size,
+            block,
+            code_index,
+            &mut sink,
+        ));
     }
     (elements, sink.layouts)
 }
@@ -598,13 +608,13 @@ pub(crate) fn md_table_cell_collapsed(
 /// セル 1 つが 1 行なので、受け皿の呼び出し順はヘッダ → 各行の行優先順になる
 fn render_table(
     theme: &Theme,
+    base: f32,
     block: &MdBlock,
     align: &[preview::MdAlign],
     header: &[MdCell],
     rows: &[Vec<MdCell>],
     sink: &mut impl MdTextSink,
 ) -> AnyElement {
-    let base = theme.font_size;
     let columns = align.len().max(header.len()).max(1);
     let shares = preview::md_table_column_shares(header, rows, columns);
     let mut table = div()
@@ -739,7 +749,7 @@ mod tests {
                 code += 1;
                 code - 1
             });
-            let _ = render_block(theme, block, code_index, &mut sink);
+            let _ = render_block(theme, theme.font_size, block, code_index, &mut sink);
         }
         sink
     }
