@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-09-27（#1797: setup の依存段が tailscale を remote と同じ検出で探すようにした）
-- 依存段（`setup_deps::resolve`）は tailscale を PATH だけで探し、PATH 外の App Store 版を「見つかりません」→ `--yes` で brew 版まで入れていた（#1038 の 2 系統同居）。正本 `tailscale::detect_tailscale`（Runnable / Unrunnable / Absent）を足して依存段・`find_tailscale`・remote setup [1/5] が読む。在るが動かない CLI は導入済みと読み入れ直させない。`run_tailscale_within` の自前の待ち（子の終了後に join）は `probe::output_with_timeout` へ寄せた
-- 実測: `scripts/test-setup-tailscale-detect-1797.sh` 55 PASS（修正前の tako で 25 FAIL = PATH 外で brew 1 回 → 0 回 / 孫がパイプを握る tailscale で 60 秒の締め切り → 5 秒）・番犬 6 本へ注入 5 通りが file:line で FAILED → 戻して緑・setup 系の隔離 10 本全緑（1499 / 1505 は tailscale を `TAKO_TAILSCALE_BIN` で閉じ込めるよう直した）・workspace 5919 passed 0 failed・clippy 3 宇宙 0・check-windows 0
-
 ## 2026-09-27（#1783: TAKO_VD_NAME に物理画面の名前を渡しても tako-vd と見なさないようにし、面の指定の判定を面を起こす前へ移した）
 - `ensure` の締めの先頭に「器が作った仮想ディスプレイか」（内蔵 = CGDisplayIsBuiltin / 器の一覧に名前が無い）を置き、物理画面なら終了コード 3 と理由 1 行で断る（修正前はスタブ実測で rc=0・その面の uuid を記録・内蔵なら器へ main を撃っていた）。ヘルパは 3 を使い方の誤り（2）として返し、`TAKO_DISPLAY` の判定を面を起こす前へ移した（uuid の記録との突き合わせだけは起こした後。FR-4.8.20〜22）
 - 実測: 注入 9 通りすべて file:line 名指しで FAILED → 戻して緑・モック 154 PASS（/bin/bash 3.2）・本物の tako-vd で ensure rc=0（構成の前後差分なし）・書き方の誤った `TAKO_DISPLAY` は ensure を呼ばず 0.01 秒で rc=2
@@ -69,10 +65,8 @@
 ## 2026-09-28（#1772: ⌘+ / ⌘- / ⌘0 をコードプレビュー（エディタ）と md の本文に効かせた）
 - ペインの文字サイズ（`pane_font_sizes`）は 13 → 16 に動くのに、本文はルートの `theme.font_size` を継承していた。本文の器 `preview-scroll` で `.text_size` + `.line_height(φ)` を継承側に指定し、md の基準・コピーボタン・行高の見積もり・仮想リストの `remeasure` を `preview_body_font_size` の 1 実装へ寄せた。#611 は行ピッチ（φ = 21px）を保ち、継承側で指定する半分だけ入れた
 - 実測（tako-vd）: `scripts/test-editor-font-1772.sh` 新 = 11 相緑（行 21 → 26px・可視 30 → 24 行・帯 158×21 → 194×26px・md 22 → 27px・10 万行末尾）/ `TAKO_1772_LEGACY=1` = 名指し FAILED、CLI 30 → 24 → 30 行・MCP 24 行（main v0.8.23 は 30 → 30）・番犬 6 規則へ注入 8 通りすべて file:line で FAILED
-## 2026-09-27（#1834: ファイルツリーの D&D でファイル・フォルダを別のフォルダへ移せるようにした）
-- 判定・実行・付け替え先は `tako_core::file_move` の 1 実装 → dispatch `FileOp{op: move, dest}` → CLI `tako file move` / MCP `tako_file_op` の `op=move`（ツールは増やさない）。同名・自分の配下・別のボリューム（EXDEV）は理由つきで断る
-- 開いているペイン（未保存の編集中・フォルダの配下）はパス・バッファ・LSP（didClose → didOpen）・監視ごと付け替わり #1659 の削除扱いにならない。実マウス 13 場面 + CLI/MCP 字面一致 7 組・A/B `TAKO_1834_LEGACY=1` で FAILED・番犬 13 本
+
 ## 2026-09-28（#1834: ファイルツリーの D&D でファイル・フォルダを別のフォルダへ移せるようにした）
 - 判定・実行・付け替え先は `tako_core::file_move` の 1 実装 → dispatch `FileOp{op: move, dest}` → CLI `tako file move` / MCP `tako_file_op` の `op=move`（ツールは増やさない）。同名・自分の配下・別のボリューム（EXDEV）は理由つきで断る。開いているペインはパス・バッファ・LSP（didClose → didOpen）・監視ごと付け替わり #1659 の削除扱いにならない
-- 仕上げで、大文字小文字を変えて名指すと付け替えと配下の判定が外れる穴（macOS の APFS / Windows。`from_real` の最後の成分が綴りのまま）を実測で再現して直した（リンク以外は移す元ごと canonicalize）
+- 仕上げで、大文字小文字を変えて名指すと付け替えと配下の判定が外れる穴（macOS の APFS / Windows。`from_real` の最後の成分が綴りのまま）を実測で再現して直した（リンク以外は移す元ごと canonicalize）。番犬「移動の実行はdispatchの1か所だけ」が Windows の区切り（`display()` の字面を `/` の定数と比較）で dispatch 自身を違反に数えていたのも直した
 - 実測: `scripts/test-tree-move-1834.sh` 31 PASS 0 FAIL（実マウス 13 場面・CLI/MCP 字面一致 7 組・A/B `TAKO_1834_LEGACY=1` で FAILED）・workspace 6161 passed 0 failed・clippy 3 宇宙 0・check-windows error 0（足した行の警告 0）

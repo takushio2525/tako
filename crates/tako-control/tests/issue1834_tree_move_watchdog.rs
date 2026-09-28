@@ -453,34 +453,46 @@ fn ツリーの受け口はドラッグ中だけ付ける() {
     ok(rule_drag_live(&source(SIDEBAR)));
 }
 
+/// 走査で得たリポジトリ相対パスを、定数と同じ `/` 区切りへ揃える。
+///
+/// `display()` の字面のまま比べると Windows では `crates\tako-control\src\dispatch.rs` になり、
+/// 許した dispatch 自身まで違反に数える（#1834 の Windows CI で実際に落ちた）。
+/// 書き方は既存の番犬（#1653 / #1811）と同じ
+fn slash_rel(rel: &str) -> String {
+    rel.replace('\\', "/")
+}
+
+/// 規則: 移動の実行（`file_move::execute(`）を呼んでよいのは dispatch だけ。
+///
+/// `rel` はリポジトリ相対パス（区切りはどちらでもよい）。違反は `/` 区切りの
+/// `file:line 行の中身` で返す（走査の本体と注入が同じ関数を通る）
+fn execute_offenders(rel: &str, src: &str) -> Vec<String> {
+    let rel = slash_rel(rel);
+    // 字面すら無いファイルは読まない（丸ごとテスト・コメントだけのファイルは
+    // 本番の範囲が空で、共通部品が「空」として止める = 見るものが無い）
+    if rel == CORE || !src.contains("file_move::execute(") {
+        return Vec::new();
+    }
+    let prod = production_range::scan(src).text;
+    let view = without_comments_checked(&prod, &rel);
+    view.lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains("file_move::execute(") && rel != DISPATCH)
+        .map(|(i, line)| format!("{rel}:{} {}", i + 1, line.trim()))
+        .collect()
+}
+
 /// 移動の実行（`file_move::execute`）を呼んでよいのは dispatch の `run_file_move` だけ
 #[test]
 fn 移動の実行はdispatchの1か所だけ() {
+    let root = repo_root();
     let mut offenders = Vec::new();
     for krate in ["tako-core", "tako-control", "tako-app", "tako-cli"] {
-        let dir = repo_root().join("crates").join(krate).join("src");
+        let dir = root.join("crates").join(krate).join("src");
         for path in walk_rs(&dir) {
-            let rel = path
-                .strip_prefix(repo_root())
-                .unwrap_or(&path)
-                .display()
-                .to_string();
-            if rel == CORE {
-                continue;
-            }
+            let rel = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy();
             let src = std::fs::read_to_string(&path).unwrap_or_default();
-            // 字面すら無いファイルは読まない（丸ごとテスト・コメントだけのファイルは
-            // 本番の範囲が空で、共通部品が「空」として止める = 見るものが無い）
-            if !src.contains("file_move::execute(") {
-                continue;
-            }
-            let prod = production_range::scan(&src).text;
-            let view = without_comments_checked(&prod, &rel);
-            for (i, line) in view.lines().enumerate() {
-                if line.contains("file_move::execute(") && rel != DISPATCH {
-                    offenders.push(format!("{rel}:{} {}", i + 1, line.trim()));
-                }
-            }
+            offenders.extend(execute_offenders(&rel, &src));
         }
     }
     assert!(
@@ -634,6 +646,47 @@ fn 注入_uiが自分で移すと名指す() {
     )
     .expect_err("MCP の op=move の欠落を見逃した");
     assert!(err.starts_with(&format!("{MCP_REQUEST}:")), "{err}");
+}
+
+/// Windows の区切り（`\`）で走査結果が来ても、許した dispatch 自身は数えず、
+/// 他のファイルへ足した移動の実行は `/` 区切りの file:line で名指す
+/// （#1834 の Windows CI: `display()` の字面を `/` 区切りの定数と比べ、dispatch 自身を違反に数えた）
+#[test]
+fn 注入_windowsの区切りでもdispatch以外の実行だけを名指す() {
+    let windows = |rel: &str| rel.replace('/', "\\");
+    let dispatch = std::fs::read_to_string(repo_root().join(DISPATCH)).expect("読める");
+    assert!(
+        dispatch.contains("file_move::execute("),
+        "{DISPATCH}:1 前提: dispatch が移動を実行している"
+    );
+    for rel in [DISPATCH.to_string(), windows(DISPATCH)] {
+        assert_eq!(
+            execute_offenders(&rel, &dispatch),
+            Vec::<String>::new(),
+            "許した dispatch 自身を違反に数えた（{rel}）"
+        );
+    }
+    // UI が自分で実行する写し（ドロップの中で dispatch を通らずに移す）
+    let marker = "        use tako_core::file_move::{DropVerdict, MoveRefusal};\n";
+    let sidebar = std::fs::read_to_string(repo_root().join(SIDEBAR)).expect("読める");
+    assert!(sidebar.contains(marker), "{SIDEBAR}:1 注入の目印が無い");
+    let bad = sidebar.replacen(
+        marker,
+        &format!("{marker}        let _ = tako_core::file_move::execute(&plan);\n"),
+        1,
+    );
+    let line = bad
+        .lines()
+        .position(|l| l.trim() == "let _ = tako_core::file_move::execute(&plan);")
+        .expect("注入した行")
+        + 1;
+    for rel in [SIDEBAR.to_string(), windows(SIDEBAR)] {
+        let offenders = execute_offenders(&rel, &bad);
+        assert!(
+            offenders.len() == 1 && offenders[0].starts_with(&format!("{SIDEBAR}:{line} ")),
+            "UI の直接実行を file:line で名指していない（{rel}）: {offenders:?}"
+        );
+    }
 }
 
 #[test]
