@@ -6981,10 +6981,21 @@ mod tests {
             hostname: host.to_string(),
             login: "user@example.com".to_string(),
         };
-        let observe = who("nTEST1724OBSERVE", "phone-observe");
-        let interact = who("nTEST1724INTERACT", "phone-interact");
-        let revoked = who("nTEST1724REVOKED", "phone-revoked");
-        let stranger = who("nTEST1724STRANGER", "phone-stranger");
+        // 端末 ID に**この回の印**を入れ、persist.log はこの印の行だけを数える（#1814）。
+        // persist.log は data dir に積もるので、明示の `TAKO_DATA_DIR` を使い回すと
+        // 前の回の「実行」の行まで数えて偽の FAILED になる
+        let run_mark = format!(
+            "R{}T{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        );
+        let observe = who(&format!("nTEST1724OBSERVE{run_mark}"), "phone-observe");
+        let interact = who(&format!("nTEST1724INTERACT{run_mark}"), "phone-interact");
+        let revoked = who(&format!("nTEST1724REVOKED{run_mark}"), "phone-revoked");
+        let stranger = who(&format!("nTEST1724STRANGER{run_mark}"), "phone-stranger");
         let mut registry = DeviceRegistry::open(&dir).expect("レジストリ");
         for (ip, w, role) in [
             ("100.64.0.21", &observe, Some(DeviceRole::Observe)),
@@ -7112,11 +7123,14 @@ mod tests {
         let ran: Vec<&str> = log
             .lines()
             .filter(|l| l.contains("リモートからコマンドカードを実行"))
-            .filter(|l| l.contains("nTEST1724"))
+            .filter(|l| l.contains(run_mark.as_str()))
             .collect();
         assert_eq!(ran.len(), 1, "受け口へ届いた実行は 1 回だけのはず: {ran:?}");
         assert!(
-            ran[0].contains("端末=nTEST1724INTERACT カード=7 番号=1 結果=app_unreachable"),
+            ran[0].contains(&format!(
+                "端末={} カード=7 番号=1 結果=app_unreachable",
+                interact.stable_id
+            )),
             "どの端末から・どのカードを・どうなったかが残る: {ran:?}"
         );
 
