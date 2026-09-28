@@ -3399,7 +3399,11 @@ impl TakoApp {
                                     },
                                 );
                             elements.push(crate::md_view::render_block(
-                                &theme, block, code_index, &mut sink,
+                                &theme,
+                                theme.font_size,
+                                block,
+                                code_index,
+                                &mut sink,
                             ));
                         }
                     }

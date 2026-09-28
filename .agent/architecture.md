@@ -1979,8 +1979,8 @@ property テスト（置換の 4 条件 = 大文字小文字 × 単語単位と�
   ページ移動の歩幅（`run_editor_command_local`）・IME の 1 フレーム目の見積もり
   （`preview_pending_cursor_origin`）がすべてこれを使う。旧実装は追従が器の高さ − 上下の
   余白を `theme.line_height`（ターミナルのセル高 13pt × 1.3 = 17px）で、ページ移動が
-  器の高さ − 上余白を描いた行の高さで、別々に数えていた。コード行は祖先の文字サイズ ×
-  gpui の既定の行高（φ 倍を丸めた値 = 21px）で組まれ、GPUI の `list` は下の余白の中まで
+  器の高さ − 上余白を描いた行の高さで、別々に数えていた。コード行は本文の器が指定する文字サイズ ×
+  `PREVIEW_BODY_LINE_HEIGHT`（φ 倍を丸めた値 = 13pt で 21px。#1772）で組まれ、GPUI の `list` は下の余白の中まで
   描く（クリップは器の矩形）。661px の器で実矩形 30 行を追従は 37 行と数え、↓ で進むと
   カーソルが画面の外へ出ていた。文書が器より短いときは残りを 1 行の高さで埋めて器の容量を
   返し、まだ 1 行も描いていなければ同じ gpui の計算で行の高さを見積もる。既知の限界:
@@ -1989,6 +1989,21 @@ property テスト（置換の 4 条件 = 大文字小文字 × 単語単位と�
   `issue1741_viewport_lines_watchdog`（4 規則）、実測は `scripts/test-viewport-lines-1741.sh`
   （visual-test 節 `viewport-lines`。正解は描いた行の実矩形。文字サイズ 8 / 13 / 32pt で
   実矩形 49 / 30 / 12 行と一致・器が動き始める行と下の余白 3 行が設計どおり）
+- **本文の文字サイズはペイン単位**（#1772）: ⌘+ / ⌘- / ⌘0 はコード / md では `pane_font_sizes`
+  （ターミナルと同じ値）を動かす。gpui の `StyledText` は字の大きさと行高を**祖先の text style** から採り、
+  `with_default_highlights` へ渡す `TextStyle` のそれは使わない（#947 と同じ機序）ので、効かせる場所は
+  本文の器（`render_preview_pane` の `preview-scroll`）しか無い。そこで `.text_size(px(body_font_size))` と
+  `.line_height(PREVIEW_BODY_LINE_HEIGHT)`（φ = gpui の既定と同じ比）を**継承側で**指定する。
+  値の口は `preview_body_font_size` の 1 実装で、器・md の基準（`md_view::render_block(theme, base, …)`）・
+  コピーボタン・行の高さの見積もり・仮想リストの測り直し（文字サイズだけが変われば
+  `ListState::remeasure`。gpui の `list` は見えている item しか測り直さない）がすべてそこから採る。
+  可視行数・追従・ページ移動・クリックは描いた行の実寸を読むので手を入れずに追従した。
+  見積もり（1 行も描いていないフレーム）は論理 px で丸めるが、gpui は行高をデバイスピクセルへ丸める
+  （2x で 15pt → 24.5px）ので差は最大で半デバイスピクセル。番犬は `issue1772_preview_font_size_watchdog`
+  （6 規則・注入 8 通り）、実測は `scripts/test-editor-font-1772.sh`（visual-test 節 `editor-font` の
+  新旧 2 腕 + 実 CLI / MCP の新旧 2 腕）。既知の境界（文字サイズに依らない・#1741 側）: 文書末では
+  `list` が最終行を器の下端へ揃えて最上段の行が上へはみ出す（上余白 14px を超える offset）ので、
+  `preview_row_geometry` はその行も数えて実矩形より 1 行多い（13pt で 30 行に対し 31 行。tako-vd 実測）
 - 回帰検出は番犬 `issue1649_cursor_follow_watchdog`（6 規則・注入 9 通り）+
   `editor_scroll` の単体 11 本 + `preview_render` の単体 2 本 + visual-test 節
   `cursor-follow`（7 相。実ピクセルではなく器の実測値で見るので画面収録の権限が要らない）。

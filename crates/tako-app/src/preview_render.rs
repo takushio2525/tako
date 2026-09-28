@@ -69,6 +69,35 @@ pub(crate) const MD_COPY_FEEDBACK: std::time::Duration = std::time::Duration::fr
 /// 同じリテラルを散らさず 1 か所に置く
 pub(crate) const PREVIEW_BODY_PADDING: f32 = PANE_PADDING + 4.0;
 
+/// プレビュー本文（コード行・行番号・md の段落）の行の高さ（#1772 / #611）。
+///
+/// 文字サイズに対する**比**で持つ（φ = gpui の `TextStyle` の既定と同じ値なので、
+/// 既定の文字サイズでは行ピッチは従来どおり 13pt → 21px）。本文の器が文字サイズと一緒に
+/// **継承側で明示する**ので、祖先（ルート）の行高が変わっても本文は動かず、文字サイズを
+/// 変えれば行も同じ比で伸び縮みする。ターミナルのセル高（`theme.line_height` =
+/// 文字サイズ × 17/13）とは別の値で、コード行をそちらへ詰めるかは #611 の判断事項
+pub(crate) const PREVIEW_BODY_LINE_HEIGHT: gpui::DefiniteLength = gpui::phi();
+
+/// 本文の文字サイズをペインへ追従させる前（#1772 以前）へ戻して同じバイナリで A/B を取る
+/// 逃げ道（`TAKO_1772_LEGACY=1`）。旧挙動 = 本文はテーマ既定の文字サイズのまま
+/// （⌘+ / ⌘- / ⌘0 でペインの文字サイズは変わるのに、字も行の高さも動かない）。
+///
+/// visual-test 節 `editor-font` の検出力の実証に使う（同じバイナリを 2 回走らせ、
+/// 旧挙動の腕だけが名指しで落ちることを見る）。本文の 1 ブロックごとに読むので `OnceLock`
+pub(crate) fn preview_font_legacy() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_1772_LEGACY").is_some())
+}
+
+/// 本文の仮想リストを組んだときの材料（#821 / #826 / #1772）
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PreviewBodyBuild {
+    /// item 数（コード = 行 / md = ブロック）。変われば作り直す
+    pub(crate) count: usize,
+    /// 本文の文字サイズ（pt）。変われば全 item の高さを測り直す（#1772）
+    pub(crate) font_size: f32,
+}
+
 /// 本文の器を行の単位で測った値（#1741。[`TakoApp::preview_row_geometry`] が作る）
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PreviewRowGeometry {
@@ -242,7 +271,9 @@ impl crate::md_view::MdTextSink for MdSelectionSink<'_, '_> {
     fn code_overlay(&mut self, index: usize) -> Option<crate::md_view::MdCodeOverlay> {
         let app = self.app;
         let pane_id = self.pane_id;
-        let base = app.theme.font_size;
+        // ボタンの寸法も本文と同じ文字サイズから（#1772。拡大した本文に既定サイズの
+        // ボタンが小さく浮かないように）
+        let base = app.preview_body_font_size(pane_id);
         let group = SharedString::from(format!("md-code-{}-{index}", pane_id.as_u64()));
         let element = app.md_code_copy_button(pane_id, index, group.clone(), base, self.cx);
         Some(crate::md_view::MdCodeOverlay { group, element })
@@ -1344,6 +1375,7 @@ impl TakoApp {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme.clone();
+        let body_font_size = self.preview_body_font_size(pane_id);
         self.ensure_pdf_raster_quality(pane_id, area, cx);
         let wanted_images: Vec<usize> = match self.previews.get(&pane_id).map(|p| &p.content) {
             Some(preview::PreviewContent::Pdf(data)) => {
@@ -3565,6 +3597,13 @@ impl TakoApp {
                     // 余白ごとリストへ渡すとクリップ位置が旧経路と一致する
                     .when(body_virtualized, |d| d.px(px(PREVIEW_BODY_PADDING)))
                     .when(!body_virtualized, |d| d.p(px(PREVIEW_BODY_PADDING)))
+                    // #1772 / #611: 本文の文字サイズと行の高さは**継承側（この器）で**決める。
+                    // gpui の `StyledText` は字の大きさと行高を祖先の text style から採り、
+                    // `with_default_highlights` へ渡す `TextStyle` のそれは使わない（#947 と
+                    // 同じ機序）。ここで指定しないと本文はルートの `theme.font_size` のままで、
+                    // ⌘+ / ⌘- / ⌘0 が動かすペインの文字サイズ（`pane_font_sizes`）が効かない
+                    .text_size(px(body_font_size))
+                    .line_height(PREVIEW_BODY_LINE_HEIGHT)
                     .flex()
                     .flex_col()
                     // #821 / #826: 仮想化した本文は中の `list` が自分でスクロールを持つ。
@@ -3915,26 +3954,38 @@ impl TakoApp {
         kind: PreviewBodyKind,
         count: usize,
     ) -> gpui::ListState {
+        let build = PreviewBodyBuild {
+            count,
+            font_size: self.preview_body_font_size(pane_id),
+        };
         if let Some((state, built_kind, built_for)) = self.preview_body_lists.get(&pane_id) {
-            if *built_kind == kind && *built_for == count {
-                return state.clone();
-            }
-            let same_kind = *built_kind == kind;
             let state = state.clone();
-            let keep = state.logical_scroll_top();
-            state.reset(count);
-            if same_kind && keep.item_ix < count {
-                state.scroll_to(keep);
+            if *built_kind == kind && *built_for == build {
+                return state;
+            }
+            if *built_kind == kind && built_for.count == count {
+                // #1772: 文字サイズだけが変わった。gpui の `list` は**見えている item しか
+                // 測り直さない**ので、画面外の行は古い文字サイズの高さのまま総高さと
+                // スクロール量の見積もりに残る。`remeasure` は item の同一性を保ったまま
+                // 高さだけを捨てる（先頭の可視 item の位置は比で保つ）
+                state.remeasure();
+            } else {
+                let same_kind = *built_kind == kind;
+                let keep = state.logical_scroll_top();
+                state.reset(count);
+                if same_kind && keep.item_ix < count {
+                    state.scroll_to(keep);
+                }
             }
             self.preview_body_lists
-                .insert(pane_id, (state.clone(), kind, count));
+                .insert(pane_id, (state.clone(), kind, build));
             return state;
         }
         // overdraw = 画面外にも描いておく高さ。ドラッグ選択がペインの端を
         // またぐときに「行がまだ無い」状態を避けるため広めに取る
         let state = gpui::ListState::new(count, gpui::ListAlignment::Top, px(600.0));
         self.preview_body_lists
-            .insert(pane_id, (state.clone(), kind, count));
+            .insert(pane_id, (state.clone(), kind, build));
         state
     }
 
@@ -3991,8 +4042,9 @@ impl TakoApp {
     /// 数えるのは**実際に描いた行の実寸**: 先頭可視行の上端から、`preview_text_layouts` に
     /// 控えた行の高さ（折り返した行はその高さ）を積み、下端が器に収まる行だけを数える
     /// （[`tako_core::editor_scroll::visible_rows`]）。器の高さを `theme.line_height` で
-    /// 割ってはいけない: あれはターミナルのセル高（13pt × 1.3 = 17px）で、コード行は祖先の
-    /// 文字サイズと gpui の既定の行高（φ 倍 = 21px）で組まれる。先頭行は器の上端から
+    /// 割ってはいけない: あれはターミナルのセル高（13pt × 1.3 = 17px）で、コード行は本文の器が
+    /// 指定する文字サイズ（ペインの文字サイズ。#1772）と [`PREVIEW_BODY_LINE_HEIGHT`]
+    /// （φ 倍 = 既定の 13pt で 21px）で組まれる。先頭行は器の上端から
     /// 上余白（`PREVIEW_BODY_PADDING`）ぶん下に描かれ、GPUI の `list` は下の余白の中まで
     /// 描く（クリップは器の矩形）ので、数える下端は器の下端そのもの
     pub(crate) fn preview_row_geometry(&self, pane_id: PaneId) -> Option<PreviewRowGeometry> {
@@ -4007,7 +4059,7 @@ impl TakoApp {
         let line_height = painted
             .and_then(|rows| rows.iter().flatten().next())
             .map(TextLayout::line_height)
-            .unwrap_or_else(|| self.preview_code_line_height_estimate());
+            .unwrap_or_else(|| self.preview_code_line_height_estimate(pane_id));
         // 仮想リストはスクロール状態から出す（`scroll_to` は論理位置を即座に書き換えるので、
         // 次の描画を待たずに連打された ↓ でも正しい位置から数えられる）。div スクロールは
         // 描いた行の位置を使う
@@ -4038,16 +4090,38 @@ impl TakoApp {
 
     /// 行をまだ 1 行も描いていないときの、コード行 1 行の高さの見積もり（#1741）。
     ///
-    /// コード行は高さを指定せず、祖先（ルート）の文字サイズ + gpui の既定の行高
-    /// （`TextStyle::default().line_height` = 文字サイズの φ 倍を丸めた値）で組まれるので、
-    /// 同じ計算をここでもする
-    fn preview_code_line_height_estimate(&self) -> Pixels {
+    /// コード行は高さを指定せず、本文の器が指定する文字サイズ（#1772。
+    /// [`Self::preview_body_font_size`]）と行の高さ（[`PREVIEW_BODY_LINE_HEIGHT`] =
+    /// 文字サイズの φ 倍）で組まれるので、同じ 2 つから計算する。gpui の `StyledText` は
+    /// これを**デバイスピクセルへ**丸める（2x の画面で 15pt → 24.5px）が、ここには画面の倍率が
+    /// 無いので論理 px で丸める（差は最大で半デバイスピクセル。1 行でも描けば実寸に置き換わる）
+    fn preview_code_line_height_estimate(&self, pane_id: PaneId) -> Pixels {
+        let font_size = px(self.preview_body_font_size(pane_id));
         let style = gpui::TextStyle {
-            font_size: px(self.theme.font_size).into(),
+            font_size: font_size.into(),
+            line_height: PREVIEW_BODY_LINE_HEIGHT,
             ..gpui::TextStyle::default()
         };
         // 行高は相対値（φ）で文字サイズは px 指定なので、rem は計算に効かない
-        style.line_height_in_pixels(px(self.theme.font_size))
+        style.line_height_in_pixels(font_size)
+    }
+
+    /// プレビュー本文の文字サイズ（pt。#1772）。
+    ///
+    /// **本文の器（`render_preview_pane` の `preview-scroll`）・md の基準サイズ・
+    /// 行の高さの見積もり・仮想リストの測り直しがすべてここから採る 1 実装**。
+    /// 値はターミナルと同じペイン単位の文字サイズ（`pane_font_size`）で、⌘+ / ⌘- / ⌘0
+    /// （`zoom_focused_pane` → `pane_font_sizes`）とメニュー（CLI `tako menu invoke` /
+    /// MCP `tako_menu`）はどちらもそれを動かす。PDF・画像は同じキーが内容ズーム
+    /// （FR-3.14）へ分岐するので、この値は動かない。
+    ///
+    /// 旧実装は本文がこれを読まずルートの `theme.font_size` を継承していたので、
+    /// ⌘+ でペインの値は 13 → 16 に変わっても字も行の高さ（21px）も動かなかった
+    pub(crate) fn preview_body_font_size(&self, pane_id: PaneId) -> f32 {
+        if preview_font_legacy() {
+            return self.theme.font_size;
+        }
+        self.pane_font_size(pane_id)
     }
 
     /// 編集カーソルの位置と、**行の単位で見た**本文の可視範囲（#1649）。
@@ -4519,6 +4593,10 @@ impl TakoApp {
         cx: &mut Context<Self>,
     ) -> (gpui::AnyElement, Vec<Option<TextLayout>>) {
         let theme = self.theme.clone();
+        // #1772: 見出し・コードブロック・余白・行の高さの基準も本文の文字サイズ
+        // （段落の字は本文の器から継承する。ここを `theme.font_size` にすると
+        // 拡大しても段落だけが大きく、見出しと行間は既定のまま食い違う）
+        let base = self.preview_body_font_size(pane_id);
         let mut sink = MdSelectionSink {
             app: self,
             cx,
@@ -4527,7 +4605,7 @@ impl TakoApp {
             line: 0,
             layouts: Vec::with_capacity(lines.len()),
         };
-        let element = crate::md_view::render_block(&theme, block, code_index, &mut sink);
+        let element = crate::md_view::render_block(&theme, base, block, code_index, &mut sink);
         let layouts = sink.layouts;
         debug_assert_eq!(
             layouts.len(),
