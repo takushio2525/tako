@@ -72,3 +72,7 @@
 ## 2026-09-27（#1834: ファイルツリーの D&D でファイル・フォルダを別のフォルダへ移せるようにした）
 - 判定・実行・付け替え先は `tako_core::file_move` の 1 実装 → dispatch `FileOp{op: move, dest}` → CLI `tako file move` / MCP `tako_file_op` の `op=move`（ツールは増やさない）。同名・自分の配下・別のボリューム（EXDEV）は理由つきで断る
 - 開いているペイン（未保存の編集中・フォルダの配下）はパス・バッファ・LSP（didClose → didOpen）・監視ごと付け替わり #1659 の削除扱いにならない。実マウス 13 場面 + CLI/MCP 字面一致 7 組・A/B `TAKO_1834_LEGACY=1` で FAILED・番犬 13 本
+## 2026-09-28（#1834: ファイルツリーの D&D でファイル・フォルダを別のフォルダへ移せるようにした）
+- 判定・実行・付け替え先は `tako_core::file_move` の 1 実装 → dispatch `FileOp{op: move, dest}` → CLI `tako file move` / MCP `tako_file_op` の `op=move`（ツールは増やさない）。同名・自分の配下・別のボリューム（EXDEV）は理由つきで断る。開いているペインはパス・バッファ・LSP（didClose → didOpen）・監視ごと付け替わり #1659 の削除扱いにならない
+- 仕上げで、大文字小文字を変えて名指すと付け替えと配下の判定が外れる穴（macOS の APFS / Windows。`from_real` の最後の成分が綴りのまま）を実測で再現して直した（リンク以外は移す元ごと canonicalize）
+- 実測: `scripts/test-tree-move-1834.sh` 31 PASS 0 FAIL（実マウス 13 場面・CLI/MCP 字面一致 7 組・A/B `TAKO_1834_LEGACY=1` で FAILED）・workspace 6161 passed 0 failed・clippy 3 宇宙 0・check-windows error 0（足した行の警告 0）

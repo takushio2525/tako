@@ -170,9 +170,9 @@ pub struct MovePlan {
     /// 移した後のパス（移動先のフォルダ + 元の名前）
     pub to: PathBuf,
     pub kind: EntryKind,
-    /// 移す元の実体の形（親だけ `canonicalize` し、最後の成分は辿らない = リンクそのもの）。
-    /// 開いているファイルの照合で、字面が食い違うとき（`/tmp` と `/private/tmp`、
-    /// Windows の大文字小文字）に使う
+    /// 移す元の実体の形（`canonicalize` 済み。リンクだけは親まで引いて最後の成分を辿らない
+    /// = リンクそのもの）。開いているファイルの照合で、字面が食い違うとき
+    /// （`/tmp` と `/private/tmp`、macOS / Windows の大文字小文字）に使う
     from_real: PathBuf,
 }
 
@@ -218,15 +218,22 @@ pub fn plan(src: &Path, dest_dir: &Path) -> Result<Planned, MoveRefusal> {
     if !std::fs::metadata(dest_dir).is_ok_and(|m| m.is_dir()) {
         return Err(MoveRefusal::DestNotDir);
     }
-    // 実体の形で比べる。移す元は**最後の成分を辿らない**（リンクを移すときに
-    // 指す先のフォルダと取り違えない）
-    let parent = src
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let from_real = canonicalize(parent)
-        .map_err(|_| MoveRefusal::SourceMissing)?
-        .join(name);
+    // 実体の形で比べる。リンクは**最後の成分を辿らない**（リンクを移すときに
+    // 指す先のフォルダと取り違えない）ので親だけを引く。それ以外は移す元そのものを引く:
+    // 親だけだと最後の成分が呼び手の綴りのまま残り、大文字小文字を区別しない
+    // ファイルシステム（macOS の既定・Windows）で `FOLDER` と実体の `folder` を別物と見て、
+    // 配下の判定と開いているペインの照合が外れる
+    let from_real = if kind == EntryKind::Symlink {
+        let parent = src
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        canonicalize(parent)
+            .map_err(|_| MoveRefusal::SourceMissing)?
+            .join(name)
+    } else {
+        canonicalize(src).map_err(|_| MoveRefusal::SourceMissing)?
+    };
     let dest_real = canonicalize(dest_dir).map_err(|_| MoveRefusal::DestNotDir)?;
     match lexical_verdict(&from_real, &dest_real) {
         DropVerdict::Refused(refusal) => return Err(refusal),
@@ -621,6 +628,50 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![base.join("dst/d/a.txt")]
         );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// 大文字小文字を区別しないファイルシステム（macOS の既定・Windows）で、呼び手が
+    /// 実体と違う綴りで名指しても、配下の判定と開いているペインの付け替えが当たる。
+    /// 移す元の最後の成分を綴りのまま実体の形に使うと、どちらも外れる
+    /// （付け替わらないペインは #1659 の「外で削除された」になる）
+    #[test]
+    fn 大文字小文字を変えて名指しても配下の判定と付け替えが当たる() {
+        let base = scratch("case");
+        touch(&base.join("folder/inner/x.txt"), "x");
+        touch(&base.join("y.txt"), "y");
+        std::fs::create_dir_all(base.join("dst")).unwrap();
+        // 区別するファイルシステム（Linux の既定）では別の名前なので、この検査の対象外
+        if !base.join("FOLDER").exists() {
+            std::fs::remove_dir_all(&base).unwrap();
+            return;
+        }
+        assert_eq!(
+            plan(&base.join("DST"), &base.join("dst")),
+            Err(MoveRefusal::IntoSelf)
+        );
+        assert_eq!(
+            plan(&base.join("FOLDER"), &base.join("folder/inner")),
+            Err(MoveRefusal::IntoDescendant)
+        );
+        let open = vec![
+            (3, base.join("folder/inner/x.txt")),
+            (4, base.join("y.txt")),
+        ];
+        let pairs = |p: &MovePlan| {
+            follows(p, &open)
+                .into_iter()
+                .map(|f| (f.pane, f.to))
+                .collect::<Vec<_>>()
+        };
+        let Ok(Planned::Move(p)) = plan(&base.join("FOLDER"), &base.join("dst")) else {
+            panic!("フォルダを移す段取りが立たない");
+        };
+        assert_eq!(pairs(&p), vec![(3, base.join("dst/FOLDER/inner/x.txt"))]);
+        let Ok(Planned::Move(p)) = plan(&base.join("Y.TXT"), &base.join("dst")) else {
+            panic!("ファイルを移す段取りが立たない");
+        };
+        assert_eq!(pairs(&p), vec![(4, base.join("dst/Y.TXT"))]);
         std::fs::remove_dir_all(&base).unwrap();
     }
 
