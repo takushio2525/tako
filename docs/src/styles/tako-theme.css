@@ -18,7 +18,9 @@
  *      b. ランディングで本文幅が狭いまま右側が大きく余る
  */
 
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Noto+Sans+JP:wght@400;500;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+/* Web フォント（Inter / Noto Sans JP / JetBrains Mono）は astro.config.mjs の head で
+ * 読む。ここで @import すると「HTML → この CSS → フォントの CSS」の 3 段連鎖になり、
+ * 約 90KB のフォント CSS が届くまで描画が止まっていた（#1843） */
 
 /* ============================================================
  * 共通トークン（テーマ非依存）
