@@ -1,6 +1,7 @@
 ---
 title: オーケストレーションとは
-description: 複数の AI エージェントを指揮者のように束ねる — tako のオーケストレーションの考え方と魅力
+seoTitle: AI エージェントのオーケストレーションとは — 複数の Claude Code を並列で動かす
+description: 司令塔の AI（master）が依頼を分解し、担当の AI（worker）を同じタブのペインに立ち上げて並列に働かせる。tako のオーケストレーションの考え方と、スクリプトや tmux で自作する場合との違いを説明します
 ---
 
 tako の目玉機能である「オーケストレーション」を、予備知識ゼロから説明します。実際の使い方は [tako master 実践ガイド](/features/orchestrator/)を参照してください。
@@ -123,3 +124,4 @@ tako master
 - [クイックスタート](/getting-started/quickstart/) — 最短 3 ステップの体験手順
 - [tako master 実践ガイド](/features/orchestrator/) — 話しかけ方の実例・つまずきポイント・仕組みの詳細
 - [内蔵 MCP サーバー](/features/mcp-server/) — オーケストレーションを支える AI 連携の仕組み
+- [Claude Code を複数同時に動かす](/guides/parallel-agents/) — tako を使わない方法も含めた 3 通りのやり方と、並列にしたときの落とし穴

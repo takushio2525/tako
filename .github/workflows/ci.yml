@@ -57,6 +57,12 @@ jobs:
       - name: docs の内部リンクを検査（#1547）
         working-directory: docs
         run: node scripts/verify-links.mjs
+      # 検索向けの head と sitemap（title / description の重複・canonical・noindex・
+      # 構造化データ・FAQ が本文と一致するか・sitemap が全ページを載せ robots から辿れるか）。
+      # どれも壊れても表示は変わらないので、ここで落とさないと検索結果で気づく（#1843）
+      - name: docs の検索向けの head と sitemap を検査（#1843）
+        working-directory: docs
+        run: node scripts/verify-seo.mjs
       # 旧ドメインの転送（functions/_middleware.js）が常に正規のオリジンへ 301 すること
       # と、dist/_headers に配信ヘッダ（HSTS・埋め込み禁止・CSP の基本指令ほか）が
       # 載っていること。Pages 側でしか効かないので、ここで落とさないと本番で気づく（#1708）

@@ -1,5 +1,6 @@
 ---
 title: OpenAI Codex CLI
+seoTitle: OpenAI Codex CLI を tako で使う — 導入・MCP 接続・Claude Code との違い
 description: codex を tako で使う手順（導入・ログイン・MCP 接続・master / worker としての使い方）と、Claude Code との差分
 ---
 

@@ -1,6 +1,7 @@
 ---
 title: 内蔵 MCP サーバー
-description: tako 最大の差別化点 — 設定ゼロで AI がターミナルを操作
+seoTitle: 内蔵 MCP サーバー — Claude Code がターミナルのペインを分割・操作する
+description: tako の中で Claude Code や Codex を起動すると、MCP の設定を書かずにペインの分割・コマンド実行・画面の読み取り・ファイル表示を AI に任せられます。tako 最大の差別化点の仕組みと、できることをまとめています
 ---
 
 tako は **MCP（Model Context Protocol）サーバーを内蔵**しています。AI エージェントが設定ゼロでペインの分割・コマンド実行・ファイル表示を行えるのが、他のターミナルとの最大の違いです。

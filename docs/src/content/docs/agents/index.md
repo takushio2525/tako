@@ -1,5 +1,6 @@
 ---
 title: エージェントの選び方
+seoTitle: AI エージェントの選び方 — Claude Code・Codex・Antigravity・ローカル LLM
 description: tako で使えるエージェント CLI は 4 系統。どれを選ぶか、あとから切り替えるにはどうするかをまとめています
 ---
 

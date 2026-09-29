@@ -13,6 +13,14 @@ const GA_MEASUREMENT_ID = 'G-30GVXMB0GH';
 // 1 つ置けば全サブドメインへ効くため、このサイトには置かない。
 const ADSENSE_PUBLISHER_ID = 'ca-pub-3136871606832456';
 
+// 本文・見出し・コードの Web フォント。以前は tako-theme.css の先頭で @import していたが、
+// それだと「HTML → CSS → このフォントの CSS（Noto Sans JP の分割定義で約 90KB）」の
+// 3 段連鎖になり、届くまで描画が止まっていた（Lighthouse の render-blocking で約 1.5 秒。#1843）。
+// head で先に接続を開き、フォントの CSS は描画を止めずに読む。届くまでは
+// `--sl-font` の後ろにある system-ui で描き、届いたら差し替わる（display=swap と同じ挙動）。
+const WEB_FONTS_CSS =
+	'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Noto+Sans+JP:wght@400;500;700&family=JetBrains+Mono:wght@400;500;600&display=swap';
+
 export default defineConfig({
 	// 公開 URL。canonical / og:url / sitemap / OG 画像の絶対 URL の基点になる
 	// （crates/tako-app/src/about_window.rs の DOCUMENTATION_URL と同じ URL）
@@ -32,6 +40,27 @@ export default defineConfig({
 						"if (location.hostname.replace(/\\.$/, '') === 'tako-docs.pages.dev') {" +
 						"location.replace('https://tako.takushio2525.com' + location.pathname + location.search + location.hash);" +
 						"}",
+				},
+				// Web フォント（WEB_FONTS_CSS の説明を参照）。接続を先に開いておき、CSS は
+				// media="print" で描画を止めずに取ってから all へ切り替える。JS が動かない環境は
+				// noscript の通常読み込みへ落ちる（見た目の最終状態はどの経路でも同じ）。
+				{ tag: 'link', attrs: { rel: 'preconnect', href: 'https://fonts.googleapis.com' } },
+				{
+					tag: 'link',
+					attrs: { rel: 'preconnect', href: 'https://fonts.gstatic.com', crossorigin: true },
+				},
+				{
+					tag: 'link',
+					attrs: {
+						rel: 'stylesheet',
+						href: WEB_FONTS_CSS,
+						media: 'print',
+						onload: "this.media='all'",
+					},
+				},
+				{
+					tag: 'noscript',
+					content: `<link rel="stylesheet" href="${WEB_FONTS_CSS}">`,
 				},
 				// Cookie 同意（Consent Mode v2）。takushio2525.com 一族で共用のバナー本体を読む。
 				// **Google タグより前に `async` を付けずに**置くのが条件（`gtag('consent',
@@ -115,6 +144,8 @@ export default defineConfig({
 					items: [
 						{ label: 'オーケストレーションとは', slug: 'features/orchestration' },
 						{ label: 'tako master 実践ガイド', slug: 'features/orchestrator' },
+						{ label: 'Claude Code を複数同時に動かす', slug: 'guides/parallel-agents' },
+						{ label: 'tmux で AI エージェントを動かす', slug: 'guides/tmux-agents' },
 						{ label: '内蔵 MCP サーバー', slug: 'features/mcp-server' },
 						{ label: '人がやること（ユーザータスク）', slug: 'features/user-tasks' },
 					],

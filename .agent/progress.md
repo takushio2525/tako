@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-09-27（#1783: TAKO_VD_NAME に物理画面の名前を渡しても tako-vd と見なさないようにし、面の指定の判定を面を起こす前へ移した）
-- `ensure` の締めの先頭に「器が作った仮想ディスプレイか」（内蔵 = CGDisplayIsBuiltin / 器の一覧に名前が無い）を置き、物理画面なら終了コード 3 と理由 1 行で断る（修正前はスタブ実測で rc=0・その面の uuid を記録・内蔵なら器へ main を撃っていた）。ヘルパは 3 を使い方の誤り（2）として返し、`TAKO_DISPLAY` の判定を面を起こす前へ移した（uuid の記録との突き合わせだけは起こした後。FR-4.8.20〜22）
-- 実測: 注入 9 通りすべて file:line 名指しで FAILED → 戻して緑・モック 154 PASS（/bin/bash 3.2）・本物の tako-vd で ensure rc=0（構成の前後差分なし）・書き方の誤った `TAKO_DISPLAY` は ensure を呼ばず 0.01 秒で rc=2
-
 ## 2026-09-27（#1763: 実行中のテーマの読み直しでも読めない色を persist.log へ残すようにした）
 - 起動時だけが警告を残し、`reload_theme`（`tako theme` / MCP / 設定画面）とタブバーのトグルは `resolve_theme()` の警告を捨てていた。3 経路とも `load_theme_logged` → `settings::ThemeWarningLog` の 1 本へ寄せ、前回と同じ警告は出さず増えたぶんを起動時と同じ「無視」、消えたぶんを「解消」で出す
 - 実測: `scripts/test-theme-reload-1763.sh` 修正前 16 PASS 10 FAIL（読み直し 0 行）→ 修正後 30 PASS 0 FAIL（CLI / MCP / toggle / 壊れた JSON）・注入 7 通りすべて file:line 名指しで FAILED → 戻して緑
@@ -70,3 +66,7 @@
 - 判定・実行・付け替え先は `tako_core::file_move` の 1 実装 → dispatch `FileOp{op: move, dest}` → CLI `tako file move` / MCP `tako_file_op` の `op=move`（ツールは増やさない）。同名・自分の配下・別のボリューム（EXDEV）は理由つきで断る。開いているペインはパス・バッファ・LSP（didClose → didOpen）・監視ごと付け替わり #1659 の削除扱いにならない
 - 仕上げで、大文字小文字を変えて名指すと付け替えと配下の判定が外れる穴（macOS の APFS / Windows。`from_real` の最後の成分が綴りのまま）を実測で再現して直した（リンク以外は移す元ごと canonicalize）。番犬「移動の実行はdispatchの1か所だけ」が Windows の区切り（`display()` の字面を `/` の定数と比較）で dispatch 自身を違反に数えていたのも直した
 - 実測: `scripts/test-tree-move-1834.sh` 31 PASS 0 FAIL（実マウス 13 場面・CLI/MCP 字面一致 7 組・A/B `TAKO_1834_LEGACY=1` で FAILED）・workspace 6161 passed 0 failed・clippy 3 宇宙 0・check-windows error 0（足した行の警告 0）
+
+## 2026-09-29（#1843: docs サイトの検索流入を増やす — 検索向けの title・構造化データ・フォントの非同期化・解説 2 本）
+- 主要 17 ページに `seoTitle`（見出しは変えず `<title>` と og:title だけ）・description 10 本を検索意図へ。JSON-LD（トップ WebSite / 各ページ BreadcrumbList / 「よくある質問」節から FAQPage）を `docs/src/structuredData.ts` の 1 か所で組む。フォントの `@import` を head の preconnect + 非同期読み込みへ。解説「Claude Code を複数同時に動かす」「tmux で AI エージェントを動かす」とハブへの導線
+- 実測: `docs/scripts/verify-seo.mjs`（新・CI の docs 節）33 ページ緑・注入 7 通りすべて名指しで FAILED・schema.org 語彙の検査 errors 0。Lighthouse の前後は PR 本文

@@ -1,5 +1,6 @@
 ---
 title: Antigravity CLI
+seoTitle: Antigravity CLI（agy）を tako で使う — worker としての使い方と制約
 description: agy を tako の worker として使う手順と、worker 専用であること・利用制限が読めないことなどの差分
 ---
 

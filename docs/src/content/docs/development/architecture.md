@@ -1,6 +1,6 @@
 ---
 title: アーキテクチャ
-description: tako の内部構造 — crate 構成と 3 層制御プレーン
+description: tako の内部構造。Rust の crate 構成（tako-core / tako-control / tako-app / tako-cli）と、汎用 CLI・内蔵 MCP サーバー・パッシブ検知の 3 層制御プレーン、設計原則を説明します
 ---
 
 tako の技術スタックと内部構造の概要です。

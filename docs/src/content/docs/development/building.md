@@ -1,6 +1,6 @@
 ---
 title: ビルド方法
-description: tako をソースからビルドする手順
+description: tako をソースからビルドする手順。前提条件、ソースの取得、cargo でのビルドと実行、セルフテスト、macOS 用の .app バンドルの生成までを説明します
 ---
 
 tako をソースからビルドする手順です。

@@ -1,5 +1,6 @@
 ---
 title: リモートアクセス
+seoTitle: スマホから AI エージェントを監視・操作する — Tailscale でのリモートアクセス
 description: Tailscale 経由でスマホから tako の画面を見る・操作する — 固定 URL と二層認証の仕組み
 ---
 

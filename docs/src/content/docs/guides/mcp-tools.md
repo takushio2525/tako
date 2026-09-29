@@ -1,5 +1,6 @@
 ---
 title: MCP ツール一覧
+seoTitle: MCP ツール一覧 — AI エージェントがターミナルを操作するためのツール
 description: tako が AI エージェントに公開する 159 個の MCP ツールの全リスト
 ---
 

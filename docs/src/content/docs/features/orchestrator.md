@@ -1,5 +1,6 @@
 ---
 title: tako master 実践ガイド
+seoTitle: tako master の使い方 — AI オーケストレーターの起動・話しかけ方・つまずきポイント
 description: tako master の起動から話しかけ方・会話例・つまずきポイントまで — オーケストレーションを日常で使うための実践ガイド
 ---
 

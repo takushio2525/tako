@@ -1,13 +1,14 @@
 ---
 /**
- * Starlight の Footer を拡張して、全ページ共通の法務リンクを足す。
+ * Starlight の Footer を拡張して、全ページ共通の法務リンクと作者のサイトへの導線を足す。
  *
+ * - 「作者のサイト」はハブ（takushio2525.com）。tako 以外のツールもそこから辿れる（#1843）。
  * - 「プライバシーポリシー」は takushio2525.com 一族で共通の 1 ページ（正本はハブ側）。
  * - 「Cookie 設定」は `data-tk-consent-open` が付いているので、consent.js が
  *   その場で同意バナーを開き直す（遷移しない）。consent.js が動かない環境では
  *   `href` のとおりポリシーの Cookie の節へ飛ぶだけになる。
  *
- * この 2 本は**素の `<a>` で書く**こと。consent.js は document の click を拾って
+ * プライバシーポリシーと Cookie 設定の 2 本は**素の `<a>` で書く**こと。consent.js は document の click を拾って
  * `preventDefault()` するため、フレームワークのリンク部品に置き換えると
  * クライアント遷移が先に走ってバナーが開かない。
  *
@@ -21,6 +22,7 @@ import StarlightFooter from '@astrojs/starlight/components/Footer.astro';
 <StarlightFooter />
 
 <div class="tako-legal">
+  <a href="https://takushio2525.com/">作者のサイト（takushio2525.com）</a>
   <a href="https://takushio2525.com/privacy/">プライバシーポリシー</a>
   <a href="https://takushio2525.com/privacy/#cookie" data-tk-consent-open>Cookie 設定</a>
 </div>
