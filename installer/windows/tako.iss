@@ -129,7 +129,13 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "{#BinDir}\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BinDir}\{#CliExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RepoRoot}\assets\icon\{#IconName}"; DestDir: "{app}"; Flags: ignoreversion
+; ライセンス本文と第三者の告知（Issue #1845。macOS の build-app.sh・ポータブル zip と同じ 3 本）。
+; GPL-3.0 第 4 条・Apache-2.0 第 4 条 (a)・MIT / BSD の表示義務は、バイナリの受け取り手へ
+; 本文と著作権表示を渡すことを求める。LICENSE は .txt を付けてメモ帳で開けるようにする。
+; 3 本が揃っていることは crates/tako-control/tests/license_bundle_watchdog.rs が検査する
 Source: "{#RepoRoot}\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
+Source: "{#RepoRoot}\THIRD-PARTY-NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#RepoRoot}\THIRD-PARTY-LICENSES.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\{#IconName}"

@@ -172,7 +172,11 @@ if (-not $SkipZip) {
         Copy-Item -LiteralPath (Join-Path $binDir 'tako-app.exe') -Destination $payload
         Copy-Item -LiteralPath (Join-Path $binDir 'tako.exe') -Destination $payload
         Copy-Item -LiteralPath $iconPath -Destination $payload
+        # ライセンス本文と第三者の告知（Issue #1845。tako.iss の [Files] と同じ 3 本）。
+        # zip に入ったことは lib/verify-assets.ps1 の Test-TakoLicenseBundle が展開して確かめる
         Copy-Item -LiteralPath (Join-Path $repoRoot 'LICENSE') -Destination (Join-Path $payload 'LICENSE.txt')
+        Copy-Item -LiteralPath (Join-Path $repoRoot 'THIRD-PARTY-NOTICES.md') -Destination (Join-Path $payload 'THIRD-PARTY-NOTICES.md')
+        Copy-Item -LiteralPath (Join-Path $repoRoot 'THIRD-PARTY-LICENSES.md') -Destination (Join-Path $payload 'THIRD-PARTY-LICENSES.md')
         if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
         Compress-Archive -Path $payload -DestinationPath $zipPath -CompressionLevel Optimal
     } finally {

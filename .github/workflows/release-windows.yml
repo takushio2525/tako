@@ -10,9 +10,16 @@
 # 段取り:
 #   1. タグ push で起動（scripts/release.sh の待ち合わせが workflow_dispatch でも起こせる）
 #   2. installer/windows/build-installer.ps1 で installer exe + ポータブル zip を作る
-#   3. installer/windows/lib/verify-assets.ps1 で検査（実機リリースと同じ 1 実装）
+#   3. installer/windows/lib/verify-assets.ps1 で検査（実機リリースと同じ 1 実装）。
+#      加えて、使い捨てのランナーでだけインストーラーを無人インストールし、
+#      インストール先の中身（exe 2 本 + ライセンス 3 本。#1845）を確かめる
 #   4. 成果物を artifact へ上げてから Release へ添付する
 #      （artifact を先に上げるので、添付に失敗しても作り直さずに回収できる）
+#
+# ドライラン（#1845）: タグ以外の ref（ブランチ）から dispatch すると、Cargo.toml の版数で
+# 1〜3 と artifact への保存までを行い、**Release へは添付しない**。PR の CI は Windows の
+# 配布物を組まないので、組み立て（build-installer.ps1 / tako.iss）を変えた PR はこれで確かめる:
+#   gh workflow run release-windows.yml --ref <ブランチ>
 #
 # リリースノート（ダウンロード表 / Windows 手順 / 動作要件 / Known limitations）は
 # macOS 側の scripts/release.sh が実アセットを読み直して作る。このワークフローは触らない
@@ -46,21 +53,30 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: タグと Cargo.toml の版数が噛み合っていることを確認
+      - name: 版数を決める（タグ = Cargo.toml と噛み合うことを確認 / タグ以外 = ドライラン）
         shell: pwsh
         run: |
           . installer/windows/lib/verify-assets.ps1
-          $tag = '${{ github.ref_name }}'
-          if ($tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?$') {
-            # ブランチから dispatch された場合はここで止める（版数が滅茶苦茶になる）
-            Write-Error "タグ形式ではない: $tag（このワークフローは v* タグから実行する）"
-            exit 1
-          }
           $inWorkspacePackage = $false
           $cargoVersion = $null
           foreach ($line in Get-Content -LiteralPath Cargo.toml) {
             if ($line -match '^\s*\[') { $inWorkspacePackage = $line -match '^\s*\[workspace\.package\]'; continue }
             if ($inWorkspacePackage -and $line -match '^\s*version\s*=\s*"([^"]+)"') { $cargoVersion = $Matches[1]; break }
+          }
+          if ('${{ github.ref_type }}' -ne 'tag') {
+            # ドライラン（#1845）: 版数は Cargo.toml から組む。exe に埋まる版数と同じなので
+            # 検査（FileVersion の突き合わせ）がそのまま通る。Release へは添付しない
+            if (-not $cargoVersion) { Write-Error 'Cargo.toml から workspace.package.version を読めなかった'; exit 1 }
+            $tag = ConvertTo-TakoTag -Version $cargoVersion
+            Write-Host "ドライラン: ref=${{ github.ref_name }} / 版数 $tag（Cargo.toml）。Release へは添付しない"
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value "TAKO_RELEASE_TAG=$tag"
+            exit 0
+          }
+          $tag = '${{ github.ref_name }}'
+          if ($tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?$') {
+            # v* 以外のタグから dispatch された場合はここで止める（版数が滅茶苦茶になる）
+            Write-Error "タグ形式ではない: $tag（このワークフローは v* タグから実行する）"
+            exit 1
           }
           # 比べるのは**数値部分**だけ。exe に埋まる FileVersion は数値しか持てないので、
           # 実際に守らせたい不変条件は「埋まる版数がタグの数値部分と一致する」こと。
@@ -74,6 +90,7 @@ jobs:
             exit 1
           }
           Write-Host "tag=$tag / Cargo.toml=$cargoVersion（数値部分 $tagNumeric）"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "TAKO_RELEASE_TAG=$tag"
 
       # gpui の Windows ビルドは Spectre-mitigated libs が前提（無いとリンクエラー）。
       # ランナーの VS には既定で入っていないため VS インストーラーで追加する（ci.yml と同じ）
@@ -114,6 +131,9 @@ jobs:
           # ci.yml（debug）とは別のキャッシュ。release は lto=thin / codegen-units=1 で
           # 成果物が全く違うため、混ぜると毎回フルビルドになる
           key: release-dist
+          # ドライランの release ビルドは数 GB あり、保存すると main の CI のキャッシュを
+          # 押し出しうるので、保存はタグの実行だけにする
+          save-if: ${{ github.ref_type == 'tag' }}
 
       # ランナーイメージには Inno Setup 6 が入っているが、イメージ更新で消えても
       # リリースを止めないよう「無ければ入れる」形にしておく
@@ -141,7 +161,7 @@ jobs:
       - name: 配布物をビルド（installer exe + ポータブル zip）
         shell: pwsh
         run: |
-          pwsh -File installer/windows/build-installer.ps1 -Version '${{ github.ref_name }}'
+          pwsh -File installer/windows/build-installer.ps1 -Version $env:TAKO_RELEASE_TAG
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # 実機リリース（release-windows.ps1）と同じ検査を通す。
@@ -150,18 +170,31 @@ jobs:
         shell: pwsh
         run: |
           . installer/windows/lib/verify-assets.ps1
-          Test-TakoWindowsAssets -Tag '${{ github.ref_name }}' -OutDir 'dist/windows' | Out-Null
+          Test-TakoWindowsAssets -Tag $env:TAKO_RELEASE_TAG -OutDir 'dist/windows' | Out-Null
+
+      # インストーラーが実際にインストール先へ置くもの（exe 2 本 + ライセンス 3 本。#1845）を、
+      # 使い捨てのランナーへ無人インストールして確かめる。実機では実インストールを
+      # 上書きするので、この検査は CI だけで行う（release-windows.ps1 からは呼ばない）
+      - name: インストーラーを無人インストールして中身を検査（CI だけ）
+        shell: pwsh
+        run: |
+          . installer/windows/lib/verify-assets.ps1
+          $setup = Join-Path 'dist/windows' (Get-TakoAssetName -Tag $env:TAKO_RELEASE_TAG -Platform 'windows' -Arch $TakoAssetArchWindows)
+          Test-TakoInstalledPayload -Setup (Resolve-Path -LiteralPath $setup).ProviderPath
 
       # 添付より先に artifact へ上げる。Release への添付が失敗しても
       # gh run download で回収できるので、ビルドをやり直さずに済む
       - uses: actions/upload-artifact@v4
         with:
-          name: tako-windows-${{ github.ref_name }}
+          # ブランチ名は `/` を含み artifact 名に使えないので、ドライランは run id で名付ける
+          name: ${{ github.ref_type == 'tag' && format('tako-windows-{0}', github.ref_name) || format('tako-windows-dryrun-{0}', github.run_id) }}
           path: dist/windows/*
           if-no-files-found: error
           retention-days: 30
 
       - name: Release へ添付（macOS 側が Release を作るのを待つ）
+        # ドライラン（タグ以外の ref）は添付しない
+        if: github.ref_type == 'tag'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

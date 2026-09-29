@@ -96,7 +96,9 @@ mv "$DIST/tako.icns" "$APP/Contents/Resources/tako.icns"
 # ライセンス本文と第三者の告知を同梱する（Issue #1709）。GPL-3.0 第 4 条・Apache-2.0 第 4 条 (a)・
 # MIT / BSD の表示義務は、バイナリの受け取り手へ本文と著作権表示を渡すことを求める。
 # .app ごと配る経路（リリース zip・Homebrew cask・アプリ内更新）はすべてここを通る。
-# 署名より前に置くので、この 3 つも署名の封印に含まれる
+# 署名より前に置くので、この 3 つも署名の封印に含まれる。Windows の zip・インストーラーも
+# 同じ 3 本を置き、揃っていることは crates/tako-control/tests/license_bundle_watchdog.rs が
+# 検査する（Issue #1845）
 cp LICENSE "$APP/Contents/Resources/LICENSE"
 cp THIRD-PARTY-NOTICES.md "$APP/Contents/Resources/THIRD-PARTY-NOTICES.md"
 cp THIRD-PARTY-LICENSES.md "$APP/Contents/Resources/THIRD-PARTY-LICENSES.md"
