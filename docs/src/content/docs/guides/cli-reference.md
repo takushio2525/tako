@@ -1,5 +1,6 @@
 ---
 title: CLI リファレンス
+seoTitle: tako CLI リファレンス — コマンドの逆引き一覧
 description: tako コマンド全 88 種の逆引き一覧 — 目的・使い方・実行例・よく使うオプション
 ---
 

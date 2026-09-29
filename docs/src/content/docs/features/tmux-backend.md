@@ -1,6 +1,7 @@
 ---
 title: tmux バックエンド
-description: tako を閉じても実行中のプロセスと画面内容がそのまま復元される
+seoTitle: tmux バックエンド — tako を閉じても AI エージェントとプロセスが消えない
+description: 全ペインを tmux セッションの上で動かし、tako を閉じても実行中のプロセス・画面内容・タブ構成をそのまま復元します。tmux が無い環境での動き、既存の tmux セッションの取り込みと掃除も説明します
 ---
 
 tako は全ペインの PTY を **tmux セッション経由**で管理します。これにより、tako を閉じて再起動しても、実行中のプロセス・画面内容・タブ構成がそのまま復元されます。
@@ -44,6 +45,17 @@ tako persist on
 ```
 
 MCP ツール `tako_persist` からも同じ操作が可能です。
+
+## 自分で作った tmux セッションを取り込む
+
+tako の外で `tmux new` して作ったセッション（たとえば AI エージェントを動かしているもの）も、tako のペインとして開けます（attach を前提にする操作なので、psmux を使う Windows ではまだ使えません。[Windows 対応状況](/windows-support/)）。
+
+```bash
+tako tmux list               # 既定の tmux サーバーと tako のセッションの一覧
+tako tmux open api --right   # 「api」セッションを今のタブの右側のペインへ取り込む
+```
+
+tmux で AI エージェントを動かすときの基本（外から画面を読む・指示を送るときの注意）は [tmux で AI エージェントを動かす](/guides/tmux-agents/)にまとめています。
 
 <figure class="tako-shot">
 <img src="/img/fleet-panel.webp" alt="fleet ビューにワークスペースとペインの一覧が表示され、稼働中・アイドルの件数が出ている画面" />

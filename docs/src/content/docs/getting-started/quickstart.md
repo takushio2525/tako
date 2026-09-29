@@ -1,5 +1,6 @@
 ---
 title: クイックスタート
+seoTitle: クイックスタート — 3 ステップで複数の AI エージェントを動かしてみる
 description: tako setup → tako master → AI に話しかける。最短 3 ステップで tako のオーケストレーションを体験する
 ---
 

@@ -1,6 +1,7 @@
 ---
 title: セットアップ
-description: tako のダウンロードからインストール、tako setup による環境構築まで、初心者向けに順を追って解説
+seoTitle: tako のインストールとセットアップ（macOS・Windows）
+description: tako のダウンロード（macOS は Homebrew か zip、Windows はインストーラーかポータブル zip）から起動、tako setup による環境構築と動作確認まで、初心者向けに順を追って解説します
 ---
 
 tako を使い始めるまでの手順を、前提知識がない方でも上から順に読めば動かせるように説明します。所要時間は 10 分程度です。

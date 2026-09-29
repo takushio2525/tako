@@ -3193,6 +3193,15 @@ docs の Issue 参照 17 件のうち 10 件が closed だった。
 CSP でスクリプトの出どころを縛るなら、検索（Pagefind）の WebAssembly のために
 `'wasm-unsafe-eval'` が要る（無いと検査が落ちる）。
 
+検索向けの head と sitemap も同じジョブで見る（#1843）。`node docs/scripts/verify-seo.mjs` は
+title / description の重複・canonical・noindex・構造化データ（トップの WebSite・各ページの
+BreadcrumbList・「## よくある質問」節の `### 質問` から組む FAQPage）・sitemap が全ページを載せて
+robots.txt から辿れることを確かめる。URL を渡すと配信中のサイトも検査できる。検索結果に出す
+`<title>` を見出しと変えたいときは frontmatter の `seoTitle` に書く（見出し・サイドバー・OG 画像は
+`title` のまま。末尾の「| tako」は `docs/src/starlightRouteData.ts` が付ける）。構造化データは
+実態どおりのものだけを `docs/src/structuredData.ts` の 1 か所で組む（評価の無い
+SoftwareApplication は書かない）。
+
 ## 個人情報を現行コードへ書かない（Issue #927）
 
 tako は public リポなので、**実ユーザー名・実ホームパス・実ホスト名・実メールアドレス・

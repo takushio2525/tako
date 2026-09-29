@@ -144,6 +144,8 @@ export default defineConfig({
 					items: [
 						{ label: 'オーケストレーションとは', slug: 'features/orchestration' },
 						{ label: 'tako master 実践ガイド', slug: 'features/orchestrator' },
+						{ label: 'Claude Code を複数同時に動かす', slug: 'guides/parallel-agents' },
+						{ label: 'tmux で AI エージェントを動かす', slug: 'guides/tmux-agents' },
 						{ label: '内蔵 MCP サーバー', slug: 'features/mcp-server' },
 						{ label: '人がやること（ユーザータスク）', slug: 'features/user-tasks' },
 					],

@@ -29,8 +29,10 @@
     "/guides/cli-reference/": "/og/guides-cli-reference.png",
     "/guides/keyboard-shortcuts/": "/og/guides-keyboard-shortcuts.png",
     "/guides/mcp-tools/": "/og/guides-mcp-tools.png",
+    "/guides/parallel-agents/": "/og/guides-parallel-agents.png",
     "/guides/remote-migration/": "/og/guides-remote-migration.png",
     "/guides/settings/": "/og/guides-settings.png",
+    "/guides/tmux-agents/": "/og/guides-tmux-agents.png",
     "/": "/og/index.png",
     "/releases/": "/og/releases.png",
     "/windows-support/": "/og/windows-support.png"

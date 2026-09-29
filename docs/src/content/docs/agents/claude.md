@@ -1,5 +1,6 @@
 ---
 title: Claude Code
+seoTitle: Claude Code を tako で使う — 導入・MCP 接続・worker での並列実行
 description: tako の基準となるエージェント CLI。導入からログイン、MCP 接続、worker としての使い方まで
 ---
 
@@ -66,3 +67,5 @@ tako orchestrator spawn --project app --prompt "テストを通してくださ�
 ```
 
 ほかの系統を既定にしている環境で、この worker だけ claude にしたいときは `--agent claude` を付けてください。
+
+複数の Claude Code を同時に走らせるときの注意（同じファイルの取り合い・止まった worker の見つけ方）は [Claude Code を複数同時に動かす](/guides/parallel-agents/)にまとめています。

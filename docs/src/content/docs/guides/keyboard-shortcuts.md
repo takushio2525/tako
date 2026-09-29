@@ -1,5 +1,6 @@
 ---
 title: キーボードショートカット
+seoTitle: tako のキーボードショートカット一覧（macOS / Windows）
 description: tako で使えるキーボードショートカット一覧（macOS / Windows 両対応）
 ---
 
