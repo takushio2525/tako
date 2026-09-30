@@ -1736,6 +1736,10 @@
         "enabled": {
           "description": "true = 有効化、false = 無効化（省略時は状態取得）",
           "type": "boolean"
+        },
+        "reattach": {
+          "description": "このペイン ID を tmux のセッションへ attach し直す（自動の再 attach が止まったペイン用。状態は list の backend_reattach）",
+          "type": "integer"
         }
       },
       "type": "object"

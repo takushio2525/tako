@@ -1256,6 +1256,8 @@ pub fn tools() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "enabled": { "type": "boolean", "description": "true = 有効化、false = 無効化（省略時は状態取得）" },
+                    // 出自: #1857（enabled とは併用しない）
+                    "reattach": { "type": "integer", "description": "このペイン ID を tmux のセッションへ attach し直す（自動の再 attach が止まったペイン用。状態は list の backend_reattach）" },
                 },
                 "additionalProperties": false,
             },

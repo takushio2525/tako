@@ -159,8 +159,9 @@ enum Command {
     #[command(name = "limit-resume")]
     LimitResume(LimitResumeArgs),
     /// セッション永続化（tmux バックエンド）の ON/OFF・状態確認。
-    /// 有効時、tako を再起動してもタブ構成と実行中プロセスが復元される
-    Persist(ToggleArgs),
+    /// 有効時、tako を再起動してもタブ構成と実行中プロセスが復元される。
+    /// `reattach --pane N` は tmux のセッションへ再接続できなくなったペインを attach し直す
+    Persist(PersistArgs),
     /// close 確認ダイアログの ON/OFF・状態確認（× ボタン / cmd+W。
     /// 確認が入るのはエージェント・実行中プロセスがあるペインのみ）
     #[command(name = "confirm-close")]
@@ -2978,6 +2979,18 @@ struct ToggleArgs {
     /// on = 有効化、off = 無効化（省略時は現在状態を表示）
     #[arg(value_parser = ["on", "off"])]
     state: Option<String>,
+}
+
+/// `tako persist` の引数。on / off は ToggleArgs と同じで、`reattach` だけペインを取る（#1857）
+#[derive(Args)]
+struct PersistArgs {
+    /// on = 有効化、off = 無効化、reattach = ペインを tmux のセッションへ attach し直す
+    /// （省略時は現在状態を表示）
+    #[arg(value_parser = ["on", "off", "reattach"])]
+    state: Option<String>,
+    /// reattach の対象ペイン ID（省略時は呼び出し元 = TAKO_PANE_ID）
+    #[arg(long)]
+    pane: Option<u64>,
 }
 
 /// 入力予測の引数（Issue #600 / #614）。
@@ -7616,6 +7629,14 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Autorename(args) => Request::AutoRename {
             enabled: args.state.as_deref().map(|s| s == "on"),
         },
+        // #1857: 再 attach は切替ではなくペイン 1 枚の操作（MCP の `reattach` と同じ要求）
+        Command::Persist(args) if args.state.as_deref() == Some("reattach") => {
+            Request::BackendReattach {
+                pane: args.pane.or_else(caller_pane).ok_or_else(|| {
+                    "reattach には --pane N（再接続するペインの ID）が要る".to_string()
+                })?,
+            }
+        }
         Command::Persist(args) => Request::Persist {
             enabled: args.state.as_deref().map(|s| s == "on"),
         },

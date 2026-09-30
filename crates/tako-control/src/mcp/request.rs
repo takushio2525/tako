@@ -255,8 +255,19 @@ pub(super) fn build_request(
             hint: bool_arg(args, "hint")?,
             tab: bool_arg(args, "tab")?,
         },
-        "tako_persist" => Request::Persist {
-            enabled: bool_arg(args, "enabled")?,
+        // #1857: `reattach` は切替ではなくペイン 1 枚の操作なので別の要求へ振り分ける
+        "tako_persist" => match u64_arg(args, "reattach")? {
+            Some(pane) => {
+                if bool_arg(args, "enabled")?.is_some() {
+                    return Err(
+                        "enabled と reattach は併用できない（切替か再 attach のどちらか）".into(),
+                    );
+                }
+                Request::BackendReattach { pane }
+            }
+            None => Request::Persist {
+                enabled: bool_arg(args, "enabled")?,
+            },
         },
         "tako_confirm_close" => Request::ConfirmClose {
             enabled: bool_arg(args, "enabled")?,

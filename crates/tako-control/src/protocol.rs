@@ -590,6 +590,10 @@ pub enum Request {
     /// `enabled` 省略時は現在状態の取得のみ。切替は**以後生成されるペイン**に効く
     /// （既存ペインのバックエンドは変わらない）。設定は永続化される
     Persist { enabled: Option<bool> },
+    /// tmux バックエンドのペインを、器のセッションへ attach し直す（Issue #1857）。
+    /// attach クライアントが外から終わり、自動の再 attach が上限で止まったペイン用。
+    /// セッションが終わっているペイン・クライアントが生きているペインはエラーで返す
+    BackendReattach { pane: u64 },
     /// タブ/ペインの × ボタン close 時の確認ダイアログ ON/OFF（Issue #172）。
     /// `enabled` 省略時は現在状態の取得のみ。設定は config.yaml に永続化される
     ConfirmClose { enabled: Option<bool> },
@@ -2450,6 +2454,8 @@ pub fn changes_layout(request: &Request) -> bool {
         | Request::Lang { .. }
         // --- ペインを新しく作る / 中身を差し替える ---
         | Request::OpenFile { .. }
+        // 再 attach（#1857）は同じペインの PTY を立て直す = 新しい PTY へ winsize を渡す
+        | Request::BackendReattach { .. }
         // 戻る / 進むは OpenFile を通って中身を差し替え、閉じたペインなら開き直す（#1677）
         | Request::Jump { .. }
         // 定義ジャンプ（#1680）は別のファイルなら新しいペインを生やす

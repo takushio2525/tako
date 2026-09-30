@@ -351,6 +351,11 @@ impl ReattachState {
         self.status
     }
 
+    /// 直近 [`WINDOW`] の間に撃った再 attach の回数
+    pub fn attempts(&self) -> usize {
+        self.recent.len()
+    }
+
     pub fn total(&self) -> u32 {
         self.total
     }
@@ -364,7 +369,7 @@ impl ReattachState {
     pub fn to_json(&self, pane: u64, lang: Lang) -> serde_json::Value {
         let mut v = serde_json::json!({
             "status": self.status.as_str(),
-            "attempts": self.recent.len(),
+            "attempts": self.attempts(),
             "total": self.total,
             "max_attempts": MAX_ATTEMPTS,
             "window_secs": WINDOW.as_secs(),

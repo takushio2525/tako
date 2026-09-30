@@ -2013,6 +2013,17 @@ struct TakoApp {
     quitting: bool,
     /// ペインを保持する tmux バックエンドセッション名（persist 有効時のみ登録される）
     backend_sessions: HashMap<PaneId, String>,
+    /// attach クライアントが外から終わったペインの再 attach の記録（#1857）。
+    /// 一度でも起きたペインにだけ作り、ペインを閉じるまで持つ（回数と直近の理由を
+    /// `tako list` / `tako read` の `backend_reattach` から読めるようにするため）
+    backend_reattach: HashMap<PaneId, tako_core::backend_reattach::ReattachState>,
+    /// 次の `spawn_session` を attach 専用のクライアントで立てるペイン（#1857）。
+    /// `new-session -A` はセッションが終わっていたら新しいシェルを作るので、再 attach だけは
+    /// `attach-session`（無ければ作らずに失敗する）を使う
+    reattach_spawn: std::collections::HashSet<PaneId>,
+    /// dispatch が積んだ手動の再 attach（#1857。`tako persist reattach`）。PTY の起動には
+    /// Context が要るので `after_dispatch` / UI の呼び出し元が消化する
+    pending_reattach: Vec<PaneId>,
     /// orphan 復元（#191）で旧 pane ID から新 pane ID へのマッピング。
     /// 既存の claude CLI プロセスが旧 TAKO_PANE_ID で MCP を呼んだとき、
     /// dispatch で resolve 失敗 → このマップで新 pane ID に解決する（#210）
@@ -2957,7 +2968,7 @@ fn release_wakeup_gate(gate: &std::sync::atomic::AtomicBool) {
 async fn batch_term_events(
     this: &gpui::WeakEntity<TakoApp>,
     cx: &mut gpui::AsyncApp,
-    pane_id: PaneId,
+    source: TermSource,
     rx: &mut futures::channel::mpsc::UnboundedReceiver<tako_core::SessionEvent>,
     delivery: &PaneDelivery,
     last_hop: &mut std::time::Instant,
@@ -3029,20 +3040,30 @@ async fn batch_term_events(
             // 「計測区間なし = 再開経路の遅延」へ誤って倒れる
             let _span = tako_control::diag::perf_span("term_events");
             if wakeup {
-                app.on_term_event(
-                    pane_id,
+                app.on_term_event_from(
+                    source,
                     tako_core::SessionEvent::Term(tako_core::TermEvent::Wakeup),
                     cx,
                 );
             }
             for event in events {
-                app.on_term_event(pane_id, event, cx);
+                app.on_term_event_from(source, event, cx);
             }
         });
         if applied.is_err() {
             return Err(());
         }
     }
+}
+
+/// 端末イベントの送り主（#1857）: どのペインの、何代目の端末（`TerminalSession::serial`）か。
+///
+/// tmux の再 attach は同じペインの端末を張り替えるので、ペイン ID だけでは古い PTY から
+/// 遅れて届いたイベント（Exit / ChildExit）と新しい端末のイベントを区別できない
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TermSource {
+    pane: PaneId,
+    serial: u64,
 }
 
 /// 描画 div 1 つぶんのチャンク（CharInfo 列の半開区間）
@@ -4163,6 +4184,9 @@ impl TakoApp {
             secondary,
             quitting: false,
             backend_sessions: HashMap::new(),
+            backend_reattach: HashMap::new(),
+            reattach_spawn: std::collections::HashSet::new(),
+            pending_reattach: Vec::new(),
             stale_pane_map: HashMap::new(),
             claude_resume_sessions: tako_core::claude_resume::ResumeIds::new(),
             agent_resume_sessions: tako_core::agent_resume::AgentResumeIds::new(),
@@ -6363,6 +6387,20 @@ impl TakoApp {
                 )));
             }
         }
+        // #1857: 手動の再 attach（`tako persist reattach`）。PTY の張り替えは Context が要るので
+        // ここで行い、応答を「立てた後の実際」へ差し替える（積んだ時点の waiting のまま返さない）
+        for (pane, spawned) in self.drain_pending_reattach(cx) {
+            if !spawned {
+                *result = Err(tako_control::DispatchError::Operation(format!(
+                    "ペイン {} の attach クライアントを起動できなかった（ペインは閉じていない）",
+                    pane.as_u64()
+                )));
+            } else if let Ok(value) = result.as_mut() {
+                if let Some(state) = self.backend_reattach_json(pane) {
+                    value["backend_reattach"] = state;
+                }
+            }
+        }
         // セッション起動後の遅延書き込み（orchestrator spawn の claude 起動コマンド等）
         for (pane, data) in std::mem::take(&mut self.pending_writes) {
             if let Some(session) = self.terminals.get(&pane) {
@@ -8400,7 +8438,22 @@ impl TakoApp {
         // 直接ではなく専用サーバーのセッションとして spawn する。`new-session -A` なので
         // 復元時（既存セッション名）は attach、新規ペインは作成と、同じ経路で済む
         let mut backend_session = None;
-        if self.tmux_persist && tako_core::backend::capabilities().survives_app_exit {
+        // #1857: 再 attach は attach 専用のクライアント（セッションが終わっていたら作らずに
+        // 失敗する）。既存のセッションへ繋ぎ直すだけなので、persist の設定を後から OFF に
+        // していても器を持つペインなら張り替える（設定は以後のペインの作り方 = FR-5.5）
+        let reattach_to = if self.reattach_spawn.remove(&pane_id) {
+            self.backend_sessions.get(&pane_id).cloned()
+        } else {
+            None
+        };
+        if let Some(name) = reattach_to {
+            options = tako_core::tmux_backend::reattach_options(
+                options,
+                &tako_core::tmux_backend::socket_name(),
+                &name,
+            );
+            backend_session = Some(name);
+        } else if self.tmux_persist && tako_core::backend::capabilities().survives_app_exit {
             let name = self
                 .backend_sessions
                 .entry(pane_id)
@@ -8439,6 +8492,12 @@ impl TakoApp {
                 self.set_osc_sink_writer(pane_id, pid);
             }
         }
+        // #1857: この端末から来たイベントだけを処理する（再 attach で張り替えた後に、
+        // 古い PTY から遅れて届く Exit を新しい端末の終わりとして扱わない）
+        let source = TermSource {
+            pane: pane_id,
+            serial: session.serial(),
+        };
         self.terminals.insert(pane_id, session);
         let delivery = self.pane_delivery.entry(pane_id).or_default().clone();
         let gate = self
@@ -8501,7 +8560,7 @@ impl TakoApp {
                     .update(cx, |app: &mut TakoApp, cx| {
                         // #643: まとめ処理側（`batch_term_events`）と同じタグで計測する
                         let _span = tako_control::diag::perf_span("term_events");
-                        app.on_term_event(pane_id, event, cx);
+                        app.on_term_event_from(source, event, cx);
                     })
                     .is_err()
                 {
@@ -8512,7 +8571,7 @@ impl TakoApp {
                 // 秒間数百〜数千届き、1 件ごとに `Entity::update`（= effect flush）を
                 // 回すだけでメインスレッドを食う。Wakeup は「描き直して」以上の意味を
                 // 持たない no-op なので、窓内の分は 1 件に畳める
-                if batch_term_events(&this, cx, pane_id, &mut rx, &delivery, &mut last_hop, &gate)
+                if batch_term_events(&this, cx, source, &mut rx, &delivery, &mut last_hop, &gate)
                     .await
                     .is_err()
                 {
@@ -8583,6 +8642,27 @@ impl TakoApp {
     /// #816 の「Wakeup でメインスレッドへ渡る最小間隔」の両方がこれを見る
     const TERM_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
 
+    /// 端末 `source` から届いたイベントを処理する（配送タスクの入口。#1857）。
+    ///
+    /// ペインの端末が張り替えられていたら（tmux の再 attach）、古い PTY から遅れて届いた
+    /// イベントは捨てる。捨てないと、古いクライアントの Exit が新しい端末の終わりとして
+    /// 扱われ、繋ぎ直した直後のペインを閉じる
+    fn on_term_event_from(
+        &mut self,
+        source: TermSource,
+        event: tako_core::SessionEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .terminals
+            .get(&source.pane)
+            .is_some_and(|s| s.serial() != source.serial)
+        {
+            return;
+        }
+        self.on_term_event(source.pane, event, cx);
+    }
+
     fn on_term_event(
         &mut self,
         pane_id: PaneId,
@@ -8598,6 +8678,11 @@ impl TakoApp {
         let mut need_immediate = false;
         let mut ui_outside_pane = state_change;
         match session.process_event(event) {
+            // #1857: tmux の attach クライアントだけが外から終わったなら閉じない。
+            // 器へ生死を聞き、セッションが生きていれば同じペインのまま繋ぎ直す
+            Some(SessionNotice::Exited) if self.begin_backend_reattach(pane_id, cx) => {
+                ui_outside_pane = true;
+            }
             Some(SessionNotice::Exited) => {
                 // PTY 死亡由来の close: セッション kill・layout 削除はしない（Issue #30）
                 self.remove_pane_with(pane_id, CloseReason::Exited, cx);
@@ -9398,6 +9483,7 @@ impl TakoApp {
     /// これは `pane_logs` 設定で OFF にできるため、OFF の環境では「再起動が消したのか
     /// 明示 close が消したのか」を事後に切り分ける材料が一切残らなかった
     fn drop_backend_session(&mut self, pane_id: PaneId, origin: CloseOrigin, caller: Option<&str>) {
+        self.drop_backend_reattach(pane_id);
         if let Some(name) = self.backend_sessions.remove(&pane_id) {
             if !self.secondary {
                 persist_diag(&format!(
@@ -9456,6 +9542,260 @@ impl TakoApp {
         } else {
             self.backend_sessions.remove(&pane_id);
         }
+        self.drop_backend_reattach(pane_id);
+    }
+
+    /// 閉じたペインの再 attach の記録を捨てる（#1857）。待っている再 attach は
+    /// `run_backend_reattach` の冒頭で「端末が居ない」に当たって撃たずに終わる
+    /// （= 再 attach 待ちの間に閉じたペインを蘇らせない）
+    fn drop_backend_reattach(&mut self, pane_id: PaneId) {
+        self.backend_reattach.remove(&pane_id);
+        self.reattach_spawn.remove(&pane_id);
+        self.pending_reattach.retain(|p| *p != pane_id);
+    }
+
+    /// 再 attach の記録の応答形（#1857。`list` / `read` / `tako persist reattach` の 1 実装）
+    fn backend_reattach_json(&self, pane: PaneId) -> Option<serde_json::Value> {
+        self.backend_reattach
+            .get(&pane)
+            .map(|s| s.to_json(pane.as_u64(), tako_core::i18n::lang()))
+    }
+
+    /// `TAKO_1857_LEGACY=1` で #1857 前の挙動（attach クライアントが終わったら器の生死を
+    /// 見ずに閉じる）へ戻す。同じバイナリで A/B を取る入口
+    fn backend_reattach_legacy() -> bool {
+        static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *LEGACY.get_or_init(|| std::env::var("TAKO_1857_LEGACY").is_ok_and(|v| v == "1"))
+    }
+
+    /// ペインの PTY の子（tmux の attach クライアント）が終わったときの入口（#1857）。
+    ///
+    /// 戻り値 true = 閉じない（器へ生死を聞いてから決める / 同じ端末の 2 通目）。
+    /// false = 従来どおりその場で閉じる（器を持たないペイン・psmux・終了処理中・A/B の旧挙動）。
+    ///
+    /// 器への問い合わせは background で行う（上限つき。メインスレッドを止めない）。
+    /// 判断は `tako_core::backend_reattach` の 1 実装
+    fn begin_backend_reattach(&mut self, pane_id: PaneId, cx: &mut Context<Self>) -> bool {
+        if Self::backend_reattach_legacy() || self.quitting || self.secondary {
+            return false;
+        }
+        // psmux（Windows）は attach クライアントの終わり方と attach 専用の経路を
+        // 実機で確かめていないので従来どおり（#1857 は tmux の事故の直し）
+        if tako_core::backend::choice() != tako_core::backend::Choice::Tmux {
+            return false;
+        }
+        let Some(name) = self.backend_sessions.get(&pane_id).cloned() else {
+            return false;
+        };
+        let Some(session) = self.terminals.get(&pane_id) else {
+            return false;
+        };
+        let serial = session.serial();
+        let exit = tako_core::backend_reattach::ClientExit::from_status(session.exit_status());
+        let own_client = session.child_pid();
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if !self
+            .backend_reattach
+            .entry(pane_id)
+            .or_default()
+            .begin_exit(serial, exit, now_unix)
+        {
+            // 同じ PTY の Exit と ChildExit の 2 通目。1 通目が既に問い合わせている
+            return true;
+        }
+        let socket = tako_core::tmux_backend::socket_name();
+        cx.spawn(async move |this, cx| {
+            let probe_name = name.clone();
+            let probe = cx
+                .background_executor()
+                .spawn(
+                    async move { tako_core::backend_reattach::probe_session(&socket, &probe_name) },
+                )
+                .await;
+            let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                app.settle_backend_exit(pane_id, serial, &name, exit, own_client, probe, cx);
+            });
+        })
+        .detach();
+        true
+    }
+
+    /// 器の答えから、閉じる / 待って繋ぎ直す / 止まる を決めて実行する（#1857）
+    #[allow(clippy::too_many_arguments)]
+    fn settle_backend_exit(
+        &mut self,
+        pane_id: PaneId,
+        serial: u64,
+        name: &str,
+        exit: tako_core::backend_reattach::ClientExit,
+        own_client: Option<u32>,
+        probe: tako_core::backend_reattach::SessionProbe,
+        cx: &mut Context<Self>,
+    ) {
+        use tako_core::backend_reattach::Verdict;
+        // 問い合わせの間にペインが閉じられた・端末が張り替えられた・器が付け替わったなら
+        // この答えはもう誰のものでもない
+        let current = self
+            .terminals
+            .get(&pane_id)
+            .is_some_and(|s| s.serial() == serial)
+            && self.backend_sessions.get(&pane_id).map(String::as_str) == Some(name);
+        if !current {
+            return;
+        }
+        let Some(state) = self.backend_reattach.get_mut(&pane_id) else {
+            return;
+        };
+        let verdict = state.decide(&probe, own_client, std::time::Instant::now());
+        if let Some(line) =
+            tako_core::backend_reattach::log_line(pane_id.as_u64(), name, exit, &verdict)
+        {
+            persist_diag(&line);
+        }
+        match verdict {
+            Verdict::Close(_) => {
+                self.backend_reattach.remove(&pane_id);
+                // PTY 死亡由来の close: セッション kill・layout 削除はしない（Issue #30）
+                self.remove_pane_with(pane_id, CloseReason::Exited, cx);
+                self.last_term_notify = std::time::Instant::now();
+                self.term_pending_app = true;
+                self.flush_term_redraw(cx);
+            }
+            Verdict::Reattach { delay, .. } => {
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(delay).await;
+                    let redraw = this
+                        .update(cx, |app: &mut TakoApp, cx| {
+                            app.run_backend_reattach(pane_id, serial, cx)
+                        })
+                        .unwrap_or_default();
+                    // #1370: 新しい PTY へ winsize を渡すのは描画の中なので、隠れた窓でも
+                    // 1 フレーム描く（IPC の `needs_frame` と同じ。root view の二重借用を
+                    // 避けて update の外で描く）
+                    for any in redraw {
+                        let _ = any.update(cx, |_, window, cx| window.draw(cx).clear());
+                    }
+                })
+                .detach();
+                cx.notify();
+            }
+            Verdict::GiveUp { .. } => self.show_backend_reattach_gave_up(pane_id, cx),
+        }
+    }
+
+    /// 待ちが明けた再 attach を撃つ（#1857）。戻り値は強制描画すべきビューポート
+    fn run_backend_reattach(
+        &mut self,
+        pane_id: PaneId,
+        serial: u64,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyWindowHandle> {
+        // 待っている間にペインが閉じられた・手動で張り替えられたなら撃たない
+        // （閉じたペインを蘇らせない / 手動で繋いだクライアントを置き換えない）
+        let still_waiting = self
+            .terminals
+            .get(&pane_id)
+            .is_some_and(|s| s.serial() == serial)
+            && self
+                .backend_reattach
+                .get(&pane_id)
+                .is_some_and(|s| s.status() == tako_core::backend_reattach::Status::Waiting);
+        if !still_waiting {
+            return Vec::new();
+        }
+        self.spawn_backend_reattach(pane_id, cx);
+        cx.notify();
+        self.viewports.iter().map(|(_, h)| *h).collect()
+    }
+
+    /// 同じペインの端末を attach 専用のクライアントで張り替える（#1857。自動と手動の 1 実装）。
+    /// 立てられなければ閉じずに止まり、案内を出す。戻り値は立てられたか
+    fn spawn_backend_reattach(&mut self, pane_id: PaneId, cx: &mut Context<Self>) -> bool {
+        let Some(name) = self.backend_sessions.get(&pane_id).cloned() else {
+            return false;
+        };
+        // cwd は attach クライアント自身の作業ディレクトリになるだけ（セッションには効かない）。
+        // 消えたディレクトリで spawn に失敗しないよう、実在するときだけ渡す
+        let cwd = self
+            .terminals
+            .get(&pane_id)
+            .and_then(|s| s.cwd())
+            .filter(|p| p.is_dir())
+            .map(std::path::Path::to_path_buf);
+        self.reattach_spawn.insert(pane_id);
+        let spawned = self.spawn_session(
+            pane_id,
+            SpawnOptions {
+                cwd,
+                ..SpawnOptions::default()
+            },
+            cx,
+        );
+        self.reattach_spawn.remove(&pane_id);
+        let Some(state) = self.backend_reattach.get_mut(&pane_id) else {
+            return spawned.is_ok();
+        };
+        match spawned {
+            Ok(()) => {
+                state.mark_attached();
+                true
+            }
+            Err(_) => {
+                state.mark_gave_up();
+                // 理由の文言は OS のエラーでパスを含みうるので persist.log へは載せない
+                persist_diag(&format!(
+                    "attach クライアントの再 attach に失敗: pane={} session={name}（PTY を起動できない。ペインは閉じない）",
+                    pane_id.as_u64()
+                ));
+                self.show_backend_reattach_gave_up(pane_id, cx);
+                false
+            }
+        }
+    }
+
+    /// 再 attach を諦めたことをペインの画面に残す（#1857）。
+    ///
+    /// ヘッダのチップ（`backend_reattach_chip`）は幅の狭いペインでは出ないので、画面にも
+    /// 1 行置く（`tako read` からも読める）。この端末の子は終わっているので横から書いてよい
+    fn show_backend_reattach_gave_up(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        if let Some(session) = self.terminals.get(&pane_id) {
+            let notice = tako_core::backend_reattach::gave_up_notice(
+                tako_core::i18n::lang(),
+                pane_id.as_u64(),
+            );
+            session.print_local(&format!("\r\n{notice}\r\n"));
+        }
+        self.notify_pane_body(pane_id, cx);
+        cx.notify();
+    }
+
+    /// dispatch が積んだ手動の再 attach を消化する（#1857）。
+    /// 戻り値は `(ペイン, 立てられたか)`。応答の差し替えは呼び出し側（`after_dispatch`）
+    fn drain_pending_reattach(&mut self, cx: &mut Context<Self>) -> Vec<(PaneId, bool)> {
+        std::mem::take(&mut self.pending_reattach)
+            .into_iter()
+            .map(|pane| (pane, self.spawn_backend_reattach(pane, cx)))
+            .collect()
+    }
+
+    /// ヘッダのチップ「再接続できません（クリックで再試行）」から（#1857）。
+    /// CLI / MCP と同じ dispatch を通す（UI にだけある経路を作らない）
+    fn retry_backend_reattach_from_ui(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        let result = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::BackendReattach {
+                pane: pane_id.as_u64(),
+            },
+            PaneOrigin::User,
+        );
+        if let Err(e) = result {
+            eprintln!("warning: 再 attach できない: {e}");
+        }
+        self.drain_pending_reattach(cx);
+        cx.notify();
     }
 
     /// 明示 close されたペインの worker レジストリエントリを closed にする（#658）。
@@ -19871,6 +20211,20 @@ impl TakoApp {
                 | tako_core::ssh_progress::ConnectPhase::Connected => None,
             }
         });
+        // #1857: tmux への再 attach（問い合わせ中 / 待ち / 断念）。繋ぎ直せたら消える。
+        // 断念は赤で残し、クリックで再試行する（CLI / MCP の `persist reattach` と同じ入口）
+        let backend_reattach_chip: Option<(String, bool)> =
+            self.backend_reattach.get(&pane_id).and_then(|st| {
+                let text = tako_core::backend_reattach::chip_label(
+                    tako_core::i18n::lang(),
+                    st.status(),
+                    st.attempts(),
+                )?;
+                Some((
+                    text,
+                    st.status() == tako_core::backend_reattach::Status::GaveUp,
+                ))
+            });
         // #966: リモートへの書き戻しの状態チップ。cwd チップは 28 文字で切るので、
         // 「ローカルへは書けたがリモートはまだ」を**別のチップ**として出す
         // （ここを出さないと、切断中の保存がユーザーから見て「保存できた」になる）
@@ -20399,6 +20753,53 @@ impl TakoApp {
                                 } else {
                                     crate::spinner::spinner(
                                         ("ssh-connect-spin", pane_id.as_u64()),
+                                        px(10.0),
+                                        hsla(color),
+                                    )
+                                })
+                                .child(SharedString::from(truncate_chars(&text, 72)))
+                        }))
+                    })
+                    // #1857: tmux への再 attach。形は SSH のチップと同じで、
+                    // 断念（赤）のクリックは閉じるのではなく再試行
+                    .when(hv.ssh_connect, |d| {
+                        d.children(backend_reattach_chip.map(|(text, gave_up)| {
+                            let color = if gave_up { theme.red } else { theme.accent };
+                            div()
+                                .id(("backend-reattach-chip", pane_id.as_u64()))
+                                .flex()
+                                .flex_none()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(4.0))
+                                .px(px(8.0))
+                                .py(px(2.0))
+                                .rounded(px(5.0))
+                                .bg(rgba(theme.chip_surface))
+                                .border_1()
+                                .border_color(hsla(color))
+                                .font_family(theme.font_family.clone())
+                                .text_size(px(10.5))
+                                .text_color(hsla(color))
+                                .when(gave_up, |d| {
+                                    d.cursor_pointer().on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.retry_backend_reattach_from_ui(pane_id, cx);
+                                        },
+                                    ))
+                                })
+                                .child(if gave_up {
+                                    svg()
+                                        .path(crate::file_icons::ui_icon::WARNING)
+                                        .w(px(10.0))
+                                        .h(px(10.0))
+                                        .flex_none()
+                                        .text_color(hsla(color))
+                                        .into_any_element()
+                                } else {
+                                    crate::spinner::spinner(
+                                        ("backend-reattach-spin", pane_id.as_u64()),
                                         px(10.0),
                                         hsla(color),
                                     )
@@ -22397,6 +22798,61 @@ impl UiStateHost for TakoApp {
             reconnect_line,
             tako_core::ssh_reconnect::TrackSource::Opened,
         );
+    }
+
+    fn backend_reattach_state(&self, pane: PaneId) -> Option<serde_json::Value> {
+        self.backend_reattach_json(pane)
+    }
+
+    fn backend_reattach(&mut self, pane: PaneId) -> Result<serde_json::Value, String> {
+        use tako_core::backend_reattach::{SessionProbe, Status};
+        let Some(name) = self.backend_sessions.get(&pane).cloned() else {
+            return Err(format!(
+                "ペイン {} は tmux のセッションを持たない（再 attach できるのは tmux 永続化のペインだけ）",
+                pane.as_u64()
+            ));
+        };
+        if !self.terminals.contains_key(&pane) {
+            return Err(format!("ペイン {} が見つからない", pane.as_u64()));
+        }
+        // クライアントが動いているペインは張り替えない（動いている attach を切ることになる）
+        let client_gone = self
+            .backend_reattach
+            .get(&pane)
+            .is_some_and(|s| s.status() != Status::Attached);
+        if !client_gone {
+            return Err(format!(
+                "ペイン {} の attach クライアントは動いている（再 attach は不要）",
+                pane.as_u64()
+            ));
+        }
+        // 手動の操作 1 回なのでここで聞く（上限つき）。終わったセッションへは撃たない
+        let socket = tako_core::tmux_backend::socket_name();
+        match tako_core::backend_reattach::probe_session(&socket, &name) {
+            SessionProbe::SessionGone | SessionProbe::ServerGone => {
+                return Err(format!(
+                    "ペイン {} のセッション {name} は終わっている（再 attach できない。ペインは閉じてよい）",
+                    pane.as_u64()
+                ));
+            }
+            SessionProbe::Alive { .. } | SessionProbe::Unknown => {}
+        }
+        if let Some(state) = self.backend_reattach.get_mut(&pane) {
+            state.begin_manual(std::time::Instant::now());
+        }
+        if !self.secondary {
+            persist_diag(&tako_core::backend_reattach::manual_log_line(
+                pane.as_u64(),
+                &name,
+            ));
+        }
+        // PTY の張り替えは Context が要る = `after_dispatch` が消化して応答を差し替える
+        self.pending_reattach.push(pane);
+        Ok(serde_json::json!({
+            "pane": pane.as_u64(),
+            "session": name,
+            "backend_reattach": self.backend_reattach_json(pane),
+        }))
     }
 
     fn ssh_connect_state(&self, pane: PaneId) -> Option<serde_json::Value> {
