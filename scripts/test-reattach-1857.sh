@@ -49,6 +49,8 @@ TMUX_SOCKET="tako-1857-$$"
 cleanup() {
   stop_isolated_gui "$APP_PID"
   tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+  # tmux は kill-server の後もソケットファイルを残すことがある（自分の名前のものだけ消す）
+  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$TMUX_SOCKET"
   if [ -n "${KEEP:-}" ]; then echo "（KEEP: $TMP を残した）"; else rm -rf "$TMP"; fi
 }
 trap cleanup EXIT
