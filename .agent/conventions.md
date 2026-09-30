@@ -38,13 +38,14 @@
   GA4 は `takushio2525.com` 一族で 1 プロパティを共有し、AdSense は所有権確認の meta だけ
   （広告は出さないので `adsbygoogle.js` は入れない。`ads.txt` はルートドメイン側に 1 つで足りる）
 - **Cookie 同意（Consent Mode v2）は takushio2525.com 一族で 1 実装を共有する**（Issue #1639）。
-  docs 側が持つのは 3 つだけ: Starlight `head` の `https://takushio2525.com/consent/consent.js`
-  （**gtag より前・`async` なし**。`gtag('consent', 'default', …)` が `gtag('config', …)` より前に
-  dataLayer へ入っていないと既定値が効かない）・gtag 初期化の保険 1 行
-  （`if (!window.tkConsent) gtag('consent', 'default', {…denied})`。既定値が 1 つも宣言されないと
-  gtag は全部同意済みとして動くので、読み込めなかったときは止める側へ倒す）・
-  フッター（`docs/src/components/FooterLegal.astro`）のプライバシーポリシーと「Cookie 設定」。
-  バナー本体・国判定・ポリシー本文はハブ側が正本なので docs には置かない。
+  docs 側が持つのは 2 つだけ: Starlight `head` の
+  `https://takushio2525.com/consent/consent.js` 1 本（**`data-ga-id` に `GA_MEASUREMENT_ID`・
+  `async` なし**。basic 型 = Issue #1855）と、フッター（`docs/src/components/FooterLegal.astro`）の
+  プライバシーポリシーと「Cookie 設定」。gtag.js は consent.js が地域と同意を見て自分で差し込む
+  （EEA・英国・スイス・国が不明なら同意まで読まない）ので、**gtag.js の script・inline の
+  `gtag('config', …)`・保険の `consent default` を head に置かない**（置くと二重に計測され、
+  EEA でも同意の前に Google へ送られる）。バナー本体・国判定・ポリシー本文・組み込み手順は
+  ハブ側（takushio2525.com リポの `.agent/consent-integration.md`）が正本なので docs には置かない。
   フッターのリンクは**素の `<a>`** で書く（consent.js が document の click を拾って
   `preventDefault()` するため、フレームワークのリンク部品だと遷移が先に走る）
 
