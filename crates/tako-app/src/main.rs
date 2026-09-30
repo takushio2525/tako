@@ -9759,14 +9759,15 @@ impl TakoApp {
     /// 再 attach を諦めたことをペインの画面に残す（#1857）。
     ///
     /// ヘッダのチップ（`backend_reattach_chip`）は幅の狭いペインでは出ないので、画面にも
-    /// 1 行置く（`tako read` からも読める）。この端末の子は終わっているので横から書いてよい
+    /// 説明と再試行のコマンドを 2 行で置く（`tako read` からも読める）。
+    /// この端末の子は終わっているので横から書いてよい
     fn show_backend_reattach_gave_up(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
         if let Some(session) = self.terminals.get(&pane_id) {
-            let notice = tako_core::backend_reattach::gave_up_notice(
+            let [what, next] = tako_core::backend_reattach::gave_up_screen_lines(
                 tako_core::i18n::lang(),
                 pane_id.as_u64(),
             );
-            session.print_local(&format!("\r\n{notice}\r\n"));
+            session.print_local(&format!("\r\n{what}\r\n{next}\r\n"));
         }
         self.notify_pane_body(pane_id, cx);
         cx.notify();
@@ -9792,7 +9793,16 @@ impl TakoApp {
             PaneOrigin::User,
         );
         if let Err(e) = result {
-            eprintln!("warning: 再 attach できない: {e}");
+            // 押しても何も起きないように見せない。断念中のペインは子が終わっているので
+            // 理由を画面へ横から書いてよい（セッションが後から終わっていた、など）
+            let gave_up = self
+                .backend_reattach
+                .get(&pane_id)
+                .is_some_and(|s| s.status() == tako_core::backend_reattach::Status::GaveUp);
+            if let (true, Some(session)) = (gave_up, self.terminals.get(&pane_id)) {
+                session.print_local(&format!("\r\n[tako] {e}\r\n"));
+                self.notify_pane_body(pane_id, cx);
+            }
         }
         self.drain_pending_reattach(cx);
         cx.notify();

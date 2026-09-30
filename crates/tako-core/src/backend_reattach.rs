@@ -445,21 +445,35 @@ pub fn chip_label(lang: Lang, status: Status, attempts: usize) -> Option<String>
     }
 }
 
-/// 止まったときにペインの画面へ出す 1 行（何が起きたか + 次の一手）。
-/// ヘッダのチップは幅の狭いペインでは出ないので、画面にも残す
-pub fn gave_up_notice(lang: Lang, pane: u64) -> String {
+/// 止まったときにペインの画面へ出す 2 行（何が起きたか / 次の一手）。
+///
+/// ヘッダのチップは幅の狭いペインでは出ないので、画面にも残す。コマンドは**行を分けて**出す
+/// （説明と続けると長い行の途中で折り返され、`--pane` と番号が別の行に割れる = 実測）
+pub fn gave_up_screen_lines(lang: Lang, pane: u64) -> [String; 2] {
     let secs = WINDOW.as_secs();
     let command = retry_command(pane);
     match lang {
-        Lang::Ja => format!(
-            "[tako] tmux のセッションへ再接続できませんでした（{secs} 秒に {MAX_ATTEMPTS} 回）。\
-             セッションと中のプロセスは残っています。再試行: {command}"
-        ),
-        Lang::En => format!(
-            "[tako] Could not reconnect to the tmux session ({MAX_ATTEMPTS} tries in {secs}s). \
-             The session and its processes are still running. Retry: {command}"
-        ),
+        Lang::Ja => [
+            format!(
+                "[tako] tmux のセッションへ再接続できませんでした（{secs} 秒に {MAX_ATTEMPTS} 回）。\
+                 セッションと中のプロセスは残っています"
+            ),
+            format!("[tako] 再試行: {command}"),
+        ],
+        Lang::En => [
+            format!(
+                "[tako] Could not reconnect to the tmux session ({MAX_ATTEMPTS} tries in {secs}s). \
+                 The session and its processes are still running"
+            ),
+            format!("[tako] Retry: {command}"),
+        ],
     }
+}
+
+/// [`gave_up_screen_lines`] を 1 行に繋いだもの（応答の `message`）
+pub fn gave_up_notice(lang: Lang, pane: u64) -> String {
+    let [what, next] = gave_up_screen_lines(lang, pane);
+    format!("{what}. {}", next.trim_start_matches("[tako] "))
 }
 
 #[cfg(test)]
@@ -761,6 +775,10 @@ mod tests {
                 notice.contains("tako persist reattach --pane 12"),
                 "{notice}"
             );
+            // 画面ではコマンドを説明と別の行に置く（折り返しでコマンドが割れない）
+            let [what, next] = gave_up_screen_lines(lang, 12);
+            assert!(!what.contains("tako persist"), "{what}");
+            assert!(next.ends_with("tako persist reattach --pane 12"), "{next}");
             assert!(chip_label(lang, Status::Attached, 1).is_none());
             for status in [Status::Checking, Status::Waiting, Status::GaveUp] {
                 assert!(chip_label(lang, status, 1).is_some(), "{status:?}");

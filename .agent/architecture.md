@@ -575,6 +575,23 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
   全滅時も layout.json を保持する（Issue #30。2026-07-03 実機: サーバー死で全タブ道連れ）。外部 tmux に attach しただけの
   ペインは何も kill しない（kill 対象は `backend_sessions` 登録分のみ）。詳細は
   `requirements.md` FR-5 の close 整合節
+- **attach クライアントの死とセッションの死を分ける**（#1857。2026-09-30）: PTY の子は
+  tmux の **attach クライアント**なので、`SessionNotice::Exited` はセッションの死とは限らない
+  （BSD pkill の引数順の罠で attach クライアント 24 本だけが SIGTERM され、生きていたセッションの
+  ペイン 24 枚とタブが消えた実例）。Exited を受けたら `tako_core::backend_reattach::probe_session`
+  （`list-clients -t =名`・上限 3 秒・background）で器に聞き、`ReattachState::decide` が決める:
+  セッション / サーバーが無い → 従来どおり閉じる / 別のクライアントが attach 中 → 閉じる
+  （`-D` の収束。奪い合わない）/ 直近 60 秒の再 attach が 5 回 → 閉じずに止まる / それ以外
+  （生きている・確かめられなかった）→ 待ち（250ms → 4 秒）の後に **attach 専用**のクライアント
+  （`tmux_backend::reattach_options` = `attach-session`。`new-session -A` だと終わっていた
+  セッションに新しいシェルが生える）で同じペインの端末を張り替える。張り替え後に古い PTY から
+  遅れて届く Exit を新しい端末へ誤配しないよう、配送は `TerminalSession::serial` を照合する
+  （`TermSource` / `on_term_event_from`）。待ちの間・問い合わせ中に閉じたペインは、端末の番号が
+  合わないので撃たずに終わる（蘇らない）。判断は persist.log に 1 行、状態は `list` / `read` の
+  `backend_reattach`、手動は `tako persist reattach` / MCP `tako_persist` の `reattach`（同じ
+  dispatch → host の 1 実装。PTY の張り替えは `after_dispatch` が消化して応答を実際へ差し替える）。
+  psmux（Windows）は attach クライアントの終わり方を実測していないので従来どおり。
+  A/B は `TAKO_1857_LEGACY=1`、番犬は `crates/tako-control/tests/issue1857_backend_reattach_watchdog.rs`
 - **共存のための conf**（`<data_dir>/tmux-backend.conf`、毎起動再生成）:
   `status off` / `prefix None`（tmux の UI・キー介入ゼロ）、`mouse on`（マウス要求
   アプリへの SGR 生転送に必要。**非マウスペインのスクロールは SGR ではなく

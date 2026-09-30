@@ -25,10 +25,10 @@
 
 use std::path::{Path, PathBuf};
 
-#[path = "common/code_view.rs"]
-mod code_view;
+// 本番コードの範囲取り（#1420）と眺めの 1 実装（`code_view` は production_range の中の 1 つを使う）
 #[path = "common/production_range.rs"]
 mod production_range;
+use production_range::code_view;
 
 const APP: &str = "crates/tako-app/src/main.rs";
 const DISPATCH: &str = "crates/tako-control/src/dispatch.rs";
@@ -399,11 +399,19 @@ fn 状態はlistとreadに載りmcpとcliは同じ要求へ振り分ける() {
     );
 }
 
+/// 注入 1 件: （名前, 注入先, 置き換え, 当てる検査）
+type Injection = (
+    &'static str,
+    &'static str,
+    &'static str,
+    fn(&Views) -> Result<(), String>,
+);
+
 /// 検出力: 実ソースへ回帰を注入すると、各検査が `main.rs:行` を名指して落ちる
 #[test]
 fn 注入した回帰をfile_lineで名指す() {
     let src = read(APP);
-    let cases: [(&str, &str, &str, fn(&Views) -> Result<(), String>); 5] = [
+    let cases: [Injection; 5] = [
         (
             "再 attach の分岐を外す",
             "Some(SessionNotice::Exited) if self.begin_backend_reattach(pane_id, cx) =>",

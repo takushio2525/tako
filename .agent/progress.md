@@ -68,3 +68,7 @@
 ## 2026-09-30（#1855: docs サイトの GA4 を同意まで読み込まない新しい形（basic 型）へ移した）
 - `docs/astro.config.mjs` の head から gtag.js と inline の config（保険の `consent default` を含む）を消し、ハブの consent.js 1 本に `data-ga-id` を付けた。gtag.js は consent.js が地域と同意を見て差し込む（Refs takushio2525/takushio2525.com#36）。`.agent/conventions.md` の同意の節も同じ形へ
 - 実測（ヘッドレス Chromium・国判定だけ差し替え・送信は 204 で打ち切り）: EEA 未選択で Google への要求 0・同意で gtag.js 1 / page_view 1・日本は 1 / 1。旧版の consent.js のままだと全場面 0 なので、merge はエッジの入れ替わりの後
+
+## 2026-09-30（#1857: tmux の attach クライアントだけが外から終わってもペインを閉じず再 attach するようにした）
+- Exited で器へ生死を聞き（`list-clients`・上限 3 秒・background）、生きていて他のクライアントが居なければ attach 専用（`attach-session`）で同じペインを張り替える。60 秒に 5 回で止まり、閉じずにチップ + 画面 2 行。persist.log に 1 行・状態は list / read の `backend_reattach`・手動は `tako persist reattach` / MCP `tako_persist` の `reattach`（カタログ +204 B）
+- 実測: `scripts/test-reattach-1857.sh` 30 PASS 0 FAIL（v0.8.25 は ① で FAILED = ペインが閉じる）・番犬の注入 5 通りすべて main.rs:行 で FAILED・A/B `TAKO_1857_LEGACY=1`
