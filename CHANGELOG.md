@@ -8,6 +8,18 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.8.26] - 2026-10-01
+
+Nightly patch release (automated). Changes since v0.8.25:
+夜間パッチリリース（自動）。v0.8.25 以降の変更:
+
+- [修正] tmux の attach クライアントが外から終わってもペインを閉じず再 attach するようにした (#1857) (#1859)
+- [改善] docs サイトの GA4 を同意まで読み込まない新しい形へ移した (#1855) (#1856)
+- [修正] macOS の配布物からビルド機のホームパスと署名者の個人名を消し、配布物を検査するようにした (#1848) (#1854)
+- [ドキュメント] SECURITY.md を置いて脆弱性の非公開の報告先を案内した (#1849) (#1852)
+- [ドキュメント] tako アプリのデータの扱い・AI に任せるときの注意・免責のページを足した (#1714)
+- [修正] Windows の zip・インストーラーへ第三者のライセンス本文と著作権表示を同梱し、両 OS の組み立てを番犬で固定した (#1845) (#1846)
+
 ## [0.8.25] - 2026-09-30
 
 Nightly patch release (automated). Changes since v0.8.24:
