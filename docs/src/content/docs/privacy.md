@@ -68,4 +68,5 @@ tako は [GNU General Public License v3.0 以降](https://github.com/takushio252
 ## お問い合わせ
 
 - **個人情報に関わること・公開したくない問い合わせ**（送信済みのエラーレポートの削除の依頼、このページの内容についての質問など）は、メールで [contact@takushio2525.com](mailto:contact@takushio2525.com) へお送りください。
+- **脆弱性の報告**は、公開の Issue には書かず、[SECURITY.md](https://github.com/takushio2525/tako/blob/main/SECURITY.md) の案内に従って GitHub の非公開の報告（Security タブの「Report a vulnerability」）から送ってください。
 - **不具合の報告・機能の要望**は、[GitHub の Issue](https://github.com/takushio2525/tako/issues) へお願いします。Issue は誰でも読める状態で公開されるので、個人情報やトークン、画面のログをそのまま貼らないでください。

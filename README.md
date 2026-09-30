@@ -255,6 +255,10 @@ v0.2.6 以降は署名の designated requirement が identifier 固定になり�
 
 </details>
 
+## セキュリティ / Security
+
+脆弱性は公開の Issue に書かず、[SECURITY.md](SECURITY.md) の非公開の窓口から知らせてください。 / Please report vulnerabilities privately as described in [SECURITY.md](SECURITY.md), not in public issues.
+
 ## ライセンス / License
 
 [GPL-3.0-or-later](LICENSE) — 依存クレート（zlog / ztracing、Zed リポ由来）が GPL-3.0 のため。
