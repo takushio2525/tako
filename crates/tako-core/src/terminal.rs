@@ -388,7 +388,16 @@ pub struct TerminalSession {
     /// スクロールバックの保持上限（行。Issue #818）。`Term` の設定と同じ値を
     /// 持つのは、上限を問い合わせるのに `Term` のロックを取りたくないため
     scrollback_lines: usize,
+    /// プロセス内で一意の端末の番号（Issue #1857）。同じペインの端末を張り替えたとき
+    /// （tmux の再 attach）、古い PTY から遅れて届くイベントを新しい端末へ誤配しないために
+    /// 配送側が照合する
+    serial: u64,
+    /// PTY 直下の子プロセスの終了ステータス（`ChildExit` を処理した後だけ Some。#1857）
+    exit_status: Option<std::process::ExitStatus>,
 }
+
+/// [`TerminalSession::serial`] の払い出し元（0 は使わない）
+static NEXT_SESSION_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// ホイール転送レート制限（#167）の状態。tokens = 残イベント数、last = 最終補充時刻
 struct WheelRateState {
@@ -581,6 +590,8 @@ impl TerminalSession {
                 copy_mode: std::sync::Mutex::new(CopyModeGate::default()),
                 child_pid,
                 scrollback_lines,
+                serial: NEXT_SESSION_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                exit_status: None,
                 wheel_rate: std::sync::Mutex::new(WheelRateState {
                     tokens: WHEEL_FORWARD_BURST,
                     last: std::time::Instant::now(),
@@ -672,6 +683,31 @@ impl TerminalSession {
     /// **プロセスの生存は保証しない**（終了後も残る）ので、生存前提の判定に使う側で確かめること
     pub fn child_pid(&self) -> Option<u32> {
         self.child_pid
+    }
+
+    /// プロセス内で一意の端末の番号（Issue #1857）。同じペインでも端末を張り替えれば変わる
+    pub fn serial(&self) -> u64 {
+        self.serial
+    }
+
+    /// PTY 直下の子プロセスの終了ステータス（Issue #1857）。
+    /// `ChildExit` を [`Self::process_event`] へ流した後だけ Some（生きている間は None）
+    pub fn exit_status(&self) -> Option<std::process::ExitStatus> {
+        self.exit_status
+    }
+
+    /// PTY を通さず、画面へ直接文字を置く（Issue #1857: 再 attach を諦めたときの案内）。
+    ///
+    /// **子プロセスが終わった後の端末にだけ使う**。PTY の読み取りスレッドはパーサの状態
+    /// （エスケープ列の途中など）を自分で持っているので、生きている端末へ横から流すと
+    /// 読み取り側の続きと混ざって化ける。子の終わりが届いた時点で読み取りスレッドは
+    /// 抜けている（`pty_loop` は読み切ってから `ChildExit` を送る = #1628）
+    pub fn print_local(&self, text: &str) {
+        let mut parser = alacritty_terminal::vte::ansi::Processor::<
+            alacritty_terminal::vte::ansi::StdSyncHandler,
+        >::new();
+        let mut term = self.term.lock();
+        parser.advance(&mut *term, text.as_bytes());
     }
 
     /// 器の履歴を遡っている最中か（転送したホイールの上下差 > 0。#686）。
@@ -1012,7 +1048,13 @@ impl TerminalSession {
                 Some(SessionNotice::TitleChanged)
             }
             TermEvent::ClipboardStore(_, text) => Some(SessionNotice::ClipboardStore(text)),
-            TermEvent::Exit | TermEvent::ChildExit(_) => Some(SessionNotice::Exited),
+            TermEvent::ChildExit(status) => {
+                // #1857: 終わり方（exit 1 / signal 9 等）を覚えておく。tmux の attach
+                // クライアントが外から殺されたのかを、画面を読まずに言うための材料
+                self.exit_status = Some(status);
+                Some(SessionNotice::Exited)
+            }
+            TermEvent::Exit => Some(SessionNotice::Exited),
             _ => None,
         }
     }

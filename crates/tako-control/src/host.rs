@@ -425,6 +425,19 @@ pub trait UiStateHost {
         None
     }
 
+    /// tmux の attach クライアントが外から終わったペインの再 attach の状態（#1857）。
+    /// 一度も起きていないペインは None。`list` / `read` に載せる（GUI はヘッダに同じ状態を出す）。
+    /// 形は `tako_core::backend_reattach::ReattachState::to_json` の 1 実装
+    fn backend_reattach_state(&self, _pane: PaneId) -> Option<Value> {
+        None
+    }
+
+    /// ペインを器のセッションへ attach し直す（#1857。`tako persist reattach`）。
+    /// 既定は GUI が居ない host = 再 attach する端末が無いのでエラー（騙らない）
+    fn backend_reattach(&mut self, _pane: PaneId) -> Result<Value, String> {
+        Err("tako アプリ（GUI）が居ないので再 attach できない".into())
+    }
+
     /// 読み込み中のリモートファイル（#1010）。ツリーがスピナーを出しているもの。
     /// `remote-folder list` の応答に載せて CLI / MCP からも「いま読み込み中」が読める
     fn remote_files_loading(&self) -> Vec<tako_core::remote_fs::RemoteRef> {

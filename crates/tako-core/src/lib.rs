@@ -7,6 +7,7 @@ pub mod acceptance_gate;
 pub mod agent_resume;
 pub mod agent_support;
 pub mod backend;
+pub mod backend_reattach;
 pub mod byte_lru;
 pub mod claude_resume;
 pub mod command_card;

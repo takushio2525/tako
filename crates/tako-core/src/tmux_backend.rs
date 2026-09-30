@@ -341,6 +341,36 @@ pub fn wrap_options(options: SpawnOptions, socket: &str, session: &str) -> Spawn
     }
 }
 
+/// SpawnOptions を**既存セッションへ attach するだけ**のクライアントに書き換える（Issue #1857）。
+///
+/// [`wrap_options`] の `new-session -A` は「無ければ作る」ので、attach クライアントだけが
+/// 外から終わった後の再 attach に使うと、その間にセッションが終わっていたときに
+/// **黙って新しいシェルが生える**。`attach-session` なら無ければ失敗して終わるので、
+/// 呼び出し側は改めて生死を確かめて閉じられる（`crate::backend_reattach`）。
+/// `attach-session` はサーバーを起こさないので `-f`（conf）も要らない。
+///
+/// `-d`（他クライアントの切り離し）は付けない: 再 attach は「他に誰も attach していない」
+/// ことを確かめてから撃つもので、その間に誰かが attach したなら奪わない。
+/// `options` の env / cwd は attach クライアント自身の環境になるだけ（セッションには効かない）
+pub fn reattach_options(options: SpawnOptions, socket: &str, session: &str) -> SpawnOptions {
+    let args = vec![
+        // UTF-8 の強制は `wrap_options` と同じ理由（Finder 起動の .app に LANG が無い）
+        "-u".to_string(),
+        "-L".to_string(),
+        socket.to_string(),
+        "attach-session".to_string(),
+        "-t".to_string(),
+        crate::tmux::exact_target(session),
+    ];
+    SpawnOptions {
+        command: Some(SpawnCommand {
+            program: crate::tmux::tmux_bin().to_string(),
+            args,
+        }),
+        ..options
+    }
+}
+
 /// 器の中のペインについて、器だけが知っている材料（#1199 で pid を足した）
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PaneFacts {
@@ -1870,6 +1900,192 @@ set -gq copy-mode-position-format ''
             wait_for(&second, "TAKO-PERSIST-OK"),
             "再 attach で画面内容が復元される。画面: {:?}",
             second.visible_lines().join("\n")
+        );
+    }
+
+    #[test]
+    fn reattachはattach専用で新しいセッションを作らない() {
+        let options = SpawnOptions {
+            command: Some(SpawnCommand {
+                program: "/bin/sh".into(),
+                args: vec![],
+            }),
+            cwd: Some("/tmp".into()),
+            env: vec![("TAKO_PANE_ID".into(), "3".into())],
+            scrollback_lines: None,
+        };
+        let wrapped = reattach_options(options, "tako-test", "tako-abc123");
+        let command = wrapped.command.expect("tmux コマンドに置き換わる");
+        assert!(command.program.ends_with("tmux"), "{}", command.program);
+        let args = command.args;
+        let l = args.iter().position(|a| a == "-L").expect("-L が要る");
+        assert_eq!(args[l + 1], "tako-test");
+        let t = args
+            .iter()
+            .position(|a| a == "attach-session")
+            .expect("attach-session");
+        assert_eq!(args[t + 1], "-t");
+        assert_eq!(args[t + 2], crate::tmux::exact_target("tako-abc123"));
+        // 無ければ作る語・他のクライアントを切り離す語を持たない
+        for forbidden in ["new-session", "-A", "-D", "-d", "-e", "-s"] {
+            assert!(
+                !args.iter().any(|a| a == forbidden),
+                "{forbidden} を含む: {args:?}"
+            );
+        }
+        // 内側コマンドは渡さない（attach 先のセッションが持っている）
+        assert_eq!(args.last(), Some(&crate::tmux::exact_target("tako-abc123")));
+        assert_eq!(wrapped.cwd.as_deref(), Some(std::path::Path::new("/tmp")));
+    }
+
+    /// #1857: attach クライアント**だけ**を外から SIGTERM しても、セッションと中のシェルは
+    /// 生きていて、attach 専用のクライアントで画面ごと戻る。セッションが終わった後の
+    /// attach 専用クライアントは**新しいセッションを作らずに**失敗する。
+    ///
+    /// kill するのは隔離ソケットの `list-clients` で引いた**自分のクライアントの pid だけ**
+    /// （名前・パターン指定の kill は使わない = 事故の原因そのもの）
+    #[test]
+    #[cfg(unix)]
+    fn issue1857_クライアントだけ殺されてもattach専用で戻りセッションが無ければ作らない() {
+        use crate::backend_reattach::{probe_session, ClientExit, ReattachState, SessionProbe};
+        if !crate::backend::capabilities().survives_app_exit {
+            eprintln!("skip: tmux が無い環境");
+            return;
+        }
+        let socket = format!("tako-coretest1857-{}", std::process::id());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
+        let session = "tako-e2e-1857";
+        let base = SpawnOptions {
+            command: Some(SpawnCommand {
+                program: "/bin/sh".into(),
+                args: vec![],
+            }),
+            cwd: Some(std::env::temp_dir()),
+            env: vec![],
+            scrollback_lines: None,
+        };
+        fn wait_for(session: &crate::TerminalSession, needle: &str) -> bool {
+            for _ in 0..100 {
+                if session.visible_lines().iter().any(|l| l.contains(needle)) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            false
+        }
+        /// 端末のイベントを流し、子の終わり（ChildExit）が届いたら true
+        fn wait_child_exit(
+            session: &mut crate::TerminalSession,
+            rx: &mut futures::channel::mpsc::UnboundedReceiver<crate::SessionEvent>,
+        ) -> bool {
+            for _ in 0..100 {
+                while let Ok(event) = rx.try_recv() {
+                    let child_exit = matches!(
+                        event,
+                        crate::SessionEvent::Term(crate::TermEvent::ChildExit(_))
+                    );
+                    session.process_event(event);
+                    if child_exit {
+                        return true;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            false
+        }
+        let client_of = |name: &str| {
+            for _ in 0..50 {
+                if let Some((pid, _)) = crate::tmux::list_client_pids(Some(&socket))
+                    .into_iter()
+                    .find(|(_, s)| s == name)
+                {
+                    return Some(pid);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            None
+        };
+        // サーバーが最後のセッションと一緒に消えない（exit-empty）よう、別のセッションを置く
+        let _ = crate::tmux::tmux_command(Some(&socket))
+            .args(["new-session", "-d", "-s", "tako-e2e-1857-keep", "sleep 600"])
+            .status();
+
+        let (mut first, mut rx1) =
+            crate::TerminalSession::spawn(80, 24, wrap_options(base.clone(), &socket, session))
+                .expect("tmux クライアントを spawn できる");
+        first.write(b"echo TAKO-1857-'A'\r".to_vec());
+        assert!(wait_for(&first, "TAKO-1857-A"), "1 回目のマーカー");
+        let pid = client_of(session).expect("自分のクライアントが list-clients に載る");
+        assert_eq!(
+            first.child_pid(),
+            Some(pid),
+            "PTY の子 = attach クライアント（自分の pid を『別のクライアント』と数えない根拠）"
+        );
+        // SAFETY: 隔離ソケットの list-clients で引いた、このテストが立てたクライアントの pid
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+        assert!(
+            wait_child_exit(&mut first, &mut rx1),
+            "attach クライアントの終わりが届く"
+        );
+        // tmux のクライアントは SIGTERM を受けると後始末をして exit 1 で終わる
+        assert_eq!(
+            ClientExit::from_status(first.exit_status()),
+            ClientExit::Code(1)
+        );
+        let probe = probe_session(&socket, session);
+        let SessionProbe::Alive { clients } = &probe else {
+            panic!("クライアントだけ死んだのでセッションは生きている: {probe:?}");
+        };
+        assert!(
+            clients.iter().all(|c| *c == pid),
+            "他のクライアントは居ない: {clients:?}"
+        );
+        let mut state = ReattachState::new();
+        let verdict = state.decide(&probe, Some(pid), std::time::Instant::now());
+        assert!(
+            matches!(
+                verdict,
+                crate::backend_reattach::Verdict::Reattach { attempt: 1, .. }
+            ),
+            "{verdict:?}"
+        );
+
+        // attach 専用のクライアントで戻る: 1 回目の出力が残り、同じシェルが続きを受け付ける
+        let (mut second, mut rx2) =
+            crate::TerminalSession::spawn(80, 24, reattach_options(base.clone(), &socket, session))
+                .expect("attach 専用のクライアントを spawn できる");
+        assert!(
+            wait_for(&second, "TAKO-1857-A"),
+            "再 attach で画面内容が戻る。画面: {:?}",
+            second.visible_lines().join("\n")
+        );
+        second.write(b"echo TAKO-1857-'B'\r".to_vec());
+        assert!(
+            wait_for(&second, "TAKO-1857-B"),
+            "同じシェルが続きを受け付ける"
+        );
+
+        // セッションを終わらせると、attach 中のクライアントも終わり、生死は「無い」になる
+        let _ = crate::tmux::kill_session(Some(&socket), session);
+        assert!(
+            wait_child_exit(&mut second, &mut rx2),
+            "セッションの終わりでクライアントも終わる"
+        );
+        assert_eq!(probe_session(&socket, session), SessionProbe::SessionGone);
+
+        // 無いセッションへの attach 専用クライアントは、作らずに失敗して終わる
+        let (mut third, mut rx3) =
+            crate::TerminalSession::spawn(80, 24, reattach_options(base, &socket, session))
+                .expect("spawn 自体はできる");
+        assert!(
+            wait_child_exit(&mut third, &mut rx3),
+            "無いセッションへの attach はすぐ終わる"
+        );
+        assert!(
+            !crate::tmux::has_session(Some(&socket), session),
+            "attach 専用のクライアントが新しいセッションを作っていない"
         );
     }
 

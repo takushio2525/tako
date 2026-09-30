@@ -2068,6 +2068,9 @@ fn dispatch_inner(
                 // #1010: SSH の接続待ち / 失敗（null = どちらでもない）。
                 // 画面がまだ空でも「何を待っているか」が応答から分かる
                 "ssh_connect": host.ssh_connect_state(PaneId::from_raw(pane_id)),
+                // #1857: tmux の attach クライアントが外から終わった後の再 attach
+                // （null = 一度も起きていない）。止まっていれば次の一手のコマンドも載る
+                "backend_reattach": host.backend_reattach_state(PaneId::from_raw(pane_id)),
                 // #1259: 送達フローの顛末（null = 未決着のフローが無い）。
                 // send_input が返した queued: true の**その後**をここで問う
                 "delivery": host.prompt_delivery_state(PaneId::from_raw(pane_id)),
@@ -3029,6 +3032,12 @@ fn dispatch_inner(
             }
             Ok(limit_resume_entry(host, target))
         }
+
+        // #1857: 判断（器の生死・他のクライアント）と PTY の張り替えは端末を持つ host の
+        // 1 実装。GUI の「クリックで再試行」も同じ入口を通る
+        Request::BackendReattach { pane } => host
+            .backend_reattach(PaneId::from_raw(pane))
+            .map_err(DispatchError::Operation),
 
         Request::Persist { enabled } => {
             if let Some(enabled) = enabled {
@@ -14803,6 +14812,9 @@ fn list_json(host: &dyn ControlHost) -> Value {
                         // 応答を読むだけのリモート daemon（#1080）が再現すると必ずずれる
                         "can_ssh": can_ssh_json(host, p),
                         "tmux_session": host.backend_session(p.id()),
+                        // #1857: attach クライアントが外から終わった後の再 attach
+                        // （null = 一度も起きていない）。status / 回数 / 直近の理由
+                        "backend_reattach": host.backend_reattach_state(p.id()),
                         // backend セッション内の window 全件（#1191）。**右パネルの
                         // 表示状態に依存しない**（要求のたびに実態へ合わせる）。
                         // `null` = backend ペインでない / tmux から採取できなかった、
