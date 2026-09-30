@@ -60,7 +60,7 @@ MCP ツール `tako_telemetry` と、設定画面の「一般 → エラーレ�
 
 ## 削除の依頼
 
-送信済みレポートの削除依頼や、テレメトリのデータに関する質問は [GitHub Issues](https://github.com/takushio2525/tako/issues) からお願いします。
+送信済みレポートの削除依頼や、テレメトリのデータに関する質問は、メールで [contact@takushio2525.com](mailto:contact@takushio2525.com) へお送りください（公開の GitHub Issue には書かないでください）。問い合わせ窓口の全体は [プライバシーとデータの送信](/privacy/) にあります。
 
 ## ソースコード
 

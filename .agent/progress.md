@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-27（#1660: 10 万行 / 10 MB まで編集できるようにした）
-- 上限の正本 `preview_limit`・超えたら理由と値を画面 / CLI / MCP へ。全文の塗りは background・行頭索引・描画の差し替えだけ更新
-- 実測: 8.6 万行で編集開始 19 ms・1 打鍵 中央値 3.2〜3.7 ms。`test-large-file-edit-1660.sh` 緑
-- #1800 / #1802 と合流: 閲覧中の ⌘F で CRLF の強調が消える退行を節 `large-file-decor` で再現 → 修正・番犬に規則 6
-
 ## 2026-09-27（#1819: 実行中に 2 回目以降に壊れた設定の中身も退避へ積んで残すようにした）
 - `quarantine_unreadable` は `.unreadable.bak` が在ると何も写さず、settings.json の申告も 1 プロセス 1 回 = 実行中に 2 回目に壊れた中身は保存（load → 既定値 → save）で跡形もなく消えていた（隔離 GUI で実測。recent / shortcuts / layout（`.corrupt` の rename）も同型）。2 本目以降を `.unreadable.<n>.bak` へ積み（同じ中身は積まない・上限 10 本で 1 本目を残して 2 本目から押し出し = persist.log に記録）、申告は壊れた中身ごとに 1 回へ
 - 実測: `scripts/test-unreadable-quarantine-1819.sh` before 21 PASS / 17 FAIL → after 38 PASS / 0 FAIL・注入 5 通りすべて file:line 名指しで FAILED → 戻して緑・workspace 5995 passed 0 failed・clippy 3 宇宙 0
@@ -70,3 +65,7 @@
 ## 2026-09-30（#1845: Windows の zip・インストーラーへライセンス 3 本を同梱し、両 OS の組み立てを番犬で固定した）
 - `tako.iss` の `[Files]` と `build-installer.ps1` の zip へ `THIRD-PARTY-NOTICES.md` / `THIRD-PARTY-LICENSES.md` を足した（`LICENSE.txt` は従来どおり）。`verify-assets.ps1` が zip を展開して 3 本が元ファイルとバイト一致するかを見て、CI だけがインストーラーを無人インストールしてインストール先も見る。`release-windows.yml` はタグ以外の ref から dispatch するとドライラン（Release へ添付しない）
 - 実測: 番犬 `license_bundle_watchdog.rs` 5 本緑・注入 12 通りすべて file:line 名指しで FAILED → 戻して緑・検査関数を pwsh 7.6 で 5 通り（正常 / 欠け / 食い違い / 空 / CI の外）
+
+## 2026-09-30（#1709: tako アプリのデータの扱いのページを最新の main で確かめ直し、窓口をメールと Issue の 2 本立てにして公開した）
+- PR #1714 を #1844 の上へ rebase（フッターは作者のサイト → tako のデータの扱い → 共通ポリシー → Cookie 設定）。事実の記述を現行コードと 1 件ずつ突き合わせ、食い違い 4 件（更新確認の時機・自動リネームの発火条件・設定の共有の始め方・導入の条件）を直し、抜けていた事実 5 件を足した
+- 窓口: 非公開は contact@takushio2525.com、不具合は GitHub Issue（telemetry.md の削除依頼も同じ）。docs 検査 6 本 rc=0・PC 幅 / スマホ幅の横はみ出し 0 px

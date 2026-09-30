@@ -34,6 +34,7 @@
     "/guides/settings/": "/og/guides-settings.png",
     "/guides/tmux-agents/": "/og/guides-tmux-agents.png",
     "/": "/og/index.png",
+    "/privacy/": "/og/privacy.png",
     "/releases/": "/og/releases.png",
     "/windows-support/": "/og/windows-support.png"
   }
