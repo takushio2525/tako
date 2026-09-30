@@ -100,6 +100,8 @@ GUI 内での常用体験は初回登録（`claude mcp add --scope user`）後�
       署名はキーチェーンの Apple Development 証明書を自動検出して使う（2026-06-12 変更。
       ad-hoc はビルドごとに CDHash が変わり TCC の権限承認が毎回リセットされるため。
       無ければ ad-hoc に劣化 + 警告。`TAKO_CODESIGN_IDENTITY` で明示指定可）
+      → #54 で DR を identifier 固定にしたので、#1848 で**既定を ad-hoc へ戻した**
+      （証明書の名義 = 個人名を配布物に載せない。理由と実測は `.agent/release.md`）
 
 **Exit Criteria**: Dock から起動した tako で、日本語入力を含む日常作業を常用できる。
 → 機械検証は完了。実 IME の見た目（manual-checks.md）と常用フィードバックはユーザーが

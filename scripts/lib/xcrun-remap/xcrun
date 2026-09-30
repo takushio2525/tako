@@ -1,0 +1,82 @@
+#!/bin/bash
+# xcrun の薄い包み（Issue #1848）。build-app.sh がリリースビルドの間だけ PATH の先頭に置く。
+#
+# gpui_macos の build.rs はシェーダーを固定の引数でコンパイルする:
+#   xcrun -sdk macosx metal -gline-tables-only … -c ./src/shaders.metal -o <OUT_DIR>/shaders.air
+#   xcrun -sdk macosx metallib <OUT_DIR>/shaders.air -o <OUT_DIR>/shaders.metallib
+# できた metallib は tako-app に include_bytes! で埋め込まれ、中にソースの絶対パス
+# （cargo の git checkout = ビルド機のホーム配下）と metallib 自身のコマンド行（OUT_DIR の
+# 絶対パス）が入る。rustc の --remap-path-prefix はここへ届かず、CCC_OVERRIDE_OPTIONS も
+# metal のドライバには効かない（実測）ので、呼び出しの引数をここで直す:
+#   - metal    : -ffile-prefix-map=<元>=<先> を足す（ソースパスと行情報のパス）
+#   - metallib : 出力先のディレクトリへ移り、同じディレクトリにあるパスを名前だけにする
+# それ以外（cc crate の --show-sdk-path・--find 等）と、付け替えの指定が無いときは素通しする。
+#
+# 付け替えの指定は build-app.sh が環境変数で渡す（値はリポジトリに書かない = #927）:
+#   TAKO_REMAP_FROM / TAKO_REMAP_TO … 1 組だけ（いまはビルド機のホーム → ~）
+#   TAKO_REAL_XCRUN                 … 本物の xcrun（既定 /usr/bin/xcrun。テストが差し替える）
+set -u
+
+real=${TAKO_REAL_XCRUN:-/usr/bin/xcrun}
+from=${TAKO_REMAP_FROM:-}
+to=${TAKO_REMAP_TO:-}
+
+if [ -z "$from" ] || [ "$from" = "/" ]; then
+  exec "$real" "$@"
+fi
+
+# xcrun の書式は `xcrun [オプション] <ツール名> [ツールの引数]`。ツール名の位置を探す
+args=("$@")
+n=$#
+i=0
+tool=""
+while [ "$i" -lt "$n" ]; do
+  a=${args[$i]}
+  case "$a" in
+    -sdk | --sdk | -toolchain | --toolchain) i=$((i + 2)) ;;
+    -f | --find) exec "$real" "$@" ;; # ツールの場所を訊くだけ（実行しない）
+    -*) i=$((i + 1)) ;;
+    *)
+      tool=$a
+      break
+      ;;
+  esac
+done
+
+case "$tool" in
+  metal)
+    # ツール名の直後へ差し込む（前半 = xcrun のオプション + ツール名、後半 = ツールの引数）。
+    # args はツール名を含むので空にならず、bash 3.2 の空配列の罠（#1518）には当たらない
+    exec "$real" "${args[@]:0:$((i + 1))}" "-ffile-prefix-map=$from=$to" "${args[@]:$((i + 1))}"
+    ;;
+  metallib)
+    out=""
+    j=$((i + 1))
+    while [ "$j" -lt "$n" ]; do
+      if [ "${args[$j]}" = "-o" ] && [ $((j + 1)) -lt "$n" ]; then
+        out=${args[$((j + 1))]}
+      fi
+      j=$((j + 1))
+    done
+    case "$out" in
+      /*) ;;
+      *) exec "$real" "$@" ;; # 出力先が相対（または無い）なら直すものが無い
+    esac
+    dir=$(dirname "$out")
+    rewritten=()
+    j=$((i + 1))
+    while [ "$j" -lt "$n" ]; do
+      a=${args[$j]}
+      case "$a" in
+        /*) [ "$(dirname "$a")" = "$dir" ] && a=$(basename "$a") ;;
+      esac
+      rewritten+=("$a")
+      j=$((j + 1))
+    done
+    cd "$dir" || exit 1
+    exec "$real" "${args[@]:0:$((i + 1))}" ${rewritten[@]+"${rewritten[@]}"}
+    ;;
+  *)
+    exec "$real" "$@"
+    ;;
+esac

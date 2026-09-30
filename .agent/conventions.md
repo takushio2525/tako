@@ -3254,6 +3254,25 @@ CI で特定の語も見張りたいときは `TAKO_PII_TERMS`（`,` 区切り�
 - 未追跡でまだ ignore もされていないファイル（作りかけの作業物など）は走査に残る。
   それで落ちたときは失敗メッセージが「CI は緑のままなので手元のファイル側を直す」と案内する
 
+### 配布物も同じ基準で見る（Issue #1848）
+
+リポジトリの外へ出る**ビルド成果物**にも混入経路がある。v0.8.24 の macOS 版は、バイナリに
+ビルド機のホームパスが約 1,400 箇所（依存 crate・std のソースパス = panic の位置情報と、
+gpui のシェーダー = metallib）入り、署名の名義（Apple Development 証明書 = 個人名）も
+`codesign -dvvv` で誰でも読めた。
+
+- パスは `scripts/build-app.sh` がビルドの間だけホームを `~` へ付け替える
+  （`--remap-path-prefix` と `scripts/lib/xcrun-remap/xcrun`）。**パスはリポジトリに書かず
+  環境から組み立てる**（`.cargo/config.toml` へ書くとそのパスが public リポに入る）。
+  `env!("CARGO_MANIFEST_DIR")` は付け替えが効かないので、release に入るコードでは使わない
+  （テスト・`visual-test` feature の中は可）
+- 署名は既定で ad-hoc（DR は #54 で identifier 固定なので TCC は保持される）
+- 検査は `scripts/lib/bundle-privacy.sh` の `check_bundle_privacy` 1 本で、`build-app.sh` の
+  署名の後と `release.sh` の zip の直前が呼ぶ。語は検査 2 と同じく**環境から作り**
+  （`HOME` / `USER` / `id -F` / `TAKO_PII_TERMS`）、**見つけた値はログへ書き戻さない**
+  （種類・件数・場所と伏せ字の Authority だけ）。テストは `bash scripts/test-bundle-privacy-1848.sh`。
+  仕組みの詳細は `.agent/release.md`「配布物に個人情報を入れない」
+
 ## 窓を出す検証はユーザーの画面に出さない（Issue #1141）
 
 隔離 GUI（`TAKO_ISOLATED=1` の tako-app・セルフテスト・visual-test・収録）は検証のたびに

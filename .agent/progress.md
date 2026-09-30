@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-09-27（#1730: 設定なしでプロジェクトの .venv / uv / poetry 等で走るようにした）
-- `.py` が常に PATH の `python3` で走っていたので、S1 の検出（`runtime_env`）を `Run` / `RunResolve` へ配線した。`py` 行は `${python} ${fileBase}`（実行環境が無ければ今とバイト一致）、activation は境界 B1 の `compose_run_script` でコマンドの先頭へ埋める。Tier P は `probe::output_with_timeout` だけを通し、答えを覚えて `Run` は子プロセス無しで重ねる（`runtime_probe`）。`RunResolve` は `prepare_offload` へ載せ `refresh` を足した
-- 実測: `scripts/test-runner-runtime-1730.sh` **24 PASS 0 FAIL**（venv / uv run / 壊れた venv / 空白と日本語 / 固まる Tier P の打ち切り / CLI と MCP の字面一致 / `TAKO_1730_LEGACY=1` で ① が FAILED）・Tier F 0.09〜0.35 ms・合流後の workspace 6070 passed 0 failed・MCP カタログ +434 B
-
 ## 2026-09-27（#1820: メニュー項目名から `/` を外して全項目を invoke できるようにし、tako theme の応答に warnings を載せた）
 - 「ライト / ダークを切替」など 4 項目（日英）がパス区切りで割れて `tako menu invoke` で名指しできなかった（英語の `Light/Dark` は空白が無く偶然届いていた）。「・」へ言い換え、番犬 2 本（全ラベルの `/` を両 OS の文言まで file:line で名指し / 実メニューの全項目を日英でフルパス・項目名の両方から `resolve_menu_item` → `find_menu_action_in` へ通す）
 - `tako theme` / MCP `tako_theme` の status / set / toggle へ `warnings`（persist.log と同じ帳簿 `ThemeWarningLog::current` から。0 件ならキーごと出さず従来とバイト一致）。カタログ +105 B（#1730 と合流後 194,174 / 204,800）
@@ -69,3 +65,7 @@
 ## 2026-09-30（#1849: SECURITY.md を置いて脆弱性の非公開の報告先を案内した）
 - リポジトリ直下に日英併記の `SECURITY.md`（第一の窓口 = GitHub の Private vulnerability reporting、第二 = メール。対象の版 = 最新の安定版とテスト版・対象範囲・書いてほしいこと・受領の目安 7 日・公開の流れ）。README と privacy.md のお問い合わせ節に導線 1 行ずつ
 - 窓口の書き分けは PR #1714 のお問い合わせ節と同じ（非公開 = メール / 不具合・要望 = 公開の Issue）。GitHub の Markdown API で描画して見出し 6・リンク切れ 0 を確認
+
+## 2026-09-30（#1848: macOS の配布物からビルド機のホームパスと署名者の個人名を消した）
+- build-app.sh の中だけでホームを `~` へ付け替える（rustc は `--remap-path-prefix` を `CARGO_ENCODED_RUSTFLAGS` で・metallib は PATH 先頭の `scripts/lib/xcrun-remap/xcrun`・専用の `target/release-dist`）。セルフテストの `env!("CARGO_MANIFEST_DIR")` 2 か所は実行時に辿る形へ。署名は既定 ad-hoc。検査 `check_bundle_privacy` を build-app.sh の署名後と release.sh の zip 直前の 2 か所から
+- 実測: HOME を含む strings 行 v0.8.24 = 1,064 / 395 → 0 / 0。release.sh は v0.8.24 で rc=1（zip 0 本）・修正後で rc=0。Gatekeeper（quarantine 付き zip）と TCC の要件つき全 19 行の判定が v0.8.24 と一致。`test-bundle-privacy-1848.sh` 33 PASS

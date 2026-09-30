@@ -62,6 +62,10 @@ source "$REPO_ROOT/scripts/lib/release-assets.sh"
 # shellcheck source=lib/launch-services.sh
 source "$REPO_ROOT/scripts/lib/launch-services.sh"
 
+# 配布物の個人情報チェック（#1848）。build-app.sh の署名の後と同じ 1 実装を、zip の直前にも呼ぶ
+# shellcheck source=lib/bundle-privacy.sh
+source "$REPO_ROOT/scripts/lib/bundle-privacy.sh"
+
 ARCH=$(uname -m)  # arm64 / x86_64
 ZIP_NAME=$(tako_asset_name "$TAG" macos "$ARCH")
 ZIP_PATH="$DIST/$ZIP_NAME"
@@ -627,6 +631,13 @@ if [[ $PWA_MARKER_FOUND -eq 0 ]]; then
   exit 1
 fi
 echo "    OK: dist の JS にソース由来マーカーを確認"
+
+# --- 配布物の個人情報チェック（Issue #1848）---
+# build-app.sh も署名の後に同じ検査をするが、--skip-build は既存の dist/tako.app をそのまま
+# 包むので、修正前のスクリプトで作った .app（ホームパス・個人名の署名入り）も通ってしまう。
+# 公開物になる zip の手前でもう一度だけ見る
+echo "==> 配布物の個人情報チェック（ビルド機のパス・署名の名義。#1848）"
+check_bundle_privacy "$APP" || exit 1
 
 # --- zip 生成 ---
 echo "==> zip 生成: $ZIP_NAME"

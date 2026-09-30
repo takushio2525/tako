@@ -28,6 +28,9 @@ VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 source "$REPO_ROOT/scripts/lib/launch-services.sh"
 # shellcheck source=lib/bundle-install.sh
 source "$REPO_ROOT/scripts/lib/bundle-install.sh"
+# 配布物の個人情報チェック（#1848）。release.sh も zip の直前に同じものを呼ぶ
+# shellcheck source=lib/bundle-privacy.sh
+source "$REPO_ROOT/scripts/lib/bundle-privacy.sh"
 
 VERIFY=0
 INSTALL=0
@@ -52,8 +55,39 @@ fi
 echo "==> PWA ビルド（web/tako-remote）"
 "$REPO_ROOT/scripts/build-pwa.sh"
 
-echo "==> リリースビルド（tako-app + tako-cli, profile.release）"
-cargo build --release -p tako-app -p tako-cli
+# --- 配布物からビルド機のパスを消す（Issue #1848）---
+# リリースビルドには依存 crate・std のソースパス（panic の位置情報）と gpui のシェーダー
+# （metallib）のパスが絶対パスで入り、v0.8.24 では約 1,400 箇所がビルド機のホーム配下
+# （= 実ユーザー名入り）だった。ホームを `~` へ付け替えてビルドする:
+#   - rustc: --remap-path-prefix（CARGO_ENCODED_RUSTFLAGS。空白入りのホームでも割れない）
+#   - metal / metallib: scripts/lib/xcrun-remap/xcrun（rustc のフラグが届かない。理由は同ファイル）
+# パスはリポジトリに書かず、ここで環境から組み立てる（public リポ = #927）。
+# フラグが変わると cargo のキャッシュが別物になるので、専用の target dir でビルドし、
+# 隔離検証・テストが使う target/release とは混ぜない。フラグにはホームだけを入れる
+# （worktree のパスを入れると、夜間リリースの一時 worktree で毎晩フルビルドになる）。
+# 付け替えの漏れは、署名の後の check_bundle_privacy が落とす
+: "${HOME:?HOME が無いとビルド機のパスを付け替えられない（#1848）}"
+DIST_TARGET_DIR="$REPO_ROOT/target/release-dist"
+REMAP_FLAG="--remap-path-prefix=$HOME=~"
+US=$'\x1f' # CARGO_ENCODED_RUSTFLAGS の区切り
+if [[ -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]]; then
+  DIST_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS}${US}${REMAP_FLAG}"
+else
+  # CARGO_ENCODED_RUSTFLAGS は RUSTFLAGS より優先されるので、指定があれば cargo と同じく
+  # 空白で区切って引き継ぐ
+  DIST_RUSTFLAGS=""
+  read -r -a user_rustflags <<<"${RUSTFLAGS:-}" || true
+  for f in ${user_rustflags[@]+"${user_rustflags[@]}"}; do
+    DIST_RUSTFLAGS+="${f}${US}"
+  done
+  DIST_RUSTFLAGS+="$REMAP_FLAG"
+fi
+
+echo "==> リリースビルド（tako-app + tako-cli, profile.release。ビルド機のパスは ~ へ付け替え）"
+CARGO_ENCODED_RUSTFLAGS="$DIST_RUSTFLAGS" \
+  PATH="$REPO_ROOT/scripts/lib/xcrun-remap:$PATH" \
+  TAKO_REMAP_FROM="$HOME" TAKO_REMAP_TO="~" \
+  cargo build --release --target-dir "$DIST_TARGET_DIR" -p tako-app -p tako-cli
 
 echo "==> アイコン生成（icon-a.svg → tako.icns）"
 ICONSET="$DIST/tako.iconset"
@@ -87,11 +121,11 @@ rm -rf "$ICONSET"
 echo "==> tako.app の組み立て"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp target/release/tako-app "$APP/Contents/MacOS/tako-app"
+cp "$DIST_TARGET_DIR/release/tako-app" "$APP/Contents/MacOS/tako-app"
 # tako CLI（MCP stdio ブリッジ `tako mcp serve` を含む）も同梱する。
 # `claude mcp add --scope user tako -- <パス> mcp serve` の登録先パスを
 # /Applications 配下で安定させるため（target/debug はビルドで消え得る）
-cp target/release/tako "$APP/Contents/MacOS/tako"
+cp "$DIST_TARGET_DIR/release/tako" "$APP/Contents/MacOS/tako"
 mv "$DIST/tako.icns" "$APP/Contents/Resources/tako.icns"
 # ライセンス本文と第三者の告知を同梱する（Issue #1709）。GPL-3.0 第 4 条・Apache-2.0 第 4 条 (a)・
 # MIT / BSD の表示義務は、バイナリの受け取り手へ本文と著作権表示を渡すことを求める。
@@ -203,30 +237,27 @@ PLIST
 # （なりすまし耐性は低下）。ローカル開発ツールの脅威モデルでは許容し、Phase 7 の
 # Developer ID 配布時に anchor + Team ID を含む DR へ強化する（強化時は 1 回だけ
 # TCC の再許可が発生する）。
+#
+# 既定は ad-hoc 署名（Issue #1848）。以前はキーチェーンの Apple Development 証明書を
+# 自動で選んでいたが、その名義は個人名で、配布物を `codesign -dvvv` すれば誰でも読めた。
+# Apple Development は配布用の証明書ではなく、公証も無いので、Gatekeeper の扱いは ad-hoc と
+# 変わらない（2026-09-30 実測: quarantine 付きの zip を展開した両方が spctl で rejected、
+# syspolicy_check の Fatal は両方とも「Notary Ticket Missing」だけ）。TCC は上の DR 固定で
+# 保持される（同日実測: TCC.db の tako の全行で、要件を満たすかが両者で一致）。
+# ad-hoc は秘密鍵を使わないので、夜間リリース（launchd）がキーチェーンの許可待ちで止まる
+# こともなく、証明書の失効も無い。
+# 証明書で署名したいとき（自己署名・Phase 7 の Developer ID）は TAKO_CODESIGN_IDENTITY で
+# 明示する。名義に個人名が入れば check_bundle_privacy が落とす
 REQ_APP='designated => identifier "dev.takushio.tako"'
 REQ_CLI='designated => identifier "dev.takushio.tako.cli"'
-resolve_sign_identity() {
-  if [[ -n "${TAKO_CODESIGN_IDENTITY:-}" ]]; then
-    echo "$TAKO_CODESIGN_IDENTITY"
-    return
-  fi
-  # Apple Development identity の SHA-1 を昇順ソートの先頭で選ぶ（複数枚あるとき
-  # find-identity の列挙順が不定でも選択が揺れないよう決定論化。DR は identifier
-  # 固定なのでどれが選ばれても TCC には影響しない。名前指定は重複時に codesign が
-  # ambiguous で落ちるため、ハッシュ指定で一意化する）
-  security find-identity -p codesigning -v 2>/dev/null \
-    | sed -n 's/^ *[0-9]*) \([0-9A-F]\{40\}\) "Apple Development:.*/\1/p' | sort | head -1
-}
-IDENTITY=$(resolve_sign_identity)
+IDENTITY="${TAKO_CODESIGN_IDENTITY:-}"
 if [[ -n "$IDENTITY" ]]; then
-  IDENTITY_NAME=$(security find-identity -p codesigning -v 2>/dev/null \
-    | grep -F "$IDENTITY" | sed -E 's/.*"(.*)"/\1/' | head -1)
-  echo "==> 署名（identity: ${IDENTITY_NAME:-$IDENTITY} / DR: identifier 固定）"
+  # 名義はログへ出さない（夜間リリースのログに個人名を残さない。#1848）
+  echo "==> 署名（identity: TAKO_CODESIGN_IDENTITY の指定 / DR: identifier 固定）"
   codesign --force -s "$IDENTITY" -i dev.takushio.tako.cli -r="$REQ_CLI" "$APP/Contents/MacOS/tako"
   codesign --force -s "$IDENTITY" -r="$REQ_APP" "$APP"
 else
-  echo "==> ad-hoc 署名（identity なし。DR は identifier 固定のため、ad-hoc でも"
-  echo "    TCC の権限承認はビルドをまたいで保持される）"
+  echo "==> ad-hoc 署名（DR は identifier 固定のため、TCC の権限承認はビルド・更新をまたいで保持される）"
   codesign --force -s - -i dev.takushio.tako.cli -r="$REQ_CLI" "$APP/Contents/MacOS/tako"
   codesign --force -s - -r="$REQ_APP" "$APP"
 fi
@@ -234,6 +265,9 @@ fi
 echo "==> 署名検証（designated requirement の固定を機械確認）"
 codesign --verify -R='identifier "dev.takushio.tako"' "$APP"
 codesign --verify -R='identifier "dev.takushio.tako.cli"' "$APP/Contents/MacOS/tako"
+
+echo "==> 配布物の個人情報チェック（ビルド機のパス・署名の名義。#1848）"
+check_bundle_privacy "$APP" || exit 1
 
 echo "==> 生成完了: ${APP}（バージョン ${VERSION}）"
 
