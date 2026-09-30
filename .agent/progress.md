@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-27（#1820: メニュー項目名から `/` を外して全項目を invoke できるようにし、tako theme の応答に warnings を載せた）
-- 「ライト / ダークを切替」など 4 項目（日英）がパス区切りで割れて `tako menu invoke` で名指しできなかった（英語の `Light/Dark` は空白が無く偶然届いていた）。「・」へ言い換え、番犬 2 本（全ラベルの `/` を両 OS の文言まで file:line で名指し / 実メニューの全項目を日英でフルパス・項目名の両方から `resolve_menu_item` → `find_menu_action_in` へ通す）
-- `tako theme` / MCP `tako_theme` の status / set / toggle へ `warnings`（persist.log と同じ帳簿 `ThemeWarningLog::current` から。0 件ならキーごと出さず従来とバイト一致）。カタログ +105 B（#1730 と合流後 194,174 / 204,800）
-- 実測: `scripts/test-menu-theme-1820.sh` 修正後 33 PASS 0 FAIL / main 15 PASS 18 FAIL・注入 6 通りすべて FAILED → 戻して緑・clippy 3 宇宙 0
-
 ## 2026-09-27（#1659: 外部変更を検知した後の逃げ道（上書き / 読み直し / 差分）を足した）
 - core `save_overwrite` / `reload_from_disk`（食い違った範囲だけ = undo で戻る）/ `disk_diff` → `PreviewSave{force}` / `PreviewRevert` / `PreviewDiff` → `tako edit save --force|reload|diff` → MCP `tako_preview_save` の `action`（+403 B）→ GUI の帯
 - 競合中は自動保存を止め通知 1 回・未編集は追従・未保存のプレビューへ別ファイルは分割。実経路 45/45（main のバイナリは 30 FAIL）・注入 7 通り名指し FAILED
@@ -69,3 +64,7 @@
 ## 2026-09-30（#1848: macOS の配布物からビルド機のホームパスと署名者の個人名を消した）
 - build-app.sh の中だけでホームを `~` へ付け替える（rustc は `--remap-path-prefix` を `CARGO_ENCODED_RUSTFLAGS` で・metallib は PATH 先頭の `scripts/lib/xcrun-remap/xcrun`・専用の `target/release-dist`）。セルフテストの `env!("CARGO_MANIFEST_DIR")` 2 か所は実行時に辿る形へ。署名は既定 ad-hoc。検査 `check_bundle_privacy` を build-app.sh の署名後と release.sh の zip 直前の 2 か所から
 - 実測: HOME を含む strings 行 v0.8.24 = 1,064 / 395 → 0 / 0。release.sh は v0.8.24 で rc=1（zip 0 本）・修正後で rc=0。Gatekeeper（quarantine 付き zip）と TCC の要件つき全 19 行の判定が v0.8.24 と一致。`test-bundle-privacy-1848.sh` 33 PASS
+
+## 2026-09-30（#1855: docs サイトの GA4 を同意まで読み込まない新しい形（basic 型）へ移した）
+- `docs/astro.config.mjs` の head から gtag.js と inline の config（保険の `consent default` を含む）を消し、ハブの consent.js 1 本に `data-ga-id` を付けた。gtag.js は consent.js が地域と同意を見て差し込む（Refs takushio2525/takushio2525.com#36）。`.agent/conventions.md` の同意の節も同じ形へ
+- 実測（ヘッドレス Chromium・国判定だけ差し替え・送信は 204 で打ち切り）: EEA 未選択で Google への要求 0・同意で gtag.js 1 / page_view 1・日本は 1 / 1。旧版の consent.js のままだと全場面 0 なので、merge はエッジの入れ替わりの後

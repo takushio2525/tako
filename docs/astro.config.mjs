@@ -62,37 +62,22 @@ export default defineConfig({
 					tag: 'noscript',
 					content: `<link rel="stylesheet" href="${WEB_FONTS_CSS}">`,
 				},
-				// Cookie 同意（Consent Mode v2）。takushio2525.com 一族で共用のバナー本体を読む。
-				// **Google タグより前に `async` を付けずに**置くのが条件（`gtag('consent',
-				// 'default', …)` が `gtag('config', …)` より前に dataLayer へ入っていないと
-				// 既定値が効かない）。旧ドメインからの転送より後ろなのは、転送で捨てる表示の
-				// ために同期の取得を待たせないため。バナー本体・国判定・ポリシーの正本は
-				// ハブ（takushio2525.com）側にあり、ここは読み込むだけ。
-				{
-					tag: 'script',
-					attrs: { src: 'https://takushio2525.com/consent/consent.js' },
-				},
-				// Google アナリティクス 4（gtag.js）。Google タグは 1 ページに 1 つだけ置く。
+				// Cookie 同意と Google アナリティクス 4。takushio2525.com 一族で共用の consent.js を
+				// 1 本読み、測定 ID を `data-ga-id` で渡す（basic 型。#1855）。gtag.js は consent.js が
+				// 地域と同意を見て自分で差し込む: EEA・英国・スイス・国が不明なら同意をもらうまで
+				// 読まず（Google へ何も送らない）、それ以外は国の判定の後に読む。
+				// **gtag.js と inline の config をここに並べない**（二重に計測される）。consent.js が
+				// 読めなければ gtag.js も読まれないので、旧来の形にあった「既定値を denied にする
+				// 保険の 1 行」も要らない。`async` を付けない（保存済みの選択の反映が遅れる）。
+				// 旧ドメインからの転送より後ろなのは、転送で捨てる表示のために同期の取得を
+				// 待たせないため。バナー本体・国判定・ポリシー・組み込み手順の正本はハブ
+				// （takushio2525.com）側にあり、ここは読み込むだけ。
 				{
 					tag: 'script',
 					attrs: {
-						async: true,
-						src: `https://www.googletagmanager.com/gtag/js?id=${GA_MEASUREMENT_ID}`,
+						src: 'https://takushio2525.com/consent/consent.js',
+						'data-ga-id': GA_MEASUREMENT_ID,
 					},
-				},
-				{
-					tag: 'script',
-					content:
-						'window.dataLayer = window.dataLayer || [];' +
-						'function gtag(){dataLayer.push(arguments);}' +
-						// consent.js を読めなかった（通信失敗・ブロック）ときの保険。既定値が
-						// 1 つも宣言されていないと gtag は全部同意済みとして動くので、止める側へ
-						// 倒す。**省略しない。**
-						'if (!window.tkConsent) ' +
-						"gtag('consent', 'default', {ad_storage: 'denied', ad_user_data: 'denied', " +
-						"ad_personalization: 'denied', analytics_storage: 'denied'});" +
-						"gtag('js', new Date());" +
-						`gtag('config', '${GA_MEASUREMENT_ID}');`,
 				},
 				// AdSense のサイト所有権確認（メタタグ方式）。広告ユニットは出さない。
 				{
