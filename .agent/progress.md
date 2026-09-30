@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-09-27（#1763: 実行中のテーマの読み直しでも読めない色を persist.log へ残すようにした）
-- 起動時だけが警告を残し、`reload_theme`（`tako theme` / MCP / 設定画面）とタブバーのトグルは `resolve_theme()` の警告を捨てていた。3 経路とも `load_theme_logged` → `settings::ThemeWarningLog` の 1 本へ寄せ、前回と同じ警告は出さず増えたぶんを起動時と同じ「無視」、消えたぶんを「解消」で出す
-- 実測: `scripts/test-theme-reload-1763.sh` 修正前 16 PASS 10 FAIL（読み直し 0 行）→ 修正後 30 PASS 0 FAIL（CLI / MCP / toggle / 壊れた JSON）・注入 7 通りすべて file:line 名指しで FAILED → 戻して緑
-
 ## 2026-09-27（#1660: 10 万行 / 10 MB まで編集できるようにした）
 - 上限の正本 `preview_limit`・超えたら理由と値を画面 / CLI / MCP へ。全文の塗りは background・行頭索引・描画の差し替えだけ更新
 - 実測: 8.6 万行で編集開始 19 ms・1 打鍵 中央値 3.2〜3.7 ms。`test-large-file-edit-1660.sh` 緑
@@ -70,3 +66,7 @@
 ## 2026-09-29（#1843: docs サイトの検索流入を増やす — 検索向けの title・構造化データ・フォントの非同期化・解説 2 本）
 - 主要 17 ページに `seoTitle`（見出しは変えず `<title>` と og:title だけ）・description 10 本を検索意図へ。JSON-LD（トップ WebSite / 各ページ BreadcrumbList / 「よくある質問」節から FAQPage）を `docs/src/structuredData.ts` の 1 か所で組む。フォントの `@import` を head の preconnect + 非同期読み込みへ。解説「Claude Code を複数同時に動かす」「tmux で AI エージェントを動かす」とハブへの導線
 - 実測: `docs/scripts/verify-seo.mjs`（新・CI の docs 節）33 ページ緑・注入 7 通りすべて名指しで FAILED・schema.org 語彙の検査 errors 0。Lighthouse の前後は PR 本文
+
+## 2026-09-30（#1845: Windows の zip・インストーラーへライセンス 3 本を同梱し、両 OS の組み立てを番犬で固定した）
+- `tako.iss` の `[Files]` と `build-installer.ps1` の zip へ `THIRD-PARTY-NOTICES.md` / `THIRD-PARTY-LICENSES.md` を足した（`LICENSE.txt` は従来どおり）。`verify-assets.ps1` が zip を展開して 3 本が元ファイルとバイト一致するかを見て、CI だけがインストーラーを無人インストールしてインストール先も見る。`release-windows.yml` はタグ以外の ref から dispatch するとドライラン（Release へ添付しない）
+- 実測: 番犬 `license_bundle_watchdog.rs` 5 本緑・注入 12 通りすべて file:line 名指しで FAILED → 戻して緑・検査関数を pwsh 7.6 で 5 通り（正常 / 欠け / 食い違い / 空 / CI の外）

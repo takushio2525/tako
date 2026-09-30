@@ -1,7 +1,7 @@
 # リリース運用（詳細）
 
-> `AGENTS.md`「リリース運用」節の**全文**。両 OS 同時リリースの仕組み・夜間リリース・
-> 次回バージョンの予約はここにある（並びは AGENTS.md と同じ）。**毎ターンは読まない** —
+> `AGENTS.md`「リリース運用」節の**詳細**。両 OS 同時リリースの仕組み・配布物に同梱する
+> ライセンス・夜間リリース・次回バージョンの予約はここにある。**毎ターンは読まない** —
 > リリースを打つ直前・機構を触る直前にその節だけ Read する。
 
 ## 両 OS 同時リリース（#965）
@@ -25,6 +25,35 @@
 - 動作要件の数値（macOS 11.0 / Windows 10.0.17763）も `release_assets` が正で、
   `tako.iss` の `MinVersion` と `build-app.sh` の `LSMinimumSystemVersion` との一致を
   テストが検証する（ノートの要件と配布物の実際の下限がズレない）
+
+## 配布物に同梱するライセンス（#1709 / #1845）
+
+GPL-3.0 第 4 条・Apache-2.0 第 4 条 (a)・MIT / BSD の表示義務は、バイナリの受け取り手へ
+本文と著作権表示を渡すことを求める。**両 OS の配布物が同じ 3 本を持つ**のが正常な状態。
+
+| 元ファイル（リポジトリ直下） | macOS（`tako.app/Contents/Resources/`） | Windows（zip の `tako/`・インストール先） |
+|---|---|---|
+| `LICENSE` | `LICENSE` | `LICENSE.txt`（メモ帳で開けるように） |
+| `THIRD-PARTY-NOTICES.md` | 同名 | 同名 |
+| `THIRD-PARTY-LICENSES.md` | 同名 | 同名 |
+
+- 組み立て: macOS = `scripts/build-app.sh`（署名より前に置く）/ Windows の zip =
+  `installer/windows/build-installer.ps1` / Windows のインストーラー = `installer/windows/tako.iss`
+  の `[Files]`。**3 か所とも 1 本ずつ明示で並べる**（まとめて glob にしない）
+- 番犬: `crates/tako-control/tests/license_bundle_watchdog.rs` が組み立ての全箇所と
+  リリース検査の表を 1 つの表へ突き合わせ、抜けたら置くべき場所の file:line を名指しして落ちる
+- 実物の検査: `installer/windows/lib/verify-assets.ps1` の `$TakoLicenseBundle` が同梱表。
+  zip は `Test-TakoWindowsAssets` が展開してリポジトリの元ファイルとのバイト一致を見る
+  （CI・実機の両経路）。インストール先は `Test-TakoInstalledPayload` が**使い捨ての CI
+  ランナーでだけ**無人インストールして見る（実機で走らせると同じ AppId の実インストールの
+  登録を上書きするので、`release-windows.ps1` からは呼ばない。番犬もこれを固定する）
+- **Windows の配布物のドライラン**: PR の CI は Windows の配布物を組まない（タグ push 時だけ）。
+  組み立てを変えた PR は `gh workflow run release-windows.yml --ref <ブランチ>` で確かめる。
+  タグ以外の ref では Cargo.toml の版数で組み立て・検査・artifact 保存（`tako-windows-dryrun-<run id>`）
+  までを行い、**Release へは添付しない**。ログの「zip の tako/ の中身」「インストール先の中身」が
+  生成物の一覧になる
+- `THIRD-PARTY-LICENSES.md` の中身は `cargo about`（`about.toml` / `about.hbs`）で生成する。
+  依存が変わったときの再生成は手動（自動化は未着手）
 
 ## 夜間リリース（自動。#166 / #1005 / #1136）
 

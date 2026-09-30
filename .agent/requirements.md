@@ -2372,6 +2372,6 @@ master 1 セッション分の工数がかかった。事故の内訳は「確�
 | NFR-3 | アイドル時メモリ（1 タブ 1 ペイン） | Electron 系より明確に軽いこと（目安 < 200MB） |
 | NFR-4 | 描画 | スクロール・大量出力で 60fps 維持 |
 | NFR-5 | 対応 OS | macOS（先行）、Windows（必須）。Linux は将来検討 |
-| NFR-6 | ライセンス | GPL-3.0-or-later（依存クレート zlog/ztracing が GPL-3.0 のため）。cmux のコード参照は引き続き禁止（`concept.md` 参照） |
+| NFR-6 | ライセンス | GPL-3.0-or-later（依存クレート zlog/ztracing が GPL-3.0 のため）。cmux のコード参照は引き続き禁止（`concept.md` 参照）。**配布物には `LICENSE`・`THIRD-PARTY-NOTICES.md`・`THIRD-PARTY-LICENSES.md` の 3 本を同梱する**（macOS = `tako.app/Contents/Resources/`、Windows = zip の `tako/` とインストール先。Windows では `LICENSE` を `LICENSE.txt` にする。#1709 / #1845）。組み立ての全箇所は番犬 `crates/tako-control/tests/license_bundle_watchdog.rs` が、実物の中身は Windows のリリース検査（`installer/windows/lib/verify-assets.ps1`）が見る。詳細は `.agent/release.md`「配布物に同梱するライセンス」 |
 | NFR-7 | 配布 | 単一バイナリ/アプリバンドル。ランタイム依存なし |
 | NFR-8 | メインスレッド非ブロック（#168） | UI スレッド（GPUI イベントループ）でサブプロセス実行・重 I/O・重計算をしない。dispatch は文脈収集のみ UI で行い実行は background（`dispatch::prepare_offload`）。32ms 超の専有は `diag::perf_span` が perf.log に記録し、新機能はこの記録が出ないことを確認する（実装指針は `architecture.md`「メインスレッド非ブロック化」節） |
