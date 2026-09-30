@@ -98,6 +98,12 @@ make_test_env() {
 touch "${!#}"
 EOF
   chmod +x "$dir/mock-bin/ditto"
+  # release.sh は zip の直前に署名の名義を読む（#1848）。ad-hoc 署名の .app として答える
+  cat > "$dir/mock-bin/codesign" <<'EOF'
+#!/usr/bin/env bash
+echo "Signature=adhoc" >&2
+EOF
+  chmod +x "$dir/mock-bin/codesign"
 
   # git リポジトリにして main をチェックアウトしておく（#1136 の不変条件を見るため）。
   # dist/ や mock-bin/ は untracked のまま（release.sh が作り消しするので追跡しない）

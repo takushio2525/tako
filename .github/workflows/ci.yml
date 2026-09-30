@@ -136,6 +136,12 @@ jobs:
       # **片肺リリースの検出が壊れたらここで落ちる**（#256 / #965）
       - name: リリース経路のモックテスト
         run: bash scripts/test-release-retry.sh
+      # 配布物の個人情報チェック（ビルド機のホームパス・署名の名義）と、シェーダーのパスを
+      # 付け替える xcrun の包みのテスト。偽の HOME と ad-hoc 署名した偽の .app だけを相手に
+      # するので、実機の値・キーチェーン・配布物には触らない。**検査が値をログへ書き戻す・
+      # Apple Development の署名を通す・包みが引数を壊す形へ戻ったらここで落ちる**（#1848）
+      - name: 配布物の個人情報チェックのテスト
+        run: bash scripts/test-bundle-privacy-1848.sh
       # 夜間リリースの版数決定（予約 / patch bump）と**共有ツリーの不変条件**の
       # モックテスト。一時ディレクトリの origin + 作業リポで実物の nightly-release.sh を
       # 走らせ、release.sh はスタブ・HOME も隔離するので本番のタグ / Release / 予約 /

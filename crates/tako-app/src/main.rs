@@ -27530,6 +27530,38 @@ mod self_test {
         )
     }
 
+    /// セルフテストが読み書きするソースツリーの根（Issue #1848）。
+    ///
+    /// `env!("CARGO_MANIFEST_DIR")` はビルド機の絶対パスが文字列のまま release バイナリへ
+    /// 入り（`--remap-path-prefix` も届かない）、配布物にホームパスを残すので使わない。
+    /// 実行中のバイナリ（`target/…/tako-app`・`dist/tako.app/…`）とカレントディレクトリから
+    /// 上へ辿り、`crates/tako-app/Cargo.toml` のある dir を返す。リポジトリの外（配布物を
+    /// そのまま走らせた）なら `None`
+    fn source_tree_root() -> Option<std::path::PathBuf> {
+        [std::env::current_exe().ok(), std::env::current_dir().ok()]
+            .into_iter()
+            .flatten()
+            .find_map(|start| {
+                start
+                    .ancestors()
+                    .find(|d| d.join("crates/tako-app/Cargo.toml").is_file())
+                    .map(std::path::Path::to_path_buf)
+            })
+    }
+
+    #[cfg(test)]
+    mod source_tree_root_tests {
+        #[test]
+        fn ビルド時のパスを使わずにソースツリーへ辿り着く() {
+            // テストバイナリも target/… の下に居るので、実行時に辿るだけで根に届く（#1848）
+            let root = super::source_tree_root().expect("リポジトリの中から走らせている");
+            assert!(root.join("crates/tako-app/Cargo.toml").is_file());
+            assert!(root
+                .join("crates/tako-app/testdata/mcp_tools_snapshot.txt")
+                .is_file());
+        }
+    }
+
     /// 失敗ログに残す実行環境の 1 行（#796）。
     /// 同じコードでも「マシンの混み具合」と「ビルド構成」で落ちる項目が変わるため、
     /// 判定の近くに必ず環境を出しておく（後から load を推測しなくて済むように）
@@ -52541,11 +52573,21 @@ mod self_test {
                     );
                     // TAKO_UPDATE_SNAPSHOT=1 なら実態でスナップショットを上書き
                     if std::env::var("TAKO_UPDATE_SNAPSHOT").is_ok() {
-                        let snap_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                            .join("testdata/mcp_tools_snapshot.txt");
-                        let content = actual.join("\n") + "\n";
-                        let _ = std::fs::write(&snap_path, &content);
-                        eprintln!("  → スナップショットを更新しました: {}", snap_path.display());
+                        match source_tree_root() {
+                            Some(root) => {
+                                let snap_path =
+                                    root.join("crates/tako-app/testdata/mcp_tools_snapshot.txt");
+                                let content = actual.join("\n") + "\n";
+                                let _ = std::fs::write(&snap_path, &content);
+                                eprintln!(
+                                    "  → スナップショットを更新しました: {}",
+                                    snap_path.display()
+                                );
+                            }
+                            None => eprintln!(
+                                "  → ソースツリーが見つからないので更新しません（リポジトリの中から実行してください）"
+                            ),
+                        }
                     }
                 }
                 ok || std::env::var("TAKO_UPDATE_SNAPSHOT").is_ok()
@@ -64268,10 +64310,12 @@ mod self_test {
             // git リポジトリは pinned フォルダで明示的に与える（この時点のペイン cwd は
             // 直前の項目が作った一時ディレクトリのことがあり、当てにできない）
             {
-                let repo_root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
-                let repo_root = std::fs::canonicalize(repo_root)
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| repo_root.to_string());
+                // 根はビルド時のパスではなく実行時に辿って決める（配布物にパスを残さない。#1848）
+                let repo_root = source_tree_root()
+                    .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .display()
+                    .to_string();
                 let pin = repo_root.clone();
                 let _ = window.update(cx, |app, _, cx| {
                     let _ = tako_control::dispatch(

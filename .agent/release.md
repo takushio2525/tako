@@ -1,7 +1,7 @@
 # リリース運用（詳細）
 
 > `AGENTS.md`「リリース運用」節の**詳細**。両 OS 同時リリースの仕組み・配布物に同梱する
-> ライセンス・夜間リリース・次回バージョンの予約はここにある。**毎ターンは読まない** —
+> ライセンス・配布物に個人情報を入れない仕組み・夜間リリース・次回バージョンの予約はここにある。**毎ターンは読まない** —
 > リリースを打つ直前・機構を触る直前にその節だけ Read する。
 
 ## 両 OS 同時リリース（#965）
@@ -54,6 +54,55 @@ GPL-3.0 第 4 条・Apache-2.0 第 4 条 (a)・MIT / BSD の表示義務は、�
   生成物の一覧になる
 - `THIRD-PARTY-LICENSES.md` の中身は `cargo about`（`about.toml` / `about.hbs`）で生成する。
   依存が変わったときの再生成は手動（自動化は未着手）
+
+## 配布物に個人情報を入れない（#1848）
+
+v0.8.24 までの macOS 版には、ビルド機のホームパス（実ユーザー名入り）が `tako-app` 1,064 行・
+`tako` 395 行（`strings` の行数）と、署名の名義（Apple Development 証明書 = 個人名）が入っていた。
+Windows 版は該当なし。既に配った版はそのまま（差し替えない）。
+
+- **パスの付け替え**（`scripts/build-app.sh` の中だけ）: ホームを `~` へ付け替えてビルドする。
+  - rustc: `--remap-path-prefix=$HOME=~` を `CARGO_ENCODED_RUSTFLAGS` で渡す（空白入りのホームでも
+    割れない。呼び出し元の `RUSTFLAGS` / `CARGO_ENCODED_RUSTFLAGS` は引き継ぐ）。依存 crate・
+    rust-src の std のソースパス（panic の位置情報）がここで消える
+  - シェーダー: gpui_macos の build.rs が `xcrun metal` / `xcrun metallib` を固定の引数で呼び、
+    metallib にソースの絶対パスと metallib 自身のコマンド行が入る。rustc のフラグは届かず、
+    `CCC_OVERRIDE_OPTIONS` も metal のドライバには効かない（実測）ので、ビルドの間だけ PATH の
+    先頭に `scripts/lib/xcrun-remap/xcrun` を置き、metal へ `-ffile-prefix-map` を足し、metallib は
+    出力先へ移って名前だけで呼ぶ（ほかの xcrun の呼び出しは素通し）
+  - **パスはリポジトリに書かない**（`.cargo/config.toml` に書くとそのパスが public リポに入る）
+  - **`env!("CARGO_MANIFEST_DIR")` は付け替えが効かない**（ただの文字列定数としてバイナリに入る）。
+    release に入るコード（実行時のセルフテストを含む）では使わず、実行時に辿る
+    （セルフテストは `self_test::source_tree_root`）。入れた実測では、付け替え後も
+    セルフテストの 2 か所だけが残り、検査が build-app.sh を止めた。テスト（`#[cfg(test)]`）と
+    `visual-test` feature の中は配布物に入らないので対象外
+- **専用の target dir**（`target/release-dist`）: フラグが変わると cargo のキャッシュが別物に
+  なるので、隔離検証・テストが使う `target/release` とは分ける。フラグにはホームだけを入れる
+  （worktree のパスを入れると、夜間リリースの一時 worktree で毎晩フルビルドになる）。
+  夜間リリースは `target/` の symlink 経由で共有ツリーの `target/release-dist` を使い回す。
+  **入れた直後の最初の 1 回だけ**フルビルドになり、ディスクを約 2GB 足す（新規ビルドの実測 1.9GB）
+- **署名は既定で ad-hoc**（`TAKO_CODESIGN_IDENTITY` を指定したときだけ証明書で署名する）。
+  2026-09-30 の実測で、Apple Development（公証なし）と比べて悪くなる点は見つからなかった:
+  - Gatekeeper: quarantine 付きの zip を展開した .app が、どちらも `spctl --assess` で rejected。
+    `syspolicy_check distribution` の Fatal はどちらも「Notary Ticket Missing」だけ
+    （ad-hoc には Warning「Adhoc Signed App」が 1 件増える）。利用者の手順（「このまま開く」/
+    `xattr -dr com.apple.quarantine`）は README・docs・cask の案内のまま
+  - TCC: DR は #54 で identifier 固定。実機の TCC.db（ユーザー + システム）で tako の要件つきの全 19 行について、
+    保存された要件を満たすかが両者で一致した（フルディスクアクセス・画面収録・フォルダ等は両方満たし、
+    #54 より前の証明書縛りの古い行はどちらも満たさない）
+  - アプリ内更新: zip は tako 自身が ureq で落とすので quarantine が付かず、Gatekeeper は関わらない。
+    差し替え後も DR は同じなので TCC は保持される
+  - キーチェーン: tako 自身はキーチェーンを使わない（子の claude 等の項目の許可は、その子の署名で
+    決まる）。ad-hoc は秘密鍵を使わないので、夜間リリース（launchd）が鍵の許可待ちで止まる余地も、
+    証明書の失効も無い
+- **検査**: `scripts/lib/bundle-privacy.sh` の `check_bundle_privacy` 1 本を、`build-app.sh` の署名の後と
+  `release.sh` の zip の直前（`--skip-build` で古い `dist/tako.app` を包む経路も塞ぐ）が呼ぶ。
+  バンドル内の全ファイルの中身に `HOME` / `USER`（汎用の名前は除く）/ `id -F` / `TAKO_PII_TERMS` の
+  語が無いこと、署名の Authority が個人の開発用証明書（Apple Development 等）でなく名義に語も
+  無いことを見て、落ちたら**値を出さずに**種類・件数・場所を出す。テストは
+  `bash scripts/test-bundle-privacy-1848.sh`（CI の macOS ジョブ。偽の HOME と ad-hoc 署名の偽 .app だけを使う）
+- Phase 7 で Developer ID を入れるときは、個人アカウントなら名義が個人名になる。検査は名義に
+  `id -F` 等の語が入れば止まるので、そこで名義を表に出すか（組織アカウントにするか）を判断する
 
 ## 夜間リリース（自動。#166 / #1005 / #1136）
 
