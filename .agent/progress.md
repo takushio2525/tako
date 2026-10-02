@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-09-30（#1845: Windows の zip・インストーラーへライセンス 3 本を同梱し、両 OS の組み立てを番犬で固定した）
-- `tako.iss` の `[Files]` と `build-installer.ps1` の zip へ `THIRD-PARTY-NOTICES.md` / `THIRD-PARTY-LICENSES.md` を足した（`LICENSE.txt` は従来どおり）。`verify-assets.ps1` が zip を展開して 3 本が元ファイルとバイト一致するかを見て、CI だけがインストーラーを無人インストールしてインストール先も見る。`release-windows.yml` はタグ以外の ref から dispatch するとドライラン（Release へ添付しない）
-- 実測: 番犬 `license_bundle_watchdog.rs` 5 本緑・注入 12 通りすべて file:line 名指しで FAILED → 戻して緑・検査関数を pwsh 7.6 で 5 通り（正常 / 欠け / 食い違い / 空 / CI の外）
-
 ## 2026-09-30（#1709: tako アプリのデータの扱いのページを最新の main で確かめ直し、窓口をメールと Issue の 2 本立てにして公開した）
 - PR #1714 を #1844 の上へ rebase（フッターは作者のサイト → tako のデータの扱い → 共通ポリシー → Cookie 設定）。事実の記述を現行コードと 1 件ずつ突き合わせ、食い違い 4 件（更新確認の時機・自動リネームの発火条件・設定の共有の始め方・導入の条件）を直し、抜けていた事実 5 件を足した
 - 窓口: 非公開は contact@takushio2525.com、不具合は GitHub Issue（telemetry.md の削除依頼も同じ）。docs 検査 6 本 rc=0・PC 幅 / スマホ幅の横はみ出し 0 px
@@ -71,3 +67,7 @@
 ## 2026-10-02（#1661: Markdown を編集して抜けたら描画へ戻し、目次を作り直すようにした）
 - 表示をエディタの行へ落とす判定を `refresh_preview_from_editor` の 1 か所（`EditState::shows_editor_lines`）へ寄せ、抜けたら**本文から**描き直す（5,000 行以下はその場・超えたら background）。抜けた後の save / reload・競合中も描画のまま・見ていた節の見出しから描く。編集中も目次が使える（`source_line`。CLI / MCP は既存の preview-outline）。layout へは抜けた先のモード
 - 実測: `scripts/test-md-edit-resume-1661.sh` 49 PASS 0 FAIL / main（048a2d9）は 22 PASS 23 FAIL（① で code のまま・目次 ERR）・A/B `TAKO_1661_LEGACY=1` で ① と visual 節が名指しで FAILED・番犬への注入 8 通りすべて file:line で FAILED・workspace 6362 passed・カタログ +132 B（並置 #1872 / ⌘F の同型 #1873）
+
+## 2026-10-02（#1864: set -e と EXIT trap を併用するスクリプトが bash 3.2 で途中の死を exit 0 に化けさせるのを塞いだ）
+- 条件は「set -e + EXIT trap + 展開エラー（set -u の未定義変数・`${x:?}`・不正な置換・readonly）」で、`/bin/sh` も同じ。番人の 1 実装 `scripts/lib/exit-guard.sh`（`tako_exit_trap` / `tako_exit 0`。印の無い 0 は 1）へ 11 本を寄せた（nightly-release.sh・release.sh --promote・promo 2・テスト 6・verify-setup-multiagent）。番犬 3 規則を `shell_scripts.rs` へ
+- 実測: 注入 A/B は修正前 rc=0 → 修正後 rc=1（nightly は Test 18 で番人を素の trap に戻すと 0・本物で 1 + ログと通知）。nightly 139 / promote 125 / retry 55 緑

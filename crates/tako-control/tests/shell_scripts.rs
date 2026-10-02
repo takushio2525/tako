@@ -4,7 +4,7 @@
 //! **CI で落とす**ための検査。`.agent/conventions.md` の
 //! 「シェルスクリプトで日本語を出すときの変数展開（Issue #837）」と
 //! 「シェルスクリプトは macOS 同梱の bash 3.2 で通す（Issue #1499 / #1518）」に
-//! 書いてある規約の機械化。
+//! 書いてある規約の機械化（同じ節の「`set -e` と EXIT trap を併用するなら番人を通す」= #1864 も）。
 
 use std::path::{Path, PathBuf};
 
@@ -499,4 +499,497 @@ fn set_uの宣言を読み分ける() {
     assert!(!declares_set_u("set -e\n"));
     assert!(!declares_set_u("set -o pipefail\n"));
     assert!(!declares_set_u("echo 'set -u'\nsettings=1\n"));
+}
+
+// ---------------------------------------------------------------------------
+// set -e と EXIT trap の併用（Issue #1864）
+// ---------------------------------------------------------------------------
+
+/// 番人の 1 実装。ここだけは素の `trap … EXIT` を張ってよい（中身そのものなので）
+const EXIT_GUARD_LIB: &str = "scripts/lib/exit-guard.sh";
+
+/// ファイルの中の 1 つの単純コマンド（クォートは外した語の並び）
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ShellCommand {
+    /// 先頭の語がある行（1 始まり）
+    line: usize,
+    /// `if` / `then` / `{` などの予約語を先頭から外した語
+    words: Vec<String>,
+    /// `( … )` / `$( … )` の中（= サブシェル。親の EXIT trap は走らない）
+    in_subshell: bool,
+}
+
+/// 単純コマンドの先頭に来ても「コマンド名」ではない予約語
+const LEADING_KEYWORDS: &[&str] = &[
+    "{", "}", "!", "if", "then", "else", "elif", "do", "while", "until", "time",
+];
+
+/// `.sh` 全体を単純コマンドへ分ける（`set -e` / `trap` / `exit` を見つけるための粗い字句解析）。
+///
+/// 行単位では読み違える形があるので**ファイル全体をクォートの状態ごと追う**:
+/// 複数行にまたがる文字列（`NOTES="…` が次の行へ続く）の中身・ヒアドキュメントの本文
+/// （テストが書き出す偽の CLI の `exit 0`）・コメントは命令として数えない。
+/// `;` `&` `|` `(` `)` と改行で区切る。`( … )` と `$( … )` の中はサブシェルとして印を付ける。
+fn shell_commands(src: &str) -> Vec<ShellCommand> {
+    #[derive(PartialEq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+    let mut out = Vec::new();
+    let mut quote = Quote::None;
+    let mut depth = 0usize;
+    let mut word = String::new();
+    let mut word_started = false;
+    let mut words: Vec<String> = Vec::new();
+    let mut start_line = 0usize;
+    let mut cmd_in_subshell = false;
+    let mut active: Option<Heredoc> = None;
+    let mut queued: Vec<Heredoc> = Vec::new();
+
+    fn end_word(word: &mut String, started: &mut bool, words: &mut Vec<String>) {
+        if *started {
+            words.push(std::mem::take(word));
+            *started = false;
+        }
+    }
+    let end_command =
+        |words: &mut Vec<String>, out: &mut Vec<ShellCommand>, line: usize, in_subshell: bool| {
+            let skip = words
+                .iter()
+                .take_while(|w| LEADING_KEYWORDS.contains(&w.as_str()))
+                .count();
+            let rest: Vec<String> = words.drain(..).skip(skip).collect();
+            if !rest.is_empty() {
+                out.push(ShellCommand {
+                    line,
+                    words: rest,
+                    in_subshell,
+                });
+            }
+        };
+
+    for (idx, line) in src.lines().enumerate() {
+        let line_no = idx + 1;
+        if let Some(hd) = active.clone() {
+            let probe = if hd.strip_tabs {
+                line.trim_start_matches('\t')
+            } else {
+                line
+            };
+            if probe == hd.delimiter {
+                active = if queued.is_empty() {
+                    None
+                } else {
+                    Some(queued.remove(0))
+                };
+            }
+            continue; // 本文は別のスクリプト（またはデータ）。この .sh の命令ではない
+        }
+        let starts_in_quote = quote != Quote::None;
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0usize;
+        let mut continued = false;
+        while i < chars.len() {
+            let c = chars[i];
+            match quote {
+                Quote::Single => {
+                    if c == '\'' {
+                        quote = Quote::None;
+                    } else {
+                        word.push(c);
+                    }
+                }
+                Quote::Double => {
+                    if c == '\\' && i + 1 < chars.len() {
+                        word.push(chars[i + 1]);
+                        i += 1;
+                    } else if c == '"' {
+                        quote = Quote::None;
+                    } else {
+                        word.push(c);
+                    }
+                }
+                Quote::None => {
+                    if words.is_empty() && !word_started {
+                        start_line = line_no;
+                        cmd_in_subshell = depth > 0;
+                    }
+                    match c {
+                        '#' if !word_started => break, // 行コメント
+                        '\\' if i + 1 == chars.len() => continued = true,
+                        '\\' => {
+                            word.push(chars[i + 1]);
+                            word_started = true;
+                            i += 1;
+                        }
+                        '\'' => {
+                            quote = Quote::Single;
+                            word_started = true;
+                        }
+                        '"' => {
+                            quote = Quote::Double;
+                            word_started = true;
+                        }
+                        ' ' | '\t' => end_word(&mut word, &mut word_started, &mut words),
+                        ';' | '&' | '|' | '(' | ')' => {
+                            end_word(&mut word, &mut word_started, &mut words);
+                            end_command(&mut words, &mut out, start_line, cmd_in_subshell);
+                            match c {
+                                '(' => depth += 1,
+                                ')' => depth = depth.saturating_sub(1),
+                                _ => {}
+                            }
+                        }
+                        _ => {
+                            word.push(c);
+                            word_started = true;
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+        if quote != Quote::None {
+            word.push('\n'); // 文字列が次の行へ続く
+            continue;
+        }
+        if continued {
+            continue; // 行末の `\` = 同じコマンドが次の行へ続く
+        }
+        end_word(&mut word, &mut word_started, &mut words);
+        end_command(&mut words, &mut out, start_line, cmd_in_subshell);
+        // 文字列の途中から始まった行の `<<` は文字列の中身なので数えない
+        if !starts_in_quote {
+            let mut opened = heredocs_opened(line);
+            if !opened.is_empty() {
+                active = Some(opened.remove(0));
+                queued.extend(opened);
+            }
+        }
+    }
+    out
+}
+
+/// `set` の 1 コマンドがオプション（短い名前 `short` / 長い名前 `long`）を**入れる**か
+fn set_command_enables(words: &[String], short: char, long: &str) -> bool {
+    if words.first().map(String::as_str) != Some("set") {
+        return false;
+    }
+    let mut args = words[1..].iter();
+    while let Some(a) = args.next() {
+        if a == "-o" {
+            if args.next().is_some_and(|n| n == long) {
+                return true;
+            }
+        } else if let Some(flags) = a.strip_prefix('-') {
+            if !flags.starts_with('-') && flags.contains(short) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `set -e`（`set -euo pipefail` / `set -o errexit` / shebang の `-e` を含む）を宣言しているか
+fn declares_errexit(src: &str, commands: &[ShellCommand]) -> bool {
+    let shebang_e = src.lines().next().is_some_and(|first| {
+        first.starts_with("#!")
+            && first
+                .split_whitespace()
+                .skip(1)
+                .any(|w| w.starts_with('-') && !w.starts_with("--") && w.contains('e'))
+    });
+    shebang_e
+        || commands
+            .iter()
+            .any(|c| set_command_enables(&c.words, 'e', "errexit"))
+}
+
+/// この単純コマンドが EXIT の trap を**張る**か（`trap - EXIT` は外す方なので false）
+fn installs_exit_trap(words: &[String]) -> bool {
+    if words.first().map(String::as_str) != Some("trap") {
+        return false;
+    }
+    let mut args: &[String] = &words[1..];
+    if args.first().is_some_and(|a| a == "--") {
+        args = &args[1..];
+    }
+    let Some((action, sigspecs)) = args.split_first() else {
+        return false; // 素の `trap` = 一覧の表示
+    };
+    // `trap - EXIT`（外す）/ `trap -p` / `trap -l`（表示）
+    if action.starts_with('-') {
+        return false;
+    }
+    sigspecs.iter().any(|s| {
+        let s = s.to_ascii_uppercase();
+        s == "EXIT" || s == "SIGEXIT" || s == "0"
+    })
+}
+
+/// 印を立てずに 0 で抜ける `exit`（`exit 0` / 引数なしの `exit`）か
+fn exits_zero_unmarked(words: &[String]) -> bool {
+    words.first().map(String::as_str) == Some("exit")
+        && matches!(words.get(1).map(String::as_str), None | Some("0"))
+}
+
+/// 監査済みの例外宣言 `# tako:exit-guard-ok <理由>`（違反行か直前の行。理由の無い宣言は無効）
+fn exit_guard_exception(lines: &[&str], line_no: usize) -> bool {
+    let has = |l: &str| {
+        l.split("tako:exit-guard-ok")
+            .nth(1)
+            .is_some_and(|reason| !reason.trim().is_empty())
+    };
+    let at = |n: usize| n.checked_sub(1).and_then(|i| lines.get(i)).copied();
+    at(line_no).is_some_and(has) || at(line_no.wrapping_sub(1)).is_some_and(has)
+}
+
+/// 呼び手の `set -e` を継ぐライブラリ（自分では宣言しなくても、宣言した側から source される）
+fn is_sourced_library(rel: &str) -> bool {
+    rel.starts_with("scripts/lib/") || rel.ends_with("/lib.sh")
+}
+
+/// 1 ファイルぶんの違反（file:line で名指しする文言）
+fn exit_guard_violations(rel: &str, src: &str) -> Vec<String> {
+    if rel == EXIT_GUARD_LIB {
+        return Vec::new();
+    }
+    let commands = shell_commands(src);
+    let lines: Vec<&str> = src.lines().collect();
+    let text = |c: &ShellCommand| {
+        lines
+            .get(c.line - 1)
+            .map(|l| l.trim().to_string())
+            .unwrap_or_default()
+    };
+    let mut out = Vec::new();
+
+    // 規則 1: set -e の下で素の EXIT trap を張っている（印の共通実装を通っていない）
+    let errexit = declares_errexit(src, &commands);
+    if errexit || is_sourced_library(rel) {
+        let how = if errexit {
+            "set -e を宣言"
+        } else {
+            "set -e を宣言した側から source される"
+        };
+        for c in commands.iter().filter(|c| installs_exit_trap(&c.words)) {
+            if !exit_guard_exception(&lines, c.line) {
+                out.push(format!(
+                    "{rel}:{}: 素の EXIT trap（{how}）→ tako_exit_trap で張る: {}",
+                    c.line,
+                    text(c)
+                ));
+            }
+        }
+    }
+
+    let first_guard = commands
+        .iter()
+        .find(|c| c.words.first().is_some_and(|w| w == "tako_exit_trap"));
+    if let Some(guard) = first_guard {
+        // 規則 2: tako_exit_trap を呼ぶのに番人の 1 実装を source していない
+        let sourced = commands.iter().any(|c| {
+            matches!(c.words.first().map(String::as_str), Some("source" | "."))
+                && c.words.get(1).is_some_and(|p| p.ends_with("exit-guard.sh"))
+        });
+        if !sourced {
+            out.push(format!(
+                "{rel}:{}: tako_exit_trap を呼ぶのに {EXIT_GUARD_LIB} を source していない: {}",
+                guard.line,
+                text(guard)
+            ));
+        }
+        // 規則 3: trap を張った後の素の `exit 0` は印が立たないので 1 に化ける
+        for c in commands
+            .iter()
+            .filter(|c| c.line > guard.line && !c.in_subshell && exits_zero_unmarked(&c.words))
+        {
+            if !exit_guard_exception(&lines, c.line) {
+                out.push(format!(
+                    "{rel}:{}: tako_exit_trap の後の素の exit（印が立たず 1 になる）→ tako_exit 0: {}",
+                    c.line,
+                    text(c)
+                ));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn set_eとexit_trapの併用は番人の共通実装を通す() {
+    let root = repo_root();
+    let mut violations: Vec<String> = Vec::new();
+    for path in shell_scripts() {
+        let src = std::fs::read_to_string(&path).expect("読める .sh");
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        violations.extend(exit_guard_violations(&rel, &src));
+    }
+    assert!(
+        violations.is_empty(),
+        "macOS 同梱の bash 3.2（`/bin/bash` と `/bin/sh`）は、set -e の下で未定義の変数などを\n\
+         踏んで死ぬと EXIT trap の中の $? が 0 になり、途中で死んだスクリプトが exit 0 で終わる\n\
+         （夜間リリースが黙って成功扱いになる型）。{EXIT_GUARD_LIB} を source して\n\
+         `tako_exit_trap <後始末>` で張り、成功で抜ける所は `tako_exit 0` にすること\n\
+         （.agent/conventions.md「シェルスクリプトは macOS 同梱の bash 3.2 で通す」節。\n\
+         監査して確かめた箇所だけ、その行か直前の行に `# tako:exit-guard-ok <理由>` で外せる）:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn 字句解析はクォートとヒアドキュメントとサブシェルを読み分ける() {
+    let words_of = |src: &str| -> Vec<Vec<String>> {
+        shell_commands(src).into_iter().map(|c| c.words).collect()
+    };
+    let w = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+    // 区切りと予約語。クォートは外して 1 語にする（混ぜ書きも 1 語）
+    assert_eq!(
+        words_of("if true; then exit 0; fi"),
+        vec![w(&["true"]), w(&["exit", "0"]), w(&["fi"])]
+    );
+    assert_eq!(
+        words_of(r#"trap 'promo_stop_isolated '"$socket" EXIT"#),
+        vec![w(&["trap", "promo_stop_isolated $socket", "EXIT"])]
+    );
+    assert_eq!(
+        words_of(r#"acquire_lock "$D" "x" || exit 0 # 説明"#),
+        vec![w(&["acquire_lock", "$D", "x"]), w(&["exit", "0"])]
+    );
+    // 複数行の文字列の中身は命令ではない（先頭の行で 1 語になる）
+    let multi = shell_commands("NOTES=\"a\nexit 0\ntrap c EXIT\"\necho done\n");
+    assert_eq!(multi.len(), 2);
+    assert_eq!(multi[0].line, 1);
+    assert_eq!(multi[1].words, w(&["echo", "done"]));
+    assert_eq!(multi[1].line, 4);
+    // ヒアドキュメントの本文（偽の CLI）は数えない。終わりの行の後は数える
+    let hd = shell_commands("cat > f <<'FAKE'\nset -e\ntrap c EXIT\nexit 0\nFAKE\nexit 0\n");
+    assert_eq!(
+        hd.iter()
+            .map(|c| (c.line, c.words.clone()))
+            .collect::<Vec<_>>(),
+        vec![(1, w(&["cat", ">", "f", "<<FAKE"])), (6, w(&["exit", "0"]))]
+    );
+    // サブシェル・コマンド置換の中の exit は親の trap を走らせない
+    let sub = shell_commands("( exit 0 )\nx=$(exit 0)\nexit 0\n");
+    assert_eq!(
+        sub.iter()
+            .filter(|c| exits_zero_unmarked(&c.words))
+            .map(|c| (c.line, c.in_subshell))
+            .collect::<Vec<_>>(),
+        vec![(1, true), (2, true), (3, false)]
+    );
+    // case の腕の `)` で深さが崩れない
+    let arm = shell_commands("case $1 in\n  --x) install; exit 0 ;;\nesac\nexit 0\n");
+    assert!(arm.iter().all(|c| !c.in_subshell));
+    // 行末の `\` は同じコマンドの続き
+    assert_eq!(
+        words_of("trap 'rm -rf x' \\\n  EXIT\n"),
+        vec![w(&["trap", "rm -rf x", "EXIT"])]
+    );
+}
+
+#[test]
+fn exit_trapとset_eとexitを読み分ける() {
+    let cmd = |s: &str| shell_commands(s).remove(0).words;
+    // 張る形（どの書き方でも EXIT を名指したら対象）
+    assert!(installs_exit_trap(&cmd("trap cleanup EXIT")));
+    assert!(installs_exit_trap(&cmd(
+        r#"trap 'rm -rf "$TMP"' EXIT HUP INT TERM"#
+    )));
+    assert!(installs_exit_trap(&cmd("trap 'x' 0")));
+    assert!(installs_exit_trap(&cmd("trap -- c exit")));
+    // 外す・表示する・EXIT 以外は対象外
+    assert!(!installs_exit_trap(&cmd("trap - EXIT")));
+    assert!(!installs_exit_trap(&cmd("trap -p EXIT")));
+    assert!(!installs_exit_trap(&cmd("trap 'exit 130' INT TERM")));
+    assert!(!installs_exit_trap(&cmd(r#"echo "trap c EXIT""#)));
+    assert!(shell_commands("# trap c EXIT").is_empty());
+
+    let errexit = |s: &str| declares_errexit(s, &shell_commands(s));
+    assert!(errexit("set -euo pipefail\n"));
+    assert!(errexit("set -eu\n"));
+    assert!(errexit("  set -e\n"));
+    assert!(errexit("set -o errexit\n"));
+    assert!(errexit("#!/bin/bash -e\necho x\n"));
+    // set -u だけ・外す側・文字列の中は宣言ではない（set -u だけなら死ねば 1 で化けない）
+    assert!(!errexit("set -uo pipefail\n"));
+    assert!(!errexit("set +e\n"));
+    assert!(!errexit("set -o pipefail\n"));
+    assert!(!errexit("echo 'set -e'\n"));
+    assert!(!errexit("cat <<'X'\nset -e\nX\n"));
+
+    assert!(exits_zero_unmarked(&cmd("exit 0")));
+    assert!(exits_zero_unmarked(&cmd("exit")));
+    assert!(!exits_zero_unmarked(&cmd("exit 1")));
+    assert!(!exits_zero_unmarked(&cmd(r#"exit "$rc""#)));
+    assert!(!exits_zero_unmarked(&cmd("tako_exit 0")));
+}
+
+#[test]
+fn 番犬は併用の3つの崩れ方をfile_lineで名指しする() {
+    let guard = "set -euo pipefail\n. \"$R/scripts/lib/exit-guard.sh\"\n";
+    // 直したあとの形は通る（trap の後でも、サブシェルの exit 0 と tako_exit 0 は良い）
+    let ok = format!(
+        "{guard}tako_exit_trap cleanup\nx=$(exit 0)\n[ \"$F\" -eq 0 ] || exit 1\ntako_exit 0\n"
+    );
+    assert_eq!(
+        exit_guard_violations("scripts/x.sh", &ok),
+        Vec::<String>::new()
+    );
+
+    // 規則 1: 素の EXIT trap（#1864 の前の nightly-release.sh の形）
+    let v = exit_guard_violations(
+        "scripts/x.sh",
+        "set -euo pipefail\n\ntrap 'cleanup_all' EXIT\n",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(
+        v[0].starts_with("scripts/x.sh:3: 素の EXIT trap（set -e を宣言）"),
+        "{v:?}"
+    );
+    // set -u だけなら化けない（死ねば 1）ので名指さない = 過大申告しない
+    assert!(exit_guard_violations("scripts/y.sh", "set -uo pipefail\ntrap c EXIT\n").is_empty());
+    // ライブラリは自分で宣言しなくても対象（呼び手の set -e を継ぐ）
+    let lib = exit_guard_violations("scripts/lib/z.sh", "f() {\n  trap c EXIT\n}\n");
+    assert_eq!(lib.len(), 1, "{lib:?}");
+    assert!(lib[0].starts_with(
+        "scripts/lib/z.sh:2: 素の EXIT trap（set -e を宣言した側から source される）"
+    ));
+    // 番人の 1 実装そのものは対象外
+    assert!(exit_guard_violations(EXIT_GUARD_LIB, "trap '_x' EXIT\n").is_empty());
+
+    // 規則 2: source を忘れた
+    let v = exit_guard_violations("scripts/x.sh", "set -eu\ntako_exit_trap c\ntako_exit 0\n");
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(
+        v[0].starts_with("scripts/x.sh:2: tako_exit_trap を呼ぶのに"),
+        "{v:?}"
+    );
+
+    // 規則 3: trap の後の素の exit 0 / 引数なしの exit（印が立たず 1 に化ける）
+    let v = exit_guard_violations(
+        "scripts/x.sh",
+        &format!("{guard}exit 0\ntako_exit_trap c\nlock || exit 0\nexit\ntako_exit 0\n"),
+    );
+    assert_eq!(v.len(), 2, "{v:?}");
+    assert!(
+        v[0].starts_with("scripts/x.sh:5: tako_exit_trap の後の素の exit"),
+        "{v:?}"
+    );
+    assert!(v[1].starts_with("scripts/x.sh:6: "), "{v:?}");
+
+    // 例外宣言は理由つきのときだけ効く
+    let src =
+        "set -e\n# tako:exit-guard-ok trap の中で exit 1 固定にしてある\ntrap 'exit 1' EXIT\n";
+    assert!(exit_guard_violations("scripts/x.sh", src).is_empty());
+    let src = "set -e\n# tako:exit-guard-ok\ntrap 'exit 1' EXIT\n";
+    assert_eq!(exit_guard_violations("scripts/x.sh", src).len(), 1);
 }

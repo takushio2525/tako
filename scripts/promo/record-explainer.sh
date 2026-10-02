@@ -30,6 +30,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
+# シーンの収録中に張る EXIT trap の番人（bash 3.2 の set -e + EXIT trap で途中の死が exit 0 に
+# 化けるのを塞ぐ。#1864）。シーンの終わりで trap - EXIT するので、正常終了に印は要らない
+source "$SCRIPT_DIR/../lib/exit-guard.sh"
 
 SCENE=${1:-}
 [ -n "$SCENE" ] || { echo "usage: $0 <scatter|control|agent|setup|basics|master|guimode|restore|remote|windows|all>" >&2; exit 2; }
@@ -246,7 +249,7 @@ scene_scatter() {
     local raw="$PROMO_OUT/scenes/scatter-raw.mp4"
     promo_make_demo_env
     explainer_begin scatter "$work" "$socket"
-    trap 'promo_stop_isolated '"$socket" EXIT
+    tako_exit_trap 'promo_stop_isolated '"$socket"
     local base; base=$(promo_base_pane)
     tko welcome dismiss >/dev/null 2>&1 || true
     type_cmd "$base" "cd $PROMO_DEMO/awesome-app && clear && bash scripts/worker.sh agent-main"
@@ -290,7 +293,7 @@ scene_control() {
     local raw="$PROMO_OUT/scenes/control-raw.mp4"
     promo_make_demo_env
     explainer_begin control "$work" "$socket"
-    trap 'promo_stop_isolated '"$socket" EXIT
+    tako_exit_trap 'promo_stop_isolated '"$socket"
     local base right
     base=$(promo_base_pane)
     tko welcome dismiss >/dev/null 2>&1 || true
@@ -345,7 +348,7 @@ scene_agent() {
         "ANTHROPIC_MODEL=$FAST_MODEL"
     )
     explainer_begin agent "$work" "$socket"
-    trap 'promo_stop_isolated '"$socket" EXIT
+    tako_exit_trap 'promo_stop_isolated '"$socket"
     local base; base=$(promo_base_pane)
     tko welcome dismiss >/dev/null 2>&1 || true
     type_cmd "$base" "cd $PROMO_DEMO/awesome-app && clear"
@@ -393,7 +396,7 @@ scene_setup() {
         "ANTHROPIC_MODEL=$FAST_MODEL"
     )
     explainer_begin setup "$work" "$socket"
-    trap 'promo_stop_isolated '"$socket" EXIT
+    tako_exit_trap 'promo_stop_isolated '"$socket"
     local base; base=$(promo_base_pane)
     # 初回起動バナー（tako setup / tako master の案内）はこの章の絵として残す
     type_cmd "$base" "cd $PROMO_DEMO/awesome-app && clear"
@@ -432,7 +435,7 @@ scene_basics() {
     local raw="$PROMO_OUT/scenes/basics-raw.mp4"
     promo_make_demo_env
     explainer_begin basics "$work" "$socket"
-    trap 'promo_stop_isolated '"$socket" EXIT
+    tako_exit_trap 'promo_stop_isolated '"$socket"
     local base; base=$(promo_base_pane)
     tko welcome dismiss >/dev/null 2>&1 || true
     type_cmd "$base" "cd $PROMO_DEMO/awesome-app && clear && ls"
@@ -516,7 +519,7 @@ scene_master() {
     # **器（tmux バックエンド）が要る**。persist=0 だと claude ペインが永久に terminal のまま
     # （隔離で実測: persist=0 は 40 秒待っても terminal / persist=1 は 5 秒で chat）
     explainer_begin master "$work" "$socket" 1
-    trap 'promo_stop_isolated '"$socket" EXIT
+    tako_exit_trap 'promo_stop_isolated '"$socket"
     local base; base=$(promo_base_pane)
     tko welcome dismiss >/dev/null 2>&1 || true
     # master が spawn 先に使うプロジェクトと、収録用の軽い worker モデル（隔離 data_dir へ書く）
@@ -619,7 +622,7 @@ scene_restore() {
     local work=/private/tmp/tako-promo-restore socket=tako-promo-rest
     promo_make_demo_env
     explainer_begin restore "$work" "$socket" 1
-    trap 'promo_stop_isolated '"$socket" EXIT
+    tako_exit_trap 'promo_stop_isolated '"$socket"
     local base; base=$(promo_base_pane)
     tko welcome dismiss >/dev/null 2>&1 || true
     type_cmd "$base" "cd $PROMO_DEMO/awesome-app && clear"
@@ -657,7 +660,7 @@ scene_remote() {
     local raw="$PROMO_OUT/scenes/remote-raw.mp4"
     promo_make_demo_env
     explainer_begin remote "$work" "$socket"
-    trap 'promo_stop_isolated '"$socket" EXIT
+    tako_exit_trap 'promo_stop_isolated '"$socket"
     local base; base=$(promo_base_pane)
     tko welcome dismiss >/dev/null 2>&1 || true
     type_cmd "$base" "cd $PROMO_DEMO/awesome-app && clear"
@@ -681,7 +684,7 @@ scene_windows() {
     local raw="$PROMO_OUT/scenes/windows-raw.mp4"
     promo_make_demo_env
     explainer_begin windows "$work" "$socket"
-    trap 'promo_stop_isolated '"$socket" EXIT
+    tako_exit_trap 'promo_stop_isolated '"$socket"
     local base; base=$(promo_base_pane)
     tko welcome dismiss >/dev/null 2>&1 || true
     type_cmd "$base" "cd $PROMO_DEMO/tako-docs && clear && ls"
@@ -736,7 +739,7 @@ scene_guimode() {
     )
     # かんたん表示のチャット判定は器（tmux バックエンド）が要る = persist=1
     explainer_begin guimode "$work" "$socket" 1
-    trap 'promo_stop_isolated '"$socket" EXIT
+    tako_exit_trap 'promo_stop_isolated '"$socket"
     # #1149 以降は layout.json の seed が効かないので、AX で 16:9 の置き場所へ直す。
     # **この章で押す 4 点**を宣言しておくと、他の worker の窓に覆われない場所を選ぶ
     # （覆われているとクリックが相手へ吸われる。lib.sh の注記）

@@ -172,6 +172,7 @@ make_env() {
 
   cp "$REPO_ROOT/scripts/nightly-release.sh" "$dir/repo/scripts/"
   cp "$REPO_ROOT/scripts/lib/nightly-reserve.sh" "$dir/repo/scripts/lib/"
+  cp "$REPO_ROOT/scripts/lib/exit-guard.sh" "$dir/repo/scripts/lib/"
   # release.sh はスタブ。本物はビルド + gh + Pages デプロイを走らせるので絶対に使わない
   cat > "$dir/repo/scripts/release.sh" <<'STUB'
 #!/bin/sh
@@ -674,6 +675,49 @@ test_repo_scoped_lock_blocks_concurrent_run() {
   rm -rf "$dir"
 }
 
+# --- Test 18: 途中で死んだ夜間リリースが exit 0 に化けない（#1864）-----------
+# launchd は /bin/bash（3.2）で起動する。3.2 は set -e の下で未定義の変数を踏んで死ぬと
+# EXIT trap の中の $? が 0 になり、素の trap のままだと途中で死んだ夜間リリースが
+# 「成功」で終わる。(a) 番人を素の trap に戻すと 0 に化ける（= 注入が本物の穴を踏んでいる）、
+# (b) 本物の番人なら 1 で終わり、ログと後始末も残る、の A/B で見る
+test_crash_is_not_success() {
+  echo ""
+  echo "Test 18: 途中で未定義の変数を踏んで死んでも exit 0 にならない（bash 3.2 の set -e + EXIT trap。#1864）"
+  local dir out rc log
+  dir=$(make_env)
+  log="$dir/home/.claude-orchestrator/logs/tako-nightly-release.log"
+  # trap とロックを取った後の判定（dry-run の終了報告）を、未定義の変数を読む行へ差し替える。
+  # 共有ツリーが dirty だと手前でスキップされるので commit しておく（push はしない）
+  perl -i -pe 's/^  log "DRY-RUN: ここで終了.*$/  log "\$\{TAKO_UNDEFINED_1864\}"/' "$dir/repo/scripts/nightly-release.sh"
+  assert_eq "注入が当たった" "1" "$(grep -c 'TAKO_UNDEFINED_1864' "$dir/repo/scripts/nightly-release.sh")"
+  cp "$dir/repo/scripts/lib/exit-guard.sh" "$dir/exit-guard.real"
+  cat > "$dir/repo/scripts/lib/exit-guard.sh" <<'NULL'
+# 番人を外した版（#1864 の前と同じ = 素の EXIT trap を張るだけ）
+tako_exit_trap() { trap "$1" EXIT; }
+tako_exit() { exit "${1:-0}"; }
+NULL
+  git -C "$dir/repo" commit --quiet -am "未定義の変数を読む行を注入（番人なし）"
+
+  rc=0
+  out=$(run_nightly "$dir" --dry-run) || rc=$?
+  assert_contains "(a) unbound variable で止まった" "$out" "TAKO_UNDEFINED_1864: unbound variable"
+  assert_eq "(a) 番人なしでは exit 0 に化ける（= #1864 の穴を踏んでいる）" "0" "$rc"
+
+  cp "$dir/exit-guard.real" "$dir/repo/scripts/lib/exit-guard.sh"
+  git -C "$dir/repo" commit --quiet -am "番人を戻す"
+  : > "$log"
+  rc=0
+  out=$(run_nightly "$dir" --dry-run) || rc=$?
+  assert_contains "(b) unbound variable で止まった" "$out" "TAKO_UNDEFINED_1864: unbound variable"
+  assert_eq "(b) 番人ありでは exit 1（成功の印が無い 0 は失敗）" "1" "$rc"
+  assert_contains "(b) 途中で止まったと stderr に言う" "$out" "夜間リリースが途中で止まった"
+  assert_contains "(b) 夜間リリースのログにも残す" "$(cat "$log")" "ERROR: 夜間リリースが途中で止まった"
+  assert_no_file "(b) リポジトリ単位のロックを片付ける" "$dir/repo/.git/tako-nightly-release.lock/pid"
+  assert_no_file "(b) HOME 単位のロックを片付ける" "$dir/home/.claude-orchestrator/locks/tako-nightly-release.lock/pid"
+  assert_eq "(b) HEAD は main のまま" "main" "$(head_of "$dir")"
+  rm -rf "$dir"
+}
+
 # --- 実行 ---
 test_reserved_version_wins
 test_no_reservation_is_patch
@@ -692,6 +736,7 @@ test_tip_moved_during_build_aborts_cleanly
 test_signal_restores_shared_tree
 test_legacy_detached_head_is_restored
 test_repo_scoped_lock_blocks_concurrent_run
+test_crash_is_not_success
 
 echo ""
 echo "================================"

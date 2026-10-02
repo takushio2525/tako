@@ -35,7 +35,10 @@ cleanup() {
   if [ -n "${PEER_PID:-}" ]; then kill "$PEER_PID" 2>/dev/null || true; fi
   rm -rf "$TMP"
 }
-trap cleanup EXIT
+# 途中で死んだテストを「緑」に化けさせない（bash 3.2 の set -e + EXIT trap。#1864）。
+# 成功で抜けるのは末尾の tako_exit 0 だけ
+. "$REPO_ROOT/scripts/lib/exit-guard.sh"
+tako_exit_trap cleanup
 
 # --- 偽 tailscale CLI ---------------------------------------------------------
 # serve 設定は $TMP/serve.json に持つ（外から書き換えられる = 「消える」を再現できる）
@@ -309,4 +312,5 @@ echo
 echo "=========================================="
 echo " PASS: $PASS / FAIL: $FAIL"
 echo "=========================================="
-[ "$FAIL" -eq 0 ]
+[ "$FAIL" -eq 0 ] || exit 1
+tako_exit 0

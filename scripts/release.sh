@@ -67,6 +67,10 @@ source "$REPO_ROOT/scripts/lib/launch-services.sh"
 # shellcheck source=lib/bundle-privacy.sh
 source "$REPO_ROOT/scripts/lib/bundle-privacy.sh"
 
+# set -e と EXIT trap の併用で終了コードが 0 に化けるのを塞ぐ番人（#1864。--promote の後始末で使う）
+# shellcheck source=lib/exit-guard.sh
+source "$REPO_ROOT/scripts/lib/exit-guard.sh"
+
 ARCH=$(uname -m)  # arm64 / x86_64
 ZIP_NAME=$(tako_asset_name "$TAG" macos "$ARCH")
 ZIP_PATH="$DIST/$ZIP_NAME"
@@ -779,16 +783,10 @@ update_docs_stable_label() {
 }
 
 # 後始末: 一時ファイルと docs の worktree（成功・失敗のどちらでも残さない）。
-# EXIT の trap なので、最後に元の終了コードで抜け直す。ただし bash 3.2 は set -u
-# （unbound variable）で死んだときだけ trap の中の $? が 0 になる（trap が無ければ 1。
-# bash 5 は trap の中でも 1）。そのままだと途中で死んだ昇格が exit 0 に見えるので、
-# 成功の exit の直前に立てる印（PROMOTE_SUCCEEDED）が無い 0 は失敗として 1 にする
+# EXIT の trap は scripts/lib/exit-guard.sh の tako_exit_trap で張る。bash 3.2 は set -e の下で
+# 未定義の変数などを踏んで死ぬと trap の中の $? が 0 になり、途中で死んだ昇格が exit 0 に
+# 見えていた（#1853）。成功の印（tako_exit 0）を立てずに抜けた 0 は番人が 1 にする（#1864）
 promote_cleanup() {
-  local rc=$?
-  if [[ $rc -eq 0 && "${PROMOTE_SUCCEEDED:-0}" != 1 ]]; then
-    echo "エラー: 昇格が途中で止まった（終了コード 0 のまま抜けかけた。上の出力の最後の行を見る）" >&2
-    rc=1
-  fi
   if [[ -n "${PROMOTE_TMPDIR:-}" && -d "$PROMOTE_TMPDIR/docs" ]]; then
     git -C "$REPO_ROOT" worktree remove --force "$PROMOTE_TMPDIR/docs" >/dev/null 2>&1 || true
   fi
@@ -796,7 +794,6 @@ promote_cleanup() {
     rm -rf "$PROMOTE_TMPDIR"
   fi
   git -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
-  exit "$rc"
 }
 
 if [[ -n "$PROMOTE_TAG" ]]; then
@@ -831,7 +828,7 @@ if [[ -n "$PROMOTE_TAG" ]]; then
   fi
 
   PROMOTE_TMPDIR=$(mktemp -d)
-  trap promote_cleanup EXIT
+  tako_exit_trap promote_cleanup "昇格"
 
   if [[ "$PROMOTE_KIND" == "test" ]]; then
     echo "==> テスト版 $PROMOTE_TAG を安定版に昇格"
@@ -922,8 +919,7 @@ $(build_release_notes "$STABLE_TAG" "$STABLE_VERSION" "${ASSET_NAMES[@]+"${ASSET
     exit "$PROMOTE_FOLLOWUP_EXIT"
   fi
   echo "==> Homebrew cask と docs の「最新の安定版」も $STABLE_TAG に揃った"
-  PROMOTE_SUCCEEDED=1
-  exit 0
+  tako_exit 0
 fi
 
 if [[ "$(uname)" != "Darwin" ]]; then
