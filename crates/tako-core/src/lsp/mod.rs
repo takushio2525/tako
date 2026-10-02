@@ -12,11 +12,13 @@
 //! - [`goto`] — 定義ジャンプ（S3 / #1680）の応答の読み取り・⌘ホバーの対象・着地の規則
 //! - [`format`] — 整形（S6 / #1683）の要求・能力・答えの読み取り・範囲の規則
 //! - [`completion`] — 補完（S5 / #1682）の応答の読み取り・絞り込み・キーの振り分け表・版の照合
+//! - [`menu`] — 右クリックメニューの LSP 項目（S7 / #1684）の出し分け（能力・位置の種類・選択）
 
 pub mod completion;
 pub mod diagnostic;
 pub mod format;
 pub mod goto;
+pub mod menu;
 pub mod position;
 pub mod root;
 pub mod servers;

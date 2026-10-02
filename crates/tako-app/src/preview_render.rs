@@ -2567,6 +2567,8 @@ impl TakoApp {
                                 position: event.position,
                                 // プレビューにエージェントは居ない（#1067 の再起動は対象外）
                                 restart_modes: Vec::new(),
+                                // ヘッダは位置を持たない（LSP の項目は本文の右クリックだけ = #1684）
+                                lsp: None,
                             });
                             cx.notify();
                         }),
@@ -3755,6 +3757,14 @@ impl TakoApp {
                                 this.sync_editor_selection_from_preview(pane_id);
                                 cx.notify();
                             }
+                        }),
+                    )
+                    // #1684: 本文の右クリックでペインのメニュー。識別子の上なら言語サーバの項目を足す
+                    // （テキストのプレビューだけ。画像・PDF は従来どおり何もしない）
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                            this.on_preview_body_right_click(pane_id, ev, cx);
                         }),
                     )
                     .on_mouse_up(

@@ -58,6 +58,7 @@ use super::completion::{CompletionAnswer, CompletionError, CompletionRequest};
 use super::diagnostics::{DiagnosticsStore, DocDiagnostics};
 use super::format::{FormatAnswer, FormatError, FormatRequest};
 use super::goto::{GotoAnswer, GotoError, GotoRequest};
+use super::menu::{MenuCapabilities, MenuRequest};
 use super::rpc::RequestId;
 use super::server::{Handlers, RpcError, ServerProcess};
 use super::text;
@@ -656,6 +657,31 @@ impl LspManager {
         if let Some(shared) = &self.shared {
             shared.supersede(Lane::Completion);
             shared.supersede(Lane::Resolve);
+        }
+    }
+
+    /// 右クリックメニューに出す項目を決める能力（#1684）。**待たない**（右クリックのたびに
+    /// UI スレッドから呼ぶ。ロックを短く取り、ルートの検出 = 数十回の stat だけ）。
+    ///
+    /// 開いている文書ならその文書のサーバ、開いていなければ文書を開いたときと同じ規則
+    /// （検出表 + ルート）で決まるサーバの申告を読む。**サーバを起こさない**
+    pub fn menu_capabilities_now(&self, path: &Path) -> MenuCapabilities {
+        match &self.shared {
+            Some(shared) => shared.menu_capabilities_now(path),
+            None => MenuCapabilities::Failed(GotoError::Disabled),
+        }
+    }
+
+    /// 同じく、まだ握手していなければ**問い合わせのあいだだけ**文書を開いてサーバを起こし、
+    /// 握手を待つ（#1684。**背景スレッドから呼ぶ**。上限は `request.timeout`）。
+    /// 起こし方は定義ジャンプと同じ（設計書 §16-2: 利用者が明示的に問い合わせたときだけ起こす）
+    pub fn menu_capabilities(
+        &self,
+        request: &MenuRequest,
+    ) -> Result<(&'static str, Value), GotoError> {
+        match &self.shared {
+            Some(shared) => shared.menu_capabilities(request),
+            None => Err(GotoError::Disabled),
         }
     }
 
@@ -1571,6 +1597,68 @@ impl Shared {
             "raw_log_dir": self.config.raw_log_dir.as_ref().map(|d| d.display().to_string()),
             "servers": servers,
         })
+    }
+}
+
+// --- 右クリックメニュー（#1684）---------------------------------------------
+
+impl Shared {
+    fn menu_capabilities_now(&self, path: &Path) -> MenuCapabilities {
+        let Some(resolved) = servers::resolve_in(self.config.table, path) else {
+            return MenuCapabilities::Failed(GotoError::NoServer);
+        };
+        let spec = resolved.spec;
+        if let Some(error) = self.not_installed_error(spec) {
+            return MenuCapabilities::Failed(error);
+        }
+        let uri = tako_core::file_uri::from_path(path);
+        let opened = self.lock().docs.get(&uri).map(|doc| doc.key.clone());
+        // 開いていなければ `open` と同じ規則でサーバを決める（ルートの検出はロックの外で）
+        let key = opened.unwrap_or_else(|| ServerKey {
+            id: spec.id,
+            root: root::find_root(spec, path),
+        });
+        let inner = self.lock();
+        let Some(slot) = inner.servers.get(&key) else {
+            return MenuCapabilities::Pending;
+        };
+        match (slot.lifecycle.state, &slot.capabilities) {
+            (ServerState::Running, Some(capabilities)) => MenuCapabilities::Ready {
+                server: spec.id,
+                capabilities: capabilities.clone(),
+            },
+            (ServerState::GaveUp | ServerState::Stopped, _) => {
+                MenuCapabilities::Failed(GotoError::Unavailable {
+                    server: spec.id,
+                    state: slot.lifecycle.state,
+                    crashes: slot.lifecycle.crashes,
+                })
+            }
+            _ => MenuCapabilities::Pending,
+        }
+    }
+
+    fn menu_capabilities(&self, request: &MenuRequest) -> Result<(&'static str, Value), GotoError> {
+        match self.menu_capabilities_now(&request.path) {
+            MenuCapabilities::Ready {
+                server,
+                capabilities,
+            } => return Ok((server, capabilities)),
+            MenuCapabilities::Failed(error) => return Err(error),
+            MenuCapabilities::Pending => {}
+        }
+        let deadline = Instant::now() + request.timeout;
+        let Some(resolved) = servers::resolve_in(self.config.table, &request.path) else {
+            return Err(GotoError::NoServer);
+        };
+        let spec = resolved.spec;
+        let uri = tako_core::file_uri::from_path(&request.path);
+        // 開いていなければ問い合わせのあいだだけ開く（定義ジャンプ・整形・補完と同じ 1 本）
+        let _transient =
+            self.open_for_request(&request.path, &uri, spec, request.document.as_deref())?;
+        let (_, capabilities, _) =
+            self.wait_ready(&uri, spec, request.timeout, deadline, &|| false)?;
+        Ok((spec.id, capabilities))
     }
 }
 

@@ -855,6 +855,12 @@ pub(super) fn build_request(
                 choice: u64_arg(args, "choice")?.map(|n| n as usize),
                 resolve: bool_arg(args, "resolve")?,
             },
+            // #1684: 右クリックメニューの LSP 項目（位置は定義ジャンプと同じ）
+            crate::dispatch::LSP_MENU_ACTION => Request::LspMenu {
+                pane: Some(target_pane(args, caller)?),
+                line: required_u64(args, "line")? as usize,
+                column: required_u64(args, "column")? as usize,
+            },
             action if tako_core::lsp::goto::GotoKind::parse(action).is_some() => Request::LspGoto {
                 action: action.to_string(),
                 pane: Some(target_pane(args, caller)?),

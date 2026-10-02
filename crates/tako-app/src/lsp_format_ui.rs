@@ -66,6 +66,17 @@ impl TakoApp {
             pane: Some(pane.as_u64()),
             range,
         };
+        self.format_preview_request(pane, request, cx);
+    }
+
+    /// 整形の要求を CLI / MCP と同じ 3 段へ渡す（編集メニュー・⇧⌘I と、右クリックメニューの
+    /// 「コードを整形」「選択範囲を整形」= #1684 が共有する入口）
+    pub(crate) fn format_preview_request(
+        &mut self,
+        pane: PaneId,
+        request: Request,
+        cx: &mut Context<Self>,
+    ) {
         match tako_control::prepare_offload(self, &request) {
             Some(Ok(job)) => self.run_lsp_format(pane, job, cx),
             Some(Err(e)) => self.show_lsp_status(pane, e.to_string(), true, cx),
@@ -99,8 +110,9 @@ impl TakoApp {
         }
     }
 
-    /// プレビューの選択（行・桁）を整形の範囲へ。選択が無ければ `None`
-    fn preview_selection_range(&self, pane: PaneId) -> Option<LineColRange> {
+    /// プレビューの選択（行・桁）を整形の範囲へ。選択が無ければ `None`。
+    /// ControlHost の `preview_selection`（右クリックメニューの「選択範囲を整形」= #1684）も読む
+    pub(crate) fn preview_selection_range(&self, pane: PaneId) -> Option<LineColRange> {
         let selection = self.preview_selections.get(&pane)?;
         let (start, end) = if selection.anchor <= selection.head {
             (selection.anchor, selection.head)

@@ -934,6 +934,20 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resolve: Option<bool>,
     },
+    /// 右クリックメニューの LSP 項目（FR-3.36 / #1684。`tako lsp menu` / MCP `tako_lsp` の
+    /// action=menu）。GUI のコードプレビューの本文を右クリックしたときと同じ出し分け
+    /// （`tako_core::lsp::menu::items` = サーバの申告・識別子の上か・選択の中か）で、項目ごとに
+    /// 押したときと同じ `tako_lsp` の引数（`args`）を返す。
+    ///
+    /// 位置は `tako edit replace-range` と同じ（`line` は 1 始まり・`column` は 0 始まりの
+    /// 行内 UTF-8 バイト）で、範囲外・文字の途中は丸めずに拒否する。サーバがまだ握手していなければ
+    /// 起こして待つ（定義ジャンプと同じ）。識別子でない位置は `status: not-symbol` で 0 件
+    LspMenu {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        line: usize,
+        column: usize,
+    },
     /// undo（#195）
     PreviewUndo { pane: Option<u64> },
     /// redo（#195）
@@ -2573,6 +2587,8 @@ pub fn changes_layout(request: &Request) -> bool {
         | Request::RemoteShortcuts { .. }
         | Request::LspServer { .. }
         | Request::LspDiagnostics { .. }
+        // 右クリックメニューの項目（#1684）は読むだけ（サーバを起こすことはあるがペインは触らない）
+        | Request::LspMenu { .. }
         // --- ペインの中身だけを触る（再描画は端末・プレビュー自身の経路が行う） ---
         // 補完（#1682）は候補を返すか、`choice` で編集バッファへ入れるだけ（ペインを増やさない）
         | Request::LspCompletion { .. }

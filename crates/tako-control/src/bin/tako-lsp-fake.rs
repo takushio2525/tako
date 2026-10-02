@@ -27,6 +27,12 @@
 //! | `no-range-format` | 文書全体の整形だけを申告する（範囲の整形は申告しない。#1683） |
 //! | `no-completion` | 補完の能力（`completionProvider`）を申告しない（#1682） |
 //!
+//! `--providers <json>` か `TAKO_LSP_FAKE_PROVIDERS`（JSON のオブジェクト）を渡すと、シナリオの
+//! 能力（定義ジャンプ・整形・補完の `…Provider`）を捨てて**そのオブジェクトの組だけ**を申告する
+//! （#1684。右クリックメニューの「能力の組み合わせ → 出る項目」を実プロセスで固定する。
+//! 例: `{"definitionProvider":true}` = 定義のみ / `{}` = 能力ゼロ）。`@<file>` ならそのファイルの中身を
+//! 起動のたびに読む（GUI を立てたまま組を替えて `tako lsp restart` で測る）。
+//!
 //! `--diagnostics <file>` か `TAKO_LSP_FAKE_DIAGNOSTICS`（LSP の `Diagnostic` の JSON 配列）を
 //! 渡すと、didOpen と didChange のたびに**その配列をそのまま** publish する（#1679。
 //! 固定の配列と tako 側の応答を突き合わせるため。didChange の回は文書の版も付ける）。
@@ -465,6 +471,14 @@ fn main() {
     let loading_ms: u64 = arg_or_env(&args, "--loading-ms", "TAKO_LSP_FAKE_LOADING_MS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(800);
+    // #1684: 申告する能力の組をそのまま差し替える（シナリオの能力は捨てる）
+    let providers: Option<serde_json::Map<String, serde_json::Value>> =
+        arg_or_env(&args, "--providers", "TAKO_LSP_FAKE_PROVIDERS")
+            .and_then(|v| match v.strip_prefix('@') {
+                Some(file) => std::fs::read_to_string(file).ok(),
+                None => Some(v),
+            })
+            .and_then(|v| serde_json::from_str(&v).ok());
     let mut input = BufReader::new(std::io::stdin());
     while let Some(message) = read_one(&mut input) {
         append(&log, &message.to_string());
@@ -536,6 +550,12 @@ fn main() {
                         "triggerCharacters": [".", ":"],
                         "resolveProvider": true,
                     });
+                }
+                if let Some(providers) = &providers {
+                    if let Some(map) = capabilities.as_object_mut() {
+                        map.retain(|key, _| !key.ends_with("Provider"));
+                        map.extend(providers.clone());
+                    }
                 }
                 out.send(serde_json::json!({
                     "jsonrpc": "2.0",
