@@ -479,3 +479,67 @@ fn 巨大な_doc_は上限で切る() {
     assert!(big.starts_with(&content.value));
     manager.shutdown_all(Duration::from_secs(2));
 }
+
+/// 実の rust-analyzer と握手して `String` の上で std の doc が届く（手動実行。CI には入れない =
+/// 導入が重い・答えが環境依存）。`cargo test -p tako-control --test issue1681_lsp_hover -- --ignored`。
+/// rust-analyzer が PATH に無ければ何もせずに終わる（SKIPPED と出す）
+#[test]
+#[ignore]
+fn 実の_rust_analyzer_が_doc_を返す() {
+    let Some(program) = tako_core::platform::exe::find("rust-analyzer") else {
+        println!("SKIPPED: rust-analyzer が無い");
+        return;
+    };
+    let scratch = Scratch::new("real");
+    std::fs::write(
+        scratch.0.join("Cargo.toml"),
+        "[package]\nname = \"real\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    let text = "fn main() {\n    let s = String::new();\n    println!(\"{}\", s.len());\n}\n";
+    let main = scratch.write("src/main.rs", text);
+    let program = program.to_string();
+    let manager = LspManager::new(LspConfig {
+        table: servers::SERVERS,
+        launcher: Arc::new(move |_spec: &ServerSpec| Launch::Found {
+            plan: ChildCmd {
+                program: program.clone(),
+                args: Vec::new(),
+            },
+            program_path: program.clone(),
+        }),
+        request_timeout: Duration::from_secs(120),
+        shutdown_timeout: Duration::from_secs(5),
+        idle_grace: DEFAULT_IDLE_GRACE,
+        restart: RestartPolicy::default(),
+        raw_log_dir: None,
+    });
+    let _link = open_editing(&manager, &main, text, 1);
+    let started = Instant::now();
+    let mut request = explicit(&main, 1, 13);
+    request.timeout = Duration::from_secs(120);
+    let answer = manager.hover(&request).expect("実サーバが答える");
+    let content = answer.content.expect("String の doc がある");
+    println!(
+        "real rust-analyzer: {:.1}s kind={} chars={} range={:?}\n{}",
+        started.elapsed().as_secs_f32(),
+        content.markup.slug(),
+        content.total_chars,
+        answer.range,
+        content
+            .value
+            .lines()
+            .take(12)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert_eq!(content.markup, Markup::Markdown);
+    assert!(content.value.contains("String"), "{}", content.value);
+    assert!(
+        content.value.contains("```rust"),
+        "コードブロックで型を返す"
+    );
+    // `String` の範囲（行 1 の `    let s = ` の後ろ = 桁 12〜18）
+    assert_eq!(answer.range, Some((At::new(1, 12), At::new(1, 18))));
+    manager.shutdown_all(Duration::from_secs(5));
+}

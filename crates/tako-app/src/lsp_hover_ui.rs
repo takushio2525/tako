@@ -52,7 +52,8 @@ pub(crate) const HOVER_BASE: f32 = 12.5;
 pub(crate) enum HoverOrigin {
     /// マウスを識別子に乗せた（語とカードの外へ出たら閉じる）
     Mouse,
-    /// 編集メニュー / パレット / CLI・MCP の `show`（打鍵・クリック・Esc で閉じる）
+    /// 編集メニュー / パレット / CLI・MCP の `show`（カードの外の押下・そのペインでの打鍵・Esc で
+    /// 閉じる。マウスの位置とフォーカスでは閉じない）
     Explicit,
 }
 
@@ -294,10 +295,7 @@ impl TakoApp {
 
     /// マウス位置の識別子と、問い合わせる桁（マウスの下の字の行内バイト）
     fn hover_symbol_at(&self, position: Point<Pixels>) -> Option<(HoverTarget, usize)> {
-        for (pane, layouts) in &self.preview_text_layouts {
-            if !self.lsp_hover_enabled_for(*pane) {
-                continue;
-            }
+        'panes: for (pane, layouts) in &self.preview_text_layouts {
             let Some(texts) = self.preview_line_texts.get(pane) else {
                 continue;
             };
@@ -308,10 +306,21 @@ impl TakoApp {
                 if !layout.bounds().contains(&position) {
                     continue;
                 }
-                // 文字の上にあるときだけ（行末より右・行間は対象外 = ⌘ホバー #1680 と同じ）。
-                // マウスの下にある行は 1 本だけなので、そこで語が無ければ探すのをやめる
-                let byte = layout.index_for_position(position).ok()?;
-                let symbol = tako_core::lsp::goto::symbol_at(texts.get(line)?, byte)?;
+                // 行の矩形で当たりを付けてから有効かを見る（マウスが動くたびに全ペインで manager の
+                // ロックを取らない）。無効なペイン（別のタブで描かれていない古い行も含む）は飛ばす
+                if !self.lsp_hover_enabled_for(*pane) {
+                    continue 'panes;
+                }
+                // 文字の上にあるときだけ（行末より右・行間は対象外 = ⌘ホバー #1680 と同じ）
+                let Ok(byte) = layout.index_for_position(position) else {
+                    continue 'panes;
+                };
+                let Some(symbol) = texts
+                    .get(line)
+                    .and_then(|text| tako_core::lsp::goto::symbol_at(text, byte))
+                else {
+                    continue 'panes;
+                };
                 return Some((
                     HoverTarget {
                         pane: *pane,
@@ -525,9 +534,16 @@ impl TakoApp {
         if !drawn {
             return false;
         }
+        // サーバの範囲（ホバーの対象）は同じ行で語と重なるときだけ、語との和にして使う
+        // （語から外れた範囲を採ると、乗せている語がカードを保つ範囲の外になり出した直後に閉じる）
         let range = match answer.range {
-            Some((start, end)) if start.line == line && end.line == line && start.col < end.col => {
-                start.col..end.col
+            Some((start, end))
+                if start.line == line
+                    && end.line == line
+                    && start.col < range.end.max(range.start + 1)
+                    && range.start < end.col =>
+            {
+                start.col.min(range.start)..end.col.max(range.end)
             }
             _ => range,
         };
@@ -578,9 +594,10 @@ impl TakoApp {
 
     /// 打鍵（プレビューの打鍵の入口の先頭）。Esc はカードだけを閉じて打鍵を取る（編集モードは
     /// 抜けない）。他の打鍵はメニュー / CLI で出したカードを閉じ、打鍵はいつもの経路へ流す
-    /// （マウスで出したカードは本文が変われば閉じる = 描く直前の照合）
-    pub(crate) fn route_lsp_hover_key(&mut self, keystroke: &Keystroke) -> bool {
-        let Some(card) = &self.lsp_hover.card else {
+    /// （マウスで出したカードは本文が変われば閉じる = 描く直前の照合）。**カードがフォーカス中の
+    /// ペインの上にあるときだけ**見る（別のペインのカードのために端末の Esc = vim 等を奪わない）
+    pub(crate) fn route_lsp_hover_key(&mut self, pane: PaneId, keystroke: &Keystroke) -> bool {
+        let Some(card) = self.lsp_hover.card.as_ref().filter(|c| c.pane == pane) else {
             return false;
         };
         if keystroke.key == "escape" && keystroke.modifiers == gpui::Modifiers::default() {
@@ -674,8 +691,7 @@ impl TakoApp {
 
     /// カードがまだ今の画面に当たっているか（描く直前に見る。外れていれば閉じる）。
     /// ペインが消えた・別のファイルに差し替わった・本文が変わった・語の行が画面の外へ出た、
-    /// マウスで出したカードはマウスが語とカードの外へ出た、メニュー / CLI で出したカードは
-    /// フォーカスが移った、のどれでも外れる
+    /// マウスで出したカードはマウスが語とカードの外へ出た、のどれでも外れる
     fn hover_still_valid(&self, window: &gpui::Window) -> Result<(), &'static str> {
         let Some(card) = &self.lsp_hover.card else {
             return Err("no-card");
@@ -698,17 +714,12 @@ impl TakoApp {
         if !drawn {
             return Err("off-screen");
         }
-        let kept = match card.origin {
-            HoverOrigin::Mouse => self.hover_keeps(window.mouse_position()),
-            HoverOrigin::Explicit => self.focused_pane() == card.pane,
-        };
-        if kept {
-            Ok(())
-        } else if card.origin == HoverOrigin::Mouse {
-            Err("mouse-left")
-        } else {
-            Err("focus")
+        // メニュー / CLI で出したカードはマウスの位置では閉じない（CLI の `--show` はフォーカスが
+        // 端末のまま出す = フォーカスでも閉じない。閉じるのはカードの外の押下・打鍵・Esc）
+        if card.origin == HoverOrigin::Mouse && !self.hover_keeps(window.mouse_position()) {
+            return Err("mouse-left");
         }
+        Ok(())
     }
 
     /// カードの本文のリンクを押した（ブラウザで開く。開けない URL は当たり判定の対象外）
@@ -840,6 +851,14 @@ impl TakoApp {
                         this.click_hover_card(ev.position);
                     }),
                 )
+                // カードの外を押したら閉じる（どこを押しても = 端末・ツリー・別のペインでも）。
+                // 押下そのものは止めない（押した先の操作はいつもどおり効く）
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    if this.lsp_hover.card.is_some() {
+                        this.close_lsp_hover();
+                        cx.notify();
+                    }
+                }))
                 .child(
                     div()
                         .id(("lsp-hover-body", generation as usize))

@@ -14204,7 +14204,7 @@ impl TakoApp {
         }
         // #1681: ホバーのカードを出していれば Esc はカードだけを閉じる（補完の一覧が先 = 両方
         // 出ていれば 1 回目の Esc は一覧）。他の打鍵はメニュー / CLI で出したカードを閉じて流す
-        if self.route_lsp_hover_key(keystroke) {
+        if self.route_lsp_hover_key(pane_id, keystroke) {
             cx.notify();
             return true;
         }
@@ -24077,9 +24077,10 @@ impl PreviewHost for TakoApp {
         let range = tako_core::lsp::goto::symbol_at(&line_text, at.col)
             .map(|symbol| symbol.range)
             .unwrap_or_else(|| {
-                let end = line_text[at.col.min(line_text.len())..]
-                    .chars()
-                    .next()
+                // 画面の行と照合した行が食い違っても落ちない（字の境界でなければ空の範囲）
+                let end = line_text
+                    .get(at.col..)
+                    .and_then(|rest| rest.chars().next())
                     .map_or(at.col, |ch| at.col + ch.len_utf8());
                 at.col..end
             });
@@ -47913,6 +47914,7 @@ mod self_test {
     /// manager の待ちの表 0・持ち手は編集セッションの 1 つだけ）
     /// (5) 下端の行ではカードを語の行の真上へ返し、ウィンドウの中に収める
     /// (6) Esc はカードだけを閉じる（編集モードは抜けない）/ 補完の一覧を出しているあいだは出さない
+    /// (7) CLI / MCP の `show` はフォーカスが端末のままでも出し続け、カードの外の押下で閉じる
     ///
     /// 判定は新しい挙動を無条件に主張する。`TAKO_1681_LEGACY=1`（マウスで問い合わせない）では
     /// (1) で落ちる = A/B の検出力。単独実行は `TAKO_VISUAL_ONLY=hover`
@@ -48300,6 +48302,87 @@ mod self_test {
             "visual-test hover: 補完の一覧を出しているあいだはカードを出さない (#1681)",
         );
         press(any, cx, "escape");
+
+        // (7) CLI / MCP の `show`（dispatch の 1 本）: フォーカスが別のペイン（端末）のままでも出て、
+        //     描いても消えない（AI は端末から叩く）。カードの外を押すと閉じる
+        let shown = window
+            .update(cx, |app, _, cx| {
+                let other = app
+                    .workspace
+                    .active_tab()
+                    .tree()
+                    .panes()
+                    .iter()
+                    .map(|p| p.id())
+                    .find(|id| *id != pane);
+                if let Some(other) = other {
+                    let _ = app.workspace.active_tab_mut().tree_mut().focus(other);
+                }
+                let out = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::LspHover {
+                        pane: Some(pane.as_u64()),
+                        line: 3,
+                        column: 13,
+                        show: Some(true),
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+                out.ok().and_then(|v| v["shown"].as_bool())
+            })
+            .ok()
+            .flatten();
+        for _ in 0..10 {
+            notify_and_draw(any, window, cx);
+        }
+        let (stays, explicit) = window
+            .update(cx, |app, _, _| {
+                (
+                    app.lsp_hover.card.is_some() && app.focused_pane() != pane,
+                    app.lsp_hover
+                        .card
+                        .as_ref()
+                        .is_some_and(|c| c.origin == crate::lsp_hover_ui::HoverOrigin::Explicit),
+                )
+            })
+            .unwrap_or((false, false));
+        let outside = point(
+            viewport.left() - px(40.0),
+            viewport.top() + viewport.size.height / 2.0,
+        );
+        for input in [
+            gpui::PlatformInput::MouseDown(MouseDownEvent {
+                button: MouseButton::Left,
+                position: outside,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            }),
+            gpui::PlatformInput::MouseUp(MouseUpEvent {
+                button: MouseButton::Left,
+                position: outside,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            }),
+        ] {
+            let _ = any.update(cx, |_, win, cx| win.dispatch_event(input, cx));
+        }
+        notify_and_draw(any, window, cx);
+        let closed_by_click = window
+            .update(cx, |app, _, _| app.lsp_hover.card.is_none())
+            .unwrap_or(false);
+        println!(
+            "TAKO_VISUAL_PIXEL: hover show shown={shown:?} stays={stays} explicit={explicit} closed_by_click={closed_by_click}"
+        );
+        check(
+            shown == Some(true) && stays && explicit,
+            "visual-test hover: CLI の show はフォーカスが端末のままでもカードを出し続ける (#1681)",
+        );
+        check(
+            closed_by_click,
+            "visual-test hover: カードの外を押すと閉じる (#1681)",
+        );
 
         if let Some(name) = override_env {
             std::env::remove_var(name);

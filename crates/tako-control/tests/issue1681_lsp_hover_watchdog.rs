@@ -393,8 +393,8 @@ fn 逆戻りを名指しできる() {
         MAIN,
         (
             "        if let Some(handled) = self.route_completion_key(pane_id, keystroke, cx) {\n            return handled;\n        }\n",
-            "        if self.route_lsp_hover_key(keystroke) { return true; }\n        if let Some(handled) = self.route_completion_key(pane_id, keystroke, cx) {\n            return handled;\n        }\n",
+            "        if self.route_lsp_hover_key(pane_id, keystroke) { return true; }\n        if let Some(handled) = self.route_completion_key(pane_id, keystroke, cx) {\n            return handled;\n        }\n",
         ),
-        "        if self.route_lsp_hover_key(keystroke) { return true; }",
+        "        if self.route_lsp_hover_key(pane_id, keystroke) { return true; }",
     );
 }
