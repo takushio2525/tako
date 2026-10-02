@@ -72,3 +72,6 @@
 ## 2026-10-02（#1683: LSP の整形（全体 / 範囲）と保存時整形（既定 off）を足した）
 - 当て方は `TextBuffer::apply_changes` の 1 実装（安定ソート → 重なり拒否 → 最小化 → `apply_edit` 1 回 = undo 1 回）、範囲の外は変えない。CLI `tako lsp format [--range]` / `format-on-save` + MCP `tako_lsp` の action（ツール増やさず +841 B）+ 編集メニュー・⇧⌘I（Win は Ctrl+Shift+I）。保存時整形は明示的な保存だけで自動保存では整形しない
 - 実測: `scripts/test-lsp-format-1683.sh` 51 PASS 0 FAIL（v0.8.26 は 30 FAIL）・実 rust-analyzer の整形が rustfmt とバイト一致し undo 1 回で戻る・番犬の注入 7 通りを file:line で名指す
+## 2026-10-02（#1860: ファイルツリーでファイル・フォルダのコピー / 切り取り / 貼り付けをできるようにした）
+- ⌘C / ⌘X / ⌘V（Windows は Ctrl）と右クリックの 3 項目。コピーは `tako_core::file_copy`（Finder 式の別名・排他作成で上書き 0・失敗は作った分だけ戻す・リンクはリンク）、切り取りの貼り付けは #1834 の `run_file_move`、貼り付け先と中身の選び方は `file_clipboard`。OS のクリップボードは境界 B28（NSPasteboard / CF_HDROP）。dispatch `FileOp` の copy / clipboard_* / paste → `tako file copy|clipboard|paste` / MCP `tako_file_op`（+709 B）。2 秒ポーリングが古い一覧で貼ったものを消す競合も直した
+- 実測: `scripts/test-tree-clipboard-1860.sh` 48 PASS 0 FAIL（実マウス・実キー 7 場面・A/B `TAKO_1860_LEGACY=1` で FAILED・CLI/MCP 字面一致 13 組・一般のペーストボード往復は保存して戻す）・番犬 18 本（注入 9 通り file:line 名指し）
