@@ -3882,6 +3882,8 @@ impl TakoApp {
         self.video_seek_bar_bounds.remove(&pane_id);
         self.forget_md_links(pane_id);
         self.forget_lsp_goto(pane_id);
+        // #1682: 閉じたペインの補完の一覧を残さない（待っている要求も捨てる）
+        self.forget_lsp_completion(pane_id);
     }
 
     /// プレビュー本文のビューポート矩形（#821 / #826）。

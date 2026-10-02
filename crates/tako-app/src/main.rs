@@ -38,6 +38,7 @@ mod form_layout;
 mod handoff_ctx;
 mod keybindings;
 mod limit_autoresume;
+mod lsp_completion_ui;
 mod lsp_format_ui;
 mod lsp_goto_ui;
 mod md_view;
@@ -1973,6 +1974,8 @@ struct TakoApp {
     lsp_format: crate::lsp_format_ui::LspFormatUi,
     /// 保存時整形（#1683。settings.json の `lsp_format_on_save` を起動時に読む。既定 OFF）
     lsp_format_on_save: bool,
+    /// 補完（予測変換）の GUI の状態（#1682）。問い合わせは manager、確定は dispatch の 1 本
+    lsp_completion: lsp_completion_ui::LspCompletionUi,
     /// タブ・ペイン名の AI 自動リネームの検知状態（FR-2.12。ループは new で張る）
     autorename: autorename::AutoRenamer,
     /// 自動命名した時刻（タブ ID → 命名時刻。#552 案 4）。命名直後だけタブに
@@ -4179,6 +4182,7 @@ impl TakoApp {
             lsp_goto: LspGotoUi::default(),
             lsp_format: crate::lsp_format_ui::LspFormatUi::default(),
             lsp_format_on_save: tako_control::settings::load().lsp_format_on_save,
+            lsp_completion: lsp_completion_ui::LspCompletionUi::default(),
             autorename: autorename::AutoRenamer::new(initial_auto_rename()),
             auto_title_hints: HashMap::new(),
             port_detect: initial_port_detect(),
@@ -13499,6 +13503,26 @@ impl TakoApp {
         Ok(())
     }
 
+    /// 複数の範囲を 1 回の操作として置き換える（#1682。補完の確定 = 本文 + 自動 import）。
+    /// undo 1 回で全部戻る。GUI の Enter と CLI / MCP の `choice` が dispatch からここを通る
+    fn edit_preview_ranges_local(
+        &mut self,
+        pane_id: PaneId,
+        edits: &[tako_core::text_edit::RangeEdit],
+        primary: usize,
+        expected_version: Option<u64>,
+    ) -> Result<(), String> {
+        self.set_preview_editing_local(pane_id, true)?;
+        let state = self.preview_edits.get_mut(&pane_id).expect("編集開始済み");
+        state
+            .buffer
+            .replace_position_ranges(edits, primary, expected_version)
+            .map_err(|e| e.to_string())?;
+        state.message = None;
+        self.refresh_preview_from_editor(pane_id);
+        Ok(())
+    }
+
     /// カーソルと選択を行・桁で置く（#1658）。本文は変えないので dirty にならない
     fn set_preview_cursor_local(
         &mut self,
@@ -14042,6 +14066,13 @@ impl TakoApp {
     fn handle_preview_edit_key(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) -> bool {
         let pane_id = self.focused_pane();
 
+        // #1682: 補完の一覧と検索バーが取り合う 5 キー（Esc / Enter / ↑ / ↓ / Tab）は
+        // 表（`tako_core::lsp::completion::route_key`）で行き先を決める。補完が取らなければ
+        // 下のいつもの経路（検索欄 / 本文）へ流れる
+        if let Some(handled) = self.route_completion_key(pane_id, keystroke, cx) {
+            return handled;
+        }
+
         // 検索バー表示中: キーを検索/置換フィールドにルーティング
         if self
             .preview_edits
@@ -14077,6 +14108,8 @@ impl TakoApp {
                 if changed {
                     self.drive_autosave(cx);
                 }
+                // #1682: Backspace は一覧を絞り直し、移動・改行は閉じる
+                self.completion_after_command(pane_id, changed, cx);
             }
             Err(message) => {
                 if let Some(edit) = self.preview_edits.get_mut(&pane_id) {
@@ -14350,6 +14383,10 @@ impl TakoApp {
     }
 
     fn insert_search_char(&mut self, pane_id: PaneId, text: &str) {
+        // #1682: キーボードは検索欄にある = 本文に付いた補完の一覧はもう打鍵に追従できない
+        if self.lsp_completion_open_in(pane_id) {
+            self.close_completion();
+        }
         let Some(edit) = self.preview_edits.get_mut(&pane_id) else {
             return;
         };
@@ -23790,6 +23827,8 @@ impl PreviewHost for TakoApp {
         self.forget_md_links(pane);
         // #1680: ⌘ホバー中の行・候補の一覧は前のファイルの行を指している
         self.forget_lsp_goto(pane);
+        // #1682: 補完の一覧も前のファイルの行を指している
+        self.forget_lsp_completion(pane);
         self.remove_preview_image_cache(pane);
         self.pending_pdf_rasters.remove(&pane);
         self.preview_views.remove(&pane);
@@ -23841,6 +23880,16 @@ impl PreviewHost for TakoApp {
         edit: &tako_core::text_edit::RangeEdit,
     ) -> Result<(), String> {
         self.edit_preview_range_local(pane, edit)
+    }
+
+    fn edit_preview_ranges(
+        &mut self,
+        pane: PaneId,
+        edits: &[tako_core::text_edit::RangeEdit],
+        primary: usize,
+        expected_version: Option<u64>,
+    ) -> Result<(), String> {
+        self.edit_preview_ranges_local(pane, edits, primary, expected_version)
     }
 
     fn set_preview_cursor(
@@ -24638,6 +24687,8 @@ impl EntityInputHandler for TakoApp {
                 edit.message = None;
                 self.refresh_preview_from_editor(pane);
                 self.drive_autosave(cx);
+                // #1682: 打った文字で補完を起こす / 一覧を絞り直す
+                self.completion_after_typing(pane, &ime.text, cx);
             } else if let Some(session) = self.terminals.get(&pane) {
                 session.write(ime.text.into_bytes());
             }
@@ -24756,6 +24807,8 @@ impl EntityInputHandler for TakoApp {
             self.ime = None;
             self.refresh_preview_from_editor(pane);
             self.drive_autosave(cx);
+            // #1682: 打った文字で補完を起こす / 一覧を絞り直す（貼り付け・IME の長い確定では起こさない）
+            self.completion_after_typing(pane, text, cx);
             window.invalidate_character_coordinates();
             cx.notify();
             return;
@@ -26413,6 +26466,8 @@ impl Render for TakoApp {
             .children(self.render_run_menu_overlay(cx))
             // #1680: 定義ジャンプの候補が複数のときの一覧
             .children(self.render_lsp_goto_menu(window, cx))
+            // #1682: 補完の候補の一覧（打っている語の頭の真下）
+            .children(self.render_lsp_completion(window, cx))
             // #739: スターターのプロファイル選択。ビューポート実寸を渡して
             // 画面外へはみ出さないよう詰める（#615 のリモートカードと同じ理由）
             .children(self.render_starter_profile_menu_overlay(window, cx))
@@ -42379,6 +42434,18 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1682: 補完の一覧（1000 件で可視ぶんだけ組む・実ピクセル・5 キー・⌘F と同時）
+                "completion" => {
+                    completion_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
+                // #1682: 実の rust-analyzer の候補が出て Enter で入るか（無ければ SKIPPED）
+                "completion-real" => {
+                    completion_real_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1680: ⌘ホバー中の識別子の下線が実ピクセルで描かれ、⌘ を離すと消えるか
                 "goto-hover" => {
                     goto_hover_visual(any, window, cx).await;
@@ -42438,7 +42505,7 @@ mod self_test {
                          tasks-accordion / shelve-tab / no-emoji / editor-keys / \
                          run-command-truncate / viewport-lines / jump-keys / search-case / goto-hover / \
                          large-file-edit / large-file-decor / external-change / editor-font / tree-move / \
-                         tree-clipboard）"
+                         tree-clipboard / completion / completion-real）"
                     );
                     std::process::exit(1);
                 }
@@ -45965,6 +46032,779 @@ mod self_test {
         check(
             released == 0,
             &format!("visual-test goto-hover: ⌘ を離すと下線が消える (#1680。rows={released})"),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 補完の一覧を用意する: 偽サーバ（`tako-lsp-fake`）を受け持ちのサーバに差し替え、
+    /// `src/main.rs` を編集モードで開いて 3 行目の行頭（字下げの後ろ）へカーソルを置く。
+    /// 返り値は (ペイン, 一時ディレクトリ, 差し替えた環境変数の名前)
+    #[cfg(feature = "visual-test")]
+    async fn completion_scene(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        label: &str,
+        rules: Option<serde_json::Value>,
+        source: &str,
+        cursor: (usize, usize),
+    ) -> (PaneId, std::path::PathBuf, Option<String>) {
+        use tako_control::protocol::Request as Req;
+        let anchor = ensure_fresh_scene(window, cx, label).await;
+        let dir = std::env::temp_dir().join(format!("tako-visual-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).expect("visual-test 補完の一時ディレクトリ");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"v\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("Cargo.toml");
+        let path = dir.join("src").join("main.rs");
+        std::fs::write(&path, source).expect("visual-test 補完の fixture");
+        let mut override_env = None;
+        if let Some(rules) = rules {
+            let fake = std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|d| d.to_path_buf()))
+                .map(|d| d.join(format!("tako-lsp-fake{}", std::env::consts::EXE_SUFFIX)))
+                .filter(|p| p.is_file())
+                .unwrap_or_else(|| {
+                    fail("visual-test 補完: 偽サーバが無い（cargo build -p tako-control --bin tako-lsp-fake を先に）")
+                });
+            let file = dir.join("completion.json");
+            std::fs::write(&file, rules.to_string()).expect("completion.json");
+            // 受け持つサーバの差し替え口（`TAKO_LSP_BIN_<ID>`）は検出表から引く（名前を書かない）
+            let spec = tako_core::lsp::servers::resolve_in(tako_core::lsp::servers::SERVERS, &path)
+                .expect("fixture の拡張子を受け持つサーバが表に在る")
+                .spec;
+            let name = tako_core::lsp::servers::override_env_name(spec.id);
+            std::env::set_var(&name, &fake);
+            std::env::set_var("TAKO_LSP_FAKE_COMPLETION", &file);
+            override_env = Some(name);
+        }
+        let pane = window
+            .update(cx, |app, _, cx| {
+                let opened = tako_control::dispatch(
+                    app,
+                    Req::OpenFile {
+                        pane: Some(anchor.as_u64()),
+                        path: path.display().to_string(),
+                        mode: Some(tako_control::protocol::PreviewModeWire::Code),
+                        direction: Some(tako_control::protocol::Direction::Right),
+                        focus: Some(true),
+                        new_tab: false,
+                        line: None,
+                        column: None,
+                    },
+                    PaneOrigin::Cli,
+                )
+                .expect("visual-test 補完を dispatch で開ける");
+                let pane = PaneId::from_raw(opened["pane"].as_u64().expect("OpenFile 応答の pane"));
+                // 打鍵の入口は `focused_pane()` を見るので、対象ペインを明示的に掴んでおく
+                let _ = app.workspace.active_tab_mut().tree_mut().focus(pane);
+                tako_control::dispatch(
+                    app,
+                    Req::PreviewEdit {
+                        pane: Some(pane.as_u64()),
+                        enabled: Some(true),
+                    },
+                    PaneOrigin::Cli,
+                )
+                .expect("visual-test 補完: 編集モードへ入れる");
+                tako_control::dispatch(
+                    app,
+                    Req::PreviewCursor {
+                        pane: Some(pane.as_u64()),
+                        line: cursor.0,
+                        col: cursor.1,
+                        select_to_line: None,
+                        select_to_col: None,
+                        expected_version: None,
+                    },
+                    PaneOrigin::Cli,
+                )
+                .expect("visual-test 補完: カーソルを置ける");
+                cx.notify();
+                pane
+            })
+            .unwrap_or_else(|_| fail("visual-test 補完 dispatch"));
+        check(
+            wait_for_preview_maps(any, window, cx, pane, false).await,
+            &format!("visual-test {label}: 行が描かれる (#1682)"),
+        );
+        (pane, dir, override_env)
+    }
+
+    /// 1 文字を**実 GUI の文字入力の入口**へ流す（キー判定 → `replace_text_in_range` = 実機の打鍵と同じ）
+    #[cfg(feature = "visual-test")]
+    fn completion_type(any: AnyWindowHandle, cx: &mut AsyncApp, ch: char) {
+        let _ = any.update(cx, |_, window, cx| {
+            window.dispatch_keystroke(
+                Keystroke {
+                    modifiers: Modifiers::default(),
+                    key: ch.to_string(),
+                    key_char: Some(ch.to_string()),
+                },
+                cx,
+            );
+        });
+    }
+
+    /// 一覧が出る（か `limit` 回で諦める）まで**状態で**待つ。出たら候補の数
+    #[cfg(feature = "visual-test")]
+    async fn completion_wait_popup(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        limit: usize,
+    ) -> Option<usize> {
+        let started = std::time::Instant::now();
+        for round in 0..limit {
+            notify_and_draw(any, window, cx);
+            let shown = window
+                .update(cx, |app, _, _| {
+                    app.lsp_completion.popup.as_ref().map(|p| p.order.len())
+                })
+                .ok()
+                .flatten();
+            if shown.is_some() {
+                notify_and_draw(any, window, cx);
+                if limit > 1 {
+                    println!(
+                        "TAKO_VISUAL_PIXEL: completion waited rounds={round} {:.2}s",
+                        started.elapsed().as_secs_f32()
+                    );
+                }
+                return shown;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(50))
+                .await;
+        }
+        None
+    }
+
+    /// 編集中の本文の `line`（0 起点）行目
+    #[cfg(feature = "visual-test")]
+    fn completion_line(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        pane: PaneId,
+        line: usize,
+    ) -> String {
+        window
+            .update(cx, |app, _, _| {
+                app.preview_edits
+                    .get(&pane)
+                    .map(|e| {
+                        e.buffer
+                            .text()
+                            .split('\n')
+                            .nth(line)
+                            .unwrap_or("")
+                            .to_string()
+                    })
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 補完（#1682）を**実 GUI の打鍵経路**と実ピクセルで見る。偽サーバに候補を 1000 件返させる。
+    ///
+    /// 相: (1) 1 文字打つと一覧が出る（デバウンス → 問い合わせ → 版の照合 → 描画）
+    /// (2) **1000 件で組んだ行は可視ぶんだけ**（`rows_built`。#821 と同じ測り方 = 全件ぶん組む
+    /// 実装では FAILED。A/B は `TAKO_1682_NO_VIRTUAL_LIST=1`）
+    /// (3) 一覧 1 枚の実ピクセル: 基準画像（同じ場面から一覧だけを外した 1 枚）との差分が
+    /// 一覧の矩形の外に 1 ピクセルも無く、中にはある（`TAKO_VISUAL_DUMP_DIR` に 2 枚を落とす）
+    /// (4) ↓ / ↑ で選択が動き、末尾まで送ると一覧が送られる（可視の範囲が追う）
+    /// (5) Esc は一覧だけを閉じる（編集モードは抜けない = 表の「補完あり × Esc」）
+    /// (6) 打ち足すとその場で絞り直す / Enter で選んだ候補が語を置き換え、undo 1 回で戻る / Tab も確定
+    /// (7) 一覧を出したまま ⌘F（検索バーと同時表示）: Esc は一覧を先に閉じ、次の Esc で検索バー
+    /// (8) 0 件に絞れたら一覧を出さない / 問い合わせ中にペインを閉じても落ちない
+    ///
+    /// 判定は新しい挙動を無条件に主張する。`TAKO_1682_LEGACY=1`（打鍵で問い合わせない）では
+    /// (1) で落ちる = A/B の検出力。単独実行は `TAKO_VISUAL_ONLY=completion`
+    #[cfg(feature = "visual-test")]
+    async fn completion_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        use tako_control::protocol::Request as Req;
+        inject_section_failure("completion");
+        let source = "fn main() {\n    let total = 1;\n    \n}\n";
+        let rules = serde_json::json!({ "generate": 1000, "word_edit": true, "resolve_doc": "doc of {label}" });
+        let (pane, dir, override_env) =
+            completion_scene(any, window, cx, "completion", Some(rules), source, (3, 4)).await;
+
+        // (1) 1 文字打つと一覧が出る
+        completion_type(any, cx, 'c');
+        let shown = completion_wait_popup(any, window, cx, 600).await;
+        println!("TAKO_VISUAL_PIXEL: completion shown={shown:?}");
+        check(
+            shown.is_some(),
+            "visual-test completion: 1 文字打つと候補の一覧が出る (#1682)",
+        );
+        check(
+            shown == Some(1000),
+            &format!("visual-test completion: 候補は 1000 件 (#1682。{shown:?})"),
+        );
+
+        // (2) 組んだ行は可視ぶんだけ（もう 1 フレーム描いて、そのフレームで組んだ数を読む）
+        notify_and_draw(any, window, cx);
+        let built = window
+            .update(cx, |app, _, _| app.lsp_completion.rows_built.get())
+            .unwrap_or(usize::MAX);
+        let limit = crate::lsp_completion_ui::COMPLETION_VISIBLE_ROWS + 3;
+        println!("TAKO_VISUAL_PIXEL: completion rows_built={built} items=1000 limit={limit}");
+        check(
+            built > 0 && built <= limit,
+            &format!("visual-test completion: 1000 件でも組む行は可視ぶんだけ (#1682。rows_built={built} > {limit} なら全件ぶん組んでいる)"),
+        );
+
+        // (3) 一覧 1 枚の実ピクセル（基準画像 = 同じ場面から一覧だけを外した 1 枚）
+        let Some((with_popup, scale)) = capture_frame(any, cx) else {
+            fail("visual-test completion: フレーム採取")
+        };
+        let bounds = window
+            .update(cx, |app, _, _| app.lsp_completion.bounds)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| fail("visual-test completion: 一覧の矩形が無い"));
+        let saved = window
+            .update(cx, |app, _, cx| {
+                let saved = app.lsp_completion.popup.take();
+                cx.notify();
+                saved
+            })
+            .ok()
+            .flatten();
+        let Some((reference, _)) = capture_frame(any, cx) else {
+            fail("visual-test completion: 基準フレーム採取")
+        };
+        let _ = window.update(cx, |app, _, cx| {
+            app.lsp_completion.popup = saved;
+            cx.notify();
+        });
+        notify_and_draw(any, window, cx);
+        let (width, height) = with_popup.dimensions();
+        // 比べるのは補完を出しているペインの本文の器の中（他のペインの端末カーソルの点滅を拾わない）
+        let viewport = window
+            .update(cx, |app, _, _| app.preview_viewport_bounds(pane))
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| fail("visual-test completion: ビューポート矩形"));
+        // 影（`shadow_lg` = 下へ 10px ずらしてぼかし 15px。ぼかしは半径の約 2 倍まで裾を引く）が
+        // 縁の外へ落ちるぶんを含める（実測: 一覧の下端から 33px 下の 1 行まで差分が出る）
+        let margin = 10.0 + 2.0 * 15.0;
+        let within = |b: &Bounds<Pixels>, m: f32, lx: f32, ly: f32| {
+            lx >= f32::from(b.left()) - m
+                && lx <= f32::from(b.right()) + m
+                && ly >= f32::from(b.top()) - m
+                && ly <= f32::from(b.bottom()) + m
+        };
+        let count = |flip: bool| {
+            let (mut inner, mut outer) = (0usize, 0usize);
+            let mut extent: Option<(f32, f32, f32, f32)> = None;
+            for y in 0..height {
+                for x in 0..width {
+                    if with_popup.get_pixel(x, y) == reference.get_pixel(x, y) {
+                        continue;
+                    }
+                    let ly = if flip { height - 1 - y } else { y } as f32 / scale;
+                    let lx = x as f32 / scale;
+                    if within(&bounds, margin, lx, ly) {
+                        inner += 1;
+                    } else if within(&viewport, 0.0, lx, ly) {
+                        outer += 1;
+                        let e = extent.get_or_insert((lx, ly, lx, ly));
+                        *e = (e.0.min(lx), e.1.min(ly), e.2.max(lx), e.3.max(ly));
+                    }
+                }
+            }
+            (inner, outer, extent)
+        };
+        // Metal の読み戻しは上下の向きがありうるので、差分が多く収まる側を採る（#812 の作法）
+        let (a, b) = (count(false), count(true));
+        let (inner, outer, extent) = if a.0 >= b.0 { a } else { b };
+        println!(
+            "TAKO_VISUAL_PIXEL: completion popup bounds={:.1}x{:.1}@{:.1},{:.1} inner={inner} outer={outer} outer_extent={extent:?} scale={scale}",
+            f32::from(bounds.size.width),
+            f32::from(bounds.size.height),
+            f32::from(bounds.left()),
+            f32::from(bounds.top()),
+        );
+        if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+            let dump = std::path::Path::new(&dump);
+            let _ = std::fs::create_dir_all(dump);
+            let _ = with_popup.save(dump.join("completion.png"));
+            let _ = reference.save(dump.join("completion-reference.png"));
+            println!("TAKO_VISUAL_DUMP: {}", dump.display());
+        }
+        let need =
+            (f32::from(bounds.size.width) * f32::from(bounds.size.height) * scale * scale * 0.3)
+                as usize;
+        check(
+            inner >= need,
+            &format!("visual-test completion: 一覧が描かれている（差分 {inner} < {need} px）"),
+        );
+        check(
+            outer == 0,
+            &format!(
+                "visual-test completion: 基準画像との差分が一覧の矩形の外にある（{outer} px）"
+            ),
+        );
+
+        let selected = |cx: &mut AsyncApp| {
+            window
+                .update(cx, |app, _, _| {
+                    app.lsp_completion.popup.as_ref().map(|p| p.selected)
+                })
+                .ok()
+                .flatten()
+        };
+        // (4) ↓ ↓ ↑ で選択が動く。末尾まで送ると可視の範囲が追う
+        press(any, cx, "down");
+        press(any, cx, "down");
+        let two = selected(cx);
+        press(any, cx, "up");
+        let one = selected(cx);
+        for _ in 0..12 {
+            press(any, cx, "down");
+        }
+        notify_and_draw(any, window, cx);
+        let (thirteen, top, rows) = window
+            .update(cx, |app, _, _| {
+                (
+                    app.lsp_completion.popup.as_ref().map(|p| p.selected),
+                    app.lsp_completion.list_top(),
+                    app.lsp_completion.rows_built.get(),
+                )
+            })
+            .unwrap_or((None, None, usize::MAX));
+        // 説明は選んだ候補だけを resolve で補う（偽サーバは `doc of <label>` を返す）
+        let mut doc = None;
+        for _ in 0..100 {
+            notify_and_draw(any, window, cx);
+            doc = window
+                .update(cx, |app, _, _| {
+                    app.lsp_completion
+                        .popup
+                        .as_ref()
+                        .and_then(|p| p.selected_item())
+                        .and_then(|i| i.documentation.clone())
+                })
+                .ok()
+                .flatten();
+            if doc.is_some() {
+                break;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(30))
+                .await;
+        }
+        println!(
+            "TAKO_VISUAL_PIXEL: completion keys two={two:?} one={one:?} thirteen={thirteen:?} top={top:?} rows={rows} doc={doc:?}"
+        );
+        check(
+            two == Some(2),
+            &format!("visual-test completion: ↓ ↓ で 3 つ目を選ぶ ({two:?})"),
+        );
+        check(
+            one == Some(1),
+            &format!("visual-test completion: ↑ で 1 つ戻る ({one:?})"),
+        );
+        check(
+            thirteen == Some(13),
+            &format!("visual-test completion: ↓ を続けると 14 個目まで送れる ({thirteen:?})"),
+        );
+        // 14 個目が見えるよう可視の範囲が送られる（10 行見えるので先頭は 4 = 14 - 10）
+        check(
+            top == Some(4),
+            &format!("visual-test completion: 選んだ行に合わせて一覧が送られる ({top:?})"),
+        );
+        check(
+            rows <= limit,
+            &format!("visual-test completion: 送った後も組む行は可視ぶんだけ ({rows})"),
+        );
+        check(
+            doc.as_deref() == Some("doc of cand0013"),
+            &format!("visual-test completion: 選んだ候補の説明を resolve で補う ({doc:?})"),
+        );
+
+        // (5) Esc は一覧だけを閉じる（編集モードは抜けない）
+        press(any, cx, "escape");
+        notify_and_draw(any, window, cx);
+        let (open, editing) = window
+            .update(cx, |app, _, _| {
+                (
+                    app.lsp_completion.popup.is_some(),
+                    app.preview_edits.get(&pane).is_some_and(|e| e.editing),
+                )
+            })
+            .unwrap_or((true, false));
+        check(!open, "visual-test completion: Esc で一覧が閉じる (#1682)");
+        check(
+            editing,
+            "visual-test completion: Esc は一覧を閉じるだけで編集モードを抜けない (#1682)",
+        );
+        check(
+            completion_line(window, cx, pane, 2) == "    c",
+            "visual-test completion: Esc は何も入れない",
+        );
+
+        // (6) 打ち足す → 一覧が出る → さらに打ち足すとその場で絞り直す → Enter で確定
+        completion_type(any, cx, 'a');
+        let again = completion_wait_popup(any, window, cx, 200).await;
+        check(
+            again == Some(1000),
+            &format!("visual-test completion: 打ち足すと一覧が出直す ({again:?})"),
+        );
+        let version_before = window
+            .update(cx, |app, _, _| {
+                app.preview_edits.get(&pane).map(|e| e.buffer.version())
+            })
+            .ok()
+            .flatten();
+        completion_type(any, cx, 'n');
+        completion_type(any, cx, 'd');
+        completion_type(any, cx, '0');
+        completion_type(any, cx, '0');
+        completion_type(any, cx, '1');
+        notify_and_draw(any, window, cx);
+        let (narrowed, head) = window
+            .update(cx, |app, _, _| {
+                app.lsp_completion
+                    .popup
+                    .as_ref()
+                    .map(|p| {
+                        let head: Vec<String> = p
+                            .order
+                            .iter()
+                            .take(10)
+                            .map(|&i| p.items[i].label.clone())
+                            .collect();
+                        (Some(p.order.len()), head)
+                    })
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        // 前方一致の 10 件（cand0010..cand0019）が先頭に並び、語の切れ目からの飛び飛びの一致
+        // （cand0101 等）がその後ろに続く。期待値はここで独立に書き下す
+        let prefix: Vec<String> = (10..20).map(|i| format!("cand{i:04}")).collect();
+        println!("TAKO_VISUAL_PIXEL: completion narrowed={narrowed:?} head={head:?}");
+        check(
+            narrowed.is_some_and(|n| (10..1000).contains(&n)),
+            &format!("visual-test completion: 打ち足すとその場で絞り直す（{narrowed:?}）"),
+        );
+        check(
+            head == prefix,
+            &format!("visual-test completion: 前方一致の候補が先頭に並ぶ ({head:?})"),
+        );
+        press(any, cx, "enter");
+        notify_and_draw(any, window, cx);
+        let accepted = completion_line(window, cx, pane, 2);
+        println!(
+            "TAKO_VISUAL_PIXEL: completion accepted={accepted:?} before_version={version_before:?}"
+        );
+        check(
+            accepted == "    cand0010",
+            &format!("visual-test completion: Enter で選んだ候補が語を置き換える ({accepted:?})"),
+        );
+        let _ = window.update(cx, |app, _, cx| {
+            let _ = tako_control::dispatch(
+                app,
+                Req::PreviewUndo {
+                    pane: Some(pane.as_u64()),
+                },
+                PaneOrigin::Cli,
+            );
+            cx.notify();
+        });
+        let undone = completion_line(window, cx, pane, 2);
+        check(
+            undone == "    cand001",
+            &format!("visual-test completion: undo 1 回で確定の前へ戻る ({undone:?})"),
+        );
+        // 語を消して打ち直す（CLI と同じ範囲編集。一覧は打鍵以外の変更で閉じる）
+        let clear = |cx: &mut AsyncApp| {
+            let _ = window.update(cx, |app, _, cx| {
+                let end = app.preview_edits.get(&pane).map_or(4, |e| {
+                    e.buffer.text().split('\n').nth(2).unwrap_or("").len()
+                });
+                let _ = tako_control::dispatch(
+                    app,
+                    Req::PreviewEditRange {
+                        pane: Some(pane.as_u64()),
+                        start_line: 3,
+                        start_col: 4,
+                        end_line: 3,
+                        end_col: end,
+                        text: String::new(),
+                        expected_version: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+            });
+            notify_and_draw(any, window, cx);
+        };
+        // Tab も確定する: `c0999` は語の切れ目から飛び飛びに合う 1 件（cand0999）だけに絞れる
+        clear(cx);
+        for ch in "c0999".chars() {
+            completion_type(any, cx, ch);
+        }
+        let mut tab_popup = None;
+        for _ in 0..200 {
+            tab_popup = completion_wait_popup(any, window, cx, 1).await;
+            if tab_popup == Some(1) {
+                break;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(30))
+                .await;
+        }
+        check(
+            tab_popup == Some(1),
+            &format!("visual-test completion: c0999 は 1 件に絞れる ({tab_popup:?})"),
+        );
+        press(any, cx, "tab");
+        let tabbed = completion_line(window, cx, pane, 2);
+        check(
+            tabbed == "    cand0999",
+            &format!("visual-test completion: Tab でも確定する（字下げを入れない。{tabbed:?}）"),
+        );
+
+        // (7) 一覧を出したまま ⌘F（検索バーと同時表示）: Esc は一覧を先に、次の Esc で検索バーを閉じる
+        clear(cx);
+        completion_type(any, cx, 'c');
+        let before_find = completion_wait_popup(any, window, cx, 200).await;
+        check(
+            before_find.is_some(),
+            "visual-test completion: ⌘F の前に一覧が出ている",
+        );
+        press(
+            any,
+            cx,
+            if cfg!(target_os = "macos") {
+                "cmd-f"
+            } else {
+                "ctrl-f"
+            },
+        );
+        notify_and_draw(any, window, cx);
+        let state = |cx: &mut AsyncApp| {
+            window
+                .update(cx, |app, _, _| {
+                    (
+                        app.lsp_completion.popup.is_some(),
+                        app.preview_edits
+                            .get(&pane)
+                            .is_some_and(|e| e.search_visible),
+                    )
+                })
+                .unwrap_or((false, false))
+        };
+        let both = state(cx);
+        press(any, cx, "escape");
+        notify_and_draw(any, window, cx);
+        let after_first = state(cx);
+        press(any, cx, "escape");
+        notify_and_draw(any, window, cx);
+        let after_second = state(cx);
+        println!(
+            "TAKO_VISUAL_PIXEL: completion find both={both:?} esc1={after_first:?} esc2={after_second:?}"
+        );
+        check(
+            both == (true, true),
+            &format!("visual-test completion: ⌘F で一覧と検索バーが同時に出る ({both:?})"),
+        );
+        check(
+            after_first == (false, true),
+            &format!("visual-test completion: 1 回目の Esc は一覧だけを閉じる ({after_first:?})"),
+        );
+        check(
+            after_second == (false, false),
+            &format!("visual-test completion: 2 回目の Esc で検索バーを閉じる ({after_second:?})"),
+        );
+
+        // (8) 0 件に絞れたら一覧を出さない（`cz` に合う候補は無い。答えが来たことは数で確かめる）/
+        //     問い合わせ中にペインを閉じても落ちない
+        let answers = |cx: &mut AsyncApp| {
+            window
+                .update(cx, |app, _, _| app.lsp_completion.answers)
+                .unwrap_or_default()
+        };
+        let before = answers(cx);
+        completion_type(any, cx, 'z');
+        for _ in 0..200 {
+            notify_and_draw(any, window, cx);
+            if answers(cx) > before {
+                break;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(30))
+                .await;
+        }
+        let (answered, none) = (
+            answers(cx) > before,
+            window
+                .update(cx, |app, _, _| app.lsp_completion.popup.is_some())
+                .unwrap_or(true),
+        );
+        check(answered, "visual-test completion: cz にも答えが来る");
+        check(
+            !none,
+            "visual-test completion: 0 件に絞れたら一覧を出さない",
+        );
+        completion_type(any, cx, 'q');
+        let _ = window.update(cx, |app, _, cx| {
+            let _ = tako_control::dispatch(
+                app,
+                Req::Close {
+                    pane: Some(pane.as_u64()),
+                    force: true,
+                    caller_role: None,
+                },
+                PaneOrigin::Cli,
+            );
+            cx.notify();
+        });
+        for _ in 0..10 {
+            notify_and_draw(any, window, cx);
+            cx.background_executor()
+                .timer(Duration::from_millis(30))
+                .await;
+        }
+        let after_close = window
+            .update(cx, |app, _, _| app.lsp_completion.popup.is_some())
+            .unwrap_or(true);
+        check(
+            !after_close,
+            "visual-test completion: 問い合わせ中にペインを閉じても一覧は残らない",
+        );
+
+        if let Some(name) = override_env {
+            std::env::remove_var(name);
+        }
+        std::env::remove_var("TAKO_LSP_FAKE_COMPLETION");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 補完（#1682）を**実の rust-analyzer** で見る（実機目視の代わり）。`rust-analyzer` が
+    /// PATH に無ければ SKIPPED。読み込み（`cargo metadata` と標準ライブラリ）が済むまでは
+    /// CLI と同じ問い合わせ（`superseding: false` = 読み込みを待つ）で待ち、その後に
+    /// **実 GUI の打鍵経路**で `s.le` を打ち、一覧に `len` が出て Enter で入ることを見る。
+    /// `TAKO_VISUAL_DUMP_DIR` に一覧の出た 1 枚を落とす。単独実行は `TAKO_VISUAL_ONLY=completion-real`
+    #[cfg(feature = "visual-test")]
+    async fn completion_real_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        // 受け持つサーバの差し替え口（`TAKO_LSP_BIN_<ID>`。隔離で HOME を替えるとログインシェルの
+        // PATH から引けないので、スクリプトは実の rust-analyzer をここで渡す）か PATH から
+        let spec = tako_core::lsp::servers::resolve_in(
+            tako_core::lsp::servers::SERVERS,
+            std::path::Path::new("main.rs"),
+        )
+        .expect("rs を受け持つサーバが表に在る")
+        .spec;
+        let overridden = std::env::var(tako_core::lsp::servers::override_env_name(spec.id))
+            .ok()
+            .is_some_and(|p| std::path::Path::new(&p).is_file());
+        if !overridden && tako_core::platform::exe::find(spec.program).is_none() {
+            println!("TAKO_VISUAL_1682_REAL: SKIPPED（{} が無い）", spec.program);
+            return;
+        }
+        inject_section_failure("completion-real");
+        let source = "fn main() {\n    let s = String::new();\n    s.\n}\n";
+        let (pane, dir, _) =
+            completion_scene(any, window, cx, "completion-real", None, source, (3, 6)).await;
+        // 読み込みが済むまで CLI と同じ問い合わせで待つ（打鍵の要求は読み込みを待たない）
+        let path = dir.join("src").join("main.rs");
+        let manager = window
+            .update(cx, |app, _, _| app.lsp.clone())
+            .unwrap_or_else(|_| fail("visual-test completion-real: manager"));
+        let started = std::time::Instant::now();
+        let warm = cx
+            .background_executor()
+            .spawn(async move {
+                manager.completion(&tako_control::lsp::CompletionRequest {
+                    path,
+                    line: 2,
+                    column: 6,
+                    timeout: Duration::from_secs(120),
+                    document: None,
+                    trigger: tako_core::lsp::completion::Trigger::Character('.'),
+                    superseding: false,
+                    resolve_top: 0,
+                })
+            })
+            .await;
+        println!(
+            "TAKO_VISUAL_PIXEL: completion-real warm={} items={} in {:.1}s",
+            warm.as_ref()
+                .map_or_else(|e| e.status().to_string(), |_| "ok".into()),
+            warm.as_ref().map_or(0, |a| a.items.len()),
+            started.elapsed().as_secs_f32()
+        );
+        check(
+            warm.is_ok(),
+            &format!(
+                "visual-test completion-real: rust-analyzer が補完に答える ({:?})",
+                warm.as_ref().err()
+            ),
+        );
+        completion_type(any, cx, 'l');
+        completion_type(any, cx, 'e');
+        let shown = completion_wait_popup(any, window, cx, 400).await;
+        let labels = window
+            .update(cx, |app, _, _| {
+                app.lsp_completion
+                    .popup
+                    .as_ref()
+                    .map(|p| {
+                        p.order
+                            .iter()
+                            .take(8)
+                            .map(|&i| p.items[i].label.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        println!("TAKO_VISUAL_PIXEL: completion-real shown={shown:?} top={labels:?}");
+        if let (Ok(dump), Some((frame, _))) = (
+            std::env::var("TAKO_VISUAL_DUMP_DIR"),
+            capture_frame(any, cx),
+        ) {
+            let dump = std::path::Path::new(&dump);
+            let _ = std::fs::create_dir_all(dump);
+            let _ = frame.save(dump.join("completion-real.png"));
+            println!("TAKO_VISUAL_DUMP: {}", dump.display());
+        }
+        check(
+            shown.is_some(),
+            "visual-test completion-real: 実サーバの候補の一覧が出る (#1682)",
+        );
+        // 並びはサーバの sortText が決める（rust-analyzer は len より leak を上に置く）ので、
+        // len を探して ↓ で選んでから Enter（実機の操作と同じ）
+        let Some(at) = labels.iter().position(|l| l == "len") else {
+            fail(&format!(
+                "visual-test completion-real: `le` の候補に len がある ({labels:?})"
+            ))
+        };
+        for _ in 0..at {
+            press(any, cx, "down");
+        }
+        press(any, cx, "enter");
+        notify_and_draw(any, window, cx);
+        let line = completion_line(window, cx, pane, 2);
+        println!("TAKO_VISUAL_PIXEL: completion-real accepted={line:?}");
+        check(
+            line.starts_with("    s.len"),
+            &format!("visual-test completion-real: Enter で len が入る ({line:?})"),
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

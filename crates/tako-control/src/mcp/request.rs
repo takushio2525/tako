@@ -846,6 +846,15 @@ pub(super) fn build_request(
             crate::dispatch::LSP_FORMAT_ON_SAVE_ACTION => Request::LspFormatOnSave {
                 enabled: bool_arg(args, "enabled")?,
             },
+            // #1682: 補完（位置は定義ジャンプと同じ。choice は候補の番号 = 確定する）
+            crate::dispatch::LSP_COMPLETION_ACTION => Request::LspCompletion {
+                pane: Some(target_pane(args, caller)?),
+                line: required_u64(args, "line")? as usize,
+                column: required_u64(args, "column")? as usize,
+                limit: u64_arg(args, "limit")?.map(|n| n as usize),
+                choice: u64_arg(args, "choice")?.map(|n| n as usize),
+                resolve: bool_arg(args, "resolve")?,
+            },
             action if tako_core::lsp::goto::GotoKind::parse(action).is_some() => Request::LspGoto {
                 action: action.to_string(),
                 pane: Some(target_pane(args, caller)?),

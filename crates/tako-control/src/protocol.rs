@@ -914,6 +914,26 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         enabled: Option<bool>,
     },
+    /// 補完（予測変換。FR-3.35 / #1682。`tako lsp completion` / MCP `tako_lsp` の
+    /// action=completion）。GUI の打鍵の一覧と同じ問い合わせ・同じ絞り込み・同じ確定の 1 本。
+    ///
+    /// 位置は `tako edit replace-range` と同じ（`line` は 1 始まり・`column` は 0 始まりの
+    /// 行内 UTF-8 バイト）で、範囲外・文字の途中は丸めずに拒否する。`limit`（既定 50）で返す
+    /// 件数を切り、切った件数を `truncated` に載せる。`choice`（1 始まり。絞り込み後の全体の
+    /// 番号）を渡すとその候補で確定する（GUI の Enter と同じ = undo 1 回で戻る）。
+    /// `resolve` は返す候補の説明を `completionItem/resolve` で補う
+    LspCompletion {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        line: usize,
+        column: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        choice: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolve: Option<bool>,
+    },
     /// undo（#195）
     PreviewUndo { pane: Option<u64> },
     /// redo（#195）
@@ -2554,6 +2574,8 @@ pub fn changes_layout(request: &Request) -> bool {
         | Request::LspServer { .. }
         | Request::LspDiagnostics { .. }
         // --- ペインの中身だけを触る（再描画は端末・プレビュー自身の経路が行う） ---
+        // 補完（#1682）は候補を返すか、`choice` で編集バッファへ入れるだけ（ペインを増やさない）
+        | Request::LspCompletion { .. }
         | Request::Send { .. }
         | Request::Scroll { .. }
         | Request::Focus { .. }

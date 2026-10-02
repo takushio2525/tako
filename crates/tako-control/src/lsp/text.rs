@@ -320,3 +320,52 @@ pub const FORMAT_ON_SAVE_SCOPE_NOTE: Note = Note::new(
     "明示的な保存（{save_key}・tako edit save）の前にだけ整形する。自動保存では整形しない",
     "Formats only before an explicit save ({save_key} / tako edit save), never on autosave",
 );
+// --- 補完（#1682）-------------------------------------------------------------
+// 失敗の多く（未導入・未応答・落ちた…）は定義ジャンプと同じ言語サーバの状態なので、上の
+// GOTO_* の文をそのまま使う。補完に固有なのは「能力に無い」「置き換わった」「本文が変わった」
+// 「候補が 0 件」「件数を切った」の 5 つだけ
+
+/// 能力に補完が無い。`{server}`
+pub const COMPLETION_UNSUPPORTED_REASON: Note = Note::new(
+    "{server} は補完に対応していない",
+    "{server} does not support completion",
+);
+
+/// 打鍵の要求が次の打鍵の要求に置き換わった（GUI の内側でだけ起きる）
+pub const COMPLETION_SUPERSEDED_REASON: Note = Note::new(
+    "次の打鍵の補完に置き換わったので取り消した",
+    "Cancelled because a newer completion request replaced it",
+);
+
+/// 問い合わせのあいだに本文が変わった（候補の位置が今の本文と合わない）
+pub const COMPLETION_EDITED_REASON: Note = Note::new(
+    "問い合わせのあいだに本文が変わったので、この答えは使わない",
+    "The text changed while waiting, so this answer was discarded",
+);
+
+/// 本文が変わったときの次の一手
+pub const COMPLETION_EDITED_NEXT_STEP: Note = Note::new(
+    "同じ位置でもう一度問い合わせる",
+    "Ask again at the same position",
+);
+
+/// 候補が 0 件（サーバは答えた）
+pub const COMPLETION_NONE_REASON: Note = Note::new(
+    "この位置に補完の候補が無い（言語サーバが 0 件と答えたか、打ちかけの語に合う候補が無い）",
+    "No completion candidates here (the server returned none, or none match the word being typed)",
+);
+
+/// 候補が 0 件のときの次の一手
+pub const COMPLETION_NONE_NEXT_STEP: Note = Note::new(
+    "語の途中や . の直後で試す（コメント・文字列の中では候補が無いことがある）",
+    "Try inside a word or right after a dot (comments and strings may have none)",
+);
+
+/// 件数の上限で切った。`{total}` = 絞り込み後の全件数
+pub const COMPLETION_TRUNCATED_NEXT_STEP: Note = Note::new(
+    "候補は全 {total} 件。続きを見るには --limit を大きくする（--choice N はどの件数でも全体の N 番目を入れる）",
+    "There are {total} candidates; raise --limit to see more (--choice N always inserts the N-th of all)",
+);
+
+/// 機能の呼び名（「能力に無い」の文へ差し込む）
+pub const COMPLETION_LABEL: Note = Note::new("補完", "completion");

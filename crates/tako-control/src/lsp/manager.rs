@@ -54,11 +54,14 @@ use tako_core::lsp::state::{Action, Event, Lifecycle, RestartPolicy, ServerState
 use tako_core::lsp::{position, root, sync};
 use tako_core::platform::child_cmd::{self, ChildCmd};
 
+use super::completion::{CompletionAnswer, CompletionError, CompletionRequest};
 use super::diagnostics::{DiagnosticsStore, DocDiagnostics};
 use super::format::{FormatAnswer, FormatError, FormatRequest};
 use super::goto::{GotoAnswer, GotoError, GotoRequest};
-use super::server::{Handlers, ServerProcess};
+use super::rpc::RequestId;
+use super::server::{Handlers, RpcError, ServerProcess};
 use super::text;
+use tako_core::lsp::completion as comp;
 
 /// 要求のタイムアウトの既定（Zed の実測値）
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -267,6 +270,39 @@ struct Inner {
     epoch: u64,
     /// 次に配る持ち手の番号（#1769）
     next_holder: u64,
+    /// 打鍵の補完と、選んだ候補の説明の補い（#1682）。列ごとに**生きている要求は 1 つだけ**で、
+    /// 次の要求が来たら前の 1 つを `$/cancelRequest` で捨てる
+    completion_lane: Inflight,
+    resolve_lane: Inflight,
+    /// 次に配る列の番号
+    next_ticket: u64,
+}
+
+/// 取り消し合う要求の列（#1682）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    /// 打鍵の補完（`textDocument/completion`）
+    Completion,
+    /// 選んだ候補の説明（`completionItem/resolve`）
+    Resolve,
+}
+
+/// 列の「いま生きている 1 つ」（#1682）
+#[derive(Default)]
+struct Inflight {
+    /// 生きている要求の番号。これと違う番号の要求は置き換わった
+    ticket: u64,
+    /// 送ったがまだ答えを受けていない要求（取り消す相手）
+    call: Option<(Weak<ServerProcess>, RequestId)>,
+}
+
+impl Inner {
+    fn lane(&mut self, lane: Lane) -> &mut Inflight {
+        match lane {
+            Lane::Completion => &mut self.completion_lane,
+            Lane::Resolve => &mut self.resolve_lane,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -587,6 +623,58 @@ impl LspManager {
             None => Err(FormatError::Lsp(GotoError::Disabled)),
         }
     }
+
+    /// 補完の問い合わせ（#1682）。**背景スレッドから呼ぶ**（サーバの起動と応答を待つ。
+    /// 上限は `request.timeout`）。
+    ///
+    /// `request.superseding`（GUI の打鍵）の要求は、次の `superseding` の要求が来た時点で
+    /// `$/cancelRequest` を送って捨て、待っていた側は [`CompletionError::Superseded`] で返る
+    /// （打鍵のたびに投げた古い要求の答えを待たない）。文書が開いていなければ定義ジャンプと
+    /// 同じく問い合わせのあいだだけ `didOpen` する
+    pub fn completion(
+        &self,
+        request: &CompletionRequest,
+    ) -> Result<CompletionAnswer, CompletionError> {
+        match &self.shared {
+            Some(shared) => shared.completion(request),
+            None => Err(GotoError::Disabled.into()),
+        }
+    }
+
+    /// 選んだ候補の説明を補う（`completionItem/resolve`。#1682）。**背景スレッドから呼ぶ**。
+    /// 文書が開いている（編集中の）ときだけ。前の説明の要求は取り消す（選択を動かすたびに投げる）
+    pub fn resolve_completion(&self, path: &Path, item: &Value) -> Result<Value, CompletionError> {
+        match &self.shared {
+            Some(shared) => shared.resolve_completion(path, item),
+            None => Err(GotoError::Disabled.into()),
+        }
+    }
+
+    /// 打鍵の補完と説明の要求を捨てる（一覧を閉じた。#1682）。答えを待っていれば
+    /// `$/cancelRequest` を送る。**待たない**（UI スレッドから呼んでよい）
+    pub fn cancel_completion(&self) {
+        if let Some(shared) = &self.shared {
+            shared.supersede(Lane::Completion);
+            shared.supersede(Lane::Resolve);
+        }
+    }
+
+    /// その文書を受け持つサーバが申告した補完のきっかけの文字（`.` / `:` 等。#1682）。
+    /// まだ握手していなければ空。**待たない**（打鍵のたびに UI スレッドから呼ぶ）
+    pub fn completion_trigger_characters(&self, path: &Path) -> Vec<String> {
+        let Some(shared) = &self.shared else {
+            return Vec::new();
+        };
+        let uri = tako_core::file_uri::from_path(path);
+        let inner = shared.lock();
+        inner
+            .docs
+            .get(&uri)
+            .and_then(|doc| inner.servers.get(&doc.key))
+            .and_then(|slot| slot.capabilities.as_ref())
+            .map(comp::trigger_characters)
+            .unwrap_or_default()
+    }
 }
 
 /// 編集セッションを持つプレビューペイン 1 つと、言語サーバとのつながり（#1679）。
@@ -758,6 +846,25 @@ impl Shared {
             }
         }
         lease(uri)
+    }
+
+    /// 開いている文書へ持ち手として加わる（本文は送らない。#1769 の共有と同じ）。
+    /// 開いていなければ `None`（確かめと加わるのを 1 回のロックで行う = すれ違いで閉じた文書へ
+    /// 空の本文で開き直さない）
+    fn join(&self, uri: &str) -> Option<Arc<DocLease>> {
+        let mut guard = self.lock();
+        let inner = &mut *guard;
+        let doc = inner.docs.get_mut(uri)?;
+        let holder = inner.next_holder;
+        inner.next_holder = inner.next_holder.wrapping_add(1);
+        // 版は文書の今の版（この持ち手は同期しない = change を呼ばない）
+        doc.holders
+            .insert(holder, u64::try_from(doc.version).unwrap_or_default());
+        Some(Arc::new(DocLease {
+            shared: self.this.clone(),
+            uri: uri.to_string(),
+            holder,
+        }))
     }
 
     fn change(&self, lease: &DocLease, text: &str, buffer_version: u64) {
@@ -1481,7 +1588,7 @@ impl Shared {
         let _transient =
             self.open_for_request(&request.path, &uri, spec, request.document.as_deref())?;
         let (process, capabilities, key) =
-            self.wait_ready(&uri, spec, request.timeout, deadline)?;
+            self.wait_ready(&uri, spec, request.timeout, deadline, &|| false)?;
         if !tako_core::lsp::goto::server_supports(&capabilities, request.kind) {
             return Err(GotoError::Unsupported { server: spec.id });
         }
@@ -1540,24 +1647,9 @@ impl Shared {
         let remaining = deadline
             .saturating_duration_since(Instant::now())
             .max(Duration::from_millis(1));
-        let answer = match process.request(request.kind.method(), params, remaining) {
-            Ok(answer) => answer,
-            Err(super::server::RpcError::Timeout(_)) => {
-                return Err(GotoError::Timeout {
-                    server: spec.id,
-                    secs: request.timeout.as_secs(),
-                    starting: false,
-                })
-            }
-            Err(super::server::RpcError::Server(e)) => {
-                return Err(GotoError::ServerError {
-                    server: spec.id,
-                    code: e.code,
-                    detail: e.message,
-                })
-            }
-            Err(_) => return Err(GotoError::Crashed { server: spec.id }),
-        };
+        let answer = process
+            .request(request.kind.method(), params, remaining)
+            .map_err(|e| rpc_failure(spec, request.timeout, e))?;
         Ok(tako_core::lsp::goto::parse_locations(&answer)
             .into_iter()
             .filter_map(|location| {
@@ -1642,8 +1734,14 @@ impl Shared {
         spec: &'static ServerSpec,
         timeout: Duration,
         deadline: Instant,
+        abandoned: &dyn Fn() -> bool,
     ) -> Result<(Arc<ServerProcess>, Value, ServerKey), GotoError> {
         loop {
+            // 待っているあいだに要らなくなった（#1682: 次の打鍵の補完に置き換わった）。
+            // 呼び手が理由を見分ける（ここでは閉じたのと同じに抜ける）
+            if abandoned() {
+                return Err(GotoError::Closed);
+            }
             {
                 let inner = self.lock();
                 let Some(doc) = inner.docs.get(uri) else {
@@ -1687,7 +1785,7 @@ impl Shared {
         }
     }
 
-    /// 問い合わせのために文書を開く（#1680 / #1683）。既に開いていれば何もしない（`None`）。
+    /// 問い合わせのために文書を開く（#1680 / #1683 / #1682）。既に開いていれば持ち手として加わる。
     ///
     /// 開いていなければ**問い合わせのあいだだけ**開く（返す持ち手が落ちると `didClose`）。本文は
     /// `document`（編集セッションの全文）、無ければディスクの中身。「開いただけではサーバを
@@ -1699,8 +1797,11 @@ impl Shared {
         spec: &'static ServerSpec,
         document: Option<&str>,
     ) -> Result<Option<Arc<DocLease>>, GotoError> {
-        if self.lock().docs.contains_key(uri) {
-            return Ok(None);
+        // 開いていれば持ち手として加わる（#1682）。加わらずに相乗りすると、同じ文書への
+        // 問い合わせが 2 本重なったとき先に終わった側の一時の持ち手が didClose を送り、
+        // 後の側が答えの直前で文書を失う
+        if let Some(lease) = self.join(uri) {
+            return Ok(Some(lease));
         }
         if let Some(error) = self.not_installed_error(spec) {
             return Err(error);
@@ -1746,7 +1847,7 @@ impl Shared {
             .open_for_request(&request.path, &uri, spec, Some(&request.text))
             .map_err(FormatError::Lsp)?;
         let (process, capabilities, _) = self
-            .wait_ready(&uri, spec, request.timeout, deadline)
+            .wait_ready(&uri, spec, request.timeout, deadline, &|| false)
             .map_err(FormatError::Lsp)?;
         let ranged = request.range.is_some();
         if !fmt::server_supports(&capabilities, ranged) {
@@ -1848,6 +1949,259 @@ impl Shared {
         replace_text(&mut doc.text, text);
         doc.version = version;
         Ok(())
+    }
+}
+
+// --- 補完（#1682）-------------------------------------------------------------
+
+impl Shared {
+    /// 列の生きている要求を取り消して新しい番号を配る。前の要求が答えを待っていれば
+    /// `$/cancelRequest` を送り、待っていた側を [`RpcError::Cancelled`] で起こす
+    fn supersede(&self, lane: Lane) -> u64 {
+        let (ticket, previous) = {
+            let mut inner = self.lock();
+            inner.next_ticket = inner.next_ticket.wrapping_add(1);
+            let ticket = inner.next_ticket;
+            let previous = std::mem::replace(inner.lane(lane), Inflight { ticket, call: None });
+            (ticket, previous.call)
+        };
+        // 取り消しはロックの外で（待ちの表は別のロック）
+        if let Some(process) = previous.and_then(|(p, id)| p.upgrade().map(|p| (p, id))) {
+            process.0.cancel_request(&process.1);
+        }
+        ticket
+    }
+
+    fn is_current(&self, lane: Lane, ticket: u64) -> bool {
+        self.lock().lane(lane).ticket == ticket
+    }
+
+    /// 要求を送って答えを待つ。`lane` があれば列へ載せ、待っているあいだに置き換われば
+    /// [`RpcError::Cancelled`] で返る（送る前に置き換わっていたら自分で取り消す）
+    fn request_in_lane(
+        &self,
+        lane: Option<(Lane, u64)>,
+        process: &Arc<ServerProcess>,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, RpcError> {
+        let call = process.send_request(method, params, timeout)?;
+        if let Some((lane, ticket)) = lane {
+            let attached = {
+                let mut inner = self.lock();
+                let inflight = inner.lane(lane);
+                if inflight.ticket == ticket {
+                    inflight.call = Some((Arc::downgrade(process), call.id.clone()));
+                    true
+                } else {
+                    false
+                }
+            };
+            if !attached {
+                process.cancel_request(&call.id);
+                return Err(RpcError::Cancelled);
+            }
+        }
+        let result = process.wait(call, timeout);
+        if let Some((lane, ticket)) = lane {
+            let mut inner = self.lock();
+            let inflight = inner.lane(lane);
+            if inflight.ticket == ticket {
+                inflight.call = None;
+            }
+        }
+        result
+    }
+
+    fn completion(&self, request: &CompletionRequest) -> Result<CompletionAnswer, CompletionError> {
+        let deadline = Instant::now() + request.timeout;
+        // 打鍵の要求は列の前の 1 つを取り消してから（最新の 1 つだけを生かす）
+        let lane = request
+            .superseding
+            .then(|| (Lane::Completion, self.supersede(Lane::Completion)));
+        let superseded = || lane.is_some_and(|(lane, ticket)| !self.is_current(lane, ticket));
+        let Some(resolved) = servers::resolve_in(self.config.table, &request.path) else {
+            return Err(GotoError::NoServer.into());
+        };
+        let spec = resolved.spec;
+        let uri = tako_core::file_uri::from_path(&request.path);
+        // 開いていなければ問い合わせのあいだだけ開く（定義ジャンプ・整形と同じ 1 本）
+        let _transient =
+            self.open_for_request(&request.path, &uri, spec, request.document.as_deref())?;
+        // 起動を待つあいだに次の打鍵に置き換わったら待ちを抜ける（古いスレッドに上限まで
+        // 状態を読ませ続けない）
+        let ready = self.wait_ready(&uri, spec, request.timeout, deadline, &superseded);
+        if superseded() {
+            return Err(CompletionError::Superseded);
+        }
+        let (process, capabilities, key) = ready?;
+        if !comp::server_supports(&capabilities) {
+            return Err(GotoError::Unsupported { server: spec.id }.into());
+        }
+        let cursor = comp::At::new(request.line, request.column);
+        loop {
+            // 問い合わせる位置は**サーバが見ている本文**（送った写し）で LSP の座標へ直す（#1769）。
+            // 送った時点の文書の版を覚え、答えが届いたときに違っていたらその答えは使わない
+            // （候補の範囲は送った本文の座標 = 打ち足した後の本文には当たらない）
+            let (at, sent_version) = {
+                let inner = self.lock();
+                let Some(doc) = inner.docs.get(&uri) else {
+                    return Err(GotoError::Closed.into());
+                };
+                (
+                    position::lsp_position_of_line_col(&doc.text, request.line, request.column),
+                    doc.version,
+                )
+            };
+            let params = json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": at.0, "character": at.1 },
+                "context": request.trigger.context(),
+            });
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1));
+            let answer = match self.request_in_lane(
+                lane,
+                &process,
+                "textDocument/completion",
+                params,
+                remaining,
+            ) {
+                Ok(answer) => answer,
+                Err(RpcError::Cancelled) => return Err(CompletionError::Superseded),
+                Err(e) => return Err(rpc_failure(spec, request.timeout, e).into()),
+            };
+            let parsed = comp::parse_response(&answer);
+            // 空の答え: 読み込み中のサーバ（rust-analyzer）なら済むのを待って問い直す（#1680 と同じ）。
+            // 打鍵の要求は待たない（次の打鍵がすぐ問い直す。読み込みが済むまで一覧は出ない）
+            if parsed.items.is_empty() && !request.superseding {
+                match self.wait_loaded(&key, deadline) {
+                    super::goto::Loading::Retry => continue,
+                    super::goto::Loading::Settled => {}
+                    super::goto::Loading::TimedOut => {
+                        return Err(GotoError::Timeout {
+                            server: spec.id,
+                            secs: request.timeout.as_secs(),
+                            starting: true,
+                        }
+                        .into())
+                    }
+                }
+            }
+            // 写しはロックの中で写し取り、座標の変換（行頭の索引 = 本文の長さに比例）は外で行う
+            // （打鍵の同期 `sync` を待たせない）
+            let text = {
+                let inner = self.lock();
+                let Some(doc) = inner.docs.get(&uri) else {
+                    return Err(GotoError::Closed.into());
+                };
+                if doc.version != sent_version {
+                    return Err(CompletionError::Edited);
+                }
+                doc.text.clone()
+            };
+            let is_incomplete = parsed.is_incomplete;
+            let dropped = parsed.dropped;
+            let mut items = comp::locate(parsed, &text, cursor);
+            let line_text = comp::tako_line(&text, request.line).to_string();
+            let resolvable = comp::resolve_supported(&capabilities);
+            if request.resolve_top > 0 && resolvable {
+                let order = comp::rank(&items, &line_text, cursor);
+                let top: Vec<usize> = order.into_iter().take(request.resolve_top).collect();
+                self.resolve_items(&process, &mut items, &top, deadline);
+            }
+            return Ok(CompletionAnswer {
+                server: spec.id,
+                items,
+                is_incomplete,
+                dropped,
+                cursor,
+                line_text,
+                resolvable,
+            });
+        }
+    }
+
+    /// 候補の説明を**まとめて**補う（CLI / MCP の `resolve`）。要求を先に全部送ってから順に待つ
+    /// （1 つずつ往復を待たない）。届かなかった候補は説明なしのまま
+    fn resolve_items(
+        &self,
+        process: &ServerProcess,
+        items: &mut [comp::CompletionItem],
+        indices: &[usize],
+        deadline: Instant,
+    ) {
+        let remaining = || {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1))
+                .min(super::completion::RESOLVE_TIMEOUT)
+        };
+        let calls: Vec<(usize, super::server::PendingCall)> = indices
+            .iter()
+            .filter_map(|&i| {
+                let raw = items.get(i)?.raw.clone();
+                process
+                    .send_request("completionItem/resolve", raw, remaining())
+                    .ok()
+                    .map(|call| (i, call))
+            })
+            .collect();
+        for (i, call) in calls {
+            if let Ok(resolved) = process.wait(call, remaining()) {
+                comp::apply_resolved(&mut items[i], &resolved);
+            }
+        }
+    }
+
+    fn resolve_completion(&self, path: &Path, item: &Value) -> Result<Value, CompletionError> {
+        let timeout = super::completion::RESOLVE_TIMEOUT;
+        let deadline = Instant::now() + timeout;
+        let lane = Some((Lane::Resolve, self.supersede(Lane::Resolve)));
+        let Some(resolved) = servers::resolve_in(self.config.table, path) else {
+            return Err(GotoError::NoServer.into());
+        };
+        let spec = resolved.spec;
+        let uri = tako_core::file_uri::from_path(path);
+        let current = || self.is_current(Lane::Resolve, lane.map_or(0, |(_, t)| t));
+        let ready = self.wait_ready(&uri, spec, timeout, deadline, &|| !current());
+        if !current() {
+            return Err(CompletionError::Superseded);
+        }
+        let (process, capabilities, _) = ready?;
+        if !comp::resolve_supported(&capabilities) {
+            return Err(GotoError::Unsupported { server: spec.id }.into());
+        }
+        match self.request_in_lane(
+            lane,
+            &process,
+            "completionItem/resolve",
+            item.clone(),
+            timeout,
+        ) {
+            Ok(value) => Ok(value),
+            Err(RpcError::Cancelled) => Err(CompletionError::Superseded),
+            Err(e) => Err(rpc_failure(spec, timeout, e).into()),
+        }
+    }
+}
+
+/// 要求の失敗を言語サーバの状態の失敗へ（定義ジャンプと補完が共有する）
+fn rpc_failure(spec: &'static ServerSpec, timeout: Duration, error: RpcError) -> GotoError {
+    match error {
+        RpcError::Timeout(_) => GotoError::Timeout {
+            server: spec.id,
+            secs: timeout.as_secs(),
+            starting: false,
+        },
+        RpcError::Server(e) => GotoError::ServerError {
+            server: spec.id,
+            code: e.code,
+            detail: e.message,
+        },
+        _ => GotoError::Crashed { server: spec.id },
     }
 }
 
@@ -2040,9 +2394,11 @@ fn stop_process(process: &ServerProcess, timeout: Duration) {
 /// サーバが無駄な仕事をする）。S1 は文書同期と診断の受信、#1680 が定義ジャンプの 4 種を足した
 fn initialize_params(root_uri: &str, root_name: &str) -> Value {
     use lsp_types::{
-        ClientCapabilities, ClientInfo, DocumentFormattingClientCapabilities,
-        DocumentRangeFormattingClientCapabilities, GeneralClientCapabilities, GotoCapability,
-        InitializeParams, PositionEncodingKind, PublishDiagnosticsClientCapabilities,
+        ClientCapabilities, ClientInfo, CompletionClientCapabilities, CompletionItemCapability,
+        CompletionItemCapabilityResolveSupport, CompletionItemTag, CompletionListCapability,
+        DocumentFormattingClientCapabilities, DocumentRangeFormattingClientCapabilities,
+        GeneralClientCapabilities, GotoCapability, InitializeParams, MarkupKind,
+        PositionEncodingKind, PublishDiagnosticsClientCapabilities, TagSupport,
         TextDocumentClientCapabilities, TextDocumentSyncClientCapabilities, Uri, WorkspaceFolder,
     };
     // #1680: 定義ジャンプの 4 種。`LocationLink` を受けられる（識別子の範囲へ正確に着地する）
@@ -2092,6 +2448,41 @@ fn initialize_params(root_uri: &str, root_name: &str) -> Value {
                 }),
                 range_formatting: Some(DocumentRangeFormattingClientCapabilities {
                     dynamic_registration: Some(false),
+                }),
+                // #1682: 補完。スニペットは申告しない（跳び先の編集を持たない = 平文で入れる）。
+                // 長い説明（documentation）だけを後から resolve で補う。型の要約（detail）と
+                // 自動 import（additionalTextEdits）は resolve へ回させない = 一覧の答えに最初から
+                // 載る（全行に型を出せる・確定を待たずに 1 回で入れられる。実測: detail を回すと
+                // rust-analyzer は選んだ 1 行にしか型を返さなかった）
+                completion: Some(CompletionClientCapabilities {
+                    dynamic_registration: Some(false),
+                    completion_item: Some(CompletionItemCapability {
+                        snippet_support: Some(false),
+                        commit_characters_support: Some(false),
+                        documentation_format: Some(vec![
+                            MarkupKind::PlainText,
+                            MarkupKind::Markdown,
+                        ]),
+                        deprecated_support: Some(true),
+                        preselect_support: Some(true),
+                        tag_support: Some(TagSupport {
+                            value_set: vec![CompletionItemTag::DEPRECATED],
+                        }),
+                        insert_replace_support: Some(true),
+                        resolve_support: Some(CompletionItemCapabilityResolveSupport {
+                            properties: vec!["documentation".into()],
+                        }),
+                        ..Default::default()
+                    }),
+                    context_support: Some(true),
+                    completion_list: Some(CompletionListCapability {
+                        item_defaults: Some(vec![
+                            "editRange".into(),
+                            "insertTextFormat".into(),
+                            "data".into(),
+                        ]),
+                    }),
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -2160,7 +2551,7 @@ mod tests {
     }
 
     #[test]
-    fn 初期化の申告は_utf16_と文書同期と診断と定義ジャンプと整形だけ() {
+    fn 初期化の申告は_utf16_と文書同期と診断と定義ジャンプと整形と補完だけ() {
         let params = initialize_params("file:///w", "w");
         assert_eq!(
             params["capabilities"]["general"]["positionEncodings"],
@@ -2172,6 +2563,7 @@ mod tests {
         assert_eq!(
             keys,
             vec![
+                "completion",
                 "declaration",
                 "definition",
                 "formatting",
@@ -2181,6 +2573,18 @@ mod tests {
                 "synchronization",
                 "typeDefinition"
             ]
+        );
+        // #1682: スニペットは申告せず、resolve へ回すのは長い説明だけ（型の要約と自動 import は
+        // 一覧に載せる）
+        let item = &params["capabilities"]["textDocument"]["completion"]["completionItem"];
+        assert_eq!(item["snippetSupport"], json!(false));
+        assert_eq!(
+            item["resolveSupport"]["properties"],
+            json!(["documentation"])
+        );
+        assert_eq!(
+            params["capabilities"]["textDocument"]["completion"]["contextSupport"],
+            json!(true)
         );
         assert_eq!(
             params["capabilities"]["textDocument"]["definition"]["linkSupport"],

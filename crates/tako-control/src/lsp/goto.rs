@@ -13,6 +13,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tako_core::lsp::goto::GotoKind;
 use tako_core::lsp::state::ServerState;
+use tako_core::platform::support::Note;
 
 use super::text;
 
@@ -165,14 +166,19 @@ impl GotoError {
 
     /// 理由（日英は `text` の 1 か所）
     pub fn reason(&self, kind: GotoKind) -> String {
+        self.reason_in(text::GOTO_UNSUPPORTED_REASON, kind_label(kind))
+    }
+
+    /// 理由。「能力に無い」の文だけは機能ごとに違うので呼び手が渡す（`{server}` と `{kind}` を
+    /// 差し込む。#1682 の補完も同じ失敗の型を使う）。それ以外は言語サーバの状態として同じ文
+    pub fn reason_in(&self, unsupported: Note, label: &str) -> String {
         match self {
             Self::Disabled => text::DISABLED_REASON.text().to_string(),
             Self::NoServer => text::GOTO_NO_SERVER_REASON.text().to_string(),
             Self::NotInstalled { reason, .. } => reason.clone(),
-            Self::Unsupported { server } => text::fill(
-                text::GOTO_UNSUPPORTED_REASON,
-                &[("server", server), ("kind", kind_label(kind))],
-            ),
+            Self::Unsupported { server } => {
+                text::fill(unsupported, &[("server", server), ("kind", label)])
+            }
             Self::Timeout {
                 server,
                 secs,
@@ -241,6 +247,12 @@ impl GotoError {
             "reason": self.reason(kind),
             "next_step": self.next_step(),
         });
+        self.add_server(&mut out);
+        out
+    }
+
+    /// 応答へ答えたサーバ（と未導入なら導入コマンド）を足す（#1682 の補完と共有）
+    pub fn add_server(&self, out: &mut Value) {
         match self {
             Self::NotInstalled {
                 server,
@@ -257,7 +269,6 @@ impl GotoError {
             | Self::ServerError { server, .. } => out["server"] = json!(server),
             _ => {}
         }
-        out
     }
 }
 

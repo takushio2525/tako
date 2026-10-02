@@ -1887,6 +1887,39 @@ syntect へ通していた**。release 実測（同じ構文セット・テー�
   （Code Runner の #1730 と同じ 1 実装。`probe` の上限つき。打ち切りは `Launch::TimedOut` =
   見つからないと区別して理由を返す）
 
+### 補完（#1682。2026-10-02）
+
+- **置き場**: 純粋部分は `tako_core::lsp::completion`（応答の読み取りと tako の座標への写し・
+  スニペットの平文化・絞り込み `rank`・件数 `truncate`・キーの表 `route_key`・版の照合 `Session`・
+  きっかけ `trigger_for`）、問い合わせと取り消しは `tako_control::lsp::manager` の
+  `completion` / `resolve_completion` / `cancel_completion`、CLI / MCP の 3 段は
+  `dispatch::lsp_completion_prepare` → `LspCompletionJob::run` → `lsp_completion_land`、確定は
+  `dispatch::lsp_completion_apply`（GUI の Enter と CLI の `--choice` の 1 本）、画面は
+  tako-app の `lsp_completion_ui.rs`
+- **取り消しの列**（`Lane`。補完と説明の 2 列）: 列ごとに「生きている要求は 1 つだけ」を番号で持ち、
+  新しい要求が来たら前の 1 つを `ServerProcess::cancel_request`（待ちの表から外して待ち手へ
+  `Cancelled` を渡し、`$/cancelRequest` を送る）で捨てる。送る前に置き換わっていたら自分で取り消す。
+  RPC 層には「送るだけで待たない要求」（`send_request` → `PendingCall` → `wait`）を足した
+  （`request` はその 2 つの合成）
+- **版の照合は 2 か所**: GUI の `Session::accept`（打鍵の番号と本文の版）と、manager の
+  「送ったときの文書の版 = 答えが届いたときの版」（違えば `Edited`）。座標の変換（行頭の索引 =
+  本文の長さに比例）は写しをロックの中で写し取ってから外で行う（打鍵の同期 `sync` を待たせない）
+- **一時 didOpen は持ち手として加わる**（`Shared::join`）: 開いている文書へ問い合わせるときも持ち手を
+  1 つ足して答えまで持つ。加わらずに相乗りすると、同じ文書への問い合わせが 2 本重なったとき先に
+  終わった側の一時の持ち手が `didClose` を送り、後の側が答えの直前で文書を失う（定義ジャンプにも
+  あった穴。`issue1682_lsp_completion` の `一時的に開いた文書は重なった問い合わせが終わるまで閉じない`）
+- **一覧は `gpui::list`**（overdraw は 1 行）で、行の高さは一定（22px）なので選択に合わせた送りは
+  先頭の行の番号だけで決める（`ListState::scroll_to_reveal_item` は測った高さで数えるので、
+  まだ描いていない遠くの行 = 末尾から先頭へ回ったとき等でずれる）。組んだ行の数は `rows_built` に
+  数え、visual-test `completion` が 1000 件で可視ぶんだけかを測る
+- **複数範囲の 1 操作**: `TextBuffer::replace_position_ranges` は並べ方・重なり・最小化を整形（#1683）と
+  同じ `order_changes` の 1 実装で決め（同じ位置への挿入は渡した順に並ぶ）、範囲を後ろから当てて
+  2 つ目以降の差分に `chained` を立てる。undo は `chained` でない差分まで戻り、redo は次の差分が
+  `chained` の間やり直す（#1651 の「本文を書き換える口は `apply_edit` / `undo` / `redo` だけ」は保つ）。
+  整形の `apply_changes` は「最初の始まり〜最後の終わり」を 1 か所の置き換えにするが、補完は先頭の
+  自動 import と下の方の語のように**離れた範囲**を入れるので、1 か所にするとあいだの本文がまるごと
+  undo へ載る（undo の予算は 8 MB = 10 MB の文書なら 1 回で履歴が消える）。だから当て方だけを分けた
+
 ## 大きいファイルの編集（#1660。2026-09-27）
 
 プレビューの読み込み上限（= 編集の上限）が 1 MB / 5,000 行で、tako 自身の `main.rs`（8 万行超）・

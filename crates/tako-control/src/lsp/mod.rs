@@ -11,7 +11,10 @@
 //! 定義ジャンプ = `tako lsp definition` 等（問い合わせの型と応答は [`goto`]、待つのは
 //! [`LspManager::goto`]）。S6（#1683）の整形 = `tako lsp format`（型と応答は [`format`]、
 //! 待つのは [`LspManager::format`]、当てるのは `TextBuffer::apply_changes`）。
+//! S5（#1682）の補完 = `tako lsp completion`（問い合わせの型と応答は
+//! [`completion`]、待つのは [`LspManager::completion`]。古い要求は `$/cancelRequest` で捨てる）。
 
+pub mod completion;
 pub mod diagnostics;
 pub mod format;
 pub mod goto;
@@ -20,6 +23,7 @@ pub mod rpc;
 pub mod server;
 pub mod text;
 
+pub use completion::{CompletionAnswer, CompletionError, CompletionRequest};
 pub use diagnostics::DocDiagnostics;
 pub use format::{FormatAnswer, FormatError, FormatRequest};
 pub use goto::{GotoAnswer, GotoError, GotoRequest, GotoTarget};

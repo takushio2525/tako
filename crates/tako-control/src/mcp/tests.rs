@@ -31,7 +31,7 @@ mod tests {
     }
 
     /// #1679 と #1680 の合流: `tako_lsp` は 1 本で、action の先頭が既定の diagnostics、
-    /// 続いて定義ジャンプの綴りの正本（`GotoKind::NAMES`）そのもの、最後に整形の 2 つ（#1683）。
+    /// 続いて定義ジャンプの綴りの正本（`GotoKind::NAMES`）そのもの、整形の 2 つ（#1683）、最後に補完（#1682）。
     /// 種類を足したのに action の表へ載せ忘れる・振り分けが受けない、のどちらもここで落ちる
     #[test]
     fn tako_lsp_の_action_は診断と定義ジャンプの全種を振り分ける() {
@@ -39,11 +39,13 @@ mod tests {
         assert_eq!(actions[0], "diagnostics");
         let goto = &actions[1..=tako_core::lsp::goto::GotoKind::NAMES.len()];
         assert_eq!(goto, &tako_core::lsp::goto::GotoKind::NAMES[..]);
+        // 定義ジャンプの後ろは整形の 2 つと補完（残りはこれだけ = 足し忘れはここで落ちる）
         assert_eq!(
             &actions[goto.len() + 1..],
             &[
                 crate::dispatch::LSP_FORMAT_ACTION,
-                crate::dispatch::LSP_FORMAT_ON_SAVE_ACTION
+                crate::dispatch::LSP_FORMAT_ON_SAVE_ACTION,
+                crate::dispatch::LSP_COMPLETION_ACTION,
             ]
         );
         for action in goto {
@@ -124,6 +126,47 @@ mod tests {
                 enabled: Some(true)
             }
         );
+    }
+
+    /// #1682: `tako_lsp` の action=completion は CLI `tako lsp completion` と同じ要求になる
+    /// （pane の省略は呼び出し元 = 定義ジャンプと同じ。位置は必須）
+    #[test]
+    fn tako_lsp_の補完は_cli_と同じ要求になる() {
+        assert_eq!(
+            build_request(
+                "tako_lsp",
+                &json!({"action": "completion", "line": 3, "column": 4, "limit": 20, "choice": 2, "resolve": true}),
+                Some(9),
+                None
+            )
+            .unwrap(),
+            Request::LspCompletion {
+                pane: Some(9),
+                line: 3,
+                column: 4,
+                limit: Some(20),
+                choice: Some(2),
+                resolve: Some(true),
+            }
+        );
+        assert_eq!(
+            build_request(
+                "tako_lsp",
+                &json!({"action": "completion", "pane": 5, "line": 1, "column": 0}),
+                Some(9),
+                None
+            )
+            .unwrap(),
+            Request::LspCompletion {
+                pane: Some(5),
+                line: 1,
+                column: 0,
+                limit: None,
+                choice: None,
+                resolve: None,
+            }
+        );
+        assert!(build_request("tako_lsp", &json!({"action": "completion"}), Some(9), None).is_err());
     }
 
     #[test]

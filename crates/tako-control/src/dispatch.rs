@@ -1153,6 +1153,281 @@ fn preview_save(
     Ok(out)
 }
 
+// --- 補完（#1682）-------------------------------------------------------------
+
+/// 補完の問い合わせ（#1682）。UI スレッドで [`lsp_completion_prepare`] が作り、
+/// [`LspCompletionJob::run`] を背景で走らせ、答えを載せた [`LspCompletionLanding`] を
+/// UI スレッドの [`lsp_completion_land`] へ戻す（CLI / MCP の 3 段。GUI の打鍵は同じ manager の
+/// 問い合わせを直接背景で待ち、確定だけ [`lsp_completion_apply`] を通る）
+pub struct LspCompletionJob {
+    manager: crate::lsp::LspManager,
+    request: crate::lsp::CompletionRequest,
+    landing: LspCompletionLanding,
+}
+
+impl LspCompletionJob {
+    /// 言語サーバへ問い合わせる（**UI スレッドで呼ばない**。上限は `CompletionRequest::timeout`）
+    pub fn run(self) -> LspCompletionLanding {
+        let mut landing = self.landing;
+        landing.answer = Some(self.manager.completion(&self.request));
+        landing
+    }
+}
+
+/// 補完の着地に要るもの（問い合わせたペインと引数）と、背景で得た答え（#1682）
+#[derive(Debug, Clone)]
+pub struct LspCompletionLanding {
+    pub source_pane: PaneId,
+    pub source_path: String,
+    /// 問い合わせた位置（行 1 始まり・桁 0 始まりの行内 UTF-8 バイト）
+    pub line: usize,
+    pub column: usize,
+    /// 返す件数（`--limit`）
+    pub limit: usize,
+    /// 確定する候補の番号（1 始まり。絞り込み後の全体の並び）
+    pub choice: Option<usize>,
+    /// 準備のときの編集セッションの版（編集していなければ `None`）。確定の前に照合する
+    pub version: Option<u64>,
+    /// 背景で得た答え（[`LspCompletionJob::run`] が入れる）
+    pub answer: Option<Result<crate::lsp::CompletionAnswer, crate::lsp::CompletionError>>,
+}
+
+/// 補完の準備（UI スレッド。#1682）。引数を検査し、編集セッションの本文と版を採る
+/// （言語サーバの座標へは manager がサーバの見ている本文で直す）。**1 プロセスも起こさない**
+pub fn lsp_completion_prepare(
+    host: &dyn ControlHost,
+    pane: Option<u64>,
+    line: usize,
+    column: usize,
+    limit: Option<usize>,
+    choice: Option<usize>,
+    resolve: bool,
+) -> Result<LspCompletionJob, DispatchError> {
+    if line == 0 {
+        return Err(DispatchError::InvalidParams(
+            tako_core::open_plan::LINE_ONE_BASED.into(),
+        ));
+    }
+    if choice == Some(0) {
+        return Err(DispatchError::InvalidParams(
+            "choice は 1 始まり（候補の一覧の番号）".into(),
+        ));
+    }
+    if limit == Some(0) {
+        return Err(DispatchError::InvalidParams(
+            "limit は 1 以上（返す候補の件数）".into(),
+        ));
+    }
+    let (_, target) = resolve_pane(host.workspace(), pane)?;
+    let Some((path, _)) = host.preview_state(target) else {
+        return Err(DispatchError::InvalidParams(format!(
+            "プレビューペインではない: {}",
+            target.as_u64()
+        )));
+    };
+    let source = host
+        .preview_goto_source(target, line - 1)
+        .map_err(DispatchError::InvalidParams)?;
+    // 桁は丸めずに拒否する（`tako edit replace-range` と同じ。#1658）
+    if column > source.line_text.len() || !source.line_text.is_char_boundary(column) {
+        return Err(DispatchError::InvalidParams(format!(
+            "column {column} は {line} 行目（{} バイト）の文字の境界ではない",
+            source.line_text.len()
+        )));
+    }
+    let Some(manager) = host.lsp() else {
+        return Err(DispatchError::Operation(
+            crate::lsp::text::UNAVAILABLE.text().to_string(),
+        ));
+    };
+    let limit = limit.unwrap_or(tako_core::lsp::completion::DEFAULT_LIMIT);
+    let version = host
+        .preview_document(target)
+        .and_then(|d| d["version"].as_u64());
+    Ok(LspCompletionJob {
+        manager: manager.clone(),
+        request: crate::lsp::CompletionRequest {
+            path: PathBuf::from(&path),
+            line: line - 1,
+            column,
+            timeout: crate::lsp::completion::completion_timeout(),
+            document: source.document,
+            // 明示の問い合わせ = 語の途中でもきっかけの文字の直後でも「呼び出した」
+            trigger: tako_core::lsp::completion::Trigger::Word,
+            superseding: false,
+            resolve_top: if resolve { limit } else { 0 },
+        },
+        landing: LspCompletionLanding {
+            source_pane: target,
+            source_path: path,
+            line,
+            column,
+            limit,
+            choice,
+            version,
+            answer: None,
+        },
+    })
+}
+
+/// 補完の着地（UI スレッド。#1682）。答えを絞り込んで並べ（GUI の一覧と同じ
+/// `tako_core::lsp::completion::rank`）、`limit` で切る。`choice` があればその候補で確定する
+/// （[`lsp_completion_apply`] = GUI の Enter と同じ 1 本）。「候補が無い」「未導入」等は
+/// `status` と理由・次の一手で返す（失敗ではなく答え）
+pub fn lsp_completion_land(
+    host: &mut dyn ControlHost,
+    landing: &LspCompletionLanding,
+) -> Result<Value, DispatchError> {
+    use tako_core::lsp::completion::{rank, truncate};
+    let from = json!({
+        "pane": landing.source_pane.as_u64(),
+        "path": landing.source_path,
+        "line": landing.line,
+        "column": landing.column,
+    });
+    let answer = match &landing.answer {
+        Some(Ok(answer)) => answer,
+        Some(Err(error)) => {
+            let mut out = error.to_json();
+            out["from"] = from;
+            return Ok(out);
+        }
+        None => {
+            return Err(DispatchError::Operation(
+                "補完の答えがまだ無い（背景の問い合わせを経ずに着地しようとした）".into(),
+            ))
+        }
+    };
+    let order = rank(&answer.items, &answer.line_text, answer.cursor);
+    if order.is_empty() {
+        let mut out = crate::lsp::completion::none_json(answer.server);
+        out["from"] = from;
+        return Ok(out);
+    }
+    let total = order.len();
+    if let Some(choice) = landing.choice {
+        let index = *order.get(choice - 1).ok_or_else(|| {
+            DispatchError::InvalidParams(format!("choice {choice} は候補（{total} 件）の外"))
+        })?;
+        let item = &answer.items[index];
+        // 待っているあいだに問い合わせたペインが閉じられた / 差し替わった / 本文が変わったら入れない
+        let still_there = host
+            .preview_state(landing.source_pane)
+            .is_some_and(|(path, _)| path == landing.source_path);
+        if !still_there {
+            let mut out = json!({
+                "status": "source-gone",
+                "action": LSP_COMPLETION_ACTION,
+                "reason": crate::lsp::text::GOTO_SOURCE_GONE_REASON.text(),
+                "next_step": crate::lsp::text::GOTO_RETRY_NEXT_STEP.text(),
+            });
+            out["from"] = from;
+            return Ok(out);
+        }
+        let current = host
+            .preview_document(landing.source_pane)
+            .and_then(|d| d["version"].as_u64());
+        if landing.version.is_some() && current != landing.version {
+            let mut out = crate::lsp::CompletionError::Edited.to_json();
+            out["from"] = from;
+            return Ok(out);
+        }
+        let applied = lsp_completion_apply(
+            host,
+            landing.source_pane,
+            item,
+            answer.cursor,
+            landing.version,
+            true,
+        )?;
+        return Ok(json!({
+            "status": "applied",
+            "action": LSP_COMPLETION_ACTION,
+            "server": answer.server,
+            "from": from,
+            "chosen": choice,
+            "total": total,
+            "item": crate::lsp::completion::item_json(item, choice, answer.cursor),
+            "edit": applied,
+        }));
+    }
+    let (shown, truncated) = truncate(total, landing.limit);
+    let items: Vec<Value> = order[..shown]
+        .iter()
+        .enumerate()
+        .map(|(n, &i)| crate::lsp::completion::item_json(&answer.items[i], n + 1, answer.cursor))
+        .collect();
+    let mut out = json!({
+        "status": "found",
+        "action": LSP_COMPLETION_ACTION,
+        "server": answer.server,
+        "from": from,
+        "total": total,
+        "shown": shown,
+        "truncated": truncated,
+        "is_incomplete": answer.is_incomplete,
+        "items": items,
+    });
+    if answer.dropped > 0 {
+        out["dropped"] = json!(answer.dropped);
+    }
+    if truncated > 0 {
+        out["next_step"] = json!(crate::lsp::text::fill(
+            crate::lsp::text::COMPLETION_TRUNCATED_NEXT_STEP,
+            &[("total", &total.to_string())]
+        ));
+    }
+    Ok(out)
+}
+
+/// 補完の確定（UI スレッド。#1682）。**GUI の Enter / Tab と CLI / MCP の `choice` が同じここを通る**。
+///
+/// 置き換えるのは 候補の始点 〜 `cursor`（+ 候補が持つカーソルより後ろの分）= 一覧を出したまま
+/// 打ち足した文字も一緒に置き換わる。追加の編集（自動 import 等）も同じ 1 回の操作で入れる
+/// （undo 1 回で全部戻る）。`same_text` が偽（答えの後に本文が変わった = GUI で打ち足した）なら、
+/// 置き換えの始点より手前の追加の編集だけを入れる（後ろの位置は打ち足した分ずれている）。
+/// `expected_version` が違えば本文を触らずに失敗する
+pub fn lsp_completion_apply(
+    host: &mut dyn ControlHost,
+    pane: PaneId,
+    item: &tako_core::lsp::completion::CompletionItem,
+    cursor: tako_core::lsp::completion::At,
+    expected_version: Option<u64>,
+    same_text: bool,
+) -> Result<Value, DispatchError> {
+    use tako_core::text_edit::RangeEdit;
+    let position = |at: tako_core::lsp::completion::At| TextPosition::new(at.line + 1, at.col);
+    let end = tako_core::lsp::completion::At::new(cursor.line, cursor.col + item.tail);
+    let mut edits = vec![RangeEdit {
+        start: position(item.start),
+        end: position(end),
+        text: item.insert_text.clone(),
+        expected_version: None,
+    }];
+    let mut skipped = 0;
+    for extra in &item.additional {
+        if same_text || extra.end <= item.start {
+            edits.push(RangeEdit {
+                start: position(extra.start),
+                end: position(extra.end),
+                text: extra.text.clone(),
+                expected_version: None,
+            });
+        } else {
+            skipped += 1;
+        }
+    }
+    host.edit_preview_ranges(pane, &edits, 0, expected_version)
+        .map_err(DispatchError::Operation)?;
+    let mut out = preview_edit_reply(host, pane);
+    out["inserted"] = json!(item.insert_text);
+    out["additional_edits"] = json!(edits.len() - 1);
+    if skipped > 0 {
+        out["skipped_additional_edits"] = json!(skipped);
+    }
+    Ok(out)
+}
+
 /// リクエストを実行し、成功時の `result` 値を返す。
 /// `origin` は新規生成ペインの生成主体（Layer 1 CLI なら `Cli`、Phase 3 の MCP なら `Mcp`）
 /// dispatch は UI スレッド（GPUI のイベントループ）で実行されるため、ここでの遅延は
@@ -1225,6 +1500,9 @@ pub enum OffloadJob {
     /// 整形の問い合わせ（#1683。保存時整形を含む）。答えを当てる（編集バッファを書き換える）のは
     /// UI スレッドでしかできないので [`OffloadOutcome::OnUi`] で戻す
     LspFormat(Box<LspFormatJob>),
+    /// 補完の問い合わせ（#1682）。待つのは background、絞り込みと確定（`choice` = 編集バッファへ
+    /// 入れる）は [`OffloadOutcome::OnUi`] で UI スレッドへ戻す
+    LspCompletion(Box<LspCompletionJob>),
     /// Code Runner の実行プロファイルと実行環境の一覧（#1730）。実行環境の Tier P
     /// （道具の場所・版・環境の置き場を子プロセスに聞く）を含むので、UI スレッドでは
     /// 相対パスの基準（ペインの cwd）だけを採る
@@ -1266,6 +1544,8 @@ pub enum OffloadContinuation {
     LspFormat(Box<LspFormatLanding>),
     /// コピーの後始末（ツリーの読み直し）と応答（#1860）
     FileCopied(Box<FileCopyLanding>),
+    /// 補完の着地（[`lsp_completion_land`]）
+    LspCompletion(Box<LspCompletionLanding>),
 }
 
 /// background の結果を受けて UI スレッドで続きを行う（#1680）。IPC の受け口と GUI の
@@ -1294,6 +1574,7 @@ pub fn finish_offload(
                 }
             }
         }
+        OffloadContinuation::LspCompletion(landing) => lsp_completion_land(host, &landing),
     }
 }
 
@@ -1464,6 +1745,26 @@ pub fn prepare_offload(
         // 腕の字面は dispatch_inner の `{ pane, force }` と分ける（#1659 の番犬が字面で探す）
         Request::PreviewSave { force, pane } => lsp_format_on_save_prepare(host, *pane, *force)
             .map(|job| job.map(|job| OffloadJob::LspFormat(Box::new(job)))),
+        // #1682: 準備（引数の検査）は UI スレッド、問い合わせは background
+        Request::LspCompletion {
+            pane,
+            line,
+            column,
+            limit,
+            choice,
+            resolve,
+        } => Some(
+            lsp_completion_prepare(
+                host,
+                *pane,
+                *line,
+                *column,
+                *limit,
+                *choice,
+                resolve.unwrap_or(false),
+            )
+            .map(|job| OffloadJob::LspCompletion(Box::new(job))),
+        ),
         // #1730: 実行環境の Tier P（子プロセス。1 回の上限 5 秒）を UI スレッドで待たない
         Request::RunResolve {
             path,
@@ -1500,6 +1801,9 @@ impl OffloadJob {
                     job: *job,
                     outcomes,
                 })))
+            }
+            OffloadJob::LspCompletion(job) => {
+                OffloadOutcome::OnUi(OffloadContinuation::LspCompletion(Box::new(job.run())))
             }
             other => OffloadOutcome::Reply(other.run_reply()),
         }
@@ -1540,6 +1844,9 @@ impl OffloadJob {
             OffloadJob::FileCopy(_) => Err(DispatchError::Operation(
                 "コピーは run_staged で走らせる（ツリーの読み直しに UI スレッドの続きが要る）"
                     .into(),
+            )),
+            OffloadJob::LspCompletion(_) => Err(DispatchError::Operation(
+                "補完は run_staged で走らせる（絞り込みと確定に UI スレッドの続きが要る）".into(),
             )),
         }
     }
@@ -4610,6 +4917,28 @@ fn dispatch_inner(
                     )]
                 ),
             }))
+        }
+
+        // #1682: 通常は prepare_offload が問い合わせを background へ出す。ここへ来るのは
+        // `TAKO_OFFLOAD=0` か直呼び（テスト）で、同じ 3 段（準備 → 問い合わせ → 着地）を直列に通る
+        Request::LspCompletion {
+            pane,
+            line,
+            column,
+            limit,
+            choice,
+            resolve,
+        } => {
+            let job = lsp_completion_prepare(
+                host,
+                pane,
+                line,
+                column,
+                limit,
+                choice,
+                resolve.unwrap_or(false),
+            )?;
+            lsp_completion_land(host, &job.run())
         }
 
         Request::SetupMcp { scope, pane, agent } => {
@@ -13951,8 +14280,9 @@ pub const LSP_ACTIONS: &[&str] = &["status", "list", "restart", "stop", "logs"];
 
 /// MCP `tako_lsp`（言語機能）の action。CLI は `tako lsp <action>`。
 /// 診断（#1679）と定義ジャンプの 4 種（#1680。綴りの正本は `GotoKind::NAMES`）と
-/// 整形・保存時整形の設定（#1683。綴りは [`LSP_FORMAT_ACTION`] / [`LSP_FORMAT_ON_SAVE_ACTION`]）。
-/// 先頭が MCP の既定。ホバー・補完等のスライスはここへ足す（ツールは増やさない）
+/// 整形・保存時整形の設定（#1683。綴りは [`LSP_FORMAT_ACTION`] / [`LSP_FORMAT_ON_SAVE_ACTION`]）と
+/// 補完（#1682。[`LSP_COMPLETION_ACTION`]）。
+/// 先頭が MCP の既定。ホバー等のスライスはここへ足す（ツールは増やさない）
 pub const LSP_FEATURE_ACTIONS: &[&str] = &[
     "diagnostics",
     tako_core::lsp::goto::GotoKind::NAMES[0],
@@ -13961,6 +14291,7 @@ pub const LSP_FEATURE_ACTIONS: &[&str] = &[
     tako_core::lsp::goto::GotoKind::NAMES[3],
     LSP_FORMAT_ACTION,
     LSP_FORMAT_ON_SAVE_ACTION,
+    LSP_COMPLETION_ACTION,
 ];
 
 /// 整形の action（#1683。CLI は `tako lsp format`）
@@ -13968,6 +14299,9 @@ pub const LSP_FORMAT_ACTION: &str = "format";
 
 /// 保存時整形の設定の action（#1683。CLI は `tako lsp format-on-save`）
 pub const LSP_FORMAT_ON_SAVE_ACTION: &str = "format-on-save";
+
+/// 補完（#1682）の action の綴り
+pub const LSP_COMPLETION_ACTION: &str = "completion";
 
 /// 言語サーバの操作の 1 実装（#1678）。CLI・MCP・同期実行・offload のすべてがここを通る。
 ///
@@ -18322,6 +18656,23 @@ mod tests {
             state.1 = true;
             Ok(())
         }
+        /// #1682: 本物の `TextBuffer::replace_position_ranges`（undo 1 回で戻る 1 操作）を通す
+        fn edit_preview_ranges(
+            &mut self,
+            pane: PaneId,
+            edits: &[tako_core::text_edit::RangeEdit],
+            primary: usize,
+            expected_version: Option<u64>,
+        ) -> Result<(), String> {
+            self.set_preview_editing(pane, true)?;
+            let state = self.preview_edits.get_mut(&pane.as_u64()).unwrap();
+            state
+                .2
+                .replace_position_ranges(edits, primary, expected_version)
+                .map_err(|e| e.to_string())?;
+            state.1 = true;
+            Ok(())
+        }
         fn set_preview_cursor(
             &mut self,
             pane: PaneId,
@@ -21155,6 +21506,296 @@ mod tests {
                     .collect(),
             })),
         }
+    }
+
+    // --- #1682: 補完の着地（絞り込み・件数の上限・確定）-----------------------------
+
+    /// 候補 1 つ（tako の座標。始点は `start`、本文は `label` と同じ）
+    fn completion_item(
+        label: &str,
+        start: tako_core::lsp::completion::At,
+    ) -> tako_core::lsp::completion::CompletionItem {
+        tako_core::lsp::completion::CompletionItem {
+            label: label.into(),
+            kind: Some(6),
+            detail: None,
+            documentation: None,
+            filter_text: None,
+            sort_text: None,
+            preselect: false,
+            deprecated: false,
+            insert_text: label.into(),
+            start,
+            tail: 0,
+            additional: Vec::new(),
+            raw: Value::Null,
+        }
+    }
+
+    /// 背景の問い合わせを経た答え（`LspCompletionJob::run` の出力）を組む
+    #[allow(clippy::too_many_arguments)]
+    fn completion_landing(
+        pane: u64,
+        path: &std::path::Path,
+        items: Vec<tako_core::lsp::completion::CompletionItem>,
+        cursor: tako_core::lsp::completion::At,
+        line_text: &str,
+        limit: usize,
+        choice: Option<usize>,
+        version: Option<u64>,
+    ) -> LspCompletionLanding {
+        LspCompletionLanding {
+            source_pane: PaneId::from_raw(pane),
+            source_path: path.display().to_string(),
+            line: cursor.line + 1,
+            column: cursor.col,
+            limit,
+            choice,
+            version,
+            answer: Some(Ok(crate::lsp::CompletionAnswer {
+                server: "fake",
+                items,
+                is_incomplete: false,
+                dropped: 0,
+                cursor,
+                line_text: line_text.into(),
+                resolvable: false,
+            })),
+        }
+    }
+
+    /// 受け入れ条件: `--limit 20` が候補を 20 件へ切り、切った件数を応答に含める
+    #[test]
+    fn 補完の_limit_は件数を切って切った件数を返す() {
+        use tako_core::lsp::completion::At;
+        let dir = jump_fixture("completion-limit", &["main.rs"]);
+        let main = dir.join("main.rs");
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let pane = jump_open(&mut host, root, &main, None, Some(Direction::Right))["pane"]
+            .as_u64()
+            .unwrap();
+        // 1000 件（語の頭は桁 4・カーソルは桁 4 = 問い合わせは空 = 全部が合う）
+        let items: Vec<_> = (0..1000)
+            .map(|i| completion_item(&format!("cand{i:04}"), At::new(0, 4)))
+            .collect();
+        let landing = completion_landing(pane, &main, items, At::new(0, 4), "    ", 20, None, None);
+        let out = lsp_completion_land(&mut host, &landing).unwrap();
+        assert_eq!(out["status"], json!("found"));
+        assert_eq!(out["total"], json!(1000));
+        assert_eq!(out["shown"], json!(20));
+        assert_eq!(out["truncated"], json!(980));
+        let items = out["items"].as_array().unwrap();
+        assert_eq!(items.len(), 20);
+        assert_eq!(items[0]["number"], json!(1));
+        assert_eq!(items[0]["label"], json!("cand0000"));
+        assert_eq!(items[19]["number"], json!(20));
+        assert!(out["next_step"].as_str().unwrap().contains("1000"));
+        // 上限以下なら切らない（next_step も無い）
+        let few: Vec<_> = (0..3)
+            .map(|i| completion_item(&format!("c{i}"), At::new(0, 4)))
+            .collect();
+        let out = lsp_completion_land(
+            &mut host,
+            &completion_landing(pane, &main, few, At::new(0, 4), "    ", 20, None, None),
+        )
+        .unwrap();
+        assert_eq!(
+            (out["shown"].clone(), out["truncated"].clone()),
+            (json!(3), json!(0))
+        );
+        assert!(out.get("next_step").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 受け入れ条件（確定）: `choice` は絞り込み後の番号の候補で確定し、自動 import も同じ
+    /// 1 回の操作で入る = undo 1 回で両方戻る。GUI の Enter と同じ `lsp_completion_apply` を通る
+    #[test]
+    fn 補完の_choice_は確定して_undo_1_回で戻る() {
+        use tako_core::lsp::completion::{At, Edit};
+        let dir = jump_fixture("completion-choice", &[]);
+        let main = dir.join("main.rs");
+        let original = "fn main() {\n    let m = Has\n}\n";
+        std::fs::write(&main, original).unwrap();
+        // host は開いたファイルを実パスで持つ（macOS の /var → /private/var）
+        let main = tako_core::platform::path::canonicalize(&main).unwrap();
+        let mut host = MockHost::new();
+        host.preview_real_files = true;
+        let root = host.root_pane();
+        let pane = jump_open(&mut host, root, &main, None, Some(Direction::Right))["pane"]
+            .as_u64()
+            .unwrap();
+        dispatch(
+            &mut host,
+            Request::PreviewEdit {
+                pane: Some(pane),
+                enabled: Some(true),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let version = host.preview_edits[&pane].2.version();
+        let cursor = At::new(1, 15);
+        let mut map = completion_item("HashMap", At::new(1, 12));
+        map.additional = vec![Edit {
+            start: At::new(0, 0),
+            end: At::new(0, 0),
+            text: "use std::collections::HashMap;\n".into(),
+        }];
+        let set = completion_item("HashSet", At::new(1, 12));
+        let other = completion_item("String", At::new(1, 12));
+        let line = "    let m = Has";
+        // 絞り込み後の並びは HashMap / HashSet（String は合わない）→ 2 番目は HashSet
+        let out_of_range = lsp_completion_land(
+            &mut host,
+            &completion_landing(
+                pane,
+                &main,
+                vec![map.clone(), set.clone(), other.clone()],
+                cursor,
+                line,
+                50,
+                Some(3),
+                Some(version),
+            ),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(out_of_range.contains("2 件"), "{out_of_range}");
+        // 版が違えば入れない（問い合わせのあいだに打った）
+        let stale = lsp_completion_land(
+            &mut host,
+            &completion_landing(
+                pane,
+                &main,
+                vec![map.clone(), set.clone()],
+                cursor,
+                line,
+                50,
+                Some(1),
+                Some(version + 7),
+            ),
+        )
+        .unwrap();
+        assert_eq!(stale["status"], json!("edited"));
+        assert_eq!(host.preview_edits[&pane].2.text(), original);
+        let applied = lsp_completion_land(
+            &mut host,
+            &completion_landing(
+                pane,
+                &main,
+                vec![map, set, other],
+                cursor,
+                line,
+                50,
+                Some(1),
+                Some(version),
+            ),
+        )
+        .unwrap();
+        assert_eq!(applied["status"], json!("applied"));
+        assert_eq!(applied["chosen"], json!(1));
+        assert_eq!(applied["item"]["label"], json!("HashMap"));
+        assert_eq!(applied["edit"]["additional_edits"], json!(1));
+        let done = "use std::collections::HashMap;\nfn main() {\n    let m = HashMap\n}\n";
+        assert_eq!(host.preview_edits[&pane].2.text(), done);
+        dispatch(
+            &mut host,
+            Request::PreviewUndo { pane: Some(pane) },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(
+            host.preview_edits[&pane].2.text(),
+            original,
+            "undo 1 回で両方戻る"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// GUI で一覧を出したまま打ち足した（答えの後に本文が変わった）ときは、置き換えの始点より
+    /// 後ろの追加の編集を入れない（位置が打ち足した分ずれている）。始点より手前は入れる
+    #[test]
+    fn 打ち足した後の確定は始点より後ろの追加の編集を入れない() {
+        use tako_core::lsp::completion::{At, Edit};
+        let dir = jump_fixture("completion-typed", &[]);
+        let main = dir.join("main.rs");
+        std::fs::write(&main, "x\nlet v = Hash;\n").unwrap();
+        let mut host = MockHost::new();
+        host.preview_real_files = true;
+        let root = host.root_pane();
+        let pane = jump_open(&mut host, root, &main, None, Some(Direction::Right))["pane"]
+            .as_u64()
+            .unwrap();
+        let mut item = completion_item("HashMap", At::new(1, 8));
+        item.additional = vec![
+            Edit {
+                start: At::new(0, 0),
+                end: At::new(0, 1),
+                text: "y".into(),
+            },
+            Edit {
+                start: At::new(1, 13),
+                end: At::new(1, 14),
+                text: "!".into(),
+            },
+        ];
+        // `Has` まで打った時点の答えを、`Hash` まで打った後（カーソル桁 12）に確定する
+        let out = lsp_completion_apply(
+            &mut host,
+            PaneId::from_raw(pane),
+            &item,
+            At::new(1, 12),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(out["additional_edits"], json!(1));
+        assert_eq!(out["skipped_additional_edits"], json!(1));
+        assert_eq!(host.preview_edits[&pane].2.text(), "y\nlet v = HashMap;\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 候補が 0 件・失敗は `status` と理由で返す（失敗にしない）
+    #[test]
+    fn 補完の候補なしと失敗は理由つきの答え() {
+        use tako_core::lsp::completion::At;
+        let dir = jump_fixture("completion-none", &["main.rs"]);
+        let main = dir.join("main.rs");
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let pane = jump_open(&mut host, root, &main, None, Some(Direction::Right))["pane"]
+            .as_u64()
+            .unwrap();
+        // 語 `zz` に合う候補が無い
+        let none = lsp_completion_land(
+            &mut host,
+            &completion_landing(
+                pane,
+                &main,
+                vec![completion_item("abc", At::new(0, 0))],
+                At::new(0, 2),
+                "zz",
+                50,
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        assert_eq!(none["status"], json!("none"));
+        assert_eq!(
+            none["reason"],
+            json!(crate::lsp::text::COMPLETION_NONE_REASON.text())
+        );
+        let mut failed = completion_landing(pane, &main, vec![], At::new(0, 0), "", 50, None, None);
+        failed.answer = Some(Err(crate::lsp::CompletionError::Query(
+            crate::lsp::GotoError::NoServer,
+        )));
+        let out = lsp_completion_land(&mut host, &failed).unwrap();
+        assert_eq!(out["status"], json!("no-server"));
+        assert_eq!(out["action"], json!("completion"));
+        assert_eq!(out["from"]["pane"], json!(pane));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// FR-3.31 / #1680 の着地の規則: 別のファイル = 新しいペイン / 同じ定義へ 2 回 = 使い回す /

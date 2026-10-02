@@ -308,7 +308,7 @@ fn 行桁の解決は丸めない() {
 
 /// 本文を変える公開 API（版が進むべきもの）。[`本文を変える公開apiはすべて版を進める`] が
 /// 挙動で確かめ、[`textbufferの書き換え口は棚卸し済み`] が取りこぼしを見る
-const MUTATES_TEXT: [&str; 18] = [
+const MUTATES_TEXT: [&str; 19] = [
     "set_text",
     // 整形の答え（書き換えの組）をまとめて 1 回で当てる（#1683。版は 1 つだけ進む）
     "apply_changes",
@@ -332,6 +332,8 @@ const MUTATES_TEXT: [&str; 18] = [
     // カーソル以降の最初を 1 件置換（#1653。検索欄の Enter と `tako edit replace`）
     "replace_next",
     "replace_position_range",
+    // 複数の範囲を 1 回の操作で置き換える（#1682。補完の確定 = 本文 + 自動 import）
+    "replace_position_ranges",
 ];
 
 /// 本文を変えない `&mut self` の公開 API（版は進まないのが正しい）。
@@ -455,6 +457,22 @@ fn 本文を変える公開apiはすべて版を進める() {
                     None,
                 )
                 .expect("1 バイト目は当たる");
+            }),
+        ),
+        (
+            "replace_position_ranges",
+            Box::new(|b: &mut TextBuffer| {
+                b.replace_position_ranges(
+                    &[RangeEdit {
+                        start: TextPosition::new(1, 0),
+                        end: TextPosition::new(1, 1),
+                        text: "R".into(),
+                        expected_version: None,
+                    }],
+                    0,
+                    None,
+                )
+                .expect("1 行目の 1 バイト目は解ける");
             }),
         ),
         (
