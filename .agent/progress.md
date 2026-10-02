@@ -20,14 +20,6 @@
 
 ---
 
-## 2026-09-27（#1832 / #1814 / #1827: 偽の FAILED になるテスト 3 本と Windows の未使用警告を直した）
-- tailscale のスタブは作った直後の起動が負荷で 1 秒を超えていた（54 回中 24 回）→ 終わるスタブは終わるまで待つ。`depsの外でも明示…` は子が出力ゼロで死ぬ形（原因は未確定）→ その回だけ上限 3 回で起こし直し終了状態を残す。`issue1724_…` は端末 ID の印の行だけ数える
-- 実測: 注入 A/B（上限 1ms / 最初の子を SIGKILL）before 10/10 FAIL → after 0/10・data dir 使い回し 3 回緑・check-windows warning 31 → 28・workspace 6074 passed 0 failed
-
-## 2026-09-28（#1772: ⌘+ / ⌘- / ⌘0 をコードプレビュー（エディタ）と md の本文に効かせた）
-- ペインの文字サイズ（`pane_font_sizes`）は 13 → 16 に動くのに、本文はルートの `theme.font_size` を継承していた。本文の器 `preview-scroll` で `.text_size` + `.line_height(φ)` を継承側に指定し、md の基準・コピーボタン・行高の見積もり・仮想リストの `remeasure` を `preview_body_font_size` の 1 実装へ寄せた。#611 は行ピッチ（φ = 21px）を保ち、継承側で指定する半分だけ入れた
-- 実測（tako-vd）: `scripts/test-editor-font-1772.sh` 新 = 11 相緑（行 21 → 26px・可視 30 → 24 行・帯 158×21 → 194×26px・md 22 → 27px・10 万行末尾）/ `TAKO_1772_LEGACY=1` = 名指し FAILED、CLI 30 → 24 → 30 行・MCP 24 行（main v0.8.23 は 30 → 30）・番犬 6 規則へ注入 8 通りすべて file:line で FAILED
-
 ## 2026-09-28（#1834: ファイルツリーの D&D でファイル・フォルダを別のフォルダへ移せるようにした）
 - 判定・実行・付け替え先は `tako_core::file_move` の 1 実装 → dispatch `FileOp{op: move, dest}` → CLI `tako file move` / MCP `tako_file_op` の `op=move`（ツールは増やさない）。同名・自分の配下・別のボリューム（EXDEV）は理由つきで断る。開いているペインはパス・バッファ・LSP（didClose → didOpen）・監視ごと付け替わり #1659 の削除扱いにならない
 - 仕上げで、大文字小文字を変えて名指すと付け替えと配下の判定が外れる穴（macOS の APFS / Windows。`from_real` の最後の成分が綴りのまま）を実測で再現して直した（リンク以外は移す元ごと canonicalize）。番犬「移動の実行はdispatchの1か所だけ」が Windows の区切り（`display()` の字面を `/` の定数と比較）で dispatch 自身を違反に数えていたのも直した
@@ -72,3 +64,7 @@
 ## 2026-10-02（#1860: ファイルツリーでファイル・フォルダのコピー / 切り取り / 貼り付けをできるようにした）
 - ⌘C / ⌘X / ⌘V（Windows は Ctrl）と右クリックの 3 項目。コピーは `tako_core::file_copy`（Finder 式の別名・排他作成で上書き 0・失敗は作った分だけ戻す・リンクはリンク）、切り取りの貼り付けは #1834 の `run_file_move`、貼り付け先と中身の選び方は `file_clipboard`。OS のクリップボードは境界 B28（NSPasteboard / CF_HDROP）。dispatch `FileOp` の copy / clipboard_* / paste → `tako file copy|clipboard|paste` / MCP `tako_file_op`（+709 B）。2 秒ポーリングが古い一覧で貼ったものを消す競合も直した
 - 実測: `scripts/test-tree-clipboard-1860.sh` 48 PASS 0 FAIL（実マウス・実キー 7 場面・A/B `TAKO_1860_LEGACY=1` で FAILED・CLI/MCP 字面一致 13 組・一般のペーストボード往復は保存して戻す）・番犬 18 本（注入 9 通り file:line 名指し）
+
+## 2026-10-02（#1682: LSP 補完（予測変換）= 打鍵中の一覧・仮想化・キーの優先順位・CLI / MCP）
+- core `lsp::completion`（読み取り・rank・truncate・route_key 20 通り・Session）+ `replace_position_ranges`（並べ方・重なり・最小化は #1683 の `order_changes`、当て方は離れた範囲をつないだ差分 = undo 1 回で範囲の外を抱えない）→ manager の取り消しの列（`$/cancelRequest`）・resolve・一時 didOpen は持ち手で加わる → dispatch 3 段 + `lsp_completion_apply` → CLI `tako lsp completion` / MCP `tako_lsp` の `action=completion` → GUI `lsp_completion_ui`（`gpui::list`）
+- 実測: `scripts/test-lsp-completion-1682.sh` 22 PASS（1000 件で組む行 10・基準画像との差分は一覧の中だけ・A/B 2 通りで FAILED・実の rust-analyzer で `s.le` → len）・e2e 8 本・注入 6 通りで名指しの FAILED

@@ -880,6 +880,19 @@ pub trait PreviewHost {
     ) -> Result<(), String> {
         Err("プレビュー編集は未対応".into())
     }
+    /// 行・桁で指定した**複数の範囲**を 1 回の操作として置き換える（#1682。補完の確定 =
+    /// 本文 + 自動 import）。undo 1 回で全部戻る。編集モードでなければ始める（範囲編集と同じ）。
+    /// 解けない指定・範囲の重なり・版違いは本文を触らずに失敗する
+    /// （`tako_core::text_edit::TextBuffer::replace_position_ranges`）
+    fn edit_preview_ranges(
+        &mut self,
+        _pane: PaneId,
+        _edits: &[tako_core::text_edit::RangeEdit],
+        _primary: usize,
+        _expected_version: Option<u64>,
+    ) -> Result<(), String> {
+        Err("プレビュー編集は未対応".into())
+    }
     /// 編集カーソルと選択の設定（#1658）。本文は変えない
     fn set_preview_cursor(
         &mut self,

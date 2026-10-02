@@ -551,6 +551,9 @@ struct EditDelta {
     kind: EditKind,
     /// この塊に最後に足した時刻（まとめの判定用。[`TextBuffer::now_millis`] の刻み）
     at_millis: u64,
+    /// 直前の差分と**一緒に戻す**（複数の範囲を 1 回で置き換えた操作の 2 つ目以降。#1682）。
+    /// undo は `false` の差分に当たるまで戻し、redo は次の差分が `true` の間やり直す
+    chained: bool,
 }
 
 impl EditDelta {
@@ -740,6 +743,13 @@ pub enum RangeEditError {
     },
     #[error("文書の版が違う（指定 {expected} / 現在 {actual}）")]
     VersionMismatch { expected: u64, actual: u64 },
+    /// 複数の範囲を 1 回で置き換える指示（#1682）が当てられない（範囲どうしの重なり等）。
+    /// 並べ方と重なりの決めは整形と同じ [`order_changes`] の 1 実装（番号は渡した配列の 1 始まり）
+    #[error(transparent)]
+    Changes(#[from] ChangesError),
+    /// 複数の範囲を 1 回で置き換える指示（#1682）が空か、カーソルを置く範囲の番号が外
+    #[error("置き換える範囲が無いか、カーソルを置く範囲の番号 {primary} が外（{count} 件）")]
+    NoPrimaryRange { primary: usize, count: usize },
 }
 
 /// 本文の 1 か所の書き換え（#1683）。範囲は**書き換える前の本文**のバイト位置。
@@ -1545,6 +1555,7 @@ impl TextBuffer {
             line_ending_after,
             kind,
             at_millis,
+            chained: false,
         };
         self.cursor = cursor;
         self.anchor = anchor;
@@ -1648,7 +1659,8 @@ impl TextBuffer {
 
     /// undo できる回数（= 塊の数。#1651）。`hello` を 1 塊で打てば 1
     pub fn undo_depth(&self) -> usize {
-        self.undo_stack.len()
+        // つながった差分（#1682 の複数範囲の 1 操作）は 1 回の undo で戻るので 1 つに数える
+        self.undo_stack.iter().filter(|d| !d.chained).count()
     }
 
     /// 上限（操作数 / バイト数）を超えたぶんを古い側から捨てる（#1651）。
@@ -1666,39 +1678,57 @@ impl TextBuffer {
             };
             total = total.saturating_sub(dropped.bytes());
         }
+        // 1 操作の途中で捨てたら、残った先頭は「その操作の始まり」として扱う（#1682。
+        // つながったままだと undo がそれより前の差分まで巻き込もうとする）
+        if let Some(front) = self.undo_stack.front_mut() {
+            front.chained = false;
+        }
     }
 
     pub fn undo(&mut self) -> bool {
-        let Some(delta) = self.undo_stack.pop_back() else {
+        if self.undo_stack.is_empty() {
             return false;
-        };
+        }
         // 本文が変わるので版は**戻らずに進む**（#1658）。「元へ戻す」も 1 つの変更で、
         // 版を戻すと「別の中身なのに同じ版」が生まれて楽観ロックが効かなくなる
         self.bump_version();
-        let end = delta.start + delta.after.len();
-        self.splice_line_starts(delta.start..end, &delta.before);
-        self.text.replace_range(delta.start..end, &delta.before);
-        self.cursor = delta.cursor_before;
-        self.anchor = delta.anchor_before;
-        self.line_ending = delta.line_ending_before;
-        self.redo_stack.push(delta);
+        // つながった差分（#1682 の複数範囲の 1 操作）は先頭の 1 つまでまとめて戻す
+        while let Some(delta) = self.undo_stack.pop_back() {
+            let end = delta.start + delta.after.len();
+            self.splice_line_starts(delta.start..end, &delta.before);
+            self.text.replace_range(delta.start..end, &delta.before);
+            self.cursor = delta.cursor_before;
+            self.anchor = delta.anchor_before;
+            self.line_ending = delta.line_ending_before;
+            let chained = delta.chained;
+            self.redo_stack.push(delta);
+            if !chained {
+                break;
+            }
+        }
         self.seal_undo_group();
         self.goal_column = None;
         true
     }
 
     pub fn redo(&mut self) -> bool {
-        let Some(delta) = self.redo_stack.pop() else {
+        if self.redo_stack.is_empty() {
             return false;
-        };
+        }
         self.bump_version();
-        let end = delta.start + delta.before.len();
-        self.splice_line_starts(delta.start..end, &delta.after);
-        self.text.replace_range(delta.start..end, &delta.after);
-        self.cursor = delta.cursor_after;
-        self.anchor = delta.anchor_after;
-        self.line_ending = delta.line_ending_after;
-        self.undo_stack.push_back(delta);
+        // 先頭の 1 つをやり直し、続きがつながっている（#1682）間は続けてやり直す
+        while let Some(delta) = self.redo_stack.pop() {
+            let end = delta.start + delta.before.len();
+            self.splice_line_starts(delta.start..end, &delta.after);
+            self.text.replace_range(delta.start..end, &delta.after);
+            self.cursor = delta.cursor_after;
+            self.anchor = delta.anchor_after;
+            self.line_ending = delta.line_ending_after;
+            self.undo_stack.push_back(delta);
+            if !self.redo_stack.last().is_some_and(|next| next.chained) {
+                break;
+            }
+        }
         self.seal_undo_group();
         self.goal_column = None;
         true
@@ -2132,6 +2162,94 @@ impl TextBuffer {
         Ok(AppliedChanges {
             changes: ordered.len(),
         })
+    }
+
+    /// 行・桁で指定した**複数の範囲**を 1 回の操作として置き換える（#1682。補完の確定 =
+    /// 本文の差し替え + 自動 import の 1 行）。
+    ///
+    /// 検査（版・各位置・逆転・`primary` の番号）と、並べ方・重なり・最小化（整形と同じ
+    /// [`order_changes`] の 1 実装 = 同じ位置への挿入は渡した順に並ぶ）を**すべて先に**済ませ、
+    /// 通らなければ本文を触らずにエラーを返す。範囲は後ろから当てるので、前の範囲の位置は
+    /// 当てるまで変わらない。カーソルは `primary` 番目の範囲へ入れた本文の末尾（前にある範囲の
+    /// 伸び縮みを足した位置）。**undo 1 回で全部戻り、redo 1 回で全部やり直す**
+    /// （離れた範囲は別々の差分をつないで持つ = [`Self::apply_changes`] と違い、あいだの本文を
+    /// undo へ載せない）。各範囲の `expected_version` は見ない（版は `expected_version` 引数で見る）
+    pub fn replace_position_ranges(
+        &mut self,
+        edits: &[RangeEdit],
+        primary: usize,
+        expected_version: Option<u64>,
+    ) -> Result<(), RangeEditError> {
+        self.check_version(expected_version)?;
+        if primary >= edits.len() {
+            return Err(RangeEditError::NoPrimaryRange {
+                primary,
+                count: edits.len(),
+            });
+        }
+        let mut changes = Vec::with_capacity(edits.len());
+        for edit in edits {
+            let start = self.resolve_position(edit.start)?;
+            let end = self.resolve_position(edit.end)?;
+            if end < start {
+                return Err(RangeEditError::InvertedRange {
+                    start_line: edit.start.line,
+                    start_column: edit.start.column,
+                    end_line: edit.end.line,
+                    end_column: edit.end.column,
+                });
+            }
+            changes.push(TextChange {
+                range: start..end,
+                text: normalize_line_endings(&edit.text, self.line_ending).into_owned(),
+            });
+        }
+        // 最後のカーソル: 当てる順で `primary` より前に来る書き換えの伸び縮み + `primary` の始点 +
+        // 入れた本文。**最小化の前の組で数える**（最小化しても当てた後の本文は同じ）。並びの鍵は
+        // `order_changes` と同じ（始まり → 終わりの安定ソート）
+        let mut order: Vec<usize> = (0..changes.len()).collect();
+        order.sort_by_key(|&i| (changes[i].range.start, changes[i].range.end));
+        let at = order.iter().position(|&i| i == primary).unwrap_or(0);
+        let mut cursor = changes[primary].range.start + changes[primary].text.len();
+        for &i in &order[..at] {
+            // 前に来る書き換えは互いに重ならず `primary` の始点より手前で終わる = 引いても負にならない
+            cursor = cursor + changes[i].text.len() - changes[i].range.len();
+        }
+        // 並べ方・重なり・最小化は整形と同じ 1 実装（#1683）。当て方だけが違う: 整形は
+        // 「最初の始まり〜最後の終わり」を 1 か所の置き換えにするが、補完は離れた範囲（先頭の自動
+        // import と下の方の語）を**別々の差分**のまま当ててつなぐ。1 か所にすると、あいだの本文が
+        // まるごと undo へ載る（10 MB の文書なら 1 回で undo の予算を超えて履歴が消える）
+        let ordered = order_changes(&self.text, changes)?;
+        // 直前の打鍵の塊へ足さない（この操作は 1 回で閉じる）
+        self.seal_undo_group();
+        if ordered.is_empty() {
+            // 入れる本文が今と同じ（打ち切った語と同じ候補）: 本文は変えずカーソルだけ語の末尾へ
+            self.set_cursor(cursor, false);
+            return Ok(());
+        }
+        for (n, change) in ordered.iter().rev().enumerate() {
+            let last = n + 1 == ordered.len();
+            self.apply_edit(Edit {
+                range: change.range.clone(),
+                replacement: &change.text,
+                // 途中の差分のカーソルは当てた範囲の末尾（redo の途中経過）。最後の 1 つが最終位置
+                cursor: if last {
+                    cursor
+                } else {
+                    change.range.start + change.text.len()
+                },
+                anchor: None,
+                kind: EditKind::Replace,
+                line_ending: None,
+            });
+            if n > 0 {
+                if let Some(delta) = self.undo_stack.back_mut() {
+                    delta.chained = true;
+                }
+            }
+        }
+        self.seal_undo_group();
+        Ok(())
     }
 
     /// カーソルと選択を行・桁で置く（#1658）。**本文は変えない**ので版も進まない
@@ -6037,5 +6155,140 @@ mod tests {
         b.apply_changes(vec![change(0..2, "日本")], None).unwrap();
         assert!(b.text().is_char_boundary(b.cursor()));
         assert_eq!(b.cursor(), 0);
+    }
+
+    // --- #1682: 複数の範囲を 1 回の操作で置き換える（補完の確定 = 本文 + 自動 import）-----
+
+    // `pos` / `range_edit` は #1658 の節の補助関数を使う
+
+    #[test]
+    fn 複数の範囲の置き換えは_undo_1_回で戻り_redo_1_回でやり直す() {
+        let original = "fn main() {\n    let m = Has\n}\n";
+        let mut b = TextBuffer::from_text(PathBuf::from("/tmp/x.rs"), original.into());
+        b.set_cursor(original.find("Has").unwrap() + 3, false);
+        let depth = b.undo_depth();
+        let version = b.version();
+        b.replace_position_ranges(
+            &[
+                // 本文（primary）: `Has` → `HashMap`
+                range_edit(pos(2, 12), pos(2, 15), "HashMap"),
+                // 自動 import: 先頭へ 1 行
+                range_edit(pos(1, 0), pos(1, 0), "use std::collections::HashMap;\n"),
+            ],
+            0,
+            Some(version),
+        )
+        .unwrap();
+        let done = "use std::collections::HashMap;\nfn main() {\n    let m = HashMap\n}\n";
+        assert_eq!(b.text(), done);
+        // カーソルは本文の末尾（先頭に足した 1 行ぶん後ろへずれた位置）
+        assert_eq!(b.cursor_position(), pos(3, 19));
+        assert_eq!(b.undo_depth(), depth + 1, "1 回の操作として積む");
+        assert!(b.version() > version);
+        assert!(b.undo());
+        assert_eq!(b.text(), original, "undo 1 回で両方戻る");
+        assert_eq!(b.cursor_position(), pos(2, 15));
+        assert!(b.redo());
+        assert_eq!(b.text(), done, "redo 1 回で両方やり直す");
+        assert_eq!(b.cursor_position(), pos(3, 19));
+        assert!(b.undo());
+        assert_eq!(b.undo_depth(), depth);
+    }
+
+    #[test]
+    fn 複数の範囲の置き換えは前の打鍵と別の操作になる() {
+        let mut b = TextBuffer::from_text(PathBuf::from("/tmp/x.rs"), "x\n".into());
+        b.set_cursor(1, false);
+        b.insert("y");
+        b.insert("z");
+        b.replace_position_ranges(&[range_edit(pos(1, 1), pos(1, 3), "_done")], 0, None)
+            .unwrap();
+        assert_eq!(b.text(), "x_done\n");
+        assert!(b.undo());
+        assert_eq!(b.text(), "xyz\n", "1 回目の undo は置き換えだけ");
+        assert!(b.undo());
+        assert_eq!(b.text(), "x\n", "2 回目で打鍵の塊");
+        assert!(!b.undo());
+        assert!(b.redo());
+        assert!(b.redo());
+        assert_eq!(b.text(), "x_done\n");
+    }
+
+    #[test]
+    fn 重なる範囲や番号の外は本文を触らずに断る() {
+        let mut b = TextBuffer::from_text(PathBuf::from("/tmp/x.rs"), "abcdef\n".into());
+        let version = b.version();
+        let overlap = b.replace_position_ranges(
+            &[
+                range_edit(pos(1, 0), pos(1, 3), "X"),
+                range_edit(pos(1, 2), pos(1, 4), "Y"),
+            ],
+            0,
+            None,
+        );
+        assert!(matches!(
+            overlap,
+            Err(RangeEditError::Changes(ChangesError::Overlap {
+                first: 1,
+                second: 2
+            }))
+        ));
+        let outside = b.replace_position_ranges(&[range_edit(pos(1, 0), pos(1, 1), "X")], 1, None);
+        assert!(matches!(
+            outside,
+            Err(RangeEditError::NoPrimaryRange {
+                primary: 1,
+                count: 1
+            })
+        ));
+        let stale = b.replace_position_ranges(
+            &[range_edit(pos(1, 0), pos(1, 1), "X")],
+            0,
+            Some(version + 1),
+        );
+        assert!(matches!(stale, Err(RangeEditError::VersionMismatch { .. })));
+        let middle = b.replace_position_ranges(&[range_edit(pos(1, 0), pos(2, 3), "X")], 0, None);
+        assert!(middle.is_err(), "範囲外の位置は丸めずに断る");
+        assert_eq!(b.text(), "abcdef\n");
+        assert_eq!(b.version(), version, "断った指示は版を進めない");
+        assert_eq!(b.undo_depth(), 0);
+    }
+
+    /// 同じ位置への挿入は重なりではない（LSP の TextEdit の配列と同じく、渡された順に現れる。
+    /// 自動 import が 2 行同じ位置に来ても確定ごと失敗しない）
+    #[test]
+    fn 同じ位置への挿入は渡された順に並ぶ() {
+        let mut b = TextBuffer::from_text(PathBuf::from("/tmp/x.rs"), "fn f() { H }\n".into());
+        b.replace_position_ranges(
+            &[
+                range_edit(pos(1, 9), pos(1, 10), "HashMap"),
+                range_edit(pos(1, 0), pos(1, 0), "use a;\n"),
+                range_edit(pos(1, 0), pos(1, 0), "use b;\n"),
+            ],
+            0,
+            None,
+        )
+        .unwrap();
+        assert_eq!(b.text(), "use a;\nuse b;\nfn f() { HashMap }\n");
+        assert_eq!(b.cursor_position(), pos(3, 16));
+        assert!(b.undo());
+        assert_eq!(b.text(), "fn f() { H }\n", "undo 1 回で 3 つとも戻る");
+    }
+
+    #[test]
+    fn 隣り合う範囲と後ろの範囲を_primary_にした置き換え() {
+        // 手前の範囲（`ab` → `X`）と、それに接する後ろの範囲（`cd` → `YYY`）。カーソルは後ろの末尾
+        let mut b = TextBuffer::from_text(PathBuf::from("/tmp/x.rs"), "abcdef\n".into());
+        b.replace_position_ranges(
+            &[
+                range_edit(pos(1, 2), pos(1, 4), "YYY"),
+                range_edit(pos(1, 0), pos(1, 2), "X"),
+            ],
+            0,
+            None,
+        )
+        .unwrap();
+        assert_eq!(b.text(), "XYYYef\n");
+        assert_eq!(b.cursor_position(), pos(1, 4));
     }
 }

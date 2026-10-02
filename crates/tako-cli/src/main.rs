@@ -996,6 +996,9 @@ enum LspCommand {
         #[arg(value_parser = ["on", "off"])]
         state: Option<String>,
     },
+    /// その位置の補完候補（GUI の打鍵中の一覧と同じ絞り込みと並び。#1682）。`--choice N` で
+    /// N 番目の候補で確定する（undo 1 回で戻る）。MCP は `tako_lsp` の action=completion
+    Completion(LspCompletionArgs),
 }
 
 /// `tako lsp format --range` の `行:桁-行:桁` を解く（#1683。行:桁は [`parse_position`]）
@@ -1011,6 +1014,33 @@ fn parse_line_col_range(text: &str) -> Result<tako_control::protocol::LineColRan
         end_line,
         end_col,
     })
+}
+
+/// `tako lsp completion` の引数（#1682）。位置は `tako edit replace-range` と同じ
+/// （行 1 始まり・桁 0 始まりの行内 UTF-8 バイト。応答の範囲もこの形）
+#[derive(clap::Args)]
+struct LspCompletionArgs {
+    /// コードプレビューのペイン ID（省略時は呼び出し元）
+    #[arg(long)]
+    pane: Option<u64>,
+    /// 行（1 始まり）
+    #[arg(long)]
+    line: usize,
+    /// 桁（0 始まりの行内 UTF-8 バイト。文字の途中は拒否）
+    #[arg(long)]
+    column: usize,
+    /// 返す件数（既定 50。切った件数は応答の truncated）
+    #[arg(long)]
+    limit: Option<usize>,
+    /// N 番目（1 始まり。件数の上限に関わらず全体の並びの番号）の候補で確定する
+    #[arg(long)]
+    choice: Option<usize>,
+    /// 返す候補の説明を言語サーバに補ってもらう（completionItem/resolve）
+    #[arg(long)]
+    resolve: bool,
+    /// JSON のまま出す
+    #[arg(long)]
+    json: bool,
 }
 
 /// `tako lsp definition` 等の引数（#1680）。位置は `tako edit replace-range` と同じ
@@ -1083,6 +1113,14 @@ impl LspCommand {
             Self::FormatOnSave { state } => Request::LspFormatOnSave {
                 enabled: state.as_deref().map(|s| s == "on"),
             },
+            Self::Completion(args) => Request::LspCompletion {
+                pane: target_pane(args.pane)?,
+                line: args.line,
+                column: args.column,
+                limit: args.limit,
+                choice: args.choice,
+                resolve: args.resolve.then_some(true),
+            },
         })
     }
 
@@ -1108,6 +1146,7 @@ impl LspCommand {
             | Self::Declaration(args)
             | Self::TypeDefinition(args)
             | Self::Implementation(args) => args.json,
+            Self::Completion(args) => args.json,
             _ => false,
         }
     }
@@ -9945,6 +9984,12 @@ fn print_lsp(sub: &LspCommand, result: &Value) {
         }
         return;
     }
+    if !sub.json() && matches!(sub, LspCommand::Completion(_)) {
+        for line in lsp_completion_lines(result) {
+            println!("{line}");
+        }
+        return;
+    }
     if sub.json()
         || !matches!(
             sub,
@@ -10107,6 +10152,49 @@ fn lsp_goto_lines(result: &Value) -> Vec<String> {
     }
     if let Some(landing) = result["landing"].as_str() {
         out.push(format!("  {landing} (pane {})", result["open"]["pane"]));
+    }
+    for key in ["reason", "next_step", "install_command"] {
+        if let Some(line) = result[key].as_str() {
+            out.push(format!("  {line}"));
+        }
+    }
+    out
+}
+
+/// `tako lsp completion` の人向けの体裁（#1682）。中身の正本は dispatch の応答。
+///
+/// 1 行目は `status`（found / applied / none / not-installed …）と件数。候補は
+/// `番号  label  種類  detail` を 1 行ずつ。確定したら入れた本文。理由と次の一手は字下げして続ける
+fn lsp_completion_lines(result: &Value) -> Vec<String> {
+    let text = |v: &Value| v.as_str().unwrap_or("").to_string();
+    let mut head = text(&result["status"]);
+    if let Some(total) = result["total"].as_u64() {
+        head.push_str(&format!(" total={total}"));
+        if let Some(shown) = result["shown"].as_u64() {
+            head.push_str(&format!(
+                " shown={shown} truncated={}",
+                result["truncated"].as_u64().unwrap_or(0)
+            ));
+        }
+    }
+    let mut out = vec![head];
+    for item in result["items"].as_array().into_iter().flatten() {
+        let mut line = format!(
+            "{:>4}  {}  {}",
+            item["number"].as_u64().unwrap_or(0),
+            text(&item["label"]),
+            item["kind"].as_str().unwrap_or("-")
+        );
+        if let Some(detail) = item["detail"].as_str() {
+            line.push_str(&format!("  {}", detail.lines().next().unwrap_or("")));
+        }
+        out.push(line);
+    }
+    if let Some(inserted) = result["edit"]["inserted"].as_str() {
+        out.push(format!(
+            "  {} (pane {}) +{} edits",
+            inserted, result["from"]["pane"], result["edit"]["additional_edits"]
+        ));
     }
     for key in ["reason", "next_step", "install_command"] {
         if let Some(line) = result[key].as_str() {
@@ -11084,6 +11172,74 @@ mod tests {
         );
         // 綴り違いは clap が弾く（`0 件` に見せない）
         assert!(Cli::try_parse_from(["tako", "lsp", "diagnostics", "--severity", "warn"]).is_err());
+        // #1682: 補完は言語機能の要求（MCP `tako_lsp` の action=completion と同じ要求になる）
+        assert_eq!(
+            build_request(&parse(&[
+                "tako",
+                "lsp",
+                "completion",
+                "--pane",
+                "7",
+                "--line",
+                "3",
+                "--column",
+                "4",
+                "--limit",
+                "20"
+            ]))
+            .unwrap(),
+            Request::LspCompletion {
+                pane: Some(7),
+                line: 3,
+                column: 4,
+                limit: Some(20),
+                choice: None,
+                resolve: None,
+            }
+        );
+        assert_eq!(
+            build_request(&parse(&[
+                "tako",
+                "lsp",
+                "completion",
+                "--pane",
+                "7",
+                "--line",
+                "1",
+                "--column",
+                "0",
+                "--choice",
+                "2",
+                "--resolve"
+            ]))
+            .unwrap(),
+            Request::LspCompletion {
+                pane: Some(7),
+                line: 1,
+                column: 0,
+                limit: None,
+                choice: Some(2),
+                resolve: Some(true),
+            }
+        );
+        assert!(Cli::try_parse_from(["tako", "lsp", "completion", "--pane", "7"]).is_err());
+        let lines = lsp_completion_lines(&serde_json::json!({
+            "status": "found", "total": 980, "shown": 2, "truncated": 978,
+            "items": [
+                {"number": 1, "label": "HashMap", "kind": "struct", "detail": "struct HashMap<K, V>\nmore"},
+                {"number": 2, "label": "hash", "kind": null},
+            ],
+            "next_step": "続き",
+        }));
+        assert_eq!(
+            lines,
+            vec![
+                "found total=980 shown=2 truncated=978",
+                "   1  HashMap  struct  struct HashMap<K, V>",
+                "   2  hash  -",
+                "  続き",
+            ]
+        );
         // 人向けの表示: 見出し（パス・ペイン・重大度ごとの数）→ 1 件 1 行（位置は replace-range の形）
         let lines = lsp_diagnostics_lines(&serde_json::json!({
             "documents": [{

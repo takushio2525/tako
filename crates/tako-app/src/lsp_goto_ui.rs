@@ -198,6 +198,8 @@ impl TakoApp {
                     OffloadContinuation::LspFormat(_) => None,
                     // 定義ジャンプの問い合わせからは来ない（コピーの続き = #1860）
                     OffloadContinuation::FileCopied(_) => None,
+                    // 定義ジャンプの問い合わせからは来ない（#1682 の補完は別の続き）
+                    OffloadContinuation::LspCompletion(_) => None,
                 };
                 self.land_lsp_goto(next, menu, cx);
             }

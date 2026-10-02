@@ -51,6 +51,9 @@ pub enum RpcError {
     QueueFull,
     #[error("サーバがエラーを返した（{}）: {}", .0.code, .0.message)]
     Server(ResponseError),
+    /// こちらから取り消した（#1682。新しい補完の要求に置き換わった・一覧を閉じた）
+    #[error("取り消した（新しい要求に置き換わった）")]
+    Cancelled,
 }
 
 /// サーバからの通知を受ける関数（method, params）
@@ -65,6 +68,15 @@ pub struct Handlers {
 }
 
 type Waiter = SyncSender<Result<Value, RpcError>>;
+
+/// 送ったが答えをまだ受けていない要求 1 つ（[`ServerProcess::send_request`]。#1682）
+pub struct PendingCall {
+    /// 要求の id（[`ServerProcess::cancel_request`] へ渡す）
+    pub id: RequestId,
+    method: String,
+    started: Instant,
+    rx: mpsc::Receiver<Result<Value, RpcError>>,
+}
 
 /// 動いている言語サーバ 1 つ
 pub struct ServerProcess {
@@ -277,6 +289,20 @@ impl ServerProcess {
         params: Value,
         timeout: Duration,
     ) -> Result<Value, RpcError> {
+        let call = self.send_request(method, params, timeout)?;
+        self.wait(call, timeout)
+    }
+
+    /// 要求を送るだけで待たない（#1682）。答えは [`Self::wait`] で受ける。
+    ///
+    /// 補完は打鍵のたびに新しい要求に置き換わるので、待っている途中で
+    /// [`Self::cancel_request`] から取り消せるよう、id を先に呼び手へ渡す
+    pub fn send_request(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<PendingCall, RpcError> {
         if self.has_exited() {
             return Err(RpcError::Disconnected);
         }
@@ -291,6 +317,22 @@ impl ServerProcess {
             self.forget(&id);
             return Err(e);
         }
+        Ok(PendingCall {
+            id,
+            method: method.to_string(),
+            started,
+            rx,
+        })
+    }
+
+    /// 送った要求の答えを待つ（**UI スレッドから呼ばない**）。期限の扱いは [`Self::request`] と同じ
+    pub fn wait(&self, call: PendingCall, timeout: Duration) -> Result<Value, RpcError> {
+        let PendingCall {
+            id,
+            method,
+            started,
+            rx,
+        } = call;
         let outcome = match rx.recv_timeout(timeout) {
             Ok(result) => result,
             Err(RecvTimeoutError::Timeout) => {
@@ -311,7 +353,19 @@ impl ServerProcess {
         outcome
     }
 
-    /// `$/cancelRequest` を送る（#1682 の補完が使う口。S1 ではタイムアウトで使う）
+    /// 送った要求を取り消す（#1682）。まだ答えを待っていれば、待ちの表から外して待ち手へ
+    /// [`RpcError::Cancelled`] を渡し、サーバへ `$/cancelRequest` を送る（遅れて届く答えは
+    /// 表に無いので捨てられる）。答えが既に届いていれば何も送らない。送ったら `true`
+    pub fn cancel_request(&self, id: &RequestId) -> bool {
+        let waiter = self.pending.lock().ok().and_then(|mut t| t.resolve(id));
+        let Some((_, waiter)) = waiter else {
+            return false;
+        };
+        let _ = waiter.try_send(Err(RpcError::Cancelled));
+        self.cancel(id).is_ok()
+    }
+
+    /// `$/cancelRequest` を送る（タイムアウトと [`Self::cancel_request`] が使う）
     pub fn cancel(&self, id: &RequestId) -> Result<(), RpcError> {
         self.notify(
             "$/cancelRequest",
@@ -380,6 +434,7 @@ fn outcome_kind(outcome: &Result<Value, RpcError>) -> String {
         Err(RpcError::Disconnected) => "disconnected".into(),
         Err(RpcError::QueueFull) => "queue_full".into(),
         Err(RpcError::Server(e)) => format!("error={}", e.code),
+        Err(RpcError::Cancelled) => "cancelled".into(),
     }
 }
 

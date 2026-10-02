@@ -25,6 +25,7 @@
 //! | `full-sync` | `normal` と同じだが全文同期（`change: 1`）を申告する |
 //! | `no-format` | 整形の能力（`documentFormattingProvider` / `documentRangeFormattingProvider`）を申告しない（#1683） |
 //! | `no-range-format` | 文書全体の整形だけを申告する（範囲の整形は申告しない。#1683） |
+//! | `no-completion` | 補完の能力（`completionProvider`）を申告しない（#1682） |
 //!
 //! `--diagnostics <file>` か `TAKO_LSP_FAKE_DIAGNOSTICS`（LSP の `Diagnostic` の JSON 配列）を
 //! 渡すと、didOpen と didChange のたびに**その配列をそのまま** publish する（#1679。
@@ -56,6 +57,17 @@
 //! 当たる規則が無い・`result` も `error` も無ければ**既定の整形**: 自分の本文の模型（下記）から
 //! 行末の空白（スペースとタブ）を消す `TextEdit` を作る（範囲の整形は範囲に収まる行末だけ）。
 //! 本文の模型から作るので、tako が送った `didChange` がずれていれば答えもずれる。
+//! 補完（`textDocument/completion` / `completionItem/resolve`。#1682）は `--completion <file>` か
+//! `TAKO_LSP_FAKE_COMPLETION` の JSON オブジェクトで答える（渡さなければ空の一覧）:
+//!
+//! ```json
+//! { "items": [{ "label": "alpha", "kind": 3 }],   // そのまま返す候補
+//!   "generate": 1000,                              // 代わりに cand0000.. を N 件作る
+//!   "incomplete": false,                           // CompletionList.isIncomplete
+//!   "delay_ms": 0,                                 // 答えるまでの待ち（待つ間に $/cancelRequest が来たら -32800 で答える）
+//!   "word_edit": true,                             // 候補ごとにカーソルの直前の語を置き換える textEdit を付ける（自前の本文の模型で数える）
+//!   "resolve_doc": "doc of {label}" }              // resolve で documentation を足す（{label} は候補の label）
+//! ```
 //!
 //! ## 本文の模型（#1769）
 //!
@@ -354,6 +366,55 @@ fn trailing_space_edits(
     edits
 }
 
+/// 補完の候補（#1682。冒頭の説明の `items` / `generate` / `word_edit`）
+fn completion_items(
+    rules: &serde_json::Value,
+    docs: &std::collections::HashMap<String, String>,
+    breaks: Breaks,
+    params: &serde_json::Value,
+) -> serde_json::Value {
+    let mut items: Vec<serde_json::Value> = match rules["generate"].as_u64() {
+        Some(n) => (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "label": format!("cand{i:04}"),
+                    "kind": 6,
+                    "sortText": format!("{i:04}"),
+                    "detail": format!("detail {i}"),
+                })
+            })
+            .collect(),
+        None => rules["items"].as_array().cloned().unwrap_or_default(),
+    };
+    if rules["word_edit"].as_bool() == Some(true) {
+        let uri = params["textDocument"]["uri"].as_str().unwrap_or("");
+        let text = docs.get(uri).cloned().unwrap_or_default();
+        let line = params["position"]["line"].as_u64().unwrap_or(0) as usize;
+        let character = params["position"]["character"].as_u64().unwrap_or(0) as usize;
+        let offset = offset_at(&text, breaks, line, character);
+        let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        let start = text[..offset]
+            .char_indices()
+            .rev()
+            .take_while(|(_, c)| is_word(*c))
+            .last()
+            .map_or(offset, |(i, _)| i);
+        let range = range_json(&text, breaks, start, offset);
+        for item in &mut items {
+            let new_text = item["insertText"]
+                .as_str()
+                .or_else(|| item["label"].as_str())
+                .unwrap_or("")
+                .to_string();
+            item["textEdit"] = serde_json::json!({ "range": range, "newText": new_text });
+        }
+    }
+    serde_json::json!({
+        "isIncomplete": rules["incomplete"].as_bool().unwrap_or(false),
+        "items": items,
+    })
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let scenario = arg_or_env(&args, "--scenario", "TAKO_LSP_FAKE_SCENARIO")
@@ -379,6 +440,14 @@ fn main() {
         _ => Breaks::Spec,
     };
     let mark = arg_or_env(&args, "--mark", "TAKO_LSP_FAKE_MARK");
+    // #1682: 補完の答え方と、待っている（まだ答えていない）補完の要求の id
+    let completion: serde_json::Value =
+        arg_or_env(&args, "--completion", "TAKO_LSP_FAKE_COMPLETION")
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or(serde_json::Value::Null);
+    let waiting: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+        Default::default();
     let doc_log = arg_or_env(&args, "--doc-log", "TAKO_LSP_FAKE_DOC_LOG");
     let mut docs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     append(&spawns, &std::process::id().to_string());
@@ -461,6 +530,12 @@ fn main() {
                     if scenario != "no-range-format" {
                         capabilities["documentRangeFormattingProvider"] = serde_json::json!(true);
                     }
+                }
+                if scenario != "no-completion" {
+                    capabilities["completionProvider"] = serde_json::json!({
+                        "triggerCharacters": [".", ":"],
+                        "resolveProvider": true,
+                    });
                 }
                 out.send(serde_json::json!({
                     "jsonrpc": "2.0",
@@ -630,6 +705,45 @@ fn main() {
                     edits.reverse();
                 }
                 out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": edits }));
+            }
+            // #1682: 補完。`delay_ms` のあいだに取り消されたら -32800 で答える（LSP の作法 =
+            // 取り消されても応答は返す）。待ちの表は答えた / 取り消した時点で外す
+            ("textDocument/completion", Some(id)) => {
+                let result = completion_items(&completion, &docs, breaks, &message["params"]);
+                let delay = completion["delay_ms"].as_u64().unwrap_or(0);
+                if delay == 0 {
+                    out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+                    continue;
+                }
+                let key = id.to_string();
+                waiting.lock().unwrap().insert(key.clone());
+                let (out, waiting) = (out.clone(), waiting.clone());
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                    if waiting.lock().unwrap().remove(&key) {
+                        out.send(
+                            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                        );
+                    }
+                });
+            }
+            ("$/cancelRequest", None) => {
+                let id = message["params"]["id"].clone();
+                if waiting.lock().unwrap().remove(&id.to_string()) {
+                    out.send(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": -32800, "message": "cancelled" },
+                    }));
+                }
+            }
+            ("completionItem/resolve", Some(id)) => {
+                let mut item = message["params"].clone();
+                if let Some(doc) = completion["resolve_doc"].as_str() {
+                    let label = item["label"].as_str().unwrap_or("").to_string();
+                    item["documentation"] = serde_json::json!(doc.replace("{label}", &label));
+                }
+                out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": item }));
             }
             ("shutdown", Some(id)) => out.send(serde_json::json!({
                 "jsonrpc": "2.0",
