@@ -1,7 +1,8 @@
 # リリース運用（詳細）
 
 > `AGENTS.md`「リリース運用」節の**詳細**。両 OS 同時リリースの仕組み・配布物に同梱する
-> ライセンス・配布物に個人情報を入れない仕組み・夜間リリース・次回バージョンの予約はここにある。**毎ターンは読まない** —
+> ライセンス・配布物に個人情報を入れない仕組み・夜間リリース・次回バージョンの予約・
+> 安定版への昇格（Homebrew cask と docs の追従）はここにある。**毎ターンは読まない** —
 > リリースを打つ直前・機構を触る直前にその節だけ Read する。
 
 ## 両 OS 同時リリース（#965）
@@ -119,7 +120,8 @@ Windows 版は該当なし。既に配った版はそのまま（差し替えな
   同じ版が別 SHA で 2 本できる原因）。多重起動ロックは HOME 単位 + **リポジトリ単位**の 2 段
 - ジョブ登録は `scripts/nightly-release.sh --install-launchd`（解除は `--uninstall-launchd`、
   確認は `launchctl list | grep tako-nightly`）。plist はリポに置かず実行時に生成する
-- Homebrew cask 更新・リリースノートの日英併記は従来どおり手動で行う
+- Homebrew cask の更新は**安定版への昇格**（下の節）が行う（夜間のテスト版では cask を動かさない）。
+  リリースノートの日英併記は従来どおり手動で行う
 
 ### 次回バージョンの予約（#1005）
 
@@ -153,3 +155,43 @@ Windows 版は該当なし。既に配った版はそのまま（差し替えな
   **本番のタグ / Release / 予約ファイル / launchd には触らない**）
 - **launchd が実行するのは install_root 側のスクリプト**（既定 `~/dev/tako/scripts/nightly-release.sh`）。
   予約機構を直したときは、そのパスへ反映されているか（= main を pull 済みか）まで確認する
+
+## 安定版への昇格（#403 / #1853 / #1592）
+
+夜間リリースは常にテスト版（prerelease）で出るので、**安定版（Latest）は人が昇格させる**。
+昇格は `scripts/release.sh --promote <tag>` の 1 本で、Release・Homebrew cask・docs の
+「最新の安定版」を同時に動かす。v0.8.0 の昇格は Release だけを動かし、cask は 1 か月半
+v0.7.0 のまま、docs のラベルも取り残された（#1853 / #1546）。
+
+| 受け付けるタグ | Release の扱い |
+|---|---|
+| 夜間の素のタグ（`v0.8.26`） | その Release の prerelease を外して Latest にする（タグ・アセットはそのまま） |
+| テスト版タグ（`v0.6.0-test.1`） | 同じコミットに安定版タグ（`v0.6.0`）を打ち、名前を付け替えたアセットで安定版 Release を作る |
+
+- どちらも最後に `gh release edit <tag> --prerelease=false --latest` を通し、読み直して外れたことを確かめる。
+  **今の Latest より古い版・ドラフト・形の違うタグ**（`-rc.1` 等）は何も変えずに exit 1
+  （打ち間違いで cask と docs を古い版へ戻さない）
+- **後続 1 = Homebrew cask**（tap `takushio2525/homebrew-tako` の `Casks/tako.rb`）:
+  公開アセット `tako-<tag>-macos-arm64.zip` を `gh release download` で実際に落として sha256 を出し、
+  GitHub の digest と突き合わせ、cask の `url` の雛形がそのアセットを指すかも確かめてから
+  version / sha256 を書き換え、ブランチ `update-<版>` を push → PR → squash merge（tap に CI は無い）。
+  **成否は gh の終了コードではなく tap の main を読み直して決める**（#1430 と同じ理由）。
+  一時 clone の commit の作者はこのリポの `user.name` / `user.email` を写す
+- **後続 2 = docs**（`docs/src/content/docs/releases.md`）: origin/main を使い捨ての worktree
+  （`--detach`）に出し、`node docs/scripts/check-releases-page.mjs --set-stable=<版> --date=<日付>` で
+  見出しの「— 最新の安定版は vX.Y.Z」と本文の「**安定版は vX.Y.Z**（日付）」を書き換える
+  （日付はその版の CHANGELOG の節。書き換えと検査は CI の番犬と同じ 1 ファイル）。ブランチ
+  `docs/promote-<tag>` で PR を出し、`scripts/merge-pr.sh` で **CI が緑で揃ってから merge** する
+  （main へ直接は push しない。CI の分だけ昇格が待つ）。その版の系列の節が無い（minor が
+  上がった直後）ときは書き換えずに落ちるので、節（読み物）を書いてから打ち直す
+- **終了コード**: 0 = Release・cask・docs が揃った / 1 = 昇格しなかった / **4 = Release は Latest に
+  なったが後続が終わっていない**（理由と、どの段かを名指しする）。片肺（Windows が無い）は
+  従来どおり報告だけで終了コードは変えない
+- **打ち直しは同じコマンド**（`scripts/release.sh --promote <安定版タグ>`）。済んだ段は飛ばす
+  （cask が既に同じ版 + 同じ sha256 / docs が既に同じ版なら何もしない）。PR が残っていれば使い回す
+- **bash 3.2 の罠**: `set -u` の unbound variable で死ぬと EXIT の trap の中の `$?` が 0 になる。
+  昇格の trap は成功の印（`PROMOTE_SUCCEEDED`）が無い 0 を 1 にして抜ける
+- **モックテスト**: `bash scripts/test-release-promote-1853.sh`（CI の macOS ジョブ）。gh と
+  `merge-pr.sh` はスタブ、origin と tap は一時ディレクトリの bare リポ（tap の clone 元は
+  `TAKO_HOMEBREW_TAP_REMOTE` で差し替える）、git のグローバル設定も切り離すので、
+  **本番の Release・タグ・tap には触らない**。実地での昇格はテストで走らせない

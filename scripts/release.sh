@@ -7,7 +7,8 @@
 #   scripts/release.sh --draft      # zip 生成 + ドラフトリリース作成
 #   scripts/release.sh --skip-build # ビルド済み dist/tako.app を使って zip のみ再生成
 #   scripts/release.sh --test       # テスト版（prerelease）としてリリース（#403）
-#   scripts/release.sh --promote <test-tag>  # テスト版を安定版に昇格（#403）
+#   scripts/release.sh --promote <tag>       # テスト版（-test.N）/ 夜間の素のタグを安定版に昇格し、
+#                                            # Homebrew cask と docs の「最新の安定版」も追従させる（#403 / #1853）
 #   scripts/release.sh --notes-only # リリースノートを生成して表示するだけ（ビルド・公開しない）
 #   scripts/release.sh --update-notes [tag]  # 公開済みリリースのノートを実アセットから作り直す
 #   scripts/release.sh --check-assets [tag]  # 両 OS の配布物が揃っているかを検査（#965）
@@ -107,7 +108,7 @@ while [[ $# -gt 0 ]]; do
     --promote)
       shift
       if [[ $# -eq 0 ]]; then
-        echo "エラー: --promote にはテスト版タグを指定してください（例: --promote v0.6.0-test.1）" >&2
+        echo "エラー: --promote には昇格するタグを指定してください（例: --promote v0.8.26）" >&2
         exit 2
       fi
       PROMOTE_TAG="$1"; shift ;;
@@ -502,92 +503,423 @@ if [[ $NOTES_ONLY -eq 1 ]]; then
   exit 0
 fi
 
-# --- 昇格（--promote）処理: テスト版と同一コミットに安定版リリースを作成 ---
-if [[ -n "$PROMOTE_TAG" ]]; then
-  if ! command -v gh >/dev/null; then
-    echo "エラー: gh CLI が必要（brew install gh）" >&2
-    exit 1
+# --- 昇格（--promote）: テスト版 / 夜間の素のタグを安定版にする（#403 / #1853）----------
+#
+# 受け付けるタグは 2 つの形:
+#   - テスト版タグ（v0.6.0-test.1）… 同じコミットに安定版タグ（v0.6.0）を打ち、アセットの
+#     名前を付け替えて添付した安定版 Release を作る（#403 以来の経路）
+#   - 夜間の素のタグ（v0.8.26）… 夜間リリースは常に prerelease で出る（#403）ので、
+#     その Release の prerelease を外して Latest にする（タグ・アセットはそのまま）
+#
+# どちらも最後に同じ後続を走らせる。Release が Latest になっても、Homebrew の cask と
+# docs の「最新の安定版」が古いままだと、そこから入れる・読む利用者には昇格していないのと
+# 同じ（v0.8.0 の昇格後も cask が 1 か月半 v0.7.0 のままだった = #1853 / #1592）:
+#   1. tap（HOMEBREW_TAP_REPO）の cask の version / sha256 を、公開アセットを実際に落として
+#      算出した値へ書き換え、PR → squash merge（tap に CI は無い）。成否は tap の main を
+#      読み直して決める
+#   2. docs/src/content/docs/releases.md の「最新の安定版」を書き換えて PR を出し、
+#      scripts/merge-pr.sh で CI が緑で揃ってから merge する（main へ直接は push しない）
+# 後続のどれかが終わらなければ exit 4（= Release は昇格済み）。同じ昇格を打ち直せば、
+# 済んだ段は飛ばして残りだけをやる（冪等）
+
+# 昇格できるタグの形
+PROMOTE_PLAIN_TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+$'
+PROMOTE_TEST_TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+-test\.[0-9]+$'
+SHA256_RE='^[0-9a-f]{64}$'
+# 後続の行き先。tap の clone 元だけはテストから一時ディレクトリの bare リポへ差し替える
+TAKO_RELEASE_REPO="takushio2525/tako"
+HOMEBREW_TAP_REPO="takushio2525/homebrew-tako"
+HOMEBREW_TAP_REMOTE=${TAKO_HOMEBREW_TAP_REMOTE:-"https://github.com/${HOMEBREW_TAP_REPO}.git"}
+HOMEBREW_CASK_PATH="Casks/tako.rb"
+# cask の url が指す配布物の arch（url の雛形は arm64 の zip）
+HOMEBREW_CASK_ARCH="arm64"
+RELEASES_PAGE="docs/src/content/docs/releases.md"
+# 「Release は安定版（Latest）になったが、cask / docs の追従が終わっていない」。
+# 1（昇格そのものの失敗）・3（片肺）と区別できるようにする
+PROMOTE_FOLLOWUP_EXIT=4
+
+# version_lt <a> <b> — x.y.z 同士で a < b なら 0
+version_lt() {
+  local a1 a2 a3 b1 b2 b3
+  IFS=. read -r a1 a2 a3 <<< "$1"
+  IFS=. read -r b1 b2 b3 <<< "$2"
+  if (( a1 != b1 )); then (( a1 < b1 )); return; fi
+  if (( a2 != b2 )); then (( a2 < b2 )); return; fi
+  (( a3 < b3 ))
+}
+
+# release_field <tag> <field> — Release の 1 項目（isPrerelease 等）を読む。読めなければ空
+release_field() {
+  gh release view "$1" --json "$2" -q ".$2" 2>/dev/null || true
+}
+
+# mark_release_latest <tag> — prerelease を外して Latest にし、外れたことを読み直して確かめる
+mark_release_latest() {
+  local tag="$1"
+  if ! gh release edit "$tag" --prerelease=false --latest >/dev/null; then
+    echo "エラー: gh release edit $tag --prerelease=false --latest が失敗した" >&2
+    return 1
   fi
-  echo "==> テスト版 $PROMOTE_TAG を安定版に昇格"
-
-  # テスト版リリースの存在確認
-  if ! gh release view "$PROMOTE_TAG" >/dev/null 2>&1; then
-    echo "エラー: テスト版リリース $PROMOTE_TAG が見つからない" >&2
-    exit 1
+  if [[ "$(release_field "$tag" isPrerelease)" != "false" ]]; then
+    echo "エラー: $tag の prerelease が外れていない（gh release view $tag で確かめる）" >&2
+    return 1
   fi
+}
 
-  # テスト版タグのコミットを取得
-  PROMOTE_COMMIT=$(git rev-list -n1 "$PROMOTE_TAG" 2>/dev/null || true)
-  if [[ -z "$PROMOTE_COMMIT" ]]; then
-    echo "エラー: タグ $PROMOTE_TAG のコミットが見つからない（git fetch --tags してください）" >&2
-    exit 1
-  fi
+# print_indented <file> <prefix> — 失敗したコマンドの stderr を字下げして出す
+print_indented() {
+  [[ -s "$1" ]] || return 0
+  sed "s/^/    $2/" "$1" >&2
+}
 
-  # 安定版タグを生成（v0.6.0-test.1 → v0.6.0）
-  STABLE_TAG=$(echo "$PROMOTE_TAG" | sed 's/-test\.[0-9]*$//')
-  STABLE_VERSION="${STABLE_TAG#v}"
-  if [[ "$STABLE_TAG" == "$PROMOTE_TAG" ]]; then
-    echo "エラー: $PROMOTE_TAG はテスト版タグ（-test.N サフィックス）ではない" >&2
-    exit 1
-  fi
-
-  echo "  テスト版: $PROMOTE_TAG (commit: ${PROMOTE_COMMIT:0:7})"
-  echo "  安定版:   $STABLE_TAG"
-
-  # テスト版のアセットをダウンロードして安定版に添付
-  PROMOTE_TMPDIR=$(mktemp -d)
-  trap 'rm -rf "$PROMOTE_TMPDIR"' EXIT
-  echo "  アセットをダウンロード..."
-  gh release download "$PROMOTE_TAG" --dir "$PROMOTE_TMPDIR" 2>/dev/null || true
-
-  # 安定版タグを同コミットに作成
-  if git rev-parse "$STABLE_TAG" >/dev/null 2>&1; then
-    echo "  安定版タグ $STABLE_TAG は既に存在。スキップ"
-  else
-    git tag -a "$STABLE_TAG" "$PROMOTE_COMMIT" -m "tako $STABLE_TAG — promoted from $PROMOTE_TAG"
-    git push origin "$STABLE_TAG"
-    echo "  安定版タグ $STABLE_TAG を作成・push"
-  fi
-
-  # アセットをリネーム（-test.N を除去）してリリース作成
-  ASSETS=()
-  ASSET_NAMES=()
-  for f in "$PROMOTE_TMPDIR"/*; do
-    [[ -f "$f" ]] || continue
-    BASENAME=$(basename "$f")
-    # tako-v0.6.0-test.1-macos-arm64.zip → tako-v0.6.0-macos-arm64.zip
-    NEWNAME=$(echo "$BASENAME" | sed "s/${PROMOTE_TAG#v}/$STABLE_VERSION/g")
-    if [[ "$NEWNAME" != "$BASENAME" ]]; then
-      mv "$f" "$PROMOTE_TMPDIR/$NEWNAME"
+# copy_commit_identity <dir> — 一時 clone でも、このリポと同じ作者名・メールで commit させる
+# （一時 clone はリポジトリのローカル設定を持たないので、素のままだと作者がグローバル設定になる）
+copy_commit_identity() {
+  local key val
+  for key in user.name user.email; do
+    val=$(git -C "$REPO_ROOT" config --get "$key" 2>/dev/null || true)
+    if [[ -n "$val" ]]; then
+      git -C "$1" config "$key" "$val"
     fi
-    ASSETS+=("$PROMOTE_TMPDIR/$NEWNAME")
-    ASSET_NAMES+=("$NEWNAME")
   done
+}
 
-  # 安定版のリリースノート（昇格の一文 + 通常と同じ構成 = ダウンロード表・OS 別手順）
-  PROMOTE_NOTES="Promoted from test release $PROMOTE_TAG.
+# cask_field <file> <version|sha256|url> — cask の `version "…"` 等の値（無ければ空）
+cask_field() {
+  sed -n 's/^[[:space:]]*'"$2"' "\(.*\)"[[:space:]]*$/\1/p' "$1" 2>/dev/null | head -1
+}
+
+# cask_rewrite <file> <version> <sha256> — version / sha256 の行だけを書き換える（字下げは保つ）
+cask_rewrite() {
+  sed -e 's/^\([[:space:]]*version \)".*"/\1"'"$2"'"/' \
+      -e 's/^\([[:space:]]*sha256 \)".*"/\1"'"$3"'"/' "$1" > "$1.new" && mv -f "$1.new" "$1"
+}
+
+# update_homebrew_cask <stable-tag> — 後続 1: tap の cask を公開アセットに合わせる
+update_homebrew_cask() {
+  local tag="$1" version="${1#v}" work asset file sha digest clone cask url expected_url
+  local cur_ver cur_sha branch pr_url merge_rc main_cask
+  work="$PROMOTE_TMPDIR/cask"
+  asset=$(tako_asset_name "$tag" macos "$HOMEBREW_CASK_ARCH")
+  echo "==> Homebrew cask を $tag へ（$HOMEBREW_TAP_REPO の ${HOMEBREW_CASK_PATH}）"
+  mkdir -p "$work/asset"
+
+  # 公開アセットを実際に落として sha256 を出す（brew が落とすのと同じファイル）
+  if ! gh release download "$tag" --pattern "$asset" --dir "$work/asset" --clobber \
+      >/dev/null 2>"$work/download.err"; then
+    echo "エラー: $tag の公開アセット $asset を落とせない（Release に無い / 通信の失敗）" >&2
+    print_indented "$work/download.err" "gh: "
+    return 1
+  fi
+  file="$work/asset/$asset"
+  if [[ ! -s "$file" ]]; then
+    echo "エラー: $tag から落とした $asset が無いか空（gh release download $tag --pattern ${asset}）" >&2
+    return 1
+  fi
+  sha=$(shasum -a 256 "$file" 2>/dev/null | awk '{print $1}') || sha=""
+  if [[ ! "$sha" =~ $SHA256_RE ]]; then
+    echo "エラー: $asset の sha256 を算出できない（shasum -a 256 の結果: ${sha:-空}）" >&2
+    return 1
+  fi
+  # GitHub がアセットごとに持つ digest と食い違えば、落とす途中で壊れている
+  digest=$(gh release view "$tag" --json assets \
+    -q ".assets[] | select(.name == \"$asset\") | .digest" 2>/dev/null || true)
+  digest=${digest#sha256:}
+  if [[ -n "$digest" && "$digest" != "null" && "$digest" != "$sha" ]]; then
+    echo "エラー: 落とした $asset の sha256 が GitHub の digest と一致しない" >&2
+    echo "    算出:   $sha" >&2
+    echo "    GitHub: $digest" >&2
+    return 1
+  fi
+  echo "    sha256: ${sha}（${asset}）"
+
+  clone="$work/tap"
+  if ! git clone --quiet "$HOMEBREW_TAP_REMOTE" "$clone" 2>"$work/clone.err"; then
+    echo "エラー: tap を clone できない（${HOMEBREW_TAP_REMOTE}）" >&2
+    print_indented "$work/clone.err" "git: "
+    return 1
+  fi
+  cask="$clone/$HOMEBREW_CASK_PATH"
+  cur_ver=$(cask_field "$cask" version)
+  cur_sha=$(cask_field "$cask" sha256)
+  url=$(cask_field "$cask" url)
+  if [[ -z "$cur_ver" || -z "$cur_sha" || -z "$url" ]]; then
+    echo "エラー: tap の $HOMEBREW_CASK_PATH に version / sha256 / url の行が見つからない（形が変わった？）" >&2
+    return 1
+  fi
+  # url の雛形が、sha256 を出したのと同じアセットを指していること
+  # （別の名前を指していれば、brew が落とす物と sha256 が合わず入れられなくなる）
+  expected_url="https://github.com/${TAKO_RELEASE_REPO}/releases/download/${tag}/${asset}"
+  if [[ "${url//'#{version}'/$version}" != "$expected_url" ]]; then
+    echo "エラー: cask の url が $asset を指していない" >&2
+    echo "    cask: $url" >&2
+    echo "    期待: $expected_url" >&2
+    return 1
+  fi
+  if [[ "$cur_ver" == "$version" && "$cur_sha" == "$sha" ]]; then
+    echo "    tap の cask は既に ${version}（sha256 も一致）。何もしない"
+    return 0
+  fi
+  echo "    cask: $cur_ver → $version"
+
+  cask_rewrite "$cask" "$version" "$sha"
+  if [[ "$(cask_field "$cask" version)" != "$version" || "$(cask_field "$cask" sha256)" != "$sha" ]]; then
+    echo "エラー: $HOMEBREW_CASK_PATH の version / sha256 を書き換えられなかった" >&2
+    return 1
+  fi
+  branch="update-$version"
+  copy_commit_identity "$clone"
+  if ! git -C "$clone" checkout --quiet -b "$branch" ||
+     ! git -C "$clone" commit --quiet -a -m "[改善] cask を tako $tag に更新" \
+         -m "sha256 は公開アセット $asset を実際にダウンロードして算出した（scripts/release.sh --promote）。"; then
+    echo "エラー: tap の clone で commit できなかった" >&2
+    return 1
+  fi
+  # 前回の打ち直しで同名のブランチが残っていても、中身は今回の値で上書きしてよい
+  if ! git -C "$clone" push --quiet --force origin "$branch" 2>"$work/push.err"; then
+    echo "エラー: tap へ push できない（$HOMEBREW_TAP_REMOTE の ${branch}）" >&2
+    print_indented "$work/push.err" "git: "
+    return 1
+  fi
+  pr_url=$(cd "$clone" && gh pr list --repo "$HOMEBREW_TAP_REPO" --head "$branch" --state open \
+    --json url -q '.[0].url' 2>/dev/null || true)
+  if [[ -z "$pr_url" || "$pr_url" == "null" ]]; then
+    if ! pr_url=$(cd "$clone" && gh pr create --repo "$HOMEBREW_TAP_REPO" --base main --head "$branch" \
+        --title "[改善] cask を tako $tag に更新" \
+        --body "$tag を安定版（Latest）へ昇格したのに合わせて cask を更新する。sha256 は公開アセット \`$asset\` を実際にダウンロードして算出した（\`scripts/release.sh --promote\` が作成）。" \
+        2>"$work/pr.err"); then
+      echo "エラー: tap の PR を作れない（ブランチ $branch は push 済み）" >&2
+      print_indented "$work/pr.err" "gh: "
+      return 1
+    fi
+  fi
+  echo "    PR: $pr_url"
+  merge_rc=0
+  (cd "$clone" && gh pr merge "$pr_url" --repo "$HOMEBREW_TAP_REPO" --squash --delete-branch) \
+    >/dev/null 2>"$work/merge.err" || merge_rc=$?
+
+  # 成否は gh の終了コードではなく tap の main の実物で決める（merge 後の後始末だけ
+  # 失敗しても gh は非 0 で終わる = #1430 と同じ）
+  main_cask="$work/main-cask.rb"
+  if ! git -C "$clone" fetch --quiet origin main 2>"$work/fetch.err"; then
+    echo "エラー: merge 後の tap の main を読み直せない" >&2
+    print_indented "$work/fetch.err" "git: "
+    return 1
+  fi
+  git -C "$clone" show "origin/main:$HOMEBREW_CASK_PATH" > "$main_cask" 2>/dev/null || : > "$main_cask"
+  if [[ "$(cask_field "$main_cask" version)" != "$version" || "$(cask_field "$main_cask" sha256)" != "$sha" ]]; then
+    echo "エラー: tap の main の cask が $version になっていない（merge されていない。gh pr merge の終了コード ${merge_rc}）" >&2
+    print_indented "$work/merge.err" "gh: "
+    echo "    PR は残してある: $pr_url" >&2
+    return 1
+  fi
+  echo "    tap の main を読み直して確認した: version $version / sha256 一致"
+}
+
+# update_docs_stable_label <stable-tag> — 後続 2: docs の「最新の安定版」を書き換えて PR → merge
+update_docs_stable_label() {
+  local tag="$1" version="${1#v}" wt date branch pr_url pr
+  wt="$PROMOTE_TMPDIR/docs"
+  branch="docs/promote-$tag"
+  echo "==> docs の「最新の安定版」を $tag へ（${RELEASES_PAGE}）"
+  if ! command -v node >/dev/null; then
+    echo "エラー: node が無い（$RELEASES_PAGE の書き換えに使う）" >&2
+    return 1
+  fi
+  # 呼び出し元のツリー（共有ツリーのこともある）は動かさない（#1136）。最新の origin/main を
+  # 使い捨ての worktree に出して、そこで書き換える
+  if ! git -C "$REPO_ROOT" fetch --quiet origin main 2>"$PROMOTE_TMPDIR/docs-fetch.err" ||
+     ! git -C "$REPO_ROOT" worktree add --quiet --detach "$wt" origin/main 2>>"$PROMOTE_TMPDIR/docs-fetch.err"; then
+    echo "エラー: origin/main を作業用の worktree に出せない" >&2
+    print_indented "$PROMOTE_TMPDIR/docs-fetch.err" "git: "
+    return 1
+  fi
+  # 日付はその版の CHANGELOG の節の日付（無ければ今日）
+  date=$(sed -n "s/^## \[${version//./\\.}\] - \([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}\).*/\1/p" \
+    "$wt/CHANGELOG.md" 2>/dev/null | head -1)
+  [[ -n "$date" ]] || date=$(date +%F)
+  # 書き換えと検査は番犬（docs の CI と同じスクリプト）の 1 実装に任せる
+  if ! node "$wt/docs/scripts/check-releases-page.mjs" --set-stable="$version" --date="$date"; then
+    echo "エラー: $RELEASES_PAGE を $tag へ書き換えられない（上の理由を直してから scripts/release.sh --promote ${tag}）" >&2
+    return 1
+  fi
+  if git -C "$wt" diff --quiet -- "$RELEASES_PAGE"; then
+    echo "    origin/main の $RELEASES_PAGE は既に ${tag}。何もしない"
+    return 0
+  fi
+  if ! git -C "$wt" commit --quiet -m "[ドキュメント] リリースノートのページの「最新の安定版」を $tag にした" \
+      -m "scripts/release.sh --promote $tag が、安定版（Latest）への昇格に合わせて書き換えた。" \
+      -- "$RELEASES_PAGE"; then
+    echo "エラー: $RELEASES_PAGE の書き換えを commit できなかった" >&2
+    return 1
+  fi
+  if ! git -C "$wt" push --quiet --force origin "HEAD:refs/heads/$branch" 2>"$PROMOTE_TMPDIR/docs-push.err"; then
+    echo "エラー: docs のブランチ $branch を push できない" >&2
+    print_indented "$PROMOTE_TMPDIR/docs-push.err" "git: "
+    return 1
+  fi
+  pr_url=$(gh pr list --repo "$TAKO_RELEASE_REPO" --head "$branch" --state open \
+    --json url -q '.[0].url' 2>/dev/null || true)
+  if [[ -z "$pr_url" || "$pr_url" == "null" ]]; then
+    if ! pr_url=$(gh pr create --repo "$TAKO_RELEASE_REPO" --base main --head "$branch" \
+        --title "[ドキュメント] リリースノートのページの「最新の安定版」を $tag にした" \
+        --body "\`scripts/release.sh --promote $tag\` が自動で作った PR。$tag を安定版（Latest）へ昇格したのに合わせて \`$RELEASES_PAGE\` の「最新の安定版」を書き換えた（#1853 / #1592）。CI が緑で揃ったら同じスクリプトが \`scripts/merge-pr.sh\` で merge する。" \
+        2>"$PROMOTE_TMPDIR/docs-pr.err"); then
+      echo "エラー: docs の PR を作れない（ブランチ $branch は push 済み）" >&2
+      print_indented "$PROMOTE_TMPDIR/docs-pr.err" "gh: "
+      return 1
+    fi
+  fi
+  pr=${pr_url##*/}
+  echo "    PR: ${pr_url}（CI が緑で揃ってから merge する）"
+  if ! (cd "$REPO_ROOT" && "$REPO_ROOT/scripts/merge-pr.sh" "$pr"); then
+    echo "エラー: docs の PR #$pr を merge できなかった（PR は残してある）。CI が緑になってから scripts/merge-pr.sh $pr" >&2
+    return 1
+  fi
+}
+
+# 後始末: 一時ファイルと docs の worktree（成功・失敗のどちらでも残さない）。
+# EXIT の trap なので、最後に元の終了コードで抜け直す。ただし bash 3.2 は set -u
+# （unbound variable）で死んだときだけ trap の中の $? が 0 になる（trap が無ければ 1。
+# bash 5 は trap の中でも 1）。そのままだと途中で死んだ昇格が exit 0 に見えるので、
+# 成功の exit の直前に立てる印（PROMOTE_SUCCEEDED）が無い 0 は失敗として 1 にする
+promote_cleanup() {
+  local rc=$?
+  if [[ $rc -eq 0 && "${PROMOTE_SUCCEEDED:-0}" != 1 ]]; then
+    echo "エラー: 昇格が途中で止まった（終了コード 0 のまま抜けかけた。上の出力の最後の行を見る）" >&2
+    rc=1
+  fi
+  if [[ -n "${PROMOTE_TMPDIR:-}" && -d "$PROMOTE_TMPDIR/docs" ]]; then
+    git -C "$REPO_ROOT" worktree remove --force "$PROMOTE_TMPDIR/docs" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${PROMOTE_TMPDIR:-}" ]]; then
+    rm -rf "$PROMOTE_TMPDIR"
+  fi
+  git -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
+  exit "$rc"
+}
+
+if [[ -n "$PROMOTE_TAG" ]]; then
+  require_gh
+  if [[ "$PROMOTE_TAG" =~ $PROMOTE_PLAIN_TAG_RE ]]; then
+    PROMOTE_KIND="nightly"
+    STABLE_TAG="$PROMOTE_TAG"
+  elif [[ "$PROMOTE_TAG" =~ $PROMOTE_TEST_TAG_RE ]]; then
+    PROMOTE_KIND="test"
+    # v0.6.0-test.1 → v0.6.0
+    STABLE_TAG="${PROMOTE_TAG%-test.*}"
+  else
+    echo "エラー: $PROMOTE_TAG は昇格できるタグの形ではない（テスト版 v0.6.0-test.1 / 夜間の素のタグ v0.8.26）" >&2
+    exit 1
+  fi
+  STABLE_VERSION="${STABLE_TAG#v}"
+
+  if ! gh release view "$PROMOTE_TAG" >/dev/null 2>&1; then
+    echo "エラー: リリース $PROMOTE_TAG が見つからない" >&2
+    exit 1
+  fi
+  if [[ "$(release_field "$PROMOTE_TAG" isDraft)" == "true" ]]; then
+    echo "エラー: $PROMOTE_TAG はドラフト。公開してから昇格させる" >&2
+    exit 1
+  fi
+  # 今の安定版より古い版は昇格させない。打ち間違えると Homebrew の cask と docs が
+  # 古い版へ戻る（同じ版の打ち直しは後続のやり直しとして通す）
+  CURRENT_LATEST=$(gh release view --json tagName -q .tagName 2>/dev/null || true)
+  if [[ "$CURRENT_LATEST" =~ $PROMOTE_PLAIN_TAG_RE ]] && version_lt "$STABLE_VERSION" "${CURRENT_LATEST#v}"; then
+    echo "エラー: $STABLE_TAG は今の安定版 $CURRENT_LATEST より古い（昇格すると Homebrew の cask と docs が古い版へ戻る）" >&2
+    exit 1
+  fi
+
+  PROMOTE_TMPDIR=$(mktemp -d)
+  trap promote_cleanup EXIT
+
+  if [[ "$PROMOTE_KIND" == "test" ]]; then
+    echo "==> テスト版 $PROMOTE_TAG を安定版に昇格"
+
+    # テスト版タグのコミットを取得
+    PROMOTE_COMMIT=$(git rev-list -n1 "$PROMOTE_TAG" 2>/dev/null || true)
+    if [[ -z "$PROMOTE_COMMIT" ]]; then
+      echo "エラー: タグ $PROMOTE_TAG のコミットが見つからない（git fetch --tags してください）" >&2
+      exit 1
+    fi
+
+    echo "  テスト版: $PROMOTE_TAG (commit: ${PROMOTE_COMMIT:0:7})"
+    echo "  安定版:   $STABLE_TAG"
+
+    # テスト版のアセットをダウンロードして安定版に添付
+    mkdir -p "$PROMOTE_TMPDIR/assets"
+    echo "  アセットをダウンロード..."
+    gh release download "$PROMOTE_TAG" --dir "$PROMOTE_TMPDIR/assets" 2>/dev/null || true
+
+    # 安定版タグを同コミットに作成
+    if git rev-parse "$STABLE_TAG" >/dev/null 2>&1; then
+      echo "  安定版タグ $STABLE_TAG は既に存在。スキップ"
+    else
+      git tag -a "$STABLE_TAG" "$PROMOTE_COMMIT" -m "tako $STABLE_TAG — promoted from $PROMOTE_TAG"
+      git push origin "$STABLE_TAG"
+      echo "  安定版タグ $STABLE_TAG を作成・push"
+    fi
+
+    # アセットをリネーム（-test.N を除去）してリリース作成
+    ASSETS=()
+    ASSET_NAMES=()
+    for f in "$PROMOTE_TMPDIR/assets"/*; do
+      [[ -f "$f" ]] || continue
+      BASENAME=$(basename "$f")
+      # tako-v0.6.0-test.1-macos-arm64.zip → tako-v0.6.0-macos-arm64.zip
+      NEWNAME=$(echo "$BASENAME" | sed "s/${PROMOTE_TAG#v}/$STABLE_VERSION/g")
+      if [[ "$NEWNAME" != "$BASENAME" ]]; then
+        mv "$f" "$PROMOTE_TMPDIR/assets/$NEWNAME"
+      fi
+      ASSETS+=("$PROMOTE_TMPDIR/assets/$NEWNAME")
+      ASSET_NAMES+=("$NEWNAME")
+    done
+
+    # 安定版のリリースノート（昇格の一文 + 通常と同じ構成 = ダウンロード表・OS 別手順）
+    PROMOTE_NOTES="Promoted from test release $PROMOTE_TAG.
 テスト版 $PROMOTE_TAG からの昇格リリース。
 
 $(build_release_notes "$STABLE_TAG" "$STABLE_VERSION" "${ASSET_NAMES[@]+"${ASSET_NAMES[@]}"}")"
 
-  if gh release view "$STABLE_TAG" >/dev/null 2>&1; then
-    echo "  安定版 Release $STABLE_TAG は既に存在。アセットのみアップロード"
-    for a in ${ASSETS[@]+"${ASSETS[@]}"}; do
-      gh release upload "$STABLE_TAG" "$a" --clobber
-    done
+    if gh release view "$STABLE_TAG" >/dev/null 2>&1; then
+      echo "  安定版 Release $STABLE_TAG は既に存在。アセットのみアップロード"
+      for a in ${ASSETS[@]+"${ASSETS[@]}"}; do
+        gh release upload "$STABLE_TAG" "$a" --clobber
+      done
+    else
+      gh release create "$STABLE_TAG" \
+        --title "tako $STABLE_TAG" \
+        --notes "$PROMOTE_NOTES" \
+        --generate-notes \
+        ${ASSETS[@]+"${ASSETS[@]}"}
+      echo "  安定版 Release $STABLE_TAG を作成"
+    fi
+    # テスト版リリースの prerelease フラグ維持（昇格しても消さない。履歴として残す）
   else
-    gh release create "$STABLE_TAG" \
-      --title "tako $STABLE_TAG" \
-      --notes "$PROMOTE_NOTES" \
-      --generate-notes \
-      ${ASSETS[@]+"${ASSETS[@]}"}
-    echo "  安定版 Release $STABLE_TAG を作成"
+    echo "==> 夜間リリース $PROMOTE_TAG を安定版に昇格（prerelease を外して Latest にする）"
+    if [[ "$(release_field "$PROMOTE_TAG" isPrerelease)" == "false" ]]; then
+      echo "  $PROMOTE_TAG は既に安定版。Latest の印と後続（cask / docs）だけをやり直す"
+    fi
   fi
 
-  # テスト版リリースの prerelease フラグ維持（昇格しても消さない。履歴として残す）
-  echo "==> 昇格完了: $PROMOTE_TAG → $STABLE_TAG"
+  # 既にあった安定版 Release（夜間の素のタグと同じ版）が prerelease のまま残らないよう、
+  # どちらの経路もここで Latest にする
+  mark_release_latest "$STABLE_TAG" || exit 1
+  echo "==> 昇格完了: $PROMOTE_TAG → ${STABLE_TAG}（Latest）"
   # 昇格元が片肺なら昇格先も片肺になる。気付けるように報告する（#965。exit は変えない）
   report_release_completeness "$STABLE_TAG" || true
+
+  PROMOTE_FOLLOWUP_FAILED=()
+  update_homebrew_cask "$STABLE_TAG" || PROMOTE_FOLLOWUP_FAILED+=("Homebrew cask")
+  update_docs_stable_label "$STABLE_TAG" || PROMOTE_FOLLOWUP_FAILED+=("docs の「最新の安定版」")
+  if [[ ${#PROMOTE_FOLLOWUP_FAILED[@]} -gt 0 ]]; then
+    echo "" >&2
+    echo "ERROR: $STABLE_TAG は安定版（Latest）になったが、後続が終わっていない: ${PROMOTE_FOLLOWUP_FAILED[*]}" >&2
+    echo "  上の理由を直してから打ち直す（済んだ段は飛ばす）: scripts/release.sh --promote $STABLE_TAG" >&2
+    exit "$PROMOTE_FOLLOWUP_EXIT"
+  fi
+  echo "==> Homebrew cask と docs の「最新の安定版」も $STABLE_TAG に揃った"
+  PROMOTE_SUCCEEDED=1
   exit 0
 fi
 
