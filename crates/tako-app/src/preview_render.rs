@@ -1411,14 +1411,26 @@ impl TakoApp {
         {
             self.preview_body_lists.remove(&pane_id);
         }
+        // #1661: 編集中の Markdown は原文の行を指す目次を出す。ボタンは常に出し、
+        // 項目を組むのは目次パネルを開いているときだけ（打鍵ごとに全文を解かない。
+        // 版が変わっていなければ前回のものを使い回す）
+        let outline_panel_open =
+            self.preview_navigation_panel == Some((pane_id, PreviewNavigationPanel::Outline));
+        let editing_outline = self
+            .preview_edits
+            .get_mut(&pane_id)
+            .filter(|edit| edit.offers_source_outline())
+            .map(|edit| outline_panel_open.then(|| edit.source_outline()));
         let state = self.previews.get(&pane_id).expect("呼び出し前に確認済み");
         let file_name = state.file_name();
         let path_label = state.path.display().to_string();
         let md_capable = state.markdown_capable();
         let mode = state.mode;
         let truncated = state.truncated;
-        let preview_outline = state.outline.clone();
-        let outline_available = !preview_outline.is_empty();
+        let (preview_outline, outline_available) = match editing_outline {
+            Some(outline) => (outline.unwrap_or_default(), true),
+            None => (state.outline.clone(), !state.outline.is_empty()),
+        };
         struct EditSnapshot {
             editing: bool,
             dirty: bool,
@@ -1770,6 +1782,23 @@ impl TakoApp {
                     } else {
                         let list_state =
                             self.preview_body_list_state(pane_id, PreviewBodyKind::Markdown, count);
+                        // #1661: 編集を抜けた直後は、編集中に見ていた節の見出しから描く
+                        if let Some(heading) = self.preview_md_resume_heading.remove(&pane_id) {
+                            let block = self.previews.get(&pane_id).and_then(|p| {
+                                match p.outline.items.get(heading)?.target {
+                                    tako_core::PreviewOutlineTarget::MarkdownBlock { block } => {
+                                        Some(block)
+                                    }
+                                    _ => None,
+                                }
+                            });
+                            if let Some(block) = block.filter(|_| count > 0) {
+                                list_state.scroll_to(gpui::ListOffset {
+                                    item_ix: block.min(count - 1),
+                                    offset_in_item: px(0.0),
+                                });
+                            }
+                        }
                         let app = cx.entity().downgrade();
                         vec![gpui::list(list_state, move |ix, _window, cx| {
                             let Some(app) = app.upgrade() else {
@@ -2731,6 +2760,7 @@ impl TakoApp {
                                 d.child(
                                     div()
                                         .id(("preview-outline-toggle", pane_id.as_u64()))
+                                        .relative()
                                         .flex()
                                         .flex_row()
                                         .items_center()
@@ -2780,7 +2810,12 @@ impl TakoApp {
                                                 .w(px(9.0))
                                                 .h(px(9.0))
                                                 .text_color(hsla(theme.text_tertiary)),
-                                        ),
+                                        )
+                                        // #1661: visual-test が実マウスで押す実矩形
+                                        .child(crate::tab_shape::probe_canvas(
+                                            self.panel_click_probe_bounds.clone(),
+                                            format!("preview-outline-toggle-{}", pane_id.as_u64()),
+                                        )),
                                 )
                             })
                             .when(zoomable, |d| {
@@ -3131,6 +3166,7 @@ impl TakoApp {
                                 d.child(
                                     div()
                                         .id(("preview-edit-toggle", pane_id.as_u64()))
+                                        .relative()
                                         .px_1()
                                         .rounded_sm()
                                         .cursor_pointer()
@@ -3176,7 +3212,12 @@ impl TakoApp {
                                                     theme.accent
                                                 })),
                                         )
-                                        .child(if editing { crate::ui_text::preview::editing() } else { crate::ui_text::preview::edit() }),
+                                        .child(if editing { crate::ui_text::preview::editing() } else { crate::ui_text::preview::edit() })
+                                        // #1661: visual-test が実マウスで押す実矩形
+                                        .child(crate::tab_shape::probe_canvas(
+                                            self.panel_click_probe_bounds.clone(),
+                                            format!("preview-edit-toggle-{}", pane_id.as_u64()),
+                                        )),
                                 )
                             })
                             .when(phv.save_button && dirty && !autosave, |d| {
@@ -3267,6 +3308,7 @@ impl TakoApp {
                                             .wrapping_mul(10_000)
                                             .wrapping_add(item_number as u64),
                                     ))
+                                    .relative()
                                     .flex()
                                     .flex_row()
                                     .items_center()
@@ -3312,6 +3354,14 @@ impl TakoApp {
                                             .whitespace_nowrap()
                                             .child(SharedString::from(item.title.clone())),
                                     )
+                                    // #1661: visual-test が実マウスで押す実矩形
+                                    .child(crate::tab_shape::probe_canvas(
+                                        self.panel_click_probe_bounds.clone(),
+                                        format!(
+                                            "preview-outline-item-{}-{item_number}",
+                                            pane_id.as_u64()
+                                        ),
+                                    ))
                                     .into_any_element()
                             })
                             .collect();
@@ -3864,9 +3914,13 @@ impl TakoApp {
         // #1660: 閉じたペインの全文の塗りは起こさない（起きていても取り込み先が無く捨てる）
         self.pending_editor_seeds
             .retain(|(pane, _)| *pane != pane_id);
+        // #1661: 閉じたペインの描き直しも起こさない
+        self.pending_md_resumes
+            .retain(|(pane, ..)| *pane != pane_id);
         self.preview_text_layouts.remove(&pane_id);
         self.preview_body_lists.remove(&pane_id);
         self.preview_pending_reveal.remove(&pane_id);
+        self.preview_md_resume_heading.remove(&pane_id);
         self.preview_md_block_index.remove(&pane_id);
         self.preview_changelogs.remove(&pane_id);
         self.preview_run_profiles.remove(&pane_id);
