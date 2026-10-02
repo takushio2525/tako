@@ -701,6 +701,14 @@ fn is_stale_socket(name: &str, is_alive: impl Fn(u32) -> bool) -> bool {
 #[cfg(test)]
 use crate::ports::process_alive;
 
+/// テスト用: 器のソケットファイルがあるか（`=` 付きの別名も見る）。
+/// 失敗の診断に載せ、「器は生きているがソケットが消えた」を見分ける（#1866）
+#[cfg(all(test, unix))]
+fn socket_file_present(socket: &str) -> bool {
+    socket_dir()
+        .is_some_and(|dir| dir.join(socket).exists() || dir.join(format!("{socket}=")).exists())
+}
+
 #[cfg(test)]
 impl Drop for TmuxTestGuard {
     fn drop(&mut self) {
@@ -2067,11 +2075,19 @@ set -gq copy-mode-position-format ''
             "同じシェルが続きを受け付ける"
         );
 
-        // セッションを終わらせると、attach 中のクライアントも終わり、生死は「無い」になる
-        let _ = crate::tmux::kill_session(Some(&socket), session);
+        // セッションを終わらせると、attach 中のクライアントも終わり、生死は「無い」になる。
+        // **kill の結果を捨てない**（#1866: ここで落ちた回は理由が 1 ビットも残らず、
+        // 「kill が器へ届いていない」のか「クライアントの終わりが届かない」のかを
+        // 切り分けられなかった）
+        let killed = crate::tmux::kill_session(Some(&socket), session);
+        let exited = wait_child_exit(&mut second, &mut rx2);
         assert!(
-            wait_child_exit(&mut second, &mut rx2),
-            "セッションの終わりでクライアントも終わる"
+            exited,
+            "セッションの終わりでクライアントも終わる。kill-session={killed:?} 生死={:?} \
+             ソケットファイル={} クライアント pid={:?}",
+            probe_session(&socket, session),
+            socket_file_present(&socket),
+            second.child_pid(),
         );
         assert_eq!(probe_session(&socket, session), SessionProbe::SessionGone);
 

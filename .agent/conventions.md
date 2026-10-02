@@ -2493,6 +2493,20 @@ stderr・そのソケットのセッション一覧・PTY / ソケット / サ�
 1 往復要った。実測の答えは PTY 103/511 = **枯渇ではなく名前の取り合い**）。
 番犬は `crates/tako-control/tests/tmux_e2e_watchdog.rs`、A/B は `TAKO_1300_LEGACY=1`。
 
+**器を畳むのは「このプロセスの誰も借りていない」が確定したときだけ（Issue #1866）**。
+器はプロセスごとで、同じバイナリのテストが参照カウントで共有する。借りる側は
+`tmux new-session` を叩く**前に**数に入り、返す側は「減らす → 0 か見る → `kill-server` →
+ソケットの除去」を**同じロックの中で**行う（`tmux_e2e::new_session` / `release_session`）。
+旧実装は「返ってから数に入る」「減らしてから別に 0 か見る」だったので、3 本目の
+`new-session` の最中に先の 2 本が返ると、最後に返った側が**起動中の隣の器ごと**畳み、
+3 本目が `error connecting to …/tako-e2e-1259-<pid> (No such file or directory)` で落ちた
+（全体テストで毎回別の 1 本。`new-session` の返りを遅らせる注入で main は 1/1・同じ数え方の旧アームは 3/3 で再現。
+消したのは他の worker ではなく**同じプロセスの後始末**だった）。
+**テストが自前で `kill-server` / ソケットの除去をしない**（隣のテストの器を消す）。
+番犬は同じ `tmux_e2e_watchdog.rs`（1 実装の外で器を畳む行と、数に入る前に器を叩く行を
+`file:line` で落とす）、振る舞いの固定と A/B（`TAKO_1866_LEGACY=1`）は
+`crates/tako-control/tests/issue1866_tmux_e2e_refcount.rs`。
+
 ## 新しい worktree は PWA のビルドから始まる（Issue #1309 / #574）
 
 `git worktree add` 直後のツリーには `web/tako-remote/dist/` が無い（`.gitignore` 対象）。
