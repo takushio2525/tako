@@ -8,6 +8,17 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.8.27] - 2026-10-03
+
+Nightly patch release (automated). Changes since v0.8.26:
+夜間パッチリリース（自動）。v0.8.26 以降の変更:
+
+- [修正] 実 tmux e2e の器の数え方が、隣のテストの起動中の器を畳んでいたのを直した (#1866) (#1871)
+- [機能追加] LSP 補完（予測変換）: 打鍵中の一覧・仮想化・キーの優先順位・CLI / MCP (#1682) (#1865)
+- [機能追加] ファイルツリーでファイル・フォルダのコピー / 切り取り / 貼り付けをできるようにした (#1860) (#1863)
+- [機能追加] LSP の整形: 全体 / 範囲 + 保存時整形（既定 OFF）（S6）(#1683) (#1862)
+- [修正] 安定版への昇格で Homebrew cask と docs の「最新の安定版」も更新するようにした (#1853) (#1861)
+
 ## [0.8.26] - 2026-10-01
 
 Nightly patch release (automated). Changes since v0.8.25:
