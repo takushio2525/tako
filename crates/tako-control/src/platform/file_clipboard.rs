@@ -28,7 +28,7 @@
 
 use std::path::PathBuf;
 
-use tako_core::file_clipboard::OsFiles;
+use tako_core::file_clipboard::{OsFiles, OsPeek};
 
 /// OS のクリップボードへファイルを書く（`cut` = 切り取り）。返り値は書いた後の変更番号
 pub fn write(paths: &[PathBuf], cut: bool) -> Result<u64, String> {
@@ -41,6 +41,12 @@ pub fn write(paths: &[PathBuf], cut: bool) -> Result<u64, String> {
 /// OS のクリップボードのファイルを読む（無ければ `paths` が空）
 pub fn read() -> OsFiles {
     imp::read(pasteboard_name().as_deref())
+}
+
+/// 中身を読まずに、変更番号とファイルがあるかだけを見る（メタデータだけ。
+/// 2 秒ポーリング・右クリックメニューはこちら = [`tako_core::file_clipboard::OsPeek`]）
+pub fn peek() -> OsPeek {
+    imp::peek(pasteboard_name().as_deref())
 }
 
 /// 変更番号が `stamp` のまま（= tako が書いたまま）なら空にする。空にしたら真
@@ -139,7 +145,7 @@ mod imp {
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
 
-    use tako_core::file_clipboard::OsFiles;
+    use tako_core::file_clipboard::{OsFiles, OsPeek};
 
     type Id = *const c_void;
     type Sel = *const c_void;
@@ -378,6 +384,22 @@ mod imp {
         }
     }
 
+    pub(super) fn peek(name: Option<&str>) -> OsPeek {
+        let _pool = Pool::new();
+        // SAFETY: write と同じ（変更番号と型の一覧 = メタデータだけを読む）
+        unsafe {
+            let Ok(pb) = pasteboard(name) else {
+                return OsPeek::default();
+            };
+            let stamp = Some(send_isize(pb, c"changeCount") as u64);
+            let types = send(pb, c"types");
+            let has_files = !types.is_null()
+                && ns_string("public.file-url")
+                    .is_ok_and(|t| send_bool1(types, c"containsObject:", t));
+            OsPeek { stamp, has_files }
+        }
+    }
+
     /// `NSPasteboardURLReadingFileURLsOnlyKey`（AppKit の定数。読み込み済みの AppKit から引く）
     unsafe fn file_urls_only_key() -> Result<Id, String> {
         let sym = libc::dlsym(
@@ -445,7 +467,7 @@ mod imp {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::path::PathBuf;
 
-    use tako_core::file_clipboard::OsFiles;
+    use tako_core::file_clipboard::{OsFiles, OsPeek};
 
     #[link(name = "user32")]
     extern "system" {
@@ -456,6 +478,7 @@ mod imp {
         fn GetClipboardData(format: u32) -> *mut c_void;
         fn RegisterClipboardFormatW(name: *const u16) -> u32;
         fn GetClipboardSequenceNumber() -> u32;
+        fn IsClipboardFormatAvailable(format: u32) -> i32;
     }
 
     #[link(name = "kernel32")]
@@ -607,6 +630,16 @@ mod imp {
         OsFiles { stamp, paths, cut }
     }
 
+    pub(super) fn peek(_name: Option<&str>) -> OsPeek {
+        // SAFETY: 引数なし（クリップボードを開かずに見る）
+        unsafe {
+            OsPeek {
+                stamp: Some(u64::from(GetClipboardSequenceNumber())),
+                has_files: IsClipboardFormatAvailable(CF_HDROP) != 0,
+            }
+        }
+    }
+
     pub(super) fn clear_if(_name: Option<&str>, stamp: u64) -> bool {
         // SAFETY: 引数なし
         if u64::from(unsafe { GetClipboardSequenceNumber() }) != stamp {
@@ -624,7 +657,7 @@ mod imp {
 mod imp {
     use std::path::PathBuf;
 
-    use tako_core::file_clipboard::OsFiles;
+    use tako_core::file_clipboard::{OsFiles, OsPeek};
 
     pub(super) fn write(
         _name: Option<&str>,
@@ -636,6 +669,10 @@ mod imp {
 
     pub(super) fn read(_name: Option<&str>) -> OsFiles {
         OsFiles::default()
+    }
+
+    pub(super) fn peek(_name: Option<&str>) -> OsPeek {
+        OsPeek::default()
     }
 
     pub(super) fn clear_if(_name: Option<&str>, _stamp: u64) -> bool {
@@ -711,6 +748,9 @@ mod tests {
         std::fs::write(&file, "x").unwrap();
         let paths = vec![file.clone(), dir.join("日本 語")];
         let stamp = imp::write(Some(&name), &paths, false).expect("書ける");
+        let peek = imp::peek(Some(&name));
+        assert_eq!(peek.stamp, Some(stamp));
+        assert!(peek.has_files, "中身を読まずにファイルがあると分かる");
         let back = imp::read(Some(&name));
         assert_eq!(back.stamp, Some(stamp));
         assert_eq!(back.paths, paths);
@@ -720,6 +760,7 @@ mod tests {
         assert_eq!(imp::read(Some(&name)).paths.len(), 2);
         assert!(imp::clear_if(Some(&name), stamp));
         assert!(imp::read(Some(&name)).paths.is_empty());
+        assert!(!imp::peek(Some(&name)).has_files);
         imp::release_unique(&name);
         let _ = std::fs::remove_dir_all(&dir);
     }

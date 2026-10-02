@@ -64,6 +64,23 @@ pub struct OsFiles {
     pub cut: bool,
 }
 
+/// OS のクリップボードの**中身を読まずに**分かること（変更番号と、ファイルがあるか）。
+///
+/// 右クリックメニューの「貼り付け」を押せるか・2 秒ポーリングの古い切り取りの判定は
+/// これだけで決める。中身（ファイル URL）を読むのは実際に貼るときと `op=clipboard` だけ
+/// （ユーザーが貼っていないのに中身を読むと、新しい macOS は pasteboard のプライバシーの
+/// 確認を出しうる。変更番号と型の一覧はメタデータなので出ない）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OsPeek {
+    pub stamp: Option<u64>,
+    pub has_files: bool,
+}
+
+/// 貼れるものがあるか（[`resolve`] が `Some` になるかを中身を読まずに見積もる）
+pub fn can_paste(tako: Option<&FileClipboard>, peek: &OsPeek) -> bool {
+    tako.is_some_and(|t| !t.paths.is_empty() && !is_stale(t, peek.stamp)) || peek.has_files
+}
+
 /// 貼るものがどちらから来たか
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClipSource {
@@ -204,6 +221,37 @@ mod tests {
             ..OsFiles::default()
         };
         assert_eq!(resolve(Some(&tako(ClipMode::Copy, Some(7))), &gone), None);
+    }
+
+    #[test]
+    fn 貼れるかは中身を読まずに変更番号とファイルの有無で決まる() {
+        let fresh = OsPeek {
+            stamp: Some(7),
+            has_files: true,
+        };
+        assert!(can_paste(Some(&tako(ClipMode::Cut, Some(7))), &fresh));
+        // tako の中身が古くても、OS にファイルがあれば貼れる（Finder のコピー）
+        assert!(can_paste(
+            Some(&tako(ClipMode::Cut, Some(7))),
+            &OsPeek {
+                stamp: Some(8),
+                has_files: true
+            }
+        ));
+        // tako の中身が古く、OS にもファイルが無い（テキストをコピーした）= 貼れない
+        assert!(!can_paste(
+            Some(&tako(ClipMode::Cut, Some(7))),
+            &OsPeek {
+                stamp: Some(8),
+                has_files: false
+            }
+        ));
+        assert!(!can_paste(None, &OsPeek::default()));
+        // OS へ書けなかった tako の中身は比べず使う
+        assert!(can_paste(
+            Some(&tako(ClipMode::Copy, None)),
+            &OsPeek::default()
+        ));
     }
 
     #[test]

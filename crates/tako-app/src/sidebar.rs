@@ -1247,7 +1247,7 @@ impl TakoApp {
                                                     })
                                             };
                                             this.select_tree_row(&ctx_path, is_dir, false);
-                                            let can_paste = this.tree_can_paste(&ctx_path);
+                                            let can_paste = this.tree_can_paste();
                                             this.context_menu = Some(ContextMenu {
                                                 path: ctx_path.clone(),
                                                 is_dir,
@@ -3634,23 +3634,18 @@ impl TakoApp {
     }
 
     /// 右クリックメニューを開くときに「貼り付け」を押せるか（#1860）。
-    /// `op=clipboard` = 貼り付けと同じ段取りを読むだけ（何も変えない）
-    pub(crate) fn tree_can_paste(&mut self, row: &std::path::Path) -> bool {
+    ///
+    /// **OS のクリップボードの中身は読まない**（変更番号と「ファイルがあるか」だけ =
+    /// `file_clipboard::can_paste`）。押しただけで中身を読むと、新しい macOS は
+    /// pasteboard のプライバシーの確認を出しうる。中身は実際に貼るときに dispatch が読む
+    pub(crate) fn tree_can_paste(&self) -> bool {
         if tako_core::file_copy::tree_keys_legacy() {
             return false;
         }
-        tako_control::dispatch(
-            self,
-            tako_control::protocol::Request::FileOp {
-                op: tako_control::protocol::FileOpKind::Clipboard,
-                path: row.display().to_string(),
-                name: None,
-                pane: None,
-                dest: None,
-            },
-            PaneOrigin::User,
+        tako_core::file_clipboard::can_paste(
+            self.file_clipboard.as_ref(),
+            &tako_control::platform::file_clipboard::peek(),
         )
-        .is_ok_and(|v| v["items"].as_array().is_some_and(|items| !items.is_empty()))
     }
 
     /// 貼り付け（#1860）。IPC と同じ 3 段を通る: `prepare_offload`（UI スレッドで
@@ -3757,7 +3752,8 @@ impl TakoApp {
         let Some(clip) = self.file_clipboard.as_ref() else {
             return false;
         };
-        let stamp = tako_control::platform::file_clipboard::read().stamp;
+        // 変更番号だけを見る（中身は読まない = 2 秒ごとに pasteboard を読まない）
+        let stamp = tako_control::platform::file_clipboard::peek().stamp;
         if !tako_core::file_clipboard::is_stale(clip, stamp) {
             return false;
         }
