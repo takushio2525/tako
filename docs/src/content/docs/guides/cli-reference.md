@@ -665,6 +665,11 @@ tako file reveal src/main.rs           # Finder で表示
 tako file open-terminal ~/Documents/webapp  # ペイン内で cd
 tako file rename old.txt new.txt
 tako file move notes.md docs          # 別のフォルダへ移す（ツリーの D&D と同じ。同名・自分の配下・別のボリュームは断る）
+tako file copy notes.md src docs      # 複製（最後が貼り付け先。同名は「名前 のコピー」等の別名で置き上書きしない）
+tako file clipboard copy notes.md     # ツリーのコピーと同じ（Finder / エクスプローラーへも貼れる）
+tako file clipboard cut notes.md      # 切り取り（貼ると移動）
+tako file paste docs                  # 貼り付け（フォルダならその中・ファイルならそのフォルダ。省略時はカレントディレクトリ）
+tako file clipboard                   # 中身と、ここへ貼ったときの貼り付け先を表示
 tako file create src helper.ts         # path 配下に name で作成
 tako file mkdir src components
 tako file trash old-notes.md           # ゴミ箱へ移動

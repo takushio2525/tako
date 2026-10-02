@@ -196,6 +196,8 @@ impl TakoApp {
                     }
                     // ⌘クリックは定義ジャンプの続きしか返さない（整形の続きは #1683 の入口から）
                     OffloadContinuation::LspFormat(_) => None,
+                    // 定義ジャンプの問い合わせからは来ない（コピーの続き = #1860）
+                    OffloadContinuation::FileCopied(_) => None,
                 };
                 self.land_lsp_goto(next, menu, cx);
             }
