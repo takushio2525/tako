@@ -23,6 +23,8 @@
 //! | `no-goto` | 定義ジャンプの能力（`definitionProvider` 等）を申告しない（#1680） |
 //! | `loading` | initialized の後 `experimental/serverStatus`（`quiescent: false`）を送り、読み込み（既定 0.8 秒。`--loading-ms` / `TAKO_LSP_FAKE_LOADING_MS`）が済むまで定義ジャンプに空（`[]`）で答え、済んだら `quiescent: true` を送る（rust-analyzer の振る舞い。#1680） |
 //! | `full-sync` | `normal` と同じだが全文同期（`change: 1`）を申告する |
+//! | `no-format` | 整形の能力（`documentFormattingProvider` / `documentRangeFormattingProvider`）を申告しない（#1683） |
+//! | `no-range-format` | 文書全体の整形だけを申告する（範囲の整形は申告しない。#1683） |
 //!
 //! `--diagnostics <file>` か `TAKO_LSP_FAKE_DIAGNOSTICS`（LSP の `Diagnostic` の JSON 配列）を
 //! 渡すと、didOpen と didChange のたびに**その配列をそのまま** publish する（#1679。
@@ -45,6 +47,15 @@
 //! `echo` は問われた位置の語（英数字と `_`）の範囲をそのまま `Location` で返す（#1769。
 //! 位置を往復させて tako の変換とサーバの数え方が揃っているかを見る）。
 //! 当たる規則が無ければ `null`（= 見つからない）で答える。
+//!
+//! 整形の 2 種（`textDocument/formatting` / `rangeFormatting`。#1683）は `--format <file>` か
+//! `TAKO_LSP_FAKE_FORMAT` の規則で答える。形は定義ジャンプの規則と同じく**上から順に最初に
+//! 当たった 1 つ**（`method` / `uri_suffix` で絞る）で、`result`（`TextEdit` の配列をそのまま返す）/
+//! `error`（`{ code, message }` でエラー応答）/ `silent` / `crash` / `delay_ms`（答える前に待つ。
+//! 待つあいだに届いた通知は答えた後に読む）/ `reverse`（既定の答えを逆順で返す）を持つ。
+//! 当たる規則が無い・`result` も `error` も無ければ**既定の整形**: 自分の本文の模型（下記）から
+//! 行末の空白（スペースとタブ）を消す `TextEdit` を作る（範囲の整形は範囲に収まる行末だけ）。
+//! 本文の模型から作るので、tako が送った `didChange` がずれていれば答えもずれる。
 //!
 //! ## 本文の模型（#1769）
 //!
@@ -150,6 +161,9 @@ const GOTO_PROVIDERS: [&str; 4] = [
     "typeDefinitionProvider",
     "implementationProvider",
 ];
+
+/// 整形の 2 種の method（#1683）
+const FORMAT_METHODS: [&str; 2] = ["textDocument/formatting", "textDocument/rangeFormatting"];
 
 /// 行の数え方（#1769。模型の説明は冒頭）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,6 +314,46 @@ fn goto_rule<'a>(
     })
 }
 
+/// 規則のうち、この整形の要求に最初に当たるもの（#1683）
+fn format_rule<'a>(
+    rules: &'a [serde_json::Value],
+    method: &str,
+    params: &serde_json::Value,
+) -> Option<&'a serde_json::Value> {
+    let uri = params["textDocument"]["uri"].as_str().unwrap_or("");
+    rules.iter().find(|rule| {
+        rule["method"].as_str().is_none_or(|m| m == method)
+            && rule["uri_suffix"].as_str().is_none_or(|s| uri.ends_with(s))
+    })
+}
+
+/// 既定の整形（#1683）: 行末の空白を消す。`within` は範囲の整形の範囲（バイト位置）
+fn trailing_space_edits(
+    text: &str,
+    breaks: Breaks,
+    within: Option<(usize, usize)>,
+) -> Vec<serde_json::Value> {
+    let starts = line_starts(text, breaks);
+    let mut edits = Vec::new();
+    for line in 0..starts.len() {
+        let (start, end) = line_span(text, &starts, line, breaks);
+        let content = &text[start..end];
+        let kept = content.trim_end_matches([' ', '\t']).len();
+        if kept == content.len() {
+            continue;
+        }
+        let (from, to) = (start + kept, end);
+        if within.is_some_and(|(a, b)| from < a || to > b) {
+            continue;
+        }
+        edits.push(serde_json::json!({
+            "range": range_json(text, breaks, from, to),
+            "newText": "",
+        }));
+    }
+    edits
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let scenario = arg_or_env(&args, "--scenario", "TAKO_LSP_FAKE_SCENARIO")
@@ -314,6 +368,11 @@ fn main() {
         .and_then(|path| std::fs::read_to_string(path).ok())
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default();
+    let format_rules: Vec<serde_json::Value> =
+        arg_or_env(&args, "--format", "TAKO_LSP_FAKE_FORMAT")
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
     // #1769: 本文の模型（冒頭の説明）
     let breaks = match arg_or_env(&args, "--line-breaks", "TAKO_LSP_FAKE_LINE_BREAKS").as_deref() {
         Some("lf") => Breaks::Lf,
@@ -394,6 +453,13 @@ fn main() {
                 if scenario != "no-goto" {
                     for key in GOTO_PROVIDERS {
                         capabilities[key] = serde_json::json!(true);
+                    }
+                }
+                // #1683: 整形の能力（`no-format` は申告しない・`no-range-format` は全体だけ）
+                if scenario != "no-format" {
+                    capabilities["documentFormattingProvider"] = serde_json::json!(true);
+                    if scenario != "no-range-format" {
+                        capabilities["documentRangeFormattingProvider"] = serde_json::json!(true);
                     }
                 }
                 out.send(serde_json::json!({
@@ -519,6 +585,51 @@ fn main() {
                     "id": id,
                     "result": rule.get("result").cloned().unwrap_or(serde_json::Value::Null),
                 }));
+            }
+            (method, Some(id)) if FORMAT_METHODS.contains(&method) => {
+                let params = &message["params"];
+                let rule = format_rule(&format_rules, method, params);
+                if let Some(rule) = rule {
+                    if rule["crash"].as_bool() == Some(true) {
+                        std::process::exit(5);
+                    }
+                    if rule["silent"].as_bool() == Some(true) {
+                        continue;
+                    }
+                    if let Some(ms) = rule["delay_ms"].as_u64() {
+                        std::thread::sleep(std::time::Duration::from_millis(ms));
+                    }
+                    if let Some(error) = rule.get("error") {
+                        out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": error }));
+                        continue;
+                    }
+                    if let Some(result) = rule.get("result") {
+                        out.send(
+                            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                        );
+                        continue;
+                    }
+                }
+                // 既定: 自分の本文の模型から行末の空白を消す
+                let uri = params["textDocument"]["uri"].as_str().unwrap_or("");
+                let text = docs.get(uri).cloned().unwrap_or_default();
+                let within = params.get("range").map(|range| {
+                    let at = |key: &str| {
+                        let p = &range[key];
+                        offset_at(
+                            &text,
+                            breaks,
+                            p["line"].as_u64().unwrap_or(0) as usize,
+                            p["character"].as_u64().unwrap_or(0) as usize,
+                        )
+                    };
+                    (at("start"), at("end"))
+                });
+                let mut edits = trailing_space_edits(&text, breaks, within);
+                if rule.is_some_and(|r| r["reverse"].as_bool() == Some(true)) {
+                    edits.reverse();
+                }
+                out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": edits }));
             }
             ("shutdown", Some(id)) => out.send(serde_json::json!({
                 "jsonrpc": "2.0",

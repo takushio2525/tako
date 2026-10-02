@@ -55,6 +55,7 @@ use tako_core::lsp::{position, root, sync};
 use tako_core::platform::child_cmd::{self, ChildCmd};
 
 use super::diagnostics::{DiagnosticsStore, DocDiagnostics};
+use super::format::{FormatAnswer, FormatError, FormatRequest};
 use super::goto::{GotoAnswer, GotoError, GotoRequest};
 use super::server::{Handlers, ServerProcess};
 use super::text;
@@ -571,6 +572,21 @@ impl LspManager {
             None => Err(GotoError::Disabled),
         }
     }
+
+    /// 整形の問い合わせ（#1683）。**背景スレッドから呼ぶ**（サーバの起動と応答を待つ。
+    /// 上限は `request.timeout`）。
+    ///
+    /// サーバが見ている本文（送った写し）を `request.text` に揃えてから頼み（打鍵の直後で
+    /// 同期がまだ・同じファイルの別のペインが編集した、のどちらでも答えの座標がずれない）、
+    /// 答えを待つあいだに写しが変わったら [`FormatError::Stale`] で返す。文書が開いていなければ
+    /// 定義ジャンプと同じく問い合わせのあいだだけ `didOpen` する。答えは並べて最小にし、
+    /// 範囲の整形なら範囲の外を変えない形へ収めて返す（当てるのは呼び手）
+    pub fn format(&self, request: &FormatRequest) -> Result<FormatAnswer, FormatError> {
+        match &self.shared {
+            Some(shared) => shared.format(request),
+            None => Err(FormatError::Lsp(GotoError::Disabled)),
+        }
+    }
 }
 
 /// 編集セッションを持つプレビューペイン 1 つと、言語サーバとのつながり（#1679）。
@@ -779,23 +795,7 @@ impl Shared {
             doc.holders.insert(holder, buffer_version);
             return;
         };
-        let changes = match kind {
-            SyncKind::None => None,
-            SyncKind::Full => Some(vec![json!({ "text": position::wire_text(text) })]),
-            SyncKind::Incremental => sync::diff_change(&doc.text, text).map(|change| {
-                vec![match change.range {
-                    Some(((sl, sc), (el, ec))) => json!({
-                        "range": {
-                            "start": { "line": sl, "character": sc },
-                            "end": { "line": el, "character": ec },
-                        },
-                        "text": change.text,
-                    }),
-                    None => json!({ "text": change.text }),
-                }]
-            }),
-        };
-        if let Some(changes) = changes {
+        if let Some(changes) = content_changes(kind, &doc.text, text) {
             let params = json!({
                 "textDocument": { "uri": uri, "version": version },
                 "contentChanges": changes,
@@ -1478,34 +1478,10 @@ impl Shared {
         let spec = resolved.spec;
         let uri = tako_core::file_uri::from_path(&request.path);
         // 開いていなければ問い合わせのあいだだけ開く（lease が落ちると didClose）
-        let _transient = if self.lock().docs.contains_key(&uri) {
-            None
-        } else {
-            if let Some(error) = self.not_installed_error(spec) {
-                return Err(error);
-            }
-            let source = match &request.document {
-                Some(document) => std::borrow::Cow::Borrowed(document.as_str()),
-                None => {
-                    let bytes =
-                        std::fs::read(&request.path).map_err(|e| GotoError::Unreadable {
-                            error: e.kind().to_string(),
-                        })?;
-                    std::borrow::Cow::Owned(String::from_utf8_lossy(&bytes).into_owned())
-                }
-            };
-            match self.open(&request.path, &source, 0) {
-                // すれ違いで別のペインが開いていれば、その文書の持ち手に加わる（#1769）
-                DocLink::Open(lease) => Some(lease),
-                // 断られた = 未導入の記録がある / 受け持つサーバが無い
-                _ => {
-                    return Err(self
-                        .not_installed_error(spec)
-                        .unwrap_or(GotoError::NoServer))
-                }
-            }
-        };
-        let (process, capabilities, key) = self.wait_ready(&uri, spec, request, deadline)?;
+        let _transient =
+            self.open_for_request(&request.path, &uri, spec, request.document.as_deref())?;
+        let (process, capabilities, key) =
+            self.wait_ready(&uri, spec, request.timeout, deadline)?;
         if !tako_core::lsp::goto::server_supports(&capabilities, request.kind) {
             return Err(GotoError::Unsupported { server: spec.id });
         }
@@ -1664,7 +1640,7 @@ impl Shared {
         &self,
         uri: &str,
         spec: &'static ServerSpec,
-        request: &GotoRequest,
+        timeout: Duration,
         deadline: Instant,
     ) -> Result<(Arc<ServerProcess>, Value, ServerKey), GotoError> {
         loop {
@@ -1703,11 +1679,48 @@ impl Shared {
             if Instant::now() >= deadline {
                 return Err(GotoError::Timeout {
                     server: spec.id,
-                    secs: request.timeout.as_secs(),
+                    secs: timeout.as_secs(),
                     starting: true,
                 });
             }
             std::thread::sleep(super::goto::READY_POLL);
+        }
+    }
+
+    /// 問い合わせのために文書を開く（#1680 / #1683）。既に開いていれば何もしない（`None`）。
+    ///
+    /// 開いていなければ**問い合わせのあいだだけ**開く（返す持ち手が落ちると `didClose`）。本文は
+    /// `document`（編集セッションの全文）、無ければディスクの中身。「開いただけではサーバを
+    /// 起こさない」（設計書 §16-2）は保ったまま、利用者が明示的に問い合わせたときだけ起こす
+    fn open_for_request(
+        &self,
+        path: &Path,
+        uri: &str,
+        spec: &'static ServerSpec,
+        document: Option<&str>,
+    ) -> Result<Option<Arc<DocLease>>, GotoError> {
+        if self.lock().docs.contains_key(uri) {
+            return Ok(None);
+        }
+        if let Some(error) = self.not_installed_error(spec) {
+            return Err(error);
+        }
+        let source = match document {
+            Some(document) => std::borrow::Cow::Borrowed(document),
+            None => {
+                let bytes = std::fs::read(path).map_err(|e| GotoError::Unreadable {
+                    error: e.kind().to_string(),
+                })?;
+                std::borrow::Cow::Owned(String::from_utf8_lossy(&bytes).into_owned())
+            }
+        };
+        match self.open(path, &source, 0) {
+            // すれ違いで別のペインが開いていれば、その文書の持ち手に加わる（#1769）
+            DocLink::Open(lease) => Ok(Some(lease)),
+            // 断られた = 未導入の記録がある / 受け持つサーバが無い
+            _ => Err(self
+                .not_installed_error(spec)
+                .unwrap_or(GotoError::NoServer)),
         }
     }
 
@@ -1719,6 +1732,122 @@ impl Shared {
             .values()
             .find(|d| d.uri_key == wanted)
             .map(|d| d.text.clone())
+    }
+
+    fn format(&self, request: &FormatRequest) -> Result<FormatAnswer, FormatError> {
+        use tako_core::lsp::format as fmt;
+        let deadline = Instant::now() + request.timeout;
+        let Some(resolved) = servers::resolve_in(self.config.table, &request.path) else {
+            return Err(FormatError::Lsp(GotoError::NoServer));
+        };
+        let spec = resolved.spec;
+        let uri = tako_core::file_uri::from_path(&request.path);
+        let _transient = self
+            .open_for_request(&request.path, &uri, spec, Some(&request.text))
+            .map_err(FormatError::Lsp)?;
+        let (process, capabilities, _) = self
+            .wait_ready(&uri, spec, request.timeout, deadline)
+            .map_err(FormatError::Lsp)?;
+        let ranged = request.range.is_some();
+        if !fmt::server_supports(&capabilities, ranged) {
+            return Err(FormatError::Unsupported {
+                server: spec.id,
+                ranged,
+            });
+        }
+        // サーバが見ている本文を頼む本文へ揃える（打鍵の直後で同期がまだ / 同じファイルの
+        // 別のペインが後から編集した。どちらも答えの座標が頼んだ本文とずれる）
+        self.align_shadow(&uri, &request.text, spec)?;
+        let params = fmt::params(&uri, &request.text, request.options, request.range.clone());
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1));
+        let answer = match process.request(fmt::method(ranged), params, remaining) {
+            Ok(answer) => answer,
+            Err(super::server::RpcError::Timeout(_)) => {
+                return Err(FormatError::Lsp(GotoError::Timeout {
+                    server: spec.id,
+                    secs: request.timeout.as_secs(),
+                    starting: false,
+                }))
+            }
+            Err(super::server::RpcError::Server(e)) => {
+                return Err(FormatError::Lsp(GotoError::ServerError {
+                    server: spec.id,
+                    code: e.code,
+                    detail: e.message,
+                }))
+            }
+            Err(_) => return Err(FormatError::Lsp(GotoError::Crashed { server: spec.id })),
+        };
+        // 待つあいだに写しが変わった（打鍵・別のペイン）= 答えの座標は今の本文に合わない
+        if self.shadow_text(&uri).as_deref() != Some(request.text.as_str()) {
+            return Err(FormatError::Stale);
+        }
+        let invalid = |detail: String| FormatError::InvalidEdits {
+            server: spec.id,
+            detail,
+        };
+        let changes =
+            fmt::parse_text_edits(&answer, &request.text).map_err(|e| invalid(e.to_string()))?;
+        let ordered = tako_core::text_edit::order_changes(&request.text, changes)
+            .map_err(|e| invalid(e.to_string()))?;
+        let (changes, dropped) = match &request.range {
+            Some(range) => {
+                fmt::restrict_to_range(&request.text, ordered, range).map_err(|outside| {
+                    FormatError::OutsideRange {
+                        server: spec.id,
+                        count: outside.count,
+                    }
+                })?
+            }
+            None => (ordered, 0),
+        };
+        Ok(FormatAnswer {
+            server: spec.id,
+            changes,
+            dropped,
+        })
+    }
+
+    /// サーバが見ている本文（写し）を `text` に揃える（#1683）。揃っていれば何も送らない。
+    ///
+    /// 版は文書ごとに単調に 1 つ進める（#1769 の規則）。持ち手ごとの「取り込んだ版」は
+    /// 触らない: 次にそのペインが同期したとき、本文が同じなら送らずに版だけ覚える
+    fn align_shadow(
+        &self,
+        uri: &str,
+        text: &str,
+        spec: &'static ServerSpec,
+    ) -> Result<(), FormatError> {
+        let mut guard = self.lock();
+        let inner = &mut *guard;
+        let Some(doc) = inner.docs.get_mut(uri) else {
+            return Err(FormatError::Lsp(GotoError::Closed));
+        };
+        if doc.text == text {
+            return Ok(());
+        }
+        let version = doc.version.saturating_add(1);
+        let live = inner.servers.get(&doc.key).and_then(|slot| {
+            (slot.lifecycle.state == ServerState::Running && doc.opened == Some(slot.generation))
+                .then(|| slot.process.clone().map(|p| (p, slot.sync_kind)))
+                .flatten()
+        });
+        if let Some((process, kind)) = live {
+            if let Some(changes) = content_changes(kind, &doc.text, text) {
+                let params = json!({
+                    "textDocument": { "uri": uri, "version": version },
+                    "contentChanges": changes,
+                });
+                if process.notify("textDocument/didChange", params).is_err() {
+                    return Err(FormatError::Lsp(GotoError::Crashed { server: spec.id }));
+                }
+            }
+        }
+        replace_text(&mut doc.text, text);
+        doc.version = version;
+        Ok(())
     }
 }
 
@@ -1855,6 +1984,26 @@ fn resolved_language(table: &'static [ServerSpec], spec: &ServerSpec, path: &Pat
         .unwrap_or("plaintext")
 }
 
+/// `didChange` の `contentChanges`（写し `old` → 今の本文 `new`）。同期しないサーバは `None`
+fn content_changes(kind: SyncKind, old: &str, new: &str) -> Option<Vec<Value>> {
+    match kind {
+        SyncKind::None => None,
+        SyncKind::Full => Some(vec![json!({ "text": position::wire_text(new) })]),
+        SyncKind::Incremental => sync::diff_change(old, new).map(|change| {
+            vec![match change.range {
+                Some(((sl, sc), (el, ec))) => json!({
+                    "range": {
+                        "start": { "line": sl, "character": sc },
+                        "end": { "line": el, "character": ec },
+                    },
+                    "text": change.text,
+                }),
+                None => json!({ "text": change.text }),
+            }]
+        }),
+    }
+}
+
 fn replace_text(shadow: &mut String, text: &str) {
     shadow.clear();
     shadow.push_str(text);
@@ -1891,7 +2040,8 @@ fn stop_process(process: &ServerProcess, timeout: Duration) {
 /// サーバが無駄な仕事をする）。S1 は文書同期と診断の受信、#1680 が定義ジャンプの 4 種を足した
 fn initialize_params(root_uri: &str, root_name: &str) -> Value {
     use lsp_types::{
-        ClientCapabilities, ClientInfo, GeneralClientCapabilities, GotoCapability,
+        ClientCapabilities, ClientInfo, DocumentFormattingClientCapabilities,
+        DocumentRangeFormattingClientCapabilities, GeneralClientCapabilities, GotoCapability,
         InitializeParams, PositionEncodingKind, PublishDiagnosticsClientCapabilities,
         TextDocumentClientCapabilities, TextDocumentSyncClientCapabilities, Uri, WorkspaceFolder,
     };
@@ -1936,6 +2086,13 @@ fn initialize_params(root_uri: &str, root_name: &str) -> Value {
                 declaration: goto(),
                 type_definition: goto(),
                 implementation: goto(),
+                // #1683: 整形（文書全体 / 範囲）。複数範囲（`rangesSupport`）は使わない
+                formatting: Some(DocumentFormattingClientCapabilities {
+                    dynamic_registration: Some(false),
+                }),
+                range_formatting: Some(DocumentRangeFormattingClientCapabilities {
+                    dynamic_registration: Some(false),
+                }),
                 ..Default::default()
             }),
             ..Default::default()
@@ -2003,7 +2160,7 @@ mod tests {
     }
 
     #[test]
-    fn 初期化の申告は_utf16_と文書同期と診断と定義ジャンプだけ() {
+    fn 初期化の申告は_utf16_と文書同期と診断と定義ジャンプと整形だけ() {
         let params = initialize_params("file:///w", "w");
         assert_eq!(
             params["capabilities"]["general"]["positionEncodings"],
@@ -2017,8 +2174,10 @@ mod tests {
             vec![
                 "declaration",
                 "definition",
+                "formatting",
                 "implementation",
                 "publishDiagnostics",
+                "rangeFormatting",
                 "synchronization",
                 "typeDefinition"
             ]
