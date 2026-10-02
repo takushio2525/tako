@@ -71,4 +71,4 @@
 
 ## 2026-10-02（#1661: Markdown を編集して抜けたら描画へ戻し、目次を作り直すようにした）
 - 表示をエディタの行へ落とす判定を `refresh_preview_from_editor` の 1 か所（`EditState::shows_editor_lines`）へ寄せ、抜けたら**本文から**描き直す（5,000 行以下はその場・超えたら background）。抜けた後の save / reload・競合中も描画のまま・見ていた節の見出しから描く。編集中も目次が使える（`source_line`。CLI / MCP は既存の preview-outline）。layout へは抜けた先のモード
-- 実測: `scripts/test-md-edit-resume-1661.sh` 49 PASS 0 FAIL / main（8c50618）は 22 PASS 23 FAIL（① で code のまま・目次 ERR）・A/B `TAKO_1661_LEGACY=1` で ① と visual 節が名指しで FAILED・番犬への注入 8 通りすべて file:line で FAILED
+- 実測: `scripts/test-md-edit-resume-1661.sh` 49 PASS 0 FAIL / main（048a2d9）は 22 PASS 23 FAIL（① で code のまま・目次 ERR）・A/B `TAKO_1661_LEGACY=1` で ① と visual 節が名指しで FAILED・番犬への注入 8 通りすべて file:line で FAILED・workspace 6362 passed・カタログ +132 B（並置 #1872 / ⌘F の同型 #1873）

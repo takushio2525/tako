@@ -464,13 +464,14 @@ else
   echo "== ⑨ 画面: visual-test 節 md-edit-resume =="
   DUMP="${DUMP_DIR:-$TMP/frames}"
   mkdir -p "$DUMP"
-  run_visual() { # ログ 追加の env…
-    local log="$1" pid i rc=0
-    shift
+  run_visual() { # ログ フレームの置き場 追加の env…
+    local log="$1" frames="$2" pid i rc=0
+    shift 2
     rm -rf "$TAKO_DATA_DIR"
-    mkdir -p "$TAKO_DATA_DIR"
+    mkdir -p "$TAKO_DATA_DIR" "$frames"
+    # 腕ごとに置き場を分ける（同じ名前のフレームを後の腕が上書きすると、落ちた腕の画面が残らない）
     launch_isolated_gui "$log" TAKO_VISUAL_TEST=1 TAKO_VISUAL_ONLY=md-edit-resume \
-      TAKO_VISUAL_DUMP_DIR="$DUMP" "$@" || rc=$?
+      TAKO_VISUAL_DUMP_DIR="$frames" "$@" || rc=$?
     if [ "$rc" -eq 4 ]; then
       echo "  仮想ディスプレイを用意できないので画面は未実測"
       return 4
@@ -485,12 +486,12 @@ else
     grep -E "TAKO_VISUAL_1661|TAKO_APP_SELF_TEST_FAILED|TAKO_VISUAL_TEST_OK" "$log" | sed 's/^/    /'
     grep -q "TAKO_VISUAL_TEST_OK" "$log"
   }
-  if run_visual "$TMP/visual.log"; then
+  if run_visual "$TMP/visual.log" "$DUMP/new"; then
     pass "visual-test md-edit-resume が通る（編集 / 目次 / 編集中 を実マウスで押す）"
   else
     fail "visual-test md-edit-resume が落ちた"
   fi
-  if run_visual "$TMP/visual-legacy.log" TAKO_1661_LEGACY=1; then
+  if run_visual "$TMP/visual-legacy.log" "$DUMP/legacy" TAKO_1661_LEGACY=1; then
     fail "legacy でも visual-test md-edit-resume が通ってしまう（検出力が無い）"
   else
     case "$(grep TAKO_APP_SELF_TEST_FAILED "$TMP/visual-legacy.log")" in
@@ -498,8 +499,8 @@ else
       *) fail "legacy の visual 節が別の理由で落ちた: $(grep TAKO_APP_SELF_TEST_FAILED "$TMP/visual-legacy.log")" ;;
     esac
   fi
-  echo "  フレーム: $DUMP"
-  ls "$DUMP" 2>/dev/null | sed 's/^/    /'
+  echo "  フレーム: ${DUMP}（new / legacy）"
+  ls "$DUMP/new" "$DUMP/legacy" 2>/dev/null | sed 's/^/    /'
 fi
 
 echo
