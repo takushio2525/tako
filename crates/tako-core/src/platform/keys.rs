@@ -157,7 +157,7 @@ pub fn link_modifier_active(platform: Platform, platform_key: bool, control: boo
     }
 }
 
-/// ファイルツリーのコピー / 切り取り / 貼り付けの操作（FR-3.33 / Issue #1860）
+/// ファイルツリーのコピー / 切り取り / 貼り付けの操作（FR-3.34 / Issue #1860）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TreeClipKey {
     Copy,

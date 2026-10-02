@@ -218,7 +218,7 @@ pub fn move_refused(refusal: &tako_core::file_move::MoveRefusal) -> String {
     }
 }
 
-// --- コピー / 切り取り / 貼り付け（FR-3.33 / #1860。キー: sidebar.clip_*） ---
+// --- コピー / 切り取り / 貼り付け（FR-3.34 / #1860。キー: sidebar.clip_*） ---
 
 /// 右クリックメニュー・失敗の通知の操作名（押した操作と失敗した操作の名前を揃える = #1399）
 pub fn menu_cut() -> &'static str {

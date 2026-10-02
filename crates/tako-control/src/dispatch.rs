@@ -4208,7 +4208,7 @@ fn dispatch_inner(
                     ))?;
                     run_file_move(host, &path, std::path::Path::new(&dest))
                 }
-                // FR-3.33 / #1860: ここは同期の経路（`TAKO_OFFLOAD=0`・テスト・直呼び）。
+                // FR-3.34 / #1860: ここは同期の経路（`TAKO_OFFLOAD=0`・テスト・直呼び）。
                 // IPC と GUI の ⌘V は `prepare_offload` が同じ `run_file_copy` を background で回す
                 FileOpKind::Copy => {
                     let dest = dest.ok_or(DispatchError::InvalidParams(
@@ -15177,7 +15177,7 @@ pub struct CopyDone {
     pub stats: tako_core::file_copy::CopyStats,
 }
 
-/// 1 つ写す（FR-3.33 / #1860）。**判定・別名・実行は `tako_core::file_copy` の 1 実装**。
+/// 1 つ写す（FR-3.34 / #1860）。**判定・別名・実行は `tako_core::file_copy` の 1 実装**。
 /// ファイルシステムだけを触り host は触らないので background でも回せる
 /// （後始末は [`finish_file_copy`] / [`finish_paste_copies`] が UI スレッドで行う）
 pub fn run_file_copy(
@@ -35974,7 +35974,7 @@ mod tests {
             &dir.join("src/a.txt"),
             Some(&dir.join("dst")),
         );
-        let Some(Ok(job)) = prepare_offload(&host, &request) else {
+        let Some(Ok(job)) = prepare_offload(&mut host, &request) else {
             panic!("コピーが offload されない");
         };
         assert!(host.file_copies.is_empty(), "準備の段では写さない");
@@ -35988,28 +35988,28 @@ mod tests {
         // dest が無ければ準備の段で断る
         assert!(matches!(
             prepare_offload(
-                &host,
+                &mut host,
                 &issue1860_op(FileOpKind::Copy, &dir.join("src/a.txt"), None)
             ),
             Some(Err(DispatchError::InvalidParams(_)))
         ));
         // 貼り付け: コピーは offload・切り取りは同期・空は準備の段で理由つき
         let paste = issue1860_op(FileOpKind::Paste, &dir.join("folder"), None);
-        assert!(matches!(prepare_offload(&host, &paste), Some(Err(_))));
+        assert!(matches!(prepare_offload(&mut host, &paste), Some(Err(_))));
         dispatch(
             &mut host,
             issue1860_op(FileOpKind::ClipboardCopy, &dir.join("src/a.txt"), None),
             PaneOrigin::Cli,
         )
         .unwrap();
-        assert!(matches!(prepare_offload(&host, &paste), Some(Ok(_))));
+        assert!(matches!(prepare_offload(&mut host, &paste), Some(Ok(_))));
         dispatch(
             &mut host,
             issue1860_op(FileOpKind::ClipboardCut, &dir.join("src/a.txt"), None),
             PaneOrigin::Cli,
         )
         .unwrap();
-        assert!(prepare_offload(&host, &paste).is_none(), "移動は同期");
+        assert!(prepare_offload(&mut host, &paste).is_none(), "移動は同期");
         let _ = std::fs::remove_dir_all(dir);
     }
 

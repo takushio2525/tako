@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-tree-clipboard-1860.sh — ファイルツリーのコピー / 切り取り / 貼り付け（FR-3.33 / #1860）の実経路テスト
+# test-tree-clipboard-1860.sh — ファイルツリーのコピー / 切り取り / 貼り付け（FR-3.34 / #1860）の実経路テスト
 #
 # 何を確かめるか（Issue #1860 の受け入れのうち、GUI・CLI・MCP・OS のクリップボードを通して初めて言えるもの）:
 #   ① visual-test `tree-clipboard` 節: 隔離 GUI（tako-vd）で**実マウス・実キー**の入口から
