@@ -23,18 +23,35 @@
 //! - 後始末はソケットファイルまで消す。tmux は `kill-server` でファイルを**残す**
 //!   （実測: この機の 208 個のうち 173 個が pid つきテストソケットの残骸）ので、
 //!   プロセスごとの名前にするだけだと残骸が 1 回 1 個ずつ増えてしまう
+//! - **器を畳むのは「誰も借りていない」が確定しているときだけ**（#1866）。
+//!   借りる側は `tmux new-session` を叩く**前に**数に入り（予約）、返す側は
+//!   「数を減らす → 0 か見る → `kill-server` → ソケットを消す」を**同じロックの中で**行う
+//!
+//! ## #1866: 器を畳む判定が、隣のテストの起動中の器を消していた
+//!
+//! 旧実装は「`new-session` が返ってから数を増やす」「数を減らしてから別に 0 か見て
+//! 畳む」だった。同じバイナリの 3 本目のテストが `new-session` を叩いている最中
+//! （器にセッションはできたが、まだ数に入っていない）に先の 2 本が返ると、
+//! 最後に返った側が数 0 を見て器を畳み、ソケットファイルまで消す。3 本目は
+//! `error connecting to …/tako-e2e-1259-<pid> (No such file or directory)` で落ちる
+//! （PR #1862 の全体テストで観測。`new-session` の返りを遅らせる注入で main は 1/1・
+//! 同じ数え方の旧アームは 3/3 で再現し、消したのは**同じプロセスの後始末**だったことを
+//! 時系列で確かめた）。
+//! 負荷で `new-session` が遅くなるほど窓が広がるので、全体テストの時だけ落ちていた。
+//! A/B は `TAKO_1866_LEGACY=1`、固定は `issue1866_tmux_e2e_refcount.rs`。
 //!
 //! 番犬 `crates/tako-control/tests/tmux_e2e_watchdog.rs` が、固定名の器と
-//! 診断なしの `new-session` が戻ってきたら落とす。
+//! 診断なしの `new-session`、1 実装の外で器を畳む呼び出しが戻ってきたら落とす。
 
-// 取り込む側（実 tmux e2e 7 本）ごとに使う項目が違う
+// 取り込む側（実 tmux e2e 8 本）ごとに使う項目が違う
 #![allow(dead_code)]
 
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// tmux の CLI は正常なら数十 ms で返る。ここは「返らない」を見分けるための上限で、
@@ -47,13 +64,51 @@ pub const DIAG_BASE: Duration = Duration::from_secs(5);
 /// 子の終了を見に行く間隔（`try_wait` は安い syscall）
 const POLL: Duration = Duration::from_millis(20);
 
-/// **このプロセスが今この器に持っているセッション数**。
+/// **このプロセスが今この器に持っているセッション数**（起動中の予約を含む）。
 ///
 /// 1 つのテストバイナリの中でテストは**並列に走る**（`claude_tui_e2e` は 7 本）。
 /// 器はプロセス単位なので、1 本が終わるたびに `kill-server` すると
 /// **同じバイナリの隣のテストのセッションまで巻き添えで消える**。最後の 1 本が
-/// 返したときだけ器を畳む
-static LIVE: AtomicUsize = AtomicUsize::new(0);
+/// 返したときだけ器を畳む。
+///
+/// 原子変数ではなくロックにしているのは、「0 になった」と「器を畳む」の間に
+/// 隣の予約を割り込ませないため（#1866。判定と kill を別々に行うと、その隙に
+/// 起動した隣の器を消す）
+static LIVE: Mutex<usize> = Mutex::new(0);
+
+/// 数のロック。テストの panic で毒が入っても数そのものは正しいので中身を使う
+fn live() -> MutexGuard<'static, usize> {
+    LIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A/B の旧アーム（`TAKO_1866_LEGACY=1`）。#1866 を観測したときの数え方へ戻す:
+/// 数に入るのは `new-session` が**返ってから**、器を畳む判定は数を減らした**後に別に**行う
+pub fn legacy_1866() -> bool {
+    std::env::var("TAKO_1866_LEGACY").is_ok_and(|v| v == "1")
+}
+
+/// `new-session` が成功して**呼び手へ返る直前**に呼ぶ差し込み口（#1866 の固定テスト用）。
+///
+/// 「器にセッションはできたが、呼び手はまだそれを使い始めていない」瞬間に
+/// 隣の後始末を走らせるために使う。旧アームではこの時点でまだ数に入っていない
+/// （= 修正前の窓そのもの）。既定は空
+type AfterNewSession = Box<dyn Fn(&[&str]) + Send + Sync>;
+static AFTER_NEW_SESSION: Mutex<Option<AfterNewSession>> = Mutex::new(None);
+
+pub fn set_after_new_session(hook: impl Fn(&[&str]) + Send + Sync + 'static) {
+    *AFTER_NEW_SESSION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(hook));
+}
+
+fn after_new_session(args: &[&str]) {
+    let hook = AFTER_NEW_SESSION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(hook) = hook.as_ref() {
+        hook(args);
+    }
+}
 
 /// A/B の旧アーム（`TAKO_1300_LEGACY=1`）。器の名前を**固定**へ戻し、
 /// `new-session` の失敗も素の 1 行だけにする（= #1300 を観測したときの形）
@@ -191,6 +246,12 @@ pub fn run_tmux(socket: &str, args: &[&str], base: Duration) -> Ran {
 /// `tmux -L <socket> new-session <args…>` を走らせ、失敗したら
 /// **理由 + 器の状態**を `Err` で返す（そのまま `panic!` へ流せる 1 枚の診断）
 pub fn new_session(socket: &str, args: &[&str]) -> Result<(), String> {
+    let legacy = legacy_1866();
+    if !legacy {
+        // **器を叩く前に数に入る**（#1866）。こうしておけば、起動中に隣が最後の 1 本を
+        // 返しても数は 0 にならず、器もソケットも畳まれない
+        *live() += 1;
+    }
     if inject_duplicate() {
         // 先に同じセッションを作っておく = 本番と同じ「取り合い」の形にする
         let mut first = vec!["new-session"];
@@ -201,11 +262,18 @@ pub fn new_session(socket: &str, args: &[&str]) -> Result<(), String> {
     full.extend_from_slice(args);
     let ran = run_tmux(socket, &full, BASE);
     if ran.ok {
-        LIVE.fetch_add(1, Ordering::SeqCst);
+        after_new_session(args);
+        if legacy {
+            // 旧アーム: 返ってから数に入る（この手前の窓で隣が器を畳める = #1866）
+            *live() += 1;
+        }
         return Ok(());
     }
     if legacy_1300() {
         // 旧アーム: 理由も器の状態も残さない（#1300 を観測したときの assert）
+        if !legacy {
+            unreserve(socket);
+        }
         return Err("tmux new-session が失敗した".to_string());
     }
     let diag = format!(
@@ -218,8 +286,19 @@ pub fn new_session(socket: &str, args: &[&str]) -> Result<(), String> {
     );
     // これから落ちるので、自分専用の器は畳んでおく（注入した残骸も道連れにする）。
     // **隣のテストがセッションを持っていれば畳まない**（旧アームも触らない）
-    kill_server_if_idle(socket);
+    if legacy {
+        kill_server_if_idle(socket);
+    } else {
+        unreserve(socket);
+    }
     Err(diag)
+}
+
+/// 予約を 1 つ返し、それが最後なら器を畳む（失敗した `new_session` の後始末）
+fn unreserve(socket: &str) {
+    let mut live = live();
+    *live = live.saturating_sub(1);
+    retire_if_unused(socket, &live);
 }
 
 /// `tmux -L <socket> send-keys <args…>` を期限つきで送る。
@@ -387,15 +466,35 @@ pub fn kill_session(socket: &str, session: &str) {
 /// ソケットファイルまで消す（`EmuGuard` / `SessionGuard` の `Drop` はこれを呼ぶ）
 pub fn release_session(socket: &str, session: &str) {
     kill_session(socket, session);
-    LIVE.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-        Some(n.saturating_sub(1))
-    })
-    .ok();
-    kill_server_if_idle(socket);
+    if legacy_1866() {
+        // 旧アーム: 減らしてから**ロックの外で**別に 0 か見る（#1866 の形）
+        {
+            let mut live = live();
+            *live = live.saturating_sub(1);
+        }
+        kill_server_if_idle(socket);
+        return;
+    }
+    // 減らす・0 か見る・畳むを 1 つのロックの中で行う（隣の予約を割り込ませない）
+    let mut live = live();
+    *live = live.saturating_sub(1);
+    retire_if_unused(socket, &live);
 }
 
-/// 借りているセッションが 0 本のときだけ、**自分専用の器**を畳んで
-/// ソケットファイルまで消す。
+/// **旧アーム（`TAKO_1866_LEGACY=1`）専用**。借りているセッションが 0 本なら器を畳む。
+///
+/// 数を読んでから畳むまでの間はロックを手放す（= #1866 の窓そのもの）ので、
+/// 取り込む側からは呼べないようにしてある。器を返すのは [`release_session`] だけ
+fn kill_server_if_idle(socket: &str) {
+    let idle = *live() == 0;
+    if idle {
+        retire_if_unused(socket, &0);
+    }
+}
+
+/// `live`（**ロック中の数**）が 0 なら器を畳む。呼び手はロックを持ったまま渡すので、
+/// 判定から `kill-server`・ソケットの除去までの間に隣が予約を入れることはない
+/// （予約はロックを待ち、畳み終わった後に新しい器を起こす）。
 ///
 /// 旧アーム（固定名 = 他プロセスと共有）では器ごと落とすと他プロセスの巻き添えに
 /// なるので触らない。
@@ -403,8 +502,8 @@ pub fn release_session(socket: &str, session: &str) {
 /// 製品側にも `tako_core::tmux_backend::kill_server` があるが、そちらは素の
 /// `output()` で**期限が無い**（返らない器に当たるとテストごと固まって Drop が
 /// 1 つも走らない = #1271）。ここは期限つきで叩き、ファイルの除去だけ 1 実装を借りる
-pub fn kill_server_if_idle(socket: &str) {
-    if legacy_1300() || LIVE.load(Ordering::SeqCst) > 0 {
+fn retire_if_unused(socket: &str, live: &usize) {
+    if legacy_1300() || *live > 0 {
         return;
     }
     let _ = run_tmux(socket, &["kill-server"], BASE);

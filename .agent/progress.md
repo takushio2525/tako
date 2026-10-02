@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-09-28（#1834: ファイルツリーの D&D でファイル・フォルダを別のフォルダへ移せるようにした）
-- 判定・実行・付け替え先は `tako_core::file_move` の 1 実装 → dispatch `FileOp{op: move, dest}` → CLI `tako file move` / MCP `tako_file_op` の `op=move`（ツールは増やさない）。同名・自分の配下・別のボリューム（EXDEV）は理由つきで断る。開いているペインはパス・バッファ・LSP（didClose → didOpen）・監視ごと付け替わり #1659 の削除扱いにならない
-- 仕上げで、大文字小文字を変えて名指すと付け替えと配下の判定が外れる穴（macOS の APFS / Windows。`from_real` の最後の成分が綴りのまま）を実測で再現して直した（リンク以外は移す元ごと canonicalize）。番犬「移動の実行はdispatchの1か所だけ」が Windows の区切り（`display()` の字面を `/` の定数と比較）で dispatch 自身を違反に数えていたのも直した
-- 実測: `scripts/test-tree-move-1834.sh` 31 PASS 0 FAIL（実マウス 13 場面・CLI/MCP 字面一致 7 組・A/B `TAKO_1834_LEGACY=1` で FAILED）・workspace 6161 passed 0 failed・clippy 3 宇宙 0・check-windows error 0（足した行の警告 0）
-
 ## 2026-09-29（#1843: docs サイトの検索流入を増やす — 検索向けの title・構造化データ・フォントの非同期化・解説 2 本）
 - 主要 17 ページに `seoTitle`（見出しは変えず `<title>` と og:title だけ）・description 10 本を検索意図へ。JSON-LD（トップ WebSite / 各ページ BreadcrumbList / 「よくある質問」節から FAQPage）を `docs/src/structuredData.ts` の 1 か所で組む。フォントの `@import` を head の preconnect + 非同期読み込みへ。解説「Claude Code を複数同時に動かす」「tmux で AI エージェントを動かす」とハブへの導線
 - 実測: `docs/scripts/verify-seo.mjs`（新・CI の docs 節）33 ページ緑・注入 7 通りすべて名指しで FAILED・schema.org 語彙の検査 errors 0。Lighthouse の前後は PR 本文
@@ -68,3 +63,7 @@
 ## 2026-10-02（#1682: LSP 補完（予測変換）= 打鍵中の一覧・仮想化・キーの優先順位・CLI / MCP）
 - core `lsp::completion`（読み取り・rank・truncate・route_key 20 通り・Session）+ `replace_position_ranges`（並べ方・重なり・最小化は #1683 の `order_changes`、当て方は離れた範囲をつないだ差分 = undo 1 回で範囲の外を抱えない）→ manager の取り消しの列（`$/cancelRequest`）・resolve・一時 didOpen は持ち手で加わる → dispatch 3 段 + `lsp_completion_apply` → CLI `tako lsp completion` / MCP `tako_lsp` の `action=completion` → GUI `lsp_completion_ui`（`gpui::list`）
 - 実測: `scripts/test-lsp-completion-1682.sh` 22 PASS（1000 件で組む行 10・基準画像との差分は一覧の中だけ・A/B 2 通りで FAILED・実の rust-analyzer で `s.le` → len）・e2e 8 本・注入 6 通りで名指しの FAILED
+
+## 2026-10-02（#1866: 全体テストで tmux 系が毎回別の 1 本落ちる = 実 tmux e2e の器の数え方が隣の起動中の器を畳んでいた）
+- 真因（1259）: `tests/common/tmux_e2e.rs` が「new-session が返ってから数に入る」「減らしてから別に 0 か見て畳む」で、3 本目の起動中に先の 2 本が返ると器を kill + ソケット削除。叩く前に予約・減算〜kill を 1 ロックへ。A/B `TAKO_1866_LEGACY=1`・差し込み口の固定テスト・番犬 3 規則（1 実装外で畳む / 数に入る前に叩く / tako-core の器の名前の重複）
+- 実測: new-session の返りを遅らせる注入で main 1/1・旧アーム 3/3 が 202 行で FAILED、修正後 3/3 緑・全体テスト 3 回連続緑（6263 passed）。1857 は自分の器のソケットだけ消す注入で同じ行・同じ文言を再現（消し手は未特定。kill の結果と器の状態を失敗文言へ）

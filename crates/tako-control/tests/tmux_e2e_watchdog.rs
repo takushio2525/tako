@@ -110,6 +110,45 @@ fn container_hits(src: &str) -> Vec<Hit> {
     out
 }
 
+/// 1 実装の外で器を畳んでよいファイル（**理由つき**。増やすときは #1866 の型に当たらないことを書く）
+const RETIRE_ALLOWLIST: &[(&str, &str)] = &[(
+    "remote_scrollback_e2e.rs",
+    "テスト 1 本だけのバイナリ（env を器の解決より先に置くため）で、隣のテストが器を共有しない。\
+     器は tmux / psmux 共用の CLI（`tako_core::backend::binary()`）を直接叩くので tmux_e2e を通せない",
+)];
+
+/// 1 実装の外で器を畳む形を拾う（#1866）。
+///
+/// 器はプロセスごとで、同じバイナリのテストが参照カウントで共有する。各テストが自前で
+/// `kill-server` / ソケットの除去をすると、隣のテストが起動中・使用中の器を消す
+/// （#1866 は 1 実装の中の数え方がまさにこれだった）。関数呼び出しは文字列を潰した
+/// 眺めで、`"kill-server"` は引数として器へ渡している行（`.arg(` / `.args(` /
+/// `run_tmux(`）だけを見る（説明文や `contains("kill-server")` には当たらない）
+fn retire_hits(src: &str) -> Vec<Hit> {
+    let code = code_view(src);
+    let raw: Vec<&str> = src.lines().collect();
+    let mut out = Vec::new();
+    for (i, line) in code.lines().enumerate() {
+        let raw_line = raw.get(i).copied().unwrap_or("");
+        let text = raw_line.trim().to_string();
+        let call = ["kill_server(", "remove_socket_file("]
+            .iter()
+            .any(|needle| line.contains(needle));
+        let passes_kill_server = raw_line.contains("\"kill-server\"")
+            && [".arg(", ".args(", "run_tmux("]
+                .iter()
+                .any(|needle| line.contains(needle));
+        if call || passes_kill_server {
+            out.push(Hit {
+                line: i + 1,
+                kind: "1 実装の外で器を畳んでいる",
+                text,
+            });
+        }
+    }
+    out
+}
+
 /// `Command::new("tmux")` の次の行が `.arg("-V")`（器の在否確認）か
 fn next_arg_is_version(raw: &[&str], at: usize) -> bool {
     raw.get(at + 1).is_some_and(|l| l.contains("\"-V\""))
@@ -214,6 +253,81 @@ fn 実tmuxのe2eが固定名の器を使っていない() {
          （固定名だと同じ機の別プロセスと同じサーバー・同じセッション名を取り合い、\
          `duplicate session` で落ちる / 相手のセッションを横から消す）:\n{}",
         found.join("\n")
+    );
+}
+
+#[test]
+fn 器を畳むのは1実装の中だけ() {
+    let mut found: Vec<String> = Vec::new();
+    for path in targets() {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if RETIRE_ALLOWLIST.iter().any(|(file, _)| *file == name) {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} を読める: {e}", path.display()));
+        let rel = path
+            .strip_prefix(repo_root())
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        for hit in retire_hits(&src) {
+            found.push(format!("  {rel}:{} {}: {}", hit.line, hit.kind, hit.text));
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "器（tmux サーバー）を 1 実装の外で畳んでいる（#1866）。同じバイナリの隣のテストが \
+         使用中・起動中の器を消す。`tmux_e2e::release_session` で返すこと（最後の 1 本の \
+         ときだけ、隣の予約を割り込ませずに器とソケットを畳む）:\n{}",
+        found.join("\n")
+    );
+}
+
+/// 「器を叩く前に数に入る」を 1 実装が守っているか（#1866）。
+///
+/// 数に入るのが `new-session` の**後**だと、その手前の窓で隣の最後の 1 本が器を畳む。
+/// 振る舞いは `issue1866_tmux_e2e_refcount.rs` が差し込み口で固定しているが、こちらは
+/// 崩れた行を file:line で名指しする
+#[test]
+fn 器の1実装は器を叩く前に数に入る() {
+    let path = tests_dir().join("common/tmux_e2e.rs");
+    let src = std::fs::read_to_string(&path).expect("tmux_e2e.rs を読める");
+    let code = code_view(&src);
+    let rel = path
+        .strip_prefix(repo_root())
+        .unwrap_or(&path)
+        .display()
+        .to_string();
+    let lines: Vec<&str> = code.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| tako_core::source_scan::fn_head_name(l) == Some("new_session"))
+        .unwrap_or_else(|| panic!("{rel} に fn new_session が無い"));
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| tako_core::source_scan::is_top_level_fn_head(l))
+        .map(|n| start + 1 + n)
+        .unwrap_or(lines.len());
+    let body = &lines[start..end];
+    let reserve = body.iter().position(|l| l.contains("*live() += 1"));
+    let first_call = body.iter().position(|l| l.contains("run_tmux("));
+    match (reserve, first_call) {
+        (Some(r), Some(c)) if r < c => {}
+        (_, Some(c)) => panic!(
+            "{rel}:{} `new_session` が数に入る前に器を叩いている（#1866）。\
+             `*live() += 1` を最初の `run_tmux(` より前に置くこと: {}",
+            start + c + 1,
+            src.lines().nth(start + c).unwrap_or("").trim()
+        ),
+        (_, None) => panic!("{rel}:{} `new_session` が器を叩いていない", start + 1),
+    }
+    assert!(
+        code.contains("static LIVE: Mutex<usize>"),
+        "{rel} の数（LIVE）がロックでない（#1866。0 の判定と kill-server の間に隣の予約が割り込む）"
     );
 }
 
