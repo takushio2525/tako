@@ -975,6 +975,42 @@ enum LspCommand {
     TypeDefinition(LspGotoArgs),
     /// 実装へ飛ぶ（引数は definition と同じ）
     Implementation(LspGotoArgs),
+    /// 編集中のコードを整形する（GUI の編集メニューの「コードを整形」と同じ。#1683）。
+    /// 編集バッファへ当てて undo 1 回で戻せる（保存はしない）。`--range` で範囲の整形
+    /// （範囲の外は変えない）。MCP は `tako_lsp` の action=format
+    Format {
+        /// コードプレビューのペイン ID（省略時は呼び出し元）
+        #[arg(long)]
+        pane: Option<u64>,
+        /// 範囲（`行:桁-行:桁`。行は 1 始まり・桁は 0 始まりの UTF-8 バイト =
+        /// `tako edit replace-range` と同じ。桁は省略可 = 0）
+        #[arg(long)]
+        range: Option<String>,
+        /// JSON のまま出す
+        #[arg(long)]
+        json: bool,
+    },
+    /// 保存時整形の設定（既定 off）。on でも明示的な保存だけで整形し、自動保存では整形しない。
+    /// 省略で今の値。MCP は `tako_lsp` の action=format-on-save
+    FormatOnSave {
+        #[arg(value_parser = ["on", "off"])]
+        state: Option<String>,
+    },
+}
+
+/// `tako lsp format --range` の `行:桁-行:桁` を解く（#1683。行:桁は [`parse_position`]）
+fn parse_line_col_range(text: &str) -> Result<tako_control::protocol::LineColRange, String> {
+    let (start, end) = text
+        .split_once('-')
+        .ok_or_else(|| format!("範囲は 行:桁-行:桁 で指定する（`-` が無い: {text}）"))?;
+    let (start_line, start_col) = parse_position(start)?;
+    let (end_line, end_col) = parse_position(end)?;
+    Ok(tako_control::protocol::LineColRange {
+        start_line,
+        start_col,
+        end_line,
+        end_col,
+    })
 }
 
 /// `tako lsp definition` 等の引数（#1680）。位置は `tako edit replace-range` と同じ
@@ -1040,6 +1076,13 @@ impl LspCommand {
                 choice: args.choice,
                 focus: args.focus.then_some(true),
             },
+            Self::Format { pane, range, .. } => Request::LspFormat {
+                pane: target_pane(*pane)?,
+                range: range.as_deref().map(parse_line_col_range).transpose()?,
+            },
+            Self::FormatOnSave { state } => Request::LspFormatOnSave {
+                enabled: state.as_deref().map(|s| s == "on"),
+            },
         })
     }
 
@@ -1057,9 +1100,10 @@ impl LspCommand {
 
     fn json(&self) -> bool {
         match self {
-            Self::Status { json, .. } | Self::Servers { json } | Self::Diagnostics { json, .. } => {
-                *json
-            }
+            Self::Status { json, .. }
+            | Self::Servers { json }
+            | Self::Diagnostics { json, .. }
+            | Self::Format { json, .. } => *json,
             Self::Definition(args)
             | Self::Declaration(args)
             | Self::TypeDefinition(args)
@@ -9764,6 +9808,24 @@ fn print_lsp(sub: &LspCommand, result: &Value) {
         }
         return;
     }
+    if !sub.json() && matches!(sub, LspCommand::Format { .. }) {
+        for line in lsp_format_lines(result) {
+            println!("{line}");
+        }
+        return;
+    }
+    if let LspCommand::FormatOnSave { .. } = sub {
+        let state = if result["enabled"] == Value::Bool(true) {
+            "on"
+        } else {
+            "off"
+        };
+        println!("format-on-save: {state}");
+        if let Some(note) = result["note"].as_str() {
+            println!("  {note}");
+        }
+        return;
+    }
     if sub.json()
         || !matches!(
             sub,
@@ -9880,6 +9942,27 @@ fn lsp_diagnostics_lines(result: &Value) -> Vec<String> {
         }
     }
     out
+}
+
+/// `tako lsp format` の人向けの体裁（#1683）。中身の正本は dispatch の応答。
+/// 1 行目は `status`、続けて注記（何か所整形したか・変える所が無い）か理由と次の一手
+fn lsp_format_lines(result: &Value) -> Vec<String> {
+    let text = |key: &str| result[key].as_str().unwrap_or_default().to_string();
+    let mut lines = vec![format!("{} {}", text("status"), text("path"))
+        .trim_end()
+        .to_string()];
+    for key in [
+        "note",
+        "dropped_note",
+        "reason",
+        "next_step",
+        "install_command",
+    ] {
+        if let Some(line) = result[key].as_str() {
+            lines.push(format!("  {line}"));
+        }
+    }
+    lines
 }
 
 /// `tako lsp definition` 等の人向けの体裁（#1680）。中身の正本は dispatch の応答。
@@ -10907,6 +10990,56 @@ mod tests {
         // つながった文書が無ければ案内だけ
         let note = lsp_diagnostics_lines(&serde_json::json!({"documents": [], "note": "n"}));
         assert_eq!(note, vec!["n".to_string()]);
+        // #1683: 整形は MCP `tako_lsp` の action=format と同じ要求（範囲は replace-range と同じ綴り）
+        assert_eq!(
+            build_request(&parse(&["tako", "lsp", "format", "--pane", "7"])).unwrap(),
+            Request::LspFormat {
+                pane: Some(7),
+                range: None
+            }
+        );
+        assert_eq!(
+            build_request(&parse(&[
+                "tako", "lsp", "format", "--pane", "7", "--range", "3:4-9"
+            ]))
+            .unwrap(),
+            Request::LspFormat {
+                pane: Some(7),
+                range: Some(tako_control::protocol::LineColRange {
+                    start_line: 3,
+                    start_col: 4,
+                    end_line: 9,
+                    end_col: 0
+                })
+            }
+        );
+        assert!(build_request(&parse(&[
+            "tako", "lsp", "format", "--pane", "7", "--range", "3:4"
+        ]))
+        .is_err());
+        assert_eq!(
+            build_request(&parse(&["tako", "lsp", "format-on-save"])).unwrap(),
+            Request::LspFormatOnSave { enabled: None }
+        );
+        assert_eq!(
+            build_request(&parse(&["tako", "lsp", "format-on-save", "on"])).unwrap(),
+            Request::LspFormatOnSave {
+                enabled: Some(true)
+            }
+        );
+        assert!(Cli::try_parse_from(["tako", "lsp", "format-on-save", "yes"]).is_err());
+        assert_eq!(
+            lsp_format_lines(&serde_json::json!({
+                "status": "formatted", "path": "/w/a.rs", "note": "n",
+            })),
+            vec!["formatted /w/a.rs".to_string(), "  n".to_string()]
+        );
+        assert_eq!(
+            lsp_format_lines(&serde_json::json!({
+                "status": "timeout", "reason": "r", "next_step": "s",
+            })),
+            vec!["timeout".to_string(), "  r".to_string(), "  s".to_string()]
+        );
         let command = parse(&["tako", "edit", "undo", "--pane", "5"]);
         assert_eq!(
             build_request(&command).unwrap(),

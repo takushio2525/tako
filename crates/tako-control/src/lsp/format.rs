@@ -20,7 +20,7 @@ use tako_core::text_edit::TextChange;
 use super::goto::GotoError;
 use super::text;
 
-/// 明示的な整形（`tako lsp format` / メニュー / ⌘⇧I）の上限の既定。起動と握手を含む
+/// 明示的な整形（`tako lsp format` / メニュー / ⇧⌘I）の上限の既定。起動と握手を含む
 /// （定義ジャンプと同じ。初回はサーバがプロジェクトを読む時間が要る）。
 /// `TAKO_LSP_FORMAT_TIMEOUT_SECS` で変えられる（0 / 不正 / 空は既定へ落とす = #1503）
 pub const DEFAULT_FORMAT_TIMEOUT: Duration = Duration::from_secs(30);

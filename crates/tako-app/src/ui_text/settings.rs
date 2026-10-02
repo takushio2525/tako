@@ -278,6 +278,18 @@ pub fn desc_preview_reload() -> &'static str {
     )
 }
 
+/// #1683: 保存時整形（既定 OFF）
+pub fn label_format_on_save() -> &'static str {
+    tr!("保存時に整形", "Format on save")
+}
+
+pub fn desc_format_on_save() -> &'static str {
+    tr!(
+        "明示的に保存したとき（保存のキー・tako edit save）だけ言語サーバで整形する。自動保存では整形しない",
+        "Format with the language server only on an explicit save (the save key / tako edit save), never on autosave"
+    )
+}
+
 pub fn label_preview_cache() -> &'static str {
     tr!("画像キャッシュ上限 (MiB)", "Image cache limit (MiB)")
 }
@@ -1549,6 +1561,8 @@ mod tests {
                 section_preview().into(),
                 label_preview_reload().into(),
                 desc_preview_reload().into(),
+                label_format_on_save().into(),
+                desc_format_on_save().into(),
                 label_preview_cache().into(),
                 desc_preview_cache().into(),
                 section_logs().into(),

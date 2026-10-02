@@ -38,6 +38,7 @@ mod form_layout;
 mod handoff_ctx;
 mod keybindings;
 mod limit_autoresume;
+mod lsp_format_ui;
 mod lsp_goto_ui;
 mod md_view;
 mod menu_bar;
@@ -1968,6 +1969,10 @@ struct TakoApp {
     jump_history: tako_core::jump_history::JumpHistory,
     /// 定義ジャンプの GUI の状態（#1680。⌘ホバー中の識別子・問い合わせ中・候補の一覧）
     lsp_goto: LspGotoUi,
+    /// 整形の問い合わせ中の印（#1683）
+    lsp_format: crate::lsp_format_ui::LspFormatUi,
+    /// 保存時整形（#1683。settings.json の `lsp_format_on_save` を起動時に読む。既定 OFF）
+    lsp_format_on_save: bool,
     /// タブ・ペイン名の AI 自動リネームの検知状態（FR-2.12。ループは new で張る）
     autorename: autorename::AutoRenamer,
     /// 自動命名した時刻（タブ ID → 命名時刻。#552 案 4）。命名直後だけタブに
@@ -4166,6 +4171,8 @@ impl TakoApp {
             lsp: tako_control::lsp::LspManager::from_env(),
             jump_history: tako_core::jump_history::JumpHistory::default(),
             lsp_goto: LspGotoUi::default(),
+            lsp_format: crate::lsp_format_ui::LspFormatUi::default(),
+            lsp_format_on_save: tako_control::settings::load().lsp_format_on_save,
             autorename: autorename::AutoRenamer::new(initial_auto_rename()),
             auto_title_hints: HashMap::new(),
             port_detect: initial_port_detect(),
@@ -11272,6 +11279,9 @@ impl TakoApp {
             "split-right",
             "split-down",
             "pin-tab-title",
+            // #1683: 言語サーバの整形（編集メニューと同じ）
+            "format-document",
+            "format-selection",
         ];
         for id in COMMANDS {
             items.push(PaletteItem::Command(
@@ -11375,6 +11385,8 @@ impl TakoApp {
                     let tab = self.workspace.active_tab_id();
                     self.pin_auto_tab_title(tab, cx);
                 }
+                "format-document" => self.format_focused_preview(false, cx),
+                "format-selection" => self.format_focused_preview(true, cx),
                 _ => {}
             },
             PaletteItem::SshHost(host, into_pane) => {
@@ -13740,6 +13752,11 @@ impl TakoApp {
 
     fn save_focused_preview(&mut self, cx: &mut Context<Self>) {
         let pane_id = self.focused_pane();
+        // #1683: 保存時整形が ON なら整形してから保存する（CLI `tako edit save` と同じ 3 段。
+        // 整形を挟まない条件なら従来どおり下で保存する）
+        if self.save_with_format(pane_id, cx) {
+            return;
+        }
         // ローカルの写しへ書くところまでは同期（速い・確実に残る）。
         // リモートへの押し出しは背景（UI スレッドで待たない）
         if self.save_preview_local(pane_id, false).is_ok() {
@@ -23228,6 +23245,72 @@ impl PreviewHost for TakoApp {
         })
     }
 
+    /// 整形（#1683）の材料。`tako edit start` と同じ口で編集モードへ入る（言語サーバもここで起きる）
+    fn preview_format_source(
+        &mut self,
+        pane: PaneId,
+        range: Option<(
+            tako_core::text_edit::TextPosition,
+            tako_core::text_edit::TextPosition,
+        )>,
+    ) -> Result<tako_control::PreviewFormatSource, String> {
+        self.set_preview_editing_local(pane, true)?;
+        let buffer = &self
+            .preview_edits
+            .get(&pane)
+            .ok_or_else(|| "編集モードを開始していない".to_string())?
+            .buffer;
+        let range = match range {
+            Some((start, end)) => {
+                let from = buffer.resolve_position(start).map_err(|e| e.to_string())?;
+                let to = buffer.resolve_position(end).map_err(|e| e.to_string())?;
+                if to < from {
+                    return Err(tako_core::text_edit::RangeEditError::InvertedRange {
+                        start_line: start.line,
+                        start_column: start.column,
+                        end_line: end.line,
+                        end_column: end.column,
+                    }
+                    .to_string());
+                }
+                Some(from..to)
+            }
+            None => None,
+        };
+        Ok(tako_control::PreviewFormatSource {
+            path: buffer.path().display().to_string(),
+            text: buffer.text().to_string(),
+            version: buffer.version(),
+            indent: buffer.indent_unit(),
+            range,
+        })
+    }
+
+    /// 整形の答えを当てる（#1683）。当てる口は `TextBuffer::apply_changes` の 1 実装
+    /// （undo 1 回で戻る）。反映は打鍵と同じ `refresh_preview_from_editor`（ハイライト・
+    /// カーソル追従・言語サーバへの同期）。自動保存は dispatch の後処理が回す
+    fn apply_preview_changes(
+        &mut self,
+        pane: PaneId,
+        changes: Vec<tako_core::text_edit::TextChange>,
+        expected_version: u64,
+    ) -> Result<tako_core::text_edit::AppliedChanges, String> {
+        let edit = self
+            .preview_edits
+            .get_mut(&pane)
+            .ok_or_else(|| "編集モードを開始していない".to_string())?;
+        let applied = edit
+            .buffer
+            .apply_changes(changes, Some(expected_version))
+            .map_err(|e| e.to_string())?;
+        if applied.changes > 0 {
+            edit.message = None;
+            edit.save_status = None;
+            self.refresh_preview_from_editor(pane);
+        }
+        Ok(applied)
+    }
+
     fn preview_goto_source(
         &self,
         pane: PaneId,
@@ -24160,6 +24243,23 @@ impl SystemHost for TakoApp {
 
     fn lsp(&self) -> Option<&tako_control::lsp::LspManager> {
         Some(&self.lsp)
+    }
+
+    fn lsp_format_on_save(&self) -> bool {
+        self.lsp_format_on_save
+    }
+
+    /// 保存時整形の切替（#1683。`tako lsp format-on-save`・設定画面）。settings.json へ書く
+    fn set_lsp_format_on_save(&mut self, enabled: bool) -> Result<(), String> {
+        // セルフテスト中はユーザー設定を汚さない（`set_preview_reload` と同じ）
+        if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            let mut settings = tako_control::settings::load();
+            settings.lsp_format_on_save = enabled;
+            tako_control::settings::save(&settings)
+                .map_err(|e| format!("設定を保存できない: {e}"))?;
+        }
+        self.lsp_format_on_save = enabled;
+        Ok(())
     }
 
     fn lsp_documents(&self) -> Vec<tako_control::lsp::LspDocument> {
@@ -26013,6 +26113,17 @@ impl Render for TakoApp {
             .on_action(cx.listener(|this, _: &CopySelection, _, cx| this.copy_selection(cx)))
             .on_action(cx.listener(|this, _: &PasteClipboard, _, cx| this.paste(cx)))
             .on_action(cx.listener(|this, _: &SavePreview, _, cx| this.save_focused_preview(cx)))
+            // #1683: 整形（⇧⌘I / Ctrl+Shift+I・編集メニュー）。範囲はメニューとパレットから
+            .on_action(
+                cx.listener(|this, _: &FormatDocument, _, cx| {
+                    this.format_focused_preview(false, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &FormatSelection, _, cx| {
+                    this.format_focused_preview(true, cx)
+                }),
+            )
             .on_action(cx.listener(|this, _: &UndoPreview, _, cx| {
                 let pane_id = this.focused_pane();
                 let _ = this.preview_undo_local(pane_id);
@@ -26600,6 +26711,10 @@ fn edit_menu() -> gpui::Menu {
         MenuItem::action(m::select_all(), SelectAll),
         MenuItem::separator(),
         MenuItem::action(m::find(), FindPreview),
+        // #1683: 言語サーバの整形（範囲は選択範囲。undo 1 回で戻る）
+        MenuItem::separator(),
+        MenuItem::action(m::format_document(), FormatDocument),
+        MenuItem::action(m::format_selection(), FormatSelection),
     ])
 }
 

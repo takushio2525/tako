@@ -60,12 +60,13 @@ pub fn jump_forward(platform: Platform) -> &'static str {
 
 /// 編集中のコードを整形する打鍵（FR-3.33 / #1683）。
 ///
-/// macOS は Zed と同じ `⌘⇧I`、Windows は Zed / VS Code（Linux）と同じ `Ctrl+Shift+I`。
+/// macOS は Zed と同じ `⇧⌘I`（メニューの表記順 ⌃⌥⇧⌘）、Windows は Zed / VS Code（Linux）と
+/// 同じ `Ctrl+Shift+I`。
 /// `Ctrl+Shift+<英字>` は `Ctrl+<英字>` と同じ C0 バイトへ潰れる（#585）ので、端末の
 /// `Ctrl+I`（= Tab）は奪わない（理由の全文は tako-app の `keybindings::format_bindings`）
 pub fn format_document(platform: Platform) -> &'static str {
     match platform {
-        Platform::MacOs => "\u{2318}\u{21e7}I",
+        Platform::MacOs => "\u{21e7}\u{2318}I",
         Platform::Windows => "Ctrl+Shift+I",
     }
 }

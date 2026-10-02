@@ -296,6 +296,17 @@ impl PreviewModeWire {
     }
 }
 
+/// 行・桁で書いた範囲（#1683）。位置は `tako edit replace-range` と同じ（行 1 始まり・
+/// 桁 0 始まりの行内 UTF-8 バイト）。`"3:0-9:0"` の綴りを解くのは CLI の入口だけで、
+/// wire は数値のまま運ぶ（解釈が CLI と MCP で割れない）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineColRange {
+    pub start_line: usize,
+    pub start_col: usize,
+    pub end_line: usize,
+    pub end_col: usize,
+}
+
 /// 操作リクエスト。`pane` 省略時は呼び出し元ペイン（クライアント側で `TAKO_PANE_ID` から
 /// 解決して詰める。FR-2.2.7）。各操作のセマンティクスは tako-core の API と 1:1
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -883,6 +894,25 @@ pub enum Request {
         choice: Option<usize>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         focus: Option<bool>,
+    },
+    /// 整形（FR-3.33 / #1683。`tako lsp format` / MCP `tako_lsp` の action=format）。
+    /// GUI の編集メニュー・⇧⌘I（Windows は Ctrl+Shift+I）と同じ 1 本。
+    ///
+    /// `range` を省けば文書全体、指定すれば範囲の整形（範囲の外は 1 バイトも変えない）。
+    /// 編集モードでなければ入る（言語サーバはそこで起きる = FR-3.28）。答えは**頼んだときの
+    /// 版**にだけ当て、undo 1 回で戻る。待つあいだに本文が変わったら当てない（`status: stale`）
+    LspFormat {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        range: Option<LineColRange>,
+    },
+    /// 保存時整形の設定（FR-3.33 / #1683。`tako lsp format-on-save [on|off]` / MCP `tako_lsp` の
+    /// action=format-on-save）。**既定 OFF**。ON でも整形するのは明示的な保存だけ（自動保存では
+    /// しない）。`enabled` を省けば今の値を返す
+    LspFormatOnSave {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        enabled: Option<bool>,
     },
     /// undo（#195）
     PreviewUndo { pane: Option<u64> },
@@ -2540,6 +2570,8 @@ pub fn changes_layout(request: &Request) -> bool {
         | Request::PreviewEdit { .. }
         | Request::PreviewApply { .. }
         | Request::PreviewEditRange { .. }
+        // 整形（#1683）は編集バッファの本文だけを変える（開くペインは無い）
+        | Request::LspFormat { .. }
         | Request::PreviewCursor { .. }
         | Request::PreviewMove { .. }
         | Request::PreviewDelete { .. }
@@ -2564,6 +2596,7 @@ pub fn changes_layout(request: &Request) -> bool {
         | Request::ConfirmClose { .. }
         | Request::LimitResume { .. }
         | Request::PreviewReload { .. }
+        | Request::LspFormatOnSave { .. }
         | Request::PreviewCache { .. }
         | Request::PreviewAutosave { .. }
         | Request::Scrollback { .. }

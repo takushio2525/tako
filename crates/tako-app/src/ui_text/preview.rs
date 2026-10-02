@@ -331,6 +331,31 @@ pub fn goto_notice(reason: &str, next_step: &str) -> String {
     )
 }
 
+// --- 整形（キー: preview.format_*。#1683） ---
+// 結果の注記・理由・次の一手の日英は dispatch の応答（`tako_control::lsp::text`）が持つ。
+// ここは画面だけの語
+
+/// 問い合わせ中の印（プレビューのヘッダに出す）
+pub fn format_running() -> &'static str {
+    tr!("整形しています…", "Formatting…")
+}
+
+/// 範囲の整形を頼んだのに選択が無い
+pub fn format_no_selection() -> &'static str {
+    tr!(
+        "範囲が選ばれていない（全体の整形は「コードを整形」）",
+        "Nothing is selected (use Format Document for the whole file)"
+    )
+}
+
+/// 編集できるコードのプレビューではないので整形できない
+pub fn format_not_code() -> &'static str {
+    tr!(
+        "整形できるのはコードのプレビューだけ",
+        "Only code previews can be formatted"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests_support;
@@ -392,6 +417,9 @@ mod tests {
                 goto_searching().to_string(),
                 goto_choose(3),
                 goto_notice("r", "n"),
+                format_running().to_string(),
+                format_no_selection().to_string(),
+                format_not_code().to_string(),
             ]
         });
     }

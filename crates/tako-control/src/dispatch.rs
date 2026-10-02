@@ -842,6 +842,313 @@ fn source_gone_json(kind: tako_core::lsp::goto::GotoKind, mut out: Value) -> Val
     out
 }
 
+/// 整形（FR-3.33 / #1683）の問い合わせ。UI スレッドで [`lsp_format_prepare`] が作り、
+/// [`LspFormatJob::run`] を背景で走らせ、答えを載せた [`LspFormatLanding`] を UI スレッドの
+/// [`lsp_format_land`] へ戻す（GUI の ⇧⌘I / メニュー・CLI・MCP・保存時整形が同じ 3 段を通る）
+pub struct LspFormatJob {
+    manager: crate::lsp::LspManager,
+    /// `None` は問い合わせるまでもなく答えが決まっている（受け持つサーバが無い = `landing.answer`）
+    request: Option<crate::lsp::FormatRequest>,
+    landing: LspFormatLanding,
+}
+
+impl LspFormatJob {
+    /// 言語サーバへ問い合わせる（**UI スレッドで呼ばない**。上限は `FormatRequest::timeout`）
+    pub fn run(self) -> LspFormatLanding {
+        let mut landing = self.landing;
+        if let Some(request) = &self.request {
+            landing.answer = Some(self.manager.format(request));
+        }
+        landing
+    }
+}
+
+/// 当てるのに要るもの（頼んだペインと版）と、背景で得た答え（#1683）
+#[derive(Debug, Clone)]
+pub struct LspFormatLanding {
+    pub pane: PaneId,
+    pub path: String,
+    /// 頼んだときの編集バッファの版（**答えはこの版にだけ当てる**）
+    pub version: u64,
+    /// 範囲の整形なら頼んだ範囲（応答へそのまま載せる）
+    pub range: Option<crate::protocol::LineColRange>,
+    /// 保存時整形（`PreviewSave` から来た）: 当てたあと保存する（当てられなくても保存する）
+    pub save_after: bool,
+    /// 背景で得た答え（[`LspFormatJob::run`] が入れる）
+    pub answer: Option<Result<crate::lsp::FormatAnswer, crate::lsp::FormatError>>,
+}
+
+/// 整形の準備（UI スレッド。#1683）。
+///
+/// 受け持つサーバが検出表に無い種類なら**編集モードへ入る前に**答えを決める（副作用を残さない）。
+/// あれば編集モードへ入り（言語サーバはそこで起きる = FR-3.28）、頼む本文・版・範囲を採る。
+/// **1 プロセスも待たない**（起動と問い合わせは background の [`LspFormatJob::run`]）
+pub fn lsp_format_prepare(
+    host: &mut dyn ControlHost,
+    pane: Option<u64>,
+    range: Option<crate::protocol::LineColRange>,
+    timeout: std::time::Duration,
+    save_after: bool,
+) -> Result<LspFormatJob, DispatchError> {
+    let (_, target) = resolve_pane(host.workspace(), pane)?;
+    let Some((path, _)) = host.preview_state(target) else {
+        return Err(DispatchError::InvalidParams(format!(
+            "プレビューペインではない: {}",
+            target.as_u64()
+        )));
+    };
+    let Some(manager) = host.lsp().cloned() else {
+        return Err(DispatchError::Operation(
+            crate::lsp::text::UNAVAILABLE.text().to_string(),
+        ));
+    };
+    let mut landing = LspFormatLanding {
+        pane: target,
+        path: path.clone(),
+        version: 0,
+        range,
+        save_after,
+        answer: None,
+    };
+    if tako_core::lsp::servers::resolve_in(tako_core::lsp::servers::SERVERS, Path::new(&path))
+        .is_none()
+    {
+        landing.answer = Some(Err(crate::lsp::FormatError::Lsp(
+            crate::lsp::GotoError::NoServer,
+        )));
+        return Ok(LspFormatJob {
+            manager,
+            request: None,
+            landing,
+        });
+    }
+    let positions = range.map(|r| {
+        (
+            TextPosition::new(r.start_line, r.start_col),
+            TextPosition::new(r.end_line, r.end_col),
+        )
+    });
+    let source = host
+        .preview_format_source(target, positions)
+        .map_err(DispatchError::InvalidParams)?;
+    landing.version = source.version;
+    Ok(LspFormatJob {
+        manager,
+        request: Some(crate::lsp::FormatRequest {
+            path: PathBuf::from(&source.path),
+            text: source.text,
+            range: source.range,
+            options: tako_core::lsp::format::FormatOptions::from_indent(source.indent),
+            timeout,
+        }),
+        landing,
+    })
+}
+
+/// 保存時整形の準備（#1683）。**整形する場合だけ** `Some`（`None` は従来どおりの保存）。
+///
+/// 整形するのは「設定が ON・上書き保存ではない・編集モード・外部変更の競合が無い・ローカルの
+/// ファイル・受け持つサーバがある」ときだけ。どれかが欠ければ従来の保存と 1 バイトも変わらない
+/// （既定 OFF なので、設定を触っていない利用者の保存は変更前とバイト一致）
+pub fn lsp_format_on_save_prepare(
+    host: &mut dyn ControlHost,
+    pane: Option<u64>,
+    force: bool,
+) -> Option<Result<LspFormatJob, DispatchError>> {
+    if force || !host.lsp_format_on_save() || host.lsp().is_none() {
+        return None;
+    }
+    let (_, target) = resolve_pane(host.workspace(), pane).ok()?;
+    let (path, _) = host.preview_state(target)?;
+    let editing = host
+        .preview_edit_state(target)
+        .is_some_and(|(editing, _)| editing);
+    if !editing
+        || host.preview_conflict(target).is_some()
+        || host.preview_remote_state(target).is_some()
+        || tako_core::lsp::servers::resolve_in(tako_core::lsp::servers::SERVERS, Path::new(&path))
+            .is_none()
+    {
+        return None;
+    }
+    Some(lsp_format_prepare(
+        host,
+        Some(target.as_u64()),
+        None,
+        crate::lsp::format::on_save_timeout(),
+        true,
+    ))
+}
+
+/// 整形の答えを当てる（UI スレッド。#1683）。当てる口は `PreviewHost::apply_preview_changes`
+/// （= `TextBuffer::apply_changes` の 1 実装。undo 1 回で戻る）だけ。
+///
+/// **頼んだときの版にだけ当てる**: 待つあいだに打鍵・別の編集で版が進んでいたら当てない
+/// （`status: stale`）。頼んだペインが閉じられた / 別のファイルへ差し替わったら `source-gone`。
+/// 答えは失敗ではなく `status` で返す（`formatted` / `unchanged` / `stale` / `timeout` /
+/// `not-installed` / `unsupported` / …。どれも `reason` / `next_step` か `note`）。
+/// 保存時整形（`save_after`）は整形の成否に関わらず保存し、整形の結果を `format` に載せる
+pub fn lsp_format_land(
+    host: &mut dyn ControlHost,
+    landing: &LspFormatLanding,
+) -> Result<Value, DispatchError> {
+    use crate::lsp::text;
+    let pane = landing.pane;
+    let mut format = match &landing.answer {
+        None => {
+            return Err(DispatchError::Operation(
+                "整形の答えがまだ無い（背景の問い合わせを経ずに当てようとした）".into(),
+            ))
+        }
+        Some(Err(error)) => error.to_json(),
+        Some(Ok(answer)) => {
+            let still_there = host
+                .preview_state(pane)
+                .is_some_and(|(path, _)| path == landing.path);
+            if !still_there {
+                json!({
+                    "status": "source-gone",
+                    "reason": text::GOTO_SOURCE_GONE_REASON.text(),
+                    "next_step": text::GOTO_RETRY_NEXT_STEP.text(),
+                })
+            } else {
+                lsp_format_apply(host, landing, answer)
+            }
+        }
+    };
+    format["path"] = json!(landing.path);
+    if let Some(range) = landing.range {
+        format["range"] = json!(range);
+    }
+    if landing.save_after {
+        // 保存時整形: 整形できなかったら理由を添えて、そのまま保存する（整形が保存を止めない）
+        let applied = matches!(format["status"].as_str(), Some("formatted" | "unchanged"));
+        if !applied {
+            let reason = format["reason"].as_str().unwrap_or_default().to_string();
+            format["note"] = json!(text::fill(
+                text::FORMAT_ON_SAVE_SKIPPED_NOTE,
+                &[("reason", &reason)]
+            ));
+        }
+        let mut out = preview_save(host, pane, false)?;
+        out["format"] = format;
+        return Ok(out);
+    }
+    // 編集系の応答（版・カーソル・undo 履歴）は 1 実装から組む（#1658）
+    let mut out = preview_edit_reply(host, pane);
+    if let (Some(out), Some(format)) = (out.as_object_mut(), format.as_object()) {
+        for (key, value) in format {
+            out.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// 答えを当てた結果の `format` 節（[`lsp_format_land`]）
+fn lsp_format_apply(
+    host: &mut dyn ControlHost,
+    landing: &LspFormatLanding,
+    answer: &crate::lsp::FormatAnswer,
+) -> Value {
+    use crate::lsp::text;
+    let mut out = json!({ "server": answer.server, "changes": 0, "dropped": answer.dropped });
+    let current = host
+        .preview_document(landing.pane)
+        .and_then(|document| document["version"].as_u64());
+    if current != Some(landing.version) {
+        let mut stale = crate::lsp::FormatError::Stale.to_json();
+        stale["server"] = json!(answer.server);
+        return stale;
+    }
+    let applied = if answer.changes.is_empty() {
+        Ok(tako_core::text_edit::AppliedChanges { changes: 0 })
+    } else {
+        host.apply_preview_changes(landing.pane, answer.changes.clone(), landing.version)
+    };
+    match applied {
+        Ok(applied) if applied.changes > 0 => {
+            out["status"] = json!("formatted");
+            out["changes"] = json!(applied.changes);
+            out["note"] = json!(text::fill(
+                text::FORMAT_DONE_NOTE,
+                &[("count", &applied.changes.to_string())]
+            ));
+        }
+        Ok(_) => {
+            out["status"] = json!("unchanged");
+            // 構文エラーがあるとサーバは整形しないことがある（rust-analyzer は rustfmt が
+            // 読めなかったとき空で答える）ので、「整形済み」と言い切らない
+            let errors = lsp_error_count(host, &landing.path);
+            out["note"] = json!(if errors > 0 {
+                text::fill(
+                    text::FORMAT_UNCHANGED_ERRORS_NOTE,
+                    &[("count", &errors.to_string())],
+                )
+            } else {
+                text::FORMAT_UNCHANGED_NOTE.text().to_string()
+            });
+        }
+        Err(detail) => {
+            return crate::lsp::FormatError::InvalidEdits {
+                server: answer.server,
+                detail,
+            }
+            .to_json()
+        }
+    }
+    if answer.dropped > 0 {
+        out["dropped_note"] = json!(text::fill(
+            text::FORMAT_DROPPED_NOTE,
+            &[("count", &answer.dropped.to_string())]
+        ));
+    }
+    out
+}
+
+/// その文書のエラーの診断の数（#1683。整形が空だったときの注記に使う）
+fn lsp_error_count(host: &dyn ControlHost, path: &str) -> usize {
+    let Some(manager) = host.lsp() else {
+        return 0;
+    };
+    let uri = tako_core::file_uri::from_path(Path::new(path));
+    manager.document_diagnostics(&uri).map_or(0, |found| {
+        found
+            .diagnostics
+            .items
+            .iter()
+            .filter(|d| d.severity == tako_core::lsp::diagnostic::Severity::Error)
+            .count()
+    })
+}
+
+/// 保存の 1 実装（`PreviewSave` の同期経路と保存時整形の後段。#1683 で切り出した）
+fn preview_save(
+    host: &mut dyn ControlHost,
+    target: PaneId,
+    force: bool,
+) -> Result<Value, DispatchError> {
+    if let Err(message) = host.save_preview(target, force) {
+        // #1659: 外部変更で断られたなら抜け方を添える
+        return Err(DispatchError::Operation(
+            match host.preview_conflict(target) {
+                Some(conflict) => format!(
+                    "{message}（{}）",
+                    preview_recovery_hint(Some(conflict.state))
+                ),
+                None => message,
+            },
+        ));
+    }
+    let mut out = preview_edit_reply(host, target);
+    out["saved"] = json!(true);
+    // #966: リモート由来なら「リモートへ書けたのか」まで応答に載せる
+    // （ローカルの写しへ書けただけで saved=true とは言わせない）
+    if let Some(remote) = host.preview_remote_state(target) {
+        out["remote"] = remote;
+    }
+    Ok(out)
+}
+
 /// リクエストを実行し、成功時の `result` 値を返す。
 /// `origin` は新規生成ペインの生成主体（Layer 1 CLI なら `Cli`、Phase 3 の MCP なら `Mcp`）
 /// dispatch は UI スレッド（GPUI のイベントループ）で実行されるため、ここでの遅延は
@@ -911,6 +1218,9 @@ pub enum OffloadJob {
     /// 定義ジャンプの問い合わせ（#1680）。サーバの起動と応答を待つので background へ出し、
     /// 着地（ペインを開く）は [`OffloadOutcome::OnUi`] で UI スレッドへ戻す
     LspGoto(Box<LspGotoJob>),
+    /// 整形の問い合わせ（#1683。保存時整形を含む）。答えを当てる（編集バッファを書き換える）のは
+    /// UI スレッドでしかできないので [`OffloadOutcome::OnUi`] で戻す
+    LspFormat(Box<LspFormatJob>),
     /// Code Runner の実行プロファイルと実行環境の一覧（#1730）。実行環境の Tier P
     /// （道具の場所・版・環境の置き場を子プロセスに聞く）を含むので、UI スレッドでは
     /// 相対パスの基準（ペインの cwd）だけを採る
@@ -930,6 +1240,8 @@ pub enum OffloadOutcome {
 pub enum OffloadContinuation {
     /// 定義ジャンプの着地（[`lsp_goto_land`]）
     LspGoto(Box<LspGotoLanding>),
+    /// 整形の答えを当てる（[`lsp_format_land`]。#1683）
+    LspFormat(Box<LspFormatLanding>),
 }
 
 /// background の結果を受けて UI スレッドで続きを行う（#1680）。IPC の受け口と GUI の
@@ -942,6 +1254,7 @@ pub fn finish_offload(
     let _span = crate::diag::perf_span("dispatch:finish_offload");
     match continuation {
         OffloadContinuation::LspGoto(landing) => lsp_goto_land(host, origin, &landing),
+        OffloadContinuation::LspFormat(landing) => lsp_format_land(host, &landing),
     }
 }
 
@@ -951,7 +1264,7 @@ pub fn finish_offload(
 /// リクエストのみ（UI スレッド専有の実測上位。perf.log: OrchestratorWorkerStatus
 /// avg 687ms / GitLog 2431ms）
 pub fn prepare_offload(
-    host: &dyn ControlHost,
+    host: &mut dyn ControlHost,
     request: &Request,
 ) -> Option<Result<OffloadJob, DispatchError>> {
     match request {
@@ -1063,6 +1376,21 @@ pub fn prepare_offload(
             )
             .map(|job| OffloadJob::LspGoto(Box::new(job))),
         ),
+        // #1683: 準備（編集モードへ入る・本文と版を採る）は UI スレッド、問い合わせは background、
+        // 答えを当てるのは UI スレッドの続き（`OffloadOutcome::OnUi`）
+        Request::LspFormat { pane, range } => Some(
+            lsp_format_prepare(
+                host,
+                *pane,
+                *range,
+                crate::lsp::format::format_timeout(),
+                false,
+            )
+            .map(|job| OffloadJob::LspFormat(Box::new(job))),
+        ),
+        // #1683: 保存時整形が ON のときだけ整形を挟む（OFF なら `None` = 従来どおり同期で保存）
+        Request::PreviewSave { pane, force } => lsp_format_on_save_prepare(host, *pane, *force)
+            .map(|job| job.map(|job| OffloadJob::LspFormat(Box::new(job)))),
         // #1730: 実行環境の Tier P（子プロセス。1 回の上限 5 秒）を UI スレッドで待たない
         Request::RunResolve {
             path,
@@ -1085,6 +1413,9 @@ impl OffloadJob {
         match self {
             OffloadJob::LspGoto(job) => {
                 OffloadOutcome::OnUi(OffloadContinuation::LspGoto(Box::new(job.run())))
+            }
+            OffloadJob::LspFormat(job) => {
+                OffloadOutcome::OnUi(OffloadContinuation::LspFormat(Box::new(job.run())))
             }
             other => OffloadOutcome::Reply(other.run_reply()),
         }
@@ -1118,6 +1449,9 @@ impl OffloadJob {
             OffloadJob::RunResolve { ctx } => finish_run_resolve(&ctx),
             OffloadJob::LspGoto(_) => Err(DispatchError::Operation(
                 "定義ジャンプは run_staged で走らせる（着地に UI スレッドの続きが要る）".into(),
+            )),
+            OffloadJob::LspFormat(_) => Err(DispatchError::Operation(
+                "整形は run_staged で走らせる（当てるのに UI スレッドの続きが要る）".into(),
             )),
         }
     }
@@ -3464,27 +3798,13 @@ fn dispatch_inner(
             Ok(preview_edit_reply(host, target))
         }
         Request::PreviewSave { pane, force } => {
+            // #1683: 保存時整形が ON なら整形してから保存する（通常は prepare_offload が
+            // background へ出す。ここへ来るのは `TAKO_OFFLOAD=0` か直呼びで、同じ 3 段を直列に通る）
+            if let Some(job) = lsp_format_on_save_prepare(host, pane, force) {
+                return lsp_format_land(host, &job?.run());
+            }
             let (_, target) = resolve_pane(host.workspace(), pane)?;
-            if let Err(message) = host.save_preview(target, force) {
-                // #1659: 外部変更で断られたなら抜け方を添える
-                return Err(DispatchError::Operation(
-                    match host.preview_conflict(target) {
-                        Some(conflict) => format!(
-                            "{message}（{}）",
-                            preview_recovery_hint(Some(conflict.state))
-                        ),
-                        None => message,
-                    },
-                ));
-            }
-            let mut out = preview_edit_reply(host, target);
-            out["saved"] = json!(true);
-            // #966: リモート由来なら「リモートへ書けたのか」まで応答に載せる
-            // （ローカルの写しへ書けただけで saved=true とは言わせない）
-            if let Some(remote) = host.preview_remote_state(target) {
-                out["remote"] = remote;
-            }
-            Ok(out)
+            preview_save(host, target, force)
         }
         Request::PreviewRevert { pane } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
@@ -4134,6 +4454,39 @@ fn dispatch_inner(
                 focus,
             )?;
             lsp_goto_land(host, origin, &job.run())
+        }
+
+        // #1683: 通常は prepare_offload が問い合わせを background へ出す。ここへ来るのは
+        // `TAKO_OFFLOAD=0` か直呼び（テスト）で、同じ 3 段（準備 → 問い合わせ → 当てる）を直列に通る
+        Request::LspFormat { pane, range } => {
+            let job = lsp_format_prepare(
+                host,
+                pane,
+                range,
+                crate::lsp::format::format_timeout(),
+                false,
+            )?;
+            lsp_format_land(host, &job.run())
+        }
+
+        // #1683: 保存時整形の設定（既定 OFF）。ON でも整形するのは明示的な保存だけ
+        Request::LspFormatOnSave { enabled } => {
+            if let Some(enabled) = enabled {
+                host.set_lsp_format_on_save(enabled)
+                    .map_err(DispatchError::Operation)?;
+            }
+            Ok(json!({
+                "enabled": host.lsp_format_on_save(),
+                "note": crate::lsp::text::fill(
+                    crate::lsp::text::FORMAT_ON_SAVE_SCOPE_NOTE,
+                    &[(
+                        "save_key",
+                        tako_core::platform::keys::save_preview(
+                            tako_core::platform::support::Platform::current()
+                        )
+                    )]
+                ),
+            }))
         }
 
         Request::SetupMcp { scope, pane, agent } => {
@@ -13474,7 +13827,8 @@ pub struct CheckHealthCtx {
 pub const LSP_ACTIONS: &[&str] = &["status", "list", "restart", "stop", "logs"];
 
 /// MCP `tako_lsp`（言語機能）の action。CLI は `tako lsp <action>`。
-/// 診断（#1679）と定義ジャンプの 4 種（#1680。綴りの正本は `GotoKind::NAMES`）。
+/// 診断（#1679）と定義ジャンプの 4 種（#1680。綴りの正本は `GotoKind::NAMES`）と
+/// 整形・保存時整形の設定（#1683。綴りは [`LSP_FORMAT_ACTION`] / [`LSP_FORMAT_ON_SAVE_ACTION`]）。
 /// 先頭が MCP の既定。ホバー・補完等のスライスはここへ足す（ツールは増やさない）
 pub const LSP_FEATURE_ACTIONS: &[&str] = &[
     "diagnostics",
@@ -13482,7 +13836,15 @@ pub const LSP_FEATURE_ACTIONS: &[&str] = &[
     tako_core::lsp::goto::GotoKind::NAMES[1],
     tako_core::lsp::goto::GotoKind::NAMES[2],
     tako_core::lsp::goto::GotoKind::NAMES[3],
+    LSP_FORMAT_ACTION,
+    LSP_FORMAT_ON_SAVE_ACTION,
 ];
+
+/// 整形の action（#1683。CLI は `tako lsp format`）
+pub const LSP_FORMAT_ACTION: &str = "format";
+
+/// 保存時整形の設定の action（#1683。CLI は `tako lsp format-on-save`）
+pub const LSP_FORMAT_ON_SAVE_ACTION: &str = "format-on-save";
 
 /// 言語サーバの操作の 1 実装（#1678）。CLI・MCP・同期実行・offload のすべてがここを通る。
 ///
@@ -16886,6 +17248,10 @@ mod tests {
         backend_windows: std::collections::HashMap<u64, Vec<tako_core::TmuxWindow>>,
         /// #1191: 要求時採取が呼ばれた回数（ペインごとではなく 1 応答 1 回のはず）
         backend_windows_refreshes: std::cell::Cell<usize>,
+        /// #1683: 言語サーバの束ね（既定 None = 「使えない」。整形の準備を通すテストだけが入れる）
+        lsp: Option<crate::lsp::LspManager>,
+        /// #1683: 保存時整形（GUI の `lsp_format_on_save` の代役）
+        format_on_save: bool,
     }
 
     impl MockHost {
@@ -16958,6 +17324,8 @@ mod tests {
                 tmux_windows: std::collections::HashMap::new(),
                 backend_windows: std::collections::HashMap::new(),
                 backend_windows_refreshes: std::cell::Cell::new(0),
+                lsp: None,
+                format_on_save: false,
             }
         }
 
@@ -17375,6 +17743,52 @@ mod tests {
                 document,
             })
         }
+        /// #1683: GUI と同じく編集モードへ入ってから、本物の `TextBuffer` の全文・版・字下げを採る
+        fn preview_format_source(
+            &mut self,
+            pane: PaneId,
+            range: Option<(TextPosition, TextPosition)>,
+        ) -> Result<crate::host::PreviewFormatSource, String> {
+            self.set_preview_editing(pane, true)?;
+            let path = self.previews[&pane.as_u64()].0.clone();
+            let buffer = &self.preview_edits[&pane.as_u64()].2;
+            let range = match range {
+                Some((start, end)) => {
+                    let start = buffer.resolve_position(start).map_err(|e| e.to_string())?;
+                    let end = buffer.resolve_position(end).map_err(|e| e.to_string())?;
+                    if end < start {
+                        return Err("範囲の終わりが始まりより前".into());
+                    }
+                    Some(start..end)
+                }
+                None => None,
+            };
+            Ok(crate::host::PreviewFormatSource {
+                path,
+                text: buffer.text().to_string(),
+                version: buffer.version(),
+                indent: buffer.indent_unit(),
+                range,
+            })
+        }
+        /// #1683: 当てるのは本物の `TextBuffer::apply_changes`（GUI と同じ 1 実装）
+        fn apply_preview_changes(
+            &mut self,
+            pane: PaneId,
+            changes: Vec<tako_core::text_edit::TextChange>,
+            expected_version: u64,
+        ) -> Result<tako_core::text_edit::AppliedChanges, String> {
+            let state = self
+                .preview_edits
+                .get_mut(&pane.as_u64())
+                .ok_or_else(|| "編集セッションがない".to_string())?;
+            let applied = state
+                .2
+                .apply_changes(changes, Some(expected_version))
+                .map_err(|e| e.to_string())?;
+            state.1 = state.2.dirty();
+            Ok(applied)
+        }
         fn jump_history(&self) -> Option<&tako_core::jump_history::JumpHistory> {
             Some(&self.jumps)
         }
@@ -17709,6 +18123,16 @@ mod tests {
     impl SystemHost for MockHost {
         fn resolve_stale_pane(&self, stale: PaneId) -> Option<PaneId> {
             self.stale_pane_map.get(&stale).copied()
+        }
+        fn lsp(&self) -> Option<&crate::lsp::LspManager> {
+            self.lsp.as_ref()
+        }
+        fn lsp_format_on_save(&self) -> bool {
+            self.format_on_save
+        }
+        fn set_lsp_format_on_save(&mut self, enabled: bool) -> Result<(), String> {
+            self.format_on_save = enabled;
+            Ok(())
         }
     }
 
@@ -30078,7 +30502,7 @@ mod tests {
             pane: Some(pane.as_u64()),
             refresh: false,
         };
-        let job = prepare_offload(&host, &req)
+        let job = prepare_offload(&mut host, &req)
             .expect("RunResolve は offload の対象")
             .expect("文脈を採れる");
         assert!(matches!(job, OffloadJob::RunResolve { .. }));
@@ -30115,7 +30539,7 @@ mod tests {
             pane: Some(999_999),
             refresh: false,
         };
-        assert!(matches!(prepare_offload(&host, &bad), Some(Err(_))));
+        assert!(matches!(prepare_offload(&mut host, &bad), Some(Err(_))));
     }
 
     /// 受け入れ条件: `.venv` があれば設定なしでその interpreter と activation
@@ -34348,5 +34772,394 @@ mod tests {
         .unwrap();
         assert!(moved.contains("\"dest\":\"/w/d\""), "{moved}");
         assert!(moved.contains("\"move\""), "{moved}");
+    }
+    // --- #1683: 整形 -----------------------------------------------------------------
+
+    /// 整形を試すプレビュー（実ファイルを開く `TextBuffer`）と、置き場
+    fn format_fixture(name: &str, file: &str, body: &str) -> (MockHost, u64, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("tako-dispatch-1683-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(file);
+        std::fs::write(&path, body).unwrap();
+        let mut host = MockHost::new();
+        host.preview_real_files = true;
+        let pane = host.root_pane();
+        host.previews
+            .insert(pane, (path.display().to_string(), PreviewModeWire::Code));
+        (host, pane, dir)
+    }
+
+    /// 背景の問い合わせを経た答え（`LspFormatJob::run` の出力）を組む。当てる段はサーバ無しで測れる
+    fn format_landing(
+        host: &mut MockHost,
+        pane: u64,
+        answer: Result<crate::lsp::FormatAnswer, crate::lsp::FormatError>,
+        save_after: bool,
+    ) -> LspFormatLanding {
+        let source = host
+            .preview_format_source(PaneId::from_raw(pane), None)
+            .unwrap();
+        LspFormatLanding {
+            pane: PaneId::from_raw(pane),
+            path: source.path,
+            version: source.version,
+            range: None,
+            save_after,
+            answer: Some(answer),
+        }
+    }
+
+    fn change(range: std::ops::Range<usize>, text: &str) -> tako_core::text_edit::TextChange {
+        tako_core::text_edit::TextChange {
+            range,
+            text: text.to_string(),
+        }
+    }
+
+    const UNFORMATTED_1683: &str = "fn main(){\nlet x=1;\n}\n";
+
+    fn formatted_answer() -> crate::lsp::FormatAnswer {
+        crate::lsp::FormatAnswer {
+            server: "fake",
+            changes: vec![
+                change(9..9, " "),
+                change(11..11, "    "),
+                change(16..17, " = "),
+            ],
+            dropped: 0,
+        }
+    }
+
+    fn buffer_text(host: &MockHost, pane: u64) -> String {
+        host.preview_edits[&pane].2.text().to_string()
+    }
+
+    /// FR-3.33: 答えは頼んだ版へ 1 回で当たり、応答は編集系の 1 実装（版・undo 履歴）から組む。
+    /// tako edit undo 1 回で整形の前の全文とバイト一致へ戻る
+    #[test]
+    fn 整形の答えは頼んだ版へ当たりundo1回で戻る() {
+        let (mut host, pane, dir) = format_fixture("apply", "main.rs", UNFORMATTED_1683);
+        let landing = format_landing(&mut host, pane, Ok(formatted_answer()), false);
+        let out = lsp_format_land(&mut host, &landing).unwrap();
+        assert_eq!(out["status"], json!("formatted"), "{out}");
+        assert_eq!(out["changes"], json!(3));
+        assert_eq!(out["server"], json!("fake"));
+        assert_eq!(out["editing"], json!(true));
+        assert_eq!(out["document"]["version"], json!(landing.version + 1));
+        assert_eq!(out["document"]["undo_depth"], json!(1));
+        assert!(out["note"].as_str().is_some_and(|n| !n.is_empty()));
+        assert_eq!(buffer_text(&host, pane), "fn main() {\n    let x = 1;\n}\n");
+        let undone = dispatch(
+            &mut host,
+            Request::PreviewUndo { pane: Some(pane) },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(undone["undone"], json!(true));
+        assert_eq!(
+            buffer_text(&host, pane).as_bytes(),
+            UNFORMATTED_1683.as_bytes()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 待つあいだに版が進んだ（打鍵・範囲編集）なら当てない。本文は利用者の編集だけ
+    #[test]
+    fn 待つあいだに版が進んだら整形を当てない() {
+        let (mut host, pane, dir) = format_fixture("stale", "main.rs", UNFORMATTED_1683);
+        let landing = format_landing(&mut host, pane, Ok(formatted_answer()), false);
+        dispatch(
+            &mut host,
+            Request::PreviewEditRange {
+                pane: Some(pane),
+                start_line: 1,
+                start_col: 0,
+                end_line: 1,
+                end_col: 0,
+                text: "// typed\n".into(),
+                expected_version: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let typed = buffer_text(&host, pane);
+        let out = lsp_format_land(&mut host, &landing).unwrap();
+        assert_eq!(out["status"], json!("stale"), "{out}");
+        assert_eq!(
+            out["reason"],
+            json!(crate::lsp::text::FORMAT_STALE_REASON.text())
+        );
+        assert_eq!(buffer_text(&host, pane), typed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 頼んだペインが別のファイルへ差し替わったら当てない / 変える所が無ければ unchanged /
+    /// 失敗は status と理由で返す（エラーにしない = CLI / MCP が読んで次へ進める）
+    #[test]
+    fn 差し替わり_変更無し_失敗はどれも状態で返す() {
+        let (mut host, pane, dir) = format_fixture("gone", "main.rs", UNFORMATTED_1683);
+        let landing = format_landing(&mut host, pane, Ok(formatted_answer()), false);
+        let other = dir.join("other.rs");
+        std::fs::write(&other, "x\n").unwrap();
+        host.previews
+            .insert(pane, (other.display().to_string(), PreviewModeWire::Code));
+        let out = lsp_format_land(&mut host, &landing).unwrap();
+        assert_eq!(out["status"], json!("source-gone"), "{out}");
+
+        let (mut host, pane, dir2) = format_fixture("unchanged", "main.rs", UNFORMATTED_1683);
+        let empty = crate::lsp::FormatAnswer {
+            server: "fake",
+            changes: Vec::new(),
+            dropped: 0,
+        };
+        let landing = format_landing(&mut host, pane, Ok(empty), false);
+        let out = lsp_format_land(&mut host, &landing).unwrap();
+        assert_eq!(out["status"], json!("unchanged"), "{out}");
+        assert_eq!(
+            out["note"],
+            json!(crate::lsp::text::FORMAT_UNCHANGED_NOTE.text())
+        );
+        assert_eq!(out["document"]["version"], json!(landing.version));
+
+        let timeout = crate::lsp::FormatError::Lsp(crate::lsp::GotoError::Timeout {
+            server: "fake",
+            secs: 3,
+            starting: false,
+        });
+        let landing = format_landing(&mut host, pane, Err(timeout), false);
+        let out = lsp_format_land(&mut host, &landing).unwrap();
+        assert_eq!(out["status"], json!("timeout"), "{out}");
+        assert!(out["next_step"].as_str().is_some_and(|n| !n.is_empty()));
+        assert_eq!(out["pane"], json!(pane));
+        assert_eq!(buffer_text(&host, pane), UNFORMATTED_1683);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// 保存時整形: 当ててから保存する（ディスクも整形後）。整形できなくても保存は止めず、
+    /// 理由を `format.note` に添える
+    #[test]
+    fn 保存時整形は当ててから保存し失敗しても保存は止めない() {
+        let (mut host, pane, dir) = format_fixture("on-save", "main.rs", UNFORMATTED_1683);
+        let landing = format_landing(&mut host, pane, Ok(formatted_answer()), true);
+        let out = lsp_format_land(&mut host, &landing).unwrap();
+        assert_eq!(out["saved"], json!(true), "{out}");
+        assert_eq!(out["format"]["status"], json!("formatted"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("main.rs")).unwrap(),
+            "fn main() {\n    let x = 1;\n}\n"
+        );
+
+        let (mut host, pane, dir2) = format_fixture("on-save-fail", "main.rs", UNFORMATTED_1683);
+        dispatch(
+            &mut host,
+            Request::PreviewEditRange {
+                pane: Some(pane),
+                start_line: 1,
+                start_col: 0,
+                end_line: 1,
+                end_col: 0,
+                text: "// a\n".into(),
+                expected_version: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let missing = crate::lsp::FormatError::Lsp(crate::lsp::GotoError::NotInstalled {
+            server: "fake",
+            reason: "fake が見つからない".into(),
+            next_step: "入れる".into(),
+            install_command: "x",
+        });
+        let landing = format_landing(&mut host, pane, Err(missing), true);
+        let out = lsp_format_land(&mut host, &landing).unwrap();
+        assert_eq!(out["saved"], json!(true), "{out}");
+        assert_eq!(out["format"]["status"], json!("not-installed"));
+        assert!(
+            out["format"]["note"]
+                .as_str()
+                .is_some_and(|n| n.contains("fake が見つからない")),
+            "{out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir2.join("main.rs")).unwrap(),
+            format!("// a\n{UNFORMATTED_1683}")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// 受け持つサーバが無い種類は**編集モードへ入る前に**答えを決める（副作用を残さない）。
+    /// サーバのある種類は編集モードへ入り、本文・版・範囲（バイト位置）を採る
+    #[test]
+    fn 整形の準備はサーバの無い種類で編集モードへ入らない() {
+        let (mut host, pane, dir) = format_fixture("prepare", "notes.txt", "a  \n");
+        // manager が無い host は「使えない」
+        assert!(lsp_format_prepare(
+            &mut host,
+            Some(pane),
+            None,
+            std::time::Duration::from_secs(1),
+            false
+        )
+        .is_err());
+        host.lsp = Some(crate::lsp::LspManager::disabled());
+        let job = lsp_format_prepare(
+            &mut host,
+            Some(pane),
+            None,
+            std::time::Duration::from_secs(1),
+            false,
+        )
+        .unwrap();
+        assert!(job.request.is_none());
+        assert!(
+            !host.preview_edits.contains_key(&pane),
+            "編集モードへ入っていない"
+        );
+        let out = lsp_format_land(&mut host, &job.run()).unwrap();
+        assert_eq!(out["status"], json!("no-server"), "{out}");
+
+        let (mut host, pane, dir2) =
+            format_fixture("prepare-rs", "main.rs", "fn a(){\nlet 名=1;\n}\n");
+        host.lsp = Some(crate::lsp::LspManager::disabled());
+        let range = crate::protocol::LineColRange {
+            start_line: 2,
+            start_col: 0,
+            end_line: 3,
+            end_col: 0,
+        };
+        let job = lsp_format_prepare(
+            &mut host,
+            Some(pane),
+            Some(range),
+            std::time::Duration::from_secs(1),
+            false,
+        )
+        .unwrap();
+        assert!(host.preview_edits[&pane].0, "編集モードへ入った");
+        let request = job.request.as_ref().unwrap();
+        assert_eq!(request.range, Some(8..19));
+        assert_eq!(request.text, "fn a(){\nlet 名=1;\n}\n");
+        assert_eq!(job.landing.range, Some(range));
+        // 無効な manager（`TAKO_1007_LEGACY=1`）は理由つきで返す
+        let out = lsp_format_land(&mut host, &job.run()).unwrap();
+        assert_eq!(out["status"], json!("disabled"), "{out}");
+        assert_eq!(out["range"]["start_line"], json!(2));
+        // 解けない範囲（文字の途中）は丸めずに拒否する
+        let bad = crate::protocol::LineColRange {
+            start_line: 2,
+            start_col: 5,
+            end_line: 3,
+            end_col: 0,
+        };
+        assert!(matches!(
+            lsp_format_prepare(
+                &mut host,
+                Some(pane),
+                Some(bad),
+                std::time::Duration::from_secs(1),
+                false
+            ),
+            Err(DispatchError::InvalidParams(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// 保存時整形は「ON・上書きでない・編集モード・競合なし・ローカル・サーバのある種類」の
+    /// ときだけ挟む。どれかが欠ければ `None` = 従来の保存と 1 バイトも変わらない
+    #[test]
+    fn 保存時整形を挟むのは条件がそろったときだけ() {
+        let (mut host, pane, dir) = format_fixture("on-save-cond", "main.rs", UNFORMATTED_1683);
+        host.lsp = Some(crate::lsp::LspManager::disabled());
+        host.set_preview_editing(PaneId::from_raw(pane), true)
+            .unwrap();
+        // 既定 OFF
+        assert!(lsp_format_on_save_prepare(&mut host, Some(pane), false).is_none());
+        host.format_on_save = true;
+        assert!(lsp_format_on_save_prepare(&mut host, Some(pane), false).is_some());
+        // 上書き保存（競合の抜け道）は整形しない
+        assert!(lsp_format_on_save_prepare(&mut host, Some(pane), true).is_none());
+        // 外部変更の競合中は整形しない（保存が断られるだけ）
+        host.preview_conflicts.insert(
+            pane,
+            crate::host::PreviewConflict {
+                state: tako_core::DiskState::Changed,
+                notices: 1,
+                autosave_paused: true,
+            },
+        );
+        assert!(lsp_format_on_save_prepare(&mut host, Some(pane), false).is_none());
+        host.preview_conflicts.remove(&pane);
+        // 編集モードを抜けている
+        host.set_preview_editing(PaneId::from_raw(pane), false)
+            .unwrap();
+        assert!(lsp_format_on_save_prepare(&mut host, Some(pane), false).is_none());
+        // サーバの無い種類
+        let (mut host, pane, dir2) = format_fixture("on-save-txt", "notes.txt", "a\n");
+        host.lsp = Some(crate::lsp::LspManager::disabled());
+        host.format_on_save = true;
+        host.set_preview_editing(PaneId::from_raw(pane), true)
+            .unwrap();
+        assert!(lsp_format_on_save_prepare(&mut host, Some(pane), false).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// `tako lsp format-on-save [on|off]` は既定 OFF を返し、切り替えた値と適用の範囲の注記を返す。
+    /// ON のときの `tako edit save` は整形を挟み、整形できなくても保存する（同期経路 = TAKO_OFFLOAD=0）
+    #[test]
+    fn 保存時整形の設定と同期経路の保存() {
+        let (mut host, pane, dir) = format_fixture("on-save-sync", "main.rs", UNFORMATTED_1683);
+        let out = dispatch(
+            &mut host,
+            Request::LspFormatOnSave { enabled: None },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(out["enabled"], json!(false));
+        assert!(
+            out["note"].as_str().is_some_and(|n| !n.contains('{')),
+            "{out}"
+        );
+        let out = dispatch(
+            &mut host,
+            Request::LspFormatOnSave {
+                enabled: Some(true),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(out["enabled"], json!(true));
+        host.lsp = Some(crate::lsp::LspManager::disabled());
+        host.set_preview_editing(PaneId::from_raw(pane), true)
+            .unwrap();
+        let out = dispatch(
+            &mut host,
+            Request::PreviewSave {
+                pane: Some(pane),
+                force: false,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(out["saved"], json!(true), "{out}");
+        assert_eq!(out["format"]["status"], json!("disabled"));
+        // OFF に戻せば format の節は付かない（従来の保存の応答と同じ形）
+        host.format_on_save = false;
+        let out = dispatch(
+            &mut host,
+            Request::PreviewSave {
+                pane: Some(pane),
+                force: false,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert!(out.get("format").is_none(), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

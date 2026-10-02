@@ -833,6 +833,14 @@ pub(super) fn build_request(
                 pane: u64_arg(args, "pane")?,
                 severity: str_arg(args, "severity")?,
             },
+            // #1683: 範囲は 4 つそろえて指定する（一部だけは黙って全体へ倒さずに拒否する）
+            crate::dispatch::LSP_FORMAT_ACTION => Request::LspFormat {
+                pane: Some(target_pane(args, caller)?),
+                range: lsp_format_range(args)?,
+            },
+            crate::dispatch::LSP_FORMAT_ON_SAVE_ACTION => Request::LspFormatOnSave {
+                enabled: bool_arg(args, "enabled")?,
+            },
             action if tako_core::lsp::goto::GotoKind::parse(action).is_some() => Request::LspGoto {
                 action: action.to_string(),
                 pane: Some(target_pane(args, caller)?),
@@ -1259,6 +1267,29 @@ pub(super) fn build_request(
         },
         _ => return Err(format!("不明なツール: {name}")),
     })
+}
+
+/// 整形の範囲（#1683）。`line` / `column` / `end_line` / `end_column` の 4 つそろえて範囲、
+/// 1 つも無ければ文書全体。**一部だけ**は黙って全体へ倒さず拒否する（範囲のつもりで全体が変わる）
+fn lsp_format_range(args: &Value) -> Result<Option<crate::protocol::LineColRange>, String> {
+    let keys = ["line", "column", "end_line", "end_column"];
+    let values = keys
+        .iter()
+        .map(|key| u64_arg(args, key))
+        .collect::<Result<Vec<_>, _>>()?;
+    match values.as_slice() {
+        [Some(sl), Some(sc), Some(el), Some(ec)] => Ok(Some(crate::protocol::LineColRange {
+            start_line: *sl as usize,
+            start_col: *sc as usize,
+            end_line: *el as usize,
+            end_col: *ec as usize,
+        })),
+        [None, None, None, None] => Ok(None),
+        _ => Err(format!(
+            "範囲の整形は {} の 4 つをそろえて指定する（省略で文書全体）",
+            keys.join(" / ")
+        )),
+    }
 }
 
 /// `pane` 引数（省略時は呼び出し元へフォールバック。FR-2.3.3 のデフォルトスコープ）

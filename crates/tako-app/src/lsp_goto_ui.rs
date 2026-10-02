@@ -194,6 +194,8 @@ impl TakoApp {
                     OffloadContinuation::LspGoto(landing) => {
                         Some((pane, anchor, (**landing).clone()))
                     }
+                    // ⌘クリックは定義ジャンプの続きしか返さない（整形の続きは #1683 の入口から）
+                    OffloadContinuation::LspFormat(_) => None,
                 };
                 self.land_lsp_goto(next, menu, cx);
             }
@@ -287,6 +289,17 @@ impl TakoApp {
         }
     }
 
+    /// ヘッダの一時表示を出す（定義ジャンプと整形 = #1683 が共有する 1 本）
+    pub(crate) fn show_lsp_status(
+        &mut self,
+        pane: PaneId,
+        message: String,
+        is_error: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_lsp_goto_status(pane, message, is_error, cx);
+    }
+
     /// ヘッダへ一時表示を出す（[`GOTO_STATUS_FEEDBACK`] で消える）
     fn show_lsp_goto_status(
         &mut self,
@@ -319,6 +332,10 @@ impl TakoApp {
     pub(crate) fn lsp_goto_header_status(&self, pane: PaneId) -> Option<(String, bool)> {
         if self.lsp_goto.pending == Some(pane) {
             return Some((crate::ui_text::preview::goto_searching().to_string(), false));
+        }
+        // #1683: 整形の答えを待っているあいだ
+        if self.lsp_format.pending == Some(pane) {
+            return Some((crate::ui_text::preview::format_running().to_string(), false));
         }
         self.lsp_goto
             .status

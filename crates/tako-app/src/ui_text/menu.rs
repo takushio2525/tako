@@ -124,6 +124,14 @@ pub fn select_all() -> &'static str {
 pub fn find() -> &'static str {
     tr!("プレビュー内を検索…", "Find in Preview…")
 }
+/// #1683: 編集中のコードを言語サーバで整形する
+pub fn format_document() -> &'static str {
+    tr!("コードを整形", "Format Document")
+}
+/// #1683: 選択範囲だけを整形する（範囲の外は変えない）
+pub fn format_selection() -> &'static str {
+    tr!("選択範囲を整形", "Format Selection")
+}
 
 // --- 表示 -------------------------------------------------------------------
 
@@ -263,6 +271,8 @@ mod tests {
                 paste().to_string(),
                 select_all().to_string(),
                 find().to_string(),
+                format_document().to_string(),
+                format_selection().to_string(),
                 command_palette().to_string(),
                 toggle_sidebar().to_string(),
                 toggle_drawer().to_string(),

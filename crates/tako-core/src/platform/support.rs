@@ -791,17 +791,18 @@ pub const MATRIX: &[Feature] = &[
     },
     Feature {
         key: "tako_lsp",
-        // #1679 / #1680: 言語機能（診断の一覧と定義ジャンプ）。受信・問い合わせは S1 と同じ std の
-        // パイプとスレッドで、変換・絞り込み・応答の読み取り・着地の規則は OS 非依存の純粋関数。
-        // URI → パスの Windows 形式（ドライブ文字・UNC）は macOS 上から単体で固定している。
-        // Windows 実機で実サーバの診断を見たことも定義へ飛んだこともまだ無い
+        // #1679 / #1680 / #1683: 言語機能（診断の一覧・定義ジャンプ・整形）。受信・問い合わせは S1 と
+        // 同じ std のパイプとスレッドで、変換・絞り込み・応答の読み取り・着地の規則・整形の当て方
+        // （`TextBuffer::apply_changes`）は OS 非依存の純粋関数。URI → パスの Windows 形式（ドライブ文字・
+        // UNC）は macOS 上から単体で固定している。Windows 実機で実サーバの診断を見たことも、
+        // 定義へ飛んだことも、整形したこともまだ無い
         macos: Support::Supported,
         windows: Support::Pending {
             note: notes::WIN_LSP_FEATURES_UNMEASURED,
             issue: 1007,
         },
         windows_evidence: Evidence::UnitTest(
-            "issue1679_lsp_diagnostics（偽サーバの Diagnostic 配列 → tako lsp diagnostics の固定値・重大度の境界・UTF-16 の桁・閉じたら保持 0）と issue1680_lsp_goto（偽サーバの Location / LocationLink → 行・桁の変換・UTF-16・見つからない / 未応答 / 未導入 / 未対応の区別・一時 didOpen の後始末）が CI の Windows ジョブで緑。URI → パスの Windows 形式は lsp::goto の単体（macOS 上で固定）",
+            "issue1679_lsp_diagnostics（偽サーバの Diagnostic 配列 → tako lsp diagnostics の固定値・重大度の境界・UTF-16 の桁・閉じたら保持 0）と issue1680_lsp_goto（偽サーバの Location / LocationLink → 行・桁の変換・UTF-16・見つからない / 未応答 / 未導入 / 未対応の区別・一時 didOpen の後始末）と issue1683_lsp_format（偽サーバの TextEdit 配列 4 形 → 固定値・undo 1 回・範囲の外を変えない・CRLF・待つあいだの変更）が CI の Windows ジョブで緑。URI → パスの Windows 形式は lsp::goto の単体（macOS 上で固定）",
         ),
     },
     Feature {

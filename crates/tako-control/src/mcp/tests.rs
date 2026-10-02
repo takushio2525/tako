@@ -31,14 +31,22 @@ mod tests {
     }
 
     /// #1679 と #1680 の合流: `tako_lsp` は 1 本で、action の先頭が既定の diagnostics、
-    /// 残りは定義ジャンプの綴りの正本（`GotoKind::NAMES`）そのもの。種類を足したのに
-    /// action の表へ載せ忘れる・振り分けが受けない、のどちらもここで落ちる
+    /// 続いて定義ジャンプの綴りの正本（`GotoKind::NAMES`）そのもの、最後に整形の 2 つ（#1683）。
+    /// 種類を足したのに action の表へ載せ忘れる・振り分けが受けない、のどちらもここで落ちる
     #[test]
     fn tako_lsp_の_action_は診断と定義ジャンプの全種を振り分ける() {
         let actions = crate::dispatch::LSP_FEATURE_ACTIONS;
         assert_eq!(actions[0], "diagnostics");
-        assert_eq!(&actions[1..], &tako_core::lsp::goto::GotoKind::NAMES[..]);
-        for action in &actions[1..] {
+        let goto = &actions[1..=tako_core::lsp::goto::GotoKind::NAMES.len()];
+        assert_eq!(goto, &tako_core::lsp::goto::GotoKind::NAMES[..]);
+        assert_eq!(
+            &actions[goto.len() + 1..],
+            &[
+                crate::dispatch::LSP_FORMAT_ACTION,
+                crate::dispatch::LSP_FORMAT_ON_SAVE_ACTION
+            ]
+        );
+        for action in goto {
             assert_eq!(
                 build_request(
                     "tako_lsp",
@@ -61,6 +69,61 @@ mod tests {
         }
         // 定義ジャンプは位置が要る（診断の既定へ黙って倒れない）
         assert!(build_request("tako_lsp", &json!({"action": "definition"}), Some(9), None).is_err());
+    }
+
+    /// #1683: 整形は CLI `tako lsp format [--pane N] [--range L1:C1-L2:C2]` と同じ要求になる。
+    /// 範囲は 4 つそろえて指定し、一部だけは全体へ倒さずに拒否する
+    #[test]
+    fn tako_lsp_の整形は_cli_と同じ要求になる() {
+        assert_eq!(
+            build_request("tako_lsp", &json!({"action": "format"}), Some(4), None).unwrap(),
+            Request::LspFormat {
+                pane: Some(4),
+                range: None
+            }
+        );
+        assert_eq!(
+            build_request(
+                "tako_lsp",
+                &json!({"action": "format", "pane": 7, "line": 2, "column": 0, "end_line": 5, "end_column": 3}),
+                Some(4),
+                None
+            )
+            .unwrap(),
+            Request::LspFormat {
+                pane: Some(7),
+                range: Some(crate::protocol::LineColRange {
+                    start_line: 2,
+                    start_col: 0,
+                    end_line: 5,
+                    end_col: 3
+                })
+            }
+        );
+        let err = build_request(
+            "tako_lsp",
+            &json!({"action": "format", "line": 2, "column": 0}),
+            Some(4),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("end_line"), "{err}");
+        assert_eq!(
+            build_request("tako_lsp", &json!({"action": "format-on-save"}), Some(4), None).unwrap(),
+            Request::LspFormatOnSave { enabled: None }
+        );
+        assert_eq!(
+            build_request(
+                "tako_lsp",
+                &json!({"action": "format-on-save", "enabled": true}),
+                None,
+                None
+            )
+            .unwrap(),
+            Request::LspFormatOnSave {
+                enabled: Some(true)
+            }
+        );
     }
 
     #[test]

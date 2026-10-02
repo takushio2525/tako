@@ -666,6 +666,20 @@ pub struct PreviewConflict {
     pub autosave_paused: bool,
 }
 
+/// 整形（#1683）の材料（[`PreviewHost::preview_format_source`]）。**頼んだときの編集バッファ**の
+/// 全文と版で、答えはこの版にだけ当てる
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewFormatSource {
+    /// 編集しているファイル（言語サーバの検出表を引く・URI を作る）
+    pub path: String,
+    pub text: String,
+    pub version: u64,
+    /// 字下げの単位（`FormattingOptions` の tabSize / insertSpaces）
+    pub indent: tako_core::text_edit::IndentUnit,
+    /// 範囲の整形なら、`text` のバイト位置へ解いた範囲（解けない指定は丸めずに拒否済み）
+    pub range: Option<std::ops::Range<usize>>,
+}
+
 /// 定義ジャンプ（#1680）の起点になるプレビューの本文（[`PreviewHost::preview_goto_source`]）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviewGotoSource {
@@ -723,6 +737,29 @@ pub trait PreviewHost {
         _line: usize,
     ) -> Result<PreviewGotoSource, String> {
         Err("定義ジャンプは未対応".into())
+    }
+    /// 整形（FR-3.33 / #1683）の材料。**編集モードでなければ入る**（整形は編集。言語サーバも
+    /// そこで起きる = FR-3.28）。`range` は行・桁（行 1 始まり・桁 0 始まりの UTF-8 バイト）で、
+    /// 解けない指定（範囲外・文字の途中・逆向き）は本文を触らずに理由を返す
+    fn preview_format_source(
+        &mut self,
+        _pane: PaneId,
+        _range: Option<(
+            tako_core::text_edit::TextPosition,
+            tako_core::text_edit::TextPosition,
+        )>,
+    ) -> Result<PreviewFormatSource, String> {
+        Err("整形は未対応".into())
+    }
+    /// 整形の答えを編集バッファへ当てる（#1683。`TextBuffer::apply_changes` の 1 実装 =
+    /// undo 1 回で戻る）。版が `expected_version` と違えば何も当てずに断る
+    fn apply_preview_changes(
+        &mut self,
+        _pane: PaneId,
+        _changes: Vec<tako_core::text_edit::TextChange>,
+        _expected_version: u64,
+    ) -> Result<tako_core::text_edit::AppliedChanges, String> {
+        Err("整形は未対応".into())
     }
     /// code 表示のプレビューがいま見ている行（1 始まり。FR-3.29 / #1677）。
     ///
@@ -1187,6 +1224,15 @@ pub trait SystemHost {
     /// `tako lsp diagnostics` がペインから文書の URI を引く。持たない実装は空
     fn lsp_documents(&self) -> Vec<crate::lsp::LspDocument> {
         Vec::new()
+    }
+    /// 保存時整形（FR-3.33 / #1683）の今の値。**既定 false**（GUI は settings.json の
+    /// `lsp_format_on_save` を起動時に読んだ値を持つ）
+    fn lsp_format_on_save(&self) -> bool {
+        false
+    }
+    /// 保存時整形の切替（`tako lsp format-on-save on|off`・設定画面）。永続化は実装側の責務
+    fn set_lsp_format_on_save(&mut self, _enabled: bool) -> Result<(), String> {
+        Err("保存時整形の設定は未対応".into())
     }
     /// ライブペインの現行ログファイル（Issue #112 B。クローズ済みペインは
     /// `pane_log::latest_for_pane` のファイル名検索にフォールバックする）
