@@ -1837,6 +1837,31 @@ syntect へ通していた**。release 実測（同じ構文セット・テー�
   そうでなければディスクの中身で UTF-8 バイト（`tako edit replace-range` の桁）と文字数
   （`OpenFile` の桁）へ直す（`lsp::goto::locate`）
 
+### 整形（#1683。2026-10-02）
+
+- **3 段で 1 本**（定義ジャンプと同じ形）: 準備（UI スレッド）= `dispatch::lsp_format_prepare`
+  （**編集モードへ入って**全文・版・範囲を採る。受け持つサーバが無い種類は入る前に `no-server`）→
+  問い合わせ（background）= `LspFormatJob::run` → `LspManager::format` → 当てる（UI スレッド）=
+  `dispatch::lsp_format_land` → `PreviewHost::apply_preview_changes`。GUI の ⇧⌘I / メニュー /
+  パレット / ⌘S（`lsp_format_ui.rs`）も IPC / MCP も同じ 3 段で、UI 層は答えを当てない。
+  準備が編集モードへ入る（= host を書き換える）ので `prepare_offload` は `&mut dyn ControlHost` を取る
+- **サーバの写しを頼む本文へ揃える**（`Shared::align_shadow`）: 打鍵の直後で UI の同期がまだ・
+  同じファイルの別のペインが後から編集した、のどちらでも答えの座標が頼んだ本文とずれる。
+  揃えたら頼み、答えのあとで写しが変わっていれば `Stale`（manager）。当てる側は**頼んだときの版**と
+  今の版を比べてもう一度 `stale` を判定する（打鍵が問い合わせ中に入ったとき）
+- **当て方の正本は `tako_core::text_edit`**: `order_changes`（安定ソート → 重なり拒否 → 最小化）と
+  `TextBuffer::apply_changes`（最初の始まりから最後の終わりまでを `apply_edit` 1 回 = undo 1 回・
+  版 1 つ。改行はバッファの流儀・カーソルと選択端は追従）。複数範囲の差分を undo 1 件へ持たせる
+  案（`EditDelta` を複数の塊にする）は undo / redo / 行頭索引の追従を全部書き直すことになるので採らず、
+  外側の 1 範囲へまとめる（範囲のあいだの本文も履歴に載るが、整形は 1 回 1 件なので予算 #1651 に収まる）
+- **範囲の整形**は `lsp::format::restrict_to_range` が範囲の外を 1 バイトも変えない形へ収める
+  （外が空白だけなら捨てる・空白以外なら全体をやめる）。能力（`documentRangeFormattingProvider`）が
+  無ければ頼まない
+- **保存時整形**は dispatch の `PreviewSave` の準備で挟む（`lsp_format_on_save_prepare`。条件が欠けたら
+  `None` = 従来の同期の保存）。当てたあと `preview_save`（`PreviewSave` の同期経路と同じ 1 実装）で
+  保存する。GUI の ⌘S は `save_with_format` から同じ準備を通し、挟まないときだけ従来の保存へ落ちる。
+  **自動保存（`run_autosave`）はこの経路を通らない**（番犬 `issue1683_lsp_format_watchdog`）
+
 ### S1 の続き（#1769。2026-09-27）
 
 - **行の区切りは 2 種類**（正本 = `tako_core::lsp::position` の冒頭）: LSP の行は仕様どおり

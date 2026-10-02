@@ -308,8 +308,10 @@ fn 行桁の解決は丸めない() {
 
 /// 本文を変える公開 API（版が進むべきもの）。[`本文を変える公開apiはすべて版を進める`] が
 /// 挙動で確かめ、[`textbufferの書き換え口は棚卸し済み`] が取りこぼしを見る
-const MUTATES_TEXT: [&str; 17] = [
+const MUTATES_TEXT: [&str; 18] = [
     "set_text",
+    // 整形の答え（書き換えの組）をまとめて 1 回で当てる（#1683。版は 1 つだけ進む）
+    "apply_changes",
     // ディスクから読み直す（#1659。`tako edit reload`。食い違った範囲だけを 1 回の編集として積む）
     "reload_from_disk",
     "reload_from",
@@ -440,6 +442,19 @@ fn 本文を変える公開apiはすべて版を進める() {
                     expected_version: None,
                 })
                 .expect("1 行目の 1 バイト目は解ける");
+            }),
+        ),
+        (
+            "apply_changes",
+            Box::new(|b: &mut TextBuffer| {
+                b.apply_changes(
+                    vec![tako_core::text_edit::TextChange {
+                        range: 0..1,
+                        text: "W".into(),
+                    }],
+                    None,
+                )
+                .expect("1 バイト目は当たる");
             }),
         ),
         (

@@ -240,10 +240,12 @@ pub const FORMAT_DONE_NOTE: Note = Note::new(
     "Formatted ({count} changes; one undo reverts it)",
 );
 
-/// 変える所が無かった
+/// 変える所が無かった。**「整形済み」と言い切らない**: rust-analyzer は rustfmt が読めない
+/// （構文エラー）ときも空で答えるので、整形済みと区別できない（実測 #1683。診断の publish は
+/// 整形の答えより遅れうるので、エラーの数が 0 でも構文エラーがありうる）
 pub const FORMAT_UNCHANGED_NOTE: Note = Note::new(
-    "変える所が無かった（整形済み）",
-    "Nothing to change (already formatted)",
+    "変える所が無かった（構文エラーがあるとサーバは整形しないことがある）",
+    "Nothing changed (servers often skip formatting when the code has syntax errors)",
 );
 
 /// 変える所が無かったが、エラーの診断がある。`{count}` = エラーの数

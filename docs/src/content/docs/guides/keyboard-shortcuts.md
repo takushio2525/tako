@@ -89,6 +89,7 @@ Windows では Command キーにあたる修飾が Win キーになり、多く�
 | プレビュー内を検索 | <kbd>Cmd</kbd>+<kbd>F</kbd> | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd> |
 | 編集を元に戻す | <kbd>Cmd</kbd>+<kbd>Z</kbd> | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> |
 | 編集をやり直す | <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Y</kbd> |
+| コードを整形（言語サーバ。undo 1 回で戻る） | <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>I</kbd> | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>I</kbd> |
 
 :::note[Windows の取り消し・やり直し]
 ターミナルでは <kbd>Ctrl</kbd>+<kbd>Z</kbd>（プロセスの一時停止）を奪えないため、取り消しも <kbd>Shift</kbd> 段に置いています。やり直しは Windows 慣習どおり <kbd>Y</kbd> です。

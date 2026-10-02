@@ -33,7 +33,7 @@ tako orchestrator spawn --help
 | [`send`](#tako-send) | ペインへテキスト・コマンドを送る |
 | [`read`](#tako-read) | ペインの画面内容を読む |
 | [`links`](#tako-links) | 画面のリンク（Cmd+クリック / Windows は Ctrl+クリックで開けるもの）を列挙する |
-| [`lsp`](#tako-lsp) | 言語サーバ（LSP）の状態と起動・停止・編集中のコードの診断（編集モードで自動的に起きる） |
+| [`lsp`](#tako-lsp) | 言語サーバ（LSP）の状態と起動・停止・編集中のコードの診断・定義ジャンプ・整形（編集モードで自動的に起きる） |
 | [`list`](#tako-list) | タブ・ペインの構成を JSON で得る |
 | [`focus`](#tako-focus) | フォーカスを移す |
 | [`scroll`](#tako-scroll) | スクロールバックを動かす |
@@ -424,7 +424,7 @@ tako title --pane 3 ""   # 空文字でクリア（自動リネームに戻る�
 
 ### tako lsp
 
-コードプレビューを**編集モードにすると**、拡張子に合う言語サーバ（Rust = rust-analyzer / C・C++ = clangd / TypeScript・JavaScript = typescript-language-server / Python = pyright）が自動的に起きます。`tako lsp` はその状態を見たり、起こし直したり、診断（エラー・警告）を一覧したりするコマンドです。診断は画面でも、コードの波線（エラー = 赤 / 警告 = 黄 / 情報 = 青 / ヒント = 灰）と右パネルの diagnostics ビューに出ます。定義ジャンプは下の「定義へ飛ぶ」を参照してください。補完はこれから順に入ります。
+コードプレビューを**編集モードにすると**、拡張子に合う言語サーバ（Rust = rust-analyzer / C・C++ = clangd / TypeScript・JavaScript = typescript-language-server / Python = pyright）が自動的に起きます。`tako lsp` はその状態を見たり、起こし直したり、診断（エラー・警告）を一覧したりするコマンドです。診断は画面でも、コードの波線（エラー = 赤 / 警告 = 黄 / 情報 = 青 / ヒント = 灰）と右パネルの diagnostics ビューに出ます。定義ジャンプは下の「定義へ飛ぶ」、整形は「コードを整形する」を参照してください。補完はこれから順に入ります。
 
 ```bash
 tako lsp status          # 状態（稼働中か・pid・診断の件数）。未導入なら理由と導入コマンド
@@ -461,6 +461,18 @@ tako lsp implementation --pane 3 --line 12 --column 8    # 実装へ（declarati
 ```
 
 `--open` で新しいペインの置き場所（`right` / `down` / `new-tab`）を選べます。見つからない・言語サーバが応答しない・入っていないときは、それぞれ別の理由と次の一手を返します。MCP では `tako_lsp`（`action` = definition 等）が同じ操作です。
+
+#### コードを整形する（tako lsp format）
+
+編集メニューの「コードを整形」（**⇧⌘I**。Windows は Ctrl+Shift+I）で、言語サーバ（Rust なら rust-analyzer 経由の rustfmt）がコードを整形します。選択した範囲だけを整形するときは「選択範囲を整形」です。整形は編集の 1 回として入るので、**undo 1 回で整形の前に戻せます**。範囲の整形は範囲の外を 1 文字も変えません。
+
+```bash
+tako lsp format --pane 3                       # そのペインのコード全体を整形する
+tako lsp format --pane 3 --range 10:0-24:0     # 10 行目から 24 行目の頭までだけ整形する
+tako lsp format-on-save on                     # 保存時整形を ON にする（既定は off）
+```
+
+保存時整形は、**自分で保存したとき**（⌘S・`tako edit save`）だけ整形してから保存します。自動保存では整形しません（打っている途中で勝手に整形されないように）。整形できなかったとき（言語サーバが入っていない・応答しない）も保存は行い、理由を出します。設定画面の「保存時に整形」でも切り替えられます。MCP では `tako_lsp`（`action=format` / `format-on-save`）が同じ操作です。
 
 ## レイアウト操作
 

@@ -223,8 +223,8 @@ pub mod notes {
     /// OS 非依存の e2e と単体で見ているが、Windows 実機で実サーバの診断を出したことも定義へ
     /// 飛んだこともまだ無い
     pub const WIN_LSP_FEATURES_UNMEASURED: Note = Note::new(
-        "診断の受信・重大度の絞り込み・定義の問い合わせ・UTF-16 の桁の変換・Windows 形式の URI → パス・着地の規則は偽サーバの e2e と単体で確かめているが、Windows 実機で実サーバ（rust-analyzer / clangd 等）の診断を出したことも定義へ飛んだこともまだ無い（#1007）",
-        "Receiving diagnostics, filtering by severity, querying definitions, converting UTF-16 columns, mapping Windows-style URIs to paths and the landing rules are covered by the fake-server e2e and unit tests, but no real language server (rust-analyzer / clangd, etc.) has produced diagnostics or been used to go to a definition on real Windows hardware yet (#1007)",
+        "診断の受信・重大度の絞り込み・定義の問い合わせ・整形の答えの当て方・UTF-16 の桁の変換・Windows 形式の URI → パス・着地の規則は偽サーバの e2e と単体で確かめているが、Windows 実機で実サーバ（rust-analyzer / clangd 等）の診断を出したことも、定義へ飛んだことも、整形したこともまだ無い（#1007）",
+        "Receiving diagnostics, filtering by severity, querying definitions, applying formatting edits, converting UTF-16 columns, mapping Windows-style URIs to paths and the landing rules are covered by the fake-server e2e and unit tests, but no real language server (rust-analyzer / clangd, etc.) has produced diagnostics, been used to go to a definition or formatted code on real Windows hardware yet (#1007)",
     );
 
     // ─── そもそも要らない / 概念が無い ─────────────────────────────
