@@ -948,7 +948,7 @@ pub enum Request {
         line: usize,
         column: usize,
     },
-    /// ホバー（型・doc。FR-3.36 / #1681。`tako lsp hover` / MCP `tako_lsp` の action=hover）。
+    /// ホバー（型・doc。FR-3.37 / #1681。`tako lsp hover` / MCP `tako_lsp` の action=hover）。
     /// GUI のマウスのホバー・編集メニューの「ホバー情報を表示」と同じ問い合わせの 1 本。
     ///
     /// 位置は `tako edit replace-range` と同じ（`line` は 1 始まり・`column` は 0 始まりの

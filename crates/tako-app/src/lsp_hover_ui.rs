@@ -64,6 +64,9 @@ pub(crate) struct HoverTarget {
     pub(crate) range: Range<usize>,
 }
 
+/// 測ったカードの実寸（カードの世代つき = 前のカードの寸法で次のカードを置かない）
+type MeasuredSlot = Rc<Cell<Option<(u64, Size<Pixels>)>>>;
+
 /// ホバーの GUI の状態（#1681）
 #[derive(Default)]
 pub(crate) struct LspHoverUi {
@@ -78,13 +81,34 @@ pub(crate) struct LspHoverUi {
     /// 直近に描いたカードの矩形（マウスがカードの上にいる間は閉じない・visual-test が差分の範囲を見る）
     pub(crate) bounds: Option<Bounds<Pixels>>,
     /// 1 フレーム目に測ったカードの実寸（世代つき）
-    measured: Rc<Cell<Option<(u64, Size<Pixels>)>>>,
+    measured: MeasuredSlot,
     /// 直近に描いたカードの本文の `TextLayout`（リンクの当たり判定）
     layouts: Vec<Option<gpui::TextLayout>>,
     /// 背景で答えを待っている問い合わせの数（100 回の出し入れで増え続けないことを visual-test が測る）
     pub(crate) inflight: usize,
     /// これまでに出したカードの数
     pub(crate) shown: u64,
+    /// 直近の答えが失敗だったときの `status`（カードを出さない理由。visual-test が名指す）
+    pub(crate) last_failure: Option<&'static str>,
+    /// 描く直前の照合でカードを閉じた直近の理由（visual-test が名指す）
+    pub(crate) last_invalid: Option<&'static str>,
+}
+
+impl LspHoverUi {
+    /// 状態の 1 行（visual-test が外れた回を名指すため。本文は出さない）
+    #[cfg(feature = "visual-test")]
+    pub(crate) fn debug_state(&self) -> String {
+        format!(
+            "target={:?} seq={} card={} inflight={} shown={} last_failure={:?} last_invalid={:?}",
+            self.target.as_ref().map(|t| (t.line, t.range.clone())),
+            self.seq,
+            self.card.is_some(),
+            self.inflight,
+            self.shown,
+            self.last_failure,
+            self.last_invalid,
+        )
+    }
 }
 
 /// 出しているカード 1 枚
@@ -458,8 +482,12 @@ impl TakoApp {
         }
         // 失敗（未応答・落ちた…）と「何も無い」はカードを出さないだけ（乗せるたびに通知しない。
         // 理由は `tako lsp hover` / `tako lsp status` が返す）
-        let Ok(answer) = outcome else {
-            return;
+        let answer = match outcome {
+            Ok(answer) => answer,
+            Err(error) => {
+                self.lsp_hover.last_failure = Some(error.status());
+                return;
+            }
         };
         if self.open_lsp_hover_card(
             target.pane,
@@ -648,16 +676,19 @@ impl TakoApp {
     /// ペインが消えた・別のファイルに差し替わった・本文が変わった・語の行が画面の外へ出た、
     /// マウスで出したカードはマウスが語とカードの外へ出た、メニュー / CLI で出したカードは
     /// フォーカスが移った、のどれでも外れる
-    fn hover_still_valid(&self, window: &gpui::Window) -> bool {
+    fn hover_still_valid(&self, window: &gpui::Window) -> Result<(), &'static str> {
         let Some(card) = &self.lsp_hover.card else {
-            return false;
+            return Err("no-card");
         };
         let same_file = self
             .previews
             .get(&card.pane)
             .is_some_and(|p| p.path == card.path && p.mode == preview::PreviewMode::Code);
-        if !same_file || self.hover_version(card.pane) != card.version {
-            return false;
+        if !same_file {
+            return Err("file");
+        }
+        if self.hover_version(card.pane) != card.version {
+            return Err("edited");
         }
         let drawn = self
             .preview_text_layouts
@@ -665,11 +696,18 @@ impl TakoApp {
             .and_then(|l| l.get(card.line))
             .is_some_and(Option::is_some);
         if !drawn {
-            return false;
+            return Err("off-screen");
         }
-        match card.origin {
+        let kept = match card.origin {
             HoverOrigin::Mouse => self.hover_keeps(window.mouse_position()),
             HoverOrigin::Explicit => self.focused_pane() == card.pane,
+        };
+        if kept {
+            Ok(())
+        } else if card.origin == HoverOrigin::Mouse {
+            Err("mouse-left")
+        } else {
+            Err("focus")
         }
     }
 
@@ -696,8 +734,11 @@ impl TakoApp {
         window: &gpui::Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if self.lsp_hover.card.is_some() && !self.hover_still_valid(window) {
-            self.close_lsp_hover();
+        if self.lsp_hover.card.is_some() {
+            if let Err(reason) = self.hover_still_valid(window) {
+                self.lsp_hover.last_invalid = Some(reason);
+                self.close_lsp_hover();
+            }
         }
         let card = self.lsp_hover.card.as_ref()?;
         let (generation, blocks, truncated) =
@@ -826,15 +867,18 @@ mod tests {
     use gpui::{FontWeight, HighlightStyle};
     use tako_core::theme::Theme;
 
-    /// 受け皿の呼び出し（テキスト・ハイライトの中身・色・太さ）を記録するだけの実装
+    /// 描いた 1 行（テキスト・ハイライトの中身・色・太さ）
+    type Row = (
+        String,
+        Vec<(Range<usize>, HighlightStyle)>,
+        tako_core::Rgb,
+        Option<FontWeight>,
+    );
+
+    /// 受け皿の呼び出しを記録するだけの実装
     #[derive(Default)]
     struct RecordingSink {
-        rows: Vec<(
-            String,
-            Vec<(Range<usize>, HighlightStyle)>,
-            tako_core::Rgb,
-            Option<FontWeight>,
-        )>,
+        rows: Vec<Row>,
         spacers: usize,
     }
 

@@ -223,8 +223,8 @@ pub mod notes {
     /// OS 非依存の e2e と単体で見ているが、Windows 実機で実サーバの診断を出したことも定義へ
     /// 飛んだこともまだ無い
     pub const WIN_LSP_FEATURES_UNMEASURED: Note = Note::new(
-        "診断の受信・重大度の絞り込み・定義の問い合わせ・整形の答えの当て方・補完の問い合わせと取り消し・右クリックメニューの能力による出し分け・UTF-16 の桁の変換・Windows 形式の URI → パス・着地の規則は偽サーバの e2e と単体で確かめているが、Windows 実機で実サーバ（rust-analyzer / clangd 等）の診断を出したことも、定義へ飛んだことも、整形したことも、補完の一覧や右クリックメニューの項目を出したこともまだ無い（#1007）",
-        "Receiving diagnostics, filtering by severity, querying definitions, applying formatting edits, querying and cancelling completions, choosing context-menu items from server capabilities, converting UTF-16 columns, mapping Windows-style URIs to paths and the landing rules are covered by the fake-server e2e and unit tests, but no real language server (rust-analyzer / clangd, etc.) has produced diagnostics, been used to go to a definition, formatted code or shown a completion list or context-menu items on real Windows hardware yet (#1007)",
+        "診断の受信・重大度の絞り込み・定義の問い合わせ・整形の答えの当て方・補完とホバーの問い合わせと取り消し・右クリックメニューの能力による出し分け・UTF-16 の桁の変換・Windows 形式の URI → パス・着地の規則は偽サーバの e2e と単体で確かめているが、Windows 実機で実サーバ（rust-analyzer / clangd 等）の診断を出したことも、定義へ飛んだことも、整形したことも、補完の一覧やホバーのカードや右クリックメニューの項目を出したこともまだ無い（#1007）",
+        "Receiving diagnostics, filtering by severity, querying definitions, applying formatting edits, querying and cancelling completions and hovers, choosing context-menu items from server capabilities, converting UTF-16 columns, mapping Windows-style URIs to paths and the landing rules are covered by the fake-server e2e and unit tests, but no real language server (rust-analyzer / clangd, etc.) has produced diagnostics, been used to go to a definition, formatted code or shown a completion list, a hover card or context-menu items on real Windows hardware yet (#1007)",
     );
 
     // ─── そもそも要らない / 概念が無い ─────────────────────────────
@@ -791,20 +791,20 @@ pub const MATRIX: &[Feature] = &[
     },
     Feature {
         key: "tako_lsp",
-        // #1679 / #1680 / #1683 / #1682 / #1684: 言語機能（診断の一覧・定義ジャンプ・整形・補完・
-        // 右クリックメニューの項目）。受信・問い合わせは S1 と同じ std のパイプとスレッドで、変換・
-        // 絞り込み・応答の読み取り・着地の規則・整形の当て方（`TextBuffer::apply_changes`）・補完の
-        // キーの振り分け表・メニューの能力による出し分けは OS 非依存の純粋関数。URI → パスの
-        // Windows 形式（ドライブ文字・UNC）は macOS 上から単体で固定している。Windows 実機で実サーバの
-        // 診断を見たことも、定義へ飛んだことも、整形したことも、補完の一覧や右クリックメニューの
-        // 項目を出したこともまだ無い
+        // #1679 / #1680 / #1683 / #1682 / #1684 / #1681: 言語機能（診断の一覧・定義ジャンプ・整形・補完・
+        // 右クリックメニューの項目・ホバー）。受信・問い合わせは S1 と同じ std のパイプとスレッドで、変換・
+        // 絞り込み・応答の読み取り（ホバーの 3 形を含む）・着地の規則・整形の当て方（`TextBuffer::apply_changes`）・
+        // 補完のキーの振り分け表・メニューの能力による出し分け・ホバーのカードの置き場は OS 非依存の純粋関数。
+        // URI → パスの Windows 形式（ドライブ文字・UNC）は macOS 上から単体で固定している。Windows 実機で
+        // 実サーバの診断を見たことも、定義へ飛んだことも、整形したことも、補完の一覧やホバーのカードや
+        // 右クリックメニューの項目を出したこともまだ無い
         macos: Support::Supported,
         windows: Support::Pending {
             note: notes::WIN_LSP_FEATURES_UNMEASURED,
             issue: 1007,
         },
         windows_evidence: Evidence::UnitTest(
-            "issue1679_lsp_diagnostics（偽サーバの Diagnostic 配列 → tako lsp diagnostics の固定値・重大度の境界・UTF-16 の桁・閉じたら保持 0）と issue1680_lsp_goto（偽サーバの Location / LocationLink → 行・桁の変換・UTF-16・見つからない / 未応答 / 未導入 / 未対応の区別・一時 didOpen の後始末）と issue1683_lsp_format（偽サーバの TextEdit 配列 4 形 → 固定値・undo 1 回・範囲の外を変えない・CRLF・待つあいだの変更）と issue1682_lsp_completion（偽サーバの補完 → 3 回の要求で $/cancelRequest 2 件・版が変わった答えを捨てる・UTF-16 の範囲・説明の補い）と issue1684_lsp_menu（偽サーバの申告 4 通り → 右クリックメニューの項目の列・握手以外を送らない・未導入）が CI の Windows ジョブで緑。URI → パスの Windows 形式は lsp::goto の単体（macOS 上で固定）",
+            "issue1679_lsp_diagnostics（偽サーバの Diagnostic 配列 → tako lsp diagnostics の固定値・重大度の境界・UTF-16 の桁・閉じたら保持 0）と issue1680_lsp_goto（偽サーバの Location / LocationLink → 行・桁の変換・UTF-16・見つからない / 未応答 / 未導入 / 未対応の区別・一時 didOpen の後始末）と issue1683_lsp_format（偽サーバの TextEdit 配列 4 形 → 固定値・undo 1 回・範囲の外を変えない・CRLF・待つあいだの変更）と issue1682_lsp_completion（偽サーバの補完 → 3 回の要求で $/cancelRequest 2 件・版が変わった答えを捨てる・UTF-16 の範囲・説明の補い）と issue1684_lsp_menu（偽サーバの申告 4 通り → 右クリックメニューの項目の列・握手以外を送らない・未導入）と issue1681_lsp_hover（偽サーバのホバー → Markdown / 平文 / 旧形式 / 空の読み取り・UTF-16 の往復・マウスの要求の取り消し・開いていない文書でサーバを起こさない・100 回で保持件数が増えない）が CI の Windows ジョブで緑。URI → パスの Windows 形式は lsp::goto の単体（macOS 上で固定）",
         ),
     },
     Feature {

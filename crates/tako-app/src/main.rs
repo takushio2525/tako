@@ -42712,6 +42712,18 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1681: ホバーのカード（実ピクセル・100 回の出し入れ・下端で上へ返す・補完と同時）
+                "hover" => {
+                    hover_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
+                // #1681: 実の rust-analyzer の doc のカードが出るか（無ければ SKIPPED）
+                "hover-real" => {
+                    hover_real_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1680: ⌘ホバー中の識別子の下線が実ピクセルで描かれ、⌘ を離すと消えるか
                 "goto-hover" => {
                     goto_hover_visual(any, window, cx).await;
@@ -47759,6 +47771,647 @@ mod self_test {
         check(
             line.starts_with("    s.len"),
             &format!("visual-test completion-real: Enter で len が入る ({line:?})"),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ホバー（#1681）の場面: 偽サーバ（補完は 1 件・ホバーは `rules`）で `src/main.rs` を編集モードで
+    /// 開く（補完の場面の 1 実装を通す。ホバーの規則は偽サーバの起動の前に env で渡す）
+    #[cfg(feature = "visual-test")]
+    async fn hover_scene(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        label: &str,
+        rules: serde_json::Value,
+        source: &str,
+    ) -> (
+        PaneId,
+        std::path::PathBuf,
+        Option<String>,
+        std::path::PathBuf,
+    ) {
+        let file = std::env::temp_dir().join(format!(
+            "tako-visual-{label}-hover-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&file, rules.to_string()).expect("hover.json");
+        std::env::set_var("TAKO_LSP_FAKE_HOVER", &file);
+        let completion = serde_json::json!({ "items": [{ "label": "totalx" }] });
+        let (pane, dir, env) =
+            completion_scene(any, window, cx, label, Some(completion), source, (1, 0)).await;
+        (pane, dir, env, file)
+    }
+
+    /// 行 `line`（0 起点）の `col` バイト目の字の中ほど（ウィンドウ座標）
+    #[cfg(feature = "visual-test")]
+    fn hover_point(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        pane: PaneId,
+        line: usize,
+        col: usize,
+    ) -> Option<Point<Pixels>> {
+        window
+            .update(cx, |app, _, _| {
+                let layout = app.preview_text_layouts.get(&pane)?.get(line)?.clone()?;
+                let a = layout.position_for_index(col)?;
+                let b = layout.position_for_index(col + 1)?;
+                Some(point((a.x + b.x) / 2.0, a.y + layout.line_height() / 2.0))
+            })
+            .ok()
+            .flatten()
+    }
+
+    /// 合成のマウス移動（実機のマウスと同じ `on_mouse_move` の入口）
+    #[cfg(feature = "visual-test")]
+    fn hover_move(any: AnyWindowHandle, cx: &mut AsyncApp, at: Point<Pixels>) {
+        let _ = any.update(cx, |_, win, cx| {
+            win.dispatch_event(
+                gpui::PlatformInput::MouseMove(MouseMoveEvent {
+                    position: at,
+                    pressed_button: None,
+                    modifiers: Modifiers::default(),
+                }),
+                cx,
+            )
+        });
+    }
+
+    /// カードが**見える状態で**出る（測った後 = 2 フレーム目）まで状態で待つ。出たら `shown` の数
+    #[cfg(feature = "visual-test")]
+    async fn hover_wait_card(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        limit: usize,
+    ) -> Option<u64> {
+        for _ in 0..limit {
+            notify_and_draw(any, window, cx);
+            let seen = window
+                .update(cx, |app, _, _| {
+                    app.lsp_hover
+                        .card
+                        .as_ref()
+                        .zip(app.lsp_hover.bounds)
+                        .map(|_| app.lsp_hover.shown)
+                })
+                .ok()
+                .flatten();
+            if seen.is_some() {
+                // 1 フレーム目は見えないまま測る。もう 1 フレーム描いて測った高さで置き直す
+                notify_and_draw(any, window, cx);
+                notify_and_draw(any, window, cx);
+                return seen;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(20))
+                .await;
+        }
+        None
+    }
+
+    /// `at` へマウスを置いてカードが出るのを待つ。出なかったとき、窓のマウス位置が置いた位置から
+    /// ずれていた（= 実機のマウスの移動が割り込んで語から外れた。蓋閉じの機では tako-vd が主画面で
+    /// カーソルがその上に居る）ときだけ置き直す（3 回まで）。返り値は（出したカードの数, 置き直した回数）。
+    /// 置いた位置のままで出なかったら置き直さない（それは実装の不具合）
+    #[cfg(feature = "visual-test")]
+    async fn hover_show(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        at: Point<Pixels>,
+        limit: usize,
+    ) -> (Option<u64>, usize) {
+        let mut retried = 0;
+        loop {
+            hover_move(any, cx, at);
+            if let Some(shown) = hover_wait_card(any, window, cx, limit).await {
+                return (Some(shown), retried);
+            }
+            let (state, mouse) = window
+                .update(cx, |app, win, _| {
+                    (app.lsp_hover.debug_state(), win.mouse_position())
+                })
+                .unwrap_or_else(|_| (String::new(), at));
+            println!("TAKO_VISUAL_PIXEL: hover not-shown at={at:?} mouse={mouse:?} {state}");
+            if mouse == at || retried >= 3 {
+                return (None, retried);
+            }
+            retried += 1;
+        }
+    }
+
+    /// ホバー（#1681）を**実 GUI のマウス経路**と実ピクセルで見る。偽サーバに Markdown
+    /// （見出し / コードブロック / リンク）を返させる。
+    ///
+    /// 相: (1) 識別子に乗せるとデバウンスの後にカードが 1 枚出る（本文は `render_block` を通した 3 種）
+    /// (2) カード 1 枚の実ピクセル: 基準画像（同じ場面からカードだけを外した 1 枚）との差分がカードの
+    /// 矩形（+影）の外に 1 ピクセルも無く、中にはある（`TAKO_VISUAL_DUMP_DIR` に 2 枚を落とす）
+    /// (3) カードの上へ下ろしても閉じない / 語でもカードでもない所へ動かすと閉じる
+    /// (4) **100 回出し入れ**しても保持件数が増えない（カードは 1 枚以下・待っている問い合わせ 0・
+    /// manager の待ちの表 0・持ち手は編集セッションの 1 つだけ）
+    /// (5) 下端の行ではカードを語の行の真上へ返し、ウィンドウの中に収める
+    /// (6) Esc はカードだけを閉じる（編集モードは抜けない）/ 補完の一覧を出しているあいだは出さない
+    ///
+    /// 判定は新しい挙動を無条件に主張する。`TAKO_1681_LEGACY=1`（マウスで問い合わせない）では
+    /// (1) で落ちる = A/B の検出力。単独実行は `TAKO_VISUAL_ONLY=hover`
+    #[cfg(feature = "visual-test")]
+    async fn hover_visual(any: AnyWindowHandle, window: WindowHandle<TakoApp>, cx: &mut AsyncApp) {
+        inject_section_failure("hover");
+        // 2 行目の `total` に Markdown のカード、それ以外の語は語をそのまま返す（echo）
+        let markdown = "# total\n\n```rust\nlet total: i32\n```\n\nThe running total. See [docs](https://doc.rust-lang.org/std/).";
+        let mut source = String::from("fn main() {\n    let total = 1;\n    let v = total;\n");
+        for i in 0..200 {
+            source.push_str(&format!("    let w{i} = total;\n"));
+        }
+        source.push_str("}\n");
+        let rules = serde_json::json!([
+            { "line": 2, "result": {
+                "contents": { "kind": "markdown", "value": markdown },
+                "range": { "start": { "line": 2, "character": 12 }, "end": { "line": 2, "character": 17 } },
+            } },
+            { "echo": true },
+        ]);
+        let (pane, dir, override_env, rules_file) =
+            hover_scene(any, window, cx, "hover", rules, &source).await;
+        // 編集モードで文書がサーバへつながる（`lsp_hover_enabled_for` の条件）まで状態で待つ
+        for _ in 0..300 {
+            let linked = window
+                .update(cx, |app, _, _| app.lsp_hover_enabled_for(pane))
+                .unwrap_or(false);
+            if linked {
+                break;
+            }
+            notify_and_draw(any, window, cx);
+            cx.background_executor()
+                .timer(Duration::from_millis(20))
+                .await;
+        }
+        let Some(on_word) = hover_point(window, cx, pane, 2, 13) else {
+            fail("visual-test hover: 2 行目の total の位置を採れない (#1681)")
+        };
+
+        // (1) 乗せるとデバウンスの後にカードが出る
+        let (shown, mut interfered) = hover_show(any, window, cx, on_word, 400).await;
+        println!("TAKO_VISUAL_PIXEL: hover shown={shown:?}");
+        check(
+            shown.is_some(),
+            "visual-test hover: 識別子に乗せるとカードが出る (#1681)",
+        );
+        let kinds = window
+            .update(cx, |app, _, _| {
+                app.lsp_hover.card.as_ref().map(|c| {
+                    c.blocks
+                        .iter()
+                        .map(|b| match &b.kind {
+                            preview::MdBlockKind::Heading { level, .. } => format!("h{level}"),
+                            preview::MdBlockKind::CodeBlock { lang, .. } => {
+                                format!("code:{}", lang.clone().unwrap_or_default())
+                            }
+                            preview::MdBlockKind::Paragraph { spans } => {
+                                format!("p:{}", spans.iter().filter(|s| s.is_link()).count())
+                            }
+                            _ => "other".into(),
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .ok()
+            .flatten();
+        println!("TAKO_VISUAL_PIXEL: hover blocks={kinds:?}");
+        check(
+            kinds.as_deref() == Some(&["h1".to_string(), "code:rust".into(), "p:1".into()][..]),
+            &format!(
+                "visual-test hover: 見出し / コードブロック / リンクの 3 種を描く ({kinds:?})"
+            ),
+        );
+
+        // (2) カード 1 枚の実ピクセル（基準画像 = 同じ場面からカードだけを外した 1 枚）
+        let Some((with_card, scale)) = capture_frame(any, cx) else {
+            fail("visual-test hover: フレーム採取")
+        };
+        let bounds = window
+            .update(cx, |app, _, _| app.lsp_hover.bounds)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| fail("visual-test hover: カードの矩形が無い"));
+        let saved = window
+            .update(cx, |app, _, cx| {
+                let saved = app.lsp_hover.card.take();
+                cx.notify();
+                saved
+            })
+            .ok()
+            .flatten();
+        let Some((reference, _)) = capture_frame(any, cx) else {
+            fail("visual-test hover: 基準フレーム採取")
+        };
+        let _ = window.update(cx, |app, _, cx| {
+            app.lsp_hover.card = saved;
+            cx.notify();
+        });
+        notify_and_draw(any, window, cx);
+        let viewport = window
+            .update(cx, |app, _, _| app.preview_viewport_bounds(pane))
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| fail("visual-test hover: ビューポート矩形"));
+        let (width, height) = with_card.dimensions();
+        // 影（`shadow_lg` = 下へ 10px・ぼかし 15px）が縁の外へ落ちるぶんを含める（補完の一覧と同じ）
+        let margin = 10.0 + 2.0 * 15.0;
+        let within = |b: &Bounds<Pixels>, m: f32, lx: f32, ly: f32| {
+            lx >= f32::from(b.left()) - m
+                && lx <= f32::from(b.right()) + m
+                && ly >= f32::from(b.top()) - m
+                && ly <= f32::from(b.bottom()) + m
+        };
+        let count = |flip: bool| {
+            let (mut inner, mut outer) = (0usize, 0usize);
+            for y in 0..height {
+                for x in 0..width {
+                    if with_card.get_pixel(x, y) == reference.get_pixel(x, y) {
+                        continue;
+                    }
+                    let ly = if flip { height - 1 - y } else { y } as f32 / scale;
+                    let lx = x as f32 / scale;
+                    if within(&bounds, margin, lx, ly) {
+                        inner += 1;
+                    } else if within(&viewport, 0.0, lx, ly) {
+                        outer += 1;
+                    }
+                }
+            }
+            (inner, outer)
+        };
+        let (a, b) = (count(false), count(true));
+        let (inner, outer) = if a.0 >= b.0 { a } else { b };
+        println!(
+            "TAKO_VISUAL_PIXEL: hover card bounds={:.1}x{:.1}@{:.1},{:.1} inner={inner} outer={outer} scale={scale}",
+            f32::from(bounds.size.width),
+            f32::from(bounds.size.height),
+            f32::from(bounds.left()),
+            f32::from(bounds.top()),
+        );
+        if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+            let dump = std::path::Path::new(&dump);
+            let _ = std::fs::create_dir_all(dump);
+            let _ = with_card.save(dump.join("hover.png"));
+            let _ = reference.save(dump.join("hover-reference.png"));
+            println!("TAKO_VISUAL_DUMP: {}", dump.display());
+        }
+        let need =
+            (f32::from(bounds.size.width) * f32::from(bounds.size.height) * scale * scale * 0.3)
+                as usize;
+        check(
+            inner >= need,
+            &format!("visual-test hover: カードが描かれている（差分 {inner} < {need} px）"),
+        );
+        check(
+            outer == 0,
+            &format!("visual-test hover: 基準画像との差分がカードの矩形の外にある（{outer} px）"),
+        );
+
+        // (3) カードの上へ下ろしても閉じない / 語でもカードでもない所（行末より右）で閉じる
+        let inside = point(
+            bounds.left() + px(20.0),
+            bounds.top() + bounds.size.height / 2.0,
+        );
+        hover_move(any, cx, inside);
+        notify_and_draw(any, window, cx);
+        let kept = window
+            .update(cx, |app, _, _| app.lsp_hover.card.is_some())
+            .unwrap_or(false);
+        check(kept, "visual-test hover: カードの上では閉じない (#1681)");
+        let away = window
+            .update(cx, |app, _, _| {
+                let layout = app.preview_text_layouts.get(&pane)?.get(0)?.clone()?;
+                let b = layout.bounds();
+                Some(point(
+                    b.right() - px(4.0),
+                    b.top() + layout.line_height() / 2.0,
+                ))
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| fail("visual-test hover: 1 行目の位置"));
+        hover_move(any, cx, away);
+        notify_and_draw(any, window, cx);
+        let closed = window
+            .update(cx, |app, _, _| app.lsp_hover.card.is_none())
+            .unwrap_or(false);
+        check(
+            closed,
+            "visual-test hover: 語でもカードでもない所へ動かすと閉じる (#1681)",
+        );
+
+        // (4) 100 回出し入れ（デバウンスを 0 にして回す。判定は保持件数の増減だけ）
+        std::env::set_var("TAKO_LSP_HOVER_DELAY_MS", "0");
+        let held = |cx: &mut AsyncApp| {
+            window
+                .update(cx, |app, _, _| {
+                    let server = app.lsp.status(None)["servers"][0].clone();
+                    (
+                        app.lsp_hover.inflight,
+                        app.lsp_hover.card.is_some() as usize,
+                        server["pending_requests"].as_u64(),
+                        server["views"].as_u64(),
+                        app.lsp_hover.shown,
+                    )
+                })
+                .unwrap_or((usize::MAX, usize::MAX, None, None, 0))
+        };
+        let before = held(cx);
+        let Some(echo_word) = hover_point(window, cx, pane, 1, 9) else {
+            fail("visual-test hover: 1 行目の total の位置")
+        };
+        let mut peak_cards = 0;
+        let mut missed = 0;
+        for n in 0..100 {
+            let at = if n % 2 == 0 { on_word } else { echo_word };
+            let (shown, retried) = hover_show(any, window, cx, at, 200).await;
+            interfered += retried;
+            if shown.is_none() {
+                missed += 1;
+                println!("TAKO_VISUAL_PIXEL: hover missed n={n}");
+            }
+            peak_cards = peak_cards.max(held(cx).1);
+            hover_move(any, cx, away);
+            notify_and_draw(any, window, cx);
+        }
+        // 背景の問い合わせが返り切るのを状態で待つ
+        for _ in 0..200 {
+            if held(cx).0 == 0 {
+                break;
+            }
+            notify_and_draw(any, window, cx);
+            cx.background_executor()
+                .timer(Duration::from_millis(20))
+                .await;
+        }
+        let after = held(cx);
+        std::env::remove_var("TAKO_LSP_HOVER_DELAY_MS");
+        println!(
+            "TAKO_VISUAL_PIXEL: hover cycles=100 missed={missed} interfered={interfered} peak_cards={peak_cards} before={before:?} after={after:?}"
+        );
+        check(
+            missed == 0,
+            &format!("visual-test hover: 100 回とも出る（出なかった回 {missed}）"),
+        );
+        check(
+            peak_cards <= 1,
+            "visual-test hover: カードは同時に 1 枚まで",
+        );
+        check(
+            after.0 == 0 && after.1 == 0,
+            &format!("visual-test hover: 100 回の後に待ちもカードも残らない ({after:?})"),
+        );
+        check(
+            after.2 == Some(0),
+            &format!("visual-test hover: manager の待ちの表が空 ({after:?})"),
+        );
+        check(
+            after.3 == before.3 && after.3 == Some(1),
+            &format!(
+                "visual-test hover: 持ち手は編集セッションの 1 つだけ ({before:?} → {after:?})"
+            ),
+        );
+        check(
+            after.4 >= before.4 + 100,
+            &format!("visual-test hover: 100 回出した ({before:?} → {after:?})"),
+        );
+
+        // (5) 下端の行: 描かれている最後の `total` の上ではカードを語の行の真上へ返す
+        std::env::set_var("TAKO_LSP_HOVER_DELAY_MS", "0");
+        let bottom = window
+            .update(cx, |app, win, _| {
+                let layouts = app.preview_text_layouts.get(&pane)?;
+                let viewport = app.preview_viewport_bounds(pane)?;
+                let (line, layout) = layouts
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, l)| l.as_ref().map(|l| (i, l)))
+                    .filter(|(_, l)| l.bounds().bottom() <= viewport.bottom())
+                    .max_by(|a, b| {
+                        a.1.bounds()
+                            .top()
+                            .partial_cmp(&b.1.bounds().top())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })?;
+                let col = app
+                    .preview_line_texts
+                    .get(&pane)?
+                    .get(line)?
+                    .find("total")?
+                    + 1;
+                let a = layout.position_for_index(col)?;
+                Some((
+                    line,
+                    point(a.x + px(2.0), a.y + layout.line_height() / 2.0),
+                    a.y,
+                    win.viewport_size(),
+                ))
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| fail("visual-test hover: 下端の行"));
+        let (line, at, line_top, viewport_size) = bottom;
+        let (shown, retried) = hover_show(any, window, cx, at, 200).await;
+        interfered += retried;
+        let rect = window
+            .update(cx, |app, _, _| app.lsp_hover.bounds)
+            .ok()
+            .flatten();
+        std::env::remove_var("TAKO_LSP_HOVER_DELAY_MS");
+        println!(
+            "TAKO_VISUAL_PIXEL: hover bottom line={line} shown={shown:?} rect={rect:?} line_top={line_top:?} viewport={viewport_size:?} interfered={interfered}"
+        );
+        let fits = rect.is_some_and(|r| {
+            r.top() >= px(0.0)
+                && r.bottom() <= viewport_size.height
+                && r.left() >= px(0.0)
+                && r.right() <= viewport_size.width
+                && r.bottom() <= line_top + px(0.5)
+        });
+        check(
+            shown.is_some() && fits,
+            &format!("visual-test hover: 下端の行では真上へ返してウィンドウに収める ({rect:?})"),
+        );
+
+        // (6) Esc はカードだけを閉じる（編集モードは抜けない）
+        press(any, cx, "escape");
+        notify_and_draw(any, window, cx);
+        let (open, editing) = window
+            .update(cx, |app, _, _| {
+                (
+                    app.lsp_hover.card.is_some(),
+                    app.preview_edits.get(&pane).is_some_and(|e| e.editing),
+                )
+            })
+            .unwrap_or((true, false));
+        check(!open, "visual-test hover: Esc でカードが閉じる (#1681)");
+        check(
+            editing,
+            "visual-test hover: Esc はカードを閉じるだけで編集モードを抜けない (#1681)",
+        );
+        // 補完の一覧を出しているあいだはカードを出さない（1 文字打つと一覧が出る）
+        let _ = window.update(cx, |app, _, cx| {
+            let _ = tako_control::dispatch(
+                app,
+                tako_control::protocol::Request::PreviewCursor {
+                    pane: Some(pane.as_u64()),
+                    line: 2,
+                    col: 18,
+                    select_to_line: None,
+                    select_to_col: None,
+                    expected_version: None,
+                },
+                PaneOrigin::Cli,
+            );
+            cx.notify();
+        });
+        completion_type(any, cx, 't');
+        let popup = completion_wait_popup(any, window, cx, 300).await;
+        let Some(on_word) = hover_point(window, cx, pane, 1, 9) else {
+            fail("visual-test hover: 打った後の 1 行目の位置")
+        };
+        std::env::set_var("TAKO_LSP_HOVER_DELAY_MS", "0");
+        hover_move(any, cx, on_word);
+        for _ in 0..15 {
+            notify_and_draw(any, window, cx);
+            cx.background_executor()
+                .timer(Duration::from_millis(20))
+                .await;
+        }
+        std::env::remove_var("TAKO_LSP_HOVER_DELAY_MS");
+        let (card, still_popup) = window
+            .update(cx, |app, _, _| {
+                (
+                    app.lsp_hover.card.is_some(),
+                    app.lsp_completion.popup.is_some(),
+                )
+            })
+            .unwrap_or((true, false));
+        println!(
+            "TAKO_VISUAL_PIXEL: hover with-completion popup={popup:?} card={card} still_popup={still_popup}"
+        );
+        check(
+            popup.is_some() && still_popup && !card,
+            "visual-test hover: 補完の一覧を出しているあいだはカードを出さない (#1681)",
+        );
+        press(any, cx, "escape");
+
+        if let Some(name) = override_env {
+            std::env::remove_var(name);
+        }
+        std::env::remove_var("TAKO_LSP_FAKE_COMPLETION");
+        std::env::remove_var("TAKO_LSP_FAKE_HOVER");
+        let _ = std::fs::remove_file(&rules_file);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ホバー（#1681）を**実の rust-analyzer** で見る（実機目視の代わり）。`rust-analyzer` が
+    /// 無ければ SKIPPED。読み込みが済むまで CLI と同じ問い合わせ（`superseding: false` = 読み込みを
+    /// 待つ）で待ち、その後に**実 GUI のマウス経路**で `String` に乗せ、std の doc のカードが出ることを
+    /// 見る。`TAKO_VISUAL_DUMP_DIR` にカードの出た 1 枚を落とす。単独実行は `TAKO_VISUAL_ONLY=hover-real`
+    #[cfg(feature = "visual-test")]
+    async fn hover_real_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        let spec = tako_core::lsp::servers::resolve_in(
+            tako_core::lsp::servers::SERVERS,
+            std::path::Path::new("main.rs"),
+        )
+        .expect("rs を受け持つサーバが表に在る")
+        .spec;
+        let overridden = std::env::var(tako_core::lsp::servers::override_env_name(spec.id))
+            .ok()
+            .is_some_and(|p| std::path::Path::new(&p).is_file());
+        if !overridden && tako_core::platform::exe::find(spec.program).is_none() {
+            println!("TAKO_VISUAL_1681_REAL: SKIPPED（{} が無い）", spec.program);
+            return;
+        }
+        inject_section_failure("hover-real");
+        let source = "fn main() {\n    let s = String::new();\n    println!(\"{}\", s.len());\n}\n";
+        let (pane, dir, _) =
+            completion_scene(any, window, cx, "hover-real", None, source, (1, 0)).await;
+        let path = dir.join("src").join("main.rs");
+        let manager = window
+            .update(cx, |app, _, _| app.lsp.clone())
+            .unwrap_or_else(|_| fail("visual-test hover-real: manager"));
+        let started = std::time::Instant::now();
+        let warm = cx
+            .background_executor()
+            .spawn(async move {
+                manager.hover(&tako_control::lsp::HoverRequest {
+                    path,
+                    line: 1,
+                    column: 13,
+                    timeout: Duration::from_secs(120),
+                    document: None,
+                    superseding: false,
+                    open: true,
+                })
+            })
+            .await;
+        let warm_text = warm
+            .as_ref()
+            .ok()
+            .and_then(|a| a.content.as_ref())
+            .map(|c| c.value.clone())
+            .unwrap_or_default();
+        println!(
+            "TAKO_VISUAL_PIXEL: hover-real warm={} chars={} in {:.1}s head={:?}",
+            warm.as_ref()
+                .map_or_else(|e| e.status().to_string(), |_| "ok".into()),
+            warm_text.chars().count(),
+            started.elapsed().as_secs_f32(),
+            warm_text.lines().take(6).collect::<Vec<_>>()
+        );
+        check(
+            warm_text.contains("String"),
+            &format!(
+                "visual-test hover-real: rust-analyzer が String の doc を返す ({:?})",
+                warm.as_ref().err()
+            ),
+        );
+        let Some(at) = hover_point(window, cx, pane, 1, 13) else {
+            fail("visual-test hover-real: String の位置")
+        };
+        hover_move(any, cx, at);
+        let shown = hover_wait_card(any, window, cx, 600).await;
+        let kinds = window
+            .update(cx, |app, _, _| {
+                app.lsp_hover.card.as_ref().map(|c| {
+                    let code = c
+                        .blocks
+                        .iter()
+                        .filter(|b| matches!(b.kind, preview::MdBlockKind::CodeBlock { .. }))
+                        .count();
+                    (c.blocks.len(), code)
+                })
+            })
+            .ok()
+            .flatten();
+        println!("TAKO_VISUAL_PIXEL: hover-real shown={shown:?} blocks={kinds:?}");
+        if let (Ok(dump), Some((frame, _))) = (
+            std::env::var("TAKO_VISUAL_DUMP_DIR"),
+            capture_frame(any, cx),
+        ) {
+            let dump = std::path::Path::new(&dump);
+            let _ = std::fs::create_dir_all(dump);
+            let _ = frame.save(dump.join("hover-real.png"));
+            println!("TAKO_VISUAL_DUMP: {}", dump.display());
+        }
+        check(
+            shown.is_some(),
+            "visual-test hover-real: 実サーバの doc のカードが出る (#1681)",
+        );
+        check(
+            kinds.is_some_and(|(_, code)| code >= 1),
+            &format!("visual-test hover-real: rust-analyzer のコードブロックを描く ({kinds:?})"),
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
