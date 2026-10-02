@@ -909,12 +909,15 @@ $(build_release_notes "$STABLE_TAG" "$STABLE_VERSION" "${ASSET_NAMES[@]+"${ASSET
   # 昇格元が片肺なら昇格先も片肺になる。気付けるように報告する（#965。exit は変えない）
   report_release_completeness "$STABLE_TAG" || true
 
-  PROMOTE_FOLLOWUP_FAILED=()
-  update_homebrew_cask "$STABLE_TAG" || PROMOTE_FOLLOWUP_FAILED+=("Homebrew cask")
-  update_docs_stable_label "$STABLE_TAG" || PROMOTE_FOLLOWUP_FAILED+=("docs の「最新の安定版」")
-  if [[ ${#PROMOTE_FOLLOWUP_FAILED[@]} -gt 0 ]]; then
+  # 終わらなかった段の名前（" / " 区切り）
+  PROMOTE_FOLLOWUP_FAILED=""
+  update_homebrew_cask "$STABLE_TAG" ||
+    PROMOTE_FOLLOWUP_FAILED="${PROMOTE_FOLLOWUP_FAILED:+$PROMOTE_FOLLOWUP_FAILED / }Homebrew cask"
+  update_docs_stable_label "$STABLE_TAG" ||
+    PROMOTE_FOLLOWUP_FAILED="${PROMOTE_FOLLOWUP_FAILED:+$PROMOTE_FOLLOWUP_FAILED / }docs の「最新の安定版」"
+  if [[ -n "$PROMOTE_FOLLOWUP_FAILED" ]]; then
     echo "" >&2
-    echo "ERROR: $STABLE_TAG は安定版（Latest）になったが、後続が終わっていない: ${PROMOTE_FOLLOWUP_FAILED[*]}" >&2
+    echo "ERROR: $STABLE_TAG は安定版（Latest）になったが、後続が終わっていない: $PROMOTE_FOLLOWUP_FAILED" >&2
     echo "  上の理由を直してから打ち直す（済んだ段は飛ばす）: scripts/release.sh --promote $STABLE_TAG" >&2
     exit "$PROMOTE_FOLLOWUP_EXIT"
   fi
