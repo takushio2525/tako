@@ -157,6 +157,63 @@ pub fn link_modifier_active(platform: Platform, platform_key: bool, control: boo
     }
 }
 
+/// ファイルツリーのコピー / 切り取り / 貼り付けの操作（FR-3.33 / Issue #1860）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeClipKey {
+    Copy,
+    Cut,
+    Paste,
+}
+
+impl TreeClipKey {
+    fn letter(self) -> char {
+        match self {
+            Self::Copy => 'C',
+            Self::Cut => 'X',
+            Self::Paste => 'V',
+        }
+    }
+}
+
+/// 打鍵がファイルツリーのコピー / 切り取り / 貼り付けか（Issue #1860）。
+///
+/// 修飾は**リンクと同じ規則**（[`link_modifier_active`]）: macOS = command のみ /
+/// Windows = control のみ。ほかの修飾（shift / alt / もう片方）が混ざったら当たらない
+/// （⌘⇧V などの別の割り当てを奪わない）。**ツリーの行を選んでいるときだけ**呼ぶこと:
+/// Windows の Ctrl+C / Ctrl+X は端末の SIGINT / readline の入力なので、選んでいなければ
+/// 端末へ流す（判定はここ、宛先の判定は GUI）
+pub fn tree_clip_key(
+    platform: Platform,
+    key: &str,
+    platform_key: bool,
+    control: bool,
+    alt: bool,
+    shift: bool,
+) -> Option<TreeClipKey> {
+    let only_primary = match platform {
+        Platform::MacOs => platform_key && !control,
+        Platform::Windows => control && !platform_key,
+    };
+    if !only_primary || alt || shift {
+        return None;
+    }
+    match key {
+        "c" => Some(TreeClipKey::Copy),
+        "x" => Some(TreeClipKey::Cut),
+        "v" => Some(TreeClipKey::Paste),
+        _ => None,
+    }
+}
+
+/// ファイルツリーのコピー / 切り取り / 貼り付けの打鍵表記（右クリックメニューの右端。
+/// macOS = `⌘C` / Windows = `Ctrl+C`）
+pub fn tree_clip_hint(platform: Platform, key: TreeClipKey) -> String {
+    match platform {
+        Platform::MacOs => format!("\u{2318}{}", key.letter()),
+        Platform::Windows => format!("Ctrl+{}", key.letter()),
+    }
+}
+
 /// 修飾キーの表記。日本語 UI は記号（`⌘`）、英語 UI は語（`Cmd`）を使う
 /// （既存の文言がそう書き分けているので、macOS 側の見た目を 1 文字も変えない）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,6 +227,29 @@ pub struct ModifierLabel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ツリーのクリップボードの打鍵は主修飾だけで当たる() {
+        use TreeClipKey::*;
+        let mac = |key, p, c, a, s| tree_clip_key(Platform::MacOs, key, p, c, a, s);
+        let win = |key, p, c, a, s| tree_clip_key(Platform::Windows, key, p, c, a, s);
+        assert_eq!(mac("c", true, false, false, false), Some(Copy));
+        assert_eq!(mac("x", true, false, false, false), Some(Cut));
+        assert_eq!(mac("v", true, false, false, false), Some(Paste));
+        // macOS の Ctrl+C は端末の SIGINT のまま・⌘⇧V / ⌥⌘V は別の割り当て
+        assert_eq!(mac("c", false, true, false, false), None);
+        assert_eq!(mac("v", true, false, false, true), None);
+        assert_eq!(mac("v", true, false, true, false), None);
+        assert_eq!(mac("a", true, false, false, false), None);
+        assert_eq!(win("c", false, true, false, false), Some(Copy));
+        assert_eq!(win("x", false, true, false, false), Some(Cut));
+        assert_eq!(win("v", false, true, false, false), Some(Paste));
+        // Windows の Win+V はクリップボード履歴・Ctrl+Shift+C は端末のコピー
+        assert_eq!(win("v", true, false, false, false), None);
+        assert_eq!(win("c", false, true, false, true), None);
+        assert_eq!(tree_clip_hint(Platform::MacOs, Copy), "\u{2318}C");
+        assert_eq!(tree_clip_hint(Platform::Windows, Paste), "Ctrl+V");
+    }
 
     #[test]
     fn 案内の打鍵はプラットフォームごとに変わる() {

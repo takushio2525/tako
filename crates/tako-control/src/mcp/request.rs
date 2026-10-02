@@ -462,6 +462,11 @@ pub(super) fn build_request(
                 "open_with" => crate::protocol::FileOpKind::OpenWith,
                 "open_in_tako" => crate::protocol::FileOpKind::OpenInTako,
                 "move" => crate::protocol::FileOpKind::Move,
+                "copy" => crate::protocol::FileOpKind::Copy,
+                "clipboard_copy" => crate::protocol::FileOpKind::ClipboardCopy,
+                "clipboard_cut" => crate::protocol::FileOpKind::ClipboardCut,
+                "clipboard" => crate::protocol::FileOpKind::Clipboard,
+                "paste" => crate::protocol::FileOpKind::Paste,
                 other => return Err(format!("op が不正: {other}")),
             };
             Request::FileOp {
@@ -475,7 +480,7 @@ pub(super) fn build_request(
                     | crate::protocol::FileOpKind::OpenInTako => Some(target_pane(args, caller)?),
                     _ => None,
                 },
-                // #1834: 移動先のフォルダ（必須かどうかの判定は dispatch の 1 か所）
+                // #1834 / #1860: 移動先・貼り付け先のフォルダ（必須かどうかの判定は dispatch の 1 か所）
                 dest: str_arg(args, "dest")?,
             }
         }

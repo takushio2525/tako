@@ -1218,6 +1218,7 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #314 / #617 / #1182 / #1834 / #1860（copy・clipboard_*・paste）
         json!({
             "name": "tako_file_op",
             "description": format!("ファイル操作を実行する。op で種別を指定:\n\
@@ -1230,19 +1231,24 @@ pub fn tools() -> Vec<Value> {
                 open_in_tako = tako の中で開く（ファイル = プレビューペイン / ディレクトリ = そこのシェル。\
                 ターミナル内のパスリンクの{lc}・修飾 + 右クリックメニューと同じ動作）/\n\
                 move = dest のフォルダへ移す（ツリーの D&D と同じ。同名・自分の配下・別のボリュームは断る。\
-                開いているペインは新しいパスへ付け替わる）。\n\
-                rename / create_file / create_dir / open_with は name、move は dest が必須。", lc = link_click()),
+                開いているペインは新しいパスへ付け替わる）/\n\
+                copy = dest のフォルダへ複製（フォルダは中身ごと。同名は上書きせず「名前 のコピー」等の別名。\
+                自分の配下へは断る。置いた先は応答の to）/\n\
+                clipboard_copy・clipboard_cut = ツリーのコピー・切り取り（OS のクリップボードにも書くのでファイルマネージャへ貼れる）/\n\
+                paste = 貼り付け（path の行へ。フォルダはその中・ファイルはそのフォルダ。切り取りは移動。\
+                ファイルマネージャでコピーしたものも貼れる）/ clipboard = 中身と paste したときの貼り付け先（何も変えない）。\n\
+                rename / create_file / create_dir / open_with は name、move / copy は dest が必須。", lc = link_click()),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "op": {
                         "type": "string",
-                        "enum": ["copy_absolute_path","copy_relative_path","reveal","open_terminal","rename","create_file","create_dir","trash","open_default","open_with","open_in_tako","move"],
+                        "enum": ["copy_absolute_path","copy_relative_path","reveal","open_terminal","rename","create_file","create_dir","trash","open_default","open_with","open_in_tako","move","copy","clipboard_copy","clipboard_cut","clipboard","paste"],
                         "description": "操作種別",
                     },
                     "path": { "type": "string", "description": "対象のファイル・フォルダパス（必須）" },
                     "name": { "type": "string", "description": "新しい名前 / アプリ名" },
-                    "dest": { "type": "string", "description": "move の移動先フォルダ" },
+                    "dest": { "type": "string", "description": "move / copy の先のフォルダ" },
                     "pane": pane_schema("対象ペイン ID（open_terminal の cd 先 / copy_relative_path の基準 / open_in_tako の分割元。省略時は呼び出し元）"),
                 },
                 "required": ["op", "path"],

@@ -16,6 +16,8 @@ pub mod ctx_usage;
 pub mod dialog;
 pub mod editor_scroll;
 pub mod emoji;
+pub mod file_clipboard;
+pub mod file_copy;
 pub mod file_move;
 pub mod file_uri;
 pub mod fnv;
