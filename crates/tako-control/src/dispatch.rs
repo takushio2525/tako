@@ -28668,14 +28668,34 @@ mod tests {
         assert_eq!(result["requested"].as_u64(), Some(stale_id));
     }
 
+    /// このホストのワークスペースに**無いと保証された**ペイン ID（stale ID の代役）。
+    ///
+    /// ペイン ID は `PANE_ID_COUNTER`（プロセス全体で共有）で採番されるので、`305` のような
+    /// 決め打ちは**同じテストバイナリの他のテストが何枚ペインを作ったか**で実在しうる。
+    /// 並び順しだいでテストのペインがちょうど 305 を引くと、stale のつもりの ID が解けて
+    /// しまう（#1860 でテストが増えた後、CI の 3 並列で毎回落ちたのを実測）
+    fn absent_pane_id(host: &MockHost) -> u64 {
+        let max = host
+            .ws
+            .tabs()
+            .iter()
+            .flat_map(|t| t.tree().panes())
+            .map(|p| p.id().as_u64())
+            .max()
+            .unwrap_or(0);
+        max + 1_000_000
+    }
+
     #[test]
     fn resolve_pane_解決不能でもエラーにせずnullを返す() {
         let mut host = MockHost::new();
-        // stale map に登録の無い旧 ID（#567 の実事象: ペイン 305 は既に存在しない）
+        // stale map に登録の無い旧 ID（#567 の実事象: ペイン 305 は既に存在しない）。
+        // 値は決め打ちせず、このワークスペースに無いものを使う
+        let stale = absent_pane_id(&host);
         let result = dispatch(
             &mut host,
             Request::ResolvePane {
-                pane: Some(305),
+                pane: Some(stale),
                 caller_pid: None,
             },
             PaneOrigin::Cli,
@@ -29910,10 +29930,11 @@ mod tests {
         // ケース 2: pane env が stale（現存しない ID 305）→ stale map もなし →
         // role 検索に落ちるが、同一 role が 3 体あるため曖昧エラーになる
         // （旧実装では先頭の master_b を黙って返していた = 実事故の再現）
+        let stale = absent_pane_id(&host);
         let result_stale = dispatch(
             &mut host,
             Request::OrchestratorSelf {
-                pane: Some(305), // 現存しない stale ID
+                pane: Some(stale), // 現存しない stale ID（決め打ちの 305 は実在しうる）
                 caller_role: Some("master:fable".into()),
                 caller_pid: Some(99999), // pid 解決も失敗
             },
