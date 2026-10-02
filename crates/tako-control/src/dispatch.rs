@@ -658,13 +658,7 @@ pub fn lsp_goto_prepare(
     let source = host
         .preview_goto_source(target, line - 1)
         .map_err(DispatchError::InvalidParams)?;
-    // 桁は丸めずに拒否する（`tako edit replace-range` と同じ。#1658）
-    if column > source.line_text.len() || !source.line_text.is_char_boundary(column) {
-        return Err(DispatchError::InvalidParams(format!(
-            "column {column} は {line} 行目（{} バイト）の文字の境界ではない",
-            source.line_text.len()
-        )));
-    }
+    check_line_column(&source.line_text, line, column)?;
     let Some(manager) = host.lsp() else {
         return Err(DispatchError::Operation(
             crate::lsp::text::UNAVAILABLE.text().to_string(),
@@ -691,6 +685,264 @@ pub fn lsp_goto_prepare(
             choice,
             focus,
             answer: None,
+        },
+    })
+}
+
+/// 位置の桁を検査する（定義ジャンプ #1680 と右クリックメニュー #1684 の共通）。
+/// 桁は丸めずに拒否する（`tako edit replace-range` と同じ。#1658）
+fn check_line_column(line_text: &str, line: usize, column: usize) -> Result<(), DispatchError> {
+    if column > line_text.len() || !line_text.is_char_boundary(column) {
+        return Err(DispatchError::InvalidParams(format!(
+            "column {column} は {line} 行目（{} バイト）の文字の境界ではない",
+            line_text.len()
+        )));
+    }
+    Ok(())
+}
+
+/// 右クリックメニューの問い合わせ（#1684）。サーバの申告（能力）を読むだけで、項目を押したときは
+/// 項目ごとの要求（[`crate::lsp::menu::item_request`] = `LspGoto` / `LspFormat`）が改めて
+/// dispatch を通る（メニューの中に操作の実装を持たない）
+pub struct LspMenuJob {
+    manager: crate::lsp::LspManager,
+    request: crate::lsp::MenuRequest,
+    context: LspMenuContext,
+}
+
+/// 問い合わせた位置と、その位置の材料（UI スレッドで採る。#1684）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspMenuContext {
+    pub pane: PaneId,
+    pub path: String,
+    /// 問い合わせた位置（行 1 始まり・桁 0 始まりの行内 UTF-8 バイト）
+    pub line: usize,
+    pub column: usize,
+    /// その位置の識別子（`#include` のパスを含む。判定は ⌘ホバーと同じ `symbol_at`）。
+    /// `None` = 識別子でない位置（LSP の項目は 0 件）
+    pub symbol: Option<tako_core::lsp::goto::Symbol>,
+    /// 識別子の字面（`symbol` が無ければ空）
+    pub symbol_text: String,
+    /// 位置を含む選択（含まない・選択が無いなら `None`）
+    pub selection: Option<crate::protocol::LineColRange>,
+}
+
+impl LspMenuContext {
+    /// 項目を押したときの位置（識別子の先頭 = ⌘クリックと同じ）と選択
+    pub fn target(&self) -> crate::lsp::menu::ItemTarget {
+        crate::lsp::menu::ItemTarget {
+            pane: self.pane.as_u64(),
+            line: self.line,
+            column: self.symbol.as_ref().map_or(self.column, |s| s.range.start),
+            selection: self.selection,
+        }
+    }
+}
+
+/// 能力を読んだ答え（#1684）
+#[derive(Debug, Clone)]
+pub enum LspMenuVerdict {
+    /// 識別子でない位置（サーバには聞かない）
+    NotSymbol,
+    /// 握手が済んだサーバの申告
+    Ready {
+        server: &'static str,
+        capabilities: Value,
+    },
+    /// 使えない（受け持つサーバが無い・未導入・未応答・止めた…）
+    Failed(crate::lsp::GotoError),
+}
+
+/// 右クリックメニューの答え（#1684）。GUI のメニューも CLI / MCP の応答もここから組む
+#[derive(Debug, Clone)]
+pub struct LspMenuAnswer {
+    pub context: LspMenuContext,
+    pub verdict: LspMenuVerdict,
+}
+
+impl LspMenuJob {
+    pub fn context(&self) -> &LspMenuContext {
+        &self.context
+    }
+
+    /// **待たずに**決まるなら答え（識別子でない・握手が済んでいる・使えないと分かっている）。
+    /// サーバがまだ握手していなければ `None`（[`Self::run`] を背景で走らせる）
+    pub fn peek(&self) -> Option<LspMenuAnswer> {
+        let verdict = if self.context.symbol.is_none() {
+            LspMenuVerdict::NotSymbol
+        } else {
+            match self.manager.menu_capabilities_now(&self.request.path) {
+                crate::lsp::MenuCapabilities::Ready {
+                    server,
+                    capabilities,
+                } => LspMenuVerdict::Ready {
+                    server,
+                    capabilities,
+                },
+                crate::lsp::MenuCapabilities::Failed(error) => LspMenuVerdict::Failed(error),
+                crate::lsp::MenuCapabilities::Pending => return None,
+            }
+        };
+        Some(LspMenuAnswer {
+            context: self.context.clone(),
+            verdict,
+        })
+    }
+
+    /// 言語サーバへ問い合わせる（**UI スレッドで呼ばない**。握手が済んでいなければ起こして待つ。
+    /// 上限は `MenuRequest::timeout`）
+    pub fn run(self) -> LspMenuAnswer {
+        let verdict = if self.context.symbol.is_none() {
+            LspMenuVerdict::NotSymbol
+        } else {
+            match self.manager.menu_capabilities(&self.request) {
+                Ok((server, capabilities)) => LspMenuVerdict::Ready {
+                    server,
+                    capabilities,
+                },
+                Err(error) => LspMenuVerdict::Failed(error),
+            }
+        };
+        LspMenuAnswer {
+            context: self.context,
+            verdict,
+        }
+    }
+}
+
+impl LspMenuAnswer {
+    /// メニューに出す LSP 項目（出し分けの正本 `tako_core::lsp::menu::items` の 1 実装）
+    pub fn items(&self) -> Vec<tako_core::lsp::menu::MenuItem> {
+        match &self.verdict {
+            LspMenuVerdict::Ready { capabilities, .. } => tako_core::lsp::menu::items(
+                capabilities,
+                self.context.symbol.as_ref().map(|s| s.kind),
+                self.context.selection.is_some(),
+            ),
+            _ => Vec::new(),
+        }
+    }
+
+    /// 項目を押したときの位置と選択（[`LspMenuContext::target`]）
+    pub fn target(&self) -> crate::lsp::menu::ItemTarget {
+        self.context.target()
+    }
+
+    /// CLI / MCP の応答。`items[].args` はその項目を押したときと同じ `tako_lsp` の引数
+    pub fn to_json(&self) -> Value {
+        use crate::lsp::{menu, text};
+        let ctx = &self.context;
+        let target = self.target();
+        let items: Vec<Value> = self
+            .items()
+            .into_iter()
+            .filter_map(|item| {
+                Some(json!({
+                    "id": item.id(),
+                    "action": menu::action_of(item),
+                    "args": menu::item_args(item, &target)?,
+                }))
+            })
+            .collect();
+        let symbol = ctx.symbol.as_ref().map(|s| {
+            json!({
+                "kind": match s.kind {
+                    tako_core::lsp::goto::SymbolKind::Identifier => "identifier",
+                    tako_core::lsp::goto::SymbolKind::IncludePath => "include-path",
+                },
+                "text": ctx.symbol_text,
+                "column": s.range.start,
+                "end_column": s.range.end,
+            })
+        });
+        let mut out = json!({
+            "status": match &self.verdict {
+                LspMenuVerdict::NotSymbol => "not-symbol",
+                LspMenuVerdict::Ready { .. } => "ok",
+                LspMenuVerdict::Failed(error) => error.status(),
+            },
+            "pane": ctx.pane.as_u64(),
+            "path": ctx.path,
+            "line": ctx.line,
+            "column": ctx.column,
+            "symbol": symbol,
+            "selection": ctx.selection,
+            "items": items,
+        });
+        match &self.verdict {
+            LspMenuVerdict::NotSymbol => {
+                out["reason"] = json!(text::MENU_NOT_SYMBOL_REASON.text());
+                out["next_step"] = json!(text::MENU_NOT_SYMBOL_NEXT_STEP.text());
+            }
+            LspMenuVerdict::Ready { server, .. } => out["server"] = json!(server),
+            LspMenuVerdict::Failed(error) => {
+                out["reason"] = json!(error.reason_in(text::GOTO_UNSUPPORTED_REASON, ""));
+                out["next_step"] = json!(error.next_step());
+                error.add_server(&mut out);
+            }
+        }
+        out
+    }
+}
+
+/// 右クリックメニューの準備（UI スレッド。#1684）。位置を検査し、その位置の識別子と、位置を含む
+/// 選択を採る。**1 プロセスも起こさない**（起こすのは [`LspMenuJob::run`]）。
+/// GUI の右クリックもこれを直接呼ぶ（CLI / MCP と同じ材料・同じ判定）
+pub fn lsp_menu_prepare(
+    host: &dyn ControlHost,
+    pane: Option<u64>,
+    line: usize,
+    column: usize,
+) -> Result<LspMenuJob, DispatchError> {
+    if line == 0 {
+        return Err(DispatchError::InvalidParams(
+            tako_core::open_plan::LINE_ONE_BASED.into(),
+        ));
+    }
+    let (_, target) = resolve_pane(host.workspace(), pane)?;
+    let Some((path, _)) = host.preview_state(target) else {
+        return Err(DispatchError::InvalidParams(format!(
+            "プレビューペインではない: {}",
+            target.as_u64()
+        )));
+    };
+    let source = host
+        .preview_goto_source(target, line - 1)
+        .map_err(DispatchError::InvalidParams)?;
+    check_line_column(&source.line_text, line, column)?;
+    let Some(manager) = host.lsp() else {
+        return Err(DispatchError::Operation(
+            crate::lsp::text::UNAVAILABLE.text().to_string(),
+        ));
+    };
+    let symbol = tako_core::lsp::goto::symbol_at(&source.line_text, column);
+    let symbol_text = symbol
+        .as_ref()
+        .map(|s| source.line_text[s.range.clone()].to_string())
+        .unwrap_or_default();
+    let at = (line - 1, column);
+    let selection = host.preview_selection(target).filter(|r| {
+        tako_core::lsp::menu::selection_covers(
+            (r.start_line.saturating_sub(1), r.start_col),
+            (r.end_line.saturating_sub(1), r.end_col),
+            at,
+        )
+    });
+    Ok(LspMenuJob {
+        manager: manager.clone(),
+        request: crate::lsp::MenuRequest {
+            path: PathBuf::from(&path),
+            document: source.document,
+            timeout: crate::lsp::goto::goto_timeout(),
+        },
+        context: LspMenuContext {
+            pane: target,
+            path,
+            line,
+            column,
+            symbol,
+            symbol_text,
+            selection,
         },
     })
 }
@@ -1503,6 +1755,9 @@ pub enum OffloadJob {
     /// 補完の問い合わせ（#1682）。待つのは background、絞り込みと確定（`choice` = 編集バッファへ
     /// 入れる）は [`OffloadOutcome::OnUi`] で UI スレッドへ戻す
     LspCompletion(Box<LspCompletionJob>),
+    /// 右クリックメニューの LSP 項目（#1684）。握手が済んでいなければサーバを起こして待つので
+    /// background へ出す（答えは能力を読むだけ = 応答をそのまま返す）
+    LspMenu(Box<LspMenuJob>),
     /// Code Runner の実行プロファイルと実行環境の一覧（#1730）。実行環境の Tier P
     /// （道具の場所・版・環境の置き場を子プロセスに聞く）を含むので、UI スレッドでは
     /// 相対パスの基準（ペインの cwd）だけを採る
@@ -1765,6 +2020,11 @@ pub fn prepare_offload(
             )
             .map(|job| OffloadJob::LspCompletion(Box::new(job))),
         ),
+        // #1684: 準備（位置の検査・識別子と選択を採る）は UI スレッド、能力の問い合わせは background
+        Request::LspMenu { pane, line, column } => Some(
+            lsp_menu_prepare(host, *pane, *line, *column)
+                .map(|job| OffloadJob::LspMenu(Box::new(job))),
+        ),
         // #1730: 実行環境の Tier P（子プロセス。1 回の上限 5 秒）を UI スレッドで待たない
         Request::RunResolve {
             path,
@@ -1835,6 +2095,7 @@ impl OffloadJob {
                 name,
             } => lsp_server_action(Some(&manager), &action, name.as_deref()),
             OffloadJob::RunResolve { ctx } => finish_run_resolve(&ctx),
+            OffloadJob::LspMenu(job) => Ok(job.run().to_json()),
             OffloadJob::LspGoto(_) => Err(DispatchError::Operation(
                 "定義ジャンプは run_staged で走らせる（着地に UI スレッドの続きが要る）".into(),
             )),
@@ -4897,6 +5158,12 @@ fn dispatch_inner(
                 false,
             )?;
             lsp_format_land(host, &job.run())
+        }
+
+        // #1684: 通常は prepare_offload が問い合わせを background へ出す。ここへ来るのは
+        // `TAKO_OFFLOAD=0` か直呼び（テスト）で、同じ 2 段（準備 → 問い合わせ）を直列に通る
+        Request::LspMenu { pane, line, column } => {
+            Ok(lsp_menu_prepare(host, pane, line, column)?.run().to_json())
         }
 
         // #1683: 保存時整形の設定（既定 OFF）。ON でも整形するのは明示的な保存だけ
@@ -14292,6 +14559,7 @@ pub const LSP_FEATURE_ACTIONS: &[&str] = &[
     LSP_FORMAT_ACTION,
     LSP_FORMAT_ON_SAVE_ACTION,
     LSP_COMPLETION_ACTION,
+    LSP_MENU_ACTION,
 ];
 
 /// 整形の action（#1683。CLI は `tako lsp format`）
@@ -14302,6 +14570,9 @@ pub const LSP_FORMAT_ON_SAVE_ACTION: &str = "format-on-save";
 
 /// 補完（#1682）の action の綴り
 pub const LSP_COMPLETION_ACTION: &str = "completion";
+
+/// 右クリックメニューの LSP 項目（#1684）の action の綴り（CLI は `tako lsp menu`）
+pub const LSP_MENU_ACTION: &str = "menu";
 
 /// 言語サーバの操作の 1 実装（#1678）。CLI・MCP・同期実行・offload のすべてがここを通る。
 ///
@@ -17976,6 +18247,8 @@ mod tests {
         lsp: Option<crate::lsp::LspManager>,
         /// #1683: 保存時整形（GUI の `lsp_format_on_save` の代役）
         format_on_save: bool,
+        /// #1684: プレビューの選択（GUI の `preview_selections` の代役）
+        selections: std::collections::HashMap<u64, crate::protocol::LineColRange>,
     }
 
     impl MockHost {
@@ -18056,6 +18329,7 @@ mod tests {
                 backend_windows_refreshes: std::cell::Cell::new(0),
                 lsp: None,
                 format_on_save: false,
+                selections: std::collections::HashMap::new(),
             }
         }
 
@@ -18443,6 +18717,9 @@ mod tests {
         }
         fn preview_current_line(&self, pane: PaneId) -> Option<usize> {
             self.preview_lines.get(&pane.as_u64()).copied()
+        }
+        fn preview_selection(&self, pane: PaneId) -> Option<crate::protocol::LineColRange> {
+            self.selections.get(&pane.as_u64()).copied()
         }
         /// #1680: 起点の本文は GUI と同じ材料（編集中ならバッファ、でなければ実ファイル）
         fn preview_goto_source(
@@ -36651,6 +36928,103 @@ mod tests {
         )
         .unwrap();
         assert!(prepare_offload(&mut host, &paste).is_none(), "移動は同期");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #1684: 右クリックメニューの準備と答え。識別子でない位置はサーバに聞かずに 0 件・
+    /// 引数の誤りは丸めずに拒否・使えないと分かっていれば理由と次の一手（失敗ではなく答え）
+    #[test]
+    fn issue1684_右クリックメニューの準備と答え() {
+        let (mut host, pane, dir) = format_fixture(
+            "menu",
+            "main.rs",
+            "fn main() {\n    let 名前 = helper(1);\n\n}\n",
+        );
+        let call = |host: &mut MockHost, line: usize, column: usize| {
+            dispatch(
+                host,
+                Request::LspMenu {
+                    pane: Some(pane),
+                    line,
+                    column,
+                },
+                PaneOrigin::Cli,
+            )
+        };
+        let invalid =
+            |r: Result<Value, DispatchError>| matches!(r, Err(DispatchError::InvalidParams(_)));
+        assert!(invalid(call(&mut host, 0, 0)), "行は 1 始まり");
+        assert!(invalid(call(&mut host, 9, 0)), "行が無い");
+        // `名` は 3 バイト（`    let ` の 8 バイトの後ろ）。途中は拒否
+        assert!(invalid(call(&mut host, 2, 9)), "文字の途中");
+        assert!(invalid(call(&mut host, 2, 99)), "行末の外");
+        // 引数が正しくても LSP の無い host は「使えない」
+        assert!(matches!(
+            call(&mut host, 2, 8),
+            Err(DispatchError::Operation(m)) if m == crate::lsp::text::UNAVAILABLE.text()
+        ));
+        host.lsp = Some(not_installed_manager());
+        // 識別子でない位置（空白・記号・数値・空行・行末）はサーバに聞かずに 0 件
+        for (line, column) in [(2, 0), (2, 15), (2, 24), (2, 25), (3, 0), (1, 11)] {
+            let out = call(&mut host, line, column).unwrap();
+            assert_eq!(out["status"], json!("not-symbol"), "{line}:{column} {out}");
+            assert_eq!(out["items"], json!([]), "{line}:{column}");
+            assert_eq!(out["symbol"], Value::Null);
+            assert_eq!(
+                out["reason"],
+                json!(crate::lsp::text::MENU_NOT_SYMBOL_REASON.text())
+            );
+        }
+        // 識別子の上: 未導入なら理由と導入コマンド（項目は出さない = 過大申告しない）
+        let out = call(&mut host, 2, 20).unwrap();
+        assert_eq!(out["status"], json!("not-installed"), "{out}");
+        assert_eq!(out["items"], json!([]));
+        assert_eq!(
+            out["symbol"],
+            json!({ "kind": "identifier", "text": "helper", "column": 17, "end_column": 23 })
+        );
+        assert!(out["install_command"].is_string(), "{out}");
+        // 非 ASCII の識別子も識別子（桁は UTF-8 バイト）
+        let out = call(&mut host, 2, 8).unwrap();
+        assert_eq!(out["symbol"]["text"], json!("名前"));
+        assert_eq!(out["symbol"]["end_column"], json!(14));
+        // LSP を止めていれば disabled
+        host.lsp = Some(crate::lsp::LspManager::disabled());
+        assert_eq!(call(&mut host, 2, 20).unwrap()["status"], json!("disabled"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #1684: 選択は右クリックした位置を含むときだけ材料に入る（GUI の「選択範囲を整形」の出し分けと同じ）。
+    /// 項目を押したときの位置は識別子の先頭（⌘クリックと同じ）
+    #[test]
+    fn issue1684_選択は位置を含むときだけ採る() {
+        let (mut host, pane, dir) =
+            format_fixture("menu-sel", "main.rs", "fn main() {\n    helper(1);\n}\n");
+        host.lsp = Some(crate::lsp::LspManager::disabled());
+        let range = crate::protocol::LineColRange {
+            start_line: 1,
+            start_col: 3,
+            end_line: 2,
+            end_col: 8,
+        };
+        host.selections.insert(pane, range);
+        let job = lsp_menu_prepare(&host, Some(pane), 2, 7).unwrap();
+        assert_eq!(job.context().selection, Some(range), "2:7 は選択の中");
+        let target = job.context().target();
+        assert_eq!(
+            (target.line, target.column),
+            (2, 4),
+            "識別子の先頭で問い合わせる"
+        );
+        assert_eq!(target.selection, Some(range));
+        // 選択の外（同じ行の後ろ）
+        let job = lsp_menu_prepare(&host, Some(pane), 2, 10).unwrap();
+        assert_eq!(job.context().selection, None, "2:10 は選択の外");
+        // 識別子でない位置は peek だけで決まる（サーバに聞かない）
+        let job = lsp_menu_prepare(&host, Some(pane), 2, 0).unwrap();
+        let answer = job.peek().expect("待たずに決まる");
+        assert!(matches!(answer.verdict, LspMenuVerdict::NotSymbol));
+        assert!(answer.items().is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 

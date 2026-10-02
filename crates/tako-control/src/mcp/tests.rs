@@ -39,13 +39,15 @@ mod tests {
         assert_eq!(actions[0], "diagnostics");
         let goto = &actions[1..=tako_core::lsp::goto::GotoKind::NAMES.len()];
         assert_eq!(goto, &tako_core::lsp::goto::GotoKind::NAMES[..]);
-        // 定義ジャンプの後ろは整形の 2 つと補完（残りはこれだけ = 足し忘れはここで落ちる）
+        // 定義ジャンプの後ろは整形の 2 つと補完と右クリックメニュー（#1684）
+        // （残りはこれだけ = 足し忘れはここで落ちる）
         assert_eq!(
             &actions[goto.len() + 1..],
             &[
                 crate::dispatch::LSP_FORMAT_ACTION,
                 crate::dispatch::LSP_FORMAT_ON_SAVE_ACTION,
                 crate::dispatch::LSP_COMPLETION_ACTION,
+                crate::dispatch::LSP_MENU_ACTION,
             ]
         );
         for action in goto {
@@ -167,6 +169,59 @@ mod tests {
             }
         );
         assert!(build_request("tako_lsp", &json!({"action": "completion"}), Some(9), None).is_err());
+    }
+
+    /// #1684: `tako_lsp` の action=menu は CLI `tako lsp menu` と同じ要求になる
+    /// （pane の省略は呼び出し元 = 定義ジャンプと同じ。位置は必須）
+    #[test]
+    fn tako_lsp_の右クリックメニューは_cli_と同じ要求になる() {
+        assert_eq!(
+            build_request(
+                "tako_lsp",
+                &json!({"action": "menu", "line": 3, "column": 4}),
+                Some(9),
+                None
+            )
+            .unwrap(),
+            Request::LspMenu {
+                pane: Some(9),
+                line: 3,
+                column: 4,
+            }
+        );
+        assert!(build_request("tako_lsp", &json!({"action": "menu", "line": 3}), Some(9), None).is_err());
+    }
+
+    /// #1684 の番犬: 右クリックメニューの項目はすべて、応答の `args` をそのまま `tako_lsp` へ渡すと
+    /// **GUI のクリックと同じ要求**（`lsp::menu::item_request`）になる。項目を足したのに MCP で
+    /// 押せない・GUI と AI で別の操作になる、のどちらもここで落ちる
+    #[test]
+    fn 右クリックメニューの項目はすべて同じ要求になる() {
+        use crate::lsp::menu::{item_args, item_request, ItemTarget};
+        let target = ItemTarget {
+            pane: 5,
+            line: 3,
+            column: 4,
+            selection: Some(crate::protocol::LineColRange {
+                start_line: 2,
+                start_col: 0,
+                end_line: 6,
+                end_col: 1,
+            }),
+        };
+        for item in tako_core::lsp::menu::MenuItem::ALL {
+            let args = item_args(item, &target).expect("選択があれば全項目に引数がある");
+            assert_eq!(
+                args["action"].as_str(),
+                Some(crate::lsp::menu::action_of(item)),
+                "{item:?}"
+            );
+            assert_eq!(
+                build_request("tako_lsp", &args, Some(99), None).unwrap(),
+                item_request(item, &target, None).unwrap(),
+                "{item:?}: MCP の args と GUI のクリックの要求が違う"
+            );
+        }
     }
 
     #[test]

@@ -296,11 +296,31 @@ fn scan_gui(gui: &str, render: &str) -> Vec<Offender> {
             }
         }
     }
+    // ⌘クリック（`start_lsp_goto`）と右クリックメニューの定義ジャンプ（#1684）は共有の入口
+    // `start_lsp_goto_request` を通り、そこが CLI / MCP と同じ準備を通る
     match fn_window(gui, "pub(crate) fn start_lsp_goto(") {
         None => out.push(Offender {
             file: GUI,
             line: 0,
             why: "`start_lsp_goto` が見つからない（走査が空振り）".into(),
+        }),
+        Some((at, window)) => {
+            if !code_only(&window)
+                .contains("self.start_lsp_goto_request(pane, request, anchor, cx)")
+            {
+                out.push(Offender {
+                    file: GUI,
+                    line: at,
+                    why: "⌘クリックが共有の入口（start_lsp_goto_request）を通っていない".into(),
+                });
+            }
+        }
+    }
+    match fn_window(gui, "pub(crate) fn start_lsp_goto_request(") {
+        None => out.push(Offender {
+            file: GUI,
+            line: 0,
+            why: "`start_lsp_goto_request` が見つからない（走査が空振り）".into(),
         }),
         Some((at, window)) => {
             if !code_only(&window).contains("tako_control::prepare_offload(self, &request)") {
@@ -406,6 +426,7 @@ fn 走査が空振りしていない() {
     }
     assert!(fn_window(&dispatch, "fn open_file(").is_some());
     assert!(fn_window(&gui, "pub(crate) fn start_lsp_goto(").is_some());
+    assert!(fn_window(&gui, "pub(crate) fn start_lsp_goto_request(").is_some());
     assert!(fn_window(&gui, "fn land_lsp_goto(").is_some());
 }
 

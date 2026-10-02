@@ -58,6 +58,33 @@ pub fn restart_handoff() -> &'static str {
     )
 }
 
+/// コードの本文を識別子の上で右クリックしたときの言語サーバの項目（#1684）。
+///
+/// 整形の 2 つは編集メニュー（#1683）と同じ操作なので**同じ関数を引く**
+/// （同じ操作に別の言い回しを作らない）。定義ジャンプの 4 つは VSCode / Zed の並びと呼び名に合わせる
+pub fn lsp_item(item: tako_core::lsp::menu::MenuItem) -> &'static str {
+    use tako_core::lsp::goto::GotoKind;
+    use tako_core::lsp::menu::MenuItem;
+    match item {
+        MenuItem::Goto(GotoKind::Definition) => tr!("定義へ移動", "Go to Definition"),
+        MenuItem::Goto(GotoKind::Declaration) => tr!("宣言へ移動", "Go to Declaration"),
+        MenuItem::Goto(GotoKind::TypeDefinition) => {
+            tr!("型定義へ移動", "Go to Type Definition")
+        }
+        MenuItem::Goto(GotoKind::Implementation) => tr!("実装へ移動", "Go to Implementation"),
+        MenuItem::Format => super::menu::format_document(),
+        MenuItem::FormatSelection => super::menu::format_selection(),
+    }
+}
+
+/// 言語サーバの握手を待っているあいだ、LSP の項目の代わりに出す押せない 1 行（#1684）
+pub fn lsp_pending() -> &'static str {
+    tr!(
+        "言語サーバに問い合わせています…",
+        "Asking the language server…"
+    )
+}
+
 pub fn background() -> &'static str {
     tr!("バックグラウンドへ", "Send to background")
 }
@@ -148,7 +175,45 @@ mod tests {
                 run_badge_failed(1),
                 run_badge_tooltip(None),
                 run_badge_tooltip(Some(1)),
+                lsp_pending().to_string(),
             ]
         });
+    }
+
+    /// #1684: 右クリックメニューの LSP の項目すべてに日英の名前がある（足した項目の名前の漏れを落とす）
+    #[test]
+    fn lsp_の項目すべてに日英の名前がある() {
+        tests_support::check_ja_en(|| {
+            tako_core::lsp::menu::MenuItem::ALL
+                .iter()
+                .map(|item| lsp_item(*item).to_string())
+                .collect()
+        });
+    }
+
+    /// #1684: 言語を切り替えると項目の名前が切り替わり、項目どうしで名前が重ならない
+    #[test]
+    fn lsp_の項目は言語を切り替えると名前が変わり重ならない() {
+        use std::cell::RefCell;
+        use tako_core::i18n::Lang;
+        let names = |lang: Lang| {
+            let out = RefCell::new(Vec::new());
+            tests_support::with_lang(lang, || {
+                *out.borrow_mut() = tako_core::lsp::menu::MenuItem::ALL
+                    .iter()
+                    .map(|item| lsp_item(*item).to_string())
+                    .chain([lsp_pending().to_string()])
+                    .collect();
+            });
+            out.into_inner()
+        };
+        let (ja, en) = (names(Lang::Ja), names(Lang::En));
+        for (j, e) in ja.iter().zip(&en) {
+            assert_ne!(j, e, "言語を切り替えても同じ名前のまま");
+        }
+        for list in [&ja, &en] {
+            let unique: std::collections::HashSet<_> = list.iter().collect();
+            assert_eq!(unique.len(), list.len(), "名前が重なっている: {list:?}");
+        }
     }
 }
