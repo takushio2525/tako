@@ -124,8 +124,10 @@ printf "PROMPT='tako %%1~ %%%% '\nRPROMPT=''\n" > "$TMP/zdot/.zshrc"
 DUMP="${TAKO_1860_DUMP_DIR:-$TMP/dump}"
 mkdir -p "$DUMP"
 
+mkdir -p "$TMP/tmpdir"
+# GUI の一時 dir も $TMP の中へ（visual-test の fixture が節の途中で落ちても後片付けで消える）
 common_env=(
-  HOME="$TMP/home" ZDOTDIR="$TMP/zdot" TAKO_LANG=ja
+  HOME="$TMP/home" ZDOTDIR="$TMP/zdot" TAKO_LANG=ja TMPDIR="$TMP/tmpdir/"
   TAKO_PERSIST=0 TAKO_AUTORENAME=0
   TAKO_DISCOVERY_DIR="$TMP/disc" TAKO_ORCHESTRATOR_DIR="$TMP/orch"
   TAKO_SESSIONS_FILE="$TMP/sessions.yaml" TAKO_PANE_LOG_DIR="$TMP/panelogs"
