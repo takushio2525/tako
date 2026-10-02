@@ -667,6 +667,9 @@ impl SettingsWindow {
             Request::PreviewReload {
                 enabled: Some(s.preview_live_reload),
             },
+            Request::LspFormatOnSave {
+                enabled: Some(s.lsp_format_on_save),
+            },
             Request::PreviewCache {
                 max_mb: Some(s.preview_cache_max_mb),
             },
@@ -1378,6 +1381,7 @@ impl SettingsWindow {
         let persist = s.tmux_persist;
         let telemetry = s.telemetry;
         let reload = s.preview_live_reload;
+        let format_on_save = s.lsp_format_on_save;
         let pane_logs = s.pane_logs;
         let confirm_close = tako_control::setup::confirm_close_enabled();
 
@@ -1595,6 +1599,23 @@ impl SettingsWindow {
                         this.run(
                             Request::PreviewReload {
                                 enabled: Some(!reload),
+                            },
+                            cx,
+                        );
+                    }),
+                ),
+            ))
+            // #1683: 保存時整形（既定 OFF。明示的な保存だけ）
+            .child(self.row(
+                txt::label_format_on_save(),
+                txt::desc_format_on_save(),
+                self.toggle(
+                    "format-on-save",
+                    format_on_save,
+                    cx.listener(move |this, _, _, cx| {
+                        this.run(
+                            Request::LspFormatOnSave {
+                                enabled: Some(!format_on_save),
                             },
                             cx,
                         );

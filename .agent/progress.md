@@ -68,3 +68,7 @@
 ## 2026-10-02（#1853 / #1592: 安定版への昇格で Homebrew cask と docs の「最新の安定版」も動かすようにした）
 - `release.sh --promote` が夜間の素のタグ（prerelease を外して Latest）も受け付け、続けて tap の cask を公開アセットの sha256 で更新（PR → merge → tap の main を読み直し）、releases.md を `check-releases-page.mjs --set-stable` で書き換えた PR を `merge-pr.sh` で merge。後続の失敗は exit 4・打ち直しは同じコマンド。bash 3.2 の set -u + EXIT trap が exit 0 に化ける穴も塞いだ
 - 実測: `scripts/test-release-promote-1853.sh` 125 PASS（注入 9 通りすべて FAILED）・既存の retry 55 / nightly 129 緑・docs の build + 検査 6 本 rc=0。releases.md の安定版は v0.8.26 へ
+
+## 2026-10-02（#1683: LSP の整形（全体 / 範囲）と保存時整形（既定 off）を足した）
+- 当て方は `TextBuffer::apply_changes` の 1 実装（安定ソート → 重なり拒否 → 最小化 → `apply_edit` 1 回 = undo 1 回）、範囲の外は変えない。CLI `tako lsp format [--range]` / `format-on-save` + MCP `tako_lsp` の action（ツール増やさず +841 B）+ 編集メニュー・⇧⌘I（Win は Ctrl+Shift+I）。保存時整形は明示的な保存だけで自動保存では整形しない
+- 実測: `scripts/test-lsp-format-1683.sh` 51 PASS 0 FAIL（v0.8.26 は 30 FAIL）・実 rust-analyzer の整形が rustfmt とバイト一致し undo 1 回で戻る・番犬の注入 7 通りを file:line で名指す

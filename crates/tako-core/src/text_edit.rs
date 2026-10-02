@@ -742,6 +742,154 @@ pub enum RangeEditError {
     VersionMismatch { expected: u64, actual: u64 },
 }
 
+/// 本文の 1 か所の書き換え（#1683）。範囲は**書き換える前の本文**のバイト位置。
+///
+/// 言語サーバの整形が返す `TextEdit` の配列を tako の座標へ直したもの。複数を
+/// まとめて当てる口は [`TextBuffer::apply_changes`] の 1 つだけ（並べ方・重なりの扱いを
+/// 呼び手ごとに書かない）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextChange {
+    pub range: Range<usize>,
+    pub text: String,
+}
+
+/// 書き換えの組を当てられない理由（#1683）。**1 つでも当たらなければ本文を触らない**。
+///
+/// 番号は受け取った配列の 1 始まり（言語サーバの答えのどれが悪いかを名指す）
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ChangesError {
+    #[error("{index} 番目の編集の範囲 {start}..{end} が本文（{len} バイト）の外")]
+    OutOfBounds {
+        index: usize,
+        start: usize,
+        end: usize,
+        len: usize,
+    },
+    #[error("{index} 番目の編集の範囲 {start}..{end} は始まりが終わりより後ろ")]
+    Inverted {
+        index: usize,
+        start: usize,
+        end: usize,
+    },
+    #[error("{index} 番目の編集の範囲が文字の途中を指している")]
+    NotCharBoundary { index: usize },
+    #[error("{first} 番目と {second} 番目の編集の範囲が重なっている")]
+    Overlap { first: usize, second: usize },
+    #[error("文書の版が違う（指定 {expected} / 現在 {actual}）")]
+    VersionMismatch { expected: u64, actual: u64 },
+}
+
+/// 書き換えの組を当てた結果（#1683）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppliedChanges {
+    /// 実際に本文を変えた箇所の数（中身の同じ書き換えは数えない）。0 なら何も変えていない
+    pub changes: usize,
+}
+
+/// 書き換えの組を**当てる順**へ並べ、検査し、最小にする（#1683）。
+///
+/// 決め（LSP 3.17 の `TextEdit[]` の規定に合わせて固定する）:
+///
+/// - **並び**: 範囲の始まり → 終わりの順の**安定**ソート。同じ範囲どうし（同じ位置への
+///   挿入）は**配列の順**を保つ（「同じ位置の挿入は配列の順に並ぶ」= LSP の規定）。
+///   挿入と、同じ位置から始まる置き換えは挿入が先（幅 0 が先に並ぶ）
+/// - **重なり**: 次の始まりが前の終わりより手前なら [`ChangesError::Overlap`] で**丸ごと拒否**
+///   （どちらを採っても誰かの意図を壊す）。**隣接**（前の終わり = 次の始まり）は重なりではない
+/// - **最小化**: 置き換える前後で同じ頭と尻を削る（`\n` 1 つを `\n` 1 つで置き換えるような
+///   行単位の答えが、実際に変わる数文字だけになる）。中身の同じ書き換えは落とす。
+///   **削るのは並べた後**（削ってから並べ直すと、挿入どうしの順が入れ替わりうる）
+///
+/// 範囲は書き換える前の本文 `text` のバイト位置で、範囲外・始まりが終わりより後ろ・
+/// 文字の途中はそれぞれの理由で拒否する（丸めない）
+pub fn order_changes(
+    text: &str,
+    changes: Vec<TextChange>,
+) -> Result<Vec<TextChange>, ChangesError> {
+    for (i, change) in changes.iter().enumerate() {
+        let (start, end) = (change.range.start, change.range.end);
+        if start > end {
+            return Err(ChangesError::Inverted {
+                index: i + 1,
+                start,
+                end,
+            });
+        }
+        if end > text.len() {
+            return Err(ChangesError::OutOfBounds {
+                index: i + 1,
+                start,
+                end,
+                len: text.len(),
+            });
+        }
+        if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            return Err(ChangesError::NotCharBoundary { index: i + 1 });
+        }
+    }
+    let mut indexed: Vec<(usize, TextChange)> = changes.into_iter().enumerate().collect();
+    // `sort_by_key` は安定（同じ範囲は配列の順のまま）
+    indexed.sort_by_key(|(_, change)| (change.range.start, change.range.end));
+    for pair in indexed.windows(2) {
+        if pair[1].1.range.start < pair[0].1.range.end {
+            return Err(ChangesError::Overlap {
+                first: pair[0].0 + 1,
+                second: pair[1].0 + 1,
+            });
+        }
+    }
+    Ok(indexed
+        .into_iter()
+        .filter_map(|(_, change)| {
+            let before = &text[change.range.clone()];
+            let (span, after) = changed_span(before, &change.text);
+            (!span.is_empty() || !after.is_empty()).then(|| TextChange {
+                range: change.range.start + span.start..change.range.start + span.end,
+                text: after.to_string(),
+            })
+        })
+        .collect())
+}
+
+/// 並べた書き換えを 1 か所の置き換えへまとめる（#1683）。最初の始まりから最後の終わりまでを、
+/// あいだの本文を挟んだ置換後の文字列で置き換える = undo の 1 件に収まる形
+fn compose_changes(text: &str, ordered: &[TextChange]) -> (Range<usize>, String) {
+    let (Some(first), Some(last)) = (ordered.first(), ordered.last()) else {
+        return (0..0, String::new());
+    };
+    let mut after = String::new();
+    let mut at = first.range.start;
+    for change in ordered {
+        after.push_str(&text[at..change.range.start]);
+        after.push_str(&change.text);
+        at = change.range.end;
+    }
+    (first.range.start..last.range.end, after)
+}
+
+/// 並べた書き換えを当てた後、書き換える前の `offset` がどこへ移るか（#1683）。
+///
+/// 書き換えより前はそのまま、後ろは長さの差だけずらす（[`follow_offset`] と同じ規則を
+/// 複数へ広げたもの）。書き換えの中にいたら、頭からの距離を保ったまま置き換えた本文の中へ
+/// 寄せる（文字の途中には置かない）
+fn follow_changes(ordered: &[TextChange], offset: usize) -> usize {
+    let mut shifted = offset;
+    for change in ordered {
+        let range = &change.range;
+        if offset <= range.start {
+            break;
+        }
+        // 前の書き換えで動いたぶんを足した、この書き換えの始まり
+        let start = shifted - (offset - range.start);
+        if offset >= range.end {
+            shifted = shifted - (range.end - range.start) + change.text.len();
+            continue;
+        }
+        let inside = snap_boundary(&change.text, (offset - range.start).min(change.text.len()));
+        return start + inside;
+    }
+    shifted
+}
+
 /// 1 ファイル分の編集バッファ。カーソルと選択端は常に UTF-8 バイト境界に置く。
 #[derive(Debug, Clone)]
 pub struct TextBuffer {
@@ -1935,6 +2083,55 @@ impl TextBuffer {
         }
         self.replace_range(start..end, &edit.text);
         Ok(())
+    }
+
+    /// 書き換えの組（言語サーバの整形の答え）を**まとめて 1 回で**当てる（#1683）。
+    ///
+    /// - 並べ方・重なり・最小化は [`order_changes`] の 1 実装（決めはそこに書いた）
+    /// - 当てるのは**最初の始まりから最後の終わりまでの 1 か所の置き換え**で、
+    ///   [`Self::apply_edit`] を 1 回だけ通る（種類は Replace = 前後の打鍵とまとまらない）。
+    ///   よって **undo 1 回で整形の前へ戻る**（#1651 の塊）。版も 1 つだけ進む
+    /// - 入れる本文の改行はバッファの流儀へ揃える（#1650。範囲の外の改行は触らない）
+    /// - カーソルと選択端は書き換えに合わせてずらす（打っていた場所から飛ばない）
+    ///
+    /// 版違い・範囲外・重なりは**本文を 1 バイトも触らずに**拒否する。中身の同じ書き換え
+    /// しか無ければ何もしない（版も進まず undo も積まない）
+    pub fn apply_changes(
+        &mut self,
+        changes: Vec<TextChange>,
+        expected_version: Option<u64>,
+    ) -> Result<AppliedChanges, ChangesError> {
+        if let Some(expected) = expected_version.filter(|v| *v != self.version) {
+            return Err(ChangesError::VersionMismatch {
+                expected,
+                actual: self.version,
+            });
+        }
+        let changes = changes
+            .into_iter()
+            .map(|change| TextChange {
+                text: normalize_line_endings(&change.text, self.line_ending).into_owned(),
+                range: change.range,
+            })
+            .collect();
+        let ordered = order_changes(&self.text, changes)?;
+        if ordered.is_empty() {
+            return Ok(AppliedChanges { changes: 0 });
+        }
+        let (range, replacement) = compose_changes(&self.text, &ordered);
+        let cursor = follow_changes(&ordered, self.cursor);
+        let anchor = self.anchor.map(|anchor| follow_changes(&ordered, anchor));
+        self.apply_edit(Edit {
+            range,
+            replacement: &replacement,
+            cursor,
+            anchor,
+            kind: EditKind::Replace,
+            line_ending: None,
+        });
+        Ok(AppliedChanges {
+            changes: ordered.len(),
+        })
     }
 
     /// カーソルと選択を行・桁で置く（#1658）。**本文は変えない**ので版も進まない
@@ -5590,5 +5787,255 @@ mod tests {
         // 手掛かりの無い本文へ差し替えたら直前の単位のまま
         b.set_text("plain\n".into());
         assert_eq!(b.indent_unit(), IndentUnit::Spaces(2));
+    }
+
+    // --- 書き換えの組をまとめて当てる（#1683）---
+
+    fn change(range: Range<usize>, text: &str) -> TextChange {
+        TextChange {
+            range,
+            text: text.to_string(),
+        }
+    }
+
+    /// 整形の前の本文（行頭が揃っておらず、`=` の前後に空白が無い）
+    const UNFORMATTED: &str = "fn main(){\nlet x=1;\nx\n}\n";
+
+    /// 重なりの無い 3 か所（`{` の前・行頭・`=` の前後）
+    fn three_changes() -> Vec<TextChange> {
+        vec![
+            change(9..9, " "),
+            change(11..11, "    "),
+            change(16..17, " = "),
+        ]
+    }
+
+    #[test]
+    fn 重なりの無い書き換えは固定値になる() {
+        let mut b = TextBuffer::from_text(path("f1.rs"), UNFORMATTED.into());
+        let applied = b.apply_changes(three_changes(), None).unwrap();
+        assert_eq!(applied.changes, 3);
+        assert_eq!(b.text(), "fn main() {\n    let x = 1;\nx\n}\n");
+    }
+
+    #[test]
+    fn 逆順に並んだ書き換えも同じ固定値になる() {
+        let mut changes = three_changes();
+        changes.reverse();
+        let mut b = TextBuffer::from_text(path("f2.rs"), UNFORMATTED.into());
+        b.apply_changes(changes, None).unwrap();
+        assert_eq!(b.text(), "fn main() {\n    let x = 1;\nx\n}\n");
+    }
+
+    /// 前の終わり = 次の始まりは重なりではない（置き換え → 置き換え・置き換え → 挿入）
+    #[test]
+    fn 隣接する書き換えは固定値になる() {
+        let mut b = TextBuffer::from_text(path("f3.rs"), UNFORMATTED.into());
+        b.apply_changes(
+            vec![
+                // `{\n` の 2 つが隣り合う（9..10 と 10..11）
+                change(9..10, " {"),
+                change(10..11, "\n    "),
+                // `x` の行: 置き換え（20..21）の終わりへ挿入（21..21）
+                change(20..21, "    x"),
+                change(21..21, ";"),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(b.text(), "fn main() {\n    let x=1;\n    x;\n}\n");
+    }
+
+    /// 同じ位置への挿入は**配列の順**に並ぶ（LSP の規定）。幅 0 の挿入は同じ位置から始まる
+    /// 置き換えより先に入る
+    #[test]
+    fn 同じ位置への挿入は配列の順に並ぶ() {
+        let mut b = TextBuffer::from_text(path("f4.rs"), "ab".into());
+        b.apply_changes(
+            vec![change(1..2, "B"), change(1..1, "1"), change(1..1, "2")],
+            None,
+        )
+        .unwrap();
+        assert_eq!(b.text(), "a12B");
+    }
+
+    /// 空の置き換え（削除）と、中身の同じ・空の書き換え（何もしない）
+    #[test]
+    fn 空置換は削除になり中身の同じ書き換えは数えない() {
+        let mut b = TextBuffer::from_text(path("f5.rs"), "a  \nb \nc\n".into());
+        let applied = b
+            .apply_changes(
+                vec![
+                    change(1..3, ""),
+                    change(5..6, ""),
+                    // 同じ中身で置き換える・空を空で置き換える = 変えない
+                    change(7..8, "c"),
+                    change(8..8, ""),
+                ],
+                None,
+            )
+            .unwrap();
+        assert_eq!(b.text(), "a\nb\nc\n");
+        assert_eq!(applied.changes, 2);
+    }
+
+    /// Issue の受け入れ条件: 整形の後の undo **1 回**で整形の前の全文とバイト一致する
+    #[test]
+    fn 整形はundo1回で前の全文とバイト一致へ戻る() {
+        let mut b = TextBuffer::from_text(path("f6.rs"), UNFORMATTED.into());
+        let (version, depth) = (b.version(), b.undo_depth());
+        b.apply_changes(three_changes(), Some(version)).unwrap();
+        // 3 か所でも版は 1 つ・履歴も 1 件だけ進む
+        assert_eq!(b.version(), version + 1);
+        assert_eq!(b.undo_depth(), depth + 1);
+        assert!(b.undo());
+        assert_eq!(b.text().as_bytes(), UNFORMATTED.as_bytes());
+        // redo 1 回で整形の後へ戻る
+        assert!(b.redo());
+        assert_eq!(b.text(), "fn main() {\n    let x = 1;\nx\n}\n");
+    }
+
+    /// 整形は前後の打鍵の塊とまとまらない（打った直後に整形して undo しても打鍵は残る）
+    #[test]
+    fn 整形は前後の打鍵とまとまらない() {
+        let mut b = TextBuffer::from_text(path("f7.rs"), UNFORMATTED.into());
+        b.set_clock_millis(0);
+        b.set_cursor(b.text().len(), false);
+        b.insert("//");
+        let typed = b.text().to_string();
+        b.apply_changes(three_changes(), None).unwrap();
+        b.insert("!");
+        assert!(b.undo());
+        assert_eq!(b.text(), "fn main() {\n    let x = 1;\nx\n}\n//");
+        assert!(b.undo());
+        assert_eq!(b.text(), typed);
+        assert!(b.undo());
+        assert_eq!(b.text(), UNFORMATTED);
+    }
+
+    /// 当てられない組は本文も版も 1 つも変えずに理由を返す（番号は配列の 1 始まり）
+    #[test]
+    fn 当てられない組は本文を触らずに拒否する() {
+        let text = "日本語\nabc\n";
+        // 拒否は「検査を全部済ませてから 1 回だけ書く」ので、後ろの方の 1 件が悪くても前は当たらない
+        for changes in [
+            vec![change(0..3, "x"), change(2..5, "y")],
+            vec![change(4..4, "x"), change(3..6, "y")],
+        ] {
+            let mut b = TextBuffer::from_text(path("f8.rs"), text.into());
+            let version = b.version();
+            assert!(b.apply_changes(changes, None).is_err());
+            assert_eq!((b.text(), b.version()), (text, version));
+        }
+        let mut b = TextBuffer::from_text(path("f8.rs"), text.into());
+        assert_eq!(
+            b.apply_changes(vec![change(0..3, "x"), change(0..6, "y")], None),
+            Err(ChangesError::Overlap {
+                first: 1,
+                second: 2
+            })
+        );
+        assert_eq!(
+            b.apply_changes(vec![change(9..9, ""), change(0..99, "y")], None),
+            Err(ChangesError::OutOfBounds {
+                index: 2,
+                start: 0,
+                end: 99,
+                len: 14
+            })
+        );
+        assert_eq!(
+            b.apply_changes(vec![change(1..3, "x")], None),
+            Err(ChangesError::NotCharBoundary { index: 1 })
+        );
+        assert_eq!(
+            b.apply_changes(
+                vec![TextChange {
+                    range: Range { start: 6, end: 3 },
+                    text: String::new()
+                }],
+                None
+            ),
+            Err(ChangesError::Inverted {
+                index: 1,
+                start: 6,
+                end: 3
+            })
+        );
+        let version = b.version();
+        assert_eq!(
+            b.apply_changes(vec![change(0..0, "x")], Some(version + 1)),
+            Err(ChangesError::VersionMismatch {
+                expected: version + 1,
+                actual: version
+            })
+        );
+        assert_eq!((b.text(), b.version(), b.undo_depth()), (text, version, 0));
+    }
+
+    /// 中身の同じ書き換えだけなら何もしない（版も履歴も進まない = 整形済みの文書を整形しても汚れない）
+    #[test]
+    fn 中身の同じ書き換えだけなら版も履歴も進まない() {
+        let mut b = TextBuffer::from_text(path("f9.rs"), "a\nb\n".into());
+        let version = b.version();
+        let applied = b
+            .apply_changes(vec![change(0..4, "a\nb\n"), change(4..4, "")], None)
+            .unwrap();
+        assert_eq!(applied.changes, 0);
+        assert_eq!(
+            (b.version(), b.undo_depth(), b.dirty()),
+            (version, 0, false)
+        );
+    }
+
+    /// 入れる本文の改行はバッファの流儀へ揃い、範囲の外の改行は 1 バイトも変わらない（#1650）。
+    /// 行単位で全文を返す答えでも、実際に変わる所だけが書き換わる
+    #[test]
+    fn crlfのファイルでは入れる改行がcrlfに揃い変わる所だけが書き換わる() {
+        let text = "fn a(){\r\nx\r\n}\r\n";
+        let mut b = TextBuffer::from_text(path("f10.rs"), text.into());
+        b.apply_changes(vec![change(0..text.len(), "fn a() {\n    x\n}\n")], None)
+            .unwrap();
+        assert_eq!(b.text(), "fn a() {\r\n    x\r\n}\r\n");
+        assert_eq!(b.line_ending(), LineEnding::Crlf);
+        assert!(b.undo());
+        assert_eq!(b.text(), text);
+        // LF のファイルへ CRLF で返ってきても LF のまま
+        let mut b = TextBuffer::from_text(path("f11.rs"), "a\nb\n".into());
+        b.apply_changes(vec![change(1..2, "\r\n\r\n")], None)
+            .unwrap();
+        assert_eq!(b.text(), "a\n\nb\n");
+    }
+
+    /// カーソルと選択端は書き換えに合わせてずれる（打っていた場所から飛ばない）
+    #[test]
+    fn カーソルと選択端は書き換えに合わせてずれる() {
+        let mut b = TextBuffer::from_text(path("f12.rs"), UNFORMATTED.into());
+        // `x` の行の頭（20）にカーソル、`let` の `t`（13）から選択
+        b.set_selection(13, 20);
+        b.apply_changes(three_changes(), None).unwrap();
+        let formatted = "fn main() {\n    let x = 1;\nx\n}\n";
+        assert_eq!(b.text(), formatted);
+        // 前に 1 + 4 + 2 = 7 バイト増えた
+        assert_eq!(b.cursor(), 27);
+        assert_eq!(&formatted[b.cursor()..b.cursor() + 1], "x");
+        assert_eq!(b.anchor(), Some(18));
+        assert_eq!(&formatted[18..19], "t");
+        // 書き換えの始まりにいたら手前のまま（挿入された空白の前）
+        let mut b = TextBuffer::from_text(path("f13.rs"), UNFORMATTED.into());
+        b.set_cursor(16, false);
+        b.apply_changes(three_changes(), None).unwrap();
+        assert_eq!(b.cursor(), 16 + 5);
+        // 書き換えの中にいたら、頭からの距離を保って置き換えた本文の中へ寄せる
+        let mut b = TextBuffer::from_text(path("f15.rs"), "xabx".into());
+        b.set_cursor(2, false);
+        b.apply_changes(vec![change(1..3, "PQR")], None).unwrap();
+        assert_eq!((b.text(), b.cursor()), ("xPQRx", 2));
+        // 文字の途中には置かない（置き換えた本文が多バイト）
+        let mut b = TextBuffer::from_text(path("f14.rs"), "ab".into());
+        b.set_cursor(1, false);
+        b.apply_changes(vec![change(0..2, "日本")], None).unwrap();
+        assert!(b.text().is_char_boundary(b.cursor()));
+        assert_eq!(b.cursor(), 0);
     }
 }

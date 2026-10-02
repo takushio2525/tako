@@ -70,7 +70,11 @@ actions!(
         ReportIssue,
         // #1677: ジャンプ履歴の戻る / 進む（割当と理由は `jump_bindings`）
         JumpBack,
-        JumpForward
+        JumpForward,
+        // #1683: 編集中のコードを整形する（割当と理由は `format_bindings`）。
+        // 範囲の整形はメニューとパレットから（キーは張らない = 既存の打鍵を奪わない）
+        FormatDocument,
+        FormatSelection
     ]
 );
 
@@ -95,7 +99,29 @@ fn bindings_for(platform: Platform) -> Vec<KeyBinding> {
         Platform::Windows => bindings.extend(non_macos_bindings()),
     }
     bindings.extend(jump_bindings(platform));
+    bindings.extend(format_bindings(platform));
     bindings
+}
+
+/// 編集中のコードの整形（FR-3.33 / #1683）。案内の表記は
+/// `tako_core::platform::keys::format_document`（番犬が突き合わせる）
+///
+/// ## macOS = ⇧⌘I（Zed と同じ）
+///
+/// cmd の付く打鍵は PTY へ何も送らない（handle_key の platform 修飾ガード）ので、端末の
+/// 入力手段は減らない。VS Code の ⇧⌥F は alt + 英字 = #575 の meta 入力（ESC 前置）を
+/// 奪うので採らない。
+///
+/// ## Windows = Ctrl+Shift+I（Zed / VS Code（Linux）と同じ）
+///
+/// #585 の原則どおり ctrl + 英字は shift 段へ逃がした形。`keystroke_to_bytes` は
+/// Ctrl+Shift+I を Ctrl+I と同じ C0 バイト（0x09 = Tab）へ潰すので、奪っても端末の
+/// Ctrl+I は無傷（`ctrl_shift_iを奪ってもctrl_iのtabは残る` テストが実変換で固定）
+fn format_bindings(platform: Platform) -> Vec<KeyBinding> {
+    match platform {
+        Platform::MacOs => vec![KeyBinding::new("cmd-shift-i", FormatDocument, None)],
+        Platform::Windows => vec![KeyBinding::new("ctrl-shift-i", FormatDocument, None)],
+    }
 }
 
 /// ジャンプ履歴の戻る / 進む（FR-3.29 / #1677）。案内の表記は
@@ -233,6 +259,8 @@ fn action_for_palette_command(command_id: &str) -> Option<&'static str> {
         "split-down" => Some("tako::SplitDown"),
         "toggle-files" => Some("tako::ToggleSidebar"),
         "open-settings" => Some("tako::OpenSettings"),
+        // #1683: 整形（範囲の整形はキーを張らない = 併記しない）
+        "format-document" => Some("tako::FormatDocument"),
         _ => None,
     }
 }
@@ -1334,6 +1362,8 @@ mod tests {
             // ジャンプ履歴（#1677。Ctrl+- は縮小なので JetBrains 系の Ctrl+Alt+← / →）
             ("ctrl-alt-left", "tako::JumpBack"),
             ("ctrl-alt-right", "tako::JumpForward"),
+            // 整形（#1683。Zed / VS Code（Linux）と同じ）
+            ("ctrl-shift-i", "tako::FormatDocument"),
         ]
     }
 
@@ -1666,10 +1696,16 @@ mod tests {
             .iter()
             .filter(|b| b.keystrokes().iter().any(|k| k.inner().modifiers.platform))
             .count();
+        // #1683: 整形の ⇧⌘I は macOS では platform 修飾で 1 本増える（45 本は不変のまま。
+        // Windows の Ctrl+Shift+I は非 platform なので数に入らない）
+        let 整形 = format_bindings(Platform::current())
+            .iter()
+            .filter(|b| b.keystrokes().iter().any(|k| k.inner().modifiers.platform))
+            .count();
         let 期待 = if cfg!(target_os = "macos") {
-            45
+            45 + 整形
         } else {
-            45 - MACOS_ONLY.len()
+            45 - MACOS_ONLY.len() + 整形
         };
         assert_eq!(
             platform本数, 期待,
@@ -1723,6 +1759,7 @@ mod tests {
             ("split-right", "tako::SplitRight"),
             ("split-down", "tako::SplitDown"),
             ("toggle-files", "tako::ToggleSidebar"),
+            ("format-document", "tako::FormatDocument"),
         ] {
             let hint = palette_shortcut(id)
                 .unwrap_or_else(|| panic!("{id}: パレットにショートカットが出ていない"));
@@ -1739,7 +1776,13 @@ mod tests {
             assert!(matched, "{id}: 表示 \"{hint}\" に対応するバインドが無い");
         }
         // バインドを持たない項目に嘘のショートカットを出さない
-        for id in ["toggle-theme", "panel-git", "toggle-drawer", "存在しないid"] {
+        for id in [
+            "toggle-theme",
+            "panel-git",
+            "toggle-drawer",
+            "format-selection",
+            "存在しないid",
+        ] {
             assert_eq!(
                 palette_shortcut(id),
                 None,
@@ -1766,6 +1809,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #1683: 整形の打鍵が**両 OS で**既存の割当と衝突しない（同じキーに 2 つのアクションを張らない）
+    #[test]
+    fn 整形の打鍵は両osで既存の割当と衝突しない() {
+        for platform in [Platform::MacOs, Platform::Windows] {
+            let all = bindings_for(platform);
+            let format = format_bindings(platform);
+            assert_eq!(format.len(), 1, "{platform:?}: 整形の打鍵は 1 本");
+            let mine = format[0].keystrokes()[0].inner().clone();
+            let others: Vec<&str> = all
+                .iter()
+                .filter(|o| {
+                    let k = o.keystrokes()[0].inner();
+                    o.keystrokes().len() == 1
+                        && k.key == mine.key
+                        && k.modifiers == mine.modifiers
+                        && o.action().name() != "tako::FormatDocument"
+                })
+                .map(|o| o.action().name())
+                .collect();
+            assert!(
+                others.is_empty(),
+                "{platform:?}: 整形の打鍵が {others:?} と衝突している"
+            );
+        }
+    }
+
+    /// #1683: Windows の Ctrl+Shift+I は Ctrl+I と同じ 0x09（Tab）へ潰れる = 奪っても
+    /// 端末の Ctrl+I は残る（#585 の「shift 段へ逃がす」原則の前提を実変換で固定する）
+    #[test]
+    fn ctrl_shift_iを奪ってもctrl_iのtabは残る() {
+        let mut shifted = ks_ctrl("i");
+        shifted.modifiers.shift = true;
+        assert_eq!(
+            keystroke_to_bytes_default(&ks_ctrl("i")),
+            Some(vec![0x09]),
+            "Ctrl+I が Tab（0x09）を送っていない（前提が変わったら判断をやり直すこと）"
+        );
+        assert_eq!(
+            keystroke_to_bytes_default(&shifted),
+            keystroke_to_bytes_default(&ks_ctrl("i")),
+            "Ctrl+Shift+I が Ctrl+I と同じバイトへ潰れていない"
+        );
     }
 
     /// #1677: ジャンプの打鍵が**両 OS で**既存の割当と衝突しない。
@@ -1857,6 +1944,10 @@ mod tests {
                 (
                     "tako::SavePreview",
                     tako_core::platform::keys::save_preview(platform),
+                ),
+                (
+                    "tako::FormatDocument",
+                    tako_core::platform::keys::format_document(platform),
                 ),
             ] {
                 let from_bindings = shortcut_hint_for(action, platform).unwrap_or_else(|| {

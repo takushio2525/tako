@@ -361,12 +361,18 @@ fn 上書きと読み直しはcoreの口を通る() {
 fn dispatchとcliとmcpが1対1で配線されている() {
     let dispatch = source(DISPATCH);
     let why = "外部変更の後の逃げ道が CLI / MCP から使えない（設計原則 5）";
+    // #1683: 保存の本体は `fn preview_save`（同期の保存と、保存時整形の後段の 1 実装）へ
+    // 切り出した。腕がそこを呼び、そこが `host.save_preview` を通ることを 2 段で見る。
+    // 腕の字面は dispatch_inner のもの（prepare_offload の腕は `{ force, pane }` の順で書いて区別する）
     dispatch.arm_calls(
         "Request::PreviewSave { pane, force } =>",
-        "host.save_preview(target, force)",
-        4,
+        "preview_save(host, target, force)",
+        8,
         why,
     );
+    dispatch
+        .require("preview_save")
+        .must_contain("host.save_preview(target, force)", why);
     dispatch.arm_calls(
         "Request::PreviewRevert { pane } =>",
         "host.revert_preview(target)",

@@ -104,6 +104,38 @@ fn specs_in_fn(src: &str, name: &str) -> Vec<String> {
     specs
 }
 
+/// `fn <name>(platform: Platform) -> Vec<KeyBinding>` の `arm`（`Platform::MacOs` /
+/// `Platform::Windows`）の腕から `KeyBinding::new("<spec>", …)` の spec を拾う（#1683 の
+/// `format_bindings` のように OS ごとに割当が違う表）
+fn specs_in_platform_fn(src: &str, name: &str, arm: &str) -> Vec<String> {
+    let head = format!("\nfn {name}(platform: Platform) -> Vec<KeyBinding> {{\n");
+    let start = src
+        .find(&head)
+        .unwrap_or_else(|| panic!("{SRC} に {name}(platform) が見つからない（構造が変わった？）"));
+    let body = &src[start + head.len()..];
+    let body = &body[..body
+        .find("\n}\n")
+        .unwrap_or_else(|| panic!("{name}() の終わりが見つからない"))];
+    let from = body
+        .find(&format!("{arm} =>"))
+        .unwrap_or_else(|| panic!("{name}() に {arm} の腕が見つからない"));
+    let rest = &body[from + arm.len()..];
+    let slice = match rest.find("Platform::") {
+        Some(next) => &rest[..next],
+        None => rest,
+    };
+    let specs: Vec<String> = slice
+        .split("KeyBinding::new(\"")
+        .skip(1)
+        .filter_map(|tail| Some(tail.split('"').next()?.to_string()))
+        .collect();
+    assert!(
+        !specs.is_empty(),
+        "{name}() の {arm} から 1 本も拾えていない"
+    );
+    specs
+}
+
 /// `<kbd>X</kbd>` の中身を出現順に拾う
 fn kbd_tokens(cell: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -212,16 +244,24 @@ fn sets() -> (
     let base = specs_in_fn(&src, "base_bindings");
     let macos_only = specs_in_fn(&src, "macos_only_bindings");
     let non_macos = specs_in_fn(&src, "non_macos_bindings");
+    // #1683: 整形の打鍵は OS ごとに違う表（macOS = cmd-shift-i / Windows = ctrl-shift-i）
+    let format_mac = specs_in_platform_fn(&src, "format_bindings", "Platform::MacOs");
+    let format_win = specs_in_platform_fn(&src, "format_bindings", "Platform::Windows");
 
     let want_mac: BTreeSet<String> = base
         .iter()
         .chain(macos_only.iter())
+        .chain(format_mac.iter())
         .map(|s| canon_spec(s))
         .collect();
     // Windows は `non_macos_bindings()` だけ。`base_bindings()` の `cmd-` は
     // Windows では Win キーへ解決されて OS に奪われるため、案内に出してはいけない
     // （`keybindings::shortcut_hint_for` が platform 修飾のバインドを落とすのと同じ規則）
-    let want_win: BTreeSet<String> = non_macos.iter().map(|s| canon_spec(s)).collect();
+    let want_win: BTreeSet<String> = non_macos
+        .iter()
+        .chain(format_win.iter())
+        .map(|s| canon_spec(s))
+        .collect();
 
     let (doc_mac, doc_win) = doc_specs(&md);
     (want_mac, want_win, doc_mac, doc_win)

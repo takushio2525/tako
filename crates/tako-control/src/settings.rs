@@ -37,6 +37,14 @@ pub struct Settings {
     /// 表示中プレビューファイルのライブリロード（Issue #233。既定 ON）
     #[serde(default = "default_true")]
     pub preview_live_reload: bool,
+    /// 保存時整形（FR-3.33 / Issue #1683。**既定 OFF** = ユーザー確定）。
+    ///
+    /// ON でも整形するのは**明示的な保存**（⌘S / `tako edit save` / MCP の save）だけで、
+    /// 自動保存（500ms のデバウンス）では整形しない（打鍵の 500ms 後に勝手に整形されない）。
+    /// **旧ファイルはキーが無くても false で読める**（`#[serde(default)]`）ので移行 Step は
+    /// 要らない（`Settings` の指紋は動くが、読み書きは後方互換）
+    #[serde(default)]
+    pub lsp_format_on_save: bool,
     /// PDF・画像・動画サムネのデコード済み画像キャッシュ上限（Issue #258。MiB）
     #[serde(default = "default_preview_cache_max_mb")]
     pub preview_cache_max_mb: u64,
@@ -192,6 +200,7 @@ impl Default for Settings {
             autosuggest_hint: true,
             autosuggest_tab: true,
             preview_live_reload: true,
+            lsp_format_on_save: false,
             preview_cache_max_mb: default_preview_cache_max_mb(),
             tmux_persist: true,
             sleep_guard_mode: crate::sleep_guard::SleepGuardMode::default(),
@@ -626,6 +635,7 @@ mod tests {
             autosuggest_hint: false,
             autosuggest_tab: false,
             preview_live_reload: false,
+            lsp_format_on_save: true,
             preview_cache_max_mb: 768,
             tmux_persist: false,
             sleep_guard_mode: crate::sleep_guard::SleepGuardMode::On,
@@ -687,6 +697,10 @@ mod tests {
         // #550: 隠しファイルは既定で非表示（未知キーの後方互換も兼ねる）
         assert!(!parsed.show_hidden_files);
         assert!(parsed.preview_live_reload);
+        // #1683: 保存時整形は既定 OFF（ユーザー確定。旧ファイル = キー無しでも false =
+        // 移行 Step 不要。指紋テストの更新理由がこれ）
+        assert!(!parsed.lsp_format_on_save);
+        assert!(!Settings::default().lsp_format_on_save);
         assert_eq!(parsed.preview_cache_max_mb, 512);
         assert!(parsed.tmux_persist);
         assert_eq!(

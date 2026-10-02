@@ -230,3 +230,93 @@ pub const GOTO_SOURCE_GONE_REASON: Note = Note::new(
     "問い合わせたペインが閉じられたか、別のファイルへ差し替わった",
     "The pane that asked was closed or now shows another file",
 );
+
+// --- 整形（#1683）---------------------------------------------------------------
+// 起動・未導入・未応答・落ちた等は定義ジャンプと同じ文（言語サーバの状態として同じもの）
+
+/// 整形した。`{count}` = 書き換えた箇所の数
+pub const FORMAT_DONE_NOTE: Note = Note::new(
+    "整形した（{count} か所。undo 1 回で戻せる）",
+    "Formatted ({count} changes; one undo reverts it)",
+);
+
+/// 変える所が無かった。**「整形済み」と言い切らない**: rust-analyzer は rustfmt が読めない
+/// （構文エラー）ときも空で答えるので、整形済みと区別できない（実測 #1683。診断の publish は
+/// 整形の答えより遅れうるので、エラーの数が 0 でも構文エラーがありうる）
+pub const FORMAT_UNCHANGED_NOTE: Note = Note::new(
+    "変える所が無かった（構文エラーがあるとサーバは整形しないことがある）",
+    "Nothing changed (servers often skip formatting when the code has syntax errors)",
+);
+
+/// 変える所が無かったが、エラーの診断がある。`{count}` = エラーの数
+pub const FORMAT_UNCHANGED_ERRORS_NOTE: Note = Note::new(
+    "変える所が無かった。エラーの診断が {count} 件あり、構文エラーがあるとサーバは整形しないことがある（tako lsp diagnostics）",
+    "Nothing changed. There are {count} error diagnostics; servers often skip formatting when the code has syntax errors (tako lsp diagnostics)",
+);
+
+/// 範囲の外の空白だけの書き換えを捨てた。`{count}`
+pub const FORMAT_DROPPED_NOTE: Note = Note::new(
+    "範囲の外にかかる空白だけの書き換え {count} か所は当てなかった（範囲の外は変えない）",
+    "Skipped {count} whitespace-only changes outside the range (nothing outside the range changes)",
+);
+
+/// サーバが整形に対応していない。`{server}`
+pub const FORMAT_UNSUPPORTED_REASON: Note = Note::new(
+    "{server} は整形に対応していない",
+    "{server} does not support formatting",
+);
+
+/// サーバが範囲の整形に対応していない。`{server}`
+pub const FORMAT_RANGE_UNSUPPORTED_REASON: Note = Note::new(
+    "{server} は範囲の整形に対応していない",
+    "{server} does not support formatting a range",
+);
+
+/// 範囲の整形に対応していないときの次の一手
+pub const FORMAT_RANGE_UNSUPPORTED_NEXT_STEP: Note = Note::new(
+    "範囲を付けずに文書全体を整形する: tako lsp format",
+    "Format the whole document instead: tako lsp format",
+);
+
+/// 待つあいだに本文が変わった
+pub const FORMAT_STALE_REASON: Note = Note::new(
+    "整形の答えを待つあいだに本文が変わったので当てなかった（古い本文への答えは位置がずれる）",
+    "The document changed while waiting for the formatter, so nothing was applied",
+);
+
+/// サーバの答えを当てられない（重なり・範囲外・形が違う）。`{server}` / `{detail}`
+pub const FORMAT_INVALID_REASON: Note = Note::new(
+    "{server} の整形の答えを当てられない（{detail}）ので何も変えなかった",
+    "Could not apply the formatting from {server} ({detail}), so nothing changed",
+);
+
+/// 範囲の外へ空白以外の書き換えが来た。`{server}` / `{count}`
+pub const FORMAT_OUTSIDE_RANGE_REASON: Note = Note::new(
+    "{server} が範囲の外（{count} か所）まで書き換えようとしたので何も変えなかった（範囲の外は変えない）",
+    "{server} tried to change {count} places outside the range, so nothing changed (nothing outside the range is changed)",
+);
+
+/// 範囲の外へ来たときの次の一手
+pub const FORMAT_OUTSIDE_RANGE_NEXT_STEP: Note = Note::new(
+    "範囲を行の頭から行の終わりまでに広げるか、範囲を付けずに全体を整形する",
+    "Widen the range to whole lines, or format the whole document",
+);
+
+/// 答えを当てられないときの次の一手
+pub const FORMAT_INVALID_NEXT_STEP: Note = Note::new(
+    "サーバの不具合の可能性がある。tako lsp logs で様子を見る",
+    "This may be a server bug; check tako lsp logs",
+);
+
+/// 保存時整形を飛ばして保存した。`{reason}` = 整形できなかった理由
+pub const FORMAT_ON_SAVE_SKIPPED_NOTE: Note = Note::new(
+    "整形せずに保存した（{reason}）",
+    "Saved without formatting ({reason})",
+);
+
+/// 保存時整形の設定の説明（`tako lsp format-on-save` の応答）。`{save_key}` = 保存の打鍵
+/// （`tako_core::platform::keys::save_preview`。OS ごとに違うので直書きしない = #1203）
+pub const FORMAT_ON_SAVE_SCOPE_NOTE: Note = Note::new(
+    "明示的な保存（{save_key}・tako edit save）の前にだけ整形する。自動保存では整形しない",
+    "Formats only before an explicit save ({save_key} / tako edit save), never on autosave",
+);

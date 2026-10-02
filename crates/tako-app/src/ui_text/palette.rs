@@ -36,6 +36,9 @@ pub fn cmd_label(id: &str) -> &'static str {
         "split-down" => tr!("ペインを下に分割", "Split pane down"),
         // #552: いまのタブ名を固定して自動リネームの上書きを止める
         "pin-tab-title" => tr!("このタブ名を固定", "Pin this tab name"),
+        // #1683: 言語サーバの整形（編集メニューと同じ）
+        "format-document" => tr!("コードを整形", "Format document"),
+        "format-selection" => tr!("選択範囲を整形", "Format selection"),
         // 言語切替は両言語でネイティブ表記を併記（切替先を字面で探せるように）。
         // 英語側に「日本語」を含む意図的な例外のため、訳し漏れ検査の対象外
         "toggle-language" => tr!(
@@ -74,6 +77,8 @@ mod tests {
                 cmd_label("split-right").to_string(),
                 cmd_label("split-down").to_string(),
                 cmd_label("pin-tab-title").to_string(),
+                cmd_label("format-document").to_string(),
+                cmd_label("format-selection").to_string(),
                 // toggle-language は意図的にネイティブ表記併記のため対象外（上記コメント）
             ]
         });
